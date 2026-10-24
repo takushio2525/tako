@@ -23,8 +23,6 @@
 use std::ops::Range;
 use std::path::Path;
 
-use thiserror::Error;
-
 use crate::file_type::{self, FileType};
 
 use super::{
@@ -96,10 +94,33 @@ impl LineOperation {
 }
 
 /// 行操作を当てられない理由（#1692）。**本文は 1 バイトも変えずに**返す
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineOpError {
-    #[error("{name} のコメント記号を知らない（コメントの記号を持たない形式）")]
     NoCommentSyntax { name: String },
+}
+
+impl std::fmt::Display for LineOpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for LineOpError {}
+
+impl LineOpError {
+    /// 表示言語を明示しての文言（#2365。`TextEditError::text_in` と同じ形）。
+    /// 日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NoCommentSyntax { name }, Ja) => {
+                format!("{name} のコメント記号を知らない（コメントの記号を持たない形式）")
+            }
+            (Self::NoCommentSyntax { name }, En) => {
+                format!("no comment syntax is known for {name} (a format without comments)")
+            }
+        }
+    }
 }
 
 /// コメントの書き方（#1692）。言語ごとの値は言語の同定の正本（[`file_type::TABLE`]）の

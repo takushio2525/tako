@@ -389,15 +389,16 @@ fn requested_index(body: &Value) -> Result<usize, ()> {
 ///
 /// status は `app_dispatch` の分類（400 = 頼み方が悪い / 500 = 内部 / 503 = app 不在）。
 /// そのうえで**画面が出し分ける 2 つ**だけ寄せ直す:
-/// - 前回の実行がまだ走っている → 409 `still_running`（目印は [`STILL_RUNNING_MARK`]）
+/// - 前回の実行がまだ走っている → 409 `still_running`（読みは [`says_still_running`]）
 /// - カード / ペインが見つからない（PC 側で閉じられた）→ 404 `not_found`
 ///
-/// [`STILL_RUNNING_MARK`]: tako_core::command_card::STILL_RUNNING_MARK
+/// [`says_still_running`]: tako_core::CommandCardError::says_still_running
 pub fn classify_error(status: u16, message: &str) -> (u16, &'static str) {
     if status == 503 {
         return (503, "app_unreachable");
     }
-    if message.contains(tako_core::command_card::STILL_RUNNING_MARK) {
+    // 目印は表示言語で日英どちらにもなる（#2365）ので、読み方は 1 実装を通す
+    if tako_core::CommandCardError::says_still_running(message) {
         return (409, "still_running");
     }
     // 「見つからない」は表示言語で日英どちらにもなる（#1762）ので、読み方は 1 実装を通す

@@ -379,7 +379,7 @@ impl SessionBackend for PsmuxBackend {
         if !session.as_str().starts_with(SESSION_PREFIX) {
             return Err(BackendError::InvalidSession {
                 name: session.as_str().to_string(),
-                reason: "tako が作った器ではない（接頭辞が一致しない）",
+                reason: super::InvalidSessionReason::NotOurs,
             });
         }
         // 既に無い場合も psmux は exit 0 を返す（実測）。無害なので区別しない

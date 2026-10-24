@@ -367,7 +367,8 @@ Geist / Geist Mono。**フォントは自己ホスト**（Google Fonts 参照禁
 - **受け口の中でも role を確かめる**（二重の門）。正は層②だが、ルータの配線を誤って
   表を通らない枝へ繋いでも実行だけは開かない
 - **失敗は画面が出し分ける 2 つだけ寄せ直す**（409 = 実行中 / 404 = PC 側で閉じられた）。
-  dispatch のエラーは IPC を越えると文字列なので、目印は定数（`STILL_RUNNING_MARK`）で持つ
+  dispatch のエラーは IPC を越えると文字列なので、目印（`still_running_mark`。表示言語ごとに 1 つ =
+  #2365）で持ち、読みは `CommandCardError::says_still_running` を通す
 - **監査と persist.log には「どの端末から・どれを・結果」だけ**。断った実行も残す
   （監査から「押したが断られた」が落ちないよう、番号は応答ではなく要求の本文から取る）
 - 検証は番犬 `issue1724_remote_card_run_watchdog`（注入 4 通りが file:line 名指しで落ちる）+

@@ -220,13 +220,14 @@ ERR="$("$TAKO_BIN" edit line toggle-comment --pane "$P" 2>&1)"
 RC=$?
 echo "    CLI: rc=$RC $ERR" | head -2
 check_eq "記号の無い形式の CLI は失敗で終わる" "1" "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
-check_eq "理由に「コメント記号を知らない」" "1" "$(printf '%s' "$ERR" | grep -c 'コメント記号を知らない')"
+# 理由の文は表示言語に従う（#2365）ので英語表示の文も数える
+check_eq "理由に「コメント記号を知らない」" "1" "$(printf '%s' "$ERR" | grep -c 'コメント記号を知らない\|no comment syntax is known')"
 MCP_ERR="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t1692","version":"0"}}}' \
   "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"tako_preview_edit\",\"arguments\":{\"pane\":${P},\"command\":\"line-toggle-comment\"}}}" \
   | "$TAKO_BIN" mcp serve 2>/dev/null | jq -c 'select(.id == 2) | .result')"
 echo "    MCP: $MCP_ERR" | cut -c1-200
 check_eq "MCP は isError で同じ理由" "true|1" \
-  "$(printf '%s' "$MCP_ERR" | jq -r '.isError')|$(printf '%s' "$MCP_ERR" | grep -c 'コメント記号を知らない')"
+  "$(printf '%s' "$MCP_ERR" | jq -r '.isError')|$(printf '%s' "$MCP_ERR" | grep -c 'コメント記号を知らない\|no comment syntax is known')"
 "$TAKO_BIN" edit save --pane "$P" >/dev/null
 check_eq "記号の無い形式の本文は変わらない" "plain" "$(cat "$TMP/notes.txt")"
 # 知らない操作名は実行前に弾く（候補を並べる）

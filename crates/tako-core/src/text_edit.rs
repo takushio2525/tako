@@ -26,8 +26,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use thiserror::Error;
-
 use crate::platform::support::Platform;
 
 // 行単位の操作（複製・移動・行インデント・コメントの付け外し。#1692）
@@ -455,22 +453,87 @@ impl DeleteMotion {
 /// いないなど）のページ移動の行数（#1652）
 const DEFAULT_PAGE_STEP: usize = 20;
 
-#[derive(Debug, Error)]
+/// 開く・保存する・読み直すを断った理由。表示（`Display`）は表示言語に従う
+/// （#2365。日英の正本は [`Self::text_in`]）
+#[derive(Debug)]
 pub enum TextEditError {
-    #[error("ファイルを読み込めない: {0}")]
-    Read(#[source] std::io::Error),
-    #[error("UTF-8 テキストではないため編集できない")]
+    Read(std::io::Error),
     InvalidUtf8,
-    #[error("ファイルが外部で変更されたため保存しなかった")]
     ExternalChanged,
     /// 開いた後にファイルが消された（#1659）。上書き保存なら作り直せる
-    #[error("ファイルが外部で削除されている")]
     ExternalDeleted,
     /// 読み直そうとしたディスクの中身が編集できない（上限超過・バイナリ。#1659）
-    #[error("{0}")]
-    NotEditable(String),
-    #[error("ファイルへ保存できない: {0}")]
-    Write(#[source] std::io::Error),
+    NotEditable(NotEditable),
+    /// 保存先が読み取り専用（書きに行く前に断る）
+    ReadOnly,
+    Write(std::io::Error),
+}
+
+/// [`TextEditError::NotEditable`] の中身（#1659 / #2365）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotEditable {
+    /// ディスクの中身が編集できる上限を超える
+    OverLimit(crate::preview_limit::Truncation),
+    /// ディスクの中身がバイナリになった
+    Binary,
+}
+
+impl std::fmt::Display for TextEditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for TextEditError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(e) | Self::Write(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl TextEditError {
+    /// 表示言語を明示しての文言（#2365。`PaneTreeError::text_in` = #2358 と同じ形）。
+    ///
+    /// (バリアント, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまで
+    /// コンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    /// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Read(e), Ja) => format!("ファイルを読み込めない: {e}"),
+            (Self::Read(e), En) => format!("cannot read the file: {e}"),
+            (Self::InvalidUtf8, Ja) => "UTF-8 テキストではないため編集できない".to_string(),
+            (Self::InvalidUtf8, En) => "not UTF-8 text, so it cannot be edited".to_string(),
+            (Self::ExternalChanged, Ja) => {
+                "ファイルが外部で変更されたため保存しなかった".to_string()
+            }
+            (Self::ExternalChanged, En) => {
+                "not saved because the file was changed outside the editor".to_string()
+            }
+            (Self::ExternalDeleted, Ja) => "ファイルが外部で削除されている".to_string(),
+            (Self::ExternalDeleted, En) => "the file was deleted outside the editor".to_string(),
+            (Self::NotEditable(NotEditable::OverLimit(limit)), Ja) => format!(
+                "ディスクの中身が編集できる上限を超えるため読み直せない: {}",
+                limit.detail_ja()
+            ),
+            (Self::NotEditable(NotEditable::OverLimit(limit)), En) => format!(
+                "cannot reload because the file on disk exceeds the editable limit: {}",
+                limit.detail_en()
+            ),
+            (Self::NotEditable(NotEditable::Binary), Ja) => {
+                "バイナリファイルは編集できない".to_string()
+            }
+            (Self::NotEditable(NotEditable::Binary), En) => {
+                "binary files cannot be edited".to_string()
+            }
+            (Self::ReadOnly, Ja) => "ファイルへ保存できない: 読み取り専用ファイル".to_string(),
+            (Self::ReadOnly, En) => "cannot save the file: read-only file".to_string(),
+            (Self::Write(e), Ja) => format!("ファイルへ保存できない: {e}"),
+            (Self::Write(e), En) => format!("cannot save the file: {e}"),
+        }
+    }
 }
 
 /// ディスク上のファイルと、バッファの**基準**（開いた / 最後に保存した / 読み直した時点の
@@ -776,36 +839,129 @@ pub struct CursorPlacement {
 /// 「3 行目を直した」と思っているのに別の場所が変わる。版（`expected_version`）で
 /// 競合を弾いても、指定そのものがずれていては意味が無いので、解けない指定は
 /// 本文を 1 バイトも触らずに理由を返す
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RangeEditError {
-    #[error("行は 1 始まり（0 行目は無い）")]
     ZeroLine,
-    #[error("行 {line} は文書の範囲外（全 {total} 行）")]
-    LineOutOfRange { line: usize, total: usize },
-    #[error("行 {line} 桁 {column} は行の長さ {length} を超えている")]
+    LineOutOfRange {
+        line: usize,
+        total: usize,
+    },
     ColumnOutOfRange {
         line: usize,
         column: usize,
         length: usize,
     },
-    #[error("行 {line} 桁 {column} は文字の途中を指している")]
-    NotCharBoundary { line: usize, column: usize },
-    #[error("範囲の終わり {end_line}:{end_column} が始まり {start_line}:{start_column} より前")]
+    NotCharBoundary {
+        line: usize,
+        column: usize,
+    },
     InvertedRange {
         start_line: usize,
         start_column: usize,
         end_line: usize,
         end_column: usize,
     },
-    #[error("文書の版が違う（指定 {expected} / 現在 {actual}）")]
-    VersionMismatch { expected: u64, actual: u64 },
+    VersionMismatch {
+        expected: u64,
+        actual: u64,
+    },
     /// 複数の範囲を 1 回で置き換える指示（#1682）が当てられない（範囲どうしの重なり等）。
     /// 並べ方と重なりの決めは整形と同じ [`order_changes`] の 1 実装（番号は渡した配列の 1 始まり）
-    #[error(transparent)]
-    Changes(#[from] ChangesError),
+    Changes(ChangesError),
     /// 複数の範囲を 1 回で置き換える指示（#1682）が空か、カーソルを置く範囲の番号が外
-    #[error("置き換える範囲が無いか、カーソルを置く範囲の番号 {primary} が外（{count} 件）")]
-    NoPrimaryRange { primary: usize, count: usize },
+    NoPrimaryRange {
+        primary: usize,
+        count: usize,
+    },
+}
+
+impl From<ChangesError> for RangeEditError {
+    fn from(e: ChangesError) -> Self {
+        Self::Changes(e)
+    }
+}
+
+impl std::fmt::Display for RangeEditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for RangeEditError {}
+
+impl RangeEditError {
+    /// 表示言語を明示しての文言（#2365。[`TextEditError::text_in`] と同じ形）。
+    /// 日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::ZeroLine, Ja) => "行は 1 始まり（0 行目は無い）".to_string(),
+            (Self::ZeroLine, En) => "lines start at 1 (there is no line 0)".to_string(),
+            (Self::LineOutOfRange { line, total }, Ja) => {
+                format!("行 {line} は文書の範囲外（全 {total} 行）")
+            }
+            (Self::LineOutOfRange { line, total }, En) => {
+                format!("line {line} is outside the document ({total} lines in total)")
+            }
+            (
+                Self::ColumnOutOfRange {
+                    line,
+                    column,
+                    length,
+                },
+                Ja,
+            ) => format!("行 {line} 桁 {column} は行の長さ {length} を超えている"),
+            (
+                Self::ColumnOutOfRange {
+                    line,
+                    column,
+                    length,
+                },
+                En,
+            ) => format!("line {line} column {column} is past the line length {length}"),
+            (Self::NotCharBoundary { line, column }, Ja) => {
+                format!("行 {line} 桁 {column} は文字の途中を指している")
+            }
+            (Self::NotCharBoundary { line, column }, En) => {
+                format!("line {line} column {column} points inside a character")
+            }
+            (
+                Self::InvertedRange {
+                    start_line,
+                    start_column,
+                    end_line,
+                    end_column,
+                },
+                Ja,
+            ) => format!(
+                "範囲の終わり {end_line}:{end_column} が始まり {start_line}:{start_column} より前"
+            ),
+            (
+                Self::InvertedRange {
+                    start_line,
+                    start_column,
+                    end_line,
+                    end_column,
+                },
+                En,
+            ) => format!(
+                "the range end {end_line}:{end_column} is before its start {start_line}:{start_column}"
+            ),
+            (Self::VersionMismatch { expected, actual }, Ja) => {
+                format!("文書の版が違う（指定 {expected} / 現在 {actual}）")
+            }
+            (Self::VersionMismatch { expected, actual }, En) => {
+                format!("document version mismatch (expected {expected} / current {actual})")
+            }
+            (Self::Changes(e), lang) => e.text_in(lang),
+            (Self::NoPrimaryRange { primary, count }, Ja) => format!(
+                "置き換える範囲が無いか、カーソルを置く範囲の番号 {primary} が外（{count} 件）"
+            ),
+            (Self::NoPrimaryRange { primary, count }, En) => format!(
+                "no range to replace, or the cursor range number {primary} is out of range ({count} ranges)"
+            ),
+        }
+    }
 }
 
 /// 本文の 1 か所の書き換え（#1683）。範囲は**書き換える前の本文**のバイト位置。
@@ -822,27 +978,90 @@ pub struct TextChange {
 /// 書き換えの組を当てられない理由（#1683）。**1 つでも当たらなければ本文を触らない**。
 ///
 /// 番号は受け取った配列の 1 始まり（言語サーバの答えのどれが悪いかを名指す）
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangesError {
-    #[error("{index} 番目の編集の範囲 {start}..{end} が本文（{len} バイト）の外")]
     OutOfBounds {
         index: usize,
         start: usize,
         end: usize,
         len: usize,
     },
-    #[error("{index} 番目の編集の範囲 {start}..{end} は始まりが終わりより後ろ")]
     Inverted {
         index: usize,
         start: usize,
         end: usize,
     },
-    #[error("{index} 番目の編集の範囲が文字の途中を指している")]
-    NotCharBoundary { index: usize },
-    #[error("{first} 番目と {second} 番目の編集の範囲が重なっている")]
-    Overlap { first: usize, second: usize },
-    #[error("文書の版が違う（指定 {expected} / 現在 {actual}）")]
-    VersionMismatch { expected: u64, actual: u64 },
+    NotCharBoundary {
+        index: usize,
+    },
+    Overlap {
+        first: usize,
+        second: usize,
+    },
+    VersionMismatch {
+        expected: u64,
+        actual: u64,
+    },
+}
+
+impl std::fmt::Display for ChangesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for ChangesError {}
+
+impl ChangesError {
+    /// 表示言語を明示しての文言（#2365。[`TextEditError::text_in`] と同じ形）。
+    /// 日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (
+                Self::OutOfBounds {
+                    index,
+                    start,
+                    end,
+                    len,
+                },
+                Ja,
+            ) => format!("{index} 番目の編集の範囲 {start}..{end} が本文（{len} バイト）の外"),
+            (
+                Self::OutOfBounds {
+                    index,
+                    start,
+                    end,
+                    len,
+                },
+                En,
+            ) => format!("edit {index} range {start}..{end} is outside the text ({len} bytes)"),
+            (Self::Inverted { index, start, end }, Ja) => {
+                format!("{index} 番目の編集の範囲 {start}..{end} は始まりが終わりより後ろ")
+            }
+            (Self::Inverted { index, start, end }, En) => {
+                format!("edit {index} range {start}..{end} starts after it ends")
+            }
+            (Self::NotCharBoundary { index }, Ja) => {
+                format!("{index} 番目の編集の範囲が文字の途中を指している")
+            }
+            (Self::NotCharBoundary { index }, En) => {
+                format!("edit {index} range points inside a character")
+            }
+            (Self::Overlap { first, second }, Ja) => {
+                format!("{first} 番目と {second} 番目の編集の範囲が重なっている")
+            }
+            (Self::Overlap { first, second }, En) => {
+                format!("the ranges of edits {first} and {second} overlap")
+            }
+            (Self::VersionMismatch { expected, actual }, Ja) => {
+                format!("文書の版が違う（指定 {expected} / 現在 {actual}）")
+            }
+            (Self::VersionMismatch { expected, actual }, En) => {
+                format!("document version mismatch (expected {expected} / current {actual})")
+            }
+        }
+    }
 }
 
 /// 書き換えの組を当てた結果（#1683）
@@ -2589,10 +2808,7 @@ impl TextBuffer {
     fn save_inner(&mut self, overwrite: bool) -> Result<(), TextEditError> {
         match std::fs::metadata(&self.path) {
             Ok(metadata) if metadata.permissions().readonly() => {
-                return Err(TextEditError::Write(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "読み取り専用ファイル",
-                )));
+                return Err(TextEditError::ReadOnly);
             }
             Ok(_) => {
                 let current = std::fs::read(&self.path).map_err(TextEditError::Read)?;
@@ -2681,15 +2897,10 @@ impl TextBuffer {
             Some(bytes.len() as u64),
             text.lines().count(),
         ) {
-            return Err(TextEditError::NotEditable(format!(
-                "ディスクの中身が編集できる上限を超えるため読み直せない: {}",
-                limit.detail_ja()
-            )));
+            return Err(TextEditError::NotEditable(NotEditable::OverLimit(limit)));
         }
         if text.contains('\0') {
-            return Err(TextEditError::NotEditable(
-                "バイナリファイルは編集できない".into(),
-            ));
+            return Err(TextEditError::NotEditable(NotEditable::Binary));
         }
         if text != self.text {
             let line_ending = LineEnding::detect(text).unwrap_or(self.line_ending);
@@ -3335,7 +3546,7 @@ mod tests {
         std::fs::set_permissions(&path, permissions).unwrap();
         let mut buffer = TextBuffer::open(&path).unwrap();
         buffer.set_text("after".into());
-        assert!(matches!(buffer.save(), Err(TextEditError::Write(_))));
+        assert!(matches!(buffer.save(), Err(TextEditError::ReadOnly)));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
         #[cfg(unix)]
         {

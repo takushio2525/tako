@@ -332,7 +332,11 @@ echo "== ⑥ A/B: TAKO_1950_LEGACY=1 では .ino が解決できない（#1950 �
 start_gui "$TMP/app-1950legacy.log" TAKO_1950_LEGACY=1 || exit 1
 L6="$(list "$FIX/Blink/Blink.ino")"
 printf '%s\n' "$L6" | head -2 | sed 's/^/    | /'
-check_has "⑥ 旧挙動は「実行コマンドが見つからない」" "実行コマンドが見つからない" "$L6"
+# 理由の文は表示言語に従う（#2365）ので英語表示の文も受ける
+case "$L6" in
+  *"実行コマンドが見つからない"*|*"run command not found"*) pass "⑥ 旧挙動は「実行コマンドが見つからない」" ;;
+  *) fail "⑥ 旧挙動は「実行コマンドが見つからない」（'実行コマンドが見つからない' が無い）" ;;
+esac
 stop_gui
 
 echo

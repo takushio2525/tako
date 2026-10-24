@@ -387,7 +387,9 @@ fn 重なった答えは当てずに理由を返す() {
         .format(&request(&path, UNFORMATTED, None))
         .unwrap_err();
     assert!(
-        matches!(&error, FormatError::InvalidEdits { detail, .. } if detail.contains("重なって")),
+        // 理由の文は表示言語に従う（#2365）
+        matches!(&error, FormatError::InvalidEdits { detail, .. }
+            if detail.contains("重なって") || detail.contains("overlap")),
         "{error:?}"
     );
     assert_eq!(error.to_json()["status"], json!("invalid-edits"));

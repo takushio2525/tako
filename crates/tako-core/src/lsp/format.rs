@@ -107,9 +107,20 @@ pub enum ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotArray => write!(f, "TextEdit の配列ではない"),
-            Self::Malformed { index } => write!(f, "{index} 番目の TextEdit の形が違う"),
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl ParseError {
+    /// 表示言語を明示しての文言（#2365。`TextEditError::text_in` と同じ形）。
+    /// 日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NotArray, Ja) => "TextEdit の配列ではない".to_string(),
+            (Self::NotArray, En) => "not an array of TextEdit".to_string(),
+            (Self::Malformed { index }, Ja) => format!("{index} 番目の TextEdit の形が違う"),
+            (Self::Malformed { index }, En) => format!("TextEdit {index} is malformed"),
         }
     }
 }

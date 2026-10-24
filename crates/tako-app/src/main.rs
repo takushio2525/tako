@@ -74927,10 +74927,17 @@ mod self_test {
                 );
                 let trash_ok = trash_notice
                     .as_deref()
-                    .is_some_and(|t| t.contains("gone.txt") && t.contains("パスが存在しない"));
+                    .is_some_and(|t| {
+                        // 理由の文は表示言語に従う（#2365）
+                        t.contains("gone.txt")
+                            && (t.contains("パスが存在しない") || t.contains("path does not exist"))
+                    });
                 let rename_ok = rename_notice
                     .as_deref()
-                    .is_some_and(|t| t.contains("taken.txt") && t.contains("既に存在する"));
+                    .is_some_and(|t| {
+                        t.contains("taken.txt")
+                            && (t.contains("既に存在する") || t.contains("already exists"))
+                    });
                 let kept_ok = kept_text.as_deref() == Some("taken.txt");
                 check(trash_ok, "ツリー: ごみ箱移動の失敗が通知欄へ出る（#1399）");
                 check(

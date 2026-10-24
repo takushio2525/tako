@@ -29,6 +29,13 @@
 #                 不明なツール・同時に指定できない 2 つ）
 #      badtype-caller  MCP の前段の型の断りを、呼び出し元ペインが決まっているブリッジで引き出す
 #                 （#2358 のブリッジは呼び出し元が決まると表示言語を設定から決めなかった）
+#   #2365 の 2 本目で次も足した（dispatch が理由の文へそのまま載せる tako-core のエラー型）:
+#      rangeout   編集中の文書の外の行を置き換える（RangeEditError::LineOutOfRange）
+#      version    版の違う置き換え（RangeEditError::VersionMismatch）
+#      nocomment  コメント記号の無い形式の行コメント（LineOpError::NoCommentSyntax）
+#      cardempty  空白だけのコマンドのカード（CommandCardError::EmptyCommand）
+#      nocmds     コマンドの無いカード（MCP。CommandCardError::NoCommands）
+#      norun      実行コマンドの決まらないファイルの実行（RunnerError::NoCommand）
 #   ① 英語表示: どの出力にも日本語（かな・漢字）が混ざらない
 #   ② 日本語表示: 日本語の前置きで返る（修正前とのバイト一致は TAKO_1762_KEEP の出力を突き合わせる）
 #   ③ GUI を経由しない CLI の直呼び（`tako orchestrator layout` / `projects remove`）も、前置きと
@@ -256,6 +263,30 @@ if new:
   echo "$mcp" > "$DIR/together.mcperr"
   mcp="$(MCP_CALLER="${first:-0}" mcp_call tako_scroll_pane '{"pane":"x","to":0}' "$DIR/badtype-caller.mcp")"
   echo "$mcp" > "$DIR/badtype-caller.mcperr"
+  # #2365 の 2 本目: tako-core のエラー型（編集・行操作・カード・Code Runner）。
+  # 編集のペインは新しいタブに開く（ここまでのタブ 1 つ・ペイン 1 つの前提のケースは撃ち終えている）
+  printf 'plain\n' > "$base/plain.txt"
+  printf 'plain\n' > "$base/norun.zzz2365"
+  edit="$("$TAKO_BIN" open "$base/plain.txt" --pane "${first:-0}" --new-tab 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("pane", ""))' 2>/dev/null)"
+  if [ -n "$edit" ] && "$TAKO_BIN" edit start --pane "$edit" > /dev/null 2>&1; then
+    cli_case rangeout edit replace-range 99:0 99:0 x --pane "$edit"
+    cli_case version edit replace-range 1:0 1:0 x --expect-version 999 --pane "$edit"
+    cli_case nocomment edit line toggle-comment --pane "$edit"
+    mcp="$(mcp_call tako_preview_edit_range "{\"pane\":${edit},\"start_line\":99,\"end_line\":99,\"text\":\"x\"}" "$DIR/rangeout.mcp")"
+    echo "$mcp" > "$DIR/rangeout.mcperr"
+    mcp="$(mcp_call tako_preview_edit "{\"pane\":${edit},\"command\":\"line-toggle-comment\"}" "$DIR/nocomment.mcp")"
+    echo "$mcp" > "$DIR/nocomment.mcperr"
+  else
+    for name in rangeout version nocomment; do
+      echo "編集のペインを開けない" > "$DIR/$name.cli"
+      echo "?" > "$DIR/$name.rc"
+    done
+  fi
+  cli_case cardempty show-command --pane "${first:-0}" "   "
+  mcp="$(mcp_call tako_show_command "{\"pane\":${first:-0},\"commands\":[]}" "$DIR/nocmds.mcp")"
+  echo "$mcp" > "$DIR/nocmds.mcperr"
+  cli_case norun run "$base/norun.zzz2365"
 
   mcp="$(mcp_call tako_theme '{"action":"set-color","key":"accent","value":"#zz"}' "$DIR/invalid.mcp")"
   echo "$mcp" > "$DIR/invalid.mcperr"
@@ -290,7 +321,9 @@ judge() {
     "$DIR"/nowindow.cli "$DIR"/notpreview.cli "$DIR"/nodir.cli "$DIR"/noscroll.cli \
     "$DIR"/noquery.cli "$DIR"/policy.cli "$DIR"/noproject.cli "$DIR"/nowindow.mcp \
     "$DIR"/notpreview.mcp "$DIR"/unknownparam.mcp "$DIR"/badtype.mcp "$DIR"/unknowntool.mcp \
-    "$DIR"/together.mcp "$DIR"/badtype-caller.mcp; do
+    "$DIR"/together.mcp "$DIR"/badtype-caller.mcp \
+    "$DIR"/rangeout.cli "$DIR"/version.cli "$DIR"/nocomment.cli "$DIR"/cardempty.cli \
+    "$DIR"/norun.cli "$DIR"/rangeout.mcp "$DIR"/nocomment.mcp "$DIR"/nocmds.mcp; do
     name="$(basename "$f")"
     [ -f "$f" ] || { fail "$label $name が無い"; continue; }
     echo "      $label $name: $(head -c 240 "$f" | tr '\n' ' ')"
@@ -315,7 +348,9 @@ judge() {
           | *"リサイズできる分割がない"* | *"は閉じられない"* | *"自分自身の隣へは移動できない"* \
           | *"対象ペインを特定できない"* | *"プレビューペインではない"* | *"ディレクトリが存在しない"* \
           | *"を指定する"* | *"未知のパラメータ"* | *"で指定する"* | *"不明なツール"* \
-          | *"同時に指定しない"*)
+          | *"同時に指定しない"* | *"文書の範囲外"* | *"文書の版が違う"* \
+          | *"コメント記号を知らない"* | *"空のコマンドは提示できない"* \
+          | *"コマンドが 1 件も指定されていない"*)
           pass "$label $name は日本語の前置き" ;;
         *) fail "$label $name に日本語の前置きが無い" ;;
       esac

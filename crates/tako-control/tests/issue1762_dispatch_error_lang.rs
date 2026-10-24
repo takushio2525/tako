@@ -17,6 +17,8 @@
 //! #2365 で、dispatch と前段（CLI / MCP の引数の組み立て）が自分で組む理由の文（`Reason`）と
 //! `orchestrator layout` の値の断り（`tako_core::LayoutParamError`）にも広げた（下半分）。
 //! こちらは落ちたときに、日英の対を書いたソースの行（`file:line`）も名指しする。
+//! #2365 の 2 本目で、dispatch が理由の文へそのまま載せる tako-core のエラー型（編集・
+//! ターミナル・Code Runner・コマンドカード・器・LSP の答えの読み）にも広げた（末尾）。
 //!
 //! このファイルは**独立したテストバイナリ**で、言語グローバルを触るのは
 //! `display_follows_the_display_language` の 1 本だけ（ほかは `text_in` で言語を引数に渡す）。
@@ -163,6 +165,15 @@ fn display_follows_the_display_language() {
         }
         for e in layout_samples() {
             assert_eq!(e.to_string(), e.text_in(lang), "{e:?} / {lang:?}");
+        }
+        // #2365 の 2 本目: dispatch が理由の文へ載せる tako-core のエラー型も同じグローバルを引く
+        for c in core_cases() {
+            assert_eq!(
+                c.value.to_string(),
+                c.value.text(lang),
+                "{:?} / {lang:?}",
+                c.value
+            );
         }
         // dispatch は tako-core の断りを `op_err`（= `Operation(e.to_string())`）で包む。
         // 包んだ表示は理由の文そのもの（前置きは足さない）で、表示言語は 1 つにそろう
@@ -654,7 +665,8 @@ fn variant_name(debug: &str) -> &str {
 ///
 /// 腕は 1 行（`(Self::Missing(key), En) =>`）でも複数行（`Self::UnknownParams { … },` の
 /// 次の行に `En,`）でもよい。`=>` までの間に言語の印があるものを採る。
-/// 全言語を 1 本で受ける腕（`(Self::TabNotFound(id), lang)`）はどの言語でも当たる
+/// 全言語を 1 本で受ける腕（`(Self::TabNotFound(id), lang)` / `(Self::Operation(m), _)`）は
+/// どの言語でも当たる
 fn arm_line(src: &str, from: &str, variant: &str, lang: Lang) -> Option<usize> {
     let token = match lang {
         Lang::Ja => "Ja",
@@ -686,6 +698,7 @@ fn arm_line(src: &str, from: &str, variant: &str, lang: Lang) -> Option<usize> {
             format!("{token},\n"),
             format!(", {token} |"),
             ", lang)".to_string(),
+            ", _)".to_string(),
         ];
         if marks.iter().any(|m| window.contains(m.as_str())) {
             return Some(i + 1);
@@ -878,4 +891,670 @@ fn 理由の文の境界() {
             E::TabNotFound(7).text_in(lang)
         );
     }
+}
+
+// ---- #2365 の 2 本目: dispatch が理由の文へそのまま載せる tako-core のエラー型 ----
+//
+// 編集（TextEdit / RangeEdit / Changes / LineOp）・ターミナル（Session）・Code Runner（Runner）・
+// コマンドカード（CommandCard）・器（Backend と InvalidSession の理由）・LSP の答えの読み
+// （format / rename の ParseError）。どれも `text_in` の (バリアント, 言語) の網羅 match で、
+// 落ちたら日英の対を書いたソースの行（`file:line`）を名指しする
+
+use tako_core::backend::{BackendError, InvalidSessionReason};
+use tako_core::command_card::CommandCardError;
+use tako_core::lsp::{
+    format::ParseError as FormatParseError, rename::ParseError as RenameParseError,
+};
+use tako_core::preview_limit::Truncation;
+use tako_core::runner::RunnerError;
+use tako_core::terminal::SessionError;
+use tako_core::text_edit::{ChangesError, LineOpError, NotEditable, RangeEditError, TextEditError};
+
+/// 型ごとの `text_in` を 1 つの口で呼ぶ（`InvalidSessionReason::text_in` だけ `&str` を返す）
+trait Bilingual: std::fmt::Debug + std::fmt::Display {
+    fn text(&self, lang: Lang) -> String;
+}
+
+macro_rules! bilingual {
+    ($($t:ty),* $(,)?) => {
+        $(impl Bilingual for $t {
+            fn text(&self, lang: Lang) -> String {
+                self.text_in(lang).to_string()
+            }
+        })*
+    };
+}
+
+bilingual!(
+    TextEditError,
+    RangeEditError,
+    ChangesError,
+    LineOpError,
+    SessionError,
+    RunnerError,
+    CommandCardError,
+    BackendError,
+    InvalidSessionReason,
+    FormatParseError,
+    RenameParseError,
+);
+
+/// 1 つの断りの見本
+struct CoreCase {
+    value: Box<dyn Bilingual>,
+    /// 日英の対を書いたソース（`include_str!`）とその repo 相対パス
+    src: &'static str,
+    path: &'static str,
+    /// `text_in` を持つ `impl` の行（腕はここから下で探す）
+    from: &'static str,
+    /// 腕の頭の `Self::` の後ろ（`ZeroLine` / `NotEditable(NotEditable::Binary`）
+    arm: &'static str,
+    /// #2365 より前の固定文（見本の値で展開したもの）
+    old_ja: &'static str,
+    /// 作り手が組んだ文をそのまま出す腕（日英が同じ文になる）
+    passthrough: bool,
+}
+
+const TEXT_EDIT_SRC: &str = include_str!("../../tako-core/src/text_edit.rs");
+const TEXT_EDIT_PATH: &str = "crates/tako-core/src/text_edit.rs";
+const LINE_OPS_SRC: &str = include_str!("../../tako-core/src/text_edit/line_ops.rs");
+const LINE_OPS_PATH: &str = "crates/tako-core/src/text_edit/line_ops.rs";
+const TERMINAL_SRC: &str = include_str!("../../tako-core/src/terminal.rs");
+const TERMINAL_PATH: &str = "crates/tako-core/src/terminal.rs";
+const RUNNER_SRC: &str = include_str!("../../tako-core/src/runner.rs");
+const RUNNER_PATH: &str = "crates/tako-core/src/runner.rs";
+const CARD_SRC: &str = include_str!("../../tako-core/src/command_card.rs");
+const CARD_PATH: &str = "crates/tako-core/src/command_card.rs";
+const BACKEND_SRC: &str = include_str!("../../tako-core/src/backend/mod.rs");
+const BACKEND_PATH: &str = "crates/tako-core/src/backend/mod.rs";
+const LSP_FORMAT_SRC: &str = include_str!("../../tako-core/src/lsp/format.rs");
+const LSP_FORMAT_PATH: &str = "crates/tako-core/src/lsp/format.rs";
+const LSP_RENAME_SRC: &str = include_str!("../../tako-core/src/lsp/rename.rs");
+const LSP_RENAME_PATH: &str = "crates/tako-core/src/lsp/rename.rs";
+
+// 型ごとの通し番号（網羅 match = バリアントを足すとここがコンパイルで落ち、
+// [`core_cases`] へ見本と旧文を足すまで通らない）
+
+fn text_edit_index(e: &TextEditError) -> usize {
+    match e {
+        TextEditError::Read(_) => 0,
+        TextEditError::InvalidUtf8 => 1,
+        TextEditError::ExternalChanged => 2,
+        TextEditError::ExternalDeleted => 3,
+        TextEditError::NotEditable(NotEditable::OverLimit(_)) => 4,
+        TextEditError::NotEditable(NotEditable::Binary) => 5,
+        TextEditError::ReadOnly => 6,
+        TextEditError::Write(_) => 7,
+    }
+}
+
+fn range_edit_index(e: &RangeEditError) -> usize {
+    match e {
+        RangeEditError::ZeroLine => 0,
+        RangeEditError::LineOutOfRange { .. } => 1,
+        RangeEditError::ColumnOutOfRange { .. } => 2,
+        RangeEditError::NotCharBoundary { .. } => 3,
+        RangeEditError::InvertedRange { .. } => 4,
+        RangeEditError::VersionMismatch { .. } => 5,
+        RangeEditError::Changes(_) => 6,
+        RangeEditError::NoPrimaryRange { .. } => 7,
+    }
+}
+
+fn changes_index(e: &ChangesError) -> usize {
+    match e {
+        ChangesError::OutOfBounds { .. } => 0,
+        ChangesError::Inverted { .. } => 1,
+        ChangesError::NotCharBoundary { .. } => 2,
+        ChangesError::Overlap { .. } => 3,
+        ChangesError::VersionMismatch { .. } => 4,
+    }
+}
+
+fn line_op_index(e: &LineOpError) -> usize {
+    match e {
+        LineOpError::NoCommentSyntax { .. } => 0,
+    }
+}
+
+fn session_index(e: &SessionError) -> usize {
+    match e {
+        SessionError::Pty(_) => 0,
+        SessionError::EventLoop(_) => 1,
+    }
+}
+
+fn runner_index(e: &RunnerError) -> usize {
+    match e {
+        RunnerError::NoCommand(_) => 0,
+        RunnerError::ProfileNotFound(_) => 1,
+        RunnerError::CwdNotFound(_) => 2,
+    }
+}
+
+fn card_index(e: &CommandCardError) -> usize {
+    match e {
+        CommandCardError::NoCommands => 0,
+        CommandCardError::EmptyCommand { .. } => 1,
+        CommandCardError::CommandTooLong { .. } => 2,
+        CommandCardError::ControlCharacter { .. } => 3,
+        CommandCardError::TooManyCommands { .. } => 4,
+        CommandCardError::LabelTooLong { .. } => 5,
+        CommandCardError::CardNotFound { .. } => 6,
+        CommandCardError::IndexOutOfRange { .. } => 7,
+        CommandCardError::StillRunning { .. } => 8,
+    }
+}
+
+fn backend_index(e: &BackendError) -> usize {
+    match e {
+        BackendError::Unsupported { .. } => 0,
+        BackendError::InvalidSession { .. } => 1,
+        BackendError::Operation(_) => 2,
+    }
+}
+
+fn invalid_session_index(r: &InvalidSessionReason) -> usize {
+    match r {
+        InvalidSessionReason::Empty => 0,
+        InvalidSessionReason::TargetExpression => 1,
+        InvalidSessionReason::Whitespace => 2,
+        InvalidSessionReason::NotOurs => 3,
+    }
+}
+
+fn format_parse_index(e: &FormatParseError) -> usize {
+    match e {
+        FormatParseError::NotArray => 0,
+        FormatParseError::Malformed { .. } => 1,
+    }
+}
+
+fn rename_parse_index(e: &RenameParseError) -> usize {
+    match e {
+        RenameParseError::NotObject => 0,
+        RenameParseError::MalformedChange { .. } => 1,
+        RenameParseError::MalformedChanges => 2,
+    }
+}
+
+fn io(kind: std::io::ErrorKind, message: &str) -> std::io::Error {
+    std::io::Error::new(kind, message.to_string())
+}
+
+/// 型ごとの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
+fn text_edit_samples() -> Vec<TextEditError> {
+    vec![
+        TextEditError::Read(io(std::io::ErrorKind::NotFound, "gone")),
+        TextEditError::InvalidUtf8,
+        TextEditError::ExternalChanged,
+        TextEditError::ExternalDeleted,
+        TextEditError::NotEditable(NotEditable::OverLimit(Truncation::Lines { lines: 300_000 })),
+        TextEditError::NotEditable(NotEditable::Binary),
+        TextEditError::ReadOnly,
+        TextEditError::Write(io(std::io::ErrorKind::Other, "disk full")),
+    ]
+}
+
+fn range_edit_samples() -> Vec<RangeEditError> {
+    vec![
+        RangeEditError::ZeroLine,
+        RangeEditError::LineOutOfRange { line: 9, total: 3 },
+        RangeEditError::ColumnOutOfRange {
+            line: 2,
+            column: 8,
+            length: 5,
+        },
+        RangeEditError::NotCharBoundary { line: 1, column: 2 },
+        RangeEditError::InvertedRange {
+            start_line: 3,
+            start_column: 4,
+            end_line: 1,
+            end_column: 2,
+        },
+        RangeEditError::VersionMismatch {
+            expected: 5,
+            actual: 6,
+        },
+        RangeEditError::Changes(ChangesError::Overlap {
+            first: 1,
+            second: 2,
+        }),
+        RangeEditError::NoPrimaryRange {
+            primary: 3,
+            count: 2,
+        },
+    ]
+}
+
+fn changes_samples() -> Vec<ChangesError> {
+    vec![
+        ChangesError::OutOfBounds {
+            index: 2,
+            start: 10,
+            end: 20,
+            len: 5,
+        },
+        ChangesError::Inverted {
+            index: 1,
+            start: 9,
+            end: 3,
+        },
+        ChangesError::NotCharBoundary { index: 4 },
+        ChangesError::Overlap {
+            first: 1,
+            second: 2,
+        },
+        ChangesError::VersionMismatch {
+            expected: 5,
+            actual: 6,
+        },
+    ]
+}
+
+fn card_samples() -> Vec<CommandCardError> {
+    vec![
+        CommandCardError::NoCommands,
+        CommandCardError::EmptyCommand { index: 2 },
+        CommandCardError::CommandTooLong {
+            index: 1,
+            len: 5000,
+            max: 4096,
+        },
+        CommandCardError::ControlCharacter { index: 3 },
+        CommandCardError::TooManyCommands { len: 11, max: 10 },
+        CommandCardError::LabelTooLong { len: 201, max: 200 },
+        CommandCardError::CardNotFound { id: 4 },
+        CommandCardError::IndexOutOfRange { index: 5, len: 1 },
+        CommandCardError::StillRunning { index: 1, pane: 31 },
+    ]
+}
+
+const INVALID_SESSION_REASONS: [InvalidSessionReason; 4] = [
+    InvalidSessionReason::Empty,
+    InvalidSessionReason::TargetExpression,
+    InvalidSessionReason::Whitespace,
+    InvalidSessionReason::NotOurs,
+];
+
+/// 全型の見本と、#2365 より前の固定文（`#[error(...)]` / `write!` の書式を見本の値で展開したもの）
+fn core_cases() -> Vec<CoreCase> {
+    fn case(
+        value: impl Bilingual + 'static,
+        (src, path, from): (&'static str, &'static str, &'static str),
+        arm: &'static str,
+        old_ja: &'static str,
+    ) -> CoreCase {
+        CoreCase {
+            value: Box::new(value),
+            src,
+            path,
+            from,
+            arm,
+            old_ja,
+            passthrough: false,
+        }
+    }
+    let text_edit = (TEXT_EDIT_SRC, TEXT_EDIT_PATH, "impl TextEditError {");
+    let range = (TEXT_EDIT_SRC, TEXT_EDIT_PATH, "impl RangeEditError {");
+    let changes = (TEXT_EDIT_SRC, TEXT_EDIT_PATH, "impl ChangesError {");
+    let line_op = (LINE_OPS_SRC, LINE_OPS_PATH, "impl LineOpError {");
+    let session = (TERMINAL_SRC, TERMINAL_PATH, "impl SessionError {");
+    let runner = (RUNNER_SRC, RUNNER_PATH, "impl RunnerError {");
+    let card = (CARD_SRC, CARD_PATH, "impl CommandCardError {");
+    let backend = (BACKEND_SRC, BACKEND_PATH, "impl BackendError {");
+    let reason = (BACKEND_SRC, BACKEND_PATH, "impl InvalidSessionReason {");
+    let format = (LSP_FORMAT_SRC, LSP_FORMAT_PATH, "impl ParseError {");
+    let rename = (LSP_RENAME_SRC, LSP_RENAME_PATH, "impl ParseError {");
+
+    let text_edit_arms: [(&str, &str); 8] = [
+        ("Read", "ファイルを読み込めない: gone"),
+        ("InvalidUtf8", "UTF-8 テキストではないため編集できない"),
+        (
+            "ExternalChanged",
+            "ファイルが外部で変更されたため保存しなかった",
+        ),
+        ("ExternalDeleted", "ファイルが外部で削除されている"),
+        (
+            "NotEditable(NotEditable::OverLimit",
+            "ディスクの中身が編集できる上限を超えるため読み直せない: 300,000 行（上限 100,000 行）",
+        ),
+        (
+            "NotEditable(NotEditable::Binary",
+            "バイナリファイルは編集できない",
+        ),
+        // #2365 より前は `Write(io::Error::new(PermissionDenied, "読み取り専用ファイル"))`
+        ("ReadOnly", "ファイルへ保存できない: 読み取り専用ファイル"),
+        ("Write", "ファイルへ保存できない: disk full"),
+    ];
+    let range_arms: [(&str, &str); 8] = [
+        ("ZeroLine", "行は 1 始まり（0 行目は無い）"),
+        ("LineOutOfRange", "行 9 は文書の範囲外（全 3 行）"),
+        ("ColumnOutOfRange", "行 2 桁 8 は行の長さ 5 を超えている"),
+        ("NotCharBoundary", "行 1 桁 2 は文字の途中を指している"),
+        ("InvertedRange", "範囲の終わり 1:2 が始まり 3:4 より前"),
+        ("VersionMismatch", "文書の版が違う（指定 5 / 現在 6）"),
+        ("Changes", "1 番目と 2 番目の編集の範囲が重なっている"),
+        (
+            "NoPrimaryRange",
+            "置き換える範囲が無いか、カーソルを置く範囲の番号 3 が外（2 件）",
+        ),
+    ];
+    let changes_arms: [(&str, &str); 5] = [
+        (
+            "OutOfBounds",
+            "2 番目の編集の範囲 10..20 が本文（5 バイト）の外",
+        ),
+        (
+            "Inverted",
+            "1 番目の編集の範囲 9..3 は始まりが終わりより後ろ",
+        ),
+        (
+            "NotCharBoundary",
+            "4 番目の編集の範囲が文字の途中を指している",
+        ),
+        ("Overlap", "1 番目と 2 番目の編集の範囲が重なっている"),
+        ("VersionMismatch", "文書の版が違う（指定 5 / 現在 6）"),
+    ];
+    let card_arms: [(&str, &str); 9] = [
+        ("NoCommands", "コマンドが 1 件も指定されていない"),
+        ("EmptyCommand", "空のコマンドは提示できない（2 件目）"),
+        ("CommandTooLong", "コマンドが長すぎる（1 件目: 5000 バイト > 上限 4096）"),
+        (
+            "ControlCharacter",
+            "コマンドに制御文字が含まれている（3 件目。改行とタブ以外は不可）",
+        ),
+        (
+            "TooManyCommands",
+            "1 カードに載せられるコマンドは 10 件まで（指定: 11 件）",
+        ),
+        ("LabelTooLong", "ラベルが長すぎる（201 文字 > 上限 200）"),
+        ("CardNotFound", "カードが見つからない（id=4）"),
+        (
+            "IndexOutOfRange",
+            "コマンド番号が範囲外（指定: 5、このカードは 1〜1）",
+        ),
+        (
+            "StillRunning",
+            "このコマンドはまだ実行中（1 件目・ペイン 31）。終わるか、そのペインを閉じてからもう一度実行する",
+        ),
+    ];
+    let reason_arms: [(&str, &str); 4] = [
+        ("Empty", "セッション名が空"),
+        (
+            "TargetExpression",
+            "tmux のターゲット式（session:window.pane）はセッション名として使えない",
+        ),
+        ("Whitespace", "セッション名に空白・制御文字は使えない"),
+        ("NotOurs", "tako が作った器ではない（接頭辞が一致しない）"),
+    ];
+
+    let mut out = Vec::new();
+    for e in text_edit_samples() {
+        let (arm, old) = text_edit_arms[text_edit_index(&e)];
+        out.push(case(e, text_edit, arm, old));
+    }
+    for e in range_edit_samples() {
+        let (arm, old) = range_arms[range_edit_index(&e)];
+        out.push(case(e, range, arm, old));
+    }
+    for e in changes_samples() {
+        let (arm, old) = changes_arms[changes_index(&e)];
+        out.push(case(e, changes, arm, old));
+    }
+    let e = LineOpError::NoCommentSyntax {
+        name: "notes.txt".into(),
+    };
+    let _ = line_op_index(&e);
+    out.push(case(
+        e,
+        line_op,
+        "NoCommentSyntax",
+        "notes.txt のコメント記号を知らない（コメントの記号を持たない形式）",
+    ));
+    for e in [
+        SessionError::Pty(io(std::io::ErrorKind::Other, "openpty")),
+        SessionError::EventLoop(io(std::io::ErrorKind::Other, "spawn")),
+    ] {
+        let (arm, old) = [
+            ("Pty", "PTY の生成に失敗した"),
+            ("EventLoop", "PTY IO スレッドの起動に失敗した"),
+        ][session_index(&e)];
+        out.push(case(e, session, arm, old));
+    }
+    for e in [
+        RunnerError::NoCommand("hint".into()),
+        RunnerError::ProfileNotFound("build".into()),
+        RunnerError::CwdNotFound("/tmp/x".into()),
+    ] {
+        let (arm, old) = [
+            ("NoCommand", "実行コマンドが見つからない: hint"),
+            (
+                "ProfileNotFound",
+                "指定されたプロファイル 'build' はファイル内に宣言されていない",
+            ),
+            ("CwdNotFound", "cwd が存在しない: /tmp/x"),
+        ][runner_index(&e)];
+        out.push(case(e, runner, arm, old));
+    }
+    for e in card_samples() {
+        let (arm, old) = card_arms[card_index(&e)];
+        out.push(case(e, card, arm, old));
+    }
+    for e in [
+        BackendError::Unsupported {
+            note: "no detach".into(),
+        },
+        BackendError::InvalidSession {
+            name: "tako-abc:0.0".into(),
+            reason: InvalidSessionReason::TargetExpression,
+        },
+        BackendError::Operation("tmux: no server".into()),
+    ] {
+        let i = backend_index(&e);
+        let (arm, old) = [
+            ("Unsupported", "no detach"),
+            (
+                "InvalidSession",
+                "セッション名として不正（tako-abc:0.0）: tmux のターゲット式（session:window.pane）はセッション名として使えない",
+            ),
+            ("Operation", "tmux: no server"),
+        ][i];
+        let mut c = case(e, backend, arm, old);
+        c.passthrough = i != 1;
+        out.push(c);
+    }
+    for r in INVALID_SESSION_REASONS {
+        let (arm, old) = reason_arms[invalid_session_index(&r)];
+        out.push(case(r, reason, arm, old));
+    }
+    for e in [
+        FormatParseError::NotArray,
+        FormatParseError::Malformed { index: 2 },
+    ] {
+        let (arm, old) = [
+            ("NotArray", "TextEdit の配列ではない"),
+            ("Malformed", "2 番目の TextEdit の形が違う"),
+        ][format_parse_index(&e)];
+        out.push(case(e, format, arm, old));
+    }
+    for e in [
+        RenameParseError::NotObject,
+        RenameParseError::MalformedChange { index: 3 },
+        RenameParseError::MalformedChanges,
+    ] {
+        let (arm, old) = [
+            ("NotObject", "WorkspaceEdit ではない"),
+            ("MalformedChange", "documentChanges の 3 番目の形が違う"),
+            ("MalformedChanges", "changes の値が TextEdit の配列ではない"),
+        ][rename_parse_index(&e)];
+        out.push(case(e, rename, arm, old));
+    }
+    out
+}
+
+/// 落ちたときに添える「日英の対を書いた行」
+fn core_where(c: &CoreCase, lang: Lang) -> String {
+    match arm_line(c.src, c.from, c.arm, lang) {
+        Some(line) => format!("{}:{line}", c.path),
+        None => format!("{}（{} の腕が見つからない）", c.path, c.arm),
+    }
+}
+
+#[test]
+fn core_のエラー型の見本は全バリアントを1つずつ持つ() {
+    covers_all(&text_edit_samples(), text_edit_index, 8);
+    covers_all(&range_edit_samples(), range_edit_index, 8);
+    covers_all(&changes_samples(), changes_index, 5);
+    covers_all(&card_samples(), card_index, 9);
+    covers_all(&INVALID_SESSION_REASONS, invalid_session_index, 4);
+    // 1 つずつ並べた型（LineOp / Session / Runner / Backend / ParseError 2 種）は
+    // 見本の数を網羅 match の通し番号の数とそろえる
+    let cases = core_cases();
+    let count = |from: &str, path: &str| {
+        cases
+            .iter()
+            .filter(|c| c.from == from && c.path == path)
+            .count()
+    };
+    assert_eq!(count("impl LineOpError {", LINE_OPS_PATH), 1);
+    assert_eq!(count("impl SessionError {", TERMINAL_PATH), 2);
+    assert_eq!(count("impl RunnerError {", RUNNER_PATH), 3);
+    assert_eq!(count("impl BackendError {", BACKEND_PATH), 3);
+    assert_eq!(count("impl ParseError {", LSP_FORMAT_PATH), 2);
+    assert_eq!(count("impl ParseError {", LSP_RENAME_PATH), 3);
+}
+
+#[test]
+fn core_のエラー型が日英を持ち英語に日本語が混ざらない() {
+    for c in core_cases() {
+        let debug = format!("{:?}", c.value);
+        let (ja, en) = (c.value.text(Lang::Ja), c.value.text(Lang::En));
+        let at = |lang| core_where(&c, lang);
+        assert!(
+            !ja.trim().is_empty(),
+            "{debug} の日本語が空（{}）",
+            at(Lang::Ja)
+        );
+        assert!(
+            !en.trim().is_empty(),
+            "{debug} の英語が空（{}）",
+            at(Lang::En)
+        );
+        if let Some(ch) = has_japanese(&en) {
+            panic!(
+                "{debug} の英語に日本語（{ch}）が混ざる: {en}（{}）",
+                at(Lang::En)
+            );
+        }
+        if c.passthrough {
+            assert_eq!(
+                ja,
+                en,
+                "{debug} は作り手の文をそのまま出す（{}）",
+                at(Lang::En)
+            );
+        } else {
+            assert_ne!(ja, en, "{debug} の英語が日本語と同じ文（{}）", at(Lang::En));
+        }
+    }
+}
+
+#[test]
+fn core_のエラー型の日本語は2365より前の固定文とバイト一致() {
+    for c in core_cases() {
+        assert_eq!(
+            c.value.text(Lang::Ja),
+            c.old_ja,
+            "{:?}（{}）",
+            c.value,
+            core_where(&c, Lang::Ja)
+        );
+    }
+}
+
+/// 番犬自身の検査: 全見本の腕の行を日英とも引ける（引けないと名指しが空振りする）
+#[test]
+fn core_のエラー型の腕の行を日英とも引ける() {
+    for c in core_cases() {
+        for lang in [Lang::Ja, Lang::En] {
+            assert!(
+                arm_line(c.src, c.from, c.arm, lang).is_some(),
+                "{:?} / {lang:?}: {} の {} 以降に Self::{} の腕が無い",
+                c.value,
+                c.path,
+                c.from,
+                c.arm
+            );
+        }
+    }
+}
+
+/// 「見つからない」の読み（リモートの 404 寄せ）と「まだ実行中」の読み（リモートの 409 寄せ）は
+/// 日英で同じ当たり方をする
+#[test]
+fn core_のエラー型の見つからないと実行中の読みは日英で同じ() {
+    for c in core_cases() {
+        let (ja, en) = (c.value.text(Lang::Ja), c.value.text(Lang::En));
+        assert_eq!(
+            E::says_not_found(&ja),
+            E::says_not_found(&en),
+            "{:?}: {ja} / {en}（{}）",
+            c.value,
+            core_where(&c, Lang::En)
+        );
+        assert_eq!(
+            CommandCardError::says_still_running(&ja),
+            CommandCardError::says_still_running(&en),
+            "{:?}: {ja} / {en}（{}）",
+            c.value,
+            core_where(&c, Lang::En)
+        );
+    }
+    // 当たるのは見つからない系・実行中だけ（前置きつきで載せても変わらない）
+    for lang in [Lang::Ja, Lang::En] {
+        let gone = CommandCardError::CardNotFound { id: 4 }.text_in(lang);
+        assert!(E::says_not_found(&E::InvalidParams(gone).text_in(lang)));
+        let running = CommandCardError::StillRunning { index: 1, pane: 31 }.text_in(lang);
+        assert!(CommandCardError::says_still_running(
+            &E::Operation(running).text_in(lang)
+        ));
+        let range = CommandCardError::IndexOutOfRange { index: 5, len: 1 }.text_in(lang);
+        assert!(!E::says_not_found(&range) && !CommandCardError::says_still_running(&range));
+    }
+}
+
+/// 境界: 入れ子（RangeEdit の中の Changes）は中の文をそのまま出し、前置きつきの断りへ
+/// 載せても前置きは 1 回だけ。io エラーの原因は `source` で辿れる（表示には足さない）
+#[test]
+fn core_のエラー型の境界() {
+    use std::error::Error as _;
+    for lang in [Lang::Ja, Lang::En] {
+        let inner = ChangesError::Inverted {
+            index: 1,
+            start: 9,
+            end: 3,
+        };
+        let outer = RangeEditError::from(inner.clone());
+        assert_eq!(outer.text_in(lang), inner.text_in(lang));
+        let prefix = E::InvalidParams(String::new()).text_in(lang);
+        let shown = E::InvalidParams(outer.text_in(lang)).text_in(lang);
+        assert_eq!(shown.matches(prefix.as_str()).count(), 1, "{shown}");
+        // 空の名前（InvalidSession の Empty）でも括弧の中が空になるだけで文は崩れない
+        let empty = BackendError::InvalidSession {
+            name: String::new(),
+            reason: InvalidSessionReason::Empty,
+        };
+        assert!(empty
+            .text_in(lang)
+            .ends_with(InvalidSessionReason::Empty.text_in(lang)));
+    }
+    let pty = SessionError::Pty(io(std::io::ErrorKind::Other, "openpty"));
+    assert_eq!(
+        pty.source().map(|s| s.to_string()).as_deref(),
+        Some("openpty")
+    );
+    let read = TextEditError::Read(io(std::io::ErrorKind::NotFound, "gone"));
+    assert!(read.source().is_some());
+    assert!(TextEditError::ReadOnly.source().is_none());
 }
