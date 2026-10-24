@@ -68,7 +68,7 @@ pub fn is_activity(cwd: Option<&Path>, event: &OscEvent) -> bool {
     match event {
         OscEvent::CwdChanged(path) => cwd != Some(path.as_path()),
         OscEvent::Mark(PromptMark::CommandFinished(_)) => true,
-        OscEvent::Mark(_) => false,
+        OscEvent::Mark(_) | OscEvent::ColorSchemeUpdates(_) | OscEvent::ColorSchemeQuery => false,
     }
 }
 

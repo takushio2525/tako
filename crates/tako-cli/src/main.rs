@@ -8102,6 +8102,10 @@ fn print_check_health(result: &Value) {
     if let Some(line) = result.get("fd_limit").and_then(fd_container_line) {
         println!("{line}");
     }
+    // #2350: 端末の問い合わせ（GUI が組んだ 1 行をそのまま出す）
+    if let Some(line) = result["terminal_queries"]["summary"].as_str() {
+        println!("{line}");
+    }
     // #1505: 環境診断の項目。**`tako setup --check` と同じ行**（正本が組んだ文字列を
     // そのまま出すので、2 つのコマンドの答えが字面まで一致する）
     for line in result["diagnostics"]["items"]

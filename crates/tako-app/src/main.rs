@@ -10717,6 +10717,13 @@ impl TakoApp {
             Some(SessionNotice::EncodingPin(event)) => {
                 tako_control::diag::encoding_pin_log(pane_id.as_u64(), &event);
             }
+            // #2350: 色（OSC 10 / 11 / 12 / 4）と明暗（CSI ? 996 n）の問い合わせへ今のテーマで
+            // その場で答える（テーマを切り替えた後の問い合わせには切り替えた後の色。画面は変わらない）
+            Some(SessionNotice::ThemeQuery(query)) => {
+                if let Some(session) = self.terminals.get(&pane_id) {
+                    session.answer_theme_query(query, &self.theme);
+                }
+            }
             None => {}
         }
         // #1657: 実行ペインが終わったら（スクリプトは側路を書いてから案内を出すので、
@@ -13113,13 +13120,28 @@ impl TakoApp {
             }
             // 保存した設定（プリセット・色オーバーライド）を読み直して適用する。
             // 読めない色の警告は dispatch の読み直しと同じ帳簿へ残す（#1763）
-            self.theme = load_theme_logged(&mut self.theme_warning_log);
+            let theme = load_theme_logged(&mut self.theme_warning_log);
+            self.apply_theme(theme);
         } else {
             // 保存していないので settings.json を読み直すと切替が即座に巻き戻る。
             // メモリ上の適用を正とする（セルフテストのテーマ検査が常に失敗していた）
-            self.theme = Theme::for_mode(next);
+            self.apply_theme(Theme::for_mode(next));
         }
         cx.notify();
+    }
+
+    /// テーマを差し替える（**読み込み以外の差し替えはすべてここを通す**。#2350）。
+    /// 端末の問い合わせの答え（前景・背景・カーソル・ANSI 色）が変わるなら、ライト / ダークの
+    /// 通知（mode 2031）を購読しているペインへ知らせる。器（tmux）は知らせを受けて色を
+    /// 問い合わせ直すので、器越しのペインの答えも新しいテーマへ追従する
+    fn apply_theme(&mut self, theme: Theme) {
+        let changed = tako_core::terminal_query::answers_differ(&self.theme, &theme);
+        self.theme = theme;
+        if changed {
+            for session in self.terminals.values() {
+                session.notify_color_scheme_change(&self.theme);
+            }
+        }
     }
 
     /// UI 表示モードのトグル（Issue #694。タブバーのボタン + ⌘K パレット用）。
@@ -25681,12 +25703,13 @@ impl UiStateHost for TakoApp {
         if self.theme.mode == mode {
             return;
         }
-        self.theme = Theme::for_mode(mode);
+        self.apply_theme(Theme::for_mode(mode));
     }
 
     // #1763: 起動時と同じ 1 本を通し、読めない色の警告を persist.log へ残す
     fn reload_theme(&mut self) {
-        self.theme = load_theme_logged(&mut self.theme_warning_log);
+        let theme = load_theme_logged(&mut self.theme_warning_log);
+        self.apply_theme(theme);
     }
 
     // #1820: `tako theme` / MCP `tako_theme` の応答へ、persist.log と同じ帳簿から載せる

@@ -1637,7 +1637,8 @@ pub fn tools() -> Vec<Value> {
             "description": "tako 環境の健全性を診断する。接続直後に呼んで環境に問題がないか確認すること。\
                 チェック項目: tako CLI が PATH に通っているか / CLI とアプリのバージョンが一致するか / \
                 外部ツール（tmux 等）の有無 / セッション永続化の状態 / \
-                tako mod の注入と報告の無い claude ペイン（理由つき）。\
+                tako mod の注入と報告の無い claude ペイン（理由つき）/ \
+                端末の問い合わせ（OSC 11 等）にどう答えるか。\
                 問題がある場合は issue 配列に修正方法の提案を含めて返す。",
             "inputSchema": {
                 "type": "object",
