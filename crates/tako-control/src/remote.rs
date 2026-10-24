@@ -4566,8 +4566,9 @@ fn dispatch_respond(
     match client.request(request) {
         Ok(v) => Ok(v),
         Err(e) => {
-            // ダイアログ不在（解消済み）は接続エラーではないので invalidate しない
-            if e.contains("ダイアログが見つからない") {
+            // ダイアログ不在（解消済み）は接続エラーではないので invalidate しない。
+            // 理由の文は表示言語で日英どちらにもなる（#2365）ので、読み方は 1 実装を通す
+            if crate::dispatch::Reason::says_no_choice_dialog(&e) {
                 return Err((409, e));
             }
             conn.invalidate();

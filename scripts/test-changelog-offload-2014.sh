@@ -315,7 +315,7 @@ cli_arm() {
     wait "$e2" 2>/dev/null
     e2rc="$(cat "$TMP/e2.rc" 2>/dev/null || echo '?')"
     echo "    E2 取っている最中の close: ${took} 秒 / 開く切替: 終了コード ${e2rc} / $(head -c 140 "$TMP/e2.out" | tr '\n' ' ')"
-    if ui_ok "$took" && [ "$e2rc" != "0" ] && [ "$e2rc" != "142" ] && grep -q "プレビューペインではない" "$TMP/e2.out"; then
+    if ui_ok "$took" && [ "$e2rc" != "0" ] && [ "$e2rc" != "142" ] && grep -q "プレビューペインではない\|not a preview pane" "$TMP/e2.out"; then
       pass "E2 取っている最中にペインを閉じられ、要求は理由つきで返る（宙に浮かない）"
     else
       fail "E2 取っている最中の close の結末が想定外（${took} / 終了コード ${e2rc}）"

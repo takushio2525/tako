@@ -131,7 +131,7 @@ pub use dispatch::{
     dispatch, dispatch_orchestrator_accounts, dispatch_orchestrator_layout, fetch_tmux_sessions,
     finish_offload, land_offload, prepare_offload, remote_open_file_fetched, ControlHost,
     DispatchError, LspFormatLanding, LspGotoLanding, NoTargetPaneAt, OffloadContinuation,
-    OffloadJob, OffloadLanding, OffloadOutcome, PinnedView, TmuxContext,
+    OffloadJob, OffloadLanding, OffloadOutcome, PinnedView, Reason, TmuxContext,
 };
 pub use host::{
     cleanup_tmux_servers_default, ChangelogDiffTarget, OrphanCleanupPlan, PreviewConflict,

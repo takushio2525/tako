@@ -181,7 +181,7 @@ check "$(grep -q '上限 2000 件で打ち切り' "$TMP/limit.out" && echo 1)" "
 if tk search '(unclosed' --regex --path "$TREE" > "$TMP/regex.out" 2>&1; then RC=0; else RC=$?; fi
 check "$([ "$RC" -ne 0 ] && grep -q '正規表現として読めない' "$TMP/regex.out" && echo 1)" "壊れた正規表現: 理由つきで失敗（rc=${RC}）"
 if tk search x --path "$TMP/nope" > "$TMP/nope.out" 2>&1; then RC=0; else RC=$?; fi
-check "$([ "$RC" -ne 0 ] && grep -q 'ディレクトリが存在しない' "$TMP/nope.out" && echo 1)" "存在しない範囲: 理由つきで失敗"
+check "$([ "$RC" -ne 0 ] && grep -q 'ディレクトリが存在しない\|directory does not exist' "$TMP/nope.out" && echo 1)" "存在しない範囲: 理由つきで失敗"
 # 読めないファイル + シンボリックリンクのループ（親を指す）
 chmod 000 "$TREE/d000/f000.rs"
 ln -s .. "$TREE/d001/loop"

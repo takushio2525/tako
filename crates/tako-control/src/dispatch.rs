@@ -163,6 +163,367 @@ impl NoTargetPaneAt {
     }
 }
 
+/// dispatch と前段（CLI / MCP の引数の組み立て）が自分で組む理由の文（#2365）。
+///
+/// 表示（`Display`）は表示言語に従い、日英の対は [`Self::text_in`] の 1 か所に置く
+/// （形は [`DispatchError::text_in`] = #1762 と [`NoTargetPaneAt`] = #2358 と同じ）。
+/// dispatch は `InvalidParams` / `Operation` の中身としてこの表示を載せる
+/// （[`Self::invalid`] / [`Self::operation`]）。表示はその時点の表示言語で決まるので、
+/// GUI を経由しない CLI の直呼びは呼ぶ前に表示言語を決めておく（`tako-cli` の `init_local_lang`）。
+///
+/// 「見つからない」系は英語にも ` not found` を含め、[`DispatchError::says_not_found`] の
+/// 当たり方を日英でそろえる（リモートの HTTP 層が 404 へ寄せる判定）。
+/// #2365 で載せたのは利用者が CLI / MCP で目にする頻度の高いものから。
+/// 残り（dispatch の個別の文・tako-core のエラー型）は Issue #2365 の続きで同じ形へ移す
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reason {
+    // ---- 引数の不足・型（MCP の前段と dispatch の検証が共有する） ----
+    /// `<key> を指定する`
+    Missing(String),
+    /// `<key> は必須`
+    Required(String),
+    NotNonNegInt(String),
+    NotInteger(String),
+    NotNumber(String),
+    NotString(String),
+    NotBool(String),
+    ElementNotString(String),
+    NotStringArray(String),
+    NotObject(String),
+    /// 環境変数の object（#1732）の値が文字列でも null でもない。`name` はその変数名
+    EnvValueNotString {
+        key: String,
+        name: String,
+    },
+    /// MCP の `direction` が right / down / left / up のどれでもない
+    InvalidDirection(String),
+    /// 同時に指定できない 2 つ
+    NotTogether(&'static str, &'static str),
+    /// どちらか一方が要る 2 つ（`pane または tab` / `--pane または --tab`）
+    EitherOf(&'static str, &'static str),
+    UnknownTool(String),
+    /// ツールスキーマに無い引数（#227）。`allowed` が空 = 引数を取らないツール
+    UnknownParams {
+        tool: String,
+        unknown: Vec<String>,
+        allowed: Vec<String>,
+    },
+    NoToolName,
+    // ---- 見つからない（英語にも ` not found` を含める） ----
+    SessionLogNotFound(String),
+    PaneLogNotFound(u64),
+    TranscriptNotFound(String),
+    ProjectNotFound(String),
+    /// ID を添えない「ペインが見つからない」
+    PaneGone,
+    /// ID を添えない「タブが見つからない」
+    TabGone,
+    /// [`DispatchError::TabNotFound`] と同じ文を理由の文として載せる
+    TabNotFound(u64),
+    MasterPaneNotFound,
+    BackendSessionNotFound(u64),
+    NoChoiceDialog,
+    ChoiceNotFound {
+        choice: String,
+        labels: String,
+    },
+    PasteTargetNotFound(String),
+    CheckpointNotFound(String),
+    // ---- プレビューペインの種別 ----
+    NotPreviewPane(u64),
+    NotMarkdownPdfPane(u64),
+    NotPdfImagePane(u64),
+    // ---- パス ----
+    PathNotFound(String),
+    NotAFile(String),
+    DirNotFound(String),
+    AlreadyExists(String),
+    // ---- git ----
+    NotGitRepo,
+    NoGitRepo,
+    // ---- CLI の前段（dispatch へ送る前に手元で断る） ----
+    /// `tako master -` / `tako solo -` の名前が空。`example` は打ち方の例
+    EmptyProfileName(&'static str),
+    /// `tako mod install|uninstall` に band / ui の引数が付いた
+    ModTakesNoArgs(String),
+    FocusTarget,
+    ScrollTarget,
+    PasteGuardRuleUsage,
+    PasteGuardPaneOnlyCheck,
+    SearchQuery,
+    DirectionNeedsTarget,
+    MoveDestination,
+    EnvAndUnsetEnv(String),
+    GatePredicate,
+    /// CLI の方向の引数（`parse_direction`）
+    CliInvalidDirection(String),
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
+impl Reason {
+    /// 表示言語を明示しての文言（#2365）。
+    ///
+    /// (バリアント, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまで
+    /// コンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    /// （`tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Missing(key), Ja) => format!("{key} を指定する"),
+            (Self::Missing(key), En) => format!("{key} is required"),
+            (Self::Required(key), Ja) => format!("{key} は必須"),
+            (Self::Required(key), En) => format!("{key} is required"),
+            (Self::NotNonNegInt(key), Ja) => format!("{key} は非負整数で指定する"),
+            (Self::NotNonNegInt(key), En) => format!("{key} must be a non-negative integer"),
+            (Self::NotInteger(key), Ja) => format!("{key} は整数で指定する"),
+            (Self::NotInteger(key), En) => format!("{key} must be an integer"),
+            (Self::NotNumber(key), Ja) => format!("{key} は数値で指定する"),
+            (Self::NotNumber(key), En) => format!("{key} must be a number"),
+            (Self::NotString(key), Ja) => format!("{key} は文字列で指定する"),
+            (Self::NotString(key), En) => format!("{key} must be a string"),
+            (Self::NotBool(key), Ja) => format!("{key} は真偽値で指定する"),
+            (Self::NotBool(key), En) => format!("{key} must be a boolean"),
+            (Self::ElementNotString(key), Ja) => format!("{key} の要素は文字列で指定する"),
+            (Self::ElementNotString(key), En) => format!("each element of {key} must be a string"),
+            (Self::NotStringArray(key), Ja) => format!("{key} は文字列の配列で指定する"),
+            (Self::NotStringArray(key), En) => format!("{key} must be an array of strings"),
+            (Self::NotObject(key), Ja) => format!("{key} は object（名前 → 値）で指定する"),
+            (Self::NotObject(key), En) => format!("{key} must be an object (name -> value)"),
+            (Self::EnvValueNotString { key, name }, Ja) => {
+                format!("{key} の値は文字列か null で指定する（{name}）")
+            }
+            (Self::EnvValueNotString { key, name }, En) => {
+                format!("each value of {key} must be a string or null ({name})")
+            }
+            (Self::InvalidDirection(other), Ja) => {
+                format!("direction が不正: {other}（right / down / left / up のいずれか）")
+            }
+            (Self::InvalidDirection(other), En) => {
+                format!("invalid direction: {other} (one of right / down / left / up)")
+            }
+            (Self::NotTogether(a, b), Ja) => format!("{a} と {b} は同時に指定しない"),
+            (Self::NotTogether(a, b), En) => format!("{a} and {b} cannot be given together"),
+            (Self::EitherOf(a, b), Ja) => format!("{a} または {b} を指定してください"),
+            (Self::EitherOf(a, b), En) => format!("pass {a} or {b}"),
+            (Self::UnknownTool(name), Ja) => format!("不明なツール: {name}"),
+            (Self::UnknownTool(name), En) => format!("unknown tool: {name}"),
+            (
+                Self::UnknownParams {
+                    tool,
+                    unknown,
+                    allowed,
+                },
+                Ja,
+            ) => {
+                let allowed = if allowed.is_empty() {
+                    "引数なし".to_string()
+                } else {
+                    allowed.join(", ")
+                };
+                format!(
+                    "未知のパラメータ: {}（{tool} が受け付けるのは {allowed} のみ）",
+                    unknown.join(", ")
+                )
+            }
+            (
+                Self::UnknownParams {
+                    tool,
+                    unknown,
+                    allowed,
+                },
+                En,
+            ) => {
+                let unknown = unknown.join(", ");
+                if allowed.is_empty() {
+                    format!("unknown parameter: {unknown} ({tool} takes no arguments)")
+                } else {
+                    format!(
+                        "unknown parameter: {unknown} ({tool} accepts only {})",
+                        allowed.join(", ")
+                    )
+                }
+            }
+            (Self::NoToolName, Ja) => "ツール名（name）が無い".to_string(),
+            (Self::NoToolName, En) => "the tool name (name) is missing".to_string(),
+            (Self::SessionLogNotFound(sid), Ja) => format!(
+                "セッション '{sid}' の端末ログが見つからない（ログ保存が OFF だったか、上限で削除済み）"
+            ),
+            (Self::SessionLogNotFound(sid), En) => format!(
+                "terminal log for session '{sid}' not found \
+                 (pane logging was off, or it was removed by the size limit)"
+            ),
+            (Self::PaneLogNotFound(pane), Ja) => format!(
+                "ペイン {pane} のログが見つからない（ログ保存が OFF だったか、上限で削除済み）"
+            ),
+            (Self::PaneLogNotFound(pane), En) => format!(
+                "log for pane {pane} not found \
+                 (pane logging was off, or it was removed by the size limit)"
+            ),
+            (Self::TranscriptNotFound(sid), Ja) => format!(
+                "セッション {sid} の会話ログ（~/.claude/projects/ の transcript）が見つからない。\
+                 claude 側で削除された可能性がある"
+            ),
+            (Self::TranscriptNotFound(sid), En) => format!(
+                "conversation log for session {sid} (the transcript under ~/.claude/projects/) \
+                 not found; claude may have deleted it"
+            ),
+            (Self::ProjectNotFound(key), Ja) => format!("プロジェクト '{key}' が見つからない"),
+            (Self::ProjectNotFound(key), En) => format!("project '{key}' not found"),
+            (Self::PaneGone, Ja) => "ペインが見つからない".to_string(),
+            (Self::PaneGone, En) => "pane not found".to_string(),
+            (Self::TabGone, Ja) => "タブが見つからない".to_string(),
+            (Self::TabGone, En) => "tab not found".to_string(),
+            (Self::TabNotFound(id), lang) => DispatchError::TabNotFound(*id).text_in(lang),
+            (Self::MasterPaneNotFound, Ja) => "master/solo ペインが見つからない\
+                 （pane を明示指定するか、TAKO_ORCHESTRATOR_ROLE を確認してください）"
+                .to_string(),
+            (Self::MasterPaneNotFound, En) => "master/solo pane not found \
+                 (pass pane explicitly, or check TAKO_ORCHESTRATOR_ROLE)"
+                .to_string(),
+            (Self::BackendSessionNotFound(pane), Ja) => {
+                format!("ペイン {pane} のバックエンドセッションが見つからない")
+            }
+            (Self::BackendSessionNotFound(pane), En) => {
+                format!("backend session for pane {pane} not found")
+            }
+            (Self::NoChoiceDialog, Ja) => {
+                "ペイン画面に選択肢ダイアログが見つからない（既に解消済みか、別の画面状態です）"
+                    .to_string()
+            }
+            (Self::NoChoiceDialog, En) => "choice dialog not found on the pane screen \
+                 (already resolved, or the screen is in another state)"
+                .to_string(),
+            (Self::ChoiceNotFound { choice, labels }, Ja) => {
+                format!("{choice} に対応する選択肢が見つからない。選択肢: {labels}")
+            }
+            (Self::ChoiceNotFound { choice, labels }, En) => {
+                format!("choice matching {choice} not found; choices: {labels}")
+            }
+            (Self::PasteTargetNotFound(path), Ja) => format!("貼り付け先が見つからない: {path}"),
+            (Self::PasteTargetNotFound(path), En) => format!("paste target not found: {path}"),
+            (Self::CheckpointNotFound(id), Ja) => format!("チェックポイントが見つからない: {id}"),
+            (Self::CheckpointNotFound(id), En) => format!("checkpoint not found: {id}"),
+            (Self::NotPreviewPane(pane), Ja) => format!("プレビューペインではない: {pane}"),
+            (Self::NotPreviewPane(pane), En) => format!("not a preview pane: {pane}"),
+            (Self::NotMarkdownPdfPane(pane), Ja) => {
+                format!("Markdown・PDF プレビューペインではない: {pane}")
+            }
+            (Self::NotMarkdownPdfPane(pane), En) => {
+                format!("not a Markdown or PDF preview pane: {pane}")
+            }
+            (Self::NotPdfImagePane(pane), Ja) => {
+                format!("PDF・画像プレビューペインではない: {pane}")
+            }
+            (Self::NotPdfImagePane(pane), En) => {
+                format!("not a PDF or image preview pane: {pane}")
+            }
+            (Self::PathNotFound(path), Ja) => format!("パスが存在しない: {path}"),
+            (Self::PathNotFound(path), En) => format!("path does not exist: {path}"),
+            (Self::NotAFile(path), Ja) => format!("ファイルではない: {path}"),
+            (Self::NotAFile(path), En) => format!("not a file: {path}"),
+            (Self::DirNotFound(path), Ja) => format!("ディレクトリが存在しない: {path}"),
+            (Self::DirNotFound(path), En) => format!("directory does not exist: {path}"),
+            (Self::AlreadyExists(path), Ja) => format!("既に存在する: {path}"),
+            (Self::AlreadyExists(path), En) => format!("already exists: {path}"),
+            (Self::NotGitRepo, Ja) => "git リポジトリではない".to_string(),
+            (Self::NotGitRepo, En) => "not a git repository".to_string(),
+            // 日本語は「見つからない」ではないので says_not_found に当たらない。英語もそろえる
+            (Self::NoGitRepo, Ja) => "git リポジトリが見つかりません".to_string(),
+            (Self::NoGitRepo, En) => "no git repository found".to_string(),
+            (Self::EmptyProfileName(example), Ja) => {
+                format!("プロファイル名が空です（例: {example}）")
+            }
+            (Self::EmptyProfileName(example), En) => {
+                format!("the profile name is empty (e.g. {example})")
+            }
+            (Self::ModTakesNoArgs(action), Ja) => {
+                format!("{action} は on / off や ui の引数を取らない")
+            }
+            (Self::ModTakesNoArgs(action), En) => {
+                format!("{action} takes no on / off or ui arguments")
+            }
+            (Self::FocusTarget, Ja) => {
+                "フォーカス先のペイン ID か方向（--left 等）を指定する".to_string()
+            }
+            (Self::FocusTarget, En) => {
+                "pass the pane ID to focus or a direction (--left etc.)".to_string()
+            }
+            (Self::ScrollTarget, Ja) => {
+                "--to（絶対位置。0 = 最下部）か --delta（相対行数）を指定する".to_string()
+            }
+            (Self::ScrollTarget, En) => {
+                "pass --to (absolute position; 0 = bottom) or --delta (relative lines)".to_string()
+            }
+            (Self::PasteGuardRuleUsage, Ja) => {
+                "規則の切替は `tako paste-guard rule <規則名> on|off`".to_string()
+            }
+            (Self::PasteGuardRuleUsage, En) => {
+                "to switch a rule, use `tako paste-guard rule <rule> on|off`".to_string()
+            }
+            (Self::PasteGuardPaneOnlyCheck, Ja) => {
+                "--pane は `tako paste-guard check` だけ".to_string()
+            }
+            (Self::PasteGuardPaneOnlyCheck, En) => {
+                "--pane works only with `tako paste-guard check`".to_string()
+            }
+            (Self::SearchQuery, Ja) => "検索語を指定する（tako search <検索語>）".to_string(),
+            (Self::SearchQuery, En) => "pass a search query (tako search <query>)".to_string(),
+            (Self::DirectionNeedsTarget, Ja) => {
+                "--right/--down/--up/--left は --target と併用する".to_string()
+            }
+            (Self::DirectionNeedsTarget, En) => {
+                "--right/--down/--up/--left work only with --target".to_string()
+            }
+            (Self::MoveDestination, Ja) => {
+                "tab か --target か --new のいずれかを指定する".to_string()
+            }
+            (Self::MoveDestination, En) => "pass tab, --target, or --new".to_string(),
+            (Self::EnvAndUnsetEnv(name), Ja) => {
+                format!("{name} を --env と --unset-env の両方に渡している")
+            }
+            (Self::EnvAndUnsetEnv(name), En) => {
+                format!("{name} is passed to both --env and --unset-env")
+            }
+            (Self::GatePredicate, Ja) => {
+                "少なくとも 1 つの述語を指定する（--command / --pr-merged / --custom）".to_string()
+            }
+            (Self::GatePredicate, En) => {
+                "pass at least one predicate (--command / --pr-merged / --custom)".to_string()
+            }
+            (Self::CliInvalidDirection(s), Ja) => {
+                format!("不正な方向: {s}（right / down / left / up）")
+            }
+            (Self::CliInvalidDirection(s), En) => {
+                format!("invalid direction: {s} (right / down / left / up)")
+            }
+        }
+    }
+
+    /// 「無効なパラメータ: 」の断りへ載せる
+    pub fn invalid(self) -> DispatchError {
+        DispatchError::InvalidParams(self.to_string())
+    }
+
+    /// 前置きの無い理由の文として載せる
+    pub fn operation(self) -> DispatchError {
+        DispatchError::Operation(self.to_string())
+    }
+
+    /// 応答の文が「ペイン画面に選択肢ダイアログが無い」を言っているか（#2365）。
+    ///
+    /// リモートの承認応答は、ダイアログ不在（解消済み）を接続の故障と分けて 409 へ寄せる。
+    /// 理由の文が表示言語に従うようになったので、日英どちらの形もこの 1 か所で読む
+    /// （日本語は #2365 より前と同じ「ダイアログが見つからない」の部分一致）
+    pub fn says_no_choice_dialog(message: &str) -> bool {
+        message.contains("ダイアログが見つからない") || message.contains("choice dialog not found")
+    }
+}
+
 /// 拡張子からプレビュー種別（ワイヤ表現）を決める。
 ///
 /// 対応表の正本は `tako_core::open_plan`（#1283）。ここは列挙の写しを作らずに
@@ -294,10 +655,7 @@ fn open_file(
     let resolved = tako_core::platform::path::canonicalize(&resolved)
         .map_err(|e| DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）")))?;
     if !resolved.is_file() {
-        return Err(DispatchError::Operation(format!(
-            "ファイルではない: {}",
-            resolved.display()
-        )));
+        return Err(Reason::NotAFile(resolved.display().to_string()).operation());
     }
     // 拡張子 → プレビュー種別の対応表は `tako_core::open_plan` が正本（#1283）。
     // リンク検出の応答（`tako links` の `open`）が同じ表を引くので、
@@ -743,10 +1101,7 @@ pub fn lsp_goto_prepare(
     }
     let (_, target) = resolve_pane(host.workspace(), pane)?;
     let Some((path, _)) = host.preview_state(target) else {
-        return Err(DispatchError::InvalidParams(format!(
-            "プレビューペインではない: {}",
-            target.as_u64()
-        )));
+        return Err(Reason::NotPreviewPane(target.as_u64()).invalid());
     };
     let source = host
         .preview_goto_source(target, line - 1)
@@ -1003,10 +1358,7 @@ pub fn lsp_menu_prepare(
     }
     let (_, target) = resolve_pane(host.workspace(), pane)?;
     let Some((path, _)) = host.preview_state(target) else {
-        return Err(DispatchError::InvalidParams(format!(
-            "プレビューペインではない: {}",
-            target.as_u64()
-        )));
+        return Err(Reason::NotPreviewPane(target.as_u64()).invalid());
     };
     let source = host
         .preview_goto_source(target, line - 1)
@@ -1313,10 +1665,7 @@ fn workspace_search_roots(
             dir = base.join(dir);
         }
         if !dir.is_dir() {
-            return Err(DispatchError::InvalidParams(format!(
-                "ディレクトリが存在しない: {}",
-                dir.display()
-            )));
+            return Err(Reason::DirNotFound(dir.display().to_string()).invalid());
         }
         return Ok(vec![dir]);
     }
@@ -1492,10 +1841,7 @@ pub fn lsp_format_prepare(
 ) -> Result<LspFormatJob, DispatchError> {
     let (_, target) = resolve_pane(host.workspace(), pane)?;
     let Some((path, _)) = host.preview_state(target) else {
-        return Err(DispatchError::InvalidParams(format!(
-            "プレビューペインではない: {}",
-            target.as_u64()
-        )));
+        return Err(Reason::NotPreviewPane(target.as_u64()).invalid());
     };
     let Some(manager) = host.lsp().cloned() else {
         return Err(DispatchError::Operation(
@@ -1827,10 +2173,7 @@ pub fn lsp_rename_prepare(
     }
     let (_, target) = resolve_pane(host.workspace(), pane)?;
     let Some((path, _)) = host.preview_state(target) else {
-        return Err(DispatchError::InvalidParams(format!(
-            "プレビューペインではない: {}",
-            target.as_u64()
-        )));
+        return Err(Reason::NotPreviewPane(target.as_u64()).invalid());
     };
     let Some(manager) = host.lsp().cloned() else {
         return Err(DispatchError::Operation(
@@ -2101,10 +2444,7 @@ pub fn lsp_completion_prepare(
     }
     let (_, target) = resolve_pane(host.workspace(), pane)?;
     let Some((path, _)) = host.preview_state(target) else {
-        return Err(DispatchError::InvalidParams(format!(
-            "プレビューペインではない: {}",
-            target.as_u64()
-        )));
+        return Err(Reason::NotPreviewPane(target.as_u64()).invalid());
     };
     let source = host
         .preview_goto_source(target, line - 1)
@@ -2368,10 +2708,7 @@ pub fn lsp_hover_prepare(
     }
     let (_, target) = resolve_pane(host.workspace(), pane)?;
     let Some((path, _)) = host.preview_state(target) else {
-        return Err(DispatchError::InvalidParams(format!(
-            "プレビューペインではない: {}",
-            target.as_u64()
-        )));
+        return Err(Reason::NotPreviewPane(target.as_u64()).invalid());
     };
     let source = host
         .preview_goto_source(target, line - 1)
@@ -2553,10 +2890,7 @@ pub fn lsp_xref_prepare(
     }
     let (_, target) = resolve_pane(host.workspace(), pane)?;
     let Some((path, _)) = host.preview_state(target) else {
-        return Err(DispatchError::InvalidParams(format!(
-            "プレビューペインではない: {}",
-            target.as_u64()
-        )));
+        return Err(Reason::NotPreviewPane(target.as_u64()).invalid());
     };
     let source = host
         .preview_goto_source(target, line - 1)
@@ -4678,7 +5012,7 @@ fn restart_scan(backend: Option<&str>) -> (Option<String>, crate::agents::Proces
 ///
 /// 先取りの内側では background が調べた答えだけを使う。答えが無ければ**ペインを作らずに**断る
 fn git_conflict_for(cwd: &Path) -> Result<(PathBuf, tako_core::ConflictState), DispatchError> {
-    let not_repo = || op_err("git リポジトリが見つかりません");
+    let not_repo = || Reason::NoGitRepo.operation();
     match probed(|p| {
         p.git_conflict
             .as_ref()
@@ -5015,9 +5349,9 @@ fn preview_changelog_prepare(
     max_count: Option<usize>,
 ) -> Result<PreviewChangelogJob, DispatchError> {
     let (_, target) = resolve_pane(host.workspace(), pane)?;
-    let (path, _) = host.preview_state(target).ok_or_else(|| {
-        DispatchError::Operation(format!("プレビューペインではない: {}", target.as_u64()))
-    })?;
+    let (path, _) = host
+        .preview_state(target)
+        .ok_or_else(|| Reason::NotPreviewPane(target.as_u64()).operation())?;
     Ok(PreviewChangelogJob {
         pane: target,
         path: PathBuf::from(path),
@@ -5044,12 +5378,7 @@ fn preview_changelog_land(
                 "変更履歴を取っている間にプレビューのファイルが変わった（履歴を置かない）".into(),
             ))
         }
-        None => {
-            return Err(DispatchError::Operation(format!(
-                "プレビューペインではない: {}",
-                pane.as_u64()
-            )))
-        }
+        None => return Err(Reason::NotPreviewPane(pane.as_u64()).operation()),
     }
     let history = history.map_err(|e| DispatchError::Operation(e.to_string()))?;
     let commits = history.commits.len();
@@ -5077,9 +5406,9 @@ fn preview_changelog_diff_prepare(
     requested: &str,
 ) -> Result<ChangelogDiffStep, DispatchError> {
     let (_, target) = resolve_pane(host.workspace(), pane)?;
-    let (path, _) = host.preview_state(target).ok_or_else(|| {
-        DispatchError::Operation(format!("プレビューペインではない: {}", target.as_u64()))
-    })?;
+    let (path, _) = host
+        .preview_state(target)
+        .ok_or_else(|| Reason::NotPreviewPane(target.as_u64()).operation())?;
     let row = host
         .changelog_diff_target(target, requested)
         .map_err(DispatchError::Operation)?;
@@ -5125,12 +5454,7 @@ fn preview_changelog_diff_land(
                 "差分を取っている間にプレビューのファイルが変わった（差分を置かない）".into(),
             ))
         }
-        None => {
-            return Err(DispatchError::Operation(format!(
-                "プレビューペインではない: {}",
-                job.pane.as_u64()
-            )))
-        }
+        None => return Err(Reason::NotPreviewPane(job.pane.as_u64()).operation()),
     }
     let row = host
         .changelog_diff_target(job.pane, &job.hash)
@@ -5407,8 +5731,7 @@ fn conflict_state_json(repo: &Path, state: &tako_core::ConflictState) -> Value {
 /// 認証まで）ので **UI スレッドで呼ばない**。IPC / MCP は [`OffloadJob::GitWrite`] が background で
 /// 呼び、同期の腕（dispatch_inner）はテスト・直呼び・A/B（`TAKO_1991_LEGACY=1`）だけが通る
 fn git_write_reply(cwd: &Path, request: Request) -> Result<Value, DispatchError> {
-    let repo =
-        tako_core::git::repo_root(cwd).ok_or_else(|| op_err("git リポジトリが見つかりません"))?;
+    let repo = tako_core::git::repo_root(cwd).ok_or_else(|| Reason::NoGitRepo.operation())?;
     // 同じリポジトリへの書き込みは 1 本ずつ（conflicts は読むだけなので並べてよい）
     let _turn = (!matches!(request, Request::GitConflicts { .. })).then(|| git_write_turn(&repo));
     match request {
@@ -5603,8 +5926,7 @@ fn run_git_merge(
 
 /// git log + branches + status の取得と応答整形（サブプロセス実行を伴う）
 fn run_git_log(cwd: &Path, max_count: Option<usize>) -> Result<Value, DispatchError> {
-    let repo = tako_core::git::repo_root(cwd)
-        .ok_or(DispatchError::Operation("git リポジトリではない".into()))?;
+    let repo = tako_core::git::repo_root(cwd).ok_or_else(|| Reason::NotGitRepo.operation())?;
     let max = max_count.unwrap_or(200);
     let commits = tako_core::git::log_commits(&repo, max);
     let branches = tako_core::git::list_branches(&repo);
@@ -5639,8 +5961,7 @@ fn run_git_log(cwd: &Path, max_count: Option<usize>) -> Result<Value, DispatchEr
 
 /// git diff の取得と応答整形（サブプロセス実行を伴う）
 fn run_git_diff(cwd: &Path, target: Option<&str>) -> Result<Value, DispatchError> {
-    let repo = tako_core::git::repo_root(cwd)
-        .ok_or(DispatchError::Operation("git リポジトリではない".into()))?;
+    let repo = tako_core::git::repo_root(cwd).ok_or_else(|| Reason::NotGitRepo.operation())?;
     let diff_target = match target {
         None | Some("unstaged") => tako_core::git::DiffTarget::Unstaged,
         Some("staged") => tako_core::git::DiffTarget::Staged,
@@ -5667,8 +5988,7 @@ fn run_git_diff(cwd: &Path, target: Option<&str>) -> Result<Value, DispatchError
 }
 
 fn run_git_show(cwd: &Path, hash: &str, file: Option<&str>) -> Result<Value, DispatchError> {
-    let repo = tako_core::git::repo_root(cwd)
-        .ok_or(DispatchError::Operation("git リポジトリではない".into()))?;
+    let repo = tako_core::git::repo_root(cwd).ok_or_else(|| Reason::NotGitRepo.operation())?;
     let detail = tako_core::git::show_commit(&repo, hash).map_err(DispatchError::Operation)?;
     let mut result = json!({
         "hash": detail.hash,
@@ -7129,12 +7449,8 @@ fn dispatch_inner(
                 )
                 .map_err(DispatchError::Operation)?
             } else {
-                host.preview_view_state(target).ok_or_else(|| {
-                    DispatchError::Operation(format!(
-                        "PDF・画像プレビューペインではない: {}",
-                        target.as_u64()
-                    ))
-                })?
+                host.preview_view_state(target)
+                    .ok_or_else(|| Reason::NotPdfImagePane(target.as_u64()).operation())?
             };
             Ok(json!({
                 "pane": target.as_u64(),
@@ -7146,12 +7462,9 @@ fn dispatch_inner(
         }
         Request::PreviewOutline { pane, item } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
-            let outline = host.preview_outline(target).ok_or_else(|| {
-                DispatchError::Operation(format!(
-                    "Markdown・PDF プレビューペインではない: {}",
-                    target.as_u64()
-                ))
-            })?;
+            let outline = host
+                .preview_outline(target)
+                .ok_or_else(|| Reason::NotMarkdownPdfPane(target.as_u64()).operation())?;
             let selected = if let Some(item) = item {
                 Some(
                     host.navigate_preview_outline(target, item)
@@ -7178,12 +7491,9 @@ fn dispatch_inner(
                     "links": links,
                 }));
             }
-            let links = host.preview_pdf_links(target).ok_or_else(|| {
-                DispatchError::Operation(format!(
-                    "Markdown・PDF プレビューペインではない: {}",
-                    target.as_u64()
-                ))
-            })?;
+            let links = host
+                .preview_pdf_links(target)
+                .ok_or_else(|| Reason::NotMarkdownPdfPane(target.as_u64()).operation())?;
             Ok(json!({
                 "pane": target.as_u64(),
                 "kind": "pdf",
@@ -7385,10 +7695,7 @@ fn dispatch_inner(
         Request::PreviewEdit { pane, enabled } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             if host.preview_state(target).is_none() {
-                return Err(DispatchError::Operation(format!(
-                    "プレビューペインではない: {}",
-                    target.as_u64()
-                )));
+                return Err(Reason::NotPreviewPane(target.as_u64()).operation());
             }
             if let Some(enabled) = enabled {
                 host.set_preview_editing(target, enabled)
@@ -7670,10 +7977,7 @@ fn dispatch_inner(
         } => {
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             if host.preview_state(target).is_none() {
-                return Err(DispatchError::Operation(format!(
-                    "プレビューペインではない: {}",
-                    target.as_u64()
-                )));
+                return Err(Reason::NotPreviewPane(target.as_u64()).operation());
             }
             // #2150: 行の diff の展開は通常 `prepare_offload` の腕（background）。ここへ来るのは畳む・
             // テスト・直呼び・`TAKO_OFFLOAD=0`・A/B だけで、本体は background と同じ 1 実装を通す
@@ -7769,10 +8073,7 @@ fn dispatch_inner(
                 }
                 FileOpKind::Reveal => {
                     if !path.exists() {
-                        return Err(DispatchError::Operation(format!(
-                            "パスが存在しない: {}",
-                            path.display()
-                        )));
+                        return Err(Reason::PathNotFound(path.display().to_string()).operation());
                     }
                     crate::platform::os_integration::reveal(&path)
                         .map_err(DispatchError::Operation)?;
@@ -7790,18 +8091,16 @@ fn dispatch_inner(
                     Ok(json!({ "pane": target.as_u64(), "cwd": dir.display().to_string() }))
                 }
                 FileOpKind::Rename => {
-                    let new_name =
-                        name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+                    let new_name = name.ok_or_else(|| Reason::Missing("name".into()).invalid())?;
                     validate_name(&new_name)?;
                     let parent = path.parent().ok_or(DispatchError::Operation(
                         "親ディレクトリが取得できない".into(),
                     ))?;
                     let new_path = parent.join(&new_name);
                     if new_path.exists() {
-                        return Err(DispatchError::Operation(format!(
-                            "既に存在する: {}",
-                            new_path.display()
-                        )));
+                        return Err(
+                            Reason::AlreadyExists(new_path.display().to_string()).operation()
+                        );
                     }
                     std::fs::rename(&path, &new_path)
                         .map_err(|e| DispatchError::Operation(format!("リネームに失敗: {e}")))?;
@@ -7810,15 +8109,13 @@ fn dispatch_inner(
                     )
                 }
                 FileOpKind::CreateFile => {
-                    let file_name =
-                        name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+                    let file_name = name.ok_or_else(|| Reason::Missing("name".into()).invalid())?;
                     validate_name(&file_name)?;
                     let new_path = dir_of(&path).join(&file_name);
                     if new_path.exists() {
-                        return Err(DispatchError::Operation(format!(
-                            "既に存在する: {}",
-                            new_path.display()
-                        )));
+                        return Err(
+                            Reason::AlreadyExists(new_path.display().to_string()).operation()
+                        );
                     }
                     std::fs::File::create(&new_path).map_err(|e| {
                         DispatchError::Operation(format!("ファイル作成に失敗: {e}"))
@@ -7826,15 +8123,13 @@ fn dispatch_inner(
                     Ok(json!({ "created": new_path.display().to_string() }))
                 }
                 FileOpKind::CreateDir => {
-                    let dir_name =
-                        name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+                    let dir_name = name.ok_or_else(|| Reason::Missing("name".into()).invalid())?;
                     validate_name(&dir_name)?;
                     let new_path = dir_of(&path).join(&dir_name);
                     if new_path.exists() {
-                        return Err(DispatchError::Operation(format!(
-                            "既に存在する: {}",
-                            new_path.display()
-                        )));
+                        return Err(
+                            Reason::AlreadyExists(new_path.display().to_string()).operation()
+                        );
                     }
                     std::fs::create_dir(&new_path).map_err(|e| {
                         DispatchError::Operation(format!("フォルダ作成に失敗: {e}"))
@@ -7844,10 +8139,7 @@ fn dispatch_inner(
                 FileOpKind::Trash => trash_one(&path),
                 FileOpKind::OpenDefault => {
                     if !path.exists() {
-                        return Err(DispatchError::Operation(format!(
-                            "パスが存在しない: {}",
-                            path.display()
-                        )));
+                        return Err(Reason::PathNotFound(path.display().to_string()).operation());
                     }
                     crate::platform::os_integration::open_default(&path)
                         .map_err(DispatchError::Operation)?;
@@ -7855,10 +8147,7 @@ fn dispatch_inner(
                 }
                 FileOpKind::OpenWith => {
                     if !path.exists() {
-                        return Err(DispatchError::Operation(format!(
-                            "パスが存在しない: {}",
-                            path.display()
-                        )));
+                        return Err(Reason::PathNotFound(path.display().to_string()).operation());
                     }
                     let app_name = name.ok_or(DispatchError::InvalidParams(
                         "name（アプリ名）を指定する".into(),
@@ -7873,10 +8162,7 @@ fn dispatch_inner(
                 // GUI・CLI・MCP で必ず一致する
                 FileOpKind::OpenInTako => {
                     if !path.exists() {
-                        return Err(DispatchError::Operation(format!(
-                            "パスが存在しない: {}",
-                            path.display()
-                        )));
+                        return Err(Reason::PathNotFound(path.display().to_string()).operation());
                     }
                     let is_dir = path.is_dir();
                     let inner = if is_dir {
@@ -8989,7 +9275,7 @@ fn dispatch_inner(
                 };
             match action.as_str() {
                 "open" => {
-                    let url = url.ok_or(DispatchError::InvalidParams("url は必須".into()))?;
+                    let url = url.ok_or_else(|| Reason::Required("url".into()).invalid())?;
                     if url.trim().is_empty() {
                         return Err(DispatchError::InvalidParams(
                             "URL が空です".into(),
@@ -9038,13 +9324,13 @@ fn dispatch_inner(
                     host.web_navigate(id, &to).map_err(op_err)
                 }
                 "eval" => {
-                    let js = js.ok_or(DispatchError::InvalidParams("js は必須".into()))?;
+                    let js = js.ok_or_else(|| Reason::Required("js".into()).invalid())?;
                     let (id, _) = host.web_target(id, pane).map_err(op_err)?;
                     host.web_eval(id, &js).map_err(op_err)
                 }
                 "eval_result" => {
                     let token =
-                        token.ok_or(DispatchError::InvalidParams("token は必須".into()))?;
+                        token.ok_or_else(|| Reason::Required("token".into()).invalid())?;
                     let (id, _) = host.web_target(id, pane).map_err(op_err)?;
                     host.web_eval_result(id, token).map_err(op_err)
                 }
@@ -10005,9 +10291,7 @@ fn dispatch_inner(
         Request::OpenDir { path, focus } => {
             let dir = PathBuf::from(&path);
             if !dir.is_dir() {
-                return Err(DispatchError::InvalidParams(format!(
-                    "ディレクトリが存在しない: {path}"
-                )));
+                return Err(Reason::DirNotFound(path.to_string()).invalid());
             }
             // 解決は境界（B26）を通す。ここが #970 の入口（起動 cwd + recent + タブ名）
             let dir = tako_core::platform::path::canonicalize_or_self(&dir);
@@ -10615,10 +10899,7 @@ fn dispatch_inner(
                 DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）"))
             })?;
             if !resolved.is_file() {
-                return Err(DispatchError::Operation(format!(
-                    "ファイルではない: {}",
-                    resolved.display()
-                )));
+                return Err(Reason::NotAFile(resolved.display().to_string()).operation());
             }
 
             // #1662: 未保存の編集を先に保存する（再生ボタン / `tako run` / MCP `tako_run` の
@@ -11368,10 +11649,7 @@ fn resolve_run_file(
     let resolved = tako_core::platform::path::canonicalize(&joined)
         .map_err(|e| DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）")))?;
     if !resolved.is_file() {
-        return Err(DispatchError::Operation(format!(
-            "ファイルではない: {}",
-            resolved.display()
-        )));
+        return Err(Reason::NotAFile(resolved.display().to_string()).operation());
     }
     Ok(resolved)
 }
@@ -11468,10 +11746,7 @@ fn finish_run_resolve(ctx: &RunResolveCtx) -> Result<Value, DispatchError> {
     let resolved = tako_core::platform::path::canonicalize(&ctx.joined)
         .map_err(|e| DispatchError::Operation(format!("ファイルを開けない（{}: {e}）", ctx.raw)))?;
     if !resolved.is_file() {
-        return Err(DispatchError::Operation(format!(
-            "ファイルではない: {}",
-            resolved.display()
-        )));
+        return Err(Reason::NotAFile(resolved.display().to_string()).operation());
     }
 
     let head = read_file_head(&resolved)?;
@@ -12025,10 +12300,7 @@ fn dispatch_logs_read(
                     .and_then(|p| tako_core::pane_log::latest_for_pane(&dir, p))
             })
             .ok_or_else(|| {
-                DispatchError::Operation(format!(
-                    "セッション '{}' の端末ログが見つからない（ログ保存が OFF だったか、上限で削除済み）",
-                    crate::sessions::short_id(sid)
-                ))
+                Reason::SessionLogNotFound(crate::sessions::short_id(sid).to_string()).operation()
             })?;
         (path, entry.pane)
     } else if let Some(p) = pane {
@@ -12037,11 +12309,7 @@ fn dispatch_logs_read(
             .pane_log_file(PaneId::from_raw(p))
             .filter(|f| f.is_file())
             .or_else(|| tako_core::pane_log::latest_for_pane(&dir, p))
-            .ok_or_else(|| {
-                DispatchError::Operation(format!(
-                    "ペイン {p} のログが見つからない（ログ保存が OFF だったか、上限で削除済み）"
-                ))
-            })?;
+            .ok_or_else(|| Reason::PaneLogNotFound(p).operation())?;
         (path, Some(p))
     } else {
         return Err(DispatchError::InvalidParams(
@@ -12160,11 +12428,10 @@ fn dispatch_sessions_resume(
 
     // 会話ログ（claude transcript）の実在確認。無ければ resume は成立しない
     if crate::transcript::find_transcript(&session_id).is_none() {
-        return Err(DispatchError::Operation(format!(
-            "セッション {} の会話ログ（~/.claude/projects/ の transcript）が見つからない。\
-             claude 側で削除された可能性がある",
-            crate::sessions::short_id(&session_id)
-        )));
+        return Err(
+            Reason::TranscriptNotFound(crate::sessions::short_id(&session_id).to_string())
+                .operation(),
+        );
     }
 
     // 分割元の解決: pane > tab > 呼び出し元 > アクティブタブ。
@@ -12335,8 +12602,8 @@ pub fn dispatch_orchestrator_projects(
             Ok(json!({ "projects": projects }))
         }
         "add" => {
-            let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
-            let cwd = cwd.ok_or(DispatchError::InvalidParams("cwd を指定する".into()))?;
+            let key = key.ok_or_else(|| Reason::Missing("key".into()).invalid())?;
+            let cwd = cwd.ok_or_else(|| Reason::Missing("cwd".into()).invalid())?;
             orchestrator::ensure_defaults().map_err(DispatchError::Operation)?;
             // ロック付き read-modify-write（#169: 並行 add で他エントリを消さない）
             orchestrator::ProjectsConfig::mutate(|config| {
@@ -12372,13 +12639,11 @@ pub fn dispatch_orchestrator_projects(
             Ok(result)
         }
         "remove" => {
-            let key = key.ok_or(DispatchError::InvalidParams("key を指定する".into()))?;
+            let key = key.ok_or_else(|| Reason::Missing("key".into()).invalid())?;
             let removed = orchestrator::ProjectsConfig::mutate(|config| config.remove(&key))
                 .map_err(DispatchError::Operation)?;
             if !removed {
-                return Err(DispatchError::Operation(format!(
-                    "プロジェクト '{key}' が見つからない"
-                )));
+                return Err(Reason::ProjectNotFound(key).operation());
             }
             Ok(json!({ "removed": key }))
         }
@@ -12526,7 +12791,7 @@ fn dispatch_orchestrator_adopt(
         // 「adopt を経由しない master の role 書き換え」が増えていないかを見張る）
         let pane_obj = tree_mut(host.workspace_mut(), tab_id)
             .get_mut(pane_id)
-            .ok_or_else(|| op_err("ペインが見つからない"))?;
+            .ok_or_else(|| Reason::PaneGone.operation())?;
         pane_obj.set_role(Some(new_role.clone()));
         // ペインの表示名の形は `tako master -<名前>` と同じ 1 実装から採る（#761 の語彙）
         pane_obj.set_title(Some(orchestrator::master_launch::pane_title_for(name)));
@@ -12887,7 +13152,7 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
         "create" => {
             let name = params
                 .name
-                .ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+                .ok_or_else(|| Reason::Missing("name".into()).invalid())?;
             let (path, profile) = orchestrator::create_profile_of(kind, &name, None)
                 .map_err(DispatchError::Operation)?;
             let mut result = profile_to_json(kind, &name, &profile);
@@ -12914,7 +13179,7 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
         "delete" => {
             let name = params
                 .name
-                .ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+                .ok_or_else(|| Reason::Missing("name".into()).invalid())?;
             let path =
                 orchestrator::delete_profile_of(kind, &name).map_err(DispatchError::Operation)?;
             Ok(json!({
@@ -12927,7 +13192,7 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
         "set" => {
             let name = params
                 .name
-                .ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+                .ok_or_else(|| Reason::Missing("name".into()).invalid())?;
             if params.model.is_some() && params.clear_model {
                 return Err(DispatchError::InvalidParams(
                     "model と clear_model は同時に指定できない".into(),
@@ -13698,7 +13963,7 @@ fn dispatch_remote_folder(
                 .iter()
                 .find(|t| t.id().as_u64() == id)
                 .map(|t| t.id())
-                .ok_or_else(|| DispatchError::Operation(format!("タブ {id} が見つからない"))),
+                .ok_or_else(|| Reason::TabNotFound(id).operation()),
             None => Ok(host.workspace().active_tab_id()),
         }
     }
@@ -14187,13 +14452,13 @@ pub fn dispatch_orchestrator_accounts(
             Ok(json!({ "accounts": accounts }))
         }
         "show" => {
-            let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            let name = name.ok_or_else(|| Reason::Missing("name".into()).invalid())?;
             let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
             let a = config.resolve(name).map_err(DispatchError::Operation)?;
             Ok(account_json(&a))
         }
         "add" => {
-            let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            let name = name.ok_or_else(|| Reason::Missing("name".into()).invalid())?;
             let inherit = inherit.unwrap_or(false);
             // config_dir / inherit の排他は登録時に弾く（壊れたエントリを作らせない。#512）
             match (inherit, config_dir) {
@@ -14246,7 +14511,7 @@ pub fn dispatch_orchestrator_accounts(
             Ok(result)
         }
         "remove" => {
-            let name = name.ok_or(DispatchError::InvalidParams("name を指定する".into()))?;
+            let name = name.ok_or_else(|| Reason::Missing("name".into()).invalid())?;
             let removed = orchestrator::AccountsConfig::mutate(|config| {
                 config.accounts.remove(name).is_some()
             })
@@ -14299,35 +14564,31 @@ pub fn dispatch_orchestrator_layout(
         MIN_WORKER_COLS_FLOOR, MIN_WORKER_COLS_MAX, WORKER_FONT_SCALE_MAX, WORKER_FONT_SCALE_MIN,
     };
     // 検証は書き込み前に完了させる（不正値ではロックを取らない）
+    // 理由の文は表示言語に従う（#2365。日英の正本は `tako_core::LayoutParamError::text_in`）
+    let invalid = |e: tako_core::LayoutParamError| DispatchError::InvalidParams(e.to_string());
     let policy = policy
         .map(tako_core::SpawnLayoutPolicy::parse)
         .transpose()
-        .map_err(DispatchError::InvalidParams)?;
+        .map_err(invalid)?;
     if let Some(r) = master_ratio {
         if !r.is_finite() || !(0.1..=0.9).contains(&r) {
-            return Err(DispatchError::InvalidParams(format!(
-                "master_ratio は 0.1〜0.9 で指定してください（指定値: {r}）"
-            )));
+            return Err(invalid(tako_core::LayoutParamError::MasterRatio(r)));
         }
     }
     if let Some(c) = min_worker_cols {
         if c != 0 && !(MIN_WORKER_COLS_FLOOR..=MIN_WORKER_COLS_MAX).contains(&c) {
-            return Err(DispatchError::InvalidParams(format!(
-                "min_worker_cols は 0（保証しない）か {MIN_WORKER_COLS_FLOOR}〜{MIN_WORKER_COLS_MAX} で指定してください（指定値: {c}）"
-            )));
+            return Err(invalid(tako_core::LayoutParamError::MinWorkerCols(c)));
         }
     }
     if let Some(s) = min_worker_font_scale {
         if !s.is_finite() || !(WORKER_FONT_SCALE_MIN..=WORKER_FONT_SCALE_MAX).contains(&s) {
-            return Err(DispatchError::InvalidParams(format!(
-                "min_worker_font_scale は {WORKER_FONT_SCALE_MIN}〜{WORKER_FONT_SCALE_MAX} で指定してください（指定値: {s}）"
-            )));
+            return Err(invalid(tako_core::LayoutParamError::MinWorkerFontScale(s)));
         }
     }
     let algorithm = algorithm
         .map(tako_core::WorkerLayoutAlgorithm::parse)
         .transpose()
-        .map_err(DispatchError::InvalidParams)?;
+        .map_err(invalid)?;
 
     let changed = policy.is_some()
         || master_ratio.is_some()
@@ -14699,9 +14960,7 @@ fn find_master_pane_strict(
         }
     }
     match fb.len() {
-        0 => Err(DispatchError::Operation(
-            "master/solo ペインが見つからない（pane を明示指定するか、TAKO_ORCHESTRATOR_ROLE を確認してください）".into()
-        )),
+        0 => Err(Reason::MasterPaneNotFound.operation()),
         1 => Ok(fb[0]),
         _ => {
             let ids: Vec<String> = fb.iter().map(|(_, p)| p.as_u64().to_string()).collect();
@@ -17712,11 +17971,9 @@ fn dispatch_orchestrator_respond(
     // `TAKO_1200_LEGACY=1` で **#1200 前の挙動**（バックエンドセッション名を必須にして
     // 器越しへ直行）へ戻す。同一バイナリで A/B を取る入口
     if std::env::var_os("TAKO_1200_LEGACY").is_some() {
-        let backend_session = host.backend_session(target).ok_or_else(|| {
-            DispatchError::Operation(format!(
-                "ペイン {pane_id} のバックエンドセッションが見つからない"
-            ))
-        })?;
+        let backend_session = host
+            .backend_session(target)
+            .ok_or_else(|| Reason::BackendSessionNotFound(pane_id).operation())?;
         return respond_to_choice_dialog(&backend_session, pane_id, choice, caller_role);
     }
     // #1200: **in-process を先に見る**。旧実装はバックエンドセッション名を必須にして
@@ -17776,12 +18033,8 @@ pub fn respond_via(
             .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}")))
     };
     let lines = capture()?;
-    let dialog = crate::claude_tui::detect_choice_dialog(&lines).ok_or_else(|| {
-        DispatchError::Operation(
-            "ペイン画面に選択肢ダイアログが見つからない（既に解消済みか、別の画面状態です）"
-                .to_string(),
-        )
-    })?;
+    let dialog = crate::claude_tui::detect_choice_dialog(&lines)
+        .ok_or_else(|| Reason::NoChoiceDialog.operation())?;
 
     // choice 省略 = 下見（構造だけ返す。送信しない）
     let Some(choice) = choice else {
@@ -18014,10 +18267,11 @@ fn resolve_choice_index(
                 return by_label(i);
             }
         }
-        return Err(DispatchError::Operation(format!(
-            "{choice} に対応する選択肢が見つからない。選択肢: {}",
-            labels()
-        )));
+        return Err(Reason::ChoiceNotFound {
+            choice: choice.to_string(),
+            labels: labels(),
+        }
+        .operation());
     }
     // 3. ラベルの部分一致
     let hits: Vec<usize> = dialog
@@ -18816,9 +19070,7 @@ pub fn lsp_diagnostics(
         Some(raw) => {
             let (_, target) = resolve_pane(host.workspace(), Some(raw))?;
             let Some((path, _)) = host.preview_state(target) else {
-                return Err(DispatchError::InvalidParams(format!(
-                    "プレビューペインではない: {raw}"
-                )));
+                return Err(Reason::NotPreviewPane(raw).invalid());
             };
             let found: Vec<_> = docs.into_iter().filter(|d| d.pane == raw).collect();
             if found.is_empty() {
@@ -20112,7 +20364,12 @@ fn find_window(ws: &Workspace, raw: u64) -> Result<tako_core::WindowId, Dispatch
         .iter()
         .map(|w| w.id())
         .find(|w| w.as_u64() == raw)
-        .ok_or_else(|| DispatchError::Operation(format!("ウィンドウ {raw} が見つからない")))
+        // 文は tako-core の断りと同じ 1 実装（#2358 の日英。#2365 で寄せた）
+        .ok_or_else(|| {
+            op_err(tako_core::WorkspaceError::WindowNotFound(
+                tako_core::WindowId::from_raw(raw),
+            ))
+        })
 }
 
 /// ウィンドウの最小化 / 最大化 / 復元（Issue #584）。`window` 省略でアクティブウィンドウ。
@@ -20691,10 +20948,7 @@ fn copy_cancel(name: Option<&str>) -> Result<Value, DispatchError> {
 /// ごみ箱へ 1 つ（`op=trash` と `paths` の 1 件ずつが通る）
 fn trash_one(path: &std::path::Path) -> Result<Value, DispatchError> {
     if !path.exists() {
-        return Err(DispatchError::Operation(format!(
-            "パスが存在しない: {}",
-            path.display()
-        )));
+        return Err(Reason::PathNotFound(path.display().to_string()).operation());
     }
     crate::platform::os_integration::move_to_trash(path).map_err(DispatchError::Operation)?;
     Ok(json!({ "trashed": path.display().to_string() }))
@@ -20854,10 +21108,7 @@ fn clipboard_put(
 ) -> Result<Value, DispatchError> {
     let paths: Vec<std::path::PathBuf> = paths.iter().map(|p| clipboard_abs(p)).collect();
     if let Some(missing) = paths.iter().find(|p| std::fs::symlink_metadata(p).is_err()) {
-        return Err(DispatchError::Operation(format!(
-            "パスが存在しない: {}",
-            missing.display()
-        )));
+        return Err(Reason::PathNotFound(missing.display().to_string()).operation());
     }
     let written =
         host.os_file_clipboard_write(&paths, mode == tako_core::file_clipboard::ClipMode::Cut);
@@ -20896,10 +21147,7 @@ pub struct PastePlan {
 /// 貼り付け先の規則は `tako_core::file_clipboard::paste_target` の 1 実装
 fn paste_plan(host: &dyn ControlHost, row: &std::path::Path) -> Result<PastePlan, DispatchError> {
     if !row.exists() {
-        return Err(DispatchError::Operation(format!(
-            "貼り付け先が見つからない: {}",
-            row.display()
-        )));
+        return Err(Reason::PasteTargetNotFound(row.display().to_string()).operation());
     }
     let row_is_dir = row.is_dir();
     let tako = host.file_clipboard();
@@ -24021,22 +24269,20 @@ fn dispatch_tree_folder(
         // `tako_core::git_tree`）を通るので、画面と応答がずれない
         "git-status" => dispatch_tree_git_status(host, tab_id, path, limit),
         "add" => {
-            let path_str = path.ok_or(DispatchError::InvalidParams("path を指定する".into()))?;
+            let path_str = path.ok_or_else(|| Reason::Missing("path".into()).invalid())?;
             let abs = PathBuf::from(&path_str);
             if !abs.is_absolute() {
                 return Err(DispatchError::InvalidParams("絶対パスを指定する".into()));
             }
             if !abs.is_dir() {
-                return Err(DispatchError::Operation(format!(
-                    "ディレクトリが存在しない: {path_str}"
-                )));
+                return Err(Reason::DirNotFound(path_str.to_string()).operation());
             }
             // 解決は境界（B26）を通す（ツリーへ保存 + 応答に出る値。#970）
             let canonical = tako_core::platform::path::canonicalize_or_self(&abs);
             let tab_mut = host
                 .workspace_mut()
                 .get_tab_mut(tab_id)
-                .ok_or(DispatchError::InvalidParams("タブが見つからない".into()))?;
+                .ok_or_else(|| Reason::TabGone.invalid())?;
             if !tab_mut.add_pinned_folder(canonical.clone()) {
                 return Ok(
                     json!({ "status": "already_exists", "path": canonical.display().to_string() }),
@@ -24046,7 +24292,7 @@ fn dispatch_tree_folder(
             Ok(json!({ "status": "added", "path": canonical.display().to_string() }))
         }
         "remove" => {
-            let path_str = path.ok_or(DispatchError::InvalidParams("path を指定する".into()))?;
+            let path_str = path.ok_or_else(|| Reason::Missing("path".into()).invalid())?;
             let abs = PathBuf::from(&path_str);
             // 追加側（B26 経由）と同じ形にする。素の canonicalize だと Windows では
             // verbatim になり、保存済みの非 verbatim と一致せず外せない（#970）
@@ -24054,7 +24300,7 @@ fn dispatch_tree_folder(
             let tab_mut = host
                 .workspace_mut()
                 .get_tab_mut(tab_id)
-                .ok_or(DispatchError::InvalidParams("タブが見つからない".into()))?;
+                .ok_or_else(|| Reason::TabGone.invalid())?;
             if !tab_mut.remove_pinned_folder(&canonical) {
                 return Err(DispatchError::Operation(format!(
                     "指定フォルダはピン留めされていない: {}",
@@ -24072,7 +24318,7 @@ fn dispatch_tree_folder(
             let tab_ref = host
                 .workspace()
                 .get_tab(tab_id)
-                .ok_or(DispatchError::InvalidParams("タブが見つからない".into()))?;
+                .ok_or_else(|| Reason::TabGone.invalid())?;
             let folders: Vec<String> = tab_ref
                 .pinned_folders()
                 .iter()
@@ -24264,9 +24510,7 @@ fn tree_git_status_roots(
         Some(p) => {
             let dir = PathBuf::from(&p);
             if !dir.is_dir() {
-                return Err(DispatchError::InvalidParams(format!(
-                    "ディレクトリが存在しない: {p}"
-                )));
+                return Err(Reason::DirNotFound(p.to_string()).invalid());
             }
             Ok(vec![dir])
         }
@@ -24358,9 +24602,7 @@ fn resolve_tab(
     if let Some(t) = tab {
         let tid = TabId::from_raw(t);
         if ws.get_tab(tid).is_none() {
-            return Err(DispatchError::InvalidParams(format!(
-                "タブ {t} が見つからない"
-            )));
+            return Err(Reason::TabNotFound(t).invalid());
         }
         return Ok(tid);
     }
@@ -24391,9 +24633,7 @@ fn dispatch_task_resume(
         crate::task_checkpoints::TaskCheckpointStore::load().map_err(DispatchError::Operation)?;
     let cp = store
         .find(task_id)
-        .ok_or_else(|| {
-            DispatchError::InvalidParams(format!("チェックポイントが見つからない: {task_id}"))
-        })?
+        .ok_or_else(|| Reason::CheckpointNotFound(task_id.to_string()).invalid())?
         .clone();
 
     let project = cp.project.as_deref().unwrap_or("default");
@@ -24607,16 +24847,15 @@ fn dispatch_orchestrator_ledger(p: LedgerParams) -> Result<Value, DispatchError>
             }))
         }
         "record" => {
-            let id = id.ok_or_else(|| DispatchError::InvalidParams("id は必須".into()))?;
-            let outcome =
-                outcome.ok_or_else(|| DispatchError::InvalidParams("outcome は必須".into()))?;
+            let id = id.ok_or_else(|| Reason::Required("id".into()).invalid())?;
+            let outcome = outcome.ok_or_else(|| Reason::Required("outcome".into()).invalid())?;
             ledger::record_outcome(&id, &outcome, rounds, note.as_deref())
                 .map_err(DispatchError::Operation)?;
             Ok(json!({"ok": true, "id": id, "outcome": outcome}))
         }
         "amend" => {
-            let id = id.ok_or_else(|| DispatchError::InvalidParams("id は必須".into()))?;
-            let note = note.ok_or_else(|| DispatchError::InvalidParams("note は必須".into()))?;
+            let id = id.ok_or_else(|| Reason::Required("id".into()).invalid())?;
+            let note = note.ok_or_else(|| Reason::Required("note".into()).invalid())?;
             ledger::amend_entry(&id, &note).map_err(DispatchError::Operation)?;
             Ok(json!({"ok": true, "id": id, "post_issue": true}))
         }
@@ -32627,8 +32866,9 @@ mod tests {
         );
         let err = open(&mut host, dir.join("dir-link")).unwrap_err();
         let message = format!("{err:?}");
+        // 理由の文は表示言語に従う（#2365）
         assert!(
-            message.contains("ファイルではない"),
+            message.contains("ファイルではない") || message.contains("not a file"),
             "ディレクトリへのリンクの理由が変わっている: {message}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -33309,7 +33549,8 @@ mod tests {
             PaneOrigin::Cli,
         );
         assert!(
-            matches!(&refused, Err(DispatchError::Operation(m)) if m.contains("プレビューペインではない")),
+            matches!(&refused, Err(DispatchError::Operation(m))
+                if m.contains("プレビューペインではない") || m.contains("not a preview pane")),
             "{refused:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -50422,7 +50663,7 @@ mod tests {
         let outside = std::env::temp_dir().join(format!("tako-1991-out-{}", std::process::id()));
         std::fs::create_dir_all(&outside).expect("作れる");
         let off = git_write_reply(&outside, Request::GitPull { pane: p }).unwrap_err();
-        assert_eq!(off, op_err("git リポジトリが見つかりません"));
+        assert_eq!(off, Reason::NoGitRepo.operation());
         let _ = std::fs::remove_dir(&outside);
     }
 
@@ -50475,10 +50716,10 @@ mod tests {
             ..UiProbes::default()
         };
         with_ui_probes(&answers, || {
-            assert!(git_conflict_for(&dir)
-                .unwrap_err()
-                .to_string()
-                .contains("git リポジトリが見つかりません"));
+            assert_eq!(
+                git_conflict_for(&dir).unwrap_err(),
+                Reason::NoGitRepo.operation()
+            );
             assert!(tmux_open_lookup(None, "gone")
                 .unwrap_err()
                 .to_string()
@@ -52682,7 +52923,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(missing.contains("パスが存在しない"), "{missing}");
+        assert!(
+            missing.contains("パスが存在しない") || missing.contains("path does not exist"),
+            "{missing}"
+        );
         assert_eq!(
             host.file_clip.as_ref().map(|c| c.mode),
             Some(tako_core::file_clipboard::ClipMode::Copy),
@@ -52799,7 +53043,8 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("2 件すべて") && err.contains("パスが存在しない"),
+            err.contains("2 件すべて")
+                && (err.contains("パスが存在しない") || err.contains("path does not exist")),
             "{err}"
         );
         let _ = std::fs::remove_dir_all(dir);

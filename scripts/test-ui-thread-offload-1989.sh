@@ -299,7 +299,7 @@ else
   fail "⑩ リサイズが効いていない: $(head -c 200 "$TMP/resize.json")"
 fi
 "$TAKO_BIN" git resolve --agent claude --pane "$P1" > "$TMP/resolve.out" 2>&1
-grep -q "git リポジトリが見つかりません\|コンフリクトが発生していません" "$TMP/resolve.out" \
+grep -q "git リポジトリが見つかりません\|no git repository found\|コンフリクトが発生していません" "$TMP/resolve.out" \
   && pass "⑦ 解消エージェントはリポジトリ外 / コンフリクト無しを理由つきで断る（ペインを作らない）" \
   || fail "⑦ 解消エージェントの断りが想定外: $(head -c 200 "$TMP/resolve.out")"
 
@@ -322,7 +322,7 @@ e5rc="$(cat "$TMP/e5.rc" 2>/dev/null || echo '?')"
 echo "    確かめの最中の close: ${took} 秒 / 解消エージェント: 終了コード ${e5rc} / $(head -c 160 "$TMP/e5.out")"
 ui_ok "$took" && pass "E5 確かめの最中でもペインを閉じられる（${took} 秒）" || fail "E5 確かめの最中にペインを閉じられない（${took}）"
 # ペインの不在の文は表示言語で日英どちらにもなる（#1762）
-if [ "$e5rc" != "0" ] && [ "$e5rc" != "142" ] && grep -q "ペイン ${P2} が見つからない\|pane ${P2} not found\|git リポジトリが見つかりません\|コンフリクトが発生していません" "$TMP/e5.out"; then
+if [ "$e5rc" != "0" ] && [ "$e5rc" != "142" ] && grep -q "ペイン ${P2} が見つからない\|pane ${P2} not found\|git リポジトリが見つかりません\|no git repository found\|コンフリクトが発生していません" "$TMP/e5.out"; then
   pass "E5 着いた答えは理由つきで断る（落ちない・固まらない・ペインを作らない）"
 else
   fail "E5 閉じたペインの解消エージェントの結末が想定外（終了コード ${e5rc}）"
@@ -336,7 +336,7 @@ P1="$(first_pane)"
 took="$(timed "$UI_REPLY_LIMIT" "$TAKO_BIN" git resolve --agent claude --pane "$P1")"
 out="$(cat "$TMP/timed.out")"
 echo "    解消エージェント: ${took} 秒 / $(printf '%s' "$out" | head -1 | head -c 120)"
-if ui_ok "$took" && grep -q "git リポジトリが見つかりません" <<<"$out"; then
+if ui_ok "$took" && grep -q "git リポジトリが見つかりません\|no git repository found" <<<"$out"; then
   pass "E4 git が無ければ理由つきで即座に断る"
 else
   fail "E4 git が無いときの結末が想定外（${took}）"

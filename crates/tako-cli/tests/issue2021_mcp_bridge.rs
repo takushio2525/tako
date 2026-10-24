@@ -37,6 +37,19 @@ impl Scratch {
         std::fs::create_dir_all(&dir).expect("一時 dir を作れる");
         Self(dir)
     }
+
+    /// ブリッジが前段の断り（未知のパラメータ等）を組む表示言語を settings.json に書く（#2365）。
+    /// 書かないと system = 実行環境のロケールで決まり、CI と手元で答えが変わる
+    fn language(&self, lang: &str) -> &Self {
+        let data = self.0.join("data");
+        std::fs::create_dir_all(&data).expect("data dir を作れる");
+        std::fs::write(
+            data.join("settings.json"),
+            format!("{{\"language\":\"{lang}\"}}"),
+        )
+        .expect("settings.json を書ける");
+        self
+    }
 }
 
 impl Drop for Scratch {
@@ -153,6 +166,7 @@ fn assert_same_bytes(label: &str, legacy: &[u8], now: &[u8]) {
 #[test]
 fn tako_の中の応答は旧経路とバイト単位で同じ() {
     let scratch = Scratch::new("inside");
+    scratch.language("ja");
     let tako = Path::new(TAKO);
     let legacy = session(tako, &["mcp", "serve"], Env::Inside, true, &scratch);
 
@@ -190,6 +204,46 @@ fn tako_の中の応答は旧経路とバイト単位で同じ() {
         &scratch,
     );
     assert_same_bytes("tako-mcp mcp serve", &legacy, &small_args);
+}
+
+/// #2365: 前段の断り（未知のパラメータ・不明なツール）はブリッジ自身が組むので、呼び出し元
+/// ペインが決まっていても（`TAKO_PANE_ID`）settings.json の表示言語で返る。#2358 までの
+/// ブリッジは呼び出し元が決まると表示言語を決めず、静的既定のまま組んでいた
+#[test]
+fn 呼び出し元が決まっていても前段の断りは設定の表示言語() {
+    for (lang, unknown_param, no_args, unknown_tool) in [
+        (
+            "en",
+            "unknown parameter: bogus",
+            "takes no arguments",
+            "unknown tool: tako_no_such_tool",
+        ),
+        (
+            "ja",
+            "未知のパラメータ: bogus",
+            "引数なし",
+            "不明なツール: tako_no_such_tool",
+        ),
+    ] {
+        let scratch = Scratch::new(&format!("lang-{lang}"));
+        scratch.language(lang);
+        let replies = lines(&session(
+            Path::new(TAKO_MCP),
+            &[],
+            Env::Inside,
+            false,
+            &scratch,
+        ));
+        let message = |i: usize| {
+            replies[i]["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(message(2).contains(unknown_param), "{lang}: {}", replies[2]);
+        assert!(message(3).contains(no_args), "{lang}: {}", replies[3]);
+        assert!(message(5).contains(unknown_tool), "{lang}: {}", replies[5]);
+    }
 }
 
 #[test]
