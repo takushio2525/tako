@@ -2357,6 +2357,20 @@ fn ui_frame_where(with_allowed: bool, lang: Lang) -> String {
     }
 }
 
+/// 使える値のうち言語ごとに書く範囲（`a〜z` / `1〜8 の番号` 等）の腕の行（語は日英で同じなので除く）
+fn ui_allowed_where(allowed: &[Allowed], lang: Lang) -> String {
+    let lines: Vec<String> = allowed
+        .iter()
+        .filter(|a| !matches!(a, Allowed::Word(_)))
+        .map(|a| ui_where("impl Allowed {", variant_name(&format!("{a:?}")), lang))
+        .collect();
+    if lines.is_empty() {
+        "-".to_string()
+    } else {
+        lines.join(", ")
+    }
+}
+
 #[test]
 fn mod_ui_の断りの見本は全バリアントを1つずつ持つ() {
     let reasons: Vec<UiReason> = ui_reason_table().into_iter().map(|(r, ..)| r).collect();
@@ -2494,13 +2508,14 @@ fn mod_ui_の断りの枠と使える値は理由と同じ言語でそろう() {
         let en = e.text_in(Lang::En);
         if let Some(ch) = has_japanese(&en) {
             panic!(
-                "{e:?} の英語に日本語（{ch}）が混ざる: {en}（枠 {} / 理由 {}）",
+                "{e:?} の英語に日本語（{ch}）が混ざる: {en}（枠 {} / 理由 {} / 使える値 {}）",
                 ui_frame_where(with_allowed, Lang::En),
                 ui_where(
                     "impl UiReason {",
                     variant_name(&format!("{:?}", e.what)),
                     Lang::En
-                )
+                ),
+                ui_allowed_where(&e.allowed, Lang::En)
             );
         }
         assert!(en.ends_with("(ui.json was not written)"), "{en}");
@@ -2590,11 +2605,17 @@ fn mod_ui_の実経路の断りは1つの応答に日英が混ざらない() {
     ];
     for (args, old_ja) in &cases {
         let err = tako_control::claude_mod_ui::run(&path, &req(args.clone())).unwrap_err();
+        // 名指しは理由・枠・使える値の範囲の腕のすべて（どこに混ざっても行が出る）
         let at = |lang| match &err {
-            tako_control::claude_mod_ui::RunError::Invalid(e) => ui_where(
-                "impl UiReason {",
-                variant_name(&format!("{:?}", e.what)),
-                lang,
+            tako_control::claude_mod_ui::RunError::Invalid(e) => format!(
+                "理由 {} / 枠 {} / 使える値 {}",
+                ui_where(
+                    "impl UiReason {",
+                    variant_name(&format!("{:?}", e.what)),
+                    lang,
+                ),
+                ui_frame_where(!e.allowed.is_empty(), lang),
+                ui_allowed_where(&e.allowed, lang)
             ),
             other => format!("{other:?}"),
         };
