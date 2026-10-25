@@ -1472,6 +1472,7 @@ fn review_mod_ui() -> Option<tako_core::claude_mod_ui::UiAnswers> {
     use tako_core::claude_mod_ui::{
         ButtonKind, ButtonSpec, Preset, SlashCommand, TakoOp, UiAnswers, Vocab, MAX_BUTTONS,
     };
+    use tako_core::i18n::Lang;
     let read_line = || {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).ok()?;
@@ -1485,8 +1486,9 @@ fn review_mod_ui() -> Option<tako_core::claude_mod_ui::UiAnswers> {
         "  Claude Code の画面の UI（tako mod の帯・ボタン・バー）: {}",
         tako_control::claude_mod_ui::summary(&current)
     );
+    // setup の対話の枠は日本語なので、説明も日本語で引く（1 行に日英を混ぜない。#2365）
     for (i, preset) in Preset::ALL.iter().enumerate() {
-        eprintln!("      [{}] {}", i + 1, preset.describe());
+        eprintln!("      [{}] {}", i + 1, preset.describe_in(Lang::Ja));
     }
     eprint!("      雛形を選択 [1-3]（Enter で今のまま）: ");
     let mut answers = UiAnswers::default();
@@ -1504,12 +1506,12 @@ fn review_mod_ui() -> Option<tako_core::claude_mod_ui::UiAnswers> {
     // ボタンの候補: 組み込みコマンド → tako の操作（shell / prompt は `tako mod ui button add` で）
     let mut candidates: Vec<(ButtonKind, &'static str, &'static str)> = SlashCommand::ALL
         .iter()
-        .map(|c| (ButtonKind::Slash, c.as_str(), c.describe()))
+        .map(|c| (ButtonKind::Slash, c.as_str(), c.describe_in(Lang::Ja)))
         .collect();
     candidates.extend(
         TakoOp::ALL
             .iter()
-            .map(|o| (ButtonKind::Tako, o.as_str(), o.describe())),
+            .map(|o| (ButtonKind::Tako, o.as_str(), o.describe_in(Lang::Ja))),
     );
     eprintln!("      ボタン（{MAX_BUTTONS} 個まで。左から並ぶ）:");
     for (i, (kind, value, about)) in candidates.iter().enumerate() {

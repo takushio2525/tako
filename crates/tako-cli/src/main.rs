@@ -9022,13 +9022,15 @@ fn read_mod_report() -> Result<Value, String> {
 /// 断ったら理由と使える値を出して終了コード 1（ui.json は書いていない）
 fn mod_ui_local(args: &ModArgs) -> Result<(), String> {
     tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    // 断りの文はどれも表示言語に従う（#2365。上で決めた言語）
     let request = tako_control::claude_mod_ui::cli_request(
         &args.rest,
         args.label.as_deref(),
         args.hotkey.as_deref(),
         args.id.as_deref(),
-    )?;
-    let path = tako_control::claude_mod_ui::default_path()?;
+    )
+    .map_err(|e| e.to_string())?;
+    let path = tako_control::claude_mod_ui::default_path().map_err(|e| e.to_string())?;
     let out = tako_control::claude_mod_ui::run(&path, &request).map_err(|e| e.message())?;
     if args.json {
         println!("{}", pretty_json(&out));
@@ -9038,23 +9040,25 @@ fn mod_ui_local(args: &ModArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// `tako mod ui` の表示（今の値・ボタン・選べる値。変更の後は結果と今の値だけ）
+/// `tako mod ui` の表示（今の値・ボタン・選べる値。変更の後は結果と今の値だけ）。
+/// 枠の文は `tako_core::claude_mod_ui::UiText`（表示言語に従う。#2365）
 fn print_mod_ui(out: &Value) {
+    use tako_core::claude_mod_ui::UiText;
     let path = tako_core::paths::shorten_home(out["path"].as_str().unwrap_or("-"));
     let state = match out["state"].as_str() {
-        Some("absent") => "（ファイルは無い = 既定で動いている）".to_string(),
-        Some("repaired") => format!(
-            "（読めない部分を既定で動かした。元は {} に残した）",
-            tako_core::paths::shorten_home(out["quarantine"].as_str().unwrap_or("-"))
-        ),
-        Some("future") => "（新しい tako が書いた形。読める範囲で使い、書き換えない）".to_string(),
-        Some("read_error") => "（読めないので既定で動いている）".to_string(),
+        Some("absent") => UiText::StateAbsent.to_string(),
+        Some("repaired") => UiText::StateRepaired {
+            quarantine: tako_core::paths::shorten_home(out["quarantine"].as_str().unwrap_or("-")),
+        }
+        .to_string(),
+        Some("future") => UiText::StateFuture.to_string(),
+        Some("read_error") => UiText::StateReadError.to_string(),
         _ => String::new(),
     };
     match out["changed"].as_bool() {
-        Some(true) => println!("変えた: {path}"),
-        Some(false) => println!("変わらない（もうその値）: {path}"),
-        None => println!("Claude Code の画面の UI（tako mod）: {path}{state}"),
+        Some(true) => println!("{}", UiText::Changed { path }),
+        Some(false) => println!("{}", UiText::Unchanged { path }),
+        None => println!("{}{state}", UiText::Heading { path }),
     }
     let choices = &out["choices"];
     let word_list = |v: &Value| {
@@ -9079,24 +9083,22 @@ fn print_mod_ui(out: &Value) {
         };
         let allowed = &choices["set"][key];
         if allowed.is_object() {
-            let how = if allowed["type"] == "list" {
-                " から並べる"
-            } else {
-                ""
+            let allowed = UiText::Allowed {
+                values: word_list(&allowed["values"]).replace(", ", " / "),
+                list: allowed["type"] == "list",
             };
-            println!(
-                "  {key:<18} {shown:<36} （{}{how}）",
-                word_list(&allowed["values"]).replace(", ", " / ")
-            );
+            println!("  {key:<18} {shown:<36} {allowed}");
         } else {
             println!("  {key:<18} {shown}");
         }
     }
     let buttons = out["ui"]["buttons"].as_array().cloned().unwrap_or_default();
     println!(
-        "  ボタン（{} / {} 個）:",
-        buttons.len(),
-        tako_core::claude_mod_ui::MAX_BUTTONS
+        "  {}",
+        UiText::ButtonsHeading {
+            count: buttons.len(),
+            max: tako_core::claude_mod_ui::MAX_BUTTONS,
+        }
     );
     for (i, b) in buttons.iter().enumerate() {
         let action: Result<tako_core::claude_mod_ui::ButtonAction, _> =
@@ -9121,11 +9123,11 @@ fn print_mod_ui(out: &Value) {
                 .collect::<Vec<_>>()
                 .join(" / ")
         };
-        println!("  ボタンに使える動作:");
+        println!("  {}", UiText::ButtonActionsHeading);
         println!("    slash  {}", values("slash"));
         println!("    tako   {}", values("tako"));
-        println!("    shell  \"<コマンド>\"（新しいペインで実行）・prompt \"<文>\"（入力欄へ入れるだけ）");
-        println!("  例:");
+        println!("    {}", UiText::ShellPromptLine);
+        println!("  {}", UiText::ExamplesHeading);
         for example in choices["examples"].as_array().into_iter().flatten() {
             println!("    {}", example.as_str().unwrap_or_default());
         }

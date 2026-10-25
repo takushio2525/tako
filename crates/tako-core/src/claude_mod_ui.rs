@@ -312,16 +312,29 @@ impl Vocab for SlashCommand {
 }
 
 impl SlashCommand {
-    /// 何をするか（`tako mod ui` の一覧と setup の対話に出す）
+    /// 何をするか（`tako mod ui` の一覧。表示言語に従う。setup の対話は [`Self::describe_in`] で日本語）
     pub fn describe(self) -> &'static str {
-        match self {
-            Self::Compact => "会話を要約して ctx を空ける",
-            Self::Clear => "会話を消して新しく始める",
-            Self::Context => "ctx の使い方を見る",
-            Self::Cost => "このセッションの費用を見る",
-            Self::Model => "モデルを選び直す",
-            Self::Effort => "effort を選び直す",
-            Self::Tako => "tako のサイドバーを開く",
+        self.describe_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての説明（#2365。日本語は #2365 より前の固定文とバイト一致）
+    pub fn describe_in(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Compact, Ja) => "会話を要約して ctx を空ける",
+            (Self::Compact, En) => "summarize the conversation to free ctx",
+            (Self::Clear, Ja) => "会話を消して新しく始める",
+            (Self::Clear, En) => "clear the conversation and start over",
+            (Self::Context, Ja) => "ctx の使い方を見る",
+            (Self::Context, En) => "see how ctx is used",
+            (Self::Cost, Ja) => "このセッションの費用を見る",
+            (Self::Cost, En) => "see the cost of this session",
+            (Self::Model, Ja) => "モデルを選び直す",
+            (Self::Model, En) => "choose the model again",
+            (Self::Effort, Ja) => "effort を選び直す",
+            (Self::Effort, En) => "choose the effort again",
+            (Self::Tako, Ja) => "tako のサイドバーを開く",
+            (Self::Tako, En) => "open the tako sidebar",
         }
     }
 }
@@ -384,17 +397,35 @@ impl TakoOp {
         }
     }
 
+    /// 何をするか（表示言語に従う。setup の対話は [`Self::describe_in`] で日本語）
     pub fn describe(self) -> &'static str {
-        match self {
-            Self::SplitRight => "右に新しいペインを開く",
-            Self::SplitDown => "下に新しいペインを開く",
-            Self::SessionRestartHarness => "会話を保ったまま claude を起動し直す",
-            Self::SessionRestartHandoff => "引き継ぎを書かせてセッションを交代する",
-            Self::LimitResumeOn => "使用制限が解けたら自動で続ける（on）",
-            Self::LimitResumeOff => "使用制限の自動復帰を止める（off）",
-            Self::Background => "このペインを裏へ回す",
-            Self::Close => "このペインを閉じる",
-            Self::OpenCwd => "このペインのフォルダを開く",
+        self.describe_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての説明（#2365。日本語は #2365 より前の固定文とバイト一致）
+    pub fn describe_in(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::SplitRight, Ja) => "右に新しいペインを開く",
+            (Self::SplitRight, En) => "open a new pane on the right",
+            (Self::SplitDown, Ja) => "下に新しいペインを開く",
+            (Self::SplitDown, En) => "open a new pane below",
+            (Self::SessionRestartHarness, Ja) => "会話を保ったまま claude を起動し直す",
+            (Self::SessionRestartHarness, En) => "restart claude keeping the conversation",
+            (Self::SessionRestartHandoff, Ja) => "引き継ぎを書かせてセッションを交代する",
+            (Self::SessionRestartHandoff, En) => {
+                "have it write a handoff and switch to a new session"
+            }
+            (Self::LimitResumeOn, Ja) => "使用制限が解けたら自動で続ける（on）",
+            (Self::LimitResumeOn, En) => "continue automatically when the usage limit lifts (on)",
+            (Self::LimitResumeOff, Ja) => "使用制限の自動復帰を止める（off）",
+            (Self::LimitResumeOff, En) => "stop resuming automatically after the usage limit (off)",
+            (Self::Background, Ja) => "このペインを裏へ回す",
+            (Self::Background, En) => "send this pane to the background",
+            (Self::Close, Ja) => "このペインを閉じる",
+            (Self::Close, En) => "close this pane",
+            (Self::OpenCwd, Ja) => "このペインのフォルダを開く",
+            (Self::OpenCwd, En) => "open this pane's folder",
         }
     }
 
@@ -488,12 +519,33 @@ impl Vocab for ButtonKind {
 }
 
 impl ButtonKind {
+    /// 何をするか（表示言語に従う）
     pub fn describe(self) -> &'static str {
-        match self {
-            Self::Slash => "Claude Code の組み込みコマンドを送る（/compact 等。許可リストだけ）",
-            Self::Tako => "tako の操作を呼ぶ（ペインの右クリックと同じ操作）",
-            Self::Shell => "書いたコマンドを新しい tako のペインで実行する（4096 バイトまで）",
-            Self::Prompt => "入力欄へ文を入れる（送らない。1000 文字まで）",
+        self.describe_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての説明（#2365。日本語は #2365 より前の固定文とバイト一致）
+    pub fn describe_in(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Slash, Ja) => {
+                "Claude Code の組み込みコマンドを送る（/compact 等。許可リストだけ）"
+            }
+            (Self::Slash, En) => {
+                "send a built-in Claude Code command (/compact etc.; allow-listed ones only)"
+            }
+            (Self::Tako, Ja) => "tako の操作を呼ぶ（ペインの右クリックと同じ操作）",
+            (Self::Tako, En) => {
+                "run a tako action (the same actions as the pane's right-click menu)"
+            }
+            (Self::Shell, Ja) => {
+                "書いたコマンドを新しい tako のペインで実行する（4096 バイトまで）"
+            }
+            (Self::Shell, En) => "run the command you wrote in a new tako pane (up to 4096 bytes)",
+            (Self::Prompt, Ja) => "入力欄へ文を入れる（送らない。1000 文字まで）",
+            (Self::Prompt, En) => {
+                "put text into the input box (it is not sent; up to 1000 characters)"
+            }
         }
     }
 }
@@ -518,12 +570,29 @@ impl Vocab for Preset {
 }
 
 impl Preset {
+    /// 何をするか（表示言語に従う。setup の対話は [`Self::describe_in`] で日本語）
     pub fn describe(self) -> &'static str {
-        match self {
-            Self::Default => "既定（ボタンは compact だけ）",
-            Self::Recommended => "おすすめ（ボタン: compact / context / split right / handoff）",
-            Self::Minimal => {
+        self.describe_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての説明（#2365。日本語は #2365 より前の固定文とバイト一致）
+    pub fn describe_in(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Default, Ja) => "既定（ボタンは compact だけ）",
+            (Self::Default, En) => "default (the only button is compact)",
+            (Self::Recommended, Ja) => {
+                "おすすめ（ボタン: compact / context / split right / handoff）"
+            }
+            (Self::Recommended, En) => {
+                "recommended (buttons: compact / context / split right / handoff)"
+            }
+            (Self::Minimal, Ja) => {
                 "最小（帯はペイン名・要注意・ボタンだけ、バーは ctx だけ、チャットの装飾なし）"
+            }
+            (Self::Minimal, En) => {
+                "minimal (the band shows only the pane name, attention and buttons; the bar \
+                 shows only ctx; no chat decorations)"
             }
         }
     }
@@ -637,22 +706,44 @@ impl SetKey {
         }
     }
 
+    /// 何を決めるか（表示言語に従う）
     pub fn describe(self) -> &'static str {
-        match self {
-            Self::BandHidden => "帯（プロンプトの上の 1 行）を隠す",
-            Self::BandSegments => "帯に並べる区切りと順番",
-            Self::UsageBarPlace => {
+        self.describe_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての説明（#2365。日本語は #2365 より前の固定文とバイト一致）
+    pub fn describe_in(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::BandHidden, Ja) => "帯（プロンプトの上の 1 行）を隠す",
+            (Self::BandHidden, En) => "hide the band (the line above the prompt)",
+            (Self::BandSegments, Ja) => "帯に並べる区切りと順番",
+            (Self::BandSegments, En) => "the segments on the band and their order",
+            (Self::UsageBarPlace, Ja) => {
                 "使用制限・ctx のバーの置き場（prompt_hint = 入力欄の下の行の末尾）"
             }
-            Self::UsageBarItems => "バーに出す項目と順番",
-            Self::CardsPlace => "コマンドカードを誰が描くか",
-            Self::ChatPlace => "チャット風の描画を誰が描くか",
-            Self::ChatBubble => "発言の吹き出し",
-            Self::ChatCodeCopy => "コードブロックの下のコピーボタン",
-            Self::ChatToolSummary => "ツール呼び出しの要約",
-            Self::ColorsAccent => "強調の色（テーマのキー）",
-            Self::ColorsWarn => "警告の色（テーマのキー）",
-            Self::ColorsDim => "控えめな文字の色（テーマのキー）",
+            (Self::UsageBarPlace, En) => {
+                "where the usage-limit / ctx bar goes (prompt_hint = the end of the line below \
+                 the input box)"
+            }
+            (Self::UsageBarItems, Ja) => "バーに出す項目と順番",
+            (Self::UsageBarItems, En) => "the items on the bar and their order",
+            (Self::CardsPlace, Ja) => "コマンドカードを誰が描くか",
+            (Self::CardsPlace, En) => "who draws the command cards",
+            (Self::ChatPlace, Ja) => "チャット風の描画を誰が描くか",
+            (Self::ChatPlace, En) => "who draws the chat-style view",
+            (Self::ChatBubble, Ja) => "発言の吹き出し",
+            (Self::ChatBubble, En) => "speech bubbles for messages",
+            (Self::ChatCodeCopy, Ja) => "コードブロックの下のコピーボタン",
+            (Self::ChatCodeCopy, En) => "the copy button below code blocks",
+            (Self::ChatToolSummary, Ja) => "ツール呼び出しの要約",
+            (Self::ChatToolSummary, En) => "summaries of tool calls",
+            (Self::ColorsAccent, Ja) => "強調の色（テーマのキー）",
+            (Self::ColorsAccent, En) => "the accent color (a theme key)",
+            (Self::ColorsWarn, Ja) => "警告の色（テーマのキー）",
+            (Self::ColorsWarn, En) => "the warning color (a theme key)",
+            (Self::ColorsDim, Ja) => "控えめな文字の色（テーマのキー）",
+            (Self::ColorsDim, En) => "the color of subdued text (a theme key)",
         }
     }
 
@@ -2244,8 +2335,137 @@ pub fn import_band(cfg: &mut UiConfig, hidden: bool, toggled_at: u64) -> bool {
 
 // --- 選べる値（`tako mod ui` の一覧） -------------------------------------------------
 
-/// 選べる値の一覧（`tako mod ui` / MCP の応答の `choices`。setup の対話もこれを読む）
+/// `tako mod ui` の応答（CLI `--json` / MCP `tako_mod` の action=ui）と CLI の表示の枠の文（#2365）。
+///
+/// 断りの文（[`UiError`] 一式）と同じ形で、日英の正本は [`Self::text_in`] の (バリアント, 言語) の
+/// 網羅 match。`Display` は表示言語（`i18n::lang()`）。日本語は #2365 より前の固定文とバイト一致
+/// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）。
+/// パス・語彙の語・利用者が書いた値は言語に依らずそのまま載せる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiText {
+    // ---- 応答の枠 ----
+    /// 変更の応答の `applies_to`（どこへいつ効くか）
+    AppliesTo,
+    /// 新しい tako が書いた形のときの応答の `note`
+    FutureNote { version: u64 },
+    /// `choices.button.hotkey`（打鍵の決まり）
+    HotkeyRule,
+    /// 置き場（`<data_dir>/claude-mod/ui.json`）が決まらない
+    NoDataDir,
+    // ---- CLI の表示（`tako mod ui` の人向けの出力） ----
+    /// 見出し（`{path}` の後ろに置き場の様子 = `State*` が続く）
+    Heading { path: String },
+    /// 置き場の様子: ファイルが無い
+    StateAbsent,
+    /// 置き場の様子: 読めない部分を既定で動かした（`quarantine` = 元を残した場所）
+    StateRepaired { quarantine: String },
+    /// 置き場の様子: 新しい tako が書いた形
+    StateFuture,
+    /// 置き場の様子: 読めない
+    StateReadError,
+    /// 変更の結果: 変えた
+    Changed { path: String },
+    /// 変更の結果: もうその値だった
+    Unchanged { path: String },
+    /// 値の行の末尾の使える値（`list` = 選んで並べる種類）
+    Allowed { values: String, list: bool },
+    /// ボタンの一覧の見出し
+    ButtonsHeading { count: usize, max: usize },
+    /// ボタンに使える動作の見出し
+    ButtonActionsHeading,
+    /// shell / prompt のボタンの書き方の行
+    ShellPromptLine,
+    /// 例の見出し
+    ExamplesHeading,
+}
+
+impl UiText {
+    /// 表示言語を明示しての文言（#2365）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::AppliesTo, Ja) => "tako のペインの claude へは次の報告（最大 15 秒）で届く\
+                 （ui.json は tako の data dir にあり、Claude Code の設定 dir へは書かない）"
+                .into(),
+            (Self::AppliesTo, En) => "reaches claude in tako panes with the next report \
+                 (within 15 seconds; ui.json lives in tako's data dir and nothing is written \
+                 to Claude Code's config dir)"
+                .into(),
+            (Self::FutureNote { version }, Ja) => format!(
+                "新しい tako が書いた形（schema_version {version}）。読める範囲で使い、書き換えない"
+            ),
+            (Self::FutureNote { version }, En) => format!(
+                "written by a newer tako (schema_version {version}); used as far as it can be \
+                 read and not rewritten"
+            ),
+            (Self::HotkeyRule, Ja) => {
+                "数字 1 字か英小文字 1 字（重複不可。省くと空いている英字を選ぶ）".into()
+            }
+            (Self::HotkeyRule, En) => "one digit or one lowercase letter (no duplicates; \
+                 when omitted, a free letter is chosen)"
+                .into(),
+            (Self::NoDataDir, Ja) => "データディレクトリが決まらない（HOME が無い）".into(),
+            (Self::NoDataDir, En) => "cannot determine the data directory (HOME is not set)".into(),
+            (Self::Heading { path }, Ja) => format!("Claude Code の画面の UI（tako mod）: {path}"),
+            (Self::Heading { path }, En) => format!("Claude Code screen UI (tako mod): {path}"),
+            (Self::StateAbsent, Ja) => "（ファイルは無い = 既定で動いている）".into(),
+            (Self::StateAbsent, En) => " (no file = running on the defaults)".into(),
+            (Self::StateRepaired { quarantine }, Ja) => {
+                format!("（読めない部分を既定で動かした。元は {quarantine} に残した）")
+            }
+            (Self::StateRepaired { quarantine }, En) => format!(
+                " (the unreadable parts run on the defaults; the original was kept at {quarantine})"
+            ),
+            (Self::StateFuture, Ja) => {
+                "（新しい tako が書いた形。読める範囲で使い、書き換えない）".into()
+            }
+            (Self::StateFuture, En) => {
+                " (written by a newer tako; used as far as it can be read and not rewritten)".into()
+            }
+            (Self::StateReadError, Ja) => "（読めないので既定で動いている）".into(),
+            (Self::StateReadError, En) => " (cannot be read, so running on the defaults)".into(),
+            (Self::Changed { path }, Ja) => format!("変えた: {path}"),
+            (Self::Changed { path }, En) => format!("changed: {path}"),
+            (Self::Unchanged { path }, Ja) => format!("変わらない（もうその値）: {path}"),
+            (Self::Unchanged { path }, En) => format!("unchanged (already that value): {path}"),
+            // `list` = 選んで並べる種類（帯の区切り・バーの項目）
+            (Self::Allowed { values, list }, Ja) => match list {
+                true => format!("（{values} から並べる）"),
+                false => format!("（{values}）"),
+            },
+            (Self::Allowed { values, list }, En) => match list {
+                true => format!("(pick and order: {values})"),
+                false => format!("({values})"),
+            },
+            (Self::ButtonsHeading { count, max }, Ja) => format!("ボタン（{count} / {max} 個）:"),
+            (Self::ButtonsHeading { count, max }, En) => format!("Buttons ({count} / {max}):"),
+            (Self::ButtonActionsHeading, Ja) => "ボタンに使える動作:".into(),
+            (Self::ButtonActionsHeading, En) => "Actions a button can run:".into(),
+            (Self::ShellPromptLine, Ja) => "shell  \"<コマンド>\"（新しいペインで実行）・\
+                 prompt \"<文>\"（入力欄へ入れるだけ）"
+                .into(),
+            (Self::ShellPromptLine, En) => "shell  \"<command>\" (runs in a new pane) · \
+                 prompt \"<text>\" (only puts it into the input box)"
+                .into(),
+            (Self::ExamplesHeading, Ja) => "例:".into(),
+            (Self::ExamplesHeading, En) => "Examples:".into(),
+        }
+    }
+}
+
+impl std::fmt::Display for UiText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+/// 選べる値の一覧（`tako mod ui` / MCP の応答の `choices`。表示言語に従う）
 pub fn choices() -> Value {
+    choices_in(crate::i18n::lang())
+}
+
+/// 表示言語を明示しての選べる値の一覧（説明の文 `about` / `hotkey` だけが言語で変わる。#2365）
+pub fn choices_in(lang: crate::i18n::Lang) -> Value {
     let mut set = Map::new();
     for key in SetKey::ALL {
         let (shape, values) = match key.shape() {
@@ -2255,7 +2475,7 @@ pub fn choices() -> Value {
         };
         set.insert(
             key.as_str().into(),
-            json!({ "type": shape, "values": values, "about": key.describe() }),
+            json!({ "type": shape, "values": values, "about": key.describe_in(lang) }),
         );
     }
     json!({
@@ -2264,21 +2484,21 @@ pub fn choices() -> Value {
         "button": {
             "max": MAX_BUTTONS,
             "label_max_columns": MAX_LABEL_COLUMNS,
-            "hotkey": "数字 1 字か英小文字 1 字（重複不可。省くと空いている英字を選ぶ）",
+            "hotkey": UiText::HotkeyRule.text_in(lang),
             "kinds": {
                 "slash": {
-                    "about": ButtonKind::Slash.describe(),
-                    "values": SlashCommand::ALL.iter().map(|c| json!({"value": c.as_str(), "about": c.describe()})).collect::<Vec<_>>(),
+                    "about": ButtonKind::Slash.describe_in(lang),
+                    "values": SlashCommand::ALL.iter().map(|c| json!({"value": c.as_str(), "about": c.describe_in(lang)})).collect::<Vec<_>>(),
                 },
                 "tako": {
-                    "about": ButtonKind::Tako.describe(),
-                    "values": TakoOp::ALL.iter().map(|o| json!({"value": o.as_str(), "about": o.describe()})).collect::<Vec<_>>(),
+                    "about": ButtonKind::Tako.describe_in(lang),
+                    "values": TakoOp::ALL.iter().map(|o| json!({"value": o.as_str(), "about": o.describe_in(lang)})).collect::<Vec<_>>(),
                 },
-                "shell": { "about": ButtonKind::Shell.describe() },
-                "prompt": { "about": ButtonKind::Prompt.describe() },
+                "shell": { "about": ButtonKind::Shell.describe_in(lang) },
+                "prompt": { "about": ButtonKind::Prompt.describe_in(lang) },
             },
         },
-        "presets": Preset::ALL.iter().map(|p| json!({"value": p.as_str(), "about": p.describe()})).collect::<Vec<_>>(),
+        "presets": Preset::ALL.iter().map(|p| json!({"value": p.as_str(), "about": p.describe_in(lang)})).collect::<Vec<_>>(),
         "examples": [
             "tako mod ui button add compact",
             "tako mod ui button add split-right",
