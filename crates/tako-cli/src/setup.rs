@@ -1547,7 +1547,8 @@ fn review_mod_ui() -> Option<tako_core::claude_mod_ui::UiAnswers> {
         }
     }
     if let Err(e) = tako_core::claude_mod_ui::check_answers(&answers) {
-        eprintln!("      {}。今のまま", e.message());
+        // setup の対話の枠は日本語なので、断りも日本語で引く（1 行に日英を混ぜない。#2365）
+        eprintln!("      {}。今のまま", e.text_in(tako_core::i18n::Lang::Ja));
         return None;
     }
     (!answers.is_empty()).then_some(answers)

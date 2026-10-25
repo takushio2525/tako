@@ -319,10 +319,13 @@ fn ui_path(host: &dyn ControlHost) -> Result<std::path::PathBuf, DispatchError> 
     })
 }
 
+/// 断りの文は表示言語に従う（前置きの `DispatchError` の表示と同じ言語。#2365）
 fn ui_error(e: crate::claude_mod_ui::RunError) -> DispatchError {
     match e {
-        crate::claude_mod_ui::RunError::Invalid(m) => DispatchError::InvalidParams(m),
-        crate::claude_mod_ui::RunError::Refused(m) => DispatchError::Operation(m),
+        crate::claude_mod_ui::RunError::Invalid(_) => DispatchError::InvalidParams(e.message()),
+        crate::claude_mod_ui::RunError::Refused(_) | crate::claude_mod_ui::RunError::Lock(_) => {
+            DispatchError::Operation(e.message())
+        }
     }
 }
 

@@ -27,6 +27,7 @@ use serde_json::{json, Value};
 use tako_control::claude_mod_ui::{self as ui, RunError};
 use tako_control::protocol::Request;
 use tako_core::claude_mod_ui::{UiAnswers, UiRequest};
+use tako_core::i18n::Lang;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -53,11 +54,15 @@ fn scratch(name: &str) -> PathBuf {
 
 // --- 3 つの口 ------------------------------------------------------------------------
 
+/// 断りの文の言語。setup の口は枠が日本語なので日本語で引く（#2365）ため、3 つの口の文を
+/// 比べるこの番犬は CLI / MCP も日本語で引く（表示言語のグローバルは触らない）
+const LANG: Lang = Lang::Ja;
+
 /// CLI の口（`tako mod ui …` の語をそのまま渡す。`mod_ui_local` と同じ 2 段）
 fn cli(path: &Path, words: &[&str]) -> Result<Value, String> {
     let words: Vec<String> = words.iter().map(|w| (*w).to_string()).collect();
     let request = ui::cli_request(&words, None, None, None)?;
-    ui::run(path, &request).map_err(|e| e.message().to_string())
+    ui::run(path, &request).map_err(|e| e.text_in(LANG))
 }
 
 /// MCP の口（`tools/call tako_mod` を本物の変換に通す。実行係は dispatch の `ui` の腕と同じ 1 本）
@@ -69,7 +74,7 @@ fn mcp(path: &Path, args: Value) -> Result<Value, String> {
                 ui: request,
                 ..
             } if action == "ui" => {
-                ui::run(path, &request.unwrap_or_default()).map_err(|e| e.message().to_string())
+                ui::run(path, &request.unwrap_or_default()).map_err(|e| e.text_in(LANG))
             }
             other => Err(format!("想定外の要求: {other:?}")),
         }
@@ -106,7 +111,7 @@ fn setup(path: &Path, mod_ui: Value) -> Result<Value, String> {
     let answers =
         tako_control::setup::SetupAnswers::from_json(&json!({ "mod_ui": mod_ui }).to_string())?;
     let mod_ui: UiAnswers = answers.mod_ui.expect("mod_ui を読んだ");
-    ui::apply_answers(path, &mod_ui).map_err(|e| e.message().to_string())
+    ui::apply_answers(path, &mod_ui).map_err(|e| e.text_in(LANG))
 }
 
 fn text(path: &Path) -> String {
@@ -293,7 +298,7 @@ fn 不正な値はどの口でも書かれず許される値が返る() {
         ),
         Err(RunError::Invalid(_))
     ));
-    assert_eq!(e_cli.message(), e_mcp);
+    assert_eq!(e_cli.text_in(LANG), e_mcp);
     assert!(e_cli.message().contains("hotkey"), "{}", e_cli.message());
     assert!(e_setup.contains("hotkey"), "{e_setup}");
     // どの口でも書いていない
