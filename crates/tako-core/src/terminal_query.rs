@@ -22,7 +22,9 @@
 //!   テーマを切り替えても器越しのペインは古い色を答え続ける）。購読していないペインへは
 //!   送らない（997 を知らない古い tmux へ送ると、中のペインへ文字として漏れ得る）
 //! - **OSC 52 の読み出し（クリップボードの中身）には答えない**。ペインの中のプログラム
-//!   （ssh 先・信頼できないスクリプトを含む）が、利用者がコピーした秘密を読めてしまうため
+//!   （ssh 先・信頼できないスクリプトを含む）が、利用者がコピーした秘密を読めてしまうため。
+//!   1 段目は Term の設定（`terminal::term_config` の `osc52` = コピーだけ）で、読み出しは
+//!   tako まで届かずに捨てられる。`ClipboardLoad` を断るのはその内側の 2 段目（届いた分だけ数える）
 //!
 //! 何に答えるかは `tako check-health` / MCP `tako_check_health` の `terminal_queries` 節で
 //! 読める（[`report`]。開発不変条件）。A/B は `TAKO_2350_LEGACY=1`（#2350 前 = 色・
@@ -366,7 +368,8 @@ pub struct KindReport {
     pub responder: Responder,
     /// tako が答えた回数（起動から）。答えるのが Term（CSI 18 t）なら None = tako は数えない
     pub answered: Option<u64>,
-    /// 断った回数（起動から）
+    /// 断った回数（起動から）。Term の設定が先に捨てた問い合わせ（OSC 52 の読み出し）は
+    /// tako まで届かないので数えない
     pub declined: u64,
 }
 

@@ -128,11 +128,17 @@ pub enum CommandState {
 /// スクロールバック上限（正本は [`crate::scrollback`]）、`kitty_keyboard` は
 /// CSI > u の push/pop 受理（既定 false だと Shift+Enter 等を区別できない）。
 /// **[`TerminalSession::set_scrollback_limit`] が同じ関数で作り直す**ので、
-/// 上限の動的変更で他の設定が巻き添えで既定へ戻ることはない
+/// 上限の動的変更で他の設定が巻き添えで既定へ戻ることはない。
+///
+/// `osc52` は既定と同じ値（コピーだけ）を**明示して固定する**（#2350）: OSC 52 の読み出し
+/// （クリップボードの中身を子へ渡す）は Term がここで捨て、tako まで届かない。alacritty が
+/// 既定を変えても読み出しが通らないように、既定に頼らない（tako 側の `ClipboardLoad` の断りは
+/// その内側の 2 段目）
 fn term_config(scrollback_lines: usize) -> Config {
     Config {
         scrolling_history: scrollback_lines,
         kitty_keyboard: true,
+        osc52: alacritty_terminal::term::Osc52::OnlyCopy,
         ..Config::default()
     }
 }
@@ -2402,6 +2408,17 @@ fn send_gated(gate: Option<&crate::encoding_pin::PinGate>, notifier: &Notifier, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2350: OSC 52 の読み出し（クリップボードの中身を子へ渡す）は Term の設定で捨てる。
+    /// 読み出しを通す値（`OnlyPaste` / `CopyPaste`）へ変わったら、ペインの中のプログラムが
+    /// 利用者のコピーした秘密を読めるようになる。書き込み（コピー）は今までどおり通す
+    #[test]
+    fn issue2350_osc52の読み出しはtermの設定で捨てる() {
+        use alacritty_terminal::term::Osc52;
+        for lines in [0, crate::scrollback::DEFAULT_LINES] {
+            assert_eq!(term_config(lines).osc52, Osc52::OnlyCopy, "{lines}");
+        }
+    }
 
     /// #2092 の番犬: PTY へ書く口（`.notify(`）は「入力の門（`send_gated`）」
     /// 「門が預かりを流す先（`spawn_in` の flush）」「端末の応答（`send_reply`。`PtyWrite` と

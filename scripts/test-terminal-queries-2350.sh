@@ -128,7 +128,6 @@ prepare_dirs() {
   echo "$TAKO_TMUX_SOCKET" > "$dir/tmux"
   printf '{\n  "language": "ja"\n}\n' > "$TAKO_DATA_DIR/settings.json"
   GUI_DIR="$dir"
-  PROBE_SEQ=0
 }
 start_gui() {
   launch_isolated_gui "$GUI_DIR/app.log" "$@" || exit $?
@@ -150,11 +149,14 @@ wait_prompt() {
   done
   return 1
 }
-# ペインでプローブを走らせ、結果のファイルのパスを返す（読めなければ空）
+# ペインでプローブを走らせ、結果のファイルのパスを返す（読めなければ空）。
+# 呼び出しは $(…) のサブシェルなので、通し番号は変数ではなくファイルに持つ（変数だと親へ
+# 戻らず毎回同じ名前になり、前の結果を新しい結果として読む）
 run_probe() {
-  local pane="$1" out i
-  PROBE_SEQ=$((PROBE_SEQ + 1))
-  out="$GUI_DIR/probe-$PROBE_SEQ.txt"
+  local pane="$1" out i n
+  n=$(( $(cat "$GUI_DIR/probe-seq" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$GUI_DIR/probe-seq"
+  out="$GUI_DIR/probe-$n.txt"
   wait_prompt "$pane" || { echo ""; return; }
   "$TAKO_BIN" send --pane "$pane" "perl $TMP/probe.pl $out" >/dev/null 2>&1
   for i in $(seq 1 600); do
@@ -287,15 +289,32 @@ check_legacy_silent() {
   done
   check "${what}: 色（OSC 10 / 11 / 12 / 4）と明暗（CSI ? 996 n）に答えない" "$silent"
 }
-# ペインを下へ分割して高さを変え、変わった寸法で CSI 14 t / 18 t が答えるかを見る（境界: 寸法が変わった直後）
+# ペインの寸法（`tako list` の cols x rows。GUI が描いて PTY へ当てた値）
+pane_size() {
+  "$TAKO_BIN" list 2>/dev/null | perl -MJSON::PP -0e '
+    my $j = eval { decode_json(<STDIN>) } or exit;
+    for my $t (@{ $j->{tabs} // $j }) {
+      for my $p (@{ $t->{panes} // [] }) {
+        print "$p->{cols}x$p->{rows}" if ($p->{id} // -1) == $ARGV[0];
+      }
+    }' "$1"
+}
+# ペインを下へ分割して高さを変え、変わった寸法で CSI 14 t / 18 t が答えるかを見る（境界: 寸法が変わった直後）。
+# 分割の寸法は次の描画で PTY へ当たるので、`tako list` の寸法が変わるのを待ってから測る
 check_after_split() {
-  local what="$1" before after p2
+  local what="$1" before after size0 i
   before=$(winsize_of "$F")
-  p2=$("$TAKO_BIN" split --pane "$PANE" --down 2>/dev/null | perl -MJSON::PP -0e 'my $j = eval { decode_json(<STDIN>) } or exit; print $j->{pane} // $j->{pane_id} // ""')
+  size0=$(pane_size "$PANE")
+  "$TAKO_BIN" split --pane "$PANE" --down >/dev/null 2>&1
+  for i in $(seq 1 100); do
+    [ "$(pane_size "$PANE")" != "$size0" ] && break
+    sleep 0.1
+  done
+  echo "    tako list の寸法: ${size0} → $(pane_size "$PANE")"
   F=$(run_probe "$PANE")
   [ -n "$F" ] || { fail "${what}: 分割の後のプローブの結果が読めない"; return; }
   after=$(winsize_of "$F")
-  echo "    分割（新ペイン ${p2:-?}）の前の寸法: ${before} → 後: ${after}"
+  echo "    分割の前の寸法（TIOCGWINSZ）: ${before} → 後: ${after}"
   check "${what}: 分割でペインの寸法が変わった（前提）" "$( [ "$before" != "$after" ] && echo 1)"
   check_sizes "$F" "${what}（分割の直後）"
 }
@@ -329,7 +348,8 @@ check_sizes "$F" "③"
 check_declines "$F" "③"
 H=$(health_json)
 echo "    check-health: legacy=$(tq_field legacy <<<"$H") osc11=$(tq_field osc11.answered <<<"$H") osc52_read.declined=$(tq_field osc52_read.declined <<<"$H") color_scheme_panes=$(tq_field color_scheme_panes <<<"$H")"
-check "③: check-health が答えた回数を数える（osc11 は BEL / ST の 2 回以上・osc52_read は断り 1 回以上・csi18t は emulator）" "$( [ "$(tq_field legacy <<<"$H")" = 0 ] && [ "$(tq_field osc11.answered <<<"$H")" -ge 2 ] && [ "$(tq_field osc52_read.declined <<<"$H")" -ge 1 ] && [ "$(tq_field osc52_read.by <<<"$H")" = declined ] && [ "$(tq_field csi18t.by <<<"$H")" = emulator ] && echo 1)"
+# OSC 52 の読み出しは Term の設定（osc52 = コピーだけ）が tako へ回す前に捨てるので、断りの回数は 0 のまま
+check "③: check-health が答えた回数を数える（osc11 は BEL / ST の 2 回以上・osc52_read は declined・csi18t は emulator）" "$( [ "$(tq_field legacy <<<"$H")" = 0 ] && [ "$(tq_field osc11.answered <<<"$H")" -ge 2 ] && [ "$(tq_field osc52_read.by <<<"$H")" = declined ] && [ "$(tq_field csi18t.by <<<"$H")" = emulator ] && echo 1)"
 HT=$("$TAKO_BIN" check-health 2>/dev/null | grep '^端末の問い合わせ: ')
 echo "    CLI: $HT"
 check "③: 人が読む出力に要約 1 行" "$(grep -q '^端末の問い合わせ: 色（OSC 10 / 11 / 12 / 4）.*OSC 52 の読み出しには答えない（起動から応答 [0-9]* 回' <<<"$HT" && echo 1)"
@@ -355,7 +375,19 @@ check_sizes "$F" "④"
 H=$(health_json)
 echo "    check-health: color_scheme_panes=$(tq_field color_scheme_panes <<<"$H")（このペイン ${PANE}）"
 check "④: 器（tmux）のペインが mode 2031 の購読者に並ぶ" "$(perl -MJSON::PP -e 'exit !(grep { $_ == $ARGV[1] } @{ decode_json($ARGV[0]) })' "$(tq_field color_scheme_panes <<<"$H")" "$PANE" 2>/dev/null && echo 1)"
+# 切り替え → tako が tmux へ 997 を知らせる → tmux が OSC 11 を問い合わせ直す → tako が答える。
+# 答えるまでの間に中のプログラムが尋ねると tmux は古い色を返すので、tako が答えた（osc11 の
+# 応答回数が増えた）のを待ってから測る
+A0=$(tq_field osc11.answered <<<"$H")
+T0=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
 "$TAKO_BIN" theme light >/dev/null 2>&1
+for i in $(seq 1 100); do
+  [ "$(tq_field osc11.answered <<<"$(health_json)")" -gt "$A0" ] 2>/dev/null && break
+  sleep 0.1
+done
+A1=$(tq_field osc11.answered <<<"$(health_json)")
+echo "    tmux の問い合わせ直しへの応答: osc11.answered ${A0} → ${A1}（切り替えから $(perl -MTime::HiRes=time -e "printf '%.2f', time - $T0") 秒以内）"
+check "④: テーマの切り替えで tmux が背景色を問い合わせ直し、tako が答えた" "$( [ "$A1" -gt "$A0" ] 2>/dev/null && echo 1)"
 F=$(run_probe "$PANE")
 if [ -n "$F" ]; then
   print_probe "$F"
