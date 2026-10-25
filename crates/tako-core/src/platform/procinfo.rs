@@ -189,7 +189,9 @@ pub fn command_line(pid: u32) -> Option<String> {
 /// プロセスオブジェクトが残る間は読める。生存の材料にするなら
 /// [`crate::platform::process::live_start_time_unix`] を通す
 pub fn start_time_unix(pid: u32) -> Option<u64> {
-    imp::start_time_unix(pid).or_else(|| injected_lingering(pid).then(now_unix_secs))
+    imp::start_time_unix(pid)
+        .or_else(|| injected_lingering(pid).then(now_unix_secs))
+        .or_else(|| injected_reuse(pid).then(now_unix_secs))
 }
 
 /// プロセスオブジェクトの終了コード（#2275）。開けない / 問い合わせに失敗したら `None`。
@@ -201,7 +203,9 @@ pub fn start_time_unix(pid: u32) -> Option<u64> {
 ///
 /// unix は `None`（生死は `kill(pid, 0)` が答える）
 pub fn exit_code(pid: u32) -> Option<u32> {
-    imp::exit_code(pid).or_else(|| injected_lingering(pid).then_some(0))
+    imp::exit_code(pid)
+        .or_else(|| injected_lingering(pid).then_some(0))
+        .or_else(|| injected_reuse(pid).then_some(crate::platform::process::STILL_ACTIVE))
 }
 
 /// #2284 の注入: **テストプロセスでだけ**、OS が「居ない」と答えた pid を
@@ -222,6 +226,74 @@ fn injected_lingering(pid: u32) -> bool {
         && pid != 0
         && pid <= i32::MAX as u32
         && crate::paths::is_test_process()
+        && imp::start_time_unix(pid).is_none()
+}
+
+/// #2284 の注入（10/24 の再発の経路）: **テストプロセスでだけ**、看取りを確かめた pid
+/// （[`crate::platform::process::wait_gone`] が居なくなったと答えた pid）を、押さえ
+/// （[`crate::platform::process::ReapedChild`]）が無く OS もその pid のプロセスを持っていないなら、
+/// **同じ pid を取った別のプロセス**に見せる（`TAKO_2284_INJECT_REUSE=1`）。
+/// [`start_time_unix`] はいまの時刻を、[`exit_code`] は `STILL_ACTIVE` を、
+/// [`crate::platform::process::pid_alive`] は「居る」を返す。
+///
+/// Windows は看取った子のハンドルがすべて閉じた時点で pid を解放し、直後に起こされた
+/// 別のプロセスへ再利用しうる。Windows CI の `platform::lid::tests::実プロセスの生死を引ける` は
+/// 看取った子（`Child`）を drop してから生死を読んでいたので、その間に pid を取った
+/// 別プロセスの生存（起動時刻 = 看取りと同じ秒）を `Owner::Alive` と読んで落ちた。
+/// その状態を macOS でも毎回作る。「ハンドルが残る間はプロセスオブジェクトと pid が残る」
+/// （Windows の仕様）は押さえの台帳で写す。負荷は生成しない。製品のバイナリでは
+/// [`crate::paths::is_test_process`] で無視する
+pub const ENV_INJECT_2284_REUSE: &str = "TAKO_2284_INJECT_REUSE";
+
+/// [`ENV_INJECT_2284_REUSE`] の台帳（看取りを確かめた pid と、pid ごとの押さえの数）
+#[derive(Default)]
+struct ReuseBook {
+    gone: HashSet<u32>,
+    pinned: HashMap<u32, usize>,
+}
+
+/// 注入が効くときだけ台帳を返す
+fn reuse_book() -> Option<std::sync::MutexGuard<'static, ReuseBook>> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on =
+        *ON.get_or_init(|| std::env::var(ENV_INJECT_2284_REUSE).is_ok_and(|v| v.trim() == "1"));
+    // 起動時刻を引けない OS（macOS 以外の unix）は「OS が持っていない」と言えないので効かせない
+    if !(on && cfg!(any(windows, target_os = "macos")) && crate::paths::is_test_process()) {
+        return None;
+    }
+    static BOOK: std::sync::OnceLock<std::sync::Mutex<ReuseBook>> = std::sync::OnceLock::new();
+    Some(
+        BOOK.get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()),
+    )
+}
+
+/// 看取りを確かめた pid を [`ENV_INJECT_2284_REUSE`] の台帳へ載せる（注入が無ければ何もしない）
+pub(crate) fn note_reaped_gone(pid: u32) {
+    if let Some(mut book) = reuse_book() {
+        book.gone.insert(pid);
+    }
+}
+
+/// [`ENV_INJECT_2284_REUSE`] の押さえを 1 つ足す（`held`）/ 外す（注入が無ければ何もしない）
+pub(crate) fn pin_against_reuse(pid: u32, held: bool) {
+    let Some(mut book) = reuse_book() else {
+        return;
+    };
+    let n = book.pinned.entry(pid).or_default();
+    *n = if held { *n + 1 } else { n.saturating_sub(1) };
+}
+
+/// [`ENV_INJECT_2284_REUSE`] で「別のプロセスが取った」と見せる pid か
+pub(crate) fn injected_reuse(pid: u32) -> bool {
+    let Some(book) = reuse_book() else {
+        return false;
+    };
+    pid != 0
+        && pid <= i32::MAX as u32
+        && book.gone.contains(&pid)
+        && book.pinned.get(&pid).copied().unwrap_or(0) == 0
         && imp::start_time_unix(pid).is_none()
 }
 

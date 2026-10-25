@@ -51,7 +51,7 @@ pub fn no_console_window(cmd: &mut Command) -> &mut Command {
 /// 「終わったか」を待ち合わせる用途には使わないこと（`remote.rs` の `has_terminated` が
 /// ゾンビ判定込みでそれを担う）
 pub fn pid_alive(pid: u32) -> bool {
-    imp::pid_alive(pid) || injected_linger(pid)
+    imp::pid_alive(pid) || injected_linger(pid) || super::procinfo::injected_reuse(pid)
 }
 
 /// #2275 の注入: **テストプロセスでだけ**、居なくなった pid を最初に見てから n ミリ秒は
@@ -107,12 +107,54 @@ pub fn wait_gone(pid: u32, limit: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + limit;
     loop {
         if !pid_alive(pid) {
+            // #2284 の注入の台帳へ（看取りを確かめた pid）。注入が無ければ何もしない
+            super::procinfo::note_reaped_gone(pid);
             return true;
         }
         if std::time::Instant::now() >= deadline {
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// 看取った子（終わって `wait()` 済み）を、**その pid を再利用させないまま**持つ（#2284）。
+///
+/// Windows の pid は、プロセスオブジェクトへのハンドルがすべて閉じた時点で解放され、
+/// 直後に起こされた別のプロセスへ**再利用されうる**。`Child` を drop すると親のハンドルが
+/// 閉じるので、「看取った pid = 確実に死んでいる pid」として生死の判定を確かめるテストが
+/// drop した後に読むと、pid を取った別プロセスの生存を読む（#2284 の 10/24 の再発）。
+/// これを持つ間は `Child`（= ハンドル）を持ち続けるので、オブジェクトは「終了済みだが残る」
+/// 状態に留まり pid は再利用されない（[`alive_unless_exited`] の Microsoft の仕様の節）。
+/// その間の [`pid_alive`] は終了コードで「居ない」と答える（#2275）。
+///
+/// unix は `wait()` で刈り取った時点で pid が解放されるので押さえにならないが、
+/// 割り当てが順送りなのですぐ再利用されることは実質ない。
+/// **起動の作法（[`no_console_window`] など）は呼び手が `cmd` に付ける**
+pub struct ReapedChild {
+    child: std::process::Child,
+}
+
+impl ReapedChild {
+    /// `cmd` を起こし、終わるまで待って看取る
+    pub fn run(cmd: &mut Command) -> std::io::Result<Self> {
+        let child = cmd.spawn()?;
+        super::procinfo::pin_against_reuse(child.id(), true);
+        // 先に包む: wait が失敗しても Drop で押さえを外す
+        let mut reaped = Self { child };
+        reaped.child.wait()?;
+        Ok(reaped)
+    }
+
+    /// 看取った子の pid（これを持つ間は再利用されない）
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for ReapedChild {
+    fn drop(&mut self) {
+        super::procinfo::pin_against_reuse(self.child.id(), false);
     }
 }
 

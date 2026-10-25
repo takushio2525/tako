@@ -1118,105 +1118,56 @@ mod tests {
     /// = macOS の CI でもこの経路を毎回試す
     #[test]
     fn issue2284_終わったのに起動時刻が読めるpidをaliveと読まない() {
-        let scratch = tako_core::test_residue::ScratchDir::new("tako-lid-2284");
+        let (ok, stdout) = run_real_probe_injected(
+            tako_core::platform::procinfo::ENV_INJECT_2284,
+            "tako-lid-2284",
+        );
+        assert!(
+            ok,
+            "終わったのに起動時刻が読める pid を Alive と読んだ（#2284）:\n{stdout}"
+        );
+    }
+
+    /// **#2284 の名指し（10/24 の再発）**: 看取った pid を、別のプロセスに再利用されうる状態で
+    /// 読まない（[`実プロセスの生死を引ける`] の「看取った pid は `Dead`」の前提を守る）。
+    ///
+    /// Windows は看取った子のハンドルが閉じた直後に pid を別のプロセスへ再利用しうる。
+    /// 看取った子（`Child`）を drop してから `probe_owner` を読むと、その間に pid を取った
+    /// 別プロセスの生存（`Alive { started: Some(看取りと同じ秒) }`）を読んで落ちる
+    /// （Windows CI の間欠）。看取りを確かめた直後の再利用を注入
+    /// （`TAKO_2284_INJECT_REUSE=1`）で毎回作った子で [`実プロセスの生死を引ける`] を回す
+    #[test]
+    fn issue2284_看取ったpidを再利用されうる状態で読まない() {
+        let (ok, stdout) = run_real_probe_injected(
+            tako_core::platform::procinfo::ENV_INJECT_2284_REUSE,
+            "tako-lid-2284r",
+        );
+        assert!(
+            ok,
+            "看取った pid を、別のプロセスに再利用されうる状態で読んだ（#2284）:\n{stdout}"
+        );
+    }
+
+    /// 注入（`env` = `1`）を付けた子で [`実プロセスの生死を引ける`] を回し、
+    /// （通ったか, 子の stdout）を返す。子でそのテストが走っていなければここで落とす
+    fn run_real_probe_injected(env: &str, scratch_name: &str) -> (bool, String) {
+        let scratch = tako_core::test_residue::ScratchDir::new(scratch_name);
         let exe = std::env::current_exe().expect("テストバイナリのパス");
         let mut cmd = std::process::Command::new(exe);
         cmd.args(["--exact", REAL_PROBE_TEST, "--test-threads=1"])
-            .env(tako_core::platform::procinfo::ENV_INJECT_2284, "1")
+            .env(env, "1")
             .env("TMPDIR", scratch.path())
             .env("TMP", scratch.path())
             .env("TEMP", scratch.path());
         let out = tako_core::platform::process::no_console_window(&mut cmd)
             .output()
             .expect("注入した子を起こせる");
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         assert!(
-            out.status.success(),
-            "終わったのに起動時刻が読める pid を Alive と読んだ（#2284）:\n{stdout}"
-        );
-        assert!(
-            stdout.contains("1 passed"),
+            stdout.contains("1 passed") || stdout.contains("1 failed"),
             "子で {REAL_PROBE_TEST} が走っていない（名前の取り違え）:\n{stdout}"
         );
-    }
-
-    /// **一時の診断（#2284・merge しない）**: Windows で看取った子の pid が、ハンドルを閉じた
-    /// 直後の次の子に再利用されるか / ハンドルを持つ間は再利用されないかを数える。
-    /// 結果は捕捉されない生の stderr へ書き、テスト自体は通す
-    #[test]
-    #[cfg_attr(not(windows), ignore = "Windows の pid 再利用の診断")]
-    fn diag_2284_windows_pid_reuse() {
-        use std::io::Write as _;
-        let scratch = tako_core::test_residue::ScratchDir::new("tako-lid-diag");
-        let exe = std::env::current_exe().expect("テストバイナリのパス");
-        let spawn = || {
-            let mut cmd = std::process::Command::new(&exe);
-            cmd.args(["--exact", "__tako_lid_no_such_test__", "--test-threads=1"])
-                .env("TMPDIR", scratch.path())
-                .env("TMP", scratch.path())
-                .env("TEMP", scratch.path())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            let mut child = tako_core::platform::process::no_console_window(&mut cmd)
-                .spawn()
-                .expect("子を起こせる");
-            child.wait().expect("子を看取れる");
-            child
-        };
-        const N: usize = 60;
-        // (a) 看取った子を drop した直後に次の子を起こす
-        let (mut next_same, mut probe_alive, mut probe_alive_started) = (0, 0, 0);
-        let mut pids = Vec::new();
-        for _ in 0..N {
-            let a = spawn();
-            let pid = a.id();
-            assert!(tako_core::platform::process::wait_gone(
-                pid,
-                std::time::Duration::from_secs(10)
-            ));
-            drop(a);
-            // 本物のテストと同じ順（drop → probe）
-            match probe_owner(pid) {
-                Owner::Alive { started } => {
-                    probe_alive += 1;
-                    if started.is_some() {
-                        probe_alive_started += 1;
-                    }
-                }
-                Owner::Dead | Owner::Unknown => {}
-            }
-            let b = spawn();
-            if b.id() == pid {
-                next_same += 1;
-            }
-            pids.push(pid);
-        }
-        // (b) 看取った子を持ったまま次の子を起こす
-        let (mut held_same, mut held_probe_dead) = (0, 0);
-        for _ in 0..N {
-            let a = spawn();
-            let pid = a.id();
-            let b = spawn();
-            if b.id() == pid {
-                held_same += 1;
-            }
-            if probe_owner(pid) == Owner::Dead {
-                held_probe_dead += 1;
-            }
-            drop(b);
-            drop(a);
-        }
-        let mut sorted = pids.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        let line = format!(
-            "\n[diag-2284] N={N} unpinned: next_child_same_pid={next_same} \
-             probe_after_drop_alive={probe_alive} (with_started={probe_alive_started}) \
-             distinct_pids={} | pinned: next_child_same_pid={held_same} probe_dead={held_probe_dead}\n\
-             [diag-2284] pids={pids:?}\n",
-            sorted.len()
-        );
-        let _ = std::io::stderr().lock().write_all(line.as_bytes());
+        (out.status.success(), stdout)
     }
 
     // --- 記録の入出力（#1373 の症状 2） ---
