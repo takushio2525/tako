@@ -1167,6 +1167,12 @@ codex 0.154.0 はセッションの終わりに **SIGTERM**、agy はセッシ�
   オブジェクトが残る間（誰かがハンドルを持つ間）は `procinfo::start_time_unix` が答える。
   「起動時刻が取れた = 生きている」と読むなら `process::live_start_time_unix` を通す
   （終了コードで終わったと言えれば `None`。読み方は `process::exited` の 1 実装 = #2275 と同じ境界）
+- **看取った pid を「死んだ pid」として読むテストは、看取った子の押さえ（`process::ReapedChild`）を
+  持ったまま読む**（#2284）。Windows は子のハンドルがすべて閉じた直後に pid を別のプロセスへ
+  再利用しうるので、`Child` を drop してから読むと pid を取った別プロセスの生存を読む
+  （Windows CI の `platform::lid::tests::実プロセスの生死を引ける` の間欠。起動時刻は看取りと同じ秒）。
+  押さえを持つ間はオブジェクトが「終了済みだが残る」状態に留まり、`pid_alive` は終了コードで
+  「居ない」と答える。再利用の注入は `TAKO_2284_INJECT_REUSE=1`（`procinfo::ENV_INJECT_2284_REUSE`）
 - ゾンビは `pid_alive` では「居る」。**停止の待ち合わせには使わない**
   （`tako_control::platform::process::has_terminated` がゾンビ込みで担う）
 - 番犬: `crates/tako-control/tests/issue1557_pid_alive_boundary_watchdog.rs`

@@ -478,6 +478,32 @@ mod tests {
         }
     }
 
+    /// [`ReapedChild`] の両端（#2284）: 起こせないコマンドは `Err`。起こせた子は終わるまで
+    /// 待って看取り、押さえを持つ間のその pid は居ない（Windows は終了コード = #2275）
+    #[test]
+    fn reaped_childは起こせないコマンドをerrで返し看取った子のpidを持つ() {
+        let mut missing = Command::new("tako-no-such-program-2284");
+        assert!(
+            ReapedChild::run(no_console_window(&mut missing)).is_err(),
+            "起こせないコマンドを看取れたことにした"
+        );
+        // すぐ終わる子。起動は 1 か所で抑止を通す（#628 の番犬の数え方）
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "exit 0"])
+        } else {
+            ("true", &[])
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(args).stdout(std::process::Stdio::null());
+        let reaped = ReapedChild::run(no_console_window(&mut cmd)).expect("起こして看取れる");
+        let pid = reaped.pid();
+        assert!(
+            !pid_alive(pid),
+            "看取った子 {pid} を押さえの間に居ると読んだ"
+        );
+        drop(reaped);
+    }
+
     /// `wait_gone` の両端: 居続ける pid は上限で諦めて `false`、居ない pid は待たずに `true`
     #[test]
     fn wait_goneは居続けるpidを上限で諦め居ないpidは待たない() {
