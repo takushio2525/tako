@@ -1409,8 +1409,18 @@ mod tests {
         }
     }
 
-    const T1: &str = "2026-10-16T12:00:10.000Z";
-    const T2: &str = "2026-10-16T12:07:00.000Z";
+    /// 応答の時刻の基準 = 実時間の 2 日前の正午（UTC）。固定日付にしない（#2402: 月の掃除が 365 日後に
+    /// その月を消し、取り込んだ直後の集約が無くなる）。プロセスに 1 つなので T1 / T2 は同じ日・同じ月に揃う
+    static NOON: std::sync::LazyLock<i64> = std::sync::LazyLock::new(|| {
+        ((now_ms() / 1000) as i64 - 2 * 86_400).div_euclid(86_400) * 86_400 + 12 * 3_600
+    });
+    /// transcript と同じミリ秒つきの UTC（12:00 と 12:05 の刻み）
+    static T1: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| ts_after_noon(10));
+    static T2: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| ts_after_noon(420));
+
+    fn ts_after_noon(secs: i64) -> String {
+        format!("{}.000Z", iso(*NOON + secs).trim_end_matches('Z'))
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn assistant(id: &str, sid: &str, ts: &str, model: &str, t: [u64; 5], cwd: &str) -> String {
@@ -1451,18 +1461,18 @@ mod tests {
     /// 書きかけの最終行・単価表に無いモデル
     fn fixture(env: &Env) -> (PathBuf, PathBuf, String) {
         let s1 = env.transcript("-home-testuser-dev-alpha", "s1.jsonl");
-        let partial = assistant("msg_c", "s1", T2, OPUS, [1, 9, 0, 0, 9], ALPHA);
+        let partial = assistant("msg_c", "s1", &T2, OPUS, [1, 9, 0, 0, 9], ALPHA);
         // 書きかけの位置（本文に日本語があるので文字境界へ丸める）
         let half = partial.floor_char_boundary(partial.len() / 2);
         write(
             &s1,
             &[
                 user("s1"),
-                assistant("msg_a", "s1", T1, OPUS, [2, 5, 10, 0, 100], ALPHA),
-                assistant("msg_a", "s1", T1, OPUS, [2, 50, 10, 0, 100], ALPHA),
-                assistant("msg_a", "s1", T1, OPUS, [2, 120, 10, 0, 100], ALPHA),
-                assistant("msg_syn", "s1", T1, "<synthetic>", [0; 5], ALPHA),
-                assistant("msg_b", "s1", T2, OPUS, [1, 7, 0, 3, 200], ALPHA),
+                assistant("msg_a", "s1", &T1, OPUS, [2, 5, 10, 0, 100], ALPHA),
+                assistant("msg_a", "s1", &T1, OPUS, [2, 50, 10, 0, 100], ALPHA),
+                assistant("msg_a", "s1", &T1, OPUS, [2, 120, 10, 0, 100], ALPHA),
+                assistant("msg_syn", "s1", &T1, "<synthetic>", [0; 5], ALPHA),
+                assistant("msg_b", "s1", &T2, OPUS, [1, 7, 0, 3, 200], ALPHA),
             ],
             // 書きかけ（改行なし）
             partial.get(..half).unwrap(),
@@ -1473,7 +1483,7 @@ mod tests {
             &[assistant(
                 "msg_s",
                 "s1",
-                T1,
+                &T1,
                 "claude-haiku-4-5-20251001",
                 [0, 10, 100, 0, 1000],
                 ALPHA,
@@ -1486,7 +1496,7 @@ mod tests {
             &[assistant(
                 "msg_d",
                 "s2",
-                T1,
+                &T1,
                 "claude-sonnet-9-9",
                 [5, 5, 0, 0, 5],
                 "/home/testuser/dev/beta/sub",
@@ -1546,7 +1556,7 @@ mod tests {
         assert_eq!(keys["s1"].account.as_deref(), Some("univ"));
         assert_eq!(
             keys["s1"].first_at,
-            tako_core::claude_mod::parse_resets_at(T1).unwrap()
+            tako_core::claude_mod::parse_resets_at(&T1).unwrap()
         );
 
         // 2 回目（変わっていない）: 何も読まない・何も書かない
@@ -1561,7 +1571,7 @@ mod tests {
         // 3 回目: 書きかけの行の残りと新しい応答を足す → 読むのは読み位置から後ろだけ
         let added = format!(
             "{rest}\n{}\n",
-            assistant("msg_e", "s1", T2, OPUS, [0, 1, 0, 0, 1], ALPHA)
+            assistant("msg_e", "s1", &T2, OPUS, [0, 1, 0, 0, 1], ALPHA)
         );
         append(&s1, &added);
         let third = env.update(&mut ix);
@@ -1582,14 +1592,14 @@ mod tests {
         let env = Env::new("truncate");
         let s3 = env.transcript("-home-testuser-dev-beta", "s3.jsonl");
         let beta = "/home/testuser/dev/beta";
-        let d = assistant("msg_d3", "s3", T1, OPUS, [5, 5, 0, 0, 5], beta);
-        let g = assistant("msg_g3", "s3", T1, OPUS, [0, 1000, 0, 0, 0], beta);
+        let d = assistant("msg_d3", "s3", &T1, OPUS, [5, 5, 0, 0, 5], beta);
+        let g = assistant("msg_g3", "s3", &T1, OPUS, [0, 1000, 0, 0, 0], beta);
         write(&s3, &[d.clone(), g.clone()], "");
         let mut ix = env.indexer().with_sources(env.sources());
         assert_eq!(env.update(&mut ix).responses, 2);
         let before = env.totals()[&("s3".to_string(), OPUS.to_string())];
         // 切り詰め: 数え済みの応答だけを残して短い新しい応答を足す（大きさは前より小さい）
-        let f = assistant("msg_f3", "s3", T2, OPUS, [0, 2, 0, 0, 0], beta);
+        let f = assistant("msg_f3", "s3", &T2, OPUS, [0, 2, 0, 0, 0], beta);
         assert!(f.len() < g.len());
         write(&s3, &[d.clone(), f.clone()], "");
         let out = env.update(&mut ix);
@@ -1699,7 +1709,7 @@ mod tests {
         let s = env.transcript("-home-testuser-dev-alpha", &format!("{old}.jsonl"));
         write(
             &s,
-            &[assistant("msg_old", old, T1, OPUS, [1, 1, 0, 0, 1], ALPHA)],
+            &[assistant("msg_old", old, &T1, OPUS, [1, 1, 0, 0, 1], ALPHA)],
             "",
         );
         let paths = SourcePaths {
@@ -1734,7 +1744,7 @@ mod tests {
             &s,
             &format!(
                 "{}\n",
-                assistant("msg_old2", old, T2, OPUS, [1, 1, 0, 0, 1], ALPHA)
+                assistant("msg_old2", old, &T2, OPUS, [1, 1, 0, 0, 1], ALPHA)
             ),
         );
         let out = env.update(&mut ix);
