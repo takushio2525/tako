@@ -37959,6 +37959,8 @@ mod tests {
             let _ = std::process::Command::new("tmux")
                 .args(["-L", &self.socket, "kill-server"])
                 .output();
+            // tmux は kill-server の後もソケットファイルを残す（#2393）
+            tako_core::tmux_backend::remove_socket_file(&self.socket);
             remove_e2e_571_dir(&self.dir);
             // #1022: この e2e は worker を既定 config dir で走らせるので、事前信頼も
             // **実ファイル**（`~/.claude/.claude.json`）へ書く（テストの隔離は通さない）。
@@ -38146,6 +38148,8 @@ mod tests {
             let _ = std::process::Command::new("tmux")
                 .args(["-L", &self.socket, "kill-server"])
                 .output();
+            // tmux は kill-server の後もソケットファイルを残す（#2393）
+            tako_core::tmux_backend::remove_socket_file(&self.socket);
             remove_e2e_577_dir(&self.dir);
             remove_e2e_trust_entry(&self.dir.join("work"));
         }

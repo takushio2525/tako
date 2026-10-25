@@ -60,7 +60,7 @@ fn env_num(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// 1 試行ぶんの置き場。Drop で器のサーバーごと片付ける（自分のソケットだけ）
+/// 1 試行ぶんの置き場。Drop で器のサーバーごと片付ける（自分のソケットだけ。ファイルまで）
 struct Fixture {
     root: PathBuf,
     socket: String,
@@ -73,6 +73,8 @@ impl Drop for Fixture {
         let _ = std::process::Command::new("tmux")
             .args(["-L", &self.socket, "kill-server"])
             .output();
+        // tmux は kill-server の後もソケットファイルを残す（#2393）
+        tako_core::tmux_backend::remove_socket_file(&self.socket);
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }

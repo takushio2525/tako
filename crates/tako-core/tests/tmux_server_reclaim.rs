@@ -58,6 +58,39 @@ fn kill_server(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+/// ダミーの器を立てる一時ディレクトリ。Drop で器を落として dir ごと消す
+/// （assert で落ちた経路でも `sleep 300` の器とソケットを残さない = #2393）
+struct Scratch {
+    dir: PathBuf,
+    servers: Vec<PathBuf>,
+}
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+        Self {
+            dir,
+            servers: Vec::new(),
+        }
+    }
+
+    /// 器を立てる（立てる前に後片付けの対象へ入れる = 途中で落ちても拾う）
+    fn spawn(&mut self, name: &str) -> PathBuf {
+        self.servers.push(self.dir.join(name));
+        spawn_server(&self.dir, name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        for path in &self.servers {
+            kill_server(path);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// 確実に生きていない pid（自分の pid から遠い上限側を探す）。
 ///
 /// **`None` を返す環境がある**: `ports::process_alive` は非 unix では常に `true`
@@ -83,13 +116,12 @@ fn 所有者が生きているサーバーはapplyでも消えない() {
         );
         return;
     };
-    let dir = std::env::temp_dir().join(format!("tako-1192-alive-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+    let mut scratch = Scratch::new("tako-1192-alive");
     // 所有 pid = このテストプロセス（確実に生きている）
-    let alive = spawn_server(&dir, &format!("tako-1192test-{}", std::process::id()));
-    let dead = spawn_server(&dir, &format!("tako-1192test-{dead_owner}"));
+    let alive = scratch.spawn(&format!("tako-1192test-{}", std::process::id()));
+    let dead = scratch.spawn(&format!("tako-1192test-{dead_owner}"));
 
-    let entries = scan_servers_in(&dir, tako_core::ports::process_alive);
+    let entries = scan_servers_in(&scratch.dir, tako_core::ports::process_alive);
     assert_eq!(entries.len(), 2, "ダミー 2 本だけを見ている: {entries:?}");
     assert!(entries.iter().all(|e| e.running), "2 本とも生きている");
 
@@ -137,10 +169,6 @@ fn 所有者が生きているサーバーはapplyでも消えない() {
         verdict_of(&dead_name)
     );
     assert!(!dead.exists(), "kill 後にソケットファイルが残っている");
-
-    kill_server(&alive);
-    kill_server(&dead);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// #1918: tako-core の lib テストの器（`tk-coretest-<用途>-<pid>`）は、テストプロセスが
@@ -154,16 +182,15 @@ fn issue1918_tk_coretestの残骸は所有者の生死で回収される() {
         tako_core::tmux_test_gate::skip("この環境の process_alive は死んだ pid を報告しない");
         return;
     };
-    let dir = std::env::temp_dir().join(format!("tako-1918-tk-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
+    let mut scratch = Scratch::new("tako-1918-tk");
     // 用途の区画に数字を入れない（数字の区画はすべて所有 pid 候補になり、生きた pid に
     // 当たると保護側に倒れて「死んだ残骸」を作れない）
-    let alive = spawn_server(&dir, &format!("tk-coretest-reclaim-{}", std::process::id()));
-    let dead = spawn_server(&dir, &format!("tk-coretest-reclaim-{dead_owner}"));
+    let alive = scratch.spawn(&format!("tk-coretest-reclaim-{}", std::process::id()));
+    let dead = scratch.spawn(&format!("tk-coretest-reclaim-{dead_owner}"));
     // 単発検証の手書きの名前（数字は pid ではない扱い）
-    let adhoc = spawn_server(&dir, &format!("tkadhoc-{dead_owner}"));
+    let adhoc = scratch.spawn(&format!("tkadhoc-{dead_owner}"));
 
-    let entries = scan_servers_in(&dir, tako_core::ports::process_alive);
+    let entries = scan_servers_in(&scratch.dir, tako_core::ports::process_alive);
     assert_eq!(entries.len(), 3, "ダミー 3 本だけを見ている: {entries:?}");
     let outcome = cleanup_servers_from(entries, "tako", &[], true, 0);
     let verdict_of = |path: &Path| {
@@ -194,11 +221,6 @@ fn issue1918_tk_coretestの残骸は所有者の生死で回収される() {
         running(&adhoc),
         "手書きの `tk*` を落とした（数字を pid と読んだ）"
     );
-
-    kill_server(&alive);
-    kill_server(&dead);
-    kill_server(&adhoc);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 残骸ソケット（サーバー不在）はファイルだけ消える。出来たては触らない
