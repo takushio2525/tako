@@ -103,6 +103,8 @@ fn kill_session(bin: &str, socket: &str) {
     let _ = Command::new(bin)
         .args(["-L", socket, "kill-server"])
         .output();
+    // tmux は kill-server の後もソケットファイルを残す（#2393。psmux はファイルを作らない = 何もしない）
+    tako_core::tmux_backend::remove_socket_file(socket);
 }
 
 /// `List` にだけ答える偽 IPC サーバーを立て、discovery へ登録する。
@@ -163,14 +165,15 @@ fn ペインidとセッション名の両方でscrollbackが返る() {
     ) else {
         return;
     };
-    if let Err(e) = start_session(&bin, &socket) {
-        panic!("器（{bin}）があるのにセッションを用意できない: {e}");
-    }
+    // 用意に失敗した経路（下の panic）でも器とソケットファイルを片付ける（#2393）
     let _guard = SessionGuard {
         bin: bin.clone(),
         socket: socket.clone(),
         disc: disc.clone(),
     };
+    if let Err(e) = start_session(&bin, &socket) {
+        panic!("器（{bin}）があるのにセッションを用意できない: {e}");
+    }
 
     // 器の出力が落ち着くまで待つ（固定待ちにしない）
     let mut by_session = Vec::new();

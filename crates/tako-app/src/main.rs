@@ -63299,6 +63299,9 @@ mod self_test {
                     wait_for_focused_text(window, cx, "TMUX-OK-42", Duration::from_secs(20)).await,
                     "tako 内で tmux がエラーなく起動",
                 );
+                // tmux は kill-server の後もソケットファイルを残す。OK が出なかった経路でも
+                // 器を落としてからファイルまで消す（#2393）
+                tako_core::tmux_backend::kill_server(&sock);
             } else {
                 println!("TAKO_SELF_TEST_SKIPPED: 1d（tmux は POSIX シェル環境のみ。器は psmux）");
             }
@@ -66378,9 +66381,8 @@ mod self_test {
                     names.iter().any(|n| n == "tako-test2"),
                     "tako tmux kill が前方一致の別セッションを巻き込まない",
                 );
-                let _ = tako_core::tmux::tmux_command(Some(&sock))
-                    .arg("kill-server")
-                    .status();
+                // ソケットファイルまで消す（tmux は kill-server の後もファイルを残す。#2393）
+                tako_core::tmux_backend::kill_server(&sock);
             } else {
                 eprintln!("（tmux 系 CLI 不在のため項目 48 をスキップ）");
             }
@@ -70237,6 +70239,8 @@ mod self_test {
                 let _ = std::process::Command::new("tmux")
                     .args(["-L", &dnd_sock, "kill-server"])
                     .status();
+                // tmux は kill-server の後もソケットファイルを残す（#2393）
+                tako_core::tmux_backend::remove_socket_file(&dnd_sock);
             } else {
                 println!(
                     "TAKO_SELF_TEST_SKIPPED: 68 の tmux 系（本物の tmux が無い。\
@@ -70635,6 +70639,8 @@ mod self_test {
                 let _ = std::process::Command::new("tmux")
                     .args(["-L", &view_sock, "kill-server"])
                     .status();
+                // tmux は kill-server の後もソケットファイルを残す（#2393）
+                tako_core::tmux_backend::remove_socket_file(&view_sock);
             } else {
                 println!(
                     "TAKO_SELF_TEST_SKIPPED: 73（本物の tmux が無い。ビューペインの \

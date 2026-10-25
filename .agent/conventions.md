@@ -3370,6 +3370,20 @@ v3.3.8 を実測）: `-f` があるとそのファイルだけを読み、既定
 （外れた名前の定義行と `-f` の無い `new-session` の行を `file:line` で落とす。セルフテストの範囲を
 拾えなくなったときも落ちる）。
 
+**テストが器を落としたらソケットファイルまで消す（Issue #2393）**。tmux は `kill-server` の後も
+`$TMUX_TMPDIR/tmux-<uid>/<名前>` のファイルを残すので、`kill-server` だけの後片付けは走るたびに
+1 個ずつためる（#2393 の時点で `issue2350_terminal_queries`・`scrollback_capture`・
+`remote_scrollback_e2e`・セルフテストの 1d / 48 / 68 / 73 が 1 回 1〜3 個ずつ残していた）。
+落としたのと**同じブロックの後ろ**で `tako_core::tmux_backend::remove_socket_file(<器>)` を呼ぶか、
+両方を行う 1 実装 `tako_core::tmux_backend::kill_server(<器>)` で落とす。後片付けは Drop に置き
+（失敗の経路の巻き戻しでも走る）、ガードは器を起こす**前に**作る（起こす途中の失敗でも片付く）。
+Drop の中では panic しない（二重 panic の abort で本来の失敗の理由が消える）。
+用途の区画は数字だけにしない（`tako-2350-<pid>` は `2350` も所有 pid の候補に読まれ、その pid が
+生きていると製品の掃除が保護側に倒れる。`tako-2350test-<pid>` の形にする）。
+番犬は同じ `issue1866_tmux_socket_name_watchdog.rs` の `テストが落とした器はソケットファイルまで消す`
+（器へ渡す `kill-server` ごとに見る。落とした直後に同じ器を起こし直す掃除と、psmux だけの器 =
+`#![cfg(windows)]` のファイルと理由つきの表は数えない）。
+
 ## 実 tmux のテストは門を通して飛ばす（Issue #2106）
 
 **「tmux が無いので飛ばす」を `eprintln!("skip: …"); return;` で直書きしない**。

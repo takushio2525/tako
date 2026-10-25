@@ -11,7 +11,8 @@
 //! psmux 側の同じ検査は `psmux_backend.rs` が持つ。
 //!
 //! **ソケットは必ず隔離する**（`tako-972test-<pid>`）。後始末は
-//! 必ずソケット指定つきの `kill-server` で行う（本番の器に触らない）。
+//! 必ずソケット指定つきの `kill-server` で行い（本番の器に触らない）、
+//! ソケットファイルまで消す（tmux は kill-server の後もファイルを残す = #2393）。
 
 use std::process::Command;
 
@@ -67,16 +68,17 @@ impl Fixture {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        if !ok {
-            tako_core::tmux_test_gate::skip("隔離した tmux サーバーを立てられない");
-            return None;
-        }
-        // 出力が落ち着くまで待つ（固定待ちにしない = #796 の作法）
+        // 立てられなかった経路（skip / CI では panic）でも Drop で器とソケットファイルを片付ける
         let fixture = Self {
             bin,
             socket,
             session,
         };
+        if !ok {
+            tako_core::tmux_test_gate::skip("隔離した tmux サーバーを立てられない");
+            return None;
+        }
+        // 出力が落ち着くまで待つ（固定待ちにしない = #796 の作法）
         for _ in 0..100 {
             if fixture
                 .capture(500)
@@ -129,6 +131,8 @@ impl Drop for Fixture {
         let _ = Command::new(&self.bin)
             .args(["-L", &self.socket, "kill-server"])
             .output();
+        // tmux は kill-server の後もソケットファイルを残す（#2393）
+        tako_core::tmux_backend::remove_socket_file(&self.socket);
     }
 }
 

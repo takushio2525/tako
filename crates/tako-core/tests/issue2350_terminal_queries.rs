@@ -101,14 +101,14 @@ impl Drop for TempDir {
     }
 }
 
-/// 隔離ソケットの tmux サーバー（終わったら kill-server する）
+/// 隔離ソケットの tmux サーバー。Drop（失敗の経路の巻き戻しでも走る）で器を落とし、
+/// ソケットファイルまで消す（tmux は kill-server の後もファイルを残す = #2393）
 struct TmuxServer(String);
 
 impl Drop for TmuxServer {
     fn drop(&mut self) {
-        let _ = std::process::Command::new(tako_core::tmux::tmux_bin())
-            .args(["-L", &self.0, "kill-server"])
-            .output();
+        // kill-server + ソケットファイルの除去の 1 実装（どちらも失敗を無視する = panic しない）
+        tako_core::tmux_backend::kill_server(&self.0);
     }
 }
 
@@ -364,9 +364,13 @@ fn 器越しのペインはtmuxが学んだ色で答えテーマの切り替え�
         return;
     }
     let dir = TempDir::new("tmux");
-    let server = TmuxServer(format!("tako2350-{}", std::process::id()));
+    // 名前は `tako-<用途>-<pid>`: 途中で殺されて Drop が走らなくても製品の掃除
+    // （`tako tmux cleanup --servers`）が名前の pid で器ごと回収できる（#1874 / #2393）。
+    // 用途の区画は数字だけにしない（数字だけの区画はどれも所有 pid の候補として読まれる）
+    let socket = format!("tako-2350test-{}", std::process::id());
+    let server = TmuxServer(socket.clone());
     let options =
-        tako_core::tmux_backend::wrap_options(sh(child_script(&dir), &dir.0), &server.0, "q2350");
+        tako_core::tmux_backend::wrap_options(sh(child_script(&dir), &dir.0), &socket, "q2350");
     let mut pane = Pane::spawn(options);
     // tmux は attach 時に外側の端末（このペイン）へライト / ダークの通知を購読する
     pane.wait_until("tmux の mode 2031 の購読", |p| {

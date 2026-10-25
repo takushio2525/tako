@@ -69,6 +69,23 @@
 //! | 既存のセッションへのグループ（`new-session -t`） | `new-session -d -t orig -s view` | 相手のセッションがある = 器は手前で起きている |
 //! | 引数の検査（`for` / 器を叩かない `assert`） | `for forbidden in ["new-session", …]` | 器を起こさない |
 //! | 名前を辿れない式 | 関数の引数・`self.socket`・`socket_for("1259")` | 定義側で見る（`socket_for` は `tmux_e2e_watchdog.rs`） |
+//!
+//! ## #2393: 器を落としたらソケットファイルまで消す
+//!
+//! tmux は `kill-server` の後も**ソケットファイルを残す**（実測。`$TMUX_TMPDIR/tmux-<uid>/` に
+//! 名前のファイルが 1 個残る）。テストが自前で `kill-server` だけを打つと、走るたびに 1 個ずつ
+//! たまる（#2393 の時点で `issue2350_terminal_queries` が 15 個・`scrollback_capture` が 33 個・
+//! `remote_scrollback_e2e` が 21 個・セルフテストの 1d / 48 / 68 / 73 が 10 個ずつ残っていた）。
+//!
+//! 見る形: テスト領域で器へ渡す `kill-server`（字面の `"kill-server"` と、シェルへ打ち込む
+//! `tmux -L <器> kill-server` = [`SHELL_RUNNERS`] の文の中だけ。失敗の文言・偽のプロセス一覧の
+//! 文字列は数えない）ごとに、**同じブロックの後ろ**でファイルを消していること
+//! （[`SOCKET_FILE_REMOVERS`]。Drop・後片付けの関数・テストの本体のどこで落としても、
+//! そのブロックの中で消す）。落とした直後に同じ器を起こし直す前回の残りの掃除
+//! （後ろ [`RESTART_WINDOW_LINES`] 行以内に `new-session`）は、ファイルを新しいサーバーが使うので数えない。
+//! psmux（Windows）だけの器は tmux のソケット置き場にファイルを作らない
+//! （`tmux_backend::socket_dir()` が `None`）ので、ファイル全体が `#![cfg(windows)]` なら数えず、
+//! それ以外の psmux 専用ファイルは [`KILL_WITHOUT_SOCKET_FILE`] に理由つきで置く。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -796,6 +813,189 @@ fn テストが起こす器は利用者の設定を読まない() {
     );
 }
 
+/// 器へ `kill-server` を渡していても、ソケットファイルを消さなくてよいファイル（**理由つき**。
+/// 増やすときは「tmux のソケット置き場にファイルを作らない」ことを書く）。
+/// ファイル全体が `#![cfg(windows)]` のもの（`spawn_arg_quoting.rs` ほか）は表に置かずに数えない
+const KILL_WITHOUT_SOCKET_FILE: &[(&str, &str)] = &[
+    (
+        "crates/tako-core/tests/common/psmux_ctl.rs",
+        "psmux（Windows）だけの器。tmux のソケット置き場にファイルを作らない（`socket_dir()` が `None`）",
+    ),
+    (
+        "crates/tako-core/tests/shell_send_e2e.rs",
+        "psmux（Windows）だけの実測（`psmux_bin()` が無ければ走らない）。同上",
+    ),
+];
+
+/// 器を落とした後にソケットファイルまで消す書き方（同じブロックの後ろにどれか 1 つ）
+const SOCKET_FILE_REMOVERS: &[&str] = &[
+    // 名前（`-L`）の器のファイル。正本は `tmux_backend::remove_socket_file` の 1 実装
+    "remove_socket_file(",
+    // `kill-server` + `remove_socket_file` の 1 実装
+    "tmux_backend::kill_server(",
+    // パス（`-S`）の器のファイル
+    "remove_file(",
+];
+
+/// 落とした直後に同じ器を起こし直す（前回の残りの掃除）とみなす `new-session` までの行数
+const RESTART_WINDOW_LINES: usize = 40;
+
+/// ファイル全体を Windows だけに絞る属性（器は psmux = ソケットファイルを作らない）
+const WINDOWS_ONLY: &str = "#![cfg(windows)]";
+
+/// 文字列をシェルへ打ち込む呼び出し（この文の中の `-L <器> … kill-server` だけが器を落とす）
+const SHELL_RUNNERS: &[&str] = &["type_text(", "send_line(", "send_keys("];
+
+/// 器へ `kill-server` を渡す位置（字面の `"kill-server"` と、シェルへ打ち込む文字列の
+/// `-L <器> … kill-server`）。検査の文（`assert!(!body.contains("kill-server"))`）・
+/// 文言の中の `\"kill-server\"`・打ち込まない文字列（失敗の文言・偽のプロセス一覧）は数えない
+fn kill_server_sites(src: &TestSource) -> Vec<usize> {
+    const WORD: &str = "kill-server";
+    let mut out = Vec::new();
+    for (at, _) in src.lit.match_indices(WORD) {
+        let before = &src.lit[..at];
+        if before.ends_with('"') {
+            if before.ends_with("\\\"") || !src.lit[at + WORD.len()..].starts_with('"') {
+                continue;
+            }
+            let (start, end) = statement_around(src.code.as_bytes(), at);
+            if !is_inspection(&src.lit[start..end]) {
+                out.push(at);
+            }
+            continue;
+        }
+        // 文字列の外（`code` で残る所）は見ない。シェルへ打ち込む文の中で、同じシェルの
+        // コマンドの手前に `-L` があるもの（= 器を指している）だけを数える
+        if src.code.as_bytes().get(at) != Some(&b' ') {
+            continue;
+        }
+        let (start, end) = statement_around(src.code.as_bytes(), at);
+        if !SHELL_RUNNERS
+            .iter()
+            .any(|r| src.code[start..end].contains(r))
+        {
+            continue;
+        }
+        let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+        let line = &before[line_start..];
+        let cmd_start = SHELL_SEPARATORS
+            .iter()
+            .filter_map(|s| line.rfind(s).map(|i| i + s.len()))
+            .max()
+            .unwrap_or(0);
+        if line[cmd_start..].contains("-L ") {
+            out.push(at);
+        }
+    }
+    out
+}
+
+/// `at` を含む一番内側のブロックの閉じ括弧の位置（`code` の眺めで数える）
+fn block_end(code: &[u8], at: usize) -> usize {
+    let mut depth = 0usize;
+    for (j, &c) in code.iter().enumerate().skip(at) {
+        match c {
+            b'{' => depth += 1,
+            b'}' if depth == 0 => return j,
+            b'}' => depth -= 1,
+            _ => {}
+        }
+    }
+    code.len()
+}
+
+/// 器を落としたのにソケットファイルを消していなければ、その行（消していれば `None`）
+fn missing_socket_removal(src: &TestSource, at: usize) -> Option<String> {
+    let rest = &src.lit[at..block_end(src.code.as_bytes(), at)];
+    if SOCKET_FILE_REMOVERS.iter().any(|r| rest.contains(r)) {
+        return None;
+    }
+    let restart_window: String = rest
+        .split_inclusive('\n')
+        .take(RESTART_WINDOW_LINES)
+        .collect();
+    if restart_window.contains("new-session") {
+        return None;
+    }
+    let line = line_of(&src.lit, at);
+    Some(
+        src.lit
+            .lines()
+            .nth(line - 1)
+            .unwrap_or("")
+            .trim()
+            .to_string(),
+    )
+}
+
+/// `kill-server` の位置の数と、ファイルを消していない位置
+fn socket_removal_problems(sources: &[TestSource]) -> (usize, Vec<String>) {
+    let mut seen = 0usize;
+    let mut problems = Vec::new();
+    for src in sources {
+        // Windows でしか走らないファイルの器は psmux（ソケットファイルを作らない）
+        if KILL_WITHOUT_SOCKET_FILE
+            .iter()
+            .any(|(rel, _)| *rel == src.rel)
+            || src.lit.lines().any(|l| l.trim() == WINDOWS_ONLY)
+        {
+            continue;
+        }
+        for at in kill_server_sites(src) {
+            seen += 1;
+            if let Some(head) = missing_socket_removal(src, at) {
+                problems.push(format!(
+                    "  {}:{} 器を落としたがソケットファイルを消していない: {head}",
+                    src.rel,
+                    line_of(&src.lit, at)
+                ));
+            }
+        }
+    }
+    (seen, problems)
+}
+
+#[test]
+fn テストが落とした器はソケットファイルまで消す() {
+    let root = repo_root();
+    let sources = test_sources(&root);
+    // 例外の表が実在のファイルを指し、そこに `kill-server` がある（改名で黙って外れない）
+    for (rel, why) in KILL_WITHOUT_SOCKET_FILE {
+        let src = sources
+            .iter()
+            .find(|s| s.rel == *rel)
+            .unwrap_or_else(|| panic!("{rel} を走査していない（例外の表を直す）: {why}"));
+        assert!(
+            !kill_server_sites(src).is_empty(),
+            "{rel} に器へ渡す `kill-server` が無い（例外の表から外す）: {why}"
+        );
+    }
+    let (seen, problems) = socket_removal_problems(&sources);
+    // 走査そのものが空振りしていない（#2393 の時点で 12 か所）
+    assert!(
+        seen >= 10,
+        "テストが器へ渡す `kill-server` を {seen} 個しか拾えない（走査の形が実装とずれている）"
+    );
+    // セルフテスト（1d はペインのシェルへ打ち込む形）も見ている
+    let self_test = sources
+        .iter()
+        .find(|s| s.rel == SELF_TEST_MAIN)
+        .expect("tako-app の main.rs を走査している");
+    assert!(
+        !kill_server_sites(self_test).is_empty(),
+        "{SELF_TEST_MAIN} のセルフテストから器へ渡す `kill-server` を拾えない\
+         （1d の `tmux -L <器> kill-server`。走査の形が実装とずれている）"
+    );
+    assert!(
+        problems.is_empty(),
+        "テストが器を `kill-server` で落とした後、ソケットファイルを消していない（#2393。\
+         tmux は kill-server の後もファイルを残すので、走るたびに 1 個ずつたまる。\
+         同じブロックの後ろで `tako_core::tmux_backend::remove_socket_file(<器>)` を呼ぶか、\
+         `tako_core::tmux_backend::kill_server(<器>)` で落とす。Drop に置けば失敗の経路でも走る）:\n{}",
+        problems.join("\n")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,6 +1206,96 @@ fn c() {
         assert_eq!(
             name_lines("crates/tako-control/tests/x.rs", text, &["tako-"]),
             vec![(2, true), (11, false), (13, true)]
+        );
+    }
+
+    /// 断片の `kill-server` の位置ごとの（行, ファイルを消していないか）
+    fn removal_lines(text: &str) -> Vec<(usize, bool)> {
+        let src = TestSource::new("crates/x/tests/fixture.rs", text);
+        kill_server_sites(&src)
+            .into_iter()
+            .map(|at| {
+                (
+                    line_of(&src.lit, at),
+                    missing_socket_removal(&src, at).is_some(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn 落とした後にファイルを消していない後片付けを名指しする() {
+        // 断片は #1300 の番犬（`tmux_e2e_watchdog.rs`）の形（`Command::new("tmux")`）に
+        // 当たらない綴りで書く（向こうは tests/ 直下を原文のまま走査する）
+        let text = r#"
+impl Drop for A {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.bin).args(["-L", &self.socket, "kill-server"]).output();
+    }
+}
+impl Drop for B {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.bin).args(["-L", &self.socket, "kill-server"]).output();
+        tako_core::tmux_backend::remove_socket_file(&self.socket);
+    }
+}
+fn c(bin: &str, path: &Path) {
+    let _ = Command::new(bin).arg("-S").arg(path).arg("kill-server").output();
+    let _ = std::fs::remove_file(path);
+}
+fn d(socket: &str) {
+    let _ = run_tmux(socket, &["kill-server"], BASE);
+    if true {
+        tako_core::tmux_backend::kill_server(socket);
+    }
+}
+fn e(bin: &str, socket: &str) {
+    if ok {
+        let _ = Command::new(bin).args(["-L", socket, "kill-server"]).output();
+    }
+    tako_core::tmux_backend::remove_socket_file(socket);
+}
+"#;
+        // A（消していない）と E（ブロックの外で消す）を落とす。約束は「落としたのと同じブロックで
+        // 消す」（外側まで探すと、Drop の後ろにある別の関数の除去で素通りする）。
+        // B・パス（`-S`）の C・同じブロックの中の入れ子で消す D は通す
+        assert_eq!(
+            removal_lines(text),
+            vec![(4, true), (9, false), (14, false), (18, false), (25, true)]
+        );
+    }
+
+    #[test]
+    fn 起こし直しの前の掃除と検査の文は数えずシェルの形は数える() {
+        let text = r#"
+fn a(bin: &str, socket: &str) {
+    let _ = Command::new(bin).args(["-L", &socket, "kill-server"]).output();
+    let session = "w571";
+    let status = Command::new(bin).args(["-L", &socket, "-f", "/dev/null", "new-session"]);
+}
+fn b(body: &str) {
+    assert!(!body.contains("kill-server"), "名前で列挙した器へ kill-server を打っている");
+    let hit = raw_line.contains("\"kill-server\"") && ok;
+}
+fn c(sock: &str) {
+    type_text(&format!("tmux -L {sock} -f /dev/null new-session -d && tmux -L {sock} kill-server"));
+    check(ok, "tmux がエラーなく起動");
+}
+fn d(sock: &str) {
+    type_text(&format!("tmux -L {sock} new-session -d 'sleep 5' && tmux -L {sock} kill-server"));
+    tako_core::tmux_backend::kill_server(sock);
+}
+fn e(sock: &str) {
+    check(ok, &format!("conf が効いていない疑い。`tmux -L {sock} kill-server` してから測り直す"));
+    let procs = vec![mux(13, "tmux.exe -L tako-iso-9 kill-server", Some(1))];
+}
+"#;
+        // 起こし直しの前の掃除（a）は通す。検査（`contains` / assert の文言）は位置に数えない。
+        // シェルへ打ち込む `-L … kill-server` は数え、消していない c を落とし、d は通す。
+        // 打ち込まない文字列（失敗の文言・偽のプロセス一覧 = e）は `-L` があっても数えない
+        assert_eq!(
+            removal_lines(text),
+            vec![(3, false), (12, true), (16, false)]
         );
     }
 }
