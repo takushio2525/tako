@@ -24,6 +24,10 @@
 //! 案内の 3 状態を見る節）。
 //! #2365 の続きで、`tako mod ui` の断り（UiError 一式 = 理由・使える値・枠・形の問題・
 //! 書き込みの断り）にも広げた（末尾。1 つの断りの中で日英が混ざらないよう 1 本で移した）。
+//! #2365 の続きで、ファイルの移動・コピーの断り（tako-core の `MoveRefusal` / `CopyRefusal` と、
+//! それを包む dispatch の「移動できない」「コピーできない」「N 件すべてできなかった」「貼り付けできない
+//! （N 件すべて）」）を理由ごと広げた（理由は tako-core のエラー型の節・包みは `Reason` の表と
+//! 「包みと理由の全組み合わせ」の節）。
 //!
 //! このファイルは**独立したテストバイナリ**で、言語グローバルを触るのは
 //! `display_follows_the_display_language` の 1 本だけ（ほかは `text_in` で言語を引数に渡す）。
@@ -537,9 +541,15 @@ fn reason_index(r: &Reason) -> usize {
         Reason::ManyOpUnsupported(_) => 82,
         Reason::BadCopyId(_) => 83,
         Reason::CopyNotRunning(_) => 84,
+        Reason::MoveRefused { .. } => 85,
+        Reason::CopyRefused { .. } => 86,
+        Reason::AllFailed(_) => 87,
+        Reason::PasteAllFailed(_) => 88,
+        Reason::NothingToPaste => 89,
+        Reason::AlreadyInFolder => 90,
     }
 }
-const REASON_VARIANTS: usize = 85;
+const REASON_VARIANTS: usize = 91;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -660,6 +670,20 @@ fn reason_samples() -> Vec<Reason> {
         Reason::ManyOpUnsupported("rename".into()),
         Reason::BadCopyId("abc".into()),
         Reason::CopyNotRunning(9),
+        Reason::MoveRefused {
+            refusal: MoveRefusal::NameTaken,
+            src: "/tmp/a.txt".into(),
+            dest: "/tmp/dst".into(),
+        },
+        Reason::CopyRefused {
+            refusal: CopyRefusal::IntoDescendant,
+            src: "/tmp/d".into(),
+            dest: "/tmp/d/sub".into(),
+        },
+        Reason::AllFailed(vec!["reason one".into(), "reason two".into()]),
+        Reason::PasteAllFailed(vec!["reason one".into(), "reason two".into()]),
+        Reason::NothingToPaste,
+        Reason::AlreadyInFolder,
     ]
 }
 
@@ -752,6 +776,12 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "paths で扱えるのは clipboard_copy / clipboard_cut / trash / move / copy（rename）",
     "name は取り消すコピーの番号（copy_progress の id）: abc",
     "番号 9 のコピーは走っていない",
+    "移動できない: 移動先に同じ名前がある（上書きしない）（/tmp/a.txt → /tmp/dst）",
+    "コピーできない: フォルダを自分の配下へはコピーできない（/tmp/d → /tmp/d/sub）",
+    "2 件すべてできなかった: reason one / reason two",
+    "貼り付けできない（2 件すべて）: reason one / reason two",
+    "貼り付けるファイルがクリップボードに無い",
+    "既にそのフォルダにある（何もしていない）",
 ];
 
 /// #2365 より前の `preview_recovery_hint` の 3 つの文（外で消された / 外で変わった / 未保存だけ）
@@ -1168,6 +1198,8 @@ fn 案内の3つの状態と添え方が日英を持ち日本語は旧文と一�
 
 use tako_core::backend::{BackendError, InvalidSessionReason};
 use tako_core::command_card::CommandCardError;
+use tako_core::file_copy::CopyRefusal;
+use tako_core::file_move::MoveRefusal;
 use tako_core::lsp::{
     format::ParseError as FormatParseError, rename::ParseError as RenameParseError,
 };
@@ -1203,6 +1235,8 @@ bilingual!(
     InvalidSessionReason,
     FormatParseError,
     RenameParseError,
+    MoveRefusal,
+    CopyRefusal,
 );
 
 /// 1 つの断りの見本
@@ -1237,6 +1271,10 @@ const LSP_FORMAT_SRC: &str = include_str!("../../tako-core/src/lsp/format.rs");
 const LSP_FORMAT_PATH: &str = "crates/tako-core/src/lsp/format.rs";
 const LSP_RENAME_SRC: &str = include_str!("../../tako-core/src/lsp/rename.rs");
 const LSP_RENAME_PATH: &str = "crates/tako-core/src/lsp/rename.rs";
+const FILE_MOVE_SRC: &str = include_str!("../../tako-core/src/file_move.rs");
+const FILE_MOVE_PATH: &str = "crates/tako-core/src/file_move.rs";
+const FILE_COPY_SRC: &str = include_str!("../../tako-core/src/file_copy.rs");
+const FILE_COPY_PATH: &str = "crates/tako-core/src/file_copy.rs";
 
 // 型ごとの通し番号（網羅 match = バリアントを足すとここがコンパイルで落ち、
 // [`core_cases`] へ見本と旧文を足すまで通らない）
@@ -1342,6 +1380,130 @@ fn rename_parse_index(e: &RenameParseError) -> usize {
         RenameParseError::MalformedChange { .. } => 1,
         RenameParseError::MalformedChanges => 2,
     }
+}
+
+fn move_refusal_index(r: &MoveRefusal) -> usize {
+    match r {
+        MoveRefusal::SourceMissing => 0,
+        MoveRefusal::DestNotDir => 1,
+        MoveRefusal::NoName => 2,
+        MoveRefusal::IntoSelf => 3,
+        MoveRefusal::IntoDescendant => 4,
+        MoveRefusal::NameTaken => 5,
+        MoveRefusal::CrossDevice => 6,
+        MoveRefusal::Remote => 7,
+        MoveRefusal::WorkspaceRoot => 8,
+        MoveRefusal::Io(_) => 9,
+    }
+}
+const MOVE_REFUSALS: usize = 10;
+
+fn copy_refusal_index(r: &CopyRefusal) -> usize {
+    match r {
+        CopyRefusal::SourceMissing => 0,
+        CopyRefusal::DestNotDir => 1,
+        CopyRefusal::NoName => 2,
+        CopyRefusal::IntoSelf => 3,
+        CopyRefusal::IntoDescendant => 4,
+        CopyRefusal::NameTaken => 5,
+        CopyRefusal::NamesExhausted => 6,
+        CopyRefusal::Unreadable(_) => 7,
+        CopyRefusal::Unwritable(_) => 8,
+        CopyRefusal::Special(_) => 9,
+        CopyRefusal::SymlinkPrivilege(_) => 10,
+        CopyRefusal::NoSpace => 11,
+        CopyRefusal::Io(_) => 12,
+        CopyRefusal::Vanished(_) => 13,
+        CopyRefusal::NotRun => 14,
+        CopyRefusal::Cancelled => 15,
+    }
+}
+const COPY_REFUSALS: usize = 16;
+
+/// 移動の断りの見本と #2365 より前の固定文（`MoveRefusal::reason` の日本語。値は ASCII）
+fn move_refusal_table() -> Vec<(MoveRefusal, &'static str)> {
+    vec![
+        (MoveRefusal::SourceMissing, "移す元が見つからない"),
+        (MoveRefusal::DestNotDir, "移動先がフォルダではない"),
+        (MoveRefusal::NoName, "移す元に名前が無い"),
+        (MoveRefusal::IntoSelf, "フォルダを自分自身へは移せない"),
+        (
+            MoveRefusal::IntoDescendant,
+            "フォルダを自分の配下へは移せない",
+        ),
+        (
+            MoveRefusal::NameTaken,
+            "移動先に同じ名前がある（上書きしない）",
+        ),
+        (
+            MoveRefusal::CrossDevice,
+            "別のボリュームへは移せない（コピーしてから元を消す移動は未対応）",
+        ),
+        (MoveRefusal::Remote, "リモート（SSH）の項目は移せない"),
+        (
+            MoveRefusal::WorkspaceRoot,
+            "ワークスペースのフォルダ（見出し）は移せない",
+        ),
+        (
+            MoveRefusal::Io("Permission denied (os error 13)".into()),
+            "OS が断った: Permission denied (os error 13)",
+        ),
+    ]
+}
+
+/// コピーの断りの見本と #2365 より前の固定文（`CopyRefusal::reason` の日本語。値は ASCII）。
+/// `Vanished` / `NotRun` は #2365 より前は `Io` の中身に日本語の文を入れていたもの
+/// （`read_error` の NotFound・dispatch の `finish_offload`）で、表示は `Io` の形のまま
+fn copy_refusal_table() -> Vec<(CopyRefusal, &'static str)> {
+    use std::path::PathBuf;
+    vec![
+        (CopyRefusal::SourceMissing, "コピー元が見つからない"),
+        (CopyRefusal::DestNotDir, "貼り付け先がフォルダではない"),
+        (CopyRefusal::NoName, "コピー元に名前が無い"),
+        (
+            CopyRefusal::IntoSelf,
+            "フォルダを自分自身の中へはコピーできない",
+        ),
+        (
+            CopyRefusal::IntoDescendant,
+            "フォルダを自分の配下へはコピーできない",
+        ),
+        (
+            CopyRefusal::NameTaken,
+            "貼り付け先に同じ名前ができた（上書きしない）",
+        ),
+        (
+            CopyRefusal::NamesExhausted,
+            "空いている名前が見つからない（上書きしない）",
+        ),
+        (
+            CopyRefusal::Unreadable(PathBuf::from("/tmp/secret")),
+            "読めない項目がある: /tmp/secret",
+        ),
+        (
+            CopyRefusal::Unwritable(PathBuf::from("/tmp/locked")),
+            "書き込めない: /tmp/locked",
+        ),
+        (
+            CopyRefusal::Special(PathBuf::from("/tmp/fifo")),
+            "特殊なファイル（FIFO・ソケット・デバイス）はコピーできない: /tmp/fifo",
+        ),
+        (
+            CopyRefusal::SymlinkPrivilege(PathBuf::from("/tmp/link")),
+            "シンボリックリンクを作る権限が無い（Windows は開発者モードか管理者が要る）: /tmp/link",
+        ),
+        (CopyRefusal::NoSpace, "空き容量が足りない"),
+        (
+            CopyRefusal::Io("Permission denied (os error 13)".into()),
+            "OS が断った: Permission denied (os error 13)",
+        ),
+        (
+            CopyRefusal::Vanished(PathBuf::from("/tmp/gone")),
+            "OS が断った: コピーの途中で見つからなくなった: /tmp/gone",
+        ),
+        (CopyRefusal::NotRun, "OS が断った: コピーが走らなかった"),
+        (CopyRefusal::Cancelled, "取り消した（作りかけは消した）"),
+    ]
 }
 
 fn io(kind: std::io::ErrorKind, message: &str) -> std::io::Error {
@@ -1656,6 +1818,17 @@ fn core_cases() -> Vec<CoreCase> {
         ][rename_parse_index(&e)];
         out.push(case(e, rename, arm, old));
     }
+    // #2365 の続き: 移動・コピーの断りの理由（dispatch の「移動できない」「コピーできない」が包む）
+    let moves = (FILE_MOVE_SRC, FILE_MOVE_PATH, "impl MoveRefusal {");
+    let copies = (FILE_COPY_SRC, FILE_COPY_PATH, "impl CopyRefusal {");
+    for (r, old) in move_refusal_table() {
+        let arm = variant_name(&format!("{r:?}")).to_string().leak();
+        out.push(case(r, moves, arm, old));
+    }
+    for (r, old) in copy_refusal_table() {
+        let arm = variant_name(&format!("{r:?}")).to_string().leak();
+        out.push(case(r, copies, arm, old));
+    }
     out
 }
 
@@ -1674,6 +1847,10 @@ fn core_のエラー型の見本は全バリアントを1つずつ持つ() {
     covers_all(&changes_samples(), changes_index, 5);
     covers_all(&card_samples(), card_index, 9);
     covers_all(&INVALID_SESSION_REASONS, invalid_session_index, 4);
+    let moves: Vec<MoveRefusal> = move_refusal_table().into_iter().map(|(r, _)| r).collect();
+    covers_all(&moves, move_refusal_index, MOVE_REFUSALS);
+    let copies: Vec<CopyRefusal> = copy_refusal_table().into_iter().map(|(r, _)| r).collect();
+    covers_all(&copies, copy_refusal_index, COPY_REFUSALS);
     // 1 つずつ並べた型（LineOp / Session / Runner / Backend / ParseError 2 種）は
     // 見本の数を網羅 match の通し番号の数とそろえる
     let cases = core_cases();
@@ -1823,6 +2000,181 @@ fn core_のエラー型の境界() {
     let read = TextEditError::Read(io(std::io::ErrorKind::NotFound, "gone"));
     assert!(read.source().is_some());
     assert!(TextEditError::ReadOnly.source().is_none());
+}
+
+// ---- #2365 の続き: 移動・コピーの断りの包み（dispatch）と理由（tako-core）の全組み合わせ ----
+//
+// 包みだけ移すと「英語の包み + 日本語の理由」に混ざる（#2365 の 3 本目の worker の判断）ので、
+// 理由ごと 1 本で移した。理由そのものは上の tako-core のエラー型の節が見る。ここでは包み
+// （`Reason::MoveRefused` / `CopyRefused` と、それを並べる `AllFailed` / `PasteAllFailed`）へ理由の
+// 全バリアントを入れ、1 つの断りの中で言語がそろうこと・日本語が #2365 より前の組み立てと
+// バイト一致することを見る。落ちたら包みの腕と理由の腕の両方の行（`file:line`）を名指しする
+
+/// 包みと理由の 1 組（表示用の名前・日英の文・#2365 より前の日本語・名指し）
+struct Wrapped {
+    debug: String,
+    ja: String,
+    en: String,
+    old_ja: String,
+    at: Box<dyn Fn(Lang) -> String>,
+}
+
+/// 理由の全バリアントを包んだもの（移動 = `run_file_move` / コピー = `copy_refused_text` の形）
+fn wrapped_refusals() -> Vec<Wrapped> {
+    let (src, dest) = ("/tmp/src", "/tmp/dest");
+    let mut out = Vec::new();
+    for (refusal, old) in move_refusal_table() {
+        let wrap = Reason::MoveRefused {
+            refusal: refusal.clone(),
+            src: src.into(),
+            dest: dest.into(),
+        };
+        let arm = variant_name(&format!("{refusal:?}")).to_string();
+        out.push(Wrapped {
+            debug: format!("{wrap:?}"),
+            ja: wrap.text_in(Lang::Ja),
+            en: wrap.text_in(Lang::En),
+            // #2365 より前の `run_file_move` の `format!("移動できない: {}（{} → {}）", …)`
+            old_ja: format!("移動できない: {old}（{src} → {dest}）"),
+            at: Box::new(move |lang| {
+                format!(
+                    "包み {} / 理由 {}",
+                    reason_where(&wrap, lang),
+                    where_arm(
+                        FILE_MOVE_SRC,
+                        FILE_MOVE_PATH,
+                        "impl MoveRefusal {",
+                        &arm,
+                        lang
+                    )
+                )
+            }),
+        });
+    }
+    for (refusal, old) in copy_refusal_table() {
+        let wrap = Reason::CopyRefused {
+            refusal: refusal.clone(),
+            src: src.into(),
+            dest: dest.into(),
+        };
+        let arm = variant_name(&format!("{refusal:?}")).to_string();
+        out.push(Wrapped {
+            debug: format!("{wrap:?}"),
+            ja: wrap.text_in(Lang::Ja),
+            en: wrap.text_in(Lang::En),
+            // #2365 より前の `copy_refused_text` の `format!("コピーできない: {}（{} → {}）", …)`
+            old_ja: format!("コピーできない: {old}（{src} → {dest}）"),
+            at: Box::new(move |lang| {
+                format!(
+                    "包み {} / 理由 {}",
+                    reason_where(&wrap, lang),
+                    where_arm(
+                        FILE_COPY_SRC,
+                        FILE_COPY_PATH,
+                        "impl CopyRefusal {",
+                        &arm,
+                        lang
+                    )
+                )
+            }),
+        });
+    }
+    out
+}
+
+#[test]
+fn 移動とコピーの包みと理由の全組み合わせで1つの断りに日英が混ざらない() {
+    let wrapped = wrapped_refusals();
+    assert_eq!(wrapped.len(), MOVE_REFUSALS + COPY_REFUSALS);
+    for w in &wrapped {
+        assert_eq!(w.ja, w.old_ja, "{}（{}）", w.debug, (w.at)(Lang::Ja));
+        if let Some(c) = has_japanese(&w.en) {
+            panic!(
+                "{} の英語の断りに日本語（{c}）が混ざる: {}（{}）",
+                w.debug,
+                w.en,
+                (w.at)(Lang::En)
+            );
+        }
+        assert_ne!(w.ja, w.en, "{} の英語が日本語と同じ文", w.debug);
+        // 「見つからない」の読み（リモートの 404 寄せ）は包んでも日英で同じ
+        assert_eq!(
+            E::says_not_found(&w.ja),
+            E::says_not_found(&w.en),
+            "{}: {} / {}（{}）",
+            w.debug,
+            w.ja,
+            w.en,
+            (w.at)(Lang::En)
+        );
+        // dispatch はこの文を前置きの無い断り（`Operation`）で返す = CLI / MCP の応答そのもの
+        for (lang, text) in [(Lang::Ja, &w.ja), (Lang::En, &w.en)] {
+            assert_eq!(&E::Operation(text.clone()).text_in(lang), text);
+        }
+    }
+    // 全部断られたときの並べ方（`many_reply` = N 件すべてできなかった / `paste_reply` =
+    // 貼り付けできない（N 件すべて））も、並べた 1 件ずつの断りと同じ言語でそろう
+    // 1 件ずつの断りの文を並べる包み（`AllFailed` / `PasteAllFailed`）
+    type Gather = fn(Vec<String>) -> Reason;
+    let alls: [(Gather, &str); 2] = [
+        (Reason::AllFailed, "2 件すべてできなかった: "),
+        (Reason::PasteAllFailed, "貼り付けできない（2 件すべて）: "),
+    ];
+    for pair in wrapped.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        for (all, old_head) in alls {
+            let ja = all(vec![a.ja.clone(), b.ja.clone()]).text_in(Lang::Ja);
+            assert_eq!(ja, format!("{old_head}{} / {}", a.old_ja, b.old_ja));
+            let en_reason = all(vec![a.en.clone(), b.en.clone()]);
+            let en = en_reason.text_in(Lang::En);
+            if let Some(c) = has_japanese(&en) {
+                panic!(
+                    "{} の英語の断りに日本語（{c}）が混ざる: {en}（{}）",
+                    variant_name(&format!("{en_reason:?}")),
+                    reason_where(&en_reason, Lang::En)
+                );
+            }
+        }
+    }
+}
+
+/// 境界: 包みのパスが空・日本語のパス（パスは書き換えず、包みと理由の言語だけが変わる）。
+/// 1 件だけ断られたときは並べずにその文をそのまま返す（`many_reply` / `paste_reply`）ので、
+/// 件数の包みは 2 件以上でだけ使われる
+#[test]
+fn 移動とコピーの包みの境界() {
+    let empty = Reason::MoveRefused {
+        refusal: MoveRefusal::SourceMissing,
+        src: String::new(),
+        dest: String::new(),
+    };
+    assert_eq!(
+        empty.text_in(Lang::Ja),
+        "移動できない: 移す元が見つからない（ → ）"
+    );
+    assert_eq!(
+        empty.text_in(Lang::En),
+        "cannot move: the item to move was not found ( → )"
+    );
+    let named = Reason::CopyRefused {
+        refusal: CopyRefusal::NameTaken,
+        src: "/tmp/メモ.txt".into(),
+        dest: "/tmp/移動先".into(),
+    };
+    let en = named.text_in(Lang::En);
+    let at = reason_where(&named, Lang::En);
+    assert!(en.starts_with("cannot copy: "), "{en}（{at}）");
+    assert!(
+        en.ends_with("(/tmp/メモ.txt → /tmp/移動先)"),
+        "{en}（{at}）"
+    );
+    // パスを除けば日本語は残らない
+    let without_paths = en.replace("/tmp/メモ.txt", "").replace("/tmp/移動先", "");
+    assert!(has_japanese(&without_paths).is_none(), "{en}（{at}）");
+    // 3 件以上でも件数と並びは保つ
+    let three = Reason::AllFailed(vec!["a".into(), "b".into(), "c".into()]);
+    assert_eq!(three.text_in(Lang::Ja), "3 件すべてできなかった: a / b / c");
+    assert_eq!(three.text_in(Lang::En), "all 3 items failed: a / b / c");
 }
 
 // ---- #2365 の続き: `tako mod ui` の断り（UiError 一式） ----

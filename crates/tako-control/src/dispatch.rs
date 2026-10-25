@@ -334,6 +334,29 @@ pub enum Reason {
     /// `copy_cancel` の `name` が番号ではない。中身は渡された文字
     BadCopyId(String),
     CopyNotRunning(u64),
+    // ---- #2365 の続き: 移動・コピーの断り（理由は tako-core の `MoveRefusal` / `CopyRefusal`。
+    // 包みだけ移すと「英語の包み + 日本語の理由」に混ざるので理由ごと同じ言語で引く） ----
+    /// `移動できない: <理由>（<src> → <dest>）`
+    MoveRefused {
+        refusal: tako_core::file_move::MoveRefusal,
+        src: String,
+        dest: String,
+    },
+    /// `コピーできない: <理由>（<src> → <dest>）`
+    CopyRefused {
+        refusal: tako_core::file_copy::CopyRefusal,
+        src: String,
+        dest: String,
+    },
+    /// まとめた操作（`paths`）が 2 件以上すべて断られた。中身は 1 件ずつの断りの文
+    /// （1 件だけならその文をそのまま返すので、ここへは来ない）
+    AllFailed(Vec<String>),
+    /// 貼り付けが 2 件以上すべて断られた。中身は 1 件ずつの断りの文
+    PasteAllFailed(Vec<String>),
+    /// 貼るファイルがクリップボードに無い
+    NothingToPaste,
+    /// 移す先が今いるフォルダ（断りではなく、移動の応答の `note`）
+    AlreadyInFolder,
 }
 
 impl std::fmt::Display for Reason {
@@ -747,6 +770,38 @@ impl Reason {
             }
             (Self::CopyNotRunning(id), Ja) => format!("番号 {id} のコピーは走っていない"),
             (Self::CopyNotRunning(id), En) => format!("copy {id} is not running"),
+            (Self::MoveRefused { refusal, src, dest }, Ja) => {
+                format!("移動できない: {}（{src} → {dest}）", refusal.text_in(Ja))
+            }
+            (Self::MoveRefused { refusal, src, dest }, En) => {
+                format!("cannot move: {} ({src} → {dest})", refusal.text_in(En))
+            }
+            (Self::CopyRefused { refusal, src, dest }, Ja) => {
+                format!("コピーできない: {}（{src} → {dest}）", refusal.text_in(Ja))
+            }
+            (Self::CopyRefused { refusal, src, dest }, En) => {
+                format!("cannot copy: {} ({src} → {dest})", refusal.text_in(En))
+            }
+            (Self::AllFailed(reasons), Ja) => {
+                format!("{} 件すべてできなかった: {}", reasons.len(), reasons.join(" / "))
+            }
+            (Self::AllFailed(reasons), En) => {
+                format!("all {} items failed: {}", reasons.len(), reasons.join(" / "))
+            }
+            (Self::PasteAllFailed(reasons), Ja) => format!(
+                "貼り付けできない（{} 件すべて）: {}",
+                reasons.len(),
+                reasons.join(" / ")
+            ),
+            (Self::PasteAllFailed(reasons), En) => format!(
+                "cannot paste (all {} items): {}",
+                reasons.len(),
+                reasons.join(" / ")
+            ),
+            (Self::NothingToPaste, Ja) => "貼り付けるファイルがクリップボードに無い".to_string(),
+            (Self::NothingToPaste, En) => "no files to paste on the clipboard".to_string(),
+            (Self::AlreadyInFolder, Ja) => "既にそのフォルダにある（何もしていない）".to_string(),
+            (Self::AlreadyInFolder, En) => "already in that folder (nothing was done)".to_string(),
         }
     }
 
@@ -4119,11 +4174,10 @@ pub fn finish_offload(
                 }
                 CopyReply::One => {
                     let (src, dest) = job.items.into_iter().next().unwrap_or_default();
-                    let outcome = outcomes.into_iter().next().unwrap_or_else(|| {
-                        Err(tako_core::file_copy::CopyRefusal::Io(
-                            "コピーが走らなかった".into(),
-                        ))
-                    });
+                    let outcome = outcomes
+                        .into_iter()
+                        .next()
+                        .unwrap_or(Err(tako_core::file_copy::CopyRefusal::NotRun));
                     finish_file_copy(host, &src, &dest, outcome)
                 }
             }
@@ -21083,12 +21137,12 @@ fn run_file_move(
 ) -> Result<Value, DispatchError> {
     use tako_core::file_move::{self, Planned};
     let refused = |refusal: file_move::MoveRefusal| {
-        DispatchError::Operation(format!(
-            "移動できない: {}（{} → {}）",
-            refusal.reason(),
-            src.display(),
-            dest.display()
-        ))
+        Reason::MoveRefused {
+            refusal,
+            src: src.display().to_string(),
+            dest: dest.display().to_string(),
+        }
+        .operation()
     };
     let plan = match file_move::plan(src, dest).map_err(refused)? {
         Planned::Unchanged { at, kind } => {
@@ -21099,7 +21153,7 @@ fn run_file_move(
                 "to": at,
                 "kind": kind.slug(),
                 "followed": [],
-                "note": "既にそのフォルダにある（何もしていない）",
+                "note": Reason::AlreadyInFolder.to_string(),
             }));
         }
         Planned::Move(plan) => plan,
@@ -21329,16 +21383,12 @@ fn many_reply(
         }
     }
     if done.is_empty() && !failed.is_empty() {
-        let reasons: Vec<&str> = failed.iter().map(|(_, r)| r.as_str()).collect();
-        return Err(DispatchError::Operation(if reasons.len() == 1 {
-            reasons[0].to_string()
+        let mut reasons: Vec<String> = failed.into_iter().map(|(_, r)| r).collect();
+        return Err(if reasons.len() == 1 {
+            DispatchError::Operation(reasons.remove(0))
         } else {
-            format!(
-                "{} 件すべてできなかった: {}",
-                reasons.len(),
-                reasons.join(" / ")
-            )
-        }));
+            Reason::AllFailed(reasons).operation()
+        });
     }
     let mut out = json!({
         "done": done,
@@ -21356,18 +21406,18 @@ fn many_reply(
     Ok(out)
 }
 
-/// コピーを断ったときの文面（GUI の通知欄・CLI・MCP が同じ文面を出す）
+/// コピーを断ったときの文面（GUI の通知欄・CLI・MCP が同じ文面を出す。表示言語に従う = #2365）
 fn copy_refused_text(
     refusal: &tako_core::file_copy::CopyRefusal,
     src: &std::path::Path,
     dest: &std::path::Path,
 ) -> String {
-    format!(
-        "コピーできない: {}（{} → {}）",
-        refusal.reason(),
-        src.display(),
-        dest.display()
-    )
+    Reason::CopyRefused {
+        refusal: refusal.clone(),
+        src: src.display().to_string(),
+        dest: dest.display().to_string(),
+    }
+    .to_string()
 }
 
 /// 写した 1 件の応答（`copied` / `from` / `to` / `kind` / `renamed` / `entries` / `bytes`）
@@ -21459,9 +21509,8 @@ fn paste_plan(host: &dyn ControlHost, row: &std::path::Path) -> Result<PastePlan
     let row_is_dir = row.is_dir();
     let tako = host.file_clipboard();
     let os = host.os_file_clipboard_read();
-    let clip = tako_core::file_clipboard::resolve(tako.as_ref(), &os).ok_or_else(|| {
-        DispatchError::Operation("貼り付けるファイルがクリップボードに無い".into())
-    })?;
+    let clip = tako_core::file_clipboard::resolve(tako.as_ref(), &os)
+        .ok_or_else(|| Reason::NothingToPaste.operation())?;
     let items = clip
         .paths
         .iter()
@@ -21509,16 +21558,12 @@ fn paste_reply(
     failed: Vec<(std::path::PathBuf, String)>,
 ) -> Result<Value, DispatchError> {
     if pasted.is_empty() && !failed.is_empty() {
-        let reasons: Vec<&str> = failed.iter().map(|(_, r)| r.as_str()).collect();
-        return Err(DispatchError::Operation(if reasons.len() == 1 {
-            reasons[0].to_string()
+        let mut reasons: Vec<String> = failed.into_iter().map(|(_, r)| r).collect();
+        return Err(if reasons.len() == 1 {
+            DispatchError::Operation(reasons.remove(0))
         } else {
-            format!(
-                "貼り付けできない（{} 件すべて）: {}",
-                reasons.len(),
-                reasons.join(" / ")
-            )
-        }));
+            Reason::PasteAllFailed(reasons).operation()
+        });
     }
     Ok(json!({
         "mode": plan.clip.mode.slug(),
@@ -25919,6 +25964,8 @@ mod setup_run_timeout_tests {
 mod tests {
     use super::*;
     use crate::protocol::Axis;
+    use tako_core::file_copy::CopyRefusal;
+    use tako_core::file_move::MoveRefusal;
     use tako_core::pane_log::CloseOrigin;
     use tako_core::TerminalSession;
 
@@ -51251,6 +51298,48 @@ mod tests {
         assert_eq!(host.backend_windows_refreshes.get(), 3, "要求ごとに 1 回");
     }
 
+    /// 表示言語に従う断り（移動・コピー = #2365）を日英どちらかの形で探す。
+    /// テストは言語グローバルに触れない（並列のテストと競合する = #608）ので、言語ごとに引いて比べる
+    fn issue2365_either(text: &str, piece: impl Fn(tako_core::i18n::Lang) -> String) -> bool {
+        [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+            .into_iter()
+            .any(|lang| text.contains(&piece(lang)))
+    }
+
+    /// まとめた操作が全部断られたときの頭（`N 件すべてできなかった: ` / `all N items failed: `）
+    fn issue2365_all_failed_head(n: usize, lang: tako_core::i18n::Lang) -> String {
+        let full = Reason::AllFailed(vec!["\u{1}".into(); n]).text_in(lang);
+        full[..full.find('\u{1}').unwrap_or(full.len())].to_string()
+    }
+
+    /// 移動の断りの全文（`移動できない: <理由>（<src> → <dest>）` / `cannot move: …`）
+    fn issue2365_move_refused(
+        refusal: tako_core::file_move::MoveRefusal,
+        src: &std::path::Path,
+        dest: &std::path::Path,
+    ) -> impl Fn(tako_core::i18n::Lang) -> String {
+        let reason = Reason::MoveRefused {
+            refusal,
+            src: src.display().to_string(),
+            dest: dest.display().to_string(),
+        };
+        move |lang| reason.text_in(lang)
+    }
+
+    /// コピーの断りの全文（`コピーできない: <理由>（<src> → <dest>）` / `cannot copy: …`）
+    fn issue2365_copy_refused(
+        refusal: tako_core::file_copy::CopyRefusal,
+        src: &std::path::Path,
+        dest: &std::path::Path,
+    ) -> impl Fn(tako_core::i18n::Lang) -> String {
+        let reason = Reason::CopyRefused {
+            refusal,
+            src: src.display().to_string(),
+            dest: dest.display().to_string(),
+        };
+        move |lang| reason.text_in(lang)
+    }
+
     /// #1834 のテストの置き場。**必ず一時 dir の中**（本物のファイルを動かさない = #1811）
     fn issue1834_scratch(tag: &str) -> std::path::PathBuf {
         let dir =
@@ -51391,7 +51480,10 @@ mod tests {
             &mut host,
             issue1834_move(&dir.join("src/a.txt"), &dir.join("dst")),
         );
-        assert!(taken.contains("同じ名前"), "{taken}");
+        assert!(
+            issue2365_either(&taken, |l| MoveRefusal::NameTaken.text_in(l)),
+            "{taken}"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("dst/a.txt")).unwrap(),
             "existing\n",
@@ -51402,12 +51494,18 @@ mod tests {
             &mut host,
             issue1834_move(&dir.join("folder"), &dir.join("folder/inner")),
         );
-        assert!(descendant.contains("配下"), "{descendant}");
+        assert!(
+            issue2365_either(&descendant, |l| MoveRefusal::IntoDescendant.text_in(l)),
+            "{descendant}"
+        );
         let itself = err(
             &mut host,
             issue1834_move(&dir.join("folder"), &dir.join("folder")),
         );
-        assert!(itself.contains("自分自身"), "{itself}");
+        assert!(
+            issue2365_either(&itself, |l| MoveRefusal::IntoSelf.text_in(l)),
+            "{itself}"
+        );
         assert!(dir.join("folder/inner/x.txt").is_file());
         let missing = dispatch(
             &mut host,
@@ -52868,7 +52966,14 @@ mod tests {
             ),
         );
         assert!(
-            into.contains("配下") && into.contains("コピーできない"),
+            issue2365_either(
+                &into,
+                issue2365_copy_refused(
+                    CopyRefusal::IntoDescendant,
+                    &dir.join("folder"),
+                    &dir.join("folder/inner"),
+                ),
+            ),
             "{into}"
         );
         assert!(!dir.join("folder/inner/folder").exists(), "何も作らない");
@@ -52876,7 +52981,10 @@ mod tests {
             &mut host,
             issue1860_op(FileOpKind::Copy, &dir.join("nope"), Some(&dir.join("dst"))),
         );
-        assert!(missing.contains("コピー元が見つからない"), "{missing}");
+        assert!(
+            issue2365_either(&missing, |l| CopyRefusal::SourceMissing.text_in(l)),
+            "{missing}"
+        );
         let no_dest = dispatch(
             &mut host,
             issue1860_op(FileOpKind::Copy, &a, None),
@@ -52987,7 +53095,14 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            refused.contains("配下") && refused.contains("移動できない"),
+            issue2365_either(
+                &refused,
+                issue2365_move_refused(
+                    MoveRefusal::IntoDescendant,
+                    &dir.join("folder"),
+                    &dir.join("folder/inner"),
+                ),
+            ),
             "{refused}"
         );
         assert!(host.file_clip.is_some(), "断ったら切り取り中のまま");
@@ -53028,7 +53143,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(empty.contains("クリップボードに無い"), "{empty}");
+        assert!(
+            issue2365_either(&empty, |l| Reason::NothingToPaste.text_in(l)),
+            "{empty}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -53354,7 +53472,10 @@ mod tests {
         assert_eq!(out["done"].as_array().map(Vec::len), Some(2), "{out}");
         assert_eq!(out["failed"].as_array().map(Vec::len), Some(1), "{out}");
         let reason = out["failed"][0]["reason"].as_str().unwrap_or_default();
-        assert!(reason.contains("同じ名前"), "{reason}");
+        assert!(
+            issue2365_either(reason, |l| MoveRefusal::NameTaken.text_in(l)),
+            "{reason}"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("dst/a.txt")).unwrap(),
             "既にある\n",
@@ -53377,7 +53498,11 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(all.contains("2 件すべて") && all.contains("配下"), "{all}");
+        assert!(
+            issue2365_either(&all, |l| issue2365_all_failed_head(2, l))
+                && issue2365_either(&all, |l| MoveRefusal::IntoDescendant.text_in(l)),
+            "{all}"
+        );
         // 配下を重ねて渡した = 親だけを移して skipped に載せる
         std::fs::create_dir_all(dir.join("other")).unwrap();
         let nested = dispatch(
@@ -53437,7 +53562,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("2 件すべて")
+            issue2365_either(&err, |l| issue2365_all_failed_head(2, l))
                 && (err.contains("パスが存在しない") || err.contains("path does not exist")),
             "{err}"
         );
@@ -53465,7 +53590,14 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            refused.contains("配下") && refused.contains("移動できない"),
+            issue2365_either(
+                &refused,
+                issue2365_move_refused(
+                    MoveRefusal::IntoDescendant,
+                    &dir.join("folder"),
+                    &dir.join("folder/inner"),
+                ),
+            ),
             "{refused}"
         );
         assert!(host.file_clip.is_some());
@@ -53479,7 +53611,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(taken.contains("同じ名前"), "{taken}");
+        assert!(
+            issue2365_either(&taken, |l| MoveRefusal::NameTaken.text_in(l)),
+            "{taken}"
+        );
         std::fs::remove_dir(dir.join("dst/folder")).unwrap();
         let moved = dispatch(
             &mut host,
@@ -53571,7 +53706,10 @@ mod tests {
         let err = finish_offload(&mut host, next, PaneOrigin::Cli)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("取り消した"), "{err}");
+        assert!(
+            issue2365_either(&err, |l| CopyRefusal::Cancelled.text_in(l)),
+            "{err}"
+        );
         assert!(!dir.join("dst/folder").exists(), "作りかけを残さない");
         assert!(dir.join("folder/f3.txt").is_file(), "コピー元は残る");
         assert!(host.file_copies.is_empty());
@@ -53710,7 +53848,14 @@ mod tests {
         assert!(
             partial["failed"][0]["reason"]
                 .as_str()
-                .is_some_and(|r| r.contains("コピーできない")),
+                .is_some_and(|r| issue2365_either(
+                    r,
+                    issue2365_copy_refused(
+                        CopyRefusal::SourceMissing,
+                        &dir.join("src/nope"),
+                        &dir.join("dst"),
+                    ),
+                )),
             "{partial}"
         );
         assert!(
@@ -53740,7 +53885,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(all.contains("2 件すべて"), "{all}");
+        assert!(
+            issue2365_either(&all, |l| issue2365_all_failed_head(2, l)),
+            "{all}"
+        );
         for request in [
             issue1867_many(FileOpKind::Copy, &[dir.join("src/a.txt")], None),
             issue1867_many(FileOpKind::Copy, &[], Some(&dir.join("dst"))),
@@ -53798,7 +53946,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("3 件すべて") && err.contains("取り消した"),
+            issue2365_either(&err, |l| issue2365_all_failed_head(3, l))
+                && issue2365_either(&err, |l| CopyRefusal::Cancelled.text_in(l)),
             "{err}"
         );
         assert_eq!(

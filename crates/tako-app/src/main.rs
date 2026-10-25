@@ -59826,8 +59826,14 @@ mod self_test {
             &format!("visual-test tree-move ②: 自分の配下の行に「移せない」の札が出る (#1834。gain={gain2})"),
         );
         let n2 = notice(cx).unwrap_or_default();
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの理由の文とも突き合わせる
+        let either = |text: &str, refusal: &MoveRefusal| {
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| text.contains(&refusal.text_in(lang)))
+        };
         check(
-            n2.contains("配下") && at("folder/inner/x.txt").is_file(),
+            either(&n2, &MoveRefusal::IntoDescendant) && at("folder/inner/x.txt").is_file(),
             &format!(
                 "visual-test tree-move ②: 落とすと理由が出て何も動かない (#1834。notice={n2:?})"
             ),
@@ -59848,7 +59854,7 @@ mod self_test {
         );
         let n3 = notice(cx).unwrap_or_default();
         check(
-            n3.contains("同じ名前")
+            either(&n3, &MoveRefusal::NameTaken)
                 && std::fs::read_to_string(at("taken/a.txt")).ok().as_deref() == Some("既存\n")
                 && at("dst/a.txt").is_file(),
             &format!(
@@ -60804,7 +60810,16 @@ mod self_test {
         let n4 = notice(cx);
         check(
             refused
-                && n4.as_deref().is_some_and(|t| t.contains("配下"))
+                // 断りの文は表示言語に従う（#2365）ので、日英どちらの理由の文とも突き合わせる
+                && n4.as_deref().is_some_and(|t| {
+                    [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                        .into_iter()
+                        .any(|lang| {
+                            t.contains(
+                                &tako_core::file_copy::CopyRefusal::IntoDescendant.text_in(lang),
+                            )
+                        })
+                })
                 && !at("deep/sub/deep").exists(),
             &format!("visual-test tree-clipboard ④: 自分の配下へは理由つきで断り何も作らない (#1860。{n4:?})"),
         );
