@@ -1225,6 +1225,8 @@ fn c() {
 
     #[test]
     fn 落とした後にファイルを消していない後片付けを名指しする() {
+        // 断片は #1300 の番犬（`tmux_e2e_watchdog.rs`）の形（`Command::new("tmux")`）に
+        // 当たらない綴りで書く（向こうは tests/ 直下を原文のまま走査する）
         let text = r#"
 impl Drop for A {
     fn drop(&mut self) {
@@ -1237,8 +1239,8 @@ impl Drop for B {
         tako_core::tmux_backend::remove_socket_file(&self.socket);
     }
 }
-fn c(path: &Path) {
-    let _ = Command::new("tmux").arg("-S").arg(path).arg("kill-server").output();
+fn c(bin: &str, path: &Path) {
+    let _ = Command::new(bin).arg("-S").arg(path).arg("kill-server").output();
     let _ = std::fs::remove_file(path);
 }
 fn d(socket: &str) {
@@ -1247,9 +1249,9 @@ fn d(socket: &str) {
         tako_core::tmux_backend::kill_server(socket);
     }
 }
-fn e(socket: &str) {
+fn e(bin: &str, socket: &str) {
     if ok {
-        let _ = Command::new("tmux").args(["-L", socket, "kill-server"]).output();
+        let _ = Command::new(bin).args(["-L", socket, "kill-server"]).output();
     }
     tako_core::tmux_backend::remove_socket_file(socket);
 }
@@ -1266,10 +1268,10 @@ fn e(socket: &str) {
     #[test]
     fn 起こし直しの前の掃除と検査の文は数えずシェルの形は数える() {
         let text = r#"
-fn a(socket: &str) {
-    let _ = Command::new("tmux").args(["-L", &socket, "kill-server"]).output();
+fn a(bin: &str, socket: &str) {
+    let _ = Command::new(bin).args(["-L", &socket, "kill-server"]).output();
     let session = "w571";
-    let status = Command::new("tmux").args(["-L", &socket, "-f", "/dev/null", "new-session"]);
+    let status = Command::new(bin).args(["-L", &socket, "-f", "/dev/null", "new-session"]);
 }
 fn b(body: &str) {
     assert!(!body.contains("kill-server"), "名前で列挙した器へ kill-server を打っている");
