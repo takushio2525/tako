@@ -374,7 +374,11 @@ mod tests {
 
     #[test]
     fn 上限とデバウンスは_env_で変えられ不正は既定へ落ちる() {
-        // env を触るテストはこの 1 本だけ（並行する他のテストが同じ名前を読まない）
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(上限とデバウンスは_env_で変えられ不正は既定へ落ちる)
+        {
+            return;
+        }
         std::env::set_var("TAKO_LSP_COMPLETION_TIMEOUT_SECS", "0");
         assert_eq!(completion_timeout(), DEFAULT_COMPLETION_TIMEOUT);
         std::env::set_var("TAKO_LSP_COMPLETION_TIMEOUT_SECS", "4");

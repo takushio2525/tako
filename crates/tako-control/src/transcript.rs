@@ -1665,6 +1665,10 @@ mod tests {
 
     #[test]
     fn read_messagesは実ファイルを読める() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(read_messagesは実ファイルを読める) {
+            return;
+        }
         // HOME を一時ディレクトリに差し替えて ~/.claude/projects/ 構造を作る
         let tmp = std::env::temp_dir().join(format!("tako-transcript-test-{}", std::process::id()));
         let proj = tmp.join(".claude").join("projects").join("-tmp-proj");

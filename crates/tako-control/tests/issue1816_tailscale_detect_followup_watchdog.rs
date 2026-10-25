@@ -110,6 +110,10 @@ fn find_in(body: &str, base: usize, rel: &str, name: &str, needle: &str, why: &s
 #[cfg(unix)]
 #[test]
 fn setupの末尾は依存段の検出を引き直さない() {
+    // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+    if tako_core::run_alone!(setupの末尾は依存段の検出を引き直さない) {
+        return;
+    }
     let dir = tako_core::test_residue::ScratchDir::new("tako-1816-reuse");
     let log = dir.path().join("calls.log");
     let cli = dir.path().join("tailscale");

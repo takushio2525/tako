@@ -35,6 +35,7 @@ use tako_core::prompt_append::{self, MARKER};
 /// 置き場は既知の接頭辞 `tako-test-data-<pid>` の下に取り、**作る経路が消す経路も持つ**
 /// （#1296 / #1312。`arm_self_cleanup` が終了時に消し、SIGKILL で残ったぶんは
 /// `tako test-residue` が所有 pid の死亡を見て掃く）
+// tako:env-write-ok data dir を読むテストは全部これを先に通し、入れる値は 1 つ（OnceLock）で書き換えはこの 1 回だけ（#2400）
 fn isolated_data_dir() -> &'static PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {

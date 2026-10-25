@@ -6668,10 +6668,12 @@ mod tests {
         }
     }
 
-    /// env var（TAKO_REMOTE_STATE_DIR / PATH）はプロセス全域のため、これを set/remove する
-    /// テスト同士が並列実行でレースする。特に PATH を空にする窓では verify_pid_identity の
-    /// ps 起動が失敗して検証素通り → daemon_stop_impl が自プロセスへ SIGTERM を送り
-    /// テスト全体が死ぬ（実測）。env var を触るテストはこのロックで直列化する
+    /// 既定の state_dir（差し替えない = テストの data dir の下の `remote/`）を共有するテストを直列にする。
+    ///
+    /// env（`TAKO_REMOTE_STATE_DIR` 等）を書き換えるテストは、#2400 から `run_alone!` で
+    /// **その 1 本だけの子**で走る（親のプロセスの env は誰も書き換えない）。以前はこのロックで
+    /// env の窓を囲んでいたが、同じ env を読む別のモジュール（`platform::local_endpoint` の
+    /// `TAKO_841_LEGACY` など）は別のロックを取るので止められなかった。子の中で取っても空振りする
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // --- #972: scrollback の対象指定の解釈 -------------------------------------
@@ -6877,6 +6879,11 @@ mod tests {
     ///   （正規の tailscaled 経由の代理。実 tailscaled は root で動くのでテストから起こせない）
     #[test]
     fn 偽のxffを付けたローカルプロセスは接続元検証で拒否される() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(偽のxffを付けたローカルプロセスは接続元検証で拒否される)
+        {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "tako-841-peer-{}-{:?}",
@@ -7034,6 +7041,11 @@ mod tests {
     /// `tests/issue1724_remote_card_run_watchdog.rs` に書いた手順で再現できる）
     #[test]
     fn issue1724_権限外からのカード実行はapiで拒否される() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1724_権限外からのカード実行はapiで拒否される)
+        {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "tako-1724-cards-{}-{:?}",
@@ -7983,6 +7995,11 @@ mod tests {
 
     #[test]
     fn kill_stale_daemonは存在しないpidを撃たずに中止する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(kill_stale_daemonは存在しないpidを撃たずに中止する)
+        {
+            return;
+        }
         // cleanup_state_files が state_dir を掃除するため、env var 窓中の他テストを壊さないよう直列化
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // **state_dir をテンポラリへ差し替えてから呼ぶこと**。差し替えないと
@@ -8003,6 +8020,11 @@ mod tests {
     /// 本番 state を消しうることを、**消さずに**パス比較だけで示す
     #[test]
     fn state_dirは環境変数未設定なら本番ディレクトリを指す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(state_dirは環境変数未設定なら本番ディレクトリを指す)
+        {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
         let production = state_dir();
@@ -8018,6 +8040,10 @@ mod tests {
 
     #[test]
     fn daemon_statusはpidファイルが無ければnot_running() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(daemon_statusはpidファイルが無ければnot_running) {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // state_dir をテンポラリに差し替えて検証
         let dir = std::env::temp_dir().join(format!("tako-test-remote-{}", std::process::id()));
@@ -8062,6 +8088,10 @@ mod tests {
 
     #[test]
     fn ensure_state_dirは0700でディレクトリを作る() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(ensure_state_dirは0700でディレクトリを作る) {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("tako-test-esd-{}", std::process::id()));
         std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
@@ -8081,6 +8111,10 @@ mod tests {
 
     #[test]
     fn parse_pid_fileは3行形式を解析する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(parse_pid_fileは3行形式を解析する) {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("tako-test-ppf-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -8124,6 +8158,10 @@ mod tests {
     /// 再利用した無関係なプロセスを `TerminateProcess` する）
     #[test]
     fn daemon_stop_implはpid再利用時にkillしない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(daemon_stop_implはpid再利用時にkillしない) {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 自分の PID を書いたが、args が "tako remote serve" でないのでエラーになる
         let dir = std::env::temp_dir().join(format!("tako-test-dsi-{}", std::process::id()));
@@ -8244,6 +8282,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_stop_implはps実行不能でもkillしない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(daemon_stop_implはps実行不能でもkillしない) {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // 使い捨てプロセスを起動して PID を取得（テスト末尾で kill + wait 回収）
         let mut child = spawn_disposable_sleep();
@@ -8357,6 +8399,7 @@ mod tests {
         tag: &str,
         health_pid: impl FnOnce(u32) -> Option<u32>,
     ) -> (Result<Value, String>, bool) {
+        tako_core::test_child::assert_alone("stale_stop_against_sleep");
         let mut child = spawn_disposable_sleep();
         let child_pid = child.id();
         let server = FakeHealthServer::start(health_pid(child_pid));
@@ -8394,6 +8437,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_stop_implはstale経路でも正体不明のpidをkillしない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(daemon_stop_implはstale経路でも正体不明のpidをkillしない)
+        {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (result, alive) = stale_stop_against_sleep("stale-foreign", Some);
         assert!(
@@ -8411,6 +8459,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_stop_implはhealthがpidを返さなければ何も撃たない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(daemon_stop_implはhealthがpidを返さなければ何も撃たない)
+        {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (result, alive) = stale_stop_against_sleep("stale-nopid", |_| None);
         assert!(alive, "pid が無い応答で誰かを撃っている");
@@ -8426,6 +8479,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_stop_implはhealthが自分のpidを返しても撃たない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(daemon_stop_implはhealthが自分のpidを返しても撃たない)
+        {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let my_pid = std::process::id();
         let (result, _alive) = stale_stop_against_sleep("stale-self", move |_| Some(my_pid));
@@ -8487,6 +8545,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_stop_implはhealthが死んだpidを返しても中止する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(daemon_stop_implはhealthが死んだpidを返しても中止する)
+        {
+            return;
+        }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (result, alive) = stale_stop_against_sleep("stale-dead", |_| Some(999_999_999));
         assert!(alive, "無関係な sleep が死んでいる");
@@ -8933,6 +8996,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn daemon_stop_implはゾンビpidを終了済みとして扱う() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(daemon_stop_implはゾンビpidを終了済みとして扱う) {
+            return;
+        }
         use std::os::unix::process::CommandExt as _;
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("tako-test-zombie-{}", std::process::id()));
@@ -9400,6 +9467,10 @@ mod tests {
     /// ワーカー数の決め方（#1403）。既定 4 / env で 1..=32 / 壊れた値は既定へ倒す
     #[test]
     fn ワーカー数はenvで1から32に丸められる() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(ワーカー数はenvで1から32に丸められる) {
+            return;
+        }
         let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let restore = std::env::var("TAKO_REMOTE_HTTP_WORKERS").ok();
         let legacy = std::env::var("TAKO_1403_LEGACY").ok();

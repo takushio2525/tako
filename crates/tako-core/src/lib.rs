@@ -113,6 +113,7 @@ pub mod tako_cli_path;
 pub mod task_checkpoint;
 pub mod terminal;
 pub mod terminal_query;
+pub mod test_child;
 pub mod test_residue;
 pub mod text;
 pub mod text_block;

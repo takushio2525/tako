@@ -70,6 +70,7 @@ fn observe_termchk() -> String {
 }
 
 /// 親プロセスの TERM / COLORTERM を差し替えて 1 系統を測る
+// tako:env-write-ok このバイナリの 2 本はどちらも ENV_LOCK を取ってから親の env を差し替える（ペインが親の env を継ぐことを測るので、子へ値だけ渡す形にできない。#2400）
 fn with_parent_env(
     term: Option<&str>,
     colorterm: Option<&str>,
@@ -127,6 +128,7 @@ fn ペインのtermは親プロセスに依らない() {
 /// **注入が効いているから通っている**ことをこのアームが示す
 #[test]
 #[cfg(unix)]
+// tako:env-write-ok このバイナリの 2 本はどちらも ENV_LOCK を取ってから親の env を差し替える（ペインが親の env を継ぐことを測るので、子へ値だけ渡す形にできない。#2400）
 fn 注入を外すと親のtermがペインへ素通しになる() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("TAKO_946_INJECT", "inherit");

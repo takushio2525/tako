@@ -38229,6 +38229,11 @@ mod tests {
     #[test]
     #[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
     fn issue571_e2e_実claudeのbusyからidleへの遷移をwatchが検知する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue571_e2e_実claudeのbusyからidleへの遷移をwatchが検知する)
+        {
+            return;
+        }
         use std::time::{Duration, Instant};
 
         let base = e2e_571_base();
@@ -38458,6 +38463,11 @@ mod tests {
     #[test]
     #[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
     fn issue577_e2e_実claudeのpermissionダイアログをwatchが検知する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue577_e2e_実claudeのpermissionダイアログをwatchが検知する)
+        {
+            return;
+        }
         use std::time::{Duration, Instant};
 
         let base = e2e_577_base();
@@ -39546,6 +39556,10 @@ mod tests {
     /// A/B: `TAKO_1453_LEGACY=1` は同一バイナリのまま「採用しない」旧挙動を再現する
     #[test]
     fn issue1453_legacyは何も書き換えない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1453_legacyは何も書き換えない) {
+            return;
+        }
         // config_dir はプロセス共有。引き継ぎファイルを作る / 消すので直列化する
         let _guard = TEST_PROJECT_LOCK
             .lock()
@@ -43651,6 +43665,10 @@ mod tests {
 
     #[test]
     fn clean_legacy_settings_json_takoキーを掃除() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(clean_legacy_settings_json_takoキーを掃除) {
+            return;
+        }
         let dir = mcp_test_dir("legacy");
         let settings = dir.join("settings.json");
         let legacy = serde_json::json!({
@@ -47168,6 +47186,10 @@ mod tests {
     /// （`TAKO_1295_INJECT_PATTERN`）から足して**将来文言を 1 つ足した状態**を作る。
     #[test]
     fn issue1295_claudeの正常完了を実行拒否へ落とさない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1295_claudeの正常完了を実行拒否へ落とさない) {
+            return;
+        }
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
         // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
@@ -48626,15 +48648,13 @@ mod tests {
     /// 隔離した置き場で `Request::UserTask` を通す（本番の `user-tasks.yaml` を触らない）。
     ///
     /// 置き場は `TAKO_USER_TASKS_FILE`（`store_path` の 1 実装が読む env）で差し替える。
-    /// env は**プロセス共通**なので、`#[test]` の並走で互いの置き場を上書きし合う
-    /// （実測: 2 本が並ぶと `add` が相手の store へ落ち、id が食い違って
-    /// 「別の行を閉じたのに展開が畳まれた」ように見えた）。排他を取り、
-    /// **元の値へ戻してからロックを解放する**（i18n の `LangGuard` と同じ形）
+    /// env は**プロセスに 1 つ**なので、呼ぶのは `run_alone!` を通した**その 1 本だけの子**の中だけ
+    /// （#2400）。並走で互いの置き場を上書きし合う（実測: 2 本が並ぶと `add` が相手の store へ落ち、
+    /// id が食い違った）のを以前はこのヘルパの排他で止めていたが、排他は同じヘルパを通るテストしか
+    /// 止めず、`store_path` を読む別の経路（`migrations` など）は差し替えた置き場を読みえた
     fn t1479_env(tag: &str) -> (tako_core::test_residue::ScratchDir, impl Drop) {
-        use std::sync::{Mutex, MutexGuard, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        tako_core::test_child::assert_alone("t1479_env");
         struct Guard {
-            _lock: MutexGuard<'static, ()>,
             original: Option<std::ffi::OsString>,
         }
         impl Drop for Guard {
@@ -48645,13 +48665,8 @@ mod tests {
                 }
             }
         }
-        let lock = LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let dir = tako_core::test_residue::ScratchDir::new(&format!("user-tasks-{tag}"));
         let guard = Guard {
-            _lock: lock,
             original: std::env::var_os("TAKO_USER_TASKS_FILE"),
         };
         std::env::set_var("TAKO_USER_TASKS_FILE", dir.path().join("user-tasks.yaml"));
@@ -48688,6 +48703,10 @@ mod tests {
     /// `list` の応答に `expanded` が載る（画面の状態を AI から読める = 設計原則 5）
     #[test]
     fn issue1479_expandは1件を開きパネルをtasksで開く() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1479_expandは1件を開きパネルをtasksで開く) {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t1479-expand");
         let mut host = MockHost::new();
         let mut add = |title: &str| {
@@ -48742,6 +48761,10 @@ mod tests {
     /// 無い id は**開いたと言わない**（存在の判定は `show` の 1 実装を通す）
     #[test]
     fn issue1479_無いidは開けない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1479_無いidは開けない) {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t1479-missing");
         let mut host = MockHost::new();
         let err = dispatch_user_task(
@@ -48761,6 +48784,10 @@ mod tests {
     /// 「開いていることになっているのに一覧に無い」が残る、を作らない
     #[test]
     fn issue1479_完了させると展開は畳まれる() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1479_完了させると展開は畳まれる) {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t1479-done");
         let mut host = MockHost::new();
         let mut add = |title: &str| {
@@ -48827,6 +48854,11 @@ mod tests {
     /// 置き場の版が同じ間は読まず、書かれた・消えた直後だけ読む。中身は dispatch の "list" と同じ
     #[test]
     fn issue2031_版が同じ間は読まず書かれた直後だけ読む() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2031_版が同じ間は読まず書かれた直後だけ読む)
+        {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2031-stamp");
         let path = dir.path().join("user-tasks.yaml");
         let mut host = MockHost::new();
@@ -48880,6 +48912,10 @@ mod tests {
     /// 壊れた置き場は 0 件へ丸めず Err（#169）。直れば読み直す
     #[test]
     fn issue2031_壊れた置き場はerrで直れば読み直す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2031_壊れた置き場はerrで直れば読み直す) {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2031-broken");
         let path = dir.path().join("user-tasks.yaml");
         let mut host = MockHost::new();
@@ -48905,6 +48941,11 @@ mod tests {
     /// background の段が書き戻す（dispatch の畳み込みと同じ確定のしかた）
     #[test]
     fn issue2031_配送の観測と書き戻しが2段に分かれて確定する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2031_配送の観測と書き戻しが2段に分かれて確定する)
+        {
+            return;
+        }
         use tako_core::user_task::DeliveryState;
         let (dir, _guard) = t1479_env("t2031-deliver");
         let path = dir.path().join("user-tasks.yaml");
@@ -48953,6 +48994,10 @@ mod tests {
     /// 読み直さなかった回も添付の実在（`exists`）は今の状態を返す（消えた添付を出せるのはそのため）
     #[test]
     fn issue2031_読まない回も添付の実在は見直す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2031_読まない回も添付の実在は見直す) {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2031-attach");
         let att = dir.path().join("shot.png");
         let mut host = MockHost::new();
@@ -49009,6 +49054,11 @@ mod tests {
     /// 段だけが Err を返す）。応答は dispatch の同期の腕と同じ形（`expanded` は要求の時点の値）
     #[test]
     fn issue2052_一覧の準備は置き場を読まずbackgroundだけが読む() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2052_一覧の準備は置き場を読まずbackgroundだけが読む)
+        {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2052-list");
         let path = dir.path().join("user-tasks.yaml");
         let mut host = MockHost::new();
@@ -49055,6 +49105,11 @@ mod tests {
     /// 触らず、③ で畳む。失敗（無い id）は UI スレッドへ戻らずに Err で、展開は残る
     #[test]
     fn issue2052_完了は書き換えをbackgroundで行い着地で畳む() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2052_完了は書き換えをbackgroundで行い着地で畳む)
+        {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2052-status");
         let mut host = MockHost::new();
         let add = |host: &mut MockHost| {
@@ -49118,6 +49173,11 @@ mod tests {
     /// 書き戻しは background。関係の無いペインのフローでは畳まない
     #[test]
     fn issue2052_配送の観測と書き戻しが分かれて確定する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2052_配送の観測と書き戻しが分かれて確定する)
+        {
+            return;
+        }
         use tako_core::user_task::DeliveryState;
         let (dir, _guard) = t1479_env("t2052-deliver");
         let path = dir.path().join("user-tasks.yaml");
@@ -49267,6 +49327,11 @@ mod tests {
     /// だけが Err）。応答は同期の腕と同じ。引数の誤りは準備で即座に断る
     #[test]
     fn issue2086_詳細と更新は準備で置き場に触れずbackgroundが読み書きする() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2086_詳細と更新は準備で置き場に触れずbackgroundが読み書きする)
+        {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2086-show");
         let path = dir.path().join("user-tasks.yaml");
         let mut host = MockHost::new();
@@ -49327,6 +49392,11 @@ mod tests {
     /// background、通知欄への 1 行は着地（UI）。戻り先の解き方（#1466）は同期の腕と同じ
     #[test]
     fn issue2086_起票は書き込みをbackgroundで行い着地で通知する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2086_起票は書き込みをbackgroundで行い着地で通知する)
+        {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2086-add");
         let path = dir.path().join("user-tasks.yaml");
         let (mut host, _master, worker) = t1466_host(
@@ -49385,6 +49455,10 @@ mod tests {
     /// master の入力欄へ届く順が届いた順のまま。運ぶのは 1 本につき 1 回
     #[test]
     fn issue2086_返答は届いた順に積み運び記録する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2086_返答は届いた順に積み運び記録する) {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2086-respond");
         let path = dir.path().join("user-tasks.yaml");
         let (mut host, master, id) = t2086_master_task();
@@ -49456,6 +49530,11 @@ mod tests {
     /// 後ろの返答は待たされない。走らせずに落ちたジョブの札も同じ。経路を省いた返答は同期の腕
     #[test]
     fn issue2086_失敗した返答と捨てた返答は後ろを待たせない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2086_失敗した返答と捨てた返答は後ろを待たせない)
+        {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2086-respond-missing");
         let (mut host, _master, id) = t2086_master_task();
         // 待たされるかは実時間ではなく札の状態で見る（`.agent/conventions.md`
@@ -49557,6 +49636,11 @@ mod tests {
     /// 組み立てが失敗したら（プロファイルが無い）タブを作らずに失敗として記録し、札は手放す
     #[test]
     fn issue2182_masterが居ない返答は組み立てをbackgroundへ出す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2182_masterが居ない返答は組み立てをbackgroundへ出す)
+        {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2182-launch");
         let path = dir.path().join("user-tasks.yaml");
         let (mut host, master, id) = t2086_master_task();
@@ -49611,6 +49695,11 @@ mod tests {
     /// 決め直してそのペインへ送る（同じプロファイルの master を 2 つにしない）
     #[test]
     fn issue2182_組み立ての間にmasterが現れたらそちらへ送る() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2182_組み立ての間にmasterが現れたらそちらへ送る)
+        {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2182-appeared");
         let (mut host, master, id) = t2086_master_task();
         t2182_set_master_role(&mut host, master, None);
@@ -49642,6 +49731,10 @@ mod tests {
     /// 返答を初回メッセージとして prompt のフローへ積む。組み立ては走らせない（渡されたものを使う）
     #[test]
     fn issue2182_組み立てた起動で起こし返答を流す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2182_組み立てた起動で起こし返答を流す) {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2182-land");
         let path = dir.path().join("user-tasks.yaml");
         let (mut host, master, id) = t2086_master_task();
@@ -49690,6 +49783,11 @@ mod tests {
     /// UI スレッドで待たずに配送の失敗として記録する（返答は積めている・札は手放す）
     #[test]
     fn issue2182_直の呼び手は組み立てを待たず失敗として記録する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2182_直の呼び手は組み立てを待たず失敗として記録する)
+        {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2182-direct");
         let (mut host, master, id) = t2086_master_task();
         t2182_set_master_role(&mut host, master, None);
@@ -49712,6 +49810,10 @@ mod tests {
     /// 同期の腕（経路を省いた返答・直呼び）は組み立ても同じスレッドで順に通す（失敗の記録は同じ）
     #[test]
     fn issue2182_同期の腕は組み立ても順に通す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2182_同期の腕は組み立ても順に通す) {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2182-sync");
         let (mut host, master, id) = t2086_master_task();
         t2182_set_master_role(&mut host, master, None);
@@ -49728,6 +49830,11 @@ mod tests {
     /// background の Err で画面に触らない。折りたたみも同じ腕
     #[test]
     fn issue2086_展開は在ることをbackgroundで確かめ着地で開く() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2086_展開は在ることをbackgroundで確かめ着地で開く)
+        {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2086-expand");
         let mut host = MockHost::new();
         let id = dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("add", None)).unwrap()
