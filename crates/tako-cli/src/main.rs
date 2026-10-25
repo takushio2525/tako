@@ -9029,8 +9029,7 @@ fn mod_ui_local(args: &ModArgs) -> Result<(), String> {
         args.id.as_deref(),
     )?;
     let path = tako_control::claude_mod_ui::default_path()?;
-    let out =
-        tako_control::claude_mod_ui::run(&path, &request).map_err(|e| e.message().to_string())?;
+    let out = tako_control::claude_mod_ui::run(&path, &request).map_err(|e| e.message())?;
     if args.json {
         println!("{}", pretty_json(&out));
     } else {

@@ -18,19 +18,29 @@ use serde_json::{json, Value};
 use tako_core::claude_mod::ModBand;
 use tako_core::claude_mod_ui::{self as core, LoadState, Loaded, UiAnswers, UiOp, UiRequest};
 
-/// [`run`] が断った理由
+/// [`run`] が断った理由。文言は表示言語に従う（#2365。日英の正本は core の各型の `text_in`）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunError {
     /// 値が語彙・形に合わない（ui.json は書いていない。許される値は文言に載る）
-    Invalid(String),
-    /// 書けない・新しい形なので書き換えない
-    Refused(String),
+    Invalid(core::UiError),
+    /// 新しい形なので書き換えない・書けない
+    Refused(core::UpdateError),
+    /// 置き場の排他を取れない（`config_io` の文をそのまま）
+    Lock(String),
 }
 
 impl RunError {
-    pub fn message(&self) -> &str {
+    /// CLI / MCP の 1 行（表示言語に従う）
+    pub fn message(&self) -> String {
+        self.text_in(tako_core::i18n::lang())
+    }
+
+    /// 表示言語を明示しての文言。setup の段は枠が日本語なので日本語で引く
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
         match self {
-            Self::Invalid(m) | Self::Refused(m) => m,
+            Self::Invalid(e) => e.text_in(lang),
+            Self::Refused(e) => e.text_in(lang),
+            Self::Lock(m) => m.clone(),
         }
     }
 }
@@ -72,6 +82,12 @@ fn record(path: &Path, state: &LoadState) {
                         .and_then(|q| std::fs::read(&q.path).ok())
                 })
                 .unwrap_or_default();
+            // 診断ログの文と重複除けの鍵は日本語で固定する（表示言語を切り替えても同じ破損を
+            // 別物と見て 2 行目を書かない。persist.log はほかの行も日本語 = #2365）
+            let problems: Vec<String> = problems
+                .iter()
+                .map(|p| p.text_in(tako_core::i18n::Lang::Ja))
+                .collect();
             let key = format!(
                 "{}\n{}",
                 problems.join("\n"),
@@ -110,17 +126,13 @@ fn record(path: &Path, state: &LoadState) {
 
 /// `tako mod ui` / MCP `tako_mod` の `action=ui` の本体
 pub fn run(path: &Path, request: &UiRequest) -> Result<Value, RunError> {
-    let op = request
-        .to_op()
-        .map_err(|e| RunError::Invalid(e.message()))?;
+    let op = request.to_op().map_err(RunError::Invalid)?;
     apply_ops(path, &[op])
 }
 
 /// setup の `--answers` の `mod_ui`（雛形 → 値 → ボタンの並び。1 つでも断られたら書かない）
 pub fn apply_answers(path: &Path, answers: &UiAnswers) -> Result<Value, RunError> {
-    let ops = answers
-        .to_ops()
-        .map_err(|e| RunError::Invalid(e.message()))?;
+    let ops = answers.to_ops().map_err(RunError::Invalid)?;
     apply_ops(path, &ops)
 }
 
@@ -131,7 +143,7 @@ fn apply_ops(path: &Path, ops: &[UiOp]) -> Result<Value, RunError> {
         return Ok(response(path, &loaded.config, &loaded.state, None));
     }
     // 読み → 当て → 書き を他のプロセス（GUI の取り込み・別の CLI）と直列にする
-    let _lock = crate::config_io::lock_exclusive(path).map_err(RunError::Refused)?;
+    let _lock = crate::config_io::lock_exclusive(path).map_err(RunError::Lock)?;
     match core::update_at(path, ops, crate::claude_mod::epoch_ms()) {
         Ok(updated) => {
             // 文字として読めない中身は先の `load` が退避へ移したので、書く前の読みは「不在」になる。
@@ -147,8 +159,8 @@ fn apply_ops(path: &Path, ops: &[UiOp]) -> Result<Value, RunError> {
                 Some((updated.changed, updated.written)),
             ))
         }
-        Err(core::UpdateError::Invalid(e)) => Err(RunError::Invalid(e.message())),
-        Err(e) => Err(RunError::Refused(e.message())),
+        Err(core::UpdateError::Invalid(e)) => Err(RunError::Invalid(e)),
+        Err(e) => Err(RunError::Refused(e)),
     }
 }
 
@@ -170,7 +182,12 @@ fn response(
         quarantine,
     } = state
     {
-        out["problems"] = json!(problems);
+        // 応答の枠（applies_to / note / choices の説明）はまだ日本語なので、問題の文もそろえて
+        // 日本語で載せる（1 つの応答に日英を混ぜない。枠と一緒に移すのは #2365 の続き）
+        out["problems"] = json!(problems
+            .iter()
+            .map(|p| p.text_in(tako_core::i18n::Lang::Ja))
+            .collect::<Vec<_>>());
         out["quarantine"] = json!(quarantine.as_ref().map(|q| q.path.display().to_string()));
     }
     if let LoadState::Future { version } = state {
@@ -396,9 +413,10 @@ pub fn run_setup_stage(answers: Option<&UiAnswers>) -> Vec<String> {
                     summary(&config)
                 )]
             }
+            // setup の段の枠は日本語なので、断りも日本語で引く（1 行に日英を混ぜない。#2365）
             Err(e) => vec![format!(
                 "  [warn] Claude Code の画面の UI（ui.json）を変えられない: {}",
-                e.message()
+                e.text_in(tako_core::i18n::Lang::Ja)
             )],
         };
     }

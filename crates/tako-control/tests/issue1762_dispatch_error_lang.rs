@@ -18,10 +18,12 @@
 //! `orchestrator layout` の値の断り（`tako_core::LayoutParamError`）にも広げた（下半分）。
 //! こちらは落ちたときに、日英の対を書いたソースの行（`file:line`）も名指しする。
 //! #2365 の 2 本目で、dispatch が理由の文へそのまま載せる tako-core のエラー型（編集・
-//! ターミナル・Code Runner・コマンドカード・器・LSP の答えの読み）にも広げた（末尾）。
+//! ターミナル・Code Runner・コマンドカード・器・LSP の答えの読み）にも広げた（後半）。
 //! #2365 の 3 本目で、保存の断りに添える案内（旧 `preview_recovery_hint`）と、dispatch の個別の文の
 //! うちプレビュー・編集・ファイル操作・ペイン / タブ操作の断りを `Reason` へ足した（`Reason` の表と、
 //! 案内の 3 状態を見る節）。
+//! #2365 の続きで、`tako mod ui` の断り（UiError 一式 = 理由・使える値・枠・形の問題・
+//! 書き込みの断り）にも広げた（末尾。1 つの断りの中で日英が混ざらないよう 1 本で移した）。
 //!
 //! このファイルは**独立したテストバイナリ**で、言語グローバルを触るのは
 //! `display_follows_the_display_language` の 1 本だけ（ほかは `text_in` で言語を引数に渡す）。
@@ -178,6 +180,34 @@ fn display_follows_the_display_language() {
                 c.value
             );
         }
+        // #2365 の続き: tako mod ui の断り（理由・使える値・形の問題・書き込みの断り）と枠も
+        // 同じグローバルを引く（CLI の `tako mod ui` と MCP の action=ui は `message()` = この表示）
+        for c in ui_cases() {
+            assert_eq!(
+                c.value.to_string(),
+                c.value.text(lang),
+                "{:?} / {lang:?}",
+                c.value
+            );
+        }
+        let framed = UiError {
+            what: UiReason::HotkeyShape,
+            allowed: vec![Allowed::Letters, Allowed::Digits],
+        };
+        assert_eq!(framed.to_string(), framed.text_in(lang));
+        assert_eq!(framed.message(), framed.text_in(lang));
+        // setup の answers の断りは枠（ほかの項目の断り）が日本語なので、表示言語に依らず
+        // 日本語で引く（1 行に日英を混ぜない）
+        let setup = tako_control::setup::SetupAnswers::from_json(
+            r#"{"mod_ui": {"buttons": [{"kind": "slash", "value": "bash"}]}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            setup,
+            "mod_ui: slash で送れるのは許可リストのコマンドだけ。使える値: compact / clear / \
+             context / cost / model / effort / tako（ui.json は書いていない）",
+            "{lang:?}"
+        );
         // dispatch は tako-core の断りを `op_err`（= `Operation(e.to_string())`）で包む。
         // 包んだ表示は理由の文そのもの（前置きは足さない）で、表示言語は 1 つにそろう
         for e in workspace_samples() {
@@ -1793,4 +1823,841 @@ fn core_のエラー型の境界() {
     let read = TextEditError::Read(io(std::io::ErrorKind::NotFound, "gone"));
     assert!(read.source().is_some());
     assert!(TextEditError::ReadOnly.source().is_none());
+}
+
+// ---- #2365 の続き: `tako mod ui` の断り（UiError 一式） ----
+//
+// 理由（UiReason）・使える値（Allowed）・枠（UiError の「ui.json は書いていない」）・形の問題
+// （UiProblem）・書き込みの断り（UpdateError / SaveRefusal）を 1 本で移した（半分だけ移すと
+// 1 つの断りの中で日英が混ざる）。どれも `text_in` の (バリアント, 言語) の網羅 match で、
+// 落ちたら日英の対を書いたソースの行（`file:line`）を名指しする
+
+use tako_core::claude_mod_ui::{
+    Allowed, ButtonField, SaveRefusal, UiError, UiProblem, UiReason, UpdateError,
+};
+
+bilingual!(UiReason, UiProblem, Allowed, UpdateError, SaveRefusal);
+
+const MOD_UI_SRC: &str = include_str!("../../tako-core/src/claude_mod_ui.rs");
+const MOD_UI_PATH: &str = "crates/tako-core/src/claude_mod_ui.rs";
+
+/// 1 つの断りの見本（ソースは [`MOD_UI_SRC`] で固定）
+struct UiCase {
+    value: Box<dyn Bilingual>,
+    /// `text_in` を持つ `impl` の行（腕はここから下で探す）
+    from: &'static str,
+    /// 腕の頭の `Self::` の後ろ
+    arm: &'static str,
+    /// #2365 より前の固定文（見本の値で展開したもの）。単独では出なかった形（「外した」を
+    /// 添えてだけ出ていた問題）は `None`（添えた形は [`ui_dropped_old_ja`] で突き合わせる）
+    old_ja: Option<&'static str>,
+    /// 日英で同じ語をそのまま出す（語彙の語・ボタンの id）
+    passthrough: bool,
+}
+
+fn ui_reason_index(r: &UiReason) -> usize {
+    match r {
+        UiReason::IdShape => 0,
+        UiReason::LabelEmpty => 1,
+        UiReason::LabelControl => 2,
+        UiReason::LabelTooWide { .. } => 3,
+        UiReason::ShellTooLong { .. } => 4,
+        UiReason::ShellControl => 5,
+        UiReason::ShellEmpty => 6,
+        UiReason::PromptEmpty => 7,
+        UiReason::PromptTooLong => 8,
+        UiReason::PromptControl => 9,
+        UiReason::HotkeyShape => 10,
+        UiReason::NotString { .. } => 11,
+        UiReason::BadValue { .. } => 12,
+        UiReason::NotBool { .. } => 13,
+        UiReason::BadListValue { .. } => 14,
+        UiReason::ListDuplicate { .. } => 15,
+        UiReason::EmptyList { .. } => 16,
+        UiReason::MoveToUnreadable => 17,
+        UiReason::MoveToRange { .. } => 18,
+        UiReason::NeedValue { .. } => 19,
+        UiReason::NeedContent { .. } => 20,
+        UiReason::NeedId { .. } => 21,
+        UiReason::NeedTo { .. } => 22,
+        UiReason::SetNeedsKey => 23,
+        UiReason::SetKeyUnknown => 24,
+        UiReason::PresetNeedsName => 25,
+        UiReason::PresetUnknown => 26,
+        UiReason::OpUnknown => 27,
+        UiReason::AnswersPresetUnknown => 28,
+        UiReason::AnswersSetKeyUnknown => 29,
+        UiReason::NoSuchButton => 30,
+        UiReason::SameAction { .. } => 31,
+        UiReason::TooManyButtons => 32,
+        UiReason::KindUnknown => 33,
+        UiReason::KindNeeded => 34,
+        UiReason::SlashNotAllowed => 35,
+        UiReason::TakoOpUnknown => 36,
+        UiReason::IdTaken => 37,
+        UiReason::HotkeyTaken => 38,
+        UiReason::Unshaped { .. } => 39,
+    }
+}
+const UI_REASON_VARIANTS: usize = 40;
+
+fn ui_problem_index(p: &UiProblem) -> usize {
+    match p {
+        UiProblem::SchemaVersion => 0,
+        UiProblem::SegmentsEmpty => 1,
+        UiProblem::SegmentsDuplicate => 2,
+        UiProblem::ItemsEmpty => 3,
+        UiProblem::ItemsDuplicate => 4,
+        UiProblem::TooManyButtons { .. } => 5,
+        UiProblem::DuplicateId { .. } => 6,
+        UiProblem::DuplicateHotkey { .. } => 7,
+        UiProblem::Field { .. } => 8,
+        UiProblem::NotNormalized { .. } => 9,
+        UiProblem::NotJson { .. } => 10,
+        UiProblem::NotObject => 11,
+        UiProblem::UnknownKey { .. } => 12,
+        UiProblem::Missing { .. } => 13,
+        UiProblem::SectionUnshaped { .. } => 14,
+        UiProblem::ButtonsNotArray => 15,
+        UiProblem::ButtonUnshaped { .. } => 16,
+        UiProblem::SameIdOrHotkey { .. } => 17,
+        UiProblem::OverMax { .. } => 18,
+        UiProblem::Dropped(_) => 19,
+        UiProblem::NotUtf8 => 20,
+        UiProblem::ReadIo { .. } => 21,
+    }
+}
+const UI_PROBLEM_VARIANTS: usize = 22;
+
+fn allowed_index(a: &Allowed) -> usize {
+    match a {
+        Allowed::Word(_) => 0,
+        Allowed::Letters => 1,
+        Allowed::Digits => 2,
+        Allowed::Position => 3,
+    }
+}
+
+fn update_error_index(e: &UpdateError) -> usize {
+    match e {
+        UpdateError::Invalid(_) => 0,
+        UpdateError::Future { .. } => 1,
+        UpdateError::Io(_) => 2,
+    }
+}
+
+fn save_refusal_index(e: &SaveRefusal) -> usize {
+    match e {
+        SaveRefusal::Unshaped(_) => 0,
+        SaveRefusal::NoDir => 1,
+    }
+}
+
+/// 理由の見本と #2365 より前の固定文（値は ASCII。英語側の検査で値の日本語を拾わないため）
+fn ui_reason_table() -> Vec<(UiReason, &'static str, &'static str)> {
+    use UiReason as R;
+    vec![
+        (R::IdShape, "IdShape", "id は英小文字・数字・`-` の 24 文字まで（先頭は英数字）"),
+        (R::LabelEmpty, "LabelEmpty", "label は空にできない（前後の空白も不可）"),
+        (R::LabelControl, "LabelControl", "label に改行・制御文字は使えない"),
+        (
+            R::LabelTooWide { columns: 18 },
+            "LabelTooWide",
+            "label は 16 桁まで（全角は 2 桁。指定は 18 桁）",
+        ),
+        (
+            R::ShellTooLong { max: 4096 },
+            "ShellTooLong",
+            "shell のコマンドは 4096 バイトまで",
+        ),
+        (
+            R::ShellControl,
+            "ShellControl",
+            "shell のコマンドに制御文字は使えない（改行とタブだけ可）",
+        ),
+        (R::ShellEmpty, "ShellEmpty", "shell のコマンドは空にできない"),
+        (R::PromptEmpty, "PromptEmpty", "prompt の文は空にできない"),
+        (R::PromptTooLong, "PromptTooLong", "prompt の文は 1000 文字まで"),
+        (
+            R::PromptControl,
+            "PromptControl",
+            "prompt の文に制御文字は使えない（改行とタブだけ可）",
+        ),
+        (R::HotkeyShape, "HotkeyShape", "hotkey は数字 1 字か英小文字 1 字"),
+        (
+            R::NotString {
+                key: "band.segments",
+            },
+            "NotString",
+            "band.segments の値は文字列で渡す",
+        ),
+        (
+            R::BadValue { key: "colors.dim" },
+            "BadValue",
+            "colors.dim に使えない値",
+        ),
+        (R::NotBool { key: "band.hidden" }, "NotBool", "band.hidden は真偽"),
+        (
+            R::BadListValue {
+                key: "usage_bar.items",
+            },
+            "BadListValue",
+            "usage_bar.items に使えない値が入っている",
+        ),
+        (
+            R::ListDuplicate {
+                key: "band.segments",
+            },
+            "ListDuplicate",
+            "band.segments に同じ値が 2 回ある（並べたい順に 1 回ずつ）",
+        ),
+        (
+            R::EmptyList {
+                key: "usage_bar.items",
+            },
+            "EmptyList",
+            "usage_bar.items は 1 つ以上並べる",
+        ),
+        (R::MoveToUnreadable, "MoveToUnreadable", "移す先の指定が読めない"),
+        (R::MoveToRange { len: 4 }, "MoveToRange", "移す先は 1〜4"),
+        (
+            R::NeedValue { op: "set".into() },
+            "NeedValue",
+            "set には 値（value） が要る",
+        ),
+        (
+            R::NeedContent {
+                op: "button_add".into(),
+            },
+            "NeedContent",
+            "button_add には 中身（value） が要る",
+        ),
+        (
+            R::NeedId {
+                op: "button_remove".into(),
+            },
+            "NeedId",
+            "button_remove には ボタンの id（id） が要る",
+        ),
+        (
+            R::NeedTo {
+                op: "button_move".into(),
+            },
+            "NeedTo",
+            "button_move には 移す先（to） が要る",
+        ),
+        (R::SetNeedsKey, "SetNeedsKey", "set にはキー（key）が要る"),
+        (R::SetKeyUnknown, "SetKeyUnknown", "set のキーが語彙に無い"),
+        (
+            R::PresetNeedsName,
+            "PresetNeedsName",
+            "preset には雛形の名前（value）が要る",
+        ),
+        (R::PresetUnknown, "PresetUnknown", "雛形の名前が語彙に無い"),
+        (R::OpUnknown, "OpUnknown", "op が語彙に無い"),
+        (
+            R::AnswersPresetUnknown,
+            "AnswersPresetUnknown",
+            "mod_ui.preset が語彙に無い",
+        ),
+        (
+            R::AnswersSetKeyUnknown,
+            "AnswersSetKeyUnknown",
+            "mod_ui.set のキーが語彙に無い",
+        ),
+        (R::NoSuchButton, "NoSuchButton", "その id のボタンは無い"),
+        (
+            R::SameAction {
+                id: "compact".into(),
+            },
+            "SameAction",
+            "同じ動作のボタン（id compact）が既にある。ラベル等を変えるなら button_remove してから足す",
+        ),
+        (
+            R::TooManyButtons,
+            "TooManyButtons",
+            "ボタンは 8 個まで（どれかを button_remove で外す）",
+        ),
+        (R::KindUnknown, "KindUnknown", "ボタンの kind が語彙に無い"),
+        (
+            R::KindNeeded,
+            "KindNeeded",
+            "ボタンの kind が要る（値が slash / tako の語でないので推せない）",
+        ),
+        (
+            R::SlashNotAllowed,
+            "SlashNotAllowed",
+            "slash で送れるのは許可リストのコマンドだけ",
+        ),
+        (R::TakoOpUnknown, "TakoOpUnknown", "tako の操作 id が語彙に無い"),
+        (R::IdTaken, "IdTaken", "その id は別のボタンが使っている"),
+        (R::HotkeyTaken, "HotkeyTaken", "その hotkey は別のボタンが使っている"),
+        (
+            R::Unshaped {
+                problems: vec![UiProblem::SegmentsEmpty, UiProblem::DuplicateId { index: 2 }],
+            },
+            "Unshaped",
+            "操作の結果が形を満たさない（band.segments が空（隠すなら band.hidden を true にする）; buttons[2].id が前のボタンと重複）",
+        ),
+    ]
+}
+
+/// 形の問題の見本と #2365 より前の固定文
+fn ui_problem_table() -> Vec<(UiProblem, &'static str, Option<&'static str>)> {
+    use UiProblem as P;
+    vec![
+        (
+            P::SchemaVersion,
+            "SchemaVersion",
+            Some("schema_version は 1"),
+        ),
+        (
+            P::SegmentsEmpty,
+            "SegmentsEmpty",
+            Some("band.segments が空（隠すなら band.hidden を true にする）"),
+        ),
+        (
+            P::SegmentsDuplicate,
+            "SegmentsDuplicate",
+            Some("band.segments に同じ区切りが 2 回ある"),
+        ),
+        (
+            P::ItemsEmpty,
+            "ItemsEmpty",
+            Some("usage_bar.items が空（消すなら usage_bar.place を off にする）"),
+        ),
+        (
+            P::ItemsDuplicate,
+            "ItemsDuplicate",
+            Some("usage_bar.items に同じ項目が 2 回ある"),
+        ),
+        (
+            P::TooManyButtons { len: 9 },
+            "TooManyButtons",
+            Some("buttons が 9 個（8 個まで）"),
+        ),
+        (
+            P::DuplicateId { index: 2 },
+            "DuplicateId",
+            Some("buttons[2].id が前のボタンと重複"),
+        ),
+        (
+            P::DuplicateHotkey { index: 3 },
+            "DuplicateHotkey",
+            Some("buttons[3].hotkey が前のボタンと重複"),
+        ),
+        (
+            P::Field {
+                index: 1,
+                field: ButtonField::Label,
+                why: UiReason::LabelControl,
+            },
+            "Field",
+            Some("buttons[1].label: label に改行・制御文字は使えない"),
+        ),
+        (
+            P::NotNormalized {
+                index: 0,
+                field: ButtonField::Command,
+            },
+            "NotNormalized",
+            Some("buttons[0].action.command: 前後の空白・改行を落とした形で書く"),
+        ),
+        (
+            P::NotJson { line: 3, column: 7 },
+            "NotJson",
+            Some("JSON として読めない（3 行 7 桁）"),
+        ),
+        (
+            P::NotObject,
+            "NotObject",
+            Some("最上位が JSON のオブジェクトではない"),
+        ),
+        (
+            P::UnknownKey {
+                key: "extra".into(),
+            },
+            "UnknownKey",
+            Some("知らないキー `extra`"),
+        ),
+        (
+            P::Missing { key: "buttons" },
+            "Missing",
+            Some("buttons が無い"),
+        ),
+        (
+            P::SectionUnshaped { key: "chat" },
+            "SectionUnshaped",
+            Some("chat が語彙・形に合わない"),
+        ),
+        (
+            P::ButtonsNotArray,
+            "ButtonsNotArray",
+            Some("buttons が配列ではない"),
+        ),
+        (P::ButtonUnshaped { index: 4 }, "ButtonUnshaped", None),
+        (P::SameIdOrHotkey { index: 5 }, "SameIdOrHotkey", None),
+        (P::OverMax { index: 8 }, "OverMax", None),
+        (
+            P::Dropped(Box::new(P::ButtonUnshaped { index: 4 })),
+            "Dropped",
+            Some("buttons[4] が語彙・形に合わない（外した）"),
+        ),
+        (P::NotUtf8, "NotUtf8", Some("UTF-8 として読めない")),
+        (
+            P::ReadIo {
+                kind: "permission denied".into(),
+            },
+            "ReadIo",
+            Some("読み取りに失敗（permission denied）"),
+        ),
+    ]
+}
+
+/// 「外した」を添えてだけ出ていた問題の、#2365 より前の固定文（`lenient_buttons` が組んでいた形）
+fn ui_dropped_old_ja() -> Vec<(UiProblem, &'static str)> {
+    use UiProblem as P;
+    vec![
+        (
+            P::ButtonUnshaped { index: 4 },
+            "buttons[4] が語彙・形に合わない（外した）",
+        ),
+        (
+            P::SameIdOrHotkey { index: 5 },
+            "buttons[5] の id か hotkey が前のボタンと重複（外した）",
+        ),
+        (
+            P::OverMax { index: 8 },
+            "buttons[8] は 8 個を超えた（外した）",
+        ),
+        (
+            P::Field {
+                index: 0,
+                field: ButtonField::Hotkey,
+                why: UiReason::HotkeyShape,
+            },
+            "buttons[0].hotkey: hotkey は数字 1 字か英小文字 1 字（外した）",
+        ),
+        (
+            P::NotNormalized {
+                index: 2,
+                field: ButtonField::Text,
+            },
+            "buttons[2].action.text: 前後の空白・改行を落とした形で書く（外した）",
+        ),
+    ]
+}
+
+fn ui_allowed_table() -> Vec<(Allowed, &'static str, &'static str)> {
+    vec![
+        (Allowed::Word("compact".into()), "Word", "compact"),
+        (Allowed::Letters, "Letters", "a〜z"),
+        (Allowed::Digits, "Digits", "0〜9"),
+        (Allowed::Position, "Position", "1〜8 の番号"),
+    ]
+}
+
+fn ui_update_table() -> Vec<(UpdateError, &'static str, &'static str)> {
+    vec![
+        (
+            UpdateError::Invalid(UiError {
+                what: UiReason::OpUnknown,
+                allowed: Vec::new(),
+            }),
+            "Invalid",
+            "op が語彙に無い（ui.json は書いていない）",
+        ),
+        (
+            UpdateError::Future { version: 2 },
+            "Future",
+            "ui.json は新しい tako が書いた形（schema_version 2）なので、この tako では書き換えない（tako を更新する）",
+        ),
+        (
+            UpdateError::Io("disk full".into()),
+            "Io",
+            "ui.json を書けない: disk full",
+        ),
+    ]
+}
+
+fn ui_save_table() -> Vec<(SaveRefusal, &'static str, &'static str)> {
+    vec![
+        (
+            SaveRefusal::Unshaped(vec![UiProblem::ItemsEmpty, UiProblem::SchemaVersion]),
+            "Unshaped",
+            "形を満たさない値は書かない（usage_bar.items が空（消すなら usage_bar.place を off にする）; schema_version は 1）",
+        ),
+        (SaveRefusal::NoDir, "NoDir", "ui.json の置き場が決まらない"),
+    ]
+}
+
+/// 全型の見本（理由・問題・使える値・書き込みの断り）
+fn ui_cases() -> Vec<UiCase> {
+    fn case(
+        value: impl Bilingual + 'static,
+        from: &'static str,
+        arm: &'static str,
+        old_ja: Option<&'static str>,
+    ) -> UiCase {
+        UiCase {
+            value: Box::new(value),
+            from,
+            arm,
+            old_ja,
+            passthrough: false,
+        }
+    }
+    let mut out = Vec::new();
+    for (r, arm, old) in ui_reason_table() {
+        out.push(case(r, "impl UiReason {", arm, Some(old)));
+    }
+    for (p, arm, old) in ui_problem_table() {
+        out.push(case(p, "impl UiProblem {", arm, old));
+    }
+    for (a, arm, old) in ui_allowed_table() {
+        let word = matches!(a, Allowed::Word(_));
+        let mut c = case(a, "impl Allowed {", arm, Some(old));
+        c.passthrough = word;
+        out.push(c);
+    }
+    for (e, arm, old) in ui_update_table() {
+        out.push(case(e, "impl UpdateError {", arm, Some(old)));
+    }
+    for (e, arm, old) in ui_save_table() {
+        out.push(case(e, "impl SaveRefusal {", arm, Some(old)));
+    }
+    out
+}
+
+/// 落ちたときに添える「日英の対を書いた行」
+fn ui_where(from: &str, arm: &str, lang: Lang) -> String {
+    match arm_line(MOD_UI_SRC, from, arm, lang) {
+        Some(line) => format!("{MOD_UI_PATH}:{line}"),
+        None => format!("{MOD_UI_PATH}（{arm} の腕が見つからない）"),
+    }
+}
+
+/// 枠（`UiError::text_in` の `(使える値が空か, 言語)` の腕）の行
+fn ui_frame_where(with_allowed: bool, lang: Lang) -> String {
+    let token = match lang {
+        Lang::Ja => "Ja",
+        Lang::En => "En",
+    };
+    let head = format!("({}, {token})", !with_allowed);
+    let lines: Vec<&str> = MOD_UI_SRC.lines().collect();
+    let found = lines
+        .iter()
+        .position(|l| l.contains("impl UiError {"))
+        .and_then(|start| {
+            (start..lines.len()).find(|&i| lines[i].trim_start().starts_with(head.as_str()))
+        });
+    match found {
+        Some(i) => format!("{MOD_UI_PATH}:{}", i + 1),
+        None => format!("{MOD_UI_PATH}（枠の {head} の腕が見つからない）"),
+    }
+}
+
+/// 使える値のうち言語ごとに書く範囲（`a〜z` / `1〜8 の番号` 等）の腕の行（語は日英で同じなので除く）
+fn ui_allowed_where(allowed: &[Allowed], lang: Lang) -> String {
+    let lines: Vec<String> = allowed
+        .iter()
+        .filter(|a| !matches!(a, Allowed::Word(_)))
+        .map(|a| ui_where("impl Allowed {", variant_name(&format!("{a:?}")), lang))
+        .collect();
+    if lines.is_empty() {
+        "-".to_string()
+    } else {
+        lines.join(", ")
+    }
+}
+
+#[test]
+fn mod_ui_の断りの見本は全バリアントを1つずつ持つ() {
+    let reasons: Vec<UiReason> = ui_reason_table().into_iter().map(|(r, ..)| r).collect();
+    covers_all(&reasons, ui_reason_index, UI_REASON_VARIANTS);
+    let problems: Vec<UiProblem> = ui_problem_table().into_iter().map(|(p, ..)| p).collect();
+    covers_all(&problems, ui_problem_index, UI_PROBLEM_VARIANTS);
+    let allowed: Vec<Allowed> = ui_allowed_table().into_iter().map(|(a, ..)| a).collect();
+    covers_all(&allowed, allowed_index, 4);
+    let update: Vec<UpdateError> = ui_update_table().into_iter().map(|(e, ..)| e).collect();
+    covers_all(&update, update_error_index, 3);
+    let save: Vec<SaveRefusal> = ui_save_table().into_iter().map(|(e, ..)| e).collect();
+    covers_all(&save, save_refusal_index, 2);
+}
+
+#[test]
+fn mod_ui_の断りが日英を持ち英語に日本語が混ざらない() {
+    for c in ui_cases() {
+        let debug = format!("{:?}", c.value);
+        let (ja, en) = (c.value.text(Lang::Ja), c.value.text(Lang::En));
+        let at = |lang| ui_where(c.from, c.arm, lang);
+        assert!(
+            !ja.trim().is_empty(),
+            "{debug} の日本語が空（{}）",
+            at(Lang::Ja)
+        );
+        assert!(
+            !en.trim().is_empty(),
+            "{debug} の英語が空（{}）",
+            at(Lang::En)
+        );
+        if let Some(ch) = has_japanese(&en) {
+            panic!(
+                "{debug} の英語に日本語（{ch}）が混ざる: {en}（{}）",
+                at(Lang::En)
+            );
+        }
+        if c.passthrough {
+            assert_eq!(ja, en, "{debug} は語をそのまま出す（{}）", at(Lang::En));
+        } else {
+            assert_ne!(ja, en, "{debug} の英語が日本語と同じ文（{}）", at(Lang::En));
+        }
+    }
+}
+
+#[test]
+fn mod_ui_の断りの日本語は2365より前の固定文とバイト一致() {
+    for c in ui_cases() {
+        if let Some(old) = c.old_ja {
+            assert_eq!(
+                c.value.text(Lang::Ja),
+                old,
+                "{:?}（{}）",
+                c.value,
+                ui_where(c.from, c.arm, Lang::Ja)
+            );
+        }
+    }
+    for (p, old) in ui_dropped_old_ja() {
+        let dropped = UiProblem::Dropped(Box::new(p.clone()));
+        assert_eq!(
+            dropped.text_in(Lang::Ja),
+            old,
+            "{p:?}（{}）",
+            ui_where("impl UiProblem {", "Dropped", Lang::Ja)
+        );
+        assert!(has_japanese(&dropped.text_in(Lang::En)).is_none(), "{p:?}");
+    }
+}
+
+/// 番犬自身の検査: 全見本の腕の行と枠の行を日英とも引ける（引けないと名指しが空振りする）
+#[test]
+fn mod_ui_の断りの腕の行を日英とも引ける() {
+    for c in ui_cases() {
+        for lang in [Lang::Ja, Lang::En] {
+            assert!(
+                arm_line(MOD_UI_SRC, c.from, c.arm, lang).is_some(),
+                "{:?} / {lang:?}: {MOD_UI_PATH} の {} 以降に Self::{} の腕が無い",
+                c.value,
+                c.from,
+                c.arm
+            );
+        }
+    }
+    for with_allowed in [false, true] {
+        for lang in [Lang::Ja, Lang::En] {
+            let at = ui_frame_where(with_allowed, lang);
+            assert!(!at.contains("見つからない"), "{at}");
+        }
+    }
+}
+
+/// 枠（「ui.json は書いていない」「使える値:」）と使える値の範囲（`a〜z` / `1〜8 の番号`）も
+/// 理由と同じ言語でそろう。日本語は #2365 より前の `message()` とバイト一致
+#[test]
+fn mod_ui_の断りの枠と使える値は理由と同じ言語でそろう() {
+    let plain = UiError {
+        what: UiReason::LabelTooWide { columns: 18 },
+        allowed: Vec::new(),
+    };
+    let hotkey = UiError {
+        what: UiReason::HotkeyShape,
+        allowed: vec![Allowed::Letters, Allowed::Digits],
+    };
+    let move_to = UiError {
+        what: UiReason::MoveToUnreadable,
+        allowed: vec![
+            Allowed::Position,
+            Allowed::Word("first".into()),
+            Allowed::Word("last".into()),
+            Allowed::Word("left".into()),
+            Allowed::Word("right".into()),
+        ],
+    };
+    for (e, old) in [
+        (
+            &plain,
+            "label は 16 桁まで（全角は 2 桁。指定は 18 桁）（ui.json は書いていない）",
+        ),
+        (
+            &hotkey,
+            "hotkey は数字 1 字か英小文字 1 字。使える値: a〜z / 0〜9（ui.json は書いていない）",
+        ),
+        (
+            &move_to,
+            "移す先の指定が読めない。使える値: 1〜8 の番号 / first / last / left / right（ui.json は書いていない）",
+        ),
+    ] {
+        let with_allowed = !e.allowed.is_empty();
+        assert_eq!(
+            e.text_in(Lang::Ja),
+            old,
+            "{e:?}（{}）",
+            ui_frame_where(with_allowed, Lang::Ja)
+        );
+        let en = e.text_in(Lang::En);
+        if let Some(ch) = has_japanese(&en) {
+            panic!(
+                "{e:?} の英語に日本語（{ch}）が混ざる: {en}（枠 {} / 理由 {} / 使える値 {}）",
+                ui_frame_where(with_allowed, Lang::En),
+                ui_where(
+                    "impl UiReason {",
+                    variant_name(&format!("{:?}", e.what)),
+                    Lang::En
+                ),
+                ui_allowed_where(&e.allowed, Lang::En)
+            );
+        }
+        assert!(en.ends_with("(ui.json was not written)"), "{en}");
+        assert_eq!(en.contains("Allowed values: "), with_allowed, "{en}");
+    }
+    assert_eq!(
+        hotkey.text_in(Lang::En),
+        "hotkey is one digit or one lowercase letter. Allowed values: a-z / 0-9 (ui.json was not written)"
+    );
+}
+
+/// 一時の ui.json（テストの data dir = #944 の隔離先の中）
+fn ui_scratch(name: &str) -> std::path::PathBuf {
+    let dir = tako_core::paths::data_dir()
+        .expect("テストの data dir")
+        .join(format!(
+            "issue2365-ui-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(tako_core::claude_mod_ui::FILENAME)
+}
+
+/// 実経路: CLI `tako mod ui` / MCP `tako_mod` の action=ui が通る `claude_mod_ui::run` の断りは、
+/// 1 つの応答の中で日英が混ざらない（英語表示に日本語が 1 字も無い・日本語表示は #2365 より前と
+/// バイト一致）。MCP は前置き（`DispatchError` の表示）つきで返るので、それも同じ言語でそろう
+#[test]
+fn mod_ui_の実経路の断りは1つの応答に日英が混ざらない() {
+    use serde_json::json;
+    use tako_core::claude_mod_ui::{SetKey, ThemeColor, UiRequest, Vocab};
+    let path = ui_scratch("lang");
+    let req = |v: serde_json::Value| -> UiRequest { serde_json::from_value(v).unwrap() };
+    // 9 個目を断らせるために 8 個まで足しておく（既定の compact + 7 個）
+    for v in [
+        "clear",
+        "context",
+        "cost",
+        "model",
+        "effort",
+        "tako",
+        "split-right",
+    ] {
+        tako_control::claude_mod_ui::run(&path, &req(json!({"op": "button_add", "value": v})))
+            .unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    let ids = "compact / clear / context / cost / model / effort / tako / split-right";
+    let colors = ThemeColor::words().join(" / ");
+    let keys = SetKey::words().join(" / ");
+    let cases: Vec<(serde_json::Value, String)> = vec![
+        (
+            json!({"op": "button_add", "kind": "javascript", "value": "alert(1)"}),
+            "ボタンの kind が語彙に無い。使える値: slash / tako / shell / prompt（ui.json は書いていない）".into(),
+        ),
+        (
+            json!({"op": "button_remove", "id": "nope"}),
+            format!("その id のボタンは無い。使える値: {ids}（ui.json は書いていない）"),
+        ),
+        (
+            json!({"op": "button_move", "id": "compact", "to": "middle"}),
+            "移す先の指定が読めない。使える値: 1〜8 の番号 / first / last / left / right（ui.json は書いていない）".into(),
+        ),
+        (
+            json!({"op": "button_add", "value": "split-down"}),
+            format!("ボタンは 8 個まで（どれかを button_remove で外す）。使える値: {ids}（ui.json は書いていない）"),
+        ),
+        (
+            json!({"op": "set", "key": "colors.dim", "value": "#ff0000"}),
+            format!("colors.dim に使えない値。使える値: {colors}（ui.json は書いていない）"),
+        ),
+        (
+            json!({"op": "set", "key": "band.color", "value": "red"}),
+            format!("set のキーが語彙に無い。使える値: {keys}（ui.json は書いていない）"),
+        ),
+        (
+            json!({"op": "button_remove"}),
+            "button_remove には ボタンの id（id） が要る（ui.json は書いていない）".into(),
+        ),
+        (
+            json!({"op": "set", "key": "band.segments", "value": "pane,pane"}),
+            "band.segments に同じ値が 2 回ある（並べたい順に 1 回ずつ）（ui.json は書いていない）"
+                .into(),
+        ),
+    ];
+    for (args, old_ja) in &cases {
+        let err = tako_control::claude_mod_ui::run(&path, &req(args.clone())).unwrap_err();
+        // 名指しは理由・枠・使える値の範囲の腕のすべて（どこに混ざっても行が出る）
+        let at = |lang| match &err {
+            tako_control::claude_mod_ui::RunError::Invalid(e) => format!(
+                "理由 {} / 枠 {} / 使える値 {}",
+                ui_where(
+                    "impl UiReason {",
+                    variant_name(&format!("{:?}", e.what)),
+                    lang,
+                ),
+                ui_frame_where(!e.allowed.is_empty(), lang),
+                ui_allowed_where(&e.allowed, lang)
+            ),
+            other => format!("{other:?}"),
+        };
+        assert_eq!(&err.text_in(Lang::Ja), old_ja, "{args}（{}）", at(Lang::Ja));
+        for lang in [Lang::Ja, Lang::En] {
+            // MCP の応答（前置き + 理由の文）
+            let shown = E::InvalidParams(err.text_in(lang)).text_in(lang);
+            if lang == Lang::En {
+                if let Some(ch) = has_japanese(&shown) {
+                    panic!(
+                        "{args} の英語の応答に日本語（{ch}）が混ざる: {shown}（{}）",
+                        at(Lang::En)
+                    );
+                }
+            } else {
+                assert!(shown.ends_with(old_ja.as_str()), "{shown}");
+            }
+        }
+    }
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "断った操作は書かない"
+    );
+    // 新しい tako が書いた形（書き換えの断り）も同じ
+    let mut future: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    future["schema_version"] = json!(2);
+    std::fs::write(&path, future.to_string()).unwrap();
+    let err = tako_control::claude_mod_ui::run(
+        &path,
+        &req(json!({"op": "set", "key": "usage_bar.place", "value": "off"})),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.text_in(Lang::Ja),
+        "ui.json は新しい tako が書いた形（schema_version 2）なので、この tako では書き換えない（tako を更新する）"
+    );
+    assert!(
+        has_japanese(&err.text_in(Lang::En)).is_none(),
+        "{}（{}）",
+        err.text_in(Lang::En),
+        ui_where("impl UpdateError {", "Future", Lang::En)
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }

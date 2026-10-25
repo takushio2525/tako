@@ -883,24 +883,24 @@ impl UiConfig {
 // prompt の文や shell のコマンドが診断ログへ流れない（AGENTS.md の絶対ルール）
 
 /// 1 つの部分の問題
-fn segments_problems(segments: &[BandSegment]) -> Vec<String> {
+fn segments_problems(segments: &[BandSegment]) -> Vec<UiProblem> {
     let mut out = Vec::new();
     if segments.is_empty() {
-        out.push("band.segments が空（隠すなら band.hidden を true にする）".into());
+        out.push(UiProblem::SegmentsEmpty);
     }
     if has_duplicate(segments) {
-        out.push("band.segments に同じ区切りが 2 回ある".into());
+        out.push(UiProblem::SegmentsDuplicate);
     }
     out
 }
 
-fn items_problems(items: &[UsageItem]) -> Vec<String> {
+fn items_problems(items: &[UsageItem]) -> Vec<UiProblem> {
     let mut out = Vec::new();
     if items.is_empty() {
-        out.push("usage_bar.items が空（消すなら usage_bar.place を off にする）".into());
+        out.push(UiProblem::ItemsEmpty);
     }
     if has_duplicate(items) {
-        out.push("usage_bar.items に同じ項目が 2 回ある".into());
+        out.push(UiProblem::ItemsDuplicate);
     }
     out
 }
@@ -912,35 +912,42 @@ fn has_duplicate<T: PartialEq>(items: &[T]) -> bool {
         .any(|(i, a)| items[..i].iter().any(|b| b == a))
 }
 
-/// ボタン 1 個の問題（`at` は `buttons[i]` の位置）
-fn button_problems(button: &Button, at: &str) -> Vec<String> {
+/// ボタン 1 個の問題（`index` は `buttons[i]` の位置）
+fn button_problems(button: &Button, index: usize) -> Vec<UiProblem> {
     let mut out = Vec::new();
+    let field = |field, e: UiError| UiProblem::Field {
+        index,
+        field,
+        why: e.what,
+    };
     if let Err(e) = check_id(&button.id) {
-        out.push(format!("{at}.id: {}", e.what));
+        out.push(field(ButtonField::Id, e));
     }
     if let Err(e) = check_label(&button.label) {
-        out.push(format!("{at}.label: {}", e.what));
+        out.push(field(ButtonField::Label, e));
     }
     if let Err(e) = check_hotkey(&button.hotkey) {
-        out.push(format!("{at}.hotkey: {}", e.what));
+        out.push(field(ButtonField::Hotkey, e));
     }
     match &button.action {
         ButtonAction::Shell { command } => {
             if let Err(e) = normalize_shell(command) {
-                out.push(format!("{at}.action.command: {}", e.what));
+                out.push(field(ButtonField::Command, e));
             } else if normalize_shell(command).ok().as_deref() != Some(command.as_str()) {
-                out.push(format!(
-                    "{at}.action.command: 前後の空白・改行を落とした形で書く"
-                ));
+                out.push(UiProblem::NotNormalized {
+                    index,
+                    field: ButtonField::Command,
+                });
             }
         }
         ButtonAction::Prompt { text } => {
             if let Err(e) = normalize_prompt(text) {
-                out.push(format!("{at}.action.text: {}", e.what));
+                out.push(field(ButtonField::Text, e));
             } else if normalize_prompt(text).ok().as_deref() != Some(text.as_str()) {
-                out.push(format!(
-                    "{at}.action.text: 前後の空白・改行を落とした形で書く"
-                ));
+                out.push(UiProblem::NotNormalized {
+                    index,
+                    field: ButtonField::Text,
+                });
             }
         }
         ButtonAction::Slash { .. } | ButtonAction::Tako { .. } => {}
@@ -949,31 +956,28 @@ fn button_problems(button: &Button, at: &str) -> Vec<String> {
 }
 
 /// ボタンの並び全体の問題（個数・id と hotkey の重複）
-fn buttons_problems(buttons: &[Button]) -> Vec<String> {
+fn buttons_problems(buttons: &[Button]) -> Vec<UiProblem> {
     let mut out = Vec::new();
     if buttons.len() > MAX_BUTTONS {
-        out.push(format!(
-            "buttons が {} 個（{MAX_BUTTONS} 個まで）",
-            buttons.len()
-        ));
+        out.push(UiProblem::TooManyButtons { len: buttons.len() });
     }
     for (i, b) in buttons.iter().enumerate() {
-        out.extend(button_problems(b, &format!("buttons[{i}]")));
+        out.extend(button_problems(b, i));
         if buttons[..i].iter().any(|o| o.id == b.id) {
-            out.push(format!("buttons[{i}].id が前のボタンと重複"));
+            out.push(UiProblem::DuplicateId { index: i });
         }
         if buttons[..i].iter().any(|o| o.hotkey == b.hotkey) {
-            out.push(format!("buttons[{i}].hotkey が前のボタンと重複"));
+            out.push(UiProblem::DuplicateHotkey { index: i });
         }
     }
     out
 }
 
 /// 全体の問題（空 = スキーマを満たす。[`validate_text`] と性質テストの判定はこれ 1 本）
-pub fn problems(cfg: &UiConfig) -> Vec<String> {
+pub fn problems(cfg: &UiConfig) -> Vec<UiProblem> {
     let mut out = Vec::new();
     if cfg.schema_version != SCHEMA_VERSION {
-        out.push(format!("schema_version は {SCHEMA_VERSION}"));
+        out.push(UiProblem::SchemaVersion);
     }
     out.extend(segments_problems(&cfg.band.segments));
     out.extend(items_problems(&cfg.usage_bar.items));
@@ -994,24 +998,20 @@ fn check_id(id: &str) -> Result<(), UiError> {
     if ok {
         Ok(())
     } else {
-        Err(UiError::new(format!(
-            "id は英小文字・数字・`-` の {MAX_ID_CHARS} 文字まで（先頭は英数字）"
-        )))
+        Err(UiError::new(UiReason::IdShape))
     }
 }
 
 fn check_label(label: &str) -> Result<(), UiError> {
     if label.trim() != label || label.is_empty() {
-        return Err(UiError::new("label は空にできない（前後の空白も不可）"));
+        return Err(UiError::new(UiReason::LabelEmpty));
     }
     if label.chars().any(char::is_control) {
-        return Err(UiError::new("label に改行・制御文字は使えない"));
+        return Err(UiError::new(UiReason::LabelControl));
     }
     let columns = UnicodeWidthStr::width(label);
     if columns > MAX_LABEL_COLUMNS {
-        return Err(UiError::new(format!(
-            "label は {MAX_LABEL_COLUMNS} 桁まで（全角は 2 桁。指定は {columns} 桁）"
-        )));
+        return Err(UiError::new(UiReason::LabelTooWide { columns }));
     }
     Ok(())
 }
@@ -1022,18 +1022,15 @@ fn hotkey_alphabet() -> impl Iterator<Item = char> {
     ('a'..='z').chain('1'..='9').chain(std::iter::once('0'))
 }
 
-fn hotkey_words() -> Vec<String> {
-    vec!["a〜z".into(), "0〜9".into()]
+fn hotkey_words() -> Vec<Allowed> {
+    vec![Allowed::Letters, Allowed::Digits]
 }
 
 fn check_hotkey(hotkey: &str) -> Result<(), UiError> {
     let mut chars = hotkey.chars();
     match (chars.next(), chars.next()) {
         (Some(c), None) if c.is_ascii_lowercase() || c.is_ascii_digit() => Ok(()),
-        _ => Err(UiError::with_allowed(
-            "hotkey は数字 1 字か英小文字 1 字",
-            hotkey_words(),
-        )),
+        _ => Err(UiError::with_items(UiReason::HotkeyShape, hotkey_words())),
     }
 }
 
@@ -1041,13 +1038,9 @@ fn check_hotkey(hotkey: &str) -> Result<(), UiError> {
 fn normalize_shell(raw: &str) -> Result<String, UiError> {
     use crate::command_card::CommandCardError as E;
     crate::command_card::normalize_command_text(raw).map_err(|e| match e {
-        E::CommandTooLong { max, .. } => {
-            UiError::new(format!("shell のコマンドは {max} バイトまで"))
-        }
-        E::ControlCharacter { .. } => {
-            UiError::new("shell のコマンドに制御文字は使えない（改行とタブだけ可）")
-        }
-        _ => UiError::new("shell のコマンドは空にできない"),
+        E::CommandTooLong { max, .. } => UiError::new(UiReason::ShellTooLong { max }),
+        E::ControlCharacter { .. } => UiError::new(UiReason::ShellControl),
+        _ => UiError::new(UiReason::ShellEmpty),
     })
 }
 
@@ -1056,20 +1049,16 @@ fn normalize_prompt(raw: &str) -> Result<String, UiError> {
     let text = raw.replace("\r\n", "\n").replace('\r', "\n");
     let text = text.trim();
     if text.is_empty() {
-        return Err(UiError::new("prompt の文は空にできない"));
+        return Err(UiError::new(UiReason::PromptEmpty));
     }
     if text.chars().count() > MAX_PROMPT_CHARS {
-        return Err(UiError::new(format!(
-            "prompt の文は {MAX_PROMPT_CHARS} 文字まで"
-        )));
+        return Err(UiError::new(UiReason::PromptTooLong));
     }
     if text
         .chars()
         .any(|c| c != '\n' && c != '\t' && c.is_control())
     {
-        return Err(UiError::new(
-            "prompt の文に制御文字は使えない（改行とタブだけ可）",
-        ));
+        return Err(UiError::new(UiReason::PromptControl));
     }
     Ok(text.to_string())
 }
@@ -1096,39 +1085,63 @@ fn clip_columns(text: &str, max: usize) -> String {
 }
 
 // --- 誤り ---------------------------------------------------------------------------
+//
+// 文言は表示言語に従う（#2365）。日英の正本は各型の `text_in` の (バリアント, 言語) の網羅 match で、
+// バリアントを足すと日英の両方を書くまでコンパイルが通らない。`Display` / `message()` は
+// `i18n::lang()` でそこを引く。日本語は #2365 より前の固定文とバイト一致
+// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）。
+// 1 つの断りの中で日英が混ざらないよう、理由・使える値・枠・形の問題を 1 本でそろえて引く
 
 /// 断った理由と、代わりに使える値（**ui.json は書いていない**）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiError {
-    pub what: String,
-    pub allowed: Vec<String>,
+    pub what: UiReason,
+    pub allowed: Vec<Allowed>,
 }
 
 impl UiError {
-    fn new(what: impl Into<String>) -> Self {
+    fn new(what: UiReason) -> Self {
         Self {
-            what: what.into(),
+            what,
             allowed: Vec::new(),
         }
     }
 
-    fn with_allowed<S: Into<String>>(what: impl Into<String>, allowed: Vec<S>) -> Self {
-        Self {
-            what: what.into(),
-            allowed: allowed.into_iter().map(Into::into).collect(),
-        }
+    /// 使える値が語彙の語・ボタンの id（日英で同じ語）のとき
+    fn with_allowed<S: Into<String>>(what: UiReason, words: Vec<S>) -> Self {
+        Self::with_items(what, Allowed::words(words))
     }
 
-    /// CLI / MCP / setup が同じ文言で返す 1 行
+    /// 使える値に範囲（`a〜z` / `1〜8 の番号`）が混ざるとき
+    fn with_items(what: UiReason, allowed: Vec<Allowed>) -> Self {
+        Self { what, allowed }
+    }
+
+    /// CLI / MCP / setup が同じ文言で返す 1 行（表示言語に従う。setup は日本語の枠なので
+    /// [`Self::text_in`] で日本語を引く）
     pub fn message(&self) -> String {
-        if self.allowed.is_empty() {
-            format!("{}（ui.json は書いていない）", self.what)
-        } else {
-            format!(
-                "{}。使える値: {}（ui.json は書いていない）",
-                self.what,
-                self.allowed.join(" / ")
-            )
+        self.text_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての文言（理由・使える値・枠を同じ言語でそろえる）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        let what = self.what.text_in(lang);
+        let allowed = || {
+            self.allowed
+                .iter()
+                .map(|a| a.text_in(lang))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        };
+        match (self.allowed.is_empty(), lang) {
+            (true, Ja) => format!("{what}（ui.json は書いていない）"),
+            (true, En) => format!("{what} (ui.json was not written)"),
+            (false, Ja) => format!("{what}。使える値: {}（ui.json は書いていない）", allowed()),
+            (false, En) => format!(
+                "{what}. Allowed values: {} (ui.json was not written)",
+                allowed()
+            ),
         }
     }
 }
@@ -1139,35 +1152,513 @@ impl std::fmt::Display for UiError {
     }
 }
 
+impl std::error::Error for UiError {}
+
+/// 断った理由（[`UiError::what`]。枠の「ui.json は書いていない」は [`UiError::text_in`] が足す）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiReason {
+    /// id の形（英小文字・数字・`-`・[`MAX_ID_CHARS`] 文字まで・先頭は英数字）
+    IdShape,
+    LabelEmpty,
+    LabelControl,
+    LabelTooWide {
+        columns: usize,
+    },
+    ShellTooLong {
+        max: usize,
+    },
+    ShellControl,
+    ShellEmpty,
+    PromptEmpty,
+    PromptTooLong,
+    PromptControl,
+    HotkeyShape,
+    /// 値が文字列・真偽・数のどれでもない（`key` は語彙のキーか `value`）
+    NotString {
+        key: &'static str,
+    },
+    BadValue {
+        key: &'static str,
+    },
+    NotBool {
+        key: &'static str,
+    },
+    BadListValue {
+        key: &'static str,
+    },
+    ListDuplicate {
+        key: &'static str,
+    },
+    EmptyList {
+        key: &'static str,
+    },
+    MoveToUnreadable,
+    MoveToRange {
+        len: usize,
+    },
+    /// 操作に引数が足りない（`op` は頼まれた op の綴りのまま）
+    NeedValue {
+        op: String,
+    },
+    NeedContent {
+        op: String,
+    },
+    NeedId {
+        op: String,
+    },
+    NeedTo {
+        op: String,
+    },
+    SetNeedsKey,
+    SetKeyUnknown,
+    PresetNeedsName,
+    PresetUnknown,
+    OpUnknown,
+    AnswersPresetUnknown,
+    AnswersSetKeyUnknown,
+    NoSuchButton,
+    SameAction {
+        id: String,
+    },
+    TooManyButtons,
+    KindUnknown,
+    KindNeeded,
+    SlashNotAllowed,
+    TakoOpUnknown,
+    IdTaken,
+    HotkeyTaken,
+    /// 最後の砦: どの操作を通っても形を満たすはずが崩れた（[`apply_all`]）
+    Unshaped {
+        problems: Vec<UiProblem>,
+    },
+}
+
+impl UiReason {
+    /// 表示言語を明示しての文言（日英の正本。日本語は #2365 より前の固定文とバイト一致）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::IdShape, Ja) => {
+                format!("id は英小文字・数字・`-` の {MAX_ID_CHARS} 文字まで（先頭は英数字）")
+            }
+            (Self::IdShape, En) => format!(
+                "id is up to {MAX_ID_CHARS} lowercase letters, digits or `-` (starting with a letter or digit)"
+            ),
+            (Self::LabelEmpty, Ja) => "label は空にできない（前後の空白も不可）".to_string(),
+            (Self::LabelEmpty, En) => {
+                "label cannot be empty (no leading or trailing spaces either)".to_string()
+            }
+            (Self::LabelControl, Ja) => "label に改行・制御文字は使えない".to_string(),
+            (Self::LabelControl, En) => {
+                "label cannot contain newlines or control characters".to_string()
+            }
+            (Self::LabelTooWide { columns }, Ja) => format!(
+                "label は {MAX_LABEL_COLUMNS} 桁まで（全角は 2 桁。指定は {columns} 桁）"
+            ),
+            (Self::LabelTooWide { columns }, En) => format!(
+                "label fits in {MAX_LABEL_COLUMNS} columns (a full-width character takes 2; given {columns})"
+            ),
+            (Self::ShellTooLong { max }, Ja) => format!("shell のコマンドは {max} バイトまで"),
+            (Self::ShellTooLong { max }, En) => {
+                format!("the shell command is up to {max} bytes")
+            }
+            (Self::ShellControl, Ja) => {
+                "shell のコマンドに制御文字は使えない（改行とタブだけ可）".to_string()
+            }
+            (Self::ShellControl, En) => {
+                "the shell command cannot contain control characters (only newlines and tabs)"
+                    .to_string()
+            }
+            (Self::ShellEmpty, Ja) => "shell のコマンドは空にできない".to_string(),
+            (Self::ShellEmpty, En) => "the shell command cannot be empty".to_string(),
+            (Self::PromptEmpty, Ja) => "prompt の文は空にできない".to_string(),
+            (Self::PromptEmpty, En) => "the prompt text cannot be empty".to_string(),
+            (Self::PromptTooLong, Ja) => format!("prompt の文は {MAX_PROMPT_CHARS} 文字まで"),
+            (Self::PromptTooLong, En) => {
+                format!("the prompt text is up to {MAX_PROMPT_CHARS} characters")
+            }
+            (Self::PromptControl, Ja) => {
+                "prompt の文に制御文字は使えない（改行とタブだけ可）".to_string()
+            }
+            (Self::PromptControl, En) => {
+                "the prompt text cannot contain control characters (only newlines and tabs)"
+                    .to_string()
+            }
+            (Self::HotkeyShape, Ja) => "hotkey は数字 1 字か英小文字 1 字".to_string(),
+            (Self::HotkeyShape, En) => "hotkey is one digit or one lowercase letter".to_string(),
+            (Self::NotString { key }, Ja) => format!("{key} の値は文字列で渡す"),
+            (Self::NotString { key }, En) => format!("pass the value of {key} as a string"),
+            (Self::BadValue { key }, Ja) => format!("{key} に使えない値"),
+            (Self::BadValue { key }, En) => format!("{key} does not take that value"),
+            (Self::NotBool { key }, Ja) => format!("{key} は真偽"),
+            (Self::NotBool { key }, En) => format!("{key} is a boolean"),
+            (Self::BadListValue { key }, Ja) => format!("{key} に使えない値が入っている"),
+            (Self::BadListValue { key }, En) => {
+                format!("{key} contains a value it does not take")
+            }
+            (Self::ListDuplicate { key }, Ja) => {
+                format!("{key} に同じ値が 2 回ある（並べたい順に 1 回ずつ）")
+            }
+            (Self::ListDuplicate { key }, En) => format!(
+                "{key} has the same value twice (list each value once, in the order you want)"
+            ),
+            (Self::EmptyList { key }, Ja) => format!("{key} は 1 つ以上並べる"),
+            (Self::EmptyList { key }, En) => format!("{key} needs at least one value"),
+            (Self::MoveToUnreadable, Ja) => "移す先の指定が読めない".to_string(),
+            (Self::MoveToUnreadable, En) => "cannot read where to move it".to_string(),
+            (Self::MoveToRange { len }, Ja) => format!("移す先は 1〜{len}"),
+            (Self::MoveToRange { len }, En) => format!("the position is 1 to {len}"),
+            (Self::NeedValue { op }, Ja) => format!("{op} には 値（value） が要る"),
+            (Self::NeedValue { op }, En) => format!("{op} needs a value (value)"),
+            (Self::NeedContent { op }, Ja) => format!("{op} には 中身（value） が要る"),
+            (Self::NeedContent { op }, En) => format!("{op} needs the content (value)"),
+            (Self::NeedId { op }, Ja) => format!("{op} には ボタンの id（id） が要る"),
+            (Self::NeedId { op }, En) => format!("{op} needs the button id (id)"),
+            (Self::NeedTo { op }, Ja) => format!("{op} には 移す先（to） が要る"),
+            (Self::NeedTo { op }, En) => format!("{op} needs where to move it (to)"),
+            (Self::SetNeedsKey, Ja) => "set にはキー（key）が要る".to_string(),
+            (Self::SetNeedsKey, En) => "set needs a key (key)".to_string(),
+            (Self::SetKeyUnknown, Ja) => "set のキーが語彙に無い".to_string(),
+            (Self::SetKeyUnknown, En) => "the set key is not in the vocabulary".to_string(),
+            (Self::PresetNeedsName, Ja) => "preset には雛形の名前（value）が要る".to_string(),
+            (Self::PresetNeedsName, En) => "preset needs a preset name (value)".to_string(),
+            (Self::PresetUnknown, Ja) => "雛形の名前が語彙に無い".to_string(),
+            (Self::PresetUnknown, En) => "the preset name is not in the vocabulary".to_string(),
+            (Self::OpUnknown, Ja) => "op が語彙に無い".to_string(),
+            (Self::OpUnknown, En) => "op is not in the vocabulary".to_string(),
+            (Self::AnswersPresetUnknown, Ja) => "mod_ui.preset が語彙に無い".to_string(),
+            (Self::AnswersPresetUnknown, En) => {
+                "mod_ui.preset is not in the vocabulary".to_string()
+            }
+            (Self::AnswersSetKeyUnknown, Ja) => "mod_ui.set のキーが語彙に無い".to_string(),
+            (Self::AnswersSetKeyUnknown, En) => {
+                "a mod_ui.set key is not in the vocabulary".to_string()
+            }
+            (Self::NoSuchButton, Ja) => "その id のボタンは無い".to_string(),
+            (Self::NoSuchButton, En) => "no button has that id".to_string(),
+            (Self::SameAction { id }, Ja) => format!(
+                "同じ動作のボタン（id {id}）が既にある。ラベル等を変えるなら button_remove してから足す"
+            ),
+            (Self::SameAction { id }, En) => format!(
+                "a button with the same action already exists (id {id}). To change its label or the like, button_remove it first and add it again"
+            ),
+            (Self::TooManyButtons, Ja) => {
+                format!("ボタンは {MAX_BUTTONS} 個まで（どれかを button_remove で外す）")
+            }
+            (Self::TooManyButtons, En) => {
+                format!("up to {MAX_BUTTONS} buttons (remove one with button_remove)")
+            }
+            (Self::KindUnknown, Ja) => "ボタンの kind が語彙に無い".to_string(),
+            (Self::KindUnknown, En) => "the button kind is not in the vocabulary".to_string(),
+            (Self::KindNeeded, Ja) => {
+                "ボタンの kind が要る（値が slash / tako の語でないので推せない）".to_string()
+            }
+            (Self::KindNeeded, En) => {
+                "the button needs a kind (the value is not a slash / tako word, so it cannot be guessed)"
+                    .to_string()
+            }
+            (Self::SlashNotAllowed, Ja) => "slash で送れるのは許可リストのコマンドだけ".to_string(),
+            (Self::SlashNotAllowed, En) => {
+                "slash sends only the commands on the allow list".to_string()
+            }
+            (Self::TakoOpUnknown, Ja) => "tako の操作 id が語彙に無い".to_string(),
+            (Self::TakoOpUnknown, En) => {
+                "the tako operation id is not in the vocabulary".to_string()
+            }
+            (Self::IdTaken, Ja) => "その id は別のボタンが使っている".to_string(),
+            (Self::IdTaken, En) => "another button already uses that id".to_string(),
+            (Self::HotkeyTaken, Ja) => "その hotkey は別のボタンが使っている".to_string(),
+            (Self::HotkeyTaken, En) => "another button already uses that hotkey".to_string(),
+            (Self::Unshaped { problems }, Ja) => format!(
+                "操作の結果が形を満たさない（{}）",
+                join_problems(problems, Ja)
+            ),
+            (Self::Unshaped { problems }, En) => format!(
+                "the result of the operation does not fit the shape ({})",
+                join_problems(problems, En)
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for UiReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+/// 使える値の 1 つ（[`UiError::allowed`]）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Allowed {
+    /// 語彙の語・ボタンの id / hotkey（日英で同じ語）
+    Word(String),
+    /// hotkey の英小文字 1 字
+    Letters,
+    /// hotkey の数字 1 字
+    Digits,
+    /// 移す先の番号（1〜[`MAX_BUTTONS`]）
+    Position,
+}
+
+impl Allowed {
+    /// 語の並び（語彙の `words()`・ボタンの id）を使える値へ
+    pub fn words<S: Into<String>>(words: Vec<S>) -> Vec<Self> {
+        words.into_iter().map(|w| Self::Word(w.into())).collect()
+    }
+
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Word(word), _) => word.clone(),
+            (Self::Letters, Ja) => "a〜z".to_string(),
+            (Self::Letters, En) => "a-z".to_string(),
+            (Self::Digits, Ja) => "0〜9".to_string(),
+            (Self::Digits, En) => "0-9".to_string(),
+            (Self::Position, Ja) => format!("1〜{MAX_BUTTONS} の番号"),
+            (Self::Position, En) => format!("a number 1-{MAX_BUTTONS}"),
+        }
+    }
+}
+
+impl std::fmt::Display for Allowed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+/// ボタンのどのフィールドか（問題の文の `buttons[i].<ここ>`。日英で同じ綴り）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonField {
+    Id,
+    Label,
+    Hotkey,
+    Command,
+    Text,
+}
+
+impl ButtonField {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::Label => "label",
+            Self::Hotkey => "hotkey",
+            Self::Command => "action.command",
+            Self::Text => "action.text",
+        }
+    }
+}
+
+/// ui.json の形の問題（[`problems`] / [`parse_lenient`]）。**利用者が書いた値は入れない**
+/// （キーの位置と種類だけ。知らないキーは名前だけを短く載せる）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiProblem {
+    SchemaVersion,
+    SegmentsEmpty,
+    SegmentsDuplicate,
+    ItemsEmpty,
+    ItemsDuplicate,
+    TooManyButtons {
+        len: usize,
+    },
+    DuplicateId {
+        index: usize,
+    },
+    DuplicateHotkey {
+        index: usize,
+    },
+    /// ボタンのフィールドが検証で断られる（理由は [`UiReason`] の文）
+    Field {
+        index: usize,
+        field: ButtonField,
+        why: UiReason,
+    },
+    /// 前後の空白・改行を落とした形で書いていない
+    NotNormalized {
+        index: usize,
+        field: ButtonField,
+    },
+    NotJson {
+        line: usize,
+        column: usize,
+    },
+    NotObject,
+    UnknownKey {
+        key: String,
+    },
+    /// 最上位の部分が無い
+    Missing {
+        key: &'static str,
+    },
+    /// 最上位の部分が語彙・形に合わない
+    SectionUnshaped {
+        key: &'static str,
+    },
+    ButtonsNotArray,
+    ButtonUnshaped {
+        index: usize,
+    },
+    SameIdOrHotkey {
+        index: usize,
+    },
+    OverMax {
+        index: usize,
+    },
+    /// そのボタンを外した（中身の問題に「外した」を添える）
+    Dropped(Box<UiProblem>),
+    NotUtf8,
+    /// 読み取りに失敗（`kind` は `io::ErrorKind` の表示）
+    ReadIo {
+        kind: String,
+    },
+}
+
+impl UiProblem {
+    /// 表示言語を明示しての文言（日英の正本。日本語は #2365 より前の固定文とバイト一致）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::SchemaVersion, Ja) => format!("schema_version は {SCHEMA_VERSION}"),
+            (Self::SchemaVersion, En) => format!("schema_version is {SCHEMA_VERSION}"),
+            (Self::SegmentsEmpty, Ja) => {
+                "band.segments が空（隠すなら band.hidden を true にする）".to_string()
+            }
+            (Self::SegmentsEmpty, En) => {
+                "band.segments is empty (to hide the band, set band.hidden to true)".to_string()
+            }
+            (Self::SegmentsDuplicate, Ja) => "band.segments に同じ区切りが 2 回ある".to_string(),
+            (Self::SegmentsDuplicate, En) => "band.segments has the same segment twice".to_string(),
+            (Self::ItemsEmpty, Ja) => {
+                "usage_bar.items が空（消すなら usage_bar.place を off にする）".to_string()
+            }
+            (Self::ItemsEmpty, En) => {
+                "usage_bar.items is empty (to remove the bar, set usage_bar.place to off)"
+                    .to_string()
+            }
+            (Self::ItemsDuplicate, Ja) => "usage_bar.items に同じ項目が 2 回ある".to_string(),
+            (Self::ItemsDuplicate, En) => "usage_bar.items has the same item twice".to_string(),
+            (Self::TooManyButtons { len }, Ja) => {
+                format!("buttons が {len} 個（{MAX_BUTTONS} 個まで）")
+            }
+            (Self::TooManyButtons { len }, En) => {
+                format!("buttons has {len} (up to {MAX_BUTTONS})")
+            }
+            (Self::DuplicateId { index }, Ja) => {
+                format!("buttons[{index}].id が前のボタンと重複")
+            }
+            (Self::DuplicateId { index }, En) => {
+                format!("buttons[{index}].id is the same as an earlier button")
+            }
+            (Self::DuplicateHotkey { index }, Ja) => {
+                format!("buttons[{index}].hotkey が前のボタンと重複")
+            }
+            (Self::DuplicateHotkey { index }, En) => {
+                format!("buttons[{index}].hotkey is the same as an earlier button")
+            }
+            (Self::Field { index, field, why }, lang) => {
+                format!("buttons[{index}].{}: {}", field.as_str(), why.text_in(lang))
+            }
+            (Self::NotNormalized { index, field }, Ja) => format!(
+                "buttons[{index}].{}: 前後の空白・改行を落とした形で書く",
+                field.as_str()
+            ),
+            (Self::NotNormalized { index, field }, En) => format!(
+                "buttons[{index}].{}: write it without leading or trailing spaces and newlines",
+                field.as_str()
+            ),
+            (Self::NotJson { line, column }, Ja) => {
+                format!("JSON として読めない（{line} 行 {column} 桁）")
+            }
+            (Self::NotJson { line, column }, En) => {
+                format!("cannot read it as JSON (line {line}, column {column})")
+            }
+            (Self::NotObject, Ja) => "最上位が JSON のオブジェクトではない".to_string(),
+            (Self::NotObject, En) => "the top level is not a JSON object".to_string(),
+            (Self::UnknownKey { key }, Ja) => format!("知らないキー `{key}`"),
+            (Self::UnknownKey { key }, En) => format!("unknown key `{key}`"),
+            (Self::Missing { key }, Ja) => format!("{key} が無い"),
+            (Self::Missing { key }, En) => format!("{key} is missing"),
+            (Self::SectionUnshaped { key }, Ja) => format!("{key} が語彙・形に合わない"),
+            (Self::SectionUnshaped { key }, En) => {
+                format!("{key} does not fit the vocabulary or shape")
+            }
+            (Self::ButtonsNotArray, Ja) => "buttons が配列ではない".to_string(),
+            (Self::ButtonsNotArray, En) => "buttons is not an array".to_string(),
+            (Self::ButtonUnshaped { index }, Ja) => {
+                format!("buttons[{index}] が語彙・形に合わない")
+            }
+            (Self::ButtonUnshaped { index }, En) => {
+                format!("buttons[{index}] does not fit the vocabulary or shape")
+            }
+            (Self::SameIdOrHotkey { index }, Ja) => {
+                format!("buttons[{index}] の id か hotkey が前のボタンと重複")
+            }
+            (Self::SameIdOrHotkey { index }, En) => {
+                format!("buttons[{index}] has the same id or hotkey as an earlier button")
+            }
+            (Self::OverMax { index }, Ja) => {
+                format!("buttons[{index}] は {MAX_BUTTONS} 個を超えた")
+            }
+            (Self::OverMax { index }, En) => {
+                format!("buttons[{index}] is past the {MAX_BUTTONS}-button limit")
+            }
+            (Self::Dropped(inner), Ja) => format!("{}（外した）", inner.text_in(Ja)),
+            (Self::Dropped(inner), En) => format!("{} (dropped)", inner.text_in(En)),
+            (Self::NotUtf8, Ja) => "UTF-8 として読めない".to_string(),
+            (Self::NotUtf8, En) => "cannot read it as UTF-8".to_string(),
+            (Self::ReadIo { kind }, Ja) => format!("読み取りに失敗（{kind}）"),
+            (Self::ReadIo { kind }, En) => format!("reading failed ({kind})"),
+        }
+    }
+
+    fn dropped(self) -> Self {
+        Self::Dropped(Box::new(self))
+    }
+}
+
+impl std::fmt::Display for UiProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+/// 問題の並びを 1 行へ（`; ` 区切り）
+pub fn join_problems(problems: &[UiProblem], lang: crate::i18n::Lang) -> String {
+    problems
+        .iter()
+        .map(|p| p.text_in(lang))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// 値（文字列・真偽・配列のどれか）から語を取り出す。不正なら理由
-fn word_of(value: &Value, key: &str) -> Result<String, UiError> {
+fn word_of(value: &Value, key: &'static str) -> Result<String, UiError> {
     match value {
         Value::String(s) => Ok(s.clone()),
         Value::Bool(b) => Ok(b.to_string()),
         Value::Number(n) => Ok(n.to_string()),
-        _ => Err(UiError::new(format!("{key} の値は文字列で渡す"))),
+        _ => Err(UiError::new(UiReason::NotString { key })),
     }
 }
 
-fn parse_one<T: Vocab>(value: &Value, key: &str) -> Result<T, UiError> {
+fn parse_one<T: Vocab>(value: &Value, key: &'static str) -> Result<T, UiError> {
     let word = word_of(value, key)?;
-    T::parse(&word).ok_or_else(|| UiError::with_allowed(format!("{key} に使えない値"), T::words()))
+    T::parse(&word).ok_or_else(|| UiError::with_allowed(UiReason::BadValue { key }, T::words()))
 }
 
-fn parse_bool(value: &Value, key: &str) -> Result<bool, UiError> {
+fn parse_bool(value: &Value, key: &'static str) -> Result<bool, UiError> {
     let word = word_of(value, key)?;
     match canonical(&word).as_str() {
         "true" | "on" | "yes" | "1" => Ok(true),
         "false" | "off" | "no" | "0" => Ok(false),
         _ => Err(UiError::with_allowed(
-            format!("{key} は真偽"),
+            UiReason::NotBool { key },
             vec!["true", "false"],
         )),
     }
 }
 
 /// 並びのある部分集合。配列か、`,` / 空白で区切った文字列
-fn parse_list<T: Vocab>(value: &Value, key: &str) -> Result<Vec<T>, UiError> {
+fn parse_list<T: Vocab>(value: &Value, key: &'static str) -> Result<Vec<T>, UiError> {
     let words: Vec<String> = match value {
         Value::Array(items) => items
             .iter()
@@ -1181,19 +1672,16 @@ fn parse_list<T: Vocab>(value: &Value, key: &str) -> Result<Vec<T>, UiError> {
     };
     let mut out = Vec::new();
     for word in &words {
-        let item = T::parse(word).ok_or_else(|| {
-            UiError::with_allowed(format!("{key} に使えない値が入っている"), T::words())
-        })?;
+        let item = T::parse(word)
+            .ok_or_else(|| UiError::with_allowed(UiReason::BadListValue { key }, T::words()))?;
         if out.contains(&item) {
-            return Err(UiError::new(format!(
-                "{key} に同じ値が 2 回ある（並べたい順に 1 回ずつ）"
-            )));
+            return Err(UiError::new(UiReason::ListDuplicate { key }));
         }
         out.push(item);
     }
     if out.is_empty() {
         return Err(UiError::with_allowed(
-            format!("{key} は 1 つ以上並べる"),
+            UiReason::EmptyList { key },
             T::words(),
         ));
     }
@@ -1231,11 +1719,16 @@ pub enum MoveTo {
 
 impl MoveTo {
     fn parse(value: &Value) -> Result<Self, UiError> {
-        let allowed = || vec!["1〜8 の番号", "first", "last", "left", "right"];
+        let allowed = || {
+            let mut out = vec![Allowed::Position];
+            out.extend(Allowed::words(vec!["first", "last", "left", "right"]));
+            out
+        };
+        let unreadable = || UiError::with_items(UiReason::MoveToUnreadable, allowed());
         let word = match value {
             Value::Number(n) => n.to_string(),
             Value::String(s) => s.trim().to_string(),
-            _ => return Err(UiError::with_allowed("移す先の指定が読めない", allowed())),
+            _ => return Err(unreadable()),
         };
         match canonical(&word).as_str() {
             "first" | "top" | "start" => Ok(Self::First),
@@ -1247,7 +1740,7 @@ impl MoveTo {
                 .ok()
                 .filter(|n| *n >= 1)
                 .map(Self::Index)
-                .ok_or_else(|| UiError::with_allowed("移す先の指定が読めない", allowed())),
+                .ok_or_else(unreadable),
         }
     }
 }
@@ -1319,17 +1812,21 @@ impl UiRequest {
     /// 形を [`UiOp`] へ。足りない引数は「何を足せばよいか」を返す
     pub fn to_op(&self) -> Result<UiOp, UiError> {
         let op = self.op.as_deref().map(canonical).unwrap_or_default();
-        let need = |what: &str| UiError::new(format!("{} には {what} が要る", self.op_name()));
+        let need = |what: fn(String) -> UiReason| UiError::new(what(self.op_name()));
         match op.as_str() {
             "" | "show" | "list" | "status" => Ok(UiOp::Show),
             "set" => {
-                let key_word = self.key.as_deref().ok_or_else(|| {
-                    UiError::with_allowed("set にはキー（key）が要る", SetKey::words())
-                })?;
+                let key_word = self
+                    .key
+                    .as_deref()
+                    .ok_or_else(|| UiError::with_allowed(UiReason::SetNeedsKey, SetKey::words()))?;
                 let key = SetKey::parse(key_word).ok_or_else(|| {
-                    UiError::with_allowed("set のキーが語彙に無い", SetKey::words())
+                    UiError::with_allowed(UiReason::SetKeyUnknown, SetKey::words())
                 })?;
-                let value = self.value.clone().ok_or_else(|| need("値（value）"))?;
+                let value = self
+                    .value
+                    .clone()
+                    .ok_or_else(|| need(|op| UiReason::NeedValue { op }))?;
                 Ok(UiOp::Set { key, value })
             }
             "buttonadd" | "add" => {
@@ -1338,7 +1835,7 @@ impl UiRequest {
                     .as_ref()
                     .map(|v| word_of(v, "value"))
                     .transpose()?
-                    .ok_or_else(|| need("中身（value）"))?;
+                    .ok_or_else(|| need(|op| UiReason::NeedContent { op }))?;
                 Ok(UiOp::ButtonAdd(ButtonSpec {
                     kind: self.kind.clone(),
                     value,
@@ -1348,11 +1845,21 @@ impl UiRequest {
                 }))
             }
             "buttonremove" | "remove" | "rm" => Ok(UiOp::ButtonRemove {
-                id: self.id.clone().ok_or_else(|| need("ボタンの id（id）"))?,
+                id: self
+                    .id
+                    .clone()
+                    .ok_or_else(|| need(|op| UiReason::NeedId { op }))?,
             }),
             "buttonmove" | "move" | "mv" => Ok(UiOp::ButtonMove {
-                id: self.id.clone().ok_or_else(|| need("ボタンの id（id）"))?,
-                to: MoveTo::parse(self.to.as_ref().ok_or_else(|| need("移す先（to）"))?)?,
+                id: self
+                    .id
+                    .clone()
+                    .ok_or_else(|| need(|op| UiReason::NeedId { op }))?,
+                to: MoveTo::parse(
+                    self.to
+                        .as_ref()
+                        .ok_or_else(|| need(|op| UiReason::NeedTo { op }))?,
+                )?,
             }),
             "reset" => Ok(UiOp::Reset),
             "preset" => {
@@ -1362,16 +1869,13 @@ impl UiRequest {
                     .map(|v| word_of(v, "value"))
                     .transpose()?
                     .ok_or_else(|| {
-                        UiError::with_allowed(
-                            "preset には雛形の名前（value）が要る",
-                            Preset::words(),
-                        )
+                        UiError::with_allowed(UiReason::PresetNeedsName, Preset::words())
                     })?;
                 Preset::parse(&word)
                     .map(UiOp::Preset)
-                    .ok_or_else(|| UiError::with_allowed("雛形の名前が語彙に無い", Preset::words()))
+                    .ok_or_else(|| UiError::with_allowed(UiReason::PresetUnknown, Preset::words()))
             }
-            _ => Err(UiError::with_allowed("op が語彙に無い", OPS.to_vec())),
+            _ => Err(UiError::with_allowed(UiReason::OpUnknown, OPS.to_vec())),
         }
     }
 
@@ -1405,13 +1909,13 @@ impl UiAnswers {
         let mut ops = Vec::new();
         if let Some(word) = &self.preset {
             let preset = Preset::parse(word).ok_or_else(|| {
-                UiError::with_allowed("mod_ui.preset が語彙に無い", Preset::words())
+                UiError::with_allowed(UiReason::AnswersPresetUnknown, Preset::words())
             })?;
             ops.push(UiOp::Preset(preset));
         }
         for (key, value) in &self.set {
             let key = SetKey::parse(key).ok_or_else(|| {
-                UiError::with_allowed("mod_ui.set のキーが語彙に無い", SetKey::words())
+                UiError::with_allowed(UiReason::AnswersSetKeyUnknown, SetKey::words())
             })?;
             ops.push(UiOp::Set {
                 key,
@@ -1443,10 +1947,7 @@ pub fn apply_all(cfg: &mut UiConfig, ops: &[UiOp], now_ms: u64) -> Result<bool, 
     // 最後の砦: どの操作を通っても形を満たす（崩れていたら書かない）
     let left = problems(&next);
     if !left.is_empty() {
-        return Err(UiError::new(format!(
-            "操作の結果が形を満たさない（{}）",
-            left.join("; ")
-        )));
+        return Err(UiError::new(UiReason::Unshaped { problems: left }));
     }
     let changed = next != *cfg;
     *cfg = next;
@@ -1516,7 +2017,7 @@ fn find_button(cfg: &UiConfig, id: &str) -> Result<usize, UiError> {
         .position(|b| b.id == want)
         .ok_or_else(|| {
             UiError::with_allowed(
-                "その id のボタンは無い",
+                UiReason::NoSuchButton,
                 cfg.buttons.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
             )
         })
@@ -1533,7 +2034,9 @@ fn move_button(cfg: &mut UiConfig, id: &str, to: MoveTo) -> Result<(), UiError> 
         MoveTo::Index(n) if n <= cfg.buttons.len() => n - 1,
         MoveTo::Index(_) => {
             return Err(UiError::with_allowed(
-                format!("移す先は 1〜{}", cfg.buttons.len()),
+                UiReason::MoveToRange {
+                    len: cfg.buttons.len(),
+                },
                 vec!["first", "last", "left", "right"],
             ))
         }
@@ -1557,16 +2060,15 @@ fn add_button(cfg: &mut UiConfig, spec: &ButtonSpec) -> Result<(), UiError> {
                 .is_some_and(|h| h.trim().to_ascii_lowercase() != same.hotkey)
             || spec.id.as_deref().is_some_and(|i| i.trim() != same.id);
         if explicit_differs {
-            return Err(UiError::new(format!(
-                "同じ動作のボタン（id {}）が既にある。ラベル等を変えるなら button_remove してから足す",
-                same.id
-            )));
+            return Err(UiError::new(UiReason::SameAction {
+                id: same.id.clone(),
+            }));
         }
         return Ok(());
     }
     if cfg.buttons.len() >= MAX_BUTTONS {
         return Err(UiError::with_allowed(
-            format!("ボタンは {MAX_BUTTONS} 個まで（どれかを button_remove で外す）"),
+            UiReason::TooManyButtons,
             cfg.buttons.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
         ));
     }
@@ -1577,14 +2079,13 @@ fn add_button(cfg: &mut UiConfig, spec: &ButtonSpec) -> Result<(), UiError> {
 /// 材料からボタンを組む（id・ラベル・hotkey を省いたら推す）。`existing` と重ならないように選ぶ
 pub fn build_button(spec: &ButtonSpec, existing: &[Button]) -> Result<Button, UiError> {
     let kind = match spec.kind.as_deref() {
-        Some(word) => ButtonKind::parse(word).ok_or_else(|| {
-            UiError::with_allowed("ボタンの kind が語彙に無い", ButtonKind::words())
-        })?,
+        Some(word) => ButtonKind::parse(word)
+            .ok_or_else(|| UiError::with_allowed(UiReason::KindUnknown, ButtonKind::words()))?,
         None if SlashCommand::parse(&spec.value).is_some() => ButtonKind::Slash,
         None if TakoOp::parse(&spec.value).is_some() => ButtonKind::Tako,
         None => {
             return Err(UiError::with_allowed(
-                "ボタンの kind が要る（値が slash / tako の語でないので推せない）",
+                UiReason::KindNeeded,
                 ButtonKind::words(),
             ))
         }
@@ -1592,16 +2093,12 @@ pub fn build_button(spec: &ButtonSpec, existing: &[Button]) -> Result<Button, Ui
     let action = match kind {
         ButtonKind::Slash => ButtonAction::Slash {
             command: SlashCommand::parse(&spec.value).ok_or_else(|| {
-                UiError::with_allowed(
-                    "slash で送れるのは許可リストのコマンドだけ",
-                    SlashCommand::words(),
-                )
+                UiError::with_allowed(UiReason::SlashNotAllowed, SlashCommand::words())
             })?,
         },
         ButtonKind::Tako => ButtonAction::Tako {
-            op: TakoOp::parse(&spec.value).ok_or_else(|| {
-                UiError::with_allowed("tako の操作 id が語彙に無い", TakoOp::words())
-            })?,
+            op: TakoOp::parse(&spec.value)
+                .ok_or_else(|| UiError::with_allowed(UiReason::TakoOpUnknown, TakoOp::words()))?,
         },
         ButtonKind::Shell => ButtonAction::Shell {
             command: normalize_shell(&spec.value)?,
@@ -1624,7 +2121,7 @@ pub fn build_button(spec: &ButtonSpec, existing: &[Button]) -> Result<Button, Ui
             check_id(&id)?;
             if existing.iter().any(|b| b.id == id) {
                 return Err(UiError::with_allowed(
-                    "その id は別のボタンが使っている",
+                    UiReason::IdTaken,
                     existing.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
                 ));
             }
@@ -1638,7 +2135,7 @@ pub fn build_button(spec: &ButtonSpec, existing: &[Button]) -> Result<Button, Ui
             check_hotkey(&hotkey)?;
             if existing.iter().any(|b| b.hotkey == hotkey) {
                 return Err(UiError::with_allowed(
-                    "その hotkey は別のボタンが使っている",
+                    UiReason::HotkeyTaken,
                     free_hotkeys(existing),
                 ));
             }
@@ -1824,7 +2321,7 @@ pub struct Parsed {
     /// 必ず形を満たす（壊れた部分は既定）
     pub config: UiConfig,
     /// 既定へ落とした部分（空 = そのまま読めた）。**利用者が書いた値は入れない**
-    pub problems: Vec<String>,
+    pub problems: Vec<UiProblem>,
     /// 書かれていた `schema_version`（無ければ None）
     pub version: Option<u64>,
 }
@@ -1844,19 +2341,20 @@ pub fn detect_version(text: &str) -> u32 {
         .map_or(1, |v| v.min(u64::from(u32::MAX)) as u32)
 }
 
-/// 今の形として読めるか（移行の `validate`）。新しい形は通す（移行の計画が「目標超過」で断る）
+/// 今の形として読めるか（移行の `validate`）。新しい形は通す（移行の計画が「目標超過」で断る）。
+/// 理由は日本語で返す（移行の申告 = `tako migrate` と persist.log の文はほかの種別も日本語。#2365）
 pub fn validate_text(text: &str) -> Result<(), String> {
     let parsed = parse_lenient(text);
     if parsed.is_future() || parsed.problems.is_empty() {
         Ok(())
     } else {
-        Err(parsed.problems.join("; "))
+        Err(join_problems(&parsed.problems, crate::i18n::Lang::Ja))
     }
 }
 
 /// 部分ごとに読む。壊れた部分は既定へ落として `problems` に積む（読める部分は捨てない）
 pub fn parse_lenient(text: &str) -> Parsed {
-    let fallback = |problem: String| Parsed {
+    let fallback = |problem: UiProblem| Parsed {
         config: UiConfig::default(),
         problems: vec![problem],
         version: None,
@@ -1864,27 +2362,26 @@ pub fn parse_lenient(text: &str) -> Parsed {
     let value: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(e) => {
-            return fallback(format!(
-                "JSON として読めない（{} 行 {} 桁）",
-                e.line(),
-                e.column()
-            ))
+            return fallback(UiProblem::NotJson {
+                line: e.line(),
+                column: e.column(),
+            })
         }
     };
     let Value::Object(map) = value else {
-        return fallback("最上位が JSON のオブジェクトではない".into());
+        return fallback(UiProblem::NotObject);
     };
     let mut problems = Vec::new();
     let version = map.get("schema_version").and_then(Value::as_u64);
     match version {
         Some(v) if v == u64::from(SCHEMA_VERSION) => {}
         Some(v) if v > u64::from(SCHEMA_VERSION) => {}
-        Some(_) | None => problems.push(format!("schema_version は {SCHEMA_VERSION}")),
+        Some(_) | None => problems.push(UiProblem::SchemaVersion),
     }
     for key in map.keys() {
         if !TOP_KEYS.contains(&key.as_str()) {
             let shown: String = key.chars().filter(|c| !c.is_control()).take(32).collect();
-            problems.push(format!("知らないキー `{shown}`"));
+            problems.push(UiProblem::UnknownKey { key: shown });
         }
     }
     let defaults = UiConfig::default();
@@ -1917,20 +2414,20 @@ pub fn parse_lenient(text: &str) -> Parsed {
 /// 1 つの部分を型どおりに読む。読めなければ既定
 fn section<T: serde::de::DeserializeOwned + Serialize>(
     map: &Map<String, Value>,
-    key: &str,
+    key: &'static str,
     default: T,
-    problems: &mut Vec<String>,
+    problems: &mut Vec<UiProblem>,
 ) -> T {
     match map.get(key) {
         None => {
-            problems.push(format!("{key} が無い"));
+            problems.push(UiProblem::Missing { key });
             default
         }
         // 型で読めて、書き戻すと同じ形になる = スキーマどおり（余計なキー・null の混入も弾く）
         Some(v) => match serde_json::from_value::<T>(v.clone()) {
             Ok(parsed) if serde_json::to_value(&parsed).ok().as_ref() == Some(v) => parsed,
             _ => {
-                problems.push(format!("{key} が語彙・形に合わない"));
+                problems.push(UiProblem::SectionUnshaped { key });
                 default
             }
         },
@@ -1938,42 +2435,41 @@ fn section<T: serde::de::DeserializeOwned + Serialize>(
 }
 
 /// ボタンは 1 個ずつ読む（壊れたものだけ落とす。重複・上限を超えたものも落とす）
-fn lenient_buttons(value: Option<&Value>, problems: &mut Vec<String>) -> Vec<Button> {
+fn lenient_buttons(value: Option<&Value>, problems: &mut Vec<UiProblem>) -> Vec<Button> {
     let items = match value {
         None => {
-            problems.push("buttons が無い".into());
+            problems.push(UiProblem::Missing { key: "buttons" });
             return default_buttons();
         }
         Some(Value::Array(items)) => items,
         Some(_) => {
-            problems.push("buttons が配列ではない".into());
+            problems.push(UiProblem::ButtonsNotArray);
             return default_buttons();
         }
     };
     let mut out: Vec<Button> = Vec::new();
     for (i, item) in items.iter().enumerate() {
-        let at = format!("buttons[{i}]");
         let button = serde_json::from_value::<Button>(item.clone())
             .ok()
             .filter(|b| serde_json::to_value(b).ok().as_ref() == Some(item));
         let Some(button) = button else {
-            problems.push(format!("{at} が語彙・形に合わない（外した）"));
+            problems.push(UiProblem::ButtonUnshaped { index: i }.dropped());
             continue;
         };
-        let mine = button_problems(&button, &at);
+        let mine = button_problems(&button, i);
         if !mine.is_empty() {
-            problems.extend(mine.into_iter().map(|p| format!("{p}（外した）")));
+            problems.extend(mine.into_iter().map(UiProblem::dropped));
             continue;
         }
         if out
             .iter()
             .any(|b| b.id == button.id || b.hotkey == button.hotkey)
         {
-            problems.push(format!("{at} の id か hotkey が前のボタンと重複（外した）"));
+            problems.push(UiProblem::SameIdOrHotkey { index: i }.dropped());
             continue;
         }
         if out.len() >= MAX_BUTTONS {
-            problems.push(format!("{at} は {MAX_BUTTONS} 個を超えた（外した）"));
+            problems.push(UiProblem::OverMax { index: i }.dropped());
             continue;
         }
         out.push(button);
@@ -1992,7 +2488,7 @@ pub enum LoadState {
     Valid,
     /// 一部（または全部）を既定へ落とした。元は `quarantine` へ保全した
     Repaired {
-        problems: Vec<String>,
+        problems: Vec<UiProblem>,
         quarantine: Option<crate::migration::Quarantine>,
     },
     /// 新しい tako が書いた形（読める範囲で使い、書き換えない）
@@ -2087,9 +2583,11 @@ fn read_text(path: &Path) -> Result<String, LoadState> {
         },
         quarantine => LoadState::Repaired {
             problems: vec![if utf8 {
-                "UTF-8 として読めない".into()
+                UiProblem::NotUtf8
             } else {
-                format!("読み取りに失敗（{}）", e.kind())
+                UiProblem::ReadIo {
+                    kind: e.kind().to_string(),
+                }
             }],
             quarantine,
         },
@@ -2114,7 +2612,7 @@ fn legacy_2238_read(path: &Path) -> Result<String, LoadState> {
             let _ = std::fs::copy(path, &slot);
         }
         LoadState::Repaired {
-            problems: vec!["UTF-8 として読めない".into()],
+            problems: vec![UiProblem::NotUtf8],
             quarantine: slot.exists().then_some(crate::migration::Quarantine {
                 path: slot,
                 copied: true,
@@ -2128,14 +2626,11 @@ fn legacy_2238_read(path: &Path) -> Result<String, LoadState> {
 pub fn save_to(path: &Path, cfg: &UiConfig) -> std::io::Result<()> {
     let left = problems(cfg);
     if !left.is_empty() {
-        return Err(std::io::Error::other(format!(
-            "形を満たさない値は書かない（{}）",
-            left.join("; ")
-        )));
+        return Err(std::io::Error::other(SaveRefusal::Unshaped(left)));
     }
     let dir = path
         .parent()
-        .ok_or_else(|| std::io::Error::other("ui.json の置き場が決まらない"))?;
+        .ok_or_else(|| std::io::Error::other(SaveRefusal::NoDir))?;
     std::fs::create_dir_all(dir)?;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -2175,16 +2670,68 @@ pub enum UpdateError {
 }
 
 impl UpdateError {
+    /// 表示言語に従う 1 行（[`Self::text_in`] を `i18n::lang()` で引く）
     pub fn message(&self) -> String {
-        match self {
-            Self::Invalid(e) => e.message(),
-            Self::Future { version } => format!(
+        self.text_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての文言（日英の正本。`Io` の中身は io の誤りの表示をそのまま添える）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Invalid(e), lang) => e.text_in(lang),
+            (Self::Future { version }, Ja) => format!(
                 "ui.json は新しい tako が書いた形（schema_version {version}）なので、この tako では書き換えない（tako を更新する）"
             ),
-            Self::Io(e) => format!("ui.json を書けない: {e}"),
+            (Self::Future { version }, En) => format!(
+                "ui.json was written by a newer tako (schema_version {version}), so this tako does not rewrite it (update tako)"
+            ),
+            (Self::Io(e), Ja) => format!("ui.json を書けない: {e}"),
+            (Self::Io(e), En) => format!("cannot write ui.json: {e}"),
         }
     }
 }
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+/// [`save_to`] が書く前に断った理由（`io::Error` に包んで返す。表示は表示言語に従う）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveRefusal {
+    /// 形を満たさない値（[`apply_all`] が先に断るので、ここへ来るのは呼び手の誤り）
+    Unshaped(Vec<UiProblem>),
+    /// 置き場（親 dir）が決まらない
+    NoDir,
+}
+
+impl SaveRefusal {
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Unshaped(problems), Ja) => format!(
+                "形を満たさない値は書かない（{}）",
+                join_problems(problems, Ja)
+            ),
+            (Self::Unshaped(problems), En) => format!(
+                "values that do not fit the shape are not written ({})",
+                join_problems(problems, En)
+            ),
+            (Self::NoDir, Ja) => "ui.json の置き場が決まらない".to_string(),
+            (Self::NoDir, En) => "cannot tell where ui.json goes".to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for SaveRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for SaveRefusal {}
 
 /// 読む → 操作を当てる → 変わったら書く。**呼び出し側が排他を取る**（tako-control は
 /// `config_io::lock_exclusive`）。操作が 1 つでも断られたら書かない
@@ -2256,7 +2803,7 @@ mod tests {
         );
         // 書いた本文はそのまま読み戻せる
         let parsed = parse_lenient(&cfg.to_text());
-        assert_eq!(parsed.problems, Vec::<String>::new());
+        assert_eq!(parsed.problems, Vec::<UiProblem>::new());
         assert_eq!(parsed.config, cfg);
         assert!(
             cfg.to_text().contains("\"kind\": \"slash\""),
@@ -2329,7 +2876,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(err.allowed, ButtonKind::words());
+        assert_eq!(err.allowed, Allowed::words(ButtonKind::words()));
         // 許可リスト外の slash
         let err = run(
             &mut cfg,
@@ -2341,8 +2888,12 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(err.allowed, SlashCommand::words());
-        assert!(err.message().contains("ui.json は書いていない"), "{err}");
+        assert_eq!(err.allowed, Allowed::words(SlashCommand::words()));
+        // 枠の「書いていない」は日英とも理由と同じ言語で添える（#2365）
+        let ja = err.text_in(crate::i18n::Lang::Ja);
+        assert!(ja.contains("ui.json は書いていない"), "{ja}");
+        let en = err.text_in(crate::i18n::Lang::En);
+        assert!(en.contains("(ui.json was not written)"), "{en}");
         // テーマに無い色
         let err = run(
             &mut cfg,
@@ -2354,7 +2905,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(err.allowed, ThemeColor::words());
+        assert_eq!(err.allowed, Allowed::words(ThemeColor::words()));
         // 未知のキー
         let err = run(
             &mut cfg,
@@ -2366,7 +2917,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(err.allowed, SetKey::words());
+        assert_eq!(err.allowed, Allowed::words(SetKey::words()));
         // label 17 桁・全角 9 字（18 桁）
         for label in ["abcdefghijklmnopq", "あいうえおかきくけ"] {
             let err = run(
@@ -2379,7 +2930,10 @@ mod tests {
                 },
             )
             .unwrap_err();
-            assert!(err.what.contains("16 桁"), "{err}");
+            assert!(
+                matches!(err.what, UiReason::LabelTooWide { columns: 17 | 18 }),
+                "{err}"
+            );
         }
         // hotkey の重複（compact が c を持つ）
         let err = run(
@@ -2392,8 +2946,8 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(!err.allowed.contains(&"c".to_string()), "{err}");
-        assert!(err.allowed.contains(&"a".to_string()), "{err}");
+        assert!(!err.allowed.contains(&Allowed::Word("c".into())), "{err}");
+        assert!(err.allowed.contains(&Allowed::Word("a".into())), "{err}");
         // hotkey の形
         let err = run(
             &mut cfg,
@@ -2405,7 +2959,8 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.what.contains("hotkey"), "{err}");
+        assert_eq!(err.what, UiReason::HotkeyShape, "{err}");
+        assert_eq!(err.allowed, [Allowed::Letters, Allowed::Digits]);
         // shell の制御文字（FR-2.22.7）
         let err = run(
             &mut cfg,
@@ -2417,7 +2972,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.what.contains("制御文字"), "{err}");
+        assert_eq!(err.what, UiReason::ShellControl, "{err}");
         assert_eq!(cfg, before, "断った操作は何も変えない");
     }
 
@@ -2455,7 +3010,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.what.contains("8 個まで"), "{err}");
+        assert_eq!(err.what, UiReason::TooManyButtons, "{err}");
         assert_eq!(err.allowed.len(), 8, "今の id を並べる");
         // hotkey は英字が先（数字は空の入力欄で帯のボタンを押してしまう）
         assert!(cfg
@@ -2488,7 +3043,13 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.what.contains("button_remove"), "{err}");
+        assert_eq!(
+            err.what,
+            UiReason::SameAction {
+                id: "compact".into()
+            },
+            "{err}"
+        );
     }
 
     #[test]
@@ -2539,7 +3100,7 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.what.contains("1〜4"), "{err}");
+        assert_eq!(err.what, UiReason::MoveToRange { len: 4 }, "{err}");
         let err = run(
             &mut cfg,
             UiRequest {
@@ -2614,7 +3175,13 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.what.contains("2 回"), "{err}");
+        assert_eq!(
+            err.what,
+            UiReason::ListDuplicate {
+                key: "band.segments"
+            },
+            "{err}"
+        );
         let err = run(
             &mut cfg,
             UiRequest {
@@ -2625,7 +3192,13 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(err.what.contains("1 つ以上"), "{err}");
+        assert_eq!(
+            err.what,
+            UiReason::EmptyList {
+                key: "usage_bar.items"
+            },
+            "{err}"
+        );
     }
 
     #[test]
@@ -2657,12 +3230,15 @@ mod tests {
         assert_eq!(parsed.config.buttons, default_buttons());
         assert!(problems(&parsed.config).is_empty());
         assert_eq!(parsed.problems.len(), 6, "{:?}", parsed.problems);
-        // 問題の文言に利用者の値（ここでは "sometimes" / "x"）を入れない
+        // 問題の文言に利用者の値（ここでは "sometimes" / "x"）を入れない（日英とも）
         for p in &parsed.problems {
-            assert!(
-                !p.contains("sometimes") && !p.contains("abcdefghijklmnopq"),
-                "{p}"
-            );
+            for lang in [crate::i18n::Lang::Ja, crate::i18n::Lang::En] {
+                let p = p.text_in(lang);
+                assert!(
+                    !p.contains("sometimes") && !p.contains("abcdefghijklmnopq"),
+                    "{p}"
+                );
+            }
         }
         assert!(validate_text(&value.to_string()).is_err());
         assert!(validate_text(&UiConfig::default().to_text()).is_ok());
@@ -2693,7 +3269,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, UpdateError::Future { version: 2 }));
-        assert!(err.message().contains("書き換えない"), "{}", err.message());
+        let ja = err.text_in(crate::i18n::Lang::Ja);
+        assert!(ja.contains("書き換えない"), "{ja}");
+        let en = err.text_in(crate::i18n::Lang::En);
+        assert!(en.contains("does not rewrite"), "{en}");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             value.to_string(),
@@ -2769,7 +3348,7 @@ mod tests {
         else {
             panic!("{:?}", loaded.state)
         };
-        assert_eq!(problems, &["UTF-8 として読めない".to_string()]);
+        assert_eq!(problems, &[UiProblem::NotUtf8]);
         assert_eq!(
             (q.path.clone(), q.copied, q.evicted),
             (slot(1), true, false)
@@ -2832,7 +3411,13 @@ mod tests {
         };
         assert_eq!(
             problems,
-            &["読み取りに失敗（permission denied）".to_string()]
+            &[UiProblem::ReadIo {
+                kind: "permission denied".into()
+            }]
+        );
+        assert_eq!(
+            problems[0].text_in(crate::i18n::Lang::Ja),
+            "読み取りに失敗（permission denied）"
         );
         assert!(q.copied && !path.exists());
         std::fs::set_permissions(&q.path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -2925,7 +3510,10 @@ mod tests {
         // 未知のキーは serde が断る・語彙の外は to_ops が断る
         assert!(serde_json::from_value::<UiAnswers>(json!({"bogus": 1})).is_err());
         let bad: UiAnswers = serde_json::from_value(json!({"preset": "fancy"})).unwrap();
-        assert_eq!(bad.to_ops().unwrap_err().allowed, Preset::words());
+        assert_eq!(
+            bad.to_ops().unwrap_err().allowed,
+            Allowed::words(Preset::words())
+        );
     }
 
     #[test]

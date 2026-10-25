@@ -249,9 +249,10 @@ impl SetupAnswers {
             }
         }
         if let Some(mod_ui) = &self.mod_ui {
-            // 書く前に断る（setup の途中で半端に止まらない）。文言は CLI / MCP と同じ
+            // 書く前に断る（setup の途中で半端に止まらない）。文言は CLI / MCP と同じ。
+            // setup の answers の断りはほかの項目も日本語なので、日本語で引く（#2365）
             tako_core::claude_mod_ui::check_answers(mod_ui)
-                .map_err(|e| format!("mod_ui: {}", e.message()))?;
+                .map_err(|e| format!("mod_ui: {}", e.text_in(tako_core::i18n::Lang::Ja)))?;
         }
         if let Some(sleep) = &self.sleep_guard {
             if let Some(mode) = sleep.mode.as_deref() {

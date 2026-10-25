@@ -148,7 +148,7 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `NotEditable` / `InvalidSessionReason`）。カードの「まだ実行中」（リモートの 409 寄せ）は
   `CommandCardError::says_still_running` で日英どちらにも当てる（目印は `still_running_mark(lang)`）。
   `BackendError::Unsupported` / `Operation` は作り手が組んだ文をそのまま出す（器の CLI の文の
-  日英は #2365 の続き）。番犬は同じ `issue1762_dispatch_error_lang.rs`（末尾の節）
+  日英は #2365 の続き）。番犬は同じ `issue1762_dispatch_error_lang.rs`（後半の節）
 - #2365 の 3 本目で、**保存の断りに添える抜け方の案内**（`Reason::RecoveryHint`。旧
   `dispatch::preview_recovery_hint`）と、それを添える 2 つの断り（dispatch の保存 =
   `Reason::SaveRefused`・GUI の `set_preview` の差し替え = `Reason::UnsavedBlocksOpen`）、
@@ -160,6 +160,19 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `OneOfRequired` / `NotOneOf`）。移動・コピーの断り（`tako_core::file_move::MoveRefusal` /
   `file_copy::CopyRefusal` と、それを包む「移動できない」「コピーできない」「N 件すべてできなかった」）は
   **理由ごと**続きで移す（包みだけ移すと英語の包み + 日本語の理由に混ざる）
+- #2365 の続きで、**`tako mod ui` の断り（`tako_core::claude_mod_ui` の UiError 一式）**も同じ形にした。
+  1 つの断りが理由・使える値・枠（「ui.json は書いていない」「使える値:」）からなるので、半分だけ
+  移すと日英が混ざる = **1 本で移す**: 理由は `UiReason`、使える値は `Allowed`（語彙の語・id は日英で
+  同じ `Word`、範囲の `a〜z` / `0〜9` / `1〜8 の番号` は言語ごと）、形の問題は `UiProblem`、書き込みの
+  断りは `UpdateError` / `SaveRefusal`。どれも `text_in` の網羅 match で、`UiError::text_in` が
+  3 つを同じ言語でそろえて組む（`message()` / `Display` は `i18n::lang()`）。tako-control の
+  `RunError` は型を持つ（`Invalid(UiError)` / `Refused(UpdateError)` / `Lock`）。
+  **言語を固定する口**: setup（`--answers` の検証・`run_setup_stage`・`--review` の対話）は枠が
+  日本語なので `text_in(Lang::Ja)`、persist.log の記録（と重複除けの鍵）・`tako migrate` の
+  `validate_text` も日本語、`tako mod ui` の成功の応答の `problems` は枠（`applies_to` / `note` /
+  `choices`）がまだ日本語なのでそろえて日本語（枠ごと移すのは #2365 の続き）。
+  番犬は同じ `issue1762_dispatch_error_lang.rs`（末尾の節。実経路 `claude_mod_ui::run` の断りで
+  英語表示に日本語が 1 字も無いことも見る）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
