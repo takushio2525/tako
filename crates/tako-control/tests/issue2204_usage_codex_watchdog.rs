@@ -18,6 +18,9 @@
 //!    （`TAKO_2192_S5_LEGACY=1`）では codex を読まない
 //! 2. 読み手の構造体（`RawLine` / `RawPayload` / `RawInfo` / `RawUsage`）と読み位置の型（`CodexCursor` /
 //!    `CodexUsage`）に本文・パス系の欄が無い（読み手の `cwd` は鍵の材料なので除く）
+//! 3. `crates/*/src`（lib のテスト = 1 プロセスの中で並列に走る）が、usage の読む env（S1 / S2 / S5 の A/B と
+//!    置き場の差し替え）を `set_var` / `remove_var` で書き換えない（#2395。A/B の窓に並走する
+//!    usage のテストの走査まで旧挙動になり、Windows CI で `agent: codex` が出ずに落ちた）
 //!
 //! [`逆戻りを名指しできる`] で、現行ソースへの注入が file:line で名指しされることを確かめる。
 
@@ -293,6 +296,103 @@ fn 読み手と読み位置の型に本文やパスの欄が無い() {
     assert!(v.is_empty(), "{}", v.join("\n"));
 }
 
+const USAGE_INDEX: &str = "crates/tako-control/src/usage/index.rs";
+
+/// `set_var(` / `remove_var(` の第 1 引数が usage の読む env を指していれば、その定数の名前（値）。
+/// `S2_LEGACY_ENV` と `CONFIG_DIRS_ENV` は claude_mod / claude_mod_install にも同名があるので、
+/// 修飾に usage の道があるか、usage のファイルの中の素の名前だけを数える
+fn usage_env_of(rel: &str, arg: &str) -> Option<String> {
+    let arg: String = arg.chars().filter(|c| !c.is_whitespace()).collect();
+    let values = [
+        tako_core::usage::S1_LEGACY_ENV,
+        tako_core::usage::codex::S5_LEGACY_ENV,
+        tako_core::usage::index::S2_LEGACY_ENV,
+        tako_control::usage::index::CONFIG_DIRS_ENV,
+        tako_control::usage::index::CODEX_HOMES_ENV,
+    ];
+    if let Some(lit) = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
+        return values.contains(&lit).then(|| lit.to_string());
+    }
+    let (qual, name) = arg.rsplit_once("::").unwrap_or(("", arg.as_str()));
+    let in_usage = rel.contains("/usage/") || rel.ends_with("/usage.rs");
+    let usage_path = qual.contains("usage")
+        || qual.starts_with("core_index")
+        || qual.starts_with("core_codex")
+        || (qual.is_empty() && in_usage);
+    match name {
+        "S1_LEGACY_ENV" | "S5_LEGACY_ENV" | "CODEX_HOMES_ENV" => Some(name.to_string()),
+        "S2_LEGACY_ENV" | "CONFIG_DIRS_ENV" if usage_path => Some(name.to_string()),
+        _ => None,
+    }
+}
+
+/// 1 ファイルの違反と、見た `set_var(` / `remove_var(` の数（コメントの行は見ない）
+fn env_write_violations(rel: &str, text: &str) -> (Vec<String>, usize) {
+    let mut out = Vec::new();
+    let mut seen = 0;
+    for needle in ["set_var(", "remove_var("] {
+        for (at, _) in text.match_indices(needle) {
+            let head = text[..at].rfind('\n').map_or(0, |i| i + 1);
+            if text[head..at].trim_start().starts_with("//") {
+                continue;
+            }
+            seen += 1;
+            let rest = &text[at + needle.len()..];
+            let arg = &rest[..rest.find([',', ')']).unwrap_or(rest.len())];
+            if let Some(name) = usage_env_of(rel, arg) {
+                let line = text[..at].matches('\n').count() + 1;
+                out.push(format!(
+                    "{rel}:{line}: lib のテストで usage の env（{name}）を書き換えている: lib のテストは \
+                     1 プロセスの中で並列に走るので、並走する usage のテストの走査まで変わる（#2395）。\
+                     A/B は値を引数で渡す（`walk_with`）か、結合テストの 1 本の中で書く"
+                ));
+            }
+        }
+    }
+    (out, seen)
+}
+
+fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+}
+
+/// 3: lib のテストが usage の読む env を書き換えない（#2395）
+#[test]
+fn libのテストはusageの読むenvを書き換えない() {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    for krate in std::fs::read_dir(root.join("crates")).unwrap().flatten() {
+        rs_files(&krate.path().join("src"), &mut files);
+    }
+    let (mut violations, mut seen) = (Vec::new(), 0);
+    for file in &files {
+        let rel = file
+            .strip_prefix(&root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        let (v, n) = env_write_violations(&rel, &text);
+        violations.extend(v);
+        seen += n;
+    }
+    assert!(
+        files.len() >= 100 && seen >= 50,
+        "走査が空振りしている（{} 個のファイル・{seen} 個の書き換え）",
+        files.len()
+    );
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}
+
 /// 注入: 現行ソースへの逆戻りが名指しされる（番犬の検出力）
 #[test]
 fn 逆戻りを名指しできる() {
@@ -333,4 +433,42 @@ fn 逆戻りを名指しできる() {
         v.iter().any(|m| m.contains("RawLine に content")),
         "注入 (3) を名指せない: {v:?}"
     );
+    // (4) #2395 の前の形: lib のテストの A/B で S5 の env を立てる（rustfmt が折った形も）
+    let index = read(USAGE_INDEX);
+    let anchor = "let found = env.codex_indexer().walk_with(true).len();";
+    assert!(index.contains(anchor), "注入 (4) の足場が無い");
+    for set in [
+        "std::env::set_var(core_codex::S5_LEGACY_ENV, \"1\");",
+        "std::env::set_var(\n            tako_core::usage::codex::S5_LEGACY_ENV,\n            \"1\",\n        );",
+    ] {
+        let injected = index.replacen(
+            anchor,
+            &format!("{set}\n        let found = env.codex_indexer().walk().len();"),
+            1,
+        );
+        let (v, _) = env_write_violations(USAGE_INDEX, &injected);
+        assert!(
+            v.iter()
+                .any(|m| m.starts_with(&format!("{USAGE_INDEX}:")) && m.contains("S5_LEGACY_ENV")),
+            "注入 (4) を名指せない: {set} → {v:?}"
+        );
+    }
+    // (5) 別のモジュールのテストが値の文字列で S2 の A/B を立てる
+    let rel = "crates/tako-control/src/claude_mod.rs";
+    let (v, _) = env_write_violations(
+        rel,
+        "fn t() {\n    std::env::set_var(\"TAKO_2192_S2_LEGACY\", \"1\");\n}\n",
+    );
+    assert!(
+        v.iter()
+            .any(|m| m.starts_with(&format!("{rel}:2:")) && m.contains("TAKO_2192_S2_LEGACY")),
+        "注入 (5) を名指せない: {v:?}"
+    );
+    // 同名の別の env（claude_mod の S2・claude_mod_install の置き場）とコメントは名指さない
+    let (v, n) = env_write_violations(
+        rel,
+        "fn t() {\n    std::env::set_var(core::S2_LEGACY_ENV, \"1\");\n    \
+         std::env::remove_var(CONFIG_DIRS_ENV);\n    // std::env::set_var(S5_LEGACY_ENV, \"1\");\n}\n",
+    );
+    assert_eq!((v.len(), n), (0, 2), "同名の別の env を名指した: {v:?}");
 }
