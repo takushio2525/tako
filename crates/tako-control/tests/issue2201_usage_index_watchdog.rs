@@ -24,6 +24,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[path = "common/detached_env.rs"]
+mod detached_env;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -71,6 +74,13 @@ fn assistant(id: &str, output: u64) -> String {
 /// 1: 実経路。**env を使うので、この 1 本の中で順に見る**
 #[test]
 fn 実経路で本文もパスも索引に出ず_ab_では作らない() {
+    // 走らせた人の TAKO_DATA_DIR（worker の検証 env の `/tmp/…`）を持ち込まない子で走らせる（#2391）
+    if detached_env::rerun_without(
+        "実経路で本文もパスも索引に出ず_ab_では作らない",
+        &["TAKO_DATA_DIR"],
+    ) {
+        return;
+    }
     let data = tako_core::paths::data_dir().expect("テストの data dir");
     assert!(
         data.starts_with(std::env::temp_dir()),
