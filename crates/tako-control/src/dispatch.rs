@@ -18916,6 +18916,8 @@ pub struct CheckHealthCtx {
     /// ペインごとの文字コード固定の記録（#2092。門を持つペイン = Windows だけ）。
     /// 記録の写しを採るだけ（ロック 1 回）で、いまのコードページの読み直しは background で行う
     encoding_pins: Vec<(u64, tako_core::encoding_pin::PinReport)>,
+    /// ライト / ダークの通知（mode 2031）を購読しているペイン（#2350。`terminal_queries` 節）
+    color_scheme_panes: Vec<u64>,
     /// tako mod の材料（#1891。`tako mod` と同じ UI スレッドの段 = `claude_mod::status_ctx`）。
     /// `Err` は mod を扱わない tako の理由、`None` は A/B（`TAKO_1891_LEGACY=1` = 節を載せない）
     claude_mod: Option<Result<Box<crate::claude_mod::StatusCtx>, String>>,
@@ -19216,6 +19218,15 @@ fn collect_check_health_ctx(host: &dyn ControlHost) -> CheckHealthCtx {
                 Some((pane.id().as_u64(), report))
             })
             .collect(),
+        color_scheme_panes: ws
+            .all_panes()
+            .iter()
+            .filter(|pane| {
+                host.session(pane.id())
+                    .is_some_and(tako_core::TerminalSession::color_scheme_updates)
+            })
+            .map(|pane| pane.id().as_u64())
+            .collect(),
         claude_mod: (!tako_core::claude_mod::no_report_legacy()).then(|| {
             crate::claude_mod::status_ctx(host)
                 .map(Box::new)
@@ -19472,6 +19483,11 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         &ctx.encoding_pins,
         tako_core::platform::console::read_pane_code_pages,
     );
+    // #2350: 端末の問い合わせのどれに答えるか（申告は持たない = 答え方の表と回数だけ）
+    let terminal_queries = terminal_queries_section(
+        &tako_core::terminal_query::report(),
+        &ctx.color_scheme_panes,
+    );
 
     // tako mod（#1891）: 注入の可否と理由・報告の無い claude のペインと理由・設定 dir ごとの skills/tako。
     // **判定は持たない**: `tako mod`（status）と同じ 2 段（`status_ctx` → `finish_status_in_background`）の
@@ -19561,6 +19577,11 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         // UTF-8 のバイト列で書く子の出力が化ける。`targets[].code_pages` はいまの値の読み直し、
         // `hold` は固定の決着まで入力を預かった記録（`release=limit` なら決着を待たずに流した）
         "encoding_pin": encoding_pin,
+        // #2350: 端末の問い合わせ（色・明暗・寸法・OSC 52 の読み出し）のどれに答えるか。
+        // `kinds[].by` = tako / emulator（alacritty が答える）/ declined、`answered` は起動からの回数。
+        // `color_scheme_panes` はライト / ダークの通知（mode 2031）を購読しているペイン
+        // （器 = tmux のペインはここに並ぶのが正しい形。並ばないとテーマを切り替えても器越しの答えが古い）
+        "terminal_queries": terminal_queries,
         // #1505: 環境診断の項目（`tako setup --check` と同じ 1 実装から出る）。
         // `items[].key` が安定した機械キーで、`items[].lines` は `--check` が
         // そのまま表示する行。`remaining` は人の手が要る残り作業
@@ -20003,6 +20024,41 @@ fn encoding_pin_section(
         },
         "panes": panes,
         "gave_up": gave_up,
+    })
+}
+
+/// `check_health` の `terminal_queries` 節（#2350）。答え方の表と回数は
+/// `tako_core::terminal_query::report` の写し（判定はここに持たない）。`summary` は
+/// CLI の人が読む出力がそのまま出す 1 行
+fn terminal_queries_section(
+    report: &tako_core::terminal_query::Report,
+    color_scheme_panes: &[u64],
+) -> Value {
+    use tako_core::terminal_query::Responder;
+    let kinds: Vec<Value> = report
+        .kinds
+        .iter()
+        .map(|k| {
+            let answers = k.responder != Responder::Declined;
+            json!({
+                "kind": k.kind.key(),
+                "sequence": k.kind.sequence(),
+                "answers": answers,
+                "by": k.responder.as_str(),
+                "from": if answers { k.kind.source() } else { None },
+                "reason": k.kind.decline_reason(report.legacy).map(|t| t.text().to_string()),
+                "answered": k.answered,
+                "declined": k.declined,
+            })
+        })
+        .collect();
+    json!({
+        "legacy": report.legacy,
+        "kinds": kinds,
+        "declined_color": report.declined_color,
+        "scheme_notices": report.scheme_notices,
+        "color_scheme_panes": color_scheme_panes,
+        "summary": report.summary().text(),
     })
 }
 
@@ -53838,6 +53894,82 @@ mod tests {
         assert_eq!(empty["needed"], cfg!(windows));
         assert_eq!(empty["panes"], json!([]));
         assert!(encoding_pin_issues(&[]).is_empty());
+    }
+
+    /// #2350: `terminal_queries` 節は答え方の表（種類ごとの答える / 答えない・誰が・出どころ・
+    /// 理由）と回数と購読しているペインを並べる。OSC 52 の読み出しは常に答えない
+    #[test]
+    fn issue2350_端末の問い合わせの節は答え方の表と回数を並べる() {
+        use tako_core::terminal_query::{KindReport, QueryKind, Report};
+        let report = |legacy: bool| Report {
+            legacy,
+            kinds: QueryKind::ALL
+                .iter()
+                .map(|&kind| KindReport {
+                    kind,
+                    responder: kind.responder(legacy),
+                    answered: (kind != QueryKind::TextAreaCells).then_some(2),
+                    declined: u64::from(kind == QueryKind::ClipboardRead),
+                })
+                .collect(),
+            declined_color: 0,
+            scheme_notices: 1,
+        };
+        let row = |section: &Value, key: &str| {
+            section["kinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|k| k["kind"] == key)
+                .unwrap_or_else(|| panic!("{key} の行が無い: {section}"))
+                .clone()
+        };
+
+        let section = terminal_queries_section(&report(false), &[4]);
+        assert_eq!(section["legacy"], false);
+        assert_eq!(
+            section["kinds"].as_array().unwrap().len(),
+            QueryKind::ALL.len()
+        );
+        let bg = row(&section, "osc11");
+        assert_eq!(bg["answers"], true);
+        assert_eq!(bg["by"], "tako");
+        assert_eq!(bg["from"], "theme.background");
+        assert_eq!(bg["reason"], Value::Null);
+        assert_eq!(bg["answered"], 2);
+        let cells = row(&section, "csi18t");
+        assert_eq!(
+            (cells["by"].clone(), cells["answered"].clone()),
+            (json!("emulator"), Value::Null)
+        );
+        let clip = row(&section, "osc52_read");
+        assert_eq!(clip["answers"], false);
+        assert_eq!(clip["by"], "declined");
+        assert_eq!(clip["from"], Value::Null);
+        assert!(clip["reason"].as_str().is_some_and(|r| !r.is_empty()));
+        assert_eq!(clip["declined"], 1);
+        assert_eq!(section["color_scheme_panes"], json!([4]));
+        assert_eq!(section["scheme_notices"], 1);
+        assert!(section["summary"]
+            .as_str()
+            .is_some_and(|s| s.contains("OSC 52")));
+
+        // A/B（#2350 前）: tako が答えていた種類は答えない・出どころも出さない
+        let legacy = terminal_queries_section(&report(true), &[]);
+        assert_eq!(legacy["legacy"], true);
+        let bg = row(&legacy, "osc11");
+        assert_eq!(
+            (bg["answers"].clone(), bg["from"].clone()),
+            (json!(false), Value::Null)
+        );
+        assert!(bg["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("TAKO_2350_LEGACY")));
+        assert_eq!(
+            row(&legacy, "csi18t")["answers"],
+            true,
+            "CSI 18 t は端末が答える"
+        );
     }
 }
 

@@ -58,7 +58,7 @@ impl SessionEvent {
 /// | `CursorBlinkingChange` | 何もしない（tako はカーソルを点滅させない = #932。形は描画のたびに Term から読む） | 合図（#2344） |
 /// | `MouseCursorDirty` | 何もしない（ペイン本体のポインタはマウス要求で変えない。要求の有無は転送の判断が Term のモードを読む） | 合図（#2344） |
 /// | `Bell` | 何もしない | 渡す（出来事であって描き直しの合図ではない。頻度も低い） |
-/// | `ColorRequest` / `TextAreaSizeRequest` / `ClipboardLoad` | 何もしない（応答していない） | 渡す（問い合わせ。応答を足すときに合図へ紛れて省かれないように） |
+/// | `ColorRequest` / `TextAreaSizeRequest` / `ClipboardLoad` | 色と CSI 14 t に答える・OSC 52 の読み出しは断る（#2350。`terminal_query`） | 渡す（問い合わせ。合図へ寄せると画面に出ていないペインの答えが遅れる / 消える） |
 /// | `PtyWrite` / `Title` / `ResetTitle` / `ClipboardStore` / `ChildExit` / `Exit` | 処理する | 渡す |
 /// | `Osc` / `EncodingPin` | 処理する | 渡す |
 ///
@@ -128,11 +128,17 @@ pub enum CommandState {
 /// スクロールバック上限（正本は [`crate::scrollback`]）、`kitty_keyboard` は
 /// CSI > u の push/pop 受理（既定 false だと Shift+Enter 等を区別できない）。
 /// **[`TerminalSession::set_scrollback_limit`] が同じ関数で作り直す**ので、
-/// 上限の動的変更で他の設定が巻き添えで既定へ戻ることはない
+/// 上限の動的変更で他の設定が巻き添えで既定へ戻ることはない。
+///
+/// `osc52` は既定と同じ値（コピーだけ）を**明示して固定する**（#2350）: OSC 52 の読み出し
+/// （クリップボードの中身を子へ渡す）は Term がここで捨て、tako まで届かない。alacritty が
+/// 既定を変えても読み出しが通らないように、既定に頼らない（tako 側の `ClipboardLoad` の断りは
+/// その内側の 2 段目）
 fn term_config(scrollback_lines: usize) -> Config {
     Config {
         scrolling_history: scrollback_lines,
         kitty_keyboard: true,
+        osc52: alacritty_terminal::term::Osc52::OnlyCopy,
         ..Config::default()
     }
 }
@@ -363,6 +369,10 @@ pub enum SessionNotice {
     /// 文字コード固定の異常（#2092）。UI 層はペイン ID を添えて persist.log へ書く
     /// （`PinLogEvent::log_line`。tako-core はペイン ID を知らない）
     EncodingPin(crate::encoding_pin::PinLogEvent),
+    /// 今のテーマが要る問い合わせ（OSC 10 / 11 / 12 / 4 の `?` と `CSI ? 996 n`。#2350）。
+    /// UI 層は**受け取ったその場で** [`TerminalSession::answer_theme_query`] へテーマを添えて
+    /// 戻す（後回しにすると、同じ読み取りで続いた問い合わせ = DA1 等の答えと順序が入れ替わる）
+    ThemeQuery(crate::terminal_query::ThemeQuery),
 }
 
 /// シェルの代わりに起動するコマンド（`tako split -- <command>` 等で使う）
@@ -499,6 +509,9 @@ pub struct TerminalSession {
     /// 文字コード固定の決着まで入力を預かる門（#2092）。固定が要らない unix と
     /// A/B の legacy では None = 素通し
     pin_gate: Option<crate::encoding_pin::PinGate>,
+    /// 子がライト / ダークの通知（mode 2031）を購読しているか（#2350。`CSI ? 2031 h / l`）。
+    /// 立っているペインへだけ、テーマの切り替えを `CSI ? 997 ; 1|2 n` で知らせる
+    color_scheme_updates: bool,
 }
 
 /// [`TerminalSession::serial`] の払い出し元（0 は使わない）
@@ -737,6 +750,7 @@ impl TerminalSession {
                 }),
                 wakeup_pending,
                 pin_gate,
+                color_scheme_updates: false,
             },
             rx,
         ))
@@ -1214,20 +1228,15 @@ impl TerminalSession {
     pub fn process_event(&mut self, event: SessionEvent) -> Option<SessionNotice> {
         match event {
             SessionEvent::Term(event) => self.process_term_event(event),
-            SessionEvent::Osc(event) => {
-                self.process_osc_event(event);
-                None
-            }
+            SessionEvent::Osc(event) => self.process_osc_event(event),
             SessionEvent::EncodingPin(event) => Some(SessionNotice::EncodingPin(event)),
         }
     }
 
     fn process_term_event(&mut self, event: TermEvent) -> Option<SessionNotice> {
         match event {
-            // 端末の応答は入力の門（#2092）を通さない: 疑似コンソールや子がこの返事を
-            // 待っていると子の起動が進まず、文字コード固定も決着しない
             TermEvent::PtyWrite(text) => {
-                self.notifier.notify(text.into_bytes());
+                self.send_reply(text.into_bytes());
                 None
             }
             TermEvent::Title(title) => {
@@ -1246,12 +1255,80 @@ impl TerminalSession {
                 Some(SessionNotice::Exited)
             }
             TermEvent::Exit => Some(SessionNotice::Exited),
+            // #2350: 端末の問い合わせ。答え方の正本は `terminal_query`
+            TermEvent::ColorRequest(index, format) => {
+                (!crate::terminal_query::legacy()).then(|| {
+                    SessionNotice::ThemeQuery(crate::terminal_query::ThemeQuery::Color(
+                        crate::terminal_query::ColorQuery::new(index, format),
+                    ))
+                })
+            }
+            TermEvent::TextAreaSizeRequest(_) => {
+                if !crate::terminal_query::legacy() {
+                    let reply = crate::terminal_query::text_area_pixels_reply(self.window_size());
+                    self.send_reply(reply.into_bytes());
+                }
+                None
+            }
+            // OSC 52 の読み出しには答えない（クリップボードの秘密を子へ渡さない）
+            TermEvent::ClipboardLoad(..) => {
+                crate::terminal_query::decline_clipboard_read();
+                None
+            }
             _ => None,
         }
     }
 
-    /// OSC 7 / 133 タップの検知を cwd・コマンド実行状態へ反映する（FR-2.4.1）
-    fn process_osc_event(&mut self, event: OscEvent) {
+    /// テーマが要る問い合わせ（[`SessionNotice::ThemeQuery`]）へ今のテーマで答える（#2350）。
+    /// プログラムが OSC で差し替えた色があればそちらが勝つ（画面の色と同じ解決）
+    pub fn answer_theme_query(&self, query: crate::terminal_query::ThemeQuery, theme: &Theme) {
+        let reply = query.reply(self.term.lock().colors(), theme);
+        if let Some(reply) = reply {
+            self.send_reply(reply.into_bytes());
+        }
+    }
+
+    /// 端末から子への応答（問い合わせの答え・ライト / ダークの通知）を PTY へ書く
+    /// （**応答の口はここ 1 本**。#2092 の番犬が数える）。入力の門（#2092）は通さない:
+    /// 疑似コンソールや子がこの返事を待っていると子の起動が進まず、文字コード固定も決着しない
+    fn send_reply(&self, bytes: Vec<u8>) {
+        self.notifier.notify(bytes);
+    }
+
+    /// テーマを切り替えたことを、ライト / ダークの通知（mode 2031）を購読している子へ
+    /// 知らせる（#2350）。購読していなければ何も書かない（偽を返す）。器（tmux）は
+    /// これを受けて色を問い合わせ直し、器越しのペインの答えが新しいテーマへ追従する
+    pub fn notify_color_scheme_change(&self, theme: &Theme) -> bool {
+        if !self.color_scheme_updates || crate::terminal_query::legacy() {
+            return false;
+        }
+        crate::terminal_query::note_scheme_notice();
+        self.send_reply(
+            crate::terminal_query::color_scheme_report(theme)
+                .as_bytes()
+                .to_vec(),
+        );
+        true
+    }
+
+    /// 子がライト / ダークの通知（mode 2031）を購読しているか（#2350。診断用）
+    pub fn color_scheme_updates(&self) -> bool {
+        self.color_scheme_updates
+    }
+
+    /// 子へ TIOCSWINSZ で見せている寸法（セル数とセルのピクセル数）
+    fn window_size(&self) -> WindowSize {
+        WindowSize {
+            num_lines: self.rows as u16,
+            num_cols: self.cols as u16,
+            cell_width: self.cell_px.0,
+            cell_height: self.cell_px.1,
+        }
+    }
+
+    /// OSC 7 / 133 タップの検知を cwd・コマンド実行状態へ反映する（FR-2.4.1）。
+    /// mode 2031 の購読を覚え、`CSI ? 996 n` は UI 層へ答えを頼む（#2350）
+    fn process_osc_event(&mut self, event: OscEvent) -> Option<SessionNotice> {
         // #1769: PATH が変わりうる出来事（cwd の変化・コマンドの終わり）を数える
         // （LSP のサーバ解決のキャッシュが引き直す合図。`shell_activity` の冒頭）
         if crate::shell_activity::is_activity(self.cwd.as_deref(), &event) {
@@ -1267,7 +1344,19 @@ impl TerminalSession {
                     self.command_state_since = Some(std::time::Instant::now());
                 }
             }
+            // #2350: ライト / ダークの通知（mode 2031）。A/B では #2350 前と同じく捨てる
+            OscEvent::ColorSchemeUpdates(on) => {
+                if !crate::terminal_query::legacy() {
+                    self.color_scheme_updates = on;
+                }
+            }
+            OscEvent::ColorSchemeQuery => {
+                return (!crate::terminal_query::legacy()).then_some(SessionNotice::ThemeQuery(
+                    crate::terminal_query::ThemeQuery::ColorScheme,
+                ));
+            }
         }
+        None
     }
 
     /// 側路（[`crate::osc_sink`]）で運ばれてきた OSC バイト列を反映する（#766）。
@@ -2348,17 +2437,29 @@ fn send_gated(gate: Option<&crate::encoding_pin::PinGate>, notifier: &Notifier, 
 mod tests {
     use super::*;
 
+    /// #2350: OSC 52 の読み出し（クリップボードの中身を子へ渡す）は Term の設定で捨てる。
+    /// 読み出しを通す値（`OnlyPaste` / `CopyPaste`）へ変わったら、ペインの中のプログラムが
+    /// 利用者のコピーした秘密を読めるようになる。書き込み（コピー）は今までどおり通す
+    #[test]
+    fn issue2350_osc52の読み出しはtermの設定で捨てる() {
+        use alacritty_terminal::term::Osc52;
+        for lines in [0, crate::scrollback::DEFAULT_LINES] {
+            assert_eq!(term_config(lines).osc52, Osc52::OnlyCopy, "{lines}");
+        }
+    }
+
     /// #2092 の番犬: PTY へ書く口（`.notify(`）は「入力の門（`send_gated`）」
-    /// 「門が預かりを流す先（`spawn_in` の flush）」「端末の応答（`process_term_event` の
-    /// `PtyWrite`）」の 3 か所だけ。新しい入力の口が門を迂回すると、Windows で固定の
-    /// 決着より先に入力が届いて出力が化ける（テストでは再現しにくい = ここで止める）
+    /// 「門が預かりを流す先（`spawn_in` の flush）」「端末の応答（`send_reply`。`PtyWrite` と
+    /// #2350 の問い合わせの答え・ライト / ダークの通知）」の 3 か所だけ。新しい入力の口が門を
+    /// 迂回すると、Windows で固定の決着より先に入力が届いて出力が化ける（テストでは再現しにくい =
+    /// ここで止める）
     #[test]
     fn issue2092_ptyへ書く口は門と応答だけ() {
         let src = include_str!("terminal.rs");
         let body = &src[..src
             .find("#[cfg(test)]\nmod tests {")
             .expect("テストモジュールの開始")];
-        let allowed = ["send_gated", "spawn_in", "process_term_event"];
+        let allowed = ["send_gated", "spawn_in", "send_reply"];
         let mut current = String::new();
         let mut offenders = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
@@ -2383,7 +2484,7 @@ mod tests {
         // 走査が空振りしていないこと（3 か所とも見つかる）
         assert_eq!(
             seen.into_iter().collect::<Vec<_>>(),
-            vec!["process_term_event", "send_gated", "spawn_in"]
+            vec!["send_gated", "send_reply", "spawn_in"]
         );
     }
 
