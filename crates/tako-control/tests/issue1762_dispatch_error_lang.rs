@@ -1924,7 +1924,7 @@ fn ui_problem_index(p: &UiProblem) -> usize {
         UiProblem::OverMax { .. } => 18,
         UiProblem::Dropped(_) => 19,
         UiProblem::NotUtf8 => 20,
-        UiProblem::ReadFailed { .. } => 21,
+        UiProblem::ReadIo { .. } => 21,
     }
 }
 const UI_PROBLEM_VARIANTS: usize = 22;
@@ -2205,10 +2205,10 @@ fn ui_problem_table() -> Vec<(UiProblem, &'static str, Option<&'static str>)> {
         ),
         (P::NotUtf8, "NotUtf8", Some("UTF-8 として読めない")),
         (
-            P::ReadFailed {
+            P::ReadIo {
                 kind: "permission denied".into(),
             },
-            "ReadFailed",
+            "ReadIo",
             Some("読み取りに失敗（permission denied）"),
         ),
     ]

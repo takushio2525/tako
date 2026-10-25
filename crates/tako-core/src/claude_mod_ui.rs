@@ -1507,7 +1507,7 @@ pub enum UiProblem {
     Dropped(Box<UiProblem>),
     NotUtf8,
     /// 読み取りに失敗（`kind` は `io::ErrorKind` の表示）
-    ReadFailed {
+    ReadIo {
         kind: String,
     },
 }
@@ -1605,8 +1605,8 @@ impl UiProblem {
             (Self::Dropped(inner), En) => format!("{} (dropped)", inner.text_in(En)),
             (Self::NotUtf8, Ja) => "UTF-8 として読めない".to_string(),
             (Self::NotUtf8, En) => "cannot read it as UTF-8".to_string(),
-            (Self::ReadFailed { kind }, Ja) => format!("読み取りに失敗（{kind}）"),
-            (Self::ReadFailed { kind }, En) => format!("reading failed ({kind})"),
+            (Self::ReadIo { kind }, Ja) => format!("読み取りに失敗（{kind}）"),
+            (Self::ReadIo { kind }, En) => format!("reading failed ({kind})"),
         }
     }
 
@@ -2585,7 +2585,7 @@ fn read_text(path: &Path) -> Result<String, LoadState> {
             problems: vec![if utf8 {
                 UiProblem::NotUtf8
             } else {
-                UiProblem::ReadFailed {
+                UiProblem::ReadIo {
                     kind: e.kind().to_string(),
                 }
             }],
@@ -3411,7 +3411,7 @@ mod tests {
         };
         assert_eq!(
             problems,
-            &[UiProblem::ReadFailed {
+            &[UiProblem::ReadIo {
                 kind: "permission denied".into()
             }]
         );
