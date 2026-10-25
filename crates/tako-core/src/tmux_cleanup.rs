@@ -1467,12 +1467,155 @@ mod tests {
         );
     }
 
-    /// 実プロセス（自分）の環境から自分のソケット名を復元できる = `socket_name()` と一致する。
-    /// 復元の順序が実装とズレたらここで落ちる
+    /// #2391: [`自分の環境からの復元はsocket_nameと一致する`] が起こし直した子だけが立てる目印
+    const SOCKET_CHILD_ENV: &str = "TAKO_2391_SOCKET_CHILD";
+    /// 子が結果を出す行の目印（行の途中から拾う = #2248）
+    const SOCKET_CHILD_MARKER: &str = "tako-2391-socket:";
+    /// 子へ渡す前に消す env（`live_peers` が相手の初期環境から読むキーと同じ）
+    const SOCKET_KEYS: [&str; 3] = [
+        crate::tmux_backend::SOCKET_ENV,
+        "TAKO_ISOLATED",
+        "TAKO_SELF_TEST",
+    ];
+
+    /// 子に組ませる env 1 つと、その子の中で読めるはずの値
+    struct SocketEnvCase {
+        name: &'static str,
+        env: &'static [(&'static str, &'static str)],
+        /// 子のプロセスの中で `socket_name()` が返す値
+        actual: &'static str,
+        /// 初期環境からの復元（`resolve_socket_name`）の期待値。`None` は `actual` と一致する
+        /// （= 一括隔離の後の形）。`Some` は子の pid から決まる名前（= 一括隔離の前の形）
+        resolved: Option<fn(u32) -> String>,
+    }
+
+    /// 実プロセスの環境から自分のソケット名を復元できる = `socket_name()` と一致する。
+    /// 復元の順序が実装とズレたらここで落ちる。
+    ///
+    /// 比べる env は**親が組んで子プロセスへ渡す**（#2391）。走らせた人の env をそのまま読むと、
+    /// `TAKO_ISOLATED=1` の下では一括隔離（tako-app の `main` が `TAKO_TMUX_SOCKET` を埋める）を
+    /// 通っていないテストプロセスで `tako-iso-<pid>` と `tako` を比べて必ず落ちていた。
+    /// 一括隔離の後の形（`main` がもう書き換えない env）では両者が一致し、前の形では
+    /// `socket_name()` 単体は既定へ落ちる（埋めるのは `main`）ことを、両方の値で見る
     #[test]
     fn 自分の環境からの復元はsocket_nameと一致する() {
-        let mine = resolve_socket_name(std::process::id(), |k| std::env::var(k).ok());
-        assert_eq!(mine, crate::tmux_backend::socket_name());
+        // 子の役: 自分の実際の env から両方を読んで出す
+        if std::env::var_os(SOCKET_CHILD_ENV).is_some() {
+            let pid = std::process::id();
+            let resolved = resolve_socket_name(pid, |k| std::env::var(k).ok());
+            let actual = crate::tmux_backend::socket_name();
+            println!("{SOCKET_CHILD_MARKER} pid={pid} resolved={resolved} actual={actual}");
+            return;
+        }
+        let cases = [
+            // ---- 一括隔離の後の形: 復元と socket_name() が一致する
+            SocketEnvCase {
+                name: "何も無い",
+                env: &[],
+                actual: "tako",
+                resolved: None,
+            },
+            SocketEnvCase {
+                name: "明示だけ",
+                env: &[("TAKO_TMUX_SOCKET", "tako-t2391-mine")],
+                actual: "tako-t2391-mine",
+                resolved: None,
+            },
+            SocketEnvCase {
+                name: "隔離 + main が埋めた明示",
+                env: &[
+                    ("TAKO_TMUX_SOCKET", "tako-iso-424242"),
+                    ("TAKO_ISOLATED", "1"),
+                ],
+                actual: "tako-iso-424242",
+                resolved: None,
+            },
+            SocketEnvCase {
+                name: "セルフテスト + main が埋めた明示",
+                env: &[
+                    ("TAKO_TMUX_SOCKET", "tako-st-424242"),
+                    ("TAKO_SELF_TEST", "1"),
+                ],
+                actual: "tako-st-424242",
+                resolved: None,
+            },
+            SocketEnvCase {
+                name: "空の明示 + 隔離（一括隔離は上書きしない）",
+                env: &[("TAKO_TMUX_SOCKET", ""), ("TAKO_ISOLATED", "1")],
+                actual: "tako",
+                resolved: None,
+            },
+            SocketEnvCase {
+                name: "隔離でない値",
+                env: &[("TAKO_ISOLATED", "0")],
+                actual: "tako",
+                resolved: None,
+            },
+            // ---- 一括隔離の前の形: 復元は main が埋める名前・socket_name() 単体は既定
+            SocketEnvCase {
+                name: "隔離だけ",
+                env: &[("TAKO_ISOLATED", "1")],
+                actual: "tako",
+                resolved: Some(isolated_socket_name),
+            },
+            SocketEnvCase {
+                name: "セルフテストだけ",
+                env: &[("TAKO_SELF_TEST", "1")],
+                actual: "tako",
+                resolved: Some(self_test_socket_name),
+            },
+        ];
+        let exe = std::env::current_exe().expect("テストバイナリのパス");
+        let me = "tmux_cleanup::tests::自分の環境からの復元はsocket_nameと一致する";
+        for case in &cases {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["--exact", me, "--test-threads=1", "--nocapture"])
+                .env(SOCKET_CHILD_ENV, "1")
+                .stdin(std::process::Stdio::null());
+            // 走らせた人の env（TAKO_ISOLATED=1 等）を子へ持ち込まない
+            for key in SOCKET_KEYS {
+                cmd.env_remove(key);
+            }
+            cmd.envs(case.env.iter().copied());
+            let out = cmd.output().expect("子のテストを起こせる");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                out.status.success(),
+                "[{}] 子が失敗した（{}）:\n{text}",
+                case.name,
+                out.status
+            );
+            let field = |rest: &str, key: &str| -> Option<String> {
+                rest.split_whitespace()
+                    .find_map(|kv| Some(kv.strip_prefix(key)?.strip_prefix('=')?.to_string()))
+            };
+            let (pid, resolved, actual) = text
+                .lines()
+                .filter_map(|line| line.split_once(SOCKET_CHILD_MARKER).map(|(_, rest)| rest))
+                .find_map(|rest| {
+                    Some((
+                        field(rest, "pid")?.parse::<u32>().ok()?,
+                        field(rest, "resolved")?,
+                        field(rest, "actual")?,
+                    ))
+                })
+                .unwrap_or_else(|| panic!("[{}] 子が結果の行まで届いていない:\n{text}", case.name));
+            assert_eq!(
+                actual, case.actual,
+                "[{}] 子のプロセスの socket_name()",
+                case.name
+            );
+            let want = case.resolved.map_or_else(|| actual.clone(), |f| f(pid));
+            assert_eq!(
+                resolved, want,
+                "[{}] 初期環境からの復元（resolve_socket_name）",
+                case.name
+            );
+        }
     }
 
     fn server(socket: &str, running: bool, clients: usize, live: &[u32]) -> ServerEntry {
