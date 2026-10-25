@@ -683,6 +683,12 @@ impl Indexer {
     /// transcript を探す（`projects/` の下の `*.jsonl` と、codex の `sessions/` / `archived_sessions/` の
     /// `rollout-*.jsonl`。並びはパス順 = 写しの数え先が毎回同じ）
     fn walk(&self) -> Vec<Found> {
+        self.walk_with(core_codex::s5_legacy())
+    }
+
+    /// [`Self::walk`] の本体。`s5_legacy` は [`core_codex::s5_legacy`] の値（テストは env を触らずに
+    /// 両アームを検査できる。env はプロセスに 1 つで、立てると並走するテストの走査まで変わる = #2395）
+    fn walk_with(&self, s5_legacy: bool) -> Vec<Found> {
         let mut out = Vec::new();
         for (i, root) in self.roots.iter().enumerate() {
             walk_jsonl(&root.dir.join("projects"), MAX_DEPTH, &mut |path, meta| {
@@ -698,7 +704,7 @@ impl Indexer {
                 });
             });
         }
-        if !core_codex::s5_legacy() {
+        if !s5_legacy {
             for (i, home) in self.codex_homes.iter().enumerate() {
                 // 鍵はファイル名（会話の id 入り）: `sessions/` から `archived_sessions/` へ移っても同じ読み位置。
                 // 両方にあれば `sessions/` を正にする（先に見たほう）
@@ -2020,11 +2026,12 @@ mod tests {
                 .total(),
             7610
         );
-        // A/B: 旧挙動は codex を読まない
-        std::env::set_var(core_codex::S5_LEGACY_ENV, "1");
-        let found = env.codex_indexer().walk().len();
-        std::env::remove_var(core_codex::S5_LEGACY_ENV);
+        // A/B: 旧挙動は codex を読まない。env は立てずに値を渡す（lib のテストは 1 プロセスで並列に走り、
+        // 立てた窓に並走する codex のテストの更新まで codex を読まなくなる = #2395。env からの配線は
+        // 結合テスト issue2204 の実経路の 1 本の中で見る）
+        let found = env.codex_indexer().walk_with(true).len();
         assert_eq!(found, 0);
+        assert_eq!(env.codex_indexer().walk_with(false).len(), 1);
         // 本文・指示・ツール・cwd・ブランチ・トークンの値が索引のどこにも出ない
         for file in files_under(&env.usage()) {
             let text = std::fs::read_to_string(&file).unwrap_or_default();

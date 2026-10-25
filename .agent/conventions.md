@@ -1196,6 +1196,26 @@ CI（env なし）では緑のテストが手元でだけ落ちる（偽の赤�
   `set_var` でプロセス全体の env を揃える（並列に走る他のテストが同じ env を読む）
 - lib の `src/` で子を起こすと `platform_parity` のコンソール窓の件数表に載る（製品の起動ではない旨の理由を書く）
 
+## lib のテストで A/B の env を立てない（Issue #2395）
+
+**`crates/*/src` のテストで、製品が実行時に読む env（A/B の `TAKO_*_LEGACY`・置き場の差し替え）を
+`std::env::set_var` で立てないこと。** env はプロセスに 1 つで、lib のテストは 1 プロセスで並列に走る。
+立てている間に並走する別のテストが同じ env を読むと、そのテストまで旧挙動で走る。
+上の #2391 の節の「`set_var` でプロセス全体の env を揃えない」を、テスト自身が A/B を切り替える形へ広げたもの。
+
+- 実物: usage の索引のテストが A/B で `TAKO_2192_S5_LEGACY=1` を立てて走査した窓に、隣の
+  `codexの過去の観測から窓ごとに区間按分できる` の更新が重なり、codex を 1 本も読まずに
+  `agent: codex` が出ず Windows CI で落ちた（#2395。CI ログでは 2 本の完了が 0.3 ms 差）
+- **書き方**: 判定の関数を「env を読む入口」と「値を引数で受ける本体」に分け、テストは本体へ
+  値を渡す（usage の `Indexer::walk` → `walk_with(s5_legacy)`・`claude_mod::lookup` の `legacy`）。
+  env から値への配線は**結合テスト（`tests/*.rs` = 別プロセス）の 1 本の中**で順に見る
+  （`issue2204_usage_codex_watchdog.rs` の実経路）
+- **番犬**: `crates/tako-control/tests/issue2204_usage_codex_watchdog.rs` の
+  `libのテストはusageの読むenvを書き換えない` が、`crates/*/src` の `set_var(` / `remove_var(` の
+  第 1 引数が usage の読む env（S1 / S2 / S5 の A/B・`CONFIG_DIRS_ENV`・`CODEX_HOMES_ENV`）を指す行を
+  `file:line` で落とす。usage 以外の env は見ない（既存の `TEST_ENV_LOCK` で直列にしている
+  モジュールがある）
+
 ## プロセスの生死は境界の 1 実装で決める（Issue #1557 / #1581）
 
 **「その pid は生きているか」を自前で書かない。`tako_core::platform::process::pid_alive`
