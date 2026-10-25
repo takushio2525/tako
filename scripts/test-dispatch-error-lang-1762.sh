@@ -36,6 +36,15 @@
 #      cardempty  空白だけのコマンドのカード（CommandCardError::EmptyCommand）
 #      nocmds     コマンドの無いカード（MCP。CommandCardError::NoCommands）
 #      norun      実行コマンドの決まらないファイルの実行（RunnerError::NoCommand）
+#   #2365 の 3 本目で次も足した（保存の断りに添える案内と dispatch の個別の文）:
+#      savechanged / savedeleted  外で書き換えた / 消したファイルの保存（理由の文 + 抜け方の案内 =
+#                 Reason::SaveRefused。修正前は英語表示で「英語の断り + 日本語の案内」が混ざった）
+#      nofile / nocolumn / newtabdir  開けないファイル・line の無い column・new_tab と方向（open_file）
+#      notfolder / nofolder  フォルダではない / 無いフォルダでタブを作る（TabNew）
+#      badjump / resizeboth / notitle / fgboth / zoomboth  jump の action・resize の delta と share・
+#                 title も role も無い・pane と tab・zoom の同時指定
+#      badname / nopaths / copyid / copygone  ファイル操作（名前・paths が空・取り消しの番号）
+#      badmove / textonly  編集の綴りの名前表・type 以外のコマンドへの text
 #   ① 英語表示: どの出力にも日本語（かな・漢字）が混ざらない
 #   ② 日本語表示: 日本語の前置きで返る（修正前とのバイト一致は TAKO_1762_KEEP の出力を突き合わせる）
 #   ③ GUI を経由しない CLI の直呼び（`tako orchestrator layout` / `projects remove`）も、前置きと
@@ -287,6 +296,64 @@ if new:
   mcp="$(mcp_call tako_show_command "{\"pane\":${first:-0},\"commands\":[]}" "$DIR/nocmds.mcp")"
   echo "$mcp" > "$DIR/nocmds.mcperr"
   cli_case norun run "$base/norun.zzz2365" --pane "${first:-0}"
+  # #2365 の 3 本目: 保存の断りに添える案内（旧 preview_recovery_hint）と、dispatch の個別の文
+  # （プレビュー・編集・ファイル操作・ペイン / タブ操作）。どれも断られて何も変わらない
+  # （保存の 2 つは外で書き換えた / 消したファイルを自分の変更で上書きしない）。
+  # 出力のパスは固定のもの（/etc/hosts・/nonexistent-tako-2365）だけにする（修正前後のバイト一致）
+  printf 'a\nb\n' > "$base/changed.rs"
+  printf 'keep\n' > "$base/deleted.rs"
+  for name in changed deleted; do
+    pane="$("$TAKO_BIN" open "$base/$name.rs" --pane "${first:-0}" --new-tab 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin).get("pane", ""))' 2>/dev/null)"
+    if [ -n "$pane" ] && "$TAKO_BIN" edit start --pane "$pane" > /dev/null 2>&1 \
+      && "$TAKO_BIN" edit autosave false --pane "$pane" > /dev/null 2>&1 \
+      && "$TAKO_BIN" edit replace-range 1:0 1:1 MINE --pane "$pane" > /dev/null 2>&1; then
+      if [ "$name" = changed ]; then
+        printf 'a\nDISK\n' > "$base/changed.rs"
+      else
+        rm -f "${base:?}/deleted.rs"
+      fi
+      cli_case "save$name" edit save --pane "$pane"
+      mcp="$(mcp_call tako_preview_save "{\"pane\":${pane}}" "$DIR/save$name.mcp")"
+      echo "$mcp" > "$DIR/save$name.mcperr"
+    else
+      echo "編集のペインを開けない" > "$DIR/save$name.cli"
+      echo "?" > "$DIR/save$name.rc"
+    fi
+  done
+  cli_case nofile open /nonexistent-tako-2365.rs --pane "${first:-0}"
+  cli_case nocolumn open /etc/hosts --pane "${first:-0}" --column 3
+  cli_case newtabdir open /etc/hosts --pane "${first:-0}" --new-tab --right
+  cli_case notfolder tab new --cwd /etc/hosts
+  cli_case nofolder tab new --cwd /nonexistent-tako-2365
+  mcp="$(mcp_call tako_open_file "{\"pane\":${first:-0},\"path\":\"/nonexistent-tako-2365.rs\"}" "$DIR/nofile.mcp")"
+  echo "$mcp" > "$DIR/nofile.mcperr"
+  mcp="$(mcp_call tako_jump '{"action":"sideways"}' "$DIR/badjump.mcp")"
+  echo "$mcp" > "$DIR/badjump.mcperr"
+  mcp="$(mcp_call tako_resize_pane "{\"pane\":${first:-0},\"axis\":\"x\",\"delta\":0.1,\"share\":0.5}" "$DIR/resizeboth.mcp")"
+  echo "$mcp" > "$DIR/resizeboth.mcperr"
+  mcp="$(mcp_call tako_set_title "{\"pane\":${first:-0}}" "$DIR/notitle.mcp")"
+  echo "$mcp" > "$DIR/notitle.mcperr"
+  mcp="$(mcp_call tako_foreground_pane '{"pane":999999,"tab":999999}' "$DIR/fgboth.mcp")"
+  echo "$mcp" > "$DIR/fgboth.mcperr"
+  mcp="$(mcp_call tako_preview_view "{\"pane\":${first:-0},\"zoom_in\":true,\"zoom_out\":true}" "$DIR/zoomboth.mcp")"
+  echo "$mcp" > "$DIR/zoomboth.mcperr"
+  mcp="$(mcp_call tako_create_tab '{"cwd":"/etc/hosts"}' "$DIR/notfolder.mcp")"
+  echo "$mcp" > "$DIR/notfolder.mcperr"
+  mcp="$(mcp_call tako_file_op '{"op":"rename","path":"/etc/hosts","name":"a/b"}' "$DIR/badname.mcp")"
+  echo "$mcp" > "$DIR/badname.mcperr"
+  mcp="$(mcp_call tako_file_op '{"op":"trash","paths":[]}' "$DIR/nopaths.mcp")"
+  echo "$mcp" > "$DIR/nopaths.mcperr"
+  mcp="$(mcp_call tako_file_op '{"op":"copy_cancel","name":"abc"}' "$DIR/copyid.mcp")"
+  echo "$mcp" > "$DIR/copyid.mcperr"
+  mcp="$(mcp_call tako_file_op '{"op":"copy_cancel","name":"9"}' "$DIR/copygone.mcp")"
+  echo "$mcp" > "$DIR/copygone.mcperr"
+  if [ -n "$edit" ]; then
+    mcp="$(mcp_call tako_preview_move "{\"pane\":${edit},\"movement\":\"diagonal\"}" "$DIR/badmove.mcp")"
+    echo "$mcp" > "$DIR/badmove.mcperr"
+    mcp="$(mcp_call tako_preview_edit "{\"pane\":${edit},\"command\":\"undo\",\"text\":\"x\"}" "$DIR/textonly.mcp")"
+    echo "$mcp" > "$DIR/textonly.mcperr"
+  fi
 
   mcp="$(mcp_call tako_theme '{"action":"set-color","key":"accent","value":"#zz"}' "$DIR/invalid.mcp")"
   echo "$mcp" > "$DIR/invalid.mcperr"
@@ -323,7 +390,13 @@ judge() {
     "$DIR"/notpreview.mcp "$DIR"/unknownparam.mcp "$DIR"/badtype.mcp "$DIR"/unknowntool.mcp \
     "$DIR"/together.mcp "$DIR"/badtype-caller.mcp \
     "$DIR"/rangeout.cli "$DIR"/version.cli "$DIR"/nocomment.cli "$DIR"/cardempty.cli \
-    "$DIR"/norun.cli "$DIR"/rangeout.mcp "$DIR"/nocomment.mcp "$DIR"/nocmds.mcp; do
+    "$DIR"/norun.cli "$DIR"/rangeout.mcp "$DIR"/nocomment.mcp "$DIR"/nocmds.mcp \
+    "$DIR"/savechanged.cli "$DIR"/savedeleted.cli "$DIR"/savechanged.mcp "$DIR"/savedeleted.mcp \
+    "$DIR"/nofile.cli "$DIR"/nocolumn.cli "$DIR"/newtabdir.cli "$DIR"/notfolder.cli \
+    "$DIR"/nofolder.cli "$DIR"/nofile.mcp "$DIR"/badjump.mcp "$DIR"/resizeboth.mcp \
+    "$DIR"/notitle.mcp "$DIR"/fgboth.mcp "$DIR"/zoomboth.mcp "$DIR"/notfolder.mcp \
+    "$DIR"/badname.mcp "$DIR"/nopaths.mcp "$DIR"/copyid.mcp "$DIR"/copygone.mcp \
+    "$DIR"/badmove.mcp "$DIR"/textonly.mcp; do
     name="$(basename "$f")"
     [ -f "$f" ] || { fail "$label $name が無い"; continue; }
     echo "      $label $name: $(head -c 240 "$f" | tr '\n' ' ')"
@@ -334,6 +407,15 @@ judge() {
     case "$kind" in
       is_error=True | rc=1) : ;;
       *) fail "$label $name が断りで返っていない（${kind}）"; continue ;;
+    esac
+    # #2365 の 3 本目: 保存の断りには抜け方の案内が添わる（どちらの表示言語でも同じコマンドの綴り）
+    case "$name" in
+      save*)
+        case "$(cat "$f")" in
+          *"tako edit save --force"*) pass "$label $name に抜け方の案内が添わる" ;;
+          *) fail "$label $name に抜け方の案内が無い" ;;
+        esac
+        ;;
     esac
     if [ "$expect" = en ]; then
       # #2365 から直呼びの layout の理由の文も表示言語に従うので、どの出力も丸ごと見る
@@ -350,7 +432,12 @@ judge() {
           | *"を指定する"* | *"未知のパラメータ"* | *"で指定する"* | *"不明なツール"* \
           | *"同時に指定しない"* | *"文書の範囲外"* | *"文書の版が違う"* \
           | *"コメント記号を知らない"* | *"空のコマンドは提示できない"* \
-          | *"コマンドが 1 件も指定されていない"*)
+          | *"コマンドが 1 件も指定されていない"* | *"上書き: tako edit save"* \
+          | *"作り直す: tako edit save"* | *"ファイルを開けない"* | *"line と一緒に"* \
+          | *"同時に指定できない"* | *"フォルダではない"* | *"フォルダを開けない"* | *"が不正: "* \
+          | *"どちらか一方を指定する"* | *"少なくとも一方を指定する"* | *"無効なファイル名"* \
+          | *"取り消すコピーの番号"* | *"のコピーは走っていない"* | *"1 つ以上指定する"* \
+          | *"のどれか"* | *"打つ文字を取らない"*)
           pass "$label $name は日本語の前置き" ;;
         *) fail "$label $name に日本語の前置きが無い" ;;
       esac

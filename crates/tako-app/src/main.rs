@@ -27059,10 +27059,9 @@ impl PreviewHost for TakoApp {
             // 差し替えると未保存の変更を失う。dispatch の `OpenFile` はこのペインを避けて
             // 分割して開く（#1659）ので、ここへ来るのは直接この口を叩いたときだけ。
             // 行き止まりにしないよう抜け方を添える
-            let message = format!(
-                "未保存の変更があるため別ファイルを開けない（{}）",
-                tako_control::dispatch::preview_recovery_hint(edit.conflict.map(|c| c.state))
-            );
+            // 文は表示言語に従う（#2365。日英の正本は `Reason::UnsavedBlocksOpen`）
+            let message =
+                tako_control::Reason::UnsavedBlocksOpen(edit.conflict.map(|c| c.state)).to_string();
             edit.message = Some(message.clone());
             return Err(message);
         }

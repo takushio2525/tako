@@ -19,6 +19,9 @@
 //! こちらは落ちたときに、日英の対を書いたソースの行（`file:line`）も名指しする。
 //! #2365 の 2 本目で、dispatch が理由の文へそのまま載せる tako-core のエラー型（編集・
 //! ターミナル・Code Runner・コマンドカード・器・LSP の答えの読み）にも広げた（末尾）。
+//! #2365 の 3 本目で、保存の断りに添える案内（旧 `preview_recovery_hint`）と、dispatch の個別の文の
+//! うちプレビュー・編集・ファイル操作・ペイン / タブ操作の断りを `Reason` へ足した（`Reason` の表と、
+//! 案内の 3 状態を見る節）。
 //!
 //! このファイルは**独立したテストバイナリ**で、言語グローバルを触るのは
 //! `display_follows_the_display_language` の 1 本だけ（ほかは `text_in` で言語を引数に渡す）。
@@ -27,7 +30,7 @@ use tako_control::DispatchError as E;
 use tako_control::{NoTargetPaneAt, Reason};
 use tako_core::i18n::{self, Lang};
 use tako_core::{
-    LayoutParamError, PaneId, PaneTreeError, SplitAxis, TabId, WindowId, WorkspaceError,
+    DiskState, LayoutParamError, PaneId, PaneTreeError, SplitAxis, TabId, WindowId, WorkspaceError,
 };
 
 /// バリアントの通し番号。**網羅 match**なので、バリアントを足すとここがコンパイルで落ちる
@@ -470,9 +473,43 @@ fn reason_index(r: &Reason) -> usize {
         Reason::EnvAndUnsetEnv(_) => 48,
         Reason::GatePredicate => 49,
         Reason::CliInvalidDirection(_) => 50,
+        Reason::RecoveryHint(_) => 51,
+        Reason::SaveRefused { .. } => 52,
+        Reason::UnsavedBlocksOpen(_) => 53,
+        Reason::NewTabWithDirection => 54,
+        Reason::ColumnNeedsLine => 55,
+        Reason::CannotOpenFile { .. } => 56,
+        Reason::OpenedButNoLine { .. } => 57,
+        Reason::JumpUnavailable => 58,
+        Reason::InvalidValue { .. } => 59,
+        Reason::NotOneOf { .. } => 60,
+        Reason::TextOnlyForType(_) => 61,
+        Reason::CannotCombine(..) => 62,
+        Reason::CannotCombineAll(_) => 63,
+        Reason::ExactlyOneOf(..) => 64,
+        Reason::AtLeastOneOf(..) => 65,
+        Reason::OneOfRequired(..) => 66,
+        Reason::ScrollToOrDelta => 67,
+        Reason::MirrorScrollUnsupported => 68,
+        Reason::NoTerminalSession(_) => 69,
+        Reason::DirectionOnlyWithTarget => 70,
+        Reason::CannotOpenFolder { .. } => 71,
+        Reason::NotAFolder(_) => 72,
+        Reason::InvalidFileName => 73,
+        Reason::NoParentDir => 74,
+        Reason::RenameFailed(_) => 75,
+        Reason::CreateFileFailed(_) => 76,
+        Reason::CreateDirFailed(_) => 77,
+        Reason::AppNameMissing => 78,
+        Reason::MoveDestMissing => 79,
+        Reason::PasteDestMissing => 80,
+        Reason::NoPaths => 81,
+        Reason::ManyOpUnsupported(_) => 82,
+        Reason::BadCopyId(_) => 83,
+        Reason::CopyNotRunning(_) => 84,
     }
 }
-const REASON_VARIANTS: usize = 51;
+const REASON_VARIANTS: usize = 85;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -538,6 +575,61 @@ fn reason_samples() -> Vec<Reason> {
         Reason::EnvAndUnsetEnv("PATH".into()),
         Reason::GatePredicate,
         Reason::CliInvalidDirection("north".into()),
+        // #2365 の 3 本目（案内の 3 状態は [`案内の3つの状態と添え方が日英を持ち日本語は旧文と一致`] が全部見る）
+        Reason::RecoveryHint(Some(DiskState::Changed)),
+        Reason::SaveRefused {
+            message: "external change".into(),
+            conflict: DiskState::Changed,
+        },
+        Reason::UnsavedBlocksOpen(None),
+        Reason::NewTabWithDirection,
+        Reason::ColumnNeedsLine,
+        Reason::CannotOpenFile {
+            path: "/tmp/x".into(),
+            error: "gone".into(),
+        },
+        Reason::OpenedButNoLine {
+            path: "/tmp/x".into(),
+            error: "binary".into(),
+        },
+        Reason::JumpUnavailable,
+        Reason::InvalidValue {
+            key: "action",
+            got: "sideways".into(),
+            allowed: "list / back / forward".into(),
+        },
+        Reason::NotOneOf {
+            key: "movement",
+            got: "diagonal".into(),
+            allowed: "left / right".into(),
+        },
+        Reason::TextOnlyForType("undo".into()),
+        Reason::CannotCombine("tab", "target"),
+        Reason::CannotCombineAll("zoom / zoom_in / zoom_out / reset"),
+        Reason::ExactlyOneOf("delta", "share"),
+        Reason::AtLeastOneOf("title", "role"),
+        Reason::OneOfRequired("pane", "tab"),
+        Reason::ScrollToOrDelta,
+        Reason::MirrorScrollUnsupported,
+        Reason::NoTerminalSession(3),
+        Reason::DirectionOnlyWithTarget,
+        Reason::CannotOpenFolder {
+            path: "/tmp/x".into(),
+            error: "gone".into(),
+        },
+        Reason::NotAFolder("/tmp/x".into()),
+        Reason::InvalidFileName,
+        Reason::NoParentDir,
+        Reason::RenameFailed("busy".into()),
+        Reason::CreateFileFailed("busy".into()),
+        Reason::CreateDirFailed("busy".into()),
+        Reason::AppNameMissing,
+        Reason::MoveDestMissing,
+        Reason::PasteDestMissing,
+        Reason::NoPaths,
+        Reason::ManyOpUnsupported("rename".into()),
+        Reason::BadCopyId("abc".into()),
+        Reason::CopyNotRunning(9),
     ]
 }
 
@@ -595,7 +687,48 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "PATH を --env と --unset-env の両方に渡している",
     "少なくとも 1 つの述語を指定する（--command / --pr-merged / --custom）",
     "不正な方向: north（right / down / left / up）",
+    // #2365 の 3 本目（dispatch の `preview_recovery_hint` と個別の文・GUI の `set_preview` の断り）
+    HINT_CHANGED_OLD_JA,
+    "external change（上書き: tako edit save --force / 読み直し（自分の変更は undo で戻せる）: tako edit reload / 差分: tako edit diff（MCP は tako_preview_save の action=overwrite / reload / diff））",
+    "未保存の変更があるため別ファイルを開けない（保存: tako edit save / 変更を捨てる: tako edit reload（MCP は tako_preview_save / action=reload））",
+    "new_tab と direction は同時に指定できない（新しいタブには分割元が無い）",
+    "column は line と一緒に指定する",
+    "ファイルを開けない（/tmp/x: gone）",
+    "開いたが行へ飛べない（/tmp/x: binary）",
+    "ジャンプ履歴はこの tako では使えない（GUI の中でだけ持つ）",
+    "action が不正: sideways（list / back / forward）",
+    "movement は left / right のどれか（\"diagonal\" は無い）",
+    "text は command=type のときだけ渡す（\"undo\" は打つ文字を取らない）",
+    "tab と target は同時に指定できない",
+    "zoom / zoom_in / zoom_out / reset は同時に指定できない",
+    "delta か share のどちらか一方を指定する",
+    "title か role の少なくとも一方を指定する",
+    "pane か tab のどちらかが要る",
+    "to（絶対位置。0 = 最下部）か delta（相対行数）のどちらか一方を指定する",
+    "このホストはバックエンドペインのスクロール表示に対応していない",
+    "ペイン 3 にターミナルセッションが無い",
+    "direction は target 指定時のみ使える",
+    "フォルダを開けない（/tmp/x: gone）",
+    "フォルダではない: /tmp/x",
+    "無効なファイル名",
+    "親ディレクトリが取得できない",
+    "リネームに失敗: busy",
+    "ファイル作成に失敗: busy",
+    "フォルダ作成に失敗: busy",
+    "name（アプリ名）を指定する",
+    "dest（移動先のフォルダ）を指定する",
+    "dest（貼り付け先のフォルダ）を指定する",
+    "paths を 1 つ以上指定する",
+    "paths で扱えるのは clipboard_copy / clipboard_cut / trash / move / copy（rename）",
+    "name は取り消すコピーの番号（copy_progress の id）: abc",
+    "番号 9 のコピーは走っていない",
 ];
+
+/// #2365 より前の `preview_recovery_hint` の 3 つの文（外で消された / 外で変わった / 未保存だけ）
+const HINT_DELETED_OLD_JA: &str = "作り直す: tako edit save --force / 差分: tako edit diff（MCP は tako_preview_save の action=overwrite / diff）";
+const HINT_CHANGED_OLD_JA: &str = "上書き: tako edit save --force / 読み直し（自分の変更は undo で戻せる）: tako edit reload / 差分: tako edit diff（MCP は tako_preview_save の action=overwrite / reload / diff）";
+const HINT_UNSAVED_OLD_JA: &str =
+    "保存: tako edit save / 変更を捨てる: tako edit reload（MCP は tako_preview_save / action=reload）";
 
 /// 「見つからない」系（英語にも ` not found` を含める約束のもの）
 fn reason_is_not_found(r: &Reason) -> bool {
@@ -709,15 +842,49 @@ fn arm_line(src: &str, from: &str, variant: &str, lang: Lang) -> Option<usize> {
 
 /// 落ちたときに添える「日英の対を書いた行」
 fn where_written(src: &str, path: &str, from: &str, debug: &str, lang: Lang) -> String {
-    match arm_line(src, from, variant_name(debug), lang) {
+    where_arm(src, path, from, variant_name(debug), lang)
+}
+
+/// [`where_written`] の腕の頭（`Self::` の後ろ）を明示する形
+fn where_arm(src: &str, path: &str, from: &str, arm: &str, lang: Lang) -> String {
+    match arm_line(src, from, arm, lang) {
         Some(line) => format!("{path}:{line}"),
-        None => format!("{path}（{} の腕が見つからない）", variant_name(debug)),
+        None => format!("{path}（{arm} の腕が見つからない）"),
     }
+}
+
+/// `Reason` の腕の頭。1 つのバリアントを中身で腕に分けたもの（#2365 の 3 本目の案内の 3 状態）は
+/// 中身まで書く（バリアント名だけだと最初の腕 = 外で消されたときの腕を名指ししてしまう）
+fn reason_arm(r: &Reason) -> String {
+    match r {
+        Reason::RecoveryHint(Some(DiskState::Deleted)) => {
+            "RecoveryHint(Some(tako_core::DiskState::Deleted)".into()
+        }
+        Reason::RecoveryHint(Some(_)) => "RecoveryHint(Some(_)".into(),
+        Reason::RecoveryHint(None) => "RecoveryHint(None".into(),
+        other => variant_name(&format!("{other:?}")).to_string(),
+    }
+}
+
+/// `Reason` の日英の対を書いた行
+fn reason_where(r: &Reason, lang: Lang) -> String {
+    where_arm(
+        DISPATCH_SRC,
+        DISPATCH_PATH,
+        "impl Reason {",
+        &reason_arm(r),
+        lang,
+    )
 }
 
 /// [`bilingual`] と同じ検査に、腕の行を添える
 fn bilingual_at(src: &str, path: &str, from: &str, debug: &str, ja: &str, en: &str) {
     let at = |lang| where_written(src, path, from, debug, lang);
+    bilingual_named(at, debug, ja, en);
+}
+
+/// [`bilingual_at`] の本体（`at` = 言語ごとの腕の行）
+fn bilingual_named(at: impl Fn(Lang) -> String, debug: &str, ja: &str, en: &str) {
     assert!(
         !ja.trim().is_empty(),
         "{debug} の日本語が空（{}）",
@@ -746,10 +913,8 @@ fn 理由の文の見本は全バリアントを1つずつ持つ() {
 #[test]
 fn 理由の文が日英を持ち英語に日本語が混ざらない() {
     for r in reason_samples() {
-        bilingual_at(
-            DISPATCH_SRC,
-            DISPATCH_PATH,
-            "impl Reason {",
+        bilingual_named(
+            |lang| reason_where(&r, lang),
             &format!("{r:?}"),
             &r.text_in(Lang::Ja),
             &r.text_in(Lang::En),
@@ -770,18 +935,11 @@ fn 理由の文が日英を持ち英語に日本語が混ざらない() {
 #[test]
 fn 理由の文の日本語は2365より前の固定文とバイト一致() {
     for r in reason_samples() {
-        let debug = format!("{r:?}");
         assert_eq!(
             r.text_in(Lang::Ja),
             REASON_OLD_JA[reason_index(&r)],
-            "{debug}（{}）",
-            where_written(
-                DISPATCH_SRC,
-                DISPATCH_PATH,
-                "impl Reason {",
-                &debug,
-                Lang::Ja
-            )
+            "{r:?}（{}）",
+            reason_where(&r, Lang::Ja)
         );
     }
     for e in layout_samples() {
@@ -805,11 +963,10 @@ fn 理由の文の日本語は2365より前の固定文とバイト一致() {
 #[test]
 fn 理由の文の腕の行を日英とも引ける() {
     for lang in [Lang::Ja, Lang::En] {
-        for r in reason_samples() {
-            let debug = format!("{r:?}");
+        for r in reason_samples().iter().chain(&hint_samples()) {
             assert!(
-                arm_line(DISPATCH_SRC, "impl Reason {", variant_name(&debug), lang).is_some(),
-                "{debug} / {lang:?}"
+                arm_line(DISPATCH_SRC, "impl Reason {", &reason_arm(r), lang).is_some(),
+                "{r:?} / {lang:?}"
             );
         }
         for e in layout_samples() {
@@ -890,6 +1047,85 @@ fn 理由の文の境界() {
             // 固定 ID 安全: 同上
             E::TabNotFound(7).text_in(lang)
         );
+    }
+}
+
+// ---- #2365 の 3 本目: 保存の断りに添える案内（旧 `preview_recovery_hint`）の 3 状態と添え方 ----
+//
+// 英語表示で「英語の断り + 日本語の案内」が混ざって出ていた（#2365 の 2 本目の worker の報告）。
+// 案内は 1 つのバリアントを外部変更の状態で 3 つの腕に分けるので、見本の表（1 バリアント 1 つ）
+// とは別にここで 3 状態を全部見る
+
+/// 案内の 3 状態（外で消された / 外で変わった / 未保存だけ）
+fn hint_samples() -> Vec<Reason> {
+    vec![
+        Reason::RecoveryHint(Some(DiskState::Deleted)),
+        Reason::RecoveryHint(Some(DiskState::Changed)),
+        Reason::RecoveryHint(None),
+    ]
+}
+
+#[test]
+fn 案内の3つの状態と添え方が日英を持ち日本語は旧文と一致() {
+    let old = [
+        HINT_DELETED_OLD_JA,
+        HINT_CHANGED_OLD_JA,
+        HINT_UNSAVED_OLD_JA,
+    ];
+    for (r, old) in hint_samples().iter().zip(old) {
+        let (ja, en) = (r.text_in(Lang::Ja), r.text_in(Lang::En));
+        bilingual_named(|lang| reason_where(r, lang), &format!("{r:?}"), &ja, &en);
+        assert_eq!(ja, old, "{r:?}（{}）", reason_where(r, Lang::Ja));
+        // 案内のコマンドは英語表示でも同じ綴り（そのまま打ち写せる）
+        for command in ["tako edit ", "tako_preview_save", "action="] {
+            assert!(
+                en.contains(command),
+                "{r:?} の英語に {command} が無い: {en}（{}）",
+                reason_where(r, Lang::En)
+            );
+        }
+    }
+    // 外から変わっていない（Unchanged）は「外で変わった」と同じ腕（#2365 より前の `Some(_)`）
+    for lang in [Lang::Ja, Lang::En] {
+        assert_eq!(
+            Reason::RecoveryHint(Some(DiskState::Unchanged)).text_in(lang),
+            Reason::RecoveryHint(Some(DiskState::Changed)).text_in(lang)
+        );
+    }
+    // 添え方: dispatch の保存の断り（`preview_save`）と GUI の差し替えの断り（`set_preview`）。
+    // 日本語は #2365 より前の `format!("{message}（{hint}）")` /
+    // `format!("未保存の変更があるため別ファイルを開けない（{hint}）")` とバイト一致
+    for state in [DiskState::Deleted, DiskState::Changed] {
+        let hint = Reason::RecoveryHint(Some(state));
+        let refused = Reason::SaveRefused {
+            message: "m".into(),
+            conflict: state,
+        };
+        assert_eq!(
+            refused.text_in(Lang::Ja),
+            format!("m（{}）", hint.text_in(Lang::Ja))
+        );
+        assert_eq!(
+            refused.text_in(Lang::En),
+            format!("m ({})", hint.text_in(Lang::En))
+        );
+    }
+    for conflict in [None, Some(DiskState::Deleted), Some(DiskState::Changed)] {
+        let hint = Reason::RecoveryHint(conflict);
+        let blocked = Reason::UnsavedBlocksOpen(conflict);
+        assert_eq!(
+            blocked.text_in(Lang::Ja),
+            format!(
+                "未保存の変更があるため別ファイルを開けない（{}）",
+                hint.text_in(Lang::Ja)
+            )
+        );
+        let en = blocked.text_in(Lang::En);
+        assert!(
+            en.ends_with(&format!("({})", hint.text_in(Lang::En))),
+            "{en}"
+        );
+        assert!(has_japanese(&en).is_none(), "{en}");
     }
 }
 

@@ -49,6 +49,14 @@ check_has() {
   esac
 }
 
+# 表示言語に従う断り（#2365）は日英どちらかの形で当たればよい（$2 = 日本語 / $3 = 英語）
+check_has_either() {
+  case "$4" in
+    *"$2"* | *"$3"*) pass "$1" ;;
+    *) fail "$1（'${2}' / '${3}' を含まない: ${4}）" ;;
+  esac
+}
+
 # 差し替えたバイナリ（main 等）で走らせているか。A/B の口と visual 節はこのビルドにしか無い
 CUSTOM_BINS=0
 if [ -n "${TAKO_BIN:-}" ] || [ -n "${APP_BIN:-}" ]; then
@@ -224,7 +232,7 @@ P3="$(open_edit "$F3" false)" || exit 1
 rm -f "$F3"
 run edit save --pane "$P3"
 check_eq "消されたファイルの保存は断る" 1 "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
-check_has "断った理由に「作り直す」が載る" "作り直す" "$OUT"
+check_has_either "断った理由に「作り直す」が載る" "作り直す" "to recreate it" "$OUT"
 check_eq "通常の保存は作り直さない" 0 "$([ -e "$F3" ] && echo 1 || echo 0)"
 run edit diff --pane "$P3"
 check_eq "diff は state=deleted" deleted "$(printf '%s' "$OUT" | jget diff.state)"
@@ -408,8 +416,8 @@ print(d["tabs"][0]["panes"][0]["id"])
   "$TAKO_BIN" edit autosave false --pane "$PL" >/dev/null
   run open "$FL2" --pane "$PL"
   echo "  legacy: 未保存のペインへ open → rc=$RC / $OUT"
-  check_has "legacy では未保存のペインへ別のファイルを開けない（④ の検査が #1659 前を検出できる）" \
-    "別ファイルを開けない" "$OUT"
+  check_has_either "legacy では未保存のペインへ別のファイルを開けない（④ の検査が #1659 前を検出できる）" \
+    "別ファイルを開けない" "cannot open another file" "$OUT"
   stop_isolated_gui "$APP_PID"
   APP_PID=""
 

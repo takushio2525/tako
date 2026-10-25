@@ -149,6 +149,17 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `CommandCardError::says_still_running` で日英どちらにも当てる（目印は `still_running_mark(lang)`）。
   `BackendError::Unsupported` / `Operation` は作り手が組んだ文をそのまま出す（器の CLI の文の
   日英は #2365 の続き）。番犬は同じ `issue1762_dispatch_error_lang.rs`（末尾の節）
+- #2365 の 3 本目で、**保存の断りに添える抜け方の案内**（`Reason::RecoveryHint`。旧
+  `dispatch::preview_recovery_hint`）と、それを添える 2 つの断り（dispatch の保存 =
+  `Reason::SaveRefused`・GUI の `set_preview` の差し替え = `Reason::UnsavedBlocksOpen`）、
+  dispatch の個別の文のうち**プレビュー・編集・ファイル操作・ペイン / タブ操作の断り**を `Reason` へ
+  足した。案内を文字列で後から括弧に入れると「英語の断り + 日本語の案内」が混ざるので、
+  **添える側ごとバリアントにする**（括弧も表示言語で変わる）。同じ形の文は鍵の名前を
+  `&'static str` で渡す 1 つのバリアントへ寄せる（`InvalidValue` = `<key> が不正: …` /
+  `CannotCombine` = `<a> と <b> は同時に指定できない` / `ExactlyOneOf` / `AtLeastOneOf` /
+  `OneOfRequired` / `NotOneOf`）。移動・コピーの断り（`tako_core::file_move::MoveRefusal` /
+  `file_copy::CopyRefusal` と、それを包む「移動できない」「コピーできない」「N 件すべてできなかった」）は
+  **理由ごと**続きで移す（包みだけ移すと英語の包み + 日本語の理由に混ざる）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
