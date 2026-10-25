@@ -2160,11 +2160,15 @@ fn 移動とコピーの包みの境界() {
         dest: "/tmp/移動先".into(),
     };
     let en = named.text_in(Lang::En);
-    assert!(en.starts_with("cannot copy: "), "{en}");
-    assert!(en.ends_with("(/tmp/メモ.txt → /tmp/移動先)"), "{en}");
+    let at = reason_where(&named, Lang::En);
+    assert!(en.starts_with("cannot copy: "), "{en}（{at}）");
+    assert!(
+        en.ends_with("(/tmp/メモ.txt → /tmp/移動先)"),
+        "{en}（{at}）"
+    );
     // パスを除けば日本語は残らない
     let without_paths = en.replace("/tmp/メモ.txt", "").replace("/tmp/移動先", "");
-    assert!(has_japanese(&without_paths).is_none(), "{en}");
+    assert!(has_japanese(&without_paths).is_none(), "{en}（{at}）");
     // 3 件以上でも件数と並びは保つ
     let three = Reason::AllFailed(vec!["a".into(), "b".into(), "c".into()]);
     assert_eq!(three.text_in(Lang::Ja), "3 件すべてできなかった: a / b / c");
