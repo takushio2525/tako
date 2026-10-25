@@ -269,11 +269,11 @@ fn rustfmt(path: &Path) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// `fn ` で始まる行ごとに区切った塊
+/// 桁 0 の関数の頭の行ごとに区切った塊（頭の判定は #1496 の共有ヘルパ）
 fn fn_chunks(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in text.split_inclusive('\n') {
-        if line.starts_with("fn ") || out.is_empty() {
+        if tako_core::source_scan::is_top_level_fn_head(line) || out.is_empty() {
             out.push(String::new());
         }
         out.last_mut().unwrap().push_str(line);
