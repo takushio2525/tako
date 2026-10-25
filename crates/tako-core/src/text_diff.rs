@@ -12,6 +12,12 @@
 //!
 //! 行は改行コードまで含めて比べる（CRLF → LF の書き換えも差分として出る）。
 //! 表示する行（[`DiffLine::content`]）からは改行コードを落とす
+//!
+//! 言語サーバの整形の答えを行ごとの置き換えへ割る [`changed_regions`]（Issue #1899）も
+//! 同じ Myers を使う。こちらは全文を書き換えた差でも区間を細かく返す（関数の説明）
+
+use std::collections::HashMap;
+use std::ops::Range;
 
 use crate::git::{DiffHunk, DiffLine, DiffLineKind};
 
@@ -148,6 +154,185 @@ fn replace_all(old_len: usize, new_len: usize) -> Vec<Op> {
         .map(|old| Op::Delete { old })
         .chain((0..new_len).map(|new| Op::Insert { new }))
         .collect()
+}
+
+/// 行の列どうしで食い違う区間 1 つ（Issue #1899）。添字は行番号（0 始まり）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineRegion {
+    /// 旧の行の範囲（空なら挿入）
+    pub old: Range<usize>,
+    /// 新の行の範囲（空なら削除）
+    pub new: Range<usize>,
+}
+
+/// 目印探しで数えてよい行数の合計（両側の行数の和の何倍まで）。目印で割った区間の中で
+/// また目印を探すので、目印が端にしか無い入力で 2 乗にならないよう頭打ちにする。
+/// 使い切ったら残りの区間は Myers（上限つき）だけで比べる
+const ANCHOR_WORK_FACTOR: usize = 8;
+
+/// `a` から `b` への行単位の食い違いを、始まりの順・重ならない区間で返す（Issue #1899）。
+///
+/// 言語サーバが全文を 1 つの書き換えで返した整形を、行ごとの小さな置き換えへ割るために使う
+/// （`text_edit` の整形の当て方）。[`diff_lines`] と違い**全文を書き換えた差でも区間を細かく
+/// 返す**: 共通の先頭・末尾を削り、両側に 1 回ずつしか現れない行を目印（patience diff。
+/// git の `--patience` と同じ考え）に区間を割ってから、目印の無い区間だけを Myers で比べる。
+/// Myers が編集距離の上限 [`MAX_EDIT_DISTANCE`] に当たった区間は丸ごと 1 区間にする
+/// （差としては正しいまま）。区間の外の行は両側で 1 対 1 に等しい
+pub fn changed_regions(a: &[&str], b: &[&str]) -> Vec<LineRegion> {
+    let mut out = Vec::new();
+    let mut anchor_work = ANCHOR_WORK_FACTOR * (a.len() + b.len());
+    // 比べ残した区間の山。前の区間を上に積む = 取り出す順が始まりの順（再帰の深さで溢れない）
+    let mut todo = vec![(0..a.len(), 0..b.len())];
+    while let Some((old, new)) = todo.pop() {
+        let (old, new) = trim_common(a, b, old, new);
+        if old.is_empty() || new.is_empty() {
+            if !(old.is_empty() && new.is_empty()) {
+                out.push(LineRegion { old, new });
+            }
+            continue;
+        }
+        let size = old.len() + new.len();
+        let anchors = if anchor_work >= size {
+            anchor_work -= size;
+            unique_anchors(a, b, &old, &new)
+        } else {
+            Vec::new()
+        };
+        if anchors.is_empty() {
+            myers_regions(a, b, old, new, &mut out);
+            continue;
+        }
+        // 目印のあいだ（と前後）を後ろから積む
+        let mut gaps = Vec::with_capacity(anchors.len() + 1);
+        let (mut at_old, mut at_new) = (old.start, new.start);
+        for (i, j) in anchors {
+            gaps.push((at_old..i, at_new..j));
+            (at_old, at_new) = (i + 1, j + 1);
+        }
+        gaps.push((at_old..old.end, at_new..new.end));
+        todo.extend(gaps.into_iter().rev());
+    }
+    out
+}
+
+/// 区間の共通の先頭・末尾の行を削る
+fn trim_common(
+    a: &[&str],
+    b: &[&str],
+    old: Range<usize>,
+    new: Range<usize>,
+) -> (Range<usize>, Range<usize>) {
+    let prefix = a[old.clone()]
+        .iter()
+        .zip(&b[new.clone()])
+        .take_while(|(x, y)| x == y)
+        .count();
+    let (old, new) = (old.start + prefix..old.end, new.start + prefix..new.end);
+    let suffix = a[old.clone()]
+        .iter()
+        .rev()
+        .zip(b[new.clone()].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    (old.start..old.end - suffix, new.start..new.end - suffix)
+}
+
+/// 区間の中で両側に 1 回ずつしか現れない行の組のうち、両側で順の揃う最長の並び（目印）
+fn unique_anchors(
+    a: &[&str],
+    b: &[&str],
+    old: &Range<usize>,
+    new: &Range<usize>,
+) -> Vec<(usize, usize)> {
+    // 行 → (旧での回数, 旧での位置, 新での回数, 新での位置)
+    let mut seen: HashMap<&str, (u32, usize, u32, usize)> = HashMap::with_capacity(old.len());
+    for i in old.clone() {
+        seen.entry(a[i]).or_insert((0, i, 0, 0)).0 += 1;
+    }
+    for j in new.clone() {
+        if let Some(entry) = seen.get_mut(b[j]) {
+            entry.2 += 1;
+            entry.3 = j;
+        }
+    }
+    let mut pairs: Vec<(usize, usize)> = seen
+        .into_values()
+        .filter(|&(in_old, _, in_new, _)| in_old == 1 && in_new == 1)
+        .map(|(_, i, _, j)| (i, j))
+        .collect();
+    pairs.sort_unstable();
+    longest_increasing(&pairs)
+}
+
+/// 旧の位置の順に並べた組から、新の位置も増え続ける最長の部分列（patience sorting。O(n log n)）
+fn longest_increasing(pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    // tails[k] = 長さ k + 1 の増加列のうち、末尾の新の位置が最小のものの末尾（pairs の添字）
+    let mut tails: Vec<usize> = Vec::new();
+    let mut prev: Vec<Option<usize>> = vec![None; pairs.len()];
+    for (i, &(_, j)) in pairs.iter().enumerate() {
+        let k = tails.partition_point(|&t| pairs[t].1 < j);
+        if k > 0 {
+            prev[i] = Some(tails[k - 1]);
+        }
+        if k == tails.len() {
+            tails.push(i);
+        } else {
+            tails[k] = i;
+        }
+    }
+    let mut out = Vec::with_capacity(tails.len());
+    let mut at = tails.last().copied();
+    while let Some(i) = at {
+        out.push(pairs[i]);
+        at = prev[i];
+    }
+    out.reverse();
+    out
+}
+
+/// 目印の無い区間を Myers で比べ、食い違う区間を `out` へ足す。上限に当たれば区間を丸ごと 1 つ
+fn myers_regions(
+    a: &[&str],
+    b: &[&str],
+    old: Range<usize>,
+    new: Range<usize>,
+    out: &mut Vec<LineRegion>,
+) {
+    let Some(ops) = myers(&a[old.clone()], &b[new.clone()], MAX_EDIT_DISTANCE) else {
+        out.push(LineRegion { old, new });
+        return;
+    };
+    // 操作列は始点から終点への順 = 旧・新の位置を数えながら、等しくない操作の連なりを 1 区間にする
+    let mut open: Option<(usize, usize)> = None;
+    let (mut i, mut j) = (old.start, new.start);
+    for op in ops {
+        match op {
+            Op::Equal { .. } => {
+                if let Some((from_old, from_new)) = open.take() {
+                    out.push(LineRegion {
+                        old: from_old..i,
+                        new: from_new..j,
+                    });
+                }
+                i += 1;
+                j += 1;
+            }
+            Op::Delete { .. } => {
+                open.get_or_insert((i, j));
+                i += 1;
+            }
+            Op::Insert { .. } => {
+                open.get_or_insert((i, j));
+                j += 1;
+            }
+        }
+    }
+    if let Some((from_old, from_new)) = open {
+        out.push(LineRegion {
+            old: from_old..i,
+            new: from_new..j,
+        });
+    }
 }
 
 /// Myers の O(ND) 差分。編集距離が `max_d` を超えたら `None`。
@@ -507,5 +692,151 @@ mod tests {
             assert_eq!(apply(&old_text, &diff), new, "old={old:?} new={new:?}");
             assert!(!diff.approximate);
         }
+    }
+
+    // --- #1899: 整形を行ごとへ割る区間 --------------------------------------------------
+
+    /// 区間で旧の行から新の行を組み直す。区間の外の行が 1 対 1 に等しいこと・区間が
+    /// 始まりの順で重ならず空でないことも確かめる
+    fn rebuild<'a>(a: &[&'a str], b: &[&'a str], regions: &[LineRegion]) -> Vec<&'a str> {
+        let mut out = Vec::new();
+        let (mut i, mut j) = (0, 0);
+        for region in regions {
+            assert!(
+                !(region.old.is_empty() && region.new.is_empty()),
+                "空の区間"
+            );
+            assert!(region.old.start >= i && region.new.start >= j, "順が戻った");
+            assert_eq!(
+                region.old.start - i,
+                region.new.start - j,
+                "外の行が対にならない"
+            );
+            for (x, y) in a[i..region.old.start].iter().zip(&b[j..region.new.start]) {
+                assert_eq!(x, y, "区間の外の行が等しくない");
+                out.push(*x);
+            }
+            out.extend_from_slice(&b[region.new.clone()]);
+            (i, j) = (region.old.end, region.new.end);
+        }
+        assert_eq!(a.len() - i, b.len() - j, "末尾の外の行が対にならない");
+        out.extend_from_slice(&a[i..]);
+        out
+    }
+
+    #[test]
+    fn 食い違う区間で旧から新を組み直せる_1899() {
+        let mut seed: u64 = 0x1899;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        for round in 0..300 {
+            // 半分は重複の多い行（目印が無い = Myers）、半分は一意の行（目印で割る）
+            let pool = if round % 2 == 0 { 4 } else { 1_000 };
+            let old: Vec<String> = (0..next(60)).map(|_| format!("{}", next(pool))).collect();
+            let mut new = old.clone();
+            for _ in 0..next(10) {
+                match next(3) {
+                    0 if !new.is_empty() => {
+                        let at = next(new.len());
+                        new.remove(at);
+                    }
+                    1 => {
+                        let at = next(new.len() + 1);
+                        new.insert(at, format!("n{}", next(pool)));
+                    }
+                    _ if !new.is_empty() => {
+                        let at = next(new.len());
+                        new[at] = format!("r{}", next(pool));
+                    }
+                    _ => {}
+                }
+            }
+            let a: Vec<&str> = old.iter().map(String::as_str).collect();
+            let b: Vec<&str> = new.iter().map(String::as_str).collect();
+            let regions = changed_regions(&a, &b);
+            assert_eq!(rebuild(&a, &b, &regions), b, "old={old:?} new={new:?}");
+            if a == b {
+                assert!(regions.is_empty());
+            }
+        }
+    }
+
+    /// Myers だけだと上限（1,000）に当たって全体が 1 区間になる差（10 万行のうち 1 万行を
+    /// 書き換え）でも、変えた行ごとの区間で返す
+    #[test]
+    fn 全体に散らばる変更でも行ごとの区間で返す_1899() {
+        let old: Vec<String> = (0..100_000).map(|i| format!("line {i}\n")).collect();
+        let new: Vec<String> = old
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i % 10 == 3 {
+                    format!("changed {i}\n")
+                } else {
+                    l.clone()
+                }
+            })
+            .collect();
+        let (old_text, new_text) = (old.concat(), new.concat());
+        assert!(
+            diff_lines(&old_text, &new_text).approximate,
+            "表示の差分は上限に当たる"
+        );
+        let a: Vec<&str> = old.iter().map(String::as_str).collect();
+        let b: Vec<&str> = new.iter().map(String::as_str).collect();
+        let regions = changed_regions(&a, &b);
+        assert_eq!(regions.len(), 10_000);
+        assert!(regions
+            .iter()
+            .all(|r| r.old.len() == 1 && r.new.len() == 1 && r.old.start % 10 == 3));
+        assert_eq!(rebuild(&a, &b, &regions), b);
+    }
+
+    #[test]
+    fn 共通の行が無く上限を超えたら丸ごと_1_区間_1899() {
+        let old: Vec<String> = (0..3_000).map(|i| format!("a{i}\n")).collect();
+        let new: Vec<String> = (0..3_000).map(|i| format!("b{i}\n")).collect();
+        let a: Vec<&str> = old.iter().map(String::as_str).collect();
+        let b: Vec<&str> = new.iter().map(String::as_str).collect();
+        assert_eq!(
+            changed_regions(&a, &b),
+            vec![LineRegion {
+                old: 0..3_000,
+                new: 0..3_000
+            }]
+        );
+    }
+
+    #[test]
+    fn 空の列と片側だけの列_1899() {
+        assert!(changed_regions(&[], &[]).is_empty());
+        assert_eq!(
+            changed_regions(&[], &["a\n"]),
+            vec![LineRegion {
+                old: 0..0,
+                new: 0..1
+            }]
+        );
+        assert_eq!(
+            changed_regions(&["a\n", "b\n"], &[]),
+            vec![LineRegion {
+                old: 0..2,
+                new: 0..0
+            }]
+        );
+        // 重複だけの行（目印が無い）の途中への挿入
+        let a = ["}\n", "}\n", "}\n"];
+        let b = ["}\n", "x\n", "}\n", "}\n"];
+        assert_eq!(
+            changed_regions(&a, &b),
+            vec![LineRegion {
+                old: 1..1,
+                new: 1..2
+            }]
+        );
     }
 }

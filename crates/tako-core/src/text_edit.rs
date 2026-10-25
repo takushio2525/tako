@@ -68,6 +68,9 @@ mod auto_close;
 mod enter;
 pub use enter::legacy_1759;
 
+// 全文を 1 つの書き換えで返す整形を行ごとの置き換えへ割る（#1899）
+mod line_split;
+
 /// 改行コード（#1650）。
 ///
 /// tako が行区切りとして扱うのは `\n` と `\r\n` の 2 つだけ。単独の `\r`
@@ -1067,7 +1070,8 @@ impl ChangesError {
 /// 書き換えの組を当てた結果（#1683）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppliedChanges {
-    /// 実際に本文を変えた箇所の数（中身の同じ書き換えは数えない）。0 なら何も変えていない
+    /// 実際に本文を変えた箇所の数（中身の同じ書き換えは数えない。改行をまたぐ書き換えは
+    /// 行ごとへ割った後の数 = #1899）。0 なら何も変えていない
     pub changes: usize,
 }
 
@@ -2648,6 +2652,9 @@ impl TextBuffer {
     ///   直す答えでも、積むのは直した数文字。#1683 の当初は最初の始まり〜最後の終わりを
     ///   1 か所にしていたので、10 MB の文書では 1 回で undo の予算 8 MB を超えた）。
     ///   当て方は補完の確定（[`Self::replace_position_ranges`]）と同じ 1 本
+    /// - 改行をまたぐ書き換え（全文を 1 つの書き換えで返すサーバの答え）は**行ごとの置き換えへ
+    ///   割ってから**当てる（#1899。`line_split`）。当てた後の本文は割らないときとバイト一致で、
+    ///   undo へ積むのは行ごとの差だけになる（10 万行の字下げ・行末の空白の直しでも数 MB）
     /// - 入れる本文の改行はバッファの流儀へ揃える（#1650。範囲の外の改行は触らない）
     /// - カーソルと選択端は書き換えに合わせてずらす（打っていた場所から飛ばない）
     ///
@@ -2675,6 +2682,13 @@ impl TextBuffer {
         if ordered.is_empty() {
             return Ok(AppliedChanges { changes: 0 });
         }
+        // 全文を 1 つの書き換えで返すサーバの答えも、行ごとの置き換えへ割る（#1899。
+        // A/B の旧腕 `TAKO_1899_LEGACY=1` は割らない）
+        let ordered = if line_split::legacy_1899() {
+            ordered
+        } else {
+            line_split::split_by_lines(&self.text, ordered)
+        };
         let cursor = follow_changes(&ordered, self.cursor);
         let anchor = self.anchor.map(|anchor| follow_changes(&ordered, anchor));
         let composed;
@@ -7421,5 +7435,192 @@ mod tests {
                 change(end - 1..end, "")
             })
             .collect()
+    }
+
+    // --- #1899: 全文を 1 つの書き換えで返す整形を行ごとの置き換えへ割る ----------------------
+
+    /// 受け入れ条件 1・2: 全文を 1 つの書き換えで返す答え（10 万行の行末の空白を消す）でも、
+    /// undo へ積むのは行ごとの差（2 バイト + 箇所の表）だけで、undo 1 回で戻る。当てた本文は
+    /// 行ごとの答え（#1869 の形）を当てたときとバイト一致（#1899 前は先頭の行末〜末尾の行末の
+    /// 1 か所 = 本文 2 本ぶん約 17 MB を積み、予算 8 MB を超えてその前の打鍵の履歴を捨てていた）
+    #[test]
+    fn 全文を_1_つで返す整形も行ごとの差だけを積み_undo_1_回で戻る_1899() {
+        let original = hundred_thousand_lines();
+        let mut b = TextBuffer::from_text(path("whole.rs"), original.clone());
+        b.set_cursor(0, false);
+        b.insert("//");
+        let typed = b.text().to_string();
+        // 同じ整形を行ごとの答えで当てた本文（バイト一致の基準）
+        let mut per_line = TextBuffer::from_text(path("per-line.rs"), typed.clone());
+        per_line
+            .apply_changes(trailing_space_changes(&typed), None)
+            .unwrap();
+        let expected = per_line.text().to_string();
+        b.set_cursor(0, false);
+        let applied = b
+            .apply_changes(vec![change(0..typed.len(), &expected)], None)
+            .unwrap();
+        assert_eq!(applied.changes, 100_000, "行ごとへ割った箇所の数");
+        assert_eq!(b.text(), expected, "割っても当てた本文はバイト一致");
+        let bytes = b.undo_history_bytes();
+        // 行ごとの差の合計（2 バイト × 10 万）+ 箇所の表 + 打鍵の塊。割らなければ本文 2 本ぶん
+        let per_span = std::mem::size_of::<DeltaSpan>();
+        assert!(
+            bytes <= 100_000 * (2 + per_span) + 4096,
+            "行ごとの差の合計を超えて積んだ（{bytes}）"
+        );
+        assert!(bytes <= UNDO_BYTE_LIMIT);
+        assert_eq!(b.undo_depth(), 2, "打鍵の塊 + 整形 1 件");
+        assert_eq!(b.line_starts(), &compute_line_starts(b.text())[..]);
+        assert!(b.undo());
+        assert_eq!(b.text(), typed, "undo 1 回で整形の前とバイト一致");
+        assert!(b.undo());
+        assert_eq!(b.text(), original, "その前の打鍵も戻れる");
+        assert!(b.redo());
+        assert!(b.redo());
+        assert_eq!(b.text(), expected);
+        assert_eq!(b.undo_history_bytes(), bytes, "往復で履歴は増えない");
+    }
+
+    /// 全文の書き換えの中にあるカーソルは、割った後は同じ行の同じ中身に留まる（割らないと
+    /// 書き換えの頭からの距離を保つだけなので、上の行が縮むと下の行へずれる）。
+    /// 割るのは割って軽くなるときだけ（行末の空白 3 か所 = 3 × (2 + 24) < 本文 2 本ぶん）
+    #[test]
+    fn 割るとカーソルは同じ行の同じ中身に留まる_1899() {
+        let text = "let alpha = 1;  \nlet beta = 2;  \nlet gamma = 3;  \nend\n";
+        let formatted = "let alpha = 1;\nlet beta = 2;\nlet gamma = 3;\nend\n";
+        let mut b = TextBuffer::from_text(path("cursor.rs"), text.into());
+        b.set_selection(text.find("beta").unwrap(), text.find("gamma").unwrap());
+        let applied = b
+            .apply_changes(vec![change(0..text.len(), formatted)], None)
+            .unwrap();
+        assert_eq!(applied.changes, 3, "行ごとへ割った");
+        assert_eq!(b.text(), formatted);
+        assert_eq!(&b.text()[b.cursor()..b.cursor() + 5], "gamma");
+        assert_eq!(
+            b.anchor(),
+            formatted.find("beta"),
+            "選択端も `beta` に留まる"
+        );
+        assert!(b.undo());
+        assert_eq!(b.text(), text);
+        assert_eq!(b.cursor(), text.find("gamma").unwrap());
+    }
+
+    /// 受け入れ条件 4: 境界（空の文書・末尾の改行の有無・CRLF・整形しても同じ）
+    #[test]
+    fn 境界でも全文の書き換えをバイト一致で当て_undo_で戻る_1899() {
+        let newline = TextBuffer::from_text(path("nl.rs"), String::new())
+            .line_ending()
+            .as_str()
+            .to_string();
+        let cases: [(&str, &str, String); 6] = [
+            // 空の文書（空の文書の改行は OS の既定 = Windows は CRLF。#1650）
+            ("", "fn main() {}\n", format!("fn main() {{}}{newline}")),
+            // 末尾に改行の無い文書
+            ("a  \nb  ", "a\nb", "a\nb".into()),
+            // 末尾の改行を足す / 消す
+            ("a  \nb", "a\nb\n", "a\nb\n".into()),
+            ("a  \nb\n", "a\nb", "a\nb".into()),
+            // CRLF の文書へ LF の全文が返る（入れる改行は CRLF へ揃う）
+            (
+                "fn a(){  \r\nx  \r\n}\r\n",
+                "fn a() {\n    x\n}\n",
+                "fn a() {\r\n    x\r\n}\r\n".into(),
+            ),
+            // 中身の違う行と空白だけ違う行の混在・行の増減
+            (
+                "fn f(){\nlet v = foo(aa, bb);\n  let y=2;  \n\n\n}\n",
+                "fn f() {\n    let v = foo(\n        aa,\n        bb,\n    );\n    let y = 2;\n}\n",
+                "fn f() {\n    let v = foo(\n        aa,\n        bb,\n    );\n    let y = 2;\n}\n"
+                    .into(),
+            ),
+        ];
+        for (before, after, expected) in cases {
+            let mut b = TextBuffer::from_text(path("edge.rs"), before.into());
+            b.apply_changes(vec![change(0..before.len(), after)], None)
+                .unwrap();
+            assert_eq!(b.text(), expected, "{before:?}");
+            assert_eq!(b.line_starts(), &compute_line_starts(b.text())[..]);
+            assert_eq!(b.undo_depth(), 1, "{before:?}");
+            assert!(b.undo());
+            assert_eq!(b.text(), before, "{before:?}");
+            assert!(b.redo());
+            assert_eq!(b.text(), expected, "{before:?}");
+        }
+        // 整形しても同じ全文: 何もしない（版も履歴も進まない）
+        let text = "fn a() {\n    x\n}\n";
+        let mut b = TextBuffer::from_text(path("same.rs"), text.into());
+        let version = b.version();
+        let applied = b
+            .apply_changes(vec![change(0..text.len(), text)], None)
+            .unwrap();
+        assert_eq!(applied.changes, 0);
+        assert_eq!((b.version(), b.undo_depth()), (version, 0));
+    }
+
+    /// 乱数の文書と、その字下げ・行末の空白・行の増減・中身を変えた全文で、当てた本文が
+    /// 全文とバイト一致し、undo / redo で往復する（多バイトの行・CRLF を含む）
+    #[test]
+    fn 乱数の全文の書き換えも往復でバイト一致する_1899() {
+        let mut seed: u64 = 0x1899_1899;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        let words = ["let x = 1;", "}", "", "fn 名前() {", "😀 // c", "x", "{"];
+        for round in 0..300 {
+            let crlf = round % 3 == 0;
+            let eol = if crlf { "\r\n" } else { "\n" };
+            let lines: Vec<String> = (0..next(25))
+                .map(|_| {
+                    format!(
+                        "{}{}{}",
+                        " ".repeat(next(3) * 2),
+                        words[next(words.len())],
+                        " ".repeat(next(2))
+                    )
+                })
+                .collect();
+            let mut formatted: Vec<String> = Vec::new();
+            for line in &lines {
+                match next(6) {
+                    0 => {}
+                    1 => {
+                        formatted.push(line.clone());
+                        formatted.push(format!("    {}", words[next(words.len())]));
+                    }
+                    2 => formatted.push(format!("r{}", next(9))),
+                    _ => formatted.push(format!("{}{}", "  ".repeat(next(3)), line.trim())),
+                }
+            }
+            let join = |lines: &[String], last: bool| {
+                let mut s = lines.join(eol);
+                if last && !lines.is_empty() {
+                    s.push_str(eol);
+                }
+                s
+            };
+            let before = join(&lines, next(2) == 0);
+            let mut b = TextBuffer::from_text(path("random.rs"), before.clone());
+            b.set_cursor(snap_cursor(&before, next(before.len() + 1)), false);
+            // サーバは LF で返す（バッファの流儀へ揃うのを確かめる。改行の無い文書の流儀は
+            // OS の既定なので、期待値はバッファの流儀から組む）
+            let answer = join(&formatted, next(2) == 0).replace("\r\n", "\n");
+            let expected = normalize_line_endings(&answer, b.line_ending()).into_owned();
+            b.apply_changes(vec![change(0..before.len(), &answer)], None)
+                .unwrap();
+            assert_eq!(b.text(), expected, "round {round}: {before:?}");
+            assert!(b.text().is_char_boundary(b.cursor()));
+            assert_eq!(b.line_starts(), &compute_line_starts(b.text())[..]);
+            if before != expected {
+                assert!(b.undo());
+                assert_eq!(b.text(), before, "round {round}");
+                assert!(b.redo());
+                assert_eq!(b.text(), expected, "round {round}");
+            }
+        }
     }
 }

@@ -62,7 +62,8 @@
 //! 当たった 1 つ**（`method` / `uri_suffix` で絞る）で、`result`（`TextEdit` の配列をそのまま返す）/
 //! `error`（`{ code, message }` でエラー応答）/ `silent` / `crash` / `hold_until`（そのファイルが
 //! できるまで答えない。待つあいだに届いた通知は答えた後に読む = #1930）/ `reverse`（既定の答えを
-//! 逆順で返す）を持つ。
+//! 逆順で返す）/ `whole`（既定の整形を当てた全文を、文書全体を置き換える 1 つの `TextEdit` で
+//! 返す = 行単位の差分を返さないサーバの形。#1899）を持つ。
 //! 当たる規則が無い・`result` も `error` も無ければ**既定の整形**: 自分の本文の模型（下記）から
 //! 行末の空白（スペースとタブ）を消す `TextEdit` を作る（範囲の整形は範囲に収まる行末だけ）。
 //! 本文の模型から作るので、tako が送った `didChange` がずれていれば答えもずれる。
@@ -696,38 +697,70 @@ fn format_rule<'a>(
     })
 }
 
-/// 既定の整形（#1683）: 行末の空白を消す。`within` は範囲の整形の範囲（バイト位置）
+/// 既定の整形（#1683）が消す行末の空白: `(行, 消す範囲の始まり, 終わり)`（バイト位置）。
+/// `within` は範囲の整形の範囲（バイト位置）
+fn trailing_spaces(
+    text: &str,
+    breaks: Breaks,
+    within: Option<(usize, usize)>,
+) -> Vec<(usize, usize, usize)> {
+    let starts = line_starts(text, breaks);
+    let mut out = Vec::new();
+    for line in 0..starts.len() {
+        let (start, end) = line_span(text, &starts, line, breaks);
+        let kept = text[start..end].trim_end_matches([' ', '\t']).len();
+        let (from, to) = (start + kept, end);
+        if from == to || within.is_some_and(|(a, b)| from < a || to > b) {
+            continue;
+        }
+        out.push((line, from, to));
+    }
+    out
+}
+
+/// 既定の整形（#1683）: 行末の空白を消す `TextEdit` を行ごとに返す
 fn trailing_space_edits(
     text: &str,
     breaks: Breaks,
     within: Option<(usize, usize)>,
 ) -> Vec<serde_json::Value> {
     let starts = line_starts(text, breaks);
-    let mut edits = Vec::new();
-    for line in 0..starts.len() {
-        let (start, end) = line_span(text, &starts, line, breaks);
-        let content = &text[start..end];
-        let kept = content.trim_end_matches([' ', '\t']).len();
-        if kept == content.len() {
-            continue;
-        }
-        let (from, to) = (start + kept, end);
-        if within.is_some_and(|(a, b)| from < a || to > b) {
-            continue;
-        }
-        // 位置はこの行の中だけで数える（`range_json` は呼ぶたびに行頭の表を作り直すので、
-        // 10 万行の答えを作ると本文の長さ × 10 万になる = #1869 の 10 万行の整形の検証で詰まった）
-        let utf16 = |s: &str| s.chars().map(char::len_utf16).sum::<usize>();
-        let (first, whole) = (utf16(&content[..kept]), utf16(content));
-        edits.push(serde_json::json!({
-            "range": {
-                "start": { "line": line, "character": first },
-                "end": { "line": line, "character": whole },
-            },
-            "newText": "",
-        }));
+    // 位置はこの行の中だけで数える（`range_json` は呼ぶたびに行頭の表を作り直すので、
+    // 10 万行の答えを作ると本文の長さ × 10 万になる = #1869 の 10 万行の整形の検証で詰まった）
+    let utf16 = |s: &str| s.chars().map(char::len_utf16).sum::<usize>();
+    trailing_spaces(text, breaks, within)
+        .into_iter()
+        .map(|(line, from, to)| {
+            let start = starts[line];
+            serde_json::json!({
+                "range": {
+                    "start": { "line": line, "character": utf16(&text[start..from]) },
+                    "end": { "line": line, "character": utf16(&text[start..to]) },
+                },
+                "newText": "",
+            })
+        })
+        .collect()
+}
+
+/// 規則の `whole: true`（#1899）: 既定の整形を当てた全文を、文書全体を置き換える
+/// **1 つの** `TextEdit` で返す（行単位の差分を返さず全文を書き換えるサーバの形）
+fn whole_document_edit(
+    text: &str,
+    breaks: Breaks,
+    within: Option<(usize, usize)>,
+) -> serde_json::Value {
+    let mut formatted = String::with_capacity(text.len());
+    let mut at = 0;
+    for (_, from, to) in trailing_spaces(text, breaks, within) {
+        formatted.push_str(&text[at..from]);
+        at = to;
     }
-    edits
+    formatted.push_str(&text[at..]);
+    serde_json::json!({
+        "range": range_json(text, breaks, 0, text.len()),
+        "newText": formatted,
+    })
 }
 
 /// 補完の候補（#1682。冒頭の説明の `items` / `generate` / `word_edit`）
@@ -1427,7 +1460,11 @@ fn main() {
                     };
                     (at("start"), at("end"))
                 });
-                let mut edits = trailing_space_edits(&text, breaks, within);
+                let mut edits = if rule.is_some_and(|r| r["whole"].as_bool() == Some(true)) {
+                    vec![whole_document_edit(&text, breaks, within)]
+                } else {
+                    trailing_space_edits(&text, breaks, within)
+                };
                 if rule.is_some_and(|r| r["reverse"].as_bool() == Some(true)) {
                     edits.reverse();
                 }
