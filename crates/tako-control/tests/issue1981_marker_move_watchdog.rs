@@ -26,6 +26,7 @@ use tako_core::prompt_append::{self, MARKER};
 
 /// **本番の data dir と HOME を読ませない**。このバイナリ全体で同じ 1 か所を指す
 /// （`migrations::run` はプロファイルを全部走査するので、テスト同士は [`serial`] で直列にする）
+// tako:env-write-ok このバイナリの全テストが先にこれを通し（serial() で 1 本ずつ）、入れる値は 1 つ（OnceLock）で書き換えはこの 1 回だけ（#2400）
 fn sandbox() -> &'static PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {

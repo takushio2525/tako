@@ -1213,8 +1213,40 @@ CI（env なし）では緑のテストが手元でだけ落ちる（偽の赤�
 - **番犬**: `crates/tako-control/tests/issue2204_usage_codex_watchdog.rs` の
   `libのテストはusageの読むenvを書き換えない` が、`crates/*/src` の `set_var(` / `remove_var(` の
   第 1 引数が usage の読む env（S1 / S2 / S5 の A/B・`CONFIG_DIRS_ENV`・`CODEX_HOMES_ENV`）を指す行を
-  `file:line` で落とす。usage 以外の env は見ない（既存の `TEST_ENV_LOCK` で直列にしている
-  モジュールがある）
+  `file:line` で落とす。usage 以外の env と、テストのコード全体の書き換えは下の #2400 の番犬が見る
+  （こちらは usage の env なら製品のコードの書き換えも、`run_alone!` の子の中の書き換えも落とす）
+
+## テストはプロセスの env を書き換えない（書くならその 1 本だけの子で。Issue #2400）
+
+**テスト（`crates/*/src` の `#[cfg(test)]` と `crates/*/tests`）は `std::env::set_var` / `remove_var` で
+プロセスの env を書き換えない。** env はプロセスに 1 つで、`cargo test` は 1 つのテストバイナリの中で
+テストを並列に走らせる。lib のテストは crate ごとに数千本が 1 プロセスに乗り、モジュールごとの
+`Mutex` は**別のモジュールの読み手**を止めない。上の #2391 は「走らせた人の env で結果を変えない」、
+#2395 は「lib のテストで usage の A/B を立てない」。この節はその全体版（どの env でも、結合テストでも）。
+
+- 実物: `remote` のテストが `TEST_ENV_LOCK` の下で `TAKO_841_LEGACY=1` を立てた窓に、
+  `platform::local_endpoint` のテストが別の `ENV_LOCK` の下で `verify_peer` を引き、
+  「tailscaled でない接続は拒否」が `NotRequired` に化けて落ちた（窓を広げる注入で 3/3）。
+  `HomeGuard`（`HOME`）・setup の `TAKO_DATA_DIR`・`TAKO_USER_TASKS_FILE` は並走する全部のテストの
+  置き場を差し替えていた
+- **書き方（上から順に）**: ① 判定を純粋関数に分けられるなら値を引数で渡す（#2395 の `walk_with`。
+  usage の env はこれしか通らない）。② env を読む入口そのものを見るなら、テストの頭で
+  `if tako_core::run_alone!(<テスト名>) { return; }` を通す（`tako_core::test_child`。親は自分の
+  テストバイナリを `--exact <名前> --include-ignored --test-threads=1` で起こし直し、子が 1 本を
+  通したことだけを見る。子のプロセスには他のテストが居ないので本文の `set_var` は漏れない）。
+  親が env を外すだけなら `rerun_alone(<名前>, &[外す env])`（結合テストは #2391 の `rerun_without`）
+- **書き換えるヘルパ**（`HomeGuard::set` / `t1479_env` / `EnvGuard::set` / `LegacyEnv::set`）は頭で
+  `tako_core::test_child::assert_alone("<名前>")` を呼ぶ。子の外で呼ばれたら panic するので、
+  呼び出し側が `run_alone!` を通し忘れても漏れる前に名指しされる
+- **やらない**: モジュールごとの `Mutex` で書き換えを囲んで済ませる（同じロックを取らない読み手が
+  別のモジュールに居る）。直列化は最後の手段で、使うなら下の目印に理由を書く
+- **番犬**: `crates/tako-control/tests/issue2400_test_env_write_watchdog.rs` が、テストの中の
+  `set_var(` / `remove_var(` を `file:line` で落とす。通すのは 3 つだけ:
+  (a) `crates/*/tests/*.rs` でテストが 1 本だけのバイナリ（2 本目を足すと落ちる）
+  (b) 囲む関数が書き換えより前に `run_alone!` / `rerun_alone` / `assert_alone` / `rerun_without` を通す
+  (c) 書き換えの段落か囲む関数の doc に `// tako:env-write-ok <理由>`（例: バイナリの全テストが
+  同じ `serial()` で 1 本ずつ走る・読み手が全部先に通す OnceLock で値は 1 つ）。コメントと文字列の中は数えない
+- 製品のコード（`TAKO_SELF_TEST` のセルフテスト・visual-test・`main` の一括隔離）は範囲外
 
 ## プロセスの生死は境界の 1 実装で決める（Issue #1557 / #1581）
 

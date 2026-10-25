@@ -61,6 +61,7 @@ unsafe extern "system" {
 
 /// テストを 1 本ずつ通す（env と固定のロックを共有するため）。出荷構成に合わせて
 /// 自分のコンソールも手放す
+// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn serial() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -75,6 +76,7 @@ fn serial() -> MutexGuard<'static, ()> {
 }
 
 /// 注入を立てた状態で spawn し、すぐ下ろす（注入は spawn の時点で読まれる）
+// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn with_env<T>(pairs: &[(&str, &str)], spawn: impl FnOnce() -> T) -> T {
     for (key, value) in pairs {
         std::env::set_var(key, value);

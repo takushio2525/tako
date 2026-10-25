@@ -74,6 +74,7 @@ impl Drop for Trial {
 }
 
 /// 本番と同じ経路（`wrap_spawn`）で器の中にシェルを立てる
+// tako:env-write-ok このバイナリの 2 本はどちらも同じく外すだけで、入れるテストは無い（器の中で走らせた cargo test が入れ子ガードに弾かれないため。#2400）
 fn spawn_wrapped(bin: &str, socket: &str, tag: &str) -> TerminalSession {
     // このテスト自身が器の中で走ると入れ子ガードに弾かれる。本番の tako-app は器の外
     unsafe {

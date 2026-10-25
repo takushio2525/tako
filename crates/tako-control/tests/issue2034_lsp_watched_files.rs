@@ -448,6 +448,7 @@ fn git_checkout_相当の差し替えを種別つきで知らせる() {
 /// 受け入れ条件 2（A/B）: 旧腕（`TAKO_2034_LEGACY=1`）は申告せず、登録を受けても見ない =
 /// 外で整形した後も古い行で答え、tako がディスクから読む抜粋は別の行（= 位置がずれる）
 #[test]
+// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 旧腕では外で整形した後も古い位置のまま() {
     let _serial = serial();
     // 外から渡された A/B の値は終わったら戻す（`TAKO_2034_LEGACY=1` で全体を回すと新腕のテストが落ちる）
@@ -650,6 +651,7 @@ fn アイドルでは何も送らない() {
 /// 知らせるので整形後の行（tako の GUI は文書を実パスで開くので、この差は根がリンクを通る経路でだけ出る）
 #[test]
 #[ignore = "実の rust-analyzer が要る（TAKO_2034_REAL_RA）"]
+// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 実の_rust_analyzer_でリンクを通る根でも整形後の行で返る() {
     let _serial = serial();
     let Some(ra) = std::env::var_os("TAKO_2034_REAL_RA") else {
