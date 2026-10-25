@@ -35,6 +35,14 @@ check_eq() {
 check_has() {
   if grep -qF -- "$3" <<<"$2"; then pass "$1"; else fail "$1（'${3}' が無い: ${2}）"; fi
 }
+# 表示言語に従う断り（#2365）は日英どちらかの形で当たればよい（$3 = 日本語 / $4 = 英語）
+check_has_either() {
+  if grep -qF -- "$3" <<<"$2" || grep -qF -- "$4" <<<"$2"; then
+    pass "$1"
+  else
+    fail "$1（'${3}' / '${4}' が無い: ${2}）"
+  fi
+}
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/tako-1842-XXXXXX")"
 TMP="$(cd "$TMP" && pwd -P)"
@@ -137,7 +145,8 @@ ERR="$("$TAKO_BIN" file move "$W/src/race.txt" "$W/dst" 2>&1)"
 RC=$?
 echo "  観測（CLI ファイル）: rc=${RC} $(sed "s#${TMP}#<TMP>#g" <<<"$ERR")"
 [ "$RC" -ne 0 ] && pass "CLI: 隙間に同名ができた移動は失敗で返る" || fail "CLI: 隙間に同名ができたのに移した"
-check_has "CLI: 断った理由が応答に出る" "$ERR" "移動先に同じ名前がある（上書きしない）"
+check_has_either "CLI: 断った理由が応答に出る" "$ERR" "移動先に同じ名前がある（上書きしない）" \
+  "the destination already has an item with the same name (not overwritten)"
 check_eq "CLI: 元のファイルが元の場所に残る" "元の中身" "$(cat "$W/src/race.txt" 2>/dev/null)"
 check_eq "CLI: 割り込んだ同名のファイルの中身が残る" "tako-1842-race" "$(cat "$W/dst/race.txt" 2>/dev/null)"
 
@@ -145,7 +154,7 @@ ERR="$("$TAKO_BIN" file move "$W/src/race-dir" "$W/dst" 2>&1)"
 RC=$?
 echo "  観測（CLI フォルダ）: rc=${RC} $(sed "s#${TMP}#<TMP>#g" <<<"$ERR")"
 [ "$RC" -ne 0 ] && pass "CLI: 空のフォルダが割り込んだ移動も失敗で返る" || fail "CLI: 空のフォルダを置き換えて移した"
-check_has "CLI: フォルダでも断った理由が出る" "$ERR" "同じ名前"
+check_has_either "CLI: フォルダでも断った理由が出る" "$ERR" "同じ名前" "the same name"
 [ -d "$W/src/race-dir/inner" ] && pass "CLI: 元のフォルダが中身ごと残る" || fail "CLI: 元のフォルダが消えた"
 if [ -d "$W/dst/race-dir" ] && [ ! -e "$W/dst/race-dir/inner" ]; then
   pass "CLI: 割り込んだ空のフォルダがそのまま残る"
@@ -156,7 +165,9 @@ fi
 RES="$(mcp_call tako_file_op "$(jq -n -c --arg p "$W/src/race-mcp.txt" --arg d "$W/dst" '{op:"move",path:$p,dest:$d}')")"
 echo "  観測（MCP）: $(sed "s#${TMP}#<TMP>#g" <<<"$RES")"
 check_eq "MCP: 隙間に同名ができた移動はエラーで返る" "true" "$(jq -r '.isError // false' <<<"$RES")"
-check_has "MCP: 断った理由が応答に出る" "$(jq -r '.content[0].text' <<<"$RES")" "移動先に同じ名前がある（上書きしない）"
+check_has_either "MCP: 断った理由が応答に出る" "$(jq -r '.content[0].text' <<<"$RES")" \
+  "移動先に同じ名前がある（上書きしない）" \
+  "the destination already has an item with the same name (not overwritten)"
 check_eq "MCP: 元のファイルが残る" "MCP の元" "$(cat "$W/src/race-mcp.txt" 2>/dev/null)"
 check_eq "MCP: 割り込んだ同名の中身が残る" "tako-1842-race" "$(cat "$W/dst/race-mcp.txt" 2>/dev/null)"
 

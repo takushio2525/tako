@@ -270,16 +270,17 @@ done
 check_eq "CLI [1] ファイルを移す" '{"followed":[{"from":"<WS>/src/a.txt","pane":"<PANE>","to":"<WS>/dst/a.txt"}],"from":"<WS>/src/a.txt","kind":"file","moved":true,"to":"<WS>/dst/a.txt"}' "$(cat "$TMP/cli-1.norm")"
 check_eq "CLI [2] フォルダを移すと配下の表示ペインが付け替わる" '{"followed":[{"from":"<WS>/folder/inner/x.txt","pane":"<PANE>","to":"<WS>/dst/folder/inner/x.txt"}],"from":"<WS>/folder","kind":"dir","moved":true,"to":"<WS>/dst/folder"}' "$(cat "$TMP/cli-2.norm")"
 case "$(cat "$TMP/cli-3.norm")" in
-  *同じ名前*) pass "CLI [3] 同名は理由つきで断る" ;;
+  # 断りの文は表示言語に従う（#2365）ので日英どちらの形でも当てる
+  *同じ名前* | *"the same name"*) pass "CLI [3] 同名は理由つきで断る" ;;
   *) fail "CLI [3] 同名の断り方: $(cat "$TMP/cli-3.norm")" ;;
 esac
 check_eq "同名の移動先を上書きしない" "既存" "$(cat "$A/taken/a.txt")"
 case "$(cat "$TMP/cli-4.norm")" in
-  *配下*) pass "CLI [4] 自分の配下へは理由つきで断る" ;;
+  *配下* | *"its own subfolder"*) pass "CLI [4] 自分の配下へは理由つきで断る" ;;
   *) fail "CLI [4] 配下の断り方: $(cat "$TMP/cli-4.norm")" ;;
 esac
 case "$(cat "$TMP/cli-5.norm")" in
-  *自分自身*) pass "CLI [5] 自分自身へは理由つきで断る" ;;
+  *自分自身* | *"into itself"*) pass "CLI [5] 自分自身へは理由つきで断る" ;;
   *) fail "CLI [5] 自分自身の断り方: $(cat "$TMP/cli-5.norm")" ;;
 esac
 [ -f "$A/日本 語/b.md" ] && pass "CLI [6] 日本語と空白を含むフォルダへ移せる" || fail "CLI [6] 日本語のフォルダへ移らない"

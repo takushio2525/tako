@@ -59,7 +59,8 @@ use crate::platform::fs_copy;
 use crate::platform::path::canonicalize;
 use crate::platform::support::Platform;
 
-/// コピーできない理由
+/// コピーできない理由。表示（`Display` / [`Self::reason`]）は表示言語に従う（#2365。日英の正本は
+/// [`Self::text_in`]）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyRefusal {
     /// コピー元が無い
@@ -88,6 +89,11 @@ pub enum CopyRefusal {
     NoSpace,
     /// OS が断った（中身は OS のエラー文）
     Io(String),
+    /// 写している途中で項目が見つからなくなった（読む側の NotFound。#2365 より前は `Io` の中身に
+    /// 日本語の文を入れていた = 表示は「OS が断った: 」に続く形のまま）
+    Vanished(PathBuf),
+    /// 写す処理が 1 件も走らなかった（background の結果が空。#2365 より前は `Io` の中身）
+    NotRun,
     /// 取り消した（#1867。作りかけは消してある）
     Cancelled,
 }
@@ -108,35 +114,86 @@ impl CopyRefusal {
             Self::Special(_) => "special",
             Self::SymlinkPrivilege(_) => "symlink_privilege",
             Self::NoSpace => "no_space",
-            Self::Io(_) => "io",
+            // #2365 より前は `Io` に入れていたので分類は変えない
+            Self::Io(_) | Self::Vanished(_) | Self::NotRun => "io",
             Self::Cancelled => "cancelled",
         }
     }
 
-    /// 理由（日本語。dispatch のエラー文と同じ流儀。画面の文言は `ui_text` が持つ）
+    /// 理由（表示言語。dispatch のエラー文と同じ流儀。画面の短い文言は `ui_text` が持つ）
     pub fn reason(&self) -> String {
-        match self {
-            Self::SourceMissing => "コピー元が見つからない".into(),
-            Self::DestNotDir => "貼り付け先がフォルダではない".into(),
-            Self::NoName => "コピー元に名前が無い".into(),
-            Self::IntoSelf => "フォルダを自分自身の中へはコピーできない".into(),
-            Self::IntoDescendant => "フォルダを自分の配下へはコピーできない".into(),
-            Self::NameTaken => "貼り付け先に同じ名前ができた（上書きしない）".into(),
-            Self::NamesExhausted => "空いている名前が見つからない（上書きしない）".into(),
-            Self::Unreadable(p) => format!("読めない項目がある: {}", p.display()),
-            Self::Unwritable(p) => format!("書き込めない: {}", p.display()),
-            Self::Special(p) => format!(
+        self.text_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての文言（#2365）。(バリアント, 言語) の網羅 match なので、バリアントを
+    /// 足すと日英の両方を書くまでコンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    /// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）。
+    /// `Io` の中身（OS のエラー文）とパスは言語に依らずそのまま載せる
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::SourceMissing, Ja) => "コピー元が見つからない".into(),
+            (Self::SourceMissing, En) => "the item to copy was not found".into(),
+            (Self::DestNotDir, Ja) => "貼り付け先がフォルダではない".into(),
+            (Self::DestNotDir, En) => "the paste destination is not a folder".into(),
+            (Self::NoName, Ja) => "コピー元に名前が無い".into(),
+            (Self::NoName, En) => "the item to copy has no name".into(),
+            (Self::IntoSelf, Ja) => "フォルダを自分自身の中へはコピーできない".into(),
+            (Self::IntoSelf, En) => "cannot copy a folder into itself".into(),
+            (Self::IntoDescendant, Ja) => "フォルダを自分の配下へはコピーできない".into(),
+            (Self::IntoDescendant, En) => "cannot copy a folder into its own subfolder".into(),
+            (Self::NameTaken, Ja) => "貼り付け先に同じ名前ができた（上書きしない）".into(),
+            (Self::NameTaken, En) => {
+                "an item with the same name appeared at the paste destination (not overwritten)"
+                    .into()
+            }
+            // 「見つからない」の読み（`DispatchError::says_not_found`）を日英でそろえる
+            (Self::NamesExhausted, Ja) => "空いている名前が見つからない（上書きしない）".into(),
+            (Self::NamesExhausted, En) => "a free name was not found (not overwritten)".into(),
+            (Self::Unreadable(p), Ja) => format!("読めない項目がある: {}", p.display()),
+            (Self::Unreadable(p), En) => format!("an item cannot be read: {}", p.display()),
+            (Self::Unwritable(p), Ja) => format!("書き込めない: {}", p.display()),
+            (Self::Unwritable(p), En) => format!("cannot write: {}", p.display()),
+            (Self::Special(p), Ja) => format!(
                 "特殊なファイル（FIFO・ソケット・デバイス）はコピーできない: {}",
                 p.display()
             ),
-            Self::SymlinkPrivilege(p) => format!(
+            (Self::Special(p), En) => format!(
+                "special files (FIFOs, sockets, devices) cannot be copied: {}",
+                p.display()
+            ),
+            (Self::SymlinkPrivilege(p), Ja) => format!(
                 "シンボリックリンクを作る権限が無い（Windows は開発者モードか管理者が要る）: {}",
                 p.display()
             ),
-            Self::NoSpace => "空き容量が足りない".into(),
-            Self::Io(e) => format!("OS が断った: {e}"),
-            Self::Cancelled => "取り消した（作りかけは消した）".into(),
+            (Self::SymlinkPrivilege(p), En) => format!(
+                "no permission to create a symbolic link (Windows needs Developer Mode or \
+                 administrator rights): {}",
+                p.display()
+            ),
+            (Self::NoSpace, Ja) => "空き容量が足りない".into(),
+            (Self::NoSpace, En) => "not enough free space".into(),
+            (Self::Io(e), Ja) => format!("OS が断った: {e}"),
+            (Self::Io(e), En) => format!("the OS refused: {e}"),
+            (Self::Vanished(p), Ja) => format!(
+                "OS が断った: コピーの途中で見つからなくなった: {}",
+                p.display()
+            ),
+            (Self::Vanished(p), En) => format!(
+                "the OS refused: the item disappeared during the copy: {}",
+                p.display()
+            ),
+            (Self::NotRun, Ja) => "OS が断った: コピーが走らなかった".into(),
+            (Self::NotRun, En) => "the OS refused: the copy did not run".into(),
+            (Self::Cancelled, Ja) => "取り消した（作りかけは消した）".into(),
+            (Self::Cancelled, En) => "cancelled (the partial copy was removed)".into(),
         }
+    }
+}
+
+impl std::fmt::Display for CopyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason())
     }
 }
 
@@ -553,10 +610,7 @@ fn probe_readable(path: &Path) -> Result<(), CopyRefusal> {
 fn read_error(error: &std::io::Error, path: &Path) -> CopyRefusal {
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => CopyRefusal::Unreadable(path.to_path_buf()),
-        std::io::ErrorKind::NotFound => CopyRefusal::Io(format!(
-            "コピーの途中で見つからなくなった: {}",
-            path.display()
-        )),
+        std::io::ErrorKind::NotFound => CopyRefusal::Vanished(path.to_path_buf()),
         _ => CopyRefusal::Io(format!("{}: {error}", path.display())),
     }
 }
@@ -1443,7 +1497,10 @@ mod tests {
             );
         }
         assert_eq!(CopyRefusal::Cancelled.slug(), "cancelled");
-        assert!(CopyRefusal::Cancelled.reason().contains("取り消した"));
+        // 文言は表示言語に従う（#2365）ので、言語グローバルに触れずに日本語を引く
+        assert!(CopyRefusal::Cancelled
+            .text_in(Lang::Ja)
+            .contains("取り消した"));
         std::fs::remove_dir_all(&base).unwrap();
     }
 
@@ -2047,6 +2104,18 @@ mod tests {
             read_error(&denied, Path::new("/y")),
             CopyRefusal::Unreadable(PathBuf::from("/y"))
         );
-        assert!(CopyRefusal::NoSpace.reason().contains("空き容量"));
+        assert!(CopyRefusal::NoSpace.text_in(Lang::Ja).contains("空き容量"));
+        // 写している途中で消えた項目は「OS が断った: 」に続く形のまま（#2365 より前は `Io` の中身に
+        // 日本語の文を入れていた。英語表示に日本語を混ぜないようバリアントへ移した）
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            read_error(&gone, Path::new("/z")),
+            CopyRefusal::Vanished(PathBuf::from("/z"))
+        );
+        assert_eq!(
+            CopyRefusal::Vanished(PathBuf::from("/z")).text_in(Lang::Ja),
+            "OS が断った: コピーの途中で見つからなくなった: /z"
+        );
+        assert_eq!(CopyRefusal::Vanished(PathBuf::from("/z")).slug(), "io");
     }
 }

@@ -159,7 +159,7 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `CannotCombine` = `<a> と <b> は同時に指定できない` / `ExactlyOneOf` / `AtLeastOneOf` /
   `OneOfRequired` / `NotOneOf`）。移動・コピーの断り（`tako_core::file_move::MoveRefusal` /
   `file_copy::CopyRefusal` と、それを包む「移動できない」「コピーできない」「N 件すべてできなかった」）は
-  **理由ごと**続きで移す（包みだけ移すと英語の包み + 日本語の理由に混ざる）
+  **理由ごと**続きで移した（下の項。包みだけ移すと英語の包み + 日本語の理由に混ざる）
 - #2365 の続きで、**`tako mod ui` の断り（`tako_core::claude_mod_ui` の UiError 一式）**も同じ形にした。
   1 つの断りが理由・使える値・枠（「ui.json は書いていない」「使える値:」）からなるので、半分だけ
   移すと日英が混ざる = **1 本で移す**: 理由は `UiReason`、使える値は `Allowed`（語彙の語・id は日英で
@@ -173,6 +173,18 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `choices`）がまだ日本語なのでそろえて日本語（枠ごと移すのは #2365 の続き）。
   番犬は同じ `issue1762_dispatch_error_lang.rs`（末尾の節。実経路 `claude_mod_ui::run` の断りで
   英語表示に日本語が 1 字も無いことも見る）
+- #2365 の続きで、**ファイルの移動・コピーの断り**を理由ごと移した: 理由は tako-core の
+  `MoveRefusal::text_in` / `CopyRefusal::text_in`（`reason()` / `Display` は `i18n::lang()`）、包みは
+  dispatch の `Reason::MoveRefused` / `CopyRefused`（「移動できない」「コピーできない」）と、全部断られた
+  ときに並べる `Reason::AllFailed`（N 件すべてできなかった）/ `PasteAllFailed`（貼り付けできない
+  （N 件すべて））。包みは理由を**値で持って同じ言語で引く**（文字列で受けると作った時点の言語に固まる）。
+  `Io(String)` の中身は OS のエラー文だけにする（tako が書く文を入れると英語表示に日本語が残る）ので、
+  旧 `Io` に入れていた「コピーの途中で見つからなくなった」「コピーが走らなかった」は `CopyRefusal::Vanished` /
+  `NotRun` にした（表示は旧 `Io` の形のまま・分類 `slug` は `io` のまま）。文言で判定する呼び手
+  （GUI の `is_copy_cancelled`・visual-test・単体テスト・検証スクリプト）は日英どちらの形とも突き合わせる。
+  番犬は同じ `issue1762_dispatch_error_lang.rs`（tako-core のエラー型の節 + 包みと理由の全組み合わせ）、
+  実経路は `tests/issue2365_move_copy_lang.rs`（GUI 無しのホストへ dispatch を渡し、移動・コピー・
+  まとめた操作・貼り付けの断りで英語表示に日本語が 1 字も無いことと日本語の旧文とのバイト一致を見る）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

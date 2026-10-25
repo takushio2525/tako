@@ -297,9 +297,13 @@ pub(crate) fn tree_row_shapes(rows: &[filetree::Row]) -> Vec<tako_core::tree_sel
         .collect()
 }
 
-/// コピーの断りが「取り消した」か（文面の正本は `tako_core::file_copy::CopyRefusal::Cancelled`）
+/// コピーの断りが「取り消した」か（文面の正本は `tako_core::file_copy::CopyRefusal::Cancelled`）。
+/// 断りの文は作った時点の表示言語で書かれる（#2365）ので、日英どちらの形でも当てる
 pub(crate) fn is_copy_cancelled(text: &str) -> bool {
-    text.contains(&tako_core::file_copy::CopyRefusal::Cancelled.reason())
+    use tako_core::i18n::Lang;
+    [Lang::Ja, Lang::En]
+        .into_iter()
+        .any(|lang| text.contains(&tako_core::file_copy::CopyRefusal::Cancelled.text_in(lang)))
 }
 
 /// バイト数の表記（帯に出す。1024 刻み・小数 1 桁）

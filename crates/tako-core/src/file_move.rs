@@ -35,7 +35,8 @@ use std::path::{Path, PathBuf};
 use crate::platform::fs_move::rename_noreplace;
 use crate::platform::path::canonicalize;
 
-/// 移せない理由
+/// 移せない理由。表示（`Display` / [`Self::reason`]）は表示言語に従う（#2365。日英の正本は
+/// [`Self::text_in`]）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MoveRefusal {
     /// 移す元が無い
@@ -80,22 +81,53 @@ impl MoveRefusal {
         }
     }
 
-    /// 理由（日本語。dispatch のエラー文と同じ流儀。画面の文言は `ui_text` が持つ）
+    /// 理由（表示言語。dispatch のエラー文と同じ流儀。画面の短い札は `ui_text` が持つ）
     pub fn reason(&self) -> String {
-        match self {
-            Self::SourceMissing => "移す元が見つからない".into(),
-            Self::DestNotDir => "移動先がフォルダではない".into(),
-            Self::NoName => "移す元に名前が無い".into(),
-            Self::IntoSelf => "フォルダを自分自身へは移せない".into(),
-            Self::IntoDescendant => "フォルダを自分の配下へは移せない".into(),
-            Self::NameTaken => "移動先に同じ名前がある（上書きしない）".into(),
-            Self::CrossDevice => {
+        self.text_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての文言（#2365）。(バリアント, 言語) の網羅 match なので、バリアントを
+    /// 足すと日英の両方を書くまでコンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    /// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）。
+    /// `Io` の中身（OS のエラー文）は言語に依らずそのまま載せる
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::SourceMissing, Ja) => "移す元が見つからない".into(),
+            (Self::SourceMissing, En) => "the item to move was not found".into(),
+            (Self::DestNotDir, Ja) => "移動先がフォルダではない".into(),
+            (Self::DestNotDir, En) => "the destination is not a folder".into(),
+            (Self::NoName, Ja) => "移す元に名前が無い".into(),
+            (Self::NoName, En) => "the item to move has no name".into(),
+            (Self::IntoSelf, Ja) => "フォルダを自分自身へは移せない".into(),
+            (Self::IntoSelf, En) => "cannot move a folder into itself".into(),
+            (Self::IntoDescendant, Ja) => "フォルダを自分の配下へは移せない".into(),
+            (Self::IntoDescendant, En) => "cannot move a folder into its own subfolder".into(),
+            (Self::NameTaken, Ja) => "移動先に同じ名前がある（上書きしない）".into(),
+            (Self::NameTaken, En) => {
+                "the destination already has an item with the same name (not overwritten)".into()
+            }
+            (Self::CrossDevice, Ja) => {
                 "別のボリュームへは移せない（コピーしてから元を消す移動は未対応）".into()
             }
-            Self::Remote => "リモート（SSH）の項目は移せない".into(),
-            Self::WorkspaceRoot => "ワークスペースのフォルダ（見出し）は移せない".into(),
-            Self::Io(e) => format!("OS が断った: {e}"),
+            (Self::CrossDevice, En) => {
+                "cannot move to another volume (moving by copying and then deleting the original \
+                 is not supported)"
+                    .into()
+            }
+            (Self::Remote, Ja) => "リモート（SSH）の項目は移せない".into(),
+            (Self::Remote, En) => "remote (SSH) items cannot be moved".into(),
+            (Self::WorkspaceRoot, Ja) => "ワークスペースのフォルダ（見出し）は移せない".into(),
+            (Self::WorkspaceRoot, En) => "a workspace folder (heading) cannot be moved".into(),
+            (Self::Io(e), Ja) => format!("OS が断った: {e}"),
+            (Self::Io(e), En) => format!("the OS refused: {e}"),
         }
+    }
+}
+
+impl std::fmt::Display for MoveRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason())
     }
 }
 
@@ -763,7 +795,10 @@ mod tests {
     fn 上書きしない移動が同名で断った失敗は同名の理由へ読む() {
         let taken = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
         assert_eq!(classify_io(&taken), MoveRefusal::NameTaken);
-        assert!(classify_io(&taken).reason().contains("同じ名前"));
+        // 文言は表示言語に従う（#2365）ので、言語グローバルに触れずに日本語を引く
+        assert!(classify_io(&taken)
+            .text_in(crate::i18n::Lang::Ja)
+            .contains("同じ名前"));
     }
 
     /// #1842: 記録されたパス（最近使った場所など）は、移した後でも字面・実体の形の
@@ -880,7 +915,9 @@ mod tests {
         // ここは std が EXDEV を寄せる先の読み替えだけを固定する
         let exdev = std::io::Error::from(std::io::ErrorKind::CrossesDevices);
         assert_eq!(classify_io(&exdev), MoveRefusal::CrossDevice);
-        assert!(MoveRefusal::CrossDevice.reason().contains("別のボリューム"));
+        assert!(MoveRefusal::CrossDevice
+            .text_in(crate::i18n::Lang::Ja)
+            .contains("別のボリューム"));
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         assert_eq!(classify_io(&denied).slug(), "io");
     }
