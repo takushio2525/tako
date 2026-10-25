@@ -138,6 +138,17 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   「見つからない」系は英語にも ` not found` を含め（`says_not_found` の当たり方を日英でそろえる）、
   ダイアログ不在の読み（リモートの承認応答の 409）は `Reason::says_no_choice_dialog` を通す。
   番犬は同じ `issue1762_dispatch_error_lang.rs`（落ちたら日英の対を書いた行を `file:line` で名指す）
+- #2365 の 2 本目で、**dispatch が理由の文へそのまま載せる tako-core のエラー型**も同じ形にした:
+  `TextEditError` / `RangeEditError` / `ChangesError` / `LineOpError`（編集）・`SessionError`・
+  `RunnerError`・`CommandCardError`・`BackendError`（と `InvalidSessionReason`）・LSP の答えの読みの
+  `lsp::format::ParseError` / `lsp::rename::ParseError`。各型の `text_in` が日英の対の 1 か所で、
+  `thiserror` の `#[error]` は使わない（`Display` は `i18n::lang()` で `text_in` を引き、
+  `source` は手で書く）。作り手が日本語の文を値で渡していたもの（読み取り専用の保存・読み直せない
+  中身・器の名前の理由）は文ではなく**バリアントで渡す**（`TextEditError::ReadOnly` /
+  `NotEditable` / `InvalidSessionReason`）。カードの「まだ実行中」（リモートの 409 寄せ）は
+  `CommandCardError::says_still_running` で日英どちらにも当てる（目印は `still_running_mark(lang)`）。
+  `BackendError::Unsupported` / `Operation` は作り手が組んだ文をそのまま出す（器の CLI の文の
+  日英は #2365 の続き）。番犬は同じ `issue1762_dispatch_error_lang.rs`（末尾の節）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

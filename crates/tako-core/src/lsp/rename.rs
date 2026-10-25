@@ -147,12 +147,28 @@ pub enum ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotObject => write!(f, "WorkspaceEdit ではない"),
-            Self::MalformedChange { index } => {
-                write!(f, "documentChanges の {index} 番目の形が違う")
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl ParseError {
+    /// 表示言語を明示しての文言（#2365。`TextEditError::text_in` と同じ形）。
+    /// 日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NotObject, Ja) => "WorkspaceEdit ではない".to_string(),
+            (Self::NotObject, En) => "not a WorkspaceEdit".to_string(),
+            (Self::MalformedChange { index }, Ja) => {
+                format!("documentChanges の {index} 番目の形が違う")
             }
-            Self::MalformedChanges => write!(f, "changes の値が TextEdit の配列ではない"),
+            (Self::MalformedChange { index }, En) => {
+                format!("documentChanges entry {index} is malformed")
+            }
+            (Self::MalformedChanges, Ja) => "changes の値が TextEdit の配列ではない".to_string(),
+            (Self::MalformedChanges, En) => {
+                "the value of changes is not an array of TextEdit".to_string()
+            }
         }
     }
 }

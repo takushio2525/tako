@@ -319,7 +319,11 @@ mod tests {
             },
             Ok(_) => panic!("ターゲット式が通ってしまった"),
         };
-        assert!(reason.note().contains("ターゲット式"));
+        // 理由の文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+        let target = tako_core::backend::InvalidSessionReason::TargetExpression;
+        assert!([tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+            .into_iter()
+            .any(|lang| reason.note().contains(target.text_in(lang))));
     }
 
     /// 到達手段が無い理由の文面には、どの backend なのかが必ず入る

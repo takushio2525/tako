@@ -33264,7 +33264,14 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(refused.contains("外部で変更"), "{refused}");
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| refused
+                    .contains(&tako_core::TextEditError::ExternalChanged.text_in(lang))),
+            "{refused}"
+        );
         assert!(refused.contains("tako edit save --force"), "{refused}");
         assert!(refused.contains("tako edit reload"), "{refused}");
         assert!(refused.contains("action=overwrite"), "{refused}");
@@ -33359,7 +33366,14 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(refused.contains("削除"), "{refused}");
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| refused
+                    .contains(&tako_core::TextEditError::ExternalDeleted.text_in(lang))),
+            "{refused}"
+        );
         assert!(refused.contains("作り直す"), "{refused}");
         let diff = run(&mut host, Request::PreviewDiff { pane: Some(pane) }).unwrap();
         assert_eq!(diff["diff"]["state"].as_str(), Some("deleted"));
@@ -33927,7 +33941,12 @@ mod tests {
         // 版違いは最初の打鍵の前に断る（何も入らない）
         let err =
             dispatch(&mut host, req("type", Some("(("), Some(0)), PaneOrigin::Cli).unwrap_err();
-        assert!(format!("{err:?}").contains("版が違う"), "{err:?}");
+        // 断りの文は表示言語に従う（#2365）
+        assert!(
+            format!("{err:?}").contains("版が違う")
+                || format!("{err:?}").contains("version mismatch"),
+            "{err:?}"
+        );
         assert_eq!(body(&host), "let v = f(x);\n");
         // text の無い type・text を取らない command は断る
         assert!(dispatch(&mut host, req("type", None, None), PaneOrigin::Cli).is_err());
@@ -34001,8 +34020,14 @@ mod tests {
         assert_eq!(text(&host), "b\r\na\r\na\r\n");
         // MockHost のバッファは `mock.txt` = コメント記号の表に行が無い形式
         let err = run(&mut host, "line-toggle-comment").unwrap_err();
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+        let no_comment = tako_core::text_edit::LineOpError::NoCommentSyntax {
+            name: "mock.txt".into(),
+        };
         assert!(
-            format!("{err:?}").contains("コメント記号を知らない"),
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| err.to_string().contains(&no_comment.text_in(lang))),
             "{err:?}"
         );
         assert_eq!(text(&host), "b\r\na\r\na\r\n", "断ったら本文は変えない");
@@ -47670,7 +47695,13 @@ mod tests {
             PaneOrigin::Mcp,
         )
         .unwrap_err();
-        assert!(format!("{err}").contains("コマンドが 1 件も"), "{err}");
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+        let says = |err: &DispatchError, want: tako_core::CommandCardError| {
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| err.to_string().contains(&want.text_in(lang)))
+        };
+        assert!(says(&err, tako_core::CommandCardError::NoCommands), "{err}");
         // 空文字列
         let err = dispatch(
             &mut host,
@@ -47678,7 +47709,10 @@ mod tests {
             PaneOrigin::Mcp,
         )
         .unwrap_err();
-        assert!(format!("{err}").contains("空のコマンド"), "{err}");
+        assert!(
+            says(&err, tako_core::CommandCardError::EmptyCommand { index: 1 }),
+            "{err}"
+        );
         // エスケープシーケンス混入
         let err = dispatch(
             &mut host,
@@ -47686,7 +47720,13 @@ mod tests {
             PaneOrigin::Mcp,
         )
         .unwrap_err();
-        assert!(format!("{err}").contains("制御文字"), "{err}");
+        assert!(
+            says(
+                &err,
+                tako_core::CommandCardError::ControlCharacter { index: 1 }
+            ),
+            "{err}"
+        );
         // 不明 action は選べる値を案内する
         let err = dispatch(
             &mut host,
@@ -47730,7 +47770,16 @@ mod tests {
             PaneOrigin::Cli,
         )
         .unwrap_err();
-        assert!(format!("{err}").contains("コマンド番号が範囲外"), "{err}");
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| err.to_string().contains(
+                    &tako_core::CommandCardError::IndexOutOfRange { index: 5, len: 1 }
+                        .text_in(lang)
+                )),
+            "{err}"
+        );
         assert!(
             host.clipboard.is_empty(),
             "失敗した操作で副作用を起こさない"
@@ -47800,12 +47849,18 @@ mod tests {
             "状態の不一致は Operation: {err:?}"
         );
         assert!(
-            err.to_string()
-                .contains(tako_core::command_card::STILL_RUNNING_MARK),
+            tako_core::CommandCardError::says_still_running(&err.to_string()),
             "{err}"
         );
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+        let running = tako_core::CommandCardError::StillRunning {
+            index: 1,
+            pane: run_pane,
+        };
         assert!(
-            err.to_string().contains(&format!("ペイン {run_pane}")),
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| err.to_string() == running.text_in(lang)),
             "{err}"
         );
         assert_eq!(
@@ -48204,7 +48259,8 @@ mod tests {
             PaneOrigin::Cli,
         )
         .unwrap_err();
-        assert!(format!("{err}").contains("見つからない"), "{err}");
+        // 「見つからない」は表示言語で日英どちらにもなる（#2365）ので、読み方は 1 実装を通す
+        assert!(DispatchError::says_not_found(&err.to_string()), "{err}");
         // 存在しないペインへの show
         let stale = tako_core::unused_id::pane().as_u64();
         let err = dispatch(

@@ -156,14 +156,42 @@ pub struct ConfigLayer {
     pub env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, thiserror::Error)]
+/// 実行計画を組めなかった理由。表示（`Display`）は表示言語に従う
+/// （#2365。日英の正本は [`Self::text_in`]）
+#[derive(Debug)]
 pub enum RunnerError {
-    #[error("実行コマンドが見つからない: {0}")]
+    /// 実行コマンドが決まらない。中身は直し方の案内（表示言語で組んだもの = `no_command_hint`）
     NoCommand(String),
-    #[error("指定されたプロファイル '{0}' はファイル内に宣言されていない")]
     ProfileNotFound(String),
-    #[error("cwd が存在しない: {0}")]
     CwdNotFound(String),
+}
+
+impl std::fmt::Display for RunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for RunnerError {}
+
+impl RunnerError {
+    /// 表示言語を明示しての文言（#2365。`TextEditError::text_in` と同じ形）。
+    /// 日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NoCommand(hint), Ja) => format!("実行コマンドが見つからない: {hint}"),
+            (Self::NoCommand(hint), En) => format!("run command not found: {hint}"),
+            (Self::ProfileNotFound(name), Ja) => {
+                format!("指定されたプロファイル '{name}' はファイル内に宣言されていない")
+            }
+            (Self::ProfileNotFound(name), En) => {
+                format!("the profile '{name}' is not declared in the file")
+            }
+            (Self::CwdNotFound(cwd), Ja) => format!("cwd が存在しない: {cwd}"),
+            (Self::CwdNotFound(cwd), En) => format!("cwd does not exist: {cwd}"),
+        }
+    }
 }
 
 // --- パーサ ---
