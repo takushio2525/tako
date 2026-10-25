@@ -14,6 +14,8 @@
 //! （このファイルを旧腕で走らせると 10 万行の検査が名指しで落ちる）。
 //!
 //! 実の rust-analyzer は `--ignored` の 1 本（`TAKO_1899_REAL_RA=<実行ファイルの実体>`）が測る。
+//! その 1 本の旧腕は `TAKO_1899_LEGACY=1` を組んだ子で当てる（プロセスの env は書き換えない =
+//! `--include-ignored` で並列に回しても 10 万行の検査へ漏れない。#2400）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -281,24 +283,129 @@ fn fn_chunks(text: &str) -> Vec<String> {
     out
 }
 
-/// 全文 1 つの答えを `TAKO_1899_LEGACY` の有無で当てた 2 つのバッファ（割る / 割らない）
-fn split_and_legacy(path: &Path, text: &str, answer: &FormatAnswer) -> (TextBuffer, TextBuffer) {
-    let mut split = TextBuffer::from_text(path.to_path_buf(), text.to_string());
-    apply(&mut split, answer);
-    std::env::set_var("TAKO_1899_LEGACY", "1");
-    let mut legacy = TextBuffer::from_text(path.to_path_buf(), text.to_string());
-    apply(&mut legacy, answer);
-    std::env::remove_var("TAKO_1899_LEGACY");
-    (split, legacy)
+/// 旧腕の子だけが立てる目印（値は入出力を置くディレクトリ）
+const LEGACY_ARM_DIR: &str = "TAKO_1899_LEGACY_ARM_DIR";
+
+/// 旧腕の子が起こし直すテスト（実の rust-analyzer の 1 本）
+const REAL_RA_TEST: &str = "実の_rust_analyzer_の整形は割っても同じ本文で_undo_1_回で戻る";
+
+/// 旧腕（`TAKO_1899_LEGACY=1` = 割らない）で当てた結果
+struct LegacyArm {
+    text: String,
+    bytes: usize,
+    changes: usize,
+}
+
+/// 答えたちを旧腕で当てた結果（答えの順）。旧腕は `TAKO_1899_LEGACY=1` を組んだ子（このテストを
+/// `--exact` で起こし直したもの）で当てる。プロセスの env を `set_var` で切り替えると、並列に走る
+/// ほかのテスト（10 万行の検査など）まで旧腕で当ててしまうのでやらない（#2400。子の起こし方は
+/// `tests/common/detached_env.rs` と同じ形 = その 1 本を通したことまで見る）
+fn legacy_arms(dir: &Path, path: &Path, text: &str, answers: &[&FormatAnswer]) -> Vec<LegacyArm> {
+    let answers: Vec<Value> = answers
+        .iter()
+        .map(|answer| {
+            answer
+                .changes
+                .iter()
+                .map(|c| json!({ "start": c.range.start, "end": c.range.end, "text": c.text }))
+                .collect()
+        })
+        .collect();
+    let input = json!({ "path": path, "text": text, "answers": answers });
+    std::fs::write(dir.join("legacy-in.json"), input.to_string()).unwrap();
+    let exe = std::env::current_exe().expect("テストバイナリのパス");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            REAL_RA_TEST,
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(LEGACY_ARM_DIR, dir)
+        .env("TAKO_1899_LEGACY", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("旧腕の子を起こせる");
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "旧腕の子が失敗した:\n{log}");
+    assert!(
+        log.contains("test result: ok. 1 passed"),
+        "旧腕の子が {REAL_RA_TEST} を走らせていない（改名漏れ？）:\n{log}"
+    );
+    let result: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("legacy-out.json")).unwrap())
+            .unwrap();
+    result
+        .as_array()
+        .expect("旧腕の結果の列")
+        .iter()
+        .map(|r| LegacyArm {
+            text: r["text"].as_str().unwrap().to_string(),
+            bytes: r["bytes"].as_u64().unwrap() as usize,
+            changes: r["changes"].as_u64().unwrap() as usize,
+        })
+        .collect()
+}
+
+/// 旧腕の子の側: 親が置いた答えたちを当て、本文・undo の履歴・当てた箇所の数を書いて返す
+fn legacy_arm_child(dir: &Path) {
+    assert_eq!(
+        std::env::var("TAKO_1899_LEGACY").as_deref(),
+        Ok("1"),
+        "旧腕の子は TAKO_1899_LEGACY=1 で起こされる"
+    );
+    let input: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("legacy-in.json")).unwrap())
+            .unwrap();
+    let path = PathBuf::from(input["path"].as_str().unwrap());
+    let text = input["text"].as_str().unwrap();
+    let out: Vec<Value> = input["answers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|changes| {
+            let answer = FormatAnswer {
+                server: "rust-analyzer",
+                changes: changes
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| tako_core::text_edit::TextChange {
+                        range: c["start"].as_u64().unwrap() as usize
+                            ..c["end"].as_u64().unwrap() as usize,
+                        text: c["text"].as_str().unwrap().to_string(),
+                    })
+                    .collect(),
+                dropped: 0,
+            };
+            let mut buffer = TextBuffer::from_text(path.clone(), text.to_string());
+            let applied = apply(&mut buffer, &answer);
+            json!({
+                "text": buffer.text(),
+                "bytes": buffer.undo_history_bytes(),
+                "changes": applied.changes,
+            })
+        })
+        .collect();
+    std::fs::write(dir.join("legacy-out.json"), Value::from(out).to_string()).unwrap();
 }
 
 /// 受け入れ条件 3（実の rust-analyzer）: 整形が rustfmt とバイト一致し、割っても割らなくても
-/// （`TAKO_1899_LEGACY`）当てた本文は同じで、undo の履歴は重くならず、undo 1 回で戻る。
+/// （旧腕 = `TAKO_1899_LEGACY=1` の子）当てた本文は同じで、undo の履歴は重くならず、undo 1 回で戻る。
 /// 同じ rustfmt の出力を全文 1 つの書き換えとして受けた形（全文を返すサーバ）も測る。
 /// `TAKO_1899_REAL_RA=<実行ファイルの実体>` で `--ignored` のときだけ（CI では走らない）
 #[test]
 #[ignore = "実の rust-analyzer が要る（TAKO_1899_REAL_RA）"]
 fn 実の_rust_analyzer_の整形は割っても同じ本文で_undo_1_回で戻る() {
+    if let Some(dir) = std::env::var_os(LEGACY_ARM_DIR) {
+        legacy_arm_child(Path::new(&dir));
+        return;
+    }
     let Some(ra) = std::env::var_os("TAKO_1899_REAL_RA") else {
         eprintln!("TAKO_1899_REAL_RA が無いので測らない");
         return;
@@ -340,31 +447,7 @@ fn 実の_rust_analyzer_の整形は割っても同じ本文で_undo_1_回で戻
         .iter()
         .filter(|c| text[c.range.clone()].contains('\n') && c.text.contains('\n'))
         .count();
-    let (mut split, legacy) = split_and_legacy(&path, &text, &answer);
-    eprintln!(
-        "#1899 実の rust-analyzer: 答え {} 件（改行をまたぐ {multi_line}）/ undo の履歴 割る {} B・割らない {} B",
-        answer.changes.len(),
-        split.undo_history_bytes(),
-        legacy.undo_history_bytes()
-    );
-    assert_eq!(
-        split.text().as_bytes(),
-        legacy.text().as_bytes(),
-        "割っても割らなくても当てた本文は同じ"
-    );
-    assert_eq!(
-        split.text(),
-        formatted,
-        "rust-analyzer の整形が rustfmt とバイト一致"
-    );
-    assert!(
-        split.undo_history_bytes() <= legacy.undo_history_bytes(),
-        "割って undo の履歴が重くなった"
-    );
-    assert!(split.undo());
-    assert_eq!(split.text().as_bytes(), text.as_bytes(), "undo 1 回で戻る");
-
-    // 同じ rustfmt の出力を全文 1 つの書き換えとして受けたら（全文を返すサーバの形）
+    // 同じ rustfmt の出力を全文 1 つの書き換えとして受けた形（全文を返すサーバの形）
     let whole = FormatAnswer {
         server: "rust-analyzer",
         changes: vec![tako_core::text_edit::TextChange {
@@ -373,11 +456,56 @@ fn 実の_rust_analyzer_の整形は割っても同じ本文で_undo_1_回で戻
         }],
         dropped: 0,
     };
-    let (mut whole_split, whole_legacy) = split_and_legacy(&path, &text, &whole);
+    let mut split = TextBuffer::from_text(path.clone(), text.clone());
+    apply(&mut split, &answer);
+    let mut whole_split = TextBuffer::from_text(path.clone(), text.clone());
+    let whole_applied = apply(&mut whole_split, &whole);
+    let [legacy, whole_legacy]: [LegacyArm; 2] =
+        legacy_arms(&scratch.0, &path, &text, &[&answer, &whole])
+            .try_into()
+            .unwrap_or_else(|_| panic!("旧腕の結果は答えと同じ 2 つ"));
+    assert_eq!(
+        whole_legacy.changes, 1,
+        "旧腕の子は全文 1 つの答えを割らずに当てる（TAKO_1899_LEGACY が子に効いている）"
+    );
+    assert!(
+        whole_applied.changes > 1,
+        "親は割る（親のプロセスの env は旧腕になっていない）"
+    );
     eprintln!(
-        "#1899 rustfmt の出力を全文 1 つで: undo の履歴 割る {} B・割らない {} B",
+        "#1899 実の rust-analyzer: 答え {} 件（改行をまたぐ {multi_line}）/ undo の履歴 割る {} B・割らない {} B",
+        answer.changes.len(),
+        split.undo_history_bytes(),
+        legacy.bytes
+    );
+    assert_eq!(
+        split.text().as_bytes(),
+        legacy.text.as_bytes(),
+        "割っても割らなくても当てた本文は同じ"
+    );
+    assert_eq!(
+        split.text(),
+        formatted,
+        "rust-analyzer の整形が rustfmt とバイト一致"
+    );
+    assert!(
+        split.undo_history_bytes() <= legacy.bytes,
+        "割って undo の履歴が重くなった"
+    );
+    assert!(split.undo());
+    assert_eq!(split.text().as_bytes(), text.as_bytes(), "undo 1 回で戻る");
+
+    eprintln!(
+        "#1899 rustfmt の出力を全文 1 つで: 当てた箇所 割る {}・割らない {} / undo の履歴 割る {} B・割らない {} B",
+        whole_applied.changes,
+        whole_legacy.changes,
         whole_split.undo_history_bytes(),
-        whole_legacy.undo_history_bytes()
+        whole_legacy.bytes
+    );
+    assert_eq!(
+        whole_legacy.text.as_bytes(),
+        formatted.as_bytes(),
+        "旧腕でも全文 1 つは rustfmt とバイト一致"
     );
     assert_eq!(
         whole_split.text(),
@@ -385,7 +513,7 @@ fn 実の_rust_analyzer_の整形は割っても同じ本文で_undo_1_回で戻
         "全文 1 つでも rustfmt とバイト一致"
     );
     assert!(
-        whole_split.undo_history_bytes() < whole_legacy.undo_history_bytes(),
+        whole_split.undo_history_bytes() < whole_legacy.bytes,
         "整形済みの関数を挟む全文の書き換えなのに割って軽くならない"
     );
     assert!(whole_split.undo());
