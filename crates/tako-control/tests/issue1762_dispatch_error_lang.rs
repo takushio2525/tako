@@ -2114,7 +2114,9 @@ fn 移動とコピーの包みと理由の全組み合わせで1つの断りに�
     }
     // 全部断られたときの並べ方（`many_reply` = N 件すべてできなかった / `paste_reply` =
     // 貼り付けできない（N 件すべて））も、並べた 1 件ずつの断りと同じ言語でそろう
-    let alls: [(fn(Vec<String>) -> Reason, &str); 2] = [
+    // 1 件ずつの断りの文を並べる包み（`AllFailed` / `PasteAllFailed`）
+    type Gather = fn(Vec<String>) -> Reason;
+    let alls: [(Gather, &str); 2] = [
         (Reason::AllFailed, "2 件すべてできなかった: "),
         (Reason::PasteAllFailed, "貼り付けできない（2 件すべて）: "),
     ];
