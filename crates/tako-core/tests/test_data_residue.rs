@@ -181,7 +181,11 @@ fn wait_for_report(report: &Path, what: &str) -> PathBuf {
 }
 
 /// 「確実に死んでいる pid」を作る（起こして看取る）。
-/// 適当な大きい数を使うと **pid 再利用中の生きたプロセス**に当たりうる
+/// 適当な大きい数を使うと **pid 再利用中の生きたプロセス**に当たりうる。
+///
+/// 押さえ（`process::ReapedChild`）を返さず `Child` を drop するのは意図した形（#2387）。
+/// この pid を読むのは掃除役の子の `OwnerProbe` で、Windows は在籍表だけで読む。
+/// 押さえを持ったままだと、ハンドルが残る終了済みの子が在籍表に載って「居る」と読まれうる（#2275）
 fn reaped_pid(scratch: &Path) -> u32 {
     let report = scratch.join("reaped.txt");
     let mut child = child_command(TOUCH_TEST, scratch, &report, false)

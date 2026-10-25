@@ -387,20 +387,23 @@ fn listing(root: &Path) -> Vec<String> {
     out
 }
 
-/// 終わったプロセスの pid（偽サーバを即死させて刈り取る）
-fn dead_pid() -> u32 {
-    let mut child = std::process::Command::new(FAKE)
-        .args(["--scenario", "die"])
-        .spawn()
-        .expect("偽サーバを起こす");
-    let pid = child.id();
-    child.wait().expect("刈り取る");
+/// 終わったプロセスの押さえ（偽サーバを即死させて刈り取る）。
+///
+/// pid が死んだままなのは**返した押さえを持つ間だけ**（#2284 / #2387）。Windows は刈り取った子の
+/// ハンドルが閉じた直後に pid を別のプロセスへ再利用しうるので、押さえを捨ててから印の生死を
+/// 読ませると、pid を取った別プロセスを「古い tako が生きている」と読んで段を残す
+fn reaped_child() -> tako_core::platform::process::ReapedChild {
+    let mut cmd = std::process::Command::new(FAKE);
+    cmd.args(["--scenario", "die"]);
+    let child = tako_core::platform::process::ReapedChild::run(&mut cmd)
+        .expect("偽サーバを起こして刈り取る");
+    let pid = child.pid();
     // 刈り取った直後の 1 回の観測で決めない（#2275）
     assert!(
         tako_core::platform::process::wait_gone(pid, Duration::from_secs(10)),
         "刈り取った pid {pid} が居なくならない"
     );
-    pid
+    child
 }
 
 /// 置き場の版から起こす manager（グローバルには無い = 置き場のものを使う。自動では取らない）
@@ -536,12 +539,14 @@ fn 版を上げると古い版の段が消え動いているあいだは残す()
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // 古い tako が終わった（印の pid が死んでいる）→ 次に起こしたとき v1 を消す
+    // 古い tako が終わった（印の pid が死んでいる）→ 次に起こしたとき v1 を消す。
+    // 押さえは片付けの結果を読み終えるまで持つ（#2387）
+    let dead = reaped_child();
     let lease = root
         .join(ID)
         .join("v1")
         .join(table::lease_name(std::process::id()));
-    std::fs::rename(&lease, lease.with_file_name(table::lease_name(dead_pid()))).unwrap();
+    std::fs::rename(&lease, lease.with_file_name(table::lease_name(dead.pid()))).unwrap();
     new_manager.restart(Some(ID));
     wait_state(&new_manager, "running");
     let cleanup = new_manager.status(None)["fetch"]["cleanup"].clone();
@@ -555,6 +560,7 @@ fn 版を上げると古い版の段が消え動いているあいだは残す()
         ["fake-sweep/hand-made", "fake-sweep/v2", "other-server/v0"],
         "今の版・他のサーバ・tako の印の無い段は残る"
     );
+    drop(dead);
     new_manager.shutdown_all(Duration::from_secs(5));
 }
 
