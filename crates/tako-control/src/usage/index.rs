@@ -1906,6 +1906,22 @@ mod tests {
         read_all::<LimitObservation>(&env.usage().join(LIMITS_FILE)).0
     }
 
+    // #2395 注入（A/B 用・後で外す）: 2 本の codex テストの順序を固定し、A/B の旧挙動の窓の中で
+    // 区間按分のテストの更新を走らせる
+    static INJ_2395: (std::sync::Mutex<u8>, std::sync::Condvar) =
+        (std::sync::Mutex::new(0), std::sync::Condvar::new());
+    fn inj_2395_mark(stage: u8) {
+        let mut g = INJ_2395.0.lock().unwrap_or_else(|e| e.into_inner());
+        *g = (*g).max(stage);
+        INJ_2395.1.notify_all();
+    }
+    fn inj_2395_wait(stage: u8) {
+        let g = INJ_2395.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = INJ_2395
+            .1
+            .wait_timeout_while(g, Duration::from_secs(60), |s| *s < stage);
+    }
+
     /// 受け入れ 1（索引の側）: 累積の差分の和が最後の累積に一致し、rate_limits は値ごとにいちばん早い
     /// 観測の 1 行だけが limits.jsonl へ入る。追記分だけを読み、archived_sessions へ移っても数え直さない
     #[test]
@@ -2022,6 +2038,8 @@ mod tests {
         );
         // A/B: 旧挙動は codex を読まない
         std::env::set_var(core_codex::S5_LEGACY_ENV, "1");
+        inj_2395_mark(1);
+        inj_2395_wait(2);
         let found = env.codex_indexer().walk().len();
         std::env::remove_var(core_codex::S5_LEGACY_ENV);
         assert_eq!(found, 0);
@@ -2093,7 +2111,9 @@ mod tests {
             ],
             "",
         );
+        inj_2395_wait(1);
         env.update(&mut env.codex_indexer());
+        inj_2395_mark(2);
         let query = crate::usage::UsageQuery {
             by: Some("project".into()),
             window: Some("all".into()),
