@@ -32706,6 +32706,238 @@ mod self_test {
         }
     }
 
+    /// #2371 の注入（`TAKO_2371_INJECT`。カンマ区切りで重ねられる）。漏れの判定の検出力を確かめる
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct St2371Inject {
+        /// `leak`: 項目 154 の 2 巡目の最初の回に、入力欄へ打った印を origin の PTY へも書く
+        /// （= 打鍵がターミナルへ漏れた形）。出力が流れている最中なので、tty のエコーは
+        /// 画面の外へ押し出され、溜まった入力は E4 の ctrl-c で捨てられる
+        pub leak: bool,
+        /// `leak-late`: 項目 154 の漏れの判定の直前に印を PTY へ書く（エコーは画面に残る = 境界）
+        pub leak_late: bool,
+        /// `leak155`: 項目 155 の 2 巡目（出力が流れている最中）に印を origin の PTY へ書く
+        pub leak155: bool,
+        /// `direct`: 項目 154 のあいだだけ器を外す（直接ペイン = tako のグリッドに履歴が残る構成の境界）
+        pub direct: bool,
+    }
+
+    impl St2371Inject {
+        pub(crate) fn parse(raw: &str) -> Self {
+            let has = |name: &str| raw.split(',').any(|v| v.trim() == name);
+            Self {
+                leak: has("leak"),
+                leak_late: has("leak-late"),
+                leak155: has("leak155"),
+                direct: has("direct"),
+            }
+        }
+    }
+
+    fn st2371_inject() -> St2371Inject {
+        St2371Inject::parse(&std::env::var("TAKO_2371_INJECT").unwrap_or_default())
+    }
+
+    /// 注入の道具: 漏れた打鍵と同じ形で、印をそのペインの PTY へ直接書く（#2371）
+    fn st2371_write_leak(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+        text: &str,
+    ) -> bool {
+        window
+            .update(cx, |app, _, _| {
+                app.terminals
+                    .get(&pane)
+                    .map(|s| s.write(text.as_bytes().to_vec()))
+                    .is_some()
+            })
+            .unwrap_or(false)
+    }
+
+    /// 器（tmux / psmux）の履歴 + 画面の平文（折り返しは結合。#2371）。
+    /// 器の無いペインは `None`、器はあるのに読めないなら `Some(Err(理由))`
+    async fn st2371_backend_text(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+    ) -> Option<Result<String, String>> {
+        let session = window
+            .update(cx, |app, _, _| app.backend_session(pane))
+            .ok()
+            .flatten()?;
+        Some(
+            cx.background_executor()
+                .spawn(async move {
+                    let Some((session, capture)) = tako_control::reach::detached_capture(&session)
+                    else {
+                        return Err(format!("器の到達手段が無い（session={session}）"));
+                    };
+                    capture
+                        .capture_history_joined(&session, ST2371_BACKEND_LINES)
+                        .ok_or_else(|| match capture.capture_scrollback(&session, 1) {
+                            Err(e) => format!("器の採取が失敗した: {e}"),
+                            Ok(_) => "器の履歴と画面が空".to_string(),
+                        })
+                })
+                .await,
+        )
+    }
+
+    /// 器の履歴を遡る行数。器の `history-limit`（10000 行）より大きければ、器は
+    /// 残っている最古の行まで返す（tmux は `-S` を履歴の頭で止める）
+    const ST2371_BACKEND_LINES: usize = 100_000;
+
+    /// #2371 の A/B。`TAKO_2371_LEGACY=1` で項目 154 / 155 の漏れの判定を修正前へ戻す
+    /// （tako のグリッドだけを読み、読んだ範囲が項目の頭まで届いているかを見ない）
+    fn legacy_2371() -> bool {
+        std::env::var("TAKO_2371_LEGACY").is_ok_and(|v| v == "1")
+    }
+
+    /// 漏れの判定の範囲の錨（#2371）。項目の頭で、そのペインに 1 行打って実行させる
+    /// （打った行のエコーは算術式のままなので、出力の綴り `ST2371S<1500+項目>` だけが錨になる）。
+    /// 錨が画面に出たら `Some(錨)`、出なければ `None`
+    async fn st2371_scan_anchor(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        sh: tako_core::platform::shell_dialect::ShellDialect,
+        pane: PaneId,
+        item: i64,
+    ) -> Option<String> {
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+            app.clear_text_input_focus();
+            cx.notify();
+        });
+        notify_and_draw(any, window, cx);
+        type_text(any, cx, &sh.echo(&sh.marker("ST2371S", 1500, item)), true);
+        let needle = format!("ST2371S{}", 1500 + item);
+        let budget = state_wait_budget(Duration::from_secs(15), machine_busy());
+        wait_for_focused_text(window, cx, &needle, budget)
+            .await
+            .then_some(needle)
+    }
+
+    /// 漏れの判定の結果（[`st2371_judge_leak`]。#2371）
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum St2371Verdict {
+        /// 漏れていない（範囲は項目の頭まで届いている）
+        Clean,
+        /// 印が見つかった。`in_backend` = 器の履歴にだけあった（tako のグリッドからは見えない）
+        Leaked { mark: String, in_backend: bool },
+        /// 器はあるのに履歴が読めない（漏れを確かめられない）
+        Unreadable(String),
+        /// 読んだ範囲に錨が無い = 範囲が項目の頭まで届かない（器の履歴やスクロールバックの上限）
+        NotCovered,
+    }
+
+    /// 漏れの判定（純粋関数。#1725 / #2371）。
+    ///
+    /// `grid` は tako のグリッド（履歴 + 画面）、`backend` は器の履歴 + 画面（器の無いペインは
+    /// `None`、器はあるのに読めないなら `Some(Err(理由))`）、`anchor` は項目の頭で打った錨
+    /// （[`st2371_scan_anchor`]）。
+    ///
+    /// 器越しのペインは tako のグリッドに器の画面しか残らない（器は外側の端末を alt screen で
+    /// 使うので tako 側の履歴が増えない = `history=0`）。出力を流しながら打つ検査では、漏れた
+    /// 打鍵のエコーが器の画面の外へ押し出される。溜まった入力は項目 154 の E4 の ctrl-c で
+    /// 捨てられるのでプロンプトにも残らず、グリッドだけを見る旧判定は漏れていても通っていた
+    /// （#2371 の偽の緑）。新判定は器の履歴まで読み、器が読めない・読んだ範囲に錨が無いときは
+    /// 「漏れていない」と読まずに落とす。`legacy` は修正前の判定（グリッドだけ・範囲を見ない）
+    pub(crate) fn st2371_judge_leak(
+        grid: &str,
+        backend: Option<Result<&str, &str>>,
+        anchor: &str,
+        forbidden: &[&str],
+        legacy: bool,
+    ) -> St2371Verdict {
+        let leaked = |mark: &str, in_backend| St2371Verdict::Leaked {
+            mark: mark.to_string(),
+            in_backend,
+        };
+        if legacy {
+            return match forbidden.iter().find(|f| grid.contains(**f)) {
+                Some(f) => leaked(f, false),
+                None => St2371Verdict::Clean,
+            };
+        }
+        let backend = match backend {
+            None => None,
+            Some(Ok(text)) => Some(text),
+            Some(Err(e)) => return St2371Verdict::Unreadable(e.to_string()),
+        };
+        for f in forbidden {
+            if grid.contains(*f) {
+                return leaked(f, false);
+            }
+            if backend.is_some_and(|b| b.contains(*f)) {
+                return leaked(f, true);
+            }
+        }
+        if grid.contains(anchor) || backend.is_some_and(|b| b.contains(anchor)) {
+            St2371Verdict::Clean
+        } else {
+            St2371Verdict::NotCovered
+        }
+    }
+
+    /// 1 ペインぶんの漏れの判定（材料を集めて [`st2371_judge_leak`] へ渡し、落ちたら名指す。#2371）。
+    /// `item` は失敗文の頭（`項目 154`）、`issue` は元の Issue（`#1725`）
+    async fn st2371_assert_no_leak(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+        anchor: &str,
+        forbidden: &[&str],
+        item: &str,
+        issue: &str,
+    ) {
+        let legacy = legacy_2371();
+        let grid = st1725_pane_text(window, cx, pane);
+        let backend = if legacy {
+            None
+        } else {
+            st2371_backend_text(window, cx, pane).await
+        };
+        let verdict = st2371_judge_leak(
+            &grid,
+            backend
+                .as_ref()
+                .map(|b| b.as_ref().map(String::as_str).map_err(String::as_str)),
+            anchor,
+            forbidden,
+            legacy,
+        );
+        // 判定に使った材料そのもの（#796）: 読んだ行数（器の有無）と結果
+        println!(
+            "TAKO_SELF_TEST_2371: {item} pane={pane:?} legacy={legacy} grid_lines={} backend={} \
+             anchor={anchor} verdict={verdict:?}",
+            grid.lines().count(),
+            match &backend {
+                None => "none".to_string(),
+                Some(Ok(t)) => format!("lines={}", t.lines().count()),
+                Some(Err(e)) => format!("err={e:?}"),
+            },
+        );
+        match verdict {
+            St2371Verdict::Clean => {}
+            St2371Verdict::Leaked { mark, in_backend } => fail(&format!(
+                "{item}: 入力欄へ打った `{mark}` がターミナル {pane:?} へ漏れた（{}） ({issue} / #2371)",
+                if in_backend {
+                    "器の履歴。tako のグリッドからは画面の外へ流れて見えない"
+                } else {
+                    "tako のグリッド"
+                }
+            )),
+            St2371Verdict::Unreadable(e) => fail(&format!(
+                "{item}: 器の履歴が読めないので漏れを確かめられない: {pane:?} {e} (#2371)"
+            )),
+            St2371Verdict::NotCovered => fail(&format!(
+                "{item}: 漏れを探した範囲が項目の頭（錨 `{anchor}`）まで届かない: {pane:?} 器={} (#2371)",
+                backend.is_some()
+            )),
+        }
+    }
+
     /// 項目 154 の 2・3 巡目にターミナルへ流す出力（純粋関数。#1725 / #2355）。
     ///
     /// #2355 の真因: 対話シェルが**自分で回す**ループ（`while …; do printf …; sleep 0.010; done`）は、
@@ -32858,7 +33090,9 @@ mod self_test {
 
     /// 項目 154 の道具: そのペインの**スクロールバックまで含めた**平文（#1725）。
     /// 出力を流しながら打つ検査なので、漏れた打鍵のエコーは画面外へ押し出される。
-    /// 可視行だけを見ると「漏れていない」が偽 PASS になる
+    /// 可視行だけを見ると「漏れていない」が偽 PASS になる。
+    /// **器越しのペインでは器の画面しか残らない**（tako 側の履歴が増えない）ので、漏れの判定は
+    /// これだけを見ず [`st2371_assert_no_leak`] を通す（器の履歴まで読む。#2371）
     fn st1725_pane_text(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, pane: PaneId) -> String {
         window
             .update(cx, |app, _, _| {
@@ -32904,6 +33138,26 @@ mod self_test {
     ) {
         use tako_control::protocol::Request as Req;
         let legacy = TakoApp::legacy_1725();
+        let inject_leak = st2371_inject();
+        // 注入 `direct`（#2371 の境界）: この項目のあいだだけ器を外す（前の項目が ON にしたまま
+        // なので、既定では器越しのペインで走る）。後片付けで元の値へ戻す
+        let restore_persist = if inject_leak.direct {
+            window
+                .update(cx, |app, _, _| {
+                    let mut set = |enabled| {
+                        tako_control::dispatch(app, Req::Persist { enabled }, PaneOrigin::Cli)
+                            .ok()
+                            .and_then(|v| v["enabled"].as_bool())
+                    };
+                    let before = set(None);
+                    let _ = set(Some(false));
+                    before
+                })
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let fixture0 = std::env::temp_dir().join(format!("tako-st1725-{}", std::process::id()));
         remove_on_fail(&fixture0);
         let _ = std::fs::remove_dir_all(&fixture0);
@@ -32967,6 +33221,16 @@ mod self_test {
             wait_for_pane_ready(window, cx, other, Duration::from_secs(20)).await,
             "項目 154: 分割したペインのシェルが立つ (#1725)",
         );
+        // 漏れの判定の範囲の錨（#2371）: 入力欄を開く前に両方のペインへ 1 行ずつ出しておく
+        let mut anchors = Vec::new();
+        for pane in [origin, other] {
+            let Some(anchor) = st2371_scan_anchor(any, window, cx, sh, pane, 154).await else {
+                fail(&format!(
+                    "項目 154: 漏れの判定の錨がペイン {pane:?} に出ない (#2371)"
+                ));
+            };
+            anchors.push((pane, anchor));
+        }
         let _ = window.update(cx, |app, _, cx| {
             let _ = app.workspace.active_tab_mut().tree_mut().focus(origin);
             app.filetree.visible = true;
@@ -33077,6 +33341,10 @@ mod self_test {
                     // **フレームを挟まず直後に**打つ（開いた直後の取りこぼし = Issue の「多い」の検査）
                     let token = format!("{LEAK_MARK}{n}x");
                     st1725_type(any, cx, &token);
+                    if inject_leak.leak && round == 2 && *entry == "root" && *id == "new-file" {
+                        let written = st2371_write_leak(window, cx, origin, &token);
+                        println!("TAKO_SELF_TEST_2371: inject=leak {label} token={token} written={written}");
+                    }
                     let obs = window
                         .update(cx, |app, _, _| {
                             app.inline_edit
@@ -33561,29 +33829,50 @@ mod self_test {
             );
         }
 
+        if inject_leak.leak_late {
+            let late = format!("{LEAK_MARK}latex");
+            let written = st2371_write_leak(window, cx, origin, &late);
+            let budget = state_wait_budget(Duration::from_secs(10), machine_busy());
+            let shown = wait_for_focused_text(window, cx, &late, budget).await;
+            println!("TAKO_SELF_TEST_2371: inject=leak-late token={late} written={written} shown={shown}");
+        }
         // --- 漏れの判定（アンカーつきの否定検査。#796）---
-        // E4 のアンカーが出たあとで、入力欄へ打った印・日本語がターミナル（履歴まで）に 1 つも無い
-        for pane in [origin, other] {
-            let text = st1725_pane_text(window, cx, pane);
-            for forbidden in [LEAK_MARK, "しりょう", "にほんご", "資料"] {
-                check(
-                    !text.contains(forbidden),
-                    &format!("項目 154: 入力欄へ打った `{forbidden}` がターミナル {pane:?} へ漏れた (#1725)"),
-                );
-            }
+        // E4 のアンカーが出たあとで、入力欄へ打った印・日本語がターミナルに 1 つも無い。
+        // 読む範囲は tako のグリッド（履歴まで）+ 器越しなら器の履歴で、項目の頭の錨まで
+        // 届いていることも見る（器越しのペインはグリッドに器の画面しか残らない = #2371）
+        for (pane, anchor) in &anchors {
+            st2371_assert_no_leak(
+                window,
+                cx,
+                *pane,
+                anchor,
+                &[LEAK_MARK, "しりょう", "にほんご", "資料"],
+                "項目 154",
+                "#1725",
+            )
+            .await;
         }
         println!(
             "TAKO_SELF_TEST_1725: legacy={legacy} opened={opened_total} created={} busy_ticks={tb}->{ta} e1={e1:?} e3b={e3b:?}",
             created.len()
         );
 
-        // 後片付け（自分のタブだけ閉じる・ツリーの表示を戻す）
+        // 後片付け（自分のタブだけ閉じる・ツリーの表示を戻す・`direct` で外した器を戻す）
         let _ = window.update(cx, |app, _, cx| {
             app.tree_row_probe = false;
             app.close_inline_edit(false);
             app.remove_tab(tab, cx);
             app.filetree.visible = prev_visible;
             app.sync_filetree_roots();
+            if let Some(before) = restore_persist {
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::Persist {
+                        enabled: Some(before),
+                    },
+                    PaneOrigin::Cli,
+                );
+            }
             cx.notify();
         });
         if fixture0.starts_with(std::env::temp_dir()) {
@@ -33882,6 +34171,16 @@ mod self_test {
             wait_for_pane_ready(window, cx, other, Duration::from_secs(20)).await,
             "項目 155: 分割したペインのシェルが立つ (#1750)",
         );
+        // 漏れの判定の範囲の錨（#2371。項目 154 と同じ判定を通す）
+        let mut anchors = Vec::new();
+        for pane in [origin, other] {
+            let Some(anchor) = st2371_scan_anchor(any, window, cx, sh, pane, 155).await else {
+                fail(&format!(
+                    "項目 155: 漏れの判定の錨がペイン {pane:?} に出ない (#2371)"
+                ));
+            };
+            anchors.push((pane, anchor));
+        }
         let focus_origin = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp| {
             let _ = window.update(cx, |app, _, cx| {
                 let _ = app.workspace.active_tab_mut().tree_mut().focus(origin);
@@ -33948,6 +34247,13 @@ mod self_test {
                 n,
                 true,
             );
+            if round == 2 && st2371_inject().leak155 {
+                let token = format!("{ST1750_LEAK_MARK}{n}x");
+                let written = st2371_write_leak(window, cx, origin, &token);
+                println!(
+                    "TAKO_SELF_TEST_2371: inject=leak155 {label} token={token} written={written}"
+                );
+            }
             if round == 2 {
                 // 入力中に外（CLI / MCP の focus）からフォーカスを動かされても、パレットは
                 // 開いたまま打鍵と変換を握る（モーダル。閉じるのはユーザーの Esc / 選択）
@@ -34370,23 +34676,27 @@ mod self_test {
             wait_for_focused_text(window, cx, "ST1750E1751", Duration::from_secs(15)).await,
             "項目 155: Web の URL 欄を閉じたあとの打鍵がターミナルへ届く (#1750)",
         );
-        for pane in [origin, other] {
-            let text = st1725_pane_text(window, cx, pane);
-            for forbidden in [
-                ST1750_LEAK_MARK,
-                "PASTE",
-                "しりょう",
-                "資料",
-                "にほんご",
-                "とちゅう",
-                "かくにん",
-                "確認",
-            ] {
-                check(
-                    !text.contains(forbidden),
-                    &format!("項目 155: 入力欄へ打った `{forbidden}` がターミナル {pane:?} へ漏れた (#1750)"),
-                );
-            }
+        // 読む範囲は項目 154 と同じ（グリッド + 器の履歴・錨まで届くこと。#2371）
+        for (pane, anchor) in &anchors {
+            st2371_assert_no_leak(
+                window,
+                cx,
+                *pane,
+                anchor,
+                &[
+                    ST1750_LEAK_MARK,
+                    "PASTE",
+                    "しりょう",
+                    "資料",
+                    "にほんご",
+                    "とちゅう",
+                    "かくにん",
+                    "確認",
+                ],
+                "項目 155",
+                "#1750",
+            )
+            .await;
         }
         println!(
             "TAKO_SELF_TEST_1750: legacy={} rounds={n} ok",
@@ -97979,6 +98289,133 @@ mod self_test_flow_2355_tests {
             );
             assert!(inner.contains("-lt 100000 "), "周回が伸びていない: {cmd}");
         }
+    }
+}
+
+/// #2371: 項目 154 / 155 の漏れの判定（`st2371_judge_leak`）。
+/// 器越しのペインは tako のグリッドに器の画面しか残らないので、画面の外へ流れた漏れは
+/// 器の履歴にしか無い。グリッドだけを読む旧判定はそれを通していた（偽の緑）。
+/// 新判定は器の履歴まで読み、器が読めない・範囲に錨が無いときも通さないことを固定する
+#[cfg(test)]
+mod self_test_leak_scan_2371_tests {
+    use super::self_test::{st2371_judge_leak, St2371Inject, St2371Verdict};
+
+    const FORBIDDEN: &[&str] = &["zqv", "しりょう", "にほんご", "資料"];
+    const ANCHOR: &str = "ST2371S1654";
+
+    /// 器の画面（= グリッド）には流した出力の末尾だけが残る
+    fn screen() -> String {
+        (3970..4000)
+            .map(|n| format!("ST1725TICK{n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 器の履歴: 錨 → 流れの途中に漏れたエコー → 画面
+    fn backend_with(leak: Option<&str>) -> String {
+        let mut lines = vec![ANCHOR.to_string(), "% ( for i in … )".to_string()];
+        for n in 1..3970 {
+            match leak {
+                Some(l) if n == 57 => lines.push(format!("{l}ST1725TICK{n}")),
+                _ => lines.push(format!("ST1725TICK{n}")),
+            }
+        }
+        lines.push(screen());
+        lines.join("\n")
+    }
+
+    #[test]
+    fn 器の履歴にだけある漏れを旧判定は通し新判定は名指して落とす() {
+        let grid = screen();
+        let backend = backend_with(Some("zqv10x"));
+        assert_eq!(
+            st2371_judge_leak(&grid, Some(Ok(&backend)), ANCHOR, FORBIDDEN, true),
+            St2371Verdict::Clean,
+            "旧判定（TAKO_2371_LEGACY=1）は修正前の偽の緑を再現する"
+        );
+        assert_eq!(
+            st2371_judge_leak(&grid, Some(Ok(&backend)), ANCHOR, FORBIDDEN, false),
+            St2371Verdict::Leaked {
+                mark: "zqv".into(),
+                in_backend: true
+            }
+        );
+    }
+
+    #[test]
+    fn 漏れていなければ通る() {
+        let grid = screen();
+        let backend = backend_with(None);
+        assert_eq!(
+            st2371_judge_leak(&grid, Some(Ok(&backend)), ANCHOR, FORBIDDEN, false),
+            St2371Verdict::Clean
+        );
+    }
+
+    #[test]
+    fn 画面に残った漏れは新旧どちらもグリッドで名指す() {
+        let grid = format!("{}\n% zqvlatex", screen());
+        let backend = format!("{}\n% zqvlatex", backend_with(None));
+        for legacy in [false, true] {
+            assert_eq!(
+                st2371_judge_leak(&grid, Some(Ok(&backend)), ANCHOR, FORBIDDEN, legacy),
+                St2371Verdict::Leaked {
+                    mark: "zqv".into(),
+                    in_backend: false
+                },
+                "legacy={legacy}"
+            );
+        }
+    }
+
+    #[test]
+    fn 器の無いペインはグリッドの履歴で判定し錨も見る() {
+        let grid = backend_with(Some("資料"));
+        assert_eq!(
+            st2371_judge_leak(&grid, None, ANCHOR, FORBIDDEN, false),
+            St2371Verdict::Leaked {
+                mark: "資料".into(),
+                in_backend: false
+            }
+        );
+        assert_eq!(
+            st2371_judge_leak(&backend_with(None), None, ANCHOR, FORBIDDEN, false),
+            St2371Verdict::Clean
+        );
+        // スクロールバックの上限で頭が切れた（錨が無い）なら「漏れていない」と読まない
+        assert_eq!(
+            st2371_judge_leak(&screen(), None, ANCHOR, FORBIDDEN, false),
+            St2371Verdict::NotCovered
+        );
+    }
+
+    #[test]
+    fn 器が読めない_範囲が頭まで届かないときは通さない() {
+        let grid = screen();
+        assert_eq!(
+            st2371_judge_leak(
+                &grid,
+                Some(Err("no server running")),
+                ANCHOR,
+                FORBIDDEN,
+                false
+            ),
+            St2371Verdict::Unreadable("no server running".into())
+        );
+        // 器の history-limit で頭が落ちた形（錨も漏れも履歴の外）
+        let truncated = backend_with(None).replace(ANCHOR, "ST1725TICK0");
+        assert_eq!(
+            st2371_judge_leak(&grid, Some(Ok(&truncated)), ANCHOR, FORBIDDEN, false),
+            St2371Verdict::NotCovered
+        );
+    }
+
+    #[test]
+    fn 注入はカンマ区切りで重ねられる() {
+        let all = St2371Inject::parse("leak, leak-late,leak155,direct");
+        assert!(all.leak && all.leak_late && all.leak155 && all.direct);
+        assert_eq!(St2371Inject::parse(""), St2371Inject::default());
+        assert_eq!(St2371Inject::parse("leaky"), St2371Inject::default());
     }
 }
 
