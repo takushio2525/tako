@@ -1164,6 +1164,25 @@ codex 0.154.0 はセッションの終わりに **SIGTERM**、agy はセッシ�
   `file:line` で落とす。本当に行頭に来るなら同じ行か 1 行上に `// 行頭一致安全: <理由>`。
   子の名前を引数や変数で渡す形と、目印を定数で書く形は見ない（既知の穴）
 
+## テストの結果を走らせた人の env で変えない（Issue #2391）
+
+**製品の env 読み（`TAKO_ISOLATED` / `TAKO_SELF_TEST` / `TAKO_TMUX_SOCKET` / `TAKO_DATA_DIR` 等）を
+通るテストは、走らせた人の env をそのまま読まない。** worker は CLI の検証で
+`TAKO_ISOLATED=1 TAKO_DATA_DIR=<短い一時 dir>` を付けたシェルから `cargo test` も回すので、
+CI（env なし）では緑のテストが手元でだけ落ちる（偽の赤）か、検査ごと抜けて緑になる（偽の緑）。
+
+- 実物: `tmux_cleanup` の「自分の環境からの復元は socket_name と一致する」は `TAKO_ISOLATED=1` の下で
+  必ず落ちていた（一括隔離 = tako-app の `main` を通らないテストプロセスで `tako-iso-<pid>` と `tako` を
+  比べる）。usage の番犬 3 本は `TAKO_DATA_DIR=/tmp/…` で「一時ディレクトリの外」と落ち、
+  `paths` / `migrations` の 2 本は `TAKO_DATA_DIR` があると検査を飛ばしていた
+- **書き方**: 判定を純粋関数に分けてあるなら env を引数で渡して表で見る（`resolve_socket_name(pid, env)`）。
+  実 env を読む入口そのものを見るなら、親が `env_remove` してから値を組んだ子プロセス（自分のテスト
+  バイナリを `--exact <名前> --test-threads=1 --nocapture`）で測る。結合テストは
+  `tests/common/detached_env.rs` の `rerun_without`。目印は上の #2248 の形で拾う
+- **やらない**: 走らせた人の env を見て検査を飛ばす（`if var_os(…).is_some() { return }`）/
+  `set_var` でプロセス全体の env を揃える（並列に走る他のテストが同じ env を読む）
+- lib の `src/` で子を起こすと `platform_parity` のコンソール窓の件数表に載る（製品の起動ではない旨の理由を書く）
+
 ## プロセスの生死は境界の 1 実装で決める（Issue #1557 / #1581）
 
 **「その pid は生きているか」を自前で書かない。`tako_core::platform::process::pid_alive`

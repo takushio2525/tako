@@ -2017,11 +2017,47 @@ mod tests {
         assert!(!take_slot(&flag), "2 回目は走らない");
     }
 
-    /// 機構自身が本番のデータディレクトリを触る穴を開けていないこと
+    /// #2391: [`テストビルドでは隔離されていない限り走らない`] が起こし直した子だけが立てる目印
+    const UNISOLATED_CHILD_ENV: &str = "TAKO_2391_MIGRATIONS_CHILD";
+
+    /// 機構自身が本番のデータディレクトリを触る穴を開けていないこと。
+    ///
+    /// `TAKO_DATA_DIR` を外した子プロセスで見る（#2391）。走らせた人の env をそのまま読んでいたので、
+    /// 明示がある環境（worker の検証 env）では検査ごと抜けて緑になっていた
     #[test]
     fn テストビルドでは隔離されていない限り走らない() {
+        if std::env::var_os(UNISOLATED_CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().expect("テストバイナリのパス");
+            let me = "migrations::tests::テストビルドでは隔離されていない限り走らない";
+            let out = std::process::Command::new(exe)
+                .args(["--exact", me, "--test-threads=1", "--nocapture"])
+                .env(UNISOLATED_CHILD_ENV, "1")
+                .env_remove("TAKO_DATA_DIR")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("子のテストを起こせる");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                out.status.success(),
+                "子が失敗した（{}）:\n{text}",
+                out.status
+            );
+            assert!(
+                text.contains("test result: ok. 1 passed"),
+                "子が検査を走らせていない（改名漏れ？）:\n{text}"
+            );
+            return;
+        }
         assert!(
-            std::env::var_os("TAKO_DATA_DIR").is_some() || run(Mode::Apply, None).files.is_empty(),
+            std::env::var_os("TAKO_DATA_DIR").is_none(),
+            "子は TAKO_DATA_DIR を持たない"
+        );
+        assert!(
+            run(Mode::Apply, None).files.is_empty(),
             "隔離されていないテストで本番を触ってはいけない"
         );
     }

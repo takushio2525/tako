@@ -641,34 +641,102 @@ mod tests {
     /// Windows の `%TEMP%` は `C:\Users\<winuser>\AppData\Local\Temp` =
     /// **必ずホーム配下**なので、どう直しても成立しない不変条件を見ていたことになる。
     /// 守りたいことを直接書くほうが強い（製品の置き場と同じ / その配下は禁止・
-    /// かつ一時ディレクトリの中にいる）
+    /// かつ一時ディレクトリの中にいる）。
+    ///
+    /// `data_dir()` の解決は**親が `TAKO_DATA_DIR` を組んだ子プロセス**で見る（#2391）。
+    /// 走らせた人の env をそのまま読んでいたので、明示がある環境（worker の検証 env・
+    /// 隔離セルフテスト）では検査ごと抜けて緑になっていた
     #[test]
     fn テストプロセスのdata_dirは製品の置き場を指さない() {
         // このテスト自身がテストバイナリなので、判定は必ず真になる
         assert!(is_test_process(), "テストバイナリで is_test_process が偽");
-        // `TAKO_DATA_DIR` が明示されている環境（隔離セルフテスト等）はそちらが優先。
-        // 明示が無いときだけ隔離先の性質を見る
-        if std::env::var_os("TAKO_DATA_DIR").is_none_or(|v| v.is_empty()) {
+        // 子の役: 親が組んだ TAKO_DATA_DIR の下で data_dir() の解決を見る
+        if let Ok(mode) = std::env::var(DATA_DIR_CHILD_ENV) {
             let dir = data_dir().expect("テストプロセスでは必ず解決する");
-            assert_eq!(dir, test_data_dir());
-            if let Some(product) = default_data_dir() {
-                assert_ne!(
-                    dir,
-                    product,
-                    "テストの data_dir が製品の置き場と同じ: {}",
-                    dir.display()
-                );
-                assert!(
-                    !dir.starts_with(&product),
-                    "テストの data_dir が製品の置き場の配下: {}",
-                    dir.display()
-                );
+            match mode.as_str() {
+                // 明示なし・空の明示 → 隔離先へ倒れる
+                "fallback" => {
+                    assert_eq!(dir, test_data_dir());
+                    assert_outside_product(&dir);
+                }
+                // 明示の `TAKO_DATA_DIR` はテストでも優先する（隔離セルフテスト・置き場の指定）
+                "explicit" => assert_eq!(
+                    Some(dir),
+                    std::env::var_os("TAKO_DATA_DIR").map(PathBuf::from)
+                ),
+                other => panic!("知らない子の役: {other}"),
             }
+            println!("{DATA_DIR_CHILD_MARKER} {mode} ok");
+            return;
+        }
+        // 隔離先そのものの性質は走らせた人の env に依らず見る
+        assert_outside_product(&test_data_dir());
+        let explicit =
+            std::env::temp_dir().join(format!("tako-2391-explicit-{}", std::process::id()));
+        let cases = [
+            ("明示なし", None, "fallback"),
+            ("空の明示", Some(std::ffi::OsStr::new("")), "fallback"),
+            ("明示", Some(explicit.as_os_str()), "explicit"),
+        ];
+        let exe = std::env::current_exe().expect("テストバイナリのパス");
+        let me = "paths::tests::テストプロセスのdata_dirは製品の置き場を指さない";
+        for (name, value, mode) in cases {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["--exact", me, "--test-threads=1", "--nocapture"])
+                .env(DATA_DIR_CHILD_ENV, mode)
+                // 走らせた人の明示と、隔離を切る A/B の逃げ道（#944）は子へ持ち込まない
+                .env_remove("TAKO_DATA_DIR")
+                .env_remove("TAKO_944_LEGACY")
+                .stdin(std::process::Stdio::null());
+            if let Some(value) = value {
+                cmd.env("TAKO_DATA_DIR", value);
+            }
+            let out = cmd.output().expect("子のテストを起こせる");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
             assert!(
-                dir.starts_with(std::env::temp_dir()),
-                "テストの data_dir が一時ディレクトリの外: {}",
+                out.status.success(),
+                "[{name}] 子が失敗した（{}）:\n{text}",
+                out.status
+            );
+            let done = format!("{mode} ok");
+            assert!(
+                text.lines().any(|line| line
+                    .split_once(DATA_DIR_CHILD_MARKER)
+                    .is_some_and(|(_, rest)| rest.trim() == done)),
+                "[{name}] 子が検査まで届いていない:\n{text}"
+            );
+        }
+    }
+
+    /// #2391: [`テストプロセスのdata_dirは製品の置き場を指さない`] が起こし直した子だけが立てる目印。
+    /// 値は子に見させる形（`fallback` = 隔離先へ倒れる / `explicit` = 明示が優先する）
+    const DATA_DIR_CHILD_ENV: &str = "TAKO_2391_DATA_DIR_CHILD";
+    /// 子が見終えたことを出す行の目印（行の途中から拾う = #2248）
+    const DATA_DIR_CHILD_MARKER: &str = "tako-2391-data-dir:";
+
+    /// テストの隔離先が製品の置き場の外・一時ディレクトリの中にあること
+    fn assert_outside_product(dir: &Path) {
+        if let Some(product) = default_data_dir() {
+            assert_ne!(
+                dir,
+                product,
+                "テストの data_dir が製品の置き場と同じ: {}",
+                dir.display()
+            );
+            assert!(
+                !dir.starts_with(&product),
+                "テストの data_dir が製品の置き場の配下: {}",
                 dir.display()
             );
         }
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "テストの data_dir が一時ディレクトリの外: {}",
+            dir.display()
+        );
     }
 }

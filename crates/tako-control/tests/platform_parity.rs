@@ -910,6 +910,13 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
              起動ではないので Windows の GUI からは到達しない",
         ),
         (
+            "crates/tako-control/src/migrations.rs",
+            1,
+            "テストモジュール内（#2391）。**自分と同じテストバイナリ**を `TAKO_DATA_DIR` を外した子として \
+             起こし、走らせた人の env に依らず「隔離されていないテストでは走らない」を見る 1 件。\
+             製品コードの起動ではないので Windows の GUI からは到達しない",
+        ),
+        (
             "crates/tako-control/src/platform/os_integration.rs",
             7,
             "境界 B8 の macOS / Linux 実装（open / osascript / xdg-open）+ テストの osascript 1 件。\
@@ -951,6 +958,12 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
             "`hostname`（`#[cfg(unix)]`）と macOS 限定の OS 情報取得（sw_vers / uname）",
         ),
         ("crates/tako-core/src/git.rs", 6, "テストモジュール内"),
+        (
+            "crates/tako-core/src/paths.rs",
+            1,
+            "テストモジュール内（#2391）。**自分と同じテストバイナリ**を `TAKO_DATA_DIR` を組んだ子として \
+             起こし、`data_dir()` の解決を走らせた人の env に依らず見る 1 件（製品の起動ではない）",
+        ),
         (
             "crates/tako-core/src/bin_resolve.rs",
             1,
@@ -1026,6 +1039,13 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
             5,
             "tmux e2e テスト内（`#[cfg(unix)]`）。#2098 で 1 件（issue1857 の e2e で子の終わりが\
              届かなかった回だけ `ps` でクライアントの状態を読み、失敗メッセージへ出す。`#[cfg(unix)]`）",
+        ),
+        (
+            "crates/tako-core/src/tmux_cleanup.rs",
+            1,
+            "テストモジュール内（#2391）。**自分と同じテストバイナリ**を `TAKO_TMUX_SOCKET` / \
+             `TAKO_ISOLATED` / `TAKO_SELF_TEST` を組んだ子として起こし、ソケット名の復元と \
+             `socket_name()` を走らせた人の env に依らず見る 1 件（製品の起動ではない）",
         ),
     ];
 
