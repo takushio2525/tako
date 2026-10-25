@@ -1113,6 +1113,20 @@ struct PipeLevel {
 
 const WORD_END: &[char] = &[' ', '\t', '\n', ';', '&', '|', '(', ')', '<', '>'];
 
+/// `${ … }` が置かれた文脈（中の `'` / `$'…'` の読みが変わる。#2378）
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParamCtx {
+    /// 語の地: `'…'` / `$'…'` は引用符（実行時も）
+    Bare,
+    /// `"…"` の中: 3.2 の構文解析は `'…'` / `$'…'` も引用符として読み、中の `}` / `"` / 空白で
+    /// `${ … }` も語も閉じない（`f "${U:-a'}" x "'b}"` は 1 語。5.3 も同じ）。実行時の展開では `'` は
+    /// ただの文字（出力に残り、中の `$( … )` は走る）
+    Dquote,
+    /// クォートされていないヒアドキュメントの本文: 区切りの行で先に切られ、構文解析を通らない
+    /// （対にならない `'` があっても区切りを越えない）。`'` は行継続を取り除くかの判定にだけ使う
+    Heredoc,
+}
+
 impl WordLexer {
     fn new(text: &str) -> Self {
         WordLexer {
@@ -1477,7 +1491,7 @@ impl WordLexer {
                 '"' => self.dquote(),
                 '`' => self.backtick(),
                 '$' if self.peek(1) == Some('(') => self.cmdsub(),
-                '$' if self.peek(1) == Some('{') => self.param(false),
+                '$' if self.peek(1) == Some('{') => self.param(ParamCtx::Bare),
                 '(' if cmd_start && {
                     let so_far: String = self.c[start..self.i].iter().collect();
                     so_far.ends_with('=') && is_assignment_word(&so_far)
@@ -1568,7 +1582,7 @@ impl WordLexer {
                 }
                 '`' => self.backtick(),
                 '$' if self.peek(1) == Some('(') => self.cmdsub(),
-                '$' if self.peek(1) == Some('{') => self.param(true),
+                '$' if self.peek(1) == Some('{') => self.param(ParamCtx::Dquote),
                 _ => self.i += 1,
             }
         }
@@ -1626,14 +1640,28 @@ impl WordLexer {
         }
     }
 
-    /// `${ … }`（中のクォート・コマンド置換も読む）
-    fn param(&mut self, in_dquote: bool) {
+    /// `${ … }`（中のクォート・コマンド置換も読む）。`ctx` = 置かれた文脈（中の `'` の読みが変わる。#2378）
+    fn param(&mut self, ctx: ParamCtx) {
         self.i += 2;
         let mut depth = 1usize;
-        // `"${ … }"` の中の `'` は語の読みではただの文字だが、3.2 の構文解析は単一引用符として読み、
-        // その中の行継続を取り除かない（`"${U:+'a\⏎b'}"` は保存された語に `\` + 改行が残る。#2352）
+        // `'…'` の中か（`"${ … }"` とヒアドキュメントの本文。語の地の `'…'` は `single` が読み切る）
         let mut sq = false;
         while let Some(ch) = self.peek(0) {
+            if sq && ctx == ParamCtx::Dquote {
+                // 構文解析では次の `'` まで何も効かない（`}` / `"` で閉じない・`\` はエスケープしない・
+                // 行継続も残る = `"${U:+'a\⏎b'}"`。#2352）。実行時の展開では `'` はただの文字なので、
+                // 中の `$( … )` / バッククォートは走る（その中の語は読む）
+                match ch {
+                    '\'' => {
+                        sq = false;
+                        self.i += 1;
+                    }
+                    '`' => self.backtick(),
+                    '$' if self.peek(1) == Some('(') => self.cmdsub(),
+                    _ => self.i += 1,
+                }
+                continue;
+            }
             match ch {
                 '\\' => {
                     if !sq {
@@ -1641,12 +1669,12 @@ impl WordLexer {
                     }
                     self.i += 2;
                 }
-                // `${U:-$'it\'s'}` の `\'` で閉じない（#2304）
-                '$' if !in_dquote && self.peek(1) == Some('\'') => {
+                // `${U:-$'it\'s'}` の `\'` で閉じない（#2304）。`"${ … }"` の中も同じ（#2378）
+                '$' if ctx != ParamCtx::Heredoc && self.peek(1) == Some('\'') => {
                     self.i += 1;
                     self.ansi_c();
                 }
-                '\'' if !in_dquote => self.single(),
+                '\'' if ctx == ParamCtx::Bare => self.single(),
                 '\'' => {
                     sq = !sq;
                     self.i += 1;
@@ -1735,7 +1763,7 @@ impl WordLexer {
                         }
                         '`' => self.backtick(),
                         '$' if self.peek(1) == Some('(') => self.cmdsub(),
-                        '$' if self.peek(1) == Some('{') => self.param(true),
+                        '$' if self.peek(1) == Some('{') => self.param(ParamCtx::Heredoc),
                         _ => self.i += 1,
                     }
                 }
@@ -1840,7 +1868,7 @@ fn top_level_unquoted(word: &[char]) -> Vec<bool> {
             '"' => lx.dquote(),
             '`' => lx.backtick(),
             '$' if lx.peek(1) == Some('(') => lx.cmdsub(),
-            '$' if lx.peek(1) == Some('{') => lx.param(false),
+            '$' if lx.peek(1) == Some('{') => lx.param(ParamCtx::Bare),
             _ => {
                 top[lx.i] = true;
                 lx.i += 1;
@@ -2946,6 +2974,230 @@ fn 番犬は行継続を取り除いた語をfile_lineで名指しする() {
     );
 }
 
+#[test]
+fn 二重引用符の中の展開の単一引用符はbash32の構文解析を写す() {
+    // (行, 写しの語 = いちばん外側の語, 3.2 の出力)。出力は `/bin/bash` 3.2.57 で `set -f +B`・
+    // `f() { printf '<%s>' "$@"; }`・`N=xay` の下で 1 行ずつ採った（5.3.15 も同じ）。
+    // `"…"` の中の `${ … }` の `'…'` / `$'…'` は、演算子（`:-` / `:+` / `#` / `%` / `/`）を問わず構文解析では
+    // 引用符（中の `}` / `"` / 空白で `${ … }` も語も閉じない。`'…'` の中の `\` はエスケープしない）。
+    // 実行時の展開では `'` はただの文字で、中の `$( … )` は走る。語の地の `${ … }` は前から同じ（#2304）。
+    // ヒアドキュメントの本文は区切りの行で先に切られる（対にならない `'` があっても後ろのコマンドは走る）
+    let cases: &[(&str, &[&str], &str)] = &[
+        (
+            "f \"${U:-it's}\" x \"it's}\"",
+            &["f", "\"${U:-it's}\" x \"it's}\""],
+            "<it's} x it's>",
+        ),
+        (
+            "f \"${N:+it's}\" x \"it's}\"",
+            &["f", "\"${N:+it's}\" x \"it's}\""],
+            "<it's} x it's>",
+        ),
+        (
+            "f \"${N#it's}\" x \"it's}\" y",
+            &["f", "\"${N#it's}\" x \"it's}\"", "y"],
+            "<xay><y>",
+        ),
+        (
+            "f \"${N%it's}\" x \"it's}\" y",
+            &["f", "\"${N%it's}\" x \"it's}\"", "y"],
+            "<xay><y>",
+        ),
+        (
+            "f \"${N/it's}\" x \"it'/b}\" y",
+            &["f", "\"${N/it's}\" x \"it'/b}\"", "y"],
+            "<xay><y>",
+        ),
+        // 割れない語の中の波括弧（`set +B` なのでそのまま。3.2 の `brace_gobbler` はクォートの外と読む）
+        (
+            "f \"${U:-a'}\" {Q1,R1} \"'b}\"",
+            &["f", "\"${U:-a'}\" {Q1,R1} \"'b}\""],
+            "<a'} {Q1,R1} 'b>",
+        ),
+        // `'…'` の中の `"` で外側の `"` を閉じない
+        (
+            "f \"${U:-'\"'}\" x",
+            &["f", "\"${U:-'\"'}\"", "x"],
+            "<''><x>",
+        ),
+        (
+            "f \"${U:-'}'}\" x",
+            &["f", "\"${U:-'}'}\"", "x"],
+            "<'}'><x>",
+        ),
+        (
+            "f \"${U:-'a\\'}\" x",
+            &["f", "\"${U:-'a\\'}\"", "x"],
+            "<'a\\'><x>",
+        ),
+        // `$'…'` も引用符（3.2 は解いた中身へ包まずに置き換える = `"${U:-}" x "}"`。#2304）
+        (
+            "f \"${U:-$'}\" x \"'}\"",
+            &["f", "\"${U:-$'}\" x \"'}\""],
+            "< x }>",
+        ),
+        // `"…"` は前から入れ子のクォート
+        (
+            "f \"${U:-\"}\"}\" x",
+            &["f", "\"${U:-\"}\"}\"", "x"],
+            "<}><x>",
+        ),
+        // `'…'` の中の `$( … )` は実行時に走る
+        (
+            "f \"${U:-'$(echo }\" x \")'}\"",
+            &["f", "\"${U:-'$(echo }\" x \")'}\""],
+            "<'} x '>",
+        ),
+        // 語の地の `${ … }` の `'…'` / `$'…'` / `"…"`
+        (
+            "f ${U:-'}\" x \"'} y",
+            &["f", "${U:-'}\" x \"'}", "y"],
+            "<}\" x \"><y>",
+        ),
+        (
+            "f ${U:-$'a\\'}'} y",
+            &["f", "${U:-$'a\\'}'}", "y"],
+            "<a'}><y>",
+        ),
+        ("f ${U:-\"}\"} y", &["f", "${U:-\"}\"}", "y"], "<}><y>"),
+        // ヒアドキュメントの本文の `'` は区切りを越えない
+        (
+            "f a <<X\n${U:-it's} z\nX\nf b",
+            &["f", "a", "f", "b"],
+            "<b>",
+        ),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|&(line, want, _)| {
+            let got: Vec<String> = outermost_words(raw_words(line))
+                .into_iter()
+                .map(|w| w.text)
+                .collect();
+            (got != want).then(|| format!("{line:?}\n  3.2: {want:?}\n  写し: {got:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    // 閉じていない `'…'` / `$'…'` / その中の `$(` やバッククォートでも panic しない
+    for broken in [
+        "f \"${U:-'",
+        "f \"${U:-'$(echo",
+        "f \"${U:-'`x",
+        "f \"${U:-$'a\\'",
+        "f \"${U:-'\\",
+    ] {
+        let _ = raw_words(broken);
+        let _ = brace32_file_pairs(broken, true);
+    }
+    // 表の出力が語の数と合う（1 行のものだけ。ヒアドキュメントの行は展開の誤りで `f a` が走らない）
+    for &(line, want, out) in cases {
+        if !line.contains('\n') {
+            assert_eq!(
+                out.matches('<').count(),
+                want.iter().filter(|w| **w != "f").count(),
+                "{line:?}"
+            );
+        }
+    }
+
+    // 実の 3.2 で、表の出力を確かめる
+    let bash = std::env::var(BASH32_ENV)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "/bin/bash".to_string());
+    match bash32_gate(cfg!(target_os = "macos"), &bash, bash_version(&bash)) {
+        Bash32Gate::Run => {}
+        Bash32Gate::Skip(reason) => {
+            eprintln!("skip: {reason}");
+            return;
+        }
+        Bash32Gate::Fail(reason) => panic!("{reason}"),
+    }
+    let lines: Vec<String> = cases.iter().map(|c| c.0.to_string()).collect();
+    let outputs = bash_eval_outputs(
+        &bash,
+        "set -f +B\nf() { printf '<%s>' \"$@\"; }\nN=xay\n",
+        &lines,
+    )
+    .expect("3.2 の出力");
+    let differ: Vec<String> = cases
+        .iter()
+        .zip(&outputs)
+        .filter(|((_, _, want), got)| got != want)
+        .map(|((line, _, want), got)| format!("{line:?}\n  表: {want:?}\n  3.2: {got:?}"))
+        .collect();
+    assert!(
+        differ.is_empty(),
+        "表が実の bash 3.2（{bash}）と食い違う:\n{}",
+        differ.join("\n")
+    );
+}
+
+#[test]
+fn 番犬は二重引用符の中の展開の単一引用符をbash32と同じに読む() {
+    // (番犬, 本文, 名指しの先頭 = 無ければ None)。`"${ … }"` の `'…'` / `$'…'` の中の `}" ` で語は割れない
+    // （`二重引用符の中の展開の単一引用符はbash32の構文解析を写す` の表）。割れたと読むと、波括弧は見逃し、
+    // パイプラインと rm の引数は在るものを見失うか無いものを名指す（#2378）
+    type Check = fn(&str, &str) -> Vec<String>;
+    let brace: Check = brace32_violations;
+    let pipe: Check = pipefail_early_quit_violations;
+    let rm: Check = rm_var_violations;
+    let cases: &[(Check, &str, Option<&str>)] = &[
+        // 波括弧（#1924）: 3.2 は 1 語のまま `{a,b}` をクォートの外と読んで展開する（5.3 も）
+        (
+            brace,
+            "f \"${U:-'}\" {a,b} \"'}\"\n",
+            Some("scripts/x.sh:1: "),
+        ),
+        (
+            brace,
+            "f \"${U:-$'}\" {a,b} \"'}\"\n",
+            Some("scripts/x.sh:1: "),
+        ),
+        // 外側の `"` を閉じた後の語の地の `{a,b}` は意図した展開
+        (brace, "f \"${U:-'\"'}\"{a,b}\n", None),
+        // pipefail（#1633）: `'"'` の後ろのパイプラインは在る・`'}" | … "'` の中のものは無い
+        (
+            pipe,
+            "set -o pipefail\nif f \"${U:-'\"'}\" | grep -q x; then :; fi\n",
+            Some("scripts/x.sh:2: f … | grep -q"),
+        ),
+        (
+            pipe,
+            "set -o pipefail\nif f \"${U:-'}\" | grep -q x \"'}\"; then :; fi\n",
+            None,
+        ),
+        // rm（#2306）: `'"'` の後ろの引数は別の語・`'}" "$d/'` の中のものは既定値の中
+        (
+            rm,
+            "set -u\nrm -rf \"${D:-'\"'}\" \"$d/x\"\n",
+            Some("scripts/x.sh:2: rm の \"$d/x\" は $d が空だと /x を指す"),
+        ),
+        (rm, "set -u\nrm -rf \"${D:-'}\" \"$d/'}\"\n", None),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|&(check, body, want)| {
+            let got = check("scripts/x.sh", body);
+            let ok = match want {
+                Some(head) => got.len() == 1 && got[0].starts_with(head),
+                None => got.is_empty(),
+            };
+            (!ok).then(|| {
+                format!(
+                    "{body:?}\n  名指すべき: {}\n  名指した: {got:?}",
+                    want.map_or("（なし）".to_string(), |h| format!("{h}…"))
+                )
+            })
+        })
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "`\"${{ … }}\"` の中の `'…'` を 3.2 と同じに読んだ名指しと合わない（WordLexer::param。#2378）:\n{}",
+        wrong.join("\n")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 波括弧の写しを実の bash 3.2 と突き合わせる（Issue #1931）
 // ---------------------------------------------------------------------------
@@ -3101,6 +3353,10 @@ enum Slot {
     Param,
     /// `"${U:-@}"`
     DqParam,
+    /// `"${U:-'@'}"` の `'…'` の中（#2378）。3.2 の構文解析は `"…"` の中の `${ … }` の `'` も単一引用符として
+    /// 読み、中の `}` / `"` / 空白で `${ … }` も語も閉じない（5.3 も同じ）。実行時の展開ではただの文字
+    /// （`'` が出力に残り、中の `$( … )` / `${U}` は展開される）
+    DqParamSq,
     /// バッククォートの中のダブルクォート（`` `show "@"` ``）。バッククォートの中は `\` を 1 段
     /// 外してから読むので、`\` の飾りは置かない（`\\"` が閉じのクォートを食う）
     BacktickDq,
@@ -3182,8 +3438,34 @@ impl Slot {
             (AnsiCDqPair, false) => &["", "y", " ", "${U}", "\\'", "\\n"],
             (Param, true) => &["", "x", "${U}", "$(show z)", "\\\n", "$\\\n{U}"],
             (Param, false) => &["", "y", "${U}", "\\\n"],
-            (DqParam, true) => &["", "x", " ", "${U}", "$(show z)", "\\\n", "x\\\n"],
-            (DqParam, false) => &["", "y", " ", "\\\n"],
+            (DqParam, true) => &[
+                "",
+                "x",
+                " ",
+                "${U}",
+                "$(show z)",
+                "\\\n",
+                "x\\\n",
+                "'x'",
+                "'}'",
+                "\"x\"",
+            ],
+            (DqParam, false) => &["", "y", " ", "\\\n", "'y'", "'}'", "\"y\""],
+            // `'…'` の中の `\` は何もエスケープしない・行継続も残る（`"${U:+'a\⏎b'}"`。#2352）
+            (DqParamSq, true) => &[
+                "",
+                "x",
+                " ",
+                "\"",
+                "}",
+                "${U}",
+                "$(show z)",
+                "\\\\",
+                "\\",
+                "\\\n",
+                "}\" ",
+            ],
+            (DqParamSq, false) => &["", "y", " ", "\"", "}", "${U}", "$(show z)", "\\\n", " \""],
             (BacktickDq, true) => &["", "x", " ", "it's ", "${U}", "$(show z)", "\\\n", "x\\\n"],
             (BacktickDq, false) => &["", "y", " ", " it's", "${U}", "$(show z)", "\\\n"],
         }
@@ -3200,6 +3482,7 @@ impl Slot {
                     | Slot::AnsiCDq
                     | Slot::AnsiCDqPair
                     | Slot::DqParam
+                    | Slot::DqParamSq
                     | Slot::BacktickDq
             )
     }
@@ -3255,6 +3538,13 @@ const BRACE_SHAPES: &[(&str, &[Slot])] = {
         ("\"$(show \"it's\")\"$\\\n'@'", &[AnsiC]),
         ("\"$\\\n{U:-$'@'}\"", &[AnsiCDq]),
         ("$(show x\\\n#@)", &[Inner]),
+        // `"${ … }"` の中の `'…'` / `$'…'` は 3.2 の構文解析で引用符（#2378）: 中の `}" ` で語が割れない
+        // （3.2 の `brace_gobbler` は `"` しか見ないので、割れない語の中の波括弧をクォートの外と読む）。
+        // 4 つ目は `'"'` の `"` で外側の `"` を閉じたと読むと、後ろの語の地の波括弧を見失う
+        ("\"${U:-'@'}\"", &[DqParamSq]),
+        ("\"${U:-'}\" @ \"'}\"", &[DqParamSq]),
+        ("\"${U:-$'}\" @ \"'}\"", &[AnsiCDq]),
+        ("\"${U:-'\"'}\"@", &[Outer]),
     ]
 };
 
@@ -3388,15 +3678,20 @@ fn bash32_oracle_cases() -> Vec<OracleCase> {
 }
 
 /// 行ごとの出力。`brace` = 波括弧展開をするか（`set -B` / `set +B`）。
-/// 1 つの bash で全行を `eval` する（構文の誤りはその行だけで止まる）。
 /// `show` / `f` は引数を空白 1 つでつないで出す（クォートの外で割れた `{ Q1,R1 }` も目印
-/// `{ Q1` の形に戻る）。`set -f` はクォートの外の展開結果をファイル名に当てないため。
-/// 出力の区切りが揃わない（途中で bash が終わった）ときは Err
+/// `{ Q1` の形に戻る）。`set -f` はクォートの外の展開結果をファイル名に当てないため
 fn bash32_outputs(bash: &str, lines: &[String], brace: bool) -> Result<Vec<String>, String> {
-    let mut script = format!(
+    let prelude = format!(
         "set -f {}B\nshow() {{ printf '%s ' \"$@\"; }}\nf() {{ printf '%s ' \"$@\"; }}\n",
         if brace { '-' } else { '+' }
     );
+    bash_eval_outputs(bash, &prelude, lines)
+}
+
+/// `prelude` の後で 1 つの bash に全行を `eval` させ（構文の誤りはその行だけで止まる）、行ごとの
+/// 標準出力を返す。出力の区切りが揃わない（途中で bash が終わった）ときは Err
+fn bash_eval_outputs(bash: &str, prelude: &str, lines: &[String]) -> Result<Vec<String>, String> {
+    let mut script = prelude.to_string();
     for (i, line) in lines.iter().enumerate() {
         script.push_str(&format!(
             "printf '\\n@@{i}@@\\n'; eval '{}'\n",
