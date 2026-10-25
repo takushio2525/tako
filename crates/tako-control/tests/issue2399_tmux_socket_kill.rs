@@ -143,7 +143,11 @@ fn 落とせた器ともう居ない器のファイルだけを消し_落とせ�
             "set -euo pipefail\ntmux_socket_kill w1\necho done",
             &[("REAL_TMUX", stub), ("STUB_RC", rc), ("STUB_OUT", msg)],
         );
-        assert!(out.status.success(), "set -e の下でも抜けずに 0 で返る: {}", stderr(&out));
+        assert!(
+            out.status.success(),
+            "set -e の下でも抜けずに 0 で返る: {}",
+            stderr(&out)
+        );
         assert_eq!(String::from_utf8_lossy(&out.stdout), "done\n");
         let files = sb.files();
         let _ = std::fs::remove_file(sb.socket_dir().join("w1"));
