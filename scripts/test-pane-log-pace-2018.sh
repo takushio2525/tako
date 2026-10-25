@@ -27,6 +27,7 @@ set -uo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_MCP_URL TAKO_ORCHESTRATOR_ROLE
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 ARMS="${1:-both}"
 TMP="$(mktemp -d /tmp/tako-2018-XXXXXX)"
 SOCK_NAME="tako-2018-$$"
@@ -35,7 +36,7 @@ FAIL=0
 
 cleanup() {
   stop_isolated_gui "${ISOLATED_GUI_PID:-}"
-  tmux -L "$SOCK_NAME" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$SOCK_NAME"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -118,7 +119,7 @@ run_arm() { # <名前> [VAR=VAL...]
   echo "== ${arm}（$*）"
   rm -rf "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR" "$TAKO_ORCHESTRATOR_DIR" "$TAKO_PANE_LOG_DIR"
   mkdir -p "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR" "$TAKO_ORCHESTRATOR_DIR"
-  tmux -L "$SOCK_NAME" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$SOCK_NAME"
   launch_isolated_gui "$TMP/app-$arm.log" TAKO_PERSIST=1 "$@" || exit $?
   local i
   for i in $(seq 1 300); do
@@ -242,7 +243,7 @@ run_arm() { # <名前> [VAR=VAL...]
 
   stop_isolated_gui "$ISOLATED_GUI_PID"
   ISOLATED_GUI_PID=""
-  tmux -L "$SOCK_NAME" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$SOCK_NAME"
   unset TAKO_SOCKET TAKO_TOKEN
 }
 

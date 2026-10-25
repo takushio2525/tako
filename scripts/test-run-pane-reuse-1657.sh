@@ -32,6 +32,7 @@ set -uo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAKO_MCP_URL
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 . "$REPO_ROOT/scripts/lib/queue.sh" # run_heavy = 重い処理を順番待ちへ（#1994）
 PASS=0
 FAIL=0
@@ -47,7 +48,7 @@ APP_PID=""
 TMUX_SOCKET="tako-1657-$$"
 cleanup() {
   stop_isolated_gui "$APP_PID"
-  tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$TMUX_SOCKET"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -320,7 +321,7 @@ check_eq "tako_run の引数に new_pane がある（ツールは増やしてい
 
 stop_isolated_gui "$APP_PID"
 APP_PID=""
-tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+tmux_socket_kill "$TMUX_SOCKET"
 
 echo
 echo "== ⑥' 器（tmux）つきでも同じ: 差し替えと capture-pane =="
@@ -351,7 +352,7 @@ check_eq "capture-pane のどのセッションにもマーカーが無い" "0" 
 check_eq "capture-pane に案内が出ている実行ペインは 1 本（差し替えた旧ペインの器は消えた）" "1" "$THINT"
 stop_isolated_gui "$APP_PID"
 APP_PID=""
-tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+tmux_socket_kill "$TMUX_SOCKET"
 
 echo
 echo "== ⑦ A/B: TAKO_1657_LEGACY=1（同じバイナリ）は積んでマーカーを出す =="
@@ -373,7 +374,7 @@ case "$LSCREEN" in
 esac
 stop_isolated_gui "$APP_PID"
 APP_PID=""
-tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+tmux_socket_kill "$TMUX_SOCKET"
 
 echo
 echo "== ⑧ タイトルバーのバッジ（visual-test の run-badge 節）=="

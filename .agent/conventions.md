@@ -3067,6 +3067,46 @@ rm -rf "$(git rev-parse --show-toplevel)/target"   # ✗ コマンド置換は�
 Issue の名指しどおり `${var:?}` にした。PowerShell の `Remove-Item` は 5 か所とも `-LiteralPath $x`
 だけで、空なら引数の束縛で止まる（同型 0）。
 
+## 検証スクリプトの器はソケットファイルまで消す（Issue #2399）
+
+tmux（3.6b で実測）は `kill-server` で落としても、最後のセッションが閉じて**自分で抜けても**
+`$TMUX_TMPDIR/tmux-<uid>/<名前>` のソケットファイルを残す。`kill-server` だけの後片付けは走るたびに
+1 個ずつためる（Rust のテストの側は #2393 の節 = `tmux_backend::kill_server`）。検証スクリプトは
+1 実装 `scripts/lib/tmux-socket.sh` の `tmux_socket_kill <名前>...` で器とファイルを一緒に片付ける:
+
+```bash
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"     # trap より前に読む（途中で落ちても関数がある）
+cleanup() { stop_isolated_gui "$PID"; tmux_socket_kill "$SOCKET"; rm -rf "${TMP:?}"; }
+trap cleanup EXIT
+```
+
+- 空の名前は何もしない（器を起こす前に後片付けが走った = 正常）。`tako`（本番の器）・`default`・
+  `/` を含む名前は触らずに stderr へ 1 行
+- ファイルを消すのは「落とせた（0）」か「もう居ない（`no server running`）」のときだけ。繋げない
+  （`Permission denied`・版の食い違い）なら器が生きているかもしれないので**残す**（消すと名前で
+  辿れない器になり、`tako tmux cleanup --servers` からも見えなくなる）
+- tmux は `REAL_TMUX`（PATH を偽の tmux へ差し替えたスクリプトが本物を握る変数）→ `tmux` の順。常に 0 を返す
+
+**番犬**: `shell_scripts.rs` の `器を起こすスクリプトはソケットファイルまで消す`。**器を起こす印**
+（`TAKO_PERSIST=<真>` を GUI へ渡す / `tmux -L … new-session`）のある `.sh` だけを見て、
+`tmux -L <器> … kill-server`（`"$REAL_TMUX"` / 条件 / ループ / `trap` の文字列 / `$( … )` の中も）を
+file:line で名指す。後ろ 3 コマンド以内でソケットの置き場（`tmux-$(id -u)`）か器の名前の変数を使う rm が
+あれば通す（#2350 / #2367 の自前の形）。起こすのにどこでも落とさないファイルも名指す。監査して
+確かめた箇所だけ、その行か直前の行に `# tako:tmux-socket-ok <理由>` で外せる。
+印の無いスクリプトは見ない: 隔離 GUI は `TAKO_PERSIST` を渡さなければ器を作らない
+（`TAKO_ISOLATED` の既定 = `TAKO_PERSIST=0`・#1979）ので、その `kill-server` は空振りの念押し。
+1 実装の振る舞い（消す / 残すの分かれ目・本物の tmux での trap の経路）は
+`crates/tako-control/tests/issue2399_tmux_socket_kill.rs`（本物の tmux の 2 本は #2106 の門を通す）。
+
+#2399 の棚卸し（`kill-server` を含む `.sh` は 136 本）: 器を起こすのは 40 本。そのうち 32 本・47 か所が
+ファイルを残す形だった（27 本は後片付けの trap ごと残す・5 本は途中の腕の切り替えだけで、最後は自前の rm が
+消していた）。残骸として見えていたのは `tako tmux cleanup --servers` が拾わない名前の `t2009-*`
+（`test-preview-memory-2009.sh`）・`t2020-*`（`test-sessions-write-2020.sh`）だけで、`tako-*` の名前
+（`tako-fp-*` = `measure-footprint-2011.sh` ほか）は製品の掃除が後から消していたので隠れていた。
+`nightly-footprint-watch.sh` は器を起こさない（子の `measure-footprint-2011.sh` が起こす）ので番犬の
+対象外だが、子を KILL したときの保険の `kill-server` も同じ 1 実装へ寄せた。残りの 96 本は印が無い。
+
 ## `.app` の差し替えは置き場のパスを空けない（Issue #1042）
 
 **`/Applications/tako.app` を差し替えるときに、そのパスが空になる瞬間を作ってはいけない。**

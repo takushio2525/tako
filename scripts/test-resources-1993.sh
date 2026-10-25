@@ -18,6 +18,7 @@ set -uo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAKO_MCP_URL
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 PASS=0
 FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
@@ -29,7 +30,7 @@ SOCKET="tk1993-$$"
 FAKE_PIDS=""
 cleanup() {
   stop_isolated_gui "${ISOLATED_GUI_PID:-}"
-  tmux -L "$SOCKET" kill-server 2>/dev/null
+  tmux_socket_kill "$SOCKET"
   for p in $FAKE_PIDS; do kill "$p" 2>/dev/null; done
   rm -rf "$TMP"
 }

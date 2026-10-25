@@ -27,6 +27,7 @@ set -euo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_ORCHESTRATOR_ROLE TAKO_TAB_ID
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 PASS=0
 FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
@@ -41,7 +42,7 @@ SOCKET="tako-2120-$$"
 APP_PID=""
 cleanup() {
   stop_isolated_gui "$APP_PID"
-  tmux -L "$SOCKET" kill-server 2>/dev/null || true
+  tmux_socket_kill "$SOCKET"
   rm -rf "$TMP"
 }
 # 途中で死んだテストを「緑」に化けさせない（#1864）

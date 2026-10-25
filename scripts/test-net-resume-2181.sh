@@ -36,6 +36,7 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAK
   TAKO_BACKEND_SOCKET TAKO_CLI
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 FAKE="$REPO_ROOT/scripts/lib/fake-agent-net-2112.sh"
 # 低いペインの行数の幅。pane 2716 と同じく「締めの行・通知・入力欄で埋まり、エラーの頭の行が
 # 画面の外」になる高さ（偽のエージェントの描く形で、10 行ならエラーは 11 行目 = 画面の外・
@@ -62,7 +63,7 @@ stop_listener() {
   fi
 }
 kill_tmux() {
-  [ -n "$TMUX_SOCKET" ] && tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1
+  [ -n "$TMUX_SOCKET" ] && tmux_socket_kill "$TMUX_SOCKET"
   TMUX_SOCKET=""
 }
 cleanup() {

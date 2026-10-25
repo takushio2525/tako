@@ -26,6 +26,7 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE
 unset CLAUDE_CONFIG_DIR CLAUDE_CODE_SESSION_ID CLAUDECODE CLAUDE_CODE_CHILD_SESSION
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 LEGACY="${TAKO_1989_LEGACY:-}"
 PASS=0
 FAIL=0
@@ -53,7 +54,7 @@ cleanup() {
       [ -n "$p" ] && kill "$p" 2>/dev/null
     done < "$JOBS"
   fi
-  "${REAL_TMUX:-tmux}" -L "tako-1989-$$" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "tako-1989-$$"
   rm -rf "$TMP"
 }
 trap cleanup EXIT

@@ -30,6 +30,7 @@ PROMO_OUT=${TAKO_PROMO_OUT:-"$HOME/Desktop/tako-promo"}
 PROMO_FRAMES=${TAKO_PROMO_FRAMES:-/private/tmp/tako-promo-frames}
 PROMO_DEMO=/private/tmp/tako-demo
 PROMO_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$PROMO_LIB_DIR/../lib/tmux-socket.sh"
 # 収録で起こす claude（隔離 tako の master / worker / setup アシスタント）に使う Claude Code の
 # 設定ディレクトリ（= アカウント）。空なら従来どおりデモ HOME 配下（`$PROMO_DEMO/home/.claude`。
 # 資格情報はログインキーチェーンの既定項目を共有）。`TAKO_PROMO_CLAUDE_CONFIG_DIR=$HOME/.claude-univ`
@@ -1008,7 +1009,7 @@ promo_stop_isolated() {
         sleep 1
         kill -9 "$PROMO_APP_PID" 2>/dev/null || true
     fi
-    [ -n "$socket" ] && { tmux -L "$socket" kill-server 2>/dev/null || true; }
+    tmux_socket_kill "$socket"
     return 0
 }
 

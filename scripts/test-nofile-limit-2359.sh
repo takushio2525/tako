@@ -35,6 +35,7 @@ set -uo pipefail
 # **本番 GUI を指す env を最初に落とす**（#1449 / #1450 で本番にペインが漏れた実例が 2 件）
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_MCP_URL TAKO_ORCHESTRATOR_ROLE
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 MAIN_APP_BIN="${MAIN_APP_BIN:-}"
 PASS=0
 FAIL=0
@@ -50,7 +51,7 @@ cleanup() {
   [ -n "$HOLD_PID" ] && kill "$HOLD_PID" 2>/dev/null
   [ -n "$APP_PID" ] && stop_isolated_gui "$APP_PID"
   for p in "$TMP"/*/tmux; do
-    [ -f "$p" ] && tmux -L "$(cat "$p")" kill-server >/dev/null 2>&1
+    [ -f "$p" ] && tmux_socket_kill "$(cat "$p")"
   done
   rm -rf "${TMP:?}"
 }
