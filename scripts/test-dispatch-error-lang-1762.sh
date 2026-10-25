@@ -39,7 +39,8 @@
 #   #2365 の 3 本目で次も足した（保存の断りに添える案内と dispatch の個別の文）:
 #      savechanged / savedeleted  外で書き換えた / 消したファイルの保存（理由の文 + 抜け方の案内 =
 #                 Reason::SaveRefused。修正前は英語表示で「英語の断り + 日本語の案内」が混ざった）
-#      nofile / nocolumn / newtabdir  開けないファイル・line の無い column・new_tab と方向（open_file）
+#      nofile / nocolumn / newtabdir  開けないファイル・line の無い column・new_tab と方向（open_file。
+#                 後ろの 2 つは CLI では clap が先に断るので MCP から引く）
 #      notfolder / nofolder  フォルダではない / 無いフォルダでタブを作る（TabNew）
 #      badjump / resizeboth / notitle / fgboth / zoomboth  jump の action・resize の delta と share・
 #                 title も role も無い・pane と tab・zoom の同時指定
@@ -322,12 +323,15 @@ if new:
     fi
   done
   cli_case nofile open /nonexistent-tako-2365.rs --pane "${first:-0}"
-  cli_case nocolumn open /etc/hosts --pane "${first:-0}" --column 3
-  cli_case newtabdir open /etc/hosts --pane "${first:-0}" --new-tab --right
   cli_case notfolder tab new --cwd /etc/hosts
   cli_case nofolder tab new --cwd /nonexistent-tako-2365
   mcp="$(mcp_call tako_open_file "{\"pane\":${first:-0},\"path\":\"/nonexistent-tako-2365.rs\"}" "$DIR/nofile.mcp")"
   echo "$mcp" > "$DIR/nofile.mcperr"
+  # column 単独・new_tab と方向は CLI では clap が先に断るので、dispatch へ届く MCP から引く
+  mcp="$(mcp_call tako_open_file "{\"pane\":${first:-0},\"path\":\"/etc/hosts\",\"column\":3}" "$DIR/nocolumn.mcp")"
+  echo "$mcp" > "$DIR/nocolumn.mcperr"
+  mcp="$(mcp_call tako_open_file "{\"pane\":${first:-0},\"path\":\"/etc/hosts\",\"new_tab\":true,\"direction\":\"right\"}" "$DIR/newtabdir.mcp")"
+  echo "$mcp" > "$DIR/newtabdir.mcperr"
   mcp="$(mcp_call tako_jump '{"action":"sideways"}' "$DIR/badjump.mcp")"
   echo "$mcp" > "$DIR/badjump.mcperr"
   mcp="$(mcp_call tako_resize_pane "{\"pane\":${first:-0},\"axis\":\"x\",\"delta\":0.1,\"share\":0.5}" "$DIR/resizeboth.mcp")"
@@ -392,7 +396,7 @@ judge() {
     "$DIR"/rangeout.cli "$DIR"/version.cli "$DIR"/nocomment.cli "$DIR"/cardempty.cli \
     "$DIR"/norun.cli "$DIR"/rangeout.mcp "$DIR"/nocomment.mcp "$DIR"/nocmds.mcp \
     "$DIR"/savechanged.cli "$DIR"/savedeleted.cli "$DIR"/savechanged.mcp "$DIR"/savedeleted.mcp \
-    "$DIR"/nofile.cli "$DIR"/nocolumn.cli "$DIR"/newtabdir.cli "$DIR"/notfolder.cli \
+    "$DIR"/nofile.cli "$DIR"/nocolumn.mcp "$DIR"/newtabdir.mcp "$DIR"/notfolder.cli \
     "$DIR"/nofolder.cli "$DIR"/nofile.mcp "$DIR"/badjump.mcp "$DIR"/resizeboth.mcp \
     "$DIR"/notitle.mcp "$DIR"/fgboth.mcp "$DIR"/zoomboth.mcp "$DIR"/notfolder.mcp \
     "$DIR"/badname.mcp "$DIR"/nopaths.mcp "$DIR"/copyid.mcp "$DIR"/copygone.mcp \
