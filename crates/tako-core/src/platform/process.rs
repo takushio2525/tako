@@ -51,7 +51,7 @@ pub fn no_console_window(cmd: &mut Command) -> &mut Command {
 /// 「終わったか」を待ち合わせる用途には使わないこと（`remote.rs` の `has_terminated` が
 /// ゾンビ判定込みでそれを担う）
 pub fn pid_alive(pid: u32) -> bool {
-    imp::pid_alive(pid) || injected_linger(pid)
+    imp::pid_alive(pid) || injected_linger(pid) || super::procinfo::injected_reuse(pid)
 }
 
 /// #2275 の注入: **テストプロセスでだけ**、居なくなった pid を最初に見てから n ミリ秒は
@@ -107,12 +107,54 @@ pub fn wait_gone(pid: u32, limit: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + limit;
     loop {
         if !pid_alive(pid) {
+            // #2284 の注入の台帳へ（看取りを確かめた pid）。注入が無ければ何もしない
+            super::procinfo::note_reaped_gone(pid);
             return true;
         }
         if std::time::Instant::now() >= deadline {
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// 看取った子（終わって `wait()` 済み）を、**その pid を再利用させないまま**持つ（#2284）。
+///
+/// Windows の pid は、プロセスオブジェクトへのハンドルがすべて閉じた時点で解放され、
+/// 直後に起こされた別のプロセスへ**再利用されうる**。`Child` を drop すると親のハンドルが
+/// 閉じるので、「看取った pid = 確実に死んでいる pid」として生死の判定を確かめるテストが
+/// drop した後に読むと、pid を取った別プロセスの生存を読む（#2284 の 10/24 の再発）。
+/// これを持つ間は `Child`（= ハンドル）を持ち続けるので、オブジェクトは「終了済みだが残る」
+/// 状態に留まり pid は再利用されない（[`alive_unless_exited`] の Microsoft の仕様の節）。
+/// その間の [`pid_alive`] は終了コードで「居ない」と答える（#2275）。
+///
+/// unix は `wait()` で刈り取った時点で pid が解放されるので押さえにならないが、
+/// 割り当てが順送りなのですぐ再利用されることは実質ない。
+/// **起動の作法（[`no_console_window`] など）は呼び手が `cmd` に付ける**
+pub struct ReapedChild {
+    child: std::process::Child,
+}
+
+impl ReapedChild {
+    /// `cmd` を起こし、終わるまで待って看取る
+    pub fn run(cmd: &mut Command) -> std::io::Result<Self> {
+        let child = cmd.spawn()?;
+        super::procinfo::pin_against_reuse(child.id(), true);
+        // 先に包む: wait が失敗しても Drop で押さえを外す
+        let mut reaped = Self { child };
+        reaped.child.wait()?;
+        Ok(reaped)
+    }
+
+    /// 看取った子の pid（これを持つ間は再利用されない）
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+impl Drop for ReapedChild {
+    fn drop(&mut self) {
+        super::procinfo::pin_against_reuse(self.child.id(), false);
     }
 }
 
@@ -434,6 +476,32 @@ mod tests {
             );
             drop(child);
         }
+    }
+
+    /// [`ReapedChild`] の両端（#2284）: 起こせないコマンドは `Err`。起こせた子は終わるまで
+    /// 待って看取り、押さえを持つ間のその pid は居ない（Windows は終了コード = #2275）
+    #[test]
+    fn reaped_childは起こせないコマンドをerrで返し看取った子のpidを持つ() {
+        let mut missing = Command::new("tako-no-such-program-2284");
+        assert!(
+            ReapedChild::run(no_console_window(&mut missing)).is_err(),
+            "起こせないコマンドを看取れたことにした"
+        );
+        // すぐ終わる子。起動は 1 か所で抑止を通す（#628 の番犬の数え方）
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/C", "exit 0"])
+        } else {
+            ("true", &[])
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(args).stdout(std::process::Stdio::null());
+        let reaped = ReapedChild::run(no_console_window(&mut cmd)).expect("起こして看取れる");
+        let pid = reaped.pid();
+        assert!(
+            !pid_alive(pid),
+            "看取った子 {pid} を押さえの間に居ると読んだ"
+        );
+        drop(reaped);
     }
 
     /// `wait_gone` の両端: 居続ける pid は上限で諦めて `false`、居ない pid は待たずに `true`
