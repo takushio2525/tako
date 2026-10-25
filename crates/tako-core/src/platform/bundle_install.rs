@@ -398,22 +398,17 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
 
-    /// `TAKO_1042_LEGACY` はプロセス全体のグローバルなので、触るテストは直列化する
-    /// （#608 / #807 と同じ形）
-    static LEGACY_ENV: Mutex<()> = Mutex::new(());
-
-    fn legacy_guard() -> MutexGuard<'static, ()> {
-        LEGACY_ENV.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// `TAKO_1042_LEGACY` を立てて、panic しても必ず戻す
+    /// `TAKO_1042_LEGACY` を立てて、panic しても必ず戻す。
+    ///
+    /// env はプロセスに 1 つなので、呼ぶのは `run_alone!` を通したその 1 本だけの子の中だけ（#2400。
+    /// 以前はこのモジュールの `Mutex` で囲んでいたが、それは同じロックを取るテストしか止めない）
     struct LegacyEnv;
 
     impl LegacyEnv {
         fn set() -> Self {
-            // SAFETY: 呼び出し側が `legacy_guard()` で直列化している
+            crate::test_child::assert_alone("LegacyEnv::set");
+            // SAFETY: 子のプロセスにはこのテストしか居ない（上の assert_alone）
             unsafe { std::env::set_var("TAKO_1042_LEGACY", "1") };
             Self
         }
@@ -421,6 +416,7 @@ mod tests {
 
     impl Drop for LegacyEnv {
         fn drop(&mut self) {
+            // tako:env-write-ok 戻すだけ（作る側の set が assert_alone で子の中を確かめている）
             // SAFETY: 同上
             unsafe { std::env::remove_var("TAKO_1042_LEGACY") };
         }
@@ -478,7 +474,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn 既存を差し替えても置き場のパスは空にならない() {
-        let _guard = legacy_guard();
         let root = TempRoot::new("replace");
         let dest = root.dir.join("Applications/tako.app");
         let new = root.dir.join("new/tako.app");
@@ -504,7 +499,6 @@ mod tests {
 
     #[test]
     fn 差し替えのあと作業用ディレクトリが残らない() {
-        let _guard = legacy_guard();
         let root = TempRoot::new("staging");
         let apps = root.dir.join("Applications");
         let dest = apps.join("tako.app");
@@ -525,7 +519,6 @@ mod tests {
 
     #[test]
     fn 置き場が空なら新規に置ける() {
-        let _guard = legacy_guard();
         let root = TempRoot::new("fresh");
         let dest = root.dir.join("Applications/tako.app");
         std::fs::create_dir_all(dest.parent().unwrap()).expect("親");
@@ -539,7 +532,6 @@ mod tests {
 
     #[test]
     fn 差し替え元が無ければ置き場に触らない() {
-        let _guard = legacy_guard();
         let root = TempRoot::new("missing-src");
         let dest = root.dir.join("Applications/tako.app");
         make_bundle(&dest, "0.8.0");
@@ -558,7 +550,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn swap経路では置き場が常に有効なバンドルで埋まっている() {
-        let _guard = legacy_guard();
         let root = TempRoot::new("occupied");
         let dest = root.dir.join("Applications/tako.app");
         let new = root.dir.join("new/tako.app");
@@ -589,7 +580,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn 標準的でないバンドルはバンドルごと入れ替える() {
-        let _guard = legacy_guard();
         let root = TempRoot::new("nonstandard");
         let dest = root.dir.join("Applications/tako.app");
         let new = root.dir.join("new/tako.app");
@@ -612,7 +602,10 @@ mod tests {
     /// A/B 計測の逃げ道が生きていることの固定
     #[test]
     fn 旧挙動へ戻す逃げ道が効く() {
-        let _guard = legacy_guard();
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if crate::run_alone!(旧挙動へ戻す逃げ道が効く) {
+            return;
+        }
         let root = TempRoot::new("legacy");
         let dest = root.dir.join("Applications/tako.app");
         let new = root.dir.join("new/tako.app");

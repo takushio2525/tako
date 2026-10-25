@@ -433,7 +433,10 @@ mod tests {
 
     #[test]
     fn 上限は_env_で変えられ不正は既定へ落ちる() {
-        // env を触るテストはこの 1 本だけ
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(上限は_env_で変えられ不正は既定へ落ちる) {
+            return;
+        }
         std::env::set_var("TAKO_LSP_XREF_TIMEOUT_SECS", "x");
         assert_eq!(xref_timeout(), DEFAULT_XREF_TIMEOUT);
         std::env::set_var("TAKO_LSP_XREF_TIMEOUT_SECS", "5");

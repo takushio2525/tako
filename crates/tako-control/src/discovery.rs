@@ -388,8 +388,13 @@ mod tests {
     /// 「生きているソケット」を指すので socket 判定では一切消えなくなっていた
     #[test]
     fn 候補列はcurrentと生存インスタンスを返し死骸は掃除される() {
-        // このテストは env（TAKO_DISCOVERY_DIR）でモジュール全体の置き場を差し替える。
-        // 他テストと並列でも安全なよう、env を使う検証はこの 1 本に集約してある
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(候補列はcurrentと生存インスタンスを返し死骸は掃除される)
+        {
+            return;
+        }
+        // このテストは env（TAKO_DISCOVERY_DIR）でモジュール全体の置き場を差し替える
+        // （子のプロセスの中だけ。親で並走する他のテストの置き場は変わらない）
         let dir = temp_path("candidates");
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("TAKO_DISCOVERY_DIR", &dir);

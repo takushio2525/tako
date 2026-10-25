@@ -468,6 +468,10 @@ mod tests {
 
     #[test]
     fn e2e_checkpoint_list_update_restart() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(e2e_checkpoint_list_update_restart) {
+            return;
+        }
         let dir = temp_dir("e2e");
         let path = dir.join("task_checkpoints.yaml");
         std::env::set_var("TAKO_TASK_CHECKPOINTS_FILE", &path);

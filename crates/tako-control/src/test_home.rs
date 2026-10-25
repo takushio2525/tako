@@ -10,6 +10,11 @@
 //!
 //! の 3 つを取りこぼしやすいので、`Drop` で必ず戻す 1 実装に寄せてある。
 //!
+//! 戻しても**差し替えている間**は漏れる: `HOME` はプロセスに 1 つで、lib のテストは 1 プロセスで
+//! 並列に走るので、窓に並走する他のテストの `home_dir()` まで一時ディレクトリを指す。
+//! そのため [`HomeGuard::set`] は `tako_core::run_alone!` を通した**その 1 本だけの子**の中でしか
+//! 呼べない（子の外なら `assert_alone` が panic する。#2400）
+//!
 //! ホーム解決の**正本**は [`tako_core::paths::home_dir`]（#870 / #893）。
 //! ここは「解決」ではなく「差し替えと復元」なので、控えを取る目的で
 //! `HOME` を直接読む唯一の場所（番犬 `home_dir_watchdog` が名指しで許可している）。
@@ -25,6 +30,7 @@ pub(crate) struct HomeGuard {
 impl HomeGuard {
     /// `HOME` を `dir` へ向ける
     pub(crate) fn set(dir: &Path) -> Self {
+        tako_core::test_child::assert_alone("HomeGuard::set");
         let original = std::env::var_os("HOME");
         std::env::set_var("HOME", dir);
         Self { original }
@@ -33,6 +39,7 @@ impl HomeGuard {
 
 impl Drop for HomeGuard {
     fn drop(&mut self) {
+        // tako:env-write-ok 戻すだけ（作る側の set が assert_alone で子の中を確かめている）
         match self.original.take() {
             Some(home) => std::env::set_var("HOME", home),
             // 元が未設定なら消す（空文字を残すと `home_dir()` の意味が変わる）
@@ -48,6 +55,10 @@ mod tests {
     /// panic しても元へ戻ること（旧実装の手書き復元はここで漏れていた）
     #[test]
     fn panicしてもhomeは元へ戻る() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(panicしてもhomeは元へ戻る) {
+            return;
+        }
         let before = std::env::var_os("HOME");
         // 差し替え先は一意な置き場（#1666。固定名の一時パスをテストに置かない。差し替えの間に
         // 同じプロセスの他のテストが HOME の下へ書いても、置き場ごと消える）

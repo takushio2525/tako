@@ -42,8 +42,8 @@ const SETUP_DEPS: &str = "crates/tako-control/src/setup_deps.rs";
 const TAILSCALE: &str = "crates/tako-control/src/tailscale.rs";
 const REMOTE_SETUP: &str = "crates/tako-control/src/remote_setup.rs";
 
-/// `TAKO_TAILSCALE_BIN` を書き換える / スタブを起こすテストを直列にする。
-/// env の読み書きを重ねないためと、孫を残すテストの spawn を他と重ねないため（#1748）
+/// スタブを起こすテストを直列にする。孫を残すテストの spawn を他と重ねないため（#1748）。
+/// `TAKO_TAILSCALE_BIN` を書き換えるテストは #2400 からその 1 本だけの子で書く（親の env は変えない）
 #[cfg(unix)]
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -138,6 +138,11 @@ fn stub(dir: &Path, name: &str, body: &str) -> String {
 #[test]
 fn 依存段とremoteの答えが揃う() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // env を書き換えるので、この 1 本だけの子で走らせる（#2400）。SERIAL を取ってから子を起こす
+    // （子の spawn を、並走するテストのスタブの書き込み・孫の spawn と重ねない = #1748）
+    if tako_core::run_alone!(依存段とremoteの答えが揃う) {
+        return;
+    }
     let dir = tako_core::test_residue::ScratchDir::new("tako-1797-detect");
     // PATH の外（App Store 版の .app 同梱 CLI を模す）。PATH は触らない = PATH からは見えない
     let apps = stub(

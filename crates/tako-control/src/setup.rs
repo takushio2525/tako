@@ -1037,10 +1037,6 @@ mod tests {
 
     // --- setup ディレクトリの置き場（Issue #1019） ---------------------------
 
-    /// `TAKO_DATA_DIR` はプロセス全体のグローバルなので、触るテストは直列化する
-    /// （`platform::path` の `LEGACY_ENV` と同じ形）
-    static DATA_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// 一時ディレクトリ（テスト間で衝突しない名前）
     fn tmp(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1228,8 +1224,6 @@ mod tests {
     /// 旧い場所が無い環境（新規ユーザー・macOS の既存ユーザー）は no-op
     #[test]
     fn 旧い場所が無ければ何もしない() {
-        // `setup_relocation_target` は env を読むので、TAKO_DATA_DIR を触るテストと直列化する
-        let _guard = DATA_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let root = tmp("absent");
         // テストプロセスは data dir が隔離されている（#944）ので、実環境の旧い場所が
         // 在っても None になる = ユーザーの setup を吸い上げない
@@ -1261,7 +1255,11 @@ mod tests {
     /// `TAKO_DATA_DIR` を渡したら**その中**を指す（隔離が効く = 受け入れ条件 1 の土台）
     #[test]
     fn 隔離時のsetupディレクトリはtako_data_dirの中を指す() {
-        let _guard = DATA_DIR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(隔離時のsetupディレクトリはtako_data_dirの中を指す)
+        {
+            return;
+        }
         let saved = std::env::var_os("TAKO_DATA_DIR");
         let iso = tmp("isolated");
         std::env::set_var("TAKO_DATA_DIR", &iso);
