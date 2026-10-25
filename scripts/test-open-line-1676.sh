@@ -43,6 +43,14 @@ check_contains() {
   esac
 }
 
+# 表示言語に従う断り（#2365）は日英どちらかの形で当たればよい（$2 = 日本語 / $3 = 英語）
+check_contains_either() {
+  case "$4" in
+    *"$2"* | *"$3"*) pass "$1" ;;
+    *) fail "$1（'${2}' / '${3}' を含まない: ${4}）" ;;
+  esac
+}
+
 TMP="$(mktemp -d /tmp/tako-1676-XXXXXX)"
 APP_PID=""
 TMUX_SOCKET="tako-1676-$$"
@@ -231,7 +239,7 @@ echo "  1 行ファイル: $(oneline "$OUT_ONE")"
 check_eq "1 行ファイルは行 1 へ丸める" "1" "$(field line "$OUT_ONE")"
 check_eq "丸めたことを知らせる" "True" "$(field clamped "$OUT_ONE")"
 ERR_MISSING="$(open_line "$FIX/nope.rs" --line 1)"
-check_contains "存在しないファイルはエラー" "ファイルを開けない" "$ERR_MISSING"
+check_contains_either "存在しないファイルはエラー" "ファイルを開けない" "cannot open the file" "$ERR_MISSING"
 
 echo
 echo "== 結果: PASS=$PASS FAIL=$FAIL =="

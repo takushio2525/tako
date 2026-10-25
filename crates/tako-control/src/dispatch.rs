@@ -257,6 +257,83 @@ pub enum Reason {
     GatePredicate,
     /// CLI の方向の引数（`parse_direction`）
     CliInvalidDirection(String),
+    // ---- #2365 の 3 本目: プレビュー・編集 ----
+    /// 外部変更の競合・未保存の変更から抜ける手段の案内（#1659）。
+    ///
+    /// 保存が断られた・別のファイルを開けなかったときのエラーへ添える（「保存しなかった」とだけ
+    /// 返すと、呼び手はペインを閉じる以外の抜け方を知らない）。CLI と MCP のどちらから来ても
+    /// 同じ文面で、MCP は `tako_preview_save` の `action` で同じ操作になる。
+    /// 中身は外部変更の状態（`None` = 競合は無く、未保存の変更だけがある）
+    RecoveryHint(Option<tako_core::DiskState>),
+    /// 外部変更で断られた保存の文（`message` = 保存の口が返した理由の文）に抜け方を添える
+    SaveRefused {
+        message: String,
+        conflict: tako_core::DiskState,
+    },
+    /// 未保存の変更があるプレビューへ別のファイルを差し替えようとした（GUI の `set_preview`）
+    UnsavedBlocksOpen(Option<tako_core::DiskState>),
+    NewTabWithDirection,
+    ColumnNeedsLine,
+    CannotOpenFile {
+        path: String,
+        error: String,
+    },
+    /// 開いたが着地点を予約できなかった（拡張子はテキストなのに中身が読めない）
+    OpenedButNoLine {
+        path: String,
+        error: String,
+    },
+    JumpUnavailable,
+    /// `<key> が不正: <got>（<allowed>）`。`allowed` は候補を ` / ` で並べたもの
+    InvalidValue {
+        key: &'static str,
+        got: String,
+        allowed: String,
+    },
+    /// 編集の綴りの名前表（movement / motion / command）に無い。`allowed` は ` / ` で並べたもの
+    NotOneOf {
+        key: &'static str,
+        got: String,
+        allowed: String,
+    },
+    /// `type` 以外の編集コマンドに打つ文字（`text`）が付いた。中身はそのコマンド名
+    TextOnlyForType(String),
+    // ---- #2365 の 3 本目: ペイン・タブ ----
+    /// `<a> と <b> は同時に指定できない`
+    CannotCombine(&'static str, &'static str),
+    /// `<list> は同時に指定できない`（3 つ以上を ` / ` で並べたもの）
+    CannotCombineAll(&'static str),
+    /// `<a> か <b> のどちらか一方を指定する`
+    ExactlyOneOf(&'static str, &'static str),
+    /// `<a> か <b> の少なくとも一方を指定する`
+    AtLeastOneOf(&'static str, &'static str),
+    /// `<a> か <b> のどちらかが要る`
+    OneOfRequired(&'static str, &'static str),
+    /// MCP / IPC の scroll に to も delta も無い・両方ある（CLI の前段は [`Self::ScrollTarget`]）
+    ScrollToOrDelta,
+    MirrorScrollUnsupported,
+    NoTerminalSession(u64),
+    DirectionOnlyWithTarget,
+    CannotOpenFolder {
+        path: String,
+        error: String,
+    },
+    NotAFolder(String),
+    // ---- #2365 の 3 本目: ファイル操作 ----
+    InvalidFileName,
+    NoParentDir,
+    RenameFailed(String),
+    CreateFileFailed(String),
+    CreateDirFailed(String),
+    AppNameMissing,
+    MoveDestMissing,
+    PasteDestMissing,
+    NoPaths,
+    /// `paths` で扱えない操作。中身はその操作の綴り
+    ManyOpUnsupported(String),
+    /// `copy_cancel` の `name` が番号ではない。中身は渡された文字
+    BadCopyId(String),
+    CopyNotRunning(u64),
 }
 
 impl std::fmt::Display for Reason {
@@ -501,6 +578,175 @@ impl Reason {
             (Self::CliInvalidDirection(s), En) => {
                 format!("invalid direction: {s} (right / down / left / up)")
             }
+            // 案内の 3 つの腕は SaveRefused / UnsavedBlocksOpen より前に置く
+            // （番犬が `Self::RecoveryHint(…` の最初の腕を日英の対の行として名指しする）
+            (Self::RecoveryHint(Some(tako_core::DiskState::Deleted)), Ja) => {
+                "作り直す: tako edit save --force / 差分: tako edit diff\
+                 （MCP は tako_preview_save の action=overwrite / diff）"
+                    .to_string()
+            }
+            (Self::RecoveryHint(Some(tako_core::DiskState::Deleted)), En) => {
+                "to recreate it: tako edit save --force / to see the diff: tako edit diff \
+                 (in MCP, tako_preview_save with action=overwrite / diff)"
+                    .to_string()
+            }
+            (Self::RecoveryHint(Some(_)), Ja) => {
+                "上書き: tako edit save --force / 読み直し（自分の変更は undo で戻せる）: \
+                 tako edit reload / 差分: tako edit diff\
+                 （MCP は tako_preview_save の action=overwrite / reload / diff）"
+                    .to_string()
+            }
+            (Self::RecoveryHint(Some(_)), En) => {
+                "to overwrite: tako edit save --force / to reload (undo brings your changes back): \
+                 tako edit reload / to see the diff: tako edit diff \
+                 (in MCP, tako_preview_save with action=overwrite / reload / diff)"
+                    .to_string()
+            }
+            (Self::RecoveryHint(None), Ja) => "保存: tako edit save / 変更を捨てる: tako edit reload\
+                 （MCP は tako_preview_save / action=reload）"
+                .to_string(),
+            (Self::RecoveryHint(None), En) => {
+                "to save: tako edit save / to discard the changes: tako edit reload \
+                 (in MCP, tako_preview_save / action=reload)"
+                    .to_string()
+            }
+            (Self::SaveRefused { message, conflict }, Ja) => format!(
+                "{message}（{}）",
+                Self::RecoveryHint(Some(*conflict)).text_in(Ja)
+            ),
+            (Self::SaveRefused { message, conflict }, En) => format!(
+                "{message} ({})",
+                Self::RecoveryHint(Some(*conflict)).text_in(En)
+            ),
+            (Self::UnsavedBlocksOpen(conflict), Ja) => format!(
+                "未保存の変更があるため別ファイルを開けない（{}）",
+                Self::RecoveryHint(*conflict).text_in(Ja)
+            ),
+            (Self::UnsavedBlocksOpen(conflict), En) => format!(
+                "cannot open another file while there are unsaved changes ({})",
+                Self::RecoveryHint(*conflict).text_in(En)
+            ),
+            (Self::NewTabWithDirection, Ja) => {
+                "new_tab と direction は同時に指定できない（新しいタブには分割元が無い）"
+                    .to_string()
+            }
+            (Self::NewTabWithDirection, En) => "new_tab and direction cannot be given together \
+                 (a new tab has no pane to split from)"
+                .to_string(),
+            (Self::ColumnNeedsLine, Ja) => "column は line と一緒に指定する".to_string(),
+            (Self::ColumnNeedsLine, En) => "pass column together with line".to_string(),
+            (Self::CannotOpenFile { path, error }, Ja) => {
+                format!("ファイルを開けない（{path}: {error}）")
+            }
+            (Self::CannotOpenFile { path, error }, En) => {
+                format!("cannot open the file ({path}: {error})")
+            }
+            (Self::OpenedButNoLine { path, error }, Ja) => {
+                format!("開いたが行へ飛べない（{path}: {error}）")
+            }
+            (Self::OpenedButNoLine { path, error }, En) => {
+                format!("opened, but cannot jump to the line ({path}: {error})")
+            }
+            (Self::JumpUnavailable, Ja) => {
+                "ジャンプ履歴はこの tako では使えない（GUI の中でだけ持つ）".to_string()
+            }
+            (Self::JumpUnavailable, En) => {
+                "jump history is not available in this tako (only the GUI keeps it)".to_string()
+            }
+            (Self::InvalidValue { key, got, allowed }, Ja) => {
+                format!("{key} が不正: {got}（{allowed}）")
+            }
+            (Self::InvalidValue { key, got, allowed }, En) => {
+                format!("invalid {key}: {got} ({allowed})")
+            }
+            (Self::NotOneOf { key, got, allowed }, Ja) => {
+                format!("{key} は {allowed} のどれか（{got:?} は無い）")
+            }
+            (Self::NotOneOf { key, got, allowed }, En) => {
+                format!("{key} must be one of {allowed} (got {got:?})")
+            }
+            (Self::TextOnlyForType(command), Ja) => format!(
+                "text は command={} のときだけ渡す（{command:?} は打つ文字を取らない）",
+                tako_core::platform::editor_keys::TYPE_COMMAND
+            ),
+            (Self::TextOnlyForType(command), En) => format!(
+                "pass text only with command={} ({command:?} takes no text to type)",
+                tako_core::platform::editor_keys::TYPE_COMMAND
+            ),
+            (Self::CannotCombine(a, b), Ja) => format!("{a} と {b} は同時に指定できない"),
+            (Self::CannotCombine(a, b), En) => format!("{a} and {b} cannot be given together"),
+            (Self::CannotCombineAll(list), Ja) => format!("{list} は同時に指定できない"),
+            (Self::CannotCombineAll(list), En) => format!("{list} cannot be given together"),
+            (Self::ExactlyOneOf(a, b), Ja) => format!("{a} か {b} のどちらか一方を指定する"),
+            (Self::ExactlyOneOf(a, b), En) => format!("pass exactly one of {a} or {b}"),
+            (Self::AtLeastOneOf(a, b), Ja) => format!("{a} か {b} の少なくとも一方を指定する"),
+            (Self::AtLeastOneOf(a, b), En) => format!("pass at least one of {a} or {b}"),
+            (Self::OneOfRequired(a, b), Ja) => format!("{a} か {b} のどちらかが要る"),
+            (Self::OneOfRequired(a, b), En) => format!("{a} or {b} is required"),
+            (Self::ScrollToOrDelta, Ja) => {
+                "to（絶対位置。0 = 最下部）か delta（相対行数）のどちらか一方を指定する".to_string()
+            }
+            (Self::ScrollToOrDelta, En) => "pass exactly one of to (absolute position; \
+                 0 = bottom) or delta (relative lines)"
+                .to_string(),
+            (Self::MirrorScrollUnsupported, Ja) => {
+                "このホストはバックエンドペインのスクロール表示に対応していない".to_string()
+            }
+            (Self::MirrorScrollUnsupported, En) => {
+                "this host cannot scroll the view of backend panes".to_string()
+            }
+            (Self::NoTerminalSession(pane), Ja) => {
+                format!("ペイン {pane} にターミナルセッションが無い")
+            }
+            (Self::NoTerminalSession(pane), En) => {
+                format!("pane {pane} has no terminal session")
+            }
+            (Self::DirectionOnlyWithTarget, Ja) => {
+                "direction は target 指定時のみ使える".to_string()
+            }
+            (Self::DirectionOnlyWithTarget, En) => {
+                "direction works only together with target".to_string()
+            }
+            (Self::CannotOpenFolder { path, error }, Ja) => {
+                format!("フォルダを開けない（{path}: {error}）")
+            }
+            (Self::CannotOpenFolder { path, error }, En) => {
+                format!("cannot open the folder ({path}: {error})")
+            }
+            (Self::NotAFolder(path), Ja) => format!("フォルダではない: {path}"),
+            (Self::NotAFolder(path), En) => format!("not a folder: {path}"),
+            (Self::InvalidFileName, Ja) => "無効なファイル名".to_string(),
+            (Self::InvalidFileName, En) => "invalid file name".to_string(),
+            (Self::NoParentDir, Ja) => "親ディレクトリが取得できない".to_string(),
+            (Self::NoParentDir, En) => "cannot get the parent directory".to_string(),
+            (Self::RenameFailed(e), Ja) => format!("リネームに失敗: {e}"),
+            (Self::RenameFailed(e), En) => format!("rename failed: {e}"),
+            (Self::CreateFileFailed(e), Ja) => format!("ファイル作成に失敗: {e}"),
+            (Self::CreateFileFailed(e), En) => format!("failed to create the file: {e}"),
+            (Self::CreateDirFailed(e), Ja) => format!("フォルダ作成に失敗: {e}"),
+            (Self::CreateDirFailed(e), En) => format!("failed to create the folder: {e}"),
+            (Self::AppNameMissing, Ja) => "name（アプリ名）を指定する".to_string(),
+            (Self::AppNameMissing, En) => "pass name (the app name)".to_string(),
+            (Self::MoveDestMissing, Ja) => "dest（移動先のフォルダ）を指定する".to_string(),
+            (Self::MoveDestMissing, En) => "pass dest (the folder to move into)".to_string(),
+            (Self::PasteDestMissing, Ja) => "dest（貼り付け先のフォルダ）を指定する".to_string(),
+            (Self::PasteDestMissing, En) => "pass dest (the folder to paste into)".to_string(),
+            (Self::NoPaths, Ja) => "paths を 1 つ以上指定する".to_string(),
+            (Self::NoPaths, En) => "pass at least one path in paths".to_string(),
+            (Self::ManyOpUnsupported(name), Ja) => format!(
+                "paths で扱えるのは clipboard_copy / clipboard_cut / trash / move / copy（{name}）"
+            ),
+            (Self::ManyOpUnsupported(name), En) => format!(
+                "paths works only with clipboard_copy / clipboard_cut / trash / move / copy ({name})"
+            ),
+            (Self::BadCopyId(text), Ja) => {
+                format!("name は取り消すコピーの番号（copy_progress の id）: {text}")
+            }
+            (Self::BadCopyId(text), En) => {
+                format!("name is the number of the copy to cancel (the id in copy_progress): {text}")
+            }
+            (Self::CopyNotRunning(id), Ja) => format!("番号 {id} のコピーは走っていない"),
+            (Self::CopyNotRunning(id), En) => format!("copy {id} is not running"),
         }
     }
 
@@ -614,9 +860,7 @@ fn open_file(
         jump_from: jump_from_rule,
     } = args;
     if new_tab && direction.is_some() {
-        return Err(DispatchError::Operation(
-            "new_tab と direction は同時に指定できない（新しいタブには分割元が無い）".into(),
-        ));
+        return Err(Reason::NewTabWithDirection.operation());
     }
     // #1676: 1 始まりの検査は**開く前**に済ませる（0 を渡した呼び出しで
     // ペインが増えてから落ちる、という後始末の要る失敗を作らない）
@@ -631,9 +875,7 @@ fn open_file(
         ));
     }
     if line.is_none() && column.is_some() {
-        return Err(DispatchError::InvalidParams(
-            "column は line と一緒に指定する".into(),
-        ));
+        return Err(Reason::ColumnNeedsLine.invalid());
     }
     let (tab, target) = match pane {
         Some(_) => resolve_pane(host.workspace(), pane)?,
@@ -652,8 +894,13 @@ fn open_file(
         }
     }
     // 解決は境界（B26）を通す（保存・応答・子プロセスへ渡る値。#970）
-    let resolved = tako_core::platform::path::canonicalize(&resolved)
-        .map_err(|e| DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）")))?;
+    let resolved = tako_core::platform::path::canonicalize(&resolved).map_err(|e| {
+        Reason::CannotOpenFile {
+            path: path.clone(),
+            error: e.to_string(),
+        }
+        .operation()
+    })?;
     if !resolved.is_file() {
         return Err(Reason::NotAFile(resolved.display().to_string()).operation());
     }
@@ -781,10 +1028,11 @@ fn open_file(
         Some(line) => Some(
             host.reveal_preview_line(view_pane, line, column)
                 .map_err(|e| {
-                    DispatchError::Operation(format!(
-                        "開いたが行へ飛べない（{}: {e}）",
-                        resolved.display()
-                    ))
+                    Reason::OpenedButNoLine {
+                        path: resolved.display().to_string(),
+                        error: e.to_string(),
+                    }
+                    .operation()
                 })?,
         ),
         None => None,
@@ -924,18 +1172,18 @@ fn jump(
         "back" => Some(JumpDirection::Back),
         "forward" => Some(JumpDirection::Forward),
         other => {
-            return Err(DispatchError::InvalidParams(format!(
-                "action が不正: {other}（{}）",
-                JUMP_ACTIONS.join(" / ")
-            )))
+            return Err(Reason::InvalidValue {
+                key: "action",
+                got: other.to_string(),
+                allowed: JUMP_ACTIONS.join(" / "),
+            }
+            .invalid())
         }
     };
     // 生死は履歴を可変で借りる前に集めておく（判定中に workspace を読めないため）
     let live = host.workspace().all_pane_ids();
     let Some(history) = host.jump_history_mut() else {
-        return Err(DispatchError::Operation(
-            "ジャンプ履歴はこの tako では使えない（GUI の中でだけ持つ）".into(),
-        ));
+        return Err(Reason::JumpUnavailable.operation());
     };
     let Some(direction) = direction else {
         return Ok(json!({
@@ -1075,18 +1323,22 @@ pub fn lsp_goto_prepare(
 ) -> Result<LspGotoJob, DispatchError> {
     use tako_core::lsp::goto::{GotoKind, Placement};
     let kind = GotoKind::parse(action).ok_or_else(|| {
-        DispatchError::InvalidParams(format!(
-            "action が不正: {action}（{}）",
-            GotoKind::NAMES.join(" / ")
-        ))
+        Reason::InvalidValue {
+            key: "action",
+            got: action.to_string(),
+            allowed: GotoKind::NAMES.join(" / "),
+        }
+        .invalid()
     })?;
     let placement = match open {
         None => Placement::Auto,
         Some(name) => Placement::parse(name).ok_or_else(|| {
-            DispatchError::InvalidParams(format!(
-                "open が不正: {name}（{}）",
-                Placement::NAMES.join(" / ")
-            ))
+            Reason::InvalidValue {
+                key: "open",
+                got: name.to_string(),
+                allowed: Placement::NAMES.join(" / "),
+            }
+            .invalid()
         })?,
     };
     if line == 0 {
@@ -2079,15 +2331,14 @@ fn preview_save(
 ) -> Result<Value, DispatchError> {
     if let Err(message) = host.save_preview(target, force) {
         // #1659: 外部変更で断られたなら抜け方を添える
-        return Err(DispatchError::Operation(
-            match host.preview_conflict(target) {
-                Some(conflict) => format!(
-                    "{message}（{}）",
-                    preview_recovery_hint(Some(conflict.state))
-                ),
-                None => message,
-            },
-        ));
+        return Err(match host.preview_conflict(target) {
+            Some(conflict) => Reason::SaveRefused {
+                message,
+                conflict: conflict.state,
+            }
+            .operation(),
+            None => DispatchError::Operation(message),
+        });
     }
     let mut out = preview_edit_reply(host, target);
     out["saved"] = json!(true);
@@ -2878,10 +3129,12 @@ pub fn lsp_xref_prepare(
 ) -> Result<LspXrefJob, DispatchError> {
     use tako_core::lsp::xref::XrefKind;
     let kind = XrefKind::parse(action).ok_or_else(|| {
-        DispatchError::InvalidParams(format!(
-            "action が不正: {action}（{}）",
-            XrefKind::NAMES.join(" / ")
-        ))
+        Reason::InvalidValue {
+            key: "action",
+            got: action.to_string(),
+            allowed: XrefKind::NAMES.join(" / "),
+        }
+        .invalid()
     })?;
     if line == 0 {
         return Err(DispatchError::InvalidParams(
@@ -3178,10 +3431,12 @@ pub fn lsp_results(
     use tako_core::lsp::goto::Placement;
     use tako_core::lsp::xref::{Body, Expand, TreeError};
     if !LSP_RESULT_ACTIONS.contains(&action) {
-        return Err(DispatchError::InvalidParams(format!(
-            "action が不正: {action}（{}）",
-            LSP_RESULT_ACTIONS.join(" / ")
-        )));
+        return Err(Reason::InvalidValue {
+            key: "action",
+            got: action.to_string(),
+            allowed: LSP_RESULT_ACTIONS.join(" / "),
+        }
+        .invalid());
     }
     // 閉じたペインの結果は残さない（閉じる経路の取りこぼしの保険。GUI は閉じた時点で消す）
     let live = host.workspace().all_pane_ids();
@@ -3252,10 +3507,12 @@ pub fn lsp_results(
             let placement = match open {
                 None => Placement::Auto,
                 Some(name) => Placement::parse(name).ok_or_else(|| {
-                    DispatchError::InvalidParams(format!(
-                        "open が不正: {name}（{}）",
-                        Placement::NAMES.join(" / ")
-                    ))
+                    Reason::InvalidValue {
+                        key: "open",
+                        got: name.to_string(),
+                        allowed: Placement::NAMES.join(" / "),
+                    }
+                    .invalid()
                 })?,
             };
             let mut out = json!({
@@ -3750,13 +4007,9 @@ impl FileCopyJob {
     /// 全部を 1 つのジョブにする（CLI `tako file copy a b dst` = MCP `paths` = 1 要求・1 ジョブ）
     fn many(paths: &[String], dest: Option<&str>) -> Result<Self, DispatchError> {
         if paths.is_empty() {
-            return Err(DispatchError::InvalidParams(
-                "paths を 1 つ以上指定する".into(),
-            ));
+            return Err(Reason::NoPaths.invalid());
         }
-        let dest = dest.ok_or(DispatchError::InvalidParams(
-            "dest（貼り付け先のフォルダ）を指定する".into(),
-        ))?;
+        let dest = dest.ok_or_else(|| Reason::PasteDestMissing.invalid())?;
         let sources: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
         let (roots, skipped) = tako_core::tree_select::distinct_roots(&sources);
         let items = roots
@@ -4041,9 +4294,7 @@ pub fn prepare_offload(
                 vec![(PathBuf::from(path), PathBuf::from(dest))],
                 CopyReply::One,
             )))),
-            None => Err(DispatchError::InvalidParams(
-                "dest（貼り付け先のフォルダ）を指定する".into(),
-            )),
+            None => Err(Reason::PasteDestMissing.invalid()),
         }),
         Request::FileOp {
             op: FileOpKind::Paste,
@@ -6089,30 +6340,6 @@ fn preview_edit_reply(host: &dyn ControlHost, target: PaneId) -> Value {
 /// `diff`（= `tako edit diff`）
 pub const PREVIEW_SAVE_ACTIONS: &[&str] = &["save", "overwrite", "reload", "diff"];
 
-/// 外部変更の競合・未保存の変更から抜ける手段の案内（#1659）。
-///
-/// 保存が断られた・別のファイルを開けなかったときのエラーへ添える（「保存しなかった」とだけ
-/// 返すと、呼び手はペインを閉じる以外の抜け方を知らない = Issue の症状）。
-/// CLI と MCP のどちらから来ても同じ文面で、MCP は `tako_preview_save` の `action` で同じ操作になる。
-/// `conflict` は外部変更の状態（`None` = 競合は無く、未保存の変更だけがある）
-pub fn preview_recovery_hint(conflict: Option<tako_core::DiskState>) -> &'static str {
-    match conflict {
-        Some(tako_core::DiskState::Deleted) => {
-            "作り直す: tako edit save --force / 差分: tako edit diff\
-             （MCP は tako_preview_save の action=overwrite / diff）"
-        }
-        Some(_) => {
-            "上書き: tako edit save --force / 読み直し（自分の変更は undo で戻せる）: \
-             tako edit reload / 差分: tako edit diff\
-             （MCP は tako_preview_save の action=overwrite / reload / diff）"
-        }
-        None => {
-            "保存: tako edit save / 変更を捨てる: tako edit reload\
-             （MCP は tako_preview_save / action=reload）"
-        }
-    }
-}
-
 /// `PreviewDiff` の応答の `diff` 節（#1659）。向きは「ディスク → 編集中」
 fn disk_diff_json(diff: &tako_core::DiskDiff, path: &str) -> Value {
     json!({
@@ -6353,11 +6580,7 @@ fn dispatch_inner(
             let new_share = match (delta, share) {
                 (Some(d), None) => tree.resize_by(target, axis.to_core(), d).map_err(op_err)?,
                 (None, Some(s)) => tree.set_share(target, axis.to_core(), s).map_err(op_err)?,
-                _ => {
-                    return Err(DispatchError::InvalidParams(
-                        "delta か share のどちらか一方を指定する".into(),
-                    ))
-                }
+                _ => return Err(Reason::ExactlyOneOf("delta", "share").invalid()),
             };
             Ok(json!({ "share": new_share }))
         }
@@ -6552,12 +6775,9 @@ fn dispatch_inner(
                 }
                 None => {
                     let (_, target) = resolve_pane(host.workspace(), pane)?;
-                    let session = host.session(target).ok_or_else(|| {
-                        DispatchError::Operation(format!(
-                            "ペイン {} にターミナルセッションが無い",
-                            target.as_u64()
-                        ))
-                    })?;
+                    let session = host
+                        .session(target)
+                        .ok_or_else(|| Reason::NoTerminalSession(target.as_u64()).operation())?;
                     let cwd = cwd_override.or_else(|| session.cwd().map(Path::to_path_buf));
                     (
                         Some(target.as_u64()),
@@ -6611,9 +6831,7 @@ fn dispatch_inner(
                 .session(target)
                 .ok_or(DispatchError::NoSession(target.as_u64()))?;
             if matches!((to, delta), (Some(_), Some(_)) | (None, None)) {
-                return Err(DispatchError::InvalidParams(
-                    "to（絶対位置。0 = 最下部）か delta（相対行数）のどちらか一方を指定する".into(),
-                ));
+                return Err(Reason::ScrollToOrDelta.invalid());
             }
             // バックエンドペイン（Phase 5.5）・TmuxOpen ビューペイン（#181）の
             // スクロールバックは tmux 側にあり、表示はホスト UI のローカルミラー
@@ -6622,11 +6840,7 @@ fn dispatch_inner(
             if host.is_mirror_scroll_pane(target) {
                 let (offset, history) = host
                     .backend_scroll_view(target, to.map(|t| t as usize), delta)
-                    .ok_or_else(|| {
-                        DispatchError::Operation(
-                            "このホストはバックエンドペインのスクロール表示に対応していない".into(),
-                        )
-                    })?;
+                    .ok_or_else(|| Reason::MirrorScrollUnsupported.operation())?;
                 return Ok(json!({
                     "pane": target.as_u64(),
                     "offset": offset,
@@ -6647,9 +6861,7 @@ fn dispatch_inner(
 
         Request::Title { pane, title, role } => {
             if title.is_none() && role.is_none() {
-                return Err(DispatchError::InvalidParams(
-                    "title か role の少なくとも一方を指定する".into(),
-                ));
+                return Err(Reason::AtLeastOneOf("title", "role").invalid());
             }
             let (tab, target) = resolve_pane(host.workspace(), pane)?;
             let all_default = host.limit_resume_default();
@@ -6902,13 +7114,14 @@ fn dispatch_inner(
                     // 解決は境界（B26）を通す。verbatim prefix をシェルの cwd にすると
                     // OSC 7 が `///?/C:/…` へ壊れて git 操作が全滅する（#970）
                     let path = tako_core::platform::path::canonicalize(&path).map_err(|e| {
-                        DispatchError::Operation(format!("フォルダを開けない（{raw}: {e}）"))
+                        Reason::CannotOpenFolder {
+                            path: raw.clone(),
+                            error: e.to_string(),
+                        }
+                        .operation()
                     })?;
                     if !path.is_dir() {
-                        return Err(DispatchError::Operation(format!(
-                            "フォルダではない: {}",
-                            path.display()
-                        )));
+                        return Err(Reason::NotAFolder(path.display().to_string()).operation());
                     }
                     Some(path)
                 }
@@ -7101,9 +7314,7 @@ fn dispatch_inner(
                 // 従来動作: 別タブの末尾（フォーカス右）へ移送
                 (Some(tab), None) => {
                     if direction.is_some() {
-                        return Err(DispatchError::InvalidParams(
-                            "direction は target 指定時のみ使える".into(),
-                        ));
+                        return Err(Reason::DirectionOnlyWithTarget.invalid());
                     }
                     let dest = find_tab(host.workspace(), tab)?;
                     host.workspace_mut()
@@ -7124,19 +7335,13 @@ fn dispatch_inner(
                 // Issue #209: 両方 None → 新タブ化
                 (None, None) => {
                     if direction.is_some() {
-                        return Err(DispatchError::InvalidParams(
-                            "direction は target 指定時のみ使える".into(),
-                        ));
+                        return Err(Reason::DirectionOnlyWithTarget.invalid());
                     }
                     host.workspace_mut()
                         .move_pane_to_new_tab(source)
                         .map_err(op_err)?;
                 }
-                (Some(_), Some(_)) => {
-                    return Err(DispatchError::InvalidParams(
-                        "tab と target は同時に指定できない".into(),
-                    ))
-                }
+                (Some(_), Some(_)) => return Err(Reason::CannotCombine("tab", "target").invalid()),
             }
             // CLI/MCP 経由ではアクティブタブ・フォーカスペインを維持（ユーザーの入力を奪わない）
             if !focus.unwrap_or(false) {
@@ -7420,9 +7625,9 @@ fn dispatch_inner(
                 + usize::from(zoom_out)
                 + usize::from(reset);
             if controls > 1 {
-                return Err(DispatchError::InvalidParams(
-                    "zoom / zoom_in / zoom_out / reset は同時に指定できない".into(),
-                ));
+                return Err(
+                    Reason::CannotCombineAll("zoom / zoom_in / zoom_out / reset").invalid(),
+                );
             }
             let zoom_command = if let Some(percent) = zoom {
                 Some(PreviewZoomCommand::Set(percent / 100.0))
@@ -7761,10 +7966,12 @@ fn dispatch_inner(
             // 綴りを解くのは tako-core の名前表 1 か所（CLI と MCP で解釈が割れない）
             let movement =
                 tako_core::text_edit::CursorMovement::from_name(&movement).ok_or_else(|| {
-                    DispatchError::Operation(format!(
-                        "movement は {} のどれか（{movement:?} は無い）",
-                        tako_core::text_edit::CursorMovement::names().join(" / ")
-                    ))
+                    Reason::NotOneOf {
+                        key: "movement",
+                        got: movement.clone(),
+                        allowed: tako_core::text_edit::CursorMovement::names().join(" / "),
+                    }
+                    .operation()
                 })?;
             host.run_preview_command(
                 target,
@@ -7785,10 +7992,12 @@ fn dispatch_inner(
             let (_, target) = resolve_pane(host.workspace(), pane)?;
             let motion =
                 tako_core::text_edit::DeleteMotion::from_name(&motion).ok_or_else(|| {
-                    DispatchError::Operation(format!(
-                        "motion は {} のどれか（{motion:?} は無い）",
-                        tako_core::text_edit::DeleteMotion::names().join(" / ")
-                    ))
+                    Reason::NotOneOf {
+                        key: "motion",
+                        got: motion.clone(),
+                        allowed: tako_core::text_edit::DeleteMotion::names().join(" / "),
+                    }
+                    .operation()
                 })?;
             host.run_preview_command(
                 target,
@@ -7811,15 +8020,15 @@ fn dispatch_inner(
                 EditorCommand::typed(text.as_deref().unwrap_or_default())
                     .map_err(DispatchError::Operation)?
             } else if text.is_some() {
-                return Err(DispatchError::Operation(format!(
-                    "text は command={TYPE_COMMAND} のときだけ渡す（{command:?} は打つ文字を取らない）"
-                )));
+                return Err(Reason::TextOnlyForType(command).operation());
             } else {
                 vec![EditorCommand::from_edit_name(&command).ok_or_else(|| {
-                    DispatchError::Operation(format!(
-                        "command は {} のどれか（{command:?} は無い）",
-                        EditorCommand::edit_names().join(" / ")
-                    ))
+                    Reason::NotOneOf {
+                        key: "command",
+                        got: command.clone(),
+                        allowed: EditorCommand::edit_names().join(" / "),
+                    }
+                    .operation()
                 })?]
             };
             // 版の照合は最初の 1 打鍵の前だけ（2 打鍵目からは自分の打鍵で版が進んでいる）
@@ -8093,9 +8302,9 @@ fn dispatch_inner(
                 FileOpKind::Rename => {
                     let new_name = name.ok_or_else(|| Reason::Missing("name".into()).invalid())?;
                     validate_name(&new_name)?;
-                    let parent = path.parent().ok_or(DispatchError::Operation(
-                        "親ディレクトリが取得できない".into(),
-                    ))?;
+                    let parent = path
+                        .parent()
+                        .ok_or_else(|| Reason::NoParentDir.operation())?;
                     let new_path = parent.join(&new_name);
                     if new_path.exists() {
                         return Err(
@@ -8103,7 +8312,7 @@ fn dispatch_inner(
                         );
                     }
                     std::fs::rename(&path, &new_path)
-                        .map_err(|e| DispatchError::Operation(format!("リネームに失敗: {e}")))?;
+                        .map_err(|e| Reason::RenameFailed(e.to_string()).operation())?;
                     Ok(
                         json!({ "old": path.display().to_string(), "new": new_path.display().to_string() }),
                     )
@@ -8117,9 +8326,8 @@ fn dispatch_inner(
                             Reason::AlreadyExists(new_path.display().to_string()).operation()
                         );
                     }
-                    std::fs::File::create(&new_path).map_err(|e| {
-                        DispatchError::Operation(format!("ファイル作成に失敗: {e}"))
-                    })?;
+                    std::fs::File::create(&new_path)
+                        .map_err(|e| Reason::CreateFileFailed(e.to_string()).operation())?;
                     Ok(json!({ "created": new_path.display().to_string() }))
                 }
                 FileOpKind::CreateDir => {
@@ -8131,9 +8339,8 @@ fn dispatch_inner(
                             Reason::AlreadyExists(new_path.display().to_string()).operation()
                         );
                     }
-                    std::fs::create_dir(&new_path).map_err(|e| {
-                        DispatchError::Operation(format!("フォルダ作成に失敗: {e}"))
-                    })?;
+                    std::fs::create_dir(&new_path)
+                        .map_err(|e| Reason::CreateDirFailed(e.to_string()).operation())?;
                     Ok(json!({ "created": new_path.display().to_string() }))
                 }
                 FileOpKind::Trash => trash_one(&path),
@@ -8149,9 +8356,7 @@ fn dispatch_inner(
                     if !path.exists() {
                         return Err(Reason::PathNotFound(path.display().to_string()).operation());
                     }
-                    let app_name = name.ok_or(DispatchError::InvalidParams(
-                        "name（アプリ名）を指定する".into(),
-                    ))?;
+                    let app_name = name.ok_or_else(|| Reason::AppNameMissing.invalid())?;
                     crate::platform::os_integration::open_with(&app_name, &path)
                         .map_err(DispatchError::Operation)?;
                     Ok(json!({ "opened": path.display().to_string(), "app": app_name }))
@@ -8196,17 +8401,13 @@ fn dispatch_inner(
                 }
                 // FR-3.32 / #1834: ツリーの D&D・CLI・MCP の移動はすべてここ 1 つ
                 FileOpKind::Move => {
-                    let dest = dest.ok_or(DispatchError::InvalidParams(
-                        "dest（移動先のフォルダ）を指定する".into(),
-                    ))?;
+                    let dest = dest.ok_or_else(|| Reason::MoveDestMissing.invalid())?;
                     run_file_move(host, &path, std::path::Path::new(&dest))
                 }
                 // FR-3.34 / #1860: ここは同期の経路（`TAKO_OFFLOAD=0`・テスト・直呼び）。
                 // IPC と GUI の ⌘V は `prepare_offload` が同じ `run_file_copy` を background で回す
                 FileOpKind::Copy => {
-                    let dest = dest.ok_or(DispatchError::InvalidParams(
-                        "dest（貼り付け先のフォルダ）を指定する".into(),
-                    ))?;
+                    let dest = dest.ok_or_else(|| Reason::PasteDestMissing.invalid())?;
                     let dest = std::path::PathBuf::from(dest);
                     // #1867: 同期の経路でも一覧に載せる（`copy_progress` / `copy_cancel` が効く）
                     let ticket = copy_ticket(&[(path.clone(), dest.clone())]);
@@ -8307,9 +8508,7 @@ fn dispatch_inner(
             // #1487: タブ単位の復帰（分割ツリー・比率・並び位置ごと戻す）
             if let Some(t) = tab {
                 if pane.is_some() {
-                    return Err(DispatchError::InvalidParams(
-                        "pane と tab は同時に指定できない".to_string(),
-                    ));
+                    return Err(Reason::CannotCombine("pane", "tab").invalid());
                 }
                 let tab_id = TabId::from_raw(t);
                 if !host.workspace().is_shelved_tab(tab_id) {
@@ -8326,9 +8525,7 @@ fn dispatch_inner(
                 }
                 return Ok(json!({ "foregrounded_tab": t, "panes": panes }));
             }
-            let pane = pane.ok_or_else(|| {
-                DispatchError::InvalidParams("pane か tab のどちらかが要る".to_string())
-            })?;
+            let pane = pane.ok_or_else(|| Reason::OneOfRequired("pane", "tab").invalid())?;
             let pane_id = PaneId::from_raw(pane);
             if !host.workspace().is_shelved(pane_id) {
                 return Err(DispatchError::PaneNotFound(pane));
@@ -10896,7 +11093,11 @@ fn dispatch_inner(
             }
             // 解決は境界（B26）を通す（保存・応答・子プロセスへ渡る値。#970）
             let resolved = tako_core::platform::path::canonicalize(&resolved).map_err(|e| {
-                DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）"))
+                Reason::CannotOpenFile {
+                    path: path.clone(),
+                    error: e.to_string(),
+                }
+                .operation()
             })?;
             if !resolved.is_file() {
                 return Err(Reason::NotAFile(resolved.display().to_string()).operation());
@@ -11646,8 +11847,13 @@ fn resolve_run_file(
             joined = cwd.join(joined);
         }
     }
-    let resolved = tako_core::platform::path::canonicalize(&joined)
-        .map_err(|e| DispatchError::Operation(format!("ファイルを開けない（{path}: {e}）")))?;
+    let resolved = tako_core::platform::path::canonicalize(&joined).map_err(|e| {
+        Reason::CannotOpenFile {
+            path: path.to_string(),
+            error: e.to_string(),
+        }
+        .operation()
+    })?;
     if !resolved.is_file() {
         return Err(Reason::NotAFile(resolved.display().to_string()).operation());
     }
@@ -11743,8 +11949,13 @@ fn run_config_sketch_prepare(
 /// `RunResolve` の本体（**UI スレッドで呼ばない**。実行環境の Tier P が子プロセスを起こす）
 fn finish_run_resolve(ctx: &RunResolveCtx) -> Result<Value, DispatchError> {
     // 解決は境界（B26）を通す（保存・応答・子プロセスへ渡る値。#970）
-    let resolved = tako_core::platform::path::canonicalize(&ctx.joined)
-        .map_err(|e| DispatchError::Operation(format!("ファイルを開けない（{}: {e}）", ctx.raw)))?;
+    let resolved = tako_core::platform::path::canonicalize(&ctx.joined).map_err(|e| {
+        Reason::CannotOpenFile {
+            path: ctx.raw.clone(),
+            error: e.to_string(),
+        }
+        .operation()
+    })?;
     if !resolved.is_file() {
         return Err(Reason::NotAFile(resolved.display().to_string()).operation());
     }
@@ -12647,9 +12858,12 @@ pub fn dispatch_orchestrator_projects(
             }
             Ok(json!({ "removed": key }))
         }
-        _ => Err(DispatchError::InvalidParams(format!(
-            "action が不正: {action}（list / add / remove）"
-        ))),
+        _ => Err(Reason::InvalidValue {
+            key: "action",
+            got: action.to_string(),
+            allowed: "list / add / remove".to_string(),
+        }
+        .invalid()),
     }
 }
 
@@ -13194,24 +13408,16 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 .name
                 .ok_or_else(|| Reason::Missing("name".into()).invalid())?;
             if params.model.is_some() && params.clear_model {
-                return Err(DispatchError::InvalidParams(
-                    "model と clear_model は同時に指定できない".into(),
-                ));
+                return Err(Reason::CannotCombine("model", "clear_model").invalid());
             }
             if params.worker_model.is_some() && params.clear_worker_model {
-                return Err(DispatchError::InvalidParams(
-                    "worker_model と clear_worker_model は同時に指定できない".into(),
-                ));
+                return Err(Reason::CannotCombine("worker_model", "clear_worker_model").invalid());
             }
             if params.worker_agent.is_some() && params.clear_worker_agent {
-                return Err(DispatchError::InvalidParams(
-                    "worker_agent と clear_worker_agent は同時に指定できない".into(),
-                ));
+                return Err(Reason::CannotCombine("worker_agent", "clear_worker_agent").invalid());
             }
             if params.master_agent.is_some() && params.clear_master_agent {
-                return Err(DispatchError::InvalidParams(
-                    "master_agent と clear_master_agent は同時に指定できない".into(),
-                ));
+                return Err(Reason::CannotCombine("master_agent", "clear_master_agent").invalid());
             }
             // agent_* 系の指定には対象エージェント名（agent）が必須
             let has_agent_edit = params.agent_model.is_some()
@@ -13270,14 +13476,10 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 }
             }
             if params.projects.is_some() && params.clear_projects {
-                return Err(DispatchError::InvalidParams(
-                    "projects と clear_projects は同時に指定できない".into(),
-                ));
+                return Err(Reason::CannotCombine("projects", "clear_projects").invalid());
             }
             if params.cwd.is_some() && params.clear_cwd {
-                return Err(DispatchError::InvalidParams(
-                    "cwd と clear_cwd は同時に指定できない".into(),
-                ));
+                return Err(Reason::CannotCombine("cwd", "clear_cwd").invalid());
             }
             // #1056: 起動時に解釈できない形は**設定時点で**弾く（`tako master` /
             // 引き継ぎが起動できないプロファイルを黙って書かせない）。
@@ -13302,19 +13504,15 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 tako_core::handoff::parse_ctx_threshold(v).map_err(DispatchError::InvalidParams)?;
             }
             if params.ctx_threshold.is_some() && params.clear_ctx_threshold {
-                return Err(DispatchError::InvalidParams(
-                    "ctx_threshold と clear_ctx_threshold は同時に指定できない".into(),
-                ));
+                return Err(
+                    Reason::CannotCombine("ctx_threshold", "clear_ctx_threshold").invalid(),
+                );
             }
             if params.auto_handoff.is_some() && params.clear_auto_handoff {
-                return Err(DispatchError::InvalidParams(
-                    "auto_handoff と clear_auto_handoff は同時に指定できない".into(),
-                ));
+                return Err(Reason::CannotCombine("auto_handoff", "clear_auto_handoff").invalid());
             }
             if params.limit_resume.is_some() && params.clear_limit_resume {
-                return Err(DispatchError::InvalidParams(
-                    "limit_resume と clear_limit_resume は同時に指定できない".into(),
-                ));
+                return Err(Reason::CannotCombine("limit_resume", "clear_limit_resume").invalid());
             }
             let env_set_clone = params.env_set.clone();
             let env_unset_clone = params.env_unset.clone();
@@ -13472,9 +13670,12 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             result["path"] = json!(path.display().to_string());
             Ok(result)
         }
-        other => Err(DispatchError::InvalidParams(format!(
-            "action が不正: {other}（list / show / set / create / copy / delete）"
-        ))),
+        other => Err(Reason::InvalidValue {
+            key: "action",
+            got: other.to_string(),
+            allowed: "list / show / set / create / copy / delete".to_string(),
+        }
+        .invalid()),
     }
 }
 
@@ -14470,9 +14671,7 @@ pub fn dispatch_orchestrator_accounts(
                     ))
                 }
                 (true, Some(_)) => {
-                    return Err(DispatchError::InvalidParams(
-                        "config_dir と inherit=true は同時に指定できない".into(),
-                    ))
+                    return Err(Reason::CannotCombine("config_dir", "inherit=true").invalid())
                 }
                 _ => {}
             }
@@ -14524,9 +14723,12 @@ pub fn dispatch_orchestrator_accounts(
                 )))
             }
         }
-        other => Err(DispatchError::InvalidParams(format!(
-            "action が不正: {other}（list / show / add / remove）"
-        ))),
+        other => Err(Reason::InvalidValue {
+            key: "action",
+            got: other.to_string(),
+            allowed: "list / show / add / remove".to_string(),
+        }
+        .invalid()),
     }
 }
 
@@ -18986,10 +19188,12 @@ pub fn lsp_server_action(
     set: Option<&serde_json::Map<String, Value>>,
 ) -> Result<Value, DispatchError> {
     if !LSP_ACTIONS.contains(&action) {
-        return Err(DispatchError::InvalidParams(format!(
-            "action が不正: {action}（{}）",
-            LSP_ACTIONS.join(" / ")
-        )));
+        return Err(Reason::InvalidValue {
+            key: "action",
+            got: action.to_string(),
+            allowed: LSP_ACTIONS.join(" / "),
+        }
+        .invalid());
     }
     // #2035: 上書きは action=options だけ・サーバの ID が要る・キーの形は先に検査する
     if let Some(set) = set {
@@ -19056,10 +19260,12 @@ pub fn lsp_diagnostics(
     let min = match severity {
         None => None,
         Some(name) => Some(Severity::parse(name).ok_or_else(|| {
-            DispatchError::InvalidParams(format!(
-                "severity が不正: {name}（{}）",
-                Severity::NAMES.join(" / ")
-            ))
+            Reason::InvalidValue {
+                key: "severity",
+                got: name.to_string(),
+                allowed: Severity::NAMES.join(" / "),
+            }
+            .invalid()
         })?),
     };
     let Some(manager) = host.lsp() else {
@@ -20840,7 +21046,7 @@ fn tmux_error(action: &str, socket: Option<&str>, session: &str, raw: &str) -> D
 
 fn validate_name(name: &str) -> Result<(), DispatchError> {
     if name.is_empty() || name.contains('/') || name.contains('\\') {
-        return Err(DispatchError::InvalidParams("無効なファイル名".into()));
+        return Err(Reason::InvalidFileName.invalid());
     }
     Ok(())
 }
@@ -21040,17 +21246,14 @@ fn copy_progress_json() -> Value {
 fn copy_cancel(name: Option<&str>) -> Result<Value, DispatchError> {
     let id = match name.map(str::trim).filter(|s| !s.is_empty()) {
         None => None,
-        Some(text) => Some(text.parse::<u64>().map_err(|_| {
-            DispatchError::InvalidParams(format!(
-                "name は取り消すコピーの番号（copy_progress の id）: {text}"
-            ))
-        })?),
+        Some(text) => Some(
+            text.parse::<u64>()
+                .map_err(|_| Reason::BadCopyId(text.to_string()).invalid())?,
+        ),
     };
     let cancelled = tako_core::file_copy::jobs().cancel(id);
     if let (Some(id), true) = (id, cancelled.is_empty()) {
-        return Err(DispatchError::Operation(format!(
-            "番号 {id} のコピーは走っていない"
-        )));
+        return Err(Reason::CopyNotRunning(id).operation());
     }
     Ok(json!({ "cancelled": cancelled }))
 }
@@ -21075,9 +21278,7 @@ fn file_op_many(
 ) -> Result<Value, DispatchError> {
     use tako_core::file_clipboard::ClipMode;
     if paths.is_empty() {
-        return Err(DispatchError::InvalidParams(
-            "paths を 1 つ以上指定する".into(),
-        ));
+        return Err(Reason::NoPaths.invalid());
     }
     let all: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
     let (targets, skipped) = tako_core::tree_select::distinct_roots(&all);
@@ -21089,9 +21290,7 @@ fn file_op_many(
             .map(|path| (path.clone(), trash_one(path)))
             .collect(),
         FileOpKind::Move => {
-            let dest = dest.ok_or(DispatchError::InvalidParams(
-                "dest（移動先のフォルダ）を指定する".into(),
-            ))?;
+            let dest = dest.ok_or_else(|| Reason::MoveDestMissing.invalid())?;
             targets
                 .iter()
                 .map(|path| (path.clone(), run_file_move(host, path, Path::new(dest))))
@@ -21109,9 +21308,7 @@ fn file_op_many(
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
                 .unwrap_or_default();
-            return Err(DispatchError::InvalidParams(format!(
-                "paths で扱えるのは clipboard_copy / clipboard_cut / trash / move / copy（{name}）"
-            )));
+            return Err(Reason::ManyOpUnsupported(name).invalid());
         }
     };
     many_reply(results, &skipped)
@@ -33087,8 +33284,13 @@ mod tests {
             "{zero_column}"
         );
         let only_column = open(&mut host, &code, None, Some(3)).unwrap_err();
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
         assert!(
-            only_column.to_string().contains("line と一緒に"),
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| only_column
+                    .to_string()
+                    .contains(&Reason::ColumnNeedsLine.text_in(lang))),
             "{only_column}"
         );
 
@@ -33430,7 +33632,14 @@ mod tests {
                     .contains(&tako_core::TextEditError::ExternalDeleted.text_in(lang))),
             "{refused}"
         );
-        assert!(refused.contains("作り直す"), "{refused}");
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| refused.contains(
+                    &Reason::RecoveryHint(Some(tako_core::DiskState::Deleted)).text_in(lang)
+                )),
+            "{refused}"
+        );
         let diff = run(&mut host, Request::PreviewDiff { pane: Some(pane) }).unwrap();
         assert_eq!(diff["diff"]["state"].as_str(), Some("deleted"));
         assert!(run(&mut host, Request::PreviewRevert { pane: Some(pane) }).is_err());
@@ -40602,7 +40811,14 @@ mod tests {
                 ..Default::default()
             })
             .expect_err("同時指定は拒否する");
-            assert!(format!("{err}").contains("同時に指定できない"), "{err}");
+            // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+            assert!(
+                [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                    .into_iter()
+                    .any(|lang| format!("{err}")
+                        .contains(&Reason::CannotCombine("cwd", "clear_cwd").text_in(lang))),
+                "{err}"
+            );
 
             // 解除
             let v = set(ProfilesParams {
@@ -41053,7 +41269,15 @@ mod tests {
 
         // 同時指定は拒否（auto_handoff と同じ規約）
         let err = set(Some(true), true).expect_err("同時指定は拒否する");
-        assert!(err.to_string().contains("同時に指定できない"), "{err}");
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| err.to_string().contains(
+                    &Reason::CannotCombine("limit_resume", "clear_limit_resume").text_in(lang)
+                )),
+            "{err}"
+        );
 
         let _ = dispatch_orchestrator_profiles(ProfilesParams {
             action: "delete".into(),
@@ -53349,7 +53573,12 @@ mod tests {
         assert!(host.file_copies.is_empty());
         // 札は落ちた = 一覧から外れ、同じ番号ではもう取り消せない
         let gone = cancel(&mut host, &id.to_string()).unwrap_err().to_string();
-        assert!(gone.contains("走っていない"), "{gone}");
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| gone == Reason::CopyNotRunning(id).text_in(lang)),
+            "{gone}"
+        );
         // 取り消さなければ数えた量と写した量が一致して終わる（同期の経路）
         let done = dispatch(&mut host, request, PaneOrigin::Cli).unwrap();
         assert_eq!(
