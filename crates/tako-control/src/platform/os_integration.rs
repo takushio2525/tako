@@ -3,7 +3,8 @@
 //! 「ファイルマネージャで表示」「既定アプリで開く」「URL を開く」「ゴミ箱へ移す」
 //! 「通知を出す」など、**OS のシェルに委ねる操作**をここへ集約する。
 //!
-//! - macOS: `open` 系（`-R` / `-a` / `-t` / `-n`）と `osascript`
+//! - macOS: 表示は tako 自身から `NSWorkspace activateFileViewerSelectingURLs:`
+//!   （`platform::finder_reveal`。#2247）、開く系は `open` 系（`-a` / `-t` / `-n`）と `osascript`
 //! - Windows: 表示は `explorer.exe /select,`、開く系は `ShellExecuteW`、
 //!   ゴミ箱は `SHFileOperationW` + `FOF_ALLOWUNDO`（#617）。URL も `ShellExecuteW`（#1371）
 //! - その他 unix: URL は `xdg-open`
@@ -59,9 +60,36 @@ pub fn file_manager() -> FileManager {
     }
 }
 
-/// ファイルマネージャ（Finder / エクスプローラー）で対象を選択表示する
+/// ファイルマネージャ（Finder / エクスプローラー）で対象を選択表示する。
+///
+/// 「Finder で表示」の入口（ファイルツリー・ターミナルのパスの ⌘+右クリック・プレビューのペイン・
+/// 設定画面・右パネルの添付・CLI `tako file reveal` / MCP `tako_file_op`）はすべて dispatch の
+/// `FileOpKind::Reveal` からここへ来る（#2247）。macOS は**このプロセス（tako の GUI）から**
+/// NSWorkspace で Finder を前面へ出す（子の `open -R` では Finder が前に出てこなかった = #2247）。
+/// CLI は GUI へ頼むだけで、自分のプロセスからは呼ばない（GUI が居なければ他の操作と同じく
+/// 「繋がらない」で断る）
 pub fn reveal(path: &Path) -> Result<(), String> {
     imp::reveal(path)
+}
+
+/// 「Finder で表示」を修正前の子の `open -R` へ戻す A/B（#2247。`TAKO_2247_LEGACY=1`）
+pub fn reveal_legacy_2247() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2247_LEGACY").is_ok_and(|v| v == "1"))
+}
+
+/// [`reveal`] の検証の記録の 1 行の頭（`scripts/test-preview-reveal-2247.sh` と visual-test が数える目印）
+pub const REVEAL_RECORD_MARK: &str = "activateFileViewerSelectingURLs:";
+
+/// 検証の口（#2247）: `TAKO_REVEAL_RECORD=<ファイル>` があれば、macOS の [`reveal`] は
+/// NSWorkspace へ渡す直前の URL を 1 行書くだけで Finder を開かない
+/// （本物の Finder の窓をユーザーの画面に出さずに、入口ごとの到達を数える）
+// macOS の実装だけが使う
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn reveal_record() -> Option<std::path::PathBuf> {
+    std::env::var_os("TAKO_REVEAL_RECORD")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 /// 既定アプリで開く
@@ -218,7 +246,11 @@ mod imp {
     use super::*;
 
     pub fn reveal(path: &Path) -> Result<(), String> {
-        spawn_open(&["-R".as_ref(), path.as_os_str()], "Finder を開けない")
+        if super::reveal_legacy_2247() {
+            // 修正前の形（#2247 の A/B）: 子の `open -R`。成功しても Finder が前に出てこなかった
+            return spawn_open(&["-R".as_ref(), path.as_os_str()], "Finder を開けない");
+        }
+        crate::platform::finder_reveal::reveal(path, super::reveal_record().as_deref())
     }
 
     pub fn open_default(path: &Path) -> Result<(), String> {

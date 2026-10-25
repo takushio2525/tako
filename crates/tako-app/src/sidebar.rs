@@ -3064,7 +3064,9 @@ impl TakoApp {
     /// 右クリック（#185 / #1684）が**同じ dispatch**（`FileOpKind::Reveal` = CLI `tako file reveal` /
     /// MCP `tako_file_op` の op=reveal）を通る。消えた・OS へ渡せなかった失敗は押した画面
     /// （`area`）の通知として出し、persist.log へも残す（黙って何も起きない、にしない）。
-    /// 操作名はメニューの文言そのもの（#617 の OS 出し分けもそのまま効く）
+    /// 操作名はメニューの文言そのもの（#617 の OS 出し分けもそのまま効く）。
+    /// dispatch の先の実体は `os_integration::reveal`（macOS はこの GUI から NSWorkspace で
+    /// Finder を前面へ出す。設定画面・右パネルの添付も同じ dispatch を通る）
     pub(crate) fn reveal_in_file_manager(
         &mut self,
         path: &std::path::Path,
@@ -3096,8 +3098,9 @@ impl TakoApp {
     }
 
     /// #2247 の A/B。`TAKO_2247_LEGACY=1` で**同一バイナリのまま**修正前の作りへ戻す
-    /// （プレビューのペインのメニューの「Finder で表示」だけが dispatch を通らず
-    /// `os_integration::reveal` を直に呼び、結果を捨てる = 消えたファイルでも無言）
+    /// （プレビューのペインのメニューと設定画面の「Finder で表示」が dispatch を通らず
+    /// `os_integration::reveal` を直に呼び、結果を捨てる = 消えたファイルでも無言。
+    /// 実体も子の `open -R` へ戻る = 同じ env を `os_integration::reveal_legacy_2247` が読む）
     pub(crate) fn legacy_2247() -> bool {
         static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *LEGACY.get_or_init(|| std::env::var("TAKO_2247_LEGACY").map(|v| v == "1") == Ok(true))

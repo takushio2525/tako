@@ -32297,7 +32297,7 @@ mod self_test {
     mod lsp_held_2048;
     #[cfg(feature = "visual-test")]
     use lsp_held_2048::lsp_held_visual;
-    /// #2247: プレビューのメニューの「Finder で表示」を実マウスで押す（visual-test `preview-reveal-2247`）
+    /// #2247: 「Finder で表示」を実マウスで押し、NSWorkspace の 1 実装へ届くか（visual-test `preview-reveal-2247`）
     #[cfg(feature = "visual-test")]
     mod preview_reveal_2247;
     #[cfg(feature = "visual-test")]
@@ -47934,7 +47934,7 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
-                // #2247: プレビューのメニューの「Finder で表示」が open -R を 1 回起こすか（偽の open）
+                // #2247: 「Finder で表示」がどの入口からも NSWorkspace の 1 実装へ 1 回届くか（記録の口）
                 "preview-reveal-2247" => {
                     preview_reveal_visual(any, window, cx).await;
                     println!("TAKO_VISUAL_TEST_OK");
