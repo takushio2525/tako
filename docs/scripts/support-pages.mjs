@@ -390,7 +390,7 @@ const AGENT_CATEGORIES = [
   ['worker への指示と応答', [
     'worker_prompt_delivery', 'worker_delivery_peer', 'prompt_delivery_receipt',
     'worker_permission_dialog', 'worker_choice_dialog', 'worker_cli_control',
-    'worker_mcp',
+    'worker_mcp', 'worker_mcp_scope',
   ]],
   ['報告と会話ログ', [
     'worker_report_scrollback', 'worker_report_transcript',

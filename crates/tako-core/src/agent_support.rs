@@ -353,6 +353,8 @@ pub mod keys {
     pub const WORKER_LOGIN_EXPIRED_DETECT: &str = "worker_login_expired_detect";
     /// worker からの MCP 接続
     pub const WORKER_MCP: &str = "worker_mcp";
+    /// worker を tako の MCP だけで起動する（利用者の設定の MCP を持ち込まない。#2412）
+    pub const WORKER_MCP_SCOPE: &str = "worker_mcp_scope";
     /// worker が実際に使ったモデルを確かめ、宣言との食い違いを知らせる（#1638）
     pub const WORKER_MODEL_ACTUAL: &str = "worker_model_actual";
     /// claude 語彙で書かれたモデル / effort の既定（プロファイルの `worker_model` /
@@ -541,6 +543,18 @@ pub mod notes {
     pub const NO_LOCAL_LOGIN: Note = Note::new(
         "自分のマシンで動かすモデルなので、ベンダーへのログインとその失効という概念が無い（失効する資格情報がそもそも存在しない）",
         "The model runs on your own machine, so there is no vendor login to expire in the first place",
+    );
+
+    /// #2412: codex は起動ごとに MCP を絞れそうだが、実行時に子が立たないことを確かめていない
+    pub const CODEX_MCP_SCOPE_NOT_MEASURED: Note = Note::new(
+        "起動ごとの `-c mcp_servers.<名>.enabled=false` で設定の上は止まる（codex-cli 0.154.0 の `codex mcp list --json`）が、実行時に子が立たないことを実測していないので、今は利用者の設定の MCP を全部持ち込む",
+        "A per-launch `-c mcp_servers.<name>.enabled=false` disables a server in the config (`codex mcp list --json`, codex-cli 0.154.0), but no run has confirmed the child is not started, so the user's MCP servers are still all brought along",
+    );
+
+    /// #2412: agy は起動ごとに MCP を絞る手段が CLI に無い
+    pub const AGY_NO_PER_LAUNCH_MCP: Note = Note::new(
+        "起動ごとに MCP を絞る手段が CLI に無い（agy 1.4.7 の `--help` に `-c` / `--mcp-config` / `--settings` が無い。`agy mcp disable` は利用者自身の agy の設定を書き換えるので使わない）",
+        "The CLI has no per-launch way to narrow MCP servers (agy 1.4.7 `--help` lists no `-c` / `--mcp-config` / `--settings`; `agy mcp disable` would rewrite the user's own agy config, so it is not used)",
     );
 
     /// #757: 失効の文言を実物で採っていない（無いと確定したわけではない）
@@ -1746,6 +1760,27 @@ pub const MATRIX: &[AgentFeature] = &[
         local: local_pending_first_class(),
         evidence: AgentEvidence::Measured(
             "#986 の実測（2026-09-09 / 隔離 GUI + tako-vd / codex-cli 0.153.0 / agy 1.1.27）:              **codex** = spawn の起動コマンドへ master と同じ `-c mcp_servers.tako.*` を一時注入する              （正本は orchestrator::agent::codex_mcp_args の 1 実装）。実 worker が              `tako.tako_list_panes({})` を呼び、**pane を省略した** `tako_set_title` が              自分のペインへ当たった。効いているのが一時注入だと分かるのは env の指紋で、             MCP 子プロセスの初期環境は一時注入の 5 個（TAKO_TAB_ID を含む）に対し、             `TAKO_986_LEGACY=1` の旧アームでは恒久登録（#979）の 4 個（TAKO_TAB_ID 無し）だった。             **agy** = per-launch の注入手段が CLI に無い（`agy --help` 実測 1.1.27: -c / --mcp-config なし）ので              恒久登録（#979）に委ねる。agy は親 env をそのまま渡す（実測: MCP 子が TAKO_* を 15 個受け取る              = claude と同じ形）ため、実 worker から pane 省略の `tako_set_title` が自分のペインへ当たった。             `TAKO_PANE_ID` が届かない系統でも解けるよう、caller_pane は **pid 祖先辿り**へ落ちる              （`tako mcp serve` が `Request::ResolvePane` で問う。#288 / #567 と同じ 1 実装）",
+        ),
+    },
+    AgentFeature {
+        key: keys::WORKER_MCP_SCOPE,
+        summary: Note::new(
+            "worker を tako の MCP だけで起動し、利用者の設定の MCP サーバーを持ち込まない（要るものはプロジェクトの mcp_servers で足す。#2412）",
+            "Workers start with only tako's MCP and do not bring along the user's own MCP servers (a project adds what it needs via mcp_servers; #2412)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::CODEX_MCP_SCOPE_NOT_MEASURED, 2418),
+        agy: unsupported(notes::AGY_NO_PER_LAUNCH_MCP),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#2412 の実測（2026-10-26 / claude 2.1.301・一時の CLAUDE_CONFIG_DIR + 偽 Messages API + 起動を記録する偽 MCP）: \
+             `--settings` の `deniedMcpServers` に並べた user scope の名前だけが立たず、`.mcp.json`（cwd と祖先）と \
+             local scope（git の根を鍵にした projects.<path>.mcpServers）は立つ。同名の .mcp.json 側まで止まるので \
+             同名は止めない。`--settings` を 2 つ渡すと後ろが勝つ。`--strict-mcp-config` は .mcp.json / local まで止め、\
+             `--setting-sources project,local` は user の settings.json まで落とすので採らない。\
+             組み立ては orchestrator::agent::build_worker_cmd（spawn / run / git resolve / 再開）、判断は worker_mcp::prepare の 1 実装。\
+             codex は `-c mcp_servers.<名>.enabled=false` が `codex mcp list --json` に効く（0.154.0）ところまで、\
+             agy 1.4.7 は起動ごとの手段が無い",
         ),
     },
     AgentFeature {

@@ -39297,6 +39297,7 @@ mod self_test {
             key: Some(key.into()),
             cwd: (action == "add").then(|| std::env::temp_dir().display().to_string()),
             description: None,
+            servers: Vec::new(),
         };
         let profile_req = |action: &str, name: &str| Req::OrchestratorProfiles {
             action: action.into(),
@@ -88438,6 +88439,7 @@ mod self_test {
                             key: Some(key.into()),
                             cwd: Some(cwd.display().to_string()),
                             description: None,
+                            servers: Vec::new(),
                         },
                         cx,
                     )
@@ -88836,6 +88838,7 @@ mod self_test {
                             key: Some(key.into()),
                             cwd: None,
                             description: None,
+                            servers: Vec::new(),
                         },
                         cx,
                     );
@@ -96130,6 +96133,7 @@ mod self_test {
                         key: Some(key149.into()),
                         cwd: Some(repo149.display().to_string()),
                         description: None,
+                        servers: Vec::new(),
                     },
                     cx,
                 );
@@ -96307,6 +96311,7 @@ mod self_test {
                             key: Some(outside149.into()),
                             cwd: Some(repo149.display().to_string()),
                             description: None,
+                            servers: Vec::new(),
                         },
                         cx,
                     );
@@ -96439,6 +96444,7 @@ mod self_test {
                             key: Some(k.into()),
                             cwd: None,
                             description: None,
+                            servers: Vec::new(),
                         },
                         cx,
                     );

@@ -39,21 +39,73 @@ pub struct ConfigLock {
 
 /// `<target>.lock` を排他ロックして返す。他プロセスが保持中ならブロックして待つ。
 /// ロックファイル自体は消さない（削除すると別プロセスが新旧 2 つの inode を
-/// 別々にロックできてしまい排他が破れるため）
+/// 別々にロックできてしまい排他が破れるため）。
+///
+/// 断りの文は日本語（呼び手の多くが日本語の枠の文へ載せる）。表示言語で返したい呼び手は
+/// [`lock_exclusive_typed`] で型のまま受ける（#2365）
 pub fn lock_exclusive(target: &Path) -> Result<ConfigLock, String> {
+    lock_exclusive_typed(target).map_err(|e| e.text_in(tako_core::i18n::Lang::Ja))
+}
+
+/// [`lock_exclusive`] の本体。断りを型で返す（文は [`LockError::text_in`] で言語を選んで引く）
+pub fn lock_exclusive_typed(target: &Path) -> Result<ConfigLock, LockError> {
     let lock_path = sibling_with_suffix(target, ".lock");
     if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| LockError::CreateDir(e.to_string()))?;
     }
     let file = OpenOptions::new()
         .create(true)
         .truncate(false) // 内容は使わない（ロック専用）。truncate 不要を明示
         .write(true)
         .open(&lock_path)
-        .map_err(|e| format!("ロックファイルを開けない ({}): {e}", lock_path.display()))?;
-    file.lock()
-        .map_err(|e| format!("ロックの取得に失敗 ({}): {e}", lock_path.display()))?;
+        .map_err(|e| LockError::Open {
+            path: lock_path.display().to_string(),
+            error: e.to_string(),
+        })?;
+    file.lock().map_err(|e| LockError::Acquire {
+        path: lock_path.display().to_string(),
+        error: e.to_string(),
+    })?;
     Ok(ConfigLock { _file: file })
+}
+
+/// 排他ロックを取れなかった理由（`error` は OS のエラー文。言語に依らずそのまま載せる）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockError {
+    /// ロックファイルの置き場のディレクトリを作れない
+    CreateDir(String),
+    /// ロックファイルを開けない
+    Open { path: String, error: String },
+    /// ロックを取れない
+    Acquire { path: String, error: String },
+}
+
+impl LockError {
+    /// 表示言語を明示しての文言（#2365）。(バリアント, 言語) の網羅 match で、日本語は
+    /// #2365 より前の固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::CreateDir(e), Ja) => format!("ディレクトリの作成に失敗: {e}"),
+            (Self::CreateDir(e), En) => format!("failed to create the directory: {e}"),
+            (Self::Open { path, error }, Ja) => {
+                format!("ロックファイルを開けない ({path}): {error}")
+            }
+            (Self::Open { path, error }, En) => {
+                format!("cannot open the lock file ({path}): {error}")
+            }
+            (Self::Acquire { path, error }, Ja) => format!("ロックの取得に失敗 ({path}): {error}"),
+            (Self::Acquire { path, error }, En) => {
+                format!("failed to take the lock ({path}): {error}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
 }
 
 /// tmp ファイル + rename によるアトミック書き込み。

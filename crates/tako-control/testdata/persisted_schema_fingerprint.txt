@@ -46,9 +46,9 @@ Place: Auto, Mod, Tako
 Policy: mode, allow, disabled_rules
 PreviewLayout: path, mode
 Profile: master_agent, model, effort, worker_model_policy, worker_model, worker_effort, delegate_guidance, worker_agent, worker_agents, system_prompt, prompt_blocks, projects, tab_naming_convention, supervisor_mode, auto_resume_dead, supervisor_max_retries, cwd, env, master_account, worker_account, ctx_threshold, auto_handoff, limit_resume, bypass_sandbox, remote_control
-ProjectEntry: cwd, description
+ProjectEntry: cwd, description, mcp_servers
 ProjectFrom: Cwd, Profile, Catalog
-ProjectsConfig: projects
+ProjectsConfig: version, projects
 RecentEntry: directory, repository, ssh
 RecentList: entries
 RecordOwner: pid, started_unix
@@ -105,7 +105,7 @@ version recent: v1 steps=0
 version config_share: v1 steps=0
 version lid_guard: v1 steps=0
 version orchestrator_config: v1 steps=0
-version projects: v1 steps=0
+version projects: v2 steps=1
 version accounts: v1 steps=0
 version profiles: v3 steps=2
 version solo_profiles: v3 steps=2

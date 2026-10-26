@@ -1128,3 +1128,16 @@ Windows CI のテスト（`crates/tako-control/src/ipc.rs` の `windows_tests::i
       増えている（パイプ名・ユーザー名は載っていない）
 - [ ] `TAKO_2361_LEGACY=1 TAKO_2361_INJECT=1` で起動すると、2 回目の `tako check-health` は
       アプリへ届かず、ローカル診断が「GUI: 動いている（pid …）のに受け口が応答しない」と出す（修正前の形）
+
+## worker を tako の MCP だけで起動する（#2412、2026-10-26）
+
+起動コマンドの組み立て・止める名前の判断・移行は単体テストと番犬（`issue2412_worker_mcp_scope_watchdog`）で、
+実物の claude が user scope の MCP を立てないことは GUI を使わない腕
+（`ARMS="headless-before headless-new" REAL_MCP=1 bash scripts/test-worker-mcp-scope-2412.sh`）で実測済み。
+**GUI 経由の spawn は 2026-10-26 時点で未実測**（蓋閉じで tako-vd が描画できなかった）。蓋を開けて次を確かめる:
+
+- [ ] `REAL_MCP=1 bash scripts/test-worker-mcp-scope-2412.sh`（既定の腕 `before new`）が PASS する。
+      修正後の腕で spawn の応答に `mcp.mode: tako_only` と止めた名前が載り、worker から
+      `tako_show_command` が呼べて CARD-DONE が返る（= `--settings` を付けても tako の MCP は使える）
+- [ ] 本番で personal アカウントの worker を 1 本 spawn し、`tako queue` のそのペインの `agent` の MB が
+      修正前（同じアカウントの worker で 800〜900 MB）より下がっている

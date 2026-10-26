@@ -169,8 +169,14 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `RunError` は型を持つ（`Invalid(UiError)` / `Refused(UpdateError)` / `Lock`）。
   **言語を固定する口**: setup（`--answers` の検証・`run_setup_stage`・`--review` の対話）は枠が
   日本語なので `text_in(Lang::Ja)`、persist.log の記録（と重複除けの鍵）・`tako migrate` の
-  `validate_text` も日本語、`tako mod ui` の成功の応答の `problems` は枠（`applies_to` / `note` /
-  `choices`）がまだ日本語なのでそろえて日本語（枠ごと移すのは #2365 の続き）。
+  `validate_text` も日本語。`tako mod ui` の成功の応答の枠（`applies_to` / `note` / `choices` の説明・
+  `hotkey`）・CLI の人向けの表示（`print_mod_ui`）・引数の読み方の断り（`cli_request` =
+  `CliRequestError`）・置き場の断り（`default_path` = `UiText::NoDataDir`）・排他の断り
+  （`RunError::Lock` = `config_io::LockError`）は #2365 の続きで表示言語へ移した（枠の文は
+  `tako_core::claude_mod_ui::UiText`、語彙の説明は各型の `describe_in`）。枠と一緒に `problems` も
+  表示言語で載せる。setup の対話（`review_mod_ui`）は枠が日本語なので `describe_in(Lang::Ja)`。
+  `config_io::lock_exclusive` はほかの呼び手が日本語の枠へ載せるので日本語のまま返し、型で受けたい
+  呼び手は `lock_exclusive_typed`。
   番犬は同じ `issue1762_dispatch_error_lang.rs`（末尾の節。実経路 `claude_mod_ui::run` の断りで
   英語表示に日本語が 1 字も無いことも見る）
 - #2365 の続きで、**ファイルの移動・コピーの断り**を理由ごと移した: 理由は tako-core の

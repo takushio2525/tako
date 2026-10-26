@@ -1,4 +1,4 @@
-//! launch_gate — agent の起動待ち（FR-2.43.11 / Issue #2413。エピック #1992）
+//! launch_gate — agent の起動待ち（FR-2.43.12 / Issue #2413。エピック #1992）
 //!
 //! 設計の正は `.agent/plans/2026-10-resource-manager.md` の §9.6（入口の棚卸し）と §11-7（#2413 で改めた）。
 //!

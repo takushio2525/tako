@@ -703,17 +703,43 @@ fn resolve_entry(name: &str, entry: &AccountEntry) -> Result<ResolvedAccount, St
 
 // --- projects.yaml ---
 
+/// projects.yaml の今の世代（#916 の移行の番地。v1 = 版数の無い #2412 前の形）。
+/// v2 で各プロジェクトに `mcp_servers` を足し、移行が直近の実績を写した（#2412）
+pub const PROJECTS_VERSION: u32 = 2;
+
+fn projects_version_v1() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectsConfig {
+    /// 世代。**書いていない旧ファイルは 1**（移行がまだ = 実績を写していない）。
+    /// ファイルが無い状態から作るときは今の世代で書く（写す実績が無い）
+    #[serde(default = "projects_version_v1")]
+    pub version: u32,
     #[serde(default)]
     pub projects: std::collections::BTreeMap<String, ProjectEntry>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl Default for ProjectsConfig {
+    fn default() -> Self {
+        Self {
+            version: PROJECTS_VERSION,
+            projects: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectEntry {
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// このプロジェクトの claude worker へ持ち込む **user scope の MCP サーバー名**（#2412）。
+    /// 空 = tako の MCP だけ（既定）。`*` = user scope を全部持ち込む。
+    /// `.mcp.json` / local scope のものはここに書かなくても立つ
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
 }
 
 /// projects.yaml を解決済みの絶対パスで返すエントリ
@@ -735,9 +761,7 @@ impl ProjectsConfig {
     /// **0 件に丸めず Err を返す**（#169: 失敗を空として扱うと後続の save が全件を消す）
     pub fn load_from(path: &Path) -> Result<Self, String> {
         if !path.is_file() {
-            return Ok(ProjectsConfig {
-                projects: std::collections::BTreeMap::new(),
-            });
+            return Ok(ProjectsConfig::default());
         }
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("projects.yaml の読み取りに失敗: {e}"))?;
@@ -807,7 +831,20 @@ impl ProjectsConfig {
     }
 
     pub fn add(&mut self, key: String, cwd: String, description: Option<String>) {
-        self.projects.insert(key, ProjectEntry { cwd, description });
+        // 既にあるキーへの add は cwd / description の上書き。mcp_servers（#2412）は残す
+        let mcp_servers = self
+            .projects
+            .get(&key)
+            .map(|e| e.mcp_servers.clone())
+            .unwrap_or_default();
+        self.projects.insert(
+            key,
+            ProjectEntry {
+                cwd,
+                description,
+                mcp_servers,
+            },
+        );
     }
 
     pub fn remove(&mut self, key: &str) -> bool {
@@ -4887,9 +4924,7 @@ mod tests {
 
     /// n 件のエントリを持つ ProjectsConfig を作る
     fn config_with_entries(n: usize) -> ProjectsConfig {
-        let mut config = ProjectsConfig {
-            projects: std::collections::BTreeMap::new(),
-        };
+        let mut config = ProjectsConfig::default();
         for i in 0..n {
             config.add(
                 format!("proj-{i:02}"),
@@ -5075,9 +5110,7 @@ mod tests {
 
     #[test]
     fn projects_config_roundtrip() {
-        let mut config = ProjectsConfig {
-            projects: std::collections::BTreeMap::new(),
-        };
+        let mut config = ProjectsConfig::default();
         config.add("demo".into(), "~/my-project".into(), Some("テスト".into()));
         let yaml = serde_yaml::to_string(&config).unwrap();
         let back: ProjectsConfig = serde_yaml::from_str(&yaml).unwrap();
@@ -6382,6 +6415,7 @@ prompt_blocks:
                 // #1013 はモデル / effort の語彙だけを見るので MCP 注入は入れない
                 // （注入そのものは #986 のテストが見る）
                 tako_bin: None,
+                mcp_settings: None,
                 env: &EMPTY_ENV_PLAN,
             },
             crate::launch_cmd::ShellDialect::Posix,
@@ -7553,14 +7587,13 @@ worker_agents:
     fn validate_projects_rejects_unknown_key() {
         // ProjectsConfig を直接構築して validate_projects_with でテスト
         // （OnceLock 競合を回避）
-        let mut config = ProjectsConfig {
-            projects: std::collections::BTreeMap::new(),
-        };
+        let mut config = ProjectsConfig::default();
         config.projects.insert(
             "tako".into(),
             ProjectEntry {
                 cwd: "/tmp".into(),
                 description: Some("test".into()),
+                ..Default::default()
             },
         );
 

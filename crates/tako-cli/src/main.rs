@@ -3073,6 +3073,15 @@ enum LedgerCommand {
     },
 }
 
+/// `tako orchestrator projects mcp <key> <op>` の操作（#2412）
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ProjectMcpOp {
+    /// 持ち込む MCP を足す
+    Add,
+    /// 持ち込む MCP を外す
+    Remove,
+}
+
 #[derive(Subcommand)]
 enum ProjectsCommand {
     /// 登録済みプロジェクトの一覧
@@ -3094,6 +3103,16 @@ enum ProjectsCommand {
         /// プロジェクトキー
         #[arg(long)]
         key: String,
+    },
+    /// claude worker へ持ち込む user scope の MCP を見る・足す・外す
+    /// （既定は tako の MCP だけ。.mcp.json のものは書かなくても立つ。#2412）
+    Mcp {
+        /// プロジェクトキー
+        key: String,
+        /// add / remove（省略は今の構成を見る）
+        op: Option<ProjectMcpOp>,
+        /// MCP サーバー名（* = user scope を全部持ち込む）
+        servers: Vec<String>,
     },
 }
 
@@ -5817,6 +5836,14 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
                         p["cwd"].as_str().unwrap_or(""),
                         p["description"].as_str().unwrap_or("")
                     );
+                    // #2412: worker へ持ち込む user scope の MCP（既定の tako だけなら出さない）
+                    let mcp: Vec<&str> = p["mcp_servers"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+                        .unwrap_or_default();
+                    if !mcp.is_empty() {
+                        println!("{:<16} worker の MCP: tako + {}", "", mcp.join(", "));
+                    }
                 }
             }
             Ok(())
@@ -5869,6 +5896,61 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
             .map_err(local_dispatch_err)?;
             eprintln!("削除しました: {key}");
             Ok(())
+        }
+        // #2412: MCP と同じ 1 本（dispatch_orchestrator_projects_mcp）を通す
+        ProjectsCommand::Mcp { key, op, servers } => {
+            let action = match op {
+                Some(ProjectMcpOp::Add) => "mcp_add",
+                Some(ProjectMcpOp::Remove) => "mcp_remove",
+                None => "mcp",
+            };
+            let res = tako_control::dispatch::dispatch_orchestrator_projects_mcp(
+                action,
+                Some(key.clone()),
+                servers.clone(),
+            )
+            .map_err(local_dispatch_err)?;
+            print_project_mcp(key, &res);
+            Ok(())
+        }
+    }
+}
+
+/// `tako orchestrator projects mcp` の表示（設定・今 spawn したときの構成・警告）
+fn print_project_mcp(key: &str, res: &serde_json::Value) {
+    let list = |v: &serde_json::Value| -> String {
+        let names: Vec<&str> = v
+            .as_array()
+            .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        if names.is_empty() {
+            "（なし）".to_string()
+        } else {
+            names.join(", ")
+        }
+    };
+    if let Some(added) = res.get("added") {
+        eprintln!("足しました: {}", list(added));
+    }
+    if let Some(removed) = res.get("removed") {
+        eprintln!("外しました: {}", list(removed));
+    }
+    let plan = &res["plan"];
+    println!(
+        "{key} の worker へ持ち込む user scope の MCP: {}",
+        list(&res["mcp_servers"])
+    );
+    println!("  今 spawn すると持ち込む: tako + {}", list(&plan["kept"]));
+    println!("  止める（user scope）: {}", list(&plan["denied"]));
+    if plan["shadowed"].as_array().is_some_and(|a| !a.is_empty()) {
+        println!(
+            "  プロジェクトの .mcp.json と同名なので止めない: {}",
+            list(&plan["shadowed"])
+        );
+    }
+    for w in res["warnings"].as_array().into_iter().flatten() {
+        if let Some(w) = w.as_str() {
+            eprintln!("警告: {w}");
         }
     }
 }
@@ -9100,13 +9182,15 @@ fn read_mod_report() -> Result<Value, String> {
 /// 断ったら理由と使える値を出して終了コード 1（ui.json は書いていない）
 fn mod_ui_local(args: &ModArgs) -> Result<(), String> {
     tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    // 断りの文はどれも表示言語に従う（#2365。上で決めた言語）
     let request = tako_control::claude_mod_ui::cli_request(
         &args.rest,
         args.label.as_deref(),
         args.hotkey.as_deref(),
         args.id.as_deref(),
-    )?;
-    let path = tako_control::claude_mod_ui::default_path()?;
+    )
+    .map_err(|e| e.to_string())?;
+    let path = tako_control::claude_mod_ui::default_path().map_err(|e| e.to_string())?;
     let out = tako_control::claude_mod_ui::run(&path, &request).map_err(|e| e.message())?;
     if args.json {
         println!("{}", pretty_json(&out));
@@ -9116,23 +9200,25 @@ fn mod_ui_local(args: &ModArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// `tako mod ui` の表示（今の値・ボタン・選べる値。変更の後は結果と今の値だけ）
+/// `tako mod ui` の表示（今の値・ボタン・選べる値。変更の後は結果と今の値だけ）。
+/// 枠の文は `tako_core::claude_mod_ui::UiText`（表示言語に従う。#2365）
 fn print_mod_ui(out: &Value) {
+    use tako_core::claude_mod_ui::UiText;
     let path = tako_core::paths::shorten_home(out["path"].as_str().unwrap_or("-"));
     let state = match out["state"].as_str() {
-        Some("absent") => "（ファイルは無い = 既定で動いている）".to_string(),
-        Some("repaired") => format!(
-            "（読めない部分を既定で動かした。元は {} に残した）",
-            tako_core::paths::shorten_home(out["quarantine"].as_str().unwrap_or("-"))
-        ),
-        Some("future") => "（新しい tako が書いた形。読める範囲で使い、書き換えない）".to_string(),
-        Some("read_error") => "（読めないので既定で動いている）".to_string(),
+        Some("absent") => UiText::StateAbsent.to_string(),
+        Some("repaired") => UiText::StateRepaired {
+            quarantine: tako_core::paths::shorten_home(out["quarantine"].as_str().unwrap_or("-")),
+        }
+        .to_string(),
+        Some("future") => UiText::StateFuture.to_string(),
+        Some("read_error") => UiText::StateReadError.to_string(),
         _ => String::new(),
     };
     match out["changed"].as_bool() {
-        Some(true) => println!("変えた: {path}"),
-        Some(false) => println!("変わらない（もうその値）: {path}"),
-        None => println!("Claude Code の画面の UI（tako mod）: {path}{state}"),
+        Some(true) => println!("{}", UiText::Changed { path }),
+        Some(false) => println!("{}", UiText::Unchanged { path }),
+        None => println!("{}{state}", UiText::Heading { path }),
     }
     let choices = &out["choices"];
     let word_list = |v: &Value| {
@@ -9157,24 +9243,22 @@ fn print_mod_ui(out: &Value) {
         };
         let allowed = &choices["set"][key];
         if allowed.is_object() {
-            let how = if allowed["type"] == "list" {
-                " から並べる"
-            } else {
-                ""
+            let allowed = UiText::Allowed {
+                values: word_list(&allowed["values"]).replace(", ", " / "),
+                list: allowed["type"] == "list",
             };
-            println!(
-                "  {key:<18} {shown:<36} （{}{how}）",
-                word_list(&allowed["values"]).replace(", ", " / ")
-            );
+            println!("  {key:<18} {shown:<36} {allowed}");
         } else {
             println!("  {key:<18} {shown}");
         }
     }
     let buttons = out["ui"]["buttons"].as_array().cloned().unwrap_or_default();
     println!(
-        "  ボタン（{} / {} 個）:",
-        buttons.len(),
-        tako_core::claude_mod_ui::MAX_BUTTONS
+        "  {}",
+        UiText::ButtonsHeading {
+            count: buttons.len(),
+            max: tako_core::claude_mod_ui::MAX_BUTTONS,
+        }
     );
     for (i, b) in buttons.iter().enumerate() {
         let action: Result<tako_core::claude_mod_ui::ButtonAction, _> =
@@ -9199,11 +9283,11 @@ fn print_mod_ui(out: &Value) {
                 .collect::<Vec<_>>()
                 .join(" / ")
         };
-        println!("  ボタンに使える動作:");
+        println!("  {}", UiText::ButtonActionsHeading);
         println!("    slash  {}", values("slash"));
         println!("    tako   {}", values("tako"));
-        println!("    shell  \"<コマンド>\"（新しいペインで実行）・prompt \"<文>\"（入力欄へ入れるだけ）");
-        println!("  例:");
+        println!("    {}", UiText::ShellPromptLine);
+        println!("  {}", UiText::ExamplesHeading);
         for example in choices["examples"].as_array().into_iter().flatten() {
             println!("    {}", example.as_str().unwrap_or_default());
         }

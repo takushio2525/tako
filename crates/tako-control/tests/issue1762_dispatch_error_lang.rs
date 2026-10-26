@@ -212,6 +212,25 @@ fn display_follows_the_display_language() {
              context / cost / model / effort / tako（ui.json は書いていない）",
             "{lang:?}"
         );
+        // #2365 の続き: tako mod ui の枠の文・引数の読み方の断り・排他の断り・語彙の説明・
+        // 選べる値の一覧も同じグローバルを引く（CLI の表示と MCP の応答はこの表示）
+        for (t, _, _) in ui_text_table() {
+            assert_eq!(t.to_string(), t.text_in(lang), "{t:?} / {lang:?}");
+        }
+        for e in CLI_REQUEST_ERRORS {
+            assert_eq!(e.to_string(), e.text_in(lang), "{e:?} / {lang:?}");
+        }
+        for (e, _) in lock_table() {
+            assert_eq!(e.to_string(), e.text_in(lang), "{e:?} / {lang:?}");
+        }
+        assert_eq!(
+            tako_core::claude_mod_ui::choices(),
+            tako_core::claude_mod_ui::choices_in(lang)
+        );
+        assert_eq!(
+            Preset::Minimal.describe(),
+            Preset::Minimal.describe_in(lang)
+        );
         // dispatch は tako-core の断りを `op_err`（= `Operation(e.to_string())`）で包む。
         // 包んだ表示は理由の文そのもの（前置きは足さない）で、表示言語は 1 つにそろう
         for e in workspace_samples() {
@@ -3012,4 +3031,540 @@ fn mod_ui_の実経路の断りは1つの応答に日英が混ざらない() {
         ui_where("impl UpdateError {", "Future", Lang::En)
     );
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+// ---- #2365 の続き: `tako mod ui` の成功の応答の枠・CLI の表示・引数の読み方・置き場・排他の断り ----
+//
+// 断り（UiError 一式）を移した後に残っていた枠（`applies_to` / `note` / `choices` の説明と `hotkey`）・
+// CLI の人向けの表示（`print_mod_ui`）・置き場の断り（`UiText`）・語彙の説明（各型の `describe_in`）・
+// 引数の読み方の断り（`CliRequestError`）・排他の断り（`config_io::LockError`）。どれも (バリアント, 言語)
+// の網羅 match で、落ちたら日英の対を書いたソースの行（`file:line`）を名指しする
+
+use tako_control::claude_mod_ui::CliRequestError;
+use tako_control::config_io::LockError;
+use tako_core::claude_mod_ui::{ButtonKind, Preset, SlashCommand, TakoOp, UiText};
+
+const MOD_UI_CONTROL_SRC: &str = include_str!("../src/claude_mod_ui.rs");
+const MOD_UI_CONTROL_PATH: &str = "crates/tako-control/src/claude_mod_ui.rs";
+const CONFIG_IO_SRC: &str = include_str!("../src/config_io.rs");
+const CONFIG_IO_PATH: &str = "crates/tako-control/src/config_io.rs";
+
+/// 1 つの文の見本（日英の文・#2365 より前の日本語・日英の対を書いた行）
+struct FrameCase {
+    debug: String,
+    ja: String,
+    en: String,
+    old_ja: String,
+    at: Box<dyn Fn(Lang) -> String>,
+}
+
+fn frame_case(
+    debug: String,
+    text: impl Fn(Lang) -> String,
+    (src, path, from): (&'static str, &'static str, &'static str),
+    arm: String,
+    old_ja: String,
+) -> FrameCase {
+    FrameCase {
+        debug,
+        ja: text(Lang::Ja),
+        en: text(Lang::En),
+        old_ja,
+        at: Box::new(move |lang| match arm_line(src, from, &arm, lang) {
+            Some(line) => format!("{path}:{line}"),
+            None => format!("{path}（{arm} の腕が見つからない）"),
+        }),
+    }
+}
+
+fn ui_text_index(t: &UiText) -> usize {
+    match t {
+        UiText::AppliesTo => 0,
+        UiText::FutureNote { .. } => 1,
+        UiText::HotkeyRule => 2,
+        UiText::NoDataDir => 3,
+        UiText::Heading { .. } => 4,
+        UiText::StateAbsent => 5,
+        UiText::StateRepaired { .. } => 6,
+        UiText::StateFuture => 7,
+        UiText::StateReadError => 8,
+        UiText::Changed { .. } => 9,
+        UiText::Unchanged { .. } => 10,
+        UiText::Allowed { .. } => 11,
+        UiText::ButtonsHeading { .. } => 12,
+        UiText::ButtonActionsHeading => 13,
+        UiText::ShellPromptLine => 14,
+        UiText::ExamplesHeading => 15,
+    }
+}
+const UI_TEXT_VARIANTS: usize = 16;
+
+fn cli_request_index(e: CliRequestError) -> usize {
+    match e {
+        CliRequestError::Usage => 0,
+        CliRequestError::ButtonNeedsVerb => 1,
+        CliRequestError::FlagsOnlyForAdd => 2,
+        CliRequestError::SetNeedsKeyValue => 3,
+        CliRequestError::AddNeedsValue => 4,
+        CliRequestError::AddTooManyWords => 5,
+        CliRequestError::RemoveNeedsId => 6,
+        CliRequestError::MoveNeedsIdAndTo => 7,
+        CliRequestError::PresetNeedsName => 8,
+    }
+}
+const CLI_REQUEST_VARIANTS: usize = 9;
+
+fn lock_index(e: &LockError) -> usize {
+    match e {
+        LockError::CreateDir(_) => 0,
+        LockError::Open { .. } => 1,
+        LockError::Acquire { .. } => 2,
+    }
+}
+const LOCK_VARIANTS: usize = 3;
+
+/// 枠の文の見本と #2365 より前の固定文（`Allowed` は並べる種類かどうかで 2 つ見る）
+fn ui_text_table() -> Vec<(UiText, &'static str, &'static str)> {
+    let path = || "/tmp/ui.json".to_string();
+    vec![
+        (
+            UiText::AppliesTo,
+            "AppliesTo",
+            "tako のペインの claude へは次の報告（最大 15 秒）で届く（ui.json は tako の data dir にあり、Claude Code の設定 dir へは書かない）",
+        ),
+        (
+            UiText::FutureNote { version: 99 },
+            "FutureNote",
+            "新しい tako が書いた形（schema_version 99）。読める範囲で使い、書き換えない",
+        ),
+        (
+            UiText::HotkeyRule,
+            "HotkeyRule",
+            "数字 1 字か英小文字 1 字（重複不可。省くと空いている英字を選ぶ）",
+        ),
+        (
+            UiText::NoDataDir,
+            "NoDataDir",
+            "データディレクトリが決まらない（HOME が無い）",
+        ),
+        (
+            UiText::Heading { path: path() },
+            "Heading",
+            "Claude Code の画面の UI（tako mod）: /tmp/ui.json",
+        ),
+        (
+            UiText::StateAbsent,
+            "StateAbsent",
+            "（ファイルは無い = 既定で動いている）",
+        ),
+        (
+            UiText::StateRepaired {
+                quarantine: "/tmp/ui.json.unreadable.bak".into(),
+            },
+            "StateRepaired",
+            "（読めない部分を既定で動かした。元は /tmp/ui.json.unreadable.bak に残した）",
+        ),
+        (
+            UiText::StateFuture,
+            "StateFuture",
+            "（新しい tako が書いた形。読める範囲で使い、書き換えない）",
+        ),
+        (
+            UiText::StateReadError,
+            "StateReadError",
+            "（読めないので既定で動いている）",
+        ),
+        (
+            UiText::Changed { path: path() },
+            "Changed",
+            "変えた: /tmp/ui.json",
+        ),
+        (
+            UiText::Unchanged { path: path() },
+            "Unchanged",
+            "変わらない（もうその値）: /tmp/ui.json",
+        ),
+        (
+            UiText::Allowed {
+                values: "a / b".into(),
+                list: true,
+            },
+            "Allowed",
+            "（a / b から並べる）",
+        ),
+        (
+            UiText::Allowed {
+                values: "a / b".into(),
+                list: false,
+            },
+            "Allowed",
+            "（a / b）",
+        ),
+        (
+            UiText::ButtonsHeading { count: 2, max: 8 },
+            "ButtonsHeading",
+            "ボタン（2 / 8 個）:",
+        ),
+        (
+            UiText::ButtonActionsHeading,
+            "ButtonActionsHeading",
+            "ボタンに使える動作:",
+        ),
+        (
+            UiText::ShellPromptLine,
+            "ShellPromptLine",
+            "shell  \"<コマンド>\"（新しいペインで実行）・prompt \"<文>\"（入力欄へ入れるだけ）",
+        ),
+        (UiText::ExamplesHeading, "ExamplesHeading", "例:"),
+    ]
+}
+
+/// 語彙の説明の #2365 より前の固定文（`describe()` の日本語。並びは各型の `ALL`）
+const SLASH_OLD_JA: [&str; 7] = [
+    "会話を要約して ctx を空ける",
+    "会話を消して新しく始める",
+    "ctx の使い方を見る",
+    "このセッションの費用を見る",
+    "モデルを選び直す",
+    "effort を選び直す",
+    "tako のサイドバーを開く",
+];
+const TAKO_OP_OLD_JA: [&str; 9] = [
+    "右に新しいペインを開く",
+    "下に新しいペインを開く",
+    "会話を保ったまま claude を起動し直す",
+    "引き継ぎを書かせてセッションを交代する",
+    "使用制限が解けたら自動で続ける（on）",
+    "使用制限の自動復帰を止める（off）",
+    "このペインを裏へ回す",
+    "このペインを閉じる",
+    "このペインのフォルダを開く",
+];
+const BUTTON_KIND_OLD_JA: [&str; 4] = [
+    "Claude Code の組み込みコマンドを送る（/compact 等。許可リストだけ）",
+    "tako の操作を呼ぶ（ペインの右クリックと同じ操作）",
+    "書いたコマンドを新しい tako のペインで実行する（4096 バイトまで）",
+    "入力欄へ文を入れる（送らない。1000 文字まで）",
+];
+const PRESET_OLD_JA: [&str; 3] = [
+    "既定（ボタンは compact だけ）",
+    "おすすめ（ボタン: compact / context / split right / handoff）",
+    "最小（帯はペイン名・要注意・ボタンだけ、バーは ctx だけ、チャットの装飾なし）",
+];
+const SET_KEY_OLD_JA: [&str; 12] = [
+    "帯（プロンプトの上の 1 行）を隠す",
+    "帯に並べる区切りと順番",
+    "使用制限・ctx のバーの置き場（prompt_hint = 入力欄の下の行の末尾）",
+    "バーに出す項目と順番",
+    "コマンドカードを誰が描くか",
+    "チャット風の描画を誰が描くか",
+    "発言の吹き出し",
+    "コードブロックの下のコピーボタン",
+    "ツール呼び出しの要約",
+    "強調の色（テーマのキー）",
+    "警告の色（テーマのキー）",
+    "控えめな文字の色（テーマのキー）",
+];
+
+/// 引数の読み方の断りの #2365 より前の固定文（語彙の語の並びは今の語彙から組む）
+fn cli_request_old_ja(e: CliRequestError) -> String {
+    use tako_core::claude_mod_ui::{SetKey, Vocab};
+    let usage = "使い方: tako mod ui [set <キー> <値> | button add [<kind>] <中身> | button remove <id> | button move <id> <先> | preset <名前> | reset]";
+    match e {
+        CliRequestError::Usage => usage.into(),
+        CliRequestError::ButtonNeedsVerb => {
+            format!("button の後ろに add / remove / move を付ける。{usage}")
+        }
+        CliRequestError::FlagsOnlyForAdd => {
+            "--label / --hotkey / --id は button add のときだけ使う".into()
+        }
+        CliRequestError::SetNeedsKeyValue => format!(
+            "set にはキーと値が要る（tako mod ui set <キー> <値>）。キー: {}",
+            SetKey::words().join(" / ")
+        ),
+        CliRequestError::AddNeedsValue => format!(
+            "button add には中身が要る（例: tako mod ui button add compact）。kind: {}",
+            ButtonKind::words().join(" / ")
+        ),
+        CliRequestError::AddTooManyWords => {
+            "コマンド・文は 1 つの引数で渡す（例: tako mod ui button add shell \"npm test\"）"
+                .into()
+        }
+        CliRequestError::RemoveNeedsId => {
+            "button remove には id を 1 つ付ける（id は tako mod ui の一覧）".into()
+        }
+        CliRequestError::MoveNeedsIdAndTo => {
+            "button move には id と先を付ける（先: 1〜8 / first / last / left / right）".into()
+        }
+        CliRequestError::PresetNeedsName => format!(
+            "preset には名前を 1 つ付ける: {}",
+            Preset::words().join(" / ")
+        ),
+    }
+}
+
+const CLI_REQUEST_ERRORS: [CliRequestError; CLI_REQUEST_VARIANTS] = [
+    CliRequestError::Usage,
+    CliRequestError::ButtonNeedsVerb,
+    CliRequestError::FlagsOnlyForAdd,
+    CliRequestError::SetNeedsKeyValue,
+    CliRequestError::AddNeedsValue,
+    CliRequestError::AddTooManyWords,
+    CliRequestError::RemoveNeedsId,
+    CliRequestError::MoveNeedsIdAndTo,
+    CliRequestError::PresetNeedsName,
+];
+
+fn lock_table() -> Vec<(LockError, &'static str)> {
+    vec![
+        (
+            LockError::CreateDir("Permission denied (os error 13)".into()),
+            "ディレクトリの作成に失敗: Permission denied (os error 13)",
+        ),
+        (
+            LockError::Open {
+                path: "/tmp/ui.json.lock".into(),
+                error: "Is a directory (os error 21)".into(),
+            },
+            "ロックファイルを開けない (/tmp/ui.json.lock): Is a directory (os error 21)",
+        ),
+        (
+            LockError::Acquire {
+                path: "/tmp/ui.json.lock".into(),
+                error: "Resource busy".into(),
+            },
+            "ロックの取得に失敗 (/tmp/ui.json.lock): Resource busy",
+        ),
+    ]
+}
+
+/// 語彙の説明の見本（型ごとに `ALL` を回す）
+fn describe_cases<T, const N: usize>(
+    all: &[T],
+    old: [&'static str; N],
+    from: &'static str,
+    text: fn(T, Lang) -> &'static str,
+) -> Vec<FrameCase>
+where
+    T: Copy + std::fmt::Debug + 'static,
+{
+    assert_eq!(all.len(), N, "{from} の語彙の数と旧文の表の数が違う");
+    all.iter()
+        .zip(old)
+        .map(|(v, old)| {
+            let v = *v;
+            frame_case(
+                format!("{v:?}.describe_in"),
+                move |lang| text(v, lang).to_string(),
+                (MOD_UI_SRC, MOD_UI_PATH, from),
+                variant_name(&format!("{v:?}")).to_string(),
+                old.to_string(),
+            )
+        })
+        .collect()
+}
+
+/// 全部の見本（枠の文・語彙の説明 5 型・引数の読み方の断り・排他の断り）
+fn frame_cases() -> Vec<FrameCase> {
+    use tako_core::claude_mod_ui::{SetKey, Vocab};
+    let mut out = Vec::new();
+    for (t, arm, old) in ui_text_table() {
+        let debug = format!("{t:?}");
+        out.push(frame_case(
+            debug,
+            move |lang| t.text_in(lang),
+            (MOD_UI_SRC, MOD_UI_PATH, "impl UiText {"),
+            arm.to_string(),
+            old.to_string(),
+        ));
+    }
+    out.extend(describe_cases(
+        SlashCommand::ALL,
+        SLASH_OLD_JA,
+        "impl SlashCommand {",
+        SlashCommand::describe_in,
+    ));
+    out.extend(describe_cases(
+        TakoOp::ALL,
+        TAKO_OP_OLD_JA,
+        "impl TakoOp {",
+        TakoOp::describe_in,
+    ));
+    out.extend(describe_cases(
+        ButtonKind::ALL,
+        BUTTON_KIND_OLD_JA,
+        "impl ButtonKind {",
+        ButtonKind::describe_in,
+    ));
+    out.extend(describe_cases(
+        Preset::ALL,
+        PRESET_OLD_JA,
+        "impl Preset {",
+        Preset::describe_in,
+    ));
+    out.extend(describe_cases(
+        SetKey::ALL,
+        SET_KEY_OLD_JA,
+        "impl SetKey {",
+        SetKey::describe_in,
+    ));
+    for e in CLI_REQUEST_ERRORS {
+        out.push(frame_case(
+            format!("{e:?}"),
+            move |lang| e.text_in(lang),
+            (
+                MOD_UI_CONTROL_SRC,
+                MOD_UI_CONTROL_PATH,
+                "impl CliRequestError {",
+            ),
+            variant_name(&format!("{e:?}")).to_string(),
+            cli_request_old_ja(e),
+        ));
+    }
+    for (e, old) in lock_table() {
+        let arm = variant_name(&format!("{e:?}")).to_string();
+        out.push(frame_case(
+            format!("{e:?}"),
+            move |lang| e.text_in(lang),
+            (CONFIG_IO_SRC, CONFIG_IO_PATH, "impl LockError {"),
+            arm,
+            old.to_string(),
+        ));
+    }
+    out
+}
+
+#[test]
+fn mod_ui_の枠と表示と引数と排他の見本は全バリアントを持つ() {
+    let texts: Vec<usize> = ui_text_table()
+        .iter()
+        .map(|(t, _, _)| ui_text_index(t))
+        .collect();
+    let missing: Vec<usize> = (0..UI_TEXT_VARIANTS)
+        .filter(|i| !texts.contains(i))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "UiText の見本に無い通し番号: {missing:?}"
+    );
+    covers_all(
+        &CLI_REQUEST_ERRORS,
+        |e| cli_request_index(*e),
+        CLI_REQUEST_VARIANTS,
+    );
+    let locks: Vec<LockError> = lock_table().into_iter().map(|(e, _)| e).collect();
+    covers_all(&locks, lock_index, LOCK_VARIANTS);
+}
+
+/// 落ちたものを全部並べる（1 件目で止めると、ほかの書き忘れが次の実行まで見えない）
+fn report_all(failures: Vec<String>) {
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+#[test]
+fn mod_ui_の枠と表示と引数と排他が日英を持ち英語に日本語が混ざらない() {
+    let mut failures = Vec::new();
+    for c in frame_cases() {
+        if c.ja.trim().is_empty() || c.en.trim().is_empty() {
+            failures.push(format!("{} の文が空（{}）", c.debug, (c.at)(Lang::En)));
+        }
+        if let Some(ch) = has_japanese(&c.en) {
+            failures.push(format!(
+                "{} の英語に日本語（{ch}）が混ざる: {}（{}）",
+                c.debug,
+                c.en,
+                (c.at)(Lang::En)
+            ));
+        } else if c.ja == c.en {
+            failures.push(format!(
+                "{} の英語が日本語と同じ文（{}）",
+                c.debug,
+                (c.at)(Lang::En)
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+#[test]
+fn mod_ui_の枠と表示と引数と排他の日本語は2365より前の固定文とバイト一致() {
+    let mut failures = Vec::new();
+    for c in frame_cases() {
+        if c.ja != c.old_ja {
+            failures.push(format!(
+                "{} の日本語が #2365 より前と違う（{}）\n  want: {}\n  got:  {}",
+                c.debug,
+                (c.at)(Lang::Ja),
+                c.old_ja,
+                c.ja
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 全見本の腕の行を日英とも引ける（引けないと名指しが空振りする）
+#[test]
+fn mod_ui_の枠と表示と引数と排他の腕の行を日英とも引ける() {
+    for c in frame_cases() {
+        for lang in [Lang::Ja, Lang::En] {
+            let at = (c.at)(lang);
+            assert!(
+                !at.contains("腕が見つからない"),
+                "{} / {lang:?}: {at}",
+                c.debug
+            );
+        }
+    }
+}
+
+/// 1 つの応答（`choices` 全体・排他の断りを包んだ `RunError`）の中で言語がそろう。
+/// 日本語の `choices` は説明の文が #2365 より前と同じ（説明の文以外 = 語彙の語・数は言語で変わらない）
+#[test]
+fn mod_ui_の選べる値と排他の断りは1つの応答の中で同じ言語にそろう() {
+    use tako_core::claude_mod_ui::choices_in;
+    fn strings(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+            serde_json::Value::Object(m) => m.values().for_each(|x| strings(x, out)),
+            _ => {}
+        }
+    }
+    let mut en = Vec::new();
+    strings(&choices_in(Lang::En), &mut en);
+    let mixed: Vec<&String> = en.iter().filter(|s| has_japanese(s).is_some()).collect();
+    assert!(
+        mixed.is_empty(),
+        "英語の choices に日本語が混ざる: {mixed:?}"
+    );
+    let ja = choices_in(Lang::Ja);
+    assert_eq!(
+        ja["button"]["hotkey"],
+        "数字 1 字か英小文字 1 字（重複不可。省くと空いている英字を選ぶ）"
+    );
+    assert_eq!(ja["presets"][2]["about"], PRESET_OLD_JA[2]);
+    // 説明の文を外せば日英で同じ形（語彙の語・数・並び）
+    fn without_text(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(m) => serde_json::Value::Object(
+                m.iter()
+                    .filter(|(k, _)| k.as_str() != "about" && k.as_str() != "hotkey")
+                    .map(|(k, x)| (k.clone(), without_text(x)))
+                    .collect(),
+            ),
+            serde_json::Value::Array(a) => {
+                serde_json::Value::Array(a.iter().map(without_text).collect())
+            }
+            other => other.clone(),
+        }
+    }
+    assert_eq!(without_text(&ja), without_text(&choices_in(Lang::En)));
+    // 排他の断りは `RunError::Lock` に包んでも同じ言語のまま（MCP は前置きつきで返る）
+    for (e, old) in lock_table() {
+        let run = tako_control::claude_mod_ui::RunError::Lock(e.clone());
+        assert_eq!(run.text_in(Lang::Ja), old);
+        let shown = E::Operation(run.text_in(Lang::En)).text_in(Lang::En);
+        assert!(has_japanese(&shown).is_none(), "{shown}");
+    }
 }
