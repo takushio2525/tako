@@ -36054,6 +36054,159 @@ mod tests {
         });
     }
 
+    /// #2413 × #2412 の継ぎ目: 起動待ちへ預けて tick で起こした claude worker の起動コマンドにも、
+    /// 待たずに起こしたときと同じ `--settings <data_dir>/worker-mcp/deny-*.json`（user scope の
+    /// MCP を止める `deniedMcpServers`）が付く。止める設定は spawn の時点で決めて書き、
+    /// 起動待ちは組み上がった起動コマンドをそのまま預かる（tick で組み直さない）
+    #[test]
+    fn issue2413_起動待ちから起こしたworkerにも2412のmcpの絞り込みが付く() {
+        use crate::orchestrator::{AccountEntry, AccountsConfig};
+        use tako_core::queue::MachineView;
+        use tako_core::resources::Pressure;
+        let machine = |p| {
+            Some(MachineView {
+                total_mb: 36 * 1024,
+                available_mb: Some(20 * 1024),
+                pressure: Some(p),
+                swap_used_mb: Some(0),
+            })
+        };
+        with_test_project(|| {
+            // user scope に tako 以外の MCP（github）を持つ config dir を、アカウント経由で読ませる
+            // （worker_mcp::user_scope_files は accounts.yaml の全アカウントの和を読む）
+            let cfg = std::env::temp_dir().join(format!("tako-2413-seam-{}", std::process::id()));
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(
+                cfg.join(".claude.json"),
+                r#"{"mcpServers":{"github":{"command":"github-mcp"}}}"#,
+            )
+            .unwrap();
+            let before = AccountsConfig::load().ok();
+            let mut accounts = before.clone().unwrap_or(AccountsConfig {
+                accounts: Default::default(),
+            });
+            accounts.accounts.insert(
+                "_tako_2413_seam_".into(),
+                AccountEntry {
+                    config_dir: Some(cfg.display().to_string()),
+                    ..Default::default()
+                },
+            );
+            accounts.save().expect("accounts.yaml の保存");
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // 応答の mcp 欄が github を止め、その設定ファイルが spawn の時点で書いてある。
+                // 戻り値は起動コマンドに現れるファイル名（引用の方言に左右されない basename）
+                let settings_of = |r: &Value| -> String {
+                    assert_eq!(r["mcp"]["mode"], "tako_only", "{r}");
+                    assert!(
+                        r["mcp"]["denied"]
+                            .as_array()
+                            .is_some_and(|d| d.iter().any(|n| n == "github")),
+                        "{r}"
+                    );
+                    let file = r["mcp"]["settings_file"]
+                        .as_str()
+                        .expect("止める設定ファイル");
+                    let body: Value = serde_json::from_str(
+                        &std::fs::read_to_string(file).expect("spawn の時点で書いてある"),
+                    )
+                    .unwrap();
+                    assert!(
+                        body["deniedMcpServers"]
+                            .as_array()
+                            .is_some_and(|d| d.iter().any(|e| e["serverName"] == "github")),
+                        "{body}"
+                    );
+                    std::path::Path::new(file)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string()
+                };
+                let launched = |host: &MockHost, pane: u64| -> Vec<String> {
+                    host.command_flows
+                        .iter()
+                        .filter(|(p, _)| p.as_u64() == pane)
+                        .map(|(_, c)| c.clone())
+                        .collect()
+                };
+
+                // 待たずに起こす（normal）: 起動コマンドに --settings とそのファイル
+                let (mut host, _) = master_host("orchestrator-master:test");
+                crate::launch_gate::enable_for_test(
+                    machine(Pressure::Normal),
+                    std::time::Duration::from_secs(60),
+                );
+                let direct = dispatch_orchestrator_spawn(
+                    &mut host,
+                    PaneOrigin::Mcp,
+                    test_spawn_params("テスト", None),
+                )
+                .expect("spawn は成功する");
+                assert_eq!(direct["launch_gate"]["state"], "starting", "{direct}");
+                let direct_pane = direct["pane_id"].as_u64().unwrap();
+                let direct_file = settings_of(&direct);
+                let direct_cmd = launched(&host, direct_pane);
+                assert_eq!(
+                    direct_cmd,
+                    vec![direct["command"].as_str().unwrap().to_string()]
+                );
+                assert!(
+                    direct_cmd[0].contains("--settings") && direct_cmd[0].contains(&direct_file),
+                    "待たずに起こした起動コマンドに止める設定が無い: {}",
+                    direct_cmd[0]
+                );
+
+                // 起動待ちへ預ける（warn）→ 圧が戻って tick が起こす: 同じ設定ファイルが付く
+                let (mut host, _) = master_host("orchestrator-master:test");
+                crate::launch_gate::enable_for_test(
+                    machine(Pressure::Warn),
+                    std::time::Duration::from_secs(60),
+                );
+                let waited = dispatch_orchestrator_spawn(
+                    &mut host,
+                    PaneOrigin::Mcp,
+                    test_spawn_params("テスト", None),
+                )
+                .expect("spawn は成功する（待ちでも失敗にしない）");
+                assert_eq!(waited["launch_gate"]["state"], "waiting", "{waited}");
+                let pane = waited["pane_id"].as_u64().unwrap();
+                assert!(launched(&host, pane).is_empty(), "待っている間は起こさない");
+                let waited_file = settings_of(&waited);
+                assert_eq!(waited_file, direct_file, "同じ構成は同じ設定ファイル");
+                crate::launch_gate::set_machine_for_test(machine(Pressure::Normal));
+                crate::launch_gate::tick(&mut host);
+                let cmd = launched(&host, pane);
+                assert_eq!(
+                    cmd,
+                    vec![waited["command"].as_str().unwrap().to_string()],
+                    "tick は預けた起動コマンドをそのまま起こす"
+                );
+                assert!(
+                    cmd[0].contains("--settings") && cmd[0].contains(&waited_file),
+                    "起動待ちから起こした起動コマンドに止める設定が無い: {}",
+                    cmd[0]
+                );
+            }));
+
+            // 後始末。**一時ディレクトリ配下であることを確かめてから**消す
+            match before {
+                Some(b) => b.save().expect("accounts.yaml を戻す"),
+                None => {
+                    let dir = crate::orchestrator::config_dir().expect("override 済み");
+                    assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
+                    let _ = std::fs::remove_file(dir.join("accounts.yaml"));
+                }
+            }
+            assert!(cfg.starts_with(std::env::temp_dir()), "{}", cfg.display());
+            let _ = std::fs::remove_dir_all(&cfg);
+            if let Err(e) = outcome {
+                std::panic::resume_unwind(e);
+            }
+        });
+    }
+
     /// #2413 の受け入れ条件 3（復元の時差）を、**本物の `launch_gate::tick`**（GUI の 500 ms tick と
     /// 同じ口・同じ判断）を 20 ms ごとに回して実時間で測る。6 ペイン（master 1）・立ち上がりの窓 150 ms:
     /// 預けた時点では 1 本も起こさない / critical の間は 1 本も起きない / normal へ戻ると master から
