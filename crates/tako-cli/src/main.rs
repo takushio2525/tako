@@ -3073,6 +3073,15 @@ enum LedgerCommand {
     },
 }
 
+/// `tako orchestrator projects mcp <key> <op>` の操作（#2412）
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ProjectMcpOp {
+    /// 持ち込む MCP を足す
+    Add,
+    /// 持ち込む MCP を外す
+    Remove,
+}
+
 #[derive(Subcommand)]
 enum ProjectsCommand {
     /// 登録済みプロジェクトの一覧
@@ -3101,8 +3110,7 @@ enum ProjectsCommand {
         /// プロジェクトキー
         key: String,
         /// add / remove（省略は今の構成を見る）
-        #[arg(value_parser = ["add", "remove"])]
-        op: Option<String>,
+        op: Option<ProjectMcpOp>,
         /// MCP サーバー名（* = user scope を全部持ち込む）
         servers: Vec<String>,
     },
@@ -5884,10 +5892,10 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
         }
         // #2412: MCP と同じ 1 本（dispatch_orchestrator_projects_mcp）を通す
         ProjectsCommand::Mcp { key, op, servers } => {
-            let action = match op.as_deref() {
-                Some("add") => "mcp_add",
-                Some("remove") => "mcp_remove",
-                _ => "mcp",
+            let action = match op {
+                Some(ProjectMcpOp::Add) => "mcp_add",
+                Some(ProjectMcpOp::Remove) => "mcp_remove",
+                None => "mcp",
             };
             let res = tako_control::dispatch::dispatch_orchestrator_projects_mcp(
                 action,

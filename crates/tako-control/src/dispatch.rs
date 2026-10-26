@@ -12976,9 +12976,7 @@ pub fn dispatch_orchestrator_projects_mcp(
     } else {
         // ロック付き read-modify-write（#169: 並行の変更を消さない）。無いキーは書かない
         orchestrator::ProjectsConfig::mutate(|config| {
-            let Some(entry) = config.projects.get_mut(&key) else {
-                return None;
-            };
+            let entry = config.projects.get_mut(&key)?;
             for name in &servers {
                 let present = entry.mcp_servers.iter().any(|s| s == name);
                 if adding && !present {

@@ -907,7 +907,7 @@ mod tests {
             .collect();
         let rows = usage_evidence_in(
             &[("proj".into(), cwd.into())],
-            &[cfg.clone()],
+            std::slice::from_ref(&cfg),
             &names,
             SystemTime::UNIX_EPOCH,
         );

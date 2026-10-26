@@ -32,6 +32,8 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+# shellcheck source=lib/tmux-socket.sh
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 ARMS="${ARMS:-before new}"
 REAL_MCP="${REAL_MCP:-}"
 BEFORE_APP="${BEFORE_APP:-/Applications/tako.app/Contents/MacOS}"
@@ -69,13 +71,15 @@ FAKE_PID=""
 cleanup() {
   [ -n "${ISOLATED_GUI_PID:-}" ] && stop_isolated_gui "$ISOLATED_GUI_PID"
   [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null
-  local s d
-  for s in $SOCKETS; do tmux -L "$s" kill-server >/dev/null 2>&1; done
+  local d
+  # 器はソケットファイルまで消す（#2399）
+  # shellcheck disable=SC2086 # 名前の並びを語へ分ける
+  tmux_socket_kill $SOCKETS
   if [ -n "${KEEP:-}" ]; then
     echo "置き場を残した:${TMP_ROOTS}"
   else
     for d in $TMP_ROOTS; do
-      case "$d" in /tmp/t2412-*) rm -rf "${d:?}" ;; esac
+      case "$d" in /tmp/t2412-* | /private/tmp/t2412-*) rm -rf "${d:?}" ;; esac
     done
   fi
 }

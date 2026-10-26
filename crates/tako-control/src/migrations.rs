@@ -307,8 +307,8 @@ const PROJECTS_V1_TO_V2: Note = Note::new(
 fn adopt_worker_mcp_usage(text: &str) -> Result<Option<String>, String> {
     // 下見（dry run）と本番の移行が同じ本文で手順を 2 回呼ぶ。会話の走査（数 GB）は
     // 重いので、同じ本文への答えはプロセスの中で 1 回だけ作る
-    static MEMO: std::sync::Mutex<Option<(String, Result<Option<String>, String>)>> =
-        std::sync::Mutex::new(None);
+    type Answer = Result<Option<String>, String>;
+    static MEMO: std::sync::Mutex<Option<(String, Answer)>> = std::sync::Mutex::new(None);
     let mut memo = MEMO.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((seen, answer)) = memo.as_ref() {
         if seen == text {
