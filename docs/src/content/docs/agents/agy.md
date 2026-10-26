@@ -85,13 +85,15 @@ agy だけが入っている環境でも `tako setup` は完了しますが、`t
 
 ## Claude Code との差分
 
-現時点で 65 件中 24 件が「対応」です（一部対応 6 件・未対応 24 件・対象外 11 件）。全件の内訳と理由は [Antigravity CLI を選ぶと落ちるもの](/agent-support/#antigravity-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
+現時点で 66 件中 24 件が「対応」です（一部対応 6 件・未対応 24 件・対象外 12 件）。全件の内訳と理由は [Antigravity CLI を選ぶと落ちるもの](/agent-support/#antigravity-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
 
 ```bash
 tako agent-support --agent agy
 ```
 
-master 関連（上記）と利用制限（上記）のほかで効くのは次の 2 点です。
+master 関連（上記）と利用制限（上記）のほかで効くのは次の 3 点です。
+
+- **worker は、あなたが agy に登録した MCP サーバーも全部持って起動します**。claude の worker は tako の MCP だけで起動して重い MCP を持ち込みませんが（[#2412](https://github.com/takushio2525/tako/issues/2412)）、agy の CLI には起動ごとに MCP を絞る手段がありません（1.4.7 の `--help` に `-c` / `--mcp-config` / `--settings` が無い）
 
 - **PC 再起動後の復元は会話ごと戻りますが、会話の選び直しはまだできません**。再起動をまたぐ復元は [#1238](https://github.com/takushio2525/tako/issues/1238) で agy にも配線され、ペインは `agy --conversation <id>` で会話を持ったまま戻ります（会話 ID を `lsof` で採るので **Windows は対象外**です）。過去の会話を一覧から選び直す `tako sessions resume` と、会話を保ったまま CLI だけ建て直す `tako session-restart` は claude 専用のままです（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
 - **契約プランを検出できません**。認証済みかどうかは分かりますが、プランの規模が取れないので、`tako setup` の推奨プロファイルは agy 単独では規模を決められません

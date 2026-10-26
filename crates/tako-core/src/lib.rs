@@ -49,6 +49,8 @@ pub mod links;
 pub mod load_issue;
 pub mod lsp;
 pub mod master_tab;
+/// 会話の記録で呼ばれた MCP サーバーを数える（#2412）
+pub mod mcp_calls;
 pub mod md_links;
 pub mod migration;
 pub mod model_check;

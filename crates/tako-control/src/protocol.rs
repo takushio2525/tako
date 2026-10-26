@@ -1392,12 +1392,16 @@ pub enum Request {
     VideoSeek { pane: Option<u64>, seconds: f64 },
     /// 動画の音量設定。`volume` は 0.0〜1.0。`pane` 省略時は呼び出し元ペイン
     VideoVolume { pane: Option<u64>, volume: f64 },
-    /// オーケストレーター: プロジェクト管理（list / add / remove）
+    /// オーケストレーター: プロジェクト管理（list / add / remove）と、worker へ持ち込む
+    /// MCP の設定（mcp = 見る / mcp_add / mcp_remove。Issue #2412）
     OrchestratorProjects {
         action: String,
         key: Option<String>,
         cwd: Option<String>,
         description: Option<String>,
+        /// mcp_add / mcp_remove の対象（user scope の MCP サーバー名。`*` = 全部持ち込む）
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        servers: Vec<String>,
     },
     /// オーケストレーター: 走っている master を専用プロファイルへ**その場で**寄せる（Issue #1453）。
     ///

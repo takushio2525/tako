@@ -126,6 +126,7 @@ tako/
 | オーケストレーター worker 報告取得 | `tako orchestrator report --pane <N> [--lines 2000]` |
 | オーケストレーター worker レジストリ一覧 | `tako orchestrator workers [--all]` |
 | オーケストレーター プロジェクト管理（add は専用プロファイルも作る。#1453） | `tako orchestrator projects list/add/remove` |
+| **worker へ持ち込む MCP（既定は tako の MCP だけ。足すのはプロジェクト単位。#2412）** | `tako orchestrator projects mcp <key> [add\|remove <名前>]` |
 | オーケストレーター プロファイル管理（#721/#749） | `tako orchestrator profiles list/show/set/create/copy/delete` |
 | **走っている master を専用プロファイルへその場で寄せる（#1453）** | `tako orchestrator adopt <名前>` |
 | **スマホから会話を操作する（Claude 公式 Remote Control。#1068 / #1069 / #1077 / #1078）** | `tako orchestrator profiles set <名前> --remote-control true` |

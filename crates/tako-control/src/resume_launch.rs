@@ -87,12 +87,17 @@ pub struct ResumeLaunch {
     /// 起動の直前に書き出す system prompt（パスと本文）。**下見では書かない**ので
     /// 実行する呼び出し側が [`ResumeLaunch::materialize`] を呼ぶ
     prompt_file: Option<(PathBuf, String)>,
+    /// worker の MCP の絞り込み（#2412。spawn と同じ判断）。設定ファイルも下見では書かない
+    worker_mcp: Option<crate::worker_mcp::WorkerMcp>,
 }
 
 impl ResumeLaunch {
     /// 起動に要るファイル（system prompt）を書き出す。`tako master` と同じく毎回書き直すので、
     /// ファイルが消えていても・プロファイルの規則が変わっていても今の内容で起動する
     pub fn materialize(&self) -> Result<(), String> {
+        if let Some(mcp) = &self.worker_mcp {
+            mcp.materialize()?;
+        }
         let Some((path, content)) = &self.prompt_file else {
             return Ok(());
         };
@@ -155,6 +160,7 @@ pub fn resume_launch_in(
             profile: None,
             warnings: Vec::new(),
             prompt_file: None,
+            worker_mcp: None,
         })
     };
     // claude 以外は起動の引数を resume へ持ち込めない（codex resume は --model を受けない
@@ -252,6 +258,7 @@ fn resume_profile_launch(
         profile: Some(profile_name),
         warnings,
         prompt_file: Some((prompt_path, prompt_content)),
+        worker_mcp: None,
     })
 }
 
@@ -289,6 +296,30 @@ fn resume_worker_launch(
         Some(l) => format!("worker:{project}:{l}"),
         None => format!("worker:{project}"),
     };
+    // #2412: spawn と同じ絞り込み（プロジェクトの mcp_servers・会話の cwd の .mcp.json）。
+    // 再開で user scope の MCP が戻ってくると、spawn で絞った意味が再起動のたびに消える
+    let keep = entry
+        .project
+        .as_deref()
+        .and_then(|p| {
+            orchestrator::ProjectsConfig::load()
+                .ok()
+                .map(|c| crate::worker_mcp::keep_for_project(&c, p))
+        })
+        .unwrap_or_default();
+    let cwd = entry
+        .cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let worker_mcp = crate::worker_mcp::prepare(
+        WorkerAgent::Claude,
+        &cwd,
+        plan.claude_config_dir().as_deref(),
+        &keep,
+        &launch.extra_args,
+    );
+    warnings.extend(worker_mcp.warnings.iter().cloned());
     let cmd = orchestrator::agent::build_worker_cmd_in(
         &orchestrator::agent::WorkerLaunch {
             agent: WorkerAgent::Claude,
@@ -300,6 +331,7 @@ fn resume_worker_launch(
             remote_control: remote_control.enabled(),
             extra_args: &launch.extra_args,
             tako_bin: Some(tako_bin),
+            mcp_settings: worker_mcp.settings_file.as_deref(),
             env: &plan,
         },
         dialect,
@@ -310,6 +342,7 @@ fn resume_worker_launch(
         profile: Some(profile_name),
         warnings,
         prompt_file: None,
+        worker_mcp: Some(worker_mcp),
     })
 }
 
