@@ -312,10 +312,11 @@ pub fn run(
     }
 }
 
-/// ui.json の置き場（ホストが決める。テストのホストは自分の一時ファイル）
+/// ui.json の置き場（ホストが決める。テストのホストは自分の一時ファイル）。決まらないときの断りは
+/// CLI の `default_path` と同じ文（表示言語に従う。#2365）
 fn ui_path(host: &dyn ControlHost) -> Result<std::path::PathBuf, DispatchError> {
     host.claude_mod_ui_path().ok_or_else(|| {
-        DispatchError::Operation("データディレクトリが決まらない（HOME が無い）".into())
+        DispatchError::Operation(tako_core::claude_mod_ui::UiText::NoDataDir.to_string())
     })
 }
 

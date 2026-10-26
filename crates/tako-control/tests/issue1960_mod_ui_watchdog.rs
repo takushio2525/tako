@@ -61,7 +61,7 @@ const LANG: Lang = Lang::Ja;
 /// CLI の口（`tako mod ui …` の語をそのまま渡す。`mod_ui_local` と同じ 2 段）
 fn cli(path: &Path, words: &[&str]) -> Result<Value, String> {
     let words: Vec<String> = words.iter().map(|w| (*w).to_string()).collect();
-    let request = ui::cli_request(&words, None, None, None)?;
+    let request = ui::cli_request(&words, None, None, None).map_err(|e| e.text_in(LANG))?;
     ui::run(path, &request).map_err(|e| e.text_in(LANG))
 }
 

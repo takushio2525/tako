@@ -25,8 +25,8 @@ pub enum RunError {
     Invalid(core::UiError),
     /// 新しい形なので書き換えない・書けない
     Refused(core::UpdateError),
-    /// 置き場の排他を取れない（`config_io` の文をそのまま）
-    Lock(String),
+    /// 置き場の排他を取れない（文は `config_io::LockError` の日英。#2365）
+    Lock(crate::config_io::LockError),
 }
 
 impl RunError {
@@ -40,14 +40,15 @@ impl RunError {
         match self {
             Self::Invalid(e) => e.text_in(lang),
             Self::Refused(e) => e.text_in(lang),
-            Self::Lock(m) => m.clone(),
+            Self::Lock(e) => e.text_in(lang),
         }
     }
 }
 
-/// 既定の置き場（`<data_dir>/claude-mod/ui.json`）
-pub fn default_path() -> Result<PathBuf, String> {
-    core::ui_path().ok_or_else(|| "データディレクトリが決まらない（HOME が無い）".into())
+/// 既定の置き場（`<data_dir>/claude-mod/ui.json`）。決まらないときの断りは
+/// [`core::UiText::NoDataDir`]（CLI は表示言語・setup の段は日本語で引く。#2365）
+pub fn default_path() -> Result<PathBuf, core::UiText> {
+    core::ui_path().ok_or(core::UiText::NoDataDir)
 }
 
 /// 壊れた中身の申告の重複除け（settings.json と同じ規則 = 壊れた中身ごとに 1 回。#1819）
@@ -143,7 +144,7 @@ fn apply_ops(path: &Path, ops: &[UiOp]) -> Result<Value, RunError> {
         return Ok(response(path, &loaded.config, &loaded.state, None));
     }
     // 読み → 当て → 書き を他のプロセス（GUI の取り込み・別の CLI）と直列にする
-    let _lock = crate::config_io::lock_exclusive(path).map_err(RunError::Lock)?;
+    let _lock = crate::config_io::lock_exclusive_typed(path).map_err(RunError::Lock)?;
     match core::update_at(path, ops, crate::claude_mod::epoch_ms()) {
         Ok(updated) => {
             // 文字として読めない中身は先の `load` が退避へ移したので、書く前の読みは「不在」になる。
@@ -164,13 +165,15 @@ fn apply_ops(path: &Path, ops: &[UiOp]) -> Result<Value, RunError> {
     }
 }
 
-/// 応答の形（CLI の `--json` と MCP が同じ）。`changed` は変更の操作のときだけ載る
+/// 応答の形（CLI の `--json` と MCP が同じ）。`changed` は変更の操作のときだけ載る。
+/// 枠の文（`problems` / `note` / `applies_to` / `choices` の説明）は表示言語で 1 つにそろえる（#2365）
 fn response(
     path: &Path,
     config: &core::UiConfig,
     state: &LoadState,
     changed: Option<(bool, bool)>,
 ) -> Value {
+    let lang = tako_core::i18n::lang();
     let mut out = json!({
         "path": path.display().to_string(),
         "state": state.code(),
@@ -182,29 +185,19 @@ fn response(
         quarantine,
     } = state
     {
-        // 応答の枠（applies_to / note / choices の説明）はまだ日本語なので、問題の文もそろえて
-        // 日本語で載せる（1 つの応答に日英を混ぜない。枠と一緒に移すのは #2365 の続き）
-        out["problems"] = json!(problems
-            .iter()
-            .map(|p| p.text_in(tako_core::i18n::Lang::Ja))
-            .collect::<Vec<_>>());
+        out["problems"] = json!(problems.iter().map(|p| p.text_in(lang)).collect::<Vec<_>>());
         out["quarantine"] = json!(quarantine.as_ref().map(|q| q.path.display().to_string()));
     }
     if let LoadState::Future { version } = state {
-        out["note"] = json!(format!(
-            "新しい tako が書いた形（schema_version {version}）。読める範囲で使い、書き換えない"
-        ));
+        out["note"] = json!(core::UiText::FutureNote { version: *version }.text_in(lang));
     }
     match changed {
         Some((changed, written)) => {
             out["changed"] = json!(changed);
             out["written"] = json!(written);
-            out["applies_to"] = json!(
-                "tako のペインの claude へは次の報告（最大 15 秒）で届く（ui.json は tako の data dir にあり、\
-                 Claude Code の設定 dir へは書かない）"
-            );
+            out["applies_to"] = json!(core::UiText::AppliesTo.text_in(lang));
         }
-        None => out["choices"] = core::choices(),
+        None => out["choices"] = core::choices_in(lang),
     }
     out
 }
@@ -259,6 +252,112 @@ pub fn status_json(path: &Path, loaded: &Loaded) -> Value {
     })
 }
 
+/// `tako mod ui …` の引数の読み方の断り（#2365。日英の正本は [`Self::text_in`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliRequestError {
+    /// 読めない並び（使い方を返す）
+    Usage,
+    /// `button` の後ろに add / remove / move が無い
+    ButtonNeedsVerb,
+    /// `--label` / `--hotkey` / `--id` を button add 以外に付けた
+    FlagsOnlyForAdd,
+    /// `set` にキーと値が無い
+    SetNeedsKeyValue,
+    /// `button add` に中身が無い
+    AddNeedsValue,
+    /// `button add` の中身が 2 語を超える（コマンド・文は 1 つの引数で渡す）
+    AddTooManyWords,
+    /// `button remove` に id が無い・多い
+    RemoveNeedsId,
+    /// `button move` に id と先が無い・多い
+    MoveNeedsIdAndTo,
+    /// `preset` に名前が無い・多い
+    PresetNeedsName,
+}
+
+impl CliRequestError {
+    /// 表示言語を明示しての文言（#2365）。(バリアント, 言語) の網羅 match で、日本語は
+    /// #2365 より前の固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。
+    /// コマンドの綴り・語彙の語は日英で同じ
+    pub fn text_in(self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::claude_mod_ui::{ButtonKind, Preset, SetKey, Vocab};
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Usage, Ja) => {
+                "使い方: tako mod ui [set <キー> <値> | button add [<kind>] <中身> | \
+                 button remove <id> | button move <id> <先> | preset <名前> | reset]"
+                    .into()
+            }
+            (Self::Usage, En) => "usage: tako mod ui [set <key> <value> | button add [<kind>] \
+                 <value> | button remove <id> | button move <id> <to> | preset <name> | reset]"
+                .into(),
+            (Self::ButtonNeedsVerb, Ja) => format!(
+                "button の後ろに add / remove / move を付ける。{}",
+                Self::Usage.text_in(Ja)
+            ),
+            (Self::ButtonNeedsVerb, En) => format!(
+                "put add / remove / move after button. {}",
+                Self::Usage.text_in(En)
+            ),
+            (Self::FlagsOnlyForAdd, Ja) => {
+                "--label / --hotkey / --id は button add のときだけ使う".into()
+            }
+            (Self::FlagsOnlyForAdd, En) => {
+                "--label / --hotkey / --id work only with button add".into()
+            }
+            (Self::SetNeedsKeyValue, Ja) => format!(
+                "set にはキーと値が要る（tako mod ui set <キー> <値>）。キー: {}",
+                SetKey::words().join(" / ")
+            ),
+            (Self::SetNeedsKeyValue, En) => format!(
+                "set needs a key and a value (tako mod ui set <key> <value>). Keys: {}",
+                SetKey::words().join(" / ")
+            ),
+            (Self::AddNeedsValue, Ja) => format!(
+                "button add には中身が要る（例: tako mod ui button add compact）。kind: {}",
+                ButtonKind::words().join(" / ")
+            ),
+            (Self::AddNeedsValue, En) => format!(
+                "button add needs a value (e.g. tako mod ui button add compact). kind: {}",
+                ButtonKind::words().join(" / ")
+            ),
+            (Self::AddTooManyWords, Ja) => {
+                "コマンド・文は 1 つの引数で渡す（例: tako mod ui button add shell \"npm test\"）"
+                    .into()
+            }
+            (Self::AddTooManyWords, En) => "pass a command or text as one argument \
+                 (e.g. tako mod ui button add shell \"npm test\")"
+                .into(),
+            (Self::RemoveNeedsId, Ja) => {
+                "button remove には id を 1 つ付ける（id は tako mod ui の一覧）".into()
+            }
+            (Self::RemoveNeedsId, En) => {
+                "button remove takes one id (the ids are listed by tako mod ui)".into()
+            }
+            (Self::MoveNeedsIdAndTo, Ja) => {
+                "button move には id と先を付ける（先: 1〜8 / first / last / left / right）".into()
+            }
+            (Self::MoveNeedsIdAndTo, En) => {
+                "button move takes an id and where to (where: 1-8 / first / last / left / right)"
+                    .into()
+            }
+            (Self::PresetNeedsName, Ja) => format!(
+                "preset には名前を 1 つ付ける: {}",
+                Preset::words().join(" / ")
+            ),
+            (Self::PresetNeedsName, En) => {
+                format!("preset takes one name: {}", Preset::words().join(" / "))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for CliRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
 /// `tako mod ui …` の引数（`ui` の後ろの語と `--label` / `--hotkey` / `--id`）を [`UiRequest`] へ。
 /// MCP の引数と**同じ形**に落とすので、ここから先は 1 実装（[`run`]）。
 ///
@@ -272,22 +371,17 @@ pub fn cli_request(
     label: Option<&str>,
     hotkey: Option<&str>,
     id: Option<&str>,
-) -> Result<UiRequest, String> {
-    use tako_core::claude_mod_ui::{ButtonKind, Preset, SetKey, Vocab};
-    let usage = "使い方: tako mod ui [set <キー> <値> | button add [<kind>] <中身> | \
-                 button remove <id> | button move <id> <先> | preset <名前> | reset]";
+) -> Result<UiRequest, CliRequestError> {
     let mut words: Vec<&str> = words.iter().map(String::as_str).collect();
     if matches!(words.first(), Some(&("button" | "buttons"))) {
         words.remove(0);
         if words.is_empty() {
-            return Err(format!(
-                "button の後ろに add / remove / move を付ける。{usage}"
-            ));
+            return Err(CliRequestError::ButtonNeedsVerb);
         }
     }
     let is_add = matches!(words.first(), Some(&("add" | "button_add")));
     if !is_add && (label.is_some() || hotkey.is_some() || (id.is_some() && words.is_empty())) {
-        return Err("--label / --hotkey / --id は button add のときだけ使う".into());
+        return Err(CliRequestError::FlagsOnlyForAdd);
     }
     let request = |op: &str| UiRequest {
         op: Some(op.into()),
@@ -295,19 +389,13 @@ pub fn cli_request(
     };
     match words.as_slice() {
         [] | ["show" | "list"] => Ok(UiRequest::default()),
-        ["set"] | ["set", _] => Err(format!(
-            "set にはキーと値が要る（tako mod ui set <キー> <値>）。キー: {}",
-            SetKey::words().join(" / ")
-        )),
+        ["set"] | ["set", _] => Err(CliRequestError::SetNeedsKeyValue),
         ["set", key, value @ ..] => Ok(UiRequest {
             key: Some((*key).into()),
             value: Some(Value::String(value.join(" "))),
             ..request("set")
         }),
-        ["add" | "button_add"] => Err(format!(
-            "button add には中身が要る（例: tako mod ui button add compact）。kind: {}",
-            ButtonKind::words().join(" / ")
-        )),
+        ["add" | "button_add"] => Err(CliRequestError::AddNeedsValue),
         ["add" | "button_add", value] => Ok(UiRequest {
             value: Some(Value::String((*value).into())),
             label: label.map(Into::into),
@@ -324,10 +412,7 @@ pub fn cli_request(
             id: id.map(Into::into),
             ..request("button_add")
         }),
-        ["add" | "button_add", ..] => Err(
-            "コマンド・文は 1 つの引数で渡す（例: tako mod ui button add shell \"npm test\"）"
-                .into(),
-        ),
+        ["add" | "button_add", ..] => Err(CliRequestError::AddTooManyWords),
         ["remove" | "rm" | "button_remove", target] => Ok(UiRequest {
             id: Some((*target).into()),
             ..request("button_remove")
@@ -337,22 +422,15 @@ pub fn cli_request(
             to: Some(Value::String((*to).into())),
             ..request("button_move")
         }),
-        ["remove" | "rm" | "button_remove", ..] => {
-            Err("button remove には id を 1 つ付ける（id は tako mod ui の一覧）".into())
-        }
-        ["move" | "mv" | "button_move", ..] => {
-            Err("button move には id と先を付ける（先: 1〜8 / first / last / left / right）".into())
-        }
+        ["remove" | "rm" | "button_remove", ..] => Err(CliRequestError::RemoveNeedsId),
+        ["move" | "mv" | "button_move", ..] => Err(CliRequestError::MoveNeedsIdAndTo),
         ["reset"] => Ok(request("reset")),
         ["preset", name] => Ok(UiRequest {
             value: Some(Value::String((*name).into())),
             ..request("preset")
         }),
-        ["preset", ..] => Err(format!(
-            "preset には名前を 1 つ付ける: {}",
-            Preset::words().join(" / ")
-        )),
-        _ => Err(usage.into()),
+        ["preset", ..] => Err(CliRequestError::PresetNeedsName),
+        _ => Err(CliRequestError::Usage),
     }
 }
 
@@ -397,9 +475,11 @@ pub fn summary(config: &core::UiConfig) -> String {
 pub fn run_setup_stage(answers: Option<&UiAnswers>) -> Vec<String> {
     let path = match default_path() {
         Ok(p) => p,
+        // setup の段の枠は日本語なので、断りも日本語で引く（1 行に日英を混ぜない。#2365）
         Err(e) => {
             return vec![format!(
-                "  [warn] Claude Code の画面の UI 設定を扱えない: {e}"
+                "  [warn] Claude Code の画面の UI 設定を扱えない: {}",
+                e.text_in(tako_core::i18n::Lang::Ja)
             )]
         }
     };
