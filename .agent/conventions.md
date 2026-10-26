@@ -179,6 +179,22 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   呼び手は `lock_exclusive_typed`。
   番犬は同じ `issue1762_dispatch_error_lang.rs`（末尾の節。実経路 `claude_mod_ui::run` の断りで
   英語表示に日本語が 1 字も無いことも見る）
+- #2365 の続きで、**`tako mod`（status / on / off / band on|off / install / uninstall）の応答と CLI の表示**も
+  移した。band の応答は status の応答そのものに `applies_to` を足した形なので、同じ応答に載る文を 1 本で
+  移す: 注入しない理由 `OffReason`・報告の無い理由 `NoReportCause`・展開の失敗 `InstallError`（tako-core の
+  `claude_mod`）、skills の衝突 `Conflict`・置かない理由 `Blocked`・書き込みの番人の断り `WriteRefused`
+  （`claude_mod_install`）、置き場が決まらない断り `paths::NoDataDir`（mod の展開・mod の UI 設定・usage の
+  3 か所が引く 1 本）、枠と CLI の表示 `tako_control::claude_mod::text::ModText`。理由は文字列ではなく
+  値で持つ（`OffReason::NameConflict` は衝突そのもの・`Blocked::Refused` は `WriteRefused`）= 応答を
+  組むときの言語で引く。**言語を固定する口**: 応答の組み立て（`status_ctx(host, lang)` /
+  `claude_mod_install::status_json(…, lang)`）は言語を引数で受け、`tako mod` の段は表示言語、
+  枠が日本語の `tako check-health`（dispatch の `collect_check_health_ctx` と CLI の
+  `print_check_health_mod`）は日本語を渡す。setup の行・persist.log・GUI の stderr の診断も日本語。
+  CLI の表示の行は `text::status_lines` / `skills_lines` の 1 本（CLI は出力だけ）で、枠の言語は
+  `settings::peek_lang_setting()`。番犬は同じ `issue1762_dispatch_error_lang.rs`（末尾の節）、実経路は
+  `tests/issue2365_mod_band_lang.rs`（GUI 無しのホストへ `claude_mod::run` を渡し、英語表示の応答と断りに
+  日本語が 1 字も無いことを見る。修正前の木でもそのままコンパイルできる口だけで書いてある = A/B に使える）。
+  mod の報告を受ける `report` の断り・skills の書き込みの失敗の文（`write_copy` ほか）は日本語のまま
 - #2365 の続きで、**ファイルの移動・コピーの断り**を理由ごと移した: 理由は tako-core の
   `MoveRefusal::text_in` / `CopyRefusal::text_in`（`reason()` / `Display` は `i18n::lang()`）、包みは
   dispatch の `Reason::MoveRefused` / `CopyRefused`（「移動できない」「コピーできない」）と、全部断られた

@@ -186,10 +186,49 @@ impl InstallOutcome {
     }
 }
 
+/// [`install`] が失敗した理由（#2365。日英の正本は [`Self::text_in`]。`tako mod` の応答の `install` は
+/// 表示言語、setup の行と GUI の stderr は日本語で引く）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallError {
+    /// データディレクトリが決まらない（HOME が無い）
+    NoDataDir,
+    /// 展開先の親（`<data_dir>/claude-mod`）を作れない
+    CreateRoot { path: String, error: String },
+    /// 一時 dir へ書き出せない
+    Write(String),
+    /// 一時 dir を本来の名前へ差し替えられない
+    Replace(String),
+}
+
+impl InstallError {
+    /// 表示言語を明示しての文言（#2365）。(バリアント, 言語) の網羅 match で、日本語は #2365 より前の
+    /// 固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。中身の OS の文は
+    /// どちらの言語でもそのまま
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NoDataDir, Ja) => crate::paths::NoDataDir.text_in(Ja).into(),
+            (Self::NoDataDir, En) => crate::paths::NoDataDir.text_in(En).into(),
+            (Self::CreateRoot { path, error }, Ja) => format!("{path} を作れない: {error}"),
+            (Self::CreateRoot { path, error }, En) => format!("cannot create {path}: {error}"),
+            (Self::Write(e), Ja) => format!("mod を書き出せない: {e}"),
+            (Self::Write(e), En) => format!("cannot write out the mod: {e}"),
+            (Self::Replace(e), Ja) => format!("mod を差し替えられない: {e}"),
+            (Self::Replace(e), En) => format!("cannot replace the mod: {e}"),
+        }
+    }
+}
+
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
 /// 同梱の mod を `<data_dir>/claude-mod/tako/` へ展開する（冪等）。
 /// 発火は GUI 起動時と `tako setup`。戻り値は展開先
-pub fn install() -> Result<(PathBuf, InstallOutcome), String> {
-    let root = mod_root().ok_or("データディレクトリが決まらない（HOME が無い）")?;
+pub fn install() -> Result<(PathBuf, InstallOutcome), InstallError> {
+    let root = mod_root().ok_or(InstallError::NoDataDir)?;
     let outcome = install_in(&root, env!("CARGO_PKG_VERSION"))?;
     Ok((root.join(MOD_NAME), outcome))
 }
@@ -199,13 +238,16 @@ pub fn install() -> Result<(PathBuf, InstallOutcome), String> {
 /// 差し替えは「一時 dir に全部書く → Claude Code の型定義だけ引き継ぐ → 旧フォルダを退避 →
 /// 一時 dir を本来の名前へ rename → 退避を消す」。ファイルを 1 本ずつ上書きすると、
 /// ホットリロードが新しい `register.ts` と古い `hooks.json` の組を読みうる
-pub fn install_in(root: &Path, version: &str) -> Result<InstallOutcome, String> {
+pub fn install_in(root: &Path, version: &str) -> Result<InstallOutcome, InstallError> {
     let dest = root.join(MOD_NAME);
     let files = rendered_files(version);
     if matches_installed(&dest, &files) {
         return Ok(InstallOutcome::Unchanged);
     }
-    std::fs::create_dir_all(root).map_err(|e| format!("{} を作れない: {e}", root.display()))?;
+    std::fs::create_dir_all(root).map_err(|e| InstallError::CreateRoot {
+        path: root.display().to_string(),
+        error: e.to_string(),
+    })?;
     sweep_leftovers(root);
     let tag = unique_tag();
     let tmp = root.join(format!(".{MOD_NAME}.tmp-{tag}"));
@@ -221,7 +263,7 @@ pub fn install_in(root: &Path, version: &str) -> Result<InstallOutcome, String> 
     };
     if let Err(e) = write() {
         let _ = std::fs::remove_dir_all(&tmp);
-        return Err(format!("mod を書き出せない: {e}"));
+        return Err(InstallError::Write(e.to_string()));
     }
     // Claude Code が書いた型定義は引き継ぐ（無ければ何もしない）
     let types = dest.join(ENGINE_TYPES_DIR);
@@ -242,7 +284,7 @@ pub fn install_in(root: &Path, version: &str) -> Result<InstallOutcome, String> 
         if moved_old {
             let _ = std::fs::rename(&old, &dest);
         }
-        return Err(format!("mod を差し替えられない: {e}"));
+        return Err(InstallError::Replace(e.to_string()));
     }
     if moved_old {
         let _ = std::fs::remove_dir_all(&old);
@@ -336,10 +378,10 @@ pub enum OffReason {
     ClaudeTooOld(String),
     /// ペインの claude の設定 dir に別の出どころの同名 `tako` がある（S7-1 #1959）。
     /// inline（env）は installed / skills-dir より先に読まれるので、注入すると利用者の `tako` を潰す。
-    /// 中身は衝突の説明（[`crate::claude_mod_install::Conflict::describe`]）。`Box<str>` にするのは
-    /// `String` の変種が 2 つになると enum にタグが要って 8 バイト増え、`ModSnapshot` 越しに
+    /// 中身は衝突そのもの（説明は応答を組むときに表示言語で引く。#2365）。`Box` にするのは
+    /// 大きな変種があると enum にタグが要って大きくなり、`ModSnapshot` 越しに
     /// `OffloadJob` の変種の大きさの差が clippy の閾値を越えるため（単体テストで大きさを固定）
-    NameConflict(Box<str>),
+    NameConflict(Box<crate::claude_mod_install::Conflict>),
     /// 利用者が Claude Code 側で tako mod を止めた（`/plugin` の disable。#1959）
     UserDisabled,
 }
@@ -358,25 +400,53 @@ impl OffReason {
         }
     }
 
+    /// 表示言語での説明（`tako mod` の応答。`tako check-health` は [`Self::describe_in`] の日本語）
     pub fn describe(&self) -> String {
-        match self {
-            OffReason::AbOff => format!("{AB_OFF_ENV} が立っている（A/B で注入を止めている）"),
-            OffReason::Disabled => "tako mod off で止めている（`tako mod on` で戻る）".into(),
-            OffReason::NotInstalled => "mod を data dir へ展開できていない".into(),
-            OffReason::NoCli => "実行中の tako の隣に tako CLI が無い".into(),
-            OffReason::ClaudeUnknown => {
+        self.describe_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての説明（#2365）。(バリアント, 言語) の網羅 match で、日本語は #2365 より前の
+    /// 固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）
+    pub fn describe_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::AbOff, Ja) => format!("{AB_OFF_ENV} が立っている（A/B で注入を止めている）"),
+            (Self::AbOff, En) => format!("{AB_OFF_ENV} is set (injection is stopped for A/B)"),
+            (Self::Disabled, Ja) => "tako mod off で止めている（`tako mod on` で戻る）".into(),
+            (Self::Disabled, En) => {
+                "stopped with tako mod off (`tako mod on` turns it back on)".into()
+            }
+            (Self::NotInstalled, Ja) => "mod を data dir へ展開できていない".into(),
+            (Self::NotInstalled, En) => "the mod could not be unpacked into the data dir".into(),
+            (Self::NoCli, Ja) => "実行中の tako の隣に tako CLI が無い".into(),
+            (Self::NoCli, En) => "no tako CLI next to the running tako".into(),
+            (Self::ClaudeUnknown, Ja) => {
                 "claude の版がまだ分からない（claude が入っていないか判定前）".into()
             }
-            OffReason::ClaudeTooOld(v) => {
+            (Self::ClaudeUnknown, En) => "the claude version is not known yet (claude is not \
+                 installed or has not been checked yet)"
+                .into(),
+            (Self::ClaudeTooOld(v), Ja) => {
                 format!("claude {v} は下限 {MIN_CLAUDE_VERSION} 未満（`claude update` で上がる）")
             }
-            OffReason::NameConflict(why) => {
-                format!("{why}（利用者の tako を優先し、このペインには注入しない）")
-            }
-            OffReason::UserDisabled => {
+            (Self::ClaudeTooOld(v), En) => format!(
+                "claude {v} is below the minimum {MIN_CLAUDE_VERSION} (`claude update` upgrades it)"
+            ),
+            (Self::NameConflict(conflict), Ja) => format!(
+                "{}（利用者の tako を優先し、このペインには注入しない）",
+                conflict.describe_in(Ja)
+            ),
+            (Self::NameConflict(conflict), En) => format!(
+                "{} (the user's tako takes precedence; not injected into this pane)",
+                conflict.describe_in(En)
+            ),
+            (Self::UserDisabled, Ja) => {
                 "Claude Code の /plugin で tako@skills-dir が止められている（利用者の選択を優先）"
                     .into()
             }
+            (Self::UserDisabled, En) => "tako@skills-dir is disabled in Claude Code's /plugin \
+                 (the user's choice takes precedence)"
+                .into(),
         }
     }
 }
@@ -919,7 +989,8 @@ impl ModUnavailable {
                 "最後の報告から {age_secs} 秒（{} 秒で失効）",
                 FRESH_FOR.as_secs()
             ),
-            ModUnavailable::NotInjected(reason) => reason.describe(),
+            // この説明は日本語の文だけを持つので、理由も日本語で引く（1 つの文に日英を混ぜない。#2365）
+            ModUnavailable::NotInjected(reason) => reason.describe_in(crate::i18n::Lang::Ja),
         }
     }
 }
@@ -967,26 +1038,56 @@ impl NoReportCause {
         }
     }
 
+    /// 表示言語での説明（`tako mod` の応答。`tako check-health` は [`Self::describe_in`] の日本語）
     pub fn describe(self) -> &'static str {
-        match self {
-            NoReportCause::SafeMode => {
+        self.describe_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての説明（#2365）。(バリアント, 言語) の網羅 match で、日本語は #2365 より前の
+    /// 固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）
+    pub fn describe_in(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::SafeMode, Ja) => {
                 "claude が --safe-mode で起動されていて mod を読まない（--safe-mode を外して起動し直せば載る）"
             }
-            NoReportCause::Bare => {
+            (Self::SafeMode, En) => {
+                "claude was started with --safe-mode and does not load mods (restart it without \
+                 --safe-mode to load it)"
+            }
+            (Self::Bare, Ja) => {
                 "claude が --bare で起動されていて mod を読まない（--bare を外して起動し直せば載る）"
             }
-            NoReportCause::BeforeInjection => {
+            (Self::Bare, En) => {
+                "claude was started with --bare and does not load mods (restart it without --bare \
+                 to load it)"
+            }
+            (Self::BeforeInjection, Ja) => {
                 "注入より前から動いていた claude（起動時の環境に tako の注入の印が無い）。\
                  新しいペインで claude を起動すれば載る"
             }
-            NoReportCause::NotLoaded => {
+            (Self::BeforeInjection, En) => {
+                "this claude was running before the injection (its startup environment has no \
+                 tako injection mark); starting claude in a new pane loads it"
+            }
+            (Self::NotLoaded, Ja) => {
                 "claude には注入が届いているが mod から報告が無い。disableAllHooks / 組織の \
                  allowManagedModsOnly で mod が読まれていないか、mod の読み込みに失敗した"
             }
-            NoReportCause::Undetermined => {
+            (Self::NotLoaded, En) => {
+                "the injection reached claude but the mod sends no reports; disableAllHooks / \
+                 the organization's allowManagedModsOnly may keep the mod from loading, or \
+                 loading the mod failed"
+            }
+            (Self::Undetermined, Ja) => {
                 "claude は動いているが mod から報告が無い。--safe-mode / --bare / \
                  disableAllHooks / 組織の allowManagedModsOnly で mod が読まれていないか、\
                  注入より前から動いていた claude"
+            }
+            (Self::Undetermined, En) => {
+                "claude is running but the mod sends no reports; --safe-mode / --bare / \
+                 disableAllHooks / the organization's allowManagedModsOnly may keep the mod \
+                 from loading, or this claude was running before the injection"
             }
         }
     }
@@ -1338,7 +1439,7 @@ pub struct ModHub {
     /// 展開先（展開に失敗したら `None`）
     pub plugin_dir: Option<PathBuf>,
     /// 展開の結果（`written` / `unchanged`）か失敗の理由
-    pub install_result: Option<Result<InstallOutcome, String>>,
+    pub install_result: Option<Result<InstallOutcome, InstallError>>,
     /// mod に渡す CLI（実行中のバイナリの隣）
     pub cli: Option<PathBuf>,
     /// 控えた claude の版（`None` = 未判定）
@@ -4666,10 +4767,12 @@ mod tests {
             .map(|c| c.code())
             .collect();
         assert_eq!(codes.len(), 5);
-        // 判別できなかったときは S1 の候補の文言のまま（`--safe-mode` を含む）
-        assert!(Undetermined.describe().contains("--safe-mode"));
+        // 判別できなかったときは S1 の候補の文言のまま（`--safe-mode` を含む。日本語の字面で見る =
+        // 表示言語のグローバルに依らない。#2365）
+        let ja = crate::i18n::Lang::Ja;
+        assert!(Undetermined.describe_in(ja).contains("--safe-mode"));
         assert!(BeforeInjection
-            .describe()
+            .describe_in(ja)
             .contains("新しいペインで claude を起動すれば載る"));
     }
 

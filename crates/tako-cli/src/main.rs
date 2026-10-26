@@ -32,6 +32,7 @@ use tako_cli::ipc::{
     SendFailure, TransportError,
 };
 use tako_cli::mcp_bridge;
+use tako_control::claude_mod::text::ModText;
 use tako_control::orchestrator::wait;
 use tako_control::protocol::{Axis, Direction, Request};
 
@@ -6606,6 +6607,9 @@ fn mod_install_local(args: &ModArgs) -> Result<(), String> {
     let ctx = tako_control::claude_mod_install::Context::from_env(
         tako_control::stale_binary::bounded_claude_version(),
     );
+    // 応答の文（applies_to・理由）は表示言語で組まれるので、呼ぶ前に決める（#2365）
+    init_local_lang();
+    let lang = tako_core::i18n::lang();
     let out = tako_control::claude_mod_install::run_action(action, args.dry_run, &[], &ctx)?;
     // 置けない（外せない）設定 dir が 1 つでもあれば終了コード 1（JSON でも同じ）
     let failed = out["skills"]["targets"]
@@ -6614,7 +6618,7 @@ fn mod_install_local(args: &ModArgs) -> Result<(), String> {
         .flatten()
         .any(|t| t["outcome"] == "error");
     let result = if failed {
-        Err("置けない（外せない）設定 dir がある（targets の error）".to_string())
+        Err(ModText::InstallTargetsFailed.text_in(lang))
     } else {
         Ok(())
     };
@@ -6622,56 +6626,28 @@ fn mod_install_local(args: &ModArgs) -> Result<(), String> {
         println!("{}", pretty_json(&out));
         return result;
     }
-    let verb = match (action, args.dry_run) {
-        ("install", true) => "tako mod install（dry-run。何も書いていない）",
-        ("install", false) => "tako mod install",
-        (_, true) => "tako mod uninstall（dry-run。何も書いていない）",
-        _ => "tako mod uninstall",
+    let heading = ModText::InstallHeading {
+        install: action == "install",
+        dry_run: args.dry_run,
+        claude: out["claude_version"].as_str().map(str::to_string),
+        min: out["min_claude_version"]
+            .as_str()
+            .unwrap_or("-")
+            .to_string(),
     };
-    println!(
-        "{verb}: claude {}（下限 {}）",
-        out["claude_version"].as_str().unwrap_or("未判定"),
-        out["min_claude_version"].as_str().unwrap_or("-"),
-    );
-    print_mod_skills(&out["skills"]);
+    println!("{}", heading.text_in(lang));
+    print_mod_skills(&out["skills"], lang);
     if let Some(note) = out["applies_to"].as_str() {
         println!("{note}");
     }
     result
 }
 
-/// 設定 dir ごとの skills/tako の行（`tako mod` と `tako mod install|uninstall` で共通）
-fn print_mod_skills(skills: &Value) {
-    let Some(targets) = skills["targets"].as_array() else {
-        return;
-    };
-    if skills["legacy"].as_bool() == Some(true) {
-        println!("skills: 入れない（TAKO_1959_LEGACY / TAKO_1877_NO_MOD）");
-    }
-    for t in targets {
-        let state = t["state"].as_str().unwrap_or("-");
-        let doing = match (t["action"].as_str(), t["outcome"].as_str()) {
-            (_, Some("written")) => "  → 置いた".to_string(),
-            (_, Some("removed")) => "  → 外した".to_string(),
-            (Some("write"), Some("planned")) => "  → 置く予定".to_string(),
-            (Some("remove"), Some("planned")) => "  → 外す予定".to_string(),
-            (_, Some("error")) => format!("  → error: {}", t["error"].as_str().unwrap_or("?")),
-            _ => String::new(),
-        };
-        let sources = t["sources"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(",");
-        println!(
-            "  {}  {state}  [{sources}]{doing}",
-            t["config_dir"].as_str().unwrap_or("?")
-        );
-        if let Some(reason) = t["reason"]["message"].as_str() {
-            println!("      {reason}");
-        }
+/// 設定 dir ごとの skills/tako の行（`tako mod` と `tako mod install|uninstall` と `tako check-health` で
+/// 共通。組み立ては tako-control の 1 本）。`lang` は行の枠の言語（check-health は日本語。#2365）
+fn print_mod_skills(skills: &Value, lang: tako_core::i18n::Lang) {
+    for line in tako_control::claude_mod::text::skills_lines(skills, lang) {
+        println!("{line}");
     }
 }
 
@@ -6786,6 +6762,8 @@ fn usage_local(args: &UsageArgs) -> Result<(), String> {
                 Err(e) => return Err(e.message()),
             }
         } else {
+            // 置き場が決まらない断り（`paths::NoDataDir`）は表示言語で組まれるので、呼ぶ前に決める（#2365）
+            init_local_lang();
             tako_control::usage::usage_payload(&query, tako_control::usage::Refresh::Full)?
         };
     let update = &payload["index"]["update"];
@@ -8342,15 +8320,17 @@ fn print_check_health(result: &Value) {
 }
 
 /// `tako check-health` の tako mod の項目（#1891）。行はすべて `tako mod` が出す行と同じ字面
-/// （1 行目・設定 dir ごとの skills/tako・報告が届いていないペインの理由）
+/// （1 行目・設定 dir ごとの skills/tako・報告が届いていないペインの理由）。check-health の枠は
+/// 日本語なので、`tako mod` の日本語表示と同じ字面で引く（節の理由の文も GUI が日本語で組む。#2365）
 fn print_check_health_mod(section: &Value) {
+    let lang = tako_core::i18n::Lang::Ja;
     println!(
         "{}",
-        tako_control::claude_mod::text::injection_line(section)
+        tako_control::claude_mod::text::injection_line(section, lang)
     );
     if section["skills"]["targets"].is_array() {
-        println!("Claude Code の設定 dir（skills/tako）:");
-        print_mod_skills(&section["skills"]);
+        println!("{}", ModText::SkillsHeading.text_in(lang));
+        print_mod_skills(&section["skills"], lang);
     }
     for row in section["panes"].as_array().into_iter().flatten() {
         if let Some(line) = tako_control::claude_mod::text::reason_line(row) {
@@ -9302,116 +9282,11 @@ fn print_mod(args: &ModArgs, result: &Value) {
         println!("{result}");
         return;
     }
-    // #1891: 1 行目と理由の行は `tako check-health` と同じ関数（字面が一致する）
-    println!("{}", tako_control::claude_mod::text::injection_line(result));
-    println!(
-        "claude {}（下限 {}）/ mod {} / 展開 {}",
-        result["claude_version"].as_str().unwrap_or("未判定"),
-        result["min_claude_version"].as_str().unwrap_or("-"),
-        result["mod_version"].as_str().unwrap_or("-"),
-        result["install"].as_str().unwrap_or("-"),
-    );
-    if let Some(note) = result["applies_to"].as_str() {
-        println!("{note}");
-    }
-    // #1959: 設定 dir ごとの skills/tako（Claude Code の /plugin に tako@skills-dir として出るもの）
-    if result["skills"]["targets"].is_array() {
-        println!("Claude Code の設定 dir（skills/tako）:");
-        print_mod_skills(&result["skills"]);
-    }
-    // #1881: Claude Code の画面の帯（プロンプトの上の 1 行）
-    let band = &result["band"];
-    if band["legacy"].as_bool() == Some(true) {
-        println!("帯: 描かない（TAKO_1877_S3_LEGACY）");
-    } else if band.is_object() {
-        // #1960: 正本は ui.json の band.hidden（中継は toggled_at があるときだけ）
-        let request = match (band["hidden"].as_bool(), band["request"].is_object()) {
-            (Some(true), _) => "・隠す（tako mod band on で戻す）",
-            (_, true) => "・出す",
-            _ => "",
-        };
-        println!(
-            "帯: ctx {}% / 使用制限 {}% 以上で ctx・使用制限も出す{request}",
-            band["ctx_percent"].as_u64().unwrap_or(0),
-            band["limit_percent"].as_f64().unwrap_or(0.0),
-        );
-    }
-    // #1963: コマンドカードを誰が描くか（カードごとの持ち主は `tako show-command --list` の owner）
-    let cards = &result["cards"];
-    if cards["legacy"].as_bool() == Some(true) {
-        println!("カード: ペイン下のカード帯（TAKO_1963_LEGACY）");
-    } else if let Some(place) = cards["place"].as_str() {
-        println!(
-            "カード: 置き場 {place}（mod が Claude Code の画面に描いたカードはペイン下のカード帯に出さない）"
-        );
-        // #2159: 会話の行のカードをクリックで押せるか（押せなくても帯のキーで押せる）
-        match (
-            cards["click"].as_bool(),
-            cards["click_legacy"].as_bool() == Some(true),
-        ) {
-            (Some(true), _) => println!("  会話の行のカードの「実行」をクリック 1 回で押せる（全画面の claude）"),
-            (Some(false), true) => println!("  会話の行のカードにボタンを置かない（TAKO_2159_LEGACY）。帯の ctrl+x → Tab → キーで押す"),
-            (Some(false), false) => println!("  クリックを渡していないので、帯の ctrl+x → Tab → キーで押す（クリックで押すなら tako mouse on）"),
-            _ => {}
-        }
-    }
-    let percent = |v: &Value| v.as_f64().map_or("-".to_string(), |p| format!("{p:.0}%"));
-    for row in result["panes"].as_array().into_iter().flatten() {
-        let pane = row["pane"].as_u64().unwrap_or(0);
-        let state = row["state"].as_str().unwrap_or("-");
-        let report = &row["report"];
-        if report.is_object() {
-            let limit = |kind: &str| {
-                report["rate_limits"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|l| l["kind"] == kind)
-                    .map_or("-".to_string(), |l| percent(&l["percent_used"]))
-            };
-            let band = &report["band"];
-            let band = match (band["hidden"].as_bool(), band["shown"].as_bool()) {
-                (Some(true), _) => "  帯 非表示".to_string(),
-                (_, Some(true)) => format!(
-                    "  帯 {} 桁: {}",
-                    band["columns"].as_u64().unwrap_or(0),
-                    band["segments"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                ),
-                (_, Some(false)) => "  帯 描いていない".to_string(),
-                _ => String::new(),
-            };
-            // #1963: 帯に押せる形で描いたコマンドカード（無い = カードを描かせていない / 描かない mod）
-            let drawn_cards = report["renders"]["cards"]
-                .as_array()
-                .map(|ids| {
-                    let ids: Vec<String> = ids.iter().map(Value::to_string).collect();
-                    format!("  カード [{}]", ids.join(", "))
-                })
-                .unwrap_or_default();
-            println!(
-                "  pane {pane}  {state}  ctx {}  5h {}  7d {}  {}  {}  ({} 秒前){band}{drawn_cards}",
-                percent(&report["context"]["percent"]),
-                limit("five_hour"),
-                limit("seven_day"),
-                report["turn"].as_str().unwrap_or("-"),
-                report["model"].as_str().unwrap_or("-"),
-                report["age_ms"].as_u64().unwrap_or(0) / 1000,
-            );
-            // #1891: 報告はあるが失効した・休眠した行は、理由も `tako check-health` と同じ字面で出す
-            if let Some(line) = tako_control::claude_mod::text::reason_line(row) {
-                println!("{line}");
-            }
-        } else if let Some(line) = tako_control::claude_mod::text::reason_line(row) {
-            println!("{line}");
-        } else {
-            println!("  pane {pane}  {state}");
-        }
+    // 行の組み立ては tako-control の 1 本（`tako check-health` と同じ関数の行を含む。#1891）。
+    // 枠の言語は表示言語（応答の理由の文も GUI が表示言語で組む。#2365）
+    let lang = tako_control::settings::peek_lang_setting().resolve();
+    for line in tako_control::claude_mod::text::status_lines(result, lang) {
+        println!("{line}");
     }
 }
 

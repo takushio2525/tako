@@ -107,6 +107,29 @@ pub fn data_dir() -> Option<PathBuf> {
     default_data_dir()
 }
 
+/// [`data_dir`] が決まらない（HOME が無い）ときの断り（#2365）。置き場を data dir の下に持つ
+/// 機能（mod の展開・mod の UI 設定・usage）が同じ文を引く。日本語は #2365 より前の固定文とバイト一致
+/// （`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoDataDir;
+
+impl NoDataDir {
+    /// 表示言語を明示しての文言（#2365）
+    pub fn text_in(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self, Ja) => "データディレクトリが決まらない（HOME が無い）",
+            (Self, En) => "cannot determine the data directory (HOME is not set)",
+        }
+    }
+}
+
+impl std::fmt::Display for NoDataDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text_in(crate::i18n::lang()))
+    }
+}
+
 /// A/B 用の逃げ道（`TAKO_944_LEGACY=1`）。#944 の隔離を切って**旧挙動を再現**する。
 ///
 /// 番犬（`tako_control::test_write_isolation`）が「これを立てると本番相当の場所へ

@@ -4318,7 +4318,7 @@ pub fn prepare_offload(
                 && !tako_core::claude_mod::no_report_legacy() =>
         {
             Some(
-                crate::claude_mod::status_ctx(host)
+                crate::claude_mod::status_ctx(host, tako_core::i18n::lang())
                     .map(|ctx| OffloadJob::ModStatus { ctx: Box::new(ctx) }),
             )
         }
@@ -19730,7 +19730,8 @@ fn collect_check_health_ctx(host: &dyn ControlHost) -> CheckHealthCtx {
             .map(|pane| pane.id().as_u64())
             .collect(),
         claude_mod: (!tako_core::claude_mod::no_report_legacy()).then(|| {
-            crate::claude_mod::status_ctx(host)
+            // 枠が日本語の check-health は理由の文も日本語で組む（1 つの出力に日英を混ぜない。#2365）
+            crate::claude_mod::status_ctx(host, tako_core::i18n::Lang::Ja)
                 .map(Box::new)
                 .map_err(|e| e.to_string())
         }),

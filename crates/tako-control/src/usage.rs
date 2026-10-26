@@ -524,7 +524,8 @@ fn refresh_index(refresh: Refresh) -> Option<Result<UpdateOutcome, String>> {
 
 /// 使用量の内訳と観測の要約（`tako usage` / MCP `tako_sessions` の `action: "usage"` / dispatch の 1 実装）
 pub fn usage_payload(query: &UsageQuery, refresh: Refresh) -> Result<Value, String> {
-    let dir = dir().ok_or_else(|| "データディレクトリが決まらない（HOME が無い）".to_string())?;
+    // 断りは置き場を data dir の下に持つ機能で共通の 1 本（表示言語。#2365）
+    let dir = dir().ok_or_else(|| tako_core::paths::NoDataDir.to_string())?;
     // 重い読み進めの前に引数を確かめる
     query.parsed()?;
     let outcome = refresh_index(refresh);
