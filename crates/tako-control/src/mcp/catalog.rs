@@ -1699,6 +1699,8 @@ pub fn tools() -> Vec<Value> {
             "name": "tako_orchestrator_projects",
             "description": "オーケストレーターのプロジェクトを管理する。\
                 action=list で登録済みプロジェクト一覧、add で新規追加、remove で削除。\
+                claude worker は tako の MCP だけで起動する。mcp_add / mcp_remove で\
+                持ち込む user scope の MCP（servers。* = 全部）を足し引きし、mcp で構成を見る。\
                 プロジェクトは projects.yaml に保存され、tako_orchestrator_spawn の\
                 対象として使える。",
             "inputSchema": {
@@ -1706,12 +1708,13 @@ pub fn tools() -> Vec<Value> {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["list", "add", "remove"],
+                        "enum": ["list", "add", "remove", "mcp", "mcp_add", "mcp_remove"],
                         "description": "操作（省略は list）",
                     },
-                    "key": { "type": "string", "description": "プロジェクトキー（add / remove 時に必須）" },
+                    "key": { "type": "string", "description": "プロジェクトキー（list 以外で必須）" },
                     "cwd": { "type": "string", "description": "作業ディレクトリ（add 時に必須。~ は $HOME に展開される）" },
                     "description": { "type": "string", "description": "プロジェクトの説明（add 時に任意）" },
+                    "servers": { "type": "array", "items": { "type": "string" }, "description": "MCP サーバー名（mcp_add / mcp_remove）" },
                 },
                 "additionalProperties": false,
             },

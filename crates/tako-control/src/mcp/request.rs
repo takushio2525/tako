@@ -743,6 +743,8 @@ pub(super) fn build_request(
             key: str_arg(args, "key")?,
             cwd: str_arg(args, "cwd")?,
             description: str_arg(args, "description")?,
+            // #2412: 1 つの名前は文字列でも受ける（配列の外し忘れで断らない）
+            servers: command_array_arg(args, "servers")?,
         },
         // #1453: 走っている master を専用プロファイルへその場で寄せる
         "tako_orchestrator_adopt" => Request::OrchestratorAdopt {

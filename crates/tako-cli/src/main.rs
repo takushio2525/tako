@@ -3095,6 +3095,17 @@ enum ProjectsCommand {
         #[arg(long)]
         key: String,
     },
+    /// claude worker へ持ち込む user scope の MCP を見る・足す・外す
+    /// （既定は tako の MCP だけ。.mcp.json のものは書かなくても立つ。#2412）
+    Mcp {
+        /// プロジェクトキー
+        key: String,
+        /// add / remove（省略は今の構成を見る）
+        #[arg(value_parser = ["add", "remove"])]
+        op: Option<String>,
+        /// MCP サーバー名（* = user scope を全部持ち込む）
+        servers: Vec<String>,
+    },
 }
 
 /// プロファイル種別の指定（#721）。既定は master なので、master を使うときは
@@ -5810,6 +5821,14 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
                         p["cwd"].as_str().unwrap_or(""),
                         p["description"].as_str().unwrap_or("")
                     );
+                    // #2412: worker へ持ち込む user scope の MCP（既定の tako だけなら出さない）
+                    let mcp: Vec<&str> = p["mcp_servers"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+                        .unwrap_or_default();
+                    if !mcp.is_empty() {
+                        println!("{:<16} worker の MCP: tako + {}", "", mcp.join(", "));
+                    }
                 }
             }
             Ok(())
@@ -5862,6 +5881,61 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
             .map_err(local_dispatch_err)?;
             eprintln!("削除しました: {key}");
             Ok(())
+        }
+        // #2412: MCP と同じ 1 本（dispatch_orchestrator_projects_mcp）を通す
+        ProjectsCommand::Mcp { key, op, servers } => {
+            let action = match op.as_deref() {
+                Some("add") => "mcp_add",
+                Some("remove") => "mcp_remove",
+                _ => "mcp",
+            };
+            let res = tako_control::dispatch::dispatch_orchestrator_projects_mcp(
+                action,
+                Some(key.clone()),
+                servers.clone(),
+            )
+            .map_err(local_dispatch_err)?;
+            print_project_mcp(key, &res);
+            Ok(())
+        }
+    }
+}
+
+/// `tako orchestrator projects mcp` の表示（設定・今 spawn したときの構成・警告）
+fn print_project_mcp(key: &str, res: &serde_json::Value) {
+    let list = |v: &serde_json::Value| -> String {
+        let names: Vec<&str> = v
+            .as_array()
+            .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        if names.is_empty() {
+            "（なし）".to_string()
+        } else {
+            names.join(", ")
+        }
+    };
+    if let Some(added) = res.get("added") {
+        eprintln!("足しました: {}", list(added));
+    }
+    if let Some(removed) = res.get("removed") {
+        eprintln!("外しました: {}", list(removed));
+    }
+    let plan = &res["plan"];
+    println!(
+        "{key} の worker へ持ち込む user scope の MCP: {}",
+        list(&res["mcp_servers"])
+    );
+    println!("  今 spawn すると持ち込む: tako + {}", list(&plan["kept"]));
+    println!("  止める（user scope）: {}", list(&plan["denied"]));
+    if plan["shadowed"].as_array().is_some_and(|a| !a.is_empty()) {
+        println!(
+            "  プロジェクトの .mcp.json と同名なので止めない: {}",
+            list(&plan["shadowed"])
+        );
+    }
+    for w in res["warnings"].as_array().into_iter().flatten() {
+        if let Some(w) = w.as_str() {
+            eprintln!("警告: {w}");
         }
     }
 }

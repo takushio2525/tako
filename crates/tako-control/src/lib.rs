@@ -125,6 +125,8 @@ pub mod user_tasks;
 pub mod welcome;
 /// worker ペインのフォント自動縮小（#1439）
 pub mod worker_font;
+/// worker へ持ち込む MCP サーバーを絞る（#2412。既定は tako の MCP だけ）
+pub mod worker_mcp;
 pub mod workspace_search;
 
 pub use dispatch::{

@@ -186,6 +186,10 @@ pub struct WorkerLaunch<'a> {
     /// `dispatch::resolve_tako_binary()` の結果を渡す（番犬
     /// `worker_mcp_injection_watchdog` が渡し忘れを落とす）
     pub tako_bin: Option<&'a str>,
+    /// user scope の MCP を止める設定ファイル（`worker_mcp::prepare` が書いたもの。Issue #2412）。
+    /// **claude だけが使う**（`--settings <path>`）。`None` は何も足さない = user scope を
+    /// 全部持ち込む（#2412 前・止めるものが無い・`TAKO_2412_LEGACY=1`）
+    pub mcp_settings: Option<&'a str>,
     /// プロファイル + アカウント解決の env 計画（展開済み）。コマンド先頭で
     /// `export K=V;` / `unset K;` として注入し、direnv が同変数を設定していても
     /// 明示指定が勝つようにする（Issue #500 / #512）
@@ -204,6 +208,7 @@ impl Default for WorkerLaunch<'_> {
             remote_control: false,
             extra_args: &[],
             tako_bin: None,
+            mcp_settings: None,
             env: &EMPTY_ENV_PLAN,
         }
     }
@@ -353,6 +358,12 @@ pub fn build_worker_cmd_in(
     if launch.remote_control && launch.agent == WorkerAgent::Claude {
         cmd.push(' ');
         cmd.push_str(crate::claude_remote::REMOTE_CONTROL_FLAG);
+    }
+    // user scope の MCP を止める（#2412）。claude だけ。プロファイルの args より**前**に置く
+    // （利用者が args に `--settings` を書いていればそちらが後勝ちする = 利用者の設定を消さない。
+    // その場合は `worker_mcp::prepare` が warnings で知らせ、ここへは None が来る）
+    if let (WorkerAgent::Claude, Some(path)) = (launch.agent, launch.mcp_settings) {
+        cmd.push_str(&format!(" --settings {}", lc::quote(dialect, path)));
     }
     // MCP の一時注入（#986）。**codex だけ**が `-c` で受け取れる。
     // claude は恒久登録（`tako setup-mcp`）+ 親 env の継承で繋がり、agy は
@@ -670,6 +681,71 @@ mod tests {
             POSIX,
         );
         assert!(cmd.ends_with("codex --search 'has space'"));
+    }
+
+    /// #2412: user scope の MCP を止める設定は claude だけに付き、プロファイルの args より前に置く
+    /// （利用者が args に `--settings` を書いていればそちらが後勝ちする = 利用者の設定を消さない）
+    #[test]
+    fn i2412_mcpの絞り込みはclaudeだけにargsより前で付く() {
+        let args = vec!["--verbose".to_string()];
+        let path = "/data/tako/worker-mcp/deny-0011.json";
+        let claude = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Claude,
+                role: "worker:x",
+                extra_args: &args,
+                mcp_settings: Some(path),
+                ..Default::default()
+            },
+            POSIX,
+        );
+        assert!(
+            claude.ends_with(&format!("claude --settings {path} --verbose")),
+            "{claude}"
+        );
+        // 空白を含む置き場（macOS の Application Support）は引用する。PowerShell も同じ
+        let spaced = "/Users/x/Library/Application Support/tako/worker-mcp/deny-1.json";
+        for (dialect, quoted) in [
+            (POSIX, format!("'{spaced}'")),
+            (
+                crate::launch_cmd::ShellDialect::PowerShell,
+                format!("'{spaced}'"),
+            ),
+        ] {
+            let cmd = build_worker_cmd_in(
+                &WorkerLaunch {
+                    agent: WorkerAgent::Claude,
+                    role: "worker:x",
+                    mcp_settings: Some(spaced),
+                    ..Default::default()
+                },
+                dialect,
+            );
+            assert!(cmd.ends_with(&format!("--settings {quoted}")), "{cmd}");
+        }
+        // codex / agy には同名のフラグが無いので付けない（付けると即死する）
+        for agent in [WorkerAgent::Codex, WorkerAgent::Agy] {
+            let cmd = build_worker_cmd_in(
+                &WorkerLaunch {
+                    agent,
+                    role: "worker:x",
+                    mcp_settings: Some(path),
+                    ..Default::default()
+                },
+                POSIX,
+            );
+            assert!(!cmd.contains("--settings"), "{cmd}");
+        }
+        // None は 1 バイトも足さない（#2412 前と同じ）
+        let none = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Claude,
+                role: "worker:x",
+                ..Default::default()
+            },
+            POSIX,
+        );
+        assert_eq!(none, "TAKO_ORCHESTRATOR_ROLE='worker:x' claude");
     }
 
     #[test]

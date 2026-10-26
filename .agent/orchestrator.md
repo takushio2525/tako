@@ -55,10 +55,13 @@ tako master
 `~/Library/Application Support/tako/orchestrator/projects.yaml`
 
 ```yaml
+version: 2
 projects:
   webapp:
     cwd: ~/Documents/webapp
     description: Web アプリケーション
+    mcp_servers:
+    - playwright
   api-server:
     cwd: ~/Documents/api-server
     description: REST API サーバー
@@ -69,6 +72,9 @@ projects:
 
 - `cwd`: 作業ディレクトリ（`~` は `$HOME` に展開される）
 - `description`: 説明（任意）
+- `mcp_servers`: このプロジェクトの claude worker へ持ち込む **user scope の MCP サーバー名**
+  （#2412。下の「worker の MCP」）。省略 = tako の MCP だけ。`*` = user scope を全部持ち込む
+- `version`: 形式の世代（#916 の移行が使う。手で書かない）
 
 ### CLI でプロジェクトを管理する
 
@@ -81,7 +87,40 @@ tako orchestrator projects add --key webapp --cwd ~/Documents/webapp --descripti
 
 # 削除
 tako orchestrator projects remove --key webapp
+
+# worker へ持ち込む MCP を見る / 足す / 外す（#2412）
+tako orchestrator projects mcp webapp
+tako orchestrator projects mcp webapp add playwright
+tako orchestrator projects mcp webapp remove playwright
 ```
+
+### worker の MCP（user scope を持ち込まない。Issue #2412）
+
+tako が起こす **claude の worker**（spawn / run / git resolve / 会話を保った再起動）は、
+既定で **tako の MCP だけ**を持って起動する。claude は起動のたびに user scope
+（`<config dir>/.claude.json` の `mcpServers`）の MCP サーバーをすべて起こし、`npx` / `uvx` 経由で
+1 本あたり 12〜15 プロセス・約 400 MB を食う（2026-10-25 にこれでメモリが尽きて PC が落ちた）。
+
+- **仕組み**: 起動コマンドに `--settings <data_dir>/worker-mcp/deny-<hash>.json` を付け、
+  その `deniedMcpServers` に止める user scope の名前を並べる（判断は `worker_mcp::prepare` の 1 実装）。
+  止める名前は**知っている config dir 全部**（起動するアカウント・tako の既定・accounts.yaml の全アカウント）
+  の user scope の和から、tako のブリッジ・`mcp_servers`・プロジェクト側と同名のものを除いたもの
+- **今までどおり立つもの**: そのリポジトリの `.mcp.json`（cwd と祖先）・local scope
+  （`claude mcp add --scope local`。git の根を鍵に引かれる）・plugin・claude.ai のコネクタ。
+  **user scope と同名の `.mcp.json` / local scope は止めない**（deny は名前で効くのでプロジェクト側まで止まる。
+  同名なら claude はプロジェクト側を採るので user 側は元々立たない）
+- **足す**: `tako orchestrator projects mcp <key> add <名前>`（MCP は `tako_orchestrator_projects` の
+  `action: mcp_add` + `servers`）。user scope にもプロジェクトの `.mcp.json` にも無い名前は足すが警告が出る
+- **spawn の応答の `mcp`**: `mode`（`tako_only` / `keep_all` / `overridden` / `unrestricted` / `legacy` /
+  `not_supported`）・`denied` / `kept` / `missing` / `shadowed`・`settings_file`。絞り込みが効かないとき
+  （プロファイルの `worker_agents.claude.args` に `--settings` がある = claude は後ろの `--settings` だけを読む /
+  設定ファイルを書けない）は `warnings` の `kind: worker_mcp` と persist.log に理由が出る（起動は止めない）
+- **移行（#916）**: projects.yaml v1 → v2 で、直近 30 日の会話（`<config dir>/projects/<cwd のスラグ>/*.jsonl`）
+  で呼ばれた `mcp__<server>__*` のうち user scope のものを、そのプロジェクトの `mcp_servers` へ写す。
+  写すのは名前だけで本文は残さない。元のファイルは `projects.yaml.pre-v1.bak`
+- **対象外**: master / solo のセッション・人が手で開く claude。codex / agy の worker は
+  能力マトリクス `worker_mcp_scope`（codex = pending #2418 / agy = unsupported）
+- A/B は `TAKO_2412_LEGACY=1`（user scope を全部持ち込む #2412 前の起動）
 
 ## プロファイルと設定の優先順位（Issue #27 で明文化）
 
@@ -256,6 +295,9 @@ worker_agents:               # エージェント別の worker 設定（任意�
     解決したときは persist.log に `mcp serve: caller_pane を pid 祖先辿りで解決（pane=N …）` が 1 行残る
   - tako の**外**で起動した codex / agy には従来どおりツールが出ない（`tako mcp serve` は
     `TAKO_SOCKET` + `TAKO_TOKEN` が無いと 0 ツール = FR-2.3.2）
+- **持ち込む MCP（#2412）**: claude の worker は tako の MCP だけで起動し、user scope の MCP は
+  `--settings` の `deniedMcpServers` で止める（`.mcp.json` / local scope はそのまま）。足すのは
+  プロジェクトの `mcp_servers`。詳細は上の「worker の MCP」
 - **事前信頼**: spawn 時に各 CLI の信頼設定（claude: `~/.claude.json` / codex:
   `~/.codex/config.toml` / agy: `~/.gemini/antigravity-cli/settings.json`）へ書き込み、
   信頼ダイアログ自体を出さない。書けなかった場合もダイアログ検出 → Enter 承諾でフォールバック
@@ -481,6 +523,13 @@ default.yaml そのものには触らない。直したら `tako migrate run`（
 | オプション | 必須 | 説明 |
 |---|---|---|
 | `--key` | ○ | プロジェクトキー |
+
+### `tako orchestrator projects mcp`
+
+`tako orchestrator projects mcp <key> [add|remove <名前>...]`。そのプロジェクトの claude worker へ
+持ち込む user scope の MCP を見る・足す・外す（#2412。上の「worker の MCP」）。引数なしは
+今の設定と「今 spawn したら持ち込む / 止める」を出す。MCP は `tako_orchestrator_projects` の
+`action: mcp / mcp_add / mcp_remove` + `servers` で 1:1。
 
 ### `tako orchestrator adopt`
 

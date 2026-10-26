@@ -3080,6 +3080,7 @@ fn apply_projects(
     };
     let config = tako_control::orchestrator::ProjectsConfig {
         projects: projects.clone(),
+        ..Default::default()
     };
     config.save()?;
     eprintln!("  [input] プロジェクト登録: {} 件", projects.len());

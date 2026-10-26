@@ -9016,7 +9016,14 @@ fn dispatch_inner(
             key,
             cwd,
             description,
-        } => dispatch_orchestrator_projects(&action, key, cwd, description),
+            servers,
+        } => match action.as_str() {
+            // #2412: worker へ持ち込む MCP の設定
+            "mcp" | "mcp_add" | "mcp_remove" => {
+                dispatch_orchestrator_projects_mcp(&action, key, servers)
+            }
+            _ => dispatch_orchestrator_projects(&action, key, cwd, description),
+        },
 
         // #1453: 走っている master を専用プロファイルへその場で寄せる
         Request::OrchestratorAdopt {
@@ -12862,7 +12869,16 @@ pub fn dispatch_orchestrator_projects(
             let projects: Vec<Value> = config
                 .list_resolved()
                 .into_iter()
-                .map(|p| json!({ "key": p.key, "cwd": p.cwd, "description": p.description }))
+                .map(|p| {
+                    // #2412: worker へ持ち込む user scope の MCP（空 = tako の MCP だけ）
+                    let mcp_servers = crate::worker_mcp::keep_for_project(&config, &p.key);
+                    json!({
+                        "key": p.key,
+                        "cwd": p.cwd,
+                        "description": p.description,
+                        "mcp_servers": mcp_servers,
+                    })
+                })
                 .collect();
             Ok(json!({ "projects": projects }))
         }
@@ -12915,10 +12931,96 @@ pub fn dispatch_orchestrator_projects(
         _ => Err(Reason::InvalidValue {
             key: "action",
             got: action.to_string(),
-            allowed: "list / add / remove".to_string(),
+            allowed: "list / add / remove / mcp / mcp_add / mcp_remove".to_string(),
         }
         .invalid()),
     }
+}
+
+/// OrchestratorProjects の mcp / mcp_add / mcp_remove（Issue #2412）。
+///
+/// プロジェクトの claude worker へ持ち込む **user scope の MCP サーバー名**（`mcp_servers`）を
+/// 見る・足す・外す。既定（空）は tako の MCP だけ。`*` で user scope を全部持ち込む。
+/// 応答の `plan` は今 spawn したら何が止まり何が持ち込まれるか（spawn の `mcp` 欄と同じ判断）。
+/// user scope にもプロジェクトの `.mcp.json` にも無い名前は足すが warnings で知らせる
+pub fn dispatch_orchestrator_projects_mcp(
+    action: &str,
+    key: Option<String>,
+    servers: Vec<String>,
+) -> Result<Value, DispatchError> {
+    use crate::orchestrator;
+    let key = key.ok_or_else(|| Reason::Missing("key".into()).invalid())?;
+    let servers: Vec<String> = servers
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if action != "mcp" && servers.is_empty() {
+        return Err(Reason::Missing("servers".into()).invalid());
+    }
+    let mut changed: Vec<String> = Vec::new();
+    let loaded = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
+    if !loaded.projects.contains_key(&key) {
+        // 無いキーへの変更でファイルを書き直さない（世代バックアップを無駄に回さない）
+        return Err(Reason::ProjectNotFound(key).operation());
+    }
+    let adding = action == "mcp_add";
+    // 変わるものが無ければ書かない（2 回目の add / 無い名前の remove = 冪等）
+    let would_change = loaded.projects.get(&key).is_some_and(|e| {
+        servers
+            .iter()
+            .any(|n| e.mcp_servers.iter().any(|s| s == n) != adding)
+    });
+    let config = if action == "mcp" || !would_change {
+        loaded
+    } else {
+        // ロック付き read-modify-write（#169: 並行の変更を消さない）。無いキーは書かない
+        orchestrator::ProjectsConfig::mutate(|config| {
+            let Some(entry) = config.projects.get_mut(&key) else {
+                return None;
+            };
+            for name in &servers {
+                let present = entry.mcp_servers.iter().any(|s| s == name);
+                if adding && !present {
+                    entry.mcp_servers.push(name.clone());
+                    changed.push(name.clone());
+                } else if !adding && present {
+                    entry.mcp_servers.retain(|s| s != name);
+                    changed.push(name.clone());
+                }
+            }
+            entry.mcp_servers.sort();
+            Some(config.clone())
+        })
+        .map_err(DispatchError::Operation)?
+        .ok_or_else(|| Reason::ProjectNotFound(key.clone()).operation())?
+    };
+    let cwd = config
+        .list_resolved()
+        .into_iter()
+        .find(|p| p.key == key)
+        .map(|p| p.cwd)
+        .ok_or_else(|| Reason::ProjectNotFound(key.clone()).operation())?;
+    let keep = crate::worker_mcp::keep_for_project(&config, &key);
+    let plan = crate::worker_mcp::prepare(
+        orchestrator::agent::WorkerAgent::Claude,
+        std::path::Path::new(&cwd),
+        None,
+        &keep,
+        &[],
+    );
+    let mut result = json!({
+        "key": key,
+        "mcp_servers": keep,
+        "plan": plan.to_json(),
+        "warnings": plan.warnings,
+    });
+    match action {
+        "mcp_add" => result["added"] = json!(changed),
+        "mcp_remove" => result["removed"] = json!(changed),
+        _ => {}
+    }
+    Ok(result)
 }
 
 /// OrchestratorAdopt — 走っている master を専用プロファイルへ**その場で**寄せる（#1453）。
@@ -16081,6 +16183,21 @@ fn dispatch_git_resolve_agent(
     let role_value = "conflict-resolver";
     // MCP の一時注入（#986）。codex だけが `-c` で受け取る（他系統は 1 バイトも変わらない）
     let tako_bin = tako_binary();
+    // #2412: spawn と同じ 1 実装。プロジェクトキーを持たないので、cwd が一致するプロジェクトの
+    // mcp_servers を使う（登録の無いリポジトリは tako の MCP だけ）
+    let worker_mcp = crate::worker_mcp::prepare(
+        worker_agent,
+        &repo,
+        profile_env.claude_config_dir().as_deref(),
+        &orchestrator::ProjectsConfig::load()
+            .map(|c| crate::worker_mcp::keep_for_cwd(&c, &repo))
+            .unwrap_or_default(),
+        &launch.extra_args,
+    )
+    .materialized();
+    for w in &worker_mcp.warnings {
+        crate::diag::persist_log(&format!("[git resolve] pane={}: {w}", new_id.as_u64()));
+    }
     let agent_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
         agent: worker_agent,
         role: role_value,
@@ -16093,6 +16210,7 @@ fn dispatch_git_resolve_agent(
         remote_control: remote_control.enabled(),
         extra_args: &launch.extra_args,
         tako_bin: Some(&tako_bin),
+        mcp_settings: worker_mcp.settings_file.as_deref(),
         env: &profile_env,
     });
 
@@ -16612,6 +16730,16 @@ fn dispatch_orchestrator_spawn(
     // MCP の一時注入（#986）。codex だけが `-c` で受け取る（他系統は 1 バイトも変わらない）。
     // master と同じ 1 実装（`agent::codex_mcp_args`）なので、worker だけ古い形になることが無い
     let tako_bin = tako_binary();
+    // #2412: user scope の MCP を持ち込まない（既定は tako の MCP だけ。足すのはプロジェクトの
+    // mcp_servers）。読む user scope は起動する claude の config dir を含む（#558 と同じ解決）
+    let worker_mcp = crate::worker_mcp::prepare(
+        worker_agent,
+        std::path::Path::new(&cwd),
+        profile_env.claude_config_dir().as_deref(),
+        &crate::worker_mcp::keep_for_project(&config, project),
+        &launch.extra_args,
+    )
+    .materialized();
     let worker_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
         agent: worker_agent,
         role: &role_value,
@@ -16624,6 +16752,7 @@ fn dispatch_orchestrator_spawn(
         remote_control: remote_control.enabled(),
         extra_args: &launch.extra_args,
         tako_bin: Some(&tako_bin),
+        mcp_settings: worker_mcp.settings_file.as_deref(),
         env: &profile_env,
     });
 
@@ -16643,6 +16772,15 @@ fn dispatch_orchestrator_spawn(
         crate::diag::persist_log(&format!("[spawn] pane={}: {w}", new_id.as_u64()));
         launch_warnings.push(json!({
             "kind": "profile_unreadable",
+            "agent": worker_agent.as_str(),
+            "message": w,
+        }));
+    }
+    // #2412: 絞り込みが効かない / 名前が見つからないことは黙らせない（spawn は止めない）
+    for w in &worker_mcp.warnings {
+        crate::diag::persist_log(&format!("[spawn] pane={}: {w}", new_id.as_u64()));
+        launch_warnings.push(json!({
+            "kind": "worker_mcp",
             "agent": worker_agent.as_str(),
             "message": w,
         }));
@@ -16874,6 +17012,8 @@ fn dispatch_orchestrator_spawn(
         "agent": worker_agent.as_str(),
         // #983: tako がどの実行ファイルを起動したか（無ければ preflight で落ちている）
         "agent_path": agent_cli_path,
+        // #2412: 持ち込んだ / 止めた MCP（mode = tako_only / keep_all / legacy / not_supported 等）
+        "mcp": worker_mcp.to_json(),
         "model": launch.model,
         // #1013: どの段が model を決めたか（explicit / account / agent_config /
         // profile_policy / cli_default）。null の model が「CLI 既定に委ねた」のか

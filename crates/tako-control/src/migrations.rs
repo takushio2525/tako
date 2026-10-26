@@ -292,6 +292,69 @@ fn pin_sandbox_bypass(text: &str) -> Result<Option<String>, String> {
     Ok(Some(out))
 }
 
+// --- projects.yaml（#2412）--------------------------------------------------
+
+const PROJECTS_V1_TO_V2: Note = Note::new(
+    "worker を tako の MCP だけで起動する前に、直近 30 日の会話で user scope の MCP を呼んでいたプロジェクトへ、その名前を mcp_servers として残す（#2412）",
+    "Before workers start with only tako's MCP, keep each user-scope MCP server a project actually called in the last 30 days of conversations as that project's mcp_servers (#2412)",
+);
+
+/// #2412: 実績（直近の transcript で呼ばれた `mcp__<server>__*`）を `mcp_servers` へ写し、
+/// 版数を 2 にする。**写すのは名前と既定だけ**で、会話の本文はどこにも残さない。
+///
+/// 読む会話は `worker_mcp::evidence_config_dirs`（テストのプロセスでは読まない）。
+/// 冪等: 2 回目は `version: 2` を見て何もしない（`detect` も同じ値を読む）
+fn adopt_worker_mcp_usage(text: &str) -> Result<Option<String>, String> {
+    // 下見（dry run）と本番の移行が同じ本文で手順を 2 回呼ぶ。会話の走査（数 GB）は
+    // 重いので、同じ本文への答えはプロセスの中で 1 回だけ作る
+    static MEMO: std::sync::Mutex<Option<(String, Result<Option<String>, String>)>> =
+        std::sync::Mutex::new(None);
+    let mut memo = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((seen, answer)) = memo.as_ref() {
+        if seen == text {
+            return answer.clone();
+        }
+    }
+    let answer = adopt_worker_mcp_usage_in(text, &crate::worker_mcp::evidence_config_dirs());
+    *memo = Some((text.to_string(), answer.clone()));
+    answer
+}
+
+/// [`adopt_worker_mcp_usage`] の本体（読む config dir を引数で受ける = テストが一時 dir を渡す）
+pub fn adopt_worker_mcp_usage_in(
+    text: &str,
+    config_dirs: &[PathBuf],
+) -> Result<Option<String>, String> {
+    let mut config: crate::orchestrator::ProjectsConfig =
+        serde_yaml::from_str(text).map_err(|e| {
+            format!(
+                "projects.yaml として読めない: {}",
+                tako_core::load_issue::yaml_error_reason(&e, text)
+            )
+        })?;
+    if config.version >= crate::orchestrator::PROJECTS_VERSION {
+        return Ok(None);
+    }
+    // 何を足したかは persist.log へ書かない（`tako migrate status` の下見でも手順が走るので、
+    // ここで書くと当てていない移行を記録してしまう）。結果は projects.yaml と
+    // `tako orchestrator projects mcp <key>` で見え、元のファイルは `.pre-v1.bak` に残る
+    crate::worker_mcp::adopt_usage_from(&mut config, config_dirs);
+    config.version = crate::orchestrator::PROJECTS_VERSION;
+    serde_yaml::to_string(&config)
+        .map(Some)
+        .map_err(|e| format!("YAML の再構成に失敗: {e}"))
+}
+
+const PROJECTS_STEPS: &[Step] = &[Step {
+    from: 1,
+    to: crate::orchestrator::PROJECTS_VERSION,
+    describe: PROJECTS_V1_TO_V2,
+    // 利用者が後で mcp_servers から名前を外したら、それは意図なので二度と足さない
+    // （版数 2 を見て当たらない = detect 側で足りている）
+    once: false,
+    apply: adopt_worker_mcp_usage,
+}];
+
 // --- 追記（prompt_blocks.append）の分割（#1477）-------------------------------
 
 /// 追記の現在の世代。v1 = 区切りが無く予算を超えている / v2 = 現在
@@ -588,7 +651,17 @@ pub const SPECS: &[SchemaSpec] = &[
         SchemaId::OrchestratorConfig,
         Some(validate_orchestrator_config),
     ),
-    pristine(SchemaId::Projects, Some(validate_projects)),
+    // #2412: v2 で各プロジェクトに mcp_servers（worker へ持ち込む user scope の MCP）を足し、
+    // 移行が直近の実績を写す。版数は最上位の `version`（無い旧ファイル = v1）
+    SchemaSpec {
+        id: SchemaId::Projects,
+        target_version: crate::orchestrator::PROJECTS_VERSION,
+        detect: detect_version_field,
+        steps: PROJECTS_STEPS,
+        once_markers: &[],
+        validate: Some(validate_projects),
+        preserve_unreadable: true,
+    },
     pristine(SchemaId::Accounts, Some(validate_accounts)),
     profile_spec(SchemaId::Profiles),
     // solo プロファイルも同じ `Profile` 型で、`master_agent: codex` を持てる

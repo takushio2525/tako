@@ -169,6 +169,7 @@ impl SettingsWindow {
                     key: None,
                     cwd: None,
                     description: None,
+                    servers: Vec::new(),
                 },
                 cx,
             )

@@ -2424,7 +2424,7 @@
     "name": "tako_setup_mcp"
   },
   {
-    "description": "オーケストレーターのプロジェクトを管理する。action=list で登録済みプロジェクト一覧、add で新規追加、remove で削除。プロジェクトは projects.yaml に保存され、tako_orchestrator_spawn の対象として使える。",
+    "description": "オーケストレーターのプロジェクトを管理する。action=list で登録済みプロジェクト一覧、add で新規追加、remove で削除。claude worker は tako の MCP だけで起動する。mcp_add / mcp_remove で持ち込む user scope の MCP（servers。* = 全部）を足し引きし、mcp で構成を見る。プロジェクトは projects.yaml に保存され、tako_orchestrator_spawn の対象として使える。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2433,7 +2433,10 @@
           "enum": [
             "list",
             "add",
-            "remove"
+            "remove",
+            "mcp",
+            "mcp_add",
+            "mcp_remove"
           ],
           "type": "string"
         },
@@ -2446,8 +2449,15 @@
           "type": "string"
         },
         "key": {
-          "description": "プロジェクトキー（add / remove 時に必須）",
+          "description": "プロジェクトキー（list 以外で必須）",
           "type": "string"
+        },
+        "servers": {
+          "description": "MCP サーバー名（mcp_add / mcp_remove）",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
