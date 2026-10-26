@@ -36,6 +36,8 @@
 //! 2. #1308 の現場は状態待ちのドライバ `i1308_wait_for_state` を通すこと
 //!    （ドライバは**尽きたら panic する** = 呼び出し側が素通りできない構造にしてある）
 //! 3. そのドライバ自身が予算・混み具合・診断・A/B の旧経路アームを持っていること
+//! 4. （10/25 の再発）#1308 の現場は POSIX でログインシェルを経由せず、描画のコマンドを
+//!    直接起こすこと（`i1308_direct_options`）
 
 use std::path::{Path, PathBuf};
 
@@ -238,6 +240,40 @@ fn 状態待ちのドライバは予算と診断とab経路を持つ() {
     assert!(
         code_view::without_comments(&src).contains("std::env::var(\"TAKO_1308_LEGACY\")"),
         "A/B の旧経路（TAKO_1308_LEGACY=1）が無いと、直したことを実測で示せない"
+    );
+}
+
+/// 10/25 の再発（#1308）: 現場は POSIX で**ログインシェルを経由しない**。
+///
+/// 10/25 までは既定のログインシェル（開発者の rc を全部読む）を起こしてプロンプトを待ち、
+/// 打ち込んでいた。詰まった機でこの起動（手元 0.6 秒）が予算 約 47 秒を使い切り、
+/// CI（素のシェル）では緑のまま手元でだけ落ちた。描画のコマンドを直接起こす
+/// `i1308_direct_options` へ戻っていること・A/B の旧経路（`TAKO_1308_TYPED=1`）の入口が
+/// 残っていることを見る
+#[test]
+fn issue1308の現場はposixでログインシェルを経由しない() {
+    let src = read_src();
+    let body = bodies(&src)
+        .into_iter()
+        .find(|b| b.name == GUARDED)
+        .unwrap_or_else(|| panic!("#1308 の現場（{GUARDED}）が切り出せていない"));
+    let code = code_view::without_comments(&body.text);
+    assert!(
+        code.contains("i1308_direct_options("),
+        "crates/tako-control/src/dispatch.rs:{} fn {GUARDED}: 描画のコマンドを直接起こす\
+         `i1308_direct_options` を通していない（ログインシェルへ戻ると、開発者の rc の起動が\
+         詰まった機で予算を使い切る = 10/25 の再発）",
+        body.line
+    );
+    assert!(
+        code.contains("typed_fixture_1308()"),
+        "crates/tako-control/src/dispatch.rs:{} fn {GUARDED}: A/B の旧経路\
+         （typed_fixture_1308）へ分岐していない",
+        body.line
+    );
+    assert!(
+        code_view::without_comments(&src).contains("std::env::var(\"TAKO_1308_TYPED\")"),
+        "A/B の旧経路（TAKO_1308_TYPED=1）が無いと、直したことを実測で示せない"
     );
 }
 
