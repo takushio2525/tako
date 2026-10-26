@@ -650,6 +650,42 @@ pub fn request(req: LaunchRequest) -> Decision {
     Decision::Wait(view)
 }
 
+/// 入口が判断を待たずに預ける（UI スレッド。GUI の起動時の復元が使う）。待たせない（無効・A/B）なら
+/// 起こし方をそのまま返す（= 呼び手がその場で起こす = 修正前と同じ）。有効なら預けて `None`:
+/// **全部を預けてから最初の tick で優先度の順に起こす**（その場で 1 本目を起こすと layout の並び順の
+/// 先頭が先に起き、master が先にならない）
+pub fn hold(req: LaunchRequest) -> Option<LaunchAction> {
+    let mut g = lock();
+    if !g.mode.is_some_and(Mode::active) {
+        return Some(req.action);
+    }
+    let now = Instant::now();
+    refresh_inputs(&mut g, now);
+    let keys = q::agent_history_keys(&req.agent);
+    let estimate = q::estimate(JobKind::Agent, Some(&keys), &g.history);
+    g.entries.insert(
+        req.pane,
+        Entry {
+            kind: req.kind,
+            agent: req.agent,
+            label: req.label,
+            priority: priority_for_role(req.role.as_deref()),
+            enqueued_ms: unix_ms(),
+            enqueued: now,
+            estimate,
+            action: Some(req.action),
+            phase: Phase::Waiting,
+            forced: false,
+            waited: true,
+            used_mb: None,
+            peak_mb: 0,
+            peak_at: None,
+        },
+    );
+    crate::resources::keep_scanning(now + KEEP_SCANNING);
+    None
+}
+
 /// 起こすと決まった 1 件
 struct Due {
     pane: u64,

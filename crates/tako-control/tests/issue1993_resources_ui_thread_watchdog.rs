@@ -22,7 +22,7 @@
 //!    `poll` / `done` / `cancel` / `set_limits` / `status_section` / `decide` / `refresh_usage` /
 //!    `machine`）は採らない（覚えを読むだけ。#1994）
 //! 7. agent の起動待ち（`launch_gate.rs`。#2413）の UI スレッドから届く口（dispatch の spawn と起動時の
-//!    復元が呼ぶ `request`、500 ms の tick が呼ぶ `tick` と、そこから呼ぶ判断・取り込み）は採らない。
+//!    復元が呼ぶ `request` / `hold`、500 ms の tick が呼ぶ `tick` と、そこから呼ぶ判断・取り込み）は採らない。
 //!    GUI の 500 ms tick が `launch_gate::tick` を呼んでいる（待たせた起動を起こす口が配線されている）
 //!
 //! # 見逃す側へ倒れないための作り
@@ -451,6 +451,7 @@ fn scan_queue(src: &str) -> Vec<Offender> {
 /// 7. agent の起動待ちの UI スレッドから届く口は採らない（#2413）
 const LAUNCH_GATE_UI_REACHABLE: &[&str] = &[
     "pub fn request(",
+    "pub fn hold(",
     "pub fn tick(",
     "pub fn perform(",
     "fn decide(g: &mut Gate",

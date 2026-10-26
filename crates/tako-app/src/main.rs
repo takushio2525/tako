@@ -5838,9 +5838,10 @@ impl TakoApp {
                         // ペインも終了する）。
                         if let Some(session) = app.terminals.get(&pane) {
                             // #2413: 一斉に起こさない（復元の列で 1 本ずつ・master が先・
-                            // メモリが逼迫しているあいだは待つ）。待たせた分は 500 ms の tick が起こす
+                            // メモリが逼迫しているあいだは待つ）。全部を預け、500 ms の tick が
+                            // 優先度の順に起こす（起動待ちが無効 = A/B なら従来どおりその場で書く）
                             let pane_obj = app.workspace.pane_anywhere(pane);
-                            let decision = tako_control::launch_gate::request(
+                            let held = tako_control::launch_gate::hold(
                                 tako_control::launch_gate::LaunchRequest {
                                     pane: pane.as_u64(),
                                     kind: tako_control::launch_gate::LaunchKind::Restore,
@@ -5855,16 +5856,12 @@ impl TakoApp {
                                     ),
                                 },
                             );
-                            match decision {
-                                tako_control::launch_gate::Decision::Now(
-                                    tako_control::launch_gate::LaunchAction::Write(bytes),
-                                ) => session.write(bytes),
-                                tako_control::launch_gate::Decision::Now(_) => {
-                                    unreachable!("復元は書き込みで預けた")
+                            match held {
+                                Some(tako_control::launch_gate::LaunchAction::Write(bytes)) => {
+                                    session.write(bytes)
                                 }
-                                tako_control::launch_gate::Decision::Wait(_) => {
-                                    restore_held += 1;
-                                }
+                                Some(_) => unreachable!("復元は書き込みで預けた"),
+                                None => restore_held += 1,
                             }
                             breakdown.record(
                                 tako_control::restore_report::PaneOutcome::Resumed {
@@ -5916,7 +5913,8 @@ impl TakoApp {
             if let Some(line) = breakdown.mismatch(restored.len()) {
                 persist_diag(&line);
             }
-            // #2413: 復元を時差にした（1 本ずつ・逼迫中は待つ）。起こすたびに `[launch-gate] 起動` が続く
+            // #2413: 復元を時差にした（master から 1 本ずつ・逼迫中は待つ）。起こすたびに
+            // `[launch-gate] 起動` が続く
             if restore_held > 0 {
                 persist_diag(&format!(
                     "[launch-gate] 復元: agent {restore_held} 本を時差で起こす（同時に 1 本・立ち上がり {} 秒ごと・\

@@ -35913,6 +35913,139 @@ mod tests {
         });
     }
 
+    /// #2413 の受け入れ条件 3（復元の時差）を、**本物の `launch_gate::tick`**（GUI の 500 ms tick と
+    /// 同じ口・同じ判断）を 20 ms ごとに回して実時間で測る。6 ペイン（master 1）・立ち上がりの窓 150 ms:
+    /// 預けた時点では 1 本も起こさない / critical の間は 1 本も起きない / normal へ戻ると master から
+    /// 1 本ずつ・どの tick で見ても立ち上がり中の復元は 1 本・間隔は窓以上 / 走っているペインは閉じない
+    #[test]
+    fn issue2413_復元はtickで1本ずつmasterから起き_逼迫中は止まる() {
+        use crate::launch_gate::{self as gate, LaunchAction, LaunchKind, LaunchRequest};
+        use std::time::{Duration, Instant};
+        use tako_core::queue::MachineView;
+        use tako_core::resources::Pressure;
+        let machine = |p| {
+            Some(MachineView {
+                total_mb: 36 * 1024,
+                available_mb: Some(20 * 1024),
+                pressure: Some(p),
+                swap_used_mb: Some(0),
+            })
+        };
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let mut panes = vec![root];
+        for _ in 1..6 {
+            panes.push(split(&mut host, root));
+        }
+        // layout の並びの最後が master（先頭の worker より先に起きることを見る）
+        let master = *panes.last().unwrap();
+        let window = Duration::from_millis(150);
+        gate::enable_for_test(machine(Pressure::Critical), window);
+        for (i, p) in panes.iter().enumerate() {
+            let role = if *p == master {
+                "orchestrator-master:t2413"
+            } else {
+                "orchestrator-worker:t2413:w"
+            };
+            let held = gate::hold(LaunchRequest {
+                pane: *p,
+                kind: LaunchKind::Restore,
+                agent: "claude".into(),
+                label: format!("p{i}"),
+                role: Some(role.into()),
+                action: LaunchAction::Command {
+                    command: format!("claude --resume s{p}"),
+                    prompt: None,
+                },
+            });
+            assert!(held.is_none(), "起動待ちが有効なら全部預ける");
+        }
+        assert!(
+            host.command_flows.is_empty(),
+            "預けた時点では 1 本も起こさない"
+        );
+        // 逼迫（critical）の間は 1 本も起きない
+        let held_since = Instant::now();
+        while held_since.elapsed() < Duration::from_millis(400) {
+            gate::tick(&mut host);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(host.command_flows.is_empty(), "critical の間に起こした");
+        let waiting = gate::status_section()["waiting"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(waiting.len(), 6);
+        assert_eq!(
+            waiting[0]["pane"], master,
+            "並びの先頭は master: {waiting:?}"
+        );
+        assert_eq!(waiting[0]["code"], "pressure_critical");
+
+        gate::set_machine_for_test(machine(Pressure::Normal));
+        let resumed = Instant::now();
+        let mut launched: Vec<(u64, Duration)> = Vec::new();
+        let mut max_starting = 0usize;
+        while launched.len() < panes.len() && resumed.elapsed() < Duration::from_secs(10) {
+            let at = resumed.elapsed();
+            gate::tick(&mut host);
+            let new: Vec<u64> = host
+                .command_flows
+                .iter()
+                .skip(launched.len())
+                .map(|(p, _)| p.as_u64())
+                .collect();
+            launched.extend(new.into_iter().map(|p| (p, at)));
+            let starting = gate::status_section()["starting"]
+                .as_array()
+                .map_or(0, |a| a.iter().filter(|s| s["kind"] == "restore").count());
+            max_starting = max_starting.max(starting);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let gaps: Vec<u128> = launched
+            .windows(2)
+            .map(|w| (w[1].1 - w[0].1).as_millis())
+            .collect();
+        eprintln!(
+            "#2413 復元の時差（窓 {} ms・tick 20 ms）: 起きた順 {:?} / 間隔 {gaps:?} ms / \
+             立ち上がり中の最大 {max_starting} 本",
+            window.as_millis(),
+            launched
+                .iter()
+                .map(|(p, t)| format!("{p}@{}ms", t.as_millis()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(launched.len(), 6, "全部起きる: {launched:?}");
+        assert_eq!(launched[0].0, master, "master が先");
+        assert_eq!(max_starting, 1, "同時に立ち上がる復元は 1 本");
+        assert!(
+            gaps.iter().all(|g| *g + 5 >= window.as_millis()),
+            "窓が明ける前に次を起こした: {gaps:?}"
+        );
+        assert!(
+            host.detached.is_empty(),
+            "起動待ちはペインを閉じない（殺さない）"
+        );
+    }
+
+    /// #2413: 起動待ちを持たない tako（A/B `TAKO_2413_LEGACY=1`・隔離）の復元は預けず、その場で全部起こす（修正前）
+    #[test]
+    fn issue2413_起動待ちが無効なら復元は預けずその場で起こす() {
+        let held = crate::launch_gate::hold(crate::launch_gate::LaunchRequest {
+            pane: 1,
+            kind: crate::launch_gate::LaunchKind::Restore,
+            agent: "claude".into(),
+            label: "p".into(),
+            role: None,
+            action: crate::launch_gate::LaunchAction::Write(b"claude --resume x\r".to_vec()),
+        });
+        assert!(matches!(
+            held,
+            Some(crate::launch_gate::LaunchAction::Write(_))
+        ));
+        assert!(!crate::launch_gate::is_waiting(1));
+    }
+
     /// #2413: 起動待ちを持たない tako（隔離・A/B・CLI のプロセス）の spawn は従来どおり即座に起こし、
     /// 応答の `launch_gate` は null
     #[test]
