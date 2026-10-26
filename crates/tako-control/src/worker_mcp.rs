@@ -141,7 +141,10 @@ pub fn user_scope_files(explicit_config_dir: Option<&str>) -> Vec<PathBuf> {
     }
     if let Ok(accounts) = crate::orchestrator::AccountsConfig::load() {
         for (_, resolved) in accounts.list_resolved() {
-            if let Some(dir) = resolved.ok().and_then(|a| a.config_dir.path().map(PathBuf::from)) {
+            if let Some(dir) = resolved
+                .ok()
+                .and_then(|a| a.config_dir.path().map(PathBuf::from))
+            {
                 push(dir.join(".claude.json"));
             }
         }
@@ -429,7 +432,10 @@ pub fn prepare_from(
     if out.plan.denied.is_empty() {
         return out;
     }
-    if extra_args.iter().any(|a| a == "--settings" || a.starts_with("--settings=")) {
+    if extra_args
+        .iter()
+        .any(|a| a == "--settings" || a.starts_with("--settings="))
+    {
         out.mode = "overridden";
         out.warnings.push(
             "プロファイルの worker_agents.claude.args に --settings があるため、user scope の MCP を止める設定が効かない（claude は後ろの --settings だけを読む）"
@@ -488,28 +494,28 @@ fn evidence_user_files(config_dirs: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
-/// 1 本の transcript から `"name":"mcp__<server>__` を数える。
+/// 1 本の transcript から `"name":"mcp__<server>__` を数える（`tako_core::mcp_calls`）。
 ///
-/// **大きな塊で読み、改行で切ってから検索する**（行ごとに文字列を作ると 6 GB で release でも
-/// 1 回 3 秒を超えた = 実測）。塊の末尾の書きかけの行は次の塊へ持ち越すので、メモリは
-/// 塊 + 最長の行ぶんだけ
+/// **大きな塊のバイト列のまま、改行で切ってから探す**（行ごとに文字列を作って `str` で探すと
+/// 6 GB に release でも 4 秒かかった = 実測）。塊の末尾の書きかけの行は次の塊へ持ち越すので、
+/// メモリは塊 + 最長の行ぶんだけ
 fn scan_transcript(path: &Path, out: &mut BTreeMap<String, u32>) {
     use std::io::Read;
     const CHUNK: usize = 4 << 20;
     let Ok(mut file) = std::fs::File::open(path) else {
         return;
     };
+    let mut chunk = vec![0u8; CHUNK];
     let mut buf: Vec<u8> = Vec::with_capacity(CHUNK);
     loop {
-        let start = buf.len();
-        buf.resize(start + CHUNK, 0);
-        let n = match file.read(&mut buf[start..]) {
+        let n = match file.read(&mut chunk) {
             Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => 0,
         };
-        buf.truncate(start + n);
+        buf.extend_from_slice(&chunk[..n]);
         let at_end = n == 0;
-        // 検索するのは最後の改行まで（終わりなら全部）
+        // 探すのは最後の改行まで（終わりなら全部）
         let upto = if at_end {
             buf.len()
         } else {
@@ -518,27 +524,10 @@ fn scan_transcript(path: &Path, out: &mut BTreeMap<String, u32>) {
                 None => continue, // 1 行が塊より長い = 改行まで読み足す
             }
         };
-        count_mcp_calls(&String::from_utf8_lossy(&buf[..upto]), out);
+        tako_core::mcp_calls::count_calls(&buf[..upto], out);
         buf.drain(..upto);
         if at_end {
             break;
-        }
-    }
-}
-
-/// 文字列の中の `"name":"mcp__<server>__` を数える（JSON の文字列値の中は `\"` なので当たらない）
-fn count_mcp_calls(text: &str, out: &mut BTreeMap<String, u32>) {
-    const NEEDLE: &str = "\"name\":\"mcp__";
-    for (at, _) in text.match_indices(NEEDLE) {
-        let rest = &text[at + NEEDLE.len()..];
-        // サーバー名は短い。区切りの `__` を探すのは先頭の 200 バイトまで
-        let head = &rest.as_bytes()[..rest.len().min(200)];
-        let Some(end) = head.windows(2).position(|w| w == b"__") else {
-            continue;
-        };
-        let server = &rest[..end];
-        if !server.is_empty() && !server.contains('"') {
-            *out.entry(server.to_string()).or_default() += 1;
         }
     }
 }
@@ -612,7 +601,11 @@ pub fn adopt_usage(config: &mut ProjectsConfig, rows: &[UsageRow]) -> Vec<(Strin
         let Some(entry) = config.projects.get_mut(&row.project) else {
             continue;
         };
-        if entry.mcp_servers.iter().any(|s| s == &row.server || s == KEEP_ALL) {
+        if entry
+            .mcp_servers
+            .iter()
+            .any(|s| s == &row.server || s == KEEP_ALL)
+        {
             continue;
         }
         entry.mcp_servers.push(row.server.clone());
@@ -662,7 +655,13 @@ mod tests {
     #[test]
     fn 既定はtakoだけを残してuser_scopeを止める() {
         let mut u = users(&["github", "playwright", "blender"]);
-        u.insert("tako".into(), srv("/Applications/tako.app/Contents/MacOS/tako", &["mcp", "serve"]));
+        u.insert(
+            "tako".into(),
+            srv(
+                "/Applications/tako.app/Contents/MacOS/tako",
+                &["mcp", "serve"],
+            ),
+        );
         let p = plan(&u, &BTreeSet::new(), &[]);
         assert_eq!(p.denied, ["blender", "github", "playwright"]);
         assert_eq!(p.tako, ["tako"]);
@@ -672,7 +671,10 @@ mod tests {
     #[test]
     fn 別名で登録したtakoのブリッジも止めない() {
         let mut u = users(&["github"]);
-        u.insert("tako-dev".into(), srv("/x/target/debug/tako", &["mcp", "serve"]));
+        u.insert(
+            "tako-dev".into(),
+            srv("/x/target/debug/tako", &["mcp", "serve"]),
+        );
         u.insert("tako-like".into(), srv("/x/tako", &["serve"]));
         let p = plan(&u, &BTreeSet::new(), &[]);
         assert_eq!(p.tako, ["tako-dev"]);
@@ -708,12 +710,21 @@ mod tests {
         assert_eq!(mcp.mode, "tako_only");
         assert_eq!(mcp.plan.denied, ["github"]);
         assert_eq!(mcp.plan.kept, ["playwright"]);
-        let path = mcp.settings_file.clone().expect("止める名前があればファイルを渡す");
-        assert!(path.contains("worker-mcp") && path.ends_with(".json"), "{path}");
+        let path = mcp
+            .settings_file
+            .clone()
+            .expect("止める名前があればファイルを渡す");
+        assert!(
+            path.contains("worker-mcp") && path.ends_with(".json"),
+            "{path}"
+        );
         // 書くのは materialize（prepare は置き場と中身を決めるだけ）
         mcp.materialize().unwrap();
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(v, json!({ "deniedMcpServers": [ { "serverName": "github" } ] }));
+        assert_eq!(
+            v,
+            json!({ "deniedMcpServers": [ { "serverName": "github" } ] })
+        );
         // 同じ構成は同じファイル（worker の本数ぶん増えない）・2 回目は書き直さない
         let again = prepare_from(&work, &files, &["playwright".into()], &[]);
         assert_eq!(again.settings_file.as_deref(), Some(path.as_str()));
@@ -739,8 +750,15 @@ mod tests {
         for arg in ["--settings", "--settings=/x.json"] {
             let mcp = prepare_from(&t, &files, &[], &[arg.to_string()]);
             assert_eq!(mcp.mode, "overridden", "{arg}");
-            assert!(mcp.settings_file.is_none(), "利用者の --settings を消して上書きしない");
-            assert!(mcp.warnings.iter().any(|w| w.contains("--settings")), "{:?}", mcp.warnings);
+            assert!(
+                mcp.settings_file.is_none(),
+                "利用者の --settings を消して上書きしない"
+            );
+            assert!(
+                mcp.warnings.iter().any(|w| w.contains("--settings")),
+                "{:?}",
+                mcp.warnings
+            );
         }
     }
 
@@ -780,7 +798,10 @@ mod tests {
     fn 足す一覧が空なら全部止める() {
         let u = users(&["github"]);
         assert_eq!(plan(&u, &BTreeSet::new(), &[]).denied, ["github"]);
-        assert_eq!(plan(&u, &BTreeSet::new(), &["  ".into()]).denied, ["github"]);
+        assert_eq!(
+            plan(&u, &BTreeSet::new(), &["  ".into()]).denied,
+            ["github"]
+        );
     }
 
     #[test]
@@ -861,7 +882,9 @@ mod tests {
         let dir = cfg.join("projects").join(project_slug(cwd));
         std::fs::create_dir_all(&dir).unwrap();
         let call = |name: &str| {
-            format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t","name":"{name}","input":{{}}}}]}}}}"#)
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t","name":"{name}","input":{{}}}}]}}}}"#
+            )
         };
         std::fs::write(
             dir.join("a.jsonl"),
@@ -871,7 +894,8 @@ mod tests {
                 call("mcp__tako__tako_list_panes"),
                 call("mcp__claude_ai_Gmail__search"),
                 // 結果の文字列の中（エスケープされた引用符）は数えない
-                r#"{"type":"user","message":{"content":"\"name\":\"mcp__github__x\""}}"#.to_string(),
+                r#"{"type":"user","message":{"content":"\"name\":\"mcp__github__x\""}}"#
+                    .to_string(),
             ]
             .join("\n"),
         )
@@ -898,7 +922,9 @@ mod tests {
         );
         // 窓の外（未来の時刻を起点）なら数えない
         let later = SystemTime::now() + Duration::from_secs(3600);
-        assert!(usage_evidence_in(&[("proj".into(), cwd.into())], &[cfg], &names, later).is_empty());
+        assert!(
+            usage_evidence_in(&[("proj".into(), cwd.into())], &[cfg], &names, later).is_empty()
+        );
     }
 
     /// 塊（4 MB）より長い行・塊の境目をまたぐ行・末尾に改行の無い行も数える
@@ -928,11 +954,29 @@ mod tests {
         )
         .unwrap();
         let rows = [
-            UsageRow { project: "a".into(), server: "playwright".into(), sessions: 1, calls: 1 },
-            UsageRow { project: "b".into(), server: "github".into(), sessions: 1, calls: 1 },
-            UsageRow { project: "zz".into(), server: "github".into(), sessions: 1, calls: 1 },
+            UsageRow {
+                project: "a".into(),
+                server: "playwright".into(),
+                sessions: 1,
+                calls: 1,
+            },
+            UsageRow {
+                project: "b".into(),
+                server: "github".into(),
+                sessions: 1,
+                calls: 1,
+            },
+            UsageRow {
+                project: "zz".into(),
+                server: "github".into(),
+                sessions: 1,
+                calls: 1,
+            },
         ];
-        assert_eq!(adopt_usage(&mut config, &rows), [("a".to_string(), "playwright".to_string())]);
+        assert_eq!(
+            adopt_usage(&mut config, &rows),
+            [("a".to_string(), "playwright".to_string())]
+        );
         assert!(adopt_usage(&mut config, &rows).is_empty());
         assert_eq!(config.projects["a"].mcp_servers, ["playwright"]);
         assert_eq!(config.projects["b"].mcp_servers, ["*"]);
