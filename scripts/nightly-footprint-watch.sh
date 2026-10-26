@@ -53,6 +53,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$ROOT/scripts/lib/tmux-socket.sh"
 PY="$ROOT/scripts/lib/footprint-watch.py"
 DIR="${TAKO_FOOTPRINT_WATCH_DIR:-$HOME/.claude-orchestrator/state/tako-footprint}"
 HISTORY="$DIR/history.tsv"
@@ -123,7 +124,7 @@ stop_job() {
   wait "$JOB_PID" 2>/dev/null || true
   # 計測の tmux サーバーは自分でセッションを分けるのでグループの外に居る。
   # 計測スクリプトのソケット名（tako-fp-<その pid>）で落とす（KILL で後片付けが走らなかったときの保険）
-  tmux -L "tako-fp-$JOB_PID" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "tako-fp-$JOB_PID"
   JOB_PID=""
 }
 

@@ -7,7 +7,7 @@
 //! 書いてある規約の機械化（同じ節の「`set -e` と EXIT trap を併用するなら番人を通す」= #1864 と
 //! 「`"$( … )"` の中のダブルクォートに `{…,…}` を置かない」= #1924・
 //! 「pipefail の下で早く抜ける読み手（`grep -q` / `head`）へパイプしない」= #1633 / #2272 も）と
-//! 「変数を使う rm は空で止める（Issue #2306）」。
+//! 「変数を使う rm は空で止める（Issue #2306）」と「検証スクリプトの器はソケットファイルまで消す（Issue #2399）」。
 
 use std::path::{Path, PathBuf};
 
@@ -4910,4 +4910,330 @@ fn 字句解析は単純コマンドとリダイレクトの行き先を読み�
     assert_eq!(risks("\"$a/x-$b\""), vec!["$a"]);
     assert!(risks("\"$a\"").is_empty());
     assert_eq!(rm_operand_risks("\"$a/x-$b\"").1, "/x-$b");
+}
+
+// ---------------------------------------------------------------------------
+// 検証スクリプトの器はソケットファイルまで消す（Issue #2399）
+// ---------------------------------------------------------------------------
+
+/// 器を落としてソケットファイルまで消す 1 実装（中の `kill-server` は検査しない = 中身そのもの）
+const TMUX_SOCKET_LIB: &str = "scripts/lib/tmux-socket.sh";
+
+/// その 1 実装の関数
+const TMUX_SOCKET_KILL: &str = "tmux_socket_kill";
+
+/// `kill-server` の後ろでソケットファイルを消す rm を探す範囲（後ろへ数える単純コマンドの数）
+const SOCKET_RM_WINDOW: usize = 3;
+
+/// ファイルの単純コマンドを（行, 語の原文）で並びの順に集める。
+/// `trap` / `tako_exit_trap` に渡した後始末の文字列は読み直して中のコマンドも並べる
+fn script_commands(src: &str) -> Vec<(usize, Vec<String>)> {
+    let chars: Vec<char> = src.chars().collect();
+    let line_of = |pos: usize| {
+        chars[..pos.min(chars.len())]
+            .iter()
+            .filter(|&&c| c == '\n')
+            .count()
+            + 1
+    };
+    let (text, origin) = join_continuations32(src);
+    let mut lx = WordLexer::new(&text);
+    lx.list(false);
+    // `x=$( … )` の中のコマンドは外側より後に読み終わるので、始まりの位置で並べ直す
+    let mut cmds: Vec<&LexCommand> = lx.commands.iter().collect();
+    cmds.sort_by_key(|c| c.start);
+    let mut out = Vec::new();
+    for cmd in cmds {
+        let line = line_of(origin.get(cmd.start).copied().unwrap_or(chars.len()));
+        if let Some((k, name @ ("trap" | "tako_exit_trap"))) = stage_command_name(&cmd.words) {
+            let mut args = cmd.words.iter().skip(k + 1).peekable();
+            if name == "trap" && args.peek().is_some_and(|a| *a == "--") {
+                args.next();
+            }
+            if let Some(action) = args.next() {
+                for (l, words) in script_commands(&shell_unquote(action)) {
+                    out.push((line + l - 1, words));
+                }
+            }
+            continue;
+        }
+        out.push((line, cmd.words.clone()));
+    }
+    out
+}
+
+/// tmux を呼ぶ単純コマンドなら、コマンド名より後ろの語（`tmux` / `/opt/…/tmux` /
+/// PATH を偽の tmux へ差し替えたスクリプトが本物を握る `"$REAL_TMUX"` / `"${REAL_TMUX:-tmux}"`）
+fn tmux_args(words: &[String]) -> Option<&[String]> {
+    let (k, name) = stage_command_name(words)?;
+    let bare = shell_unquote(name);
+    let is_tmux = bare == "tmux" || (bare.starts_with('$') && bare.contains("TMUX"));
+    is_tmux.then(|| &words[k + 1..])
+}
+
+/// `-L` に渡した器の名前（原文）
+fn tmux_socket_arg(args: &[String]) -> Option<&str> {
+    let i = args.iter().position(|a| a == "-L")?;
+    args.get(i + 1).map(String::as_str)
+}
+
+/// 語の中で展開している変数の名前（`$x` / `${x…}`。`$$` などの特殊変数は数えない）
+fn expanded_var_names(word: &str) -> Vec<String> {
+    let c: Vec<char> = word.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < c.len() {
+        if c[i] == '$' {
+            let start = if c.get(i + 1) == Some(&'{') {
+                i + 2
+            } else {
+                i + 1
+            };
+            let mut end = start;
+            while end < c.len()
+                && (c[end] == '_'
+                    || c[end].is_ascii_alphabetic()
+                    || (end > start && c[end].is_ascii_digit()))
+            {
+                end += 1;
+            }
+            if end > start {
+                out.push(c[start..end].iter().collect());
+            }
+            i = end.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 器を起こす印の行（`TAKO_PERSIST=<真>` を渡して GUI を起こす / `tmux -L … new-session`）。
+/// 隔離 GUI は `TAKO_PERSIST` を渡さなければ器を作らない（#1979 = `TAKO_ISOLATED` の既定 OFF）ので、
+/// 印の無いスクリプトの `kill-server` は空振りの念押しで、ソケットファイルも生まれない
+fn tmux_server_starts(cmds: &[(usize, Vec<String>)]) -> Vec<usize> {
+    cmds.iter()
+        .filter(|(_, words)| {
+            let persist = words.iter().any(|w| {
+                shell_unquote(w)
+                    .strip_prefix("TAKO_PERSIST=")
+                    .is_some_and(|v| !matches!(v, "" | "0" | "false" | "off"))
+            });
+            let new_session = tmux_args(words).is_some_and(|a| {
+                tmux_socket_arg(a).is_some() && a.iter().any(|w| w == "new-session" || w == "new")
+            });
+            persist || new_session
+        })
+        .map(|(line, _)| *line)
+        .collect()
+}
+
+/// その単純コマンドが `-L` に `sock` を渡した器のソケットファイルを消す rm か
+/// （ソケットの置き場 `tmux-$(id -u)` を名指すか、器の名前の変数をすべて使っている）
+fn removes_socket_file(words: &[String], sock: &str) -> bool {
+    if stage_command_name(words).is_none_or(|(_, name)| name != "rm") {
+        return false;
+    }
+    let sock_vars = expanded_var_names(sock);
+    words.iter().skip(1).any(|w| {
+        let vars = expanded_var_names(w);
+        w.contains("tmux-") || (!sock_vars.is_empty() && sock_vars.iter().all(|v| vars.contains(v)))
+    })
+}
+
+/// 監査済みの例外宣言 `# tako:tmux-socket-ok <理由>`（違反行か直前の行。理由の無い宣言は無効）
+fn tmux_socket_exception(lines: &[&str], line_no: usize) -> bool {
+    let has = |l: &str| {
+        l.split("tako:tmux-socket-ok")
+            .nth(1)
+            .is_some_and(|reason| !reason.trim().is_empty())
+    };
+    let at = |n: usize| n.checked_sub(1).and_then(|i| lines.get(i)).copied();
+    at(line_no).is_some_and(has) || at(line_no.wrapping_sub(1)).is_some_and(has)
+}
+
+/// 1 ファイルぶんの検査: 器を起こすか（印の数）と違反（file:line で名指しする文言）
+fn tmux_socket_scan(rel: &str, src: &str) -> (usize, Vec<String>) {
+    if rel == TMUX_SOCKET_LIB {
+        return (0, Vec::new());
+    }
+    let cmds = script_commands(src);
+    let starts = tmux_server_starts(&cmds);
+    let Some(&first_start) = starts.first() else {
+        return (0, Vec::new());
+    };
+    let lines: Vec<&str> = src.lines().collect();
+    let text = |line: usize| lines.get(line - 1).map_or("", |l| l.trim());
+    let mut out = Vec::new();
+    let mut cleanups = 0usize;
+    for (i, (line, words)) in cmds.iter().enumerate() {
+        if stage_command_name(words).is_some_and(|(_, name)| name == TMUX_SOCKET_KILL) {
+            cleanups += 1;
+            continue;
+        }
+        let Some(args) = tmux_args(words) else {
+            continue;
+        };
+        let Some(sock) = tmux_socket_arg(args) else {
+            continue;
+        };
+        if !args.iter().any(|w| w == "kill-server") {
+            continue;
+        }
+        cleanups += 1;
+        if tmux_socket_exception(&lines, *line) {
+            continue;
+        }
+        let removed = cmds[i + 1..]
+            .iter()
+            .take(SOCKET_RM_WINDOW)
+            .any(|(_, w)| removes_socket_file(w, sock));
+        if !removed {
+            out.push(format!(
+                "{rel}:{line}: 器 {sock} を kill-server で落としたがソケットファイルを消していない \
+                 → {TMUX_SOCKET_KILL} {sock} で書く: {}",
+                text(*line)
+            ));
+        }
+    }
+    if cleanups == 0 {
+        out.push(format!(
+            "{rel}:{first_start}: 器を起こしているのにどこでも落としていない \
+             → 後片付け（EXIT の trap）で {TMUX_SOCKET_KILL} <器の名前> を呼ぶ: {}",
+            text(first_start)
+        ));
+    }
+    (starts.len(), out)
+}
+
+#[test]
+fn 器を起こすスクリプトはソケットファイルまで消す() {
+    let root = repo_root();
+    let lib = std::fs::read_to_string(root.join(TMUX_SOCKET_LIB)).expect("1 実装が実在する");
+    assert!(
+        lib.contains(&format!("{TMUX_SOCKET_KILL}() {{")),
+        "{TMUX_SOCKET_LIB} が {TMUX_SOCKET_KILL} を定義していない（番犬が案内する先が無い）"
+    );
+    let mut violations: Vec<String> = Vec::new();
+    let mut starting = 0usize;
+    for path in shell_scripts() {
+        let src = std::fs::read_to_string(&path).expect("読める .sh");
+        let rel = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let (starts, v) = tmux_socket_scan(&rel, &src);
+        starting += usize::from(starts > 0);
+        violations.extend(v);
+    }
+    // 走査そのものが空振りしていない（#2399 の時点で器を起こすスクリプトは 40 本）
+    assert!(
+        starting >= 30,
+        "器を起こすスクリプトを {starting} 本しか拾えない（走査の形が実装とずれている）"
+    );
+    assert!(
+        violations.is_empty(),
+        "検証スクリプトが起こした器を kill-server で落とした後、ソケットファイルを消していない（#2399。\n\
+         tmux は kill-server の後も（最後のセッションが閉じて自分で抜けても）\n\
+         $TMUX_TMPDIR/tmux-<uid>/<名前> を残すので、走るたびに 1 個ずつたまる。\n\
+         `. \"$REPO_ROOT/{TMUX_SOCKET_LIB}\"` を読み、`{TMUX_SOCKET_KILL} <器の名前>` で落とす。\n\
+         EXIT の trap の後片付けに置けば途中で落ちた経路でも片付く。\n\
+         .agent/conventions.md「検証スクリプトの器はソケットファイルまで消す」節。\n\
+         監査して確かめた箇所だけ、その行か直前の行に `# tako:tmux-socket-ok <理由>` で外せる）:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn 番犬は器を落としてソケットファイルを残す形をfile_lineで名指しする() {
+    let v = |body: &str| tmux_socket_scan("scripts/x.sh", body).1;
+    let one = |body: &str| -> String {
+        let got = v(body);
+        assert_eq!(got.len(), 1, "{body:?} → {got:?}");
+        got[0].clone()
+    };
+    let gui = "launch_isolated_gui \"$TMP/app.log\" TAKO_PERSIST=1\n";
+    // 文言: file:line・器の名前・直し方
+    assert!(one(&format!(
+        "cleanup() {{\n  tmux -L \"$SOCKET\" kill-server 2>/dev/null\n}}\ntrap cleanup EXIT\n{gui}"
+    ))
+    .starts_with(
+        "scripts/x.sh:2: 器 \"$SOCKET\" を kill-server で落としたがソケットファイルを消していない \
+         → tmux_socket_kill \"$SOCKET\" で書く"
+    ));
+    // 器を起こす印の書き方を問わない（引数・クォート・export・前置の代入・変数・tmux の new-session）
+    for start in [
+        "launch_isolated_gui \"$log\" TAKO_PERSIST=1",
+        "launch_isolated_gui \"$log\" \"TAKO_PERSIST=1\"",
+        "launch_isolated_gui \"$log\" TAKO_PERSIST=\"$persist\"",
+        "export TAKO_PERSIST=1",
+        "TAKO_PERSIST=1 \"$APP_BIN\" &",
+        "env TAKO_PERSIST=on \"$APP_BIN\"",
+        "tmux -L \"$S\" -f /dev/null new-session -d -s x",
+        "\"$REAL_TMUX\" -L \"$S\" new -d",
+    ] {
+        one(&format!("{start}\ntmux -L \"$S\" kill-server\n"));
+    }
+    // 落とし方の書き方を問わない（本物を握る変数・条件・ループ・後始末の文字列・置換の中）
+    for kill in [
+        "\"${REAL_TMUX:-tmux}\" -L \"tako-1989-$$\" kill-server >/dev/null 2>&1 || true",
+        "[ -n \"$S\" ] && tmux -L \"$S\" kill-server",
+        "for s in $SOCKETS; do tmux -L \"$s\" kill-server; done",
+        "trap 'tmux -L \"$S\" kill-server' EXIT",
+        "out=\"$(tmux -L \"$S\" kill-server 2>&1)\"",
+        "/opt/homebrew/bin/tmux -L x kill-server",
+    ] {
+        one(&format!("{gui}{kill}\n"));
+    }
+    // 起こすのに落とさない
+    assert!(one(gui).starts_with(
+        "scripts/x.sh:1: 器を起こしているのにどこでも落としていない → 後片付け（EXIT の trap）で tmux_socket_kill"
+    ));
+
+    // 名指さない形: 1 実装で落とす・直後に置き場のファイルを消す・器を起こさない
+    for body in [
+        format!("{gui}cleanup() {{ tmux_socket_kill \"$SOCKET\"; }}\n"),
+        format!("{gui}tmux_socket_kill \"t2020-new-$$\" \"t2020-legacy-$$\"\n"),
+        format!(
+            "{gui}tmux -L \"$S\" kill-server >/dev/null 2>&1 || true\n\
+             rm -f \"${{TMUX_TMPDIR:-/tmp}}/tmux-$(id -u)/${{S:?}}\"\n"
+        ),
+        format!(
+            "{gui}for name in a b; do\n  tmux -L \"$name\" kill-server\n  rm -f \"$sockdir/$name\"\ndone\n"
+        ),
+        "launch_isolated_gui \"$log\" TAKO_PERSIST=0\ntmux -L \"$S\" kill-server\n".to_string(),
+        "export TAKO_PERSIST=0\ntmux -L \"$S\" kill-server\n".to_string(),
+        "tmux -L \"$S\" kill-server\n".to_string(),
+        format!("{gui}echo \"TAKO_PERSIST=1\" ; tmux_socket_kill x\n"),
+        format!("{gui}# tmux -L \"$S\" kill-server\ntmux_socket_kill \"$S\"\n"),
+    ] {
+        assert_eq!(v(&body), Vec::<String>::new(), "{body}");
+    }
+    // 別の器・別の物を消す rm は消したことにしない
+    one(&format!(
+        "{gui}tmux -L \"$S\" kill-server\nrm -rf \"$TMP\"\n"
+    ));
+    one(&format!(
+        "{gui}tmux -L \"t2020-$arm-$$\" kill-server\nrm -rf \"$TMP/out-$x\"\n"
+    ));
+    // 例外宣言は理由つきのときだけ効く（その行か直前の行）
+    assert!(v(&format!(
+        "{gui}# tako:tmux-socket-ok 残骸の検出を確かめるためにわざと残す\ntmux -L \"$S\" kill-server\n"
+    ))
+    .is_empty());
+    assert_eq!(
+        v(&format!(
+            "{gui}# tako:tmux-socket-ok\ntmux -L \"$S\" kill-server\n"
+        ))
+        .len(),
+        1
+    );
+    // 1 実装そのものは数えない
+    assert!(tmux_socket_scan(
+        TMUX_SOCKET_LIB,
+        &format!("{gui}out=\"$(tmux -L \"$name\" kill-server 2>&1)\"\n")
+    )
+    .1
+    .is_empty());
 }

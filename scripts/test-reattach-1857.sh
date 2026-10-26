@@ -33,6 +33,7 @@ set -uo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAKO_MCP_URL
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 ONLY="${ONLY:-}"
 PASS=0
 FAIL=0
@@ -48,9 +49,7 @@ APP_PID=""
 TMUX_SOCKET="tako-1857-$$"
 cleanup() {
   stop_isolated_gui "$APP_PID"
-  tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-  # tmux は kill-server の後もソケットファイルを残すことがある（自分の名前のものだけ消す）
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}"
+  tmux_socket_kill "$TMUX_SOCKET"
   if [ -n "${KEEP:-}" ]; then echo "（KEEP: $TMP を残した）"; else rm -rf "$TMP"; fi
 }
 trap cleanup EXIT
@@ -95,7 +94,7 @@ start_app() {
 stop_app() {
   stop_isolated_gui "$APP_PID"
   APP_PID=""
-  tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$TMUX_SOCKET"
   sleep 1
 }
 

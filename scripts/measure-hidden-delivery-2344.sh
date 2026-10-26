@@ -25,6 +25,7 @@ set -uo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 SECS="${1:-20}"
 ROUNDS="${2:-2}"
 KIND="${3:-lines}"
@@ -36,7 +37,7 @@ cleanup() {
   stop_isolated_gui "${ISOLATED_GUI_PID:-}"
   local s
   for s in $SOCKETS; do
-    tmux -L "$s" kill-server >/dev/null 2>&1 || true
+    tmux_socket_kill "$s"
   done
   rm -rf "${TMP:?}"
 }
@@ -146,7 +147,7 @@ print(f"  {label:<10} 出力起因の再描画の要求（全体） {(f1 - f0) /
 PY
   stop_isolated_gui "$ISOLATED_GUI_PID"
   ISOLATED_GUI_PID=""
-  tmux -L "$sock" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$sock"
   sleep 3
 }
 

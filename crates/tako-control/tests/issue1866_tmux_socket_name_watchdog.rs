@@ -68,6 +68,7 @@
 //! |---|---|---|
 //! | 既存のセッションへのグループ（`new-session -t`） | `new-session -d -t orig -s view` | 相手のセッションがある = 器は手前で起きている |
 //! | 引数の検査（`for` / 器を叩かない `assert`） | `for forbidden in ["new-session", …]` | 器を起こさない |
+//! | 比べるだけの字面（`==` / `!=`） | `w == "kill-server"`（#2399 の `shell_scripts.rs`） | 語を見分けるだけで器を叩かない |
 //! | 名前を辿れない式 | 関数の引数・`self.socket`・`socket_for("1259")` | 定義側で見る（`socket_for` は `tmux_e2e_watchdog.rs`） |
 //!
 //! ## #2393: 器を落としたらソケットファイルまで消す
@@ -678,6 +679,9 @@ fn bound_conf(src: &TestSource, start: usize, stmt: &str) -> bool {
 
 /// `"new-session"` の位置 `at` の文が `-f` なしで器を起こしていれば、その文の頭の 1 行
 fn missing_conf(src: &TestSource, at: usize) -> Option<String> {
+    if is_comparison(&src.lit[..at]) {
+        return None;
+    }
     let (start, end) = statement_around(src.code.as_bytes(), at);
     let stmt = &src.lit[start..end];
     if stmt.contains("\"-f\"")
@@ -846,6 +850,16 @@ const WINDOWS_ONLY: &str = "#![cfg(windows)]";
 /// 文字列をシェルへ打ち込む呼び出し（この文の中の `-L <器> … kill-server` だけが器を落とす）
 const SHELL_RUNNERS: &[&str] = &["type_text(", "send_line(", "send_keys("];
 
+/// 字面を `==` / `!=` で比べているだけか（`w == "kill-server"`。語を見分ける検査で器は叩かない。
+/// #2399 の番犬 `shell_scripts.rs` がシェルの単純コマンドの語をこの形で見分ける）
+fn is_comparison(before_literal: &str) -> bool {
+    let b = before_literal
+        .strip_suffix('"')
+        .unwrap_or(before_literal)
+        .trim_end();
+    b.ends_with("==") || b.ends_with("!=")
+}
+
 /// 器へ `kill-server` を渡す位置（字面の `"kill-server"` と、シェルへ打ち込む文字列の
 /// `-L <器> … kill-server`）。検査の文（`assert!(!body.contains("kill-server"))`）・
 /// 文言の中の `\"kill-server\"`・打ち込まない文字列（失敗の文言・偽のプロセス一覧）は数えない
@@ -855,7 +869,10 @@ fn kill_server_sites(src: &TestSource) -> Vec<usize> {
     for (at, _) in src.lit.match_indices(WORD) {
         let before = &src.lit[..at];
         if before.ends_with('"') {
-            if before.ends_with("\\\"") || !src.lit[at + WORD.len()..].starts_with('"') {
+            if before.ends_with("\\\"")
+                || !src.lit[at + WORD.len()..].starts_with('"')
+                || is_comparison(before)
+            {
                 continue;
             }
             let (start, end) = statement_around(src.code.as_bytes(), at);
@@ -1297,5 +1314,24 @@ fn e(sock: &str) {
             removal_lines(text),
             vec![(3, false), (12, true), (16, false)]
         );
+    }
+
+    #[test]
+    fn 比べるだけの字面は器を叩く位置に数えない() {
+        // #2399: shell_scripts.rs の番犬はシェルの語を `w == "kill-server"` の形で見分ける。
+        // 比べるだけの字面（a）は器を落とす / 起こす位置に数えず、叩く形（b / c）は今までどおり名指す
+        let text = r#"
+fn a(args: &[String]) -> bool {
+    args.iter().any(|w| w == "kill-server") || args.iter().any(|w| w != "new-session")
+}
+fn b(bin: &str, socket: &str) {
+    let _ = Command::new(bin).args(["-L", socket, "kill-server"]).output();
+}
+fn c(bin: &str, socket: &str) {
+    let _ = Command::new(bin).args(["-L", socket, "new-session"]).output();
+}
+"#;
+        assert_eq!(removal_lines(text), vec![(6, true)]);
+        assert_eq!(conf_lines(text), vec![9]);
     }
 }

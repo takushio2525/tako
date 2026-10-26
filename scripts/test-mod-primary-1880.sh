@@ -33,6 +33,7 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAK
 unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID CLAUDECODE
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 ONLY="${ONLY:-}"
 PASS=0
 FAIL=0
@@ -71,8 +72,7 @@ cleanup() {
   # 止めた claude は戻してから落とす（SIGSTOP のまま残さない）
   if [ -n "$CLAUDE_PID" ]; then kill -CONT "$CLAUDE_PID" >/dev/null 2>&1 || true; fi
   stop_isolated_gui "$APP_PID"
-  tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}"
+  tmux_socket_kill "$TMUX_SOCKET"
   if [ "$INLINE_EXISTED" = 0 ] && [ -d "$INLINE_DATA" ]; then
     rmdir "$INLINE_DATA" 2>/dev/null || true
   fi
@@ -427,7 +427,7 @@ for r in d.get("panes", []):
     fail "再起動後に生き残った送り手の報告が届かない"
   fi
   stop_app
-  tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$TMUX_SOCKET"
 }
 
 # --- claude: 実 claude（statusLine なし）-------------------------------------------

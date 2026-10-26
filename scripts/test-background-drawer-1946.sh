@@ -29,6 +29,7 @@ set -uo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 PASS=0
 FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
@@ -39,7 +40,7 @@ DUMP_ROOT="${1:-$TMP/dump}"
 SOCKET="tako-1946v-$$"
 cleanup() {
   stop_isolated_gui "${ISOLATED_GUI_PID:-}"
-  tmux -L "$SOCKET" kill-server 2>/dev/null
+  tmux_socket_kill "$SOCKET"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -89,7 +90,7 @@ run_section() {
   done
   stop_isolated_gui "$pid"
   # 節が残した器（隔離ソケットのサーバー）を次の腕へ持ち越さない
-  tmux -L "$SOCKET" kill-server 2>/dev/null
+  tmux_socket_kill "$SOCKET"
   return 0
 }
 

@@ -35,6 +35,7 @@ unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_UR
 export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 ONLY="${ONLY:-}"
 SECS="${SECS:-60}"
 PASS=0
@@ -64,8 +65,7 @@ mask() { sed -e "s#${REAL_HOME}#~#g" -e "s#${MASK_USER}#<user>#g" -e "s#${TMP}#<
 cleanup() {
   [ -n "$LOAD_PID" ] && kill "$LOAD_PID" 2>/dev/null
   stop_isolated_gui "$APP_PID"
-  tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}"
+  tmux_socket_kill "$TMUX_SOCKET"
   [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null
   if [ -n "${KEEP:-}" ]; then echo "（KEEP: <tmp> を残した）"; else rm -rf "$TMP"; fi
 }
@@ -230,7 +230,7 @@ stop_app() {
   stop_isolated_gui "$APP_PID"
   APP_PID=""
   # 器ごと claude を落とす（次の腕は新しい claude で同じ条件にする）
-  tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$TMUX_SOCKET"
   sleep 1
 }
 

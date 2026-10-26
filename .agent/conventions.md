@@ -2051,6 +2051,25 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     素の上限（30 秒）は旧の固定窓（10 秒 / 20 秒）より広く採る（#771 と同じ理由）
   - 番犬 `issue1308_pty_wait_watchdog` が、実 PTY を張るテスト
     （`TerminalSession::spawn(` を持つ関数）の自前の固定窓を `file:line` で落とす
+  - **fixture は開発者のログインシェルを経由させない**（10/25 の再発）。状態待ちに寄せた後も、
+    手元の高負荷（load 11〜18 / 18 コア）で予算 約 47 秒を使い切って落ちた（全体 51.6 秒・
+    通常は 4〜5 秒 = **1 秒の処理が 47 倍**。同じ機の自然な負荷 load 7〜42 の 8 回は
+    プロンプト 0.6〜1.0 秒 = 予算に 50 倍の余裕。load だけでは説明がつかず、予算の伸ばし方を
+    変えても届かない）。`$SHELL -l` は rc を全部読み外部コマンドを幾つも起こす（実測: 対話
+    ログイン zsh 0.6 秒 / 素の `/bin/sh -c` 5 ms 未満）うえ、「プロンプト → 打鍵の受け付け →
+    描画」の 3 段を経る。CI のシェルは素なので緑のまま手元でしか落ちない。主題に要るのは
+    画面の絵だけなので、POSIX は描画のコマンドを `/bin/sh -c` で直接起こし
+    （`i1308_direct_options`）、待つ状態を「描かれた」の 1 つにした（PowerShell は打ち込む
+    経路のまま）。A/B は `TAKO_1308_TYPED=1`（10/25 までの打ち込む経路）。注入
+    `TAKO_1308_INJECT=stuck`（ログインシェルが上がらない）/ `deaf`（プロンプトは出るが
+    打鍵が実行されない）は打ち込む経路だけを落とし、`blank`（直接経路で描かない）は
+    上限で**落ちる**ことを見る。番犬 `issue1308の現場はposixでログインシェルを経由しない`
+  - **失敗文の値は見出しの 1 行に全部載せる**（10/25 の再発）。値を 2 行目に置いていたので、
+    `grep` で `panicked at` の行だけを残した報告から waited / budget / load が消え、見立てが
+    割れた。今は `TAKO_1308_WAIT:` の行に waited / budget / base / 混み具合（始まり→終わり）/
+    load 3 値 / メモリ圧 / swap / 送った数 / 画面の変化の数 / 最後に画面が動いた時刻を載せ、
+    続けて年表（画面の変化と送った時刻）と画面を出す。「遅かった（画面は進んでいた）」と
+    「止まっていた（画面が動かなかった）」が失敗文だけで分かれる
 - **background の重い処理の戻りを回数の窓で待たない**（#1890）。visual-test 節
   `large-file-decor` / `large-file-edit`（#1660）は、読み取り表示の塗りと編集開始の全文の塗り
   （どちらも background の syntect）を `for _ in 0..3000 { 10ms 待って描く }` / `0..6000` で
@@ -3110,6 +3129,46 @@ rm -rf "$(git rev-parse --show-toplevel)/target"   # ✗ コマンド置換は�
 `/bin` を消す形だった）。`release.sh` の 4 か所は展開だけの引数（空でも何も消さない）で番犬は求めないが、
 Issue の名指しどおり `${var:?}` にした。PowerShell の `Remove-Item` は 5 か所とも `-LiteralPath $x`
 だけで、空なら引数の束縛で止まる（同型 0）。
+
+## 検証スクリプトの器はソケットファイルまで消す（Issue #2399）
+
+tmux（3.6b で実測）は `kill-server` で落としても、最後のセッションが閉じて**自分で抜けても**
+`$TMUX_TMPDIR/tmux-<uid>/<名前>` のソケットファイルを残す。`kill-server` だけの後片付けは走るたびに
+1 個ずつためる（Rust のテストの側は #2393 の節 = `tmux_backend::kill_server`）。検証スクリプトは
+1 実装 `scripts/lib/tmux-socket.sh` の `tmux_socket_kill <名前>...` で器とファイルを一緒に片付ける:
+
+```bash
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"     # trap より前に読む（途中で落ちても関数がある）
+cleanup() { stop_isolated_gui "$PID"; tmux_socket_kill "$SOCKET"; rm -rf "${TMP:?}"; }
+trap cleanup EXIT
+```
+
+- 空の名前は何もしない（器を起こす前に後片付けが走った = 正常）。`tako`（本番の器）・`default`・
+  `/` を含む名前は触らずに stderr へ 1 行
+- ファイルを消すのは「落とせた（0）」か「もう居ない（`no server running`）」のときだけ。繋げない
+  （`Permission denied`・版の食い違い）なら器が生きているかもしれないので**残す**（消すと名前で
+  辿れない器になり、`tako tmux cleanup --servers` からも見えなくなる）
+- tmux は `REAL_TMUX`（PATH を偽の tmux へ差し替えたスクリプトが本物を握る変数）→ `tmux` の順。常に 0 を返す
+
+**番犬**: `shell_scripts.rs` の `器を起こすスクリプトはソケットファイルまで消す`。**器を起こす印**
+（`TAKO_PERSIST=<真>` を GUI へ渡す / `tmux -L … new-session`）のある `.sh` だけを見て、
+`tmux -L <器> … kill-server`（`"$REAL_TMUX"` / 条件 / ループ / `trap` の文字列 / `$( … )` の中も）を
+file:line で名指す。後ろ 3 コマンド以内でソケットの置き場（`tmux-$(id -u)`）か器の名前の変数を使う rm が
+あれば通す（#2350 / #2367 の自前の形）。起こすのにどこでも落とさないファイルも名指す。監査して
+確かめた箇所だけ、その行か直前の行に `# tako:tmux-socket-ok <理由>` で外せる。
+印の無いスクリプトは見ない: 隔離 GUI は `TAKO_PERSIST` を渡さなければ器を作らない
+（`TAKO_ISOLATED` の既定 = `TAKO_PERSIST=0`・#1979）ので、その `kill-server` は空振りの念押し。
+1 実装の振る舞い（消す / 残すの分かれ目・本物の tmux での trap の経路）は
+`crates/tako-control/tests/issue2399_tmux_socket_kill.rs`（本物の tmux の 2 本は #2106 の門を通す）。
+
+#2399 の棚卸し（`kill-server` を含む `.sh` は 136 本）: 器を起こすのは 40 本。そのうち 32 本・47 か所が
+ファイルを残す形だった（27 本は後片付けの trap ごと残す・5 本は途中の腕の切り替えだけで、最後は自前の rm が
+消していた）。残骸として見えていたのは `tako tmux cleanup --servers` が拾わない名前の `t2009-*`
+（`test-preview-memory-2009.sh`）・`t2020-*`（`test-sessions-write-2020.sh`）だけで、`tako-*` の名前
+（`tako-fp-*` = `measure-footprint-2011.sh` ほか）は製品の掃除が後から消していたので隠れていた。
+`nightly-footprint-watch.sh` は器を起こさない（子の `measure-footprint-2011.sh` が起こす）ので番犬の
+対象外だが、子を KILL したときの保険の `kill-server` も同じ 1 実装へ寄せた。残りの 96 本は印が無い。
 
 ## `.app` の差し替えは置き場のパスを空けない（Issue #1042）
 
