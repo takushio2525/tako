@@ -49,7 +49,7 @@ pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  [NG] $1"; }
 check() { if [ "$1" = "1" ]; then pass "$2"; else fail "$2"; fi; }
 check_eq() {
-  if [ "$2" = "$3" ]; then pass "$1（$3）"; else fail "$1（期待 '${2}' / 実際 '${3}'）"; fi
+  if [ "${2}" = "${3}" ]; then pass "${1}（${3}）"; else fail "${1}（期待 '${2}' / 実際 '${3}'）"; fi
 }
 
 for bin in tmux zsh python3 perl; do
