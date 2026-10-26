@@ -35987,7 +35987,7 @@ mod tests {
         let mut launched: Vec<(u64, Duration)> = Vec::new();
         let mut max_starting = 0usize;
         while launched.len() < panes.len() && resumed.elapsed() < Duration::from_secs(10) {
-            let at = resumed.elapsed();
+            let tick_at = resumed.elapsed();
             gate::tick(&mut host);
             let new: Vec<u64> = host
                 .command_flows
@@ -35995,7 +35995,7 @@ mod tests {
                 .skip(launched.len())
                 .map(|(p, _)| p.as_u64())
                 .collect();
-            launched.extend(new.into_iter().map(|p| (p, at)));
+            launched.extend(new.into_iter().map(|p| (p, tick_at)));
             let starting = gate::status_section()["starting"]
                 .as_array()
                 .map_or(0, |a| a.iter().filter(|s| s["kind"] == "restore").count());
