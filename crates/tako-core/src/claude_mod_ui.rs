@@ -2404,8 +2404,8 @@ impl UiText {
             (Self::HotkeyRule, En) => "one digit or one lowercase letter (no duplicates; \
                  when omitted, a free letter is chosen)"
                 .into(),
-            (Self::NoDataDir, Ja) => "データディレクトリが決まらない（HOME が無い）".into(),
-            (Self::NoDataDir, En) => "cannot determine the data directory (HOME is not set)".into(),
+            (Self::NoDataDir, Ja) => crate::paths::NoDataDir.text_in(Ja).into(),
+            (Self::NoDataDir, En) => crate::paths::NoDataDir.text_in(En).into(),
             (Self::Heading { path }, Ja) => format!("Claude Code の画面の UI（tako mod）: {path}"),
             (Self::Heading { path }, En) => format!("Claude Code screen UI (tako mod): {path}"),
             (Self::StateAbsent, Ja) => "（ファイルは無い = 既定で動いている）".into(),

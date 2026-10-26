@@ -231,6 +231,30 @@ fn display_follows_the_display_language() {
             Preset::Minimal.describe(),
             Preset::Minimal.describe_in(lang)
         );
+        // #2365 の続き: tako mod（status / on / off / band / install）の枠・理由の文・置き場の断りも
+        // 同じグローバルを引く（MCP の応答と CLI の表示はこの表示）
+        for (t, _) in mod_text_table() {
+            assert_eq!(t.to_string(), t.text_in(lang), "{t:?} / {lang:?}");
+        }
+        for (r, _) in off_reason_table() {
+            assert_eq!(r.describe(), r.describe_in(lang), "{r:?} / {lang:?}");
+        }
+        for (c, _) in no_report_table() {
+            assert_eq!(c.describe(), c.describe_in(lang), "{c:?} / {lang:?}");
+        }
+        for (e, _) in install_error_table() {
+            assert_eq!(e.to_string(), e.text_in(lang), "{e:?} / {lang:?}");
+        }
+        for (c, _, _) in conflict_table() {
+            assert_eq!(c.describe(), c.describe_in(lang), "{c:?} / {lang:?}");
+        }
+        for (b, _) in blocked_table() {
+            assert_eq!(b.describe(), b.describe_in(lang), "{b:?} / {lang:?}");
+        }
+        assert_eq!(
+            tako_core::paths::NoDataDir.to_string(),
+            tako_core::paths::NoDataDir.text_in(lang)
+        );
         // dispatch は tako-core の断りを `op_err`（= `Operation(e.to_string())`）で包む。
         // 包んだ表示は理由の文そのもの（前置きは足さない）で、表示言語は 1 つにそろう
         for e in workspace_samples() {
@@ -3566,5 +3590,699 @@ fn mod_ui_の選べる値と排他の断りは1つの応答の中で同じ言語
         assert_eq!(run.text_in(Lang::Ja), old);
         let shown = E::Operation(run.text_in(Lang::En)).text_in(Lang::En);
         assert!(has_japanese(&shown).is_none(), "{shown}");
+    }
+}
+
+// --- #2365 の続き: tako mod（status / on / off / band / install / uninstall）の枠と理由 -----------
+//
+// `tako mod band on|off` の応答は `tako mod`（status）の応答そのものに `applies_to` を足した形なので、
+// 同じ応答に載る文（注入しない理由 `OffReason`・報告の無い理由 `NoReportCause`・展開の失敗
+// `InstallError`・skills の衝突 `Conflict`・置かない理由 `Blocked` / `WriteRefused`・置き場が決まらない
+// `paths::NoDataDir`・枠と CLI の表示 `claude_mod::text::ModText`）をまとめて見る。どれも (バリアント, 言語)
+// の網羅 match で、落ちたら日英の対を書いたソースの行（`file:line`）を名指しする
+
+use tako_control::claude_mod::text::ModText;
+use tako_core::claude_mod::{InstallError, NoReportCause, OffReason};
+use tako_core::claude_mod_install::{Blocked, Conflict, WriteRefused};
+
+const CORE_MOD_SRC: &str = include_str!("../../tako-core/src/claude_mod.rs");
+const CORE_MOD_PATH: &str = "crates/tako-core/src/claude_mod.rs";
+const CORE_MOD_INSTALL_SRC: &str = include_str!("../../tako-core/src/claude_mod_install.rs");
+const CORE_MOD_INSTALL_PATH: &str = "crates/tako-core/src/claude_mod_install.rs";
+const PATHS_SRC: &str = include_str!("../../tako-core/src/paths.rs");
+const PATHS_PATH: &str = "crates/tako-core/src/paths.rs";
+const CONTROL_MOD_SRC: &str = include_str!("../src/claude_mod.rs");
+const CONTROL_MOD_PATH: &str = "crates/tako-control/src/claude_mod.rs";
+
+/// バリアントの無い型（`NoDataDir` / `WriteRefused`）の `text_in` で、言語の腕（`Ja =>` / `(Self, Ja) =>`）が
+/// 始まる行（1 始まり）
+fn lang_arm_line(src: &str, from: &str, lang: Lang) -> Option<usize> {
+    let token = match lang {
+        Lang::Ja => "Ja",
+        Lang::En => "En",
+    };
+    let lines: Vec<&str> = src.lines().collect();
+    let start = lines.iter().position(|l| l.contains(from))?;
+    let marks = [format!(" {token} =>"), format!(", {token}) =>")];
+    (start..lines.len())
+        .find(|&i| marks.iter().any(|m| lines[i].contains(m.as_str())))
+        .map(|i| i + 1)
+}
+
+fn plain_case(
+    debug: String,
+    text: impl Fn(Lang) -> String,
+    (src, path, from): (&'static str, &'static str, &'static str),
+    old_ja: String,
+) -> FrameCase {
+    FrameCase {
+        debug,
+        ja: text(Lang::Ja),
+        en: text(Lang::En),
+        old_ja,
+        at: Box::new(move |lang| match lang_arm_line(src, from, lang) {
+            Some(line) => format!("{path}:{line}"),
+            None => format!("{path}（{from} の {lang:?} の腕が見つからない）"),
+        }),
+    }
+}
+
+fn off_reason_index(r: &OffReason) -> usize {
+    match r {
+        OffReason::AbOff => 0,
+        OffReason::Disabled => 1,
+        OffReason::NotInstalled => 2,
+        OffReason::NoCli => 3,
+        OffReason::ClaudeUnknown => 4,
+        OffReason::ClaudeTooOld(_) => 5,
+        OffReason::NameConflict(_) => 6,
+        OffReason::UserDisabled => 7,
+    }
+}
+const OFF_REASON_VARIANTS: usize = 8;
+
+fn no_report_index(c: &NoReportCause) -> usize {
+    match c {
+        NoReportCause::SafeMode => 0,
+        NoReportCause::Bare => 1,
+        NoReportCause::BeforeInjection => 2,
+        NoReportCause::NotLoaded => 3,
+        NoReportCause::Undetermined => 4,
+    }
+}
+const NO_REPORT_VARIANTS: usize = 5;
+
+fn install_error_index(e: &InstallError) -> usize {
+    match e {
+        InstallError::NoDataDir => 0,
+        InstallError::CreateRoot { .. } => 1,
+        InstallError::Write(_) => 2,
+        InstallError::Replace(_) => 3,
+    }
+}
+const INSTALL_ERROR_VARIANTS: usize = 4;
+
+fn conflict_index(c: &Conflict) -> usize {
+    match c {
+        Conflict::UserSkillsDir { .. } => 0,
+        Conflict::ModifiedCopy => 1,
+        Conflict::SkillsSameName { .. } => 2,
+        Conflict::InstalledPlugin { .. } => 3,
+        Conflict::EnabledPlugin { .. } => 4,
+    }
+}
+const CONFLICT_VARIANTS: usize = 5;
+
+fn blocked_index(b: &Blocked) -> usize {
+    match b {
+        Blocked::Refused(_) => 0,
+        Blocked::Legacy => 1,
+        Blocked::Disabled => 2,
+        Blocked::ClaudeUnknown => 3,
+        Blocked::ClaudeTooOld(_) => 4,
+    }
+}
+const BLOCKED_VARIANTS: usize = 5;
+
+fn mod_text_index(t: &ModText) -> usize {
+    match t {
+        ModText::AppliesToOnOff => 0,
+        ModText::AppliesToBand => 1,
+        ModText::AppliesToInstall => 2,
+        ModText::AppliesToUninstall => 3,
+        ModText::NoHub => 4,
+        ModText::UnknownAction { .. } => 5,
+        ModText::UnknownInstallAction { .. } => 6,
+        ModText::Stale { .. } => 7,
+        ModText::BandHiddenByOtherMod => 8,
+        ModText::SkillsOutdated => 9,
+        ModText::SkillsUserDisabled => 10,
+        ModText::SkillsNotInstalled => 11,
+        ModText::SkillsNoConfigDir => 12,
+        ModText::InstallTargetsFailed => 13,
+        ModText::InjectionUnknown { .. } => 14,
+        ModText::Injecting => 15,
+        ModText::NotInjecting { .. } => 16,
+        ModText::NotInjectingBare => 17,
+        ModText::VersionLine { .. } => 18,
+        ModText::InstallHeading { .. } => 19,
+        ModText::SkillsHeading => 20,
+        ModText::SkillsLegacy => 21,
+        ModText::SkillsWritten => 22,
+        ModText::SkillsRemoved => 23,
+        ModText::SkillsWritePlanned => 24,
+        ModText::SkillsRemovePlanned => 25,
+        ModText::BandLegacy => 26,
+        ModText::BandLine { .. } => 27,
+        ModText::CardsLegacy => 28,
+        ModText::CardsPlace { .. } => 29,
+        ModText::CardsClickable => 30,
+        ModText::CardsNoButtonLegacy => 31,
+        ModText::CardsNoClick => 32,
+        ModText::PaneBandHidden => 33,
+        ModText::PaneBandShown { .. } => 34,
+        ModText::PaneBandNotDrawn => 35,
+        ModText::PaneCards { .. } => 36,
+        ModText::SecondsAgo { .. } => 37,
+    }
+}
+const MOD_TEXT_VARIANTS: usize = 38;
+
+/// 注入しない理由の見本と #2365 より前の固定文
+fn off_reason_table() -> Vec<(OffReason, String)> {
+    use tako_core::claude_mod::{AB_OFF_ENV, MIN_CLAUDE_VERSION};
+    vec![
+        (
+            OffReason::AbOff,
+            format!("{AB_OFF_ENV} が立っている（A/B で注入を止めている）"),
+        ),
+        (
+            OffReason::Disabled,
+            "tako mod off で止めている（`tako mod on` で戻る）".into(),
+        ),
+        (
+            OffReason::NotInstalled,
+            "mod を data dir へ展開できていない".into(),
+        ),
+        (
+            OffReason::NoCli,
+            "実行中の tako の隣に tako CLI が無い".into(),
+        ),
+        (
+            OffReason::ClaudeUnknown,
+            "claude の版がまだ分からない（claude が入っていないか判定前）".into(),
+        ),
+        (
+            OffReason::ClaudeTooOld("2.1.280".into()),
+            format!("claude 2.1.280 は下限 {MIN_CLAUDE_VERSION} 未満（`claude update` で上がる）"),
+        ),
+        (
+            OffReason::NameConflict(Box::new(Conflict::InstalledPlugin {
+                id: "tako@other".into(),
+            })),
+            "同じ名前の plugin tako@other が入っている（plugins/installed_plugins.json）\
+             （利用者の tako を優先し、このペインには注入しない）"
+                .into(),
+        ),
+        (
+            OffReason::UserDisabled,
+            "Claude Code の /plugin で tako@skills-dir が止められている（利用者の選択を優先）"
+                .into(),
+        ),
+    ]
+}
+
+fn no_report_table() -> Vec<(NoReportCause, &'static str)> {
+    vec![
+        (
+            NoReportCause::SafeMode,
+            "claude が --safe-mode で起動されていて mod を読まない（--safe-mode を外して起動し直せば載る）",
+        ),
+        (
+            NoReportCause::Bare,
+            "claude が --bare で起動されていて mod を読まない（--bare を外して起動し直せば載る）",
+        ),
+        (
+            NoReportCause::BeforeInjection,
+            "注入より前から動いていた claude（起動時の環境に tako の注入の印が無い）。\
+             新しいペインで claude を起動すれば載る",
+        ),
+        (
+            NoReportCause::NotLoaded,
+            "claude には注入が届いているが mod から報告が無い。disableAllHooks / 組織の \
+             allowManagedModsOnly で mod が読まれていないか、mod の読み込みに失敗した",
+        ),
+        (
+            NoReportCause::Undetermined,
+            "claude は動いているが mod から報告が無い。--safe-mode / --bare / \
+             disableAllHooks / 組織の allowManagedModsOnly で mod が読まれていないか、\
+             注入より前から動いていた claude",
+        ),
+    ]
+}
+
+fn install_error_table() -> Vec<(InstallError, &'static str)> {
+    vec![
+        (
+            InstallError::NoDataDir,
+            "データディレクトリが決まらない（HOME が無い）",
+        ),
+        (
+            InstallError::CreateRoot {
+                path: "/tmp/claude-mod".into(),
+                error: "Permission denied (os error 13)".into(),
+            },
+            "/tmp/claude-mod を作れない: Permission denied (os error 13)",
+        ),
+        (
+            InstallError::Write("No space left on device (os error 28)".into()),
+            "mod を書き出せない: No space left on device (os error 28)",
+        ),
+        (
+            InstallError::Replace("Directory not empty (os error 66)".into()),
+            "mod を差し替えられない: Directory not empty (os error 66)",
+        ),
+    ]
+}
+
+/// 衝突の見本（腕の頭・#2365 より前の固定文）。`UserSkillsDir` は印の有無で腕が 2 本
+fn conflict_table() -> Vec<(Conflict, &'static str, &'static str)> {
+    vec![
+        (
+            Conflict::UserSkillsDir { named_tako: true },
+            "UserSkillsDir { named_tako: true }",
+            "skills/tako は利用者の plugin（tako の管理印が無い）なので触らない",
+        ),
+        (
+            Conflict::UserSkillsDir { named_tako: false },
+            "UserSkillsDir { named_tako: false }",
+            "skills/tako は利用者のもの（tako の管理印が無い）なので触らない",
+        ),
+        (
+            Conflict::ModifiedCopy,
+            "ModifiedCopy",
+            "skills/tako の写しに手が入っている（管理印のハッシュと違う）ので上書きしない",
+        ),
+        (
+            Conflict::SkillsSameName {
+                dir: "other".into(),
+            },
+            "SkillsSameName",
+            "skills/other が同じ名前の plugin tako を名乗っている",
+        ),
+        (
+            Conflict::InstalledPlugin {
+                id: "tako@other".into(),
+            },
+            "InstalledPlugin",
+            "同じ名前の plugin tako@other が入っている（plugins/installed_plugins.json）",
+        ),
+        (
+            Conflict::EnabledPlugin {
+                id: "tako@other".into(),
+            },
+            "EnabledPlugin",
+            "同じ名前の plugin tako@other が有効になっている（settings.json の enabledPlugins）",
+        ),
+    ]
+}
+
+fn blocked_table() -> Vec<(Blocked, String)> {
+    use tako_core::claude_mod::{AB_OFF_ENV, MIN_CLAUDE_VERSION};
+    use tako_core::claude_mod_install::LEGACY_ENV;
+    vec![
+        (
+            Blocked::Refused(WriteRefused {
+                dir: "~/.claude".into(),
+            }),
+            "検証プロセス（テスト・TAKO_ISOLATED・セルフテスト）は一時 dir の外の設定 dir へ書かない: ~/.claude"
+                .into(),
+        ),
+        (
+            Blocked::Legacy,
+            format!("{LEGACY_ENV} / {AB_OFF_ENV} が立っている（A/B で skills-dir へ入れない）"),
+        ),
+        (
+            Blocked::Disabled,
+            "tako mod off で止めている（`tako mod on` で戻る）".into(),
+        ),
+        (
+            Blocked::ClaudeUnknown,
+            "claude の版が分からない（claude が入っていないか判定前）ので入れない".into(),
+        ),
+        (
+            Blocked::ClaudeTooOld("2.1.280".into()),
+            format!(
+                "claude 2.1.280 は下限 {MIN_CLAUDE_VERSION} 未満なので入れない（`claude update` で上がる）"
+            ),
+        ),
+    ]
+}
+
+/// 枠と CLI の表示の文の見本と #2365 より前の固定文（引数で文の変わるものは代表を複数）
+fn mod_text_table() -> Vec<(ModText, &'static str)> {
+    let version = |claude: Option<&str>, min: &str, m: &str, install: &str| ModText::VersionLine {
+        claude: claude.map(str::to_string),
+        min: min.into(),
+        mod_version: m.into(),
+        install: install.into(),
+    };
+    let heading = |install: bool, dry_run: bool, claude: Option<&str>| ModText::InstallHeading {
+        install,
+        dry_run,
+        claude: claude.map(str::to_string),
+        min: "2.1.294".into(),
+    };
+    let band = |request: Option<bool>| ModText::BandLine {
+        ctx_percent: 80,
+        limit_percent: 90.0,
+        request,
+    };
+    vec![
+        (
+            ModText::AppliesToOnOff,
+            "次に作るペインから（動いている claude には効かない。止めるなら claude を起動し直す）",
+        ),
+        (
+            ModText::AppliesToBand,
+            "動いている claude の帯へ次の報告（最大 15 秒）で届く。Claude Code の中で /tako band on|off \
+             を後から打てば、そちらが勝つ",
+        ),
+        (
+            ModText::AppliesToInstall,
+            "走っている claude にもホットリロードで効く（tako の外の claude では休眠）",
+        ),
+        (
+            ModText::AppliesToUninstall,
+            "走っている claude からも外れる。tako のペインには env の注入（S1）で今までどおり読まれる",
+        ),
+        (
+            ModText::NoHub,
+            "この tako は mod を扱わない（2 つ目のインスタンス等）",
+        ),
+        (
+            ModText::UnknownAction {
+                action: "bogus".into(),
+            },
+            "未知の action: bogus（status / on / off / band-on / band-off / ui / install / \
+             uninstall / report）",
+        ),
+        (
+            ModText::UnknownInstallAction {
+                action: "bogus".into(),
+            },
+            "未知の action: bogus（install / uninstall）",
+        ),
+        (
+            ModText::Stale {
+                age_secs: 60,
+                fresh_for_secs: 30,
+            },
+            "最後の報告から 60 秒（30 秒で失効）。claude が終わったか mod が止まった",
+        ),
+        (
+            ModText::BandHiddenByOtherMod,
+            "帯は他の mod に隠された（Claude Code の帯のフックが呼ばれていない = 外側の mod が next を\
+             呼ばずに帯を描いている）。入力欄の下の行のバーとサイドバー（/tako）はそのまま使える",
+        ),
+        (
+            ModText::SkillsOutdated,
+            "tako の写しが古い（tako mod install か次の GUI 起動で差し替わる）",
+        ),
+        (
+            ModText::SkillsUserDisabled,
+            "Claude Code の /plugin で tako@skills-dir が止められている（tako のペインでも休眠する）",
+        ),
+        (
+            ModText::SkillsNotInstalled,
+            "まだ入れていない（tako mod install / tako setup で入る）",
+        ),
+        (
+            ModText::SkillsNoConfigDir,
+            "設定 dir が無い（claude がまだ使っていない。tako は設定 dir を作らない）",
+        ),
+        (
+            ModText::InstallTargetsFailed,
+            "置けない（外せない）設定 dir がある（targets の error）",
+        ),
+        (
+            ModText::InjectionUnknown { reason: "x".into() },
+            "tako mod: 不明（x）",
+        ),
+        (ModText::Injecting, "tako mod: 新しく作るペインへ注入する"),
+        (
+            ModText::NotInjecting { reason: "x".into() },
+            "tako mod: 注入しない（x）",
+        ),
+        (ModText::NotInjectingBare, "tako mod: 注入しない"),
+        (
+            version(Some("2.1.294"), "2.1.294", "0.8.39", "written"),
+            "claude 2.1.294（下限 2.1.294）/ mod 0.8.39 / 展開 written",
+        ),
+        (
+            version(None, "-", "-", "-"),
+            "claude 未判定（下限 -）/ mod - / 展開 -",
+        ),
+        (
+            heading(true, true, Some("2.1.294")),
+            "tako mod install（dry-run。何も書いていない）: claude 2.1.294（下限 2.1.294）",
+        ),
+        (
+            heading(true, false, None),
+            "tako mod install: claude 未判定（下限 2.1.294）",
+        ),
+        (
+            heading(false, true, Some("2.1.294")),
+            "tako mod uninstall（dry-run。何も書いていない）: claude 2.1.294（下限 2.1.294）",
+        ),
+        (
+            heading(false, false, Some("2.1.294")),
+            "tako mod uninstall: claude 2.1.294（下限 2.1.294）",
+        ),
+        (ModText::SkillsHeading, "Claude Code の設定 dir（skills/tako）:"),
+        (
+            ModText::SkillsLegacy,
+            "skills: 入れない（TAKO_1959_LEGACY / TAKO_1877_NO_MOD）",
+        ),
+        (ModText::SkillsWritten, "  → 置いた"),
+        (ModText::SkillsRemoved, "  → 外した"),
+        (ModText::SkillsWritePlanned, "  → 置く予定"),
+        (ModText::SkillsRemovePlanned, "  → 外す予定"),
+        (ModText::BandLegacy, "帯: 描かない（TAKO_1877_S3_LEGACY）"),
+        (
+            band(Some(true)),
+            "帯: ctx 80% / 使用制限 90% 以上で ctx・使用制限も出す・隠す（tako mod band on で戻す）",
+        ),
+        (
+            band(Some(false)),
+            "帯: ctx 80% / 使用制限 90% 以上で ctx・使用制限も出す・出す",
+        ),
+        (
+            band(None),
+            "帯: ctx 80% / 使用制限 90% 以上で ctx・使用制限も出す",
+        ),
+        (
+            ModText::CardsLegacy,
+            "カード: ペイン下のカード帯（TAKO_1963_LEGACY）",
+        ),
+        (
+            ModText::CardsPlace {
+                place: "auto".into(),
+            },
+            "カード: 置き場 auto（mod が Claude Code の画面に描いたカードはペイン下のカード帯に出さない）",
+        ),
+        (
+            ModText::CardsClickable,
+            "  会話の行のカードの「実行」をクリック 1 回で押せる（全画面の claude）",
+        ),
+        (
+            ModText::CardsNoButtonLegacy,
+            "  会話の行のカードにボタンを置かない（TAKO_2159_LEGACY）。帯の ctrl+x → Tab → キーで押す",
+        ),
+        (
+            ModText::CardsNoClick,
+            "  クリックを渡していないので、帯の ctrl+x → Tab → キーで押す（クリックで押すなら tako mouse on）",
+        ),
+        (ModText::PaneBandHidden, "  帯 非表示"),
+        (
+            ModText::PaneBandShown {
+                columns: 120,
+                segments: "pane tab".into(),
+            },
+            "  帯 120 桁: pane tab",
+        ),
+        (ModText::PaneBandNotDrawn, "  帯 描いていない"),
+        (
+            ModText::PaneCards {
+                ids: "1, 2".into(),
+            },
+            "  カード [1, 2]",
+        ),
+        (ModText::SecondsAgo { secs: 3 }, "(3 秒前)"),
+    ]
+}
+
+/// 全部の見本（tako-core の理由 5 型 + 番人の断り + 置き場の断り + 枠と CLI の表示）
+fn mod_band_cases() -> Vec<FrameCase> {
+    let mut out = Vec::new();
+    for (r, old) in off_reason_table() {
+        let arm = variant_name(&format!("{r:?}")).to_string();
+        out.push(frame_case(
+            format!("OffReason::{r:?}"),
+            move |lang| r.describe_in(lang),
+            (CORE_MOD_SRC, CORE_MOD_PATH, "impl OffReason {"),
+            arm,
+            old,
+        ));
+    }
+    for (c, old) in no_report_table() {
+        out.push(frame_case(
+            format!("NoReportCause::{c:?}"),
+            move |lang| c.describe_in(lang).to_string(),
+            (CORE_MOD_SRC, CORE_MOD_PATH, "impl NoReportCause {"),
+            variant_name(&format!("{c:?}")).to_string(),
+            old.to_string(),
+        ));
+    }
+    for (e, old) in install_error_table() {
+        let arm = variant_name(&format!("{e:?}")).to_string();
+        out.push(frame_case(
+            format!("InstallError::{e:?}"),
+            move |lang| e.text_in(lang),
+            (CORE_MOD_SRC, CORE_MOD_PATH, "impl InstallError {"),
+            arm,
+            old.to_string(),
+        ));
+    }
+    for (c, arm, old) in conflict_table() {
+        out.push(frame_case(
+            format!("Conflict::{c:?}"),
+            move |lang| c.describe_in(lang),
+            (
+                CORE_MOD_INSTALL_SRC,
+                CORE_MOD_INSTALL_PATH,
+                "impl Conflict {",
+            ),
+            arm.to_string(),
+            old.to_string(),
+        ));
+    }
+    for (b, old) in blocked_table() {
+        let arm = variant_name(&format!("{b:?}")).to_string();
+        out.push(frame_case(
+            format!("Blocked::{b:?}"),
+            move |lang| b.describe_in(lang),
+            (
+                CORE_MOD_INSTALL_SRC,
+                CORE_MOD_INSTALL_PATH,
+                "impl Blocked {",
+            ),
+            arm,
+            old,
+        ));
+    }
+    let refused = WriteRefused {
+        dir: "~/.claude".into(),
+    };
+    out.push(plain_case(
+        "WriteRefused".into(),
+        move |lang| refused.text_in(lang),
+        (
+            CORE_MOD_INSTALL_SRC,
+            CORE_MOD_INSTALL_PATH,
+            "impl WriteRefused {",
+        ),
+        "検証プロセス（テスト・TAKO_ISOLATED・セルフテスト）は一時 dir の外の設定 dir へ書かない: ~/.claude"
+            .into(),
+    ));
+    out.push(plain_case(
+        "paths::NoDataDir".into(),
+        |lang| tako_core::paths::NoDataDir.text_in(lang).to_string(),
+        (PATHS_SRC, PATHS_PATH, "impl NoDataDir {"),
+        "データディレクトリが決まらない（HOME が無い）".into(),
+    ));
+    for (t, old) in mod_text_table() {
+        let arm = variant_name(&format!("{t:?}")).to_string();
+        out.push(frame_case(
+            format!("ModText::{t:?}"),
+            move |lang| t.text_in(lang),
+            (CONTROL_MOD_SRC, CONTROL_MOD_PATH, "impl ModText {"),
+            arm,
+            old.to_string(),
+        ));
+    }
+    out
+}
+
+/// 見本の通し番号が型の全バリアントを含むか（同じバリアントの見本が複数あってよい）
+fn covers_every<T>(samples: &[T], index: impl Fn(&T) -> usize, n: usize, name: &str) {
+    let seen: Vec<usize> = samples.iter().map(index).collect();
+    let missing: Vec<usize> = (0..n).filter(|i| !seen.contains(i)).collect();
+    assert!(
+        missing.is_empty(),
+        "{name} の見本に無いバリアント（通し番号）: {missing:?}"
+    );
+}
+
+#[test]
+fn mod_の状態と帯の応答の見本は全バリアントを持つ() {
+    let offs: Vec<OffReason> = off_reason_table().into_iter().map(|(r, _)| r).collect();
+    covers_every(&offs, off_reason_index, OFF_REASON_VARIANTS, "OffReason");
+    let causes: Vec<NoReportCause> = no_report_table().into_iter().map(|(c, _)| c).collect();
+    covers_every(
+        &causes,
+        no_report_index,
+        NO_REPORT_VARIANTS,
+        "NoReportCause",
+    );
+    let errors: Vec<InstallError> = install_error_table().into_iter().map(|(e, _)| e).collect();
+    covers_every(
+        &errors,
+        install_error_index,
+        INSTALL_ERROR_VARIANTS,
+        "InstallError",
+    );
+    let conflicts: Vec<Conflict> = conflict_table().into_iter().map(|(c, _, _)| c).collect();
+    covers_every(&conflicts, conflict_index, CONFLICT_VARIANTS, "Conflict");
+    let blocked: Vec<Blocked> = blocked_table().into_iter().map(|(b, _)| b).collect();
+    covers_every(&blocked, blocked_index, BLOCKED_VARIANTS, "Blocked");
+    let texts: Vec<ModText> = mod_text_table().into_iter().map(|(t, _)| t).collect();
+    covers_every(&texts, mod_text_index, MOD_TEXT_VARIANTS, "ModText");
+}
+
+#[test]
+fn mod_の状態と帯の応答の文が日英を持ち英語に日本語が混ざらない() {
+    let mut failures = Vec::new();
+    for c in mod_band_cases() {
+        if c.ja.trim().is_empty() || c.en.trim().is_empty() {
+            failures.push(format!("{} の文が空（{}）", c.debug, (c.at)(Lang::En)));
+        }
+        if let Some(ch) = has_japanese(&c.en) {
+            failures.push(format!(
+                "{} の英語に日本語（{ch}）が混ざる: {}（{}）",
+                c.debug,
+                c.en,
+                (c.at)(Lang::En)
+            ));
+        } else if c.ja == c.en {
+            failures.push(format!(
+                "{} の英語が日本語と同じ文（{}）",
+                c.debug,
+                (c.at)(Lang::En)
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+#[test]
+fn mod_の状態と帯の応答の文の日本語は2365より前の固定文とバイト一致() {
+    let mut failures = Vec::new();
+    for c in mod_band_cases() {
+        if c.ja != c.old_ja {
+            failures.push(format!(
+                "{} の日本語が #2365 より前と違う（{}）\n  want: {}\n  got:  {}",
+                c.debug,
+                (c.at)(Lang::Ja),
+                c.old_ja,
+                c.ja
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 全見本の腕の行を日英とも引ける（引けないと名指しが空振りする）
+#[test]
+fn mod_の状態と帯の応答の文の腕の行を日英とも引ける() {
+    for c in mod_band_cases() {
+        for lang in [Lang::Ja, Lang::En] {
+            let at = (c.at)(lang);
+            assert!(
+                !at.contains("腕が見つからない"),
+                "{} / {lang:?}: {at}",
+                c.debug
+            );
+        }
     }
 }

@@ -4318,7 +4318,7 @@ pub fn prepare_offload(
                 && !tako_core::claude_mod::no_report_legacy() =>
         {
             Some(
-                crate::claude_mod::status_ctx(host)
+                crate::claude_mod::status_ctx(host, tako_core::i18n::lang())
                     .map(|ctx| OffloadJob::ModStatus { ctx: Box::new(ctx) }),
             )
         }
@@ -19730,7 +19730,8 @@ fn collect_check_health_ctx(host: &dyn ControlHost) -> CheckHealthCtx {
             .map(|pane| pane.id().as_u64())
             .collect(),
         claude_mod: (!tako_core::claude_mod::no_report_legacy()).then(|| {
-            crate::claude_mod::status_ctx(host)
+            // 枠が日本語の check-health は理由の文も日本語で組む（1 つの出力に日英を混ぜない。#2365）
+            crate::claude_mod::status_ctx(host, tako_core::i18n::Lang::Ja)
                 .map(Box::new)
                 .map_err(|e| e.to_string())
         }),
@@ -53458,9 +53459,18 @@ mod tests {
         );
         let row = status(&mut host)["panes"][0].clone();
         assert_eq!(row["band"]["state"], "hidden_by_other_mod", "{row}");
-        assert!(row["band"]["message"]
-            .as_str()
-            .unwrap()
+        // 文は表示言語に従う（#2365）。並走するテストがグローバルを動かしても揺れないよう、日英の
+        // どちらかの文と一致することを見る
+        let message = row["band"]["message"].as_str().unwrap();
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .iter()
+                .any(|l| message
+                    == crate::claude_mod::text::ModText::BandHiddenByOtherMod.text_in(*l)),
+            "{message}"
+        );
+        assert!(crate::claude_mod::text::ModText::BandHiddenByOtherMod
+            .text_in(tako_core::i18n::Lang::Ja)
             .contains("他の mod"));
 
         // 描いていない（statusLine が出している・off）→ tako が出す

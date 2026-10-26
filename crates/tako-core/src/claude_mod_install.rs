@@ -251,29 +251,57 @@ impl Conflict {
         }
     }
 
+    /// 表示言語での説明（`tako mod` の応答。setup・persist.log は [`Self::describe_in`] の日本語）
     pub fn describe(&self) -> String {
-        match self {
-            Conflict::UserSkillsDir { named_tako: true } => {
+        self.describe_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての説明（#2365）。(バリアント, 言語) の網羅 match で、日本語は #2365 より前の
+    /// 固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）
+    pub fn describe_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::UserSkillsDir { named_tako: true }, Ja) => {
                 "skills/tako は利用者の plugin（tako の管理印が無い）なので触らない".into()
             }
-            Conflict::UserSkillsDir { named_tako: false } => {
+            (Self::UserSkillsDir { named_tako: true }, En) => {
+                "skills/tako is the user's plugin (no tako management mark), so it is left alone"
+                    .into()
+            }
+            (Self::UserSkillsDir { named_tako: false }, Ja) => {
                 "skills/tako は利用者のもの（tako の管理印が無い）なので触らない".into()
             }
-            Conflict::ModifiedCopy => {
+            (Self::UserSkillsDir { named_tako: false }, En) => {
+                "skills/tako belongs to the user (no tako management mark), so it is left alone"
+                    .into()
+            }
+            (Self::ModifiedCopy, Ja) => {
                 "skills/tako の写しに手が入っている（管理印のハッシュと違う）ので上書きしない"
                     .into()
             }
-            Conflict::SkillsSameName { dir } => {
+            (Self::ModifiedCopy, En) => "the copy in skills/tako has been edited (it differs \
+                 from the management mark's hash), so it is not overwritten"
+                .into(),
+            (Self::SkillsSameName { dir }, Ja) => {
                 format!("skills/{dir} が同じ名前の plugin tako を名乗っている")
             }
-            Conflict::InstalledPlugin { id } => {
+            (Self::SkillsSameName { dir }, En) => {
+                format!("skills/{dir} claims the same plugin name tako")
+            }
+            (Self::InstalledPlugin { id }, Ja) => {
                 format!("同じ名前の plugin {id} が入っている（plugins/installed_plugins.json）")
             }
-            Conflict::EnabledPlugin { id } => {
+            (Self::InstalledPlugin { id }, En) => format!(
+                "a plugin with the same name {id} is installed (plugins/installed_plugins.json)"
+            ),
+            (Self::EnabledPlugin { id }, Ja) => {
                 format!(
                     "同じ名前の plugin {id} が有効になっている（settings.json の enabledPlugins）"
                 )
             }
+            (Self::EnabledPlugin { id }, En) => format!(
+                "a plugin with the same name {id} is enabled (enabledPlugins in settings.json)"
+            ),
         }
     }
 
@@ -298,9 +326,10 @@ impl Inspection {
     /// env の注入を止める理由（衝突 > 利用者の停止）。`None` = 注入してよい
     pub fn injection_block(&self) -> Option<claude_mod::OffReason> {
         if let Some(conflict) = self.conflicts.iter().find(|c| c.blocks_injection()) {
-            return Some(claude_mod::OffReason::NameConflict(
-                conflict.describe().into_boxed_str(),
-            ));
+            // 文ではなく衝突そのものを持つ（応答を組むときに表示言語で引く。#2365）
+            return Some(claude_mod::OffReason::NameConflict(Box::new(
+                conflict.clone(),
+            )));
         }
         self.user_disabled
             .then_some(claude_mod::OffReason::UserDisabled)
@@ -391,7 +420,7 @@ pub fn inspect(config_dir: &Path) -> Inspection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocked {
     /// 検証プロセスの番人（[`write_guard`]）
-    Refused(String),
+    Refused(WriteRefused),
     /// A/B（[`LEGACY_ENV`] / `TAKO_1877_NO_MOD`）
     Legacy,
     /// `tako mod off`
@@ -413,30 +442,84 @@ impl Blocked {
         }
     }
 
+    /// 表示言語での説明（`tako mod` の応答。setup・persist.log は [`Self::describe_in`] の日本語）
     pub fn describe(&self) -> String {
-        match self {
-            Blocked::Refused(why) => why.clone(),
-            Blocked::Legacy => {
+        self.describe_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての説明（#2365）。(バリアント, 言語) の網羅 match で、日本語は #2365 より前の
+    /// 固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）
+    pub fn describe_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Refused(why), lang) => why.text_in(lang),
+            (Self::Legacy, Ja) => {
                 format!(
                     "{LEGACY_ENV} / {} が立っている（A/B で skills-dir へ入れない）",
                     claude_mod::AB_OFF_ENV
                 )
             }
-            Blocked::Disabled => "tako mod off で止めている（`tako mod on` で戻る）".into(),
-            Blocked::ClaudeUnknown => {
+            (Self::Legacy, En) => format!(
+                "{LEGACY_ENV} / {} is set (not put into skills-dir for A/B)",
+                claude_mod::AB_OFF_ENV
+            ),
+            (Self::Disabled, Ja) => "tako mod off で止めている（`tako mod on` で戻る）".into(),
+            (Self::Disabled, En) => {
+                "stopped with tako mod off (`tako mod on` turns it back on)".into()
+            }
+            (Self::ClaudeUnknown, Ja) => {
                 "claude の版が分からない（claude が入っていないか判定前）ので入れない".into()
             }
-            Blocked::ClaudeTooOld(v) => format!(
+            (Self::ClaudeUnknown, En) => "not put in because the claude version is not known \
+                 (claude is not installed or has not been checked yet)"
+                .into(),
+            (Self::ClaudeTooOld(v), Ja) => format!(
                 "claude {v} は下限 {} 未満なので入れない（`claude update` で上がる）",
+                claude_mod::MIN_CLAUDE_VERSION
+            ),
+            (Self::ClaudeTooOld(v), En) => format!(
+                "not put in because claude {v} is below the minimum {} (`claude update` \
+                 upgrades it)",
                 claude_mod::MIN_CLAUDE_VERSION
             ),
         }
     }
 }
 
+/// 書き込みの番人（[`write_guard`]）が断った設定 dir（#2365。文は [`Self::text_in`] の日英）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRefused {
+    /// 断った設定 dir（ホームは `~` に縮めた形）
+    pub dir: String,
+}
+
+impl WriteRefused {
+    /// 表示言語を明示しての文言（#2365）。日本語は #2365 より前の固定文とバイト一致
+    /// （`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        let dir = &self.dir;
+        match lang {
+            Ja => format!(
+                "検証プロセス（テスト・TAKO_ISOLATED・セルフテスト）は一時 dir の外の設定 dir へ書かない: {dir}"
+            ),
+            En => format!(
+                "a verification process (tests, TAKO_ISOLATED, self-test) does not write to \
+                 config dirs outside temporary dirs: {dir}"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for WriteRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
 /// tako 側の事情から「置いてよいか」を決める。理由が複数あれば番人 → A/B → 設定 → 版の順に 1 つ
 pub fn gate(
-    guard: Result<(), String>,
+    guard: Result<(), WriteRefused>,
     legacy: bool,
     enabled: bool,
     claude_version: Option<&str>,
@@ -632,7 +715,7 @@ fn canonical_lenient(path: &Path) -> PathBuf {
 
 /// 書いてよい設定 dir か。**検証プロセスは一時 dir の外へ書かない**（`verification` は
 /// [`crate::paths::is_verification_process`] の値。テストは env を触らずに両アームを検査できる）
-pub fn write_guard(config_dir: &Path, verification: bool) -> Result<(), String> {
+pub fn write_guard(config_dir: &Path, verification: bool) -> Result<(), WriteRefused> {
     if !verification {
         return Ok(());
     }
@@ -650,10 +733,9 @@ pub fn write_guard(config_dir: &Path, verification: bool) -> Result<(), String> 
     {
         return Ok(());
     }
-    Err(format!(
-        "検証プロセス（テスト・TAKO_ISOLATED・セルフテスト）は一時 dir の外の設定 dir へ書かない: {}",
-        crate::paths::shorten_home(&config_dir.display().to_string())
-    ))
+    Err(WriteRefused {
+        dir: crate::paths::shorten_home(&config_dir.display().to_string()),
+    })
 }
 
 /// A/B の入口（[`LEGACY_ENV`] か S1 の `TAKO_1877_NO_MOD`）が立っているか
@@ -1105,7 +1187,14 @@ mod tests {
             (gate(Ok(()), false, false, Some("2.1.294")), State::Disabled),
             (gate(Ok(()), true, true, Some("2.1.294")), State::Legacy),
             (
-                gate(Err("番人".into()), false, true, Some("2.1.294")),
+                gate(
+                    Err(WriteRefused {
+                        dir: "番人".into()
+                    }),
+                    false,
+                    true,
+                    Some("2.1.294"),
+                ),
                 State::Refused,
             ),
         ] {
@@ -1233,7 +1322,10 @@ mod tests {
             "/Users/testuser/.claude"
         });
         let err = write_guard(&home_like, true).unwrap_err();
-        assert!(err.contains("検証プロセス"), "{err}");
+        assert!(
+            err.text_in(crate::i18n::Lang::Ja).contains("検証プロセス"),
+            "{err}"
+        );
         assert!(
             write_guard(&home_like, false).is_ok(),
             "製品の経路は止めない"

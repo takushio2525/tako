@@ -171,6 +171,9 @@ start_app() {
   export TAKO_SESSIONS_FILE="$TMP/$name/sessions.yaml"
   export TAKO_PANE_LOG_DIR="$TMP/$name/panelogs"
   export TAKO_WORKERS_FILE="$TMP/$name/workers.yaml"
+  # `tako mod --json` の理由は表示言語・check-health は日本語（#2365）。同じ字面で比べるので
+  # GUI と CLI を日本語表示に固定する（OS のロケールに依らない）
+  export TAKO_LANG=ja
   mkdir -p "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR" "$TAKO_ORCHESTRATOR_DIR"
   # shellcheck disable=SC2046
   launch_isolated_gui "$TMP/app-${name}.log" $(sandbox_env) TAKO_PERSIST=0 \

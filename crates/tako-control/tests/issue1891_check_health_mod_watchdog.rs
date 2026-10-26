@@ -180,13 +180,9 @@ fn scan_check_health(dispatch: &str) -> Vec<String> {
 fn scan_cli(cli: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (name, required) in [
-        (
-            "print_mod",
-            &[
-                "claude_mod::text::injection_line(",
-                "claude_mod::text::reason_line(",
-            ][..],
-        ),
+        // #2365: `tako mod` の行の組み立ては tako-control の `text::status_lines` へ移した（CLI は出力だけ）。
+        // `status_lines` が 1 行目と理由の行を同じ関数で出すことは [`人が読む行は1つの関数から出る`] が見る
+        ("print_mod", &["claude_mod::text::status_lines("][..]),
         (
             "print_check_health_mod",
             &[
@@ -295,6 +291,37 @@ fn 人が読む行は1つの関数から出る() {
     );
     // 文面の正本は 1 か所（tako-control の text）
     let control = code(CONTROL_MOD, &read(CONTROL_MOD));
+    // #2365: CLI の `tako mod` の行を組む `text::status_lines` も、1 行目と理由の行を同じ関数で出す
+    // （`pub mod text` の中の関数なので、頭の行から同じ字下げの `}` までを本体とする）
+    let mut lines = Vec::new();
+    let mut inside = false;
+    for (index, line) in control.lines().enumerate() {
+        if line.starts_with("    pub fn status_lines(") {
+            inside = true;
+            continue;
+        }
+        if inside {
+            if line == "    }" {
+                break;
+            }
+            lines.push((index + 1, line.to_string()));
+        }
+    }
+    assert!(
+        !lines.is_empty(),
+        "{CONTROL_MOD} に `text::status_lines` が無い（改名・移設したなら番犬も追うこと）"
+    );
+    let missed = missing(
+        CONTROL_MOD,
+        "status_lines",
+        &lines,
+        &["injection_line(", "reason_line(", "skills_lines("],
+    );
+    assert!(
+        missed.is_empty(),
+        "`tako mod` の行が check-health と同じ関数を通っていない:\n  {}",
+        missed.join("\n  ")
+    );
     assert_eq!(
         control
             .matches("\"tako mod: 新しく作るペインへ注入する\"")

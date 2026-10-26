@@ -1173,7 +1173,11 @@ fn initial_claude_mod() -> tako_core::claude_mod::ModHub {
     let installed = claude_mod::install();
     match &installed {
         Ok((dir, _)) => hub.plugin_dir = Some(dir.clone()),
-        Err(e) => eprintln!("warning: tako mod を展開できない（注入しない）: {e}"),
+        // 診断の stderr は日本語の行なので理由も日本語で引く（#2365）
+        Err(e) => eprintln!(
+            "warning: tako mod を展開できない（注入しない）: {}",
+            e.text_in(tako_core::i18n::Lang::Ja)
+        ),
     }
     hub.install_result = Some(installed.map(|(_, outcome)| outcome));
     hub.claude_version = tako_control::stale_binary::quick_claude_version();

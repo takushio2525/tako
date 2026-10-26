@@ -22,7 +22,9 @@ use serde_json::{json, Value};
 use tako_core::claude_mod_install::{
     self as core, Action, Blocked, CopyState, Expected, Inspection, Outcome, State,
 };
+use tako_core::i18n::Lang;
 
+use crate::claude_mod::text::ModText;
 use crate::setup::{SetupPlan, SetupValueSource};
 
 /// 置く先の出どころ
@@ -273,40 +275,37 @@ fn short(path: &Path) -> String {
     tako_core::paths::shorten_home(&path.display().to_string())
 }
 
-/// 状態の説明（`tako mod` の `reason.message`。installed なら無い）
+/// 状態の説明（`tako mod` の `reason.message`。installed なら無い）。`lang` は `tako mod` の応答なら
+/// 表示言語、setup の行・persist.log・`tako check-health` なら日本語（#2365）
 fn state_message(
     result_state: State,
     inspection: &Inspection,
     blocked: Option<&Blocked>,
+    lang: Lang,
 ) -> Option<String> {
     match result_state {
         State::Installed => None,
-        State::Outdated => Some("tako の写しが古い（tako mod install か次の GUI 起動で差し替わる）".into()),
+        State::Outdated => Some(ModText::SkillsOutdated.text_in(lang)),
         State::NameConflict => Some(
             inspection
                 .conflicts
                 .iter()
-                .map(|c| c.describe())
+                .map(|c| c.describe_in(lang))
                 .collect::<Vec<_>>()
                 .join(" / "),
         ),
-        State::UserDisabled => Some(
-            "Claude Code の /plugin で tako@skills-dir が止められている（tako のペインでも休眠する）"
-                .into(),
-        ),
-        State::NotInstalled => Some("まだ入れていない（tako mod install / tako setup で入る）".into()),
-        State::NoConfigDir => {
-            Some("設定 dir が無い（claude がまだ使っていない。tako は設定 dir を作らない）".into())
-        }
+        State::UserDisabled => Some(ModText::SkillsUserDisabled.text_in(lang)),
+        State::NotInstalled => Some(ModText::SkillsNotInstalled.text_in(lang)),
+        State::NoConfigDir => Some(ModText::SkillsNoConfigDir.text_in(lang)),
         State::ClaudeTooOld
         | State::ClaudeUnknown
         | State::Disabled
         | State::Legacy
-        | State::Refused => blocked.map(Blocked::describe),
+        | State::Refused => blocked.map(|b| b.describe_in(lang)),
     }
 }
 
-fn target_json(result: &TargetResult) -> Value {
+fn target_json(result: &TargetResult, lang: Lang) -> Value {
     let inspection = &result.inspection;
     let mut row = json!({
         "config_dir": short(&result.target.dir),
@@ -321,13 +320,13 @@ fn target_json(result: &TargetResult) -> Value {
             .iter()
             .map(|c| json!({
                 "code": c.code(),
-                "message": c.describe(),
+                "message": c.describe_in(lang),
                 "blocks_injection": c.blocks_injection(),
             }))
             .collect::<Vec<_>>(),
         "action": result.action.as_str(),
     });
-    if let Some(message) = state_message(result.state, inspection, result.blocked.as_ref()) {
+    if let Some(message) = state_message(result.state, inspection, result.blocked.as_ref(), lang) {
         row["reason"] = json!({ "code": result.state.code(), "message": message });
     }
     match &result.outcome {
@@ -340,7 +339,7 @@ fn target_json(result: &TargetResult) -> Value {
     row
 }
 
-fn skills_json(results: &[TargetResult], expected: &Expected) -> Value {
+fn skills_json(results: &[TargetResult], expected: &Expected, lang: Lang) -> Value {
     let count = |state: State| results.iter().filter(|r| r.state == state).count();
     json!({
         "plugin_id": core::SKILLS_PLUGIN_ID,
@@ -354,12 +353,18 @@ fn skills_json(results: &[TargetResult], expected: &Expected) -> Value {
             "user_disabled": count(State::UserDisabled),
             "not_installed": count(State::NotInstalled),
         },
-        "targets": results.iter().map(target_json).collect::<Vec<_>>(),
+        "targets": results.iter().map(|r| target_json(r, lang)).collect::<Vec<_>>(),
     })
 }
 
-/// `tako mod`（status）の `skills`（**読むだけ**。GUI の UI スレッドから呼ぶので書かない）
-pub fn status_json(reported: &[String], claude_version: Option<&str>, enabled: bool) -> Value {
+/// `tako mod`（status）の `skills`（**読むだけ**。GUI の UI スレッドから呼ぶので書かない）。
+/// `lang` は理由の文の言語（`tako mod` は表示言語・`tako check-health` は日本語。#2365）
+pub fn status_json(
+    reported: &[String],
+    claude_version: Option<&str>,
+    enabled: bool,
+    lang: Lang,
+) -> Value {
     let expected = Expected::current();
     let ctx = Context {
         enabled,
@@ -368,22 +373,33 @@ pub fn status_json(reported: &[String], claude_version: Option<&str>, enabled: b
         verification: tako_core::paths::is_verification_process(),
     };
     let targets = collect_targets(&target_inputs(reported));
-    skills_json(&sync_targets(&targets, &ctx, &expected, true), &expected)
+    skills_json(
+        &sync_targets(&targets, &ctx, &expected, true),
+        &expected,
+        lang,
+    )
 }
 
-/// `tako mod install|uninstall`（CLI はローカルで、MCP は dispatch から呼ぶ）
+/// `tako mod install|uninstall`（CLI はローカルで、MCP は dispatch から呼ぶ）。応答の文は表示言語
+/// （persist.log の行は日本語のまま。#2365）
 pub fn run_action(
     action: &str,
     dry_run: bool,
     reported: &[String],
     ctx: &Context,
 ) -> Result<Value, String> {
+    let lang = tako_core::i18n::lang();
     let expected = Expected::current();
     let targets = collect_targets(&target_inputs(reported));
     let results = match action {
         "install" => sync_targets(&targets, ctx, &expected, dry_run),
         "uninstall" => uninstall_targets(&targets, ctx, &expected, dry_run),
-        other => return Err(format!("未知の action: {other}（install / uninstall）")),
+        other => {
+            return Err(ModText::UnknownInstallAction {
+                action: other.into(),
+            }
+            .text_in(lang))
+        }
     };
     if !dry_run {
         for line in log_lines(&results, None) {
@@ -395,12 +411,13 @@ pub fn run_action(
         "dry_run": dry_run,
         "claude_version": ctx.claude_version,
         "min_claude_version": tako_core::claude_mod::MIN_CLAUDE_VERSION,
-        "skills": skills_json(&results, &expected),
+        "skills": skills_json(&results, &expected, lang),
     });
     out["applies_to"] = json!(match action {
-        "install" => "走っている claude にもホットリロードで効く（tako の外の claude では休眠）",
-        _ => "走っている claude からも外れる。tako のペインには env の注入（S1）で今までどおり読まれる",
-    });
+        "install" => ModText::AppliesToInstall,
+        _ => ModText::AppliesToUninstall,
+    }
+    .text_in(lang));
     Ok(out)
 }
 
@@ -419,7 +436,7 @@ pub fn log_lines(results: &[TargetResult], why: Option<&str>) -> Vec<String> {
                 )),
                 Ok(Outcome::Removed) => Some(format!(
                     "tako mod{lead}: {dir}/skills/tako の写しを外した（{}）",
-                    state_message(r.state, &r.inspection, r.blocked.as_ref())
+                    state_message(r.state, &r.inspection, r.blocked.as_ref(), Lang::Ja)
                         .unwrap_or_else(|| r.state.code().into())
                 )),
                 Err(e) => Some(format!("tako mod{lead}: {dir} へ置けない: {e}")),
@@ -512,7 +529,7 @@ fn record_changes(
             Ok(Outcome::Written) => format!("tako mod {} の写し", expected.version),
             Ok(Outcome::Removed) => format!(
                 "外した（{}）",
-                state_message(r.state, &r.inspection, r.blocked.as_ref())
+                state_message(r.state, &r.inspection, r.blocked.as_ref(), Lang::Ja)
                     .unwrap_or_else(|| r.state.code().into())
             ),
             _ => continue,
@@ -572,7 +589,7 @@ fn setup_stage_for(
         if same && none_placed && !matches!(blocked, Blocked::Refused(_)) {
             lines.push(format!(
                 "  [skip] tako mod を Claude Code へ入れない: {}（tako のペインは今までどおり env で読ませる）",
-                blocked.describe()
+                blocked.describe_in(Lang::Ja)
             ));
             return lines;
         }
@@ -586,14 +603,15 @@ fn setup_stage_for(
             (Ok(Outcome::Written), _) => format!("  [ok] tako mod を Claude Code へ入れた: {path}"),
             (Ok(Outcome::Removed), _) => format!(
                 "  [ok] {path} の tako の写しを外した: {}",
-                state_message(r.state, &r.inspection, r.blocked.as_ref()).unwrap_or_default()
+                state_message(r.state, &r.inspection, r.blocked.as_ref(), Lang::Ja)
+                    .unwrap_or_default()
             ),
             (Ok(_), State::Installed) => format!("  [ok] tako mod（Claude Code）は最新: {path}"),
             (Ok(_), State::NoConfigDir) => continue,
             (Ok(_), state) => format!(
                 "  [skip] {}: {}",
                 short(&r.target.dir),
-                state_message(state, &r.inspection, r.blocked.as_ref())
+                state_message(state, &r.inspection, r.blocked.as_ref(), Lang::Ja)
                     .unwrap_or_else(|| state.code().into())
             ),
         };
@@ -708,7 +726,7 @@ mod tests {
         ];
         let expected = Expected::for_version("9.9.9");
         let results = sync_targets(&targets, &ctx(), &expected, false);
-        let json = skills_json(&results, &expected);
+        let json = skills_json(&results, &expected, Lang::Ja);
         assert_eq!(json["targets"][0]["state"], "installed");
         assert_eq!(json["targets"][0]["outcome"], "written");
         assert_eq!(json["targets"][0]["mark_version"], "9.9.9");

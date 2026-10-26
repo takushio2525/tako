@@ -24,10 +24,12 @@ use tako_core::claude_mod::{
     self as core, Accepted, ModHub, ModRateLimit, ModUnavailable, OffReason, StoredReport,
 };
 use tako_core::claude_mod_ui::Vocab;
+use tako_core::i18n::Lang;
 use tako_core::PaneId;
 
 use crate::dispatch::DispatchError;
 use crate::host::ControlHost;
+use text::ModText;
 
 /// CLI / dispatch が受け付ける action
 pub const ACTIONS: &[&str] = &[
@@ -78,9 +80,11 @@ pub fn run_setup_stage() -> String {
                 }
             }
         }
-        Err(e) => {
-            format!("  [warn] tako mod を展開できない（claude の状態は画面から読むので続行）: {e}")
-        }
+        // setup の段の枠は日本語なので、失敗の理由も日本語で引く（1 行に日英を混ぜない。#2365）
+        Err(e) => format!(
+            "  [warn] tako mod を展開できない（claude の状態は画面から読むので続行）: {}",
+            e.text_in(Lang::Ja)
+        ),
     }
 }
 
@@ -279,9 +283,7 @@ pub fn run(
             host.set_claude_mod_enabled(enabled)
                 .map_err(DispatchError::Operation)?;
             let mut out = status(host)?;
-            out["applies_to"] = json!(
-                "次に作るペインから（動いている claude には効かない。止めるなら claude を起動し直す）"
-            );
+            out["applies_to"] = json!(ModText::AppliesToOnOff.text_in(tako_core::i18n::lang()));
             Ok(out)
         }
         "band-on" | "band-off" => {
@@ -295,20 +297,19 @@ pub fn run(
             };
             crate::claude_mod_ui::run(&ui_path(host)?, &request).map_err(ui_error)?;
             let mut out = status(host)?;
-            out["applies_to"] = json!(
-                "動いている claude の帯へ次の報告（最大 15 秒）で届く。Claude Code の中で /tako band on|off \
-                 を後から打てば、そちらが勝つ"
-            );
+            out["applies_to"] = json!(ModText::AppliesToBand.text_in(tako_core::i18n::lang()));
             Ok(out)
         }
         "ui" => {
             crate::claude_mod_ui::run(&ui_path(host)?, &ui.unwrap_or_default()).map_err(ui_error)
         }
         "report" => accept_report(host, report, pane),
-        other => Err(DispatchError::InvalidParams(format!(
-            "未知の action: {other}（{}）",
-            ACTIONS.join(" / ")
-        ))),
+        other => Err(DispatchError::InvalidParams(
+            ModText::UnknownAction {
+                action: other.into(),
+            }
+            .to_string(),
+        )),
     }
 }
 
@@ -331,13 +332,13 @@ fn ui_error(e: crate::claude_mod_ui::RunError) -> DispatchError {
 }
 
 fn hub(host: &dyn ControlHost) -> Result<&ModHub, DispatchError> {
-    host.claude_mod().ok_or_else(|| {
-        DispatchError::Operation("この tako は mod を扱わない（2 つ目のインスタンス等）".into())
-    })
+    host.claude_mod()
+        .ok_or_else(|| DispatchError::Operation(ModText::NoHub.to_string()))
 }
 
-fn reason_json(reason: &OffReason) -> Value {
-    json!({ "code": reason.code(), "message": reason.describe() })
+/// 注入しない理由（`message` は `lang` で引く。`tako mod` は表示言語・`tako check-health` は日本語。#2365）
+fn reason_json(reason: &OffReason, lang: Lang) -> Value {
+    json!({ "code": reason.code(), "message": reason.describe_in(lang) })
 }
 
 /// 報告を受け取り、tako 側のスナップショットを返す（設計書 §2.3。S3 から mod が使う）
@@ -609,13 +610,14 @@ fn resolve_reporting_pane(
     }
 }
 
-/// ペイン 1 行の状態
+/// ペイン 1 行の状態（理由の `message` は `lang` で引く。#2365）
 fn pane_row(
     hub: &ModHub,
     pane: PaneId,
     title: Option<&str>,
     claude_on_screen: bool,
     now: Instant,
+    lang: Lang,
 ) -> Value {
     let raw = pane.as_u64();
     let injection = hub.injections.get(&raw);
@@ -624,26 +626,27 @@ fn pane_row(
     let (state, reason) = match (stored, injection) {
         // #1959: 利用者が Claude Code 側で止めた（mod の最後の報告）。休眠した mod はもう
         // 報告しないので鮮度に依らず出す
-        _ if dormant.is_some() => ("user_disabled", reason_json(&OffReason::UserDisabled)),
+        _ if dormant.is_some() => ("user_disabled", reason_json(&OffReason::UserDisabled, lang)),
         (Some(s), _) if core::is_fresh(s.received, now) => ("reporting", Value::Null),
         (Some(s), _) => (
             "stale",
             json!({
                 "code": "mod_stale",
-                "message": format!(
-                    "最後の報告から {} 秒（{} 秒で失効）。claude が終わったか mod が止まった",
-                    now.saturating_duration_since(s.received).as_secs(),
-                    core::FRESH_FOR.as_secs()
-                ),
+                "message": ModText::Stale {
+                    age_secs: now.saturating_duration_since(s.received).as_secs(),
+                    fresh_for_secs: core::FRESH_FOR.as_secs(),
+                }
+                .text_in(lang),
             }),
         ),
         (None, Some(inj)) => match &inj.off {
-            Some(off) => ("not_injected", reason_json(off)),
+            Some(off) => ("not_injected", reason_json(off, lang)),
             // #1891: 理由はここでは材料なし（候補を並べた文）。背景の段（[`finish_status`]）が
             // ペインの claude を調べられたら 1 つに決めて差し替える
-            None if claude_on_screen => {
-                (NO_REPORT, no_report_reason(core::classify_no_report(None)))
-            }
+            None if claude_on_screen => (
+                NO_REPORT,
+                no_report_reason(core::classify_no_report(None), lang),
+            ),
             None => ("waiting", Value::Null),
         },
         (None, None) => ("unknown", Value::Null),
@@ -662,7 +665,7 @@ fn pane_row(
         row["report"] = report_json(s, now);
         // #1962: 帯を描けているか（新鮮で renders を送ってくる mod だけ）
         if core::is_fresh(s.received, now) {
-            if let Some(band) = band_state_json(&s.report) {
+            if let Some(band) = band_state_json(&s.report, lang) {
                 row["band"] = band;
             }
         }
@@ -672,13 +675,12 @@ fn pane_row(
 
 /// 帯の状態（#1962。`drawn` / `not_drawn` / `hidden_by_other_mod`）。renders を送らない mod
 /// （S7-3 前・A/B の S3 の描き方）は `None`
-fn band_state_json(report: &core::ModReport) -> Option<Value> {
+fn band_state_json(report: &core::ModReport, lang: Lang) -> Option<Value> {
     let renders = report.renders.as_ref()?;
     if core::band_hidden_by_other_mod(report) {
         return Some(json!({
             "state": "hidden_by_other_mod",
-            "message": "帯は他の mod に隠された（Claude Code の帯のフックが呼ばれていない = 外側の mod が next を\
-                呼ばずに帯を描いている）。入力欄の下の行のバーとサイドバー（/tako）はそのまま使える",
+            "message": ModText::BandHiddenByOtherMod.text_in(lang),
         }));
     }
     Some(json!({
@@ -712,11 +714,11 @@ pub fn status_bar_json(host: &dyn ControlHost, now: Instant) -> Value {
 const NO_REPORT: &str = "no_report";
 
 /// 報告の無いペインの理由（#1891。`code` は S2 の語彙 `mod_absent` のまま、`cause` が判別した 1 つ）
-fn no_report_reason(cause: core::NoReportCause) -> Value {
+fn no_report_reason(cause: core::NoReportCause, lang: Lang) -> Value {
     json!({
         "code": ModUnavailable::Absent.code(),
         "cause": cause.code(),
-        "message": cause.describe(),
+        "message": cause.describe_in(lang),
     })
 }
 
@@ -742,11 +744,14 @@ pub struct StatusCtx {
     probes: Vec<crate::agent_resume::PaneProbe>,
     /// 上限の外で調べなかった数
     over_limit: usize,
+    /// 理由・状態の文の言語（`tako mod` は表示言語・`tako check-health` は日本語。#2365）
+    lang: Lang,
 }
 
 /// `tako mod`（status）の UI スレッドの段（#1891。**子プロセスもファイルも触らない** = ui.json・skills の
-/// 読みと報告の無い claude の調べは背景の段）
-pub fn status_ctx(host: &dyn ControlHost) -> Result<StatusCtx, DispatchError> {
+/// 読みと報告の無い claude の調べは背景の段）。`lang` は応答の文の言語（#2365。`tako mod` は表示言語、
+/// 枠が日本語の `tako check-health` は日本語を渡す = 1 つの出力に日英を混ぜない）
+pub fn status_ctx(host: &dyn ControlHost, lang: Lang) -> Result<StatusCtx, DispatchError> {
     let hub = hub(host)?;
     let now = Instant::now();
     let injection = hub.decide(core::ab_off());
@@ -763,7 +768,7 @@ pub fn status_ctx(host: &dyn ControlHost) -> Result<StatusCtx, DispatchError> {
                     crate::claude_tui::ClaudeScreen::Unknown
                 )
             });
-            let mut row = pane_row(hub, id, pane.title(), on_screen, now);
+            let mut row = pane_row(hub, id, pane.title(), on_screen, now, lang);
             // #1964: GUI モードでこのペインのチャットを誰が出すか（mod が描いている組は report.renders.chat）
             if hub.reports.contains_key(&id.as_u64()) {
                 row["chat"] = chat_owner_json(host, id, now);
@@ -825,11 +830,11 @@ pub fn status_ctx(host: &dyn ControlHost) -> Result<StatusCtx, DispatchError> {
             "ui_mode": host.ui_mode().as_str(),
             "legacy": core::chat_legacy(),
         },
-        "reason": injection.off_reason().map(reason_json),
+        "reason": injection.off_reason().map(|r| reason_json(r, lang)),
         "plugin_dir": hub.plugin_dir.as_ref().map(|p| p.display().to_string()),
         "install": match &hub.install_result {
             Some(Ok(outcome)) => json!(outcome.as_str()),
-            Some(Err(e)) => json!(format!("error: {e}")),
+            Some(Err(e)) => json!(format!("error: {}", e.text_in(lang))),
             None => Value::Null,
         },
         "cli": hub.cli.as_ref().map(|p| p.display().to_string()),
@@ -855,6 +860,7 @@ pub fn status_ctx(host: &dyn ControlHost) -> Result<StatusCtx, DispatchError> {
         plugin_dir: hub.plugin_dir.clone(),
         probes,
         over_limit,
+        lang,
     })
 }
 
@@ -915,6 +921,7 @@ fn finish_status(ctx: StatusCtx, evidence: Option<&HashMap<u64, core::NoReportEv
         enabled,
         probes,
         over_limit,
+        lang,
         ..
     } = ctx;
     // #1960: 定型の UI 設定（帯の中継の正本 = band.hidden もここから）
@@ -926,12 +933,12 @@ fn finish_status(ctx: StatusCtx, evidence: Option<&HashMap<u64, core::NoReportEv
     }
     // S7-1（#1959）: 設定 dir ごとの skills/tako（読むだけ。報告で見えた dir も含む）
     out["skills"] =
-        crate::claude_mod_install::status_json(&reported, claude_version.as_deref(), enabled);
+        crate::claude_mod_install::status_json(&reported, claude_version.as_deref(), enabled, lang);
     if let (Some(evidence), Some(rows)) = (evidence, out["panes"].as_array_mut()) {
         for row in rows.iter_mut().filter(|r| r["state"] == NO_REPORT) {
             let found = row["pane"].as_u64().and_then(|pane| evidence.get(&pane));
             if let Some(found) = found {
-                row["reason"] = no_report_reason(core::classify_no_report(Some(found)));
+                row["reason"] = no_report_reason(core::classify_no_report(Some(found)), lang);
             }
         }
     }
@@ -954,7 +961,10 @@ pub fn finish_status_in_background(ctx: StatusCtx) -> Value {
 /// `tako mod`（status）の同期の腕（テスト・直呼び・`on` / `off` / `band-*` の応答・A/B）。
 /// 実プロセスは調べない（UI スレッドで走りうるので）= 報告の無いペインの理由は候補を並べた文
 fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
-    Ok(finish_status(status_ctx(host)?, None))
+    Ok(finish_status(
+        status_ctx(host, tako_core::i18n::lang())?,
+        None,
+    ))
 }
 
 // --- `tako check-health` の mod の項目（#1891） -------------------------------------
@@ -1028,7 +1038,7 @@ pub fn health_issues(section: &Value) -> Vec<Value> {
         issues.push(json!({
             "level": "info",
             "check": "claude_mod",
-            "message": text::injection_line(section),
+            "message": text::injection_line(section, Lang::Ja),
         }));
     }
     let lines: Vec<String> = section["panes"]
@@ -1056,18 +1066,597 @@ pub fn health_issues(section: &Value) -> Vec<Value> {
 /// 人が読む行（#1891）。`tako mod` と `tako check-health` の CLI が**同じ関数で**同じ字面を出す
 pub mod text {
     use serde_json::Value;
+    use tako_core::i18n::Lang;
 
-    /// 1 行目（注入するか・しないなら理由。分からなければ不明と理由）
-    pub fn injection_line(status: &Value) -> String {
+    /// `tako mod`（status / on / off / band / install / uninstall）の応答の枠と CLI の表示の文（#2365。
+    /// 日英の正本は [`Self::text_in`]）。`tako mod` は表示言語、枠が日本語の `tako check-health` と
+    /// setup・persist.log は日本語で引く（1 つの出力に日英を混ぜない）
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum ModText {
+        /// `on` / `off` の応答の `applies_to`
+        AppliesToOnOff,
+        /// `band-on` / `band-off` の応答の `applies_to`
+        AppliesToBand,
+        /// `install` の応答の `applies_to`
+        AppliesToInstall,
+        /// `uninstall` の応答の `applies_to`
+        AppliesToUninstall,
+        /// mod を扱わない tako（2 つ目のインスタンス等）への断り
+        NoHub,
+        /// 知らない action の断り
+        UnknownAction { action: String },
+        /// install / uninstall 以外の action の断り（`claude_mod_install::run_action`）
+        UnknownInstallAction { action: String },
+        /// ペインの報告が失効した
+        Stale { age_secs: u64, fresh_for_secs: u64 },
+        /// 帯が他の mod に隠された
+        BandHiddenByOtherMod,
+        /// skills/tako の写しが古い
+        SkillsOutdated,
+        /// skills/tako が Claude Code の /plugin で止められている
+        SkillsUserDisabled,
+        /// skills/tako をまだ入れていない
+        SkillsNotInstalled,
+        /// 設定 dir が無い
+        SkillsNoConfigDir,
+        /// `tako mod install|uninstall` で置けない（外せない）設定 dir があった（CLI の終了コード 1）
+        InstallTargetsFailed,
+        /// 1 行目: 分からない（理由つき）
+        InjectionUnknown { reason: String },
+        /// 1 行目: 注入する
+        Injecting,
+        /// 1 行目: 注入しない（理由つき）
+        NotInjecting { reason: String },
+        /// 1 行目: 注入しない（理由なし）
+        NotInjectingBare,
+        /// 2 行目: claude と mod の版・展開の結果
+        VersionLine {
+            claude: Option<String>,
+            min: String,
+            mod_version: String,
+            install: String,
+        },
+        /// `tako mod install|uninstall` の 1 行目
+        InstallHeading {
+            install: bool,
+            dry_run: bool,
+            claude: Option<String>,
+            min: String,
+        },
+        /// 設定 dir ごとの skills/tako の見出し
+        SkillsHeading,
+        /// skills を入れない A/B
+        SkillsLegacy,
+        /// 設定 dir の行の末尾: 置いた
+        SkillsWritten,
+        /// 設定 dir の行の末尾: 外した
+        SkillsRemoved,
+        /// 設定 dir の行の末尾: 置く予定（dry-run）
+        SkillsWritePlanned,
+        /// 設定 dir の行の末尾: 外す予定（dry-run）
+        SkillsRemovePlanned,
+        /// 帯を描かない A/B
+        BandLegacy,
+        /// 帯の閾値と中継の要求（`request` は `Some(true)` = 隠す・`Some(false)` = 出す・`None` = 要求なし）
+        BandLine {
+            ctx_percent: u64,
+            limit_percent: f64,
+            request: Option<bool>,
+        },
+        /// カードを描かない A/B
+        CardsLegacy,
+        /// カードの置き場
+        CardsPlace { place: String },
+        /// 会話の行のカードをクリックで押せる
+        CardsClickable,
+        /// 会話の行のカードにボタンを置かない A/B
+        CardsNoButtonLegacy,
+        /// クリックを渡していない
+        CardsNoClick,
+        /// ペインの行: 帯を隠している
+        PaneBandHidden,
+        /// ペインの行: 帯の桁と区画
+        PaneBandShown { columns: u64, segments: String },
+        /// ペインの行: 帯を描いていない
+        PaneBandNotDrawn,
+        /// ペインの行: 帯に描いたカード
+        PaneCards { ids: String },
+        /// ペインの行: 最後の報告からの秒
+        SecondsAgo { secs: u64 },
+    }
+
+    impl ModText {
+        /// 表示言語を明示しての文言（#2365）。(バリアント, 言語) の網羅 match で、日本語は #2365 より前の
+        /// 固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。コマンド・env の
+        /// 綴りは日英で同じ
+        pub fn text_in(&self, lang: Lang) -> String {
+            use Lang::{En, Ja};
+            let not_checked = |claude: &Option<String>, lang: Lang| -> String {
+                match (claude.as_deref(), lang) {
+                    (Some(v), _) => v.to_string(),
+                    (None, Ja) => "未判定".into(),
+                    (None, En) => "not checked".into(),
+                }
+            };
+            match (self, lang) {
+                (Self::AppliesToOnOff, Ja) => {
+                    "次に作るペインから（動いている claude には効かない。止めるなら claude を起動し直す）"
+                        .into()
+                }
+                (Self::AppliesToOnOff, En) => "from the next pane created (running claude is not \
+                     affected; restart claude to stop it)"
+                    .into(),
+                (Self::AppliesToBand, Ja) => {
+                    "動いている claude の帯へ次の報告（最大 15 秒）で届く。Claude Code の中で /tako band on|off \
+                     を後から打てば、そちらが勝つ"
+                        .into()
+                }
+                (Self::AppliesToBand, En) => "reaches the band of running claude with the next \
+                     report (within 15 seconds); typing /tako band on|off inside Claude Code \
+                     afterwards wins"
+                    .into(),
+                (Self::AppliesToInstall, Ja) => {
+                    "走っている claude にもホットリロードで効く（tako の外の claude では休眠）".into()
+                }
+                (Self::AppliesToInstall, En) => "takes effect in running claude too via hot \
+                     reload (dormant in claude outside tako)"
+                    .into(),
+                (Self::AppliesToUninstall, Ja) => {
+                    "走っている claude からも外れる。tako のペインには env の注入（S1）で今までどおり読まれる"
+                        .into()
+                }
+                (Self::AppliesToUninstall, En) => "removed from running claude too; tako panes \
+                     keep loading it through the env injection (S1) as before"
+                    .into(),
+                (Self::NoHub, Ja) => "この tako は mod を扱わない（2 つ目のインスタンス等）".into(),
+                (Self::NoHub, En) => {
+                    "this tako does not handle the mod (a second instance, etc.)".into()
+                }
+                (Self::UnknownAction { action }, Ja) => {
+                    format!("未知の action: {action}（{}）", super::ACTIONS.join(" / "))
+                }
+                (Self::UnknownAction { action }, En) => {
+                    format!("unknown action: {action} ({})", super::ACTIONS.join(" / "))
+                }
+                (Self::UnknownInstallAction { action }, Ja) => {
+                    format!("未知の action: {action}（install / uninstall）")
+                }
+                (Self::UnknownInstallAction { action }, En) => {
+                    format!("unknown action: {action} (install / uninstall)")
+                }
+                (
+                    Self::Stale {
+                        age_secs,
+                        fresh_for_secs,
+                    },
+                    Ja,
+                ) => format!(
+                    "最後の報告から {age_secs} 秒（{fresh_for_secs} 秒で失効）。claude が終わったか mod が止まった"
+                ),
+                (
+                    Self::Stale {
+                        age_secs,
+                        fresh_for_secs,
+                    },
+                    En,
+                ) => format!(
+                    "{age_secs} seconds since the last report (expires after {fresh_for_secs} \
+                     seconds); claude has exited or the mod stopped"
+                ),
+                (Self::BandHiddenByOtherMod, Ja) => {
+                    "帯は他の mod に隠された（Claude Code の帯のフックが呼ばれていない = 外側の mod が next を\
+                     呼ばずに帯を描いている）。入力欄の下の行のバーとサイドバー（/tako）はそのまま使える"
+                        .into()
+                }
+                (Self::BandHiddenByOtherMod, En) => "the band is hidden by another mod (Claude \
+                     Code's band hook is not called = an outer mod draws the band without calling \
+                     next); the bar below the input line and the sidebar (/tako) still work"
+                    .into(),
+                (Self::SkillsOutdated, Ja) => {
+                    "tako の写しが古い（tako mod install か次の GUI 起動で差し替わる）".into()
+                }
+                (Self::SkillsOutdated, En) => "the tako copy is outdated (tako mod install or the \
+                     next GUI start replaces it)"
+                    .into(),
+                (Self::SkillsUserDisabled, Ja) => {
+                    "Claude Code の /plugin で tako@skills-dir が止められている（tako のペインでも休眠する）"
+                        .into()
+                }
+                (Self::SkillsUserDisabled, En) => "tako@skills-dir is disabled in Claude Code's \
+                     /plugin (dormant in tako panes too)"
+                    .into(),
+                (Self::SkillsNotInstalled, Ja) => {
+                    "まだ入れていない（tako mod install / tako setup で入る）".into()
+                }
+                (Self::SkillsNotInstalled, En) => {
+                    "not put in yet (tako mod install / tako setup puts it in)".into()
+                }
+                (Self::SkillsNoConfigDir, Ja) => {
+                    "設定 dir が無い（claude がまだ使っていない。tako は設定 dir を作らない）".into()
+                }
+                (Self::SkillsNoConfigDir, En) => "no config dir (claude has not used it yet; tako \
+                     does not create config dirs)"
+                    .into(),
+                (Self::InstallTargetsFailed, Ja) => {
+                    "置けない（外せない）設定 dir がある（targets の error）".into()
+                }
+                (Self::InstallTargetsFailed, En) => "some config dirs could not be written or \
+                     cleared (see error in targets)"
+                    .into(),
+                (Self::InjectionUnknown { reason }, Ja) => format!("tako mod: 不明（{reason}）"),
+                (Self::InjectionUnknown { reason }, En) => {
+                    format!("tako mod: unknown ({reason})")
+                }
+                (Self::Injecting, Ja) => "tako mod: 新しく作るペインへ注入する".into(),
+                (Self::Injecting, En) => "tako mod: injected into newly created panes".into(),
+                (Self::NotInjecting { reason }, Ja) => format!("tako mod: 注入しない（{reason}）"),
+                (Self::NotInjecting { reason }, En) => {
+                    format!("tako mod: not injected ({reason})")
+                }
+                (Self::NotInjectingBare, Ja) => "tako mod: 注入しない".into(),
+                (Self::NotInjectingBare, En) => "tako mod: not injected".into(),
+                (
+                    Self::VersionLine {
+                        claude,
+                        min,
+                        mod_version,
+                        install,
+                    },
+                    Ja,
+                ) => format!(
+                    "claude {}（下限 {min}）/ mod {mod_version} / 展開 {install}",
+                    not_checked(claude, Ja)
+                ),
+                (
+                    Self::VersionLine {
+                        claude,
+                        min,
+                        mod_version,
+                        install,
+                    },
+                    En,
+                ) => format!(
+                    "claude {} (minimum {min}) / mod {mod_version} / unpacked {install}",
+                    not_checked(claude, En)
+                ),
+                (
+                    Self::InstallHeading {
+                        install,
+                        dry_run,
+                        claude,
+                        min,
+                    },
+                    Ja,
+                ) => {
+                    let verb = match (*install, *dry_run) {
+                        (true, true) => "tako mod install（dry-run。何も書いていない）",
+                        (true, false) => "tako mod install",
+                        (false, true) => "tako mod uninstall（dry-run。何も書いていない）",
+                        (false, false) => "tako mod uninstall",
+                    };
+                    format!("{verb}: claude {}（下限 {min}）", not_checked(claude, Ja))
+                }
+                (
+                    Self::InstallHeading {
+                        install,
+                        dry_run,
+                        claude,
+                        min,
+                    },
+                    En,
+                ) => {
+                    let verb = match (*install, *dry_run) {
+                        (true, true) => "tako mod install (dry-run; nothing written)",
+                        (true, false) => "tako mod install",
+                        (false, true) => "tako mod uninstall (dry-run; nothing written)",
+                        (false, false) => "tako mod uninstall",
+                    };
+                    format!(
+                        "{verb}: claude {} (minimum {min})",
+                        not_checked(claude, En)
+                    )
+                }
+                (Self::SkillsHeading, Ja) => "Claude Code の設定 dir（skills/tako）:".into(),
+                (Self::SkillsHeading, En) => "Claude Code config dirs (skills/tako):".into(),
+                (Self::SkillsLegacy, Ja) => {
+                    "skills: 入れない（TAKO_1959_LEGACY / TAKO_1877_NO_MOD）".into()
+                }
+                (Self::SkillsLegacy, En) => {
+                    "skills: not put in (TAKO_1959_LEGACY / TAKO_1877_NO_MOD)".into()
+                }
+                (Self::SkillsWritten, Ja) => "  → 置いた".into(),
+                (Self::SkillsWritten, En) => "  → put in".into(),
+                (Self::SkillsRemoved, Ja) => "  → 外した".into(),
+                (Self::SkillsRemoved, En) => "  → removed".into(),
+                (Self::SkillsWritePlanned, Ja) => "  → 置く予定".into(),
+                (Self::SkillsWritePlanned, En) => "  → to be put in".into(),
+                (Self::SkillsRemovePlanned, Ja) => "  → 外す予定".into(),
+                (Self::SkillsRemovePlanned, En) => "  → to be removed".into(),
+                (Self::BandLegacy, Ja) => "帯: 描かない（TAKO_1877_S3_LEGACY）".into(),
+                (Self::BandLegacy, En) => "band: not drawn (TAKO_1877_S3_LEGACY)".into(),
+                (
+                    Self::BandLine {
+                        ctx_percent,
+                        limit_percent,
+                        request,
+                    },
+                    Ja,
+                ) => {
+                    let request = match request {
+                        Some(true) => "・隠す（tako mod band on で戻す）",
+                        Some(false) => "・出す",
+                        None => "",
+                    };
+                    format!(
+                        "帯: ctx {ctx_percent}% / 使用制限 {limit_percent}% 以上で ctx・使用制限も出す{request}"
+                    )
+                }
+                (
+                    Self::BandLine {
+                        ctx_percent,
+                        limit_percent,
+                        request,
+                    },
+                    En,
+                ) => {
+                    let request = match request {
+                        Some(true) => "; hidden (tako mod band on shows it again)",
+                        Some(false) => "; shown",
+                        None => "",
+                    };
+                    format!(
+                        "band: ctx and usage limits also shown at ctx {ctx_percent}% / usage \
+                         limit {limit_percent}% or more{request}"
+                    )
+                }
+                (Self::CardsLegacy, Ja) => "カード: ペイン下のカード帯（TAKO_1963_LEGACY）".into(),
+                (Self::CardsLegacy, En) => {
+                    "cards: the card strip below the pane (TAKO_1963_LEGACY)".into()
+                }
+                (Self::CardsPlace { place }, Ja) => format!(
+                    "カード: 置き場 {place}（mod が Claude Code の画面に描いたカードはペイン下のカード帯に出さない）"
+                ),
+                (Self::CardsPlace { place }, En) => format!(
+                    "cards: place {place} (cards the mod draws on Claude Code's screen are left \
+                     out of the card strip below the pane)"
+                ),
+                (Self::CardsClickable, Ja) => {
+                    "  会話の行のカードの「実行」をクリック 1 回で押せる（全画面の claude）".into()
+                }
+                (Self::CardsClickable, En) => "  the Run button on cards in conversation lines \
+                     works with one click (full-screen claude)"
+                    .into(),
+                (Self::CardsNoButtonLegacy, Ja) => {
+                    "  会話の行のカードにボタンを置かない（TAKO_2159_LEGACY）。帯の ctrl+x → Tab → キーで押す"
+                        .into()
+                }
+                (Self::CardsNoButtonLegacy, En) => "  no buttons on cards in conversation lines \
+                     (TAKO_2159_LEGACY); press them with ctrl+x → Tab → key in the band"
+                    .into(),
+                (Self::CardsNoClick, Ja) => {
+                    "  クリックを渡していないので、帯の ctrl+x → Tab → キーで押す（クリックで押すなら tako mouse on）"
+                        .into()
+                }
+                (Self::CardsNoClick, En) => "  clicks are not forwarded, so press them with \
+                     ctrl+x → Tab → key in the band (tako mouse on enables clicking)"
+                    .into(),
+                (Self::PaneBandHidden, Ja) => "  帯 非表示".into(),
+                (Self::PaneBandHidden, En) => "  band hidden".into(),
+                (Self::PaneBandShown { columns, segments }, Ja) => {
+                    format!("  帯 {columns} 桁: {segments}")
+                }
+                (Self::PaneBandShown { columns, segments }, En) => {
+                    format!("  band {columns} columns: {segments}")
+                }
+                (Self::PaneBandNotDrawn, Ja) => "  帯 描いていない".into(),
+                (Self::PaneBandNotDrawn, En) => "  band not drawn".into(),
+                (Self::PaneCards { ids }, Ja) => format!("  カード [{ids}]"),
+                (Self::PaneCards { ids }, En) => format!("  cards [{ids}]"),
+                (Self::SecondsAgo { secs }, Ja) => format!("({secs} 秒前)"),
+                (Self::SecondsAgo { secs }, En) => format!("({secs}s ago)"),
+            }
+        }
+    }
+
+    impl std::fmt::Display for ModText {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.text_in(tako_core::i18n::lang()))
+        }
+    }
+
+    /// 1 行目（注入するか・しないなら理由。分からなければ不明と理由）。`lang` は行の枠の言語で、
+    /// 理由の文は応答に載っている言語のまま（応答を組んだ側が同じ言語で引く。#2365）
+    pub fn injection_line(status: &Value, lang: Lang) -> String {
         let reason = status["reason"]["message"].as_str();
         if status["available"] == Value::Bool(false) {
-            return format!("tako mod: 不明（{}）", reason.unwrap_or("-"));
+            return ModText::InjectionUnknown {
+                reason: reason.unwrap_or("-").into(),
+            }
+            .text_in(lang);
         }
         match (status["injecting"].as_bool(), reason) {
-            (Some(true), _) => "tako mod: 新しく作るペインへ注入する".to_string(),
-            (_, Some(reason)) => format!("tako mod: 注入しない（{reason}）"),
-            _ => "tako mod: 注入しない".to_string(),
+            (Some(true), _) => ModText::Injecting.text_in(lang),
+            (_, Some(reason)) => ModText::NotInjecting {
+                reason: reason.into(),
+            }
+            .text_in(lang),
+            _ => ModText::NotInjectingBare.text_in(lang),
         }
+    }
+
+    /// `tako mod`（status / on / off / band）の CLI の表示（#1879）。`lang` は行の枠の言語で、
+    /// 理由の文は応答に載っている言語のまま（GUI が同じ表示言語で組む。#2365）
+    pub fn status_lines(result: &Value, lang: Lang) -> Vec<String> {
+        let mut lines = Vec::new();
+        // #1891: 1 行目と理由の行は `tako check-health` と同じ関数（字面が一致する）
+        lines.push(injection_line(result, lang));
+        lines.push(
+            ModText::VersionLine {
+                claude: result["claude_version"].as_str().map(str::to_string),
+                min: result["min_claude_version"]
+                    .as_str()
+                    .unwrap_or("-")
+                    .to_string(),
+                mod_version: result["mod_version"].as_str().unwrap_or("-").to_string(),
+                install: result["install"].as_str().unwrap_or("-").to_string(),
+            }
+            .text_in(lang),
+        );
+        if let Some(note) = result["applies_to"].as_str() {
+            lines.push(note.to_string());
+        }
+        // #1959: 設定 dir ごとの skills/tako（Claude Code の /plugin に tako@skills-dir として出るもの）
+        if result["skills"]["targets"].is_array() {
+            lines.push(ModText::SkillsHeading.text_in(lang));
+            lines.extend(skills_lines(&result["skills"], lang));
+        }
+        // #1881: Claude Code の画面の帯（プロンプトの上の 1 行）
+        let band = &result["band"];
+        if band["legacy"].as_bool() == Some(true) {
+            lines.push(ModText::BandLegacy.text_in(lang));
+        } else if band.is_object() {
+            // #1960: 正本は ui.json の band.hidden（中継は toggled_at があるときだけ）
+            let request = match (band["hidden"].as_bool(), band["request"].is_object()) {
+                (Some(true), _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            lines.push(
+                ModText::BandLine {
+                    ctx_percent: band["ctx_percent"].as_u64().unwrap_or(0),
+                    limit_percent: band["limit_percent"].as_f64().unwrap_or(0.0),
+                    request,
+                }
+                .text_in(lang),
+            );
+        }
+        // #1963: コマンドカードを誰が描くか（カードごとの持ち主は `tako show-command --list` の owner）
+        let cards = &result["cards"];
+        if cards["legacy"].as_bool() == Some(true) {
+            lines.push(ModText::CardsLegacy.text_in(lang));
+        } else if let Some(place) = cards["place"].as_str() {
+            lines.push(
+                ModText::CardsPlace {
+                    place: place.to_string(),
+                }
+                .text_in(lang),
+            );
+            // #2159: 会話の行のカードをクリックで押せるか（押せなくても帯のキーで押せる）
+            match (
+                cards["click"].as_bool(),
+                cards["click_legacy"].as_bool() == Some(true),
+            ) {
+                (Some(true), _) => lines.push(ModText::CardsClickable.text_in(lang)),
+                (Some(false), true) => lines.push(ModText::CardsNoButtonLegacy.text_in(lang)),
+                (Some(false), false) => lines.push(ModText::CardsNoClick.text_in(lang)),
+                _ => {}
+            }
+        }
+        let percent = |v: &Value| v.as_f64().map_or("-".to_string(), |p| format!("{p:.0}%"));
+        for row in result["panes"].as_array().into_iter().flatten() {
+            let pane = row["pane"].as_u64().unwrap_or(0);
+            let state = row["state"].as_str().unwrap_or("-");
+            let report = &row["report"];
+            if report.is_object() {
+                let limit = |kind: &str| {
+                    report["rate_limits"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .find(|l| l["kind"] == kind)
+                        .map_or("-".to_string(), |l| percent(&l["percent_used"]))
+                };
+                let band = &report["band"];
+                let band = match (band["hidden"].as_bool(), band["shown"].as_bool()) {
+                    (Some(true), _) => ModText::PaneBandHidden.text_in(lang),
+                    (_, Some(true)) => ModText::PaneBandShown {
+                        columns: band["columns"].as_u64().unwrap_or(0),
+                        segments: band["segments"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    }
+                    .text_in(lang),
+                    (_, Some(false)) => ModText::PaneBandNotDrawn.text_in(lang),
+                    _ => String::new(),
+                };
+                // #1963: 帯に押せる形で描いたコマンドカード（無い = カードを描かせていない / 描かない mod）
+                let drawn_cards = report["renders"]["cards"]
+                    .as_array()
+                    .map(|ids| {
+                        let ids: Vec<String> = ids.iter().map(Value::to_string).collect();
+                        ModText::PaneCards {
+                            ids: ids.join(", "),
+                        }
+                        .text_in(lang)
+                    })
+                    .unwrap_or_default();
+                lines.push(format!(
+                    "  pane {pane}  {state}  ctx {}  5h {}  7d {}  {}  {}  {}{band}{drawn_cards}",
+                    percent(&report["context"]["percent"]),
+                    limit("five_hour"),
+                    limit("seven_day"),
+                    report["turn"].as_str().unwrap_or("-"),
+                    report["model"].as_str().unwrap_or("-"),
+                    ModText::SecondsAgo {
+                        secs: report["age_ms"].as_u64().unwrap_or(0) / 1000,
+                    }
+                    .text_in(lang),
+                ));
+                // #1891: 報告はあるが失効した・休眠した行は、理由も `tako check-health` と同じ字面で出す
+                if let Some(line) = reason_line(row) {
+                    lines.push(line);
+                }
+            } else if let Some(line) = reason_line(row) {
+                lines.push(line);
+            } else {
+                lines.push(format!("  pane {pane}  {state}"));
+            }
+        }
+        lines
+    }
+
+    /// 設定 dir ごとの skills/tako の行（`tako mod` と `tako mod install|uninstall` と
+    /// `tako check-health` で共通）。`lang` は行の枠の言語（理由の文は応答に載っている言語のまま。#2365）
+    pub fn skills_lines(skills: &Value, lang: Lang) -> Vec<String> {
+        let mut lines = Vec::new();
+        let Some(targets) = skills["targets"].as_array() else {
+            return lines;
+        };
+        if skills["legacy"].as_bool() == Some(true) {
+            lines.push(ModText::SkillsLegacy.text_in(lang));
+        }
+        for t in targets {
+            let state = t["state"].as_str().unwrap_or("-");
+            let doing = match (t["action"].as_str(), t["outcome"].as_str()) {
+                (_, Some("written")) => ModText::SkillsWritten.text_in(lang),
+                (_, Some("removed")) => ModText::SkillsRemoved.text_in(lang),
+                (Some("write"), Some("planned")) => ModText::SkillsWritePlanned.text_in(lang),
+                (Some("remove"), Some("planned")) => ModText::SkillsRemovePlanned.text_in(lang),
+                (_, Some("error")) => {
+                    format!("  → error: {}", t["error"].as_str().unwrap_or("?"))
+                }
+                _ => String::new(),
+            };
+            let sources = t["sources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",");
+            lines.push(format!(
+                "  {}  {state}  [{sources}]{doing}",
+                t["config_dir"].as_str().unwrap_or("?")
+            ));
+            if let Some(reason) = t["reason"]["message"].as_str() {
+                lines.push(format!("      {reason}"));
+            }
+        }
+        lines
     }
 
     /// ペインの行の理由（報告が届いていない行だけ。`  pane N  状態  理由`）
@@ -1115,12 +1704,12 @@ mod tests {
         hub.accept(1, report("busy"), now);
         hub.accept(4, report("idle"), now - Duration::from_secs(60));
 
-        let row = pane_row(&hub, PaneId::from_raw(1), None, true, now);
+        let row = pane_row(&hub, PaneId::from_raw(1), None, true, now, Lang::Ja);
         assert_eq!(row["state"], "reporting");
         assert_eq!(row["report"]["turn"], "busy");
         assert_eq!(row["report"]["context"]["percent"], 10);
 
-        let row = pane_row(&hub, PaneId::from_raw(2), None, true, now);
+        let row = pane_row(&hub, PaneId::from_raw(2), None, true, now, Lang::Ja);
         assert_eq!(row["state"], "no_report");
         assert_eq!(row["reason"]["code"], "mod_absent");
         // #1891: 行を組む段（UI スレッド）では材料が無い = 候補を並べた文
@@ -1129,21 +1718,21 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("--safe-mode"));
-        let row = pane_row(&hub, PaneId::from_raw(2), None, false, now);
+        let row = pane_row(&hub, PaneId::from_raw(2), None, false, now, Lang::Ja);
         assert_eq!(
             row["state"], "waiting",
             "claude が居ないペインは理由を出さない"
         );
 
-        let row = pane_row(&hub, PaneId::from_raw(3), None, true, now);
+        let row = pane_row(&hub, PaneId::from_raw(3), None, true, now, Lang::Ja);
         assert_eq!(row["state"], "not_injected");
         assert_eq!(row["reason"]["code"], "disabled");
 
-        let row = pane_row(&hub, PaneId::from_raw(4), None, true, now);
+        let row = pane_row(&hub, PaneId::from_raw(4), None, true, now, Lang::Ja);
         assert_eq!(row["state"], "stale");
         assert_eq!(row["reason"]["code"], "mod_stale");
 
-        let row = pane_row(&hub, PaneId::from_raw(9), None, false, now);
+        let row = pane_row(&hub, PaneId::from_raw(9), None, false, now, Lang::Ja);
         assert_eq!(row["state"], "unknown");
     }
 
@@ -1152,7 +1741,7 @@ mod tests {
     /// 4 ペイン（1 = --safe-mode / 2 = 注入前の claude / 3 = tako mod off / 4 = 報告あり）の材料
     fn status_ctx_1891(hub: &ModHub, now: Instant) -> StatusCtx {
         let rows: Vec<Value> = (1..=4)
-            .map(|p| pane_row(hub, PaneId::from_raw(p), None, true, now))
+            .map(|p| pane_row(hub, PaneId::from_raw(p), None, true, now, Lang::Ja))
             .collect();
         StatusCtx {
             ui_path: None,
@@ -1174,6 +1763,7 @@ mod tests {
             plugin_dir: hub.plugin_dir.clone(),
             probes: Vec::new(),
             over_limit: 0,
+            lang: Lang::Ja,
         }
     }
 
@@ -1214,7 +1804,7 @@ mod tests {
         assert_eq!(rows[0]["reason"]["code"], "mod_absent");
         assert_eq!(
             rows[0]["reason"]["message"],
-            core::NoReportCause::SafeMode.describe()
+            core::NoReportCause::SafeMode.describe_in(Lang::Ja)
         );
         assert_eq!(rows[1]["reason"]["cause"], "before_injection");
         // 注入しなかった行・報告のある行は調べの材料で変わらない
@@ -1266,7 +1856,7 @@ mod tests {
             text::reason_line(&rows[0]).unwrap(),
             format!(
                 "  pane 1  no_report  {}",
-                core::NoReportCause::SafeMode.describe()
+                core::NoReportCause::SafeMode.describe_in(Lang::Ja)
             )
         );
         assert_eq!(
@@ -1275,11 +1865,11 @@ mod tests {
             "報告のある行は理由を出さない"
         );
         assert_eq!(
-            text::injection_line(&section),
-            text::injection_line(&status)
+            text::injection_line(&section, Lang::Ja),
+            text::injection_line(&status, Lang::Ja)
         );
         assert_eq!(
-            text::injection_line(&section),
+            text::injection_line(&section, Lang::Ja),
             "tako mod: 新しく作るペインへ注入する"
         );
 
@@ -1300,7 +1890,7 @@ mod tests {
         let section = health_unavailable("tako アプリへ届かない（x）");
         assert_eq!(section["available"], false);
         assert_eq!(
-            text::injection_line(&section),
+            text::injection_line(&section, Lang::Ja),
             "tako mod: 不明（tako アプリへ届かない（x））"
         );
         assert!(health_issues(&section).is_empty());
@@ -1310,7 +1900,7 @@ mod tests {
             json!({
                 "available": true,
                 "injecting": false,
-                "reason": reason_json(&reason),
+                "reason": reason_json(&reason, Lang::Ja),
                 "panes": [],
             })
         };
