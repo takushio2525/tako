@@ -470,10 +470,12 @@ mod tests {
     // --- 接続元プロセスの検証（#841）---
 
     /// テスト中だけ環境変数を差し替える（drop で必ず戻す）。
-    /// env はプロセス共有なので **`ENV_LOCK` を取ってから**使うこと
+    /// env はプロセスに 1 つなので、呼ぶのは `run_alone!` を通した子の中だけ（#2400。以前は
+    /// モジュールの `ENV_LOCK` で囲んでいたが、同じ env を読む `remote` のテストは別のロックだった）
     struct EnvGuard(&'static str, Option<String>);
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
+            tako_core::test_child::assert_alone("EnvGuard::set");
             let old = std::env::var(key).ok();
             std::env::set_var(key, value);
             Self(key, old)
@@ -481,14 +483,13 @@ mod tests {
     }
     impl Drop for EnvGuard {
         fn drop(&mut self) {
+            // tako:env-write-ok 戻すだけ（作る側の set が assert_alone で子の中を確かめている）
             match &self.1 {
                 Some(v) => std::env::set_var(self.0, v),
                 None => std::env::remove_var(self.0),
             }
         }
     }
-
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// 自分自身へループバック接続を張り、その接続を検証にかける（drop で閉じる）
     struct SelfConnection {
@@ -524,7 +525,11 @@ mod tests {
 
     #[test]
     fn tailscaleデーモンの名前判定は設置場所に依らない() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(tailscaleデーモンの名前判定は設置場所に依らない)
+        {
+            return;
+        }
         std::env::remove_var(TRUSTED_PEER_NAMES_ENV);
         // 実測で確認した 3 系統（Homebrew standalone / macOS GUI のシステム拡張 / Windows）
         assert!(looks_like_tailscale_daemon("tailscaled"));
@@ -547,7 +552,6 @@ mod tests {
 
     #[test]
     fn udsエンドポイントは接続元検証を通さない() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // **プラットフォームではなくエンドポイントの形**で分岐する（受け入れ条件 4）。
         // UDS は socket 0600 + 親 0700 で別ユーザーの接続自体が起きない
         let uds = Endpoint::Unix(PathBuf::from("/tmp/x.sock"));
@@ -561,7 +565,11 @@ mod tests {
 
     #[test]
     fn tailscaledでないローカルプロセスの接続は拒否される() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(tailscaledでないローカルプロセスの接続は拒否される)
+        {
+            return;
+        }
         std::env::remove_var(LEGACY_ENV);
         std::env::remove_var(TRUSTED_PEER_NAMES_ENV);
         let conn = SelfConnection::new();
@@ -576,7 +584,10 @@ mod tests {
 
     #[test]
     fn 信頼名に載せた接続元は通る() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(信頼名に載せた接続元は通る) {
+            return;
+        }
         std::env::remove_var(LEGACY_ENV);
         let conn = SelfConnection::new();
         // 「正規の tailscaled からの接続」の代理（実 tailscaled は root で動くので
@@ -591,7 +602,10 @@ mod tests {
 
     #[test]
     fn 材料が無ければ拒否側へ倒れる() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(材料が無ければ拒否側へ倒れる) {
+            return;
+        }
         std::env::remove_var(LEGACY_ENV);
         let ep = Endpoint::Loopback(40001);
         // 接続元アドレスが取れない
@@ -614,7 +628,10 @@ mod tests {
 
     #[test]
     fn 閉じた接続でも所有者を取り違えない() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(閉じた接続でも所有者を取り違えない) {
+            return;
+        }
         std::env::remove_var(LEGACY_ENV);
         std::env::remove_var(TRUSTED_PEER_NAMES_ENV);
         // ブロックを抜けた時点で両端が閉じる。
@@ -639,7 +656,10 @@ mod tests {
 
     #[test]
     fn 検証結果はキャッシュしない() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(検証結果はキャッシュしない) {
+            return;
+        }
         std::env::remove_var(LEGACY_ENV);
         std::env::remove_var(TRUSTED_PEER_NAMES_ENV);
         let conn = SelfConnection::new();
@@ -660,7 +680,10 @@ mod tests {
 
     #[test]
     fn legacyは検証を切って旧挙動へ戻す() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(legacyは検証を切って旧挙動へ戻す) {
+            return;
+        }
         std::env::remove_var(TRUSTED_PEER_NAMES_ENV);
         let conn = SelfConnection::new();
         assert!(matches!(

@@ -21,11 +21,10 @@ use tako_core::i18n::Lang;
 
 #[test]
 fn 失敗1_cliがpathに無ければ理由と次の一手が出る() {
-    // 実経路（境界 B16 = `platform::exe::find`）で「無い」を作る。
-    // 実在しない名前を探させるのではなく、**PATH を空にして本物の名前を探させる**
-    let original = std::env::var_os("PATH");
-    // exe::find は unix ではログインシェル経由なので、PATH だけでは隠せないことがある。
-    // ここでは locate の戻りではなく、失敗したときの文言が正しいことを固定する
+    // 実経路（境界 B16 = `platform::exe::find`）は unix ではログインシェル経由なので、
+    // PATH だけでは「無い」を作れない。ここでは locate の戻りではなく、失敗したときの文言が
+    // 正しいことを固定する（PATH は触らない。以前は控えた値を書き戻すだけの set_var があり、
+    // 値は変えないままプロセスの env を書き換えていた = #2400）
     let err = AgentCliError {
         agent: WorkerAgent::Codex,
         problem: AgentCliProblem::NotFound,
@@ -45,9 +44,6 @@ fn 失敗1_cliがpathに無ければ理由と次の一手が出る() {
     match agent_cli::locate(WorkerAgent::Codex) {
         Ok(path) => assert!(!path.is_empty(), "解決したパスは空でない"),
         Err(e) => assert_eq!(e.problem, AgentCliProblem::NotFound),
-    }
-    if let Some(p) = original {
-        unsafe { std::env::set_var("PATH", p) };
     }
 }
 

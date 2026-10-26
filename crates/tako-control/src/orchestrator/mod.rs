@@ -4429,6 +4429,10 @@ mod tests {
 
     #[test]
     fn issue1453_legacyは生成しない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1453_legacyは生成しない) {
+            return;
+        }
         let key = "_tako_1453_legacy_";
         let _guard = t1453_setup(key, "/tmp/_tako_1453_repo_");
         let restore = std::env::var("TAKO_1453_LEGACY").ok();

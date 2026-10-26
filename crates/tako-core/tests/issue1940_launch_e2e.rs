@@ -162,6 +162,7 @@ impl Fixture {
 
 type Rx = futures::channel::mpsc::UnboundedReceiver<tako_core::SessionEvent>;
 
+// tako:env-write-ok このバイナリの 2 本はどちらも同じく外すだけで、TMUX を入れるテストは無い（器の中で走らせた cargo test が入れ子ガードに弾かれないため。#2400）
 fn spawn(fx: &Fixture, cols: usize, rows: usize) -> (TerminalSession, Rx) {
     unsafe {
         std::env::remove_var("TMUX");

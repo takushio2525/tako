@@ -244,6 +244,7 @@ fn 状態を送らないサーバの握手直後の空は最初の診断まで�
 
 /// A/B（検出力の実証）: #1977 の前は、猶予が明けた後の空がそのまま 0 件で確定する（同じ順序）
 #[test]
+// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 旧挙動では猶予の後の空がそのまま確定する() {
     let _env = serial();
     std::env::set_var("TAKO_1977_LEGACY", "1");
@@ -645,6 +646,7 @@ fn 書けない置き場では消さずに理由を返す() {
 
 /// A/B: 旧腕（`TAKO_1977_LEGACY=1`）は起こしても片付けない
 #[test]
+// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 旧挙動では片付けない() {
     let _env = serial();
     let scratch = Scratch::new("sweep-legacy");
@@ -769,6 +771,7 @@ fn シェル統合の合図は引き直しを待たず間隔は直前の_1_巡�
 
 /// 間隔の決め方（下限 15 秒・時間 × 50・上限 5 分。旧腕は固定の 15 秒）
 #[test]
+// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 引き直しの間隔は直前の_1_巡の_50_倍を下限と上限に収める() {
     let _env = serial();
     let secs = |ms: u64| recheck_interval(Some(Duration::from_millis(ms))).as_secs();

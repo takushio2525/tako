@@ -82,8 +82,11 @@ fn remove_trust_entry(dir: &Path) {
 }
 
 /// 隔離 env（persist.log の書き先と tmux ソケット）をプロセスへ入れる。
-/// `find_claude_pid_for_backend` / `socket_name` はこの env を読む
+/// `find_claude_pid_for_backend` / `socket_name` はこの env を読む。
+/// 呼ぶのは `run_alone!` を通したその 1 本だけの子の中だけ（#2400。3 本を `--ignored` でまとめて
+/// 回すと、後から入れた置き場と送達モードが先のテストへ漏れていた）
 fn isolate(name: &str) -> PathBuf {
+    tako_core::test_child::assert_alone("isolate");
     let data = work_dir(&format!("{name}-data"));
     std::fs::create_dir_all(&data).expect("data dir を作れる");
     std::env::set_var("TAKO_DATA_DIR", &data);
@@ -234,6 +237,10 @@ fn transcript_len(session_id: &str) -> u64 {
 #[test]
 #[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
 fn peer_送達が_idle_の_worker_へ届く() {
+    // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+    if tako_core::run_alone!(peer_送達が_idle_の_worker_へ届く) {
+        return;
+    }
     isolate("idle");
     let dir = work_dir("idle");
     let guard = launch_claude("peer-idle", &dir);
@@ -293,6 +300,10 @@ fn peer_送達が_idle_の_worker_へ届く() {
 #[test]
 #[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
 fn peer_送達が_busy_の_worker_へ届く() {
+    // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+    if tako_core::run_alone!(peer_送達が_busy_の_worker_へ届く) {
+        return;
+    }
     isolate("busy");
     let dir = work_dir("busy");
     let guard = launch_claude("peer-busy", &dir);
@@ -371,6 +382,10 @@ fn peer_送達が_busy_の_worker_へ届く() {
 #[test]
 #[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
 fn peer_が使えないときはキー経路で届く() {
+    // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+    if tako_core::run_alone!(peer_が使えないときはキー経路で届く) {
+        return;
+    }
     isolate("fallback");
     // peer 不成立を模擬する（実環境の「サーバー側 gate off」「古い claude」と同じ結果）
     std::env::set_var(peer_messaging::ENV_MODE, "off");

@@ -140,6 +140,7 @@ impl Drop for Restore {
 
 /// 受け入れ条件 1・2: 倒れること、そして落ちても次回起動で戻ること
 #[test]
+// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 倒したあと落ちても次回起動の残留復元で元へ戻る() {
     let _serial = serial();
     let dir = std::env::temp_dir().join(format!("tako-lid-e2e-{}", std::process::id()));
@@ -187,6 +188,7 @@ fn 倒したあと落ちても次回起動の残留復元で元へ戻る() {
 /// 蓋の設定は電源プランに書かれる永続設定なので、電源要求と違って OS が回収してくれない。
 /// ここが抜けると「tako を終了したら蓋を閉じてもスリープしない PC」が出来上がる
 #[test]
+// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 正常終了で蓋設定が元へ戻る() {
     let _serial = serial();
     let dir = std::env::temp_dir().join(format!("tako-lid-exit-{}", std::process::id()));
@@ -224,6 +226,7 @@ fn 正常終了で蓋設定が元へ戻る() {
 /// `Attributes = 1` で UI から隠されていて、値を明示的に書いたあとでも `/query` には
 /// 現れない（実測。`/qh` なら `LIDACTION` として出る）
 #[test]
+// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn powercfgの目でもlidactionが倒れて見える() {
     let _serial = serial();
     let dir = std::env::temp_dir().join(format!("tako-lid-pcfg-{}", std::process::id()));
@@ -276,6 +279,7 @@ fn powercfgの目でもlidactionが倒れて見える() {
 
 /// 受け入れ条件 3: ユーザーが自分で設定を変えていたら、解除で勝手に戻さない
 #[test]
+// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn ユーザーが蓋設定を変えていたら解除で上書きしない() {
     let _serial = serial();
     let dir = std::env::temp_dir().join(format!("tako-lid-user-{}", std::process::id()));

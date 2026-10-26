@@ -159,7 +159,7 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `CannotCombine` = `<a> と <b> は同時に指定できない` / `ExactlyOneOf` / `AtLeastOneOf` /
   `OneOfRequired` / `NotOneOf`）。移動・コピーの断り（`tako_core::file_move::MoveRefusal` /
   `file_copy::CopyRefusal` と、それを包む「移動できない」「コピーできない」「N 件すべてできなかった」）は
-  **理由ごと**続きで移す（包みだけ移すと英語の包み + 日本語の理由に混ざる）
+  **理由ごと**続きで移した（下の項。包みだけ移すと英語の包み + 日本語の理由に混ざる）
 - #2365 の続きで、**`tako mod ui` の断り（`tako_core::claude_mod_ui` の UiError 一式）**も同じ形にした。
   1 つの断りが理由・使える値・枠（「ui.json は書いていない」「使える値:」）からなるので、半分だけ
   移すと日英が混ざる = **1 本で移す**: 理由は `UiReason`、使える値は `Allowed`（語彙の語・id は日英で
@@ -173,6 +173,18 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `choices`）がまだ日本語なのでそろえて日本語（枠ごと移すのは #2365 の続き）。
   番犬は同じ `issue1762_dispatch_error_lang.rs`（末尾の節。実経路 `claude_mod_ui::run` の断りで
   英語表示に日本語が 1 字も無いことも見る）
+- #2365 の続きで、**ファイルの移動・コピーの断り**を理由ごと移した: 理由は tako-core の
+  `MoveRefusal::text_in` / `CopyRefusal::text_in`（`reason()` / `Display` は `i18n::lang()`）、包みは
+  dispatch の `Reason::MoveRefused` / `CopyRefused`（「移動できない」「コピーできない」）と、全部断られた
+  ときに並べる `Reason::AllFailed`（N 件すべてできなかった）/ `PasteAllFailed`（貼り付けできない
+  （N 件すべて））。包みは理由を**値で持って同じ言語で引く**（文字列で受けると作った時点の言語に固まる）。
+  `Io(String)` の中身は OS のエラー文だけにする（tako が書く文を入れると英語表示に日本語が残る）ので、
+  旧 `Io` に入れていた「コピーの途中で見つからなくなった」「コピーが走らなかった」は `CopyRefusal::Vanished` /
+  `NotRun` にした（表示は旧 `Io` の形のまま・分類 `slug` は `io` のまま）。文言で判定する呼び手
+  （GUI の `is_copy_cancelled`・visual-test・単体テスト・検証スクリプト）は日英どちらの形とも突き合わせる。
+  番犬は同じ `issue1762_dispatch_error_lang.rs`（tako-core のエラー型の節 + 包みと理由の全組み合わせ）、
+  実経路は `tests/issue2365_move_copy_lang.rs`（GUI 無しのホストへ dispatch を渡し、移動・コピー・
+  まとめた操作・貼り付けの断りで英語表示に日本語が 1 字も無いことと日本語の旧文とのバイト一致を見る）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
@@ -1213,8 +1225,40 @@ CI（env なし）では緑のテストが手元でだけ落ちる（偽の赤�
 - **番犬**: `crates/tako-control/tests/issue2204_usage_codex_watchdog.rs` の
   `libのテストはusageの読むenvを書き換えない` が、`crates/*/src` の `set_var(` / `remove_var(` の
   第 1 引数が usage の読む env（S1 / S2 / S5 の A/B・`CONFIG_DIRS_ENV`・`CODEX_HOMES_ENV`）を指す行を
-  `file:line` で落とす。usage 以外の env は見ない（既存の `TEST_ENV_LOCK` で直列にしている
-  モジュールがある）
+  `file:line` で落とす。usage 以外の env と、テストのコード全体の書き換えは下の #2400 の番犬が見る
+  （こちらは usage の env なら製品のコードの書き換えも、`run_alone!` の子の中の書き換えも落とす）
+
+## テストはプロセスの env を書き換えない（書くならその 1 本だけの子で。Issue #2400）
+
+**テスト（`crates/*/src` の `#[cfg(test)]` と `crates/*/tests`）は `std::env::set_var` / `remove_var` で
+プロセスの env を書き換えない。** env はプロセスに 1 つで、`cargo test` は 1 つのテストバイナリの中で
+テストを並列に走らせる。lib のテストは crate ごとに数千本が 1 プロセスに乗り、モジュールごとの
+`Mutex` は**別のモジュールの読み手**を止めない。上の #2391 は「走らせた人の env で結果を変えない」、
+#2395 は「lib のテストで usage の A/B を立てない」。この節はその全体版（どの env でも、結合テストでも）。
+
+- 実物: `remote` のテストが `TEST_ENV_LOCK` の下で `TAKO_841_LEGACY=1` を立てた窓に、
+  `platform::local_endpoint` のテストが別の `ENV_LOCK` の下で `verify_peer` を引き、
+  「tailscaled でない接続は拒否」が `NotRequired` に化けて落ちた（窓を広げる注入で 3/3）。
+  `HomeGuard`（`HOME`）・setup の `TAKO_DATA_DIR`・`TAKO_USER_TASKS_FILE` は並走する全部のテストの
+  置き場を差し替えていた
+- **書き方（上から順に）**: ① 判定を純粋関数に分けられるなら値を引数で渡す（#2395 の `walk_with`。
+  usage の env はこれしか通らない）。② env を読む入口そのものを見るなら、テストの頭で
+  `if tako_core::run_alone!(<テスト名>) { return; }` を通す（`tako_core::test_child`。親は自分の
+  テストバイナリを `--exact <名前> --include-ignored --test-threads=1` で起こし直し、子が 1 本を
+  通したことだけを見る。子のプロセスには他のテストが居ないので本文の `set_var` は漏れない）。
+  親が env を外すだけなら `rerun_alone(<名前>, &[外す env])`（結合テストは #2391 の `rerun_without`）
+- **書き換えるヘルパ**（`HomeGuard::set` / `t1479_env` / `EnvGuard::set` / `LegacyEnv::set`）は頭で
+  `tako_core::test_child::assert_alone("<名前>")` を呼ぶ。子の外で呼ばれたら panic するので、
+  呼び出し側が `run_alone!` を通し忘れても漏れる前に名指しされる
+- **やらない**: モジュールごとの `Mutex` で書き換えを囲んで済ませる（同じロックを取らない読み手が
+  別のモジュールに居る）。直列化は最後の手段で、使うなら下の目印に理由を書く
+- **番犬**: `crates/tako-control/tests/issue2400_test_env_write_watchdog.rs` が、テストの中の
+  `set_var(` / `remove_var(` を `file:line` で落とす。通すのは 3 つだけ:
+  (a) `crates/*/tests/*.rs` でテストが 1 本だけのバイナリ（2 本目を足すと落ちる）
+  (b) 囲む関数が書き換えより前に `run_alone!` / `rerun_alone` / `assert_alone` / `rerun_without` を通す
+  (c) 書き換えの段落か囲む関数の doc に `// tako:env-write-ok <理由>`（例: バイナリの全テストが
+  同じ `serial()` で 1 本ずつ走る・読み手が全部先に通す OnceLock で値は 1 つ）。コメントと文字列の中は数えない
+- 製品のコード（`TAKO_SELF_TEST` のセルフテスト・visual-test・`main` の一括隔離）は範囲外
 
 ## プロセスの生死は境界の 1 実装で決める（Issue #1557 / #1581）
 
@@ -2007,6 +2051,25 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     素の上限（30 秒）は旧の固定窓（10 秒 / 20 秒）より広く採る（#771 と同じ理由）
   - 番犬 `issue1308_pty_wait_watchdog` が、実 PTY を張るテスト
     （`TerminalSession::spawn(` を持つ関数）の自前の固定窓を `file:line` で落とす
+  - **fixture は開発者のログインシェルを経由させない**（10/25 の再発）。状態待ちに寄せた後も、
+    手元の高負荷（load 11〜18 / 18 コア）で予算 約 47 秒を使い切って落ちた（全体 51.6 秒・
+    通常は 4〜5 秒 = **1 秒の処理が 47 倍**。同じ機の自然な負荷 load 7〜42 の 8 回は
+    プロンプト 0.6〜1.0 秒 = 予算に 50 倍の余裕。load だけでは説明がつかず、予算の伸ばし方を
+    変えても届かない）。`$SHELL -l` は rc を全部読み外部コマンドを幾つも起こす（実測: 対話
+    ログイン zsh 0.6 秒 / 素の `/bin/sh -c` 5 ms 未満）うえ、「プロンプト → 打鍵の受け付け →
+    描画」の 3 段を経る。CI のシェルは素なので緑のまま手元でしか落ちない。主題に要るのは
+    画面の絵だけなので、POSIX は描画のコマンドを `/bin/sh -c` で直接起こし
+    （`i1308_direct_options`）、待つ状態を「描かれた」の 1 つにした（PowerShell は打ち込む
+    経路のまま）。A/B は `TAKO_1308_TYPED=1`（10/25 までの打ち込む経路）。注入
+    `TAKO_1308_INJECT=stuck`（ログインシェルが上がらない）/ `deaf`（プロンプトは出るが
+    打鍵が実行されない）は打ち込む経路だけを落とし、`blank`（直接経路で描かない）は
+    上限で**落ちる**ことを見る。番犬 `issue1308の現場はposixでログインシェルを経由しない`
+  - **失敗文の値は見出しの 1 行に全部載せる**（10/25 の再発）。値を 2 行目に置いていたので、
+    `grep` で `panicked at` の行だけを残した報告から waited / budget / load が消え、見立てが
+    割れた。今は `TAKO_1308_WAIT:` の行に waited / budget / base / 混み具合（始まり→終わり）/
+    load 3 値 / メモリ圧 / swap / 送った数 / 画面の変化の数 / 最後に画面が動いた時刻を載せ、
+    続けて年表（画面の変化と送った時刻）と画面を出す。「遅かった（画面は進んでいた）」と
+    「止まっていた（画面が動かなかった）」が失敗文だけで分かれる
 - **background の重い処理の戻りを回数の窓で待たない**（#1890）。visual-test 節
   `large-file-decor` / `large-file-edit`（#1660）は、読み取り表示の塗りと編集開始の全文の塗り
   （どちらも background の syntect）を `for _ in 0..3000 { 10ms 待って描く }` / `0..6000` で

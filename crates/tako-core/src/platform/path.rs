@@ -288,7 +288,6 @@ fn legacy() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
 
     /// **#1569 の本体**: `canonicalize`（verbatim）と `git rev-parse --show-toplevel`
     /// （`/` 区切り）の食い違いを跨いで相対表記が出ること。
@@ -550,19 +549,17 @@ mod tests {
         ));
     }
 
-    /// `TAKO_970_LEGACY` はプロセス全体のグローバルなので、触るテストは直列化する
-    /// （#608 / #807 / #1042 と同じ形）
-    static LEGACY_ENV: Mutex<()> = Mutex::new(());
-
-    fn legacy_guard() -> MutexGuard<'static, ()> {
-        LEGACY_ENV.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
+    /// `TAKO_970_LEGACY` を立てて、panic しても必ず戻す。
+    ///
+    /// env はプロセスに 1 つなので、呼ぶのは `run_alone!` を通したその 1 本だけの子の中だけ（#2400。
+    /// 以前はこのモジュールの `Mutex` で囲んでいたが、[`canonicalize`] は tako-core の他のモジュールの
+    /// テストも通るので、同じロックを取らない読み手まで旧挙動になりえた）
     struct LegacyEnv;
 
     impl LegacyEnv {
         fn set() -> Self {
-            // SAFETY: 呼び出し側が `legacy_guard()` で直列化している
+            crate::test_child::assert_alone("LegacyEnv::set");
+            // SAFETY: 子のプロセスにはこのテストしか居ない（上の assert_alone）
             unsafe { std::env::set_var("TAKO_970_LEGACY", "1") };
             Self
         }
@@ -570,6 +567,7 @@ mod tests {
 
     impl Drop for LegacyEnv {
         fn drop(&mut self) {
+            // tako:env-write-ok 戻すだけ（作る側の set が assert_alone で子の中を確かめている）
             // SAFETY: 同上
             unsafe { std::env::remove_var("TAKO_970_LEGACY") };
         }
@@ -577,7 +575,6 @@ mod tests {
 
     #[test]
     fn 実パスの解決は入口を通っても同じ場所を指す() {
-        let _guard = legacy_guard();
         let dir = std::env::temp_dir();
         let via_boundary = canonicalize(&dir).expect("temp_dir は解決できる");
         let raw = dir.canonicalize().expect("temp_dir は解決できる"); // watchdog-allow: 対照
@@ -595,7 +592,10 @@ mod tests {
 
     #[test]
     fn legacy_envで剥がさない旧挙動へ戻る() {
-        let _guard = legacy_guard();
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if crate::run_alone!(legacy_envで剥がさない旧挙動へ戻る) {
+            return;
+        }
         let dir = std::env::temp_dir();
         let raw = dir.canonicalize().expect("temp_dir は解決できる"); // watchdog-allow: 対照
         let _legacy = LegacyEnv::set();

@@ -334,6 +334,29 @@ pub enum Reason {
     /// `copy_cancel` の `name` が番号ではない。中身は渡された文字
     BadCopyId(String),
     CopyNotRunning(u64),
+    // ---- #2365 の続き: 移動・コピーの断り（理由は tako-core の `MoveRefusal` / `CopyRefusal`。
+    // 包みだけ移すと「英語の包み + 日本語の理由」に混ざるので理由ごと同じ言語で引く） ----
+    /// `移動できない: <理由>（<src> → <dest>）`
+    MoveRefused {
+        refusal: tako_core::file_move::MoveRefusal,
+        src: String,
+        dest: String,
+    },
+    /// `コピーできない: <理由>（<src> → <dest>）`
+    CopyRefused {
+        refusal: tako_core::file_copy::CopyRefusal,
+        src: String,
+        dest: String,
+    },
+    /// まとめた操作（`paths`）が 2 件以上すべて断られた。中身は 1 件ずつの断りの文
+    /// （1 件だけならその文をそのまま返すので、ここへは来ない）
+    AllFailed(Vec<String>),
+    /// 貼り付けが 2 件以上すべて断られた。中身は 1 件ずつの断りの文
+    PasteAllFailed(Vec<String>),
+    /// 貼るファイルがクリップボードに無い
+    NothingToPaste,
+    /// 移す先が今いるフォルダ（断りではなく、移動の応答の `note`）
+    AlreadyInFolder,
 }
 
 impl std::fmt::Display for Reason {
@@ -747,6 +770,38 @@ impl Reason {
             }
             (Self::CopyNotRunning(id), Ja) => format!("番号 {id} のコピーは走っていない"),
             (Self::CopyNotRunning(id), En) => format!("copy {id} is not running"),
+            (Self::MoveRefused { refusal, src, dest }, Ja) => {
+                format!("移動できない: {}（{src} → {dest}）", refusal.text_in(Ja))
+            }
+            (Self::MoveRefused { refusal, src, dest }, En) => {
+                format!("cannot move: {} ({src} → {dest})", refusal.text_in(En))
+            }
+            (Self::CopyRefused { refusal, src, dest }, Ja) => {
+                format!("コピーできない: {}（{src} → {dest}）", refusal.text_in(Ja))
+            }
+            (Self::CopyRefused { refusal, src, dest }, En) => {
+                format!("cannot copy: {} ({src} → {dest})", refusal.text_in(En))
+            }
+            (Self::AllFailed(reasons), Ja) => {
+                format!("{} 件すべてできなかった: {}", reasons.len(), reasons.join(" / "))
+            }
+            (Self::AllFailed(reasons), En) => {
+                format!("all {} items failed: {}", reasons.len(), reasons.join(" / "))
+            }
+            (Self::PasteAllFailed(reasons), Ja) => format!(
+                "貼り付けできない（{} 件すべて）: {}",
+                reasons.len(),
+                reasons.join(" / ")
+            ),
+            (Self::PasteAllFailed(reasons), En) => format!(
+                "cannot paste (all {} items): {}",
+                reasons.len(),
+                reasons.join(" / ")
+            ),
+            (Self::NothingToPaste, Ja) => "貼り付けるファイルがクリップボードに無い".to_string(),
+            (Self::NothingToPaste, En) => "no files to paste on the clipboard".to_string(),
+            (Self::AlreadyInFolder, Ja) => "既にそのフォルダにある（何もしていない）".to_string(),
+            (Self::AlreadyInFolder, En) => "already in that folder (nothing was done)".to_string(),
         }
     }
 
@@ -4119,11 +4174,10 @@ pub fn finish_offload(
                 }
                 CopyReply::One => {
                     let (src, dest) = job.items.into_iter().next().unwrap_or_default();
-                    let outcome = outcomes.into_iter().next().unwrap_or_else(|| {
-                        Err(tako_core::file_copy::CopyRefusal::Io(
-                            "コピーが走らなかった".into(),
-                        ))
-                    });
+                    let outcome = outcomes
+                        .into_iter()
+                        .next()
+                        .unwrap_or(Err(tako_core::file_copy::CopyRefusal::NotRun));
                     finish_file_copy(host, &src, &dest, outcome)
                 }
             }
@@ -21083,12 +21137,12 @@ fn run_file_move(
 ) -> Result<Value, DispatchError> {
     use tako_core::file_move::{self, Planned};
     let refused = |refusal: file_move::MoveRefusal| {
-        DispatchError::Operation(format!(
-            "移動できない: {}（{} → {}）",
-            refusal.reason(),
-            src.display(),
-            dest.display()
-        ))
+        Reason::MoveRefused {
+            refusal,
+            src: src.display().to_string(),
+            dest: dest.display().to_string(),
+        }
+        .operation()
     };
     let plan = match file_move::plan(src, dest).map_err(refused)? {
         Planned::Unchanged { at, kind } => {
@@ -21099,7 +21153,7 @@ fn run_file_move(
                 "to": at,
                 "kind": kind.slug(),
                 "followed": [],
-                "note": "既にそのフォルダにある（何もしていない）",
+                "note": Reason::AlreadyInFolder.to_string(),
             }));
         }
         Planned::Move(plan) => plan,
@@ -21329,16 +21383,12 @@ fn many_reply(
         }
     }
     if done.is_empty() && !failed.is_empty() {
-        let reasons: Vec<&str> = failed.iter().map(|(_, r)| r.as_str()).collect();
-        return Err(DispatchError::Operation(if reasons.len() == 1 {
-            reasons[0].to_string()
+        let mut reasons: Vec<String> = failed.into_iter().map(|(_, r)| r).collect();
+        return Err(if reasons.len() == 1 {
+            DispatchError::Operation(reasons.remove(0))
         } else {
-            format!(
-                "{} 件すべてできなかった: {}",
-                reasons.len(),
-                reasons.join(" / ")
-            )
-        }));
+            Reason::AllFailed(reasons).operation()
+        });
     }
     let mut out = json!({
         "done": done,
@@ -21356,18 +21406,18 @@ fn many_reply(
     Ok(out)
 }
 
-/// コピーを断ったときの文面（GUI の通知欄・CLI・MCP が同じ文面を出す）
+/// コピーを断ったときの文面（GUI の通知欄・CLI・MCP が同じ文面を出す。表示言語に従う = #2365）
 fn copy_refused_text(
     refusal: &tako_core::file_copy::CopyRefusal,
     src: &std::path::Path,
     dest: &std::path::Path,
 ) -> String {
-    format!(
-        "コピーできない: {}（{} → {}）",
-        refusal.reason(),
-        src.display(),
-        dest.display()
-    )
+    Reason::CopyRefused {
+        refusal: refusal.clone(),
+        src: src.display().to_string(),
+        dest: dest.display().to_string(),
+    }
+    .to_string()
 }
 
 /// 写した 1 件の応答（`copied` / `from` / `to` / `kind` / `renamed` / `entries` / `bytes`）
@@ -21459,9 +21509,8 @@ fn paste_plan(host: &dyn ControlHost, row: &std::path::Path) -> Result<PastePlan
     let row_is_dir = row.is_dir();
     let tako = host.file_clipboard();
     let os = host.os_file_clipboard_read();
-    let clip = tako_core::file_clipboard::resolve(tako.as_ref(), &os).ok_or_else(|| {
-        DispatchError::Operation("貼り付けるファイルがクリップボードに無い".into())
-    })?;
+    let clip = tako_core::file_clipboard::resolve(tako.as_ref(), &os)
+        .ok_or_else(|| Reason::NothingToPaste.operation())?;
     let items = clip
         .paths
         .iter()
@@ -21509,16 +21558,12 @@ fn paste_reply(
     failed: Vec<(std::path::PathBuf, String)>,
 ) -> Result<Value, DispatchError> {
     if pasted.is_empty() && !failed.is_empty() {
-        let reasons: Vec<&str> = failed.iter().map(|(_, r)| r.as_str()).collect();
-        return Err(DispatchError::Operation(if reasons.len() == 1 {
-            reasons[0].to_string()
+        let mut reasons: Vec<String> = failed.into_iter().map(|(_, r)| r).collect();
+        return Err(if reasons.len() == 1 {
+            DispatchError::Operation(reasons.remove(0))
         } else {
-            format!(
-                "貼り付けできない（{} 件すべて）: {}",
-                reasons.len(),
-                reasons.join(" / ")
-            )
-        }));
+            Reason::PasteAllFailed(reasons).operation()
+        });
     }
     Ok(json!({
         "mode": plan.clip.mode.slug(),
@@ -25919,6 +25964,8 @@ mod setup_run_timeout_tests {
 mod tests {
     use super::*;
     use crate::protocol::Axis;
+    use tako_core::file_copy::CopyRefusal;
+    use tako_core::file_move::MoveRefusal;
     use tako_core::pane_log::CloseOrigin;
     use tako_core::TerminalSession;
 
@@ -38182,6 +38229,11 @@ mod tests {
     #[test]
     #[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
     fn issue571_e2e_実claudeのbusyからidleへの遷移をwatchが検知する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue571_e2e_実claudeのbusyからidleへの遷移をwatchが検知する)
+        {
+            return;
+        }
         use std::time::{Duration, Instant};
 
         let base = e2e_571_base();
@@ -38411,6 +38463,11 @@ mod tests {
     #[test]
     #[ignore = "実 tmux + 実 claude + API を使う（手動実行専用）"]
     fn issue577_e2e_実claudeのpermissionダイアログをwatchが検知する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue577_e2e_実claudeのpermissionダイアログをwatchが検知する)
+        {
+            return;
+        }
         use std::time::{Duration, Instant};
 
         let base = e2e_577_base();
@@ -39499,6 +39556,10 @@ mod tests {
     /// A/B: `TAKO_1453_LEGACY=1` は同一バイナリのまま「採用しない」旧挙動を再現する
     #[test]
     fn issue1453_legacyは何も書き換えない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1453_legacyは何も書き換えない) {
+            return;
+        }
         // config_dir はプロセス共有。引き継ぎファイルを作る / 消すので直列化する
         let _guard = TEST_PROJECT_LOCK
             .lock()
@@ -42866,11 +42927,95 @@ mod tests {
     /// `TAKO_1308_INJECT=late` の遅れ。旧の固定窓 10 秒より長く、新の素の上限 30 秒より短い
     /// （不等式は `issue1308_注入の遅れは旧の窓を超えて新の上限に収まる` が拘束する）
     const I1308_INJECT_LATE_SECS: u64 = 15;
+    /// 失敗文へ残す年表の行数の上限（古いものから捨て、捨てた数も出す）
+    const I1308_TIMELINE_MAX: usize = 24;
 
     /// A/B: `TAKO_1308_LEGACY=1` は #1308 **前**の待ちへ戻す
     /// （固定窓・送り直しなし・**尽きても検査せず素通り**）
     fn legacy_1308() -> bool {
         std::env::var("TAKO_1308_LEGACY").is_ok_and(|v| v == "1")
+    }
+
+    /// A/B（#1308 の 10/25 の再発）: `TAKO_1308_TYPED=1` は 10/25 までの fixture へ戻す
+    /// （既定のログインシェルを起こし、プロンプトを待ってから描画のコマンドを打ち込む）
+    fn typed_fixture_1308() -> bool {
+        std::env::var("TAKO_1308_TYPED").is_ok_and(|v| v == "1")
+    }
+
+    /// 状態待ちの年表（#1308 の 10/25）。**画面が変わった時刻**と**送った時刻**を残す。
+    ///
+    /// 10/25 の再発は失敗文の値が残らず、「遅かった（画面は進んでいた）」のか
+    /// 「止まっていた（画面が動かなかった）」のかを後から分けられなかった。
+    /// 年表があれば、最後に画面が動いた時刻と送り直しの効き目が失敗文だけで読める
+    #[derive(Default)]
+    struct I1308Timeline {
+        lines: std::collections::VecDeque<String>,
+        dropped: usize,
+        last_screen: Option<String>,
+        changes: u32,
+        last_change: Option<std::time::Duration>,
+    }
+
+    impl I1308Timeline {
+        fn push(&mut self, at: std::time::Duration, event: String) {
+            if self.lines.len() == I1308_TIMELINE_MAX {
+                self.lines.pop_front();
+                self.dropped += 1;
+            }
+            self.lines
+                .push_back(format!("{:>6.2}s {event}", at.as_secs_f64()));
+        }
+
+        /// 画面が前回と違うときだけ 1 行残す（行数と末尾の行の頭）
+        fn observe(&mut self, at: std::time::Duration, screen: String) {
+            if self.last_screen.as_deref() == Some(screen.as_str()) {
+                return;
+            }
+            let shown: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+            let tail: String = shown
+                .last()
+                .map_or("", |l| l.trim())
+                .chars()
+                .take(40)
+                .collect();
+            self.push(at, format!("画面 {} 行（末尾 {tail:?}）", shown.len()));
+            self.changes += 1;
+            self.last_change = Some(at);
+            self.last_screen = Some(screen);
+        }
+
+        fn render(&self) -> String {
+            let mut out = String::new();
+            if self.dropped > 0 {
+                out.push_str(&format!("  （古い {} 行は省いた）\n", self.dropped));
+            }
+            for line in &self.lines {
+                out.push_str("  ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out
+        }
+    }
+
+    /// 失敗文に添える機の状態（load の 3 値・メモリ圧・swap）。採れない OS では `unknown`。
+    ///
+    /// 予算は load1 だけで伸ばしているので、**load では見えない詰まり**（メモリ圧・swap）が
+    /// 原因だったかを失敗文だけで読めるようにする（10/25 は swap 10.9 / 12 GB の機だった）
+    fn i1308_machine_line() -> String {
+        let Some(m) = tako_core::platform::resources::machine() else {
+            return "load=unknown pressure=unknown swap=unknown".to_string();
+        };
+        let load = m.load.map_or("unknown".to_string(), |l| {
+            format!("{:.1}/{:.1}/{:.1}", l[0], l[1], l[2])
+        });
+        let pressure = m
+            .pressure_level
+            .map_or("unknown".to_string(), |p| p.to_string());
+        let swap = m.swap.map_or("unknown".to_string(), |(used, total)| {
+            format!("{}/{}MB", used >> 20, total >> 20)
+        });
+        format!("load={load} pressure={pressure} swap={swap}")
     }
 
     /// **状態待ちの共通ドライバ**（#1308）。`ready` が真になるまで待つ。
@@ -42887,7 +43032,9 @@ mod tests {
     ///   （実測 2026-09-11: `prompt_ok=false waited=10.03s dialog_seen=false
     ///   waited=20.04s load=3.89` / 全件走 19 回に 1 回）
     /// - 診断は Issue 番号で名乗る（`TAKO_1308_WAIT`）。「何を待っていたか」と
-    ///   「実際に何が届いたか」を必ず出す（#1252 / #1265 の規約）
+    ///   「実際に何が届いたか」を必ず出す（#1252 / #1265 の規約）。値（waited / budget /
+    ///   混み具合 / メモリ圧 / swap / 送った数 / 最後に画面が動いた時刻）は**見出しの 1 行に
+    ///   すべて載せる**。10/25 の再発は `grep` で見出しの次の行を落とし、値が残らなかった
     fn i1308_wait_for_state(
         what: &str,
         base: std::time::Duration,
@@ -42918,23 +43065,37 @@ mod tests {
         let mut sends = u32::from(send.is_some());
         let mut next_send = started + every;
         let mut attempts = 0u32;
+        let mut timeline = I1308Timeline::default();
+        if send.is_some() {
+            timeline.push(Duration::ZERO, "送った（1 回目）".to_string());
+        }
         loop {
             attempts += 1;
+            timeline.observe(started.elapsed(), screen());
             if ready() {
                 return;
             }
             if started.elapsed() >= budget {
+                let fmt_busy =
+                    |b: Option<f64>| b.map_or("unknown".to_string(), |b| format!("{b:.2}"));
                 panic!(
-                    "TAKO_1308_WAIT: 待っていたもの={what} / 届いたもの=画面（下）\n\
-                     waited={:.1}s budget={:.1}s base={:.1}s attempts={attempts} \
-                     sends={sends} load={}\n\
+                    "TAKO_1308_WAIT: 待っていたもの={what} waited={:.1}s budget={:.1}s \
+                     base={:.1}s busy={}→{} {} sends={sends} attempts={attempts} \
+                     screen_changes={} last_change={}\n\
                      固定窓ではなく状態で待っている。ここで素通りすると、原因は\
-                     別の場所で別の顔をして現れる（#1308）\n{}",
+                     別の場所で別の顔をして現れる（#1308）\n\
+                     年表（画面の変化と送った時刻）:\n{}届いたもの=画面:\n{}",
                     started.elapsed().as_secs_f64(),
                     budget.as_secs_f64(),
                     base.as_secs_f64(),
-                    busy.map(|b| format!("{b:.2}"))
-                        .unwrap_or_else(|| "unknown".into()),
+                    fmt_busy(busy),
+                    fmt_busy(tako_core::wait_budget::machine_busy()),
+                    i1308_machine_line(),
+                    timeline.changes,
+                    timeline
+                        .last_change
+                        .map_or("never".to_string(), |d| format!("{:.1}s", d.as_secs_f64())),
+                    timeline.render(),
                     screen(),
                 );
             }
@@ -42942,6 +43103,7 @@ mod tests {
                 if let Some(send) = send {
                     send();
                     sends += 1;
+                    timeline.push(started.elapsed(), format!("送り直した（{sends} 回目）"));
                 }
                 next_send = Instant::now() + every;
             }
@@ -42949,6 +43111,8 @@ mod tests {
         }
     }
 
+    /// 打ち込む経路（PowerShell / `TAKO_1308_TYPED=1`）のログインシェルを起こす。
+    ///
     /// 注入（#1308）: 混み具合そのものは再現できないので**遅れ**を入れる
     /// （#1265 の `late` と同じ考え方）。
     ///
@@ -42962,26 +43126,66 @@ mod tests {
     /// tty のキューに残り、遅れて起きたシェルが**後から実行してしまう**
     /// （実測: 旧アームまで通ってしまい A/B にならなかった）。
     ///
+    /// 10/25 の再発（予算 約 47 秒を待ち切った）を写す注入が 2 つある。どちらも
+    /// **ログインシェルが予算のうちに使える状態にならない**ことを写す（遅れではなく止まり。
+    /// 1 秒で済む処理が 47 秒を超えたので、混み具合で予算を伸ばす形では届かない）:
+    ///
+    /// - `stuck`: シェルが上がってこない（画面は空のまま = プロンプト待ちで尽きる）
+    /// - `deaf`: プロンプトは出るが打った行が実行されない（エコーだけが積もる =
+    ///   ダイアログの描画待ちで尽きる。#1308 の 9/11 の実失敗と同じ絵）
+    ///
     /// POSIX 限定（`/bin/sh` を使う）。CI はこの env を置かない
     fn i1308_spawn_options() -> SpawnOptions {
-        if cfg!(windows) || !std::env::var("TAKO_1308_INJECT").is_ok_and(|v| v == "late") {
+        let inject = std::env::var("TAKO_1308_INJECT").unwrap_or_default();
+        if cfg!(windows) || !matches!(inject.as_str(), "late" | "stuck" | "deaf") {
             return SpawnOptions::default();
         }
-        let shell = tako_core::platform::shell::default_shell()
-            .map(|s| s.program)
-            .unwrap_or_else(|| "/bin/sh".to_string());
-        let quoted = tako_core::shell::quote_for_shell(&shell);
+        let script = match inject.as_str() {
+            "stuck" => "exec sleep 600".to_string(),
+            "deaf" => "printf '$ '; exec sleep 600".to_string(),
+            _ => {
+                let shell = tako_core::platform::shell::default_shell()
+                    .map(|s| s.program)
+                    .unwrap_or_else(|| "/bin/sh".to_string());
+                let quoted = tako_core::shell::quote_for_shell(&shell);
+                format!(
+                    "cat </dev/tty >/dev/null & drain=$!; \
+                     sleep {I1308_INJECT_LATE_SECS}; kill $drain 2>/dev/null; \
+                     exec {quoted} -l"
+                )
+            }
+        };
         SpawnOptions {
             command: Some(tako_core::SpawnCommand {
                 program: "/bin/sh".to_string(),
-                args: vec![
-                    "-c".to_string(),
-                    format!(
-                        "cat </dev/tty >/dev/null & drain=$!; \
-                         sleep {I1308_INJECT_LATE_SECS}; kill $drain 2>/dev/null; \
-                         exec {quoted} -l"
-                    ),
-                ],
+                args: vec!["-c".to_string(), script],
+            }),
+            ..SpawnOptions::default()
+        }
+    }
+
+    /// 描画のコマンドを**直接**起こす（POSIX。#1308 の 10/25 の再発）。
+    ///
+    /// 10/25 までは既定のログインシェル（`$SHELL -l` = 開発者の rc を全部読む）を起こし、
+    /// 「プロンプトが出る → 打鍵が受け付けられる → ダイアログが描かれる」の 3 段を
+    /// 待っていた。rc は外部コマンドを幾つも起こす（手元の実測: 対話ログイン zsh の起動
+    /// 0.6 秒 / 素の `/bin/sh -c` 5 ms 未満）ので、詰まった機ではここが 1 秒 → 47 秒に
+    /// 化けて予算を使い切った（CI のシェルは素なので緑のまま）。主題（#1200: respond が
+    /// 保持しているペインへ in-process で届く）に要るのは**画面にダイアログがあること**
+    /// だけなので、ログインシェルも打鍵も通さず、待つ状態を「描かれた」の 1 つにする。
+    ///
+    /// 注入 `TAKO_1308_INJECT=blank` は描かずに止まる（上限で**落ちる**ことを確かめる口。
+    /// 素通りしたら `dispatch` が無関係な原因を名指しする = #1308 の本題）
+    fn i1308_direct_options(paint: &str) -> SpawnOptions {
+        let script = if std::env::var("TAKO_1308_INJECT").is_ok_and(|v| v == "blank") {
+            "exec sleep 600".to_string()
+        } else {
+            paint.to_string()
+        };
+        SpawnOptions {
+            command: Some(tako_core::SpawnCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), script],
             }),
             ..SpawnOptions::default()
         }
@@ -43027,10 +43231,7 @@ mod tests {
         let pane_id = host.workspace().get_tab(tab_id).unwrap().tree().focused();
 
         // 選択肢ダイアログを描いて保持するペイン（claude の usage_limit と同じ形）。
-        // 素のシェルへ**打ち込む**のはセルフテスト項目 748 と同じ形（方言は
-        // `shell_dialect` が選ぶので macOS / Windows の両方で同じ絵になる）
-        let (session, _rx) = TerminalSession::spawn(80, 24, i1308_spawn_options())
-            .expect("既定シェルの PTY を張れる");
+        // 絵は `shell_dialect` が選ぶので macOS / Windows の両方で同じになる
         let Some(sh) = tako_core::platform::shell_dialect::for_default_shell() else {
             eprintln!("skip: 既定シェルの方言を決められない");
             return;
@@ -43045,20 +43246,34 @@ mod tests {
             ),
             30,
         );
+        // POSIX は描画のコマンドを**直接**起こす（#1308 の 10/25 の再発。理由は
+        // `i1308_direct_options`）。PowerShell は従来どおり素のシェルへ打ち込む
+        // （セルフテスト項目 748 と同じ形。Windows の CI はこの経路で緑）
+        let typed = !matches!(sh, tako_core::platform::shell_dialect::ShellDialect::Posix)
+            || typed_fixture_1308();
+        let options = if typed {
+            i1308_spawn_options()
+        } else {
+            i1308_direct_options(&dialog_cmd)
+        };
+        let (session, _rx) = TerminalSession::spawn(80, 24, options).expect("PTY を張れる");
 
-        // ① プロンプトが出てから打つ（出る前に打つと行が食われる）。**状態で待つ**
-        //    = 旧実装はここを固定 10 秒窓で待ち、尽きても検査せず打ち込んでいた（#1308）
-        i1308_wait_for_state(
-            "素のシェルのプロンプト",
-            I1308_PROMPT_BASE,
-            I1308_LEGACY_PROMPT_WINDOW,
-            None,
-            || session.visible_lines().join("\n"),
-            || !session.visible_lines().iter().all(|l| l.trim().is_empty()),
-        );
+        // ① （打ち込む経路だけ）プロンプトが出てから打つ（出る前に打つと行が食われる）。
+        //    **状態で待つ** = 旧実装はここを固定 10 秒窓で待ち、尽きても検査せず
+        //    打ち込んでいた（#1308）
+        if typed {
+            i1308_wait_for_state(
+                "素のシェルのプロンプト",
+                I1308_PROMPT_BASE,
+                I1308_LEGACY_PROMPT_WINDOW,
+                None,
+                || session.visible_lines().join("\n"),
+                || !session.visible_lines().iter().all(|l| l.trim().is_empty()),
+            );
+        }
 
         // ② 画面にダイアログが出るまで待つ（描画は PTY 経由なので即時ではない）。
-        //    届かないあいだは上限つきで打ち直す
+        //    打ち込む経路は、届かないあいだ上限つきで打ち直す
         let retype = || {
             session.write(format!("{dialog_cmd}\r").into_bytes());
         };
@@ -43066,7 +43281,7 @@ mod tests {
             "選択肢ダイアログの描画",
             I1308_DIALOG_BASE,
             I1308_LEGACY_DIALOG_WINDOW,
-            Some(&retype),
+            typed.then_some(&retype as &dyn Fn()),
             || session.visible_lines().join("\n"),
             || crate::claude_tui::detect_choice_dialog(&session.visible_lines()).is_some(),
         );
@@ -43604,6 +43819,10 @@ mod tests {
 
     #[test]
     fn clean_legacy_settings_json_takoキーを掃除() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(clean_legacy_settings_json_takoキーを掃除) {
+            return;
+        }
         let dir = mcp_test_dir("legacy");
         let settings = dir.join("settings.json");
         let legacy = serde_json::json!({
@@ -47121,6 +47340,10 @@ mod tests {
     /// （`TAKO_1295_INJECT_PATTERN`）から足して**将来文言を 1 つ足した状態**を作る。
     #[test]
     fn issue1295_claudeの正常完了を実行拒否へ落とさない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1295_claudeの正常完了を実行拒否へ落とさない) {
+            return;
+        }
         use crate::orchestrator::registry::{registry_path, WorkerEntry, WorkerRegistry};
         let path = registry_path().unwrap();
         // 共有レジストリの鍵は採番器から取る（spawn のテストの採番と重ねない = #2239）
@@ -48579,15 +48802,13 @@ mod tests {
     /// 隔離した置き場で `Request::UserTask` を通す（本番の `user-tasks.yaml` を触らない）。
     ///
     /// 置き場は `TAKO_USER_TASKS_FILE`（`store_path` の 1 実装が読む env）で差し替える。
-    /// env は**プロセス共通**なので、`#[test]` の並走で互いの置き場を上書きし合う
-    /// （実測: 2 本が並ぶと `add` が相手の store へ落ち、id が食い違って
-    /// 「別の行を閉じたのに展開が畳まれた」ように見えた）。排他を取り、
-    /// **元の値へ戻してからロックを解放する**（i18n の `LangGuard` と同じ形）
+    /// env は**プロセスに 1 つ**なので、呼ぶのは `run_alone!` を通した**その 1 本だけの子**の中だけ
+    /// （#2400）。並走で互いの置き場を上書きし合う（実測: 2 本が並ぶと `add` が相手の store へ落ち、
+    /// id が食い違った）のを以前はこのヘルパの排他で止めていたが、排他は同じヘルパを通るテストしか
+    /// 止めず、`store_path` を読む別の経路（`migrations` など）は差し替えた置き場を読みえた
     fn t1479_env(tag: &str) -> (tako_core::test_residue::ScratchDir, impl Drop) {
-        use std::sync::{Mutex, MutexGuard, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        tako_core::test_child::assert_alone("t1479_env");
         struct Guard {
-            _lock: MutexGuard<'static, ()>,
             original: Option<std::ffi::OsString>,
         }
         impl Drop for Guard {
@@ -48598,13 +48819,8 @@ mod tests {
                 }
             }
         }
-        let lock = LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let dir = tako_core::test_residue::ScratchDir::new(&format!("user-tasks-{tag}"));
         let guard = Guard {
-            _lock: lock,
             original: std::env::var_os("TAKO_USER_TASKS_FILE"),
         };
         std::env::set_var("TAKO_USER_TASKS_FILE", dir.path().join("user-tasks.yaml"));
@@ -48641,6 +48857,10 @@ mod tests {
     /// `list` の応答に `expanded` が載る（画面の状態を AI から読める = 設計原則 5）
     #[test]
     fn issue1479_expandは1件を開きパネルをtasksで開く() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1479_expandは1件を開きパネルをtasksで開く) {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t1479-expand");
         let mut host = MockHost::new();
         let mut add = |title: &str| {
@@ -48695,6 +48915,10 @@ mod tests {
     /// 無い id は**開いたと言わない**（存在の判定は `show` の 1 実装を通す）
     #[test]
     fn issue1479_無いidは開けない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1479_無いidは開けない) {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t1479-missing");
         let mut host = MockHost::new();
         let err = dispatch_user_task(
@@ -48714,6 +48938,10 @@ mod tests {
     /// 「開いていることになっているのに一覧に無い」が残る、を作らない
     #[test]
     fn issue1479_完了させると展開は畳まれる() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1479_完了させると展開は畳まれる) {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t1479-done");
         let mut host = MockHost::new();
         let mut add = |title: &str| {
@@ -48780,6 +49008,11 @@ mod tests {
     /// 置き場の版が同じ間は読まず、書かれた・消えた直後だけ読む。中身は dispatch の "list" と同じ
     #[test]
     fn issue2031_版が同じ間は読まず書かれた直後だけ読む() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2031_版が同じ間は読まず書かれた直後だけ読む)
+        {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2031-stamp");
         let path = dir.path().join("user-tasks.yaml");
         let mut host = MockHost::new();
@@ -48833,6 +49066,10 @@ mod tests {
     /// 壊れた置き場は 0 件へ丸めず Err（#169）。直れば読み直す
     #[test]
     fn issue2031_壊れた置き場はerrで直れば読み直す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2031_壊れた置き場はerrで直れば読み直す) {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2031-broken");
         let path = dir.path().join("user-tasks.yaml");
         let mut host = MockHost::new();
@@ -48858,6 +49095,11 @@ mod tests {
     /// background の段が書き戻す（dispatch の畳み込みと同じ確定のしかた）
     #[test]
     fn issue2031_配送の観測と書き戻しが2段に分かれて確定する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2031_配送の観測と書き戻しが2段に分かれて確定する)
+        {
+            return;
+        }
         use tako_core::user_task::DeliveryState;
         let (dir, _guard) = t1479_env("t2031-deliver");
         let path = dir.path().join("user-tasks.yaml");
@@ -48906,6 +49148,10 @@ mod tests {
     /// 読み直さなかった回も添付の実在（`exists`）は今の状態を返す（消えた添付を出せるのはそのため）
     #[test]
     fn issue2031_読まない回も添付の実在は見直す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2031_読まない回も添付の実在は見直す) {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2031-attach");
         let att = dir.path().join("shot.png");
         let mut host = MockHost::new();
@@ -48962,6 +49208,11 @@ mod tests {
     /// 段だけが Err を返す）。応答は dispatch の同期の腕と同じ形（`expanded` は要求の時点の値）
     #[test]
     fn issue2052_一覧の準備は置き場を読まずbackgroundだけが読む() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2052_一覧の準備は置き場を読まずbackgroundだけが読む)
+        {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2052-list");
         let path = dir.path().join("user-tasks.yaml");
         let mut host = MockHost::new();
@@ -49008,6 +49259,11 @@ mod tests {
     /// 触らず、③ で畳む。失敗（無い id）は UI スレッドへ戻らずに Err で、展開は残る
     #[test]
     fn issue2052_完了は書き換えをbackgroundで行い着地で畳む() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2052_完了は書き換えをbackgroundで行い着地で畳む)
+        {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2052-status");
         let mut host = MockHost::new();
         let add = |host: &mut MockHost| {
@@ -49071,6 +49327,11 @@ mod tests {
     /// 書き戻しは background。関係の無いペインのフローでは畳まない
     #[test]
     fn issue2052_配送の観測と書き戻しが分かれて確定する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2052_配送の観測と書き戻しが分かれて確定する)
+        {
+            return;
+        }
         use tako_core::user_task::DeliveryState;
         let (dir, _guard) = t1479_env("t2052-deliver");
         let path = dir.path().join("user-tasks.yaml");
@@ -49220,6 +49481,11 @@ mod tests {
     /// だけが Err）。応答は同期の腕と同じ。引数の誤りは準備で即座に断る
     #[test]
     fn issue2086_詳細と更新は準備で置き場に触れずbackgroundが読み書きする() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2086_詳細と更新は準備で置き場に触れずbackgroundが読み書きする)
+        {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2086-show");
         let path = dir.path().join("user-tasks.yaml");
         let mut host = MockHost::new();
@@ -49280,6 +49546,11 @@ mod tests {
     /// background、通知欄への 1 行は着地（UI）。戻り先の解き方（#1466）は同期の腕と同じ
     #[test]
     fn issue2086_起票は書き込みをbackgroundで行い着地で通知する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2086_起票は書き込みをbackgroundで行い着地で通知する)
+        {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2086-add");
         let path = dir.path().join("user-tasks.yaml");
         let (mut host, _master, worker) = t1466_host(
@@ -49338,6 +49609,10 @@ mod tests {
     /// master の入力欄へ届く順が届いた順のまま。運ぶのは 1 本につき 1 回
     #[test]
     fn issue2086_返答は届いた順に積み運び記録する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2086_返答は届いた順に積み運び記録する) {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2086-respond");
         let path = dir.path().join("user-tasks.yaml");
         let (mut host, master, id) = t2086_master_task();
@@ -49409,6 +49684,11 @@ mod tests {
     /// 後ろの返答は待たされない。走らせずに落ちたジョブの札も同じ。経路を省いた返答は同期の腕
     #[test]
     fn issue2086_失敗した返答と捨てた返答は後ろを待たせない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2086_失敗した返答と捨てた返答は後ろを待たせない)
+        {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2086-respond-missing");
         let (mut host, _master, id) = t2086_master_task();
         // 待たされるかは実時間ではなく札の状態で見る（`.agent/conventions.md`
@@ -49510,6 +49790,11 @@ mod tests {
     /// 組み立てが失敗したら（プロファイルが無い）タブを作らずに失敗として記録し、札は手放す
     #[test]
     fn issue2182_masterが居ない返答は組み立てをbackgroundへ出す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2182_masterが居ない返答は組み立てをbackgroundへ出す)
+        {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2182-launch");
         let path = dir.path().join("user-tasks.yaml");
         let (mut host, master, id) = t2086_master_task();
@@ -49564,6 +49849,11 @@ mod tests {
     /// 決め直してそのペインへ送る（同じプロファイルの master を 2 つにしない）
     #[test]
     fn issue2182_組み立ての間にmasterが現れたらそちらへ送る() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2182_組み立ての間にmasterが現れたらそちらへ送る)
+        {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2182-appeared");
         let (mut host, master, id) = t2086_master_task();
         t2182_set_master_role(&mut host, master, None);
@@ -49595,6 +49885,10 @@ mod tests {
     /// 返答を初回メッセージとして prompt のフローへ積む。組み立ては走らせない（渡されたものを使う）
     #[test]
     fn issue2182_組み立てた起動で起こし返答を流す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2182_組み立てた起動で起こし返答を流す) {
+            return;
+        }
         let (dir, _guard) = t1479_env("t2182-land");
         let path = dir.path().join("user-tasks.yaml");
         let (mut host, master, id) = t2086_master_task();
@@ -49643,6 +49937,11 @@ mod tests {
     /// UI スレッドで待たずに配送の失敗として記録する（返答は積めている・札は手放す）
     #[test]
     fn issue2182_直の呼び手は組み立てを待たず失敗として記録する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2182_直の呼び手は組み立てを待たず失敗として記録する)
+        {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2182-direct");
         let (mut host, master, id) = t2086_master_task();
         t2182_set_master_role(&mut host, master, None);
@@ -49665,6 +49964,10 @@ mod tests {
     /// 同期の腕（経路を省いた返答・直呼び）は組み立ても同じスレッドで順に通す（失敗の記録は同じ）
     #[test]
     fn issue2182_同期の腕は組み立ても順に通す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2182_同期の腕は組み立ても順に通す) {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2182-sync");
         let (mut host, master, id) = t2086_master_task();
         t2182_set_master_role(&mut host, master, None);
@@ -49681,6 +49984,11 @@ mod tests {
     /// background の Err で画面に触らない。折りたたみも同じ腕
     #[test]
     fn issue2086_展開は在ることをbackgroundで確かめ着地で開く() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2086_展開は在ることをbackgroundで確かめ着地で開く)
+        {
+            return;
+        }
         let (_dir, _guard) = t1479_env("t2086-expand");
         let mut host = MockHost::new();
         let id = dispatch_user_task(&mut host, PaneOrigin::Cli, t1479_params("add", None)).unwrap()
@@ -51251,6 +51559,48 @@ mod tests {
         assert_eq!(host.backend_windows_refreshes.get(), 3, "要求ごとに 1 回");
     }
 
+    /// 表示言語に従う断り（移動・コピー = #2365）を日英どちらかの形で探す。
+    /// テストは言語グローバルに触れない（並列のテストと競合する = #608）ので、言語ごとに引いて比べる
+    fn issue2365_either(text: &str, piece: impl Fn(tako_core::i18n::Lang) -> String) -> bool {
+        [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+            .into_iter()
+            .any(|lang| text.contains(&piece(lang)))
+    }
+
+    /// まとめた操作が全部断られたときの頭（`N 件すべてできなかった: ` / `all N items failed: `）
+    fn issue2365_all_failed_head(n: usize, lang: tako_core::i18n::Lang) -> String {
+        let full = Reason::AllFailed(vec!["\u{1}".into(); n]).text_in(lang);
+        full[..full.find('\u{1}').unwrap_or(full.len())].to_string()
+    }
+
+    /// 移動の断りの全文（`移動できない: <理由>（<src> → <dest>）` / `cannot move: …`）
+    fn issue2365_move_refused(
+        refusal: tako_core::file_move::MoveRefusal,
+        src: &std::path::Path,
+        dest: &std::path::Path,
+    ) -> impl Fn(tako_core::i18n::Lang) -> String {
+        let reason = Reason::MoveRefused {
+            refusal,
+            src: src.display().to_string(),
+            dest: dest.display().to_string(),
+        };
+        move |lang| reason.text_in(lang)
+    }
+
+    /// コピーの断りの全文（`コピーできない: <理由>（<src> → <dest>）` / `cannot copy: …`）
+    fn issue2365_copy_refused(
+        refusal: tako_core::file_copy::CopyRefusal,
+        src: &std::path::Path,
+        dest: &std::path::Path,
+    ) -> impl Fn(tako_core::i18n::Lang) -> String {
+        let reason = Reason::CopyRefused {
+            refusal,
+            src: src.display().to_string(),
+            dest: dest.display().to_string(),
+        };
+        move |lang| reason.text_in(lang)
+    }
+
     /// #1834 のテストの置き場。**必ず一時 dir の中**（本物のファイルを動かさない = #1811）
     fn issue1834_scratch(tag: &str) -> std::path::PathBuf {
         let dir =
@@ -51391,7 +51741,10 @@ mod tests {
             &mut host,
             issue1834_move(&dir.join("src/a.txt"), &dir.join("dst")),
         );
-        assert!(taken.contains("同じ名前"), "{taken}");
+        assert!(
+            issue2365_either(&taken, |l| MoveRefusal::NameTaken.text_in(l)),
+            "{taken}"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("dst/a.txt")).unwrap(),
             "existing\n",
@@ -51402,12 +51755,18 @@ mod tests {
             &mut host,
             issue1834_move(&dir.join("folder"), &dir.join("folder/inner")),
         );
-        assert!(descendant.contains("配下"), "{descendant}");
+        assert!(
+            issue2365_either(&descendant, |l| MoveRefusal::IntoDescendant.text_in(l)),
+            "{descendant}"
+        );
         let itself = err(
             &mut host,
             issue1834_move(&dir.join("folder"), &dir.join("folder")),
         );
-        assert!(itself.contains("自分自身"), "{itself}");
+        assert!(
+            issue2365_either(&itself, |l| MoveRefusal::IntoSelf.text_in(l)),
+            "{itself}"
+        );
         assert!(dir.join("folder/inner/x.txt").is_file());
         let missing = dispatch(
             &mut host,
@@ -52868,7 +53227,14 @@ mod tests {
             ),
         );
         assert!(
-            into.contains("配下") && into.contains("コピーできない"),
+            issue2365_either(
+                &into,
+                issue2365_copy_refused(
+                    CopyRefusal::IntoDescendant,
+                    &dir.join("folder"),
+                    &dir.join("folder/inner"),
+                ),
+            ),
             "{into}"
         );
         assert!(!dir.join("folder/inner/folder").exists(), "何も作らない");
@@ -52876,7 +53242,10 @@ mod tests {
             &mut host,
             issue1860_op(FileOpKind::Copy, &dir.join("nope"), Some(&dir.join("dst"))),
         );
-        assert!(missing.contains("コピー元が見つからない"), "{missing}");
+        assert!(
+            issue2365_either(&missing, |l| CopyRefusal::SourceMissing.text_in(l)),
+            "{missing}"
+        );
         let no_dest = dispatch(
             &mut host,
             issue1860_op(FileOpKind::Copy, &a, None),
@@ -52987,7 +53356,14 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            refused.contains("配下") && refused.contains("移動できない"),
+            issue2365_either(
+                &refused,
+                issue2365_move_refused(
+                    MoveRefusal::IntoDescendant,
+                    &dir.join("folder"),
+                    &dir.join("folder/inner"),
+                ),
+            ),
             "{refused}"
         );
         assert!(host.file_clip.is_some(), "断ったら切り取り中のまま");
@@ -53028,7 +53404,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(empty.contains("クリップボードに無い"), "{empty}");
+        assert!(
+            issue2365_either(&empty, |l| Reason::NothingToPaste.text_in(l)),
+            "{empty}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -53354,7 +53733,10 @@ mod tests {
         assert_eq!(out["done"].as_array().map(Vec::len), Some(2), "{out}");
         assert_eq!(out["failed"].as_array().map(Vec::len), Some(1), "{out}");
         let reason = out["failed"][0]["reason"].as_str().unwrap_or_default();
-        assert!(reason.contains("同じ名前"), "{reason}");
+        assert!(
+            issue2365_either(reason, |l| MoveRefusal::NameTaken.text_in(l)),
+            "{reason}"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.join("dst/a.txt")).unwrap(),
             "既にある\n",
@@ -53377,7 +53759,11 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(all.contains("2 件すべて") && all.contains("配下"), "{all}");
+        assert!(
+            issue2365_either(&all, |l| issue2365_all_failed_head(2, l))
+                && issue2365_either(&all, |l| MoveRefusal::IntoDescendant.text_in(l)),
+            "{all}"
+        );
         // 配下を重ねて渡した = 親だけを移して skipped に載せる
         std::fs::create_dir_all(dir.join("other")).unwrap();
         let nested = dispatch(
@@ -53437,7 +53823,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("2 件すべて")
+            issue2365_either(&err, |l| issue2365_all_failed_head(2, l))
                 && (err.contains("パスが存在しない") || err.contains("path does not exist")),
             "{err}"
         );
@@ -53465,7 +53851,14 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(
-            refused.contains("配下") && refused.contains("移動できない"),
+            issue2365_either(
+                &refused,
+                issue2365_move_refused(
+                    MoveRefusal::IntoDescendant,
+                    &dir.join("folder"),
+                    &dir.join("folder/inner"),
+                ),
+            ),
             "{refused}"
         );
         assert!(host.file_clip.is_some());
@@ -53479,7 +53872,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(taken.contains("同じ名前"), "{taken}");
+        assert!(
+            issue2365_either(&taken, |l| MoveRefusal::NameTaken.text_in(l)),
+            "{taken}"
+        );
         std::fs::remove_dir(dir.join("dst/folder")).unwrap();
         let moved = dispatch(
             &mut host,
@@ -53571,7 +53967,10 @@ mod tests {
         let err = finish_offload(&mut host, next, PaneOrigin::Cli)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("取り消した"), "{err}");
+        assert!(
+            issue2365_either(&err, |l| CopyRefusal::Cancelled.text_in(l)),
+            "{err}"
+        );
         assert!(!dir.join("dst/folder").exists(), "作りかけを残さない");
         assert!(dir.join("folder/f3.txt").is_file(), "コピー元は残る");
         assert!(host.file_copies.is_empty());
@@ -53710,7 +54109,14 @@ mod tests {
         assert!(
             partial["failed"][0]["reason"]
                 .as_str()
-                .is_some_and(|r| r.contains("コピーできない")),
+                .is_some_and(|r| issue2365_either(
+                    r,
+                    issue2365_copy_refused(
+                        CopyRefusal::SourceMissing,
+                        &dir.join("src/nope"),
+                        &dir.join("dst"),
+                    ),
+                )),
             "{partial}"
         );
         assert!(
@@ -53740,7 +54146,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(all.contains("2 件すべて"), "{all}");
+        assert!(
+            issue2365_either(&all, |l| issue2365_all_failed_head(2, l)),
+            "{all}"
+        );
         for request in [
             issue1867_many(FileOpKind::Copy, &[dir.join("src/a.txt")], None),
             issue1867_many(FileOpKind::Copy, &[], Some(&dir.join("dst"))),
@@ -53798,7 +54207,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("3 件すべて") && err.contains("取り消した"),
+            issue2365_either(&err, |l| issue2365_all_failed_head(3, l))
+                && issue2365_either(&err, |l| CopyRefusal::Cancelled.text_in(l)),
             "{err}"
         );
         assert_eq!(

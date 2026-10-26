@@ -2122,12 +2122,16 @@ mod tests {
 
     /// `TAKO_989_LEGACY=1` で claude 1 系統だけへ戻る（同一バイナリでの A/B）。
     ///
-    /// **env を触るので直列前提**（他のテストが `bootstrap_agents` を見ないよう、
-    /// このテストの中だけで立てて必ず落とす）
+    /// env を書き換えるので、この 1 本だけの子で走らせる（他のテストの `bootstrap_agents` が
+    /// 旧挙動を読まない。#2400）
     #[test]
     fn legacy_envで対象がclaudeだけへ戻る() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(legacy_envで対象がclaudeだけへ戻る) {
+            return;
+        }
         assert_eq!(bootstrap_agents(), AgentKind::ALL.to_vec());
-        // SAFETY: このテストだけが `TAKO_989_LEGACY` を触る
+        // SAFETY: 子のプロセスにはこのテストしか居ない（`run_alone!`）
         unsafe { std::env::set_var("TAKO_989_LEGACY", "1") };
         let legacy = bootstrap_agents();
         unsafe { std::env::remove_var("TAKO_989_LEGACY") };
