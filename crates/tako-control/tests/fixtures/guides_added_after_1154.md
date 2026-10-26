@@ -369,3 +369,21 @@ call it with `TAKO_ORCHESTRATOR_ROLE=master:<profile>` so the reply has an addre
      with no master of this profile (a successor closing its own predecessor
      always goes through, even from another tab). If a close is refused,
      follow the reason in the response instead of looking for a way around it.
+
+<!-- #2413: メモリが逼迫しているあいだ spawn / run の起動を待たせる。spawning の手順へ「待ちの見え方と -->
+<!-- 上書き・再送しないこと」を足した本文をそのまま貼る。 -->
+### When memory is tight (`launch_gate`)
+
+If a spawn / run response has `launch_gate.state: "waiting"`, tako created the pane
+and the worker record but is holding the agent launch because memory is tight
+(memory pressure warn / critical, swap over its guard line, or free memory below
+the reserve). It launches by itself when memory recovers; `reason` says why and
+`position` / `waiting` where it is in line. Do not resend the prompt, close the
+pane, or respawn — the command and prompt are held and go out on launch. Meanwhile
+`tako_orchestrator_worker_status` reports `status: "launch_waiting"`,
+`tako_orchestrator_workers` shows `launch: "waiting"`, and `run_status` reports
+`launch_waiting` (the run timeout starts after the launch). `tako_queue` lists the
+held launches under `launches`. If the work is urgent, launch it now with
+`tako queue start <pane>` (MCP `tako_queue` with `action: "start"`, `id` = pane).
+Running workers are never stopped. After a reboot, saved sessions come back one at
+a time, masters first.

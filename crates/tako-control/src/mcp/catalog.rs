@@ -1654,11 +1654,12 @@ pub fn tools() -> Vec<Value> {
                 panes はメモリの多いペイン上位（agent_mb = agent と MCP サーバー）。worker を増やす前・\
                 ビルドの前に空きを確かめる。queue 節は `tako queue <コマンド>` の順番待ち（実行中・待ち・上限）。\
                 cancel は id（受付番号）を取り消す。limits は上限の読み書き（省略で読むだけ）。\
-                順番待ちで走らせるのは CLI だけ。",
+                順番待ちで走らせるのは CLI だけ。launches 節はメモリ逼迫で起動を待つ agent（spawn / run / 復元）、\
+                start は id（そのペイン）を今すぐ起こす。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["status", "cancel", "limits"], "default": "status" },
+                    "action": { "type": "string", "enum": ["status", "cancel", "limits", "start"], "default": "status" },
                     "id": { "type": "integer" },
                     "limits": {
                         "type": "object",
@@ -1933,7 +1934,8 @@ pub fn tools() -> Vec<Value> {
                 worker_id（ペイン消失後も watch / status / report に使える）。\
                 tmux_session は pane ID が解決できないとき（BG タブ・tako 再起動後）に \
                 tako_read_pane / tako_send_input へ渡す。launch_warnings[]（kind / message / next_step。\
-                spawn は続行する）があれば **next_step を実行してから作業を任せる**。",
+                spawn は続行する）があれば **next_step を実行してから作業を任せる**。\
+                launch_gate.state=waiting はメモリ逼迫で起動待ち（圧が戻ると起きる。急ぐなら tako_queue の start）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2126,7 +2128,8 @@ pub fn tools() -> Vec<Value> {
             "description": "子 worker を spawn し、即座に run_id を返す（非同期。呼び出しが中断されても run_id で\
                 追跡できる）。進捗は tako_orchestrator_run_status、結果は tako_orchestrator_run_result。\
                 完了判定は worker_status と同じで、timeout_seconds に達すると status=timeout、\
-                API エラー等で止まると status=worker_error + error を返す。sync=true で完了まで待つ。",
+                API エラー等で止まると status=worker_error + error を返す。sync=true で完了まで待つ。\
+                メモリ逼迫で起動待ちの間は status=launch_waiting（時間切れの時計は起きてから数える）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

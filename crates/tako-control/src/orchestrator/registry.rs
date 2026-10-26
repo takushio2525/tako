@@ -636,11 +636,48 @@ fn record_launch_failure_at(
     })
 }
 
+/// 起動待ちの後に agent を起こした（#2413）: active で、まだ起動の証拠が無いエントリの `spawned_at` を
+/// 今へ直す。送達の猶予（[`PROMPT_DELIVERY_GRACE_SECS`]）は起動からの秒数なので、待った分で
+/// 「依頼文が届いていない」と言わない（supervisor の自動再送がシェルへ依頼文を撃たない）
+pub fn record_launch_started(pane: u64) -> Result<(), String> {
+    let Some(path) = registry_path() else {
+        return Ok(());
+    };
+    record_launch_started_at(&path, pane)
+}
+
+fn record_launch_started_at(path: &Path, pane: u64) -> Result<(), String> {
+    if !path.is_file() {
+        return Ok(());
+    }
+    let current = WorkerRegistry::load_from(path)?;
+    let target = |e: &WorkerEntry| {
+        e.is_active()
+            && e.pane == pane
+            && e.session_id.is_none()
+            && e.prompt_delivered_at.is_none()
+            && e.launch_failed_at.is_none()
+    };
+    if !current.workers.values().any(target) {
+        return Ok(());
+    }
+    let now = crate::sessions::now_iso();
+    WorkerRegistry::mutate_at(path, |reg| {
+        for entry in reg.workers.values_mut() {
+            if target(entry) {
+                entry.spawned_at = now.clone();
+            }
+        }
+    })
+}
+
 /// 起動の状態（Issue #1940）。`workers` の `launch` に出る。
 ///
 /// - `failed`: 起動失敗を記録した（理由は `launch_failure`）
 /// - `started`: エージェントの会話を検出した / 依頼文の到達を確認した
 /// - `pending`: どちらもまだ（起動途中。会話を検出できない系統もここに留まる）
+/// - `waiting`: メモリの逼迫で起動を待たせている（#2413。`workers` が起動待ちを見て上書きする。
+///   理由と順番は `launch_gate`）
 pub fn launch_state(entry: &WorkerEntry) -> &'static str {
     if entry.launch_failed_at.is_some() {
         "failed"
@@ -1242,6 +1279,11 @@ pub fn prompt_delivery_assessment_with(
     if !entry.is_active() {
         return PromptDelivery::NotApplicable;
     }
+    // #2413: メモリの逼迫で起動を待たせている = agent がまだ居ない。待った分を猶予に数えない
+    // （起こしたら `record_launch_started` が `spawned_at` を起こした時刻へ直す）
+    if crate::launch_gate::is_waiting(entry.pane) {
+        return PromptDelivery::Pending;
+    }
     let Some(spawned) = crate::sessions::parse_iso(&entry.spawned_at) else {
         return PromptDelivery::NotApplicable;
     };
@@ -1336,7 +1378,13 @@ pub fn list_payload(
             "prompt_delivery_failure": e.prompt_delivery_failure,
             // #1940: 起動の状態（failed / started / pending）と失敗の理由コード。
             // spawn は即返るので、起動の失敗はここで初めて見える
-            "launch": launch_state(e),
+            "launch": if e.is_active() && crate::launch_gate::is_waiting(e.pane) {
+                "waiting"
+            } else {
+                launch_state(e)
+            },
+            // #2413: メモリの逼迫で起動を待たせている（理由・順番・上書きの案内）。待っていなければ null
+            "launch_gate": e.is_active().then(|| crate::launch_gate::view(e.pane)).flatten(),
             "launch_failure": e.launch_failure,
             "launch_exit_code": e.launch_exit_code,
             "launch_failed_at": e.launch_failed_at,
@@ -1913,6 +1961,80 @@ mod tests {
         // 書き戻しても空の欄は出さない（旧い tako が読んでも困らない）
         let back = serde_yaml::to_string(&reg).unwrap();
         assert!(!back.contains("launch_"), "{back}");
+    }
+
+    /// #2413: 起動を待たせている worker は、猶予（240 秒）を過ぎても送達を Pending のまま・一覧の
+    /// `launch` は `waiting` で理由（`launch_gate`）つき。起こしたら起点（spawned_at）を今へ直すので、
+    /// 待った分で「届いていない」（supervisor の自動再送の引き金）を言わない
+    #[test]
+    fn issue2413_起動待ちの間は送達を保留し_起こしたら起点を直す() {
+        use tako_core::queue::MachineView;
+        use tako_core::resources::Pressure;
+        let path = temp_registry_file("issue2413-gate");
+        register_at(&path, sample_record(61));
+        register_at(&path, sample_record(62));
+        // 古い spawn（猶予を過ぎた）にする
+        WorkerRegistry::mutate_at(&path, |reg| {
+            for e in reg.workers.values_mut() {
+                e.spawned_at = "2026-10-01T00:00:00Z".into();
+            }
+        })
+        .unwrap();
+        crate::launch_gate::enable_for_test(
+            Some(MachineView {
+                total_mb: 36 * 1024,
+                available_mb: Some(20 * 1024),
+                pressure: Some(Pressure::Critical),
+                swap_used_mb: Some(0),
+            }),
+            std::time::Duration::from_secs(60),
+        );
+        let held = crate::launch_gate::request(crate::launch_gate::LaunchRequest {
+            pane: 61,
+            kind: crate::launch_gate::LaunchKind::Spawn,
+            agent: "claude".into(),
+            label: "x".into(),
+            role: None,
+            action: crate::launch_gate::LaunchAction::Command {
+                command: "claude".into(),
+                prompt: None,
+            },
+        });
+        assert!(matches!(held, crate::launch_gate::Decision::Wait(_)));
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let now = crate::sessions::parse_iso(&crate::sessions::now_iso()).unwrap();
+        let e61 = reg.workers.values().find(|e| e.pane == 61).unwrap();
+        let e62 = reg.workers.values().find(|e| e.pane == 62).unwrap();
+        assert_eq!(
+            prompt_delivery_assessment(e61, now),
+            PromptDelivery::Pending,
+            "起動待ちは猶予に数えない"
+        );
+        assert_ne!(
+            prompt_delivery_assessment(e62, now),
+            PromptDelivery::Pending,
+            "待っていない worker は従来どおり"
+        );
+        let payload = list_payload(&reg, &[], &[], &[], false);
+        let w61 = payload["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["pane"] == 61)
+            .unwrap()
+            .clone();
+        assert_eq!(w61["launch"], "waiting");
+        assert_eq!(w61["launch_gate"]["code"], "pressure_critical");
+
+        record_launch_started_at(&path, 61).unwrap();
+        let reg = WorkerRegistry::load_from(&path).unwrap();
+        let e61 = reg.workers.values().find(|e| e.pane == 61).unwrap();
+        let e62 = reg.workers.values().find(|e| e.pane == 62).unwrap();
+        assert_ne!(
+            e61.spawned_at, "2026-10-01T00:00:00Z",
+            "起点を起こした時刻へ直す"
+        );
+        assert_eq!(e62.spawned_at, "2026-10-01T00:00:00Z", "別ペインは触らない");
     }
 
     /// #1940: 起動に失敗した spawn は `workers` に理由コードつきで出る

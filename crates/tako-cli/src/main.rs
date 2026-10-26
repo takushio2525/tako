@@ -4020,6 +4020,13 @@ enum QueueCommand {
         #[arg(long)]
         json: bool,
     },
+    /// メモリの逼迫で起動を待っている agent を今すぐ起こす（#2413。番号は `tako queue` の起動待ちのペイン）
+    Start {
+        /// 起動を待っているペインの番号（spawn / run の応答の `pane_id`）
+        id: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// 上限を読む / 変える（引数なしで今の値。`settings.json` の `resources` 節）
     Limits {
         /// 同時に走らせる重い処理の数（既定 = RAM 12 GB あたり 1・1〜4）
@@ -7692,6 +7699,37 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
             }
             Ok(())
         }
+        Some(QueueCommand::Start { id, json }) => {
+            let request = Request::Queue {
+                action: Some("start".into()),
+                job: None,
+                id: Some(*id),
+                limits: None,
+            };
+            let result = queue_send(request).map_err(|e| match e {
+                SendError::Unreachable(_) => QUEUE_OFFLINE_NOTE.to_string(),
+                SendError::Timeout(limit) => tako_control::protocol::reply_timeout_message(limit),
+                SendError::Rejected(m) => m,
+            })?;
+            if *json {
+                println!("{}", pretty_json(&result));
+            } else if result["state"] == "already_started" {
+                println!("ペイン {} の agent はもう起こしている", result["pane"]);
+            } else {
+                println!(
+                    "ペイン {} の agent を今すぐ起こす（待ち {}{}）",
+                    result["pane"],
+                    tako_control::queue_wrapper::human_secs(
+                        result["waited_s"].as_u64().unwrap_or(0)
+                    ),
+                    result["was"]["reason"]
+                        .as_str()
+                        .map(|r| format!("・待っていた理由: {r}"))
+                        .unwrap_or_default()
+                );
+            }
+            Ok(())
+        }
         Some(QueueCommand::Limits {
             max_jobs,
             reserve_gb,
@@ -8065,6 +8103,46 @@ fn print_queue_status(v: &Value) {
         );
     }
     print_queue_section(&v["queue"]);
+    print_launches_section(&v["launches"]);
+}
+
+/// agent の起動待ちの節の表示（#2413）。待ちも立ち上がり中も無ければ何も出さない
+fn print_launches_section(l: &Value) {
+    let waiting = l["waiting"].as_array().cloned().unwrap_or_default();
+    let starting = l["starting"].as_array().cloned().unwrap_or_default();
+    if waiting.is_empty() && starting.is_empty() {
+        return;
+    }
+    println!(
+        "agent の起動待ち: 待ち {}・立ち上がり中 {}（逼迫が解けると起きる。今すぐ起こすには tako queue start <ペイン>）",
+        waiting.len(),
+        starting.len()
+    );
+    for w in &waiting {
+        println!(
+            "  待ち {}  ペイン {}  {}  {}  {}  待ち {}  — {}",
+            w["position"],
+            w["pane"],
+            w["kind"].as_str().unwrap_or("?"),
+            w["label"].as_str().unwrap_or(""),
+            w["priority"].as_str().unwrap_or("normal"),
+            tako_control::queue_wrapper::human_secs(w["waited_s"].as_u64().unwrap_or(0)),
+            w["reason"].as_str().unwrap_or("?")
+        );
+    }
+    for r in &starting {
+        println!(
+            "  立ち上がり中  ペイン {}  {}  {}  {}秒{}",
+            r["pane"],
+            r["kind"].as_str().unwrap_or("?"),
+            r["label"].as_str().unwrap_or(""),
+            r["since_s"].as_u64().unwrap_or(0),
+            r["memory_mb"]
+                .as_u64()
+                .map(|m| format!("  {}", human_mb(m)))
+                .unwrap_or_default()
+        );
+    }
 }
 
 /// `ipc.pipe` の 1 行（#2361。節が無ければ `None` = windows 以外・旧版の応答）

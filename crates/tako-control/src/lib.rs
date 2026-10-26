@@ -64,6 +64,7 @@ pub mod handoff_guard;
 pub mod host;
 pub mod ipc;
 pub mod launch_cmd;
+pub mod launch_gate;
 pub mod layout;
 pub mod layout_reconcile;
 pub mod limit_stop;

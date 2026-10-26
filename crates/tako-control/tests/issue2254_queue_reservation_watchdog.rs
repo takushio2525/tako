@@ -73,6 +73,7 @@ fn input<'a>(m: MachineView, run: &'a [RunningJob], wait: &'a [WaitingJob]) -> A
         regathering: false,
         overtake: true,
         release_after_peak: true,
+        min_progress: true,
     }
 }
 

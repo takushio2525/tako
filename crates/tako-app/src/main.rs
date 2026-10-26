@@ -4755,6 +4755,18 @@ impl TakoApp {
         if let Some(role) = queue_role {
             tako_control::queue::enable(role);
         }
+        // #2413: agent の起動待ち（メモリが逼迫しているあいだは spawn / run / 復元を待たせ、復元は時差）。
+        // 本番（とセカンダリ = 機の値はマシン全体なので同じ判断になる）で有効。隔離 / セルフテストは
+        // 注入 `TAKO_2413_INJECT` があるときだけ（機の実際の圧で検証用の GUI を固めない）。
+        // 下の復元より前に有効にする（復元の 1 本目から列に並べる）
+        tako_control::launch_gate::enable(tako_control::launch_gate::mode_for(
+            tako_core::paths::is_verification_process(),
+            std::env::var_os("TAKO_SELF_TEST").is_some(),
+            tako_control::launch_gate::legacy(),
+            std::env::var(tako_control::launch_gate::ENV_INJECT)
+                .ok()
+                .as_deref(),
+        ));
         let queue_ipc = match (queue_role, queue_explicit.as_deref(), &token) {
             (Some(tako_control::queue::Role::Explicit), Some(path), Some(token)) => {
                 match IpcServer::start_at(control_tx.clone(), token.clone(), path) {
@@ -5594,6 +5606,8 @@ impl TakoApp {
             // 全ペインを説明できていなかった）。
             // 系統ごとの resume 件数（#1238）と新規シェルの理由（#1076）も同じ器が持つ
             let mut breakdown = tako_control::restore_report::RestoreBreakdown::new();
+            // #2413: 復元の列で待たせた agent の本数（1 本目以外・逼迫中は全部）
+            let mut restore_held = 0usize;
             // 復元より前に刈り込んだペイン（#1858）。復元していないので M の内訳には入れず、
             // 1 行目の括弧の外と 2 行目の末尾に添える
             breakdown.note_pruned(restore_prune.pruned.len(), restore_prune.closed_tabs.len());
@@ -5823,7 +5837,32 @@ impl TakoApp {
                         // エージェント終了後は元のシェルへ戻れる（明示コマンド spawn だと
                         // ペインも終了する）。
                         if let Some(session) = app.terminals.get(&pane) {
-                            session.write(resume_input(&command));
+                            // #2413: 一斉に起こさない（復元の列で 1 本ずつ・master が先・
+                            // メモリが逼迫しているあいだは待つ）。全部を預け、500 ms の tick が
+                            // 優先度の順に起こす（起動待ちが無効 = A/B なら従来どおりその場で書く）
+                            let pane_obj = app.workspace.pane_anywhere(pane);
+                            let held = tako_control::launch_gate::hold(
+                                tako_control::launch_gate::LaunchRequest {
+                                    pane: pane.as_u64(),
+                                    kind: tako_control::launch_gate::LaunchKind::Restore,
+                                    agent: agent.as_str().to_string(),
+                                    label: pane_obj
+                                        .and_then(|p| p.title())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    role: pane_obj.and_then(|p| p.role()).map(str::to_string),
+                                    action: tako_control::launch_gate::LaunchAction::Write(
+                                        resume_input(&command),
+                                    ),
+                                },
+                            );
+                            match held {
+                                Some(tako_control::launch_gate::LaunchAction::Write(bytes)) => {
+                                    session.write(bytes)
+                                }
+                                Some(_) => unreachable!("復元は書き込みで預けた"),
+                                None => restore_held += 1,
+                            }
                             breakdown.record(
                                 tako_control::restore_report::PaneOutcome::Resumed {
                                     agent,
@@ -5873,6 +5912,15 @@ impl TakoApp {
             // 結末を記録しない経路が将来また増えても、二度と無言にはならない
             if let Some(line) = breakdown.mismatch(restored.len()) {
                 persist_diag(&line);
+            }
+            // #2413: 復元を時差にした（master から 1 本ずつ・逼迫中は待つ）。起こすたびに
+            // `[launch-gate] 起動` が続く
+            if restore_held > 0 {
+                persist_diag(&format!(
+                    "[launch-gate] 復元: agent {restore_held} 本を時差で起こす（同時に 1 本・立ち上がり {} 秒ごと・\
+                     メモリが逼迫しているあいだは待つ。状況は tako queue）",
+                    tako_control::launch_gate::STARTUP_SECS
+                ));
             }
             // 復元時のプレビューも background でハイライト / 読み込みする
             for (pane, path, text) in std::mem::take(&mut app.pending_highlights) {
@@ -6482,6 +6530,9 @@ impl TakoApp {
                     // 建て直しが残っていなければ顛末は宙に浮く（取りこぼしで溜めない）
                     app.relaunch_flow_events.clear();
                 }
+                // #2413: 起動待ちの agent を起こす（件が無ければロック 1 回で戻る。覚えを読むだけで採らない）。
+                // 起こした分は下の 2 つのフローがこの tick から運ぶ
+                tako_control::launch_gate::tick(app);
                 if !app.command_flows.is_empty() {
                     app.drive_command_flows();
                 }
