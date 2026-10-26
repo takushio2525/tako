@@ -242,7 +242,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_mod` | tako mod（Claude Code の mod）の状態と切替（ペインごとの ctx・使用制限・ターンの報告。Claude Code の画面の帯の表示切替 = `band-on` / `band-off`） |
 | `tako_migrate` | 設定・データファイルの形式の確認と自動マイグレーションの手動発火 |
 | `tako_check_health` | tako 環境の健全性を診断する |
-| `tako_queue` | PC のメモリ・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動いてどれだけ食っているか。順番待ち（`tako queue <コマンド>`）の状況・取り消し・上限の読み書き（走らせるのは CLI だけ） |
+| `tako_queue` | PC のメモリ・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動いてどれだけ食っているか。順番待ち（`tako queue <コマンド>`）の状況・取り消し・上限の読み書き（走らせるのは CLI だけ）。メモリの逼迫で起動を待っている agent（`launches`）を `start` で今すぐ起こす |
 | `tako_platform` | プラットフォーム対応マトリクスの参照（使える / 縮退 / 未実装） |
 | `tako_update` | アプリ内更新の診断・チェック・実行 |
 | `tako_stale_binary` | 稼働中セッションの claude バイナリの鮮度確認と張り直し |

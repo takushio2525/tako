@@ -46,6 +46,22 @@ This will:
 3. Send your prompt to the worker (with delivery verification)
 4. Return the pane ID and tmux_session for monitoring
 
+### When memory is tight (`launch_gate`)
+
+If a spawn / run response has `launch_gate.state: "waiting"`, tako created the pane
+and the worker record but is holding the agent launch because memory is tight
+(memory pressure warn / critical, swap over its guard line, or free memory below
+the reserve). It launches by itself when memory recovers; `reason` says why and
+`position` / `waiting` where it is in line. Do not resend the prompt, close the
+pane, or respawn — the command and prompt are held and go out on launch. Meanwhile
+`tako_orchestrator_worker_status` reports `status: "launch_waiting"`,
+`tako_orchestrator_workers` shows `launch: "waiting"`, and `run_status` reports
+`launch_waiting` (the run timeout starts after the launch). `tako_queue` lists the
+held launches under `launches`. If the work is urgent, launch it now with
+`tako queue start <pane>` (MCP `tako_queue` with `action: "start"`, `id` = pane).
+Running workers are never stopped. After a reboot, saved sessions come back one at
+a time, masters first.
+
 Always pass a `label` (2-4 words naming the deliverable) — without it the pane
 title is just the project name and the user cannot tell workers apart. Check the
 returned `agent` / `model` / `effort` fields and correct course if they are not

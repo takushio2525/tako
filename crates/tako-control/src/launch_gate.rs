@@ -395,15 +395,20 @@ fn refresh_inputs(g: &mut Gate, now: Instant) {
     }
     let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
     let changed = g.inject.as_ref().is_none_or(|(_, seen, _)| *seen != mtime);
-    let value = if changed {
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<Inject>(&t).ok())
-            .unwrap_or_default()
-    } else {
-        g.inject.take().map(|(_, _, v)| v).unwrap_or_default()
+    let previous = g.inject.take();
+    let parsed = changed
+        .then(|| {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Inject>(&t).ok())
+        })
+        .flatten();
+    g.inject = match (parsed, previous) {
+        (Some(value), _) => Some((now, mtime, value)),
+        // 変わっていない / 読めない（書きかけ）なら前の値のまま。読めなかったときは mtime を進めず次も読む
+        (None, Some((_, seen, value))) => Some((now, if changed { None } else { seen }, value)),
+        (None, None) => Some((now, None, Inject::default())),
     };
-    g.inject = Some((now, mtime, value));
 }
 
 fn startup_window(g: &Gate) -> Duration {

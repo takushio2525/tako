@@ -2366,7 +2366,7 @@
     "name": "tako_check_health"
   },
   {
-    "description": "PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動きどれだけ食っているかを返す。panes はメモリの多いペイン上位（agent_mb = agent と MCP サーバー）。worker を増やす前・ビルドの前に空きを確かめる。queue 節は `tako queue <コマンド>` の順番待ち（実行中・待ち・上限）。cancel は id（受付番号）を取り消す。limits は上限の読み書き（省略で読むだけ）。順番待ちで走らせるのは CLI だけ。",
+    "description": "PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動きどれだけ食っているかを返す。panes はメモリの多いペイン上位（agent_mb = agent と MCP サーバー）。worker を増やす前・ビルドの前に空きを確かめる。queue 節は `tako queue <コマンド>` の順番待ち（実行中・待ち・上限）。cancel は id（受付番号）を取り消す。limits は上限の読み書き（省略で読むだけ）。順番待ちで走らせるのは CLI だけ。launches 節はメモリ逼迫で起動を待つ agent（spawn / run / 復元）、start は id（そのペイン）を今すぐ起こす。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2375,7 +2375,8 @@
           "enum": [
             "status",
             "cancel",
-            "limits"
+            "limits",
+            "start"
           ],
           "type": "string"
         },
@@ -2795,7 +2796,7 @@
     "name": "tako_orchestrator_layout"
   },
   {
-    "description": "プロジェクトの作業ディレクトリで子 worker を spawn する（分割元の右に新ペインを作り、エージェントを起動してプロンプトを送る。送信まで 15〜20 秒は想定内）。**pane か tab を必ず指定する**（省略すると呼び出し元タブに生える）。返り値は pane_id / tmux_session / spawned_by（spawn 元）/ agent / worker_id（ペイン消失後も watch / status / report に使える）。tmux_session は pane ID が解決できないとき（BG タブ・tako 再起動後）に tako_read_pane / tako_send_input へ渡す。launch_warnings[]（kind / message / next_step。spawn は続行する）があれば **next_step を実行してから作業を任せる**。",
+    "description": "プロジェクトの作業ディレクトリで子 worker を spawn する（分割元の右に新ペインを作り、エージェントを起動してプロンプトを送る。送信まで 15〜20 秒は想定内）。**pane か tab を必ず指定する**（省略すると呼び出し元タブに生える）。返り値は pane_id / tmux_session / spawned_by（spawn 元）/ agent / worker_id（ペイン消失後も watch / status / report に使える）。tmux_session は pane ID が解決できないとき（BG タブ・tako 再起動後）に tako_read_pane / tako_send_input へ渡す。launch_warnings[]（kind / message / next_step。spawn は続行する）があれば **next_step を実行してから作業を任せる**。launch_gate.state=waiting はメモリ逼迫で起動待ち（圧が戻ると起きる。急ぐなら tako_queue の start）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2984,7 +2985,7 @@
     "name": "tako_orchestrator_handoffs"
   },
   {
-    "description": "子 worker を spawn し、即座に run_id を返す（非同期。呼び出しが中断されても run_id で追跡できる）。進捗は tako_orchestrator_run_status、結果は tako_orchestrator_run_result。完了判定は worker_status と同じで、timeout_seconds に達すると status=timeout、API エラー等で止まると status=worker_error + error を返す。sync=true で完了まで待つ。",
+    "description": "子 worker を spawn し、即座に run_id を返す（非同期。呼び出しが中断されても run_id で追跡できる）。進捗は tako_orchestrator_run_status、結果は tako_orchestrator_run_result。完了判定は worker_status と同じで、timeout_seconds に達すると status=timeout、API エラー等で止まると status=worker_error + error を返す。sync=true で完了まで待つ。メモリ逼迫で起動待ちの間は status=launch_waiting（時間切れの時計は起きてから数える）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
