@@ -16776,7 +16776,10 @@ fn dispatch_orchestrator_spawn(
     }
     // #2412: 絞り込みが効かない / 名前が見つからないことは黙らせない（spawn は止めない）
     for w in &worker_mcp.warnings {
-        crate::diag::persist_log(&format!("[spawn] pane={}: {w}", new_id.as_u64()));
+        crate::diag::persist_log(&format!(
+            "[spawn] pane={} worker の MCP: {w}",
+            new_id.as_u64()
+        ));
         launch_warnings.push(json!({
             "kind": "worker_mcp",
             "agent": worker_agent.as_str(),

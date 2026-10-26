@@ -171,7 +171,7 @@ pub fn user_scope(files: &[PathBuf]) -> BTreeMap<String, Value> {
 /// cwd・正規化した cwd と、それぞれの祖先
 fn cwd_and_ancestors(cwd: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    let canonical = std::fs::canonicalize(cwd).ok();
+    let canonical = tako_core::platform::path::canonicalize(cwd).ok();
     for base in std::iter::once(cwd.to_path_buf()).chain(canonical) {
         for dir in base.ancestors() {
             let dir = dir.to_path_buf();
@@ -313,7 +313,9 @@ pub fn keep_for_project(config: &ProjectsConfig, project: &str) -> Vec<String> {
 /// cwd が一致するプロジェクトの `mcp_servers`（git resolve のように
 /// プロジェクトキーを持たない起動で使う）。一致が無ければ空
 pub fn keep_for_cwd(config: &ProjectsConfig, cwd: &Path) -> Vec<String> {
-    let norm = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.components().collect());
+    let norm = |p: &Path| {
+        tako_core::platform::path::canonicalize(p).unwrap_or_else(|_| p.components().collect())
+    };
     let target = norm(cwd);
     config
         .list_resolved()
