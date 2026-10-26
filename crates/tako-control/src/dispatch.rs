@@ -36028,6 +36028,106 @@ mod tests {
         );
     }
 
+    /// #2413 の受け入れ条件 2: critical のまま、CLI / MCP と同じ `Request::Queue { action: "start" }` の口で
+    /// 待っている spawn を今すぐ起こせる（次の tick で起動コマンドと依頼文が積まれる）
+    #[test]
+    fn issue2413_critical中でもqueue_startの口で起こせる() {
+        use tako_core::queue::MachineView;
+        use tako_core::resources::Pressure;
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let master = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(master),
+                    title: None,
+                    role: Some("orchestrator-master:test".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            crate::launch_gate::enable_for_test(
+                Some(MachineView {
+                    total_mb: 36 * 1024,
+                    available_mb: Some(20 * 1024),
+                    pressure: Some(Pressure::Critical),
+                    swap_used_mb: Some(0),
+                }),
+                std::time::Duration::from_secs(60),
+            );
+            let r = dispatch_orchestrator_spawn(
+                &mut host,
+                PaneOrigin::Mcp,
+                test_spawn_params("急ぎ", None),
+            )
+            .unwrap();
+            let pane = r["pane_id"].as_u64().unwrap();
+            assert_eq!(r["launch_gate"]["code"], "pressure_critical");
+            crate::launch_gate::tick(&mut host);
+            assert!(host.command_flows.is_empty(), "critical の間は起こさない");
+            let started = dispatch(
+                &mut host,
+                Request::Queue {
+                    action: Some("start".into()),
+                    job: None,
+                    id: Some(pane),
+                    limits: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .expect("start は通る");
+            assert_eq!(started["state"], "starting");
+            assert_eq!(started["was"]["code"], "pressure_critical");
+            crate::launch_gate::tick(&mut host);
+            assert_eq!(host.command_flows.len(), 1, "critical のまま起こした");
+            assert_eq!(host.prompt_flows.len(), 1);
+            // 待っていないペインの start は断る（二重に起こさない）
+            assert!(dispatch(
+                &mut host,
+                Request::Queue {
+                    action: Some("start".into()),
+                    job: None,
+                    id: Some(pane + 1000),
+                    limits: None,
+                },
+                PaneOrigin::Mcp,
+            )
+            .is_err());
+        });
+    }
+
+    /// #2413 の受け入れ条件 5: A/B（`TAKO_2413_LEGACY=1` = `mode_for` の legacy）は同じ注入があっても
+    /// 起動待ちを持たず、spawn は即座に起こす（修正前と同じ）
+    #[test]
+    fn issue2413_ab_legacyは同じ注入でもspawnを即座に起こす() {
+        let mode = crate::launch_gate::mode_for(true, false, true, Some("/tmp/inject.json"));
+        assert!(matches!(mode, crate::launch_gate::Mode::Off(_)));
+        crate::launch_gate::enable(mode);
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let master = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(master),
+                    title: None,
+                    role: Some("orchestrator-master:test".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            let r = dispatch_orchestrator_spawn(
+                &mut host,
+                PaneOrigin::Mcp,
+                test_spawn_params("テスト", None),
+            )
+            .unwrap();
+            assert!(r["launch_gate"].is_null());
+            assert_eq!(host.command_flows.len(), 1, "修正前は即座に起こす");
+        });
+    }
+
     /// #2413: 起動待ちを持たない tako（A/B `TAKO_2413_LEGACY=1`・隔離）の復元は預けず、その場で全部起こす（修正前）
     #[test]
     fn issue2413_起動待ちが無効なら復元は預けずその場で起こす() {

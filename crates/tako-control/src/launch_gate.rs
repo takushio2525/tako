@@ -1110,6 +1110,58 @@ mod tests {
         assert_eq!(g.entries[&7].phase, Phase::Due);
     }
 
+    /// 検証の注入（`TAKO_2413_INJECT` のファイル）: 書いた圧で待ち、書き換えると 1 秒以内に読み直す。
+    /// 読めない中身（書きかけ）は前の値を保つ（実機の圧へ落ちない）
+    #[test]
+    fn 注入のファイルで逼迫を与え_書き換えると読み直す() {
+        let dir = tako_core::test_residue::process_scratch("launch-gate-inject");
+        let path = dir.join(format!("inject-{:?}.json", std::thread::current().id()));
+        let write = |p: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"total_mb":36864,"available_mb":20480,"pressure":"{p}","swap_used_mb":0}}"#
+                ),
+            )
+            .unwrap()
+        };
+        write("critical");
+        {
+            let mut g = lock();
+            *g = Gate::default();
+            g.mode = Some(Mode::Injected);
+            g.inject_path = Some(path.clone());
+            g.fixed_startup = Some(Duration::from_secs(60));
+        }
+        let v = waiting(request(req(30, LaunchKind::Spawn, None)));
+        assert_eq!(v["code"], "pressure_critical");
+        std::thread::sleep(INJECT_RECHECK + Duration::from_millis(100));
+        std::fs::write(&path, "{\"pressure\":").unwrap();
+        let mut g = lock();
+        let now = Instant::now();
+        refresh_inputs(&mut g, now);
+        decide(&mut g, now);
+        assert_eq!(
+            g.entries[&30].phase,
+            Phase::Waiting,
+            "書きかけは前の critical を保つ"
+        );
+        drop(g);
+        std::thread::sleep(INJECT_RECHECK + Duration::from_millis(100));
+        write("normal");
+        let mut g = lock();
+        let now = Instant::now();
+        refresh_inputs(&mut g, now);
+        decide(&mut g, now);
+        assert_eq!(
+            g.entries[&30].phase,
+            Phase::Due,
+            "normal を読み直して起こす"
+        );
+        drop(g);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn 役割から優先度() {
         assert_eq!(

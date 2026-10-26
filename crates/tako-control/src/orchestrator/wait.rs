@@ -2654,6 +2654,81 @@ mod tests {
         assert!(script.responses.is_empty(), "起きた直後の 1 回を読み捨てる");
     }
 
+    /// #2413 の受け入れ条件 1（run）: spawn が起動待ちを返したら、run の開始の応答に `launch_gate` を載せ、
+    /// 待っている間の `run_status` は `launch_waiting`（理由つき）。起動待ちが無くなれば通常の状態へ戻る
+    #[test]
+    fn issue2413_runの開始と状態は起動待ちを返す() {
+        use tako_core::queue::MachineView;
+        use tako_core::resources::Pressure;
+        crate::launch_gate::enable_for_test(
+            Some(MachineView {
+                total_mb: 36 * 1024,
+                available_mb: Some(20 * 1024),
+                pressure: Some(Pressure::Warn),
+                swap_used_mb: Some(0),
+            }),
+            Duration::from_secs(60),
+        );
+        let pane = 77_413;
+        let held = crate::launch_gate::request(crate::launch_gate::LaunchRequest {
+            pane,
+            kind: crate::launch_gate::LaunchKind::Spawn,
+            agent: "claude".into(),
+            label: "r".into(),
+            role: None,
+            action: crate::launch_gate::LaunchAction::Command {
+                command: "claude".into(),
+                prompt: None,
+            },
+        });
+        let gate = match held {
+            crate::launch_gate::Decision::Wait(v) => v,
+            crate::launch_gate::Decision::Now(_) => panic!("warn で起こした"),
+        };
+        let mut exec = |_req: Request| -> Result<Value, String> {
+            Ok(json!({ "pane_id": pane, "spawned_by": 1, "launch_gate": gate.clone() }))
+        };
+        let opts = RunOptions {
+            project: "p".into(),
+            prompt: "x".into(),
+            label: None,
+            model: None,
+            effort: None,
+            agent: None,
+            pane: Some(1),
+            tab: None,
+            caller_role: None,
+            timeout: Duration::from_secs(60),
+            auto_close: false,
+            output_lines: 10,
+            initial_delay: Duration::from_millis(10),
+            interval: Duration::from_millis(10),
+            task_type: None,
+            account: None,
+        };
+        // 完了待ちのスレッド: 起動待ちを 3 回見てから消える（gone で終わる = スレッドを残さない）
+        let started = run_start(&mut exec, &opts, || {
+            let mut n = 0u32;
+            Box::new(move |_req: Request| {
+                n += 1;
+                Ok(json!({ "status": if n <= 3 { "launch_waiting" } else { "gone" } }))
+            })
+        })
+        .unwrap();
+        assert_eq!(started["launch_gate"]["state"], "waiting");
+        assert_eq!(started["launch_gate"]["code"], "pressure_warn");
+        let run_id = started["run_id"].as_str().unwrap().to_string();
+        let st = run_status(&run_id).unwrap();
+        assert_eq!(st["status"], "launch_waiting", "{st}");
+        assert_eq!(st["launch_gate"]["position"], 1);
+        // 上書きで起こした後（tick が Starting にする前は起こすと決めた = まだ待ちの印）も、状態は理由つきで読める
+        crate::launch_gate::start_now(pane).unwrap();
+        assert_eq!(
+            run_status(&run_id).unwrap()["launch_gate"]["state"],
+            "starting"
+        );
+    }
+
     #[test]
     fn agentsソースのidleは3回連続で完了と判定する() {
         let mut script = ExecScript::new(vec![
