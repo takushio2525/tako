@@ -486,6 +486,24 @@ pub fn managed(jobs: &[(u64, u32)], since: Option<Instant>) -> Option<(Instant, 
     Some((at, core_res::managed_view(&samples, &cpu, &heavy, jobs)))
 }
 
+/// ペインごとの木のメモリ（MiB）の覚え（**採らない**。agent の起動待ち = #2413 が、立ち上がり中の agent の
+/// 使用量として読む）。走査の覚えが `since` より新しいときだけ返す
+pub fn pane_memory(since: Option<Instant>) -> Option<(Instant, HashMap<u64, u64>)> {
+    let p = lock(published());
+    let snap = p.procs.as_ref()?;
+    if since.is_some_and(|s| snap.at <= s) {
+        return None;
+    }
+    Some((
+        snap.at,
+        snap.report
+            .panes
+            .iter()
+            .map(|u| (u.pane, mb(u.memory)))
+            .collect(),
+    ))
+}
+
 /// IPC / MCP の `Request::Queue` に答える（**UI スレッドでは呼ばない**。`ipc::submit` の手前）。
 /// 覚えが古ければこのスレッドで採り直す
 pub fn answer(action: Option<&str>) -> Result<Value, DispatchError> {

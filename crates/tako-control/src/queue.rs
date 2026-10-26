@@ -416,13 +416,7 @@ fn machine(a: &Arbiter, inj: Option<&Inject>) -> (Option<MachineView>, u32) {
         .and_then(|i| i.cpus)
         .or((stats.cpus > 0).then_some(stats.cpus))
         .unwrap_or_else(fallback_cpus);
-    let view = stats.memory.map(|m| MachineView {
-        total_mb: m.total / MIB,
-        available_mb: Some(m.available / MIB),
-        pressure: stats.pressure,
-        swap_used_mb: stats.swap.map(|(used, _)| used / MIB),
-    });
-    (view, cpus)
+    (q::machine_view(&stats), cpus)
 }
 
 // ===== 受け答え =====
@@ -451,9 +445,10 @@ pub fn answer(request: &Request) -> Result<Value, DispatchError> {
     }
 }
 
-/// status の JSON へ順番待ちの節を足す（採らない。UI スレッドから呼んでよい）
+/// status の JSON へ順番待ちの節と agent の起動待ちの節（#2413）を足す（採らない。UI スレッドから呼んでよい）
 pub fn with_section(mut status: Value) -> Value {
     status["queue"] = status_section();
+    status["launches"] = crate::launch_gate::status_section();
     status
 }
 
@@ -465,6 +460,16 @@ pub fn handle(
     limits: Option<&LimitsPatch>,
 ) -> Result<Value, DispatchError> {
     match action {
+        // #2413: agent の起動待ちを今すぐ起こす（id = 待っているペイン）。起動待ちは調停役とは別に
+        // 持つ（隔離の注入でも効く）ので、調停役かどうかを問わない
+        "start" => {
+            let pane = id.ok_or_else(|| {
+                DispatchError::InvalidParams(
+                    "start には起動を待っているペインの番号（id）が要る".into(),
+                )
+            })?;
+            crate::launch_gate::start_now(pane).map_err(DispatchError::Operation)
+        }
         "limits" => set_limits(limits.cloned().unwrap_or_default()),
         "cancel" => {
             let id = id.ok_or_else(|| {
@@ -483,7 +488,7 @@ pub fn handle(
             done(job, Instant::now())
         }
         other => Err(DispatchError::InvalidParams(format!(
-            "未知の action: {other}（使えるのは status / cancel / limits）"
+            "未知の action: {other}（使えるのは status / cancel / limits / start）"
         ))),
     }
 }
@@ -640,6 +645,8 @@ fn decide(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
         regathering,
         overtake: !legacy_2243(),
         release_after_peak: !legacy_2254(),
+        // 重い処理は終われば空くので、外の負荷だけで永久に待たせない（agent の起動待ち = #2413 は false）
+        min_progress: true,
     });
     let mut active = running.iter().filter(|r| !r.stalled).count();
     let granted_at = unix_ms();

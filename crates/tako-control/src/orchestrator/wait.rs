@@ -219,13 +219,15 @@ pub fn wait_for_worker(
     progress: Option<&Arc<Mutex<RunSnapshot>>>,
 ) -> WatchOutcome {
     let start = Instant::now();
-    let deadline = opts.timeout.map(|t| start + t);
+    let mut deadline = opts.timeout.map(|t| start + t);
     std::thread::sleep(opts.initial_delay);
 
     let mut idle_streak: u32 = 0;
     let mut gone_streak: u32 = 0;
     let mut stalled_streak: u32 = 0;
     let mut agent_dead_streak: u32 = 0;
+    // #2413: メモリの逼迫で起動を待たされていた（起きたら起動直後の待ちをやり直す）
+    let mut launch_waited = false;
 
     loop {
         if let Some(dl) = deadline {
@@ -244,6 +246,30 @@ pub fn wait_for_worker(
         match result {
             Ok(val) => {
                 let status = val["status"].as_str().unwrap_or("unknown");
+                // #2413: 起動を待たされている = agent はまだ居ない（画面は素のシェル）。完了と読まず、
+                // 待ちの間は時間切れの時計も止める（起きてから `timeout` を数える）
+                if status == "launch_waiting" {
+                    if let Some(snap) = progress {
+                        if let Ok(mut s) = snap.lock() {
+                            s.worker_status = status.to_string();
+                            s.elapsed_secs = start.elapsed().as_secs();
+                        }
+                    }
+                    idle_streak = 0;
+                    gone_streak = 0;
+                    stalled_streak = 0;
+                    agent_dead_streak = 0;
+                    launch_waited = true;
+                    deadline = opts.timeout.map(|t| Instant::now() + t);
+                    std::thread::sleep(opts.interval);
+                    continue;
+                }
+                if std::mem::take(&mut launch_waited) {
+                    // 起きた直後は起動とプロンプト送達の最中（spawn 直後と同じ待ちを置く）
+                    deadline = opts.timeout.map(|t| Instant::now() + t);
+                    std::thread::sleep(opts.initial_delay);
+                    continue;
+                }
                 let recent = val["recent_output"].as_str().unwrap_or("");
                 let source = val["status_source"].as_str().unwrap_or("screen");
                 // agents 一次シグナル（明示 or 自動解決）は streak 3、画面推定は streak 8。
@@ -578,6 +604,10 @@ pub fn run_worker(
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
     let tmux_session = spawn_result["tmux_session"].as_str().map(String::from);
     on_spawned(pane_id, tmux_session.as_deref());
+    // #2413: メモリの逼迫で起動を待たされた（完了待ちは起きるまで時計を止めて待つ）
+    if let Some(line) = crate::launch_gate::wait_line(&spawn_result["launch_gate"]) {
+        eprintln!("{line}");
+    }
 
     // --- 2. 完了待ち ---
     let start = Instant::now();
@@ -823,9 +853,19 @@ pub fn run_start(
     let pane_id = spawn_result["pane_id"].as_u64().unwrap_or(0);
     let spawned_by = spawn_result["spawned_by"].as_u64().unwrap_or(0);
     let tmux_session = spawn_result["tmux_session"].as_str().map(String::from);
+    // #2413: メモリの逼迫で起動を待たされた（spawn の応答の `launch_gate`）
+    let launch_gate = spawn_result
+        .get("launch_gate")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let launch_waiting = launch_gate["state"] == "waiting";
 
     let snapshot = Arc::new(Mutex::new(RunSnapshot {
-        worker_status: "starting".into(),
+        worker_status: if launch_waiting {
+            "launch_waiting".into()
+        } else {
+            "starting".into()
+        },
         elapsed_secs: 0,
     }));
     let completed = Arc::new(Mutex::new(None));
@@ -892,6 +932,8 @@ pub fn run_start(
         "pane_id": pane_id,
         "spawned_by": spawned_by,
         "tmux_session": tmux_session,
+        // #2413: `state` が `waiting` なら起動待ち（圧が戻ると起きる。`run_status` で追える）
+        "launch_gate": launch_gate,
     }))
 }
 
@@ -941,13 +983,21 @@ pub fn run_status(run_id: &str) -> Result<Value, String> {
     drop(completed);
 
     let snap = entry.snapshot.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(json!({
+    let mut out = json!({
         "run_id": run_id,
         "pane_id": entry.pane_id,
         "status": snap.worker_status,
         "phase": "running",
         "elapsed_seconds": entry.started_at.elapsed().as_secs(),
-    }))
+    });
+    // #2413: 起動待ち（理由・順番・上書きの案内）。待っている間は status が `launch_waiting`
+    if let Some(gate) = crate::launch_gate::view(entry.pane_id) {
+        if crate::launch_gate::is_waiting(entry.pane_id) {
+            out["status"] = json!("launch_waiting");
+        }
+        out["launch_gate"] = gate;
+    }
+    Ok(out)
 }
 
 /// 完了した run の結果を回収する。未完了なら `phase: "running"` を返す。
@@ -2584,6 +2634,24 @@ mod tests {
                 .expect("スクリプトの応答が尽きた")
         };
         wait_for_worker(&mut exec, opts, None)
+    }
+
+    /// #2413: 起動待ちの worker（画面は素のシェル）を完了と読まない。起きた直後の 1 回は
+    /// spawn 直後と同じく待ち直して読み捨て、その後は通常の判定へ戻る
+    #[test]
+    fn issue2413_起動待ちの間は完了と読まず_起きたら待ち直す() {
+        let mut script = ExecScript::new(vec![
+            status("launch_waiting", "% ", "screen"),
+            status("launch_waiting", "% ", "screen"),
+            status("launch_waiting", "% ", "screen"),
+            status("idle", "% ", "screen"),
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+            status("idle", IDLE_SCREEN, "agents"),
+        ]);
+        let outcome = run_wait(&mut script, &watch_opts(1, Some(Duration::from_secs(60))));
+        assert!(matches!(outcome, WatchOutcome::Idle { .. }), "{outcome:?}");
+        assert!(script.responses.is_empty(), "起きた直後の 1 回を読み捨てる");
     }
 
     #[test]

@@ -12767,8 +12767,6 @@ fn dispatch_sessions_resume(
         scrollback_lines: None,
     };
     host.attach_session(new_id, options);
-    // シェル起動後に resume コマンドを注入する（送達確認つき。#640）
-    host.queue_command_flow(new_id, resume_cmd.clone());
 
     // タイトル・role をカタログのメタから復元する
     let title = match (&entry.project, &entry.label) {
@@ -12805,7 +12803,27 @@ fn dispatch_sessions_resume(
     // #1140: 会話を引き継いで立て直した master / solo も本人のペイン
     // （ここを外すと「再起動したら自動復帰だけ落ちていた」になる）
     apply_master_pane_profile_defaults(pane_obj, role.as_deref(), all_default);
-    pane_obj.set_role(role);
+    pane_obj.set_role(role.clone());
+
+    // シェル起動後に resume コマンドを注入する（送達確認つき。#640）。
+    // #2413: 会話が 1 本増える入口なので、メモリが逼迫しているあいだは起動待ちへ預ける
+    let launch_gate = launch_agent_gated(
+        host,
+        origin,
+        crate::launch_gate::LaunchRequest {
+            pane: new_id.as_u64(),
+            kind: crate::launch_gate::LaunchKind::SessionResume,
+            agent: entry.agent.clone().unwrap_or_else(|| "claude".into()),
+            label: title
+                .clone()
+                .unwrap_or_else(|| crate::sessions::short_id(&session_id).to_string()),
+            role,
+            action: crate::launch_gate::LaunchAction::Command {
+                command: resume_cmd.clone(),
+                prompt: None,
+            },
+        },
+    );
 
     crate::diag::persist_log(&format!(
         "会話の再開: pane={} 会話={} 組み立て={} プロファイル={}",
@@ -12824,6 +12842,8 @@ fn dispatch_sessions_resume(
         "recipe": launch.recipe.as_str(),
         "profile": launch.profile,
         "warnings": launch.warnings,
+        // #2413: 起動待ち（spawn の応答と同じ形）
+        "launch_gate": launch_gate,
     }))
 }
 
@@ -16118,9 +16138,6 @@ fn dispatch_git_resolve_agent(
         );
     }
 
-    // 起動コマンドは送達確認つきで送る（#640）
-    host.queue_command_flow(new_id, agent_cmd.clone());
-
     // プロンプトは雛形から生成する（文面は conflict-resolver.md で差し替え可能）
     let template = orchestrator::conflict_resolver_template();
     let prompt = orchestrator::render_conflict_prompt(
@@ -16137,9 +16154,24 @@ fn dispatch_git_resolve_agent(
             files: &state.files,
         },
     );
-    host.queue_prompt_flow(new_id, prompt.clone());
-
     let window_title = format!("conflict: {}", state.operation.as_str());
+    // 起動コマンドは送達確認つきで送る（#640）。#2413: AI からの起動はメモリが逼迫しているあいだ
+    // 起動待ちへ預ける（GUI の操作 = 人の明示は待たせない）
+    let launch_gate = launch_agent_gated(
+        host,
+        origin,
+        crate::launch_gate::LaunchRequest {
+            pane: new_id.as_u64(),
+            kind: crate::launch_gate::LaunchKind::ConflictResolver,
+            agent: worker_agent.as_str().to_string(),
+            label: window_title.clone(),
+            role: Some(role_value.to_string()),
+            action: crate::launch_gate::LaunchAction::Command {
+                command: agent_cmd.clone(),
+                prompt: Some(crate::launch_gate::FirstPrompt::Follow(prompt.clone())),
+            },
+        },
+    );
     let pane_obj = tree_mut(host.workspace_mut(), tab_id)
         .get_mut(new_id)
         .expect("直前に split で追加済み");
@@ -16173,6 +16205,8 @@ fn dispatch_git_resolve_agent(
             .map(|p| p.display().to_string()),
         "pre_trusted": pre_trusted,
         "tmux_session": tmux_session,
+        // #2413: 起動待ち（spawn の応答と同じ形）
+        "launch_gate": launch_gate,
         // #1068: この解消エージェントの会話が Remote Control へ繋がるか。
         // opt-in していても環境が不適格なら false で、理由は `blocked` に入る
         // （spawn と同じ扱い = 無言で「繋がっているはず」にしない）
@@ -16444,6 +16478,30 @@ fn top_left_pane(tree: &tako_core::PaneTree) -> Option<PaneId> {
         .map(|(id, _)| id)
 }
 
+/// #2413: agent を起こす（メモリが逼迫しているあいだは起動待ちへ預けてすぐ返る）。
+/// 人の GUI 操作（[`PaneOrigin::User`]）は明示の起動とみなして待たせない。戻り値は応答の `launch_gate`
+/// （`waiting` = 預けた / `starting` = 起こした / `None` = 起動待ちを持たない tako・人の操作）
+fn launch_agent_gated(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    req: crate::launch_gate::LaunchRequest,
+) -> Option<Value> {
+    use crate::launch_gate::{self as gate, Decision};
+    let pane = req.pane;
+    let decision = if origin == PaneOrigin::User {
+        Decision::Now(req.action)
+    } else {
+        gate::request(req)
+    };
+    match decision {
+        Decision::Now(action) => {
+            gate::perform(host, pane, action);
+            gate::view(pane)
+        }
+        Decision::Wait(view) => Some(view),
+    }
+}
+
 fn dispatch_orchestrator_spawn(
     host: &mut dyn ControlHost,
     origin: PaneOrigin,
@@ -16670,17 +16728,38 @@ fn dispatch_orchestrator_spawn(
         );
     }
 
+    let pane_role = match label {
+        Some(l) => format!("orchestrator-worker:{project}:{l}"),
+        None => format!("orchestrator-worker:{project}"),
+    };
     // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
     // かつ、起動した直後の PTY へ書いたバイトは器（psmux）に落とされる（#640 実測:
     // PTY 起動から 0〜500ms の書き込みは全損、1500〜3000ms は途中欠落）。
-    // 「シェルの準備待ち → エコー確認 → 分離 Enter → 実行確認」を回す送達確認フローで送る
-    host.queue_command_flow(new_id, worker_cmd.clone());
-
+    // 「シェルの準備待ち → エコー確認 → 分離 Enter → 実行確認」を回す送達確認フローで送る。
+    //
     // プロンプトは claude TUI の起動完了を画面内容で確認してから送達確認つきで送る。
     // ステートマシン駆動: alt_screen 遷移 → 信頼ダイアログ承諾 → ❯ 表示待ち →
     // bracketed paste → 分離 Enter → 入力欄の空検証 + Enter 再送（Issue #32）。
     // マルチラインは bracketed paste でそのまま渡るため改行の平坦化はしない
-    host.queue_spawn_prompt_flow(new_id, prompt.to_string());
+    //
+    // #2413: メモリが逼迫しているあいだ（メモリ圧 warn / critical・swap・空きの予約割れ）は起動を待たせる。
+    // ペイン・レジストリ・台帳は今作り、起動コマンドと依頼文は起動待ちへ預けてすぐ答える
+    // （MCP の呼び出しを固めない）。圧が戻ると GUI の tick が同じ 2 つのフローを積む
+    let launch_gate = launch_agent_gated(
+        host,
+        origin,
+        crate::launch_gate::LaunchRequest {
+            pane: new_id.as_u64(),
+            kind: crate::launch_gate::LaunchKind::Spawn,
+            agent: worker_agent.as_str().to_string(),
+            label: window_title.clone(),
+            role: Some(pane_role.clone()),
+            action: crate::launch_gate::LaunchAction::Command {
+                command: worker_cmd.clone(),
+                prompt: Some(crate::launch_gate::FirstPrompt::Spawn(prompt.to_string())),
+            },
+        },
+    );
 
     // タイトルと role 設定
     // #1945: 一括ボタンの全体の既定（spawn 引数・プロファイルが何も言わないときの最後の段）
@@ -16694,10 +16773,6 @@ fn dispatch_orchestrator_spawn(
         .expect("直前に split で追加済み");
     pane_obj.set_title(Some(window_title.clone()));
     pane_obj.set_spawned_by(Some(target));
-    let pane_role = match label {
-        Some(l) => format!("orchestrator-worker:{project}:{l}"),
-        None => format!("orchestrator-worker:{project}"),
-    };
     pane_obj.set_role(Some(pane_role));
     // 利用上限後の自動復帰（FR-2.27 / #813）の既定を worker ペインへ適用する（#822）。
     // 解決順は spawn 引数 → プロファイル → 全体の既定（#1945）。ON のときだけ監査行を残す
@@ -16903,6 +16978,10 @@ fn dispatch_orchestrator_spawn(
         // #983: spawn は成立したが完全ではなかったもの（分類 + 理由 + 次の一手）。
         // 空配列 = 何も問題が無かった
         "warnings": launch_warnings,
+        // #2413: 起動待ち。`state` が `waiting` ならメモリの逼迫で agent をまだ起こしていない
+        // （`reason` / `position` / `waiting`。圧が戻ると起きる。急ぐなら `start_now` のコマンド）。
+        // `starting` = 起こした。null = 起動待ちを持たない tako（隔離 / A/B）
+        "launch_gate": launch_gate,
     }))
 }
 
@@ -17495,7 +17574,7 @@ fn finish_worker_status(
             .as_ref()
             .and_then(|(_, e)| e.session_id.clone())
     });
-    apply_worker_status_corrections(ResolvedWorkerStatus {
+    let out = apply_worker_status_corrections(ResolvedWorkerStatus {
         status,
         status_source: status_source.to_string(),
         login_account_resolver: Some(Box::new(move || {
@@ -17534,7 +17613,29 @@ fn finish_worker_status(
             }
             None => monitor.to_json(),
         },
-    })
+    })?;
+    Ok(with_launch_gate(out, pane_id))
+}
+
+/// #2413: メモリの逼迫で起動を待たせている worker は、画面（素のシェルのプロンプト）から読んだ状態ではなく
+/// `launch_waiting` と理由・順番（`launch_gate`）を返す。シェルのプロンプトを idle（= 完了）と読ませず、
+/// 起動前に起こりえない事象（依頼文の未達・突然死・起動の失敗・停滞）も出さない
+/// （watch / run / supervisor がシェルへ依頼文を再送しない）。立ち上がり中は状態を変えずに `launch_gate` だけ添える
+fn with_launch_gate(mut v: Value, pane: u64) -> Value {
+    let Some(gate) = crate::launch_gate::view(pane) else {
+        return v;
+    };
+    if crate::launch_gate::is_waiting(pane) {
+        v["status"] = json!("launch_waiting");
+        v["events"] = json!([]);
+        for key in ["error", "stalled", "prompt_undelivered"] {
+            if v.get(key).is_some() {
+                v[key] = Value::Null;
+            }
+        }
+    }
+    v["launch_gate"] = gate;
+    v
 }
 
 /// worker の宣言 / 実際のモデル（#1638。`worker_status` の `model_declared` / `model_actual` /
@@ -35720,6 +35821,123 @@ mod tests {
                     .map(|(p, d)| (p.as_u64(), d.len()))
                     .collect::<Vec<_>>()
             );
+        });
+    }
+
+    /// #2413: メモリ圧 warn / critical の間の spawn はペインとレジストリを作り、起動コマンドと依頼文を
+    /// 起動待ちへ預けて `launch_gate`（理由・順番・上書きの案内）を返す。worker の状態は `launch_waiting`
+    /// （素のシェルを完了と読ませない）。圧が戻ると tick が**待たずに起こすときと同じ 2 つのフロー**を積む
+    #[test]
+    fn issue2413_逼迫中のspawnは起動待ちへ預け_圧が戻ると同じフローを積む() {
+        use tako_core::queue::MachineView;
+        use tako_core::resources::Pressure;
+        let machine = |p| {
+            Some(MachineView {
+                total_mb: 36 * 1024,
+                available_mb: Some(20 * 1024),
+                pressure: Some(p),
+                swap_used_mb: Some(0),
+            })
+        };
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let master = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(master),
+                    title: None,
+                    role: Some("orchestrator-master:test".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            crate::launch_gate::enable_for_test(
+                machine(Pressure::Warn),
+                std::time::Duration::from_secs(60),
+            );
+            let r = dispatch_orchestrator_spawn(
+                &mut host,
+                PaneOrigin::Mcp,
+                test_spawn_params("テスト", None),
+            )
+            .expect("spawn は成功する（待ちでも失敗にしない）");
+            let pane = r["pane_id"].as_u64().expect("ペインは今作る");
+            let gate = &r["launch_gate"];
+            assert_eq!(
+                (gate["state"].as_str(), gate["code"].as_str()),
+                (Some("waiting"), Some("pressure_warn")),
+                "{r}"
+            );
+            assert_eq!(gate["position"], 1);
+            assert_eq!(gate["start_now"], format!("tako queue start {pane}"));
+            assert!(
+                host.command_flows.is_empty() && host.prompt_flows.is_empty(),
+                "待っている間は起動コマンドも依頼文も積まない"
+            );
+            // worker の状態: 素のシェルの idle ではなく launch_waiting
+            let v = with_launch_gate(
+                json!({ "status": "idle", "events": [{ "kind": "prompt_undelivered" }], "error": null }),
+                pane,
+            );
+            assert_eq!(v["status"], "launch_waiting");
+            assert_eq!(v["events"], json!([]));
+            assert_eq!(v["launch_gate"]["state"], "waiting");
+
+            // 圧が戻ると tick が起こす = 待たずに起こすときと同じ起動コマンドと依頼文
+            crate::launch_gate::set_machine_for_test(machine(Pressure::Normal));
+            crate::launch_gate::tick(&mut host);
+            assert_eq!(
+                host.command_flows
+                    .iter()
+                    .map(|(p, c)| (p.as_u64(), c.clone()))
+                    .collect::<Vec<_>>(),
+                vec![(pane, r["command"].as_str().unwrap().to_string())]
+            );
+            assert_eq!(
+                host.prompt_flows
+                    .iter()
+                    .map(|(p, t)| (p.as_u64(), t.clone()))
+                    .collect::<Vec<_>>(),
+                vec![(pane, "テスト".to_string())]
+            );
+            assert_eq!(crate::launch_gate::view(pane).unwrap()["state"], "starting");
+            assert_eq!(
+                with_launch_gate(json!({ "status": "busy" }), pane)["status"],
+                "busy",
+                "起こした後は状態を書き換えない"
+            );
+            // 2 回目の tick は何も積まない（同じペインへ 2 本起こさない）
+            crate::launch_gate::tick(&mut host);
+            assert_eq!(host.command_flows.len(), 1);
+        });
+    }
+
+    /// #2413: 起動待ちを持たない tako（隔離・A/B・CLI のプロセス）の spawn は従来どおり即座に起こし、
+    /// 応答の `launch_gate` は null
+    #[test]
+    fn issue2413_起動待ちが無効ならspawnは従来どおり() {
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let master = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(master),
+                    title: None,
+                    role: Some("orchestrator-master:test".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            let r = dispatch_orchestrator_spawn(
+                &mut host,
+                PaneOrigin::Mcp,
+                test_spawn_params("テスト", None),
+            )
+            .unwrap();
+            assert!(r["launch_gate"].is_null(), "{}", r["launch_gate"]);
+            assert_eq!(host.command_flows.len(), 1);
         });
     }
 

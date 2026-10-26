@@ -18,12 +18,22 @@
 //! 1. 同じ target dir の処理が走っている（停滞中も含む = cargo のロックを持っている）→ 待つ
 //! 2. メモリ圧 critical → 待つ（走っているものは止めない）
 //! 3. **最低限の前進**: 管理下の実行中（停滞を除く）が 0 件なら、ここで入れる
-//!    （メモリ・外の処理・warn の条件が欠けていても。外の負荷だけで永久に待たないため）
+//!    （メモリ・外の処理・warn の条件が欠けていても。外の負荷だけで永久に待たないため）。
+//!    agent の起動（#2413。[`AdmitInput::min_progress`] = `false`）はこの段を飛ばす:
+//!    常駐は終わらないので、逼迫中に 1 本ずつでも足すと戻らない
 //! 4. メモリ圧 warn（または swap が `swap_guard` 以上）→ 待つ（= 実行中が 0 件のときだけ 1 件）
 //! 5. 実行中（停滞を除く）+ tako の外の重い処理 ≥ `max_jobs` → 待つ
 //! 6. 空き − （走り出したばかりの処理がまだ使っていない見込み）− 見込み < 予約 → 待つ
 //!
 //! 機の値が採れない（Windows は #2000 まで）ときは 2・4・6 を飛ばし、同時数だけで決める。
+//!
+//! ## agent の起動待ち（#2413）
+//!
+//! spawn / run・再起動後の復元が起こす agent も**同じ [`admit`]** で待たせる（方針を 2 か所に書かない）。
+//! 呼ぶのは `tako_control::launch_gate` で、違いは入力だけ: 最低限の前進なし（上の 3）・同時数の上限なし・
+//! 実行中 = 立ち上がり中の agent（見込みは [`JobKind::Agent`] の過去の記録）・復元は 1 本の列
+//! （target dir の段 1 を「同時に 1 本」の列として使う。spawn は列の待ちを追い越せる）。
+//! メモリ圧 warn / critical・swap・空きの予約で待つのは重い処理と同じ段（2・4・6）
 //!
 //! ## 見込みと「まだ使っていない見込み」（#2254）
 //!
@@ -56,7 +66,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::resources::Pressure;
+use crate::resources::{MachineStats, Pressure, MIB};
 
 /// 1 GiB を MiB で
 const GIB_MB: u64 = 1024;
@@ -94,6 +104,9 @@ pub enum JobKind {
     Node,
     /// 隔離の tako-app
     Gui,
+    /// agent の起動（#2413。spawn / run / 復元が起こす claude 等）。`tako queue` の wrapper は送らない
+    /// （[`classify`] は返さない）。起動待ち（`tako_control::launch_gate`）が見込みと過去の記録に使う
+    Agent,
     #[default]
     Other,
 }
@@ -106,6 +119,7 @@ impl JobKind {
             Self::Browser => "browser",
             Self::Node => "node",
             Self::Gui => "gui",
+            Self::Agent => "agent",
             Self::Other => "other",
         }
     }
@@ -119,10 +133,16 @@ impl JobKind {
             Self::Build => BUILD_ESTIMATE_MB,
             Self::Test => TEST_ESTIMATE_MB,
             Self::Browser => 2 * GIB_MB,
+            Self::Agent => AGENT_ESTIMATE_MB,
             Self::Node | Self::Gui | Self::Other => GIB_MB,
         }
     }
 }
+
+/// agent 1 本の見込みメモリ（MiB）。過去の記録（立ち上がりの最大）が無いときの既定。
+/// claude 本体 + 子孫（MCP サーバー）の RSS の中央値 596 MB（2026-10-12 の実測。設計書 §1.3）を
+/// [`HISTORY_STEP_MB`] 刻みへ切り上げた
+pub const AGENT_ESTIMATE_MB: u64 = 5 * HISTORY_STEP_MB;
 
 /// build の見込みメモリ（MiB）。tako-core を触った後の `cargo build --workspace`（取り分 6）の
 /// 木の最大 3,430 MB（2026-10-15 の実測。設計書 §4.7）を 0.5 GB 単位へ切り上げた
@@ -460,6 +480,16 @@ pub fn history_keys(argv: &[String], repo: &str) -> Option<HistoryKeys> {
         shape: Some(hash_words(repo, &shape)),
         name: sub.map_or_else(|| program.to_string(), |s| format!("{program} {s}")),
     })
+}
+
+/// agent 1 本の過去の記録の鍵（#2413。純関数）。同じ系統（claude / codex / agy …）の立ち上がりの最大を引く。
+/// 形（`shape`）は持たない = 系統をまたいで見込みを借りない（系統ごとに常駐の大きさが違う）
+pub fn agent_history_keys(agent: &str) -> HistoryKeys {
+    HistoryKeys {
+        key: hash_words("agent", &[agent]),
+        shape: None,
+        name: agent.to_string(),
+    }
 }
 
 /// 過去の記録の 1 行（`<data_dir>/resources/history.jsonl`。調停役が終わった処理ごとに 1 行足す）。
@@ -806,6 +836,17 @@ pub struct MachineView {
     pub swap_used_mb: Option<u64>,
 }
 
+/// 採った機の値を割り当ての判断の形へ（純関数。順番待ちの調停役と agent の起動待ち = #2413 が同じ 1 本を通す）。
+/// メモリの内訳が採れなければ `None`（= 同時数だけで決める）
+pub fn machine_view(stats: &MachineStats) -> Option<MachineView> {
+    stats.memory.map(|m| MachineView {
+        total_mb: m.total / MIB,
+        available_mb: Some(m.available / MIB),
+        pressure: stats.pressure,
+        swap_used_mb: stats.swap.map(|(used, _)| used / MIB),
+    })
+}
+
 /// 実行中の 1 件
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RunningJob {
@@ -1013,6 +1054,10 @@ pub struct AdmitInput<'a> {
     /// ピークを過ぎた実行中の「まだ使っていない見込み」を 0 にする（#2254。`false` = 修正前の
     /// 「見込み − 今の使用量」を最後まで押さえる。調停役は env `TAKO_2254_LEGACY=1` のときだけ `false`）
     pub release_after_peak: bool,
+    /// 最低限の前進（実行中が 0 件ならメモリ・warn の条件が欠けても先頭を入れる）を使う。
+    /// 重い処理 = `true`（終われば空くので、外の負荷だけで永久に待たないため）。
+    /// agent の起動待ち（#2413）= `false`（常駐は終わらない = 逼迫中に足した分は戻らない）
+    pub min_progress: bool,
 }
 
 /// [`admit`] の結果
@@ -1091,8 +1136,8 @@ fn check(
         return Err(WaitReason::PressureCritical);
     }
     let active: Vec<&RunningJob> = running.iter().filter(|r| !r.stalled).collect();
-    // 最低限の前進
-    if active.is_empty() {
+    // 最低限の前進（agent の起動待ちは使わない = #2413）
+    if active.is_empty() && input.min_progress {
         return Ok(());
     }
     if let Some(reason) = pressure {
@@ -1223,6 +1268,84 @@ pub fn admit(input: &AdmitInput<'_>) -> Admission {
     }
 }
 
+// ===== agent の起動待ち（#2413）=====
+
+/// 再起動後の復元の列（#2413）。復元はこの列で **1 本ずつ**起こす（[`admit`] の段 1「同じ target dir は
+/// 同時に 1 件」を列として使う）。列の待ちは段 1 だけで入れない件なので、spawn は追い越せる
+pub const RESTORE_LANE: &str = "<agent-restore>";
+
+/// agent の起動待ちの判断（#2413。純関数）。重い処理と**同じ [`admit`]** を agent の方針の入力で呼ぶ:
+///
+/// - 最低限の前進なし（[`AdmitInput::min_progress`] = `false`）: メモリ圧 warn / critical・swap の警戒線・
+///   空きの予約を割るあいだは、立ち上がり中が 0 本でも起こさない（常駐は終わらないので足した分が戻らない）
+/// - 同時数の上限なし: agent の本数そのものは数えない（歯止めはメモリの段 2・4・6）
+/// - `starting` = 立ち上がり中の agent（まだ使っていない見込みを空きから引く = 立て続けの起動を重ねない）
+/// - 復元は [`RESTORE_LANE`] の列で 1 本ずつ（spawn は列の待ちを追い越せる）
+///
+/// `limits` は重い処理と同じ実効値（`settings.json` の `resources` 節の予約・swap の警戒線）
+pub fn admit_launches(
+    machine: Option<MachineView>,
+    limits: Limits,
+    starting: &[RunningJob],
+    waiting: &[WaitingJob],
+) -> Admission {
+    admit(&AdmitInput {
+        machine,
+        limits: Limits {
+            max_jobs: u32::MAX,
+            ..limits
+        },
+        running: starting,
+        waiting,
+        unmanaged: 0,
+        regathering: false,
+        overtake: true,
+        release_after_peak: true,
+        min_progress: false,
+    })
+}
+
+/// agent の起動が待つ理由の 1 文（#2413）。重い処理の文（[`WaitReason::text`]）は「実行中が終わってから
+/// 1 件ずつ」「同じ target dir」など順番待ちの言葉なので、agent の起動の言葉へ言い換える
+pub fn launch_reason_text(reason: &WaitReason) -> String {
+    match reason {
+        WaitReason::PressureCritical => "メモリ圧 critical（agent の起動を止めている）".into(),
+        WaitReason::PressureWarn => "メモリ圧 warn（normal へ戻るまで agent を起こさない）".into(),
+        WaitReason::Swap { used_mb } => format!(
+            "swap 使用 {}（警戒線を下回るまで agent を起こさない）",
+            gb(*used_mb)
+        ),
+        WaitReason::Memory {
+            available_mb,
+            need_mb,
+            reserve_mb,
+            pending_mb,
+            estimate_mb,
+        } => {
+            let breakdown = if *pending_mb > 0 {
+                format!(
+                    " = 立ち上がり中の agent のまだ使っていない見込み {} + この agent の見込み {}",
+                    gb(*pending_mb),
+                    gb(*estimate_mb)
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "空きメモリ不足（空き {}・必要 {}{breakdown}・予約 {}）",
+                gb(*available_mb),
+                gb(*need_mb),
+                gb(*reserve_mb)
+            )
+        }
+        WaitReason::TargetDir => {
+            "再起動後の復元は 1 本ずつ（前の agent の立ち上がりを待っている）".into()
+        }
+        WaitReason::Ahead => "前に並んでいる起動の後".into(),
+        other => other.text(),
+    }
+}
+
 /// 取り分（`CARGO_BUILD_JOBS` / `RUST_TEST_THREADS`）: max(1, 論理 CPU ÷ 実行中の数)。
 /// `running` は今回入れる分を含めた実行中（停滞を除く）の件数
 pub fn share(cpus: u32, running: usize) -> u32 {
@@ -1320,6 +1443,7 @@ mod tests {
             regathering: false,
             overtake: true,
             release_after_peak: true,
+            min_progress: true,
         }
     }
 
@@ -2381,5 +2505,158 @@ mod tests {
         let back: HistoryRow =
             serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
         assert_eq!(back, full);
+    }
+
+    // ===== agent の起動待ち（#2413）=====
+
+    fn agent_wait(id: u64, at: u64) -> WaitingJob {
+        WaitingJob {
+            estimate_mb: AGENT_ESTIMATE_MB,
+            ..wait(id, at)
+        }
+    }
+
+    fn restore_wait(id: u64, at: u64) -> WaitingJob {
+        WaitingJob {
+            target_dir: Some(RESTORE_LANE.into()),
+            ..agent_wait(id, at)
+        }
+    }
+
+    fn starting(id: u64, lane: bool) -> RunningJob {
+        RunningJob {
+            id,
+            estimate_mb: AGENT_ESTIMATE_MB,
+            used_mb: Some(50),
+            target_dir: lane.then(|| RESTORE_LANE.to_string()),
+            ..RunningJob::default()
+        }
+    }
+
+    #[test]
+    fn issue2413_agentはwarnとcriticalで立ち上がり中が0本でも待つ() {
+        let w = [agent_wait(1, 1)];
+        for (p, code) in [
+            (Pressure::Warn, "pressure_warn"),
+            (Pressure::Critical, "pressure_critical"),
+        ] {
+            let a = admit_launches(Some(machine(20, p)), limits_36gb(), &[], &w);
+            assert!(a.grants.is_empty(), "{p:?} で起こした: {a:?}");
+            assert_eq!(a.blocked.as_ref().map(WaitReason::code), Some(code));
+        }
+        // 重い処理（最低限の前進あり）は warn でも実行中 0 件なら入る = 同じ admit の入力の違いだけ
+        let heavy = admit(&input(
+            Some(machine(20, Pressure::Warn)),
+            limits_36gb(),
+            &[],
+            &w,
+            0,
+        ));
+        assert_eq!(heavy.grants, vec![1]);
+        // normal へ戻ると起こす
+        let a = admit_launches(Some(machine(20, Pressure::Normal)), limits_36gb(), &[], &w);
+        assert_eq!(a.grants, vec![1]);
+    }
+
+    #[test]
+    fn issue2413_agentはswapの警戒線と空きの予約でも待つ() {
+        let w = [agent_wait(1, 1)];
+        let swapped = MachineView {
+            swap_used_mb: Some(3 * GIB_MB),
+            ..machine(20, Pressure::Normal)
+        };
+        let a = admit_launches(Some(swapped), limits_36gb(), &[], &w);
+        assert_eq!(a.blocked.as_ref().map(WaitReason::code), Some("swap"));
+        // 予約 3.6 GB + 見込み 0.625 GB に空き 4 GB は足りない（立ち上がり中 0 本でも）
+        let a = admit_launches(
+            Some(machine_mb(4 * GIB_MB, Pressure::Normal)),
+            limits_36gb(),
+            &[],
+            &w,
+        );
+        assert_eq!(a.blocked.as_ref().map(WaitReason::code), Some("memory"));
+        // 立ち上がり中のまだ使っていない見込みも引く: 空き 5 GB で 1 本目は入り、2 本目は入らない
+        let two = [agent_wait(1, 1), agent_wait(2, 2)];
+        let a = admit_launches(
+            Some(machine_mb(5 * GIB_MB, Pressure::Normal)),
+            limits_36gb(),
+            &[starting(9, false)],
+            &two,
+        );
+        assert_eq!(a.grants, vec![1], "{a:?}");
+        // 2 本目は「今入れた 1 本目」もまだ使っていない見込みとして数える
+        assert_eq!(a.reason_of(2).map(WaitReason::code), Some("memory"));
+        let a = admit_launches(
+            Some(machine_mb(5 * GIB_MB, Pressure::Normal)),
+            limits_36gb(),
+            &[starting(9, false), starting(8, false)],
+            &two,
+        );
+        let text = launch_reason_text(a.blocked.as_ref().unwrap());
+        assert!(
+            a.grants.is_empty() && text.contains("立ち上がり中の agent"),
+            "{a:?} / {text}"
+        );
+    }
+
+    #[test]
+    fn issue2413_復元は列で1本ずつでspawnは列の待ちを追い越す() {
+        let m = Some(machine(20, Pressure::Normal));
+        // 復元 3 本: 1 回目は先頭だけ（列は同時に 1 本）
+        let w = [restore_wait(1, 1), restore_wait(2, 2), restore_wait(3, 3)];
+        let a = admit_launches(m, limits_36gb(), &[], &w);
+        assert_eq!(a.grants, vec![1]);
+        // 先頭が立ち上がり中なら列は待ち、後から来た spawn は追い越して起きる
+        let w = [restore_wait(2, 2), restore_wait(3, 3), agent_wait(4, 4)];
+        let a = admit_launches(m, limits_36gb(), &[starting(1, true)], &w);
+        assert_eq!(a.grants, vec![4], "{a:?}");
+        let text = launch_reason_text(a.reason_of(2).unwrap());
+        assert!(text.contains("1 本ずつ"), "{text}");
+        // 立ち上がりを終えた（立ち上がり中の一覧から外れた）ら次の 1 本
+        let a = admit_launches(m, limits_36gb(), &[], &w);
+        assert_eq!(a.grants, vec![2, 4]);
+        // 逼迫中は列も spawn も待つ（列の待ちだけが追い越しの対象）
+        let a = admit_launches(Some(machine(20, Pressure::Warn)), limits_36gb(), &[], &w);
+        assert!(a.grants.is_empty());
+        // 優先度: master（high）の復元が先頭
+        let mut hi = restore_wait(9, 9);
+        hi.priority = Priority::High;
+        let a = admit_launches(m, limits_36gb(), &[], &[restore_wait(2, 2), hi]);
+        assert_eq!(a.grants, vec![9]);
+        // 復元 0 本は何もしない
+        assert_eq!(
+            admit_launches(m, limits_36gb(), &[], &[]),
+            Admission::default()
+        );
+    }
+
+    #[test]
+    fn issue2413_機の値が採れなければ時差だけ() {
+        // Windows（#2000 まで）: メモリの段は飛ばし、復元の列だけが効く
+        let w = [restore_wait(1, 1), restore_wait(2, 2), agent_wait(3, 3)];
+        let a = admit_launches(None, limits_36gb(), &[], &w);
+        assert_eq!(a.grants, vec![1, 3]);
+    }
+
+    #[test]
+    fn issue2413_agentの鍵は系統ごとで生の名前以外を持たない() {
+        let c = agent_history_keys("claude");
+        assert_ne!(c.key, agent_history_keys("codex").key);
+        assert_eq!(c.key, agent_history_keys("claude").key);
+        assert_eq!((c.shape.as_deref(), c.name.as_str()), (None, "claude"));
+        // 記録が無ければ既定（設計書 §1.3 の実測）、あれば直近の最大
+        assert_eq!(
+            estimate(JobKind::Agent, Some(&c), &[]).mb,
+            AGENT_ESTIMATE_MB
+        );
+        let rows = [HistoryRow {
+            key: c.key.clone(),
+            kind: JobKind::Agent,
+            peak_mb: 300,
+            ..HistoryRow::default()
+        }];
+        let e = estimate(JobKind::Agent, Some(&c), &rows);
+        assert_eq!((e.mb, e.from), (384, EstimateFrom::History));
+        assert_eq!(classify(&argv("claude --resume x")), JobKind::Other);
     }
 }

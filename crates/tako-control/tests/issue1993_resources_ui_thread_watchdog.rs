@@ -21,6 +21,9 @@
 //! 6. 順番待ちの調停役（`queue.rs`）のうち dispatch の腕から届く口（`handle` と、そこから呼ぶ
 //!    `poll` / `done` / `cancel` / `set_limits` / `status_section` / `decide` / `refresh_usage` /
 //!    `machine`）は採らない（覚えを読むだけ。#1994）
+//! 7. agent の起動待ち（`launch_gate.rs`。#2413）の UI スレッドから届く口（dispatch の spawn と起動時の
+//!    復元が呼ぶ `request`、500 ms の tick が呼ぶ `tick` と、そこから呼ぶ判断・取り込み）は採らない。
+//!    GUI の 500 ms tick が `launch_gate::tick` を呼んでいる（待たせた起動を起こす口が配線されている）
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -38,6 +41,7 @@ const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
 const IPC: &str = "crates/tako-control/src/ipc.rs";
 const RESOURCES: &str = "crates/tako-control/src/resources.rs";
 const QUEUE: &str = "crates/tako-control/src/queue.rs";
+const LAUNCH_GATE: &str = "crates/tako-control/src/launch_gate.rs";
 
 /// UI スレッドで呼んではいけない口（右は名指しの理由）
 const SCANS: &[(&str, &str)] = &[
@@ -151,6 +155,7 @@ struct Sources {
     ipc: String,
     resources: String,
     queue: String,
+    launch_gate: String,
 }
 
 impl Sources {
@@ -163,6 +168,7 @@ impl Sources {
             ipc: read(&root, IPC),
             resources: read(&root, RESOURCES),
             queue: read(&root, QUEUE),
+            launch_gate: read(&root, LAUNCH_GATE),
         }
     }
 
@@ -173,6 +179,7 @@ impl Sources {
         out.extend(scan_ipc(&self.ipc));
         out.extend(scan_resources(&self.resources));
         out.extend(scan_queue(&self.queue));
+        out.extend(scan_launch_gate(&self.launch_gate, &self.main));
         out
     }
 }
@@ -441,6 +448,55 @@ fn scan_queue(src: &str) -> Vec<Offender> {
     out
 }
 
+/// 7. agent の起動待ちの UI スレッドから届く口は採らない（#2413）
+const LAUNCH_GATE_UI_REACHABLE: &[&str] = &[
+    "pub fn request(",
+    "pub fn tick(",
+    "pub fn perform(",
+    "fn decide(g: &mut Gate",
+    "fn machine(g: &Gate",
+    "fn refresh_usage(",
+    "fn refresh_inputs(",
+    "fn settle(",
+];
+
+fn scan_launch_gate(src: &str, main: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    for head in LAUNCH_GATE_UI_REACHABLE {
+        match fn_window(src, head) {
+            None => out.push(Offender {
+                file: LAUNCH_GATE,
+                line: 0,
+                why: format!("`{head}` が見つからない（走査が空振り）"),
+            }),
+            Some((at, window)) => {
+                let place = format!(
+                    "起動待ちの `{}`",
+                    head.trim_start_matches("pub fn ")
+                        .trim_start_matches("fn ")
+                        .split('(')
+                        .next()
+                        .unwrap_or(head)
+                );
+                scans_in(LAUNCH_GATE, at, &window, &place, &mut out);
+            }
+        }
+    }
+    if !main
+        .lines()
+        .any(|l| !is_comment(l) && l.contains("tako_control::launch_gate::tick(app)"))
+    {
+        out.push(Offender {
+            file: MAIN,
+            line: 0,
+            why: "500 ms の tick が `tako_control::launch_gate::tick(app)` を呼んでいない \
+                  （待たせた agent の起動を誰も起こさない = 逼迫が解けても worker が立たない）"
+                .into(),
+        });
+    }
+    out
+}
+
 #[test]
 fn ui_スレッドはpcリソースを採らない() {
     let s = Sources::load();
@@ -624,5 +680,34 @@ fn 逆戻りを名指しできる() {
         scan_queue(&q),
         QUEUE,
         "refresh_machine_if_stale(",
+    );
+
+    // ⑨ 起動待ちの tick（UI スレッドの 500 ms）で機の値を採り直す（#2413）
+    let g = inject(
+        &s.launch_gate,
+        "        refresh_inputs(&mut g, now);\n        refresh_usage(&mut g);",
+        "        refresh_inputs(&mut g, now);\n        crate::resources::refresh_machine_if_stale();\n        refresh_usage(&mut g);",
+        "⑨",
+    );
+    expect_named(
+        "起動待ちの tick で採る",
+        scan_launch_gate(&g, &s.main),
+        LAUNCH_GATE,
+        "refresh_machine_if_stale(",
+    );
+    // ⑩ 500 ms の tick から起動待ちを外す（待たせた起動を誰も起こさない）
+    let m = inject(
+        &s.main,
+        "                tako_control::launch_gate::tick(app);",
+        "",
+        "⑩",
+    );
+    let offenders = scan_launch_gate(&s.launch_gate, &m);
+    assert!(
+        offenders
+            .iter()
+            .any(|o| o.file == MAIN && o.why.contains("launch_gate::tick(app)")),
+        "注入「⑩」を名指しできない: {:?}",
+        offenders.iter().map(Offender::report).collect::<Vec<_>>()
     );
 }

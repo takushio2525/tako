@@ -69,6 +69,7 @@ fn input<'a>(l: Limits, run: &'a [RunningJob], wait: &'a [WaitingJob]) -> AdmitI
         regathering: false,
         overtake: true,
         release_after_peak: true,
+        min_progress: true,
     }
 }
 
