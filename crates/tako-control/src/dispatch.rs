@@ -53459,9 +53459,18 @@ mod tests {
         );
         let row = status(&mut host)["panes"][0].clone();
         assert_eq!(row["band"]["state"], "hidden_by_other_mod", "{row}");
-        assert!(row["band"]["message"]
-            .as_str()
-            .unwrap()
+        // 文は表示言語に従う（#2365）。並走するテストがグローバルを動かしても揺れないよう、日英の
+        // どちらかの文と一致することを見る
+        let message = row["band"]["message"].as_str().unwrap();
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .iter()
+                .any(|l| message
+                    == crate::claude_mod::text::ModText::BandHiddenByOtherMod.text_in(*l)),
+            "{message}"
+        );
+        assert!(crate::claude_mod::text::ModText::BandHiddenByOtherMod
+            .text_in(tako_core::i18n::Lang::Ja)
             .contains("他の mod"));
 
         // 描いていない（statusLine が出している・off）→ tako が出す
