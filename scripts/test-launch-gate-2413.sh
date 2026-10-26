@@ -58,6 +58,8 @@ done
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+# shellcheck source=lib/tmux-socket.sh
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 # HOME を差し替える**前**にバイナリを決める（後で呼ぶとツールチェーンを一時 HOME へ取り直す）
 isolated_gui_bins || exit 1
 
@@ -67,8 +69,7 @@ cleanup() {
   [ -n "${ISOLATED_GUI_PID:-}" ] && stop_isolated_gui "$ISOLATED_GUI_PID"
   local s
   for s in $SOCKETS; do
-    tmux -L "$s" kill-server >/dev/null 2>&1
-    rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${s:?}"
+    tmux_socket_kill "$s"
   done
   if [ -n "${KEEP:-}" ]; then
     echo "置き場を残した: $ROOT"
@@ -392,7 +393,7 @@ part_spawn() {
   check_eq "⑥ critical へ戻しても走っている agent は殺さない（生存 / 起動）" "$total/$total" "$alive/$total"
   check_eq "⑥ 新しい spawn は待つ（起動は 4 本のまま）" 4 "$(launch_count)"
   stop_gui
-  tmux -L "$SOCK" kill-server >/dev/null 2>&1
+  tmux_socket_kill "$SOCK"
 
   # ⑩ A/B: 同じ注入（critical）で修正前は即座に起こす
   echo
@@ -407,7 +408,7 @@ part_spawn() {
   n="$(wait_launches 1 15)"
   check_eq "⑩ 修正前は critical でも即座に起こす" 1 "$n"
   stop_gui
-  tmux -L "$SOCK" kill-server >/dev/null 2>&1
+  tmux_socket_kill "$SOCK"
 }
 
 # ============================== 復元 ==============================
@@ -436,7 +437,7 @@ prepare_restore() {
     "⑨ 復元する agent が 0 本の起動では復元の行が出ない"
   stop_gui
   # PC の再起動の代わり: 器（tmux）ごと消す
-  tmux -L "$SOCK" kill-server >/dev/null 2>&1
+  tmux_socket_kill "$SOCK"
   sleep 1
   cp "$TAKO_DATA_DIR/layout.json" "$R/layout.seed.json"
   J seed_layout "$TAKO_DATA_DIR/layout.json" "$HOME/.claude/projects/p" "$R/table.txt" > "$R/seeded.txt"
@@ -446,7 +447,7 @@ prepare_restore() {
 
 # 同じ layout で起動し直す（前の回の器と起動の記録を消す）
 reset_restore() {
-  tmux -L "$SOCK" kill-server >/dev/null 2>&1
+  tmux_socket_kill "$SOCK"
   sleep 1
   cp "$R/layout.restore.json" "$TAKO_DATA_DIR/layout.json"
   : > "$LAUNCHES"
@@ -517,7 +518,7 @@ part_restore() {
   check_eq "⑩ 修正前は critical でも全部起こす" "$expect" "$COUNT"
   check "$([ "$OVERLAP" -ge 3 ] && echo 1 || echo 0)" "⑩ 修正前は一斉（${SAME} 秒以内に ${OVERLAP} 本）"
   stop_gui
-  tmux -L "$SOCK" kill-server >/dev/null 2>&1
+  tmux_socket_kill "$SOCK"
 }
 
 for part in $PARTS; do
