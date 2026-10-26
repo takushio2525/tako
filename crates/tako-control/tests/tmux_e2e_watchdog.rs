@@ -111,11 +111,19 @@ fn container_hits(src: &str) -> Vec<Hit> {
 }
 
 /// 1 実装の外で器を畳んでよいファイル（**理由つき**。増やすときは #1866 の型に当たらないことを書く）
-const RETIRE_ALLOWLIST: &[(&str, &str)] = &[(
-    "remote_scrollback_e2e.rs",
-    "テスト 1 本だけのバイナリ（env を器の解決より先に置くため）で、隣のテストが器を共有しない。\
-     器は tmux / psmux 共用の CLI（`tako_core::backend::binary()`）を直接叩くので tmux_e2e を通せない",
-)];
+const RETIRE_ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "remote_scrollback_e2e.rs",
+        "テスト 1 本だけのバイナリ（env を器の解決より先に置くため）で、隣のテストが器を共有しない。\
+         器は tmux / psmux 共用の CLI（`tako_core::backend::binary()`）を直接叩くので tmux_e2e を通せない",
+    ),
+    (
+        "issue2399_tmux_socket_kill.rs",
+        "器はテストごとに別の一時 `TMUX_TMPDIR` の中に立てる（置き場ごと別 = 隣のテストと器を共有しない）。\
+         検証スクリプトの後片付けの 1 実装（`scripts/lib/tmux-socket.sh`）そのものを測るので tmux_e2e を通せない。\
+         Drop の `kill-server` は失敗の経路の保険（#2399）",
+    ),
+];
 
 /// 1 実装の外で器を畳む形を拾う（#1866）。
 ///

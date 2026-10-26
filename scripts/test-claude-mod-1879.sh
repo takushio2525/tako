@@ -40,6 +40,7 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAK
 unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID CLAUDECODE
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 ONLY="${ONLY:-}"
 PASS=0
 FAIL=0
@@ -86,8 +87,7 @@ WORKDIR="${CLAUDE_WORKDIR:-$(git -C "$REPO_ROOT" worktree list --porcelain | awk
 # 後始末。終了コードの補正は exit-guard の番人（#1864）が受け持つ（印の無い 0 は 1）
 cleanup() {
   stop_isolated_gui "$APP_PID"
-  tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
-  rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/${TMUX_SOCKET:?}"
+  tmux_socket_kill "$TMUX_SOCKET"
   # テストが作らせた空 dir だけ消す（前からあったものには触らない）
   if [ "$INLINE_EXISTED" = 0 ] && [ -d "$INLINE_DATA" ]; then
     rmdir "$INLINE_DATA" 2>/dev/null || true
@@ -430,7 +430,7 @@ for r in d.get("panes", []):
   np="$(root_pane)"
   exit_claude "$np"
   stop_app
-  tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$TMUX_SOCKET"
 }
 
 # --- 3. 版の下限未満（2.1.280 の実体）--------------------------------------------

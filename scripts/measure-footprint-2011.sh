@@ -45,6 +45,7 @@ set -uo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_MCP_URL TAKO_ORCHESTRATOR_ROLE
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 SCEN="${1:-std}"
 IDLE="${2:-60}"
 EXTRA_ENV="${TAKO_FOOTPRINT_ENV:-}"
@@ -60,7 +61,7 @@ CAFF_PID=""
 cleanup() {
   [ -n "$CAFF_PID" ] && kill "$CAFF_PID" 2>/dev/null
   stop_isolated_gui "${ISOLATED_GUI_PID:-}"
-  tmux -L "$SOCK_NAME" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$SOCK_NAME"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -278,7 +279,7 @@ run_one() {
 
   rm -rf "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR" "$TAKO_ORCHESTRATOR_DIR" "$TAKO_PANE_LOG_DIR"
   mkdir -p "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR" "$TAKO_ORCHESTRATOR_DIR"
-  tmux -L "$SOCK_NAME" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$SOCK_NAME"
 
   local t0 t1
   # shellcheck disable=SC2086
@@ -393,7 +394,7 @@ print("\t".join([spec, mode, n, front, back, bg, prev, startup] + fp_idle.split(
       filled, drawn, lid, locked, env]))
 PY
   stop_isolated_gui "$ISOLATED_GUI_PID"; ISOLATED_GUI_PID=""
-  tmux -L "$SOCK_NAME" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "$SOCK_NAME"
   unset TAKO_SOCKET TAKO_TOKEN
   tail -1 "$TMP/result.tsv" | awk -F'\t' '{printf "  %-14s 放置 %6s MB（malloc %s・描画 %s・tmux %s）CPU %s%%・子 %s%%・描画 %s 回/秒 ｜ 出力中 %s MB（描画 %s）CPU %s%%・子 %s%%・描画 %s 回/秒 ｜ 起動 %s ms・スレッド %s・中身 %s・描画 %s・蓋 %s\n", $1, $9, $10, $11, $13, $16, $17, $20, $22, $24, $25, $26, $28, $8, $14, $30, $31, $32 ($33 == "ロック" ? "・画面ロック中" : "")}'
   sleep 3

@@ -21,6 +21,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 ARMS="${ARMS:-new legacy}"
@@ -48,7 +49,7 @@ SOCKETS=""
 cleanup() {
   [ -n "${ISOLATED_GUI_PID:-}" ] && stop_isolated_gui "$ISOLATED_GUI_PID"
   local s d
-  for s in $SOCKETS; do tmux -L "$s" kill-server >/dev/null 2>&1; done
+  for s in $SOCKETS; do tmux_socket_kill "$s"; done
   # KEEP=1 なら置き場を残す（persist.log / perf.log / app.log を後から読むため）
   if [ -n "${KEEP:-}" ]; then
     echo "置き場を残した:${TMP_ROOTS}"
@@ -235,7 +236,7 @@ for t in json.load(sys.stdin)["tabs"]:
   fi
 
   stop_isolated_gui "$ISOLATED_GUI_PID"
-  tmux -L "$sock" kill-server >/dev/null 2>&1
+  tmux_socket_kill "$sock"
 }
 
 for arm in $ARMS; do

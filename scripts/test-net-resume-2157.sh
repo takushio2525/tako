@@ -34,6 +34,7 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAK
   TAKO_BACKEND_SOCKET TAKO_CLI
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 FAKE="$REPO_ROOT/scripts/lib/fake-agent-net-2112.sh"
 PASS=0
 FAIL=0
@@ -55,7 +56,7 @@ stop_listener() {
   fi
 }
 kill_tmux() {
-  [ -n "$TMUX_SOCKET" ] && tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1
+  [ -n "$TMUX_SOCKET" ] && tmux_socket_kill "$TMUX_SOCKET"
   TMUX_SOCKET=""
 }
 cleanup() {

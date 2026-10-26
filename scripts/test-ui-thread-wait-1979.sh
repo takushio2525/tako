@@ -31,6 +31,7 @@ set -uo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 LEGACY="${TAKO_1979_LEGACY:-}"
 PASS=0
 FAIL=0
@@ -54,7 +55,7 @@ cleanup() {
       [ -n "$p" ] && kill "$p" 2>/dev/null
     done < "$HOLDERS"
   fi
-  "${REAL_TMUX:-tmux}" -L "tako-1979-$$" kill-server >/dev/null 2>&1 || true
+  tmux_socket_kill "tako-1979-$$"
   rm -rf "$TMP"
 }
 trap cleanup EXIT

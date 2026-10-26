@@ -27,6 +27,7 @@ set -uo pipefail
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE CLAUDE_CONFIG_DIR ZDOTDIR
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 MINUTES="${1:-30}"
 DURATION=$((MINUTES * 60))
 PASS=0
@@ -52,7 +53,7 @@ cleanup() {
   for p in $POLL_PIDS; do kill "$p" 2>/dev/null; done
   for p in $GUI_PIDS; do stop_isolated_gui "$p"; done
   kill_agents
-  for arm in $ARMS; do tmux -L "t2020-$arm-$$" kill-server 2>/dev/null; done
+  for arm in $ARMS; do tmux_socket_kill "t2020-$arm-$$"; done
   sleep 6 # 偽の claude の sleep 5 が抜けるのを待つ（孤児を残さない）
   [ -n "${KEEP_TMP:-}" ] && { echo "一時 dir を残した: $TMP"; return; }
   rm -rf "$TMP"
@@ -376,7 +377,7 @@ fi
 echo
 echo "== ④ 器ごと落とした後の再起動で会話が戻る（#1076 / FR-5.9.1）"
 kill_agents
-for arm in $ARMS; do tmux -L "t2020-$arm-$$" kill-server 2>/dev/null; done
+for arm in $ARMS; do tmux_socket_kill "t2020-$arm-$$"; done
 sleep 6
 for arm in $ARMS; do
   : > "$TMP/fake-$arm/launch.log"
