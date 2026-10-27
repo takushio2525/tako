@@ -1321,10 +1321,22 @@ mod tests {
     #[test]
     fn test_detect_install_method_returns_value() {
         let method = detect_install_method();
+        // Windows はインストーラー / ポータブルの 2 系統、それ以外は macOS の 3 系統（#2434）
+        let expected: &[InstallMethod] = if Platform::current() == Platform::Windows {
+            &[
+                InstallMethod::WindowsInstaller,
+                InstallMethod::WindowsPortable,
+            ]
+        } else {
+            &[
+                InstallMethod::Homebrew,
+                InstallMethod::Zip,
+                InstallMethod::BrokenBrew,
+            ]
+        };
         assert!(
-            method == InstallMethod::Homebrew
-                || method == InstallMethod::Zip
-                || method == InstallMethod::BrokenBrew
+            expected.contains(&method),
+            "{method:?} はこのプラットフォームの配布系統 {expected:?} に無い"
         );
     }
 
