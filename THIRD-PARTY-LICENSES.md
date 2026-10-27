@@ -21,7 +21,7 @@ are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 | ライセンス / License | 件数 / Count |
 |---|---|
-| MIT License | 490 |
+| MIT License | 491 |
 | Apache License 2.0 | 30 |
 | Unicode License v3 | 19 |
 | ISC License | 18 |
@@ -5606,6 +5606,7 @@ DEALINGS IN THE SOFTWARE.
 
 - [dirs-sys 0.5.0](https://github.com/dirs-dev/dirs-sys-rs)
 - [dirs 6.0.0](https://github.com/soc/dirs-rs)
+- [dirs 7.0.0](https://codeberg.org/dirs/dirs-rs)
 
 ```text
 Copyright (c) 2018-2019 dirs-rs contributors
@@ -7992,7 +7993,7 @@ SOFTWARE.
 
 使用しているクレート / Used by:
 
-- [wry 0.55.1](https://github.com/tauri-apps/wry)
+- [wry 0.57.1](https://github.com/tauri-apps/wry)
 
 ```text
 MIT License
@@ -8376,8 +8377,8 @@ SOFTWARE.
 - [svg_fmt 0.4.5](https://github.com/nical/rust_debug)
 - [taffy 0.10.1](https://github.com/DioxusLabs/taffy)
 - [webview2-com-macros 0.8.1](https://github.com/wravery/webview2-rs)
-- [webview2-com-sys 0.38.2](https://github.com/wravery/webview2-rs)
-- [webview2-com 0.38.2](https://github.com/wravery/webview2-rs)
+- [webview2-com-sys 0.39.1](https://github.com/wravery/webview2-rs)
+- [webview2-com 0.39.1](https://github.com/wravery/webview2-rs)
 - [windows-collections 0.2.0](https://github.com/microsoft/windows-rs)
 - [windows-collections 0.3.2](https://github.com/microsoft/windows-rs)
 - [windows-core 0.61.2](https://github.com/microsoft/windows-rs)

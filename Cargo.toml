@@ -101,7 +101,7 @@ serde_yaml = "0.9"
 toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
 # Web ビューペイン（FR-3.8）: OS ネイティブ webview（macOS = WKWebView / Windows = WebView2）を
 # GPUI ウィンドウの子ビューとして統合する。Apache-2.0 OR MIT。追加ランタイム同梱不要（NFR-3/7）
-wry = { version = "0.55", default-features = false, features = ["os-webview"] }
+wry = { version = "0.57.1", default-features = false, features = ["os-webview"] }
 # GPUI ウィンドウから wry へ渡す親ウィンドウハンドル（gpui と同じ 0.6 系）
 raw-window-handle = "0.6"
 # リモート接続の WS 画面プッシュ（tako-control::remote）
@@ -118,7 +118,8 @@ base64 = "0.22"
 # .rc を自前で書く embed-resource と違い Cargo のメタデータからバージョン情報を組める
 winresource = "0.1"
 # Windows の OS 標準 PDF レンダラ `Windows.Data.Pdf` を呼ぶ WinRT バインディング（#521）。
-# Microsoft 公式・MIT OR Apache-2.0。既に gpui / wry 経由で依存グラフの中にいる 0.62 系へ揃える。
+# Microsoft 公式・MIT OR Apache-2.0。gpui（accesskit_windows）と wry（0.57 から = #2445）が使う 0.62 系へ揃える
+# （gpui 本体の 0.61 とは別。tako が版の数を増やさない）。
 # 参照するのは cfg(windows) のときだけなので macOS のビルドグラフには載らない
 windows = { version = "0.62", features = ["Data_Pdf", "Foundation", "Storage_Streams"] }
 # PDF 構造パーサ（#693）。Windows.Data.Pdf にはリンク注釈・目次・テキスト抽出 API が無いため、

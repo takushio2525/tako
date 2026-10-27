@@ -24,7 +24,7 @@ use tako_core::PaneId;
 ///
 /// Windows の wry（WebView2）は環境・コントローラ・初期化スクリプトの作成完了を
 /// `webview2_com::wait_with_pump`（`GetMessageA` + `DispatchMessageA` の入れ子のループ）で待つ
-/// （wry-0.55.1 `src/webview2/mod.rs:363 / :414 / :1308`）。App を借用したまま
+/// （wry-0.57.1 `src/webview2/mod.rs:377 / :435 / :1414`。0.55 から変わらない）。App を借用したまま
 /// （クリックハンドラ・render・dispatch のどれも借用の内側）生成すると、ポンプが走らせた
 /// gpui の前景タスクの `AsyncApp::update_entity` が `borrow_mut()` で二重借用の panic を起こし、
 /// 窓プロシージャを跨ぐので巻き戻せず abort する（#724 の実機の panic.log と隔離環境の再現で
@@ -52,12 +52,15 @@ pub(crate) fn async_build_decision(windows: bool, legacy: bool, forced: bool) ->
 
 /// ページから tako へ ipc（`window.ipc.postMessage`）でタイトル・URL を送らせるか（#724 の W2）。
 ///
-/// Windows の wry は ipc ハンドラが付いていると、COM のコールバックの中で
-/// `Request::builder().uri(url).body(js).unwrap()`（wry-0.55.1 `src/webview2/mod.rs:910`）を呼ぶ。
+/// wry 0.55 の WebView2 は ipc ハンドラが付いていると、COM のコールバックの中で
+/// `Request::builder().uri(url).body(js).unwrap()`（wry-0.55.1 `src/webview2/mod.rs:910`）を呼んだ。
 /// `url` はメッセージを送った文書の URI で、data: / about:blank や URI が未確定のときは
-/// `http::Uri` にならず `InvalidUri(Empty)` で panic → 巻き戻せず abort する（#724 のコメントの実機の
-/// スタック）。同じハンドラの先頭は `let (Some(args), Some(ipc_handler)) = … else { return Ok(()) }`
-/// （同 :892）なので、**ipc ハンドラを付けなければ :910 に届かない**ことが wry のソースで決まる。
+/// `http::Uri` にならず `InvalidUri(Empty)` で panic → 巻き戻せず abort した（#724 のコメントの実機の
+/// スタック）。上流は 0.56.1 でこれを `match` に変え（wry#1772）、いまの 0.57.1 は不正な URI の
+/// メッセージを捨てるだけになった（`attach_ipc_handler`。番犬が registry の実ソースで確かめる）。
+/// それでも Windows で付けないままにしているのは、付けた形を Windows の実機でまだ通していないため
+/// （#2445。戻すのは実機で確かめてから）。付けなければ wry はハンドラの登録そのものをしない
+/// （`if let Some(ipc_handler) = attributes.ipc_handler.take()`）。
 /// JS の側で http(s) のときだけ送る形は、`http::Uri` が受け付ける文字列を tako が当てる形になり
 /// 根拠が弱いので採らない。タイトル・URL は 2 秒ごとの [`WebViewEntry::poll_state`]
 /// （eval の経路。もともと正本）が拾う。Windows で失うのは http(s) のページの即時の更新だけ
@@ -85,6 +88,40 @@ pub fn inject_build_delay() -> Option<std::time::Duration> {
 /// #724 の修正前へ戻す（`TAKO_724_LEGACY=1`。Windows の実機の A/B 用）
 fn legacy_724() -> bool {
     std::env::var_os("TAKO_724_LEGACY").is_some()
+}
+
+/// ページに要素の全画面表示（Fullscreen API。動画の全画面ボタン等）を許すか（#2445）。
+///
+/// wry 0.56 から macOS の WKWebView は要素の全画面表示が常に入る（wry#1779 / #1780。0.55 は
+/// `fullscreen` feature を入れたときだけで、tako は入れていなかった）。全画面のあいだ WebKit は
+/// WKWebView を描画ビューから外して全画面の窓へ移し、元の場所へ代わりのビュー（スナップショット）を
+/// 置く（WebKit の `WKFullScreenWindowController.mm`）。tako の前提「WKWebView の superview は
+/// gpui の描画ビュー」（#1481 / #1837）がそのあいだ崩れるので、同じソースから次が読める:
+/// ①位置合わせ（`set_bounds`）が全画面の窓の中の WKWebView を動かし、戻った後は代わりのビューの
+/// 古い位置に残る ②閉じると wry の Drop が全画面の窓から外し、WebKit の戻す処理が tako の知らない
+/// WKWebView を tako の窓へ戻しうる ③全画面のあいだ tako の窓の宛先が NSWindow 自身になり、
+/// ターミナルへ打鍵が届かない。手当てと実機での確かめが済むまでは 0.55 と同じく切る（依存の更新で
+/// 製品の挙動を変えない）。A/B: `TAKO_2445_FULLSCREEN=1` = wry の既定（入れる）
+pub(crate) fn element_fullscreen_enabled() -> bool {
+    std::env::var_os("TAKO_2445_FULLSCREEN").is_some()
+}
+
+/// 作った Web ビューへ [`element_fullscreen_enabled`] の判断を当てる（macOS だけ。WebView2 の
+/// 全画面は WebView2 の窓の中で閉じるので触らない）
+fn apply_element_fullscreen(view: &wry::WebView) {
+    #[cfg(target_os = "macos")]
+    {
+        use wry::WebViewExtMacOS;
+        let wk = view.webview();
+        key_monitor::set_element_fullscreen(
+            &*wk as *const _ as *const std::ffi::c_void,
+            element_fullscreen_enabled(),
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = view;
+    }
 }
 
 /// Web ビューの段階（#724）。`Ready` だけが wry の Web ビューを持つ
@@ -123,7 +160,7 @@ impl WebViewPhase {
 /// ウィンドウ破棄 = アプリ終了」を前提に初回 render で 1 度だけ採っていたが、
 /// 複数ウィンドウ（#339 で最初の窓を閉じる）と macOS の Dock 復帰（#381 で最後の窓を
 /// 閉じて開き直す）でこの前提は崩れていた。閉じた窓の描画ビューを親にすると、wry は
-/// 親の NSWindow を `ns_view.window().unwrap()`（wkwebview/mod.rs:392）で引くので、
+/// 親の NSWindow を `ns_view.window().unwrap()`（wry-0.57.1 wkwebview/mod.rs:434）で引くので、
 /// 窓が解放されていれば **panic でプロセスごと落ちる**。解放されていなければ
 /// 閉じた窓の中に見えない Web ビューを作る。採り直しの判定は呼び出し側
 /// （`TakoApp::refresh_webview_parent`）が [`Self::owner`] と [`Self::attached`] で行う
@@ -481,9 +518,10 @@ impl WebViewEntry {
                     }
                 }
             });
-        // #724 の W2: Windows では ipc ハンドラを付けない（付けると data: / about:blank で
-        // wry の mod.rs:910 の unwrap に届く。理由は `ipc_hook_enabled`）。ハンドラが無いと
-        // postMessage は捨てられるだけなので、送り手の初期化スクリプトも入れない
+        // #724 の W2: Windows では ipc ハンドラを付けない（wry 0.55 は data: / about:blank で
+        // mod.rs:910 の unwrap に届いた。0.57.1 は捨てるだけだが実機で未確認。理由は
+        // `ipc_hook_enabled`）。ハンドラが無いと postMessage は捨てられるだけなので、
+        // 送り手の初期化スクリプトも入れない
         if ipc_hook_enabled() {
             let ipc_shared = Arc::clone(shared);
             builder = builder
@@ -505,9 +543,12 @@ impl WebViewEntry {
                     }
                 });
         }
-        builder
+        let view = builder
             .build_as_child(window)
-            .map_err(|e| format!("webview 生成失敗: {e}"))
+            .map_err(|e| format!("webview 生成失敗: {e}"))?;
+        // #2445: 要素の全画面表示は切る（理由は `element_fullscreen_enabled`）
+        apply_element_fullscreen(&view);
+        Ok(view)
     }
 
     /// 作った wry の Web ビューを取り付ける。ナビゲーションの見張り（10 秒）はここから数える
@@ -1234,6 +1275,64 @@ mod key_monitor {
         }
     }
 
+    /// WKWebView の要素の全画面表示を入れる / 切る（#2445）。設定は WKWebView の
+    /// `configuration.preferences`（複製の設定もページと同じ WebPreferences を指すので、生成後に
+    /// 書いてもそのページへ効く）。macOS 12.3 以降は公開 API の `elementFullscreenEnabled`、
+    /// それより前は wry が入れるのと同じ非公開の KVC 鍵 `fullScreenEnabled`。送れたら true
+    pub(super) fn set_element_fullscreen(webview: *const c_void, enabled: bool) -> bool {
+        if webview.is_null() {
+            return false;
+        }
+        unsafe {
+            let f_id: unsafe extern "C" fn(*const c_void, *const c_void) -> *const c_void =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let config = f_id(webview, sel("configuration"));
+            if config.is_null() {
+                return false;
+            }
+            let prefs = f_id(config, sel("preferences"));
+            if prefs.is_null() {
+                return false;
+            }
+            let setter = sel("setElementFullscreenEnabled:");
+            let f_responds: unsafe extern "C" fn(
+                *const c_void,
+                *const c_void,
+                *const c_void,
+            ) -> bool = std::mem::transmute(objc_msgSend as *const c_void);
+            if f_responds(prefs, sel("respondsToSelector:"), setter) {
+                let f_set: unsafe extern "C" fn(*const c_void, *const c_void, bool) =
+                    std::mem::transmute(objc_msgSend as *const c_void);
+                f_set(prefs, setter, enabled);
+                return true;
+            }
+            let f_num: unsafe extern "C" fn(*const c_void, *const c_void, bool) -> *const c_void =
+                std::mem::transmute(objc_msgSend as *const c_void);
+            let f_str: unsafe extern "C" fn(
+                *const c_void,
+                *const c_void,
+                *const std::ffi::c_char,
+            ) -> *const c_void = std::mem::transmute(objc_msgSend as *const c_void);
+            let f_kv: unsafe extern "C" fn(
+                *const c_void,
+                *const c_void,
+                *const c_void,
+                *const c_void,
+            ) = std::mem::transmute(objc_msgSend as *const c_void);
+            let value = f_num(cls("NSNumber"), sel("numberWithBool:"), enabled);
+            let key = f_str(
+                cls("NSString"),
+                sel("stringWithUTF8String:"),
+                c"fullScreenEnabled".as_ptr(),
+            );
+            if value.is_null() || key.is_null() {
+                return false;
+            }
+            f_kv(prefs, sel("setValue:forKey:"), value, key);
+            true
+        }
+    }
+
     /// `child` を `parent` の子へ移す（AppKit が古い親から外す）。送ったら true
     pub(super) fn add_subview(parent: *const c_void, child: *const c_void) -> bool {
         if parent.is_null() || child.is_null() {
@@ -1528,6 +1627,30 @@ mod tests {
         assert!(s.pending_new_window_urls.is_empty());
     }
 
+    /// Cargo.lock に載っている wry の版（#724 / #2445 の番犬が根拠を版に結び付ける）
+    fn wry_version() -> String {
+        include_str!("../../../Cargo.lock")
+            .split("[[package]]")
+            .find(|p| p.contains("\nname = \"wry\"\n"))
+            .and_then(|p| p.lines().find_map(|l| l.strip_prefix("version = \"")))
+            .map(|v| v.trim_end_matches('"').to_string())
+            .expect("Cargo.lock に wry が無い")
+    }
+
+    /// registry にある wry の実ソース（`rel` は crate 内の相対パス）。取得していない機では None
+    fn wry_source(ver: &str, rel: &str) -> Option<String> {
+        // cargo の置き場（`CARGO_HOME`、無ければホームの `.cargo`。ホームは paths の 1 実装 = #893）
+        let home = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| tako_core::paths::home_dir().map(|h| h.join(".cargo")))?;
+        let path = std::fs::read_dir(home.join("registry").join("src"))
+            .ok()?
+            .flatten()
+            .map(|d| d.path().join(format!("wry-{ver}")).join(rel))
+            .find(|p| p.is_file())?;
+        std::fs::read_to_string(path).ok()
+    }
+
     /// `src` の中の関数 `sig` の本文（次の同じ深さの `fn` の手前まで）
     fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
         let start = src
@@ -1555,7 +1678,7 @@ mod tests {
 
     /// **wry の `window().unwrap()` に届く前に、親・自分が窓に載っているかを見る**（#1837）。
     ///
-    /// macOS の wry は生成（wkwebview/mod.rs:392 / 607）・位置合わせ（:1013）・focus（:1039）で
+    /// macOS の wry は生成（wry-0.57.1 wkwebview/mod.rs:434 / 663）・位置合わせ（:1104）・focus（:1130）で
     /// 親や WKWebView の NSWindow を `unwrap()` で引くので、窓から外れたまま呼ぶと panic で
     /// tako 全体が落ちる（セルフテスト項目 79 → 155 の実測）。#334 と同じく、tako 側で
     /// 先に断る形を固定する。どれかの検査を消すと落ちる
@@ -1806,10 +1929,11 @@ mod tests {
     /// **Windows では ipc ハンドラを付けない**（#724 の W2）。
     ///
     /// wry 0.55 の WebView2 は ipc ハンドラが付いていると、COM のコールバックの中で送り主の文書の
-    /// URI を `http::Uri` へ unwrap し（`src/webview2/mod.rs:910`）、data: / about:blank で abort する。
-    /// 同じハンドラの先頭は ipc ハンドラが無ければ戻る（`let (Some(args), Some(ipc_handler)) … else`）
-    /// ので、付けなければ :910 に届かない。ここでは ①判断 ②`build_view` が判断の内側でだけ付けること
-    /// ③（registry に wry の実ソースがあれば）その `let … else` が unwrap より前にあることを固定する
+    /// URI を `http::Uri` へ unwrap し（`src/webview2/mod.rs:910`）、data: / about:blank で abort した。
+    /// 0.57（#2445）は ①ハンドラが無ければ登録そのものをせず ②付いていても不正な URI のメッセージは
+    /// `match` で捨てる（wry#1772）。ここでは ①判断 ②`build_view` が判断の内側でだけ付けること
+    /// ③ Cargo.lock の wry が 0.57 系であること（版が変わったら止まる）と、registry に wry の実ソースが
+    /// あれば上の 2 点がその版のソースで成り立つことを固定する
     #[test]
     fn issue724_windowsではipcハンドラを付けない() {
         // ①
@@ -1833,45 +1957,43 @@ mod tests {
                 "{call} は判断の内側の 1 か所だけ"
             );
         }
-        // ③ 根拠は wry の版に結び付いている。上げたら読み直す（0.56.1 以降は上流が unwrap をやめた）
-        let lock = include_str!("../../../Cargo.lock");
-        let ver = lock
-            .split("[[package]]")
-            .find(|p| p.contains("\nname = \"wry\"\n"))
-            .and_then(|p| p.lines().find_map(|l| l.strip_prefix("version = \"")))
-            .map(|v| v.trim_end_matches('"').to_string())
-            .expect("Cargo.lock に wry が無い");
+        // ③ 根拠は wry の版に結び付いている。版が変わったら読み直す（#2445 で 0.55 → 0.57）
+        let ver = wry_version();
         assert!(
-            ver.starts_with("0.55."),
-            "wry が {ver} になった。#724 の W2（Windows で ipc を付けない）の根拠は 0.55 の \
-             src/webview2/mod.rs:910 の unwrap。上流は 0.56.1 で unwrap をやめたので、\
-             新しい版のハンドラを読み直して ipc_hook_decision を戻すか決める"
+            ver.starts_with("0.57."),
+            "wry が {ver} になった。#724 の W2（Windows で ipc を付けない）の根拠は 0.57 の \
+             src/webview2/mod.rs（ハンドラが無ければ登録しない・不正な URI のメッセージは捨てる）。\
+             新しい版の ipc の扱いを読み直して、この検査と ipc_hook_decision を合わせる"
         );
-        // cargo の置き場（`CARGO_HOME`、無ければホームの `.cargo`。ホームは paths の 1 実装 = #893）
-        let home = std::env::var_os("CARGO_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| tako_core::paths::home_dir().map(|h| h.join(".cargo")));
-        let found = home.and_then(|h| {
-            std::fs::read_dir(h.join("registry").join("src"))
-                .ok()?
-                .flatten()
-                .map(|d| d.path().join(format!("wry-{ver}/src/webview2/mod.rs")))
-                .find(|p| p.is_file())
-        });
-        let Some(path) = found else {
+        let Some(wry) = wry_source(&ver, "src/webview2/mod.rs") else {
             println!("TAKO_724: wry {ver} の実ソースが registry に無いので ③ は見送る");
             return;
         };
-        let wry = std::fs::read_to_string(&path).expect("wry の実ソース");
-        let guard = wry
-            .find("let (Some(args), Some(ipc_handler)) = (args, &ipc_handler) else")
-            .expect("wry の ipc ハンドラの先頭の let … else が無い（形が変わった）");
-        let unwrap = wry
-            .find("ipc_handler(Request::builder().uri(url).body(js).unwrap())")
-            .expect("wry の ipc の unwrap が無い（形が変わった）");
+        // ハンドラが無ければ登録そのものをしない（付けない Windows では COM のコールバックが無い）
+        let cond = wry
+            .find("if let Some(ipc_handler) = attributes.ipc_handler.take() {")
+            .expect("wry の ipc ハンドラの登録の条件が無い（形が変わった）");
+        let attach = wry
+            .find("Self::attach_ipc_handler(&webview, ipc_handler")
+            .expect("wry の ipc ハンドラの登録が無い（形が変わった）");
         assert!(
-            guard < unwrap,
-            "wry {ver} の ipc ハンドラは、ハンドラが無いときに unwrap より前で戻らない"
+            cond < attach && wry[cond..attach].lines().count() <= 2,
+            "wry {ver} は ipc ハンドラが無いときにも登録へ進む"
+        );
+        // 付いていても、送り主の URI が http::Uri にならないメッセージは unwrap せずに捨てる
+        let start = wry
+            .find("unsafe fn attach_ipc_handler(")
+            .expect("wry の attach_ipc_handler が無い（形が変わった）");
+        let handler = &wry[start..];
+        let handler = &handler[..handler.find("\n  #[inline]").unwrap_or(handler.len())];
+        assert!(
+            handler.contains("match Request::builder().uri(url).body(js) {")
+                && handler.contains("Ok(request) => ipc_handler(request),"),
+            "wry {ver} の ipc ハンドラが不正な URI を match で捨てる形でない（形が変わった）"
+        );
+        assert!(
+            !handler.contains(".unwrap()"),
+            "wry {ver} の ipc ハンドラに unwrap が戻った（#724 の abort の形）"
         );
     }
 
@@ -1882,5 +2004,101 @@ mod tests {
         assert_eq!(WebViewPhase::Building.as_str(), "creating");
         assert_eq!(WebViewPhase::Held.as_str(), "held");
         assert_eq!(WebViewPhase::Failed.as_str(), "failed");
+    }
+
+    /// **作った Web ビューはすぐに要素の全画面表示の判断を当てる**（#2445）。
+    ///
+    /// wry 0.56 から macOS の WKWebView は要素の全画面表示が常に入り、全画面のあいだは WKWebView が
+    /// gpui の描画ビューから外れる（理由の全文は `element_fullscreen_enabled`）。wry を呼ぶ 1 か所
+    /// （`build_view`。同期の生成も生成タスクも通る）が、作った直後・返す前に当てていることと、
+    /// 既定を変える口が A/B の env 1 つだけであることを固定する
+    #[test]
+    fn issue2445_作ったwebviewは要素の全画面表示を切る() {
+        let src = include_str!("webview.rs");
+        let build = fn_body(src, "fn build_view(");
+        assert!(
+            guarded(
+                build,
+                ".build_as_child(",
+                "apply_element_fullscreen(&view);"
+            ),
+            "build_view が wry の生成の後に要素の全画面表示の判断を当てていない（#2445）"
+        );
+        assert!(
+            guarded(build, "apply_element_fullscreen(&view);", "Ok(view)"),
+            "build_view が判断を当てる前に Web ビューを返している（#2445）"
+        );
+        // どちらもモジュール直下の関数なので、閉じ括弧（行頭の `}`）までを本文とする
+        let top_fn = |sig: &str| {
+            let rest = &src[src
+                .find(sig)
+                .unwrap_or_else(|| panic!("{sig} が見つからない"))..];
+            &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+        };
+        let apply = top_fn("fn apply_element_fullscreen(");
+        assert!(
+            apply.contains("element_fullscreen_enabled()"),
+            "apply_element_fullscreen が判断の 1 か所を通っていない（#2445）"
+        );
+        let decide = top_fn("pub(crate) fn element_fullscreen_enabled(");
+        assert_eq!(
+            decide.matches("std::env::var").count(),
+            1,
+            "要素の全画面表示を入れる口は A/B の env 1 つだけ（#2445）"
+        );
+        assert!(decide.contains("\"TAKO_2445_FULLSCREEN\""));
+    }
+
+    /// **背景で Web ビューを作ってもアプリを前面に出さない**（#2445 / wry#1866）。
+    ///
+    /// wry 0.55 の macOS は生成のたびに `NSApplication::activate` を呼んだので、別のアプリを
+    /// 使っているあいだの `tako web open`（AI の操作・起動時の復元）で tako が前面へ出た。
+    /// 0.57 は「見えていて focus を取る」生成のときだけ呼ぶ。tako は不可視・focus なしで作る
+    /// （次のフレームの `sync_frame` が見せる）ので、その 2 つと、registry に wry の実ソースが
+    /// あれば activate がその条件の内側にしか無いことを固定する
+    #[test]
+    fn issue2445_背景で作ってもアプリを前面に出さない() {
+        let src = include_str!("webview.rs");
+        let build = fn_body(src, "fn build_view(");
+        for opt in [".with_visible(false)", ".with_focused(false)"] {
+            assert!(
+                build.contains(opt),
+                "build_view が {opt} を外した（wry が生成でアプリを前面へ出す。#2445）"
+            );
+        }
+        let ver = wry_version();
+        let Some(wry) = wry_source(&ver, "src/wkwebview/mod.rs") else {
+            println!(
+                "TAKO_2445: wry {ver} の実ソースが registry に無いので activate の検査は見送る"
+            );
+            return;
+        };
+        // activate はどれも「見えていて focus を取る」条件のブロックの内側にあること
+        // （条件の文字列は makeFirstResponder 用にも出るので、各呼び出しの直前の条件で見る）
+        const GUARD: &str = "if attributes.visible && attributes.focused {";
+        let calls: Vec<usize> = ["NSApplication::activate(", "activateIgnoringOtherApps("]
+            .iter()
+            .flat_map(|c| wry.match_indices(c).map(|(i, _)| i))
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "wry {ver} の activate が無い（形が変わった）"
+        );
+        for at in calls {
+            let line = wry[..at].lines().count();
+            let inside = wry[..at].rfind(GUARD).is_some_and(|guard| {
+                // ブロックの終わり = 条件の行の字下げで閉じる `}`
+                let indent = wry[..guard].rsplit('\n').next().unwrap_or("");
+                let close = format!("\n{indent}}}");
+                wry[guard..]
+                    .find(&close)
+                    .is_some_and(|len| at < guard + len)
+            });
+            assert!(
+                inside,
+                "wry {ver} の wkwebview/mod.rs:{line} の activate が「見えていて focus を取る」条件の外にある\
+                 （0.55 は生成のたびに前面へ出した。#2445）"
+            );
+        }
     }
 }
