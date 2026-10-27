@@ -1120,7 +1120,7 @@ client_tty = backend セッションの pane_tty）ため、backend を先に見
 ## Web ビューペイン（FR-3.8）→ ✅ wry ネイティブ統合で実装（2026-07-13、#155）
 
 **GPUI には webview 要素が無い**ため、第一候補だった「ネイティブ webview の重ね合わせ」を
-**wry 0.55**（Tauri の webview ライブラリ。Apache-2.0 OR MIT。macOS = WKWebView /
+**wry 0.57**（Tauri の webview ライブラリ。Apache-2.0 OR MIT。macOS = WKWebView /
 Windows = WebView2）で実装した。CDP ミラー方式 PoC（ヘッドレス Chrome +
 スクショポーリング）は座標ずれ・入力中継の品質限界・Chrome 依存のため置き換え。
 
@@ -1132,7 +1132,7 @@ Windows = WebView2）で実装した。CDP ミラー方式 PoC（ヘッドレス
 - **親は採った窓が閉じたら採り直す（#1837）**: 親（GPUI の描画ビュー）は窓ごとに別物なので、
   最初の窓を閉じる（#339）・macOS で最後の窓を閉じて Dock から開き直す（#381）と、初回に
   採った親は閉じた窓のものになる。macOS の wry は親や WKWebView の NSWindow を
-  `window().unwrap()` で引く（生成 = wkwebview/mod.rs:392・位置合わせ = :1013・focus = :1039）ので、
+  `window().unwrap()` で引く（wry-0.57.1 の生成 = wkwebview/mod.rs:434・位置合わせ = :1104・focus = :1130）ので、
   閉じた窓が解放されていれば **panic でプロセスごと落ちる**（セルフテスト項目 79 → 155 の実測）。
   解放されていなければ閉じた窓の中に見えない Web ビューを作る（`tako window close` の直後の実測）。
   そこで ① render の冒頭（`refresh_webview_parent`）で「採った窓がビューポート対応表に残り、
@@ -1206,6 +1206,33 @@ Web ビューはネイティブ子ビューなので、**ページをクリッ�
   常に false になり、同じソースでも結果が変わる（#796）。宛先が**どのオブジェクトか**は
   first responder のアドレスで言い分ける
 
+### 要素の全画面表示は切る（#2445）
+
+wry 0.56 から macOS の WKWebView は要素の全画面表示（Fullscreen API。動画の全画面ボタン等）が
+**常に入る**（wry#1779 / #1780。0.55 は `fullscreen` feature のときだけで、tako は入れていなかった）。
+全画面のあいだ WebKit は WKWebView を gpui の描画ビューから外して全画面の窓へ移し、元の場所へ
+代わりのビュー（スナップショット）を置く。戻すときは代わりのビューの位置へ戻し、tako の窓の宛先を
+WKWebView にする（WebKit の `WKFullScreenWindowController.mm`）。上の 2 節の前提「WKWebView の
+superview は gpui の描画ビュー」がそのあいだ崩れ、同じソースから次が読める:
+
+- 位置合わせ（`set_bounds`）が全画面の窓の中の WKWebView を動かし、戻った後は代わりのビューの
+  古い位置に残る（`bounds_now` と実体がずれる）
+- 閉じると wry の Drop が全画面の窓から外し、WebKit の戻す処理が tako の知らない WKWebView を
+  tako の窓へ戻しうる
+- 全画面のあいだ tako の窓の宛先が NSWindow 自身になり、ターミナルへ打鍵が届かない
+  （`webview_holding_focus` は NSView でない宛先を戻さない）
+
+そこで**生成の直後に 0.55 と同じく切る**（`webview.rs` の `element_fullscreen_enabled` /
+`apply_element_fullscreen`。`build_view` の 1 か所 = 同期の生成も生成タスクも通る）。設定は WKWebView の
+`configuration.preferences`（複製の設定もページと同じ WebPreferences を指すので生成後に書いて効く）、
+macOS 12.3 以降は公開 API の `elementFullscreenEnabled`、それより前は wry と同じ KVC 鍵 `fullScreenEnabled`。
+全画面を使えるようにするには上の 3 点の手当てと実機での出入りの確かめが要る（別 Issue）。
+A/B は `TAKO_2445_FULLSCREEN=1`（wry の既定 = 入れる）。検査はセルフテスト項目 71 の
+`TAKO_SELF_TEST_2445`（ページの `document.fullscreenEnabled`）と番犬
+`issue2445_作ったwebviewは要素の全画面表示を切る`、実経路は `bash scripts/test-webview-fullscreen-2445.sh [off|on]`。
+同じ番で 0.57.1 の「不可視・focus なしの生成ではアプリを前面へ出さない」（wry#1866。0.55 は生成のたびに
+`NSApplication::activate` を呼んだ）を `issue2445_背景で作ってもアプリを前面に出さない` が registry の実ソースで固定する
+
 ### フレーム同期を「印」でやってはいけない（#838）
 
 2026-08-18 まで、可視性は**印（mark）方式**だった: ペイン本体の render が
@@ -1243,15 +1270,15 @@ Windows では Web ビューを開くと tako がプロセスごと落ちてい�
 
 - **W1（主因）**: wry の WebView2 は環境・コントローラ・初期化スクリプトの作成完了を
   `webview2_com::wait_with_pump`（`GetMessageA` + `DispatchMessageA` の入れ子のループ）で待つ
-  （wry-0.55.1 `src/webview2/mod.rs:363 / :414 / :1308`）。tako は App を借用したまま
+  （wry-0.57.1 `src/webview2/mod.rs:377 / :435 / :1414`。0.55 から変わらない）。tako は App を借用したまま
   （dispatch・クリックハンドラ・render の復元）同期で生成していたので、ポンプが gpui の
   前景タスク（gpui_windows `platform.rs:905` の `run_foreground_task`）を走らせると
   `AsyncApp::update_entity` の `borrow_mut()`（gpui `app/async_context.rs:65`）が二重借用で
   panic し、窓プロシージャを跨いで abort した（実機の panic.log で `CallWindowProcW` が 2 段）。
   macOS の WKWebView の生成はポンプを回さないので起きない
-- **W2**: ipc ハンドラが付いていると、wry は COM のコールバックの中で送り主の文書の URI を
-  `Request::builder().uri(url).body(js).unwrap()`（同 :910）に通し、data: / about:blank や
-  URI が未確定のときに `InvalidUri(Empty)` で abort した
+- **W2**: ipc ハンドラが付いていると、wry 0.55 は COM のコールバックの中で送り主の文書の URI を
+  `Request::builder().uri(url).body(js).unwrap()`（wry-0.55.1 の同 :910）に通し、data: / about:blank や
+  URI が未確定のときに `InvalidUri(Empty)` で abort した（0.56.1 で上流が `match` に変えた = wry#1772）
 
 手当て（判断は `webview.rs` の `async_build_enabled` / `ipc_hook_enabled` の 1 か所）:
 
@@ -1271,10 +1298,10 @@ Windows では Web ビューを開くと tako がプロセスごと落ちてい�
   生成中にペインやタブを閉じると、Web ビューは従来どおり dock へ外れ、作り終えたら dock に入る。
   `web close` / × で消したものは作り終えた時点で捨てる。親が閉じていたら（#1837）生成に入らず失敗にする
 - **W2**: Windows では ipc ハンドラと送り手の初期化スクリプト（`STATE_HOOK_JS`）を付けない。
-  wry の同じハンドラの先頭は `let (Some(args), Some(ipc_handler)) = … else { return Ok(()) }`
-  なので、付けなければ :910 に届かないことが wry のソースで決まる（番犬が registry の実ソースで
-  確かめる）。JS の側で http(s) のときだけ送る形は、`http::Uri` が受け付ける文字列を tako が
-  当てる形になり根拠が弱いので採らない。タイトル・URL は 2 秒ごとの `poll_state`（eval。もともと正本）が拾う
+  wry 0.57 は付けなければ登録そのものをせず、付けても不正な URI のメッセージは捨てるだけになった
+  （番犬が registry の実ソースで確かめる）。それでも付けないままなのは、付けた形を Windows の実機で
+  まだ通していないため（#2445。戻すのは実機で確かめてから）。JS の側で http(s) のときだけ送る形は、
+  `http::Uri` が受け付ける文字列を tako が当てる形になり根拠が弱いので採らない。タイトル・URL は 2 秒ごとの `poll_state`（eval。もともと正本）が拾う
 - **W4**: 生成を始める前に `<data_dir>/webview-guard.json`（`tako_control::webview_guard`）へ
   （ペイン, URL）を書き、生成と最初の読み込みが済んだら（または 15 秒で）消す。abort は
   layout.json を消さないので、印が無いと落ちる直前の Web ビューが起動のたびに同じ賭けになる。
@@ -1292,7 +1319,7 @@ open の後に ready を待つ（同期の生成では最初の 1 回で当た�
 番犬は `webview.rs` の `issue724_webviewの生成をappの借用の外で行う`（main.rs の同期の生成が
 `async_build_enabled` の早期 return の後にしか無い・`job.build()` がどの `.update(` の内側にも無い。
 違反は file:line で名指し）と `issue724_windowsではipcハンドラを付けない`。
-wry を 0.56.1 以降へ上げたら W2 の根拠を読み直す（上流は unwrap をやめた。番犬が版で止める）
+wry の版を変えたら W1 / W2 の根拠を読み直す（番犬が Cargo.lock の版で止める。#2445 で 0.55 → 0.57）
 
 ## AI 誘導・注釈レイヤ（FR-2.6、後段フェーズ）
 

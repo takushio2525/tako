@@ -1,9 +1,9 @@
 //! 抽象境界 B12（ドキュメントレンダラ）の Windows 実装 — `Windows.Data.Pdf` + `lopdf`（#521 / #693）。
 //!
 //! Windows 10 以降に OS 同梱の WinRT PDF レンダラ（Edge の PDF 表示と同じエンジン）を使う。
-//! 追加の配布物は要らず、`windows` crate は既に依存グラフの中にいる（gpui / wry 経由）ので
-//! feature を足すだけで済む。macOS が OS 標準の PDFKit / Core Graphics を使っているのと
-//! 同じ構造になる。
+//! 追加の配布物は要らず、`windows` crate の 0.62 系は既に依存グラフの中にいる（gpui の
+//! accesskit_windows と wry 経由。#2445）ので feature を足すだけで済む。macOS が OS 標準の
+//! PDFKit / Core Graphics を使っているのと同じ構造になる。
 //!
 //! ## リンク注釈・目次・テキスト (#693)
 //!

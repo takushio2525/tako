@@ -72471,8 +72471,8 @@ mod self_test {
             //     unwrap しており、`data:` URL では `InvalidUri(Empty)` で panic する。
             //     しかもコールバック内なので**巻き戻せず abort** する（#724 症状②。
             //     実測スタックは Issue へ記録）。#724 で ipc を付けない（W2）・生成を App の
-            //     借用の外へ出す（W1）手当てを入れたが、実機で通るのを確かめるまでは
-            //     対象外のまま（クラッシュはセルフテスト全体を道連れにする）
+            //     借用の外へ出す（W1）手当てを入れ、wry 0.57（#2445）で上流も unwrap をやめたが、
+            //     実機で通るのを確かめるまでは対象外のまま（クラッシュはセルフテスト全体を道連れにする）
             if cfg!(target_os = "windows") {
                 println!(
                     "TAKO_SELF_TEST_SKIPPED: 71（Web ビューが WebView2 側の非巻き戻し panic で \
@@ -72709,6 +72709,67 @@ mod self_test {
                 )
                 .await;
                 check(eval_ok, "Web ビュー eval → eval_result（JS 評価）");
+                // #2445: 要素の全画面表示は切ってある（wry 0.56 から既定で入る。理由は
+                // `webview::element_fullscreen_enabled`）。ページから見て fullscreenEnabled が真でないこと
+                // （接頭辞つきも見る）。A/B の `TAKO_2445_FULLSCREEN=1` では真になる = 検出力。
+                // requestFullscreen は呼ばない（許されていれば eval はユーザー操作扱いなので、
+                // 検証の窓が本当に全画面の Space へ移る）
+                if cfg!(target_os = "macos") {
+                    let want = webview::element_fullscreen_enabled();
+                    let js = "document.fullscreenEnabled === true \
+                              || document.webkitFullscreenEnabled === true";
+                    let fs_token = window
+                        .update(cx, |app, _, _cx| {
+                            tako_control::dispatch(
+                                app,
+                                web_req("eval", None, Some(web_id), None, Some(js), None),
+                                PaneOrigin::Cli,
+                            )
+                            .ok()
+                            .and_then(|v| v["token"].as_u64())
+                        })
+                        .ok()
+                        .flatten();
+                    let mut seen = None;
+                    if let Some(token) = fs_token {
+                        wait_for_backend_state(
+                            cx,
+                            "71-fullscreen",
+                            text_wait_budget(25, 200, 20),
+                            |cx| {
+                                seen = window
+                                    .update(cx, |app, _, _cx| {
+                                        tako_control::dispatch(
+                                            app,
+                                            web_req(
+                                                "eval_result",
+                                                None,
+                                                Some(web_id),
+                                                None,
+                                                None,
+                                                Some(token),
+                                            ),
+                                            PaneOrigin::Cli,
+                                        )
+                                        .ok()?["result"]
+                                            .as_bool()
+                                    })
+                                    .ok()
+                                    .flatten();
+                                seen.is_some()
+                            },
+                        )
+                        .await;
+                    }
+                    println!("TAKO_SELF_TEST_2445: fullscreen_enabled={seen:?} want={want}");
+                    check(
+                        seen == Some(want),
+                        &format!(
+                            "Web ビューの要素の全画面表示が{}（ページの fullscreenEnabled={seen:?}。#2445）",
+                            if want { "入っている" } else { "切れている" }
+                        ),
+                    );
+                }
                 // hide: dock 退避（ページは生存、ペインは閉じる）
                 let hidden = window
                     .update(cx, |app, _, _cx| {
