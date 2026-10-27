@@ -143,10 +143,11 @@ pub mod notes {
         "Fixes for the web view crashing the whole app (a double borrow while WebView2 is being created and an unwrap inside a COM callback) are in, but unverified on real Windows hardware (#724)",
     );
 
-    /// #528。daemon の起動・停止が `setsid` / シグナルマスク前提のまま
+    /// #528。daemon の起動が `setsid` / シグナルマスク前提のまま。
+    /// 停止は #1599 で境界の終了要求と admin API の shutdown（OS を問わない）へ寄せた
     pub const WIN_REMOTE_UNVERIFIED: Note = Note::new(
-        "remote デーモンの起動・停止に unix 前提の処理が残っており、Windows 実機での通し確認も未了",
-        "Starting and stopping the remote daemon still relies on unix-only handling, and no end-to-end run has been measured on Windows",
+        "remote デーモンの起動に unix 前提の処理（setsid / シグナルマスク）が残っており、Windows 実機での通し確認も未了（停止は #1599 で境界の終了要求と admin API の shutdown へ寄せた）",
+        "Starting the remote daemon still relies on unix-only handling (setsid / signal mask), and no end-to-end run has been measured on Windows (stopping was moved onto the termination boundary and the admin API shutdown in #1599)",
     );
 
     /// #1090。SSH クライアントの能力そのものの縮退（多重化が無い）。
@@ -187,19 +188,21 @@ pub mod notes {
         "AI naming works, but without shell integration (#525) a tab's inputs (cwd, title, command state) never change after startup, so each tab is named only once. Without claude installed the tab name becomes the PowerShell executable path (#760)",
     );
 
-    /// #936 で検知と警告は動くようになった。残るのはバナーの「張り直す」で、
-    /// ハーネス更新がプロセスの終了要求（境界 B5 の制御側 = #1067）に依っている
+    /// #936 で検知と警告は動くようになった。バナーの「張り直す」はハーネス更新と同じ実装で、
+    /// プロセスの終了要求（境界 B5 の制御側）は #1599 で Windows にも入った。
+    /// 残る縮退は「強制終了になる」ことと、Windows 実機での通しが未実測なこと
     pub const WIN_STALE_BINARY_RESTART: Note = Note::new(
-        "古いバイナリの検知と警告は動くが、バナーの「張り直す」はプロセスの終了要求が Windows 未対応のため実行できない（#1067 / 境界 B5）",
-        "Detecting a stale binary and warning about it works, but the banner's Restart action cannot run because process termination is not implemented on Windows (#1067 / boundary B5)",
+        "古いバイナリの検知と警告は動く。バナーの「張り直す」はハーネス更新と同じ実装で、終了要求は #1599 で Windows にも入ったが、Windows には穏当な終了要求が無いので CLI は強制終了（TerminateProcess）になり、実機での通しは未実測（#1067 / #1599）",
+        "Detecting a stale binary and warning about it works. The banner's Restart action shares the harness-update implementation; process termination now exists on Windows (#1599), but Windows has no graceful termination request, so the CLI is force-terminated (TerminateProcess), and the full run has not been measured on real Windows hardware (#1067 / #1599)",
     );
 
     /// #766 / #525。側路（`TAKO_OSC_SINK`）で届くが、能力申告は素通し不可のまま
     /// #1067。ハーネス更新は旧プロセスへの終了要求（境界 B5 の制御側）が要る。
-    /// Windows 実装は未着手（`platform::process::terminate` が明示的に Err を返す）
+    /// Windows の腕は #1599 で入った（`OpenProcess` + `TerminateProcess`）。Windows には
+    /// 穏当な終了要求が無いので強制終了になり、通しは実機で未実測
     pub const WIN_SESSION_RESTART_TERMINATE: Note = Note::new(
-        "引き継ぎ再起動は使えるが、ハーネス更新（会話を保ったまま CLI を建て直す）はプロセスの終了要求が Windows 未対応のため使えない（#1067 / 境界 B5）",
-        "Restarting with a handoff works, but the harness update (rebuilding the CLI while keeping the conversation) is unavailable because process termination is not implemented on Windows (#1067 / boundary B5)",
+        "引き継ぎ再起動は使える。ハーネス更新（会話を保ったまま CLI を建て直す）の終了要求は #1599 で Windows にも入ったが、Windows には穏当な終了要求が無いので CLI は後始末の機会なく強制終了（TerminateProcess）される。終了 → シェルの復帰 → --resume の送達の通しは Windows 実機で未実測（#1067 / #1599）",
+        "Restarting with a handoff works. Process termination for the harness update (rebuilding the CLI while keeping the conversation) now exists on Windows (#1599), but Windows has no graceful termination request, so the CLI is force-terminated (TerminateProcess) without a chance to clean up. The full run (terminate, shell returns, --resume delivered) has not been measured on real Windows hardware (#1067 / #1599)",
     );
     pub const WIN_SHELL_INTEGRATION_PSMUX: Note = Note::new(
         "cwd 追従とコマンド状態は器（psmux）越しでも側路で届くが、psmux が OSC を素通ししないため status の effective は false のままになる（#766）",
@@ -1478,7 +1481,7 @@ pub const MATRIX: &[Feature] = &[
             issue: 528,
         },
         windows_evidence: Evidence::UnitTest(
-            "同上（daemon_stop_impl はpid再利用時にkillしない が失敗）。#1616 で Windows も正体確認を通るようになり、この検査は両 OS とも「撃たずに中止」を見る形になった（停止そのものは #1599 が未実装。実機の再測は未了）",
+            "#1616 で Windows も正体確認を通るようになり、daemon_stop_impl はpid再利用時にkillしない は両 OS とも「撃たずに中止」を見る。#1599 で停止を境界 platform::process::terminate（Windows は TerminateProcess）と admin API の shutdown（OS を問わない穏当な停止）へ寄せ、止められなければ stopped: true を返さず Err にした。CI の Windows ジョブで、停止の芯が自分で起こした子を実際に止めること・正体の違う pid（正規経路 / stale 経路）を撃たないこと・shutdown が管理トークンでだけ受け付けることを実プロセスで確認。daemon の起動（#971）が Windows で通らないので、実 daemon の停止の通しは未実測",
         ),
     },
     Feature {
@@ -1601,17 +1604,17 @@ pub const MATRIX: &[Feature] = &[
     },
     Feature {
         // #1067: エージェントペインの「セッションを引き継いで再起動」2 種。
-        // 引き継ぎ再起動（handoff）は master ペインへ定型文を送るだけなので両 OS 共通だが、
+        // 引き継ぎ再起動（handoff）は master ペインへ定型文を送るだけなので両 OS 共通。
         // ハーネス更新（harness）は旧プロセスへ終了要求を出す必要があり、境界 B5 の
-        // Windows 実装が未着手（`platform::process::terminate` は明示 Err）。
-        // **未実測ではなく構造的に使えない**ので Pending ではなく Degraded
+        // Windows の腕は #1599 で入った。**Supported へ倒さない**のは、Windows には穏当な
+        // 終了要求が無く CLI が強制終了になる（macOS の SIGTERM と別物）のと、通しが未実測なため
         key: "tako_session_restart",
         macos: Support::Supported,
         windows: Support::Degraded {
             note: notes::WIN_SESSION_RESTART_TERMINATE,
         },
-        windows_evidence: Evidence::ByDesign(
-            "tako_control::platform::process::terminate の Windows 実装は「プロセスの停止は Windows では未対応です」を返す（B5 の制御側が未実装）。handoff は queue_prompt_flow だけを使うので影響を受けない",
+        windows_evidence: Evidence::UnitTest(
+            "#1599: 境界 tako_control::platform::process::terminate の Windows の腕（OpenProcess + TerminateProcess）が、自分で起こした子を実際に止める（子の終了コードが TerminateProcess に渡した値になる）ことを CI の Windows ジョブの実プロセステスト（platform::process::tests を名指しで回す段）で確認。dispatch の harness は OS 分岐なしでこの境界を呼ぶ。終了 → シェルの復帰 → --resume の送達の通しは未実測。handoff は queue_prompt_flow だけを使うので影響を受けない",
         ),
     },
     Feature {
@@ -1746,15 +1749,15 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         // #936 で検知そのものは動くようになった。**Supported へ倒さない**のは
         // バナーの「張り直す」（= `tako session_restart` と同一実装）が
-        // プロセスの終了要求を必要とし、その Windows 実装が無いため
-        // （`platform::process::terminate` は明示 Err）。status / dismiss は動く
+        // プロセスの終了要求を必要とし、Windows ではそれが強制終了になるうえ
+        // （#1599 で腕は入った）通しが未実測なため。status / dismiss は動く
         key: "tako_stale_binary",
         macos: Support::Supported,
         windows: Support::Degraded {
             note: notes::WIN_STALE_BINARY_RESTART,
         },
         windows_evidence: Evidence::Measured(
-            "#936 の Windows 11 実測（隔離 GUI + 偽 claude）: 実行中プロセスのパスを境界 B5（`procinfo::image_path`）で解決し、`tako stale-binary status` が stale=true / spawned_version=1.0.0 / current_version=1.0.1 を返してバナー「claude 1.0.1 が利用可能です（このセッションは 1.0.0）」が出る。claude の自己更新と同じ形（旧 exe を改名 → 新 exe を同じ名前で設置）でも stale=false → true へ変わる。張り直しは #1067 の terminate 未実装のため実行できない",
+            "#936 の Windows 11 実測（隔離 GUI + 偽 claude）: 実行中プロセスのパスを境界 B5（`procinfo::image_path`）で解決し、`tako stale-binary status` が stale=true / spawned_version=1.0.0 / current_version=1.0.1 を返してバナー「claude 1.0.1 が利用可能です（このセッションは 1.0.0）」が出る。claude の自己更新と同じ形（旧 exe を改名 → 新 exe を同じ名前で設置）でも stale=false → true へ変わる。張り直しの終了要求は #1599 で Windows にも入った（CI の Windows ジョブの実プロセステストで確認）が、張り直しの通しは未実測",
         ),
     },
     Feature {
