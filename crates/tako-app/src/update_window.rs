@@ -997,18 +997,7 @@ impl TakoApp {
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
                 match result {
-                    Ok(msg) => {
-                        app.update_state = UpdateState::Done(txt::restarting(&msg));
-                        cx.notify();
-                        app.save_layout();
-                        if let Err(e) = update_checker::restart_app() {
-                            app.update_state =
-                                UpdateState::Failed(txt::restart_failed(&e.to_string()));
-                            cx.notify();
-                            return;
-                        }
-                        cx.quit();
-                    }
+                    Ok(applied) => app.finish_update(applied, cx),
                     Err(msg) => {
                         // brew 失敗で zip フォールバック可能な場合は専用状態に遷移（#50）
                         let method = update_checker::detect_install_method();
@@ -1030,6 +1019,22 @@ impl TakoApp {
         .detach();
     }
 
+    /// 適用が済んだ後の共通の締め（#2434）: layout を保存してから起動し直し、抜ける。
+    ///
+    /// Windows はここでインストーラーを起こす（起こすまで何も上書きしていない）。
+    /// 起こせなければ抜けずに理由を出す = 今の版のまま使い続けられる
+    fn finish_update(&mut self, applied: update_checker::Applied, cx: &mut Context<Self>) {
+        self.update_state = UpdateState::Done(txt::restarting(&applied.message));
+        cx.notify();
+        self.save_layout();
+        if let Err(e) = update_checker::restart_app(&applied.restart) {
+            self.update_state = UpdateState::Failed(applied.restart.failed_text(&e));
+            cx.notify();
+            return;
+        }
+        cx.quit();
+    }
+
     pub(crate) fn start_zip_fallback(&mut self, cx: &mut Context<Self>) {
         let info = match &self.update_state {
             UpdateState::BrewFailedFallback { info, .. } => info.clone(),
@@ -1044,18 +1049,7 @@ impl TakoApp {
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
                 match result {
-                    Ok(msg) => {
-                        app.update_state = UpdateState::Done(txt::restarting(&msg));
-                        cx.notify();
-                        app.save_layout();
-                        if let Err(e) = update_checker::restart_app() {
-                            app.update_state =
-                                UpdateState::Failed(txt::restart_failed(&e.to_string()));
-                            cx.notify();
-                            return;
-                        }
-                        cx.quit();
-                    }
+                    Ok(applied) => app.finish_update(applied, cx),
                     Err(msg) => app.update_state = UpdateState::Failed(msg),
                 }
                 cx.notify();
@@ -1324,6 +1318,8 @@ brew upgrade --cask tako
             download_url: Some("https://example.invalid/tako.zip".into()),
             asset_name: Some("tako.zip".into()),
             notes: notes.map(str::to_string),
+            asset_size: None,
+            asset_digest: None,
         }
     }
 

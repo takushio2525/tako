@@ -2560,11 +2560,13 @@ pub fn tools() -> Vec<Value> {
         json!({
             "name": "tako_update",
             "description": "アプリ内更新の診断・チェック・実行（チャンネル制）。\
-                action: status = 配布系統（homebrew / zip / broken-brew）・現在バージョン・\
+                action: status = 配布系統（homebrew / zip / broken-brew / windows-installer / windows-portable）・現在バージョン・\
                 現在チャンネル（stable / test）・PATH 上の重複 CLI・更新画面が開いているか（window_open）/ \
                 check = GitHub Releases で最新版の有無を確認（更新はしない）/ \
-                apply = 配布系統に応じた更新を実行（再起動は UI 側で行い、CLI / MCP からは結果の確認まで）/ \
-                apply-zip = zip 経由で強制更新 / repair = broken-brew 状態を修復 / \
+                apply = 配布系統に応じた更新を実行（macOS は差し替えまで・再起動は UI 側。\
+                Windows はインストーラーを sha256 で検査して起動し tako は約 1 秒後に終了、入れ替え後に起動し直す = \
+                installer_started / quitting）/ \
+                apply-zip = zip 経由で強制更新（macOS）/ repair = broken-brew 状態を修復 / \
                 open = GUI のアップデート専用画面を開く / card = 画面上部の更新通知カードの状態 / \
                 card-dismiss = カードを閉じる（そのバージョンは以後通知しない）/ card-show = 抑止を解除して出し直す。",
             "inputSchema": {

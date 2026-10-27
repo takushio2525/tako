@@ -314,6 +314,29 @@ impl SettingsWindow {
         }
     }
 
+    /// 「設定ファイルを Finder で表示」（#2247）: 他の入口と同じ dispatch `FileOpKind::Reveal`
+    /// （= CLI `tako file reveal` / MCP `tako_file_op`）を通し、失敗はこの画面のメッセージへ出す
+    pub(crate) fn reveal_settings_file(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = settings::settings_path() else {
+            return;
+        };
+        if TakoApp::legacy_2247() {
+            // 修正前の形（#2247 の A/B）: dispatch を通らず結果も捨てる
+            let _ = tako_control::platform::os_integration::reveal(&path);
+            return;
+        }
+        self.run(
+            Request::FileOp {
+                op: tako_control::protocol::FileOpKind::Reveal,
+                path: path.display().to_string(),
+                name: None,
+                pane: None,
+                dest: None,
+            },
+            cx,
+        );
+    }
+
     /// read-only の状態照会（メッセージも再読込もしない）
     fn query(&mut self, request: Request, cx: &mut Context<Self>) -> Option<serde_json::Value> {
         let app = self.tako_app.upgrade()?;
@@ -3392,11 +3415,7 @@ impl SettingsWindow {
                         "adv-reveal",
                         txt::advanced_reveal(fm),
                         BtnKind::Normal,
-                        |_, _, _| {
-                            if let Some(path) = settings::settings_path() {
-                                let _ = tako_control::platform::os_integration::reveal(&path);
-                            }
-                        },
+                        cx.listener(|this, _, _, cx| this.reveal_settings_file(cx)),
                     ))
                     .child(self.button(
                         "adv-open-editor",

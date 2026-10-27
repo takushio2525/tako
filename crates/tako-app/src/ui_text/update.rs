@@ -52,6 +52,17 @@ pub fn method_zip() -> &'static str {
 pub fn method_zip_broken() -> &'static str {
     tr!("zip (brew 破損)", "zip (broken brew)")
 }
+/// Windows のインストーラーで入れた tako（#2434）
+pub fn method_installer() -> &'static str {
+    tr!("インストーラー", "Installer")
+}
+/// Windows のポータブル版・開発ビルド（アプリ内では更新しない。#2434）
+pub fn method_portable() -> &'static str {
+    tr!(
+        "ポータブル版（アプリ内更新なし）",
+        "Portable (no in-app update)"
+    )
+}
 pub fn brew_failed(err: &str) -> String {
     tr!(
         format!("brew 更新失敗: {err}"),
@@ -80,6 +91,14 @@ pub fn restart_failed(e: &str) -> String {
     tr!(
         format!("更新は完了しましたが再起動に失敗: {e}"),
         format!("Update finished but restart failed: {e}")
+    )
+}
+/// Windows でインストーラーを起こせなかった（#2434）。**何も上書きしていない**ので
+/// macOS の `restart_failed`（更新は済んでいる）とは意味が逆になる
+pub fn installer_launch_failed(e: &str) -> String {
+    tr!(
+        format!("インストーラーを起動できず、更新していません（今の版のまま使えます）: {e}"),
+        format!("Could not start the installer, so nothing was updated (the current version keeps working): {e}")
     )
 }
 pub fn latest() -> &'static str {
@@ -200,6 +219,8 @@ pub fn install_method_display(method: &str) -> String {
     match method {
         "homebrew" => "Homebrew".to_string(),
         "broken-brew" => method_zip_broken().to_string(),
+        "windows-installer" => method_installer().to_string(),
+        "windows-portable" => method_portable().to_string(),
         _ => method_zip().to_string(),
     }
 }
@@ -239,6 +260,9 @@ mod tests {
                 run().to_string(),
                 method_zip().to_string(),
                 method_zip_broken().to_string(),
+                method_installer().to_string(),
+                method_portable().to_string(),
+                installer_launch_failed("os error 2"),
                 brew_failed("timeout"),
                 update_via_zip().to_string(),
                 updating().to_string(),

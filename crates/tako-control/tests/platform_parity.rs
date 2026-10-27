@@ -937,9 +937,10 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-control/src/remote.rs",
-            7,
+            6,
             "`/bin/sh` / `/bin/sleep`（`#[cfg(unix)]` とテスト。#1768 の daemon の子の fd 検査で \
-             1 件増えた）。ゾンビ判定の `/bin/ps` は              #1067 で境界（`platform::process::is_zombie`）へ移し、抑止を通している",
+             1 件増えた）。ゾンビ判定の `/bin/ps` は              #1067 で境界（`platform::process::is_zombie`）へ移し、抑止を通している。\
+             停止のテストの使い捨ての子（`spawn_disposable_sleep`）は #1599 で両 OS 化して抑止を通した（1 件減った）",
         ),
         (
             "crates/tako-control/src/sleep_guard.rs",

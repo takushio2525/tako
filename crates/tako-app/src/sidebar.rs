@@ -783,6 +783,9 @@ pub(crate) enum NoticeArm {
     /// 変更履歴の行のクリックで diff を取れなかった（git が上限まで返らない等。`TAKO_2150_LEGACY`）。
     /// 旧挙動では UI スレッドで上限なしに待ち、失敗は黙って何もしないので、通知も出ない
     Issue2150,
+    /// プレビューのペインのメニューの「Finder で表示」の失敗（消えたファイル等。`TAKO_2247_LEGACY`）。
+    /// 旧挙動では dispatch を通らず結果を捨てるので、通知も出ない
+    Issue2247,
 }
 
 impl NoticeArm {
@@ -806,6 +809,7 @@ impl NoticeArm {
             NoticeArm::Issue1945 => tako_core::limit_resume_all::legacy(),
             NoticeArm::Issue2014 => tako_core::probe::issue2014_legacy(),
             NoticeArm::Issue2150 => tako_core::probe::issue2150_legacy(),
+            NoticeArm::Issue2247 => TakoApp::legacy_2247(),
         }
     }
 }
@@ -2585,7 +2589,6 @@ impl TakoApp {
         // 先に控える。操作名は**メニューに出ている文言そのもの**を使う（#617 の
         // OS 出し分けもそのまま効く = 押した項目と失敗した項目の名前が一致する）
         let target = path_str.clone();
-        let fm = tako_control::platform::os_integration::file_manager();
         match action {
             "copy-abs" => {
                 match tako_control::dispatch(
@@ -2637,24 +2640,7 @@ impl TakoApp {
                 }
             }
             "reveal" => {
-                let result = tako_control::dispatch(
-                    self,
-                    Request::FileOp {
-                        op: FileOpKind::Reveal,
-                        path: path_str,
-                        name: None,
-                        pane: None,
-                        dest: None,
-                    },
-                    PaneOrigin::User,
-                );
-                if let Err(e) = result {
-                    self.notify_tree_dispatch_failed(
-                        crate::ui_text::sidebar::menu_reveal(fm),
-                        Some(&target),
-                        &e,
-                    );
-                }
+                self.reveal_in_file_manager(path, NoticeArea::Tree, NoticeArm::Issue1399);
             }
             "open-term" => {
                 let pane = self.focused_pane().as_u64();
@@ -3070,6 +3056,54 @@ impl TakoApp {
             "operation",
             crate::ui_text::sidebar::notice_open_failed(path, reason),
         );
+    }
+
+    /// ファイルマネージャ（Finder / エクスプローラー）で対象を選択表示する UI の入口の 1 実装（#2247）。
+    ///
+    /// ファイルツリーの右クリック・ターミナルのパスの cmd+右クリック（#1182）・プレビューのペインの
+    /// 右クリック（#185 / #1684）が**同じ dispatch**（`FileOpKind::Reveal` = CLI `tako file reveal` /
+    /// MCP `tako_file_op` の op=reveal）を通る。消えた・OS へ渡せなかった失敗は押した画面
+    /// （`area`）の通知として出し、persist.log へも残す（黙って何も起きない、にしない）。
+    /// 操作名はメニューの文言そのもの（#617 の OS 出し分けもそのまま効く）。
+    /// dispatch の先の実体は `os_integration::reveal`（macOS はこの GUI から NSWorkspace で
+    /// Finder を前面へ出す。設定画面・右パネルの添付も同じ dispatch を通る）
+    pub(crate) fn reveal_in_file_manager(
+        &mut self,
+        path: &std::path::Path,
+        area: NoticeArea,
+        arm: NoticeArm,
+    ) {
+        let target = path.display().to_string();
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::FileOp {
+                op: tako_control::protocol::FileOpKind::Reveal,
+                path: target.clone(),
+                name: None,
+                pane: None,
+                dest: None,
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            let fm = tako_control::platform::os_integration::file_manager();
+            self.notify_ui_dispatch_failed(
+                area,
+                arm,
+                crate::ui_text::sidebar::menu_reveal(fm),
+                Some(&target),
+                &e,
+            );
+        }
+    }
+
+    /// #2247 の A/B。`TAKO_2247_LEGACY=1` で**同一バイナリのまま**修正前の作りへ戻す
+    /// （プレビューのペインのメニューと設定画面の「Finder で表示」が dispatch を通らず
+    /// `os_integration::reveal` を直に呼び、結果を捨てる = 消えたファイルでも無言。
+    /// 実体も子の `open -R` へ戻る = 同じ env を `os_integration::reveal_legacy_2247` が読む）
+    pub(crate) fn legacy_2247() -> bool {
+        static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *LEGACY.get_or_init(|| std::env::var("TAKO_2247_LEGACY").map(|v| v == "1") == Ok(true))
     }
 
     /// #1399 の A/B。`TAKO_1399_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す

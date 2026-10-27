@@ -135,6 +135,10 @@ const CLAUDE_SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// ので、連打で `list-windows` を毎回起動しないための間引き。右パネルの
 /// ポーリング（2 秒）より短いので、パネルを開いていても値が古くならない
 const BACKEND_WINDOWS_FRESH: Duration = Duration::from_millis(500);
+/// CLI / MCP の `update apply` が Windows のインストーラーを起こしてから抜けるまでの猶予（#2434）。
+/// 応答を受け口のスレッドが書き切るのを待つ（書くのは数 ms。インストーラーはこの pid が
+/// 消えるまで上書きを始めないので、長めに取っても入れ替えの順序は崩れない）
+const UPDATE_QUIT_DELAY: Duration = Duration::from_secs(1);
 
 /// #1191 の A/B。`TAKO_1191_LEGACY=1` で**同一バイナリのまま**旧挙動
 /// （`backend_windows` を要求時に採らない = 右パネルの表示状態に依存する）へ戻す
@@ -3193,6 +3197,9 @@ struct TakoApp {
     update_window_handle: Option<gpui::WindowHandle<update_window::UpdateWindow>>,
     /// dispatch / カード / パレットからアップデート画面を開くための pending キュー（#616）
     pending_update_open: bool,
+    /// CLI / MCP の `update apply` が Windows のインストーラーを起こした（#2434）。
+    /// 応答を返し切ってから正規の終了経路で抜ける（`after_dispatch` が消化する）
+    pending_update_quit: bool,
     /// メニューバーを貼った時点の表示言語（Issue #485。言語切替で貼り直す）。
     /// 起動直後は None: 初回 `cx.set_menus` は TakoApp 生成前（＝ settings の
     /// 言語適用前）に走るため、初回 render で必ず貼り直して解決済み言語に合わせる
@@ -5399,6 +5406,7 @@ impl TakoApp {
             about_window_handle: None,
             update_window_handle: None,
             pending_update_open: false,
+            pending_update_quit: false,
             menus_lang: None,
             command_cards: tako_core::CommandCards::new(),
             pending_clipboard: Vec::new(),
@@ -5865,22 +5873,15 @@ impl TakoApp {
                         if let Some(session) = app.terminals.get(&pane) {
                             // #2413: 一斉に起こさない（復元の列で 1 本ずつ・master が先・
                             // メモリが逼迫しているあいだは待つ）。全部を預け、500 ms の tick が
-                            // 優先度の順に起こす（起動待ちが無効 = A/B なら従来どおりその場で書く）
-                            let pane_obj = app.workspace.pane_anywhere(pane);
+                            // 優先度の順に起こす（起動待ちが無効 = A/B なら従来どおりその場で書く）。
+                            // 役割は layout から復元したペインから引く（組み立ては単体テストと共有）
                             let held = tako_control::launch_gate::hold(
-                                tako_control::launch_gate::LaunchRequest {
-                                    pane: pane.as_u64(),
-                                    kind: tako_control::launch_gate::LaunchKind::Restore,
-                                    agent: agent.as_str().to_string(),
-                                    label: pane_obj
-                                        .and_then(|p| p.title())
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                    role: pane_obj.and_then(|p| p.role()).map(str::to_string),
-                                    action: tako_control::launch_gate::LaunchAction::Write(
-                                        resume_input(&command),
-                                    ),
-                                },
+                                tako_control::launch_gate::restore_request(
+                                    pane.as_u64(),
+                                    app.workspace.pane_anywhere(pane),
+                                    agent.as_str(),
+                                    resume_input(&command),
+                                ),
                             );
                             match held {
                                 Some(tako_control::launch_gate::LaunchAction::Write(bytes)) => {
@@ -7818,6 +7819,17 @@ impl TakoApp {
         // CLI / MCP の編集は autosave: true でも永久に保存されなかった）
         if !Self::autosave_dispatch_legacy() {
             self.drive_autosave(cx);
+        }
+        // #2434: Windows のインストーラーを起こした `update apply` の後始末。応答を返し切る
+        // 猶予を置いてから Cmd+Q と同じ `cx.quit()` で抜ける（インストーラーはこの pid が
+        // 消えるのを待ってから上書きし、終わったら tako を起こし直す）
+        if std::mem::take(&mut self.pending_update_quit) {
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(UPDATE_QUIT_DELAY).await;
+                persist_diag("更新: インストーラーへ引き渡したので終了する（#2434。CLI / MCP の update apply）");
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
         }
         // 重量プレビュー（PDF / 動画）の background 読み込み（Issue #168）
         self.drain_pending_preview_loads(cx);
@@ -15253,6 +15265,29 @@ impl TakoApp {
 
     /// アップデート画面を開く / 前面化する（Issue #616）。
     /// 設定画面（#459）・About（#485）と同じ単一インスタンス方式
+    /// Windows の `update apply` の続き（#2434）。検査済みのインストーラーを起こし、
+    /// 応答を返し切ってから抜ける。**この時点ではまだ何も上書きしていない**ので
+    /// `updated` は false で、何が起きるかを `installer_started` / `quitting` で返す。
+    /// 起こせなければ Err（今の版のまま動き続ける）。macOS（`.app` は差し替え済み）は
+    /// 従来どおり CLI / MCP からは起動し直さない
+    fn hand_over_to_installer(
+        &mut self,
+        restart: &update_checker::Restart,
+        json: &mut serde_json::Value,
+    ) -> Result<(), String> {
+        let update_checker::Restart::RunInstaller(prepared) = restart else {
+            return Ok(());
+        };
+        self.save_layout();
+        update_checker::restart_app(restart).map_err(|e| restart.failed_text(&e))?;
+        self.pending_update_quit = true;
+        json["updated"] = false.into();
+        json["installer_started"] = true.into();
+        json["quitting"] = true.into();
+        json["installer_log"] = prepared.log_path.display().to_string().into();
+        Ok(())
+    }
+
     pub(crate) fn open_update_window_impl(&mut self, cx: &mut Context<Self>) {
         if let Some(handle) = self.update_window_handle {
             cx.defer(move |cx| {
@@ -28366,14 +28401,16 @@ impl SystemHost for TakoApp {
             })?;
         // 差し替えの手段（#1042）や brew の結果は message に載る。dispatch が捨てると
         // CLI / MCP からは「何が起きたか」が一切見えないので通す
-        let message = update_checker::perform_update(&info)?;
-        Ok(serde_json::json!({
+        let applied = update_checker::perform_update(&info)?;
+        let mut json = serde_json::json!({
             "updated": true,
             "version": info.version,
             "channel": info.channel.label(),
             "install_method": update_checker::detect_install_method().label(),
-            "message": message,
-        }))
+            "message": applied.message,
+        });
+        self.hand_over_to_installer(&applied.restart, &mut json)?;
+        Ok(json)
     }
     fn update_apply_zip(&mut self, channel: Option<&str>) -> Result<serde_json::Value, String> {
         let ch: update_checker::Channel =
@@ -28386,13 +28423,13 @@ impl SystemHost for TakoApp {
                     ch.display_label()
                 )
             })?;
-        let message = update_checker::perform_update_zip(&info)?;
+        let applied = update_checker::perform_update_zip(&info)?;
         Ok(serde_json::json!({
             "updated": true,
             "version": info.version,
             "channel": info.channel.label(),
             "install_method": "zip (fallback)",
-            "message": message,
+            "message": applied.message,
         }))
     }
     fn update_repair(&mut self) -> Result<serde_json::Value, String> {
@@ -29133,9 +29170,19 @@ impl TakoApp {
                                     ));
                                 }
                             }
+                            // #2247: ツリー・パスのメニュー・CLI / MCP と同じ dispatch を通し、
+                            // 失敗（消えたファイル等）はプレビューの通知として出す
                             "reveal" => {
                                 if let Some(p) = &preview_path {
-                                    let _ = tako_control::platform::os_integration::reveal(p);
+                                    if TakoApp::legacy_2247() {
+                                        let _ = tako_control::platform::os_integration::reveal(p);
+                                    } else {
+                                        this.reveal_in_file_manager(
+                                            p,
+                                            crate::sidebar::NoticeArea::Preview,
+                                            crate::sidebar::NoticeArm::Issue2247,
+                                        );
+                                    }
                                 }
                             }
                             "open-default" => {
@@ -32634,6 +32681,11 @@ mod self_test {
     mod lsp_held_2048;
     #[cfg(feature = "visual-test")]
     use lsp_held_2048::lsp_held_visual;
+    /// #2247: 「Finder で表示」を実マウスで押し、NSWorkspace の 1 実装へ届くか（visual-test `preview-reveal-2247`）
+    #[cfg(feature = "visual-test")]
+    mod preview_reveal_2247;
+    #[cfg(feature = "visual-test")]
+    use preview_reveal_2247::preview_reveal_visual;
     /// #1956: 検出表の第 2 波を実のサーバで起こし、波線とホバーのカードを撮る（visual-test `lsp-servers`）
     #[cfg(feature = "visual-test")]
     mod lsp_servers_1956;
@@ -39390,6 +39442,8 @@ mod self_test {
                     download_url: Some("https://example.invalid/tako.zip".into()),
                     asset_name: Some("tako-v0.6.2-macos-arm64.zip".into()),
                     notes: Some(notes.to_string()),
+                    asset_size: None,
+                    asset_digest: None,
                 }),
                 test: None,
                 rate_limit_note: None,
@@ -48304,6 +48358,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2247: 「Finder で表示」がどの入口からも NSWorkspace の 1 実装へ 1 回届くか（記録の口）
+                "preview-reveal-2247" => {
+                    preview_reveal_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1684: 実の rust-analyzer で右クリック → 項目 → 定義へ移動（無ければ SKIPPED）
                 "lsp-context-menu-real" => {
                     lsp_context_menu_real_visual(any, window, cx).await;
@@ -48567,7 +48627,7 @@ mod self_test {
                          syntax-alias / extra-syntax / net-resume / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
                          workspace-search-1694 / paste-guard / bracket-match / enter-1759 / \
-                         changelog-offload / changelog-expand / tasks-launch-2182 / palette-alias）"
+                         changelog-offload / changelog-expand / tasks-launch-2182 / palette-alias / preview-reveal-2247）"
                     );
                     std::process::exit(1);
                 }
@@ -77268,6 +77328,8 @@ mod self_test {
                     download_url: Some("https://example.invalid/tako.zip".into()),
                     asset_name: Some(format!("tako-v{v}-macos-arm64.zip")),
                     notes: Some(NOTES_MD.to_string()),
+                    asset_size: None,
+                    asset_digest: None,
                 };
                 let available = |stable: Option<&str>, test: Option<&str>| {
                     UpdateState::Available(ChannelUpdates {
@@ -78179,6 +78241,8 @@ mod self_test {
                                 download_url: None,
                                 asset_name: None,
                                 notes: None,
+                                asset_size: None,
+                                asset_digest: None,
                             }),
                             test: None,
                             rate_limit_note: None,

@@ -9,6 +9,13 @@
 ;   - ユーザー PATH（HKCU\Environment）へ {app} を追加する。tako 自身は PATH を触らないので、
 ;     ペイン内で `tako` を叩く「AI フルコントロール」経路はこの追加に依存している。
 ;     HKLM は一切触らない。
+;   - アプリ内更新（#2434）は tako がこのインストーラーを無言で起こす:
+;       /SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /SP- /LOG="..."
+;       /TAKOWAITPID=<抜ける tako の pid> /TAKORELAUNCH="<起動し直す tako-app.exe>"
+;     後ろ 2 つは tako 専用の指定で、[Code] の InitializeSetup / DeinitializeSetup が読む
+;     （tako が抜けるのを待ってから上書きし、終わり際に tako を起動し直す）。
+;     指定が無い起動（手動・CI の無人インストール）では何もしない。
+;     正本は crates/tako-app/src/platform/installer_update.rs
 ;   - バージョンはこのファイルに埋め込まず、ISCC の /DAppVersion=... で注入する
 ;     （build-installer.ps1 が Cargo.toml から読んで渡す）。
 ;   - 出力ファイル名も /DAssetBaseName=... で注入する。命名規則の正は
@@ -103,7 +110,8 @@ MinVersion=10.0.17763
 ChangesEnvironment=yes
 
 ; 実行中の tako を Restart Manager で検出して閉じる（閉じないと上書きコピーに失敗する）。
-; 勝手に再起動はしない
+; 無言のとき（アプリ内更新）は常に閉じる。Restart Manager による再起動はしない
+; （アプリ内更新の起動し直しは [Code] の DeinitializeSetup が受け持つ。#2434）
 CloseApplications=yes
 CloseApplicationsFilter=*.exe
 RestartApplications=no
@@ -148,6 +156,92 @@ Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; F
 [Code]
 const
   EnvironmentKey = 'Environment';
+  { アプリ内更新（#2434）: 抜ける tako を待つ上限。過ぎたら Restart Manager に閉じさせる }
+  TakoExitWaitMs = 30000;
+  SYNCHRONIZE = $00100000;
+  WAIT_OBJECT_0 = 0;
+
+var
+  { アプリ内更新（#2434）: ファイルの上書きが最後まで済んだか }
+  InstallSucceeded: Boolean;
+
+function OpenProcess(dwDesiredAccess: DWORD; bInheritHandle: BOOL; dwProcessId: DWORD): THandle;
+  external 'OpenProcess@kernel32.dll stdcall';
+function WaitForSingleObject(hHandle: THandle; dwMilliseconds: DWORD): DWORD;
+  external 'WaitForSingleObject@kernel32.dll stdcall';
+function CloseHandle(hObject: THandle): BOOL;
+  external 'CloseHandle@kernel32.dll stdcall';
+
+{ /TAKOWAITPID=<pid>（アプリ内更新で抜ける tako）。指定が無ければ 0 }
+function TakoWaitPid(): Integer;
+begin
+  Result := StrToIntDef(ExpandConstant('{param:TAKOWAITPID|0}'), 0);
+end;
+
+{ Pid のプロセスが TimeoutMs 以内に終わったか（もう居ない・開けない場合も True）。
+  TimeoutMs = 0 なら「いま居ないか」だけを見る }
+function ProcessExited(Pid: Integer; TimeoutMs: Integer): Boolean;
+var
+  H: THandle;
+begin
+  Result := True;
+  if Pid <= 0 then
+    Exit;
+  H := OpenProcess(SYNCHRONIZE, False, Pid);
+  if H = 0 then
+    Exit;
+  Result := WaitForSingleObject(H, TimeoutMs) = WAIT_OBJECT_0;
+  CloseHandle(H);
+end;
+
+{ アプリ内更新（#2434）: tako が抜けてから上書きを始める。抜けなければ Restart Manager に任せる }
+function InitializeSetup(): Boolean;
+var
+  Pid: Integer;
+begin
+  Result := True;
+  Pid := TakoWaitPid();
+  if Pid <= 0 then
+    Exit;
+  if ProcessExited(Pid, TakoExitWaitMs) then
+    Log(Format('tako (pid %d) has exited; continuing the update', [Pid]))
+  else
+    Log(Format('tako (pid %d) is still running after %d ms; Restart Manager will close it', [Pid, TakoExitWaitMs]));
+end;
+
+{ アプリ内更新（#2434）: 終わり際に tako を起動し直す。成功なら入れた先の新しい tako-app.exe、
+  失敗・中断ならロールバックで元に戻った /TAKORELAUNCH の exe を起こす。
+  待っていた tako がまだ残っているなら 2 つ目は起こさない。
+  （波括弧のコメントは入れ子にできないので、この中に波括弧の定数を書かない） }
+procedure DeinitializeSetup();
+var
+  Target, Installed: string;
+  ResultCode: Integer;
+begin
+  Target := ExpandConstant('{param:TAKORELAUNCH|}');
+  if Target = '' then
+    Exit;
+  if not ProcessExited(TakoWaitPid(), 0) then
+  begin
+    Log('tako is still running; not relaunching it');
+    Exit;
+  end;
+  if InstallSucceeded then
+  begin
+    Installed := ExpandConstant('{app}\{#AppExeName}');
+    if FileExists(Installed) then
+      Target := Installed;
+  end;
+  if not FileExists(Target) then
+  begin
+    Log('relaunch target not found: ' + Target);
+    Exit;
+  end;
+  if Exec(Target, '', ExtractFileDir(Target), SW_SHOWNORMAL, ewNoWait, ResultCode) then
+    Log('relaunched tako: ' + Target)
+  else
+    Log(Format('failed to relaunch tako: %s (%s)', [Target, SysErrorMessage(ResultCode)]));
+end;
 
 { 比較用に正規化する: 前後の空白を落とし、末尾のバックスラッシュを落とし、小文字化し、
   レジストリに未展開のまま入りがちな環境変数を展開する。
@@ -277,6 +371,9 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if (CurStep = ssPostInstall) and WizardIsTaskSelected('addtopath') then
     EnvAddPath(ExpandConstant('{app}'));
+  { ssPostInstall に来た = ファイルの上書きとレジストリの書き込みが済んだ（#2434） }
+  if CurStep = ssPostInstall then
+    InstallSucceeded := True;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

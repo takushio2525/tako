@@ -37,6 +37,9 @@ notify.workspace = true
 image.workspace = true
 # アプリ内更新の GitHub Releases チェック（update_checker）
 ureq.workspace = true
+# Windows のアプリ内更新でインストーラーを配布元の sha256 と突き合わせる（#2434。
+# tako-core / tako-control が既に使っている版なので依存の木は増えない）
+sha2.workspace = true
 # Web ビューペイン（FR-3.8）: OS ネイティブ webview の GPUI 子ビュー統合
 wry.workspace = true
 raw-window-handle.workspace = true

@@ -1336,6 +1336,7 @@ MCP / CLI から受け、UI 層がレイアウト矩形に変換して描画す�
 | PTY | openpty | ConPTY |
 | IPC | Unix domain socket | Named pipe |
 | プロセスツリー / listen ポート | libproc | Toolhelp32 / GetExtendedTcpTable |
+| プロセスの停止（B5 の制御側 `platform::process::terminate`） | SIGTERM / SIGKILL | `TerminateProcess`（穏当な終了要求は無い = `force` に関わらず強制。#1599） |
 | シェル統合 | zsh / bash / fish | PowerShell |
 
 trait で抽象化し、core/ と control/ は platform/ の trait のみに依存する。

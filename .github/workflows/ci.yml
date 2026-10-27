@@ -166,7 +166,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: macos-latest
-    timeout-minutes: 60
+    # 60 分では足りない（10/27: main でも 37〜54 分。PR の CI が重なるとビルドが 10 → 20 分に延びて
+    # 2 本続けて 60 分で打ち切られた）。Windows ジョブと同じ 90 分にする
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4
@@ -538,6 +540,11 @@ jobs:
       # テストバイナリは上のステップで作ってあるので追加の所要は数秒
       - name: psmux バックエンドの実行検査（#1314。conf の原子的な差し替えを含む）
         run: cargo test -p tako-core --lib backend::psmux
+      # #1599: プロセスの停止（`OpenProcess` + `TerminateProcess`）も **macOS では 1 行も
+      # 実行できない** FFI。自分で起こした子を実際に止めるか・正体の違う pid を撃たないか・
+      # remote の停止の芯と admin API の shutdown を、全数より手前に名指しで置く（#1282 と同じ理由）
+      - name: プロセスの停止の実行検査（#1599。TerminateProcess と remote の停止）
+        run: cargo test -p tako-control --lib -- platform::process::tests remote::tests::停止の芯 remote::tests::daemon_stop_impl remote::tests::kill_stale_daemon remote::tests::admin_apiのshutdown
       # **ワークスペース全体のテストを blocking にする**（#1278 / #583）。
       # #583 は「POSIX 前提の既存失敗が残っているあいだ非ブロッキング」で据え置いていたが、
       # そのあいだに未検出が溜まり、実機で 19 → 24 件まで増えていた（#1278）。

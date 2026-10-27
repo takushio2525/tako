@@ -3651,8 +3651,8 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
   （#2040 で macOS の CI が上限 2400 秒を 19 秒超え、緑なのに「merge してはいけない」と返った）。
   上限に達したら**最後にもう一度**状態を見て、全部そろって完了していれば緑 0 / 赤 1 を結論にする
   （確定は 2 回連続の観測のままなので、足す観測は最大 2 回・完了でないと分かった時点で 2）。
-  既定の上限は 4800 秒 = **macOS の job 自身の `timeout-minutes: 60`** + 判定と runner 待ちの余裕
-  （macOS の CI は 2026-10-16 に 36〜54 分）。`--timeout` か `TAKO_WAIT_PR_CHECKS_TIMEOUT` で変える
+  既定の上限は 6600 秒 = **macOS の job 自身の `timeout-minutes: 90`** + 判定と runner 待ちの余裕
+  （macOS の CI は 2026-10-16 に 36〜54 分。10/27 に PR の CI が重なって 60 分で 2 本打ち切られたので job の上限を 90 分へ・既定を 4800 → 6600 秒）。`--timeout` か `TAKO_WAIT_PR_CHECKS_TIMEOUT` で変える
   （`merge-pr.sh` にもそのまま届く）。**macOS の job の上限を伸ばすときは既定も伸ばす**
   （`test-wait-pr-checks.sh` の Test 35 が実物の `ci.yml` と比べて落とす）。A/B は `TAKO_2047_LEGACY=1`
   （上限で即 2・既定 2400 秒。Test 33 が「上限の直後の緑を 2 と誤判定する」を固定している）
