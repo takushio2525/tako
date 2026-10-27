@@ -513,8 +513,8 @@ pub struct TerminalSession {
     /// 立っているペインへだけ、テーマの切り替えを `CSI ? 997 ; 1|2 n` で知らせる
     color_scheme_updates: bool,
     /// PTY 直下の子とその子孫を入れた Job（#2454。境界 B30）。drop（= ペインを閉じる）で
-    /// 中身を全部止める。unix・器のペイン・A/B の legacy・作れなかった回は None
-    /// （従来どおり PTY を閉じるだけ）
+    /// コンソールのプロセスを止め、GUI のアプリとその子孫は残す（`Job::close_for_pane`）。
+    /// unix・器のペイン・A/B の legacy・作れなかった回は None（従来どおり PTY を閉じるだけ）
     job: Option<crate::platform::job::Job>,
 }
 
@@ -879,7 +879,8 @@ impl TerminalSession {
     }
 
     /// PTY 直下の子とその子孫を入れた Job（#2454）。ペインを閉じる（この端末を drop する）と
-    /// 中身が全部止まる。unix・器のペイン・A/B の legacy・作れなかった回は None
+    /// コンソールのプロセスが止まり、GUI のアプリとその子孫は残る。
+    /// unix・器のペイン・A/B の legacy・作れなかった回は None
     pub fn descendant_job(&self) -> Option<&crate::platform::job::Job> {
         self.job.as_ref()
     }
@@ -2140,6 +2141,11 @@ impl Drop for TerminalSession {
         }
         // IO スレッドへ終了を通知する（PTY が drop されシェルにも HUP が届く）
         let _ = self.notifier.0.send(Msg::Shutdown);
+        // #2454: 子孫のうちコンソールのプロセスを止め、ペインから起こした GUI のアプリと
+        // その子孫は残す（寿命の決まりは `platform::job`）。Job が無ければ何もしない
+        if let Some(job) = self.job.take() {
+            job.close_for_pane();
+        }
     }
 }
 

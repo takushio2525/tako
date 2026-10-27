@@ -319,7 +319,7 @@ fn issue2454_jobへ入れられなくてもペインは起動し閉じられる(
 }
 
 /// **境界の端**: 中身が先に死んだ Job を止める・同じ Job を 2 回止める（同じペインを 2 回閉じる形）・
-/// 止め終わった Job を drop する、のどれも成功し panic しない
+/// 空になった Job をペインの閉じ方（GUI を残す）で手放す、のどれも成功し panic しない
 #[test]
 fn issue2454_中身が先に死んだjobを止めても2回止めても成功する() {
     let mut child = std::process::Command::new("ping");
@@ -335,6 +335,32 @@ fn issue2454_中身が先に死んだjobを止めても2回止めても成功す
     child.wait().expect("看取れる");
     assert_eq!(job.terminate(), Ok(()), "中身が死んだ Job を止められない");
     assert_eq!(job.terminate(), Ok(()), "同じ Job の 2 回目を止められない");
-    drop(job);
+    assert_eq!(
+        job.release_keeping_gui(),
+        job::Release::default(),
+        "空の Job を手放すと何も止めず何も残さない"
+    );
     assert!(!pid_alive(child.id()));
+}
+
+/// ペインの閉じ方（GUI を残す）でも、コンソールの子だけの Job は全部止まる（GUI が居ない速い道）
+#[test]
+fn issue2454_コンソールだけのjobはペインの閉じ方でも全部止まる() {
+    let mut child = std::process::Command::new("ping");
+    child
+        .args(["-n", "600", "127.0.0.1"])
+        .stdout(std::process::Stdio::null());
+    let mut child = tako_core::platform::process::no_console_window(&mut child)
+        .spawn()
+        .expect("眠るだけの子を起こせる");
+    let job = job::Job::contain(child.id()).expect("自分の子を Job に入れられる");
+    let release = job.release_keeping_gui();
+    // 止めた数は子とそのコンソールのホスト（conhost。Windows が付ける）で 1〜2 本
+    assert!(
+        release.kept == 0 && release.stopped >= 1,
+        "コンソールの子を止めなかった・GUI と読んだ（{release:?}）"
+    );
+    // 自分の子なので看取れる（Job が止めた = 終了コード 1）
+    let status = child.wait().expect("看取れる");
+    assert_eq!(status.code(), Some(1), "Job が止めていない（{status:?}）");
 }

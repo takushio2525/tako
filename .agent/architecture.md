@@ -1333,9 +1333,25 @@ Windows の `TerminateProcess` は子孫を道連れにしない。ConPTY を閉
 残った（FR-2.33.9 の「1 日 46 本」）。いまは子 1 つ（ペインの PTY 直下の子 / 言語サーバ 1 つ）ごとに
 Job を 1 つ作り、起こした直後に入れる（以後その子が起こすものは Job を受け継ぐ）。
 
-- **止めるとき**: ペインは `TerminalSession` の drop（= ペインを閉じる）、言語サーバは
-  `ServerProcess::kill`（`tako lsp stop` も GUI の終了も最後はここ）で `TerminateJobObject`。
-  `KILL_ON_JOB_CLOSE` なので tako が落ちてハンドルが閉じても中身は止まる（隔離インスタンスの終了も同じ）
+- **寿命の決まり**（正本は `platform::job` の冒頭の表）:
+
+  | いつ | コンソールのプロセス | GUI のアプリとその子孫 |
+  |---|---|---|
+  | ペインを閉じる（`TerminalSession` の drop → `Job::close_for_pane`） | 止める | **残す** |
+  | 言語サーバを止める（`ServerProcess::kill` = `tako lsp stop` / GUI の終了 / drop） | 止める | 止める |
+  | tako が落ちる（OS がハンドルを閉じる = `KILL_ON_JOB_CLOSE`。隔離インスタンスの終了も同じ） | 止める | 止める |
+
+  ペインから起こした GUI アプリ（`code .` の初回・`notepad` など）をペインと一緒に消さない（Windows Terminal も
+  macOS の `open` も残す）。ペインを閉じるときは Job の中の pid を列挙し（`JobObjectBasicProcessIdList`）、
+  実行ファイルの PE ヘッダのサブシステムが GUI のもの（`pe_subsystem`）と、親を **Job の中で**たどって
+  GUI に当たるもの（VS Code の統合ターミナルのシェル・言語サーバはコンソールだが VS Code の子孫）を残し
+  （コンソールのホスト `conhost.exe` / `OpenConsole.exe` は GUI と数えない = `is_console_host`）、
+  残りを 1 本ずつ止める（撃つ前に開いたハンドルで `IsProcessInJob` を確かめる = 列挙の後の pid の再利用を
+  撃たない）。親の起動時刻が子より後ならその親は pid の再利用とみなしてたどらない。振り分けは純関数
+  `split_for_release` の 1 実装。GUI が居なければ Job ごと止める。最後に `KILL_ON_JOB_CLOSE` を外してから
+  ハンドルを閉じる（外さないと閉じた瞬間に残したものも止まる）。列挙できないときは全部止める
+- **tako の普通の終了**は端末を drop しない（`on_app_quit` の後は OS がハンドルを閉じる）ので、いまは
+  「落ちたとき」と同じく GUI の孫も止まる
 - **`JOB_OBJECT_LIMIT_BREAKAWAY_OK` を付ける**: `CREATE_BREAKAWAY_FROM_JOB` で明示的に外へ出る子（親の
   寿命から切り離すと宣言した常駐 = unix の `setsid` に当たる）は出られる。付けないとその子の
   `CreateProcess` が ERROR_ACCESS_DENIED で失敗する。`SILENT_BREAKAWAY_OK` は付けない（回収にならない）
@@ -1348,12 +1364,13 @@ Job を 1 つ作り、起こした直後に入れる（以後その子が起こ�
   器の実行ファイルか。名前は `backend::is_plumbing_process` の正本）。`wrap_options` / `reattach_options` /
   `PsmuxBackend::wrap_spawn` の出力が器と判定されることを単体テストで固定している
 - **入れられないとき**（作成・割り当ての失敗）は `None` で従来の止め方（直下の子だけ）へ落ちる。panic しない
-- 副作用: ペインから起こした GUI アプリ（`notepad` など、既存のインスタンスへ引き渡さずに自分で窓を持つもの）も
-  ペインを閉じると止まる（unix の HUP と同じ寿命。Windows Terminal はコンソールに繋がった子だけを止める）
 
-A/B は `TAKO_2454_LEGACY=1`（Job を作らない）、注入は `TAKO_2454_INJECT=assign_fail`（テストプロセスだけ）。
-実プロセスのテストは `crates/tako-core/tests/issue2454_pane_job_windows.rs`（ペイン）と
-`crates/tako-control/tests/issue2454_lsp_job_windows.rs`（`.cmd` → cmd.exe → 偽サーバ）。
+A/B は `TAKO_2454_LEGACY=1`（Job を作らない）と `TAKO_2454_KILL_GUI=1`（ペインを閉じるときも GUI ごと全部止める）、
+注入は `TAKO_2454_INJECT=assign_fail`（テストプロセスだけ）。実プロセスのテストは
+`crates/tako-core/tests/issue2454_pane_job_windows.rs`（ペインのコンソールの孫）・
+`crates/tako-control/tests/issue2454_pane_gui_windows.rs`（同じペインの GUI の孫は残りコンソールの孫は止まる。
+GUI 役はテスト専用の `tako-gui-sleeper`）・`crates/tako-control/tests/issue2454_lsp_job_windows.rs`
+（`.cmd` → cmd.exe → 偽サーバ）。
 
 **縮退の宣言は system prompt へも流れる**（#516。正本は `tako-core::platform::support`）。
 ただし prompt へ載せるのは「この環境は何か」と「縮退が N 件あること・その引き方」だけで、
