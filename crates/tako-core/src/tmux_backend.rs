@@ -3621,9 +3621,34 @@ set -gq copy-mode-position-format ''
         nested_socket: &str,
         inner_cmd: &str,
     ) -> (crate::TerminalSession, crate::test_residue::ScratchDir) {
+        spawn_nested_with_conf(
+            backend_socket,
+            nested_socket,
+            inner_cmd,
+            NESTED_TMUX_SNIPPET,
+        )
+    }
+
+    /// 器の側のセッション名（`spawn_nested_with_conf` が `wrap_options` へ渡す）
+    #[cfg(unix)]
+    const NEST_BACKEND_SESSION: &str = "tako-e2e-nest";
+
+    /// ネスト tmux 側のセッション名
+    #[cfg(unix)]
+    const NEST_SESSION: &str = "nest";
+
+    /// [`spawn_nested`] のネスト conf を差し替えられる版（#2406 の注入 `never` が
+    /// `mouse off` = バグ (1) の設定で起こす）
+    #[cfg(unix)]
+    fn spawn_nested_with_conf(
+        backend_socket: &str,
+        nested_socket: &str,
+        inner_cmd: &str,
+        nested_conf: &str,
+    ) -> (crate::TerminalSession, crate::test_residue::ScratchDir) {
         let conf_dir = crate::test_residue::ScratchDir::new("nest-conf");
         let conf_path = conf_dir.join(format!("{nested_socket}.conf"));
-        std::fs::write(&conf_path, NESTED_TMUX_SNIPPET).expect("ネスト conf を書ける");
+        std::fs::write(&conf_path, nested_conf).expect("ネスト conf を書ける");
         // バックエンドペインの中でユーザー tmux サーバーへ new-session する
         // （実機の「自前 tmux セッションを tako 内で attach」構成の再現）
         let options = SpawnOptions {
@@ -3638,7 +3663,7 @@ set -gq copy-mode-position-format ''
                     "new-session".into(),
                     "-A".into(),
                     "-s".into(),
-                    "nest".into(),
+                    NEST_SESSION.into(),
                     inner_cmd.into(),
                 ],
             }),
@@ -3649,16 +3674,161 @@ set -gq copy-mode-position-format ''
         let (session, _rx) = crate::TerminalSession::spawn(
             80,
             24,
-            wrap_options(options, backend_socket, "tako-e2e-nest"),
+            wrap_options(options, backend_socket, NEST_BACKEND_SESSION),
         )
         .expect("ネスト構成を spawn できる");
         (session, conf_dir)
     }
 
+    // ── #2406: ネスト tmux 越しのホイールの待ち ──────────────────────────────
+    //
+    // **`LINE-99` が見えても、ネスト tmux のマウス要求が器のペインに在るとは限らない**。
+    // ネスト tmux は起動中、端末の応答（DA / XTVERSION）を受けるたびに `tty_invalidate` で
+    // マウス要求を外し（`\e[?1000l` …）、次の周回で付け直す。外しと付け直しは**別の書き込み**に
+    // なりうる（実測: 既存セッションへの attach で、「外し + LINE-99 の描画」の書き込みの
+    // 40 µs 後に付け直しの書き込み）。応答が描画より後に着く順序（混んだ機）では、器は
+    // 「LINE-99 が見えるのにペインの `mouse_any_flag=0`」の窓を持つ。
+    //
+    // その窓に届いたホイールは**捨てられる**。器の既定の `WheelUpPane` は
+    // `#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}` で `send-keys -M` へ回し
+    // （器のペインはネスト tmux の alt screen なので常に真 = copy-mode には入らない。#1252 とは
+    // ここが違う）、マウスを要求していないペインへのマウスイベントは tmux が落とす。旧テストは
+    // ホイールを 1 発だけ打っていたので、最下部（`LINE-78`〜`LINE-99`）のまま窓が尽きていた
+    // （CI の形）。外側の `mouse_reporting()` は器の `mouse on` で attach 時点から真なので、
+    // これも証跡にならない（#1252 と同じ）
+
+    /// A/B: `TAKO_2406_LEGACY=1` は #2406 **前**の待ちへ戻す
+    /// （アンカー = 外側 `mouse_reporting()` + `LINE-99` / ホイールは 1 発 / 固定回数の窓）
+    #[cfg(unix)]
+    fn legacy_2406() -> bool {
+        std::env::var("TAKO_2406_LEGACY").is_ok_and(|v| v == "1")
+    }
+
+    /// 注入 `gap` で、外したマウス要求を付け直すまでの遅れ
+    #[cfg(unix)]
+    const GAP_2406: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// 注入（#2406）。混み具合は再現できないので**ネストのマウス要求が外れている窓**そのものを作る
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Inject2406 {
+        /// 最初のホイールの直前にネストのマウス要求を外し（器のペインから消えたのを確かめてから
+        /// 打つ）、付け直しを [`GAP_2406`] 遅らせる = `tty_invalidate` の窓が混んだ機で伸びた形。
+        /// 旧経路は確定で FAILED
+        Gap,
+        /// ネスト conf を `mouse off` にする = バグ (1) の設定（**新経路でも FAILED が正しい**）
+        Never,
+    }
+
+    #[cfg(unix)]
+    fn inject_2406() -> Option<Inject2406> {
+        match std::env::var("TAKO_2406_INJECT").ok().as_deref() {
+            None | Some("") => None,
+            Some("gap") => Some(Inject2406::Gap),
+            Some("never") => Some(Inject2406::Never),
+            // 綴り違いを「注入なし」として黙って通さない
+            Some(other) => panic!("TAKO_2406_INJECT={other:?} は知らない値（gap / never）"),
+        }
+    }
+
+    /// ネスト conf（注入 `never` は `mouse on` を `mouse off` へ）
+    #[cfg(unix)]
+    fn nested_conf_2406(inject: Option<Inject2406>) -> String {
+        if inject != Some(Inject2406::Never) {
+            return NESTED_TMUX_SNIPPET.to_string();
+        }
+        let conf = NESTED_TMUX_SNIPPET.replace("set -g mouse on", "set -g mouse off");
+        assert!(
+            conf.contains("set -g mouse off"),
+            "注入 never: ネスト conf の `set -g mouse on` を差し替えられない"
+        );
+        conf
+    }
+
+    /// 注入 `gap` の前半: ネストのマウス要求を外し、器のペインから消えたのを確かめる
+    #[cfg(unix)]
+    fn inject_2406_before_wheel(backend: &str, nested: &str) {
+        let out = crate::tmux::tmux_command(Some(nested))
+            .args(["set", "-g", "mouse", "off"])
+            .output()
+            .expect("注入: ネスト tmux を呼べる");
+        assert!(
+            out.status.success(),
+            "注入 gap: ネストの mouse を外せない。stderr={:?}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        wait_for_state(
+            "注入: 器のペインからネストのマウス要求が消える（#{mouse_any_flag}=0）",
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(20),
+            || (!probe_pane_mouse(backend, NEST_BACKEND_SESSION).any).then_some(()),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "注入 gap が効かない（#2406）。{}",
+                e.tagged("TAKO_2406_INJECT")
+                    .observed(probe_pane_mouse(backend, NEST_BACKEND_SESSION).describe())
+            )
+        });
+    }
+
+    /// 注入 `gap` の後半: 付け直しを [`GAP_2406`] 遅らせる（打ったホイールはその間に器へ届いて
+    /// 捨てられる）。テストが先に終わって器が消えていても落とさない
+    #[cfg(unix)]
+    fn inject_2406_restore_later(nested: &str) {
+        let nested = nested.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(GAP_2406);
+            let _ = crate::tmux::tmux_command(Some(&nested))
+                .args(["set", "-g", "mouse", "on"])
+                .output();
+        });
+    }
+
+    /// 画面の先頭行の `LINE-n` の n（遡れたかの判定）
+    #[cfg(unix)]
+    fn nested_top_line(session: &crate::TerminalSession) -> Option<usize> {
+        session
+            .visible_lines()
+            .first()
+            .and_then(|l| l.trim_end().strip_prefix("LINE-")?.parse().ok())
+    }
+
+    /// ネスト側のスクロールの状態（失敗の診断用。器が食ったのか / ネストが受けて
+    /// 動かなかったのかを分ける。#2406）
+    #[cfg(unix)]
+    fn describe_nested_scroll(nested: &str) -> String {
+        match crate::tmux::tmux_command(Some(nested))
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                NEST_SESSION,
+                "#{pane_in_mode},#{scroll_position},#{history_size},#{mouse}",
+            ])
+            .output()
+        {
+            Ok(out) if out.status.success() => format!(
+                "ネスト側 inmode,scroll,history,mouse={}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            ),
+            Ok(out) => format!(
+                "ネスト側 rc={:?} stderr={:?}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => format!("ネスト側を呼べない: {e}"),
+        }
+    }
+
     /// ネスト tmux 越しのホイールがユーザーサーバーの copy-mode スクロールに乗る e2e
     /// （2026-06-12 実機バグ (1) の再発防止。NESTED_TMUX_SNIPPET の mouse on が前提）。
     /// 経路: tako の SGR → バックエンド tmux（mouse_any=1 で send -M 生転送）→
-    /// ネスト tmux（mouse on）→ copy-mode でネスト側スクロールバックを遡る
+    /// ネスト tmux（mouse on）→ copy-mode でネスト側スクロールバックを遡る。
+    ///
+    /// アンカーは**器のペイン側のマウス要求**で、ホイールは**遡るまで毎周期打ち直す**。
+    /// 要求が外れた窓に落ちたホイールは器が捨てるので、1 発だけでは届かない回がある
+    /// （#2406。理由はこの上のブロック）
     #[test]
     #[cfg(unix)]
     fn ネストtmux越しのホイールで内側スクロールバックを遡れる() {
@@ -3668,55 +3838,135 @@ set -gq copy-mode-position-format ''
         let backend = format!("tako-coretest-nestw-{}", std::process::id());
         let nested = format!("tako-coretest-nestw-in-{}", std::process::id());
         let _cleanup = TmuxTestGuard::new(vec![backend.clone(), nested.clone()]);
-        let (session, _nest_conf) = spawn_nested(
+        let inject = inject_2406();
+        let (session, _nest_conf) = spawn_nested_with_conf(
             &backend,
             &nested,
             "i=0; while [ $i -lt 100 ]; do echo LINE-$i; i=$((i+1)); done; exec sleep 60",
+            &nested_conf_2406(inject),
         );
-        // ネスト内の出力完了 + 外側のマウスモード（バックエンド mouse on）を待つ
-        let mut ready = false;
-        for _ in 0..100 {
-            if session.mouse_reporting()
-                && session
-                    .visible_lines()
-                    .iter()
-                    .any(|l| l.trim_end() == "LINE-99")
-            {
-                ready = true;
-                break;
+        if legacy_2406() {
+            // TAKO_2406_LEGACY_ARM 開始（#2406 **前**の待ち。番犬はここを対象外にする）
+            // ネスト内の出力完了 + 外側のマウスモード（バックエンド mouse on）を待つ
+            let mut ready = false;
+            for _ in 0..100 {
+                if session.mouse_reporting()
+                    && session
+                        .visible_lines()
+                        .iter()
+                        .any(|l| l.trim_end() == "LINE-99")
+                {
+                    ready = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(
-            ready,
-            "ネスト構成が立ち上がらない。画面: {:?}",
-            session.visible_lines().join("\n")
-        );
-        // ホイール上 → ネスト tmux の copy-mode で遡る（過去の LINE-n が見える）
-        session.scroll_wheel(3, 10, 10);
-        let mut scrolled = false;
-        for _ in 0..50 {
-            let top_n = session
-                .visible_lines()
-                .first()
-                .map(|l| l.trim_end().to_string())
-                .and_then(|t| {
-                    t.strip_prefix("LINE-")
-                        .and_then(|s| s.parse::<usize>().ok())
-                });
-            if let Some(n) = top_n {
-                if n < 77 {
+            assert!(
+                ready,
+                "ネスト構成が立ち上がらない。画面: {:?}",
+                session.visible_lines().join("\n")
+            );
+            // ホイール上 → ネスト tmux の copy-mode で遡る（過去の LINE-n が見える）
+            if inject == Some(Inject2406::Gap) {
+                inject_2406_before_wheel(&backend, &nested);
+            }
+            session.scroll_wheel(3, 10, 10);
+            if inject == Some(Inject2406::Gap) {
+                inject_2406_restore_later(&nested);
+            }
+            let mut scrolled = false;
+            for _ in 0..50 {
+                if nested_top_line(&session).is_some_and(|n| n < 77) {
                     scrolled = true;
                     break;
                 }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                scrolled,
+                "ネスト越しのホイールでスクロールバックを遡れない（バグ (1) の回帰）。画面: {:?}",
+                session.visible_lines().join("\n")
+            );
+            // TAKO_2406_LEGACY_ARM 終了
+            return;
         }
-        assert!(
-            scrolled,
-            "ネスト越しのホイールでスクロールバックを遡れない（バグ (1) の回帰）。画面: {:?}",
-            session.visible_lines().join("\n")
+
+        // 遡る先（ネストの出力の最後まで）が揃うのを待つ
+        wait_for_state(
+            "ネストの出力の最後 `LINE-99` が画面に出る",
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(100),
+            || {
+                session
+                    .visible_lines()
+                    .iter()
+                    .any(|l| l.trim_end() == "LINE-99")
+                    .then_some(())
+            },
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "ネスト構成が立ち上がらない（#2406）。{} 画面: {:?}",
+                e.tagged("TAKO_2406_WAIT")
+                    .observed(describe_nested_scroll(&nested)),
+                session.visible_lines().join("\n")
+            )
+        });
+        // ネスト tmux のマウス要求が器のペインに届いている
+        let pane = wait_pane_mouse_ready(&backend, NEST_BACKEND_SESSION, || {}).unwrap_or_else(|e| {
+            panic!(
+                "ネスト tmux のマウス要求が器のペインへ届かない（バグ (1) の回帰。#2406）。{} {} 画面: {:?}",
+                e.tagged("TAKO_2406_WAIT"),
+                describe_nested_scroll(&nested),
+                session.visible_lines().join("\n")
+            )
+        });
+        eprintln!(
+            "TAKO_2406: {} legacy=false inject={inject:?}",
+            pane.describe()
         );
+
+        // ホイール上 → ネスト tmux の copy-mode で遡る（過去の LINE-n が見える）。
+        // 要求は付け直しの途中で一瞬外れうる（外れた窓のホイールは器が捨てる）ので、
+        // 毎周期 器のペインを見てから打ち、遡るまで打ち直す
+        let mut sent = 0u32;
+        let mut unready = 0u32;
+        let scrolled = wait_for_state(
+            "ホイールでネストのスクロールバックを遡る（先頭が LINE-77 未満）",
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_millis(100),
+            || {
+                if nested_top_line(&session).is_some_and(|n| n < 77) {
+                    return Some(());
+                }
+                if !probe_pane_mouse(&backend, NEST_BACKEND_SESSION).ready() {
+                    unready += 1;
+                    return None;
+                }
+                let inject_gap = sent == 0 && inject == Some(Inject2406::Gap);
+                if inject_gap {
+                    inject_2406_before_wheel(&backend, &nested);
+                }
+                session.scroll_wheel(3, 10, 10);
+                sent += 1;
+                if inject_gap {
+                    inject_2406_restore_later(&nested);
+                }
+                None
+            },
+        );
+        eprintln!("TAKO_2406: wheel sent={sent} unready={unready}");
+        scrolled.unwrap_or_else(|e| {
+            panic!(
+                "ネスト越しのホイールでスクロールバックを遡れない（バグ (1) の回帰。#2406）。{} 画面: {:?}",
+                e.tagged("TAKO_2406_WAIT").observed(format!(
+                    "ホイール sent={sent} unready={unready} / {} / {}",
+                    probe_pane_mouse(&backend, NEST_BACKEND_SESSION).describe(),
+                    describe_nested_scroll(&nested)
+                )),
+                session.visible_lines().join("\n")
+            )
+        });
     }
 
     /// ネスト tmux 越しの CSI u（Shift+Enter）が最内のアプリへ kitty 形式のまま届く e2e

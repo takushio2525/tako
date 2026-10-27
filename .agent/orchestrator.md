@@ -118,9 +118,44 @@ tako が起こす **claude の worker**（spawn / run / git resolve / 会話を�
 - **移行（#916）**: projects.yaml v1 → v2 で、直近 30 日の会話（`<config dir>/projects/<cwd のスラグ>/*.jsonl`）
   で呼ばれた `mcp__<server>__*` のうち user scope のものを、そのプロジェクトの `mcp_servers` へ写す。
   写すのは名前だけで本文は残さない。元のファイルは `projects.yaml.pre-v1.bak`
-- **対象外**: master / solo のセッション・人が手で開く claude。codex / agy の worker は
-  能力マトリクス `worker_mcp_scope`（codex = pending #2418 / agy = unsupported）
-- A/B は `TAKO_2412_LEGACY=1`（user scope を全部持ち込む #2412 前の起動）
+- **対象外**: master / solo のセッション・人が手で開く claude。agy の worker は
+  能力マトリクス `worker_mcp_scope`（agy = unsupported。起動ごとの手段が CLI に無い）
+- A/B は `TAKO_2412_LEGACY=1`（user scope を全部持ち込む #2412 前の起動。codex も戻る）
+
+#### codex の worker（Issue #2418）
+
+**codex の worker**（spawn / run / git resolve）も同じ判断（`worker_mcp::plan` = 同じ `mcp_servers`）で
+tako の MCP だけを持って起動する。違うのは読む場所と渡し方だけ（実測は codex-cli 0.154.0・一時の
+`CODEX_HOME` + 偽 Responses API `scripts/lib/fake-responses-api.mjs` + 起動を記録する偽 MCP）。
+
+- **user 設定**: `$CODEX_HOME/config.toml` の `[mcp_servers.*]`（インライン表・根の点つきキーも読む）。
+  `CODEX_HOME` はプロファイル / アカウントの `env:` の export → 明示の unset なら `~/.codex` → tako の
+  環境変数 → `~/.codex`（`worker_mcp::codex_home_for`）
+- **仕組み**: 起動コマンドの tako の MCP の一時注入（#986）の後・プロファイルの args の前に、止める名前ごとに
+  `-c 'mcp_servers.<名>.enabled=false'` と**目印** `-c 'mcp_servers.<名>.command=tako-disabled'`
+  （http の server は `url=http://127.0.0.1:9/tako-disabled`）を付ける（組み立ては `worker_mcp::codex_off_args`）。
+  止めた server の子プロセスは立たない（`ps` の子孫で実測）
+- **目印を付ける理由**: config.toml に無い名前を `enabled=false` だけで渡すと、codex は `invalid transport` で
+  **起動しない**（実測）。tako が読んだ config.toml と worker のシェルが読むもの（rc や direnv が `CODEX_HOME` を
+  差し替える）がずれても worker を落とさないよう、それだけで成り立つ項目にする。止めた項目なので目印は走らない。
+  **種類は読んだ transport に合わせる**（url の server に `command` を足すと起動しない = 実測）。
+  値に引用符を使わない（TOML として読めない値は codex がそのまま文字列にする。PowerShell 7.3 前の
+  native 引数で `"` が落ちても同じ値）
+- **プロジェクト側と同名は止めない**: codex が読むプロジェクトの設定は、cwd から git の根まで
+  （git が無ければ cwd だけ）の**信頼済み**フォルダの `.codex/config.toml`（実測）。同名ならプロジェクト側の
+  定義が勝つが、`enabled=false` はプロジェクト側まで止める（実測）。tako は信頼を見ずに広めに数える
+  （損をするのは同名の user 側を止め損ねるだけ）。祖先を無制限には辿らない（ホームの `~/.codex/config.toml` =
+  user 設定そのものを拾って何も止めなくなる）。応答では `shadowed`
+- **止められない名前**: `-c` のキーは `.` で区切られ引用符も効かない（実測）ので、名前に `.` や空白などを
+  含む server は止めずに持ち込み、`warnings` で知らせる（通すのは `codex mcp add` が許す英数字・`-`・`_`・`:`・`@`・`/`。
+  `.` は許されるがキーの区切りになる。手書きの config.toml の Unicode の英数字も通る = いずれも実測）
+- **config.toml が壊れている**: codex 自身が起動しない。tako は何も足さず `mode: unrestricted` と警告
+- **spawn の応答の `mcp`**: claude と同じ形に `config_file`（読んだ config.toml）が付く。
+  `tako orchestrator projects mcp <key>` の応答は codex の設定がある機でだけ `codex_plan` を持ち、CLI は
+  「codex の worker で止める」の行を出す
+- **対象外**: 再起動をまたぐ復元（`codex resume <id>`。起動の引数を持ち込まない = #986 の注入も載らない）・
+  移行（#916）の実績は claude の会話だけを数える（codex の rollout は読まない）
+- A/B は `TAKO_2418_LEGACY=1`（codex だけ #2418 前 = user 設定を全部持ち込む）
 
 ## プロファイルと設定の優先順位（Issue #27 で明文化）
 

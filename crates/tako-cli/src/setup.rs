@@ -604,14 +604,7 @@ fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
                         Path::new(p)
                     ))
             );
-            eprintln!(
-                "  PATH:   {}",
-                if value["launcher_dir_on_path"].as_bool() == Some(true) {
-                    "通っています"
-                } else {
-                    "通っていません"
-                }
-            );
+            eprintln!("  PATH:   {}", path_label(value));
             eprintln!(
                 "  認証:   {}",
                 if value["authenticated"].as_bool() == Some(true) {
@@ -677,11 +670,7 @@ fn print_bootstrap_agent_line(state: &serde_json::Value) {
     eprintln!("  {mark} {agent}: {binary}");
     eprintln!(
         "        PATH: {} / 認証: {} / 次の一歩: {}",
-        if state["launcher_dir_on_path"].as_bool() == Some(true) {
-            "通っています"
-        } else {
-            "通っていません"
-        },
+        path_label(state),
         if state["authenticated"].as_bool() == Some(true) {
             "済み"
         } else {
@@ -689,6 +678,19 @@ fn print_bootstrap_agent_line(state: &serde_json::Value) {
         },
         state["next_step_description"].as_str().unwrap_or("")
     );
+}
+
+/// 導入状況の PATH の欄。新しいタブでだけ引ける（#2428。Windows でインストーラが足した直後）なら
+/// そう言う（「通っています」だけだと、このタブで打って見つからない）
+fn path_label(state: &serde_json::Value) -> &'static str {
+    match (
+        state["launcher_dir_on_path"].as_bool() == Some(true),
+        state["needs_new_tab"].as_bool() == Some(true),
+    ) {
+        (true, true) => "通っています（このタブには未反映。tako で新しいタブを開くと使えます）",
+        (true, false) => "通っています",
+        (false, _) => "通っていません",
+    }
 }
 
 /// 引き継ぎ計画の表示（誰へ・何を頼むか）
@@ -1098,10 +1100,14 @@ fn run_bootstrap_for(
                 return stuck(RemainingKind::AgentLogin(target), e);
             }
         } else {
+            // #2428: このタブから引けないなら、その場の全文と末尾の一覧の両方に新しいタブの 1 行が載る
             return stuck(
                 RemainingKind::AgentLogin(target),
-                setup_bootstrap::auth_instructions_for(target).join("\n"),
-            );
+                setup_bootstrap::auth_instructions_in(&state).join("\n"),
+            )
+            .into_iter()
+            .map(|item| item.noting_state(&state))
+            .collect();
         }
     }
     Vec::new()
@@ -3845,6 +3851,24 @@ fn print_context_budget_status() {
 mod tests {
     use super::*;
     use tako_control::setup::SetupConfig;
+
+    /// #2428: 新しいタブでだけ引けるなら、PATH の欄がそう言う（「通っています」だけで終えない）
+    #[test]
+    fn issue2428_新しいタブでだけ引けるならpathの欄で言い分ける() {
+        let label = |on_path: bool, needs_new_tab: Option<bool>| {
+            let mut value = serde_json::json!({ "launcher_dir_on_path": on_path });
+            if let Some(flag) = needs_new_tab {
+                value["needs_new_tab"] = serde_json::json!(flag);
+            }
+            path_label(&value)
+        };
+        assert!(label(true, Some(true)).contains("tako で新しいタブを開くと使えます"));
+        assert_eq!(label(true, Some(false)), "通っています");
+        // 欄が無い応答（#2428 前の GUI が返す JSON）は前の表示のまま
+        assert_eq!(label(true, None), "通っています");
+        assert_eq!(label(false, Some(true)), "通っていません");
+        assert_eq!(label(false, None), "通っていません");
+    }
 
     /// #2233: 読めない default.yaml の値を「現在の default」として見せない
     #[test]

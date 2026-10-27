@@ -190,6 +190,10 @@ pub struct WorkerLaunch<'a> {
     /// **claude だけが使う**（`--settings <path>`）。`None` は何も足さない = user scope を
     /// 全部持ち込む（#2412 前・止めるものが無い・`TAKO_2412_LEGACY=1`）
     pub mcp_settings: Option<&'a str>,
+    /// user 設定の MCP を止める codex の server（`worker_mcp::prepare` が決めたもの。Issue #2418）。
+    /// **codex だけが使う**（`-c mcp_servers.<名>.enabled=false` + 目印 = `worker_mcp::codex_off_args`）。
+    /// 空は何も足さない = user 設定を全部持ち込む（#2418 前・止めるものが無い・`TAKO_2418_LEGACY=1`）
+    pub mcp_codex_off: &'a [crate::worker_mcp::CodexOff],
     /// プロファイル + アカウント解決の env 計画（展開済み）。コマンド先頭で
     /// `export K=V;` / `unset K;` として注入し、direnv が同変数を設定していても
     /// 明示指定が勝つようにする（Issue #500 / #512）
@@ -209,6 +213,7 @@ impl Default for WorkerLaunch<'_> {
             extra_args: &[],
             tako_bin: None,
             mcp_settings: None,
+            mcp_codex_off: &[],
             env: &EMPTY_ENV_PLAN,
         }
     }
@@ -373,6 +378,14 @@ pub fn build_worker_cmd_in(
         if !legacy_no_worker_mcp() {
             cmd.push_str(&codex_mcp_args(tako_bin, dialect));
         }
+    }
+    // user 設定の MCP を止める（#2418）。codex だけ。プロファイルの args より**前**に置く
+    // （利用者が args に `-c mcp_servers.<名>.…` を書いていればそちらが後勝ちする）
+    if launch.agent == WorkerAgent::Codex {
+        cmd.push_str(&crate::worker_mcp::codex_off_args(
+            launch.mcp_codex_off,
+            dialect,
+        ));
     }
     for arg in launch.extra_args {
         cmd.push(' ');
@@ -746,6 +759,58 @@ mod tests {
             POSIX,
         );
         assert_eq!(none, "TAKO_ORCHESTRATOR_ROLE='worker:x' claude");
+    }
+
+    /// #2418: user 設定の MCP を止める `-c` は codex だけに、tako の MCP の一時注入の後・
+    /// プロファイルの args より前に付く（利用者の `-c` が後勝ちする）
+    #[test]
+    fn i2418_codexの絞り込みはtakoの注入の後でargsより前に付く() {
+        use crate::worker_mcp::CodexOff;
+        let args = vec!["--search".to_string()];
+        let off = [CodexOff {
+            name: "github".into(),
+            http: false,
+        }];
+        let codex = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Codex,
+                role: "worker:x",
+                extra_args: &args,
+                tako_bin: Some("/x/tako"),
+                mcp_codex_off: &off,
+                ..Default::default()
+            },
+            POSIX,
+        );
+        let tako_at = codex.find("mcp_servers.tako.env_vars").expect(&codex);
+        let off_at = codex
+            .find(" -c 'mcp_servers.github.enabled=false' -c 'mcp_servers.github.command=tako-disabled'")
+            .expect(&codex);
+        assert!(tako_at < off_at, "{codex}");
+        assert!(codex.ends_with("tako-disabled' --search"), "{codex}");
+        // claude / agy には付けない（codex の -c は他系統では即死する）
+        for agent in [WorkerAgent::Claude, WorkerAgent::Agy] {
+            let cmd = build_worker_cmd_in(
+                &WorkerLaunch {
+                    agent,
+                    role: "worker:x",
+                    mcp_codex_off: &off,
+                    ..Default::default()
+                },
+                POSIX,
+            );
+            assert!(!cmd.contains("enabled=false"), "{cmd}");
+        }
+        // 空は 1 バイトも足さない（#2418 前と同じ）
+        let none = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Codex,
+                role: "worker:x",
+                ..Default::default()
+            },
+            POSIX,
+        );
+        assert_eq!(none, "TAKO_ORCHESTRATOR_ROLE='worker:x' codex");
     }
 
     #[test]

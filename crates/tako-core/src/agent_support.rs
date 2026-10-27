@@ -545,12 +545,6 @@ pub mod notes {
         "The model runs on your own machine, so there is no vendor login to expire in the first place",
     );
 
-    /// #2412: codex は起動ごとに MCP を絞れそうだが、実行時に子が立たないことを確かめていない
-    pub const CODEX_MCP_SCOPE_NOT_MEASURED: Note = Note::new(
-        "起動ごとの `-c mcp_servers.<名>.enabled=false` で設定の上は止まる（codex-cli 0.154.0 の `codex mcp list --json`）が、実行時に子が立たないことを実測していないので、今は利用者の設定の MCP を全部持ち込む",
-        "A per-launch `-c mcp_servers.<name>.enabled=false` disables a server in the config (`codex mcp list --json`, codex-cli 0.154.0), but no run has confirmed the child is not started, so the user's MCP servers are still all brought along",
-    );
-
     /// #2412: agy は起動ごとに MCP を絞る手段が CLI に無い
     pub const AGY_NO_PER_LAUNCH_MCP: Note = Note::new(
         "起動ごとに MCP を絞る手段が CLI に無い（agy 1.4.7 の `--help` に `-c` / `--mcp-config` / `--settings` が無い。`agy mcp disable` は利用者自身の agy の設定を書き換えるので使わない）",
@@ -1765,11 +1759,11 @@ pub const MATRIX: &[AgentFeature] = &[
     AgentFeature {
         key: keys::WORKER_MCP_SCOPE,
         summary: Note::new(
-            "worker を tako の MCP だけで起動し、利用者の設定の MCP サーバーを持ち込まない（要るものはプロジェクトの mcp_servers で足す。#2412）",
-            "Workers start with only tako's MCP and do not bring along the user's own MCP servers (a project adds what it needs via mcp_servers; #2412)",
+            "worker を tako の MCP だけで起動し、利用者の設定の MCP サーバーを持ち込まない（要るものはプロジェクトの mcp_servers で足す。#2412 / #2418）",
+            "Workers start with only tako's MCP and do not bring along the user's own MCP servers (a project adds what it needs via mcp_servers; #2412 / #2418)",
         ),
         claude: S::Supported,
-        codex: pending(notes::CODEX_MCP_SCOPE_NOT_MEASURED, 2418),
+        codex: S::Supported,
         agy: unsupported(notes::AGY_NO_PER_LAUNCH_MCP),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Measured(
@@ -1779,7 +1773,13 @@ pub const MATRIX: &[AgentFeature] = &[
              同名は止めない。`--settings` を 2 つ渡すと後ろが勝つ。`--strict-mcp-config` は .mcp.json / local まで止め、\
              `--setting-sources project,local` は user の settings.json まで落とすので採らない。\
              組み立ては orchestrator::agent::build_worker_cmd（spawn / run / git resolve / 再開）、判断は worker_mcp::prepare の 1 実装。\
-             codex は `-c mcp_servers.<名>.enabled=false` が `codex mcp list --json` に効く（0.154.0）ところまで、\
+             codex は #2418 の実測（2026-10-27 / codex-cli 0.154.0・一時の CODEX_HOME + 偽 Responses API + 起動を記録する偽 MCP）: \
+             起動ごとの `-c mcp_servers.<名>.enabled=false` で止めた server の子プロセスは立たず、tako の MCP は立つ。\
+             config.toml に無い名前を `enabled=false` だけで渡すと `invalid transport` で起動しないので、読んだ transport と \
+             同じ種類の目印（stdio = command・http = url）を一緒に渡す（種類を違えると起動しない）。プロジェクトの \
+             `.codex/config.toml`（cwd から git の根まで・信頼済みのフォルダ）と同名の server は、止めるとプロジェクト側まで \
+             止まるので止めない。名前に `.`・空白を含む server は `-c` で表せない（付けると起動しない）ので持ち込む。\
+             codex の対象は spawn / run / git resolve（再起動後の復元の `codex resume` は起動の引数を持ち込まない）。\
              agy 1.4.7 は起動ごとの手段が無い",
         ),
     },

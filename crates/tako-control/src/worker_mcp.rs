@@ -36,7 +36,27 @@
 //! `CLAUDE_CONFIG_DIR` を差し替える環境では、tako には実際に読まれる dir が分からない。
 //! 実在しない名前を止めても何も起きないので、和をとる側に倒す。
 //!
-//! codex / agy の扱いは能力マトリクス（`worker_mcp_scope`）に宣言してある。
+//! # codex（Issue #2418。実測 codex-cli 0.154.0・一時の CODEX_HOME + 偽 Responses API + 起動を記録する偽 MCP）
+//!
+//! 判断（止める / 持ち込む / 同名は止めない）は claude と同じ [`plan`]。違うのは読む場所と渡し方だけ:
+//!
+//! - **user 設定**は `$CODEX_HOME/config.toml` の `[mcp_servers.*]` 1 本（[`codex_home_for`]）
+//! - **起動ごとに `-c mcp_servers.<名>.enabled=false`** で止める。実行時にその server の子は立たない
+//! - **知らない名前を `enabled=false` だけで渡すと codex が起動しない**（`invalid transport` で終了 1）。
+//!   tako が読んだ config.toml と worker のシェルが読むもの（`CODEX_HOME` を rc や direnv が差し替える）が
+//!   ずれても worker を落とさないよう、**読んだ transport と同じ種類の目印**（stdio = `command`・
+//!   http = `url`）を一緒に渡して、それだけで成り立つ項目にする（[`codex_off_args`]）。止めた項目なので
+//!   目印のコマンドが走ることは無い。種類を違えると（url の server に `command`）起動しない
+//! - `-c` のキーは `.` で区切られ引用符も効かないので、名前に `.` や空白などを含む server は止められない
+//!   （付けると起動しない）。警告して持ち込む
+//! - **プロジェクトの `.codex/config.toml` と同名は止めない**: プロジェクト側の定義が勝つが、
+//!   `enabled=false` は同名のプロジェクト側まで止める（claude の deny と同じ）。codex が読むのは
+//!   cwd から git の根まで（git が無ければ cwd だけ）の、信頼済みのフォルダの `.codex/config.toml`。
+//!   信頼は見ずに広めに数える（損をするのは同名の user 側を止め損ねるだけ）。祖先を無制限に辿ると
+//!   ホームの `~/.codex/config.toml`（user 設定そのもの）を拾って何も止めなくなるので、git の根で止める
+//! - config.toml が壊れていると codex 自身が起動しない。tako は何も足さずに警告する
+//!
+//! agy の扱いは能力マトリクス（`worker_mcp_scope`）に宣言してある。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -46,10 +66,25 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::orchestrator::agent::WorkerAgent;
-use crate::orchestrator::ProjectsConfig;
+use crate::orchestrator::{EnvPlan, ProjectsConfig};
 
 /// `mcp_servers` に書くと user scope を**全部持ち込む**（絞らない）印
 pub const KEEP_ALL: &str = "*";
+
+/// codex の止めた stdio の server へ渡す目印のコマンド（#2418。止めた項目なので走らない）。
+/// 引用符を使わない（TOML として読めない値は codex がそのまま文字列にする = `--help` の記述・実測。
+/// PowerShell 7.3 前の native 引数で `"` が落ちても同じ値になる）
+pub const CODEX_OFF_COMMAND: &str = "tako-disabled";
+
+/// codex の止めた http の server へ渡す目印の URL（同上。繋ぎに行くことは無い）
+pub const CODEX_OFF_URL: &str = "http://127.0.0.1:9/tako-disabled";
+
+/// codex の worker の A/B（`TAKO_2418_LEGACY=1` で codex だけ #2418 前 = user 設定を全部持ち込む）
+pub fn legacy_codex() -> bool {
+    std::env::var("TAKO_2418_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
 
 /// 実績として読む transcript の窓（最終更新がこれより新しいもの）
 pub const EVIDENCE_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -335,21 +370,39 @@ pub struct WorkerMcp {
     pub settings_file: Option<String>,
     /// 書き出す中身（[`WorkerMcp::materialize`] が書く）
     settings_body: Option<String>,
+    /// codex の起動コマンドで止める server（`-c mcp_servers.<名>.enabled=false`。#2418）。
+    /// claude / agy では常に空
+    pub codex_off: Vec<CodexOff>,
+    /// 読んだ codex の user 設定（応答の `config_file`。codex だけ）
+    pub config_file: Option<String>,
     /// 応答の warnings と persist.log へ出す文
     pub warnings: Vec<String>,
+}
+
+/// codex の worker で止める 1 つの server（#2418）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexOff {
+    pub name: String,
+    /// tako が読んだ定義が http（`url`）か。目印の種類を合わせる（違えると codex が起動しない）
+    pub http: bool,
 }
 
 impl WorkerMcp {
     /// 応答の `mcp` 欄
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "mode": self.mode,
             "denied": self.plan.denied,
             "kept": self.plan.kept,
             "missing": self.plan.missing,
             "shadowed": self.plan.shadowed,
             "settings_file": self.settings_file,
-        })
+        });
+        // codex は読んだ config.toml を見せる（worker のシェルが別の CODEX_HOME を読む食い違いの手がかり）
+        if let Some(file) = &self.config_file {
+            v["config_file"] = json!(file);
+        }
+        v
     }
 
     /// 設定ファイルを書く（中身が同じなら書かない）。起動の直前に呼ぶ
@@ -378,33 +431,55 @@ impl WorkerMcp {
 
 /// worker の MCP の構成を決める（ファイルは書かない。書くのは [`WorkerMcp::materialize`]）。
 ///
+/// `env` は起動する worker の env 計画（claude の config dir・codex の `CODEX_HOME` を引く）。
 /// `extra_args` はプロファイルの `worker_agents.claude.args`（`--settings` の重複の検査に使う）
 pub fn prepare(
     agent: WorkerAgent,
     cwd: &Path,
-    explicit_config_dir: Option<&str>,
+    env: &EnvPlan,
     keep: &[String],
     extra_args: &[String],
 ) -> WorkerMcp {
-    // codex / agy は能力マトリクス（worker_mcp_scope）のとおり今は絞らない
-    if agent != WorkerAgent::Claude {
-        return WorkerMcp {
+    match agent {
+        WorkerAgent::Claude => {
+            if legacy() {
+                return WorkerMcp {
+                    mode: "legacy",
+                    ..Default::default()
+                };
+            }
+            prepare_from(
+                cwd,
+                &user_scope_files(env.claude_config_dir().as_deref()),
+                keep,
+                extra_args,
+            )
+        }
+        WorkerAgent::Codex => {
+            if legacy() || legacy_codex() {
+                return WorkerMcp {
+                    mode: "legacy",
+                    ..Default::default()
+                };
+            }
+            match codex_home_for(env) {
+                Some(home) => prepare_codex_from(cwd, &home.join("config.toml"), keep),
+                None => WorkerMcp {
+                    mode: "unrestricted",
+                    warnings: vec![
+                        "codex の設定の置き場（CODEX_HOME）を決められないので、今回は user 設定の MCP を全部持ち込んで起動する"
+                            .to_string(),
+                    ],
+                    ..Default::default()
+                },
+            }
+        }
+        // agy は能力マトリクス（worker_mcp_scope）のとおり絞らない（起動ごとの手段が CLI に無い）
+        WorkerAgent::Agy => WorkerMcp {
             mode: "not_supported",
             ..Default::default()
-        };
+        },
     }
-    if legacy() {
-        return WorkerMcp {
-            mode: "legacy",
-            ..Default::default()
-        };
-    }
-    prepare_from(
-        cwd,
-        &user_scope_files(explicit_config_dir),
-        keep,
-        extra_args,
-    )
 }
 
 /// [`prepare`] の本体（claude の worker・読む `.claude.json` を引数で受ける = テストが一時 dir を渡す）
@@ -458,6 +533,175 @@ pub fn prepare_from(
         }
     }
     out
+}
+
+// --- codex（Issue #2418） -----------------------------------------------------
+
+/// codex の worker が読む `CODEX_HOME`。
+///
+/// env 計画の export（プロファイル / アカウントの `env:`）→ 明示の unset なら既定の `~/.codex` →
+/// 検証プロセスでは検証用のホームの `.codex`（本物の設定を読まない。usage の `codex_homes` と同じ）→
+/// tako の環境変数 `CODEX_HOME` → `~/.codex`
+pub fn codex_home_for(env: &EnvPlan) -> Option<PathBuf> {
+    const KEY: &str = "CODEX_HOME";
+    if let Some(v) = env.export_value(KEY).filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(v));
+    }
+    if env.unsets.iter().any(|k| k == KEY) || tako_core::paths::is_verification_process() {
+        return crate::orchestrator::agent_config_home().map(|h| h.join(".codex"));
+    }
+    crate::codex_session::codex_home()
+}
+
+/// codex の設定（TOML）の `mcp_servers`（名前 → 定義を JSON にしたもの）。
+/// ファイルが無ければ空。読めない・TOML として壊れていれば Err
+pub fn codex_servers(path: &Path) -> Result<BTreeMap<String, Value>, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(format!("{} を読めない: {e}", path.display())),
+    };
+    let root: Value = toml::from_str(&text)
+        .map_err(|e| format!("{} を TOML として読めない: {e}", path.display()))?;
+    Ok(root
+        .get("mcp_servers")
+        .and_then(Value::as_object)
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default())
+}
+
+/// codex がプロジェクトの `.codex/config.toml` を探すフォルダ: cwd から git の根まで
+/// （git が無ければ cwd だけ = 実測）。cwd と正規化した cwd の両方から辿る
+fn codex_project_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let canonical = tako_core::platform::path::canonicalize(cwd).ok();
+    for base in std::iter::once(cwd.to_path_buf()).chain(canonical) {
+        let chain: Vec<&Path> = base.ancestors().collect();
+        let root = chain.iter().position(|d| d.join(".git").exists());
+        let upto = root.map_or(1, |i| i + 1);
+        for dir in &chain[..upto] {
+            let dir = dir.to_path_buf();
+            if !out.contains(&dir) {
+                out.push(dir);
+            }
+        }
+    }
+    out
+}
+
+/// プロジェクトの `.codex/config.toml` で宣言された server 名（これと同名の user 設定は止めない）。
+/// user 設定そのもの（cwd がホームで `~/.codex/config.toml` を指す）は数えない。壊れたファイルは読み飛ばす
+pub fn codex_project_declared(cwd: &Path, user_config: &Path) -> BTreeSet<String> {
+    let same = |a: &Path, b: &Path| {
+        let norm =
+            |p: &Path| tako_core::platform::path::canonicalize(p).unwrap_or_else(|_| p.into());
+        a == b || norm(a) == norm(b)
+    };
+    let mut out = BTreeSet::new();
+    for dir in codex_project_dirs(cwd) {
+        let file = dir.join(".codex").join("config.toml");
+        if !file.is_file() || same(&file, user_config) {
+            continue;
+        }
+        if let Ok(servers) = codex_servers(&file) {
+            out.extend(servers.into_keys());
+        }
+    }
+    out
+}
+
+/// codex の `-c` のキーに書ける名前か。`codex mcp add` が許す文字（英数字・`-`・`_`・`:`・`@`・`/`・`.`）から
+/// `.` を除いたものに限る（キーは `.` で区切られ、引用符も効かない = 実測）。`:` `@` `/` と、手書きの
+/// config.toml の Unicode の英数字は `-c` で通る（実測）。空白などは止めずに持ち込む側へ倒す
+pub fn codex_name_expressible(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | ':' | '@' | '/'))
+}
+
+/// [`prepare`] の codex の本体（読む config.toml を引数で受ける = テストが一時 dir を渡す）
+pub fn prepare_codex_from(cwd: &Path, user_config: &Path, keep: &[String]) -> WorkerMcp {
+    let config_file = Some(user_config.display().to_string());
+    let user = match codex_servers(user_config) {
+        Ok(u) => u,
+        Err(e) => {
+            return WorkerMcp {
+                mode: "unrestricted",
+                config_file,
+                warnings: vec![format!(
+                    "codex の設定を読めないので、今回は user 設定の MCP に何も足さずに起動する: {e}"
+                )],
+                ..Default::default()
+            }
+        }
+    };
+    let declared = codex_project_declared(cwd, user_config);
+    let mut plan = plan(&user, &declared, keep);
+    let mut warnings: Vec<String> = plan
+        .missing
+        .iter()
+        .map(|name| {
+            format!(
+                "プロジェクトの mcp_servers の '{name}' は codex の config.toml にもプロジェクトの .codex/config.toml にも見つからない（今は何も足されない）"
+            )
+        })
+        .collect();
+    let (ok, odd): (Vec<String>, Vec<String>) = std::mem::take(&mut plan.denied)
+        .into_iter()
+        .partition(|n| codex_name_expressible(n));
+    for name in odd {
+        warnings.push(format!(
+            "codex の -c は名前の '.' や空白などを表せないので、'{name}' は止めずに持ち込む"
+        ));
+    }
+    plan.denied = ok;
+    let codex_off = plan
+        .denied
+        .iter()
+        .map(|name| CodexOff {
+            name: name.clone(),
+            http: user
+                .get(name)
+                .is_some_and(|d| d.get("command").is_none() && d.get("url").is_some()),
+        })
+        .collect();
+    WorkerMcp {
+        mode: if plan.keep_all {
+            "keep_all"
+        } else {
+            "tako_only"
+        },
+        plan,
+        codex_off,
+        config_file,
+        warnings,
+        ..Default::default()
+    }
+}
+
+/// codex の起動コマンドへ足す断片（`-c mcp_servers.<名>.enabled=false` + 目印。正本はこの 1 実装）。
+/// 空なら 1 バイトも足さない
+pub fn codex_off_args(off: &[CodexOff], dialect: crate::launch_cmd::ShellDialect) -> String {
+    use crate::launch_cmd as lc;
+    let mut s = String::new();
+    for o in off {
+        let name = &o.name;
+        let (key, value) = if o.http {
+            ("url", CODEX_OFF_URL)
+        } else {
+            ("command", CODEX_OFF_COMMAND)
+        };
+        s.push_str(&format!(
+            " -c {}",
+            lc::quote(dialect, &format!("mcp_servers.{name}.enabled=false"))
+        ));
+        s.push_str(&format!(
+            " -c {}",
+            lc::quote(dialect, &format!("mcp_servers.{name}.{key}={value}"))
+        ));
+    }
+    s
 }
 
 // --- 実績（移行で既定に残すもの） --------------------------------------------
@@ -787,13 +1031,224 @@ mod tests {
     }
 
     #[test]
-    fn claude以外は絞らない() {
+    fn agyは絞らない() {
         let t = tempdir();
-        for agent in [WorkerAgent::Codex, WorkerAgent::Agy] {
-            let mcp = prepare(agent, &t, None, &[], &[]);
-            assert_eq!(mcp.mode, "not_supported");
-            assert!(mcp.settings_file.is_none());
+        let mcp = prepare(
+            WorkerAgent::Agy,
+            &t,
+            &crate::orchestrator::EMPTY_ENV_PLAN,
+            &[],
+            &[],
+        );
+        assert_eq!(mcp.mode, "not_supported");
+        assert!(mcp.settings_file.is_none() && mcp.codex_off.is_empty());
+    }
+
+    // --- codex（#2418） ---
+
+    /// codex の config.toml を一時 dir に置く
+    fn codex_toml(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("codex-home").join("config.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    const CODEX_USER: &str = r#"
+model = "gpt-x"
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "github"]
+[mcp_servers.github.env]
+K = "v"
+[mcp_servers.web]
+url = "http://127.0.0.1:1/mcp"
+[mcp_servers.playwright]
+command = "npx"
+args = ["-y", "playwright"]
+[mcp_servers.tako]
+command = "/Applications/tako.app/Contents/MacOS/tako"
+args = ["mcp", "serve"]
+[projects."/x"]
+trust_level = "trusted"
+"#;
+
+    #[test]
+    fn codexは同じ判断でuser設定を止め足した名前とtakoは残す() {
+        let t = tempdir();
+        let cfg = codex_toml(&t, CODEX_USER);
+        let mcp = prepare_codex_from(&t, &cfg, &["playwright".into()]);
+        assert_eq!(mcp.mode, "tako_only");
+        assert_eq!(mcp.plan.denied, ["github", "web"]);
+        assert_eq!(mcp.plan.kept, ["playwright"]);
+        assert_eq!(mcp.plan.tako, ["tako"]);
+        // 目印は読んだ transport と同じ種類（url の server に command を足すと codex が起動しない）
+        assert_eq!(
+            mcp.codex_off,
+            [
+                CodexOff {
+                    name: "github".into(),
+                    http: false
+                },
+                CodexOff {
+                    name: "web".into(),
+                    http: true
+                },
+            ]
+        );
+        assert!(mcp.settings_file.is_none() && mcp.warnings.is_empty());
+        assert_eq!(
+            mcp.to_json()["config_file"],
+            json!(cfg.display().to_string())
+        );
+    }
+
+    #[test]
+    fn codexのインライン表と根の点つきキーも読む() {
+        let t = tempdir();
+        // `[mcp_servers]` の下のインライン表（codex は実測で読む）
+        let cfg = codex_toml(
+            &t,
+            "[mcp_servers]\ninline = { command = \"y\", args = [] }\nhttp = { url = \"http://h/mcp\" }\n",
+        );
+        let mcp = prepare_codex_from(&t, &cfg, &[]);
+        assert_eq!(mcp.plan.denied, ["http", "inline"]);
+        assert!(mcp.codex_off.iter().any(|o| o.name == "http" && o.http));
+        assert!(mcp.codex_off.iter().any(|o| o.name == "inline" && !o.http));
+        // 根の点つきキー（同じファイルで `[mcp_servers]` と混ぜると TOML として二重定義）
+        let cfg = codex_toml(
+            &t,
+            "model = \"m\"\nmcp_servers.dotted.command = \"x\"\nmcp_servers.web.url = \"http://h\"\n",
+        );
+        let mcp = prepare_codex_from(&t, &cfg, &[]);
+        assert_eq!(mcp.plan.denied, ["dotted", "web"]);
+    }
+
+    #[test]
+    fn codexのプロジェクト設定と同名は止めず_git_の根まで探す() {
+        let t = tempdir();
+        let cfg = codex_toml(&t, CODEX_USER);
+        let repo = t.join("repo");
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(sub.join(".git-not")).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".codex")).unwrap();
+        std::fs::write(
+            repo.join(".codex/config.toml"),
+            "[mcp_servers.github]\ncommand = \"proj\"\n",
+        )
+        .unwrap();
+        // cwd が git の根の下 → 根の .codex を読む
+        let mcp = prepare_codex_from(&sub, &cfg, &[]);
+        assert_eq!(mcp.plan.shadowed, ["github"]);
+        assert_eq!(mcp.plan.denied, ["playwright", "web"]);
+        // git が無ければ cwd の .codex だけ（祖先は読まない = codex と同じ）
+        std::fs::remove_dir_all(repo.join(".git")).unwrap();
+        let mcp = prepare_codex_from(&sub, &cfg, &[]);
+        assert!(mcp.plan.shadowed.is_empty(), "{:?}", mcp.plan.shadowed);
+        assert_eq!(mcp.plan.denied, ["github", "playwright", "web"]);
+        let mcp = prepare_codex_from(&repo, &cfg, &[]);
+        assert_eq!(mcp.plan.shadowed, ["github"]);
+    }
+
+    #[test]
+    fn codexのuser設定そのものはプロジェクト側と数えない() {
+        // cwd がホーム = `<cwd>/.codex/config.toml` が user 設定そのもの
+        let t = tempdir();
+        let home = t.join("home");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        let cfg = home.join(".codex/config.toml");
+        std::fs::write(&cfg, CODEX_USER).unwrap();
+        let mcp = prepare_codex_from(&home, &cfg, &[]);
+        assert!(mcp.plan.shadowed.is_empty(), "{:?}", mcp.plan.shadowed);
+        assert_eq!(mcp.plan.denied, ["github", "playwright", "web"]);
+    }
+
+    #[test]
+    fn codexの設定が無ければ何も足さず壊れていれば警告する() {
+        let t = tempdir();
+        let none = prepare_codex_from(&t, &t.join("nope/config.toml"), &[]);
+        assert_eq!(none.mode, "tako_only");
+        assert!(none.codex_off.is_empty() && none.warnings.is_empty());
+        let cfg = codex_toml(&t, "[mcp_servers.a\ncommand = ");
+        let broken = prepare_codex_from(&t, &cfg, &[]);
+        assert_eq!(broken.mode, "unrestricted");
+        assert!(broken.codex_off.is_empty());
+        assert!(
+            broken.warnings.iter().any(|w| w.contains("TOML")),
+            "{:?}",
+            broken.warnings
+        );
+    }
+
+    #[test]
+    fn codexの_c_で表せない名前は止めずに警告する() {
+        let t = tempdir();
+        let cfg = codex_toml(
+            &t,
+            "[mcp_servers.\"my.server\"]\ncommand = \"x\"\n[mcp_servers.\"a b\"]\ncommand = \"x\"\n[mcp_servers.\"名前\"]\ncommand = \"x\"\n[mcp_servers.\"@scope/x:1\"]\ncommand = \"x\"\n",
+        );
+        let mcp = prepare_codex_from(&t, &cfg, &[]);
+        // `codex mcp add` が許す `:` `@` `/` と Unicode の英数字は通る（実測）
+        assert_eq!(mcp.plan.denied, ["@scope/x:1", "名前"]);
+        for n in ["my.server", "a b"] {
+            assert!(mcp.warnings.iter().any(|w| w.contains(n)), "{n}");
         }
+    }
+
+    #[test]
+    fn codexで足した名前がどこにも無ければ警告し星は全部持ち込む() {
+        let t = tempdir();
+        let cfg = codex_toml(&t, CODEX_USER);
+        let mcp = prepare_codex_from(&t, &cfg, &["coplay-mcp".into()]);
+        assert_eq!(mcp.plan.missing, ["coplay-mcp"]);
+        assert!(mcp.warnings.iter().any(|w| w.contains("coplay-mcp")));
+        let all = prepare_codex_from(&t, &cfg, &["*".into()]);
+        assert_eq!(all.mode, "keep_all");
+        assert!(all.codex_off.is_empty());
+    }
+
+    #[test]
+    fn codexの_c_の断片は止める宣言と目印の組() {
+        use crate::launch_cmd::ShellDialect::{Posix, PowerShell};
+        let off = [
+            CodexOff {
+                name: "github".into(),
+                http: false,
+            },
+            CodexOff {
+                name: "web".into(),
+                http: true,
+            },
+        ];
+        assert_eq!(
+            codex_off_args(&off, Posix),
+            " -c 'mcp_servers.github.enabled=false' -c 'mcp_servers.github.command=tako-disabled' \
+             -c 'mcp_servers.web.enabled=false' -c 'mcp_servers.web.url=http://127.0.0.1:9/tako-disabled'"
+        );
+        // PowerShell も単引用符（中に " を使わない = 7.3 前の native 引数でも値が変わらない）
+        let ps = codex_off_args(&off[..1], PowerShell);
+        assert_eq!(
+            ps,
+            " -c 'mcp_servers.github.enabled=false' -c 'mcp_servers.github.command=tako-disabled'"
+        );
+        assert!(!ps.contains('"'));
+        assert_eq!(codex_off_args(&[], Posix), "");
+    }
+
+    #[test]
+    fn codex_home_は_env_計画の_export_を先に見る() {
+        let plan = EnvPlan {
+            exports: vec![("CODEX_HOME".into(), "/tmp/ch".into())],
+            unsets: vec![],
+        };
+        assert_eq!(codex_home_for(&plan), Some(PathBuf::from("/tmp/ch")));
+        // テストのプロセスでは本物の CODEX_HOME / ~/.codex を読まない（検証用のホーム）
+        let fallback = codex_home_for(&crate::orchestrator::EMPTY_ENV_PLAN);
+        assert_eq!(
+            fallback,
+            crate::orchestrator::agent_config_home().map(|h| h.join(".codex"))
+        );
     }
 
     #[test]
