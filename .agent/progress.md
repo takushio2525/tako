@@ -20,45 +20,6 @@
 
 ---
 
-## 2026-10-25（#2284 の再発: 真因はテスト = 看取った `Child` を drop してから読み、Windows が再利用した pid の別プロセスを `Alive` と読んだ → `process::ReapedChild` を持ったまま読む）
-- 注入 `TAKO_2284_INJECT_REUSE` で修正前は CI と同じ `lid.rs:1071` で FAILED → 修正後 ok（macOS / Windows）・カタログ +0 B。PR #2385
-
-## 2026-10-25（#2387: issue1977 の LSP の古い版の片付けのテストの `dead_pid()` を `reaped_child()` へ。test_data_residue の `reaped_pid` は対象外として conventions に例外を記録）
-- 注入で修正前 `:548` FAILED → 修正後 ok・並列 24/24 × 2・カタログ +0 B。PR #2389
-
-## 2026-10-25（#2350: 端末の問い合わせ（OSC 10/11/12/4・CSI ? 996 n・CSI 14 t）に答え、mode 2031 を購読した器（tmux）へテーマの切り替えを知らせる・OSC 52 の読み出しは断る・check-health の `terminal_queries`）
-- 修正前は色と 14 t が無応答（器越しは OSC 4 の後 5.5 秒止まる）→ 修正後は両方で答えテーマにも追従・カタログ +63 B。PR #2382
-
-## 2026-10-25（#2365 の 3 本目: 保存の断りに添える案内を `Reason` へ移し、プレビュー・編集・ファイル操作・ペイン / タブ操作の断り 34 種を足した（51 → 85 種））
-- 実経路 修正前 PASS=157 FAIL=44 → 修正後 PASS=201・日本語表示 63 本バイト一致・注入 4 通り・カタログ +0 B。PR #2390
-
-## 2026-10-25（#2393: 実 tmux のテストが `kill-server` の後にソケットファイルを残していた件を、失敗の経路も含めて `remove_socket_file` / `kill_server` する形へ。番犬 `テストが落とした器はソケットファイルまで消す`）
-- 修正前 1 回 5 個 → 修正後 0（失敗の経路の注入も 0）・番犬は main の版で 10 か所を名指し・カタログ +0 B。PR #2396
-
-## 2026-10-25（#2391: 走らせた人の env（TAKO_ISOLATED / TAKO_SELF_TEST / TAKO_DATA_DIR）で結果が変わるテスト 6 本を、env を組んだ子プロセスで見る形へ）
-- tako-core 全テスト × env 5 通りの修正前の赤 → 修正後は全部緑・tako-control + tako-cli の 4 failed → 0・注入 3 通り・カタログ +0 B。PR #2397
-
-## 2026-10-25（#2365 の続き: `tako mod ui` の断り（UiError 一式）を日英の網羅 match へ。setup / persist.log / migrate は日本語固定）
-- A/B 25 件で日本語はバイト一致・英語表示の日本語 25 → 0・注入 5 通りで file:line を名指し・カタログ +0 B。PR #2394
-
-## 2026-10-25（#2395: usage の索引のテストが A/B の env をプロセス全体に立て、並走する codex の区間按分のテストまで旧挙動にしていた → `walk_with(s5_legacy)` へ分け、テストは env を立てない）
-- 順序を固定する注入で修正前は CI と同じ assert で FAILED → 修正後 ok・usage 50 回緑・カタログ +0 B。時限の 2 本は #2402。PR #2398
-
-## 2026-10-25（#1899 の 1 点目: 全文を 1 つの TextEdit で返す整形を行ごとの置き換えへ割る = `text_diff::changed_regions` + `text_edit::line_split`。割って undo が軽くなるときだけ割る）
-- 10 万行で undo 17.4 MB・深さ 1 → 2.6 MB・深さ 2・本文はバイト一致・A/B `TAKO_1899_LEGACY=1`・カタログ +0 B。CLI の実経路は未実測。PR #2401
-
-## 2026-10-25（#2365 の続き: ファイルの移動・コピーの断りを理由ごと（`MoveRefusal` / `CopyRefusal` の `text_in` + dispatch の `Reason`）日英の網羅 match へ）
-- 実経路 14 件で英語表示の日本語 14 → 0・日本語はバイト一致・注入 3 通りで file:line を名指し・カタログ +0 B。PR #2404
-
-## 2026-10-25（#2402: usage::index の claude 系テストの固定日付が 2027-11 以降に月の掃除で消えて落ちる時限 → 実時間の 2 日前の正午からの相対へ・製品は無変更）
-- `now_ms()` を 400 日ずらす注入で修正前 2 本 FAILED → 修正後は月末の境界も含め全通過・カタログ +0 B。PR #2405
-
-## 2026-10-25（#2400: env を書く lib のテスト 62 本と結合テスト 5 本を `tako_core::run_alone!`（その 1 本だけの子）へ・env 専用ロック 5 つを撤去・番犬 `issue2400_test_env_write_watchdog`）
-- 並走の注入で修正前 3/3 FAILED → 修正後 3/3 ok・番犬は注入で名指し・カタログ +0 B。PR #2409
-
-## 2026-10-26（10/25 夜の PC 停止の調査: メモリ枯渇 → Jetsam → watchdog のカーネルパニック（3 回目）。主因は agent の常駐 = claude 1 本ごとに user scope の MCP 12〜15 プロセス）
-- 記録は #1992 のコメント。ユーザー判断で #2412（worker は tako の MCP だけ）・#2413（逼迫中は起動を待たせる）を起票
-
 ## 2026-10-26（#1308 の再発: respond の実 PTY テストの fixture をログインシェル経由から `/bin/sh -c` の直接起動へ・失敗文の値を `TAKO_1308_WAIT` の 1 行へ）
 - 注入 `stuck` / `deaf` で修正前は同じ行で FAILED → 修正後 ok・単独 20/20・カタログ +0 B。同じ形の残り 3 か所は #2415。PR #2410
 
@@ -79,3 +40,42 @@
 
 ## 2026-10-26（#2365 の続き: `tako mod`（status / on / off / band / install / uninstall）の応答と CLI の表示を日英の網羅 match へ・置き場の断り `paths::NoDataDir`）
 - A/B で英語表示の応答 14 → 0・CLI の表示 12 → 0・日本語はバイト一致・注入 4 通り・カタログ +0 B。PR #2423
+
+## 2026-10-27（#2416: mod の報告のテストの ui.json の置き場が同じ TAKO_DATA_DIR で前の回の残りを読んでいた → MockHost ごとの `ScratchDir` へ）
+- 修正前は同じ dir の 2 回目で 1960 が必ず FAILED → 修正後は連続 3 回・並列 2〜4 プロセスで全部緑・カタログ +0 B。PR #2436
+
+## 2026-10-28（#2411: issue2367 の旧挙動の腕の間欠の真因はテスト = 理由を tmux の代替画面から読んでいた → stderr から採り、終了と fd の空きを状態待ちへ）
+- 注入 `late-read` で旧 0/5 → 新 5/5・30 回 × 並列 1 / 4 で全通過・カタログ +0 B。PR #2442
+
+## 2026-10-28（#2406: ネスト tmux 越しのホイールの e2e の間欠 = 起動中にマウス要求が外れる窓へ 1 発だけのホイールが落ちていた → 器のペイン側の要求で待ち、遡るまで打ち直す）
+- 注入 `TAKO_2406_INJECT=gap` で修正前 FAILED → 修正後 ok・30 回 × 並列 1 / 4 で全通過・カタログ +0 B。PR #2439
+
+## 2026-10-28（#2428: Windows の新しいペインがレジストリの PATH を読み直す・setup の「次の 1 手」に「新しいタブを開いて」を添える）
+- check-windows / clippy 3 種 / test が緑・Windows 専用の実 ConPTY テストで A/B・カタログ +0 B。Windows 実機は未検証（Refs）。PR #2440
+
+## 2026-10-28（#2418: codex の worker も tako の MCP とプロジェクトで足した MCP だけで起動 = `-c mcp_servers.<名>.enabled=false`・`projects mcp` に `codex_plan`）
+- マトリクスの codex 列は supported。PR #2437
+
+## 2026-10-28（#724: Windows の Web ビューの生成を App の借用の外で 1 本ずつ・Windows では ipc を付けない・生成中に落ちた Web ビューを次の起動で保留）
+- macOS 実経路 sync 7/7・async 24/24・番犬は注入 2 通りで名指し・カタログ +0 B。Windows 実機は未確認（Refs）。PR #2444
+
+## 2026-10-28（#2247: 「Finder で表示」を tako 自身の NSWorkspace で Finder を前面へ出す 1 実装にし、プレビュー・設定画面も dispatch へ寄せた）
+- A/B `TAKO_2247_LEGACY=1`・実経路 18 PASS・カタログ +0 B。本物の Finder は install 後に確認（`tako todo` u-86）。PR #2441
+
+## 2026-10-28（#2426: #2413 の e2e の 2 件 = 起動待ちから起こした run の run_status が `launch_waiting` のまま残る・e2e が master の役割を付けていなかった）
+- e2e PASS 46 / FAIL 0（修正前 40 / 2）・単体 3 本は修正前 FAILED → 修正後 ok・カタログ +0 B。PR #2438
+
+## 2026-10-28（#1599: Windows の `platform::process::terminate` を実装・remote の停止 2 経路を `stop_verified_daemon` へ寄せ、止められなければ Err）
+- 注入で実プロセス 5 本 / 番犬 3 通りが名指しで FAILED・実 daemon で 3 経路を確認・カタログ +0 B。stale 経路は #2455。PR #2449
+
+## 2026-10-28（CI の macOS ジョブの上限を 60 → 90 分へ・CI 待ちの既定 4800 → 6600 秒）
+- PR の CI が重なると 60 分で打ち切られていた（10/27 に 2 本）。PR #2450
+
+## 2026-10-28（#2434: Windows のアプリ内更新 = インストーラーの検査（取得元・大きさ・sha256・PE）→ 無言の起動 → tako が抜けてから入れ替え → 起動し直し）
+- カタログ +194 B。実機の通しは未実測（Refs）。PR #2443
+
+## 2026-10-28（#2432: Windows のシェル統合を `$PROFILE` に書かず、ペインの PowerShell を `-NoExit -EncodedCommand` で起こして読ませる。旧ブロックは移行 `powershell_profile` が外す）
+- macOS の pwsh 実物で確認・Windows CI で Restricted 相当の e2e・カタログ +74 B。実機と psmux は未検証（Refs）。PR #2457
+
+## 2026-10-28（#2435: Windows の `\` の形のパス（`C:\…`・UNC・`src\main.rs:10:5`）をリンクの候補にする・ignore 5 本を外す）
+- 単体 68 本 + dispatch 2 本・CLI 実経路 8/8（macOS）・注入で 2 本が落ちる・カタログ +0 B。実機の Ctrl+クリックは未（Refs）。PR #2456
