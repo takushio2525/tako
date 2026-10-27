@@ -53,12 +53,14 @@ fn item_body<'a>(src: &'a str, head: &str) -> &'a str {
     let start = src
         .find(head)
         .unwrap_or_else(|| panic!("{head} が見つからない（関数名を変えたら番犬も直す）"));
+    // 切り出し安全: find が返した位置に ASCII の head の長さを足した位置
     let rest = &src[start + head.len()..];
     let end = ["\nfn ", "\npub fn ", "\n#[cfg", "\n/// ", "\n#[derive"]
         .iter()
         .filter_map(|m| rest.find(m))
         .min()
         .unwrap_or(rest.len());
+    // 切り出し安全: 両端とも find が返した位置（+ ASCII の長さ）
     &src[start..start + head.len() + end]
 }
 
@@ -68,6 +70,7 @@ fn restart_windows_arm(src: &str) -> &str {
     let at = body
         .find("Restart::RunInstaller(")
         .expect("restart_app に Windows の枝（Restart::RunInstaller）が無い");
+    // 切り出し安全: find が返した位置
     &body[at..]
 }
 
@@ -148,7 +151,9 @@ fn param_name(src: &str, constant: &str) -> String {
     let at = src
         .find(&head)
         .unwrap_or_else(|| panic!("{ARM} に {constant} が無い"));
+    // 切り出し安全: find が返した位置に ASCII の head の長さを足した位置
     let rest = &src[at + head.len()..];
+    // 切り出し安全: find が返した ASCII の `"` の位置
     rest[..rest.find('"').expect("閉じの引用符")].to_string()
 }
 
@@ -188,7 +193,9 @@ fn 番犬はwindowsの腕へ戻った展開コマンドを名指す() {
     let at = checker.find(head).expect("update_via_installer");
     let injected = format!(
         "{}{head}info: &UpdateInfo) {{ std::process::Command::new(\"ditto\"); }}\n{}",
+        // 切り出し安全: find が返した位置（+ ASCII の head の長さ）
         &checker[..at],
+        // 切り出し安全: 同上
         &checker[at + head.len()..]
     );
     let found = mac_tools_in(item_body(&injected, head));

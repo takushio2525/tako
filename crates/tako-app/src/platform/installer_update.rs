@@ -179,7 +179,9 @@ pub fn installer_args(log_path: &Path, wait_pid: u32, relaunch: &Path) -> Vec<In
 /// Windows のコマンドラインの尾（Inno Setup の書式どおり `/名前="値"`）。
 ///
 /// std の引数の引用（引数全体を `"` で囲む）に頼らず、Inno Setup の説明書の形
-/// （`/LOG="filename"`）で組む。Windows のパスは `"` を含められないので値の引用はこれで閉じる
+/// （`/LOG="filename"`）で組む。Windows のパスは `"` を含められないので値の引用はこれで閉じる。
+/// 起動で使うのは Windows だけ（他の OS では単体テストが形を確かめる）
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn command_tail(args: &[InstallerArg]) -> String {
     args.iter()
         .map(|arg| match arg {
@@ -392,7 +394,9 @@ pub fn launch(
     let args = installer_args(&prepared.log_path, wait_pid, relaunch);
     let mut cmd = Command::new(&prepared.path);
     imp::push_args(&mut cmd, &args);
-    cmd.stdin(Stdio::null())
+    // インストーラーは GUI なので窓の有無は変わらないが、GUI から起こす子は境界を通す（#586）
+    tako_core::platform::process::no_console_window(&mut cmd)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -570,7 +574,9 @@ mod tests {
         for bad in [
             hex.to_string(),
             format!("sha512:{hex}"),
+            // 切り出し安全: hex は 16 進の ASCII だけ
             format!("sha256:{}", &hex[1..]),
+            // 切り出し安全: 同上
             format!("sha256:{}zz", &hex[2..]),
             String::new(),
         ] {
@@ -590,7 +596,8 @@ mod tests {
         assert_eq!(std::fs::read(&part).unwrap(), body);
 
         // 途中で切れた（足りないまま終わった）
-        let short = &body[..150_000];
+        // 切り出し安全: body はバイト列（Vec<u8>）で、文字列ではない
+        let short: &[u8] = &body[..150_000];
         assert_eq!(
             receive(Cursor::new(short.to_vec()), &part, 200_000, &sha),
             Err(InstallerError::Size {
@@ -643,6 +650,7 @@ mod tests {
                 ));
             }
             let n = buf.len().min(self.at - self.pos);
+            // 切り出し安全: data はバイト列（Vec<u8>）で、文字列ではない
             buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
             self.pos += n;
             Ok(n)
@@ -681,6 +689,7 @@ mod tests {
             );
             let _ = stream.write_all(head.as_bytes());
             let end = cut.unwrap_or(body.len()).min(body.len());
+            // 切り出し安全: body はバイト列（Vec<u8>）で、文字列ではない
             let _ = stream.write_all(&body[..end]);
             let _ = stream.flush();
             // 切るときはそのまま閉じる（Content-Length に足りないまま終わる）
@@ -791,14 +800,14 @@ mod tests {
              /TAKOWAITPID=4242 \
              /TAKORELAUNCH=\"C:\\Users\\testuser\\AppData\\Local\\Programs\\tako\\tako-app.exe\""
         );
-        // 空白入りのパス（ユーザー名に空白がある）も値だけを引用して 1 つの指定に収める
+        // 空白入りのパス（ユーザー名やフォルダ名に空白がある）も値だけを引用して 1 つの指定に収める
         let spaced = command_tail(&[InstallerArg::Path(
             RELAUNCH_PARAM,
-            PathBuf::from(r"C:\Users\Yamada Taro\tako-app.exe"),
+            PathBuf::from(r"C:\Program Files\tako test\tako-app.exe"),
         )]);
         assert_eq!(
             spaced,
-            r#"/TAKORELAUNCH="C:\Users\Yamada Taro\tako-app.exe""#
+            r#"/TAKORELAUNCH="C:\Program Files\tako test\tako-app.exe""#
         );
         // 再起動を OS に任せない・ウィザードを出さない、は欠かせない
         for must in ["/NORESTART", "/SUPPRESSMSGBOXES", "/SILENT"] {
@@ -811,7 +820,7 @@ mod tests {
         let install = Path::new(r"C:\Users\testuser\AppData\Local\Programs\tako\");
         for exe in [
             r"C:\Users\testuser\AppData\Local\Programs\tako\tako-app.exe",
-            r"c:\users\TESTUSER\appdata\local\programs\TAKO\tako-app.exe",
+            r"c:\USERS\testuser\APPDATA\local\programs\TAKO\tako-app.exe",
             r"\\?\C:\Users\testuser\AppData\Local\Programs\tako\tako-app.exe",
             "C:/Users/testuser/AppData/Local/Programs/tako/tako-app.exe",
         ] {
