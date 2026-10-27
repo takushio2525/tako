@@ -230,7 +230,11 @@ pub struct BootstrapState {
     pub account_plan: Option<String>,
     /// ランチャーの置き場所が PATH に入っているか
     pub launcher_dir: PathBuf,
+    /// 「新しく開いたターミナル（tako の新しいタブを含む）が見る PATH」に入っているか
     pub launcher_dir_on_path: bool,
+    /// **いまのプロセスの PATH** に入っているか（#2428）。`tako setup` をペインから打ったなら、
+    /// そのタブで引けるか。`launcher_dir_on_path` だけが立っているなら、新しいタブを開けば引ける
+    pub launcher_dir_on_process_path: bool,
     /// PATH 追記の書き先（判定できないシェルなら None）
     pub profile: Option<PathBuf>,
     pub profile_has_block: bool,
@@ -266,6 +270,20 @@ impl BootstrapState {
         }
     }
 
+    /// このタブでは引けないが、tako の新しいタブなら引ける（#2428）。
+    /// 立つのは新しいペインがレジストリの PATH を読み直す環境（Windows）だけ。unix の判定と文面は変えない
+    pub fn needs_new_tab(&self) -> bool {
+        self.needs_new_tab_in(user_path::rereads_for_new_panes())
+    }
+
+    /// [`Self::needs_new_tab`] の本体（読み直すかを引数で受ける**純粋関数**）
+    fn needs_new_tab_in(&self, rereads: bool) -> bool {
+        rereads
+            && self.binary.is_some()
+            && self.launcher_dir_on_path
+            && !self.launcher_dir_on_process_path
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "agent": self.agent.as_str(),
@@ -276,6 +294,9 @@ impl BootstrapState {
             "account_plan": self.account_plan,
             "launcher_dir": self.launcher_dir.display().to_string(),
             "launcher_dir_on_path": self.launcher_dir_on_path,
+            // #2428: いまのプロセスで引けるか / 新しいタブを開けば引けるか
+            "launcher_dir_on_process_path": self.launcher_dir_on_process_path,
+            "needs_new_tab": self.needs_new_tab(),
             "profile": self.profile.as_ref().map(|p| p.display().to_string()),
             "profile_has_block": self.profile_has_block,
             "shell": self.shell.map(ShellKind::as_str),
@@ -362,6 +383,44 @@ pub fn auth_instructions_for(agent: AgentKind) -> Vec<String> {
     }
     out.push("ログインしたら tako setup をやり直してください".to_string());
     out
+}
+
+/// [`auth_instructions_for`] に、いまの導入状況から言えることを添えたもの（#2428）。
+///
+/// このタブからは引けないが新しいタブなら引けるとき、「次の 1 手」の**手前**に
+/// 新しいタブを開く 1 行を入れる（打ってから「見つからない」と言われる前に読める位置）
+pub fn auth_instructions_in(state: &BootstrapState) -> Vec<String> {
+    with_new_tab_note(auth_instructions_for(state.agent), new_tab_note(state))
+}
+
+/// 案内の行へ新しいタブの 1 行を差し込む（**純粋関数**）
+fn with_new_tab_note(mut lines: Vec<String>, note: Option<String>) -> Vec<String> {
+    if let Some(note) = note {
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("次の 1 手"))
+            .unwrap_or(lines.len());
+        lines.insert(at, note);
+    }
+    lines
+}
+
+/// [`BootstrapState::needs_new_tab`] のときに添える 1 行（**文面の正本はここ**。#2428）。
+///
+/// tako の新しいタブはレジストリの PATH を読み直す（`user_path::pane_path`）ので、
+/// tako 自体の再起動は要らない。外のターミナルも、新しく開けば同じ値を読む
+pub fn new_tab_note(state: &BootstrapState) -> Option<String> {
+    state
+        .needs_new_tab()
+        .then(|| new_tab_note_text(state.agent))
+}
+
+fn new_tab_note_text(agent: AgentKind) -> String {
+    format!(
+        "このタブは {} の置き場所が PATH に入る前に開いたので、ここからはまだ引けません。\
+         tako で新しいタブを開いてから打ってください（tako の再起動は要りません）",
+        agent.as_str()
+    )
 }
 
 /// `TAKO_1129_LEGACY=1` で修正前（tako が `claude auth login` を起こす）へ戻す。
@@ -695,7 +754,8 @@ fn status_with(
     let (auth, auth_timeout) = binary.as_deref().map(auth).unwrap_or_default();
     let authenticated = auth.authenticated;
     let launcher_dir = r.launcher_dir_in(&home);
-    let (on_path, path_timeout) = launcher_dir_on_path(&launcher_dir, &found);
+    let (reach, path_timeout) = launcher_dir_on_path(&launcher_dir, &found);
+    let on_path = reach.new_terminal;
     let (shell, profile) = shell_target();
     let profile_has_block = profile
         .as_deref()
@@ -718,6 +778,7 @@ fn status_with(
         account_plan: auth.plan,
         launcher_dir,
         launcher_dir_on_path: on_path,
+        launcher_dir_on_process_path: reach.this_process,
         profile,
         profile_has_block,
         shell,
@@ -829,26 +890,66 @@ pub fn status_all_json() -> Value {
 /// PATH の探索がいま打ち切られたなら PATH は読みに行かない（同じログインシェルへ尋ねても上限まで
 /// 待つだけ）。そのときの「確かめられなかった」は [`BootstrapState::step_unconfirmed`] が探索の
 /// 知らせから読む
+///
+/// ## 「新しいターミナル」と「いまのプロセス」を分ける（#2428）
+///
+/// 戻り値の 1 つ目は両方を持つ。Windows ではレジストリに入っただけでは**いまのタブには届かない**
+/// （PATH はプロセスの起動時に 1 回だけ渡る）ので、「PATH に在る」だけで「次の 1 手」を出すと、
+/// そのタブで打った人には「見つからない」になる。新しいペインの PATH は
+/// `user_path::reach` がペインの実物（`user_path::pane_path`）と同じ組み方で見る
 fn launcher_dir_on_path(
     dir: &Path,
     found: &tako_core::platform::exe::BoundedFind,
-) -> (bool, Option<tako_core::probe::TimeoutNotice>) {
+) -> (PathReach, Option<tako_core::probe::TimeoutNotice>) {
     let path_var = std::env::var("PATH").unwrap_or_default();
     if user_path::is_supported() && !legacy_mode() {
-        let on_path = user_path::contains_entry(&path_var, dir)
+        if user_path::rereads_for_new_panes() {
+            let reach = user_path::reach(dir);
+            return (
+                PathReach {
+                    new_terminal: reach.new_pane,
+                    this_process: reach.this_process,
+                },
+                None,
+            );
+        }
+        // `TAKO_2428_LEGACY=1`: #2428 前（ユーザー PATH を PowerShell で読み、いまのタブと区別しない）
+        let this_process = user_path::contains_entry(&path_var, dir);
+        let on_path = this_process
             || user_path::read()
                 .map(|value| user_path::contains_entry(&value.raw, dir))
                 .unwrap_or(false);
-        return (on_path, None);
+        return (
+            PathReach {
+                new_terminal: on_path,
+                this_process,
+            },
+            None,
+        );
     }
+    let this_process = shell_profile::path_contains(&path_var, dir);
+    let reach = |new_terminal| PathReach {
+        new_terminal,
+        this_process,
+    };
     // どれか 1 つで「在る」（判定の順は答えを変えない）。ログインシェルを起こす段を最後に置く
-    if shell_profile::path_contains(&path_var, dir) || found.path.is_some() {
-        return (true, None);
+    if this_process || found.path.is_some() {
+        return (reach(true), None);
     }
     if found.timeout.is_some() {
-        return (false, None);
+        return (reach(false), None);
     }
-    login_shell_sees(dir)
+    let (seen, timeout) = login_shell_sees(dir);
+    (reach(seen), timeout)
+}
+
+/// ランチャーの置き場所がどこから引けるか（#2428）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PathReach {
+    /// 新しく開いたターミナル（tako の新しいタブを含む）が見る PATH に入っている
+    new_terminal: bool,
+    /// いまのプロセスの PATH に入っている
+    this_process: bool,
 }
 
 /// ログインシェルの PATH に `dir` が入っているか（`.app` の痩せた PATH 対策）。
@@ -1505,17 +1606,30 @@ fn ensure_user_path(
         "verified": verified,
         "tako_cli_link_change": link_change.as_str(),
         "tako_cli": tako_cli_path_json(),
-        "note": if verified {
-            format!(
-                "{} コマンドと tako コマンドがどのターミナルからも使えます",
-                agent.as_str()
-            )
-        } else {
-            "ユーザー環境変数へ追加しました。いま開いているターミナルには反映されないので、\
-             新しいターミナルを開いてください"
-                .to_string()
-        },
+        "note": user_path_note(agent, verified, user_path::rereads_for_new_panes()),
     }))
+}
+
+/// Windows の PATH 段の注記（**純粋関数**。読み直すかを引数で受ける）。
+///
+/// #2428 から、tako の新しいタブはレジストリの PATH を読み直すので「新しいタブ」でよいと案内する
+/// （前の「新しいターミナルを開いてください」は、tako の新しいタブでは直らず再起動が要った）
+fn user_path_note(agent: AgentKind, verified: bool, rereads: bool) -> String {
+    if verified {
+        return format!(
+            "{} コマンドと tako コマンドがどのターミナルからも使えます",
+            agent.as_str()
+        );
+    }
+    if rereads {
+        return "ユーザー環境変数 Path には入っていますが、いま開いているタブにはまだ届いていません。\
+                tako で新しいタブを開くと使えます（tako の再起動は要りません。\
+                tako の外のターミナルも、新しく開けば使えます）"
+            .to_string();
+    }
+    "ユーザー環境変数へ追加しました。いま開いているターミナルには反映されないので、\
+     新しいターミナルを開いてください"
+        .to_string()
 }
 
 /// ユーザー環境変数 `Path` へ `dirs` を**1 エントリずつ末尾追記**する（境界 B23）。
@@ -1547,8 +1661,10 @@ fn ensure_user_path_dirs(dirs: &[PathBuf]) -> Result<Value, String> {
         }
     }
     // レジストリへ入っていても**いまのプロセスには反映されない**（Windows は
-    // 再ログイン / 新しいプロセス起動まで伝播しない。#525 実測）
-    let verified = change == PathChange::AlreadyOnPath || process_has;
+    // 再ログイン / 新しいプロセス起動まで伝播しない。#525 実測）。
+    // #2428 前は「レジストリに既に在った」だけで確かめたことにしていたので、このタブでは
+    // 引けないのに「どのターミナルからも使えます」と言っていた
+    let verified = process_has || (user_path::legacy_2428() && change == PathChange::AlreadyOnPath);
     Ok(json!({
         "shell": "windows-user-path",
         "profile": "HKCU\\Environment\\Path",
@@ -2192,5 +2308,94 @@ mod tests {
                 agent.as_str()
             );
         }
+    }
+
+    // --- 新しいタブで引ける / このタブで引ける（#2428）---
+
+    /// 認証の段にいる Windows の導入状況（パスはプレースホルダ = #927）
+    fn auth_state(on_path: bool, on_process_path: bool) -> BootstrapState {
+        let home = Path::new("C:\\Users\\winuser");
+        BootstrapState {
+            agent: AgentKind::Claude,
+            binary: Some("C:\\Users\\winuser\\.local\\bin\\claude.exe".to_string()),
+            authenticated: false,
+            account_plan: None,
+            launcher_dir: PathBuf::from("C:\\Users\\winuser\\.local\\bin"),
+            launcher_dir_on_path: on_path,
+            launcher_dir_on_process_path: on_process_path,
+            profile: None,
+            profile_has_block: false,
+            shell: None,
+            step: Step::Auth,
+            plan: plan_of(Platform::Windows, AgentKind::Claude, home),
+            auth_timeout: None,
+            locate_timeout: None,
+            path_timeout: None,
+        }
+    }
+
+    #[test]
+    fn 新しいタブで引けてこのタブで引けないときだけ新しいタブを勧める() {
+        // 公式インストーラがユーザー PATH へ足した直後（#2428 の症状の形）
+        assert!(auth_state(true, false).needs_new_tab_in(true));
+        // このタブでも引ける = 勧めない
+        assert!(!auth_state(true, true).needs_new_tab_in(true));
+        // 新しいタブでも引けない = PATH の段の話なので、新しいタブを勧めても直らない
+        assert!(!auth_state(false, false).needs_new_tab_in(true));
+        // 新しいペインが読み直さない環境（unix・A/B の旧アーム）では立てない = 文面を変えない
+        assert!(!auth_state(true, false).needs_new_tab_in(false));
+        // 未導入なら開くタブの話にならない
+        let mut missing = auth_state(true, false);
+        missing.binary = None;
+        assert!(!missing.needs_new_tab_in(true));
+    }
+
+    #[test]
+    fn 新しいタブの1行は次の1手の手前に入る() {
+        let base = auth_instructions_for(AgentKind::Claude);
+        let note = new_tab_note_text(AgentKind::Claude);
+        let lines = with_new_tab_note(base.clone(), Some(note.clone()));
+        let at_note = lines.iter().position(|l| *l == note).expect("1 行が入る");
+        let at_next = lines
+            .iter()
+            .position(|l| l.starts_with("次の 1 手"))
+            .expect("次の 1 手が残る");
+        assert_eq!(at_note + 1, at_next, "次の 1 手の直前に置く: {lines:?}");
+        assert_eq!(lines.len(), base.len() + 1, "ほかの行は 1 行も変えない");
+        // 文面は「新しいタブ」「再起動は要らない」と系統名を名指す
+        assert!(note.contains("新しいタブ") && note.contains("再起動は要りません"));
+        assert!(note.contains("claude"));
+        // 添えるものが無ければ元のまま（unix の案内は 1 文字も変わらない）
+        assert_eq!(with_new_tab_note(base.clone(), None), base);
+        // 「次の 1 手」の行が無い案内でも落とさず末尾へ置く
+        let tail = with_new_tab_note(vec!["a".to_string()], Some(note.clone()));
+        assert_eq!(tail, vec!["a".to_string(), note]);
+    }
+
+    #[test]
+    fn windowsのpath段の注記はこのタブで引けるかで変わる() {
+        let agent = AgentKind::Claude;
+        // このタブで引ける
+        assert!(user_path_note(agent, true, true).contains("どのターミナルからも使えます"));
+        // レジストリにだけある: 新しいタブを開けばよい（tako の再起動は要らない）
+        let note = user_path_note(agent, false, true);
+        assert!(note.contains("tako で新しいタブ"), "{note}");
+        assert!(note.contains("再起動は要りません"), "{note}");
+        // A/B の旧アーム（新しいペインが読み直さない）は前の文面のまま
+        assert_eq!(
+            user_path_note(agent, false, false),
+            "ユーザー環境変数へ追加しました。いま開いているターミナルには反映されないので、\
+             新しいターミナルを開いてください"
+        );
+    }
+
+    #[test]
+    fn 新しいタブで引けるかとこのタブで引けるかをjsonで分けて返す() {
+        let state = auth_state(true, false);
+        let json = state.to_json();
+        assert_eq!(json["launcher_dir_on_path"], true);
+        assert_eq!(json["launcher_dir_on_process_path"], false);
+        // `needs_new_tab` は実行中の環境で決まる（Windows だけが立てる）
+        assert_eq!(json["needs_new_tab"], user_path::rereads_for_new_panes());
     }
 }
