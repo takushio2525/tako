@@ -738,6 +738,11 @@ pub const SPECS: &[SchemaSpec] = &[
     // 手順は `shell_integration::strip_legacy_block`、ここは**発火と可視化だけ**を引き受ける
     // （[`powershell_profile_reports`]）。利用者のファイルなので形式の検査は持たない
     pristine(SchemaId::PowerShellProfile, None),
+    // #2431: Windows の Web ビュー（WebView2）のユーザーデータを実行ファイルの隣から
+    // `%LOCALAPPDATA%\tako\WebView2` へ移す。**フォルダの置き場の変更**なのでテキスト置換の
+    // Step では表せない。手順は `platform::webview2::relocate`、ここは**発火と可視化だけ**を
+    // 引き受ける（[`webview2_reports`]）。中身は WebView2 のプロファイルなので形式の検査は持たない
+    pristine(SchemaId::WebView2Data, None),
 ];
 
 /// 種別から登録を引く
@@ -797,6 +802,8 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
         SchemaId::RunConfigs => crate::run_configs::store_path().into_iter().collect(),
         // #2432: 利用者の `$PROFILE`。走査ではなく専用実装へ委譲する（[`powershell_profile_reports`]）
         SchemaId::PowerShellProfile => Vec::new(),
+        // #2431: WebView2 のユーザーデータ（フォルダ）。走査ではなく専用実装へ委譲する（[`webview2_reports`]）
+        SchemaId::WebView2Data => Vec::new(),
         // #1959: data dir の外（設定 dir ごと）。置く先の解決は claude_mod_install の 1 実装
         SchemaId::ClaudeModMark => crate::claude_mod_install::collect_targets(
             &crate::claude_mod_install::target_inputs(&[]),
@@ -976,6 +983,12 @@ fn run_inner(mode: Mode, only: Option<SchemaId>, proposals: Proposals) -> Migrat
         }
         if spec.id == SchemaId::PowerShellProfile {
             for file in powershell_profile_reports(mode) {
+                report.push(file);
+            }
+            continue;
+        }
+        if spec.id == SchemaId::WebView2Data {
+            for file in webview2_reports(mode) {
                 report.push(file);
             }
             continue;
@@ -1258,6 +1271,83 @@ fn powershell_profile_reports_for(
 const POWERSHELL_PROFILE_V1_TO_V2: Note = Note::new(
     "以前の版が $PROFILE に置いたシェル統合の管理ブロックを取り除く（統合は tako のペインの起動時に読む。他の行はそのまま・ブロックだけのファイルは消す。#2432）",
     "Remove the shell integration block an earlier tako put in $PROFILE (tako now loads it when it starts a pane; other lines are kept and a file holding only the block is deleted. #2432)",
+);
+
+/// Windows の Web ビュー（WebView2）のユーザーデータを実行ファイルの隣から
+/// `%LOCALAPPDATA%\tako\WebView2` へ移す（#2431）。
+///
+/// どこに旧い置き場が残っているかは `platform::webview2::legacy_user_data_dirs`（Windows だけ。
+/// 隔離・検証のプロセスは常に空 = 隔離した検証が本番の旧い置き場を動かさない）。
+/// 移設の判断と実行は tako-core の 1 実装で、ここは結果を [`MigrationReport`] の語彙へ翻訳するだけ
+fn webview2_reports(mode: Mode) -> Vec<FileReport> {
+    let Some(to) = tako_core::platform::webview2::user_data_dir() else {
+        return Vec::new();
+    };
+    webview2_reports_for(
+        tako_core::platform::webview2::legacy_user_data_dirs(),
+        &to,
+        mode,
+    )
+}
+
+/// [`webview2_reports`] の本体（対象を渡せるので一時置き場で検査できる）。
+///
+/// Check と Apply で**同じ 1 本**を通す（予告と報告が食い違わない）。報告するパスは旧い置き場で、
+/// `backup` は旧い中身がいまある場所（移した先か `.pre-v1.bak`）。移せなければ（Web ビューが開いて
+/// いる = 使用中など）旧い置き場は無傷のまま `Failed` を返し、次の発火でまた試される。
+/// そのあいだ GUI は旧い置き場を使い続ける（`platform::webview2::data_dir_choice`）
+fn webview2_reports_for(legacy: Vec<PathBuf>, to: &Path, mode: Mode) -> Vec<FileReport> {
+    use tako_core::platform::webview2::{relocate, Relocation};
+    legacy
+        .into_iter()
+        // 見てから当てるまでに別の発火点が移し終えていたら対象にしない（2 回目は何もしない）
+        .filter(|from| from.is_dir())
+        .map(|from| {
+            let outcome = match relocate(&from, to, mode == Mode::Apply) {
+                Ok(Relocation::Moved { to }) => FileOutcome::Migrated {
+                    from: 1,
+                    to: 2,
+                    backup: to,
+                    applied: vec![WEBVIEW2_DATA_MOVE],
+                },
+                Ok(Relocation::Copied { backup, .. }) => FileOutcome::Migrated {
+                    from: 1,
+                    to: 2,
+                    backup,
+                    applied: vec![WEBVIEW2_DATA_COPY],
+                },
+                Ok(Relocation::SetAside { backup }) => FileOutcome::Migrated {
+                    from: 1,
+                    to: 2,
+                    backup,
+                    applied: vec![WEBVIEW2_DATA_SET_ASIDE],
+                },
+                Err(reason) => FileOutcome::Failed {
+                    reason: reason.to_string(),
+                },
+            };
+            FileReport {
+                id: SchemaId::WebView2Data,
+                path: from,
+                outcome,
+            }
+        })
+        .collect()
+}
+
+const WEBVIEW2_DATA_MOVE: Note = Note::new(
+    "Web ビュー（WebView2）のユーザーデータを実行ファイルの隣から %LOCALAPPDATA%\\tako\\WebView2 へ丸ごと移す（中身は変えない。#2431）",
+    "Move the web view (WebView2) user data as a whole from beside the executable to %LOCALAPPDATA%\\tako\\WebView2 (contents unchanged. #2431)",
+);
+
+const WEBVIEW2_DATA_COPY: Note = Note::new(
+    "Web ビュー（WebView2）のユーザーデータを別のドライブの %LOCALAPPDATA%\\tako\\WebView2 へ写し、実行ファイルの隣の旧い置き場は .pre-v1.bak へ退避する（#2431）",
+    "Copy the web view (WebView2) user data to %LOCALAPPDATA%\\tako\\WebView2 on another drive and keep the old location beside the executable as .pre-v1.bak (#2431)",
+);
+
+const WEBVIEW2_DATA_SET_ASIDE: Note = Note::new(
+    "新しい置き場（%LOCALAPPDATA%\\tako\\WebView2）が既にあるので、実行ファイルの隣の旧い WebView2 のユーザーデータは混ぜずに .pre-v1.bak へ退避する（#2431）",
+    "The new location (%LOCALAPPDATA%\\tako\\WebView2) already exists, so the old WebView2 user data beside the executable is kept as .pre-v1.bak instead of being merged (#2431)",
 );
 
 /// `handoff_store` の書き込みが作る世代バックアップ（`<name>.bak.1`）。
@@ -2122,6 +2212,136 @@ mod tests {
             Mode::Apply,
         );
         assert_eq!(raced[0].outcome, FileOutcome::UpToDate { version: 2 });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2431: WebView2 のユーザーデータも番地に載るが、走査ではなく専用実装へ委譲する
+    #[test]
+    fn webview2のユーザーデータは番地に載るが走査対象を持たない() {
+        let spec = spec(SchemaId::WebView2Data).expect("登録されている");
+        assert!(spec.is_pristine(), "テキスト置換の手順は持たない");
+        assert!(
+            targets(SchemaId::WebView2Data).is_empty(),
+            "ファイル走査ではなく platform::webview2::relocate へ委譲する"
+        );
+        assert!(
+            spec.validate.is_none(),
+            "WebView2 のプロファイルなので形式は問わない"
+        );
+        // 検証プロセス（このテスト）は本番の旧い置き場（実行ファイルの隣）を見に行かない
+        assert!(webview2_reports(Mode::Apply).is_empty());
+    }
+
+    /// WebView2 が作る形（`EBWebView/Default/…`）を模した旧い置き場
+    fn webview2_legacy(root: &Path) -> PathBuf {
+        let from = root
+            .join("Programs")
+            .join("tako")
+            .join("tako-app.exe.WebView2");
+        let profile = from.join("EBWebView").join("Default");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join("Cookies"), b"cookie-bytes").unwrap();
+        std::fs::write(from.join("EBWebView").join("Local State"), b"{}").unwrap();
+        from
+    }
+
+    /// #2431 の受け入れ条件 2: 旧い置き場（実行ファイルの隣）から新しい置き場へ移る。
+    /// 見るだけ（Check）は書かない・当てると中身はそのまま移る・2 回目は何もしない（冪等）。
+    /// 新旧の両方があるときは混ぜずに旧い方を `.pre-v1.bak` へ退避する
+    #[test]
+    fn webview2のユーザーデータを新しい置き場へ移す() {
+        let dir = temp_dir("webview2-2431");
+        let from = webview2_legacy(&dir);
+        let to = dir.join("Local").join("tako").join("WebView2");
+
+        // 見るだけ: 予告は出すが 1 バイトも動かさない
+        let planned = webview2_reports_for(vec![from.clone()], &to, Mode::Check);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].id, SchemaId::WebView2Data);
+        assert_eq!(planned[0].path, from, "報告するのは旧い置き場");
+        assert!(planned[0].outcome.changed(), "{planned:?}");
+        assert!(from.is_dir() && !to.exists(), "見るだけで書いた");
+        assert_eq!(file_json(&planned[0], false)["state"], "migrated");
+
+        // 当てる: 中身は 1 バイトも変えずに新しい置き場へ
+        let done = webview2_reports_for(vec![from.clone()], &to, Mode::Apply);
+        assert_eq!(
+            done[0].outcome,
+            FileOutcome::Migrated {
+                from: 1,
+                to: 2,
+                backup: to.clone(),
+                applied: vec![WEBVIEW2_DATA_MOVE],
+            }
+        );
+        assert!(!from.exists());
+        assert_eq!(
+            std::fs::read(to.join("EBWebView/Default/Cookies")).unwrap(),
+            b"cookie-bytes"
+        );
+        assert_eq!(
+            file_json(&done[0], true)["steps"][0],
+            WEBVIEW2_DATA_MOVE.text()
+        );
+
+        // 2 回目: 旧い置き場はもう無いので何もしない（新しい置き場も触らない）
+        assert!(webview2_reports_for(vec![from.clone()], &to, Mode::Apply).is_empty());
+        assert_eq!(
+            std::fs::read(to.join("EBWebView/Default/Cookies")).unwrap(),
+            b"cookie-bytes"
+        );
+
+        // 新旧の両方がある（旧い版を一度使い直した等）: 新しい方を正とし、旧い方は退避する
+        let again = webview2_legacy(&dir);
+        let both = webview2_reports_for(vec![again.clone()], &to, Mode::Apply);
+        let backup = migration::backup_path(&again, 1);
+        assert_eq!(
+            both[0].outcome,
+            FileOutcome::Migrated {
+                from: 1,
+                to: 2,
+                backup: backup.clone(),
+                applied: vec![WEBVIEW2_DATA_SET_ASIDE],
+            }
+        );
+        assert!(!again.exists());
+        assert_eq!(
+            std::fs::read(backup.join("EBWebView/Default/Cookies")).unwrap(),
+            b"cookie-bytes",
+            "旧い中身は消さずに退避に残る"
+        );
+        assert_eq!(
+            std::fs::read(to.join("EBWebView/Local State")).unwrap(),
+            b"{}",
+            "新しい置き場は触らない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2431: 移せないとき（使用中など）は旧い置き場が無傷で残り、`Failed`（人が気にするべき状態）で
+    /// 申告する = 次の発火でまた試される
+    #[test]
+    #[cfg(unix)]
+    fn webview2のユーザーデータを移せなければ旧い置き場が無傷で残る() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("webview2-2431-fail");
+        let from = webview2_legacy(&dir);
+        let to = dir.join("Local").join("tako").join("WebView2");
+        // 旧い置き場の親を読み取り専用にする = rename が断られる（Windows の使用中と同じ形の失敗）
+        let parent = from.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let done = webview2_reports_for(vec![from.clone()], &to, Mode::Apply);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(&done[0].outcome, FileOutcome::Failed { reason } if reason.contains("WebView2")),
+            "{done:?}"
+        );
+        assert!(done[0].outcome.needs_attention());
+        assert_eq!(
+            std::fs::read(from.join("EBWebView/Default/Cookies")).unwrap(),
+            b"cookie-bytes"
+        );
+        assert!(!to.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

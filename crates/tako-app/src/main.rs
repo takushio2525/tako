@@ -28018,6 +28018,9 @@ impl WebViewHost for TakoApp {
                         "state": e.phase().as_str(),
                         "error": err.as_ref().map(|(msg, _)| msg.as_str()),
                         "failed_url": err.as_ref().map(|(_, url)| url.as_str()),
+                        // #2431: 生成の失敗の種別（runtime_missing / runtime_outdated / other。
+                        // Windows だけ。案内の文は error）
+                        "create_failure": e.create_failure(),
                         // #838: ちらつきの機械検証用。visible_flips = 可視 ⇔ 不可視が
                         // 実際に切り替わった累計回数（安定していれば増えない）
                         "visible": e.visible_now,
@@ -28140,6 +28143,8 @@ impl WebViewHost for TakoApp {
             "state": e.phase().as_str(),
             "error": err.as_ref().map(|(msg, _)| msg.as_str()),
             "failed_url": err.as_ref().map(|(_, url)| url.as_str()),
+            // #2431: 生成の失敗の種別（web list と同じ）
+            "create_failure": e.create_failure(),
         }))
     }
 }

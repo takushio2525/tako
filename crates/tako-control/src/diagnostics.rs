@@ -272,6 +272,7 @@ pub fn collect() -> Report {
     items.push(agents_detected_item(&bootstrap));
     items.extend(dep_items());
     items.extend(fda_item());
+    items.extend(webview2_item(&tako_core::platform::webview2::runtime()));
     let (mcp, mcp_timeouts) = mcp_items(&bootstrap);
     items.extend(mcp);
     probe_timeouts.extend(mcp_timeouts);
@@ -730,6 +731,25 @@ fn fda_item() -> Vec<Item> {
 #[cfg(not(target_os = "macos"))]
 fn fda_item() -> Vec<Item> {
     Vec::new()
+}
+
+// --- WebView2 ランタイム（Windows の Web ビュー。#2431） ------------------------
+
+/// WebView2 ランタイムの版（Windows だけ。macOS は対象外 = 項目を出さない）。
+/// 判定と文言は `platform::webview2` の 1 実装（check-health の `webview2` 節と同じ材料）
+fn webview2_item(runtime: &tako_core::platform::webview2::Runtime) -> Option<Item> {
+    use tako_core::i18n::Lang;
+    let summary = runtime.summary_in(Lang::Ja)?;
+    let status = match runtime.state() {
+        "missing" => Status::Missing,
+        "outdated" => Status::Warn,
+        _ => Status::Ok,
+    };
+    let item = Item::new("webview2", status, summary);
+    Some(match runtime.next_step_in(Lang::Ja) {
+        Some(step) => item.line(format!("      {step}")),
+        None => item,
+    })
 }
 
 // --- MCP 登録（#979） -------------------------------------------------------
@@ -1302,6 +1322,37 @@ fn ipc_item() -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2431: WebView2 の版の項目。macOS は出さない・入っていなければ不足・古ければ警告で、
+    /// どちらも次の一手の行を持つ
+    #[test]
+    fn webview2の項目は版と次の一手を出す() {
+        use tako_core::platform::webview2::{Runtime, INSTALL_COMMAND, REQUIRED_VERSION};
+        assert_eq!(webview2_item(&Runtime::NotApplicable), None);
+        let fresh = webview2_item(&Runtime::Installed {
+            version: "146.0.3856.84".into(),
+        })
+        .unwrap();
+        assert_eq!(fresh.key, "webview2");
+        assert_eq!(fresh.status, Status::Ok);
+        assert!(fresh.summary.contains("146.0.3856.84"));
+        assert_eq!(fresh.lines.len(), 1);
+        let missing = webview2_item(&Runtime::Missing).unwrap();
+        assert_eq!(missing.status, Status::Missing);
+        assert!(missing.summary.contains("無い"));
+        assert!(
+            missing.lines[1].contains(INSTALL_COMMAND),
+            "{:?}",
+            missing.lines
+        );
+        let old = webview2_item(&Runtime::Installed {
+            version: "120.0.2210.91".into(),
+        })
+        .unwrap();
+        assert_eq!(old.status, Status::Warn);
+        assert!(old.summary.contains(REQUIRED_VERSION));
+        assert_eq!(old.lines.len(), 2);
+    }
 
     #[test]
     fn ラベルと機械可読の語彙が1対1() {
