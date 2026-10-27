@@ -9,6 +9,10 @@
 //! cwd 追従・コマンド実行状態）・入力予測・自動命名の素材が、人が
 //! `tako shell-integration install` を自分で見つけて打つまで欠けたままだった。
 //!
+//! #2432 で Windows も `$PROFILE` へ書かなくなった（ペインの PowerShell の起動引数で読ませる）
+//! ので、段の仕事は「スクリプトを書き出し、どう届くかを 1 行で言う」になった。下の 5 つは
+//! そのまま効く（段の呼び忘れ・二重化・質問・cfg 分岐・`Result` 化はどれも起こりうる）。
+//!
 //! ## ここで止める 5 つ
 //!
 //! 1. **段の呼び忘れ**。配置は `tako setup` の 1 行と `tako setup --check` の 1 行で
@@ -19,7 +23,7 @@
 //!    `$PROFILE` を触り始めたら、冪等性とマーカー 1 個の保証が 2 か所に散る）
 //! 3. **質問の再生**。段は `[y/N]` を出さない（#262 の質問ゼロ）。聞かないので
 //!    `--yes` / 非 TTY / GUI の初回起動で分岐する必要が無い = 入力を読む口を持たない
-//! 4. **`cfg!(windows)` での分岐**。配置が要るかは [`Delivery`] が宣言している。
+//! 4. **`cfg!(windows)` での分岐**。どう届くかは [`Delivery`] が宣言している。
 //!    cfg で分けると **Windows でだけ通る経路が macOS のテストから消える**
 //!    （実機を持たない CI では永久に検査できなくなる）
 //! 5. **失敗で setup が止まること**。段は `Result` を返さない（`?` で上へ投げられない）。
@@ -31,7 +35,7 @@
 //!
 //! 実経路（隔離 HOME で `tako setup` → 表示・冪等・失敗時の完走）は
 //! `scripts/test-setup-shell-integration-1504.sh`。Windows 形の表示・残りの判断は
-//! `tako_control::shell_integration` の `stage_tests`（Profile 経路の `Status` を
+//! `tako_control::shell_integration` の `stage_tests`（Launch 経路の `Status` を
 //! 組んで macOS 上で全分岐を通す）。ここは**配線が外れていないこと**だけを見る。
 
 use std::path::{Path, PathBuf};
@@ -232,7 +236,7 @@ fn 段は入力を読まない() {
     }
 }
 
-/// 4: 配置が要るかの判断は `Delivery` で、`cfg!(windows)` で分けない
+/// 4: どう届くかの判断は `Delivery` で、`cfg!(windows)` で分けない（#1504 / #2432）
 #[test]
 fn 配置の判断はdeliveryで行い_cfgで分けない() {
     let text = production_part(STAGE_RS, &read(STAGE_RS));
@@ -241,20 +245,22 @@ fn 配置の判断はdeliveryで行い_cfgで分けない() {
         assert!(
             production.is_empty(),
             "{STAGE_RS}: 段が `{needle}` で分岐している（{}）。\n\
-             配置が要るかは `Delivery`（automatic / profile）が宣言しているので\n\
+             どう届くかは `Delivery`（automatic / launch）が宣言しているので\n\
              そちらで分けること。cfg で分けると Windows でだけ通る経路が\n\
-             macOS のテストから消え、実機を持たない CI では永久に検査できない（#1504）",
+             macOS のテストから消え、実機を持たない CI では永久に検査できない（#1504 / #2432）",
             where_(STAGE_RS, &production)
         );
     }
     assert!(
-        text.contains("fn needs_placement"),
-        "{STAGE_RS}: `needs_placement`（配置が要るかの判断 1 か所）が消えている"
+        text.contains("fn delivery_line"),
+        "{STAGE_RS}: `delivery_line`（どう届くかの判断 1 か所）が消えている"
     );
-    assert!(
-        text.contains("si::Delivery::Profile"),
-        "{STAGE_RS}: 判断が `Delivery` を見ていない"
-    );
+    for variant in ["si::Delivery::Automatic", "si::Delivery::Launch"] {
+        assert!(
+            text.contains(variant),
+            "{STAGE_RS}: 判断が `{variant}` を見ていない（`Delivery` で分けること）"
+        );
+    }
 }
 
 /// 5: 段は `Result` を返さない（失敗を `?` で上へ投げて setup を止められない形）

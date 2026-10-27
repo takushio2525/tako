@@ -665,9 +665,12 @@ impl TerminalSession {
             .as_ref()
             .is_some_and(|c| crate::platform::fd_limit::routes_container_children(&c.args));
         let mut tty_options = tty::Options {
-            // command 未指定なら既定シェルを明示解決する（login ラッパ回避。`default_shell`）
+            // command 未指定なら既定シェルを明示解決する（login ラッパ回避。`default_shell`）。
+            // Windows はそのシェル（PowerShell）へ統合を読ませる起動引数を足す（#2432。
+            // unix は env 注入で届くので `pane_shell` は None = 従来どおり）
             shell: options
                 .command
+                .or_else(crate::shell_integration::pane_shell)
                 .or_else(default_shell)
                 .map(|c| tty::Shell::new(c.program, c.args)),
             // cwd 未指定なら親プロセスの cwd（.app 起動時は `/`）ではなくホームを既定にする。

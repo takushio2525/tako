@@ -451,30 +451,36 @@ mod tests {
             "検証プロセスの履歴の書き先がセッションへ固定されていない（#1253）"
         );
 
-        assert_eq!(
-            args,
-            vec![
-                "-u",
-                "-L",
-                "tako-unit",
-                "-f",
-                "<conf>",
-                "new-session",
-                "-A",
-                "-D",
-                "-s",
-                "tako-0123456789ab",
-                "-e",
-                "TAKO_PANE_ID=7",
-                "-e",
-                "TAKO_TAB_ID=3",
-                // #1105: 器の同一性は名前で伝える（統合が接頭辞を推測しない）
-                "-e",
-                "TAKO_BACKEND_SOCKET=tako-unit",
-                "-c",
-                "/tmp/work",
-            ]
+        let mut expected: Vec<String> = [
+            "-u",
+            "-L",
+            "tako-unit",
+            "-f",
+            "<conf>",
+            "new-session",
+            "-A",
+            "-D",
+            "-s",
+            "tako-0123456789ab",
+            "-e",
+            "TAKO_PANE_ID=7",
+            "-e",
+            "TAKO_TAB_ID=3",
+            // #1105: 器の同一性は名前で伝える（統合が接頭辞を推測しない）
+            "-e",
+            "TAKO_BACKEND_SOCKET=tako-unit",
+            "-c",
+            "/tmp/work",
+        ]
+        .map(String::from)
+        .to_vec();
+        // #2432: 統合を起動引数で読ませる環境（Windows）だけ、素のペインにも内側コマンドが付く。
+        // unix は None = 未指定のまま（ZDOTDIR を食わせない）
+        expected.extend(
+            crate::shell_integration::pane_shell()
+                .map(|shell| crate::backend::inner_command_line(&shell)),
         );
+        assert_eq!(args, expected);
 
         // env / cwd は SpawnOptions 側にも残る（クライアント経由でセッション環境になる）
         assert_eq!(wrapped.env, options.env);

@@ -57,14 +57,14 @@ pub fn run(action: Option<&str>) -> Result<Value, String> {
     Ok(out)
 }
 
-// --- `tako setup` の段（#1504 / #1500 の棚卸し Z9）---
+// --- `tako setup` の段（#1504 / #1500 の棚卸し Z9 / #2432）---
 
 /// setup の段の結果。**表示と「残り」だけを持つ**（呼び手は出して積むだけ）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageOutcome {
     /// そのまま 1 行ずつ出す表示（段組みの字下げを含む）
     pub lines: Vec<String>,
-    /// 配置できなかったときに人へ残る作業（#1501）。成功時は `None`
+    /// 用意できなかったときに人へ残る作業（#1501）。成功時は `None`
     pub remaining: Option<Remaining>,
 }
 
@@ -82,27 +82,25 @@ pub fn legacy_no_setup_stage() -> bool {
 const LEGACY_LINE: &str =
     "  [legacy] シェル統合の配置は TAKO_1504_LEGACY=1 で無効（#1504 前の挙動）";
 
-/// `tako setup` のシェル統合の段（#1504）。
+/// `tako setup` のシェル統合の段（#1504 / #2432）。
 ///
-/// ## なぜ setup の段なのか
+/// ## 何をする段か
 ///
-/// [`si::install`] の呼び手は CLI `tako shell-integration` と MCP だけで、**setup も
-/// installer も呼んでいなかった**。macOS / Linux は spawn 時の環境変数注入で届くので
-/// 人の手はゼロだが、**Windows は `$PROFILE` へブロックを追記しないと 1 行も効かない**
-/// （OSC 7 / 133 = ペインの cwd 追従とコマンド実行状態、入力予測、自動命名の素材）。
-/// つまり Windows の利用者は `tako shell-integration install` を**自分で見つけて打つまで**
-/// 機能が欠けたままで、「ゼロコンフィグで一般ユーザーが使える」（エピック #1500）に反する。
+/// [`si::install`] で統合スクリプトを data dir へ最新の形で書き出し、**この環境でどう
+/// 届くか**を 1 行で言う。#1504 の時点の Windows は `$PROFILE` へブロックを書かないと
+/// 1 行も効かなかったので、この段がその配置を担っていた。#2432 から**どの OS も
+/// ユーザーのファイルを書かない**（Windows は tako がペインの PowerShell を起こすときの
+/// 起動引数で読ませる = インストール直後・setup の前から効く）。以前の版が置いた
+/// `$PROFILE` のブロックは、この段より先に走る移行の段（`migrations::setup_lines`）が取り除く
 ///
 /// ## 作法（#868 / #1499 / #1501 / #1502 と揃える）
 ///
-/// - **ユーザーのファイルを触る前に「何をどこへ書くか」を出して同意扱いで続行する**。
-///   `[y/N]` は出さない（#262 の質問ゼロ）。先例は #1502 の PATH 設置で、どちらも
-///   「tako の管理ブロック 1 個」+「`uninstall` / `undo-path` で元のバイト列へ戻せる」
+/// - **聞かない**（#262 の質問ゼロ）。ユーザーのファイルを書かないので予告も要らない
 /// - **`--yes` / 非 TTY で分岐しない**。聞かないので入力を読む口を持たない
 ///   （GUI の初回起動・パイプ経由でも同じ経路が同じ結果になる）
-/// - **止めない**。配置に失敗しても残り作業 1 件として脇に置き、setup は完走する（#1501）
-/// - **`cfg!(windows)` で分岐しない**。配置が要るかどうかは [`si::Delivery`] が
-///   宣言している（= macOS 上でも Profile 経路の表示と残りを検査できる）
+/// - **止めない**。書き出しに失敗しても残り作業 1 件として脇に置き、setup は完走する（#1501）
+/// - **`cfg!(windows)` で分岐しない**。どう届くかは [`si::Delivery`] が宣言している
+///   （= macOS 上でも Windows の Launch 経路の表示を検査できる）
 pub fn run_setup_stage() -> StageOutcome {
     if legacy_no_setup_stage() {
         return StageOutcome {
@@ -110,20 +108,13 @@ pub fn run_setup_stage() -> StageOutcome {
             remaining: None,
         };
     }
-    let before = si::status();
-    // 書く前に予告する（ユーザーのファイルを触るのはここだけ）
-    let mut lines = announce_lines(&before);
     match si::install() {
-        Ok(changes) => {
-            lines.extend(result_lines(&before, &changes));
-            StageOutcome {
-                lines,
-                remaining: None,
-            }
-        }
+        Ok(_) => StageOutcome {
+            lines: state_lines(&si::status(), Phase::Setup),
+            remaining: None,
+        },
         Err(e) => {
-            let (failure, remaining) = failure_lines(&e);
-            lines.extend(failure);
+            let (lines, remaining) = failure_lines(&e);
             StageOutcome {
                 lines,
                 remaining: Some(remaining),
@@ -132,7 +123,7 @@ pub fn run_setup_stage() -> StageOutcome {
     }
 }
 
-/// `tako setup --check` の 1 行（**読み取りだけ**。配置も書き込みもしない）
+/// `tako setup --check` の 1 行（**読み取りだけ**。書き出しも書き込みもしない）
 pub fn check_line() -> String {
     if legacy_no_setup_stage() {
         return LEGACY_LINE.to_string();
@@ -140,7 +131,9 @@ pub fn check_line() -> String {
     check_line_for(&si::status())
 }
 
-/// `tako setup --check` が積む残り作業（未配置のときだけ 1 件）
+/// `tako setup --check` が積む残り作業。#2432 以降は人の手で配置するものが無いので、
+/// 統合が効かない環境（既定シェルが PowerShell でない）でも `tako` のコマンドでは直せず、
+/// 積まない（`[不足]` の行で知らせるだけ）
 pub fn check_remaining() -> Option<Remaining> {
     if legacy_no_setup_stage() {
         return None;
@@ -148,12 +141,50 @@ pub fn check_remaining() -> Option<Remaining> {
     check_remaining_for(&si::status())
 }
 
-/// 配置が要る環境か。**判断はここ 1 か所**（`cfg!(windows)` を散らさない）
-fn needs_placement(status: &si::Status) -> bool {
-    status.delivery == si::Delivery::Profile
+/// 段（`tako setup`）と点検（`--check`）のどちらの文面か
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Setup,
+    Check,
 }
 
-/// 器が OSC を落として「配置しても効かない」ときだけ出す注記（#525）
+/// どう届くかの表示。**判断はここ 1 か所**（`cfg!(windows)` を散らさない）
+fn state_lines(status: &si::Status, phase: Phase) -> Vec<String> {
+    let mut lines = vec![delivery_line(status, phase)];
+    if status.installed() {
+        lines.extend(backend_note(status));
+    }
+    lines.extend(legacy_note(status));
+    lines
+}
+
+/// 届け方の 1 行。`si::Delivery` の 2 値で分ける
+fn delivery_line(status: &si::Status, phase: Phase) -> String {
+    match (status.delivery, phase) {
+        (si::Delivery::Automatic, Phase::Setup) => format!(
+            "  [OK] シェル統合: 環境変数の注入で有効です（{}。設定ファイルは書き換えません）",
+            si::shells()
+        ),
+        (si::Delivery::Automatic, Phase::Check) => format!(
+            "  [OK] シェル統合: 環境変数の注入で有効（{}）",
+            si::shells()
+        ),
+        (si::Delivery::Launch, _) if !status.installed() => format!(
+            "  [不足] シェル統合: 既定のシェルが PowerShell でないため効きません（{} が見つかりません）",
+            si::shells()
+        ),
+        (si::Delivery::Launch, Phase::Setup) => format!(
+            "  [OK] シェル統合: tako が開く PowerShell へ起動時に読ませます（{}。$PROFILE は書き換えません）",
+            si::shells()
+        ),
+        (si::Delivery::Launch, Phase::Check) => format!(
+            "  [OK] シェル統合: tako が開く PowerShell へ起動時に読ませる（{}）",
+            si::shells()
+        ),
+    }
+}
+
+/// 器が OSC を落として「届け方が整っていても効かない」ときだけ出す注記（#525）
 fn backend_note(status: &si::Status) -> Option<String> {
     status
         .blocked_by_backend
@@ -161,91 +192,28 @@ fn backend_note(status: &si::Status) -> Option<String> {
         .map(|reason| format!("         [注意] {reason}"))
 }
 
-/// 配置先 1 件をどうするか（予告に出す 1 行）
-fn target_plan(target: &si::ProfileTarget) -> String {
-    let action = match (target.installed, target.up_to_date) {
-        (true, true) => "変更なし",
-        (true, false) => "既存のブロックを差し替え",
-        _ => "新しく追記",
-    };
-    format!(
-        "         {}: {}（{action}）",
-        target.label,
-        target.path.display()
-    )
-}
-
-/// 書く前の予告（**ユーザーのファイルへ何をどこへ書くか**）。
-///
-/// 環境変数注入で完結する環境（macOS / Linux）と、既に最新が入っている環境では
-/// 1 行も出さない（冪等な再実行を静かに保つ = FR-2.14.8）
-fn announce_lines(status: &si::Status) -> Vec<String> {
-    if !needs_placement(status) || status.installed() {
+/// 以前の版が `$PROFILE` に置いたブロックが残っているときだけ出す注記（#2432）。
+/// 通常は移行が取り除くので出ない。出ているなら移行が失敗している（理由は `tako migrate`）。
+/// 直し方はブロックだけを外す `uninstall`（`tako migrate run` は利用者の判断が要る案まで当てる）
+fn legacy_note(status: &si::Status) -> Vec<String> {
+    if status.legacy_blocks.is_empty() {
         return Vec::new();
     }
-    let mut lines = vec![format!(
-        "  [設定] シェル統合: {} のプロファイルへ tako の管理ブロックを置きます",
-        si::shells()
-    )];
-    lines.extend(status.targets.iter().map(target_plan));
-    lines.push(
-        "         置くのは tako の管理ブロック 1 個だけで、ファイルの他の行はそのまま残します"
+    let mut lines = vec![
+        "         [注意] 以前の版が $PROFILE に置いた管理ブロックが残っています（取り除くには tako shell-integration uninstall）"
             .to_string(),
+    ];
+    lines.extend(
+        status
+            .legacy_blocks
+            .iter()
+            .map(|block| format!("           {}: {}", block.label, block.path.display())),
     );
-    lines.push(
-        "         これで効くもの: ペインの cwd 追従・コマンド実行状態（OSC 7 / 133）・入力予測"
-            .to_string(),
-    );
-    lines.push("         元に戻すには tako shell-integration uninstall".to_string());
     lines
 }
 
-/// 変更 1 件の見え方（`ChangeKind` の写しはここだけ）
-fn change_label(kind: si::ChangeKind) -> &'static str {
-    match kind {
-        si::ChangeKind::Installed => "新規",
-        si::ChangeKind::Updated => "更新",
-        si::ChangeKind::Unchanged => "変更なし",
-        si::ChangeKind::Removed => "解除",
-        si::ChangeKind::Absent => "無し",
-        si::ChangeKind::Deleted => "削除",
-    }
-}
-
-/// 配置できたときの表示。
-///
-/// - 環境変数注入で完結する環境: 「ファイルは触っていない」と言う 1 行だけ
-/// - 配置した: どのプロファイルがどうなったかと、**既存ペインには効かない**ことを言う
-/// - 既に最新だった: 「配置済み（変更なし）」の 1 行だけ（冪等な再実行）
-fn result_lines(before: &si::Status, changes: &[si::Change]) -> Vec<String> {
-    let mut lines = Vec::new();
-    if !needs_placement(before) {
-        lines.push(format!(
-            "  [OK] シェル統合: 環境変数の注入で有効です（{}。設定ファイルは書き換えません）",
-            si::shells()
-        ));
-        lines.extend(backend_note(before));
-        return lines;
-    }
-    let detail = changes
-        .iter()
-        .map(|change| format!("{}: {}", change.label, change_label(change.kind)))
-        .collect::<Vec<_>>()
-        .join(" / ");
-    let wrote = changes
-        .iter()
-        .any(|change| !matches!(change.kind, si::ChangeKind::Unchanged));
-    if wrote {
-        lines.push(format!("  [OK] シェル統合: 配置しました（{detail}）"));
-        lines.push("         いま開いているペインには反映されません（開き直すと有効）".to_string());
-    } else {
-        lines.push(format!("  [OK] シェル統合: 配置済み（{detail}）"));
-    }
-    lines.extend(backend_note(before));
-    lines
-}
-
-/// 配置できなかったときの表示と、人へ残る 1 件（**止めない** = #1501）
+/// 用意できなかったときの表示と、人へ残る 1 件（**止めない** = #1501）。
+/// 「配置」はデータディレクトリへのスクリプトの配置（ユーザーのファイルではない）
 fn failure_lines(error: &str) -> (Vec<String>, Remaining) {
     let lines = vec![
         format!("  [警告] シェル統合の配置を見送りました: {error}"),
@@ -259,50 +227,12 @@ fn failure_lines(error: &str) -> (Vec<String>, Remaining) {
 
 /// `--check` の 1 行（複数行になることもある）。**判定は段と同じ材料を読む**
 fn check_line_for(status: &si::Status) -> String {
-    if !needs_placement(status) {
-        let mut line = format!(
-            "  [OK] シェル統合: 環境変数の注入で有効（{}）",
-            si::shells()
-        );
-        if let Some(note) = backend_note(status) {
-            line.push('\n');
-            line.push_str(&note);
-        }
-        return line;
-    }
-    if status.installed() {
-        let labels = status
-            .targets
-            .iter()
-            .map(|target| target.label.clone())
-            .collect::<Vec<_>>()
-            .join(" / ");
-        let mut line = format!("  [OK] シェル統合: 配置済み（{labels}）");
-        if let Some(note) = backend_note(status) {
-            line.push('\n');
-            line.push_str(&note);
-        }
-        return line;
-    }
-    if status.targets.is_empty() {
-        return format!(
-            "  [不足] シェル統合: 未配置（{} が見つかりません）",
-            si::shells()
-        );
-    }
-    let mut line = "  [不足] シェル統合: 未配置（ペインの cwd 追従・コマンド実行状態が働きません）"
-        .to_string();
-    for target in &status.targets {
-        line.push('\n');
-        line.push_str(&target_plan(target));
-    }
-    line
+    state_lines(status, Phase::Check).join("\n")
 }
 
-/// `--check` が積む残り作業（**未配置のときだけ**。配置済み / 注入だけの環境は 0 件）
-fn check_remaining_for(status: &si::Status) -> Option<Remaining> {
-    (needs_placement(status) && !status.installed())
-        .then(|| Remaining::new(RemainingKind::ShellIntegration))
+/// `--check` が積む残り作業。人の手で配置するものが無い（#2432）ので積まない
+fn check_remaining_for(_status: &si::Status) -> Option<Remaining> {
+    None
 }
 
 #[cfg(test)]
@@ -311,26 +241,24 @@ mod stage_tests {
 
     use super::*;
 
-    /// Windows 形の状態を組む（**macOS 上で Profile 経路を検査するための材料**。
-    /// 実機を持たない CI でも表示・冪等・失敗の分岐を全部通せる）
-    fn windows_status(targets: Vec<si::ProfileTarget>) -> si::Status {
+    /// Windows 形の状態を組む（**macOS 上で Launch 経路を検査するための材料**。
+    /// 実機を持たない CI でも表示・注記・失敗の分岐を全部通せる）
+    fn windows_status(launch_shell: Option<&str>) -> si::Status {
         si::Status {
-            delivery: si::Delivery::Profile,
+            delivery: si::Delivery::Launch,
             script: Some(PathBuf::from(
                 r"C:\Users\winuser\AppData\Roaming\tako\shell-integration\tako.ps1",
             )),
-            targets,
+            launch_shell: launch_shell.map(str::to_string),
+            legacy_blocks: Vec::new(),
             blocked_by_backend: None,
         }
     }
 
-    fn target(label: &str, installed: bool, up_to_date: bool) -> si::ProfileTarget {
-        si::ProfileTarget {
+    fn legacy(label: &str) -> si::LegacyBlock {
+        si::LegacyBlock {
             label: label.to_string(),
-            exe: "pwsh.exe".to_string(),
             path: PathBuf::from(format!(r"C:\Users\winuser\Documents\{label}\profile.ps1")),
-            installed,
-            up_to_date,
         }
     }
 
@@ -338,18 +266,17 @@ mod stage_tests {
         si::Status {
             delivery: si::Delivery::Automatic,
             script: Some(PathBuf::from("/tmp/tako/shell-integration/tako.bash")),
-            targets: Vec::new(),
+            launch_shell: None,
+            legacy_blocks: Vec::new(),
             blocked_by_backend: None,
         }
     }
 
+    const PWSH: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
+
     #[test]
-    fn 注入で完結する環境は何も予告しない() {
-        assert!(
-            announce_lines(&unix_status()).is_empty(),
-            "macOS / Linux はユーザーのファイルを触らないので予告するものが無い"
-        );
-        let lines = result_lines(&unix_status(), &[]);
+    fn 注入で完結する環境は1行だけ言う() {
+        let lines = state_lines(&unix_status(), Phase::Setup);
         assert_eq!(lines.len(), 1, "1 行だけ: {lines:?}");
         assert!(lines[0].contains("環境変数の注入で有効"), "{lines:?}");
         assert!(
@@ -358,95 +285,62 @@ mod stage_tests {
         );
     }
 
+    /// #2432: Windows も**ユーザーのファイルを書かない**ことを言い切る。予告も
+    /// 「開き直すと有効」も要らない（書いていないし、新しいペインから効く）
     #[test]
-    fn 未配置なら何をどこへ書くかを出す() {
-        let status = windows_status(vec![
-            target("PowerShell 7", false, false),
-            target("Windows PowerShell 5.1", false, false),
-        ]);
-        let lines = announce_lines(&status);
+    fn windowsは起動時に読ませて_profileを書き換えないと言う() {
+        let lines = state_lines(&windows_status(Some(PWSH)), Phase::Setup);
         let text = lines.join("\n");
-        // **書き先を 1 件も隠さない**（ユーザーのファイルを触る前の説明責任）
-        for target in &status.targets {
-            assert!(
-                text.contains(&target.path.display().to_string()),
-                "{} の書き先が出ていない: {text}",
-                target.label
-            );
-            assert!(text.contains(&target.label), "{text}");
-        }
-        assert!(text.contains("管理ブロック 1 個"), "何を書くか: {text}");
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(text.starts_with("  [OK]"), "{text}");
+        assert!(text.contains("起動時に読ませます"), "{text}");
+        assert!(text.contains("$PROFILE は書き換えません"), "{text}");
         assert!(
-            text.contains("他の行はそのまま残します"),
-            "既存を壊さないこと: {text}"
+            !text.contains("管理ブロック 1 個"),
+            "旧方式の予告が残っている: {text}"
         );
-        assert!(
-            text.contains("tako shell-integration uninstall"),
-            "元に戻す 1 行（#322 の最簡形）: {text}"
-        );
-        // 聞かない（同意扱いで続行する = #262 の質問ゼロ）
         assert!(!text.contains("[y/N]"), "質問を足している: {text}");
     }
 
+    /// 既定シェルが PowerShell でない（cmd.exe へ落ちた）環境は「不足」と言う。
+    /// `tako` のコマンドでは直せないので残り作業には積まない
     #[test]
-    fn 配置済みなら予告せず変更なしと言う() {
-        let status = windows_status(vec![target("PowerShell 7", true, true)]);
-        assert!(
-            announce_lines(&status).is_empty(),
-            "2 回目は静か（冪等な再実行 = FR-2.14.8）"
-        );
-        let changes = vec![si::Change {
-            label: "PowerShell 7".to_string(),
-            path: status.targets[0].path.clone(),
-            kind: si::ChangeKind::Unchanged,
-        }];
-        let lines = result_lines(&status, &changes);
-        let text = lines.join("\n");
-        assert!(text.contains("配置済み"), "{text}");
-        assert!(text.contains("変更なし"), "{text}");
-        assert!(
-            !text.contains("開き直すと有効"),
-            "何も書いていないのに再起動を促している: {text}"
-        );
+    fn powershellが無ければ不足と言い残りには積まない() {
+        let status = windows_status(None);
+        let line = check_line_for(&status);
+        assert!(line.starts_with("  [不足]"), "{line}");
+        assert!(line.contains("PowerShell でない"), "{line}");
+        assert!(check_remaining_for(&status).is_none());
     }
 
+    /// 以前の版のブロックが残っている（移行が失敗した）ときだけ、場所と直し方を出す
     #[test]
-    fn 配置したらどこがどうなったかと既存ペインへ効かないことを言う() {
-        let status = windows_status(vec![
-            target("PowerShell 7", false, false),
-            target("Windows PowerShell 5.1", true, false),
-        ]);
-        let changes = vec![
-            si::Change {
-                label: "PowerShell 7".to_string(),
-                path: status.targets[0].path.clone(),
-                kind: si::ChangeKind::Installed,
-            },
-            si::Change {
-                label: "Windows PowerShell 5.1".to_string(),
-                path: status.targets[1].path.clone(),
-                kind: si::ChangeKind::Updated,
-            },
-        ];
-        let text = result_lines(&status, &changes).join("\n");
-        assert!(text.contains("配置しました"), "{text}");
-        assert!(text.contains("PowerShell 7: 新規"), "{text}");
-        assert!(text.contains("Windows PowerShell 5.1: 更新"), "{text}");
+    fn 旧ブロックが残っていれば場所と直し方を出す() {
+        let mut status = windows_status(Some(PWSH));
+        status.legacy_blocks = vec![legacy("PowerShell"), legacy("WindowsPowerShell")];
+        let text = check_line_for(&status);
+        assert!(text.contains("[注意]"), "{text}");
         assert!(
-            text.contains("開き直すと有効"),
-            "既存ペインには効かないことを言う: {text}"
+            text.contains("tako shell-integration uninstall"),
+            "直し方（ブロックだけを外す最簡形）: {text}"
         );
+        for block in &status.legacy_blocks {
+            assert!(
+                text.contains(&block.path.display().to_string()),
+                "{} の場所が出ていない: {text}",
+                block.label
+            );
+        }
+        // 残っていなければ注記は出ない
+        assert!(!check_line_for(&windows_status(Some(PWSH))).contains("[注意]"));
     }
 
     #[test]
     fn 失敗しても止めず残り1件へ落とす() {
-        let (lines, remaining) = failure_lines("PowerShell が見つからないため配置先がありません");
+        let (lines, remaining) = failure_lines("統合スクリプトを書き出せません: 書き込み禁止");
         let text = lines.join("\n");
         assert!(text.starts_with("  [警告]"), "{text}");
-        assert!(
-            text.contains("PowerShell が見つからない"),
-            "理由を出す: {text}"
-        );
+        assert!(text.contains("書き込み禁止"), "理由を出す: {text}");
         assert!(
             text.contains("tako shell-integration install"),
             "次に打つ 1 行: {text}"
@@ -461,57 +355,27 @@ mod stage_tests {
             remaining
                 .detail
                 .iter()
-                .any(|line| line.contains("PowerShell が見つからない")),
+                .any(|line| line.contains("書き込み禁止")),
             "理由を黙って捨てていない: {:?}",
             remaining.detail
         );
     }
 
     #[test]
-    fn checkは配置状況を読むだけで残りも判断する() {
-        // 注入だけで効く環境: OK・残り 0 件
-        let unix = unix_status();
-        assert!(
-            check_line_for(&unix).contains("[OK]"),
-            "{}",
-            check_line_for(&unix)
-        );
-        assert!(check_remaining_for(&unix).is_none());
-
-        // 配置済み: OK・残り 0 件
-        let done = windows_status(vec![target("PowerShell 7", true, true)]);
-        assert!(check_line_for(&done).contains("配置済み"));
-        assert!(check_remaining_for(&done).is_none());
-
-        // 未配置: 不足・残り 1 件（書き先も出す）
-        let todo = windows_status(vec![target("PowerShell 7", false, false)]);
-        let line = check_line_for(&todo);
-        assert!(line.contains("[不足]"), "{line}");
-        assert!(line.contains("profile.ps1"), "書き先を出す: {line}");
-        assert_eq!(
-            check_remaining_for(&todo).map(|r| r.kind),
-            Some(RemainingKind::ShellIntegration)
-        );
-
-        // 配置先が 1 つも無い（PowerShell 不在）
-        let none = windows_status(Vec::new());
-        assert!(
-            check_line_for(&none).contains("見つかりません"),
-            "{}",
-            check_line_for(&none)
-        );
-        assert_eq!(
-            check_remaining_for(&none).map(|r| r.kind),
-            Some(RemainingKind::ShellIntegration),
-            "配置先が無いことも「残り」として見える"
-        );
+    fn checkは状況を読むだけで残りを積まない() {
+        for status in [unix_status(), windows_status(Some(PWSH))] {
+            let line = check_line_for(&status);
+            assert!(line.contains("[OK]"), "{line}");
+            assert!(check_remaining_for(&status).is_none());
+        }
+        assert!(check_line_for(&windows_status(Some(PWSH))).contains("起動時に読ませる"));
     }
 
     #[test]
-    fn 器がoscを落とすなら配置しても効かないことを言う() {
-        let mut status = windows_status(vec![target("PowerShell 7", true, true)]);
+    fn 器がoscを落とすなら効かないことを言う() {
+        let mut status = windows_status(Some(PWSH));
         status.blocked_by_backend = Some("永続バックエンドが OSC を通さない".to_string());
-        let text = result_lines(&status, &[]).join("\n");
+        let text = state_lines(&status, Phase::Setup).join("\n");
         assert!(text.contains("[注意]"), "{text}");
         assert!(text.contains("OSC を通さない"), "{text}");
         assert!(
@@ -521,8 +385,8 @@ mod stage_tests {
         );
     }
 
-    /// 実行環境そのものを相手にする 1 本（macOS では注入経路・Windows では配置経路）。
-    /// **どちらでも「段は表示を返して人へ残りを丸投げしない」**ことだけを見る
+    /// 実行環境そのものを相手にする 1 本（macOS では注入経路・Windows では起動引数の経路）。
+    /// **どちらでも「段は表示を返し、ユーザーのファイルを書かず、人へ残りを丸投げしない」**
     #[test]
     fn 実環境の段は表示を返す() {
         if legacy_no_setup_stage() {
@@ -535,13 +399,11 @@ mod stage_tests {
             "段組みの字下げとタグが崩れている: {:?}",
             outcome.lines
         );
-        if cfg!(unix) {
-            assert!(
-                outcome.remaining.is_none(),
-                "unix は配置するものが無いので残りは出ない: {:?}",
-                outcome.remaining
-            );
-        }
+        assert!(
+            outcome.remaining.is_none(),
+            "置くものが無いので残りは出ない: {:?}",
+            outcome.remaining
+        );
     }
 }
 
@@ -570,11 +432,20 @@ mod tests {
             "shells",
             "installed",
             "effective",
-            "targets",
+            "launch_shell",
+            "legacy_blocks",
             "blocked_by_backend",
         ] {
             assert!(out.get(key).is_some(), "{key} が応答に無い: {out}");
         }
+    }
+
+    /// #2432: install はどの OS でもユーザーのファイルを書かない（変更 0 件）
+    #[test]
+    fn installはユーザーのファイルを書かない() {
+        let out = run(Some("install")).expect("スクリプトを書き出せる");
+        assert_eq!(out["action"], "install");
+        assert_eq!(out["changes"], json!([]), "{out}");
     }
 
     #[test]
@@ -588,16 +459,32 @@ mod tests {
     }
 
     /// unix は env 注入で完結するので配置対象を持たない。
-    /// **「配置済み」と報告されるが「解除するものは無い」**という組み合わせを固定する
+    /// **「有効」と報告されるが「解除するものは無い」**という組み合わせを固定する
     #[cfg(unix)]
     #[test]
     fn unix_は自動配置で解除対象を持たない() {
         let out = run(None).unwrap();
         assert_eq!(out["delivery"], "automatic");
         assert_eq!(out["installed"], true);
-        assert_eq!(out["targets"], json!([]));
+        assert_eq!(out["legacy_blocks"], json!([]));
+        assert_eq!(out["launch_shell"], json!(null));
 
         let err = run(Some("uninstall")).expect_err("解除する配置が無い");
         assert!(err.contains("環境変数"), "{err}");
+    }
+
+    /// Windows は起動引数で読ませるので配置対象を持たない（#2432）。検証プロセスは
+    /// 本物の `$PROFILE` を見ないので、解除は「残っていない」で断る
+    #[cfg(windows)]
+    #[test]
+    fn windows_は起動引数で届き解除対象を持たない() {
+        let out = run(None).unwrap();
+        assert_eq!(out["delivery"], "launch");
+        assert_eq!(out["installed"], true, "{out}");
+        assert!(out["launch_shell"].is_string(), "{out}");
+        assert_eq!(out["legacy_blocks"], json!([]));
+
+        let err = run(Some("uninstall")).expect_err("解除する配置が無い");
+        assert!(err.contains("起動引数"), "{err}");
     }
 }

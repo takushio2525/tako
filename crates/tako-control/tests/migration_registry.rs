@@ -96,6 +96,20 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         // #1959: tako mod の写しと管理印。設定 dir ごとに tako が置く（共有しない = Local）
         ("skills/tako/", SchemaId::ClaudeModMark),
     ];
+    // 共有分類カタログに**載らない**番地（tako が置いたものではなく、利用者のファイルの中の
+    // tako の管理ブロックを取り除くためだけの番地）。デバイス間で共有するものではないので
+    // カタログの根（`Root`）を増やさない。足すなら理由を添えてここへ
+    const OUTSIDE_CATALOG: &[(&str, SchemaId)] = &[
+        // #2432: 以前の版が `$PROFILE` に置いたシェル統合のブロック（移行で取り除くだけ）
+        ("<PowerShell の $PROFILE>", SchemaId::PowerShellProfile),
+    ];
+    for (path, id) in OUTSIDE_CATALOG {
+        assert!(
+            migrations::spec(*id).is_some(),
+            "{} が移行の番地に無い（{path}）",
+            id.as_str()
+        );
+    }
     use tako_control::config_share::catalog;
     for (root, mapping) in [
         (catalog::Root::TakoData, MAPPING),
@@ -116,7 +130,7 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         }
     }
     assert_eq!(
-        MAPPING.len() + CLAUDE_MAPPING.len(),
+        MAPPING.len() + CLAUDE_MAPPING.len() + OUTSIDE_CATALOG.len(),
         SchemaId::all().len(),
         "番地を足したら対応表にも足す（どのファイルの版数かが分からなくなる）"
     );

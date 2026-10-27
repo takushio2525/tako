@@ -7,10 +7,12 @@
 //! - unix: シェルが拾う環境変数を注入するだけで済む。**シェル判定はしない**
 //!   （zsh は `ZDOTDIR`、bash は `PROMPT_COMMAND`、fish は `XDG_DATA_DIRS` しか
 //!   見ないため、3 点セットを常時注入しても互いに無害）。ユーザーのファイルは触らない
-//! - Windows: PowerShell に `ZDOTDIR` 相当の環境変数が無いので、`$PROFILE` へ
-//!   マーカーで囲んだ 1 ブロックを書く（#525）。配置は [`install`] /
-//!   [`uninstall`] / [`status`] で、CLI・MCP へ 1:1 で出す
+//! - Windows: PowerShell に `ZDOTDIR` 相当の環境変数が無いので、tako がペインの
+//!   PowerShell を起こすときの**起動引数**で統合を読ませる（[`pane_shell`]。#2432）。
+//!   ユーザーの `$PROFILE` は書かない（#525〜#2432 の間は書いていた。残っている管理ブロックは
+//!   自動移行が [`strip_legacy_block`] で取り除く）
 //!
+//! 状態は [`status`]、`install` / `uninstall` と合わせて CLI・MCP へ 1:1 で出す。
 //! 無効化は `TAKO_NO_SHELL_INTEGRATION=1`（FR-2.4.4 の設定 UI までの暫定）。
 
 use std::path::{Path, PathBuf};
@@ -23,12 +25,10 @@ const BASH_SCRIPT: &str = include_str!("../shell-integration/tako.bash");
 const FISH_SCRIPT: &str = include_str!("../shell-integration/tako.fish");
 const POWERSHELL_SCRIPT: &str = include_str!("../shell-integration/tako.ps1");
 
-/// `$PROFILE` へ書くブロックの開始・終了マーカー。**この 2 行が管理範囲の定義**で、
-/// 再配置（冪等）も解除もこの区間だけを見る。文字列を変えると既存の配置を
-/// 見失うので、変えるときは移行を用意すること
-#[cfg_attr(not(windows), allow(dead_code))]
+/// 以前の版（#525〜#2432）が `$PROFILE` へ書いたブロックの開始・終了マーカー。
+/// **この 2 行が管理範囲の定義**で、取り除くときもこの区間だけを見る。
+/// 新しくは書かない（#2432）。利用者の PC に残っている配置を見失わないよう文字列は変えない
 const BLOCK_BEGIN: &str = "# >>> tako shell integration >>>";
-#[cfg_attr(not(windows), allow(dead_code))]
 const BLOCK_END: &str = "# <<< tako shell integration <<<";
 
 /// 同梱している zsh-autosuggestions（MIT）の本体。出所とライセンスは
@@ -66,8 +66,8 @@ pub fn cli_file_name() -> String {
 /// これを避けるため、器はこの名前のぶんを `-e` でセッション作成時に固定する
 /// （[`crate::backend::session_pinned_env`]）。
 ///
-/// Windows は `$PROFILE` 経由で spawn 時の注入が無いので、この表は POSIX 側だけを指す
-/// （名前が載っていても `options.env` に無ければ何も起きない）
+/// Windows は環境変数ではなく起動引数で読ませる（[`pane_shell`]。#2432）ので、この表は
+/// POSIX 側だけを指す（名前が載っていても `options.env` に無ければ何も起きない）
 pub const INJECTED_KEYS: &[&str] = &[
     // zsh
     "ZDOTDIR",
@@ -385,7 +385,7 @@ fn write_powershell_script(root: &Path) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-// --- 配置 API（B13）。Windows は `$PROFILE` へ、unix は env 注入で完結する ---
+// --- 届け方（B13）。unix は env 注入、Windows はペインの PowerShell の起動引数 ---
 
 /// この環境でシェル統合が対象にするシェル。
 ///
@@ -396,13 +396,19 @@ pub fn shells() -> &'static str {
     imp::SHELLS
 }
 
-/// 統合の届け方。**ユーザーに「何をすれば効くのか」を説明するために種類が要る**
+/// 統合の届け方。**ユーザーに「何をすれば効くのか」を説明するために種類が要る**。
+///
+/// どちらも**ユーザーのファイルを触らない**。#2432 より前の Windows は `$PROFILE` へ
+/// 管理ブロックを書いていたが、実行ポリシーが既定（クライアント OS は Restricted）の PC では
+/// tako の外の PowerShell（Windows Terminal・VS Code）まで起動のたびにエラーを出しうるので、
+/// tako のペインだけで読む形へ替えた（10/27 のユーザー判断）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
-    /// 環境変数の注入だけで済む（ユーザーのファイルを触らない）
+    /// 環境変数の注入だけで済む（unix。zsh は `ZDOTDIR`・bash は `PROMPT_COMMAND`・
+    /// fish は `XDG_DATA_DIRS` を拾う）
     Automatic,
-    /// ユーザーの `$PROFILE` へブロックを書く必要がある
-    Profile,
+    /// tako がペインのシェル（PowerShell）を起こすときの起動引数で読ませる（Windows。#2432）
+    Launch,
 }
 
 impl Delivery {
@@ -410,52 +416,48 @@ impl Delivery {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Automatic => "automatic",
-            Self::Profile => "profile",
+            Self::Launch => "launch",
         }
     }
 }
 
-/// 配置先 1 件（PowerShell のエディションごと）
+/// #2432 より前の版が `$PROFILE` へ書いた管理ブロックが残っている場所（エディションごと）
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProfileTarget {
+pub struct LegacyBlock {
     /// 表示名（`PowerShell 7` / `Windows PowerShell 5.1`）
     pub label: String,
-    /// 解決に使った実行ファイル
-    pub exe: String,
     /// `$PROFILE.CurrentUserAllHosts`
     pub path: PathBuf,
-    /// 管理ブロックが入っているか
-    pub installed: bool,
-    /// 入っているブロックが現行の内容と一致するか（`installed` が false なら常に false）
-    pub up_to_date: bool,
 }
 
-/// 現在の配置状態
+/// 現在の状態
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub delivery: Delivery,
     /// 統合スクリプト本体（データディレクトリ配下）
     pub script: Option<PathBuf>,
-    /// 配置先。`Automatic` では常に空
-    pub targets: Vec<ProfileTarget>,
-    /// 配置できていても**器（永続バックエンド）が OSC を通さない**ために
+    /// 統合を読ませて起こすシェル（`Launch` のときだけ）。`None` = 既定シェルが
+    /// PowerShell でない（cmd.exe へ落ちた環境）ので統合は効かない
+    pub launch_shell: Option<String>,
+    /// 以前の版が `$PROFILE` に置いた管理ブロックが残っている場所。
+    /// 自動移行（`tako migrate` / `tako setup` / 起動時）が取り除くので、通常は空
+    pub legacy_blocks: Vec<LegacyBlock>,
+    /// 届け方が整っていても**器（永続バックエンド）が OSC を通さない**ために
     /// 統合が届かない場合の説明。届くなら `None`（#525）
     pub blocked_by_backend: Option<String>,
 }
 
 impl Status {
-    /// 配置そのものが済んでいるか（器の事情は見ない）
+    /// 統合がこの環境のペインへ届く形になっているか（器の事情は見ない）
     pub fn installed(&self) -> bool {
         match self.delivery {
             Delivery::Automatic => true,
-            Delivery::Profile => {
-                !self.targets.is_empty() && self.targets.iter().all(|t| t.installed && t.up_to_date)
-            }
+            Delivery::Launch => self.launch_shell.is_some(),
         }
     }
 
     /// この環境で統合が**実際にペインへ効く**か。
-    /// 配置済みでも器が OSC を落とすなら効かない（psmux。#525）
+    /// 届け方が整っていても器が OSC を落とすなら効かない（psmux で側路が無い場合。#525）
     pub fn effective(&self) -> bool {
         self.installed() && self.blocked_by_backend.is_none()
     }
@@ -470,12 +472,10 @@ impl Status {
             "effective": self.effective(),
             "blocked_by_backend": self.blocked_by_backend,
             "osc_transport": osc_transport().as_str(),
-            "targets": self.targets.iter().map(|t| serde_json::json!({
-                "label": t.label,
-                "exe": t.exe,
-                "path": t.path.display().to_string(),
-                "installed": t.installed,
-                "up_to_date": t.up_to_date,
+            "launch_shell": self.launch_shell,
+            "legacy_blocks": self.legacy_blocks.iter().map(|b| serde_json::json!({
+                "label": b.label,
+                "path": b.path.display().to_string(),
             })).collect::<Vec<_>>(),
         })
     }
@@ -541,26 +541,17 @@ fn backend_block() -> Option<String> {
 /// 1 ファイルに対して行った（行わなかった）こと
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
-    /// 新しく書いた
-    Installed,
-    /// 既存のブロックを現行内容へ差し替えた
-    Updated,
-    /// 既に最新だったので触っていない
-    Unchanged,
     /// ブロックを取り除いた
     Removed,
     /// もともと入っていなかった
     Absent,
-    /// 解除の結果ファイルが空になったので削除した
+    /// 取り除いた結果ファイルが空になったので削除した
     Deleted,
 }
 
 impl ChangeKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Installed => "installed",
-            Self::Updated => "updated",
-            Self::Unchanged => "unchanged",
             Self::Removed => "removed",
             Self::Absent => "absent",
             Self::Deleted => "deleted",
@@ -585,43 +576,172 @@ impl Change {
     }
 }
 
-/// 現在の配置状態を調べる
+/// 現在の状態を調べる
 pub fn status() -> Status {
     imp::status()
 }
 
-/// 統合を配置する（冪等。2 回実行してもブロックは 1 個）
+/// 統合スクリプトを最新にする（冪等）。**ユーザーのファイルは触らない**。
+///
+/// どの OS も届け方は spawn 時なので「置く」ものは無い（#2432 で Windows の `$PROFILE` への
+/// 配置をやめた）。以前の版が置いた管理ブロックを取り除くのは自動移行の仕事
+/// （`tako-control::migrations`）で、ここで重ねて触らない
 pub fn install() -> Result<Vec<Change>, String> {
-    imp::install()
+    write_scripts().map_err(|e| format!("統合スクリプトを書き出せません: {e}"))?;
+    Ok(Vec::new())
 }
 
-/// 統合を解除する。**加えた区切りごと取り除き、元のバイト列へ戻す**
+/// 以前の版が `$PROFILE` に置いた管理ブロックを取り除く（[`strip_legacy_block`] の 1 実装）。
+/// 取り除くものが無ければ「解除する配置が無い」ことをエラーで返す
 pub fn uninstall() -> Result<Vec<Change>, String> {
-    imp::uninstall()
+    let blocks = legacy_blocks();
+    if blocks.is_empty() {
+        return Err(imp::NOTHING_TO_UNINSTALL.to_string());
+    }
+    blocks
+        .into_iter()
+        .map(|block| {
+            let kind = strip_legacy_block(&block.path, None)?;
+            Ok(Change {
+                label: block.label,
+                path: block.path,
+                kind,
+            })
+        })
+        .collect()
+}
+
+/// 素のペイン（起動コマンドの指定が無いペイン）で起こすシェルを、統合を読ませる形で返す（#2432）。
+///
+/// `None` = 既定のまま起こしてよい（unix は env 注入で届く / `TAKO_NO_SHELL_INTEGRATION=1` /
+/// 既定シェルが PowerShell でない）。
+///
+/// **呼ぶのは「素のペインのシェルを決める場所」だけ**: 器なしのペイン（`TerminalSession::spawn`）と
+/// 器のペイン（`tmux_backend::wrap_options` / `PsmuxBackend::wrap_spawn`）。unix で `Some` を
+/// 返してはいけない — tmux はコマンドを渡すと `default-shell -c` で包み、その非対話の zsh が
+/// 統合の `ZDOTDIR` を食って内側の対話シェルへ届かなくなる（2026-06-12 のスパイクで判明）
+pub fn pane_shell() -> Option<crate::terminal::SpawnCommand> {
+    if disabled() {
+        return None;
+    }
+    imp::pane_shell()
+}
+
+/// 以前の版が置いた管理ブロックが残っている `$PROFILE`。
+///
+/// unix では常に空。**検証プロセス（`cargo test`・セルフテスト・隔離起動）でも空を返す**:
+/// 置き場はユーザーの本物の「ドキュメント」で、data dir の隔離では逃がせないため
+/// （中身の判定と取り除き方は [`legacy_blocks_in`] / [`strip_legacy_block`] を一時置き場で検査する）
+pub fn legacy_blocks() -> Vec<LegacyBlock> {
+    if crate::paths::is_verification_process() {
+        return Vec::new();
+    }
+    legacy_blocks_in(&imp::legacy_profile_candidates())
+}
+
+/// 候補（表示名, パス）のうち管理ブロックを持つもの。読めないファイルは「持たない」扱い
+pub fn legacy_blocks_in(candidates: &[(String, PathBuf)]) -> Vec<LegacyBlock> {
+    candidates
+        .iter()
+        .filter(|(_, path)| std::fs::read(path).is_ok_and(|bytes| find_block(&bytes).is_some()))
+        .map(|(label, path)| LegacyBlock {
+            label: label.clone(),
+            path: path.clone(),
+        })
+        .collect()
+}
+
+/// 1 ファイルから以前の版の管理ブロックを取り除く（自動移行と `uninstall` の 1 実装。#2432）。
+///
+/// - **ブロックの外はバイトのまま残す**（BOM・改行コード・ANSI の日本語を含めて符号を変えない。
+///   区切り改行の戻し方は [`crate::text_block`] の 1 実装）
+/// - 取り除いた結果が空（BOM と空白だけ）なら**ファイルを消す**。以前の版は profile が無い PC へ
+///   新しく作っていたので、空のまま残すと実行ポリシーが Restricted の PC では空の
+///   `profile.ps1` を読みに行ってエラーを出し続ける
+/// - `backup` を渡すと、書き換える前の中身をそこへ写す（既にあれば上書きしない =
+///   最初の旧内容を潰さない）。写せなければ取り除かない
+pub fn strip_legacy_block(path: &Path, backup: Option<&Path>) -> Result<ChangeKind, String> {
+    let current = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ChangeKind::Absent),
+        Err(e) => return Err(format!("{} を読めません: {e}", path.display())),
+    };
+    if find_block(&current).is_none() {
+        return Ok(ChangeKind::Absent);
+    }
+    if let Some(backup) = backup.filter(|b| !b.exists()) {
+        std::fs::write(backup, &current).map_err(|e| {
+            format!(
+                "退避に失敗したので取り除かない（{}）: {e}",
+                backup.display()
+            )
+        })?;
+    }
+    let next = remove_block(&current);
+    if split_bom(&next).1.iter().all(u8::is_ascii_whitespace) {
+        std::fs::remove_file(path)
+            .map_err(|e| format!("{} を削除できません: {e}", path.display()))?;
+        return Ok(ChangeKind::Deleted);
+    }
+    std::fs::write(path, &next)
+        .map_err(|e| format!("{} を書き換えられません: {e}", path.display()))?;
+    Ok(ChangeKind::Removed)
 }
 
 // --- ここから下はプラットフォーム非依存の純粋関数（macOS 上でも全部テストできる） ---
 
-/// `$PROFILE` へ書くブロック本文（末尾は改行 1 個）。
+/// PowerShell のペインに統合を読ませる起動コマンド（純粋関数。#2432）。
 ///
-/// **本文は ASCII だけで書く**。書き込み先はユーザーのファイルで、符号は UTF-8 とは
-/// 限らない（BOM 無しの `.ps1` は Windows PowerShell 5.1 では ANSI = 日本語環境なら
-/// CP932）。日本語のコメントを混ぜると、そのファイルを開いたときだけ化ける
-/// 「符号が混ざったファイル」を作ってしまう。日本語の説明は `tako setup` の出力と
-/// ドキュメントが担当する（そちらは端末の符号が分かっているので安全に出せる）
-#[cfg_attr(not(windows), allow(dead_code))]
-fn profile_block(script: &Path) -> String {
-    let literal = powershell_ascii_literal(&script.display().to_string());
+/// - **`-NoProfile` を付けない**: ユーザーの profile は今までどおり読まれ、統合はその後に読む
+///   （PowerShell は profile → `-Command` の順に走らせる。oh-my-posh 等が profile で
+///   差し替えた `prompt` を後から包むので、ユーザーのプロンプトを潰さない）
+/// - **スクリプトファイルを実行しない**: 本文をテキストで読み、`[scriptblock]::Create` で
+///   実行する。実行ポリシー（既定の Restricted を含む）が止めるのはスクリプトファイルの
+///   実行で、コマンドとして渡した文字列は対象外。`-ExecutionPolicy Bypass` で起こす案は
+///   採らなかった: ペインのセッションの実行ポリシーそのものが緩み、Process スコープの値を
+///   持つ環境変数 `PSExecutionPolicyPreference` を継承する子の PowerShell（エージェントや
+///   npm が起こすもの）まで Bypass になる
+/// - **`-EncodedCommand`**: パスに空白・単引用符・非 ASCII があっても、ConPTY の argv・器
+///   （psmux）の単語分割・PowerShell の 3 層で引用符が崩れない（#875 の実行ペインと同じ手）
+/// - 読めない・壊れているときは**黙って素のシェルになる**（ペインに赤いエラーを出さない。
+///   効いているかは `tako shell-integration` の status とセルフテスト 41 で見える）
+pub fn powershell_pane_command(program: &str, script: &Path) -> crate::terminal::SpawnCommand {
+    crate::terminal::SpawnCommand {
+        program: program.to_string(),
+        args: vec![
+            "-NoExit".to_string(),
+            "-EncodedCommand".to_string(),
+            crate::platform::shell::encode_powershell_command(&powershell_bootstrap(script)),
+        ],
+    }
+}
+
+/// [`powershell_pane_command`] が渡すコマンド本文。パスは ASCII だけの式で埋める
+/// （[`powershell_ascii_literal`]。非 ASCII のパスは `[char]0xNNNN` へ逃がす）
+fn powershell_bootstrap(script: &Path) -> String {
+    let path = powershell_ascii_literal(&script.display().to_string());
     format!(
-        "{BLOCK_BEGIN}\n\
-         # Managed by `tako shell-integration`. Remove with `tako shell-integration uninstall`.\n\
-         # Enables pane cwd tracking and command state (OSC 7 / 133) inside tako panes.\n\
-         if ($env:TAKO_PANE_ID) {{\n\
-         \x20   $__takoShellIntegrationScript = {literal}\n\
-         \x20   if (Test-Path -LiteralPath $__takoShellIntegrationScript) {{ . $__takoShellIntegrationScript }}\n\
-         }}\n\
-         {BLOCK_END}\n"
+        "$__takoShellIntegrationScript = {path}; \
+         if (Test-Path -LiteralPath $__takoShellIntegrationScript) {{ \
+         try {{ . ([scriptblock]::Create([System.IO.File]::ReadAllText($__takoShellIntegrationScript))) }} catch {{ }} }}; \
+         Remove-Variable -Name __takoShellIntegrationScript -ErrorAction SilentlyContinue"
     )
+}
+
+/// `$PROFILE.CurrentUserAllHosts` の置き場（純粋関数）。PowerShell 7 と 5.1 は
+/// 「ドキュメント」の下のフォルダ名だけが違う（`PowerShell` / `WindowsPowerShell`）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn profile_candidates_in(documents: &Path) -> Vec<(String, PathBuf)> {
+    vec![
+        (
+            "PowerShell 7".to_string(),
+            documents.join("PowerShell").join("profile.ps1"),
+        ),
+        (
+            "Windows PowerShell 5.1".to_string(),
+            documents.join("WindowsPowerShell").join("profile.ps1"),
+        ),
+    ]
 }
 
 /// 管理ブロックのマーカー。読み書きの規則（区切り改行 1 個・元バイト列への完全復帰）は
@@ -630,28 +750,29 @@ const MARKERS: crate::text_block::BlockMarkers =
     crate::text_block::BlockMarkers::new(BLOCK_BEGIN, BLOCK_END);
 
 /// ブロックの位置（開始バイト, 終了バイト = 末尾改行を含む）
-#[cfg_attr(not(windows), allow(dead_code))]
 fn find_block(text: &[u8]) -> Option<(usize, usize)> {
     MARKERS.find(text)
 }
 
-/// ブロックを配置した結果のファイル内容（あれば置換、無ければ追記）
-#[cfg_attr(not(windows), allow(dead_code))]
-fn apply_block(original: &[u8], block: &str) -> Vec<u8> {
-    MARKERS.apply(original, block)
-}
-
-/// ブロックを取り除いた結果のファイル内容。[`apply_block`] が足した改行も戻す
-#[cfg_attr(not(windows), allow(dead_code))]
+/// ブロックを取り除いた結果のファイル内容。配置のときに足した区切りの改行も戻す
 fn remove_block(current: &[u8]) -> Vec<u8> {
     MARKERS.remove(current)
 }
 
+/// UTF-8 の BOM と本文に分ける（BOM が無ければ前半は空）
+fn split_bom(raw: &[u8]) -> (&[u8], &[u8]) {
+    if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        raw.split_at(3)
+    } else {
+        (&[], raw)
+    }
+}
+
 /// 文字列を **ASCII だけで書かれた** PowerShell の文字列式にする。
 ///
-/// 5.1 は BOM 無しの `.ps1` を ANSI コードページとして読むため、既存プロファイルへ
-/// 非 ASCII を追記すると化ける（実測: 検証機の `$PROFILE` は
-/// `…\OneDrive\ドキュメント\PowerShell\` にある）。非 ASCII は `[char]0xNNNN` へ逃がす
+/// 5.1 は BOM 無しの `.ps1` を ANSI コードページとして読むため、非 ASCII を
+/// そのまま埋めると化ける（実測: 検証機の「ドキュメント」は `…\OneDrive\ドキュメント\`）。
+/// 非 ASCII は `[char]0xNNNN` へ逃がす。
 /// **`shell_profile`（#868 の PATH 通し）と共有する**。同じ escape を 2 つ持つと
 /// 必ず片方が腐るので、実装はここ 1 本に保つ
 pub(crate) fn powershell_ascii_literal(value: &str) -> String {
@@ -682,9 +803,9 @@ pub(crate) fn powershell_ascii_literal(value: &str) -> String {
 
 #[cfg(unix)]
 mod imp {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    use super::{Change, Delivery, Status};
+    use super::{Delivery, Status};
 
     pub(super) const SHELLS: &str = "zsh / bash / fish";
     /// 側路（#766）に対応した統合スクリプトを持っているか。
@@ -692,6 +813,8 @@ mod imp {
     /// zsh / bash / fish の正本にも書き先の扱いを入れていない。
     /// **通さない器を unix で採ることになったら、正本へ足してからここを true にする**
     pub(super) const SIDE_CHANNEL: bool = false;
+    pub(super) const NOTHING_TO_UNINSTALL: &str =
+        "この環境のシェル統合は環境変数の注入だけで完結するため、解除する配置がありません";
 
     /// unix はシェルが拾う環境変数を撒くだけで届く（ユーザーのファイルを触らない）
     pub(super) fn injected_env(root: &Path, bash_path: &Path) -> Vec<(String, String)> {
@@ -721,279 +844,154 @@ mod imp {
         env
     }
 
+    /// env 注入で届くので、素のペインは既定のシェルをそのまま起こす（[`super::pane_shell`]）
+    pub(super) fn pane_shell() -> Option<crate::terminal::SpawnCommand> {
+        None
+    }
+
     pub(super) fn status() -> Status {
         Status {
             delivery: Delivery::Automatic,
             script: super::integration_root().map(|r| r.join("tako.bash")),
-            targets: Vec::new(),
+            launch_shell: None,
+            legacy_blocks: Vec::new(),
             blocked_by_backend: super::backend_block(),
         }
     }
 
-    /// 配置するものが無いので、スクリプトを最新にするだけ（冪等）
-    pub(super) fn install() -> Result<Vec<Change>, String> {
-        super::write_scripts().map_err(|e| format!("統合スクリプトを書き出せません: {e}"))?;
-        Ok(Vec::new())
-    }
-
-    pub(super) fn uninstall() -> Result<Vec<Change>, String> {
-        Err(
-            "この環境のシェル統合は環境変数の注入だけで完結するため、解除する配置がありません"
-                .to_string(),
-        )
+    /// `$PROFILE` は Windows にしか無い
+    pub(super) fn legacy_profile_candidates() -> Vec<(String, PathBuf)> {
+        Vec::new()
     }
 }
 
 #[cfg(windows)]
 mod imp {
-    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
-    use super::{Change, ChangeKind, Delivery, ProfileTarget, Status};
+    use super::{Delivery, Status};
+    use crate::platform::shell_dialect::ShellDialect;
 
     pub(super) const SHELLS: &str = "PowerShell 7 / Windows PowerShell 5.1";
     /// `tako.ps1` は `TAKO_OSC_SINK` があれば OSC を側路へ書く（#766）
     pub(super) const SIDE_CHANNEL: bool = true;
+    pub(super) const NOTHING_TO_UNINSTALL: &str =
+        "この環境のシェル統合は tako がペインの PowerShell を起こすときの起動引数で読ませるため、\
+         解除する配置がありません（以前の版が $PROFILE に置いた管理ブロックも残っていません）";
 
-    /// Windows は `$PROFILE` 経由なので、spawn 時に注入する環境変数は無い。
+    /// Windows は起動引数で読ませる（[`pane_shell`]）ので、spawn 時に注入する環境変数は無い。
     /// POSIX 用の 3 点セットを撒いても PowerShell は 1 つも見ないため、ペインの
     /// 環境を汚さないよう出さない
     pub(super) fn injected_env(_root: &Path, _bash_path: &Path) -> Vec<(String, String)> {
         Vec::new()
     }
 
+    /// 既定シェルが PowerShell なら、統合を読ませる起動引数を足して返す（#2432）
+    pub(super) fn pane_shell() -> Option<crate::terminal::SpawnCommand> {
+        let program = powershell_default_shell()?;
+        let script = super::integration_root()?.join("tako.ps1");
+        // 書き出しはプロセスで 1 回（`env()` の OnceLock）。器のペインのように
+        // `TerminalSession::spawn` より前に起動コマンドを組む経路でも、シェルが
+        // 読みに行く時点でスクリプトが在るようにする
+        let _ = super::env();
+        Some(super::powershell_pane_command(&program, &script))
+    }
+
+    /// 素のペインの既定シェル（PowerShell のときだけ。cmd.exe へ落ちた環境は `None`）
+    fn powershell_default_shell() -> Option<String> {
+        crate::platform::shell::default_shell()
+            .map(|s| s.program)
+            .filter(|p| ShellDialect::from_program(p) == Some(ShellDialect::PowerShell))
+    }
+
     pub(super) fn status() -> Status {
-        let script = super::integration_root().map(|r| r.join("tako.ps1"));
-        let block = script.as_deref().map(super::profile_block);
-        let targets = editions()
-            .into_iter()
-            .filter_map(|(label, exe)| {
-                let path = profile_path_cached(&exe)?;
-                let content = std::fs::read(&path).unwrap_or_default();
-                let found = super::find_block(&content);
-                let up_to_date = match (&found, &block) {
-                    (Some((b, e)), Some(block)) => &content[*b..*e] == block.as_bytes(),
-                    _ => false,
-                };
-                Some(ProfileTarget {
-                    label,
-                    exe,
-                    path,
-                    installed: found.is_some(),
-                    up_to_date,
-                })
-            })
-            .collect();
         Status {
-            delivery: Delivery::Profile,
-            script,
-            targets,
+            delivery: Delivery::Launch,
+            script: super::integration_root().map(|r| r.join("tako.ps1")),
+            launch_shell: powershell_default_shell(),
+            legacy_blocks: super::legacy_blocks(),
             blocked_by_backend: super::backend_block(),
         }
     }
 
-    pub(super) fn install() -> Result<Vec<Change>, String> {
-        let root = super::integration_root()
-            .ok_or_else(|| "データディレクトリを解決できません".to_string())?;
-        let script = super::write_powershell_script(&root)
-            .map_err(|e| format!("統合スクリプトを書き出せません: {e}"))?;
-        let block = super::profile_block(&script);
-
-        let targets = status().targets;
-        if targets.is_empty() {
-            return Err("PowerShell が見つからないため配置先がありません".to_string());
-        }
-        let mut changes = Vec::new();
-        for target in targets {
-            if target.installed && target.up_to_date {
-                changes.push(Change {
-                    label: target.label,
-                    path: target.path,
-                    kind: ChangeKind::Unchanged,
-                });
-                continue;
-            }
-            let kind = if target.installed {
-                ChangeKind::Updated
-            } else {
-                ChangeKind::Installed
-            };
-            write_profile(&target.path, &block)?;
-            changes.push(Change {
-                label: target.label,
-                path: target.path,
-                kind,
-            });
-        }
-        Ok(changes)
+    /// 以前の版が管理ブロックを書いた `$PROFILE.CurrentUserAllHosts`（両エディション）
+    pub(super) fn legacy_profile_candidates() -> Vec<(String, PathBuf)> {
+        documents_dir()
+            .map(|dir| super::profile_candidates_in(&dir))
+            .unwrap_or_default()
     }
 
-    pub(super) fn uninstall() -> Result<Vec<Change>, String> {
-        let mut changes = Vec::new();
-        for target in status().targets {
-            if !target.installed {
-                changes.push(Change {
-                    label: target.label,
-                    path: target.path,
-                    kind: ChangeKind::Absent,
-                });
-                continue;
-            }
-            let current = std::fs::read(&target.path)
-                .map_err(|e| format!("{} を読めません: {e}", target.path.display()))?;
-            // BOM もユーザーの記述もバイトのまま持ち回る（符号を勝手に変えない）
-            let next = super::remove_block(&current);
-            let kind = if split_bom(&next).1.iter().all(u8::is_ascii_whitespace) {
-                // 配置のために作ったファイルを残さない
-                std::fs::remove_file(&target.path)
-                    .map_err(|e| format!("{} を削除できません: {e}", target.path.display()))?;
-                ChangeKind::Deleted
-            } else {
-                std::fs::write(&target.path, &next)
-                    .map_err(|e| format!("{} を書き換えられません: {e}", target.path.display()))?;
-                ChangeKind::Removed
-            };
-            changes.push(Change {
-                label: target.label,
-                path: target.path,
-                kind,
-            });
-        }
-        if changes.is_empty() {
-            return Err("PowerShell が見つからないため配置先がありません".to_string());
-        }
-        Ok(changes)
-    }
-
-    /// プロファイルへブロックを反映する。
+    /// `$PROFILE` の置き場の親 = ユーザーの「ドキュメント」（既知フォルダ `FOLDERID_Documents`）。
     ///
-    /// 新規作成は **BOM 付き UTF-8**（5.1 が BOM 無しを ANSI として読むため）。
-    /// 既存ファイルは **エンコーディングを変えない**（ブロック本文は ASCII のみなので、
-    /// UTF-8 でも ANSI でも同じバイト列になる）
-    fn write_profile(path: &Path, block: &str) -> Result<(), String> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| format!("{} を作成できません: {e}", dir.display()))?;
+    /// PowerShell 自身も `$PROFILE` をここから組む（5.1 / 7 とも
+    /// `Environment.GetFolderPath(MyDocuments)` = 同じ既知フォルダ）。**PowerShell を起こして
+    /// 尋ねない**: 移行は GUI の起動・`tako master` のたびに走るので、1 回 200〜400ms の起動を
+    /// 2 エディションぶん払うと体感できるほど遅くなる。`%USERPROFILE%\Documents` の決め打ちは
+    /// OneDrive のフォルダーリダイレクトで外れる（実測: 検証機は `…\OneDrive\ドキュメント`）ので、
+    /// それは API が答えないときの保険にだけ使う。PowerShell の答えとの一致は Windows の
+    /// テスト（`旧ブロックの置き場はpowershellが答える場所と一致する`）が見る
+    pub(super) fn documents_dir() -> Option<PathBuf> {
+        known_documents_dir().or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|v| !v.is_empty())
+                .map(|home| PathBuf::from(home).join("Documents"))
+        })
+    }
+
+    fn known_documents_dir() -> Option<PathBuf> {
+        use std::os::windows::ffi::OsStringExt;
+
+        #[repr(C)]
+        struct Guid {
+            data1: u32,
+            data2: u16,
+            data3: u16,
+            data4: [u8; 8],
         }
-        let raw = match std::fs::read(path) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(format!("{} を読めません: {e}", path.display())),
+        // {FDD39AD0-238F-46AF-ADB4-6C85480369C7}
+        const FOLDERID_DOCUMENTS: Guid = Guid {
+            data1: 0xFDD3_9AD0,
+            data2: 0x238F,
+            data3: 0x46AF,
+            data4: [0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7],
         };
-        // 中身が無い（新規 / 空）ときだけ BOM を付ける。既存ファイルには足さない
-        // （ANSI のファイルへ BOM を付けると別の符号として読まれる）
-        let out = if split_bom(&raw).1.is_empty() {
-            let mut out = vec![0xEF, 0xBB, 0xBF];
-            out.extend_from_slice(block.as_bytes());
-            out
+        // `windows-sys` を足さず必要な関数だけ宣言する方針は `platform::install_info` と同じ
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn SHGetKnownFolderPath(
+                rfid: *const Guid,
+                dwflags: u32,
+                htoken: isize,
+                ppszpath: *mut *mut u16,
+            ) -> i32;
+        }
+        #[link(name = "ole32")]
+        unsafe extern "system" {
+            fn CoTaskMemFree(pv: *const std::ffi::c_void);
+        }
+
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        // SAFETY: GUID と受け取り先は有効なポインタ。htoken = 0 は「このプロセスのユーザー」
+        let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_DOCUMENTS, 0, 0, &mut raw) };
+        let dir = if hr >= 0 && !raw.is_null() {
+            let mut len = 0usize;
+            // SAFETY: 成功時の raw は NUL 終端の UTF-16 文字列
+            let wide = unsafe {
+                while *raw.add(len) != 0 {
+                    len += 1;
+                }
+                std::slice::from_raw_parts(raw, len)
+            };
+            Some(PathBuf::from(std::ffi::OsString::from_wide(wide)))
         } else {
-            super::apply_block(&raw, block)
+            None
         };
-        std::fs::write(path, out)
-            .map_err(|e| format!("{} を書き換えられません: {e}", path.display()))
-    }
-
-    fn split_bom(raw: &[u8]) -> (&[u8], &[u8]) {
-        if raw.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            raw.split_at(3)
-        } else {
-            (&[], raw)
+        // 受け取ったバッファは成否によらず返す（API の契約）
+        if !raw.is_null() {
+            // SAFETY: SHGetKnownFolderPath が CoTaskMemAlloc で確保したもの
+            unsafe { CoTaskMemFree(raw.cast()) };
         }
-    }
-
-    /// この環境に居る PowerShell のエディション。**両方に配置する**
-    /// （片方だけだと、ペインで `powershell` と打った瞬間に統合が消える）
-    fn editions() -> Vec<(String, String)> {
-        let mut found = Vec::new();
-        if let Some(pwsh) = crate::platform::exe::find("pwsh") {
-            found.push(("PowerShell 7".to_string(), pwsh));
-        }
-        if let Some(root) = std::env::var_os("SystemRoot").and_then(|v| v.into_string().ok()) {
-            let ps = format!("{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
-            if Path::new(&ps).exists() {
-                found.push(("Windows PowerShell 5.1".to_string(), ps));
-            }
-        }
-        found
-    }
-
-    /// 解決した `$PROFILE` のプロセス内キャッシュ。
-    /// `status()` は setup の 1 回の実行中に何度も呼ばれるが、1 回あたり PowerShell の
-    /// 起動（実測 200〜400ms）なので、素直に呼ぶと体感できるだけ遅くなる
-    fn profile_path_cached(exe: &str) -> Option<PathBuf> {
-        static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<PathBuf>>>> =
-            std::sync::OnceLock::new();
-        let cache = CACHE.get_or_init(Default::default);
-        if let Some(hit) = cache.lock().ok().and_then(|c| c.get(exe).cloned()) {
-            return hit;
-        }
-        let resolved = profile_path(exe);
-        if let Ok(mut c) = cache.lock() {
-            c.insert(exe.to_string(), resolved.clone());
-        }
-        resolved
-    }
-
-    /// `$PROFILE.CurrentUserAllHosts` を **PowerShell 自身に尋ねる**。
-    ///
-    /// `%USERPROFILE%\Documents` の決め打ちは OneDrive のフォルダーリダイレクトで外れる
-    /// （実測: 検証機は `…\OneDrive\ドキュメント\PowerShell\profile.ps1`）。
-    /// 受け取りは **UTF-8 バイトの 16 進**にする — 5.1 のリダイレクト出力は OEM
-    /// コードページなので、生の文字列で受けると日本語のパスが壊れる
-    fn profile_path(exe: &str) -> Option<PathBuf> {
-        const SCRIPT: &str = "-join ([System.Text.Encoding]::UTF8.GetBytes($PROFILE.CurrentUserAllHosts) | ForEach-Object { '{0:x2}' -f $_ })";
-        let mut cmd = Command::new(exe);
-        cmd.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            SCRIPT,
-        ]);
-        crate::platform::process::no_console_window(&mut cmd);
-        let out = cmd.output().ok()?;
-        if !out.status.success() {
-            return fallback_profile_path(exe);
-        }
-        let hex: String = String::from_utf8_lossy(&out.stdout)
-            .chars()
-            .filter(|c| c.is_ascii_hexdigit())
-            .collect();
-        decode_hex(&hex)
-            .and_then(|b| String::from_utf8(b).ok())
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| fallback_profile_path(exe))
-    }
-
-    /// PowerShell に尋ねられなかったときの保険。リダイレクトされていない既定の場所
-    fn fallback_profile_path(exe: &str) -> Option<PathBuf> {
-        let home = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty())?;
-        let dir = if exe.to_ascii_lowercase().contains("windowspowershell") {
-            "WindowsPowerShell"
-        } else {
-            "PowerShell"
-        };
-        Some(
-            PathBuf::from(home)
-                .join("Documents")
-                .join(dir)
-                .join("profile.ps1"),
-        )
-    }
-
-    fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-        if !hex.len().is_multiple_of(2) {
-            return None;
-        }
-        let bytes = hex.as_bytes();
-        let mut out = Vec::with_capacity(hex.len() / 2);
-        for pair in bytes.chunks(2) {
-            let s = std::str::from_utf8(pair).ok()?;
-            out.push(u8::from_str_radix(s, 16).ok()?);
-        }
-        Some(out)
+        dir.filter(|d| !d.as_os_str().is_empty())
     }
 }
 
@@ -1470,33 +1468,119 @@ mod tests {
     }
 }
 
-/// PowerShell 統合の純粋関数のテスト（#525）。
+/// PowerShell 統合の純粋関数のテスト（#525 / #2432）。
 ///
-/// **`unix` で切らない**。ここで検証するのは「バイト列の切った貼った」と
-/// 「ASCII への逃がし方」だけで、どのプラットフォームでも同じ答えになる。
+/// **`unix` で切らない**。ここで検証するのは「起動コマンドの形」「バイト列の切った貼った」
+/// 「ASCII への逃がし方」で、どのプラットフォームでも同じ答えになる。
 /// Windows 実機を待たずに macOS の `cargo test` で回せることが重要
 /// （実機でしか走らないテストは書いた本人以外が壊れに気付けない）。
 /// 実際に PowerShell を起動する e2e は `tests/shell_integration_powershell.rs`
 #[cfg(test)]
 mod powershell_tests {
     use super::*;
+    use crate::platform::shell::decode_powershell_command;
+    use crate::test_residue::ScratchDir;
+
+    /// 以前の版（#525〜#2432）が `$PROFILE` へ書いていたブロックと**同じバイト列**。
+    /// 取り除く側の検査は、利用者の PC に実際に残っている形で行う
+    fn legacy_block(script: &Path) -> String {
+        let literal = powershell_ascii_literal(&script.display().to_string());
+        format!(
+            "{BLOCK_BEGIN}\n\
+             # Managed by `tako shell-integration`. Remove with `tako shell-integration uninstall`.\n\
+             # Enables pane cwd tracking and command state (OSC 7 / 133) inside tako panes.\n\
+             if ($env:TAKO_PANE_ID) {{\n\
+             \x20   $__takoShellIntegrationScript = {literal}\n\
+             \x20   if (Test-Path -LiteralPath $__takoShellIntegrationScript) {{ . $__takoShellIntegrationScript }}\n\
+             }}\n\
+             {BLOCK_END}\n"
+        )
+    }
 
     fn block() -> String {
-        profile_block(Path::new("C:\\tako\\tako.ps1"))
+        legacy_block(Path::new("C:\\tako\\tako.ps1"))
     }
 
-    fn text(bytes: &[u8]) -> String {
-        String::from_utf8_lossy(bytes).into_owned()
+    /// 以前の版が既存のプロファイルへ置いた形（新規なら BOM 付きで作っていた）
+    fn installed(original: &[u8]) -> Vec<u8> {
+        if split_bom(original).1.is_empty() {
+            let mut out = vec![0xEF, 0xBB, 0xBF];
+            out.extend_from_slice(block().as_bytes());
+            out
+        } else {
+            MARKERS.apply(original, &block())
+        }
     }
 
+    fn pane_words(script: &str) -> (Vec<String>, String) {
+        let command = powershell_pane_command(
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+            Path::new(script),
+        );
+        assert_eq!(
+            command.program,
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
+        );
+        let body = decode_powershell_command(command.args.last().expect("本文がある"));
+        (command.args, body)
+    }
+
+    /// **受け入れ条件 1 の形**: ユーザーの profile を読む（`-NoProfile` を付けない）・
+    /// 実行ポリシーに触れない（`-ExecutionPolicy` を付けない・スクリプトファイルを実行しない）・
+    /// 対話を続ける（`-NoExit`）
     #[test]
-    fn ブロックはマーカーで囲まれスクリプトを読み込む() {
-        let b = block();
-        assert!(b.starts_with(BLOCK_BEGIN), "{b}");
-        assert!(b.ends_with(&format!("{BLOCK_END}\n")), "{b}");
-        assert!(b.contains("'C:\\tako\\tako.ps1'"), "{b}");
-        // ペインの外では何もしない（プロファイルに置き続けても無害であることの担保）
-        assert!(b.contains("$env:TAKO_PANE_ID"), "{b}");
+    fn ペインの起動コマンドはprofileを読み実行ポリシーに触れない() {
+        let (args, body) = pane_words("C:\\tako\\shell-integration\\tako.ps1");
+        assert_eq!(args.len(), 3, "{args:?}");
+        assert_eq!(args[0], "-NoExit", "{args:?}");
+        assert_eq!(args[1], "-EncodedCommand", "{args:?}");
+        for flag in ["-NoProfile", "-ExecutionPolicy", "-File", "-Command"] {
+            assert!(
+                !args.iter().any(|a| a.eq_ignore_ascii_case(flag)),
+                "{flag} を付けている: {args:?}"
+            );
+        }
+        // 本文はファイルを**テキストで**読み、スクリプトブロックとして実行する
+        assert!(body.contains("[System.IO.File]::ReadAllText("), "{body}");
+        assert!(body.contains(". ([scriptblock]::Create("), "{body}");
+        assert!(
+            body.contains("'C:\\tako\\shell-integration\\tako.ps1'"),
+            "{body}"
+        );
+        // 置き場が消えていても赤いエラーを出さない
+        assert!(body.contains("Test-Path -LiteralPath"), "{body}");
+        assert!(body.contains("catch { }"), "{body}");
+        // ユーザーの変数の名前空間に残さない
+        assert!(
+            body.contains("Remove-Variable -Name __takoShellIntegrationScript"),
+            "{body}"
+        );
+        // ドットソースでファイルを実行する形（実行ポリシーの対象）になっていない
+        assert!(!body.contains(". $__takoShellIntegrationScript"), "{body}");
+        assert!(!body.contains(". '"), "{body}");
+    }
+
+    /// 空白・単引用符・日本語を含むパスでも、引数は 3 語のまま崩れない
+    /// （ConPTY の argv・psmux の単語分割・PowerShell の 3 層を 1 語で通る）
+    #[test]
+    fn 空白と単引用符と日本語のパスでも引数は崩れない() {
+        let script = "C:\\Users\\winuser\\ドキュメント\\it's tako data\\tako.ps1";
+        let (args, body) = pane_words(script);
+        assert_eq!(args.len(), 3, "{args:?}");
+        let encoded = &args[2];
+        assert!(
+            encoded
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')),
+            "base64 以外の文字が混ざっている: {encoded}"
+        );
+        // 本文のパスは ASCII だけの式で、単引用符は二重化される
+        assert!(body.is_ascii(), "{body}");
+        assert!(body.contains("it''s tako data"), "{body}");
+        assert!(
+            body.contains("[char]0x30C9"),
+            "ド が逃がされていない: {body}"
+        );
     }
 
     /// #766: 器が OSC を素通ししないときの側路。**正本のスクリプトが**
@@ -1534,45 +1618,23 @@ mod powershell_tests {
         );
     }
 
+    /// 二重に読まれても 1 回分しか効かない（移行前の `$PROFILE` のブロックと
+    /// 起動引数の両方から読まれる回がある）
     #[test]
-    fn 空プロファイルへの配置は区切りを足さない() {
-        assert_eq!(apply_block(b"", &block()), block().into_bytes());
-    }
-
-    #[test]
-    fn 二回配置してもブロックは一個() {
-        let once = apply_block(b"Set-Alias ll Get-ChildItem\n", &block());
-        let twice = apply_block(&once, &block());
-        assert_eq!(once, twice);
-        assert_eq!(
-            text(&twice).matches(BLOCK_BEGIN).count(),
-            1,
-            "{}",
-            text(&twice)
+    fn ps1は二重に読まれても一度しか効かない() {
+        assert!(
+            POWERSHELL_SCRIPT
+                .contains("if ($env:TAKO_PANE_ID -and -not $global:__takoShellIntegration) {"),
+            "二重読み込みのガードが消えている"
         );
     }
 
-    #[test]
-    fn 内容が変わったブロックは置換されユーザーの記述は残る() {
-        let user = "Set-Alias ll Get-ChildItem\n";
-        let old = apply_block(
-            user.as_bytes(),
-            &profile_block(Path::new("C:\\old\\tako.ps1")),
-        );
-        let new = text(&apply_block(&old, &block()));
-        assert_eq!(new.matches(BLOCK_BEGIN).count(), 1, "{new}");
-        assert!(new.contains("C:\\tako\\tako.ps1"), "{new}");
-        assert!(!new.contains("C:\\old\\tako.ps1"), "{new}");
-        assert!(new.starts_with(user), "{new}");
-    }
-
-    /// **受け入れ条件そのもの**: 解除で元のバイト列へ完全に戻る。
-    /// 末尾の改行の有無・空ファイル・ブロックの後ろにユーザーが書き足した場合まで見る
+    /// **受け入れ条件そのもの**: 取り除くと元のバイト列へ完全に戻る。
+    /// 末尾の改行の有無・ブロックの後ろにユーザーが書き足した場合まで見る
     #[test]
     fn 解除は元のバイト列へ完全に戻す() {
         for original in [
-            &b""[..],
-            b"Set-Alias ll Get-ChildItem\n",
+            &b"Set-Alias ll Get-ChildItem\n"[..],
             b"Set-Alias ll Get-ChildItem",          // 改行で終わらない
             b"a\n\n\nb\n",                          // 連続改行
             b"function prompt { 'x> ' }\r\nls\r\n", // CRLF
@@ -1580,9 +1642,8 @@ mod powershell_tests {
             // バイト列でも壊さずに戻せること = ユーザーのプロファイルを破壊しない保証
             b"# \x93\xfa\x96\x7b\x8c\xea\r\nSet-Alias ll Get-ChildItem\r\n",
         ] {
-            let installed = apply_block(original, &block());
             assert_eq!(
-                remove_block(&installed),
+                remove_block(&installed(original)),
                 original,
                 "元へ戻らない: {original:?}"
             );
@@ -1591,8 +1652,7 @@ mod powershell_tests {
 
     #[test]
     fn ブロックの後ろに書き足されていても解除できる() {
-        let installed = apply_block(b"head\n", &block());
-        let mut edited = installed;
+        let mut edited = installed(b"head\n");
         edited.extend_from_slice(b"tail\n");
         assert_eq!(remove_block(&edited), b"head\ntail\n");
     }
@@ -1601,6 +1661,122 @@ mod powershell_tests {
     fn 未配置のファイルは解除で変化しない() {
         let text = b"Set-Alias ll Get-ChildItem\n";
         assert_eq!(remove_block(text), text);
+    }
+
+    /// 他人の行と混ざったプロファイル: ブロックだけ消え、他の行はバイトのまま残る
+    #[test]
+    fn 取り除くのはブロックだけで他人の行は残す() {
+        let dir = ScratchDir::new("i2432-strip-mixed");
+        let path = dir.path().join("profile.ps1");
+        let user_before = b"# \x93\xfa\x96\x7b\r\nImport-Module posh-git\r\n";
+        let mut bytes = installed(user_before);
+        bytes.extend_from_slice(b"oh-my-posh init pwsh | Invoke-Expression\r\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(strip_legacy_block(&path, None), Ok(ChangeKind::Removed));
+        let mut want = user_before.to_vec();
+        want.extend_from_slice(b"oh-my-posh init pwsh | Invoke-Expression\r\n");
+        assert_eq!(std::fs::read(&path).unwrap(), want);
+        // 2 回目は何もしない（冪等）
+        assert_eq!(strip_legacy_block(&path, None), Ok(ChangeKind::Absent));
+        assert_eq!(std::fs::read(&path).unwrap(), want);
+    }
+
+    /// 以前の版が新しく作ったプロファイル（BOM + ブロックだけ）は**ファイルごと**消える。
+    /// 空の `profile.ps1` を残すと、Restricted の PC では読み込みのエラーが出続ける
+    #[test]
+    fn ブロックだけのプロファイルは消す() {
+        let dir = ScratchDir::new("i2432-strip-only");
+        let path = dir.path().join("profile.ps1");
+        std::fs::write(&path, installed(b"")).unwrap();
+        assert_eq!(strip_legacy_block(&path, None), Ok(ChangeKind::Deleted));
+        assert!(!path.exists(), "空になったプロファイルが残っている");
+        // 空白だけが残る形（利用者が改行を足していた）も消す
+        let mut bytes = installed(b"");
+        bytes.extend_from_slice(b"\r\n\r\n");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(strip_legacy_block(&path, None), Ok(ChangeKind::Deleted));
+        assert!(!path.exists());
+    }
+
+    /// `$PROFILE` が無い・ブロックが無いファイルは触らない
+    #[test]
+    fn 無いファイルとブロックの無いファイルは触らない() {
+        let dir = ScratchDir::new("i2432-strip-absent");
+        let missing = dir.path().join("PowerShell").join("profile.ps1");
+        assert_eq!(strip_legacy_block(&missing, None), Ok(ChangeKind::Absent));
+        assert!(!missing.exists(), "無いファイルを作った");
+
+        let plain = dir.path().join("profile.ps1");
+        std::fs::write(&plain, b"Set-Alias ll Get-ChildItem\n").unwrap();
+        let backup = dir.path().join("profile.ps1.pre-v1.bak");
+        assert_eq!(
+            strip_legacy_block(&plain, Some(&backup)),
+            Ok(ChangeKind::Absent)
+        );
+        assert_eq!(
+            std::fs::read(&plain).unwrap(),
+            b"Set-Alias ll Get-ChildItem\n"
+        );
+        assert!(!backup.exists(), "変えないファイルの退避を作った");
+    }
+
+    /// 退避は書き換える前の中身。既にあれば上書きしない（最初の旧内容を潰さない）。
+    /// 退避できないなら取り除かない
+    #[test]
+    fn 退避してから取り除き退避できなければ触らない() {
+        let dir = ScratchDir::new("i2432-strip-backup");
+        let path = dir.path().join("profile.ps1");
+        let original = installed(b"Set-Alias ll Get-ChildItem\n");
+        std::fs::write(&path, &original).unwrap();
+        let backup = dir.path().join("profile.ps1.pre-v1.bak");
+        assert_eq!(
+            strip_legacy_block(&path, Some(&backup)),
+            Ok(ChangeKind::Removed)
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+
+        // 2 本目のブロックを書いて取り除いても、最初の退避は潰さない
+        std::fs::write(&path, installed(b"second\n")).unwrap();
+        assert_eq!(
+            strip_legacy_block(&path, Some(&backup)),
+            Ok(ChangeKind::Removed)
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+
+        // 退避先に書けない（親が無い）なら本体は 1 バイトも変えない
+        let again = installed(b"third\n");
+        std::fs::write(&path, &again).unwrap();
+        let unwritable = dir
+            .path()
+            .join("no-such-dir")
+            .join("profile.ps1.pre-v1.bak");
+        let err = strip_legacy_block(&path, Some(&unwritable)).expect_err("退避できない");
+        assert!(err.contains("退避に失敗"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), again);
+    }
+
+    /// 候補のうちブロックを持つものだけを返す（読めない・無いは持たない扱い）
+    #[test]
+    fn ブロックが残っているプロファイルだけを拾う() {
+        let dir = ScratchDir::new("i2432-legacy-scan");
+        let candidates = profile_candidates_in(dir.path());
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].0, "PowerShell 7");
+        assert!(candidates[0].1.ends_with("PowerShell/profile.ps1"));
+        assert_eq!(candidates[1].0, "Windows PowerShell 5.1");
+        assert!(candidates[1].1.ends_with("WindowsPowerShell/profile.ps1"));
+        assert!(legacy_blocks_in(&candidates).is_empty(), "どれも無い");
+
+        for (_, path) in &candidates {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&candidates[0].1, b"Set-Alias ll Get-ChildItem\n").unwrap();
+        std::fs::write(&candidates[1].1, installed(b"")).unwrap();
+        let found = legacy_blocks_in(&candidates);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].label, "Windows PowerShell 5.1");
+        assert_eq!(found[0].path, candidates[1].1);
     }
 
     #[test]
@@ -1616,23 +1792,10 @@ mod powershell_tests {
 
     #[test]
     fn 非asciiのパスは_charエスケープへ逃がす() {
-        // 実機の $PROFILE が OneDrive の「ドキュメント」配下にある構成を想定
+        // 実機の「ドキュメント」が OneDrive の日本語名の配下にある構成を想定
         let got = powershell_ascii_literal("C:\\日\\a.ps1");
         assert!(got.is_ascii(), "非 ASCII が残っている: {got}");
         assert_eq!(got, "'C:\\' + [char]0x65E5 + '\\a.ps1'");
-    }
-
-    /// **ブロック全体が ASCII**であること。ユーザーのプロファイルは ANSI（CP932）のことが
-    /// あり、そこへ UTF-8 の日本語を混ぜると符号が混在したファイルになる
-    #[test]
-    fn ブロック全体がasciiになる() {
-        for path in ["C:\\tako\\tako.ps1", "C:\\ドキュメント\\tako.ps1"] {
-            let b = profile_block(Path::new(path));
-            assert!(
-                b.is_ascii(),
-                "ブロックに非 ASCII が混ざっている（{path}）:\n{b}"
-            );
-        }
     }
 
     #[test]
@@ -1645,8 +1808,8 @@ mod powershell_tests {
 
     #[test]
     fn powershellスクリプトはasciiのみ() {
-        // 5.1 は BOM 無しの .ps1 を ANSI として読む。非 ASCII を入れると
-        // プロファイルへ並べたときに化けるので、同梱スクリプト自体を ASCII に保つ
+        // 5.1 は BOM 無しの .ps1 を ANSI として読む。BOM 付きで書き出しているが、
+        // 利用者が手で写して BOM を落としても化けないよう同梱スクリプト自体を ASCII に保つ
         assert!(
             POWERSHELL_SCRIPT.is_ascii(),
             "tako.ps1 に非 ASCII が混ざっている"
@@ -1683,5 +1846,107 @@ mod powershell_tests {
             POWERSHELL_SCRIPT.contains(r"'\\?\UNC\'") && POWERSHELL_SCRIPT.contains(r"'\\?\'"),
             "__takoStripVerbatim が verbatim / verbatim UNC の両方を見ていない（#970）"
         );
+    }
+}
+
+/// 実行環境そのものを相手にするテスト（#2432）
+#[cfg(test)]
+mod delivery_tests {
+    use super::*;
+
+    /// unix は env 注入で届くので、素のペインに明示コマンドを渡してはいけない
+    /// （tmux の `default-shell -c` の zsh が `ZDOTDIR` を食う）。macOS / Linux の挙動が
+    /// #2432 で変わっていないことの固定
+    #[cfg(unix)]
+    #[test]
+    fn unixの素のペインは既定のシェルのまま() {
+        assert!(pane_shell().is_none());
+        let status = status();
+        assert_eq!(status.delivery, Delivery::Automatic);
+        assert!(status.installed());
+        assert!(status.legacy_blocks.is_empty());
+        assert_eq!(status.launch_shell, None);
+        assert_eq!(status.describe()["delivery"], "automatic");
+    }
+
+    /// Windows の素のペインは、既定シェル（PowerShell）へ統合を読ませる引数を足したもの
+    #[cfg(windows)]
+    #[test]
+    fn windowsの素のペインは統合を読ませたpowershell() {
+        let shell = crate::platform::shell::default_shell().expect("既定シェル");
+        let pane = pane_shell().expect("PowerShell の環境では起動コマンドを返す");
+        assert_eq!(
+            pane.program, shell.program,
+            "既定シェルの実行ファイルを使う"
+        );
+        assert_eq!(pane.args[0], "-NoExit");
+        assert_eq!(pane.args[1], "-EncodedCommand");
+        let status = status();
+        assert_eq!(status.delivery, Delivery::Launch);
+        assert_eq!(status.launch_shell.as_deref(), Some(shell.program.as_str()));
+        assert!(status.installed());
+        // 検証プロセスは本物の「ドキュメント」の $PROFILE を見に行かない
+        assert!(status.legacy_blocks.is_empty());
+        // 起動前にスクリプトが書き出されている（器のペインは spawn より先に組む）
+        let script = status.script.expect("スクリプトの置き場");
+        assert!(script.exists(), "{script:?} が無い");
+    }
+
+    /// 旧ブロックの置き場（既知フォルダから組んだもの）は、PowerShell 自身が答える
+    /// `$PROFILE.CurrentUserAllHosts` と一致する。**読むだけ**（プロファイルは触らない）
+    #[cfg(windows)]
+    #[test]
+    fn 旧ブロックの置き場はpowershellが答える場所と一致する() {
+        let candidates = imp::legacy_profile_candidates();
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        let root = std::env::var("SystemRoot").expect("SystemRoot");
+        let mut shells = vec![(
+            "Windows PowerShell 5.1",
+            format!("{root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"),
+        )];
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            let pwsh = format!("{pf}\\PowerShell\\7\\pwsh.exe");
+            if Path::new(&pwsh).exists() {
+                shells.push(("PowerShell 7", pwsh));
+            }
+        }
+        // 受け取りは UTF-8 バイトの 16 進（5.1 のリダイレクト出力は OEM コードページなので、
+        // 生の文字列で受けると日本語のパスが壊れる）
+        const SCRIPT: &str = "-join ([System.Text.Encoding]::UTF8.GetBytes($PROFILE.CurrentUserAllHosts) | ForEach-Object { '{0:x2}' -f $_ })";
+        for (label, exe) in shells {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                SCRIPT,
+            ]);
+            crate::platform::process::no_console_window(&mut cmd);
+            let out = cmd.output().expect("PowerShell を起動できる");
+            let hex: String = String::from_utf8_lossy(&out.stdout)
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .collect();
+            let bytes: Vec<u8> = hex
+                .as_bytes()
+                .chunks(2)
+                .map(|pair| {
+                    let pair = std::str::from_utf8(pair).expect("ASCII の 16 進");
+                    u8::from_str_radix(pair, 16).expect("16 進")
+                })
+                .collect();
+            let answered = PathBuf::from(String::from_utf8(bytes).expect("UTF-8"));
+            let ours = &candidates
+                .iter()
+                .find(|(l, _)| l == label)
+                .expect("候補にある")
+                .1;
+            assert_eq!(
+                ours.to_string_lossy().to_lowercase(),
+                answered.to_string_lossy().to_lowercase(),
+                "{label}: 既知フォルダから組んだ場所と $PROFILE が違う"
+            );
+        }
     }
 }

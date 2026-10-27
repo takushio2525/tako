@@ -534,11 +534,12 @@ impl ShellDialect {
     /// 対話シェルの argv。`None` = この方言は spawn 時の env 注入だけで統合が効くので
     /// 既定シェルをそのまま起こせばよい（POSIX）。
     ///
-    /// なぜ要るか（#889）: PowerShell の統合は `$PROFILE` へ書いたブロック経由なので、
-    /// `TAKO_ISOLATED=1` で data_dir を隔離するセルフテストからは配置が見えない
-    /// （`status()` が見る `<隔離 data_dir>/shell-integration/tako.ps1` と `$PROFILE` が
-    /// 指す本番のパスが別物になる）。**実機の `$PROFILE` の状態でテストの結果が変わる**
-    /// ので、統合を自分で読ませた対話シェルを起こして前提を閉じる。
+    /// なぜ要るか（#889）: 当時の PowerShell の統合は `$PROFILE` へ書いたブロック経由で、
+    /// `TAKO_ISOLATED=1` で data_dir を隔離するセルフテストからは配置が見えなかった
+    /// （**実機の `$PROFILE` の状態でテストの結果が変わった**）ので、統合を自分で読ませた
+    /// 対話シェルを起こして前提を閉じた。#2432 から製品のペインは起動引数で統合を読む
+    /// （`shell_integration::powershell_pane_command`）が、こちらは `-NoProfile` で
+    /// **ユーザーの profile（oh-my-posh 等）からも切り離す**ための検証用の形として残す。
     ///
     /// **`.` とスクリプトパスは別々の語で渡す**: 実機の Rust argv → ConPTY 経路で
     /// 緑になっていることが分かっているのはこの形だけ
@@ -1494,8 +1495,8 @@ mod tests {
         );
     }
 
-    /// #889: PowerShell の統合は `$PROFILE` 経由なので、隔離した data_dir で走る
-    /// セルフテストからは配置が見えない。自分でドットソースして前提を閉じる
+    /// #889: セルフテストはユーザーの profile にも配置の状態にも依らず、
+    /// 自分でドットソースして前提を閉じる（#2432 以降も検証用の形として残す）
     #[test]
     fn 統合を読み込ませた対話シェルのargv() {
         let script = Path::new("C:\\iso\\shell-integration\\tako.ps1");

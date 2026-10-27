@@ -355,9 +355,14 @@ impl SessionBackend for PsmuxBackend {
             args.push(cwd.display().to_string());
         }
         // 明示コマンドは psmux の引数パーサに合わせて 1 引数へ畳む。
-        // 未指定なら渡さない（psmux の default-shell = pwsh がそのまま立つ）
-        if let Some(inner) = &options.command {
-            args.push(inner_command(inner));
+        // 未指定なら統合を読ませた既定シェル（#2432）。それも無ければ渡さない
+        // （psmux の default-shell = pwsh がそのまま立つ）
+        if let Some(inner) = options
+            .command
+            .clone()
+            .or_else(crate::shell_integration::pane_shell)
+        {
+            args.push(inner_command(&inner));
         }
         SpawnOptions {
             command: Some(SpawnCommand {
@@ -1239,30 +1244,33 @@ mod tests {
             histfile, expected_histfile,
             "検証プロセスの履歴の書き先がセッションへ固定されていない（#1253）"
         );
-        assert_eq!(
-            args,
-            vec![
-                "-u",
-                "-L",
-                "tako-unit",
-                "-f",
-                "<conf>",
-                "new-session",
-                "-A",
-                "-D",
-                "-s",
-                "tako-0123456789ab",
-                "-e",
-                "TAKO_PANE_ID=7",
-                "-e",
-                "TAKO_TAB_ID=3",
-                // #1105: 器の同一性は名前で伝える（統合が接頭辞を推測しない）
-                "-e",
-                "TAKO_BACKEND_SOCKET=tako-unit",
-                "-c",
-                "C:\\work",
-            ]
-        );
+        let mut expected: Vec<String> = [
+            "-u",
+            "-L",
+            "tako-unit",
+            "-f",
+            "<conf>",
+            "new-session",
+            "-A",
+            "-D",
+            "-s",
+            "tako-0123456789ab",
+            "-e",
+            "TAKO_PANE_ID=7",
+            "-e",
+            "TAKO_TAB_ID=3",
+            // #1105: 器の同一性は名前で伝える（統合が接頭辞を推測しない）
+            "-e",
+            "TAKO_BACKEND_SOCKET=tako-unit",
+            "-c",
+            "C:\\work",
+        ]
+        .map(String::from)
+        .to_vec();
+        // #2432: Windows の素のペインは統合を読ませた既定シェルを内側コマンドで明示する
+        // （psmux の default-shell は引数なしの pwsh を起こすため）。unix は None = 付かない
+        expected.extend(crate::shell_integration::pane_shell().map(|shell| inner_command(&shell)));
+        assert_eq!(args, expected);
         // env / cwd は素通しで in-process の PTY へ渡る
         assert_eq!(wrapped.env, options.env);
         assert_eq!(wrapped.cwd, options.cwd);

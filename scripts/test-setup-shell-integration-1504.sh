@@ -7,7 +7,8 @@
 #   聞かずに続けるか（`--yes` / 非 TTY / 端末ありで同じ結果）。2 回目が冪等か。
 #   配置に失敗しても setup が完走して「残り」に載るか（#1501 の契約）。
 #
-#   **Windows 形（`$PROFILE` へブロックを置く経路）の表示・冪等・残りの判断**は
+#   **Windows 形（ペインの PowerShell の起動引数で読ませる経路。#2432 より前は `$PROFILE`
+#   へブロックを置いていた）の表示・注記・残りの判断**は
 #   macOS 上で `Status` を組んで通す Rust 側（`shell_integration::stage_tests` と
 #   番犬 `issue1504_setup_shell_integration_watchdog`）が担当するので、
 #   このスクリプトの最後でまとめて走らせて件数を数える（実機は要求しない）。
@@ -265,8 +266,8 @@ if [ -z "${TAKO_1504_LEGACY:-}" ]; then
 fi
 
 # --- H. Windows 形の分岐と番犬（Rust 側）------------------------------------
-# 実機を持たない環境で Profile 経路（`$PROFILE` へブロックを置く）の表示・冪等・
-# 残りを通すのはここ。`Status` を組んで純粋関数へ渡すので macOS でも全分岐を通る
+# 実機を持たない環境で Launch 経路（ペインの PowerShell の起動引数で読ませる。#2432）の
+# 表示・注記・残りを通すのはここ。`Status` を組んで純粋関数へ渡すので macOS でも全分岐を通る
 echo "== H) Windows 形の分岐と配線の番犬（Rust） =="
 for t in "-p tako-control --lib shell_integration::" \
          "-p tako-control --test issue1504_setup_shell_integration_watchdog" \

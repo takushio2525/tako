@@ -594,10 +594,17 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
     // default-shell（$SHELL → passwd の順で解決）をログインシェルとして直接 spawn
     // するので、直接 spawn 時と同じく統合が効く。
     // 明示コマンドは残余引数が空白連結 + sh -c されるため、各語をクォートして 1 引数で渡す。
-    // **第 1 語の書き方だけは器によって違う**ので組み立ては backend 側の 1 か所へ（#881）
+    // **第 1 語の書き方だけは器によって違う**ので組み立ては backend 側の 1 か所へ（#881）。
+    // 素のペインでも、統合を起動引数で読ませる環境（Windows の psmux。#2432）では
+    // そのシェルを明示する（器の default-shell は引数なしの pwsh を起こすため）。
+    // unix は `pane_shell` が None なので上の理由どおり渡さないまま
     let mut inner = None;
-    if let Some(command) = &options.command {
-        inner = Some(crate::backend::inner_command_line(command));
+    if let Some(command) = options
+        .command
+        .clone()
+        .or_else(crate::shell_integration::pane_shell)
+    {
+        inner = Some(crate::backend::inner_command_line(&command));
     }
     // #2367: GUI が fd 上限を引き上げたなら、器の中のペインの子は起動時の値へ戻す段
     // （GUI 自身の実行ファイル）を通す。残余引数が 2 個以上だと tmux は `execvp` で直に起こし
@@ -2269,7 +2276,14 @@ set -gq copy-mode-position-format ''
             .position(|a| a == "-s")
             .expect("-s が要る");
         assert_eq!(command.args[s_at + 1], "tako-x");
-        let tail = &command.args[s_at + 2..];
+        let mut tail = &command.args[s_at + 2..];
+        // #2432: 統合を起動引数で読ませる環境（Windows）だけは、統合つきの既定シェルを
+        // 内側コマンドとして明示する。unix は None なので従来どおり何も足さない
+        if let Some(shell) = crate::shell_integration::pane_shell() {
+            let (last, rest) = tail.split_last().expect("内側コマンドがある");
+            assert_eq!(last, &crate::backend::inner_command_line(&shell));
+            tail = rest;
+        }
         assert!(
             tail.chunks(2).all(|c| c.len() == 2 && c[0] == "-e"),
             "セッション名の後に内側コマンドが足されている: {tail:?}"

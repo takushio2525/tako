@@ -3,7 +3,7 @@
  * 場面: Windows に入れる（入手 → 警告 → インストーラー → 初回起動 → セットアップ）。7 手順。
  * 事実の出どころ: installer/windows/tako.iss（per-user・PATH 追加は既定オン・Windows 10 1809 以降 x64）/
  * 台帳 W 節（未署名なので SmartScreen が出ることがある・Windows のメニュー行）/
- * crates/tako-control/src/shell_integration.rs・setup_deps.rs の出力の形（$PROFILE への管理ブロック・
+ * crates/tako-control/src/shell_integration.rs・setup_deps.rs の出力の形（シェル統合は $PROFILE を書かずペインの起動時に読む = #2432・
  * psmux は winget のコマンドを案内するだけで代行しない）。パスは架空。
  */
 import Scrolly from '../motion/Scrolly.astro';
