@@ -13023,15 +13023,40 @@ pub fn dispatch_orchestrator_projects_mcp(
     let plan = crate::worker_mcp::prepare(
         orchestrator::agent::WorkerAgent::Claude,
         std::path::Path::new(&cwd),
-        None,
+        &orchestrator::EMPTY_ENV_PLAN,
         &keep,
         &[],
     );
+    let mut warnings = plan.warnings.clone();
+    // #2418: codex の worker の構成も同じ mcp_servers で決まる。claude は知っている config dir の和を
+    // 読む（知らない名前を止めても害が無い）が、codex は worker が読む config.toml **1 本**で決まる
+    // （知らない名前を止めると起動しない）ので、CODEX_HOME を spawn と同じくプロファイルの env から引く
+    // （そのプロジェクトの専用プロファイル → default）。codex の設定が無い機（codex を使わない人）には
+    // 出さない（足した名前がすべて「見つからない」と警告されるだけになる）
+    let codex_env = orchestrator::load_profile_of(orchestrator::ProfileKind::Master, &key)
+        .or_else(|_| orchestrator::load_profile_of(orchestrator::ProfileKind::Master, "default"))
+        .map(|p| p.resolved_env_plan())
+        .unwrap_or_default();
+    let codex = crate::worker_mcp::codex_home_for(&codex_env)
+        .filter(|home| home.join("config.toml").is_file())
+        .map(|_| {
+            crate::worker_mcp::prepare(
+                orchestrator::agent::WorkerAgent::Codex,
+                std::path::Path::new(&cwd),
+                &codex_env,
+                &keep,
+                &[],
+            )
+        });
+    if let Some(c) = &codex {
+        warnings.extend(c.warnings.iter().map(|w| format!("codex: {w}")));
+    }
     let mut result = json!({
         "key": key,
         "mcp_servers": keep,
         "plan": plan.to_json(),
-        "warnings": plan.warnings,
+        "codex_plan": codex.as_ref().map(|c| c.to_json()),
+        "warnings": warnings,
     });
     match action {
         "mcp_add" => result["added"] = json!(changed),
@@ -16206,7 +16231,7 @@ fn dispatch_git_resolve_agent(
     let worker_mcp = crate::worker_mcp::prepare(
         worker_agent,
         &repo,
-        profile_env.claude_config_dir().as_deref(),
+        &profile_env,
         &orchestrator::ProjectsConfig::load()
             .map(|c| crate::worker_mcp::keep_for_cwd(&c, &repo))
             .unwrap_or_default(),
@@ -16229,6 +16254,7 @@ fn dispatch_git_resolve_agent(
         extra_args: &launch.extra_args,
         tako_bin: Some(&tako_bin),
         mcp_settings: worker_mcp.settings_file.as_deref(),
+        mcp_codex_off: &worker_mcp.codex_off,
         env: &profile_env,
     });
 
@@ -16787,11 +16813,12 @@ fn dispatch_orchestrator_spawn(
     // master と同じ 1 実装（`agent::codex_mcp_args`）なので、worker だけ古い形になることが無い
     let tako_bin = tako_binary();
     // #2412: user scope の MCP を持ち込まない（既定は tako の MCP だけ。足すのはプロジェクトの
-    // mcp_servers）。読む user scope は起動する claude の config dir を含む（#558 と同じ解決）
+    // mcp_servers）。読む user scope は起動する claude の config dir を含む（#558 と同じ解決）。
+    // codex は env 計画の CODEX_HOME の config.toml を読み、`-c` で止める（#2418）
     let worker_mcp = crate::worker_mcp::prepare(
         worker_agent,
         std::path::Path::new(&cwd),
-        profile_env.claude_config_dir().as_deref(),
+        &profile_env,
         &crate::worker_mcp::keep_for_project(&config, project),
         &launch.extra_args,
     )
@@ -16809,6 +16836,7 @@ fn dispatch_orchestrator_spawn(
         extra_args: &launch.extra_args,
         tako_bin: Some(&tako_bin),
         mcp_settings: worker_mcp.settings_file.as_deref(),
+        mcp_codex_off: &worker_mcp.codex_off,
         env: &profile_env,
     });
 

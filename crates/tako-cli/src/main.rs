@@ -5949,6 +5949,20 @@ fn print_project_mcp(key: &str, res: &serde_json::Value) {
             list(&plan["shadowed"])
         );
     }
+    // #2418: codex の worker（codex の設定がある機だけ応答に載る）
+    let codex = &res["codex_plan"];
+    if codex.is_object() {
+        println!(
+            "  codex の worker で止める（config.toml）: {}",
+            list(&codex["denied"])
+        );
+        if codex["shadowed"].as_array().is_some_and(|a| !a.is_empty()) {
+            println!(
+                "  codex: プロジェクトの .codex/config.toml と同名なので止めない: {}",
+                list(&codex["shadowed"])
+            );
+        }
+    }
     for w in res["warnings"].as_array().into_iter().flatten() {
         if let Some(w) = w.as_str() {
             eprintln!("警告: {w}");

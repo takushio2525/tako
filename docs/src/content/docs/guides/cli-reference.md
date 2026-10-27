@@ -1548,16 +1548,17 @@ tako orchestrator projects remove --key webapp
 
 **worker は tako の MCP だけを持って起動します。** あなたが Claude Code に登録した MCP サーバー
 （user scope。playwright や github など）は、worker 1 本ごとに数百 MB を使うので持ち込みません。
-そのリポジトリの `.mcp.json` に書いた MCP は今までどおり使えます。worker にも使わせたい MCP は
+codex の worker も同じで、`~/.codex/config.toml` に登録した MCP は持ち込みません。
+そのリポジトリの `.mcp.json`（codex は `.codex/config.toml`）に書いた MCP は今までどおり使えます。worker にも使わせたい MCP は
 プロジェクトごとに足します。
 
 ```bash
-tako orchestrator projects mcp webapp                 # 今の設定と、持ち込む / 止める MCP を見る
+tako orchestrator projects mcp webapp                 # 今の設定と、持ち込む / 止める MCP を見る（codex の分も）
 tako orchestrator projects mcp webapp add playwright  # このプロジェクトの worker に持ち込む
 tako orchestrator projects mcp webapp remove playwright
 ```
 
-更新した直後は、直近 30 日の会話で実際に使っていた MCP が各プロジェクトに自動で足されています。
+更新した直後は、直近 30 日の Claude Code の会話で実際に使っていた MCP が各プロジェクトに自動で足されています。
 
 ### tako orchestrator adopt
 
