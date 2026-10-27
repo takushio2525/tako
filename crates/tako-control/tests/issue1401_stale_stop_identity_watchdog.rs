@@ -102,6 +102,8 @@ fn check_kill_stale_daemon(source: &str, rel: &str) {
     for signal in [
         "libc::kill",
         "platform::process::terminate",
+        // #1599 で撃つ段は停止の芯（正規経路と 1 実装）へ寄せた。芯を呼ぶ = 撃つ
+        "stop_verified_daemon(",
         "SIGTERM",
         "SIGKILL",
     ] {

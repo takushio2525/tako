@@ -627,7 +627,7 @@
     {
       "key": "tako_remote_messages",
       "status": "pending",
-      "note_ja": "remote デーモンの起動・停止に unix 前提の処理が残っており、Windows 実機での通し確認も未了",
+      "note_ja": "remote デーモンの起動に unix 前提の処理（setsid / シグナルマスク）が残っており、Windows 実機での通し確認も未了（停止は #1599 で境界の終了要求と admin API の shutdown へ寄せた）",
       "evidence": "measured",
       "evidence_detail": "#937 の Windows 11 実測: CLI が <SESSION_ID> を要求するところまで確認。実機の claude が未認証で会話を作れないため本体は未実測（デーモン側は #971 でブロック）"
     },
@@ -653,7 +653,7 @@
     {
       "key": "tako_remote_start",
       "status": "pending",
-      "note_ja": "remote デーモンの起動・停止に unix 前提の処理が残っており、Windows 実機での通し確認も未了",
+      "note_ja": "remote デーモンの起動に unix 前提の処理（setsid / シグナルマスク）が残っており、Windows 実機での通し確認も未了（停止は #1599 で境界の終了要求と admin API の shutdown へ寄せた）",
       "evidence": "unit-test",
       "evidence_detail": "実機の cargo test で remote::tests の 2 件（daemon_stop_impl / is_process_alive）が失敗。うち is_process_alive は「非 unix では常に false」という製品側の穴で #1557 で解消し、daemon_stop_impl が見ていた正体確認の素通りは #1616 で解消（どちらも実機の再測は未了）"
     },
@@ -667,9 +667,9 @@
     {
       "key": "tako_remote_stop",
       "status": "pending",
-      "note_ja": "remote デーモンの起動・停止に unix 前提の処理が残っており、Windows 実機での通し確認も未了",
+      "note_ja": "remote デーモンの起動に unix 前提の処理（setsid / シグナルマスク）が残っており、Windows 実機での通し確認も未了（停止は #1599 で境界の終了要求と admin API の shutdown へ寄せた）",
       "evidence": "unit-test",
-      "evidence_detail": "同上（daemon_stop_impl はpid再利用時にkillしない が失敗）。#1616 で Windows も正体確認を通るようになり、この検査は両 OS とも「撃たずに中止」を見る形になった（停止そのものは #1599 が未実装。実機の再測は未了）"
+      "evidence_detail": "#1616 で Windows も正体確認を通るようになり、daemon_stop_impl はpid再利用時にkillしない は両 OS とも「撃たずに中止」を見る。#1599 で停止を境界 platform::process::terminate（Windows は TerminateProcess）と admin API の shutdown（OS を問わない穏当な停止）へ寄せ、止められなければ stopped: true を返さず Err にした。CI の Windows ジョブで、停止の芯が自分で起こした子を実際に止めること・正体の違う pid（正規経路 / stale 経路）を撃たないこと・shutdown が管理トークンでだけ受け付けることを実プロセスで確認。daemon の起動（#971）が Windows で通らないので、実 daemon の停止の通しは未実測"
     },
     {
       "key": "tako_rename_tab",
@@ -755,9 +755,9 @@
     {
       "key": "tako_session_restart",
       "status": "degraded",
-      "note_ja": "引き継ぎ再起動は使えるが、ハーネス更新（会話を保ったまま CLI を建て直す）はプロセスの終了要求が Windows 未対応のため使えない（#1067 / 境界 B5）",
-      "evidence": "by-design",
-      "evidence_detail": "tako_control::platform::process::terminate の Windows 実装は「プロセスの停止は Windows では未対応です」を返す（B5 の制御側が未実装）。handoff は queue_prompt_flow だけを使うので影響を受けない"
+      "note_ja": "引き継ぎ再起動は使える。ハーネス更新（会話を保ったまま CLI を建て直す）の終了要求は #1599 で Windows にも入ったが、Windows には穏当な終了要求が無いので CLI は後始末の機会なく強制終了（TerminateProcess）される。終了 → シェルの復帰 → --resume の送達の通しは Windows 実機で未実測（#1067 / #1599）",
+      "evidence": "unit-test",
+      "evidence_detail": "#1599: 境界 tako_control::platform::process::terminate の Windows の腕（OpenProcess + TerminateProcess）が、自分で起こした子を実際に止める（子の終了コードが TerminateProcess に渡した値になる）ことを CI の Windows ジョブの実プロセステスト（platform::process::tests を名指しで回す段）で確認。dispatch の harness は OS 分岐なしでこの境界を呼ぶ。終了 → シェルの復帰 → --resume の送達の通しは未実測。handoff は queue_prompt_flow だけを使うので影響を受けない"
     },
     {
       "key": "tako_sessions",
@@ -849,9 +849,9 @@
     {
       "key": "tako_stale_binary",
       "status": "degraded",
-      "note_ja": "古いバイナリの検知と警告は動くが、バナーの「張り直す」はプロセスの終了要求が Windows 未対応のため実行できない（#1067 / 境界 B5）",
+      "note_ja": "古いバイナリの検知と警告は動く。バナーの「張り直す」はハーネス更新と同じ実装で、終了要求は #1599 で Windows にも入ったが、Windows には穏当な終了要求が無いので CLI は強制終了（TerminateProcess）になり、実機での通しは未実測（#1067 / #1599）",
       "evidence": "measured",
-      "evidence_detail": "#936 の Windows 11 実測（隔離 GUI + 偽 claude）: 実行中プロセスのパスを境界 B5（`procinfo::image_path`）で解決し、`tako stale-binary status` が stale=true / spawned_version=1.0.0 / current_version=1.0.1 を返してバナー「claude 1.0.1 が利用可能です（このセッションは 1.0.0）」が出る。claude の自己更新と同じ形（旧 exe を改名 → 新 exe を同じ名前で設置）でも stale=false → true へ変わる。張り直しは #1067 の terminate 未実装のため実行できない"
+      "evidence_detail": "#936 の Windows 11 実測（隔離 GUI + 偽 claude）: 実行中プロセスのパスを境界 B5（`procinfo::image_path`）で解決し、`tako stale-binary status` が stale=true / spawned_version=1.0.0 / current_version=1.0.1 を返してバナー「claude 1.0.1 が利用可能です（このセッションは 1.0.0）」が出る。claude の自己更新と同じ形（旧 exe を改名 → 新 exe を同じ名前で設置）でも stale=false → true へ変わる。張り直しの終了要求は #1599 で Windows にも入った（CI の Windows ジョブの実プロセステストで確認）が、張り直しの通しは未実測"
     },
     {
       "key": "tako_task_checkpoint",
