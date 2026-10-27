@@ -196,11 +196,7 @@ impl Job {
             if members.is_empty() {
                 break;
             }
-            let gui: HashSet<u32> = members
-                .iter()
-                .copied()
-                .filter(|pid| imp::is_gui(*pid))
-                .collect();
+            let gui: HashSet<u32> = members.iter().copied().filter(|pid| is_gui(*pid)).collect();
             if gui.is_empty() {
                 // 残すものが無い = Job ごと止める（列挙の後に起きた子も 1 回で止まる）
                 if let Err(reason) = job.terminate() {
@@ -248,6 +244,26 @@ impl Drop for Job {
             }
         }
     }
+}
+
+/// PE ヘッダを探す範囲（`e_lfanew` はふつう数百バイト以内）
+const PE_HEADER_BYTES: u64 = 4096;
+
+/// その pid の実行ファイルが GUI サブシステムか。パスは境界 B5（`procinfo::image_path`）で引き、
+/// ヘッダは [`pe_subsystem`] で読む。引けない・読めない・コンソールのホストは false
+/// （コンソールとして扱う = 止める側。#2454 の目的は残骸を残さないこと）
+fn is_gui(pid: u32) -> bool {
+    use std::io::Read;
+    let Some(path) = crate::platform::procinfo::image_path(pid) else {
+        return false;
+    };
+    if is_console_host(&path.to_string_lossy()) {
+        return false;
+    }
+    let mut header = Vec::new();
+    let read = std::fs::File::open(&path)
+        .and_then(|file| file.take(PE_HEADER_BYTES).read_to_end(&mut header));
+    read.is_ok() && pe_subsystem(&header) == Some(IMAGE_SUBSYSTEM_WINDOWS_GUI)
 }
 
 /// コンソールのホスト（`conhost.exe` / `OpenConsole.exe`）か（純粋関数。macOS からも検査できる）。
@@ -359,25 +375,19 @@ mod imp {
             match *self {}
         }
     }
-
-    /// unix では呼ばれない（Job が作られない）
-    pub(super) fn is_gui(_pid: u32) -> bool {
-        false
-    }
 }
 
 /// Windows の腕。`CreateJobObjectW` + `SetInformationJobObject` + `AssignProcessToJobObject`
 #[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
-    use std::io::Read;
 
     type Handle = *mut c_void;
 
     /// `PROCESS_TERMINATE` / `PROCESS_SET_QUOTA`（winnt.h）。`AssignProcessToJobObject` に要る権利
     const PROCESS_TERMINATE: u32 = 0x0001;
     const PROCESS_SET_QUOTA: u32 = 0x0100;
-    /// `PROCESS_QUERY_LIMITED_INFORMATION`（winnt.h）。`IsProcessInJob` / 実行ファイルの名前に要る権利
+    /// `PROCESS_QUERY_LIMITED_INFORMATION`（winnt.h）。`IsProcessInJob` に要る権利
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     /// winnt.h の `JOB_OBJECT_LIMIT_*`
     const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x0000_0800;
@@ -390,8 +400,6 @@ mod imp {
     /// 止めたプロセスの終了コード。`platform::process::terminate` と同じ 1
     /// （`STILL_ACTIVE` でなければ生存判定が終了済みと読む。#2275）
     const EXIT_CODE: u32 = 1;
-    /// PE ヘッダを探す範囲（`e_lfanew` はふつう数百バイト以内）
-    const PE_HEADER_BYTES: u64 = 4096;
     /// 列挙の入れ物の上限（pid の数）
     const MAX_MEMBERS: usize = 65_536;
 
@@ -455,12 +463,6 @@ mod imp {
         fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
         fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> Handle;
         fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
-        fn QueryFullProcessImageNameW(
-            process: Handle,
-            flags: u32,
-            name: *mut u16,
-            size: *mut u32,
-        ) -> i32;
         fn CloseHandle(object: Handle) -> i32;
     }
 
@@ -625,28 +627,6 @@ mod imp {
             // SAFETY: CreateJobObjectW が返した有効なハンドルを 1 回だけ閉じる
             unsafe { CloseHandle(self.handle) };
         }
-    }
-
-    /// その pid の実行ファイルが GUI サブシステムか。開けない・読めないときは false
-    /// （コンソールとして扱う = 止める側。#2454 の目的は残骸を残さないこと）
-    pub(super) fn is_gui(pid: u32) -> bool {
-        let Some(process) = Process::open(PROCESS_QUERY_LIMITED_INFORMATION, pid) else {
-            return false;
-        };
-        let mut name = vec![0u16; 32_768];
-        let mut size = name.len() as u32;
-        // SAFETY: name は size 要素ぶん生きていて、size は書き込まれた長さ（終端を除く）を返す
-        if unsafe { QueryFullProcessImageNameW(process.0, 0, name.as_mut_ptr(), &mut size) } == 0 {
-            return false;
-        }
-        let path = String::from_utf16_lossy(&name[..size as usize]);
-        if super::is_console_host(&path) {
-            return false;
-        }
-        let mut header = Vec::new();
-        let read = std::fs::File::open(&path)
-            .and_then(|file| file.take(PE_HEADER_BYTES).read_to_end(&mut header));
-        read.is_ok() && super::pe_subsystem(&header) == Some(super::IMAGE_SUBSYSTEM_WINDOWS_GUI)
     }
 }
 
