@@ -1141,3 +1141,22 @@ Windows CI のテスト（`crates/tako-control/src/ipc.rs` の `windows_tests::i
       `tako_show_command` が呼べて CARD-DONE が返る（= `--settings` を付けても tako の MCP は使える）
 - [ ] 本番で personal アカウントの worker を 1 本 spawn し、`tako queue` のそのペインの `agent` の MB が
       修正前（同じアカウントの worker で 800〜900 MB）より下がっている
+
+## Windows のアプリ内更新（#2434、2026-10-27）
+
+経路の判断（取得元・大きさ・sha256・PE ヘッダ・無言の指定・置き場の判定）は単体テストと番犬
+（`issue2434_windows_update_watchdog`）で、`tako.iss` の文法と指定なしの無人インストールは
+`gh workflow run release-windows.yml --ref <ブランチ>` のドライランで確かめる。
+**指定付きの入れ替えと起動し直しは Windows 実機でしか見られない**。本番の tako を上書きしないよう、
+実機の普段使いでない Windows ユーザー（または使い捨ての VM）で次を確かめる:
+
+- [ ] 1 つ前の版のインストーラーを入れて起動し、`tako update apply --channel test` を打つ。応答に
+      `installer_started: true` / `quitting: true` / `installer_log` が載り、約 1 秒後に tako が消え、
+      進捗の窓が出て閉じ、新しい版の tako が開く（`tako update status` の `current_version` が上がる）
+- [ ] 入れ替えの前後で `%APPDATA%\tako`（settings.json / layout.json）と PATH・デスクトップのアイコンの
+      有無が変わっていない
+- [ ] `installer_log` の setup.log に `tako (pid N) has exited` と `relaunched tako:` の 2 行がある
+- [ ] インストーラーの進捗の窓でキャンセルすると、元の版の tako が起動し直す（setup.log に
+      `relaunched tako:` があり、版は上がっていない）
+- [ ] ポータブル zip を展開した tako で `tako update apply` を打つと、何も起きずに
+      「インストーラーで入れた場所から動いていない」理由が返る

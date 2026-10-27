@@ -203,10 +203,11 @@ pub mod notes {
         "cwd tracking and command state are delivered through a side channel even inside the psmux container, but because psmux does not pass OSC through, the status field effective stays false (#766)",
     );
 
-    /// #937。確認とノート表示は動くが、適用（インストーラー実行）は未実測
+    /// #937 / #2434。確認とノート表示は動く。適用（インストーラーの検査・無言の実行・
+    /// 起動し直し）は #2434 で実装したが、実機の通しは測っていない
     pub const WIN_UPDATE_APPLY_UNVERIFIED: Note = Note::new(
-        "更新の確認とリリースノートの表示は動くが、更新の適用（インストーラーの実行と再起動）は Windows 実機で未実測（#937）",
-        "Checking for updates and rendering the release notes work, but applying an update (running the installer and restarting) has not been measured on Windows (#937)",
+        "更新の確認・リリースノートの表示・適用（インストーラーを取得元・大きさ・sha256 で検査して無言で起動し、tako が終わってから入れ替えて起動し直す）は実装済みだが、適用の通しは Windows 実機で未実測（#2434）。ポータブル版・開発ビルドはアプリ内では更新しない",
+        "Checking for updates, rendering the release notes and applying an update (verifying the installer's origin, size and sha256, running it silently, replacing tako after it exits and restarting it) are implemented, but the end-to-end apply has not been measured on real Windows (#2434). Portable and development builds are not updated in-app",
     );
 
     /// #1950。Code Runner の解決と実行は実測済みだが、Arduino のスケッチが使う arduino-cli の
@@ -1921,7 +1922,7 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_UPDATE_APPLY_UNVERIFIED,
         },
         windows_evidence: Evidence::SelfTest(
-            "項目 90（更新画面と Markdown のリリースノート）+ #587 / #723 で実機の配布物生成とバージョン解析を実測。適用そのものは未実測",
+            "項目 90（更新画面と Markdown のリリースノート）+ #587 / #723 で実機の配布物生成とバージョン解析を実測。適用（#2434）は偽の配布元からの取得・検査・インストーラーへの指定を単体（Windows CI を含む）で確認、実機の通しは未実測",
         ),
     },
     Feature {

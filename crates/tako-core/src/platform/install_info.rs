@@ -1,4 +1,4 @@
-//! インストーラーが記録した「実際に入っている版数」の問い合わせ（抽象境界 B20）
+//! インストーラーが記録した「実際に入っている版数」と「入れた先」の問い合わせ（抽象境界 B20）
 //!
 //! ## なぜ境界が要るか（#723）
 //!
@@ -29,6 +29,20 @@
 /// （タグ表記のまま返し、正規化は呼び出し側に委ねる）。
 pub fn installed_version() -> Option<String> {
     imp::installed_version()
+}
+
+/// インストーラーが記録した**入れた先のフォルダ**（Inno Setup の `InstallLocation`。#2434）。
+///
+/// アプリ内更新はインストーラーを無言で起こして上書きさせる。インストーラーは前回の
+/// 入れた先（`UsePreviousAppDir` の既定）へ入れるので、**いま動いている exe がその中に
+/// 居るときだけ**この経路で更新できる。ポータブル zip・開発ビルドの exe は別の場所に居るので、
+/// 呼び出し側はこの値と `current_exe` の置き場を比べて断る。
+///
+/// 記録が無い / 読めない場合は `None`（macOS では常に `None`）
+pub fn install_location() -> Option<std::path::PathBuf> {
+    imp::install_location()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 #[cfg(windows)]
@@ -73,6 +87,15 @@ mod imp {
     }
 
     pub(super) fn installed_version() -> Option<String> {
+        read_uninstall_value("DisplayVersion")
+    }
+
+    /// Inno Setup は `InstallLocation` に `{app}\`（末尾の区切り付き）を書く
+    pub(super) fn install_location() -> Option<String> {
+        read_uninstall_value("InstallLocation")
+    }
+
+    fn read_uninstall_value(name: &str) -> Option<String> {
         let subkey = wide(UNINSTALL_SUBKEY);
         let mut hkey: isize = 0;
         // SAFETY: subkey は NUL 終端の生存するバッファ、hkey はスタック上の変数
@@ -82,7 +105,7 @@ mod imp {
             // インストーラー経由で入っていない（ポータブル zip / 開発ビルド）
             return None;
         }
-        let value = read_string(hkey, "DisplayVersion");
+        let value = read_string(hkey, name);
         // SAFETY: RegOpenKeyExW が成功したハンドルだけを閉じる
         unsafe { RegCloseKey(hkey) };
         value
@@ -142,6 +165,11 @@ mod imp {
     pub(super) fn installed_version() -> Option<String> {
         None
     }
+
+    /// macOS の置き場は `.app` バンドルで決まる（`update_checker::app_bundle_path`）
+    pub(super) fn install_location() -> Option<String> {
+        None
+    }
 }
 
 /// UTF-16 バッファから末尾の NUL 以降を落として `String` にする。
@@ -186,5 +214,15 @@ mod tests {
         // 非 Windows では常に None
         #[cfg(not(windows))]
         assert!(v.is_none());
+    }
+
+    #[test]
+    fn install_location_does_not_panic() {
+        // 記録が在れば空ではない。非 Windows では常に None
+        if let Some(dir) = install_location() {
+            assert!(!dir.as_os_str().is_empty());
+        }
+        #[cfg(not(windows))]
+        assert!(install_location().is_none());
     }
 }
