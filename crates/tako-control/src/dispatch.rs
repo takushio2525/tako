@@ -26372,8 +26372,12 @@ mod tests {
         selections: std::collections::HashMap<u64, crate::protocol::LineColRange>,
         /// #1879: tako mod の状態（GUI の `claude_mod` の代役）
         claude_mod: tako_core::claude_mod::ModHub,
-        /// #1960: このホストだけの ui.json（テストの data dir の中。並行テストと取り合わない）
+        /// #1960: このホストだけの ui.json（`_mod_ui_dir` の中。並行テストと取り合わない）
         mod_ui_path: std::path::PathBuf,
+        /// #2416: [`Self::mod_ui_path`] の置き場。ホストごとに新しく作り、ホストと一緒に消える
+        /// （#1312 の `ScratchDir`）。data dir の下に連番で置くと、同じ `TAKO_DATA_DIR` で回した
+        /// 前の回の ui.json を、同じ番号を引いた別のテストが読んでいた
+        _mod_ui_dir: tako_core::test_residue::ScratchDir,
         /// #1908: ファイルツリー（GUI の `filetree` と `tree_selection` の代役）
         tree: MockTree,
     }
@@ -26389,6 +26393,7 @@ mod tests {
 
     impl MockHost {
         fn new() -> Self {
+            let mod_ui_dir = tako_core::test_residue::ScratchDir::new("dispatch-mock-mod-ui");
             Self {
                 ws: Workspace::new("t1", Pane::new(PaneOrigin::User)),
                 attached: Vec::new(),
@@ -26485,19 +26490,8 @@ mod tests {
                 auto_close: true,
                 selections: std::collections::HashMap::new(),
                 claude_mod: tako_core::claude_mod::ModHub::new(true),
-                mod_ui_path: {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static SEQ: AtomicU64 = AtomicU64::new(0);
-                    // テストの一時の置き場（#944 の隔離先 = プロセスの終わりに消える）。製品が
-                    // data dir に置くファイルではないので、式を分けて共有分類カタログの被覆の
-                    // 走査（`data_dir()` の直後の join）に載せない
-                    let scratch =
-                        tako_core::paths::data_dir().expect("テストの data dir（#944 の隔離先）");
-                    scratch.join(format!(
-                        "mock-mod-ui-{}/ui.json",
-                        SEQ.fetch_add(1, Ordering::Relaxed)
-                    ))
-                },
+                mod_ui_path: mod_ui_dir.path().join("ui.json"),
+                _mod_ui_dir: mod_ui_dir,
                 tree: MockTree::default(),
             }
         }
