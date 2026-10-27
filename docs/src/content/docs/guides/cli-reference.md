@@ -249,6 +249,8 @@ tako setup bootstrap handoff                  # 別のエージェントへ導�
 
 「どのターミナルからも使えるようにする」のやり方は OS で違います。macOS / Linux はログインシェルの設定ファイル（zsh なら `~/.zprofile`）へ 1 ブロック追記し、Windows は**ユーザー環境変数 `Path`** へ追記します（Windows 版の公式インストーラは PATH を自動では通さず、手作業を案内して終わるためです）。どちらも `undo-path` で元に戻せます。macOS では 3 系統とも同じ場所（`~/.local/bin`）に入るので、**追記されるブロックは 1 つだけ**です。
 
+Windows では、ユーザー環境変数 `Path` の変更は**すでに開いているタブには届きません**。tako の新しいタブはユーザー環境変数を読み直してから起動するので、セットアップのあとは **tako で新しいタブを開けば**、tako を再起動しなくてもそのまま使えます。`tako setup` もこの状態を見分けて「新しいタブを開いてから打ってください」と案内します（`tako setup bootstrap status --json` では `needs_new_tab` が `true` になります）。
+
 **Windows で tako が実際にインストーラを走らせるのは `claude` だけ**です。`codex` / `agy` は状態の確認と公式コマンドの案内までで、実行は行いません（Windows 実機での確認が済んでいないためです）。表示される公式コマンドをご自身で実行すれば、そのあとの PATH 通しと状態確認は tako が引き継げます。詳しくは [Windows 対応状況](/windows-support/) をご覧ください。
 
 :::note[うまく入らないときは別のエージェントに頼めます]
@@ -1546,16 +1548,17 @@ tako orchestrator projects remove --key webapp
 
 **worker は tako の MCP だけを持って起動します。** あなたが Claude Code に登録した MCP サーバー
 （user scope。playwright や github など）は、worker 1 本ごとに数百 MB を使うので持ち込みません。
-そのリポジトリの `.mcp.json` に書いた MCP は今までどおり使えます。worker にも使わせたい MCP は
+codex の worker も同じで、`~/.codex/config.toml` に登録した MCP は持ち込みません。
+そのリポジトリの `.mcp.json`（codex は `.codex/config.toml`）に書いた MCP は今までどおり使えます。worker にも使わせたい MCP は
 プロジェクトごとに足します。
 
 ```bash
-tako orchestrator projects mcp webapp                 # 今の設定と、持ち込む / 止める MCP を見る
+tako orchestrator projects mcp webapp                 # 今の設定と、持ち込む / 止める MCP を見る（codex の分も）
 tako orchestrator projects mcp webapp add playwright  # このプロジェクトの worker に持ち込む
 tako orchestrator projects mcp webapp remove playwright
 ```
 
-更新した直後は、直近 30 日の会話で実際に使っていた MCP が各プロジェクトに自動で足されています。
+更新した直後は、直近 30 日の Claude Code の会話で実際に使っていた MCP が各プロジェクトに自動で足されています。
 
 ### tako orchestrator adopt
 

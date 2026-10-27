@@ -127,7 +127,7 @@ master が裏でやっていることを少しだけ紹介します。すべて�
 - **監視と回収**: master は worker の完了・入力待ち・消滅を自動検知し、出力を読み取って報告し、役目を終えたペインを片付けます
 - **検収してから報告**: worker の「完了しました」は鵜呑みにされません。master が受け入れ条件ごとの証拠（実行コマンドと出力・diff）を検査してから、結果があなたに届きます。検証できない項目は「未検証」と明示されます
 - **worker は使い捨て**: タスクごとに新しい worker を立てるのが master の流儀です。コンテキストが混ざらず、失敗の切り分けも簡単になります
-- **worker は身軽に**: worker は tako の MCP だけを持って起動します。あなたが Claude Code に登録した MCP（playwright・github など）は 1 本ごとに数百 MB を使うので持ち込まず、リポジトリの `.mcp.json` に書いたものだけが今までどおり立ちます。worker にも使わせたい MCP は「このプロジェクトの worker に playwright も持たせて」と頼むか、`tako orchestrator projects mcp <プロジェクト> add <名前>` で足せます
+- **worker は身軽に**: worker は tako の MCP だけを持って起動します。あなたが Claude Code や codex に登録した MCP（playwright・github など）は 1 本ごとに数百 MB を使うので持ち込まず、リポジトリの `.mcp.json`（codex は `.codex/config.toml`）に書いたものだけが今までどおり立ちます。worker にも使わせたい MCP は「このプロジェクトの worker に playwright も持たせて」と頼むか、`tako orchestrator projects mcp <プロジェクト> add <名前>` で足せます
 
 ## 設定ファイルの場所（上級者・AI 向けの参考情報）
 

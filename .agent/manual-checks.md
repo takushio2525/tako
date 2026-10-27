@@ -521,6 +521,23 @@ eval / hide / show / close を機械検証する。実マウス・キーボー�
   リモート画面共有）には映らない
 - ペインの角丸（7px）に対し webview は矩形のまま数 px 内側に収まる（見た目の妥協）
 
+### Windows で開いても落ちない（#724）
+
+本番と別の data dir の隔離インスタンスで行う（本番の tako・設定・layout.json には触らない）。
+落ちたかどうかは `<data_dir>\panic.log` の末尾とイベントビューアの Application Error（ID 1000 / 1001）の
+tako-app で見る。修正前の形は同じバイナリで `TAKO_724_LEGACY=1`。
+
+- [ ] 出力を流し続けるペイン（例: `ping -t 127.0.0.1`）を開いたまま、`tako web open https://example.com`
+  を 10 回（開く → `tako web close`）→ 一度も落ちない。`web list` の `state` が queued → creating → ready と進む
+- [ ] `tako web open "data:text/html,hi"` と `tako web open about:blank` → 落ちない。タイトルは 2 秒ほどで出る
+  （Windows は ipc を付けないので eval の 2 秒ポーリングが拾う）
+- [ ] ポート提案チップの「ブラウザで開く」・dock の URL 入力・ページ内の target=_blank → 落ちない
+- [ ] 開いている途中にもう 1 本開く → 2 本目は queued で待ち、1 本目が ready になってから作られる
+- [ ] 開いている途中にそのペインを閉じる → 落ちない。Web ビューは dock に入る（`web list` の pane が null）
+- [ ] Web ビューを開いた状態で tako を終了 → 起動し直すと同じ URL で開き直る（保留にならない）
+- [ ] 印（`<data_dir>\webview-guard.json`）を手で置いて起動 → その Web ビューは自動で開かず「保留」
+  （ペインに理由と「開く」）。「開く」で開き、印が消える
+
 ## sleep-guard 状態チップ + 詳細ポップオーバー（#440、2026-07-22）
 
 チップ文言の選択ロジック・ポップオーバー文言の組み立て・絵文字ゼロは unit test で
@@ -1141,3 +1158,18 @@ Windows CI のテスト（`crates/tako-control/src/ipc.rs` の `windows_tests::i
       `tako_show_command` が呼べて CARD-DONE が返る（= `--settings` を付けても tako の MCP は使える）
 - [ ] 本番で personal アカウントの worker を 1 本 spawn し、`tako queue` のそのペインの `agent` の MB が
       修正前（同じアカウントの worker で 800〜900 MB）より下がっている
+
+## codex の worker も tako の MCP だけで起動する（#2418、2026-10-27）
+
+止める名前の判断・`-c` の組み立て・置く位置は単体テストと番犬（`issue2412_worker_mcp_scope_watchdog`）で、
+実物の codex（0.154.0）が止めた server の子を立てない・プロジェクトで足した MCP と `.codex/config.toml` の MCP は立つ・
+設定がずれても目印つきなら起動する・壊れた config.toml の扱いは GUI を使わない腕
+（`ARMS="headless-before headless-new edge" bash scripts/test-codex-worker-mcp-2418.sh`）で、隔離 GUI からの spawn は
+`ARMS=new`（tako-vd が描画できる = 蓋が開いているとき）で 2026-10-27 に実測済み（PASS=14）。版を上げたら次を確かめる:
+
+- [ ] `bash scripts/test-codex-worker-mcp-2418.sh`（既定の腕。`new` = 隔離 GUI）が PASS する。spawn の応答の
+      `mcp` が `mode: tako_only`・`denied: [user-alpha, user-beta, user-web]`・`kept: [user-keep]`・`shadowed: [user-shared]`、
+      起動した codex のコマンド行に `-c mcp_servers.user-alpha.enabled=false` と目印が載り、worker から
+      `tako_show_command` が呼べて CARD-DONE が返る
+- [ ] 本番で codex の worker を 1 本 spawn し、応答の `mcp.denied` に `~/.codex/config.toml` の MCP（tako 以外）が並び、
+      `ps` でその codex の子孫に止めた MCP が居ない

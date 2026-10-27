@@ -312,13 +312,8 @@ fn resume_worker_launch(
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    let worker_mcp = crate::worker_mcp::prepare(
-        WorkerAgent::Claude,
-        &cwd,
-        plan.claude_config_dir().as_deref(),
-        &keep,
-        &launch.extra_args,
-    );
+    let worker_mcp =
+        crate::worker_mcp::prepare(WorkerAgent::Claude, &cwd, &plan, &keep, &launch.extra_args);
     warnings.extend(worker_mcp.warnings.iter().cloned());
     let cmd = orchestrator::agent::build_worker_cmd_in(
         &orchestrator::agent::WorkerLaunch {
@@ -332,6 +327,7 @@ fn resume_worker_launch(
             extra_args: &launch.extra_args,
             tako_bin: Some(tako_bin),
             mcp_settings: worker_mcp.settings_file.as_deref(),
+            mcp_codex_off: &worker_mcp.codex_off,
             env: &plan,
         },
         dialect,

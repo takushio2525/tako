@@ -6416,6 +6416,7 @@ prompt_blocks:
                 // （注入そのものは #986 のテストが見る）
                 tako_bin: None,
                 mcp_settings: None,
+                mcp_codex_off: &[],
                 env: &EMPTY_ENV_PLAN,
             },
             crate::launch_cmd::ShellDialect::Posix,
