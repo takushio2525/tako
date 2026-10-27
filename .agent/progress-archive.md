@@ -646,3 +646,16 @@
 - 2026-10-25 #2365 の 2 本目: tako-core のエラー型 10 種（編集 4・Session・Runner・CommandCard・Backend・LSP の ParseError 2）を `text_in` の日英へ・「まだ実行中」は `says_still_running`
 - 2026-10-25 #2371: セルフテスト項目 154 の漏れの判定が器越しのペイン（history=0）で画面の外へ流れた漏れを見落とす偽の緑 → `st2371_assert_no_leak` がグリッド + 器の履歴を読む・項目 155 も同じ判定へ
 - 2026-10-25 #2378: 番犬の 3.2 の写しの字句が `"${ … }"` の中の `'…'` / `$'…'` を 3.2 と同じに引用符として読む = `ParamCtx`
+- 2026-10-25 #2284 の再発: 真因はテスト = 看取った `Child` を drop してから読み、Windows が再利用した pid の別プロセスを `Alive` と読んだ → `process::ReapedChild` を持ったまま読む
+- 2026-10-25 #2387: issue1977 の LSP の古い版の片付けのテストの `dead_pid()` を `reaped_child()` へ。test_data_residue の `reaped_pid` は対象外として conventions に例外を記録
+- 2026-10-25 #2350: 端末の問い合わせ（OSC 10/11/12/4・CSI ? 996 n・CSI 14 t）に答え、mode 2031 を購読した器（tmux）へテーマの切り替えを知らせる・OSC 52 の読み出しは断る・check-health の `terminal_queries`
+- 2026-10-25 #2365 の 3 本目: 保存の断りに添える案内を `Reason` へ移し、プレビュー・編集・ファイル操作・ペイン / タブ操作の断り 34 種を足した（51 → 85 種）
+- 2026-10-25 #2393: 実 tmux のテストが `kill-server` の後にソケットファイルを残していた件を、失敗の経路も含めて `remove_socket_file` / `kill_server` する形へ。番犬 `テストが落とした器はソケットファイルまで消す`
+- 2026-10-25 #2391: 走らせた人の env（TAKO_ISOLATED / TAKO_SELF_TEST / TAKO_DATA_DIR）で結果が変わるテスト 6 本を、env を組んだ子プロセスで見る形へ
+- 2026-10-25 #2365 の続き: `tako mod ui` の断り（UiError 一式）を日英の網羅 match へ。setup / persist.log / migrate は日本語固定
+- 2026-10-25 #2395: usage の索引のテストが A/B の env をプロセス全体に立て、並走する codex の区間按分のテストまで旧挙動にしていた → `walk_with(s5_legacy)` へ分け、テストは env を立てない
+- 2026-10-25 #1899 の 1 点目: 全文を 1 つの TextEdit で返す整形を行ごとの置き換えへ割る = `text_diff::changed_regions` + `text_edit::line_split`。割って undo が軽くなるときだけ割る
+- 2026-10-25 #2365 の続き: ファイルの移動・コピーの断りを理由ごと（`MoveRefusal` / `CopyRefusal` の `text_in` + dispatch の `Reason`）日英の網羅 match へ
+- 2026-10-25 #2402: usage::index の claude 系テストの固定日付が 2027-11 以降に月の掃除で消えて落ちる時限 → 実時間の 2 日前の正午からの相対へ・製品は無変更
+- 2026-10-25 #2400: env を書く lib のテスト 62 本と結合テスト 5 本を `tako_core::run_alone!`（その 1 本だけの子）へ・env 専用ロック 5 つを撤去・番犬 `issue2400_test_env_write_watchdog`
+- 2026-10-26 #1992 10/25 夜の PC 停止の調査: メモリ枯渇 → Jetsam → watchdog のカーネルパニック（3 回目）。主因は agent の常駐 = claude 1 本ごとに user scope の MCP 12〜15 プロセス
