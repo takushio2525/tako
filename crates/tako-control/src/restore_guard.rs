@@ -518,15 +518,12 @@ mod tests {
 
     #[test]
     fn 器へ繋いだ直後に入力なしで全滅したら救済する() {
+        // 時刻は注入する（`t0` からずらした `Instant` を渡すだけで実時間は測らない）
         let t0 = Instant::now();
         let w = armed(t0);
-        let d = w.decide(t0 + Duration::from_millis(800), 2, false);
-        assert_eq!(
-            d,
-            Decision::Rescue {
-                elapsed: Duration::from_millis(800)
-            }
-        );
+        let offset = Duration::from_millis(800);
+        let d = w.decide(t0 + offset, 2, false);
+        assert_eq!(d, Decision::Rescue { elapsed: offset });
     }
 
     #[test]
