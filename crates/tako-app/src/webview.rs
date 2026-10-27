@@ -1622,7 +1622,7 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with("    ") && !line[4..].starts_with(' '))
             .filter_map(tako_core::source_scan::fn_head_name)
-            .last()
+            .next_back()
     }
 
     /// `open`（`(` の位置）に対応する `)` の位置。文字列リテラルと行コメントは飛ばす
