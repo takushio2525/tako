@@ -287,6 +287,15 @@ mod tests {
         });
         recent.save();
 
+        // 4c. Web ビューの生成中の印（<data_dir>/webview-guard.json と .lock。#724 の W4）。
+        //     足して外す = 平常時と同じくファイルは残らないが、排他の .lock と書き先は見る
+        let probe = crate::webview_guard::GuardMark {
+            pane: Some(944),
+            url: "about:blank".into(),
+        };
+        let _ = crate::webview_guard::begin(&probe);
+        let _ = crate::webview_guard::end(&probe);
+
         // 5. 外部エージェントの事前信頼（~/.claude.json・~/.codex/config.toml・
         //    ~/.gemini/antigravity-cli/settings.json）
         let _ = crate::claude_tui::ensure_trusted("/tmp/tako-944-probe");

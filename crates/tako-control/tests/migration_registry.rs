@@ -379,6 +379,13 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             &["HistoryRow", "JobKind"],
         ),
         (
+            // #724 の W4: Web ビューの生成中に落ちた印 `<data_dir>/webview-guard.json`。版数の番地は持たない
+            // （共有しない Local のランタイム状態。読めなければ捨てる = 保留しない側へ倒す）が、
+            // 欄を増減・改名したら旧い印が読めるかをここで選ばせる
+            "crates/tako-control/src/webview_guard.rs",
+            &["GuardFile", "GuardMark"],
+        ),
+        (
             // #2204: codex の rollout の読みの状態（`cursor.jsonl` の行の `codex`。claude の行には無い =
             // serde の default で旧い行がそのまま読める）
             "crates/tako-core/src/usage/codex.rs",

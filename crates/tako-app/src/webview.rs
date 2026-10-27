@@ -14,10 +14,106 @@
 //! 下に隠れる。重なりが生じる UI の表示中は呼び出し側が `sync_frame(None)` で隠すこと
 //! （`.agent/architecture.md`「Web ビューペイン」節）。
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tako_core::PaneId;
+
+/// Web ビューの生成を **gpui の App を借用していないところ**で 1 本ずつ行うか（#724 の W1）。
+///
+/// Windows の wry（WebView2）は環境・コントローラ・初期化スクリプトの作成完了を
+/// `webview2_com::wait_with_pump`（`GetMessageA` + `DispatchMessageA` の入れ子のループ）で待つ
+/// （wry-0.55.1 `src/webview2/mod.rs:363 / :414 / :1308`）。App を借用したまま
+/// （クリックハンドラ・render・dispatch のどれも借用の内側）生成すると、ポンプが走らせた
+/// gpui の前景タスクの `AsyncApp::update_entity` が `borrow_mut()` で二重借用の panic を起こし、
+/// 窓プロシージャを跨ぐので巻き戻せず abort する（#724 の実機の panic.log と隔離環境の再現で
+/// 同じ署名）。真のときは `TakoApp::create_webview` が待ち行列へ積むだけにし、生成は
+/// 常駐の生成タスク（`TakoApp::spawn_webview_builder`）が `update` の**外**で行う。
+///
+/// macOS の WKWebView の生成はポンプを回さないので偽（従来どおり同期で生成）。
+/// A/B: Windows で `TAKO_724_LEGACY=1` = 修正前の同期生成（W2 の ipc も戻る）/
+/// macOS で `TAKO_724_ASYNC=1` = Windows と同じ非同期の経路を通す（経路の検証用）
+pub fn async_build_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        async_build_decision(
+            cfg!(windows),
+            legacy_724(),
+            std::env::var_os("TAKO_724_ASYNC").is_some(),
+        )
+    })
+}
+
+/// [`async_build_enabled`] の判断（純関数）
+pub(crate) fn async_build_decision(windows: bool, legacy: bool, forced: bool) -> bool {
+    !legacy && (windows || forced)
+}
+
+/// ページから tako へ ipc（`window.ipc.postMessage`）でタイトル・URL を送らせるか（#724 の W2）。
+///
+/// Windows の wry は ipc ハンドラが付いていると、COM のコールバックの中で
+/// `Request::builder().uri(url).body(js).unwrap()`（wry-0.55.1 `src/webview2/mod.rs:910`）を呼ぶ。
+/// `url` はメッセージを送った文書の URI で、data: / about:blank や URI が未確定のときは
+/// `http::Uri` にならず `InvalidUri(Empty)` で panic → 巻き戻せず abort する（#724 のコメントの実機の
+/// スタック）。同じハンドラの先頭は `let (Some(args), Some(ipc_handler)) = … else { return Ok(()) }`
+/// （同 :892）なので、**ipc ハンドラを付けなければ :910 に届かない**ことが wry のソースで決まる。
+/// JS の側で http(s) のときだけ送る形は、`http::Uri` が受け付ける文字列を tako が当てる形になり
+/// 根拠が弱いので採らない。タイトル・URL は 2 秒ごとの [`WebViewEntry::poll_state`]
+/// （eval の経路。もともと正本）が拾う。Windows で失うのは http(s) のページの即時の更新だけ
+pub(crate) fn ipc_hook_enabled() -> bool {
+    ipc_hook_decision(cfg!(windows), legacy_724())
+}
+
+/// [`ipc_hook_enabled`] の判断（純関数）
+pub(crate) fn ipc_hook_decision(windows: bool, legacy: bool) -> bool {
+    !windows || legacy
+}
+
+/// 注入（#724 の検証用）: 生成タスクが仕事を取り出してから wry を呼ぶまで、ほかのタスクを
+/// 止めずに待つ（`TAKO_724_INJECT_BUILD_DELAY_MS=<ms>`）。Windows の最初の生成
+/// （msedgewebview2 の起動待ち = 数秒のあいだ前景タスクが走り続ける）を macOS で再現し、
+/// 生成中のもう 1 本・生成中に閉じる・生成中に落ちる（W4）を実経路で見る
+pub fn inject_build_delay() -> Option<std::time::Duration> {
+    std::env::var("TAKO_724_INJECT_BUILD_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
+}
+
+/// #724 の修正前へ戻す（`TAKO_724_LEGACY=1`。Windows の実機の A/B 用）
+fn legacy_724() -> bool {
+    std::env::var_os("TAKO_724_LEGACY").is_some()
+}
+
+/// Web ビューの段階（#724）。`Ready` だけが wry の Web ビューを持つ
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebViewPhase {
+    /// wry の Web ビューがある（表示・操作できる）
+    Ready,
+    /// 生成待ち（Windows では生成を App の借用の外で 1 本ずつ行う）
+    Queued,
+    /// 生成中（wry が入れ子のメッセージループを回している）
+    Building,
+    /// 前回この Web ビューの生成中に tako が落ちたので、自動では開かずに保留している（W4）
+    Held,
+    /// 生成に失敗した（理由はエラー表示。再読み込みで生成し直す）
+    Failed,
+}
+
+impl WebViewPhase {
+    /// CLI / MCP の `web list` / `read` / `open` の `state`
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Queued => "queued",
+            Self::Building => "creating",
+            Self::Held => "held",
+            Self::Failed => "failed",
+        }
+    }
+}
 
 /// GPUI ウィンドウの生ハンドルを保持して wry の親にするラッパー。
 /// `gpui::Window` は render 中しか触れないため、render で採取した
@@ -98,6 +194,18 @@ impl WindowHandleBox {
 impl Drop for WindowHandleBox {
     fn drop(&mut self) {
         key_monitor::release_view(self.ns_view_ptr());
+    }
+}
+
+/// 生成タスクへ親を持ち出すための写し（#724）。描画ビューを持つ数を揃える
+/// （macOS は写しの分も retain し、Drop が release する。Windows の親は HWND で何もしない）
+impl Clone for WindowHandleBox {
+    fn clone(&self) -> Self {
+        key_monitor::retain_view(self.ns_view_ptr());
+        Self {
+            raw: self.raw,
+            owner: self.owner,
+        }
     }
 }
 
@@ -186,6 +294,8 @@ pub struct WebShared {
     pub can_go_back: bool,
     /// ブラウザ履歴で「進む」が可能か
     pub can_go_forward: bool,
+    /// 最初の読み込みが終わったか（PageLoadEvent::Finished。#724 の W4 の印を外す合図）
+    pub first_load_done: bool,
 }
 
 /// タイトル・URL の変化を Rust 側へ通知する初期化スクリプト。
@@ -222,10 +332,17 @@ const STATE_HOOK_JS: &str = r#"
 "#;
 
 /// 1 ページ = 1 エントリ。ペイン表示中（`pane = Some`）と dock 退避中（`None`）の
-/// 両状態を通じて wry WebView インスタンスを保持し続ける
+/// 両状態を通じて wry WebView インスタンスを保持し続ける。
+///
+/// **wry の Web ビューをまだ持たないエントリもある**（#724）: Windows では生成を App の借用の外で
+/// 1 本ずつ行うので、生成待ち・生成中・保留（W4）・生成失敗のあいだもエントリは先に置く。
+/// ペインの描画・`web list`・layout.json の保存・dock・閉じる経路は既存のまま URL を扱える
 pub struct WebViewEntry {
     pub id: WebViewId,
-    pub view: wry::WebView,
+    /// wry の Web ビュー。None = [`WebViewPhase::Ready`] 以外（#724）
+    view: Option<wry::WebView>,
+    /// 段階（#724）。`&self` の経路（navigate / retry）から生成し直しを頼めるよう `Cell`
+    phase: Cell<WebViewPhase>,
     pub shared: Arc<Mutex<WebShared>>,
     /// Some = このペインに表示中 / None = dock 退避中
     pub pane: Option<PaneId>,
@@ -240,14 +357,88 @@ pub struct WebViewEntry {
     /// eval トークン採番
     next_eval_token: u64,
     /// いまの親（[`WindowHandleBox::key`]。#1837）。親を採り直したら
-    /// [`Self::adopt_parent`] がこれと突き合わせて付け替える
+    /// [`Self::adopt_parent`] がこれと突き合わせて付け替える。生成前は 0
     parent: usize,
 }
 
+/// 生成タスクへ渡す 1 本ぶんの仕事（#724 の W1）。借用の内側で
+/// [`WebViewEntry::begin_build`] が作り、**借用の外**で [`Self::build`] を呼ぶ
+pub struct BuildJob {
+    pub id: WebViewId,
+    url: String,
+    shared: Arc<Mutex<WebShared>>,
+    parent: WindowHandleBox,
+}
+
+impl BuildJob {
+    /// wry の Web ビューを作る。**gpui の App を借用していないところで呼ぶ**（#724）。
+    /// Windows の wry はこの中で入れ子のメッセージループを回し、gpui の前景タスクが走る
+    pub fn build(self) -> BuiltWebView {
+        let result = WebViewEntry::build_view(&self.parent, &self.url, &self.shared);
+        BuiltWebView {
+            id: self.id,
+            parent: self.parent.key(),
+            result,
+        }
+    }
+}
+
+/// [`BuildJob::build`] の結果。借用の内側で [`WebViewEntry::install_built`] が取り付ける
+pub struct BuiltWebView {
+    pub id: WebViewId,
+    parent: usize,
+    result: Result<wry::WebView, String>,
+}
+
 impl WebViewEntry {
-    /// wry WebView を GPUI ウィンドウの子ビューとして生成する。
+    /// wry WebView を GPUI ウィンドウの子ビューとして生成する（その場で生成する経路。macOS）。
     /// 生成直後は不可視（次フレームの `sync_frame` で表示位置が決まる）
     pub fn build(window: &WindowHandleBox, id: WebViewId, url: &str) -> Result<Self, String> {
+        let mut entry = Self::queued(id, url)?;
+        let view = Self::build_view(window, url, &entry.shared)?;
+        entry.install(view, window.key());
+        Ok(entry)
+    }
+
+    /// 生成待ちのエントリ（#724。wry の Web ビューはまだ無い）
+    pub fn queued(id: WebViewId, url: &str) -> Result<Self, String> {
+        validate_url(url)?;
+        Ok(Self::placeholder(id, url, WebViewPhase::Queued))
+    }
+
+    /// 保留のエントリ（#724 の W4。前回この Web ビューの生成中に tako が落ちた）。
+    /// 開くのは利用者が頼んだとき（[`Self::navigate`] / [`Self::retry`]）だけ
+    pub fn held(id: WebViewId, url: &str) -> Self {
+        Self::placeholder(id, url, WebViewPhase::Held)
+    }
+
+    fn placeholder(id: WebViewId, url: &str, phase: WebViewPhase) -> Self {
+        let shared = Arc::new(Mutex::new(WebShared {
+            url: url.to_string(),
+            ..Default::default()
+        }));
+        Self {
+            id,
+            view: None,
+            phase: Cell::new(phase),
+            shared,
+            pane: None,
+            visible_now: false,
+            bounds_now: None,
+            visible_flips: 0,
+            bounds_sets: 0,
+            next_eval_token: 1,
+            parent: 0,
+        }
+    }
+
+    /// wry の Web ビューを作る（親の検査・ハンドラの取り付け・`build_as_child`）。
+    /// 状態の書き戻し先は呼び出し側のエントリの `shared`
+    fn build_view(
+        window: &WindowHandleBox,
+        url: &str,
+        shared: &Arc<Mutex<WebShared>>,
+    ) -> Result<wry::WebView, String> {
         validate_url(url)?;
         // 親が窓に載っていなければ wry へ渡さない（#1837。#334 と同じく、wry の unwrap に
         // 届く前に断る = tako 全体を落とさない）。macOS の wry は親の NSWindow を
@@ -255,50 +446,17 @@ impl WebViewEntry {
         if !window.attached() {
             return Err(detached_parent_error());
         }
-        let track_nav = should_track_nav(url);
-        let shared = Arc::new(Mutex::new(WebShared {
-            url: url.to_string(),
-            nav_started_at: if track_nav {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            },
-            nav_target_url: if track_nav {
-                Some(url.to_string())
-            } else {
-                None
-            },
-            ..Default::default()
-        }));
-        let ipc_shared = Arc::clone(&shared);
-        let load_shared = Arc::clone(&shared);
-        let new_win_shared = Arc::clone(&shared);
-        let view = wry::WebViewBuilder::new()
+        let load_shared = Arc::clone(shared);
+        let new_win_shared = Arc::clone(shared);
+        let mut builder = wry::WebViewBuilder::new()
             .with_url(url)
             .with_visible(false)
             .with_focused(false)
-            .with_initialization_script(STATE_HOOK_JS)
             .with_new_window_req_handler(move |url, _features| {
                 if let Ok(mut s) = new_win_shared.lock() {
                     s.pending_new_window_urls.push(url);
                 }
                 wry::NewWindowResponse::Deny
-            })
-            .with_ipc_handler(move |req| {
-                let body: &str = req.body();
-                let Ok(msg) = serde_json::from_str::<serde_json::Value>(body) else {
-                    return;
-                };
-                if msg.get("kind").and_then(|v| v.as_str()) == Some("state") {
-                    if let Ok(mut s) = ipc_shared.lock() {
-                        if let Some(t) = msg.get("title").and_then(|v| v.as_str()) {
-                            s.title = t.to_string();
-                        }
-                        if let Some(u) = msg.get("url").and_then(|v| v.as_str()) {
-                            s.url = u.to_string();
-                        }
-                    }
-                }
             })
             .with_on_page_load_handler(move |event, url| {
                 if let Ok(mut s) = load_shared.lock() {
@@ -318,24 +476,117 @@ impl WebViewEntry {
                             s.nav_target_url = None;
                             s.error = None;
                             s.failed_url = None;
+                            s.first_load_done = true;
                         }
                     }
                 }
-            })
+            });
+        // #724 の W2: Windows では ipc ハンドラを付けない（付けると data: / about:blank で
+        // wry の mod.rs:910 の unwrap に届く。理由は `ipc_hook_enabled`）。ハンドラが無いと
+        // postMessage は捨てられるだけなので、送り手の初期化スクリプトも入れない
+        if ipc_hook_enabled() {
+            let ipc_shared = Arc::clone(shared);
+            builder = builder
+                .with_initialization_script(STATE_HOOK_JS)
+                .with_ipc_handler(move |req| {
+                    let body: &str = req.body();
+                    let Ok(msg) = serde_json::from_str::<serde_json::Value>(body) else {
+                        return;
+                    };
+                    if msg.get("kind").and_then(|v| v.as_str()) == Some("state") {
+                        if let Ok(mut s) = ipc_shared.lock() {
+                            if let Some(t) = msg.get("title").and_then(|v| v.as_str()) {
+                                s.title = t.to_string();
+                            }
+                            if let Some(u) = msg.get("url").and_then(|v| v.as_str()) {
+                                s.url = u.to_string();
+                            }
+                        }
+                    }
+                });
+        }
+        builder
             .build_as_child(window)
-            .map_err(|e| format!("webview 生成失敗: {e}"))?;
-        Ok(Self {
-            id,
-            view,
-            shared,
-            pane: None,
-            visible_now: false,
-            bounds_now: None,
-            visible_flips: 0,
-            bounds_sets: 0,
-            next_eval_token: 1,
-            parent: window.key(),
+            .map_err(|e| format!("webview 生成失敗: {e}"))
+    }
+
+    /// 作った wry の Web ビューを取り付ける。ナビゲーションの見張り（10 秒）はここから数える
+    /// （Windows の最初の生成は msedgewebview2 の起動を待つので、生成の前から数えると
+    /// 生成だけで期限を越える）
+    fn install(&mut self, view: wry::WebView, parent: usize) {
+        self.view = Some(view);
+        self.parent = parent;
+        self.phase.set(WebViewPhase::Ready);
+        self.bounds_now = None;
+        // 読み込みのイベント（nav_committed / first_load_done）はここでは消さない: wry は
+        // `Navigate` を最後のポンプの後に呼ぶので生成中には届かないが、先に届いていても失わない
+        if let Ok(mut s) = self.shared.lock() {
+            let url = s.url.clone();
+            if should_track_nav(&url) && !s.nav_committed {
+                s.nav_started_at = Some(std::time::Instant::now());
+                s.nav_target_url = Some(url);
+            }
+        }
+    }
+
+    /// いまの段階（#724）
+    pub fn phase(&self) -> WebViewPhase {
+        self.phase.get()
+    }
+
+    /// 生成待ちのエントリから生成の仕事を取り出す（#724 の W1。借用の内側で呼ぶ）。
+    /// 生成待ちでなければ None。取り出したら [`WebViewPhase::Building`] になる
+    pub fn begin_build(&self, parent: &WindowHandleBox) -> Option<BuildJob> {
+        if self.phase.get() != WebViewPhase::Queued {
+            return None;
+        }
+        self.phase.set(WebViewPhase::Building);
+        Some(BuildJob {
+            id: self.id,
+            url: self.current_url(),
+            shared: Arc::clone(&self.shared),
+            parent: parent.clone(),
         })
+    }
+
+    /// [`BuildJob::build`] の結果を取り付ける（借用の内側で呼ぶ）。失敗したら理由を
+    /// エラー表示（再読み込みで生成し直す）に出して Err を返す
+    pub fn install_built(&mut self, built: BuiltWebView) -> Result<(), String> {
+        match built.result {
+            Ok(view) => {
+                self.install(view, built.parent);
+                Ok(())
+            }
+            Err(reason) => {
+                self.fail(&reason);
+                Err(reason)
+            }
+        }
+    }
+
+    /// 生成に入れなかった・失敗した（#724）。理由はエラー表示に出し、再読み込みで生成し直す
+    pub fn fail(&self, reason: &str) {
+        self.phase.set(WebViewPhase::Failed);
+        if let Ok(mut s) = self.shared.lock() {
+            s.error = Some(reason.to_string());
+            s.failed_url = Some(s.url.clone());
+            s.loading = false;
+            s.nav_started_at = None;
+            s.nav_target_url = None;
+        }
+    }
+
+    /// まだ wry の Web ビューが無いあいだの断り（#724。CLI / MCP の eval 等の応答）
+    fn not_ready_error(&self) -> String {
+        crate::ui_text::webdock::not_ready(self.id.as_u64(), self.phase.get().as_str())
+    }
+
+    /// 最初の読み込みが終わったか（#724 の W4 の印を外す合図）
+    pub fn first_load_done(&self) -> bool {
+        self.shared
+            .lock()
+            .map(|s| s.first_load_done)
+            .unwrap_or(false)
     }
 
     /// いまの親（`parent`）の子か（#1837。`tako web list` の `attached`）
@@ -352,13 +603,17 @@ impl WebViewEntry {
     /// Windows は親の HWND が壊れると子の WebView2 の窓も壊れるので付け替えられない
     /// （窓を閉じた時点でそのページは失われる。生成と位置合わせは落ちない）
     pub fn adopt_parent(&mut self, parent: &WindowHandleBox) -> bool {
-        if self.parented_to(parent) || !parent.attached() {
+        // 生成前（#724）は付け替えるものが無い。生成は採り直した親で行われる
+        if self.view.is_none() || self.parented_to(parent) || !parent.attached() {
             return false;
         }
         #[cfg(target_os = "macos")]
         {
             use wry::WebViewExtMacOS;
-            let wk = self.view.webview();
+            let Some(view) = self.view.as_ref() else {
+                return false;
+            };
+            let wk = view.webview();
             let wk_ptr = &*wk as *const _ as *const std::ffi::c_void;
             if !key_monitor::add_subview(parent.ns_view_ptr(), wk_ptr) {
                 return false;
@@ -375,16 +630,20 @@ impl WebViewEntry {
     }
 
     /// WKWebView がいま窓に載っているか（#1837。macOS の wry は位置合わせ・focus で
-    /// `webview.window().unwrap()` を引くので、偽のまま呼ぶと panic する）
+    /// `webview.window().unwrap()` を引くので、偽のまま呼ぶと panic する）。生成前は偽（#724）
     fn in_window(&self) -> bool {
+        let Some(view) = self.view.as_ref() else {
+            return false;
+        };
         #[cfg(target_os = "macos")]
         {
             use wry::WebViewExtMacOS;
-            let wk = self.view.webview();
+            let wk = view.webview();
             key_monitor::view_has_window(&*wk as *const _ as *const std::ffi::c_void)
         }
         #[cfg(not(target_os = "macos"))]
         {
+            let _ = view;
             true
         }
     }
@@ -398,37 +657,51 @@ impl WebViewEntry {
     /// selector の例外で abort した）。「WKWebView の superview が常に正しい宛先」（#1481）を
     /// その場で AppKit に聞く。付け替えていない Web ビューでは wry と同じ宛先になる
     fn focus_parent(&self) {
+        let Some(view) = self.view.as_ref() else {
+            return;
+        };
         #[cfg(target_os = "macos")]
         {
             use wry::WebViewExtMacOS;
-            let wk = self.view.webview();
+            let wk = view.webview();
             key_monitor::focus_superview(&*wk as *const _ as *const std::ffi::c_void);
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = self.view.focus_parent();
+            let _ = view.focus_parent();
         }
     }
 
-    /// ページへキー入力の宛先を渡す（#1481）。窓に載っていなければ渡さない（#1837）
+    /// ページへキー入力の宛先を渡す（#1481）。窓に載っていなければ渡さない（#1837）。
+    /// 生成前は理由つきで断る（#724）
     pub fn focus(&self) -> Result<(), String> {
+        let Some(view) = self.view.as_ref() else {
+            return Err(self.not_ready_error());
+        };
         if !self.in_window() {
             return Err(detached_parent_error());
         }
-        self.view.focus().map_err(|e| e.to_string())
+        view.focus().map_err(|e| e.to_string())
     }
 
     /// フレーム同期: 表示すべきなら bounds（論理 px）を渡し、隠すなら None。
-    /// 実際の AppKit / Win32 呼び出しは値が変わったときだけ行う
+    /// 実際の AppKit / Win32 呼び出しは値が変わったときだけ行う。
+    /// 生成前（#724）は置くものが無い（ペインの本文は GPUI が「準備中」「保留」を描く）
     pub fn sync_frame(&mut self, bounds: Option<(f64, f64, f64, f64)>) {
+        if self.view.is_none() {
+            return;
+        }
         match bounds {
             // 窓に載っていない Web ビューは置けない（#1837。wry の set_bounds が
             // `webview.window().unwrap()` で panic する）。親を採り直して付け替えれば
             // 次のフレームで置かれる
             Some(_) if !self.in_window() => {}
             Some((x, y, w, h)) => {
+                let Some(view) = self.view.as_ref() else {
+                    return;
+                };
                 if self.bounds_now != Some((x, y, w, h)) {
-                    let _ = self.view.set_bounds(wry::Rect {
+                    let _ = view.set_bounds(wry::Rect {
                         position: wry::dpi::Position::Logical(wry::dpi::LogicalPosition::new(x, y)),
                         size: wry::dpi::Size::Logical(wry::dpi::LogicalSize::new(w, h)),
                     });
@@ -436,7 +709,7 @@ impl WebViewEntry {
                     self.bounds_sets = self.bounds_sets.saturating_add(1);
                 }
                 if !self.visible_now {
-                    let _ = self.view.set_visible(true);
+                    let _ = view.set_visible(true);
                     self.visible_now = true;
                     self.visible_flips = self.visible_flips.saturating_add(1);
                 }
@@ -446,7 +719,9 @@ impl WebViewEntry {
                     // 隠す前にフォーカスを親（GPUI ウィンドウ）へ返す。
                     // 返さないとキー入力が不可視 webview に吸われ続ける
                     self.focus_parent();
-                    let _ = self.view.set_visible(false);
+                    if let Some(view) = self.view.as_ref() {
+                        let _ = view.set_visible(false);
+                    }
                     self.visible_now = false;
                     self.visible_flips = self.visible_flips.saturating_add(1);
                 }
@@ -458,8 +733,11 @@ impl WebViewEntry {
     /// 位置は次の render の `sync_frame` が補正する。
     /// 可視状態の変化はここも数える（#838 の計器が実態とずれないように）
     pub fn show_without_bounds(&mut self) {
+        let Some(view) = self.view.as_ref() else {
+            return;
+        };
         if !self.visible_now {
-            let _ = self.view.set_visible(true);
+            let _ = view.set_visible(true);
             self.visible_now = true;
             self.visible_flips = self.visible_flips.saturating_add(1);
         }
@@ -469,10 +747,13 @@ impl WebViewEntry {
     /// ipc（WKScriptMessageHandler）は data: URL 等で通知が届かないケースを実機で
     /// 確認したため（#155 セルフテスト診断: eval は届くが ipc の title が空のまま）、
     /// 実証済みの evaluate_script_with_callback 経路を正とし、ipc は http(s) ページでの
-    /// 即時更新用に併存させる
+    /// 即時更新用に併存させる（Windows は ipc を付けないのでこれだけ。#724 の W2）
     pub fn poll_state(&self) {
+        let Some(view) = self.view.as_ref() else {
+            return;
+        };
         let shared = Arc::clone(&self.shared);
-        let _ = self.view.evaluate_script_with_callback(
+        let _ = view.evaluate_script_with_callback(
             "JSON.stringify({t:document.title||'',u:location.href||'',b:navigation&&navigation.canGoBack||false,f:navigation&&navigation.canGoForward||false,h:history.length||0})",
             move |result| {
                 let Ok(serde_json::Value::String(inner)) =
@@ -505,15 +786,17 @@ impl WebViewEntry {
         );
     }
 
-    /// ナビゲーション操作。`to` は "back" / "forward" / "reload" / URL 文字列
+    /// ナビゲーション操作。`to` は "back" / "forward" / "reload" / URL 文字列。
+    /// wry の Web ビューがまだ無いとき（#724）は [`Self::navigate_pending`]
     pub fn navigate(&self, to: &str) -> Result<(), String> {
+        let Some(view) = self.view.as_ref() else {
+            return self.navigate_pending(to);
+        };
         match to {
-            "back" => self
-                .view
+            "back" => view
                 .evaluate_script("history.back();")
                 .map_err(|e| format!("back 失敗: {e}")),
-            "forward" => self
-                .view
+            "forward" => view
                 .evaluate_script("history.forward();")
                 .map_err(|e| format!("forward 失敗: {e}")),
             "reload" => {
@@ -524,7 +807,7 @@ impl WebViewEntry {
                         return self.navigate(&url);
                     }
                 }
-                self.view.reload().map_err(|e| format!("reload 失敗: {e}"))
+                view.reload().map_err(|e| format!("reload 失敗: {e}"))
             }
             url => {
                 let url = normalize_url(url);
@@ -541,9 +824,42 @@ impl WebViewEntry {
                         s.nav_target_url = Some(url.clone());
                     }
                 }
-                self.view
-                    .load_url(&url)
+                view.load_url(&url)
                     .map_err(|e| format!("URL 読み込み失敗: {e}"))
+            }
+        }
+    }
+
+    /// wry の Web ビューがまだ無いときのナビゲーション（#724）。
+    ///
+    /// - 保留（W4）・生成失敗: **ここで生成し直しを頼む**（生成待ちへ戻す）。URL を渡せば
+    ///   その URL で、back / forward / reload なら元の URL で開く。生成タスクを起こすのは
+    ///   呼び出し側（`TakoApp::wake_webview_builder`）
+    /// - 生成待ち: URL なら生成する URL を差し替える（back / forward / reload は何もしない）
+    /// - 生成中: 断る（作り終えてから navigate する）
+    fn navigate_pending(&self, to: &str) -> Result<(), String> {
+        let phase = self.phase.get();
+        let target = match to {
+            "back" | "forward" | "reload" => None,
+            url => {
+                let url = normalize_url(url);
+                validate_url(&url)?;
+                Some(url)
+            }
+        };
+        match phase {
+            WebViewPhase::Building | WebViewPhase::Ready => Err(self.not_ready_error()),
+            WebViewPhase::Queued | WebViewPhase::Held | WebViewPhase::Failed => {
+                if let Ok(mut s) = self.shared.lock() {
+                    if let Some(url) = target {
+                        s.url = url;
+                    }
+                    s.error = None;
+                    s.failed_url = None;
+                    s.loading = false;
+                }
+                self.phase.set(WebViewPhase::Queued);
+                Ok(())
             }
         }
     }
@@ -552,20 +868,22 @@ impl WebViewEntry {
     /// dispatch は UI スレッドで走るため、ここで結果を同期待ちしてはならない
     /// （wry のコールバックも UI スレッド配送 = 待つとデッドロック）
     pub fn eval(&mut self, js: &str) -> Result<u64, String> {
+        let Some(view) = self.view.as_ref() else {
+            return Err(self.not_ready_error());
+        };
         let token = self.next_eval_token;
         self.next_eval_token += 1;
         let shared = Arc::clone(&self.shared);
-        self.view
-            .evaluate_script_with_callback(js, move |result| {
-                if let Ok(mut s) = shared.lock() {
-                    // 回収されない結果が無限に溜まらないよう上限を設ける
-                    if s.eval_results.len() > 64 {
-                        s.eval_results.clear();
-                    }
-                    s.eval_results.insert(token, result);
+        view.evaluate_script_with_callback(js, move |result| {
+            if let Ok(mut s) = shared.lock() {
+                // 回収されない結果が無限に溜まらないよう上限を設ける
+                if s.eval_results.len() > 64 {
+                    s.eval_results.clear();
                 }
-            })
-            .map_err(|e| format!("eval 失敗: {e}"))?;
+                s.eval_results.insert(token, result);
+            }
+        })
+        .map_err(|e| format!("eval 失敗: {e}"))?;
         Ok(token)
     }
 
@@ -1244,24 +1562,25 @@ mod tests {
     #[test]
     fn issue1837_wryのunwrapに届く前に窓に載っているかを見る() {
         let src = include_str!("webview.rs");
-        let build = fn_body(src, "pub fn build(");
+        // #724: wry を呼ぶのは `build_view` の 1 か所（同期の `build` も生成タスクの `BuildJob::build` も通る）
+        let build = fn_body(src, "fn build_view(");
         assert!(
             guarded(build, "window.attached()", ".build_as_child("),
-            "WebViewEntry::build が親の生存を見ずに wry へ渡している（#1837）"
+            "WebViewEntry::build_view が親の生存を見ずに wry へ渡している（#1837）"
         );
         let sync = fn_body(src, "pub fn sync_frame(");
         assert!(
-            guarded(sync, "self.in_window()", "self.view.set_bounds("),
+            guarded(sync, "self.in_window()", "view.set_bounds("),
             "sync_frame が窓に載っているかを見ずに set_bounds を呼んでいる（#1837）"
         );
         let focus = fn_body(src, "pub fn focus(&self)");
         assert!(
-            guarded(focus, "self.in_window()", "self.view.focus()"),
+            guarded(focus, "self.in_window()", "view.focus()"),
             "focus が窓に載っているかを見ずに wry の focus を呼んでいる（#1837）"
         );
         // 隠すときの宛先の戻しは wry の focus_parent（生成時の親）ではなく、いまの superview へ
         assert!(
-            !sync.contains("self.view.focus_parent()"),
+            !sync.contains("view.focus_parent()"),
             "sync_frame が wry の focus_parent を直に呼んでいる。付け替えた後は生成時の親が\
              窓に居ないので NSWindow 自身が宛先になる（#1837）。self.focus_parent() を通すこと"
         );
@@ -1289,5 +1608,279 @@ mod tests {
         assert!(reason.contains("Web ビューの親"));
         assert!(reason.contains("窓を開いて"));
         assert!(reason.contains("#1837"));
+    }
+
+    /// `src` の `offset` が何行目か（1 始まり。番犬の名指し用）
+    fn line_of(src: &str, offset: usize) -> usize {
+        src[..offset].matches('\n').count() + 1
+    }
+
+    /// `offset` を含む impl のメソッド（4 字下げの `fn`）の名前。関数の頭の判定は
+    /// 共有ヘルパ（#1496。`pub(crate) fn` / `async fn` も頭と見なす）
+    fn enclosing_method(src: &str, offset: usize) -> Option<&str> {
+        src[..offset]
+            .lines()
+            .filter(|line| line.starts_with("    ") && !line[4..].starts_with(' '))
+            .filter_map(tako_core::source_scan::fn_head_name)
+            .last()
+    }
+
+    /// `open`（`(` の位置）に対応する `)` の位置。文字列リテラルと行コメントは飛ばす
+    fn matching_paren(src: &str, open: usize) -> Option<usize> {
+        let b = src.as_bytes();
+        let mut depth = 0i32;
+        let mut i = open;
+        while i < b.len() {
+            match b[i] {
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        if b[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// **Windows の Web ビューの生成は gpui の App の借用の外で行う**（#724 の W1）。
+    ///
+    /// 借用の内側（dispatch・クリックハンドラ・render）で wry を呼ぶと、WebView2 の入れ子の
+    /// メッセージループが gpui の前景タスクを走らせ、`update_entity` の `borrow_mut()` が
+    /// 二重借用の panic → 窓プロシージャを跨いで abort する（#724 の実機の panic.log）。
+    /// 固定する形:
+    /// ① main.rs の同期の生成（`WebViewEntry::build(`）は `create_webview` の中で、
+    ///   `async_build_enabled()` の早期 return の**後**にしか無い
+    /// ② 生成タスクの wry 呼び出し（`job.build()`）は `spawn_webview_builder` の中で、
+    ///   どの `.update(` の引数（= 借用の内側）にも入っていない
+    /// ③ main.rs は wry を直に呼ばない（`build_view` / `WebViewBuilder` / `build_as_child`）
+    /// ④ Windows は既定で非同期の経路（A/B の env が無ければ）
+    #[test]
+    fn issue724_webviewの生成をappの借用の外で行う() {
+        let main = include_str!("main.rs");
+        let here = "crates/tako-app/src/main.rs";
+        let mut bad = Vec::new();
+        // ①
+        for (at, _) in main.match_indices("WebViewEntry::build(") {
+            let method = enclosing_method(main, at);
+            let ok = method == Some("create_webview") && {
+                let sig = "fn create_webview(";
+                let body = fn_body(main, sig);
+                // fn_body はシグネチャの直後から始まる
+                let rel = at.saturating_sub(main.find(sig).unwrap_or(0) + sig.len());
+                let gate = body.find("if webview::async_build_enabled() {");
+                let ret = gate.and_then(|g| body[g..].find("return Ok(id);").map(|r| g + r));
+                matches!(ret, Some(r) if r < rel)
+            };
+            if !ok {
+                bad.push(format!(
+                    "{here}:{} 同期の生成が非同期の経路の早期 return の外にある（{}）",
+                    line_of(main, at),
+                    method.unwrap_or("?")
+                ));
+            }
+        }
+        // ②
+        let calls: Vec<usize> = main.match_indices("job.build()").map(|(i, _)| i).collect();
+        if calls.is_empty() {
+            bad.push(format!("{here}: 生成タスクの job.build() が見つからない"));
+        }
+        for at in calls {
+            let method = enclosing_method(main, at);
+            if method != Some("spawn_webview_builder") {
+                bad.push(format!(
+                    "{here}:{} job.build() が生成タスクの外（{}）にある",
+                    line_of(main, at),
+                    method.unwrap_or("?")
+                ));
+                continue;
+            }
+            let start = main.find("fn spawn_webview_builder(").unwrap_or(0);
+            for (u, _) in main[start..at].match_indices(".update(") {
+                let open = start + u + ".update".len();
+                if matching_paren(main, open).is_none_or(|close| close > at) {
+                    bad.push(format!(
+                        "{here}:{} job.build() が {here}:{} の .update( の内側 = App の借用の中にある",
+                        line_of(main, at),
+                        line_of(main, open)
+                    ));
+                }
+            }
+        }
+        // ③
+        for direct in ["build_view(", "wry::WebViewBuilder", "build_as_child("] {
+            for (at, _) in main.match_indices(direct) {
+                bad.push(format!(
+                    "{here}:{} main.rs が wry の生成（{direct}）を直に呼んでいる",
+                    line_of(main, at)
+                ));
+            }
+        }
+        // webview.rs の側: wry の生成は build_view の 1 か所（テストの中の文字列は数えない）
+        let src = include_str!("webview.rs");
+        let code = &src[..src.find("#[cfg(test)]\nmod tests").unwrap_or(src.len())];
+        let builds: Vec<usize> = code
+            .match_indices(".build_as_child(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            builds.len(),
+            1,
+            "wry の build_as_child は build_view の 1 か所だけ"
+        );
+        assert_eq!(
+            enclosing_method(src, builds[0]),
+            Some("build_view"),
+            "crates/tako-app/src/webview.rs:{} build_as_child が build_view の外にある",
+            line_of(src, builds[0])
+        );
+        assert!(
+            bad.is_empty(),
+            "#724 の W1 が崩れている:\n{}",
+            bad.join("\n")
+        );
+        // ④
+        assert!(
+            async_build_decision(true, false, false),
+            "Windows は既定で非同期"
+        );
+        assert!(
+            !async_build_decision(false, false, false),
+            "macOS は既定で同期"
+        );
+        assert!(
+            !async_build_decision(true, true, false),
+            "TAKO_724_LEGACY=1 は修正前"
+        );
+        assert!(
+            async_build_decision(false, false, true),
+            "TAKO_724_ASYNC=1 は macOS でも非同期"
+        );
+        assert!(!async_build_decision(false, true, true), "LEGACY が勝つ");
+    }
+
+    /// 番犬そのものに検出力がある（#724）。修正前の形を写しへ注入すると名指しで落ちる
+    #[test]
+    fn issue724_番犬は借用の内側の生成を名指しする() {
+        // 借用の内側で job.build() を呼ぶ写し
+        let injected = "impl X {\n    fn spawn_webview_builder(cx: C) {\n        \
+                        let built = this.update(cx, |app, _| app.take().map(|job| job.build()));\n    }\n}\n";
+        let at = injected.find("job.build()").unwrap();
+        assert_eq!(
+            enclosing_method(injected, at),
+            Some("spawn_webview_builder")
+        );
+        let open = injected.find(".update(").unwrap() + ".update".len();
+        let close = matching_paren(injected, open).unwrap();
+        assert!(close > at, "update の引数の内側にあると読めること");
+        assert_eq!(line_of(injected, at), 3);
+        // 外にある形は内側と読まない
+        let fixed = "    fn spawn_webview_builder() {\n        let job = this.update(cx, |a, _| a.take());\n        \
+                     let built = job.build();\n    }\n";
+        let at = fixed.find("job.build()").unwrap();
+        let open = fixed.find(".update(").unwrap() + ".update".len();
+        assert!(matching_paren(fixed, open).unwrap() < at);
+        // 文字列の中の括弧に惑わされない
+        let quoted = r#"x.update(cx, |_, _| println!("(")); job.build()"#;
+        let open = quoted.find(".update(").unwrap() + ".update".len();
+        assert!(matching_paren(quoted, open).unwrap() < quoted.find("job.build()").unwrap());
+    }
+
+    /// **Windows では ipc ハンドラを付けない**（#724 の W2）。
+    ///
+    /// wry 0.55 の WebView2 は ipc ハンドラが付いていると、COM のコールバックの中で送り主の文書の
+    /// URI を `http::Uri` へ unwrap し（`src/webview2/mod.rs:910`）、data: / about:blank で abort する。
+    /// 同じハンドラの先頭は ipc ハンドラが無ければ戻る（`let (Some(args), Some(ipc_handler)) … else`）
+    /// ので、付けなければ :910 に届かない。ここでは ①判断 ②`build_view` が判断の内側でだけ付けること
+    /// ③（registry に wry の実ソースがあれば）その `let … else` が unwrap より前にあることを固定する
+    #[test]
+    fn issue724_windowsではipcハンドラを付けない() {
+        // ①
+        assert!(!ipc_hook_decision(true, false), "Windows は ipc を付けない");
+        assert!(ipc_hook_decision(false, false), "macOS は従来どおり付ける");
+        assert!(ipc_hook_decision(true, true), "TAKO_724_LEGACY=1 は修正前");
+        // ②
+        let src = include_str!("webview.rs");
+        let body = fn_body(src, "fn build_view(");
+        for call in [
+            ".with_ipc_handler(",
+            ".with_initialization_script(STATE_HOOK_JS)",
+        ] {
+            assert!(
+                guarded(body, "if ipc_hook_enabled() {", call),
+                "build_view が ipc_hook_enabled() の外で {call} を付けている（#724 の W2）"
+            );
+            assert_eq!(
+                body.matches(call).count(),
+                1,
+                "{call} は判断の内側の 1 か所だけ"
+            );
+        }
+        // ③ 根拠は wry の版に結び付いている。上げたら読み直す（0.56.1 以降は上流が unwrap をやめた）
+        let lock = include_str!("../../../Cargo.lock");
+        let ver = lock
+            .split("[[package]]")
+            .find(|p| p.contains("\nname = \"wry\"\n"))
+            .and_then(|p| p.lines().find_map(|l| l.strip_prefix("version = \"")))
+            .map(|v| v.trim_end_matches('"').to_string())
+            .expect("Cargo.lock に wry が無い");
+        assert!(
+            ver.starts_with("0.55."),
+            "wry が {ver} になった。#724 の W2（Windows で ipc を付けない）の根拠は 0.55 の \
+             src/webview2/mod.rs:910 の unwrap。上流は 0.56.1 で unwrap をやめたので、\
+             新しい版のハンドラを読み直して ipc_hook_decision を戻すか決める"
+        );
+        // cargo の置き場（`CARGO_HOME`、無ければホームの `.cargo`。ホームは paths の 1 実装 = #893）
+        let home = std::env::var_os("CARGO_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| tako_core::paths::home_dir().map(|h| h.join(".cargo")));
+        let found = home.and_then(|h| {
+            std::fs::read_dir(h.join("registry").join("src"))
+                .ok()?
+                .flatten()
+                .map(|d| d.path().join(format!("wry-{ver}/src/webview2/mod.rs")))
+                .find(|p| p.is_file())
+        });
+        let Some(path) = found else {
+            println!("TAKO_724: wry {ver} の実ソースが registry に無いので ③ は見送る");
+            return;
+        };
+        let wry = std::fs::read_to_string(&path).expect("wry の実ソース");
+        let guard = wry
+            .find("let (Some(args), Some(ipc_handler)) = (args, &ipc_handler) else")
+            .expect("wry の ipc ハンドラの先頭の let … else が無い（形が変わった）");
+        let unwrap = wry
+            .find("ipc_handler(Request::builder().uri(url).body(js).unwrap())")
+            .expect("wry の ipc の unwrap が無い（形が変わった）");
+        assert!(
+            guard < unwrap,
+            "wry {ver} の ipc ハンドラは、ハンドラが無いときに unwrap より前で戻らない"
+        );
+    }
+
+    #[test]
+    fn issue724_段階の名前はcliの値() {
+        assert_eq!(WebViewPhase::Ready.as_str(), "ready");
+        assert_eq!(WebViewPhase::Queued.as_str(), "queued");
+        assert_eq!(WebViewPhase::Building.as_str(), "creating");
+        assert_eq!(WebViewPhase::Held.as_str(), "held");
+        assert_eq!(WebViewPhase::Failed.as_str(), "failed");
     }
 }

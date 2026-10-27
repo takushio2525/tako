@@ -27,6 +27,8 @@ DeliveryState: Sent, Launched, Delivered, Failed
 DesiredState: since
 Device: id, name, login, node_name, role, created_at, last_seen
 DevicesFile: devices
+GuardFile: marks
+GuardMark: pane, url
 HistoryRow: at, key, shape, name, kind, peak_mb, peak_at_s, ran_s, exit_code
 JobKind: Build, Test, Browser, Node, Gui, Agent, Other
 KeyFrom: Account, ConfigDir

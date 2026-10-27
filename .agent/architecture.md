@@ -1237,6 +1237,63 @@ GPUI のオーバーレイ（ピン留め窓 FR-2.16.15・ホバープレビュ�
 オフスクリーン合成（CEF/Servo 級の重量）か webview 内 JS オーバーレイが要る。
 スクリーンショット系機能（terminal_screen_lines 等）には webview の中身は映らない
 
+### Windows の生成は App の借用の外で 1 本ずつ（#724）
+
+Windows では Web ビューを開くと tako がプロセスごと落ちていた。原因は 2 つ。
+
+- **W1（主因）**: wry の WebView2 は環境・コントローラ・初期化スクリプトの作成完了を
+  `webview2_com::wait_with_pump`（`GetMessageA` + `DispatchMessageA` の入れ子のループ）で待つ
+  （wry-0.55.1 `src/webview2/mod.rs:363 / :414 / :1308`）。tako は App を借用したまま
+  （dispatch・クリックハンドラ・render の復元）同期で生成していたので、ポンプが gpui の
+  前景タスク（gpui_windows `platform.rs:905` の `run_foreground_task`）を走らせると
+  `AsyncApp::update_entity` の `borrow_mut()`（gpui `app/async_context.rs:65`）が二重借用で
+  panic し、窓プロシージャを跨いで abort した（実機の panic.log で `CallWindowProcW` が 2 段）。
+  macOS の WKWebView の生成はポンプを回さないので起きない
+- **W2**: ipc ハンドラが付いていると、wry は COM のコールバックの中で送り主の文書の URI を
+  `Request::builder().uri(url).body(js).unwrap()`（同 :910）に通し、data: / about:blank や
+  URI が未確定のときに `InvalidUri(Empty)` で abort した
+
+手当て（判断は `webview.rs` の `async_build_enabled` / `ipc_hook_enabled` の 1 か所）:
+
+- **W1**: Windows では `create_webview` が**生成待ちのエントリを積むだけ**にし、起動時に 1 本だけ
+  立てる生成タスク（`spawn_webview_builder`）が ①借用の内側で仕事を取り出す
+  （`take_webview_build_job`）②**借用の外**で `BuildJob::build`（= wry）③借用の内側で取り付ける
+  （`attach_built_webview`）を繰り返す。3 つの入口（dispatch の web open・dock / target=_blank・
+  起動時の復元）はどれも `create_webview` を通るので同じ経路に乗る。生成タスクは 1 本で、
+  自分の poll の最中に再入しないので**生成中は 1 本だけ**（②の最中に描画や IPC が新しい
+  Web ビューを頼んでも積まれるだけ）。dispatch は Context を持たないので、起こすのはチャネル
+  （`webview_build_wake`）。起こし損ねは 2 秒ごとのポーリングが拾う
+- **エントリは wry の Web ビューより先に置く**: `WebViewEntry` の wry の実体は `Option` で、段階
+  （`WebViewPhase` = ready / queued / creating / held / failed）を持つ。ペインの描画（「準備しています」）・
+  `web list` / `read` / `open` の `state`・layout.json の保存（URL を失わない）・dock・閉じる経路は
+  既存のまま扱える。実体の無いあいだの eval / focus は理由つきで断り、navigate は
+  生成し直しの依頼（保留・失敗）か、生成する URL の差し替え（生成待ち）になる。
+  生成中にペインやタブを閉じると、Web ビューは従来どおり dock へ外れ、作り終えたら dock に入る。
+  `web close` / × で消したものは作り終えた時点で捨てる。親が閉じていたら（#1837）生成に入らず失敗にする
+- **W2**: Windows では ipc ハンドラと送り手の初期化スクリプト（`STATE_HOOK_JS`）を付けない。
+  wry の同じハンドラの先頭は `let (Some(args), Some(ipc_handler)) = … else { return Ok(()) }`
+  なので、付けなければ :910 に届かないことが wry のソースで決まる（番犬が registry の実ソースで
+  確かめる）。JS の側で http(s) のときだけ送る形は、`http::Uri` が受け付ける文字列を tako が
+  当てる形になり根拠が弱いので採らない。タイトル・URL は 2 秒ごとの `poll_state`（eval。もともと正本）が拾う
+- **W4**: 生成を始める前に `<data_dir>/webview-guard.json`（`tako_control::webview_guard`）へ
+  （ペイン, URL）を書き、生成と最初の読み込みが済んだら（または 15 秒で）消す。abort は
+  layout.json を消さないので、印が無いと落ちる直前の Web ビューが起動のたびに同じ賭けになる。
+  次の起動は印に当たる Web ビューを**保留**（ペインか dock に URL を残し、「開く」で生成し直す。
+  CLI / MCP は `web navigate`）にする。突き合わせはペインが先・次に URL。保留は開くか閉じるまで続く。
+  macOS（同期の生成）は印を書かず読まない
+
+A/B は `TAKO_724_LEGACY=1`（Windows を修正前の同期の生成・ipc ありへ戻す）と
+`TAKO_724_ASYNC=1`（macOS で Windows と同じ生成タスクの経路を通す = 経路の検証用）。
+生成に時間が掛かる形（Windows の最初の生成 = msedgewebview2 の起動待ちのあいだも前景タスクが走る）は
+`TAKO_724_INJECT_BUILD_DELAY_MS=<ms>` で作る（仕事を取り出してから wry を呼ぶまで、ほかのタスクを止めずに待つ）。
+実経路は `bash scripts/test-webview-build-724.sh [sync|async]`（macOS の隔離 GUI。async は生成中のもう 1 本・
+生成中の eval・生成中に閉じる・kill -9 → 再起動での保留 → 開き直しまで見る）。セルフテスト項目 71 / 155 は
+open の後に ready を待つ（同期の生成では最初の 1 回で当たる）。
+番犬は `webview.rs` の `issue724_webviewの生成をappの借用の外で行う`（main.rs の同期の生成が
+`async_build_enabled` の早期 return の後にしか無い・`job.build()` がどの `.update(` の内側にも無い。
+違反は file:line で名指し）と `issue724_windowsではipcハンドラを付けない`。
+wry を 0.56.1 以降へ上げたら W2 の根拠を読み直す（上流は unwrap をやめた。番犬が版で止める）
+
 ## AI 誘導・注釈レイヤ（FR-2.6、後段フェーズ）
 
 ペイン上のハイライト・指し示しは **GPUI の描画だけで完結する見込み**（deferred / overlay 描画、
