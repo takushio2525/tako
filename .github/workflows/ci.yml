@@ -166,7 +166,9 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: macos-latest
-    timeout-minutes: 60
+    # 60 分では足りない（10/27: main でも 37〜54 分。PR の CI が重なるとビルドが 10 → 20 分に延びて
+    # 2 本続けて 60 分で打ち切られた）。Windows ジョブと同じ 90 分にする
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v4

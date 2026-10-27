@@ -54,7 +54,7 @@ EXTERNAL_CHECKS=("Cloudflare Pages")
 # 余裕 20 分** = 80 分。緑になり得る macOS の run を、CI 自身が打ち切るより先に諦めない
 # （Windows の上限 90 分は実所要がその半分以下なので追わない）。足りない日は
 # TAKO_WAIT_PR_CHECKS_TIMEOUT=<秒> か --timeout <秒> で伸ばす（--timeout が優先）
-DEFAULT_TIMEOUT=4800
+DEFAULT_TIMEOUT=6600
 DEFAULT_INTERVAL=20
 # 待機が長いときの生存表示（秒）
 HEARTBEAT=300
@@ -89,7 +89,7 @@ usage() {
 
   PR の CI が「期待するチェックが全部そろって、全部完了」するまで待つ。
   同じ結論を 2 回連続で観測するまで確定しない（GitHub API の揺れ対策）。
-  上限（既定 4800 秒）に達したら最後にもう一度状態を見て、そろっていればそれを結論にする。
+  上限（既定 6600 秒）に達したら最後にもう一度状態を見て、そろっていればそれを結論にする。
   上限は --timeout か環境変数 TAKO_WAIT_PR_CHECKS_TIMEOUT（秒）で変えられる（--timeout が優先）。
 
 終了コード: 0 = 全部緑 / 1 = 失敗あり / 2 = タイムアウト / 3 = 引数・gh のエラー /
