@@ -1159,6 +1159,19 @@ Windows CI のテスト（`crates/tako-control/src/ipc.rs` の `windows_tests::i
 - [ ] 本番で personal アカウントの worker を 1 本 spawn し、`tako queue` のそのペインの `agent` の MB が
       修正前（同じアカウントの worker で 800〜900 MB）より下がっている
 
+## 「Finder で表示」で Finder が前に出る（#2247、2026-10-25）
+
+入口から実体（tako の GUI から `NSWorkspace activateFileViewerSelectingURLs:`）までの到達は
+`scripts/test-preview-reveal-2247.sh` と visual-test `preview-reveal-2247` で機械検証済み
+（記録の口 `TAKO_REVEAL_RECORD` で受けるので本物の Finder は出していない）。
+**Finder が実際に前へ出るかは本物の Finder でしか確かめられない**（macOS 14 以降の協調的なアクティベーション）。
+本番の tako（macOS 14 以降）で次を確かめる:
+
+- [ ] プレビューのペイン（画像・PDF・Markdown）のヘッダを右クリック →「Finder で表示」で、Finder の窓が
+      tako の前に出て対象のファイルが選ばれている（tako の後ろ・別のデスクトップに出ない）
+- [ ] ファイルツリーの右クリック →「Finder で表示」と、`tako file reveal <ファイル>` でも同じく前に出る
+- [ ] `TAKO_2247_LEGACY=1` で起動した tako では（Finder が前に出ないなら）修正前の形が再現する
+
 ## codex の worker も tako の MCP だけで起動する（#2418、2026-10-27）
 
 止める名前の判断・`-c` の組み立て・置く位置は単体テストと番犬（`issue2412_worker_mcp_scope_watchdog`）で、

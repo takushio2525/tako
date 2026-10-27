@@ -10,6 +10,8 @@
 pub mod facts;
 /// OS のファイルのクリップボード（境界 B28。#1860）
 pub mod file_clipboard;
+#[cfg(target_os = "macos")]
+pub mod finder_reveal;
 /// 蓋を閉じたまま実行を継続する制御（境界 B9 の蓋ぶん。#697）
 pub mod lid;
 pub mod local_endpoint;

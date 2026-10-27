@@ -29133,9 +29133,19 @@ impl TakoApp {
                                     ));
                                 }
                             }
+                            // #2247: ツリー・パスのメニュー・CLI / MCP と同じ dispatch を通し、
+                            // 失敗（消えたファイル等）はプレビューの通知として出す
                             "reveal" => {
                                 if let Some(p) = &preview_path {
-                                    let _ = tako_control::platform::os_integration::reveal(p);
+                                    if TakoApp::legacy_2247() {
+                                        let _ = tako_control::platform::os_integration::reveal(p);
+                                    } else {
+                                        this.reveal_in_file_manager(
+                                            p,
+                                            crate::sidebar::NoticeArea::Preview,
+                                            crate::sidebar::NoticeArm::Issue2247,
+                                        );
+                                    }
                                 }
                             }
                             "open-default" => {
@@ -32634,6 +32644,11 @@ mod self_test {
     mod lsp_held_2048;
     #[cfg(feature = "visual-test")]
     use lsp_held_2048::lsp_held_visual;
+    /// #2247: 「Finder で表示」を実マウスで押し、NSWorkspace の 1 実装へ届くか（visual-test `preview-reveal-2247`）
+    #[cfg(feature = "visual-test")]
+    mod preview_reveal_2247;
+    #[cfg(feature = "visual-test")]
+    use preview_reveal_2247::preview_reveal_visual;
     /// #1956: 検出表の第 2 波を実のサーバで起こし、波線とホバーのカードを撮る（visual-test `lsp-servers`）
     #[cfg(feature = "visual-test")]
     mod lsp_servers_1956;
@@ -48304,6 +48319,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2247: 「Finder で表示」がどの入口からも NSWorkspace の 1 実装へ 1 回届くか（記録の口）
+                "preview-reveal-2247" => {
+                    preview_reveal_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1684: 実の rust-analyzer で右クリック → 項目 → 定義へ移動（無ければ SKIPPED）
                 "lsp-context-menu-real" => {
                     lsp_context_menu_real_visual(any, window, cx).await;
@@ -48567,7 +48588,7 @@ mod self_test {
                          syntax-alias / extra-syntax / net-resume / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
                          workspace-search-1694 / paste-guard / bracket-match / enter-1759 / \
-                         changelog-offload / changelog-expand / tasks-launch-2182 / palette-alias）"
+                         changelog-offload / changelog-expand / tasks-launch-2182 / palette-alias / preview-reveal-2247）"
                     );
                     std::process::exit(1);
                 }
