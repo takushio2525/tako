@@ -28,6 +28,7 @@
 //! | `no-range-format` | 文書全体の整形だけを申告する（範囲の整形は申告しない。#1683） |
 //! | `no-completion` | 補完の能力（`completionProvider`）を申告しない（#1682） |
 //! | `no-hover` | ホバーの能力（`hoverProvider`）を申告しない（#1681） |
+//! | `linger` | `normal` と同じだが `exit` も stdin の EOF も無視して居座る（止まるのは kill だけ。#2454 で cmd.exe の孫として残るかを測る） |
 //!
 //! `--providers <json>` か `TAKO_LSP_FAKE_PROVIDERS`（JSON のオブジェクト）を渡すと、シナリオの
 //! 能力（定義ジャンプ・整形・補完の `…Provider`）を捨てて**そのオブジェクトの組だけ**を申告する
@@ -1586,8 +1587,15 @@ fn main() {
                 "id": id,
                 "result": null,
             })),
+            ("exit", None) if scenario == "linger" => {}
             ("exit", None) => std::process::exit(0),
             _ => {}
+        }
+    }
+    // #2454: 止める手段が kill だけのサーバ（孫として残ったら居座る形）
+    if scenario == "linger" {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
         }
     }
     // stdin が閉じた（親が落ちた）ら自分で終わる = 孤児にならない

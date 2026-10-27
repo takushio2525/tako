@@ -512,6 +512,10 @@ pub struct TerminalSession {
     /// 子がライト / ダークの通知（mode 2031）を購読しているか（#2350。`CSI ? 2031 h / l`）。
     /// 立っているペインへだけ、テーマの切り替えを `CSI ? 997 ; 1|2 n` で知らせる
     color_scheme_updates: bool,
+    /// PTY 直下の子とその子孫を入れた Job（#2454。境界 B30）。drop（= ペインを閉じる）で
+    /// 中身を全部止める。unix・器のペイン・A/B の legacy・作れなかった回は None
+    /// （従来どおり PTY を閉じるだけ）
+    job: Option<crate::platform::job::Job>,
 }
 
 /// [`TerminalSession::serial`] の払い出し元（0 は使わない）
@@ -664,6 +668,11 @@ impl TerminalSession {
             .command
             .as_ref()
             .is_some_and(|c| crate::platform::fd_limit::routes_container_children(&c.args));
+        // #2454: 子孫を Job へ入れて閉じるときにまとめて止めるか（Windows だけ。境界 B30）。
+        // 器のクライアントは入れない: 器のサーバーはその子として起き、Job を受け継ぐと
+        // ペインを閉じたとき・GUI を終えたときに器ごと消える
+        let reap_descendants = crate::platform::job::SUPPORTED
+            && !crate::tmux_backend::is_container_client(options.command.as_ref());
         let mut tty_options = tty::Options {
             // command 未指定なら既定シェルを明示解決する（login ラッパ回避。`default_shell`）。
             // Windows はそのシェル（PowerShell）へ統合を読ませる起動引数を足す（#2432。
@@ -696,6 +705,12 @@ impl TerminalSession {
             })
         })
         .map_err(SessionError::Pty)?;
+        let child_pid = pty_child_pid(&pty);
+        // #2454: 起こした直後に Job へ入れる（シェルが子を起こす前。窓の話は `platform::job`）。
+        // pid は alacritty が子のハンドルを持ち続けるので再利用されない。入れられなければ None
+        let job = child_pid
+            .filter(|_| reap_descendants)
+            .and_then(crate::platform::job::Job::contain);
         // PTY スレーブの tty 名（/dev/ttysNNN）。tmux クライアントとの対応付けに使う（FR-2.13.2）
         let tty_name = slave_tty_name(&mut pty);
         // 疑似コンソールの文字コードを UTF-8 に固定する（#655。Windows のみ実体を持つ）。
@@ -706,7 +721,6 @@ impl TerminalSession {
         // 逃がす（UI スレッドは止めない）。失敗してもペインは起動する。
         // 固定はシェルと同期していないので、**入力は固定の決着まで門が預かる**（#2092）。
         // 諦めた・上限で流したことはイベントで UI 層へ渡す（persist.log はペイン ID を知る側が書く）
-        let child_pid = pty_child_pid(&pty);
         let pin_events = tx.clone();
         let pin_gate = crate::encoding_pin::begin(child_pid, container, move |event| {
             let _ = pin_events.unbounded_send(SessionEvent::EncodingPin(event));
@@ -761,6 +775,7 @@ impl TerminalSession {
                 wakeup_pending,
                 pin_gate,
                 color_scheme_updates: false,
+                job,
             },
             rx,
         ))
@@ -861,6 +876,12 @@ impl TerminalSession {
     /// **プロセスの生存は保証しない**（終了後も残る）ので、生存前提の判定に使う側で確かめること
     pub fn child_pid(&self) -> Option<u32> {
         self.child_pid
+    }
+
+    /// PTY 直下の子とその子孫を入れた Job（#2454）。ペインを閉じる（この端末を drop する）と
+    /// 中身が全部止まる。unix・器のペイン・A/B の legacy・作れなかった回は None
+    pub fn descendant_job(&self) -> Option<&crate::platform::job::Job> {
+        self.job.as_ref()
     }
 
     /// プロセス内で一意の端末の番号（Issue #1857）。同じペインでも端末を張り替えれば変わる

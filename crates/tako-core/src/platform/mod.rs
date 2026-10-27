@@ -24,6 +24,8 @@ pub mod fs_copy;
 pub mod fs_move;
 pub mod ime;
 pub mod install_info;
+/// 子孫をまとめて回収する入れ物（境界 B30。#2454）
+pub mod job;
 pub mod keys;
 pub mod locale;
 pub mod path;
