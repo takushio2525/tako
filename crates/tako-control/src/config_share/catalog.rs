@@ -211,6 +211,13 @@ pub mod notes {
     );
     /// 順番待ちの過去の記録（#2254）。**共有すると鍵が合わない**: 鍵は repo の根のパスを含むハッシュなので、
     /// 別のマシン（別のホームパス）では同じコマンドが別の鍵になる。最大メモリもこのマシンの実測
+    /// Web ビューの生成中に落ちた印（#724 の W4）。**共有すると別のマシンの Web ビューを保留する**:
+    /// 印は「このマシンで生成している途中に tako が落ちた」ことの記録で、ペイン ID もこのマシンのもの
+    pub const WEBVIEW_GUARD: Note = Note::new(
+        "Web ビューの生成中に tako が落ちた印（次の起動で自動では開かない）。このマシンの出来事なので共有しない",
+        "Marks of web views that were being created when tako went down (not reopened automatically on the next start). \
+         They describe this machine only, so they are not shared",
+    );
     pub const QUEUE_HISTORY: Note = Note::new(
         "順番待ちの過去の記録（処理ごとの最大メモリ・所要時間。鍵は repo の場所を含むハッシュ）。このマシンの実測で、別のマシンでは鍵が合わないので共有しない",
         "Heavy-job queue history (peak memory and duration per command, keyed by a hash that includes the repo \
@@ -450,6 +457,15 @@ pub const CATALOG: &[Entry] = &[
         path: "lid-guard.json",
         class: Class::Local,
         note: notes::LID_GUARD,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
+    // #724 の W4: Web ビューの生成中に落ちた印（平常時はファイルが無い）
+    Entry {
+        root: Root::TakoData,
+        path: "webview-guard.json",
+        class: Class::Local,
+        note: notes::WEBVIEW_GUARD,
         local_fields: &[],
         needs_local_unless: &[],
     },

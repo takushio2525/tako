@@ -521,6 +521,23 @@ eval / hide / show / close を機械検証する。実マウス・キーボー�
   リモート画面共有）には映らない
 - ペインの角丸（7px）に対し webview は矩形のまま数 px 内側に収まる（見た目の妥協）
 
+### Windows で開いても落ちない（#724）
+
+本番と別の data dir の隔離インスタンスで行う（本番の tako・設定・layout.json には触らない）。
+落ちたかどうかは `<data_dir>\panic.log` の末尾とイベントビューアの Application Error（ID 1000 / 1001）の
+tako-app で見る。修正前の形は同じバイナリで `TAKO_724_LEGACY=1`。
+
+- [ ] 出力を流し続けるペイン（例: `ping -t 127.0.0.1`）を開いたまま、`tako web open https://example.com`
+  を 10 回（開く → `tako web close`）→ 一度も落ちない。`web list` の `state` が queued → creating → ready と進む
+- [ ] `tako web open "data:text/html,hi"` と `tako web open about:blank` → 落ちない。タイトルは 2 秒ほどで出る
+  （Windows は ipc を付けないので eval の 2 秒ポーリングが拾う）
+- [ ] ポート提案チップの「ブラウザで開く」・dock の URL 入力・ページ内の target=_blank → 落ちない
+- [ ] 開いている途中にもう 1 本開く → 2 本目は queued で待ち、1 本目が ready になってから作られる
+- [ ] 開いている途中にそのペインを閉じる → 落ちない。Web ビューは dock に入る（`web list` の pane が null）
+- [ ] Web ビューを開いた状態で tako を終了 → 起動し直すと同じ URL で開き直る（保留にならない）
+- [ ] 印（`<data_dir>\webview-guard.json`）を手で置いて起動 → その Web ビューは自動で開かず「保留」
+  （ペインに理由と「開く」）。「開く」で開き、印が消える
+
 ## sleep-guard 状態チップ + 詳細ポップオーバー（#440、2026-07-22）
 
 チップ文言の選択ロジック・ポップオーバー文言の組み立て・絵文字ゼロは unit test で
