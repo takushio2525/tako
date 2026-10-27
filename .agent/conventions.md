@@ -2004,6 +2004,15 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   （#2196。CI の macOS で上方向の SGR が 3 → 6 個）。待つのは `#{mouse_sgr_flag}`
   （`wait_pane_mouse_ready` / `scroll_mirror::history_state`）。届いた列は**個数まで**比べる
   （`contains` は 2 回届いても通る）。番犬 `mouse_report_wait_watchdog` が両方の現場を名指しで落とす
+  - **内側の出力もアンカーにならず、一度立った要求も消えうる**（#2406）。内側がネスト tmux だと、
+    起動中に端末の応答（DA / XTVERSION）を受けるたびに `tty_invalidate` で要求を外し、次の周回で
+    付け直す。外しと付け直しは別の書き込みになりうる（既存セッションへの attach で、外し + 描画の
+    書き込みの 40 µs 後に付け直し）ので、応答が描画より後に着くと「`LINE-99` が見えるのに
+    器のペインは `mouse_any_flag=0`」の窓が開く。器のペインはネスト tmux の alt screen なので、
+    既定の `WheelUpPane`（`#{alternate_on}` が真）はホイールを copy-mode ではなく `send-keys -M`
+    へ回し、要求の無いペインへのマウスイベントとして**捨てる**（#1252 の copy-mode 入りとは別の形）。
+    ホイールは**毎周期 器のペインを `probe_pane_mouse` で見てから打ち、遡るまで打ち直す**
+    （A/B `TAKO_2406_LEGACY=1`・注入 `TAKO_2406_INJECT=gap|never`・診断 `TAKO_2406_WAIT`）
 
 - **「窓が尽きた」は症状で、原因ではない**（#1265）。固定窓のテストが落ちたとき、
   出力から読めるのは「時間内に来なかった」だけで、**窓が短いのか / 相手が動いて

@@ -32,11 +32,23 @@
 //! 誤検知になる。待ちかどうかは「自分で寝ているか」で決まり、状態待ちの `sleep` は
 //! 共通ドライバ `wait_for_state` の中（= 本体の外）にある
 //!
-//! 同じファイルの兄弟テスト（`ネストtmux越しのホイールで内側スクロールバックを遡れる` /
-//! `通常ペインのホイールはcopy_modeで遡りインジケータを出さない` /
+//! 同じファイルの兄弟テスト（`通常ペインのホイールはcopy_modeで遡りインジケータを出さない` /
 //! `alt_screenの非マウスペインでホイールが矢印に化けない`）は対象外。どれも
-//! **内側が実際に出した内容**（`LINE-99`）か器の `#{alternate_on}`（`wait_alt_screen`）を
+//! 器の `#{alternate_on}`（`wait_alt_screen`）か、マウスを要求しない内側の出力を
 //! アンカーにしていて、外側 `mouse_reporting()` を単独のアンカーにしていない
+//!
+//! ## 内側の出力もアンカーにならない（#2406）
+//!
+//! `ネストtmux越しのホイールで内側スクロールバックを遡れる` は外側 `mouse_reporting()` +
+//! 内側の出力 `LINE-99` をアンカーにしていて、上の理由で対象外にしていたが、**それも偽の
+//! アンカー**だった。内側のネスト tmux は起動中に端末の応答（DA / XTVERSION）を受けるたびに
+//! `tty_invalidate` でマウス要求を外し、次の周回で付け直す。外しと付け直しは別の書き込みに
+//! なりうるので、応答が描画より後に着くと「`LINE-99` が見えるのに器のペインは
+//! `mouse_any_flag=0`」の窓が開く。器のペインは alt screen なので、器はその窓のホイールを
+//! copy-mode ではなく `send-keys -M` へ回し、要求の無いペインへのイベントとして捨てる。
+//! 1 発だけ打っていたので最下部のまま落ちた（CI の macOS）。本体（`TAKO_2406_LEGACY_ARM` を
+//! 除く）に器のペイン側のアンカー（`wait_pane_mouse_ready(`）と毎周期の器のペインの問い合わせ
+//! （`probe_pane_mouse(`）があり、`mouse_reporting()` と自前の `std::thread::sleep` が無いことを見る
 //!
 //! ## 別ファイルの同じ罠（#2196）
 //!
@@ -222,5 +234,71 @@ fn 番犬が2196の走査対象を見つけている() {
     assert!(
         code.contains("pub fn history_state(") && code.contains("#{mouse_sgr_flag}"),
         "history_state が器のペイン側のフラグ（#{{mouse_sgr_flag}}）を問い合わせていない"
+    );
+}
+
+/// #2406 の現場（同じ `tmux_backend.rs`）。内側の出力 `LINE-99` をアンカーにしていた
+const NESTED_GUARDED: &str = "ネストtmux越しのホイールで内側スクロールバックを遡れる";
+const ARM_BEGIN_2406: &str = "TAKO_2406_LEGACY_ARM 開始";
+const ARM_END_2406: &str = "TAKO_2406_LEGACY_ARM 終了";
+
+#[test]
+fn ネストのホイールe2eは器のペイン側のアンカーで待ち毎周期問い合わせている() {
+    let src = std::fs::read_to_string(target()).expect("tmux_backend.rs を読める");
+    let body = body_of(&src, NESTED_GUARDED)
+        .unwrap_or_else(|| panic!("テスト本体が見つからない: {NESTED_GUARDED}"));
+    let (code, _dropped) = strip_arms(&body, ARM_BEGIN_2406, ARM_END_2406);
+    // コメントを落とした眺めで見る（本体の説明コメントの綴りで緑 / 赤にならない = #1609）
+    let code = code_view::without_comments(&code);
+    let mut offenders: Vec<&str> = Vec::new();
+    if !code.contains("wait_pane_mouse_ready(") {
+        offenders.push("器のペイン側のアンカー（wait_pane_mouse_ready）を使っていない");
+    }
+    if !code.contains("probe_pane_mouse(") {
+        offenders.push(
+            "ホイールを打つ前に毎周期 器のペインを問い合わせていない（probe_pane_mouse）。\
+             要求は付け直しの途中で一瞬外れうる",
+        );
+    }
+    if code.contains("mouse_reporting()") {
+        offenders.push("外側 `mouse_reporting()` を見ている");
+    }
+    if code.contains("std::thread::sleep") {
+        offenders.push("自前の固定待ちを入れている（`std::thread::sleep`）");
+    }
+    assert!(
+        offenders.is_empty(),
+        "{NESTED_GUARDED}: 内側の出力 `LINE-99` は、ネスト tmux のマウス要求が器のペインに\n\
+         在る証跡にならない。ネスト tmux は端末の応答を受けるたびに `tty_invalidate` で\n\
+         要求を外して次の周回で付け直すので、その窓に届いたホイールは器が捨てる（#2406）。\n\
+         器のペインを見てから打ち、遡るまで打ち直すこと:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// #2406 の走査先を取り違えて**何も見ていない番犬**になっていないこと
+#[test]
+fn 番犬が2406の走査対象を見つけている() {
+    let src = std::fs::read_to_string(target()).expect("tmux_backend.rs を読める");
+    let body = body_of(&src, NESTED_GUARDED)
+        .unwrap_or_else(|| panic!("#2406 の現場（{NESTED_GUARDED}）が切り出せていない"));
+    let (_, dropped) = strip_arms(&body, ARM_BEGIN_2406, ARM_END_2406);
+    assert!(
+        dropped > 0,
+        "{NESTED_GUARDED} に A/B の旧経路アーム（{ARM_BEGIN_2406}）が無い。\
+         マーカーを消したなら番犬の前提が崩れているので、番犬側も直すこと"
+    );
+    // 旧経路アームの中身は外側 `mouse_reporting()` を見ている = 除去が効かなければ
+    // 本体の検査が必ず落ちる形になっていること（アームが空の目印だけになっていない）
+    let arm_only: String = body
+        .split(ARM_BEGIN_2406)
+        .nth(1)
+        .and_then(|rest| rest.split(ARM_END_2406).next())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        arm_only.contains("mouse_reporting()") && arm_only.contains("std::thread::sleep"),
+        "{NESTED_GUARDED} の旧経路アームが #2406 前の待ち（外側 mouse_reporting() + 固定回数の窓）を\
+         再現していない"
     );
 }
