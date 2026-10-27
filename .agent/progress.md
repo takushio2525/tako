@@ -20,45 +20,6 @@
 
 ---
 
-## 2026-10-24（#2359: GUI の fd 上限を起動時に min(hard, 10240, kern.maxfilesperproc) へ上げ、ペインの PTY の子には起動時の値を戻す・check-health に `fd_limit` 節と 80% の warning）
-- 本番 28 ペインで 121 / 256 本（4 本 / ペイン）→ 再起動後 10240・枯渇の注入で修正前 0/5 → 修正後 5/5 通る・カタログ +0 B。器の tmux の天井は #2367。PR #2364
-
-## 2026-10-24（#2357: 実 tmux のテストの間欠の真因はテスト = 「読むと消す」`take_pane_died_dump` を書き出しの出現で叩き、書きかけを消していた → 器が消えたと `probe_session` で確かめてから 1 回読む・同型 4 か所も）
-- 注入で main は CI と同文言で FAILED → 修正後 ok・30 回 × 並列 1 / 4 で全通過・カタログ +0 B。PR #2366
-
-## 2026-10-24（#2360: 起動時の IPC ソケットの生存確認が connect 1 回で、control.json の無い 2 つ目が満杯の生きた受け口を奪っていた → `ipc_socket::judge_occupant` が持ち主の pid と繋ぎ直しまで見る・奪わなかった 2 つ目はセカンダリ・`ipc.fixed_path`）
-- 実経路 修正前 27 PASS 22 FAIL → 修正後 49 PASS・A/B `TAKO_2360_LEGACY=1`・カタログ +0 B。net_stop の間欠は #2369。PR #2368
-
-## 2026-10-24（#2355: 項目 154 の E4 の間欠の真因はテスト = 流していたシェルのループが ^C を取りこぼす（素の zsh で 450 回中 9 回）→ ループをサブシェルで包み、止まったことを状態で待つ）
-- A/B `TAKO_2355_LEGACY=1` + 注入 `lostint` で旧は FAILED・新は通過・5 回完走・カタログ +0 B。漏れの判定の偽の緑は #2371。PR #2370
-
-## 2026-10-24（#2369: net_stop の到達確認のテストが listener を drop した番号を「閉じたポート」に使い、並列の spawn が fd を子へ持ち出すと繋がっていた → 繋いだソケットの手元側の番号を握って使い、`ConnectionRefused` で落ちることも確かめる）
-- 持ち出しの注入で修正前 FAILED → 修正後 ok・全体と並列 30/30・カタログ +0 B。同型の LSP テスト 2 本は #2373、CLOEXEC の非原子性は #1788 へ。PR #2374
-
-## 2026-10-24（#2367: 器の tmux サーバーへ引き上げた fd 上限を渡す = attach クライアントだけ戻さず、器のペインの子は GUI 自身の段 `__tako-container-exec` で起動時の値へ戻してから tmux と同じ形で exec。check-health の `fd_limit.container`・FR-2.2.16）
-- 実経路 22 PASS（修正前は soft 64 で window 53 本・新しいペインが消える → 修正後は 10240・器のシェルは 64 のまま）・カタログ +0 B。17:45 に install・本番の器は soft 2560。PR #2376
-
-## 2026-10-24（#2352: 番犬の 3.2 の写しが行継続を 3.2 と同じ文脈で取り除いてから読む = `join_continuations32`。波括弧・pipefail・rm の 3 本が通す・表に行継続の飾り）
-- 突き合わせ 修正前 63 箇所 → 0・注入で 63 に戻る・リポジトリの名指しは前後とも 0・カタログ +0 B。申し送り #2378。PR #2375
-
-## 2026-10-24（#2365 の 1 本目: dispatch と前段（CLI / MCP）の理由の文と orchestrator layout の値の断りを `tako_control::Reason` / `tako_core::LayoutParamError` の日英の網羅 match へ。MCP の stdio ブリッジは設定から表示言語を決める）
-- 実経路 修正前 PASS=69 FAIL=30 → 修正後 PASS=99・日本語表示 66 本バイト一致・注入 4 通りで file:line を名指し・カタログ +0 B。残りは #2365 の続き。PR #2379
-
-## 2026-10-24（#2361: Windows の accept ループがパイプのインスタンスを作れないと break して止まっていた → `ipc_socket::create_with_retry` が 100 ms から倍々・最長 5 秒の間で作り直す・persist.log は途切れの始まりと戻りの 2 行・check-health に `ipc.pipe`）
-- Windows CI で修正前 FAILED → 修正後緑・番犬の注入で ipc.rs:498 を名指し・カタログ +0 B。Windows 実機は未確認（manual-checks に手順）。PR #2380
-
-## 2026-10-24（#2373: LSP の取得のテスト 2 本（1944 のオフライン / 1956 の確かめ落ち）が drop した listener の番号を「オフラインの配布元」に使い、子へ持ち出されると繋がっていた → #2369 と同じ「繋いだソケットの手元側の番号を握る」形を `tests/common/closed_port.rs` へ）
-- 持ち出しの注入で修正前 2 本 FAILED → 修正後 ok・並列 30/30・カタログ +0 B。PR #2381
-
-## 2026-10-25（#2365 の 2 本目: tako-core のエラー型 10 種（編集 4・Session・Runner・CommandCard・Backend・LSP の ParseError 2）を `text_in` の日英へ・「まだ実行中」は `says_still_running`）
-- 英語表示で日本語入り 14 → 0・日本語はバイト一致・注入 2 回で番犬が file:line を名指し・カタログ +0 B。PR #2383
-
-## 2026-10-25（#2371: セルフテスト項目 154 の漏れの判定が器越しのペイン（history=0）で画面の外へ流れた漏れを見落とす偽の緑 → `st2371_assert_no_leak` がグリッド + 器の履歴を読む・項目 155 も同じ判定へ）
-- 修正前 + 注入 `leak` で通過 → 修正後は「器の履歴」と名指して FAILED・A/B `TAKO_2371_LEGACY=1`・カタログ +0 B。PR #2377
-
-## 2026-10-25（#2378: 番犬の 3.2 の写しの字句が `"${ … }"` の中の `'…'` / `$'…'` を 3.2 と同じに引用符として読む = `ParamCtx`）
-- 突き合わせ 修正前 28 箇所 → 0・注入で 28 に戻る・リポジトリの名指しは前後で 0・カタログ +0 B。PR #2386
-
 ## 2026-10-25（#2284 の再発: 真因はテスト = 看取った `Child` を drop してから読み、Windows が再利用した pid の別プロセスを `Alive` と読んだ → `process::ReapedChild` を持ったまま読む）
 - 注入 `TAKO_2284_INJECT_REUSE` で修正前は CI と同じ `lid.rs:1071` で FAILED → 修正後 ok（macOS / Windows）・カタログ +0 B。PR #2385
 
@@ -79,3 +40,42 @@
 
 ## 2026-10-25（#2365 の続き: `tako mod ui` の断り（UiError 一式）を日英の網羅 match へ。setup / persist.log / migrate は日本語固定）
 - A/B 25 件で日本語はバイト一致・英語表示の日本語 25 → 0・注入 5 通りで file:line を名指し・カタログ +0 B。PR #2394
+
+## 2026-10-25（#2395: usage の索引のテストが A/B の env をプロセス全体に立て、並走する codex の区間按分のテストまで旧挙動にしていた → `walk_with(s5_legacy)` へ分け、テストは env を立てない）
+- 順序を固定する注入で修正前は CI と同じ assert で FAILED → 修正後 ok・usage 50 回緑・カタログ +0 B。時限の 2 本は #2402。PR #2398
+
+## 2026-10-25（#1899 の 1 点目: 全文を 1 つの TextEdit で返す整形を行ごとの置き換えへ割る = `text_diff::changed_regions` + `text_edit::line_split`。割って undo が軽くなるときだけ割る）
+- 10 万行で undo 17.4 MB・深さ 1 → 2.6 MB・深さ 2・本文はバイト一致・A/B `TAKO_1899_LEGACY=1`・カタログ +0 B。CLI の実経路は未実測。PR #2401
+
+## 2026-10-25（#2365 の続き: ファイルの移動・コピーの断りを理由ごと（`MoveRefusal` / `CopyRefusal` の `text_in` + dispatch の `Reason`）日英の網羅 match へ）
+- 実経路 14 件で英語表示の日本語 14 → 0・日本語はバイト一致・注入 3 通りで file:line を名指し・カタログ +0 B。PR #2404
+
+## 2026-10-25（#2402: usage::index の claude 系テストの固定日付が 2027-11 以降に月の掃除で消えて落ちる時限 → 実時間の 2 日前の正午からの相対へ・製品は無変更）
+- `now_ms()` を 400 日ずらす注入で修正前 2 本 FAILED → 修正後は月末の境界も含め全通過・カタログ +0 B。PR #2405
+
+## 2026-10-25（#2400: env を書く lib のテスト 62 本と結合テスト 5 本を `tako_core::run_alone!`（その 1 本だけの子）へ・env 専用ロック 5 つを撤去・番犬 `issue2400_test_env_write_watchdog`）
+- 並走の注入で修正前 3/3 FAILED → 修正後 3/3 ok・番犬は注入で名指し・カタログ +0 B。PR #2409
+
+## 2026-10-26（10/25 夜の PC 停止の調査: メモリ枯渇 → Jetsam → watchdog のカーネルパニック（3 回目）。主因は agent の常駐 = claude 1 本ごとに user scope の MCP 12〜15 プロセス）
+- 記録は #1992 のコメント。ユーザー判断で #2412（worker は tako の MCP だけ）・#2413（逼迫中は起動を待たせる）を起票
+
+## 2026-10-26（#1308 の再発: respond の実 PTY テストの fixture をログインシェル経由から `/bin/sh -c` の直接起動へ・失敗文の値を `TAKO_1308_WAIT` の 1 行へ）
+- 注入 `stuck` / `deaf` で修正前は同じ行で FAILED → 修正後 ok・単独 20/20・カタログ +0 B。同じ形の残り 3 か所は #2415。PR #2410
+
+## 2026-10-26（#2419: docs サイトの共用の consent.js を async で読み、最初の描画を止めない。製品は無変更）
+- PR #2420
+
+## 2026-10-26（#2399: 器を起こす検証スクリプト 32 本・47 か所の `kill-server` を `tmux_socket_kill`（`scripts/lib/tmux-socket.sh`）へ寄せ、ソケットファイルを残さない・番犬 `器を起こすスクリプトはソケットファイルまで消す`）
+- 修正前 計 31 個 → 0・失敗経路の注入 22 本で 1〜4 → 0・番犬は修正前の版で 32 本を名指し・カタログ +0 B。PR #2408
+
+## 2026-10-26（#2365 の続き: `tako mod ui` の成功の応答の枠・CLI の表示・`cli_request` の断り 9 種・排他の断り `config_io::LockError`・置き場が決まらない断りを日英の網羅 match へ）
+- A/B 20 件で英語表示の日本語入り 20 → 0・日本語は 40 ファイルがバイト一致・注入 4 通り・カタログ +0 B。PR #2417
+
+## 2026-10-26（#2412: claude の worker を tako の MCP だけで起動 = `--settings` の `deniedMcpServers` で user scope を止める・プロジェクト単位で足す `projects mcp`・projects.yaml v2 の移行で直近 30 日の実績を写す）
+- 常駐 1,218 → 265 MB / 本・本番の GUI から起こした worker は 4 プロセス 695 MB・カタログ +321 B。codex は #2418。PR #2422
+
+## 2026-10-26（#2413: メモリ逼迫中は agent の起動（spawn / run / 復元・sessions resume・git resolve）を `admit` と同じ純関数で待たせ、復元は master から 1 本ずつ時差・上書きは `tako queue start <ペイン>`）
+- 単体で復元の間隔 150〜176 ms・立ち上がり中は最大 1 本・カタログ +394 B。10/27 の実 GUI の e2e は PASS 40 / FAIL 2（run_status の戻り・master が先）→ #2426。PR #2421
+
+## 2026-10-26（#2365 の続き: `tako mod`（status / on / off / band / install / uninstall）の応答と CLI の表示を日英の網羅 match へ・置き場の断り `paths::NoDataDir`）
+- A/B で英語表示の応答 14 → 0・CLI の表示 12 → 0・日本語はバイト一致・注入 4 通り・カタログ +0 B。PR #2423
