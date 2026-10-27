@@ -1005,9 +1005,11 @@ mod tests {
     #[test]
     fn issue1510_自動の段はguiの隣のcliを先に使う() {
         let exe = Path::new("/opt/tako/tako-app");
+        // 区切りは OS に任せる（Windows の join は `\`。期待値も同じ組み方で作る）
+        let sibling = Path::new("/opt/tako").join("tako");
         assert_eq!(
-            auto_setup_binary_with(Some(exe), "tako", &|p| p == Path::new("/opt/tako/tako")),
-            Some("/opt/tako/tako".to_string())
+            auto_setup_binary_with(Some(exe), "tako", &|p| p == sibling.as_path()),
+            Some(sibling.display().to_string())
         );
         assert_eq!(auto_setup_binary_with(Some(exe), "tako", &|_| false), None);
         assert_eq!(auto_setup_binary_with(None, "tako", &|_| true), None);
