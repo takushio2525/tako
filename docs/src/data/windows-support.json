@@ -235,9 +235,9 @@
     {
       "key": "tako_links",
       "status": "degraded",
-      "note_ja": "`C:\\…` のバックスラッシュ絶対パスはリンクにならない（`/` を含む形だけが候補。`src/main.rs` のような相対パスは効く）",
+      "note_ja": "`C:\\…`・`\\\\server\\share\\…`・`src\\main.rs:10:5` のような `\\` 区切りのパスもリンクになる（#2435）。ただし拡張子の無い `\\` 区切りの相対パス（`src\\components`）は `.\\src\\components` の形のときだけ、Debug 表示の二重バックスラッシュ（`C:\\\\Users\\\\…`）はリンクにならない（`\\n` などのエスケープと見分けるため）",
       "evidence": "unit-test",
-      "evidence_detail": "links の単体（地の文に埋まったホーム起点のパス / 全角記号入りのファイル名 / 候補の切り出し規則）と dispatch の links 経路。どちらも OS 非依存で Windows ランナーでも走る"
+      "evidence_detail": "links の単体（`\\` の形の候補を macOS 上から Platform::Windows で検査 / Windows ランナーで cargo・rustc・Python・Node の出力のパスが実在チェックまで通る / URL・`\\n`・正規表現を候補にしない）と dispatch の links 経路（`C:\\…` の絶対パス）。どれも Windows ランナーで走る"
     },
     {
       "key": "tako_list_panes",

@@ -110,10 +110,11 @@ pub mod notes {
 
     // ─── 実測で分かっている縮退 ───────────────────────────────────
 
-    /// #153 / #1283。ターミナル内のパス検出は `/` を含む形だけを候補にする
+    /// #153 / #1283 / #2435。ターミナル内のパス検出は `\` の形も候補にするが、
+    /// エスケープ（`\n` 等）と見分けられない 2 つの形だけは候補にしない
     pub const WIN_PATH_LINK_BACKSLASH: Note = Note::new(
-        "`C:\\…` のバックスラッシュ絶対パスはリンクにならない（`/` を含む形だけが候補。`src/main.rs` のような相対パスは効く）",
-        "Backslash absolute paths (`C:\\…`) are not detected as links; only forms containing `/` are candidates (relative paths like `src/main.rs` work).",
+        "`C:\\…`・`\\\\server\\share\\…`・`src\\main.rs:10:5` のような `\\` 区切りのパスもリンクになる（#2435）。ただし拡張子の無い `\\` 区切りの相対パス（`src\\components`）は `.\\src\\components` の形のときだけ、Debug 表示の二重バックスラッシュ（`C:\\\\Users\\\\…`）はリンクにならない（`\\n` などのエスケープと見分けるため）",
+        "Backslash paths such as `C:\\…`, `\\\\server\\share\\…` and `src\\main.rs:10:5` are detected as links (#2435). Relative backslash paths without an extension (`src\\components`) are only detected in the `.\\src\\components` form, and Debug-escaped paths with doubled backslashes (`C:\\\\Users\\\\…`) are not detected, so that escapes such as `\\n` are not mistaken for paths.",
     );
     /// #693。Windows.Data.Pdf はページ画像は返すが文字位置を返さない
     pub const WIN_PDF_NO_TEXT_LAYER: Note = Note::new(
@@ -792,18 +793,18 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_links",
         macos: Support::Supported,
-        // 検出そのものは OS に依らない（`tako links --text` は両 OS で同じ答えを出す）。
-        // ただし **`C:\…` のバックスラッシュ絶対パスはリンクにならない**
-        // （`links::is_path_like` が `/` を含む形だけを候補にする = #153 の既存制約。
-        // `src/main.rs` のような `/` 区切りの相対パスは効く）。#1283 で足した
-        // 「地の文に埋まったパスを削って探す」側は文字種で判断するので両 OS 同じ
+        // #2435 から Windows では `\` の形（`C:\…` / UNC / `src\main.rs:10:5`）も候補にする
+        // （`links::is_path_like` が `Platform` を引数で受ける）。残る狭さは 2 つ:
+        // 拡張子の無い `\` 区切りの相対パス（`src\components`。`.\src\components` なら効く）と
+        // Debug 表示の二重バックスラッシュ（`C:\\Users\\…`）。どちらも `\n` などの
+        // エスケープと見分ける手がかりが無いので候補にしない（macOS の `/` の形には無い狭さ）
         windows: Support::Degraded {
             note: notes::WIN_PATH_LINK_BACKSLASH,
         },
-        // 検出は純粋関数（画面テキスト → リンク）なので、両 OS で走る単体が根拠になる。
-        // 縮退（バックスラッシュ絶対パス）は #153 からの設計判断で、実測を待つ余地が無い
+        // 候補の切り出しは純粋関数で、`Platform::Windows` を渡して macOS 上からも検査できる。
+        // 実在チェックまで通す形は Windows ランナーの単体が見る
         windows_evidence: Evidence::UnitTest(
-            "links の単体（地の文に埋まったホーム起点のパス / 全角記号入りのファイル名 / 候補の切り出し規則）と dispatch の links 経路。どちらも OS 非依存で Windows ランナーでも走る",
+            "links の単体（`\\` の形の候補を macOS 上から Platform::Windows で検査 / Windows ランナーで cargo・rustc・Python・Node の出力のパスが実在チェックまで通る / URL・`\\n`・正規表現を候補にしない）と dispatch の links 経路（`C:\\…` の絶対パス）。どれも Windows ランナーで走る",
         ),
     },
     Feature {
