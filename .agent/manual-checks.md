@@ -1141,3 +1141,18 @@ Windows CI のテスト（`crates/tako-control/src/ipc.rs` の `windows_tests::i
       `tako_show_command` が呼べて CARD-DONE が返る（= `--settings` を付けても tako の MCP は使える）
 - [ ] 本番で personal アカウントの worker を 1 本 spawn し、`tako queue` のそのペインの `agent` の MB が
       修正前（同じアカウントの worker で 800〜900 MB）より下がっている
+
+## codex の worker も tako の MCP だけで起動する（#2418、2026-10-27）
+
+止める名前の判断・`-c` の組み立て・置く位置は単体テストと番犬（`issue2412_worker_mcp_scope_watchdog`）で、
+実物の codex（0.154.0）が止めた server の子を立てない・プロジェクトで足した MCP と `.codex/config.toml` の MCP は立つ・
+設定がずれても目印つきなら起動する・壊れた config.toml の扱いは GUI を使わない腕
+（`ARMS="headless-before headless-new edge" bash scripts/test-codex-worker-mcp-2418.sh`）で実測済み。
+**GUI 経由の spawn は 2026-10-27 時点で未実測**（蓋閉じで tako-vd が描画できなかった）。蓋を開けて次を確かめる:
+
+- [ ] `bash scripts/test-codex-worker-mcp-2418.sh`（既定の腕。`new` = 隔離 GUI）が PASS する。spawn の応答の
+      `mcp` が `mode: tako_only`・`denied: [user-alpha, user-beta, user-web]`・`kept: [user-keep]`・`shadowed: [user-shared]`、
+      起動した codex のコマンド行に `-c mcp_servers.user-alpha.enabled=false` と目印が載り、worker から
+      `tako_show_command` が呼べて CARD-DONE が返る
+- [ ] 本番で codex の worker を 1 本 spawn し、応答の `mcp.denied` に `~/.codex/config.toml` の MCP（tako 以外）が並び、
+      `ps` でその codex の子孫に止めた MCP が居ない

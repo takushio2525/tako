@@ -78,7 +78,7 @@ tako は codex が**実際に**どのモデルで動いたかを読みません�
 
 ## Claude Code との差分
 
-現時点で 66 件中 36 件が「対応」です（一部対応 8 件・未対応 19 件・対象外 3 件）。全件の内訳と理由は [OpenAI Codex CLI を選ぶと落ちるもの](/agent-support/#openai-codex-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
+現時点で 66 件中 37 件が「対応」です（一部対応 8 件・未対応 18 件・対象外 3 件）。全件の内訳と理由は [OpenAI Codex CLI を選ぶと落ちるもの](/agent-support/#openai-codex-cli-を選ぶと落ちるもの) にあります。手元で最新を引くなら次を実行してください。
 
 ```bash
 tako agent-support --agent codex
@@ -86,7 +86,7 @@ tako agent-support --agent codex
 
 とくに効くのは次の 4 点です。
 
-- **worker は、あなたが codex に登録した MCP サーバーも全部持って起動します**。claude の worker は tako の MCP だけで起動して重い MCP を持ち込みません（[#2412](https://github.com/takushio2525/tako/issues/2412)）。codex でも起動ごとに止める設定は効きそうですが、実際に子プロセスが立たないことをまだ確かめていません（追跡: [#2418](https://github.com/takushio2525/tako/issues/2418)）
+- **PC 再起動後に戻した worker は、あなたが codex に登録した MCP サーバーも全部持って戻ります**。新しく立てる worker は claude と同じく tako の MCP だけで起動し（[#2418](https://github.com/takushio2525/tako/issues/2418)）、要る MCP は `tako orchestrator projects mcp <プロジェクト> add <名前>` で足します。ただし再起動をまたぐ復元は `codex resume <id>` で起こすので、この絞り込みが載りません
 
 - **PC 再起動後の復元は会話ごと戻りますが、会話の選び直しはまだできません**。再起動をまたぐ復元は [#1238](https://github.com/takushio2525/tako/issues/1238) で codex にも配線され、ペインは `codex resume <id>` で会話を持ったまま戻ります（会話 ID を `lsof` で採るので **Windows は対象外**です）。過去の会話を一覧から選び直す `tako sessions resume` と、会話を保ったまま CLI だけ建て直す `tako session-restart` は claude 専用のままです（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
 - **tako 側からアカウントを切り替えられません**。設定ファイルの置き場が固定のためです（[#975](https://github.com/takushio2525/tako/issues/975)）
