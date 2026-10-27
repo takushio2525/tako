@@ -71,7 +71,7 @@ while [[ $# -gt 0 ]]; do
 
   CI が「期待するチェックが全部そろって全部緑」になるまで待ってから squash merge する
   （待ちの判定は scripts/wait-pr-checks.sh）。揃わなければ merge しない。
-  待ちの上限も wait-pr-checks.sh と同じ（既定 4800 秒。--timeout か環境変数
+  待ちの上限も wait-pr-checks.sh と同じ（既定 6600 秒。--timeout か環境変数
   TAKO_WAIT_PR_CHECKS_TIMEOUT で変える。上限に達したら最後にもう一度状態を見る）。
 
 終了コード: 0 = merge が成立している（すでに MERGED だった再実行も 0）/
