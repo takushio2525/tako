@@ -262,7 +262,11 @@ pub const CATALOG: &[Entry] = &[
         note: notes::DECLARATIVE,
         // 「バナーを閉じた」「この版の更新通知を閉じた」はそのデバイスの操作履歴。
         // 共有すると別デバイスで初回案内が出なくなる（#513 要件 2）
-        local_fields: &["welcome_dismissed", "update_card_dismissed"],
+        local_fields: &[
+            "welcome_dismissed",
+            "welcome_onboarding",
+            "update_card_dismissed",
+        ],
         needs_local_unless: &[],
     },
     Entry {

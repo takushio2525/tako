@@ -769,6 +769,22 @@ pub trait UiStateHost {
     /// ウェルカムバナーの表示 / 非表示（再描画は実装側の責務。
     /// 「以後出さない」の永続化は dispatch 側で行う。Issue #549）
     fn set_welcome_banner_visible(&mut self, _visible: bool) {}
+    /// 初回起動の導線の状態（#1510）。既定（GUI が居ないホスト）は None
+    fn welcome_onboarding(&self) -> Option<crate::welcome::Onboarding> {
+        None
+    }
+    /// 確かめた「次にやること」を受け取る（#1510）。GUI はバナーを描き直し、
+    /// 要れば自動の段を走らせ直す・見張りを続ける（どちらも Context が要るので積むだけ）
+    fn welcome_apply_step(&mut self, _step: crate::welcome::NextStep) {}
+    /// 「次にやること」のボタンを押す（#1510。ペインを開く・master を起こす・自動の段）。
+    /// 実際に開くのは dispatch の後処理（Context が要る）。GUI が居ないホストは Err
+    fn welcome_launch(&mut self, _launch: crate::welcome::Launch) -> Result<(), String> {
+        Err("ボタンを押す GUI が居ない".into())
+    }
+    /// 自動の段を走らせる（#1510）。既に走っていれば false（GUI が居ないホストも false）
+    fn welcome_start_auto(&mut self) -> bool {
+        false
+    }
     /// 利用制限メトリクスの即時再取得（#357 リロードボタン）。
     /// 全ペインの TUI フッターを再走査し、現在のメトリクスを JSON で返す
     fn refresh_limits(&mut self) -> serde_json::Value {

@@ -857,8 +857,10 @@ fn install_failure_message(target: AgentKind, reason: &str) -> String {
 /// - 案内が済んだら、**残りの系統を足すコマンドを出す**（強制せず導線だけ残す）
 ///
 /// 選ぶ順は「途中まで入っているもの（PATH / 認証だけ足りない）を先に仕上げる」→
-/// それも無ければ推奨（claude）。非対話・`--yes` では質問せず推奨で進む
-fn run_bootstrap_stage(assume_yes: bool) -> BootstrapOutcome {
+/// それも無ければ推奨（claude）。非対話・`--yes` では質問せず推奨で進む。
+///
+/// `install` = ネットワークから取って入れる段を走らせてよいか（[`InstallGate`]。#1510）
+fn run_bootstrap_stage(assume_yes: bool, install: InstallGate) -> BootstrapOutcome {
     let states = setup_bootstrap::status_all();
     if states.is_empty() {
         return BootstrapOutcome::default();
@@ -926,7 +928,7 @@ fn run_bootstrap_stage(assume_yes: bool) -> BootstrapOutcome {
     );
     eprintln!();
 
-    let remaining = run_bootstrap_for(target, &state, assume_yes);
+    let remaining = run_bootstrap_for(target, &state, assume_yes, install);
 
     eprintln!();
     if remaining.is_empty() {
@@ -972,6 +974,7 @@ fn run_bootstrap_for(
     target: AgentKind,
     state: &setup_bootstrap::BootstrapState,
     assume_yes: bool,
+    install: InstallGate,
 ) -> Vec<Remaining> {
     /// 詰まった理由をその場で出してから 1 件にして返す（**無言で飛ばさない**）。
     ///
@@ -990,58 +993,77 @@ fn run_bootstrap_for(
     if state.step == Step::Install {
         eprintln!("  [1/3] {}", Step::Install.describe_for(target));
         print_install_plan(&state.plan.to_json());
-        if !state.plan.can_run {
-            // 代行できない環境。**案内で終わらせず**、別のエージェント CLI が
-            // 居ればそちらへ引き継ぐ（#1057）
-            let reason = format!(
-                "この環境では tako が {} の自動インストールを代行できません",
-                target.product()
-            );
-            if try_agent_handoff(target, &reason, assume_yes) {
-                eprintln!(
-                    "  [OK] 引き継ぎ先のエージェントが {} を導入しました",
-                    target.product()
-                );
-            } else {
-                return stuck(
-                    RemainingKind::AgentInstall(target),
-                    install_failure_message(target, &reason),
-                );
-            }
-        } else {
-            if !confirm("この内容でインストールしますか？", true, assume_yes) {
+        match install_action(install, state.plan.can_run) {
+            InstallAction::Skip => {
+                // #1510: 初回起動の自動実行（`install: false`）。**同意なしにネットワークの
+                // スクリプトを走らせない**。計画は上で見せたので、残り作業 1 件にして先へ進む
+                // （代行の引き継ぎも起こさない = 別の CLI に入れさせるのも導入のうち）
                 return stuck(
                     RemainingKind::AgentInstall(target),
                     format!(
-                        "インストールを中止しました。\n\
-                         自分で入れる場合は次のコマンドを実行してください:\n  {}",
-                        state.plan.official_command
+                        "{}（ネットワークからの導入は同意を得てから行います）。\n\
+                         tako の画面の「{} を入れる」を押すか、次のコマンドを実行してください:\n  \
+                         tako setup bootstrap install{}",
+                        InstallGate::DENY_NOTE,
+                        target.product(),
+                        setup_bootstrap::agent_flag(target)
                     ),
                 );
             }
-            eprintln!();
-            if let Err(e) = setup_bootstrap::install_for(
-                target,
-                InstallOptions {
-                    dry_run: false,
-                    interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
-                },
-            ) {
-                // **案内だけで人間へ丸投げしない**（#1057）。導入済みの別系統 CLI が
-                // 居れば、その setup エージェントへ導入の代行を引き継ぐ
-                eprintln!("  [失敗] {e}");
-                if !try_agent_handoff(target, &e, assume_yes) {
-                    return stuck(
-                        RemainingKind::AgentInstall(target),
-                        install_failure_message(target, &e),
-                    );
-                }
-                eprintln!(
-                    "  [OK] 引き継ぎ先のエージェントが {} を導入しました",
+            InstallAction::Handoff => {
+                // 代行できない環境。**案内で終わらせず**、別のエージェント CLI が
+                // 居ればそちらへ引き継ぐ（#1057）
+                let reason = format!(
+                    "この環境では tako が {} の自動インストールを代行できません",
                     target.product()
                 );
-            } else {
-                eprintln!("  [OK] {} を導入しました", target.product());
+                if try_agent_handoff(target, &reason, assume_yes) {
+                    eprintln!(
+                        "  [OK] 引き継ぎ先のエージェントが {} を導入しました",
+                        target.product()
+                    );
+                } else {
+                    return stuck(
+                        RemainingKind::AgentInstall(target),
+                        install_failure_message(target, &reason),
+                    );
+                }
+            }
+            InstallAction::Run => {
+                if !confirm("この内容でインストールしますか？", true, assume_yes) {
+                    return stuck(
+                        RemainingKind::AgentInstall(target),
+                        format!(
+                            "インストールを中止しました。\n\
+                             自分で入れる場合は次のコマンドを実行してください:\n  {}",
+                            state.plan.official_command
+                        ),
+                    );
+                }
+                eprintln!();
+                if let Err(e) = setup_bootstrap::install_for(
+                    target,
+                    InstallOptions {
+                        dry_run: false,
+                        interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
+                    },
+                ) {
+                    // **案内だけで人間へ丸投げしない**（#1057）。導入済みの別系統 CLI が
+                    // 居れば、その setup エージェントへ導入の代行を引き継ぐ
+                    eprintln!("  [失敗] {e}");
+                    if !try_agent_handoff(target, &e, assume_yes) {
+                        return stuck(
+                            RemainingKind::AgentInstall(target),
+                            install_failure_message(target, &e),
+                        );
+                    }
+                    eprintln!(
+                        "  [OK] 引き継ぎ先のエージェントが {} を導入しました",
+                        target.product()
+                    );
+                } else {
+                    eprintln!("  [OK] {} を導入しました", target.product());
+                }
             }
         }
     }
@@ -1185,6 +1207,55 @@ fn legacy_launch_auth_login(
 
 // --- 依存ツールチェック ---
 
+/// ネットワークから取って入れる段（エージェント CLI の公式インストーラ・brew / winget の
+/// 依存導入）を走らせてよいか（#1510）。
+///
+/// GUI の初回起動の自動実行は `--answers` の `install: false` で呼ぶので `Deny` になり、
+/// 導入の段は**計画を見せて残り作業にするだけ**で何も取りに行かない。判断は
+/// [`InstallGate::from_answers`] の 1 か所で、テストが自動実行の answers から縛る
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallGate {
+    /// 従来どおり（`--yes` / 非 TTY は同意扱いで入れる・端末なら聞く）
+    Allow,
+    /// 入れない（残り作業にする）
+    Deny,
+}
+
+impl InstallGate {
+    /// 入れなかった段の 1 行（その場の表示と残り作業の詳細で同じ文面）
+    const DENY_NOTE: &'static str = "初回起動の自動実行では導入しません";
+
+    fn from_answers(answers: &SetupAnswers) -> Self {
+        if answers.allows_install() {
+            Self::Allow
+        } else {
+            Self::Deny
+        }
+    }
+}
+
+/// 導入の段（[1/3]）で何をするか（**純粋関数**。#1510 の「自動実行はネットワークへ出ない」を
+/// テストが縛る口）。`can_run` = tako が公式インストーラの実行を代行できる環境か
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallAction {
+    /// 入れない（計画を見せて残り作業にする。初回起動の自動実行）
+    Skip,
+    /// tako は代行できない（導入済みの別の CLI への引き継ぎを試す。端末と同意が要る）
+    Handoff,
+    /// 公式インストーラを走らせる（端末なら確認を挟む・`--yes` / 非 TTY は同意扱い）
+    Run,
+}
+
+/// [`InstallAction`] を決める。**`Deny` は代行の可否より先に見る**（引き継ぎ先の CLI に
+/// 入れさせるのも導入のうちなので、自動実行ではどちらも起こさない）
+fn install_action(gate: InstallGate, can_run: bool) -> InstallAction {
+    match (gate, can_run) {
+        (InstallGate::Deny, _) => InstallAction::Skip,
+        (InstallGate::Allow, false) => InstallAction::Handoff,
+        (InstallGate::Allow, true) => InstallAction::Run,
+    }
+}
+
 /// 依存チェック段の対話の強さ。**2 つは別物**（#1499）。
 ///
 /// #1499 前は 1 つの `interactive` が「依存の導入を聞く」と「FDA / スリープ設定を
@@ -1200,12 +1271,13 @@ struct DepCheckMode {
 }
 
 impl DepCheckMode {
-    /// `tako setup` 本体。**`--review` かどうかに関わらず**未検出の依存は聞く（#1499）
-    fn for_setup(review: bool, assume_yes: bool) -> Self {
+    /// `tako setup` 本体。**`--review` かどうかに関わらず**未検出の依存は聞く（#1499）。
+    /// `install` が `Deny`（初回起動の自動実行。#1510）なら `--check` と同じ読み取りだけの段になる
+    fn for_setup(review: bool, assume_yes: bool, install: InstallGate) -> Self {
         Self {
             review_settings: review && !setup_bootstrap::legacy_mode(),
             offer: setup_deps::DepOfferContext {
-                stage_installs: true,
+                stage_installs: install == InstallGate::Allow,
                 review,
                 assume_yes,
                 stdin_is_terminal: std::io::IsTerminal::is_terminal(&std::io::stdin()),
@@ -2746,10 +2818,11 @@ fn default_profile_path() -> Result<PathBuf, String> {
 
 fn print_setup_summary(plan: &SetupPlan) {
     eprintln!();
+    // 見出しの正本は tako-control 側（GUI が初回起動の自動実行の結果をこの文面で読む。#1510）
     if plan.is_empty() {
-        eprintln!("セットアップ結果: 変更なし（前回の設定は最新）");
+        eprintln!("{}", tako_control::setup::SUMMARY_UNCHANGED);
     } else {
-        eprintln!("セットアップ結果（変更したのはこれだけです）:");
+        eprintln!("{}", tako_control::setup::SUMMARY_CHANGED_HEADER);
         eprintln!("{}", plan.render_diff());
     }
 }
@@ -3288,7 +3361,9 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
 
     // ゼロスタート導入（#868）。導入済みなら何も出さずに素通りする＝従来の検出型と同じ体験。
     // 未導入なら インストール → PATH 通し → 認証 まで案内してから検出型へ進む
-    let bootstrap = run_bootstrap_stage(assume_yes);
+    // #1510: GUI の初回起動の自動実行は `install: false` で来る（ネットワークの導入をしない）
+    let install = InstallGate::from_answers(answers);
+    let bootstrap = run_bootstrap_stage(assume_yes, install);
     remaining.extend(bootstrap.remaining);
     setup_remaining::legacy_stop(&remaining)?;
 
@@ -3310,7 +3385,7 @@ pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Resu
         missing,
         tailscale,
     } = run_dependency_check(
-        DepCheckMode::for_setup(review_mode, assume_yes),
+        DepCheckMode::for_setup(review_mode, assume_yes, install),
         sleep_guard_answer,
     );
     remaining.extend(missing);
@@ -3851,6 +3926,55 @@ fn print_context_budget_status() {
 mod tests {
     use super::*;
     use tako_control::setup::SetupConfig;
+
+    /// **#1510 の受け入れ条件 3**: GUI の初回起動の自動の段（`welcome::auto_setup_answers`）は、
+    /// エージェント CLI の公式インストーラも brew / winget の依存導入も**走らせない**。
+    /// `--yes` でも・端末があってもなくても・代行できる環境でもできない環境でも同じ
+    #[test]
+    fn issue1510_自動の段のanswersはネットワークからの導入を走らせない() {
+        let gate = InstallGate::from_answers(&tako_control::welcome::auto_setup_answers());
+        assert_eq!(gate, InstallGate::Deny);
+        for can_run in [true, false] {
+            assert_eq!(
+                install_action(gate, can_run),
+                InstallAction::Skip,
+                "エージェント CLI の導入（can_run={can_run}）"
+            );
+        }
+        for review in [false, true] {
+            for assume_yes in [false, true] {
+                for tty in [false, true] {
+                    let mut mode = DepCheckMode::for_setup(review, assume_yes, gate);
+                    mode.offer.stdin_is_terminal = tty;
+                    let offer = setup_deps::offer_for(true, mode.offer);
+                    assert!(
+                        !matches!(
+                            offer,
+                            setup_deps::DepOffer::AutoInstall | setup_deps::DepOffer::Ask
+                        ),
+                        "依存の導入（review={review} yes={assume_yes} tty={tty}）: {offer:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// 省略（ターミナルの `tako setup` / MCP `tako_setup`）は #1510 前のまま
+    #[test]
+    fn issue1510_省略時の導入の判断は従来どおり() {
+        let gate = InstallGate::from_answers(&SetupAnswers::default());
+        assert_eq!(gate, InstallGate::Allow);
+        assert_eq!(install_action(gate, true), InstallAction::Run);
+        assert_eq!(install_action(gate, false), InstallAction::Handoff);
+        let mut mode = DepCheckMode::for_setup(false, true, gate);
+        mode.offer.stdin_is_terminal = false;
+        mode.offer.legacy = false;
+        assert_eq!(
+            setup_deps::offer_for(true, mode.offer),
+            setup_deps::DepOffer::AutoInstall,
+            "--yes は同意扱い（#1499）"
+        );
+    }
 
     /// #2428: 新しいタブでだけ引けるなら、PATH の欄がそう言う（「通っています」だけで終えない）
     #[test]

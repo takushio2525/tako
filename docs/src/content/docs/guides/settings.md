@@ -271,12 +271,14 @@ tako platform --json
 
 ## 初回起動バナー
 
-初回だけ、タブバーの下に `tako setup` / `tako master` への案内バナーが出ます。消したあとでも呼び戻せます。
+初回起動で手間のかからない初期設定が自動で進み、タブバーの下に「次にやること」（AI エージェントを入れる・ログインする・master を起動する）が出ます。やることが残っているあいだは起動のたびに出ます。消したあとでも呼び戻せます。
 
 ```bash
-tako welcome           # 表示状態
-tako welcome show
-tako welcome dismiss
+tako welcome           # 表示状態と次にやること
+tako welcome next      # 次にやることを進める（バナーのボタンと同じ）
+tako welcome hide      # その回だけ閉じる
+tako welcome dismiss   # 以後出さない
+tako welcome show      # もう一度出す
 ```
 
 ## AI に頼んで変える

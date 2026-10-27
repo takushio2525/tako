@@ -132,7 +132,7 @@ tako orchestrator spawn --help
 | [`session-restart`](#tako-session-restart) | エージェントを会話ごと引き継いで再起動 |
 | [`limit-resume`](#tako-limit-resume) | 利用上限後の自動復帰（ペイン単位） |
 | [`limit-service`](#表示設定のトグル) | 利用制限表示のサービス切替 |
-| [`welcome`](#tako-welcome) | 初回起動バナーの状態・再表示 |
+| [`welcome`](#tako-welcome) | 初回起動バナーの状態・次にやること・再表示 |
 
 ### 開く・戻る
 
@@ -1414,12 +1414,15 @@ tako limit-resume --all         # 全ペインの状態を一覧
 
 ### tako welcome
 
-初回起動時にタブバー直下へ出る案内バナーの操作です。
+初回起動時にタブバー直下へ出る案内バナーと、初回起動の導線（自動の初期設定 → 次にやること）の操作です。
 
 ```bash
-tako welcome           # 表示状態と案内すべきコマンド
+tako welcome           # 表示状態と次にやること（onboarding.step.command が打つべき 1 行）
+tako welcome next      # 次にやることを進める（バナーのボタンと同じ。入れる・ログインは新しいタブで実行）
+tako welcome auto      # 自動の初期設定をもう一度（インターネットからの導入はしない）
 tako welcome show      # もう一度出す
-tako welcome dismiss   # 消す
+tako welcome hide      # その回だけ閉じる
+tako welcome dismiss   # 以後出さない
 ```
 
 ## 開く・戻る

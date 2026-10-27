@@ -2804,20 +2804,19 @@ pub fn tools() -> Vec<Value> {
         // 出自: #549
         json!({
             "name": "tako_welcome",
-            "description": "初回起動のウェルカムバナー。tako を初めて起動したユーザーへ\
-                「tako setup で初期設定 → tako master で AI 司令塔」の導線を画面上部に出す。\
-                action=status（既定）で表示状態（visible / dismissed / first_launch）と\
-                案内すべきコマンド（setup_command / master_command）を返す。\
-                action=show でバナーを再表示（初期設定がまだのユーザーへ導線を出し直したいとき）。\
-                action=dismiss で閉じて以後出さない（settings.json に永続化）。\
-                ユーザーが「何から始めればいいか」で迷っていたら status で状態を確認し、\
-                setup_command をそのまま案内するか tako_setup を実行すること。",
+            "description": "初回起動のバナーと導線。初回起動で副作用の小さい setup の段（PATH・MCP 登録・\
+                指示ファイル。ネットワークからの導入はしない）を自動で走らせ、残り作業（エージェント CLI の\
+                導入・ログイン）のあいだは「次にやること」を、済んだら master の起動を出す。\
+                status（既定）: 表示状態と onboarding（auto = 自動の段の結果 / step = 次にやることと最簡の command）。\
+                next: 次にやることを押す（導入・ログインはタブを開いてコマンドを打つ。ユーザーに頼まれたときだけ）。\
+                auto: 自動の段をもう一度。show / hide（いまだけ閉じる）/ dismiss（以後出さない）。\
+                何から始めればいいか迷っているユーザーには status の step.command を案内する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "show", "dismiss"],
+                        "enum": ["status", "next", "auto", "show", "hide", "dismiss"],
                         "description": "操作（省略は status）",
                     },
                 },

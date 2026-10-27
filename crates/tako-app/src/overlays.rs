@@ -19,6 +19,10 @@ impl TakoApp {
         if !self.welcome_banner {
             return None;
         }
+        // #1510: 導線が動いているときは「次にやること」を出す形。偽なら #549 の形のまま
+        if self.welcome_live {
+            return Some(self.render_welcome_onboarding(cx));
+        }
         use crate::ui_text::welcome as txt;
         let theme = self.theme.clone();
 
@@ -178,6 +182,266 @@ impl TakoApp {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// 初回起動の導線のバナー（#1510）。
+    ///
+    /// 見出し行（題・設定を開く・今後表示しない・あとで）/ 自動の段の 1 行 / 「次にやること」と
+    /// その段のボタン、の 3 段。段の判定と遷移は `tako_control::welcome`、ボタンは CLI / MCP の
+    /// `tako welcome next` と同じ要求を投げる（UI に閉じたロジックを作らない）
+    fn render_welcome_onboarding(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        use crate::ui_text::welcome as txt;
+        use tako_control::welcome::{AutoState, NextStep};
+        let theme = self.theme.clone();
+        let now = std::time::Instant::now();
+        let onboarding = self.welcome_onboarding.clone();
+
+        // 見出し行の文字だけのボタン
+        let link = |id: &'static str, label: String| {
+            let accent = theme.accent;
+            div()
+                .id(id)
+                .flex_none()
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(4.0))
+                .text_size(px(11.0))
+                .text_color(hsla(theme.text_muted))
+                .cursor_pointer()
+                .hover(move |d| d.text_color(hsla(accent)))
+                .child(SharedString::from(label))
+        };
+        let note = |text: String, color: tako_core::Rgb| {
+            div()
+                .w_full()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .text_size(px(11.0))
+                .text_color(hsla(color))
+                .child(SharedString::from(text))
+        };
+
+        // 自動の段の 1 行（走っていない起動 = 確かめるだけのときは出さない）
+        let auto_row = match &onboarding.auto {
+            AutoState::Idle => None,
+            AutoState::Running => Some((txt::auto_running().to_string(), false, false)),
+            AutoState::Done(outcome) if outcome.completed => Some((
+                txt::auto_done(outcome.changes),
+                false,
+                outcome.log.is_some(),
+            )),
+            AutoState::Done(outcome) => Some((
+                txt::auto_failed(outcome.error.as_deref().unwrap_or("?")),
+                true,
+                outcome.log.is_some(),
+            )),
+        }
+        .map(|(text, failed, has_log)| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .child(div().flex_1().min_w(px(0.0)).child(note(
+                    text,
+                    if failed {
+                        theme.red
+                    } else {
+                        theme.text_secondary
+                    },
+                )))
+                .when(has_log, |d| {
+                    d.child(
+                        link("welcome-view-log", txt::view_log().to_string())
+                            .on_click(cx.listener(|this, _, _, cx| this.open_welcome_log(cx))),
+                    )
+                })
+        });
+
+        // 「次にやること」: (本文, 何をどこに, ボタン, master か)
+        let next = |text: String| format!("{}{text}", txt::next_label());
+        let (desc, detail, button, master) = match &onboarding.step {
+            None => (txt::checking().to_string(), None, None, false),
+            Some(NextStep::Install { agent, plan }) if plan.can_run => (
+                next(txt::install_step(agent.product())),
+                Some(txt::install_what_where(
+                    &plan.official_command,
+                    &tako_core::paths::shorten_home(&plan.launcher.to_string_lossy()),
+                )),
+                Some(txt::install_button(agent.product())),
+                false,
+            ),
+            Some(NextStep::Install { agent, .. }) => (
+                next(txt::install_manual_step(agent.product())),
+                None,
+                Some(txt::install_manual_button().to_string()),
+                false,
+            ),
+            Some(NextStep::Path { agent }) => (
+                next(txt::path_step(agent.as_str())),
+                None,
+                Some(txt::path_button().to_string()),
+                false,
+            ),
+            Some(NextStep::Login { agent, .. }) => (
+                next(txt::login_step(&txt::account(*agent))),
+                None,
+                Some(txt::login_button().to_string()),
+                false,
+            ),
+            Some(NextStep::Master { .. }) => (
+                txt::ready_step().to_string(),
+                None,
+                Some(txt::run_master_button().to_string()),
+                true,
+            ),
+            Some(NextStep::Unknown { reason }) => (
+                txt::unknown_step(reason),
+                None,
+                Some(txt::run_setup_button().to_string()),
+                false,
+            ),
+        };
+        let watching = onboarding.watching(now);
+
+        let step_column =
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(hsla(theme.foreground))
+                        .child(SharedString::from(desc)),
+                )
+                .children(detail.map(|text| {
+                    note(text, theme.text_muted).font_family(theme.font_family.clone())
+                }))
+                .when(watching, |d| {
+                    d.child(note(txt::watching().to_string(), theme.text_secondary))
+                });
+
+        let step_button = button.map(|label| {
+            let accent = theme.accent;
+            div()
+                .id("welcome-next")
+                .flex_none()
+                .px(px(12.0))
+                .py(px(5.0))
+                .rounded(px(5.0))
+                .text_size(px(12.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .cursor_pointer()
+                .bg(rgba(accent))
+                .text_color(hsla(theme.background))
+                .hover(move |d| d.bg(rgba_alpha(accent, 0.85)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    // master は確かめ直さずに起こす（#549 のボタン・パレットと同じ 1 実装）。
+                    // それ以外は押した時点の状態を確かめてからその段を流す（`tako welcome next`）
+                    if master {
+                        this.run_master_command(cx);
+                    } else {
+                        this.press_welcome_next(cx);
+                    }
+                }))
+                .child(SharedString::from(label))
+        });
+
+        div()
+            .id("welcome-banner")
+            .flex_none()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .px(px(14.0))
+            .py(px(10.0))
+            .bg(rgba_alpha(theme.accent, 0.10))
+            .border_b_1()
+            .border_color(hsla_alpha(theme.accent, 0.28))
+            // 見出し行: 題 + 設定を開く + 今後表示しない + あとで
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hsla(theme.foreground))
+                            .child(SharedString::from(txt::title().to_string())),
+                    )
+                    .child(
+                        link("welcome-settings", txt::open_settings_button().to_string()).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.pending_settings_open = Some(None);
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        link("welcome-never", txt::never_show().to_string()).on_click(
+                            cx.listener(|this, _, _, cx| this.dismiss_welcome_banner(cx)),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .id("welcome-later")
+                            .flex_none()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(5.0))
+                            .px(px(6.0))
+                            .py(px(2.0))
+                            .rounded(px(4.0))
+                            .text_size(px(11.0))
+                            .text_color(hsla(theme.text_muted))
+                            .cursor_pointer()
+                            .hover({
+                                let hl = theme.surface_highlight;
+                                move |d| d.bg(rgba(hl))
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| this.hide_welcome_banner(cx)))
+                            .child(SharedString::from(txt::later().to_string()))
+                            .child(
+                                svg()
+                                    .path(ui_icon::CLOSE)
+                                    .w(px(9.0))
+                                    .h(px(9.0))
+                                    .flex_none()
+                                    .text_color(hsla(theme.text_muted)),
+                            ),
+                    ),
+            )
+            .children(auto_row)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(step_column)
+                    .children(step_button),
+            )
+            .into_any_element()
     }
 
     /// ⌘K コマンドパレット（#217 カンプ。上部中央のモーダル + 検索 + 候補リスト）

@@ -118,10 +118,12 @@ fn issue1499_依存チェックの対話をreviewだけで決めない() {
          通すこと（#1499 / #1524）"
     );
     // 呼び出しの形（`--review` に依らない本体経路）。#1621 で `--answers` の
-    // sleep_guard を 2 つ目の引数で段へ渡すようになったので、1 つ目の引数の形を縛る
+    // sleep_guard を 2 つ目の引数で段へ渡すようになったので、1 つ目の引数の形を縛る。
+    // #1510 で 3 つ目に導入の門（`install`）が入った: GUI の初回起動の自動の段（`install: false`）
+    // だけが `--check` と同じ読み取りの段になり、それ以外は従来どおり導入まで行う
     for shape in [
-        "DepCheckMode::for_setup(review_mode, assume_yes),",
-        "stage_installs: true",
+        "DepCheckMode::for_setup(review_mode, assume_yes, install),",
+        "stage_installs: install == InstallGate::Allow",
     ] {
         assert!(
             src.contains(shape),
