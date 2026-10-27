@@ -3,6 +3,7 @@
 //! `Screen` のテキストから URL やパスを検出し、グリッド座標のスパンとして返す。
 //! GPUI 非依存。UI 層は検出結果を使って cmd+ホバー下線や cmd+クリック開く処理を行う。
 
+use crate::platform::support::Platform;
 use crate::screen::Screen;
 use std::{
     ops::Range,
@@ -65,7 +66,16 @@ pub fn detect_links_with_home_in(
     let mut links = Vec::new();
     detect_urls(screen, &mut links);
     let url_links = links.clone();
-    detect_paths(screen, cwd, home, &url_links, &mut links, legacy);
+    // パスの形の判定は実行中の OS の形で行う（#2435。`C:\…` を候補にするのは Windows だけ）
+    detect_paths(
+        screen,
+        cwd,
+        home,
+        &url_links,
+        &mut links,
+        legacy,
+        Platform::current(),
+    );
     links
 }
 
@@ -385,9 +395,10 @@ fn detect_paths(
     existing_links: &[DetectedLink],
     out: &mut Vec<DetectedLink>,
     legacy: bool,
+    platform: Platform,
 ) {
     let (text, byte_map) = combined_screen_text(screen);
-    for (token, byte_range) in extract_path_tokens(&text, legacy) {
+    for (token, byte_range) in extract_path_tokens(&text, legacy, platform) {
         let full_spans =
             byte_offsets_to_spans(&byte_map, byte_range.start, byte_range.end, screen.cols);
         if full_spans.is_empty() || overlaps_existing(existing_links, &full_spans) {
@@ -396,10 +407,10 @@ fn detect_paths(
 
         // 地の文が食い込んだトークンに備えて候補を長い順に試す（#1283）。
         // トークン全体が最初の候補なので、今まで引けていた形は定義上そのまま引ける
-        for (rel_start, candidate) in path_candidates_in(&token, legacy) {
+        for (rel_start, candidate) in path_candidates_in(&token, legacy, platform) {
             // 行番号サフィックスを分離（`src/main.rs:42:5` → `src/main.rs`）
             let path_part = strip_line_col_suffix(candidate);
-            let Some(resolved) = resolve_path(path_part, cwd, home) else {
+            let Some(resolved) = resolve_path(path_part, cwd, home, platform) else {
                 continue;
             };
             let start = byte_range.start + rel_start;
@@ -443,16 +454,17 @@ pub fn legacy_1283() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_1283_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
-/// [`path_candidates`] の本体（判断を引数で受け取る形。env は唯一の差）
-fn path_candidates_in(token: &str, legacy: bool) -> Vec<(usize, &str)> {
+/// [`path_candidates`] の本体（判断を引数で受け取る形。env は唯一の差）。
+/// `platform` はパスの形の判定に使う（#2435。Windows では `\` も区切り）
+fn path_candidates_in(token: &str, legacy: bool, platform: Platform) -> Vec<(usize, &str)> {
     let mut out = vec![(0usize, token)];
     // 地の文が食い込む余地があるのは「ASCII だけで書かれていないトークン」だけ。
     // 全 ASCII のトークンでは候補を増やさない（実在チェックの syscall を増やさない）
     if legacy || token.is_ascii() {
         return out;
     }
-    let starts = candidate_starts(token);
-    let ends = candidate_ends(token);
+    let starts = candidate_starts(token, platform);
+    let ends = candidate_ends(token, platform);
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     for &start in &starts {
         for &end in &ends {
@@ -465,7 +477,7 @@ fn path_candidates_in(token: &str, legacy: bool) -> Vec<(usize, &str)> {
     pairs.sort_by_key(|&(start, end)| std::cmp::Reverse(end - start));
     for (start, end) in pairs.into_iter().take(MAX_TRIMMED_CANDIDATES) {
         let sub = &token[start..end];
-        if is_path_like(sub) {
+        if is_path_like(sub, platform) {
             out.push((start, sub));
         }
     }
@@ -475,29 +487,39 @@ fn path_candidates_in(token: &str, legacy: bool) -> Vec<(usize, &str)> {
 /// パスの本体に現れうる文字か。
 ///
 /// 非 ASCII は「本体にも地の文にも現れる」ので**本体扱いにしない**
-/// （切り出し位置の手がかりとして使う）。引用符・バッククォートも本体扱いしない
-fn is_path_body_char(ch: char) -> bool {
+/// （切り出し位置の手がかりとして使う）。引用符・バッククォートも本体扱いしない。
+/// `\` は Windows でだけ本体（区切り）として扱う（#2435。macOS ではファイル名の 1 文字）
+fn is_path_body_char(ch: char, platform: Platform) -> bool {
     ch.is_ascii_alphanumeric()
         || matches!(
             ch,
             '.' | '_' | '-' | '~' | '/' | '+' | '=' | '%' | '@' | '#' | '$' | '&' | '!' | ':'
         )
+        || (ch == '\\' && platform == Platform::Windows)
 }
 
 /// 先頭に地の文が食い込んでいる場合の切り出し位置（先頭 = 0 を必ず含む）。
 ///
 /// **絶対パス / ホーム起点 / `./` `../` が始まる位置だけ**を候補にする
-/// （途中の `/` から切ると意味の無い断片が大量に増える）
-fn candidate_starts(token: &str) -> Vec<usize> {
+/// （途中の `/` から切ると意味の無い断片が大量に増える）。Windows では
+/// `C:\` `C:/` `\\`（UNC）`.\` `..\` `~\` の始まりも足す（#2435）
+fn candidate_starts(token: &str, platform: Platform) -> Vec<usize> {
     let mut starts = vec![0usize];
     let mut prev_is_body = true;
     for (idx, ch) in token.char_indices() {
         if idx > 0 && !prev_is_body {
             let rest = &token[idx..];
+            let windows_start = platform == Platform::Windows
+                && (has_drive_prefix(rest)
+                    || rest.starts_with(r"\\")
+                    || rest.starts_with(r".\")
+                    || rest.starts_with(r"..\")
+                    || rest.starts_with(r"~\"));
             if rest.starts_with("~/")
                 || rest.starts_with('/')
                 || rest.starts_with("./")
                 || rest.starts_with("../")
+                || windows_start
             {
                 starts.push(idx);
                 if starts.len() > MAX_CUTS {
@@ -505,7 +527,7 @@ fn candidate_starts(token: &str) -> Vec<usize> {
                 }
             }
         }
-        prev_is_body = is_path_body_char(ch);
+        prev_is_body = is_path_body_char(ch, platform);
     }
     starts
 }
@@ -513,15 +535,17 @@ fn candidate_starts(token: &str) -> Vec<usize> {
 /// 末尾に地の文が食い込んでいる場合の切り出し位置（末尾 = 長さを必ず含む）。
 ///
 /// 「本体の文字 → 本体でない文字」へ切り替わる位置だけを候補にする
-/// （`…mp4このリンクが` なら `こ` の位置 1 つだけ）。`/` で終わる候補は
-/// **パスの区切りを跨いで切った断片**なので採らない（存在するディレクトリへ
-/// 誤って飛ばさないため）
-fn candidate_ends(token: &str) -> Vec<usize> {
+/// （`…mp4このリンクが` なら `こ` の位置 1 つだけ）。`/`（Windows では `\` も）で
+/// 終わる候補は**パスの区切りを跨いで切った断片**なので採らない（存在する
+/// ディレクトリへ誤って飛ばさないため）
+fn candidate_ends(token: &str, platform: Platform) -> Vec<usize> {
     let mut ends = vec![token.len()];
     let mut prev_is_body = false;
     for (idx, ch) in token.char_indices() {
-        let is_body = is_path_body_char(ch);
-        if !is_body && prev_is_body && idx >= 2 && !token[..idx].ends_with('/') {
+        let is_body = is_path_body_char(ch, platform);
+        let ends_at_separator = token[..idx].ends_with('/')
+            || (platform == Platform::Windows && token[..idx].ends_with('\\'));
+        if !is_body && prev_is_body && idx >= 2 && !ends_at_separator {
             ends.push(idx);
             if ends.len() > MAX_CUTS {
                 break;
@@ -533,10 +557,15 @@ fn candidate_ends(token: &str) -> Vec<usize> {
 }
 
 /// パスらしきトークンを行テキストから抽出する。
-/// `/` `.` `~` で始まるか、内部に `/` を含む空白区切りトークンを候補とする。
+/// `/` `.` `~` で始まるか、内部に `/` を含む空白区切りトークンを候補とする
+/// （Windows の形は [`is_path_like`] を参照）。
 ///
 /// `legacy` は #1283 の A/B（`TAKO_1283_LEGACY=1` で修正前の切り出しへ戻す）
-fn extract_path_tokens(text: &str, legacy: bool) -> Vec<(String, Range<usize>)> {
+fn extract_path_tokens(
+    text: &str,
+    legacy: bool,
+    platform: Platform,
+) -> Vec<(String, Range<usize>)> {
     let mut tokens = Vec::new();
     let chars: Vec<(usize, char)> = text.char_indices().collect();
 
@@ -604,8 +633,16 @@ fn extract_path_tokens(text: &str, legacy: bool) -> Vec<(String, Range<usize>)> 
         };
         i = j + skip_end;
 
-        // パスらしさの判定: `/` `.` `~` で始まるか、内部に `/` を含む
-        if is_path_like(&token_text) {
+        // パスらしさの判定: `/` `.` `~` で始まるか、内部に `/` を含む（Windows は `\` の形も）。
+        // #2435: 地の文が前にくっついた Windows の形（`見てC:\…`）はトークン全体だと
+        // `:` がドライブ以外の位置に在るので形の判定に通らない。地の文を削った候補
+        // （#1283）にパスらしい形が在れば拾う（`/` の形はトークン全体が `/` を含むので
+        // 従来どおり上の判定で通る = macOS の答えは変わらない）
+        let windows_embedded = platform == Platform::Windows
+            && !legacy
+            && !token_text.is_ascii()
+            && path_candidates_in(&token_text, legacy, platform).len() > 1;
+        if is_path_like(&token_text, platform) || windows_embedded {
             // 末尾のコロンや句読点を剥がす（`path/to/file:` 等）
             let cleaned = token_text.trim_end_matches([':', '.', ',']);
             if !cleaned.is_empty() {
@@ -616,18 +653,103 @@ fn extract_path_tokens(text: &str, legacy: bool) -> Vec<(String, Range<usize>)> 
     tokens
 }
 
-/// トークンがパスらしいかの簡易判定
-fn is_path_like(token: &str) -> bool {
+/// トークンがパスらしいかの簡易判定。
+///
+/// `/` の形（下記）は両 OS 共通。Windows ではさらに `\` の形（[`is_windows_path_like`]）も
+/// 候補にする（#2435）。**macOS では `\` を区切りとして扱わない**（ファイル名に
+/// 使える 1 文字なので、`\` を含む語を候補にすると判定が変わる）
+fn is_path_like(token: &str, platform: Platform) -> bool {
     if token.is_empty() {
         return false;
     }
     let first = token.chars().next().unwrap();
     // `/` `~` `./` `../` で始まる、または内部に `/` を含む
-    first == '/'
+    let slash_form = first == '/'
         || first == '~'
         || token.starts_with("./")
         || token.starts_with("../")
-        || (token.contains('/') && !token.contains("://"))
+        || (token.contains('/') && !token.contains("://"));
+    slash_form || (platform == Platform::Windows && is_windows_path_like(token))
+}
+
+/// Windows のファイル名に使えない文字（`:` はドライブと `:行:桁` があるので別に見る）。
+/// これを含む語は glob・正規表現・リダイレクトであってパスではない
+const WINDOWS_INVALID_CHARS: [char; 6] = ['*', '?', '"', '<', '>', '|'];
+
+/// `C:\` / `C:/` で始まるか（ドライブレターの絶対パス。#2435）
+fn has_drive_prefix(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+}
+
+/// Windows の絶対パスの形か（`C:\…` / `C:/…` / `\\server\share\…` / `\\?\C:\…`）。
+/// 実在チェックの前に「cwd へ繋がず、そのまま引く」を決めるのに使う
+fn is_windows_absolute(s: &str) -> bool {
+    has_drive_prefix(s) || s.starts_with(r"\\")
+}
+
+/// Windows の `\` の形のパスらしいか（#2435）。
+///
+/// 候補にする形:
+/// - ドライブレター（`C:\…` / `C:/…`）・UNC（`\\server\share…`）・`\\?\C:\…`
+/// - `.\` `..\` `~\` で始まる相対
+/// - それ以外の `\` を含む相対（`src\main.rs:10:5`）は、**最後の名前に拡張子があるか
+///   `:行` が付くときだけ**。`Hello\nWorld` のようなエスケープ入りの文と見分ける
+///   手がかりが他に無いため（拡張子の無いディレクトリは `.\src` の形なら候補になる）
+///
+/// 候補にしない形: `\` で始まる語（`\n` `\d+` などのエスケープ・正規表現）/
+/// 途中に `\\` を含む語（エスケープされた文字列。Debug 表示の `C:\\Users\\…` も含む）/
+/// `*?"<>|` を含む語 / ドライブ以外の位置に `:` を含む語
+fn is_windows_path_like(token: &str) -> bool {
+    // 行末の句読点と `:行:桁` を外した本体で見る（`src\main.rs:4:5:` の形）
+    let trimmed = token.trim_end_matches([':', '.', ',']);
+    let body = strip_line_col_suffix(trimmed);
+    let has_line = body.len() < trimmed.len();
+    // 絶対パスの形なら、接頭辞の後ろ（`rest`）だけを検査する
+    let rest = if let Some(after) = body
+        .strip_prefix(r"\\?\")
+        .filter(|after| has_drive_prefix(after))
+    {
+        // 切り出し安全: has_drive_prefix が先頭 3 バイトを ASCII（`C:\`）と確かめている
+        Some(&after[2..])
+    } else if has_drive_prefix(body) {
+        // 切り出し安全: has_drive_prefix が先頭 3 バイトを ASCII（`C:\`）と確かめている
+        Some(&body[2..])
+    } else if let Some(after) = body.strip_prefix(r"\\") {
+        // UNC は `\\server\share` の 2 つが揃って初めて絶対パス
+        let mut parts = after.split('\\');
+        let server = parts.next().unwrap_or("");
+        let share = parts.next().unwrap_or("");
+        if server.is_empty() || share.is_empty() {
+            return false;
+        }
+        Some(after)
+    } else {
+        None
+    };
+    let checked = rest.unwrap_or(body);
+    if checked.contains(WINDOWS_INVALID_CHARS) || checked.contains(':') || checked.contains(r"\\") {
+        return false;
+    }
+    if rest.is_some()
+        || body.starts_with(r".\")
+        || body.starts_with(r"..\")
+        || body.starts_with(r"~\")
+    {
+        return true;
+    }
+    if !body.contains('\\') || body.starts_with('\\') || body.ends_with('\\') {
+        return false;
+    }
+    has_line || body.rsplit('\\').next().is_some_and(has_file_extension)
+}
+
+/// `main.rs` のように拡張子があるか（`.gitignore` のような先頭ドットだけの名前は除く）
+fn has_file_extension(name: &str) -> bool {
+    name.rfind('.').is_some_and(|dot| {
+        let ext = &name[dot + 1..];
+        dot > 0 && !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric())
+    })
 }
 
 /// `src/main.rs:42:5` → `src/main.rs` のように行番号・列番号サフィックスを除去する
@@ -650,29 +772,32 @@ fn strip_line_col_suffix(token: &str) -> &str {
 }
 
 /// パスを解決する。cwd 基準の相対 / `~` 展開 / 絶対パスの 3 戦略を試し、
-/// 実在するものを返す。
-fn resolve_path(raw: &str, cwd: Option<&Path>, home: Option<&Path>) -> Option<PathBuf> {
+/// 実在するものを返す。Windows では `~\` の展開と `C:\…` / UNC の絶対パスも扱う（#2435）
+fn resolve_path(
+    raw: &str,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    platform: Platform,
+) -> Option<PathBuf> {
     if raw.is_empty() || raw.len() < 2 {
         return None;
     }
+    let windows = platform == Platform::Windows;
 
     // `~` 展開
-    let expanded = if raw.starts_with("~/") || raw == "~" {
-        // 切り出し安全: 先頭 2 バイトは ASCII の `~/`（`~` 単独は上の len < 2 で返している）
+    let expanded = if raw.starts_with("~/") || raw == "~" || (windows && raw.starts_with(r"~\")) {
+        // 切り出し安全: 先頭 2 バイトは ASCII の `~/` / `~\`（`~` 単独は上の len < 2 で返している）
         home.map(|h| h.join(&raw[2..]))
     } else {
         None
     };
 
     // 試す順序: 展開済み → 絶対パス → cwd 相対
+    let absolute = raw.starts_with('/') || (windows && is_windows_absolute(raw));
     let candidates: Vec<PathBuf> = [
         expanded,
-        if raw.starts_with('/') {
-            Some(PathBuf::from(raw))
-        } else {
-            None
-        },
-        cwd.filter(|_| !raw.starts_with('/') && !raw.starts_with('~'))
+        absolute.then(|| PathBuf::from(raw)),
+        cwd.filter(|_| !absolute && !raw.starts_with('~'))
             .map(|cwd| cwd.join(raw)),
     ]
     .into_iter()
@@ -939,17 +1064,9 @@ mod tests {
         cleanup_test_dir(&dir);
     }
 
-    /// **Windows では skip**（#1278）。fixture が `dir.join(...)` で作る絶対パスは
-    /// Windows では `C:\…` のバックスラッシュ形で、**製品は設計上それを
-    /// リンクにしない**（`is_path_like` が `/` を含む形だけを候補にする = #153 からの
-    /// 判断で、`platform::support` の `tako_links` は `Support::Degraded` +
-    /// `notes::WIN_PATH_LINK_BACKSLASH` として**宣言済み**）。
-    /// `~/` 起点は Windows でも効くので `detect_tilde_path` は両 OS で走る
+    /// fixture が `dir.join(...)` で作る絶対パスは Windows では `C:\…` の形。
+    /// #2435 からはこれも候補になるので両 OS で走る（以前は Windows で skip していた）
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows は `C:\\…` のバックスラッシュ絶対パスをリンクにしない（宣言済みの縮退。platform::support の tako_links = Degraded / #153）"
-    )]
     fn detect_absolute_path() {
         let dir = setup_test_dir("absolute");
         let abs = dir.join("README.md");
@@ -978,14 +1095,8 @@ mod tests {
         let _ = std::fs::remove_file(&test_file);
     }
 
-    /// **Windows では skip**（`detect_absolute_path` と同じ宣言済みの縮退。#1278）。
-    /// ホーム起点（`~/`）の検出自体は Windows でも効くが、この検査は
-    /// バックスラッシュ絶対パスの検出と同じ 1 本の中で見ている
+    /// cwd が無くても絶対パス（Windows では `C:\…` = #2435）とホーム起点は引ける
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows は `C:\\…` のバックスラッシュ絶対パスをリンクにしない（宣言済みの縮退。platform::support の tako_links = Degraded / #153）"
-    )]
     fn cwd不明でも絶対パスとホーム起点は検出する() {
         let dir = setup_test_dir("without_cwd");
         let abs = dir.join("README.md");
@@ -1015,14 +1126,8 @@ mod tests {
         cleanup_test_dir(&dir);
     }
 
-    /// **Windows では skip**（`detect_absolute_path` と同じ宣言済みの縮退。#1278）。
-    /// 折り返しの結合そのものは OS 非依存だが、fixture が絶対パスなので
-    /// Windows では候補にならない
+    /// 折り返しの結合は OS 非依存。fixture の絶対パスは Windows では `C:\…` の形（#2435）
     #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows は `C:\\…` のバックスラッシュ絶対パスをリンクにしない（宣言済みの縮退。platform::support の tako_links = Degraded / #153）"
-    )]
     fn tuiの装飾付きsoft_wrapをまたぐパスを検出する() {
         use crate::screen::StyleRun;
 
@@ -1144,9 +1249,8 @@ mod tests {
     #[test]
     fn 空白詰めの実画面でも隣接行のパスを検出する() {
         let dir = setup_test_dir("padded");
-        // **画面に出す形は `/` 区切り**にする（`is_path_like` は `/` を含まない
-        // Windows のバックスラッシュ形式を候補にしない = #153 の既存制約。
-        // ここで見たいのは soft wrap の判定なので、両 OS で成立する形で書く）
+        // **画面に出す形は `/` 区切り**にする（ここで見たいのは soft wrap の判定なので、
+        // 両 OS で同じ答えになる形で書く。`\` の形は `windowsの形…_2435` の単体が見る）
         let lines = [
             // 素のファイル名は候補にならない（`is_path_like`）ので `./` を付ける
             "./README.md 更新",
@@ -1185,9 +1289,8 @@ mod tests {
 
     /// 空白詰めでも**本当に右端まで埋まった行**は従来どおり次行へ直結する（折り返し）。
     ///
-    /// 折り返しを起こすには**絶対パスの長さ**が要るので unix 限定
-    /// （Windows のバックスラッシュ形式は `is_path_like` が候補にしない = #153 の既存制約）
-    #[cfg(unix)]
+    /// 折り返しを起こすには**絶対パスの長さ**が要る。Windows の `C:\…` も #2435 から
+    /// 候補になるので両 OS で走る（以前は unix 限定）
     #[test]
     fn 空白詰めでも右端まで埋まった行は折り返しとして繋ぐ() {
         let dir = setup_test_dir("padded_wrap");
@@ -1270,14 +1373,23 @@ mod tests {
 
     #[test]
     fn is_path_like_checks() {
-        assert!(is_path_like("/usr/bin/env"));
-        assert!(is_path_like("~/config"));
-        assert!(is_path_like("./local"));
-        assert!(is_path_like("../parent"));
-        assert!(is_path_like("src/main.rs"));
-        assert!(!is_path_like("plain"));
-        assert!(!is_path_like("http://example.com"));
-        assert!(!is_path_like(""));
+        // `/` の形は両 OS で同じ答え
+        for platform in [Platform::MacOs, Platform::Windows] {
+            assert!(is_path_like("/usr/bin/env", platform));
+            assert!(is_path_like("~/config", platform));
+            assert!(is_path_like("./local", platform));
+            assert!(is_path_like("../parent", platform));
+            assert!(is_path_like("src/main.rs", platform));
+            assert!(is_path_like("C:/Users/winuser/x.txt", platform));
+            assert!(!is_path_like("plain", platform));
+            assert!(!is_path_like("http://example.com", platform));
+            assert!(!is_path_like("", platform));
+        }
+        // `\` の形は Windows だけ（macOS では `\` はファイル名の 1 文字。#2435）
+        for token in [r"C:\Users\winuser", r"src\main.rs:10:5", r"\\server\share"] {
+            assert!(is_path_like(token, Platform::Windows), "{token}");
+            assert!(!is_path_like(token, Platform::MacOs), "{token}");
+        }
     }
 
     #[test]
@@ -1577,7 +1689,7 @@ mod tests {
     #[test]
     fn 候補は長い順でトークン全体が先頭_1283() {
         let token = "動画は`~/Desktop/x.mp4`、確認して。";
-        let cands = path_candidates_in(token, false);
+        let cands = path_candidates_in(token, false, Platform::MacOs);
         assert_eq!(cands[0], (0, token), "先頭はトークン全体");
         assert!(
             cands.iter().any(|&(_, c)| c == "~/Desktop/x.mp4"),
@@ -1590,13 +1702,265 @@ mod tests {
         );
 
         // 全 ASCII のトークンでは候補を増やさない（実在チェックの syscall を増やさない）
-        assert_eq!(path_candidates_in("src/main.rs:42:5", false).len(), 1);
+        assert_eq!(
+            path_candidates_in("src/main.rs:42:5", false, Platform::MacOs).len(),
+            1
+        );
 
         // `/` で終わる断片は採らない（存在するディレクトリへ誤って飛ばさないため）
-        let cands = path_candidates_in("~/Desktop/tako-promo/存在しない", false);
+        let cands = path_candidates_in("~/Desktop/tako-promo/存在しない", false, Platform::MacOs);
         assert!(
             cands.iter().all(|&(_, c)| !c.ends_with('/')),
             "`/` 終わりの候補が混ざる: {cands:?}"
         );
+    }
+
+    // ---- #2435: Windows の `\` の形のパス ----
+
+    /// 1 行のテキストから、実在チェックに掛ける候補（`:行:桁` を外した形）を出現順に返す。
+    /// 実在チェックの手前までは `platform` を引数で受ける純関数なので、
+    /// **macOS 上から Windows の形を検査できる**
+    fn path_parts_on(line: &str, platform: Platform) -> Vec<String> {
+        extract_path_tokens(line, false, platform)
+            .iter()
+            .flat_map(|(token, _)| {
+                path_candidates_in(token, false, platform)
+                    .into_iter()
+                    .map(|(_, c)| strip_line_col_suffix(c).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// cargo / rustc / Python / Node / MSVC / PowerShell が Windows で出す形が
+    /// 1 本ずつ候補になる。macOS では同じ行から `\` の候補は出ない（`\` はファイル名の 1 文字）
+    #[test]
+    fn windowsの形はplatformを渡すと候補になる_2435() {
+        let cases: &[(&str, &str)] = &[
+            // rustc / cargo のエラー位置
+            (r"   --> src\main.rs:10:5", r"src\main.rs"),
+            (
+                r"thread 'main' panicked at src\main.rs:4:5:",
+                r"src\main.rs",
+            ),
+            // Python のトレースバック（引用符で囲まれる）
+            (
+                r#"  File "C:\Users\winuser\proj\main.py", line 10, in <module>"#,
+                r"C:\Users\winuser\proj\main.py",
+            ),
+            // Node のスタック（括弧で囲まれる）
+            (
+                r"    at Object.<anonymous> (C:\Users\winuser\proj\index.js:10:5)",
+                r"C:\Users\winuser\proj\index.js",
+            ),
+            // MSVC（`(行,桁)` は括弧で切れる）
+            (
+                r"C:\proj\main.cpp(10,5): error C2065: 'x': undeclared identifier",
+                r"C:\proj\main.cpp",
+            ),
+            // PowerShell のプロンプト
+            (r"PS C:\Users\winuser\proj>", r"C:\Users\winuser\proj"),
+            // `/` 区切りのドライブ（MinGW の gcc など。両 OS で候補）
+            (
+                "C:/Users/winuser/proj/main.c:3:1: error",
+                "C:/Users/winuser/proj/main.c",
+            ),
+            // UNC と `\\?\`
+            (
+                r"\\fileserver\share\docs\spec.md",
+                r"\\fileserver\share\docs\spec.md",
+            ),
+            (
+                r"\\?\C:\Users\winuser\proj\Cargo.toml",
+                r"\\?\C:\Users\winuser\proj\Cargo.toml",
+            ),
+            // `.\` `..\` `~\` で始まる相対は拡張子が無くても候補
+            (r"cd .\scripts", r".\scripts"),
+            (r"..\other\lib.rs", r"..\other\lib.rs"),
+            (r"~\proj\notes", r"~\proj\notes"),
+            // エッジ: 行末の `:` / 括弧で囲まれたパス / 拡張子が無くても `:行` が付けば候補
+            (r"error in src\lib.rs:", r"src\lib.rs"),
+            (r"(src\lib.rs:3)", r"src\lib.rs"),
+            (r"src\Makefile:12", r"src\Makefile"),
+            // 空白を含むパスは引用符で囲まれていれば 1 本
+            (
+                r#"open "C:\Program Files\tako\tako.exe" now"#,
+                r"C:\Program Files\tako\tako.exe",
+            ),
+        ];
+        for &(line, want) in cases {
+            let parts = path_parts_on(line, Platform::Windows);
+            assert_eq!(parts, vec![want.to_string()], "line={line}");
+            // macOS の答えは変えない（`~` 始まりは修正前から macOS でも候補 = 展開しないので
+            // リンクにはならない。それ以外の `\` の形は macOS では候補にならない）
+            if want.contains('\\') && !want.starts_with('~') {
+                let mac = path_parts_on(line, Platform::MacOs);
+                assert!(
+                    !mac.iter().any(|p| p == want),
+                    "macOS で `\\` の形が候補になった: {line} → {mac:?}"
+                );
+            }
+        }
+
+        // 日本語のファイル名 + 前後に地の文（#1283 の削り方が `\` の形でも効く）
+        let parts = path_parts_on(
+            r"見てC:\Users\winuser\資料\メモ.txtを開いて",
+            Platform::Windows,
+        );
+        assert!(
+            parts.contains(&r"C:\Users\winuser\資料\メモ.txt".to_string()),
+            "{parts:?}"
+        );
+        // `\` で終わる断片（区切りを跨いで切った形）は採らない
+        assert!(parts.iter().all(|p| !p.ends_with('\\')), "{parts:?}");
+        // 全角の括弧で囲まれた形
+        let parts = path_parts_on(r"（C:\proj\main.rs:10:5）を見て", Platform::Windows);
+        assert!(parts.contains(&r"C:\proj\main.rs".to_string()), "{parts:?}");
+
+        // 空白を含むパスを引用符なしで出すと空白で割れる（`/` の形と同じ扱い）。
+        // 割れた前半 `C:\Program` は実在しないのでリンクにならない
+        let parts = path_parts_on(r"C:\Program Files\tako\tako.exe", Platform::Windows);
+        assert_eq!(
+            parts,
+            vec![
+                r"C:\Program".to_string(),
+                r"Files\tako\tako.exe".to_string()
+            ]
+        );
+    }
+
+    /// URL・`\n` を含む文・エスケープ・正規表現・glob は Windows でも `\` の候補にしない
+    #[test]
+    fn windowsでも誤検出は候補にしない_2435() {
+        let lines = [
+            // URL（`\` が混ざっても URL は URL）
+            r"see https://example.com/a\b.html",
+            // `\n` を含む普通の文・エスケープ
+            r#"println!("Hello\nWorld");"#,
+            r"line1\nline2\n",
+            r#"echo "done\n""#,
+            r"\n",
+            r"\t",
+            r"\r\n",
+            // 正規表現
+            r"\d+\.\d+",
+            r"^\s*(\w+)$",
+            r"foo\.bar",
+            r"[A-Z]:\\",
+            // エスケープされた文字列（Debug 表示の二重バックスラッシュ）
+            r#""C:\\Users\\winuser\\x.toml""#,
+            r"a\\b\\c.txt",
+            // glob
+            r"src\*.rs",
+            // ドメイン\ユーザー・レジストリ（拡張子の無い相対 / `:` 入り）
+            r"DOMAIN\winuser",
+            r"HKLM\Software\Microsoft",
+            r"HKLM:\Software",
+            // `\` だけ・UNC の片割れ
+            r"\",
+            r"\\",
+            r"\\server",
+        ];
+        for line in lines {
+            let parts = path_parts_on(line, Platform::Windows);
+            assert!(parts.is_empty(), "誤検出: {line} → {parts:?}");
+        }
+    }
+
+    /// `~\` は Windows でだけホームへ展開する（実在チェックまで通す。ホームは引数で注入）。
+    /// 1 階層の名前にしているのは、macOS では `\` がファイル名の 1 文字で、
+    /// `~\a\b` を `join` すると別のパスになるため
+    #[test]
+    fn windowsではホーム起点の円記号も展開する_2435() {
+        let home = setup_fake_home("win_tilde");
+        std::fs::write(home.join("notes.txt"), "").unwrap();
+        let screen = make_screen(&[r"see ~\notes.txt:3 now"], 80);
+
+        let mut on_windows = Vec::new();
+        detect_paths(
+            &screen,
+            None,
+            Some(home.as_path()),
+            &[],
+            &mut on_windows,
+            false,
+            Platform::Windows,
+        );
+        let targets = path_targets(&on_windows);
+        assert_eq!(targets.len(), 1, "targets={targets:?}");
+        assert_eq!(Path::new(&targets[0]), home.join("notes.txt").as_path());
+        // 下線は `:3` まで（`/` の形の `path:行` と同じ）
+        assert_eq!(on_windows[0].spans, vec![(0, 4, 17)]);
+
+        // macOS では展開しない（`~\` は `~` で始まる名前の 1 つ）
+        let mut on_macos = Vec::new();
+        detect_paths(
+            &screen,
+            None,
+            Some(home.as_path()),
+            &[],
+            &mut on_macos,
+            false,
+            Platform::MacOs,
+        );
+        assert!(path_targets(&on_macos).is_empty(), "{on_macos:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Windows の実ファイルシステムで、cargo / rustc / Python / Node の出力の `\` の形が
+    /// 実在チェックまで通ってリンクになる（#2435）。
+    ///
+    /// **Windows 限定**: `\` を区切りとして扱うのは Windows だけで、macOS では
+    /// `cwd.join("src\\main.rs")` が別の 1 ファイル名になり実在チェックで落ちる。
+    /// 同じ形の切り出しは `windowsの形はplatformを渡すと候補になる_2435` が macOS 上から見る
+    #[cfg(windows)]
+    #[test]
+    fn windowsの出力のパスが実在チェックまで通ってリンクになる_2435() {
+        let dir = setup_test_dir("win2435");
+        let main_rs = dir.join("src").join("main.rs");
+        let readme = dir.join("README.md");
+        let cjk = dir.join("資料.txt");
+        std::fs::write(&cjk, "").unwrap();
+        let spaced = dir.join("Program Files").join("tool.exe");
+        std::fs::create_dir_all(spaced.parent().unwrap()).unwrap();
+        std::fs::write(&spaced, "").unwrap();
+
+        let cases = [
+            (r"   --> src\main.rs:10:5".to_string(), main_rs.clone()),
+            (
+                r"thread 'main' panicked at src\main.rs:4:5:".to_string(),
+                main_rs.clone(),
+            ),
+            (
+                format!("  File \"{}\", line 10, in <module>", readme.display()),
+                readme.clone(),
+            ),
+            (
+                format!("    at Object.<anonymous> ({}:10:5)", main_rs.display()),
+                main_rs.clone(),
+            ),
+            (format!("見て{}を開いて", cjk.display()), cjk.clone()),
+            (format!("open \"{}\" now", spaced.display()), spaced.clone()),
+            (
+                r".\deep\nested\file.txt".to_string(),
+                dir.join("deep").join("nested").join("file.txt"),
+            ),
+        ];
+        for (line, want) in &cases {
+            let links = detect_in_lines(std::slice::from_ref(line), 240, Some(&dir), None);
+            let targets = path_targets(&links);
+            assert_eq!(targets.len(), 1, "line={line} targets={targets:?}");
+            assert_eq!(Path::new(&targets[0]), want.as_path(), "line={line}");
+        }
+
+        // 実在しないものはリンクにならない
+        let links = detect_in_lines(
+            &[r"--> src\missing.rs:1:1".to_string()],
+            240,
+            Some(&dir),
+            None,
+        );
+        assert!(path_targets(&links).is_empty());
+        cleanup_test_dir(&dir);
     }
 }

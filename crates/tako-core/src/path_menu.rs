@@ -223,10 +223,9 @@ mod tests {
         Some((link.target.clone(), actions(is_dir)))
     }
 
-    /// **画面に出す形は `/` 区切りで書く**（`is_path_like` は `/` を含まない Windows の
-    /// バックスラッシュ形式を候補にしない = #153 の既存制約）。ここで見たいのは
-    /// 「cmd+クリックが解決できる形すべてにメニューが出るか」なので、両 OS で成立する
-    /// 相対形で書き、絶対パスは unix 限定の別テストに分ける
+    /// **画面に出す形は `/` 区切りで書く**（ここで見たいのは「cmd+クリックが解決できる
+    /// 形すべてにメニューが出るか」なので、両 OS で同じ答えになる相対形で書く。
+    /// `\` の形の検出は `links` の単体 = #2435 が見る）。絶対パスは別テストに分ける
     #[test]
     fn 相対_行番号つき_ディレクトリ_空白入りのどれでもメニューが出る() {
         let dir = std::env::temp_dir().join(format!("tako_path_menu_{}", std::process::id()));
@@ -297,8 +296,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 絶対パス（`/` 始まり）。Windows のバックスラッシュ形式は検出対象外なので unix 限定
-    #[cfg(unix)]
+    /// 絶対パス（macOS は `/` 始まり、Windows は `C:\…` = #2435 から候補になったので両 OS で走る）
     #[test]
     fn 絶対パスでもメニューが出る() {
         let dir = std::env::temp_dir().join(format!("tako_path_menu_abs_{}", std::process::id()));
