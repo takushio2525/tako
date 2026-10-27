@@ -264,7 +264,11 @@ xattr -dr com.apple.quarantine /Applications/tako.app
 
 macOS は `/Applications/tako.app` をダブルクリック、または Dock / Launchpad から起動します。Windows はスタートメニューの「tako」から起動します。通常のターミナルと同じように、シェル（macOS は zsh など、Windows は PowerShell）が 1 ペイン開きます。
 
-**初回起動時は、タブバーの下に案内バナーが出ます。** 「セットアップを実行」を押すと新しいタブで `tako setup` が走り、「master を起動」を押すと新しいタブで `tako master` が起動します。バナーは一度閉じると再表示されません（`tako welcome show` でいつでも呼び戻せます）。同じ項目は <kbd>Cmd</kbd>+<kbd>K</kbd>（Windows は <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>）のコマンドパレットにも常設されています。
+**初回起動時は、タブバーの下に案内バナーが出ます。** 起動と同時に、手間のかからない初期設定（PATH・AI 連携の登録・指示ファイル）が自動で進みます。インターネットから何かを取って入れることはしません。
+
+続いてバナーに「次にやること」が 1 つ出ます。AI エージェント（Claude Code）が入っていなければ「Claude Code を入れる」、入っていてログインがまだなら「ログイン」のボタンです。入れるボタンは、実行するコマンドと置き場所をボタンの横に表示してから、新しいタブでそのコマンドを実行します。ログインのボタンはブラウザを開きます。どちらも、終わるとバナーが自動で次の段へ進み、最後に「master を起動」が出ます。
+
+やることが残っているあいだ、バナーは起動のたびに出ます。「あとで」はその回だけ閉じ、「今後表示しない」を押すと以後は出ません（`tako welcome show` でいつでも呼び戻せます）。同じ項目は <kbd>Cmd</kbd>+<kbd>K</kbd>（Windows は <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>P</kbd>）のコマンドパレットにも常設されています。
 
 <figure class="tako-shot">
 <img src="/img/welcome-banner.webp" alt="tako の初回起動時に表示されるバナー。1. tako setup、2. tako master の 2 ステップと、それぞれの実行ボタンが並んでいる" />

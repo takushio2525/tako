@@ -1982,7 +1982,7 @@ pub const MATRIX: &[Feature] = &[
         macos: Support::Supported,
         windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "項目 88（バナーと案内コマンドの取得）に加え、2026-09-09 の Windows 11 実機で「セットアップを実行」ボタンから新しいタブが開き tako.exe setup が実際に走った（ゼロスタート導入の 3/3 まで到達）。投入経路の #899 は PR #931（2026-08-27 merge）で ShellDialect::command_word 経由になり、LF 側は #897 の番犬が禁じている",
+            "項目 88（バナーと案内コマンドの取得）に加え、2026-09-09 の Windows 11 実機で「セットアップを実行」ボタンから新しいタブが開き tako.exe setup が実際に走った（ゼロスタート導入の 3/3 まで到達）。投入経路の #899 は PR #931（2026-08-27 merge）で ShellDialect::command_word 経由になり、LF 側は #897 の番犬が禁じている。#1510 の導線（自動の段・次にやることのボタン）はボタンが同じ command_word 経由でタブへ打つ形で、PowerShell の形は welcome の単体テストが縛る（Windows 実機の通しは未実測）",
         ),
     },
     Feature {

@@ -165,6 +165,24 @@ pub struct SetupAnswers {
     /// Claude Code の画面の UI（tako mod の ui.json。#1960）。省略時は今の値のまま。
     /// 検証は `tako mod ui` / MCP `tako_mod` の `action=ui` と同じ 1 実装
     pub mod_ui: Option<tako_core::claude_mod_ui::UiAnswers>,
+    /// ネットワークから取って入れる段（エージェント CLI の公式インストーラ・brew / winget の
+    /// 依存導入）を走らせるか。`false` = 走らせず残り作業にする（#1510。GUI の初回起動の
+    /// 自動実行がこれで呼ぶ = **同意なしにネットワークのスクリプトを実行しない**）。
+    /// 省略時は従来どおり（`--yes` / 非 TTY は同意扱いで入れる）
+    pub install: Option<bool>,
+}
+
+/// setup の締めの要約の見出し（#1510）。CLI の表示と、GUI が自動実行の結果を読む
+/// [`crate::welcome::parse_auto_summary`] が同じ文面を見る（正本はここ 1 か所）
+pub const SUMMARY_UNCHANGED: &str = "セットアップ結果: 変更なし（前回の設定は最新）";
+/// 変更があったときの見出し。この後ろに [`SetupPlan::render_diff`] の行（`  - ` 始まり）が続く
+pub const SUMMARY_CHANGED_HEADER: &str = "セットアップ結果（変更したのはこれだけです）:";
+
+impl SetupAnswers {
+    /// ネットワークから取って入れる段を走らせてよいか（#1510。省略は従来どおり許す）
+    pub fn allows_install(&self) -> bool {
+        self.install != Some(false)
+    }
 }
 
 /// 設定共有の回答（Issue #513）

@@ -2183,6 +2183,20 @@ pub(crate) struct LspGotoMenu {
     landing: tako_control::LspGotoLanding,
 }
 
+/// dispatch の内側（`tako welcome next|auto`・確かめの着地）で頼まれた初回起動の導線の続き（#1510）。
+/// ペインを開く・background を起こすには Context が要るので、`after_dispatch` が消化する
+#[derive(Default)]
+struct WelcomePending {
+    /// 「次にやること」のボタンの中身
+    launch: Option<tako_control::welcome::Launch>,
+    /// 自動の段を走らせる
+    auto: bool,
+    /// 見張りのループを立てる
+    watch: bool,
+    /// 「次にやること」を確かめる（`tako welcome show` で出し直したとき = まだ確かめていない）
+    probe: bool,
+}
+
 struct TakoApp {
     workspace: Workspace,
     terminals: HashMap<PaneId, TerminalSession>,
@@ -3005,6 +3019,17 @@ struct TakoApp {
     /// 起動時に settings.json の実在で判定し（`welcome::should_show_on_launch`）、
     /// 閉じたら settings.json へ永続化する
     welcome_banner: bool,
+    /// 初回起動の導線（#1510）を動かすか。起動時に 1 回決める（偽なら #549 のバナーのまま）
+    welcome_live: bool,
+    /// 導線の状態（自動の段・「次にやること」・見張り）。遷移の正本は `tako_control::welcome`
+    welcome_onboarding: tako_control::welcome::Onboarding,
+    /// 導線のボタンで開いたペインと、そのとき押した段（同じ段をもう一度押したら打ち直さずに見せる）
+    welcome_pane: Option<(PaneId, &'static str)>,
+    /// dispatch の内側で頼まれた導線の続き（Context が要るので `after_dispatch` で消化する）
+    welcome_pending: WelcomePending,
+    /// 見張りのループが走っているか / 確かめが飛んでいるか（重ねて撃たない）
+    welcome_watch_running: bool,
+    welcome_probe_inflight: bool,
     /// UI 表示モード（Issue #691 / #694。settings.json `ui_mode` 永続化）。
     /// 既定 terminal = 従来どおりの描画。gui のときだけ判定表（`tako_core::ui_mode`）で
     /// ペインごとに表示を出し分ける
@@ -5324,6 +5349,12 @@ impl TakoApp {
             // 起動処理は settings を読むだけで書かないため、ここでの判定は
             // 「このプロセスが最初の 1 回目か」を正しく反映する
             welcome_banner: tako_control::welcome::should_show_on_launch(),
+            welcome_live: tako_control::welcome::onboarding_enabled(),
+            welcome_onboarding: tako_control::welcome::Onboarding::default(),
+            welcome_pane: None,
+            welcome_pending: WelcomePending::default(),
+            welcome_watch_running: false,
+            welcome_probe_inflight: false,
             // #694: 表示モードは settings.json 由来（既定 terminal）。
             // 復元（layout.json）とは無関係なので persist の挙動には影響しない
             ui_mode: tako_control::settings::load().ui_mode(),
@@ -6024,6 +6055,12 @@ impl TakoApp {
         // #1679: 言語サーバの診断の知らせを受けて波線・右パネルを描き直す
         app.spawn_lsp_diagnostics_loop(cx);
         app.spawn_lsp_state_loop(cx);
+
+        // #1510: 初回起動の導線（副作用の小さい setup の段を自動で走らせ、「次にやること」を
+        // 確かめる）。セカンダリでは走らせない（同じ HOME の設定を 2 つのプロセスで触らない）
+        if !secondary {
+            app.start_welcome_onboarding(cx);
+        }
 
         // #724 の W1: Windows は Web ビューの生成を App の借用の外で 1 本ずつ行う常駐タスクを立てる
         // （macOS は従来どおり同期で生成するので立てない）
@@ -7800,6 +7837,8 @@ impl TakoApp {
         }
         // #2203: dispatch の内側（`tako panel --view usage` / 同期の `show`）で頼まれた usage の読み直し
         self.drain_usage_pending(cx);
+        // #1510: dispatch の内側（`tako welcome next|auto` / 確かめの着地）で頼まれた導線の続き
+        self.drain_welcome_pending(cx);
         // セッション起動後の遅延書き込み（orchestrator spawn の claude 起動コマンド等）
         for (pane, data) in std::mem::take(&mut self.pending_writes) {
             if let Some(session) = self.terminals.get(&pane) {
@@ -13539,13 +13578,24 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) {
         let line = tako_control::welcome::launch_command_line(subcommand);
+        self.open_command_tab(tab_title, line, cx);
+    }
+
+    /// 素のログインシェルのタブを作り、そこへコマンド行を送る（[`Self::launch_tako_command`] と
+    /// #1510 の導線のボタンの共通形）。開いたペインを返す（開けなければ None）
+    fn open_command_tab(
+        &mut self,
+        tab_title: &str,
+        line: String,
+        cx: &mut Context<Self>,
+    ) -> Option<PaneId> {
         let pane = Pane::new(PaneOrigin::User);
         let pane_id = pane.id();
         self.workspace.create_tab(tab_title.to_string(), pane);
         if let Err(e) = self.spawn_session(pane_id, SpawnOptions::default(), cx) {
             eprintln!("warning: {tab_title} タブを開けない: {e}");
             self.remove_pane(pane_id, cx);
-            return;
+            return None;
         }
         // #899: 新しいペインは器（psmux）が起動直後の入力を落とすことがあるので、
         // 生 write ではなく #640 の送達確認つき経路へ積む（行末も CR になる）
@@ -13555,18 +13605,262 @@ impl TakoApp {
         self.scroll_active_tab_into_view();
         self.sync_filetree_roots();
         cx.notify();
+        Some(pane_id)
     }
 
-    /// バナーの「セットアップを実行」/ パレットの同項目
+    /// バナーの「セットアップを実行」/ パレットの同項目。
+    /// #1510 の導線が動いているときはバナーを閉じない（残り作業を出し続ける）
     pub(crate) fn run_setup_command(&mut self, cx: &mut Context<Self>) {
-        self.dismiss_welcome_banner(cx);
+        if !self.welcome_live {
+            self.dismiss_welcome_banner(cx);
+        }
         self.launch_tako_command("setup", "setup", cx);
     }
 
-    /// バナーの「master を起動」/ パレットの同項目
+    /// バナーの「master を起動」/ パレットの同項目。
+    /// #1510 の導線が動いているときは「以後出さない」ではなく導線を終える（master を起動した = 完了）
     pub(crate) fn run_master_command(&mut self, cx: &mut Context<Self>) {
-        self.dismiss_welcome_banner(cx);
+        if self.welcome_live {
+            self.finish_welcome_onboarding(cx);
+        } else {
+            self.dismiss_welcome_banner(cx);
+        }
         self.launch_tako_command("master", "master", cx);
+    }
+
+    // --- 初回起動の導線（Issue #1510）--------------------------------------
+
+    /// 起動時の入口。バナーを出す起動（初回 / 導線の途中）でだけ動く。
+    /// setup が一度も最後まで走っていなければ自動の段から、走っていれば確かめるだけ
+    /// （= 2 回目の起動で自動の段を繰り返さない。失敗していれば残りから再開する）
+    fn start_welcome_onboarding(&mut self, cx: &mut Context<Self>) {
+        if !self.welcome_banner || !self.welcome_live {
+            return;
+        }
+        // 初回起動（settings.json がまだ無い）なら導線を始めた印を残す（以後の起動でも出し続ける）
+        if !tako_control::settings::load().welcome_onboarding {
+            if let Err(e) = tako_control::welcome::begin_onboarding() {
+                eprintln!("warning: 初回起動の導線の状態を保存できない: {e}");
+            }
+        }
+        let completed = tako_control::setup::load_config()
+            .map(|config| config.setup.completed)
+            .unwrap_or(false);
+        if completed {
+            self.probe_welcome(cx);
+        } else {
+            self.start_welcome_auto(cx);
+        }
+    }
+
+    /// 自動の段（ネットワークの導入を含まない setup）を background で走らせる。
+    /// 終わったら「次にやること」を確かめ直す。既に走っていれば何もしない
+    fn start_welcome_auto(&mut self, cx: &mut Context<Self>) {
+        if self.welcome_onboarding.auto_running() {
+            return;
+        }
+        self.welcome_onboarding.auto = tako_control::welcome::AutoState::Running;
+        let task = cx
+            .background_executor()
+            .spawn(async { tako_control::welcome::run_auto_setup() });
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+            let _ = this.update(cx, |app: &mut TakoApp, cx| {
+                app.welcome_onboarding.finish_auto(outcome);
+                app.probe_welcome(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 「次にやること」を確かめる。CLI / MCP の `tako welcome` と同じ要求を投げる
+    /// （確かめは offload の background・段の受け取りは着地 = `welcome_apply_step`）
+    fn probe_welcome(&mut self, cx: &mut Context<Self>) {
+        if self.welcome_probe_inflight {
+            return;
+        }
+        self.welcome_probe_inflight = true;
+        self.dispatch_off_ui(
+            tako_control::protocol::Request::Welcome {
+                action: Some("status".into()),
+            },
+            PaneOrigin::User,
+            cx,
+            |app, result, cx| {
+                app.welcome_probe_inflight = false;
+                if let Err(e) = result {
+                    eprintln!("warning: 初回起動の導線の状態を確かめられない: {e}");
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// バナーの「次にやること」のボタン。CLI / MCP の `tako welcome next` と同じ要求
+    /// （押した時点の状態を確かめ直してから、その段のボタンの中身を流す）
+    pub(crate) fn press_welcome_next(&mut self, cx: &mut Context<Self>) {
+        self.dispatch_off_ui(
+            tako_control::protocol::Request::Welcome {
+                action: Some("next".into()),
+            },
+            PaneOrigin::User,
+            cx,
+            |_, result, cx| {
+                if let Err(e) = result {
+                    eprintln!("warning: 次にやることを進められない: {e}");
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// バナーの「あとで」。いまだけ閉じる（導線が続いていれば次の起動でまた出る）。
+    /// CLI / MCP の `tako welcome hide` と同じ要求
+    pub(crate) fn hide_welcome_banner(&mut self, cx: &mut Context<Self>) {
+        if let Err(e) = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::Welcome {
+                action: Some("hide".into()),
+            },
+            PaneOrigin::User,
+        ) {
+            eprintln!("warning: ウェルカムバナーを閉じられない: {e}");
+        }
+        cx.notify();
+    }
+
+    /// 自動の段の全文（`<data_dir>/setup/first-run.log`）を新しいタブのプレビューで開く
+    pub(crate) fn open_welcome_log(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = tako_control::welcome::auto_log_path().filter(|p| p.is_file()) else {
+            return;
+        };
+        let result = tako_control::dispatch(
+            self,
+            tako_control::protocol::Request::OpenFile {
+                pane: None,
+                path: path.display().to_string(),
+                mode: None,
+                direction: None,
+                focus: Some(true),
+                new_tab: true,
+                line: None,
+                column: None,
+            },
+            PaneOrigin::User,
+        );
+        if let Err(e) = result {
+            eprintln!("warning: 初期設定の結果を開けない: {e}");
+        }
+        self.drain_pending_highlights(cx);
+        cx.notify();
+    }
+
+    /// 導線を終える（master を起動した）。バナーを閉じ、以後の起動では出さない
+    fn finish_welcome_onboarding(&mut self, cx: &mut Context<Self>) {
+        self.welcome_banner = false;
+        self.welcome_onboarding.watch_until = None;
+        // セルフテスト中はユーザー設定を汚さない（dismiss_welcome_banner と同方針）
+        if std::env::var_os("TAKO_SELF_TEST").is_none() {
+            if let Err(e) = tako_control::welcome::finish_onboarding() {
+                eprintln!("warning: 初回起動の導線の状態を保存できない: {e}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// dispatch の内側で頼まれた続きを消化する（`after_dispatch` から）
+    fn drain_welcome_pending(&mut self, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.welcome_pending);
+        if let Some(launch) = pending.launch {
+            self.run_welcome_launch(launch, cx);
+        }
+        if pending.auto {
+            self.start_welcome_auto(cx);
+        }
+        if pending.watch {
+            self.ensure_welcome_watch(cx);
+        }
+        if pending.probe {
+            self.probe_welcome(cx);
+        }
+    }
+
+    /// 「次にやること」のボタンの中身を流す
+    fn run_welcome_launch(
+        &mut self,
+        launch: tako_control::welcome::Launch,
+        cx: &mut Context<Self>,
+    ) {
+        use tako_control::welcome::Launch;
+        match launch {
+            Launch::Master => self.run_master_command(cx),
+            Launch::Auto => self.start_welcome_auto(cx),
+            Launch::Pane { title, line } => {
+                let kind = self
+                    .welcome_onboarding
+                    .step
+                    .as_ref()
+                    .map_or("unknown", tako_control::welcome::NextStep::kind);
+                let alive = self
+                    .welcome_pane
+                    .filter(|(pane, _)| self.terminals.contains_key(pane));
+                let pane = match alive {
+                    // 同じ段をもう一度押した = まだそのタブで進めている。打ち直さずにそのタブを見せる
+                    Some((pane, pressed)) if pressed == kind => {
+                        self.jump_to_pane(pane, cx);
+                        return;
+                    }
+                    // 前の段（入れる）が済んだタブへ次の段（ログイン）を打つ = 同じ画面で続ける
+                    Some((pane, _)) => {
+                        self.jump_to_pane(pane, cx);
+                        self.queue_command_flow(pane, line);
+                        pane
+                    }
+                    None => match self.open_command_tab(title, line, cx) {
+                        Some(pane) => pane,
+                        None => return,
+                    },
+                };
+                self.welcome_pane = Some((pane, kind));
+                self.welcome_onboarding
+                    .start_watch(std::time::Instant::now());
+                self.ensure_welcome_watch(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// ボタンで開いたタブの仕事（導入・ログイン）の終わりを見張る。
+    /// 一定間隔で確かめ、段が進むか期限が来るかバナーが閉じたら止まる
+    fn ensure_welcome_watch(&mut self, cx: &mut Context<Self>) {
+        if self.welcome_watch_running {
+            return;
+        }
+        self.welcome_watch_running = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(tako_control::welcome::WATCH_INTERVAL)
+                .await;
+            let keep = this
+                .update(cx, |app: &mut TakoApp, cx| {
+                    let keep = app.welcome_banner
+                        && app.welcome_onboarding.watching(std::time::Instant::now());
+                    if keep {
+                        app.probe_welcome(cx);
+                    } else {
+                        app.welcome_watch_running = false;
+                        cx.notify();
+                    }
+                    keep
+                })
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        })
+        .detach();
     }
 
     /// バナーを閉じて「次回から出さない」を永続化する。
@@ -26217,7 +26511,36 @@ impl UiStateHost for TakoApp {
     }
 
     fn set_welcome_banner_visible(&mut self, visible: bool) {
+        // #1510: 導線の形で出し直したら「次にやること」を確かめる（出しっぱなしの「確かめています」にしない）
+        if visible && !self.welcome_banner && self.welcome_live {
+            self.welcome_pending.probe = true;
+        }
         self.welcome_banner = visible;
+    }
+
+    // #1510: 初回起動の導線。判定と遷移は `tako_control::welcome`、ここは状態の受け渡しと
+    // 「Context が要る続き」を積むだけ（消化は `after_dispatch` → `drain_welcome_pending`）
+    fn welcome_onboarding(&self) -> Option<tako_control::welcome::Onboarding> {
+        Some(self.welcome_onboarding.clone())
+    }
+
+    fn welcome_apply_step(&mut self, step: tako_control::welcome::NextStep) {
+        let effects = self
+            .welcome_onboarding
+            .apply_step(step, std::time::Instant::now());
+        self.welcome_pending.auto |= effects.run_auto;
+        self.welcome_pending.watch |= effects.watch;
+    }
+
+    fn welcome_launch(&mut self, launch: tako_control::welcome::Launch) -> Result<(), String> {
+        self.welcome_pending.launch = Some(launch);
+        Ok(())
+    }
+
+    fn welcome_start_auto(&mut self) -> bool {
+        let starts = !self.welcome_onboarding.auto_running() && !self.welcome_pending.auto;
+        self.welcome_pending.auto = true;
+        starts
     }
 
     // #666: AI コマンド提案カード。判定・検証・実行は dispatch 側に置き、

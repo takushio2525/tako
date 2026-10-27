@@ -172,6 +172,12 @@ pub struct Settings {
     /// これはユーザーが明示的に閉じた記録。CLI / MCP `tako welcome` から操作できる
     #[serde(default)]
     pub welcome_dismissed: bool,
+    /// 初回起動から始まった導線（#1510）が続いているか（既定 false）。
+    /// 初回起動で立ち、master を起動したら倒れる。立っているあいだはバナーが毎回出る
+    /// （残り作業 = エージェント CLI の導入・ログイン を出し続ける）。**既存ユーザーの
+    /// ファイルには無い = serde の default で false** なので、#1510 より前から使っている人には出ない
+    #[serde(default)]
+    pub welcome_onboarding: bool,
     /// 更新通知カードを閉じたときの対象バージョン（Issue #616。None = 閉じていない）。
     /// 値は「どのバージョンを案内していたか」を表すキー（例 `"stable:0.6.1 test:0.7.0-test.1"`）。
     /// 新しいバージョンを検知するとキーが変わり、カードは再び出る（= バージョン単位の抑止）
@@ -312,6 +318,7 @@ impl Default for Settings {
             show_hidden_files: false,
             telemetry: false,
             welcome_dismissed: false,
+            welcome_onboarding: false,
             update_card_dismissed: None,
             limit_service: default_limit_service(),
             language: default_language(),
@@ -915,6 +922,7 @@ mod tests {
             show_hidden_files: true,
             telemetry: true,
             welcome_dismissed: true,
+            welcome_onboarding: true,
             update_card_dismissed: Some("stable:9.9.9".into()),
             limit_service: "codex".into(),
             language: "en".into(),

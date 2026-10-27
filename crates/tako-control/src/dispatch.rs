@@ -3958,6 +3958,28 @@ pub enum OffloadJob {
     /// `git diff` / `git diff-tree` は上限つきで background。置くのは
     /// [`OffloadContinuation::PreviewChangelogDiff`] で UI スレッドへ戻す
     PreviewChangelogDiff(Box<PreviewChangelogDiffJob>),
+    /// 初回起動の導線の「次にやること」の確かめ（#1510）。ログインシェル・認証の問い合わせ
+    /// （[`crate::welcome::probe`]）は background、段を GUI へ渡してボタンを押すのは
+    /// [`OffloadContinuation::Welcome`] で UI スレッドへ戻す
+    Welcome(WelcomeProbeFor),
+}
+
+/// 何のために「次にやること」を確かめるか（#1510）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WelcomeProbeFor {
+    /// 状態を返す（GUI の見張り・`tako welcome`）
+    Status,
+    /// その段のボタンを押す（`tako welcome next`・バナーのボタン）
+    Next,
+}
+
+/// 確かめた段の着地（[`welcome_land`]。#1510）
+pub struct WelcomeLanding {
+    probe_for: WelcomeProbeFor,
+    step: crate::welcome::NextStep,
+    /// 押すときのボタンの中身（コマンド行）。**background で組む**: tako の実行ファイルの解決
+    /// （`resolve_tako_binary`）は安定版が無ければログインシェルの `command -v` を待つ（#1984）
+    launch: Option<crate::welcome::Launch>,
 }
 
 /// プレビューの変更履歴を取るジョブ（#2014。[`preview_changelog_prepare`] が UI スレッドで作る）
@@ -4126,6 +4148,8 @@ pub enum OffloadContinuation {
     PreviewChangelog(Box<PreviewChangelogLanding>),
     /// 取った 1 行の diff を変更履歴へ置く（[`preview_changelog_diff_land`]。#2150）
     PreviewChangelogDiff(Box<PreviewChangelogDiffLanding>),
+    /// 確かめた「次にやること」を GUI へ渡す・押す（[`welcome_land`]。#1510）
+    Welcome(Box<WelcomeLanding>),
 }
 
 impl OffloadContinuation {
@@ -4143,6 +4167,8 @@ impl OffloadContinuation {
             | Self::UserTaskStatus(_)
             | Self::PreviewChangelog(_)
             | Self::PreviewChangelogDiff(_) => false,
+            // #1510: 押す（ペインを開く・master を起こす）ときだけタブが増える
+            Self::Welcome(landing) => landing.probe_for == WelcomeProbeFor::Next,
             // #2086: 同期の腕と同じ判定（返答だけが真 = master を起こすとタブが増える）
             Self::UserTaskStored(landing) => matches!(**landing, UserTaskLanding::Responded { .. }),
             // #2182: master を起こす着地（タブが増える）
@@ -4212,6 +4238,7 @@ pub fn finish_offload(
         OffloadContinuation::PreviewChangelogDiff(landing) => {
             preview_changelog_diff_land(host, *landing)
         }
+        OffloadContinuation::Welcome(landing) => welcome_land(host, *landing),
     }
 }
 
@@ -4726,6 +4753,15 @@ pub fn prepare_offload(
         Request::UserTask { action, via, .. } if user_task_offloads(action, via.as_deref()) => {
             Some(user_task_offload_prepare(host, request))
         }
+        // #1510: 「次にやること」の確かめ（ログインシェル・認証の問い合わせ）を UI スレッドで待たない。
+        // status は導線が動いているときだけ確かめる（#549 の形のままなら読むだけ = 同期の腕）
+        Request::Welcome { action } => match action.as_deref().unwrap_or("status") {
+            "status" if crate::welcome::onboarding_enabled() => {
+                Some(Ok(OffloadJob::Welcome(WelcomeProbeFor::Status)))
+            }
+            "next" => Some(Ok(OffloadJob::Welcome(WelcomeProbeFor::Next))),
+            _ => None,
+        },
         // 呼び出し元の pid 祖先辿り・CLI の所在確認・再起動の計画の走査を先取りする。
         // 先取りが要らない（pid の無い self 等）ときは `None` = 同期の腕（子プロセスを起こさない）。
         // 要るものの判断（`probe_needs`）も空の答えの内側で回す（判断の途中で待たない）
@@ -4831,6 +4867,17 @@ impl OffloadJob {
                 OffloadOutcome::OnUi(OffloadContinuation::PreviewChangelogDiff(Box::new(
                     job.run(tako_core::git::changelog_timeout()),
                 )))
+            }
+            // #1510: 確かめ（待つ）は background、GUI へ渡す・押すのは UI スレッドへ戻す
+            OffloadJob::Welcome(probe_for) => {
+                let step = crate::welcome::probe();
+                let launch = (probe_for == WelcomeProbeFor::Next)
+                    .then(|| crate::welcome::launch_for(&step, crate::welcome::default_dialect()));
+                OffloadOutcome::OnUi(OffloadContinuation::Welcome(Box::new(WelcomeLanding {
+                    probe_for,
+                    step,
+                    launch,
+                })))
             }
             other => OffloadOutcome::Reply(other.run_reply()),
         }
@@ -4998,6 +5045,10 @@ impl OffloadJob {
             )),
             OffloadJob::PreviewChangelogDiff(_) => Err(DispatchError::Operation(
                 "変更履歴の diff は run_staged で走らせる（変更履歴へ置くのに UI スレッドの続きが要る）"
+                    .into(),
+            )),
+            OffloadJob::Welcome(_) => Err(DispatchError::Operation(
+                "初回起動の導線の確かめは run_staged で走らせる（段を GUI へ渡すのに UI スレッドの続きが要る）"
                     .into(),
             )),
         }
@@ -11539,6 +11590,23 @@ fn dispatch_inner(
             match action {
                 "status" => {}
                 "show" => host.set_welcome_banner_visible(true),
+                // #1510: いまだけ閉じる（導線が続いていれば次の起動でまた出る）
+                "hide" => host.set_welcome_banner_visible(false),
+                // #1510: 「次にやること」を押す。IPC / GUI のボタンは offload が確かめてから
+                // [`welcome_land`] へ来る。ここは直の呼び手（同じスレッドで確かめる）
+                "next" => {
+                    let step = crate::welcome::probe();
+                    let launch = crate::welcome::launch_for(&step, crate::welcome::default_dialect());
+                    return welcome_next(host, step, launch);
+                }
+                // #1510: 自動の段（ネットワークの導入を含まない setup）をもう一度走らせる。
+                // 走るのは GUI の background で、結果は status の onboarding.auto で読む
+                "auto" => {
+                    let started = host.welcome_start_auto();
+                    let mut out = welcome_status(host);
+                    out["started"] = json!(started);
+                    return Ok(out);
+                }
                 "dismiss" => {
                     host.set_welcome_banner_visible(false);
                     // ユーザー設定を汚さない（Theme / LimitService と同方針）
@@ -11553,7 +11621,7 @@ fn dispatch_inner(
                 }
                 other => {
                     return Err(DispatchError::InvalidParams(format!(
-                        "不明な action: {other:?}（status / show / dismiss のいずれか）"
+                        "不明な action: {other:?}（status / show / hide / dismiss / next / auto のいずれか）"
                     )))
                 }
             }
@@ -11565,13 +11633,57 @@ fn dispatch_inner(
 /// ウェルカムバナーの状態 + 案内コマンド（Issue #549）。
 /// コマンドは #322 の最簡形で返す（AI がユーザーへそのまま提示できる）
 fn welcome_status(host: &dyn ControlHost) -> Value {
+    let settings = crate::settings::load();
     json!({
         "visible": host.welcome_banner_visible(),
-        "dismissed": crate::settings::load().welcome_dismissed,
+        "dismissed": settings.welcome_dismissed,
         "first_launch": crate::welcome::is_first_launch(),
         "setup_command": crate::welcome::SETUP_COMMAND,
         "master_command": crate::welcome::MASTER_COMMAND,
+        // #1510: 導線（初回起動の自動の段・「次にやること」）。`enabled` が偽なら #549 の形のまま
+        "onboarding": {
+            "enabled": crate::welcome::onboarding_enabled(),
+            "active": settings.welcome_onboarding,
+            "state": host
+                .welcome_onboarding()
+                .map(|o| o.to_json(std::time::Instant::now())),
+        },
     })
+}
+
+/// 確かめた「次にやること」を押す（#1510）。段を GUI へ渡してから、その段のボタンの中身を流す。
+/// ボタンの中身は呼び手が組んで渡す（offload の腕は background で組む = UI スレッドで待たない）
+fn welcome_next(
+    host: &mut dyn ControlHost,
+    step: crate::welcome::NextStep,
+    launch: crate::welcome::Launch,
+) -> Result<Value, DispatchError> {
+    let launched = json!({ "kind": step.kind(), "command": step.command() });
+    host.welcome_apply_step(step);
+    host.welcome_launch(launch)
+        .map_err(DispatchError::Operation)?;
+    let mut out = welcome_status(host);
+    out["launched"] = launched;
+    Ok(out)
+}
+
+/// background で確かめた段の着地（#1510）
+fn welcome_land(
+    host: &mut dyn ControlHost,
+    landing: WelcomeLanding,
+) -> Result<Value, DispatchError> {
+    match landing.probe_for {
+        WelcomeProbeFor::Status => {
+            host.welcome_apply_step(landing.step);
+            Ok(welcome_status(host))
+        }
+        WelcomeProbeFor::Next => match landing.launch {
+            Some(launch) => welcome_next(host, landing.step, launch),
+            None => Err(DispatchError::Operation(
+                "ボタンの中身が組まれていない（background の段を通っていない）".into(),
+            )),
+        },
+    }
 }
 
 // --- AI コマンド提案カード (#666) ---
@@ -19289,7 +19401,7 @@ pub const STABLE_APP_BINARY: &str = "/Applications/tako.app/Contents/MacOS/tako"
 
 /// tako CLI の実行ファイル名。Windows は `tako.exe`（`EXE_SUFFIX` は空文字なので
 /// unix では従来どおり `tako`）。**`cfg` を書かずに済ませるための std 定数**
-fn tako_cli_file_name() -> String {
+pub(crate) fn tako_cli_file_name() -> String {
     format!("tako{}", std::env::consts::EXE_SUFFIX)
 }
 
@@ -19341,7 +19453,7 @@ fn resolve_tako_binary_with(
 /// それでも終わらない形（導入器が固まる等）へ最後の蓋をする。
 /// 打ち切りは失敗にせず `completed: false` + `timed_out: true` で返す
 /// （何が起きたかを呼び手＝ AI / CLI が読めるようにする）
-fn run_setup_cli(tako_bin: &str, answers_json: &str) -> Result<Value, DispatchError> {
+pub(crate) fn run_setup_cli(tako_bin: &str, answers_json: &str) -> Result<Value, DispatchError> {
     run_setup_cli_within(
         tako_bin,
         answers_json,
@@ -48887,9 +48999,99 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            format!("{err:?}").contains("status / show / dismiss"),
+            format!("{err:?}").contains("status / show / hide / dismiss / next / auto"),
             "選べる値を案内すること: {err:?}"
         );
+    }
+
+    /// #1510: 「あとで」はいまだけ閉じる（`dismissed` を書かない = 導線が続いていれば次の起動でまた出る）
+    #[test]
+    fn issue1510_welcomeのhideはいまだけ閉じる() {
+        let mut host = MockHost::new();
+        host.set_welcome_banner_visible(true);
+        let v = dispatch(
+            &mut host,
+            Request::Welcome {
+                action: Some("hide".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["visible"], false);
+        assert!(!host.welcome_banner_visible());
+        assert!(v["onboarding"]["enabled"].is_boolean(), "{v}");
+        assert!(v["onboarding"]["active"].is_boolean(), "{v}");
+    }
+
+    /// #1510: GUI の居ないホストでは自動の段も「次にやること」のボタンも押せない（黙って成功にしない）
+    #[test]
+    fn issue1510_welcomeのautoとnextはguiが居ないと押せない() {
+        let mut host = MockHost::new();
+        let v = dispatch(
+            &mut host,
+            Request::Welcome {
+                action: Some("auto".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(v["started"], false, "{v}");
+        // 確かめた段の着地（offload の続き）。押す先が無ければ断る
+        let landing = WelcomeLanding {
+            probe_for: WelcomeProbeFor::Next,
+            step: crate::welcome::NextStep::Master {
+                agent: tako_core::platform::agent_install::AgentKind::Claude,
+            },
+            launch: Some(crate::welcome::Launch::Master),
+        };
+        assert!(matches!(
+            welcome_land(&mut host, landing),
+            Err(DispatchError::Operation(_))
+        ));
+        // 状態の着地は段を渡して状態を返すだけ
+        let landing = WelcomeLanding {
+            probe_for: WelcomeProbeFor::Status,
+            step: crate::welcome::NextStep::Unknown { reason: "x".into() },
+            launch: None,
+        };
+        let v = welcome_land(&mut host, landing).unwrap();
+        assert_eq!(v["onboarding"]["state"], serde_json::Value::Null, "{v}");
+    }
+
+    /// #1510: 「次にやること」の確かめ（ログインシェル・認証の問い合わせ）は UI スレッドで待たない。
+    /// status は導線が動いているときだけ確かめる（テストプロセス = 検証プロセスは既定で動かさない）
+    #[test]
+    fn issue1510_welcomeの確かめはbackgroundへ出す() {
+        let mut host = MockHost::new();
+        let next = prepare_offload(
+            &mut host,
+            &Request::Welcome {
+                action: Some("next".into()),
+            },
+        );
+        assert!(matches!(
+            next,
+            Some(Ok(OffloadJob::Welcome(WelcomeProbeFor::Next)))
+        ));
+        // 走らせた人の env（`TAKO_FIRST_RUN`）で結果が変わらないよう、判断の口と突き合わせる（#2391）
+        let status = prepare_offload(&mut host, &Request::Welcome { action: None });
+        assert_eq!(
+            status.is_some(),
+            crate::welcome::onboarding_enabled(),
+            "導線を動かさないなら読むだけ（同期の腕）"
+        );
+        for action in ["show", "hide", "dismiss", "auto"] {
+            assert!(
+                prepare_offload(
+                    &mut host,
+                    &Request::Welcome {
+                        action: Some(action.into()),
+                    },
+                )
+                .is_none(),
+                "{action} は確かめない"
+            );
+        }
     }
 
     #[test]
