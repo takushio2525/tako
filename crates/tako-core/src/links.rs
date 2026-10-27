@@ -710,8 +710,10 @@ fn is_windows_path_like(token: &str) -> bool {
         .strip_prefix(r"\\?\")
         .filter(|after| has_drive_prefix(after))
     {
+        // 切り出し安全: has_drive_prefix が先頭 3 バイトを ASCII（`C:\`）と確かめている
         Some(&after[2..])
     } else if has_drive_prefix(body) {
+        // 切り出し安全: has_drive_prefix が先頭 3 バイトを ASCII（`C:\`）と確かめている
         Some(&body[2..])
     } else if let Some(after) = body.strip_prefix(r"\\") {
         // UNC は `\\server\share` の 2 つが揃って初めて絶対パス
