@@ -94,6 +94,8 @@ pub mod remote_setup;
 pub mod remote_ssh;
 pub mod remote_tasks;
 pub mod resources;
+/// 復元の直後の全滅ガード（#641。全ペイン PTY 死亡で終了せず救済・連続したら復元を見送る）
+pub mod restore_guard;
 pub mod restore_report;
 pub mod resume_launch;
 pub mod run_configs;

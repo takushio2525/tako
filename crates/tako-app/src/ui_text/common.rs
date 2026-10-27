@@ -12,6 +12,10 @@ pub fn cancel() -> &'static str {
 pub fn restore() -> &'static str {
     tr!("復帰", "Restore")
 }
+/// 復元の直後に全ペインが終わったので立て直したシェルのタブ名（#641。理由は persist.log）
+pub fn restore_failed() -> &'static str {
+    tr!("復元できず", "Restore failed")
+}
 /// 結果表示を畳むボタン（アップデート画面の完了 / 失敗表示など。#616）
 pub fn close() -> &'static str {
     tr!("閉じる", "Close")

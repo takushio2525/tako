@@ -766,6 +766,20 @@ tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無
   dispatch → host の 1 実装。PTY の張り替えは `after_dispatch` が消化して応答を実際へ差し替える）。
   psmux（Windows）は attach クライアントの終わり方を実測していないので従来どおり。
   A/B は `TAKO_1857_LEGACY=1`、番犬は `crates/tako-control/tests/issue1857_backend_reattach_watchdog.rs`
+- **復元の直後の全滅で終了しない**（#641。2026-10-28）: 最後のタブが PTY 死亡で閉じると
+  `remove_tab_with` の LastTab 分岐が終了する（#30）。起動時に器へ繋いだペインが繋いだ直後に
+  全滅すると、次の起動も同じ復元で即終了するループになる（Windows の psmux で GUI が立ち上がらなかった）。
+  そこで LastTab 分岐は終了の前に `TakoApp::rescue_after_restore` を通し、判断は
+  `tako_control::restore_guard::Window::decide` の純関数 1 本に置く: 窓（`WINDOW` = 30 秒）は
+  復元・orphan 自動復帰の後に `arm_restore_guard` が器のペインの枚数で開き、入力
+  （`handle_key` / `paste_to_terminal` / 明示 close の `drop_backend_session_with` /
+  IPC の `counts_as_input`）で閉じる。救済は器を使わないシェルのタブ（`direct_spawn` を
+  `spawn_session` が 1 回だけ消費する）+ 死んだタブを Exited の close で外す（器は kill しない）+
+  `layout.json.rescued` への退避 + `restore-guard.json` の連続回数。連続が `SKIP_AFTER`（2）に
+  達した次の起動は `skip_restore_if_due` が layout の復元を見送る（復元の分岐の手前。
+  orphan 自動復帰はそのまま走るので、生きている器は「復帰」タブへ戻る）。
+  **器の不調そのもの（psmux の残骸）はここでは直さない**: 救済は「起動できない」を断つだけで、
+  捨てた器は次の起動の orphan 自動復帰がまた試す。A/B は `TAKO_641_LEGACY=1`
 - **共存のための conf**（`<data_dir>/tmux-backend.conf`、毎起動再生成）:
   `status off` / `prefix None`（tmux の UI・キー介入ゼロ）、`mouse on`（マウス要求
   アプリへの SGR 生転送に必要。**非マウスペインのスクロールは SGR ではなく

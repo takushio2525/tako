@@ -7563,6 +7563,8 @@ fn dispatch_inner(
                 // 起動時の復元で器（tmux セッション）が無いので刈り込んだペイン（#1858）。
                 // 件数は last_restore の行にも載る。会話の記録があれば `conversation` に系統名
                 "restore_pruned": host.persist_restore_pruned(),
+                // 復元の直後の全滅ガード（#641）: 窓・救済の行（どの器を捨てたか）・連続の記録・退避先
+                "restore_guard": host.restore_guard_status(),
                 // 起動時に orphan 自動復帰した tmux セッション数（Issue #191）
                 "recovered_count": host.recovered_sessions_count(),
                 // 保存の内訳（#1425）: calls / skipped（変化検出で省いた）/
