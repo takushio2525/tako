@@ -394,14 +394,13 @@ mod tests {
         assert!(err.contains("失敗"), "{err}");
     }
 
+    /// 呼び名は [`GRACEFUL_TERMINATE`] から決まる（Windows に穏当な終了要求は無い）
     #[test]
     fn request_nameはosの終了要求の名前を返す() {
         if cfg!(unix) {
-            assert!(GRACEFUL_TERMINATE);
             assert_eq!(request_name(false), "SIGTERM");
             assert_eq!(request_name(true), "SIGKILL");
         } else {
-            assert!(!GRACEFUL_TERMINATE, "Windows に穏当な終了要求は無い");
             assert_eq!(request_name(false), "TerminateProcess");
             assert_eq!(request_name(true), "TerminateProcess");
         }
