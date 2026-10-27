@@ -6851,6 +6851,7 @@ dependencies = [
  "tako-core",
  "thiserror 2.0.18",
  "tiny_http",
+ "toml 1.1.2+spec-1.1.0",
  "tracing",
  "tungstenite",
  "ureq",

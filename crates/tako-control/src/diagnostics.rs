@@ -445,7 +445,9 @@ fn shortest_bootstrap_remaining(states: &BootstrapStates) -> Option<Remaining> {
         .find(|(agent, _)| *agent == target)
         .map(|(_, state)| state)
     {
-        Some(Ok(state)) => RemainingKind::for_step(state.step, target).map(Remaining::new),
+        Some(Ok(state)) => RemainingKind::for_step(state.step, target)
+            .map(Remaining::new)
+            .map(|item| item.noting_state(state)),
         Some(Err(e)) => Some(Remaining::with_detail(
             RemainingKind::AgentStatusUnknown,
             vec![e.clone()],
@@ -1397,6 +1399,7 @@ mod tests {
             account_plan: authenticated.then(|| "max".to_string()),
             launcher_dir: std::path::PathBuf::from("/opt/fake/bin"),
             launcher_dir_on_path: step != crate::setup_bootstrap::Step::Path,
+            launcher_dir_on_process_path: step != crate::setup_bootstrap::Step::Path,
             profile: None,
             profile_has_block: false,
             shell: None,

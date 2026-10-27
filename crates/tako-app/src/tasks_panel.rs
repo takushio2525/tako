@@ -1111,7 +1111,7 @@ impl TakoApp {
     }
 
     /// 添付をファイルマネージャで表示する（`tako_file_op` と同じ dispatch）
-    fn user_task_reveal(&mut self, path: &str, cx: &mut Context<Self>) {
+    pub(crate) fn user_task_reveal(&mut self, path: &str, cx: &mut Context<Self>) {
         let request = Request::FileOp {
             op: FileOpKind::Reveal,
             path: path.to_string(),

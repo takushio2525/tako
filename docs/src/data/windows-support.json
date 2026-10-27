@@ -994,9 +994,9 @@
     {
       "key": "tako_web",
       "status": "pending",
-      "note_ja": "Web ビューは WebView2 側の巻き戻せない panic でアプリごと落ちるため開けない",
+      "note_ja": "Web ビューを開くとアプリごと落ちていた原因（WebView2 の生成中の二重借用と COM コールバックの中の unwrap）への手当てを入れたが、Windows 実機で未確認（#724）",
       "evidence": "measured",
-      "evidence_detail": "セルフテスト項目 71 は WebView2 の非巻き戻し panic（wry/src/webview2/mod.rs:910）でアプリごと落ちるためスキップ"
+      "evidence_detail": "修正前の実機の記録: panic.log に gpui の async_context.rs:65 の二重借用（CallWindowProcW が 2 段）、セルフテスト項目 71 で wry/src/webview2/mod.rs:910 の InvalidUri(Empty)。#724 で生成を App の借用の外へ出し・Windows では ipc を付けず・生成中に落ちた Web ビューを次の起動で保留にした。項目 71 は実機で通るまでスキップのまま"
     },
     {
       "key": "tako_welcome",

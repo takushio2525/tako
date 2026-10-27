@@ -8,10 +8,12 @@
 //! **新しい起動経路を足して `mcp_settings` を渡し忘れる**と、その経路の worker だけ黙って
 //! 全部持ち込む（単体テストは今の出力しか見ないので、同じ形の再発はソースの形で止める）。
 //!
+//! codex（#2418）も同じ 1 本道で、`WorkerLaunch::mcp_codex_off` → `-c mcp_servers.<名>.enabled=false`。
+//!
 //! 1. [`worker_を起動する経路は_mcp_settings_を渡している`] — spawn / git resolve / 再開の
-//!    `WorkerLaunch` が `mcp_settings:` を持ち、リテラルの `None` ではない
-//! 2. [`止める設定の組み立ては1実装しかない`] — `deniedMcpServers` を書く製品コードが
-//!    `worker_mcp.rs` だけ（経路ごとに写しが増えない）
+//!    `WorkerLaunch` が `mcp_settings:` と `mcp_codex_off:` を持ち、リテラルの `None` / 空ではない
+//! 2. [`止める設定の組み立ては1実装しかない`] — `deniedMcpServers` と codex の `enabled=false` を書く
+//!    製品コードが `worker_mcp.rs` だけ（経路ごとに写しが増えない）
 
 use std::path::{Path, PathBuf};
 
@@ -97,15 +99,21 @@ fn worker_を起動する経路は_mcp_settings_を渡している() {
                 !block.contains("mcp_settings: None"),
                 "{rel}: 起動経路の WorkerLaunch が mcp_settings: None = user scope の MCP を全部持ち込む（#2412）:\n{block}"
             );
+            // #2418: codex の worker は `mcp_codex_off` で止める（渡し忘れ = user 設定の MCP を全部持ち込む）
+            assert!(
+                block.contains("mcp_codex_off: &worker_mcp.codex_off"),
+                "{rel}: WorkerLaunch が mcp_codex_off に worker_mcp::prepare の結果を渡していない = この経路の codex worker は user 設定の MCP を全部持ち込む（#2418）:\n{block}"
+            );
         }
     }
 }
 
-/// 2: 止める設定（`deniedMcpServers`）の組み立ては `worker_mcp.rs` の 1 実装だけ
+/// 2: 止める設定（`deniedMcpServers` と codex の `enabled=false`）の組み立ては `worker_mcp.rs` の 1 実装だけ
 #[test]
 fn 止める設定の組み立ては1実装しかない() {
     let dir = workspace_file("crates/tako-control/src");
     let mut writers = Vec::new();
+    let mut codex_writers = Vec::new();
     let mut stack = vec![dir.clone()];
     while let Some(d) = stack.pop() {
         for entry in std::fs::read_dir(&d).unwrap().flatten() {
@@ -114,8 +122,13 @@ fn 止める設定の組み立ては1実装しかない() {
                 stack.push(p);
             } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
                 let src = std::fs::read_to_string(&p).unwrap();
-                if production_source(&src).contains("deniedMcpServers") {
-                    writers.push(p.strip_prefix(&dir).unwrap().display().to_string());
+                let body = production_source(&src);
+                let rel = p.strip_prefix(&dir).unwrap().display().to_string();
+                if body.contains("deniedMcpServers") {
+                    writers.push(rel.clone());
+                }
+                if body.contains("enabled=false") {
+                    codex_writers.push(rel);
                 }
             }
         }
@@ -124,5 +137,10 @@ fn 止める設定の組み立ては1実装しかない() {
         writers,
         ["worker_mcp.rs"],
         "deniedMcpServers を組むコードが worker_mcp.rs 以外にある（正本は worker_mcp::settings_json の 1 実装）"
+    );
+    assert_eq!(
+        codex_writers,
+        ["worker_mcp.rs"],
+        "codex の enabled=false を組むコードが worker_mcp.rs 以外にある（正本は worker_mcp::codex_off_args の 1 実装。#2418）"
     );
 }

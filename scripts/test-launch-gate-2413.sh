@@ -11,9 +11,11 @@
 #   ② 待っている間に critical → normal: critical の間も起きず、normal で起きる
 #   ③ 上書き: critical のまま `tako queue start <ペイン>` で起きる
 #   ④ run（MCP の tako_orchestrator_run）: 起動待ちの間 run_status は launch_waiting、normal で起きる
+#      （起きた後は完了待ちの初期待ちの間も launch_waiting を残さない = #2426）。起動待ちのまま閉じた run は終わる
 #   ⑤ 待っているペインを閉じる → 起こさない（persist.log に 1 行）
 #   ⑥ 走っている agent（偽 claude）は圧が critical に戻っても 1 本も殺されない
 #   ⑦ 復元: N ペインが 1 本ずつ（立ち上がりの窓ごと）・master が先・同時に起きる agent は 1 本
+#      （準備で保存した layout に master が 1 枚あることを先に確かめる = 材料の無いまま並びを見ない。#2426）
 #   ⑧ 逼迫中の復元: critical の間は 1 本も起きず、normal で時差で起きる
 #   ⑨ 復元する agent が 0 本の起動では、起動待ちは何もしない（persist.log に復元の行が無い）
 #   ⑩ A/B: `TAKO_2413_LEGACY=1` は同じ注入でも spawn を即座に起こし、復元を一斉に起こす（修正前）
@@ -338,6 +340,13 @@ part_spawn() {
   "$TAKO_BIN" orchestrator run-status "$run_id" > "$R/rs1.json" 2>/dev/null
   check_eq "④ run_status は launch_waiting" launch_waiting "$(J get "$R/rs1.json" status)"
   check_eq "④ run_status に理由" pressure_critical "$(J get "$R/rs1.json" launch_gate.code)"
+  # ④ 起動待ちのまま閉じた run（終わり方は spawn / run の最後に見る = 完了待ちの読み直しを待つ）
+  mcp_call "$R/run2.json" tako_orchestrator_run "{\"project\":\"t2413\",\"prompt\":\"#2413 run closed\",\"pane\":$MASTER,\"label\":\"rc\",\"timeout_seconds\":120}"
+  local run2_id t_closed
+  run2_id="$(J get "$R/run2.json" run_id)"
+  check_eq "④ 閉じる run も待ち" waiting "$(J get "$R/run2.json" launch_gate.state)"
+  "$TAKO_BIN" close --pane "$(J get "$R/run2.json" pane_id)" --force >/dev/null 2>&1
+  t_closed="$(perl -MTime::HiRes=time -e 'printf("%.3f", time)')"
 
   # ⑤ 待っているペインを閉じる → 起こさない
   spawn_json "$R/s5.json" closed
@@ -358,7 +367,7 @@ part_spawn() {
   check "$([ $? -eq 0 ] && echo 1 || echo 0)" "⑤ persist.log に閉じた 1 行"
   "$TAKO_BIN" orchestrator run-status "$run_id" > "$R/rs2.json" 2>/dev/null
   check "$([ "$(J get "$R/rs2.json" status)" != launch_waiting ] && echo 1 || echo 0)" \
-    "④ 起きた後の run_status は launch_waiting でない（$(J get "$R/rs2.json" status)）"
+    "④ 起きた後の run_status は launch_waiting でない（$(J get "$R/rs2.json" status)・launch_gate.state $(J get "$R/rs2.json" launch_gate.state)）"
   "$TAKO_BIN" orchestrator workers > "$R/w2.json" 2>/dev/null
   check "$([ "$(J worker "$R/w2.json" "$p1" launch)" != waiting ] && echo 1 || echo 0)" \
     "① 起きた後の workers の launch は waiting でない（$(J worker "$R/w2.json" "$p1" launch)）"
@@ -392,6 +401,15 @@ part_spawn() {
   done
   check_eq "⑥ critical へ戻しても走っている agent は殺さない（生存 / 起動）" "$total/$total" "$alive/$total"
   check_eq "⑥ 新しい spawn は待つ（起動は 4 本のまま）" 4 "$(launch_count)"
+  # ④ 起動待ちのまま閉じた run は、起きたと読まずに終わる（agent は 1 本も起こさない = 上の本数に含まれない）
+  local k
+  for k in $(seq 1 60); do
+    "$TAKO_BIN" orchestrator run-status "$run2_id" > "$R/rs3.json" 2>/dev/null
+    [ "$(J get "$R/rs3.json" phase)" = finished ] && break
+    sleep 1
+  done
+  check_eq "④ 起動待ちのまま閉じた run は終わる" finished "$(J get "$R/rs3.json" phase)"
+  echo "    閉じてから終わるまで: $(perl -MTime::HiRes=time -e "printf('%.1fs', time - $t_closed)")（status $(J get "$R/rs3.json" status)）"
   stop_gui
   tmux_socket_kill "$SOCK"
 
@@ -412,24 +430,37 @@ part_spawn() {
 }
 
 # ============================== 復元 ==============================
+#   set_role <ペイン> <役割>: 役割を付ける。付けられなければ止める（材料の無いまま並びを見ない）
+set_role() {
+  if ! "$TAKO_BIN" title --pane "$1" --role "$2" > "$R/title.txt" 2>&1; then
+    fail "ペイン $1 に役割 $2 を付けられない（$(head -c 120 "$R/title.txt")）"
+    exit 1
+  fi
+}
+
 #   prepare_restore <回の名前>: N ペイン（最後の 1 枚を master）を作って保存し、器を消して会話 ID を付ける
 prepare_restore() {
   new_round "$1"
   inject normal
   start_gui "$1-prep"
   "$TAKO_BIN" list > "$R/list.json"
-  local first i p
+  local first i p role
   first="$(J panes "$R/list.json" | awk '{print $1}')"
-  "$TAKO_BIN" title --pane "$first" --role "orchestrator-worker:t2413:w0" >/dev/null 2>&1
+  set_role "$first" "orchestrator-worker:t2413:w0"
   for i in $(seq 2 "$N"); do
-    "$TAKO_BIN" split --pane "$first" > "$R/split.json" 2>/dev/null
-    p="$(J get "$R/split.json" pane)"
-    [ "$p" = null ] && p="$(J get "$R/split.json" pane_id)"
-    if [ "$i" = "$N" ]; then
-      "$TAKO_BIN" title --pane "$p" --role "orchestrator-master:t2413" >/dev/null 2>&1
-    else
-      "$TAKO_BIN" title --pane "$p" --role "orchestrator-worker:t2413:w$i" >/dev/null 2>&1
-    fi
+    # `tako split` は新しいペインの ID を**数字だけ**で出す（JSON ではない）。#2426: JSON として読むと
+    # null になり、続く `title --pane null` が断られて master の役割が付かないまま「master が先」を見ていた
+    "$TAKO_BIN" split --pane "$first" > "$R/split.txt" 2>/dev/null
+    p="$(tr -d '[:space:]' < "$R/split.txt")"
+    case "$p" in
+      '' | *[!0-9]*)
+        fail "split の出力からペイン ID を読めない（$(head -c 80 "$R/split.txt")）"
+        exit 1
+        ;;
+    esac
+    role="orchestrator-worker:t2413:w$i"
+    [ "$i" = "$N" ] && role="orchestrator-master:t2413"
+    set_role "$p" "$role"
   done
   sleep 4
   # ⑨ 復元する agent が 0 本の起動（この準備の起動）では起動待ちは何もしない
@@ -443,6 +474,9 @@ prepare_restore() {
   J seed_layout "$TAKO_DATA_DIR/layout.json" "$HOME/.claude/projects/p" "$R/table.txt" > "$R/seeded.txt"
   cp "$TAKO_DATA_DIR/layout.json" "$R/layout.restore.json"
   echo "    会話 ID を付けたペイン: $(cat "$R/seeded.txt") 本"
+  # 並びの判定の材料: 保存された layout に master が 1 枚・役割の無いペインが無い（#2426）
+  check_eq "⑦ 準備: layout の master は 1 枚" 1 "$(grep -c ' orchestrator-master:' "$R/table.txt" | tr -d ' ')"
+  check_eq "⑦ 準備: 役割の無いペインは 0 枚" 0 "$(awk '$3 == "-"' "$R/table.txt" | grep -c . | tr -d ' ')"
 }
 
 # 同じ layout で起動し直す（前の回の器と起動の記録を消す）

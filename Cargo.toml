@@ -94,6 +94,11 @@ image = "0.25"
 rust-embed = "8"
 pathdiff = "0.2"
 serde_yaml = "0.9"
+# codex の設定（`$CODEX_HOME/config.toml` と `.codex/config.toml`）を読む（#2418。worker_mcp）。codex 自身も
+# 使う定番の TOML パーサで、gpui のビルド依存として既にツリーにある 1.x（新しいクレートの取得は無い）。
+# 行ごとの自前の読みはインライン表・点つきキーを取りこぼし、transport を読み違えると codex が起動しなく
+# なる（実測）。spawn のたびに `codex mcp list --json` を呼ぶ案は UI スレッドの dispatch で走るので採らない
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
 # Web ビューペイン（FR-3.8）: OS ネイティブ webview（macOS = WKWebView / Windows = WebView2）を
 # GPUI ウィンドウの子ビューとして統合する。Apache-2.0 OR MIT。追加ランタイム同梱不要（NFR-3/7）
 wry = { version = "0.55", default-features = false, features = ["os-webview"] }

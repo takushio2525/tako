@@ -401,6 +401,14 @@ fn webview_parent_diag(line: &str) {
     persist_diag(line);
 }
 
+/// W4 の印（`webview-guard.json`）を書けなかったら persist.log に 1 行残す（#724）。
+/// 書けなくても Web ビューは開く（印は落ちたときの保険で、開くことの前提ではない）
+fn webview_guard_write(result: Result<(), String>) {
+    if let Err(e) = result {
+        persist_diag(&format!("Web ビューの生成中の印を書けない (#724): {e}"));
+    }
+}
+
 /// wry の親（`window_raw_handle`）をこのフレームでどう扱うか（#1837）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebviewParentStep {
@@ -2976,6 +2984,18 @@ struct TakoApp {
     /// 起動復元で開き直す Web ビュー（ペイン対応, URL）。ウィンドウハンドルが
     /// 要るため初回 render で消費する
     pending_webview_restore: Vec<(Option<u64>, String)>,
+    /// Web ビューの生成タスクを起こす口（#724 の W1。`webview::async_build_enabled` のときだけ
+    /// Some）。生成待ちを積んだ側が `()` を送る（dispatch は Context を持たないのでチャネルで起こす）
+    webview_build_wake: Option<futures::channel::mpsc::UnboundedSender<()>>,
+    /// 生成中・保留中の Web ビューの印（#724 の W4。id → (印, 生成し終えた時刻)）。
+    /// 時刻が入ったものは、最初の読み込みが済むか期限が来たら印を外す
+    webview_guard_marks: HashMap<
+        webview::WebViewId,
+        (
+            tako_control::webview_guard::GuardMark,
+            Option<std::time::Instant>,
+        ),
+    >,
     /// stale claude バイナリの検知状態（Issue #498）。ペインごとに管理
     stale_binary_banners: HashMap<PaneId, StaleBinaryBanner>,
     /// stale 検知の走査状態（Issue #772）。前回の指紋・対象・時刻を持ち、
@@ -5296,6 +5316,8 @@ impl TakoApp {
             window_raw_handle: None,
             webview_key_focus_returns: 0,
             pending_webview_restore: Vec::new(),
+            webview_build_wake: None,
+            webview_guard_marks: HashMap::new(),
             stale_binary_banners: HashMap::new(),
             stale_binary_scan: tako_control::stale_binary::ScanState::default(),
             // #549: 初回起動（settings.json がまだ無い）だけウェルカムバナーを出す。
@@ -5851,22 +5873,15 @@ impl TakoApp {
                         if let Some(session) = app.terminals.get(&pane) {
                             // #2413: 一斉に起こさない（復元の列で 1 本ずつ・master が先・
                             // メモリが逼迫しているあいだは待つ）。全部を預け、500 ms の tick が
-                            // 優先度の順に起こす（起動待ちが無効 = A/B なら従来どおりその場で書く）
-                            let pane_obj = app.workspace.pane_anywhere(pane);
+                            // 優先度の順に起こす（起動待ちが無効 = A/B なら従来どおりその場で書く）。
+                            // 役割は layout から復元したペインから引く（組み立ては単体テストと共有）
                             let held = tako_control::launch_gate::hold(
-                                tako_control::launch_gate::LaunchRequest {
-                                    pane: pane.as_u64(),
-                                    kind: tako_control::launch_gate::LaunchKind::Restore,
-                                    agent: agent.as_str().to_string(),
-                                    label: pane_obj
-                                        .and_then(|p| p.title())
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                    role: pane_obj.and_then(|p| p.role()).map(str::to_string),
-                                    action: tako_control::launch_gate::LaunchAction::Write(
-                                        resume_input(&command),
-                                    ),
-                                },
+                                tako_control::launch_gate::restore_request(
+                                    pane.as_u64(),
+                                    app.workspace.pane_anywhere(pane),
+                                    agent.as_str(),
+                                    resume_input(&command),
+                                ),
                             );
                             match held {
                                 Some(tako_control::launch_gate::LaunchAction::Write(bytes)) => {
@@ -6009,6 +6024,12 @@ impl TakoApp {
         // #1679: 言語サーバの診断の知らせを受けて波線・右パネルを描き直す
         app.spawn_lsp_diagnostics_loop(cx);
         app.spawn_lsp_state_loop(cx);
+
+        // #724 の W1: Windows は Web ビューの生成を App の借用の外で 1 本ずつ行う常駐タスクを立てる
+        // （macOS は従来どおり同期で生成するので立てない）
+        if webview::async_build_enabled() {
+            app.webview_build_wake = Some(Self::spawn_webview_builder(cx));
+        }
 
         // IPC リクエストを UI スレッドで dispatch するループ。
         // 操作セマンティクスは tako-control::dispatch に一元化されている（設計原則 5）
@@ -6672,6 +6693,10 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:webview");
                         app.poll_webview_state();
                         app.process_pending_new_windows(wcx);
+                        // #724: 生成し終えた Web ビューの印を最初の読み込みの後に外す。
+                        // 生成待ちの起こし損ねもここで拾う（起こすのは生成待ちがあるときだけ）
+                        app.settle_webview_guard();
+                        app.wake_webview_builder();
                     }
                     // #666: 閉じたペインのコマンドカードを掃除する（メモリ操作のみ）
                     app.prune_command_cards();
@@ -21926,6 +21951,8 @@ impl TakoApp {
         let can_go_back = self.webviews[idx].can_go_back();
         let can_go_forward = self.webviews[idx].can_go_forward();
         let error_state = self.webviews[idx].error_state();
+        // #724: wry の Web ビューがまだ無いあいだ（生成待ち・生成中・保留）は GPUI が本文を描く
+        let phase = self.webviews[idx].phase();
 
         // 本文領域 = pane_text_areas と同じ絶対座標（タイトルバー・枠・パディングの内側）。
         // GPUI の Pixels は論理座標なので wry の Logical bounds へそのまま渡せる。
@@ -21992,6 +22019,8 @@ impl TakoApp {
                                     eprintln!("warning: webview navigate({to}) 失敗: {err}");
                                 }
                             }
+                            // #724: 保留・生成失敗の再読み込みは生成し直しの依頼
+                            this.wake_webview_builder();
                             cx.notify();
                         }))
                 } else {
@@ -22000,6 +22029,8 @@ impl TakoApp {
             };
         let body = if let Some((error_msg, failed_url)) = &error_state {
             self.render_webview_error_overlay(pane_id, error_msg, failed_url, &theme, cx)
+        } else if phase != webview::WebViewPhase::Ready {
+            self.render_webview_pending_body(pane_id, phase, &url, &theme, cx)
         } else {
             div().flex_1().bg(rgba(theme.background))
         };
@@ -22389,11 +22420,96 @@ impl TakoApp {
                                 {
                                     let _ = e.retry();
                                 }
+                                // #724: 生成失敗・保留の「再読み込み / 開く」は生成し直しの依頼
+                                this.wake_webview_builder();
                                 cx.notify();
                             }))
                             .child(crate::ui_text::webdock::reload()),
                     ),
             )
+    }
+
+    /// wry の Web ビューがまだ無いペインの本文（#724）。生成待ち・生成中は「準備しています」、
+    /// 保留（W4 = 前回の生成中に tako が落ちた）は理由と「開く」（押すと生成し直す）
+    fn render_webview_pending_body(
+        &self,
+        pane_id: PaneId,
+        phase: webview::WebViewPhase,
+        url: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let held = phase == webview::WebViewPhase::Held;
+        let message = if held {
+            crate::ui_text::webdock::held()
+        } else {
+            crate::ui_text::webdock::creating()
+        };
+        let url_display = SharedString::from(truncate_chars(url, 60));
+        let card = div()
+            .max_w(px(380.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                svg()
+                    .path(crate::file_icons::ui_icon::GLOBE)
+                    .w(px(32.0))
+                    .h(px(32.0))
+                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.4)),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(hsla(theme.foreground))
+                    .child(message),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(hsla_alpha(theme.tab_inactive_foreground, 0.7))
+                    .overflow_hidden()
+                    .child(url_display),
+            )
+            .when(held, |d| {
+                d.child(
+                    div()
+                        .id(("web-held-open", pane_id.as_u64()))
+                        .mt(px(4.0))
+                        .px(px(16.0))
+                        .py(px(6.0))
+                        .rounded(px(6.0))
+                        .bg(rgba_alpha(theme.accent, 0.15))
+                        .text_size(px(12.0))
+                        .text_color(hsla(theme.accent))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgba_alpha(theme.accent, 0.25)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(e) = this.webviews.iter().find(|e| e.pane == Some(pane_id))
+                            {
+                                let _ = e.retry();
+                            }
+                            this.wake_webview_builder();
+                            cx.notify();
+                        }))
+                        .child(crate::ui_text::webdock::open()),
+                )
+            });
+        div()
+            .flex_1()
+            .bg(rgba(theme.background))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(12.0))
+            .child(card)
     }
 
     /// Web ビューペインの × = ページごと完全破棄（ブラウザのタブ × と同じ）。
@@ -22403,7 +22519,9 @@ impl TakoApp {
             // #1481: 壊す前に宛先を GPUI へ戻す。宛先のまま消えると
             // ウィンドウの first responder が宙に浮き、どこへも打鍵が届かない
             self.return_webview_key_focus(true);
-            self.webviews.remove(idx);
+            let entry = self.webviews.remove(idx);
+            // #724 の W4: 保留・生成中のまま閉じたものの印も外す（閉じた = もう開かない）
+            self.forget_webview_guard(entry.id);
             if self.webviews.is_empty() {
                 webview::set_has_webview(false);
             }
@@ -22428,7 +22546,13 @@ impl TakoApp {
         }
     }
 
-    /// wry WebView を生成して webviews に登録する（表示先ペインは呼び出し側が設定）
+    /// wry WebView を生成して webviews に登録する（表示先ペインは呼び出し側が設定）。
+    ///
+    /// **Windows ではここで生成しない**（#724 の W1）。呼び出し側はどれも gpui の App を
+    /// 借用している（dispatch・クリックハンドラ・render の復元）ので、ここで wry を呼ぶと
+    /// WebView2 の入れ子のメッセージループが前景タスクを走らせて二重借用で abort する。
+    /// 生成待ちのエントリを積んで生成タスクを起こすだけにし、生成は
+    /// [`Self::spawn_webview_builder`] が借用の外で 1 本ずつ行う
     fn create_webview(&mut self, url: &str) -> Result<webview::WebViewId, String> {
         let handle = self
             .window_raw_handle
@@ -22443,11 +22567,179 @@ impl TakoApp {
             return Err(reason);
         }
         let id = webview::WebViewId(self.webview_next_id);
+        if webview::async_build_enabled() {
+            let entry = webview::WebViewEntry::queued(id, url)?;
+            self.webview_next_id += 1;
+            self.webviews.push(entry);
+            self.wake_webview_builder();
+            return Ok(id);
+        }
         let entry = webview::WebViewEntry::build(handle, id, url)?;
         self.webview_next_id += 1;
         self.webviews.push(entry);
         webview::set_has_webview(true);
         Ok(id)
+    }
+
+    /// Web ビューの生成タスク（#724 の W1）。起動時に 1 本だけ立てる。
+    ///
+    /// 起こされるたびに生成待ちが無くなるまで、①借用の内側で 1 本ぶんの仕事を取り出す
+    /// （[`Self::take_webview_build_job`]）②**借用の外**で wry の Web ビューを作る ③借用の内側で
+    /// 取り付ける（[`Self::attach_built_webview`]）を繰り返す。②の最中に WebView2 の入れ子の
+    /// メッセージループが gpui の前景タスク（PTY の出力・ポーリング・IPC・描画）を走らせても、
+    /// App は借用されていないので二重借用にならない。②で描画や IPC が新しい Web ビューを
+    /// 頼んでも、積まれるだけで入れ子にはならない = **生成中は 1 本だけ**（このタスクは 1 本で、
+    /// 自分の poll の最中に自分が再入することはない）。
+    /// **②を `this.update` の中へ移してはいけない**（番犬 `issue724_webviewの生成をappの借用の外で行う`）
+    fn spawn_webview_builder(
+        cx: &mut Context<Self>,
+    ) -> futures::channel::mpsc::UnboundedSender<()> {
+        let (wake_tx, mut wake_rx) = unbounded::<()>();
+        cx.spawn(async move |this, cx| {
+            while wake_rx.next().await.is_some() {
+                // 溜まった起こしは 1 回に数える（どのみち生成待ちが無くなるまで回す）
+                while wake_rx.try_recv().is_ok() {}
+                loop {
+                    let Ok(job) = this.update(cx, |app, _| app.take_webview_build_job()) else {
+                        return;
+                    };
+                    let Some(job) = job else {
+                        break;
+                    };
+                    // 注入（検証用）: 生成に時間が掛かる形を、ほかのタスクを止めずに作る
+                    if let Some(delay) = webview::inject_build_delay() {
+                        cx.background_executor().timer(delay).await;
+                    }
+                    // ここは App を借用していない（#724 の W1）
+                    let built = job.build();
+                    if this
+                        .update(cx, |app, cx| app.attach_built_webview(built, cx))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
+        wake_tx
+    }
+
+    /// 生成待ちがあれば生成タスクを起こす（#724。生成タスクが無い = 同期で生成する環境では何もしない）
+    fn wake_webview_builder(&self) {
+        let Some(wake) = &self.webview_build_wake else {
+            return;
+        };
+        if self
+            .webviews
+            .iter()
+            .any(|e| e.phase() == webview::WebViewPhase::Queued)
+        {
+            let _ = wake.unbounded_send(());
+        }
+    }
+
+    /// 生成待ちから 1 本ぶんの仕事を取り出す（#724 の W1。借用の内側 = wry は呼ばない）。
+    ///
+    /// 親が閉じていれば（#1837）生成に入らずその Web ビューを失敗にして次を見る。取り出す前に
+    /// W4 の印を書く（保留から開き直したものは前の印を新しい印へ差し替える）
+    fn take_webview_build_job(&mut self) -> Option<webview::BuildJob> {
+        loop {
+            let idx = self
+                .webviews
+                .iter()
+                .position(|e| e.phase() == webview::WebViewPhase::Queued)?;
+            if !self.webview_parent_live() {
+                let reason = webview::detached_parent_error();
+                webview_parent_diag(&reason);
+                self.webviews[idx].fail(&reason);
+                continue;
+            }
+            let parent = self.window_raw_handle.as_ref()?;
+            let entry = &self.webviews[idx];
+            let job = entry.begin_build(parent)?;
+            let mark = tako_control::webview_guard::GuardMark {
+                pane: entry.pane.map(|p| p.as_u64()),
+                url: entry.current_url(),
+            };
+            if let Some((old, _)) = self.webview_guard_marks.remove(&job.id) {
+                webview_guard_write(tako_control::webview_guard::end(&old));
+            }
+            webview_guard_write(tako_control::webview_guard::begin(&mark));
+            self.webview_guard_marks.insert(job.id, (mark, None));
+            return Some(job);
+        }
+    }
+
+    /// 借用の外で作った wry の Web ビューを取り付ける（#724 の W1）。生成中に閉じられていたら
+    /// 捨てる。取り付けたら W4 の印は最初の読み込みが済むまで残す（[`Self::settle_webview_guard`]）
+    fn attach_built_webview(&mut self, built: webview::BuiltWebView, cx: &mut Context<Self>) {
+        let id = built.id;
+        let Some(idx) = self.webviews.iter().position(|e| e.id == id) else {
+            // 生成中に `web close` / × で閉じられた。作ったもの（built）はここで捨てる
+            self.forget_webview_guard(id);
+            persist_diag(&format!(
+                "Web ビュー {} は生成中に閉じられたので、作り終えたものを捨てた (#724)",
+                id.as_u64()
+            ));
+            return;
+        };
+        match self.webviews[idx].install_built(built) {
+            Ok(()) => {
+                webview::set_has_webview(true);
+                if let Some((_, built_at)) = self.webview_guard_marks.get_mut(&id) {
+                    *built_at = Some(std::time::Instant::now());
+                }
+                // いま表示しているペインなら次の render を待たずに置く（#442 と同じ理由）。
+                // 生成中に別のタブへ移っていたら置かない（次の render が決める）
+                if let Some(pane) = self.webviews[idx].pane {
+                    if self.pane_text_areas.iter().any(|(p, _)| *p == pane) {
+                        self.eagerly_show_webview(pane);
+                    }
+                }
+            }
+            Err(reason) => {
+                self.forget_webview_guard(id);
+                persist_diag(&format!(
+                    "Web ビュー {} を作れなかった (#724): {reason}",
+                    id.as_u64()
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    /// 生成し終えた Web ビューの W4 の印を、最初の読み込みが済むか期限が来たら外す
+    /// （#724。2 秒ポーリングから呼ぶ）。最初の読み込みまで見張るのは、W2 の unwrap のように
+    /// 生成が返った直後（最初のナビゲーション）に落ちる経路もあったため
+    fn settle_webview_guard(&mut self) {
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+        let done: Vec<webview::WebViewId> = self
+            .webview_guard_marks
+            .iter()
+            .filter(|(id, (_, built_at))| {
+                let Some(built_at) = built_at else {
+                    return false;
+                };
+                let loaded = self
+                    .webviews
+                    .iter()
+                    .find(|e| e.id == **id)
+                    .is_none_or(|e| e.first_load_done());
+                loaded || built_at.elapsed() >= GRACE
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in done {
+            self.forget_webview_guard(id);
+        }
+    }
+
+    /// W4 の印を外す（#724。生成が済んだ・失敗した・閉じた）
+    fn forget_webview_guard(&mut self, id: webview::WebViewId) {
+        if let Some((mark, _)) = self.webview_guard_marks.remove(&id) {
+            webview_guard_write(tako_control::webview_guard::end(&mark));
+        }
     }
 
     /// wry の親（[`Self::window_raw_handle`]）がいま開いている tako の窓のものか（#1837）。
@@ -22622,6 +22914,7 @@ impl TakoApp {
                     if let Some(e) = self.webviews.iter().find(|e| e.pane == Some(pane_id)) {
                         let _ = e.navigate(&normalized);
                     }
+                    self.wake_webview_builder();
                 }
             }
             "escape" => {
@@ -23007,24 +23300,42 @@ impl TakoApp {
 
     /// 起動復元分の Web ビューを開き直す（初回 render でハンドル採取後に呼ぶ）。
     /// 保存時のペイン ID は Phase 5.5 の同一 ID 復元で現ワークスペースにも存在する
+    ///
+    /// **前回、生成中に tako が落ちた Web ビューは自動では開かない**（#724 の W4）。印
+    /// （`webview-guard.json`）に当たるものは保留のエントリとして同じペイン（無ければ dock）に置き、
+    /// URL を残す。開くのは利用者が「開く」を押したとき（CLI / MCP は `web navigate`）
     fn restore_webviews(&mut self) {
         let pending = std::mem::take(&mut self.pending_webview_restore);
-        for (pane, url) in pending {
+        // 印を書くのは生成タスクの経路だけ（macOS の同期の生成は印を書かず、保留から
+        // 開き直す担い手も居ない）。同期の経路は印を読まず従来どおりすべて開き直す
+        let marks = if webview::async_build_enabled() {
+            tako_control::webview_guard::load()
+        } else {
+            Vec::new()
+        };
+        let split = tako_control::webview_guard::split_restore(pending, &marks);
+        for (pane, url, mark) in split.held {
+            let id = webview::WebViewId(self.webview_next_id);
+            self.webview_next_id += 1;
+            let mut entry = webview::WebViewEntry::held(id, &url);
+            entry.pane = pane.and_then(|raw| self.restore_target_pane(raw, &url));
+            persist_diag(&format!(
+                "Web ビュー復元: 前回の生成中に tako が終了したので自動では開かない（ペイン {}・\
+                 開くには「開く」または tako web navigate --id {} reload）(#724)",
+                entry
+                    .pane
+                    .map(|p| p.as_u64().to_string())
+                    .unwrap_or_else(|| "dock".into()),
+                id.as_u64(),
+            ));
+            self.webviews.push(entry);
+            self.webview_guard_marks.insert(id, (mark, None));
+        }
+        for (pane, url) in split.auto {
             match self.create_webview(&url) {
                 Ok(id) => {
                     if let Some(raw) = pane {
-                        let target = self
-                            .workspace
-                            .tabs()
-                            .iter()
-                            .flat_map(|t| t.tree().panes())
-                            .map(|p| p.id())
-                            .find(|p| p.as_u64() == raw);
-                        if target.is_none() {
-                            eprintln!(
-                                "warning: Web ビュー復元: ペイン {raw} が見つからないため dock へ退避 ({url})"
-                            );
-                        }
+                        let target = self.restore_target_pane(raw, &url);
                         if let Some(e) = self.webviews.iter_mut().find(|e| e.id == id) {
                             e.pane = target;
                         }
@@ -23033,6 +23344,24 @@ impl TakoApp {
                 Err(err) => eprintln!("warning: Web ビュー復元失敗 ({url}): {err}"),
             }
         }
+    }
+
+    /// 復元する Web ビューの表示先（保存時のペイン ID。Phase 5.5 の同一 ID 復元で現ワークスペースにも
+    /// 存在する）。見つからなければ None = dock へ退避
+    fn restore_target_pane(&self, raw: u64, url: &str) -> Option<PaneId> {
+        let target = self
+            .workspace
+            .tabs()
+            .iter()
+            .flat_map(|t| t.tree().panes())
+            .map(|p| p.id())
+            .find(|p| p.as_u64() == raw);
+        if target.is_none() {
+            eprintln!(
+                "warning: Web ビュー復元: ペイン {raw} が見つからないため dock へ退避 ({url})"
+            );
+        }
+        target
     }
 
     /// 子ワーカードロップダウン（#217 カンプ: w282 / radius 9 / ヘッダ + 行）。
@@ -27631,16 +27960,18 @@ impl WebViewHost for TakoApp {
             e.pane = Some(pane);
         }
         self.eagerly_show_webview(pane);
-        let url = self
+        let (url, state) = self
             .webviews
             .iter()
             .find(|e| e.id == id)
-            .map(|e| e.current_url())
+            .map(|e| (e.current_url(), e.phase().as_str()))
             .unwrap_or_default();
         Ok(serde_json::json!({
             "id": id.as_u64(),
             "pane": pane.as_u64(),
             "url": url,
+            // #724: Windows は生成を後で 1 本ずつ行うので queued で返る（ready になってから eval / read）
+            "state": state,
         }))
     }
 
@@ -27682,6 +28013,9 @@ impl WebViewHost for TakoApp {
                         "title": e.current_title(),
                         "pane": e.pane.map(|p| p.as_u64()),
                         "loading": e.is_loading(),
+                        // #724: ready / queued / creating / held（前回の生成中に落ちたので
+                        // 自動では開いていない）/ failed。held と failed は navigate で開き直す
+                        "state": e.phase().as_str(),
                         "error": err.as_ref().map(|(msg, _)| msg.as_str()),
                         "failed_url": err.as_ref().map(|(_, url)| url.as_str()),
                         // #838: ちらつきの機械検証用。visible_flips = 可視 ⇔ 不可視が
@@ -27739,6 +28073,8 @@ impl WebViewHost for TakoApp {
         // #1481: 壊す前に宛先を GPUI へ戻す（× ボタンと同じ 1 実装）
         self.return_webview_key_focus(true);
         let entry = self.webviews.remove(idx);
+        // #724 の W4: 保留・生成中のまま閉じたものの印も外す
+        self.forget_webview_guard(entry.id);
         if self.webviews.is_empty() {
             webview::set_has_webview(false);
         }
@@ -27752,7 +28088,10 @@ impl WebViewHost for TakoApp {
             .find(|e| e.id.as_u64() == id)
             .ok_or(format!("Web ビュー {id} が見つからない"))?;
         e.navigate(to)?;
-        Ok(serde_json::json!({ "id": id, "navigated": to }))
+        let state = e.phase().as_str();
+        // #724: 保留・生成失敗の navigate は生成し直しの依頼（生成待ちへ戻る）
+        self.wake_webview_builder();
+        Ok(serde_json::json!({ "id": id, "navigated": to, "state": state }))
     }
 
     fn web_eval(&mut self, id: u64, js: &str) -> Result<serde_json::Value, String> {
@@ -27798,6 +28137,7 @@ impl WebViewHost for TakoApp {
             "title": e.current_title(),
             "loading": e.is_loading(),
             "pane": e.pane.map(|p| p.as_u64()),
+            "state": e.phase().as_str(),
             "error": err.as_ref().map(|(msg, _)| msg.as_str()),
             "failed_url": err.as_ref().map(|(_, url)| url.as_str()),
         }))
@@ -28830,9 +29170,19 @@ impl TakoApp {
                                     ));
                                 }
                             }
+                            // #2247: ツリー・パスのメニュー・CLI / MCP と同じ dispatch を通し、
+                            // 失敗（消えたファイル等）はプレビューの通知として出す
                             "reveal" => {
                                 if let Some(p) = &preview_path {
-                                    let _ = tako_control::platform::os_integration::reveal(p);
+                                    if TakoApp::legacy_2247() {
+                                        let _ = tako_control::platform::os_integration::reveal(p);
+                                    } else {
+                                        this.reveal_in_file_manager(
+                                            p,
+                                            crate::sidebar::NoticeArea::Preview,
+                                            crate::sidebar::NoticeArm::Issue2247,
+                                        );
+                                    }
                                 }
                             }
                             "open-default" => {
@@ -32331,6 +32681,11 @@ mod self_test {
     mod lsp_held_2048;
     #[cfg(feature = "visual-test")]
     use lsp_held_2048::lsp_held_visual;
+    /// #2247: 「Finder で表示」を実マウスで押し、NSWorkspace の 1 実装へ届くか（visual-test `preview-reveal-2247`）
+    #[cfg(feature = "visual-test")]
+    mod preview_reveal_2247;
+    #[cfg(feature = "visual-test")]
+    use preview_reveal_2247::preview_reveal_visual;
     /// #1956: 検出表の第 2 波を実のサーバで起こし、波線とホバーのカードを撮る（visual-test `lsp-servers`）
     #[cfg(feature = "visual-test")]
     mod lsp_servers_1956;
@@ -34481,11 +34836,12 @@ mod self_test {
         });
 
         // --- 2. Web ビューのアドレスバー ---
-        // Windows の WebView2 は data: URL で落ちる（項目 71 と同じ事情 = #724 症状②）
+        // Windows の WebView2 は data: URL で落ちていた（項目 71 と同じ事情 = #724 症状②。
+        // 手当ては入ったが実機で未確認なので対象外のまま）
         if cfg!(target_os = "windows") {
             println!(
                 "TAKO_SELF_TEST_SKIPPED: 155 のアドレスバー（Web ビューが WebView2 側の非巻き戻し \
-                 panic で落ちる。#724 症状②）"
+                 panic で落ちていた。#724 の手当ては実機で未確認）"
             );
         } else {
             focus_origin(window, cx);
@@ -34532,6 +34888,11 @@ mod self_test {
                 Ok((id, pane)) => (id, PaneId::from_raw(pane)),
                 Err(e) => fail(&format!("項目 155: Web ビューを開けない (#1750): {e}")),
             };
+            // #724: 非同期の生成では open の直後は queued（項目 71 と同じ）
+            check(
+                wait_webview_ready(window, cx, web_id, "155-ready").await,
+                "項目 155: Web ビュー open → ready（#724）",
+            );
             // #1837: 項目 79 / 79b で窓を閉じて Dock 復帰で開き直した後でも、Web ビューは
             // **いま開いている窓**の子になる（CLI / MCP の `web list` と同じ入口で読む）。
             // 旧実装は初回に採った（= 閉じた）窓の描画ビューを親にし、生成そのものが
@@ -37823,6 +38184,38 @@ mod self_test {
     /// `budget=` / `legacy=` / `capped=` / `inject=` + 判定した瞬間の `load=`）。
     /// `capped=true` = 4 倍まで積んでも足りなかった印。項目ごとの材料
     /// （`TAKO_SELF_TEST_TMUX_ATTACH` / `_181_VIEW` / `_61F` 等）は呼び出し側に残す
+    /// Web ビューが ready（wry の Web ビューを持つ）になるまで待つ（#724）。
+    /// 同期の生成では open の時点で ready なので最初の 1 回で返る
+    async fn wait_webview_ready(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        web_id: u64,
+        tag: &str,
+    ) -> bool {
+        let ok = wait_for_backend_state(cx, tag, text_wait_budget(25, 200, 20), |cx| {
+            window
+                .update(cx, |app, _, _| {
+                    app.webviews.iter().any(|e| {
+                        e.id.as_u64() == web_id && e.phase() == webview::WebViewPhase::Ready
+                    })
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        let state = window
+            .update(cx, |app, _, _| {
+                app.webviews
+                    .iter()
+                    .find(|e| e.id.as_u64() == web_id)
+                    .map(|e| e.phase().as_str())
+            })
+            .ok()
+            .flatten()
+            .unwrap_or("gone");
+        println!("TAKO_SELF_TEST_724: wait={tag} id={web_id} state={state}");
+        ok
+    }
+
     async fn wait_for_backend_state<F>(
         cx: &mut AsyncApp,
         tag: &str,
@@ -47965,6 +48358,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2247: 「Finder で表示」がどの入口からも NSWorkspace の 1 実装へ 1 回届くか（記録の口）
+                "preview-reveal-2247" => {
+                    preview_reveal_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1684: 実の rust-analyzer で右クリック → 項目 → 定義へ移動（無ければ SKIPPED）
                 "lsp-context-menu-real" => {
                     lsp_context_menu_real_visual(any, window, cx).await;
@@ -48228,7 +48627,7 @@ mod self_test {
                          syntax-alias / extra-syntax / net-resume / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
                          workspace-search-1694 / paste-guard / bracket-match / enter-1759 / \
-                         changelog-offload / changelog-expand / tasks-launch-2182 / palette-alias）"
+                         changelog-offload / changelog-expand / tasks-launch-2182 / palette-alias / preview-reveal-2247）"
                     );
                     std::process::exit(1);
                 }
@@ -72127,16 +72526,17 @@ mod self_test {
             //     ページは data: URL（外部ネットワーク不要）。dispatch 直呼び = CLI / MCP と
             //     同一経路（開発不変条件。引数変換は mcp.rs / tako-cli の単体テストが担保）。
             //
-            //     Windows ではこの項目が **tako を落とす**: wry 0.55 の WebView2 側
-            //     （`wry/src/webview2/mod.rs:910`）が現在 URI を `http::Uri` として
+            //     Windows ではこの項目が **tako を落としていた**: wry 0.55 の WebView2 側
+            //     （`wry/src/webview2/mod.rs:910`）が送り主の URI を `http::Uri` として
             //     unwrap しており、`data:` URL では `InvalidUri(Empty)` で panic する。
             //     しかもコールバック内なので**巻き戻せず abort** する（#724 症状②。
-            //     実測スタックは Issue へ記録）。
-            //     クラッシュはセルフテスト全体を道連れにするので、直るまで対象外にする
+            //     実測スタックは Issue へ記録）。#724 で ipc を付けない（W2）・生成を App の
+            //     借用の外へ出す（W1）手当てを入れたが、実機で通るのを確かめるまでは
+            //     対象外のまま（クラッシュはセルフテスト全体を道連れにする）
             if cfg!(target_os = "windows") {
                 println!(
                     "TAKO_SELF_TEST_SKIPPED: 71（Web ビューが WebView2 側の非巻き戻し panic で \
-                     アプリごと落ちる。#724 症状②）"
+                     アプリごと落ちていた。#724 の手当ては実機で未確認）"
                 );
             } else {
                 #[allow(clippy::too_many_arguments)]
@@ -72179,13 +72579,27 @@ mod self_test {
                             PaneOrigin::Cli,
                         )
                         .ok()
-                        .and_then(|v| Some((v["id"].as_u64()?, v["pane"].as_u64()?)))
+                        .and_then(|v| {
+                            println!(
+                                "TAKO_SELF_TEST_724: item=71 open_state={} async={}",
+                                v["state"].as_str().unwrap_or("-"),
+                                webview::async_build_enabled()
+                            );
+                            Some((v["id"].as_u64()?, v["pane"].as_u64()?))
+                        })
                     })
                     .ok()
                     .flatten();
                 let Some((web_id, web_pane)) = opened else {
                     fail("Web ビュー open（wry 生成）");
                 };
+                // #724: 非同期の生成（Windows の既定・macOS の `TAKO_724_ASYNC=1`）では open の直後は
+                // queued で、生成タスクが App の借用の外で作り終えると ready になる。
+                // 同期の生成（macOS の既定）では最初の 1 回で当たる
+                check(
+                    wait_webview_ready(window, cx, web_id, "71-ready").await,
+                    "Web ビュー open → ready（#724 の生成タスクが作り終える）",
+                );
                 // list: id・ペイン対応・URL が載る
                 let listed = window
                     .update(cx, |app, _, _cx| {
@@ -72738,8 +73152,11 @@ mod self_test {
                                 false
                             }
                             Some((web2_id, web2_pane)) => {
+                                // #724: 非同期の生成では 2 枚目も作り終えてから触る
+                                let ready2 =
+                                    wait_webview_ready(window, cx, web2_id, "71-2nd-ready").await;
                                 notify_and_draw(any, window, cx);
-                                let ok = grab(window, cx, web_id) && {
+                                let ok = ready2 && grab(window, cx, web_id) && {
                                     // いまは 1 枚目のページが宛先
                                     let held1 = owner(window, cx);
                                     let _ = window.update(cx, |app, _, _| {

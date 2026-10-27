@@ -134,10 +134,13 @@ pub mod notes {
         "There is no Windows video decoder implementation, so opening a video file returns an error",
     );
 
-    /// #724 症状②。`wry` の WebView2 が COM コールバック内で unwrap して abort する
+    /// #724 症状②。WebView2 の生成中の入れ子のメッセージループ（gpui の App の二重借用）と、
+    /// COM のコールバックの中の unwrap で、巻き戻せずアプリごと abort していた。
+    /// 生成を借用の外へ出し（W1）・Windows では ipc を付けず（W2）・生成中に落ちたものは
+    /// 次の起動で保留にする（W4）手当てを入れたが、Windows 実機での確認が済んでいない
     pub const WIN_WEBVIEW2_PANIC: Note = Note::new(
-        "Web ビューは WebView2 側の巻き戻せない panic でアプリごと落ちるため開けない",
-        "The web view cannot be opened: WebView2 raises a non-unwinding panic that aborts the whole app",
+        "Web ビューを開くとアプリごと落ちていた原因（WebView2 の生成中の二重借用と COM コールバックの中の unwrap）への手当てを入れたが、Windows 実機で未確認（#724）",
+        "Fixes for the web view crashing the whole app (a double borrow while WebView2 is being created and an unwrap inside a COM callback) are in, but unverified on real Windows hardware (#724)",
     );
 
     /// #528。daemon の起動・停止が `setsid` / シグナルマスク前提のまま
@@ -1966,7 +1969,7 @@ pub const MATRIX: &[Feature] = &[
             issue: 724,
         },
         windows_evidence: Evidence::Measured(
-            "セルフテスト項目 71 は WebView2 の非巻き戻し panic（wry/src/webview2/mod.rs:910）でアプリごと落ちるためスキップ",
+            "修正前の実機の記録: panic.log に gpui の async_context.rs:65 の二重借用（CallWindowProcW が 2 段）、セルフテスト項目 71 で wry/src/webview2/mod.rs:910 の InvalidUri(Empty)。#724 で生成を App の借用の外へ出し・Windows では ipc を付けず・生成中に落ちた Web ビューを次の起動で保留にした。項目 71 は実機で通るまでスキップのまま",
         ),
     },
     Feature {

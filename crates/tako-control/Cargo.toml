@@ -18,6 +18,8 @@ tiny_http.workspace = true
 tungstenite.workspace = true
 pathdiff.workspace = true
 serde_yaml.workspace = true
+# codex の worker へ持ち込む MCP を決めるために codex の config.toml を読む（#2418。worker_mcp）
+toml.workspace = true
 qrcode.workspace = true
 image.workspace = true
 rust-embed.workspace = true

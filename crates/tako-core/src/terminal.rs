@@ -643,6 +643,13 @@ impl TerminalSession {
         // シェル統合（OSC 7/133 発行）の自動注入。options.env が常に優先
         env.extend(crate::shell_integration::env().iter().cloned());
         env.extend(options.env);
+        // Windows はペインを起こすたびにレジストリの PATH を読み直して渡す（#2428。境界 B23）。
+        // tako を開いたままインストーラが足した置き場所（`~\.local\bin`）を、tako の再起動なしに
+        // 新しいタブから引けるようにする。呼び出し側が PATH を明示したときと unix では何もしない
+        crate::platform::user_path::apply_pane_path(
+            &mut env,
+            crate::platform::user_path::pane_path,
+        );
         // **TERM / COLORTERM だけは最後**（#946）。呼び出し側の env にも親プロセスにも
         // 依らせない = 「注入する」という設計意図が環境で消えない
         let env = finalize_pane_env(env, inherit_terminal_env());

@@ -56,7 +56,8 @@ the reserve). It launches by itself when memory recovers; `reason` says why and
 pane, or respawn — the command and prompt are held and go out on launch. Meanwhile
 `tako_orchestrator_worker_status` reports `status: "launch_waiting"`,
 `tako_orchestrator_workers` shows `launch: "waiting"`, and `run_status` reports
-`launch_waiting` (the run timeout starts after the launch). `tako_queue` lists the
+`launch_waiting`, then `starting` once launched (the run timeout starts after the
+launch). `tako_queue` lists the
 held launches under `launches`. If the work is urgent, launch it now with
 `tako queue start <pane>` (MCP `tako_queue` with `action: "start"`, `id` = pane).
 Running workers are never stopped. After a reboot, saved sessions come back one at

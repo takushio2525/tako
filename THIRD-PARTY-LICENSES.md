@@ -21,7 +21,7 @@ are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 | ライセンス / License | 件数 / Count |
 |---|---|
-| MIT License | 485 |
+| MIT License | 490 |
 | Apache License 2.0 | 30 |
 | Unicode License v3 | 19 |
 | ISC License | 18 |
@@ -6909,6 +6909,10 @@ DEALINGS IN THE SOFTWARE.
 - [colorchoice 1.0.5](https://github.com/rust-cli/anstyle.git)
 - [is_terminal_polyfill 1.70.2](https://github.com/polyfill-rs/is_terminal_polyfill)
 - [once_cell_polyfill 1.70.2](https://github.com/polyfill-rs/once_cell_polyfill)
+- [serde_spanned 1.1.1](https://github.com/toml-rs/toml)
+- [toml 1.1.2+spec-1.1.0](https://github.com/toml-rs/toml)
+- [toml_datetime 1.1.1+spec-1.1.0](https://github.com/toml-rs/toml)
+- [toml_parser 1.1.2+spec-1.1.0](https://github.com/toml-rs/toml)
 
 ```text
 Copyright (c) Individual contributors
@@ -8950,6 +8954,34 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+```
+
+### MIT License
+
+使用しているクレート / Used by:
+
+- [winnow 1.0.4](https://github.com/winnow-rs/winnow)
+
+```text
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
