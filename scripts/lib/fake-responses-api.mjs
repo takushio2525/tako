@@ -7,7 +7,8 @@
 // `requires_openai_auth = false`）。本物の codex の認証・課金は使わない。
 //
 // 答え: 最後の発話に「Show this card: {JSON}」があれば、要求の tools にある `…tako_show_command` を
-// その JSON で呼ぶ function_call を返し、その結果（function_call_output）が来たら「CARD-DONE」と答える
+// その JSON で呼ぶ function_call を返し、その結果（function_call_output）が来たら「CARD-DONE」（呼べなかった =
+// `unsupported call` / 承認で断られたなら「CARD-FAILED」）と答える
 // （worker から tako の MCP が使えることの確認）。「Reply with exactly one word: X」なら X、ほかは「ok」。
 // FAKE_DELAY_MS を渡すと答える前にその時間だけ待つ（`codex exec` を生かしたまま子孫を数えるため）。
 // 受けた要求は 1 行ずつ FAKE_LOG へ（経路と、要求の tools の名前だけ。本文は書かない）。
@@ -83,21 +84,36 @@ function message(text) {
   }
 }
 
+// `…tako_show_command` の呼び先。codex 0.154.0 は MCP のツールを `{ type: 'namespace', name: 'mcp__<server>',
+// tools: [{ type: 'function', name: '<tool>' }] }` で渡し、呼び出しは `name: '<tool>'` + `namespace: 'mcp__<server>'`
+// の形でだけ受ける（`mcp__<server>__<tool>` の 1 語は `unsupported call` = 実測）
+function takoShowCommand(tools) {
+  for (const t of Array.isArray(tools) ? tools : []) {
+    if (typeof t?.name === 'string' && /tako_show_command$/.test(t.name)) return { name: t.name }
+    for (const inner of Array.isArray(t?.tools) ? t.tools : []) {
+      if (typeof inner?.name === 'string' && /tako_show_command$/.test(inner.name)) {
+        return { name: inner.name, namespace: t.name }
+      }
+    }
+  }
+  return null
+}
+
 function answer(body) {
   const input = Array.isArray(body?.input) ? body.input : []
   const last = input[input.length - 1]
-  // tako の MCP を呼んだ結果が返ってきた番
+  // tako の MCP を呼んだ結果が返ってきた番。呼べなかった（知らない呼び出し・承認待ちで断られた）なら CARD-FAILED
   if (last?.type === 'function_call_output' || last?.type === 'custom_tool_call_output') {
-    return message('CARD-DONE')
+    const out = JSON.stringify(last.output ?? '')
+    return message(/unsupported call|requires approval/.test(out) ? 'CARD-FAILED' : 'CARD-DONE')
   }
   // 最後のユーザーの発話
   const users = input.filter(i => i?.role === 'user')
   const text = users.length ? textOf(users[users.length - 1]) : ''
   const at = text.indexOf('Show this card: ')
   if (at >= 0) {
-    const names = toolNames(body?.tools)
-    const name = names.find(n => /tako_show_command$/.test(n))
-    if (name !== undefined) {
+    const tool = takoShowCommand(body?.tools)
+    if (tool !== null) {
       let args = text.slice(at + 'Show this card: '.length).trim()
       const nl = args.indexOf('\n')
       if (nl >= 0) args = args.slice(0, nl)
@@ -106,7 +122,7 @@ function answer(body) {
         type: 'function_call',
         id: `fc_fake_${seq}`,
         call_id: `call_fake_${seq}`,
-        name,
+        ...tool,
         arguments: args,
         status: 'completed',
       }
@@ -131,7 +147,15 @@ const server = http.createServer((req, res) => {
     }
     const path = (req.url ?? '').split('?')[0]
     if (req.method === 'POST' && /\/responses$/.test(path)) {
-      note(`POST ${path} tools=${toolNames(body?.tools).filter(n => /mcp|__/.test(n)).join(',')}`)
+      const input = Array.isArray(body?.input) ? body.input : []
+      const last = input[input.length - 1]
+      const takoTools = (Array.isArray(body?.tools) ? body.tools : [])
+        .filter(t => /tako/.test(t?.name ?? ''))
+        .map(t => `${t.type}:${t.name}`)
+      note(
+        `POST ${path} last=${last?.type ?? last?.role ?? '-'} tako=${takoTools.join(',')} ` +
+          `tools=${toolNames(body?.tools).filter(n => /mcp|__/.test(n)).join(',')}`,
+      )
       const send = () => reply(res, answer(body))
       if (delay > 0) setTimeout(send, delay)
       else send()

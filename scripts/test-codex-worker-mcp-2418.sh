@@ -381,8 +381,10 @@ run_gui() {
   master="$("$TAKO_BIN" list | jq -r '.tabs[0].panes[0].id')"
   : >"$TMP/mcp.log"
   : >"$API_TMP/fake.log"
+  # 最初の依頼で tako の MCP を呼ばせる（偽 API が tako_show_command を呼ぶ → 結果が来たら CARD-DONE）。
+  # spawn の依頼は送達確認つきで届く（2 通目を `tako send` で送ると codex の入力欄に残って送信されないことがあった）
   resp="$("$TAKO_BIN" orchestrator spawn --project p1 --pane "$master" --label m --agent codex \
-    --prompt "Reply with exactly one word: READY" 2>&1)"
+    --prompt 'Show this card: {"commands":["echo 2418"],"label":"t2418"}' 2>&1)"
   pane="$(jq -r '.pane_id // empty' <<<"$resp" 2>/dev/null)"
   if [ -z "$pane" ]; then
     bad "spawn が通らない: $(printf '%s' "$resp" | head -c 300)"
@@ -423,14 +425,18 @@ run_gui() {
   check "$(started user-keep)" "[gui] プロジェクトで足した user-keep は立つ"
   check "$(started proj-shared)" "[gui] 同名の .codex/config.toml 側（proj-shared）は立つ"
   check "$(started proj-only)" "[gui] .codex/config.toml の proj-only は立つ"
-  # tako の MCP を呼ぶ（偽 API が tako_show_command を呼ぶ → 結果が来たら CARD-DONE）
-  "$TAKO_BIN" send --pane "$pane" 'Show this card: {"commands":["echo 2418"],"label":"t2418"}' >/dev/null 2>&1
   ok=0
   for i in $(seq 1 60); do
     if grep -q "CARD-DONE" <<<"$("$TAKO_BIN" read --pane "$pane" 2>/dev/null)"; then ok=1; break; fi
     sleep 0.5
   done
   check "$ok" "[gui] worker から tako の MCP（tako_show_command）が呼べた"
+  if [ "$ok" != 1 ]; then
+    echo "  画面（末尾）:"
+    "$TAKO_BIN" read --pane "$pane" 2>/dev/null | sed '/^[[:space:]]*$/d' | tail -15 | sed "s#$TMP#<tmp>#g; s/^/    /"
+    echo "  偽 API が受けた要求:"
+    cut -c1-200 "$API_TMP/fake.log" | sed 's/^/    /'
+  fi
   "$TAKO_BIN" close --pane "$pane" --force >/dev/null 2>&1
   for i in $(seq 1 40); do
     kill -0 "$cpid" 2>/dev/null || break

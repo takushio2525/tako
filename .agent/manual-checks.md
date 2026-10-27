@@ -1147,8 +1147,8 @@ Windows CI のテスト（`crates/tako-control/src/ipc.rs` の `windows_tests::i
 止める名前の判断・`-c` の組み立て・置く位置は単体テストと番犬（`issue2412_worker_mcp_scope_watchdog`）で、
 実物の codex（0.154.0）が止めた server の子を立てない・プロジェクトで足した MCP と `.codex/config.toml` の MCP は立つ・
 設定がずれても目印つきなら起動する・壊れた config.toml の扱いは GUI を使わない腕
-（`ARMS="headless-before headless-new edge" bash scripts/test-codex-worker-mcp-2418.sh`）で実測済み。
-**GUI 経由の spawn は 2026-10-27 時点で未実測**（蓋閉じで tako-vd が描画できなかった）。蓋を開けて次を確かめる:
+（`ARMS="headless-before headless-new edge" bash scripts/test-codex-worker-mcp-2418.sh`）で、隔離 GUI からの spawn は
+`ARMS=new`（tako-vd が描画できる = 蓋が開いているとき）で 2026-10-27 に実測済み（PASS=14）。版を上げたら次を確かめる:
 
 - [ ] `bash scripts/test-codex-worker-mcp-2418.sh`（既定の腕。`new` = 隔離 GUI）が PASS する。spawn の応答の
       `mcp` が `mode: tako_only`・`denied: [user-alpha, user-beta, user-web]`・`kept: [user-keep]`・`shadowed: [user-shared]`、
