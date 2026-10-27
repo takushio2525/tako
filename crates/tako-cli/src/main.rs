@@ -6682,24 +6682,29 @@ fn shell_integration_local(args: &ShellIntegrationArgs) -> Result<(), String> {
         "  届け方   : {}",
         match delivery {
             "automatic" => "環境変数の注入（ユーザーのファイルは触らない）",
-            "profile" => "PowerShell の $PROFILE へブロックを配置",
+            "launch" => "tako が開く PowerShell へ起動時に読ませる（$PROFILE は触らない）",
             other => other,
         }
     );
     if let Some(script) = out["script"].as_str() {
         println!("  スクリプト: {script}");
     }
-    for t in out["targets"].as_array().into_iter().flatten() {
-        let state = match (t["installed"].as_bool(), t["up_to_date"].as_bool()) {
-            (Some(true), Some(true)) => "配置済み",
-            (Some(true), _) => "配置済み（内容が古い。install で更新できます）",
-            _ => "未配置",
-        };
+    if let Some(shell) = out["launch_shell"].as_str() {
+        println!("  シェル   : {shell}");
+    }
+    // #2432: 以前の版が置いた `$PROFILE` のブロックが残っている（移行が取り除けなかった）
+    let legacy = out["legacy_blocks"].as_array().cloned().unwrap_or_default();
+    if !legacy.is_empty() {
         println!(
-            "  - {:<24} {state}\n    {}",
-            t["label"].as_str().unwrap_or("?"),
-            t["path"].as_str().unwrap_or("?")
+            "  [注意] 以前の版が $PROFILE に置いた管理ブロックが残っています（取り除くには tako shell-integration uninstall）"
         );
+        for b in &legacy {
+            println!(
+                "  - {}\n    {}",
+                b["label"].as_str().unwrap_or("?"),
+                b["path"].as_str().unwrap_or("?")
+            );
+        }
     }
     for c in out["changes"].as_array().into_iter().flatten() {
         println!(

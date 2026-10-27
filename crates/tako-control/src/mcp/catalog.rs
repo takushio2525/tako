@@ -2967,15 +2967,15 @@ pub fn tools() -> Vec<Value> {
         // 出自: #525 / #467
         json!({
             "name": "tako_shell_integration",
-            "description": "シェル統合（OSC 7 / 133）の配置状態の確認と配置・解除。\
+            "description": "シェル統合（OSC 7 / 133）の状態の確認。\
                 これが効いていないとペインの cwd 追従（`list` の cwd）とコマンド実行状態\
                 （idle / running / failed）が取れない。\
-                action: status（既定。状態だけ返す）/ install / uninstall。\
-                unix は環境変数の注入だけで完結するので配置操作は要らない（uninstall はエラー）。\
-                Windows は PowerShell の $PROFILE へマーカー付きブロックを 1 個置く（冪等）。\
-                **応答の installed は「配置できたか」で effective は「実際に効くか」**で、\
-                器（永続バックエンド）が OSC を通さないと配置済みでも効かない。\
-                効かない理由は blocked_by_backend に入る。",
+                action: status（既定。状態だけ返す）/ install（スクリプトを書き出し直す）/ \
+                uninstall（以前の版が $PROFILE に置いた管理ブロックを外す）。\
+                どの OS もユーザーのファイルは書かない: unix は環境変数の注入、Windows は \
+                tako がペインの PowerShell を起こすときの起動引数で読ませる（delivery: automatic / launch）。\
+                **応答の installed は「届け方が整っているか」で effective は「実際に効くか」**で、\
+                器（永続バックエンド）が OSC を通さないと効かない。理由は blocked_by_backend に入る。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

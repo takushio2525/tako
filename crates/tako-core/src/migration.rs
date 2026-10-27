@@ -116,6 +116,14 @@ pub enum SchemaId {
     ClaudeModMark,
     /// `<data_dir>/run-configs.json`（Code Runner の実行設定 = 選んだ実行環境・プロファイル。#1731）
     RunConfigs,
+    /// 利用者の PowerShell の `$PROFILE`（`CurrentUserAllHosts`）にある **tako の管理ブロック**（#2432）。
+    ///
+    /// #525〜#2432 の間、`tako setup` / `tako shell-integration install` が Windows で
+    /// シェル統合を読ませるために書いていた。#2432 からはペインの起動引数で読ませるので、
+    /// 移行は**そのブロックだけ**を取り除く（ブロックの外の行はバイトのまま残す・空になった
+    /// ファイルは消す・書き換える前の中身は `.pre-v1.bak` に残す）。tako の data dir の外の
+    /// **利用者のファイル**なので形式の検査は持たない。手順は `shell_integration` が持つ
+    PowerShellProfile,
 }
 
 impl SchemaId {
@@ -148,6 +156,7 @@ impl SchemaId {
             Self::ClaudeModUi => "claude_mod_ui",
             Self::ClaudeModMark => "claude_mod_mark",
             Self::RunConfigs => "run_configs",
+            Self::PowerShellProfile => "powershell_profile",
         }
     }
 
@@ -184,6 +193,7 @@ impl SchemaId {
             Self::ClaudeModUi,
             Self::ClaudeModMark,
             Self::RunConfigs,
+            Self::PowerShellProfile,
         ]
     }
 }

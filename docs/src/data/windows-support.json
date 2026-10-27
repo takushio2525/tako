@@ -818,9 +818,9 @@
     {
       "key": "tako_shell_integration",
       "status": "degraded",
-      "note_ja": "cwd 追従とコマンド状態は器（psmux）越しでも側路で届くが、psmux が OSC を素通ししないため status の effective は false のままになる（#766）",
+      "note_ja": "tako のペインの PowerShell は起動引数で統合を読む（$PROFILE は書かない・実行ポリシーが Restricted でも効く。#2432）。器（psmux）越しは側路で届く（#766）。ペインの中で手で起こした入れ子の PowerShell には統合が入らない",
       "evidence": "measured",
-      "evidence_detail": "#766 で側路の state が unknown → idle、exit_code=3、cwd が OSC 7 由来で追従。実機 shell_integration_powershell 7/0（#525）"
+      "evidence_detail": "#766 で側路の state が unknown → idle、exit_code=3、cwd が OSC 7 由来で追従。実機 shell_integration_powershell 7/0（#525）。#2432 の起動引数の形は Windows CI の同テスト（実行ポリシー Restricted）で確認、実機は未実測"
     },
     {
       "key": "tako_show_command",

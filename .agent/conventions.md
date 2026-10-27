@@ -727,7 +727,7 @@ ANSI コードページ**（英語版 = CP1252 / 日本語版 = CP932）とし�
 | `installer/windows/lib/verify-assets.ps1` | CI（`shell: pwsh` で dot-source）と `release-windows.ps1`・`license_bundle_watchdog` が pwsh で | (B) |
 | `scripts/windows/measure-window.ps1` | 開発者の実機計測。本文の Usage が `powershell -File`（5.1）で、もともと 5.1 向けに ASCII で書いてある | (A) |
 | `scripts/windows/check-powershell51.ps1` | CI の windows ジョブが `shell: powershell`（5.1）で走らせる | (A) |
-| `crates/tako-core/shell-integration/tako.ps1` | 利用者の `$PROFILE` から読む（5.1 を含む）。リポジトリの写しは `include_str!` のテンプレートで ASCII（番犬あり）、配置時に BOM を付けて書く | 例外（`EXEMPT`） |
+| `crates/tako-core/shell-integration/tako.ps1` | tako がペインの PowerShell（5.1 を含む）を起こすときにテキストとして読ませる（#2432。それまでは利用者の `$PROFILE` から読んでいた）。リポジトリの写しは `include_str!` のテンプレートで ASCII（番犬あり）、書き出し時に BOM を付ける | 例外（`EXEMPT`） |
 
 - 番犬 `crates/tako-control/tests/powershell51_watchdog.rs` が全 `.ps1` を走査し、どちらでもない
   ファイルを名指しして落とす（新しく足したものにも当たる）。pwsh があれば
@@ -1828,9 +1828,9 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
 - **PTY 起動の失敗理由を捨てない**。セルフテストの `spawn_session` の `Err` を捨てると
   「起動できなかった」が「画面に出ない」として現れ、原因が fixture 側にあるように見える
   （#903 が長引いた理由の 1 つ）。`spawn_error` を診断行に出す
-- **シェル統合を要る項目は「配置されているか」でゲートしない**。Windows の
+- **シェル統合を要る項目は「配置されているか」でゲートしない**。#2432 より前の Windows の
   `shell_integration::status().installed()` は「`$PROFILE` のブロックが *いまの
-  data dir の* `tako.ps1` を指しているか」で決まるので、**`TAKO_ISOLATED=1` が
+  data dir の* `tako.ps1` を指しているか」で決まっていたので、**`TAKO_ISOLATED=1` が
   data dir を pid ごとに変える隔離セルフテストからは配置が見えない**。ここをゲートに
   すると同じ機・同じコードでも起動の仕方で「skip される回」と「走る回」が入れ替わり、
   レシピどおりに回すと**その機能が永久に未検証**になる（項目 41 / 41b の OSC 7 / 133 が

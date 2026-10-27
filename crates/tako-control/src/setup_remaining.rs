@@ -55,7 +55,7 @@ pub enum RemainingKind {
     Mcp { agent: String },
     /// 依存ツールの導入
     Dep { bin: String },
-    /// シェル統合の配置（Windows の `$PROFILE`。#1504）
+    /// シェル統合のスクリプトを用意できなかった（#1504。#2432 から `$PROFILE` には書かない）
     ShellIntegration,
 }
 

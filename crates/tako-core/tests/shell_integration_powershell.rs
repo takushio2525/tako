@@ -1,6 +1,7 @@
 //! PowerShell シェル統合（OSC 7 / 133）の統合テスト（#525）。**実際にシェルを起動して測る**。
 //!
-//! 単体テスト（`shell_integration.rs` 内）は「tako が `$PROFILE` へ何を書くか」を固定する。
+//! 単体テスト（`shell_integration.rs` 内）は「tako がペインの PowerShell をどんな引数で
+//! 起こすか」（#2432）と「以前の版の `$PROFILE` のブロックをどう取り除くか」を固定する。
 //! こちらは **統合スクリプトを読んだ PowerShell が実際に OSC を出すか**、そしてそれが
 //! `TerminalSession` の `command_state()` / `cwd()` へ届くかを見る。
 //! ペインの状態ドット（`tako list` の `state`）はこの 2 つがそのまま出ているので、
@@ -12,8 +13,12 @@
 //!
 //! `encoding_conpty.rs` と同じく、出荷構成（コンソールを持たない GUI プロセス）に合わせて
 //! テスト冒頭で `FreeConsole` する。**ユーザーの `$PROFILE` は一切触らない** —
-//! 統合スクリプトは `-NoProfile` で起動したシェルへドットソースで読ませる
-//! （`$PROFILE` への配置そのものは単体テストと実機 e2e の担当）。
+//! スクリプトそのものの検査は `-NoProfile` で起動したシェルへドットソースで読ませ、
+//! 製品の起動形（`shell_integration::powershell_pane_command`。profile を読む形）の検査は
+//! 実行ポリシーを Process スコープで Restricted にして走らせる（Restricted では
+//! profile のスクリプトが読まれないので、実行環境の profile に揺らされない）。
+//! Restricted を作るのは環境変数 `PSExecutionPolicyPreference`（Process スコープの置き場）だけで、
+//! CurrentUser / LocalMachine のポリシー（レジストリ）は触らない。
 
 #![cfg(windows)]
 
@@ -45,14 +50,38 @@ fn detach_own_console() {
 /// 統合スクリプトを一時ディレクトリへ書き出す。**リポジトリの正本をそのまま使う**
 /// （テスト用に書き直すと、本番と違うものを検証してしまう）
 fn write_script() -> PathBuf {
+    write_script_in(&std::env::temp_dir().join(format!("tako-si-test-{}", std::process::id())))
+}
+
+/// 置き場を選んで書き出す（#2432 の「空白入りの置き場」の検査用）
+fn write_script_in(dir: &Path) -> PathBuf {
     const SCRIPT: &str = include_str!("../shell-integration/tako.ps1");
-    let dir = std::env::temp_dir().join(format!("tako-si-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れること");
+    std::fs::create_dir_all(dir).expect("一時ディレクトリを作れること");
     let path = dir.join("tako.ps1");
     let mut bytes = vec![0xEF, 0xBB, 0xBF];
     bytes.extend_from_slice(SCRIPT.as_bytes());
     std::fs::write(&path, bytes).expect("統合スクリプトを書けること");
     path
+}
+
+/// 実行ポリシーを Restricted にする環境変数（Process スコープ。Windows のクライアント OS の
+/// 既定の CurrentUser / LocalMachine と同じ効き方をし、レジストリは触らない。#2432）
+const RESTRICTED: (&str, &str) = ("PSExecutionPolicyPreference", "Restricted");
+
+/// スクリプト**ファイル**をドットソースする形（スクリプトそのものの検査用。#2432 より前の
+/// `$PROFILE` のブロックと同じく、実行ポリシーの対象になる読ませ方）
+fn dot_source_command(program: &str, script: &Path) -> SpawnCommand {
+    SpawnCommand {
+        program: program.to_string(),
+        args: vec![
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NoExit".into(),
+            "-Command".into(),
+            ".".into(),
+            script.display().to_string(),
+        ],
+    }
 }
 
 fn pwsh7() -> Option<String> {
@@ -90,24 +119,34 @@ impl Pane {
     /// `Cannot find path` で拒否する = 実測）ので、`CreateProcess` へ渡す形でしか
     /// 再現できない
     fn new_in(program: &str, script: &Path, cwd: PathBuf) -> Self {
-        let command = SpawnCommand {
-            program: program.to_string(),
-            args: vec![
-                "-NoLogo".into(),
-                "-NoProfile".into(),
-                "-NoExit".into(),
-                "-Command".into(),
-                ".".into(),
-                script.display().to_string(),
-            ],
-        };
+        Self::spawn(dot_source_command(program, script), cwd, &[])
+    }
+
+    /// **製品の起動形**（#2432）のペイン。tako が素のペインで PowerShell を起こすときと
+    /// 同じ引数（`shell_integration::powershell_pane_command`）で起こす。`extra_env` で
+    /// 実行ポリシー等を足す
+    fn product(program: &str, script: &Path, extra_env: &[(&str, &str)]) -> Self {
+        Self::spawn(
+            tako_core::shell_integration::powershell_pane_command(program, script),
+            std::env::temp_dir(),
+            extra_env,
+        )
+    }
+
+    fn spawn(command: SpawnCommand, cwd: PathBuf, extra_env: &[(&str, &str)]) -> Self {
+        let mut env = vec![("TAKO_PANE_ID".to_string(), "1".to_string())];
+        env.extend(
+            extra_env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string())),
+        );
         let (session, rx) = TerminalSession::spawn(
             120,
             40,
             SpawnOptions {
                 command: Some(command),
                 cwd: Some(cwd),
-                env: vec![("TAKO_PANE_ID".into(), "1".into())],
+                env,
                 scrollback_lines: None,
             },
         )
@@ -204,7 +243,11 @@ impl Pane {
 fn state_transitions(program: &str) {
     detach_own_console();
     let script = write_script();
-    let mut pane = Pane::new(program, &script);
+    run_state_transitions(Pane::new(program, &script));
+}
+
+/// [`state_transitions`] の本体。読ませ方（ドットソース / 製品の起動形）を問わず同じ遷移を見る
+fn run_state_transitions(mut pane: Pane) {
     pane.wait_ready();
 
     // 1) 実行中は Running（OSC 133;C）
@@ -258,7 +301,11 @@ fn state_transitions(program: &str) {
 fn cwd_tracking(program: &str, dir_name: &str) {
     detach_own_console();
     let script = write_script();
-    let mut pane = Pane::new(program, &script);
+    run_cwd_tracking(Pane::new(program, &script), dir_name);
+}
+
+/// [`cwd_tracking`] の本体（読ませ方を問わない）
+fn run_cwd_tracking(mut pane: Pane, dir_name: &str) {
     pane.wait_ready();
 
     let start = pane.session.cwd().map(Path::to_path_buf).expect("初期 cwd");
@@ -711,6 +758,166 @@ fn 器の中でも側路を張れば状態とcwdが届く() {
         tako_core::shell_integration::osc_transport(),
         tako_core::shell_integration::OscTransport::SideChannel,
         "この構成の申告が side-channel になっていない"
+    );
+}
+
+// --- #2432: 製品の起動形（`$PROFILE` に書かず、ペインの起動引数で読ませる）---------------
+
+/// **#2432 の受け入れ条件 1**: 実行ポリシーが Restricted でも、製品の起動形のペインは
+/// idle → running → idle / failed(exit code) を報告する（スクリプトファイルを実行しないので
+/// ポリシーの対象外）。PowerShell 7
+#[test]
+fn 製品の起動形はrestrictedでもpwsh7のペインで状態が報告される() {
+    let Some(program) = pwsh7() else {
+        eprintln!("skip: PowerShell 7 が無い");
+        return;
+    };
+    detach_own_console();
+    let script = write_script();
+    run_state_transitions(Pane::product(&program, &script, &[RESTRICTED]));
+}
+
+/// 同じく Windows PowerShell 5.1（Windows に必ず居る側。pwsh 7 の無い PC の既定シェル）
+#[test]
+fn 製品の起動形はrestrictedでもwindowspowershell51のペインで状態が報告される() {
+    let Some(program) = windows_powershell() else {
+        eprintln!("skip: Windows PowerShell 5.1 が無い");
+        return;
+    };
+    detach_own_console();
+    let script = write_script();
+    run_state_transitions(Pane::product(&program, &script, &[RESTRICTED]));
+}
+
+/// 実行ポリシーが Restricted でも cwd が追従する（OSC 7）
+#[test]
+fn 製品の起動形はrestrictedでもcwdが追従する() {
+    let Some(program) = pwsh7().or_else(windows_powershell) else {
+        eprintln!("skip: PowerShell が無い");
+        return;
+    };
+    detach_own_console();
+    let script = write_script();
+    run_cwd_tracking(
+        Pane::product(&program, &script, &[RESTRICTED]),
+        &format!("tako-2432-cwd-{}", std::process::id()),
+    );
+}
+
+/// **このテスト群の検出力**: 同じ Restricted で、スクリプト**ファイル**をドットソースする
+/// 読ませ方（#2432 より前の `$PROFILE` のブロックと同じ）は統合が読めない。ここが崩れたら
+/// 上の 3 本は Restricted を作れていない（= 緑でも受け入れ条件の証拠にならない）
+#[test]
+fn ファイルをドットソースする読ませ方はrestrictedでは統合が読めない() {
+    let Some(program) = pwsh7().or_else(windows_powershell) else {
+        eprintln!("skip: PowerShell が無い");
+        return;
+    };
+    detach_own_console();
+    let script = write_script();
+    let mut pane = Pane::spawn(
+        dot_source_command(&program, &script),
+        std::env::temp_dir(),
+        &[RESTRICTED],
+    );
+    // プロンプトが出るまで待つ（統合が読めていれば Idle になるが、ここではならない）
+    let prompted = pane.wait(Duration::from_secs(30), |s| {
+        s.visible_lines().iter().any(|l| l.contains("PS "))
+    });
+    pane.send_line("cmd.exe /c exit 3");
+    let leaked = pane.wait_state(CommandState::Failed(3), Duration::from_secs(10));
+    assert!(prompted, "プロンプトが出ない\n{}", pane.screen());
+    assert!(
+        !leaked,
+        "Restricted なのにスクリプトファイルが読めている（RESTRICTED の作り方が効いていない）\n{}",
+        pane.screen()
+    );
+    assert_eq!(
+        pane.session.command_state(),
+        CommandState::Unknown,
+        "{}",
+        pane.screen()
+    );
+}
+
+/// 製品の起動形は**ペインの実行ポリシーを緩めない**。`-ExecutionPolicy Bypass` で起こすと
+/// Process スコープ（環境変数 `PSExecutionPolicyPreference`）が Bypass になり、ペインの中で
+/// 起こす子の PowerShell（エージェントや npm が起こすもの）まで Bypass を受け継ぐ
+#[test]
+fn 製品の起動形はペインの実行ポリシーを緩めない() {
+    let Some(program) = pwsh7().or_else(windows_powershell) else {
+        eprintln!("skip: PowerShell が無い");
+        return;
+    };
+    detach_own_console();
+    let script = write_script();
+    let mut pane = Pane::product(&program, &script, &[RESTRICTED]);
+    pane.wait_ready();
+    // 打った行（`"EP=" + …`）には `EP=Restricted` が現れないので、出力だけを拾える
+    pane.send_line(
+        "Write-Output ('EP=' + (Get-ExecutionPolicy) + ';ENV=' + $env:PSExecutionPolicyPreference)",
+    );
+    let ok = pane.wait(Duration::from_secs(20), |s| {
+        s.visible_lines()
+            .iter()
+            .any(|l| l.contains("EP=Restricted;ENV=Restricted"))
+    });
+    assert!(ok, "ペインの実行ポリシーが変わっている\n{}", pane.screen());
+}
+
+/// 統合スクリプトの置き場に空白があっても読める（`-EncodedCommand` で渡すので、ConPTY の
+/// argv・PowerShell の引数解釈の層で引用符が崩れない。ユーザー名に空白がある PC の
+/// `%APPDATA%\tako` がこれに当たる）。5.1 は引用符の取りこぼしで落ちやすい側なのでこちらで見る
+#[test]
+fn 置き場に空白があっても製品の起動形で読める() {
+    let Some(program) = windows_powershell().or_else(pwsh7) else {
+        eprintln!("skip: PowerShell が無い");
+        return;
+    };
+    detach_own_console();
+    let dir = tako_core::test_residue::ScratchDir::new("i2432-space");
+    let script = write_script_in(&dir.path().join("tako data").join("shell integration"));
+    let mut pane = Pane::product(&program, &script, &[RESTRICTED]);
+    pane.wait_ready();
+    pane.send_line("cmd.exe /c exit 5");
+    assert!(
+        pane.wait_state(CommandState::Failed(5), Duration::from_secs(20)),
+        "空白入りの置き場から統合が読めていない（state={:?}）\n{}",
+        pane.session.command_state(),
+        pane.screen()
+    );
+}
+
+/// 置き場が消えていても**赤いエラーを出さず**素のシェルとして使える（data dir を消された・
+/// 器の中の古いセッションが前の置き場を指している、等）
+#[test]
+fn 置き場が無ければ黙って素のシェルになる() {
+    let Some(program) = pwsh7().or_else(windows_powershell) else {
+        eprintln!("skip: PowerShell が無い");
+        return;
+    };
+    detach_own_console();
+    let dir = tako_core::test_residue::ScratchDir::new("i2432-missing");
+    let missing = dir.path().join("gone").join("tako.ps1");
+    let mut pane = Pane::product(&program, &missing, &[RESTRICTED]);
+    let prompted = pane.wait(Duration::from_secs(30), |s| {
+        s.visible_lines().iter().any(|l| l.contains("PS "))
+    });
+    pane.send_line("Write-Output ('ALIVE=' + (1 + 1))");
+    let alive = pane.wait(Duration::from_secs(20), |s| {
+        s.visible_lines().iter().any(|l| l.contains("ALIVE=2"))
+    });
+    let screen = pane.screen();
+    assert!(prompted && alive, "シェルとして使えない\n{screen}");
+    assert_eq!(
+        pane.session.command_state(),
+        CommandState::Unknown,
+        "{screen}"
+    );
+    // 起動コマンドの中身（パスや Test-Path）が画面にエラーとして出ていない
+    assert!(
+        !screen.contains("tako.ps1") && !screen.contains("__takoShellIntegrationScript"),
+        "起動コマンドがエラーとして画面に出ている\n{screen}"
     );
 }
 

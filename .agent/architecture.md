@@ -647,7 +647,17 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   dispatch の list（CLI / MCP）に `cwd` / `state` / `exit_code` として公開。
   シェル統合の注入は `tako-core::shell_integration`（zsh = ZDOTDIR / bash = PROMPT_COMMAND /
   fish = XDG_DATA_DIRS の 3 点セットを判定なしで常時注入。
-  `TAKO_NO_SHELL_INTEGRATION=1` で無効化。PowerShell は Phase 6）
+  `TAKO_NO_SHELL_INTEGRATION=1` で無効化）
+- **PowerShell（Windows）は起動引数で読ませる**（#2432。#525〜#2432 は `$PROFILE` へ管理ブロックを
+  書いていた）。素のペインのシェルを決める 3 か所（器なし = `TerminalSession::spawn`、器 =
+  `tmux_backend::wrap_options` / `PsmuxBackend::wrap_spawn`）が `shell_integration::pane_shell()` を引き、
+  Windows だけ `-NoExit -EncodedCommand <統合スクリプトをテキストで読み [scriptblock]::Create で実行>`
+  を足す（unix は `None` = 従来どおり。tmux へコマンドを渡すと zsh ラッパーが ZDOTDIR を食うため）。
+  スクリプトファイルを実行しないので実行ポリシー（Restricted を含む）の対象外で、`-NoProfile` を
+  付けないのでユーザーの profile も今までどおり読まれる。`-ExecutionPolicy Bypass` は採らない
+  （ペインと子の PowerShell の Process スコープまで緩むため）。既知の制限: ペインの中で手で起こした
+  入れ子の PowerShell には統合が入らない。残った `$PROFILE` のブロックは移行
+  （`SchemaId::PowerShellProfile`）が取り除く
 - **listen ポート検知** → 検知層は実装済み（2026-06-12、FR-2.4.2。`tako-core::ports`）
   - macOS: libproc（`proc_listpids` → `proc_bsdinfo.e_tdev` とペインの PTY スレーブ rdev の
     突き合わせで「ペイン配下」を判定 → `PROC_PIDLISTFDS` + `PROC_PIDFDSOCKETINFO` で

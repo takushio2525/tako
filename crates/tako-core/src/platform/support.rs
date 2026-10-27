@@ -204,9 +204,10 @@ pub mod notes {
         "引き継ぎ再起動は使える。ハーネス更新（会話を保ったまま CLI を建て直す）の終了要求は #1599 で Windows にも入ったが、Windows には穏当な終了要求が無いので CLI は後始末の機会なく強制終了（TerminateProcess）される。終了 → シェルの復帰 → --resume の送達の通しは Windows 実機で未実測（#1067 / #1599）",
         "Restarting with a handoff works. Process termination for the harness update (rebuilding the CLI while keeping the conversation) now exists on Windows (#1599), but Windows has no graceful termination request, so the CLI is force-terminated (TerminateProcess) without a chance to clean up. The full run (terminate, shell returns, --resume delivered) has not been measured on real Windows hardware (#1067 / #1599)",
     );
-    pub const WIN_SHELL_INTEGRATION_PSMUX: Note = Note::new(
-        "cwd 追従とコマンド状態は器（psmux）越しでも側路で届くが、psmux が OSC を素通ししないため status の effective は false のままになる（#766）",
-        "cwd tracking and command state are delivered through a side channel even inside the psmux container, but because psmux does not pass OSC through, the status field effective stays false (#766)",
+    /// #2432 で `$PROFILE` への配置をやめ、ペインの PowerShell の起動引数で読ませる形にした
+    pub const WIN_SHELL_INTEGRATION: Note = Note::new(
+        "tako のペインの PowerShell は起動引数で統合を読む（$PROFILE は書かない・実行ポリシーが Restricted でも効く。#2432）。器（psmux）越しは側路で届く（#766）。ペインの中で手で起こした入れ子の PowerShell には統合が入らない",
+        "PowerShell in a tako pane loads the integration through its launch arguments (nothing is written to $PROFILE and it works under a Restricted execution policy; #2432). Inside the psmux container it arrives through a side channel (#766). A nested PowerShell you start by hand inside a pane does not get the integration",
     );
 
     /// #937 / #2434。確認とノート表示は動く。適用（インストーラーの検査・無言の実行・
@@ -1709,10 +1710,10 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_shell_integration",
         macos: Support::Supported,
         windows: Support::Degraded {
-            note: notes::WIN_SHELL_INTEGRATION_PSMUX,
+            note: notes::WIN_SHELL_INTEGRATION,
         },
         windows_evidence: Evidence::Measured(
-            "#766 で側路の state が unknown → idle、exit_code=3、cwd が OSC 7 由来で追従。実機 shell_integration_powershell 7/0（#525）",
+            "#766 で側路の state が unknown → idle、exit_code=3、cwd が OSC 7 由来で追従。実機 shell_integration_powershell 7/0（#525）。#2432 の起動引数の形は Windows CI の同テスト（実行ポリシー Restricted）で確認、実機は未実測",
         ),
     },
     Feature {

@@ -733,6 +733,11 @@ pub const SPECS: &[SchemaSpec] = &[
     // 版数フィールドを持つ。S4 以降で項目を足すときは serde の default で旧ファイルがそのまま
     // 読めるので Step は要らない（形を変えるときだけ target_version を上げて Step を足す）
     versioned(SchemaId::RunConfigs, Some(validate_run_configs)),
+    // #2432: 以前の版が利用者の `$PROFILE` に置いたシェル統合の管理ブロック。**ファイルを消す**
+    // ことがある（ブロックだけのプロファイル）のでテキスト置換の Step では表せない。
+    // 手順は `shell_integration::strip_legacy_block`、ここは**発火と可視化だけ**を引き受ける
+    // （[`powershell_profile_reports`]）。利用者のファイルなので形式の検査は持たない
+    pristine(SchemaId::PowerShellProfile, None),
 ];
 
 /// 種別から登録を引く
@@ -790,6 +795,8 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
         SchemaId::RemoteDesired => single("remote/tako-remote.desired"),
         SchemaId::ClaudeModUi => tako_core::claude_mod_ui::ui_path().into_iter().collect(),
         SchemaId::RunConfigs => crate::run_configs::store_path().into_iter().collect(),
+        // #2432: 利用者の `$PROFILE`。走査ではなく専用実装へ委譲する（[`powershell_profile_reports`]）
+        SchemaId::PowerShellProfile => Vec::new(),
         // #1959: data dir の外（設定 dir ごと）。置く先の解決は claude_mod_install の 1 実装
         SchemaId::ClaudeModMark => crate::claude_mod_install::collect_targets(
             &crate::claude_mod_install::target_inputs(&[]),
@@ -963,6 +970,12 @@ fn run_inner(mode: Mode, only: Option<SchemaId>, proposals: Proposals) -> Migrat
         }
         if spec.id == SchemaId::Setup {
             for file in setup_reports(mode) {
+                report.push(file);
+            }
+            continue;
+        }
+        if spec.id == SchemaId::PowerShellProfile {
+            for file in powershell_profile_reports(mode) {
                 report.push(file);
             }
             continue;
@@ -1191,6 +1204,60 @@ fn setup_failed(to: &Path, reason: String) -> FileReport {
 const SETUP_V1_TO_V2: Note = Note::new(
     "setup の生成物を data dir の外から <data_dir>/setup へ移す（#1019）",
     "Move the setup artifacts from outside the data dir into <data_dir>/setup (#1019)",
+);
+
+/// 以前の版が `$PROFILE` に置いたシェル統合の管理ブロックを取り除く（#2432）。
+///
+/// どこに残っているかは `shell_integration::legacy_blocks`（Windows だけ。unix と検証プロセスは
+/// 常に空 = 隔離した検証が利用者の本物のプロファイルを書き換えない）。判定と書き換えは
+/// tako-core の 1 実装で、ここは結果を [`MigrationReport`] の語彙へ翻訳するだけ
+fn powershell_profile_reports(mode: Mode) -> Vec<FileReport> {
+    powershell_profile_reports_for(tako_core::shell_integration::legacy_blocks(), mode)
+}
+
+/// [`powershell_profile_reports`] の本体（対象を渡せるので一時置き場で検査できる）。
+///
+/// Check と Apply で**同じ 1 本**を通す（予告と報告が食い違わない）。退避先は機構の
+/// 作法どおり `<profile>.pre-v1.bak`（既にあれば上書きしない）。失敗したら元のファイルは
+/// 無傷のまま `Failed` を返し、次の発火でまた試される
+fn powershell_profile_reports_for(
+    blocks: Vec<tako_core::shell_integration::LegacyBlock>,
+    mode: Mode,
+) -> Vec<FileReport> {
+    blocks
+        .into_iter()
+        .map(|block| {
+            let backup = migration::backup_path(&block.path, 1);
+            let migrated = FileOutcome::Migrated {
+                from: 1,
+                to: 2,
+                backup: backup.clone(),
+                applied: vec![POWERSHELL_PROFILE_V1_TO_V2],
+            };
+            let outcome = if mode == Mode::Check {
+                migrated
+            } else {
+                match tako_core::shell_integration::strip_legacy_block(&block.path, Some(&backup)) {
+                    Ok(tako_core::shell_integration::ChangeKind::Absent) => {
+                        // 見てから書き換えるまでの間に別の発火点が済ませた
+                        FileOutcome::UpToDate { version: 2 }
+                    }
+                    Ok(_) => migrated,
+                    Err(reason) => FileOutcome::Failed { reason },
+                }
+            };
+            FileReport {
+                id: SchemaId::PowerShellProfile,
+                path: block.path,
+                outcome,
+            }
+        })
+        .collect()
+}
+
+const POWERSHELL_PROFILE_V1_TO_V2: Note = Note::new(
+    "以前の版が $PROFILE に置いたシェル統合の管理ブロックを取り除く（統合は tako のペインの起動時に読む。他の行はそのまま・ブロックだけのファイルは消す。#2432）",
+    "Remove the shell integration block an earlier tako put in $PROFILE (tako now loads it when it starts a pane; other lines are kept and a file holding only the block is deleted. #2432)",
 );
 
 /// `handoff_store` の書き込みが作る世代バックアップ（`<name>.bak.1`）。
@@ -1958,6 +2025,104 @@ mod tests {
         let failed = setup_failed(&to, "退避に失敗".into());
         assert!(failed.outcome.needs_attention());
         assert_eq!(file_json(&failed, true)["state"], "failed");
+    }
+
+    /// #2432: `$PROFILE` の管理ブロックも番地に載るが、走査ではなく専用実装へ委譲する
+    #[test]
+    fn powershellのプロファイルは番地に載るが走査対象を持たない() {
+        let spec = spec(SchemaId::PowerShellProfile).expect("登録されている");
+        assert!(spec.is_pristine(), "テキスト置換の手順は持たない");
+        assert!(
+            targets(SchemaId::PowerShellProfile).is_empty(),
+            "ファイル走査ではなく shell_integration::strip_legacy_block へ委譲する"
+        );
+        assert!(
+            spec.validate.is_none(),
+            "利用者のファイルなので形式は問わない"
+        );
+        // 検証プロセス（このテスト）は利用者の本物のプロファイルを見に行かない
+        assert!(powershell_profile_reports(Mode::Apply).is_empty());
+    }
+
+    /// #2432 の受け入れ条件 2: 以前の版が置いたブロックだけを取り除き、他人の行は残す。
+    /// ブロックだけのプロファイルは消し、どちらも書き換える前の中身を `.pre-v1.bak` に残す。
+    /// 見るだけ（Check）は 1 バイトも書かない。2 回目は何も起きない（冪等）
+    #[test]
+    fn powershellのプロファイルからブロックだけを取り除く() {
+        use tako_core::shell_integration::{legacy_blocks_in, LegacyBlock};
+        let dir = temp_dir("ps-profile-2432");
+        const BLOCK: &str = "# >>> tako shell integration >>>\n\
+             if ($env:TAKO_PANE_ID) {\n\
+             \x20   $__takoShellIntegrationScript = 'C:\\tako\\tako.ps1'\n\
+             \x20   if (Test-Path -LiteralPath $__takoShellIntegrationScript) { . $__takoShellIntegrationScript }\n\
+             }\n\
+             # <<< tako shell integration <<<\n";
+        let mixed = dir.join("PowerShell").join("profile.ps1");
+        let only = dir.join("WindowsPowerShell").join("profile.ps1");
+        std::fs::create_dir_all(mixed.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(only.parent().unwrap()).unwrap();
+        let user = "Import-Module posh-git\r\n";
+        let mixed_before = format!("{user}\n{BLOCK}oh-my-posh init pwsh | Invoke-Expression\r\n");
+        std::fs::write(&mixed, &mixed_before).unwrap();
+        let mut only_before = vec![0xEF, 0xBB, 0xBF];
+        only_before.extend_from_slice(BLOCK.as_bytes());
+        std::fs::write(&only, &only_before).unwrap();
+        let candidates = vec![
+            ("PowerShell 7".to_string(), mixed.clone()),
+            ("Windows PowerShell 5.1".to_string(), only.clone()),
+        ];
+        let blocks: Vec<LegacyBlock> = legacy_blocks_in(&candidates);
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+
+        // 見るだけ: 予告は出すが書かない
+        let planned = powershell_profile_reports_for(blocks.clone(), Mode::Check);
+        assert_eq!(planned.len(), 2);
+        assert!(planned.iter().all(|r| r.id == SchemaId::PowerShellProfile));
+        assert!(planned.iter().all(|r| r.outcome.changed()));
+        assert_eq!(std::fs::read_to_string(&mixed).unwrap(), mixed_before);
+        assert_eq!(std::fs::read(&only).unwrap(), only_before);
+        assert!(!migration::backup_path(&mixed, 1).exists());
+
+        // 当てる
+        let done = powershell_profile_reports_for(blocks, Mode::Apply);
+        for report in &done {
+            assert!(
+                matches!(report.outcome, FileOutcome::Migrated { from: 1, to: 2, .. }),
+                "{report:?}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&mixed).unwrap(),
+            format!("{user}oh-my-posh init pwsh | Invoke-Expression\r\n"),
+            "ブロックの外の行（CRLF を含む）はそのまま残る"
+        );
+        assert!(!only.exists(), "ブロックだけのプロファイルは消える");
+        assert_eq!(
+            std::fs::read_to_string(migration::backup_path(&mixed, 1)).unwrap(),
+            mixed_before
+        );
+        assert_eq!(
+            std::fs::read(migration::backup_path(&only, 1)).unwrap(),
+            only_before
+        );
+        let json = file_json(&done[0], true);
+        assert_eq!(json["state"], "migrated");
+        assert_eq!(json["steps"][0], POWERSHELL_PROFILE_V1_TO_V2.text());
+
+        // 2 回目: もう残っていないので対象に上がらない
+        assert!(legacy_blocks_in(&candidates).is_empty());
+
+        // 見てから当てるまでに別の発火点が済ませた回は「最新」と言う（書き換えたことにしない）
+        std::fs::write(&mixed, "Set-Alias ll Get-ChildItem\n").unwrap();
+        let raced = powershell_profile_reports_for(
+            vec![LegacyBlock {
+                label: "PowerShell 7".to_string(),
+                path: mixed.clone(),
+            }],
+            Mode::Apply,
+        );
+        assert_eq!(raced[0].outcome, FileOutcome::UpToDate { version: 2 });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// トークン・秘匿情報を持つ種別は読めなくても**写しを残さない**。

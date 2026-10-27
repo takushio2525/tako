@@ -199,7 +199,7 @@ tako setup --changes --json
 tako setup --reset
 ```
 
-`tako setup` は**シェル統合**（ペインの作業ディレクトリ追従・コマンドの実行状態・入力予測）の配置も自分で行います。macOS / Linux は tako が開くシェルへ環境変数を渡すだけで効くので設定ファイルには何も書かず、状態が 1 行出るだけです。**Windows は PowerShell のプロファイル（`$PROFILE`）への追記が必要**なので、どのファイルへ何を書くか（置くのは tako の管理ブロック 1 個だけで既存の行はそのまま残ること・`tako shell-integration uninstall` で元に戻せること）を表示してから配置します。2 回目以降は差分がなければ何も書きません。配置できなかったときも setup は最後まで走り、`tako shell-integration install` を「残り」として案内します。状態だけ見たいときは `tako shell-integration` または `tako setup --check` です。
+`tako setup` は**シェル統合**（ペインの作業ディレクトリ追従・コマンドの実行状態・入力予測）のスクリプトも用意します。**どの OS も設定ファイルには何も書かず**、状態が 1 行出るだけです。macOS / Linux は tako が開くシェルへ環境変数を渡すだけで効き、Windows は tako がペインの PowerShell を開くときに読み込ませます（`$PROFILE` は書き換えず、実行ポリシーが Restricted の PC でも効き、tako の外の PowerShell には影響しません）。以前の版が `$PROFILE` に足した管理ブロックは自動の移行が取り除きます（他の行はそのまま）。用意できなかったときも setup は最後まで走り、`tako shell-integration install` を「残り」として案内します。状態だけ見たいときは `tako shell-integration` または `tako setup --check` です。
 
 `tako setup` の最後には、**スマホから使えるか**を `スマホからの接続: …` の 1 行で出します。Tailscale の導入・ログイン・証明書・公開の状態を**読むだけ**で（何も入れず何も起動しません）、その状態で次に打つコマンドを添えます。Tailscale が未導入なら `tako setup deps install`（依存チェックの段で出るものと同じ案内）、入っていて途中まで済んでいるなら `tako remote setup`、公開まで済んでいれば接続先の URL です。Tailscale が入っているのに実行できないときは「未導入」とは言わず `Tailscale を実行できませんでした` と出します。Tailscale が応答しないときは `[確認できません] tailscale status --json（10 秒応答なし）` と出して先へ進むので、setup が止まることはありません。
 
@@ -1886,8 +1886,8 @@ tako queue start 12          # メモリの逼迫で起動を待っている age
                              # 圧が戻ると自動で起きる。再起動後の復元は master から 1 本ずつ時差で起きる）
 
 tako shell-integration           # シェル統合（cwd 追従・コマンド実行状態）が効いているか
-tako shell-integration install   # 配置する（tako setup が自分で通るので普段は不要）
-tako shell-integration uninstall # 配置を取り除く（書き足したブロックだけを消す）
+tako shell-integration install   # スクリプトを書き出し直す（tako setup が自分で通るので普段は不要）
+tako shell-integration uninstall # 以前の版が $PROFILE に足したブロックだけを外す（普段は自動の移行が済ませる）
 
 tako mod                     # tako mod（Claude Code の mod）の状態。ペインごとの ctx・使用制限・ターンの報告と、届かない理由
 tako mod off                 # 次に作るペインから mod を読ませない（動いている claude には効かない）

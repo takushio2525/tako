@@ -1,12 +1,17 @@
 # tako shell integration (PowerShell) -- emits OSC 7 (cwd) / OSC 133 (prompt marks). FR-2.4.1 / #525
 #
-# Dot-sourced from the user's $PROFILE by the marker block that `tako setup` writes.
-# It does nothing outside a tako pane, so leaving it in the profile is harmless.
+# Loaded by tako itself when it starts PowerShell in a pane: the pane is started with
+# -NoExit -EncodedCommand, and that command reads this file as text and runs it as a script
+# block (#2432). Nothing is written to the user's $PROFILE, and the execution policy does
+# not apply (it governs script FILES, not command text), so a Restricted machine works too.
+# Older tako versions dot-sourced this from a marker block in $PROFILE; the guard below makes
+# a second load a no-op, and the automatic migration removes that block.
+# It does nothing outside a tako pane.
 #
 # ASCII ONLY. Windows PowerShell 5.1 reads a BOM-less .ps1 as the ANSI code page
-# (CP932 on a Japanese Windows), so any non-ASCII byte here would be mangled once this
-# text lives next to a profile that has no BOM. Non-ASCII data (a script path with
-# Japanese characters) is escaped as [char]0xNNNN by the writer, never embedded raw.
+# (CP932 on a Japanese Windows), so any non-ASCII byte here would be mangled if this file
+# were ever copied without its BOM. Non-ASCII data (a script path with Japanese
+# characters) is escaped as [char]0xNNNN by the writer, never embedded raw.
 #
 # Works on Windows PowerShell 5.1 and PowerShell 7+.
 
