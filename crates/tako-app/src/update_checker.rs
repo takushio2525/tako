@@ -18,6 +18,11 @@
 //! macOS 先行リリース + Windows アセット後付け（#594 の運用）をしても、
 //! Windows 側に「更新はあるがダウンロードできない」通知が出ない。
 //! アセット命名規則の正は `tako_core::platform::release_assets`。
+//!
+//! Windows の適用（#2434）: 配布物は Inno Setup のインストーラーなので、zip の展開・`.app` の
+//! 差し替えは使わない。インストーラーを検査して無言で起こし、tako が抜けたあとの入れ替えと
+//! 起動し直しはインストーラーに任せる（`crate::platform::installer_update`。経路の振り分けは
+//! [`apply_route`] の 1 か所）
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -25,6 +30,8 @@ use std::time::Duration;
 
 use tako_core::platform::release_assets::{self, Arch};
 use tako_core::platform::support::Platform;
+
+use crate::platform::installer_update;
 
 /// 更新チェック間隔（24 時間）
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -148,6 +155,10 @@ pub struct UpdateInfo {
     /// リリースノート本文（GitHub Releases の `body`。#616 のアップデート画面で表示）。
     /// 追加の API リクエストは要らない（/releases の応答に既に含まれている）
     pub notes: Option<String>,
+    /// 配布物の大きさ（asset の `size`）。Windows の腕が受けたインストーラーと突き合わせる（#2434）
+    pub asset_size: Option<u64>,
+    /// 配布物の sha256（asset の `digest` = `sha256:<16 進>`。#2434）
+    pub asset_digest: Option<String>,
 }
 
 /// 更新候補を選ぶ基準になる実行環境（#595）。
@@ -319,6 +330,12 @@ pub enum InstallMethod {
     /// .app 実体はあるが brew の cask 台帳に登録されていない（#50）。
     /// brew upgrade 失敗等で台帳と実体が乖離した詰み状態
     BrokenBrew,
+    /// Windows: Inno Setup のインストーラーで入れた先から動いている（#2434）。
+    /// 更新はインストーラーを検査して無言で起こす
+    WindowsInstaller,
+    /// Windows: インストーラーで入れた先の外から動いている（ポータブル zip・開発ビルド）。
+    /// インストーラーは前回の入れた先へ入れるので、アプリ内では更新しない（#2434）
+    WindowsPortable,
 }
 
 impl InstallMethod {
@@ -327,6 +344,8 @@ impl InstallMethod {
             InstallMethod::Homebrew => "homebrew",
             InstallMethod::Zip => "zip",
             InstallMethod::BrokenBrew => "broken-brew",
+            InstallMethod::WindowsInstaller => "windows-installer",
+            InstallMethod::WindowsPortable => "windows-portable",
         }
     }
 }
@@ -334,12 +353,36 @@ impl InstallMethod {
 /// 配布系統の判別（高速パス: ファイルパスのみ。brew サブプロセスを呼ばない）。
 /// broken-brew の検知には `detect_install_method_full()` を使う
 pub fn detect_install_method() -> InstallMethod {
+    if Platform::current() == Platform::Windows {
+        return windows_install_method();
+    }
     detect_install_method_inner(is_app_in_caskroom(), is_exe_in_caskroom())
+}
+
+/// Windows の配布系統（#2434）。インストーラーの記録（レジストリ）を引くので
+/// プロセス内で 1 度だけ解決する（更新画面の描画から呼ばれる。#212 / #168 と同じ理由）
+fn windows_install_method() -> InstallMethod {
+    static METHOD: std::sync::OnceLock<InstallMethod> = std::sync::OnceLock::new();
+    *METHOD.get_or_init(|| {
+        let location = tako_core::platform::install_info::install_location();
+        let installed = std::env::current_exe().is_ok_and(|exe| {
+            crate::platform::installer_update::runs_from_install_dir(location.as_deref(), &exe)
+        });
+        if installed {
+            InstallMethod::WindowsInstaller
+        } else {
+            InstallMethod::WindowsPortable
+        }
+    })
 }
 
 /// broken-brew を含む完全な配布系統判別（低速: brew サブプロセスを呼ぶ可能性あり）。
 /// background executor や CLI/MCP の status から呼ぶ。render パスでは呼ばない
 pub fn detect_install_method_full() -> InstallMethod {
+    // Windows に brew は無い（台帳の確認もしない）
+    if Platform::current() == Platform::Windows {
+        return windows_install_method();
+    }
     let app_in_caskroom = is_app_in_caskroom();
     let exe_in_caskroom = is_exe_in_caskroom();
     let fast = detect_install_method_inner(app_in_caskroom, exe_in_caskroom);
@@ -728,24 +771,32 @@ pub fn check_all_channels() -> Result<ChannelUpdates, CheckError> {
     Ok(result)
 }
 
+/// [`select_asset`] が選んだ配布物
+struct SelectedAsset {
+    name: String,
+    url: String,
+    /// asset の `size`（#2434）
+    size: Option<u64>,
+    /// asset の `digest`（#2434）
+    digest: Option<String>,
+}
+
 /// 1 リリースの `assets` から自分の環境向けの配布物を選ぶ（#595）。
 ///
-/// 戻り値は `(アセット名, ダウンロード URL)`。**該当が無ければ `None`** =
-/// このリリースは自分にとって「更新候補ではない」。
+/// **該当が無ければ `None`** = このリリースは自分にとって「更新候補ではない」。
 fn select_asset(
     release: &serde_json::Value,
     platform: Platform,
     arch: Arch,
-) -> Option<(String, String)> {
+) -> Option<SelectedAsset> {
     let assets = release["assets"].as_array()?;
     let names: Vec<&str> = assets.iter().filter_map(|a| a["name"].as_str()).collect();
     let chosen = release_assets::select(names.iter().copied(), platform, arch)?;
+    let asset = assets.iter().find(|a| a["name"].as_str() == Some(chosen));
 
     // 通常は GitHub が browser_download_url を返す。欠けていても命名規則から
     // 復元できる（URL の組み立て規則はここ 1 箇所）
-    let url = assets
-        .iter()
-        .find(|a| a["name"].as_str() == Some(chosen))
+    let url = asset
         .and_then(|a| a["browser_download_url"].as_str())
         .map(str::to_string)
         .unwrap_or_else(|| {
@@ -753,7 +804,12 @@ fn select_asset(
             format!("https://github.com/{OWNER_REPO}/releases/download/{tag}/{chosen}")
         });
 
-    Some((chosen.to_string(), url))
+    Some(SelectedAsset {
+        name: chosen.to_string(),
+        url,
+        size: asset.and_then(|a| a["size"].as_u64()),
+        digest: asset.and_then(|a| a["digest"].as_str()).map(str::to_string),
+    })
 }
 
 /// /releases JSON 配列から ChannelUpdates をパースする（実行環境で判定）
@@ -813,7 +869,7 @@ fn parse_releases_for(
         }
 
         // 自分の環境向けアセットが無いリリースは読み飛ばして次を探す（#595 要件 1）
-        let Some((asset_name, download_url)) = select_asset(release, env.platform, arch) else {
+        let Some(asset) = select_asset(release, env.platform, arch) else {
             continue;
         };
 
@@ -831,9 +887,11 @@ fn parse_releases_for(
             version: version_str.to_string(),
             channel,
             html_url,
-            download_url: Some(download_url),
-            asset_name: Some(asset_name),
+            download_url: Some(asset.url),
+            asset_name: Some(asset.name),
             notes,
+            asset_size: asset.size,
+            asset_digest: asset.digest,
         });
     }
 
@@ -865,22 +923,149 @@ pub fn card_should_show(updates: &ChannelUpdates, dismissed: Option<&str>) -> bo
     }
 }
 
-/// 更新を実行する（ブロッキング。background executor で呼ぶ）。
-/// broken-brew 状態では zip フォールバックを使う
-pub fn perform_update(info: &UpdateInfo) -> Result<String, String> {
-    match detect_install_method_full() {
-        InstallMethod::Homebrew => update_via_homebrew(info),
-        InstallMethod::Zip => update_via_zip(info),
-        InstallMethod::BrokenBrew => {
-            // broken-brew では brew 経由の更新は不可能 → zip で直接更新
-            update_via_zip(info)
+/// 更新の適用の結果（#2434）。`message` は CLI / MCP の応答と画面にそのまま出る
+#[derive(Debug)]
+pub struct Applied {
+    pub message: String,
+    /// 適用の後に何で起動し直すか
+    pub restart: Restart,
+}
+
+/// 適用の後の起動し直し方（#2434）
+#[derive(Debug)]
+pub enum Restart {
+    /// macOS: 差し替えた `.app` を新しいプロセスとして開く（ファイルはもう新しい版）
+    OpenBundle,
+    /// Windows: 検査済みのインストーラーを無言で起こし、自分は抜ける。
+    /// **この時点ではまだ何も上書きしていない**（上書きと起動し直しはインストーラーが行う）
+    RunInstaller(installer_update::PreparedInstaller),
+}
+
+impl Restart {
+    /// 起動し直しに失敗したときの文言（macOS は更新済み・Windows は未適用で、意味が違う）
+    pub fn failed_text(&self, err: &str) -> String {
+        match self {
+            Restart::OpenBundle => crate::ui_text::update::restart_failed(err),
+            Restart::RunInstaller(_) => crate::ui_text::update::installer_launch_failed(err),
         }
     }
 }
 
-/// zip 強制更新（brew 失敗時のフォールバック用。配布系統を問わず zip で更新する）
-pub fn perform_update_zip(info: &UpdateInfo) -> Result<String, String> {
-    update_via_zip(info)
+/// 配布系統ごとの適用経路（#2434）。**Windows の配布系統が macOS の経路
+/// （brew / zip の展開 / `.app` の差し替え）へ入らない**ことをここ 1 か所で決める
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyRoute {
+    Homebrew,
+    /// zip を展開して `.app` を差し替える（macOS 専用）
+    MacZip,
+    /// インストーラーを検査して無言で起こす（Windows 専用）
+    WindowsInstaller,
+    /// 適用できない（理由は配布系統の側にある）
+    Refuse(InstallMethod),
+}
+
+/// `apply`（配布系統に任せる）の経路
+fn apply_route(method: InstallMethod) -> ApplyRoute {
+    match method {
+        InstallMethod::Homebrew => ApplyRoute::Homebrew,
+        // broken-brew では brew 経由の更新は不可能 → zip で直接更新
+        InstallMethod::Zip | InstallMethod::BrokenBrew => ApplyRoute::MacZip,
+        InstallMethod::WindowsInstaller => ApplyRoute::WindowsInstaller,
+        InstallMethod::WindowsPortable => ApplyRoute::Refuse(method),
+    }
+}
+
+/// `apply-zip`（brew 失敗時の zip への強制）の経路。Windows では zip で `.app` を
+/// 差し替える手段が原理的に無いので断る
+fn zip_route(method: InstallMethod) -> ApplyRoute {
+    match method {
+        InstallMethod::Homebrew | InstallMethod::Zip | InstallMethod::BrokenBrew => {
+            ApplyRoute::MacZip
+        }
+        InstallMethod::WindowsInstaller | InstallMethod::WindowsPortable => {
+            ApplyRoute::Refuse(method)
+        }
+    }
+}
+
+/// 更新を実行する（ブロッキング。background executor で呼ぶ）。
+/// broken-brew 状態では zip フォールバックを使う
+pub fn perform_update(info: &UpdateInfo) -> Result<Applied, String> {
+    run_route(apply_route(detect_install_method_full()), info)
+}
+
+/// zip 強制更新（brew 失敗時のフォールバック用。macOS では配布系統を問わず zip で更新する）
+pub fn perform_update_zip(info: &UpdateInfo) -> Result<Applied, String> {
+    run_route(zip_route(detect_install_method_full()), info)
+}
+
+fn run_route(route: ApplyRoute, info: &UpdateInfo) -> Result<Applied, String> {
+    let open_bundle = |message| Applied {
+        message,
+        restart: Restart::OpenBundle,
+    };
+    match route {
+        ApplyRoute::Homebrew => update_via_homebrew(info).map(open_bundle),
+        ApplyRoute::MacZip => update_via_zip(info).map(open_bundle),
+        ApplyRoute::WindowsInstaller => update_via_installer(info),
+        ApplyRoute::Refuse(method) => Err(refusal_text(method, info)),
+    }
+}
+
+/// 適用できない配布系統の断り
+fn refusal_text(method: InstallMethod, info: &UpdateInfo) -> String {
+    match method {
+        InstallMethod::WindowsPortable => format!(
+            "{}（リリースページ: {}）",
+            installer_update::InstallerError::NotInstalled,
+            info.html_url
+        ),
+        InstallMethod::WindowsInstaller => format!(
+            "Windows には zip で差し替える経路が無い（zip は macOS の .app 用）。\
+             `tako update apply` でインストーラーから更新してください（リリースページ: {}）",
+            info.html_url
+        ),
+        other => format!("配布系統 {} では更新できない", other.label()),
+    }
+}
+
+/// Windows の腕（#2434）: インストーラーを取得元・サイズ・sha256・PE ヘッダで検査する。
+/// **ここではまだ起動しない**（起動は layout を保存してから `restart_app` が行う）。
+/// 失敗したら何も上書きしていない今の版のまま、理由とリリースページを返す
+fn update_via_installer(info: &UpdateInfo) -> Result<Applied, String> {
+    let fail = |e: installer_update::InstallerError| {
+        format!(
+            "{e}。今の版のまま使えます（手動で入れるならリリースページ: {}）",
+            info.html_url
+        )
+    };
+    let (Some(url), Some(asset_name)) = (info.download_url.as_deref(), info.asset_name.as_deref())
+    else {
+        return Err(format!(
+            "このリリースに Windows のインストーラーが見つからない（リリースページ: {}）",
+            info.html_url
+        ));
+    };
+    installer_update::check_origin(url, OWNER_REPO, asset_name).map_err(fail)?;
+    let expected = installer_update::Expected {
+        asset_name,
+        url,
+        size: info.asset_size,
+        digest: info.asset_digest.as_deref(),
+    };
+    // 検査できないものは置き場を作る前に断る（一時 dir に何も残さない）
+    installer_update::checkable(&expected).map_err(fail)?;
+    let dir =
+        installer_update::fresh_attempt_dir(&installer_update::staging_root()).map_err(fail)?;
+    let prepared = installer_update::download(&expected, &dir, &format!("tako/{CURRENT_VERSION}"))
+        .map_err(fail)?;
+    Ok(Applied {
+        message: format!(
+            "インストーラーで更新（v{} の sha256 が配布元と一致。tako を終了して入れ替え、終わったら起動し直します）",
+            info.version
+        ),
+        restart: Restart::RunInstaller(prepared),
+    })
 }
 
 fn update_via_homebrew(info: &UpdateInfo) -> Result<String, String> {
@@ -993,14 +1178,36 @@ fn find_app_bundle(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// .app バンドルを自動再起動する。呼び出し元プロセスは exit(0) で終了する想定。
-/// macOS の `open -n` でバンドルを新プロセスとして起動し、自分は終了する。
-pub fn restart_app() -> Result<(), String> {
-    let bundle = app_bundle_path()
-        .ok_or_else(|| ".app バンドルのパスが特定できない（CLI 単体実行？）".to_string())?;
-    tako_control::platform::os_integration::open_new_instance(&bundle)
-        .map_err(|e| format!("再起動に失敗: {e}"))?;
-    Ok(())
+/// 適用の後に起動し直す。呼び出し元は成功したらすぐ `cx.quit()` で抜ける想定。
+///
+/// - macOS: `open -n` でバンドルを新プロセスとして起動し、自分は終了する
+/// - Windows（#2434）: 検査済みのインストーラーを無言で起こす。インストーラーは
+///   この tako の pid が消えるのを待ってから上書きし、終わったら tako を起こし直す。
+///   起動できなければ `Err` = 何も上書きしていないので今の版のまま動き続ける
+pub fn restart_app(restart: &Restart) -> Result<(), String> {
+    match restart {
+        Restart::OpenBundle => {
+            let bundle = app_bundle_path()
+                .ok_or_else(|| ".app バンドルのパスが特定できない（CLI 単体実行？）".to_string())?;
+            tako_control::platform::os_integration::open_new_instance(&bundle)
+                .map_err(|e| format!("再起動に失敗: {e}"))?;
+            Ok(())
+        }
+        Restart::RunInstaller(prepared) => {
+            let relaunch = installer_update::relaunch_target().map_err(|e| e.to_string())?;
+            // 子は待たない（tako はこの後すぐ抜け、インストーラーが残って仕事をする）
+            let child = installer_update::launch(prepared, std::process::id(), &relaunch)
+                .map_err(|e| format!("{e}。今の版のまま使えます"))?;
+            tako_control::diag::persist_log(&format!(
+                "更新: インストーラーを起動した（pid {}・sha256 {}・ログ {}）。\
+                 tako を終了し、インストール後にインストーラーが起動し直す（#2434）",
+                child.id(),
+                prepared.sha256,
+                prepared.log_path.display()
+            ));
+            Ok(())
+        }
+    }
 }
 
 /// dispatch 層に公開する更新情報の JSON 表現（broken-brew 診断を含む）
@@ -1114,10 +1321,22 @@ mod tests {
     #[test]
     fn test_detect_install_method_returns_value() {
         let method = detect_install_method();
+        // Windows はインストーラー / ポータブルの 2 系統、それ以外は macOS の 3 系統（#2434）
+        let expected: &[InstallMethod] = if Platform::current() == Platform::Windows {
+            &[
+                InstallMethod::WindowsInstaller,
+                InstallMethod::WindowsPortable,
+            ]
+        } else {
+            &[
+                InstallMethod::Homebrew,
+                InstallMethod::Zip,
+                InstallMethod::BrokenBrew,
+            ]
+        };
         assert!(
-            method == InstallMethod::Homebrew
-                || method == InstallMethod::Zip
-                || method == InstallMethod::BrokenBrew
+            expected.contains(&method),
+            "{method:?} はこのプラットフォームの配布系統 {expected:?} に無い"
         );
     }
 
@@ -1985,6 +2204,8 @@ mod tests {
             download_url: None,
             asset_name: None,
             notes: None,
+            asset_size: None,
+            asset_digest: None,
         };
         ChannelUpdates {
             stable: stable.map(|v| info(v, Channel::Stable)),
@@ -2074,5 +2295,174 @@ mod tests {
             // ネットワーク不達なら Network エラーが返る（panic しない）
             let _ = check_channel(Channel::Stable);
         });
+    }
+
+    // --- #2434: Windows の適用経路 ---
+
+    /// asset に `size` / `digest` まで載ったリリース（GitHub API の実際の形）
+    fn release_with_digest(tag: &str, name: &str, size: u64, digest: &str) -> serde_json::Value {
+        serde_json::json!({
+            "tag_name": tag,
+            "prerelease": false,
+            "html_url": format!("https://github.com/{OWNER_REPO}/releases/tag/{tag}"),
+            "assets": [{
+                "name": name,
+                "size": size,
+                "digest": digest,
+                "browser_download_url":
+                    format!("https://github.com/{OWNER_REPO}/releases/download/{tag}/{name}"),
+            }],
+        })
+    }
+
+    #[test]
+    fn windowsの更新候補は配布元の大きさとsha256を持つ() {
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let releases = vec![release_with_digest(
+            "v99.0.0",
+            "tako-v99.0.0-windows-x86_64.exe",
+            24_950_562,
+            &digest,
+        )];
+        let stable = parse_releases_for(&releases, WIN, "0.8.39").stable.unwrap();
+        assert_eq!(
+            stable.asset_name.as_deref(),
+            Some("tako-v99.0.0-windows-x86_64.exe")
+        );
+        assert_eq!(stable.asset_size, Some(24_950_562));
+        assert_eq!(stable.asset_digest.as_deref(), Some(digest.as_str()));
+        // 古い fixture（size / digest 無し）でも候補にはなる（検査は適用の時点で断る）
+        let bare = vec![release(
+            "v99.0.0",
+            false,
+            &["tako-v99.0.0-windows-x86_64.exe"],
+        )];
+        let stable = parse_releases_for(&bare, WIN, "0.8.39").stable.unwrap();
+        assert_eq!((stable.asset_size, stable.asset_digest), (None, None));
+    }
+
+    #[test]
+    fn 同じ版のwindowsインストーラーは更新候補にしない() {
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let releases = vec![release_with_digest(
+            "v0.8.39",
+            "tako-v0.8.39-windows-x86_64.exe",
+            1,
+            &digest,
+        )];
+        let updates = parse_releases_for(&releases, WIN, "0.8.39");
+        assert!(updates.stable.is_none() && updates.test.is_none());
+    }
+
+    #[test]
+    fn windowsの配布系統はmacosの経路へ入らない() {
+        // apply: インストーラーで入れた tako はインストーラー、ポータブル版は断る
+        assert_eq!(
+            apply_route(InstallMethod::WindowsInstaller),
+            ApplyRoute::WindowsInstaller
+        );
+        assert_eq!(
+            apply_route(InstallMethod::WindowsPortable),
+            ApplyRoute::Refuse(InstallMethod::WindowsPortable)
+        );
+        // apply-zip: Windows には zip で .app を差し替える経路が無い
+        for method in [
+            InstallMethod::WindowsInstaller,
+            InstallMethod::WindowsPortable,
+        ] {
+            assert_eq!(zip_route(method), ApplyRoute::Refuse(method));
+            assert!(!matches!(
+                apply_route(method),
+                ApplyRoute::MacZip | ApplyRoute::Homebrew
+            ));
+        }
+        // macOS の経路は従来どおり
+        assert_eq!(apply_route(InstallMethod::Homebrew), ApplyRoute::Homebrew);
+        assert_eq!(apply_route(InstallMethod::Zip), ApplyRoute::MacZip);
+        assert_eq!(apply_route(InstallMethod::BrokenBrew), ApplyRoute::MacZip);
+        for method in [
+            InstallMethod::Homebrew,
+            InstallMethod::Zip,
+            InstallMethod::BrokenBrew,
+        ] {
+            assert_eq!(zip_route(method), ApplyRoute::MacZip);
+        }
+        assert_eq!(InstallMethod::WindowsInstaller.label(), "windows-installer");
+        assert_eq!(InstallMethod::WindowsPortable.label(), "windows-portable");
+    }
+
+    fn windows_info(url: &str, size: Option<u64>, digest: Option<&str>) -> UpdateInfo {
+        UpdateInfo {
+            version: "99.0.0".into(),
+            channel: Channel::Stable,
+            html_url: format!("https://github.com/{OWNER_REPO}/releases/tag/v99.0.0"),
+            download_url: Some(url.into()),
+            asset_name: Some("tako-v99.0.0-windows-x86_64.exe".into()),
+            notes: None,
+            asset_size: size,
+            asset_digest: digest.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn windowsの適用は取得元と検査の材料が揃わなければ取りに行かずに断る() {
+        let good =
+            format!("https://github.com/{OWNER_REPO}/releases/download/v99.0.0/tako-v99.0.0-windows-x86_64.exe");
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        // 取得元が違う
+        let err = run_route(
+            ApplyRoute::WindowsInstaller,
+            &windows_info(
+                "https://example.com/tako-v99.0.0-windows-x86_64.exe",
+                Some(1),
+                Some(&digest),
+            ),
+        )
+        .unwrap_err();
+        assert!(err.contains("取得元"), "{err}");
+        assert!(err.contains("今の版のまま使えます"), "{err}");
+        assert!(
+            err.contains("/releases/tag/v99.0.0"),
+            "リリースページへ案内する: {err}"
+        );
+        // 配布元が sha256 を示していない
+        let err = run_route(
+            ApplyRoute::WindowsInstaller,
+            &windows_info(&good, Some(1), None),
+        )
+        .unwrap_err();
+        assert!(err.contains("sha256"), "{err}");
+        assert!(err.contains("今の版のまま使えます"), "{err}");
+        // ポータブル版
+        let err = run_route(
+            ApplyRoute::Refuse(InstallMethod::WindowsPortable),
+            &windows_info(&good, Some(1), Some(&digest)),
+        )
+        .unwrap_err();
+        assert!(err.contains("ポータブル版"), "{err}");
+        // Windows での apply-zip
+        let err = run_route(
+            ApplyRoute::Refuse(InstallMethod::WindowsInstaller),
+            &windows_info(&good, Some(1), Some(&digest)),
+        )
+        .unwrap_err();
+        assert!(err.contains("tako update apply"), "{err}");
+    }
+
+    #[test]
+    fn 起動し直しに失敗したときの文面はwindowsでは未適用を言う() {
+        let installer = Restart::RunInstaller(installer_update::PreparedInstaller {
+            path: PathBuf::from("setup.exe"),
+            log_path: PathBuf::from("setup.log"),
+            size: 1,
+            sha256: String::new(),
+        });
+        let mac = Restart::OpenBundle.failed_text("x");
+        let win = installer.failed_text("x");
+        assert_ne!(mac, win);
+        assert!(
+            win.contains("更新していません") || win.contains("nothing was updated"),
+            "{win}"
+        );
     }
 }

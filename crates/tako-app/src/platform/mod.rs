@@ -7,6 +7,8 @@
 //! **`#[cfg(target_os)]` を書いてよいのはこの配下の実装選択だけ**で、
 //! 呼び出し側（`preview` / `preview_render` / UI）は単一のコードパスを持つ。
 
+/// アプリ内更新の Windows の腕 = インストーラーを検査して無言で起こす（B14。#2434）
+pub mod installer_update;
 pub mod pdf;
 /// 利用者が待っている重い background 処理を App Nap に間引かせない（#1916 / #1926）
 pub mod user_work;
