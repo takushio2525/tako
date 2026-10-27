@@ -36414,6 +36414,232 @@ mod tests {
         });
     }
 
+    /// #2426（実 GUI の e2e ④ の NG）: MCP の run と同じ材料で、起こした後の `run_status` が
+    /// `launch_waiting` のまま残らないことを見る。材料 = spawn は本物の dispatch・完了待ちは MCP の本番の
+    /// 初期待ち `RUN_INITIAL_DELAY` と間隔 `RUN_INTERVAL`・起こすのは本物の `launch_gate::tick`。
+    /// 修正前は完了待ちのスレッドが初期待ち（20 秒）を先に寝ていて進捗が spawn の応答の `launch_waiting` の
+    /// まま残り、`run_status` は起動待ちが「待ち」のときしか正本（launch_gate）を見ていなかった
+    /// （#2413 のテストは初期待ち 10 ms で回していたので、スレッドがすぐ読み直して隠れていた）
+    #[test]
+    fn issue2426_起こした後のrun_statusはlaunch_waitingのまま残らない() {
+        use crate::orchestrator::wait::{self, RunOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use tako_core::queue::MachineView;
+        use tako_core::resources::Pressure;
+        let machine = |p| {
+            Some(MachineView {
+                total_mb: 36 * 1024,
+                available_mb: Some(20 * 1024),
+                pressure: Some(p),
+                swap_used_mb: Some(0),
+            })
+        };
+        with_test_project(|| {
+            let mut host = MockHost::new();
+            let master = host.root_pane();
+            dispatch(
+                &mut host,
+                Request::Title {
+                    pane: Some(master),
+                    title: None,
+                    role: Some("orchestrator-master:test".into()),
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+            crate::launch_gate::enable_for_test(
+                machine(Pressure::Critical),
+                std::time::Duration::from_secs(60),
+            );
+            let opts = RunOptions {
+                project: TEST_PROJECT.into(),
+                prompt: "#2426".into(),
+                label: None,
+                model: None,
+                effort: None,
+                agent: None,
+                pane: Some(master),
+                tab: None,
+                caller_role: Some("orchestrator-master:test".into()),
+                timeout: std::time::Duration::from_secs(120),
+                auto_close: false,
+                output_lines: 10,
+                initial_delay: wait::RUN_INITIAL_DELAY,
+                interval: wait::RUN_INTERVAL,
+                task_type: None,
+                account: None,
+            };
+            // 完了待ちのスレッドが読む worker の状態。GUI では同じ dispatch が launch_gate を見て答えるが、
+            // 単体テストの launch_gate はスレッドごとなので台本で答える（待ちの間は launch_waiting。
+            // 終わったら gone = スレッドを残さない）
+            let done = Arc::new(AtomicBool::new(false));
+            let done_for_poll = Arc::clone(&done);
+            let started = {
+                let mut exec = |req: Request| {
+                    dispatch(&mut host, req, PaneOrigin::Mcp).map_err(|e| e.to_string())
+                };
+                wait::run_start(&mut exec, &opts, move || {
+                    Box::new(move |_req: Request| {
+                        let status = if done_for_poll.load(Ordering::SeqCst) {
+                            "gone"
+                        } else {
+                            "launch_waiting"
+                        };
+                        Ok(json!({ "status": status }))
+                    })
+                })
+                .expect("run を始められる")
+            };
+            assert!(
+                started["tmux_session"].is_null(),
+                "gone の判定で tmux を叩かない"
+            );
+            assert_eq!(started["launch_gate"]["state"], "waiting", "{started}");
+            let run_id = started["run_id"].as_str().unwrap().to_string();
+            let pane = started["pane_id"].as_u64().unwrap();
+            assert_eq!(
+                wait::run_status(&run_id).unwrap()["status"],
+                "launch_waiting"
+            );
+
+            // 圧が戻り、GUI の tick が起こす（待たずに起こすときと同じフロー）
+            crate::launch_gate::set_machine_for_test(machine(Pressure::Normal));
+            crate::launch_gate::tick(&mut host);
+            assert_eq!(host.command_flows.len(), 1, "tick で起こした");
+            assert_eq!(crate::launch_gate::view(pane).unwrap()["state"], "starting");
+            let st = wait::run_status(&run_id).unwrap();
+            done.store(true, Ordering::SeqCst);
+            assert_eq!(
+                st["status"], "starting",
+                "orchestrator/wait.rs の run_status が起こした後も起動待ちを返した: {st}"
+            );
+            assert_eq!(st["phase"], "running");
+            assert_eq!(st["launch_gate"]["state"], "starting");
+        });
+    }
+
+    /// layout の往復（GUI が保存して次の起動で読む `layout.json` と同じ直列化）を通した workspace から、
+    /// GUI の起動時の復元と同じ組み立て（`launch_gate::restore_request`）で全部を預け、本物の tick で
+    /// 起きた順を返す。役割は `tako title --role` と同じ `Request::Title` で付ける（`None` は付けない）。
+    /// 返り値は（`roles` と同じ並びのペイン ID, 起きた順のペイン ID と優先度）
+    fn issue2426_layoutから復元して起きた順(
+        roles: &[Option<&str>],
+    ) -> (Vec<u64>, Vec<(u64, String)>) {
+        use crate::launch_gate as gate;
+        use tako_core::queue::MachineView;
+        use tako_core::resources::Pressure;
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let mut panes = vec![root];
+        for _ in 1..roles.len() {
+            panes.push(split(&mut host, root));
+        }
+        for (p, role) in panes.iter().zip(roles) {
+            if let Some(role) = role {
+                dispatch(
+                    &mut host,
+                    Request::Title {
+                        pane: Some(*p),
+                        title: None,
+                        role: Some((*role).into()),
+                    },
+                    PaneOrigin::Cli,
+                )
+                .unwrap();
+            }
+        }
+        let file = crate::layout::capture(
+            host.workspace(),
+            &|_| crate::layout::PaneMeta::default(),
+            None,
+        );
+        let saved = serde_json::to_string(&file).unwrap();
+        let loaded: crate::layout::LayoutFile = serde_json::from_str(&saved).unwrap();
+        let (ws, restored) = crate::layout::restore(&loaded).expect("保存した layout を戻せる");
+        // 立ち上がりの窓 0 = 次の tick で前の 1 本が明け、次の 1 本が起きる（1 tick に 1 本）
+        gate::enable_for_test(
+            Some(MachineView {
+                total_mb: 36 * 1024,
+                available_mb: Some(20 * 1024),
+                pressure: Some(Pressure::Normal),
+                swap_used_mb: Some(0),
+            }),
+            std::time::Duration::ZERO,
+        );
+        for r in &restored {
+            let req = gate::restore_request(
+                r.pane,
+                ws.pane_anywhere(PaneId::from_raw(r.pane)),
+                "claude",
+                format!("claude --resume s{}\r", r.pane).into_bytes(),
+            );
+            assert!(gate::hold(req).is_none(), "起動待ちが有効なら全部預ける");
+        }
+        let mut order: Vec<(u64, String)> = Vec::new();
+        for _ in 0..roles.len() * 3 {
+            gate::tick(&mut host);
+            let starting: Vec<(u64, String)> = gate::status_section()["starting"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|s| Some((s["pane"].as_u64()?, s["priority"].as_str()?.to_string())))
+                .collect();
+            assert!(
+                starting.len() <= 1,
+                "同時に立ち上がる復元は 1 本: {starting:?}"
+            );
+            for s in starting {
+                if !order.iter().any(|(p, _)| *p == s.0) {
+                    order.push(s);
+                }
+            }
+            if order.len() == roles.len() {
+                break;
+            }
+        }
+        (panes, order)
+    }
+
+    /// #2426（実 GUI の e2e ⑦）: 再起動後の復元で master が先に起きることを、役割を layout から引く
+    /// 実際の経路の材料で見る（#2413 のテストは `hold` に役割を直接渡していた）。master は layout の
+    /// 並びの最後（先頭の worker より先に起きる = 並びは役割から決まっている）。役割の無いペインも混ぜる
+    #[test]
+    fn issue2426_layoutから復元した役割で復元はmasterから起きる() {
+        let roles = [
+            Some("orchestrator-worker:t2426:w0"),
+            Some("orchestrator-worker:t2426:w1"),
+            None,
+            Some("orchestrator-master:t2426"),
+        ];
+        let (panes, order) = issue2426_layoutから復元して起きた順(&roles);
+        assert_eq!(order.len(), roles.len(), "全部起きる: {order:?}");
+        assert_eq!(
+            order[0],
+            (panes[3], "high".to_string()),
+            "layout から戻した master の役割が並びに届いていない（launch_gate::restore_request）: {order:?}"
+        );
+        assert!(
+            order[1..].iter().all(|(_, pri)| pri == "normal"),
+            "{order:?}"
+        );
+    }
+
+    /// #2426 のエッジケース: master が居ない復元（worker だけ）も 1 本ずつ全部起きる。先頭は受付の
+    /// いちばん古い件（layout の並びの先頭 = 根のペイン）
+    #[test]
+    fn issue2426_masterが居ない復元もworkerを1本ずつ全部起こす() {
+        let roles = [
+            Some("orchestrator-worker:t2426:w0"),
+            Some("orchestrator-worker:t2426:w1"),
+            Some("orchestrator-worker:t2426:w2"),
+        ];
+        let (panes, order) = issue2426_layoutから復元して起きた順(&roles);
+        assert_eq!(order.len(), roles.len(), "全部起きる: {order:?}");
+        assert_eq!(order[0].0, panes[0], "{order:?}");
+        assert!(order.iter().all(|(_, pri)| pri == "normal"), "{order:?}");
+    }
+
     /// #2413 の受け入れ条件 5: A/B（`TAKO_2413_LEGACY=1` = `mode_for` の legacy）は同じ注入があっても
     /// 起動待ちを持たず、spawn は即座に起こす（修正前と同じ）
     #[test]

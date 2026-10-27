@@ -688,6 +688,28 @@ pub fn hold(req: LaunchRequest) -> Option<LaunchAction> {
     None
 }
 
+/// GUI の起動時の復元の 1 件（[`hold`] へ渡す）。表示名と役割は **layout から復元した workspace のペイン**
+/// から引く（役割は並びの優先度 = master / solo が先）。GUI と単体テストが同じ組み立てを通るよう
+/// ここに置く（#2426: 単体テストは役割を直接渡していて、layout から役割が届くかを見ていなかった）
+pub fn restore_request(
+    pane: u64,
+    restored: Option<&tako_core::Pane>,
+    agent: &str,
+    input: Vec<u8>,
+) -> LaunchRequest {
+    LaunchRequest {
+        pane,
+        kind: LaunchKind::Restore,
+        agent: agent.to_string(),
+        label: restored
+            .and_then(|p| p.title())
+            .unwrap_or_default()
+            .to_string(),
+        role: restored.and_then(|p| p.role()).map(str::to_string),
+        action: LaunchAction::Write(input),
+    }
+}
+
 /// 起こすと決まった 1 件
 struct Due {
     pane: u64,

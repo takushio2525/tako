@@ -220,14 +220,24 @@ pub fn wait_for_worker(
 ) -> WatchOutcome {
     let start = Instant::now();
     let mut deadline = opts.timeout.map(|t| start + t);
-    std::thread::sleep(opts.initial_delay);
+    // #2426: spawn が起動待ちを返した run（進捗が `launch_waiting` から始まる = `run_start`）には
+    // まだ agent が居ない。初期待ち（agent の起動 + 依頼文の送達）は起きてから置くので先に寝ず、
+    // 待っている間は `interval` ごとに読む（先に寝ると、起きた後も閉じられた後も初期待ちのあいだ
+    // 進捗が起動待ちのまま残り、起きた直後の待ちも初期待ちの残りぶんへ縮む）
+    let started_waiting = progress.is_some_and(|snap| {
+        snap.lock()
+            .is_ok_and(|s| s.worker_status == "launch_waiting")
+    });
+    if !started_waiting {
+        std::thread::sleep(opts.initial_delay);
+    }
 
     let mut idle_streak: u32 = 0;
     let mut gone_streak: u32 = 0;
     let mut stalled_streak: u32 = 0;
     let mut agent_dead_streak: u32 = 0;
     // #2413: メモリの逼迫で起動を待たされていた（起きたら起動直後の待ちをやり直す）
-    let mut launch_waited = false;
+    let mut launch_waited = started_waiting;
 
     loop {
         if let Some(dl) = deadline {
@@ -264,8 +274,16 @@ pub fn wait_for_worker(
                     std::thread::sleep(opts.interval);
                     continue;
                 }
-                if std::mem::take(&mut launch_waited) {
-                    // 起きた直後は起動とプロンプト送達の最中（spawn 直後と同じ待ちを置く）
+                // 待っている間に閉じられた（gone）は起きたのではない（下の gone の判定へ進む）
+                if status != "gone" && std::mem::take(&mut launch_waited) {
+                    // 起きた直後は起動とプロンプト送達の最中（spawn 直後と同じ待ちを置く）。
+                    // #2426: 進捗も起動中へ直す（この待ちのあいだ run_status が起動待ちのまま残らない）
+                    if let Some(snap) = progress {
+                        if let Ok(mut s) = snap.lock() {
+                            s.worker_status = "starting".into();
+                            s.elapsed_secs = start.elapsed().as_secs();
+                        }
+                    }
                     deadline = opts.timeout.map(|t| Instant::now() + t);
                     std::thread::sleep(opts.initial_delay);
                     continue;
@@ -994,6 +1012,10 @@ pub fn run_status(run_id: &str) -> Result<Value, String> {
     if let Some(gate) = crate::launch_gate::view(entry.pane_id) {
         if crate::launch_gate::is_waiting(entry.pane_id) {
             out["status"] = json!("launch_waiting");
+        } else if out["status"] == "launch_waiting" {
+            // #2426: 起こした後、完了待ちのスレッドが読み直すまで進捗は起動待ちのまま。正本の
+            // 起動待ち（このプロセスの launch_gate）が立ち上がり中と言うなら起動中と答える
+            out["status"] = json!("starting");
         }
         out["launch_gate"] = gate;
     }
@@ -2727,6 +2749,100 @@ mod tests {
             run_status(&run_id).unwrap()["launch_gate"]["state"],
             "starting"
         );
+    }
+
+    /// #2426 の完了待ちの台本: 呼ばれるたびに回数を `calls` へ送り、`woke` が立つまでは `launch_waiting`、
+    /// 立った後は `after` を返す。初期待ちは本番（20 秒）より長い 1 時間 = 先に寝る版はここで止まる
+    fn issue2426_起動待ちから始まるrun(
+        after: &'static str,
+    ) -> (
+        Arc<Mutex<RunSnapshot>>,
+        Arc<std::sync::atomic::AtomicBool>,
+        std::sync::mpsc::Receiver<u32>,
+        std::sync::mpsc::Receiver<WatchOutcome>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // run_start が spawn の応答の起動待ちを見て作るのと同じ進捗
+        let snapshot = Arc::new(Mutex::new(RunSnapshot {
+            worker_status: "launch_waiting".into(),
+            elapsed_secs: 0,
+        }));
+        let woke = Arc::new(AtomicBool::new(false));
+        let (calls_tx, calls) = std::sync::mpsc::channel();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let snap = Arc::clone(&snapshot);
+        let woke_poll = Arc::clone(&woke);
+        std::thread::spawn(move || {
+            let mut n = 0u32;
+            let mut exec = move |_req: Request| -> Result<Value, String> {
+                n += 1;
+                let _ = calls_tx.send(n);
+                let status = if woke_poll.load(Ordering::SeqCst) {
+                    after
+                } else {
+                    "launch_waiting"
+                };
+                Ok(json!({ "status": status }))
+            };
+            let opts = WatchOptions {
+                initial_delay: Duration::from_secs(3600),
+                interval: Duration::from_millis(5),
+                ..watch_opts(1, None)
+            };
+            let _ = done_tx.send(wait_for_worker(&mut exec, &opts, Some(&snap)));
+        });
+        (snapshot, woke, calls, done)
+    }
+
+    /// #2426（実 GUI の e2e ④）: spawn が起動待ちを返した run の完了待ちは、初期待ちを先に寝ずに
+    /// 待っている間も読み、起きたのを見たら進捗を `starting` へ直してから初期待ちを置く。修正前は初期待ちを
+    /// 先に寝て、起きた後も進捗が `launch_waiting` のまま残った（見張りの 30 秒は固まりの番で、所要は比べない）
+    #[test]
+    fn issue2426_起動待ちから始まったrunは初期待ちを先に寝ず_起きたら進捗を起動中へ直す() {
+        use std::sync::atomic::Ordering;
+        let guard = Duration::from_secs(30);
+        let (snapshot, woke, calls, _done) = issue2426_起動待ちから始まるrun("busy");
+        // 待っている間に 2 回読む（初期待ちを先に寝る版はここで止まる）
+        for want in 1..=2 {
+            assert_eq!(
+                calls.recv_timeout(guard).ok(),
+                Some(want),
+                "orchestrator/wait.rs の wait_for_worker が起動待ちの run で初期待ちを先に寝た"
+            );
+        }
+        assert_eq!(snapshot.lock().unwrap().worker_status, "launch_waiting");
+        woke.store(true, Ordering::SeqCst);
+        // 起きたのを見る 1 回 → 進捗は起動中（その後の初期待ち 1 時間のあいだ読み直さない）。
+        // 状態で待つ（5 ms × 6000 = 30 秒は固まりの番）
+        let mut status = String::new();
+        for _ in 0..6000 {
+            status = snapshot.lock().unwrap().worker_status.clone();
+            if status != "launch_waiting" {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            status, "starting",
+            "起きた後の進捗が起動待ちのまま（run_status が launch_waiting を返し続ける）"
+        );
+    }
+
+    /// #2426 のエッジケース: 起動待ちのまま閉じられた run（gone）は起きたと読まない = 初期待ちを置かず、
+    /// 進捗を `starting` にせず、gone の判定（3 回）で終わる
+    #[test]
+    fn issue2426_起動待ちのまま閉じたrunは起きたと読まずに終わる() {
+        use std::sync::atomic::Ordering;
+        let (snapshot, woke, calls, done) = issue2426_起動待ちから始まるrun("gone");
+        assert_eq!(calls.recv_timeout(Duration::from_secs(30)).ok(), Some(1));
+        woke.store(true, Ordering::SeqCst);
+        let outcome = done.recv_timeout(Duration::from_secs(30));
+        assert_eq!(
+            outcome.ok(),
+            Some(WatchOutcome::Gone),
+            "閉じたのを起きたと読んで初期待ちに入った（orchestrator/wait.rs の wait_for_worker）"
+        );
+        assert_eq!(snapshot.lock().unwrap().worker_status, "gone");
     }
 
     #[test]
