@@ -35,6 +35,13 @@
 //! 在籍の列挙（Toolhelp）が失敗すると全 pid が「載っていない」= 不在に見えるので、
 //! そこを `Dead` と読むと 1 回の失敗で**生きている別 worker の置き場を全部消す**。
 //! 材料の状態は [`Roster`] が 3 値で持ち、失敗（`Unavailable`）は誰の生死も答えない。
+//!
+//! ## プロセスの残骸（#2448）
+//!
+//! dir と同じく、テストが打ち切った子の**孫**も残りうる（直接の子だけを kill する口で
+//! `sh -c "…; sleep 600"` を打ち切ると、`sleep` が親を失ってテストのプロセスグループのまま眠る）。
+//! 掃除の仕組みは持たず、一巡の番犬（テストモジュールの `テストを一巡してもtmpdirに残骸が残らない`）が
+//! 子を自分のプロセスグループで起こして、終わった後にグループへ残ったものを数えて名指す（macOS）。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1221,7 +1228,7 @@ mod tests {
         std::panic::set_hook(hook);
         assert!(outside.is_dir(), "一時ディレクトリの外を消した");
     }
-    // --------------------------- 一巡して残骸が残らないことの実測（Issue #1312）
+    // ---- 一巡して残骸（一時 dir = Issue #1312 / 親を失った孫プロセス = Issue #2448）が残らないことの実測
 
     /// 子として起こされた印（無ければ番犬本体が動く）。
     /// これが無いと子の中の番犬がまた子を起こして止まらない
@@ -1230,9 +1237,35 @@ mod tests {
     /// 子（このテストバイナリの再実行）の待ちの上限
     const RESIDUE_DEADLINE: Duration = Duration::from_secs(600);
 
-    /// このテストバイナリを**使い捨ての TMPDIR** で回し、残った `tako-*` の名前を返す。
+    /// 子の一巡で外す 1 本（使い捨ての TMPDIR では成立しない。[`run_suite_in`] の中の説明）
+    const SKIP_IN_CHILD: &str = "ホストごとに_controlpath_が分かれる";
+
+    /// #2448 の検出力を見る注入の目印。立っていると
+    /// [`注入_打ち切った子の孫を親を失った形で残す`] が孫を残す（子にだけ渡す）
+    const ORPHAN_INJECT: &str = "TAKO_2448_INJECT_ORPHAN";
+
+    /// 子が終わった後、そのグループの残りが出ていくのを待つ刻みと回数（40 × 50 ms）。
+    /// SIGKILL を受けて出ていく途中のものはこの間に消え、眠り続ける孫は残る
+    #[cfg(target_os = "macos")]
+    const ORPHAN_TICK: Duration = Duration::from_millis(50);
+    #[cfg(target_os = "macos")]
+    const ORPHAN_SETTLE_TICKS: u32 = 40;
+
+    /// 子の一巡の結果
+    struct SuiteRun {
+        /// TMPDIR に残った `tako-*` の名前
+        residues: Vec<String>,
+        /// 子のプロセスグループに残ったプロセス（#2448。`pid N` + コマンド行。macOS 以外は常に空）
+        orphans: Vec<String>,
+        /// 子の標準出力と標準エラー
+        out: String,
+    }
+
+    /// このテストバイナリを**使い捨ての TMPDIR** で回し、残った `tako-*` の名前と、
+    /// 子のプロセスグループに残ったプロセス（#2448）を返す。
+    /// `args` は libtest へそのまま渡す（filter、または `--exact` と名前）。`env` は子にだけ足す。
     /// 標準出力はファイルへ落とす（パイプに溜めると全件の出力で詰まる）
-    fn run_suite_in(scratch: &Path, filter: Option<&str>, legacy: bool) -> (Vec<String>, String) {
+    fn run_suite_in(scratch: &Path, args: &[&str], env: &[(&str, &str)]) -> SuiteRun {
         let log = scratch.join("child.log");
         let tmp = scratch.join("tmp");
         std::fs::create_dir_all(&tmp).expect("子の TMPDIR を作れる");
@@ -1240,14 +1273,17 @@ mod tests {
         let mut cmd = std::process::Command::new(exe);
         // Windows でコンソール窓を出さない（#628 / #586 の 1 実装を通す）
         crate::platform::process::no_console_window(&mut cmd);
-        if let Some(f) = filter {
-            cmd.arg(f);
-        }
+        cmd.args(args);
         // この 1 本だけは**使い捨ての TMPDIR では成立しない**: ssh の ControlPath は
         // unix domain socket のパス長上限（`MAX_SOCKET_PATH` = 92）に収まる必要があり、
         // 親の置き場の下へ潜らせた TMPDIR ではその予算を使い切る。
         // 残骸を数えるという番犬の本題とは関係が無いので外す
-        cmd.args(["--skip", "ホストごとに_controlpath_が分かれる"]);
+        cmd.args(["--skip", SKIP_IN_CHILD]);
+        // #2448: 子を自分のプロセスグループの頭にする。テストが打ち切った子の孫は、親を失っても
+        // このグループを抜けないので一巡の後に数えられる（tmux のペイン・PTY の子・
+        // `probe::group_output_with_timeout` の子は自分のグループを持つので数えない）
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         cmd.env(RESIDUE_CHILD, "1")
             // 一時ディレクトリの解決元は OS ごとに違う（unix = TMPDIR /
             // Windows = TMP・TEMP）。両方を使い捨てへ向ける
@@ -1266,18 +1302,24 @@ mod tests {
                     .append(true)
                     .open(&log)
                     .expect("子のログを開ける"),
-            );
-        if legacy {
-            cmd.env("TAKO_1312_LEGACY", "1");
-        } else {
-            cmd.env_remove("TAKO_1312_LEGACY");
-        }
+            )
+            .env_remove("TAKO_1312_LEGACY")
+            .env_remove(ORPHAN_INJECT)
+            .envs(env.iter().copied());
         let mut child = cmd.spawn().expect("子を起こせる");
         let deadline = std::time::Instant::now() + RESIDUE_DEADLINE;
         loop {
             match child.try_wait().expect("子の状態を読める") {
                 Some(_) => break,
                 None if std::time::Instant::now() >= deadline => {
+                    // 子のグループごと止める（中のテストが起こした孫も残さない）
+                    #[cfg(unix)]
+                    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+                        // SAFETY: 自分が起こしてまだ刈り取っていない子が率いるグループへ送るだけ
+                        unsafe {
+                            libc::kill(-pgid, libc::SIGKILL);
+                        }
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     panic!("子のテスト一巡が {RESIDUE_DEADLINE:?} で終わらない");
@@ -1285,6 +1327,7 @@ mod tests {
                 None => std::thread::sleep(Duration::from_millis(50)),
             }
         }
+        let orphans = take_orphans(child.id());
         let out = std::fs::read_to_string(&log).unwrap_or_default();
         let mut residues: Vec<String> = std::fs::read_dir(&tmp)
             .map(|entries| {
@@ -1296,7 +1339,136 @@ mod tests {
             })
             .unwrap_or_default();
         residues.sort();
-        (residues, out)
+        SuiteRun {
+            residues,
+            orphans,
+            out,
+        }
+    }
+
+    /// 子が終わった後に、そのプロセスグループ（`pgid` = 子の pid）へ残った自分の uid のプロセス（#2448）。
+    ///
+    /// 親を失った孫はグループを抜けないのでここに残る。出ていく途中のものは
+    /// [`ORPHAN_SETTLE_TICKS`] 回まで消えるのを待つ。残ったものは pid 指定の SIGKILL で片付ける
+    /// （番犬自身が残骸を残さない）。ゾンビは載らない（`ports::short_info` が引けない。
+    /// 親の居ないゾンビは launchd がすぐ刈る）
+    #[cfg(target_os = "macos")]
+    fn take_orphans(pgid: u32) -> Vec<String> {
+        let mut left = group_members(pgid);
+        for _ in 0..ORPHAN_SETTLE_TICKS {
+            if left.is_empty() {
+                break;
+            }
+            std::thread::sleep(ORPHAN_TICK);
+            left = group_members(pgid);
+        }
+        let mut buf = vec![0u8; crate::ports::procargs_buffer_len().unwrap_or(0)];
+        left.into_iter()
+            .map(|(pid, comm)| {
+                let argv = u32::try_from(pid)
+                    .ok()
+                    .and_then(|p| crate::ports::argv_and_env(p, &mut buf, &[]))
+                    .and_then(|(argv, _)| argv)
+                    .unwrap_or(comm);
+                // SAFETY: 自分の uid で、自分が起こした子のグループに残ったプロセスだけへ送る
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+                format!("pid {pid} `{argv}`")
+            })
+            .collect()
+    }
+
+    /// グループの在籍を読む手段（libproc）が無い OS では数えない（#2448 の検査は macOS だけ）
+    #[cfg(not(target_os = "macos"))]
+    fn take_orphans(_pgid: u32) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// プロセスグループ `pgid` に居る自分の uid のプロセス（pid と短い名前。ゾンビは載らない）
+    #[cfg(target_os = "macos")]
+    fn group_members(pgid: u32) -> Vec<(i32, String)> {
+        let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+            return Vec::new();
+        };
+        // SAFETY: 自分の uid を読むだけ
+        let uid = unsafe { libc::getuid() };
+        crate::ports::list_pids()
+            .into_iter()
+            // SAFETY: pid の所属グループを読むだけ（居なければ -1）
+            .filter(|&pid| unsafe { libc::getpgid(pid) } == pgid)
+            .filter_map(|pid| {
+                let (_, owner, comm) = crate::ports::short_info(pid)?;
+                (owner == uid).then_some((pid, comm))
+            })
+            .collect()
+    }
+
+    /// 子が一巡するテストの名前（`--list` の `<名前>: test` の行。子で外す 1 本は除く）
+    fn suite_names() -> Vec<String> {
+        let exe = std::env::current_exe().expect("テストバイナリのパス");
+        let mut cmd = std::process::Command::new(exe);
+        // Windows でコンソール窓を出さない（#628 / #586 の 1 実装を通す）
+        crate::platform::process::no_console_window(&mut cmd);
+        cmd.arg("--list");
+        let crate::probe::Outcome::Done { stdout, .. } =
+            crate::probe::command_output_with_timeout(&mut cmd, "--list", RESIDUE_DEADLINE)
+        else {
+            panic!("テストの一覧を読めない");
+        };
+        String::from_utf8_lossy(&stdout)
+            .lines()
+            .filter_map(|l| l.strip_suffix(": test"))
+            .filter(|n| !n.contains(SKIP_IN_CHILD))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// 子のグループに孫を残したテストを名指す（#2448）。`names` を半分ずつ子で走らせ、
+    /// 残ったほうへ潜る（犯人が 1 本なら約 log2(件数) 段・全体で一巡 1 回ぶんほどの実行）。
+    /// 半分ずつでは残らないとき（組み合わせでだけ残る）はその組を 1 行で返す
+    fn orphan_makers(scratch: &Path, names: &[String], env: &[(&str, &str)]) -> Vec<String> {
+        if let [one] = names {
+            return vec![one.clone()];
+        }
+        let (front, back) = names.split_at(names.len() / 2);
+        let mut found = Vec::new();
+        for half in [front, back] {
+            let mut args = vec!["--exact"];
+            args.extend(half.iter().map(String::as_str));
+            if !run_suite_in(scratch, &args, env).orphans.is_empty() {
+                found.extend(orphan_makers(scratch, half, env));
+            }
+        }
+        if found.is_empty() {
+            found.push(format!(
+                "{} 本を一緒に走らせたときだけ残る（先頭は {}）",
+                names.len(),
+                names.first().map(String::as_str).unwrap_or("")
+            ));
+        }
+        found
+    }
+
+    /// #2448 の検出力を見る注入。目印（[`ORPHAN_INJECT`]）があるときだけ、修正前の
+    /// `probe::tests` と同じ形（直接の子だけを kill する口で `sh -c "…; sleep"` を打ち切る）で
+    /// 孫を親を失った形で残す。普段の一巡では何もしない。孫は 60 秒で自分から終わる
+    /// （番犬が片付け損ねても長く残らない）。予算 2 秒は sh が `sleep` を起こすまで（ms）と桁で開けてある
+    #[cfg(unix)]
+    #[test]
+    fn 注入_打ち切った子の孫を親を失った形で残す() {
+        if std::env::var_os(ORPHAN_INJECT).is_none() {
+            return;
+        }
+        let outcome = crate::probe::output_with_timeout(
+            "/bin/sh",
+            &["-c", "printf %s x; sleep 60"],
+            Duration::from_secs(2),
+        );
+        assert!(
+            outcome.timeout_notice().is_some(),
+            "打ち切られていない: {outcome:?}"
+        );
     }
 
     /// `test result: …; N passed;` の合計（ok / FAILED のどちらの行からも採る）
@@ -1330,6 +1502,13 @@ mod tests {
     /// [`KINDS`] の `auto: false` でそもそも対象外）。
     /// 機序の確定と手当ては #1581 に残る（案 2 = `remove_own_dirs` の短いリトライ /
     /// 案 3 = 番犬側の固定待ち。どちらも実機が要る）
+    ///
+    /// **同じ一巡で、親を失った孫プロセスも数える**（#2448。macOS）。子は自分のプロセスグループを
+    /// 率いて走り、終わった後にそのグループへ残ったものがテストの置き去りにした孫。10/28 の実物は
+    /// `probe::tests::出力を少し出してから固まる子も…` の `sh -c "printf …; sleep 600"`
+    /// （打ち切りの kill が sh にしか届かず、`sleep 600` が ppid 1 で 10 分残った。この一巡でも
+    /// もう 1 回走るので、`cargo test` 1 回で 2 本）。残っていたら一覧の二分探索でテストを名指す。
+    /// 検出力は注入（[`注入_打ち切った子の孫を親を失った形で残す`]）を毎回名指せることで見る
     #[test]
     #[cfg_attr(
         windows,
@@ -1341,28 +1520,68 @@ mod tests {
         }
         let scratch = ScratchDir::new("residue-watchdog");
 
-        let (residues, out) = run_suite_in(scratch.path(), None, false);
+        let run = run_suite_in(scratch.path(), &[], &[]);
         // **個々のテストの成否では落とさない**（ここの本題は残骸の数で、
         // 他のテストの失敗まで二重に報告すると原因が埋もれる）。
         // 代わりに「一巡したこと」を件数で確かめる
-        let passed = passed_count(&out);
+        let passed = passed_count(&run.out);
         assert!(
             passed >= 500,
             "子が一巡していない（passed={passed}）= 検査になっていない。末尾:\n{}",
-            out.lines().rev().take(20).collect::<Vec<_>>().join("\n")
+            run.out
+                .lines()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("\n")
         );
+        let residues = &run.residues;
         assert!(
             residues.is_empty(),
             "テストを一巡したら TMPDIR に {} 件残った（作り手は名前で辿れる）: {residues:?}\n\
              直し方: その dir を tako_core::test_residue::ScratchDir / process_scratch で作る",
             residues.len()
         );
+        // #2448: テストが打ち切った子の孫が、親を失って子のプロセスグループに残っていない
+        if !run.orphans.is_empty() {
+            let makers = orphan_makers(scratch.path(), &suite_names(), &[]);
+            panic!(
+                "テストを一巡したら、子のプロセスグループに {} 本が親を失って残った（#2448）: {:?}\n\
+                 残したテスト: {makers:?}\n\
+                 直し方: 打ち切る子は `exec` で置き換えて孫を作らない（`sh -c \"printf …; exec sleep 600\"`）。\
+                 直接の子だけを kill する口（`probe::output_with_timeout` / `Child::kill`）は孫に届かない。\
+                 孫が要る形は `probe::group_output_with_timeout` で起こしてグループごと畳む",
+                run.orphans.len(),
+                run.orphans
+            );
+        }
 
         // A/B: 器を修正前（作りっぱなし）へ戻すと同じ手順で残る = 検出力がある
-        let (legacy, _) = run_suite_in(scratch.path(), Some("osc_sink::tests::"), true);
+        let legacy = run_suite_in(
+            scratch.path(),
+            &["osc_sink::tests::"],
+            &[("TAKO_1312_LEGACY", "1")],
+        );
         assert!(
-            !legacy.is_empty(),
+            !legacy.residues.is_empty(),
             "TAKO_1312_LEGACY=1 でも残らない = A/B が効いていない"
         );
+
+        // #2448 の検出力: 修正前の probe と同じ形で孫を残す注入を、静かなテストと並べても名指せる
+        #[cfg(target_os = "macos")]
+        {
+            let inject = "test_residue::tests::注入_打ち切った子の孫を親を失った形で残す";
+            let quiet = "test_residue::tests::同じタグでも別のdirになる";
+            let makers = orphan_makers(
+                scratch.path(),
+                &[quiet.to_string(), inject.to_string()],
+                &[(ORPHAN_INJECT, "1")],
+            );
+            assert_eq!(
+                makers,
+                [inject],
+                "孫を残す注入を名指せない = #2448 の検査が効いていない"
+            );
+        }
     }
 }

@@ -847,7 +847,12 @@ mod tests {
     }
 
     /// **返ってこない子**の script。`prefix` を先に出してから固まる。
-    /// Windows の定番 sleep は `ping -n`（`timeout` は stdin を要求する）
+    /// Windows の定番 sleep は `ping -n`（`timeout` は stdin を要求する）。
+    ///
+    /// 固まる本体は `exec` で子そのものと置き換える（#2448）。打ち切りの kill は直接の子にしか
+    /// 届かないので、macOS の `/bin/sh`（bash 3.2）が並びの最後の `sleep` を子として起こすと、
+    /// kill は sh に当たって `sleep 600` が親を失って 10 分残る（テストは緑のまま）。番犬は
+    /// `test_residue` の一巡。Windows の `cmd /C` には `exec` が無く `ping` は孫のまま（#2454）
     fn hang_script(prefix: Option<&str>) -> String {
         #[cfg(windows)]
         {
@@ -859,8 +864,8 @@ mod tests {
         #[cfg(not(windows))]
         {
             match prefix {
-                Some(p) => format!("printf %s {p}; sleep 600"),
-                None => "sleep 600".to_string(),
+                Some(p) => format!("printf %s {p}; exec sleep 600"),
+                None => "exec sleep 600".to_string(),
             }
         }
     }
@@ -1010,7 +1015,8 @@ mod tests {
     #[test]
     fn 組み立て済みのcommandも上限で打ち切られる() {
         let mut command = Command::new("/bin/sh");
-        crate::platform::process::no_console_window(&mut command).args(["-c", "sleep 600"]);
+        // `exec`: 打ち切りの kill を眠る本人に当てる（sh の 1 文の最適化に頼らない。#2448）
+        crate::platform::process::no_console_window(&mut command).args(["-c", "exec sleep 600"]);
         let outcome =
             command_output_with_timeout(&mut command, "sh sleep", Duration::from_millis(300));
         assert!(
