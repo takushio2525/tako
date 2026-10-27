@@ -53,6 +53,23 @@ fn refuse_special_pid(pid: u32) -> String {
     format!("PID {pid} は停止の対象にできない（0 と範囲外の値は、送るとプロセスグループや全プロセスを指す）")
 }
 
+/// 開いたハンドルで見た相手が**もう終わっている / 終わりかけ**か（Windows の腕の純粋部分。#1599）。
+///
+/// `signaled` は `WaitForSingleObject(handle, 0)` がシグナル状態を返したか、`exit_code` は
+/// `GetExitCodeProcess` の結果。Microsoft の仕様では終了時に**終了コードが先に決まり、
+/// その後でオブジェクトがシグナル状態になる**（#2275 で記録した順序）。その間の相手は
+/// まだシグナル状態でないうえ、`TerminateProcess` は ERROR_ACCESS_DENIED で失敗する。
+/// シグナル状態だけで見ると、終わりかけの相手への要求を「失敗」と答えてしまう
+/// （CI の Windows で実際に割れた）。終了コードの読みは生存判定と同じ 1 実装
+/// （`tako_core::platform::process::exited`）に揃える = 停止の待ち合わせ（`has_terminated`）と
+/// 同じ瞬間から「終わった」と言う。
+///
+/// cfg で割れていないので **macOS からも Windows の腕の判定を検査できる**
+#[cfg_attr(not(windows), allow(dead_code))]
+fn already_ending(signaled: bool, exit_code: Option<u32>) -> bool {
+    signaled || tako_core::platform::process::exited(exit_code)
+}
+
 /// プロセスが**終了済み**か（ゾンビも終了済みとして扱う）。
 ///
 /// `kill(pid, 0)`（= `tako_core::platform::process::pid_alive`）は**ゾンビにも成功する**ので、
@@ -180,6 +197,8 @@ mod imp {
     const PROCESS_TERMINATE: u32 = 0x0001;
     /// `SYNCHRONIZE`（winnt.h）。終わったかを `WaitForSingleObject` で問うのに要る権利
     const SYNCHRONIZE: u32 = 0x0010_0000;
+    /// `PROCESS_QUERY_LIMITED_INFORMATION`（winnt.h）。終了コードを問うのに要る権利
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x0000_1000;
     /// `WAIT_OBJECT_0`。プロセスのオブジェクトがシグナル状態 = もう終わっている
     const WAIT_OBJECT_0: u32 = 0;
     /// 終わらせたプロセスの終了コード。`STILL_ACTIVE`（259）でなければ生存判定
@@ -191,15 +210,20 @@ mod imp {
         fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> Handle;
         fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
         fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+        fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
         fn CloseHandle(object: Handle) -> i32;
     }
 
-    /// 開いたハンドルの相手がもう終わっているか（待たずに 1 回だけ問う）
+    /// 開いたハンドルの相手がもう終わっている / 終わりかけか（待たずに 1 回だけ問う）。
+    /// 判定は純関数 [`super::already_ending`]
     ///
     /// # Safety
-    /// `handle` は `SYNCHRONIZE` 付きで開いた有効なハンドル
-    unsafe fn exited(handle: Handle) -> bool {
-        WaitForSingleObject(handle, 0) == WAIT_OBJECT_0
+    /// `handle` は `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION` 付きで開いた有効なハンドル
+    unsafe fn ending(handle: Handle) -> bool {
+        let signaled = WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
+        let mut code = 0u32;
+        let exit_code = (GetExitCodeProcess(handle, &mut code) != 0).then_some(code);
+        super::already_ending(signaled, exit_code)
     }
 
     pub fn terminate(pid: u32, _force: bool) -> Result<(), String> {
@@ -210,7 +234,11 @@ mod imp {
         // SAFETY: OpenProcess の戻りは null を検査し、復帰経路すべてで CloseHandle する。
         // 以降の API はこのハンドルと値渡しの引数しか受け取らない
         unsafe {
-            let handle = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid);
+            let handle = OpenProcess(
+                PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            );
             if handle.is_null() {
                 // 居ない（ERROR_INVALID_PARAMETER）/ 権限が無い（ERROR_ACCESS_DENIED）
                 return Err(format!(
@@ -218,17 +246,17 @@ mod imp {
                     std::io::Error::last_os_error()
                 ));
             }
-            let outcome = if exited(handle) {
+            let outcome = if ending(handle) {
                 // もう終わっている（誰かがハンドルを持つ間はオブジェクトが残る = unix のゾンビ
-                // 相当）。unix の kill がゾンビへ成功するのと揃え、要求は果たされている扱い
+                // 相当）か、終わりかけ。unix の kill がゾンビへ成功するのと揃え、要求は果たされている扱い
                 Ok(())
             } else if TerminateProcess(handle, EXIT_CODE) != 0 {
                 Ok(())
             } else {
                 let err = std::io::Error::last_os_error();
                 // 終わりかけの相手への TerminateProcess は ERROR_ACCESS_DENIED で失敗する。
-                // 開いてから撃つまでに終わったのなら要求は果たされている
-                if exited(handle) {
+                // 開いてから撃つまでに終わり始めたのなら要求は果たされている
+                if ending(handle) {
                     Ok(())
                 } else {
                     Err(format!("PID {pid} の TerminateProcess に失敗（{err}）"))
@@ -334,7 +362,12 @@ mod tests {
     ///
     /// unix は刈り取る前のゾンビ（`kill` は成功する）、Windows は終わったが
     /// ハンドルが残っているオブジェクト（`TerminateProcess` は ACCESS_DENIED で失敗するので、
-    /// 腕が先に終わったかを問う）。どちらも `Child` を持ったまま = pid は再利用されない
+    /// 腕が先に終わったかを問う）。どちらも `Child` を持ったまま = pid は再利用されない。
+    ///
+    /// 待ち合わせは `has_terminated`（Windows は終了コード）なので、**終了コードは決まったが
+    /// まだシグナル状態でない**窓に当たりうる。腕がシグナル状態だけで見ていた版は、この窓で
+    /// Err を返して CI の Windows で割れた（#1599 の 2 回目の run）。判定の向きは
+    /// `already_ending` の単体が決定的に固定する
     #[test]
     fn terminateは終わった自分の子へは何も起こさずokを返す() {
         let mut child = spawn_quick();
@@ -392,6 +425,26 @@ mod tests {
     fn terminateは居ないpidをerrで返す() {
         let err = terminate(99_999_999, true).expect_err("居ない pid は撃てない");
         assert!(err.contains("失敗"), "{err}");
+    }
+
+    /// Windows の腕の「もう終わっている / 終わりかけ」の判定（純関数。macOS でも回る）
+    #[test]
+    fn already_endingは終了コードが決まった時点で終わりかけと読む() {
+        use tako_core::platform::process::STILL_ACTIVE;
+        assert!(already_ending(true, None), "シグナル状態 = 終わっている");
+        assert!(
+            already_ending(false, Some(1)),
+            "終了コードが決まってまだシグナル状態でない窓（CI の Windows で割れた形）"
+        );
+        assert!(already_ending(false, Some(0)), "正常終了のコードも同じ");
+        assert!(
+            !already_ending(false, Some(STILL_ACTIVE)),
+            "走っている相手を終わったと読まない（撃たずに Ok を返す嘘になる）"
+        );
+        assert!(
+            !already_ending(false, None),
+            "終了コードを読めないときは終わったと言えない"
+        );
     }
 
     /// 呼び名は [`GRACEFUL_TERMINATE`] から決まる（Windows に穏当な終了要求は無い）
