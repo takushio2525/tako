@@ -5843,22 +5843,15 @@ impl TakoApp {
                         if let Some(session) = app.terminals.get(&pane) {
                             // #2413: 一斉に起こさない（復元の列で 1 本ずつ・master が先・
                             // メモリが逼迫しているあいだは待つ）。全部を預け、500 ms の tick が
-                            // 優先度の順に起こす（起動待ちが無効 = A/B なら従来どおりその場で書く）
-                            let pane_obj = app.workspace.pane_anywhere(pane);
+                            // 優先度の順に起こす（起動待ちが無効 = A/B なら従来どおりその場で書く）。
+                            // 役割は layout から復元したペインから引く（組み立ては単体テストと共有）
                             let held = tako_control::launch_gate::hold(
-                                tako_control::launch_gate::LaunchRequest {
-                                    pane: pane.as_u64(),
-                                    kind: tako_control::launch_gate::LaunchKind::Restore,
-                                    agent: agent.as_str().to_string(),
-                                    label: pane_obj
-                                        .and_then(|p| p.title())
-                                        .unwrap_or_default()
-                                        .to_string(),
-                                    role: pane_obj.and_then(|p| p.role()).map(str::to_string),
-                                    action: tako_control::launch_gate::LaunchAction::Write(
-                                        resume_input(&command),
-                                    ),
-                                },
+                                tako_control::launch_gate::restore_request(
+                                    pane.as_u64(),
+                                    app.workspace.pane_anywhere(pane),
+                                    agent.as_str(),
+                                    resume_input(&command),
+                                ),
                             );
                             match held {
                                 Some(tako_control::launch_gate::LaunchAction::Write(bytes)) => {
