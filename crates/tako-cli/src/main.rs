@@ -567,7 +567,8 @@ struct RunDefaultArgs {
 
 #[derive(Args)]
 struct RecoverArgs {
-    /// このバックアップ世代（1〜3、または good = 最後に復元へ成功した良品）を
+    /// このバックアップ世代（1〜3、good = 最後に復元へ成功した良品、または
+    /// rescued = 復元の直後に全ペインが終わったので退避した構成。#641）を
     /// layout.json へ復元する。現在の layout.json は layout.json.pre-recover へ退避される
     #[arg(long, value_name = "世代")]
     apply: Option<String>,
@@ -8663,6 +8664,16 @@ fn recover_list(path: &std::path::Path) -> Result<(), String> {
     // 良品スナップショット（#381: 最後に復元へ実際に成功した構成）
     let good = path.with_extension("json.good");
     println!("layout.json.good    : {}", describe(&good));
+    // 復元の直後の全滅で救済・見送りしたときに退避した構成（#641）
+    let rescued = path.with_extension(tako_control::restore_guard::RESCUED_EXT);
+    println!("layout.json.rescued : {}", describe(&rescued));
+    if let Some(record) = tako_control::restore_guard::load() {
+        println!(
+            "復元の直後の全滅    : 連続 {} 回（{} 回続くと次の起動は復元を見送る）",
+            record.count,
+            tako_control::restore_guard::SKIP_AFTER
+        );
+    }
     eprintln!();
     // 打鍵の表記は正本から引く（Windows は Ctrl+Shift+Q。#1203）
     let quit_key =
@@ -8671,18 +8682,25 @@ fn recover_list(path: &std::path::Path) -> Result<(), String> {
     eprintln!("tako を再起動すると復元されたレイアウトで立ち上がります。");
     eprintln!("実体の tmux セッションが生きていれば、実行中プロセスごと画面に戻ります。");
     eprintln!("（good = 最後に復元へ成功した良品。`tako recover --apply good` で戻せます）");
+    if rescued.is_file() {
+        eprintln!(
+            "（rescued = 復元の直後に全ペインが終わったので退避した構成。`tako recover --apply rescued` で戻せます）"
+        );
+    }
     Ok(())
 }
 
-/// バックアップ世代（1〜3 / good）を layout.json へ復元する
+/// バックアップ世代（1〜3 / good / rescued）を layout.json へ復元する
 /// （現行は layout.json.pre-recover へ退避）
 fn recover_apply(path: &std::path::Path, generation: &str, force: bool) -> Result<(), String> {
     let bak = match generation {
         "1" | "2" | "3" => tako_control::config_io::backup_path(path, generation.parse().unwrap()),
         "good" => path.with_extension("json.good"),
+        // #641: 復元の直後の全滅で救済・見送りしたときの退避
+        "rescued" => path.with_extension(tako_control::restore_guard::RESCUED_EXT),
         other => {
             return Err(format!(
-                "世代は 1〜3 または good で指定してください（指定: {other}）"
+                "世代は 1〜3・good・rescued のどれかで指定してください（指定: {other}）"
             ))
         }
     };

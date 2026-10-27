@@ -425,6 +425,24 @@ pub const CATALOG: &[Entry] = &[
         local_fields: &[],
         needs_local_unless: &[],
     },
+    // #641: 復元の直後に全ペインが PTY 死亡したとき（救済・見送り）に退避した layout
+    Entry {
+        root: Root::TakoData,
+        path: "layout.json.rescued",
+        class: Class::Local,
+        note: notes::RUNTIME,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
+    // #641: 復元の直後の全滅で救済した連続回数（平常時はファイルが無い）
+    Entry {
+        root: Root::TakoData,
+        path: "restore-guard.json",
+        class: Class::Local,
+        note: notes::RUNTIME,
+        local_fields: &[],
+        needs_local_unless: &[],
+    },
     Entry {
         root: Root::TakoData,
         // #766: 器が OSC を素通ししない環境でのシェル統合の側路（ペインごとの実行時ファイル）

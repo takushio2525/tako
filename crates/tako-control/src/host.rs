@@ -1433,6 +1433,11 @@ pub trait SystemHost {
     fn persist_restore_pruned(&self) -> Vec<crate::layout_reconcile::PrunedPane> {
         Vec::new()
     }
+    /// 復元の直後の全滅ガードの状態（#641。窓・救済の行・連続の記録・退避先）。
+    /// 正本は `crate::restore_guard::Window::to_json`。復元しない実装（テストホスト等）では null
+    fn restore_guard_status(&self) -> Value {
+        Value::Null
+    }
     /// 起動時に orphan 自動復帰した tmux セッション数（Issue #191）
     fn recovered_sessions_count(&self) -> usize {
         0

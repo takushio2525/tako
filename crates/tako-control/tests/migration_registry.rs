@@ -386,6 +386,13 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             &["GuardFile", "GuardMark"],
         ),
         (
+            // #641: 復元の直後の全滅で救済した連続回数 `<data_dir>/restore-guard.json`。版数の番地は
+            // 持たない（共有しない Local のランタイム状態。読めなければ無いものとして扱う = 見送らない側へ
+            // 倒す）が、欄を増減・改名したら旧い記録が読めるかをここで選ばせる
+            "crates/tako-control/src/restore_guard.rs",
+            &["GuardRecord"],
+        ),
+        (
             // #2204: codex の rollout の読みの状態（`cursor.jsonl` の行の `codex`。claude の行には無い =
             // serde の default で旧い行がそのまま読める）
             "crates/tako-core/src/usage/codex.rs",

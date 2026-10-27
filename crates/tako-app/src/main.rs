@@ -3141,6 +3141,12 @@ struct TakoApp {
     sleep_guard_popover_anchor: Option<gpui::Point<gpui::Pixels>>,
     /// 起動時に orphan 自動復帰した tmux セッション数（Issue #191。診断用）
     recovered_count: usize,
+    /// 復元の直後の全滅ガード（#641）。起動時に器へ繋いでからの窓・入力の有無・救済の有無
+    restore_guard: tako_control::restore_guard::Window,
+    /// 復元に使った layout（#641 の救済で `layout.json.rescued` へ退避する。窓を過ぎたら捨てる）
+    restore_source: Option<tako_control::layout::LayoutFile>,
+    /// 器を使わずに起こすペイン（#641 の救済のシェル。`spawn_session` が 1 回だけ消費する）
+    direct_spawn: std::collections::HashSet<PaneId>,
     /// ペインの平文ログ管理（Issue #112 B）
     pane_logs: std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
     /// 器のペインの取り込みの間合い（#2018。どの tick で tmux を起こすかを決める）
@@ -4857,11 +4863,21 @@ impl TakoApp {
         let mut window_frames_restore: Vec<(u64, tako_control::layout::WindowFrame)> = Vec::new();
         // 器（tmux セッション）が無いので復元より前に外したペイン（#1858）
         let mut restore_prune = tako_control::layout_reconcile::PruneReport::default();
+        // #641: 実際に復元へ使った layout（直後の全滅で救済するときに退避する）
+        let mut restore_source: Option<tako_control::layout::LayoutFile> = None;
         let (workspace, restore_report) = if let Some(reason) = &secondary_reason {
             let msg = format!(
                 "復元スキップ: {reason}のためセカンダリモードで起動\
                  （このウィンドウのタブは永続化されず、既存側の復元・保存を妨げない）"
             );
+            persist_diag(&msg);
+            (Workspace::new("1", Pane::new(PaneOrigin::User)), msg)
+        } else if let Some(msg) = tmux_persist
+            .then(tako_control::restore_guard::skip_restore_if_due)
+            .flatten()
+        {
+            // #641: 直前の起動が続けて「復元の直後に全ペイン PTY 死亡」で救済に落ちた。
+            // 今回は layout を復元しない（layout.json は layout.json.rescued へ退避済み）
             persist_diag(&msg);
             (Workspace::new("1", Pane::new(PaneOrigin::User)), msg)
         } else if tmux_persist {
@@ -4903,7 +4919,12 @@ impl TakoApp {
                     .iter()
                     .filter_map(|w| w.frame.clone().map(|f| (w.id, f)))
                     .collect();
-                tako_control::layout::restore(&file)
+                let restored_ws = tako_control::layout::restore(&file);
+                // #641: 器へ繋ぎ直す復元だけ、直後の全滅に備えて中身を控える
+                if restored_ws.is_ok() && tmux_available {
+                    restore_source = Some(file);
+                }
+                restored_ws
             });
             match loaded {
                 Ok((ws, panes)) => {
@@ -5372,6 +5393,9 @@ impl TakoApp {
             sleep_guard_popover_open: false,
             sleep_guard_popover_anchor: None,
             recovered_count: 0,
+            restore_guard: Default::default(),
+            restore_source,
+            direct_spawn: Default::default(),
             pane_logs: std::sync::Arc::new(std::sync::Mutex::new(
                 tako_core::pane_log::PaneLogManager::new(
                     tako_core::pane_log::log_dir()
@@ -5541,6 +5565,10 @@ impl TakoApp {
                     this.quitting
                 ));
             }
+            // #641: 救済せずに終わる起動は、復元の直後の全滅の連続を途切れさせる
+            if this.restore_guard.clear_on_quit() {
+                tako_control::restore_guard::clear();
+            }
             if !this.quitting {
                 // ペインログ（Issue #112 B）: バックエンドの無い直接ペインはアプリと共に
                 // プロセスが死ぬため、可視画面をフラッシュして書き残す。バックエンドペインは
@@ -5613,6 +5641,8 @@ impl TakoApp {
             flush_sessions
         })
         .detach();
+        // #641: 復元したペインがあったか（下の orphan 復帰の後に、直後の全滅を見張る窓を開く）
+        let restored_any = !restored.is_empty();
         if restored.is_empty() {
             let root_id = app.workspace.active_tab().tree().focused();
             if let Err(e) = app.spawn_session(root_id, SpawnOptions::default(), cx) {
@@ -5988,6 +6018,8 @@ impl TakoApp {
                 eprintln!("info: {report}");
             }
         }
+        // #641: 復元・orphan 復帰で器へ繋いだペインの直後の全滅を見張る窓を開く
+        app.arm_restore_guard(restored_any);
 
         // 起動時の orphan 一括クリーンアップ（FR-2.16.11）。復元で backend_sessions が
         // 出揃った後に実行し、前回クラッシュ等で取り残された detached・非 grouped の
@@ -6146,6 +6178,10 @@ impl TakoApp {
                             ..
                         }
                     );
+                    // #641: ペインへの送信・クリックは「入力」（以後の全滅は普通の終了として扱う）
+                    if tako_control::restore_guard::counts_as_input(&incoming.request) {
+                        app.restore_guard.note_input();
+                    }
                     let mut result = tako_control::dispatch(app, incoming.request, incoming.origin);
                     if limit_resume_changed && app.refresh_limit_resume_summary() {
                         cx.notify();
@@ -6802,6 +6838,8 @@ impl TakoApp {
                         }
                     }
                     app.save_layout();
+                    // #641: 復元の直後の窓を救済なしで過ぎたら、連続の記録を消す
+                    app.settle_restore_guard();
                     // (read_dir し直す対象, git status を引くリポジトリの起点)。
                     // #1009: git 側へ渡すのは**ワークスペースルートだけ**にする。
                     // 以前は展開済みディレクトリを全部渡していたので
@@ -10540,6 +10578,8 @@ impl TakoApp {
         } else {
             None
         };
+        // #641: 復元の直後の全滅から救済するシェルは器を使わない（器の不調に巻き込まれない）
+        let direct = self.direct_spawn.remove(&pane_id);
         if let Some(name) = reattach_to {
             options = tako_core::tmux_backend::reattach_options(
                 options,
@@ -10547,7 +10587,10 @@ impl TakoApp {
                 &name,
             );
             backend_session = Some(name);
-        } else if self.tmux_persist && tako_core::backend::capabilities().survives_app_exit {
+        } else if !direct
+            && self.tmux_persist
+            && tako_core::backend::capabilities().survives_app_exit
+        {
             let name = self
                 .backend_sessions
                 .entry(pane_id)
@@ -11830,9 +11873,15 @@ impl TakoApp {
         self.claude_resume_sessions.remove(pane_id);
         self.agent_resume_sessions.remove(pane_id);
         if reason.is_explicit() {
+            // #641: 明示の close（× / ⌘W / CLI / MCP）も人 / AI の操作 = 以後の全滅は普通の終了
+            self.restore_guard.note_input();
             self.drop_backend_session(pane_id, reason.origin(), None);
         } else {
-            self.backend_sessions.remove(&pane_id);
+            // #641: 窓の内側で PTY 死亡により外れた器を控える（救済の行に載せる）
+            if let Some(name) = self.backend_sessions.remove(&pane_id) {
+                self.restore_guard
+                    .note_exit(std::time::Instant::now(), &name);
+            }
         }
         self.drop_backend_reattach(pane_id);
     }
@@ -12374,6 +12423,18 @@ impl TakoApp {
                 if self.quitting {
                     return;
                 }
+                // #641: 器へ繋いだ直後に入力の無いまま全ペインが PTY 死亡した = 復元の失敗。
+                // 終了すると次の起動も同じ復元で即終了するループになる（Windows の実機で
+                // GUI が立ち上がらなかった）ので、終了せず器を使わない新しいシェルのタブで続ける。
+                // 普通の終了（入力の後の exit・窓を過ぎた全滅・明示 close）は従来どおり
+                let keep = if reason.is_explicit() || self.secondary {
+                    tako_control::restore_guard::Keep::NotArmed
+                } else {
+                    match self.rescue_after_restore(tab_id, &pane_ids, cx) {
+                        Ok(()) => return,
+                        Err(keep) => keep,
+                    }
+                };
                 self.quitting = true;
                 // セルフテスト中はここが**静かな終了**になる（persist_diag も抑止される）。
                 // 「以降の項目が走らなかった」の原因がログから分からなくなるので、
@@ -12407,9 +12468,11 @@ impl TakoApp {
                             reason.origin().marker()
                         ));
                     } else {
-                        persist_diag(
-                            "全ペイン終了（PTY 死亡）: layout.json は保持して終了（次回起動で復元）",
-                        );
+                        // #641: ガードが働かなかった理由を添える（ガードに関係の無い終了は従来の行のまま）
+                        persist_diag(&format!(
+                            "全ペイン終了（PTY 死亡）: layout.json は保持して終了（次回起動で復元）{}",
+                            keep.note().unwrap_or_default()
+                        ));
                     }
                 }
                 // 明示 close は空で再開するため接続情報も片付ける。PTY 死亡由来は
@@ -12422,6 +12485,121 @@ impl TakoApp {
         }
         self.sync_preview_watches();
         cx.notify();
+    }
+
+    /// 起動時の復元・orphan 復帰で器へ繋いだペインがあれば、直後の全滅を見張る窓を開く（#641）。
+    /// 器へ繋がなかった起動は連続の記録を消す（その起動は同じ理由で終わっていない）。
+    /// セカンダリ・セルフテスト・`TAKO_641_LEGACY=1` は窓も記録も触らない
+    fn arm_restore_guard(&mut self, restored_any: bool) {
+        if self.secondary
+            || std::env::var_os("TAKO_SELF_TEST").is_some()
+            || tako_control::restore_guard::legacy()
+        {
+            self.restore_guard.mark_settled();
+            self.restore_source = None;
+            return;
+        }
+        if restored_any || self.recovered_count > 0 {
+            let containers = self
+                .workspace
+                .tabs()
+                .iter()
+                .flat_map(|t| t.tree().panes())
+                .filter(|p| self.backend_sessions.contains_key(&p.id()))
+                .count();
+            self.restore_guard
+                .arm(std::time::Instant::now(), containers);
+        }
+        if !self.restore_guard.armed() {
+            self.restore_source = None;
+        }
+        self.settle_restore_guard();
+    }
+
+    /// 窓を救済なしで過ぎた（窓を開かなかった起動は直ちに）なら連続の記録を消す（#641。2 秒 tick）
+    fn settle_restore_guard(&mut self) {
+        if self.restore_guard.settle_due(std::time::Instant::now()) {
+            tako_control::restore_guard::clear();
+            self.restore_guard.mark_settled();
+            self.restore_source = None;
+        }
+    }
+
+    /// 最後のタブが PTY 死亡で閉じるとき、復元の直後の全滅なら終了せずに救済する（#641）。
+    ///
+    /// 救済 = 復元に使った layout を `layout.json.rescued` へ退避し、器を使わない新しいシェルの
+    /// タブを立て、死んだタブを外す（器は kill しない = #30 と同じ PTY 死亡由来の close）。
+    /// 理由と捨てた器は persist.log へ、連続回数は `restore-guard.json` へ残す。
+    /// 救済しないなら終了の理由（persist.log の「全ペイン終了」の行へ添える）を返す
+    fn rescue_after_restore(
+        &mut self,
+        tab_id: TabId,
+        pane_ids: &[PaneId],
+        cx: &mut Context<Self>,
+    ) -> Result<(), tako_control::restore_guard::Keep> {
+        use tako_control::restore_guard as guard;
+        let dying: Vec<String> = pane_ids
+            .iter()
+            .filter_map(|id| self.backend_sessions.get(id).cloned())
+            .collect();
+        let elapsed =
+            match self
+                .restore_guard
+                .decide(std::time::Instant::now(), dying.len(), guard::legacy())
+            {
+                guard::Decision::Rescue { elapsed } => elapsed,
+                guard::Decision::Quit(keep) => return Err(keep),
+            };
+        // 器を使わずに起こす（同じ器の不調に巻き込まれない。以後の分割は従来どおり器に乗る）
+        let pane = Pane::new(PaneOrigin::User);
+        let pane_id = pane.id();
+        let new_tab = self
+            .workspace
+            .create_tab(crate::ui_text::common::restore_failed(), pane);
+        self.direct_spawn.insert(pane_id);
+        if let Err(e) = self.spawn_session(pane_id, SpawnOptions::default(), cx) {
+            self.direct_spawn.remove(&pane_id);
+            let _ = self.workspace.close_tab(new_tab);
+            persist_diag(&format!(
+                "復元の直後の全滅（#641）: 救済のシェルを起こせない（{e}）ので従来どおり終了する"
+            ));
+            return Err(guard::Keep::RescueFailed);
+        }
+        let mut exited = self.restore_guard.exited().to_vec();
+        for name in dying {
+            if !exited.contains(&name) {
+                exited.push(name);
+            }
+        }
+        let stashed = match (self.restore_source.take(), guard::rescued_path()) {
+            (Some(file), Some(path)) => guard::stash_layout_at(&path, &file).map(|()| Some(path)),
+            (Some(_), None) => Err(tako_core::paths::NoDataDir.to_string()),
+            (None, _) => Ok(None),
+        };
+        let record = guard::path()
+            .ok_or_else(|| tako_core::paths::NoDataDir.to_string())
+            .and_then(|p| {
+                guard::record_rescue_at(
+                    &p,
+                    guard::Reason::AllExitedAfterRestore,
+                    tako_control::queue::unix_ms(),
+                )
+            });
+        let line = guard::rescue_line(
+            elapsed,
+            &exited,
+            stashed
+                .as_ref()
+                .map(|p| p.as_deref())
+                .map_err(String::as_str),
+            record.as_ref().map_err(String::as_str),
+        );
+        persist_diag(&line);
+        self.restore_guard.mark_rescued(line);
+        // 最後のタブではなくなったので通常の close（後始末・ペインログ・worker 記録）を通る
+        self.remove_tab_with(tab_id, CloseReason::Exited, cx);
+        self.save_layout();
+        Ok(())
     }
 
     /// orphan tmux セッションの一括クリーンアップ本体（FR-2.16.11）。
@@ -17134,6 +17312,8 @@ impl TakoApp {
         if !self.terminals.contains_key(&pane) {
             return;
         }
+        // #641: 貼り付けも入力（右クリックメニューからはキーを通らない）
+        self.restore_guard.note_input();
         if self.paste_guard && !tako_core::paste_guard::legacy() && !text.is_empty() {
             use tako_core::paste_guard as pg;
             let legacy_2050 = pg::legacy_2050();
@@ -17320,6 +17500,8 @@ impl TakoApp {
     fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
         // Issue #168: キーストローク毎の処理コストを計測（入力レイテンシの内訳）
         let _span = tako_control::diag::perf_span("key_input");
+        // #641: 人が打鍵した = 以後の全滅は普通の終了（`exit` で最後のシェルを閉じた等）
+        self.restore_guard.note_input();
         // #2046: 貼り付けの確認中は全キーを握る。Esc と Enter はどちらも「やめる」
         // （貼り付けの直後に送信のつもりで押した Enter で鍵を送らない）。送るのはボタンだけ
         if self.pending_paste.is_some() {
@@ -28269,6 +28451,10 @@ impl SystemHost for TakoApp {
 
     fn persist_restore_pruned(&self) -> Vec<tako_control::layout_reconcile::PrunedPane> {
         self.restore_pruned.clone()
+    }
+
+    fn restore_guard_status(&self) -> serde_json::Value {
+        self.restore_guard.to_json(std::time::Instant::now())
     }
 
     fn recovered_sessions_count(&self) -> usize {
