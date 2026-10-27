@@ -220,7 +220,7 @@ mod tests {
                 std::env::temp_dir().join(format!("tako-reveal-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).expect("一時 dir");
-            Self(std::fs::canonicalize(&dir).expect("正規化"))
+            Self(tako_core::platform::path::canonicalize(&dir).expect("正規化"))
         }
     }
 

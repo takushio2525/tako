@@ -156,10 +156,10 @@ printf '# 空白 と 日本語\n\n本文\n' > "$SPACED"
 
 # 本物の Finder を出さない: GUI の env に記録の口が無い・PATH の先頭が偽の open でなければ押さない
 guard_gui_env() {
-  local envs
+  local envs gui_path
   envs="$(ps -E -ww -o command= -p "$APP_PID" | tr ' ' '\n')"
-  if printf '%s\n' "$envs" | grep -qx "TAKO_REVEAL_RECORD=$RECORD" \
-    && printf '%s\n' "$envs" | grep '^PATH=' | head -1 | grep -q "^PATH=$PROBE/bin:"; then
+  gui_path="$(grep '^PATH=' <<<"$envs" | sed -n '1p')"
+  if grep -qx "TAKO_REVEAL_RECORD=$RECORD" <<<"$envs" && [[ "$gui_path" == "PATH=$PROBE/bin:"* ]]; then
     pass "GUI の env に記録の口があり、PATH の先頭は偽の open の dir"
   else
     echo "GUI の env に記録の口・偽の open が無い（本物の Finder を出さないため止める）"
@@ -263,7 +263,7 @@ mkdir -p "$TMP/disc-none"
 OUT="$(env TAKO_DISCOVERY_DIR="$TMP/disc-none" ${probe_env[@]+"${probe_env[@]}"} "$TAKO_BIN" file reveal "$SPACED" 2>&1)"
 RC=$?
 [ "$RC" -ne 0 ] && pass "GUI が居ない CLI は非ゼロで断る（終了コード ${RC}）" || fail "GUI が居ないのに成功扱い"
-echo "  観測: $(printf '%s' "$OUT" | head -2 | tr '\n' ' ' | sed "s#${TMP}#<TMP>#g")"
+echo "  観測: $(printf '%s' "$OUT" | sed -n '1,2p' | tr '\n' ' ' | sed "s#${TMP}#<TMP>#g")"
 check_eq "GUI が居ない CLI は Finder を呼ばない" "" "$(calls)"
 
 echo

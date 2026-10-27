@@ -312,7 +312,7 @@ pub(super) async fn preview_reveal_visual(
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).expect("visual-test preview-reveal-2247 の一時 dir");
     // 比べるのはプレビューが持つ形（dispatch が正規化した実体のパス = /private/var/… 等）
-    let tmp = std::fs::canonicalize(&tmp).expect("一時 dir を正規化できる");
+    let tmp = tako_core::platform::path::canonicalize(&tmp).expect("一時 dir を正規化できる");
 
     let plain = tmp.join("reveal.md");
     let spaced = tmp.join("空白 と 日本語.md");
@@ -460,19 +460,19 @@ pub(super) async fn preview_reveal_visual(
     let _ = window.update(cx, |app, _, cx| {
         app.open_settings_window_impl(Some(crate::settings_window::SettingsTab::Advanced), cx);
     });
-    let mut settings = None;
-    for _ in 0..40 {
-        settings = window
-            .update(cx, |app, _, _| app.settings_window_handle)
-            .ok()
-            .flatten();
-        if settings.is_some() {
-            break;
-        }
-        cx.background_executor()
-            .timer(Duration::from_millis(100))
-            .await;
-    }
+    // 窓が開いたという状態で待つ（回数の窓で待たない = #1902）
+    wait_for_app_state(
+        window,
+        cx,
+        &format!("visual-test {LABEL} ⑦: 設定ウィンドウ"),
+        state_wait_budget(Duration::from_secs(10), machine_busy()),
+        |app| app.settings_window_handle.is_some(),
+    )
+    .await;
+    let settings = window
+        .update(cx, |app, _, _| app.settings_window_handle)
+        .ok()
+        .flatten();
     let Some(settings) = settings else {
         fail(&format!("visual-test {LABEL} ⑦: 設定ウィンドウが開かない"));
     };
