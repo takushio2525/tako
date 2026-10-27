@@ -181,6 +181,21 @@ impl Remaining {
     pub fn with_detail(kind: RemainingKind, detail: Vec<String>) -> Self {
         Self { kind, detail }
     }
+
+    /// いまの導入状況から言えることを添える（#2428）。ログインの段で、このタブからは引けないが
+    /// 新しいタブなら引けるなら、新しいタブを開く 1 行を足す（`tako setup` の末尾と `--check` が
+    /// 同じ 1 行を出すよう、添える判断はここ 1 か所）
+    pub fn noting_state(self, state: &setup_bootstrap::BootstrapState) -> Self {
+        self.noting(setup_bootstrap::new_tab_note(state))
+    }
+
+    /// [`Self::noting_state`] の本体（添える 1 行を引数で受ける**純粋関数**）
+    fn noting(mut self, note: Option<String>) -> Self {
+        if matches!(self.kind, RemainingKind::AgentLogin(_)) {
+            self.detail.extend(note);
+        }
+        self
+    }
 }
 
 /// 積まれた残り作業を「人が上から片付ける一覧」へ整える（**純粋関数**）。
@@ -438,5 +453,26 @@ mod tests {
         } else {
             assert!(legacy_stop(&items).is_ok(), "既定アームでは止まらない");
         }
+    }
+
+    /// #2428: このタブで引けないときの 1 行はログインの段にだけ添え、表示の末尾に出る
+    #[test]
+    fn 新しいタブの1行はログインの段にだけ添える() {
+        let note = "新しいタブを開いてから打ってください".to_string();
+        let login =
+            Remaining::new(RemainingKind::AgentLogin(AgentKind::Claude)).noting(Some(note.clone()));
+        assert_eq!(login.detail.last(), Some(&note));
+        // 既定の理由（代行しない理由）は消さない
+        assert_eq!(login.detail.len(), 2, "{:?}", login.detail);
+        let rendered = render(&[login]).join("\n");
+        assert!(rendered.contains("claude auth login"), "{rendered}");
+        assert!(rendered.contains(&note), "{rendered}");
+        // ログイン以外の段には添えない（PATH の段は新しいタブでは直らない）
+        let path =
+            Remaining::new(RemainingKind::AgentPath(AgentKind::Claude)).noting(Some(note.clone()));
+        assert!(!path.detail.contains(&note));
+        // 添えるものが無ければ何も変えない（unix・このタブで引けるとき）
+        let plain = Remaining::new(RemainingKind::AgentLogin(AgentKind::Claude));
+        assert_eq!(plain.clone().noting(None), plain);
     }
 }
