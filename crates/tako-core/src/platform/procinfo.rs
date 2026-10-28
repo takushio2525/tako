@@ -371,12 +371,27 @@ impl IdentityVerdict {
     }
 }
 
-/// 起動時刻の照合で許す差（秒）。
+/// 起動時刻の照合で、記録より**後ろ**へ許す差（秒）。
 ///
-/// 記録を書き出す時刻と OS が持つ生成時刻は同じプロセスでも一致しない
-/// （プロセス起動 → 記録の書き出しまでに間がある）。pid の再利用は
-/// 「前の持ち主が死んでから」なので、この程度の窓で取り違えることは無い
+/// 時計の粒度（`ps` の etime は秒単位）と丸めの分だけ。記録より**前**へは
+/// 上限を置かない（[`started_before_record`]。#2466）
 pub const START_TIME_SLACK_SECS: u64 = 5;
+
+/// 「いまこの pid を持つプロセスは、記録を書いた本人か」を起動時刻で決める（#2466。純関数）。
+///
+/// 記録（PID ファイルの起動時刻）は**本人が生きている間に**自分の pid と一緒に書く。
+/// なので記録より前から同じ pid で生きている相手は本人しかあり得ない（同じ pid を持つ
+/// 2 つのプロセスは同時に居られない）。pid を再利用した別のプロセスは、本人が死んだ後 =
+/// 記録より後に起動している。**判定は片側**: 記録 + [`START_TIME_SLACK_SECS`] より後に
+/// 起動していれば別物、それ以前ならどれだけ前でも本人。
+///
+/// #2466 以前は両側 ±5 秒で比べていた。記録を書くのは起動の後（remote daemon は
+/// tailscale の serve を張り終えてから）なので、起動直後の tailscale が遅いと間が 5 秒を
+/// 超え、**本物の daemon を「pid の再利用」と判定して** `tako remote stop` が止められなかった
+/// （実測: 起動 → 記録が 8 秒の daemon で再現）
+pub fn started_before_record(actual_start_unix: u64, recorded_unix: u64) -> bool {
+    actual_start_unix <= recorded_unix.saturating_add(START_TIME_SLACK_SECS)
+}
 
 /// その pid の正体の材料を OS から引く（#1616）。
 ///
@@ -419,7 +434,8 @@ pub fn judge_identity(
         materials += 1;
     }
     if let (Some(recorded), Some(actual)) = (expected.start_time_unix, observed.start_time_unix) {
-        if actual.abs_diff(recorded) > START_TIME_SLACK_SECS {
+        // 照合の規則は 1 実装（unix の ps 経路と共有する。#2466）
+        if !started_before_record(actual, recorded) {
             return IdentityVerdict::Mismatch;
         }
         materials += 1;
@@ -1823,7 +1839,7 @@ mod tests {
         );
     }
 
-    /// 起動時刻は `START_TIME_SLACK_SECS` まで許し、それを超えたら `Mismatch`
+    /// 記録より後ろへは `START_TIME_SLACK_SECS` まで許し、それを超えたら `Mismatch`
     #[test]
     fn 起動時刻は許容差までしか許さない() {
         let at = |secs: u64| ObservedProcess {
@@ -1866,6 +1882,41 @@ mod tests {
                 |_| true
             ),
             IdentityVerdict::Mismatch
+        );
+    }
+
+    /// #2466: 記録より**前**に起動していれば、何秒前でも同じプロセス。
+    ///
+    /// 記録は起動の後に本人が書く（remote daemon は tailscale の serve を張り終えてから）。
+    /// 起動直後の tailscale が遅く間が 5 秒を超えた daemon を、旧実装（両側 ±5 秒）は
+    /// 「pid の再利用」と判定して止められなかった。後ろ側（記録より後の起動 = 再利用）は
+    /// 従来どおり弾く
+    #[test]
+    fn 記録より前に起動していれば何秒前でも同じプロセス() {
+        let recorded = 1_700_000_000;
+        let expected = ExpectedProcess {
+            exe: None,
+            start_time_unix: Some(recorded),
+        };
+        for before in [START_TIME_SLACK_SECS + 1, 8, 60, 12 * 3600] {
+            let observed = ObservedProcess {
+                start_time_unix: Some(recorded - before),
+                ..ObservedProcess::default()
+            };
+            assert_eq!(
+                judge_identity(&observed, expected, |_| true),
+                IdentityVerdict::Confirmed,
+                "記録の {before} 秒前に起動した = 記録を書いた本人"
+            );
+            assert!(started_before_record(recorded - before, recorded));
+        }
+        assert!(
+            !started_before_record(recorded + START_TIME_SLACK_SECS + 1, recorded),
+            "記録より後に起動した = pid を再利用した別のプロセス"
+        );
+        assert!(
+            started_before_record(u64::MAX, u64::MAX),
+            "記録が上限でも桁あふれしない"
         );
     }
 

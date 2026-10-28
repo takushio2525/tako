@@ -27,6 +27,8 @@
 //! 3. [`stale経路は停止結果を伝播する`] — 呼び出し側が `?` を外して握り潰す
 //! 4. [`ps出力の判定は1実装で空を弾く`] — 空出力の素通り（#1401 の補足）が戻る
 //! 5. [`確認できないときstateを消さない`] — 拒否の前に state を掃除してしまう
+//!    （#2466 から正規経路 = PID ファイルの PID も同じ約束。修正前の形は
+//!    [`正規経路の検査は修正前の形を検出する`] が注入で確かめる）
 //!
 //! 併せて、中止の文言が 1 実装から組まれていること
 //! （[`中止の文言は1実装から組む`]）も見る。
@@ -43,6 +45,10 @@ const REMOTE: &str = "crates/tako-control/src/remote.rs";
 /// 「このコマンドラインは `tako remote serve` か」の判定関数。綴りはこの 1 か所に持つ。
 /// #1616 で unix / Windows 共通の規則になり `ps_args_is_tako_remote_serve` から改名した
 const IDENTITY_RULE: &str = "command_line_is_tako_remote_serve";
+
+/// 正体を確かめられなかった pid を人が確かめる手順（打つ OS のもの）を組む関数。
+/// 正規経路と stale 経路の中止の説明が共有する（#2466）
+const CHECK_COMMANDS: &str = "identity_check_commands";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -124,6 +130,31 @@ fn check_kill_stale_daemon(source: &str, rel: &str) {
     );
 }
 
+/// 正規経路（PID ファイルの PID）も、正体を確かめられずに断るときは state を消さないこと（#2466）。
+///
+/// #2466 以前は断る直前に `cleanup_state_files()` を呼んでいた。本物の daemon を取り違えると
+/// PID ファイルと管理トークンが消え、PID ファイル無しの daemon が残る（`forget_if_stopped` が
+/// 「止まった」と読んで起動の意図まで消す）。見るのは「中止の文言を返す `return Err(` を囲む
+/// 最後の `if` から、その `return Err(` まで」= 断る腕の中
+fn check_pidfile_refusal_keeps_state(source: &str, rel: &str) {
+    let (line, body) = fn_body(source, rel, "\nfn daemon_stop_impl(");
+    let prefix = body.find("pid_identity_refusal(").unwrap_or_else(|| {
+        panic!("{rel}:{line} 正規経路の中止文言（`pid_identity_refusal(`）が見つからない")
+    });
+    let ret = body[..prefix]
+        .rfind("return Err(")
+        .unwrap_or_else(|| panic!("{rel}:{line} 正規経路の中止を返す `return Err(` が無い"));
+    let arm = body[..ret]
+        .rfind("if ")
+        .unwrap_or_else(|| panic!("{rel}:{line} 正規経路の中止を囲む `if` が無い"));
+    assert!(
+        !body[arm..ret].contains("cleanup_state_files"),
+        "{rel}:{line} 正規経路が正体を確かめられないまま state を掃除している（#2466）。\n\
+         本物の daemon だったとき PID ファイルと管理トークンを失い、止められない daemon が残る:\n{}",
+        &body[arm..ret]
+    );
+}
+
 /// 停止経路が `kill_stale_daemon` の結果を捨てていないこと
 fn check_call_site(source: &str, rel: &str) {
     let (line, body) = fn_body(source, rel, "\nfn daemon_stop_impl(");
@@ -147,8 +178,48 @@ fn kill_stale_daemonはシグナルより先に正体確認する() {
 
 #[test]
 fn 確認できないときstateを消さない() {
-    // check_kill_stale_daemon の中で見る（順序と掃除は同じ本文を読むため 1 実装）
+    // stale 経路は check_kill_stale_daemon の中で見る（順序と掃除は同じ本文を読むため 1 実装）
     check_kill_stale_daemon(&production(REMOTE), REMOTE);
+    // 正規経路（PID ファイルの PID）も同じ約束（#2466）
+    check_pidfile_refusal_keeps_state(&production(REMOTE), REMOTE);
+}
+
+/// #2466 の検査に検出力があること（修正前の形を注入する）
+#[test]
+fn 正規経路の検査は修正前の形を検出する() {
+    // ① 修正前の daemon_stop_impl そのもの: 断る直前に state を掃除していた
+    let legacy = "\nfn daemon_stop_impl(force: bool) -> Result<Value, String> {\n\
+        \x20   if !verify_pid_identity(&pid_info) {\n\
+        \x20       cleanup_state_files();\n\
+        \x20       return Err(format!(\n\
+        \x20           \"{prefix}state ファイルは掃除しました。\",\n\
+        \x20           prefix = pid_identity_refusal(pid_num),\n\
+        \x20       ));\n\
+        \x20   }\n\
+        \x20   Ok(json!({}))\n\
+        }\n";
+    let caught = std::panic::catch_unwind(|| check_pidfile_refusal_keeps_state(legacy, "注入"));
+    assert!(
+        caught.is_err(),
+        "① 断る腕の中の state 掃除を検出できていない"
+    );
+
+    // ② 現行の形は通る: 終了済みの片付け（別の腕）は掃除してよい
+    let ok = "\nfn daemon_stop_impl(force: bool) -> Result<Value, String> {\n\
+        \x20   let confirmed = verify_pid_identity(&pid_info);\n\
+        \x20   if has_terminated(pid_num) {\n\
+        \x20       cleanup_state_files();\n\
+        \x20       return Err(\"既に終了\".to_string());\n\
+        \x20   }\n\
+        \x20   if !confirmed {\n\
+        \x20       return Err(format!(\n\
+        \x20           \"{prefix}state ファイルは残しました。\",\n\
+        \x20           prefix = pid_identity_refusal(pid_num),\n\
+        \x20       ));\n\
+        \x20   }\n\
+        \x20   Ok(json!({}))\n\
+        }\n";
+    check_pidfile_refusal_keeps_state(ok, "注入");
 }
 
 #[test]
@@ -205,17 +276,27 @@ fn 中止の文言は1実装から組む() {
         sbody.contains("pid_identity_refusal"),
         "{REMOTE}:{sline} stale 経路の中止文言が共通の前置きを通っていない（#1401 / #329）"
     );
-    for step in ["tako remote start", "tasklist", "ps -p"] {
-        assert!(
-            sbody.contains(step),
-            "{REMOTE}:{sline} 中止の説明から手順 `{step}` が消えている（#1401 の受け入れ条件 1）"
-        );
-    }
     let (dline, dbody) = fn_body(&src, REMOTE, "\nfn daemon_stop_impl(");
     assert!(
         dbody.contains("pid_identity_refusal"),
         "{REMOTE}:{dline} 正規経路の中止文言が共通の前置きを通っていない（#329）"
     );
+    // 確かめる手順（打つ OS のもの）は 2 本の中止経路が共有する 1 実装（#2466 で正規経路も
+    // 手順を返すようになった）。手順の綴りはそこに、再起動の手順は各経路の説明に在る
+    let (cline, cbody) = fn_body(&src, REMOTE, &format!("\nfn {CHECK_COMMANDS}("));
+    for step in ["tasklist", "ps -p"] {
+        assert!(
+            cbody.contains(step),
+            "{REMOTE}:{cline} 中止の説明から手順 `{step}` が消えている（#1401 の受け入れ条件 1）"
+        );
+    }
+    for (line, body, path) in [(sline, &sbody, "stale 経路"), (dline, &dbody, "正規経路")] {
+        assert!(
+            body.contains(&format!("{CHECK_COMMANDS}(")) && body.contains("tako remote start"),
+            "{REMOTE}:{line} {path}の中止の説明が確かめる手順（`{CHECK_COMMANDS}`）か \
+             `tako remote start` を通っていない（#1401 / #2466）"
+        );
+    }
 }
 
 /// 走査範囲が本番コード全体を覆っていること（#1420）。
