@@ -187,15 +187,15 @@ fn run_and_cancel() -> (i32, Held, Held) {
     (code, cmd, ping)
 }
 
-/// queue の回は入れ子の印を外した子で走らせ直す（`tako queue cargo test` の中でも入れ子として素通りしない）
-fn rerun_without_queue_job(test: &str) -> bool {
-    tako_core::test_child::rerun_alone(test, &[tako_control::queue::ENV_JOB])
-}
-
-/// **受け入れ条件 2**: `tako queue` の取り消しで、子（cmd.exe）の孫（ping）まで止まる
+/// **受け入れ条件 2**: `tako queue` の取り消しで、子（cmd.exe）の孫（ping）まで止まる。
+/// queue の回は入れ子の印（`TAKO_QUEUE_JOB`）を外した子で走らせ直す（`tako queue cargo test` の
+/// 中で回しても入れ子として素通りしない）
 #[test]
 fn issue2462_queueの取り消しで孫まで止まる() {
-    if rerun_without_queue_job("issue2462_queueの取り消しで孫まで止まる") {
+    if tako_core::test_child::rerun_alone(
+        "issue2462_queueの取り消しで孫まで止まる",
+        &[tako_control::queue::ENV_JOB],
+    ) {
         return;
     }
     let (code, cmd, ping) = run_and_cancel();
@@ -219,7 +219,10 @@ fn issue2462_queueの取り消しで孫まで止まる() {
 /// **A/B の旧アーム（= 修正前の実装）**: 取り消しで cmd.exe が止まった後も、孫は生きている
 #[test]
 fn issue2462_旧アームではqueueの取り消しで孫が残る() {
-    if rerun_without_queue_job("issue2462_旧アームではqueueの取り消しで孫が残る") {
+    if tako_core::test_child::rerun_alone(
+        "issue2462_旧アームではqueueの取り消しで孫が残る",
+        &[tako_control::queue::ENV_JOB],
+    ) {
         return;
     }
     std::env::set_var(job::ENV_LEGACY, "1"); // 子の中だけ（他のテストは居ない）
