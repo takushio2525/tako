@@ -21,6 +21,9 @@
 //! 3. [`guiは固定パスの先客を第三のガードとして読む`] — IPC を立てた後に `fixed_path_holder` を
 //!    読んでから `secondary` を確定している
 //! 4. [`abの逃げ道は1つのenvに閉じている`] — `TAKO_2360_LEGACY` を読むのは tako-core の 1 か所
+//! 5. [`残骸はlistenした受け口のdropで作らない`] — テストが「誰も受けない残骸」を
+//!    `drop(UnixListener::bind(..))` で作らない（#2458。並走するテストが起こした子が fd の写しを
+//!    握っている間は受け口が生きていて `Live` と読む。作り方は `ipc.rs` の `unlistened_socket`）
 
 use std::path::{Path, PathBuf};
 
@@ -217,4 +220,78 @@ fn abの逃げ道は1つのenvに閉じている() {
         "TAKO_2360_LEGACY を読むのは tako_core::ipc_socket::legacy_2360 だけにする\
          （起動時の判定・見張り・GUI の第三のガードの A/B がずれる）: {readers:?}"
     );
+}
+
+/// 1 行で受け口を張ってすぐ閉じる形（#2458）。コメントと文字列を潰した眺めの 1 行を見る
+fn drops_bound_listener(code_line: &str) -> bool {
+    code_line.contains("drop(") && code_line.contains("UnixListener::bind(")
+}
+
+/// `crates/*/src` と `crates/*/tests` の `.rs`（リポジトリルートからの相対パス。並びは固定）
+fn rust_sources() -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = workspace_root();
+    let mut files = Vec::new();
+    let crates = std::fs::read_dir(root.join("crates")).expect("crates/ が読める");
+    for entry in crates.flatten() {
+        walk(&entry.path().join("src"), &mut files);
+        walk(&entry.path().join("tests"), &mut files);
+    }
+    let mut rels: Vec<String> = files
+        .iter()
+        .map(|p| {
+            p.strip_prefix(&root)
+                .expect("リポジトリ内")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    rels.sort();
+    rels
+}
+
+#[test]
+fn 残骸はlistenした受け口のdropで作らない() {
+    let mut offenders = Vec::new();
+    for rel in rust_sources() {
+        let src = std::fs::read_to_string(workspace_root().join(&rel))
+            .unwrap_or_else(|e| panic!("{rel} を読めない: {e}"));
+        let view = production_range::code_view_of(&src);
+        for ((i, code), raw) in view.lines().enumerate().zip(src.lines()) {
+            if drops_bound_listener(code) {
+                offenders.push(format!("{rel}:{} `{}`", i + 1, raw.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "listen した受け口を張ってすぐ drop して「誰も受けない残骸」を作っている。同じテストバイナリの\
+         別のテストが子を起こすと、fork から exec までの子（と CLOEXEC を立てる前の隙に起きた\
+         posix_spawn の子）が fd の写しを握り、drop の後も受け口が listen したまま繋がる\
+         （= 残骸を `Live` と読む。#2458 は負荷の高い全体実行で間欠的に落ちた）。\
+         bind だけして listen しないソケットで作ること（`ipc.rs` の `unlistened_socket`）:\n{}",
+        offenders.join("\n")
+    );
+    // 検出力: 修正前の ipc.rs の形（1 行目）を名指し、コメントの中は数えない
+    let sample = "    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());\n\
+                  \x20   // drop(UnixListener::bind(&path))\n";
+    let hits: Vec<usize> = production_range::code_view_of(sample)
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| drops_bound_listener(l))
+        .map(|(i, _)| i + 1)
+        .collect();
+    assert_eq!(hits, vec![1], "見本の 1 行目だけを名指すはず");
 }
