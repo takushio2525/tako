@@ -1282,6 +1282,27 @@ CI（env なし）では緑のテストが手元でだけ落ちる（偽の赤�
   同じ `serial()` で 1 本ずつ走る・読み手が全部先に通す OnceLock で値は 1 つ）。コメントと文字列の中は数えない
 - 製品のコード（`TAKO_SELF_TEST` のセルフテスト・visual-test・`main` の一括隔離）は範囲外
 
+## テストの「誰も受けないソケット」は listen せずに作る（Issue #2458）
+
+**テストが残骸のソケット（ファイルはあるが誰も受けない）を作るとき、`UnixListener::bind` で
+張ってすぐ drop しない。** drop しても、同じテストバイナリの別のテストがその瞬間に起こした子が
+fd の写しを握っていれば、ソケットは listen したまま生きていて connect が通る。fork から exec までの
+子は CLOEXEC の fd も写しで持ち（exec で閉じる）、macOS の std は `socket()` と CLOEXEC を別の
+syscall で立てるので posix_spawn の子へも隙に渡る（`tako-core::platform::fd_inherit` の #1768 と同じ機構）。
+
+- 実物: `ipc::tests::issue2360_誰も受けない残骸は繋ぎ直した後に残骸と読む` が、負荷の高い全体実行で
+  残骸を `Live` と読んで落ちた。drop 直後に connect する計測では、単独 3,354 回中 0 回・
+  tako-control の lib 全体と並走で 39,532 回中 11 回 / 40,100 回中 18 回繋がった（握り手は 1 ms
+  未満で放す = exec で閉じる子）。同じ全体実行で交互に回すと、listen して drop は 19,998 回中 6 回・
+  listen しない作り方は 19,997 回中 0 回。drop の前に `try_clone()` で写しを握る注入で、CI と同じ
+  assert（`left: Live`）が毎回落ちる
+- **書き方**: bind だけして listen しないソケットで作る（`ipc.rs` の `unlistened_socket`）。写しを
+  誰が握っていても connect は ECONNREFUSED で、落ちたプロセスの残骸と同じ返り方になる。テストは
+  写しを握ったまま判定して、この性質そのものを毎回確かめる
+- **番犬**: `crates/tako-control/tests/issue2360_socket_liveness_watchdog.rs` の
+  `残骸はlistenした受け口のdropで作らない` が、`crates/*/{src,tests}` の 1 行に `drop(` と
+  `UnixListener::bind(` が並ぶ形を `file:line` で落とす（コメントと文字列の中は数えない）
+
 ## プロセスの生死は境界の 1 実装で決める（Issue #1557 / #1581）
 
 **「その pid は生きているか」を自前で書かない。`tako_core::platform::process::pid_alive`

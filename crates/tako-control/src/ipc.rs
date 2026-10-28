@@ -2258,11 +2258,58 @@ mod tests {
             .map(|m| (m.dev(), m.ino()))
     }
 
-    /// 同じパスへ別の受け口を張って閉じる（ファイルは残る = 落ちたプロセスの残骸の形）
+    /// 同じパスへ誰も受けないソケットを作って閉じる（ファイルは残る = 落ちたプロセスの残骸の形）
     fn leave_dead_socket(path: &str) -> (u64, u64) {
         std::fs::remove_file(path).expect("ソケットファイルを消せる");
-        drop(std::os::unix::net::UnixListener::bind(path).expect("同じパスへ張れる"));
+        drop(unlistened_socket(std::path::Path::new(path)));
         file_id(path).expect("残骸が残る")
+    }
+
+    /// 誰も受けない残骸のソケットファイルを `path` に作り、そのソケットを返す（#2458）。
+    /// 返り値を drop すれば落ちたプロセスの残骸、握っていれば別のプロセスが fd の写しを持った形。
+    ///
+    /// **listen した受け口を drop して作らない**。同じテストバイナリの別のテストが子を起こすと、
+    /// fork から exec までの子は fd 表の写しを（CLOEXEC の fd も）握り、macOS の std は `socket()` と
+    /// CLOEXEC を別の syscall で立てるので posix_spawn の子へも隙に渡る。写しが残っている間は
+    /// drop した受け口が listen したまま生きていて connect が通る（= `Live` と読む。負荷の高い
+    /// 全体実行で間欠的に落ちた）。bind だけして listen しないソケットは、写しを誰が握っていても
+    /// connect は ECONNREFUSED（落ちたプロセスの残骸と同じ返り方）
+    fn unlistened_socket(path: &std::path::Path) -> std::os::fd::OwnedFd {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: 引数は定数だけで、返った fd はすぐ下で 1 回だけ包む
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+        // SAFETY: socket が返した開いた fd で、ほかに持ち主は居ない
+        let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+        // SAFETY: sockaddr_un は数値と配列だけの構造体で、全 0 が有効な値
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_bytes();
+        assert!(
+            bytes.len() < addr.sun_path.len(),
+            "sun_path に収まらない: {}",
+            path.display()
+        );
+        for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+            *dst = *src as libc::c_char;
+        }
+        // SAFETY: addr は初期化済みで、渡す長さはその大きさ
+        let rc = unsafe {
+            libc::bind(
+                socket.as_raw_fd(),
+                (&addr as *const libc::sockaddr_un).cast(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "bind {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+        socket
     }
 
     #[test]
@@ -2468,7 +2515,9 @@ mod tests {
     fn issue2360_誰も受けない残骸は繋ぎ直した後に残骸と読む() {
         let path = issue2360_path("dead");
         let _ = std::fs::remove_file(&path);
-        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        // 残骸の fd の写しを握ったまま判定する（並走するテストが起こした子が受け継いだ形。
+        // listen した受け口の写しならここで `Live` に倒れる = #2458）
+        let inherited = unlistened_socket(&path);
         let started = std::time::Instant::now();
         let occupant = unix_imp::occupant_with(&path, false);
         let took = started.elapsed();
@@ -2477,8 +2526,10 @@ mod tests {
             took >= std::time::Duration::from_millis(350),
             "繋ぎ直しの間を置かずに残骸と読んだ: {took:?}"
         );
-        // 旧判定も残骸と読む（待たないことは tako-core の台本のテストが待ちの合計 0 で固定する。
-        // ここで実時間の上限を測ると負荷で反転する = test_timing_watchdog）
+        // 写しも閉じた残骸（落ちたプロセスの形）を、旧判定も残骸と読む（待たないことは tako-core の
+        // 台本のテストが待ちの合計 0 で固定する。ここで実時間の上限を測ると負荷で反転する =
+        // test_timing_watchdog）
+        drop(inherited);
         assert_eq!(
             unix_imp::occupant_with(&path, true),
             tako_core::ipc_socket::Occupant::Dead
