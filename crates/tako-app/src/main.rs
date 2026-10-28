@@ -100323,6 +100323,7 @@ mod persist_resume_tests {
             backend_session: None,
             pane: None,
             platform: Platform::MacOs,
+            worker_mcp_args: None,
         }
     }
 

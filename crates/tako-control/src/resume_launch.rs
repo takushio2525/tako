@@ -31,6 +31,9 @@
 //!
 //! claude 以外（codex / agy）は起動の引数を resume へ持ち込めない・持ち込まない系統なので
 //! 従来どおり `sessions::resume_command` を通す（能力マトリクス `resume_launch_args`）。
+//! ただし **worker の MCP の断片**（絞り込み #2412 / #2418・tako の MCP の一時注入 #986）だけは
+//! どの経路でも spawn と同じ `worker_mcp::prepare_for_resume` + `agent::worker_mcp_args` で載せる
+//! （#2447。`codex resume` は `-c` を受ける = 0.154.0 の --help。再起動をまたぐ GUI の復元も同じ）。
 
 use std::path::{Path, PathBuf};
 
@@ -154,17 +157,28 @@ pub fn resume_launch_in(
         .and_then(Agent::parse)
         .unwrap_or(Agent::Claude);
     let catalog = || -> Result<ResumeLaunch, String> {
+        // #2447: worker なら spawn と同じ MCP の断片（codex は `codex resume -c …`）。
+        // 設定ファイルは下見では書かない（実行する側の materialize が書く）
+        let worker_mcp = crate::sessions::resume_worker_mcp(agent, session_id, entry);
+        let mcp_args = worker_mcp
+            .as_ref()
+            .map(|(worker, mcp)| crate::sessions::resume_mcp_args(*worker, mcp, tako_bin, dialect))
+            .unwrap_or_default();
+        let warnings = worker_mcp
+            .as_ref()
+            .map(|(_, mcp)| mcp.warnings.clone())
+            .unwrap_or_default();
         Ok(ResumeLaunch {
-            command: crate::sessions::resume_command(session_id, entry)?,
+            command: crate::sessions::resume_command(session_id, entry, &mcp_args)?,
             recipe: ResumeRecipe::Catalog,
             profile: None,
-            warnings: Vec::new(),
+            warnings,
             prompt_file: None,
-            worker_mcp: None,
+            worker_mcp: worker_mcp.map(|(_, mcp)| mcp),
         })
     };
     // claude 以外は起動の引数を resume へ持ち込めない（codex resume は --model を受けない
-    // = agent_resume::ResumeSpec の accepts_launch_flags）。旧挙動の A/B もここ
+    // = agent_resume::ResumeSpec の accepts_launch_flags。MCP の断片だけは載せる = #2447）。旧挙動の A/B もここ
     if legacy || agent != Agent::Claude {
         return catalog();
     }
@@ -297,23 +311,15 @@ fn resume_worker_launch(
         None => format!("worker:{project}"),
     };
     // #2412: spawn と同じ絞り込み（プロジェクトの mcp_servers・会話の cwd の .mcp.json）。
-    // 再開で user scope の MCP が戻ってくると、spawn で絞った意味が再起動のたびに消える
-    let keep = entry
-        .project
-        .as_deref()
-        .and_then(|p| {
-            orchestrator::ProjectsConfig::load()
-                .ok()
-                .map(|c| crate::worker_mcp::keep_for_project(&c, p))
-        })
-        .unwrap_or_default();
-    let cwd = entry
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let worker_mcp =
-        crate::worker_mcp::prepare(WorkerAgent::Claude, &cwd, &plan, &keep, &launch.extra_args);
+    // 再開で user scope の MCP が戻ってくると、spawn で絞った意味が再起動のたびに消える。
+    // 判断は再起動をまたぐ復元（#2447）と同じ `prepare_for_resume`
+    let worker_mcp = crate::worker_mcp::prepare_for_resume(
+        WorkerAgent::Claude,
+        entry.project.as_deref(),
+        entry.cwd.as_deref(),
+        &plan,
+        &launch.extra_args,
+    );
     warnings.extend(worker_mcp.warnings.iter().cloned());
     let cmd = orchestrator::agent::build_worker_cmd_in(
         &orchestrator::agent::WorkerLaunch {

@@ -86,6 +86,14 @@ pub fn legacy_codex() -> bool {
         .unwrap_or(false)
 }
 
+/// 再開（resume）の A/B（`TAKO_2447_LEGACY=1` で #2447 前 = 再起動をまたいだ復元と
+/// カタログの再開に MCP の断片を載せない。spawn と `tako sessions resume` の claude の worker は変わらない）
+pub fn legacy_resume() -> bool {
+    std::env::var("TAKO_2447_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 /// 実績として読む transcript の窓（最終更新がこれより新しいもの）
 pub const EVIDENCE_WINDOW: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
@@ -427,6 +435,39 @@ impl WorkerMcp {
         }
         self
     }
+}
+
+/// 再開（resume）で起こす worker の MCP を決める（#2447。**spawn と同じ [`prepare`] を通す**）。
+///
+/// 持ち込む名前は spawn と同じくプロジェクトの `mcp_servers`（[`keep_for_project`]）。cwd は会話の
+/// 作業 dir、記録に無ければプロジェクトの cwd（spawn が起動した場所）。`env` は**会話の記録がある**
+/// 設定の置き場を指す計画（claude = 会話の config dir・codex = rollout を探した `CODEX_HOME`）
+pub fn prepare_for_resume(
+    agent: WorkerAgent,
+    project: Option<&str>,
+    cwd: Option<&str>,
+    env: &EnvPlan,
+    extra_args: &[String],
+) -> WorkerMcp {
+    let config = ProjectsConfig::load().ok();
+    let keep = match (&config, project) {
+        (Some(c), Some(p)) => keep_for_project(c, p),
+        _ => Vec::new(),
+    };
+    let cwd = cwd
+        .filter(|c| !c.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let p = project?;
+            config
+                .as_ref()?
+                .list_resolved()
+                .into_iter()
+                .find(|r| r.key == p)
+                .map(|r| PathBuf::from(r.cwd))
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    prepare(agent, &cwd, env, &keep, extra_args)
 }
 
 /// worker の MCP の構成を決める（ファイルは書かない。書くのは [`WorkerMcp::materialize`]）。

@@ -96,7 +96,7 @@ tako orchestrator projects mcp webapp remove playwright
 
 ### worker の MCP（user scope を持ち込まない。Issue #2412）
 
-tako が起こす **claude の worker**（spawn / run / git resolve / 会話を保った再起動）は、
+tako が起こす **claude の worker**（spawn / run / git resolve / 会話を保った再起動 / 再起動をまたぐ復元）は、
 既定で **tako の MCP だけ**を持って起動する。claude は起動のたびに user scope
 （`<config dir>/.claude.json` の `mcpServers`）の MCP サーバーをすべて起こし、`npx` / `uvx` 経由で
 1 本あたり 12〜15 プロセス・約 400 MB を食う（2026-10-25 にこれでメモリが尽きて PC が落ちた）。
@@ -122,9 +122,31 @@ tako が起こす **claude の worker**（spawn / run / git resolve / 会話を�
   能力マトリクス `worker_mcp_scope`（agy = unsupported。起動ごとの手段が CLI に無い）
 - A/B は `TAKO_2412_LEGACY=1`（user scope を全部持ち込む #2412 前の起動。codex も戻る）
 
+#### 再開（resume）の worker（Issue #2447）
+
+再起動をまたいだ復元（GUI を起こし直す・PC の再起動 = `codex resume <id>` / `claude --resume <id>`）と
+カタログの再開（`tako sessions resume` / 会話を保った再起動のカタログ経路）も、**spawn と同じ判断・同じ組み立て**で
+MCP の断片を載せる。#2447 の前は復元だけがカタログのメタで組まれ、GUI を起こし直すたびに絞り込みと
+codex の tako の MCP の一時注入（#986）が外れていた（実測: 隔離 GUI で spawn の断片 9〜13 個 → 復元 0 個）。
+
+- **1 実装**: 判断は `worker_mcp::prepare_for_resume`（spawn と同じ `prepare`。持ち込むのはプロジェクトの
+  `mcp_servers`、cwd は会話の作業 dir → 無ければプロジェクトの cwd）、断片は `agent::worker_mcp_args`
+  （spawn の `build_worker_cmd_in` も同じ関数）。再開の入口は `sessions::resume_worker_mcp` + `resume_mcp_args`
+- **読む設定の置き場は会話の記録がある場所**: claude = 会話の config dir、codex = rollout を探した
+  `CODEX_HOME`（resume が実際に開くのもそこ）。spawn のプロファイルの env は復元の起動に載らないので、
+  プロファイルを読み直さない
+- **位置**: codex は `codex resume -c … <id>`（`resume` の後。0.154.0 の `--help` で `-c` を受ける）、
+  claude は `--resume` の前。worker 以外（master / solo / 役割の無いペイン）には足さない
+- **設定ファイル**: GUI の復元はその場で打つので spawn と同じく書いてから使い（書けなければ絞らずに起動して
+  persist.log へ `[restore] pane=N worker の MCP: …`）、カタログの再開は下見では書かない（実行時の materialize）
+- **対象外**: 突然死の復旧案内（worker_status の `resume_command` = #390）。状態照会のたびに組まれるので
+  user scope の `.claude.json`（数百 KB）を読む判断を載せない
+- A/B は `TAKO_2447_LEGACY=1`（復元とカタログの再開に断片を載せない = #2447 前）。実経路の測り方は
+  `scripts/test-resume-worker-mcp-2447.sh`（隔離 GUI + 実物の codex + 偽 claude）
+
 #### codex の worker（Issue #2418）
 
-**codex の worker**（spawn / run / git resolve）も同じ判断（`worker_mcp::plan` = 同じ `mcp_servers`）で
+**codex の worker**（spawn / run / git resolve / 再起動をまたぐ復元）も同じ判断（`worker_mcp::plan` = 同じ `mcp_servers`）で
 tako の MCP だけを持って起動する。違うのは読む場所と渡し方だけ（実測は codex-cli 0.154.0・一時の
 `CODEX_HOME` + 偽 Responses API `scripts/lib/fake-responses-api.mjs` + 起動を記録する偽 MCP）。
 
@@ -153,8 +175,9 @@ tako の MCP だけを持って起動する。違うのは読む場所と渡し�
 - **spawn の応答の `mcp`**: claude と同じ形に `config_file`（読んだ config.toml）が付く。
   `tako orchestrator projects mcp <key>` の応答は codex の設定がある機でだけ `codex_plan` を持ち、CLI は
   「codex の worker で止める」の行を出す
-- **対象外**: 再起動をまたぐ復元（`codex resume <id>`。起動の引数を持ち込まない = #986 の注入も載らない）・
-  移行（#916）の実績は claude の会話だけを数える（codex の rollout は読まない）
+- **再起動をまたぐ復元**: `codex resume <id>` にも同じ断片が載る（#2447。上の「再開（resume）の worker」）。
+  model / effort / 承認の引数は今も持ち込まない（能力マトリクス `resume_launch_args`）
+- **対象外**: 移行（#916）の実績は claude の会話だけを数える（codex の rollout は読まない）
 - A/B は `TAKO_2418_LEGACY=1`（codex だけ #2418 前 = user 設定を全部持ち込む）
 
 ## プロファイルと設定の優先順位（Issue #27 で明文化）

@@ -364,34 +364,56 @@ pub fn build_worker_cmd_in(
         cmd.push(' ');
         cmd.push_str(crate::claude_remote::REMOTE_CONTROL_FLAG);
     }
-    // user scope の MCP を止める（#2412）。claude だけ。プロファイルの args より**前**に置く
-    // （利用者が args に `--settings` を書いていればそちらが後勝ちする = 利用者の設定を消さない。
-    // その場合は `worker_mcp::prepare` が warnings で知らせ、ここへは None が来る）
-    if let (WorkerAgent::Claude, Some(path)) = (launch.agent, launch.mcp_settings) {
-        cmd.push_str(&format!(" --settings {}", lc::quote(dialect, path)));
-    }
-    // MCP の一時注入（#986）。**codex だけ**が `-c` で受け取れる。
-    // claude は恒久登録（`tako setup-mcp`）+ 親 env の継承で繋がり、agy は
-    // per-launch の注入手段が CLI に無い（`agy --help` に -c / --mcp-config が無い =
-    // 実測 1.1.27）ので恒久登録に委ねる。詳細は `.agent/orchestrator.md`
-    if let (WorkerAgent::Codex, Some(tako_bin)) = (launch.agent, launch.tako_bin) {
-        if !legacy_no_worker_mcp() {
-            cmd.push_str(&codex_mcp_args(tako_bin, dialect));
-        }
-    }
-    // user 設定の MCP を止める（#2418）。codex だけ。プロファイルの args より**前**に置く
-    // （利用者が args に `-c mcp_servers.<名>.…` を書いていればそちらが後勝ちする）
-    if launch.agent == WorkerAgent::Codex {
-        cmd.push_str(&crate::worker_mcp::codex_off_args(
-            launch.mcp_codex_off,
-            dialect,
-        ));
-    }
+    // MCP の断片（#2412 / #986 / #2418）。プロファイルの args より**前**に置く
+    // （利用者が args に `--settings` / `-c mcp_servers.<名>.…` を書いていればそちらが後勝ちする）
+    cmd.push_str(&worker_mcp_args(
+        launch.agent,
+        launch.tako_bin,
+        launch.mcp_settings,
+        launch.mcp_codex_off,
+        dialect,
+    ));
     for arg in launch.extra_args {
         cmd.push(' ');
         cmd.push_str(&crate::launch_cmd::quote(dialect, arg));
     }
     cmd
+}
+
+/// worker の起動コマンドへ足す MCP の断片（**spawn と再開（resume）が共有する正本**。#2447）。
+///
+/// 再起動をまたいだ復元（`codex resume <id>` / `claude --resume <id>`）も同じ断片を載せるので、
+/// GUI を起こし直しても spawn と同じ MCP で戻る（#2447 の前は復元で外れていた）。
+/// 判断（何を止めるか）は `worker_mcp::prepare` の 1 実装で、ここは渡し方だけを持つ
+pub fn worker_mcp_args(
+    agent: WorkerAgent,
+    tako_bin: Option<&str>,
+    mcp_settings: Option<&str>,
+    mcp_codex_off: &[crate::worker_mcp::CodexOff],
+    dialect: crate::launch_cmd::ShellDialect,
+) -> String {
+    use crate::launch_cmd as lc;
+    let mut s = String::new();
+    // user scope の MCP を止める（#2412）。claude だけ
+    // （利用者がプロファイルの args に `--settings` を書いていれば `worker_mcp::prepare` が
+    // warnings で知らせ、ここへは None が来る = 利用者の設定を消さない）
+    if let (WorkerAgent::Claude, Some(path)) = (agent, mcp_settings) {
+        s.push_str(&format!(" --settings {}", lc::quote(dialect, path)));
+    }
+    // MCP の一時注入（#986）。**codex だけ**が `-c` で受け取れる。
+    // claude は恒久登録（`tako setup-mcp`）+ 親 env の継承で繋がり、agy は
+    // per-launch の注入手段が CLI に無い（`agy --help` に -c / --mcp-config が無い =
+    // 実測 1.1.27）ので恒久登録に委ねる。詳細は `.agent/orchestrator.md`
+    if let (WorkerAgent::Codex, Some(tako_bin)) = (agent, tako_bin) {
+        if !legacy_no_worker_mcp() {
+            s.push_str(&codex_mcp_args(tako_bin, dialect));
+        }
+    }
+    // user 設定の MCP を止める（#2418）。codex だけ
+    if agent == WorkerAgent::Codex {
+        s.push_str(&crate::worker_mcp::codex_off_args(mcp_codex_off, dialect));
+    }
+    s
 }
 
 /// 単一引数のシェルクオート。英数と安全な記号のみなら素通し、

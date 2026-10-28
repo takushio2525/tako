@@ -1779,8 +1779,12 @@ pub const MATRIX: &[AgentFeature] = &[
              同じ種類の目印（stdio = command・http = url）を一緒に渡す（種類を違えると起動しない）。プロジェクトの \
              `.codex/config.toml`（cwd から git の根まで・信頼済みのフォルダ）と同名の server は、止めるとプロジェクト側まで \
              止まるので止めない。名前に `.`・空白を含む server は `-c` で表せない（付けると起動しない）ので持ち込む。\
-             codex の対象は spawn / run / git resolve（再起動後の復元の `codex resume` は起動の引数を持ち込まない）。\
-             agy 1.4.7 は起動ごとの手段が無い",
+             codex の対象は spawn / run / git resolve / 再起動をまたぐ復元。#2447 の実測（2026-10-28 / 隔離 GUI + 実物の \
+             codex-cli 0.154.0 + 偽 claude・scripts/test-resume-worker-mcp-2447.sh）: 修正前は GUI を起こし直した復元が \
+             `codex resume <id>` / `claude --resume <id>` だけで組まれ、spawn の断片（codex 9〜13 個・claude の `--settings`）が \
+             0 個になり、止めたはずの user 設定の MCP が立っていた。いまは復元とカタログの再開も spawn と同じ \
+             worker_mcp::prepare_for_resume（判断）と orchestrator::agent::worker_mcp_args（断片）を通る \
+             （`codex resume` は `-c` を受ける = 0.154.0 の --help）。agy 1.4.7 は起動ごとの手段が無い",
         ),
     },
     AgentFeature {

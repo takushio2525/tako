@@ -84,11 +84,9 @@ tako は codex が**実際に**どのモデルで動いたかを読みません�
 tako agent-support --agent codex
 ```
 
-とくに効くのは次の 4 点です。
+とくに効くのは次の 3 点です。
 
-- **PC 再起動後に戻した worker は、あなたが codex に登録した MCP サーバーも全部持って戻ります**。新しく立てる worker は claude と同じく tako の MCP だけで起動し（[#2418](https://github.com/takushio2525/tako/issues/2418)）、要る MCP は `tako orchestrator projects mcp <プロジェクト> add <名前>` で足します。ただし再起動をまたぐ復元は `codex resume <id>` で起こすので、この絞り込みが載りません
-
-- **PC 再起動後の復元は会話ごと戻りますが、会話の選び直しはまだできません**。再起動をまたぐ復元は [#1238](https://github.com/takushio2525/tako/issues/1238) で codex にも配線され、ペインは `codex resume <id>` で会話を持ったまま戻ります（会話 ID を `lsof` で採るので **Windows は対象外**です）。過去の会話を一覧から選び直す `tako sessions resume` と、会話を保ったまま CLI だけ建て直す `tako session-restart` は claude 専用のままです（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
+- **PC 再起動後の復元は会話ごと戻りますが、会話の選び直しはまだできません**。再起動をまたぐ復元は [#1238](https://github.com/takushio2525/tako/issues/1238) で codex にも配線され、ペインは `codex resume <id>` で会話を持ったまま戻ります（会話 ID を `lsof` で採るので **Windows は対象外**です）。戻った worker も新しく立てる worker と同じく tako の MCP だけを持ち、あなたが codex に登録した MCP サーバーは持ち込みません（[#2418](https://github.com/takushio2525/tako/issues/2418) / [#2447](https://github.com/takushio2525/tako/issues/2447)。要る MCP は `tako orchestrator projects mcp <プロジェクト> add <名前>` で足します）。過去の会話を一覧から選び直す `tako sessions resume` と、会話を保ったまま CLI だけ建て直す `tako session-restart` は claude 専用のままです（追跡: [#975](https://github.com/takushio2525/tako/issues/975)）
 - **tako 側からアカウントを切り替えられません**。設定ファイルの置き場が固定のためです（[#975](https://github.com/takushio2525/tako/issues/975)）
 - **ワークスペースのクレジットが尽きたときは自動で再開しません**。5 時間 / 週の枠は解除を待って自分で再開しますが、クレジット切れには「待つ」出口が無いので tako は何も選ばずに止まります
 

@@ -152,8 +152,14 @@ const server = http.createServer((req, res) => {
       const takoTools = (Array.isArray(body?.tools) ? body.tools : [])
         .filter(t => /tako/.test(t?.name ?? ''))
         .map(t => `${t.type}:${t.name}`)
+      // 呼んだ結果の判定の種類だけ（本文は書かない。#2447 で spawn と復元の結果を比べるため）
+      let verdict = ''
+      if (last?.type === 'function_call_output' || last?.type === 'custom_tool_call_output') {
+        const out = JSON.stringify(last.output ?? '')
+        verdict = /requires approval/.test(out) ? 'approval' : /unsupported call/.test(out) ? 'unsupported' : 'done'
+      }
       note(
-        `POST ${path} last=${last?.type ?? last?.role ?? '-'} tako=${takoTools.join(',')} ` +
+        `POST ${path} last=${last?.type ?? last?.role ?? '-'}${verdict ? ` out=${verdict}` : ''} tako=${takoTools.join(',')} ` +
           `tools=${toolNames(body?.tools).filter(n => /mcp|__/.test(n)).join(',')}`,
       )
       const send = () => reply(res, answer(body))
