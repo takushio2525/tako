@@ -1052,7 +1052,7 @@ mod tests {
     fn 旧い置き場を丸ごと移し2回目は何もしない() {
         let scratch_move = scratch("move");
         let root = scratch_move.path();
-        let from = legacy_profile(&root);
+        let from = legacy_profile(root);
         let to = root.join("Local").join("tako").join("WebView2");
         // 見るだけ: 何も触らない
         assert_eq!(
@@ -1078,7 +1078,7 @@ mod tests {
     fn 新旧の両方があれば混ぜずに旧い方を退避する() {
         let scratch_both = scratch("both");
         let root = scratch_both.path();
-        let from = legacy_profile(&root);
+        let from = legacy_profile(root);
         let to = root.join("Local").join("tako").join("WebView2");
         std::fs::create_dir_all(to.join("EBWebView")).unwrap();
         std::fs::write(to.join("EBWebView").join("Local State"), b"new").unwrap();
@@ -1104,7 +1104,7 @@ mod tests {
         // 新しい置き場は触らない
         assert_eq!(read(&to.join("EBWebView/Local State")), b"new");
         // 退避先が埋まっていれば次の番号
-        let again = legacy_profile(&root);
+        let again = legacy_profile(root);
         assert_eq!(again, from);
         let second = PathBuf::from(format!("{}.2", backup.display()));
         assert_eq!(
@@ -1126,7 +1126,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let scratch_fail = scratch("fail");
         let root = scratch_fail.path();
-        let from = legacy_profile(&root);
+        let from = legacy_profile(root);
         // 旧い置き場の親を読み取り専用にする = rename が断られる（Windows の使用中と同じ形の失敗）
         let parent = from.parent().unwrap().to_path_buf();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -1164,7 +1164,7 @@ mod tests {
     fn 別のボリュームは写してから旧い置き場を退避する() {
         let scratch_cross = scratch("cross");
         let root = scratch_cross.path();
-        let from = legacy_profile(&root);
+        let from = legacy_profile(root);
         let to = root.join("Local").join("tako").join("WebView2");
         // 最初の rename（旧い置き場 → 新しい置き場）だけ別のボリュームとして断る
         let cross = |a: &Path, b: &Path| -> std::io::Result<()> {
@@ -1198,7 +1198,7 @@ mod tests {
         // 写しかけで失敗: 据える rename を断る → 写しかけは消え、旧い置き場は無傷
         let scratch_cross_fail = scratch("cross-fail");
         let root = scratch_cross_fail.path();
-        let from = legacy_profile(&root);
+        let from = legacy_profile(root);
         let to = root.join("Local").join("tako").join("WebView2");
         let refuse = |a: &Path, _b: &Path| -> std::io::Result<()> {
             if a == from.as_path() {
