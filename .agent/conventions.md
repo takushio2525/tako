@@ -2118,6 +2118,18 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     `TAKO_1308_INJECT=stuck`（ログインシェルが上がらない）/ `deaf`（プロンプトは出るが
     打鍵が実行されない）は打ち込む経路だけを落とし、`blank`（直接経路で描かない）は
     上限で**落ちる**ことを見る。番犬 `issue1308の現場はposixでログインシェルを経由しない`
+  - **待たないテストでもログインシェルを fixture にしない**（#2415）。dispatch.rs の残り 3 本
+    （`read_pane` の送達の顛末・`list` の `can_ssh`・`open_remote` の target=pane）は
+    `SpawnOptions::default()` を起こしてすぐ判定するので、#1308 の注入 `stuck` / `deaf` では
+    落ちない（実測）。ところが `open_remote` は判定の前に `ssh` の場所をログインシェルへ尋ねる
+    （`remote_fs::ssh_bin` → `exe::find`。上限 5 秒）ので、その間に fixture の rc が進み、
+    alt screen へ入る rc（自動 tmux など）だと `alt_screen` で断られて落ちる（偽の rc で 20/20）。
+    `$SHELL` を起こせない環境では 3 本とも張れずに落ちる。判定に要るのは「セッションがある」
+    だけなので、POSIX は `/bin/sh -c "exec sleep 600"` を直接起こす `i2415_session_options` を
+    通す（Windows は既定のまま）。A/B は `TAKO_2415_LEGACY=1`。番犬
+    `実ptyを張るテストはposixで素のログインシェルを起こさない` が、実 PTY を張るテストの素の
+    `SpawnOptions::default()` を `file:line` で落とす（ログインシェルそのものが主題なら、同じ行か
+    直前の行に `tako:login-shell-ok <理由>`）
   - **失敗文の値は見出しの 1 行に全部載せる**（10/25 の再発）。値を 2 行目に置いていたので、
     `grep` で `panicked at` の行だけを残した報告から waited / budget / load が消え、見立てが
     割れた。今は `TAKO_1308_WAIT:` の行に waited / budget / base / 混み具合（始まり→終わり）/
