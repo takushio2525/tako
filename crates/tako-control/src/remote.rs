@@ -8788,11 +8788,13 @@ mod tests {
     fn verify_pid_identityは記録より前に起動した本物を通す() {
         // コマンドラインが `tako remote serve` に見える使い捨てのプロセス。
         // `read` は組み込みなので子を作らず、kill すれば後に何も残らない
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "read line", "tako", "remote", "serve"])
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.args(["-c", "read line", "tako", "remote", "serve"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        // 起動の形は spawn_disposable_sleep と揃える（#628 の番犬が数える）
+        let mut child = tako_core::platform::process::no_console_window(&mut cmd)
             .spawn()
             .expect("使い捨ての sh");
         let pid = child.id();
