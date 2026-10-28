@@ -5594,6 +5594,18 @@ impl TakoApp {
                 let dir = tako_core::paths::verification_agent_home();
                 let _ = std::fs::remove_dir_all(&dir);
             }
+            // #2454: 普通の終了はペインを閉じるのと同じ扱い（Windows）。この後は端末を drop せずに
+            // OS がハンドルを閉じるので、手放さないと KILL_ON_JOB_CLOSE でペインから起こした
+            // GUI のアプリまで止まる。コンソールのプロセスは止め、GUI とその子孫は残す。
+            // ペインログの書き出し・構成の保存（画面を読む）の後に置く。unix・器のペインは 0
+            let released =
+                tako_core::terminal::release_descendants_on_quit(this.terminals.values_mut());
+            if released > 0 && !this.secondary {
+                persist_diag(&format!(
+                    "on_app_quit: ペインの子孫の Job を {released} 個手放した\
+                     （コンソールは止め GUI は残す）"
+                ));
+            }
             // セルフテスト最終項目（フォーカス喪失状態の cmd-q。#103）の成功マーカー。
             // ここに到達した = Quit がフォーカス非依存で発火し quit 経路に入った証拠。
             // **ただし quit 経路は最終項目以外からも来る**（ウィンドウ 0 枚の自動終了・
@@ -102621,6 +102633,54 @@ impl Workspace {
         assert!(
             body.contains("save_layout()"),
             "アプリ終了処理から save_layout が消えている（再起動で構成を失う）"
+        );
+    }
+
+    /// **#2454 の番犬**: 普通の終了（`on_app_quit`）は全ペインの子孫をペインを閉じたのと同じ扱いで
+    /// 手放す（コンソールは止め、ペインから起こした GUI のアプリとその子孫は残す）。
+    ///
+    /// この 1 行が消えると、終了の後に OS がハンドルを閉じて `KILL_ON_JOB_CLOSE` が GUI のアプリまで
+    /// 止める（= 落ちたときの扱い。この PR より前は普通の終了で GUI のアプリは残っていた）。
+    /// 振る舞いは Windows CI の実プロセスのテスト `issue2454_pane_gui_windows` が
+    /// `release_descendants_on_quit` を呼んでから drop せずに終わる子で見る。ここは呼び出しの位置を固定する:
+    /// ペインログの書き出し・構成の保存（画面を読む）の後、セルフテストの終了より前。
+    /// `if !this.quitting` の中へ入れない（最後のタブを閉じた後の終了も普通の終了）
+    #[test]
+    fn issue2454_アプリ終了処理はペインの子孫を閉じたのと同じ扱いで手放す() {
+        const CALL: &str =
+            "tako_core::terminal::release_descendants_on_quit(this.terminals.values_mut())";
+        let text = source("src/main.rs");
+        let start = text
+            .find("cx.on_app_quit(")
+            .expect("on_app_quit の登録が見つからない（構造が変わったらこの番犬も見直すこと）");
+        let body = &text[start..];
+        let end = body
+            .find("\n        .detach();")
+            .expect("on_app_quit クロージャの終端が見つからない");
+        let body = &body[..end];
+        let at = body.find(CALL).unwrap_or_else(|| {
+            panic!("アプリ終了処理から {CALL} が消えている（終了で GUI のアプリまで止まる。#2454）")
+        });
+        let saved = body
+            .find("save_layout()")
+            .expect("save_layout が見つからない");
+        let self_test = body
+            .find("TAKO_APP_SELF_TEST_OK")
+            .expect("セルフテストの成功マーカーが見つからない");
+        assert!(
+            saved < at && at < self_test,
+            "{CALL} の位置が違う（構成の保存の後・セルフテストの終了より前に置く）"
+        );
+        let quitting_block = body
+            .find("if !this.quitting {")
+            .expect("quitting の分岐が見つからない");
+        let quitting_end = quitting_block
+            + body[quitting_block..]
+                .find("\n            }\n")
+                .expect("quitting の分岐の終端が見つからない");
+        assert!(
+            at > quitting_end,
+            "{CALL} が `if !this.quitting` の中にある（最後のタブを閉じた後の終了で GUI のアプリまで止まる）"
         );
     }
 

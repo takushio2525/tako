@@ -1338,6 +1338,7 @@ Job を 1 つ作り、起こした直後に入れる（以後その子が起こ�
   | いつ | コンソールのプロセス | GUI のアプリとその子孫 |
   |---|---|---|
   | ペインを閉じる（`TerminalSession` の drop → `Job::close_for_pane`） | 止める | **残す** |
+  | tako を普通に終了する（`on_app_quit` → `terminal::release_descendants_on_quit`。閉じるのと同じ） | 止める | **残す** |
   | 言語サーバを止める（`ServerProcess::kill` = `tako lsp stop` / GUI の終了 / drop） | 止める | 止める |
   | tako が落ちる（OS がハンドルを閉じる = `KILL_ON_JOB_CLOSE`。隔離インスタンスの終了も同じ） | 止める | 止める |
 
@@ -1350,8 +1351,11 @@ Job を 1 つ作り、起こした直後に入れる（以後その子が起こ�
   撃たない）。親の起動時刻が子より後ならその親は pid の再利用とみなしてたどらない。振り分けは純関数
   `split_for_release` の 1 実装。GUI が居なければ Job ごと止める。最後に `KILL_ON_JOB_CLOSE` を外してから
   ハンドルを閉じる（外さないと閉じた瞬間に残したものも止まる）。列挙できないときは全部止める
-- **tako の普通の終了**は端末を drop しない（`on_app_quit` の後は OS がハンドルを閉じる）ので、いまは
-  「落ちたとき」と同じく GUI の孫も止まる
+- **tako の普通の終了**は端末を drop しない（`on_app_quit` の後は OS がハンドルを閉じる）ので、
+  `on_app_quit` が全ペインの Job を `release_descendants_on_quit` で手放す（ペインログの書き出し・構成の保存の後。
+  `if !this.quitting` の外 = 最後のタブを閉じた後の終了も同じ）。呼ばないと `KILL_ON_JOB_CLOSE` で GUI の
+  アプリまで止まる（= 落ちたときの扱い）。呼び出しの位置は tako-app の番犬
+  `issue2454_アプリ終了処理はペインの子孫を閉じたのと同じ扱いで手放す` が固定する
 - **`JOB_OBJECT_LIMIT_BREAKAWAY_OK` を付ける**: `CREATE_BREAKAWAY_FROM_JOB` で明示的に外へ出る子（親の
   寿命から切り離すと宣言した常駐 = unix の `setsid` に当たる）は出られる。付けないとその子の
   `CreateProcess` が ERROR_ACCESS_DENIED で失敗する。`SILENT_BREAKAWAY_OK` は付けない（回収にならない）
@@ -1369,7 +1373,8 @@ A/B は `TAKO_2454_LEGACY=1`（Job を作らない）と `TAKO_2454_KILL_GUI=1`�
 注入は `TAKO_2454_INJECT=assign_fail`（テストプロセスだけ）。実プロセスのテストは
 `crates/tako-core/tests/issue2454_pane_job_windows.rs`（ペインのコンソールの孫）・
 `crates/tako-control/tests/issue2454_pane_gui_windows.rs`（同じペインの GUI の孫は残りコンソールの孫は止まる。
-GUI 役はテスト専用の `tako-gui-sleeper`）・`crates/tako-control/tests/issue2454_lsp_job_windows.rs`
+GUI 役はテスト専用の `tako-gui-sleeper`。普通の終了の経路 = 関数を呼んでから drop せずに終わる子と、
+呼ばずに終わる子 = 落ちたときも同じファイル）・`crates/tako-control/tests/issue2454_lsp_job_windows.rs`
 （`.cmd` → cmd.exe → 偽サーバ）。
 
 **縮退の宣言は system prompt へも流れる**（#516。正本は `tako-core::platform::support`）。

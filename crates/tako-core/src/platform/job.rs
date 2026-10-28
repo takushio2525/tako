@@ -28,6 +28,7 @@
 //! | いつ | コンソールのプロセス | GUI のアプリとその子孫 |
 //! |---|---|---|
 //! | ペインを閉じる（[`Job::close_for_pane`]） | 止める | **残す** |
+//! | tako を普通に終了する（`on_app_quit` → `terminal::release_descendants_on_quit`） | 止める | **残す** |
 //! | 言語サーバを止める（[`Job::terminate`] / drop） | 止める | 止める |
 //! | tako が落ちる（OS がハンドルを閉じる = `KILL_ON_JOB_CLOSE`） | 止める | 止める |
 //!

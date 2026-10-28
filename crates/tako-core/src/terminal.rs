@@ -885,6 +885,19 @@ impl TerminalSession {
         self.job.as_ref()
     }
 
+    /// 子孫をペインを閉じたのと同じ扱いで手放す（#2454。コンソールのプロセスは止め、GUI のアプリと
+    /// その子孫は残す = `Job::close_for_pane`）。手放したら true。冪等（2 回目以降と Job の無い
+    /// 端末は何もせず false）。drop と [`release_descendants_on_quit`] がここを通る
+    pub fn release_descendants(&mut self) -> bool {
+        match self.job.take() {
+            Some(job) => {
+                job.close_for_pane();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// プロセス内で一意の端末の番号（Issue #1857）。同じペインでも端末を張り替えれば変わる
     pub fn serial(&self) -> u64 {
         self.serial
@@ -2143,10 +2156,24 @@ impl Drop for TerminalSession {
         let _ = self.notifier.0.send(Msg::Shutdown);
         // #2454: 子孫のうちコンソールのプロセスを止め、ペインから起こした GUI のアプリと
         // その子孫は残す（寿命の決まりは `platform::job`）。Job が無ければ何もしない
-        if let Some(job) = self.job.take() {
-            job.close_for_pane();
-        }
+        self.release_descendants();
     }
+}
+
+/// tako を普通に終了するとき、全ペインの子孫をペインを閉じたのと同じ扱いで手放す（#2454）。
+///
+/// GUI の終了（`on_app_quit` の後）は端末を drop しないまま OS がハンドルを閉じるので、
+/// 呼ばないと `KILL_ON_JOB_CLOSE` で GUI のアプリまで止まる（= 落ちたときの扱い）。
+/// 普通の終了はペインを閉じるのと同じにする: コンソールのプロセスは止め、GUI のアプリとその子孫は
+/// 残す。返り値は手放した Job の数（unix・器のペインは Job を持たないので 0）
+pub fn release_descendants_on_quit<'a>(
+    sessions: impl IntoIterator<Item = &'a mut TerminalSession>,
+) -> usize {
+    sessions
+        .into_iter()
+        .map(TerminalSession::release_descendants)
+        .filter(|released| *released)
+        .count()
 }
 
 impl CommandState {

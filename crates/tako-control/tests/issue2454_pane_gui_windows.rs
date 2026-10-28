@@ -26,7 +26,9 @@
 #![cfg(windows)]
 
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -151,7 +153,7 @@ impl Drop for Scratch {
 /// GUI の孫とコンソールの孫を起こして居座るペイン
 struct Pane {
     session: TerminalSession,
-    _rx: futures::channel::mpsc::UnboundedReceiver<tako_core::terminal::SessionEvent>,
+    _rx: Rx,
     shell: u32,
     gui: Held,
     console: Held,
@@ -162,7 +164,10 @@ fn powershell() -> PathBuf {
     PathBuf::from(root).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe")
 }
 
-fn spawn_pane(scratch: &Scratch) -> Pane {
+type Rx = futures::channel::mpsc::UnboundedReceiver<tako_core::terminal::SessionEvent>;
+
+/// GUI の孫とコンソールの孫を起こすペインを開く（pid は `out` へ書かれる）
+fn open_pane(out: &Path) -> (TerminalSession, Rx, u32) {
     let (session, rx) = TerminalSession::spawn(
         120,
         40,
@@ -180,7 +185,7 @@ fn spawn_pane(scratch: &Scratch) -> Pane {
             cwd: Some(std::env::temp_dir()),
             // 書き出し先と GUI の実行ファイルはペインの env として渡す（このプロセスの env は書き換えない）
             env: vec![
-                (OUT_ENV.to_string(), scratch.out().display().to_string()),
+                (OUT_ENV.to_string(), out.display().to_string()),
                 (GUI_ENV.to_string(), GUI.to_string()),
             ],
             scrollback_lines: None,
@@ -188,22 +193,32 @@ fn spawn_pane(scratch: &Scratch) -> Pane {
     )
     .expect("ConPTY を起動できること");
     let shell = session.child_pid().expect("PTY 直下の子の pid");
+    (session, rx, shell)
+}
+
+/// ペインの PowerShell が書いた「GUI の pid コンソールの pid」を待って読む（状態待ち）
+fn wait_pids(out: &Path, what: &str) -> (u32, u32) {
     let deadline = Instant::now() + START_LIMIT;
-    let (gui, console) = loop {
-        let pids: Vec<u32> = std::fs::read_to_string(scratch.out())
+    loop {
+        let pids: Vec<u32> = std::fs::read_to_string(out)
             .unwrap_or_default()
             .split_whitespace()
             .filter_map(|s| s.parse().ok())
             .collect();
         if let [gui, console] = pids[..] {
-            break (gui, console);
+            return (gui, console);
         }
         assert!(
             Instant::now() < deadline,
-            "ペインの PowerShell が {START_LIMIT:?} で孫の pid を書き出さない（シェル {shell}）"
+            "{what} の PowerShell が {START_LIMIT:?} で孫の pid を書き出さない"
         );
         std::thread::sleep(Duration::from_millis(50));
-    };
+    }
+}
+
+fn spawn_pane(scratch: &Scratch) -> Pane {
+    let (session, rx, shell) = open_pane(&scratch.out());
+    let (gui, console) = wait_pids(&scratch.out(), &format!("ペイン（シェル {shell}）"));
     let gui = Held::open(gui);
     let console = Held::open(console);
     assert!(
@@ -298,6 +313,138 @@ fn issue2454_全部止める旧アームではguiの孫も止まる() {
     );
     println!(
         "TAKO2454_PANE_GUI_KILLALL shell={shell} gui={} gui_gone=true console={} console_gone=true",
+        gui.pid, console.pid
+    );
+}
+
+// --- tako の普通の終了（on_app_quit）---------------------------------------
+//
+// GUI の終了は端末を drop しないまま OS がハンドルを閉じる。`on_app_quit` が
+// `release_descendants_on_quit` で全ペインの Job を手放すので、普通の終了はペインを閉じるのと同じ扱い
+// （コンソールは止め、GUI は残す）になる。呼び出しの 1 行の位置は tako-app の番犬
+// `issue2454_アプリ終了処理はペインの子孫を閉じたのと同じ扱いで手放す` が固定する。
+// ここでは同じ関数を呼んでから drop せずにプロセスを終える子を起こし、残る孫を親が見る。
+
+/// 子として起こすときだけ立つ（`quit` = 終了の経路で手放す / `crash` = 手放さずに終わる）
+const QUIT_CHILD_ENV: &str = "TAKO_2454_QUIT_CHILD";
+/// 子のペインが孫の pid を書く先
+const QUIT_OUT_ENV: &str = "TAKO_2454_QUIT_OUT";
+/// 子のテストの名前（親が `--exact` で起こす）
+const QUIT_CHILD_TEST: &str = "issue2454_quit_child";
+
+/// 子の本体: GUI の孫とコンソールの孫を起こすペインを開き、親の合図（stdin の 1 行）を待って、
+/// `quit` なら tako の普通の終了と同じく `release_descendants_on_quit` を呼んでから、GPUI の終了と
+/// 同じく端末を drop せずにプロセスを終える（OS がハンドルを閉じる）。`crash` は呼ばずに終える
+#[test]
+#[ignore = "issue2454 の普通の終了のテストが子として起こすときだけ走る"]
+fn issue2454_quit_child() {
+    let Ok(mode) = std::env::var(QUIT_CHILD_ENV) else {
+        return;
+    };
+    let out = PathBuf::from(std::env::var(QUIT_OUT_ENV).expect("親が渡す書き出し先"));
+    let (mut session, _rx, _shell) = open_pane(&out);
+    let _ = wait_pids(&out, "子のペイン");
+    let mut go = String::new();
+    let _ = std::io::stdin().read_line(&mut go);
+    if mode == "quit" {
+        let released =
+            tako_core::terminal::release_descendants_on_quit(std::iter::once(&mut session));
+        assert_eq!(released, 1, "ペインの Job を手放していない");
+    }
+    std::process::exit(0);
+}
+
+/// このテストが起こした子（テストバイナリ）を、親のテストが落ちた後にも残さない
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// 子を起こして終了の経路を通させ、孫の見張り（GUI / コンソール）と子の終了ステータスを返す
+fn run_quit_child(mode: &str, scratch: &Scratch) -> (Held, Held, std::process::ExitStatus) {
+    let mut cmd = Command::new(std::env::current_exe().expect("テストバイナリのパス"));
+    cmd.args([
+        "--exact",
+        QUIT_CHILD_TEST,
+        "--include-ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(QUIT_CHILD_ENV, mode)
+    .env(QUIT_OUT_ENV, scratch.out())
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null());
+    let mut child = ChildGuard(cmd.spawn().expect("子を起こせる"));
+    let (gui, console) = wait_pids(&scratch.out(), "子のペイン");
+    // 子が終わる前に開く（子が終わった後も pid を再利用させずに見張る）
+    let gui = Held::open(gui);
+    let console = Held::open(console);
+    let mut stdin = child.0.stdin.take().expect("stdin はパイプ");
+    writeln!(stdin, "go").expect("子へ合図を送れる");
+    drop(stdin);
+    let deadline = Instant::now() + GONE_LIMIT;
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("子を待てる") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "子（{mode}）が {GONE_LIMIT:?} で終わらない"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    (gui, console, status)
+}
+
+/// **普通の終了の受け入れ条件**: tako の普通の終了の経路（`release_descendants_on_quit` を呼んでから
+/// drop せずにプロセスが終わる）を通ると、GUI の孫は残り、コンソールの孫は止まる
+#[test]
+fn issue2454_普通の終了の経路ではguiの孫が残りコンソールの孫は止まる() {
+    let scratch = Scratch::new("quit");
+    let (gui, console, status) = run_quit_child("quit", &scratch);
+    assert!(status.success(), "子が失敗した（{status:?}）");
+    assert!(
+        console.wait_gone(GONE_LIMIT),
+        "普通の終了の後もコンソールの孫 {} が {GONE_LIMIT:?} 残った",
+        console.pid
+    );
+    assert!(
+        !gui.wait_gone(CONFIRM_ALIVE),
+        "普通の終了で GUI の孫 {} まで止まった（ペインを閉じたのと同じく残す）",
+        gui.pid
+    );
+    println!(
+        "TAKO2454_QUIT gui={} gui_alive=true console={} console_gone=true",
+        gui.pid, console.pid
+    );
+    // GUI の孫は `Held` の drop が止める（このテストが起こしたもの）
+}
+
+/// **落ちたとき（= 手放さずに終わる。この修正の前の普通の終了も同じ）**: OS がハンドルを閉じ、
+/// `KILL_ON_JOB_CLOSE` で GUI の孫も止まる = 上のテストに検出力がある
+#[test]
+fn issue2454_手放さずに終わるとguiの孫も止まる() {
+    let scratch = Scratch::new("crash");
+    let (gui, console, status) = run_quit_child("crash", &scratch);
+    assert!(status.success(), "子が失敗した（{status:?}）");
+    assert!(
+        console.wait_gone(GONE_LIMIT),
+        "手放さずに終わってもコンソールの孫 {} が残った",
+        console.pid
+    );
+    assert!(
+        gui.wait_gone(GONE_LIMIT),
+        "手放さずに終わったのに GUI の孫 {} が止まらない（この測り方では差が出ない）",
+        gui.pid
+    );
+    println!(
+        "TAKO2454_QUIT_CRASH gui={} gui_gone=true console={} console_gone=true",
         gui.pid, console.pid
     );
 }
