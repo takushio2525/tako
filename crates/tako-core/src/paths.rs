@@ -467,6 +467,56 @@ pub fn default_data_dir() -> Option<PathBuf> {
     }
 }
 
+/// マシンに閉じたデータ（ローミングさせない大きなキャッシュ）の置き場（#2431）。
+///
+/// Windows の [`data_dir`] は `%APPDATA%`（Roaming）で、ローミングプロファイルではログオン・
+/// ログオフのたびに同期される。Web ビューの WebView2 のユーザーデータ（キャッシュ・Cookie・
+/// 数十〜数百 MB）はそこへ置かず `%LOCALAPPDATA%\tako`（無ければ
+/// `%USERPROFILE%\AppData\Local\tako`）へ置く（Microsoft の WebView2 の文書の例も
+/// LocalApplicationData の下）。
+///
+/// `TAKO_DATA_DIR`（隔離）とテストプロセス（#944）は [`data_dir`] と同じ置き場へ倒す
+/// = 隔離した検証が本番の `%LOCALAPPDATA%` に書かない。Windows 以外も [`data_dir`] と同じ
+pub fn local_data_dir() -> Option<PathBuf> {
+    if std::env::var_os("TAKO_DATA_DIR").is_some_and(|d| !d.is_empty())
+        || (is_test_process() && !issue944_legacy())
+    {
+        return data_dir();
+    }
+    default_local_data_dir()
+}
+
+/// 製品（非テスト）での [`local_data_dir`] の本体
+pub fn default_local_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        local_data_dir_from(
+            std::env::var_os("LOCALAPPDATA"),
+            std::env::var_os("USERPROFILE"),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        default_data_dir()
+    }
+}
+
+/// Windows の [`default_local_data_dir`] の規則（env に触らない純関数。macOS でも検査できる）
+pub fn local_data_dir_from(
+    local_app_data: Option<std::ffi::OsString>,
+    user_profile: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    local_app_data
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            user_profile
+                .filter(|h| !h.is_empty())
+                .map(|h| PathBuf::from(h).join("AppData").join("Local"))
+        })
+        .map(|d| d.join("tako"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,5 +811,44 @@ mod tests {
             "テストの data_dir が一時ディレクトリの外: {}",
             dir.display()
         );
+    }
+
+    /// Windows のマシンに閉じた置き場は `%LOCALAPPDATA%\tako`（#2431）。空の env は
+    /// 無いものとして `%USERPROFILE%\AppData\Local` へ落ちる（[`default_data_dir`] と同じ作法）
+    #[test]
+    fn issue2431_ローカルの置き場はlocalappdataの下() {
+        let local = r"C:\Users\winuser\AppData\Local";
+        assert_eq!(
+            local_data_dir_from(Some(local.into()), Some(r"C:\Users\winuser".into())),
+            Some(PathBuf::from(local).join("tako"))
+        );
+        assert_eq!(
+            local_data_dir_from(Some(OsString::new()), Some(r"C:\Users\winuser".into())),
+            Some(
+                PathBuf::from(r"C:\Users\winuser")
+                    .join("AppData")
+                    .join("Local")
+                    .join("tako")
+            )
+        );
+        assert_eq!(local_data_dir_from(None, Some(OsString::new())), None);
+        assert_eq!(local_data_dir_from(None, None), None);
+    }
+
+    /// テストプロセスと `TAKO_DATA_DIR` は data dir と同じ置き場へ倒す（#2431 / #944）。
+    /// どちらの env で走らせても、本番の `%LOCALAPPDATA%` には書かない
+    #[test]
+    fn issue2431_テストプロセスのローカルの置き場はdata_dirと同じ() {
+        let dir = local_data_dir().expect("テストプロセスでは必ず解決する");
+        assert_eq!(Some(dir.clone()), data_dir());
+        if let Some(product) = default_local_data_dir() {
+            if std::env::var_os("TAKO_DATA_DIR").is_none() {
+                assert!(
+                    !dir.starts_with(&product),
+                    "テストのローカルの置き場が製品の置き場の配下: {}",
+                    dir.display()
+                );
+            }
+        }
     }
 }

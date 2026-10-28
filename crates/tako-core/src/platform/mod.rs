@@ -41,5 +41,7 @@ pub mod ssh_client;
 pub mod stack;
 pub mod support;
 pub mod user_path;
+/// Windows の Web ビュー（WebView2）の置き場・ランタイムの版・生成の失敗の案内（#2431）
+pub mod webview2;
 pub mod window_bounds;
 pub mod window_lifecycle;

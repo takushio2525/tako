@@ -265,6 +265,15 @@ fn 表示とjsonは同じ項目から出る() {
             .bin
     );
     required.push(&container);
+    // #2431: WebView2 ランタイムの版は Windows だけ（macOS の WKWebView は OS に含まれる = 出さない）
+    if cfg!(windows) {
+        required.push("webview2");
+    } else {
+        assert!(
+            !keys.iter().any(|k| k == "webview2"),
+            "macOS に WebView2 の項目が出ている: {keys:?}"
+        );
+    }
     for key in required {
         assert!(
             keys.iter().any(|k| k == key),

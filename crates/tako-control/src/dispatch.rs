@@ -20134,6 +20134,23 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         &ctx.color_scheme_panes,
     );
 
+    // #2431: WebView2 ランタイムの版（Windows の Web ビューに要る）とユーザーデータの置き場。
+    // 判定は `platform::webview2` の 1 実装（診断項目 `webview2` と同じ材料。レジストリを読むだけ）。
+    // 入っていない・古いときだけ申告する。macOS は対象外（節は `applicable: false`）
+    let webview2_runtime = tako_core::platform::webview2::runtime();
+    if let Some(message) = webview2_runtime.next_step_in(tako_core::i18n::Lang::Ja) {
+        issues.push(json!({
+            "level": "warning",
+            "check": "webview2",
+            "message": message,
+        }));
+    }
+    let webview2 = webview2_describe(
+        &webview2_runtime,
+        &tako_core::platform::webview2::data_dir_choice(),
+        &tako_core::platform::webview2::legacy_user_data_dirs(),
+    );
+
     // tako mod（#1891）: 注入の可否と理由・報告の無い claude のペインと理由・設定 dir ごとの skills/tako。
     // **判定は持たない**: `tako mod`（status）と同じ 2 段（`status_ctx` → `finish_status_in_background`）の
     // 応答から同じキーを写す（`health_section`）。mod を扱わない tako は理由つきの不明
@@ -20222,6 +20239,11 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         // UTF-8 のバイト列で書く子の出力が化ける。`targets[].code_pages` はいまの値の読み直し、
         // `hold` は固定の決着まで入力を預かった記録（`release=limit` なら決着を待たずに流した）
         "encoding_pin": encoding_pin,
+        // #2431: WebView2 ランタイム（Windows の Web ビュー）。`state` = installed / missing / outdated /
+        // not_applicable（macOS）、`version` は入っている版（無ければ null）、`required` は要る版。
+        // `data_dir` は Web ビューへ渡すユーザーデータの置き場（`data_dir_choice` = new /
+        // pending_legacy = 使用中で移せず旧い置き場を使っている）、`legacy_dirs` はまだ移していない旧い置き場
+        "webview2": webview2,
         // #2350: 端末の問い合わせ（色・明暗・寸法・OSC 52 の読み出し）のどれに答えるか。
         // `kinds[].by` = tako / emulator（alacritty が答える）/ declined、`answered` は起動からの回数。
         // `color_scheme_panes` はライト / ダークの通知（mode 2031）を購読しているペイン
@@ -20240,6 +20262,24 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
             "backgrounded": bg_count,
         },
         "issues": issues,
+    })
+}
+
+/// `check_health` の `webview2` 節（#2431）。材料は `platform::webview2` の 1 実装で、ここは形を作るだけ
+fn webview2_describe(
+    runtime: &tako_core::platform::webview2::Runtime,
+    choice: &tako_core::platform::webview2::DataDirChoice,
+    legacy: &[std::path::PathBuf],
+) -> Value {
+    let applicable = *runtime != tako_core::platform::webview2::Runtime::NotApplicable;
+    json!({
+        "applicable": applicable,
+        "state": runtime.state(),
+        "version": runtime.version(),
+        "required": applicable.then_some(tako_core::platform::webview2::REQUIRED_VERSION),
+        "data_dir": choice.path().map(|p| p.display().to_string()),
+        "data_dir_choice": choice.as_str(),
+        "legacy_dirs": legacy.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
     })
 }
 
@@ -56180,5 +56220,53 @@ mod issue2367_tests {
             .unwrap()
             .to_string();
         assert!(!message.contains("前に読めた"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod issue2431_tests {
+    use super::*;
+    use tako_core::platform::webview2::{DataDirChoice, Runtime, REQUIRED_VERSION};
+
+    /// Windows: 入っている版・要る版・Web ビューへ渡す置き場・まだ移していない旧い置き場を出す
+    #[test]
+    fn webview2の節は版と置き場を出す() {
+        let runtime = Runtime::Installed {
+            version: "146.0.3856.84".into(),
+        };
+        let new = std::path::PathBuf::from("/l/tako/WebView2");
+        let section = webview2_describe(&runtime, &DataDirChoice::New(new.clone()), &[]);
+        assert_eq!(section["applicable"], true);
+        assert_eq!(section["state"], "installed");
+        assert_eq!(section["version"], "146.0.3856.84");
+        assert_eq!(section["required"], REQUIRED_VERSION);
+        assert_eq!(section["data_dir"], new.display().to_string());
+        assert_eq!(section["data_dir_choice"], "new");
+        assert_eq!(section["legacy_dirs"], json!([]));
+        // 使用中で移せず旧い置き場を使っている
+        let legacy = std::path::PathBuf::from("/p/tako/tako-app.exe.WebView2");
+        let pending = webview2_describe(
+            &runtime,
+            &DataDirChoice::PendingLegacy(legacy.clone()),
+            std::slice::from_ref(&legacy),
+        );
+        assert_eq!(pending["data_dir_choice"], "pending_legacy");
+        assert_eq!(pending["legacy_dirs"][0], legacy.display().to_string());
+        // 入っていない: 版は null、状態は missing
+        let missing = webview2_describe(&Runtime::Missing, &DataDirChoice::New(new), &[]);
+        assert_eq!(missing["state"], "missing");
+        assert_eq!(missing["version"], Value::Null);
+    }
+
+    /// macOS: 対象外（版も置き場も出さない）
+    #[test]
+    fn webview2の節はwindows以外では対象外() {
+        let section =
+            webview2_describe(&Runtime::NotApplicable, &DataDirChoice::NotApplicable, &[]);
+        assert_eq!(section["applicable"], false);
+        assert_eq!(section["state"], "not_applicable");
+        assert_eq!(section["version"], Value::Null);
+        assert_eq!(section["required"], Value::Null);
+        assert_eq!(section["data_dir"], Value::Null);
     }
 }

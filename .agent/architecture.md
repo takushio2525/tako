@@ -1345,6 +1345,53 @@ open の後に ready を待つ（同期の生成では最初の 1 回で当た�
 違反は file:line で名指し）と `issue724_windowsではipcハンドラを付けない`。
 wry の版を変えたら W1 / W2 の根拠を読み直す（番犬が Cargo.lock の版で止める。#2445 で 0.55 → 0.57）
 
+### WebView2 のユーザーデータの置き場と生成の失敗の案内（#2431）
+
+判断と文言の正本は `tako_core::platform::webview2`（GPUI 非依存。macOS でも検査できる純関数）。
+
+- **置き場**: wry は `WebContext` を渡さないと WebView2 の既定 = 実行ファイルの隣
+  （`%LOCALAPPDATA%\Programs\tako\tako-app.exe.WebView2`）を使っていた。アンインストールしても残り、
+  アプリ内更新（#2434）が実行ファイルを入れ替える場所と同居する。Windows の `build_view` は
+  `web_context()` → `data_dir_choice()` で置き場を決めて `WebViewBuilder::new_with_web_context` で作る
+  （macOS は渡さない = 挙動を変えない）。新しい置き場は `paths::local_data_dir()` の下の `WebView2`
+  = `%LOCALAPPDATA%\tako\WebView2`。data dir（`%APPDATA%` = Roaming）に置かないのは、数十〜数百 MB の
+  キャッシュをローミングプロファイルで同期させないため（Microsoft の WebView2 の文書の例も
+  LocalApplicationData）。`TAKO_DATA_DIR`（隔離）とテストプロセスは data dir の下へ倒す
+- **移行（#916）**: 番地は `SchemaId::WebView2Data`（v1 = 実行ファイルの隣 / v2 = 新しい置き場）。
+  テキスト置換の Step では表せないので Setup / PowerShellProfile と同じく専用実装
+  （`migrations::webview2_reports` → `platform::webview2::relocate`）。旧い置き場は
+  `<自分の実行ファイルの dir>` と `install_info::install_location()` の `tako-app.exe.WebView2`
+  （Windows だけ・隔離 / 検証のプロセスは常に空）。移し方は**上書きしない rename で丸ごと**
+  （`fs_move::rename_noreplace`。中身は 1 バイトも変えず途中で止まらない。数百 MB を起動時に
+  複製しない）。新しい置き場が既にあれば 2 つのプロファイルは混ぜずに新しい方を正とし、旧い方を
+  `.pre-v1.bak` へ退避する。別のボリューム（ポータブル zip を別ドライブに置いた等）は一時の名前へ
+  写し終えてから据え、旧い方を `.pre-v1.bak` へ退避する（写しかけで失敗したら写しかけだけを消す）。
+  旧い中身はどの経路でも消さない。2 回目は旧い置き場が無いので何もしない（冪等）
+- **使用中で移せないとき**: Web ビューが開いている（msedgewebview2 がファイルを掴んでいる）と
+  Windows は rename を断る。旧い置き場は無傷のまま `Failed` を persist.log へ残し、次の発火
+  （GUI の起動・`tako master`・`tako setup`・`tako migrate run`）でまた試す。そのあいだの GUI は
+  **旧い置き場を使い続ける**（`DataDirChoice::PendingLegacy`。新しい空の置き場で始めると Cookie・
+  ログインが片方へ割れる）。置き場は Web ビューを作るたびに決め直すので、移し終えれば次の
+  Web ビューから新しい置き場になる。GUI の起動時の発火は Web ビューを作る前なので、ふつうは
+  起動時に移る（直前の tako の msedgewebview2 が残っている数秒だけ外れうる）
+- **生成の失敗の分類**: WebView2 のローダーは「ランタイムが無い」も「互換の版が無い」も
+  `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`（`0x80070002`）で返す。wry 0.57.1 は
+  `CoreWebView2EnvironmentOptions::default()` を渡し、その `TargetCompatibleBrowserVersion` は
+  webview2-com-sys 0.39.1 の `145.0.3800.47`（`REQUIRED_VERSION`）なので、それより古いランタイムしか
+  無い PC でも同じ失敗になる。`classify` は入っている版（レジストリ）を先に見て「無い / 古い」を決め、
+  版が足りているのに `0x80070002` なら登録はあるが使えない = 「無い」と同じ入れ直しの案内、それ以外は
+  「その他」。HRESULT は wry の原文（webview2-com の Error の Debug = `HRESULT(0x80070002)`）から拾う。
+  文言は日英の網羅 match（`CreateFailure::message_in`）で、原文を末尾に残す。種別は
+  `web list` / `read` の `create_failure`（`runtime_missing` / `runtime_outdated` / `other`）
+- **ランタイムの版**: `runtime()` は Microsoft が文書化している検出（Evergreen の client
+  `{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}` の `pv`。機械単位は WOW6432Node・ユーザー単位は HKCU。
+  空と `0.0.0.0` は入っていない）で読む。GUI を要らないので check-health の `webview2` 節（CLI / MCP）・
+  診断項目 `webview2`（`tako setup --check` と、GUI に届かないときの check-health にも同じ行）・
+  生成の失敗の分類が同じ答えになる。入っていない・古いときだけ check-health の issues に載る
+- 番犬は `webview.rs` の `issue2431_webviewへユーザーデータの置き場を渡す`（`build_view` が置き場の判断と
+  分類の 1 か所を通る）と `issue2431_求めるwebview2の版はwryの既定と同じ`（Cargo.lock の webview2-com の
+  版で止め、registry に実ソースがあれば対象の版・既定・表示の形を確かめる）
+
 ## AI 誘導・注釈レイヤ（FR-2.6、後段フェーズ）
 
 ペイン上のハイライト・指し示しは **GPUI の描画だけで完結する見込み**（deferred / overlay 描画、

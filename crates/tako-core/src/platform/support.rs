@@ -138,10 +138,12 @@ pub mod notes {
     /// #724 症状②。WebView2 の生成中の入れ子のメッセージループ（gpui の App の二重借用）と、
     /// COM のコールバックの中の unwrap で、巻き戻せずアプリごと abort していた。
     /// 生成を借用の外へ出し（W1）・Windows では ipc を付けず（W2）・生成中に落ちたものは
-    /// 次の起動で保留にする（W4）手当てを入れたが、Windows 実機での確認が済んでいない
+    /// 次の起動で保留にする（W4）手当てを入れたが、Windows 実機での確認が済んでいない。
+    /// #2431: WebView2 ランタイムが要る（macOS の WKWebView は OS に含まれる）ことと、
+    /// ユーザーデータの置き場・失敗の案内も実機では未確認
     pub const WIN_WEBVIEW2_PANIC: Note = Note::new(
-        "Web ビューを開くとアプリごと落ちていた原因（WebView2 の生成中の二重借用と COM コールバックの中の unwrap）への手当てを入れたが、Windows 実機で未確認（#724）",
-        "Fixes for the web view crashing the whole app (a double borrow while WebView2 is being created and an unwrap inside a COM callback) are in, but unverified on real Windows hardware (#724)",
+        "Web ビューを開くとアプリごと落ちていた原因（WebView2 の生成中の二重借用と COM コールバックの中の unwrap）への手当てを入れたが、Windows 実機で未確認（#724）。WebView2 ランタイム（145.0.3800.47 以上）が要り、無い・古い PC では生成の失敗が入れ方を案内する（版は check-health の webview2。ユーザーデータは %LOCALAPPDATA%\\tako\\WebView2。#2431）",
+        "Fixes for the web view crashing the whole app (a double borrow while WebView2 is being created and an unwrap inside a COM callback) are in, but unverified on real Windows hardware (#724). The WebView2 Runtime (145.0.3800.47 or later) is required; on a PC without it or with an older one, the creation failure explains how to install it (the version is under webview2 in check-health; user data lives in %LOCALAPPDATA%\\tako\\WebView2. #2431)",
     );
 
     /// #528。daemon の起動が `setsid` / シグナルマスク前提のまま。

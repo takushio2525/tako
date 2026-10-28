@@ -124,6 +124,14 @@ pub enum SchemaId {
     /// ファイルは消す・書き換える前の中身は `.pre-v1.bak` に残す）。tako の data dir の外の
     /// **利用者のファイル**なので形式の検査は持たない。手順は `shell_integration` が持つ
     PowerShellProfile,
+    /// Windows の Web ビュー（WebView2）のユーザーデータの置き場（#2431）。
+    ///
+    /// v1 = WebView2 の既定（実行ファイルの隣の `tako-app.exe.WebView2`）/ v2 =
+    /// `%LOCALAPPDATA%\tako\WebView2`。**フォルダの置き場の変更**なのでテキスト置換の
+    /// [`Step`] では表せない。手順は `platform::webview2::relocate`（上書きしない rename で
+    /// 丸ごと移す。新しい置き場が既にあれば旧い方を `.pre-v1.bak` へ退避）。
+    /// 中身は WebView2 のプロファイル（tako の形式ではない）なので形式の検査は持たない
+    WebView2Data,
 }
 
 impl SchemaId {
@@ -157,6 +165,7 @@ impl SchemaId {
             Self::ClaudeModMark => "claude_mod_mark",
             Self::RunConfigs => "run_configs",
             Self::PowerShellProfile => "powershell_profile",
+            Self::WebView2Data => "webview2_data",
         }
     }
 
@@ -194,6 +203,7 @@ impl SchemaId {
             Self::ClaudeModMark,
             Self::RunConfigs,
             Self::PowerShellProfile,
+            Self::WebView2Data,
         ]
     }
 }

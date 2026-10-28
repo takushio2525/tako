@@ -102,6 +102,10 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
     const OUTSIDE_CATALOG: &[(&str, SchemaId)] = &[
         // #2432: 以前の版が `$PROFILE` に置いたシェル統合のブロック（移行で取り除くだけ）
         ("<PowerShell の $PROFILE>", SchemaId::PowerShellProfile),
+        // #2431: Windows の Web ビュー（WebView2）のユーザーデータ。新しい置き場は data dir（`%APPDATA%`）の
+        // 外の `%LOCALAPPDATA%\tako\WebView2`（ローミングさせないキャッシュ）で、中身は WebView2 の
+        // プロファイル（tako の形式ではない）。共有もしない（マシンに閉じる）のでカタログの根を増やさない
+        ("<%LOCALAPPDATA%\\tako\\WebView2>", SchemaId::WebView2Data),
     ];
     for (path, id) in OUTSIDE_CATALOG {
         assert!(

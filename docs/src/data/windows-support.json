@@ -994,7 +994,7 @@
     {
       "key": "tako_web",
       "status": "pending",
-      "note_ja": "Web ビューを開くとアプリごと落ちていた原因（WebView2 の生成中の二重借用と COM コールバックの中の unwrap）への手当てを入れたが、Windows 実機で未確認（#724）",
+      "note_ja": "Web ビューを開くとアプリごと落ちていた原因（WebView2 の生成中の二重借用と COM コールバックの中の unwrap）への手当てを入れたが、Windows 実機で未確認（#724）。WebView2 ランタイム（145.0.3800.47 以上）が要り、無い・古い PC では生成の失敗が入れ方を案内する（版は check-health の webview2。ユーザーデータは %LOCALAPPDATA%\\tako\\WebView2。#2431）",
       "evidence": "measured",
       "evidence_detail": "修正前の実機の記録: panic.log に gpui の async_context.rs:65 の二重借用（CallWindowProcW が 2 段）、セルフテスト項目 71 で wry/src/webview2/mod.rs:910 の InvalidUri(Empty)。#724 で生成を App の借用の外へ出し・Windows では ipc を付けず・生成中に落ちた Web ビューを次の起動で保留にした。項目 71 は実機で通るまでスキップのまま"
     },

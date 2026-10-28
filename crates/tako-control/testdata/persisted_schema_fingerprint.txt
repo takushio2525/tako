@@ -125,3 +125,4 @@ version claude_mod_ui: v1 steps=0
 version claude_mod_mark: v1 steps=0
 version run_configs: v1 steps=0
 version powershell_profile: v1 steps=0
+version webview2_data: v1 steps=0

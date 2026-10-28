@@ -124,6 +124,59 @@ fn apply_element_fullscreen(view: &wry::WebView) {
     }
 }
 
+/// Web ビューへ渡す WebContext（#2431）。Windows だけユーザーデータの置き場を明示し、
+/// macOS は None（WebContext を渡さない = 従来と同じ）。置き場は Web ビューを作るたびに決め直す
+/// （旧い置き場から移せていないあいだは旧い置き場を使い続け、移し終えたら次の Web ビューから
+/// 新しい置き場になる。決め方は `platform::webview2::data_dir_choice` の 1 実装）。
+/// wry の WebView2 が置き場を読むのは生成の中（`create_environment`）だけなので、生成が返れば捨ててよい
+fn web_context() -> Option<wry::WebContext> {
+    let choice = tako_core::platform::webview2::data_dir_choice();
+    note_data_dir_choice(&choice);
+    choice
+        .path()
+        .map(|dir| wry::WebContext::new(Some(dir.to_path_buf())))
+}
+
+/// どの置き場を渡したかを persist.log へ（変わったときだけ 1 行。#2431）
+fn note_data_dir_choice(choice: &tako_core::platform::webview2::DataDirChoice) {
+    use tako_core::platform::webview2::DataDirChoice;
+    static LAST: Mutex<Option<String>> = Mutex::new(None);
+    let line = match choice {
+        DataDirChoice::NotApplicable => return,
+        DataDirChoice::Unresolved => {
+            "Web ビューのユーザーデータの置き場が決まらない（LOCALAPPDATA も USERPROFILE も無い）ので \
+             WebView2 の既定に任せる (#2431)"
+                .to_string()
+        }
+        DataDirChoice::New(dir) => {
+            format!("Web ビューのユーザーデータ: {} (#2431)", dir.display())
+        }
+        DataDirChoice::PendingLegacy(dir) => format!(
+            "Web ビューのユーザーデータ: 旧い置き場 {} を使う（使用中で移せていない。次の起動で移す。#2431）",
+            dir.display()
+        ),
+    };
+    if let Ok(mut last) = LAST.lock() {
+        if last.as_deref() == Some(line.as_str()) {
+            return;
+        }
+        *last = Some(line.clone());
+    }
+    tako_control::diag::persist_log(&line);
+}
+
+/// 生成の失敗の文言（#2431）。Windows は「ランタイムが無い / 古い / その他」に分けて次にやることを
+/// 言い（種別は `create_failure` へ）、macOS は従来の文言のまま
+fn create_failure_reason(raw: &str, shared: &Arc<Mutex<WebShared>>) -> String {
+    let Some(failure) = tako_core::platform::webview2::classify_here(raw) else {
+        return format!("webview 生成失敗: {raw}");
+    };
+    if let Ok(mut s) = shared.lock() {
+        s.create_failure = Some(failure.kind());
+    }
+    failure.message(raw)
+}
+
 /// Web ビューの段階（#724）。`Ready` だけが wry の Web ビューを持つ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebViewPhase {
@@ -333,6 +386,9 @@ pub struct WebShared {
     pub can_go_forward: bool,
     /// 最初の読み込みが終わったか（PageLoadEvent::Finished。#724 の W4 の印を外す合図）
     pub first_load_done: bool,
+    /// 直近の生成の失敗の種別（#2431。`runtime_missing` / `runtime_outdated` / `other`。
+    /// Windows だけ = macOS は従来どおり None。`web list` / `read` の `create_failure`）
+    pub create_failure: Option<&'static str>,
 }
 
 /// タイトル・URL の変化を Rust 側へ通知する初期化スクリプト。
@@ -483,9 +539,19 @@ impl WebViewEntry {
         if !window.attached() {
             return Err(detached_parent_error());
         }
+        if let Ok(mut s) = shared.lock() {
+            s.create_failure = None;
+        }
         let load_shared = Arc::clone(shared);
         let new_win_shared = Arc::clone(shared);
-        let mut builder = wry::WebViewBuilder::new()
+        // #2431: Windows はユーザーデータの置き場を明示する（WebContext を渡さないと wry は
+        // 実行ファイルの隣の `tako-app.exe.WebView2` を使う）。macOS は渡さない = 挙動を変えない
+        let mut context = web_context();
+        let builder = match context.as_mut() {
+            Some(context) => wry::WebViewBuilder::new_with_web_context(context),
+            None => wry::WebViewBuilder::new(),
+        };
+        let mut builder = builder
             .with_url(url)
             .with_visible(false)
             .with_focused(false)
@@ -545,7 +611,7 @@ impl WebViewEntry {
         }
         let view = builder
             .build_as_child(window)
-            .map_err(|e| format!("webview 生成失敗: {e}"))?;
+            .map_err(|e| create_failure_reason(&e.to_string(), shared))?;
         // #2445: 要素の全画面表示は切る（理由は `element_fullscreen_enabled`）
         apply_element_fullscreen(&view);
         Ok(view)
@@ -974,6 +1040,11 @@ impl WebViewEntry {
             .ok()
             .map(|mut s| std::mem::take(&mut s.pending_new_window_urls))
             .unwrap_or_default()
+    }
+
+    /// 直近の生成の失敗の種別（#2431。None = 失敗していない・Windows 以外）
+    pub fn create_failure(&self) -> Option<&'static str> {
+        self.shared.lock().ok()?.create_failure
     }
 
     /// エラー状態を返す（None = 正常）
@@ -1629,16 +1700,27 @@ mod tests {
 
     /// Cargo.lock に載っている wry の版（#724 / #2445 の番犬が根拠を版に結び付ける）
     fn wry_version() -> String {
+        lock_version("wry")
+    }
+
+    /// Cargo.lock に載っている crate の版（同じ名前が 2 版あれば先の方）
+    fn lock_version(name: &str) -> String {
+        let head = format!("\nname = \"{name}\"\n");
         include_str!("../../../Cargo.lock")
             .split("[[package]]")
-            .find(|p| p.contains("\nname = \"wry\"\n"))
+            .find(|p| p.contains(&head))
             .and_then(|p| p.lines().find_map(|l| l.strip_prefix("version = \"")))
             .map(|v| v.trim_end_matches('"').to_string())
-            .expect("Cargo.lock に wry が無い")
+            .unwrap_or_else(|| panic!("Cargo.lock に {name} が無い"))
     }
 
     /// registry にある wry の実ソース（`rel` は crate 内の相対パス）。取得していない機では None
     fn wry_source(ver: &str, rel: &str) -> Option<String> {
+        crate_source("wry", ver, rel)
+    }
+
+    /// registry にある crate の実ソース。取得していない機（Windows 専用の crate を macOS で）では None
+    fn crate_source(name: &str, ver: &str, rel: &str) -> Option<String> {
         // cargo の置き場（`CARGO_HOME`、無ければホームの `.cargo`。ホームは paths の 1 実装 = #893）
         let home = std::env::var_os("CARGO_HOME")
             .map(std::path::PathBuf::from)
@@ -1646,7 +1728,7 @@ mod tests {
         let path = std::fs::read_dir(home.join("registry").join("src"))
             .ok()?
             .flatten()
-            .map(|d| d.path().join(format!("wry-{ver}")).join(rel))
+            .map(|d| d.path().join(format!("{name}-{ver}")).join(rel))
             .find(|p| p.is_file())?;
         std::fs::read_to_string(path).ok()
     }
@@ -2098,6 +2180,157 @@ mod tests {
                 inside,
                 "wry {ver} の wkwebview/mod.rs:{line} の activate が「見えていて focus を取る」条件の外にある\
                  （0.55 は生成のたびに前面へ出した。#2445）"
+            );
+        }
+    }
+
+    /// **Windows の Web ビューへユーザーデータの置き場を渡す**（#2431）。
+    ///
+    /// WebContext を渡さないと wry は実行ファイルの隣（`tako-app.exe.WebView2`）を使う。wry を呼ぶ 1 か所
+    /// （`build_view`）が、置き場の判断（`web_context` → `platform::webview2::data_dir_choice`）を通して
+    /// `new_with_web_context` で作ることと、生成の失敗が分類の 1 か所（`create_failure_reason` →
+    /// `classify_here`）を通ることを固定する
+    #[test]
+    fn issue2431_webviewへユーザーデータの置き場を渡す() {
+        let src = include_str!("webview.rs");
+        let build = fn_body(src, "fn build_view(");
+        assert!(
+            guarded(
+                build,
+                "let mut context = web_context();",
+                "new_with_web_context(context)"
+            ),
+            "build_view が置き場の判断を通さずに wry の Web ビューを作っている（#2431）"
+        );
+        assert!(
+            guarded(build, "new_with_web_context(context)", ".build_as_child("),
+            "build_view が WebContext を渡さずに生成している（#2431）"
+        );
+        assert!(
+            build.contains(".map_err(|e| create_failure_reason(&e.to_string(), shared))?;"),
+            "生成の失敗が分類を通っていない（#2431）"
+        );
+        let top_fn = |sig: &str| {
+            let rest = &src[src
+                .find(sig)
+                .unwrap_or_else(|| panic!("{sig} が見つからない"))..];
+            &rest[..rest.find("\n}\n").unwrap_or(rest.len())]
+        };
+        assert!(top_fn("fn web_context(").contains("platform::webview2::data_dir_choice()"));
+        assert!(
+            top_fn("fn create_failure_reason(").contains("platform::webview2::classify_here(raw)")
+        );
+    }
+
+    /// macOS は WebContext を渡さず、失敗の文言も従来のまま（#2431 で macOS の挙動を変えない）
+    #[test]
+    #[cfg(not(windows))]
+    fn issue2431_macosでは置き場を渡さず文言も変えない() {
+        assert!(web_context().is_none());
+        let shared = Arc::new(Mutex::new(WebShared::default()));
+        assert_eq!(
+            create_failure_reason("boom", &shared),
+            "webview 生成失敗: boom"
+        );
+        assert_eq!(shared.lock().unwrap().create_failure, None);
+    }
+
+    /// Windows はテストの data dir の下の WebView2 を渡し（本番の置き場に書かない）、
+    /// 失敗は分類して種別を残す
+    #[test]
+    #[cfg(windows)]
+    fn issue2431_windowsでは置き場を渡し失敗を分類する() {
+        let context = web_context().expect("Windows は WebContext を渡す");
+        assert_eq!(
+            context.data_directory().map(std::path::Path::to_path_buf),
+            tako_core::platform::webview2::user_data_dir()
+        );
+        let shared = Arc::new(Mutex::new(WebShared::default()));
+        let raw =
+            "WebView2 error: WindowsError(Error { code: HRESULT(0x80070002), message: \"\" })";
+        let text = create_failure_reason(raw, &shared);
+        assert!(text.contains(raw), "{text}");
+        let kind = shared.lock().unwrap().create_failure;
+        assert!(
+            matches!(kind, Some("runtime_missing" | "runtime_outdated")),
+            "{kind:?}"
+        );
+    }
+
+    /// wry の原文から HRESULT を拾えること（#2431）。wry の `WebView2Error` は webview2-com の
+    /// Error の Display（= Debug）で、その中の windows の Error の Debug が `HRESULT(0x…)` を出す。
+    /// Windows では本物の windows の Error で確かめる
+    #[test]
+    #[cfg(windows)]
+    fn issue2431_本物のwindowsのエラーからhresultを拾える() {
+        let error = windows::core::Error::from(windows::core::HRESULT(0x8007_0002_u32 as i32));
+        let raw = format!("WebView2 error: WindowsError({error:?})");
+        assert_eq!(
+            tako_core::platform::webview2::hresult_in(&raw),
+            Some(tako_core::platform::webview2::HRESULT_FILE_NOT_FOUND),
+            "{raw}"
+        );
+    }
+
+    /// **求める WebView2 の版は wry の既定と同じ**（#2431）。
+    ///
+    /// wry は環境のオプションを `CoreWebView2EnvironmentOptions::default()` で作り、その
+    /// `TargetCompatibleBrowserVersion` は webview2-com-sys の `CORE_WEBVIEW_TARGET_PRODUCT_VERSION`。
+    /// これより古いランタイムでは生成が `0x80070002` で失敗するので、`REQUIRED_VERSION` はこの値に
+    /// 揃っていなければならない。版が変わったら止まり、registry に実ソースがあれば値と表示の形
+    /// （HRESULT を拾う手がかり）をその版のソースで確かめる
+    #[test]
+    fn issue2431_求めるwebview2の版はwryの既定と同じ() {
+        use tako_core::platform::webview2::REQUIRED_VERSION;
+        let sys = lock_version("webview2-com-sys");
+        let com = lock_version("webview2-com");
+        assert!(
+            sys == "0.39.1" && com == "0.39.1",
+            "webview2-com が {com} / webview2-com-sys が {sys} になった。REQUIRED_VERSION（{REQUIRED_VERSION}）は \
+             0.39.1 の CORE_WEBVIEW_TARGET_PRODUCT_VERSION。新しい版の値を読み直して合わせる"
+        );
+        let Some(bindings) = crate_source("webview2-com-sys", &sys, "src/bindings.rs") else {
+            println!("TAKO_2431: webview2-com-sys {sys} の実ソースが registry に無いので値の検査は見送る");
+            return;
+        };
+        let at = bindings
+            .find("pub const CORE_WEBVIEW_TARGET_PRODUCT_VERSION")
+            .expect("CORE_WEBVIEW_TARGET_PRODUCT_VERSION が無い（形が変わった）");
+        assert!(
+            bindings[at..]
+                .lines()
+                .take(3)
+                .any(|l| l.contains(&format!("w!(\"{REQUIRED_VERSION}\")"))),
+            "webview2-com-sys {sys} の対象の版が REQUIRED_VERSION（{REQUIRED_VERSION}）と違う"
+        );
+        if let Some(options) = crate_source("webview2-com", &com, "src/options.rs") {
+            assert!(
+                options.contains("CORE_WEBVIEW_TARGET_PRODUCT_VERSION.to_string()"),
+                "webview2-com {com} の既定が対象の版を使っていない（形が変わった）"
+            );
+        }
+        if let Some(lib) = crate_source("webview2-com", &com, "src/lib.rs") {
+            assert!(
+                lib.contains("write!(f, \"{self:?}\")"),
+                "webview2-com {com} の Error の表示が Debug でない = HRESULT を拾う手がかりが変わった"
+            );
+        }
+        let ver = wry_version();
+        if let Some(wry) = wry_source(&ver, "src/webview2/mod.rs") {
+            assert!(
+                wry.contains("CoreWebView2EnvironmentOptions::default()")
+                    && !wry.contains("set_target_compatible_browser_version"),
+                "wry {ver} が対象の版を既定から変えている（REQUIRED_VERSION を読み直す）"
+            );
+            assert!(
+                wry.contains(".and_then(|context| context.data_directory())"),
+                "wry {ver} が WebContext の置き場を WebView2 へ渡していない（形が変わった）"
+            );
+        }
+        if let Some(error) = wry_source(&ver, "src/error.rs") {
+            assert!(
+                error.contains("#[error(\"WebView2 error: {0}\")]"),
+                "wry {ver} の WebView2Error の表示が変わった（HRESULT を拾う手がかり）"
             );
         }
     }
