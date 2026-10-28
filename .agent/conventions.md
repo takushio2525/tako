@@ -3393,6 +3393,29 @@ CLOEXEC 無しで受け継ぎ、exec 後も握る。漏れた先が長生きす�
 - 同じ隙間は製品にもあるが、製品の条件では当たらなかった（隔離 GUI で 3000 回中 0 回）。
   製品で実際に漏れていたのは別の型（GUI が CLOEXEC 無しで開いた fd）で、次の節で塞いだ
 
+### テストが打ち切る子は `exec` で置き換え、孫を作らない（Issue #2448）
+
+**「返らない子」を `sh -c "…; sleep 600"` の形で作り、直接の子だけを kill する口
+（`probe::output_with_timeout` / `command_output_with_timeout` / `Child::kill`）で打ち切らないこと。**
+macOS の `/bin/sh`（bash 3.2）は並びの最後のコマンドを exec せず子として起こすので、kill は sh に当たり、
+`sleep` は親を失って（ppid 1・テストのプロセスグループのまま）眠り続ける。テストは緑のまま。
+
+- 実物: `probe::tests::出力を少し出してから固まる子も…` が `printf %s partial; sleep 600` で 1 回に 1 本残し、
+  一巡の番犬（下）の子でももう 1 回走るので `cargo test` 1 回で 2 本（10/28 の観測と同じ = 同じ pgid・
+  数秒差）。Issue の見立てだった tmux の窓の `sleep 600`（`tmux_backend` の issue1857 / issue2367）は残らない:
+  ペインは setsid で自分のグループを持ち、`TmuxTestGuard` の kill-server で終わる（実測）。PTY の子も
+  端末が閉じた SIGHUP で終わる
+- **書き方**: 眠る本体は `exec` で子そのものと置き換える（`printf %s x; exec sleep 600`）。1 文だけの
+  `sh -c "sleep 600"` も bash の最適化に頼らず `exec` を書く。孫が要る形（rc が孫を起こす）を見るなら
+  `probe::group_output_with_timeout` で起こしてグループごと畳むか、#1748 の `StopGrandchild` で止める
+- **番犬**: `test_residue` の `テストを一巡してもtmpdirに残骸が残らない`（macOS）が、一巡の子を自分の
+  プロセスグループで起こし、終わった後にグループへ残ったプロセスを数える。残っていればテスト一覧の
+  二分探索で名指し、残ったものは自分の uid のものだけ pid 指定で止める。検出力は修正前の形で孫を残す注入
+  （`注入_打ち切った子の孫を親を失った形で残す`、目印 `TAKO_2448_INJECT_ORPHAN`）を毎回名指せることで見る。
+  見えるのは tako-core の lib のテストだけで、setsid する子（tmux / PTY）と別のグループの子は見えない
+- Windows の `cmd /C "…& ping -n 600 …"` は `exec` が無く、`TerminateProcess` も孫に届かないので
+  同じ形が残る（子孫ごと畳むのは #2454 の Job Object の話）
+
 ## 長生きする子へ GUI の fd を渡さない（Issue #1768）
 
 **fork + exec で起きる子は、fork の瞬間に GUI が CLOEXEC 無しで開いていた fd をすべて受け継ぐ。**
