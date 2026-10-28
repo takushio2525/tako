@@ -2574,6 +2574,10 @@ OS 依存ではない。
   （`assert!(warm <= cold, …)`）。誤検知しないよう、タイムアウト
   （`while t0.elapsed() < limit`）・報告のみ（`println!`）は対象外。
   コメントと文字列リテラルは潰してから見るので、期待値の文字列に当たらない
+- 規則（実時間の値 2 つ）にかからなくても、**測った時刻と判断の時刻がずれる形**は同じ間欠を持つ
+  （#2424: `tick_at = resumed.elapsed()` の後に `tick()` の中で時刻を取り、間隔を `+ 5` ms の余裕で
+  窓と比べていた = `tick_at` の後に 200 ms 止まると 5 回中 5 回落ちた）。窓や間隔を確かめるテストは、
+  判断する側の時計を止めて進める（`launch_gate::advance_clock_for_test`）
 - `test_timing_watchdog.rs` の `実時間の絶対予算は宣言したものだけ` —
   実時間の値 **1 つ**と `Duration::from_*` の比較（絶対予算）は、
   `ABSOLUTE_BUDGET_ALLOWLIST` に**根拠つきで宣言したものだけ**許す（#962）
