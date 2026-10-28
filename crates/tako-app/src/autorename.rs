@@ -506,12 +506,18 @@ fn spawn_claude(bin: &Path, prompt: &str, strict: bool, timeout: Duration) -> Cl
             return ClaudeRun::Failed;
         }
     };
+    // #2462: 打ち切りの kill を孫まで届かせる入れ物（Windows だけ。境界 B30）。npm の `claude.cmd` は
+    // cmd.exe → node.exe の 2 段で、`--strict-mcp-config` を外した再試行は MCP サーバも子に持つので、
+    // 直下の子の kill だけでは cmd.exe しか止まらない。プロンプトを書く前（= 子が孫を起こす前）に入れる。
+    // 普通に終わったら drop が何も止めずに手放す
+    let mut descendants = tako_core::platform::job::KillScope::contain(child.id());
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes());
         // drop で stdin が閉じ、-p は EOF までをプロンプトとして読む
     }
     // stdout はパイプ詰まり防止のため別スレッドで吸い出しつつ、タイムアウト付きで待つ
     let Some(mut stdout) = child.stdout.take() else {
+        descendants.stop();
         let _ = child.kill();
         let _ = child.wait();
         return ClaudeRun::Failed;
@@ -541,6 +547,8 @@ fn spawn_claude(bin: &Path, prompt: &str, strict: bool, timeout: Duration) -> Cl
                     started.elapsed().as_secs_f32(),
                     timeout.as_secs()
                 ));
+                // #2462: 子孫は入れ物ごと（コンソールは止め GUI のアプリは残す）。直下の子は次の kill
+                descendants.stop();
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -2144,5 +2152,152 @@ TAIL
             REL,
             line_of(&src, "const STALE_RETRY_DELAYS")
         );
+    }
+
+    /// #2462: AI 命名の上限の打ち切りで、npm の `claude.cmd` と同じ形（`.cmd` → cmd.exe → 孫）の孫まで
+    /// 止まることの実測（Windows の実プロセス）。修正前は cmd.exe だけが止まり、孫が残った。
+    ///
+    /// 偽 claude（`.cmd`）は `ping -n 600` を孫として起こして居座る。見張り役のスレッドが一覧から
+    /// 「このテストプロセスの子の cmd.exe の子の ping」を見つけ、**ハンドルを持ったまま**見張る
+    /// （pid の再利用で偽の緑・赤を出さない = #2284）。上限は見張り役が孫を見つけるまでの幅で、比較には使わない
+    #[cfg(windows)]
+    mod issue2462 {
+        use super::*;
+        use std::ffi::c_void;
+        use std::sync::mpsc;
+
+        /// 打ち切りの上限（cmd.exe が ping を起こすまでの幅。状態待ちの上限）
+        const LIMIT: Duration = Duration::from_secs(15);
+        /// 止まるのを待つ上限（状態待ちの上限）
+        const GONE_LIMIT: Duration = Duration::from_secs(60);
+
+        type Handle = *mut c_void;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        const WAIT_OBJECT_0: u32 = 0;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+            fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+            fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
+            fn CloseHandle(object: Handle) -> i32;
+        }
+
+        /// 見張る孫（ハンドルを持つ間は pid が再利用されない）。drop で生きていれば止める
+        struct Held {
+            pid: u32,
+            handle: Handle,
+        }
+
+        // SAFETY: カーネルオブジェクトのハンドルはどのスレッドからでも使える（見張り役から渡す）
+        unsafe impl Send for Held {}
+
+        impl Held {
+            fn open(pid: u32) -> Option<Held> {
+                // SAFETY: 戻りは null を検査し、drop で 1 回だけ閉じる
+                let handle = unsafe {
+                    OpenProcess(
+                        SYNCHRONIZE | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                        0,
+                        pid,
+                    )
+                };
+                (!handle.is_null()).then_some(Held { pid, handle })
+            }
+
+            fn wait_gone(&self, limit: Duration) -> bool {
+                let ms = u32::try_from(limit.as_millis()).unwrap_or(u32::MAX);
+                // SAFETY: drop まで有効なハンドル
+                unsafe { WaitForSingleObject(self.handle, ms) == WAIT_OBJECT_0 }
+            }
+        }
+
+        impl Drop for Held {
+            fn drop(&mut self) {
+                // SAFETY: open が返した有効なハンドル。撃つのはこのテストの偽 claude の孫だけ
+                unsafe {
+                    if WaitForSingleObject(self.handle, 0) != WAIT_OBJECT_0 {
+                        TerminateProcess(self.handle, 1);
+                    }
+                    CloseHandle(self.handle);
+                }
+            }
+        }
+
+        /// 見張り役: このプロセスの子の cmd.exe の子の ping を `LIMIT` まで探して開く
+        fn watch_grandchild() -> mpsc::Receiver<Option<Held>> {
+            let me = std::process::id();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + LIMIT;
+                let found = loop {
+                    let procs = tako_core::platform::procinfo::snapshot();
+                    let ping = procs
+                        .iter()
+                        .filter(|c| c.ppid == me && c.name.eq_ignore_ascii_case("cmd.exe"))
+                        .find_map(|c| {
+                            procs.iter().find(|p| {
+                                p.ppid == c.pid && p.name.eq_ignore_ascii_case("ping.exe")
+                            })
+                        })
+                        .and_then(|p| Held::open(p.pid));
+                    if ping.is_some() || Instant::now() >= deadline {
+                        break ping;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                };
+                let _ = tx.send(found);
+            });
+            rx
+        }
+
+        /// 偽 claude（`.cmd`）を上限で打ち切り、孫を返す
+        fn time_out_fake_claude(label: &str) -> Held {
+            let dir = tako_core::test_residue::ScratchDir::new(&format!("autorename-2462-{label}"));
+            let bin = dir.join("claude.cmd");
+            std::fs::write(&bin, "@echo off\r\nping -n 600 127.0.0.1 > NUL\r\n")
+                .expect("偽 claude を書ける");
+            let watcher = watch_grandchild();
+            let run = spawn_claude(&bin, "prompt", true, LIMIT);
+            assert_eq!(run, ClaudeRun::Failed, "打ち切りが非ゼロ終了に化けている");
+            watcher.recv().expect("見張り役が返す").unwrap_or_else(|| {
+                panic!("偽 claude の孫の ping を打ち切り（{LIMIT:?}）までに見つけられない（測りたい形でない）")
+            })
+        }
+
+        /// **受け入れ条件 2**: AI 命名の上限の打ち切りで、`.cmd` 経由の孫まで止まる
+        #[test]
+        fn issue2462_命名の打ち切りでcmd経由の孫まで止まる() {
+            let ping = time_out_fake_claude("stop");
+            assert!(
+                ping.wait_gone(GONE_LIMIT),
+                "打ち切りの後も claude.cmd の孫 {} が {GONE_LIMIT:?} 残った（#2462）",
+                ping.pid
+            );
+            println!("TAKO2462_AUTORENAME grandchild={} gone=true", ping.pid);
+        }
+
+        /// **A/B の旧アーム（= 修正前の実装）**: 打ち切りの後も孫は生きている = 測り方に検出力がある
+        #[test]
+        fn issue2462_旧アームでは命名の打ち切りで孫が残る() {
+            if tako_core::run_alone!(issue2462_旧アームでは命名の打ち切りで孫が残る)
+            {
+                return;
+            }
+            std::env::set_var(tako_core::platform::job::ENV_LEGACY, "1"); // 子の中だけ
+            let ping = time_out_fake_claude("legacy");
+            assert!(
+                !ping.wait_gone(Duration::ZERO),
+                "旧アームで孫 {} が止まった（この測り方では #2462 の差が出ない）",
+                ping.pid
+            );
+            println!(
+                "TAKO2462_AUTORENAME_LEGACY grandchild={} survived=true",
+                ping.pid
+            );
+            // 孫は `Held` の drop が止める（このテストの偽 claude が起こしたもの）
+        }
     }
 }

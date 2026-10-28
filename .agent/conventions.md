@@ -3434,8 +3434,11 @@ macOS の `/bin/sh`（bash 3.2）は並びの最後のコマンドを exec せ�
   二分探索で名指し、残ったものは自分の uid のものだけ pid 指定で止める。検出力は修正前の形で孫を残す注入
   （`注入_打ち切った子の孫を親を失った形で残す`、目印 `TAKO_2448_INJECT_ORPHAN`）を毎回名指せることで見る。
   見えるのは tako-core の lib のテストだけで、setsid する子（tmux / PTY）と別のグループの子は見えない
-- Windows の `cmd /C "…& ping -n 600 …"` は `exec` が無く、`TerminateProcess` も孫に届かないので
-  同じ形が残る（子孫ごと畳むのは #2454 の Job Object の話）
+- Windows の `cmd /C "…& ping -n 600 …"` は `exec` が無く、`TerminateProcess` も孫に届かない。
+  `probe` の打ち切りは #2462 から子を Job Object（境界 B30 の `KillScope`）へ入れて孫ごと畳むので、
+  probe の口（`output_with_timeout` / `command_output_with_timeout` / `wait_with_timeout`）で打ち切る形は
+  残らない（実測は `tako-core/tests/issue2462_probe_job_windows.rs`）。`Child::kill` を直に書くなら
+  Windows で孫を作る子は `platform::job::KillScope::contain` で入れておき、`stop` してから kill する
 
 ## 長生きする子へ GUI の fd を渡さない（Issue #1768）
 

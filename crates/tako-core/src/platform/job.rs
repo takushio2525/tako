@@ -30,7 +30,13 @@
 //! | ペインを閉じる（[`Job::close_for_pane`]） | 止める | **残す** |
 //! | tako を普通に終了する（`on_app_quit` → `terminal::release_descendants_on_quit`） | 止める | **残す** |
 //! | 言語サーバを止める（[`Job::terminate`] / drop） | 止める | 止める |
+//! | 打ち切り・取り消し（probe の上限・`tako queue` の取り消し・AI 命名の上限 = [`KillScope::stop`]。#2462） | 止める | **残す** |
+//! | 上の子が普通に終わる（[`KillScope`] の drop。#2462） | **残す** | **残す** |
+//! | エージェントの再起動（session-restart の harness = [`Job::stop_descendants_of`]。#2462） | そのエージェントの子孫だけ止める | **残す** |
 //! | tako が落ちる（OS がハンドルを閉じる = `KILL_ON_JOB_CLOSE`） | 止める | 止める |
+//!
+//! 普通に終わった子の残り（常駐。unix で親を失っても残るもの）を止めないのは、#2462 の前と unix の
+//! 振る舞いを変えないため。止めるのは tako が止めると決めたとき（打ち切り・取り消し・再起動）だけ。
 //!
 //! ペインから起こした GUI アプリ（`code .` の初回・`notepad` など）をペインと一緒に消さない
 //! （Windows Terminal も macOS の `open` も残す。消すと「ペインを閉じたらエディタごと消えた」になる）。
@@ -58,6 +64,9 @@
 //! その子として起きる。入れるとサーバーまで Job を受け継ぎ、ペインを閉じたとき・GUI を終えたときに
 //! 器ごと消える（再起動をまたいで残す約束が壊れる）。器のクライアントかどうかは呼び手が判断する
 //! （`TerminalSession::spawn_in` が `tmux_backend::is_container_client` で見る）。
+//!
+//! 打ち切り・取り消しの子（[`KillScope`]）も同じ理由で器の CLI は入れない（probe の
+//! `wait_with_timeout` が実行ファイル名で見る。器の 1 回の問い合わせがサーバーを起こすことがある）。
 //!
 //! unix は何もしない（[`Job::contain`] が `None`）: ペインは PTY の HUP、言語サーバは stdin の EOF と
 //! kill に任せる（従来どおり）。A/B は `TAKO_2454_LEGACY=1`（Job を作らない = #2454 前）と
@@ -233,6 +242,184 @@ impl Job {
         release
         // job の drop がハンドルを閉じる
     }
+
+    /// `root` の子孫を、この Job の中で止める（#2462。エージェントの再起動 = session-restart の harness）。
+    ///
+    /// ペインの Job はシェルごと入っているので Job ごとは止められない（シェルまで止まる）。中身を
+    /// 列挙して親を Job の中でたどり（[`descendants_in`]）、`root` の子孫だけを選ぶ。寿命はペインを
+    /// 閉じるのと同じで、GUI のアプリとその子孫は残す（[`split_for_release`]）。`root` 自身は止めない
+    /// （呼び手が先に止める。止めた後に呼んでよい = Windows は親が終わっても子の親の pid を書き換えない）。
+    /// 止める前にその pid がまだこの Job に居ることを開いたハンドルで確かめる。
+    /// 列挙できない・`root` の子孫が Job に居ないときは何もしない（ペインのシェルを撃たない）
+    pub fn stop_descendants_of(&self, root: u32) -> Release {
+        let mut release = Release::default();
+        let Some(job) = self.inner.as_ref() else {
+            return release;
+        };
+        // 前の回で止めた中継ぎ（もう列挙に出ない）の親も覚えておく = その子もたどれる
+        let mut parents: HashMap<u32, u32> = HashMap::new();
+        let mut stopped: HashSet<u32> = HashSet::new();
+        for _ in 0..RELEASE_ROUNDS {
+            let members = match job.members() {
+                Ok(members) => members,
+                Err(reason) => {
+                    tracing::warn!("子孫を列挙できないので止めない: {reason}");
+                    return release;
+                }
+            };
+            parents.extend(
+                crate::platform::procinfo::snapshot_checked()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|entry| (entry.pid, entry.ppid)),
+            );
+            let parent = |pid: u32| parents.get(&pid).copied();
+            let targets = descendants_in(
+                &members,
+                root,
+                &stopped,
+                parent,
+                crate::platform::procinfo::start_time_unix,
+            );
+            if targets.is_empty() {
+                break;
+            }
+            let gui: HashSet<u32> = targets.iter().copied().filter(|pid| is_gui(*pid)).collect();
+            let plan = split_for_release(
+                &targets,
+                |pid| gui.contains(&pid),
+                parent,
+                crate::platform::procinfo::start_time_unix,
+            );
+            release.kept = plan.keep.len();
+            if plan.stop.is_empty() {
+                break;
+            }
+            for pid in plan.stop {
+                if job.stop_member(pid) {
+                    release.stopped += 1;
+                }
+                stopped.insert(pid);
+            }
+        }
+        release
+    }
+
+    /// 中身を止めずに手放す（#2462。[`KillScope`] の drop = 子が普通に終わった）。
+    /// `KILL_ON_JOB_CLOSE` を外してから閉じる。外せないときは閉じると中身が止まる（警告を残す）
+    fn detach(mut self) {
+        if let Some(job) = self.inner.take() {
+            if let Err(reason) = job.clear_kill_on_close() {
+                tracing::warn!(
+                    "KILL_ON_JOB_CLOSE を外せない（閉じると残ったものも止まる）: {reason}"
+                );
+            }
+            // job の drop がハンドルを閉じる
+        }
+    }
+}
+
+/// 打ち切り・取り消しの kill を子孫まで届かせる入れ物（#2462。境界 B30 の上の薄い型）。
+///
+/// probe の上限（`probe::wait_with_timeout`）・`tako queue` の取り消し・AI 命名の上限が使う。
+/// 起こした直後に [`KillScope::contain`] で入れ、止めると決めたときだけ [`KillScope::stop`]
+/// （コンソールのプロセスは止め、GUI のアプリとその子孫は残す = ペインを閉じるのと同じ）。
+/// **drop では何も止めない**: 子が普通に終わった後の残り（常駐）は #2462 の前も unix も残るので、
+/// `KILL_ON_JOB_CLOSE` を外してから閉じる。呼び手のプロセスが落ちたときは OS がハンドルを閉じて
+/// 全部止まる（寿命の決まりの最後の行）。
+///
+/// unix・A/B の legacy（`TAKO_2454_LEGACY=1`）・入れられなかった回は空で、`stop` は何もしない
+/// （呼び手は従来どおり直下の子を kill する = 孫は残る）
+pub struct KillScope {
+    /// `stop` と drop が 1 回だけ取り出す
+    job: Option<Job>,
+}
+
+impl KillScope {
+    /// `pid` の子を子孫ごと入れる（[`Job::contain`]。`pid` の扱いの約束も同じ）
+    pub fn contain(pid: u32) -> KillScope {
+        KillScope {
+            job: Job::contain(pid),
+        }
+    }
+
+    /// 何も入れない（入れない子 = 器の CLI・既に終わった子）
+    pub fn empty() -> KillScope {
+        KillScope { job: None }
+    }
+
+    /// 入れられたか（テストと診断用）
+    pub fn is_contained(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// `pid` が入っているか（[`Job::contains`]。テストと診断用）
+    pub fn contains(&self, pid: u32) -> Option<bool> {
+        self.job.as_ref().and_then(|job| job.contains(pid))
+    }
+
+    /// 打ち切る・取り消す: コンソールのプロセスを止め、GUI のアプリとその子孫は残して手放す
+    /// （[`Job::release_keeping_gui`]）。2 回目以降と空の入れ物は何もしない
+    pub fn stop(&mut self) -> Release {
+        self.job
+            .take()
+            .map(Job::release_keeping_gui)
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for KillScope {
+    fn drop(&mut self) {
+        if let Some(job) = self.job.take() {
+            job.detach();
+        }
+    }
+}
+
+/// `root` の子孫（`root` 自身は含まない）を Job の中の pid から選ぶ（純粋関数。macOS からも検査できる）。
+///
+/// `members` の pid の親（`parent`）をたどって `root` に着くものを返す。間でたどってよいのは
+/// `members` と `via`（同じ呼び出しの前の回で止めた = もう列挙に出ない中継ぎ）だけ。`root` は
+/// `members` に居なくてよい（止めた後）。親子の読み違いは子孫の側へ倒さない（[`split_for_release`] と同じ）:
+///
+/// - 親が分からない・Job の外（`root` を除く）ならそこで止まる（= 子孫でない）
+/// - 親の起動時刻（`started`）が子より後なら、その親は pid が再利用された別のプロセスなのでたどらない
+///   （`root` が止まった後に別のプロセスがその pid を取った回も同じ）。時刻が分からなければ親子を信じる
+/// - 親子の読みが輪になってもたどる回数は中の数までで打ち切る
+pub fn descendants_in(
+    members: &[u32],
+    root: u32,
+    via: &HashSet<u32>,
+    parent: impl Fn(u32) -> Option<u32>,
+    started: impl Fn(u32) -> Option<u64>,
+) -> Vec<u32> {
+    let inside: HashSet<u32> = members.iter().chain(via.iter()).copied().collect();
+    let reaches_root = |pid: u32| {
+        let mut current = pid;
+        for _ in 0..=inside.len() {
+            let Some(up) = parent(current).filter(|up| *up != current) else {
+                return false;
+            };
+            if let (Some(up_started), Some(started)) = (started(up), started(current)) {
+                if up_started > started {
+                    return false;
+                }
+            }
+            if up == root {
+                return true;
+            }
+            if !inside.contains(&up) {
+                return false;
+            }
+            current = up;
+        }
+        false
+    };
+    members
+        .iter()
+        .copied()
+        .filter(|pid| *pid != root && reaches_root(*pid))
+        .collect()
 }
 
 impl Drop for Job {
@@ -793,5 +980,119 @@ mod tests {
         assert_eq!(plan.stop, vec![1, 2, 3], "輪になった親子の読み");
         let plan = split_for_release(&members, |_| false, Some, |_| None);
         assert_eq!(plan.stop, vec![1, 2, 3], "自分が親");
+    }
+
+    /// 木を `(pid, 親, 起動時刻)` で書いて `root` の子孫を選ぶ
+    fn descendants(tree: &[(u32, u32, u64)], root: u32, via: &[u32]) -> Vec<u32> {
+        let members: Vec<u32> = tree.iter().map(|t| t.0).collect();
+        let find = |pid: u32| tree.iter().find(|t| t.0 == pid);
+        descendants_in(
+            &members,
+            root,
+            &via.iter().copied().collect(),
+            |pid| find(pid).map(|t| t.1),
+            |pid| find(pid).map(|t| t.2),
+        )
+    }
+
+    /// **#2462 の再起動の規則**: ペインの Job の中から、止めたエージェントの子孫だけを選ぶ
+    /// （シェルとシェルの別の子は選ばない）。GUI を残すのは続く [`split_for_release`] の役目
+    #[test]
+    fn issue2462_エージェントの子孫だけを選びシェルとほかの子は選ばない() {
+        // 1 = シェル / 2 = エージェント / 3 = MCP の cmd.exe / 4 = その node.exe /
+        // 5 = エージェントが起こした GUI / 6 = その子 / 7 = シェルの別の子
+        let tree = [
+            (1, 100, 10),
+            (2, 1, 11),
+            (3, 2, 12),
+            (4, 3, 13),
+            (5, 2, 14),
+            (6, 5, 15),
+            (7, 1, 16),
+        ];
+        assert_eq!(descendants(&tree, 2, &[]), vec![3, 4, 5, 6]);
+        // 続く振り分けで GUI（5）とその子孫（6）は残り、コンソール（3 / 4）は止まる
+        let targets = descendants(&tree, 2, &[]);
+        let plan = split_for_release(
+            &targets,
+            |pid| pid == 5,
+            |pid| tree.iter().find(|t| t.0 == pid).map(|t| t.1),
+            |pid| tree.iter().find(|t| t.0 == pid).map(|t| t.2),
+        );
+        assert_eq!(plan.stop, vec![3, 4]);
+        assert_eq!(plan.keep, vec![5, 6]);
+    }
+
+    /// エージェントを先に止めた後（Job の列挙に居ない）でも、その子孫は親の pid でたどれる
+    #[test]
+    fn issue2462_止めた後のエージェントの子孫もたどれる() {
+        let tree = [(1, 100, 10), (3, 2, 12), (4, 3, 13), (7, 1, 16)];
+        assert_eq!(descendants(&tree, 2, &[]), vec![3, 4]);
+    }
+
+    /// 前の回で止めた中継ぎ（列挙に出ない）を通る子孫も選ぶ。通してよいのは止めたものだけ
+    #[test]
+    fn issue2462_前の回で止めた中継ぎを通る子孫も選ぶ() {
+        // 3 は前の回で止めた（列挙に居ない）。4 はその後に 3 が起こした子
+        let members = [1, 4];
+        let parent = |pid: u32| match pid {
+            1 => Some(100),
+            4 => Some(3),
+            3 => Some(2),
+            _ => None,
+        };
+        let via: HashSet<u32> = [3].into_iter().collect();
+        assert_eq!(descendants_in(&members, 2, &via, parent, |_| None), vec![4]);
+        assert!(
+            descendants_in(&members, 2, &HashSet::new(), parent, |_| None).is_empty(),
+            "止めていない Job の外の中継ぎを通った"
+        );
+    }
+
+    /// 止めたエージェントの pid を後から起きた別のプロセスが取った（起動時刻が子より後）なら、
+    /// その子をエージェントの子孫と読まない
+    #[test]
+    fn issue2462_再利用されたpidを親と読まない() {
+        let tree = [(1, 100, 10), (2, 1, 50), (3, 2, 12)];
+        assert!(
+            descendants(&tree, 2, &[]).is_empty(),
+            "後から起きた 2 を親と読んだ"
+        );
+        // 同じ秒に起きた本当の親子は信じる
+        let tree = [(1, 100, 10), (2, 1, 12), (3, 2, 12)];
+        assert_eq!(descendants(&tree, 2, &[]), vec![3]);
+    }
+
+    /// 子孫が居ない・親が分からない・輪・root 自身は選ばない（ペインのシェルを撃たない）
+    #[test]
+    fn issue2462_子孫が居ない_親が分からない_輪_root自身は選ばない() {
+        assert!(descendants(&[(1, 100, 10), (7, 1, 16)], 2, &[]).is_empty());
+        let members = [1, 2, 3];
+        assert!(descendants_in(&members, 2, &HashSet::new(), |_| None, |_| None).is_empty());
+        let cycle = |pid: u32| Some(if pid == 3 { 1 } else { pid + 1 });
+        assert!(
+            descendants_in(&members, 9, &HashSet::new(), cycle, |_| None).is_empty(),
+            "輪になった親子の読みで止まらない"
+        );
+        assert_eq!(
+            descendants(&[(2, 1, 11), (3, 2, 12)], 2, &[]),
+            vec![3],
+            "root 自身を選んだ"
+        );
+    }
+
+    /// unix・入れられない pid は空の入れ物で、止めても何もしない（直下の子を kill する従来の形）
+    #[test]
+    fn issue2462_空の入れ物は止めても何もしない() {
+        let mut empty = KillScope::empty();
+        assert!(!empty.is_contained());
+        assert_eq!(empty.stop(), Release::default());
+        assert_eq!(empty.stop(), Release::default(), "2 回目");
+        let mut bad = KillScope::contain(0);
+        assert!(!bad.is_contained());
+        assert_eq!(bad.stop(), Release::default());
+        if !SUPPORTED {
+            assert!(!KillScope::contain(std::process::id()).is_contained());
+        }
     }
 }

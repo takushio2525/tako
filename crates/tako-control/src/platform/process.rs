@@ -30,6 +30,26 @@ pub fn terminate(pid: u32, force: bool) -> Result<(), String> {
     imp::terminate(pid, force)
 }
 
+/// [`terminate`] で終了を要求し、`job`（`pid` が居るペインの子孫の入れ物 = `TerminalSession::descendant_job`）
+/// の中に残った `pid` の子孫も止める（#2462。境界 B30 の `Job::stop_descendants_of`）。
+///
+/// Windows の `TerminateProcess` は子孫を道連れにせず、unix の SIGTERM と違って相手に後始末の
+/// 機会も無い。エージェントの再起動（session-restart の harness）で古いエージェントが起こした
+/// MCP サーバ・背景のシェルが、ペインを閉じるまで残っていた。子孫の寿命はペインを閉じるのと同じ
+/// （コンソールのプロセスは止め、GUI のアプリとその子孫は残す）で、ペインのシェルとその別の子は撃たない。
+///
+/// 終了要求が失敗したら子孫には触れずに `Err`（呼び手は何も壊さずに断る）。unix・器のペイン・
+/// A/B の `TAKO_2454_LEGACY=1`（`job` が無い）は [`terminate`] だけ（unix は SIGTERM を受けた相手が
+/// 自分の子を畳む）。返り値は止めた / 残した子孫の数
+pub fn terminate_with_descendants(
+    pid: u32,
+    force: bool,
+    job: Option<&tako_core::platform::job::Job>,
+) -> Result<tako_core::platform::job::Release, String> {
+    terminate(pid, force)?;
+    Ok(job.map_or_else(Default::default, |job| job.stop_descendants_of(pid)))
+}
+
 /// 穏当な終了要求（`terminate(pid, false)`）が強制終了と**別物**か（#1599）。
 ///
 /// unix は SIGTERM（相手が後始末できる）と SIGKILL が別物 = `true`。

@@ -1408,7 +1408,7 @@ MCP / CLI から受け、UI 層がレイアウト矩形に変換して描画す�
 | IPC | Unix domain socket | Named pipe |
 | プロセスツリー / listen ポート | libproc | Toolhelp32 / GetExtendedTcpTable |
 | プロセスの停止（B5 の制御側 `platform::process::terminate`） | SIGTERM / SIGKILL | `TerminateProcess`（穏当な終了要求は無い = `force` に関わらず強制。#1599） |
-| 子孫の回収（B30 `platform::job`。ペインを閉じる・言語サーバを止める） | 何もしない（PTY の HUP / stdin の EOF と kill） | Job Object（`KILL_ON_JOB_CLOSE`。#2454） |
+| 子孫の回収（B30 `platform::job`。ペインを閉じる・言語サーバを止める・打ち切り / 取り消し / 再起動） | 何もしない（PTY の HUP / stdin の EOF と kill / プロセスグループ・木への SIGTERM） | Job Object（`KILL_ON_JOB_CLOSE`。#2454 / #2462） |
 | シェル統合 | zsh / bash / fish | PowerShell |
 
 trait で抽象化し、core/ と control/ は platform/ の trait のみに依存する。
@@ -1428,6 +1428,9 @@ Job を 1 つ作り、起こした直後に入れる（以後その子が起こ�
   | ペインを閉じる（`TerminalSession` の drop → `Job::close_for_pane`） | 止める | **残す** |
   | tako を普通に終了する（`on_app_quit` → `terminal::release_descendants_on_quit`。閉じるのと同じ） | 止める | **残す** |
   | 言語サーバを止める（`ServerProcess::kill` = `tako lsp stop` / GUI の終了 / drop） | 止める | 止める |
+  | 打ち切り・取り消し（probe の上限・`tako queue` の取り消し・AI 命名の上限 = `KillScope::stop`。#2462） | 止める | **残す** |
+  | 上の子が普通に終わる（`KillScope` の drop。#2462） | **残す** | **残す** |
+  | エージェントの再起動（session-restart の harness = `Job::stop_descendants_of`。#2462） | そのエージェントの子孫だけ止める | **残す** |
   | tako が落ちる（OS がハンドルを閉じる = `KILL_ON_JOB_CLOSE`。隔離インスタンスの終了も同じ） | 止める | 止める |
 
   ペインから起こした GUI アプリ（`code .` の初回・`notepad` など）をペインと一緒に消さない（Windows Terminal も
@@ -1456,6 +1459,20 @@ Job を 1 つ作り、起こした直後に入れる（以後その子が起こ�
   器の実行ファイルか。名前は `backend::is_plumbing_process` の正本）。`wrap_options` / `reattach_options` /
   `PsmuxBackend::wrap_spawn` の出力が器と判定されることを単体テストで固定している
 - **入れられないとき**（作成・割り当ての失敗）は `None` で従来の止め方（直下の子だけ）へ落ちる。panic しない
+- **打ち切り・取り消しの子（#2462）**: probe の待ちの 1 実装（`probe::wait_with_timeout` = `output_with_timeout` /
+  `command_output_with_timeout` / `claude agents --json` の走査 / `tako setup` の子が通る）・`tako queue` の子
+  （`queue_wrapper`）・AI 命名の `claude -p`（`autorename::spawn_claude`）は、起こした直後に `KillScope` へ入れ、
+  止めると決めたときだけ `stop`（ペインを閉じるのと同じ振り分け）。**drop では止めない**（`KILL_ON_JOB_CLOSE` を
+  外してから閉じる = 普通に終わった子が残した常駐は #2462 の前と unix と同じく残る）。probe は器の CLI
+  （実行ファイル名が `backend::is_plumbing_process`。1 回の問い合わせが器のサーバーを起こすことがある）と
+  入れる前に終わった子を入れない（`probe::kill_scope`）
+- **エージェントの再起動（#2462）**: ペインの Job はシェルごと入っているので Job ごとは止められない。
+  `tako_control::platform::process::terminate_with_descendants` が終了要求の後、ペインの Job の中の pid を
+  列挙して親を Job の中でたどり（純関数 `descendants_in`。止めた後のエージェントも親の pid でたどれる・
+  起動時刻が子より後の親は pid の再利用とみなす）、そのエージェントの子孫だけを `split_for_release` の振り分けで
+  止める（シェルとシェルの別の子は撃たない）。器のペインは Job が無いので従来どおり（エージェントだけ）
+- `agents.rs` 自身の kill は libproc の無い unix の `ps` の落ち先とテストだけ（Windows は Toolhelp32 で引くので
+  子を起こさない）。`claude agents --json` の走査は probe の待ちを通るので上の打ち切りで回収される
 
 A/B は `TAKO_2454_LEGACY=1`（Job を作らない）と `TAKO_2454_KILL_GUI=1`（ペインを閉じるときも GUI ごと全部止める）、
 注入は `TAKO_2454_INJECT=assign_fail`（テストプロセスだけ）。実プロセスのテストは
@@ -1463,7 +1480,10 @@ A/B は `TAKO_2454_LEGACY=1`（Job を作らない）と `TAKO_2454_KILL_GUI=1`�
 `crates/tako-control/tests/issue2454_pane_gui_windows.rs`（同じペインの GUI の孫は残りコンソールの孫は止まる。
 GUI 役はテスト専用の `tako-gui-sleeper`。普通の終了の経路 = 関数を呼んでから drop せずに終わる子と、
 呼ばずに終わる子 = 落ちたときも同じファイル）・`crates/tako-control/tests/issue2454_lsp_job_windows.rs`
-（`.cmd` → cmd.exe → 偽サーバ）。
+（`.cmd` → cmd.exe → 偽サーバ）。#2462 は `crates/tako-core/tests/issue2462_probe_job_windows.rs`（probe の打ち切りの
+孫・普通に終わった子の常駐は残る・割り当ての失敗）・`crates/tako-control/tests/issue2462_kill_paths_windows.rs`
+（`tako queue` の取り消しの孫・再起動でエージェントの孫は止まりシェルは残る・先に死んだエージェント）・
+tako-app の `autorename::tests::issue2462`（`.cmd` の偽 claude の孫）。どれも `TAKO_2454_LEGACY=1` の旧アームで孫が残る。
 
 **縮退の宣言は system prompt へも流れる**（#516。正本は `tako-core::platform::support`）。
 ただし prompt へ載せるのは「この環境は何か」と「縮退が N 件あること・その引き方」だけで、

@@ -202,10 +202,12 @@ pub mod notes {
     /// #766 / #525。側路（`TAKO_OSC_SINK`）で届くが、能力申告は素通し不可のまま
     /// #1067。ハーネス更新は旧プロセスへの終了要求（境界 B5 の制御側）が要る。
     /// Windows の腕は #1599 で入った（`OpenProcess` + `TerminateProcess`）。Windows には
-    /// 穏当な終了要求が無いので強制終了になり、通しは実機で未実測
+    /// 穏当な終了要求が無いので強制終了になり、通しは実機で未実測。#2462 で古い CLI の子孫
+    /// （MCP サーバ・背景のシェル）はペインの Job（#2454）の中で止めるようになったが、器（psmux）の
+    /// ペインは Job が無いので CLI だけが止まる
     pub const WIN_SESSION_RESTART_TERMINATE: Note = Note::new(
-        "引き継ぎ再起動は使える。ハーネス更新（会話を保ったまま CLI を建て直す）の終了要求は #1599 で Windows にも入ったが、Windows には穏当な終了要求が無いので CLI は後始末の機会なく強制終了（TerminateProcess）される。終了 → シェルの復帰 → --resume の送達の通しは Windows 実機で未実測（#1067 / #1599）",
-        "Restarting with a handoff works. Process termination for the harness update (rebuilding the CLI while keeping the conversation) now exists on Windows (#1599), but Windows has no graceful termination request, so the CLI is force-terminated (TerminateProcess) without a chance to clean up. The full run (terminate, shell returns, --resume delivered) has not been measured on real Windows hardware (#1067 / #1599)",
+        "引き継ぎ再起動は使える。ハーネス更新（会話を保ったまま CLI を建て直す）の終了要求は #1599 で Windows にも入ったが、Windows には穏当な終了要求が無いので CLI は後始末の機会なく強制終了（TerminateProcess）される。古い CLI が起こした子（MCP サーバ・背景のシェル）は tako がペインの中で止める（#2462。GUI のアプリは残す）が、器（psmux）のペインでは CLI だけが止まり子はペインを閉じるまで残る。終了 → シェルの復帰 → --resume の送達の通しは Windows 実機で未実測（#1067 / #1599）",
+        "Restarting with a handoff works. Process termination for the harness update (rebuilding the CLI while keeping the conversation) now exists on Windows (#1599), but Windows has no graceful termination request, so the CLI is force-terminated (TerminateProcess) without a chance to clean up. tako stops the processes the old CLI started (MCP servers, background shells) inside the pane (#2462; GUI apps are kept), but in a psmux container pane only the CLI is stopped and its children stay until the pane is closed. The full run (terminate, shell returns, --resume delivered) has not been measured on real Windows hardware (#1067 / #1599)",
     );
     /// #2432 で `$PROFILE` への配置をやめ、ペインの PowerShell の起動引数で読ませる形にした
     pub const WIN_SHELL_INTEGRATION: Note = Note::new(
@@ -1619,7 +1621,7 @@ pub const MATRIX: &[Feature] = &[
             note: notes::WIN_SESSION_RESTART_TERMINATE,
         },
         windows_evidence: Evidence::UnitTest(
-            "#1599: 境界 tako_control::platform::process::terminate の Windows の腕（OpenProcess + TerminateProcess）が、自分で起こした子を実際に止める（子の終了コードが TerminateProcess に渡した値になる）ことを CI の Windows ジョブの実プロセステスト（platform::process::tests を名指しで回す段）で確認。dispatch の harness は OS 分岐なしでこの境界を呼ぶ。終了 → シェルの復帰 → --resume の送達の通しは未実測。handoff は queue_prompt_flow だけを使うので影響を受けない",
+            "#1599: 境界 tako_control::platform::process::terminate の Windows の腕（OpenProcess + TerminateProcess）が、自分で起こした子を実際に止める（子の終了コードが TerminateProcess に渡した値になる）ことを CI の Windows ジョブの実プロセステスト（platform::process::tests を名指しで回す段）で確認。dispatch の harness は OS 分岐なしでこの境界を呼ぶ。#2462: 同じ口（terminate_with_descendants）がペインの Job の中のエージェントの孫を止めペインのシェルは残すことを CI の Windows ジョブの実プロセステスト（issue2462_kill_paths_windows。旧アームでは孫が残る）で確認。終了 → シェルの復帰 → --resume の送達の通しは未実測。handoff は queue_prompt_flow だけを使うので影響を受けない",
         ),
     },
     Feature {
