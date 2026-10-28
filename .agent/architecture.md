@@ -1408,9 +1408,62 @@ MCP / CLI から受け、UI 層がレイアウト矩形に変換して描画す�
 | IPC | Unix domain socket | Named pipe |
 | プロセスツリー / listen ポート | libproc | Toolhelp32 / GetExtendedTcpTable |
 | プロセスの停止（B5 の制御側 `platform::process::terminate`） | SIGTERM / SIGKILL | `TerminateProcess`（穏当な終了要求は無い = `force` に関わらず強制。#1599） |
+| 子孫の回収（B30 `platform::job`。ペインを閉じる・言語サーバを止める） | 何もしない（PTY の HUP / stdin の EOF と kill） | Job Object（`KILL_ON_JOB_CLOSE`。#2454） |
 | シェル統合 | zsh / bash / fish | PowerShell |
 
 trait で抽象化し、core/ と control/ は platform/ の trait のみに依存する。
+
+### 子孫の回収（境界 B30。#2454）
+
+Windows の `TerminateProcess` は子孫を道連れにしない。ConPTY を閉じれば疑似コンソールに繋がった子は
+止まるが、`CREATE_NO_WINDOW` で起きた子（stdio をパイプにした MCP サーバなど）はコンソールに
+繋がっていないので残り、npm の `.cmd` の言語サーバは `Child::kill` で cmd.exe だけが止まって node.exe が
+残った（FR-2.33.9 の「1 日 46 本」）。いまは子 1 つ（ペインの PTY 直下の子 / 言語サーバ 1 つ）ごとに
+Job を 1 つ作り、起こした直後に入れる（以後その子が起こすものは Job を受け継ぐ）。
+
+- **寿命の決まり**（正本は `platform::job` の冒頭の表）:
+
+  | いつ | コンソールのプロセス | GUI のアプリとその子孫 |
+  |---|---|---|
+  | ペインを閉じる（`TerminalSession` の drop → `Job::close_for_pane`） | 止める | **残す** |
+  | tako を普通に終了する（`on_app_quit` → `terminal::release_descendants_on_quit`。閉じるのと同じ） | 止める | **残す** |
+  | 言語サーバを止める（`ServerProcess::kill` = `tako lsp stop` / GUI の終了 / drop） | 止める | 止める |
+  | tako が落ちる（OS がハンドルを閉じる = `KILL_ON_JOB_CLOSE`。隔離インスタンスの終了も同じ） | 止める | 止める |
+
+  ペインから起こした GUI アプリ（`code .` の初回・`notepad` など）をペインと一緒に消さない（Windows Terminal も
+  macOS の `open` も残す）。ペインを閉じるときは Job の中の pid を列挙し（`JobObjectBasicProcessIdList`）、
+  実行ファイルの PE ヘッダのサブシステムが GUI のもの（`pe_subsystem`）と、親を **Job の中で**たどって
+  GUI に当たるもの（VS Code の統合ターミナルのシェル・言語サーバはコンソールだが VS Code の子孫）を残し
+  （コンソールのホスト `conhost.exe` / `OpenConsole.exe` は GUI と数えない = `is_console_host`）、
+  残りを 1 本ずつ止める（撃つ前に開いたハンドルで `IsProcessInJob` を確かめる = 列挙の後の pid の再利用を
+  撃たない）。親の起動時刻が子より後ならその親は pid の再利用とみなしてたどらない。振り分けは純関数
+  `split_for_release` の 1 実装。GUI が居なければ Job ごと止める。最後に `KILL_ON_JOB_CLOSE` を外してから
+  ハンドルを閉じる（外さないと閉じた瞬間に残したものも止まる）。列挙できないときは全部止める
+- **tako の普通の終了**は端末を drop しない（`on_app_quit` の後は OS がハンドルを閉じる）ので、
+  `on_app_quit` が全ペインの Job を `release_descendants_on_quit` で手放す（ペインログの書き出し・構成の保存の後。
+  `if !this.quitting` の外 = 最後のタブを閉じた後の終了も同じ）。呼ばないと `KILL_ON_JOB_CLOSE` で GUI の
+  アプリまで止まる（= 落ちたときの扱い）。呼び出しの位置は tako-app の番犬
+  `issue2454_アプリ終了処理はペインの子孫を閉じたのと同じ扱いで手放す` が固定する
+- **`JOB_OBJECT_LIMIT_BREAKAWAY_OK` を付ける**: `CREATE_BREAKAWAY_FROM_JOB` で明示的に外へ出る子（親の
+  寿命から切り離すと宣言した常駐 = unix の `setsid` に当たる）は出られる。付けないとその子の
+  `CreateProcess` が ERROR_ACCESS_DENIED で失敗する。`SILENT_BREAKAWAY_OK` は付けない（回収にならない）
+- **起動直後の窓**: `PROC_THREAD_ATTRIBUTE_JOB_LIST` は渡せない（ConPTY は alacritty_terminal が属性
+  リストを中で 1 枠だけ作って `CreateProcessW` を呼ぶ・std の `CommandExt::raw_attribute` は 1.95 で
+  unstable）ので、起こした直後に `AssignProcessToJobObject` する。窓はシェル / cmd.exe が子を起こすまでの
+  時間より十分短く、Windows CI の実プロセスのテストは孫が Job に入っていることを確かめてから閉じる
+- **器（psmux）のクライアントは入れない**: 器のサーバーはクライアントの子として起きる（`new-session -A`）
+  ので、入れると GUI の終了で器ごと消える。判定は `tmux_backend::is_container_client`（PTY 直下に起こすのが
+  器の実行ファイルか。名前は `backend::is_plumbing_process` の正本）。`wrap_options` / `reattach_options` /
+  `PsmuxBackend::wrap_spawn` の出力が器と判定されることを単体テストで固定している
+- **入れられないとき**（作成・割り当ての失敗）は `None` で従来の止め方（直下の子だけ）へ落ちる。panic しない
+
+A/B は `TAKO_2454_LEGACY=1`（Job を作らない）と `TAKO_2454_KILL_GUI=1`（ペインを閉じるときも GUI ごと全部止める）、
+注入は `TAKO_2454_INJECT=assign_fail`（テストプロセスだけ）。実プロセスのテストは
+`crates/tako-core/tests/issue2454_pane_job_windows.rs`（ペインのコンソールの孫）・
+`crates/tako-control/tests/issue2454_pane_gui_windows.rs`（同じペインの GUI の孫は残りコンソールの孫は止まる。
+GUI 役はテスト専用の `tako-gui-sleeper`。普通の終了の経路 = 関数を呼んでから drop せずに終わる子と、
+呼ばずに終わる子 = 落ちたときも同じファイル）・`crates/tako-control/tests/issue2454_lsp_job_windows.rs`
+（`.cmd` → cmd.exe → 偽サーバ）。
 
 **縮退の宣言は system prompt へも流れる**（#516。正本は `tako-core::platform::support`）。
 ただし prompt へ載せるのは「この環境は何か」と「縮退が N 件あること・その引き方」だけで、

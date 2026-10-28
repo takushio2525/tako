@@ -53,6 +53,10 @@ const NOT_PRODUCT: &[(&str, &str)] = &[
         "crates/tako-control/src/bin/tako-lsp-fake.rs",
         "テスト専用の偽 LSP サーバ（#1678）。配布物に入らず、tako-core を使わない",
     ),
+    (
+        "crates/tako-control/src/bin/tako-gui-sleeper.rs",
+        "テスト専用の GUI サブシステムの実行ファイル（#2454。眠るだけ）。配布物に入らず、tako-core を使わない",
+    ),
 ];
 
 /// `crates/*` の実行ファイルの入口を集める（`src/main.rs` / `src/bin/` / `examples/` /

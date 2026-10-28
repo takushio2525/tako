@@ -11,7 +11,8 @@
 //!
 //! プロセスは [`Drop`] で必ず kill + 刈り取りする。GUI が kill -9 で落ちたときは
 //! stdin が閉じる（EOF）ので、サーバは自分で終わる（LSP サーバの通常の振る舞い。
-//! 受け入れ条件の「孤児を残さない」は偽サーバで実測する）。
+//! 受け入れ条件の「孤児を残さない」は偽サーバで実測する）。Windows は子孫ごと Job に入れるので、
+//! kill も GUI の落ちも cmd.exe 経由の孫まで止める（#2454。`tako_core::platform::job`）。
 //!
 //! **診断ログに本文を書かない**（AGENTS.md の絶対ルール。LSP の I/O はソースコードを含む）。
 //! perf.log へは要求の method 名・所要・結果の種別だけ。生の JSON-RPC は
@@ -89,6 +90,9 @@ pub struct ServerProcess {
     label: String,
     pid: u32,
     child: Mutex<Option<Child>>,
+    /// 子とその子孫を入れた Job（#2454）。[`Self::kill`] が中身を全部止める。
+    /// unix・A/B の legacy・作れなかった回は None（直下の子だけを kill する = 従来どおり）
+    job: Option<tako_core::platform::job::Job>,
     outbox: SyncSender<Vec<u8>>,
     pending: Arc<Mutex<PendingTable<Waiter>>>,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
@@ -125,6 +129,10 @@ impl ServerProcess {
             .stderr(Stdio::piped());
         let mut child = command.spawn()?;
         let pid = child.id();
+        // #2454: 起こした直後に子孫ごと Job へ入れる（Windows だけ。境界 B30）。npm の `.cmd` は
+        // cmd.exe 経由で起き、`Child::kill` だけでは cmd.exe しか止まらず node.exe が残る。
+        // pid は `child` がハンドルを持つ間は再利用されない。入れられなければ None（従来の kill）
+        let job = tako_core::platform::job::Job::contain(pid);
         let stdin = child.stdin.take().expect("stdin はパイプ");
         let stdout = child.stdout.take().expect("stdout はパイプ");
         let stderr = child.stderr.take().expect("stderr はパイプ");
@@ -146,6 +154,7 @@ impl ServerProcess {
             label: label.to_string(),
             pid,
             child: Mutex::new(Some(child)),
+            job,
             outbox: outbox.clone(),
             pending: Arc::new(Mutex::new(PendingTable::default())),
             stderr_tail: Arc::new(Mutex::new(VecDeque::new())),
@@ -414,8 +423,16 @@ impl ServerProcess {
         }
     }
 
-    /// kill して刈り取る（冪等）
+    /// kill して刈り取る（冪等）。
+    ///
+    /// 子孫（cmd.exe 経由の node.exe・サーバが起こした子）は Job ごと先に止める（#2454）。
+    /// 直下の子が自分で終わった後（`exit` を受けた正常終了）に呼んでも、残った子孫を止める
     pub fn kill(&self) {
+        if let Some(job) = &self.job {
+            if let Err(reason) = job.terminate() {
+                tracing::warn!("LSP の子孫を止められない（直下の子だけを止める）: {reason}");
+            }
+        }
         if let Ok(mut guard) = self.child.lock() {
             if let Some(mut child) = guard.take() {
                 let _ = child.kill();

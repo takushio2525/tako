@@ -545,6 +545,14 @@ jobs:
       # remote の停止の芯と admin API の shutdown を、全数より手前に名指しで置く（#1282 と同じ理由）
       - name: プロセスの停止の実行検査（#1599。TerminateProcess と remote の停止）
         run: cargo test -p tako-control --lib -- platform::process::tests remote::tests::停止の芯 remote::tests::daemon_stop_impl remote::tests::kill_stale_daemon remote::tests::admin_apiのshutdown
+      # #2454: 子孫の回収（Job Object）も **macOS では 1 行も実行できない** FFI。ペインを閉じたとき・
+      # 言語サーバを止めたときに孫まで止まるか（A/B の旧アームでは残るか）・ペインを閉じても
+      # GUI の孫は残るかを、全数より手前に名指しで置く（#1282 と同じ理由）。
+      # --nocapture は孫の pid と結果の行（TAKO2454_*）をログへ残すため
+      - name: 子孫の回収の実行検査（#2454。ペインの孫）
+        run: cargo test -p tako-core --test issue2454_pane_job_windows -- --nocapture
+      - name: 子孫の回収の実行検査（#2454。言語サーバの孫・ペインの GUI の孫は残る）
+        run: cargo test -p tako-control --test issue2454_lsp_job_windows --test issue2454_pane_gui_windows -- --nocapture
       # **ワークスペース全体のテストを blocking にする**（#1278 / #583）。
       # #583 は「POSIX 前提の既存失敗が残っているあいだ非ブロッキング」で据え置いていたが、
       # そのあいだに未検出が溜まり、実機で 19 → 24 件まで増えていた（#1278）。

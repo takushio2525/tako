@@ -1190,6 +1190,20 @@ mod tests {
         }
     }
 
+    /// **#2454 の器の約束**: psmux の器を起こす組み立ては器のクライアントと判定される =
+    /// ペインの子孫を入れる Job に入れない（入れると psmux のサーバーが Job を受け継ぎ、
+    /// ペインを閉じたとき・GUI を終えたときに器ごと消える）
+    #[test]
+    fn issue2454_psmuxの器を起こす組み立てはjobに入れない側と判定される() {
+        let b = backend();
+        let wrapped = b.wrap_spawn(SpawnOptions::default(), &session("tako-0123456789ab"));
+        assert!(
+            crate::tmux_backend::is_container_client(wrapped.command.as_ref()),
+            "psmux の器のクライアントを Job に入れる側と読んだ（器ごと消える）: {:?}",
+            wrapped.command
+        );
+    }
+
     #[test]
     fn wrap_spawn_argv_スナップショット() {
         let b = backend();

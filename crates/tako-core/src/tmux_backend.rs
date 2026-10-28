@@ -655,6 +655,30 @@ pub fn reattach_options(options: SpawnOptions, socket: &str, session: &str) -> S
     }
 }
 
+/// PTY 直下に起こすものが器（tmux / psmux）のクライアントか（#2454）。
+///
+/// [`wrap_options`] / [`reattach_options`] は、どちらも器の実行ファイル（[`crate::tmux::tmux_bin`]）を
+/// PTY 直下に起こす。器のサーバーは `new-session -A` が無ければそのクライアントの子として起こすので、
+/// ペインの子孫をまとめて止める入れ物（`platform::job`）に入れると、ペインを閉じたとき・
+/// GUI を終えたときに器ごと消える（再起動をまたいで残す約束が壊れる）。判断は
+/// [`is_container_client_with`] の 1 実装
+pub fn is_container_client(command: Option<&SpawnCommand>) -> bool {
+    command.is_some_and(|c| is_container_client_with(&c.program, crate::tmux::tmux_bin()))
+}
+
+/// [`is_container_client`] の判断部（純粋関数。macOS から Windows の形も検査できる）。
+///
+/// 解決済みの器の実行ファイルと同じか、名前（`/` と `\` の後ろ）が器の実行ファイル名
+/// （[`crate::backend::is_plumbing_process`] = psmux が配る 3 本と tmux）なら器のクライアント。
+/// 迷う形は器の側へ倒す（入れ損ねても回収が従来どおりに戻るだけだが、器を入れると利用者の器が消える）
+pub fn is_container_client_with(program: &str, tmux_bin: &str) -> bool {
+    if program == tmux_bin {
+        return true;
+    }
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    crate::backend::is_plumbing_process(name)
+}
+
 /// 器の中のペインについて、器だけが知っている材料（#1199 で pid を足した）
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PaneFacts {
@@ -2604,6 +2628,82 @@ set -gq copy-mode-position-format ''
         // 内側コマンドは渡さない（attach 先のセッションが持っている）
         assert_eq!(args.last(), Some(&crate::tmux::exact_target("tako-abc123")));
         assert_eq!(wrapped.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
+    }
+
+    /// **#2454 の器の約束**: 器を起こす / 繋ぐ組み立て（新規・復元の `new-session -A` と
+    /// 再 attach の `attach-session`）は、どちらも器のクライアントと判定される =
+    /// `TerminalSession::spawn_in` がペインの子孫を入れる Job に入れない。
+    /// 入れると器のサーバー（クライアントの子として起きる）が Job を受け継ぎ、ペインを閉じたとき・
+    /// GUI を終えたときに器ごと消える。素のシェル・明示コマンドのペインは入れる側
+    #[test]
+    fn issue2454_器を起こす組み立てはjobに入れない側と判定される() {
+        let base = SpawnOptions {
+            command: Some(SpawnCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "claude".into()],
+            }),
+            cwd: Some("/tmp".into()),
+            env: vec![("TAKO_PANE_ID".into(), "3".into())],
+            scrollback_lines: None,
+        };
+        assert!(
+            !is_container_client(base.command.as_ref()),
+            "器でない明示コマンドを器と読んだ（子孫が回収されない）"
+        );
+        assert!(
+            !is_container_client(None),
+            "既定シェルのペインを器と読んだ（子孫が回収されない）"
+        );
+        let wrapped = wrap_options(base.clone(), "tako-test", "tako-2454a");
+        assert!(
+            is_container_client(wrapped.command.as_ref()),
+            "器の新規・復元のクライアントを Job に入れる側と読んだ（器ごと消える）: {:?}",
+            wrapped.command
+        );
+        let reattach = reattach_options(base, "tako-test", "tako-2454a");
+        assert!(
+            is_container_client(reattach.command.as_ref()),
+            "器の再 attach のクライアントを Job に入れる側と読んだ（器ごと消える）: {:?}",
+            reattach.command
+        );
+    }
+
+    /// [`is_container_client_with`] の形（Windows の psmux の置き場も macOS から検査する）
+    #[test]
+    fn issue2454_器の実行ファイルは名前と解決済みのパスで見分ける() {
+        const PSMUX: &str = r"C:\Users\winuser\AppData\Local\psmux\tmux.exe";
+        // 解決済みの器の実行ファイルそのもの
+        assert!(is_container_client_with(PSMUX, PSMUX));
+        assert!(is_container_client_with("tmux", "tmux"));
+        // 名前で見分ける（大小・拡張子・区切りの違い）
+        for program in [
+            "/opt/homebrew/bin/tmux",
+            r"C:\Tools\PSMUX.EXE",
+            r"C:\Tools\psmux.exe",
+            r"C:\Tools\pmux.exe",
+            "psmux",
+            "TMUX.exe",
+        ] {
+            assert!(
+                is_container_client_with(program, PSMUX),
+                "{program} を器でないと読んだ"
+            );
+        }
+        // 器でないもの（名前に tmux を含むだけのもの・シェル・agent）
+        for program in [
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "pwsh",
+            r"C:\Windows\System32\cmd.exe",
+            "/bin/zsh",
+            "claude",
+            r"C:\Tools\tmux-helper.exe",
+            "/usr/local/bin/tmuxinator",
+        ] {
+            assert!(
+                !is_container_client_with(program, PSMUX),
+                "{program} を器と読んだ（子孫が回収されない）"
+            );
+        }
     }
 
     /// #1857: attach クライアント**だけ**を外から SIGTERM しても、セッションと中のシェルは
