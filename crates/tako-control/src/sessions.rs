@@ -991,10 +991,78 @@ pub fn show_payload(id_prefix: &str) -> Result<Value, String> {
 /// **系統ごとの書式は `tako_core::agent_resume::resume_spec` が正本**（#1238）。
 /// claude だけが `--model` / `--effort` を載せられる（`codex resume` は受け取らず、
 /// agy は会話に記録された設定を上書きしないため足さない）。
-/// 会話が既定以外の config ディレクトリにあれば `CLAUDE_CONFIG_DIR` を前置する（Issue #652）
-pub fn resume_command(id: &str, entry: &SessionEntry) -> Result<String, String> {
+/// 会話が既定以外の config ディレクトリにあれば `CLAUDE_CONFIG_DIR` を前置する（Issue #652）。
+///
+/// `mcp_args` は worker の MCP の断片（[`resume_worker_mcp`] + [`resume_mcp_args`] = spawn と
+/// 同じ組み立て。#2447）。worker 以外は空
+pub fn resume_command(id: &str, entry: &SessionEntry, mcp_args: &str) -> Result<String, String> {
     let agent = agent_of(entry);
-    resume_command_with_env(id, entry, conversation_env(agent, id).as_deref())
+    resume_command_with_env(id, entry, conversation_env(agent, id).as_deref(), mcp_args)
+}
+
+/// 再開（resume）で起こす worker の MCP を決める（#2447。I/O あり = プロジェクトの設定・user scope・
+/// 会話の所在を読む）。**spawn と同じ [`crate::worker_mcp::prepare`] を通す**ので、再起動をまたいで
+/// 戻った worker も spawn と同じ MCP だけを持つ（#2412 / #2418 の対策が再起動で外れない）。
+///
+/// 読む設定の置き場は**会話の記録がある場所**（claude = 会話の config dir・codex = rollout を探した
+/// `CODEX_HOME`）。resume が実際に開くのもそこなので、spawn のプロファイルとずれても今の会話に合う。
+/// `None` = worker でない（master / solo / 役割の無いペイン）・worker になれない系統・`TAKO_2447_LEGACY=1`
+pub fn resume_worker_mcp(
+    agent: Agent,
+    id: &str,
+    entry: &SessionEntry,
+) -> Option<(
+    crate::orchestrator::agent::WorkerAgent,
+    crate::worker_mcp::WorkerMcp,
+)> {
+    if entry.kind != "worker" || crate::worker_mcp::legacy_resume() {
+        return None;
+    }
+    let worker = crate::orchestrator::agent::WorkerAgent::try_from(agent).ok()?;
+    let mut env = crate::orchestrator::EnvPlan::default();
+    match agent {
+        Agent::Claude => {
+            if let Some(location) = crate::transcript::locate_transcript(id) {
+                if !location.is_default {
+                    env.exports.push((
+                        crate::orchestrator::CLAUDE_CONFIG_DIR_ENV.to_string(),
+                        location.config_dir.display().to_string(),
+                    ));
+                }
+            }
+        }
+        Agent::Codex => {
+            if let Some(home) = crate::codex_session::codex_home() {
+                env.exports
+                    .push(("CODEX_HOME".to_string(), home.display().to_string()));
+            }
+        }
+        Agent::Agy | Agent::Local => {}
+    }
+    let mcp = crate::worker_mcp::prepare_for_resume(
+        worker,
+        entry.project.as_deref(),
+        entry.cwd.as_deref(),
+        &env,
+        &[],
+    );
+    Some((worker, mcp))
+}
+
+/// 再開のコマンドへ足す MCP の断片（spawn と同じ [`crate::orchestrator::agent::worker_mcp_args`]）
+pub fn resume_mcp_args(
+    agent: crate::orchestrator::agent::WorkerAgent,
+    mcp: &crate::worker_mcp::WorkerMcp,
+    tako_bin: &str,
+    dialect: crate::launch_cmd::ShellDialect,
+) -> String {
+    crate::orchestrator::agent::worker_mcp_args(
+        agent,
+        Some(tako_bin),
+        mcp.settings_file.as_deref(),
+        &mcp.codex_off,
+        dialect,
+    )
 }
 
 /// カタログの記録が指す系統（未記録は claude = 既定）
@@ -1022,11 +1090,12 @@ fn conversation_env(agent: Agent, id: &str) -> Option<String> {
         .then(String::new)
 }
 
-/// `resume_command` の本体（env プレフィクスを引数で受け取るテスト可能版）
+/// `resume_command` の本体（env プレフィクスと MCP の断片を引数で受け取るテスト可能版）
 fn resume_command_with_env(
     id: &str,
     entry: &SessionEntry,
     env_prefix: Option<&str>,
+    mcp_args: &str,
 ) -> Result<String, String> {
     let agent = agent_of(entry);
     let spec = tako_core::agent_resume::resume_spec(agent).ok_or_else(|| {
@@ -1084,6 +1153,9 @@ fn resume_command_with_env(
         cmd.push(' ');
         cmd.push_str(head);
     }
+    // worker の MCP の断片（#2447。spawn と同じ `worker_mcp_args` が組んだもの）。
+    // codex は `resume` の後（`codex resume -c …` = 0.154.0 の --help）・claude は `--resume` の前
+    cmd.push_str(mcp_args);
     if let Some(flag) = spec.id_flag {
         cmd.push(' ');
         cmd.push_str(flag);
@@ -1170,6 +1242,10 @@ pub struct RestoreInput<'a> {
     pub pane: Option<u64>,
     /// 判定する OS（**引数で受ける**ので macOS 上から Windows 側を検証できる）
     pub platform: Platform,
+    /// 復元する会話が worker のとき、起動コマンドへ足す MCP の断片（#2447）。
+    /// 決めるのは実環境版の [`restore_plan`]（spawn と同じ判断 = [`resume_worker_mcp`]）で、
+    /// ここは差し込むだけ。`None` は何も足さない
+    pub worker_mcp_args: Option<&'a str>,
 }
 
 /// 復元時の 1 ペインの判断（材料を引数で受け取る純粋版）。
@@ -1203,7 +1279,12 @@ pub fn restore_plan_in(input: RestoreInput<'_>) -> RestorePlan {
     // エージェントは master / worker として認識されない**（オーケストレーターからも
     // MCP からも見えない）ので、ここは最小形へ落とさずに済ませたい
     if let Some(entry) = launch_record(&input, id, resume.agent) {
-        if let Ok(command) = resume_command_with_env(id, &entry, Some(env_prefix)) {
+        // MCP の断片は worker だけ（master / solo は spawn でも絞らない = #2412 の対象外）
+        let mcp_args = match entry.kind.as_str() {
+            "worker" => input.worker_mcp_args.unwrap_or(""),
+            _ => "",
+        };
+        if let Ok(command) = resume_command_with_env(id, &entry, Some(env_prefix), mcp_args) {
             let with_role = matches!(entry.kind.as_str(), "master" | "worker" | "solo");
             return RestorePlan::Resume {
                 agent: resume.agent,
@@ -1216,7 +1297,7 @@ pub fn restore_plan_in(input: RestoreInput<'_>) -> RestorePlan {
         agent: Some(resume.agent.as_str().to_string()),
         ..SessionEntry::default()
     };
-    match resume_command_with_env(id, &minimal, Some(env_prefix)) {
+    match resume_command_with_env(id, &minimal, Some(env_prefix), "") {
         Ok(command) => RestorePlan::Resume {
             agent: resume.agent,
             command,
@@ -1266,6 +1347,8 @@ fn launch_record(input: &RestoreInput<'_>, id: &str, agent: Agent) -> Option<Ses
         agent: Some(agent.as_str().to_string()),
         model: pending.model.clone(),
         effort: pending.effort.clone(),
+        // worker の MCP の判断（`.mcp.json` / `.codex/config.toml` の同名）は spawn の cwd で見る（#2447）
+        cwd: pending.cwd.clone(),
         ..SessionEntry::default()
     })
 }
@@ -1294,7 +1377,7 @@ pub fn restore_plan(
     } else {
         catalog
     };
-    restore_plan_in(RestoreInput {
+    let input = RestoreInput {
         backend_alive,
         resume,
         conversation: conversation.as_deref(),
@@ -1302,7 +1385,46 @@ pub fn restore_plan(
         backend_session,
         pane,
         platform: Platform::current(),
+        worker_mcp_args: None,
+    };
+    let mcp_args = restore_worker_mcp_args(&input);
+    restore_plan_in(RestoreInput {
+        worker_mcp_args: mcp_args.as_deref(),
+        ..input
     })
+}
+
+/// 復元する会話が worker なら、spawn と同じ MCP の断片を決める（#2447。設定ファイルもここで書く）。
+///
+/// 復元は起こしたその場で打つので、spawn と同じく**書いてから使い**、書けなければ絞り込みをやめる
+/// （[`crate::worker_mcp::WorkerMcp::materialized`]）。効かない理由は persist.log へ（起動は止めない）
+fn restore_worker_mcp_args(input: &RestoreInput<'_>) -> Option<String> {
+    let resume = input.resume?;
+    let id = resume
+        .id
+        .filter(|id| crate::transcript::is_valid_session_id(id))?;
+    // 会話が無い・この環境で復元できないなら起こさない（restore_plan_in と同じ前提）
+    input.conversation?;
+    if !tako_core::agent_resume::restore_support(resume.agent, input.platform).is_wired() {
+        return None;
+    }
+    let entry = launch_record(input, id, resume.agent)?;
+    let (worker, mcp) = resume_worker_mcp(resume.agent, id, &entry)?;
+    let mcp = mcp.materialized();
+    for w in &mcp.warnings {
+        crate::diag::persist_log(&format!(
+            "[restore] pane={} worker の MCP: {w}",
+            input
+                .pane
+                .map_or_else(|| "-".to_string(), |p| p.to_string())
+        ));
+    }
+    Some(resume_mcp_args(
+        worker,
+        &mcp,
+        &crate::dispatch::resolve_tako_binary(),
+        crate::launch_cmd::launch_dialect(),
+    ))
 }
 
 /// 現在時刻の ISO 表記（カタログの記録時刻用）
@@ -1794,8 +1916,8 @@ mod tests {
             effort: Some("max".into()),
             ..Default::default()
         };
-        let cmd =
-            resume_command_with_env("11111111-2222-3333-4444-555555555555", &entry, None).unwrap();
+        let cmd = resume_command_with_env("11111111-2222-3333-4444-555555555555", &entry, None, "")
+            .unwrap();
         assert_eq!(
             cmd,
             "TAKO_ORCHESTRATOR_ROLE='worker:tako:112-log' claude --model claude-fable-5 --effort max --resume 11111111-2222-3333-4444-555555555555"
@@ -1806,7 +1928,7 @@ mod tests {
             profile: Some("default".into()),
             ..Default::default()
         };
-        let cmd = resume_command_with_env("abc", &solo, None).unwrap();
+        let cmd = resume_command_with_env("abc", &solo, None, "").unwrap();
         assert!(
             cmd.starts_with("TAKO_ORCHESTRATOR_ROLE=solo claude"),
             "{cmd}"
@@ -1823,7 +1945,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resume_command_with_env("01a08347-543b-7a20-8e49-a93380efb375", &codex, None).unwrap(),
+            resume_command_with_env("01a08347-543b-7a20-8e49-a93380efb375", &codex, None, "").unwrap(),
             "TAKO_ORCHESTRATOR_ROLE='worker:tako' codex resume 01a08347-543b-7a20-8e49-a93380efb375"
         );
 
@@ -1834,7 +1956,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resume_command_with_env("874efd16-af95-4b2e-8036-84f6c3eaded3", &agy, None).unwrap(),
+            resume_command_with_env("874efd16-af95-4b2e-8036-84f6c3eaded3", &agy, None, "")
+                .unwrap(),
             "agy --conversation 874efd16-af95-4b2e-8036-84f6c3eaded3"
         );
 
@@ -1843,7 +1966,7 @@ mod tests {
             agent: Some("local".into()),
             ..Default::default()
         };
-        let err = resume_command_with_env("abc", &local, None).unwrap_err();
+        let err = resume_command_with_env("abc", &local, None, "").unwrap_err();
         assert!(err.contains("resume 非対応"), "{err}");
 
         // 書式検証（パストラバーサル防止）は全系統に効く
@@ -1853,7 +1976,7 @@ mod tests {
                 ..Default::default()
             };
             assert!(
-                resume_command_with_env("../etc", &invalid, None).is_err(),
+                resume_command_with_env("../etc", &invalid, None, "").is_err(),
                 "{agent} が不正な ID を通した"
             );
         }
@@ -1874,6 +1997,7 @@ mod tests {
             "e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4",
             &entry,
             Some("export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; "),
+            "",
         )
         .unwrap();
         assert_eq!(
@@ -1897,6 +2021,7 @@ mod tests {
             backend_session: None,
             pane: None,
             platform: Platform::MacOs,
+            worker_mcp_args: None,
         }
     }
 
@@ -2078,6 +2203,276 @@ mod tests {
                 with_role: false,
             }
         );
+    }
+
+    /// #2447: 復元する会話が worker なら、決めた MCP の断片を会話 ID の前へ差し込む
+    /// （codex は `codex resume` の後・claude は `--resume` の前）。worker 以外と最小形には足さない
+    #[test]
+    fn restore_planはworkerの再開へmcpの断片を差し込む() {
+        let id = "01a08347-543b-7a20-8e49-a93380efb375";
+        let frag = " -c 'mcp_servers.x.enabled=false' -c 'mcp_servers.x.command=tako-disabled'";
+        let mut catalog = SessionCatalog::default();
+        catalog.pending.push(PendingSpawn {
+            tmux_session: Some("tako-w2".into()),
+            kind: "worker".into(),
+            project: Some("tako".into()),
+            label: Some("2447".into()),
+            agent: Some("codex".into()),
+            cwd: Some("/work/tako".into()),
+            ..Default::default()
+        });
+        let codex = |args: Option<&str>| {
+            restore_plan_in(RestoreInput {
+                resume: Some(PaneResume {
+                    agent: Agent::Codex,
+                    id: Some(id),
+                }),
+                catalog: Some(&catalog),
+                backend_session: Some("tako-w2"),
+                worker_mcp_args: args,
+                ..input(None, Some(""))
+            })
+        };
+        assert_eq!(
+            codex(Some(frag)),
+            RestorePlan::Resume {
+                agent: Agent::Codex,
+                command: format!(
+                    "TAKO_ORCHESTRATOR_ROLE='worker:tako:2447' codex resume{frag} {id}"
+                ),
+                with_role: true,
+            }
+        );
+        // 断片が決まらない（`TAKO_2447_LEGACY=1` 等）なら #2447 前と 1 バイトも変わらない
+        assert_eq!(
+            codex(None),
+            RestorePlan::Resume {
+                agent: Agent::Codex,
+                command: format!("TAKO_ORCHESTRATOR_ROLE='worker:tako:2447' codex resume {id}"),
+                with_role: true,
+            }
+        );
+        // spawn 記録の cwd は判断の材料として引き継ぐ（.codex/config.toml の同名を見る場所）
+        let probe = RestoreInput {
+            catalog: Some(&catalog),
+            backend_session: Some("tako-w2"),
+            ..input(None, Some(""))
+        };
+        assert_eq!(
+            launch_record(&probe, id, Agent::Codex).and_then(|e| e.cwd),
+            Some("/work/tako".to_string())
+        );
+
+        // claude の worker は `--resume` の前（spawn と同じ `--settings`）
+        let cid = "e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4";
+        let env = "export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; ";
+        let settings = " --settings /data/worker-mcp/deny-0123456789abcdef.json";
+        let mut claude = SessionCatalog::default();
+        claude.entries.insert(
+            cid.into(),
+            SessionEntry {
+                kind: "worker".into(),
+                project: Some("tako".into()),
+                agent: Some("claude".into()),
+                model: Some("claude-opus-5".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            restore_plan_in(RestoreInput {
+                catalog: Some(&claude),
+                worker_mcp_args: Some(settings),
+                ..input(Some(cid), Some(env))
+            }),
+            RestorePlan::Resume {
+                agent: Agent::Claude,
+                command: format!(
+                    "{env}TAKO_ORCHESTRATOR_ROLE='worker:tako' claude --model claude-opus-5{settings} --resume {cid}"
+                ),
+                with_role: true,
+            }
+        );
+        // master は spawn でも絞らない（#2412 の対象外）ので、断片が渡っても足さない
+        let mut master = SessionCatalog::default();
+        master.entries.insert(
+            cid.into(),
+            SessionEntry {
+                kind: "master".into(),
+                agent: Some("claude".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            restore_plan_in(RestoreInput {
+                catalog: Some(&master),
+                worker_mcp_args: Some(settings),
+                ..input(Some(cid), Some(env))
+            }),
+            RestorePlan::Resume {
+                agent: Agent::Claude,
+                command: format!("{env}TAKO_ORCHESTRATOR_ROLE=master claude --resume {cid}"),
+                with_role: true,
+            }
+        );
+        // 記録の無い会話（最小形）にも足さない
+        assert_eq!(
+            restore_plan_in(RestoreInput {
+                worker_mcp_args: Some(settings),
+                ..input(Some(cid), Some(env))
+            }),
+            RestorePlan::Resume {
+                agent: Agent::Claude,
+                command: format!("{env}claude --resume {cid}"),
+                with_role: false,
+            }
+        );
+    }
+
+    /// #2447 の主題: 同じ判断（`worker_mcp::prepare` の結果）から組んだ spawn と再開の起動コマンドは、
+    /// **同じ MCP の断片**を持つ（組み立ては `agent::worker_mcp_args` の 1 実装）。
+    /// codex = tako の MCP の一時注入（#986）+ user 設定を止める `-c`（#2418）、claude = `--settings`（#2412）
+    #[test]
+    fn spawnと再開は同じmcpの断片を持つ() {
+        use crate::launch_cmd::ShellDialect;
+        use crate::orchestrator::agent::{
+            build_worker_cmd_in, worker_mcp_args, WorkerAgent, WorkerLaunch,
+        };
+        let t = tako_core::test_residue::ScratchDir::new("t2447");
+        let cwd = t.path().join("p");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let tako_bin = "/Applications/tako.app/Contents/MacOS/tako";
+
+        // codex: user 設定に stdio と http の server（どちらも止まる）+ プロジェクトで足した名前
+        let config = t.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[mcp_servers.user-alpha]\ncommand = \"npx\"\n\n\
+             [mcp_servers.user-web]\nurl = \"http://127.0.0.1:1/mcp\"\n\n\
+             [mcp_servers.user-keep]\ncommand = \"uvx\"\n",
+        )
+        .unwrap();
+        let mcp = crate::worker_mcp::prepare_codex_from(&cwd, &config, &["user-keep".to_string()]);
+        let frag = worker_mcp_args(
+            WorkerAgent::Codex,
+            Some(tako_bin),
+            None,
+            &mcp.codex_off,
+            ShellDialect::Posix,
+        );
+        for needle in [
+            "mcp_servers.tako.command=",
+            "mcp_servers.user-alpha.enabled=false",
+            "mcp_servers.user-web.url=http://127.0.0.1:9/tako-disabled",
+        ] {
+            assert!(frag.contains(needle), "{needle} が無い: {frag}");
+        }
+        assert!(!frag.contains("user-keep"), "足した名前は止めない: {frag}");
+        let spawn = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Codex,
+                role: "worker:tako:2447",
+                tako_bin: Some(tako_bin),
+                mcp_codex_off: &mcp.codex_off,
+                ..Default::default()
+            },
+            ShellDialect::Posix,
+        );
+        let id = "01a08347-543b-7a20-8e49-a93380efb375";
+        let entry = SessionEntry {
+            kind: "worker".into(),
+            project: Some("tako".into()),
+            label: Some("2447".into()),
+            agent: Some("codex".into()),
+            ..Default::default()
+        };
+        let resume = resume_command_with_env(
+            id,
+            &entry,
+            Some(""),
+            &resume_mcp_args(WorkerAgent::Codex, &mcp, tako_bin, ShellDialect::Posix),
+        )
+        .unwrap();
+        assert_eq!(
+            spawn,
+            format!("TAKO_ORCHESTRATOR_ROLE='worker:tako:2447' codex{frag}"),
+            "spawn の断片が worker_mcp_args と違う"
+        );
+        assert_eq!(
+            resume,
+            format!("TAKO_ORCHESTRATOR_ROLE='worker:tako:2447' codex resume{frag} {id}"),
+            "再開の断片が spawn と違う"
+        );
+
+        // claude: user scope の止める名前が `--settings` のファイルになる（spawn と同じパス）
+        let claude_json = t.path().join(".claude.json");
+        std::fs::write(
+            &claude_json,
+            r#"{"mcpServers": {"user-alpha": {"command": "npx"}, "tako": {"command": "tako", "args": ["mcp", "serve"]}}}"#,
+        )
+        .unwrap();
+        let mcp = crate::worker_mcp::prepare_from(&cwd, &[claude_json], &[], &[]);
+        assert_eq!(mcp.plan.denied, ["user-alpha"]);
+        let settings = mcp
+            .settings_file
+            .clone()
+            .expect("止める名前があれば設定ファイルが決まる");
+        let spawn = build_worker_cmd_in(
+            &WorkerLaunch {
+                agent: WorkerAgent::Claude,
+                role: "worker:tako",
+                tako_bin: Some(tako_bin),
+                mcp_settings: Some(&settings),
+                ..Default::default()
+            },
+            ShellDialect::Posix,
+        );
+        let cid = "e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4";
+        let entry = SessionEntry {
+            kind: "worker".into(),
+            project: Some("tako".into()),
+            agent: Some("claude".into()),
+            ..Default::default()
+        };
+        let resume = resume_command_with_env(
+            cid,
+            &entry,
+            None,
+            &resume_mcp_args(WorkerAgent::Claude, &mcp, tako_bin, ShellDialect::Posix),
+        )
+        .unwrap();
+        let want = format!(
+            " --settings {}",
+            crate::launch_cmd::quote(ShellDialect::Posix, &settings)
+        );
+        assert!(spawn.ends_with(&want), "{spawn}");
+        assert_eq!(
+            resume,
+            format!("TAKO_ORCHESTRATOR_ROLE='worker:tako' claude{want} --resume {cid}")
+        );
+    }
+
+    /// #2447: 再開の MCP を決めるのは worker だけ（master / solo / 役割の無いペインは spawn でも絞らない）
+    #[test]
+    fn 再開のmcpはworkerだけが決める() {
+        let id = "01a08347-543b-7a20-8e49-a93380efb375";
+        for kind in ["master", "solo", "pane", ""] {
+            let entry = SessionEntry {
+                kind: kind.into(),
+                agent: Some("codex".into()),
+                ..Default::default()
+            };
+            assert!(
+                resume_worker_mcp(Agent::Codex, id, &entry).is_none(),
+                "{kind} に MCP の判断が付いた"
+            );
+        }
+        // worker になれない系統（ローカル LLM）も決めない
+        let local = SessionEntry {
+            kind: "worker".into(),
+            agent: Some("local".into()),
+            ..Default::default()
+        };
+        assert!(resume_worker_mcp(Agent::Local, id, &local).is_none());
     }
 
     /// カタログの記録の系統が layout と食い違っても、**実際に動いていた系統**の
