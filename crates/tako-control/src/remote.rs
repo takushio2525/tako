@@ -2695,18 +2695,7 @@ fn stale_stop_refusal(pid: u32) -> String {
         .and_then(|e| e.socket_path())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(port_path);
-    // 手順は打つ OS のものを出す（Windows に ps / rm は無い）
-    let (inspect, remove) = if cfg!(windows) {
-        (
-            format!("tasklist /FI \"PID eq {pid}\""),
-            format!("Remove-Item {}", record.display()),
-        )
-    } else {
-        (
-            format!("ps -p {pid} -o args="),
-            format!("rm {}", record.display()),
-        )
-    };
+    let (inspect, remove) = identity_check_commands(pid, &record);
     format!(
         "{prefix}\n\
          記録された待ち受け（{reach}）が答えた PID です。state ファイルは残しました。\n\
@@ -2716,6 +2705,24 @@ fn stale_stop_refusal(pid: u32) -> String {
         prefix = pid_identity_refusal(pid),
         indent = "  ",
     )
+}
+
+/// 正体を確かめられなかった pid を人が確かめる手順と、記録を消す手順（#1401 / #2466）。
+///
+/// 正規経路（PID ファイル）と stale 経路（待ち受けの記録）の 1 実装。
+/// 手順は打つ OS のものを出す（Windows に ps / rm は無い）
+fn identity_check_commands(pid: u32, record: &std::path::Path) -> (String, String) {
+    if cfg!(windows) {
+        (
+            format!("tasklist /FI \"PID eq {pid}\""),
+            format!("Remove-Item {}", record.display()),
+        )
+    } else {
+        (
+            format!("ps -p {pid} -o args="),
+            format!("rm {}", record.display()),
+        )
+    }
 }
 
 /// P0-4: PID が本当に tako remote serve プロセスか検証する。
@@ -2748,8 +2755,9 @@ fn verify_pid_identity(info: &PidInfo) -> bool {
                 return false;
             }
         }
-        // etime ベースの起動時刻チェック（記録がある場合のみ。±5 秒の余裕）。
-        // ps etime（経過時間）+ 現在 epoch → 起動 epoch を逆算し、記録値と照合する
+        // etime ベースの起動時刻チェック（記録がある場合のみ）。
+        // ps etime（経過時間）+ 現在 epoch → 起動 epoch を逆算し、記録値と照合する。
+        // 規則は境界の腕と 1 実装の片側判定（記録より後に起動 = pid の再利用。#2466）
         if let Some(recorded) = info.start_time {
             let etime_result = Command::new("/bin/ps")
                 .args(["-p", &info.pid.to_string(), "-o", "etime="])
@@ -2767,7 +2775,10 @@ fn verify_pid_identity(info: &PidInfo) -> bool {
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0);
                             let actual_start = now.saturating_sub(elapsed_secs);
-                            if actual_start.abs_diff(recorded) > 5 {
+                            if !tako_core::platform::procinfo::started_before_record(
+                                actual_start,
+                                recorded,
+                            ) {
                                 return false;
                             }
                         }
@@ -2849,11 +2860,13 @@ pub fn daemon_force_stop() -> Result<Value, String> {
 /// 停止のあと daemon が居なければ「起動していた」の記録を消す（#1485）。
 ///
 /// **判定は結果の文字列ではなく現況**にする。`daemon_stop_impl` は「止めた」だけでなく
-/// 「もともと止まっていた」「pid が別人だったので state だけ掃除した」も `Err` で返す
+/// 「もともと止まっていた」も `Err` で返す
 /// ので、`Ok` だけを見ると *Mac の再起動で daemon が消えた後に `tako remote stop` した*
 /// 人の意図（もう起動しないでほしい）を取りこぼし、次の GUI 起動で勝手に戻ってしまう。
-/// 逆に「止まらなかった（SIGTERM / SIGKILL のタイムアウト）」のときは daemon が生きた
-/// ままなので記録も残す = **消す条件は「止まっていること」の 1 つ**
+/// 逆に「止まらなかった（SIGTERM / SIGKILL のタイムアウト）」「pid の正体を確かめられず
+/// 撃たなかった」のときは PID ファイルを残すので記録も残る = **消す条件は「止まっていること」の 1 つ**。
+/// #2466 以前は正体を確かめられないと PID ファイルを掃除していたので、本物の daemon が
+/// 生きたまま記録まで消えていた
 fn forget_if_stopped(result: Result<Value, String>) -> Result<Value, String> {
     if daemon_status()["running"].as_bool() != Some(true) {
         clear_desired();
@@ -2940,18 +2953,31 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
         }
     };
     let pid_num = pid_info.pid;
-    // ゾンビ（終了済みで未刈り取り）も「既に終了」として扱う（#619）
+    // P0-4: PID が本当に tako remote プロセスか検証（検証不能時も kill しない = fail-safe）
+    let confirmed = verify_pid_identity(&pid_info);
+    // ゾンビ（終了済みで未刈り取り）も「既に終了」として扱う（#619）。確かめた**後**に見るのは、
+    // 確認は生きている相手にしか通らないため: 確かめる間に終わった daemon を
+    // 「確認できない」と取り違えず、ここで片付ける（#2466）
     if has_terminated(pid_num) {
         cleanup_state_files();
         return Err("リモートサーバーが起動していない（プロセスは既に終了）".to_string());
     }
-    // P0-4: PID が本当に tako remote プロセスか検証（検証不能時も kill しない = fail-safe）
-    if !verify_pid_identity(&pid_info) {
-        cleanup_state_files();
+    if !confirmed {
+        // state は**消さない**（#2466）。相手が本物の daemon だったとき、PID ファイルと
+        // 管理トークンを消すと止める手掛かりを失い、PID ファイル無しの daemon が残る
+        // （しかも `forget_if_stopped` が「止まった」と読んで起動の意図まで消す）。
+        // 消すのは止めたと確かめた後だけ。手で確かめる手順を返し、人の判断に委ねる
+        let (inspect, remove) = identity_check_commands(pid_num, &pid_path());
         return Err(format!(
-            "{prefix}state ファイルは掃除しました。手動で停止するには: {manual}",
+            "{prefix}\n\
+             PID ファイルに記録された PID です。state ファイルは残しました。\n\
+             {indent}この PID の正体を確認する: {inspect}\n\
+             {indent}tako remote serve なら止める: {manual}\n\
+             {indent}tako の daemon でなければ記録を消す: {remove}\n\
+             {indent}そのうえで起動し直す: tako remote start",
             prefix = pid_identity_refusal(pid_num),
             manual = manual_stop_command(pid_num),
+            indent = "  ",
         ));
     }
     // 止め方の段は stale 経路と 1 実装（#1599）。止まったのを観測したときだけ Ok で、
@@ -8703,6 +8729,93 @@ mod tests {
         assert!(
             err.contains("確認できません"),
             "検証不能時のエラーメッセージ: {err}"
+        );
+    }
+
+    /// #2466: 正体を確かめられずに断るときは state を**消さない**。
+    ///
+    /// 修正前は断る直前に `cleanup_state_files()` を呼んでいた。本物の daemon を取り違えると
+    /// PID ファイルと管理トークンが消え、PID ファイル無しの daemon が残った（本番で実測）。
+    /// 相手が本当に別のプロセス（pid の再利用）でも、撃たずに記録を残して手順を返す
+    #[test]
+    fn daemon_stop_implは正体を確かめられないときstateを残す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(daemon_stop_implは正体を確かめられないときstateを残す)
+        {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child = spawn_disposable_sleep();
+        let child_pid = child.id();
+
+        let dir = std::env::temp_dir().join(format!("tako-test-2466-keep-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        std::fs::write(pid_path(), format!("{child_pid}\n/bin/sleep\n0\n")).unwrap();
+        std::fs::write(token_path(), "test-token").unwrap();
+
+        let result = daemon_stop_impl(false);
+        let kept = [pid_path().exists(), token_path().exists()];
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+
+        let alive = !has_terminated(child_pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let err = result.expect_err("正体を確かめられない相手は止めない");
+        assert!(alive, "撃っていない");
+        assert!(
+            err.contains("確認できません") && err.contains("残しました"),
+            "断った理由と、記録を残したことを言う: {err}"
+        );
+        assert_eq!(
+            kept,
+            [true, true],
+            "PID ファイルと管理トークンを残す（#2466）: {err}"
+        );
+    }
+
+    /// #2466: 起動から PID ファイルを書くまでに 5 秒を超える間があった本物の daemon を通す。
+    ///
+    /// daemon は tailscale の serve を張り終えてから記録を書くので、起動直後の tailscale が
+    /// 遅いと間が開く。旧実装は記録と `ps` の起動時刻を両側 ±5 秒で比べ、本物を
+    /// 「pid の再利用」と判定して止められなかった。記録より**後**に起動した相手（再利用）は
+    /// 従来どおり弾く。unix の ps 経路を実プロセスで動かす（境界の腕の規則は
+    /// procinfo の単体テストが持つ）
+    #[cfg(unix)]
+    #[test]
+    fn verify_pid_identityは記録より前に起動した本物を通す() {
+        // コマンドラインが `tako remote serve` に見える使い捨てのプロセス。
+        // `read` は組み込みなので子を作らず、kill すれば後に何も残らない
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read line", "tako", "remote", "serve"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("使い捨ての sh");
+        let pid = child.id();
+        let now = now_epoch_secs();
+        let late = verify_pid_identity(&PidInfo {
+            pid,
+            exe: None,
+            start_time: Some(now + 30),
+        });
+        let reused = verify_pid_identity(&PidInfo {
+            pid,
+            exe: None,
+            start_time: Some(now.saturating_sub(3600)),
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            late,
+            "記録の 30 秒前に起動した本物（起動 → 記録が遅い daemon）を通す"
+        );
+        assert!(
+            !reused,
+            "記録の 1 時間後に起動した相手 = pid の再利用は弾く"
         );
     }
 
