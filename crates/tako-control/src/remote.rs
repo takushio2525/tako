@@ -2493,7 +2493,7 @@ pub fn daemon_pid_if_alive() -> Option<u32> {
 pub fn daemon_status() -> Value {
     let pid_info = match parse_pid_file() {
         Ok(info) => info,
-        Err(_) => return with_autostart_fields(json!({ "running": false })),
+        Err(_) => return with_autostart_fields(with_pidless_listener(json!({ "running": false }))),
     };
     let pid_num = pid_info.pid;
     if !is_process_alive(pid_num) {
@@ -2569,6 +2569,25 @@ pub fn daemon_status() -> Value {
         status["devices"] = json!(n);
     }
     with_autostart_fields(status)
+}
+
+/// PID ファイルが無いときの状態へ、まだ応答している待ち受けを添える（#2455）。
+///
+/// `running` は PID ファイルで決まるので false のまま。ただし記録された待ち受けがまだ応答して
+/// いれば、PID ファイルだけが消えた daemon が動き続けている（スマホからは繋がるのに
+/// `running: false` としか言わなかった）ので、その待ち受けと止め方を添える。
+/// 普段の停止状態は到達先の記録も消えているので、接続は試さない
+fn with_pidless_listener(mut status: Value) -> Value {
+    if let Some(endpoint) = current_endpoint().filter(local_endpoint::probe_alive) {
+        status["pidless_listener"] = json!(endpoint.describe());
+        status["warnings"] = json!([format!(
+            "PID ファイルが無いのに、記録された待ち受け（{}）が応答しています。\
+             `tako remote stop` で止めてください（相手を確かめられないときは、\
+             止めずに確かめる手順を返します）",
+            endpoint.describe()
+        )]);
+    }
+    status
 }
 
 /// 自動復帰の意図と直近の結果を応答へ載せる（#1485）。
@@ -2892,32 +2911,23 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
                 // 到達可能かどうかだけで stale を判定する。応答が返らない場合に
                 // state を消すと、生きている daemon を到達不能にしてしまう
                 if local_endpoint::probe_alive(&ep) {
-                    // 生きた daemon がいる → health を叩いて pid を取得
-                    let req =
-                        "GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-                    if let Ok(resp) = local_endpoint::request_raw(&ep, req, None) {
-                        if let Some(body) = resp.split_once("\r\n\r\n").map(|(_, b)| b) {
-                            if let Ok(v) = serde_json::from_str::<Value>(body.trim()) {
-                                if let Some(pid) = v["pid"].as_u64() {
-                                    let pid = pid as u32;
-                                    eprintln!(
-                                        "PID ファイルが消失していますが、記録された待ち受けが応答しました（PID {pid}）。正体を確認します…"
-                                    );
-                                    // 正体確認は kill_stale_daemon の中（#1401）。
-                                    // 確認できなければ撃たずに中止の理由を返す。
-                                    // 止められなかったときも Err（#1599: 撃たずに
-                                    // `stopped: true` を返す嘘を作らない）
-                                    let by = kill_stale_daemon(pid)?;
-                                    cleanup_serve_leftover();
-                                    return Ok(json!({
-                                        "stopped": true,
-                                        "stale_pid": pid,
-                                        "via": by.as_str(),
-                                    }));
-                                }
-                            }
-                        }
-                    }
+                    // 生きた待ち受けがいる → 管理トークンで停止要求を送り、受け付けた daemon に
+                    // pid を答えさせる（#2455。`/api/health` はローカル直結に 401 で手掛かりに
+                    // ならない）。受け付けなければ相手を確かめられないので、撃たずに理由を返す
+                    let pid = ask_pidless_shutdown(&ep, &token_path())?;
+                    eprintln!(
+                        "PID ファイルが消失していますが、記録された待ち受けの daemon（PID {pid}）が停止要求を受け付けました。終了を確かめます…"
+                    );
+                    // 終わらなければ正体確認は kill_stale_daemon の中（#1401）。
+                    // 確認できなければ撃たずに中止の理由を返す。
+                    // 止められなかったときも Err（#1599: 撃たずに
+                    // `stopped: true` を返す嘘を作らない）
+                    let by = kill_stale_daemon(pid, &ep, &LiveStopMeans)?;
+                    return Ok(json!({
+                        "stopped": true,
+                        "stale_pid": pid,
+                        "via": by.as_str(),
+                    }));
                 } else {
                     // stale な到達先 — 記録を消す（UDS はファイル、TCP はポート記録）
                     if let Some(p) = ep.socket_path() {
@@ -2984,7 +2994,8 @@ enum StopMode {
     Graceful,
     /// `tako remote stop --force`: いきなり強制終了
     Force,
-    /// stale 経路（PID ファイルが無い）: 畳ませる → 穏当 → 強制と上げていく（従来どおり）
+    /// stale 経路（PID ファイルが無い）: 畳む要求は呼び出し側が管理トークンで済ませ、
+    /// 予算内に終わらなかった（#2455）ので、穏当 → 強制と上げていく
     Escalate,
 }
 
@@ -3066,14 +3077,16 @@ fn stop_verified_daemon(
     mode: StopMode,
     means: &impl StopMeans,
 ) -> Result<StoppedBy, String> {
+    // 段 1: daemon 自身に畳ませる。後始末（serve の解除・state の掃除）を daemon が
+    // やる、OS を問わない穏当な停止（Windows には SIGTERM に当たる要求が無い）。
+    // 受け付けない（古い daemon・トークンが無い・届かない）か、受け付けても予算内に
+    // 終わらなければ、境界の終了要求へ進む。stale 経路はこの段を呼び出し側で済ませている
+    // （pid の手掛かりが停止要求の応答そのもの。#2455）ので、同じ要求を 2 度送らない
+    if mode == StopMode::Graceful && means.ask_shutdown(pid).is_ok() && !means.wait(pid).timed_out()
+    {
+        return Ok(StoppedBy::Shutdown);
+    }
     if mode != StopMode::Force {
-        // 段 1: daemon 自身に畳ませる。後始末（serve の解除・state の掃除）を daemon が
-        // やる、OS を問わない穏当な停止（Windows には SIGTERM に当たる要求が無い）。
-        // 受け付けない（古い daemon・トークンが無い・届かない）か、受け付けても予算内に
-        // 終わらなければ、境界の終了要求へ進む
-        if means.ask_shutdown(pid).is_ok() && !means.wait(pid).timed_out() {
-            return Ok(StoppedBy::Shutdown);
-        }
         // 段 2: 穏当な終了要求（unix は SIGTERM。Windows は TerminateProcess = 強制）
         if request_then_wait(pid, false, means)? {
             return Ok(StoppedBy::Terminate);
@@ -3141,21 +3154,36 @@ fn send_admin_shutdown(
     token: &str,
     expected_pid: u32,
 ) -> Result<(), String> {
+    shutdown_accepted(&post_admin_shutdown(endpoint, token)?, expected_pid)
+}
+
+/// shutdown の要求を送って応答全体を返す（#1599 / #2455 の 1 実装）
+fn post_admin_shutdown(endpoint: &local_endpoint::Endpoint, token: &str) -> Result<String, String> {
     let request = format!(
         "POST {ADMIN_SHUTDOWN_PATH} HTTP/1.1\r\nHost: localhost\r\nX-Tako-Admin: {token}\r\n\
          Content-Length: 0\r\nConnection: close\r\n\r\n"
     );
-    let response = local_endpoint::request_raw(endpoint, &request, Some(ADMIN_SHUTDOWN_TIMEOUT))
-        .map_err(|e| format!("daemon へ届かない ({}): {e}", endpoint.describe()))?;
-    shutdown_accepted(&response, expected_pid)
+    local_endpoint::request_raw(endpoint, &request, Some(ADMIN_SHUTDOWN_TIMEOUT))
+        .map_err(|e| format!("daemon へ届かない ({}): {e}", endpoint.describe()))
 }
 
-/// shutdown の応答を読む（純関数。#1599）。
+/// shutdown の応答を、正体を確かめた pid と突き合わせて読む（純関数。#1599）。
 ///
-/// 受け付けた印（`shutting_down: true`）と pid の一致を両方見る。ステータスだけで読むと、
-/// 何にでも 200 を返す相手（ポートを再利用した別のサーバー）を「畳んだ」と取り違える。
 /// 古い daemon（この道を持たない）は 404 = Err で、呼び出し側は境界の終了要求へ進む
 fn shutdown_accepted(response: &str, expected_pid: u32) -> Result<(), String> {
+    match shutdown_acceptor_pid(response)? {
+        pid if pid == expected_pid => Ok(()),
+        pid => Err(format!(
+            "畳むと答えたのは別の daemon（PID {pid}）で、確かめた PID {expected_pid} ではない"
+        )),
+    }
+}
+
+/// shutdown の応答から、受け付けた daemon の pid を読む（純関数。#1599 / #2455）。
+///
+/// 受け付けた印（`shutting_down: true`）と pid の両方が揃ったときだけ Ok。ステータスだけで
+/// 読むと、何にでも 200 を返す相手（ポートを再利用した別のサーバー）を「畳んだ」と取り違える
+fn shutdown_acceptor_pid(response: &str) -> Result<u32, String> {
     let (head, body) = response
         .split_once("\r\n\r\n")
         .ok_or("daemon の応答が不正（ヘッダ境界なし）")?;
@@ -3165,21 +3193,108 @@ fn shutdown_accepted(response: &str, expected_pid: u32) -> Result<(), String> {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .ok_or("daemon の応答が不正（ステータス行なし）")?;
-    if status != 200 {
-        return Err(format!("daemon が畳む要求を受け付けなかった ({status})"));
+    match status {
+        200 => {}
+        // 管理 API は管理トークンが合わなければ 401（`check_admin`）。tako の daemon だが
+        // この state の daemon ではない（別の data dir）か、トークンが古い
+        401 => return Err("管理トークンが合わない (401)".to_string()),
+        404 => {
+            return Err(
+                "停止要求の受け口が無い (404。#1599 より前の daemon か、tako 以外)".to_string(),
+            )
+        }
+        other => return Err(format!("daemon が畳む要求を受け付けなかった ({other})")),
     }
     let value: Value = serde_json::from_str(body.trim())
         .map_err(|e| format!("daemon の応答を解釈できない: {e}"))?;
     if value["shutting_down"].as_bool() != Some(true) {
         return Err("daemon の応答に受け付けた印が無い".to_string());
     }
-    match value["pid"].as_u64() {
-        Some(pid) if pid == u64::from(expected_pid) => Ok(()),
-        Some(pid) => Err(format!(
-            "畳むと答えたのは別の daemon（PID {pid}）で、確かめた PID {expected_pid} ではない"
-        )),
-        None => Err("daemon の応答に pid が無い".to_string()),
+    value["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| "daemon の応答に pid が無い".to_string())
+}
+
+/// PID ファイルが無いまま応答している待ち受けへ、管理トークンで停止要求を送る（#2455）。
+///
+/// 受け付けた daemon は自分の pid を答えるので、それが stale 経路の手掛かりになる。
+/// `/api/health` は層①（tailnet の身元）を通った要求にしか答えず、ローカル直結は 401 なので
+/// 手掛かりにならない（#2455 以前はここで pid が取れず「起動していない」と返し、daemon が
+/// 生き残った）。管理トークンは daemon が起動時に書く秘密（0600）なので、受け付けた相手は
+/// **この state の daemon** に限られる（別の data dir の daemon はトークンが合わず 401）。
+///
+/// 受け付けなければ何も撃たず、相手を確かめる手順を添えた理由を返す（state は残す）
+fn ask_pidless_shutdown(
+    endpoint: &local_endpoint::Endpoint,
+    token_file: &std::path::Path,
+) -> Result<u32, String> {
+    let token = std::fs::read_to_string(token_file).map_err(|e| {
+        let reason = if e.kind() == io::ErrorKind::NotFound {
+            "管理トークンも無い".to_string()
+        } else {
+            format!("管理トークンを読めない（{e}）")
+        };
+        pidless_stop_refusal(endpoint, &reason)
+    })?;
+    post_admin_shutdown(endpoint, token.trim())
+        .and_then(|response| shutdown_acceptor_pid(&response))
+        .map_err(|reason| pidless_stop_refusal(endpoint, &reason))
+}
+
+/// 記録された待ち受けに居る相手を確かめるコマンド（打つ OS のもの。#2455）
+fn listener_inspect_command(endpoint: &local_endpoint::Endpoint) -> String {
+    match endpoint {
+        local_endpoint::Endpoint::Loopback(port) if cfg!(windows) => {
+            format!("Get-NetTCPConnection -LocalPort {port} -State Listen")
+        }
+        local_endpoint::Endpoint::Loopback(port) => format!("lsof -nP -iTCP:{port} -sTCP:LISTEN"),
+        local_endpoint::Endpoint::Unix(path) => format!("lsof {}", path.display()),
     }
+}
+
+/// PID ファイルが無く、記録された待ち受けに停止要求も通らなかったときの説明（#2455）。
+///
+/// 「起動していない」とは言わない（待ち受けは応答している）。state は**消さない**:
+/// 相手が本物の daemon かもしれないうちに記録を消すと到達不能にする（[`stale_stop_refusal`]
+/// と同じ理由）。代わりに、相手を確かめて人が止める手順を打つ OS のもので返す
+fn pidless_stop_refusal(endpoint: &local_endpoint::Endpoint, reason: &str) -> String {
+    let record = endpoint
+        .socket_path()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(port_path);
+    let (stop, remove) = if cfg!(windows) {
+        (
+            "Stop-Process -Id <PID>".to_string(),
+            format!("Remove-Item {}", record.display()),
+        )
+    } else {
+        ("kill <PID>".to_string(), format!("rm {}", record.display()))
+    };
+    format!(
+        "PID ファイルが無く、記録された待ち受け（{reach}）は応答していますが、\
+         停止要求が通りませんでした: {reason}\n\
+         相手が tako の daemon か確かめられないので、何も止めていません。state ファイルは残しました。\n\
+         {indent}待ち受けている相手を確かめる: {inspect}\n\
+         {indent}tako の daemon なら止める: {stop}\n\
+         {indent}tako の daemon でなければ記録を消す: {remove}\n\
+         {indent}そのうえで起動し直す: tako remote start",
+        reach = endpoint.describe(),
+        inspect = listener_inspect_command(endpoint),
+        indent = "  ",
+    )
+}
+
+/// stale 経路で pid は終わったのに、記録された待ち受けがまだ応答しているときの説明（#2455）
+fn pidless_listener_outlived(pid: u32, endpoint: &local_endpoint::Endpoint) -> String {
+    format!(
+        "停止要求を受け付けた PID {pid} は終わりましたが、記録された待ち受け（{reach}）は\
+         まだ応答しています。応答したのは別のプロセスかもしれないので、止めたことにせず\
+         state ファイルを残しました。\n  待ち受けている相手を確かめる: {inspect}",
+        reach = endpoint.describe(),
+        inspect = listener_inspect_command(endpoint),
+    )
 }
 
 /// serve 子プロセスに使う tako バイナリを解決する（#432）。
@@ -3536,29 +3651,52 @@ fn wait_for_termination_with(
     out
 }
 
-/// PID ファイルが消えていて health が答えた PID だけが手掛かりのときの停止（stale 経路）。
+/// PID ファイルが消えていて、停止要求を受け付けた daemon が答えた PID だけが手掛かりのときの
+/// 停止（stale 経路。手掛かりの取り方は [`ask_pidless_shutdown`]。#2455）。
 ///
-/// **正体を確認できたときだけ**撃つ: 畳ませる → 穏当な終了要求 → 最大 5 秒ポーリング →
-/// 終了しなければ強制終了 → state ファイルの掃除（段は [`stop_verified_daemon`] の 1 実装。
-/// #1599）。確認できなければ何も撃たず state も残し、中止の理由と手で確かめる手順を
-/// `Err` で返す（#1401）。**止められなかったときも `Err` で state を残す**（#1599）
-fn kill_stale_daemon(pid: u32) -> Result<StoppedBy, String> {
-    // **正体確認をこの関数の中で行う**（#1401）。呼び出し側に委ねていた旧実装では、
-    // 記録済みポートを再利用した無関係プロセスへ SIGTERM → 5 秒後 SIGKILL を撃てた
-    // （#329 で正規経路に入れた fail-safe が stale 側には無かった）。
-    // 手掛かりは PID だけ（exe と起動時刻の記録は PID ファイルと一緒に消えている）
-    let info = PidInfo {
-        pid,
-        exe: None,
-        start_time: None,
-    };
-    if !verify_pid_identity(&info) {
-        return Err(stale_stop_refusal(pid));
+/// まず daemon 自身が畳み終えるのを待つ（何も撃たない）。予算内に終わらなければ、
+/// **正体を確認できたときだけ**撃つ: 穏当な終了要求 → 最大 5 秒ポーリング → 終了しなければ
+/// 強制終了（段は [`stop_verified_daemon`] の 1 実装。#1599）。確認できなければ何も撃たず
+/// state も残し、中止の理由と手で確かめる手順を `Err` で返す（#1401）。
+/// **止められなかったとき・pid が終わっても待ち受けが応答しているときも `Err` で state を残す**
+/// （#1599 / #2455: 嘘の `stopped: true` を作らない）
+fn kill_stale_daemon(
+    pid: u32,
+    endpoint: &local_endpoint::Endpoint,
+    means: &impl StopMeans,
+) -> Result<StoppedBy, String> {
+    let mut by = StoppedBy::Shutdown;
+    if means.wait(pid).timed_out() {
+        // **正体確認をこの関数の中で行う**（#1401）。呼び出し側に委ねていた旧実装では、
+        // 記録済みポートを再利用した無関係プロセスへ SIGTERM → 5 秒後 SIGKILL を撃てた
+        // （#329 で正規経路に入れた fail-safe が stale 側には無かった）。
+        // 手掛かりは PID だけ（exe と起動時刻の記録は PID ファイルと一緒に消えている）
+        let info = PidInfo {
+            pid,
+            exe: None,
+            start_time: None,
+        };
+        if !verify_pid_identity(&info) {
+            // 確認は生きている相手にしか通らない。待ちの予算を過ぎてから確かめるまでの間に
+            // 畳み終えた daemon を「確認できない」と取り違えない
+            if !means.terminated(pid) {
+                return Err(stale_stop_refusal(pid));
+            }
+        } else {
+            // 撃つのは境界の終了要求だけ（#1599）。#1599 以前はここが `#[cfg(unix)]` の
+            // `libc::kill` で、Windows は何も撃たずに下の掃除へ進み `stopped: true` を返していた。
+            // 止まったのを観測できなければ `?` で抜けて state を残す
+            by = stop_verified_daemon(pid, StopMode::Escalate, means)?;
+        }
     }
-    // 撃つのは境界の終了要求だけ（#1599）。#1599 以前はここが `#[cfg(unix)]` の
-    // `libc::kill` で、Windows は何も撃たずに下の掃除へ進み `stopped: true` を返していた。
-    // 止まったのを観測できなければ `?` で抜けて state を残す
-    let by = stop_verified_daemon(pid, StopMode::Escalate, &LiveStopMeans)?;
+    // 止めたいのは待ち受け（スマホが繋がる先）。pid が終わっても待ち受けが応答していれば、
+    // 停止要求に答えたのは別のプロセスだった = 止めたことにしない（state も残す）
+    if local_endpoint::probe_alive(endpoint) {
+        return Err(pidless_listener_outlived(pid, endpoint));
+    }
+    // 畳み終えた daemon は serve の解除も済ませている。強制終了で残った serve 設定は
+    // ここで回収する（到達先の記録を読むので、state の掃除より先）
+    cleanup_serve_leftover();
     cleanup_state_files();
     Ok(by)
 }
@@ -4950,7 +5088,8 @@ fn handle_request_v2(
     }
 
     // /api/health: 層①のみ。version は PWA の互換チェックに使う。
-    // pid は stale daemon 検出時の回収に使う（daemon_stop_impl）
+    // pid は stale daemon の回収の手掛かりにならない（ローカル直結はここへ届く前に 401）。
+    // 回収は管理トークンの停止要求が答える pid を使う（`ask_pidless_shutdown`。#2455）
     if path == "/api/health" && method == tiny_http::Method::Get {
         return respond(
             request,
@@ -8221,6 +8360,8 @@ mod tests {
         assert!(!constant_time_eq(b"", b"x"));
     }
 
+    /// 停止要求に存在しない pid を答えた相手は、pid が「終わった」ように見えても待ち受けが
+    /// 応答し続ける。止めたことにせず、記録も消さない（#2455。嘘の `stopped: true` を作らない）
     #[test]
     fn kill_stale_daemonは存在しないpidを撃たずに中止する() {
         // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
@@ -8237,11 +8378,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tako-test-kill-stale-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
-        // is_process_alive が false = 正体を確認できない → 撃たずに理由を返す（#1401）
-        let err = kill_stale_daemon(999_999_999).expect_err("確認できない PID は撃たない");
+        std::env::set_var("TAKO_TAILSCALE_BIN", "/nonexistent/tako-test-tailscale");
+        let live = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("待ち受けの bind");
+        let port = live.local_addr().expect("待ち受けの addr").port();
+        std::fs::write(port_path(), port.to_string()).expect("port ファイルを書く");
+        let endpoint = local_endpoint::Endpoint::Loopback(port);
+        let result = kill_stale_daemon(999_999_999, &endpoint, &LiveStopMeans);
+        let kept = port_path().exists();
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
-        assert!(err.contains("確認できません"), "中止理由が返る: {err}");
+        std::env::remove_var("TAKO_TAILSCALE_BIN");
+        drop(live);
         let _ = std::fs::remove_dir_all(&dir);
+        let err = result.expect_err("待ち受けが残っているのに止めたことにした");
+        assert!(err.contains("まだ応答しています"), "中止理由が返る: {err}");
+        assert!(kept, "止めていないのに到達先の記録を消した");
     }
 
     /// 上のテストの回帰止め: state_dir 未差し替えで cleanup 系を呼ぶと
@@ -8556,51 +8706,102 @@ mod tests {
         );
     }
 
-    /// 偽の `/api/health` を答えるループバック listener（#1401 の再現・回帰に使う）。
+    /// 偽の待ち受けの答え方（#2455）
+    #[derive(Clone, Copy)]
+    enum FakeListenerKind {
+        /// 実 daemon の形: `/api/health` もほかの道もローカル直結には 401。停止要求は管理トークンが
+        /// 合えば受け付けて `pid` を答え、その pid を止めてから待ち受けを閉じる（daemon が畳む形）
+        Daemon { token: &'static str, pid: u32 },
+        /// 何を聞かれても 200 と health の形（`pid` 付き）を返す無関係なサーバー
+        Foreign { pid: u32 },
+    }
+
+    /// 実 daemon の受け口をなぞる偽の待ち受け（#2455 の再現・回帰に使う）。
     ///
-    /// stale 経路は ①`probe_alive` の接続 ②health の往復 で **2 回**繋ぐので accept を
+    /// #2455 以前のテストは「`/api/health` が誰にでも `pid` を答える」偽物で stale 経路を回して
+    /// いたので、実 daemon（health はローカル直結に 401）では pid が取れずに「起動していない」で
+    /// 終わる欠陥を見逃した。ここは認証の形を実 daemon に合わせる（実 daemon の形そのものは
+    /// `admin_apiのshutdownは管理トークンでだけ旗を立ててpidを返す` が実際の受け口で固定する）。
+    ///
+    /// stale 経路は ①`probe_alive` の接続 ②停止要求の往復 で 2 回以上繋ぐので accept を
     /// 回し続ける。停止は旗 + nonblocking accept で、`Drop` が join まで見届ける
     /// （テストが終わったあとにポートを掴んだスレッドを残さない）
-    struct FakeHealthServer {
+    struct FakeStaleListener {
         port: u16,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
-    impl FakeHealthServer {
-        /// `pid` を載せた health を返す listener を立てる（`None` = `pid` を載せない応答）
-        fn start(pid: Option<u32>) -> Self {
+    impl FakeStaleListener {
+        fn start(kind: FakeListenerKind) -> Self {
             use std::io::{Read, Write};
+            fn respond(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listener の bind");
             let port = listener.local_addr().expect("listener の addr").port();
             listener.set_nonblocking(true).expect("nonblocking");
-            let body = match pid {
-                Some(p) => format!("{{\"status\":\"ok\",\"version\":\"test\",\"pid\":{p}}}"),
-                None => "{\"status\":\"ok\",\"version\":\"test\"}".to_string(),
-            };
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let flag = stop.clone();
             let handle = std::thread::spawn(move || {
                 while !flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    match listener.accept() {
-                        Ok((mut s, _)) => {
-                            let _ = s.set_nonblocking(false);
-                            // 要求は読み捨てる（probe_alive は何も送らずに切る）
-                            let mut buf = [0u8; 1024];
-                            let _ = s.read(&mut buf);
-                            let resp = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                body.len(),
-                                body
-                            );
-                            let _ = s.write_all(resp.as_bytes());
-                            let _ = s.flush();
-                        }
+                    let mut stream = match listener.accept() {
+                        Ok((s, _)) => s,
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(std::time::Duration::from_millis(5));
+                            continue;
                         }
                         Err(_) => break,
+                    };
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                    // ヘッダの終わりまで読む（probe_alive は何も送らずに切る = 0 バイト）
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => raw.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let request = String::from_utf8_lossy(&raw).into_owned();
+                    match kind {
+                        FakeListenerKind::Foreign { pid } => {
+                            let body =
+                                format!("{{\"status\":\"ok\",\"version\":\"test\",\"pid\":{pid}}}");
+                            respond(&mut stream, "200 OK", &body);
+                        }
+                        FakeListenerKind::Daemon { token, pid } => {
+                            let shutdown =
+                                request.starts_with(&format!("POST {ADMIN_SHUTDOWN_PATH} "));
+                            let admitted = request.lines().any(|l| {
+                                l.split_once(':').is_some_and(|(k, v)| {
+                                    k.eq_ignore_ascii_case("x-tako-admin") && v.trim() == token
+                                })
+                            });
+                            if shutdown && admitted {
+                                // 畳む: 自分（pid）を止めてから待ち受けを閉じ、受け付けた印を返す
+                                let _ = crate::platform::process::terminate(pid, true);
+                                drop(listener);
+                                let body = format!("{{\"shutting_down\":true,\"pid\":{pid}}}");
+                                respond(&mut stream, "200 OK", &body);
+                                return;
+                            }
+                            respond(
+                                &mut stream,
+                                "401 Unauthorized",
+                                "{\"error\":\"unauthorized\"}",
+                            );
+                        }
                     }
                 }
             });
@@ -8612,7 +8813,7 @@ mod tests {
         }
     }
 
-    impl Drop for FakeHealthServer {
+    impl Drop for FakeStaleListener {
         fn drop(&mut self) {
             self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             if let Some(h) = self.handle.take() {
@@ -8621,20 +8822,34 @@ mod tests {
         }
     }
 
+    /// [`stale_stop_against`] の観測
+    struct StaleStopOutcome {
+        result: Result<Value, String>,
+        /// 待ち受けの持ち主に見立てた子の pid
+        child_pid: u32,
+        /// 停止の後も子が生きていたか
+        alive: bool,
+        /// 停止の後も到達先の記録（port ファイル）が残っていたか
+        port_kept: bool,
+        status_before: Value,
+        status_after: Value,
+    }
+
     /// stale 経路（PID ファイルが無く、記録された待ち受けだけが残る）を作って
-    /// `daemon_stop_impl` を呼ぶ。戻りは `(停止結果, sleep が生きているか)`。
+    /// `daemon_stop_impl` を呼ぶ（#2455）。
     ///
-    /// 使い捨ての `/bin/sleep` を「ポートを再利用した無関係プロセス」に見立てる
-    /// （#329 のテストと同じ形）。`health_pid` は sleep の PID を受け取って
-    /// **health に載せる pid** を返すクロージャ
-    fn stale_stop_against_sleep(
+    /// 使い捨ての子（[`spawn_disposable_sleep`]）を「待ち受けの持ち主」に見立てる。`kind` は子の
+    /// pid を受け取って偽の待ち受けの答え方を返す。`token` は管理トークンのファイルへ書く中身
+    /// （`None` = ファイルを置かない）
+    fn stale_stop_against(
         tag: &str,
-        health_pid: impl FnOnce(u32) -> Option<u32>,
-    ) -> (Result<Value, String>, bool) {
-        tako_core::test_child::assert_alone("stale_stop_against_sleep");
+        kind: impl FnOnce(u32) -> FakeListenerKind,
+        token: Option<&str>,
+    ) -> StaleStopOutcome {
+        tako_core::test_child::assert_alone("stale_stop_against");
         let mut child = spawn_disposable_sleep();
         let child_pid = child.id();
-        let server = FakeHealthServer::start(health_pid(child_pid));
+        let listener = FakeStaleListener::start(kind(child_pid));
 
         let dir = std::env::temp_dir().join(format!("tako-test-{tag}-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
@@ -8642,30 +8857,167 @@ mod tests {
         // 停止の成功経路は cleanup_serve_leftover で tailscale CLI を起こす。
         // 本番の serve 設定へ触らせないため存在しないパスへ向けておく（#445 の二重防御）
         std::env::set_var("TAKO_TAILSCALE_BIN", "/nonexistent/tako-test-tailscale");
-        // PID ファイルは**書かない**（= stale 経路の入口）。port ファイルだけ残す
-        std::fs::write(port_path(), server.port.to_string()).expect("port ファイルを書く");
+        // PID ファイルは**書かない**（= stale 経路の入口）。port ファイルと管理トークンだけ残す
+        std::fs::write(port_path(), listener.port.to_string()).expect("port ファイルを書く");
+        if let Some(t) = token {
+            std::fs::write(token_path(), t).expect("管理トークンを書く");
+        }
         assert!(!pid_path().exists(), "PID ファイルが無い状態を作る");
 
+        let status_before = daemon_status();
         let result = daemon_stop_impl(false);
+        let status_after = daemon_status();
+        let port_kept = port_path().exists();
 
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
         std::env::remove_var("TAKO_TAILSCALE_BIN");
-        // **kill の有無を観測してから**自分で後片付けする（順序を逆にすると検出力が消える）。
-        // 観測は `has_terminated`: sleep は自分の子なので SIGTERM 後はゾンビになり、
-        // `kill(pid, 0)` は**ゾンビにも成功する** = 生存判定では撃たれたことが見えない（#619）
+        // **止まったかを観測してから**自分で後片付けする（順序を逆にすると検出力が消える）。
+        // 観測は `has_terminated`: 子は止められた後ゾンビになり、`kill(pid, 0)` は
+        // **ゾンビにも成功する** = 生存判定では撃たれたことが見えない（#619）
         let alive = !has_terminated(child_pid);
         let _ = child.kill();
         let _ = child.wait();
-        drop(server);
+        drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
-        (result, alive)
+        StaleStopOutcome {
+            result,
+            child_pid,
+            alive,
+            port_kept,
+            status_before,
+            status_after,
+        }
     }
 
-    /// **#1401 の回帰**: stale 経路も PID の正体確認を通す。
+    /// 相手を確かめる手順（打つ OS のもの。`listener_inspect_command`）
+    fn inspect_step() -> &'static str {
+        if cfg!(windows) {
+            "Get-NetTCPConnection"
+        } else {
+            "lsof"
+        }
+    }
+
+    /// **#2455 の回帰**: PID ファイルが消えた daemon を、管理トークンの停止要求で止める。
     ///
-    /// health が返した PID が `tako remote serve` でなければ SIGTERM を撃たず、
-    /// 「確認できないので中止した」と手動手順を返す。修正前は `kill_stale_daemon` が
-    /// 正体確認なしに SIGTERM → 5 秒後 SIGKILL を撃っていた（= sleep が死ぬ）
+    /// 修正前は `/api/health` で pid を聞いていたが、実 daemon はローカル直結に 401 を返すので
+    /// pid が取れず、「起動していない（PID ファイルが無い）」と返して daemon が生き残った
+    #[test]
+    fn daemon_stop_implはpidファイルが無くても管理トークンでdaemonを止める() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(daemon_stop_implはpidファイルが無くても管理トークンでdaemonを止める)
+        {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let out = stale_stop_against(
+            "stale-2455",
+            |pid| FakeListenerKind::Daemon {
+                token: "t-2455",
+                pid,
+            },
+            Some("t-2455\n"),
+        );
+        // 止める前の status は running: false のまま、PID ファイルの無い待ち受けを言う
+        assert_eq!(out.status_before["running"], json!(false));
+        assert!(
+            out.status_before["pidless_listener"]
+                .as_str()
+                .is_some_and(|ep| ep.starts_with("127.0.0.1:")),
+            "status が PID ファイルの無い待ち受けを言わない: {}",
+            out.status_before
+        );
+        let v = out
+            .result
+            .unwrap_or_else(|e| panic!("PID ファイルの無い daemon を止められない（#2455）: {e}"));
+        assert_eq!(v["stopped"], json!(true), "{v}");
+        assert_eq!(v["stale_pid"], json!(out.child_pid), "{v}");
+        assert_eq!(v["via"], json!("shutdown"), "{v}");
+        assert!(
+            !out.alive,
+            "Ok なのに daemon（子 {}）が生きている",
+            out.child_pid
+        );
+        assert!(!out.port_kept, "止めた後も到達先の記録が残っている");
+        assert!(
+            out.status_after.get("pidless_listener").is_none(),
+            "止めた後も status が待ち受けを言う: {}",
+            out.status_after
+        );
+    }
+
+    /// 管理トークンが合わない相手（別の data dir の daemon・トークンが古い）は止めない。
+    /// 「起動していない」とも言わず、相手を確かめる手順を返して state を残す（#2455）
+    #[test]
+    fn 管理トークンが合わない待ち受けはpidファイルが無くても止めない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(管理トークンが合わない待ち受けはpidファイルが無くても止めない)
+        {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let out = stale_stop_against(
+            "stale-badtoken",
+            |pid| FakeListenerKind::Daemon {
+                token: "t-real",
+                pid,
+            },
+            Some("t-other\n"),
+        );
+        assert!(out.alive, "管理トークンの合わない相手の pid が止められた");
+        assert!(out.port_kept, "止めていないのに到達先の記録を消した");
+        let err = out
+            .result
+            .expect_err("管理トークンの合わない相手を止めたことにした");
+        assert!(err.contains("管理トークンが合わない"), "{err}");
+        assert!(
+            !err.contains("起動していない"),
+            "待ち受けが応答しているのに「起動していない」と言った: {err}"
+        );
+        assert!(
+            err.contains(inspect_step()),
+            "相手を確かめる手順が返る: {err}"
+        );
+        assert!(
+            out.status_after["pidless_listener"].is_string(),
+            "止められなかった待ち受けを status が言わない: {}",
+            out.status_after
+        );
+    }
+
+    /// 管理トークンが無いときも止めず、理由と手順を返す（#2455）
+    #[test]
+    fn 管理トークンが無ければpidファイルの無い待ち受けを止めない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(管理トークンが無ければpidファイルの無い待ち受けを止めない)
+        {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let out = stale_stop_against(
+            "stale-notoken",
+            |pid| FakeListenerKind::Daemon {
+                token: "t-real",
+                pid,
+            },
+            None,
+        );
+        assert!(out.alive, "管理トークンが無いのに相手の pid が止められた");
+        assert!(out.port_kept, "止めていないのに到達先の記録を消した");
+        let err = out
+            .result
+            .expect_err("管理トークンが無いのに止めたことにした");
+        assert!(err.contains("管理トークンも無い"), "{err}");
+        assert!(
+            err.contains(inspect_step()),
+            "相手を確かめる手順が返る: {err}"
+        );
+        assert!(err.contains("tako remote start"), "復旧の手順が返る: {err}");
+    }
+
+    /// **#1401 の回帰**: 記録済みポートを再利用した無関係なサーバーが pid を名乗っても撃たない。
+    /// 停止要求を受け付けた印が無い = tako の daemon と確かめられない（#2455 で pid の
+    /// 手掛かりを health から停止要求の応答へ移した後も同じ約束）
     #[test]
     fn daemon_stop_implはstale経路でも正体不明のpidをkillしない() {
         // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
@@ -8674,53 +9026,22 @@ mod tests {
             return;
         }
         let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (result, alive) = stale_stop_against_sleep("stale-foreign", Some);
-        assert!(
-            alive,
-            "stale 経路が正体不明の PID へ SIGTERM を撃っている（#1401）"
+        let out = stale_stop_against(
+            "stale-foreign",
+            |pid| FakeListenerKind::Foreign { pid },
+            Some("t-stale\n"),
         );
-        let err = result.expect_err("撃たずに中止する = Err");
-        assert!(err.contains("確認できません"), "中止理由が返る: {err}");
-        // 手順は打つ OS のもの（Windows に ps は無い。`stale_stop_refusal`）
-        let inspect = if cfg!(windows) { "tasklist" } else { "ps -p" };
-        assert!(err.contains(inspect), "正体を確かめる手順が返る: {err}");
-        assert!(err.contains("tako remote start"), "復旧の手順が返る: {err}");
-    }
-
-    /// stale 経路の縁①: health が `pid` を載せてこないなら撃つ相手が決まらない。
-    /// 「起動していない（PID ファイルが無い）」で終わり、記録も残る
-    #[test]
-    fn daemon_stop_implはhealthがpidを返さなければ何も撃たない() {
-        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
-        if tako_core::run_alone!(daemon_stop_implはhealthがpidを返さなければ何も撃たない)
-        {
-            return;
-        }
-        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (result, alive) = stale_stop_against_sleep("stale-nopid", |_| None);
-        assert!(alive, "pid が無い応答で誰かを撃っている");
-        let err = result.expect_err("撃つ相手が決まらない = Err");
         assert!(
-            err.contains("起動していない"),
-            "撃たずに「起動していない」で終わる: {err}"
+            out.alive,
+            "stale 経路が無関係なサーバーの名乗った PID を撃った（#1401）"
         );
-    }
-
-    /// stale 経路の縁②: health が**停止操作をしている自分自身**の PID を返しても撃たない
-    /// （テストプロセスが死ぬ形。#329 の flaky と同じ壊れ方）
-    #[test]
-    fn daemon_stop_implはhealthが自分のpidを返しても撃たない() {
-        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
-        if tako_core::run_alone!(daemon_stop_implはhealthが自分のpidを返しても撃たない)
-        {
-            return;
-        }
-        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let my_pid = std::process::id();
-        let (result, _alive) = stale_stop_against_sleep("stale-self", move |_| Some(my_pid));
-        // ここに到達している = 自プロセスが SIGTERM されていない
-        let err = result.expect_err("自分自身も正体確認で弾かれる");
-        assert!(err.contains("確認できません"), "中止理由が返る: {err}");
+        assert!(out.port_kept, "止めていないのに到達先の記録を消した");
+        let err = out.result.expect_err("撃たずに中止する = Err");
+        assert!(err.contains("受け付けた印が無い"), "{err}");
+        assert!(
+            err.contains(inspect_step()),
+            "相手を確かめる手順が返る: {err}"
+        );
     }
 
     /// `ps` の出力が**空**のときは「確認できない」= kill しない（#1401 の受け入れ条件 3）。
@@ -8769,22 +9090,6 @@ mod tests {
             !command_line_is_tako_remote_serve("\"C:\\Windows\\System32\\notepad.exe\""),
             "pid を再利用した無関係なプロセスは false"
         );
-    }
-
-    /// stale 経路の縁③: health が**死んだ PID** を返したときも撃たず中止する
-    /// （応答した相手とその PID が別 = 正体不明）
-    #[test]
-    fn daemon_stop_implはhealthが死んだpidを返しても中止する() {
-        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
-        if tako_core::run_alone!(daemon_stop_implはhealthが死んだpidを返しても中止する)
-        {
-            return;
-        }
-        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (result, alive) = stale_stop_against_sleep("stale-dead", |_| Some(999_999_999));
-        assert!(alive, "無関係な sleep が死んでいる");
-        let err = result.expect_err("正体が確認できない = Err");
-        assert!(err.contains("確認できません"), "中止理由が返る: {err}");
     }
 
     // --- #1599: 停止の段（正規経路と stale 経路の 1 実装）---
@@ -8894,7 +9199,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            stop_verified_daemon(42, StopMode::Escalate, &slow),
+            stop_verified_daemon(42, StopMode::Graceful, &slow),
             Ok(StoppedBy::Terminate)
         );
         assert_eq!(
@@ -8919,11 +9224,13 @@ mod tests {
         );
     }
 
-    /// stale 経路は強制まで上げ、**それでも止まらなければ Err**（#1599 の嘘の成功を作らない）
+    /// stale 経路は強制まで上げ、**それでも止まらなければ Err**（#1599 の嘘の成功を作らない）。
+    /// 畳む要求は呼び出し側が済ませている（#2455）ので、ここでは 2 度目を送らない
     #[test]
     fn stale経路は強制まで上げて止まらなければerrを返す() {
         let stuck = FakeStopMeans {
             graceful: true,
+            shutdown_ok: true,
             ..Default::default()
         };
         let err = stop_verified_daemon(42, StopMode::Escalate, &stuck).expect_err("止まっていない");
@@ -8931,7 +9238,6 @@ mod tests {
         assert_eq!(
             stuck.calls(),
             [
-                "shutdown",
                 "terminate(force=false)",
                 "wait",
                 "terminate(force=true)",
@@ -8940,6 +9246,7 @@ mod tests {
         );
         let escalated = FakeStopMeans {
             graceful: true,
+            shutdown_ok: true,
             ends_on_wait: Some(1),
             ..Default::default()
         };
@@ -8950,13 +9257,87 @@ mod tests {
         assert_eq!(
             escalated.calls(),
             [
-                "shutdown",
                 "terminate(force=false)",
                 "wait",
                 "terminate(force=true)",
                 "wait"
             ]
         );
+    }
+
+    /// 終わらない相手を確かめる前の待ち受けの片付け用: 何も待ち受けていないループバックの到達先
+    fn closed_loopback_endpoint() -> local_endpoint::Endpoint {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        local_endpoint::Endpoint::Loopback(port)
+    }
+
+    /// stale 経路の段（#2455）: 停止要求を受け付けた daemon は自分で畳む。終わるのを待つだけで
+    /// 何も撃たない（正体確認も終了要求も呼ばない）
+    #[test]
+    fn stale経路は畳み終えたdaemonへ何も撃たない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(stale経路は畳み終えたdaemonへ何も撃たない) {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 成功の経路は state を掃除するので、本番の state を指さない置き場へ差し替える
+        let dir = std::env::temp_dir().join(format!("tako-test-2455-done-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        std::env::set_var("TAKO_TAILSCALE_BIN", "/nonexistent/tako-test-tailscale");
+        let m = FakeStopMeans {
+            graceful: true,
+            ends_on_wait: Some(0),
+            ..Default::default()
+        };
+        let result = kill_stale_daemon(42, &closed_loopback_endpoint(), &m);
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        std::env::remove_var("TAKO_TAILSCALE_BIN");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(result, Ok(StoppedBy::Shutdown));
+        assert_eq!(m.calls(), ["wait"], "畳み終えた daemon へ何かを撃った");
+    }
+
+    /// stale 経路の段（#1401 / #2455）: 停止要求を受け付けたと答えたのに予算内に終わらない相手は、
+    /// 正体を確かめられなければ撃たない（無関係なプロセスの pid・停止操作をしている自分自身の pid）
+    #[test]
+    fn stale経路は畳み終えない相手の正体を確かめられなければ撃たない() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(stale経路は畳み終えない相手の正体を確かめられなければ撃たない)
+        {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 誤って成功の経路へ進んでも本番の state を消さない置き場へ差し替える
+        let dir = std::env::temp_dir().join(format!("tako-test-2455-stuck-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        std::env::set_var("TAKO_TAILSCALE_BIN", "/nonexistent/tako-test-tailscale");
+        let mut child = spawn_disposable_sleep();
+        let endpoint = closed_loopback_endpoint();
+        let mut outcomes = Vec::new();
+        for pid in [child.id(), std::process::id()] {
+            let m = FakeStopMeans {
+                graceful: true,
+                ..Default::default()
+            };
+            outcomes.push((pid, kill_stale_daemon(pid, &endpoint, &m), m.calls()));
+        }
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        std::env::remove_var("TAKO_TAILSCALE_BIN");
+        // 観測してから片付ける（順序を逆にすると検出力が消える）
+        let alive = !has_terminated(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(alive, "正体を確かめられない pid が撃たれた（#1401）");
+        for (pid, result, calls) in outcomes {
+            let err = result.expect_err("確かめられない相手を止めたことにした");
+            assert!(err.contains("確認できません"), "pid {pid}: {err}");
+            assert_eq!(calls, ["wait", "terminated"], "pid {pid}: 撃つ段へ進んだ");
+        }
     }
 
     /// **Windows の段取り**: 穏当な要求がそのまま `TerminateProcess` なので、その後に
@@ -8974,11 +9355,13 @@ mod tests {
                 err.contains("state ファイルは残してあります"),
                 "{mode:?}: {err}"
             );
-            assert_eq!(
-                m.calls(),
-                ["shutdown", "terminate(force=false)", "wait"],
-                "{mode:?}"
-            );
+            // stale 経路は畳む要求を呼び出し側で済ませている（#2455）
+            let expected: &[&str] = if mode == StopMode::Graceful {
+                &["shutdown", "terminate(force=false)", "wait"]
+            } else {
+                &["terminate(force=false)", "wait"]
+            };
+            assert_eq!(m.calls(), expected, "{mode:?}");
         }
     }
 
@@ -9108,6 +9491,40 @@ mod tests {
         assert!(shutdown_accepted("壊れた応答", 42).is_err());
     }
 
+    /// stale 経路の手掛かり（#2455）: 受け付けた daemon の pid を読む。受け付けた印と pid の
+    /// 両方が揃わなければ Err で、断られた理由（管理トークン / 受け口が無い）を言い分ける
+    #[test]
+    fn shutdown_acceptor_pidは受け付けた印とpidを読む() {
+        let resp = |status: &str, body: &str| {
+            format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\r\n{body}")
+        };
+        assert_eq!(
+            shutdown_acceptor_pid(&resp("200 OK", r#"{"shutting_down":true,"pid":42}"#)),
+            Ok(42)
+        );
+        let denied = shutdown_acceptor_pid(&resp("401 Unauthorized", r#"{"error":"x"}"#))
+            .expect_err("管理トークンを断った相手を受け付けたと読んだ");
+        assert!(denied.contains("管理トークンが合わない"), "{denied}");
+        let old = shutdown_acceptor_pid(&resp("404 Not Found", r#"{"error":"x"}"#))
+            .expect_err("受け口の無い相手を受け付けたと読んだ");
+        assert!(old.contains("受け口が無い"), "{old}");
+        // 何にでも 200 を返す相手（health の形）を「受け付けた」と読まない
+        let foreign = shutdown_acceptor_pid(&resp("200 OK", r#"{"status":"ok","pid":42}"#))
+            .expect_err("health の形を受け付けたと読んだ");
+        assert!(foreign.contains("受け付けた印が無い"), "{foreign}");
+        for body in [
+            r#"{"shutting_down":true}"#,
+            r#"{"shutting_down":true,"pid":0}"#,
+            r#"{"shutting_down":true,"pid":4294967296}"#,
+        ] {
+            assert!(
+                shutdown_acceptor_pid(&resp("200 OK", body)).is_err(),
+                "撃つ相手にならない pid を読んだ: {body}"
+            );
+        }
+        assert!(shutdown_acceptor_pid("壊れた応答").is_err());
+    }
+
     /// admin API の shutdown（#1599）を**実際の HTTP 経路**で: 管理トークンがあるときだけ旗を
     /// 立て、自分の pid を返す。serve 経由（XFF）とトークン無しは 401 で旗を立てない。
     /// state ファイルにも env にも依らない（到達先とトークンを直に渡す）
@@ -9198,6 +9615,97 @@ mod tests {
         let err = send_admin_shutdown(&endpoint, "test-admin-token", me.wrapping_add(1))
             .expect_err("別の daemon の受け付けを確かめた pid の停止と取り違えた");
         assert!(err.contains("別の daemon"), "{err}");
+
+        handle.join().expect("サーバースレッド");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **#2455 の前提を実際の受け口で固定する**: PID ファイルが無いときの手掛かりは
+    /// `/api/health` からは取れない（ローカル直結は 401）が、管理トークンの停止要求なら
+    /// daemon 自身が pid を答える。トークンが合わない・無いときは旗を立てずに断る。
+    /// state ファイルにも env にも依らない（到達先とトークンのファイルを直に渡す）
+    #[test]
+    fn pidファイルが無いときの手掛かりは管理トークンの停止要求から取る() {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-2455-pidless-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        let registry = DeviceRegistry::open(&dir).expect("レジストリ");
+        let (server, endpoint) =
+            local_endpoint::bind(&local_endpoint::EndpointSpec::Loopback).expect("bind");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let ctx = Arc::new(DaemonCtx {
+            registry: Mutex::new(registry),
+            ts_cli: "tailscale".to_string(),
+            admin_token: "test-admin-token".to_string(),
+            tmux_socket: "tako-test-2455".to_string(),
+            ws_connections: Mutex::new(HashMap::new()),
+            base_url: "https://example.tail0000.ts.net".to_string(),
+            expected_host: "example.tail0000.ts.net".to_string(),
+            endpoint: endpoint.clone(),
+            peer_rejects: Mutex::new(PeerRejectState::default()),
+            shutdown: shutdown.clone(),
+        });
+        let app_conn = Arc::new(RwLock::new(AppConnection::new()));
+        let pane_mapping = Arc::new(RwLock::new(PaneMapping::new()));
+        let broadcasters = new_broadcaster_map();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..3 {
+                match server.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(Some(req)) => {
+                        handle_request_v2(req, &ctx, &app_conn, &pane_mapping, &broadcasters)
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // ① health はローカル直結に 401 で pid を返さない（#2455 の原因）
+        let health = local_endpoint::request_raw(
+            &endpoint,
+            "GET /api/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .expect("health の応答");
+        assert!(
+            health.starts_with("HTTP/1.1 401"),
+            "health がローカル直結に答えた: {health}"
+        );
+        assert!(
+            !health.contains("\"pid\""),
+            "health が pid を返した: {health}"
+        );
+
+        // ② 管理トークンが合わない → 断る・旗は立たない
+        let wrong = dir.join("wrong.token");
+        std::fs::write(&wrong, "not-the-admin-token\n").expect("トークンを書く");
+        let err = ask_pidless_shutdown(&endpoint, &wrong).expect_err("合わないトークンで止めた");
+        assert!(err.contains("管理トークンが合わない"), "{err}");
+        assert!(
+            !shutdown.load(Ordering::Relaxed),
+            "合わないトークンで旗が立った"
+        );
+        // ③ 管理トークンが無い → 送らずに断る
+        let err = ask_pidless_shutdown(&endpoint, &dir.join("missing.token"))
+            .expect_err("トークンが無いのに止めた");
+        assert!(err.contains("管理トークンも無い"), "{err}");
+        assert!(
+            !shutdown.load(Ordering::Relaxed),
+            "トークンが無いのに旗が立った"
+        );
+        // ④ 管理トークンが合う → daemon が受け付けて自分の pid を答える
+        let good = dir.join("good.token");
+        std::fs::write(&good, "test-admin-token\n").expect("トークンを書く");
+        assert_eq!(
+            ask_pidless_shutdown(&endpoint, &good),
+            Ok(std::process::id())
+        );
+        assert!(
+            shutdown.load(Ordering::Relaxed),
+            "受け付けたのに旗が立っていない"
+        );
 
         handle.join().expect("サーバースレッド");
         let _ = std::fs::remove_dir_all(&dir);

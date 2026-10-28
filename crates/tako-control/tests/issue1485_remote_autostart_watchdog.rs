@@ -647,11 +647,12 @@ fn 逆戻りを名指しできる() {
         want + 1
     );
 
-    // 注入 4: 止まっているときの応答から意図を落とす（黙る形へ戻る）
+    // 注入 4: 止まっているときの応答から意図を落とす（黙る形へ戻る）。
+    // PID ファイルが無い分岐は、まだ応答している待ち受けも添える（#2455）
     let mut s = sources(&root);
     s.remote = base.remote.replace(
-        "Err(_) => return with_autostart_fields(json!({ \"running\": false })),",
-        "Err(_) => return json!({ \"running\": false }),",
+        "Err(_) => return with_autostart_fields(with_pidless_listener(json!({ \"running\": false }))),",
+        "Err(_) => return with_pidless_listener(json!({ \"running\": false })),",
     );
     assert!(s.remote != base.remote, "注入 4 の対象が見つからない");
     let found = all(&s);
