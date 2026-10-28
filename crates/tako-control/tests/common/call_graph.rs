@@ -80,6 +80,11 @@ impl Source {
         source
     }
 
+    /// このファイルの関数（本体の `{` の順。呼び出しを辿らず、位置を囲む関数だけ引く番犬が使う = #2424）
+    pub fn fns(&self) -> &[FnDef] {
+        &self.fns
+    }
+
     /// バイト位置の 1 始まりの行番号
     pub fn line_of(&self, at: usize) -> usize {
         match self.line_starts.binary_search(&at) {
@@ -377,10 +382,11 @@ fn fn_name_of(core: &str) -> Option<(String, usize)> {
             continue;
         }
         let rest = core[at + 2..].trim_start();
+        // 名前は Unicode の識別子として読む（テストの日本語の関数名。`ident_byte` の ASCII だけだと
+        // `fn 復元は…()` が関数に見えず、囲みの関数を引く番犬で中の行が関数の外になる = #2424）
         let name: String = rest
-            .bytes()
-            .take_while(|c| ident_byte(*c))
-            .map(char::from)
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
         let next = rest[name.len()..].trim_start();
         if !name.is_empty() && (next.starts_with('(') || next.starts_with('<')) {

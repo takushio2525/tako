@@ -2576,6 +2576,16 @@ OS 依存ではない。
   （`assert!(warm <= cold, …)`）。誤検知しないよう、タイムアウト
   （`while t0.elapsed() < limit`）・報告のみ（`println!`）は対象外。
   コメントと文字列リテラルは潰してから見るので、期待値の文字列に当たらない
+- **実時間の名前（`let x = ….elapsed();`）は束縛した関数の中の assert でだけ数える**（#2424）。
+  囲みの関数は `tests/common/call_graph.rs` の本体の範囲（波括弧の対応）で決めるので、テストの途中の
+  入れ子の関数・クロージャで外側のテストの束縛と assert が分かれない。以前はファイル全体で 1 つに
+  畳んでいたので、`dispatch.rs` の 1 か所の `let at = resumed.elapsed();` で別のテストの補助関数
+  `at(…)` を使う assert 3 か所まで名指しした（PR #2421 は改名で通した）。**名指しが別の関数の値なら
+  改名で逃げず番犬の誤りとして Issue にする**
+- 規則（実時間の値 2 つ）にかからなくても、**測った時刻と判断の時刻がずれる形**は同じ間欠を持つ
+  （#2424: `tick_at = resumed.elapsed()` の後に `tick()` の中で時刻を取り、間隔を `+ 5` ms の余裕で
+  窓と比べていた = `tick_at` の後に 200 ms 止まると 5 回中 5 回落ちた）。窓や間隔を確かめるテストは、
+  判断する側の時計を止めて進める（`launch_gate::advance_clock_for_test`）
 - `test_timing_watchdog.rs` の `実時間の絶対予算は宣言したものだけ` —
   実時間の値 **1 つ**と `Duration::from_*` の比較（絶対予算）は、
   `ABSOLUTE_BUDGET_ALLOWLIST` に**根拠つきで宣言したものだけ**許す（#962）
@@ -2595,8 +2605,9 @@ OS 依存ではない。
   クレートを跨いだ `#[path]` は tako-app のビルドを別クレートのテスト配置に縛る
 - 番犬 `issue1496_fn_head_watchdog` が ①直書きの再発（許可は理由つき 1 件）
   ②寄せ先が実際にヘルパを呼んでいること を止める。棚卸しの全文は同ファイルの冒頭
-- `fn ` を**語として**探す位置ベースの走査（`test_timing_watchdog` の `enclosing_fn` /
-  `ui_text/lang_watchdog` の `fn_defs`）は修飾子に依らないので対象外
+- `fn ` を**語として**探す位置ベースの走査（`ui_text/lang_watchdog` の `fn_defs`）と、
+  `call_graph` の本体の範囲を引く走査（`test_timing_watchdog` の `enclosing_fn` = #2424 から）は
+  修飾子に依らないので対象外
 
 ### 禁止する口は「窓の直書き」ではなく呼び出しを辿って探す（Issue #2042）
 

@@ -20,6 +20,8 @@
 //! `assert` 系マクロの**条件部**に、実時間の値が **2 つ以上**現れる形だけを落とす
 //! （`assert!(warm <= cold, …)` / `assert!(t1.elapsed() < t0.elapsed())`）。
 //! 実時間の値とは `.elapsed()` そのものと、`let x = ….elapsed();` で束縛された名前。
+//! 名前は**束縛した関数の中の assert でだけ**数える（#2424。ファイル全体で 1 つに畳むと、
+//! 別のテストが同じ名前で持つ実時間ではない値まで数える = 下の `duration_names`）。
 //!
 //! 拾えないのは「`let` と `.elapsed()` が別の行に分かれた束縛」だけ（そのときは
 //! `.elapsed()` が assert の条件部へ直接現れる形になりやすいので、そちらで捕まる）。
@@ -96,9 +98,15 @@ fn test_sources() -> Vec<PathBuf> {
     out
 }
 
-#[path = "common/code_view.rs"]
-mod code_view_mod;
-use code_view_mod::code_view;
+/// コメントと文字列を潰す眺めは `call_graph` が `production_range::code_view` で作る
+#[path = "common/production_range.rs"]
+mod production_range;
+
+/// 関数の本体の範囲は `call_graph` の 1 実装を引く（#2424。波括弧の対応で取るので、
+/// テストの途中の入れ子の関数やクロージャで囲みの関数を取り違えない）
+#[path = "common/call_graph.rs"]
+mod call_graph;
+use call_graph::{FnDef, Source};
 
 /// A/B の旧経路アームの除去は #1252 / #1265 の番犬と共有する（前処理を 2 か所に書かない）
 #[path = "common/test_source.rs"]
@@ -109,11 +117,11 @@ use test_source::blank_arms;
 const ARM_BEGIN: &str = "LEGACY_ARM 開始";
 const ARM_END: &str = "LEGACY_ARM 終了";
 
-/// 走査用の眺め（アームを空行へ潰してから、コメントと文字列を潰す）。
+/// 走査用の眺め（アームを空行へ潰してから、コメントと文字列を潰す）と、その中の関数。
 /// 行数はどちらの前処理でも保たれるので `file:line` はそのまま数えられる
-fn scan_view(src: &str) -> (String, usize) {
-    let (body, dropped) = blank_arms(src, ARM_BEGIN, ARM_END);
-    (code_view(&body), dropped)
+fn scan_view(rel: &str, src: &str) -> Source {
+    let (body, _) = blank_arms(src, ARM_BEGIN, ARM_END);
+    Source::new(rel, &body)
 }
 
 /// 実時間の**絶対予算**（実時間の値 1 つと `Duration::from_*` の比較）を許す場所。
@@ -142,25 +150,16 @@ const ABSOLUTE_BUDGET_ALLOWLIST: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// その位置を囲んでいる `fn` の名前（入れ子の `fn` はテストに無いので直前のものが囲み）
-fn enclosing_fn(code: &str, at: usize) -> String {
-    let mut best = String::new();
-    for (pos, _) in code[..at].match_indices("fn ") {
-        if pos > 0 {
-            let prev = code.as_bytes()[pos - 1] as char;
-            if prev.is_alphanumeric() || prev == '_' {
-                continue;
-            }
-        }
-        let name: String = code[pos + 3..]
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() {
-            best = name;
-        }
-    }
-    best
+/// その位置を本体に含む**最も内側**の関数（関数の外なら `None`）。
+///
+/// #2424 で「直前の `fn`」から本体の範囲へ替えた。直前の `fn` で決めると、テストの途中に
+/// 入れ子の関数があるとその後ろの行が入れ子の関数のものに見え、外側のテストで束縛した名前と
+/// assert が別の関数に分かれる（名前を関数ごとに数える規則では違反を見逃す）
+fn enclosing_fn(fns: &[FnDef], at: usize) -> Option<&FnDef> {
+    // `fns` は本体の `{` の順に並ぶ。`at` より前で始まった関数を後ろから見て、
+    // 最初に `at` を含むものが最も内側（手前で閉じた兄弟・入れ子は含まないので飛ぶ）
+    let started = fns.partition_point(|f| f.body.0 <= at);
+    fns[..started].iter().rev().find(|f| at <= f.body.1)
 }
 
 /// 実時間の**絶対予算**の形か（実時間の値と `Duration::from_*` の比較）
@@ -175,14 +174,23 @@ fn word_like_elapsed(cond: &str) -> bool {
         .any(|t| t.contains("elapsed"))
 }
 
-/// `let x = ….elapsed()…;` で束縛された名前（= 実時間の値）。
+/// `let x = ….elapsed()…;` で束縛された名前（= 実時間の値）と、束縛した関数
+/// （本体の `{` の位置。関数の外なら `None`）。
 ///
-/// **同じ名前は 1 つに畳む**（#962 で src を走査して踏んだ: `main.rs` は
+/// **名前が効くのは束縛した関数の中だけ**（#2424）。以前はファイル全体で 1 つに畳んでいたので、
+/// `dispatch.rs`（約 5.6 万行）の 1 か所の `let at = resumed.elapsed();` で、別のテストの補助関数
+/// `at(…)` を使う assert 3 か所まで実時間の比較に数えていた（PR #2421 は改名で通した）。
+/// クロージャの中の束縛は囲む関数のものとして数える（同じ関数の assert から捕まえて比べられる）。
+///
+/// 同じ関数の中の同じ名前は 1 つに畳む（#962 で src を走査して踏んだ: `main.rs` は
 /// `let waited = started.elapsed();` を 3 か所で束縛していて、別スコープの
 /// `let waited = format!(…)` を使う assert が「実時間の値 3 つ」に見えていた）
-fn duration_names(code: &str) -> Vec<String> {
+fn duration_names(code: &str, fns: &[FnDef]) -> Vec<(Option<usize>, String)> {
     let mut names = Vec::new();
-    for line in code.lines() {
+    let mut offset = 0;
+    for line in code.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
         let t = line.trim_start();
         let Some(rest) = t.strip_prefix("let ") else {
             continue;
@@ -195,8 +203,10 @@ fn duration_names(code: &str) -> Vec<String> {
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
-        if !name.is_empty() && !names.contains(&name) {
-            names.push(name);
+        let scope = enclosing_fn(fns, start + (line.len() - t.len())).map(|f| f.body.0);
+        let named = (scope, name);
+        if !named.1.is_empty() && !names.contains(&named) {
+            names.push(named);
         }
     }
     names
@@ -258,6 +268,28 @@ fn assert_conditions(code: &str) -> Vec<(usize, String)> {
     out
 }
 
+/// ファイル 1 つの「実時間の値を 2 つ以上比べる assert」（行番号と条件部）。
+/// 名前は assert を囲む関数で束縛したものだけ数える（#2424）
+fn compared_real_times(rel: &str, src: &str) -> Vec<(usize, String)> {
+    let source = scan_view(rel, src);
+    let code = &source.code;
+    let names = duration_names(code, source.fns());
+    let mut out = Vec::new();
+    for (at, cond) in assert_conditions(code) {
+        let scope = enclosing_fn(source.fns(), at).map(|f| f.body.0);
+        let inline = cond.matches(".elapsed()").count();
+        let named: usize = names
+            .iter()
+            .filter(|(s, _)| *s == scope)
+            .map(|(_, n)| word_count(&cond, n))
+            .sum();
+        if inline + named >= 2 {
+            out.push((code[..at].lines().count(), cond));
+        }
+    }
+    out
+}
+
 #[test]
 fn 効果を実時間で比べているテストが無い() {
     let root = repo_root();
@@ -266,16 +298,12 @@ fn 効果を実時間で比べているテストが無い() {
         let Ok(src) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let (code, _) = scan_view(&src);
-        let names = duration_names(&code);
-        for (at, cond) in assert_conditions(&code) {
-            let inline = cond.matches(".elapsed()").count();
-            let named: usize = names.iter().map(|n| word_count(&cond, n)).sum();
-            if inline + named < 2 {
-                continue;
-            }
-            let line = code[..at].lines().count();
-            let shown = path.strip_prefix(&root).unwrap_or(&path).display();
+        let shown = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        for (line, cond) in compared_real_times(&shown, &src) {
             violations.push(format!("  {shown}:{line}: assert(… {cond} …)"));
         }
     }
@@ -305,12 +333,13 @@ fn 実時間の絶対予算は宣言したものだけ() {
             .unwrap_or(&path)
             .display()
             .to_string();
-        let (code, _) = scan_view(&src);
-        for (at, cond) in assert_conditions(&code) {
+        let source = scan_view(&shown, &src);
+        let code = &source.code;
+        for (at, cond) in assert_conditions(code) {
             if !is_absolute_budget(&cond) {
                 continue;
             }
-            let owner = enclosing_fn(&code, at);
+            let owner = enclosing_fn(source.fns(), at).map_or("", |f| f.name.as_str());
             let declared = ABSOLUTE_BUDGET_ALLOWLIST
                 .iter()
                 .any(|(f, n, _)| shown.replace('\\', "/") == *f && owner == *n);
@@ -392,5 +421,109 @@ fn 番犬が走査対象とアームを見つけている() {
         src.lines().count(),
         blanked.lines().count(),
         "アーム除去で行数が変わると file:line がずれる"
+    );
+}
+
+/// 名前の効く範囲（#2424）を合成したソースで確かめる。実時間の名前は**束縛した関数の中だけ**で
+/// 数え、関数の境目は本体の範囲（波括弧の対応）で決める。ファイル全体で 1 つに畳む形（修正前）は
+/// 「別のテストの補助関数」と「入れ子の関数の中の束縛」を名指しし、「直前の `fn`」で囲みを決める形は
+/// 入れ子の関数の後ろの行を入れ子の関数のものと読んで、「入れ子の関数の中の束縛」を名指しし
+/// 「入れ子の関数を挟んだ違反」を見逃す。関数名を ASCII でしか読まない形は、日本語名のテスト
+/// （1 件目）をどれも関数の外として 1 つに束ね、修正前と同じく補助関数を名指しする
+#[test]
+fn 実時間の名前は束縛した関数の中だけで数える() {
+    // (場面, ソース, 名指しされるべき assert の条件部)
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            "別のテストが同じ名前の補助関数を持つ（PR #2421 で踏んだ形）",
+            r#"
+fn 復元の時差を測る() {
+    let resumed = Instant::now();
+    let at = resumed.elapsed();
+    launched.push(at);
+}
+fn カーソルが動く() {
+    let at = |v: &Value| (v["line"].as_u64(), v["col"].as_u64());
+    assert_eq!(at(&first), at(&second));
+}
+"#,
+            &[],
+        ),
+        (
+            "同じ関数の中で実時間の値 2 つを比べる（本物の違反）。別の関数の同じ名前は数えない",
+            r#"
+fn warm_is_faster() {
+    let at = t0.elapsed();
+    let base = t1.elapsed();
+    assert!(at <= base, "{at:?}/{base:?}");
+}
+fn cursor_moves() {
+    assert_eq!(at(&first), at(&second));
+}
+"#,
+            &["at <= base"],
+        ),
+        (
+            "入れ子の関数の中の束縛は外側の assert に効かない",
+            r#"
+fn outer() {
+    fn measure() -> Duration {
+        let spent = t0.elapsed();
+        spent
+    }
+    let spent = fake_clock.now();
+    assert!(spent >= floor_of(spent));
+}
+"#,
+            &[],
+        ),
+        (
+            "入れ子の関数を挟んでも外側のテストの違反は見逃さない",
+            r#"
+fn warm_after_helper() {
+    let cold = t0.elapsed();
+    fn helper() -> u32 {
+        1
+    }
+    let warm = t1.elapsed();
+    assert!(warm <= cold);
+}
+"#,
+            &["warm <= cold"],
+        ),
+        (
+            "クロージャの中の束縛と、クロージャが捕まえた束縛",
+            r#"
+fn in_closure() {
+    let check = || {
+        let cold = t0.elapsed();
+        let warm = t1.elapsed();
+        assert!(warm <= cold);
+    };
+    let first = t2.elapsed();
+    let second = t3.elapsed();
+    let compare = || assert!(second <= first);
+    check();
+    compare();
+}
+"#,
+            &["warm <= cold", "second <= first"],
+        ),
+    ];
+    // 場面ごとの食い違いを全部並べてから落ちる（どの読み違いかを 1 回で判る）
+    let mut wrong = Vec::new();
+    for (scene, src, want) in cases {
+        let got: Vec<String> = compared_real_times("synthetic.rs", src)
+            .into_iter()
+            .map(|(_, cond)| cond)
+            .collect();
+        if got != *want {
+            wrong.push(format!("  {scene}: 名指し {got:?} / 期待 {want:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "実時間の名前の範囲を読み違えた:\n{}",
+        wrong.join("\n")
     );
 }

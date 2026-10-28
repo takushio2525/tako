@@ -26,8 +26,9 @@
 //!
 //! 残したもの（**#1496 の癖は無い**ので触らない。検出力を動かさないため）:
 //!
-//! - `test_timing_watchdog.rs` の `enclosing_fn` / `tako-app/src/ui_text/lang_watchdog.rs`
-//!   の `fn_defs` — `fn ` を**語として**探す位置ベース。修飾子の前置に依らず正しい名前を返す
+//! - `tako-app/src/ui_text/lang_watchdog.rs` の `fn_defs` — `fn ` を**語として**探す位置ベース。
+//!   修飾子の前置に依らず正しい名前を返す（`test_timing_watchdog.rs` の `enclosing_fn` も同じ理由で
+//!   ここに居たが、#2424 から `common/call_graph.rs` の本体の範囲を引く）
 //! - `issue1376_url_scheme_watchdog.rs` — 「`fn ` を含む行」の逆引き。`pub(crate) fn …` の
 //!   行も当たるので #1496 の癖は無い（コメント行にも当たる緩さは別の話で、
 //!   狭めると検査範囲が広がって**検出が弱くなる**側へ倒れるので動かさない）

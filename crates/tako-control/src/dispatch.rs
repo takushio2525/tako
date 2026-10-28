@@ -36377,13 +36377,16 @@ mod tests {
     }
 
     /// #2413 の受け入れ条件 3（復元の時差）を、**本物の `launch_gate::tick`**（GUI の 500 ms tick と
-    /// 同じ口・同じ判断）を 20 ms ごとに回して実時間で測る。6 ペイン（master 1）・立ち上がりの窓 150 ms:
+    /// 同じ口・同じ判断）を 20 ms ごとに回して測る。6 ペイン（master 1）・立ち上がりの窓 150 ms:
     /// 預けた時点では 1 本も起こさない / critical の間は 1 本も起きない / normal へ戻ると master から
-    /// 1 本ずつ・どの tick で見ても立ち上がり中の復元は 1 本・間隔は窓以上 / 走っているペインは閉じない
+    /// 1 本ずつ・どの tick で見ても立ち上がり中の復元は 1 本・間隔は窓以上で、窓が明けた最初の tick で
+    /// 次を起こす / 走っているペインは閉じない。
+    /// 時刻は gate の時計を止めて tick ごとに進める（#2424: 実時間で測ると、テストが測った時刻と gate が
+    /// 判断に使う時刻のあいだの遅れが回ごとに違う混んだ機で、間隔が窓を下回って見えた）
     #[test]
     fn issue2413_復元はtickで1本ずつmasterから起き_逼迫中は止まる() {
         use crate::launch_gate::{self as gate, LaunchAction, LaunchKind, LaunchRequest};
-        use std::time::{Duration, Instant};
+        use std::time::Duration;
         use tako_core::queue::MachineView;
         use tako_core::resources::Pressure;
         let machine = |p| {
@@ -36403,7 +36406,10 @@ mod tests {
         // layout の並びの最後が master（先頭の worker より先に起きることを見る）
         let master = *panes.last().unwrap();
         let window = Duration::from_millis(150);
+        let tick = Duration::from_millis(20);
         gate::enable_for_test(machine(Pressure::Critical), window);
+        // 時計を止める（以後は tick ごとに 20 ms ずつ進める = 眠らない）
+        let mut now = gate::advance_clock_for_test(Duration::ZERO);
         for (i, p) in panes.iter().enumerate() {
             let role = if *p == master {
                 "orchestrator-master:t2413"
@@ -36427,11 +36433,10 @@ mod tests {
             host.command_flows.is_empty(),
             "預けた時点では 1 本も起こさない"
         );
-        // 逼迫（critical）の間は 1 本も起きない
-        let held_since = Instant::now();
-        while held_since.elapsed() < Duration::from_millis(400) {
+        // 逼迫（critical）の間は 1 本も起きない（400 ms ぶん = 20 tick）
+        for _ in 0..20 {
             gate::tick(&mut host);
-            std::thread::sleep(Duration::from_millis(20));
+            now = gate::advance_clock_for_test(tick);
         }
         assert!(host.command_flows.is_empty(), "critical の間に起こした");
         let waiting = gate::status_section()["waiting"]
@@ -36446,11 +36451,13 @@ mod tests {
         assert_eq!(waiting[0]["code"], "pressure_critical");
 
         gate::set_machine_for_test(machine(Pressure::Normal));
-        let resumed = Instant::now();
+        let resumed = now;
+        // (ペイン, 起こした tick で gate が判断に使った時刻の resumed からの差)
         let mut launched: Vec<(u64, Duration)> = Vec::new();
         let mut max_starting = 0usize;
-        while launched.len() < panes.len() && resumed.elapsed() < Duration::from_secs(10) {
-            let tick_at = resumed.elapsed();
+        while launched.len() < panes.len() && now.duration_since(resumed) < Duration::from_secs(10)
+        {
+            let tick_at = now.duration_since(resumed);
             gate::tick(&mut host);
             let new: Vec<u64> = host
                 .command_flows
@@ -36463,16 +36470,17 @@ mod tests {
                 .as_array()
                 .map_or(0, |a| a.iter().filter(|s| s["kind"] == "restore").count());
             max_starting = max_starting.max(starting);
-            std::thread::sleep(Duration::from_millis(20));
+            now = gate::advance_clock_for_test(tick);
         }
         let gaps: Vec<u128> = launched
             .windows(2)
             .map(|w| (w[1].1 - w[0].1).as_millis())
             .collect();
         eprintln!(
-            "#2413 復元の時差（窓 {} ms・tick 20 ms）: 起きた順 {:?} / 間隔 {gaps:?} ms / \
+            "#2413 復元の時差（窓 {} ms・tick {} ms・止めた時計）: 起きた順 {:?} / 間隔 {gaps:?} ms / \
              立ち上がり中の最大 {max_starting} 本",
             window.as_millis(),
+            tick.as_millis(),
             launched
                 .iter()
                 .map(|(p, t)| format!("{p}@{}ms", t.as_millis()))
@@ -36481,9 +36489,11 @@ mod tests {
         assert_eq!(launched.len(), 6, "全部起きる: {launched:?}");
         assert_eq!(launched[0].0, master, "master が先");
         assert_eq!(max_starting, 1, "同時に立ち上がる復元は 1 本");
+        // 止めた時計なので余裕は要らない: 窓以上・窓が明けた最初の tick（窓 + 1 tick 未満）
+        let (floor, ceil) = (window.as_millis(), (window + tick).as_millis());
         assert!(
-            gaps.iter().all(|g| *g + 5 >= window.as_millis()),
-            "窓が明ける前に次を起こした: {gaps:?}"
+            gaps.iter().all(|g| (floor..ceil).contains(g)),
+            "窓が明ける前に起こした / 明けた最初の tick で起こしていない（{floor}..{ceil} ms）: {gaps:?}"
         );
         assert!(
             host.detached.is_empty(),

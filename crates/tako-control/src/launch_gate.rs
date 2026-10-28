@@ -289,6 +289,8 @@ struct Gate {
     fixed_machine: Option<Option<MachineView>>,
     /// 立ち上がりの長さを固定する（**単体テストだけ**）
     fixed_startup: Option<Duration>,
+    /// 時計を止める（**単体テストだけ**。本番は常に `None` = 今の時刻）
+    fixed_now: Option<Instant>,
 }
 
 #[cfg(not(test))]
@@ -323,8 +325,24 @@ pub(crate) fn set_machine_for_test(machine: Option<MachineView>) {
     lock().fixed_machine = Some(machine);
 }
 
+/// このスレッドの起動待ちの時計を止め、`by` だけ進めた時刻を返す（単体テストだけ。`Duration::ZERO` で
+/// 止めるだけ）。#2424: 立ち上がりの窓と起こした間隔を実時間で測ると、テストが測った時刻と gate が
+/// 判断に使う時刻のあいだの遅れが回ごとに違う混んだ機で、間隔が窓を下回って見える
+#[cfg(test)]
+pub(crate) fn advance_clock_for_test(by: Duration) -> Instant {
+    let mut g = lock();
+    let at = clock(&g) + by;
+    g.fixed_now = Some(at);
+    at
+}
+
 fn lock() -> std::sync::MutexGuard<'static, Gate> {
     gate().lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// 判断に使う時刻（単体テストが止めた時計があればそれ。本番は常に今の時刻）
+fn clock(g: &Gate) -> Instant {
+    g.fixed_now.unwrap_or_else(Instant::now)
 }
 
 /// GUI の起動時に有効にする（過去の記録の `agent` の行を 1 回だけ読む）
@@ -605,7 +623,7 @@ pub fn request(req: LaunchRequest) -> Decision {
     if !g.mode.is_some_and(Mode::active) {
         return Decision::Now(req.action);
     }
-    let now = Instant::now();
+    let now = clock(&g);
     refresh_inputs(&mut g, now);
     let keys = q::agent_history_keys(&req.agent);
     let estimate = q::estimate(JobKind::Agent, Some(&keys), &g.history);
@@ -661,7 +679,7 @@ pub fn hold(req: LaunchRequest) -> Option<LaunchAction> {
     if !g.mode.is_some_and(Mode::active) {
         return Some(req.action);
     }
-    let now = Instant::now();
+    let now = clock(&g);
     refresh_inputs(&mut g, now);
     let keys = q::agent_history_keys(&req.agent);
     let estimate = q::estimate(JobKind::Agent, Some(&keys), &g.history);
@@ -727,7 +745,7 @@ pub fn tick(host: &mut dyn ControlHost) {
         if g.entries.is_empty() {
             return;
         }
-        let now = Instant::now();
+        let now = clock(&g);
         let gone: Vec<u64> = g
             .entries
             .keys()
@@ -846,7 +864,7 @@ pub fn perform(host: &mut dyn ControlHost, pane: u64, action: LaunchAction) {
 /// 次の tick（500 ms 以内）で起こす。呼んだこと自体を同意とみなす
 pub fn start_now(pane: u64) -> Result<Value, String> {
     let mut g = lock();
-    let now = Instant::now();
+    let now = clock(&g);
     let (code, text) = reason_of(&g.last, pane);
     let Some(e) = g.entries.get_mut(&pane) else {
         return Err(format!(
@@ -871,7 +889,7 @@ pub fn start_now(pane: u64) -> Result<Value, String> {
 /// ペインの起動待ちの状態（応答の `launch_gate`。無ければ `None` = 待っていない・立ち上がりも終えた）
 pub fn view(pane: u64) -> Option<Value> {
     let g = lock();
-    view_of(&g, pane, Instant::now())
+    view_of(&g, pane, clock(&g))
 }
 
 /// ペインの起動を待たせているか（起こすと決めた直後を含む = まだ agent が居ない）
@@ -901,7 +919,7 @@ pub fn wait_line(view: &Value) -> Option<String> {
 /// `tako queue`（status）の `launches` 節
 pub fn status_section() -> Value {
     let g = lock();
-    let now = Instant::now();
+    let now = clock(&g);
     let Some(mode) = g.mode else {
         return json!({ "mode": "off", "reason": "この tako は起動待ちを持たない" });
     };
