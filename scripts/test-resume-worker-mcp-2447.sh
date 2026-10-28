@@ -313,9 +313,11 @@ stop_gui() {
 
 # 画面に「答えの行」（その語だけの行）が出るまで待つ。出たら 1
 wait_answer() {
-  local pane="$1" word="$2" i
+  local pane="$1" word="$2" i screen
   for i in $(seq 1 60); do
-    if "$TAKO_BIN" read --pane "$pane" 2>/dev/null | grep -Eq "^[^A-Za-z0-9]*${word}[[:space:]]*\$"; then
+    # pipefail の下で `X | grep -q` にしない（grep が先に抜けると左辺が SIGPIPE で落ちる = #1633）
+    screen="$("$TAKO_BIN" read --pane "$pane" 2>/dev/null)"
+    if grep -Eq "^[^A-Za-z0-9]*${word}[[:space:]]*\$" <<<"$screen"; then
       echo 1
       return
     fi
@@ -534,10 +536,10 @@ run_arm() {
     # 復元した codex から tako の MCP が呼べるか（#986 の一時注入。user 設定の偽 tako には
     # tako_show_command が無いので、注入が無ければ道具の一覧に tako の名前空間が出ない）
     card_check "$restored_c1" "${arm}/復元後" "$([ "$arm" = legacy ] && echo 0 || echo 1)"
-    if [ "$arm" != legacy ]; then
-      check "$([ "$LAST_CARD" = "$spawn_card" ] && echo 1 || echo 0)" \
-        "[${arm}] 復元後の tako の MCP の呼び出しの結果が spawn と同じ（spawn ${spawn_card} / 復元 ${LAST_CARD}）"
-    fi
+    # 呼んだ結果は合否に入れない（参考の表示だけ）: MCP の呼び出しに承認が要るかは codex が決める
+    # （approval_policy = never で要ると判断すると `requires approval` で断る）。tako の -c を通さない
+    # codex 単体でも新規起動で断られることがあり、tako が渡す引数では決まらない（#2447 の報告）
+    [ "$arm" != legacy ] && echo "  （参考）tako の MCP を呼んだ結果: spawn ${spawn_card} / 復元 ${LAST_CARD}"
   else
     bad "[${arm}] 復元した codex p1 のペインが見つからない"
   fi
