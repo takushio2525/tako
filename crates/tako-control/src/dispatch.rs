@@ -26055,13 +26055,26 @@ fn dispatch_session_restart(
             // 終了要求はここで同期的に出す（応答へ結果を載せるため）。
             // 落ちたかの確認と resume の送達は host 側の段取りが引き受ける
             if let Some(pid) = plan.agent_pid {
-                if let Err(e) = crate::platform::process::terminate(pid, false) {
-                    crate::diag::persist_log(&format!(
-                        "セッション再起動: 断った pane={pane_raw} mode=harness 理由=terminate_failed"
-                    ));
-                    return Err(DispatchError::Operation(format!(
-                        "エージェントのプロセス（pid {pid}）を終了できなかったので建て直さない: {e}"
-                    )));
+                // #2462: ペインの Job（#2454）の中に残る古いエージェントの子孫（MCP サーバ・背景の
+                // シェル）も止める。Windows の終了要求は子孫を道連れにしない（unix・器のペインは Job が無い）
+                let job = host.session(pane_id).and_then(|s| s.descendant_job());
+                match crate::platform::process::terminate_with_descendants(pid, false, job) {
+                    Ok(descendants) => {
+                        if descendants != tako_core::platform::job::Release::default() {
+                            crate::diag::persist_log(&format!(
+                                "セッション再起動: 子孫 pane={pane_raw} 止めた={} 残した={}（GUI）",
+                                descendants.stopped, descendants.kept
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        crate::diag::persist_log(&format!(
+                            "セッション再起動: 断った pane={pane_raw} mode=harness 理由=terminate_failed"
+                        ));
+                        return Err(DispatchError::Operation(format!(
+                            "エージェントのプロセス（pid {pid}）を終了できなかったので建て直さない: {e}"
+                        )));
+                    }
                 }
             }
             let command = launch.command.clone();

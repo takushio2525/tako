@@ -755,9 +755,9 @@
     {
       "key": "tako_session_restart",
       "status": "degraded",
-      "note_ja": "引き継ぎ再起動は使える。ハーネス更新（会話を保ったまま CLI を建て直す）の終了要求は #1599 で Windows にも入ったが、Windows には穏当な終了要求が無いので CLI は後始末の機会なく強制終了（TerminateProcess）される。終了 → シェルの復帰 → --resume の送達の通しは Windows 実機で未実測（#1067 / #1599）",
+      "note_ja": "引き継ぎ再起動は使える。ハーネス更新（会話を保ったまま CLI を建て直す）の終了要求は #1599 で Windows にも入ったが、Windows には穏当な終了要求が無いので CLI は後始末の機会なく強制終了（TerminateProcess）される。古い CLI が起こした子（MCP サーバ・背景のシェル）は tako がペインの中で止める（#2462。GUI のアプリは残す）が、器（psmux）のペインでは CLI だけが止まり子はペインを閉じるまで残る。終了 → シェルの復帰 → --resume の送達の通しは Windows 実機で未実測（#1067 / #1599）",
       "evidence": "unit-test",
-      "evidence_detail": "#1599: 境界 tako_control::platform::process::terminate の Windows の腕（OpenProcess + TerminateProcess）が、自分で起こした子を実際に止める（子の終了コードが TerminateProcess に渡した値になる）ことを CI の Windows ジョブの実プロセステスト（platform::process::tests を名指しで回す段）で確認。dispatch の harness は OS 分岐なしでこの境界を呼ぶ。終了 → シェルの復帰 → --resume の送達の通しは未実測。handoff は queue_prompt_flow だけを使うので影響を受けない"
+      "evidence_detail": "#1599: 境界 tako_control::platform::process::terminate の Windows の腕（OpenProcess + TerminateProcess）が、自分で起こした子を実際に止める（子の終了コードが TerminateProcess に渡した値になる）ことを CI の Windows ジョブの実プロセステスト（platform::process::tests を名指しで回す段）で確認。dispatch の harness は OS 分岐なしでこの境界を呼ぶ。#2462: 同じ口（terminate_with_descendants）がペインの Job の中のエージェントの孫を止めペインのシェルは残すことを CI の Windows ジョブの実プロセステスト（issue2462_kill_paths_windows。旧アームでは孫が残る）で確認。終了 → シェルの復帰 → --resume の送達の通しは未実測。handoff は queue_prompt_flow だけを使うので影響を受けない"
     },
     {
       "key": "tako_sessions",

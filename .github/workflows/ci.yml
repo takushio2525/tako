@@ -553,6 +553,15 @@ jobs:
         run: cargo test -p tako-core --test issue2454_pane_job_windows -- --nocapture
       - name: 子孫の回収の実行検査（#2454。言語サーバの孫・ペインの GUI の孫は残る）
         run: cargo test -p tako-control --test issue2454_lsp_job_windows --test issue2454_pane_gui_windows -- --nocapture
+      # #2462: 打ち切り・取り消し・再起動の経路（probe の上限 / tako queue の取り消し / AI 命名の上限 /
+      # session-restart の harness）も同じ Job の境界で孫まで止まるか（旧アームでは残るか）を名指しで回す。
+      # --nocapture は孫の pid と結果の行（TAKO2462_*）をログへ残すため
+      - name: 子孫の回収の実行検査（#2462。probe の打ち切りの孫）
+        run: cargo test -p tako-core --test issue2462_probe_job_windows -- --nocapture
+      - name: 子孫の回収の実行検査（#2462。queue の取り消し・再起動の孫）
+        run: cargo test -p tako-control --test issue2462_kill_paths_windows -- --nocapture
+      - name: 子孫の回収の実行検査（#2462。AI 命名の打ち切りの孫）
+        run: cargo test -p tako-app --bin tako-app -- autorename::tests::issue2462 --nocapture
       # **ワークスペース全体のテストを blocking にする**（#1278 / #583）。
       # #583 は「POSIX 前提の既存失敗が残っているあいだ非ブロッキング」で据え置いていたが、
       # そのあいだに未検出が溜まり、実機で 19 → 24 件まで増えていた（#1278）。

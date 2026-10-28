@@ -29,7 +29,8 @@
 //!   待っていた理由と、枠とメモリを押さえていた処理（[`gave_up_lines`]）を出す（#2254）
 //! - 受付で過去の記録の鍵（`HistoryKeys`。repo の根 + 正規化した argv のハッシュ）を送る。
 //!   調停役はそれで見込みメモリを引く（#2254）
-//! - 実行中の取り消しは子とその子孫へ SIGTERM → 10 秒で SIGKILL（Windows は子の kill。#2000 で Job Object）
+//! - 実行中の取り消しは子とその子孫へ SIGTERM → 10 秒で SIGKILL（Windows は子を起こした直後に入れた
+//!   Job Object ごと止める = コンソールのプロセスは止め GUI のアプリは残す。#2462。境界 B30）
 //!
 //! 送受信（IPC の 1 往復）は呼び手（tako-cli の transport）が閉包で渡す。ここは状態の進め方と
 //! OS 依存（シグナル・子の木）だけを持つ。
@@ -544,6 +545,9 @@ fn run_with(
             return q::EXIT_SPAWN_FAILED;
         }
     };
+    // #2462: 取り消しを子孫まで届かせる入れ物（Windows だけ。起こした直後 = 子が孫を起こす前に入れる）。
+    // 子が普通に終わったら drop が何も止めずに手放す
+    let mut descendants = tako_core::platform::job::KillScope::contain(child.id());
     wire.child_pid = Some(child.id());
     wire.started_at_ms = Some(unix_ms());
     let mut cancel_at: Option<Instant> = None;
@@ -567,14 +571,14 @@ fn run_with(
             if let Ok(v) = beat {
                 if v["cancel"] == true && cancel_at.is_none() {
                     note("取り消されたので子を止める（SIGTERM → 10 秒で SIGKILL）");
-                    tree::terminate(&mut child, false);
+                    tree::terminate(&mut child, &mut descendants, false);
                     cancel_at = Some(Instant::now());
                 }
             }
         }
         if let Some(at) = cancel_at {
             if !killed && at.elapsed() >= KILL_GRACE {
-                tree::terminate(&mut child, true);
+                tree::terminate(&mut child, &mut descendants, true);
                 killed = true;
             }
         }
@@ -650,10 +654,12 @@ mod signals {
 mod tree {
     use std::process::Child;
 
+    use tako_core::platform::job::KillScope;
+
     /// unix: 子とその子孫（libproc の親子表）へ SIGTERM（`force` なら SIGKILL）。
-    /// 親子表が採れなければ子だけ
+    /// 親子表が採れなければ子だけ。入れ物（`KillScope`）は unix では空なので見ない
     #[cfg(unix)]
-    pub fn terminate(child: &mut Child, force: bool) {
+    pub fn terminate(child: &mut Child, _descendants: &mut KillScope, force: bool) {
         let root = child.id();
         let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
         let mut targets = vec![root];
@@ -680,9 +686,13 @@ mod tree {
         }
     }
 
-    /// Windows: 子だけ止める（木ごとは Job Object = #2000）
+    /// Windows: 子とその子孫を入れ物（Job Object。境界 B30。#2462）ごと止める。寿命はペインを
+    /// 閉じるのと同じ（コンソールのプロセスは止め、GUI のアプリとその子孫は残す）。穏当な終了要求は
+    /// 無いので `force` は見ない（1 回目で止まる。2 回目の入れ物は空）。入れ物が無い回
+    /// （入れられなかった・A/B の `TAKO_2454_LEGACY=1`）は子だけ（孫は残る = #2462 の前）
     #[cfg(not(unix))]
-    pub fn terminate(child: &mut Child, _force: bool) {
+    pub fn terminate(child: &mut Child, descendants: &mut KillScope, _force: bool) {
+        descendants.stop();
         let _ = child.kill();
     }
 }

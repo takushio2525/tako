@@ -269,7 +269,8 @@ fn 落ちてもシェルが戻るまで打たない(s: &Sources) -> Result<(), S
     let terminate = require(
         &dispatch,
         DISPATCH,
-        "crate::platform::process::terminate(pid, false)",
+        // #2462 で終了要求はペインの Job の中の子孫も止める口へ寄せた（要求そのものは同じ terminate）
+        "crate::platform::process::terminate_with_descendants(pid, false,",
         "終了要求が見当たらない",
     )?;
     if before > terminate {

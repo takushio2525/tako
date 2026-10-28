@@ -32,10 +32,13 @@
 //!
 //! ## 分かっている限界
 //!
-//! - **打ち切りで kill するのは直接の子だけ**。子が残した孫は孤児として残る
-//!   （`claude mcp list` は MCP サーバを子として起こす）。上限が無かったときは
-//!   そもそも永久に待っていたので後退ではないが、孫まで畳むには生成時に
-//!   プロセスグループを分ける必要があり、Windows は job object が要るので別の話
+//! - **unix の打ち切りで kill するのは直接の子だけ**（[`group_output_with_timeout`] で起こした子を除く）。
+//!   子が残した孫は孤児として残る（`claude mcp list` は MCP サーバを子として起こす）。上限が
+//!   無かったときはそもそも永久に待っていたので後退ではないが、孫まで畳むには生成時に
+//!   プロセスグループを分ける必要がある。**Windows は #2462 で孫まで畳む**: 待ちの 1 実装が子を
+//!   起こした直後に Job Object（境界 B30 の `platform::job::KillScope`）へ入れ、打ち切りで
+//!   コンソールのプロセスを止める（GUI のアプリとその子孫は残す・普通に終わったら何も止めない・
+//!   器の CLI は入れない）。A/B は `TAKO_2454_LEGACY=1`（Job を作らない = #2462 の前）
 //! - **読み切りの猶予は「予算の残り」と 2 秒の小さいほう**。子が予算ぎりぎりで
 //!   終わると、パイプに残ったぶんを読む時間がほとんど無い。「全体で予算を超えない」を
 //!   契約にしてある（孫が書き手として残ると EOF は来ないので、2 秒で頭打ちにする）
@@ -692,6 +695,7 @@ pub fn group_output_with_timeout(command: &mut Command, label: &str, budget: Dur
 /// 打ち切りの kill。子が**自分のプロセスグループを率いている**（[`group_output_with_timeout`] で
 /// 起こした）ならグループごと SIGKILL を送る（rc が起こした孫も残さない = #1532）。
 /// それ以外の子（親のグループに居る）は直接の子だけ（孫は残る = モジュール冒頭の「分かっている限界」）。
+/// Windows の孫は呼び手（[`wait_with_timeout`]）が先に入れ物（`kill_scope`）ごと止める（#2462）。
 ///
 /// グループへ送るのは子がまだ刈り取られていないとき（`try_wait` が `None` を返した直後）だけなので、
 /// 番号が別のグループへ使い回されていることは無い
@@ -719,6 +723,9 @@ pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Out
     } else {
         budget
     };
+    // #2462: 打ち切りの kill を孫まで届かせる入れ物（Windows だけ）。普通に終わったら drop が
+    // 何も止めずに手放す（返り方はどれでもよい）。呼び手が起こした直後にここへ来る前提
+    let mut descendants = kill_scope(&mut child);
     let out = drain(child.stdout.take());
     let err = drain(child.stderr.take());
     let start = Instant::now();
@@ -746,6 +753,8 @@ pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Out
             }
             Ok(None) => {
                 if start.elapsed() >= budget {
+                    // #2462: 子孫は入れ物ごと（コンソールは止め GUI のアプリは残す）。直下の子は次の kill
+                    descendants.stop();
                     kill_on_timeout(&mut child);
                     // 刈り取り（`wait`）は**ここで待たない**（#1979）。カーネルの中で止まった
                     // 子は SIGKILL を受けても出てくるまで終わらず、ここで `wait` すると
@@ -769,6 +778,35 @@ pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Out
             }
         }
     }
+}
+
+/// 待つ子を子孫ごと入れ物へ入れる（#2462。Windows だけ。境界 B30 の [`KillScope`]）。
+///
+/// Windows の `TerminateProcess` は子孫を道連れにしないので、`.cmd` の CLI（`claude.cmd` → cmd.exe →
+/// node.exe）・`claude mcp list` が起こす MCP サーバ・テストの `cmd /C "… ping"` の孫が打ち切りの
+/// 後も残っていた。入れないのは 2 つ:
+///
+/// - **器の CLI**（tmux / psmux。実行ファイル名を [`crate::backend::is_plumbing_process`] で見る）:
+///   器のサーバーはクライアントの子として起きるので、1 回の問い合わせ（`new-session` など）の
+///   打ち切りで器ごと消える（`platform::job` の「器は入れない」と同じ理由）。名前が引けない子も
+///   器の側へ倒す（入れ損ねても従来の止め方に戻るだけ）
+/// - **既に終わった子**（入れる前に終わった = 孫を起こす暇が無い。割り当ての失敗の警告を出さない）
+///
+/// [`KillScope`]: crate::platform::job::KillScope
+fn kill_scope(child: &mut Child) -> crate::platform::job::KillScope {
+    use crate::platform::job::KillScope;
+    if !crate::platform::job::SUPPORTED || matches!(child.try_wait(), Ok(Some(_))) {
+        return KillScope::empty();
+    }
+    let pid = child.id();
+    let container = crate::platform::procinfo::image_path(pid).is_none_or(|path| {
+        path.file_name()
+            .is_none_or(|name| crate::backend::is_plumbing_process(&name.to_string_lossy()))
+    });
+    if container {
+        return KillScope::empty();
+    }
+    KillScope::contain(pid)
 }
 
 /// 打ち切った子の刈り取りを別スレッドへ渡す（#1979）。
@@ -852,7 +890,8 @@ mod tests {
     /// 固まる本体は `exec` で子そのものと置き換える（#2448）。打ち切りの kill は直接の子にしか
     /// 届かないので、macOS の `/bin/sh`（bash 3.2）が並びの最後の `sleep` を子として起こすと、
     /// kill は sh に当たって `sleep 600` が親を失って 10 分残る（テストは緑のまま）。番犬は
-    /// `test_residue` の一巡。Windows の `cmd /C` には `exec` が無く `ping` は孫のまま（#2454）
+    /// `test_residue` の一巡。Windows の `cmd /C` には `exec` が無く `ping` は孫のままだが、
+    /// 打ち切りが入れ物（Job）ごと止める（#2462。実プロセスの検査は `tests/issue2462_probe_job_windows.rs`）
     fn hang_script(prefix: Option<&str>) -> String {
         #[cfg(windows)]
         {
@@ -1027,6 +1066,28 @@ mod tests {
         crate::platform::process::no_console_window(&mut ok).args(["-c", "printf %s ok"]);
         match command_output_with_timeout(&mut ok, "sh printf", Duration::from_secs(30)) {
             Outcome::Done { stdout, .. } => assert_eq!(stdout, b"ok"),
+            other => panic!("Done を期待したが {other:?}"),
+        }
+    }
+
+    /// #2462 の境界の端: 待つ前に終わっていた子を渡しても、入れ物へ入れようとせず
+    /// （入れられない子で警告を出さない）終了コードどおりの Done で返る
+    #[test]
+    fn 待つ前に終わった子もdoneで返る() {
+        // `cmd /C` でも `sh -c` でも同じ綴り
+        let (program, args) = shell("exit 3");
+        let mut command = Command::new(program);
+        crate::platform::process::no_console_window(&mut command)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("すぐ終わる子を起こせる");
+        // 終わるまで待ってから渡す（`try_wait` は終了コードを覚えているので待ちの 1 実装も同じ値を読む）
+        let status = child.wait().expect("看取れる");
+        assert_eq!(status.code(), Some(3));
+        match wait_with_timeout(child, "exit 3", Duration::from_secs(30)) {
+            Outcome::Done { status, .. } => assert_eq!(status.code(), Some(3)),
             other => panic!("Done を期待したが {other:?}"),
         }
     }
