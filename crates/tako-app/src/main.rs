@@ -98777,12 +98777,12 @@ mod selftest_launch_withdraw_watchdog {
             if !(code(line) && LAUNCHERS.iter().any(|p| line.contains(p))) {
                 continue;
             }
+            // 関数の頭の判定は共有ヘルパ（`pub(crate) fn` / `async fn` も頭と読む。#1496）
             let header = lines[i.saturating_sub(2)..i]
                 .iter()
                 .rev()
-                .map(|(_, l)| l.trim_start())
-                .find(|l| l.starts_with("fn "));
-            if let Some(name) = header.and_then(|l| l["fn ".len()..].split('(').next()) {
+                .find_map(|(_, l)| tako_core::source_scan::fn_head_name(l));
+            if let Some(name) = header {
                 builders.push(format!("{name}("));
                 builder_lines.push(i);
             }
@@ -98794,9 +98794,8 @@ mod selftest_launch_withdraw_watchdog {
             }
             let launches = LAUNCHERS.iter().any(|p| line.contains(p))
                 || PALETTE_LAUNCH_IDS.contains(&line.trim())
-                || builders
-                    .iter()
-                    .any(|b| line.contains(b.as_str()) && !line.contains(&format!("fn {b}")));
+                || (tako_core::source_scan::fn_head_name(line).is_none()
+                    && builders.iter().any(|b| line.contains(b.as_str())));
             if !launches {
                 continue;
             }
@@ -98861,6 +98860,16 @@ mod selftest_launch_withdraw_watchdog {
         assert!(
             unwithdrawn_launches(&wrap(&format!("{builder}    withdraw_launch(app, p);\n")))
                 .is_empty()
+        );
+        // 可視性つきの頭（`pub(crate) fn`）も要求を組む関数として読む（#1496 の共有ヘルパ）
+        assert_eq!(
+            unwithdrawn_launches(&wrap(
+                &builder.replace("    fn spawn_req", "    pub(crate) fn spawn_req")
+            )),
+            vec![(
+                8,
+                "let v = dispatch(app, spawn_req(1), origin);".to_string()
+            )]
         );
         // パレットの起動導線（項目 88 の形）
         let palette = "    app.palette_execute(\n        PaletteItem::Command(\n            label,\n            \"run-setup\",\n        ),\n        cx,\n    );\n";
