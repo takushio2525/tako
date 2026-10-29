@@ -1538,11 +1538,21 @@ mod tests {
         for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
             assert!(syntax_ok(shell, &line), "{shell} で構文が通らない: {line}");
         }
-        // 検出力: 素の `&` 形は bash / sh で落ちる（= この検査は空振りしていない）
+        // 検出力: 素の `&` 形は bash / sh で落ちる（= この検査は空振りしていない）。
+        // bash の構文エラーは取り込んで捨てる（ターミナルへ出すと `cargo test` の最中の
+        // 本物のエラーに見える = #1614）。中身で「構文エラーで落ちた」ことまで確かめ、
+        // bash が起きない等の別の失敗と区別する（文言を英語に固定するため LC_ALL=C）
         let naive = POSIX.sequence(&["sleep 300 &".to_string(), POSIX.sleep(3)]);
+        let out = std::process::Command::new("/bin/bash")
+            .args(["-n", "-c", &naive])
+            .env("LC_ALL", "C")
+            .output()
+            .expect("/bin/bash を起動できない");
+        let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            !syntax_ok("/bin/bash", &naive),
-            "`&;` の形が bash で通ってしまっている（検査の前提が崩れている）: {naive}"
+            !out.status.success() && stderr.contains("syntax error"),
+            "`&;` の形が bash の構文エラーにならない（検査の前提が崩れている）: {naive} / {:?} / stderr: {stderr}",
+            out.status
         );
     }
 
