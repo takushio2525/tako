@@ -251,6 +251,26 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `tests/issue2365_front_lang.rs` の後半（偽の GUI = 黙る・閉じる・壊れた行を返す受け口と、壊れた・読めない
   ゲートの置き場を CLI / MCP で叩く。`TAKO_2365_FRONT_BIN` で A/B）と tako-control の
   `tests/issue2365_store_lang.rs`（GUI 無しのホストへ todo / チェックポイント / ゲートの要求を渡す）
+- #2365 の続きで、**全部の置き場が共有する書き出し**（`config_io` の 6 文）・**remote daemon が tako app へ
+  繋ぐ口**（`remote.rs` の `AppIpcClient` の 9 行）・**置き場の口の「データディレクトリを解決できない」**
+  （settings / discovery / layout の 5 か所）を移した。`config_io` は断りを `WriteError`（網羅 match）で持ち、
+  **`String` を返す口（`atomic_write` / `atomic_write_with_backup` / `rotate_backups` / `lock_exclusive`）は
+  日本語のまま**（persist.log と日本語の枠の呼び手 = sessions / orchestrator / setup ほかはそのまま使う）。
+  表示言語に従う枠を持つ置き場（ゲート・チェックポイント・人がやること・実行設定）は型の口（`*_typed`）を
+  呼んで `.to_string()` で返す（**1 つの断りの枠と中身の言語をそろえる**。枠が日本語のままの呼び手を型の口へ
+  移すと逆に混ざるので、枠を移すときに一緒に移す）。データディレクトリの断りは 5 か所が
+  `config_io::DataDirUnresolved` を `io::Error` に包み、`io::Error` の表示は日本語のまま（起動時の警告・
+  persist.log・`tako persist` の診断）。利用者へ返す枠（`Reason::SaveSettingsFailed` = `Reason::settings_save_failed(&e)`・
+  `tako run-default` の素の文・LSP の初期化オプションの `Note`）は `config_io::IoCause::of(&e)` で枠と同じ言語に
+  引く。remote の口は内部で `Reason` を型のまま返し、文にするのは `roundtrip_detailed` の 1 か所（表示言語は
+  ipc.rs と同じ `settings::client_lang()`）。9 行のうち日本語が ipc.rs と同じ 4 種（5 行）は同じバリアント、
+  文言が違っていた 3 種（4 行。`tako app へ接続できない (…)` ほか）は日本語を修正前とそろえるため別のバリアント
+  （`AppCannotConnect` / `AppRequestEncodeFailed` / `AppNoReply`。英語は同じ意味の文を引く）。
+  番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（`WriteError` の表・置き場が日本語の口を呼んで
+  いないか `TYPED_WRITE_SCOPES`・書き出し / 接続 / 置き場の口の日本語の固定文・データディレクトリの素の
+  文字列・`settings::save(` の結果を `e.to_string()` で包む形）、実経路は `tests/issue2365_store_lang.rs` の
+  書き出しのケース（ロック・世代バックアップの位置にフォルダ・書き込めないフォルダ）と `remote.rs` の単体
+  テスト（実ソケットで繋がらない・答えない・壊れた行）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

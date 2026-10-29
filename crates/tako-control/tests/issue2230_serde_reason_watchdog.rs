@@ -102,6 +102,11 @@ const ALLOWED: &[Allow] = &[
     },
     Allow {
         file: "crates/tako-control/src/remote.rs",
+        needle: "Reason::ReplyUnreadable(",
+        why: "daemon が tako app から受けた IPC の応答の 1 行（ファイルではない。#2365 で Reason へ移した）",
+    },
+    Allow {
+        file: "crates/tako-control/src/remote.rs",
         needle: "JSON パースエラー",
         why: "リモートの HTTP 要求の本文",
     },

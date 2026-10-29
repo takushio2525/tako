@@ -1045,37 +1045,60 @@ impl AppIpcClient {
     /// **Windows 側は #972 まで `Err("Windows の IPC は未実装")` だった**ので、
     /// daemon / CLI から app へ問い合わせる経路（数値ペイン ID → 器のセッションの
     /// 解決を含む）が丸ごと成立していなかった
+    ///
+    /// 通信の断りを文にするのはここ 1 か所（#2365）。日英の対は [`crate::Reason`]、表示言語は
+    /// GUI の外の解決（[`crate::settings::client_lang`]）で、`tako-cli` の ipc.rs の `refusal` と
+    /// 同じ引き方。日本語が ipc.rs と同じ文は同じバリアントを使い（文言を 2 か所に書かない）、
+    /// 日本語の文言が違っていた 3 つだけ `App…` のバリアント（英語は同じ意味の文を引く）。
+    /// app から返った断り（内側の `Err` = [`AppCallError::Rejected`] の中身）は app の表示言語で
+    /// 組まれている
     fn roundtrip_detailed(
         socket: &str,
         token: &str,
         request: crate::protocol::Request,
     ) -> Result<Result<Value, crate::protocol::RpcError>, String> {
+        Self::roundtrip_typed(socket, token, request)
+            .map_err(|reason| reason.text_in(crate::settings::client_lang()))
+    }
+
+    /// [`Self::roundtrip_detailed`] の本体。通信の断りを型で返す（文は言語を選んで引く）
+    fn roundtrip_typed(
+        socket: &str,
+        token: &str,
+        request: crate::protocol::Request,
+    ) -> Result<Result<Value, crate::protocol::RpcError>, crate::Reason> {
         let (read_half, write_half) = Self::connect_stream(socket)?;
         Self::roundtrip_on(read_half, write_half, token, request)
     }
 
     #[cfg(unix)]
-    fn connect_stream(socket: &str) -> Result<(impl Read, impl Write), String> {
+    fn connect_stream(socket: &str) -> Result<(impl Read, impl Write), crate::Reason> {
         use std::os::unix::net::UnixStream;
 
-        let stream = UnixStream::connect(socket)
-            .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
+        let stream = UnixStream::connect(socket).map_err(|e| crate::Reason::AppCannotConnect {
+            socket: socket.to_string(),
+            error: e.to_string(),
+        })?;
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .ok();
         let read_half = stream
             .try_clone()
-            .map_err(|e| format!("接続の複製に失敗: {e}"))?;
+            .map_err(|e| crate::Reason::ConnectionCloneFailed(e.to_string()))?;
         Ok((read_half, stream))
     }
 
     #[cfg(windows)]
-    fn connect_stream(socket: &str) -> Result<(impl Read, impl Write), String> {
-        let stream = crate::platform::named_pipe::connect_client(socket, 3_000)
-            .map_err(|e| format!("tako app へ接続できない ({socket}): {e}"))?;
+    fn connect_stream(socket: &str) -> Result<(impl Read, impl Write), crate::Reason> {
+        let stream = crate::platform::named_pipe::connect_client(socket, 3_000).map_err(|e| {
+            crate::Reason::AppCannotConnect {
+                socket: socket.to_string(),
+                error: e.to_string(),
+            }
+        })?;
         let read_half = stream
             .try_clone()
-            .map_err(|e| format!("接続の複製に失敗: {e}"))?;
+            .map_err(|e| crate::Reason::ConnectionCloneFailed(e.to_string()))?;
         Ok((read_half, stream))
     }
 
@@ -1085,23 +1108,23 @@ impl AppIpcClient {
         mut write_half: W,
         token: &str,
         request: crate::protocol::Request,
-    ) -> Result<Result<Value, crate::protocol::RpcError>, String> {
+    ) -> Result<Result<Value, crate::protocol::RpcError>, crate::Reason> {
         use std::io::{BufRead, BufReader};
 
         let envelope = crate::protocol::RequestEnvelope::new(1, token, request);
-        let json =
-            serde_json::to_string(&envelope).map_err(|e| format!("リクエストの構築に失敗: {e}"))?;
-        writeln!(write_half, "{json}").map_err(|e| format!("送信に失敗: {e}"))?;
+        let json = serde_json::to_string(&envelope)
+            .map_err(|e| crate::Reason::AppRequestEncodeFailed(e.to_string()))?;
+        writeln!(write_half, "{json}").map_err(|e| crate::Reason::SendFailed(e.to_string()))?;
 
         let mut line = String::new();
         BufReader::new(read_half)
             .read_line(&mut line)
-            .map_err(|e| format!("応答の受信に失敗: {e}"))?;
+            .map_err(|e| crate::Reason::ReceiveFailed(e.to_string()))?;
         if line.is_empty() {
-            return Err("tako app から応答が返らなかった".into());
+            return Err(crate::Reason::AppNoReply);
         }
-        let response: crate::protocol::ResponseEnvelope =
-            serde_json::from_str(&line).map_err(|e| format!("応答を解釈できない: {e}"))?;
+        let response: crate::protocol::ResponseEnvelope = serde_json::from_str(&line)
+            .map_err(|e| crate::Reason::ReplyUnreadable(e.to_string()))?;
         match response.error {
             Some(error) => Ok(Err(error)),
             None => Ok(Ok(response.result.unwrap_or(Value::Null))),
@@ -7815,6 +7838,103 @@ mod tests {
                 Err(AppCallError::Transport(_))
             ),
             "接続できない相手は伝送エラー"
+        );
+
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "一時ディレクトリ配下以外は消さない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2365: daemon → app の通信の断りは型（`Reason`）のまま返り、文は言語を選んで引く。
+    /// 実ソケットで「繋がらない・答えずに閉じる・壊れた行を返す」を起こし、ipc.rs と同じ意味の
+    /// 断りは同じバリアントになること・日本語は #2365 より前の文とバイト一致・英語に日本語が
+    /// 混ざらないこと・文にする口（`roundtrip_detailed`）が GUI の外の表示言語で引くことを見る
+    #[cfg(unix)]
+    #[test]
+    fn app_への通信の断りは型で返り言語を選んで文になる() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        use tako_core::i18n::Lang;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tako-2365-ipc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        let has_japanese = |s: &str| {
+            s.chars()
+                .any(|c| matches!(c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF))
+        };
+
+        // 繋がらない（ソケットが無い）
+        let gone = dir.join("gone.sock").display().to_string();
+        let err = AppIpcClient::roundtrip_typed(&gone, "t", crate::protocol::Request::List)
+            .expect_err("繋がらない");
+        let crate::Reason::AppCannotConnect { socket, error } = &err else {
+            panic!("繋がらないのは AppCannotConnect: {err:?}");
+        };
+        assert_eq!(socket, &gone);
+        assert_eq!(
+            err.text_in(Lang::Ja),
+            format!("tako app へ接続できない ({gone}): {error}"),
+            "日本語は #2365 より前の文とバイト一致"
+        );
+        // 文にする口は GUI の外の表示言語で引く（ipc.rs の `refusal` と同じ）
+        let text = AppIpcClient::roundtrip_detailed(&gone, "t", crate::protocol::Request::List)
+            .expect_err("繋がらない");
+        assert_eq!(text, err.text_in(crate::settings::client_lang()));
+
+        // 答えずに閉じる・壊れた行を返す app を模す（1 回ずつ受ける）
+        let sock = dir.join("app.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("UDS");
+        let server = std::thread::spawn(move || {
+            for reply in [None, Some("not json")] {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                if let Some(reply) = reply {
+                    let mut w = stream;
+                    let _ = writeln!(w, "{reply}");
+                }
+            }
+        });
+        let socket = sock.display().to_string();
+        let no_reply = AppIpcClient::roundtrip_typed(&socket, "t", crate::protocol::Request::List)
+            .expect_err("答えずに閉じる");
+        assert_eq!(no_reply, crate::Reason::AppNoReply);
+        assert_eq!(
+            no_reply.text_in(Lang::Ja),
+            "tako app から応答が返らなかった"
+        );
+        let unreadable =
+            AppIpcClient::roundtrip_typed(&socket, "t", crate::protocol::Request::List)
+                .expect_err("壊れた行");
+        let crate::Reason::ReplyUnreadable(error) = &unreadable else {
+            panic!("壊れた行は ipc.rs と同じ ReplyUnreadable: {unreadable:?}");
+        };
+        assert_eq!(
+            unreadable.text_in(Lang::Ja),
+            format!("応答を解釈できない: {error}")
+        );
+        let _ = server.join();
+
+        for reason in [&err, &no_reply, &unreadable] {
+            let en = reason.text_in(Lang::En);
+            assert!(!has_japanese(&en), "英語に日本語が混ざる: {en}");
+            assert_ne!(en, reason.text_in(Lang::Ja));
+        }
+        // 日本語の文言が ipc.rs と違う 3 つは、英語だけ ipc.rs と同じ意味の文を引く
+        assert_eq!(
+            crate::Reason::AppNoReply.text_in(Lang::En),
+            crate::Reason::NoReply.text_in(Lang::En)
         );
 
         assert!(

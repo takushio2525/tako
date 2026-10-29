@@ -166,12 +166,13 @@ pub fn update_at<R>(
     path: &Path,
     f: impl FnOnce(&mut RunConfigsFile) -> R,
 ) -> Result<(R, RunConfigsFile), String> {
-    let _lock = crate::config_io::lock_exclusive(path)?;
+    // 排他・書き出しの断りは `tako run-config` の断りと同じ表示言語で返す（型の口。#2365）
+    let _lock = crate::config_io::lock_exclusive_typed(path).map_err(|e| e.to_string())?;
     let mut store = load_from(path);
     let out = f(&mut store);
     store.tidy(FILES_MAX);
     let text = serde_json::to_string_pretty(&store).map_err(|e| e.to_string())? + "\n";
-    crate::config_io::atomic_write(path, &text)?;
+    crate::config_io::atomic_write_typed(path, &text).map_err(|e| e.to_string())?;
     Ok((out, store))
 }
 

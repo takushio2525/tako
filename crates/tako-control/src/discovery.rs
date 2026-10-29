@@ -70,12 +70,7 @@ fn instance_path(pid: u32) -> Option<PathBuf> {
 /// 自分のインスタンスファイル + current ポインタの両方を更新し、
 /// 死んだインスタンスの残骸ファイルを掃除する
 pub fn write(info: &ControlInfo) -> io::Result<PathBuf> {
-    let path = info_path().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "データディレクトリを解決できない",
-        )
-    })?;
+    let path = info_path().ok_or_else(|| crate::config_io::DataDirUnresolved.io_error())?;
     if let Some(instance) = instance_path(info.pid) {
         write_to(&instance, info)?;
     }
@@ -89,12 +84,8 @@ pub fn write(info: &ControlInfo) -> io::Result<PathBuf> {
 /// セカンダリモード（多重起動の後発。Issue #113）用: 生きているプライマリへの
 /// CLI / MCP 接続（control.json 経由）を奪わずに、自分もフォールバック候補列には載る
 pub fn write_instance_only(info: &ControlInfo) -> io::Result<PathBuf> {
-    let instance = instance_path(info.pid).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "データディレクトリを解決できない",
-        )
-    })?;
+    let instance =
+        instance_path(info.pid).ok_or_else(|| crate::config_io::DataDirUnresolved.io_error())?;
     write_to(&instance, info)?;
     Ok(instance)
 }

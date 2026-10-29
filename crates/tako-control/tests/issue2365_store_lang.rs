@@ -11,6 +11,12 @@
 //!
 //! を見る。置き場はテストのプロセスの隔離先（`paths::data_dir` の一時 dir）にあり、ケースごとに
 //! 消してから作る（壊れたファイル・読めないファイル・置き場の親がファイル）。
+//!
+//! #2365 の続き（全部の置き場が共有する書き出し `config_io`）: 置き場の断りを移した後も、排他・
+//! 書き出しの断り（「ロックファイルを開けない (…)」「バックアップの作成に失敗 (…)」「一時ファイルの
+//! 書き込みに失敗 (…)」ほか）は `config_io` の日本語の固定文のまま英語表示にも出ていた。ロックの
+//! 位置にフォルダ・世代バックアップの位置にフォルダ・書き込めない置き場のフォルダ（unix）を仕込み、
+//! 実行設定（`tako run-config` = `runner_defaults` の `path`）の置き場も同じく見る。
 //! 表示言語はプロセス全体の状態なので、**専用の統合テストバイナリの 1 本のテスト関数**の中で順に
 //! 切り替える。このファイルは修正前の木でもコンパイルできる API だけを使う（A/B: 修正前は英語表示の
 //! 検査で落ち、件数を出す）
@@ -71,6 +77,9 @@ struct Stores {
     gates: PathBuf,
     checkpoints: PathBuf,
     user_tasks: PathBuf,
+    run_configs: PathBuf,
+    /// 実行設定を書くケースが指すファイル（置き場の外。中身は読むだけ）
+    script: PathBuf,
 }
 
 impl Stores {
@@ -80,9 +89,19 @@ impl Stores {
             checkpoints: tako_control::task_checkpoints::store_path()
                 .expect("チェックポイントの置き場"),
             user_tasks: tako_control::user_tasks::store_path().expect("ユーザータスクの置き場"),
+            run_configs: tako_control::run_configs::store_path().expect("実行設定の置き場"),
+            script: std::env::temp_dir()
+                .join(format!("tako-2365-run-{}", std::process::id()))
+                .join("hello.py"),
         };
         let temp = std::env::temp_dir();
-        for path in [&stores.gates, &stores.checkpoints, &stores.user_tasks] {
+        for path in [
+            &stores.gates,
+            &stores.checkpoints,
+            &stores.user_tasks,
+            &stores.run_configs,
+            &stores.script,
+        ] {
             assert!(
                 path.starts_with(&temp),
                 "置き場がテストの隔離先の外を指している（本番の data dir に触らない）: {}",
@@ -94,9 +113,25 @@ impl Stores {
 
     /// ケースの前後で状態を持ち越さない（権限を戻してから消す。置き場の親に置いたファイルも消す）
     fn reset(&self) {
-        for path in [&self.gates, &self.checkpoints, &self.user_tasks] {
+        for path in [
+            &self.gates,
+            &self.checkpoints,
+            &self.user_tasks,
+            &self.run_configs,
+        ] {
+            if let Some(parent) = path.parent() {
+                make_writable_dir(parent);
+            }
             make_readable(path);
             let _ = std::fs::remove_file(path);
+            // 排他・世代バックアップの位置に仕込んだもの（フォルダ・ファイル）も消す
+            for suffix in [".lock", ".bak.1", ".bak.2", ".bak.3"] {
+                let mut name = path.file_name().unwrap_or_default().to_os_string();
+                name.push(suffix);
+                let sibling = path.with_file_name(name);
+                let _ = std::fs::remove_dir_all(&sibling);
+                let _ = std::fs::remove_file(&sibling);
+            }
         }
         if let Some(parent) = self.user_tasks.parent() {
             if parent.is_file() {
@@ -115,6 +150,18 @@ fn make_readable(path: &Path) {
 #[cfg(not(unix))]
 fn make_readable(_path: &Path) {}
 
+/// 書き込めなくした置き場のフォルダを戻す（`ReadOnlyParent` の後片付け）
+#[cfg(unix)]
+fn make_writable_dir(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if dir.is_dir() {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[cfg(not(unix))]
+fn make_writable_dir(_dir: &Path) {}
+
 /// ケースの前に置き場へ仕込むもの
 enum Setup {
     /// 何も置かない（置き場のファイルが無い）
@@ -125,6 +172,13 @@ enum Setup {
     Unreadable(fn(&Stores) -> &Path),
     /// 置き場の親フォルダの位置にファイルを置く（フォルダを作れない）
     ParentIsFile(fn(&Stores) -> &Path),
+    /// 排他のロックファイルの位置にフォルダを置く（ロックファイルを開けない）
+    LockIsDir(fn(&Stores) -> &Path),
+    /// 中身を書き、世代バックアップ `.bak.<n>` の位置にフォルダを置く（n = 1: 作れない /
+    /// n = 2: `.bak.1` はファイルにして繰り下げられない）
+    BackupIsDir(fn(&Stores) -> &Path, u32),
+    /// 置き場のフォルダを書き込めなくする（ロックファイルだけ先に置く = 一時ファイルで止まる。unix）
+    ReadOnlyParent(fn(&Stores) -> &Path),
 }
 
 struct Case {
@@ -141,6 +195,9 @@ fn checkpoints(s: &Stores) -> &Path {
 }
 fn user_tasks(s: &Stores) -> &Path {
     &s.user_tasks
+}
+fn run_configs(s: &Stores) -> &Path {
+    &s.run_configs
 }
 
 /// 構文の壊れた YAML（`[` が閉じていない）
@@ -351,6 +408,38 @@ fn cases() -> Vec<Case> {
             Setup::ParentIsFile(user_tasks),
             req("user_task", json!({ "action": "add", "title": "t" })),
         ),
+        // ---- 全部の置き場が共有する書き出し（config_io の排他・世代バックアップ）----
+        case(
+            "gate_lock_is_dir",
+            Setup::LockIsDir(gates),
+            req(
+                "task_gate",
+                json!({
+                    "action": "set",
+                    "task_id": "t1",
+                    "criteria_json": r#"[{"id":"a","kind":{"type":"custom","description":"d"}}]"#,
+                }),
+            ),
+        ),
+        case(
+            "checkpoint_backup_is_dir",
+            Setup::BackupIsDir(checkpoints, 1),
+            req(
+                "task_checkpoint",
+                json!({ "action": "checkpoint", "task_id": "t1", "phase": "running" }),
+            ),
+        ),
+        case(
+            "todo_backup_shift",
+            Setup::BackupIsDir(user_tasks, 2),
+            req("user_task", json!({ "action": "add", "title": "t" })),
+        ),
+        // 要求は観測の直前に組む（実行するファイルを作ってから = [`run_config_request`]）
+        case(
+            "run_config_lock_is_dir",
+            Setup::LockIsDir(run_configs),
+            Value::Null,
+        ),
     ];
     if cfg!(unix) {
         out.extend([
@@ -368,6 +457,11 @@ fn cases() -> Vec<Case> {
                 "todo_store_unreadable",
                 Setup::Unreadable(user_tasks),
                 req("user_task", json!({ "action": "show", "id": "u-1" })),
+            ),
+            case(
+                "todo_tmp_unwritable",
+                Setup::ReadOnlyParent(user_tasks),
+                req("user_task", json!({ "action": "add", "title": "t" })),
             ),
         ]);
     }
@@ -400,7 +494,69 @@ fn prepare(stores: &Stores, setup: &Setup) {
             let _ = std::fs::remove_dir_all(parent);
             std::fs::write(parent, "not a folder").expect("親の位置にファイルを置ける");
         }
+        Setup::LockIsDir(which) => {
+            std::fs::create_dir_all(sibling(which(stores), ".lock"))
+                .expect("ロックの位置にフォルダ");
+        }
+        Setup::BackupIsDir(which, generation) => {
+            write(which(stores), "version: 1\n");
+            if *generation > 1 {
+                std::fs::write(sibling(which(stores), ".bak.1"), "version: 1\n").expect("bak.1");
+            }
+            std::fs::create_dir_all(sibling(which(stores), &format!(".bak.{generation}")))
+                .expect("世代バックアップの位置にフォルダ");
+        }
+        Setup::ReadOnlyParent(which) => {
+            let path = which(stores);
+            let parent = path.parent().expect("親がある");
+            std::fs::create_dir_all(parent).expect("置き場の親を作れる");
+            std::fs::write(sibling(path, ".lock"), "").expect("ロックファイル");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o555))
+                    .expect("書き込めなくできる");
+            }
+        }
     }
+}
+
+/// 置き場の隣のファイル（`<名前><suffix>`。`config_io` の `.lock` / `.bak.<n>` と同じ置き方）
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// 実行設定を書く要求（`tako run-config <file> --args x` と同じ形。ファイルはここで作る）
+fn run_config_request(stores: &Stores) -> Value {
+    if let Some(dir) = stores.script.parent() {
+        std::fs::create_dir_all(dir).expect("スクリプトの置き場");
+    }
+    std::fs::write(&stores.script, "print('hi')\n").expect("スクリプト");
+    json!({
+        "method": "runner_defaults",
+        "params": { "path": stores.script.display().to_string(), "args": "x" },
+    })
+}
+
+/// 一時ファイルの名前（`<名前>.tmp.<pid>.<連番>`）の数字を伏せる（連番は書き込みの回数で変わる）
+fn mask_tmp(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(".tmp.") {
+        out.push_str(&rest[..at + ".tmp.".len()]);
+        rest = &rest[at + ".tmp.".len()..];
+        let digits = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        // 末尾の `.` は数字の区切りではない（`… (os error 13).` のような文の終わり）
+        let digits = rest[..digits].trim_end_matches('.').len();
+        out.push('N');
+        rest = &rest[digits..];
+    }
+    out.push_str(rest);
+    out
 }
 
 struct Seen {
@@ -416,15 +572,20 @@ fn observe(stores: &Stores) -> Vec<Seen> {
         .into_iter()
         .map(|case| {
             prepare(stores, &case.setup);
-            let request: Request = serde_json::from_value(case.wire.clone())
-                .unwrap_or_else(|e| panic!("{}: 要求を組めない: {e} / {}", case.name, case.wire));
+            let wire = if case.wire.is_null() {
+                run_config_request(stores)
+            } else {
+                case.wire.clone()
+            };
+            let request: Request = serde_json::from_value(wire.clone())
+                .unwrap_or_else(|e| panic!("{}: 要求を組めない: {e} / {wire}", case.name));
             let text = match tako_control::dispatch(&mut host, request, PaneOrigin::Cli) {
                 Err(e) => e.to_string(),
                 Ok(v) => format!("<断られずに通った: {v}>"),
             };
             Seen {
                 name: case.name,
-                text,
+                text: mask_tmp(&text),
             }
         })
         .collect();
@@ -434,8 +595,11 @@ fn observe(stores: &Stores) -> Vec<Seen> {
 
 /// #2365 より前の日本語の文（修正前の木で [`observe`] が返した文そのもの。前置き込み）。
 /// OS の文（`os error N`）は実行環境の std の文を埋める
-fn old_ja(name: &str) -> String {
+fn old_ja(name: &str, stores: &Stores) -> String {
     let os = |code: i32| std::io::Error::from_raw_os_error(code).to_string();
+    // フォルダをファイルとして開く・複製先にする・上書きの rename 先にする（unix は EISDIR = 21・
+    // Windows は ERROR_ACCESS_DENIED = 5）
+    let is_dir = || os(if cfg!(windows) { 5 } else { 21 });
     match name {
         "gate_criteria_not_json" => {
             "criteria の JSON パースに失敗: expected ident at line 1 column 2".into()
@@ -493,6 +657,32 @@ fn old_ja(name: &str) -> String {
             format!("task_checkpoints.yaml の読み取りに失敗: {}", os(13))
         }
         "todo_store_unreadable" => format!("user-tasks.yaml の読み取りに失敗: {}", os(13)),
+        // 全部の置き場が共有する書き出し（config_io の排他・世代バックアップ・一時ファイル）
+        "gate_lock_is_dir" => format!(
+            "ロックファイルを開けない ({}): {}",
+            sibling(&stores.gates, ".lock").display(),
+            is_dir()
+        ),
+        "checkpoint_backup_is_dir" => format!(
+            "バックアップの作成に失敗 ({}): {}",
+            stores.checkpoints.display(),
+            is_dir()
+        ),
+        "todo_backup_shift" => format!(
+            "バックアップの繰り下げに失敗 ({}): {}",
+            sibling(&stores.user_tasks, ".bak.1").display(),
+            is_dir()
+        ),
+        "run_config_lock_is_dir" => format!(
+            "ロックファイルを開けない ({}): {}",
+            sibling(&stores.run_configs, ".lock").display(),
+            is_dir()
+        ),
+        "todo_tmp_unwritable" => format!(
+            "一時ファイルの書き込みに失敗 ({}N): {}",
+            sibling(&stores.user_tasks, ".tmp.").display(),
+            os(13)
+        ),
         other => panic!("旧文の表に無いケース: {other}"),
     }
 }
@@ -507,6 +697,9 @@ fn 置き場の断りは表示言語に従う() {
         by_lang.push((lang, observe(&stores)));
     }
     i18n::set_lang(original);
+    if let Some(dir) = stores.script.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     let mut failures = Vec::new();
     let (mut en_japanese, mut ja_mismatch) = (0, 0);
@@ -515,7 +708,7 @@ fn 置き場の断りは表示言語に従う() {
             println!("[{lang:?}] {}: {}", s.name, s.text);
             match lang {
                 Lang::Ja => {
-                    let old = old_ja(s.name);
+                    let old = old_ja(s.name, &stores);
                     if s.text != old {
                         ja_mismatch += 1;
                         failures.push(format!(
