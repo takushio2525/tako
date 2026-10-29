@@ -27,8 +27,10 @@
 //!
 //! ## 何を違反とするか（**誤検知しない形**）
 //!
-//! 対象は `crates/tako-control/src/dispatch.rs` の**実 PTY を張るテストだけ**
-//! （`TerminalSession::spawn(` を持つ関数本体）。
+//! 対象は `crates/tako-control/src/dispatch.rs` と `crates/tako-control/src/test_write_isolation.rs`
+//! （#2479）の**実 PTY を張るテストだけ**（`TerminalSession::spawn(` を持つ関数本体）。
+//! 1 と 5 は両方のファイルを、2〜4 は dispatch.rs の #1308 の現場を、6 は
+//! test_write_isolation.rs のシェル probe を見る。
 //!
 //! 1. 実 PTY を張るテストが待ちを持つなら、上限は `state_wait_budget` 由来であること
 //!    （#1297 の `issue1297_実ptyのゴースト提案で…` は自前の `Instant::now() + budget` だが
@@ -41,6 +43,11 @@
 //! 5. （#2415）実 PTY を張るテストは、どれも**素の既定**（`SpawnOptions::default()` =
 //!    開発者のログインシェル）を起こさないこと。セッションがあるだけでよいなら
 //!    `i2415_session_options` を通す
+//! 6. （#2479）対話ログインシェルの履歴（#1253）を見る子の probe `shell_probe` は、
+//!    ログインシェルそのものが主題なので素の既定を理由つきで残すが、待ちは**尽きたら落ちる**
+//!    ドライバ `wait_for_shell` を前提（プロンプト）と本題（打った行の実行）の 2 回通し、
+//!    打つのは前提を待った後であること。旧実装は固定 20 秒の窓で待ち、尽きても検査せずに打ち、
+//!    実行を見届けられなくても警告だけで返していた（= 履歴の番犬が何も見ないまま緑）
 
 use std::path::{Path, PathBuf};
 
@@ -56,12 +63,24 @@ const DRIVER: &str = "i1308_wait_for_state";
 /// 自前の待ち（固定窓）の印
 const HAND_ROLLED: [&str; 3] = ["Instant::now() +", "thread::sleep", "for _ in 0.."];
 
-fn target() -> PathBuf {
+/// 走査するファイル（リポジトリルートからの相対）
+const DISPATCH: &str = "crates/tako-control/src/dispatch.rs";
+/// #2479: 対話ログインシェルの履歴（#1253）を見る子の probe の置き場
+const WRITE_ISOLATION: &str = "crates/tako-control/src/test_write_isolation.rs";
+/// 実 PTY を張るテストの共通の検査（1 と 5）を当てるファイル
+const TARGETS: [&str; 2] = [DISPATCH, WRITE_ISOLATION];
+
+/// #2479 の現場（子のシェル probe）
+const PROBE: &str = "shell_probe";
+/// その状態待ちのドライバ（尽きたら panic する）
+const PROBE_DRIVER: &str = "wait_for_shell";
+
+fn target(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("リポジトリルート")
-        .join("crates/tako-control/src/dispatch.rs")
+        .join(rel)
 }
 
 /// 切り出した関数本体（`file:line` で名指しできるよう開始行も持つ）
@@ -126,24 +145,23 @@ fn blank_arm(body: &str) -> (String, usize) {
 #[path = "common/code_view.rs"]
 mod code_view;
 
+fn read(rel: &str) -> String {
+    std::fs::read_to_string(target(rel)).unwrap_or_else(|e| panic!("{rel} を読める: {e}"))
+}
+
 fn read_src() -> String {
-    std::fs::read_to_string(target()).expect("dispatch.rs を読める")
+    read(DISPATCH)
 }
 
 /// 違反の名指し（`file:line fn 名: 理由`）
-fn at(body: &Body, offset: usize, why: &str) -> String {
-    format!(
-        "crates/tako-control/src/dispatch.rs:{} fn {}: {why}",
-        body.line + offset,
-        body.name
-    )
+fn at(rel: &str, body: &Body, offset: usize, why: &str) -> String {
+    format!("{rel}:{} fn {}: {why}", body.line + offset, body.name)
 }
 
-#[test]
-fn 実ptyを張るテストの待ちはstate_wait_budget由来である() {
-    let src = read_src();
+/// 実 PTY を張るテストのうち、自前の固定窓で待っている行を `file:line fn 名` で返す
+fn hand_rolled_offenders(rel: &str, src: &str) -> Vec<String> {
     let mut offenders: Vec<String> = Vec::new();
-    for body in bodies(&src) {
+    for body in bodies(src) {
         if !body.text.contains("TerminalSession::spawn(") {
             continue;
         }
@@ -155,6 +173,7 @@ fn 実ptyを張るテストの待ちはstate_wait_budget由来である() {
         for (n, line) in code.lines().enumerate() {
             if let Some(pat) = HAND_ROLLED.iter().find(|p| line.contains(**p)) {
                 offenders.push(at(
+                    rel,
                     &body,
                     n,
                     &format!("実 PTY を自前の固定窓（`{pat}`）で待っている"),
@@ -162,12 +181,22 @@ fn 実ptyを張るテストの待ちはstate_wait_budget由来である() {
             }
         }
     }
+    offenders
+}
+
+#[test]
+fn 実ptyを張るテストの待ちはstate_wait_budget由来である() {
+    let offenders: Vec<String> = TARGETS
+        .iter()
+        .flat_map(|rel| hand_rolled_offenders(rel, &read(rel)))
+        .collect();
     assert!(
         offenders.is_empty(),
         "固定窓は「窓が足りない」のか「シェルが起きていない」のかを診断から消す\n\
          （#1308 は起動前の PTY へ打ち込み、`#1200 の回帰`という無関係な原因で落ちていた）。\n\
          上限は `tako_core::wait_budget::state_wait_budget`（混み具合で伸ばすだけ・\n\
-         4 倍で打ち切り）由来にするか、`{DRIVER}` を通すこと:\n  {}",
+         4 倍で打ち切り）由来にするか、`{DRIVER}`（{WRITE_ISOLATION} は `{PROBE_DRIVER}`）を\n\
+         通すこと:\n  {}",
         offenders.join("\n  ")
     );
 }
@@ -183,6 +212,7 @@ fn issue1308の現場は状態待ちのドライバを通している() {
     let mut offenders: Vec<String> = Vec::new();
     if !code.contains(&format!("{DRIVER}(")) {
         offenders.push(at(
+            DISPATCH,
             &body,
             0,
             &format!("状態待ちのドライバ（{DRIVER}）を通していない"),
@@ -190,7 +220,12 @@ fn issue1308の現場は状態待ちのドライバを通している() {
     }
     for (n, line) in code.lines().enumerate() {
         if let Some(pat) = HAND_ROLLED.iter().find(|p| line.contains(**p)) {
-            offenders.push(at(&body, n, &format!("自前の待ち（`{pat}`）が戻っている")));
+            offenders.push(at(
+                DISPATCH,
+                &body,
+                n,
+                &format!("自前の待ち（`{pat}`）が戻っている"),
+            ));
         }
     }
     assert!(
@@ -291,12 +326,13 @@ const BARE_DEFAULT: &str = "SpawnOptions::default()";
 ///
 /// `..SpawnOptions::default()`（構造体の残りを埋める形 = `command` を自分で渡している）は
 /// 違反にしない。目印 `tako:login-shell-ok` の後ろに理由があれば通す
-/// （ログインシェルそのものが主題のテスト用。今の dispatch.rs には無い）。
+/// （ログインシェルそのものが主題のテスト用。今は test_write_isolation.rs の `shell_probe`
+/// = 対話ログインシェルの履歴（#1253）だけ。dispatch.rs には無い）。
 ///
 /// 既知の穴: `Default::default()` で作る形・`SpawnOptions { cwd, ..SpawnOptions::default() }`
 /// のように `command` を渡さない構造体・素の既定を返す helper を通す形は見えない
 /// （helper は理由を doc に書く。#1308 の打ち込む経路 `i1308_spawn_options` がその形）
-fn login_shell_offenders(src: &str) -> Vec<String> {
+fn login_shell_offenders(rel: &str, src: &str) -> Vec<String> {
     let mut out = Vec::new();
     for body in bodies(src) {
         if !body.text.contains("TerminalSession::spawn(") {
@@ -321,6 +357,7 @@ fn login_shell_offenders(src: &str) -> Vec<String> {
                 continue;
             }
             out.push(at(
+                rel,
                 &body,
                 n,
                 &format!("実 PTY に素の `{BARE_DEFAULT}`（開発者のログインシェル）を起こしている"),
@@ -339,8 +376,11 @@ fn login_shell_offenders(src: &str) -> Vec<String> {
 /// 判定に要るのは「セッションがある」だけなので、直接起こす fixture へ寄せてある
 #[test]
 fn 実ptyを張るテストはposixで素のログインシェルを起こさない() {
+    let offenders: Vec<String> = TARGETS
+        .iter()
+        .flat_map(|rel| login_shell_offenders(rel, &read(rel)))
+        .collect();
     let src = read_src();
-    let offenders = login_shell_offenders(&src);
     assert!(
         offenders.is_empty(),
         "実 PTY を張るテストが開発者のログインシェル（rc を全部読む）を起こしている。\n\
@@ -399,7 +439,7 @@ fn ログインシェルの番犬は素の既定だけを名指しする() {
         "}",
     ]
     .join("\n");
-    let got = login_shell_offenders(&src);
+    let got = login_shell_offenders(DISPATCH, &src);
     let names: Vec<&str> = got
         .iter()
         .filter_map(|o| o.split(" fn ").nth(1))
@@ -417,9 +457,202 @@ fn ログインシェルの番犬は素の既定だけを名指しする() {
     );
 }
 
+/// #2479 の現場（子のシェル probe）の違反を `file:line fn 名` で返す。
+///
+/// - 状態待ちのドライバ [`PROBE_DRIVER`] を**前提（プロンプト）と本題（打った行の実行）の
+///   2 回**通していること（1 つの窓にまとめると「準備ができていない」と「本題が壊れた」が
+///   同じ失敗に見える = #1308 と同じ理由）
+/// - 打つ（`.write(`）のは**最初の待ちより後**であること（旧実装は尽きても検査せずに打っていた）
+/// - ドライバが予算（`state_wait_budget`）・混み具合・素通り防止（`panic!`）・診断の見出しを持つこと
+///
+/// 自前の固定窓（`Instant::now() +` 等）の復活は共通の検査（[`hand_rolled_offenders`]）が落とす
+fn probe_offenders(rel: &str, src: &str) -> Vec<String> {
+    let all = bodies(src);
+    let Some(probe) = all.iter().find(|b| b.name == PROBE) else {
+        return vec![format!(
+            "{rel}: #2479 の現場（fn {PROBE}）が切り出せていない"
+        )];
+    };
+    let mut out = Vec::new();
+    // コメントと文字列を潰した眺め（行番号は保たれる）
+    let code = code_view::code_view(&probe.text);
+    let call = format!("{PROBE_DRIVER}(");
+    let waits: Vec<usize> = code
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains(&call))
+        .map(|(n, _)| n)
+        .collect();
+    if waits.len() < 2 {
+        out.push(at(
+            rel,
+            probe,
+            0,
+            &format!(
+                "状態待ちのドライバ（{PROBE_DRIVER}）を前提（プロンプト）と本題（打った行の実行）の \
+                 2 回通していない（{} 回）",
+                waits.len()
+            ),
+        ));
+    }
+    if let Some(n) = code.lines().position(|l| l.contains(".write(")) {
+        if waits.first().is_none_or(|&w| n < w) {
+            out.push(at(
+                rel,
+                probe,
+                n,
+                "前提（プロンプト）を待つ前に打っている = 尽きても検査せずに打つ形",
+            ));
+        }
+    }
+    let Some(driver) = all.iter().find(|b| b.name == PROBE_DRIVER) else {
+        out.push(format!(
+            "{rel}: 状態待ちのドライバ（fn {PROBE_DRIVER}）が切り出せていない"
+        ));
+        return out;
+    };
+    let driver_code = code_view::without_comments(&driver.text);
+    for needed in [
+        "state_wait_budget(",
+        "machine_busy()",
+        "panic!(",
+        "TAKO_2479_WAIT",
+    ] {
+        if !driver_code.contains(needed) {
+            out.push(at(
+                rel,
+                driver,
+                0,
+                &format!(
+                    "`{needed}` が無い（予算・混み具合・素通り防止・診断のどれかが落ちている）"
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// #2479: 対話ログインシェルの履歴（#1253）を見る子の probe は、**尽きたら落ちる**状態待ちを
+/// 前提と本題の 2 回通し、前提を待ってから打つ。
+///
+/// 旧実装は固定 20 秒の窓でプロンプトを待ち、尽きても検査せずに打ち、実行を見届けられなくても
+/// 警告だけで返していた。打った行が実行されなければ履歴は書かれないので、番犬
+/// `検証プロセスはユーザーのシェル履歴へ書かない` が何も見ないまま緑になる（手元では、
+/// プロンプトに載る長い一時 dir 名で打った行が折り返し、注入なしでも毎回この形だった）
+#[test]
+fn issue2479_シェルprobeは尽きたら落ちる状態待ちを通す() {
+    let offenders = probe_offenders(WRITE_ISOLATION, &read(WRITE_ISOLATION));
+    assert!(
+        offenders.is_empty(),
+        "シェル probe（#1253）の待ちが、尽きたら落ちる形になっていない（#2479）。\n\
+         固定窓で待って尽きても次へ進むと、履歴の番犬が何も見ないまま緑になる。\n\
+         `{PROBE_DRIVER}` を前提（プロンプト）と本題（打った行の実行）の 2 回通し、\n\
+         打つのは前提を待った後にすること:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+/// 上の番犬の検出力: **修正前の形**（固定窓で待って尽きても打つ）と、ドライバを 1 回しか
+/// 通さない形・待つ前に打つ形・panic しないドライバを名指しし、直した形は通す
+#[test]
+fn シェルprobeの番犬は修正前の形を名指しする() {
+    let driver = [
+        "    fn wait_for_shell(what: &str) {",
+        "        let budget = tako_core::wait_budget::state_wait_budget(BASE, machine_busy());",
+        "        panic!(\"TAKO_2479_WAIT: 待っていたもの={what}\");",
+        "    }",
+    ];
+    let fixed = [
+        "mod tests {",
+        "    fn shell_probe() {",
+        "        let spawned = TerminalSession::spawn(80, 24, SpawnOptions::default());",
+        "        wait_for_shell(\"プロンプト\", None, &screen, &ready);",
+        "        let send = || session.write(line());",
+        "        wait_for_shell(\"実行\", Some(&send), &screen, &probe_executed);",
+        "    }",
+    ];
+    let src = |probe: &[&str], driver: &[&str]| -> String {
+        let mut lines: Vec<&str> = Vec::new();
+        lines.push("mod tests {");
+        lines.extend_from_slice(&probe[1..]);
+        lines.extend_from_slice(driver);
+        lines.push("}");
+        lines.join("\n")
+    };
+    assert_eq!(
+        probe_offenders(WRITE_ISOLATION, &src(&fixed, &driver)),
+        Vec::<String>::new(),
+        "直した形を名指しした"
+    );
+
+    // 修正前の形（#2479 の前の main と同じ並び）
+    let legacy = [
+        "mod tests {",
+        "    fn shell_probe() {",
+        "        let ready = std::time::Instant::now() + std::time::Duration::from_secs(20);",
+        "        while session.visible_lines().iter().all(|l| l.trim().is_empty()) {",
+        "            std::thread::sleep(poll);",
+        "        }",
+        "        session.write(format!(\"echo {SHELL_PROBE_MARKER}\\r\").into_bytes());",
+        "    }",
+    ];
+    let got = probe_offenders(WRITE_ISOLATION, &src(&legacy, &driver));
+    assert!(
+        got.iter()
+            .any(|o| o.contains(":2 fn shell_probe: 状態待ちのドライバ"))
+            && got.iter().any(|o| o.contains(":7 fn shell_probe: 前提")),
+        "修正前の形を名指しできていない: {got:#?}"
+    );
+
+    // ドライバを 1 回しか通さない（前提と本題を 1 つの窓にまとめた）形
+    let once = [fixed[0], fixed[1], fixed[2], fixed[4], fixed[5], fixed[6]];
+    let got = probe_offenders(WRITE_ISOLATION, &src(&once, &driver));
+    assert!(
+        got.iter().any(|o| o.contains("2 回通していない（1 回）")),
+        "1 回だけの待ちを名指しできていない: {got:#?}"
+    );
+
+    // 待つ前に打つ形
+    let early = [
+        fixed[0], fixed[1], fixed[2], fixed[4], fixed[3], fixed[5], fixed[6],
+    ];
+    let got = probe_offenders(WRITE_ISOLATION, &src(&early, &driver));
+    assert!(
+        got.iter().any(|o| o.contains(":4 fn shell_probe: 前提")),
+        "待つ前に打つ形を名指しできていない: {got:#?}"
+    );
+
+    // 尽きても panic しないドライバ（警告だけで返す = 旧実装の終わり方）
+    let quiet = [
+        driver[0],
+        driver[1],
+        "        eprintln!(\"warn: シェル probe のマーカーが画面に出そろわなかった\");",
+        driver[3],
+    ];
+    let got = probe_offenders(WRITE_ISOLATION, &src(&fixed, &quiet));
+    assert!(
+        got.iter().any(|o| o.contains("`panic!(` が無い"))
+            && got.iter().any(|o| o.contains("`TAKO_2479_WAIT` が無い")),
+        "panic しないドライバを名指しできていない: {got:#?}"
+    );
+}
+
 /// 走査先を取り違えて**何も見ていない番犬**になっていないこと
 #[test]
 fn 番犬が走査対象を見つけている() {
+    // #2479: test_write_isolation.rs のシェル probe が実 PTY を張る関数として見えている
+    let probe_src = read(WRITE_ISOLATION);
+    let probe_bodies = bodies(&probe_src);
+    assert!(
+        probe_bodies
+            .iter()
+            .any(|b| b.name == PROBE && b.text.contains("TerminalSession::spawn(")),
+        "{WRITE_ISOLATION} の #2479 の現場（{PROBE}）を実 PTY を張る関数として見つけられていない"
+    );
+    assert!(
+        probe_bodies.iter().any(|b| b.name == PROBE_DRIVER),
+        "{WRITE_ISOLATION} の状態待ちのドライバ（{PROBE_DRIVER}）を見つけられていない"
+    );
     let src = read_src();
     let all = bodies(&src);
     let pty: Vec<&Body> = all
