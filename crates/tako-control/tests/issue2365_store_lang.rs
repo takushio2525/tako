@@ -434,6 +434,7 @@ fn cases() -> Vec<Case> {
             Setup::BackupIsDir(user_tasks, 2),
             req("user_task", json!({ "action": "add", "title": "t" })),
         ),
+        // 要求は観測の直前に組む（実行するファイルを作ってから = [`run_config_request`]）
         case(
             "run_config_lock_is_dir",
             Setup::LockIsDir(run_configs),

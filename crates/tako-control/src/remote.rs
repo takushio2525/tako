@@ -1048,7 +1048,8 @@ impl AppIpcClient {
     ///
     /// 通信の断りを文にするのはここ 1 か所（#2365）。日英の対は [`crate::Reason`]、表示言語は
     /// GUI の外の解決（[`crate::settings::client_lang`]）で、`tako-cli` の ipc.rs の `refusal` と
-    /// 同じ引き方。同じ意味の文は ipc.rs と同じバリアントを使う（文言を 2 か所に書かない）。
+    /// 同じ引き方。日本語が ipc.rs と同じ文は同じバリアントを使い（文言を 2 か所に書かない）、
+    /// 日本語の文言が違っていた 3 つだけ `App…` のバリアント（英語は同じ意味の文を引く）。
     /// app から返った断り（内側の `Err` = [`AppCallError::Rejected`] の中身）は app の表示言語で
     /// 組まれている
     fn roundtrip_detailed(
