@@ -20,6 +20,10 @@
 //!    `legacy_resume_command` を呼ぶ製品コードが決まった場所だけ（照会の経路から呼ばない）
 //! 3. [`打った時点の組み立ては_1_実装を通る`] — CLI の `orchestrator_resume` が `registry_resume_launch` →
 //!    `worker_resume_launch`（spawn の `build_worker_cmd_in`）を通り、MCP の設定ファイルを書いてから走らせる
+//! 4. [`無人の復旧は_path_の_tako_に頼らない`] — supervisor の自動復旧（`recover_dead`）が死んだペインへ
+//!    打つ 1 行は、表示用の素の `tako …` ではなく `unattended_resume_line`（動いている tako と同じ場所の
+//!    CLI の絶対パス）。PATH の先頭に古い開発ビルドの `tako` が居る機械では、素の `tako` は
+//!    `orchestrator resume` を知らずに落ちる
 //!
 //! 落ちたときは `ファイル:行` を名指しする。
 
@@ -288,4 +292,50 @@ fn 打った時点の組み立ては_1_実装を通る() {
             "復旧が spawn の組み立ての写しを持っている（1 実装から外れた）",
         );
     }
+}
+
+/// 4: 無人の復旧（supervisor）は PATH の先頭の `tako` に頼らず、動いている tako と同じ場所の CLI を打つ
+#[test]
+fn 無人の復旧は_path_の_tako_に頼らない() {
+    const SUPERVISOR: &str = "crates/tako-control/src/orchestrator/supervisor.rs";
+    let src = read(SUPERVISOR);
+    let dead = fn_lines(&src, SUPERVISOR, "pub fn recover_dead(");
+    forbid(
+        &dead,
+        SUPERVISOR,
+        "format!(\"{cmd}\\r\")",
+        "表示用の案内（素の `tako …`）をそのまま打っている = PATH の先頭の古い tako に当たる",
+    );
+    require(
+        &dead,
+        SUPERVISOR,
+        "unattended_resume_line(cmd, &ctx.resume_shell)",
+        "無人で打つ 1 行を動いている tako と同じ場所の CLI へ書き換えていない",
+    );
+    let lp = fn_lines(&src, SUPERVISOR, "pub fn supervisor_loop(");
+    require(
+        &lp,
+        SUPERVISOR,
+        "ResumeShell::current()",
+        "supervisor が打ち込む先のシェル（隣の CLI）を実物から引いていない",
+    );
+
+    let registry = read(REGISTRY);
+    let line = fn_lines(&registry, REGISTRY, "pub fn unattended_resume_line(");
+    for (needle, why) in [
+        ("shell.cli", "隣の CLI を使っていない"),
+        (
+            "ShellDialect::PowerShell => format!(\"& {program} {args}\")",
+            "PowerShell で引用したパスを呼び出し演算子なしで打っている（文字列として評価され起動しない）",
+        ),
+    ] {
+        require(&line, REGISTRY, needle, why);
+    }
+    let current = fn_lines(&registry, REGISTRY, "    pub fn current() -> Self {");
+    require(
+        &current,
+        REGISTRY,
+        "tako_cli_path::current_cli()",
+        "隣の CLI を実体の在り処の正本（tako_cli_path::current_cli）から引いていない",
+    );
 }

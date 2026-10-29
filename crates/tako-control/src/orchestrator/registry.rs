@@ -1043,6 +1043,51 @@ pub fn resume_command(worker_id: &str, entry: &WorkerEntry) -> Option<String> {
     Some(format!("tako orchestrator resume {worker_id}"))
 }
 
+/// 案内（[`resume_command`]）を打ち込む先のシェル（#2470）。無人の経路が打つ 1 行を決める材料
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeShell {
+    /// 動いている tako と同じ場所の CLI（実行中バイナリの隣。無ければ `None` = 素の `tako`）
+    pub cli: Option<PathBuf>,
+    /// 打ち込む先のシェルの方言（起動コマンドの組み立てと同じ `launch_cmd::launch_dialect`）
+    pub dialect: crate::launch_cmd::ShellDialect,
+}
+
+impl ResumeShell {
+    /// この tako のプロセスから見た値（実体の在り処の正本は `tako_cli_path::current_cli`）
+    pub fn current() -> Self {
+        Self {
+            cli: tako_core::tako_cli_path::current_cli(),
+            dialect: crate::launch_cmd::launch_dialect(),
+        }
+    }
+}
+
+/// 案内を**無人で**シェルへ打ち込むときの 1 行（#2470。supervisor の自動復旧）。
+///
+/// 表示用の案内は #322 どおり素の `tako orchestrator resume <N>` だが、打ち込む先のシェルの PATH で
+/// 最初に当たる `tako` が動いている GUI と同じ版とは限らない（開発用の古い `target/release/tako` が
+/// PATH の先頭に居る機械がある = 古い CLI は `orchestrator resume` を知らず、無人の復旧が必ず落ちる）。
+/// 無人の経路は**動いている tako と同じ場所の CLI** を絶対パスで、方言どおりにクォートして打つ
+/// （PowerShell は呼び出し演算子 `&` が要る）。隣に CLI が無い（開発の `cargo run` 等）ときと、
+/// 案内が `tako orchestrator resume` でない（`TAKO_2470_LEGACY=1` の claude の直起動）ときはそのまま
+pub fn unattended_resume_line(guide: &str, shell: &ResumeShell) -> String {
+    use crate::launch_cmd::{quote, ShellDialect};
+    let Some(args) = guide
+        .strip_prefix("tako ")
+        .filter(|rest| rest.starts_with("orchestrator resume "))
+    else {
+        return guide.to_string();
+    };
+    let Some(cli) = shell.cli.as_deref() else {
+        return guide.to_string();
+    };
+    let program = quote(shell.dialect, &cli.display().to_string());
+    match shell.dialect {
+        ShellDialect::Posix => format!("{program} {args}"),
+        ShellDialect::PowerShell => format!("& {program} {args}"),
+    }
+}
+
 /// #2470 の A/B。`TAKO_2470_LEGACY=1` で**同一バイナリのまま**復旧の案内を修正前の
 /// `cd <cwd> && claude --model … --effort … --resume <id>` へ戻す
 /// （`tako orchestrator resume` もこの 1 行をそのままシェルで走らせる）
@@ -2414,6 +2459,64 @@ mod tests {
         };
         assert!(resume_command("7", &codex).is_none());
         assert!(resume_command("", &entry).is_none());
+    }
+
+    /// #2470: 無人で打つ 1 行は、動いている tako と同じ場所の CLI を絶対パスで（PATH の先頭の古い
+    /// `tako` に当たらない）。方言どおりにクォートし、PowerShell は呼び出し演算子を付ける。
+    /// 隣に CLI が無い・案内が `tako orchestrator resume` でないときはそのまま
+    #[test]
+    fn issue2470_無人で打つ1行は隣のcliの絶対パス() {
+        use crate::launch_cmd::ShellDialect;
+        let guide = "tako orchestrator resume 7";
+        let shell = |cli: Option<&str>, dialect| ResumeShell {
+            cli: cli.map(PathBuf::from),
+            dialect,
+        };
+        assert_eq!(
+            unattended_resume_line(
+                guide,
+                &shell(
+                    Some("/Applications/tako.app/Contents/MacOS/tako"),
+                    ShellDialect::Posix
+                )
+            ),
+            "/Applications/tako.app/Contents/MacOS/tako orchestrator resume 7"
+        );
+        assert_eq!(
+            unattended_resume_line(
+                guide,
+                &shell(Some("/Users/x/My Apps/tako.app/tako"), ShellDialect::Posix)
+            ),
+            "'/Users/x/My Apps/tako.app/tako' orchestrator resume 7"
+        );
+        assert_eq!(
+            unattended_resume_line(
+                guide,
+                &shell(
+                    Some(r"C:\Users\x\AppData\Local\Programs\tako\tako.exe"),
+                    ShellDialect::PowerShell
+                )
+            ),
+            r"& 'C:\Users\x\AppData\Local\Programs\tako\tako.exe' orchestrator resume 7"
+        );
+        // 隣に CLI が無い（cargo run 等）= 素の `tako`
+        assert_eq!(
+            unattended_resume_line(guide, &shell(None, ShellDialect::Posix)),
+            guide
+        );
+        // 修正前の案内（claude の直起動）・別のコマンドは書き換えない
+        let legacy = "cd '/tmp/p' && claude --resume abc";
+        assert_eq!(
+            unattended_resume_line(legacy, &shell(Some("/opt/tako"), ShellDialect::Posix)),
+            legacy
+        );
+        assert_eq!(
+            unattended_resume_line(
+                "tako send --pane 3 x",
+                &shell(Some("/opt/tako"), ShellDialect::Posix)
+            ),
+            "tako send --pane 3 x"
+        );
     }
 
     /// 以下 2 本は修正前の形（`TAKO_2470_LEGACY=1` の腕 = `legacy_resume_command`）

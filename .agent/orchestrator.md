@@ -809,8 +809,13 @@ closed にしても `resume_command` / `report --worker` / `workers --all` は�
 ### `tako orchestrator resume <worker_id>`（突然死からの復旧。#390 / #2470）
 
 worker_status / watch（`WORKER_DEAD`）/ workers の `resume_command` がこの 1 行。**死んだ worker のペインの
-シェルで打つ**（supervisor の自動復旧 `auto_resume_dead` も同じ 1 行をそのペインへ送る。master は
-`tako_send_input` で送る）。CLI がレジストリの spawn の記録（project / label / cwd / model / effort /
+シェルで打つ**（master は `tako_send_input` で送る）。表示用の案内は #322 どおり素の `tako …` だが、
+**無人の経路（supervisor の自動復旧 `recover_dead`）は PATH に頼らない**: 打ち込む先のシェルの PATH の先頭に
+`orchestrator resume` を知らない古い `tako`（開発用の `target/release/tako` 等）が居ると必ず落ちるので、
+動いている tako と同じ場所の CLI（実行中バイナリの隣 = `tako_cli_path::current_cli`）を絶対パスで、
+方言どおりにクォートして打つ（PowerShell は `& '<path>' orchestrator resume N`。隣に CLI が無い `cargo run` 等だけ
+素の `tako`。`registry::unattended_resume_line`）。なお `supervisor_loop` は #401 から製品コードの呼び手が無い
+（`auto_resume_dead` は設定と状態表示だけ）ので、いまの本番で無人の打ち込みは起きない。CLI がレジストリの spawn の記録（project / label / cwd / model / effort /
 spawn した master のプロファイル）から、GUI の復元・`tako sessions resume` と同じ
 `resume_launch::worker_resume_launch`（spawn の `build_worker_cmd_in` に会話 ID を渡す）で起動コマンドを組み、
 MCP の設定ファイル（#2412 の `--settings`）を書いて、**このシェルのプロセスを置き換えて**起動する。

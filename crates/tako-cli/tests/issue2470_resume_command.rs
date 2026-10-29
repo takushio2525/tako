@@ -12,6 +12,11 @@
 //! 会話の記録はアカウントの設定 dir（`CLAUDE_CONFIG_DIR`）に置く（`--account` で spawn した worker と同じ形。
 //! user scope の MCP はその dir の `.claude.json` から読まれる）。A/B は `TAKO_2470_LEGACY=1`
 //! （修正前の案内を同じ走らせ方で走らせる）。
+//!
+//! 無人の自動復旧（supervisor の `recover_dead`）は案内を死んだペインのシェルへ打ち込む。そのシェルの PATH の
+//! 先頭に `orchestrator resume` を知らない古い `tako`（開発用の `target/release/tako` 等）が居ても、
+//! 動いている tako と同じ場所の CLI を絶対パスで打って戻すことを、本物の `/bin/sh` で見る
+//! （`無人の復旧は_path_の先頭の古い_tako_に当たらない`）。
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -32,6 +37,13 @@ const FAKE_CLAUDE: &str = r#"#!/bin/sh
   echo "T2470_ENV=${T2470_ENV-<unset>}"
   for a in "$@"; do echo "arg=$a"; done
 } > "$T2470_OUT"
+"#;
+
+/// 偽の古い tako: `orchestrator resume` を知らない開発ビルド。呼ばれたことを残して clap と同じ形で落ちる
+const STALE_TAKO: &str = r#"#!/bin/sh
+echo "$*" >> "$T2470_STALE_LOG"
+echo "error: unrecognized subcommand 'resume'" >&2
+exit 2
 "#;
 
 struct Env {
@@ -150,6 +162,47 @@ impl Env {
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
+    }
+
+    fn stale_log(&self) -> PathBuf {
+        self.dir.path().join("stale-tako.log")
+    }
+
+    /// PATH の先頭（偽 claude と同じ dir）へ、`orchestrator resume` を知らない古い tako を置く
+    fn install_stale_tako(&self) {
+        let tako = self.bin().join("tako");
+        std::fs::write(&tako, STALE_TAKO).unwrap();
+        std::fs::set_permissions(&tako, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// 死んだ worker のペインのシェル: 打ち込まれた文字を本物の `/bin/sh` が読む。端末は Enter の
+    /// `\r` を改行へ直して渡す（ICRNL）ので、同じ変換をしてから標準入力へ流す。env は `resume` と同じ
+    fn pane_shell(&self, typed: &str) -> i32 {
+        use std::io::Write;
+        let _ = std::fs::remove_file(self.out());
+        let mut child = Command::new("/bin/sh")
+            .current_dir(self.dir.path())
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", self.bin().display()))
+            .env("HOME", self.home())
+            .env("SHELL", "/bin/sh")
+            .env("TAKO_ISOLATED", "1")
+            .env("TAKO_DATA_DIR", self.dir.path())
+            .env("CLAUDE_CONFIG_DIR", self.account())
+            .env("T2470_OUT", self.out())
+            .env("T2470_STALE_LOG", self.stale_log())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("/bin/sh を起こせない");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(typed.replace('\r', "\n").as_bytes())
+            .unwrap();
+        child.wait().unwrap().code().unwrap_or(-1)
     }
 
     /// 偽 claude が受け取ったもの（起動されていなければ panic）
@@ -328,4 +381,97 @@ fn 記録が足りなければ起動せずに理由で止まる() {
         "既定プロファイルでも MCP の絞り込みは spawn と同じ: {:?}",
         got.args()
     );
+}
+
+/// 差し戻し（#2470）: 無人の自動復旧（supervisor の `recover_dead`）は、死んだペインのシェルの PATH の先頭に
+/// `orchestrator resume` を知らない古い tako が居ても、動いている tako と同じ場所の CLI を絶対パスで打って戻す
+#[test]
+fn 無人の復旧は_path_の先頭の古い_tako_に当たらない() {
+    use std::cell::RefCell;
+    use tako_control::launch_cmd::ShellDialect;
+    use tako_control::orchestrator::registry::ResumeShell;
+    use tako_control::orchestrator::supervisor::{
+        recover_dead, SupervisorContext, SupervisorMode, SupervisorState,
+    };
+    use tako_control::protocol::Request;
+
+    // supervisor の監査ログ（data dir の supervisor.log）を本番へ書かない（テストのプロセスは一時 dir）
+    let data = tako_core::paths::data_dir().expect("data dir");
+    assert!(
+        data.starts_with(std::env::temp_dir()),
+        "本番の data dir へ書こうとしている: {}",
+        data.display()
+    );
+    let env = Env::new();
+    env.install_stale_tako();
+    let guide = "tako orchestrator resume 7";
+
+    // 修正前（PR の head の recover_dead は表示用の案内をそのまま打っていた）: 古い tako に当たって落ちる
+    let code = env.pane_shell(&format!("{guide}\r"));
+    assert_ne!(code, 0, "古い tako で通ってしまった");
+    let stale = std::fs::read_to_string(env.stale_log()).unwrap_or_default();
+    assert!(
+        stale.contains("orchestrator resume 7"),
+        "PATH の先頭の古い tako に当たっていない: {stale:?}"
+    );
+    assert!(!env.out().exists(), "古い tako のはずが claude が起動した");
+    std::fs::remove_file(env.stale_log()).unwrap();
+
+    // 修正後: supervisor の経路そのもの（recover_dead）が打つ 1 行を同じシェルへ流す。
+    // 動いている tako と同じ場所の CLI = このテストが叩いている本物の CLI
+    let typed = RefCell::new(Vec::<String>::new());
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_tako"));
+    let recovered = {
+        let mut exec = |r: Request| -> Result<serde_json::Value, String> {
+            match r {
+                Request::Send { text, .. } => {
+                    typed.borrow_mut().push(text.clone());
+                    env.pane_shell(&text);
+                    Ok(serde_json::json!({"ok": true}))
+                }
+                Request::OrchestratorWorkerStatus { .. } => Ok(serde_json::json!({
+                    "status": if env.out().exists() { "busy" } else { "idle" }
+                })),
+                _ => Err("mock".into()),
+            }
+        };
+        let mut ctx = SupervisorContext {
+            exec: &mut exec,
+            pane_id: 5,
+            worker_id: "7".into(),
+            mode: SupervisorMode::Auto,
+            auto_resume_dead: true,
+            max_retries: 3,
+            resume_shell: ResumeShell {
+                cli: Some(cli.clone()),
+                dialect: ShellDialect::Posix,
+            },
+        };
+        let mut state = SupervisorState::default();
+        recover_dead(&mut ctx, Some(guide), &mut state)
+    };
+    let typed = typed.into_inner();
+    assert_eq!(typed.len(), 1, "{typed:?}");
+    assert!(
+        typed[0].contains(&cli.display().to_string()) && !typed[0].starts_with("tako "),
+        "無人の復旧が PATH の tako を打っている: {:?}",
+        typed[0]
+    );
+    assert!(
+        recovered,
+        "supervisor の復旧が busy を確かめられなかった: {typed:?}"
+    );
+    assert!(
+        !env.stale_log().exists(),
+        "古い tako に当たった: {:?}",
+        std::fs::read_to_string(env.stale_log())
+    );
+    let got = env.captured();
+    assert!(
+        got.arg_after("--settings").is_some(),
+        "spawn と同じ起動で戻っていない: {:?}",
+        got.args()
+    );
+    assert_eq!(got.arg_after("--permission-mode"), Some("auto"));
+    assert_eq!(got.arg_after("--resume"), Some(SID));
 }

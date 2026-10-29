@@ -141,6 +141,8 @@ pub struct SupervisorContext<'a> {
     pub mode: SupervisorMode,
     pub auto_resume_dead: bool,
     pub max_retries: u32,
+    /// 突然死からの復旧で案内を打ち込む先のシェル（#2470。動いている tako と同じ場所の CLI と方言）
+    pub resume_shell: crate::orchestrator::registry::ResumeShell,
 }
 
 /// 復旧履歴の 1 エントリ
@@ -715,8 +717,11 @@ pub fn recover_dead(
         return false;
     };
 
-    // resume コマンドをシェルへ送る
-    let send = (ctx.exec)(send_request(ctx.pane_id, format!("{cmd}\r")));
+    // resume コマンドをシェルへ送る。#2470: 案内は表示用の素の `tako orchestrator resume <N>` なので、
+    // 無人で打つ 1 行は PATH の先頭の `tako`（古い開発ビルド等）に頼らず、動いている tako と同じ場所の
+    // CLI を絶対パスで打つ（監査ログには表示用の案内のまま残す）
+    let line = crate::orchestrator::registry::unattended_resume_line(cmd, &ctx.resume_shell);
+    let send = (ctx.exec)(send_request(ctx.pane_id, format!("{line}\r")));
     if let Err(ref e) = send {
         audit_log(
             &ctx.worker_id,
@@ -990,6 +995,7 @@ pub fn supervisor_loop(
             mode,
             auto_resume_dead,
             max_retries,
+            resume_shell: crate::orchestrator::registry::ResumeShell::current(),
         };
 
         // 通知イベント生成（全モードで master へ通知する）
@@ -1361,6 +1367,11 @@ mod tests {
             mode,
             auto_resume_dead: true,
             max_retries: 3,
+            // 隣の CLI が無い構成（`cargo run` 等）= 案内をそのまま打つ
+            resume_shell: crate::orchestrator::registry::ResumeShell {
+                cli: None,
+                dialect: crate::launch_cmd::ShellDialect::Posix,
+            },
         }
     }
 
@@ -1446,6 +1457,41 @@ mod tests {
         assert_eq!(state.history.len(), 1);
         assert!(state.history[0].success);
         assert_eq!(state.history[0].trigger, "dead");
+    }
+
+    /// #2470: 無人で打ち込む 1 行は PATH の `tako` ではなく、動いている tako と同じ場所の CLI の絶対パス
+    #[test]
+    fn recover_dead_は隣のcliを絶対パスで打つ() {
+        let sent = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = sent.clone();
+        let mut exec = move |r: Request| -> Result<Value, String> {
+            match r {
+                Request::Send { text, .. } => {
+                    sink.lock().unwrap().push(text);
+                    Ok(json!({"ok": true}))
+                }
+                Request::OrchestratorWorkerStatus { .. } => Ok(json!({"status": "busy"})),
+                _ => Err("mock".into()),
+            }
+        };
+        let mut ctx = make_ctx(&mut exec, SupervisorMode::Auto);
+        ctx.resume_shell = crate::orchestrator::registry::ResumeShell {
+            cli: Some(std::path::PathBuf::from(
+                "/Applications/tako.app/Contents/MacOS/tako",
+            )),
+            dialect: crate::launch_cmd::ShellDialect::Posix,
+        };
+        let mut state = SupervisorState::default();
+        assert!(recover_dead(
+            &mut ctx,
+            Some("tako orchestrator resume 7"),
+            &mut state
+        ));
+        assert_eq!(
+            sent.lock().unwrap().as_slice(),
+            ["/Applications/tako.app/Contents/MacOS/tako orchestrator resume 7\r".to_string()],
+            "PATH の先頭の tako（古い開発ビルド等）に頼らない"
+        );
     }
 
     #[test]

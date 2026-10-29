@@ -48044,6 +48044,7 @@ mod tests {
                 mode: SupervisorMode::Auto,
                 auto_resume_dead: false,
                 max_retries: 3,
+                resume_shell: crate::orchestrator::registry::ResumeShell::current(),
             };
             let mut state = SupervisorState::default();
             if wants_prompt_resend(&v) {
