@@ -6,11 +6,12 @@
 //! 名前の検査（#428）・器ごとの組み立ての差が本番で効いていなかった。#881 では psmux 側の
 //! 組み立てを直しても実機で何も変わらず、気づくのに実機 1 往復かかった。
 //!
-//! ここでは 2 点を見張る:
+//! ここでは次を見張る:
 //!
 //! 1. tako-core の外の製品コード（tako-app / tako-control / tako-cli の `src`）が
 //!    `wrap_options(` を直接呼んでいない（戻ったら file:line を名指しで落とす）
-//! 2. tako-app の `spawn_session` が `backend::wrap_spawn_for_pane(` を通っている
+//! 2. tako-app の `spawn_session` が `backend::wrap_spawn_for_pane(` を通り、器の名前の
+//!    払い出し（dispatch の事前予約 `reserve_backend_session`）も `backend::reserve_for_pane(` を通る
 
 use std::path::{Path, PathBuf};
 
@@ -84,22 +85,59 @@ fn tako_coreの外の製品コードはwrap_optionsを直接呼ばない() {
     );
 }
 
-#[test]
-fn tako_appのspawn_sessionはbackendの入口を通る() {
-    const MAIN: &str = "crates/tako-app/src/main.rs";
-    let src = std::fs::read_to_string(repo_root().join(MAIN))
-        .unwrap_or_else(|e| panic!("{MAIN} を読めない: {e}"));
-    let start = src.find("fn spawn_session(").unwrap_or_else(|| {
-        panic!("{MAIN} に spawn_session が無い（名前が変わったならこの番犬も直す）")
-    });
-    let line = src[..start].lines().count() + 1;
-    // 次のメソッド（同じ字下げの `fn `）の手前までを本体とみなす
+const MAIN: &str = "crates/tako-app/src/main.rs";
+
+fn read_main() -> String {
+    std::fs::read_to_string(repo_root().join(MAIN))
+        .unwrap_or_else(|e| panic!("{MAIN} を読めない: {e}"))
+}
+
+/// `head`（`fn 名前(`）から次のメソッド（同じ字下げの `fn `）の手前までを本体とみなし、
+/// 定義の行番号（1 始まり）と本体を返す
+fn method_body<'a>(src: &'a str, head: &str) -> (usize, &'a str) {
+    let start = src
+        .find(head)
+        .unwrap_or_else(|| panic!("{MAIN} に {head} が無い（名前が変わったならこの番犬も直す）"));
+    let line = src[..start].matches('\n').count() + 1;
     let body = &src[start..];
     let end = body[1..].find("\n    fn ").map_or(body.len(), |i| i + 1);
-    let body = &body[..end];
+    (line, &body[..end])
+}
+
+#[test]
+fn tako_appのspawn_sessionはbackendの入口を通る() {
+    let src = read_main();
+    let (line, body) = method_body(&src, "fn spawn_session(");
     assert!(
         body.contains("wrap_spawn_for_pane("),
         "{MAIN}:{line} の spawn_session が `tako_core::backend::wrap_spawn_for_pane` を通っていない（#885）"
+    );
+}
+
+/// 器の名前の払い出し（dispatch の事前予約 = `reserve_backend_session`）も同じ入口を通る。
+/// 名前を手で払い出して map へ入れる形（`or_insert_with(new_backend_session_name)`）へ戻ると、
+/// 器の名前の検査（#428）を通っていない名前が spawn の前に外（orchestrator の台帳）へ出る
+#[test]
+fn 器の名前の払い出しはbackendの入口を通る() {
+    let src = read_main();
+    let minted: Vec<String> = src
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| {
+            !l.trim_start().starts_with("//")
+                && l.contains("or_insert_with(new_backend_session_name)")
+        })
+        .map(|(i, l)| format!("{MAIN}:{}: {}", i + 1, l.trim()))
+        .collect();
+    assert!(
+        minted.is_empty(),
+        "器の名前を backend の入口（reserve_for_pane / wrap_spawn_for_pane）を通さずに払い出している（#885）:\n{}",
+        minted.join("\n")
+    );
+    let (line, body) = method_body(&src, "fn reserve_backend_session(");
+    assert!(
+        body.contains("reserve_for_pane("),
+        "{MAIN}:{line} の reserve_backend_session が `tako_core::backend::reserve_for_pane` を通っていない（#885）"
     );
 }
 

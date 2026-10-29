@@ -28856,16 +28856,18 @@ impl SystemHost for TakoApp {
     }
 
     fn reserve_backend_session(&mut self, pane: PaneId) -> Option<String> {
-        if self.tmux_persist && tako_core::backend::capabilities().survives_app_exit {
-            Some(
-                self.backend_sessions
-                    .entry(pane)
-                    .or_insert_with(new_backend_session_name)
-                    .clone(),
-            )
-        } else {
-            None
-        }
+        // #885: 器の名前の払い出しは spawn と同じ backend の入口（reserve_for_pane）を通す
+        // （器を配るかの判断と器の名前の検査 = #428 を spawn_session と 1 箇所に揃える）
+        let existing = self.backend_sessions.get(&pane).cloned();
+        let session = tako_core::backend::reserve_for_pane(
+            tako_core::backend::backend(),
+            self.tmux_persist,
+            existing.as_deref(),
+            new_backend_session_name,
+        )?;
+        let name = session.into_string();
+        self.backend_sessions.insert(pane, name.clone());
+        Some(name)
     }
 
     fn update_status(&self) -> serde_json::Value {
