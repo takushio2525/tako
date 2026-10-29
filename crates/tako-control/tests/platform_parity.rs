@@ -867,10 +867,12 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         (
             "crates/tako-cli/src/main.rs",
-            1,
+            3,
             "番犬（#1958）が**自分と同じテストバイナリ**を `TAKO_PANE_ID` の有無の 2 通りで起こす \
              `#[cfg(test)]` の 1 箇所（env は起動時にしか変えられないため）。製品の起動ではないので \
-             Windows の GUI からは到達しない",
+             Windows の GUI からは到達しない。残り 2 件は `tako orchestrator resume`（#2470）が \
+             組んだ起動コマンドを打ったシェル（POSIX の sh / PowerShell）で走らせる対話起動で、\
+             端末の中でエージェントと対話するので窓を隠してはいけない（GUI からは起こさない）",
         ),
         (
             "crates/tako-cli/src/mcp_bridge.rs",

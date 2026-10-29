@@ -1060,7 +1060,7 @@
       "key": "worker_death_resume",
       "summary_ja": "突然死を検知して復旧コマンドを提示する（#390）",
       "evidence": "source",
-      "evidence_detail": "dispatch.rs のレジストリの resume_command はコメントどおり claude のみ （session ID から claude --resume を組む）",
+      "evidence_detail": "registry.rs の resume_command はコメントどおり claude のみ （案内 tako orchestrator resume <worker_id> が spawn と同じ組み立てで claude --resume を組む。#2470）",
       "agents": {
         "claude": {
           "status": "supported"

@@ -141,8 +141,9 @@ codex の tako の MCP の一時注入（#986）が外れていた（実測: 隔
   claude は `--resume` の前。worker 以外（master / solo / 役割の無いペイン）には足さない
 - **設定ファイル**: GUI の復元はその場で打つので spawn と同じく書いてから使い（書けなければカタログのメタの形で
   起動して persist.log へ `[restore] pane=N worker …`）、カタログの再開は下見では書かない（実行時の materialize）
-- **対象外**: 突然死の復旧案内（worker_status の `resume_command` = #390 / #2470）。状態照会のたびに組まれるので
-  user scope の `.claude.json`（数百 KB）を読む判断を載せない
+- **突然死の復旧案内（#2470）**: worker_status の `resume_command` は `tako orchestrator resume <worker_id>` の
+  1 行だけを返し、同じ判断・同じ断片は**打った時点で**載せる（状態照会のたびに user scope の `.claude.json`
+  （数百 KB）を読まない）。下の「`tako orchestrator resume`」
 - A/B は `TAKO_2447_LEGACY=1`（復元とカタログの再開に断片を載せない = #2447 前）。実経路の測り方は
   `scripts/test-resume-worker-mcp-2447.sh`（隔離 GUI + 実物の codex + 偽 claude）
 
@@ -804,6 +805,30 @@ GC は `workers` の列挙のついでに走る（別コマンドは要らない
 過渡状態で生きている worker を落とさないため、`dead_since` を刻んでから確認期間を待つ。
 closed にしても `resume_command` / `report --worker` / `workers --all` は引けるので、
 突然死からの復旧材料（#390）は失われない。
+
+### `tako orchestrator resume <worker_id>`（突然死からの復旧。#390 / #2470）
+
+worker_status / watch（`WORKER_DEAD`）/ workers の `resume_command` がこの 1 行。**死んだ worker のペインの
+シェルで打つ**（master は `tako_send_input` で送る）。表示用の案内は #322 どおり素の `tako …` だが、
+**無人の経路（supervisor の自動復旧 `recover_dead`）は PATH に頼らない**: 打ち込む先のシェルの PATH の先頭に
+`orchestrator resume` を知らない古い `tako`（開発用の `target/release/tako` 等）が居ると必ず落ちるので、
+動いている tako と同じ場所の CLI（実行中バイナリの隣 = `tako_cli_path::current_cli`）を絶対パスで、
+方言どおりにクォートして打つ（PowerShell は `& '<path>' orchestrator resume N`。隣に CLI が無い `cargo run` 等だけ
+素の `tako`。`registry::unattended_resume_line`）。なお `supervisor_loop` は #401 から製品コードの呼び手が無い
+（`auto_resume_dead` は設定と状態表示だけ）ので、いまの本番で無人の打ち込みは起きない。CLI がレジストリの spawn の記録（project / label / cwd / model / effort /
+spawn した master のプロファイル）から、GUI の復元・`tako sessions resume` と同じ
+`resume_launch::worker_resume_launch`（spawn の `build_worker_cmd_in` に会話 ID を渡す）で起動コマンドを組み、
+MCP の設定ファイル（#2412 の `--settings`）を書いて、**このシェルのプロセスを置き換えて**起動する。
+新しいペインは作らないので、ペイン番号での追跡（watch / report / worker_status）はそのまま続く。GUI は要らない。
+
+- アカウントは会話の記録がある設定 dir へ寄せる（記録が既定の `~/.claude` なら `unset CLAUDE_CONFIG_DIR`。
+  親のシェルが別アカウントの値を持っていても会話の在る側で開く = #652）
+- 作業 dir（worktree）が消えていれば起動せずに止まる。会話 ID 未検出・claude 以外・知らない worker ID も理由で止まる
+- #2470 より前に spawn した worker（`WorkerEntry.profile` が無い）は既定プロファイルで組み、`警告:` を出す
+- 新しいペインで開き直したいとき（ペインごと消えた closed の worker 等）は、そのペインのシェルで同じ 1 行を打つか、
+  `tako sessions resume <会話 ID>`（新しいペインを分割する。こちらは GUI が要る）
+- A/B は `TAKO_2470_LEGACY=1`（修正前の案内 `cd <cwd> && claude --model … --effort … --resume <id>` を出し、
+  この CLI もそれをそのまま走らせる）
 
 ### `tako orchestrator watch`
 

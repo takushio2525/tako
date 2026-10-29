@@ -1561,8 +1561,8 @@ pub const MATRIX: &[AgentFeature] = &[
         agy: pending(notes::NOT_WIRED, 975),
         local: local_pending_first_class(),
         evidence: AgentEvidence::Source(
-            "dispatch.rs のレジストリの resume_command はコメントどおり claude のみ \
-             （session ID から claude --resume を組む）",
+            "registry.rs の resume_command はコメントどおり claude のみ \
+             （案内 tako orchestrator resume <worker_id> が spawn と同じ組み立てで claude --resume を組む。#2470）",
         ),
     },
     AgentFeature {

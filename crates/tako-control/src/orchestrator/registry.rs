@@ -168,6 +168,11 @@ pub struct WorkerEntry {
     /// `agent_exited` のとき、シェルが報告した終了コード（OSC 133;D。無ければ None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_exit_code: Option<i32>,
+    /// spawn した master のプロファイル名（#2470。`default` を含む）。突然死からの復旧
+    /// （`tako orchestrator resume <worker_id>`）が spawn と同じプロファイルで組むための記録。
+    /// #2470 前のファイルには無い = serde の default で None として読める（移行は要らない）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// 起動失敗の理由（Issue #1940）。綴りは `workers` の `launch_failure` にそのまま出る
@@ -374,6 +379,8 @@ pub struct RegisterSpawn {
     pub ledger_id: Option<String>,
     pub cwd: Option<String>,
     pub prompt_head: Option<String>,
+    /// spawn した master のプロファイル名（#2470）
+    pub profile: Option<String>,
 }
 
 /// spawn した worker をレジストリへ登録し、発番した worker ID を返す。
@@ -421,6 +428,7 @@ pub fn record_spawn(record: RegisterSpawn) -> Result<String, String> {
                 launch_failed_at: None,
                 launch_failure: None,
                 launch_exit_code: None,
+                profile: record.profile.clone(),
             },
         );
         reg.gc();
@@ -1013,13 +1021,85 @@ pub fn resend_command(entry: &WorkerEntry) -> Option<String> {
     Some(format!("tako send --pane {} '<同じ依頼文>'", entry.pane))
 }
 
-/// レジストリの session ID から復旧コマンドを組み立てる（#390: SIGSEGV 等の
-/// 突然死からの復旧提示）。claude のみ（--resume の互換が確認できているのは claude）。
-/// master はこのコマンドを死んだペインのシェルへ send_input するか、新ペインで実行する。
+/// 突然死からの復旧コマンド（#390: SIGSEGV 等の突然死からの復旧提示）。claude の worker で
+/// session ID を検出済みのときだけ出す（`--resume` の互換が確認できているのは claude）。
+/// master / supervisor はこの 1 行を**死んだペインのシェルへ送る**か、新しいペインで実行する。
 ///
-/// 会話が既定以外の config ディレクトリにあれば `CLAUDE_CONFIG_DIR` を前置する
-/// （`--account` で spawn した worker の会話は `~/.claude` に無い。Issue #652）
-pub fn resume_command(entry: &WorkerEntry) -> Option<String> {
+/// #2470: 案内は `tako orchestrator resume <worker_id>` の 1 行で、**起動コマンドは打った時点で**
+/// spawn と同じ組み立て（`resume_launch::registry_resume_launch` = `build_worker_cmd_in` に会話 ID を
+/// 渡す 1 実装）で組む。照会（worker_status / watch / workers）のたびに組むと、spawn と同じ判断のために
+/// user scope の `.claude.json`（1 本 260〜350 KB × アカウント数）を読むことになるので、ここは
+/// **ファイルを 1 つも読まない純関数**に保つ（番犬 `issue2470_resume_command_watchdog`）。
+/// #2470 前は `cd <cwd> && claude --model … --effort … --resume <id>` を組んでいて、#2412 の
+/// `--settings`（user scope の MCP を止める）・プロファイルの args（`--permission-mode auto`）と env・
+/// `TAKO_ORCHESTRATOR_ROLE` が落ちていた。A/B は `TAKO_2470_LEGACY=1`
+pub fn resume_command(worker_id: &str, entry: &WorkerEntry) -> Option<String> {
+    if legacy_2470() {
+        return legacy_resume_command(entry);
+    }
+    if entry.agent != "claude" || entry.session_id.is_none() || worker_id.is_empty() {
+        return None;
+    }
+    Some(format!("tako orchestrator resume {worker_id}"))
+}
+
+/// 案内（[`resume_command`]）を打ち込む先のシェル（#2470）。無人の経路が打つ 1 行を決める材料
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeShell {
+    /// 動いている tako と同じ場所の CLI（実行中バイナリの隣。無ければ `None` = 素の `tako`）
+    pub cli: Option<PathBuf>,
+    /// 打ち込む先のシェルの方言（起動コマンドの組み立てと同じ `launch_cmd::launch_dialect`）
+    pub dialect: crate::launch_cmd::ShellDialect,
+}
+
+impl ResumeShell {
+    /// この tako のプロセスから見た値（実体の在り処の正本は `tako_cli_path::current_cli`）
+    pub fn current() -> Self {
+        Self {
+            cli: tako_core::tako_cli_path::current_cli(),
+            dialect: crate::launch_cmd::launch_dialect(),
+        }
+    }
+}
+
+/// 案内を**無人で**シェルへ打ち込むときの 1 行（#2470。supervisor の自動復旧）。
+///
+/// 表示用の案内は #322 どおり素の `tako orchestrator resume <N>` だが、打ち込む先のシェルの PATH で
+/// 最初に当たる `tako` が動いている GUI と同じ版とは限らない（開発用の古い `target/release/tako` が
+/// PATH の先頭に居る機械がある = 古い CLI は `orchestrator resume` を知らず、無人の復旧が必ず落ちる）。
+/// 無人の経路は**動いている tako と同じ場所の CLI** を絶対パスで、方言どおりにクォートして打つ
+/// （PowerShell は呼び出し演算子 `&` が要る）。隣に CLI が無い（開発の `cargo run` 等）ときと、
+/// 案内が `tako orchestrator resume` でない（`TAKO_2470_LEGACY=1` の claude の直起動）ときはそのまま
+pub fn unattended_resume_line(guide: &str, shell: &ResumeShell) -> String {
+    use crate::launch_cmd::{quote, ShellDialect};
+    let Some(args) = guide
+        .strip_prefix("tako ")
+        .filter(|rest| rest.starts_with("orchestrator resume "))
+    else {
+        return guide.to_string();
+    };
+    let Some(cli) = shell.cli.as_deref() else {
+        return guide.to_string();
+    };
+    let program = quote(shell.dialect, &cli.display().to_string());
+    match shell.dialect {
+        ShellDialect::Posix => format!("{program} {args}"),
+        ShellDialect::PowerShell => format!("& {program} {args}"),
+    }
+}
+
+/// #2470 の A/B。`TAKO_2470_LEGACY=1` で**同一バイナリのまま**復旧の案内を修正前の
+/// `cd <cwd> && claude --model … --effort … --resume <id>` へ戻す
+/// （`tako orchestrator resume` もこの 1 行をそのままシェルで走らせる）
+pub fn legacy_2470() -> bool {
+    std::env::var("TAKO_2470_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// 修正前（#2470 前）の復旧コマンド。照会のたびに会話の記録の所在を探し、会話が既定以外の
+/// config ディレクトリにあれば `CLAUDE_CONFIG_DIR` を前置する（#652）
+pub fn legacy_resume_command(entry: &WorkerEntry) -> Option<String> {
     let env_prefix = entry
         .session_id
         .as_deref()
@@ -1028,7 +1108,7 @@ pub fn resume_command(entry: &WorkerEntry) -> Option<String> {
     resume_command_with_env(entry, env_prefix.as_deref())
 }
 
-/// `resume_command` の本体（env プレフィクスを引数で受け取るテスト可能版）
+/// `legacy_resume_command` の本体（env プレフィクスを引数で受け取るテスト可能版）
 fn resume_command_with_env(entry: &WorkerEntry, env_prefix: Option<&str>) -> Option<String> {
     if entry.agent != "claude" {
         return None;
@@ -1388,7 +1468,7 @@ pub fn list_payload(
             "launch_failure": e.launch_failure,
             "launch_exit_code": e.launch_exit_code,
             "launch_failed_at": e.launch_failed_at,
-            "resume_command": resume_command(e),
+            "resume_command": resume_command(id, e),
             // #822: 利用上限後の自動復帰（FR-2.27）が有効か。ペインが生きていないときは
             // ペイン属性を読めない（番号が別ペインへ再利用されている可能性もある）ので null
             "limit_resume": pane_alive.then(|| limit_resume_panes.contains(&e.pane)),
@@ -1468,6 +1548,7 @@ mod tests {
             ledger_id: Some("L1".into()),
             cwd: Some("/tmp/proj".into()),
             prompt_head: Some("Issue #390: ...".into()),
+            profile: None,
         }
     }
 
@@ -1514,6 +1595,7 @@ mod tests {
                     launch_failed_at: None,
                     launch_failure: None,
                     launch_exit_code: None,
+                    profile: record.profile.clone(),
                 },
             );
             reg.gc();
@@ -2348,6 +2430,96 @@ mod tests {
         );
     }
 
+    /// #2470: 案内は打った時点で spawn と同じ組み立てを通す 1 行。照会のたびに組まない
+    /// （ファイルを読まない = 同じ入力なら常に同じ文字列・設定や会話の記録の有無に依らない）
+    #[test]
+    fn issue2470_resume_commandは打った時点で組む1行だけを返す() {
+        let entry = WorkerEntry {
+            agent: "claude".into(),
+            session_id: Some("abc-123".into()),
+            cwd: Some("/tmp/proj".into()),
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            profile: Some("p2470".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resume_command("7", &entry).as_deref(),
+            Some("tako orchestrator resume 7")
+        );
+        // 会話 ID 未検出・claude 以外・ID が空は案内しない（従来と同じ条件）
+        let no_sid = WorkerEntry {
+            session_id: None,
+            ..entry.clone()
+        };
+        assert!(resume_command("7", &no_sid).is_none());
+        let codex = WorkerEntry {
+            agent: "codex".into(),
+            ..entry.clone()
+        };
+        assert!(resume_command("7", &codex).is_none());
+        assert!(resume_command("", &entry).is_none());
+    }
+
+    /// #2470: 無人で打つ 1 行は、動いている tako と同じ場所の CLI を絶対パスで（PATH の先頭の古い
+    /// `tako` に当たらない）。方言どおりにクォートし、PowerShell は呼び出し演算子を付ける。
+    /// 隣に CLI が無い・案内が `tako orchestrator resume` でないときはそのまま
+    #[test]
+    fn issue2470_無人で打つ1行は隣のcliの絶対パス() {
+        use crate::launch_cmd::ShellDialect;
+        let guide = "tako orchestrator resume 7";
+        let shell = |cli: Option<&str>, dialect| ResumeShell {
+            cli: cli.map(PathBuf::from),
+            dialect,
+        };
+        assert_eq!(
+            unattended_resume_line(
+                guide,
+                &shell(
+                    Some("/Applications/tako.app/Contents/MacOS/tako"),
+                    ShellDialect::Posix
+                )
+            ),
+            "/Applications/tako.app/Contents/MacOS/tako orchestrator resume 7"
+        );
+        assert_eq!(
+            unattended_resume_line(
+                guide,
+                &shell(Some("/Users/x/My Apps/tako.app/tako"), ShellDialect::Posix)
+            ),
+            "'/Users/x/My Apps/tako.app/tako' orchestrator resume 7"
+        );
+        assert_eq!(
+            unattended_resume_line(
+                guide,
+                &shell(
+                    Some(r"C:\Users\x\AppData\Local\Programs\tako\tako.exe"),
+                    ShellDialect::PowerShell
+                )
+            ),
+            r"& 'C:\Users\x\AppData\Local\Programs\tako\tako.exe' orchestrator resume 7"
+        );
+        // 隣に CLI が無い（cargo run 等）= 素の `tako`
+        assert_eq!(
+            unattended_resume_line(guide, &shell(None, ShellDialect::Posix)),
+            guide
+        );
+        // 修正前の案内（claude の直起動）・別のコマンドは書き換えない
+        let legacy = "cd '/tmp/p' && claude --resume abc";
+        assert_eq!(
+            unattended_resume_line(legacy, &shell(Some("/opt/tako"), ShellDialect::Posix)),
+            legacy
+        );
+        assert_eq!(
+            unattended_resume_line(
+                "tako send --pane 3 x",
+                &shell(Some("/opt/tako"), ShellDialect::Posix)
+            ),
+            "tako send --pane 3 x"
+        );
+    }
+
+    /// 以下 2 本は修正前の形（`TAKO_2470_LEGACY=1` の腕 = `legacy_resume_command`）
     #[test]
     fn resume_commandはsession検出済みclaudeのみ組み立てる() {
         let entry = WorkerEntry {
@@ -2638,7 +2810,7 @@ mod tests {
         assert!(entry.dead_since.is_none(), "倒したら死亡マークは畳む");
         // #390 の追跡・復旧材料は closed でも残っている
         assert_eq!(entry.session_id.as_deref(), Some("sid-42"));
-        assert!(resume_command(entry).is_some());
+        assert!(resume_command(&id, entry).is_some());
         // ディスクにも反映されている
         let on_disk = WorkerRegistry::load_from(&path).unwrap();
         assert_eq!(on_disk.workers[&id].status, "closed");

@@ -16798,6 +16798,10 @@ fn dispatch_orchestrator_spawn(
             warning: profile_warning,
         },
     ) = spawn_caller_profile(host, pane, caller_role);
+    // #2470: 読んだプロファイルの名前（レジストリへ記録し、突然死からの復旧が同じプロファイルで組む）。
+    // ペインを分割する前に引く（spawned_by を辿る起点は呼び出し元）
+    let caller_profile =
+        caller_profile_name(host.workspace(), pane.map(PaneId::from_raw), &role_suffix);
 
     // Part 2: projects 制限の強制（Issue #500）。プロファイルに projects が設定されている場合、
     // 範囲外のプロジェクトへの spawn を拒否する
@@ -17154,6 +17158,7 @@ fn dispatch_orchestrator_spawn(
             ledger_id: Some(ledger_id.clone()).filter(|s| !s.is_empty()),
             cwd: Some(cwd.clone()),
             prompt_head: Some(crate::sessions::prompt_head(prompt, 200)),
+            profile: Some(caller_profile),
         })
         .unwrap_or_else(|e| {
             eprintln!("warning: worker レジストリへの登録に失敗: {e}");
@@ -17768,7 +17773,8 @@ fn finish_worker_status(
         && recent_output.is_some();
     let registry_resume_command = registry_worker
         .as_ref()
-        .and_then(|(_, e)| orchestrator::registry::resume_command(e));
+        // #2470: 打った時点で spawn と同じ組み立てを通す 1 行（照会ではファイルを読まない）
+        .and_then(|(id, e)| orchestrator::registry::resume_command(id, e));
     let registry_launch_failure = registry_worker.as_ref().and_then(|(_, e)| {
         e.launch_failure
             .clone()
@@ -24939,16 +24945,26 @@ fn resolve_caller_profile_with_role(
     // 旧形式のプロファイル・設定を実行時に検知して直す（#916 の二段構え 2 段目）。
     // 1 プロセス 1 回しか実際には走らないので、この頻繁な経路から呼んでも軽い
     let _ = crate::migrations::ensure_migrated();
+    let name = &caller_profile_name(workspace, caller, role_suffix);
+    crate::orchestrator::master_launch::load_caller_profile(name, launching)
+}
+
+/// 呼び出し元 master のプロファイル名（無ければ `default`）。読み込み（[`resolve_caller_profile_with_role`]）と
+/// worker レジストリへの記録（#2470 = 突然死からの復旧が同じプロファイルで組む）が同じ解決を通る
+fn caller_profile_name(
+    workspace: &tako_core::Workspace,
+    caller: Option<PaneId>,
+    role_suffix: &Option<String>,
+) -> String {
     let suffix = role_suffix
         .clone()
         .or_else(|| caller.and_then(|pid| find_master_suffix_from(workspace, pid)))
         .unwrap_or_default();
-    let name = if suffix.is_empty() {
-        "default"
+    if suffix.is_empty() {
+        "default".to_string()
     } else {
-        &suffix
-    };
-    crate::orchestrator::master_launch::load_caller_profile(name, launching)
+        suffix
+    }
 }
 
 /// caller ペインから master の role suffix を検索する。
@@ -29114,6 +29130,7 @@ mod tests {
             ledger_id: None,
             cwd: None,
             prompt_head: None,
+            profile: None,
         })
         .expect("レジストリへ登録できる");
 
@@ -29176,6 +29193,7 @@ mod tests {
             ledger_id: None,
             cwd: None,
             prompt_head: None,
+            profile: None,
         })
         .expect("レジストリへ登録できる");
         for pane in [ghost, alive] {
@@ -48026,6 +48044,7 @@ mod tests {
                 mode: SupervisorMode::Auto,
                 auto_resume_dead: false,
                 max_retries: 3,
+                resume_shell: crate::orchestrator::registry::ResumeShell::current(),
             };
             let mut state = SupervisorState::default();
             if wants_prompt_resend(&v) {
@@ -48669,20 +48688,16 @@ mod tests {
             .filter_map(|e| e["kind"].as_str())
             .collect();
         assert!(kinds.contains(&"agent_dead"), "events: {kinds:?}");
-        assert_eq!(
-            v["resume_command"],
-            "cd '/tmp/proj' && claude --resume sid-7802"
-        );
+        // #2470: 案内は打った時点で spawn と同じ組み立てを通す 1 行（照会では組まない）
+        let guide = format!("tako orchestrator resume {id}");
+        assert_eq!(v["resume_command"], guide.as_str());
         let dead_ev = v["events"]
             .as_array()
             .unwrap()
             .iter()
             .find(|e| e["kind"] == "agent_dead")
             .unwrap();
-        assert_eq!(
-            dead_ev["resume_command"],
-            "cd '/tmp/proj' && claude --resume sid-7802"
-        );
+        assert_eq!(dead_ev["resume_command"], guide.as_str());
         assert_eq!(dead_ev["recommended_action"], "resume_session");
         // session 検出済みなので prompt_undelivered は出ない
         assert!(!kinds.contains(&"prompt_undelivered"));

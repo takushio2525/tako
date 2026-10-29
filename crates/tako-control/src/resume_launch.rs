@@ -351,6 +351,85 @@ pub fn worker_resume_launch(
     ))
 }
 
+/// 突然死からの復旧（`tako orchestrator resume <worker_id>`。#2470）の起動コマンド。
+///
+/// 材料は worker レジストリの spawn の記録（project / label / cwd / model / effort / 起動した master の
+/// プロファイル）で、組み立ては GUI の復元・`tako sessions resume`・会話を保った再起動と同じ
+/// [`worker_resume_launch`]（spawn の `build_worker_cmd_in` に会話 ID を渡す）。MCP の絞り込み（#2412 の
+/// `--settings`）もここで spawn と同じ判断を通すので、user scope の `.claude.json` を読むのは
+/// **打った時点の 1 回だけ**（照会の `registry::resume_command` は読まない）。
+/// 設定ファイルは下見では書かないので、実行する側が [`ResumeLaunch::materialize`] を呼ぶ
+pub fn registry_resume_launch(
+    entry: &crate::orchestrator::registry::WorkerEntry,
+) -> Result<ResumeLaunch, String> {
+    let location = entry
+        .session_id
+        .as_deref()
+        .and_then(crate::transcript::locate_transcript);
+    registry_resume_launch_in(
+        entry,
+        location.as_ref(),
+        &crate::dispatch::resolve_tako_binary(),
+        crate::launch_cmd::launch_dialect(),
+    )
+}
+
+/// [`registry_resume_launch`] の本体（会話の所在・tako の実体パス・方言を引数で受ける）
+pub fn registry_resume_launch_in(
+    entry: &crate::orchestrator::registry::WorkerEntry,
+    location: Option<&TranscriptLocation>,
+    tako_bin: &str,
+    dialect: crate::launch_cmd::ShellDialect,
+) -> Result<ResumeLaunch, String> {
+    // 案内（`registry::resume_command`）と同じ条件。codex / agy の突然死からの復旧は能力マトリクスの
+    // `worker_death_resume`（#975）
+    if entry.agent != "claude" {
+        return Err(format!(
+            "突然死からの復旧は claude の worker だけ（この worker は {}）",
+            if entry.agent.is_empty() {
+                "agent 未記録"
+            } else {
+                entry.agent.as_str()
+            }
+        ));
+    }
+    let session_id = entry.session_id.as_deref().ok_or(
+        "この worker は会話 ID が未検出なので再開できない（起動直後に落ちた・まだ走査されていない）",
+    )?;
+    // spawn の記録をカタログのメタの形へ写す（kind = worker なので spawn と同じ組み立てを通る）
+    let catalog = SessionEntry {
+        kind: "worker".into(),
+        agent: Some(entry.agent.clone()),
+        project: Some(entry.project.clone()).filter(|p| !p.is_empty()),
+        label: entry.label.clone(),
+        cwd: entry.cwd.clone(),
+        model: entry.model.clone(),
+        effort: entry.effort.clone(),
+        ..Default::default()
+    };
+    let hints = ResumeHints {
+        worker_profile: entry.profile.clone(),
+        // レジストリの記録は spawn が決めた値そのもの（`None` も「--model を付けなかった」）
+        worker_launch: Some(RecordedLaunch {
+            model: entry.model.clone(),
+            effort: entry.effort.clone(),
+        }),
+    };
+    let mut launch = worker_resume_launch(
+        session_id, &catalog, &hints, location, None, tako_bin, dialect,
+    )
+    .ok_or("この worker の系統は spawn と同じ組み立てで再開できない")??;
+    if entry.profile.is_none() {
+        launch.warnings.insert(
+            0,
+            "spawn した master のプロファイルの記録が無い（#2470 より前に spawn した worker）ので、\
+             既定プロファイルの設定で組んだ"
+                .to_string(),
+        );
+    }
+    Ok(launch)
+}
+
 /// master / solo: `tako master -<名前>` / `tako solo -<名前>` と同じ組み立て + `--resume`
 fn resume_profile_launch(
     session_id: &str,
@@ -1334,5 +1413,127 @@ mod tests {
         assert_eq!(model(Some("other"), Some(7)).as_deref(), Some("pane-new"));
         assert_eq!(model(Some("other"), None), None);
         assert_eq!(model(None, Some(8)), None);
+    }
+
+    /// #2470: 突然死からの復旧（`tako orchestrator resume <worker_id>`）は、レジストリの spawn の記録を
+    /// GUI の復元・`tako sessions resume` と同じ 1 実装（`resume_launch_in` の worker の腕）へ渡すだけ。
+    /// プロファイルの args（`--permission-mode auto`）・env・role・model / effort・設定 dir が落ちない
+    #[test]
+    fn i2470_レジストリの記録から_spawn_と同じ組み立てで組む() {
+        use crate::orchestrator::registry::WorkerEntry;
+        save_profile(
+            "rl2470a",
+            "env:\n  T2470_ENV: from-profile\nbypass_sandbox: false\n\
+             worker_agents:\n  claude:\n    model: claude-opus-5-5\n    effort: xhigh\n    \
+             args: [\"--permission-mode\", \"auto\"]\n",
+        );
+        let entry = WorkerEntry {
+            agent: "claude".into(),
+            project: "tako".into(),
+            label: Some("cl".into()),
+            session_id: Some(ID.into()),
+            cwd: Some("/tmp/rl2470a-proj".into()),
+            model: Some("claude-opus-5-5".into()),
+            effort: Some("xhigh".into()),
+            profile: Some("rl2470a".into()),
+            ..Default::default()
+        };
+        let loc = location("/tmp/rl2470a", false);
+        let got = registry_resume_launch_in(&entry, Some(&loc), "/opt/tako", ShellDialect::Posix)
+            .unwrap();
+        // 同じ材料で `tako sessions resume` / GUI の復元の入口を通したものと 1 バイトも違わない
+        let catalog = SessionEntry {
+            kind: "worker".into(),
+            agent: Some("claude".into()),
+            project: Some("tako".into()),
+            label: Some("cl".into()),
+            cwd: entry.cwd.clone(),
+            model: entry.model.clone(),
+            effort: entry.effort.clone(),
+            ..Default::default()
+        };
+        let hints = ResumeHints {
+            worker_profile: Some("rl2470a".into()),
+            worker_launch: Some(RecordedLaunch {
+                model: entry.model.clone(),
+                effort: entry.effort.clone(),
+            }),
+        };
+        let via_sessions = resume_launch_in(
+            ID,
+            &catalog,
+            &hints,
+            Some(&loc),
+            None,
+            "/opt/tako",
+            ShellDialect::Posix,
+            false,
+        )
+        .unwrap();
+        assert_eq!(got.command, via_sessions.command);
+        assert_eq!(got.recipe, ResumeRecipe::WorkerProfile);
+        assert_eq!(got.profile.as_deref(), Some("rl2470a"));
+        for needle in [
+            "T2470_ENV=from-profile",
+            "TAKO_ORCHESTRATOR_ROLE='worker:tako:cl'",
+            "CLAUDE_CONFIG_DIR=/tmp/rl2470a",
+            "--model claude-opus-5-5",
+            "--effort xhigh",
+            "--permission-mode auto",
+        ] {
+            assert!(got.command.contains(needle), "{needle}: {}", got.command);
+        }
+        assert!(
+            got.command.ends_with(&format!(" --resume {ID}")),
+            "{}",
+            got.command
+        );
+        assert!(got.warnings.is_empty(), "{:?}", got.warnings);
+    }
+
+    /// #2470 より前の記録（プロファイル名が無い）は既定プロファイルで組み、黙らない。
+    /// codex・会話 ID 未検出・会話の記録が無いものは組まずに理由を返す
+    #[test]
+    fn i2470_記録が足りなければ黙らずに理由を返す() {
+        use crate::orchestrator::registry::WorkerEntry;
+        let entry = WorkerEntry {
+            agent: "claude".into(),
+            project: "tako".into(),
+            session_id: Some(ID.into()),
+            ..Default::default()
+        };
+        let loc = location("/tmp/rl2470b", true);
+        let got = registry_resume_launch_in(&entry, Some(&loc), "/opt/tako", ShellDialect::Posix)
+            .unwrap();
+        assert_eq!(got.profile.as_deref(), Some("default"));
+        assert!(
+            got.warnings[0].contains("プロファイルの記録が無い"),
+            "{:?}",
+            got.warnings
+        );
+        // 会話が既定の設定 dir にあれば、親の env の CLAUDE_CONFIG_DIR を外して起動する（#652）
+        assert!(
+            got.command.contains("unset CLAUDE_CONFIG_DIR"),
+            "{}",
+            got.command
+        );
+
+        let codex = WorkerEntry {
+            agent: "codex".into(),
+            ..entry.clone()
+        };
+        let err = registry_resume_launch_in(&codex, Some(&loc), "/opt/tako", ShellDialect::Posix)
+            .unwrap_err();
+        assert!(err.contains("claude の worker だけ"), "{err}");
+        let no_sid = WorkerEntry {
+            session_id: None,
+            ..entry.clone()
+        };
+        let err = registry_resume_launch_in(&no_sid, Some(&loc), "/opt/tako", ShellDialect::Posix)
+            .unwrap_err();
+        assert!(err.contains("会話 ID が未検出"), "{err}");
+        let err =
+            registry_resume_launch_in(&entry, None, "/opt/tako", ShellDialect::Posix).unwrap_err();
+        assert!(err.contains("記録"), "{err}");
     }
 }
