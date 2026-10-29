@@ -3194,14 +3194,11 @@ pub fn reply_timeout(request: &Request) -> Option<std::time::Duration> {
     )
 }
 
-/// 時間切れの文言（CLI・MCP の stdio ブリッジ・`tako queue` の状況が同じ 1 行を出す）
+/// 時間切れの文言（CLI・MCP の stdio ブリッジ・`tako queue` の状況が同じ 1 行を出す）。
+/// 日英の対は [`crate::Reason::ReplyTimeout`]、表示言語は GUI の外の解決
+/// （[`crate::settings::client_lang`]。#2365）
 pub fn reply_timeout_message(limit: std::time::Duration) -> String {
-    format!(
-        "tako アプリが {} 秒応答しない（接続は受けたが返事が無い = GUI が固まっている可能性。\
-         要求は届いているので、GUI が戻ると後から処理されることがある。\
-         待つ上限は env {REPLY_TIMEOUT_ENV}（秒・0 で上限なし））",
-        limit.as_secs()
-    )
+    crate::Reason::ReplyTimeout(limit.as_secs()).text_in(crate::settings::client_lang())
 }
 
 /// リクエストエンベロープ。`token` はセッション毎のランダム値（FR-2.3.4）。
@@ -3895,8 +3892,21 @@ mod tests {
 
     #[test]
     fn 時間切れの文言は秒数と上書きの口を出す() {
-        let m = reply_timeout_message(std::time::Duration::from_secs(30));
+        use tako_core::i18n::Lang;
+        // 表示言語は GUI の外の解決（実行環境で決まる）なので、日英の対を言語を明示して見る
+        let m = crate::Reason::ReplyTimeout(30).text_in(Lang::Ja);
         assert!(m.starts_with("tako アプリが 30 秒応答しない"), "{m}");
         assert!(m.contains(REPLY_TIMEOUT_ENV), "{m}");
+        let en = crate::Reason::ReplyTimeout(30).text_in(Lang::En);
+        assert!(
+            en.starts_with("the tako app has not replied for 30 s"),
+            "{en}"
+        );
+        assert!(en.contains(REPLY_TIMEOUT_ENV), "{en}");
+        let m = reply_timeout_message(std::time::Duration::from_secs(30));
+        assert_eq!(
+            m,
+            crate::Reason::ReplyTimeout(30).text_in(crate::settings::client_lang())
+        );
     }
 }

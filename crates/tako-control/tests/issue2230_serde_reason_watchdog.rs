@@ -57,7 +57,7 @@ const ALLOWED: &[Allow] = &[
     },
     Allow {
         file: "crates/tako-cli/src/ipc.rs",
-        needle: "応答を解釈できない",
+        needle: "Reason::ReplyUnreadable(",
         why: "GUI からの IPC 応答（ファイルではない）",
     },
     Allow {
@@ -137,17 +137,17 @@ const ALLOWED: &[Allow] = &[
     },
     Allow {
         file: "crates/tako-control/src/acceptance_gates.rs",
-        needle: "criteria の JSON パースに失敗",
+        needle: "Reason::JsonArgUnreadable(\"criteria\"",
         why: "受け入れ条件の --criteria（CLI / MCP の引数）",
     },
     Allow {
         file: "crates/tako-control/src/acceptance_gates.rs",
-        needle: "criterion kind のパースに失敗",
+        needle: "Reason::CriterionKindUnreadable(",
         why: "受け入れ条件の --criteria の 1 件（CLI / MCP の引数）",
     },
     Allow {
         file: "crates/tako-control/src/acceptance_gates.rs",
-        needle: "results の JSON パースに失敗",
+        needle: "Reason::JsonArgUnreadable(\"results\"",
         why: "受け入れ条件の判定結果（CLI / MCP の引数）",
     },
     Allow {

@@ -235,6 +235,22 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   英語表示に日本語が無いことと日本語の旧文とのバイト一致を見る。`TAKO_2365_FRONT_BIN` で修正前の
   バイナリを叩ける = A/B）。文言で判定していた検証スクリプト（`test-reattach-1857.sh` /
   `test-claude-mod-1879.sh`）は日英どちらの形とも突き合わせる
+- #2365 の続きで、**GUI へ繋ぐ口**（`tako-cli` の `ipc.rs` = tako の外・接続できない・応答しない・
+  応答が返らない / 壊れている、`protocol::reply_timeout_message`、`tako master` / `tako solo` の起動失敗の
+  包み `launch_failure_message`）と **dispatch が呼ぶ置き場**（`acceptance_gates` / `task_checkpoints` /
+  `user_tasks` の読み取り・パース・書き出し・語彙・見つからない）の断りを `Reason` へ移した（24 種）。
+  CLI は GUI へ送るだけの枝で表示言語のグローバルを決めないので、接続まわりの断りは
+  `settings::client_lang()`（`peek_lang_setting` の解決を 1 プロセス 1 回だけ覚える。GUI は使わない）で
+  `text_in` を引く。置き場の断りは `Reason::…to_string()`（GUI / ブリッジの表示言語）で、手元で置き場を
+  開く `tako task gate` は `init_local_lang()` で先に決める。パースの理由は `load_issue::YamlReason`
+  （種類と行・列だけ = #2230）を包みと同じ言語で引き、persist.log へ流れる `yaml_error_reason` は日本語の
+  まま。tako-core の `TaskStore` の断りは `user_task::TaskRefusal`（同じ網羅 match の形）。置き場の
+  ファイルの中身になる文（受け入れ条件の evidence・配送の理由 `UNRESOLVED_ORIGIN_REASON`）と master へ
+  運ぶ返答の本文は断りではないので日本語のまま。番犬は同じ `issue1762_dispatch_error_lang.rs`
+  （`Reason` の表 + 末尾の節が `CLIENT_STORE_SCOPES` の範囲のソースを読む）、実経路は tako-cli の
+  `tests/issue2365_front_lang.rs` の後半（偽の GUI = 黙る・閉じる・壊れた行を返す受け口と、壊れた・読めない
+  ゲートの置き場を CLI / MCP で叩く。`TAKO_2365_FRONT_BIN` で A/B）と tako-control の
+  `tests/issue2365_store_lang.rs`（GUI 無しのホストへ todo / チェックポイント / ゲートの要求を渡す）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

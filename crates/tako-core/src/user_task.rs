@@ -458,6 +458,55 @@ impl Default for TaskStore {
 /// id の前置き。AI 側（`task-N`）と取り違えないための綴り
 pub const ID_PREFIX: &str = "u-";
 
+/// 置き場の操作の断り（#2365）。
+///
+/// 操作は `Result<_, String>` のまま、文はここ 1 か所の日英の対から引く（形は
+/// `tako_control::Reason` と同じ (バリアント, 言語) の網羅 match）。表示（`Display`）は
+/// 表示言語のグローバルに従う（GUI の dispatch・MCP のブリッジが通る）。
+/// 「見つからない」は英語にも ` not found` を含める（リモートの HTTP 層が 404 へ寄せる判定）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskRefusal {
+    /// 起票のタイトルが空
+    EmptyTitle,
+    /// 部分更新に項目が 1 つも無い
+    NothingToUpdate,
+    /// 部分更新でタイトルを空にしようとした
+    ClearTitle,
+    /// その id のタスクが無い
+    NotFound(String),
+}
+
+impl TaskRefusal {
+    /// (バリアント, 言語) の網羅 match。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::EmptyTitle, Ja) => "タイトルが空（一覧で選べないタスクは作れない）".to_string(),
+            (Self::EmptyTitle, En) => {
+                "the title is empty (a task that cannot be picked from the list cannot be created)"
+                    .to_string()
+            }
+            (Self::NothingToUpdate, Ja) => "更新する項目が 1 つも指定されていない".to_string(),
+            (Self::NothingToUpdate, En) => "no field to update was given".to_string(),
+            (Self::ClearTitle, Ja) => "タイトルを空にはできない".to_string(),
+            (Self::ClearTitle, En) => "the title cannot be made empty".to_string(),
+            (Self::NotFound(id), Ja) => format!("タスクが見つからない: {id}"),
+            (Self::NotFound(id), En) => format!("user task not found: {id}"),
+        }
+    }
+}
+
+impl std::fmt::Display for TaskRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+/// その id のタスクが無いときの断りの文
+fn not_found(id: &str) -> String {
+    TaskRefusal::NotFound(id.to_string()).to_string()
+}
+
 impl TaskStore {
     pub fn find(&self, id: &str) -> Option<&UserTask> {
         self.tasks.iter().find(|t| t.id == id)
@@ -484,7 +533,7 @@ impl TaskStore {
     pub fn add(&mut self, new: NewTask) -> Result<&UserTask, String> {
         let title = new.title.trim().to_string();
         if title.is_empty() {
-            return Err("タイトルが空（一覧で選べないタスクは作れない）".into());
+            return Err(TaskRefusal::EmptyTitle.to_string());
         }
         let now = unix_now();
         let task = UserTask {
@@ -512,16 +561,14 @@ impl TaskStore {
     /// 部分更新。触っていないフィールドは保つ
     pub fn update(&mut self, id: &str, patch: TaskPatch) -> Result<&UserTask, String> {
         if patch.is_empty() {
-            return Err("更新する項目が 1 つも指定されていない".into());
+            return Err(TaskRefusal::NothingToUpdate.to_string());
         }
         if let Some(title) = &patch.title {
             if title.trim().is_empty() {
-                return Err("タイトルを空にはできない".into());
+                return Err(TaskRefusal::ClearTitle.to_string());
             }
         }
-        let task = self
-            .find_mut(id)
-            .ok_or_else(|| format!("タスクが見つからない: {id}"))?;
+        let task = self.find_mut(id).ok_or_else(|| not_found(id))?;
         if let Some(title) = patch.title {
             task.title = title.trim().to_string();
         }
@@ -552,9 +599,7 @@ impl TaskStore {
 
     /// 状態を変える（`done` / `dismiss`）
     pub fn set_status(&mut self, id: &str, status: TaskStatus) -> Result<&UserTask, String> {
-        let task = self
-            .find_mut(id)
-            .ok_or_else(|| format!("タスクが見つからない: {id}"))?;
+        let task = self.find_mut(id).ok_or_else(|| not_found(id))?;
         task.status = status;
         task.touch();
         Ok(task)
@@ -568,9 +613,7 @@ impl TaskStore {
         comment: &str,
         via: Via,
     ) -> Result<usize, String> {
-        let task = self
-            .find_mut(id)
-            .ok_or_else(|| format!("タスクが見つからない: {id}"))?;
+        let task = self.find_mut(id).ok_or_else(|| not_found(id))?;
         task.responses.push(TaskResponse {
             decision,
             comment: comment.trim().to_string(),
@@ -586,9 +629,7 @@ impl TaskStore {
 
     /// 配送の記録を置く（1 タスクにつき最後の 1 回だけ持つ）
     pub fn set_delivery(&mut self, id: &str, delivery: Delivery) -> Result<(), String> {
-        let task = self
-            .find_mut(id)
-            .ok_or_else(|| format!("タスクが見つからない: {id}"))?;
+        let task = self.find_mut(id).ok_or_else(|| not_found(id))?;
         task.delivery = Some(delivery);
         task.touch();
         Ok(())
@@ -745,6 +786,9 @@ mod tests {
 
     #[test]
     fn 空タイトルは拒否する() {
+        // 断りの文は表示言語のグローバルで決まる。2 回読む間に他のテストが言語を切り替えないよう
+        // 排他を取る（#1274）
+        let _lang = crate::i18n::testing::lang_guard();
         let mut store = TaskStore::default();
         let err = store
             .add(NewTask {
@@ -752,7 +796,10 @@ mod tests {
                 ..NewTask::default()
             })
             .unwrap_err();
-        assert!(err.contains("タイトルが空"), "{err}");
+        assert_eq!(err, TaskRefusal::EmptyTitle.to_string());
+        assert!(TaskRefusal::EmptyTitle
+            .text_in(crate::i18n::Lang::Ja)
+            .contains("タイトルが空"));
         assert!(store.tasks.is_empty(), "拒否したのに積まれている");
     }
 

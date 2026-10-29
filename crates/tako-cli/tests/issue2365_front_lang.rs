@@ -615,3 +615,392 @@ fn 打たれた値は英語表示でもそのまま埋める() {
 fn 叩くバイナリが実在する() {
     assert!(Path::new(&tako()).is_file(), "{}", tako().display());
 }
+
+// ---- #2365 の続き: GUI へ繋ぐ口（接続まわり）と、CLI / MCP のブリッジが手元で開く置き場の断り ----
+//
+// 修正前（実測）: 英語表示でも、GUI が居ない・繋がらない・応答しない・応答が壊れているときの断り
+// （`tako-cli` の ipc.rs）と、受け入れゲートの置き場の断り（ゲートが無い・ファイルが壊れている・
+// 読めない。`tako task gate` と MCP `tako_task_gate_check` は GUI を通さず手元で開く）が日本語の
+// 固定文のまま返った。GUI の代わりに、接続を受けて黙る・閉じる・壊れた行を返す受け口を立てる。
+// 期待する日本語のうち OS の文（`os error N`）は実行環境の std の文を埋める
+
+/// 偽の GUI の振る舞い
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum Fake {
+    /// 接続を受けて要求も読まず、返事をしないまま持ち続ける（固まった GUI）
+    Silent,
+    /// 要求を 1 行読んで、何も返さずに閉じる
+    Hangup,
+    /// 要求を 1 行読んで、JSON でない 1 行を返す
+    Garbage,
+}
+
+/// 1 接続だけ `fake` の通りに振る舞う受け口を立てる（unix のみ）。戻り値は接続先
+#[cfg(unix)]
+fn fake_gui(scratch: &Scratch, tag: &str, fake: Fake) -> String {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+    let path = scratch.0.join(format!("{tag}.sock"));
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path).expect("受け口を作れる");
+    std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        match fake {
+            Fake::Silent => std::thread::sleep(std::time::Duration::from_secs(5)),
+            Fake::Hangup | Fake::Garbage => {
+                let mut line = String::new();
+                let _ =
+                    BufReader::new(stream.try_clone().expect("複製できる")).read_line(&mut line);
+                if matches!(fake, Fake::Garbage) {
+                    let mut stream = stream;
+                    let _ = writeln!(stream, "not json");
+                }
+            }
+        }
+    });
+    path.display().to_string()
+}
+
+/// 接続まわり・置き場のケース: 名前と、断りの文を引き出して #2365 より前の日本語と組で返す手順
+struct LiveCase {
+    name: &'static str,
+    run: fn(&Scratch) -> (Result<String, String>, String),
+}
+
+/// `tako <args>` を追加の env 付きで走らせ、標準エラーの断りを返す
+fn cli_refusal(scratch: &Scratch, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
+    let mut command = scratch.command(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let out = command
+        .stdin(Stdio::null())
+        .output()
+        .expect("tako が終わる");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    match stderr.trim_end().strip_prefix("error: ") {
+        Some(message) if !out.status.success() => Ok(message.to_string()),
+        _ => Err(format!(
+            "断られない（{}）stdout={} stderr={stderr}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout)
+        )),
+    }
+}
+
+/// `tako mcp serve` へ tools/call を 1 本流して断りを返す。`socket` が `None` なら tako の外
+fn mcp_refusal(
+    scratch: &Scratch,
+    socket: Option<&str>,
+    tool: &str,
+    args: &str,
+) -> Result<String, String> {
+    let mut command = scratch.command(&["mcp", "serve"]);
+    if let Some(socket) = socket {
+        command
+            .env("TAKO_SOCKET", socket)
+            .env("TAKO_TOKEN", "t2365")
+            .env("TAKO_PANE_ID", "7");
+    }
+    let mut child = command.spawn().expect("ブリッジを起動できる");
+    {
+        let mut input = child.stdin.take().expect("stdin");
+        writeln!(
+            input,
+            r#"{{"jsonrpc":"2.0","id":0,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"t2365","version":"0"}}}}}}"#
+        )
+        .expect("stdin へ書ける");
+        writeln!(
+            input,
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"{tool}","arguments":{args}}}}}"#
+        )
+        .expect("stdin へ書ける");
+    }
+    let out = child.wait_with_output().expect("ブリッジが終わる");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    for reply in stdout.lines() {
+        let Ok(reply) = serde_json::from_str::<Value>(reply) else {
+            continue;
+        };
+        if reply["id"] != 2 {
+            continue;
+        }
+        if reply["result"]["isError"] == true {
+            return Ok(reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .to_string());
+        }
+        if let Some(message) = reply["error"]["message"].as_str() {
+            return Ok(message.to_string());
+        }
+        return Err(format!("断られない: {reply}"));
+    }
+    Err(format!("応答が無い: {stdout}"))
+}
+
+/// 存在しないソケットへの接続の失敗で OS が返す文
+fn no_such_socket() -> String {
+    std::io::Error::from_raw_os_error(2).to_string()
+}
+
+const OUTSIDE_OLD_JA: &str = "tako アプリへの接続情報が無い（TAKO_SOCKET / TAKO_TOKEN 未設定・\
+    接続情報ファイルも無し）。tako アプリを起動するか、tako 内のターミナルで実行してください";
+
+/// 受け入れゲートの置き場（`<data dir>/acceptance_gates.yaml`）
+fn gates_file(scratch: &Scratch) -> PathBuf {
+    scratch.0.join("data/acceptance_gates.yaml")
+}
+
+/// 置き場の後片付け（ケースの間で状態を持ち越さない）
+fn reset_gates(scratch: &Scratch) {
+    let path = gates_file(scratch);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// 構文の壊れたゲートの置き場（`[` が閉じていない）
+const BROKEN_GATES: &str = "version: 1\ngates: [\n  - task_id: t1\n";
+
+fn live_cases() -> Vec<LiveCase> {
+    let mut cases = vec![
+        // ---- 接続まわり（ipc.rs）----
+        LiveCase {
+            name: "cli_outside",
+            run: |s| (cli_refusal(s, &["list"], &[]), OUTSIDE_OLD_JA.to_string()),
+        },
+        LiveCase {
+            name: "cli_cannot_connect",
+            run: |s| {
+                let socket = s.socket();
+                let got = cli_refusal(
+                    s,
+                    &["list"],
+                    &[("TAKO_SOCKET", socket.as_str()), ("TAKO_TOKEN", "t2365")],
+                );
+                (
+                    got,
+                    format!(
+                        "tako アプリへ接続できない（{socket}: {}）",
+                        no_such_socket()
+                    ),
+                )
+            },
+        },
+        LiveCase {
+            name: "mcp_outside",
+            run: |s| {
+                (
+                    mcp_refusal(s, None, "tako_list_panes", "{}"),
+                    OUTSIDE_OLD_JA.to_string(),
+                )
+            },
+        },
+        LiveCase {
+            name: "mcp_cannot_connect",
+            run: |s| {
+                let socket = s.socket();
+                (
+                    mcp_refusal(s, Some(&socket), "tako_list_panes", "{}"),
+                    format!(
+                        "tako アプリへ接続できない（{socket}: {}）",
+                        no_such_socket()
+                    ),
+                )
+            },
+        },
+        // ---- 置き場（受け入れゲート。CLI は手元・MCP はブリッジが開く）----
+        LiveCase {
+            name: "cli_gate_not_found",
+            run: |s| {
+                reset_gates(s);
+                (
+                    cli_refusal(s, &["task", "gate", "show", "nope"], &[]),
+                    "ゲートが見つからない: nope".to_string(),
+                )
+            },
+        },
+        LiveCase {
+            name: "mcp_gate_not_found",
+            run: |s| {
+                reset_gates(s);
+                (
+                    mcp_refusal(s, None, "tako_task_gate_check", r#"{"task_id":"nope"}"#),
+                    "ゲートが見つからない: nope".to_string(),
+                )
+            },
+        },
+        LiveCase {
+            name: "cli_gate_broken",
+            run: |s| {
+                reset_gates(s);
+                std::fs::write(gates_file(s), BROKEN_GATES).expect("壊れた置き場を書ける");
+                let got = cli_refusal(s, &["task", "gate", "show", "t1"], &[]);
+                reset_gates(s);
+                (
+                    got,
+                    "acceptance_gates.yaml のパースに失敗: YAML の構文が壊れている（3 行 3 列）"
+                        .to_string(),
+                )
+            },
+        },
+        LiveCase {
+            name: "mcp_gate_broken",
+            run: |s| {
+                reset_gates(s);
+                std::fs::write(gates_file(s), BROKEN_GATES).expect("壊れた置き場を書ける");
+                let got = mcp_refusal(s, None, "tako_task_gate_check", r#"{"task_id":"t1"}"#);
+                reset_gates(s);
+                (
+                    got,
+                    "acceptance_gates.yaml のパースに失敗: YAML の構文が壊れている（3 行 3 列）"
+                        .to_string(),
+                )
+            },
+        },
+    ];
+    cases.extend(unix_live_cases());
+    cases
+}
+
+/// 偽の GUI（Unix domain socket）と権限で読めない置き場を使うケース
+#[cfg(not(unix))]
+fn unix_live_cases() -> Vec<LiveCase> {
+    Vec::new()
+}
+
+#[cfg(unix)]
+fn unix_live_cases() -> Vec<LiveCase> {
+    vec![
+        LiveCase {
+            name: "cli_reply_timeout",
+            run: |s| {
+                let socket = fake_gui(s, "silent", Fake::Silent);
+                (
+                    cli_refusal(
+                        s,
+                        &["list"],
+                        &[
+                            ("TAKO_SOCKET", socket.as_str()),
+                            ("TAKO_TOKEN", "t2365"),
+                            ("TAKO_IPC_TIMEOUT_SECS", "1"),
+                        ],
+                    ),
+                    "tako アプリが 1 秒応答しない（接続は受けたが返事が無い = GUI が固まっている可能性。\
+                     要求は届いているので、GUI が戻ると後から処理されることがある。\
+                     待つ上限は env TAKO_IPC_TIMEOUT_SECS（秒・0 で上限なし））"
+                        .to_string(),
+                )
+            },
+        },
+        LiveCase {
+            name: "cli_no_reply",
+            run: |s| {
+                let socket = fake_gui(s, "hangup", Fake::Hangup);
+                (
+                    cli_refusal(
+                        s,
+                        &["list"],
+                        &[("TAKO_SOCKET", socket.as_str()), ("TAKO_TOKEN", "t2365")],
+                    ),
+                    "tako アプリから応答が返らなかった".to_string(),
+                )
+            },
+        },
+        LiveCase {
+            name: "cli_reply_garbage",
+            run: |s| {
+                let socket = fake_gui(s, "garbage", Fake::Garbage);
+                (
+                    cli_refusal(
+                        s,
+                        &["list"],
+                        &[("TAKO_SOCKET", socket.as_str()), ("TAKO_TOKEN", "t2365")],
+                    ),
+                    "応答を解釈できない: expected ident at line 1 column 2".to_string(),
+                )
+            },
+        },
+        LiveCase {
+            name: "mcp_reply_garbage",
+            run: |s| {
+                let socket = fake_gui(s, "mcp-garbage", Fake::Garbage);
+                (
+                    mcp_refusal(s, Some(&socket), "tako_list_panes", "{}"),
+                    "応答を解釈できない: expected ident at line 1 column 2".to_string(),
+                )
+            },
+        },
+        LiveCase {
+            name: "cli_gate_unreadable",
+            run: |s| {
+                use std::os::unix::fs::PermissionsExt;
+                reset_gates(s);
+                let path = gates_file(s);
+                std::fs::write(&path, "version: 1\n").expect("置き場を書ける");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+                    .expect("読めなくできる");
+                let got = cli_refusal(s, &["task", "gate", "show", "t1"], &[]);
+                reset_gates(s);
+                (
+                    got,
+                    format!(
+                        "acceptance_gates.yaml の読み取りに失敗: {}",
+                        std::io::Error::from_raw_os_error(13)
+                    ),
+                )
+            },
+        },
+    ]
+}
+
+#[test]
+fn 接続まわりと置き場の断りは英語表示に日本語を含まず日本語表示は2365より前とバイト一致() {
+    let all = live_cases();
+    let en = Scratch::new("en");
+    let ja = Scratch::new("ja");
+    let mut failures = Vec::new();
+    let mut en_japanese = 0;
+    let mut ja_mismatch = 0;
+    for case in &all {
+        let (got, _) = (case.run)(&en);
+        match got {
+            Ok(text) => {
+                eprintln!("[en] {}: {text}", case.name);
+                if let Some(c) = has_japanese(&text) {
+                    en_japanese += 1;
+                    failures.push(format!(
+                        "[{}] 英語表示の断りに日本語（{c}）: {text}",
+                        case.name
+                    ));
+                }
+            }
+            Err(e) => failures.push(format!("[{}] 英語表示: {e}", case.name)),
+        }
+        let (got, want) = (case.run)(&ja);
+        match got {
+            Ok(text) if text == want => eprintln!("[ja] {}: {text}", case.name),
+            Ok(text) => {
+                ja_mismatch += 1;
+                failures.push(format!(
+                    "[{}] 日本語表示が #2365 より前と違う\n  want: {want}\n  got:  {text}",
+                    case.name
+                ));
+            }
+            Err(e) => failures.push(format!("[{}] 日本語表示: {e}", case.name)),
+        }
+    }
+    eprintln!(
+        "{}: {} ケース・英語表示で日本語入り {en_japanese} 件・日本語表示の不一致 {ja_mismatch} 件",
+        tako().display(),
+        all.len()
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

@@ -18,6 +18,7 @@
 
 use std::path::Path;
 
+use crate::i18n::Lang;
 use crate::migration::Quarantine;
 
 /// 既定値へ落とした理由
@@ -74,19 +75,100 @@ pub fn json_reason(e: &serde_json::Error) -> String {
 /// 値が無い（空・コメントだけ・`~`）/ 形が違う。位置は serde_yaml の `location()`（1 始まり）で、
 /// 位置を持たない誤り（複数の文書など）は種類だけ
 pub fn yaml_reason(e: &serde_yaml::Error, text: &str) -> String {
-    let kind = if serde_yaml::from_str::<serde::de::IgnoredAny>(text).is_err() {
-        "YAML の構文が壊れている"
-    } else if matches!(
-        serde_yaml::from_str::<serde_yaml::Value>(text),
-        Ok(serde_yaml::Value::Null)
-    ) {
-        "YAML が空"
-    } else {
-        "YAML の形が期待と違う"
-    };
-    match e.location() {
-        Some(at) => format!("{kind}（{} 行 {} 列）", at.line(), at.column()),
-        None => kind.to_string(),
+    YamlReason::located(e, text).text_in(Lang::Ja)
+}
+
+/// YAML を解釈できなかった理由を、表示言語で引ける形で持つ（#2365）。
+///
+/// 中身は [`yaml_reason`] と同じ「種類と位置だけ」（ファイルの中身を引用しない = #2230）。
+/// 利用者へ返す断り（置き場の「<ファイル> のパースに失敗」= `tako_control::Reason::StoreParseFailed`）は
+/// 包みと同じ言語で [`Self::text_in`] を引く。persist.log へ流れる [`yaml_reason`] /
+/// [`yaml_error_reason`] は日本語のまま（診断ログは日本語固定 = FR-2.42.21）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YamlReason {
+    /// 種類と位置（行・列。1 始まり。位置を持たない誤り = 複数の文書などは `None`）
+    Located {
+        kind: YamlProblem,
+        at: Option<(usize, usize)>,
+    },
+    /// `TAKO_2230_LEGACY=1` の修正前の形（serde の素の文言。英語のまま）
+    Raw(String),
+}
+
+/// [`YamlReason`] の種類
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YamlProblem {
+    /// 構文として読めない
+    Syntax,
+    /// 値が無い（空・コメントだけ・`~`）
+    Empty,
+    /// 読めるが形が期待と違う
+    Shape,
+}
+
+impl YamlProblem {
+    /// (種類, 言語) の網羅 match。日本語は #2365 より前の [`yaml_reason`] とバイト一致
+    pub fn text_in(self, lang: Lang) -> &'static str {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Syntax, Ja) => "YAML の構文が壊れている",
+            (Self::Syntax, En) => "the YAML syntax is broken",
+            (Self::Empty, Ja) => "YAML が空",
+            (Self::Empty, En) => "the YAML is empty",
+            (Self::Shape, Ja) => "YAML の形が期待と違う",
+            (Self::Shape, En) => "the YAML does not have the expected shape",
+        }
+    }
+}
+
+impl YamlReason {
+    /// 種類と位置を採る（`text` は解釈しようとした中身。種類は文言を読まずに読み直して決める）
+    pub fn located(e: &serde_yaml::Error, text: &str) -> Self {
+        let kind = if serde_yaml::from_str::<serde::de::IgnoredAny>(text).is_err() {
+            YamlProblem::Syntax
+        } else if matches!(
+            serde_yaml::from_str::<serde_yaml::Value>(text),
+            Ok(serde_yaml::Value::Null)
+        ) {
+            YamlProblem::Empty
+        } else {
+            YamlProblem::Shape
+        };
+        Self::Located {
+            kind,
+            at: e.location().map(|at| (at.line(), at.column())),
+        }
+    }
+
+    /// [`yaml_error_reason`] の表示言語版（`TAKO_2230_LEGACY=1` なら素の文言）
+    pub fn of(e: &serde_yaml::Error, text: &str) -> Self {
+        if legacy_raw_serde_reason() {
+            return Self::Raw(e.to_string());
+        }
+        Self::located(e, text)
+    }
+
+    /// (形, 言語) の網羅 match
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Located { kind, at: None }, _) => kind.text_in(lang).to_string(),
+            (
+                Self::Located {
+                    kind,
+                    at: Some((line, column)),
+                },
+                Ja,
+            ) => format!("{}（{line} 行 {column} 列）", kind.text_in(lang)),
+            (
+                Self::Located {
+                    kind,
+                    at: Some((line, column)),
+                },
+                En,
+            ) => format!("{} (line {line}, column {column})", kind.text_in(lang)),
+            (Self::Raw(raw), _) => raw.clone(),
+        }
     }
 }
 
@@ -110,10 +192,7 @@ pub fn json_error_reason(e: &serde_json::Error) -> String {
 
 /// [`json_error_reason`] の YAML 版。`text` は解釈しようとした中身（[`yaml_reason`] が読み直す）
 pub fn yaml_error_reason(e: &serde_yaml::Error, text: &str) -> String {
-    if legacy_raw_serde_reason() {
-        return e.to_string();
-    }
-    yaml_reason(e, text)
+    YamlReason::of(e, text).text_in(Lang::Ja)
 }
 
 #[cfg(test)]
