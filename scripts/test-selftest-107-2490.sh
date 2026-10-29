@@ -140,8 +140,10 @@ failed_osc() { grep -q "TAKO_APP_SELF_TEST_FAILED: 107: 裏タブでも OSC" "$R
 failed_any() { grep -q "TAKO_APP_SELF_TEST_FAILED" "$RUN_LOG" && echo 1; }
 # 項目 107 を通った = 108 に入った（または最後まで通った）・それより前に FAILED が無い
 passed_107() {
+  local head
   grep -qE "${ITEM108}|TAKO_APP_SELF_TEST_OK" "$RUN_LOG" || return 0
-  upto_108 | grep -q "TAKO_APP_SELF_TEST_FAILED" && return 0
+  head="$(upto_108)"
+  grep -q "TAKO_APP_SELF_TEST_FAILED" <<<"$head" && return 0
   echo 1
 }
 deferred_ok() { grep -q "TAKO_SELF_TEST_2490: deferred req=0 reserved=true delivered=true" "$RUN_LOG" && echo 1; }
