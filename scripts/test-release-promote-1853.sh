@@ -13,6 +13,7 @@
 #   - 昇格したのに Homebrew cask が古い版のまま（Homebrew の利用者に更新が届かない = #1853）
 #   - 昇格したのに docs の「最新の安定版」が古い版のまま（#1592 / #1575）
 #   - 後続の失敗が終了コードに出ない（気づかないまま昇格が「済んだ」扱いになる）
+#   - merge-pr.sh の 5（GitHub API に届かない）を CI の赤と同じ文言で案内する（#2498。Test 4c）
 #   - 途中で死んだ昇格が exit 0 に見える（bash 3.2 の set -u + EXIT trap。Test 7）
 set -euo pipefail
 
@@ -145,6 +146,8 @@ EOF
 #!/usr/bin/env bash
 echo "merge-pr \$*" >> "$D/gh-calls"
 if [[ -f "$D/state/docs-merge-fail" ]]; then echo "merge しない: CI が赤（mock）" >&2; exit 1; fi
+# 任意の終了コードで終わる（5 = GitHub API に届かない #1704 / 3 = gh のエラー。#2498）
+if [[ -f "$D/state/docs-merge-rc" ]]; then echo "merge-pr の終了コード \$(cat "$D/state/docs-merge-rc")（mock）" >&2; exit "\$(cat "$D/state/docs-merge-rc")"; fi
 b=\$(git --git-dir="$D/origin.git" for-each-ref --format='%(refname:short)' 'refs/heads/docs/promote-*' | head -1)
 git --git-dir="$D/origin.git" update-ref refs/heads/main "refs/heads/\$b"
 git --git-dir="$D/origin.git" update-ref -d "refs/heads/\$b"
@@ -495,6 +498,30 @@ test_docs_failures() {
   expect_followup_failure "docs の merge" "docs の PR #1900 を merge できなかった"
   assert_contains "origin の main の docs は古いまま" "$(origin_releases_page)" "— 最新の安定版は v99.1.2"
   assert_caller_untouched
+  cleanup_env
+
+  # merge-pr.sh の 5 は「GitHub API に届かない」で CI の結論ではない（#1704）。
+  # CI の赤と同じ「CI が緑になってから」と案内すると、赤と読まれる（#2498）
+  echo ""
+  echo "--- Test 4c: merge-pr.sh が 5（GitHub API に届かない）-> 回線の案内で exit 4 ---"
+  make_env
+  echo 5 > "$D/state/docs-merge-rc"
+  run_promote v99.1.3
+  expect_followup_failure "API に届かない" "GitHub API に届かない（merge-pr.sh の終了コード 5。CI の結論ではない）"
+  assert_contains "回線が戻ってからの打ち直しを案内" "$OUT" "回線が戻ってから scripts/merge-pr.sh 1900"
+  assert_not_contains "CI の赤の案内を出さない" "$OUT" "CI が緑になってから scripts/merge-pr.sh"
+  assert_contains "PR を残したと言う" "$OUT" "PR は残してある"
+  assert_contains "origin の main の docs は古いまま" "$(origin_releases_page)" "— 最新の安定版は v99.1.2"
+  assert_caller_untouched
+  cleanup_env
+
+  echo ""
+  echo "--- Test 4d: merge-pr.sh が 3（gh のエラー）-> 従来どおり CI の案内で exit 4 ---"
+  make_env
+  echo 3 > "$D/state/docs-merge-rc"
+  run_promote v99.1.3
+  expect_followup_failure "gh のエラー" "docs の PR #1900 を merge できなかった（PR は残してある）。CI が緑になってから scripts/merge-pr.sh 1900"
+  assert_not_contains "API に届かないとは言わない" "$OUT" "GitHub API に届かない"
   cleanup_env
 }
 

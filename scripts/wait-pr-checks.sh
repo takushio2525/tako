@@ -59,10 +59,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXTERNAL_CHECKS=("Cloudflare Pages")
 
 # 実測（2026-10-15〜16 の PR CI。#2047）: macOS 36〜54 分（PR #2141 = 54 分 30 秒）/ Windows 30〜38 分。
-# テストの本数と負荷で macOS は伸び続けている（2026-09-11 は 12〜13 分だった）。
-# 既定は **macOS の job 自身の上限（ci.yml の timeout-minutes: 60）+ 変更範囲の判定と runner 待ちの
-# 余裕 20 分** = 80 分。緑になり得る macOS の run を、CI 自身が打ち切るより先に諦めない
-# （Windows の上限 90 分は実所要がその半分以下なので追わない）。足りない日は
+# テストの本数と負荷で macOS は伸び続けている（2026-09-11 は 12〜13 分だった。10/27 は PR の CI が
+# 重なって 60 分の上限で 2 本打ち切られ、job の上限を 90 分へ上げた = #2450）。
+# 既定は **macOS の job 自身の上限（ci.yml の timeout-minutes: 90）+ 変更範囲の判定と runner 待ちの
+# 余裕 20 分** = 110 分。緑になり得る macOS の run を、CI 自身が打ち切るより先に諦めない
+# （Windows の job の上限も同じ 90 分なので、この値で両方を覆う）。足りない日は
 # TAKO_WAIT_PR_CHECKS_TIMEOUT=<秒> か --timeout <秒> で伸ばす（--timeout が優先）
 DEFAULT_TIMEOUT=6600
 DEFAULT_INTERVAL=20

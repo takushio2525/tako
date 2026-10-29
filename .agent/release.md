@@ -424,7 +424,10 @@ v0.7.0 のまま、docs のラベルも取り残された（#1853 / #1546）。
   見出しの「— 最新の安定版は vX.Y.Z」と本文の「**安定版は vX.Y.Z**（日付）」を書き換える
   （日付はその版の CHANGELOG の節。書き換えと検査は CI の番犬と同じ 1 ファイル）。ブランチ
   `docs/promote-<tag>` で PR を出し、`scripts/merge-pr.sh` で **CI が緑で揃ってから merge** する
-  （main へ直接は push しない。CI の分だけ昇格が待つ）。その版の系列の節が無い（minor が
+  （main へ直接は push しない。CI の分だけ昇格が待つ）。`merge-pr.sh` が **5**（GitHub API に
+  届かない = CI の結論ではない。#1704）で終わったときだけ、CI の赤の「CI が緑になってから」ではなく
+  「回線が戻ってから `scripts/merge-pr.sh <PR>`」と案内する（#2498。5 の値は `scripts/lib/gh-retry.sh` の
+  `GH_UNREACHABLE_EXIT` を source して引く）。その版の系列の節が無い（minor が
   上がった直後）ときは書き換えずに落ちるので、節（読み物）を書いてから打ち直す
 - **終了コード**: 0 = Release・cask・docs が揃った / 1 = 昇格しなかった / **4 = Release は Latest に
   なったが後続が終わっていない**（理由と、どの段かを名指しする）。片肺（Windows が無い）は
