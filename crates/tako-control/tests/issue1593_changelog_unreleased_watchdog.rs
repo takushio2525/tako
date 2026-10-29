@@ -125,10 +125,12 @@ fn 二つ目を差し込むと_file_line_で名指しする() {
     }
     let injected = lines.join("\n");
     let found = violations(CHANGELOG, &injected);
-    let has_top = headings(&text)
-        .first()
-        .is_some_and(|(_, name)| is_unreleased(name));
-    let want = if has_top {
+    // 差し込んだ行より上に Unreleased があれば「2 つ目」、無ければ「版の節より下」で名指しされる
+    // （実物が既に崩れていても、この検査は差し込んだ行の名指しだけを見る）
+    let earlier = headings(&text)
+        .iter()
+        .any(|(line, name)| *line < at && is_unreleased(name));
+    let want = if earlier {
         format!("{CHANGELOG}:{at}: 2 つ目の `## [Unreleased]`")
     } else {
         format!("{CHANGELOG}:{at}: `## [Unreleased]` が最初の版の節")
