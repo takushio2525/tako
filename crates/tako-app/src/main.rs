@@ -5753,6 +5753,17 @@ impl TakoApp {
                 tako_control::shelved_restore::claimed_by_tabs(&restored, |id| {
                     pane_ids.iter().any(|p| p.as_u64() == id)
                 });
+            // #2486: 表のペインどうしが同じ器の名前を持つなら、復元の順で最初のペインが器を持ち、
+            // 2 本目以降は新しい器で起こす。同じ器へ繋ぐと器のクライアント（`new-session -A -D`）が
+            // 先のペインを切り離し、#1857 の判定がそのペインを閉じていた。判断の正本は
+            // `restore_vessels`。器が永続しない環境（器なし）は名前を使わないので見ない
+            let tab_vessels = if tmux_available && !tako_control::restore_vessels::legacy() {
+                tako_control::restore_vessels::TabVessels::new(&restored, |id| {
+                    pane_ids.iter().any(|p| p.as_u64() == id)
+                })
+            } else {
+                tako_control::restore_vessels::TabVessels::default()
+            };
             // セッションカタログ（#112）は復元ループの外で 1 回だけ読む。
             // 起動条件（役割 / model / effort）の出どころで、読めなければ最小形へ落ちる
             let catalog = tako_control::sessions::SessionCatalog::load().ok();
@@ -5856,15 +5867,23 @@ impl TakoApp {
                     breakdown.record(tako_control::restore_report::PaneOutcome::Webview);
                     continue;
                 }
-                let backend_alive = r.session.as_ref().is_some_and(|name| {
+                let vessel_alive = |name: &str| {
                     tmux_available
                         && tako_core::tmux::has_session(
                             Some(&tako_core::tmux_backend::socket_name()),
                             name,
                         )
-                });
-                if let Some(name) = &r.session {
-                    app.backend_sessions.insert(pane, name.clone());
+                };
+                // このペインが繋ぐ器の名前（#2486。重複した 2 本目は None = spawn が新しい器を払い出す）
+                let claim = tab_vessels.claim(r, hidden.is_none(), vessel_alive);
+                let vessel = claim.vessel();
+                let duplicate = claim.duplicate();
+                if let Some(plan) = duplicate {
+                    persist_diag(&tako_control::restore_vessels::log_line(r.pane, plan));
+                }
+                let backend_alive = vessel.is_some_and(vessel_alive);
+                if let Some(name) = vessel {
+                    app.backend_sessions.insert(pane, name.to_string());
                 }
                 // #1446: SSH の追跡を引き継ぐ。**器が生きていたときだけ**
                 // （器ごと消えていたら新しいシェルが開く = 繋がっている相手が居ない）。
@@ -5874,7 +5893,7 @@ impl TakoApp {
                 }
                 // ペインログ（Issue #112 B）: 前回の取り込み位置を復元し、tako 停止中に
                 // tmux 側へ積もった出力を次回 tick の差分として取り込む
-                if let Some(history) = r.logged_history {
+                if let (Some(history), None) = (r.logged_history, duplicate) {
                     let meta = app.pane_log_meta(pane);
                     app.pane_logs_lock()
                         .seed_history(pane.as_u64(), &meta, history as usize);
@@ -5888,13 +5907,22 @@ impl TakoApp {
                 // #1238: claude 以外（codex / agy）も同じ経路で戻す。どちらの保存も
                 // 無いペインは従来どおり新規シェル。**layout の系統が正**（記録の齟齬で
                 // 別系統のコマンドを組まない）
-                let saved_agent = r.agent_resume.as_ref().and_then(|a| {
-                    Some(tako_control::sessions::PaneResume {
-                        agent: tako_core::agent_support::Agent::parse(&a.agent)?,
-                        id: a.id.as_deref(),
-                    })
-                });
-                let resume = match &r.claude_session_id {
+                // #2486: 重複したペインで会話を resume しないなら、会話の記録も引き継がない
+                // （残すと次の保存で layout に居座り、器が消えた後の復元で同じ会話を
+                // 2 本目として resume しうる）。会話そのものはカタログに残る
+                let resume_blocked = duplicate.and_then(|d| d.resume_blocked).is_some();
+                let saved_agent = r
+                    .agent_resume
+                    .as_ref()
+                    .filter(|_| !resume_blocked)
+                    .and_then(|a| {
+                        Some(tako_control::sessions::PaneResume {
+                            agent: tako_core::agent_support::Agent::parse(&a.agent)?,
+                            id: a.id.as_deref(),
+                        })
+                    });
+                let claude_session_id = r.claude_session_id.as_ref().filter(|_| !resume_blocked);
+                let resume = match claude_session_id {
                     Some(id) => Some(tako_control::sessions::PaneResume {
                         agent: tako_core::agent_support::Agent::Claude,
                         id: Some(id.as_str()),
@@ -5909,15 +5937,23 @@ impl TakoApp {
                     resume.and_then(|r| r.id),
                     worker_registry.as_ref(),
                 );
-                let plan = tako_control::sessions::restore_plan(
-                    backend_alive,
-                    resume,
-                    catalog.as_ref(),
-                    r.session.as_deref(),
-                    Some(r.pane),
-                    &hints,
-                );
-                if let Some(session_id) = &r.claude_session_id {
+                let plan = if resume_blocked {
+                    RestorePlan::FreshShell(
+                        tako_control::sessions::FreshShellReason::DuplicateVessel,
+                    )
+                } else {
+                    // 起動条件を spawn 記録から引くキーも、このペインが繋ぐ器の名前
+                    // （重複した 2 本目に持ち主の記録を引かせない）
+                    tako_control::sessions::restore_plan(
+                        backend_alive,
+                        resume,
+                        catalog.as_ref(),
+                        vessel,
+                        Some(r.pane),
+                        &hints,
+                    )
+                };
+                if let Some(session_id) = claude_session_id {
                     if tako_control::transcript::is_valid_session_id(session_id) {
                         // **未確認**として持つ（スキャンの不在では落とさない。#1076）
                         app.claude_resume_sessions.seed(pane, session_id);
@@ -5926,7 +5962,7 @@ impl TakoApp {
                 // claude の ID があるペインは claude が勝つので、claude 以外の記録は
                 // 引き継がない（**seed した記録は未確認のまま落ちない**ので、
                 // 引き継ぐと使われない古い会話参照が layout に居座り続ける）
-                if let (None, Some(saved)) = (&r.claude_session_id, saved_agent) {
+                if let (None, Some(saved)) = (claude_session_id, saved_agent) {
                     // ID が無くても系統は覚えておく（保存し直せるまでのあいだ、
                     // 内訳ログが `ID なし` と `resume 非対応` を言い分けられる）
                     app.agent_resume_sessions.seed(pane, saved.agent, saved.id);

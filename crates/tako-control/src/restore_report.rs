@@ -537,6 +537,7 @@ mod tests {
                 FreshShellReason::InvalidSessionId,
                 FreshShellReason::TranscriptMissing,
                 FreshShellReason::ResumeUnsupported,
+                FreshShellReason::DuplicateVessel,
             ]
             .map(PaneOutcome::FreshShell),
         );
