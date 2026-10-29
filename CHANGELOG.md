@@ -8,6 +8,8 @@ change-type tag. Entries without a platform tag apply to every platform.
 プラットフォーム固有の項目は種別タグの直後に `[Windows]` / `[macOS]` を付ける
 （無印 = 全プラットフォーム共通）。規約の詳細は `.agent/conventions.md`。
 
+## [Unreleased]
+
 ## [0.8.39] - 2026-10-21
 
 Nightly patch release (automated). Changes since v0.8.38:
@@ -243,8 +245,6 @@ Nightly patch release (automated). Changes since v0.8.32:
 - [リファクタ] 言語の同定の正本 file_type へ色分け・プレビュー種別・インデント・言語トークンを寄せ、tako open / tako edit の応答に file_type / syntax を載せる (#1948) (#2005)
 - [修正] git の書き込み系と起動時の orphan の一括回収を UI スレッドから外し、自動復帰の tmux の 3 口を上限つきにする (#1991) (#2008)
 - [機能追加] tako mod S7-4: コマンドカードを mod で描き、描いたカードだけ GPUI のカード帯から外す (#1963) (#2004)
-
-## [Unreleased]
 
 ### Added
 
@@ -792,53 +792,6 @@ Nightly patch release (automated). Changes since v0.8.7:
 - [修正] 狭いペインの /model セレクタを選択肢ダイアログとして読めるようにした (#1143) (#1155)
 - [改善] 解説動画の収録を常設の仮想ディスプレイ tako-vd へ移し、master 章を撮り直して v2 を合成 (#1081) (#1145)
 
-## [0.8.7] - 2026-09-07
-
-Nightly patch release (automated). Changes since v0.8.6:
-夜間パッチリリース（自動）。v0.8.6 以降の変更:
-
-- [修正] 仮想ディスプレイを Main にしたままにしない / 同名の増殖で止まる / 孤児の後片付けは実行条件を満たすまで拒否する (#1150) (#1152)
-- [改善] プロファイルのリミット後自動復帰を master / solo 本人と後任 master にも配る (#1140) (#1151)
-- [機能追加] 検証用 GUI をユーザーのメイン画面に出さない: 常設の仮想ディスプレイへ逃がす (#1141) (#1149)
-- [改善] worker ペイン 1 枚に最小幅を保証し、割る spawn は別タブへ出す (#1132) (#1148)
-- [修正] 狭いペインで折り返された選択肢ラベルを結合してから構造を組む (#1131) (#1144)
-- [ドキュメント] AGENTS.md のコマンド表を .agent/commands.md へ分離する (#1139) (#1146)
-- [機能追加] 起動時ロードの予算 tako context-budget: 計測・自動修正・規約の機械強制 (#1139) (#1142)
-- [修正] tako が `claude auth login` を起こさない: 実機で 1 日 46 本まで積み上がった孤児を根治 (#1129) (#1135)
-- [修正] 切断理由が折り返しで割れても認証系だと分かる: 鍵の失敗を打ち直さない / Windows 実機セルフテストが初完走 (#1127) (#1138)
-- [ドキュメント] YouTube 解説動画の台本・収録・合成パイプライン (#1081) (#1126)
-
-## [Unreleased]
-
-### Added
-
-- **Startup load budget: `tako context-budget`** (#1139). Everything an agent
-  force-loads at startup — the global guide, `AGENTS.md` and its `@import` chain,
-  the master / solo system prompt, handoff files — is now measured against numeric
-  limits. `tako context-budget` reports bytes / lines / estimated tokens / budget /
-  reason per item; `tako context-budget fix` automatically folds old work-log entries
-  into `progress-archive.md`, one line each. The fix is idempotent, never rewrites or
-  summarises text, and refuses to write unless the total entry count is preserved
-  (the full text stays in git history). Overruns that need a human decision come back
-  as `proposals` with the concrete next step. Available as MCP `tako_context_budget`
-  (action `check` / `fix`), and checked in CI by a watchdog that runs the same
-  judgement function on this repository's own work log.
-  Measured trigger: master was spending 31% of its context (~310k tokens) before doing
-  any work, 180k of which was an `@import`ed work log grown to 332 entries / 407 KB
-  over three months, because the existing rule only *suggested* archiving.
-- **起動時ロードの予算 `tako context-budget`**（#1139）。エージェントが起動した瞬間に
-  強制ロードするもの（グローバル指示・`AGENTS.md` と `@import` チェーン・master / solo の
-  system prompt・引き継ぎ）を数値の上限と突き合わせる。`tako context-budget` が項目ごとに
-  bytes / 行 / 概算トークン / 予算 / 超過理由を返し、`tako context-budget fix` が作業ログの
-  古いエントリを `progress-archive.md` へ 1 行ずつ自動で移す。**冪等・本文の要約も改変も
-  しない・移送で総エントリ数が合わなければ書き込まない**（全文は git 履歴に残る）。
-  人間の判断が要る超過は直し方つきの `proposals` として返る。MCP `tako_context_budget`
-  （action = check / fix）と 1:1 で、CI の番犬が**同じ判定関数**でこのリポジトリ自身の
-  作業ログを検査する。
-  きっかけの実測: master が何も作業しないうちにコンテキストの 31%（約 31 万トークン）を
-  使っており、その 18 万トークンは 3 か月で 332 エントリ / 407 KB に育った `@import` 済みの
-  作業ログだった（既存の規約はアーカイブを**提案**するだけだったため守られなかった）。
-
 ### Changed
 
 - **The master / solo system prompt is now under the startup load budget, and its
@@ -874,6 +827,54 @@ Nightly patch release (automated). Changes since v0.8.6:
   （ユーザー自身の `prompt_blocks.append` はファイル名で名指しする）。
   実測: そのプロファイルで 59,501 B / 4.07 万トークン → 32,626 B / 2.04 万トークン、
   既定 blocks 単体では 21,072 B。A/B は `TAKO_1154_LEGACY=1`。
+
+## [0.8.7] - 2026-09-07
+
+Nightly patch release (automated). Changes since v0.8.6:
+夜間パッチリリース（自動）。v0.8.6 以降の変更:
+
+- [修正] 仮想ディスプレイを Main にしたままにしない / 同名の増殖で止まる / 孤児の後片付けは実行条件を満たすまで拒否する (#1150) (#1152)
+- [改善] プロファイルのリミット後自動復帰を master / solo 本人と後任 master にも配る (#1140) (#1151)
+- [機能追加] 検証用 GUI をユーザーのメイン画面に出さない: 常設の仮想ディスプレイへ逃がす (#1141) (#1149)
+- [改善] worker ペイン 1 枚に最小幅を保証し、割る spawn は別タブへ出す (#1132) (#1148)
+- [修正] 狭いペインで折り返された選択肢ラベルを結合してから構造を組む (#1131) (#1144)
+- [ドキュメント] AGENTS.md のコマンド表を .agent/commands.md へ分離する (#1139) (#1146)
+- [機能追加] 起動時ロードの予算 tako context-budget: 計測・自動修正・規約の機械強制 (#1139) (#1142)
+- [修正] tako が `claude auth login` を起こさない: 実機で 1 日 46 本まで積み上がった孤児を根治 (#1129) (#1135)
+- [修正] 切断理由が折り返しで割れても認証系だと分かる: 鍵の失敗を打ち直さない / Windows 実機セルフテストが初完走 (#1127) (#1138)
+- [ドキュメント] YouTube 解説動画の台本・収録・合成パイプライン (#1081) (#1126)
+
+### Added
+
+- **Startup load budget: `tako context-budget`** (#1139). Everything an agent
+  force-loads at startup — the global guide, `AGENTS.md` and its `@import` chain,
+  the master / solo system prompt, handoff files — is now measured against numeric
+  limits. `tako context-budget` reports bytes / lines / estimated tokens / budget /
+  reason per item; `tako context-budget fix` automatically folds old work-log entries
+  into `progress-archive.md`, one line each. The fix is idempotent, never rewrites or
+  summarises text, and refuses to write unless the total entry count is preserved
+  (the full text stays in git history). Overruns that need a human decision come back
+  as `proposals` with the concrete next step. Available as MCP `tako_context_budget`
+  (action `check` / `fix`), and checked in CI by a watchdog that runs the same
+  judgement function on this repository's own work log.
+  Measured trigger: master was spending 31% of its context (~310k tokens) before doing
+  any work, 180k of which was an `@import`ed work log grown to 332 entries / 407 KB
+  over three months, because the existing rule only *suggested* archiving.
+- **起動時ロードの予算 `tako context-budget`**（#1139）。エージェントが起動した瞬間に
+  強制ロードするもの（グローバル指示・`AGENTS.md` と `@import` チェーン・master / solo の
+  system prompt・引き継ぎ）を数値の上限と突き合わせる。`tako context-budget` が項目ごとに
+  bytes / 行 / 概算トークン / 予算 / 超過理由を返し、`tako context-budget fix` が作業ログの
+  古いエントリを `progress-archive.md` へ 1 行ずつ自動で移す。**冪等・本文の要約も改変も
+  しない・移送で総エントリ数が合わなければ書き込まない**（全文は git 履歴に残る）。
+  人間の判断が要る超過は直し方つきの `proposals` として返る。MCP `tako_context_budget`
+  （action = check / fix）と 1:1 で、CI の番犬が**同じ判定関数**でこのリポジトリ自身の
+  作業ログを検査する。
+  きっかけの実測: master が何も作業しないうちにコンテキストの 31%（約 31 万トークン）を
+  使っており、その 18 万トークンは 3 か月で 332 エントリ / 407 KB に育った `@import` 済みの
+  作業ログだった（既存の規約はアーカイブを**提案**するだけだったため守られなかった）。
+
+### Changed
+
 - **Profile-level auto-resume after usage limits now covers the master / solo session
   itself** (#1140, extends #822). A profile's `limit_resume: true` used to reach only
   the workers spawned from it, so when the master itself hit a usage limit everything
@@ -988,35 +989,6 @@ Nightly patch release (automated). Changes since v0.8.3:
 - [修正] Windows で GUI モードのスターターへ到達できない問題（切替導線の 2 穴）を根治 (#1058) (#1065)
 - [機能追加] setup の依存導入を案内止まりから実行代行へ: Windows の Claude Code 自動インストール + 失敗時のエージェント引き継ぎ + macOS の任意依存その場導入 (#1057) (#1064)
 
-## [0.8.3] - 2026-09-02
-
-Nightly patch release (automated). Changes since v0.8.2:
-夜間パッチリリース（自動）。v0.8.2 以降の変更:
-
-- [修正] 追跡ドキュメントの本番機ホスト名・tailnet ID・IP をプレースホルダへ (#1060) (#1061)
-- [ドキュメント] リモート大刷新の先行調査: Claude 公式 Remote Control への委譲は成立する (#1059)
-
-## [0.8.2] - 2026-08-30
-
-Nightly patch release (automated). Changes since v0.8.1:
-夜間パッチリリース（自動）。v0.8.1 以降の変更:
-
-- [ドキュメント] 8/29 並行 8 本の progress 追記 + activeContext を規約サイズへ圧縮 (#1054)
-- [改善] 自己検査を持たない daemon の serve_ok: null に理由を添える (#1049) (#1053)
-- [修正] remote が「起動中」を名乗ったまま tailnet から見えない問題を根治 (#1049) (#1051)
-- [修正] セルフテスト項目 111 の番兵と実 claude の使用率の衝突で確定失敗する問題を根治 (#1048) (#1052)
-- [修正] ネット断で SSH のペイン・タブ・リモートフォルダを失わず回線復帰で自動再接続する (#1040) (#1050)
-- [ドキュメント] #1038 の作業履歴を progress へ追記 (#1038) (#1047)
-- [修正] アプリ内アップデートで Dock のピン留めが外れる問題を根治 (#1042) (#1046)
-- [修正] remote の中継先をループバック TCP へ寄せて全リクエスト 502 を根治する (#1038) (#971) (#1044)
-- [機能追加] Finder からターミナルペインへの D&D でパスを挿入する (#1043) (#1045)
-- [修正] 検索のヒット位置が小文字化でバイト長が変わる文字でずれる問題を根治 (#1016) (#1039)
-- [機能追加] ファイルツリーに git ステータスの色分けとバッジを出す (#1009) (#1037)
-- [ドキュメント] 3 CLI の北極星測定レポートを追加 (#983) (#975) (#1036)
-- [ドキュメント] docs 全体に実画面のスクリーンショットを入れる（22 図 / 12 ページ）(#1027) (#1032)
-
-## [Unreleased]
-
 ### Changed / 変更
 
 - **[改善] [Windows] PerMonitorV2 マニフェストを自己検査つきの不変条件にする (#1063)**
@@ -1047,6 +1019,51 @@ Nightly patch release (automated). Changes since v0.8.1:
   a startup diagnostic, `dpi_awareness` in the `tako_check_health` MCP tool, self-test item 139 on Windows,
   and a watchdog that runs on macOS. `scripts/windows/measure-window.ps1` ships the correct
   measurement tool and refuses to run if it cannot declare per-monitor awareness.
+
+### Added / 追加
+
+- **[機能追加] エージェントペインの右クリックに「会話を引き継いだ再起動」2 種を追加 (#1067)**
+  claude CLI は symlink の張り替えで更新されるので、長生きのセッションは起動時の旧バイナリを
+  握り続ける（#498 の stale 警告）。**会話を 1 文字も失わずにプロセスだけ建て直す**
+  「会話を保って再起動（CLI 更新）」と、#749 の自動ハンドオフを人の操作で起こせる
+  「引き継ぎを書かせて再起動」（master のみ）をペインの右クリックへ置いた。
+  AI からは `tako session-restart [--mode harness|handoff]` / MCP `tako_session_restart`
+  （**引数なしは下見**で、できること + できない理由を返すだけ）。旧プロセスは
+  **落ちたのを確かめてから** resume の行を送るので、動いている TUI の入力欄へ流れ込まない。
+  会話 ID を解決できないときは**プロセスに触らずに断る**。#498 の張り直しボタンも同一実装へ寄せた。
+  Agent panes now offer two "restart while keeping the session" actions in the context menu:
+  rebuilding just the CLI process and resuming the same conversation (the one-click fix for a
+  stale `claude` binary), and asking a master to write a handoff before a fresh session takes
+  over. Exposed as `tako session-restart` / `tako_session_restart`; with no arguments it only
+  reports what is possible and why. The old process is confirmed dead before the resume line is
+  typed, and the restart is refused outright when the conversation id cannot be resolved.
+
+## [0.8.3] - 2026-09-02
+
+Nightly patch release (automated). Changes since v0.8.2:
+夜間パッチリリース（自動）。v0.8.2 以降の変更:
+
+- [修正] 追跡ドキュメントの本番機ホスト名・tailnet ID・IP をプレースホルダへ (#1060) (#1061)
+- [ドキュメント] リモート大刷新の先行調査: Claude 公式 Remote Control への委譲は成立する (#1059)
+
+## [0.8.2] - 2026-08-30
+
+Nightly patch release (automated). Changes since v0.8.1:
+夜間パッチリリース（自動）。v0.8.1 以降の変更:
+
+- [ドキュメント] 8/29 並行 8 本の progress 追記 + activeContext を規約サイズへ圧縮 (#1054)
+- [改善] 自己検査を持たない daemon の serve_ok: null に理由を添える (#1049) (#1053)
+- [修正] remote が「起動中」を名乗ったまま tailnet から見えない問題を根治 (#1049) (#1051)
+- [修正] セルフテスト項目 111 の番兵と実 claude の使用率の衝突で確定失敗する問題を根治 (#1048) (#1052)
+- [修正] ネット断で SSH のペイン・タブ・リモートフォルダを失わず回線復帰で自動再接続する (#1040) (#1050)
+- [ドキュメント] #1038 の作業履歴を progress へ追記 (#1038) (#1047)
+- [修正] アプリ内アップデートで Dock のピン留めが外れる問題を根治 (#1042) (#1046)
+- [修正] remote の中継先をループバック TCP へ寄せて全リクエスト 502 を根治する (#1038) (#971) (#1044)
+- [機能追加] Finder からターミナルペインへの D&D でパスを挿入する (#1043) (#1045)
+- [修正] 検索のヒット位置が小文字化でバイト長が変わる文字でずれる問題を根治 (#1016) (#1039)
+- [機能追加] ファイルツリーに git ステータスの色分けとバッジを出す (#1009) (#1037)
+- [ドキュメント] 3 CLI の北極星測定レポートを追加 (#983) (#975) (#1036)
+- [ドキュメント] docs 全体に実画面のスクリーンショットを入れる（22 図 / 12 ページ）(#1027) (#1032)
 
 ### Fixed / 修正
 
@@ -1081,23 +1098,49 @@ Nightly patch release (automated). Changes since v0.8.1:
   tailscale has no `unix:` serve target at all (#971). Set
   `TAKO_REMOTE_ENDPOINT=unix` to keep the previous Unix-socket listener.
 
-### Added / 追加
+- [修正] [macOS] アプリ内アップデートのたびに Dock のピン留めが外れる問題を根治 (#1042)
+  Dock のピン留めは `.app` への **file URL ブックマーク**（`com.apple.dock` の
+  `persistent-apps[].tile-data.book`）で持たれ、CNID（inode）を優先して解決する。
+  更新の適用は `/Applications/tako.app` を `tako.app.bak` へ**退避してから**新版を
+  別 inode でコピーし、最後に退避先を削除していたので、**置き場が空いた瞬間**に
+  追跡している側は「アプリが退避先へ移動した」としか読めず参照をそちらへ書き直し、
+  最後の削除でその実体が消えてピンが外れていた。
+  差し替えを「隣へステージ → `renamex_np(RENAME_SWAP)` でアトミックに入れ替え →
+  旧版を捨てる」へ変更し、**置き場が一度も空かない**形にした。標準的なバンドルでは
+  `Contents/` だけを入れ替えるので **`.app` 自体の inode が変わらず**、ブックマークは
+  張り直しすら要らない（実測: 修正前は置き場が空になるサンプルを毎回 1300〜1600 件
+  観測し `isStale` が立つ / 修正後は 0 件で `isStale` は false のまま）。
+  副次的に、入れ替えの手前で失敗しても旧アプリが消えなくなった。
+  `scripts/build-app.sh --install` の `rm -rf` → `cp -R` も同じ形へ揃えた。
+  併せて `tako update apply` / `apply-zip` の応答に `message` を追加し、どの手段で
+  差し替えたか（`contents-swap` / `swap` / `fresh` / `move-aside`）を CLI / MCP から
+  読めるようにした（従来は dispatch がメッセージを捨てていた）。
+  Fixed the Dock pin being lost on every in-app update. The bundle is now staged next
+  to its destination and swapped in atomically (`RENAME_SWAP`), so
+  `/Applications/tako.app` is never momentarily absent; for standard bundles only
+  `Contents/` is swapped, leaving the `.app` inode — and therefore the Dock's
+  bookmark — untouched.
 
-- **[機能追加] エージェントペインの右クリックに「会話を引き継いだ再起動」2 種を追加 (#1067)**
-  claude CLI は symlink の張り替えで更新されるので、長生きのセッションは起動時の旧バイナリを
-  握り続ける（#498 の stale 警告）。**会話を 1 文字も失わずにプロセスだけ建て直す**
-  「会話を保って再起動（CLI 更新）」と、#749 の自動ハンドオフを人の操作で起こせる
-  「引き継ぎを書かせて再起動」（master のみ）をペインの右クリックへ置いた。
-  AI からは `tako session-restart [--mode harness|handoff]` / MCP `tako_session_restart`
-  （**引数なしは下見**で、できること + できない理由を返すだけ）。旧プロセスは
-  **落ちたのを確かめてから** resume の行を送るので、動いている TUI の入力欄へ流れ込まない。
-  会話 ID を解決できないときは**プロセスに触らずに断る**。#498 の張り直しボタンも同一実装へ寄せた。
-  Agent panes now offer two "restart while keeping the session" actions in the context menu:
-  rebuilding just the CLI process and resuming the same conversation (the one-click fix for a
-  stale `claude` binary), and asking a master to write a handoff before a fresh session takes
-  over. Exposed as `tako session-restart` / `tako_session_restart`; with no arguments it only
-  reports what is possible and why. The old process is confirmed dead before the resume line is
-  typed, and the restart is refused outright when the conversation id cannot be resolved.
+- [修正] 検索のヒット位置が小文字化でバイト長が変わる文字でずれる問題を根治 (#1016)
+  プレビューの検索・置換（⌘F / `tako preview-search` / `tako_preview_search`）が、
+  **小文字化した写しのバイト位置を元テキストの位置として使っていた**。小文字化は
+  バイト長を変えうる（`İ` U+0130 は 2 → 3 バイト、`ẞ` U+1E9E は 3 → 2 バイト）ので、
+  該当文字がファイルに 1 つあるだけで以降のヒットがずれ、**置換すると本文が壊れる**。
+  実測では壊れるだけでなく**アプリごと落ちる**経路もあった（全置換で文字境界を割る
+  `not a char boundary` panic / 終端が本文の範囲を超える out of bounds panic）。
+  探索そのものは写しに対する高速な部分文字列探索のまま残し、見つかった位置を
+  元テキストへ戻す形にした（戻せない位置 = 展開された文字の途中で始まる一致は返さない）。
+  本文全体のバイト長が一致していても安全ではない（`İ` と `ẞ` が両方あると伸縮が
+  打ち消しあって総和だけ一致し、途中の位置は食い違う）ため、総和は判断材料にしていない。
+  同根の位置ずれがあったターミナルのリンク検出（`http://` / `https://` の走査）も同時に修正。
+  Preview search / replace used byte offsets taken from a lowercased copy as offsets into
+  the original text. Lowercasing can change byte length (`İ` U+0130 grows 2 → 3 bytes,
+  `ẞ` U+1E9E shrinks 3 → 2), so a single such character shifted every later hit and
+  corrupted the file on replace — and in some paths panicked the whole app. Matching now
+  maps hits back to original-text offsets, and the same drift in terminal link detection
+  is fixed too.
+
+### Added / 追加
 
 - **[改善] 自己検査を持たない daemon の `serve_ok: null` に理由を添えた (#1049)**
   tako を更新しても remote デーモンは動き続けるので、新しい CLI から見ると
@@ -1143,33 +1186,6 @@ Nightly patch release (automated). Changes since v0.8.1:
   standalone `tailscaled` are running; it asks (or explains its non-interactive pick),
   remembers the choice, and surfaces the duplicate-node situation in
   `tako remote status`.
-
-## [0.8.1] - 2026-08-29
-
-Nightly patch release (automated). Changes since v0.8.0:
-夜間パッチリリース（自動）。v0.8.0 以降の変更:
-
-- [修正] 送達の観測手段をマトリクスから引き、起動失敗の系統を網羅する (#983) (#1029)
-- [改善] チャットの生成中ドットを有限回化する (#1012) (#1020)
-- [修正] docs トップのヒーロー背景装飾が画面途中で矩形に切れる問題を根治 (#1026) (#1028)
-- [改善] SSH の進行状況を可視化: 読み込み中のスピナーと接続待ちの表示 (#1010) (#1025)
-- [修正] ファイルメニュー経路の SSH ペインでターミナルが立たない問題を根治 (#1023) (#1024)
-
-## [0.8.0] - 2026-08-28
-
-Nightly minor release (automated). Changes since v0.7.10:
-夜間マイナーリリース（自動）。v0.7.10 以降の変更:
-
-- [機能追加] setup でエージェントごとのモデル一覧を実取得して選べるようにする (#1002) (#1014)
-- [改善] claude agents --json の起動コストを削る: 前段ガード + 鮮度の用途分離 (#1011) (#1018)
-- [ドキュメント] progress.md に #1006（SSH 接続の開き方 2 点）の記録を追記
-- [改善] SSH 接続の開き方 2 点: ペインメニューからの SSH 化 + 既定を現在タブの新ペインへ (#1006) (#1017)
-- [機能追加] 夜間リリースの次回バージョン予約: patch 固定をやめ minor / major を夜間発火に乗せる (#1005) (#1008)
-- [改善] codex の利用上限を構造化データで扱い自動復帰を成立させる / agy の可否を実測で確定 (#985) (#1003)
-
-## [Unreleased]
-
-### Added / 追加
 
 - [機能追加] **Finder からターミナルペインへファイルをドラッグ&ドロップするとパスが入る**
   ようにした (#1043)。Terminal.app / iTerm2 と同じ体験で、複数選択は空白区切り、空白・
@@ -1228,6 +1244,19 @@ Nightly minor release (automated). Changes since v0.7.10:
   outage went undetected for 66s before) and fixed the very first SSH connection failing on a
   fresh install because `<data_dir>/ssh/` was never created.
 
+## [0.8.1] - 2026-08-29
+
+Nightly patch release (automated). Changes since v0.8.0:
+夜間パッチリリース（自動）。v0.8.0 以降の変更:
+
+- [修正] 送達の観測手段をマトリクスから引き、起動失敗の系統を網羅する (#983) (#1029)
+- [改善] チャットの生成中ドットを有限回化する (#1012) (#1020)
+- [修正] docs トップのヒーロー背景装飾が画面途中で矩形に切れる問題を根治 (#1026) (#1028)
+- [改善] SSH の進行状況を可視化: 読み込み中のスピナーと接続待ちの表示 (#1010) (#1025)
+- [修正] ファイルメニュー経路の SSH ペインでターミナルが立たない問題を根治 (#1023) (#1024)
+
+### Added / 追加
+
 - [改善] SSH の進行状況を可視化した (#1010)
   ① **リモートファイルの読み込み中はツリーの行に回る弧が出る**。GUI の「開く」は
   SFTP の取得を**背景**へ出すようにしたので（従来は UI スレッドで同期実行 =
@@ -1256,48 +1285,6 @@ Nightly minor release (automated). Changes since v0.7.10:
 
 ### Fixed / 修正
 
-- [修正] [macOS] アプリ内アップデートのたびに Dock のピン留めが外れる問題を根治 (#1042)
-  Dock のピン留めは `.app` への **file URL ブックマーク**（`com.apple.dock` の
-  `persistent-apps[].tile-data.book`）で持たれ、CNID（inode）を優先して解決する。
-  更新の適用は `/Applications/tako.app` を `tako.app.bak` へ**退避してから**新版を
-  別 inode でコピーし、最後に退避先を削除していたので、**置き場が空いた瞬間**に
-  追跡している側は「アプリが退避先へ移動した」としか読めず参照をそちらへ書き直し、
-  最後の削除でその実体が消えてピンが外れていた。
-  差し替えを「隣へステージ → `renamex_np(RENAME_SWAP)` でアトミックに入れ替え →
-  旧版を捨てる」へ変更し、**置き場が一度も空かない**形にした。標準的なバンドルでは
-  `Contents/` だけを入れ替えるので **`.app` 自体の inode が変わらず**、ブックマークは
-  張り直しすら要らない（実測: 修正前は置き場が空になるサンプルを毎回 1300〜1600 件
-  観測し `isStale` が立つ / 修正後は 0 件で `isStale` は false のまま）。
-  副次的に、入れ替えの手前で失敗しても旧アプリが消えなくなった。
-  `scripts/build-app.sh --install` の `rm -rf` → `cp -R` も同じ形へ揃えた。
-  併せて `tako update apply` / `apply-zip` の応答に `message` を追加し、どの手段で
-  差し替えたか（`contents-swap` / `swap` / `fresh` / `move-aside`）を CLI / MCP から
-  読めるようにした（従来は dispatch がメッセージを捨てていた）。
-  Fixed the Dock pin being lost on every in-app update. The bundle is now staged next
-  to its destination and swapped in atomically (`RENAME_SWAP`), so
-  `/Applications/tako.app` is never momentarily absent; for standard bundles only
-  `Contents/` is swapped, leaving the `.app` inode — and therefore the Dock's
-  bookmark — untouched.
-
-- [修正] 検索のヒット位置が小文字化でバイト長が変わる文字でずれる問題を根治 (#1016)
-  プレビューの検索・置換（⌘F / `tako preview-search` / `tako_preview_search`）が、
-  **小文字化した写しのバイト位置を元テキストの位置として使っていた**。小文字化は
-  バイト長を変えうる（`İ` U+0130 は 2 → 3 バイト、`ẞ` U+1E9E は 3 → 2 バイト）ので、
-  該当文字がファイルに 1 つあるだけで以降のヒットがずれ、**置換すると本文が壊れる**。
-  実測では壊れるだけでなく**アプリごと落ちる**経路もあった（全置換で文字境界を割る
-  `not a char boundary` panic / 終端が本文の範囲を超える out of bounds panic）。
-  探索そのものは写しに対する高速な部分文字列探索のまま残し、見つかった位置を
-  元テキストへ戻す形にした（戻せない位置 = 展開された文字の途中で始まる一致は返さない）。
-  本文全体のバイト長が一致していても安全ではない（`İ` と `ẞ` が両方あると伸縮が
-  打ち消しあって総和だけ一致し、途中の位置は食い違う）ため、総和は判断材料にしていない。
-  同根の位置ずれがあったターミナルのリンク検出（`http://` / `https://` の走査）も同時に修正。
-  Preview search / replace used byte offsets taken from a lowercased copy as offsets into
-  the original text. Lowercasing can change byte length (`İ` U+0130 grows 2 → 3 bytes,
-  `ẞ` U+1E9E shrinks 3 → 2), so a single such character shifted every later hit and
-  corrupted the file on replace — and in some paths panicked the whole app. Matching now
-  maps hits back to original-text offsets, and the same drift in terminal link detection
-  is fixed too.
-
 - [修正] ファイルメニュー / パレットから開いた SSH ペインでターミナルが立たない (#1023)
   「ファイル→リモート接続」で出したペインは**ターミナルが出るまで待たされる**のに、
   ペイン右クリックの SSH 化は即出る、という非対称があった。原因は GUI 経路が
@@ -1320,6 +1307,18 @@ Nightly minor release (automated). Changes since v0.7.10:
   is up immediately (137ms). The same missing drain in the file tree's "Open SSH pane here"
   and the tmux panel's "restore" button is fixed too, and a watchdog test now guards it.
 
+## [0.8.0] - 2026-08-28
+
+Nightly minor release (automated). Changes since v0.7.10:
+夜間マイナーリリース（自動）。v0.7.10 以降の変更:
+
+- [機能追加] setup でエージェントごとのモデル一覧を実取得して選べるようにする (#1002) (#1014)
+- [改善] claude agents --json の起動コストを削る: 前段ガード + 鮮度の用途分離 (#1011) (#1018)
+- [ドキュメント] progress.md に #1006（SSH 接続の開き方 2 点）の記録を追記
+- [改善] SSH 接続の開き方 2 点: ペインメニューからの SSH 化 + 既定を現在タブの新ペインへ (#1006) (#1017)
+- [機能追加] 夜間リリースの次回バージョン予約: patch 固定をやめ minor / major を夜間発火に乗せる (#1005) (#1008)
+- [改善] codex の利用上限を構造化データで扱い自動復帰を成立させる / agy の可否を実測で確定 (#985) (#1003)
+
 ### Changed / 変更
 
 - [改善] SSH 接続の開き方を 2 点変えた (#1006)
@@ -1339,6 +1338,51 @@ Nightly minor release (automated). Changes since v0.7.10:
   now goes through the same dispatch, so the #919 guarantees (connecting banner,
   ConnectTimeout, failures staying on screen) finally apply to it too.
 
+### Added
+
+- [機能追加] `tako setup` がエージェントごとの**モデル一覧を実取得**して選べるようにした
+  (#1002)。取得は各 CLI の一覧コマンド（**codex = `codex debug models`** / **agy = `agy models`**）で、
+  codex はモデル別の effort 語彙とコンテキスト長まで並ぶ。**claude は一覧コマンドを持たない**
+  （`claude models` はプロンプトとして解釈される）ので同梱のエイリアス（`opus` / `sonnet` /
+  `fable`）を並べ、「実取得ではない」ことを明示する。取得の失敗は 5 種に分類して
+  「理由 + 次の一手」を返す（未導入 = 導入コマンド / 未ログイン / 一覧コマンドが無い /
+  コマンド失敗 / 書式が変わった）。一覧は `tako setup models [--agent <系統>] [--json]` /
+  MCP `tako_setup_models` から読める。**対話ピッカーは `tako setup --review` だけ**で、
+  標準 `tako setup` は質問ゼロのまま「いま何が選ばれているか + 変えたいときのコマンド」を
+  出す。**1 番は常に「CLI の既定に任せる」**（tako はモデルを固定しない）。未導入の系統も
+  選択肢に並び、選ぶと導入手順が返る。選択は既定プロファイルの model / effort へ
+  ロック付きで書くので既存の設定は壊れない（master が別系統のときは master 側へ書かない）
+- [Added] `tako setup` can now **fetch the real model list from each agent CLI** and let you
+  pick one (#1002). The list comes from each CLI's own command (**codex = `codex debug
+  models`**, **agy = `agy models`**); for codex it includes the per-model effort vocabulary
+  and context window. **claude has no such command** (`claude models` is interpreted as a
+  prompt), so tako offers its built-in aliases (`opus` / `sonnet` / `fable`) and says
+  explicitly that this is not a live fetch. Failures are classified into five kinds with a
+  reason and a next step (not installed — with the install command / not signed in / no list
+  command / command failed / format changed). Read the list with `tako setup models
+  [--agent <agent>] [--json]` or MCP `tako_setup_models`. **The interactive picker only runs
+  under `tako setup --review`**; plain `tako setup` stays question-free and just prints what
+  is selected plus the command to change it. **Option 1 is always "leave it to the CLI
+  default"** — tako never pins a model for you. Agents that are not installed are still
+  listed, and picking one returns install guidance. The choice is written to the default
+  profile's model / effort under a lock, so the rest of your profile is untouched (and the
+  master side is left alone when master runs a different agent).
+- [機能追加] 設定画面（Cmd+, → プロファイル）の model 行からも同じ候補を選べるようにした
+  (#1002)。「候補を取得」を**押したときだけ** background で一覧を取るので、タブを開く動作は
+  今までどおり軽い（`agy models` はネットワーク取得で数秒かかる）。自由入力は残してある。
+  agy の effort チップも同じ変更で出るようになった
+- [Added] The settings screen (Cmd+, → Profiles) can pick from the same list on its model row
+  (#1002). The list is fetched in the background **only when you press "Fetch options"**, so
+  opening the tab stays as fast as before (`agy models` does a network round-trip that takes
+  seconds). Free-text entry is still available. agy's effort chips now appear too.
+- [機能追加] agy の worker へも `--effort` を渡すようにした (#1002)。`agy models` が挙げる
+  全モデルで `--effort low|medium|high` が受理されることを実測した（表示名の `(High)` 等は
+  モデル側の設定で `--effort` とは別物）。旧挙動は `TAKO_1002_LEGACY=1`
+- [Added] agy workers now receive `--effort` as well (#1002). Measured that
+  `--effort low|medium|high` is accepted for every model `agy models` reports (the `(High)`
+  suffix in a display name is a property of the model, not the `--effort` flag). Set
+  `TAKO_1002_LEGACY=1` for the previous behaviour.
+
 ## [0.7.10] - 2026-08-27
 
 Nightly patch release (automated). Changes since v0.7.9:
@@ -1346,6 +1390,28 @@ Nightly patch release (automated). Changes since v0.7.9:
 
 - [改善] codex worker の状態監視を claude 同等へ: 構造化ソース + 弱マーカーの agent 別分離 (#984) (#1000)
 - [修正] 非 claude agent の spawn の無言死を塞ぐ: CLI の実在をペイン作成前に確かめる (#983) (#999)
+
+### Fixed
+
+- [修正] codex / agy / claude の CLI が入っていない環境で worker を spawn すると、tako が
+  構造化された失敗を 1 つも出さずに「成功」と報告していた問題を修正 (#983)。ペインには
+  `command not found` が出るだけ、送達検査は「実行された」までしか見ず、`prompt_delivery` も
+  claude 以外は `n/a` だったため、**spawn は成功したと言われたのに worker が何もしない**
+  状態（無言死）になっていた。**ペインを作る前に**実行ファイルの実在を確かめ、無ければ
+  理由 + 次の一手（公式の導入コマンド・参考 URL・`tako setup` の案内）を返す。
+  失敗しても空ペインもレジストリの active も残らない。解決した実行ファイルは spawn 応答の
+  `agent_path` に載る。同じ検査は `tako master` / `tako solo` / 引き継ぎの後任 master /
+  コンフリクト解消エージェントにも入っている
+- [Fixed] Spawning a worker when the agent CLI (codex / agy / claude) is not installed no
+  longer reports success while nothing happens (#983). Previously the assembled command was
+  piped straight into the shell, so the pane just showed `command not found`: the delivery
+  check only verifies that *something* ran, and `prompt_delivery` returns `n/a` for
+  non-claude agents — a silent death. tako now checks that the executable exists **before
+  creating the pane** and, when it is missing, returns the reason plus the next step (the
+  official install command, a reference URL and a pointer to `tako setup`). No empty pane
+  and no active registry entry is left behind, and the resolved executable is reported as
+  `agent_path` in the spawn response. The same check guards `tako master`, `tako solo`, the
+  successor master created by a handoff, and the conflict-resolver agent
 
 ## [0.7.9] - 2026-08-27
 
@@ -1431,156 +1497,6 @@ Nightly patch release (automated). Changes since v0.7.7:
 - [修正] tako-app を release で GUI サブシステムへリンクし、無音死を防ぐ (#586) (#467) (#941)
 - [ドキュメント] README を再構成 + Homebrew 導入手順とドキュメントサイトへの導線を追加 (#939)
 - [改善] 対応マトリクスを実測根拠つきで棚卸し + docs「Windows 対応状況」ページ (#591) (#938)
-
-## [Unreleased]
-
-### Added
-
-- [機能追加] `tako setup` がエージェントごとの**モデル一覧を実取得**して選べるようにした
-  (#1002)。取得は各 CLI の一覧コマンド（**codex = `codex debug models`** / **agy = `agy models`**）で、
-  codex はモデル別の effort 語彙とコンテキスト長まで並ぶ。**claude は一覧コマンドを持たない**
-  （`claude models` はプロンプトとして解釈される）ので同梱のエイリアス（`opus` / `sonnet` /
-  `fable`）を並べ、「実取得ではない」ことを明示する。取得の失敗は 5 種に分類して
-  「理由 + 次の一手」を返す（未導入 = 導入コマンド / 未ログイン / 一覧コマンドが無い /
-  コマンド失敗 / 書式が変わった）。一覧は `tako setup models [--agent <系統>] [--json]` /
-  MCP `tako_setup_models` から読める。**対話ピッカーは `tako setup --review` だけ**で、
-  標準 `tako setup` は質問ゼロのまま「いま何が選ばれているか + 変えたいときのコマンド」を
-  出す。**1 番は常に「CLI の既定に任せる」**（tako はモデルを固定しない）。未導入の系統も
-  選択肢に並び、選ぶと導入手順が返る。選択は既定プロファイルの model / effort へ
-  ロック付きで書くので既存の設定は壊れない（master が別系統のときは master 側へ書かない）
-- [Added] `tako setup` can now **fetch the real model list from each agent CLI** and let you
-  pick one (#1002). The list comes from each CLI's own command (**codex = `codex debug
-  models`**, **agy = `agy models`**); for codex it includes the per-model effort vocabulary
-  and context window. **claude has no such command** (`claude models` is interpreted as a
-  prompt), so tako offers its built-in aliases (`opus` / `sonnet` / `fable`) and says
-  explicitly that this is not a live fetch. Failures are classified into five kinds with a
-  reason and a next step (not installed — with the install command / not signed in / no list
-  command / command failed / format changed). Read the list with `tako setup models
-  [--agent <agent>] [--json]` or MCP `tako_setup_models`. **The interactive picker only runs
-  under `tako setup --review`**; plain `tako setup` stays question-free and just prints what
-  is selected plus the command to change it. **Option 1 is always "leave it to the CLI
-  default"** — tako never pins a model for you. Agents that are not installed are still
-  listed, and picking one returns install guidance. The choice is written to the default
-  profile's model / effort under a lock, so the rest of your profile is untouched (and the
-  master side is left alone when master runs a different agent).
-- [機能追加] 設定画面（Cmd+, → プロファイル）の model 行からも同じ候補を選べるようにした
-  (#1002)。「候補を取得」を**押したときだけ** background で一覧を取るので、タブを開く動作は
-  今までどおり軽い（`agy models` はネットワーク取得で数秒かかる）。自由入力は残してある。
-  agy の effort チップも同じ変更で出るようになった
-- [Added] The settings screen (Cmd+, → Profiles) can pick from the same list on its model row
-  (#1002). The list is fetched in the background **only when you press "Fetch options"**, so
-  opening the tab stays as fast as before (`agy models` does a network round-trip that takes
-  seconds). Free-text entry is still available. agy's effort chips now appear too.
-- [機能追加] agy の worker へも `--effort` を渡すようにした (#1002)。`agy models` が挙げる
-  全モデルで `--effort low|medium|high` が受理されることを実測した（表示名の `(High)` 等は
-  モデル側の設定で `--effort` とは別物）。旧挙動は `TAKO_1002_LEGACY=1`
-- [Added] agy workers now receive `--effort` as well (#1002). Measured that
-  `--effort low|medium|high` is accepted for every model `agy models` reports (the `(High)`
-  suffix in a display name is a property of the model, not the `--effort` flag). Set
-  `TAKO_1002_LEGACY=1` for the previous behaviour.
-- [機能追加] ペインで `ssh <host>` に入るだけで、そのホストのフォルダがファイルツリーへ
-  並ぶようにした (#976)。明示的な「リモートからフォルダを開く」操作は要らない（初期パスは
-  sftp の初期 cwd = リモートのホーム）。ルートは**ローカルフォルダと同じ形**（フォルダ名 +
-  フォルダアイコン）で**ローカルの後ろに**並び、SSH であることと相手は行末のバッジ
-  （`SSH <host>`）が示す。**切断してもフォルダは消さず**バッジが「切断」へ変わる
-  （右クリックの「再読み込み」で復帰）。宛先を取り違える形（`-p` / `-J` /
-  `-o Hostname=` / `ssh host <コマンド>` / `-N` 等）は**見送って理由を残し**、鍵・agent で
-  入れない相手はパスワードを聞かずに見送る。**アイドル時のコストはゼロ**: 走査の材料は
-  OSC 133 のコマンド状態とペインの子 pid で、指紋が動いたときと 60 秒の保険
-  （生きた ssh を抱えている間だけ）でのみプロセス表を採り、採取は #772 / #779 の
-  `ProcessSnapshot` へ相乗りする（実測: 自動追加 ON / OFF どちらもアイドル 120 秒で
-  採取 6 回 = **同数**）。実測では `ssh <host>` から検知 5 秒・ツリー表示 12 秒。
-  切替は 設定画面 → リモート / `tako remote-folder auto [on|off]` / MCP
-  `tako_remote_folder` の `action: "auto"`（既定 ON）。Windows はプロセスのコマンド行を
-  採れないので自動検知は働かない（明示経路はそのまま使える）
-- [Added] Entering `ssh <host>` in a pane now makes that host's folder appear in the file
-  tree (#976) — no explicit "Open Remote Folder" step, and the initial path is the remote
-  home (sftp's initial cwd). The root looks exactly like a local workspace folder (name +
-  folder icon) and sits after the local ones; a badge at the end of the row (`SSH <host>`)
-  says it is remote and which machine it is. **Disconnecting never removes the folder** —
-  the badge turns red and reads "offline", and the right-click "Reload" brings it back.
-  Command lines where tako cannot guarantee it would reach the same machine (`-p`, `-J`,
-  `-o Hostname=`, `ssh host <command>`, `-N`, …) are skipped with a recorded reason, and
-  hosts that need a password are skipped instead of prompting. Idle cost is zero: the scan
-  is gated on OSC 133 command state plus the pane's child pid, runs only on fingerprint
-  changes and a 60 s safety net (only while a live ssh is tracked), and shares the
-  `ProcessSnapshot` introduced by #772 / #779 (measured: 6 captures per idle 120 s with the
-  feature both on and off). Measured latency: detected 5 s after `ssh <host>`, folder shown
-  at 12 s. Toggle it in Settings → Remote, `tako remote-folder auto [on|off]`, or MCP
-  `tako_remote_folder` with `action: "auto"` (on by default). Windows cannot read process
-  command lines, so auto-detection does not run there (the explicit path still works)
-
-### Fixed
-
-- [修正] codex / agy / claude の CLI が入っていない環境で worker を spawn すると、tako が
-  構造化された失敗を 1 つも出さずに「成功」と報告していた問題を修正 (#983)。ペインには
-  `command not found` が出るだけ、送達検査は「実行された」までしか見ず、`prompt_delivery` も
-  claude 以外は `n/a` だったため、**spawn は成功したと言われたのに worker が何もしない**
-  状態（無言死）になっていた。**ペインを作る前に**実行ファイルの実在を確かめ、無ければ
-  理由 + 次の一手（公式の導入コマンド・参考 URL・`tako setup` の案内）を返す。
-  失敗しても空ペインもレジストリの active も残らない。解決した実行ファイルは spawn 応答の
-  `agent_path` に載る。同じ検査は `tako master` / `tako solo` / 引き継ぎの後任 master /
-  コンフリクト解消エージェントにも入っている
-- [Fixed] Spawning a worker when the agent CLI (codex / agy / claude) is not installed no
-  longer reports success while nothing happens (#983). Previously the assembled command was
-  piped straight into the shell, so the pane just showed `command not found`: the delivery
-  check only verifies that *something* ran, and `prompt_delivery` returns `n/a` for
-  non-claude agents — a silent death. tako now checks that the executable exists **before
-  creating the pane** and, when it is missing, returns the reason plus the next step (the
-  official install command, a reference URL and a pointer to `tako setup`). No empty pane
-  and no active registry entry is left behind, and the resolved executable is reported as
-  `agent_path` in the spawn response. The same check guards `tako master`, `tako solo`, the
-  successor master created by a handoff, and the conflict-resolver agent
-- [修正] codex を master / solo / worker に使うとき、承認とサンドボックスを丸ごと外す
-  `--dangerously-bypass-approvals-and-sandbox` が**無条件で付いていた**のを、
-  プロファイルの `bypass_sandbox`（既定 false）による明示 opt-in へ変更 (#981)。
-  claude master には相当するフラグが無いので系統間で既定の安全性が非対称で、
-  外す手段（opt-out）も無かった。既存プロファイルは自動マイグレーション（#916）で
-  `bypass_sandbox: true` が書かれるので**挙動は変わらない**（新規だけ安全側になる）。
-  操作は CLI `--bypass-sandbox` / MCP `bypass_sandbox` / 設定画面のトグルの 3 経路。
-  起動時に「サンドボックスが今どうなっているか」を 1 行出す（外れていないときも出して
-  外し方を添えるので、承認プロンプトで止まっても理由が画面に残る）
-- [Fixed] Launching codex as master / solo / worker no longer passes
-  `--dangerously-bypass-approvals-and-sandbox` unconditionally; it is now an explicit
-  opt-in via the profile's `bypass_sandbox` (default false) (#981). claude master has no
-  equivalent flag, so the previous default made the two agents asymmetric in safety with
-  no way to opt out. Existing profiles are auto-migrated (#916) to `bypass_sandbox: true`,
-  so **behavior does not change for them** — only newly created profiles get the safe
-  default. Configurable from the CLI (`--bypass-sandbox`), MCP (`bypass_sandbox`) and the
-  settings window, and the launch output now states whether the sandbox is on or off
-- [修正] タブバーの横スクロールが効かず、タブが増えると画面外に埋もれてアクセスできない
-  問題を根治 (#961)。原因は #576（`0880c26` で main へ）がタブピルへ付けた `occlude()`。
-  GPUI の `hit_test` は `occlude()` で走査を **break** するため、祖先である
-  `tab-scroll-area` の hitbox が hit test から落ち、`overflow_x_scroll` の発火条件
-  （`should_handle_scroll()`）が **タブピルの上では常に false** になっていた
-  （ピルが領域のほぼ全面を覆うので事実上どこでも効かない）。`occlude()` は
-  Windows のボタン死（#576）を防ぐために必要なので外さず、**スクロール領域の中で
-  occlude する要素がホイールを自分で中継する**形にした。中継の計算は GPUI 既定と
-  同じ意味論なので、ピルの上と隙間の上で挙動が一致する
-- [Fixed] The tab bar can be scrolled again; tabs beyond the visible width are no longer
-  unreachable (#961). #576 added `occlude()` to each tab pill so Windows would stop
-  swallowing clicks, but GPUI's hit test *breaks* at an occluding hitbox, so the
-  scroll container behind the pills never satisfied `should_handle_scroll()` — and the
-  pills cover almost the whole strip. The pills keep `occlude()` (removing it brings
-  #576 back) and now relay wheel events to the scroll container themselves, using the
-  same delta rules GPUI applies, so scrolling over a pill and over a gap behave alike.
-
-### Changed
-
-- [改善] 実行中タブのドット脈動を「走り始めの合図」に限り、フレーム要求の恒久化を
-  止めた (#945)。状態ドットは `Running` のあいだ 2 秒周期で脈動していたが、GPUI は
-  アニメーションが動いているあいだ**毎フレーム再描画を要求する**ため、エージェント
-  （claude / codex）のようにフォアグラウンドで走り続けるペインがあるタブでは、
-  操作していなくてもアプリがアイドルに到達しなかった（#786 / #801 / #803 で削った
-  毎フレームの固定費がここで復活していた）。脈動を有限回（2 秒 × 3）で終わらせ、
-  以後は色だけの静的表示にした。実測: 出力ゼロのペイン 1 枚で tako 自身の CPU が
-  **19.09% → 2.93%**。走り始めの合図は残るので「いま何か走っている」は従来どおり分かる
-- [Changed] The pulsing dot on a running tab now pulses only while a command *starts*,
-  instead of forever (#945). GPUI requests a new frame on every frame while an animation
-  is running, so a tab holding a long-lived foreground process — any coding agent — kept
-  the whole app off its idle path and re-paid the per-frame cost that #786 / #801 / #803
-  had removed. The dot now pulses three times and then stays a solid color. Measured on an
-  otherwise silent pane: tako's own CPU dropped from **19.09% to 2.93%**.
 
 ### Fixed
 

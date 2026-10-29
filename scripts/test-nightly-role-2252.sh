@@ -57,7 +57,7 @@ make_env() {
   git -C "$dir/repo" config tag.gpgsign false
   git -C "$dir/repo" remote add origin "$dir/origin.git"
   command cp -f "$REPO_ROOT/scripts/nightly-release.sh" "$dir/repo/scripts/"
-  command cp -f "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$REPO_ROOT/scripts/lib/exit-guard.sh" "$dir/repo/scripts/lib/"
+  command cp -f "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$REPO_ROOT/scripts/lib/exit-guard.sh" "$REPO_ROOT/scripts/lib/changelog.sh" "$dir/repo/scripts/lib/"
   # release.sh（ビルド / Release）は使い捨ての worktree の中で呼ばれるので、記録は $HOME へ
   printf '#!/bin/sh\necho "release.sh $*" >> "$HOME/calls.log"\nexit 0\n' > "$dir/repo/scripts/release.sh"
   chmod +x "$dir/repo/scripts/release.sh"

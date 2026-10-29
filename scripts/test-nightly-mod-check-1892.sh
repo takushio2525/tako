@@ -308,7 +308,7 @@ STUB
   git -C "$dir/repo" remote add origin "$dir/origin.git"
 
   cp "$REPO_ROOT/scripts/nightly-release.sh" "$REPO_ROOT/scripts/check-claude-mod.sh" "$dir/repo/scripts/"
-  cp "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$REPO_ROOT/scripts/lib/exit-guard.sh" "$dir/repo/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$REPO_ROOT/scripts/lib/exit-guard.sh" "$REPO_ROOT/scripts/lib/changelog.sh" "$dir/repo/scripts/lib/"
   printf '#!/bin/sh\necho "STUB release.sh $*"\nexit 0\n' > "$dir/repo/scripts/release.sh"
   chmod +x "$dir/repo/scripts/release.sh"
 

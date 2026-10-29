@@ -123,8 +123,8 @@ notify() {
 }
 
 # 次回バージョン予約の正本（#1005。読み書き・検証・版種判定）と、set -e と EXIT trap の
-# 併用で終了コードが 0 に化けるのを塞ぐ番人（#1864）
-for _lib in nightly-reserve.sh exit-guard.sh; do
+# 併用で終了コードが 0 に化けるのを塞ぐ番人（#1864）と、CHANGELOG へ版の節を挿す正本（#1593）
+for _lib in nightly-reserve.sh exit-guard.sh changelog.sh; do
   if [[ ! -f "$REPO_ROOT/scripts/lib/$_lib" ]]; then
     log "ERROR: scripts/lib/${_lib} が見つからない（${REPO_ROOT}）。リポジトリが不完全"
     notify "失敗: ${_lib} が見つからない"
@@ -135,6 +135,8 @@ done
 source "$REPO_ROOT/scripts/lib/nightly-reserve.sh"
 # shellcheck source=lib/exit-guard.sh
 source "$REPO_ROOT/scripts/lib/exit-guard.sh"
+# shellcheck source=lib/changelog.sh
+source "$REPO_ROOT/scripts/lib/changelog.sh"
 
 # ---- 次回バージョン予約の CLI（#1005）--------------------------------------
 
@@ -840,7 +842,8 @@ awk -v old="version = \"$CUR_VERSION\"" -v new="version = \"$NEW_VERSION\"" \
   '!done && $0 == old { print new; done = 1; next } { print }' \
   Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
 
-# CHANGELOG.md: 最新バージョン節の直前に自動生成節を挿入
+# CHANGELOG.md: 最上段の ## [Unreleased] の直下へ自動生成節を挿し、Unreleased の手書きの項目は
+# その節の末尾へ移す（Unreleased は最上段に 1 つのまま。#1593 / scripts/lib/changelog.sh）
 SECTION_FILE=$(mktemp)
 {
   echo "## [$NEW_VERSION] - $TODAY"
@@ -851,10 +854,7 @@ SECTION_FILE=$(mktemp)
   git log --format='- %s' "$LATEST_TAG..origin/main"
   echo ""
 } > "$SECTION_FILE"
-awk -v secfile="$SECTION_FILE" '
-  !ins && /^## \[/ { while ((getline line < secfile) > 0) print line; close(secfile); ins = 1 }
-  { print }
-' CHANGELOG.md > CHANGELOG.md.tmp && mv CHANGELOG.md.tmp CHANGELOG.md
+changelog_insert_release CHANGELOG.md "$SECTION_FILE"
 rm -f "$SECTION_FILE"
 
 # Cargo.lock の workspace メンバー版数を同期

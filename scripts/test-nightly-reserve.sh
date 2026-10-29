@@ -173,6 +173,7 @@ make_env() {
   cp "$REPO_ROOT/scripts/nightly-release.sh" "$dir/repo/scripts/"
   cp "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$dir/repo/scripts/lib/"
   cp "$REPO_ROOT/scripts/lib/exit-guard.sh" "$dir/repo/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/changelog.sh" "$dir/repo/scripts/lib/"
   # release.sh はスタブ。本物はビルド + gh + Pages デプロイを走らせるので絶対に使わない
   cat > "$dir/repo/scripts/release.sh" <<'STUB'
 #!/bin/sh
@@ -189,7 +190,9 @@ STUB
   printf '/target\n/dist\n' > "$dir/repo/.gitignore"
 
   printf '[workspace.package]\nversion = "%s"\n' "$cur" > "$dir/repo/Cargo.toml"
-  printf '# Changelog\n\n## [%s] - 2026-01-01\n\nInitial\n' "$cur" > "$dir/repo/CHANGELOG.md"
+  # 手書きの Unreleased つき（夜間がそれを最上段に残し、項目を版の節へ移すことを Test 8 で見る。#1593）
+  printf '# Changelog\n\n## [Unreleased]\n\n- 手書きの項目 (#1593)\n\n## [%s] - 2026-01-01\n\nInitial\n' "$cur" \
+    > "$dir/repo/CHANGELOG.md"
   printf '# dummy lock\n' > "$dir/repo/Cargo.lock"
   git -C "$dir/repo" add -A
   git -C "$dir/repo" commit --quiet -m "init ${cur}"
@@ -405,6 +408,11 @@ test_full_run_consumes_reservation() {
   assert_contains "CHANGELOG に節ができる" "$changelog" "## [0.8.0] - "
   assert_contains "CHANGELOG が minor 表記（英）" "$changelog" "Nightly minor release (automated)"
   assert_contains "CHANGELOG が minor 表記（日）" "$changelog" "夜間マイナーリリース（自動）"
+  # #1593: Unreleased は最上段に 1 つのまま、手書きの項目はリリースした版の節へ移る
+  assert_eq "CHANGELOG の Unreleased は 1 つ・最初の版の節より上（#1593）" "1 ## [Unreleased]" \
+    "$(grep -c '^## \[Unreleased\]' <<<"$changelog") $(grep -m1 '^## \[' <<<"$changelog")"
+  assert_eq "手書きの項目は 0.8.0 の節へ移る（#1593）" "## [0.8.0]" \
+    "$(awk '/^## \[/ { h = $1 " " $2 } /手書きの項目/ { print h; exit }' <<<"$changelog")"
   assert_eq "コミット件名が minor 表記" \
     "[リリース] v0.8.0: 夜間マイナーリリース（自動）" \
     "$(git -C "$origin" log -1 --format=%s main)"

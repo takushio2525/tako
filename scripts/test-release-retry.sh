@@ -8,6 +8,8 @@
 #   Test 5〜8: macOS / Windows 両 OS の待ち合わせと片肺リリースの検出（#965）
 #   Test 9〜13: --check-assets（公開済みリリースの検査）。両 OS の揃い（#965）と、Release の
 #              zip にライセンスが入りタグのファイルとバイト一致するか（#1850）
+#   Test 14〜15: 夜間リリースが CHANGELOG へ版の節を挿しても `## [Unreleased]` が最上段に 1 つの
+#              まま・手書きの項目がその版のリリースノートに載る（#1593。scripts/lib/changelog.sh）
 #
 # #1850 の zip は偽の gh の `release download` が <dir>/release-assets/ から渡す（ネットワークを
 # 使わない）。zip の中の置き場と表は release.sh と同じ scripts/lib/license-bundle.sh で引くので、
@@ -57,6 +59,17 @@ assert_contains() {
   else
     echo "  FAIL: $desc (not found: '$needle')"
     FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_not_contains() {
+  local desc="$1" haystack="$2" needle="$3"
+  if grep -qF -- "$needle" <<<"$haystack"; then
+    echo "  FAIL: $desc (found but should not: '$needle')"
+    FAIL=$((FAIL + 1))
+  else
+    echo "  PASS: $desc"
+    PASS=$((PASS + 1))
   fi
 }
 
@@ -718,6 +731,148 @@ test_check_assets_follows_table() {
   rm -rf "${dir:?}"
 }
 
+# ---------------------------------------------------------------------------
+# Test 14〜15: CHANGELOG の `## [Unreleased]` は最上段に 1 つ（#1593）
+#
+# 夜間リリース（nightly-release.sh）が版の節を挿す scripts/lib/changelog.sh の
+# changelog_insert_release を、手書きの Unreleased がある CHANGELOG へ 2 回続けて当てる。
+# 間に PR が項目を足す（最上段の節が Unreleased ならその下へ、違えば最上段へ新しい Unreleased を
+# 作る = #1593 で 5 つ並んだときの PR の足し方）。修正前の挿し方（TAKO_1593_LEGACY=1）では
+# Unreleased が版の節の下へ押し出されて 2 つに増え、手書きの項目がリリースノートに載らない。
+# ここが落ちるということは、夜間リリースのたびに Unreleased が増える状態に戻ったという意味。
+# ---------------------------------------------------------------------------
+
+# shellcheck source=lib/changelog.sh
+source scripts/lib/changelog.sh
+
+# 夜間リリースと同じ並びの版の節を挿す（nightly-release.sh の SECTION_FILE と同じ形）
+cl_release() {
+  local file="$1" ver="$2" commit="$3" sec
+  sec=$(mktemp)
+  printf '## [%s] - 2026-01-01\n\nNightly patch release (automated). Changes since v0.0.0:\n夜間パッチリリース（自動）。v0.0.0 以降の変更:\n\n- %s\n\n' \
+    "$ver" "$commit" > "$sec"
+  changelog_insert_release "$file" "$sec"
+  rm -f "${sec:?}"
+}
+
+# PR が手書きの項目を足す: 最上段の節が Unreleased ならその見出しの直下へ、違えば最上段へ作る
+cl_pr_add() {
+  local file="$1" entry="$2"
+  awk -v entry="$entry" '
+    !done && /^## \[/ {
+      if ($0 ~ /^## \[Unreleased\]/) { print; print ""; print entry; done = 1; next }
+      print "## [Unreleased]"; print ""; print entry; print ""; done = 1
+    }
+    { print }
+  ' "$file" > "$file.tmp" && mv -f "$file.tmp" "$file"
+}
+
+cl_unreleased_count() {
+  grep -c '^## \[Unreleased\]' "$1" || true
+}
+
+# 最初の `## [` が Unreleased か（yes / no）
+cl_unreleased_on_top() {
+  awk '/^## \[/ { print ($0 ~ /^## \[Unreleased\]/ ? "yes" : "no"); exit }' "$1"
+}
+
+# その版のリリースノート（release.sh --notes-only = 本物の extract_changelog を通す）
+cl_notes() {
+  local dir="$1" ver="$2"
+  printf 'version = "%s"\n' "$ver" > "$dir/Cargo.toml"
+  (cd "$dir" && PATH="$dir/mock-bin:$PATH" bash scripts/release.sh --notes-only 2>/dev/null)
+}
+
+# 手書きの Unreleased → 挿入 → PR が項目を足す → 挿入、を 1 本の CHANGELOG へ当てる
+cl_two_releases() {
+  local dir="$1"
+  printf '# Changelog\n\n## [Unreleased]\n\n### Added\n\n- 手書きの項目 A (#9001)\n\n## [99.0.0] - 2026-01-01\n\nTest release\n' \
+    > "$dir/CHANGELOG.md"
+  cl_release "$dir/CHANGELOG.md" 99.0.1 "[修正] 一つ目 (#9002)"
+  cl_pr_add "$dir/CHANGELOG.md" "- 手書きの項目 B (#9003)"
+  cl_release "$dir/CHANGELOG.md" 99.0.2 "[修正] 二つ目 (#9004)"
+}
+
+# --- Test 14: 手書きの Unreleased から挿入を 2 回続けても 1 つ・最上段（A/B）---
+test_changelog_unreleased_single() {
+  echo ""
+  echo "--- Test 14: 挿入を 2 回続けても ## [Unreleased] は最上段に 1 つ（#1593）---"
+  local dir file notes1 notes2
+  dir=$(make_test_env)
+  file="$dir/CHANGELOG.md"
+
+  # A: 修正前の挿し方（負の対照）。ここが PASS しないなら、このテストは #1593 を見分けられていない
+  TAKO_1593_LEGACY=1 cl_two_releases "$dir"
+  assert_eq "A（修正前）: Unreleased が 2 つに増える" "2" "$(cl_unreleased_count "$file")"
+  assert_eq "A（修正前）: 最上段の節が版になる" "no" "$(cl_unreleased_on_top "$file")"
+  notes1=$(cl_notes "$dir" 99.0.1)
+  assert_not_contains "A（修正前）: 手書きの項目 A が 99.0.1 のノートに載らない" "$notes1" "手書きの項目 A"
+
+  # B: 修正後
+  cl_two_releases "$dir"
+  assert_eq "B: Unreleased は 1 つ" "1" "$(cl_unreleased_count "$file")"
+  assert_eq "B: Unreleased は最初の版の節より上" "yes" "$(cl_unreleased_on_top "$file")"
+  assert_eq "B: Unreleased の中身は空（次の見出しが 99.0.2）" "## [99.0.2] - 2026-01-01" \
+    "$(awk '/^## \[Unreleased\]/ { on = 1; next } on && NF { print; exit }' "$file")"
+  notes1=$(cl_notes "$dir" 99.0.1)
+  notes2=$(cl_notes "$dir" 99.0.2)
+  assert_contains "B: 99.0.1 のノートにコミット一覧" "$notes1" "- [修正] 一つ目 (#9002)"
+  assert_contains "B: 99.0.1 のノートに手書きの項目 A" "$notes1" "- 手書きの項目 A (#9001)"
+  assert_not_contains "B: 99.0.1 のノートに B は載らない" "$notes1" "手書きの項目 B"
+  assert_contains "B: 99.0.2 のノートに手書きの項目 B" "$notes2" "- 手書きの項目 B (#9003)"
+  assert_not_contains "B: 99.0.2 のノートに A は載らない" "$notes2" "手書きの項目 A"
+  assert_not_contains "B: ノートに Unreleased の見出しが混ざらない" "$notes1$notes2" "Unreleased"
+  assert_eq "B: 手書きの項目は消えず重複もしない" "1 1" \
+    "$(grep -c '手書きの項目 A' "$file") $(grep -c '手書きの項目 B' "$file")"
+  rm -rf "${dir:?}"
+}
+
+# --- Test 15: 境界（Unreleased が無い / 版の節が無い / 既に 2 つある / 形の固定）---
+test_changelog_unreleased_edges() {
+  echo ""
+  echo "--- Test 15: changelog_insert_release の境界（#1593）---"
+  local dir file err
+
+  dir=$(mktemp -d)
+  file="$dir/CHANGELOG.md"
+
+  # (a) Unreleased が無い（夜間リリースのモックの CHANGELOG と同じ形）→ 最上段に作る
+  printf '# Changelog\n\n## [1.0.0] - 2026-01-01\n\nInitial\n' > "$file"
+  cl_release "$file" 1.0.1 "x (#1)"
+  assert_eq "(a) Unreleased を 1 つ作る" "1" "$(cl_unreleased_count "$file")"
+  assert_eq "(a) 作った Unreleased は最上段" "yes" "$(cl_unreleased_on_top "$file")"
+
+  # (b) 空の Unreleased へ 2 回挿した形を丸ごと固定する（空行の増殖・節の取り違えが無い）
+  cl_release "$file" 1.0.2 "y (#2)"
+  local want
+  want=$(printf '%s\n' '# Changelog' '' '## [Unreleased]' '' \
+    '## [1.0.2] - 2026-01-01' '' \
+    'Nightly patch release (automated). Changes since v0.0.0:' \
+    '夜間パッチリリース（自動）。v0.0.0 以降の変更:' '' '- y (#2)' '' \
+    '## [1.0.1] - 2026-01-01' '' \
+    'Nightly patch release (automated). Changes since v0.0.0:' \
+    '夜間パッチリリース（自動）。v0.0.0 以降の変更:' '' '- x (#1)' '' \
+    '## [1.0.0] - 2026-01-01' '' 'Initial')
+  assert_eq "(b) 2 回挿した後の全文が期待どおり" "$want" "$(cat "$file")"
+
+  # (c) 版の節が 1 つも無い（Unreleased だけの新しいプロジェクト）→ 手書きの項目ごと版の節へ
+  printf '# Changelog\n\n## [Unreleased]\n\n- 最初の項目 (#3)\n' > "$file"
+  cl_release "$file" 0.1.0 "z (#4)"
+  assert_eq "(c) Unreleased は 1 つ" "1" "$(cl_unreleased_count "$file")"
+  assert_eq "(c) 手書きの項目は 0.1.0 の節へ" "## [0.1.0] - 2026-01-01" \
+    "$(awk '/^## \[/ { h = $0 } /最初の項目/ { print h; exit }' "$file")"
+
+  # (d) 既に最上段より下にも Unreleased がある（規則が崩れた状態）→ 増やさず、警告で名指しする
+  printf '# Changelog\n\n## [Unreleased]\n\n- 上 (#5)\n\n## [1.0.0] - 2026-01-01\n\n## [Unreleased]\n\n- 下 (#6)\n' > "$file"
+  err=$(cl_release "$file" 1.0.1 "w (#7)" 2>&1 >/dev/null)
+  assert_eq "(d) 数は 2 のまま（増やさない）" "2" "$(cl_unreleased_count "$file")"
+  assert_contains "(d) 下の Unreleased を警告する" "$err" "最上段より下に ## [Unreleased] が 1 個ある"
+  assert_eq "(d) 最上段の項目は 1.0.1 の節へ" "## [1.0.1] - 2026-01-01" \
+    "$(awk '/^## \[/ { h = $0 } /- 上 \(#5\)/ { print h; exit }' "$file")"
+
+  rm -rf "${dir:?}"
+}
+
 # --- 実行 ---
 test_retry_then_success
 test_all_retries_fail
@@ -732,6 +887,8 @@ test_check_assets_missing_licenses
 test_check_assets_byte_mismatch
 test_check_assets_error_paths
 test_check_assets_follows_table
+test_changelog_unreleased_single
+test_changelog_unreleased_edges
 
 echo ""
 echo "================================"
