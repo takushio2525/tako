@@ -1419,6 +1419,100 @@ fn inject_777_hang(kind: &str) {
     }
 }
 
+/// このプロセスだけが使う資源の後片付け（#1192 / #1253 / #2388）。
+///
+/// **成功の出口（`on_app_quit`）とセルフテストの失敗の出口（`self_test::fail`）の 1 実装**。
+/// 失敗の出口は `exit(1)` で終わって `on_app_quit` を通らないので、以前は FAILED のたびに
+/// 器のサーバー（`tako-iso-<pid>` / `tako-st-<pid>`）とソケットファイル・検証用の設定置き場が
+/// 残っていた（#2388）。片付ける物を足すときはここへ足す = 両方の出口へ同時に効く
+/// （配線は番犬 `selftest_exit_cleanup_watchdog` が見る）。
+///
+/// - #1192: 自分の pid から作った使い捨てソケット（`tako-iso-<pid>` / `tako-st-<pid>`）は、
+///   このプロセスが終われば誰も再利用できない。放っておくと tmux サーバーとソケットファイルが
+///   増え続けるので（実測 2026-09-09: 生存 93 本 / 388 MB / 最古 11 日）自分で落とす。
+///   **明示指定の `TAKO_TMUX_SOCKET` には触らない**（再起動をまたいでセッションを残す検証が
+///   実在する = #770）
+/// - #1253: 検証起動（隔離 / セルフテスト / visual-test）が使った使い捨ての設定置き場
+///   （事前信頼とシェル履歴の書き先）。pid つきなのでこのプロセス専用 = 誰の邪魔にもならない
+///
+/// `origin` は persist.log の行の頭（どの出口から来たか）。何度呼んでも壊れない
+/// （無いサーバー・無い dir は黙って飛ばす。窓ごとの `on_app_quit` が重ねて呼ぶ）
+///
+/// **設定置き場を先に消してから器を落とす**（#2388 で実測）。ペインのシェルの `HISTFILE` は
+/// この置き場の `shell_history` なので、器を先に落とすと器の中のシェルが SIGHUP で履歴を書き、
+/// 書いている最中の rmdir が空でないと断られて `shell_history` 入りの dir が残る。先に消せば
+/// 書き先の dir が無い（シェルは親 dir を作らない）ので、器の外のペインのシェルと同じく何も残らない
+fn cleanup_process_scoped(origin: &str, secondary: bool) -> ProcessScopedCleanup {
+    let agent_home = tako_core::paths::is_verification_process().then(|| {
+        let dir = tako_core::paths::verification_agent_home();
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    });
+    let backend_socket = tako_core::tmux_backend::socket_name();
+    let backend = (!secondary
+        && tako_core::tmux_cleanup::owns_disposable_socket(std::process::id(), &backend_socket))
+    .then(|| {
+        tako_core::tmux_backend::kill_server(&backend_socket);
+        persist_diag(&format!(
+            "{origin}: 使い捨て backend サーバーを片付けた（socket={backend_socket}）"
+        ));
+        backend_socket
+    });
+    ProcessScopedCleanup {
+        backend,
+        agent_home,
+    }
+}
+
+/// [`cleanup_process_scoped`] が片付けにいった物（失敗の出口が 1 行で申告する。#2388）
+struct ProcessScopedCleanup {
+    /// 落とした使い捨て backend のソケット名。明示指定のソケット・2 枚目以降の窓は `None`
+    backend: Option<String>,
+    /// 消した検証用の設定置き場。検証起動でなければ `None`
+    agent_home: Option<std::path::PathBuf>,
+}
+
+impl ProcessScopedCleanup {
+    /// 片付けた後もまだ在る物（`server` / `socket` / `agent_home`）。器へ 1 回問い合わせる
+    fn left(&self) -> Vec<&'static str> {
+        let mut left = Vec::new();
+        if let Some(socket) = &self.backend {
+            if !tako_core::tmux::list_sessions(Some(socket)).is_empty() {
+                left.push("server");
+            }
+            // tmux は名前の末尾に `=` が付いた形でも置く（`remove_socket_file` と同じ 2 通り）
+            let file_left = tako_core::tmux_backend::socket_dir().is_some_and(|dir| {
+                dir.join(socket).exists() || dir.join(format!("{socket}=")).exists()
+            });
+            if file_left {
+                left.push("socket");
+            }
+        }
+        if self.agent_home.as_ref().is_some_and(|dir| dir.exists()) {
+            left.push("agent_home");
+        }
+        left
+    }
+
+    /// 失敗の出口が出す 1 行の中身（`backend=<ソケット|-> agent_home=<removed|-> left=<none|名前,…>`）
+    fn summary(&self, left: &[&str]) -> String {
+        format!(
+            "backend={} agent_home={} left={}",
+            self.backend.as_deref().unwrap_or("-"),
+            if self.agent_home.is_some() {
+                "removed"
+            } else {
+                "-"
+            },
+            if left.is_empty() {
+                "none".to_string()
+            } else {
+                left.join(",")
+            }
+        )
+    }
+}
+
 /// GPUI ウィンドウの close に失敗したときの診断行（#828）。
 ///
 /// `sync_viewports` は対応表を先に落としてから close を投げるので、ここで失敗すると
@@ -5636,31 +5730,10 @@ impl TakoApp {
                     tako_control::discovery::cleanup(std::process::id());
                 }
             }
-            // #1192: 自分の pid から作った使い捨てソケット（tako-iso-<pid> /
-            // tako-st-<pid>）は、このプロセスが終われば誰も再利用できない。
-            // 放っておくと tmux サーバーとソケットファイルが増え続けるので
-            // （実測 2026-09-09: 生存 93 本 / 388 MB / 最古 11 日）自分で落とす。
-            // **明示指定の TAKO_TMUX_SOCKET には触らない**（再起動をまたいで
-            // セッションを残す検証が実在する = #770）
-            let backend_socket = tako_core::tmux_backend::socket_name();
-            if !this.secondary
-                && tako_core::tmux_cleanup::owns_disposable_socket(
-                    std::process::id(),
-                    &backend_socket,
-                )
-            {
-                tako_core::tmux_backend::kill_server(&backend_socket);
-                persist_diag(&format!(
-                    "on_app_quit: 使い捨て backend サーバーを片付けた（socket={backend_socket}）"
-                ));
-            }
-            // #1253: 検証起動（隔離 / セルフテスト / visual-test）が使った
-            // 使い捨ての設定置き場（事前信頼とシェル履歴の書き先）を片付ける。
-            // pid つきなのでこのプロセス専用 = 誰の邪魔にもならない
-            if tako_core::paths::is_verification_process() {
-                let dir = tako_core::paths::verification_agent_home();
-                let _ = std::fs::remove_dir_all(&dir);
-            }
+            // #1192 / #1253: このプロセスだけが使う資源（自分の pid から作った使い捨ての
+            // backend サーバーとソケットファイル・検証起動の設定置き場）を片付ける。
+            // セルフテストの失敗の出口（`self_test::fail`）と同じ 1 実装（#2388）
+            cleanup_process_scoped("on_app_quit", this.secondary);
             // #2454: 普通の終了はペインを閉じるのと同じ扱い（Windows）。この後は端末を drop せずに
             // OS がハンドルを閉じるので、手放さないと KILL_ON_JOB_CLOSE でペインから起こした
             // GUI のアプリまで止まる。コンソールのプロセスは止め、GUI とその子孫は残す。
@@ -32612,6 +32685,8 @@ fn resolve_target_display(cx: &App) -> Option<gpui::DisplayId> {
         eprintln!("error: {notice}");
         // セルフテストを無音終了にしない（ハーネスが見ているのは FAILED 行）
         if std::env::var_os("TAKO_SELF_TEST").is_some() {
+            // tako:exit-cleanup-ok 窓を 1 枚も開く前（置き先を決める段）に終わる = ペインも器の
+            // サーバーもまだ起きておらず、セルフテストの項目も 1 つも走っていない（#2388）
             println!(
                 "TAKO_APP_SELF_TEST_FAILED: 145: 検証用 GUI の置き先が見つからないので\
                  窓を開かずに終了した (#1160 / #1697)"
@@ -36335,7 +36410,94 @@ mod self_test {
         println!("TAKO_APP_SELF_TEST_ENV: {}", env_line());
         println!("TAKO_APP_SELF_TEST_FAILED: {step}");
         run_fail_cleanup();
+        // #2388: 成功の出口（`on_app_quit`）と同じ後片付けを通す。exit は `on_app_quit` を
+        // 通らないので、ここで呼ばないと器のサーバー（`tako-iso-<pid>`）・ソケットファイル・
+        // 検証用の設定置き場が FAILED のたびに残る。`secondary` は偽: 2 枚目以降の窓を除くのは
+        // 窓が残るプロセスのためで、exit はプロセスごと終える（pid から作った名前を使い続ける窓は無い）
+        run_exit_cleanup_bounded(|| super::cleanup_process_scoped("self_test::fail", false));
         std::process::exit(1);
+    }
+
+    /// 失敗の出口の後片付けの上限（#2388）。`on_app_quit` を見張る終了の猶予（#777 の既定 5 秒）と揃える
+    const EXIT_CLEANUP_LIMIT: Duration = Duration::from_secs(5);
+
+    /// 失敗の出口の後片付けを上限つきで走らせ、何を片付けたかを 1 行出す（#2388）。
+    ///
+    /// FAILED の行を出した**後**に呼ばれ、器が応答しない（止まったサーバーへの `kill-server` は
+    /// 返らない）・panic した、のどちらでも [`EXIT_CLEANUP_LIMIT`] までに戻る = 呼び手は exit(1) へ
+    /// 進み、落ちた理由の行と終了コードは変わらない（残した物は `tako tmux cleanup --servers` が拾う型）。
+    /// `TAKO_2388_LEGACY=1` は修正前（片付けずに exit）= 同一バイナリでの A/B、
+    /// `TAKO_2388_INJECT=hang` は片付けが返らない形（上限の検証専用）
+    fn run_exit_cleanup_bounded(
+        cleanup: impl FnOnce() -> super::ProcessScopedCleanup + Send + 'static,
+    ) {
+        if std::env::var_os("TAKO_2388_LEGACY").is_some() {
+            return;
+        }
+        let hang = std::env::var("TAKO_2388_INJECT").as_deref() == Ok("hang");
+        let line = match bounded_on_thread(EXIT_CLEANUP_LIMIT, move || {
+            if hang {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+            let done = cleanup();
+            let left = done.left();
+            done.summary(&left)
+        }) {
+            Ok(summary) => summary,
+            Err(why) => format!("{why}（残して終える）"),
+        };
+        println!("TAKO_APP_SELF_TEST_EXIT_CLEANUP: {line} (#2388)");
+    }
+
+    /// `work` を別スレッドで回し、`limit` までに返った値を返す（#2388）。
+    /// 上限を過ぎた・panic した・スレッドを起こせない、は理由の文で返す。返らないスレッドは
+    /// 置いていく（呼び手は直後に exit するので、プロセスと一緒に消える）
+    fn bounded_on_thread<T: Send + 'static>(
+        limit: Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("self-test-exit-cleanup".into())
+            .spawn(move || {
+                let _ = tx.send(work());
+            })
+            .map_err(|e| format!("後片付けのスレッドを起こせない: {e}"))?;
+        rx.recv_timeout(limit).map_err(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Timeout => {
+                format!("上限 {limit:?} で終わらなかった")
+            }
+            std::sync::mpsc::RecvTimeoutError::Disconnected => "途中で落ちた（panic）".into(),
+        })
+    }
+
+    #[cfg(test)]
+    mod exit_cleanup_tests {
+        use super::bounded_on_thread;
+        use std::time::Duration;
+
+        #[test]
+        fn 上限までに返った後片付けは値を返す() {
+            assert_eq!(bounded_on_thread(Duration::from_secs(5), || 7), Ok(7));
+        }
+
+        /// 器が応答しない形（#2388 のエッジ）: 上限で置いていき、呼び手は exit へ進める
+        #[test]
+        fn 返らない後片付けは上限で置いていく() {
+            // 経路で見る（実時間の予算は置かない）: 上限を守らなければ 10 秒後に Ok(()) で返る
+            let got = bounded_on_thread(Duration::from_millis(100), || {
+                std::thread::sleep(Duration::from_secs(10));
+            });
+            assert_eq!(got, Err("上限 100ms で終わらなかった".to_string()));
+        }
+
+        #[test]
+        fn panicした後片付けは理由の文で返る() {
+            let got = bounded_on_thread(Duration::from_secs(5), || -> u8 {
+                panic!("#2388 の注入: 後片付けの途中で落ちる")
+            });
+            assert_eq!(got, Err("途中で落ちた（panic）".to_string()));
+        }
     }
 
     /// 節が作った一時ファイル / dir の登録簿（#2051 / FR-4.8.23）。
@@ -99074,6 +99236,291 @@ mod selftest_launch_withdraw_watchdog {
             "fn product(&mut self) {\n    self.launch_tako_command(\"setup\", \"setup\", cx);\n}\nmod self_test {\n}\n"
         )
         .is_empty());
+    }
+}
+
+/// 「セルフテストの出口が、成功の出口と同じ後片付けを通らない」形の番犬（#2388）。
+///
+/// 失敗の出口（`self_test::fail`）は `exit(1)` で終わって `on_app_quit` を通らないので、配線を
+/// 忘れると器のサーバー（`tako-iso-<pid>`）・ソケットファイル・検証用の設定置き場が FAILED の
+/// たびに残る（#2388 で実測）。片付けの中身は `cleanup_process_scoped` の 1 実装なので、ここは
+/// **配線**を見る:
+///
+/// 1. `self_test::fail` が `std::process::exit` より前に `cleanup_process_scoped` を呼ぶ
+/// 2. `on_app_quit` が成功の行（`TAKO_APP_SELF_TEST_OK`）より前に `cleanup_process_scoped` を呼ぶ
+/// 3. FAILED の行を出すのは `fail` の中・`on_app_quit` の後片付けの後・逃げ道（その行か直前
+///    [`ALLOW_ABOVE`] 行に `tako:exit-cleanup-ok <理由>`）のどれか = 後片付けを通らない失敗の出口を
+///    `fail` の外に増やさない
+/// 4. 使い捨ての判定（`owns_disposable_socket`）を呼ぶのは `cleanup_process_scoped` の中だけ
+///
+/// テストのモジュール（`#[cfg(test)]` の直後の `mod … {`）は見ない
+#[cfg(test)]
+mod selftest_exit_cleanup_watchdog {
+    const FILE: &str = "crates/tako-app/src/main.rs";
+    const CLEANUP: &str = "cleanup_process_scoped(";
+    /// FAILED の行（文字列リテラルの頭として探す。`contains("TAKO_APP_SELF_TEST_FAILED")` の検査は拾わない）
+    const FAILED: &str = "\"TAKO_APP_SELF_TEST_FAILED:";
+    const OK_LINE: &str = "println!(\"TAKO_APP_SELF_TEST_OK\")";
+    const QUIT_HOOK: &str = "cx.on_app_quit(";
+    const DISPOSABLE: &str = "owns_disposable_socket(";
+    const ALLOW_MARKER: &str = "tako:exit-cleanup-ok";
+    const ALLOW_ABOVE: usize = 6;
+
+    fn code(line: &str) -> bool {
+        !line.trim_start().starts_with("//")
+    }
+
+    /// テストのモジュールを除いた行（行番号は 1 始まり）。`#[cfg(test)]` と `mod … {` の間の
+    /// 属性・コメントは読み飛ばし、同じ字下げの閉じ括弧までを外す
+    fn product_lines(src: &str) -> Vec<(usize, &str)> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim() == "#[cfg(test)]" {
+                let mut j = i + 1;
+                while j < lines.len() && {
+                    let t = lines[j].trim_start();
+                    t.starts_with("#[") || t.starts_with("//")
+                } {
+                    j += 1;
+                }
+                if let Some(head) = lines.get(j) {
+                    let t = head.trim_start();
+                    if t.starts_with("mod ") && t.ends_with('{') {
+                        let close = format!("{}}}", &head[..head.len() - t.len()]);
+                        if let Some(end) = lines[j + 1..].iter().position(|l| *l == close) {
+                            i = j + 1 + end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push((i + 1, lines[i]));
+            i += 1;
+        }
+        out
+    }
+
+    /// `fn <name>(` の頭から同じ字下げの閉じ括弧までの (頭の行, 閉じの行)
+    fn fn_span(lines: &[(usize, &str)], name: &str) -> Option<(usize, usize)> {
+        let start = lines
+            .iter()
+            .position(|(_, l)| code(l) && tako_core::source_scan::fn_head_name(l) == Some(name))?;
+        let head = lines[start].1;
+        let close = format!("{}}}", &head[..head.len() - head.trim_start().len()]);
+        let end = lines[start..].iter().position(|(_, l)| *l == close)? + start;
+        Some((lines[start].0, lines[end].0))
+    }
+
+    /// 違反（行番号と理由。行が決まらないものは 0）
+    fn violations(src: &str) -> Vec<(usize, String)> {
+        let lines = product_lines(src);
+        let has_cleanup =
+            |range: &[(usize, &str)]| range.iter().any(|(_, l)| code(l) && l.contains(CLEANUP));
+        let mut out = Vec::new();
+
+        // 1. 失敗の出口（`mod self_test` の中の `fn fail`）
+        let self_test = lines
+            .iter()
+            .position(|(_, l)| *l == "mod self_test {")
+            .unwrap_or(lines.len());
+        let fail = fn_span(&lines[self_test..], "fail");
+        match fail {
+            None => out.push((
+                0,
+                "`mod self_test` の `fn fail` が見つからない（改名したならこの番犬も直す）".into(),
+            )),
+            Some((head, end)) => {
+                let body: Vec<(usize, &str)> = lines
+                    .iter()
+                    .filter(|(n, _)| *n > head && *n <= end)
+                    .copied()
+                    .collect();
+                match body
+                    .iter()
+                    .position(|(_, l)| code(l) && l.contains("std::process::exit("))
+                {
+                    None => out.push((
+                        head,
+                        "`self_test::fail` が exit しない（形が変わったならこの番犬も直す）".into(),
+                    )),
+                    Some(exit) if !has_cleanup(&body[..exit]) => out.push((
+                        body[exit].0,
+                        "`self_test::fail` が `cleanup_process_scoped` を通らずに exit する".into(),
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
+
+        // 2. 成功の出口（`on_app_quit` の成功の行まで）
+        let hook = lines
+            .iter()
+            .position(|(_, l)| code(l) && l.contains(QUIT_HOOK));
+        let ok = hook.and_then(|h| {
+            lines[h..]
+                .iter()
+                .position(|(_, l)| code(l) && l.contains(OK_LINE))
+                .map(|o| o + h)
+        });
+        // 後片付けを通った後の範囲（この中の FAILED の行は後片付けの後に出る）
+        let mut quit_cleaned = None;
+        match (hook, ok) {
+            (Some(h), Some(o)) => match lines[h..o]
+                .iter()
+                .position(|(_, l)| code(l) && l.contains(CLEANUP))
+            {
+                Some(c) => quit_cleaned = Some((lines[h + c].0, lines[o].0)),
+                None => out.push((
+                    lines[o].0,
+                    "`on_app_quit` が `cleanup_process_scoped` を通らずに成功の行を出す".into(),
+                )),
+            },
+            _ => out.push((
+                0,
+                "`on_app_quit` と成功の行（TAKO_APP_SELF_TEST_OK）が見つからない\
+                 （形が変わったならこの番犬も直す）"
+                    .into(),
+            )),
+        }
+
+        // 3. FAILED の行を出す場所
+        for (i, (n, line)) in lines.iter().enumerate() {
+            if !(code(line) && line.contains(FAILED)) {
+                continue;
+            }
+            let in_fail = fail.is_some_and(|(h, e)| *n > h && *n <= e);
+            let after_quit_cleanup = quit_cleaned.is_some_and(|(c, o)| *n > c && *n < o);
+            let allowed = lines[i.saturating_sub(ALLOW_ABOVE)..=i]
+                .iter()
+                .any(|(_, l)| l.contains(ALLOW_MARKER));
+            if !(in_fail || after_quit_cleanup || allowed) {
+                out.push((
+                    *n,
+                    "FAILED の行を `self_test::fail` の外で出している（後片付けを通らない失敗の出口）"
+                        .into(),
+                ));
+            }
+        }
+
+        // 4. 使い捨ての判定は後片付けの 1 実装の中だけ
+        let shared = fn_span(&lines, "cleanup_process_scoped");
+        if shared.is_none() {
+            out.push((
+                0,
+                "`fn cleanup_process_scoped` が見つからない（改名したならこの番犬も直す）".into(),
+            ));
+        }
+        for (n, line) in &lines {
+            let inside = shared.is_some_and(|(h, e)| *n > h && *n <= e);
+            if code(line) && line.contains(DISPOSABLE) && !inside {
+                out.push((
+                    *n,
+                    "使い捨て backend の判定を `cleanup_process_scoped` の外で呼んでいる\
+                     （後片付けは 1 実装へ寄せる）"
+                        .into(),
+                ));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn セルフテストの出口は成功の出口と同じ後片付けを通る() {
+        let found = violations(include_str!("main.rs"));
+        let named: Vec<String> = found
+            .iter()
+            .map(|(n, why)| format!("{FILE}:{n}: {why}"))
+            .collect();
+        assert!(
+            named.is_empty(),
+            "{}\nセルフテストの失敗の出口は exit で終わり `on_app_quit` を通らないので、\
+             `cleanup_process_scoped` を呼ばないと器のサーバー（tako-iso-<pid>）・ソケットファイル・\
+             検証用の設定置き場が FAILED のたびに残る（#2388）。失敗は `self_test::fail` を通し、\
+             片付ける物は `cleanup_process_scoped` へ足すこと。後片付けの要らない出口だけ、\
+             その行か直前 6 行に `// tako:exit-cleanup-ok <理由>` を書く",
+            named.join("\n")
+        );
+    }
+
+    /// 検出力の担保: 配線を外した形を行番号で名指しし、正しい形・テストの中は通す
+    #[test]
+    fn 番犬は後片付けを通らない出口を名指しする() {
+        let good: Vec<&str> = vec![
+            "fn cleanup_process_scoped(origin: &str, secondary: bool) {", // 1
+            "    let _ = owns_disposable_socket(1, \"s\");",              // 2
+            "}",                                                          // 3
+            "fn app(cx: &mut App) {",                                     // 4
+            "    cx.on_app_quit(|this, cx| {",                            // 5
+            "        cleanup_process_scoped(\"on_app_quit\", this.secondary);", // 6
+            "        if early {",                                         // 7
+            "            println!(",                                      // 8
+            "                \"TAKO_APP_SELF_TEST_FAILED: 最終項目より前\"", // 9
+            "            );",                                             // 10
+            "        }",                                                  // 11
+            "        println!(\"TAKO_APP_SELF_TEST_OK\");",               // 12
+            "    });",                                                    // 13
+            "}",                                                          // 14
+            "mod self_test {",                                            // 15
+            "    fn fail(step: &str) -> ! {",                             // 16
+            "        println!(\"TAKO_APP_SELF_TEST_FAILED: {step}\");",   // 17
+            "        run(|| super::cleanup_process_scoped(\"self_test::fail\", false));", // 18
+            "        std::process::exit(1);",                             // 19
+            "    }",                                                      // 20
+            "}",                                                          // 21
+        ];
+        let lines = |src: &[&str]| -> Vec<usize> {
+            violations(&src.join("\n"))
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect()
+        };
+        assert_eq!(lines(&good), Vec::<usize>::new());
+
+        // ① fail から外す / コメントの中にしか無い = exit の行を名指し
+        let mut no_fail = good.clone();
+        no_fail.remove(17);
+        assert_eq!(lines(&no_fail), vec![18]);
+        let mut commented = good.clone();
+        commented[17] =
+            "        // run(|| super::cleanup_process_scoped(\"self_test::fail\", false));";
+        assert_eq!(lines(&commented), vec![19]);
+
+        // ② on_app_quit から外す = 成功の行と、後片付けの前になった FAILED の行を名指し
+        let mut no_quit = good.clone();
+        no_quit.remove(5);
+        assert_eq!(lines(&no_quit), vec![11, 8]);
+
+        // ③ fail の外に失敗の出口を増やす = その行を名指し。逃げ道があれば通す
+        let mut extra = good.clone();
+        extra.insert(
+            20,
+            "    fn other() { println!(\"TAKO_APP_SELF_TEST_FAILED: x\"); }",
+        );
+        assert_eq!(lines(&extra), vec![21]);
+        extra.insert(20, "    // tako:exit-cleanup-ok 器を起こす前に終わる");
+        assert_eq!(lines(&extra), Vec::<usize>::new());
+
+        // ④ 使い捨ての判定を後片付けの外へ書き直す = その行を名指し
+        let mut inlined = good.clone();
+        inlined.insert(
+            6,
+            "        if owns_disposable_socket(pid, &socket) { kill(); }",
+        );
+        assert_eq!(lines(&inlined), vec![7]);
+
+        // テストのモジュールの中（fixture や assert の文字列）は見ない
+        let mut with_test = good.clone();
+        with_test.extend([
+            "#[cfg(test)]",
+            "#[allow(dead_code)]",
+            "mod t {",
+            "    const S: &str = \"\\\"TAKO_APP_SELF_TEST_FAILED: x\";",
+            "    fn f() { owns_disposable_socket(1, \"s\"); }",
+            "}",
+        ]);
+        assert_eq!(lines(&with_test), Vec::<usize>::new());
     }
 }
 

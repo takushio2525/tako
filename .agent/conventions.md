@@ -2252,6 +2252,21 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
 - 消えたかは `TAKO_APP_SELF_TEST_CLEANUP: registered=N removed=M left=K` の行で読む。
   A/B は `TAKO_2051_LEGACY=1`、実経路は `bash scripts/test-visual-fail-cleanup-2051.sh`
 
+### プロセスの後片付けは成功の出口と失敗の出口で 1 実装（Issue #2388）
+
+節の一時ファイル（上）とは別に、**プロセスが終わるときに片付ける物**（自分の pid から作った
+使い捨ての器のサーバー `tako-iso-<pid>` / `tako-st-<pid>` とソケットファイル・検証用の設定置き場
+`tako-agent-config-<pid>`）は `cleanup_process_scoped` の 1 実装が持ち、成功の出口（`on_app_quit`）と
+失敗の出口（`self_test::fail`）の両方が呼ぶ（FR-4.8.26）。
+
+- 終了時に片付ける物を足すときは `cleanup_process_scoped` へ足す（`on_app_quit` へ直に書くと
+  FAILED の経路で残る = #2388 の形）。セルフテストの失敗は `fail()` を通し、`TAKO_APP_SELF_TEST_FAILED`
+  を `fail` の外で出して exit しない。後片付けの要らない出口（窓を開く前に終わる等）だけ、その行か
+  直前 6 行に `// tako:exit-cleanup-ok <理由>` を書く（番犬 `selftest_exit_cleanup_watchdog`）
+- `fail()` は FAILED の行の**後**に上限 5 秒で片付けるので、片付けが固まっても落ちた理由と終了コード 1 は
+  変わらない。片付けた物は `TAKO_APP_SELF_TEST_EXIT_CLEANUP: backend=… agent_home=… left=…` の行で読む。
+  A/B は `TAKO_2388_LEGACY=1`、実経路は `bash scripts/test-selftest-failed-cleanup-2388.sh`
+
 ## TUI の画面マーカーは「幅で切られる」前提で選ぶ（Issue #1015）
 
 エージェント CLI は**フッター行を自分でペイン幅に合わせて `…` で切る**。だから
