@@ -3810,7 +3810,8 @@ CI 完了前に merge され（merge 04:24:10 / Windows 完了 04:48:24）、過
   （macOS の CI は 2026-10-16 に 36〜54 分。10/27 に PR の CI が重なって 60 分で 2 本打ち切られたので job の上限を 90 分へ・既定を 4800 → 6600 秒）。`--timeout` か `TAKO_WAIT_PR_CHECKS_TIMEOUT` で変える
   （`merge-pr.sh` にもそのまま届く）。**macOS の job の上限を伸ばすときは既定も伸ばす**
   （`test-wait-pr-checks.sh` の Test 35 が実物の `ci.yml` と比べて落とす）。A/B は `TAKO_2047_LEGACY=1`
-  （上限で即 2・既定 2400 秒。Test 33 が「上限の直後の緑を 2 と誤判定する」を固定している）
+  （上限で即 2・既定 2400 秒。Test 33 が「上限の直後の緑を 2 と誤判定する」を固定している）。
+  既定の秒数・分数を文章に書いた所（`.agent/commands.md` の待ちの行・この節・`DEFAULT_TIMEOUT` の上のコメント・両スクリプトの `--help`）は、番犬 `issue2501_wait_timeout_docs_watchdog` が実値と突き合わせて行を名指しで落とす（#2501。docs だけの PR でも ubuntu で走る）
 - **衝突しているあいだ CI の run は作られないので、待たずに 4 で終わる**（#1365）。base が進んで
   衝突すると GitHub は merge コミットを作れず **`pull_request` の run を作らない**ので、
   `gh pr checks` には外部連携の `Cloudflare Pages` だけが並び、macOS / Windows は永久に未登録のまま
