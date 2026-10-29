@@ -40,8 +40,10 @@
 
 use tako_control::DispatchError as E;
 use tako_control::{NoTargetPaneAt, Reason};
+use tako_core::dialog::ConfirmBlock;
 use tako_core::i18n::{self, Lang};
 use tako_core::load_issue::{YamlProblem, YamlReason};
+use tako_core::remote_shortcuts::ShortcutError;
 use tako_core::user_task::TaskRefusal;
 use tako_core::{
     DiskState, LayoutParamError, PaneId, PaneTreeError, SplitAxis, TabId, WindowId, WorkspaceError,
@@ -694,9 +696,76 @@ fn reason_index(r: &Reason) -> usize {
         Reason::AppCannotConnect { .. } => 179,
         Reason::AppRequestEncodeFailed(_) => 180,
         Reason::AppNoReply => 181,
+        // #2365 の続き: 選択肢ダイアログへの応答・ダイアログ表示中の送信
+        Reason::RespondHint { .. } => 182,
+        Reason::ScreenCaptureFailed(_) => 183,
+        Reason::KeySendFailed { .. } => 184,
+        Reason::UnnumberedDialogBlocked(_) => 185,
+        Reason::DialogVanishedWhileMoving => 186,
+        Reason::CursorNotLanded(_) => 187,
+        Reason::ChoiceLabelTruncated { .. } => 188,
+        Reason::ChoiceEmpty(_) => 189,
+        Reason::ChoiceOutOfRange { .. } => 190,
+        Reason::ChoiceNoMatch { .. } => 191,
+        Reason::ChoiceAmbiguous { .. } => 192,
+        Reason::DialogBlocksSend { .. } => 193,
+        // #2365 の続き: orchestrator
+        Reason::NotMasterPane { .. } => 194,
+        Reason::NotProfileOrProject { .. } => 195,
+        Reason::CopyNameMissing => 196,
+        Reason::CopyFromMissing => 197,
+        Reason::AgentSettingsNeedAgent => 198,
+        Reason::EnvEntryShape(_) => 199,
+        Reason::CwdNotAbsolute(_) => 200,
+        Reason::AccountNeedsConfigOrInherit => 201,
+        Reason::AccountNotRegistered(_) => 202,
+        Reason::RoleAmbiguous { .. } => 203,
+        Reason::MasterPaneAmbiguous(_) => 204,
+        Reason::ReportUnavailable(_) => 205,
+        Reason::ProjectNotAllowed { .. } => 206,
+        Reason::ProjectKeyNotFileName(_) => 207,
+        Reason::HomeDirUnknown => 208,
+        Reason::ActionExactlyOneOf { .. } => 209,
+        Reason::NoHandoffMaterial { .. } => 210,
+        Reason::SystemPromptDirFailed(_) => 211,
+        Reason::SystemPromptWriteFailed(_) => 212,
+        Reason::WorkerRegistryUnreadable(_) => 213,
+        // #2365 の続き: 枠が日本語だった設定の保存・リモート閲覧のショートカット
+        Reason::UpdateCardSaveFailed(_) => 214,
+        Reason::WelcomeSaveFailed(_) => 215,
+        Reason::SaveFailed(_) => 216,
+        Reason::Shortcut(_) => 217,
+        // #2365 の続き: Web ビュー・メニュー
+        Reason::UrlEmpty => 218,
+        Reason::WebShowNeedsId => 219,
+        Reason::WebAlreadyDocked(_) => 220,
+        Reason::WebNavigateNeedsTo => 221,
+        Reason::MenuOpenCloseUnavailable => 222,
+        Reason::MenuNameEmpty => 223,
+        Reason::MenuNameAmbiguous { .. } => 224,
+        Reason::MenuNotFound { .. } => 225,
+        Reason::MenuUndefined => 226,
+        Reason::MenuItemPathEmpty => 227,
+        Reason::MenuItemAmbiguous { .. } => 228,
+        Reason::MenuItemNotFound(_) => 229,
+        // #2365 の続き: 個別の値の検証
+        Reason::NetworkWithEnabled => 230,
+        Reason::AllWithEnabled => 231,
+        Reason::PositivePx(_) => 232,
+        Reason::OneOfGiven { .. } => 233,
+        Reason::PaneNeedsCheckText => 234,
+        Reason::AtLeastOne(_) => 235,
+        Reason::AutoCloseValue(_) => 236,
+        Reason::RunConfigPathWithDefaults => 237,
+        Reason::ReadNeedsPaneOrSession => 238,
+        Reason::CwdUnavailable => 239,
+        Reason::CwdMissing(_) => 240,
+        Reason::TmuxResizeShape => 241,
+        Reason::NoTmuxSessionOnPane(_) => 242,
+        Reason::TmuxSessionNotFound { .. } => 243,
     }
 }
-const REASON_VARIANTS: usize = 182;
+const REASON_VARIANTS: usize = 244;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1003,6 +1072,136 @@ fn reason_samples() -> Vec<Reason> {
         },
         Reason::AppRequestEncodeFailed("key must be a string".into()),
         Reason::AppNoReply,
+        // #2365 の続き: 選択肢ダイアログへの応答・ダイアログ表示中の送信
+        Reason::RespondHint {
+            count: 3,
+            truncated: false,
+        },
+        Reason::ScreenCaptureFailed("tmux capture-pane failed".into()),
+        Reason::KeySendFailed {
+            key: "Enter".into(),
+            error: "Broken pipe (os error 32)".into(),
+        },
+        Reason::UnnumberedDialogBlocked(ConfirmBlock::NoHighlight),
+        Reason::DialogVanishedWhileMoving,
+        Reason::CursorNotLanded("Yes".into()),
+        Reason::ChoiceLabelTruncated {
+            position: 2,
+            label: "Opus (1M".into(),
+            number: 2,
+            labels: "1. Default / 2. Opus (1M".into(),
+        },
+        Reason::ChoiceEmpty("1. Yes / 2. No".into()),
+        Reason::ChoiceOutOfRange {
+            n: 9,
+            count: 2,
+            labels: "1. Yes / 2. No".into(),
+        },
+        Reason::ChoiceNoMatch {
+            choice: "maybe".into(),
+            truncated: false,
+            labels: "1. Yes / 2. No".into(),
+        },
+        Reason::ChoiceAmbiguous {
+            choice: "o".into(),
+            hits: 2,
+            labels: "1. Yes / 2. No".into(),
+        },
+        Reason::DialogBlocksSend {
+            kind: "usage_limit",
+            options: "1. Stop / 2. Switch".into(),
+            pane: Some(5),
+        },
+        // #2365 の続き: orchestrator
+        Reason::NotMasterPane {
+            pane: 7,
+            role: Some("worker:web".into()),
+        },
+        Reason::NotProfileOrProject {
+            name: "nope".into(),
+            profiles: vec!["default".into(), "fable".into()],
+            projects: vec!["web".into()],
+        },
+        Reason::CopyNameMissing,
+        Reason::CopyFromMissing,
+        Reason::AgentSettingsNeedAgent,
+        Reason::EnvEntryShape("NOEQ".into()),
+        Reason::CwdNotAbsolute("rel/dir".into()),
+        Reason::AccountNeedsConfigOrInherit,
+        Reason::AccountNotRegistered("work".into()),
+        Reason::RoleAmbiguous {
+            role: "master:default".into(),
+            panes: vec![3, 5],
+        },
+        Reason::MasterPaneAmbiguous(vec![3, 5]),
+        Reason::ReportUnavailable(42),
+        Reason::ProjectNotAllowed {
+            project: "web".into(),
+            allowed: vec!["api".into(), "docs".into()],
+        },
+        Reason::ProjectKeyNotFileName("a/b".into()),
+        Reason::HomeDirUnknown,
+        Reason::ActionExactlyOneOf {
+            action: "show",
+            a: "project",
+            b: "profile",
+        },
+        Reason::NoHandoffMaterial {
+            projects_dir: "/tmp/h/projects".into(),
+            memo_path: "/tmp/h/default.md".into(),
+        },
+        Reason::SystemPromptDirFailed("Permission denied (os error 13)".into()),
+        Reason::SystemPromptWriteFailed("No space left on device (os error 28)".into()),
+        Reason::WorkerRegistryUnreadable("expected value at line 1 column 1".into()),
+        // #2365 の続き: 枠が日本語だった設定の保存・リモート閲覧のショートカット
+        Reason::UpdateCardSaveFailed(IoCause::Other("Read-only file system (os error 30)".into())),
+        Reason::WelcomeSaveFailed(IoCause::DataDirUnresolved),
+        Reason::SaveFailed("Permission denied (os error 13)".into()),
+        Reason::Shortcut(ShortcutError::NotAbsolute),
+        // #2365 の続き: Web ビュー・メニュー
+        Reason::UrlEmpty,
+        Reason::WebShowNeedsId,
+        Reason::WebAlreadyDocked(2),
+        Reason::WebNavigateNeedsTo,
+        Reason::MenuOpenCloseUnavailable,
+        Reason::MenuNameEmpty,
+        Reason::MenuNameAmbiguous {
+            query: "e".into(),
+            candidates: vec!["Edit".into(), "View".into()],
+        },
+        Reason::MenuNotFound {
+            query: "Nope".into(),
+            candidates: vec!["File".into(), "Edit".into()],
+        },
+        Reason::MenuUndefined,
+        Reason::MenuItemPathEmpty,
+        Reason::MenuItemAmbiguous {
+            path: "tab".into(),
+            candidates: vec!["File/New Tab".into(), "File/Close Tab".into()],
+        },
+        Reason::MenuItemNotFound("File/Nope".into()),
+        // #2365 の続き: 個別の値の検証
+        Reason::NetworkWithEnabled,
+        Reason::AllWithEnabled,
+        Reason::PositivePx("width"),
+        Reason::OneOfGiven {
+            key: "mode",
+            allowed: "confirm / warn".into(),
+            got: "loud".into(),
+        },
+        Reason::PaneNeedsCheckText,
+        Reason::AtLeastOne("max_mb"),
+        Reason::AutoCloseValue("sometimes".into()),
+        Reason::RunConfigPathWithDefaults,
+        Reason::ReadNeedsPaneOrSession,
+        Reason::CwdUnavailable,
+        Reason::CwdMissing("/tmp/gone".into()),
+        Reason::TmuxResizeShape,
+        Reason::NoTmuxSessionOnPane(4),
+        Reason::TmuxSessionNotFound {
+            session: "work".into(),
+            socket: None,
+        },
     ]
 }
 
@@ -1209,7 +1408,103 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "tako app へ接続できない (/tmp/tako/control.sock): Connection refused (os error 61)",
     "リクエストの構築に失敗: key must be a string",
     "tako app から応答が返らなかった",
+    // #2365 の続き: dispatch の `respond_via` / `resolve_choice_index` / `dialog_send_refusal`
+    "応答するには choice に番号（1-3）かラベルの一部を渡す",
+    "画面の取得に失敗: tmux capture-pane failed",
+    "キー Enter の送信に失敗: Broken pipe (os error 32)",
+    "番号なしダイアログで選択カーソルが画面に無くハイライト位置を特定できない（Enter は送らない）\
+     （手動で応答してください）",
+    "カーソル移動中にダイアログが消えた（応答は送っていません）",
+    "選択肢「Yes」へカーソルを移動できなかったため応答を中止した（Enter は送っていません）",
+    "選択肢 2 のラベルは画面上で切り詰められているか説明との境目が読めない（`Opus (1M`）ため、\
+     ラベル指定では確定できない。番号（--choice 2）で指定する。選択肢: 1. Default / 2. Opus (1M",
+    "choice が空。選択肢: 1. Yes / 2. No",
+    "choice 9 は範囲外（1-2）。選択肢: 1. Yes / 2. No",
+    "「maybe」に一致する選択肢が無い。選択肢: 1. Yes / 2. No",
+    "「o」が複数の選択肢に一致する（2件）。番号で指定する。選択肢: 1. Yes / 2. No",
+    "選択肢ダイアログ（usage_limit）が表示中のため送信を中止した。\
+     入力欄が奪われているので、テキストや Enter はダイアログのキー操作として食われる\
+     （数字なら選択が確定してしまう）。選択肢: 1. Stop / 2. Switch。\
+     応答は `tako orchestrator respond --pane 5 --choice <番号|ラベル>`\
+     （choice を省略すると構造だけ確認できる）",
+    // #2365 の続き: dispatch の orchestrator（adopt・profiles・accounts・role の解決・report・spawn・引き継ぎ）
+    "ペイン 7 は master ではない（role=worker:web）。adopt は master のペインにだけ効く",
+    "'nope' はプロファイルでもプロジェクトでもない。\n\
+     プロファイル: default / fable\n\
+     プロジェクト: web\n\
+     プロジェクトを先に登録するには: tako orchestrator projects add --key nope --cwd <path>",
+    "name（複製先）を指定する",
+    "from（複製元）を指定する",
+    "agent_* 系の設定には agent（対象エージェント名）を指定する",
+    "env の形式が不正（KEY=VALUE が必要）: NOEQ",
+    "cwd は絶対パスか `~/` から始まる形で指定する（相対パスは起動時に解決できない）: rel/dir",
+    "config_dir か inherit のどちらかを指定する\
+     （別 config dir なら config_dir、既定の資格情報をそのまま使うなら inherit=true）",
+    "アカウント 'work' は登録されていない",
+    "role 'master:default' が複数ペインに存在（pane: 3, 5）。--pane で明示指定してください",
+    "master/solo ペインが複数（pane: 3, 5）。pid / env / stale map では解決できず、role も曖昧。\
+     --pane で明示指定してください",
+    "pane 42 の報告を取得できない（backend session 不在または scrollback 空）",
+    "プロファイルの projects 制限により、プロジェクト 'web' への spawn は許可されていない（許可: api, docs）",
+    "プロジェクトキーがファイル名として使えない: a/b",
+    "ホームディレクトリが取得できない",
+    "show は project か profile のどちらか一方を指定する",
+    // 後ろに tako-core の雛形（`project_handoff_template`）が付く（[`reason_old_ja`]）
+    "引き継ぎの材料が無い（プロジェクト単位のファイルも運用メモも空）。\n\
+     プロジェクト固有の引き継ぎ: /tmp/h/projects/<project-key>.md\n\
+     プロジェクトに紐付かない運用メモ: /tmp/h/default.md\n\
+     master は引き継ぎ前に前者へ状態を書き込む必要がある。書式:\n",
+    "system prompt の保存先を作れない: Permission denied (os error 13)",
+    "system prompt の書き出しに失敗: No space left on device (os error 28)",
+    "worker レジストリを読めない: expected value at line 1 column 1",
+    // #2365 の続き: 設定の保存（更新通知カード・ウェルカムバナー）・リモート閲覧のショートカット
+    "更新通知カードの状態を保存できない: Read-only file system (os error 30)",
+    "ウェルカムバナーの状態を保存できない: データディレクトリを解決できない",
+    "保存に失敗: Permission denied (os error 13)",
+    "絶対パスで指定してください",
+    // #2365 の続き: Web ビュー・メニュー
+    "URL が空です",
+    "id は必須（web list で確認）",
+    "Web ビュー 2 は既に dock 退避中",
+    "to は必須（back / forward / reload / URL）",
+    "この環境の menu open / close は使えません（メニューは OS のメニューバーに載るため \
+     tako が開閉できない）。項目の実行は menu invoke が使えます",
+    "メニュー名が空",
+    "メニュー名 'e' が曖昧です: Edit / View",
+    "メニュー 'Nope' が見つかりません（候補: File / Edit）",
+    "メニュー定義がありません（GUI が起動していない可能性があります）",
+    "項目のパスが空",
+    "項目 'tab' が曖昧です: File/New Tab / File/Close Tab",
+    "メニュー項目 'File/Nope' が見つかりません（`tako menu list` で一覧できます）",
+    // #2365 の続き: 個別の値の検証（limit-resume・panel・paste-guard・logs・run・sessions・tmux）
+    "network と enabled は併用できない（全体の設定かペインの設定のどちらか）",
+    "all と enabled は併用できない（一覧か設定のどちらか）",
+    "width は正の数（px）を指定する",
+    "mode は confirm / warn のどれか（指定: loud）",
+    "pane は判定する文字（check / text）と一緒に渡す",
+    "max_mb は 1 以上を指定する",
+    "auto_close は success / always / never のいずれか（指定: \"sometimes\"）",
+    "path（実行設定）と ext / command / remove（拡張子既定）は同時に使えない",
+    "read には pane または session_id が必要",
+    "cwd が取得できない",
+    "cwd が存在しない: /tmp/gone",
+    "cols と rows の両方を指定するか、reset を使うこと",
+    "ペイン 4 に tmux セッションがない（tmux 永続化が無効 / 直接 spawn / 取り込みビューでもない）",
+    "tmux セッション work が見つからない（既定サーバー）。対象は `tako tmux list` で確認すること",
 ];
+
+/// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
+/// （#2365 より前も `project_handoff_template` = 表示言語の雛形を付けていた）が続く
+fn reason_old_ja(r: &Reason) -> String {
+    let fixed = REASON_OLD_JA[reason_index(r)];
+    match r {
+        Reason::NoHandoffMaterial { .. } => format!(
+            "{fixed}{}",
+            tako_core::handoff::project_handoff_template_in(Lang::Ja, "<project-key>")
+        ),
+        _ => fixed.to_string(),
+    }
+}
 
 /// #2365 より前の `preview_recovery_hint` の 3 つの文（外で消された / 外で変わった / 未保存だけ）
 const HINT_DELETED_OLD_JA: &str = "作り直す: tako edit save --force / 差分: tako edit diff（MCP は tako_preview_save の action=overwrite / diff）";
@@ -1235,6 +1530,7 @@ fn reason_is_not_found(r: &Reason) -> bool {
             | Reason::PasteTargetNotFound(_)
             | Reason::CheckpointNotFound(_)
             | Reason::GateNotFound(_)
+            | Reason::TmuxSessionNotFound { .. }
     )
 }
 
@@ -1425,7 +1721,7 @@ fn 理由の文の日本語は2365より前の固定文とバイト一致() {
     for r in reason_samples() {
         assert_eq!(
             r.text_in(Lang::Ja),
-            REASON_OLD_JA[reason_index(&r)],
+            reason_old_ja(&r),
             "{r:?}（{}）",
             reason_where(&r, Lang::Ja)
         );
@@ -5915,4 +6211,308 @@ fn settings_の書き出しの断りを素の文で包まない() {
 fn settings_の書き出しの走査は文の終わりで止まる() {
     let src = "fn a() {\n    let _ = crate::settings::save(&s);\n    x.map_err(|e| e.to_string());\n    crate::settings::save(&s)\n        .map_err(|e| DispatchError::Operation(e.to_string()))?;\n    // crate::settings::save(&s).map_err(|e| e.to_string())\n}\n";
     assert_eq!(settings_save_raw_wraps(src), vec![5]);
+}
+
+// ---- #2365 の続き: dispatch の個別の断り（選択肢ダイアログ・orchestrator・設定の保存・Web・メニュー・
+// 値の検証）のソースを読む番犬 ----
+//
+// 日英の対は上の `Reason` の表で見る。表では見えないのは、移した断りの近くへ日本語の固定文を
+// **書き足す**こと（英語表示でもその 1 か所だけ日本語で返る）。2 つの形で `file:line` を名指す:
+// (1) 断りを全部移した関数（[`DISPATCH_REASON_SCOPES`]）は、関数の中に日本語の固定文があれば落とす
+//     （`unreachable!` / `expect` の文とコメントは見ない = 前段の番犬と同じ読み方）
+// (2) 日本語の残る大きな関数（`dispatch_inner` ほか）の中で移した文（[`DISPATCH_MOVED_OLD_JA`]）は、
+//     旧文の断片が dispatch の本体（`impl Reason` の表と単体テストの外）へ戻れば落とす
+
+/// 断りを全部 `Reason` へ移した dispatch の関数（頭）。persist.log・応答の注記など日本語のまま残す文を
+/// 持つ関数はここへ入れず、[`DISPATCH_MOVED_OLD_JA`] の断片で見る
+const DISPATCH_REASON_SCOPES: &[&str] = &[
+    // 選択肢ダイアログへの応答（`tako orchestrator respond`）とダイアログ表示中の送信
+    "pub fn respond_via(",
+    "fn resolve_choice_index(",
+    "fn dialog_blocks_send(",
+    "fn dialog_send_refusal(",
+    // orchestrator
+    "pub fn dispatch_orchestrator_profiles(",
+    "fn find_master_pane_strict(",
+    "fn finish_orchestrator_report(",
+    "pub fn dispatch_orchestrator_handoff_files(",
+    "fn resolve_worker_query(",
+    // リモート閲覧のショートカット・メニュー
+    "pub fn dispatch_remote_shortcuts(",
+    "fn require_in_window_menu(",
+    "fn resolve_menu_index(",
+    "pub fn resolve_menu_item(",
+    // 値の検証・cwd・tmux
+    "fn send_paste_gate(",
+    "fn dispatch_logs_read(",
+    "fn git_pane_cwd(",
+    "fn tmux_select_window_target(",
+    "fn compute_tmux_open_lookup(",
+];
+
+/// 日本語の残る関数の中で移した断りの旧文の断片と、寄せた先のバリアント
+const DISPATCH_MOVED_OLD_JA: &[(&str, &str)] = &[
+    ("更新通知カードの状態を保存できない", "UpdateCardSaveFailed"),
+    ("ウェルカムバナーの状態を保存できない", "WelcomeSaveFailed"),
+    ("URL が空です", "UrlEmpty"),
+    ("id は必須（web list", "WebShowNeedsId"),
+    ("は既に dock 退避中", "WebAlreadyDocked"),
+    ("to は必須（back", "WebNavigateNeedsTo"),
+    ("は併用できない（全体の設定か", "NetworkWithEnabled"),
+    ("は併用できない（一覧か", "AllWithEnabled"),
+    ("は正の数（px）", "PositivePx"),
+    ("のどれか（指定: ", "OneOfGiven"),
+    ("判定する文字（check / text）", "PaneNeedsCheckText"),
+    ("は 1 以上を指定する", "AtLeastOne"),
+    ("auto_close は success", "AutoCloseValue"),
+    (
+        "（拡張子既定）は同時に使えない",
+        "RunConfigPathWithDefaults",
+    ),
+    ("cwd が取得できない", "CwdUnavailable"),
+    ("cwd が存在しない", "CwdMissing"),
+    ("cols と rows の両方", "TmuxResizeShape"),
+    ("は master ではない（role=", "NotMasterPane"),
+    (
+        "はプロファイルでもプロジェクトでもない",
+        "NotProfileOrProject",
+    ),
+    (
+        "config_dir か inherit のどちらか",
+        "AccountNeedsConfigOrInherit",
+    ),
+    ("は登録されていない", "AccountNotRegistered"),
+    ("への spawn は許可されていない", "ProjectNotAllowed"),
+    ("pane または tab を指定してください", "EitherOf"),
+    ("引き継ぎの材料が無い", "NoHandoffMaterial"),
+    ("system prompt の保存先を作れない", "SystemPromptDirFailed"),
+    ("system prompt の書き出しに失敗", "SystemPromptWriteFailed"),
+    ("ホームディレクトリが取得できない", "HomeDirUnknown"),
+    ("worker レジストリを読めない", "WorkerRegistryUnreadable"),
+];
+
+/// [`DISPATCH_MOVED_OLD_JA`] の断片が dispatch の本体の文字列リテラルにある行（1 始まり）
+fn moved_old_ja_hits(lines: &[(usize, &str)]) -> Vec<(usize, &'static str, &'static str)> {
+    let mut out = Vec::new();
+    for (line, code) in lines {
+        for lit in line_literals(code) {
+            for (fragment, variant) in DISPATCH_MOVED_OLD_JA {
+                if lit.contains(fragment) {
+                    out.push((*line, *fragment, *variant));
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn dispatch_の個別の断りを移した関数に日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for head in DISPATCH_REASON_SCOPES {
+        let Some(lines) = front_scope_lines(DISPATCH_SRC, Some(head)) else {
+            failures.push(format!(
+                "{DISPATCH_PATH}: 走査の範囲 `{head}` が見つからない（関数の改名で番犬が空振りする。\
+                 DISPATCH_REASON_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in front_japanese(&lines) {
+            failures.push(format!(
+                "{DISPATCH_PATH}:{line}: 断りを Reason へ移した関数（`{head}`）に日本語の固定文がある = \
+                 英語表示にもそのまま出る（tako_control::Reason へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+#[test]
+fn dispatch_の個別の断りの旧文が本体に戻っていない() {
+    let mut failures = Vec::new();
+    for (line, fragment, variant) in moved_old_ja_hits(&dispatch_code_lines()) {
+        failures.push(format!(
+            "{DISPATCH_PATH}:{line}: 移した断りの旧文（「{fragment}」）が日本語の固定文で戻っている = \
+             英語表示にもそのまま出る（Reason::{variant} を使う）"
+        ));
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 断片は旧文に当たり、`impl Reason` の表・コメントは見ない。移した関数の範囲は
+/// 頭と同じ字下げの `}` で切れる（隣の関数へはみ出さない）
+#[test]
+fn dispatch_の個別の断りの番犬の境界() {
+    let src = r#"fn a() -> Result<(), DispatchError> {
+    // 更新通知カードの状態を保存できない（コメントは見ない）
+    return Err(DispatchError::Operation(format!("更新通知カードの状態を保存できない: {e}")));
+}
+fn b() {
+    let _ = "cwd が取得できない";
+}
+"#;
+    let lines: Vec<(usize, &str)> = src.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+    let code: Vec<(usize, &str)> = lines
+        .iter()
+        .copied()
+        .filter(|(_, l)| !l.trim_start().starts_with("//"))
+        .collect();
+    let hits: Vec<(usize, &str)> = moved_old_ja_hits(&code)
+        .into_iter()
+        .map(|(line, _, variant)| (line, variant))
+        .collect();
+    assert_eq!(
+        hits,
+        vec![(3, "UpdateCardSaveFailed"), (6, "CwdUnavailable")]
+    );
+    let scoped = front_scope_lines(src, Some("fn a(")).expect("頭を引ける");
+    assert_eq!(
+        front_japanese(&scoped)
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect::<Vec<_>>(),
+        vec![3]
+    );
+    // 移した関数の表と断片の表は、今の dispatch で全部当たる（改名で空振りしない）
+    for head in DISPATCH_REASON_SCOPES {
+        assert!(
+            front_scope_lines(DISPATCH_SRC, Some(head)).is_some(),
+            "{head}"
+        );
+    }
+    // 断片は寄せた先の日本語の腕の文に含まれる（断片の書き間違いで番犬が何も見なくなるのを止める）
+    let ja: Vec<String> = reason_samples().iter().map(|r| reason_old_ja(r)).collect();
+    for (fragment, variant) in DISPATCH_MOVED_OLD_JA {
+        assert!(
+            ja.iter().any(|t| t.contains(fragment)),
+            "断片「{fragment}」（{variant}）が Reason の日本語の文に無い"
+        );
+    }
+}
+
+/// 境界: 1 つのバリアントが値で腕を分けるもの（下見の案内・切り詰め・応答の案内のペイン・role の有無・
+/// 一覧が空・確定を見送る理由・ショートカットの断り・書き出しの口の印・tmux のサーバー）を、表の見本に
+/// 載せていない側も日英で見る。日本語は #2365 より前の文とバイト一致
+#[test]
+fn dispatch_の個別の断りの値で分かれる腕の境界() {
+    let cases: Vec<(Reason, String)> = vec![
+        (
+            Reason::RespondHint {
+                count: 2,
+                truncated: true,
+            },
+            "応答するには choice に番号（1-2）を渡す（この画面はラベルが切り詰められているか説明との\
+             境目が読めないのでラベル指定は受け付けない）"
+                .into(),
+        ),
+        (
+            Reason::UnnumberedDialogBlocked(ConfirmBlock::OutOfRange),
+            "番号なしダイアログで選択肢の並びが採取のあいだに変わった（添字が範囲外。Enter は送らない）\
+             （手動で応答してください）"
+                .into(),
+        ),
+        (
+            Reason::ChoiceNoMatch {
+                choice: "x".into(),
+                truncated: true,
+                labels: "1. Defaul…".into(),
+            },
+            "「x」に一致する選択肢が無い（この画面はラベルが切り詰められているか説明との境目が読めないので、\
+             ラベルでは確定できない。番号で指定する）。選択肢: 1. Defaul…"
+                .into(),
+        ),
+        (
+            Reason::DialogBlocksSend {
+                kind: "permission",
+                options: "1. Yes / 2. No".into(),
+                pane: None,
+            },
+            "選択肢ダイアログ（permission）が表示中のため送信を中止した。入力欄が奪われているので、\
+             テキストや Enter はダイアログのキー操作として食われる（数字なら選択が確定してしまう）。\
+             選択肢: 1. Yes / 2. No。応答は `tako orchestrator respond --pane <N> --choice <番号|ラベル>`\
+             （choice を省略すると構造だけ確認できる）"
+                .into(),
+        ),
+        (
+            Reason::NotMasterPane {
+                pane: 7,
+                role: None,
+            },
+            "ペイン 7 は master ではない（role=なし）。adopt は master のペインにだけ効く".into(),
+        ),
+        (
+            Reason::NotProfileOrProject {
+                name: "x".into(),
+                profiles: Vec::new(),
+                projects: Vec::new(),
+            },
+            "'x' はプロファイルでもプロジェクトでもない。\nプロファイル: （なし）\nプロジェクト: （なし）\n\
+             プロジェクトを先に登録するには: tako orchestrator projects add --key x --cwd <path>"
+                .into(),
+        ),
+        (
+            Reason::UpdateCardSaveFailed(IoCause::DataDirUnresolved),
+            "更新通知カードの状態を保存できない: データディレクトリを解決できない".into(),
+        ),
+        (
+            Reason::WelcomeSaveFailed(IoCause::Other(String::new())),
+            "ウェルカムバナーの状態を保存できない: ".into(),
+        ),
+        (
+            Reason::TmuxSessionNotFound {
+                session: "work".into(),
+                socket: Some("tako-x".into()),
+            },
+            "tmux セッション work が見つからない（socket: tako-x）。対象は `tako tmux list` で確認すること"
+                .into(),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (r, old) in &cases {
+        let (ja, en) = (r.text_in(Lang::Ja), r.text_in(Lang::En));
+        if &ja != old {
+            failures.push(format!(
+                "{r:?}: 日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}"
+            ));
+        }
+        if let Some(c) = has_japanese(&en) {
+            failures.push(format!("{r:?}: 英語に日本語（{c}）: {en}"));
+        }
+    }
+    // ショートカットの断りは全種を tako-core の日英の対で引く
+    for e in [
+        ShortcutError::NotAbsolute,
+        ShortcutError::NotFound,
+        ShortcutError::NotADirectory,
+        ShortcutError::TooMany,
+        ShortcutError::UnknownShortcut,
+        ShortcutError::Builtin,
+    ] {
+        let r = Reason::Shortcut(e);
+        assert_eq!(r.text_in(Lang::Ja), e.message_ja());
+        assert_eq!(r.text_in(Lang::En), e.message_en());
+        // 「見つかりません」系も英語に ` not found` を含めない（404 寄せの読みを日英でそろえる）
+        assert!(!E::says_not_found(&r.text_in(Lang::Ja)));
+        assert!(!E::says_not_found(&r.text_in(Lang::En)));
+    }
+    // 引き継ぎの材料が無い断りの書式（雛形）は枠と同じ言語
+    let handoff = Reason::NoHandoffMaterial {
+        projects_dir: "/tmp/h".into(),
+        memo_path: "/tmp/m.md".into(),
+    };
+    assert!(handoff
+        .text_in(Lang::En)
+        .ends_with(&tako_core::handoff::project_handoff_template_in(
+            Lang::En,
+            "<project-key>"
+        )));
+    // tmux の既定サーバーの日本語は tako-core の表示（`socket_label`）と同じ文
+    let default_server = Reason::TmuxSessionNotFound {
+        session: "w".into(),
+        socket: None,
+    };
+    assert!(default_server
+        .text_in(Lang::Ja)
+        .contains(&tako_core::tmux::socket_label(None)));
+    report_all(failures);
 }

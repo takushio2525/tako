@@ -4743,6 +4743,8 @@ fn cli_main() -> ExitCode {
                 }
                 HandoffsCommand::Migrate { profile } => ("migrate", None, profile.clone(), None),
             };
+            // 手元で dispatch を直呼びする。理由の文（#2365）を前置きと同じ表示言語で組む
+            init_local_lang();
             tako_control::dispatch::dispatch_orchestrator_handoff_files(
                 action,
                 project.as_deref(),
@@ -6324,7 +6326,9 @@ fn remote_shortcuts(command: Option<RemoteShortcutsCommand>) -> Result<(), Strin
         Some(RemoteShortcutsCommand::Add { path, name }) => ("add", Some(path), name),
         Some(RemoteShortcutsCommand::Remove { path }) => ("remove", Some(path), None),
     };
-    // dispatch と**同一関数**を共用する（IPC 不要 = GUI が動いていなくても効く）
+    // dispatch と**同一関数**を共用する（IPC 不要 = GUI が動いていなくても効く）。
+    // 理由の文（#2365）を前置きと同じ表示言語で組む
+    init_local_lang();
     let result =
         tako_control::dispatch::dispatch_remote_shortcuts(action, path.as_deref(), name.as_deref())
             .map_err(local_dispatch_err)?;

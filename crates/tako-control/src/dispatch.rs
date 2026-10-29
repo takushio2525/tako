@@ -632,6 +632,213 @@ pub enum Reason {
     AppRequestEncodeFailed(String),
     /// `tako app から応答が返らなかった`（英語は [`Self::NoReply`] と同じ文）
     AppNoReply,
+    // ---- #2365 の続き: 選択肢ダイアログへの応答（`tako orchestrator respond`）と、ダイアログ表示中の送信の断り。
+    // 選択肢の一覧（`labels`）は呼び手が `Reason::choice_labels` で表示言語の印（切り詰め）つきで組む ----
+    /// `応答するには choice に番号（1-<count>）…を渡す`（断りではなく、choice を省いた下見の応答の `hint`。
+    /// `truncated` = ラベルが切り詰められていてラベルでは選べない画面）
+    RespondHint {
+        count: usize,
+        truncated: bool,
+    },
+    /// `画面の取得に失敗: <error>`
+    ScreenCaptureFailed(String),
+    /// `キー <key> の送信に失敗: <error>`
+    KeySendFailed {
+        key: String,
+        error: String,
+    },
+    /// `番号なしダイアログで<理由>（手動で応答してください）`（理由は tako-core の `ConfirmBlock`）
+    UnnumberedDialogBlocked(tako_core::dialog::ConfirmBlock),
+    /// `カーソル移動中にダイアログが消えた（応答は送っていません）`
+    DialogVanishedWhileMoving,
+    /// `選択肢「<label>」へカーソルを移動できなかったため応答を中止した（Enter は送っていません）`
+    CursorNotLanded(String),
+    /// ラベルで当たった選択肢のラベルが切り詰められている（#1143 / #2302）。`position` は 1 始まり
+    ChoiceLabelTruncated {
+        position: usize,
+        label: String,
+        number: u32,
+        labels: String,
+    },
+    /// `choice が空。選択肢: <labels>`
+    ChoiceEmpty(String),
+    /// `choice <n> は範囲外（1-<count>）。選択肢: <labels>`
+    ChoiceOutOfRange {
+        n: u32,
+        count: usize,
+        labels: String,
+    },
+    /// `「<choice>」に一致する選択肢が無い<切り詰めの注記>。選択肢: <labels>`
+    ChoiceNoMatch {
+        choice: String,
+        truncated: bool,
+        labels: String,
+    },
+    /// `「<choice>」が複数の選択肢に一致する（<hits>件）。番号で指定する。選択肢: <labels>`
+    ChoiceAmbiguous {
+        choice: String,
+        hits: usize,
+        labels: String,
+    },
+    /// 選択肢ダイアログの表示中に送信を断った（#748）。`kind` はダイアログの種別の slug、
+    /// `options` は `<番号>. <ラベル>` を ` / ` で並べたもの、`pane` は応答の案内に添える ID
+    DialogBlocksSend {
+        kind: &'static str,
+        options: String,
+        pane: Option<u64>,
+    },
+    // ---- #2365 の続き: orchestrator（adopt・profiles・accounts・role の解決・report・spawn・引き継ぎ）の断り ----
+    /// `ペイン <pane> は master ではない（role=<role>）。adopt は master のペインにだけ効く`
+    NotMasterPane {
+        pane: u64,
+        role: Option<String>,
+    },
+    /// `'<name>' はプロファイルでもプロジェクトでもない。`（候補と登録の案内つき。空の一覧は「（なし）」）
+    NotProfileOrProject {
+        name: String,
+        profiles: Vec<String>,
+        projects: Vec<String>,
+    },
+    /// `name（複製先）を指定する`（`profiles copy`）
+    CopyNameMissing,
+    /// `from（複製元）を指定する`（`profiles copy`）
+    CopyFromMissing,
+    /// `agent_* 系の設定には agent（対象エージェント名）を指定する`
+    AgentSettingsNeedAgent,
+    /// `env の形式が不正（KEY=VALUE が必要）: <entry>`（`profiles set --env`）
+    EnvEntryShape(String),
+    /// ``cwd は絶対パスか `~/` から始まる形で指定する（相対パスは起動時に解決できない）: <raw>``
+    CwdNotAbsolute(String),
+    /// `config_dir か inherit のどちらかを指定する（…）`（`accounts add`）
+    AccountNeedsConfigOrInherit,
+    /// `アカウント '<name>' は登録されていない`
+    AccountNotRegistered(String),
+    /// `role '<role>' が複数ペインに存在（pane: <ids>）。--pane で明示指定してください`
+    RoleAmbiguous {
+        role: String,
+        panes: Vec<u64>,
+    },
+    /// `master/solo ペインが複数（pane: <ids>）。…--pane で明示指定してください`
+    MasterPaneAmbiguous(Vec<u64>),
+    /// `pane <id> の報告を取得できない（backend session 不在または scrollback 空）`
+    ReportUnavailable(u64),
+    /// `プロファイルの projects 制限により、プロジェクト '<project>' への spawn は許可されていない（許可: …）`
+    ProjectNotAllowed {
+        project: String,
+        allowed: Vec<String>,
+    },
+    /// `プロジェクトキーがファイル名として使えない: <key>`
+    ProjectKeyNotFileName(String),
+    /// `ホームディレクトリが取得できない`
+    HomeDirUnknown,
+    /// `<action> は <a> か <b> のどちらか一方を指定する`
+    ActionExactlyOneOf {
+        action: &'static str,
+        a: &'static str,
+        b: &'static str,
+    },
+    /// 引き継ぎの材料が無い（#792 / #915）。書く場所と書式（雛形も表示言語で引く）を添える
+    NoHandoffMaterial {
+        projects_dir: String,
+        memo_path: String,
+    },
+    /// `system prompt の保存先を作れない: <error>`
+    SystemPromptDirFailed(String),
+    /// `system prompt の書き出しに失敗: <error>`
+    SystemPromptWriteFailed(String),
+    /// `worker レジストリを読めない: <error>`
+    WorkerRegistryUnreadable(String),
+    // ---- #2365 の続き: 枠が日本語だった設定の保存の断りと、リモート閲覧のショートカットの断り ----
+    /// `更新通知カードの状態を保存できない: <e>`（中身は settings.json の書き出しの口の `io::Error`）
+    UpdateCardSaveFailed(crate::config_io::IoCause),
+    /// `ウェルカムバナーの状態を保存できない: <e>`（同上）
+    WelcomeSaveFailed(crate::config_io::IoCause),
+    /// `保存に失敗: <error>`（リモート閲覧のショートカットの書き出し）
+    SaveFailed(String),
+    /// リモート閲覧のショートカットの追加・削除の断り（文は tako-core の日英の対）
+    Shortcut(tako_core::remote_shortcuts::ShortcutError),
+    // ---- #2365 の続き: Web ビュー（`tako web`）の断り ----
+    /// `URL が空です`
+    UrlEmpty,
+    /// `id は必須（web list で確認）`
+    WebShowNeedsId,
+    /// `Web ビュー <id> は既に dock 退避中`
+    WebAlreadyDocked(u64),
+    /// `to は必須（back / forward / reload / URL）`
+    WebNavigateNeedsTo,
+    // ---- #2365 の続き: メニュー（`tako menu`）の断り。見つからない系は日本語が「見つかりません」なので、
+    // 英語も ` not found` を含めない（[`DispatchError::says_not_found`] の当たり方を日英でそろえる） ----
+    /// `この環境の menu open / close は使えません（…）。項目の実行は menu invoke が使えます`
+    MenuOpenCloseUnavailable,
+    /// `メニュー名が空`
+    MenuNameEmpty,
+    /// `メニュー名 '<query>' が曖昧です: <candidates>`
+    MenuNameAmbiguous {
+        query: String,
+        candidates: Vec<String>,
+    },
+    /// `メニュー '<query>' が見つかりません（候補: <candidates>）`
+    MenuNotFound {
+        query: String,
+        candidates: Vec<String>,
+    },
+    /// `メニュー定義がありません（GUI が起動していない可能性があります）`
+    MenuUndefined,
+    /// `項目のパスが空`
+    MenuItemPathEmpty,
+    /// `項目 '<path>' が曖昧です: <candidates>`
+    MenuItemAmbiguous {
+        path: String,
+        candidates: Vec<String>,
+    },
+    /// ``メニュー項目 '<path>' が見つかりません（`tako menu list` で一覧できます）``
+    MenuItemNotFound(String),
+    // ---- #2365 の続き: 個別の値の検証（limit-resume・panel・paste-guard・logs・run・sessions・tmux） ----
+    /// `network と enabled は併用できない（全体の設定かペインの設定のどちらか）`
+    NetworkWithEnabled,
+    /// `all と enabled は併用できない（一覧か設定のどちらか）`
+    AllWithEnabled,
+    /// `<key> は正の数（px）を指定する`
+    PositivePx(&'static str),
+    /// `<key> は <allowed> のどれか（指定: <got>）`。`allowed` は候補を ` / ` で並べたもの（ASCII）
+    OneOfGiven {
+        key: &'static str,
+        allowed: String,
+        got: String,
+    },
+    /// `pane は判定する文字（check / text）と一緒に渡す`（paste-guard）
+    PaneNeedsCheckText,
+    /// `<key> は 1 以上を指定する`
+    AtLeastOne(&'static str),
+    /// `auto_close は success / always / never のいずれか（指定: <got:?>）`
+    AutoCloseValue(String),
+    /// `path（実行設定）と ext / command / remove（拡張子既定）は同時に使えない`
+    RunConfigPathWithDefaults,
+    /// `read には pane または session_id が必要`（ペインログ）
+    ReadNeedsPaneOrSession,
+    /// `cwd が取得できない`
+    CwdUnavailable,
+    /// `cwd が存在しない: <path>`
+    CwdMissing(String),
+    /// `cols と rows の両方を指定するか、reset を使うこと`（tmux の window のリサイズ）
+    TmuxResizeShape,
+    /// `ペイン <id> に tmux セッションがない（…）`
+    NoTmuxSessionOnPane(u64),
+    /// `tmux セッション <session> が見つからない（<サーバー>）。…`（英語にも ` not found` を含める）。
+    /// `socket` が無ければ既定サーバー（日本語は `tako_core::tmux::socket_label` と同じ文）
+    TmuxSessionNotFound {
+        session: String,
+        socket: Option<String>,
+    },
+}
+
+/// ペイン ID の並び（`3, 5`）。複数ペインに当たった断りに添える
+fn join_ids(panes: &[u64]) -> String {
+    panes
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// 整形の範囲を表す 4 つの鍵（#1683。MCP `tako_lsp` の format の range と
@@ -1554,6 +1761,530 @@ impl Reason {
             }
             (Self::AppNoReply, Ja) => "tako app から応答が返らなかった".to_string(),
             (Self::AppNoReply, En) => Self::NoReply.text_in(En),
+            (
+                Self::RespondHint {
+                    count,
+                    truncated: true,
+                },
+                Ja,
+            ) => format!(
+                "応答するには choice に番号（1-{count}）を渡す\
+                 （この画面はラベルが切り詰められているか説明との境目が読めないので\
+                 ラベル指定は受け付けない）"
+            ),
+            (
+                Self::RespondHint {
+                    count,
+                    truncated: true,
+                },
+                En,
+            ) => format!(
+                "to answer, pass the number (1-{count}) as choice (the labels on this screen \
+                 are truncated or cannot be told apart from their descriptions, so a label is \
+                 not accepted)"
+            ),
+            (
+                Self::RespondHint {
+                    count,
+                    truncated: false,
+                },
+                Ja,
+            ) => format!("応答するには choice に番号（1-{count}）かラベルの一部を渡す"),
+            (
+                Self::RespondHint {
+                    count,
+                    truncated: false,
+                },
+                En,
+            ) => format!("to answer, pass the number (1-{count}) or part of a label as choice"),
+            (Self::ScreenCaptureFailed(error), Ja) => format!("画面の取得に失敗: {error}"),
+            (Self::ScreenCaptureFailed(error), En) => {
+                format!("failed to capture the screen: {error}")
+            }
+            (Self::KeySendFailed { key, error }, Ja) => format!("キー {key} の送信に失敗: {error}"),
+            (Self::KeySendFailed { key, error }, En) => {
+                format!("failed to send the key {key}: {error}")
+            }
+            (Self::UnnumberedDialogBlocked(block), Ja) => {
+                format!("番号なしダイアログで{}（手動で応答してください）", block.note())
+            }
+            (Self::UnnumberedDialogBlocked(block), En) => {
+                let why = match block {
+                    tako_core::dialog::ConfirmBlock::NoHighlight => {
+                        "the selection cursor is not on the screen, so the highlighted choice \
+                         cannot be located (Enter is not sent)"
+                    }
+                    tako_core::dialog::ConfirmBlock::OutOfRange => {
+                        "the choices changed while the screen was being read (index out of \
+                         range; Enter is not sent)"
+                    }
+                };
+                format!("in a dialog without numbers, {why} (answer it by hand)")
+            }
+            (Self::DialogVanishedWhileMoving, Ja) => {
+                "カーソル移動中にダイアログが消えた（応答は送っていません）".to_string()
+            }
+            (Self::DialogVanishedWhileMoving, En) => {
+                "the dialog disappeared while the cursor was moving (no answer was sent)"
+                    .to_string()
+            }
+            (Self::CursorNotLanded(label), Ja) => format!(
+                "選択肢「{label}」へカーソルを移動できなかったため応答を中止した（Enter は送っていません）"
+            ),
+            (Self::CursorNotLanded(label), En) => format!(
+                "could not move the cursor to the choice \"{label}\", so the answer was \
+                 cancelled (Enter was not sent)"
+            ),
+            (
+                Self::ChoiceLabelTruncated {
+                    position,
+                    label,
+                    number,
+                    labels,
+                },
+                Ja,
+            ) => format!(
+                "選択肢 {position} のラベルは画面上で切り詰められているか説明との境目が読めない（`{label}`）ため、\
+                 ラベル指定では確定できない。番号（--choice {number}）で指定する。選択肢: {labels}"
+            ),
+            (
+                Self::ChoiceLabelTruncated {
+                    position,
+                    label,
+                    number,
+                    labels,
+                },
+                En,
+            ) => format!(
+                "the label of choice {position} is truncated on the screen or cannot be told \
+                 apart from its description (`{label}`), so it cannot be chosen by label. \
+                 Pass the number (--choice {number}). Choices: {labels}"
+            ),
+            (Self::ChoiceEmpty(labels), Ja) => format!("choice が空。選択肢: {labels}"),
+            (Self::ChoiceEmpty(labels), En) => format!("choice is empty. Choices: {labels}"),
+            (Self::ChoiceOutOfRange { n, count, labels }, Ja) => {
+                format!("choice {n} は範囲外（1-{count}）。選択肢: {labels}")
+            }
+            (Self::ChoiceOutOfRange { n, count, labels }, En) => {
+                format!("choice {n} is out of range (1-{count}). Choices: {labels}")
+            }
+            (
+                Self::ChoiceNoMatch {
+                    choice,
+                    truncated,
+                    labels,
+                },
+                Ja,
+            ) => {
+                let note = if *truncated {
+                    "（この画面はラベルが切り詰められているか説明との境目が読めないので、ラベルでは確定できない。番号で指定する）"
+                } else {
+                    ""
+                };
+                format!("「{choice}」に一致する選択肢が無い{note}。選択肢: {labels}")
+            }
+            (
+                Self::ChoiceNoMatch {
+                    choice,
+                    truncated,
+                    labels,
+                },
+                En,
+            ) => {
+                let note = if *truncated {
+                    " (the labels on this screen are truncated or cannot be told apart from \
+                     their descriptions, so a label cannot settle it; pass the number)"
+                } else {
+                    ""
+                };
+                format!("no choice matches \"{choice}\"{note}. Choices: {labels}")
+            }
+            (
+                Self::ChoiceAmbiguous {
+                    choice,
+                    hits,
+                    labels,
+                },
+                Ja,
+            ) => format!(
+                "「{choice}」が複数の選択肢に一致する（{hits}件）。番号で指定する。選択肢: {labels}"
+            ),
+            (
+                Self::ChoiceAmbiguous {
+                    choice,
+                    hits,
+                    labels,
+                },
+                En,
+            ) => format!(
+                "\"{choice}\" matches {hits} choices. Pass the number. Choices: {labels}"
+            ),
+            (
+                Self::DialogBlocksSend {
+                    kind,
+                    options,
+                    pane,
+                },
+                Ja,
+            ) => {
+                let pane_arg = pane.map_or_else(|| "--pane <N>".to_string(), |p| format!("--pane {p}"));
+                format!(
+                    "選択肢ダイアログ（{kind}）が表示中のため送信を中止した。\
+                     入力欄が奪われているので、テキストや Enter はダイアログのキー操作として食われる\
+                     （数字なら選択が確定してしまう）。選択肢: {options}。\
+                     応答は `tako orchestrator respond {pane_arg} --choice <番号|ラベル>`\
+                     （choice を省略すると構造だけ確認できる）"
+                )
+            }
+            (
+                Self::DialogBlocksSend {
+                    kind,
+                    options,
+                    pane,
+                },
+                En,
+            ) => {
+                let pane_arg = pane.map_or_else(|| "--pane <N>".to_string(), |p| format!("--pane {p}"));
+                format!(
+                    "sending was cancelled because a choice dialog ({kind}) is showing. \
+                     The dialog has taken over the input box, so text and Enter would be eaten \
+                     as dialog keys (a digit would confirm a choice). Choices: {options}. \
+                     Answer with `tako orchestrator respond {pane_arg} --choice <number|label>` \
+                     (omit choice to see only the structure)"
+                )
+            }
+            (Self::NotMasterPane { pane, role }, Ja) => format!(
+                "ペイン {pane} は master ではない（role={}）。adopt は master のペインにだけ効く",
+                role.as_deref().unwrap_or("なし")
+            ),
+            (Self::NotMasterPane { pane, role }, En) => format!(
+                "pane {pane} is not a master (role={}). adopt only works on a master pane",
+                role.as_deref().unwrap_or("none")
+            ),
+            (
+                Self::NotProfileOrProject {
+                    name,
+                    profiles,
+                    projects,
+                },
+                Ja,
+            ) => {
+                let list = |names: &[String]| {
+                    if names.is_empty() {
+                        "（なし）".to_string()
+                    } else {
+                        names.join(" / ")
+                    }
+                };
+                format!(
+                    "'{name}' はプロファイルでもプロジェクトでもない。\n\
+                     プロファイル: {}\n\
+                     プロジェクト: {}\n\
+                     プロジェクトを先に登録するには: tako orchestrator projects add --key {name} --cwd <path>",
+                    list(profiles),
+                    list(projects)
+                )
+            }
+            (
+                Self::NotProfileOrProject {
+                    name,
+                    profiles,
+                    projects,
+                },
+                En,
+            ) => {
+                let list = |names: &[String]| {
+                    if names.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        names.join(" / ")
+                    }
+                };
+                format!(
+                    "'{name}' is neither a profile nor a project.\n\
+                     Profiles: {}\n\
+                     Projects: {}\n\
+                     To register the project first: tako orchestrator projects add --key {name} --cwd <path>",
+                    list(profiles),
+                    list(projects)
+                )
+            }
+            (Self::CopyNameMissing, Ja) => "name（複製先）を指定する".to_string(),
+            (Self::CopyNameMissing, En) => {
+                "name (the profile to create) is required".to_string()
+            }
+            (Self::CopyFromMissing, Ja) => "from（複製元）を指定する".to_string(),
+            (Self::CopyFromMissing, En) => "from (the profile to copy) is required".to_string(),
+            (Self::AgentSettingsNeedAgent, Ja) => {
+                "agent_* 系の設定には agent（対象エージェント名）を指定する".to_string()
+            }
+            (Self::AgentSettingsNeedAgent, En) => {
+                "agent_* settings need agent (the agent they apply to)".to_string()
+            }
+            (Self::EnvEntryShape(entry), Ja) => {
+                format!("env の形式が不正（KEY=VALUE が必要）: {entry}")
+            }
+            (Self::EnvEntryShape(entry), En) => {
+                format!("invalid env entry (KEY=VALUE is required): {entry}")
+            }
+            (Self::CwdNotAbsolute(raw), Ja) => format!(
+                "cwd は絶対パスか `~/` から始まる形で指定する（相対パスは起動時に解決できない）: {raw}"
+            ),
+            (Self::CwdNotAbsolute(raw), En) => format!(
+                "pass cwd as an absolute path or one starting with `~/` \
+                 (a relative path cannot be resolved at launch): {raw}"
+            ),
+            (Self::AccountNeedsConfigOrInherit, Ja) => "config_dir か inherit のどちらかを指定する\
+                 （別 config dir なら config_dir、既定の資格情報をそのまま使うなら inherit=true）"
+                .to_string(),
+            (Self::AccountNeedsConfigOrInherit, En) => "pass config_dir or inherit \
+                 (config_dir for a separate config dir, inherit=true to use the default \
+                 credentials as they are)"
+                .to_string(),
+            (Self::AccountNotRegistered(name), Ja) => {
+                format!("アカウント '{name}' は登録されていない")
+            }
+            (Self::AccountNotRegistered(name), En) => format!("account '{name}' is not registered"),
+            (Self::RoleAmbiguous { role, panes }, Ja) => format!(
+                "role '{role}' が複数ペインに存在（pane: {}）。--pane で明示指定してください",
+                join_ids(panes)
+            ),
+            (Self::RoleAmbiguous { role, panes }, En) => format!(
+                "role '{role}' is on more than one pane (pane: {}). Pass --pane explicitly",
+                join_ids(panes)
+            ),
+            (Self::MasterPaneAmbiguous(panes), Ja) => format!(
+                "master/solo ペインが複数（pane: {}）。pid / env / stale map では解決できず、role も曖昧。--pane で明示指定してください",
+                join_ids(panes)
+            ),
+            (Self::MasterPaneAmbiguous(panes), En) => format!(
+                "more than one master/solo pane (pane: {}). pid / env / stale map could not \
+                 settle it and the role is ambiguous too. Pass --pane explicitly",
+                join_ids(panes)
+            ),
+            (Self::ReportUnavailable(pane), Ja) => format!(
+                "pane {pane} の報告を取得できない（backend session 不在または scrollback 空）"
+            ),
+            (Self::ReportUnavailable(pane), En) => format!(
+                "cannot get the report of pane {pane} (no backend session, or the scrollback \
+                 is empty)"
+            ),
+            (Self::ProjectNotAllowed { project, allowed }, Ja) => format!(
+                "プロファイルの projects 制限により、プロジェクト '{project}' への spawn は許可されていない（許可: {}）",
+                allowed.join(", ")
+            ),
+            (Self::ProjectNotAllowed { project, allowed }, En) => format!(
+                "the profile's projects limit does not allow spawning into project \
+                 '{project}' (allowed: {})",
+                allowed.join(", ")
+            ),
+            (Self::ProjectKeyNotFileName(key), Ja) => {
+                format!("プロジェクトキーがファイル名として使えない: {key}")
+            }
+            (Self::ProjectKeyNotFileName(key), En) => {
+                format!("the project key cannot be used as a file name: {key}")
+            }
+            (Self::HomeDirUnknown, Ja) => "ホームディレクトリが取得できない".to_string(),
+            (Self::HomeDirUnknown, En) => "cannot determine the home directory".to_string(),
+            (Self::ActionExactlyOneOf { action, a, b }, Ja) => {
+                format!("{action} は {a} か {b} のどちらか一方を指定する")
+            }
+            (Self::ActionExactlyOneOf { action, a, b }, En) => {
+                format!("{action} needs exactly one of {a} or {b}")
+            }
+            (
+                Self::NoHandoffMaterial {
+                    projects_dir,
+                    memo_path,
+                },
+                Ja,
+            ) => format!(
+                "引き継ぎの材料が無い（プロジェクト単位のファイルも運用メモも空）。\n\
+                 プロジェクト固有の引き継ぎ: {projects_dir}/<project-key>.md\n\
+                 プロジェクトに紐付かない運用メモ: {memo_path}\n\
+                 master は引き継ぎ前に前者へ状態を書き込む必要がある。書式:\n{}",
+                tako_core::handoff::project_handoff_template_in(lang, "<project-key>")
+            ),
+            (
+                Self::NoHandoffMaterial {
+                    projects_dir,
+                    memo_path,
+                },
+                En,
+            ) => format!(
+                "nothing to hand off (both the per-project files and the profile memo are empty).\n\
+                 Per-project handoff: {projects_dir}/<project-key>.md\n\
+                 Profile memo not tied to a project: {memo_path}\n\
+                 The master must write its state into the former before handing off. Format:\n{}",
+                tako_core::handoff::project_handoff_template_in(lang, "<project-key>")
+            ),
+            (Self::SystemPromptDirFailed(error), Ja) => {
+                format!("system prompt の保存先を作れない: {error}")
+            }
+            (Self::SystemPromptDirFailed(error), En) => {
+                format!("cannot create the folder for the system prompt: {error}")
+            }
+            (Self::SystemPromptWriteFailed(error), Ja) => {
+                format!("system prompt の書き出しに失敗: {error}")
+            }
+            (Self::SystemPromptWriteFailed(error), En) => {
+                format!("failed to write the system prompt: {error}")
+            }
+            (Self::WorkerRegistryUnreadable(error), Ja) => {
+                format!("worker レジストリを読めない: {error}")
+            }
+            (Self::WorkerRegistryUnreadable(error), En) => {
+                format!("cannot read the worker registry: {error}")
+            }
+            (Self::UpdateCardSaveFailed(cause), Ja) => {
+                format!("更新通知カードの状態を保存できない: {}", cause.text_in(lang))
+            }
+            (Self::UpdateCardSaveFailed(cause), En) => format!(
+                "cannot save the state of the update card: {}",
+                cause.text_in(lang)
+            ),
+            (Self::WelcomeSaveFailed(cause), Ja) => {
+                format!("ウェルカムバナーの状態を保存できない: {}", cause.text_in(lang))
+            }
+            (Self::WelcomeSaveFailed(cause), En) => format!(
+                "cannot save the state of the welcome banner: {}",
+                cause.text_in(lang)
+            ),
+            (Self::SaveFailed(error), Ja) => format!("保存に失敗: {error}"),
+            (Self::SaveFailed(error), En) => format!("failed to save: {error}"),
+            (Self::Shortcut(e), Ja) => e.message_ja(),
+            (Self::Shortcut(e), En) => e.message_en(),
+            (Self::UrlEmpty, Ja) => "URL が空です".to_string(),
+            (Self::UrlEmpty, En) => "the URL is empty".to_string(),
+            (Self::WebShowNeedsId, Ja) => "id は必須（web list で確認）".to_string(),
+            (Self::WebShowNeedsId, En) => "id is required (see web list)".to_string(),
+            (Self::WebAlreadyDocked(id), Ja) => format!("Web ビュー {id} は既に dock 退避中"),
+            (Self::WebAlreadyDocked(id), En) => format!("web view {id} is already docked"),
+            (Self::WebNavigateNeedsTo, Ja) => "to は必須（back / forward / reload / URL）".to_string(),
+            (Self::WebNavigateNeedsTo, En) => {
+                "to is required (back / forward / reload / URL)".to_string()
+            }
+            (Self::MenuOpenCloseUnavailable, Ja) => {
+                "この環境の menu open / close は使えません（メニューは OS のメニューバーに載るため \
+                 tako が開閉できない）。項目の実行は menu invoke が使えます"
+                    .to_string()
+            }
+            (Self::MenuOpenCloseUnavailable, En) => {
+                "menu open / close is not available here (the menus live in the OS menu bar, \
+                 which tako cannot open or close). Use menu invoke to run an item"
+                    .to_string()
+            }
+            (Self::MenuNameEmpty, Ja) => "メニュー名が空".to_string(),
+            (Self::MenuNameEmpty, En) => "the menu name is empty".to_string(),
+            (Self::MenuNameAmbiguous { query, candidates }, Ja) => {
+                format!("メニュー名 '{query}' が曖昧です: {}", candidates.join(" / "))
+            }
+            (Self::MenuNameAmbiguous { query, candidates }, En) => format!(
+                "the menu name '{query}' is ambiguous: {}",
+                candidates.join(" / ")
+            ),
+            (Self::MenuNotFound { query, candidates }, Ja) => format!(
+                "メニュー '{query}' が見つかりません（候補: {}）",
+                candidates.join(" / ")
+            ),
+            (Self::MenuNotFound { query, candidates }, En) => format!(
+                "there is no menu '{query}' (candidates: {})",
+                candidates.join(" / ")
+            ),
+            (Self::MenuUndefined, Ja) => {
+                "メニュー定義がありません（GUI が起動していない可能性があります）".to_string()
+            }
+            (Self::MenuUndefined, En) => {
+                "there are no menu definitions (the GUI may not be running)".to_string()
+            }
+            (Self::MenuItemPathEmpty, Ja) => "項目のパスが空".to_string(),
+            (Self::MenuItemPathEmpty, En) => "the item path is empty".to_string(),
+            (Self::MenuItemAmbiguous { path, candidates }, Ja) => {
+                format!("項目 '{path}' が曖昧です: {}", candidates.join(" / "))
+            }
+            (Self::MenuItemAmbiguous { path, candidates }, En) => format!(
+                "the item '{path}' is ambiguous: {}",
+                candidates.join(" / ")
+            ),
+            (Self::MenuItemNotFound(path), Ja) => format!(
+                "メニュー項目 '{path}' が見つかりません（`tako menu list` で一覧できます）"
+            ),
+            (Self::MenuItemNotFound(path), En) => format!(
+                "there is no menu item '{path}' (list them with `tako menu list`)"
+            ),
+            (Self::NetworkWithEnabled, Ja) => {
+                "network と enabled は併用できない（全体の設定かペインの設定のどちらか）".to_string()
+            }
+            (Self::NetworkWithEnabled, En) => "network and enabled cannot be combined \
+                 (it is either the global setting or a pane setting)"
+                .to_string(),
+            (Self::AllWithEnabled, Ja) => {
+                "all と enabled は併用できない（一覧か設定のどちらか）".to_string()
+            }
+            (Self::AllWithEnabled, En) => {
+                "all and enabled cannot be combined (it is either the list or a setting)"
+                    .to_string()
+            }
+            (Self::PositivePx(key), Ja) => format!("{key} は正の数（px）を指定する"),
+            (Self::PositivePx(key), En) => format!("{key} must be a positive number (px)"),
+            (Self::OneOfGiven { key, allowed, got }, Ja) => {
+                format!("{key} は {allowed} のどれか（指定: {got}）")
+            }
+            (Self::OneOfGiven { key, allowed, got }, En) => {
+                format!("{key} must be one of {allowed} (given: {got})")
+            }
+            (Self::PaneNeedsCheckText, Ja) => {
+                "pane は判定する文字（check / text）と一緒に渡す".to_string()
+            }
+            (Self::PaneNeedsCheckText, En) => {
+                "pass pane together with the text to check (check / text)".to_string()
+            }
+            (Self::AtLeastOne(key), Ja) => format!("{key} は 1 以上を指定する"),
+            (Self::AtLeastOne(key), En) => format!("{key} must be 1 or more"),
+            (Self::AutoCloseValue(got), Ja) => {
+                format!("auto_close は success / always / never のいずれか（指定: {got:?}）")
+            }
+            (Self::AutoCloseValue(got), En) => {
+                format!("auto_close must be one of success / always / never (given: {got:?})")
+            }
+            (Self::RunConfigPathWithDefaults, Ja) => {
+                "path（実行設定）と ext / command / remove（拡張子既定）は同時に使えない".to_string()
+            }
+            (Self::RunConfigPathWithDefaults, En) => "path (a run configuration) cannot be \
+                 combined with ext / command / remove (extension defaults)"
+                .to_string(),
+            (Self::ReadNeedsPaneOrSession, Ja) => {
+                "read には pane または session_id が必要".to_string()
+            }
+            (Self::ReadNeedsPaneOrSession, En) => "read needs pane or session_id".to_string(),
+            (Self::CwdUnavailable, Ja) => "cwd が取得できない".to_string(),
+            (Self::CwdUnavailable, En) => "cannot get the cwd".to_string(),
+            (Self::CwdMissing(path), Ja) => format!("cwd が存在しない: {path}"),
+            (Self::CwdMissing(path), En) => format!("the cwd does not exist: {path}"),
+            (Self::TmuxResizeShape, Ja) => {
+                "cols と rows の両方を指定するか、reset を使うこと".to_string()
+            }
+            (Self::TmuxResizeShape, En) => "pass both cols and rows, or use reset".to_string(),
+            (Self::NoTmuxSessionOnPane(pane), Ja) => format!(
+                "ペイン {pane} に tmux セッションがない\
+                 （tmux 永続化が無効 / 直接 spawn / 取り込みビューでもない）"
+            ),
+            (Self::NoTmuxSessionOnPane(pane), En) => format!(
+                "pane {pane} has no tmux session (tmux persistence is off / spawned directly / \
+                 not an imported view either)"
+            ),
+            (Self::TmuxSessionNotFound { session, socket }, Ja) => format!(
+                "tmux セッション {session} が見つからない（{}）。\
+                 対象は `tako tmux list` で確認すること",
+                tako_core::tmux::socket_label(socket.as_deref())
+            ),
+            (Self::TmuxSessionNotFound { session, socket }, En) => format!(
+                "tmux session {session} not found ({}). Check the target with `tako tmux list`",
+                match socket {
+                    Some(name) => format!("socket: {name}"),
+                    None => "default server".to_string(),
+                }
+            ),
         }
     }
 
@@ -1571,6 +2302,29 @@ impl Reason {
     /// 中身（データディレクトリを解決できない の印）も枠と同じ表示言語で引けるよう型で持つ（#2365）
     pub fn settings_save_failed(e: &std::io::Error) -> Self {
         Self::SaveSettingsFailed(crate::config_io::IoCause::of(e))
+    }
+
+    /// 選択肢の一覧（`<番号>. <ラベル>` を ` / ` で並べたもの）。切り詰められたラベルには表示言語の
+    /// 印を付ける（#1143）。印の言語は断りの文と同じ表示言語（断りは組んだその場で表示する）
+    fn choice_labels(
+        dialog: &crate::claude_tui::ChoiceDialog,
+        lang: tako_core::i18n::Lang,
+    ) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        dialog
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, o)| {
+                let mark = match (o.label_truncated, lang) {
+                    (false, _) => "",
+                    (true, Ja) => "（切り詰め）",
+                    (true, En) => " (truncated)",
+                };
+                format!("{}. {}{mark}", o.number.unwrap_or((i + 1) as u32), o.label)
+            })
+            .collect::<Vec<_>>()
+            .join(" / ")
     }
 
     /// 応答の文が「ペイン画面に選択肢ダイアログが無い」を言っているか（#2365）。
@@ -6620,7 +7374,7 @@ fn resolve_worker_query(
     use crate::orchestrator::registry::WorkerRegistry;
     if let Some(worker_id) = worker {
         let reg = WorkerRegistry::load()
-            .map_err(|e| DispatchError::Operation(format!("worker レジストリを読めない: {e}")))?;
+            .map_err(|e| Reason::WorkerRegistryUnreadable(e.to_string()).operation())?;
         let (_, entry) = reg
             .resolve(worker_id)
             .map_err(DispatchError::InvalidParams)?;
@@ -6631,9 +7385,7 @@ fn resolve_worker_query(
         });
     }
     let Some(pane_id) = pane_id else {
-        return Err(DispatchError::InvalidParams(
-            "pane_id または worker を指定してください".into(),
-        ));
+        return Err(Reason::EitherOf("pane_id", "worker").invalid());
     };
     // pane_id 指定: 欠けている追跡キーだけをレジストリで補完（明示指定は常に優先）
     if session_id.is_none() || tmux_session.is_none() {
@@ -6802,7 +7554,7 @@ fn finish_workers_list(
     } else {
         registry::WorkerRegistry::load()
     }
-    .map_err(|e| DispatchError::Operation(format!("worker レジストリを読めない: {e}")))?;
+    .map_err(|e| Reason::WorkerRegistryUnreadable(e.to_string()).operation())?;
     Ok(registry::list_payload(
         &reg,
         &live_backends,
@@ -6819,7 +7571,7 @@ fn git_pane_cwd(host: &dyn ControlHost, pane: Option<u64>) -> Result<PathBuf, Di
     host.session(target)
         .and_then(|s| s.cwd())
         .map(Path::to_path_buf)
-        .ok_or(DispatchError::Operation("cwd が取得できない".into()))
+        .ok_or_else(|| Reason::CwdUnavailable.operation())
 }
 
 /// コンフリクト状態の JSON 表現（#496。CLI / MCP / UI で同じ形を使う）
@@ -8289,10 +9041,7 @@ fn dispatch_inner(
             // 設定画面のトグル・CLI `--network on|off`・MCP の `network` がここを通る
             if let Some(val) = network {
                 if enabled.is_some() {
-                    return Err(DispatchError::InvalidParams(
-                        "network と enabled は併用できない（全体の設定かペインの設定のどちらか）"
-                            .into(),
-                    ));
+                    return Err(Reason::NetworkWithEnabled.invalid());
                 }
                 host.set_network_resume(val);
                 crate::diag::persist_log(&format!("[net-resume] enabled={val}"));
@@ -8304,11 +9053,7 @@ fn dispatch_inner(
                     // 一括（#1945）: 退避中を含む全エージェントのペインを揃え、
                     // 以後に立つペインの既定（settings.json）も同じ値にする
                     Some(val) if !legacy => return Ok(limit_resume_bulk(host, val)),
-                    Some(_) => {
-                        return Err(DispatchError::InvalidParams(
-                            "all と enabled は併用できない（一覧か設定のどちらか）".into(),
-                        ))
-                    }
+                    Some(_) => return Err(Reason::AllWithEnabled.invalid()),
                     // 一覧（#813。有効なペインがどれかを 1 回で把握する）
                     None => return Ok(limit_resume_list(host)),
                 }
@@ -8390,16 +9135,12 @@ fn dispatch_inner(
         } => {
             if let Some(w) = width {
                 if !w.is_finite() || w <= 0.0 {
-                    return Err(DispatchError::InvalidParams(
-                        "width は正の数（px）を指定する".into(),
-                    ));
+                    return Err(Reason::PositivePx("width").invalid());
                 }
             }
             if let Some(sw) = sidebar_width {
                 if !sw.is_finite() || sw <= 0.0 {
-                    return Err(DispatchError::InvalidParams(
-                        "sidebar_width は正の数（px）を指定する".into(),
-                    ));
+                    return Err(Reason::PositivePx("sidebar_width").invalid());
                 }
             }
             host.set_panel(visible, width, view);
@@ -8670,17 +9411,17 @@ fn dispatch_inner(
                 .as_deref()
                 .map(|r| {
                     pg::Answer::parse(r).ok_or_else(|| {
-                        DispatchError::InvalidParams(format!(
-                            "respond は {} のどれか（指定: {r}）",
-                            pg::Answer::VALUES.join(" / ")
-                        ))
+                        Reason::OneOfGiven {
+                            key: "respond",
+                            allowed: pg::Answer::VALUES.join(" / "),
+                            got: r.to_string(),
+                        }
+                        .invalid()
                     })
                 })
                 .transpose()?;
             if pane.is_some() && check.is_none() {
-                return Err(DispatchError::InvalidParams(
-                    "pane は判定する文字（check / text）と一緒に渡す".into(),
-                ));
+                return Err(Reason::PaneNeedsCheckText.invalid());
             }
             // #2050: 段・許可リスト・規則は写しの上で全部当ててから 1 回で反映する
             // （途中の綴りの誤りで半端に変わった状態を作らない）
@@ -8691,10 +9432,12 @@ fn dispatch_inner(
                     let mut policy = host.paste_guard_policy_base();
                     if let Some(m) = mode.as_deref() {
                         policy.mode = pg::Mode::parse(m).ok_or_else(|| {
-                            DispatchError::InvalidParams(format!(
-                                "mode は {} のどれか（指定: {m}）",
-                                pg::Mode::VALUES.join(" / ")
-                            ))
+                            Reason::OneOfGiven {
+                                key: "mode",
+                                allowed: pg::Mode::VALUES.join(" / "),
+                                got: m.to_string(),
+                            }
+                            .invalid()
                         })?;
                     }
                     for (name, on) in rules.iter().flatten() {
@@ -9779,7 +10522,7 @@ fn dispatch_inner(
                     let cwd = host
                         .session(target)
                         .and_then(|s| s.cwd())
-                        .ok_or(DispatchError::Operation("cwd が取得できない".into()))?;
+                        .ok_or_else(|| Reason::CwdUnavailable.operation())?;
                     McpScope::Project(cwd.to_path_buf())
                 }
                 _ => McpScope::User,
@@ -10359,14 +11102,12 @@ fn dispatch_inner(
                 "open" => {
                     let url = url.ok_or_else(|| Reason::Required("url".into()).invalid())?;
                     if url.trim().is_empty() {
-                        return Err(DispatchError::InvalidParams("URL が空です".into()));
+                        return Err(Reason::UrlEmpty.invalid());
                     }
                     split_and(host, pane, &|h, new_id| h.web_open(new_id, &url))
                 }
                 "show" => {
-                    let id = id.ok_or(DispatchError::InvalidParams(
-                        "id は必須（web list で確認）".into(),
-                    ))?;
+                    let id = id.ok_or_else(|| Reason::WebShowNeedsId.invalid())?;
                     // 既に表示中なら分割しない。focus 指定時のみフォーカス移動
                     let (_, showing) = host.web_target(Some(id), None).map_err(op_err)?;
                     if let Some(p) = showing {
@@ -10385,9 +11126,7 @@ fn dispatch_inner(
                 "list" => Ok(host.web_list()),
                 "hide" => {
                     let (id, showing) = host.web_target(id, pane).map_err(op_err)?;
-                    let shown = showing.ok_or(DispatchError::Operation(format!(
-                        "Web ビュー {id} は既に dock 退避中"
-                    )))?;
+                    let shown = showing.ok_or_else(|| Reason::WebAlreadyDocked(id).operation())?;
                     close_pane_of(host, shown)?;
                     Ok(json!({ "id": id, "hidden": true }))
                 }
@@ -10399,9 +11138,7 @@ fn dispatch_inner(
                     Ok(json!({ "id": id, "closed": true }))
                 }
                 "navigate" => {
-                    let to = to.ok_or(DispatchError::InvalidParams(
-                        "to は必須（back / forward / reload / URL）".into(),
-                    ))?;
+                    let to = to.ok_or_else(|| Reason::WebNavigateNeedsTo.invalid())?;
                     let (id, _) = host.web_target(id, pane).map_err(op_err)?;
                     host.web_navigate(id, &to).map_err(op_err)
                 }
@@ -10464,9 +11201,10 @@ fn dispatch_inner(
                         let mut settings = crate::settings::load();
                         settings.update_card_dismissed = key;
                         if let Err(e) = crate::settings::save(&settings) {
-                            return Err(DispatchError::Operation(format!(
-                                "更新通知カードの状態を保存できない: {e}"
-                            )));
+                            return Err(Reason::UpdateCardSaveFailed(
+                                crate::config_io::IoCause::of(&e),
+                            )
+                            .operation());
                         }
                     }
                     Ok(host.update_card_status())
@@ -11437,17 +12175,13 @@ fn dispatch_inner(
                 }
                 if let Some(m) = max_mb {
                     if m == 0 {
-                        return Err(DispatchError::InvalidParams(
-                            "max_mb は 1 以上を指定する".into(),
-                        ));
+                        return Err(Reason::AtLeastOne("max_mb").invalid());
                     }
                     settings.pane_log_max_mb = m;
                 }
                 if let Some(t) = total_max_mb {
                     if t == 0 {
-                        return Err(DispatchError::InvalidParams(
-                            "total_max_mb は 1 以上を指定する".into(),
-                        ));
+                        return Err(Reason::AtLeastOne("total_max_mb").invalid());
                     }
                     settings.pane_log_total_max_mb = t;
                 }
@@ -11970,9 +12704,7 @@ fn dispatch_inner(
         } => {
             let ac = auto_close.as_deref().unwrap_or("success");
             if !matches!(ac, "success" | "always" | "never") {
-                return Err(DispatchError::InvalidParams(format!(
-                    "auto_close は success / always / never のいずれか（指定: {ac:?}）"
-                )));
+                return Err(Reason::AutoCloseValue(ac.to_string()).invalid());
             }
 
             let (tab_id, target) = if let Some(tab_raw) = tab {
@@ -12087,9 +12819,7 @@ fn dispatch_inner(
         } => {
             let ac = auto_close.as_deref().unwrap_or("never");
             if !matches!(ac, "success" | "always" | "never") {
-                return Err(DispatchError::InvalidParams(format!(
-                    "auto_close は success / always / never のいずれか（指定: {ac:?}）"
-                )));
+                return Err(Reason::AutoCloseValue(ac.to_string()).invalid());
             }
 
             let (tab_id, target) = if let Some(tab_raw) = tab {
@@ -12180,9 +12910,7 @@ fn dispatch_inner(
             if !cwd.is_dir() {
                 return Err(match layer.cwd {
                     Some(_) => crate::run_configs::saved_cwd_missing(&cwd, &resolved),
-                    None => {
-                        DispatchError::Operation(format!("cwd が存在しない: {}", cwd.display()))
-                    }
+                    None => Reason::CwdMissing(cwd.display().to_string()).operation(),
                 });
             }
 
@@ -12342,10 +13070,7 @@ fn dispatch_inner(
             // #1731: `path` = そのファイル / プロジェクトの実行設定（`ext` = 拡張子既定とは排他）
             if let Some(path) = path {
                 if ext.is_some() || command.is_some() || remove {
-                    return Err(DispatchError::InvalidParams(
-                        "path（実行設定）と ext / command / remove（拡張子既定）は同時に使えない"
-                            .into(),
-                    ));
+                    return Err(Reason::RunConfigPathWithDefaults.invalid());
                 }
                 let file = resolve_run_file(host, &path, pane)?;
                 let head = read_file_head(&file)?;
@@ -12531,9 +13256,10 @@ fn dispatch_inner(
                     let should_save = !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none();
                     if should_save {
                         if let Err(e) = crate::welcome::mark_dismissed() {
-                            return Err(DispatchError::Operation(format!(
-                                "ウェルカムバナーの状態を保存できない: {e}"
-                            )));
+                            return Err(Reason::WelcomeSaveFailed(crate::config_io::IoCause::of(
+                                &e,
+                            ))
+                            .operation());
                         }
                     }
                 }
@@ -12990,9 +13716,7 @@ impl RunConfigSketchJob {
             ));
         };
         if ext.is_some() || command.is_some() || remove {
-            return Err(DispatchError::InvalidParams(
-                "path（実行設定）と ext / command / remove（拡張子既定）は同時に使えない".into(),
-            ));
+            return Err(Reason::RunConfigPathWithDefaults.invalid());
         }
         let head = read_file_head(&self.file)?;
         crate::sketch_board::handle_path(
@@ -13620,9 +14344,7 @@ fn dispatch_logs_read(
             .ok_or_else(|| Reason::PaneLogNotFound(p).operation())?;
         (path, Some(p))
     } else {
-        return Err(DispatchError::InvalidParams(
-            "read には pane または session_id が必要".into(),
-        ));
+        return Err(Reason::ReadNeedsPaneOrSession.invalid());
     };
     let max_lines = lines.unwrap_or(200).clamp(1, 100_000);
     let content =
@@ -14132,11 +14854,11 @@ fn dispatch_orchestrator_adopt(
         .is_some_and(|r| tako_core::handoff::master_profile_of_role(r).is_some())
         || caller_role.is_some_and(|r| tako_core::handoff::master_profile_of_any_role(r).is_some());
     if !is_master {
-        return Err(DispatchError::Operation(format!(
-            "ペイン {} は master ではない（role={}）。adopt は master のペインにだけ効く",
-            pane_id.as_u64(),
-            pane_role.as_deref().unwrap_or("なし")
-        )));
+        return Err(Reason::NotMasterPane {
+            pane: pane_id.as_u64(),
+            role: pane_role.clone(),
+        }
+        .operation());
     }
 
     let (current_name, profile_source) =
@@ -14174,14 +14896,12 @@ fn dispatch_orchestrator_adopt(
             let projects = orchestrator::ProjectsConfig::load()
                 .map(|c| c.projects.keys().cloned().collect::<Vec<_>>())
                 .unwrap_or_default();
-            return Err(DispatchError::Operation(format!(
-                "'{name}' はプロファイルでもプロジェクトでもない。\n\
-                 プロファイル: {}\n\
-                 プロジェクト: {}\n\
-                 プロジェクトを先に登録するには: tako orchestrator projects add --key {name} --cwd <path>",
-                if profiles.is_empty() { "（なし）".into() } else { profiles.join(" / ") },
-                if projects.is_empty() { "（なし）".into() } else { projects.join(" / ") },
-            )));
+            return Err(Reason::NotProfileOrProject {
+                name: name.to_string(),
+                profiles,
+                projects,
+            }
+            .operation());
         }
         let gen = orchestrator::ensure_project_profile(name);
         // #1825: default を継承できずに作っていない = 採用先が無い。
@@ -14602,12 +15322,12 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             Ok(result)
         }
         "copy" => {
-            let name = params.name.ok_or(DispatchError::InvalidParams(
-                "name（複製先）を指定する".into(),
-            ))?;
-            let from = params.from.ok_or(DispatchError::InvalidParams(
-                "from（複製元）を指定する".into(),
-            ))?;
+            let name = params
+                .name
+                .ok_or_else(|| Reason::CopyNameMissing.invalid())?;
+            let from = params
+                .from
+                .ok_or_else(|| Reason::CopyFromMissing.invalid())?;
             let base =
                 orchestrator::load_profile_of(kind, &from).map_err(DispatchError::Operation)?;
             let (path, profile) = orchestrator::create_profile_of(kind, &name, Some(base))
@@ -14654,9 +15374,7 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 || params.agent_skip_permissions.is_some()
                 || params.agent_args.is_some();
             if has_agent_edit && params.agent.is_none() {
-                return Err(DispatchError::InvalidParams(
-                    "agent_* 系の設定には agent（対象エージェント名）を指定する".into(),
-                ));
+                return Err(Reason::AgentSettingsNeedAgent.invalid());
             }
             // エージェント名は設定時点で検証する（spawn / master 起動時の不意のエラーを防ぐ）
             if let Some(a) = params.worker_agent.as_deref() {
@@ -14675,9 +15393,12 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 Some("delegate") => Some(orchestrator::WorkerModelPolicy::Delegate),
                 Some("fixed") => Some(orchestrator::WorkerModelPolicy::Fixed),
                 Some(p) => {
-                    return Err(DispatchError::InvalidParams(format!(
-                        "worker_model_policy が不正: '{p}'（inherit / delegate / fixed）"
-                    )));
+                    return Err(Reason::InvalidValue {
+                        key: "worker_model_policy",
+                        got: format!("'{p}'"),
+                        allowed: "inherit / delegate / fixed".into(),
+                    }
+                    .invalid());
                 }
                 None => None,
             };
@@ -14687,9 +15408,7 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 for entry in env_set {
                     match entry.split_once('=') {
                         None => {
-                            return Err(DispatchError::InvalidParams(format!(
-                                "env の形式が不正（KEY=VALUE が必要）: {entry}"
-                            )));
+                            return Err(Reason::EnvEntryShape(entry.clone()).invalid());
                         }
                         Some((k, _)) => {
                             // 一時的に Profile で内部変数チェック
@@ -14716,9 +15435,7 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             // 起動だけ落ちるという一番たちの悪い形になる）
             if let Some(raw) = params.cwd.as_deref().filter(|c| !c.is_empty()) {
                 if !raw.starts_with("~/") && !Path::new(raw).is_absolute() {
-                    return Err(DispatchError::InvalidParams(format!(
-                        "cwd は絶対パスか `~/` から始まる形で指定する（相対パスは起動時に解決できない）: {raw}"
-                    )));
+                    return Err(Reason::CwdNotAbsolute(raw.to_string()).invalid());
                 }
                 let probe = orchestrator::Profile {
                     cwd: Some(raw.to_string()),
@@ -15895,13 +16612,7 @@ pub fn dispatch_orchestrator_accounts(
             let inherit = inherit.unwrap_or(false);
             // config_dir / inherit の排他は登録時に弾く（壊れたエントリを作らせない。#512）
             match (inherit, config_dir) {
-                (false, None) => {
-                    return Err(DispatchError::InvalidParams(
-                        "config_dir か inherit のどちらかを指定する\
-                         （別 config dir なら config_dir、既定の資格情報をそのまま使うなら inherit=true）"
-                            .into(),
-                    ))
-                }
+                (false, None) => return Err(Reason::AccountNeedsConfigOrInherit.invalid()),
                 (true, Some(_)) => {
                     return Err(Reason::CannotCombine("config_dir", "inherit=true").invalid())
                 }
@@ -15950,9 +16661,7 @@ pub fn dispatch_orchestrator_accounts(
             if removed {
                 Ok(json!({ "removed": name }))
             } else {
-                Err(DispatchError::Operation(format!(
-                    "アカウント '{name}' は登録されていない"
-                )))
+                Err(Reason::AccountNotRegistered(name.to_string()).operation())
             }
         }
         other => Err(Reason::InvalidValue {
@@ -16379,11 +17088,11 @@ fn find_master_pane_strict(
         return Ok(exact[0]);
     }
     if exact.len() > 1 {
-        let ids: Vec<String> = exact.iter().map(|(_, p)| p.as_u64().to_string()).collect();
-        return Err(DispatchError::Operation(format!(
-            "role '{target_role}' が複数ペインに存在（pane: {}）。--pane で明示指定してください",
-            ids.join(", ")
-        )));
+        return Err(Reason::RoleAmbiguous {
+            role: target_role.to_string(),
+            panes: exact.iter().map(|(_, p)| p.as_u64()).collect(),
+        }
+        .operation());
     }
     let mut fb: Vec<(TabId, PaneId)> = Vec::new();
     for t in ws.tabs() {
@@ -16396,13 +17105,9 @@ fn find_master_pane_strict(
     match fb.len() {
         0 => Err(Reason::MasterPaneNotFound.operation()),
         1 => Ok(fb[0]),
-        _ => {
-            let ids: Vec<String> = fb.iter().map(|(_, p)| p.as_u64().to_string()).collect();
-            Err(DispatchError::Operation(format!(
-                "master/solo ペインが複数（pane: {}）。pid / env / stale map では解決できず、role も曖昧。--pane で明示指定してください",
-                ids.join(", ")
-            )))
-        }
+        _ => Err(
+            Reason::MasterPaneAmbiguous(fb.iter().map(|(_, p)| p.as_u64()).collect()).operation(),
+        ),
     }
 }
 
@@ -16631,9 +17336,7 @@ fn finish_orchestrator_report(
             result["text"] = json!(sb);
         }
         (None, None) => {
-            return Err(DispatchError::Operation(format!(
-                "pane {pane_id} の報告を取得できない（backend session 不在または scrollback 空）"
-            )));
+            return Err(Reason::ReportUnavailable(pane_id).operation());
         }
     }
 
@@ -16701,11 +17404,8 @@ pub fn dispatch_orchestrator_handoff_files(
         }
         "show" => match (project, profile) {
             (Some(key), None) => {
-                let path = store::project_handoff_path(key).ok_or_else(|| {
-                    DispatchError::InvalidParams(format!(
-                        "プロジェクトキーがファイル名として使えない: {key}"
-                    ))
-                })?;
+                let path = store::project_handoff_path(key)
+                    .ok_or_else(|| Reason::ProjectKeyNotFileName(key.to_string()).invalid())?;
                 let body = store::read_project_handoff(key);
                 let doc = body.as_deref().map(ho::split_handoff);
                 Ok(json!({
@@ -16720,7 +17420,7 @@ pub fn dispatch_orchestrator_handoff_files(
             }
             (None, Some(name)) => {
                 let path = crate::orchestrator::handoff_path(name)
-                    .ok_or_else(|| op_err("ホームディレクトリが取得できない"))?;
+                    .ok_or_else(|| Reason::HomeDirUnknown.operation())?;
                 let body = crate::orchestrator::read_handoff(name);
                 let doc = body.as_deref().map(ho::split_handoff);
                 Ok(json!({
@@ -16733,13 +17433,20 @@ pub fn dispatch_orchestrator_handoff_files(
                     "warning": body.as_deref().and_then(|b| ho::profile_memo_warning(name, b)),
                 }))
             }
-            _ => Err(DispatchError::InvalidParams(
-                "show は project か profile のどちらか一方を指定する".into(),
-            )),
+            _ => Err(Reason::ActionExactlyOneOf {
+                action: "show",
+                a: "project",
+                b: "profile",
+            }
+            .invalid()),
         },
         "write" => {
             let body = content.ok_or_else(|| {
-                DispatchError::InvalidParams("write は content を指定する".into())
+                Reason::ActionMustGive {
+                    action: "write",
+                    key: "content",
+                }
+                .invalid()
             })?;
             let text = if body.ends_with('\n') {
                 body.to_string()
@@ -16767,9 +17474,12 @@ pub fn dispatch_orchestrator_handoff_files(
                         "warning": ho::profile_memo_warning(name, &text),
                     }))
                 }
-                _ => Err(DispatchError::InvalidParams(
-                    "write は project か profile のどちらか一方を指定する".into(),
-                )),
+                _ => Err(Reason::ActionExactlyOneOf {
+                    action: "write",
+                    a: "project",
+                    b: "profile",
+                }
+                .invalid()),
             }
         }
         // #916 の段 2 を手でも撃てるようにしたもの（通常は自動で走る）
@@ -16961,13 +17671,11 @@ fn dispatch_orchestrator_handoff(
             .unwrap_or_else(|| "<unknown>".to_string());
         // #792 / #915: 書けと言うだけでなく**どこへどう書くか**まで返す。
         // これを最初に読むのは AI なので、ここが書式を知る唯一の機会になりうる
-        let template = tako_core::handoff::project_handoff_template("<project-key>");
-        return Err(DispatchError::Operation(format!(
-            "引き継ぎの材料が無い（プロジェクト単位のファイルも運用メモも空）。\n\
-             プロジェクト固有の引き継ぎ: {projects_dir}/<project-key>.md\n\
-             プロジェクトに紐付かない運用メモ: {memo_path}\n\
-             master は引き継ぎ前に前者へ状態を書き込む必要がある。書式:\n{template}"
-        )));
+        return Err(Reason::NoHandoffMaterial {
+            projects_dir,
+            memo_path,
+        }
+        .operation());
     }
     // env 検証（内部変数の上書き拒否。Issue #500）
     profile.validate_env().map_err(DispatchError::Operation)?;
@@ -16998,14 +17706,14 @@ fn dispatch_orchestrator_handoff(
         load_warning.as_deref(),
     );
     let prompt_path = orchestrator::config_dir()
-        .ok_or_else(|| op_err("ホームディレクトリが取得できない"))?
+        .ok_or_else(|| Reason::HomeDirUnknown.operation())?
         .join(format!("_system_prompt_{profile_name}.md"));
     if let Some(parent) = prompt_path.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| op_err(format!("system prompt の保存先を作れない: {e}")))?;
+            .map_err(|e| Reason::SystemPromptDirFailed(e.to_string()).operation())?;
     }
     std::fs::write(&prompt_path, &prompt_content)
-        .map_err(|e| op_err(format!("system prompt の書き出しに失敗: {e}")))?;
+        .map_err(|e| Reason::SystemPromptWriteFailed(e.to_string()).operation())?;
     let tako_bin = tako_binary();
     // ペインを分割する**前**に組み立てる（失敗したときに空ペインだけ残さない）
     let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)
@@ -17701,9 +18409,7 @@ fn dispatch_orchestrator_spawn(
         limit_resume,
     } = params;
     if pane.is_none() && tab.is_none() {
-        return Err(DispatchError::Operation(
-            "pane または tab を指定してください".into(),
-        ));
+        return Err(Reason::EitherOf("pane", "tab").operation());
     }
 
     use crate::orchestrator;
@@ -17736,10 +18442,11 @@ fn dispatch_orchestrator_spawn(
     // 範囲外のプロジェクトへの spawn を拒否する
     if let Some(ref allowed) = profile.projects {
         if !allowed.iter().any(|p| p == project) {
-            return Err(DispatchError::Operation(format!(
-                "プロファイルの projects 制限により、プロジェクト '{project}' への spawn は許可されていない（許可: {}）",
-                allowed.join(", ")
-            )));
+            return Err(Reason::ProjectNotAllowed {
+                project: project.to_string(),
+                allowed: allowed.clone(),
+            }
+            .operation());
         }
     }
 
@@ -19600,7 +20307,7 @@ pub fn respond_via(
     let capture = || -> Result<Vec<String>, DispatchError> {
         access
             .capture()
-            .map_err(|e| DispatchError::Operation(format!("画面の取得に失敗: {e}")))
+            .map_err(|e| Reason::ScreenCaptureFailed(e.to_string()).operation())
     };
     let lines = capture()?;
     let dialog = crate::claude_tui::detect_choice_dialog(&lines)
@@ -19611,21 +20318,13 @@ pub fn respond_via(
         let mut result = dialog.to_json();
         result["pane_id"] = json!(pane_id);
         result["responded"] = json!(false);
-        result["hint"] = json!(if dialog.labels_truncated() {
-            // #1143 / #2302: 画面上のラベルが `…` で打ち切られている、または説明との
-            // 境目が読めない = 一致で選べない
-            format!(
-                "応答するには choice に番号（1-{}）を渡す\
-                 （この画面はラベルが切り詰められているか説明との境目が読めないので\
-                 ラベル指定は受け付けない）",
-                dialog.options.len()
-            )
-        } else {
-            format!(
-                "応答するには choice に番号（1-{}）かラベルの一部を渡す",
-                dialog.options.len()
-            )
-        });
+        // #1143 / #2302: 画面上のラベルが `…` で打ち切られている、または説明との
+        // 境目が読めない = 一致で選べない
+        result["hint"] = json!(Reason::RespondHint {
+            count: dialog.options.len(),
+            truncated: dialog.labels_truncated(),
+        }
+        .to_string());
         return Ok(result);
     };
 
@@ -19635,9 +20334,13 @@ pub fn respond_via(
     // --- キー送出（種別ではなく「番号つきか」で分岐する） ---
     let mut keys_sent: Vec<String> = Vec::new();
     let send = |key: &str| -> Result<(), DispatchError> {
-        access
-            .send_key(key)
-            .map_err(|e| DispatchError::Operation(format!("キー {key} の送信に失敗: {e}")))
+        access.send_key(key).map_err(|e| {
+            Reason::KeySendFailed {
+                key: key.to_string(),
+                error: e.to_string(),
+            }
+            .operation()
+        })
     };
     if dialog.numbered {
         let number = chosen.number.unwrap_or((index + 1) as u32).to_string();
@@ -19664,10 +20367,7 @@ pub fn respond_via(
             match tako_core::dialog::confirm_step(count, current, index) {
                 tako_core::dialog::ConfirmStep::Confirm => break,
                 tako_core::dialog::ConfirmStep::Blocked(block) => {
-                    return Err(DispatchError::Operation(format!(
-                        "番号なしダイアログで{}（手動で応答してください）",
-                        block.note()
-                    )));
+                    return Err(Reason::UnnumberedDialogBlocked(block).operation());
                 }
                 tako_core::dialog::ConfirmStep::Move { key, steps } => {
                     for _ in 0..steps {
@@ -19678,11 +20378,8 @@ pub fn respond_via(
                 }
             }
             // 移動後の実画面から現在位置を読み直す（キーを飲まれた場合の再試行）
-            let after = crate::claude_tui::detect_choice_dialog(&capture()?).ok_or_else(|| {
-                DispatchError::Operation(
-                    "カーソル移動中にダイアログが消えた（応答は送っていません）".to_string(),
-                )
-            })?;
+            let after = crate::claude_tui::detect_choice_dialog(&capture()?)
+                .ok_or_else(|| Reason::DialogVanishedWhileMoving.operation())?;
             count = after.options.len();
             current = after.highlighted;
             if current
@@ -19698,10 +20395,7 @@ pub fn respond_via(
             .and_then(|d| d.highlighted.and_then(|i| d.options.get(i).cloned()))
             .is_some_and(|o| o.label == chosen.label);
         if !landed {
-            return Err(DispatchError::Operation(format!(
-                "選択肢「{}」へカーソルを移動できなかったため応答を中止した（Enter は送っていません）",
-                chosen.label
-            )));
+            return Err(Reason::CursorNotLanded(chosen.label.clone()).operation());
         }
         send("Enter")?;
         keys_sent.push("Enter".to_string());
@@ -19768,42 +20462,24 @@ fn resolve_choice_index(
     dialog: &crate::claude_tui::ChoiceDialog,
     choice: &str,
 ) -> Result<usize, DispatchError> {
-    let labels = || {
-        dialog
-            .options
-            .iter()
-            .enumerate()
-            .map(|(i, o)| {
-                let mark = if o.label_truncated {
-                    "（切り詰め）"
-                } else {
-                    ""
-                };
-                format!("{}. {}{mark}", o.number.unwrap_or((i + 1) as u32), o.label)
-            })
-            .collect::<Vec<_>>()
-            .join(" / ")
-    };
+    // 断りは組んだその場で表示する（`operation()`）ので、一覧の印も同じ表示言語で組む
+    let labels = || Reason::choice_labels(dialog, tako_core::i18n::lang());
     // ラベル一致で当たった選択肢が切り詰められていたら確定しない（#1143）
     let by_label = |i: usize| -> Result<usize, DispatchError> {
         if dialog.options[i].label_truncated {
-            return Err(DispatchError::Operation(format!(
-                "選択肢 {} のラベルは画面上で切り詰められているか説明との境目が読めない（`{}`）ため、\
-                 ラベル指定では確定できない。番号（--choice {}）で指定する。選択肢: {}",
-                i + 1,
-                dialog.options[i].label,
-                dialog.options[i].number.unwrap_or((i + 1) as u32),
-                labels()
-            )));
+            return Err(Reason::ChoiceLabelTruncated {
+                position: i + 1,
+                label: dialog.options[i].label.clone(),
+                number: dialog.options[i].number.unwrap_or((i + 1) as u32),
+                labels: labels(),
+            }
+            .operation());
         }
         Ok(i)
     };
     let lower = choice.trim().to_lowercase();
     if lower.is_empty() {
-        return Err(DispatchError::Operation(format!(
-            "choice が空。選択肢: {}",
-            labels()
-        )));
+        return Err(Reason::ChoiceEmpty(labels()).operation());
     }
     // 1. 番号
     if let Ok(n) = lower.parse::<u32>() {
@@ -19814,11 +20490,12 @@ fn resolve_choice_index(
             .checked_sub(1)
             .filter(|i| *i < dialog.options.len());
         return i.ok_or_else(|| {
-            DispatchError::Operation(format!(
-                "choice {n} は範囲外（1-{}）。選択肢: {}",
-                dialog.options.len(),
-                labels()
-            ))
+            Reason::ChoiceOutOfRange {
+                n,
+                count: dialog.options.len(),
+                labels: labels(),
+            }
+            .operation()
         });
     }
     // 2. yes / no エイリアス（#319 の互換。permission ダイアログの実文言に合わせる）
@@ -19851,24 +20528,22 @@ fn resolve_choice_index(
         .filter(|(_, o)| o.label.to_lowercase().contains(&lower))
         .map(|(i, _)| i)
         .collect();
-    // 切り詰められたラベルがある画面では「一致しなかった」も確定的ではない
-    // （消えた部分に一致していたかもしれない）ので、番号を促す（#1143）
-    let truncated_note = if dialog.labels_truncated() {
-        "（この画面はラベルが切り詰められているか説明との境目が読めないので、ラベルでは確定できない。番号で指定する）"
-    } else {
-        ""
-    };
     match hits.len() {
         1 => by_label(hits[0]),
-        0 => Err(DispatchError::Operation(format!(
-            "「{choice}」に一致する選択肢が無い{truncated_note}。選択肢: {}",
-            labels()
-        ))),
-        _ => Err(DispatchError::Operation(format!(
-            "「{choice}」が複数の選択肢に一致する（{}件）。番号で指定する。選択肢: {}",
-            hits.len(),
-            labels()
-        ))),
+        // 切り詰められたラベルがある画面では「一致しなかった」も確定的ではない
+        // （消えた部分に一致していたかもしれない）ので、番号を促す（#1143）
+        0 => Err(Reason::ChoiceNoMatch {
+            choice: choice.to_string(),
+            truncated: dialog.labels_truncated(),
+            labels: labels(),
+        }
+        .operation()),
+        _ => Err(Reason::ChoiceAmbiguous {
+            choice: choice.to_string(),
+            hits: hits.len(),
+            labels: labels(),
+        }
+        .operation()),
     }
 }
 
@@ -19894,7 +20569,7 @@ fn dialog_blocks_send(
     }
     let (pane_id, lines) = send_target_screen(host, pane, tmux_session)?;
     let dialog = crate::claude_tui::detect_choice_dialog(&lines)?;
-    dialog_send_refusal(&dialog, pane_id).map(DispatchError::Operation)
+    dialog_send_refusal(&dialog, pane_id).map(Reason::operation)
 }
 
 /// 送信拒否の文面（純関数。`None` = 送信して良い）。
@@ -19902,7 +20577,7 @@ fn dialog_blocks_send(
 fn dialog_send_refusal(
     dialog: &crate::claude_tui::ChoiceDialog,
     pane_id: Option<u64>,
-) -> Option<String> {
+) -> Option<Reason> {
     if dialog.kind.auto_accepted() {
         return None;
     }
@@ -19913,17 +20588,11 @@ fn dialog_send_refusal(
         .map(|(i, o)| format!("{}. {}", o.number.unwrap_or((i + 1) as u32), o.label))
         .collect::<Vec<_>>()
         .join(" / ");
-    let pane_arg = pane_id
-        .map(|p| format!("--pane {p}"))
-        .unwrap_or_else(|| "--pane <N>".to_string());
-    Some(format!(
-        "選択肢ダイアログ（{}）が表示中のため送信を中止した。\
-         入力欄が奪われているので、テキストや Enter はダイアログのキー操作として食われる\
-         （数字なら選択が確定してしまう）。選択肢: {options}。\
-         応答は `tako orchestrator respond {pane_arg} --choice <番号|ラベル>`\
-         （choice を省略すると構造だけ確認できる）",
-        dialog.kind.as_str()
-    ))
+    Some(Reason::DialogBlocksSend {
+        kind: dialog.kind.as_str(),
+        options,
+        pane: pane_id,
+    })
 }
 
 /// `Send` の対象ペインの画面を採る（in-process セッション優先、無ければ detached 経由）
@@ -21910,9 +22579,9 @@ pub fn dispatch_remote_shortcuts(
             let mut file = crate::data_files::load_remote_shortcuts();
             let added = file
                 .add(std::path::Path::new(target), name, now)
-                .map_err(|e| DispatchError::Operation(e.message_ja()))?;
+                .map_err(|e| Reason::Shortcut(e).operation())?;
             file.save()
-                .map_err(|e| DispatchError::Operation(format!("保存に失敗: {e}")))?;
+                .map_err(|e| Reason::SaveFailed(e.to_string()).operation())?;
             let mut out = listing(&file);
             out["added"] = added.to_json();
             Ok(out)
@@ -21922,9 +22591,9 @@ pub fn dispatch_remote_shortcuts(
             let mut file = crate::data_files::load_remote_shortcuts();
             let removed = file
                 .remove(key, home.as_deref())
-                .map_err(|e| DispatchError::Operation(e.message_ja()))?;
+                .map_err(|e| Reason::Shortcut(e).operation())?;
             file.save()
-                .map_err(|e| DispatchError::Operation(format!("保存に失敗: {e}")))?;
+                .map_err(|e| Reason::SaveFailed(e.to_string()).operation())?;
             let mut out = listing(&file);
             out["removed"] = json!(removed.id);
             Ok(out)
@@ -22228,11 +22897,7 @@ fn require_in_window_menu(
     if snapshot.in_window {
         return Ok(());
     }
-    Err(DispatchError::Operation(
-        "この環境の menu open / close は使えません（メニューは OS のメニューバーに載るため \
-         tako が開閉できない）。項目の実行は menu invoke が使えます"
-            .into(),
-    ))
+    Err(Reason::MenuOpenCloseUnavailable.operation())
 }
 
 /// メニュー名を添字へ解決する（完全一致 → 前方一致 → 部分一致。大小文字は無視）。
@@ -22244,7 +22909,7 @@ fn resolve_menu_index(
 ) -> Result<usize, DispatchError> {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
-        return Err(DispatchError::InvalidParams("メニュー名が空".into()));
+        return Err(Reason::MenuNameEmpty.invalid());
     }
     // 添字での直接指定も許す（`menu open 0`）
     if let Ok(index) = q.parse::<usize>() {
@@ -22272,22 +22937,22 @@ fn resolve_menu_index(
             0 => continue,
             1 => return Ok(hits[0]),
             _ => {
-                let candidates: Vec<&str> = hits
-                    .iter()
-                    .map(|i| snapshot.menus[*i].name.as_str())
-                    .collect();
-                return Err(DispatchError::InvalidParams(format!(
-                    "メニュー名 '{query}' が曖昧です: {}",
-                    candidates.join(" / ")
-                )));
+                return Err(Reason::MenuNameAmbiguous {
+                    query: query.to_string(),
+                    candidates: hits
+                        .iter()
+                        .map(|i| snapshot.menus[*i].name.clone())
+                        .collect(),
+                }
+                .invalid());
             }
         }
     }
-    let all: Vec<&str> = snapshot.menus.iter().map(|m| m.name.as_str()).collect();
-    Err(DispatchError::InvalidParams(format!(
-        "メニュー '{query}' が見つかりません（候補: {}）",
-        all.join(" / ")
-    )))
+    Err(Reason::MenuNotFound {
+        query: query.to_string(),
+        candidates: snapshot.menus.iter().map(|m| m.name.clone()).collect(),
+    }
+    .invalid())
 }
 
 /// `resolve_menu_item` の戻り
@@ -22316,9 +22981,7 @@ pub fn resolve_menu_item(
     use crate::protocol::MenuItemSnapshot as I;
 
     if snapshot.menus.is_empty() {
-        return Err(DispatchError::Operation(
-            "メニュー定義がありません（GUI が起動していない可能性があります）".into(),
-        ));
+        return Err(Reason::MenuUndefined.operation());
     }
     let segments: Vec<&str> = path
         .split('/')
@@ -22326,7 +22989,7 @@ pub fn resolve_menu_item(
         .filter(|s| !s.is_empty())
         .collect();
     if segments.is_empty() {
-        return Err(DispatchError::InvalidParams("項目のパスが空".into()));
+        return Err(Reason::MenuItemPathEmpty.invalid());
     }
 
     // 「メニュー名を省略した項目名だけ」の指定を全メニュー横断で拾う。
@@ -22403,18 +23066,15 @@ pub fn resolve_menu_item(
                 });
             }
             _ => {
-                let candidates: Vec<&str> =
-                    hits.iter().map(|i| flat[*i].0.as_str()).take(8).collect();
-                return Err(DispatchError::InvalidParams(format!(
-                    "項目 '{path}' が曖昧です: {}",
-                    candidates.join(" / ")
-                )));
+                return Err(Reason::MenuItemAmbiguous {
+                    path: path.to_string(),
+                    candidates: hits.iter().map(|i| flat[*i].0.clone()).take(8).collect(),
+                }
+                .invalid());
             }
         }
     }
-    Err(DispatchError::InvalidParams(format!(
-        "メニュー項目 '{path}' が見つかりません（`tako menu list` で一覧できます）"
-    )))
+    Err(Reason::MenuItemNotFound(path.to_string()).invalid())
 }
 
 fn tree_mut(ws: &mut Workspace, tab: TabId) -> &mut tako_core::PaneTree {
@@ -23523,9 +24183,7 @@ fn tmux_resize_reply(
         );
     }
     let (Some(cols), Some(rows)) = (cols, rows) else {
-        return Err(DispatchError::InvalidParams(
-            "cols と rows の両方を指定するか、reset を使うこと".into(),
-        ));
+        return Err(Reason::TmuxResizeShape.invalid());
     };
     tako_core::tmux::resize_window(socket.as_deref(), session, window, cols, rows).map_err(
         |e| {
@@ -23559,12 +24217,7 @@ fn tmux_select_window_target(
         host.tmux_view(target).as_ref(),
         host.backend_session(target).as_deref(),
     )
-    .ok_or_else(|| {
-        DispatchError::Operation(format!(
-            "ペイン {target} に tmux セッションがない\
-             （tmux 永続化が無効 / 直接 spawn / 取り込みビューでもない）"
-        ))
-    })?;
+    .ok_or_else(|| Reason::NoTmuxSessionOnPane(target.as_u64()).operation())?;
     Ok((target, resolved))
 }
 
@@ -23662,10 +24315,12 @@ fn send_paste_gate(
     let relay = relay
         .map(|r| {
             pg::Relay::parse(r).ok_or_else(|| {
-                DispatchError::InvalidParams(format!(
-                    "paste_guard は {} のどれか（指定: {r}）",
-                    pg::Relay::VALUES.join(" / ")
-                ))
+                Reason::OneOfGiven {
+                    key: "paste_guard",
+                    allowed: pg::Relay::VALUES.join(" / "),
+                    got: r.to_string(),
+                }
+                .invalid()
             })
         })
         .transpose()?;
@@ -24154,11 +24809,11 @@ fn compute_tmux_open_lookup(
     // CLI / MCP からのタイポで空ペインだけが生えるのを防ぐ）。
     // socket 省略時は上の解決が存在を証明しているので、明示指定のときだけ確認する
     if socket_arg.is_some() && !tako_core::tmux::has_session(socket.as_deref(), session) {
-        return Err(format!(
-            "tmux セッション {session} が見つからない（{}）。\
-             対象は `tako tmux list` で確認すること",
-            tako_core::tmux::socket_label(socket.as_deref())
-        ));
+        return Err(Reason::TmuxSessionNotFound {
+            session: session.to_string(),
+            socket: socket.clone(),
+        }
+        .to_string());
     }
     // 元セッションの解決（無限ネスト防止）。tmux はグループ名を「最初に作られた元セッション名」に
     // するため、`tako-view-*` ラッパーや grouped session を開こうとしても group を辿れば元へ戻る
@@ -41058,13 +41713,19 @@ mod tests {
         assert_eq!(resolve_choice_index(&dialog, "no").unwrap(), 2);
         // ラベルの部分一致（大小無視）
         assert_eq!(resolve_choice_index(&dialog, "don't ask again").unwrap(), 1);
-        // 範囲外・不一致はエラー（選択肢一覧を添える）
+        // 範囲外・不一致はエラー（選択肢一覧を添える）。断りは表示言語に従う（#2365）ので日英どちらでも見る
         let err = resolve_choice_index(&dialog, "9").unwrap_err().to_string();
-        assert!(err.contains("範囲外") && err.contains("1. Yes"), "{err}");
+        assert!(
+            (err.contains("範囲外") || err.contains("out of range")) && err.contains("1. Yes"),
+            "{err}"
+        );
         let err = resolve_choice_index(&dialog, "存在しない")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("一致する選択肢が無い"), "{err}");
+        assert!(
+            err.contains("一致する選択肢が無い") || err.contains("no choice matches"),
+            "{err}"
+        );
     }
 
     /// claude 2.x の信頼ダイアログ（**番号なし・選択肢 2 つ**の実採取。#1223）
@@ -41092,7 +41753,10 @@ mod tests {
         // エイリアス（`no` は `No,` 始まりに当たる = 既定の `No, exit`）
         assert_eq!(resolve_choice_index(&dialog, "no").unwrap(), 0);
         let err = resolve_choice_index(&dialog, "3").unwrap_err().to_string();
-        assert!(err.contains("範囲外"), "{err}");
+        assert!(
+            err.contains("範囲外") || err.contains("out of range"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -41104,7 +41768,10 @@ mod tests {
         let err = resolve_choice_index(&dialog, "opus")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("複数の選択肢に一致"), "{err}");
+        assert!(
+            err.contains("複数の選択肢に一致") || err.contains("\"opus\" matches 2 choices"),
+            "{err}"
+        );
     }
 
     /// #1143 実採取（claude 2.1.258 / 25 桁 × 40 行）。カーソルもキー案内も画面外で、
@@ -41158,7 +41825,10 @@ mod tests {
         assert_eq!(resolve_choice_index(&dialog, "2").unwrap(), 1);
         // 画面に出ていない番号は範囲外（見えていない選択肢を勝手に押さない）
         let err = resolve_choice_index(&dialog, "4").unwrap_err().to_string();
-        assert!(err.contains("範囲外"), "{err}");
+        assert!(
+            err.contains("範囲外") || err.contains("out of range"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -41170,8 +41840,9 @@ mod tests {
         let err = resolve_choice_index(&dialog, "defaul")
             .unwrap_err()
             .to_string();
+        // 断りは表示言語に従う（#2365）ので日英どちらでも見る
         assert!(
-            err.contains("切り詰め") && err.contains("--choice 1"),
+            (err.contains("切り詰め") || err.contains("truncated")) && err.contains("--choice 1"),
             "{err}"
         );
         // 不一致のときも「番号で指定する」と案内する（消えた部分に一致していたかも
@@ -41179,9 +41850,15 @@ mod tests {
         let err = resolve_choice_index(&dialog, "recommended")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("番号で指定する"), "{err}");
+        assert!(
+            err.contains("番号で指定する") || err.contains("pass the number"),
+            "{err}"
+        );
         // 一覧の表示にも切り詰めが出る（master がラベルを信用しないための手がかり）
-        assert!(err.contains("1. Defaul…（切り詰め）"), "{err}");
+        assert!(
+            err.contains("1. Defaul…（切り詰め）") || err.contains("1. Defaul… (truncated)"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -41272,7 +41949,9 @@ mod tests {
     #[test]
     fn issue748_ダイアログ中のsendは選択肢つきで断る() {
         // #748 の観測 1 / 4: テキストや Enter はダイアログのキー操作として食われる
-        let refusal = dialog_send_refusal(&dialog_of(LIMIT_DIALOG_748), Some(5)).expect("断る");
+        let refusal = dialog_send_refusal(&dialog_of(LIMIT_DIALOG_748), Some(5))
+            .expect("断る")
+            .to_string();
         assert!(refusal.contains("usage_limit"), "{refusal}");
         assert!(
             refusal.contains("1. Stop and wait for limit to reset"),
@@ -41622,7 +42301,8 @@ mod tests {
         let err = t1453_adopt(&mut host, pane, "_tako_1453_unknown_").unwrap_err();
         let msg = format!("{err:?}");
         assert!(
-            msg.contains("プロファイルでもプロジェクトでもない"),
+            msg.contains("プロファイルでもプロジェクトでもない")
+                || msg.contains("neither a profile nor a project"),
             "{msg}"
         );
         assert!(msg.contains("projects add"), "登録の手を案内しない: {msg}");
@@ -41702,6 +42382,7 @@ mod tests {
         let err = res.expect_err("legacy で採用が通った");
         assert!(
             format!("{err:?}").contains("プロファイルでもプロジェクトでもない")
+                || format!("{err:?}").contains("neither a profile nor a project")
                 || format!("{err:?}").contains("見つからない"),
             "{err:?}"
         );
@@ -42129,7 +42810,10 @@ mod tests {
         );
         assert!(result.is_err(), "引き継ぎの材料が無ければエラー");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("引き継ぎの材料が無い"), "{err}");
+        assert!(
+            err.contains("引き継ぎの材料が無い") || err.contains("nothing to hand off"),
+            "{err}"
+        );
         // #915: プロジェクト単位の置き場と運用メモの**両方**のパスを返す
         assert!(err.contains("projects/<project-key>.md"), "{err}");
         // #792: 書式（2 節の雛形）まで返す。ここが AI が書式を知る唯一の機会になりうる
@@ -45763,7 +46447,7 @@ mod tests {
         );
         let err_msg = result_stale.unwrap_err().to_string();
         assert!(
-            err_msg.contains("複数ペインに存在"),
+            err_msg.contains("複数ペインに存在") || err_msg.contains("on more than one pane"),
             "エラーメッセージに「複数ペインに存在」を含むこと: {err_msg}"
         );
     }

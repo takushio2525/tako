@@ -271,6 +271,24 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   文字列・`settings::save(` の結果を `e.to_string()` で包む形）、実経路は `tests/issue2365_store_lang.rs` の
   書き出しのケース（ロック・世代バックアップの位置にフォルダ・書き込めないフォルダ）と `remote.rs` の単体
   テスト（実ソケットで繋がらない・答えない・壊れた行）
+- #2365 の続きで、**dispatch の個別の断り**のうち利用者が目にする頻度の高い領域を移した（62 種）:
+  選択肢ダイアログへの応答（`respond_via` / `resolve_choice_index` の断りと、`choice` を省いた下見の
+  `hint` = `RespondHint`）とダイアログ表示中の送信の断り（`DialogBlocksSend`）、orchestrator（adopt・
+  profiles copy / set・accounts add / remove・role の解決・report・spawn・引き継ぎファイル・引き継ぎ・
+  worker レジストリ）、枠が日本語だった設定の保存（更新通知カード・ウェルカムバナー = `IoCause` で中身も
+  同じ言語）、リモート閲覧のショートカット（理由は tako-core の `ShortcutError` の日英の対）、Web ビュー、
+  メニュー、値の検証（limit-resume・panel・paste-guard・logs・auto_close・実行設定・tmux）。選択肢の一覧の
+  切り詰めの印は `Reason::choice_labels(dialog, lang)` で表示言語のものを付ける。番号なしダイアログで確定を
+  見送る理由（tako-core の `ConfirmBlock::note`）は日本語のまま persist.log と共有し、断りの英語は
+  `Reason::UnnumberedDialogBlocked` の腕で引く。「見つかりません」系（メニュー・ショートカット）は日本語が
+  「見つからない」を含まないので英語も ` not found` を含めない（`says_not_found` の当たり方を日英でそろえる）。
+  GUI を経由せず dispatch を直呼びする CLI の枝（`tako orchestrator handoffs` / `tako remote shortcuts`）は
+  `init_local_lang()` を先に呼ぶ（表示言語のグローバルの既定は英語）。番犬は同じ
+  `issue1762_dispatch_error_lang.rs`（`Reason` の表 + 末尾の節 = 断りを全部移した関数 `DISPATCH_REASON_SCOPES`
+  の日本語の固定文と、日本語の残る関数へ戻った旧文 `DISPATCH_MOVED_OLD_JA` を `file:line` で名指す）、
+  実経路は `tests/issue2365_dispatch_reasons_lang.rs`（GUI 無しのホストへ IPC と同じ形の要求を渡し、
+  応答は画面とキーを差し替えた `DialogAccess` を `respond_via` へ渡す）。persist.log・応答の注記
+  （adopt の判断の注記・accounts の既定パスの警告）・check-health の診断は対象外（日本語のまま）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
