@@ -77,6 +77,11 @@ source "$REPO_ROOT/scripts/lib/license-bundle.sh"
 # shellcheck source=lib/exit-guard.sh
 source "$REPO_ROOT/scripts/lib/exit-guard.sh"
 
+# merge-pr.sh の「GitHub API に届かない」の終了コード（GH_UNREACHABLE_EXIT）は待ち側と同じ 1 実装から引く
+# （#1704 / #2498。--promote の docs の PR の案内を CI の赤と出し分ける）
+# shellcheck source=lib/gh-retry.sh
+source "$REPO_ROOT/scripts/lib/gh-retry.sh"
+
 ARCH=$(uname -m)  # arm64 / x86_64
 ZIP_NAME=$(tako_asset_name "$TAG" macos "$ARCH")
 ZIP_PATH="$DIST/$ZIP_NAME"
@@ -805,7 +810,7 @@ update_homebrew_cask() {
 
 # update_docs_stable_label <stable-tag> — 後続 2: docs の「最新の安定版」を書き換えて PR → merge
 update_docs_stable_label() {
-  local tag="$1" version="${1#v}" wt date branch pr_url pr
+  local tag="$1" version="${1#v}" wt date branch pr_url pr merge_rc
   wt="$PROMOTE_TMPDIR/docs"
   branch="docs/promote-$tag"
   echo "==> docs の「最新の安定版」を $tag へ（${RELEASES_PAGE}）"
@@ -859,7 +864,14 @@ update_docs_stable_label() {
   fi
   pr=${pr_url##*/}
   echo "    PR: ${pr_url}（CI が緑で揃ってから merge する）"
-  if ! (cd "$REPO_ROOT" && "$REPO_ROOT/scripts/merge-pr.sh" "$pr"); then
+  merge_rc=0
+  (cd "$REPO_ROOT" && "$REPO_ROOT/scripts/merge-pr.sh" "$pr") || merge_rc=$?
+  if [[ $merge_rc -eq $GH_UNREACHABLE_EXIT ]]; then
+    # 届かない = 赤ではない（#2498）。merge-pr.sh は merge の後に状態を確かめられないときも 5 で、
+    # 打ち直せば MERGED の再実行として 0 で終わるので、merge したかどうかは決めつけない
+    echo "エラー: docs の PR #$pr の merge を終えられなかった（PR は残してある）。GitHub API に届かない（merge-pr.sh の終了コード ${merge_rc}。CI の結論ではない）。回線が戻ってから scripts/merge-pr.sh $pr" >&2
+    return 1
+  elif [[ $merge_rc -ne 0 ]]; then
     echo "エラー: docs の PR #$pr を merge できなかった（PR は残してある）。CI が緑になってから scripts/merge-pr.sh $pr" >&2
     return 1
   fi
