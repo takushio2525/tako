@@ -27963,8 +27963,9 @@ mod tests {
     fn issue1259_readpaneの応答が送達の顛末を持つ() {
         let mut host = MockHost::new();
         let pane = host.root_pane();
-        let (session, _rx) = TerminalSession::spawn(80, 24, SpawnOptions::default())
-            .expect("既定シェルの PTY を張れる");
+        // 要るのはセッションがあることだけ（ログインシェルは起こさない。#2415）
+        let (session, _rx) =
+            TerminalSession::spawn(80, 24, i2415_session_options()).expect("PTY を張れる");
         host.sessions.insert(pane, session);
         // 未決着が無ければ null（成功した過去の送達で応答を賑やかにしない）
         let out = dispatch(
@@ -44031,9 +44032,11 @@ mod tests {
             "list が false と言ったなら実行も断られる"
         );
 
-        // ② 素のシェルのセッションを張ると true になり、実行も通る
-        let (session, _rx) = TerminalSession::spawn(80, 24, SpawnOptions::default())
-            .expect("既定シェルの PTY を張れる");
+        // ② セッション（alt screen でもコマンドの実行中でもない）を張ると true になり、
+        //    実行も通る。開発者のログインシェルは起こさない（#2415。理由は
+        //    `i2415_session_options`）
+        let (session, _rx) =
+            TerminalSession::spawn(80, 24, i2415_session_options()).expect("PTY を張れる");
         host.sessions.insert(pane_id.as_u64(), session);
         let list = dispatch(&mut host, Request::List, PaneOrigin::Cli).unwrap();
         assert_eq!(list["tabs"][0]["panes"][0]["can_ssh"]["ok"], true);
@@ -44348,6 +44351,37 @@ mod tests {
         }
     }
 
+    /// 「セッションがあるペイン」の fixture（#2415）。
+    ///
+    /// `can_ssh` / `open_remote` の判定と `read_pane` の応答に要るのは**セッションがあること**
+    /// （と、alt screen でもコマンドの実行中でもないこと）だけで、シェルが上がったことも
+    /// 打鍵も要らない。POSIX は何も描かずに眠るプロセスを `/bin/sh -c` で**直接**起こす
+    /// （`exec` で置き換え = 孫を残さない。#2448）。
+    ///
+    /// 10/28 までは既定のログインシェル（`$SHELL -l` = 開発者の rc を全部読む）を起こしていた。
+    /// 3 本ともプロンプトも打鍵も待たないので #1308 の形（起動の遅さで予算を使い切る）では
+    /// 落ちないが、判定が「その瞬間に開発者の rc がどこまで進んだか」に左右される。
+    /// `open_remote` は判定の前に `ssh` の場所をログインシェルへ尋ねる（`remote_fs::ssh_bin`。
+    /// 上限 5 秒）ので、その間に fixture の rc が先へ進み、alt screen へ入る rc（自動 tmux など）
+    /// だと `alt_screen` で断られて落ちる（実測: そういう偽の rc で 20/20）。`$SHELL` を
+    /// 起こせない環境では張れずに 3 本とも落ちていた。
+    ///
+    /// Windows は従来どおり既定のシェル（PowerShell。Windows の CI はこの形で緑で、手元で
+    /// 確かめられないので触らない = #1308 と同じ扱い）。
+    /// A/B: `TAKO_2415_LEGACY=1` で 10/28 までの既定のログインシェルへ戻す
+    fn i2415_session_options() -> SpawnOptions {
+        if cfg!(windows) || std::env::var("TAKO_2415_LEGACY").is_ok_and(|v| v == "1") {
+            return SpawnOptions::default();
+        }
+        SpawnOptions {
+            command: Some(tako_core::SpawnCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exec sleep 600".to_string()],
+            }),
+            ..SpawnOptions::default()
+        }
+    }
+
     /// #1308 の A/B が成立する不等式（**旧の固定窓 < 注入の遅れ < 新の素の上限**）。
     ///
     /// 等しいと「空いている機では旧と同じ」になり `TAKO_1308_LEGACY=1` との差が出ない
@@ -44481,9 +44515,10 @@ mod tests {
         let mut host = MockHost::new();
         let tab_id = host.workspace().active_tab_id();
         let pane_id = host.workspace().get_tab(tab_id).unwrap().tree().focused();
-        // 素のシェルのセッションを実際に張る（判定材料がセッション由来のため）
-        let (session, _rx) = TerminalSession::spawn(80, 24, SpawnOptions::default())
-            .expect("既定シェルの PTY を張れる");
+        // セッションを実際に張る（判定材料がセッション由来のため）。開発者の
+        // ログインシェルは起こさない（#2415。理由は `i2415_session_options`）
+        let (session, _rx) =
+            TerminalSession::spawn(80, 24, i2415_session_options()).expect("PTY を張れる");
         host.sessions.insert(pane_id.as_u64(), session);
 
         let tabs_before = host.workspace().tabs().len();

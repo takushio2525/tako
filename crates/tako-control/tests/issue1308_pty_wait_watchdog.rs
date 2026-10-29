@@ -38,6 +38,9 @@
 //! 3. そのドライバ自身が予算・混み具合・診断・A/B の旧経路アームを持っていること
 //! 4. （10/25 の再発）#1308 の現場は POSIX でログインシェルを経由せず、描画のコマンドを
 //!    直接起こすこと（`i1308_direct_options`）
+//! 5. （#2415）実 PTY を張るテストは、どれも**素の既定**（`SpawnOptions::default()` =
+//!    開発者のログインシェル）を起こさないこと。セッションがあるだけでよいなら
+//!    `i2415_session_options` を通す
 
 use std::path::{Path, PathBuf};
 
@@ -274,6 +277,143 @@ fn issue1308の現場はposixでログインシェルを経由しない() {
     assert!(
         code_view::without_comments(&src).contains("std::env::var(\"TAKO_1308_TYPED\")"),
         "A/B の旧経路（TAKO_1308_TYPED=1）が無いと、直したことを実測で示せない"
+    );
+}
+
+/// 「セッションがあるペイン」の fixture（#2415）
+const SESSION_FIXTURE: &str = "i2415_session_options";
+/// 素の既定を残してよい理由の目印（同じ行か直前の行に `tako:login-shell-ok <理由>`）
+const LOGIN_SHELL_OK: &str = "tako:login-shell-ok";
+/// 素の既定（command 無し = 開発者のログインシェル）
+const BARE_DEFAULT: &str = "SpawnOptions::default()";
+
+/// 実 PTY を張るテストのうち、**素の既定**を起こしている行を `file:line fn 名` で返す（#2415）。
+///
+/// `..SpawnOptions::default()`（構造体の残りを埋める形 = `command` を自分で渡している）は
+/// 違反にしない。目印 `tako:login-shell-ok` の後ろに理由があれば通す
+/// （ログインシェルそのものが主題のテスト用。今の dispatch.rs には無い）。
+///
+/// 既知の穴: `Default::default()` で作る形・`SpawnOptions { cwd, ..SpawnOptions::default() }`
+/// のように `command` を渡さない構造体・素の既定を返す helper を通す形は見えない
+/// （helper は理由を doc に書く。#1308 の打ち込む経路 `i1308_spawn_options` がその形）
+fn login_shell_offenders(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for body in bodies(src) {
+        if !body.text.contains("TerminalSession::spawn(") {
+            continue;
+        }
+        let raw: Vec<&str> = body.text.lines().collect();
+        // コメントと文字列を潰した眺め（行番号は保たれる）。説明文の綴りを拾わない
+        let code = code_view::code_view(&body.text);
+        for (n, line) in code.lines().enumerate() {
+            let bare = line
+                .match_indices(BARE_DEFAULT)
+                .any(|(i, _)| !line[..i].ends_with(".."));
+            if !bare {
+                continue;
+            }
+            let justified = [Some(n), n.checked_sub(1)].into_iter().flatten().any(|k| {
+                raw.get(k)
+                    .and_then(|l| l.split_once(LOGIN_SHELL_OK))
+                    .is_some_and(|(_, why)| !why.trim().is_empty())
+            });
+            if justified {
+                continue;
+            }
+            out.push(at(
+                &body,
+                n,
+                &format!("実 PTY に素の `{BARE_DEFAULT}`（開発者のログインシェル）を起こしている"),
+            ));
+        }
+    }
+    out
+}
+
+/// #2415: 実 PTY を張るテストは POSIX で**開発者のログインシェルを起こさない**。
+///
+/// 10/28 まで 3 本（`read_pane` の送達の顛末・`list` の `can_ssh`・`open_remote` の
+/// target=pane）が `SpawnOptions::default()` を起こしていた。どれもプロンプトも打鍵も
+/// 待たないが、`open_remote` は判定の前に `ssh` の場所をログインシェルへ尋ねる（上限 5 秒）
+/// ので、その間に fixture の rc が進み、alt screen へ入る rc だと落ちていた（偽の rc で 20/20）。
+/// 判定に要るのは「セッションがある」だけなので、直接起こす fixture へ寄せてある
+#[test]
+fn 実ptyを張るテストはposixで素のログインシェルを起こさない() {
+    let src = read_src();
+    let offenders = login_shell_offenders(&src);
+    assert!(
+        offenders.is_empty(),
+        "実 PTY を張るテストが開発者のログインシェル（rc を全部読む）を起こしている。\n\
+         判定がその瞬間の rc の進み具合に左右され、CI（素のシェル）では緑のまま手元でだけ落ちる\n\
+         （#1308 / #2415）。セッションがあるだけでよいなら `{SESSION_FIXTURE}()`、絵が要るなら\n\
+         `i1308_direct_options` のように描くコマンドを直接起こすこと。ログインシェルそのものが\n\
+         主題なら、同じ行か直前の行に `{LOGIN_SHELL_OK} <理由>` を書く:\n  {}",
+        offenders.join("\n  ")
+    );
+    // fixture 自身が POSIX で直接起こしていること（素の既定へ戻すと上の検査が素通りになる）
+    let fixture = bodies(&src)
+        .into_iter()
+        .find(|b| b.name == SESSION_FIXTURE)
+        .unwrap_or_else(|| panic!("#2415 の fixture（{SESSION_FIXTURE}）が切り出せていない"));
+    let code = code_view::without_comments(&fixture.text);
+    assert!(
+        code.contains("program: \"/bin/sh\"") && code.contains("cfg!(windows)"),
+        "crates/tako-control/src/dispatch.rs:{} fn {SESSION_FIXTURE}: POSIX で `/bin/sh -c` を\
+         直接起こしていない（素の既定へ戻すとログインシェルを経由する = #2415）",
+        fixture.line
+    );
+}
+
+/// 上の番犬の検出力: **素の既定だけ**を名指しし、構造体の残りを埋める形・説明文・
+/// 理由つきの目印は通す
+#[test]
+fn ログインシェルの番犬は素の既定だけを名指しする() {
+    let src = [
+        "mod tests {",
+        "    fn 素の既定() {",
+        "        let (s, _rx) = TerminalSession::spawn(80, 24, SpawnOptions::default()).unwrap();",
+        "    }",
+        "    fn 変数へ退避した既定() {",
+        "        let opts = tako_core::terminal::SpawnOptions::default();",
+        "        let (s, _rx) = TerminalSession::spawn(80, 24, opts).unwrap();",
+        "    }",
+        "    fn 直接起こす() {",
+        "        // 説明文に SpawnOptions::default() と書いても拾わない",
+        "        let (s, _rx) = TerminalSession::spawn(80, 24, SpawnOptions {",
+        "            command: Some(cmd()),",
+        "            ..SpawnOptions::default()",
+        "        }).unwrap();",
+        "        let msg = \"SpawnOptions::default()\";",
+        "    }",
+        "    fn 理由つき() {",
+        "        // tako:login-shell-ok 主題が対話ログインシェルの履歴",
+        "        let (s, _rx) = TerminalSession::spawn(80, 24, SpawnOptions::default()).unwrap();",
+        "    }",
+        "    fn 理由なしの目印() {",
+        "        // tako:login-shell-ok",
+        "        let (s, _rx) = TerminalSession::spawn(80, 24, SpawnOptions::default()).unwrap();",
+        "    }",
+        "    fn 実ptyを張らない() {",
+        "        host.attach_session(pane, SpawnOptions::default());",
+        "    }",
+        "}",
+    ]
+    .join("\n");
+    let got = login_shell_offenders(&src);
+    let names: Vec<&str> = got
+        .iter()
+        .filter_map(|o| o.split(" fn ").nth(1))
+        .filter_map(|o| o.split(':').next())
+        .collect();
+    assert_eq!(
+        names,
+        ["素の既定", "変数へ退避した既定", "理由なしの目印"],
+        "名指しが期待とずれた: {got:#?}"
+    );
+    assert!(
+        got[0].starts_with("crates/tako-control/src/dispatch.rs:3 "),
+        "行番号がずれている: {}",
+        got[0]
     );
 }
 
