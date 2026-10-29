@@ -4893,6 +4893,14 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
 - **HOME を本物のままにした起動では、ペインのシェルが利用者の rc を読む**。rc が `CLAUDE_CONFIG_DIR` を
   export していれば、ペインで打った claude は本物の設定 dir を使う（GUI の env では止められない）。
   ペインの claude まで隔離するなら一時の HOME か ZDOTDIR を並べる（既存の検証の大半はそうしている）
+- **セルフテスト（`TAKO_SELF_TEST=1`）が起動コマンドを積む項目は、見たら取り下げる**（#2446）。セルフテストは
+  HOME を本物のまま起こすので、項目が積んだ `claude`（worker の spawn）や `tako setup`（パレットの run-setup）が
+  走ると、ペインのシェルが利用者の rc の `CLAUDE_CONFIG_DIR` を拾い、本物のアカウントで claude が起きる。
+  注入した mod はその使用量を GUI へ報告するので、ステータスバーの 5h を見る項目 111 が本物の値（実測
+  `statusbar=3`。setup の引き継ぎの claude がプロンプトを処理していた）で落ちていた。起動の経路だけを見る項目は
+  dispatch と**同じ update の中で** `self_test::withdraw_launch` を呼ぶ（取り下げた行が返るので「正しい行が
+  積まれた」はそれで見る）。番犬は tako-app の `selftest_launch_withdraw_watchdog`（起動を積む入口の後ろ 40 行に
+  取り下げが無ければ行番号で名指す。走らせる理由がある入口だけ `// tako:launch-ok <理由>`）
 - **クリップボードはヘルパでは守れない**。GUI のコピー（OSC 52・mod の `$.ui.copy`・コピーボタン）は
   OS の汎用ペーストボードへ直に書くので、Copy を押す確認は隔離 tmux（`set-clipboard off`）で行う（#1963）
 - **偽のエージェント（`sleep` の代わり）はシンボリックリンクで作る**。`/bin/sleep` などシステムの実行ファイルの

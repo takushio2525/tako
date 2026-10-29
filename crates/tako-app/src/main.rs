@@ -36523,6 +36523,32 @@ mod self_test {
         bytes
     }
 
+    /// そのペインへ積まれた起動コマンド（#640 の送達フロー）と初回プロンプトを取り下げる（#2446）。
+    /// 返り値は取り下げた起動コマンド（項目はこれで「正しい行が積まれた」を見る）。
+    ///
+    /// **積んだ行を走らせると本物のアカウントで claude が起きる**。隔離セルフテストのペインの
+    /// シェルは利用者の rc を読む（HOME は本物）ので、rc が `CLAUDE_CONFIG_DIR` を export して
+    /// いれば `claude` は本物の設定 dir で起き、注入した tako mod がその使用量をこの GUI へ報告する。
+    /// #2446 の実測: パレットの run-setup が本物の `tako setup` を完走させ、引き継ぎの claude が
+    /// 本物の 5h を報告して項目 111 が `statusbar=3` で落ちた（GUI はその報告を見て本物の設定 dir の
+    /// skills/tako まで確かめに行っていた）。
+    /// 項目 72 / 117 の worker spawn も本物の設定 dir の `claude` を起こしていた。
+    /// 起動の経路（どのペインへ何が積まれたか）だけを見る項目は、dispatch と**同じ update の中で**
+    /// これを呼ぶ（間に tick を挟むと送達が始まる）。番犬は `selftest_launch_withdraw_watchdog`
+    pub(crate) fn withdraw_launch(app: &mut TakoApp, pane: PaneId) -> Vec<String> {
+        let mut withdrawn = Vec::new();
+        app.command_flows.retain(|c| {
+            if c.pane == pane {
+                withdrawn.push(c.flow.command().to_string());
+                false
+            } else {
+                true
+            }
+        });
+        app.prompt_flows.retain(|f| f.pane != pane);
+        withdrawn
+    }
+
     /// 隔離 HOME の zsh をペイン内から起こすコマンドを組む（項目 41c / 41d。#833）。
     ///
     /// **値は必ずクオートして通す**。`format!("HOME={} ZDOTDIR={zdotdir} /bin/zsh", …)`
@@ -73926,11 +73952,13 @@ mod self_test {
             //     だけがリフローされ、ユーザー由来ペインの矩形が不変であることを
             //     rect（単位矩形の比率）で機械検証する。dispatch 直呼び = CLI / MCP と
             //     同一経路（開発不変条件）。spawn の cwd 解決用に projects.yaml へ
-            //     一時プロジェクトを登録し、終了時に削除する。worker エージェント CLI の
-            //     起動完了は待たない（レイアウト検証には無関係。prompt は空文字のため
-            //     エージェントが起動しても API 呼び出しは発生しない。事前信頼の書き込みが
-            //     ~/.claude.json に一時 dir の trust を 1 エントリ残しうるが、実在しない
-            //     パスとして無視される）
+            //     一時プロジェクトを登録し、終了時に削除する。worker エージェント CLI は
+            //     **起動しない**（レイアウト検証には無関係）。spawn が積んだ起動コマンドは
+            //     dispatch と同じ update の中で `withdraw_launch` が取り下げる（#2446。
+            //     走らせるとペインのシェルが利用者の rc を読み、本物の設定 dir の claude が
+            //     起きて mod が本物の使用量を報告していた）。事前信頼の書き込みが
+            //     設定 dir の .claude.json に一時 dir の trust を 1 エントリ残しうるが、
+            //     実在しないパスとして無視される
             {
                 fn rect_close(r: tako_core::Rect, x: f32, y: f32, w: f32, h: f32) -> bool {
                     (r.x - x).abs() < 1e-3
@@ -73938,6 +73966,7 @@ mod self_test {
                         && (r.width - w).abs() < 1e-3
                         && (r.height - h).abs() < 1e-3
                 }
+                // 要求を組むだけ（dispatch は呼び出し側。番犬はこの関数名の呼び出しを見る）
                 fn spawn_req(pane: u64, label: &str) -> tako_control::protocol::Request {
                     tako_control::protocol::Request::OrchestratorSpawn {
                         project: "tako-selftest-165".into(),
@@ -74074,19 +74103,29 @@ mod self_test {
                 for label in ["w1", "w2", "w3", "w4"] {
                     let spawned = window
                         .update(cx, |app, _, _cx| {
-                            tako_control::dispatch(
+                            let id = tako_control::dispatch(
                                 app,
                                 spawn_req(lt_master, label),
                                 PaneOrigin::Mcp,
                             )
                             .ok()
-                            .and_then(|v| v["pane_id"].as_u64())
+                            .and_then(|v| v["pane_id"].as_u64())?;
+                            // 積まれた worker の起動コマンドは走らせない（#2446）
+                            let withdrawn = withdraw_launch(app, PaneId::from_raw(id));
+                            Some((id, withdrawn.len()))
                         })
                         .ok()
                         .flatten();
-                    let Some(id) = spawned else {
+                    let Some((id, withdrawn)) = spawned else {
                         fail(&format!("spawn レイアウト: {label} の spawn"));
                     };
+                    check(
+                        withdrawn == 1,
+                        &format!(
+                            "spawn レイアウト: {label} の起動コマンドが 1 本積まれ、走らせずに取り下げた \
+                             (#2446。取り下げ={withdrawn})"
+                        ),
+                    );
                     workers.push(id);
                 }
                 let (w1, w2, w3, w4) = (workers[0], workers[1], workers[2], workers[3]);
@@ -74242,12 +74281,17 @@ mod self_test {
                                 .unwrap_or(0);
                             let spawned = window
                                 .update(cx, |app, _, _cx| {
-                                    tako_control::dispatch(
+                                    let resp = tako_control::dispatch(
                                         app,
                                         spawn_req(lt_master, "w1439"),
                                         PaneOrigin::Mcp,
                                     )
-                                    .ok()
+                                    .ok()?;
+                                    // 積まれた worker の起動コマンドは走らせない（#2446）
+                                    if let Some(id) = resp["pane_id"].as_u64() {
+                                        withdraw_launch(app, PaneId::from_raw(id));
+                                    }
+                                    Some(resp)
                                 })
                                 .ok()
                                 .flatten();
@@ -77468,7 +77512,33 @@ mod self_test {
                                 .tabs()
                                 .last()
                                 .is_some_and(|t| t.title() == "setup");
-                        shown && rendered && hidden && unrendered && has_entries && launched
+                        // 積まれた `tako setup` は**走らせない**（#2446）。走らせると本物の setup が
+                        // 完走し、引き継ぎの claude が本物のアカウントの使用量を mod で報告していた
+                        // （項目 111 が statusbar=3 で落ちた真因）。見るのは「開いたタブのペインへ
+                        // 製品が組む行が積まれた」までで、見たら取り下げる（項目 97d と同じ作法）
+                        let setup_panes: Vec<PaneId> = app
+                            .workspace
+                            .tabs()
+                            .last()
+                            .map(|t| t.tree().panes().into_iter().map(|p| p.id()).collect())
+                            .unwrap_or_default();
+                        let withdrawn: Vec<String> = setup_panes
+                            .into_iter()
+                            .flat_map(|p| withdraw_launch(app, p))
+                            .collect();
+                        let setup_line = tako_control::welcome::launch_command_line("setup");
+                        let setup_queued = withdrawn.iter().any(|l| l == &setup_line);
+                        println!(
+                            "TAKO_SELF_TEST_2446: item=88 withdrawn={} setup_queued={setup_queued}",
+                            withdrawn.len()
+                        );
+                        shown
+                            && rendered
+                            && hidden
+                            && unrendered
+                            && has_entries
+                            && launched
+                            && setup_queued
                     })
                     .unwrap_or(false);
                 check(
@@ -88494,6 +88564,9 @@ mod self_test {
                             )
                             .ok()?;
                             let pane = spawned["pane_id"].as_u64()?;
+                            // 見るのはペイン属性だけ。積まれた worker の起動コマンドは
+                            // 走らせない（#2446。本物の設定 dir の claude が起きる）
+                            withdraw_launch(app, PaneId::from_raw(pane));
                             let from_spawn = spawned["limit_resume"].as_bool()?;
                             // ペイン属性そのもの（ヘッダのインジケータもこれを読む）
                             let on_pane = app
@@ -97387,7 +97460,7 @@ mod self_test {
                     );
                     let refused149 = window
                         .update(cx, |app, _, _| {
-                            tako_control::dispatch(
+                            let spawned = tako_control::dispatch(
                                 app,
                                 Req::OrchestratorSpawn {
                                     project: outside149.into(),
@@ -97405,9 +97478,18 @@ mod self_test {
                                     limit_resume: None,
                                 },
                                 PaneOrigin::Cli,
-                            )
-                            .err()
-                            .map(|e| format!("{e:?}"))
+                            );
+                            match spawned {
+                                Err(e) => Some(format!("{e:?}")),
+                                // 断られなかった（= 下の check で落ちる）ときも、積まれた起動は
+                                // 走らせない（#2446。本物の設定 dir の claude がプロンプトつきで起きる）
+                                Ok(v) => {
+                                    if let Some(id) = v["pane_id"].as_u64() {
+                                        withdraw_launch(app, PaneId::from_raw(id));
+                                    }
+                                    None
+                                }
+                            }
                         })
                         .ok()
                         .flatten()
@@ -98647,6 +98729,181 @@ mod selftest_shell_env_command_tests {
             !out.status.success() || String::from_utf8_lossy(&out.stdout) != dir,
             "旧実装（クオート無し）が通ってしまう = この回帰テストは検出力を失っている"
         );
+    }
+}
+
+/// 「セルフテストが起動コマンドを積んで、取り下げずに走らせる」形の番犬（#2446）。
+///
+/// 隔離セルフテストのペインのシェルは利用者の rc を読む（HOME は本物）ので、積まれた `claude` /
+/// `tako setup` が走ると本物の設定 dir（= 本物のアカウント）で claude が起き、注入した tako mod が
+/// その使用量をこの GUI へ報告する。項目 88（#549）のパレットの run-setup が本物の `tako setup` を
+/// 完走させ、引き継ぎの claude の報告で項目 111 が `statusbar=3` で落ちていた（項目 72 / 117 の
+/// worker spawn も本物の設定 dir の claude を起こしていた）。起動の経路だけを見る項目は、積んだ直後に
+/// `self_test::withdraw_launch` で取り下げる。この番犬は、セルフテスト本体の中で「起動を積む入口」の
+/// 後ろ [`WINDOW`] 行以内に取り下げがあるかを見る
+#[cfg(test)]
+mod selftest_launch_withdraw_watchdog {
+    /// 起動を積む入口（呼び出しの形）。worker の spawn・パレットの起動導線・起動用タブ
+    const LAUNCHERS: &[&str] = &[
+        "OrchestratorSpawn {",
+        "run_setup_command(",
+        "run_master_command(",
+        "launch_tako_command(",
+        "open_command_tab(",
+    ];
+    /// パレットの起動導線の id（`PaletteItem::Command(ラベル, id)` の id だけの行）
+    const PALETTE_LAUNCH_IDS: &[&str] = &["\"run-setup\",", "\"run-master\","];
+    const WITHDRAW: &str = "withdraw_launch(";
+    /// 入口から取り下げまでの行数の上限（同じ update の中で取り下げる = 近くに書く）
+    const WINDOW: usize = 40;
+    /// 走らせる理由がある入口の逃げ道（入口の行か直前 [`ALLOW_ABOVE`] 行に `tako:launch-ok <理由>`）
+    const ALLOW_MARKER: &str = "tako:launch-ok";
+    /// 逃げ道を探す行数（パレットの id の行は呼び出しの 3 行下にある）
+    const ALLOW_ABOVE: usize = 6;
+
+    /// セルフテスト本体（`mod self_test {` から、行頭の閉じ括弧まで）の行。行番号は 1 始まり
+    fn self_test_region(src: &str) -> Vec<(usize, &str)> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for (index, line) in src.lines().enumerate() {
+            if !inside {
+                inside = line == "mod self_test {";
+                continue;
+            }
+            if line == "}" {
+                break;
+            }
+            out.push((index + 1, line));
+        }
+        out
+    }
+
+    /// 取り下げの無い入口（行番号と行）。要求を組むだけの関数（`fn 名前(` の直後に入口がある）は、
+    /// 関数の中ではなく**その関数の呼び出し**を入口として見る
+    fn unwithdrawn_launches(src: &str) -> Vec<(usize, String)> {
+        let lines = self_test_region(src);
+        let code = |line: &str| !line.trim_start().starts_with("//");
+        let mut builders: Vec<String> = Vec::new();
+        let mut builder_lines = Vec::new();
+        for (i, (_, line)) in lines.iter().enumerate() {
+            if !(code(line) && LAUNCHERS.iter().any(|p| line.contains(p))) {
+                continue;
+            }
+            // 関数の頭の判定は共有ヘルパ（`pub(crate) fn` / `async fn` も頭と読む。#1496）
+            let header = lines[i.saturating_sub(2)..i]
+                .iter()
+                .rev()
+                .find_map(|(_, l)| tako_core::source_scan::fn_head_name(l));
+            if let Some(name) = header {
+                builders.push(format!("{name}("));
+                builder_lines.push(i);
+            }
+        }
+        let mut hits = Vec::new();
+        for (i, (number, line)) in lines.iter().enumerate() {
+            if !code(line) || builder_lines.contains(&i) {
+                continue;
+            }
+            let launches = LAUNCHERS.iter().any(|p| line.contains(p))
+                || PALETTE_LAUNCH_IDS.contains(&line.trim())
+                || (tako_core::source_scan::fn_head_name(line).is_none()
+                    && builders.iter().any(|b| line.contains(b.as_str())));
+            if !launches {
+                continue;
+            }
+            let allowed = lines[i.saturating_sub(ALLOW_ABOVE)..=i]
+                .iter()
+                .any(|(_, l)| l.contains(ALLOW_MARKER));
+            let withdrawn = lines[i..(i + WINDOW).min(lines.len())]
+                .iter()
+                .any(|(_, l)| code(l) && l.contains(WITHDRAW));
+            if !allowed && !withdrawn {
+                hits.push((*number, line.trim().to_string()));
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn セルフテストが積んだ起動は走らせる前に取り下げる() {
+        let src = include_str!("main.rs");
+        assert!(
+            self_test_region(src).len() > 10_000,
+            "main.rs の `mod self_test {{` が見つからない = この番犬は何も見ていない"
+        );
+        let hits = unwithdrawn_launches(src);
+        assert!(
+            hits.is_empty(),
+            "main.rs{hits:?} がセルフテストで起動コマンドを積んだまま取り下げていない。\
+             隔離セルフテストのペインのシェルは利用者の rc を読むので、走ると本物の設定 dir の \
+             claude が起き、tako mod が本物の使用量を報告する（#2446 で項目 111 が落ちた）。\
+             積んだ直後（同じ update の中）に `self_test::withdraw_launch` で取り下げること。\
+             走らせる理由がある入口だけ、入口の行か直前 6 行に `// tako:launch-ok <理由>` を書く"
+        );
+    }
+
+    /// 検出力の担保: 取り下げの無い入口を名指しし、取り下げ・逃げ道・本体の外は見逃す
+    #[test]
+    fn 番犬は取り下げの無い起動を名指しする() {
+        let wrap = |body: &str| format!("fn outside() {{}}\nmod self_test {{\n{body}}}\n");
+        let spawn = "    let v = dispatch(\n        app,\n        Req::OrchestratorSpawn {\n            pane: Some(1),\n        },\n    );\n";
+        assert_eq!(
+            unwithdrawn_launches(&wrap(spawn)),
+            vec![(5, "Req::OrchestratorSpawn {".to_string())]
+        );
+        assert!(
+            unwithdrawn_launches(&wrap(&format!("{spawn}    withdraw_launch(app, p);\n")))
+                .is_empty()
+        );
+        // 取り下げがコメントの中にしか無ければ取り下げていない
+        assert_eq!(
+            unwithdrawn_launches(&wrap(&format!("{spawn}    // withdraw_launch(app, p);\n"))).len(),
+            1
+        );
+        // 要求を組むだけの関数は中身ではなく呼び出しを見る
+        let builder = "    fn spawn_req(pane: u64) -> Request {\n        Request::OrchestratorSpawn {\n            pane: Some(pane),\n        }\n    }\n    let v = dispatch(app, spawn_req(1), origin);\n";
+        assert_eq!(
+            unwithdrawn_launches(&wrap(builder)),
+            vec![(
+                8,
+                "let v = dispatch(app, spawn_req(1), origin);".to_string()
+            )]
+        );
+        assert!(
+            unwithdrawn_launches(&wrap(&format!("{builder}    withdraw_launch(app, p);\n")))
+                .is_empty()
+        );
+        // 可視性つきの頭（`pub(crate) fn`）も要求を組む関数として読む（#1496 の共有ヘルパ）
+        assert_eq!(
+            unwithdrawn_launches(&wrap(
+                &builder.replace("    fn spawn_req", "    pub(crate) fn spawn_req")
+            )),
+            vec![(
+                8,
+                "let v = dispatch(app, spawn_req(1), origin);".to_string()
+            )]
+        );
+        // パレットの起動導線（項目 88 の形）
+        let palette = "    app.palette_execute(\n        PaletteItem::Command(\n            label,\n            \"run-setup\",\n        ),\n        cx,\n    );\n";
+        assert_eq!(
+            unwithdrawn_launches(&wrap(palette)),
+            vec![(6, "\"run-setup\",".to_string())]
+        );
+        // 一覧の並び（実行ではない）は入口にしない
+        assert!(unwithdrawn_launches(&wrap(
+            "    let ids = [\"run-setup\", \"run-master\", \"open-settings\"];\n"
+        ))
+        .is_empty());
+        // 逃げ道
+        assert!(unwithdrawn_launches(&wrap(&format!(
+            "    // tako:launch-ok 走らせて見る項目\n{palette}"
+        )))
+        .is_empty());
+        // 本体の外（製品のコード）は見ない
+        assert!(unwithdrawn_launches(
+            "fn product(&mut self) {\n    self.launch_tako_command(\"setup\", \"setup\", cx);\n}\nmod self_test {\n}\n"
+        )
+        .is_empty());
     }
 }
 
