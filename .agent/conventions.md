@@ -231,7 +231,7 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   （GUI の表示言語 / ブリッジが起動時に設定から決めた言語）、CLI の前段は `front_err`。番犬は同じ
   `issue1762_dispatch_error_lang.rs`（`Reason` の表 + 最後の節が前段のソースを読み、日本語の固定文の
   書き足しを `file:line` で名指す。走査の範囲は `FRONT_SCOPES`）、実経路は tako-cli の
-  `tests/issue2365_front_lang.rs`（ビルドした `tako` を一時の data dir で叩き、CLI 21 + MCP 32 ケースで
+  `tests/issue2365_front_lang.rs`（ビルドした `tako` を一時の data dir で叩き、CLI 19 + MCP 31 ケース（JSON-RPC の口 2 つを含む）で
   英語表示に日本語が無いことと日本語の旧文とのバイト一致を見る。`TAKO_2365_FRONT_BIN` で修正前の
   バイナリを叩ける = A/B）。文言で判定していた検証スクリプト（`test-reattach-1857.sh` /
   `test-claude-mod-1879.sh`）は日英どちらの形とも突き合わせる
