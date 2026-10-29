@@ -39589,6 +39589,24 @@ mod self_test {
             .flatten()
     }
 
+    /// 出力起因の再描画の間引きの窓を**両方**空けて、「要求するなら即座に要求する」状態にする
+    /// （項目 107 の判定の前提。#2490）。
+    ///
+    /// 間引きの時計は 2 つある: フォーカス中のペインの 16ms（`last_term_notify`）と、フォーカスの
+    /// 無いペインの上限（#1979 の `last_unfocused_flush`。既定 30 fps = 33ms）。前者だけを巻き戻すと、
+    /// 直前の 1 間隔以内にフォーカスの無いペインの再描画が流れていた回（フォーカス中の再描画への
+    /// 相乗りを含む = FR-4.11.1）だけ、フォーカスの無いペインへの出力が予約（タイマー）へ回り、
+    /// その場の `term_redraw_requests` が 0 のまま判定される。予約へ回るのは仕様どおりなので、
+    /// 直すのは判定の前提の側。A/B は `TAKO_2490_LEGACY=1`（前者だけ = 修正前）。
+    /// 番犬は `selftest_redraw_window_watchdog`
+    fn open_redraw_windows(app: &mut TakoApp) {
+        let ago = tako_core::monotonic::rewound(Duration::from_secs(1));
+        app.last_term_notify = ago;
+        if std::env::var_os("TAKO_2490_LEGACY").is_none() {
+            app.last_unfocused_flush = ago;
+        }
+    }
+
     /// [`measure_output_redraw`] の結果（#995）。
     pub(crate) struct RedrawWindow {
         /// 清浄だった試行の増分（全試行が汚れていたら `None` = 判定できない）
@@ -85659,18 +85677,46 @@ mod self_test {
                         check(vis_ok, "107: 表示中タブのペインは可視と判定される (#782)");
                         check(hid_ok, "107: 裏タブのペインは不可視と判定される (#782)");
 
+                        // #2490 の検出力の注入（実機で偶然を待たない）。どちらも判定の update の
+                        // **先頭**に置く = 判定の直前に別の update で起きたことを作る:
+                        // - `clock` … 毎回、フォーカスの無いペインの上限の時計（#1979）を
+                        //   「いま流した」にする（直前 33ms 以内に別のフォーカスの無いペインの
+                        //   再描画が流れた回）
+                        // - `piggyback` … 表示中ペインへ流す前に、フォーカスの無いペインの再描画を
+                        //   1 件溜めておく（新しい裏タブのシェルの起動時の OSC が溜まっている回）。
+                        //   表示中ペインの再描画がそれを相乗りで流し（FR-4.11.1）、上限の時計が
+                        //   「いま」へ進んだ直後に裏タブの OSC を流す順序になる
+                        // 修正前（`TAKO_2490_LEGACY=1`）はどちらも「裏タブの OSC」の判定で FAILED
+                        let inject2490 = std::env::var("TAKO_2490_INJECT").unwrap_or_default();
                         // 出力イベントを 1 つの update 内で流し、その場で数える
-                        // （他ペインの出力・遅延 notify が混ざらない決定的な判定）
+                        // （他ペインの出力・遅延 notify が混ざらない決定的な判定）。
+                        // 返すのは (要求の増分, 省いた増分, 流す前の上限の時計の経過 ms,
+                        // 流す前に予約が残っていたか, 流す間に相乗りで流れたフォーカスの無いペインの再描画)
                         let feed782 = |cx: &mut gpui::AsyncApp, pane: Option<PaneId>, osc: bool| {
                             window782
                                 .update(cx, |app: &mut TakoApp, _, cx| {
                                     let target = pane.unwrap_or_else(|| app.focused_pane());
+                                    match inject2490.as_str() {
+                                        "clock" => {
+                                            app.last_unfocused_flush = std::time::Instant::now()
+                                        }
+                                        "piggyback" if pane.is_none() => {
+                                            app.unfocused_pending_app = true
+                                        }
+                                        _ => {}
+                                    }
+                                    let ago_ms = app.last_unfocused_flush.elapsed().as_millis();
+                                    let reserved = app.unfocused_notify_pending
+                                        || app.unfocused_pending_app
+                                        || !app.unfocused_pending_panes.is_empty();
                                     // デバウンス窓を空けて「要求するなら即座に要求する」状態にする
-                                    app.last_term_notify = tako_core::monotonic::rewound(
-                                        std::time::Duration::from_secs(1),
+                                    // （フォーカス中の 16ms と #1979 の上限の両方。#2490）
+                                    open_redraw_windows(app);
+                                    let (r0, s0, u0) = (
+                                        app.term_redraw_requests,
+                                        app.term_redraw_skipped,
+                                        app.unfocused_flushes,
                                     );
-                                    let (r0, s0) =
-                                        (app.term_redraw_requests, app.term_redraw_skipped);
                                     for _ in 0..8 {
                                         let event = if osc {
                                             tako_core::SessionEvent::Osc(
@@ -85688,11 +85734,14 @@ mod self_test {
                                     (
                                         app.term_redraw_requests - r0,
                                         app.term_redraw_skipped - s0,
+                                        ago_ms,
+                                        reserved,
+                                        app.unfocused_flushes - u0,
                                     )
                                 })
-                                .unwrap_or((0, 0))
+                                .unwrap_or((0, 0, 0, false, 0))
                         };
-                        let (hidden_req, hidden_skip) = feed782(cx, Some(hidden), false);
+                        let (hidden_req, hidden_skip, ..) = feed782(cx, Some(hidden), false);
                         let has_session = window782
                             .update(cx, |app: &mut TakoApp, _, _| {
                                 (
@@ -85710,18 +85759,88 @@ mod self_test {
                             hidden_req == 0 && hidden_skip == 8,
                             "107: 裏タブの出力では再描画を要求しない (#782)",
                         );
-                        let (visible_req, _) = feed782(cx, None, false);
+                        let (visible_req, _, _, _, piggybacked) = feed782(cx, None, false);
                         check(
                             visible_req >= 1,
                             "107: 表示中ペインの出力では再描画を要求する (#782)",
                         );
                         // OSC（cwd・実行状態）はタブバー等ペインの外にも出るので、
                         // 裏タブでも描き直す（状態変化を取りこぼさない）
-                        let (osc_req, _) = feed782(cx, Some(hidden), true);
+                        let (osc_req, _, osc_ago_ms, osc_reserved, _) =
+                            feed782(cx, Some(hidden), true);
+                        // 診断（#2490）: 修正前に落ちる回は「直前の表示中ペインの再描画が
+                        // フォーカスの無いペインの再描画を相乗りで流した（piggyback=1）」か
+                        // 「流す前の上限の時計が 1 間隔（既定 33ms）未満（unfocused_ago_ms）」
+                        println!(
+                            "TAKO_SELF_TEST_2490: osc req={osc_req} piggyback={piggybacked} \
+                             unfocused_ago_ms={osc_ago_ms} reserved={osc_reserved} \
+                             legacy={} inject={inject2490:?}",
+                            std::env::var_os("TAKO_2490_LEGACY").is_some()
+                        );
                         check(
                             osc_req >= 1,
                             "107: 裏タブでも OSC 由来の状態変化は再描画する (#782)",
                         );
+                        // 上限の窓をまたぐ場合（#2490）: #1979 の上限の窓が閉じている間
+                        // （直前にフォーカスの無いペインの再描画が流れた）の裏タブの OSC は、
+                        // その場では要求せず予約（タイマー）へ回り、次の間隔で流れる。上の判定は
+                        // 窓を空けて「要求するか」を見るので、窓が閉じていても取りこぼさない
+                        // ことはここで見る。上限なし（`TAKO_1979_LEGACY=1`）では予約へ回らない
+                        if tako_core::probe::issue1979_legacy() {
+                            println!(
+                                "TAKO_SELF_TEST_SKIPPED: 107 の予約の判定\
+                                 （TAKO_1979_LEGACY で上限なし）"
+                            );
+                        } else {
+                            let (deferred_req, reserved, flushes0) = window782
+                                .update(cx, |app: &mut TakoApp, _, cx| {
+                                    // 上限の窓を閉じる = 「いま流した」
+                                    app.last_unfocused_flush = std::time::Instant::now();
+                                    let (r0, u0) = (app.term_redraw_requests, app.unfocused_flushes);
+                                    app.on_term_event(
+                                        hidden,
+                                        tako_core::SessionEvent::Osc(
+                                            tako_core::osc_tap::OscEvent::Mark(
+                                                tako_core::osc_tap::PromptMark::PromptStart,
+                                            ),
+                                        ),
+                                        cx,
+                                    );
+                                    (
+                                        app.term_redraw_requests - r0,
+                                        app.unfocused_pending_app && app.unfocused_notify_pending,
+                                        u0,
+                                    )
+                                })
+                                .unwrap_or((u64::MAX, false, 0));
+                            // 予約が流れたか = 予約の後にフォーカスの無いペインの再描画が 1 回以上
+                            // 流れた（流すたびに溜まり分を全部持っていくので、誰の予約で流れても
+                            // この OSC は載っている）
+                            let started = std::time::Instant::now();
+                            let delivered = wait_for_app_state(
+                                window782,
+                                cx,
+                                "107: 予約した裏タブの OSC の再描画が流れる",
+                                state_wait_budget(Duration::from_secs(2), machine_busy()),
+                                move |app| app.unfocused_flushes > flushes0,
+                            )
+                            .await;
+                            println!(
+                                "TAKO_SELF_TEST_2490: deferred req={deferred_req} \
+                                 reserved={reserved} delivered={delivered} waited_ms={}",
+                                started.elapsed().as_millis()
+                            );
+                            check(
+                                deferred_req == 0 && reserved,
+                                "107: 上限の窓が閉じている間の裏タブの OSC は予約へ回る \
+                                 (#1979 / #2490)",
+                            );
+                            check(
+                                delivered,
+                                "107: 予約した裏タブの OSC の再描画は次の間隔で流れる \
+                                 (#1979 / #2490)",
+                            );
+                        }
                         // 後片付け: 作った裏タブを閉じる
                         let _ = window782.update(cx, |app: &mut TakoApp, _, cx| {
                             app.remove_pane_with(
@@ -99093,8 +99212,9 @@ mod selftest_launch_withdraw_watchdog {
     /// 逃げ道を探す行数（パレットの id の行は呼び出しの 3 行下にある）
     const ALLOW_ABOVE: usize = 6;
 
-    /// セルフテスト本体（`mod self_test {` から、行頭の閉じ括弧まで）の行。行番号は 1 始まり
-    fn self_test_region(src: &str) -> Vec<(usize, &str)> {
+    /// セルフテスト本体（`mod self_test {` から、行頭の閉じ括弧まで）の行。行番号は 1 始まり。
+    /// 範囲取りは 1 実装（`selftest_redraw_window_watchdog` も使う）
+    pub(super) fn self_test_region(src: &str) -> Vec<(usize, &str)> {
         let mut out = Vec::new();
         let mut inside = false;
         for (index, line) in src.lines().enumerate() {
@@ -99236,6 +99356,153 @@ mod selftest_launch_withdraw_watchdog {
             "fn product(&mut self) {\n    self.launch_tako_command(\"setup\", \"setup\", cx);\n}\nmod self_test {\n}\n"
         )
         .is_empty());
+    }
+}
+
+/// 項目 107（#782）の判定が、#1979 の上限の時計も空けてから出力を流す形の番犬（#2490）。
+///
+/// 判定は「要求するなら即座に要求する」状態で出力を流し、その場の要求数を数える。間引きの時計は
+/// フォーカス中の 16ms（`last_term_notify`）とフォーカスの無いペインの上限（`last_unfocused_flush`）の
+/// 2 つで、前者だけを巻き戻していた修正前は、直前の 1 間隔（既定 33ms）以内にフォーカスの無い
+/// ペインの再描画が流れた回だけ裏タブの OSC が予約へ回り、要求数 0 で落ちていた（10/29 に 8 本中
+/// 4 本）。見るのは ① 窓を空ける 1 実装 [`HELPER`] が両方の時計を書いている ② 項目 107 の
+/// 流し込み [`FEED`] がその 1 実装を通り、通った後から最初の `on_term_event` までに時計を書き戻さない
+#[cfg(test)]
+mod selftest_redraw_window_watchdog {
+    use super::selftest_launch_withdraw_watchdog::self_test_region;
+
+    /// 窓を空ける 1 実装（関数の頭）
+    const HELPER: &str = "fn open_redraw_windows(";
+    const HELPER_CALL: &str = "open_redraw_windows(";
+    /// 項目 107 の流し込み（クロージャの頭）
+    const FEED: &str = "let feed782 =";
+    const FEED_EVENT: &str = "on_term_event(";
+    /// 間引きの時計（フォーカス中の 16ms / #1979 のフォーカスの無いペインの上限）への代入
+    const CLOCKS: &[&str] = &[".last_term_notify =", ".last_unfocused_flush ="];
+
+    fn code(line: &str) -> bool {
+        !line.trim_start().starts_with("//")
+    }
+
+    fn indent(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    /// `head` を含む行から、同じ字下げの閉じ括弧の行までの行（行番号つき）
+    fn block<'a>(lines: &[(usize, &'a str)], head: &str) -> Option<Vec<(usize, &'a str)>> {
+        let start = lines
+            .iter()
+            .position(|(_, l)| code(l) && l.contains(head))?;
+        let depth = indent(lines[start].1);
+        let mut out = vec![lines[start]];
+        for &(number, line) in &lines[start + 1..] {
+            out.push((number, line));
+            if indent(line) == depth && line.trim_start().starts_with('}') {
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    /// 違反（行番号と理由）。見つからない（= 番犬が何も見ていない）も違反に数える（行番号 0）
+    fn violations(src: &str) -> Vec<(usize, String)> {
+        let lines = self_test_region(src);
+        let mut out = Vec::new();
+        match block(&lines, HELPER) {
+            None => out.push((0, format!("`{HELPER}` が見つからない"))),
+            Some(body) => {
+                for clock in CLOCKS {
+                    if !body.iter().any(|(_, l)| code(l) && l.contains(clock)) {
+                        out.push((
+                            body[0].0,
+                            format!("窓を空ける 1 実装が `{clock}` を書いていない"),
+                        ));
+                    }
+                }
+            }
+        }
+        match block(&lines, FEED) {
+            None => out.push((0, format!("`{FEED}` が見つからない"))),
+            Some(body) => {
+                let open = body
+                    .iter()
+                    .position(|(_, l)| code(l) && l.contains(HELPER_CALL));
+                let first_event = body
+                    .iter()
+                    .position(|(_, l)| code(l) && l.contains(FEED_EVENT));
+                match (open, first_event) {
+                    (Some(open), Some(event)) if open < event => {
+                        for &(number, line) in &body[open + 1..event] {
+                            if code(line) && CLOCKS.iter().any(|c| line.contains(c)) {
+                                out.push((
+                                    number,
+                                    "窓を空けた後、流す前に時計を書き戻している".into(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => out.push((
+                        body[0].0,
+                        "流し込みが窓を空ける 1 実装を通ってから出力を流していない".into(),
+                    )),
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn 項目107は両方の時計を空けてから出力を流す() {
+        let src = include_str!("main.rs");
+        let hits = violations(src);
+        assert!(
+            hits.is_empty(),
+            "main.rs{hits:?}: 項目 107（#782）の判定は、フォーカス中の 16ms と #1979 の上限の \
+             両方の時計を `open_redraw_windows` で空けてから出力を流すこと。16ms の時計だけを \
+             巻き戻すと、直前の 33ms 以内にフォーカスの無いペインの再描画が流れた回だけ裏タブの \
+             OSC が予約へ回り、要求数 0 で間欠的に落ちる（#2490）"
+        );
+    }
+
+    /// 検出力の担保: 修正前の 2 つの形と、空けた窓を閉じ直す形を名指しする
+    #[test]
+    fn 番犬は時計を片方しか空けない形を名指しする() {
+        let wrap = |body: &str| format!("fn outside() {{}}\nmod self_test {{\n{body}}}\n");
+        let lines_of = |src: &str| {
+            violations(src)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>()
+        };
+        // 行 3〜7 が 1 実装、行 8〜14 が流し込み
+        let helper = "    fn open_redraw_windows(app: &mut TakoApp) {\n        let ago = rewound(d);\n        app.last_term_notify = ago;\n        app.last_unfocused_flush = ago;\n    }\n";
+        let feed = "        let feed782 = |cx, pane, osc| {\n            w.update(cx, |app, _, cx| {\n                app.last_unfocused_flush = Instant::now();\n                open_redraw_windows(app);\n                app.on_term_event(t, e, cx);\n            })\n        };\n";
+        // 注入（窓を空ける前の書き込み）は通る
+        assert!(lines_of(&wrap(&format!("{helper}{feed}"))).is_empty());
+        // ① 1 実装が #1979 の時計を書かない
+        let helper_legacy = helper.replace("        app.last_unfocused_flush = ago;\n", "");
+        assert_eq!(lines_of(&wrap(&format!("{helper_legacy}{feed}"))), vec![3]);
+        // ② 流し込みが 1 実装を通らず 16ms の時計だけを直に巻き戻す（修正前の形）
+        let feed_legacy = feed.replace(
+            "open_redraw_windows(app);",
+            "app.last_term_notify = rewound(d);",
+        );
+        assert_eq!(lines_of(&wrap(&format!("{helper}{feed_legacy}"))), vec![8]);
+        // コメントの中の呼び出しは通ったことにしない
+        let feed_comment =
+            feed.replace("open_redraw_windows(app);", "// open_redraw_windows(app);");
+        assert_eq!(lines_of(&wrap(&format!("{helper}{feed_comment}"))), vec![8]);
+        // ③ 空けた窓を流す前に閉じ直す
+        let feed_closed = feed.replace(
+            "open_redraw_windows(app);\n",
+            "open_redraw_windows(app);\n                app.last_unfocused_flush = Instant::now();\n",
+        );
+        assert_eq!(lines_of(&wrap(&format!("{helper}{feed_closed}"))), vec![12]);
+        // 本体の外は見ない（= 見つからないとして落ちる。何も見ずに通らない）
+        assert_eq!(
+            lines_of(&format!("{helper}{feed}mod self_test {{\n}}\n")),
+            vec![0, 0]
+        );
     }
 }
 
