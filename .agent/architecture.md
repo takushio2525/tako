@@ -772,6 +772,13 @@ tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無
   dispatch → host の 1 実装。PTY の張り替えは `after_dispatch` が消化して応答を実際へ差し替える）。
   psmux（Windows）は attach クライアントの終わり方を実測していないので従来どおり。
   A/B は `TAKO_1857_LEGACY=1`、番犬は `crates/tako-control/tests/issue1857_backend_reattach_watchdog.rs`
+- **復元で 1 つの器を 2 本の端末へ繋がない**（#2486。2026-10-29）: `-D` の収束は「同じペインの多重起動」には
+  正しいが、`layout.json` で表のペインどうしが同じ器の名前を持つと、2 本目が 1 本目を切り離し、上の判定
+  （別のクライアントが attach 中）で 1 本目が**ペインごと閉じる**。復元ループは名前を `layout.json` から直接使わず、
+  `tako_control::restore_vessels::TabVessels::claim` の結果（`vessel()`）から取る: 復元の順で最初のペインが器を持ち、
+  2 本目以降は `None`（= `wrap_spawn_for_pane` が新しい器を払い出す）。会話の resume は器が生きている・先のペインと
+  同じ会話なら止め、persist.log に `器の名前の重複: …` を 1 行（FR-5.22）。退避の重複は `shelved_restore::plan`（#1576）。
+  A/B は `TAKO_2486_LEGACY=1`、番犬は `crates/tako-control/tests/issue2486_duplicate_vessel_watchdog.rs`
 - **復元の直後の全滅で終了しない**（#641。2026-10-28）: 最後のタブが PTY 死亡で閉じると
   `remove_tab_with` の LastTab 分岐が終了する（#30）。起動時に器へ繋いだペインが繋いだ直後に
   全滅すると、次の起動も同じ復元で即終了するループになる（Windows の psmux で GUI が立ち上がらなかった）。

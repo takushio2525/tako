@@ -1183,6 +1183,10 @@ pub enum FreshShellReason {
     /// **その系統をこの環境では復元できない**（#1238）。
     /// 「保存されていない」（`NoSessionId`）と混ぜると原因が読めない
     ResumeUnsupported,
+    /// **器の名前を先のペインと重複して持っていた**（#2486）。新しい器で起こし、
+    /// 会話は resume しない（器の中で動いているのがどちらの会話か分からない /
+    /// 先のペインと同じ会話。判断は `crate::restore_vessels`）
+    DuplicateVessel,
 }
 
 impl FreshShellReason {
@@ -1193,6 +1197,7 @@ impl FreshShellReason {
             Self::InvalidSessionId => "形式不正",
             Self::TranscriptMissing => "会話が見つからない",
             Self::ResumeUnsupported => "resume 非対応",
+            Self::DuplicateVessel => "器の名前の重複",
         }
     }
 }

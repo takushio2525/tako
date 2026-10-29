@@ -97,6 +97,7 @@ pub mod resources;
 /// 復元の直後の全滅ガード（#641。全ペイン PTY 死亡で終了せず救済・連続したら復元を見送る）
 pub mod restore_guard;
 pub mod restore_report;
+pub mod restore_vessels;
 pub mod resume_launch;
 pub mod run_configs;
 pub mod runtime_probe;
