@@ -47,9 +47,23 @@ mod tests {
     #[cfg(unix)]
     const SHELL_PROBE_ENV: &str = "TAKO_1253_SHELL_PROBE";
 
-    /// シェル probe が打つコマンドの目印
+    /// シェル probe が打つコマンドの出力の目印（打った行のエコーには現れない。[`shell_probe_line`]）
     #[cfg(unix)]
     const SHELL_PROBE_MARKER: &str = "TAKO_1253_HISTORY_MARKER";
+
+    /// 子のシェル probe が打った行の実行まで見届けたときに出す目印（#2479）。
+    /// 親はこれが無ければ落とす = probe が走らないまま「履歴が無い」で緑になる形を塞ぐ
+    #[cfg(unix)]
+    const SHELL_PROBE_DONE: &str = "TAKO_2479_PROBE=executed";
+
+    /// シェル probe の待ちの素の上限（混み具合で伸ばす前。#2479）。**旧の固定窓（20 秒）より
+    /// 広く採る**（等しいと空いている機で旧と同じ形になる。#771 / #1308 と同じ理由）
+    #[cfg(unix)]
+    const SHELL_PROBE_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// 打った行を送り直す回数の上限（間隔 = 予算 / これ。予算を伸ばしても回数は増えない）
+    #[cfg(unix)]
+    const SHELL_PROBE_MAX_SENDS: u32 = 8;
 
     /// 出力ゼロで終わった子を起こし直す上限（初回を含む。[`run_child_at`]。#1832）
     const SILENT_CHILD_ATTEMPTS: usize = 3;
@@ -343,39 +357,160 @@ mod tests {
     /// 既定シェルを PTY で起こして 1 行打つ（#1253 の子 probe 本体）。
     ///
     /// 本番ならここで**対話ログインシェル**がユーザーの `~/.zsh_history` へ積む。
-    /// 待ちは固定時間ではなく**画面の状態**で切る（`conventions.md` の待ち条件）
+    /// 待ちは固定時間ではなく**画面の状態**で切り、尽きたら次へ進まずに落とす
+    /// （[`wait_for_shell`]。#2479）。**前提（シェルが上がった）と本題（打った行が
+    /// 実行された）は別々に待つ**（#1308 と同じ理由: 1 つの窓にまとめると
+    /// 「準備ができていない」と「本題が壊れた」が同じ失敗に見える）
     #[cfg(unix)]
     fn shell_probe() {
         use tako_core::terminal::{SpawnOptions, TerminalSession};
 
-        let Ok((session, _rx)) = TerminalSession::spawn(80, 24, SpawnOptions::default()) else {
-            eprintln!("skip: 既定シェルの PTY を張れない");
-            return;
+        // tako:login-shell-ok 主題が対話ログインシェルの履歴（#1253）なのでログインシェル自体が要る
+        let spawned = TerminalSession::spawn(80, 24, SpawnOptions::default());
+        let (session, _rx) = spawned.unwrap_or_else(|e| {
+            panic!(
+                "TAKO_2479_PROBE: 既定シェル（{}）の PTY を張れない = 履歴の番犬が何も見られない: {e}",
+                shell_name()
+            )
+        });
+        let screen = || session.visible_lines().join("\n");
+        // 前提: ログインシェルが上がる（画面に何か出る）。上がる前に打った行は食われる
+        wait_for_shell(
+            "ログインシェルのプロンプト",
+            None,
+            &screen,
+            &|s| !s.trim().is_empty(),
+        );
+        // 本題: 打った行が実行される = **出力にだけ現れる**マーカーが見える
+        // （[`shell_probe_line`]）。`INC_APPEND_HISTORY` はコマンドの確定時に追記するので、
+        // ここまで来れば履歴も書かれている
+        let send = || session.write(shell_probe_line().into_bytes());
+        wait_for_shell("打った行の実行", Some(&send), &screen, &probe_executed);
+        println!("{SHELL_PROBE_DONE}");
+    }
+
+    /// 画面（行を `\n` でつないだもの）から「打った行が実行された」を読む（#2479）。
+    /// 目印は出力にだけ現れる（[`shell_probe_line`]）ので、1 本見えれば足りる
+    #[cfg(unix)]
+    fn probe_executed(screen: &str) -> bool {
+        screen.contains(SHELL_PROBE_MARKER)
+    }
+
+    /// シェル probe が打つ行（#2479）。マーカーを `""` で割って打つので、**打った行の
+    /// エコーにはマーカーが現れず、実行した出力にだけ現れる**（sh / bash / zsh / dash で実測）。
+    ///
+    /// 旧実装は `echo <マーカー>` を打ち、「マーカーを含む行が 2 本（エコーと出力）」で実行を
+    /// 判定していた。子のシェルの cwd は空の HOME（`$TMPDIR` の下 = `/private/var/…` へ
+    /// 解決されて `~` に縮まない）なので、プロンプトに長い一時 dir 名が載り、打った行が
+    /// 80 桁で折り返すと**エコー側のマーカーが 2 行に割れて**数えられない。ユーザー名と
+    /// ホスト名の長さ次第で、毎回 20 秒の窓を使い切って警告だけで通っていた（手元で実測）。
+    /// 出力のマーカーは行頭から 24 桁なので折り返さない
+    #[cfg(unix)]
+    fn shell_probe_line() -> String {
+        let (head, tail) = SHELL_PROBE_MARKER.split_at(SHELL_PROBE_MARKER.len() / 2);
+        format!("echo {head}\"\"{tail}\r")
+    }
+
+    /// 失敗文に載せる既定シェルの名前（**ファイル名だけ**。`$SHELL` がホームの下を
+    /// 指していても実ホームパスを出さない = #927）
+    #[cfg(unix)]
+    fn shell_name() -> String {
+        let shell = std::env::var("SHELL").unwrap_or_default();
+        Path::new(&shell).file_name().map_or_else(
+            || "unknown".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// 失敗文に添える機の状態（load の 3 値・メモリ圧・swap。採れない OS では `unknown`）。
+    /// 予算は load だけで伸ばすので、load では見えない詰まりも失敗文だけで読めるようにする
+    /// （#1308 の 10/25 と同じ理由）
+    #[cfg(unix)]
+    fn machine_line() -> String {
+        let Some(m) = tako_core::platform::resources::machine() else {
+            return "load=unknown pressure=unknown swap=unknown".to_string();
         };
-        let poll = std::time::Duration::from_millis(50);
-        // プロンプトが出てから打つ（出る前に打つと行が食われる）
-        let ready = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while session.visible_lines().iter().all(|l| l.trim().is_empty())
-            && std::time::Instant::now() < ready
-        {
-            std::thread::sleep(poll);
-        }
-        session.write(format!("echo {SHELL_PROBE_MARKER}\r").into_bytes());
-        // 打った行のエコーと出力の 2 本が見えたら、履歴も書かれている
-        // （`INC_APPEND_HISTORY` はコマンド確定時に追記する）
-        let done = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while std::time::Instant::now() < done {
-            let hits = session
-                .visible_lines()
-                .iter()
-                .filter(|l| l.contains(SHELL_PROBE_MARKER))
-                .count();
-            if hits >= 2 {
+        let load = m.load.map_or("unknown".to_string(), |l| {
+            format!("{:.1}/{:.1}/{:.1}", l[0], l[1], l[2])
+        });
+        let pressure = m
+            .pressure_level
+            .map_or("unknown".to_string(), |p| p.to_string());
+        let swap = m.swap.map_or("unknown".to_string(), |(used, total)| {
+            format!("{}/{}MB", used >> 20, total >> 20)
+        });
+        format!("load={load} pressure={pressure} swap={swap}")
+    }
+
+    /// シェル probe の状態待ち（#2479）。`ready`（その時点の画面を受ける）が真になるまで待ち、
+    /// **尽きたら次の手順へ進まずに理由つきで落とす**。
+    ///
+    /// 旧実装は固定 20 秒の窓でプロンプトを待ち、尽きても検査せずに打ち、打った行の実行も
+    /// 20 秒待って出そろわなければ警告だけで返していた（#1308 と同じ形）。打った行が
+    /// 実行されなければ履歴は書かれないので、**番犬が何も見ないまま「履歴へ書かない」で緑**になる。
+    ///
+    /// - 上限は `wait_budget::state_wait_budget`（混み具合で伸ばすだけ・4 倍で打ち切り）
+    /// - `send` を渡すと届くまで上限つきで送り直す（#1165 / #1308 と同じ形。「画面に何か
+    ///   出た」は zle が上がった証拠としては弱く、起動途中の PTY は打鍵を落とす = #640）。
+    ///   間隔は予算に比例 = 混み具合が変わっても送る回数は変わらない
+    /// - 失敗文は見出し `TAKO_2479_WAIT:` の 1 行に値をすべて載せ、続けて画面を出す
+    ///   （#1308 の 10/25: 値を 2 行目に置くと `grep` で消える）
+    #[cfg(unix)]
+    fn wait_for_shell(
+        what: &str,
+        send: Option<&dyn Fn()>,
+        screen: &dyn Fn() -> String,
+        ready: &dyn Fn(&str) -> bool,
+    ) {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let busy = tako_core::wait_budget::machine_busy();
+        let budget = tako_core::wait_budget::state_wait_budget(SHELL_PROBE_BASE, busy);
+        let every = budget / SHELL_PROBE_MAX_SENDS;
+        let mut next_send = started;
+        let mut sends = 0u32;
+        let mut last_screen = String::new();
+        let mut changes = 0u32;
+        let mut last_change: Option<Duration> = None;
+        loop {
+            let now = screen();
+            if now != last_screen {
+                changes += 1;
+                last_change = Some(started.elapsed());
+                last_screen = now.clone();
+            }
+            if ready(&now) {
                 return;
             }
-            std::thread::sleep(poll);
+            if started.elapsed() >= budget {
+                let fmt_busy =
+                    |b: Option<f64>| b.map_or("unknown".to_string(), |b| format!("{b:.2}"));
+                panic!(
+                    "TAKO_2479_WAIT: 待っていたもの={what} waited={:.1}s budget={:.1}s \
+                     base={:.1}s busy={}→{} {} sends={sends} screen_changes={changes} \
+                     last_change={} shell={}\n\
+                     固定窓ではなく状態で待っている。尽きたまま次へ進むと、履歴が書かれないまま\
+                     「履歴へ書かない」で緑になる（#2479）\n届いたもの=画面:\n{now}",
+                    started.elapsed().as_secs_f64(),
+                    budget.as_secs_f64(),
+                    SHELL_PROBE_BASE.as_secs_f64(),
+                    fmt_busy(busy),
+                    fmt_busy(tako_core::wait_budget::machine_busy()),
+                    machine_line(),
+                    last_change.map_or("never".to_string(), |d| format!("{:.1}s", d.as_secs_f64())),
+                    shell_name(),
+                );
+            }
+            if Instant::now() >= next_send {
+                if let Some(send) = send {
+                    send();
+                    sends += 1;
+                }
+                next_send = Instant::now() + every;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        eprintln!("warn: シェル probe のマーカーが画面に出そろわなかった");
     }
 
     #[test]
@@ -516,10 +651,21 @@ mod tests {
                 .collect()
         };
 
+        // 子が打った行の実行まで見届けたか（#2479）。見届けずに返る子だと、下の「履歴が無い」は
+        // 何も見ていない緑になる。`--nocapture` の libtest は `test <名前> ... ` の後ろへ
+        // 改行せずに続けるので、行頭ではなく部分一致で拾う（#2248）
+        let probed = |stdout: &str| {
+            assert!(
+                stdout.contains(SHELL_PROBE_DONE),
+                "子のシェル probe が打った行の実行まで見届けていない（#2479）\n{stdout}"
+            );
+        };
+
         let home = prepare("histfix");
         let (ok, stdout, created) = run_child_with(&home, None, false, &[(SHELL_PROBE_ENV, "1")]);
         let _ = std::fs::remove_dir_all(&home);
         assert!(ok, "子テストが失敗した\n{stdout}");
+        probed(&stdout);
         assert!(
             history_files(&created).is_empty(),
             "検証プロセスがユーザーのシェル履歴へ書いた（#1253）: {:#?}",
@@ -537,12 +683,50 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&home);
         assert!(ok, "子テストが失敗した\n{stdout}");
+        probed(&stdout);
         if history_files(&created).is_empty() {
             eprintln!(
                 "skip(A/B のみ): 既定シェル（{}）が履歴ファイルを持たないので旧挙動を実証できない",
                 std::env::var("SHELL").unwrap_or_default()
             );
         }
+    }
+
+    /// #2479: シェル probe の「打った行が実行された」は、**打った行のエコーと折り返しに
+    /// 左右されない**。
+    ///
+    /// 旧実装は「目印を含む行が 2 本（エコーと出力）」で判定していて、打った行が 80 桁で
+    /// 折り返すとエコー側の目印が 2 行に割れて成り立たなかった（下の `executed` は手元で
+    /// 実測した画面の形。ユーザー名・ホスト名・時刻はプレースホルダ）。送り直しを足すと、
+    /// 逆にエコー 2 本だけで（実行されていなくても）成り立つ形でもあった
+    #[test]
+    #[cfg(unix)]
+    fn シェルprobeの実行の判定は打った行のエコーと折り返しに左右されない() {
+        let typed = shell_probe_line();
+        let echo = typed.trim_end_matches('\r');
+        assert!(
+            !echo.contains(SHELL_PROBE_MARKER),
+            "打つ行に目印がそのまま入っている = エコーだけで実行に見える: {echo:?}"
+        );
+        // 実行されない（tty のエコーだけが送り直しのたびに積もる）画面は、どの桁で
+        // 折り返しても実行と見なさない
+        let line = format!("testuser@host % {echo}");
+        for col in 1..line.len() {
+            let (a, b) = line.split_at(col);
+            let deaf = format!("{a}\n{b}\n{line}\n{line}");
+            assert!(
+                !probe_executed(&deaf),
+                "エコーだけの画面を実行と見なした（{col} 桁で折り返し）:\n{deaf}"
+            );
+        }
+        // 実行された画面（打った行は折り返している）は 1 本の出力で実行と見なす
+        let wrapped = format!("testuser@host tako-944-histfix-12345-1761700000000000000 % {echo}");
+        let (a, b) = wrapped.split_at(80);
+        let executed = format!("{a}\n{b}\n{SHELL_PROBE_MARKER}\ntestuser@host % ");
+        assert!(
+            probe_executed(&executed),
+            "実行された画面を見落とした:\n{executed}"
+        );
     }
 
     /// #1261: **テストプロセスは実 claude / codex / agy を起こさない**。
