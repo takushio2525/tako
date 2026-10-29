@@ -25,7 +25,7 @@
 //! | `pane_tty` が実在しない `/dev/pty1` を返す | [`SessionBackend::pane_tty`] は `None` を返す |
 //! | `list-clients -F` が書式指定を無視（クライアント PID が取れない） | [`super::owner`] のオーナー記録で代替（#177 の強奪ガード） |
 //! | `new-session -D` が他クライアントを切り離さない | 同上。**器に収束を期待しない** |
-//! | 既定の warm pane 先読みが 1 セッションあたり pwsh を 1 本余計に常駐させる | conf に `set -g warm off`（+243MB → +131MB/session） |
+//! | 既定の warm pane 先読みが 1 セッションあたり pwsh を 1 本余計に常駐させる | psmux 版 conf に `set -g warm off`（+243MB → +131MB/session）。**本番の spawn の conf にはまだ無い**（#2484） |
 //! | 器の中のシェルは tako の ConPTY の子ではない（コードページ固定が届かない） | [`SessionBackend::pane_pids`] で器へ `#{pane_pid}` を尋ね、器の内側にも B19 の固定を当てる（#659） |
 //! | ホイールで copy mode に入り、滞在中の打鍵をシェルへ渡さない | `#{pane_in_mode}` で確かめてから、解除キー `q` を打鍵と同じ PTY へ前置する（#686） |
 //! | `bind-key -T copy-mode …` が無反応（キーテーブル未実装。`list-keys -T copy-mode` が空） | conf での解決を諦め、上記の in-band 解除を採る |
@@ -94,6 +94,14 @@ set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL CLAUDE_CODE_PLUGI
 pub struct PsmuxBackend {
     /// psmux 実行ファイル（[`super::binary`] が解決したもの）
     bin: String,
+    /// ペインの PTY に起こす器のクライアントの実行ファイル（[`SessionBackend::wrap_spawn`]）。
+    ///
+    /// 本番（[`Self::new`]）は `tmux::tmux_bin()` = psmux が配る `tmux.exe`。#885 まで本番の
+    /// spawn は `tmux_backend::wrap_options` を直接呼んでいて、Windows の実機で確かめてきたのは
+    /// この形なので、wrap_spawn を本番へ通すにあたって argv を変えないためにそのまま引き継ぐ
+    /// （他の操作と同じ `bin` へ寄せるかは実機の確認が要るので #885 では扱わない）。
+    /// [`Self::with_parts`]（検証）は `bin` そのもの
+    client: String,
     /// 専用サーバーのソケット名（`-L`）。tmux 版と同じ解決を使う
     /// （`TAKO_TMUX_SOCKET` = `TAKO_ISOLATED` の一括隔離が psmux にもそのまま効く）
     socket: String,
@@ -108,12 +116,15 @@ pub struct PsmuxBackend {
 
 impl PsmuxBackend {
     pub fn new(bin: String, version: String) -> Self {
-        Self::with_parts(
-            bin,
-            version,
-            crate::tmux_backend::socket_name(),
-            owner_dir(),
-        )
+        Self {
+            client: crate::tmux::tmux_bin().to_string(),
+            ..Self::with_parts(
+                bin,
+                version,
+                crate::tmux_backend::socket_name(),
+                owner_dir(),
+            )
+        }
     }
 
     /// ソケットとオーナー記録の置き場を明示しての構築。
@@ -124,6 +135,7 @@ impl PsmuxBackend {
                 bin: bin.clone(),
                 socket: socket.clone(),
             },
+            client: bin.clone(),
             bin,
             socket,
             version,
@@ -204,16 +216,19 @@ pub fn verified_conf() -> &'static str {
 const CONF_FILE_NAME: &str = "psmux-backend.conf";
 
 /// 専用 conf をデータディレクトリへ書き出し、そのパスを返す（内容が変わっていれば
-/// 上書き = バージョン更新追従）。書けない環境では `None` を返し、`-f` を付けずに
-/// 起動する（ユーザー conf を読む可能性は残るが、器が作れないよりはよい）
+/// 上書き = バージョン更新追従）。書けない環境では `None` を返す。
+///
+/// **本番のペインの spawn はこの conf を使わない**（#885 から `wrap_spawn` は本番の conf =
+/// `tmux_backend::ensure_conf` を使う）。使うのは `PsmuxBackend::sync_config` と検証で、
+/// 本番へ入れるかは #2484 で扱う
 pub fn ensure_conf() -> Option<PathBuf> {
     write_conf_in(&data_dir()?, BACKEND_CONF).ok()
 }
 
 /// conf を `dir` へ**原子的に**置き、そのパスを返す（#1314）。
 ///
-/// **一時ファイル → rename で差し替える**。[`PsmuxBackend::wrap_spawn`] はペインを
-/// spawn するたびにここを通るので、複数ペイン・複数インスタンス（本番 GUI + 隔離 GUI +
+/// **一時ファイル → rename で差し替える**。#885 までの `PsmuxBackend::wrap_spawn` はペインを
+/// spawn するたびにここを通っていたので、複数ペイン・複数インスタンス（本番 GUI + 隔離 GUI +
 /// テスト）が重なると「書き手が truncate している最中の conf」を、別ペインが起動した
 /// psmux サーバーが `-f` で読みうる。読ませると器は既定設定（status on / warm on /
 /// history-limit 既定）で立ち上がり、ステータスバーが出る・warm pane が pwsh を
@@ -318,59 +333,40 @@ impl SessionBackend for PsmuxBackend {
         SessionRef::new(candidate).ok()
     }
 
-    /// `psmux -u -L <socket> -f <conf> new-session -A -D -s <name> [-e K=V]… [-c cwd] [command]`
+    /// `<client> -u -L <socket> -f <conf> new-session -A -D -s <name> [-e K=V]… [-c cwd] [command]`
     ///
-    /// 形は tmux 版（`tmux_backend::wrap_options`）と同じで、実測で全項目の反映を確認済み
-    /// （`-e` 2 本・`-c`・conf の `history-limit`）。**`-D` は psmux では現状効かない**が、
-    /// psmux が実装したときに tmux と同じ収束挙動へ戻るよう残す。効かない前提の安全策は
-    /// オーナー記録（下）であって、このフラグではない
+    /// **組み立ては tmux 版と同じ 1 実装**（`tmux_backend::wrap_options_for`）。本番のペインの
+    /// spawn は #885 からここを通る（`backend::wrap_spawn_for_pane`）。#885 まではここに psmux 版の
+    /// 組み立て（psmux 版 conf = `BACKEND_CONF`・クライアント = `bin`）を持っていたが、本番は
+    /// それを通らず tmux 版を直接呼んでいたので、**本番が Windows の実機で走らせてきた形を正にした**:
+    /// conf は器の能力で組む本番の conf（#974）、クライアントは [`Self::new`] の `client`。
+    /// psmux 版 conf にだけある `warm off` を本番へ入れるかは実機の確認が要るので別に扱う（#2484）。
+    /// 内側コマンドの書き方だけはこの器の能力（`quotes_program = false`。#881）で決める。
+    ///
+    /// 形は実測で全項目の反映を確認済み（`-e` 2 本・`-c`・conf の `history-limit`）。
+    /// **`-D` は psmux では現状効かない**が、psmux が実装したときに tmux と同じ収束挙動へ
+    /// 戻るよう残す。効かない前提の安全策はオーナー記録（下）であって、このフラグではない
     fn wrap_spawn(&self, options: SpawnOptions, session: &SessionRef) -> SpawnOptions {
-        // 器を握るのはこの瞬間（= 実際に attach する時点）。#177 の強奪ガードの材料になる
+        // 器を握るのはこの瞬間（= 実際に attach する時点）。#177 の強奪ガードの材料になる。
+        // 手放すのはペインを閉じたとき（[`Self::release`] / [`Self::kill`]）
         if let Claim::Foreign(pid) = self.owners.claim(session) {
             eprintln!(
                 "warning: 器 {session} は別インスタンス（pid {pid}）が使用中のまま attach する\
                  （psmux は -D で切り離せないため、両方のクライアントが残る）"
             );
         }
-        let mut args = vec!["-u".to_string(), "-L".to_string(), self.socket.clone()];
-        if let Some(conf) = ensure_conf() {
-            args.push("-f".to_string());
-            args.push(conf.display().to_string());
-        }
-        args.extend([
-            "new-session".to_string(),
-            "-A".to_string(),
-            "-D".to_string(),
-            "-s".to_string(),
-            session.as_str().to_string(),
-        ]);
-        // ペイン固有の環境変数はセッション作成時に確定させる（tmux 版と同じ理由。
-        // サーバーのグローバル環境から stale な値を拾わせない）
-        for (key, val) in crate::backend::session_pinned_pairs(&options.env, &self.socket) {
-            args.push("-e".to_string());
-            args.push(format!("{key}={val}"));
-        }
-        if let Some(cwd) = &options.cwd {
-            args.push("-c".to_string());
-            args.push(cwd.display().to_string());
-        }
-        // 明示コマンドは psmux の引数パーサに合わせて 1 引数へ畳む。
-        // 未指定なら統合を読ませた既定シェル（#2432）。それも無ければ渡さない
-        // （psmux の default-shell = pwsh がそのまま立つ）
-        if let Some(inner) = options
-            .command
-            .clone()
-            .or_else(crate::shell_integration::pane_shell)
-        {
-            args.push(inner_command(&inner));
-        }
-        SpawnOptions {
-            command: Some(SpawnCommand {
-                program: self.bin.clone(),
-                args,
-            }),
-            ..options
-        }
+        crate::tmux_backend::wrap_options_for(
+            options,
+            &self.client,
+            self.capabilities().quotes_program,
+            &self.socket,
+            session.as_str(),
+        )
+    }
+
+    /// 器のオーナー記録を外す（#885）。器そのものは消さない
+    fn release(&self, session: &SessionRef) {
+        self.owners.release(session);
     }
 
     fn exists(&self, session: &SessionRef) -> bool {
@@ -1439,6 +1435,108 @@ mod tests {
             b.is_orphan_candidate(&info, &HashSet::new()),
             "所有者が居なくなれば残骸候補になる"
         );
+    }
+
+    /// #885: 本番のペインの spawn の入口（`backend::wrap_spawn_for_pane`）を通すと、psmux の器は
+    /// その場で器のオーナー記録を取り（#177 の強奪ガードの材料）、ペインを閉じたら手放す。
+    /// #885 までは本番がこの入口を通らず、記録が 1 件も作られていなかった
+    #[test]
+    fn 本番のspawn入口を通るとオーナー記録を取り閉じると手放す() {
+        let b: &'static PsmuxBackend = Box::leak(Box::new(backend()));
+        let spawn = crate::backend::wrap_spawn_for_pane(
+            b,
+            true,
+            None,
+            || "tako-885000000001".to_string(),
+            SpawnOptions::default(),
+        );
+        let s = spawn.session.expect("psmux は器を配る");
+        assert_eq!(
+            b.owners.holder(&s),
+            Some(std::process::id()),
+            "器を配ったのにオーナー記録が無い"
+        );
+        b.release(&s);
+        assert_eq!(
+            b.owners.holder(&s),
+            None,
+            "閉じた器のオーナー記録が残っている"
+        );
+    }
+
+    /// #885: 別インスタンスが握っている器へ本番の入口から attach しても記録を奪わない
+    /// （警告だけ出して attach する = #177 の強奪ガードは `foreign_holders` でこれを見る）
+    #[test]
+    fn 別インスタンスが握る器は本番の入口でも記録を奪わない() {
+        let b: &'static PsmuxBackend = Box::leak(Box::new(backend()));
+        let s = session("tako-885000000002");
+        // 同じ置き場を別の記録簿から握る = 別インスタンス（ロックはハンドル単位で排他される）
+        let other = OwnerRecords::new(crate::test_residue::process_scratch("psmux-unit"));
+        assert_eq!(other.claim_as(&s, 424243), Claim::Ours);
+        let spawn = crate::backend::wrap_spawn_for_pane(
+            b,
+            true,
+            Some(s.as_str()),
+            || unreachable!("既存の器の名前があるのに候補名を払い出した"),
+            SpawnOptions::default(),
+        );
+        assert_eq!(spawn.session.as_ref(), Some(&s));
+        assert_eq!(
+            b.owners.holder(&s),
+            Some(424243),
+            "別インスタンスの記録を奪った"
+        );
+        assert_eq!(
+            b.foreign_holders(std::slice::from_ref(&s))
+                .iter()
+                .map(|h| h.pid)
+                .collect::<Vec<_>>(),
+            vec![424243]
+        );
+        other.release(&s);
+    }
+
+    /// #885: 本番（[`PsmuxBackend::new`]）の組み立ては、#885 まで本番の Windows が走らせてきた形
+    /// （`tmux_backend::wrap_options` の直呼び）とバイト等価。クライアントも `tmux_bin()` のまま
+    #[test]
+    fn 本番のpsmuxの組み立ては885前の本番の直呼びとバイト等価() {
+        let b = PsmuxBackend::new("psmux".into(), VERIFIED_VERSION.into());
+        let s = session("tako-885000000003");
+        let socket = crate::tmux_backend::socket_name();
+        let options = SpawnOptions {
+            command: None,
+            cwd: Some(PathBuf::from("C:\\work")),
+            env: vec![
+                ("TAKO_PANE_ID".into(), "7".into()),
+                ("TAKO_TOKEN".into(), "secret".into()),
+                ("TAKO_TAB_ID".into(), "3".into()),
+            ],
+            scrollback_lines: None,
+        };
+        // #885 前の本番 = 大域の器（本番の Windows では psmux そのもの）の書き方で組む直呼び。
+        // 器の無いテスト機では大域の書き方が違うので、本番の Windows の書き方（psmux）で組む
+        let before = if crate::backend::capabilities().quotes_program
+            == b.capabilities().quotes_program
+            || crate::shell_integration::pane_shell().is_none()
+        {
+            crate::tmux_backend::wrap_options(options.clone(), &socket, s.as_str())
+        } else {
+            crate::tmux_backend::wrap_options_for(
+                options.clone(),
+                crate::tmux::tmux_bin(),
+                b.capabilities().quotes_program,
+                &socket,
+                s.as_str(),
+            )
+        };
+        let after = b.wrap_spawn(options, &s);
+        let (before_cmd, after_cmd) = (before.command.unwrap(), after.command.unwrap());
+        assert_eq!(after_cmd.program, crate::tmux::tmux_bin());
+        assert_eq!(after_cmd.program, before_cmd.program);
+        assert_eq!(after_cmd.args, before_cmd.args);
+        assert_eq!(after.env, before.env);
+        assert_eq!(after.cwd, before.cwd);
+        b.release(&s);
     }
 
     #[test]

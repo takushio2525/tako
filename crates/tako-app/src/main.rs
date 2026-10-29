@@ -1594,6 +1594,14 @@ fn new_backend_session_name() -> String {
     format!("{}{tail}", tako_core::tmux_backend::SESSION_PREFIX)
 }
 
+/// このインスタンスが器を手放したことを backend へ伝える（#885。psmux は器のオーナー記録 =
+/// #177 の強奪ガードの材料を外す。tmux / 器なしは何もしない）。器そのものは消さない
+fn release_backend_session(name: &str) {
+    if let Ok(session) = tako_core::backend::SessionRef::new(name) {
+        tako_core::backend::backend().release(&session);
+    }
+}
+
 /// プレビューを開く（提案チップ承諾アクションの**差し替え点**）。
 /// 当面は外部ブラウザで開き、Phase 5 で Web ビューペイン（FR-3.8）が入ったら
 /// ここをペイン生成（`tako_open_url` 相当）へ差し替える
@@ -10633,6 +10641,10 @@ impl TakoApp {
         let mut backend_session = None;
         // #2367: 器の新しいペイン（`new-session -A`）を起こしたか（器の tmux サーバーの上限を記録する）
         let mut container_spawn = false;
+        // #2092: 器（psmux）の中のシェルの文字コード固定（#659）も、PTY 直下の子の固定と
+        // 同じ門に載せて入力を預からせる（#2092 前はこの経路で器の内側が固定されていなかった）。
+        // unix は固定が要らないので None（器への問い合わせもスレッドも作らない）
+        let container_pin;
         // #1857: 再 attach は attach 専用のクライアント（セッションが終わっていたら作らずに
         // 失敗する）。既存のセッションへ繋ぎ直すだけなので、persist の設定を後から OFF に
         // していても器を持つペインなら張り替える（設定は以後のペインの作り方 = FR-5.5）
@@ -10649,39 +10661,58 @@ impl TakoApp {
                 &tako_core::tmux_backend::socket_name(),
                 &name,
             );
+            container_pin = tako_core::encoding_pin::ContainerPin::for_session(&name);
             backend_session = Some(name);
-        } else if !direct
-            && self.tmux_persist
-            && tako_core::backend::capabilities().survives_app_exit
-        {
-            let name = self
-                .backend_sessions
-                .entry(pane_id)
-                .or_insert_with(new_backend_session_name)
-                .clone();
-            options = tako_core::tmux_backend::wrap_options(
-                options,
-                &tako_core::tmux_backend::socket_name(),
-                &name,
-            );
-            backend_session = Some(name);
-            container_spawn = true;
         } else {
-            self.backend_sessions.remove(&pane_id);
+            // #885: 器を配るか・器の中でどう起こすかは backend が答える（reserve の名前の検査 =
+            // #428・器ごとの組み立て。psmux はここで器のオーナー記録を取る = #177）。器を持たない
+            // backend（tmux の無い環境）は reserve が器を配らないので、ここで問うのは設定だけ
+            let persist = !direct && self.tmux_persist;
+            let existing = self.backend_sessions.get(&pane_id).cloned();
+            let spawn = tako_core::backend::wrap_spawn_for_pane(
+                tako_core::backend::backend(),
+                persist,
+                existing.as_deref(),
+                new_backend_session_name,
+                options,
+            );
+            options = spawn.options;
+            container_pin = spawn.pin;
+            if let Some(session) = spawn.session {
+                let name = session.into_string();
+                self.backend_sessions.insert(pane_id, name.clone());
+                backend_session = Some(name);
+                container_spawn = true;
+            } else {
+                self.backend_sessions.remove(&pane_id);
+                // 器の名前として使えない名前（layout.json の破損・ターゲット式 = #428）は
+                // 器なしで起こす。黙って倒さず、何が起きたかを persist.log に残す
+                if let (true, Some(name)) = (persist, existing.as_deref()) {
+                    if let Err(e) = tako_core::backend::SessionRef::new(name) {
+                        persist_diag(&format!(
+                            "器の名前として使えないので器なしで起こした: pane={} {e}",
+                            pane_id.as_u64()
+                        ));
+                    }
+                }
+            }
         }
         // #818: スクロールバック上限は設定値を既定にする。呼び出し側が明示していれば
         // そちらを尊重する（`get_or_insert` なので上書きしない）
         options
             .scrollback_lines
             .get_or_insert(self.scrollback_lines);
-        // #2092: 器（psmux）の中のシェルの文字コード固定（#659）も、PTY 直下の子の固定と
-        // 同じ門に載せて入力を預からせる（#2092 前はこの経路で器の内側が固定されていなかった）。
-        // unix は固定が要らないので None（器への問い合わせもスレッドも作らない）
-        let container_pin = backend_session
-            .as_deref()
-            .and_then(tako_core::encoding_pin::ContainerPin::for_session);
         let (session, mut rx) =
-            TerminalSession::spawn_in(INITIAL_COLS, INITIAL_ROWS, options, container_pin)?;
+            match TerminalSession::spawn_in(INITIAL_COLS, INITIAL_ROWS, options, container_pin) {
+                Ok(spawned) => spawned,
+                Err(e) => {
+                    // #885: 端末を起こせなかったら、wrap_spawn で握った器の記録（psmux）を手放す
+                    if let Some(name) = &backend_session {
+                        release_backend_session(name);
+                    }
+                    return Err(e);
+                }
+            };
         // #2367: 器の tmux サーバーの fd の上限を persist.log へ（サーバーが変わったときだけ 1 行。
         // 読むのは裏のスレッド = UI スレッドは止めない）
         if container_spawn {
@@ -11886,7 +11917,8 @@ impl TakoApp {
                 if let Some(close) = pending_log {
                     finish_backend_pane_log_close(&logs, &socket, pane_id, close);
                 }
-                tako_core::tmux_backend::kill_session(&socket, &name)
+                tako_core::tmux_backend::kill_session(&socket, &name);
+                release_backend_session(&name);
             });
         } else if let Some(close) = pending_log {
             self.flush_pane_log_close_now(pane_id, close);
@@ -11944,6 +11976,8 @@ impl TakoApp {
             if let Some(name) = self.backend_sessions.remove(&pane_id) {
                 self.restore_guard
                     .note_exit(std::time::Instant::now(), &name);
+                // #885: 器は消さないが、このインスタンスはもう握っていない
+                release_backend_session(&name);
             }
         }
         self.drop_backend_reattach(pane_id);

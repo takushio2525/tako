@@ -557,6 +557,13 @@ pub trait SessionBackend: Send + Sync {
 
     fn kill(&self, session: &SessionRef) -> Result<(), BackendError>;
 
+    /// このインスタンスがその器を手放す（ペインを閉じた・ペインの端末が終わった）。**器は消さない**。
+    ///
+    /// [`Self::wrap_spawn`] で器を握った記録を持つ実装（psmux のオーナー記録 = #177 の
+    /// 強奪ガードの材料）がここで記録を外す。外さないと、閉じたペインのぶんだけ記録の
+    /// ファイルとロックを抱え続ける。記録を持たない実装（tmux / 器なし）は何もしない（#885）
+    fn release(&self, _session: &SessionRef) {}
+
     fn list(&self) -> Vec<SessionInfo>;
 
     /// 指定セッション群を握っている外部クライアント（#177 復元強奪ガード）
@@ -804,11 +811,6 @@ pub fn reserve_for_pane(
     }
 }
 
-/// ペインの spawn を器の中で起動する形へ書き換える（[`reserve_for_pane`] + [`SessionBackend::wrap_spawn`]）。
-///
-/// 返り値の `Option<SessionRef>` が `None` = 器なし = 呼び出し側は
-/// そのペインを直接ペインとして扱う（`SpawnOptions` は素通し）。
-/// **PTY を所有するのは呼び出し側の `TerminalSession::spawn` のまま**である点に注意
 /// 器へ渡す「内側コマンド 1 本」を組み立てる（#881）。
 ///
 /// tmux と psmux で**第 1 語の書き方だけ**が違う。ここを 1 か所にしておかないと、
@@ -828,28 +830,46 @@ pub(crate) fn compose_inner_command(
     psmux::inner_command(command)
 }
 
+/// [`wrap_spawn_for_pane`] の結果
+#[derive(Debug)]
+pub struct PaneSpawn {
+    /// 器の中で起動する形へ書き換えた spawn（器なしなら素通し）
+    pub options: SpawnOptions,
+    /// 配った器。`None` = 器なし = 呼び出し側はそのペインを直接ペインとして扱う
+    pub session: Option<SessionRef>,
+    /// 器の内側のコードページ固定（#659）。呼び出し側は `TerminalSession::spawn_in` へ渡し、
+    /// 入力の保留（#2092）と同じ門に載せる。固定が要らない（unix）・器なしなら `None`
+    pub pin: Option<crate::encoding_pin::ContainerPin>,
+}
+
+/// ペインの spawn を器の中で起動する形へ書き換える（[`reserve_for_pane`] + [`SessionBackend::wrap_spawn`]）。
+///
+/// **本番のペインの spawn（tako-app の `spawn_session`）が通る 1 箇所**（#885。番犬は
+/// `tests/issue885_spawn_via_backend_watchdog.rs`）。これを通すので、器の名前の検査
+/// （[`SessionBackend::reserve`] = #428）と器ごとの組み立て（psmux はここで器のオーナー記録を
+/// 取る = #177 の強奪ガードの材料）が本番で効く。
+/// **PTY を所有するのは呼び出し側の `TerminalSession::spawn_in` のまま**である点に注意
 pub fn wrap_spawn_for_pane(
     backend: &'static dyn SessionBackend,
     persist: bool,
     existing: Option<&str>,
     candidate: impl FnOnce() -> String,
     options: SpawnOptions,
-) -> (SpawnOptions, Option<SessionRef>) {
+) -> PaneSpawn {
     match reserve_for_pane(backend, persist, existing, candidate) {
-        Some(session) => {
-            let wrapped = backend.wrap_spawn(options, &session);
-            // 器の中のシェルは tako の ConPTY の子ではないので、
-            // `TerminalSession::spawn` のコードページ固定（B19）が届かない。
-            // 器の内側にも同じ固定を届ける（#659）。ここは端末を起こす前なので
-            // 入力の保留（#2092）は持てない。**本番の GUI は `TerminalSession::spawn_in` へ
-            // [`crate::encoding_pin::ContainerPin`] を渡す経路**で、固定と保留を 1 つの門に載せる
-            crate::encoding_pin::start_container_ungated(crate::encoding_pin::ContainerPin::new(
-                backend,
-                session.clone(),
-            ));
-            (wrapped, Some(session))
-        }
-        None => (options, None),
+        Some(session) => PaneSpawn {
+            options: backend.wrap_spawn(options, &session),
+            // 器の中のシェルは tako の ConPTY の子ではないので、`TerminalSession::spawn` の
+            // コードページ固定（B19）が届かない。器の内側にも同じ固定を届ける（#659）。
+            // ここでは起こさず、端末を起こす側の門（#2092）へ渡す
+            pin: crate::encoding_pin::ContainerPin::when_needed(backend, session.clone()),
+            session: Some(session),
+        },
+        None => PaneSpawn {
+            options,
+            session: None,
+            pin: None,
+        },
     }
 }
 
@@ -1358,7 +1378,9 @@ mod pane_scoped_env_tests {
     }
 
     /// 表を引く側が tmux / psmux の両方であること（片方だけ足すと
-    /// 「tmux では効くが psmux では効かない」という追いにくい差になる）
+    /// 「tmux では効くが psmux では効かない」という追いにくい差になる）。
+    /// #885 から psmux は tmux と同じ組み立て（`tmux_backend::wrap_options_for`）を呼ぶので、
+    /// 自前で表を引くか、その組み立てへ委ねていればよい
     #[test]
     fn 器の実装はどちらもこの表を引いている() {
         for (name, src) in [
@@ -1366,7 +1388,7 @@ mod pane_scoped_env_tests {
             ("backend/psmux.rs", include_str!("psmux.rs")),
         ] {
             assert!(
-                src.contains("session_pinned_pairs("),
+                src.contains("session_pinned_pairs(") || src.contains("wrap_options_for("),
                 "{name} が session_pinned_pairs を引いていない（キーの直書き、または \
                  `options.env` だけを舐める形へ戻っている = #1105 が再発する）"
             );
@@ -1501,23 +1523,24 @@ mod tests {
     }
 
     /// 器へ渡す行の組み立てが 1 か所に集まっていること（番犬）。
-    /// `tmux_backend::wrap_options` が `shell_quoted` を直接呼ぶ形へ戻ると、
-    /// psmux では第 1 語が引用符付きのまま渡って**静かに起動できなくなる**（#881）
+    /// 組み立ての本体（`tmux_backend::wrap_options_for`。#885 で tmux / psmux が共有）が
+    /// `shell_quoted` を直接呼ぶ形へ戻ると、psmux では第 1 語が引用符付きのまま渡って
+    /// **静かに起動できなくなる**（#881）
     #[test]
     fn wrap_optionsは内側コマンドの組み立てを境界へ委ねる() {
         let src = include_str!("../tmux_backend.rs");
         let body = src
-            .split("pub fn wrap_options(")
+            .split("fn wrap_options_for(")
             .nth(1)
-            .expect("wrap_options の定義");
+            .expect("wrap_options_for の定義");
         let body = &body[..body.find("\npub ").unwrap_or(body.len())];
         assert!(
-            body.contains("inner_command_line("),
-            "wrap_options が内側コマンドの組み立てを境界へ委ねていない"
+            body.contains("compose_inner_command("),
+            "wrap_options_for が内側コマンドの組み立てを境界へ委ねていない"
         );
         assert!(
             !body.contains("shell_quoted(inner)"),
-            "wrap_options が shell_quoted を直接呼んでいる（psmux で第 1 語が壊れる。#881）"
+            "wrap_options_for が shell_quoted を直接呼んでいる（psmux で第 1 語が壊れる。#881）"
         );
     }
 
@@ -1858,14 +1881,15 @@ mod tests {
             env: vec![("TAKO_PANE_ID".into(), "7".into())],
             scrollback_lines: None,
         };
-        let (wrapped, session) = wrap_spawn_for_pane(
+        let spawn = wrap_spawn_for_pane(
             host,
             true,
             None,
             || "tako-0123456789ab".to_string(),
             options.clone(),
         );
-        let session = session.expect("器を持つ backend は器を配る");
+        let wrapped = spawn.options;
+        let session = spawn.session.expect("器を持つ backend は器を配る");
         assert_eq!(session.as_str(), "tako-0123456789ab");
         let cmd = wrapped.command.expect("器の中で起動する形へ書き換わる");
         assert_eq!(cmd.program, "tako-session-host");
@@ -1880,34 +1904,50 @@ mod tests {
         // 復元・再 spawn。ここで新しい名前を払い出すと、生きている器を取り残して
         // 別の器を作る（= 実行中プロセスの置き去り）ことになる
         let (host, _pids) = FakeSessionHost::leaked();
-        let (_, session) = wrap_spawn_for_pane(
+        let spawn = wrap_spawn_for_pane(
             host,
             true,
             Some("tako-ffffffffffff"),
             || panic!("既存名があるのに候補名を払い出した"),
             SpawnOptions::default(),
         );
-        assert_eq!(session.unwrap().as_str(), "tako-ffffffffffff");
+        assert_eq!(spawn.session.unwrap().as_str(), "tako-ffffffffffff");
     }
 
     /// **#659 の配線**: 器を配ったら、器の**内側**のプロセスへコードページ固定を
     /// 届ける経路が起動する。#655 の固定は tako の ConPTY 直下の子（= psmux では
     /// クライアント）にしか当たらず、器の中のシェルに届いていなかった。
     ///
+    /// 固定は配った器を相手に作られ、端末を起こす側の門（`encoding_pin::begin` =
+    /// `TerminalSession::spawn_in` の 1 箇所。#2092）で走る。#885 まではここで門なしに
+    /// 走らせていたが、本番の spawn がこの関数を通るようになったので、門と二重に走らせない。
+    ///
     /// 固定が要るのは Windows だけなので、**unix では器へ問い合わせすらしない**
     /// （器への問い合わせはサブプロセス起動。無駄なスレッドも作らない）ことも同時に固定する
     #[test]
     fn 器を配ったら器の内側のpidを問い合わせる() {
         let (host, pids) = FakeSessionHost::leaked();
-        let (_, session) = wrap_spawn_for_pane(
+        let spawn = wrap_spawn_for_pane(
             host,
             true,
             None,
             || "tako-0123456789ab".to_string(),
             SpawnOptions::default(),
         );
-        assert!(session.is_some());
+        assert!(spawn.session.is_some());
         let pinning = crate::platform::console::pin_needed();
+        assert_eq!(
+            spawn.pin.is_some(),
+            pinning,
+            "器の内側の固定は要るプラットフォームでだけ作る"
+        );
+        // 関数そのものは固定を走らせない（門と二重に走らせない）
+        assert!(
+            pids.recv_timeout(Duration::from_millis(300)).is_err(),
+            "wrap_spawn_for_pane が門を通さずに固定を走らせた"
+        );
+        // 端末を起こす側の門へ渡すと、配った器の内側を尋ねる
+        let _gate = crate::encoding_pin::begin(None, spawn.pin, |_| {});
         // 起きないことの確認に 5 秒待たない（unix 側は短く打ち切る）
         let wait = if pinning {
             Duration::from_secs(5)
@@ -1943,27 +1983,29 @@ mod tests {
 
         // persist OFF: 器を持つ backend でも器は配らない（ユーザー設定が最優先）
         let (host, _pids) = FakeSessionHost::leaked();
-        let (passthrough, session) = wrap_spawn_for_pane(
+        let spawn = wrap_spawn_for_pane(
             host,
             false,
             None,
             || "tako-0123456789ab".to_string(),
             opts.clone(),
         );
-        assert!(session.is_none());
-        assert_eq!(passthrough.command.unwrap().program, "/bin/zsh");
+        assert!(spawn.session.is_none());
+        assert!(spawn.pin.is_none());
+        assert_eq!(spawn.options.command.unwrap().program, "/bin/zsh");
         assert!(host.wrapped.lock().unwrap().is_empty());
 
         // 器なし backend: persist ON でも直接ペイン（#30 の「構造のみ永続化」経路）
-        let (passthrough, session) = wrap_spawn_for_pane(
+        let spawn = wrap_spawn_for_pane(
             &NullBackend,
             true,
             None,
             || "tako-0123456789ab".to_string(),
             opts.clone(),
         );
-        assert!(session.is_none());
-        assert_eq!(passthrough.command.unwrap().program, "/bin/zsh");
+        assert!(spawn.session.is_none());
+        assert!(spawn.pin.is_none());
+        assert_eq!(spawn.options.command.unwrap().program, "/bin/zsh");
     }
 
     #[test]
