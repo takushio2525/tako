@@ -5937,21 +5937,23 @@ impl TakoApp {
                     resume.and_then(|r| r.id),
                     worker_registry.as_ref(),
                 );
+                // 起動条件を spawn 記録から引くキーも、このペインが繋ぐ器の名前
+                // （#2486: 重複した 2 本目に持ち主の記録を引かせない）
+                let plan = tako_control::sessions::restore_plan(
+                    backend_alive,
+                    resume,
+                    catalog.as_ref(),
+                    vessel,
+                    Some(r.pane),
+                    &hints,
+                );
+                // #2486: 会話を止めた重複は、内訳の理由を「ID なし」ではなく重複と言う
                 let plan = if resume_blocked {
                     RestorePlan::FreshShell(
                         tako_control::sessions::FreshShellReason::DuplicateVessel,
                     )
                 } else {
-                    // 起動条件を spawn 記録から引くキーも、このペインが繋ぐ器の名前
-                    // （重複した 2 本目に持ち主の記録を引かせない）
-                    tako_control::sessions::restore_plan(
-                        backend_alive,
-                        resume,
-                        catalog.as_ref(),
-                        vessel,
-                        Some(r.pane),
-                        &hints,
-                    )
+                    plan
                 };
                 if let Some(session_id) = claude_session_id {
                     if tako_control::transcript::is_valid_session_id(session_id) {

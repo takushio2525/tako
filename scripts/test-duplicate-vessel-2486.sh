@@ -208,7 +208,7 @@ session_of() { python3 -I "$TOOL" sessions "$1" | awk -v p="$2" '$1==p {print $2
 
 echo "== 隔離 GUI を起こして 3 ペインの構成を組む =="
 start_app base
-P1="$(pane_ids | head -1)"
+P1="$(pane_ids | sed -n '1p')"
 if [ "$(pane_count)" != "1" ]; then
   echo "繋がった先が隔離インスタンスではない（ペイン $(pane_count) 枚）。中止する。"; exit 1
 fi
@@ -232,16 +232,16 @@ check_eq "器が 3 本ある（ペインごとに 1 本）" "3" "$(vessel_count)
 
 # 器の集合を「元の 3 本」に戻す（前の場合が作った器・消した器を揃える）
 reset_vessels() {
+  local p s screen
   tm ls -F '#{session_name}' 2>/dev/null | while read -r s; do
     case "$s" in "$S1" | "$S2" | "$S3") : ;; *) tm kill-session -t "=$s" ;; esac
   done
   for p in "$P1" "$P2" "$P3"; do
-    local s
     s="$(session_of "$TMP/layout-good.json" "$p")"
     # 印が消えた器（③で消して tako が作り直した器）も作り直す
-    if tm has-session -t "=$s" 2>/dev/null \
-      && ! tm capture-pane -p -t "=${s}:" 2>/dev/null | grep -q "MARK_$p"; then
-      tm kill-session -t "=$s"
+    if tm has-session -t "=$s" 2>/dev/null; then
+      screen="$(tm capture-pane -p -t "=${s}:" 2>/dev/null)"
+      [[ "$screen" == *"MARK_$p"* ]] || tm kill-session -t "=$s"
     fi
     if ! tm has-session -t "=$s" 2>/dev/null; then
       # 印は器のコマンド自身に出させる（起きたばかりのシェルへの打鍵は初期化に食われることがある）
@@ -299,7 +299,7 @@ if [ -z "$EXPECT_LEGACY" ]; then
   check_has "① 理由の行が先に持つペインを名指す" "ペイン ${P1} が先に持つ" "$(grep "器の名前の重複: pane=$P2 " "$PLOG")"
   check_eq "① 片方を閉じる行（別のクライアントが attach 中）は出ない" "0" \
     "$(grep -c '別のクライアント' "$PLOG" | tr -d ' ')"
-  NEW2="$(tm ls -F '#{session_name}' | grep -v -x -e "$S1" -e "$S3" | head -1)"
+  NEW2="$(tm ls -F '#{session_name}' | grep -v -x -e "$S1" -e "$S3" | sed -n '1p')"
   check_eq "① 2 本目の新しい器は元の名前と違う" "1" "$([ -n "$NEW2" ] && [ "$NEW2" != "$S1" ] && echo 1 || echo 0)"
   sleep 3   # 保存を待つ
   check_eq "① 次の保存で layout の 2 本目は新しい器の名前" "$NEW2" "$(session_of "$LAYOUT" "$P2")"
