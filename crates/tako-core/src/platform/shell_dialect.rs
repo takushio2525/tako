@@ -1528,21 +1528,37 @@ mod tests {
             line.contains("{ sleep 300 & }; tako1367_pid=$!"),
             "実際の行: {line}"
         );
-        let syntax_ok = |shell: &str, script: &str| {
+        // 子の stderr は取り込む（構文エラーをターミナルへ素通しにすると `cargo test` の
+        // 最中の本物のエラーに見える = #1614）。文言を英語に固定するため LC_ALL=C。
+        // シェルを起こせなければ None
+        let parse = |shell: &str, script: &str| {
             std::process::Command::new(shell)
                 .args(["-n", "-c", script])
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(true)
+                .env("LC_ALL", "C")
+                .output()
+                .ok()
         };
         for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
-            assert!(syntax_ok(shell, &line), "{shell} で構文が通らない: {line}");
+            // そのシェルが無い環境では見送る
+            let Some(out) = parse(shell, &line) else {
+                continue;
+            };
+            assert!(
+                out.status.success(),
+                "{shell} で構文が通らない: {line} / stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
-        // 検出力: 素の `&` 形は bash / sh で落ちる（= この検査は空振りしていない）
+        // 検出力: 素の `&` 形は bash / sh で落ちる（= この検査は空振りしていない）。
+        // 取り込んだ中身で「構文エラーで落ちた」ことまで確かめ、bash が起きない等の
+        // 別の失敗と区別する
         let naive = POSIX.sequence(&["sleep 300 &".to_string(), POSIX.sleep(3)]);
+        let out = parse("/bin/bash", &naive).expect("/bin/bash を起動できない");
+        let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            !syntax_ok("/bin/bash", &naive),
-            "`&;` の形が bash で通ってしまっている（検査の前提が崩れている）: {naive}"
+            !out.status.success() && stderr.contains("syntax error"),
+            "`&;` の形が bash の構文エラーにならない（検査の前提が崩れている）: {naive} / {:?} / stderr: {stderr}",
+            out.status
         );
     }
 
