@@ -50,7 +50,7 @@ pub fn load_from(path: &Path) -> Result<TaskStore, String> {
         std::thread::sleep(delay);
     }
     let content = std::fs::read_to_string(path).map_err(|e| {
-        Reason::StoreReadFailed {
+        Reason::StoreUnreadable {
             file: FILE,
             error: e.to_string(),
         }

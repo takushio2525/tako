@@ -677,7 +677,7 @@ fn reason_index(r: &Reason) -> usize {
         Reason::ReplyTimeout(_) => 164,
         Reason::LaunchPaneUnavailable { .. } => 165,
         // #2365 の続き: dispatch が呼ぶ置き場（acceptance_gates / task_checkpoints / user_tasks）
-        Reason::StoreReadFailed { .. } => 166,
+        Reason::StoreUnreadable { .. } => 166,
         Reason::StoreParseFailed { .. } => 167,
         Reason::StoreDirFailed { .. } => 168,
         Reason::YamlEncodeFailed(_) => 169,
@@ -960,7 +960,7 @@ fn reason_samples() -> Vec<Reason> {
             stale_pane: Some(305),
         },
         // #2365 の続き: 置き場
-        Reason::StoreReadFailed {
+        Reason::StoreUnreadable {
             file: "user-tasks.yaml",
             error: "Permission denied (os error 13)".into(),
         },

@@ -73,7 +73,7 @@ impl AcceptanceGateStore {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(path).map_err(|e| {
-            Reason::StoreReadFailed {
+            Reason::StoreUnreadable {
                 file: FILE,
                 error: e.to_string(),
             }

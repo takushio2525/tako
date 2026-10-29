@@ -224,7 +224,12 @@ print(next(x["count"] for x in d["open_counts_by_kind"] if x["kind"]=="post"))')
 # 空タイトルは拒否（一覧で選べないものを作らせない）
 EMPTY_OUT="$("$TAKO_BIN" todo add "   " 2>&1)"; EMPTY_RC=$?
 check_eq "空タイトルは拒否される（終了コード）" "1" "$EMPTY_RC"
-check_contains "空タイトルの理由が出る" "$EMPTY_OUT" "タイトルが空"
+# 断りの文は GUI の表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+case "$EMPTY_OUT" in
+  *"the title is empty"*) EMPTY_NEEDLE="the title is empty" ;;
+  *) EMPTY_NEEDLE="タイトルが空" ;;
+esac
+check_contains "空タイトルの理由が出る" "$EMPTY_OUT" "$EMPTY_NEEDLE"
 
 # --- ② 永続が再起動をまたぐ ---------------------------------------------------
 echo

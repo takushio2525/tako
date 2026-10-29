@@ -576,7 +576,7 @@ pub enum Reason {
     },
     // ---- #2365 の続き: dispatch が呼ぶ置き場（acceptance_gates / task_checkpoints / user_tasks）の断り ----
     /// `<file> の読み取りに失敗: <error>`
-    StoreReadFailed {
+    StoreUnreadable {
         file: &'static str,
         error: String,
     },
@@ -1475,10 +1475,10 @@ impl Reason {
                 }
                 message
             }
-            (Self::StoreReadFailed { file, error }, Ja) => {
+            (Self::StoreUnreadable { file, error }, Ja) => {
                 format!("{file} の読み取りに失敗: {error}")
             }
-            (Self::StoreReadFailed { file, error }, En) => format!("failed to read {file}: {error}"),
+            (Self::StoreUnreadable { file, error }, En) => format!("failed to read {file}: {error}"),
             (Self::StoreParseFailed { file, reason }, Ja) => {
                 format!("{file} のパースに失敗: {}", reason.text_in(lang))
             }
@@ -51178,6 +51178,11 @@ mod tests {
 
     // --- #2031: 一覧の 2 段（右パネルの 2 秒ごとの一覧更新を UI スレッドで読まない） ---
 
+    /// 置き場のパースの失敗の断りか（表示言語で文が変わるので日英どちらの形とも突き合わせる。#2365）
+    fn says_parse_failed(message: &str) -> bool {
+        message.contains("のパースに失敗") || message.contains("failed to parse ")
+    }
+
     fn t2031_list_request(all: Option<bool>) -> Request {
         Request::UserTask {
             action: "list".into(),
@@ -51281,7 +51286,7 @@ mod tests {
         assert!(
             broken
                 .as_ref()
-                .is_err_and(|e| e.to_string().contains("パースに失敗")),
+                .is_err_and(|e| says_parse_failed(&e.to_string())),
             "壊れた置き場を前回の正本でごまかした / 0 件へ丸めた"
         );
         std::fs::remove_file(&path).unwrap();
@@ -51443,7 +51448,7 @@ mod tests {
             Some(Ok(job)) => job,
             _ => panic!("準備が置き場を読んだ（壊れた置き場で準備が失敗した）"),
         };
-        assert!(t2052_drive(&mut host, job).is_err_and(|e| e.to_string().contains("パースに失敗")));
+        assert!(t2052_drive(&mut host, job).is_err_and(|e| says_parse_failed(&e.to_string())));
         // 取得条件の誤りは準備（UI スレッド）で即座に返す（置き場に触らない）
         let mut bad = t2052_request("list", None);
         if let Request::UserTask { status, .. } = &mut bad {
@@ -51740,7 +51745,7 @@ mod tests {
         std::fs::write(&path, "tasks: [ {{{ 壊れた").unwrap();
         let job = t2086_prepare(&mut host, &t2086_req(t1479_params("show", Some(&id))));
         assert!(t2086_settle(&mut host, job.run_staged())
-            .is_err_and(|e| e.to_string().contains("パースに失敗")));
+            .is_err_and(|e| says_parse_failed(&e.to_string())));
     }
 
     /// 起票: 起票元の材料（呼び出し元ペインの role・spawn 元）は準備（UI）で写し、解決と書き込みは
@@ -51796,7 +51801,7 @@ mod tests {
         let job = t2086_prepare(&mut host, &t2086_req(t1466_params(None, worker)));
         assert!(matches!(
             job.run_staged(),
-            OffloadOutcome::Reply(Err(DispatchError::Operation(e))) if e.contains("パースに失敗")
+            OffloadOutcome::Reply(Err(DispatchError::Operation(e))) if says_parse_failed(&e)
         ));
         assert_eq!(
             host.user_tasks_notified.len(),
@@ -51906,7 +51911,7 @@ mod tests {
         );
         assert!(matches!(
             missing.run_staged(),
-            OffloadOutcome::Reply(Err(DispatchError::Operation(e))) if e.contains("見つからない")
+            OffloadOutcome::Reply(Err(DispatchError::Operation(e))) if DispatchError::says_not_found(&e)
         ));
         drop(dropped);
         assert_eq!(
