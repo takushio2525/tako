@@ -46,6 +46,11 @@
 #                 title も role も無い・pane と tab・zoom の同時指定
 #      badname / nopaths / copyid / copygone  ファイル操作（名前・paths が空・取り消しの番号）
 #      badmove / textonly  編集の綴りの名前表・type 以外のコマンドへの text
+#   #2365 の続きで次も足した（action で操作を選ぶツールの断りと tako_theme の残り。どれも書く前に断る）:
+#      themetarget / colorkey / colornokey / colornovalue / reserved / presetnoname  tako theme の
+#                 知らない target・知らない色キー・キー無し・値無し・予約名・名前無し（CLI。前 2 つは MCP も）
+#      badaction / badvalue / needhint / needid / todoshow / unfamiliar  不明な action・不明な値・
+#                 案内つきの引数不足・task_id 無し・id 無し（tako_todo）・未知の action（tako_web）（MCP）
 #   ① 英語表示: どの出力にも日本語（かな・漢字）が混ざらない
 #   ② 日本語表示: 日本語の前置きで返る（修正前とのバイト一致は TAKO_1762_KEEP の出力を突き合わせる）
 #   ③ GUI を経由しない CLI の直呼び（`tako orchestrator layout` / `projects remove`）も、前置きと
@@ -369,6 +374,30 @@ if new:
     mcp="$(mcp_call tako_scroll_pane "{\"pane\":${preview},\"to\":0}" "$DIR/nosession.mcp")"
     echo "$mcp" > "$DIR/nosession.mcperr"
   fi
+  # #2365 の続き: action で操作を選ぶツールの断り（不明な action・値・操作に要る引数）と tako_theme の残り。
+  # どれも設定・置き場へ書く前に断る（色・プリセットは書かない）
+  cli_case themetarget theme colors --target nope-2365
+  cli_case colorkey theme color nosuch '#000000'
+  cli_case colornokey theme color
+  cli_case colornovalue theme color accent
+  cli_case reserved theme preset save dark
+  cli_case presetnoname theme preset save
+  mcp="$(mcp_call tako_theme '{"action":"bogus"}' "$DIR/badaction.mcp")"
+  echo "$mcp" > "$DIR/badaction.mcperr"
+  mcp="$(mcp_call tako_lang '{"action":"set","value":"bogus"}' "$DIR/badvalue.mcp")"
+  echo "$mcp" > "$DIR/badvalue.mcperr"
+  mcp="$(mcp_call tako_ui_mode '{"action":"set"}' "$DIR/needhint.mcp")"
+  echo "$mcp" > "$DIR/needhint.mcperr"
+  mcp="$(mcp_call tako_task_gate_show '{}' "$DIR/needid.mcp")"
+  echo "$mcp" > "$DIR/needid.mcperr"
+  mcp="$(mcp_call tako_todo '{"action":"show"}' "$DIR/todoshow.mcp")"
+  echo "$mcp" > "$DIR/todoshow.mcperr"
+  mcp="$(mcp_call tako_theme '{"action":"set-color","key":"nosuch","value":"#000000"}' "$DIR/colorkey.mcp")"
+  echo "$mcp" > "$DIR/colorkey.mcperr"
+  mcp="$(mcp_call tako_web '{"action":"bogus"}' "$DIR/unfamiliar.mcp")"
+  echo "$mcp" > "$DIR/unfamiliar.mcperr"
+  mcp="$(mcp_call tako_theme '{"action":"colors","target":"nope-2365"}' "$DIR/themetarget.mcp")"
+  echo "$mcp" > "$DIR/themetarget.mcperr"
 
   stop_isolated_gui "$APP_PID"
   APP_PID=""
@@ -400,7 +429,11 @@ judge() {
     "$DIR"/nofolder.cli "$DIR"/nofile.mcp "$DIR"/badjump.mcp "$DIR"/resizeboth.mcp \
     "$DIR"/notitle.mcp "$DIR"/fgboth.mcp "$DIR"/zoomboth.mcp "$DIR"/notfolder.mcp \
     "$DIR"/badname.mcp "$DIR"/nopaths.mcp "$DIR"/copyid.mcp "$DIR"/copygone.mcp \
-    "$DIR"/badmove.mcp "$DIR"/textonly.mcp; do
+    "$DIR"/badmove.mcp "$DIR"/textonly.mcp \
+    "$DIR"/themetarget.cli "$DIR"/colorkey.cli "$DIR"/colornokey.cli "$DIR"/colornovalue.cli \
+    "$DIR"/reserved.cli "$DIR"/presetnoname.cli "$DIR"/badaction.mcp "$DIR"/badvalue.mcp \
+    "$DIR"/needhint.mcp "$DIR"/needid.mcp "$DIR"/todoshow.mcp "$DIR"/colorkey.mcp \
+    "$DIR"/unfamiliar.mcp "$DIR"/themetarget.mcp; do
     name="$(basename "$f")"
     [ -f "$f" ] || { fail "$label $name が無い"; continue; }
     echo "      $label $name: $(head -c 240 "$f" | tr '\n' ' ')"
@@ -441,7 +474,8 @@ judge() {
           | *"同時に指定できない"* | *"フォルダではない"* | *"フォルダを開けない"* | *"が不正: "* \
           | *"どちらか一方を指定する"* | *"少なくとも一方を指定する"* | *"無効なファイル名"* \
           | *"取り消すコピーの番号"* | *"のコピーは走っていない"* | *"1 つ以上指定する"* \
-          | *"のどれか"* | *"打つ文字を取らない"*)
+          | *"のどれか"* | *"打つ文字を取らない"* | *"不明な "* | *" が必要"* | *"未知の"* \
+          | *"は予約名"*)
           pass "$label $name は日本語の前置き" ;;
         *) fail "$label $name に日本語の前置きが無い" ;;
       esac
