@@ -406,9 +406,28 @@ pub struct RunningChildrenScanState {
     pub scanned_at: Option<Instant>,
     /// 前回の走査時に while-agents-running が有効だったか。
     pub sleep_guard_active: bool,
+    /// この走査で busy の集合が前回から変わった = **1 度きりの瞬間の観測**（#2477）。
+    /// 真なら次の tick でもう 1 度採って確かめる（[`should_rescan_running_children`]）。
+    /// 立てるのは [`RunningChildrenScanState::settled_against`] だけ
+    pub unconfirmed: bool,
 }
 
 impl RunningChildrenScanState {
+    /// 前回の走査と突き合わせ、busy の集合が変わっていたら「確かめ直し待ち」にする（#2477）。
+    ///
+    /// プロセス表は**ある 1 瞬間**の写しなので、シェルがプロンプトのたびに起こす数 ms の子
+    /// （direnv の precmd・入力予測の非同期の子シェル・打ったばかりのコマンド）を拾うことがある。
+    /// 拾った子がそのまま消えても指紋（OSC 133 の状態など）は動かない —— 短いコマンドは
+    /// C と D が同じ tick の間に終わるので `Idle` のまま見える —— ので、旧実装は 60 秒の保険まで
+    /// 採り直さず、アイドルのシェルを「子が動いている」と言い続けた（close 確認・GUI モードの
+    /// スターター・スリープ防止が最大 60 秒ずれる）。変わった回だけ次の tick で確かめれば、
+    /// 増える採取は変化 1 回につき 1 回で済む（毎 tick 採らない = #779 の予算を崩さない）
+    pub fn settled_against(mut self, prev: &RunningChildrenScanState) -> Self {
+        self.unconfirmed =
+            self.busy_sessions != prev.busy_sessions || self.busy_panes != prev.busy_panes;
+        self
+    }
+
     /// busy なエージェントの数（器あり + 器なしの合算）。
     ///
     /// sleep guard の `busy_agents` はこの**1 実装**を通す（#372）。
@@ -459,6 +478,13 @@ pub fn legacy_372() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_372_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
+/// #2477 の A/B。`TAKO_2477_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （busy の集合が変わった回を確かめ直さない = 1 瞬間だけ居た子を拾うと 60 秒の保険まで残る）
+pub fn legacy_2477() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2477_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
 /// 変化に現れない終了等を回収する低頻度の保険。
 pub const RUNNING_CHILDREN_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -469,10 +495,28 @@ pub fn should_rescan_running_children(
     sleep_guard_active: bool,
     now: Instant,
 ) -> bool {
+    should_rescan_running_children_in(prev, targets, sleep_guard_active, now, legacy_2477())
+}
+
+/// 判定の本体（A/B のため旧挙動を引数で受ける。#2477）。
+///
+/// `legacy_unconfirmed` が真なら、busy の集合が変わった回も確かめ直さない = #2477 前の挙動
+pub fn should_rescan_running_children_in(
+    prev: &RunningChildrenScanState,
+    targets: &[RunningChildrenScanTarget],
+    sleep_guard_active: bool,
+    now: Instant,
+    legacy_unconfirmed: bool,
+) -> bool {
     let Some(scanned_at) = prev.scanned_at else {
         return true;
     };
     if prev.targets != targets {
+        return true;
+    }
+    // 前回は busy の集合が変わった回 = 1 瞬間の観測なので、もう 1 度だけ採って確かめる（#2477。
+    // 理由は `settled_against`）
+    if prev.unconfirmed && !legacy_unconfirmed {
         return true;
     }
     // off / on から while-agents-running へ切り替えた瞬間は、古い共有キャッシュを
@@ -534,6 +578,8 @@ pub fn scan_running_children_in(
         busy_panes,
         scanned_at: Some(now),
         sleep_guard_active,
+        // 前回との突き合わせは呼び出し側が `settled_against` で行う（#2477）
+        unconfirmed: false,
     }
 }
 
@@ -1478,6 +1524,7 @@ mod tests {
             busy_panes: Vec::new(),
             scanned_at: Some(now),
             sleep_guard_active: true,
+            unconfirmed: false,
         };
         assert!(!should_rescan_running_children(&prev, &targets, true, now));
     }
@@ -1492,6 +1539,7 @@ mod tests {
             busy_panes: Vec::new(),
             scanned_at: Some(now),
             sleep_guard_active: true,
+            unconfirmed: false,
         };
         assert!(should_rescan_running_children(
             &prev,
@@ -1538,6 +1586,7 @@ mod tests {
             busy_panes: Vec::new(),
             scanned_at: Some(scanned_at),
             sleep_guard_active: false,
+            unconfirmed: false,
         };
         assert!(should_rescan_running_children(
             &prev, &targets, true, scanned_at
@@ -1757,6 +1806,7 @@ mod tests {
             busy_panes: Vec::new(),
             scanned_at: Some(now),
             sleep_guard_active: true,
+            unconfirmed: false,
         };
         assert!(!should_rescan_running_children(
             &prev,
@@ -1783,6 +1833,179 @@ mod tests {
             true,
             now
         ));
+    }
+
+    // --- #2477: 1 瞬間だけ居た子を拾った走査は、次の tick で確かめ直す ---
+
+    /// 1 tick ぶん進めて採り直す（呼び出し側 = GUI の 2 秒 tick と同じ順: 判定 → 採取 → 突き合わせ）。
+    /// 採り直さない tick は前回の結果をそのまま持ち越す（GUI の else 枝と同じ）
+    fn tick_2477(
+        prev: RunningChildrenScanState,
+        targets: &[RunningChildrenScanTarget],
+        now: Instant,
+        snapshot: &ProcessSnapshot,
+        legacy: bool,
+    ) -> (bool, RunningChildrenScanState) {
+        if !should_rescan_running_children_in(&prev, targets, true, now, legacy) {
+            return (false, prev);
+        }
+        let next = scan_running_children_in(targets.to_vec(), true, now, Some(snapshot), false)
+            .settled_against(&prev);
+        (true, next)
+    }
+
+    /// Issue #2477 の筋書きそのもの: アイドルのシェル（指紋は Idle のまま）で、別の理由の
+    /// 採り直しが数 ms だけ居た子（direnv の precmd・入力予測の子シェル・打ったばかりの
+    /// 短いコマンド）を拾い、その子は指紋を動かさずに消える
+    #[test]
+    fn 一瞬だけ居た子は次のtickで確かめ直してbusyが下りる() {
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(2);
+        let idle = vec![direct_target(7, 100, tako_core::CommandState::Idle, false)];
+        // 子の居ない落ち着いた状態（前回の走査で子なし）
+        let quiet =
+            scan_running_children_in(idle.clone(), true, t0, Some(&snapshot_372(false)), false)
+                .settled_against(&RunningChildrenScanState::default());
+        assert!(
+            !quiet.unconfirmed,
+            "子が 1 本も居ないなら確かめ直しは要らない"
+        );
+
+        // 別の理由（他のペインの変化・ssh / codex の相乗り）で採った瞬間に子が居た
+        let caught = scan_running_children_in(
+            idle.clone(),
+            true,
+            t0 + tick,
+            Some(&snapshot_372(true)),
+            false,
+        )
+        .settled_against(&quiet);
+        assert!(
+            caught.is_pane_busy_in(7, false),
+            "前提: 採った瞬間の子を busy に数える"
+        );
+        assert!(
+            caught.unconfirmed,
+            "busy の集合が変わった回は確かめ直し待ちになる"
+        );
+
+        // 旧（TAKO_2477_LEGACY=1）: 指紋が Idle のままなので 60 秒の保険まで採り直さず、
+        // 子が消えても busy が残る（= 項目 694(e) が 15 秒 busy_children=true のまま落ちた形）
+        let mut legacy = caught.clone();
+        for i in 2..30u32 {
+            let (rescanned, next) =
+                tick_2477(legacy, &idle, t0 + tick * i, &snapshot_372(false), true);
+            assert!(
+                !rescanned,
+                "旧の腕が {i} tick 目で採り直した（前提が崩れている）"
+            );
+            legacy = next;
+        }
+        assert!(
+            legacy.is_pane_busy_in(7, false),
+            "旧の腕は crates/tako-control/src/agents.rs の should_rescan_running_children_in が \
+             確かめ直さないので busy が残るはず"
+        );
+
+        // 新: 次の tick で確かめ直し、消えた子は busy から下りる
+        let (rescanned, confirmed) =
+            tick_2477(caught, &idle, t0 + tick * 2, &snapshot_372(false), false);
+        assert!(
+            rescanned,
+            "busy の集合が変わった次の tick で採り直していない"
+        );
+        assert!(
+            !confirmed.is_pane_busy_in(7, false),
+            "確かめ直した走査で、消えた子がまだ busy に数えられている"
+        );
+        // 下りた回も「変わった回」なのでもう 1 度だけ採り、そこで落ち着く（毎 tick 採り続けない）
+        let (rescanned, settled) =
+            tick_2477(confirmed, &idle, t0 + tick * 3, &snapshot_372(false), false);
+        assert!(rescanned && !settled.unconfirmed);
+        let (rescanned, _) = tick_2477(settled, &idle, t0 + tick * 4, &snapshot_372(false), false);
+        assert!(
+            !rescanned,
+            "落ち着いた後も毎 tick 採り直している（#779 の予算を崩す）"
+        );
+    }
+
+    /// 境界: 本当に動き続ける子（背景ジョブ・TUI エージェント）は確かめ直しの 1 回で
+    /// busy のまま落ち着き、それ以上は採らない（増える採取は変化 1 回につき 1 回）
+    #[test]
+    fn 動き続ける子は確かめ直し1回でbusyのまま落ち着く() {
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(2);
+        let idle = vec![direct_target(7, 100, tako_core::CommandState::Idle, false)];
+        let quiet =
+            scan_running_children_in(idle.clone(), true, t0, Some(&snapshot_372(false)), false)
+                .settled_against(&RunningChildrenScanState::default());
+        let caught = scan_running_children_in(
+            idle.clone(),
+            true,
+            t0 + tick,
+            Some(&snapshot_372(true)),
+            false,
+        )
+        .settled_against(&quiet);
+        let (rescanned, confirmed) =
+            tick_2477(caught, &idle, t0 + tick * 2, &snapshot_372(true), false);
+        assert!(rescanned);
+        assert!(
+            confirmed.is_pane_busy_in(7, false),
+            "動き続ける子を取りこぼした"
+        );
+        assert!(
+            !confirmed.unconfirmed,
+            "同じ結果が 2 回続いたら確かめ直しは終わる"
+        );
+        for i in 3..30u32 {
+            let (rescanned, _) = tick_2477(
+                confirmed.clone(),
+                &idle,
+                t0 + tick * i,
+                &snapshot_372(true),
+                false,
+            );
+            assert!(
+                !rescanned,
+                "{i} tick 目: 落ち着いた busy を毎 tick 採り直している"
+            );
+        }
+        // 60 秒の保険は従来どおり効く（背景ジョブが黙って終わった分の回収）
+        assert!(should_rescan_running_children_in(
+            &confirmed,
+            &idle,
+            true,
+            t0 + tick * 2 + RUNNING_CHILDREN_RESCAN_INTERVAL,
+            false
+        ));
+    }
+
+    /// 境界: 器ありペイン（器のセッション名で数える側）も同じ規則で確かめ直す
+    #[test]
+    fn 器のセッションでも一瞬の子は確かめ直す() {
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(2);
+        let targets = vec![running_target(
+            "tako-s1",
+            tako_core::CommandState::Idle,
+            false,
+        )];
+        let with_child = |child: bool| {
+            let mut parents: HashMap<u32, u32> = [(500, 1)].into();
+            if child {
+                parents.insert(600, 500);
+            }
+            ProcessSnapshot::from_parts(vec![("tako-s1:0.0".to_string(), 500u32)], parents)
+        };
+        let caught =
+            scan_running_children_in(targets.clone(), true, t0, Some(&with_child(true)), false)
+                .settled_against(&RunningChildrenScanState::default());
+        assert_eq!(caught.busy_sessions, vec!["tako-s1".to_string()]);
+        assert!(caught.unconfirmed);
+        let (rescanned, confirmed) =
+            tick_2477(caught, &targets, t0 + tick, &with_child(false), false);
+        assert!(rescanned && confirmed.busy_sessions.is_empty());
     }
 
     #[test]
