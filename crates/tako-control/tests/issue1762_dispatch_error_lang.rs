@@ -6381,7 +6381,7 @@ fn b() {
         );
     }
     // 断片は寄せた先の日本語の腕の文に含まれる（断片の書き間違いで番犬が何も見なくなるのを止める）
-    let ja: Vec<String> = reason_samples().iter().map(|r| reason_old_ja(r)).collect();
+    let ja: Vec<String> = reason_samples().iter().map(reason_old_ja).collect();
     for (fragment, variant) in DISPATCH_MOVED_OLD_JA {
         assert!(
             ja.iter().any(|t| t.contains(fragment)),

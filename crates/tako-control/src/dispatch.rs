@@ -41879,18 +41879,23 @@ mod tests {
         let dialog = dialog_of(ASK_32X46_2302);
         assert!(dialog.labels_truncated());
         // 1 行目に一致しても確定しない（続きがラベルか説明か画面から分からない）
+        // 断りは表示言語に従う（#2365）ので日英どちらでも見る
         let err = resolve_choice_index(&dialog, "status")
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("説明との境目") && err.contains("--choice 1"),
+            (err.contains("説明との境目") || err.contains("apart from its description"))
+                && err.contains("--choice 1"),
             "{err}"
         );
         // 本来のラベル（60 桁で採った同じダイアログ）でも一致させない
         let err = resolve_choice_index(&dialog, "status の判定を先に直す")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("番号で指定する"), "{err}");
+        assert!(
+            err.contains("番号で指定する") || err.contains("pass the number"),
+            "{err}"
+        );
         // 説明の文言でほかの選択肢を掴まない（修正前は選択肢 3 のラベルに説明が丸ごと
         // 混ざっていて、`判定の材料` で選択肢 3 を確定していた）
         assert!(resolve_choice_index(&dialog, "判定の材料").is_err());
@@ -41917,17 +41922,22 @@ mod tests {
         assert!(dialog.labels_truncated());
         // 修正前は選択肢 2 のラベルに説明が丸ごと混ざっていて、説明の語 `error line` で
         // 選択肢 2 を確定していた（実物の claude の器越しで再現）
+        // 断りは表示言語に従う（#2365）ので日英どちらでも見る
         let err = resolve_choice_index(&dialog, "error line")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("番号で指定する"), "{err}");
+        assert!(
+            err.contains("番号で指定する") || err.contains("pass the number"),
+            "{err}"
+        );
         assert!(resolve_choice_index(&dialog, "Shared inputs").is_err());
         // ラベルの 1 行目に当たっても、次の行が続きか説明か分からないので確定しない
         let err = resolve_choice_index(&dialog, "Fix the status anchor first")
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("説明との境目") && err.contains("--choice 2"),
+            (err.contains("説明との境目") || err.contains("apart from its description"))
+                && err.contains("--choice 2"),
             "{err}"
         );
         // 番号は効く・自由入力は従来どおりラベルで選べる
@@ -42346,7 +42356,11 @@ mod tests {
             PaneOrigin::Mcp,
         )
         .unwrap_err();
-        assert!(format!("{err:?}").contains("master ではない"), "{err:?}");
+        assert!(
+            format!("{err:?}").contains("master ではない")
+                || format!("{err:?}").contains("is not a master"),
+            "{err:?}"
+        );
     }
 
     /// A/B: `TAKO_1453_LEGACY=1` は同一バイナリのまま「採用しない」旧挙動を再現する
@@ -43661,8 +43675,10 @@ mod tests {
                     ..Default::default()
                 })
                 .expect_err(&format!("{bad} を拒否しなかった"));
+                // 断りは表示言語に従う（#2365）ので日英どちらでも見る
                 assert!(
-                    format!("{err}").contains("絶対パス"),
+                    format!("{err}").contains("絶対パス")
+                        || format!("{err}").contains("absolute path"),
                     "{bad}: 理由が不親切: {err}"
                 );
             }
