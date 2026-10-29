@@ -242,10 +242,11 @@ fn 修正前の形を名指しできる() {
     };
 
     // ① 修正前: 診断が上限なしの `status_all()` を A/B のゲートの外で呼ぶ
+    // （#1622 で導入状況は `collect_with` へ渡すクロージャになった。中身の形は同じ）
     let d = inject(
         &diagnostics,
-        "    let bootstrap = if tako_core::probe::issue2255_legacy() {\n        crate::setup_bootstrap::status_all()\n    } else {\n        crate::setup_bootstrap::status_all_within(tako_core::probe::auth_probe_timeout())\n    };",
-        "    let bootstrap = crate::setup_bootstrap::status_all();",
+        "    let bootstrap = || {\n        if tako_core::probe::issue2255_legacy() {\n            crate::setup_bootstrap::status_all()\n        } else {\n            crate::setup_bootstrap::status_all_within(tako_core::probe::auth_probe_timeout())\n        }\n    };",
+        "    let bootstrap = || crate::setup_bootstrap::status_all();",
         "①",
     );
     let hits = unbounded_calls(&graph_with(&[(DIAGNOSTICS, &d)]));

@@ -39,6 +39,14 @@
 //! `prepare_offload` で background executor へ出すこと。UI スレッドで呼ぶと
 //! そのぶん窓が止まる。
 //!
+//! 外部プロセスを起こす問い合わせは**重ねて走らせる**（#1622。[`collect_with`]）。
+//! 導入状況（約 3 秒）を呼び出し元のスレッドで採る間に、`claude mcp list`（約 5.7 秒）ほかを
+//! 背景で最大 [`PROBE_CONCURRENCY`] 本ずつ走らせ、項目は今まで通りの並びで組む（実測 2026-10-30:
+//! check-health 9.7〜12.0 秒 → 5.8〜6.4 秒・出力はバイト一致）。番犬はこのファイルの単体テスト
+//! `外部の問い合わせは導入状況と重ねて走り答えは逐次と同じ`（偽の問い合わせが互いの始まりを
+//! 待ち合う = 時間で比べない）、実経路は `scripts/test-check-health-parallel-1622.sh`。
+//! A/B は `TAKO_1622_LEGACY=1`（重ねない）。
+//!
 //! 認証の問い合わせ（`claude auth status --json` / `codex login status` / `agy models`）は
 //! **上限つきで系統を並べて**聞く（#2255。既定 10 秒 = `probe::auth_probe_timeout`）。
 //! check-health は固まった GUI の切り分けに使う道具なので、返らない CLI 1 つで診断ごと
@@ -238,16 +246,194 @@ impl Report {
 /// 環境診断の全項目（**この 1 実装が正本**）。
 ///
 /// 重い（エージェント CLI へ問い合わせる）ので、UI スレッドから呼ばないこと。
+/// 外部プロセスを起こす問い合わせは重ねて走らせる（#1622。[`collect_with`]）。
+///
+/// 問い合わせは**呼び出しの形**（`|| f()`）で書く。`f` を値で渡すと字面の呼び出しグラフ
+/// （#2255 の番犬 `crates/tako-control/tests/issue2255_diagnostics_auth_probe_watchdog.rs`）が
+/// ここから先を辿れなくなり、問い合わせの先で上限なしの口を呼んでも見逃す
+#[allow(clippy::redundant_closure)]
 pub fn collect() -> Report {
-    let mut items = Vec::new();
-    let mut probe_timeouts = Vec::new();
     // #2255: 認証の問い合わせは上限つきで、系統を並べて聞く（返らない CLI 1 つで診断ごと
     // 固まらないため）。A/B の旧経路は setup と同じ上限なしの 1 系統ずつ
-    let bootstrap = if tako_core::probe::issue2255_legacy() {
-        crate::setup_bootstrap::status_all()
-    } else {
-        crate::setup_bootstrap::status_all_within(tako_core::probe::auth_probe_timeout())
+    let bootstrap = || {
+        if tako_core::probe::issue2255_legacy() {
+            crate::setup_bootstrap::status_all()
+        } else {
+            crate::setup_bootstrap::status_all_within(tako_core::probe::auth_probe_timeout())
+        }
     };
+    let probes = Probes {
+        bootstrap: &bootstrap,
+        claude_mcp: &|| crate::agent_mcp::claude_health_now(),
+        codex_mcp: &|| crate::agent_mcp::state(crate::orchestrator::agent::WorkerAgent::Codex),
+        agy_mcp: &|| crate::agent_mcp::state(crate::orchestrator::agent::WorkerAgent::Agy),
+        deps: &|| dep_items(),
+        config_share: &|| config_share_item(),
+        tako_cli_path: &|| tako_cli_path_item(),
+    };
+    collect_with(&probes, probe_concurrency(issue1622_legacy()))
+}
+
+// --- 外部の問い合わせを重ねる（#1622） ----------------------------------------
+
+/// 導入状況（3 系統）。`setup_bootstrap::status_all` / `status_all_within` の答えの形
+type BootstrapList = Vec<(
+    AgentKind,
+    Result<crate::setup_bootstrap::BootstrapState, String>,
+)>;
+
+/// `claude mcp list` の答え（登録済みか・登録パスが生きているか・打ち切りの知らせ）
+type ClaudeMcp = (bool, bool, Option<tako_core::probe::TimeoutNotice>);
+
+/// 外部プロセスを起こす問い合わせの口（#1622）。
+///
+/// 項目の組み立て（[`assemble`]）はここで採った答えだけを読み、問い合わせを 1 つも起こさない
+/// （判定は今まで通りの関数が持つ = 重ねても 1 マスも変わらない）。本番は [`collect`] が
+/// 実物を差し、テストは偽の口を差して重なりと同時数を観測する（本物の CLI を起こさない）
+struct Probes<'a> {
+    /// 導入状況。呼び出し元のスレッドで採る（系統どうしは `status_all_within` が並べる = #2255）
+    bootstrap: &'a (dyn Fn() -> BootstrapList + Sync),
+    claude_mcp: &'a (dyn Fn() -> ClaudeMcp + Sync),
+    codex_mcp: &'a (dyn Fn() -> crate::agent_mcp::McpState + Sync),
+    agy_mcp: &'a (dyn Fn() -> crate::agent_mcp::McpState + Sync),
+    /// 導入状況に依らない項目は、問い合わせから項目の組み立てまで背景で済ませる
+    /// （`dep_items` / `config_share_item` / `tako_cli_path_item` をそのまま呼ぶ）
+    deps: &'a (dyn Fn() -> Vec<Item> + Sync),
+    config_share: &'a (dyn Fn() -> Item + Sync),
+    tako_cli_path: &'a (dyn Fn() -> Item + Sync),
+}
+
+/// 背景で採った答え（導入状況を除く）
+struct Answers {
+    claude_mcp: ClaudeMcp,
+    codex_mcp: crate::agent_mcp::McpState,
+    agy_mcp: crate::agent_mcp::McpState,
+    deps: Vec<Item>,
+    config_share: Item,
+    tako_cli_path: Item,
+}
+
+/// 背景で外部の問い合わせを同時に走らせる上限（#1622）。
+///
+/// 呼び出し元のスレッドは導入状況（系統ごとに 1 本ずつ並べる = #2255）を採るので、同時に走る
+/// 子プロセスは最大でこの数 + 系統数。ログインシェル（`exe::find`）と CLI を一度に起こしすぎて、
+/// 遅い機で個々の上限（ログインシェルは既定 5 秒）に掛かりやすくならないよう抑える。
+/// 実測（3 系統の Mac）では一番長い `claude mcp list`（5.7 秒）の間に残り（計 1.6 秒）が
+/// もう 1 本で片付くので 2 本で足りる。遅い機（依存の検出が長い等）の余裕を見て 3 本
+const PROBE_CONCURRENCY: usize = 3;
+
+/// 背景の同時数。A/B の旧経路は 0 = 重ねない（導入状況の後に 1 本ずつ）
+fn probe_concurrency(legacy: bool) -> usize {
+    if legacy {
+        0
+    } else {
+        PROBE_CONCURRENCY
+    }
+}
+
+/// A/B（#1622）: `TAKO_1622_LEGACY=1` で外部の問い合わせを重ねず、導入状況の後に 1 本ずつ採る
+/// （問い合わせの集合と項目の組み立ては同じ = 出力は一致する）。**ゲートはこの 1 か所**
+fn issue1622_legacy() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_1622_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// 外部の問い合わせを重ねて採り、今まで通りの並びで項目を組む（#1622）。
+///
+/// 背景の問い合わせは**長い順に始める**（`claude mcp list` は登録済みの MCP サーバへ 1 台ずつ
+/// 繋ぐので一番長い = 実測 5.7 秒）。MCP の問い合わせは導入状況を待たずに始めるが、項目は今まで
+/// 通り「導入済みの系統だけ」出す（[`mcp_items`] の判定。未導入の系統の答えは捨てる）。
+/// 答えは種類ごとの置き場へ入るので、終わった順は項目の並びに響かない
+fn collect_with(probes: &Probes<'_>, concurrency: usize) -> Report {
+    let claude_mcp = Slot::new();
+    let codex_mcp = Slot::new();
+    let agy_mcp = Slot::new();
+    let deps = Slot::new();
+    let config_share = Slot::new();
+    let tako_cli_path = Slot::new();
+    let jobs: Vec<Job<'_>> = vec![
+        Box::new(|| claude_mcp.put((probes.claude_mcp)())),
+        Box::new(|| deps.put((probes.deps)())),
+        Box::new(|| config_share.put((probes.config_share)())),
+        Box::new(|| codex_mcp.put((probes.codex_mcp)())),
+        Box::new(|| tako_cli_path.put((probes.tako_cli_path)())),
+        Box::new(|| agy_mcp.put((probes.agy_mcp)())),
+    ];
+    let bootstrap = overlap(concurrency, jobs, probes.bootstrap);
+    let answers = Answers {
+        claude_mcp: claude_mcp.take(),
+        codex_mcp: codex_mcp.take(),
+        agy_mcp: agy_mcp.take(),
+        deps: deps.take(),
+        config_share: config_share.take(),
+        tako_cli_path: tako_cli_path.take(),
+    };
+    assemble(bootstrap, answers)
+}
+
+/// 背景で走らせる問い合わせ 1 本（答えは自分の [`Slot`] へ置く）
+type Job<'a> = Box<dyn FnOnce() + Send + 'a>;
+
+/// `here` を呼び出し元のスレッドで走らせながら、`jobs` を並びの順に最大 `limit` 本のスレッドで
+/// 走らせる（#1622）。並びの先頭ほど先に始まる。全部が終わってから `here` の答えを返す。
+///
+/// `limit == 0` は重ねない（`here` の後に 1 本ずつ = A/B の旧経路）。どれかが panic したら
+/// 全部を待ってから panic する（逐次のときと同じく呼び手へ伝わる）
+fn overlap<R>(limit: usize, jobs: Vec<Job<'_>>, here: impl FnOnce() -> R) -> R {
+    if limit == 0 {
+        let out = here();
+        jobs.into_iter().for_each(|job| job());
+        return out;
+    }
+    let workers = limit.min(jobs.len());
+    let queue = std::sync::Mutex::new(jobs.into_iter());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                // 錠は次の 1 本を取り出す間だけ持つ（走らせている間は持たない）
+                let next = queue.lock().ok().and_then(|mut queue| queue.next());
+                let Some(job) = next else { break };
+                job();
+            });
+        }
+        here()
+    })
+}
+
+/// 背景の問い合わせが答えを 1 度だけ置く場所
+struct Slot<T>(std::sync::Mutex<Option<T>>);
+
+impl<T> Slot<T> {
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    fn put(&self, value: T) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(value);
+        }
+    }
+
+    /// [`overlap`] が返った後に読む。問い合わせが panic したら `overlap` が先に panic するので、
+    /// ここへ来たときは必ず置かれている
+    fn take(self) -> T {
+        self.0
+            .into_inner()
+            .ok()
+            .flatten()
+            .expect("背景の問い合わせが答えを置いている（#1622）")
+    }
+}
+
+/// 採った答えから項目を組む（**問い合わせを 1 つも起こさない**。並びと判定は #1622 の前と同じ）
+fn assemble(bootstrap: BootstrapList, answers: Answers) -> Report {
+    let mut items = Vec::new();
+    let mut probe_timeouts = Vec::new();
     probe_timeouts.extend(
         bootstrap
             .iter()
@@ -267,13 +453,18 @@ pub fn collect() -> Report {
         }
     }
     items.extend(agent_cli_items(&bootstrap));
-    items.push(tako_cli_path_item());
+    items.push(answers.tako_cli_path);
     items.push(shell_integration_item());
     items.push(agents_detected_item(&bootstrap));
-    items.extend(dep_items());
+    items.extend(answers.deps);
     items.extend(fda_item());
     items.extend(webview2_item(&tako_core::platform::webview2::runtime()));
-    let (mcp, mcp_timeouts) = mcp_items(&bootstrap);
+    let (mcp, mcp_timeouts) = mcp_items(
+        &bootstrap,
+        answers.claude_mcp,
+        &answers.codex_mcp,
+        &answers.agy_mcp,
+    );
     items.extend(mcp);
     probe_timeouts.extend(mcp_timeouts);
     items.extend(agent_role_items(&bootstrap));
@@ -281,7 +472,7 @@ pub fn collect() -> Report {
     items.extend(instruction_items(&bootstrap));
     items.push(agents_sync_item());
     items.extend(sleep_guard_items());
-    items.push(config_share_item());
+    items.push(answers.config_share);
     items.push(profiles_item());
     items.push(remote_item());
     items.push(ipc_item());
@@ -754,7 +945,15 @@ fn webview2_item(runtime: &tako_core::platform::webview2::Runtime) -> Option<Ite
 
 // --- MCP 登録（#979） -------------------------------------------------------
 
-fn mcp_items(states: &BootstrapStates) -> (Vec<Item>, Vec<tako_core::probe::TimeoutNotice>) {
+/// 問い合わせの答え（`claude` = `agent_mcp::claude_health_now`・`codex` / `agy` = `agent_mcp::state`）は
+/// 導入状況を待たずに背景で採ったもの（#1622）。**未導入の系統の答えはここで捨てる**（項目の集合は
+/// 今まで通り導入状況だけで決まる）
+fn mcp_items(
+    states: &BootstrapStates,
+    claude: ClaudeMcp,
+    codex: &crate::agent_mcp::McpState,
+    agy: &crate::agent_mcp::McpState,
+) -> (Vec<Item>, Vec<tako_core::probe::TimeoutNotice>) {
     use crate::agent_mcp::McpState;
     use crate::orchestrator::agent::WorkerAgent;
 
@@ -769,7 +968,7 @@ fn mcp_items(states: &BootstrapStates) -> (Vec<Item>, Vec<tako_core::probe::Time
     // `agent_mcp` は面倒を見ない = `handled_here` が false）
     if installed(AgentKind::Claude) {
         // 打ち切りの知らせも受け取る（#1503。確認できなかったことを黙らせない）
-        let (registered, healthy, notice) = crate::agent_mcp::claude_health_now();
+        let (registered, healthy, notice) = claude;
         let key = "mcp.claude";
         // 問い合わせ（実行ファイルの検出 = #1533 / `claude mcp list` = #1503）を打ち切って
         // 登録を読めなかった。未登録ではなく確かめられなかったので、登録し直しへ人を送らない
@@ -811,17 +1010,16 @@ fn mcp_items(states: &BootstrapStates) -> (Vec<Item>, Vec<tako_core::probe::Time
             }))
         });
     }
-    for (kind, agent) in [
-        (AgentKind::Codex, WorkerAgent::Codex),
-        (AgentKind::Agy, WorkerAgent::Agy),
+    for (kind, agent, state) in [
+        (AgentKind::Codex, WorkerAgent::Codex, codex),
+        (AgentKind::Agy, WorkerAgent::Agy, agy),
     ] {
         if !installed(kind) {
             continue;
         }
         let name = agent.as_str();
         let key = format!("mcp.{name}");
-        let state = crate::agent_mcp::state(agent);
-        let mut item = match &state {
+        let mut item = match state {
             McpState::Ready { .. } => {
                 Item::new(key, Status::Ok, format!("{name} MCP: tako が登録済み"))
             }
@@ -1665,5 +1863,397 @@ mod tests {
         let items = agent_cli_items(&plain);
         assert_eq!(items[1].status, Status::Missing);
         assert!(line_of(&items[1]).contains("(path)"));
+    }
+
+    // --- #1622: 外部の問い合わせを重ねる ------------------------------------------
+
+    const DIAGNOSTICS_RS: &str = "crates/tako-control/src/diagnostics.rs";
+
+    /// 本番コードで `needle` が最初に現れる行（名指しに使う。テスト領域はファイルの末尾なので先に当たらない）
+    fn source_line(needle: &str) -> String {
+        let line = include_str!("diagnostics.rs")
+            .lines()
+            .position(|l| l.contains(needle))
+            .map_or(0, |i| i + 1);
+        format!("{DIAGNOSTICS_RS}:{line}")
+    }
+
+    /// 偽の問い合わせが互いの始まりを待ち合う観測台（#1622）。
+    ///
+    /// **実時間で比べない**: 重なっていれば待ち合いはその場で成立し、重なっていなければ（直列）
+    /// 相手が始まらないまま締め切りを過ぎる。締め切りはテストが固まらないための安全弁で、
+    /// 判定は「待ち合いが成立したか」という状態だけで行う
+    struct Rendezvous {
+        seen: std::sync::Mutex<Seen>,
+        changed: std::sync::Condvar,
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        /// 始まった口（始まった順。背景かどうか）
+        started: Vec<(&'static str, bool)>,
+        /// いま走っている背景の口の数と、その最大
+        running: usize,
+        max_running: usize,
+        /// 成立しなかった待ち合い
+        unmet: Vec<String>,
+        /// 締め切りを過ぎた待ちがある（以降の待ちはすぐ抜ける = 失敗が 20 秒 × 件数にならない）
+        gave_up: bool,
+    }
+
+    impl Seen {
+        fn has_started(&self, name: &str) -> bool {
+            self.started.iter().any(|(n, _)| *n == name)
+        }
+
+        fn background_started(&self) -> usize {
+            self.started.iter().filter(|(_, bg)| *bg).count()
+        }
+    }
+
+    /// 待ち合いの安全弁。成立する側はすぐ抜けるので、通るときの所要時間には出ない
+    const RENDEZVOUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    impl Rendezvous {
+        fn new() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Seen::default()),
+                changed: std::sync::Condvar::new(),
+            }
+        }
+
+        fn lock(&self) -> std::sync::MutexGuard<'_, Seen> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// `name` が始まった。背景の口なら、それより前に始まった背景の口の数を返す
+        fn enter(&self, name: &'static str, background: bool) -> usize {
+            let mut seen = self.lock();
+            let before = seen.background_started();
+            seen.started.push((name, background));
+            if background {
+                seen.running += 1;
+                seen.max_running = seen.max_running.max(seen.running);
+            }
+            self.changed.notify_all();
+            before
+        }
+
+        fn leave(&self) {
+            let mut seen = self.lock();
+            seen.running -= 1;
+            self.changed.notify_all();
+        }
+
+        /// `cond` が成り立つまで待つ。締め切りを過ぎたら成立しなかったと記録する
+        fn wait_until(&self, who: &str, what: &str, cond: impl Fn(&Seen) -> bool) {
+            let deadline = std::time::Instant::now() + RENDEZVOUS_DEADLINE;
+            let mut seen = self.lock();
+            while !cond(&seen) && !seen.gave_up {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    seen.unmet
+                        .push(format!("{who} が「{what}」を待ったが成立しなかった"));
+                    seen.gave_up = true;
+                    self.changed.notify_all();
+                    break;
+                }
+                seen = self
+                    .changed
+                    .wait_timeout(seen, deadline - now)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+        }
+
+        /// 背景の口の本体: 最初の 1 組（上限ぶん）はそろうまで互いに待つ = 上限まで重なることの観測
+        fn background<T>(&self, name: &'static str, answer: T) -> T {
+            let before = self.enter(name, true);
+            if before < PROBE_CONCURRENCY {
+                self.wait_until(
+                    name,
+                    &format!("背景の口が {PROBE_CONCURRENCY} 本同時に走る"),
+                    |s| s.background_started() >= PROBE_CONCURRENCY,
+                );
+            }
+            self.leave();
+            answer
+        }
+    }
+
+    /// 偽の答え: claude は導入済みで認証を打ち切り・`claude mcp list` も打ち切り、codex は使える、
+    /// agy は**未導入**（背景で採った MCP の答えは捨てられるべき）
+    fn fake_bootstrap() -> BootstrapList {
+        use crate::setup_bootstrap::Step;
+        let mut agy = bootstrap_state(AgentKind::Agy, Step::Install, false, None);
+        agy.binary = None;
+        vec![
+            (
+                AgentKind::Claude,
+                Ok(bootstrap_state(
+                    AgentKind::Claude,
+                    Step::Auth,
+                    false,
+                    Some(10),
+                )),
+            ),
+            (
+                AgentKind::Codex,
+                Ok(bootstrap_state(AgentKind::Codex, Step::Ready, true, None)),
+            ),
+            (AgentKind::Agy, Ok(agy)),
+        ]
+    }
+
+    fn fake_claude_mcp() -> ClaudeMcp {
+        let notice = tako_core::probe::TimeoutNotice {
+            label: tako_core::probe::label("claude", &["mcp", "list"]),
+            waited_secs: 15,
+        };
+        (false, false, Some(notice))
+    }
+
+    fn fake_mcp_ready() -> crate::agent_mcp::McpState {
+        crate::agent_mcp::McpState::Ready {
+            command: "/opt/fake/bin/tako".to_string(),
+        }
+    }
+
+    fn fake_deps() -> Vec<Item> {
+        crate::setup_deps::current_deps()
+            .into_iter()
+            .map(|dep| {
+                let key = format!("dep.{}", dep.bin);
+                Item::new(key, Status::Ok, format!("{0}: /opt/fake/bin/{0}", dep.bin))
+            })
+            .collect()
+    }
+
+    fn fake_config_share() -> Item {
+        let env = crate::config_share::env::ShareEnvironment {
+            linked: false,
+            repo: None,
+            repo_ok: false,
+            external: Vec::new(),
+            gh: None,
+        };
+        let text = config_share_lines(&env, false).join("\n");
+        Item::from_text(
+            "config_share",
+            status_from_line(&text),
+            summary_of(&text),
+            &text,
+        )
+    }
+
+    fn fake_tako_cli_path() -> Item {
+        let text = "  [OK] tako CLI の PATH: 外部ターミナルからも使えます（/opt/fake/bin）";
+        Item::from_text("tako_cli_path", Status::Ok, summary_of(text), text)
+    }
+
+    fn fake_answers() -> Answers {
+        Answers {
+            claude_mcp: fake_claude_mcp(),
+            codex_mcp: fake_mcp_ready(),
+            agy_mcp: fake_mcp_ready(),
+            deps: fake_deps(),
+            config_share: fake_config_share(),
+            tako_cli_path: fake_tako_cli_path(),
+        }
+    }
+
+    /// 比べる眺め。`ipc` の項目は GUI 内の記録（プロセス全体で 1 つ）を読み、並走する ipc の
+    /// テストが書き換えうるので外す（ここで見たいのは問い合わせの答えから組んだ並びと判定）
+    fn comparable(report: &Report) -> (Value, Vec<String>) {
+        let kept = Report {
+            items: report
+                .items
+                .iter()
+                .filter(|item| item.key != "ipc")
+                .cloned()
+                .collect(),
+            probe_timeouts: report.probe_timeouts.clone(),
+        };
+        (kept.to_json(), kept.lines())
+    }
+
+    /// #1622 の番犬: 外部の問い合わせは導入状況と重ねて走り、背景は上限まで重なって上限を超えず、
+    /// 答えは逐次に組んだものと 1 バイトも変わらない
+    #[test]
+    fn 外部の問い合わせは導入状況と重ねて走り答えは逐次と同じ() {
+        let watch = Rendezvous::new();
+        let bootstrap = || {
+            watch.enter("bootstrap", false);
+            watch.wait_until(
+                "導入状況（bootstrap）",
+                "claude mcp list が始まる",
+                |s| s.has_started("claude_mcp"),
+            );
+            fake_bootstrap()
+        };
+        let claude_mcp = || {
+            // 背景の先頭（一番長い問い合わせ）は導入状況と重なる
+            watch.enter("claude_mcp", true);
+            watch.wait_until(
+                "claude mcp list",
+                "導入状況（bootstrap）が始まる",
+                |s| s.has_started("bootstrap"),
+            );
+            watch.leave();
+            fake_claude_mcp()
+        };
+        let probes = Probes {
+            bootstrap: &bootstrap,
+            claude_mcp: &claude_mcp,
+            codex_mcp: &|| watch.background("codex_mcp", fake_mcp_ready()),
+            agy_mcp: &|| watch.background("agy_mcp", fake_mcp_ready()),
+            deps: &|| watch.background("deps", fake_deps()),
+            config_share: &|| watch.background("config_share", fake_config_share()),
+            tako_cli_path: &|| watch.background("tako_cli_path", fake_tako_cli_path()),
+        };
+        let report = collect_with(&probes, probe_concurrency(false));
+        let seen = watch.lock();
+
+        // 1. 重なった（直列へ戻すと、導入状況か背景の 1 組が相手の始まりを待ったまま締め切りを過ぎる）
+        assert!(
+            seen.unmet.is_empty(),
+            "{}（fn collect_with）が外部の問い合わせを重ねずに走らせた（#1622）:\n  {}\n\
+             始まった順: {:?}\n\n\
+             `claude mcp list`（実測 5.7 秒）が導入状況（実測 3 秒）の後に並ぶと check-health が 10 秒へ戻る。\n\
+             導入状況は呼び出し元のスレッドで、残りは背景で最大 {PROBE_CONCURRENCY} 本ずつ重ねること（`overlap`）",
+            source_line("fn collect_with("),
+            seen.unmet.join("\n  "),
+            seen.started,
+        );
+        // 2. 背景の同時数は上限を超えない
+        assert!(
+            seen.max_running <= PROBE_CONCURRENCY,
+            "{}（PROBE_CONCURRENCY = {PROBE_CONCURRENCY}）を超えて背景の問い合わせが {} 本同時に走った（#1622）。\n\
+             ログインシェルと CLI を一度に起こしすぎると、遅い機で個々の上限に掛かりやすくなる",
+            source_line("const PROBE_CONCURRENCY"),
+            seen.max_running,
+        );
+        // 3. どの口も 1 度だけ呼ばれた（重ねても問い合わせの集合は変わらない）
+        let mut names: Vec<&str> = seen.started.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![
+                "agy_mcp",
+                "bootstrap",
+                "claude_mcp",
+                "codex_mcp",
+                "config_share",
+                "deps",
+                "tako_cli_path"
+            ],
+            "{}: 問い合わせの呼ばれ方が変わった（#1622）",
+            source_line("fn collect_with(")
+        );
+        drop(seen);
+
+        // 4. 逐次に組んだもの（問い合わせを起こさない組み立てへ同じ答えを渡す）と 1 バイトも変わらない
+        let serial = assemble(fake_bootstrap(), fake_answers());
+        assert_eq!(
+            comparable(&report),
+            comparable(&serial),
+            "{}: 重ねた結果が逐次に組んだものと違う（#1622。判定と並びは 1 マスも変えない）",
+            source_line("fn collect_with(")
+        );
+
+        // 5. 打ち切りの知らせは重ねた後も落ちない・順も今まで通り（認証 → `claude mcp list`）
+        let labels: Vec<&str> = report
+            .probe_timeouts
+            .iter()
+            .map(|n| n.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                tako_core::probe::label(
+                    "claude",
+                    crate::setup_bootstrap::auth_probe_argv(AgentKind::Claude)
+                )
+                .as_str(),
+                tako_core::probe::label("claude", &["mcp", "list"]).as_str(),
+            ],
+            "打ち切りの知らせが落ちたか並びが変わった（#1622 / #1503 / #2255）"
+        );
+        let mcp_claude = report
+            .items
+            .iter()
+            .find(|item| item.key == "mcp.claude")
+            .expect("mcp.claude の項目");
+        assert_eq!(mcp_claude.status, Status::Warn, "{mcp_claude:?}");
+        assert!(
+            mcp_claude.summary.contains("登録状態を確認できません")
+                && mcp_claude.summary.contains("15 秒で応答なし"),
+            "`claude mcp list` の打ち切りの知らせが項目から落ちた（#1503 / #1622）: {mcp_claude:?}"
+        );
+
+        // 6. 未導入の系統（agy）の答えは捨てる（項目の集合は導入状況だけで決まる = 今まで通り）
+        for key in ["mcp.agy", "agent_role.agy", "instructions.agy"] {
+            assert!(
+                report.items.iter().all(|item| item.key != key),
+                "未導入の agy の {key} が出た（背景で採った答えを導入状況で捨てていない。#1622）"
+            );
+        }
+        assert!(report.items.iter().any(|item| item.key == "mcp.codex"));
+    }
+
+    /// #1622: 重ねても重ねなくても（A/B の旧経路 = `TAKO_1622_LEGACY=1`）答えは 1 バイトも変わらない
+    #[test]
+    fn 重ねても重ねなくても答えは同じ() {
+        let bootstrap = || fake_bootstrap();
+        let probes = Probes {
+            bootstrap: &bootstrap,
+            claude_mcp: &|| fake_claude_mcp(),
+            codex_mcp: &|| fake_mcp_ready(),
+            agy_mcp: &|| fake_mcp_ready(),
+            deps: &|| fake_deps(),
+            config_share: &|| fake_config_share(),
+            tako_cli_path: &|| fake_tako_cli_path(),
+        };
+        let parallel = collect_with(&probes, probe_concurrency(false));
+        let legacy = collect_with(&probes, probe_concurrency(true));
+        assert_eq!(comparable(&parallel), comparable(&legacy));
+        assert_eq!(probe_concurrency(true), 0, "A/B の旧経路は重ねない");
+        assert!(probe_concurrency(false) > 1, "既定は重ねる");
+    }
+
+    /// #1622: 本番の入口が A/B のゲートから同時数を決める（`collect_with` へ決め打ちの値を渡すと、
+    /// 上の番犬は緑のまま本番だけ直列へ戻る）
+    #[test]
+    fn 本番の入口はゲートから同時数を決める() {
+        let src = include_str!("diagnostics.rs");
+        let head = "pub fn collect() -> Report {";
+        let start = src.find(head).expect("collect の頭");
+        let end = start + src[start..].find("\n}\n").expect("collect の終わり");
+        assert!(
+            src[start..end].contains("collect_with(&probes, probe_concurrency(issue1622_legacy()))"),
+            "{}（fn collect）が `probe_concurrency(issue1622_legacy())` で同時数を決めていない（#1622）",
+            source_line(head)
+        );
+    }
+
+    /// `overlap` は並びの先頭から始め、上限ぶんだけ重ね、答えを取り違えない（#1622）
+    #[test]
+    fn overlapは全部を1度ずつ走らせてからhereの答えを返す() {
+        for limit in [0, 1, 2, PROBE_CONCURRENCY, 8] {
+            let done = std::sync::Mutex::new(Vec::new());
+            let jobs: Vec<Job<'_>> = (0..5)
+                .map(|i| {
+                    let done = &done;
+                    Box::new(move || done.lock().expect("錠").push(i)) as Job<'_>
+                })
+                .collect();
+            let out = overlap(limit, jobs, || "here");
+            assert_eq!(out, "here");
+            let mut ran = done.into_inner().expect("錠");
+            ran.sort_unstable();
+            assert_eq!(ran, vec![0, 1, 2, 3, 4], "limit={limit}");
+        }
+        // 空でも here は走る
+        assert_eq!(overlap(PROBE_CONCURRENCY, Vec::new(), || 7), 7);
     }
 }
