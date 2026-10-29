@@ -494,7 +494,7 @@ make_nightly_env() { # <dir> <変更を積むか 1/0> <タグを打つか 1/0>
   git -C "$dir/repo" config tag.gpgsign false
   git -C "$dir/repo" remote add origin "$dir/origin.git"
   cp "$REPO_ROOT/scripts/nightly-release.sh" "$dir/repo/scripts/"
-  cp "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$REPO_ROOT/scripts/lib/exit-guard.sh" "$dir/repo/scripts/lib/"
+  cp "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$REPO_ROOT/scripts/lib/exit-guard.sh" "$REPO_ROOT/scripts/lib/changelog.sh" "$dir/repo/scripts/lib/"
   printf '#!/bin/sh\necho "STUB release.sh $*"\nexit 0\n' > "$dir/repo/scripts/release.sh"
   chmod +x "$dir/repo/scripts/release.sh"
   printf '/target\n/dist\n/scripts/nightly-footprint-watch.sh\n' > "$dir/repo/.gitignore"

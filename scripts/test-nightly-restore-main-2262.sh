@@ -116,7 +116,7 @@ make_env() {
 
   # 別の PC から origin/main が新しい版の夜間へ進む（#1136 / #1892 / #2023 相当。検査の 2 つは tracked）
   command cp -f "$NIGHTLY_UNDER_TEST" "$dir/dev/scripts/nightly-release.sh"
-  command cp -f "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$REPO_ROOT/scripts/lib/exit-guard.sh" "$dir/dev/scripts/lib/"
+  command cp -f "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$REPO_ROOT/scripts/lib/exit-guard.sh" "$REPO_ROOT/scripts/lib/changelog.sh" "$dir/dev/scripts/lib/"
   cat > "$dir/dev/scripts/check-claude-mod.sh" <<'SH'
 #!/bin/bash
 echo "mod-check $*" >> "$HOME/calls.log"

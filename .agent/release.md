@@ -148,6 +148,14 @@ Windows 版は該当なし。既に配った版はそのまま（差し替えな
   実行され、前回タグ以降に main へ変更があった夜だけ自動リリースする
   （version bump → CHANGELOG 自動節 → コミット → annotated tag → release.sh でバイナリ付き
   GitHub Release）。クラウドルーチンでの夜間リリースはバイナリを作れず廃止した（経緯は #166）
+- **CHANGELOG の `## [Unreleased]` は最上段に 1 つ（#1593）**: 自動節は最上段の Unreleased の**直下**へ挿し、
+  Unreleased に書かれていた手書きの項目はその版の節の末尾（コミット一覧の後ろ）へ移して Unreleased を空で残す
+  （無ければ作る）。正本は `scripts/lib/changelog.sh` の `changelog_insert_release`。旧版は「最初の `## [` の直前」へ
+  挿したので Unreleased 自体が押し出され、次の PR が最上段に新しい Unreleased を作る、を繰り返して 10/30 には
+  5 つ並んでいた（押し出された手書きの項目は版のリリースノートにも載らなかった）。最上段より下にも残っていれば
+  警告だけ出して最上段の 1 つを扱う。モックは `bash scripts/test-release-retry.sh` の Test 14〜15（A/B は
+  `TAKO_1593_LEGACY=1`）と `scripts/test-nightly-reserve.sh` の Test 8、実物は番犬
+  `crates/tako-control/tests/issue1593_changelog_unreleased_watchdog.rs` が見る
 - 自動スキップ条件: 変更なし / 共有ツリー dirty / 手動リリース進行中（Cargo.toml version ≠ 最新タグ）/
   プレリリース版 / 多重起動。ログは `~/.claude-orchestrator/logs/tako-nightly-release.log`
 - **共有ツリー（install_root）の HEAD は動かさない（#1136）**: リリース作業は毎回

@@ -367,6 +367,15 @@ commit 件名から CHANGELOG の節を自動生成するので、件名に無�
 [修正] [Windows] ConPTY のリサイズ追従を修正 (#123)
 ```
 
+### 手書きの項目は最上段の `## [Unreleased]` へ（Issue #1593）
+
+PR で CHANGELOG へ手書きの項目を足すときは、**最初の版の節より上にある 1 つだけの
+`## [Unreleased]`** の下へ書く（無ければそこに作る。版の節の間に新しい Unreleased を作らない）。
+夜間リリースはその Unreleased を最上段に空で残し、中身を新しい版の節の末尾へ移す
+（`scripts/lib/changelog.sh`）ので、書いた項目はその夜の版のリリースノートに載る。
+手動リリースで版の節を書くときも、版の節は Unreleased の**下**に置く。2 つ目の Unreleased や
+版の節より下の Unreleased は番犬 `issue1593_changelog_unreleased_watchdog` が file:line で落とす。
+
 ### リリースノートの構成
 
 `scripts/release.sh` が CHANGELOG と**実アセット**から自動生成する。手で書かない。

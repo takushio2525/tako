@@ -93,7 +93,7 @@ make_env() {
   git -C "$dir/dev" remote add origin "$dir/origin.git"
   mkdir -p "$dir/dev/scripts/lib"
   write_nightly_version "$dir/dev" old
-  command cp -f "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$REPO_ROOT/scripts/lib/exit-guard.sh" "$dir/dev/scripts/lib/"
+  command cp -f "$REPO_ROOT/scripts/lib/nightly-reserve.sh" "$REPO_ROOT/scripts/lib/exit-guard.sh" "$REPO_ROOT/scripts/lib/changelog.sh" "$dir/dev/scripts/lib/"
   printf '#!/bin/sh\necho "release.sh $*" >> "$HOME/calls.log"\nexit 0\n' > "$dir/dev/scripts/release.sh"
   chmod +x "$dir/dev/scripts/release.sh"
   printf '/target\n/dist\n' > "$dir/dev/.gitignore"
