@@ -5748,6 +5748,9 @@ impl TakoApp {
             // セッションカタログ（#112）は復元ループの外で 1 回だけ読む。
             // 起動条件（役割 / model / effort）の出どころで、読めなければ最小形へ落ちる
             let catalog = tako_control::sessions::SessionCatalog::load().ok();
+            // worker レジストリ（spawn が記録した model / effort）も 1 回だけ。worker を spawn と同じ
+            // 組み立てで戻す手掛かり（#2473。`tako sessions resume` / 会話を保った再起動と同じ材料）
+            let worker_registry = tako_control::orchestrator::registry::WorkerRegistry::load().ok();
             for r in &restored {
                 // `hidden` = 退避のまま戻すペインの種別（表のペインは None）。以降の枝は表と
                 // 退避で共通で、結末だけを `PaneOutcome::within` が「たまり場・退避」へ数え替える
@@ -5890,12 +5893,21 @@ impl TakoApp {
                     }),
                     None => saved_agent,
                 };
+                // worker は spawn と同じ組み立てで戻す（#2473）。起動した master のプロファイルは
+                // 復元した layout の role / spawned_by から辿る（ペイン ID は復元で保たれる）
+                let hints = tako_control::resume_launch::restore_hints(
+                    &app.workspace,
+                    pane,
+                    resume.and_then(|r| r.id),
+                    worker_registry.as_ref(),
+                );
                 let plan = tako_control::sessions::restore_plan(
                     backend_alive,
                     resume,
                     catalog.as_ref(),
                     r.session.as_deref(),
                     Some(r.pane),
+                    &hints,
                 );
                 if let Some(session_id) = &r.claude_session_id {
                     if tako_control::transcript::is_valid_session_id(session_id) {
@@ -100336,6 +100348,7 @@ mod persist_resume_tests {
             pane: None,
             platform: Platform::MacOs,
             worker_mcp_args: None,
+            worker_command: None,
         }
     }
 

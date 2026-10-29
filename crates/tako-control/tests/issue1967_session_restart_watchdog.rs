@@ -147,14 +147,20 @@ fn 再開コマンドは元の起動の正本を通す(s: &Sources) -> Result<()
         "orchestrator::agent::build_worker_cmd_in(",
         "worker の再開が spawn と同じ組み立てを通っていない = 許可モード・追加引数が落ちる",
     )?;
-    for win in [&master, &worker] {
-        require(
-            win,
-            RESUME,
-            "with_resume_flag(",
-            "`--resume <id>` を書式の正本から足していない",
-        )?;
-    }
+    require(
+        &master,
+        RESUME,
+        "with_resume_flag(",
+        "`--resume <id>` を書式の正本から足していない",
+    )?;
+    // worker は spawn と同じ関数へ会話 ID を渡し、書式の正本（resume_spec）は
+    // build_worker_cmd_in の中で引く（codex の `resume` を program の直後へ置くため。#2473）
+    require(
+        &worker,
+        RESUME,
+        "resume: Some(session_id)",
+        "`--resume <id>` を書式の正本から足していない（spawn と同じ関数へ会話 ID を渡していない）",
+    )?;
     Ok(())
 }
 

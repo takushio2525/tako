@@ -28,12 +28,20 @@
 //! アカウント（`CLAUDE_CONFIG_DIR`）だけは**会話の記録がある場所**へ寄せる。記録の無い
 //! config dir で resume すると `No conversation found` で落ちるため（#652 と同じ理由）。
 //! プロファイルのアカウントと記録の所在が食い違ったら warnings に出す（黙って寄せない）。
+//! codex の worker の `CODEX_HOME` も同じ考え方で、rollout を見つけた置き場へ寄せる（#2473）。
 //!
-//! claude 以外（codex / agy）は起動の引数を resume へ持ち込めない・持ち込まない系統なので
-//! 従来どおり `sessions::resume_command` を通す（能力マトリクス `resume_launch_args`）。
-//! ただし **worker の MCP の断片**（絞り込み #2412 / #2418・tako の MCP の一時注入 #986）だけは
-//! どの経路でも spawn と同じ `worker_mcp::prepare_for_resume` + `agent::worker_mcp_args` で載せる
-//! （#2447。`codex resume` は `-c` を受ける = 0.154.0 の --help。再起動をまたぐ GUI の復元も同じ）。
+//! # worker は 3 つの入口が同じ 1 実装を通る（#2473）
+//!
+//! worker の再開は**再起動をまたぐ GUI の復元**（`sessions::restore_plan`）・`tako sessions resume`・
+//! 会話を保った再起動のどれでも [`worker_resume_launch`] → `build_worker_cmd_in`（spawn と同じ関数に
+//! 会話 ID を渡す = `WorkerLaunch::resume`）で組む。#2473 の前は GUI の復元だけがカタログのメタで組まれ、
+//! 再起動のたびに `--permission-mode auto`（プロファイルの args）・`--remote-control`・プロファイルの env が
+//! 落ち、`--model` は `claude agents` が報告した実モデルへ化けていた（隔離 GUI の実測）。
+//! 対象の系統は能力マトリクス `resume_launch_args`（claude / codex。codex は `codex resume` が
+//! `-m` / `-c` / プロファイルの args を受ける = 0.154.0 の --help）。agy と worker 以外の codex は
+//! 従来どおり `sessions::resume_command`（カタログのメタ）を通る。ただし **worker の MCP の断片**
+//! （絞り込み #2412 / #2418・tako の MCP の一時注入 #986）は**どの経路でも** spawn と同じ
+//! `worker_mcp::prepare_for_resume` + `agent::worker_mcp_args` で載せる（#2447）。
 
 use std::path::{Path, PathBuf};
 
@@ -51,7 +59,7 @@ pub enum ResumeRecipe {
     SoloProfile,
     /// 起動した master のプロファイル + 記録した model / effort から spawn と同じ組み立て
     WorkerProfile,
-    /// カタログのメタだけ（claude 以外・role の無いペイン・`TAKO_1967_LEGACY=1`）
+    /// カタログのメタだけ（agy・worker 以外の codex・role の無いペイン・`TAKO_1967_LEGACY=1`）
     Catalog,
 }
 
@@ -72,9 +80,74 @@ pub struct ResumeHints {
     /// worker を起動した master のプロファイル名（spawn の `resolve_caller_profile` と同じ考え方。
     /// `None` は既定プロファイル）
     pub worker_profile: Option<String>,
-    /// worker レジストリに記録した model / effort（spawn 時に解決済みの値。カタログより優先）
-    pub worker_model: Option<String>,
-    pub worker_effort: Option<String>,
+    /// worker レジストリに記録した spawn の model / effort（spawn 時に解決済みの値。カタログより優先）。
+    /// **`Some` は記録がある = 中の `None` も spawn が決めた値**（`--model` を付けずに CLI の既定へ委ねた）。
+    /// カタログの model は `claude agents` が報告した実モデルで上書きされるので、記録があるのに
+    /// カタログへ落ちると spawn に無い `--model` が付く（#2473 の実測）。`None` = 記録が無いときだけ
+    /// カタログのメタへ落ちる（[`recorded_worker_launch`]）
+    pub worker_launch: Option<RecordedLaunch>,
+}
+
+/// spawn がレジストリに記録した model / effort（#1967 / #2473）
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordedLaunch {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
+/// レジストリから、この会話（引けなければこのペイン）を spawn したときの model / effort を引く
+/// （`tako sessions resume` は会話 ID・会話を保った再起動はペイン・GUI の復元は両方 = 同じ 1 実装）。
+/// 同一ペイン番号には世代が堆積するので最後に spawn したものを採る（#466 と同型）
+pub fn recorded_worker_launch(
+    registry: &crate::orchestrator::registry::WorkerRegistry,
+    session_id: Option<&str>,
+    pane: Option<u64>,
+) -> Option<RecordedLaunch> {
+    let latest = |pick: &dyn Fn(&crate::orchestrator::registry::WorkerEntry) -> bool| {
+        registry
+            .workers
+            .values()
+            .filter(|e| pick(e))
+            .max_by_key(|e| e.spawned_at.clone())
+            .map(|e| RecordedLaunch {
+                model: e.model.clone(),
+                effort: e.effort.clone(),
+            })
+    };
+    session_id
+        .and_then(|id| latest(&|e| e.session_id.as_deref() == Some(id)))
+        .or_else(|| pane.and_then(|p| latest(&|e| e.pane == p)))
+}
+
+/// GUI の復元（再起動をまたぐ）で worker を組むための手掛かり（#2473）。`tako sessions resume` /
+/// 会話を保った再起動と同じ材料: 起動した master のプロファイル = ペインの `spawned_by` を辿った
+/// master の role（layout.json が role と spawned_by を保つ）、model / effort = レジストリの記録
+pub fn restore_hints(
+    workspace: &tako_core::Workspace,
+    pane: tako_core::PaneId,
+    session_id: Option<&str>,
+    registry: Option<&crate::orchestrator::registry::WorkerRegistry>,
+) -> ResumeHints {
+    ResumeHints {
+        worker_profile: crate::dispatch::find_master_suffix_from(workspace, pane).map(|s| {
+            if s.is_empty() {
+                DEFAULT_PROFILE.to_string()
+            } else {
+                s
+            }
+        }),
+        worker_launch: registry
+            .and_then(|reg| recorded_worker_launch(reg, session_id, Some(pane.as_u64()))),
+    }
+}
+
+/// #2473 の A/B。`TAKO_2473_LEGACY=1` で**同一バイナリのまま**「GUI の復元と codex の worker の再開は
+/// カタログのメタだけで組む」#2473 前へ戻す（claude の `tako sessions resume` / 会話を保った再起動は
+/// #1967 のまま spawn と同じ組み立て）
+pub fn legacy_2473() -> bool {
+    std::env::var("TAKO_2473_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// 組み上がった再開コマンド
@@ -127,23 +200,38 @@ pub fn resume_launch(
     hints: &ResumeHints,
 ) -> Result<ResumeLaunch, String> {
     let location = crate::transcript::locate_transcript(session_id);
+    let codex_home = codex_rollout_home(session_id, entry);
     resume_launch_in(
         session_id,
         entry,
         hints,
         location.as_ref(),
+        codex_home.as_deref(),
         &crate::dispatch::resolve_tako_binary(),
         crate::launch_cmd::launch_dialect(),
         tako_core::session_restart::legacy_1967(),
     )
 }
 
-/// [`resume_launch`] の本体（会話の所在・tako の実体パス・方言・旧挙動を引数で受ける）
+/// codex の会話なら、rollout が見つかった `CODEX_HOME`（[`pin_codex_home`] の材料）。
+/// 見つからない・codex でないなら `None`（寄せない）
+pub fn codex_rollout_home(session_id: &str, entry: &SessionEntry) -> Option<PathBuf> {
+    if entry.agent.as_deref().and_then(Agent::parse) != Some(Agent::Codex) {
+        return None;
+    }
+    crate::codex_session::find_rollout(session_id)?;
+    crate::codex_session::codex_home()
+}
+
+/// [`resume_launch`] の本体（会話の所在・tako の実体パス・方言・旧挙動を引数で受ける）。
+/// `codex_home` は codex の rollout を見つけた置き場（[`codex_rollout_home`]）
+#[allow(clippy::too_many_arguments)]
 pub fn resume_launch_in(
     session_id: &str,
     entry: &SessionEntry,
     hints: &ResumeHints,
     location: Option<&TranscriptLocation>,
+    codex_home: Option<&Path>,
     tako_bin: &str,
     dialect: crate::launch_cmd::ShellDialect,
     legacy: bool,
@@ -177,18 +265,22 @@ pub fn resume_launch_in(
             worker_mcp: worker_mcp.map(|(_, mcp)| mcp),
         })
     };
-    // claude 以外は起動の引数を resume へ持ち込めない（codex resume は --model を受けない
-    // = agent_resume::ResumeSpec の accepts_launch_flags。MCP の断片だけは載せる = #2447）。旧挙動の A/B もここ
-    if legacy || agent != Agent::Claude {
+    // 旧挙動の A/B（#1967）
+    if legacy {
         return catalog();
     }
-    let location = location.ok_or_else(|| {
-        format!(
-            "会話 {} の記録（claude の transcript）が見つからない。\
-             削除されたか、登録されていない設定 dir にある（`tako orchestrator accounts list`）",
-            crate::sessions::short_id(session_id)
-        )
-    })?;
+    // worker は spawn と同じ組み立て（GUI の復元と同じ 1 実装 = #2473）。対象外の系統（agy）はカタログ
+    if let Some(launch) = worker_resume_launch(
+        session_id, entry, hints, location, codex_home, tako_bin, dialect,
+    ) {
+        return launch;
+    }
+    // claude 以外の master / solo・worker 以外は起動の引数を resume へ持ち込めない（カタログの組み立ては
+    // claude の `--effort` 書式 = agent_resume::ResumeSpec の accepts_launch_flags。MCP の断片だけは載せる = #2447）
+    if agent != Agent::Claude {
+        return catalog();
+    }
+    let location = location.ok_or_else(|| no_transcript(session_id))?;
     match entry.kind.as_str() {
         "master" => resume_profile_launch(
             session_id,
@@ -206,10 +298,57 @@ pub fn resume_launch_in(
             tako_bin,
             dialect,
         ),
-        "worker" => resume_worker_launch(session_id, entry, hints, location, tako_bin, dialect),
         // role の無いペイン（手動起動）は元の起動を知らない = カタログのメタが全て
         _ => catalog(),
     }
+}
+
+/// claude の会話の記録が見つからないときの理由（利用者へそのまま出す）
+fn no_transcript(session_id: &str) -> String {
+    format!(
+        "会話 {} の記録（claude の transcript）が見つからない。\
+         削除されたか、登録されていない設定 dir にある（`tako orchestrator accounts list`）",
+        crate::sessions::short_id(session_id)
+    )
+}
+
+/// worker の再開コマンド（**GUI の復元・`tako sessions resume`・会話を保った再起動が共有する 1 実装**。#2473）。
+///
+/// spawn と同じ `build_worker_cmd_in` に会話 ID を渡して組む（[`resume_worker_launch`]）。
+/// `None` = この会話は対象外 = worker でない・能力マトリクス `resume_launch_args` が使えない系統（agy）・
+/// codex で `TAKO_2473_LEGACY=1`。呼び出し側はカタログのメタの組み立てへ落ちる
+pub fn worker_resume_launch(
+    session_id: &str,
+    entry: &SessionEntry,
+    hints: &ResumeHints,
+    location: Option<&TranscriptLocation>,
+    codex_home: Option<&Path>,
+    tako_bin: &str,
+    dialect: crate::launch_cmd::ShellDialect,
+) -> Option<Result<ResumeLaunch, String>> {
+    use tako_core::agent_support::{keys, supports};
+    if entry.kind != "worker" {
+        return None;
+    }
+    let agent = entry
+        .agent
+        .as_deref()
+        .and_then(Agent::parse)
+        .unwrap_or(Agent::Claude);
+    if !supports(agent, keys::RESUME_LAUNCH_ARGS) {
+        return None;
+    }
+    // claude は #1967 から。A/B（#2473）で外すのは #2473 で載せた codex だけ
+    if agent != Agent::Claude && legacy_2473() {
+        return None;
+    }
+    let worker = WorkerAgent::try_from(agent).ok()?;
+    if !crate::transcript::is_valid_session_id(session_id) {
+        return Some(Err("session_id の形式が不正".into()));
+    }
+    Some(resume_worker_launch(
+        session_id, worker, entry, hints, location, codex_home, tako_bin, dialect,
+    ))
 }
 
 /// master / solo: `tako master -<名前>` / `tako solo -<名前>` と同じ組み立て + `--resume`
@@ -276,12 +415,16 @@ fn resume_profile_launch(
     })
 }
 
-/// worker: spawn と同じ組み立て（起動した master のプロファイル + 記録した model / effort）+ `--resume`
+/// worker: spawn と同じ組み立て（起動した master のプロファイル + 記録した model / effort）に
+/// 会話 ID を渡す（`WorkerLaunch::resume` = 書式は spawn と同じ関数の中で `resume_spec` から足す。#2473）
+#[allow(clippy::too_many_arguments)]
 fn resume_worker_launch(
     session_id: &str,
+    worker: WorkerAgent,
     entry: &SessionEntry,
     hints: &ResumeHints,
-    location: &TranscriptLocation,
+    location: Option<&TranscriptLocation>,
+    codex_home: Option<&Path>,
     tako_bin: &str,
     dialect: crate::launch_cmd::ShellDialect,
 ) -> Result<ResumeLaunch, String> {
@@ -294,16 +437,31 @@ fn resume_worker_launch(
     let (profile, profile_name) =
         load_profile_for_resume(ProfileKind::Master, name, &mut warnings)?;
     profile.validate_env()?;
-    // spawn は env 計画にアカウントを混ぜる（`resolved_env_plan_with_account`）。
-    // 再開ではアカウントを**会話の記録の所在**で決める（spawn 時の `--account` は記録に無い）
-    let mut plan = profile.resolved_env_plan();
-    pin_config_dir(&mut plan, location, &mut warnings);
-    // 記録した値（spawn 時に解決済み）を明示指定として渡す。記録が無ければ spawn と同じ解決
-    let model = hints.worker_model.as_deref().or(entry.model.as_deref());
-    let effort = hints.worker_effort.as_deref().or(entry.effort.as_deref());
-    let launch = profile.resolve_agent_launch(WorkerAgent::Claude, model, effort);
-    let remote_control =
-        orchestrator::remote_control_decision(&profile, WorkerAgent::Claude, &plan);
+    // spawn と同じ env 計画（プロファイルの env + worker のアカウント）。そのうえで設定の置き場だけを
+    // **会話の記録の所在**へ寄せる（spawn 時の `--account` は記録に無い / 記録の無い置き場で resume すると落ちる）
+    let mut plan = worker_env_plan(&profile, &mut warnings);
+    match worker {
+        WorkerAgent::Claude => {
+            let location = location.ok_or_else(|| no_transcript(session_id))?;
+            pin_config_dir(&mut plan, location, &mut warnings);
+        }
+        WorkerAgent::Codex => {
+            if let Some(home) = codex_home {
+                pin_codex_home(&mut plan, home, &mut warnings);
+            }
+        }
+        // 能力マトリクス `resume_launch_args` が agy を通さない（worker_resume_launch で弾く）
+        WorkerAgent::Agy => {}
+    }
+    // 記録した値（spawn 時に解決済み）を明示指定として渡す。**記録があれば None も spawn の決めた値**
+    // （カタログの model は `claude agents` の実モデルで上書きされるので混ぜない = #2473）。
+    // 記録が無いときだけカタログのメタ、それも無ければ spawn と同じ解決
+    let (model, effort) = match &hints.worker_launch {
+        Some(recorded) => (recorded.model.as_deref(), recorded.effort.as_deref()),
+        None => (entry.model.as_deref(), entry.effort.as_deref()),
+    };
+    let launch = profile.resolve_agent_launch(worker, model, effort);
+    let remote_control = orchestrator::remote_control_decision(&profile, worker, &plan);
     // role は spawn と同じ綴り（ラベルが無ければ project だけ）
     let project = entry.project.as_deref().unwrap_or("resumed");
     let role = match entry.label.as_deref() {
@@ -312,9 +470,9 @@ fn resume_worker_launch(
     };
     // #2412: spawn と同じ絞り込み（プロジェクトの mcp_servers・会話の cwd の .mcp.json）。
     // 再開で user scope の MCP が戻ってくると、spawn で絞った意味が再起動のたびに消える。
-    // 判断は再起動をまたぐ復元（#2447）と同じ `prepare_for_resume`
+    // 判断は再起動をまたぐ復元（#2447）と同じ `prepare_for_resume`。読む置き場は上で会話の所在へ寄せた計画
     let worker_mcp = crate::worker_mcp::prepare_for_resume(
-        WorkerAgent::Claude,
+        worker,
         entry.project.as_deref(),
         entry.cwd.as_deref(),
         &plan,
@@ -323,7 +481,7 @@ fn resume_worker_launch(
     warnings.extend(worker_mcp.warnings.iter().cloned());
     let cmd = orchestrator::agent::build_worker_cmd_in(
         &orchestrator::agent::WorkerLaunch {
-            agent: WorkerAgent::Claude,
+            agent: worker,
             role: &role,
             model: launch.model.as_deref(),
             effort: launch.effort.as_deref(),
@@ -335,17 +493,36 @@ fn resume_worker_launch(
             mcp_settings: worker_mcp.settings_file.as_deref(),
             mcp_codex_off: &worker_mcp.codex_off,
             env: &plan,
+            resume: Some(session_id),
         },
         dialect,
     );
     Ok(ResumeLaunch {
-        command: with_resume_flag(cmd, session_id),
+        command: cmd,
         recipe: ResumeRecipe::WorkerProfile,
         profile: Some(profile_name),
         warnings,
         prompt_file: None,
         worker_mcp: Some(worker_mcp),
     })
+}
+
+/// spawn と同じ env 計画（プロファイルの env + worker のアカウント = `resolved_env_plan_with_account`）。
+/// spawn 時の `--account` は記録に無いのでプロファイルの `worker_account`（無ければ `master_account`）で引く。
+/// アカウントが引けなくても再開は止めない（プロファイルの env だけで組み、理由を warnings へ）
+fn worker_env_plan(profile: &Profile, warnings: &mut Vec<String>) -> EnvPlan {
+    let Some(name) = profile.resolve_worker_account_name(None) else {
+        return profile.resolved_env_plan();
+    };
+    match orchestrator::AccountsConfig::load().and_then(|accounts| accounts.resolve(name)) {
+        Ok(account) => profile.resolved_env_plan_with_account(Some(&account)),
+        Err(e) => {
+            warnings.push(format!(
+                "worker のアカウント '{name}' を引けないので、プロファイルの env だけで再開した: {e}"
+            ));
+            profile.resolved_env_plan()
+        }
+    }
 }
 
 const DEFAULT_PROFILE: &str = "default";
@@ -402,6 +579,29 @@ fn pin_config_dir(plan: &mut EnvPlan, location: &TranscriptLocation, warnings: &
     } else {
         plan.exports
             .push((key.to_string(), wanted.display().to_string()));
+    }
+}
+
+/// env 計画の `CODEX_HOME` を **rollout を見つけた置き場**へ寄せる（#2473。claude の [`pin_config_dir`] と
+/// 同じ考え方）。計画が `CODEX_HOME` を決めていなければ触らない（spawn も決めていない = 同じ env を継ぐ）。
+/// 決めていて食い違うときだけ寄せて warnings に出す（記録の無い置き場で `codex resume` すると会話が無い）
+fn pin_codex_home(plan: &mut EnvPlan, home: &Path, warnings: &mut Vec<String>) {
+    const KEY: &str = "CODEX_HOME";
+    let Some(current) = plan.export_value(KEY).map(PathBuf::from) else {
+        return;
+    };
+    if current == home {
+        return;
+    }
+    warnings.push(format!(
+        "プロファイルの CODEX_HOME（{}）に会話の記録が無いので、記録のある置き場（{}）で再開した",
+        current.display(),
+        home.display()
+    ));
+    for (k, v) in plan.exports.iter_mut() {
+        if k == KEY {
+            *v = home.display().to_string();
+        }
     }
 }
 
@@ -464,6 +664,7 @@ mod tests {
             &master_entry("rl1967a"),
             &ResumeHints::default(),
             Some(&loc),
+            None,
             "/opt/tako",
             ShellDialect::Posix,
             false,
@@ -521,6 +722,7 @@ mod tests {
             &master_entry("rl1967b"),
             &ResumeHints::default(),
             Some(&loc),
+            None,
             "/opt/tako",
             ShellDialect::Posix,
             true,
@@ -543,6 +745,7 @@ mod tests {
             &master_entry("default"),
             &ResumeHints::default(),
             None,
+            None,
             "/opt/tako",
             ShellDialect::Posix,
             false,
@@ -562,6 +765,7 @@ mod tests {
             &master_entry("rl1967c"),
             &ResumeHints::default(),
             Some(&location("/tmp/rl1967c-home/.claude", true)),
+            None,
             "/opt/tako",
             ShellDialect::Posix,
             false,
@@ -611,6 +815,7 @@ mod tests {
             &master_entry("rl1967d"),
             &ResumeHints::default(),
             Some(&loc),
+            None,
             "/opt/tako",
             ShellDialect::Posix,
             false,
@@ -622,6 +827,7 @@ mod tests {
             &master_entry("rl1967-label-only"),
             &ResumeHints::default(),
             Some(&loc),
+            None,
             "/opt/tako",
             ShellDialect::Posix,
             false,
@@ -658,6 +864,7 @@ mod tests {
             &entry,
             &ResumeHints::default(),
             Some(&location("/tmp/rl1967e", false)),
+            None,
             "/opt/tako",
             ShellDialect::Posix,
             false,
@@ -690,14 +897,17 @@ mod tests {
         };
         let hints = ResumeHints {
             worker_profile: Some("rl1967f".into()),
-            worker_model: Some("claude-opus-5-5".into()),
-            worker_effort: Some("high".into()),
+            worker_launch: Some(RecordedLaunch {
+                model: Some("claude-opus-5-5".into()),
+                effort: Some("high".into()),
+            }),
         };
         let got = resume_launch_in(
             ID,
             &entry,
             &hints,
             Some(&location("/tmp/rl1967f", false)),
+            None,
             "/opt/tako",
             ShellDialect::Posix,
             false,
@@ -728,6 +938,7 @@ mod tests {
             &pane,
             &ResumeHints::default(),
             Some(&location("/tmp/rl1967g", false)),
+            None,
             "/opt/tako",
             ShellDialect::Posix,
             false,
@@ -745,6 +956,7 @@ mod tests {
             &codex,
             &ResumeHints::default(),
             None,
+            None,
             "/opt/tako",
             ShellDialect::Posix,
             false,
@@ -752,5 +964,375 @@ mod tests {
         if let Ok(got) = got {
             assert_eq!(got.recipe, ResumeRecipe::Catalog);
         }
+    }
+
+    // ---- #2473: worker の再開は spawn と同じ 1 実装 ----
+
+    /// spawn（dispatch の `build_worker_cmd` と同じ材料）で組んだら、という起動コマンド。
+    /// 再開の組み立てと**同じ解決**（プロファイル → resolve_agent_launch → remote_control_decision →
+    /// prepare_for_resume）を辿り、`resume: None` で組む = 比べる相手
+    fn spawn_cmd_for(
+        profile_name: &str,
+        worker: WorkerAgent,
+        role: &str,
+        recorded: &RecordedLaunch,
+        plan: &EnvPlan,
+    ) -> String {
+        let profile = Profile::load(profile_name).unwrap();
+        let launch = profile.resolve_agent_launch(
+            worker,
+            recorded.model.as_deref(),
+            recorded.effort.as_deref(),
+        );
+        let rc = orchestrator::remote_control_decision(&profile, worker, plan);
+        let mcp = crate::worker_mcp::prepare_for_resume(
+            worker,
+            Some("tako"),
+            None,
+            plan,
+            &launch.extra_args,
+        );
+        orchestrator::agent::build_worker_cmd_in(
+            &orchestrator::agent::WorkerLaunch {
+                agent: worker,
+                role,
+                model: launch.model.as_deref(),
+                effort: launch.effort.as_deref(),
+                skip_permissions: launch.skip_permissions,
+                allow_sandbox_bypass: launch.allow_sandbox_bypass,
+                remote_control: rc.enabled(),
+                extra_args: &launch.extra_args,
+                tako_bin: Some("/opt/tako"),
+                mcp_settings: mcp.settings_file.as_deref(),
+                mcp_codex_off: &mcp.codex_off,
+                env: plan,
+                resume: None,
+            },
+            ShellDialect::Posix,
+        )
+    }
+
+    fn worker_entry(agent: &str, label: &str) -> SessionEntry {
+        SessionEntry {
+            kind: "worker".into(),
+            project: Some("tako".into()),
+            label: Some(label.into()),
+            agent: Some(agent.into()),
+            // カタログの model は `claude agents` の実モデルで上書きされうる（記録があれば使わない）
+            model: Some("claude-opus-5".into()),
+            ..Default::default()
+        }
+    }
+
+    /// 本番の worker と同じ形のプロファイル（model / effort / `--permission-mode auto` / Remote Control /
+    /// env）で、claude の worker の再開は spawn の起動コマンドに `--resume <id>` が付いただけ。
+    /// 許可スキップは付かない（プロファイルが opt-in していない = spawn も付けない）
+    #[test]
+    fn i2473_claude_の_worker_の再開は_spawn_の起動コマンドに_resume_を足しただけ() {
+        save_profile(
+            "rl2473a",
+            "env:\n  T2473_ENV: from-profile\nremote_control: true\nbypass_sandbox: false\n\
+             worker_agents:\n  claude:\n    model: claude-opus-5-5\n    effort: xhigh\n    \
+             args: [\"--permission-mode\", \"auto\"]\n",
+        );
+        let recorded = RecordedLaunch {
+            model: Some("claude-opus-5-5".into()),
+            effort: Some("xhigh".into()),
+        };
+        let hints = ResumeHints {
+            worker_profile: Some("rl2473a".into()),
+            worker_launch: Some(recorded.clone()),
+        };
+        let loc = location("/tmp/rl2473a", false);
+        let got = resume_launch_in(
+            ID,
+            &worker_entry("claude", "cl"),
+            &hints,
+            Some(&loc),
+            None,
+            "/opt/tako",
+            ShellDialect::Posix,
+            false,
+        )
+        .unwrap();
+        assert_eq!(got.recipe, ResumeRecipe::WorkerProfile);
+        // spawn は会話の config dir を（アカウント経由で）export する。再開は記録の所在へ寄せる = 同じ値
+        let mut plan = Profile::load("rl2473a").unwrap().resolved_env_plan();
+        plan.exports.push((
+            orchestrator::CLAUDE_CONFIG_DIR_ENV.into(),
+            "/tmp/rl2473a".into(),
+        ));
+        let spawn = spawn_cmd_for(
+            "rl2473a",
+            WorkerAgent::Claude,
+            "worker:tako:cl",
+            &recorded,
+            &plan,
+        );
+        assert_eq!(got.command, format!("{spawn} --resume {ID}"));
+        for needle in [
+            "T2473_ENV=from-profile",
+            "--model claude-opus-5-5",
+            "--effort xhigh",
+            "--permission-mode auto",
+        ] {
+            assert!(got.command.contains(needle), "{needle}: {}", got.command);
+        }
+        assert!(
+            !got.command.contains("--dangerously-skip-permissions"),
+            "{}",
+            got.command
+        );
+        // Remote Control は spawn と同じ判定（opt-in + 適格）で付く
+        let rc = orchestrator::remote_control_decision(
+            &Profile::load("rl2473a").unwrap(),
+            WorkerAgent::Claude,
+            &plan,
+        );
+        assert_eq!(
+            got.command.contains("--remote-control"),
+            rc.enabled(),
+            "{}",
+            got.command
+        );
+    }
+
+    /// codex の worker の再開も spawn と同じ組み立て: `codex resume` の後ろに spawn の引数
+    /// （`--model` / `-c model_reasoning_effort=` / tako の MCP / プロファイルの args）がそのまま並ぶ
+    #[test]
+    fn i2473_codex_の_worker_の再開は_spawn_と同じ引数を_codex_resume_へ渡す() {
+        save_profile(
+            "rl2473b",
+            "bypass_sandbox: false\nworker_agents:\n  codex:\n    model: gpt-5.6-terra\n    \
+             effort: medium\n    args: [\"--search\"]\n",
+        );
+        let recorded = RecordedLaunch {
+            model: Some("gpt-5.6-terra".into()),
+            effort: Some("medium".into()),
+        };
+        let hints = ResumeHints {
+            worker_profile: Some("rl2473b".into()),
+            worker_launch: Some(recorded.clone()),
+        };
+        let got = resume_launch_in(
+            ID,
+            &worker_entry("codex", "cx"),
+            &hints,
+            None,
+            None,
+            "/opt/tako",
+            ShellDialect::Posix,
+            false,
+        )
+        .unwrap();
+        assert_eq!(got.recipe, ResumeRecipe::WorkerProfile);
+        let spawn = spawn_cmd_for(
+            "rl2473b",
+            WorkerAgent::Codex,
+            "worker:tako:cx",
+            &recorded,
+            &Profile::load("rl2473b").unwrap().resolved_env_plan(),
+        );
+        let (head, tail) = spawn
+            .split_once(" codex")
+            .expect("spawn は codex を起動する");
+        assert_eq!(got.command, format!("{head} codex resume{tail} {ID}"));
+        for needle in [
+            "codex resume --model gpt-5.6-terra -c model_reasoning_effort=medium",
+            "mcp_servers.tako.command=",
+            " --search ",
+        ] {
+            assert!(got.command.contains(needle), "{needle}: {}", got.command);
+        }
+        assert!(
+            !got.command
+                .contains("--dangerously-bypass-approvals-and-sandbox"),
+            "{}",
+            got.command
+        );
+    }
+
+    /// レジストリに記録があれば、`None` の欄も spawn の決めた値（`--model` を付けずに CLI の既定へ委ねた）。
+    /// カタログの model（`claude agents` の実モデル）を混ぜない。記録が無いときだけカタログへ落ちる
+    #[test]
+    fn i2473_記録の_none_は_spawn_の値でカタログの実モデルを混ぜない() {
+        save_profile("rl2473c", "bypass_sandbox: false\n");
+        let loc = location("/tmp/rl2473c", false);
+        let run = |worker_launch: Option<RecordedLaunch>| {
+            resume_launch_in(
+                ID,
+                &worker_entry("claude", "cl"),
+                &ResumeHints {
+                    worker_profile: Some("rl2473c".into()),
+                    worker_launch,
+                },
+                Some(&loc),
+                None,
+                "/opt/tako",
+                ShellDialect::Posix,
+                false,
+            )
+            .unwrap()
+            .command
+        };
+        let recorded = run(Some(RecordedLaunch {
+            model: None,
+            effort: Some("max".into()),
+        }));
+        assert!(!recorded.contains("--model"), "{recorded}");
+        assert!(recorded.contains("--effort max"), "{recorded}");
+        // 記録が無い（レジストリが読めない・掃除された）ときはカタログのメタ
+        let fallback = run(None);
+        assert!(fallback.contains("--model claude-opus-5 "), "{fallback}");
+    }
+
+    /// 許可スキップは spawn と同じ判断に従う（プロファイルの opt-in が無ければ付かない =
+    /// 本番の worker の形。opt-in していれば spawn も再開も同じく付く = 片方だけ外れない）
+    #[test]
+    fn i2473_許可スキップは_spawn_と同じ判断で_既定では付かない() {
+        let loc = location("/tmp/rl2473d", false);
+        for (name, yaml, claude_skip, codex_bypass) in [
+            (
+                "rl2473d-off",
+                "bypass_sandbox: false\nworker_agents:\n  claude:\n    args: [\"--permission-mode\", \"auto\"]\n",
+                false,
+                false,
+            ),
+            (
+                "rl2473d-on",
+                "bypass_sandbox: true\nworker_agents:\n  claude:\n    skip_permissions: true\n",
+                true,
+                true,
+            ),
+        ] {
+            save_profile(name, yaml);
+            let hints = ResumeHints {
+                worker_profile: Some(name.into()),
+                worker_launch: Some(RecordedLaunch::default()),
+            };
+            let claude = resume_launch_in(
+                ID,
+                &worker_entry("claude", "cl"),
+                &hints,
+                Some(&loc),
+                None,
+                "/opt/tako",
+                ShellDialect::Posix,
+                false,
+            )
+            .unwrap()
+            .command;
+            let codex = resume_launch_in(
+                ID,
+                &worker_entry("codex", "cx"),
+                &hints,
+                None,
+                None,
+                "/opt/tako",
+                ShellDialect::Posix,
+                false,
+            )
+            .unwrap()
+            .command;
+            assert_eq!(
+                claude.contains("--dangerously-skip-permissions"),
+                claude_skip,
+                "{name}: {claude}"
+            );
+            assert_eq!(
+                codex.contains("--dangerously-bypass-approvals-and-sandbox"),
+                codex_bypass,
+                "{name}: {codex}"
+            );
+        }
+    }
+
+    /// 能力マトリクス `resume_launch_args` が通さない系統（agy）と worker 以外の codex はカタログのメタ
+    #[test]
+    fn i2473_agy_の_worker_と_codex_の_master_はカタログ() {
+        for entry in [
+            worker_entry("agy", "ag"),
+            SessionEntry {
+                kind: "master".into(),
+                agent: Some("codex".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                worker_resume_launch(
+                    ID,
+                    &entry,
+                    &ResumeHints::default(),
+                    None,
+                    None,
+                    "/opt/tako",
+                    ShellDialect::Posix
+                )
+                .is_none(),
+                "{entry:?}"
+            );
+            let got = resume_launch_in(
+                ID,
+                &entry,
+                &ResumeHints::default(),
+                None,
+                None,
+                "/opt/tako",
+                ShellDialect::Posix,
+                false,
+            )
+            .unwrap();
+            assert_eq!(got.recipe, ResumeRecipe::Catalog, "{entry:?}");
+        }
+    }
+
+    /// codex の `CODEX_HOME` は rollout を見つけた置き場へ寄せる（claude の設定 dir と同じ考え方）。
+    /// 計画が決めていなければ触らない（spawn も決めていない）
+    #[test]
+    fn i2473_codex_home_は記録の所在へ寄せる() {
+        let mut plan = EnvPlan {
+            exports: vec![("CODEX_HOME".into(), "/tmp/a".into())],
+            unsets: Vec::new(),
+        };
+        let mut warnings = Vec::new();
+        pin_codex_home(&mut plan, Path::new("/tmp/b"), &mut warnings);
+        assert_eq!(plan.export_value("CODEX_HOME"), Some("/tmp/b"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let mut same = Vec::new();
+        pin_codex_home(&mut plan, Path::new("/tmp/b"), &mut same);
+        assert!(same.is_empty());
+        let mut none = EnvPlan::default();
+        pin_codex_home(&mut none, Path::new("/tmp/b"), &mut same);
+        assert_eq!(none, EnvPlan::default(), "決めていない計画には足さない");
+    }
+
+    /// レジストリの引き方: 会話 ID が先・無ければペインの最後の世代・どちらも無ければ `None`
+    #[test]
+    fn i2473_レジストリの記録は会話_id_が先でペインは最後の世代() {
+        use crate::orchestrator::registry::{WorkerEntry, WorkerRegistry};
+        let mut reg = WorkerRegistry::default();
+        let mut put = |key: &str, pane: u64, sid: Option<&str>, model: &str, at: &str| {
+            reg.workers.insert(
+                key.into(),
+                WorkerEntry {
+                    pane,
+                    session_id: sid.map(str::to_string),
+                    model: Some(model.into()),
+                    spawned_at: at.into(),
+                    ..Default::default()
+                },
+            );
+        };
+        put("a", 7, Some(ID), "by-session", "2026-10-01T00:00:00Z");
+        put("b", 7, None, "pane-old", "2026-10-02T00:00:00Z");
+        put("c", 7, None, "pane-new", "2026-10-03T00:00:00Z");
+        let model = |sid: Option<&str>, pane: Option<u64>| {
+            recorded_worker_launch(&reg, sid, pane).and_then(|r| r.model)
+        };
+        assert_eq!(model(Some(ID), Some(7)).as_deref(), Some("by-session"));
+        assert_eq!(model(None, Some(7)).as_deref(), Some("pane-new"));
+        assert_eq!(model(Some("other"), Some(7)).as_deref(), Some("pane-new"));
+        assert_eq!(model(Some("other"), None), None);
+        assert_eq!(model(None, Some(8)), None);
     }
 }

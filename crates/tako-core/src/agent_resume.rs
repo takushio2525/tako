@@ -210,12 +210,14 @@ pub struct ResumeSpec {
     pub head: &'static [&'static str],
     /// 会話 ID の直前に置くフラグ。`None` = 位置引数として直接渡す
     pub id_flag: Option<&'static str>,
-    /// `--model` / `--effort` のような**起動条件を足してよいか**。
+    /// カタログのメタだけの組み立て（`sessions::resume_command`）が `--model` / `--effort` を
+    /// **claude の書式のまま**足してよいか。
     ///
-    /// codex の `resume` は `--model` を受け取らない（`codex resume --help` 実測。
-    /// モデルは記録済みのセッション側にある）。agy の `--conversation` は
-    /// グローバルフラグと併用できるが、会話に記録された設定を上書きしないよう
-    /// **足さない**側へ倒してある
+    /// codex は false: 効き目の書式が違う（effort は `-c model_reasoning_effort=`）ので claude の
+    /// `--effort` を足すと起動しない。codex-cli 0.154.0 の `codex resume --help` は `-m` / `-c` を
+    /// 受けるので、**worker の再開は spawn と同じ組み立て**（`build_worker_cmd_in` = 系統ごとの書式）で
+    /// 起動条件ごと渡す（#2473）。agy の `--conversation` はグローバルフラグと併用できるが、
+    /// 会話に記録された設定を上書きしないよう**足さない**側へ倒してある
     pub accepts_launch_flags: bool,
 }
 
@@ -402,7 +404,7 @@ mod tests {
         assert_eq!(codex.id_flag, None, "codex は ID を位置引数で取る");
         assert!(
             !codex.accepts_launch_flags,
-            "codex resume は --model を受け取らない"
+            "カタログの組み立ては codex へ claude の --effort 書式を足さない（worker は build_worker_cmd_in = #2473）"
         );
 
         let agy = resume_spec(Agent::Agy).expect("agy");
