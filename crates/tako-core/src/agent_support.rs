@@ -1206,14 +1206,20 @@ pub const MATRIX: &[AgentFeature] = &[
             "A resumed conversation starts with the same arguments as its original launch (model, effort, system prompt, permission mode, Remote Control) (#1967)",
         ),
         claude: S::Supported,
-        codex: pending(notes::NOT_WIRED, 975),
+        codex: degraded(Note::new(
+            "worker の再開（再起動をまたぐ復元を含む）は spawn と同じ引数（モデル・effort・プロファイルの args と env）で立てる。master / solo の再開はカタログのメタだけで組む",
+            "A resumed worker (including the restore across restarts) starts with the same arguments as its spawn (model, effort, profile args and env); a resumed master / solo is still assembled from the catalog metadata only",
+        )),
         agy: pending(notes::NOT_WIRED, 975),
         local: local_pending_first_class(),
-        evidence: AgentEvidence::Source(
+        evidence: AgentEvidence::Measured(
             "tako-control/src/resume_launch.rs が master / solo は build_master_cmd、worker は \
-             build_worker_cmd（元の起動の正本）で組んで `--resume <id>` を足す。claude 以外は \
-             起動の引数を resume へ持ち込めない・持ち込まない（`codex resume` は --model を受けない = \
-             agent_resume::ResumeSpec の accepts_launch_flags）ので従来のカタログのメタだけの組み立てに残る",
+             build_worker_cmd_in（spawn と同じ関数に会話 ID を渡す = WorkerLaunch::resume）で組む。\
+             worker は GUI の再起動をまたぐ復元・tako sessions resume・会話を保った再起動が同じ \
+             worker_resume_launch を通る（#2473）。#2473: 隔離 GUI + 偽 claude / 偽 codex で spawn と復元の \
+             引数・役割・プロファイルの env が一致（scripts/test-resume-launch-args-2473.sh。codex-cli 0.154.0 の \
+             `codex resume --help` は -m / -c と spawn の承認・サンドボックスの引数を受ける）。codex の master / solo の \
+             再開はカタログのメタだけ（claude の --effort 書式を足さない = agent_resume::ResumeSpec の accepts_launch_flags）",
         ),
     },
     AgentFeature {

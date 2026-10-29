@@ -131,18 +131,45 @@ codex の tako の MCP の一時注入（#986）が外れていた（実測: 隔
 
 - **1 実装**: 判断は `worker_mcp::prepare_for_resume`（spawn と同じ `prepare`。持ち込むのはプロジェクトの
   `mcp_servers`、cwd は会話の作業 dir → 無ければプロジェクトの cwd）、断片は `agent::worker_mcp_args`
-  （spawn の `build_worker_cmd_in` も同じ関数）。再開の入口は `sessions::resume_worker_mcp` + `resume_mcp_args`
+  （spawn の `build_worker_cmd_in` も同じ関数）。#2473 からは MCP の断片も含めて起動コマンド全体を
+  下の「起動の引数」の 1 実装が組む。`sessions::resume_worker_mcp` + `resume_mcp_args` は、そこを通らない
+  再開（agy・組めなかったとき・`TAKO_2473_LEGACY=1`）の断片だけを受け持つ
 - **読む設定の置き場は会話の記録がある場所**: claude = 会話の config dir、codex = rollout を探した
-  `CODEX_HOME`（resume が実際に開くのもそこ）。spawn のプロファイルの env は復元の起動に載らないので、
-  プロファイルを読み直さない
+  `CODEX_HOME`（resume が実際に開くのもそこ）。#2473 からは spawn と同じくプロファイルの env 計画を組み、
+  その置き場だけを会話の所在へ寄せる（`pin_config_dir` / `pin_codex_home`。食い違ったら warnings）
 - **位置**: codex は `codex resume -c … <id>`（`resume` の後。0.154.0 の `--help` で `-c` を受ける）、
   claude は `--resume` の前。worker 以外（master / solo / 役割の無いペイン）には足さない
-- **設定ファイル**: GUI の復元はその場で打つので spawn と同じく書いてから使い（書けなければ絞らずに起動して
-  persist.log へ `[restore] pane=N worker の MCP: …`）、カタログの再開は下見では書かない（実行時の materialize）
-- **対象外**: 突然死の復旧案内（worker_status の `resume_command` = #390）。状態照会のたびに組まれるので
+- **設定ファイル**: GUI の復元はその場で打つので spawn と同じく書いてから使い（書けなければカタログのメタの形で
+  起動して persist.log へ `[restore] pane=N worker …`）、カタログの再開は下見では書かない（実行時の materialize）
+- **対象外**: 突然死の復旧案内（worker_status の `resume_command` = #390 / #2470）。状態照会のたびに組まれるので
   user scope の `.claude.json`（数百 KB）を読む判断を載せない
 - A/B は `TAKO_2447_LEGACY=1`（復元とカタログの再開に断片を載せない = #2447 前）。実経路の測り方は
   `scripts/test-resume-worker-mcp-2447.sh`（隔離 GUI + 実物の codex + 偽 claude）
+
+#### 再開（resume）の worker の起動の引数（Issue #2473）
+
+worker の再開は、**再起動をまたぐ GUI の復元**（器が死んで `claude … --resume <id>` / `codex resume … <id>` で
+起こし直す）・`tako sessions resume`・会話を保った再起動のどれでも、spawn と**同じ関数**で起動の引数を組む:
+`resume_launch::worker_resume_launch` → `build_worker_cmd_in`（spawn と同じ関数に `WorkerLaunch::resume` = 会話 ID を
+渡し、書式は中で `agent_resume::resume_spec` から引く）。#2473 の前は GUI の復元だけがカタログのメタで組まれ、
+再起動のたびに `--permission-mode auto`（プロファイルの `worker_agents.<agent>.args`）・`--remote-control`・
+プロファイルの env・codex の `--model` / `-c model_reasoning_effort=` / args が落ち、claude の `--model` は
+`claude agents` が報告した実モデルへ化けていた（隔離 GUI + 偽 claude / 偽 codex の実測）。
+
+- **材料は spawn と同じ**: 起動した master のプロファイル（ペインの `spawned_by` を辿った master の role。
+  GUI の復元は layout が保つ role / spawned_by から `resume_launch::restore_hints` で引く）・env 計画
+  （プロファイルの env + worker のアカウント）・model / effort は **worker レジストリの spawn の記録**
+  （`recorded_worker_launch`。記録があれば `None` も spawn の決めた値 = `--model` を付けずに CLI の既定へ委ねた。
+  カタログの model は実モデルで上書きされるので、記録が無いときだけカタログへ落ちる）
+- **許可の扱いは spawn と同じ判断**: `--permission-mode auto` はプロファイルの args から付き、許可スキップ
+  （`--dangerously-skip-permissions` / `--dangerously-bypass-approvals-and-sandbox`）はプロファイルが opt-in した
+  ときだけ spawn と同じく付く（本番の worker のプロファイルは opt-in していない）
+- **対象の系統**: 能力マトリクス `resume_launch_args`（claude = supported、codex = worker だけ。agy はカタログのメタ）。
+  codex の master / solo の再開は今もカタログのメタだけ
+- **組めないとき**: GUI の復元はカタログのメタの形で会話を戻し、理由を persist.log の `[restore] pane=N worker …` へ
+- A/B は `TAKO_2473_LEGACY=1`（GUI の復元と codex の worker の再開をカタログのメタで組む = #2473 前。claude の
+  `tako sessions resume` / 会話を保った再起動は #1967 のまま）。番犬は `issue2473_resume_launch_args_watchdog`、
+  実経路は `scripts/test-resume-launch-args-2473.sh`（隔離 GUI + 偽 claude / 偽 codex。腕 new / plain / legacy）
 
 #### codex の worker（Issue #2418）
 
@@ -176,7 +203,8 @@ tako の MCP だけを持って起動する。違うのは読む場所と渡し�
   `tako orchestrator projects mcp <key>` の応答は codex の設定がある機でだけ `codex_plan` を持ち、CLI は
   「codex の worker で止める」の行を出す
 - **再起動をまたぐ復元**: `codex resume <id>` にも同じ断片が載る（#2447。上の「再開（resume）の worker」）。
-  model / effort / 承認の引数は今も持ち込まない（能力マトリクス `resume_launch_args`）
+  #2473 からは model / effort / 承認の引数 / プロファイルの args と env も spawn と同じ関数で `codex resume` の後ろへ
+  並ぶ（上の「再開（resume）の worker の起動の引数」。能力マトリクス `resume_launch_args` の codex = worker だけ）
 - **対象外**: 移行（#916）の実績は claude の会話だけを数える（codex の rollout は読まない）
 - A/B は `TAKO_2418_LEGACY=1`（codex だけ #2418 前 = user 設定を全部持ち込む）
 

@@ -986,12 +986,14 @@ pub fn show_payload(id_prefix: &str) -> Result<Value, String> {
     }))
 }
 
-/// resume 用の起動コマンドを組み立てる。
+/// resume 用の起動コマンドを**カタログのメタだけで**組み立てる。
 ///
 /// **系統ごとの書式は `tako_core::agent_resume::resume_spec` が正本**（#1238）。
-/// claude だけが `--model` / `--effort` を載せられる（`codex resume` は受け取らず、
-/// agy は会話に記録された設定を上書きしないため足さない）。
+/// claude だけが `--model` / `--effort` を載せられる（codex は書式が違うので claude の `--effort` を
+/// 足さず、agy は会話に記録された設定を上書きしないため足さない）。
 /// 会話が既定以外の config ディレクトリにあれば `CLAUDE_CONFIG_DIR` を前置する（Issue #652）。
+/// **worker は使わない**: spawn と同じ組み立ては `resume_launch::worker_resume_launch`（#2473）。
+/// ここへ来る worker は対象外の系統（agy）・組めなかったとき・`TAKO_2473_LEGACY=1` だけ
 ///
 /// `mcp_args` は worker の MCP の断片（[`resume_worker_mcp`] + [`resume_mcp_args`] = spawn と
 /// 同じ組み立て。#2447）。worker 以外は空
@@ -1244,8 +1246,14 @@ pub struct RestoreInput<'a> {
     pub platform: Platform,
     /// 復元する会話が worker のとき、起動コマンドへ足す MCP の断片（#2447）。
     /// 決めるのは実環境版の [`restore_plan`]（spawn と同じ判断 = [`resume_worker_mcp`]）で、
-    /// ここは差し込むだけ。`None` は何も足さない
+    /// ここは差し込むだけ。`None` は何も足さない。**`worker_command` が決まったときは使わない**
+    /// （そちらが同じ断片を spawn と同じ組み立てで持つ）
     pub worker_mcp_args: Option<&'a str>,
+    /// 復元する会話が worker のとき、**spawn と同じ組み立て**で組んだ起動コマンド全体（#2473）。
+    /// 決めるのは実環境版の [`restore_plan`]（`resume_launch::worker_resume_launch` =
+    /// `tako sessions resume` / 会話を保った再起動と同じ 1 実装）。`None` = 組めない・対象外の系統（agy）・
+    /// `TAKO_2473_LEGACY=1` → カタログのメタで組む従来の形（+ `worker_mcp_args`）へ落ちる
+    pub worker_command: Option<&'a str>,
 }
 
 /// 復元時の 1 ペインの判断（材料を引数で受け取る純粋版）。
@@ -1279,6 +1287,15 @@ pub fn restore_plan_in(input: RestoreInput<'_>) -> RestorePlan {
     // エージェントは master / worker として認識されない**（オーケストレーターからも
     // MCP からも見えない）ので、ここは最小形へ落とさずに済ませたい
     if let Some(entry) = launch_record(&input, id, resume.agent) {
+        // worker は spawn と同じ組み立て（#2473）。許可モード・Remote Control・プロファイルの args / env・
+        // 記録した model / effort・MCP の断片まで spawn の関数が組んだものをそのまま打つ
+        if let ("worker", Some(command)) = (entry.kind.as_str(), input.worker_command) {
+            return RestorePlan::Resume {
+                agent: resume.agent,
+                command: command.to_string(),
+                with_role: true,
+            };
+        }
         // MCP の断片は worker だけ（master / solo は spawn でも絞らない = #2412 の対象外）
         let mcp_args = match entry.kind.as_str() {
             "worker" => input.worker_mcp_args.unwrap_or(""),
@@ -1354,13 +1371,15 @@ fn launch_record(input: &RestoreInput<'_>, id: &str, agent: Agent) -> Option<Ses
 }
 
 /// [`restore_plan_in`] の実環境版（会話の所在の走査とカタログの読み込みを行う）。
-/// カタログは復元ループの外で 1 回だけ読んで渡す
+/// カタログは復元ループの外で 1 回だけ読んで渡す。`hints` は worker を spawn と同じ組み立てで
+/// 組むための手掛かり（起動した master のプロファイル・レジストリの記録 = `resume_launch::restore_hints`。#2473）
 pub fn restore_plan(
     backend_alive: bool,
     resume: Option<PaneResume<'_>>,
     catalog: Option<&SessionCatalog>,
     backend_session: Option<&str>,
     pane: Option<u64>,
+    hints: &crate::resume_launch::ResumeHints,
 ) -> RestorePlan {
     // 器が生きているなら会話ファイルの走査（read_dir）自体が要らない
     if backend_alive {
@@ -1386,12 +1405,84 @@ pub fn restore_plan(
         pane,
         platform: Platform::current(),
         worker_mcp_args: None,
+        worker_command: None,
     };
-    let mcp_args = restore_worker_mcp_args(&input);
+    // worker は spawn と同じ組み立て（#2473）。組めなかったときだけ従来の形 + MCP の断片（#2447）
+    let worker_command = restore_worker_command(&input, hints);
+    let mcp_args = match worker_command {
+        Some(_) => None,
+        None => restore_worker_mcp_args(&input),
+    };
     restore_plan_in(RestoreInput {
         worker_mcp_args: mcp_args.as_deref(),
+        worker_command: worker_command.as_deref(),
         ..input
     })
+}
+
+/// 復元する会話が worker なら、**spawn と同じ組み立て**で起動コマンドを組む（#2473）。
+///
+/// 組み立ては `tako sessions resume` / 会話を保った再起動と同じ `resume_launch::worker_resume_launch`
+/// （= spawn の `build_worker_cmd_in` に会話 ID を渡す）。#2473 の前は GUI の復元だけがカタログの
+/// メタで組まれ、`--permission-mode auto`（プロファイルの args）・`--remote-control`・プロファイルの env が
+/// 落ちていた。復元はその場で打つので、MCP の設定ファイルも spawn と同じく書いてから使う。
+/// 組めない・書けないときは理由を persist.log へ出して `None`（従来の形で会話は戻す = 起動は止めない）
+fn restore_worker_command(
+    input: &RestoreInput<'_>,
+    hints: &crate::resume_launch::ResumeHints,
+) -> Option<String> {
+    if crate::resume_launch::legacy_2473() {
+        return None;
+    }
+    let resume = input.resume?;
+    let id = resume
+        .id
+        .filter(|id| crate::transcript::is_valid_session_id(id))?;
+    // 会話が無い・この環境で復元できないなら起こさない（restore_plan_in と同じ前提）
+    input.conversation?;
+    if !tako_core::agent_resume::restore_support(resume.agent, input.platform).is_wired() {
+        return None;
+    }
+    let entry = launch_record(input, id, resume.agent)?;
+    let pane = input
+        .pane
+        .map_or_else(|| "-".to_string(), |p| p.to_string());
+    let location = match resume.agent {
+        Agent::Claude => crate::transcript::locate_transcript(id),
+        _ => None,
+    };
+    // codex は会話が見つかった（input.conversation）置き場 = tako が rollout を探した CODEX_HOME
+    let codex_home = match resume.agent {
+        Agent::Codex => crate::codex_session::codex_home(),
+        _ => None,
+    };
+    let launch = match crate::resume_launch::worker_resume_launch(
+        id,
+        &entry,
+        hints,
+        location.as_ref(),
+        codex_home.as_deref(),
+        &crate::dispatch::resolve_tako_binary(),
+        crate::launch_cmd::launch_dialect(),
+    )? {
+        Ok(launch) => launch,
+        Err(e) => {
+            crate::diag::persist_log(&format!(
+                "[restore] pane={pane} worker を spawn と同じ組み立てで組めないのでカタログのメタで戻す: {e}"
+            ));
+            return None;
+        }
+    };
+    if let Err(e) = launch.materialize() {
+        crate::diag::persist_log(&format!(
+            "[restore] pane={pane} worker の起動に要るファイルを書けないのでカタログのメタで戻す: {e}"
+        ));
+        return None;
+    }
+    for w in &launch.warnings {
+        crate::diag::persist_log(&format!("[restore] pane={pane} worker: {w}"));
+    }
+    Some(launch.command)
 }
 
 /// 復元する会話が worker なら、spawn と同じ MCP の断片を決める（#2447。設定ファイルもここで書く）。
@@ -2022,6 +2113,7 @@ mod tests {
             pane: None,
             platform: Platform::MacOs,
             worker_mcp_args: None,
+            worker_command: None,
         }
     }
 
@@ -2320,6 +2412,84 @@ mod tests {
                 worker_mcp_args: Some(settings),
                 ..input(Some(cid), Some(env))
             }),
+            RestorePlan::Resume {
+                agent: Agent::Claude,
+                command: format!("{env}claude --resume {cid}"),
+                with_role: false,
+            }
+        );
+    }
+
+    /// #2473: 復元する会話が worker なら、spawn と同じ組み立てで決めたコマンド（`worker_command`）を
+    /// そのまま打つ（カタログのメタ・MCP の断片の差し込みは使わない）。worker 以外・記録の無い会話は
+    /// 従来どおり。決まらなかった（agy・組めない・`TAKO_2473_LEGACY=1`）ときもカタログのメタへ落ちる
+    #[test]
+    fn restore_planはworkerをspawnと同じ組み立てのコマンドで戻す() {
+        let cid = "e16cde37-c0e0-4126-9ef4-9c6b0bfeccc4";
+        let env = "export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; ";
+        let built = format!(
+            "export CLAUDE_CONFIG_DIR=/Users/me/.claude-univ; TAKO_ORCHESTRATOR_ROLE='worker:tako' \
+             claude --model claude-opus-5-5 --effort xhigh --permission-mode auto --resume {cid}"
+        );
+        let mut worker = SessionCatalog::default();
+        worker.entries.insert(
+            cid.into(),
+            SessionEntry {
+                kind: "worker".into(),
+                project: Some("tako".into()),
+                agent: Some("claude".into()),
+                model: Some("claude-opus-5".into()),
+                ..Default::default()
+            },
+        );
+        let plan = |catalog: &SessionCatalog, command: Option<&str>| {
+            restore_plan_in(RestoreInput {
+                catalog: Some(catalog),
+                worker_mcp_args: Some(" --settings /x.json"),
+                worker_command: command,
+                ..input(Some(cid), Some(env))
+            })
+        };
+        assert_eq!(
+            plan(&worker, Some(&built)),
+            RestorePlan::Resume {
+                agent: Agent::Claude,
+                command: built.clone(),
+                with_role: true,
+            }
+        );
+        // 決まらなかったときは #2473 前の形（カタログのメタ + MCP の断片）
+        assert_eq!(
+            plan(&worker, None),
+            RestorePlan::Resume {
+                agent: Agent::Claude,
+                command: format!(
+                    "{env}TAKO_ORCHESTRATOR_ROLE='worker:tako' claude --model claude-opus-5 --settings /x.json --resume {cid}"
+                ),
+                with_role: true,
+            }
+        );
+        // master は worker の組み立てを使わない（#2473 の対象外 = 従来どおり）
+        let mut master = SessionCatalog::default();
+        master.entries.insert(
+            cid.into(),
+            SessionEntry {
+                kind: "master".into(),
+                agent: Some("claude".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            plan(&master, Some(&built)),
+            RestorePlan::Resume {
+                agent: Agent::Claude,
+                command: format!("{env}TAKO_ORCHESTRATOR_ROLE=master claude --resume {cid}"),
+                with_role: true,
+            }
+        );
+        // 記録の無い会話（最小形）にも使わない
+        assert_eq!(
+            plan(&SessionCatalog::default(), Some(&built)),
             RestorePlan::Resume {
                 agent: Agent::Claude,
                 command: format!("{env}claude --resume {cid}"),

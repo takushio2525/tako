@@ -12847,7 +12847,6 @@ fn dispatch_sessions_resume(
     // `resume_launch` の 1 実装）。worker は spawn と同じく「起動する側の master」の
     // プロファイルで組む（分割元から spawned_by を辿る）。ペインを分割する**前**に組み、
     // 組めなければ何も作らずに理由を返す（codex / agy の非対応もここで明示される）
-    let (worker_model, worker_effort) = registry_launch_of_session(&session_id);
     let hints = crate::resume_launch::ResumeHints {
         worker_profile: find_master_suffix_from(host.workspace(), target).map(|s| {
             if s.is_empty() {
@@ -12856,8 +12855,7 @@ fn dispatch_sessions_resume(
                 s
             }
         }),
-        worker_model,
-        worker_effort,
+        worker_launch: registry_launch_of_session(&session_id),
     };
     let launch = crate::resume_launch::resume_launch(&session_id, &entry, &hints)
         .map_err(DispatchError::Operation)?;
@@ -12968,18 +12966,12 @@ fn dispatch_sessions_resume(
     }))
 }
 
-/// worker レジストリに記録した、この会話の起動時の model / effort（#1967）
-fn registry_launch_of_session(session_id: &str) -> (Option<String>, Option<String>) {
+/// worker レジストリに記録した、この会話の起動時の model / effort（#1967。引き方は GUI の復元と
+/// 同じ `resume_launch::recorded_worker_launch` = #2473）
+fn registry_launch_of_session(session_id: &str) -> Option<crate::resume_launch::RecordedLaunch> {
     crate::orchestrator::registry::WorkerRegistry::load()
         .ok()
-        .and_then(|reg| {
-            reg.workers
-                .values()
-                .filter(|e| e.session_id.as_deref() == Some(session_id))
-                .max_by_key(|e| e.spawned_at.clone())
-                .map(|e| (e.model.clone(), e.effort.clone()))
-        })
-        .unwrap_or((None, None))
+        .and_then(|reg| crate::resume_launch::recorded_worker_launch(&reg, Some(session_id), None))
 }
 
 // --- オーケストレーター dispatch ---
@@ -16370,6 +16362,7 @@ fn dispatch_git_resolve_agent(
         mcp_settings: worker_mcp.settings_file.as_deref(),
         mcp_codex_off: &worker_mcp.codex_off,
         env: &profile_env,
+        resume: None,
     });
 
     // 事前信頼（未信頼フォルダの確認ダイアログにプロンプトが食われるのを防ぐ。Issue #32）。
@@ -16952,6 +16945,8 @@ fn dispatch_orchestrator_spawn(
         mcp_settings: worker_mcp.settings_file.as_deref(),
         mcp_codex_off: &worker_mcp.codex_off,
         env: &profile_env,
+        // 新しい会話（再開は resume_launch::worker_resume_launch が同じ関数へ会話 ID を渡す = #2473）
+        resume: None,
     });
 
     // 事前信頼: 未信頼フォルダでエージェント CLI を起動すると信頼ダイアログが出て、
@@ -24958,7 +24953,11 @@ fn resolve_caller_profile_with_role(
 
 /// caller ペインから master の role suffix を検索する。
 /// caller 自身が master なら直接返し、そうでなければ spawned_by を辿る。
-fn find_master_suffix_from(workspace: &tako_core::Workspace, start: PaneId) -> Option<String> {
+/// GUI の復元も同じ関数で worker を起動した master のプロファイルを引く（#2473 = `resume_launch::restore_hints`）
+pub(crate) fn find_master_suffix_from(
+    workspace: &tako_core::Workspace,
+    start: PaneId,
+) -> Option<String> {
     if let Some(suffix) = pane_master_suffix(workspace, start) {
         return Some(suffix);
     }
@@ -25831,7 +25830,6 @@ fn build_session_restart_plan(host: &dyn ControlHost, pane_id: PaneId) -> Sessio
             entry.label = parsed.label.clone().or(entry.label);
         }
     }
-    let (worker_model, worker_effort) = registry_launch_of(pane_id);
     let hints = crate::resume_launch::ResumeHints {
         // worker を起動した master のプロファイル（spawn と同じく spawned_by を辿る）
         worker_profile: find_master_suffix_from(host.workspace(), pane_id).map(|s| {
@@ -25841,8 +25839,7 @@ fn build_session_restart_plan(host: &dyn ControlHost, pane_id: PaneId) -> Sessio
                 s
             }
         }),
-        worker_model,
-        worker_effort,
+        worker_launch: registry_launch_of(pane_id),
     };
     let (launch, resume_error) = match session_id.as_deref() {
         Some(id) => match crate::resume_launch::resume_launch_in(
@@ -25850,6 +25847,7 @@ fn build_session_restart_plan(host: &dyn ControlHost, pane_id: PaneId) -> Sessio
             &entry,
             &hints,
             location.as_ref(),
+            crate::resume_launch::codex_rollout_home(id, &entry).as_deref(),
             &tako_binary(),
             crate::launch_cmd::launch_dialect(),
             tako_core::session_restart::legacy_1967(),
@@ -25914,18 +25912,14 @@ fn build_session_restart_plan(host: &dyn ControlHost, pane_id: PaneId) -> Sessio
 }
 
 /// worker レジストリに記録した、このペインの起動時の model / effort（#1967）。
-/// 同一ペイン番号には世代が堆積するので最後に spawn したものを採る（#466 と同型）
-fn registry_launch_of(pane: PaneId) -> (Option<String>, Option<String>) {
+/// 同一ペイン番号には世代が堆積するので最後に spawn したものを採る（#466 と同型。
+/// 引き方は GUI の復元と同じ `resume_launch::recorded_worker_launch` = #2473）
+fn registry_launch_of(pane: PaneId) -> Option<crate::resume_launch::RecordedLaunch> {
     crate::orchestrator::registry::WorkerRegistry::load()
         .ok()
         .and_then(|reg| {
-            reg.workers
-                .values()
-                .filter(|e| e.pane == pane.as_u64())
-                .max_by_key(|e| e.spawned_at.clone())
-                .map(|e| (e.model.clone(), e.effort.clone()))
+            crate::resume_launch::recorded_worker_launch(&reg, None, Some(pane.as_u64()))
         })
-        .unwrap_or((None, None))
 }
 
 /// SessionRestart — `mode` 省略で下見、指定で実行（#1067）

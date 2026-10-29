@@ -198,6 +198,11 @@ pub struct WorkerLaunch<'a> {
     /// `export K=V;` / `unset K;` として注入し、direnv が同変数を設定していても
     /// 明示指定が勝つようにする（Issue #500 / #512）
     pub env: &'a EnvPlan,
+    /// 再開する会話 ID（Issue #2473）。`None` = spawn（新しい会話）。`Some` のときは**同じ組み立て**に
+    /// 系統の再開の書式（`tako_core::agent_resume::resume_spec`）を足す = codex は program の直後に
+    /// `resume`、末尾に `--resume <id>`（claude）/ `<id>`（codex）。ID の形は呼び出し側が
+    /// `transcript::is_valid_session_id` で確かめてから渡す
+    pub resume: Option<&'a str>,
 }
 
 impl Default for WorkerLaunch<'_> {
@@ -215,6 +220,7 @@ impl Default for WorkerLaunch<'_> {
             mcp_settings: None,
             mcp_codex_off: &[],
             env: &EMPTY_ENV_PLAN,
+            resume: None,
         }
     }
 }
@@ -320,6 +326,17 @@ pub fn build_worker_cmd_in(
         &lc::quote(dialect, launch.role),
     ));
     cmd.push_str(launch.agent.as_str());
+    // 再開（#2473）。spawn と**同じ組み立て**のまま、書式の正本（resume_spec）から再開の語だけを足す。
+    // codex の `resume` はサブコマンドなので program の直後（`codex resume [OPTIONS] [SESSION_ID]`）
+    let resume = launch.resume.and_then(|id| {
+        tako_core::agent_resume::resume_spec(launch.agent.into()).map(|spec| (spec, id))
+    });
+    if let Some((spec, _)) = resume {
+        for head in spec.head {
+            cmd.push(' ');
+            cmd.push_str(head);
+        }
+    }
     if let Some(model) = launch.model {
         cmd.push_str(&format!(" --model {}", lc::quote(dialect, model)));
     }
@@ -376,6 +393,15 @@ pub fn build_worker_cmd_in(
     for arg in launch.extra_args {
         cmd.push(' ');
         cmd.push_str(&crate::launch_cmd::quote(dialect, arg));
+    }
+    // 会話 ID は末尾（claude = `--resume <id>`・codex = 位置引数 `<id>`）
+    if let Some((spec, id)) = resume {
+        if let Some(flag) = spec.id_flag {
+            cmd.push(' ');
+            cmd.push_str(flag);
+        }
+        cmd.push(' ');
+        cmd.push_str(id);
     }
     cmd
 }
@@ -850,6 +876,67 @@ mod tests {
             assert!(!cmd.contains("effort"));
             assert!(cmd.starts_with("TAKO_ORCHESTRATOR_ROLE='worker:x' "));
         }
+    }
+
+    /// #2473: 再開（`resume: Some(id)`）は spawn と**同じ組み立て**に、系統の再開の書式
+    /// （`agent_resume::resume_spec`）だけを足す。codex の `resume` は program の直後、
+    /// ID は末尾。許可・Remote Control・追加引数・env・MCP は spawn の出力のまま並ぶ
+    #[test]
+    fn i2473_再開は_spawn_と同じ組み立てに再開の書式だけを足す() {
+        let id = "cb6d0127-b67d-44ac-b897-065b9f0678f0";
+        let env = EnvPlan {
+            exports: vec![("T2473".into(), "v".into())],
+            unsets: vec!["CLAUDE_CONFIG_DIR".into()],
+        };
+        let args = ["--permission-mode".to_string(), "auto".to_string()];
+        for agent in WorkerAgent::ALL {
+            let launch = |resume| WorkerLaunch {
+                agent,
+                role: "worker:p:l",
+                model: Some("m-1"),
+                effort: Some("high"),
+                skip_permissions: false,
+                remote_control: true,
+                extra_args: &args,
+                tako_bin: Some("/opt/tako"),
+                env: &env,
+                resume,
+                ..Default::default()
+            };
+            let spawn = build_worker_cmd_in(&launch(None), POSIX);
+            let resumed = build_worker_cmd_in(&launch(Some(id)), POSIX);
+            let want = match agent {
+                WorkerAgent::Claude => format!("{spawn} --resume {id}"),
+                WorkerAgent::Codex => {
+                    let (head, tail) = spawn.split_once(" codex").unwrap();
+                    format!("{head} codex resume{tail} {id}")
+                }
+                WorkerAgent::Agy => format!("{spawn} --conversation {id}"),
+            };
+            assert_eq!(resumed, want, "{agent:?}");
+            assert!(resumed.contains("--permission-mode auto"), "{resumed}");
+            assert!(!resumed.contains("--dangerously-"), "{resumed}");
+        }
+        // PowerShell の方言でも同じ形（再開の語は引用しない固定の綴り）
+        let ps = crate::launch_cmd::ShellDialect::PowerShell;
+        let codex = |resume| {
+            build_worker_cmd_in(
+                &WorkerLaunch {
+                    agent: WorkerAgent::Codex,
+                    role: "worker:p",
+                    resume,
+                    ..Default::default()
+                },
+                ps,
+            )
+        };
+        assert_eq!(
+            codex(Some(id)),
+            format!(
+                "{} {id}",
+                codex(None).replacen(" codex", " codex resume", 1)
+            )
+        );
     }
 
     #[test]

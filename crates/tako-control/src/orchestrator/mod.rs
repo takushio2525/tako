@@ -6418,6 +6418,7 @@ prompt_blocks:
                 mcp_settings: None,
                 mcp_codex_off: &[],
                 env: &EMPTY_ENV_PLAN,
+                resume: None,
             },
             crate::launch_cmd::ShellDialect::Posix,
         )
