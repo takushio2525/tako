@@ -41,6 +41,8 @@
 use tako_control::DispatchError as E;
 use tako_control::{NoTargetPaneAt, Reason};
 use tako_core::i18n::{self, Lang};
+use tako_core::load_issue::{YamlProblem, YamlReason};
+use tako_core::user_task::TaskRefusal;
 use tako_core::{
     DiskState, LayoutParamError, PaneId, PaneTreeError, SplitAxis, TabId, WindowId, WorkspaceError,
 };
@@ -662,9 +664,35 @@ fn reason_index(r: &Reason) -> usize {
         Reason::PositionColumn(_) => 152,
         Reason::RangeShape(_) => 153,
         Reason::ManyPartlyFailed { .. } => 154,
+        // #2365 の続き: CLI / MCP のブリッジが GUI へ繋ぐ口（`tako-cli` の ipc.rs）と起動失敗の包み
+        Reason::OutsideTako => 155,
+        Reason::CannotConnect { .. } => 156,
+        Reason::ConnectionCloneFailed(_) => 157,
+        Reason::ReplyThreadEnded => 158,
+        Reason::RequestEncodeFailed(_) => 159,
+        Reason::SendFailed(_) => 160,
+        Reason::ReceiveFailed(_) => 161,
+        Reason::NoReply => 162,
+        Reason::ReplyUnreadable(_) => 163,
+        Reason::ReplyTimeout(_) => 164,
+        Reason::LaunchPaneUnavailable { .. } => 165,
+        // #2365 の続き: dispatch が呼ぶ置き場（acceptance_gates / task_checkpoints / user_tasks）
+        Reason::StoreReadFailed { .. } => 166,
+        Reason::StoreParseFailed { .. } => 167,
+        Reason::StoreDirFailed { .. } => 168,
+        Reason::YamlEncodeFailed(_) => 169,
+        Reason::JsonSerializeFailed(_) => 170,
+        Reason::JsonArgUnreadable(..) => 171,
+        Reason::ItemNeedsId(_) => 172,
+        Reason::CriterionKindUnreadable(..) => 173,
+        Reason::UnknownBare { .. } => 174,
+        Reason::UnknownPlain { .. } => 175,
+        Reason::CriteriaEmpty => 176,
+        Reason::GateNotFound(_) => 177,
+        Reason::TaskGoneAfterRespond => 178,
     }
 }
-const REASON_VARIANTS: usize = 155;
+const REASON_VARIANTS: usize = 179;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -912,6 +940,58 @@ fn reason_samples() -> Vec<Reason> {
             total: 4,
             failed: 1,
         },
+        // #2365 の続き: GUI へ繋ぐ口と起動失敗の包み
+        Reason::OutsideTako,
+        Reason::CannotConnect {
+            socket: "/tmp/tk/none.sock".into(),
+            error: "No such file or directory (os error 2)".into(),
+        },
+        Reason::ConnectionCloneFailed("Bad file descriptor (os error 9)".into()),
+        Reason::ReplyThreadEnded,
+        Reason::RequestEncodeFailed("key must be a string".into()),
+        Reason::SendFailed("Broken pipe (os error 32)".into()),
+        Reason::ReceiveFailed("Connection reset by peer (os error 54)".into()),
+        Reason::NoReply,
+        Reason::ReplyUnreadable("expected value at line 1 column 1".into()),
+        Reason::ReplyTimeout(30),
+        Reason::LaunchPaneUnavailable {
+            cause: "cannot connect".into(),
+            cmd_hint: "tako master -fable".into(),
+            stale_pane: Some(305),
+        },
+        // #2365 の続き: 置き場
+        Reason::StoreReadFailed {
+            file: "user-tasks.yaml",
+            error: "Permission denied (os error 13)".into(),
+        },
+        Reason::StoreParseFailed {
+            file: "task_checkpoints.yaml",
+            reason: YamlReason::Located {
+                kind: YamlProblem::Syntax,
+                at: Some((3, 5)),
+            },
+        },
+        Reason::StoreDirFailed {
+            file: "user-tasks.yaml",
+            error: "Permission denied (os error 13)".into(),
+        },
+        Reason::YamlEncodeFailed("boom".into()),
+        Reason::JsonSerializeFailed("boom".into()),
+        Reason::JsonArgUnreadable("criteria", "expected value at line 1 column 1".into()),
+        Reason::ItemNeedsId("criterion"),
+        Reason::CriterionKindUnreadable("tests".into(), "missing field `type`".into()),
+        Reason::UnknownBare {
+            key: "phase",
+            got: "flying".into(),
+        },
+        Reason::UnknownPlain {
+            key: "kind",
+            got: "chore".into(),
+            allowed: "approval / review / post / other".into(),
+        },
+        Reason::CriteriaEmpty,
+        Reason::GateNotFound("task-9".into()),
+        Reason::TaskGoneAfterRespond,
     ]
 }
 
@@ -1082,6 +1162,38 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "位置は 行:桁 で指定する（桁が数値でない: 1:y）",
     "範囲は 行:桁-行:桁 で指定する（`-` が無い: 1:0）",
     "4 件中 1 件をできなかった",
+    // #2365 の続き: `tako-cli` の ipc.rs（接続まわり）・`protocol::reply_timeout_message`・
+    // main.rs の `launch_failure_message`
+    "tako アプリへの接続情報が無い（TAKO_SOCKET / TAKO_TOKEN 未設定・接続情報ファイルも無し）。\
+     tako アプリを起動するか、tako 内のターミナルで実行してください",
+    "tako アプリへ接続できない（/tmp/tk/none.sock: No such file or directory (os error 2)）",
+    "接続の複製に失敗: Bad file descriptor (os error 9)",
+    "応答を待つスレッドが途中で終わった",
+    "送信の構築に失敗: key must be a string",
+    "送信に失敗: Broken pipe (os error 32)",
+    "応答の受信に失敗: Connection reset by peer (os error 54)",
+    "tako アプリから応答が返らなかった",
+    "応答を解釈できない: expected value at line 1 column 1",
+    "tako アプリが 30 秒応答しない（接続は受けたが返事が無い = GUI が固まっている可能性。\
+     要求は届いているので、GUI が戻ると後から処理されることがある。\
+     待つ上限は env TAKO_IPC_TIMEOUT_SECS（秒・0 で上限なし））",
+    "起動先ペインを確保できない: cannot connect\n\
+     復旧: tako アプリを起動し、その中のターミナルで `tako master -fable` を実行してください\n      \
+     このシェルの TAKO_PANE_ID=305 は古い可能性があります: `unset TAKO_PANE_ID` してから再実行してください",
+    // #2365 の続き: acceptance_gates.rs / task_checkpoints.rs / user_tasks.rs
+    "user-tasks.yaml の読み取りに失敗: Permission denied (os error 13)",
+    "task_checkpoints.yaml のパースに失敗: YAML の構文が壊れている（3 行 5 列）",
+    "user-tasks.yaml の置き場を作れない: Permission denied (os error 13)",
+    "YAML のシリアライズに失敗: boom",
+    "JSON シリアライズに失敗: boom",
+    "criteria の JSON パースに失敗: expected value at line 1 column 1",
+    "criterion に id が必要",
+    "criterion kind のパースに失敗 (id=tests): missing field `type`",
+    "不明な phase: flying",
+    "不明な kind: chore（approval / review / post / other のいずれか）",
+    "criteria を 1 つ以上指定する",
+    "ゲートが見つからない: task-9",
+    "直前に更新したタスクが無い",
 ];
 
 /// #2365 より前の `preview_recovery_hint` の 3 つの文（外で消された / 外で変わった / 未保存だけ）
@@ -1107,6 +1219,7 @@ fn reason_is_not_found(r: &Reason) -> bool {
             | Reason::ChoiceNotFound { .. }
             | Reason::PasteTargetNotFound(_)
             | Reason::CheckpointNotFound(_)
+            | Reason::GateNotFound(_)
     )
 }
 
@@ -4965,4 +5078,384 @@ fn next() {
     let whole = front_scope_lines(src, None).expect("全体");
     let found: Vec<usize> = front_japanese(&whole).into_iter().map(|(l, _)| l).collect();
     assert_eq!(found, vec![4, 11, 17]);
+}
+
+// ---- #2365 の続き: GUI へ繋ぐ口（接続まわり）と置き場の断り（ソースを読む番犬と tako-core の対） ----
+//
+// 接続まわり（`tako-cli` の ipc.rs・起動失敗の包み）と置き場（acceptance_gates / task_checkpoints /
+// user_tasks と tako-core の `TaskStore`）の断りは `Reason` の表（上）と下の tako-core の対で日英を見る。
+// 前段と同じく、表では見えない「日本語の固定文の書き足し」をソースを読んで `file:line` で名指す。
+// 置き場のファイルの中身になる文（受け入れ条件の evidence・配送の理由）と master へ運ぶ返答の本文は
+// 断りではないので走査の範囲に入れない（関数の頭で範囲を取る）
+
+const IPC_SRC: &str = include_str!("../../tako-cli/src/ipc.rs");
+const IPC_PATH: &str = "crates/tako-cli/src/ipc.rs";
+const GATES_SRC: &str = include_str!("../src/acceptance_gates.rs");
+const GATES_PATH: &str = "crates/tako-control/src/acceptance_gates.rs";
+const CHECKPOINTS_SRC: &str = include_str!("../src/task_checkpoints.rs");
+const CHECKPOINTS_PATH: &str = "crates/tako-control/src/task_checkpoints.rs";
+const USER_TASKS_SRC: &str = include_str!("../src/user_tasks.rs");
+const USER_TASKS_PATH: &str = "crates/tako-control/src/user_tasks.rs";
+const CORE_USER_TASK_SRC: &str = include_str!("../../tako-core/src/user_task.rs");
+const CORE_USER_TASK_PATH: &str = "crates/tako-core/src/user_task.rs";
+const LOAD_ISSUE_SRC: &str = include_str!("../../tako-core/src/load_issue.rs");
+const LOAD_ISSUE_PATH: &str = "crates/tako-core/src/load_issue.rs";
+
+/// 接続まわり・置き場の走査の範囲
+enum Span {
+    /// 関数（または impl）の頭から、頭と同じ字下げの `}` まで（[`front_scope_lines`]）
+    Item(&'static str),
+    /// ファイルの本体（単体テストの前まで）
+    Whole,
+    /// ファイルの頭から、印を含む行の手前まで（ipc.rs は入れ子の単体テストを持つ `mod deadline` の前で切る）
+    Until(&'static str),
+}
+
+const CLIENT_STORE_SCOPES: &[(&str, &str, Span)] = &[
+    // 接続まわり: 接続情報の解決・接続・往復（unix / windows の両方）
+    (IPC_PATH, IPC_SRC, Span::Until("    mod deadline {")),
+    (
+        CLI_MAIN_PATH,
+        CLI_MAIN_SRC,
+        Span::Item("fn launch_failure_message("),
+    ),
+    // 受け入れゲート（evidence を組む execute_command / check_pr_merged は置き場の中身なので外す）
+    (
+        GATES_PATH,
+        GATES_SRC,
+        Span::Item("impl AcceptanceGateStore {"),
+    ),
+    (
+        GATES_PATH,
+        GATES_SRC,
+        Span::Item("fn store_path_or_refuse("),
+    ),
+    (GATES_PATH, GATES_SRC, Span::Item("fn gate_not_found(")),
+    (GATES_PATH, GATES_SRC, Span::Item("pub fn parse_criteria(")),
+    (
+        GATES_PATH,
+        GATES_SRC,
+        Span::Item("pub fn set_gate_payload_at("),
+    ),
+    (
+        GATES_PATH,
+        GATES_SRC,
+        Span::Item("pub fn set_gate_payload("),
+    ),
+    (
+        GATES_PATH,
+        GATES_SRC,
+        Span::Item("pub fn show_gate_payload_at("),
+    ),
+    (
+        GATES_PATH,
+        GATES_SRC,
+        Span::Item("pub fn show_gate_payload("),
+    ),
+    (GATES_PATH, GATES_SRC, Span::Item("pub fn parse_results(")),
+    (
+        GATES_PATH,
+        GATES_SRC,
+        Span::Item("pub fn record_results_payload_at("),
+    ),
+    (
+        GATES_PATH,
+        GATES_SRC,
+        Span::Item("pub fn record_results_payload("),
+    ),
+    (
+        GATES_PATH,
+        GATES_SRC,
+        Span::Item("pub fn execute_gate_check("),
+    ),
+    (
+        GATES_PATH,
+        GATES_SRC,
+        Span::Item("pub fn execute_gate_check_at("),
+    ),
+    // チェックポイント（ファイル全体）
+    (CHECKPOINTS_PATH, CHECKPOINTS_SRC, Span::Whole),
+    // ユーザータスク（配送の理由 `UNRESOLVED_ORIGIN_REASON` と返答の本文は外す）
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        Span::Item("pub fn load_from("),
+    ),
+    (USER_TASKS_PATH, USER_TASKS_SRC, Span::Item("pub fn load(")),
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        Span::Item("fn store_path_or_refuse("),
+    ),
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        Span::Item("pub fn mutate_at<"),
+    ),
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        Span::Item("pub fn mutate<"),
+    ),
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        Span::Item("pub fn parse_kind("),
+    ),
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        Span::Item("pub fn parse_status("),
+    ),
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        Span::Item("pub fn parse_decision("),
+    ),
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        Span::Item("pub fn parse_via("),
+    ),
+    (USER_TASKS_PATH, USER_TASKS_SRC, Span::Item("fn unknown<")),
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        Span::Item("pub fn show_at("),
+    ),
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        Span::Item("pub fn respond_at("),
+    ),
+    // tako-core の置き場の操作（`expect` の内部の印は見ない）
+    (
+        CORE_USER_TASK_PATH,
+        CORE_USER_TASK_SRC,
+        Span::Item("impl TaskStore {"),
+    ),
+    (
+        CORE_USER_TASK_PATH,
+        CORE_USER_TASK_SRC,
+        Span::Item("fn not_found("),
+    ),
+];
+
+/// 走査の範囲の行。範囲が見つからなければ `None`（改名で番犬が空振りするのを止める）
+fn client_store_lines<'a>(src: &'a str, span: &Span) -> Option<Vec<(usize, &'a str)>> {
+    match span {
+        Span::Item(head) => front_scope_lines(src, Some(head)),
+        Span::Whole => front_scope_lines(src, None),
+        Span::Until(mark) => {
+            let end = src.lines().position(|l| l.contains(mark))?;
+            Some(
+                src.lines()
+                    .take(end)
+                    .enumerate()
+                    .map(|(i, l)| (i + 1, l))
+                    .collect(),
+            )
+        }
+    }
+}
+
+fn span_name(span: &Span) -> String {
+    match span {
+        Span::Item(head) => format!("`{head}`"),
+        Span::Whole => "<ファイル全体>".into(),
+        Span::Until(mark) => format!("<頭から `{}` の手前まで>", mark.trim()),
+    }
+}
+
+#[test]
+fn 接続まわりと置き場の断りに日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, src, span) in CLIENT_STORE_SCOPES {
+        let Some(lines) = client_store_lines(src, span) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 {} が見つからない（改名で番犬が空振りする。\
+                 CLIENT_STORE_SCOPES を直す）",
+                span_name(span)
+            ));
+            continue;
+        };
+        for (line, text) in front_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 接続まわり・置き場の断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （tako_control::Reason へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 印の手前で切る範囲は印の行と後ろを見ず、印が無ければ空振りとして `None`
+#[test]
+fn 接続まわりの範囲は印の手前で切る() {
+    let src = "fn a() -> String {\n    \"接続できない\".into()\n}\n    mod deadline {\n        let _ = \"テストの文\";\n";
+    let lines = client_store_lines(src, &Span::Until("    mod deadline {")).expect("印がある");
+    let found: Vec<usize> = front_japanese(&lines).into_iter().map(|(l, _)| l).collect();
+    assert_eq!(found, vec![2], "印より前の植えた 1 か所だけを名指す");
+    assert!(client_store_lines(src, &Span::Until("mod absent {")).is_none());
+}
+
+/// tako-core の置き場の断り（`TaskRefusal`）の通し番号（網羅 match）
+fn task_refusal_index(r: &TaskRefusal) -> usize {
+    match r {
+        TaskRefusal::EmptyTitle => 0,
+        TaskRefusal::NothingToUpdate => 1,
+        TaskRefusal::ClearTitle => 2,
+        TaskRefusal::NotFound(_) => 3,
+    }
+}
+const TASK_REFUSALS: usize = 4;
+
+/// 見本と #2365 より前の固定文（`TaskStore` の操作が書いていた文）
+fn task_refusal_table() -> Vec<(TaskRefusal, &'static str)> {
+    vec![
+        (
+            TaskRefusal::EmptyTitle,
+            "タイトルが空（一覧で選べないタスクは作れない）",
+        ),
+        (
+            TaskRefusal::NothingToUpdate,
+            "更新する項目が 1 つも指定されていない",
+        ),
+        (TaskRefusal::ClearTitle, "タイトルを空にはできない"),
+        (
+            TaskRefusal::NotFound("u-9".into()),
+            "タスクが見つからない: u-9",
+        ),
+    ]
+}
+
+/// YAML の誤りの種類の通し番号（網羅 match）
+fn yaml_problem_index(p: &YamlProblem) -> usize {
+    match p {
+        YamlProblem::Syntax => 0,
+        YamlProblem::Empty => 1,
+        YamlProblem::Shape => 2,
+    }
+}
+const YAML_PROBLEMS: usize = 3;
+
+/// 見本と #2365 より前の固定文（`load_issue::yaml_reason` の種類の文）
+const YAML_PROBLEM_TABLE: [(YamlProblem, &str); YAML_PROBLEMS] = [
+    (YamlProblem::Syntax, "YAML の構文が壊れている"),
+    (YamlProblem::Empty, "YAML が空"),
+    (YamlProblem::Shape, "YAML の形が期待と違う"),
+];
+
+#[test]
+fn 置き場の_core_の断りの見本は全バリアントを持ち日英を持ち日本語は2365より前とバイト一致() {
+    let refusals: Vec<TaskRefusal> = task_refusal_table().into_iter().map(|(r, _)| r).collect();
+    covers_all(&refusals, task_refusal_index, TASK_REFUSALS);
+    let problems: Vec<YamlProblem> = YAML_PROBLEM_TABLE.iter().map(|(p, _)| *p).collect();
+    covers_all(&problems, yaml_problem_index, YAML_PROBLEMS);
+    for (r, old) in task_refusal_table() {
+        let debug = format!("{r:?}");
+        let at = |lang| {
+            where_written(
+                CORE_USER_TASK_SRC,
+                CORE_USER_TASK_PATH,
+                "impl TaskRefusal {",
+                &debug,
+                lang,
+            )
+        };
+        assert_eq!(r.text_in(Lang::Ja), old, "{debug}（{}）", at(Lang::Ja));
+        bilingual_named(at, &debug, &r.text_in(Lang::Ja), &r.text_in(Lang::En));
+        // 「見つからない」の読み（リモートの 404 寄せ）は見つからない系だけに日英で当たる
+        for lang in [Lang::Ja, Lang::En] {
+            assert_eq!(
+                E::says_not_found(&r.text_in(lang)),
+                matches!(r, TaskRefusal::NotFound(_)),
+                "{debug} / {lang:?}"
+            );
+        }
+    }
+    for (p, old) in YAML_PROBLEM_TABLE {
+        let debug = format!("{p:?}");
+        let at = |lang| {
+            where_written(
+                LOAD_ISSUE_SRC,
+                LOAD_ISSUE_PATH,
+                "impl YamlProblem {",
+                &debug,
+                lang,
+            )
+        };
+        assert_eq!(p.text_in(Lang::Ja), old, "{debug}（{}）", at(Lang::Ja));
+        bilingual_named(at, &debug, p.text_in(Lang::Ja), p.text_in(Lang::En));
+    }
+}
+
+/// 境界: パースの理由は位置の有無と A/B の素の文言でも包みと同じ言語にそろい、日本語は
+/// persist.log へ流れる `yaml_error_reason`（日本語固定）と同じ文になる
+#[test]
+fn 置き場のパースの理由は位置の有無と素の文言でも包みと同じ言語() {
+    let text = "gates: [\n  - task_id: a\n";
+    let e = serde_yaml::from_str::<serde_yaml::Value>(text).expect_err("壊れている");
+    let reason = YamlReason::located(&e, text);
+    assert_eq!(
+        reason.text_in(Lang::Ja),
+        tako_core::load_issue::yaml_error_reason(&e, text),
+        "日本語は persist.log へ流れる文と同じ"
+    );
+    let forms = [
+        reason,
+        YamlReason::Located {
+            kind: YamlProblem::Empty,
+            at: None,
+        },
+        YamlReason::Raw("invalid type: integer `5`, expected a sequence".into()),
+    ];
+    for form in forms {
+        let wrapped = |lang| {
+            Reason::StoreParseFailed {
+                file: "user-tasks.yaml",
+                reason: form.clone(),
+            }
+            .text_in(lang)
+        };
+        let en = wrapped(Lang::En);
+        assert!(has_japanese(&en).is_none(), "{form:?}: {en}");
+        assert!(en.starts_with("failed to parse user-tasks.yaml: "), "{en}");
+        assert!(wrapped(Lang::Ja).starts_with("user-tasks.yaml のパースに失敗: "));
+    }
+    assert_eq!(
+        YamlReason::Located {
+            kind: YamlProblem::Shape,
+            at: Some((2, 7)),
+        }
+        .text_in(Lang::En),
+        "the YAML does not have the expected shape (line 2, column 7)"
+    );
+}
+
+/// 境界: 起動失敗の包みは古い TAKO_PANE_ID が無ければ unset を案内せず、原因の文を言語ごとに
+/// そのまま埋める（原因が改行を含んでも包みは 1 回だけ）
+#[test]
+fn 起動失敗の包みの境界() {
+    for lang in [Lang::Ja, Lang::En] {
+        let cause = Reason::OutsideTako.text_in(lang);
+        let without = Reason::LaunchPaneUnavailable {
+            cause: cause.clone(),
+            cmd_hint: "tako master".into(),
+            stale_pane: None,
+        }
+        .text_in(lang);
+        assert!(!without.contains("unset TAKO_PANE_ID"), "{without}");
+        assert!(without.contains(&cause), "{without}");
+        assert!(without.contains("`tako master`"), "{without}");
+        assert_eq!(without.lines().count(), 2, "{without}");
+        let nested = Reason::LaunchPaneUnavailable {
+            cause: "a\nb".into(),
+            cmd_hint: "tako solo".into(),
+            stale_pane: Some(7),
+        }
+        .text_in(lang);
+        assert_eq!(nested.lines().count(), 4, "{nested}");
+        assert!(nested.contains("TAKO_PANE_ID=7"), "{nested}");
+    }
 }

@@ -480,6 +480,18 @@ pub fn peek_lang_setting() -> tako_core::i18n::LangSetting {
         .unwrap_or_default()
 }
 
+/// GUI の外（`tako` CLI・MCP の stdio ブリッジ）が GUI へ繋ぐ口の断りを組む表示言語（#2365）。
+///
+/// CLI は GUI へ送るだけの枝で表示言語のグローバルを決めない（毎回 settings.json を読まない）ので、
+/// 接続の失敗・時間切れの断りを組むときに初めて設定から解決する（解決は CLI の前段の `front_err` と
+/// 同じ [`peek_lang_setting`]）。system のときの OS の検出はプロセスを起こすことがあるので、
+/// **1 プロセスで 1 回**だけ解決して覚える（発見ファイルの候補を順に試して断りを何度組んでも 1 回）。
+/// GUI は使わない（GUI の表示言語は実行中に切り替わるので `tako_core::i18n::lang()` を引く）
+pub fn client_lang() -> tako_core::i18n::Lang {
+    static LANG: std::sync::OnceLock<tako_core::i18n::Lang> = std::sync::OnceLock::new();
+    *LANG.get_or_init(|| peek_lang_setting().resolve())
+}
+
 /// 指定パスから設定を読む（不在・破損は None）。
 ///
 /// **破損していたら既定値へ落とす前に退避する**（#916）。settings.json は

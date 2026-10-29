@@ -13,6 +13,11 @@ use tako_core::acceptance_gate::{
 };
 use tako_core::task_checkpoint::unix_now;
 
+use crate::Reason;
+
+/// 置き場のファイル名（断りの文に載せる）
+const FILE: &str = "acceptance_gates.yaml";
+
 /// ゲートファイルのパス
 /// `TAKO_ACCEPTANCE_GATES_FILE` で上書き可能（隔離検証用）
 pub fn store_path() -> Option<PathBuf> {
@@ -67,21 +72,27 @@ impl AcceptanceGateStore {
         if !path.is_file() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("acceptance_gates.yaml の読み取りに失敗: {e}"))?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            Reason::StoreReadFailed {
+                file: FILE,
+                error: e.to_string(),
+            }
+            .to_string()
+        })?;
         if content.trim().is_empty() {
             return Ok(Self::default());
         }
         serde_yaml::from_str(&content).map_err(|e| {
-            format!(
-                "acceptance_gates.yaml のパースに失敗: {}",
-                tako_core::load_issue::yaml_error_reason(&e, &content)
-            )
+            Reason::StoreParseFailed {
+                file: FILE,
+                reason: tako_core::load_issue::YamlReason::of(&e, &content),
+            }
+            .to_string()
         })
     }
 
     pub fn load() -> Result<Self, String> {
-        let path = store_path().ok_or("データディレクトリを解決できない")?;
+        let path = store_path_or_refuse()?;
         Self::load_from(&path)
     }
 
@@ -89,16 +100,26 @@ impl AcceptanceGateStore {
         let _lock = crate::config_io::lock_exclusive(path)?;
         let mut store = Self::load_from(path)?;
         let result = f(&mut store);
-        let content =
-            serde_yaml::to_string(&store).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
+        let content = serde_yaml::to_string(&store)
+            .map_err(|e| Reason::YamlEncodeFailed(e.to_string()).to_string())?;
         crate::config_io::atomic_write_with_backup(path, &content)?;
         Ok(result)
     }
 
     pub fn mutate<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
-        let path = store_path().ok_or("データディレクトリを解決できない")?;
+        let path = store_path_or_refuse()?;
         Self::mutate_at(&path, f)
     }
+}
+
+/// [`store_path`] が決まらなければ断る（データディレクトリを解決できない）
+fn store_path_or_refuse() -> Result<PathBuf, String> {
+    store_path().ok_or_else(|| Reason::DataDirUnresolved.to_string())
+}
+
+/// ゲートが見つからない断り
+fn gate_not_found(task_id: &str) -> String {
+    Reason::GateNotFound(task_id.to_string()).to_string()
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -109,21 +130,27 @@ impl AcceptanceGateStore {
 /// 形式: [{ "id": "tests_green", "kind": { "type": "command", "cmd": "cargo test" }, ... }, ...]
 pub fn parse_criteria(criteria_json: &str) -> Result<Vec<AcceptanceCriterion>, String> {
     let arr: Vec<Value> = serde_json::from_str(criteria_json)
-        .map_err(|e| format!("criteria の JSON パースに失敗: {e}"))?;
+        .map_err(|e| Reason::JsonArgUnreadable("criteria", e.to_string()).to_string())?;
     let mut criteria = Vec::new();
     for v in &arr {
         let id = v["id"]
             .as_str()
-            .ok_or("criterion に id が必要")?
+            .ok_or_else(|| Reason::ItemNeedsId("criterion").to_string())?
             .to_string();
         let kind: CriterionKind = serde_json::from_value(v["kind"].clone())
-            .map_err(|e| format!("criterion kind のパースに失敗 (id={id}): {e}"))?;
+            .map_err(|e| Reason::CriterionKindUnreadable(id.clone(), e.to_string()).to_string())?;
         let status = if let Some(s) = v["status"].as_str() {
             match s {
                 "pending" => CriterionStatus::Pending,
                 "passed" => CriterionStatus::Passed,
                 "failed" => CriterionStatus::Failed,
-                other => return Err(format!("不明な status: {other}")),
+                other => {
+                    return Err(Reason::UnknownBare {
+                        key: "status",
+                        got: other.to_string(),
+                    }
+                    .to_string())
+                }
             }
         } else {
             CriterionStatus::Pending
@@ -148,7 +175,7 @@ pub fn set_gate_payload_at(
 ) -> Result<Value, String> {
     let criteria = parse_criteria(criteria_json)?;
     if criteria.is_empty() {
-        return Err("criteria を 1 つ以上指定する".into());
+        return Err(Reason::CriteriaEmpty.to_string());
     }
     AcceptanceGateStore::mutate_at(path, |store| {
         let mut gate = AcceptanceGate {
@@ -169,7 +196,7 @@ pub fn set_gate_payload(
     criteria_json: &str,
     cwd: Option<&str>,
 ) -> Result<Value, String> {
-    let path = store_path().ok_or("データディレクトリを解決できない")?;
+    let path = store_path_or_refuse()?;
     set_gate_payload_at(&path, task_id, criteria_json, cwd)
 }
 
@@ -180,18 +207,14 @@ pub fn set_gate_payload(
 /// gate show のレスポンス JSON を構築する（パス指定版）
 pub fn show_gate_payload_at(path: &Path, task_id: &str) -> Result<Value, String> {
     let store = AcceptanceGateStore::load_from(path)?;
-    let gate = store
-        .find(task_id)
-        .ok_or_else(|| format!("ゲートが見つからない: {task_id}"))?;
+    let gate = store.find(task_id).ok_or_else(|| gate_not_found(task_id))?;
     Ok(gate_to_json(gate))
 }
 
 /// gate show のレスポンス JSON を構築する
 pub fn show_gate_payload(task_id: &str) -> Result<Value, String> {
     let store = AcceptanceGateStore::load()?;
-    let gate = store
-        .find(task_id)
-        .ok_or_else(|| format!("ゲートが見つからない: {task_id}"))?;
+    let gate = store.find(task_id).ok_or_else(|| gate_not_found(task_id))?;
     Ok(gate_to_json(gate))
 }
 
@@ -240,11 +263,14 @@ pub struct CriterionResult {
 /// 形式: [{ "id": "tests_green", "passed": true, "evidence": "exit 0" }, ...]
 pub fn parse_results(results_json: &str) -> Result<Vec<CriterionResult>, String> {
     let arr: Vec<Value> = serde_json::from_str(results_json)
-        .map_err(|e| format!("results の JSON パースに失敗: {e}"))?;
+        .map_err(|e| Reason::JsonArgUnreadable("results", e.to_string()).to_string())?;
     let mut results = Vec::new();
     for v in &arr {
         results.push(CriterionResult {
-            id: v["id"].as_str().ok_or("result に id が必要")?.to_string(),
+            id: v["id"]
+                .as_str()
+                .ok_or_else(|| Reason::ItemNeedsId("result").to_string())?
+                .to_string(),
             passed: v["passed"].as_bool().unwrap_or(false),
             evidence: v["evidence"].as_str().unwrap_or("").to_string(),
         });
@@ -264,7 +290,7 @@ pub fn record_results_payload_at(
     let overall: GateStatus = AcceptanceGateStore::mutate_at(path, |store| {
         let gate = store
             .find_mut(task_id)
-            .ok_or_else(|| format!("ゲートが見つからない: {task_id}"))?;
+            .ok_or_else(|| gate_not_found(task_id))?;
         for r in &results {
             if let Some(c) = gate.criteria.iter_mut().find(|c| c.id == r.id) {
                 c.status = if r.passed {
@@ -293,7 +319,7 @@ pub fn record_results_payload(
     results_json: &str,
     sync_checkpoint: bool,
 ) -> Result<Value, String> {
-    let path = store_path().ok_or("データディレクトリを解決できない")?;
+    let path = store_path_or_refuse()?;
     record_results_payload_at(&path, task_id, results_json, sync_checkpoint)
 }
 
@@ -305,7 +331,7 @@ pub fn record_results_payload(
 /// Custom 述語はスキップする（手動判定のため）。
 /// checkpoint 連動: sync_checkpoint=true かつ全 Passed → checkpoint.phase = Done
 pub fn execute_gate_check(task_id: &str, sync_checkpoint: bool) -> Result<Value, String> {
-    let path = store_path().ok_or("データディレクトリを解決できない")?;
+    let path = store_path_or_refuse()?;
     execute_gate_check_at(&path, task_id, sync_checkpoint)
 }
 
@@ -316,9 +342,7 @@ pub fn execute_gate_check_at(
     sync_checkpoint: bool,
 ) -> Result<Value, String> {
     let store = AcceptanceGateStore::load_from(path)?;
-    let gate = store
-        .find(task_id)
-        .ok_or_else(|| format!("ゲートが見つからない: {task_id}"))?;
+    let gate = store.find(task_id).ok_or_else(|| gate_not_found(task_id))?;
 
     let cwd = gate.cwd.clone();
     let mut results = Vec::new();
@@ -341,8 +365,8 @@ pub fn execute_gate_check_at(
         return show_gate_payload_at(path, task_id);
     }
 
-    let results_json =
-        serde_json::to_string(&results).map_err(|e| format!("JSON シリアライズに失敗: {e}"))?;
+    let results_json = serde_json::to_string(&results)
+        .map_err(|e| Reason::JsonSerializeFailed(e.to_string()).to_string())?;
     record_results_payload_at(path, task_id, &results_json, sync_checkpoint)
 }
 
@@ -717,7 +741,8 @@ mod tests {
 
         let result = show_gate_payload_at(&path, "no-such-task");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("見つからない"));
+        // 断りの文は表示言語で変わる（#2365）。見つからない系の読みは日英どちらにも当たる
+        assert!(crate::DispatchError::says_not_found(&result.unwrap_err()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -728,7 +753,7 @@ mod tests {
 
         let result = set_gate_payload_at(&path, "task-1", "[]", None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("1 つ以上"));
+        assert_eq!(result.unwrap_err(), Reason::CriteriaEmpty.to_string());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

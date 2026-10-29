@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tako_core::task_checkpoint::{unix_now, TaskCheckpoint, TaskPhase};
 
+use crate::Reason;
+
+/// 置き場のファイル名（断りの文に載せる）
+const FILE: &str = "task_checkpoints.yaml";
+
 /// チェックポイントファイルのパス
 /// `TAKO_TASK_CHECKPOINTS_FILE` で上書き可能（隔離検証用）
 pub fn store_path() -> Option<PathBuf> {
@@ -98,21 +103,27 @@ impl TaskCheckpointStore {
         if !path.is_file() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("task_checkpoints.yaml の読み取りに失敗: {e}"))?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            Reason::StoreReadFailed {
+                file: FILE,
+                error: e.to_string(),
+            }
+            .to_string()
+        })?;
         if content.trim().is_empty() {
             return Ok(Self::default());
         }
         serde_yaml::from_str(&content).map_err(|e| {
-            format!(
-                "task_checkpoints.yaml のパースに失敗: {}",
-                tako_core::load_issue::yaml_error_reason(&e, &content)
-            )
+            Reason::StoreParseFailed {
+                file: FILE,
+                reason: tako_core::load_issue::YamlReason::of(&e, &content),
+            }
+            .to_string()
         })
     }
 
     pub fn load() -> Result<Self, String> {
-        let path = store_path().ok_or("データディレクトリを解決できない")?;
+        let path = store_path_or_refuse()?;
         Self::load_from(&path)
     }
 
@@ -121,16 +132,32 @@ impl TaskCheckpointStore {
         let _lock = crate::config_io::lock_exclusive(path)?;
         let mut store = Self::load_from(path)?;
         let result = f(&mut store);
-        let content =
-            serde_yaml::to_string(&store).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
+        let content = serde_yaml::to_string(&store)
+            .map_err(|e| Reason::YamlEncodeFailed(e.to_string()).to_string())?;
         crate::config_io::atomic_write_with_backup(path, &content)?;
         Ok(result)
     }
 
     pub fn mutate<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
-        let path = store_path().ok_or("データディレクトリを解決できない")?;
+        let path = store_path_or_refuse()?;
         Self::mutate_at(&path, f)
     }
+}
+
+/// [`store_path`] が決まらなければ断る（データディレクトリを解決できない）
+fn store_path_or_refuse() -> Result<PathBuf, String> {
+    store_path().ok_or_else(|| Reason::DataDirUnresolved.to_string())
+}
+
+/// phase の綴りを読む（無い綴りは断る）
+fn parse_phase(phase: &str) -> Result<TaskPhase, String> {
+    TaskPhase::parse(phase).ok_or_else(|| {
+        Reason::UnknownBare {
+            key: "phase",
+            got: phase.to_string(),
+        }
+        .to_string()
+    })
 }
 
 /// checkpoint action のレスポンス JSON を構築する
@@ -150,11 +177,11 @@ pub fn checkpoint_payload(
     cwd: Option<&str>,
 ) -> Result<Value, String> {
     let phase_val = phase
-        .map(|p| TaskPhase::parse(p).ok_or_else(|| format!("不明な phase: {p}")))
+        .map(parse_phase)
         .transpose()?
         .unwrap_or(TaskPhase::Running);
 
-    let path = store_path().ok_or("データディレクトリを解決できない")?;
+    let path = store_path_or_refuse()?;
     let result = TaskCheckpointStore::mutate_at(&path, |store| {
         let id = task_id
             .map(String::from)
@@ -183,9 +210,7 @@ pub fn checkpoint_payload(
 
 /// list action のレスポンス JSON を構築する
 pub fn list_payload(phase_filter: Option<&str>) -> Result<Value, String> {
-    let phase = phase_filter
-        .map(|p| TaskPhase::parse(p).ok_or_else(|| format!("不明な phase: {p}")))
-        .transpose()?;
+    let phase = phase_filter.map(parse_phase).transpose()?;
     let store = TaskCheckpointStore::load()?;
     let items: Vec<Value> = store
         .list_by_phase(phase)
@@ -201,12 +226,12 @@ pub fn update_phase_payload(
     phase: &str,
     reason: Option<&str>,
 ) -> Result<Value, String> {
-    let new_phase = TaskPhase::parse(phase).ok_or_else(|| format!("不明な phase: {phase}"))?;
-    let path = store_path().ok_or("データディレクトリを解決できない")?;
+    let new_phase = parse_phase(phase)?;
+    let path = store_path_or_refuse()?;
     TaskCheckpointStore::mutate_at(&path, |store| {
         let cp = store
             .find_mut(task_id)
-            .ok_or_else(|| format!("チェックポイントが見つからない: {task_id}"))?;
+            .ok_or_else(|| Reason::CheckpointNotFound(task_id.to_string()).to_string())?;
         cp.phase = new_phase;
         if let Some(r) = reason {
             cp.suspended_reason = Some(r.to_string());
@@ -221,7 +246,7 @@ pub fn update_phase_payload(
 
 /// pane_id に紐づく active なチェックポイントの phase を Suspended に遷移させる
 pub fn suspend_by_pane(pane_id: u64, reason: &str) -> Result<Option<String>, String> {
-    let path = store_path().ok_or("データディレクトリを解決できない")?;
+    let path = store_path_or_refuse()?;
     suspend_by_pane_at(&path, pane_id, reason)
 }
 
@@ -563,7 +588,8 @@ mod tests {
         // 8. 存在しない task_id の update はエラー
         let err = update_phase_payload("nonexistent", "done", None);
         assert!(err.is_err());
-        assert!(err.unwrap_err().contains("見つからない"));
+        // 断りの文は表示言語で変わる（#2365）。見つからない系の読みは日英どちらにも当たる
+        assert!(crate::DispatchError::says_not_found(&err.unwrap_err()));
 
         std::env::remove_var("TAKO_TASK_CHECKPOINTS_FILE");
         let _ = std::fs::remove_dir_all(&dir);

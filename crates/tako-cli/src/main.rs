@@ -9586,19 +9586,15 @@ fn rename_launch_tab(
 
 /// 起動先を確保できないときのエラー文（Issue #567）。
 /// フォールバック（新規タブ）まで届かない = アプリへ接続できていない状態なので、
-/// 復旧手順を必ず添える。コマンドは最簡形で示す（#322）
+/// 復旧手順を必ず添える。コマンドは最簡形で示す（#322）。
+/// 原因（`cause`）は接続の断り（`ipc.rs`）なので、包みも同じ解決の表示言語で組む（#2365）
 fn launch_failure_message(cause: &str, cmd_hint: &str, requested: Option<u64>) -> String {
-    let mut message = format!(
-        "起動先ペインを確保できない: {cause}\n\
-         復旧: tako アプリを起動し、その中のターミナルで `{cmd_hint}` を実行してください"
-    );
-    if let Some(old) = requested {
-        message.push_str(&format!(
-            "\n      このシェルの TAKO_PANE_ID={old} は古い可能性があります: \
-             `unset TAKO_PANE_ID` してから再実行してください"
-        ));
+    tako_control::Reason::LaunchPaneUnavailable {
+        cause: cause.to_string(),
+        cmd_hint: cmd_hint.to_string(),
+        stale_pane: requested,
     }
-    message
+    .text_in(tako_control::settings::client_lang())
 }
 
 /// 相対パスを CLI 実行時の cwd で絶対化する。`--pane` で別ペインを指定しても
@@ -12302,6 +12298,8 @@ fn run_list(command: &Command) -> Result<(), String> {
 
 /// gate 操作のローカル処理（YAML I/O + コマンド実行。IPC 不要。#244）
 fn gate_cli(sub: &GateCommand) -> Result<(), String> {
+    // 置き場の断り（`acceptance_gates` が組む `Reason`）の表示言語を設定から決める（#2365）
+    init_local_lang();
     match sub {
         GateCommand::Set {
             task_id,
@@ -14058,7 +14056,6 @@ fn print_result(command: &Command, result: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tako_cli::ipc::OUTSIDE_TAKO;
 
     /// CLI 引数 → Request の対応（接続せずに検証できる範囲）
     fn parse(args: &[&str]) -> Command {
@@ -16579,19 +16576,37 @@ mod tests {
     /// フォールバック不能（GUI 不在）のエラーには復旧手順が載る（#567 受け入れ条件 2）
     #[test]
     fn 起動失敗のエラーに復旧手順が載る() {
-        let with_stale = launch_failure_message(OUTSIDE_TAKO, "tako master -fable", Some(305));
+        // 包みと原因の文は表示言語（GUI の外の解決 = 実行環境）で変わるので、日本語の対を固定して見る
+        // （#2365。`launch_failure_message` は同じ対を実行環境の言語で引くだけ）
+        use tako_core::i18n::Lang;
+        let outside = tako_control::Reason::OutsideTako.text_in(Lang::Ja);
+        let in_lang = |lang: Lang, cause: &str, cmd_hint: &str, requested: Option<u64>| {
+            tako_control::Reason::LaunchPaneUnavailable {
+                cause: cause.to_string(),
+                cmd_hint: cmd_hint.to_string(),
+                stale_pane: requested,
+            }
+            .text_in(lang)
+        };
+        assert_eq!(
+            launch_failure_message(&outside, "tako master", Some(305)),
+            in_lang(
+                tako_control::settings::client_lang(),
+                &outside,
+                "tako master",
+                Some(305)
+            )
+        );
+        let with_stale = in_lang(Lang::Ja, &outside, "tako master -fable", Some(305));
         assert!(with_stale.contains("tako アプリを起動"), "{with_stale}");
         assert!(
             with_stale.contains("unset TAKO_PANE_ID"),
             "古い ID を持つシェルには unset を案内する: {with_stale}"
         );
         assert!(with_stale.contains("tako master -fable"), "{with_stale}");
-        assert!(
-            with_stale.contains(OUTSIDE_TAKO),
-            "原因も残す: {with_stale}"
-        );
+        assert!(with_stale.contains(&outside), "原因も残す: {with_stale}");
 
-        let without = launch_failure_message(OUTSIDE_TAKO, "tako master", None);
+        let without = in_lang(Lang::Ja, &outside, "tako master", None);
         assert!(
             !without.contains("unset TAKO_PANE_ID"),
             "そもそも設定されていないなら unset は案内しない: {without}"

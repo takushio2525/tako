@@ -7,11 +7,21 @@
 
 use serde_json::Value;
 use tako_control::protocol::Request;
+use tako_control::Reason;
 
 /// tako の外で実行されたときのエラー（FR-2.2.8）。
 /// 接続情報は環境変数 → 発見ファイル（FR-2.2.9）の順で解決した上での不在を意味する
-pub const OUTSIDE_TAKO: &str = "tako アプリへの接続情報が無い（TAKO_SOCKET / TAKO_TOKEN 未設定・\
-    接続情報ファイルも無し）。tako アプリを起動するか、tako 内のターミナルで実行してください";
+pub fn outside_tako() -> String {
+    refusal(Reason::OutsideTako)
+}
+
+/// 接続まわりの断りの文（#2365）。日英の対は `tako_control::Reason`、表示言語は GUI の外の解決
+/// （`settings::client_lang`。CLI は GUI へ送るだけの枝で表示言語のグローバルを決めないので、
+/// `Reason` の `Display` = グローバルを引くと日本語表示の人へ英語で出る）。
+/// GUI から返った断り（`TransportError::Auth` / `Other` の中身）は GUI の表示言語で組まれている
+fn refusal(reason: Reason) -> String {
+    reason.text_in(tako_control::settings::client_lang())
+}
 
 /// `TAKO_PANE_ID`（呼び出し元ペイン）。tako 内のシェルなら必ず入っている（FR-2.1.1）
 pub fn caller_pane() -> Option<u64> {
@@ -151,7 +161,7 @@ pub fn send_request_classified(
     }
     Err(SendFailure::Unreachable(match last_failure {
         Some(stale) => stale.message(),
-        None => OUTSIDE_TAKO.to_string(),
+        None => outside_tako(),
     }))
 }
 
@@ -196,8 +206,9 @@ pub mod transport {
 
     use serde_json::Value;
     use tako_control::protocol::{error_code, Request, RequestEnvelope, ResponseEnvelope};
+    use tako_control::Reason;
 
-    use super::TransportError;
+    use super::{refusal, TransportError};
 
     /// `origin` は生成主体の自己申告（MCP ブリッジは `Some("mcp")`、CLI 直は `None`）
     pub fn roundtrip(
@@ -229,11 +240,14 @@ pub mod transport {
     ) -> Result<(deadline::Stream, deadline::Stream), TransportError> {
         use std::os::unix::net::UnixStream;
         let stream = UnixStream::connect(socket).map_err(|e| {
-            TransportError::Connect(format!("tako アプリへ接続できない（{socket}: {e}）"))
+            TransportError::Connect(refusal(Reason::CannotConnect {
+                socket: socket.to_string(),
+                error: e.to_string(),
+            }))
         })?;
-        let read_half = stream
-            .try_clone()
-            .map_err(|e| TransportError::Other(format!("接続の複製に失敗: {e}")))?;
+        let read_half = stream.try_clone().map_err(|e| {
+            TransportError::Other(refusal(Reason::ConnectionCloneFailed(e.to_string())))
+        })?;
         // 読み書きの両方に「繋がってから上限まで」の同じ締め切りを掛ける
         let at = limit.map(|l| std::time::Instant::now() + l);
         Ok((
@@ -249,11 +263,14 @@ pub mod transport {
     ) -> Result<(std::fs::File, std::fs::File), TransportError> {
         let stream =
             tako_control::platform::named_pipe::connect_client(socket, 3_000).map_err(|e| {
-                TransportError::Connect(format!("tako アプリへ接続できない（{socket}: {e}）"))
+                TransportError::Connect(refusal(Reason::CannotConnect {
+                    socket: socket.to_string(),
+                    error: e.to_string(),
+                }))
             })?;
-        let read_half = stream
-            .try_clone()
-            .map_err(|e| TransportError::Other(format!("接続の複製に失敗: {e}")))?;
+        let read_half = stream.try_clone().map_err(|e| {
+            TransportError::Other(refusal(Reason::ConnectionCloneFailed(e.to_string())))
+        })?;
         Ok((read_half, stream))
     }
 
@@ -301,9 +318,9 @@ pub mod transport {
         match rx.recv_timeout(limit) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(TransportError::Timeout(limit)),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(TransportError::Broken(
-                "応答を待つスレッドが途中で終わった".into(),
-            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(TransportError::Broken(refusal(Reason::ReplyThreadEnded)))
+            }
         }
     }
 
@@ -315,8 +332,9 @@ pub mod transport {
         origin: Option<&str>,
         limit: Option<Duration>,
     ) -> Result<Value, TransportError> {
-        // 締め切りを過ぎた読み書き（unix は EAGAIN = WouldBlock）は時間切れ、それ以外は途中で切れた
-        let broken = |what: &str, e: std::io::Error| match limit {
+        // 締め切りを過ぎた読み書き（unix は EAGAIN = WouldBlock）は時間切れ、それ以外は途中で切れた。
+        // `what` は途中で切れたときの断り（OS の文を受けて組む）
+        let broken = |what: fn(String) -> Reason, e: std::io::Error| match limit {
             Some(limit)
                 if matches!(
                     e.kind(),
@@ -325,25 +343,24 @@ pub mod transport {
             {
                 TransportError::Timeout(limit)
             }
-            _ => TransportError::Broken(format!("{what}に失敗: {e}")),
+            _ => TransportError::Broken(refusal(what(e.to_string()))),
         };
         let mut envelope = RequestEnvelope::new(1, token, request);
         envelope.origin = origin.map(Into::into);
-        let json = serde_json::to_string(&envelope)
-            .map_err(|e| TransportError::Other(format!("送信の構築に失敗: {e}")))?;
-        writeln!(write_half, "{json}").map_err(|e| broken("送信", e))?;
+        let json = serde_json::to_string(&envelope).map_err(|e| {
+            TransportError::Other(refusal(Reason::RequestEncodeFailed(e.to_string())))
+        })?;
+        writeln!(write_half, "{json}").map_err(|e| broken(Reason::SendFailed, e))?;
 
         let mut line = String::new();
         BufReader::new(read_half)
             .read_line(&mut line)
-            .map_err(|e| broken("応答の受信", e))?;
+            .map_err(|e| broken(Reason::ReceiveFailed, e))?;
         if line.is_empty() {
-            return Err(TransportError::Broken(
-                "tako アプリから応答が返らなかった".into(),
-            ));
+            return Err(TransportError::Broken(refusal(Reason::NoReply)));
         }
         let response: ResponseEnvelope = serde_json::from_str(&line)
-            .map_err(|e| TransportError::Broken(format!("応答を解釈できない: {e}")))?;
+            .map_err(|e| TransportError::Broken(refusal(Reason::ReplyUnreadable(e.to_string()))))?;
         if let Some(error) = response.error {
             return Err(if error.code == error_code::AUTH {
                 TransportError::Auth(error.message)
@@ -773,8 +790,15 @@ mod tests {
 
         #[test]
         fn 時間切れの文言は上限の秒数を出す() {
+            // 表示言語は GUI の外の解決（実行環境で決まる）なので、同じ解決の文と突き合わせる
             let m = TransportError::Timeout(Duration::from_secs(30)).message();
-            assert!(m.starts_with("tako アプリが 30 秒応答しない"), "{m}");
+            assert_eq!(
+                m,
+                tako_control::Reason::ReplyTimeout(30)
+                    .text_in(tako_control::settings::client_lang())
+            );
+            let ja = tako_control::Reason::ReplyTimeout(30).text_in(tako_core::i18n::Lang::Ja);
+            assert!(ja.starts_with("tako アプリが 30 秒応答しない"), "{ja}");
         }
     }
 }
