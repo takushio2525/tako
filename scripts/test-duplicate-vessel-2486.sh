@@ -11,7 +11,10 @@
 #      （①の後にもう一度再起動すると、重複は解けていて普通の再 attach になる）
 #   ⑤ persist off では復元しない（修正前と同じ）
 #   ⑥ A/B: `TAKO_2486_LEGACY=1` で修正前の症状（片方のペインが閉じる）が同一バイナリで出る
+#   ⑦ 会話の記録つきの重複（器が生きている）: 2 本目は会話を resume せず、記録も引き継がない
+#      （内訳の新規シェルの理由は `器の名前の重複`）
 # を実測する。
+# 蓋閉じの機で tako-vd が起動の合間に眠ったときは、その起動だけをやり直す（start_app）。
 #
 # 器の中身の取り違えを見るため、各器へ印（`echo MARK_<ペイン>`）を打ってから終了し、
 # 復元後にどのペインがどの印を映しているかを `tako read` で読む。
@@ -21,7 +24,7 @@
 #
 # **CI には登録しない**（実 GUI を立てるので表示のある実機でだけ回る = 他の
 # `isolated-gui.sh` 系スクリプトと同じ扱い）。CI 側の担保は単体テスト
-# （`tako_control::vessel_claims`）と番犬
+# （`tako_control::restore_vessels`）と番犬
 # （`crates/tako-control/tests/issue2486_duplicate_vessel_watchdog.rs`）。
 #
 # 使い方: bash scripts/test-duplicate-vessel-2486.sh
@@ -380,7 +383,7 @@ check_eq "④ $P1 は自分の器（印）" "MARK_$P1" "$(marks_of "$P1")"
 check_eq "④ $P2 は自分の器（印）" "MARK_$P2" "$(marks_of "$P2")"
 check_eq "④ 重複の行は出ない" "0" "$(grep -c '器の名前の重複' "$PLOG" | tr -d ' ')"
 # split した新しいペインも従来どおり新しい器を持つ
-P4="$("$TAKO_BIN" split --pane "$P3" --right | tr -dc '0-9')"
+"$TAKO_BIN" split --pane "$P3" --right >/dev/null
 sleep 1
 check_eq "④ split したペインに器が 1 本増える" "4" "$(vessel_count)"
 stop_app
