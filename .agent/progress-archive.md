@@ -4,10 +4,6 @@
 
 ---
 
-- 2026-07-30 #656: Markdown プレビューの表示品質を全面改善
-- 2026-07-30 #668: visual-test のインデントガイド節が main で失敗していた問題
-- 2026-07-30 #669: コードプレビュー（非 md）の構文色がライトテーマで読めない問題
-- 2026-07-30 #680: md プレビューのリンク ⌘+クリック + コードブロックのコピーボタン
 - 2026-07-31 #691: GUI ライク表示モード（初心者向け UI）の詳細仕様策定 — docs のみ
 - 2026-07-31 #694: GUI モード G1 — モード基盤 + スターター 3 ボタン
 - 2026-07-31 #690: アップデート詳細のリリースノートを Markdown レンダリングへ
@@ -659,3 +655,18 @@
 - 2026-10-25 #2402: usage::index の claude 系テストの固定日付が 2027-11 以降に月の掃除で消えて落ちる時限 → 実時間の 2 日前の正午からの相対へ・製品は無変更
 - 2026-10-25 #2400: env を書く lib のテスト 62 本と結合テスト 5 本を `tako_core::run_alone!`（その 1 本だけの子）へ・env 専用ロック 5 つを撤去・番犬 `issue2400_test_env_write_watchdog`
 - 2026-10-26 #1992 10/25 夜の PC 停止の調査: メモリ枯渇 → Jetsam → watchdog のカーネルパニック（3 回目）。主因は agent の常駐 = claude 1 本ごとに user scope の MCP 12〜15 プロセス
+- 2026-10-26 #1308 の再発: respond の実 PTY テストの fixture をログインシェル経由から `/bin/sh -c` の直接起動へ・失敗文の値を `TAKO_1308_WAIT` の 1 行へ
+- 2026-10-26 #2419: docs サイトの共用の consent.js を async で読み、最初の描画を止めない。製品は無変更
+- 2026-10-26 #2399: 器を起こす検証スクリプト 32 本・47 か所の `kill-server` を `tmux_socket_kill`（`scripts/lib/tmux-socket.sh`）へ寄せ、ソケットファイルを残さない・番犬 `器を起こすスクリプトはソケットファイルまで消す`
+- 2026-10-26 #2365 の続き: `tako mod ui` の成功の応答の枠・CLI の表示・`cli_request` の断り 9 種・排他の断り `config_io::LockError`・置き場が決まらない断りを日英の網羅 match へ
+- 2026-10-26 #2412: claude の worker を tako の MCP だけで起動 = `--settings` の `deniedMcpServers` で user scope を止める・プロジェクト単位で足す `projects mcp`・projects.yaml v2 の移行で直近…
+- 2026-10-26 #2413: メモリ逼迫中は agent の起動（spawn / run / 復元・sessions resume・git resolve）を `admit` と同じ純関数で待たせ、復元は master から 1 本ずつ時差・上書きは `tako queue start <ペイン>`
+- 2026-10-26 #2365 の続き: `tako mod`（status / on / off / band / install / uninstall）の応答と CLI の表示を日英の網羅 match へ・置き場の断り `paths::NoDataDir`
+- 2026-10-27 #2416: mod の報告のテストの ui.json の置き場が同じ TAKO_DATA_DIR で前の回の残りを読んでいた → MockHost ごとの `ScratchDir` へ
+- 2026-10-28 #2411: issue2367 の旧挙動の腕の間欠の真因はテスト = 理由を tmux の代替画面から読んでいた → stderr から採り、終了と fd の空きを状態待ちへ
+- 2026-10-28 #2406: ネスト tmux 越しのホイールの e2e の間欠 = 起動中にマウス要求が外れる窓へ 1 発だけのホイールが落ちていた → 器のペイン側の要求で待ち、遡るまで打ち直す
+- 2026-10-28 #2428: Windows の新しいペインがレジストリの PATH を読み直す・setup の「次の 1 手」に「新しいタブを開いて」を添える
+- 2026-10-28 #2418: codex の worker も tako の MCP とプロジェクトで足した MCP だけで起動 = `-c mcp_servers.<名>.enabled=false`・`projects mcp` に `codex_plan`
+- 2026-10-28 #724: Windows の Web ビューの生成を App の借用の外で 1 本ずつ・Windows では ipc を付けない・生成中に落ちた Web ビューを次の起動で保留
+- 2026-10-28 #2247: 「Finder で表示」を tako 自身の NSWorkspace で Finder を前面へ出す 1 実装にし、プレビュー・設定画面も dispatch へ寄せた
+- 2026-10-28 #2426: #2413 の e2e の 2 件 = 起動待ちから起こした run の run_status が `launch_waiting` のまま残る・e2e が master の役割を付けていなかった
