@@ -419,7 +419,134 @@ pub enum Reason {
         got: String,
         presets: Vec<String>,
     },
+    // ---- #2365 の続き: MCP の前段（`mcp/request.rs` の引数の組み立てと JSON-RPC の口）が
+    // ツールごとに書いていた断り。鍵の名前・候補は呼び手が値で渡す（候補は ASCII だけ） ----
+    /// `click は {"row": 行, "col": 桁}（0 始まりの表示セル）で指定する`（`tako_send_input` の click）
+    ClickShape,
+    /// `click.<key> を 0 以上の整数で指定する`
+    ClickCell(String),
+    /// `axis は "x" か "y" を指定する`（`tako_resize_pane`）
+    AxisXOrY,
+    /// `enabled と reattach は併用できない（切替か再 attach のどちらか）`（`tako_persist`）
+    ReattachWithEnabled,
+    /// `text は command=type と組で渡す`（`tako_preview_edit` の command 無し）
+    TextNeedsType,
+    /// `<key> が不正: <got>`（候補を添えない旧形。`tako_file_op` の op）
+    InvalidValueBare {
+        key: &'static str,
+        got: String,
+    },
+    /// `path（または paths）を指定する`（`tako_file_op`）
+    PathOrPaths,
+    /// `view が不正: <got>（<候補と旧称>）`（`tako_panel`）。旧称の説明も表示言語で引く
+    /// （[`crate::protocol::PanelViewWire::values_hint_in`]）
+    InvalidPanelView(String),
+    /// `<key> を解釈できない: <error>`（`error` は serde の文）
+    CannotParse(&'static str, String),
+    /// `name を指定する（プロファイル名 / プロジェクトキー）`（`tako_orchestrator_adopt`）
+    AdoptNameMissing,
+    /// `<key> を指定する（<hint>）`。`hint` は候補（ASCII）
+    MissingHint {
+        key: &'static str,
+        hint: &'static str,
+    },
+    /// `set はオブジェクト（キー → 値）`（`tako_lsp_server` の options）
+    SetNotObject,
+    /// `<action> は <key> を指定する`（`tako_lsp` の rename の new_name）
+    ActionMustGive {
+        action: &'static str,
+        key: &'static str,
+    },
+    /// `action は <MCP の action> のどれか（report は MCP に無い）`（`tako_mod`）
+    ModMcpAction,
+    /// `action=ui の引数が読めない: <error>`（`tako_mod` の ui。`error` は serde の文）
+    ModUiArgs(String),
+    /// `rules.<name> は true / false で指定する`（`tako_settings` の paste_guard）
+    RuleNotBool(String),
+    /// `rules は {"規則名": true / false} で指定する`
+    RulesShape,
+    /// `<key> は action=paste_guard のときだけ使える`
+    PasteGuardOnly(String),
+    /// `<key> は <allowed> のいずれか`（`tako_open_remote` の target）。`allowed` は ASCII
+    OneOfListed {
+        key: &'static str,
+        allowed: String,
+    },
+    /// `<key> の JSON 変換に失敗: <error>`。`key` が無ければ `JSON 変換に失敗: <error>`
+    /// （受け入れゲートの criteria。MCP と CLI の前段）
+    JsonEncodeFailed {
+        key: Option<&'static str>,
+        error: String,
+    },
+    /// `範囲の整形は line / column / end_line / end_column の 4 つをそろえて指定する（省略で文書全体）`
+    /// （鍵は [`LSP_FORMAT_RANGE_KEYS`]）
+    FormatRangeIncomplete,
+    /// `メソッド <method> は未対応`（MCP の JSON-RPC の口）
+    UnknownMethod(String),
+    /// `リクエストを JSON として解釈できない`（MCP の HTTP の口）
+    RequestNotJson,
+    /// `JSON として解釈できない: <error>`（MCP の stdio ブリッジの口。`error` は serde の文）
+    NotJson(String),
+    // ---- #2365 の続き: CLI の前段（`tako-cli` の `build_request` とそれが呼ぶ補助）が書いていた断り ----
+    /// `--dx / --dy / --share-x / --share-y のどれか 1 つを指定する`（`tako resize`）
+    ResizeOneOf,
+    /// ``文字を渡せるのは `tako paste-guard check|allow|unallow|rule` だけ``
+    PasteGuardTextUsage,
+    /// ``外す許可の ID（`tako paste-guard` の allow[].id）か all を渡す``
+    PasteGuardUnallowId,
+    /// `標準入力の読み取りに失敗: <error>`（`error` は OS の文）
+    StdinReadFailed(String),
+    /// `移動の単位は <名前表> のどれか（<got:?> は無い）`（`tako edit move`。表は tako-core の 1 か所）
+    BadMovement(String),
+    /// `削除の単位は <名前表> のどれか（<got:?> は無い）`（`tako edit delete`）
+    BadMotion(String),
+    /// `行の操作は <名前表> のどれか（<got:?> は無い）`（`tako edit line`）
+    BadLineOp(String),
+    /// `--dry-run は install / uninstall にだけ付ける（tako mod install --dry-run）`
+    ModDryRunOnly,
+    /// `band には on か off を付ける（tako mod band off で帯を隠す）`
+    ModBandOnOff,
+    /// `on / off は band の後ろにだけ付ける（帯の切替は tako mod band on|off。画面の UI 設定は tako mod ui）`
+    ModOnOffAfterBand,
+    /// `reattach には --pane N（再接続するペインの ID）が要る`（`tako persist reattach`）
+    ReattachNeedsPane,
+    /// `ペイン ID か --tab のどちらかを指定する（tako backgrounded で確認）`（`tako foreground`）
+    ForegroundTarget,
+    /// `移すものと移動先のフォルダを指定する（例: tako file move a.txt dst）`
+    FileMoveArgs,
+    /// `コピー元と貼り付け先のフォルダを指定する（例: tako file copy a.txt dst）`
+    FileCopyArgs,
+    /// `コピー元が複数のときは 1 件ずつ送る（file_copy_cli）`（A/B の旧経路だけが通る内部の断り）
+    CopyOneAtATime,
+    /// `<total> 件中 <failed> 件をコピーできなかった`（`tako file copy` の終わりの行）
+    CopyPartlyFailed {
+        total: usize,
+        failed: usize,
+    },
+    /// `<total> 件中 <failed> 件をできなかった`（`tako file move` / `trash` のまとめた操作の終わりの行）
+    ManyPartlyFailed {
+        total: usize,
+        failed: usize,
+    },
+    /// `作業ディレクトリを読めない: <error>`（`tako run-config`。`error` は OS の文）
+    CwdUnreadable(String),
+    /// `--env は K=V の形で指定する（指定: <got:?>）`
+    EnvShape(String),
+    /// `報告を stdin から読めない: <error>`（`tako mod report`）
+    ModReportUnreadable(String),
+    /// `報告の JSON を読めない: <error>`（`tako mod report`。`error` は serde の文）
+    ModReportNotJson(String),
+    /// `位置は 行:桁 で指定する（行が数値でない: <text>）`（`tako edit replace-range` ほか）
+    PositionLine(String),
+    /// `位置は 行:桁 で指定する（桁が数値でない: <text>）`
+    PositionColumn(String),
+    /// ``範囲は 行:桁-行:桁 で指定する（`-` が無い: <text>）``（`tako lsp format --range`）
+    RangeShape(String),
 }
+
+/// 整形の範囲を表す 4 つの鍵（#1683。MCP `tako_lsp` の format の range と
+/// [`Reason::FormatRangeIncomplete`] が引く 1 か所）
+pub const LSP_FORMAT_RANGE_KEYS: [&str; 4] = ["line", "column", "end_line", "end_column"];
 
 impl std::fmt::Display for Reason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -950,6 +1077,245 @@ impl Reason {
                     "unknown theme: {got:?} (target is dark / light / a preset name; \
                      presets: {presets})"
                 )
+            }
+            // ---- MCP の前段 ----
+            (Self::ClickShape, Ja) => {
+                "click は {\"row\": 行, \"col\": 桁}（0 始まりの表示セル）で指定する".to_string()
+            }
+            (Self::ClickShape, En) => {
+                "pass click as {\"row\": row, \"col\": column} (0-based display cells)".to_string()
+            }
+            (Self::ClickCell(key), Ja) => format!("click.{key} を 0 以上の整数で指定する"),
+            (Self::ClickCell(key), En) => format!("click.{key} must be an integer of 0 or more"),
+            (Self::AxisXOrY, Ja) => "axis は \"x\" か \"y\" を指定する".to_string(),
+            (Self::AxisXOrY, En) => "axis must be \"x\" or \"y\"".to_string(),
+            (Self::ReattachWithEnabled, Ja) => {
+                "enabled と reattach は併用できない（切替か再 attach のどちらか）".to_string()
+            }
+            (Self::ReattachWithEnabled, En) => "enabled and reattach cannot be used together \
+                 (either toggle it or reattach)"
+                .to_string(),
+            (Self::TextNeedsType, Ja) => "text は command=type と組で渡す".to_string(),
+            (Self::TextNeedsType, En) => "pass text together with command=type".to_string(),
+            (Self::InvalidValueBare { key, got }, Ja) => format!("{key} が不正: {got}"),
+            (Self::InvalidValueBare { key, got }, En) => format!("invalid {key}: {got}"),
+            (Self::PathOrPaths, Ja) => "path（または paths）を指定する".to_string(),
+            (Self::PathOrPaths, En) => "pass path (or paths)".to_string(),
+            (Self::InvalidPanelView(got), Ja) => format!(
+                "view が不正: {got}（{}）",
+                crate::protocol::PanelViewWire::values_hint_in(Ja)
+            ),
+            (Self::InvalidPanelView(got), En) => format!(
+                "invalid view: {got} ({})",
+                crate::protocol::PanelViewWire::values_hint_in(En)
+            ),
+            (Self::CannotParse(key, error), Ja) => format!("{key} を解釈できない: {error}"),
+            (Self::CannotParse(key, error), En) => format!("cannot parse {key}: {error}"),
+            (Self::AdoptNameMissing, Ja) => {
+                "name を指定する（プロファイル名 / プロジェクトキー）".to_string()
+            }
+            (Self::AdoptNameMissing, En) => {
+                "name is required (a profile name / project key)".to_string()
+            }
+            (Self::MissingHint { key, hint }, Ja) => format!("{key} を指定する（{hint}）"),
+            (Self::MissingHint { key, hint }, En) => format!("{key} is required ({hint})"),
+            (Self::SetNotObject, Ja) => "set はオブジェクト（キー → 値）".to_string(),
+            (Self::SetNotObject, En) => "set must be an object (key -> value)".to_string(),
+            (Self::ActionMustGive { action, key }, Ja) => format!("{action} は {key} を指定する"),
+            (Self::ActionMustGive { action, key }, En) => {
+                format!("{key} is required for {action}")
+            }
+            (Self::ModMcpAction, Ja) => format!(
+                "action は {} のどれか（report は MCP に無い）",
+                crate::claude_mod::MCP_ACTIONS.join(" / ")
+            ),
+            (Self::ModMcpAction, En) => format!(
+                "action must be one of {} (report is not available over MCP)",
+                crate::claude_mod::MCP_ACTIONS.join(" / ")
+            ),
+            (Self::ModUiArgs(error), Ja) => format!("action=ui の引数が読めない: {error}"),
+            (Self::ModUiArgs(error), En) => {
+                format!("cannot read the arguments of action=ui: {error}")
+            }
+            (Self::RuleNotBool(name), Ja) => format!("rules.{name} は true / false で指定する"),
+            (Self::RuleNotBool(name), En) => format!("rules.{name} must be true / false"),
+            (Self::RulesShape, Ja) => "rules は {\"規則名\": true / false} で指定する".to_string(),
+            (Self::RulesShape, En) => "pass rules as {\"rule name\": true / false}".to_string(),
+            (Self::PasteGuardOnly(key), Ja) => {
+                format!("{key} は action=paste_guard のときだけ使える")
+            }
+            (Self::PasteGuardOnly(key), En) => {
+                format!("{key} can be used only with action=paste_guard")
+            }
+            (Self::OneOfListed { key, allowed }, Ja) => format!("{key} は {allowed} のいずれか"),
+            (Self::OneOfListed { key, allowed }, En) => {
+                format!("{key} must be one of {allowed}")
+            }
+            (Self::JsonEncodeFailed { key, error }, Ja) => match key {
+                Some(key) => format!("{key} の JSON 変換に失敗: {error}"),
+                None => format!("JSON 変換に失敗: {error}"),
+            },
+            (Self::JsonEncodeFailed { key, error }, En) => match key {
+                Some(key) => format!("failed to encode {key} as JSON: {error}"),
+                None => format!("failed to encode as JSON: {error}"),
+            },
+            (Self::FormatRangeIncomplete, Ja) => format!(
+                "範囲の整形は {} の 4 つをそろえて指定する（省略で文書全体）",
+                LSP_FORMAT_RANGE_KEYS.join(" / ")
+            ),
+            (Self::FormatRangeIncomplete, En) => format!(
+                "to format a range, pass all four of {} (omit them all to format the whole document)",
+                LSP_FORMAT_RANGE_KEYS.join(" / ")
+            ),
+            (Self::UnknownMethod(method), Ja) => format!("メソッド {method} は未対応"),
+            (Self::UnknownMethod(method), En) => format!("method {method} is not supported"),
+            (Self::RequestNotJson, Ja) => "リクエストを JSON として解釈できない".to_string(),
+            (Self::RequestNotJson, En) => "cannot parse the request as JSON".to_string(),
+            (Self::NotJson(error), Ja) => format!("JSON として解釈できない: {error}"),
+            (Self::NotJson(error), En) => format!("cannot parse as JSON: {error}"),
+            // ---- CLI の前段 ----
+            (Self::ResizeOneOf, Ja) => {
+                "--dx / --dy / --share-x / --share-y のどれか 1 つを指定する".to_string()
+            }
+            (Self::ResizeOneOf, En) => {
+                "pass exactly one of --dx / --dy / --share-x / --share-y".to_string()
+            }
+            (Self::PasteGuardTextUsage, Ja) => {
+                "文字を渡せるのは `tako paste-guard check|allow|unallow|rule` だけ".to_string()
+            }
+            (Self::PasteGuardTextUsage, En) => {
+                "text can be passed only to `tako paste-guard check|allow|unallow|rule`".to_string()
+            }
+            (Self::PasteGuardUnallowId, Ja) => {
+                "外す許可の ID（`tako paste-guard` の allow[].id）か all を渡す".to_string()
+            }
+            (Self::PasteGuardUnallowId, En) => "pass the ID of the allowance to remove \
+                 (allow[].id in `tako paste-guard`) or all"
+                .to_string(),
+            (Self::StdinReadFailed(error), Ja) => format!("標準入力の読み取りに失敗: {error}"),
+            (Self::StdinReadFailed(error), En) => {
+                format!("failed to read standard input: {error}")
+            }
+            (Self::BadMovement(got), Ja) => format!(
+                "移動の単位は {} のどれか（{got:?} は無い）",
+                tako_core::text_edit::CursorMovement::names().join(" / ")
+            ),
+            (Self::BadMovement(got), En) => format!(
+                "the movement must be one of {} (got {got:?})",
+                tako_core::text_edit::CursorMovement::names().join(" / ")
+            ),
+            (Self::BadMotion(got), Ja) => format!(
+                "削除の単位は {} のどれか（{got:?} は無い）",
+                tako_core::text_edit::DeleteMotion::names().join(" / ")
+            ),
+            (Self::BadMotion(got), En) => format!(
+                "the delete motion must be one of {} (got {got:?})",
+                tako_core::text_edit::DeleteMotion::names().join(" / ")
+            ),
+            (Self::BadLineOp(got), Ja) => format!(
+                "行の操作は {} のどれか（{got:?} は無い）",
+                tako_core::text_edit::LineOperation::names().join(" / ")
+            ),
+            (Self::BadLineOp(got), En) => format!(
+                "the line operation must be one of {} (got {got:?})",
+                tako_core::text_edit::LineOperation::names().join(" / ")
+            ),
+            (Self::ModDryRunOnly, Ja) => {
+                "--dry-run は install / uninstall にだけ付ける（tako mod install --dry-run）"
+                    .to_string()
+            }
+            (Self::ModDryRunOnly, En) => {
+                "--dry-run goes only with install / uninstall (tako mod install --dry-run)"
+                    .to_string()
+            }
+            (Self::ModBandOnOff, Ja) => {
+                "band には on か off を付ける（tako mod band off で帯を隠す）".to_string()
+            }
+            (Self::ModBandOnOff, En) => {
+                "band takes on or off (tako mod band off hides the band)".to_string()
+            }
+            (Self::ModOnOffAfterBand, Ja) => "on / off は band の後ろにだけ付ける\
+                 （帯の切替は tako mod band on|off。画面の UI 設定は tako mod ui）"
+                .to_string(),
+            (Self::ModOnOffAfterBand, En) => "on / off goes only after band \
+                 (toggle the band with tako mod band on|off; the UI settings are tako mod ui)"
+                .to_string(),
+            (Self::ReattachNeedsPane, Ja) => {
+                "reattach には --pane N（再接続するペインの ID）が要る".to_string()
+            }
+            (Self::ReattachNeedsPane, En) => {
+                "reattach needs --pane N (the ID of the pane to reconnect)".to_string()
+            }
+            (Self::ForegroundTarget, Ja) => {
+                "ペイン ID か --tab のどちらかを指定する（tako backgrounded で確認）".to_string()
+            }
+            (Self::ForegroundTarget, En) => {
+                "pass a pane ID or --tab (list them with tako backgrounded)".to_string()
+            }
+            (Self::FileMoveArgs, Ja) => {
+                "移すものと移動先のフォルダを指定する（例: tako file move a.txt dst）".to_string()
+            }
+            (Self::FileMoveArgs, En) => "pass what to move and the destination folder \
+                 (e.g. tako file move a.txt dst)"
+                .to_string(),
+            (Self::FileCopyArgs, Ja) => {
+                "コピー元と貼り付け先のフォルダを指定する（例: tako file copy a.txt dst）"
+                    .to_string()
+            }
+            (Self::FileCopyArgs, En) => "pass the sources and the destination folder \
+                 (e.g. tako file copy a.txt dst)"
+                .to_string(),
+            (Self::CopyOneAtATime, Ja) => {
+                "コピー元が複数のときは 1 件ずつ送る（file_copy_cli）".to_string()
+            }
+            (Self::CopyOneAtATime, En) => {
+                "send several sources one at a time (file_copy_cli)".to_string()
+            }
+            (Self::CopyPartlyFailed { total, failed }, Ja) => {
+                format!("{total} 件中 {failed} 件をコピーできなかった")
+            }
+            (Self::CopyPartlyFailed { total, failed }, En) => {
+                format!("could not copy {failed} of {total}")
+            }
+            (Self::ManyPartlyFailed { total, failed }, Ja) => {
+                format!("{total} 件中 {failed} 件をできなかった")
+            }
+            (Self::ManyPartlyFailed { total, failed }, En) => {
+                format!("could not complete {failed} of {total}")
+            }
+            (Self::CwdUnreadable(error), Ja) => format!("作業ディレクトリを読めない: {error}"),
+            (Self::CwdUnreadable(error), En) => {
+                format!("cannot read the working directory: {error}")
+            }
+            (Self::EnvShape(got), Ja) => format!("--env は K=V の形で指定する（指定: {got:?}）"),
+            (Self::EnvShape(got), En) => format!("pass --env as K=V (got {got:?})"),
+            (Self::ModReportUnreadable(error), Ja) => {
+                format!("報告を stdin から読めない: {error}")
+            }
+            (Self::ModReportUnreadable(error), En) => {
+                format!("cannot read the report from stdin: {error}")
+            }
+            (Self::ModReportNotJson(error), Ja) => format!("報告の JSON を読めない: {error}"),
+            (Self::ModReportNotJson(error), En) => {
+                format!("cannot read the report JSON: {error}")
+            }
+            (Self::PositionLine(text), Ja) => {
+                format!("位置は 行:桁 で指定する（行が数値でない: {text}）")
+            }
+            (Self::PositionLine(text), En) => {
+                format!("pass the position as line:column (the line is not a number: {text})")
+            }
+            (Self::PositionColumn(text), Ja) => {
+                format!("位置は 行:桁 で指定する（桁が数値でない: {text}）")
+            }
+            (Self::PositionColumn(text), En) => format!(
+                "pass the position as line:column (the column is not a number: {text})"
+            ),
+            (Self::RangeShape(text), Ja) => {
+                format!("範囲は 行:桁-行:桁 で指定する（`-` が無い: {text}）")
+            }
+            (Self::RangeShape(text), En) => {
+                format!("pass the range as line:column-line:column (`-` is missing: {text})")
             }
         }
     }

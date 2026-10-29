@@ -83,7 +83,7 @@ pub fn handle_message(message: &Value, session: &mut McpSession) -> Option<Value
             Ok(json!({ "tools": tools }))
         }
         "tools/call" => call_tool(&params, session),
-        _ => Err((-32601, format!("メソッド {method} は未対応"))),
+        _ => Err((-32601, Reason::UnknownMethod(method).to_string())),
     };
     Some(match result {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),

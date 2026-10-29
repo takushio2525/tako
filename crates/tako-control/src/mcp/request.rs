@@ -50,13 +50,13 @@ pub(super) fn build_request(
             let click = args
                 .get("click")
                 .and_then(Value::as_object)
-                .ok_or("click は {\"row\": 行, \"col\": 桁}（0 始まりの表示セル）で指定する")?;
+                .ok_or_else(|| Reason::ClickShape.to_string())?;
             let cell = |key: &str| -> Result<usize, String> {
                 click
                     .get(key)
                     .and_then(Value::as_u64)
                     .map(|n| n as usize)
-                    .ok_or_else(|| format!("click.{key} を 0 以上の整数で指定する"))
+                    .ok_or_else(|| Reason::ClickCell(key.to_string()).to_string())
             };
             Request::PaneClick {
                 pane: Some(required_u64(args, "pane")?),
@@ -125,7 +125,7 @@ pub(super) fn build_request(
             let pane = u64_arg(args, "pane")?;
             let direction = direction_arg(args)?;
             if pane.is_none() && direction.is_none() {
-                return Err("pane か direction のどちらか一方を指定する".into());
+                return Err(Reason::ExactlyOneOf("pane", "direction").to_string());
             }
             Request::Focus { pane, direction }
         }
@@ -143,7 +143,7 @@ pub(super) fn build_request(
             axis: match str_arg(args, "axis")?.as_deref() {
                 Some("x") => Axis::X,
                 Some("y") => Axis::Y,
-                _ => return Err("axis は \"x\" か \"y\" を指定する".into()),
+                _ => return Err(Reason::AxisXOrY.to_string()),
             },
             delta: f32_arg(args, "delta")?,
             share: f32_arg(args, "share")?,
@@ -240,30 +240,42 @@ pub(super) fn build_request(
                     height: required_f32(args, "height")?,
                 },
                 other => {
-                    return Err(format!(
-                        "action が不正: {other}（list | new | close | move-tab | focus | \
-                         minimize | maximize | restore | move | resize）"
-                    ))
+                    return Err(Reason::InvalidValue {
+                        key: "action",
+                        got: other.to_string(),
+                        allowed: "list | new | close | move-tab | focus | \
+                                  minimize | maximize | restore | move | resize"
+                            .to_string(),
+                    }
+                    .to_string())
                 }
             }
         }
         "tako_menu" => {
             let action = str_arg(args, "action")?.unwrap_or_else(|| "list".into());
+            let needs = |key: &'static str| {
+                Reason::ActionNeeds {
+                    action: action.clone(),
+                    key,
+                }
+                .to_string()
+            };
             match action.as_str() {
                 "list" => Request::MenuList,
                 "open" => Request::MenuOpen {
-                    menu: str_arg(args, "menu")?
-                        .ok_or_else(|| "open には menu が必要".to_string())?,
+                    menu: str_arg(args, "menu")?.ok_or_else(|| needs("menu"))?,
                 },
                 "close" => Request::MenuClose,
                 "invoke" => Request::MenuInvoke {
-                    path: str_arg(args, "path")?
-                        .ok_or_else(|| "invoke には path が必要".to_string())?,
+                    path: str_arg(args, "path")?.ok_or_else(|| needs("path"))?,
                 },
                 other => {
-                    return Err(format!(
-                        "action が不正: {other}（list | open | close | invoke）"
-                    ))
+                    return Err(Reason::InvalidValue {
+                        key: "action",
+                        got: other.to_string(),
+                        allowed: "list | open | close | invoke".to_string(),
+                    }
+                    .to_string())
                 }
             }
         }
@@ -296,9 +308,7 @@ pub(super) fn build_request(
         "tako_persist" => match u64_arg(args, "reattach")? {
             Some(pane) => {
                 if bool_arg(args, "enabled")?.is_some() {
-                    return Err(
-                        "enabled と reattach は併用できない（切替か再 attach のどちらか）".into(),
-                    );
+                    return Err(Reason::ReattachWithEnabled.to_string());
                 }
                 Request::BackendReattach { pane }
             }
@@ -332,7 +342,14 @@ pub(super) fn build_request(
                 None => None,
                 Some("code") => Some(crate::protocol::PreviewModeWire::Code),
                 Some("markdown") => Some(crate::protocol::PreviewModeWire::Markdown),
-                Some(other) => return Err(format!("mode が不正: {other}（code | markdown）")),
+                Some(other) => {
+                    return Err(Reason::InvalidValue {
+                        key: "mode",
+                        got: other.to_string(),
+                        allowed: "code | markdown".to_string(),
+                    }
+                    .to_string())
+                }
             },
             direction: direction_arg(args)?,
             focus: bool_arg(args, "focus")?,
@@ -422,7 +439,7 @@ pub(super) fn build_request(
             }
             (None, None) => {
                 if str_arg(args, "text")?.is_some() {
-                    return Err("text は command=type と組で渡す".into());
+                    return Err(Reason::TextNeedsType.to_string());
                 }
                 Request::PreviewEdit {
                     pane: Some(target_pane(args, caller)?),
@@ -472,10 +489,12 @@ pub(super) fn build_request(
                 Some("reload") => Request::PreviewRevert { pane },
                 Some("diff") => Request::PreviewDiff { pane },
                 Some(other) => {
-                    return Err(format!(
-                        "action は {} のどれか（{other:?} は無い）",
-                        crate::dispatch::PREVIEW_SAVE_ACTIONS.join(" / ")
-                    ))
+                    return Err(Reason::NotOneOf {
+                        key: "action",
+                        got: other.to_string(),
+                        allowed: crate::dispatch::PREVIEW_SAVE_ACTIONS.join(" / "),
+                    }
+                    .to_string())
                 }
             }
         }
@@ -548,7 +567,13 @@ pub(super) fn build_request(
                 "paste_move" => crate::protocol::FileOpKind::PasteMove,
                 "copy_progress" => crate::protocol::FileOpKind::CopyProgress,
                 "copy_cancel" => crate::protocol::FileOpKind::CopyCancel,
-                other => return Err(format!("op が不正: {other}")),
+                other => {
+                    return Err(Reason::InvalidValueBare {
+                        key: "op",
+                        got: other.to_string(),
+                    }
+                    .to_string())
+                }
             };
             // #1867: paths = まとめて（ツリーの複数選択と同じ 1 要求。扱える op の判定は dispatch）
             if let Some(paths) = str_vec_arg(args, "paths")? {
@@ -564,7 +589,7 @@ pub(super) fn build_request(
                 | crate::protocol::FileOpKind::CopyCancel => {
                     str_arg(args, "path")?.unwrap_or_default()
                 }
-                _ => str_arg(args, "path")?.ok_or("path（または paths）を指定する")?,
+                _ => str_arg(args, "path")?.ok_or_else(|| Reason::PathOrPaths.to_string())?,
             };
             Request::FileOp {
                 op,
@@ -678,12 +703,7 @@ pub(super) fn build_request(
                 // 正式値は GUI のタブ表示名と 1:1、旧称 tmux も後方互換で受理する（#553）
                 Some(v) => match crate::protocol::PanelViewWire::parse(v) {
                     Some(view) => Some(view),
-                    None => {
-                        return Err(format!(
-                            "view が不正: {v}（{}）",
-                            crate::protocol::PanelViewWire::values_hint()
-                        ))
-                    }
+                    None => return Err(Reason::InvalidPanelView(v.to_string()).to_string()),
                 },
             },
             filetree: bool_arg(args, "filetree")?,
@@ -717,7 +737,7 @@ pub(super) fn build_request(
                 None | Some(Value::Null) => None,
                 Some(v) => Some(
                     serde_json::from_value(v.clone())
-                        .map_err(|e| format!("limits を解釈できない: {e}"))?,
+                        .map_err(|e| Reason::CannotParse("limits", e.to_string()).to_string())?,
                 ),
             },
         },
@@ -748,9 +768,7 @@ pub(super) fn build_request(
         },
         // #1453: 走っている master を専用プロファイルへその場で寄せる
         "tako_orchestrator_adopt" => Request::OrchestratorAdopt {
-            name: str_arg(args, "name")?.ok_or_else(|| {
-                "name を指定する（プロファイル名 / プロジェクトキー）".to_string()
-            })?,
+            name: str_arg(args, "name")?.ok_or_else(|| Reason::AdoptNameMissing.to_string())?,
             pane: u64_arg(args, "pane")?.or(caller),
             caller_role: caller_role.map(str::to_string),
             caller_pid: None,
@@ -926,7 +944,13 @@ pub(super) fn build_request(
             tail: u64_arg(args, "tail")?.map(|n| n as usize),
         },
         "tako_remote_devices" => Request::RemoteDevices {
-            action: str_arg(args, "action")?.ok_or("action を指定する（list / revoke / role）")?,
+            action: str_arg(args, "action")?.ok_or_else(|| {
+                Reason::MissingHint {
+                    key: "action",
+                    hint: "list / revoke / role",
+                }
+                .to_string()
+            })?,
             device_id: str_arg(args, "device_id")?,
             role: str_arg(args, "role")?,
         },
@@ -942,7 +966,7 @@ pub(super) fn build_request(
             set: match args.get("set") {
                 None | Some(Value::Null) => None,
                 Some(Value::Object(map)) => Some(map.clone()),
-                Some(_) => return Err("set はオブジェクト（キー → 値）".into()),
+                Some(_) => return Err(Reason::SetNotObject.to_string()),
             },
         },
         // #1679 / #1680 / #1683 / #1682 / #1681 / #1686: 言語機能の 1 ツール。action ごとに型のある要求へ振り分ける
@@ -992,7 +1016,13 @@ pub(super) fn build_request(
                 pane: Some(target_pane(args, caller)?),
                 line: required_u64(args, "line")? as usize,
                 column: required_u64(args, "column")? as usize,
-                new_name: str_arg(args, "new_name")?.ok_or("rename は new_name を指定する")?,
+                new_name: str_arg(args, "new_name")?.ok_or_else(|| {
+                    Reason::ActionMustGive {
+                        action: crate::dispatch::LSP_RENAME_ACTION,
+                        key: "new_name",
+                    }
+                    .to_string()
+                })?,
                 confirm: bool_arg(args, "confirm")?.unwrap_or(false),
             },
             // #1685: 参照・階層（位置は定義ジャンプと同じ。show で右パネルにも出す）
@@ -1026,14 +1056,22 @@ pub(super) fn build_request(
                 focus: bool_arg(args, "focus")?,
             },
             other => {
-                return Err(format!(
-                    "action が不正: {other}（{}）",
-                    crate::dispatch::LSP_FEATURE_ACTIONS.join(" / ")
-                ))
+                return Err(Reason::InvalidValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: crate::dispatch::LSP_FEATURE_ACTIONS.join(" / "),
+                }
+                .to_string())
             }
         },
         "tako_remote_setup" => Request::RemoteSetup {
-            action: str_arg(args, "action")?.ok_or("action を指定する（check / run）")?,
+            action: str_arg(args, "action")?.ok_or_else(|| {
+                Reason::MissingHint {
+                    key: "action",
+                    hint: "check / run",
+                }
+                .to_string()
+            })?,
             answers: args.get("answers").cloned(),
         },
         "tako_remote_scrollback" => Request::RemoteScrollback {
@@ -1138,10 +1176,7 @@ pub(super) fn build_request(
             let action = str_arg(args, "action")?;
             if let Some(a) = &action {
                 if !crate::claude_mod::MCP_ACTIONS.contains(&a.as_str()) {
-                    return Err(format!(
-                        "action は {} のどれか（report は MCP に無い）",
-                        crate::claude_mod::MCP_ACTIONS.join(" / ")
-                    ));
+                    return Err(Reason::ModMcpAction.to_string());
                 }
             }
             // #1960: action=ui の引数（op / key / value / kind / id / label / hotkey / to）は
@@ -1153,7 +1188,7 @@ pub(super) fn build_request(
                     serde_json::from_value::<tako_core::claude_mod_ui::UiRequest>(Value::Object(
                         fields,
                     ))
-                    .map_err(|e| format!("action=ui の引数が読めない: {e}"))?,
+                    .map_err(|e| Reason::ModUiArgs(e.to_string()).to_string())?,
                 )
             } else {
                 None
@@ -1224,11 +1259,11 @@ pub(super) fn build_request(
                         .map(|(name, on)| {
                             on.as_bool()
                                 .map(|on| (name.clone(), on))
-                                .ok_or_else(|| format!("rules.{name} は true / false で指定する"))
+                                .ok_or_else(|| Reason::RuleNotBool(name.clone()).to_string())
                         })
                         .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?,
                 ),
-                Some(_) => return Err("rules は {\"規則名\": true / false} で指定する".into()),
+                Some(_) => return Err(Reason::RulesShape.to_string()),
             };
             Request::PasteGuard {
                 enabled: bool_arg(args, "enabled")?,
@@ -1249,7 +1284,7 @@ pub(super) fn build_request(
             .into_iter()
             .find(|k| args.get(*k).is_some())
             {
-                return Err(format!("{key} は action=paste_guard のときだけ使える"));
+                return Err(Reason::PasteGuardOnly(key.to_string()).to_string());
             }
             Request::Settings {
                 action: str_arg(args, "action")?.map(|s| s.to_string()),
@@ -1363,10 +1398,11 @@ pub(super) fn build_request(
             target: match str_arg(args, "target")? {
                 Some(t) => Some(
                     tako_core::remote_open::RemoteOpenTarget::parse(&t).ok_or_else(|| {
-                        format!(
-                            "target は {} のいずれか",
-                            tako_core::remote_open::RemoteOpenTarget::values_hint()
-                        )
+                        Reason::OneOfListed {
+                            key: "target",
+                            allowed: tako_core::remote_open::RemoteOpenTarget::values_hint(),
+                        }
+                        .to_string()
                     })?,
                 ),
                 None => None,
@@ -1476,8 +1512,13 @@ pub(super) fn build_request(
         },
         "tako_task_gate" => {
             let criteria_val = args.get("criteria").ok_or_else(|| missing("criteria"))?;
-            let criteria_json = serde_json::to_string(criteria_val)
-                .map_err(|e| format!("criteria の JSON 変換に失敗: {e}"))?;
+            let criteria_json = serde_json::to_string(criteria_val).map_err(|e| {
+                Reason::JsonEncodeFailed {
+                    key: Some("criteria"),
+                    error: e.to_string(),
+                }
+                .to_string()
+            })?;
             Request::TaskGate {
                 action: "set".into(),
                 task_id: str_arg(args, "task_id")?,
@@ -1571,8 +1612,7 @@ pub(super) fn build_request(
 /// 整形の範囲（#1683）。`line` / `column` / `end_line` / `end_column` の 4 つそろえて範囲、
 /// 1 つも無ければ文書全体。**一部だけ**は黙って全体へ倒さず拒否する（範囲のつもりで全体が変わる）
 fn lsp_format_range(args: &Value) -> Result<Option<crate::protocol::LineColRange>, String> {
-    let keys = ["line", "column", "end_line", "end_column"];
-    let values = keys
+    let values = crate::dispatch::LSP_FORMAT_RANGE_KEYS
         .iter()
         .map(|key| u64_arg(args, key))
         .collect::<Result<Vec<_>, _>>()?;
@@ -1584,10 +1624,7 @@ fn lsp_format_range(args: &Value) -> Result<Option<crate::protocol::LineColRange
             end_col: *ec as usize,
         })),
         [None, None, None, None] => Ok(None),
-        _ => Err(format!(
-            "範囲の整形は {} の 4 つをそろえて指定する（省略で文書全体）",
-            keys.join(" / ")
-        )),
+        _ => Err(Reason::FormatRangeIncomplete.to_string()),
     }
 }
 

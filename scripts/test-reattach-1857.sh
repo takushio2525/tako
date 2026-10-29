@@ -348,7 +348,8 @@ scenario_give_up_and_manual() {
   wait_for 100 status_is "$p" gave_up || { fail "2 度目の上限で止まらない"; return; }
   out="$(mcp_call tako_persist "{\"reattach\":${p},\"enabled\":true}" 2>&1)"
   case "$out" in
-    *"併用できない"*) pass "MCP: reattach と enabled の併用は断る" ;;
+    # 断りは表示言語に従う（#2365）ので日英どちらの形とも突き合わせる
+    *"併用できない"* | *"cannot be used together"*) pass "MCP: reattach と enabled の併用は断る" ;;
     *) fail "MCP: reattach と enabled の併用を断らない（${out}）" ;;
   esac
   before="$(last_tick "$p")"

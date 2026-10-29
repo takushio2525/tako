@@ -1274,7 +1274,7 @@ struct LspMenuArgs {
 fn parse_line_col_range(text: &str) -> Result<tako_control::protocol::LineColRange, String> {
     let (start, end) = text
         .split_once('-')
-        .ok_or_else(|| format!("範囲は 行:桁-行:桁 で指定する（`-` が無い: {text}）"))?;
+        .ok_or_else(|| front_err(tako_control::Reason::RangeShape(text.to_string())))?;
     let (start_line, start_col) = parse_position(start)?;
     let (end_line, end_col) = parse_position(end)?;
     Ok(tako_control::protocol::LineColRange {
@@ -3812,7 +3812,7 @@ fn paste_guard_check_text(arg: Option<&str>) -> Result<String, String> {
             std::io::stdin()
                 .take(8 << 20)
                 .read_to_string(&mut buf)
-                .map_err(|e| format!("標準入力の読み取りに失敗: {e}"))?;
+                .map_err(|e| front_err(tako_control::Reason::StdinReadFailed(e.to_string())))?;
             Ok(buf)
         }
     }
@@ -9293,8 +9293,9 @@ fn read_mod_report() -> Result<Value, String> {
     std::io::stdin()
         .take(1 << 20)
         .read_to_string(&mut input)
-        .map_err(|e| format!("報告を stdin から読めない: {e}"))?;
-    serde_json::from_str(&input).map_err(|e| format!("報告の JSON を読めない: {e}"))
+        .map_err(|e| front_err(tako_control::Reason::ModReportUnreadable(e.to_string())))?;
+    serde_json::from_str(&input)
+        .map_err(|e| front_err(tako_control::Reason::ModReportNotJson(e.to_string())))
 }
 
 /// `tako mod ui …`（#1960。ローカル処理 = GUI 不要）。引数の読み方も操作も
@@ -9812,12 +9813,12 @@ fn parse_position(text: &str) -> Result<(usize, usize), String> {
     let line: usize = line
         .trim()
         .parse()
-        .map_err(|_| format!("位置は 行:桁 で指定する（行が数値でない: {text}）"))?;
+        .map_err(|_| front_err(tako_control::Reason::PositionLine(text.to_string())))?;
     let col: usize = match col {
         Some(col) => col
             .trim()
             .parse()
-            .map_err(|_| format!("位置は 行:桁 で指定する（桁が数値でない: {text}）"))?,
+            .map_err(|_| front_err(tako_control::Reason::PositionColumn(text.to_string())))?,
         None => 0,
     };
     Ok((line, col))
@@ -9910,11 +9911,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 (None, Some(d), None, None) => (Axis::Y, Some(d), None),
                 (None, None, Some(s), None) => (Axis::X, None, Some(s)),
                 (None, None, None, Some(s)) => (Axis::Y, None, Some(s)),
-                _ => {
-                    return Err(
-                        "--dx / --dy / --share-x / --share-y のどれか 1 つを指定する".into(),
-                    )
-                }
+                _ => return Err(front_err(tako_control::Reason::ResizeOneOf)),
             };
             Request::Resize {
                 pane: target_pane(args.pane)?,
@@ -10030,9 +10027,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             if args.text.is_some()
                 && !matches!(action, Some("check" | "allow" | "unallow" | "rule"))
             {
-                return Err(
-                    "文字を渡せるのは `tako paste-guard check|allow|unallow|rule` だけ".into(),
-                );
+                return Err(front_err(tako_control::Reason::PasteGuardTextUsage));
             }
             if args.value.is_some() != (action == Some("rule")) {
                 return Err(front_err(tako_control::Reason::PasteGuardRuleUsage));
@@ -10074,11 +10069,11 @@ fn build_request(command: &Command) -> Result<Request, String> {
                     _ => None,
                 },
                 unallow: match action {
-                    Some("unallow") => {
-                        Some(args.text.clone().ok_or(
-                            "外す許可の ID（`tako paste-guard` の allow[].id）か all を渡す",
-                        )?)
-                    }
+                    Some("unallow") => Some(
+                        args.text
+                            .clone()
+                            .ok_or_else(|| front_err(tako_control::Reason::PasteGuardUnallowId))?,
+                    ),
                     _ => None,
                 },
                 rules,
@@ -10125,8 +10120,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
             let text = match args.text.as_deref() {
                 Some("-") => {
                     let mut buf = String::new();
-                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
-                        .map_err(|e| format!("標準入力の読み取りに失敗: {e}"))?;
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).map_err(
+                        |e| front_err(tako_control::Reason::StdinReadFailed(e.to_string())),
+                    )?;
                     Some(buf)
                 }
                 other => other.map(str::to_string),
@@ -10210,10 +10206,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
             } => {
                 // 綴りは実行前に弾く（サーバーまで持って行かない）。表は tako-core の 1 か所
                 if tako_core::text_edit::CursorMovement::from_name(movement).is_none() {
-                    return Err(format!(
-                        "移動の単位は {} のどれか（{movement:?} は無い）",
-                        tako_core::text_edit::CursorMovement::names().join(" / ")
-                    ));
+                    return Err(front_err(tako_control::Reason::BadMovement(
+                        movement.clone(),
+                    )));
                 }
                 Request::PreviewMove {
                     pane: target_pane(*pane)?,
@@ -10228,10 +10223,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 pane,
             } => {
                 if tako_core::text_edit::DeleteMotion::from_name(motion).is_none() {
-                    return Err(format!(
-                        "削除の単位は {} のどれか（{motion:?} は無い）",
-                        tako_core::text_edit::DeleteMotion::names().join(" / ")
-                    ));
+                    return Err(front_err(tako_control::Reason::BadMotion(motion.clone())));
                 }
                 Request::PreviewDelete {
                     pane: target_pane(*pane)?,
@@ -10289,10 +10281,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 // （`line-<操作>`）へは editor_keys が頭を付ける（綴りを CLI で組まない）
                 use tako_core::text_edit::LineOperation;
                 let Some(op) = LineOperation::from_name(operation) else {
-                    return Err(format!(
-                        "行の操作は {} のどれか（{operation:?} は無い）",
-                        LineOperation::names().join(" / ")
-                    ));
+                    return Err(front_err(tako_control::Reason::BadLineOp(
+                        operation.clone(),
+                    )));
                 };
                 Request::PreviewEditCommand {
                     pane: target_pane(*pane)?,
@@ -10476,10 +10467,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             dry_run: false,
         },
         Command::Mod(args) if args.dry_run => {
-            return Err(
-                "--dry-run は install / uninstall にだけ付ける（tako mod install --dry-run）"
-                    .into(),
-            )
+            return Err(front_err(tako_control::Reason::ModDryRunOnly))
         }
         // #1881: `tako mod band on|off` は dispatch の action `band-on` / `band-off`（MCP と同じ語）
         Command::Mod(args) if args.action.as_deref() == Some("band") => Request::Mod {
@@ -10487,11 +10475,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 match args.rest.iter().map(String::as_str).collect::<Vec<_>>()[..] {
                     ["on"] => "band-on".into(),
                     ["off"] => "band-off".into(),
-                    _ => {
-                        return Err(
-                            "band には on か off を付ける（tako mod band off で帯を隠す）".into(),
-                        )
-                    }
+                    _ => return Err(front_err(tako_control::Reason::ModBandOnOff)),
                 },
             ),
             report: None,
@@ -10505,11 +10489,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 || args.hotkey.is_some()
                 || args.id.is_some() =>
         {
-            return Err(
-                "on / off は band の後ろにだけ付ける（帯の切替は tako mod band on|off。\
-                 画面の UI 設定は tako mod ui）"
-                    .into(),
-            )
+            return Err(front_err(tako_control::Reason::ModOnOffAfterBand))
         }
         Command::Mod(args) if matches!(args.action.as_deref(), Some("install" | "uninstall")) => {
             unreachable!("mod install / uninstall は run() を通らない（ローカル処理）")
@@ -10524,9 +10504,10 @@ fn build_request(command: &Command) -> Result<Request, String> {
         // #1857: 再 attach は切替ではなくペイン 1 枚の操作（MCP の `reattach` と同じ要求）
         Command::Persist(args) if args.state.as_deref() == Some("reattach") => {
             Request::BackendReattach {
-                pane: args.pane.or_else(caller_pane).ok_or_else(|| {
-                    "reattach には --pane N（再接続するペインの ID）が要る".to_string()
-                })?,
+                pane: args
+                    .pane
+                    .or_else(caller_pane)
+                    .ok_or_else(|| front_err(tako_control::Reason::ReattachNeedsPane))?,
             }
         }
         Command::Persist(args) => Request::Persist {
@@ -10879,10 +10860,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         },
         Command::Foreground(args) => {
             if args.pane.is_none() && args.tab.is_none() {
-                return Err(
-                    "ペイン ID か --tab のどちらかを指定する（tako backgrounded で確認）"
-                        .to_string(),
-                );
+                return Err(front_err(tako_control::Reason::ForegroundTarget));
             }
             Request::Foreground {
                 pane: args.pane,
@@ -11002,9 +10980,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         // #1867: 移す元が複数ならまとめた要求（ツリーの複数選択の D&D と同じ 1 要求）
         Command::File(FileCommand::Move { paths }) => {
             let Some((dest, sources)) = paths.split_last().filter(|(_, s)| !s.is_empty()) else {
-                return Err(
-                    "移すものと移動先のフォルダを指定する（例: tako file move a.txt dst）".into(),
-                );
+                return Err(front_err(tako_control::Reason::FileMoveArgs));
             };
             file_op_for(
                 tako_control::protocol::FileOpKind::Move,
@@ -11017,7 +10993,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::File(FileCommand::Copy { paths }) => {
             let mut requests = file_copy_requests(paths)?;
             if requests.len() != 1 {
-                return Err("コピー元が複数のときは 1 件ずつ送る（file_copy_cli）".into());
+                return Err(front_err(tako_control::Reason::CopyOneAtATime));
             }
             requests.remove(0)
         }
@@ -12027,7 +12003,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             let path = std::path::Path::new(&args.path);
             let path = if path.is_relative() {
                 std::env::current_dir()
-                    .map_err(|e| format!("作業ディレクトリを読めない: {e}"))?
+                    .map_err(|e| front_err(tako_control::Reason::CwdUnreadable(e.to_string())))?
                     .join(path)
             } else {
                 path.to_path_buf()
@@ -12081,7 +12057,7 @@ fn run_config_env(
     for kv in set {
         let (k, v) = kv
             .split_once('=')
-            .ok_or_else(|| format!("--env は K=V の形で指定する（指定: {kv:?}）"))?;
+            .ok_or_else(|| front_err(tako_control::Reason::EnvShape(kv.clone())))?;
         map.insert(k.to_string(), Some(v.to_string()));
     }
     for k in unset {
@@ -12401,7 +12377,12 @@ fn build_criteria_json(
             "kind": { "type": "custom", "description": desc },
         }));
     }
-    serde_json::to_string(&criteria).map_err(|e| format!("JSON 変換に失敗: {e}"))
+    serde_json::to_string(&criteria).map_err(|e| {
+        front_err(tako_control::Reason::JsonEncodeFailed {
+            key: None,
+            error: e.to_string(),
+        })
+    })
 }
 
 fn parse_direction(s: &str) -> Result<Direction, String> {
@@ -12421,9 +12402,7 @@ fn parse_direction(s: &str) -> Result<Direction, String> {
 /// どれも CLI の cwd 基準で絶対化する（GUI の cwd で読ませない = move と同じ）
 fn file_copy_requests(paths: &[String]) -> Result<Vec<Request>, String> {
     let Some((dest, sources)) = paths.split_last().filter(|(_, s)| !s.is_empty()) else {
-        return Err(
-            "コピー元と貼り付け先のフォルダを指定する（例: tako file copy a.txt dst）".into(),
-        );
+        return Err(front_err(tako_control::Reason::FileCopyArgs));
     };
     let dest = resolve_cli_path(dest);
     if !tako_core::file_copy::legacy_1895() {
@@ -12459,10 +12438,10 @@ fn file_copy_cli(paths: &[String]) -> Result<(), String> {
         let failed = result["failed"].as_array().map_or(0, Vec::len);
         if many && failed > 0 {
             let done = result["done"].as_array().map_or(0, Vec::len);
-            return Err(format!(
-                "{} 件中 {failed} 件をコピーできなかった",
-                done + failed
-            ));
+            return Err(front_err(tako_control::Reason::CopyPartlyFailed {
+                total: done + failed,
+                failed,
+            }));
         }
         return Ok(());
     }
@@ -12477,7 +12456,10 @@ fn file_copy_cli(paths: &[String]) -> Result<(), String> {
         }
     }
     if failed > 0 {
-        return Err(format!("{total} 件中 {failed} 件をコピーできなかった"));
+        return Err(front_err(tako_control::Reason::CopyPartlyFailed {
+            total,
+            failed,
+        }));
     }
     Ok(())
 }
@@ -12515,7 +12497,10 @@ fn file_many_cli(command: &Command) -> Result<(), String> {
     let failed = result["failed"].as_array().map_or(0, Vec::len);
     if many && failed > 0 {
         let done = result["done"].as_array().map_or(0, Vec::len);
-        return Err(format!("{} 件中 {failed} 件をできなかった", done + failed));
+        return Err(front_err(tako_control::Reason::ManyPartlyFailed {
+            total: done + failed,
+            failed,
+        }));
     }
     Ok(())
 }
