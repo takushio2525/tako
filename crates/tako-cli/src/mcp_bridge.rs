@@ -36,7 +36,7 @@ use serde_json::Value;
 use tako_control::mcp::ParamsTable;
 use tako_control::protocol::Request;
 
-use crate::ipc::{caller_pane, resolve_caller_pane_via_app, send_request_via, OUTSIDE_TAKO};
+use crate::ipc::{caller_pane, outside_tako, resolve_caller_pane_via_app, send_request_via};
 
 /// カタログ係として起こされた印（env。値は問わない）
 pub const CATALOG_HELPER_ENV: &str = "TAKO_MCP_CATALOG_HELPER";
@@ -273,7 +273,7 @@ fn serve_until_end(catalog: Catalog) -> Result<(), Stop> {
                     if connected {
                         send_request_via(request, Some("mcp"))
                     } else {
-                        Err(OUTSIDE_TAKO.into())
+                        Err(outside_tako())
                     }
                 };
                 let mut session = tako_control::mcp::McpSession {

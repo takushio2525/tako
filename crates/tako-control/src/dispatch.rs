@@ -542,6 +542,83 @@ pub enum Reason {
     PositionColumn(String),
     /// ``範囲は 行:桁-行:桁 で指定する（`-` が無い: <text>）``（`tako lsp format --range`）
     RangeShape(String),
+    // ---- #2365 の続き: CLI / MCP の stdio ブリッジが GUI へ繋ぐ口（`tako-cli` の `ipc.rs`）の断り。
+    // 表示言語は呼び手が [`crate::settings::client_lang`] で決める（CLI は表示言語のグローバルを持たない） ----
+    /// tako の外で実行された（接続情報が環境変数にも発見ファイルにも無い。FR-2.2.8）
+    OutsideTako,
+    /// `tako アプリへ接続できない（<socket>: <error>）`（`error` は OS の文）
+    CannotConnect {
+        socket: String,
+        error: String,
+    },
+    /// `接続の複製に失敗: <error>`
+    ConnectionCloneFailed(String),
+    /// `応答を待つスレッドが途中で終わった`（Windows の往復）
+    ReplyThreadEnded,
+    /// `送信の構築に失敗: <error>`（`error` は serde の文）
+    RequestEncodeFailed(String),
+    /// `送信に失敗: <error>`
+    SendFailed(String),
+    /// `応答の受信に失敗: <error>`
+    ReceiveFailed(String),
+    /// `tako アプリから応答が返らなかった`
+    NoReply,
+    /// `応答を解釈できない: <error>`（GUI からの応答の 1 行。`error` は serde の文）
+    ReplyUnreadable(String),
+    /// `tako アプリが <秒> 秒応答しない（…）`（[`crate::protocol::reply_timeout_message`]。#2123）
+    ReplyTimeout(u64),
+    /// `tako master` / `tako solo` が起動先のペインを確保できない（#567）。`cause` は接続の断り、
+    /// `cmd_hint` は案内する最簡形のコマンド（#322）、`stale_pane` はこのシェルの古い `TAKO_PANE_ID`
+    LaunchPaneUnavailable {
+        cause: String,
+        cmd_hint: String,
+        stale_pane: Option<u64>,
+    },
+    // ---- #2365 の続き: dispatch が呼ぶ置き場（acceptance_gates / task_checkpoints / user_tasks）の断り ----
+    /// `<file> の読み取りに失敗: <error>`
+    StoreUnreadable {
+        file: &'static str,
+        error: String,
+    },
+    /// `<file> のパースに失敗: <reason>`（`reason` は種類と行・列だけ = 中身を引用しない。#2230。
+    /// 理由も同じ表示言語で引く = 1 つの断りに日英が混ざらない）
+    StoreParseFailed {
+        file: &'static str,
+        reason: tako_core::load_issue::YamlReason,
+    },
+    /// `<file> の置き場を作れない: <error>`
+    StoreDirFailed {
+        file: &'static str,
+        error: String,
+    },
+    /// `YAML のシリアライズに失敗: <error>`
+    YamlEncodeFailed(String),
+    /// `JSON シリアライズに失敗: <error>`
+    JsonSerializeFailed(String),
+    /// `<key> の JSON パースに失敗: <error>`（受け入れゲートの criteria / results の引数。`error` は serde の文）
+    JsonArgUnreadable(&'static str, String),
+    /// `<key> に id が必要`（受け入れゲートの criteria / results の 1 件）
+    ItemNeedsId(&'static str),
+    /// `criterion kind のパースに失敗 (id=<id>): <error>`（中身は (id, serde の文)）
+    CriterionKindUnreadable(String, String),
+    /// `不明な <key>: <got>`（引用符も候補も添えない旧形。ゲートの status・チェックポイントの phase）
+    UnknownBare {
+        key: &'static str,
+        got: String,
+    },
+    /// `不明な <key>: <got>（<allowed> のいずれか）`（引用符を付けない旧形。ユーザータスクの語彙）。
+    /// `allowed` は候補を ` / ` で並べたもの
+    UnknownPlain {
+        key: &'static str,
+        got: String,
+        allowed: String,
+    },
+    /// `criteria を 1 つ以上指定する`
+    CriteriaEmpty,
+    /// `ゲートが見つからない: <task_id>`（英語にも ` not found` を含める）
+    GateNotFound(String),
+    /// `直前に更新したタスクが無い`（返答を積んだ直後に読み直せない = 置き場の内部の不整合）
+    TaskGoneAfterRespond,
 }
 
 /// 整形の範囲を表す 4 つの鍵（#1683。MCP `tako_lsp` の format の range と
@@ -1317,6 +1394,137 @@ impl Reason {
             (Self::RangeShape(text), En) => {
                 format!("pass the range as line:column-line:column (`-` is missing: {text})")
             }
+            (Self::OutsideTako, Ja) => "tako アプリへの接続情報が無い（TAKO_SOCKET / TAKO_TOKEN 未設定・\
+                 接続情報ファイルも無し）。tako アプリを起動するか、tako 内のターミナルで実行してください"
+                .to_string(),
+            (Self::OutsideTako, En) => "no connection info for the tako app (TAKO_SOCKET / \
+                 TAKO_TOKEN are not set and there is no connection info file). Start the tako app, \
+                 or run this in a terminal inside tako"
+                .to_string(),
+            (Self::CannotConnect { socket, error }, Ja) => {
+                format!("tako アプリへ接続できない（{socket}: {error}）")
+            }
+            (Self::CannotConnect { socket, error }, En) => {
+                format!("cannot connect to the tako app ({socket}: {error})")
+            }
+            (Self::ConnectionCloneFailed(error), Ja) => format!("接続の複製に失敗: {error}"),
+            (Self::ConnectionCloneFailed(error), En) => {
+                format!("failed to duplicate the connection: {error}")
+            }
+            (Self::ReplyThreadEnded, Ja) => "応答を待つスレッドが途中で終わった".to_string(),
+            (Self::ReplyThreadEnded, En) => "the thread waiting for the reply ended early".to_string(),
+            (Self::RequestEncodeFailed(error), Ja) => format!("送信の構築に失敗: {error}"),
+            (Self::RequestEncodeFailed(error), En) => format!("failed to build the request: {error}"),
+            (Self::SendFailed(error), Ja) => format!("送信に失敗: {error}"),
+            (Self::SendFailed(error), En) => format!("failed to send the request: {error}"),
+            (Self::ReceiveFailed(error), Ja) => format!("応答の受信に失敗: {error}"),
+            (Self::ReceiveFailed(error), En) => format!("failed to receive the reply: {error}"),
+            (Self::NoReply, Ja) => "tako アプリから応答が返らなかった".to_string(),
+            (Self::NoReply, En) => "the tako app sent no reply".to_string(),
+            (Self::ReplyUnreadable(error), Ja) => format!("応答を解釈できない: {error}"),
+            (Self::ReplyUnreadable(error), En) => format!("cannot parse the reply: {error}"),
+            (Self::ReplyTimeout(secs), Ja) => format!(
+                "tako アプリが {secs} 秒応答しない（接続は受けたが返事が無い = GUI が固まっている可能性。\
+                 要求は届いているので、GUI が戻ると後から処理されることがある。\
+                 待つ上限は env {}（秒・0 で上限なし））",
+                crate::protocol::REPLY_TIMEOUT_ENV
+            ),
+            (Self::ReplyTimeout(secs), En) => format!(
+                "the tako app has not replied for {secs} s (it accepted the connection but sent \
+                 no reply; the GUI may be frozen. The request has arrived, so it may still be \
+                 processed when the GUI recovers. The wait limit is env {} (seconds; 0 = no limit))",
+                crate::protocol::REPLY_TIMEOUT_ENV
+            ),
+            (
+                Self::LaunchPaneUnavailable {
+                    cause,
+                    cmd_hint,
+                    stale_pane,
+                },
+                Ja,
+            ) => {
+                let mut message = format!(
+                    "起動先ペインを確保できない: {cause}\n\
+                     復旧: tako アプリを起動し、その中のターミナルで `{cmd_hint}` を実行してください"
+                );
+                if let Some(old) = stale_pane {
+                    message.push_str(&format!(
+                        "\n      このシェルの TAKO_PANE_ID={old} は古い可能性があります: \
+                         `unset TAKO_PANE_ID` してから再実行してください"
+                    ));
+                }
+                message
+            }
+            (
+                Self::LaunchPaneUnavailable {
+                    cause,
+                    cmd_hint,
+                    stale_pane,
+                },
+                En,
+            ) => {
+                let mut message = format!(
+                    "cannot secure a pane to launch in: {cause}\n\
+                     To recover: start the tako app and run `{cmd_hint}` in a terminal inside it"
+                );
+                if let Some(old) = stale_pane {
+                    message.push_str(&format!(
+                        "\n      TAKO_PANE_ID={old} in this shell may be stale: \
+                         run `unset TAKO_PANE_ID` and try again"
+                    ));
+                }
+                message
+            }
+            (Self::StoreUnreadable { file, error }, Ja) => {
+                format!("{file} の読み取りに失敗: {error}")
+            }
+            (Self::StoreUnreadable { file, error }, En) => format!("failed to read {file}: {error}"),
+            (Self::StoreParseFailed { file, reason }, Ja) => {
+                format!("{file} のパースに失敗: {}", reason.text_in(lang))
+            }
+            (Self::StoreParseFailed { file, reason }, En) => {
+                format!("failed to parse {file}: {}", reason.text_in(lang))
+            }
+            (Self::StoreDirFailed { file, error }, Ja) => {
+                format!("{file} の置き場を作れない: {error}")
+            }
+            (Self::StoreDirFailed { file, error }, En) => {
+                format!("cannot create the folder for {file}: {error}")
+            }
+            (Self::YamlEncodeFailed(error), Ja) => format!("YAML のシリアライズに失敗: {error}"),
+            (Self::YamlEncodeFailed(error), En) => format!("failed to serialize as YAML: {error}"),
+            (Self::JsonSerializeFailed(error), Ja) => format!("JSON シリアライズに失敗: {error}"),
+            (Self::JsonSerializeFailed(error), En) => {
+                format!("failed to serialize as JSON: {error}")
+            }
+            (Self::JsonArgUnreadable(key, error), Ja) => {
+                format!("{key} の JSON パースに失敗: {error}")
+            }
+            (Self::JsonArgUnreadable(key, error), En) => {
+                format!("failed to parse {key} as JSON: {error}")
+            }
+            (Self::ItemNeedsId(key), Ja) => format!("{key} に id が必要"),
+            (Self::ItemNeedsId(key), En) => format!("each {key} needs an id"),
+            (Self::CriterionKindUnreadable(id, error), Ja) => {
+                format!("criterion kind のパースに失敗 (id={id}): {error}")
+            }
+            (Self::CriterionKindUnreadable(id, error), En) => {
+                format!("failed to parse the criterion kind (id={id}): {error}")
+            }
+            (Self::UnknownBare { key, got }, Ja) => format!("不明な {key}: {got}"),
+            (Self::UnknownBare { key, got }, En) => format!("unknown {key}: {got}"),
+            (Self::UnknownPlain { key, got, allowed }, Ja) => {
+                format!("不明な {key}: {got}（{allowed} のいずれか）")
+            }
+            (Self::UnknownPlain { key, got, allowed }, En) => {
+                format!("unknown {key}: {got} (one of {allowed})")
+            }
+            (Self::CriteriaEmpty, Ja) => "criteria を 1 つ以上指定する".to_string(),
+            (Self::CriteriaEmpty, En) => "pass at least one criterion".to_string(),
+            (Self::GateNotFound(task_id), Ja) => format!("ゲートが見つからない: {task_id}"),
+            (Self::GateNotFound(task_id), En) => format!("acceptance gate not found: {task_id}"),
+            (Self::TaskGoneAfterRespond, Ja) => "直前に更新したタスクが無い".to_string(),
+            (Self::TaskGoneAfterRespond, En) => "the task updated just now is missing".to_string(),
         }
     }
 
@@ -50970,6 +51178,11 @@ mod tests {
 
     // --- #2031: 一覧の 2 段（右パネルの 2 秒ごとの一覧更新を UI スレッドで読まない） ---
 
+    /// 置き場のパースの失敗の断りか（表示言語で文が変わるので日英どちらの形とも突き合わせる。#2365）
+    fn says_parse_failed(message: &str) -> bool {
+        message.contains("のパースに失敗") || message.contains("failed to parse ")
+    }
+
     fn t2031_list_request(all: Option<bool>) -> Request {
         Request::UserTask {
             action: "list".into(),
@@ -51073,7 +51286,7 @@ mod tests {
         assert!(
             broken
                 .as_ref()
-                .is_err_and(|e| e.to_string().contains("パースに失敗")),
+                .is_err_and(|e| says_parse_failed(&e.to_string())),
             "壊れた置き場を前回の正本でごまかした / 0 件へ丸めた"
         );
         std::fs::remove_file(&path).unwrap();
@@ -51235,7 +51448,7 @@ mod tests {
             Some(Ok(job)) => job,
             _ => panic!("準備が置き場を読んだ（壊れた置き場で準備が失敗した）"),
         };
-        assert!(t2052_drive(&mut host, job).is_err_and(|e| e.to_string().contains("パースに失敗")));
+        assert!(t2052_drive(&mut host, job).is_err_and(|e| says_parse_failed(&e.to_string())));
         // 取得条件の誤りは準備（UI スレッド）で即座に返す（置き場に触らない）
         let mut bad = t2052_request("list", None);
         if let Request::UserTask { status, .. } = &mut bad {
@@ -51532,7 +51745,7 @@ mod tests {
         std::fs::write(&path, "tasks: [ {{{ 壊れた").unwrap();
         let job = t2086_prepare(&mut host, &t2086_req(t1479_params("show", Some(&id))));
         assert!(t2086_settle(&mut host, job.run_staged())
-            .is_err_and(|e| e.to_string().contains("パースに失敗")));
+            .is_err_and(|e| says_parse_failed(&e.to_string())));
     }
 
     /// 起票: 起票元の材料（呼び出し元ペインの role・spawn 元）は準備（UI）で写し、解決と書き込みは
@@ -51588,7 +51801,7 @@ mod tests {
         let job = t2086_prepare(&mut host, &t2086_req(t1466_params(None, worker)));
         assert!(matches!(
             job.run_staged(),
-            OffloadOutcome::Reply(Err(DispatchError::Operation(e))) if e.contains("パースに失敗")
+            OffloadOutcome::Reply(Err(DispatchError::Operation(e))) if says_parse_failed(&e)
         ));
         assert_eq!(
             host.user_tasks_notified.len(),
@@ -51698,7 +51911,7 @@ mod tests {
         );
         assert!(matches!(
             missing.run_staged(),
-            OffloadOutcome::Reply(Err(DispatchError::Operation(e))) if e.contains("見つからない")
+            OffloadOutcome::Reply(Err(DispatchError::Operation(e))) if DispatchError::says_not_found(&e)
         ));
         drop(dropped);
         assert_eq!(

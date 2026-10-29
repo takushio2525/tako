@@ -19,8 +19,13 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 use tako_core::user_task::{
     unix_now, CopyText, Decision, Delivery, DeliveryState, NewTask, TaskFilter, TaskKind,
-    TaskOrigin, TaskPatch, TaskStatus, TaskStore, UserTask, Via,
+    TaskOrigin, TaskPatch, TaskRefusal, TaskStatus, TaskStore, UserTask, Via,
 };
+
+use crate::Reason;
+
+/// 置き場のファイル名（断りの文に載せる）
+const FILE: &str = "user-tasks.yaml";
 
 /// ユーザータスクの置き場。`TAKO_USER_TASKS_FILE` で上書きできる（隔離検証用。
 /// `task_checkpoints` の `TAKO_TASK_CHECKPOINTS_FILE` と同じ作法）
@@ -44,22 +49,32 @@ pub fn load_from(path: &Path) -> Result<TaskStore, String> {
     if let Some(delay) = read_delay_inject() {
         std::thread::sleep(delay);
     }
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("user-tasks.yaml の読み取りに失敗: {e}"))?;
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        Reason::StoreUnreadable {
+            file: FILE,
+            error: e.to_string(),
+        }
+        .to_string()
+    })?;
     if content.trim().is_empty() {
         return Ok(TaskStore::default());
     }
     serde_yaml::from_str(&content).map_err(|e| {
-        format!(
-            "user-tasks.yaml のパースに失敗: {}",
-            tako_core::load_issue::yaml_error_reason(&e, &content)
-        )
+        Reason::StoreParseFailed {
+            file: FILE,
+            reason: tako_core::load_issue::YamlReason::of(&e, &content),
+        }
+        .to_string()
     })
 }
 
 pub fn load() -> Result<TaskStore, String> {
-    let path = store_path().ok_or("データディレクトリを解決できない")?;
-    load_from(&path)
+    load_from(&store_path_or_refuse()?)
+}
+
+/// [`store_path`] が決まらなければ断る（データディレクトリを解決できない）
+fn store_path_or_refuse() -> Result<PathBuf, String> {
+    store_path().ok_or_else(|| Reason::DataDirUnresolved.to_string())
 }
 
 /// 置き場の版（#2031）。前回と同じなら中身も同じとみなし、読み直さない。
@@ -107,21 +122,25 @@ fn read_delay_inject() -> Option<std::time::Duration> {
 /// **同時に 2 プロセスが add しても取りこぼさない**のはこの flock による
 pub fn mutate_at<R>(path: &Path, f: impl FnOnce(&mut TaskStore) -> R) -> Result<R, String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("user-tasks.yaml の置き場を作れない: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| {
+            Reason::StoreDirFailed {
+                file: FILE,
+                error: e.to_string(),
+            }
+            .to_string()
+        })?;
     }
     let _lock = crate::config_io::lock_exclusive(path)?;
     let mut store = load_from(path)?;
     let result = f(&mut store);
-    let content =
-        serde_yaml::to_string(&store).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
+    let content = serde_yaml::to_string(&store)
+        .map_err(|e| Reason::YamlEncodeFailed(e.to_string()).to_string())?;
     crate::config_io::atomic_write_with_backup(path, &content)?;
     Ok(result)
 }
 
 pub fn mutate<R>(f: impl FnOnce(&mut TaskStore) -> R) -> Result<R, String> {
-    let path = store_path().ok_or("データディレクトリを解決できない")?;
-    mutate_at(&path, f)
+    mutate_at(&store_path_or_refuse()?, f)
 }
 
 // --- JSON 化（CLI / MCP / 画面が共有する形） ---------------------------------
@@ -213,55 +232,31 @@ pub fn list_json(store: &TaskStore, filter: &TaskFilter) -> Value {
 // --- 語彙のパース（CLI / MCP が同じ綴りを使う） -----------------------------
 
 pub fn parse_kind(s: &str) -> Result<TaskKind, String> {
-    TaskKind::parse(s).ok_or_else(|| {
-        format!(
-            "不明な kind: {s}（{} のいずれか）",
-            TaskKind::all()
-                .iter()
-                .map(|k| k.as_str())
-                .collect::<Vec<_>>()
-                .join(" / ")
-        )
-    })
+    TaskKind::parse(s).ok_or_else(|| unknown("kind", s, TaskKind::all().iter().map(|k| k.as_str())))
 }
 
 pub fn parse_status(s: &str) -> Result<TaskStatus, String> {
-    TaskStatus::parse(s).ok_or_else(|| {
-        format!(
-            "不明な status: {s}（{} のいずれか）",
-            TaskStatus::all()
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(" / ")
-        )
-    })
+    TaskStatus::parse(s)
+        .ok_or_else(|| unknown("status", s, TaskStatus::all().iter().map(|s| s.as_str())))
 }
 
 pub fn parse_decision(s: &str) -> Result<Decision, String> {
-    Decision::parse(s).ok_or_else(|| {
-        format!(
-            "不明な decision: {s}（{} のいずれか）",
-            Decision::all()
-                .iter()
-                .map(|d| d.as_str())
-                .collect::<Vec<_>>()
-                .join(" / ")
-        )
-    })
+    Decision::parse(s)
+        .ok_or_else(|| unknown("decision", s, Decision::all().iter().map(|d| d.as_str())))
 }
 
 pub fn parse_via(s: &str) -> Result<Via, String> {
-    Via::parse(s).ok_or_else(|| {
-        format!(
-            "不明な via: {s}（{} のいずれか）",
-            Via::all()
-                .iter()
-                .map(|v| v.as_str())
-                .collect::<Vec<_>>()
-                .join(" / ")
-        )
-    })
+    Via::parse(s).ok_or_else(|| unknown("via", s, Via::all().iter().map(|v| v.as_str())))
+}
+
+/// 語彙に無い綴りの断り（候補は ` / ` で並べる）
+fn unknown<'a>(key: &'static str, got: &str, allowed: impl Iterator<Item = &'a str>) -> String {
+    Reason::UnknownPlain {
+        key,
+        got: got.to_string(),
+        allowed: allowed.collect::<Vec<_>>().join(" / "),
+    }
+    .to_string()
 }
 
 /// `ラベル=本文` を [`CopyText`] にする。`=` が無ければラベルなし（`本文`）
@@ -295,7 +290,7 @@ pub fn show_at(path: &Path, id: &str) -> Result<Value, String> {
     store
         .find(id)
         .map(task_to_json)
-        .ok_or_else(|| format!("タスクが見つからない: {id}"))
+        .ok_or_else(|| TaskRefusal::NotFound(id.to_string()).to_string())
 }
 
 pub fn update_at(path: &Path, id: &str, patch: TaskPatch) -> Result<Value, String> {
@@ -320,7 +315,7 @@ pub fn respond_at(
         let task = store
             .find(id)
             .cloned()
-            .ok_or("直前に更新したタスクが無い")?;
+            .ok_or_else(|| Reason::TaskGoneAfterRespond.to_string())?;
         Ok((task, index))
     })?
 }
