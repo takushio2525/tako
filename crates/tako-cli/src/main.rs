@@ -17047,8 +17047,17 @@ mod platform_matrix_parity {
     /// MCP ツールを持たないことが意図的な CLI 専用コマンド。
     /// いずれも「GUI / MCP が使えない状況のための入口」なので MCP からは提供できない
     /// （`master` / `solo` はエージェント CLI の起動そのもの、`mcp serve` は MCP ブリッジ自身、
-    /// `recover` は GUI 死亡時の復旧、`remote serve` はデーモン本体）
-    const CLI_ONLY: &[&str] = &["master", "solo", "mcp serve", "recover", "remote serve"];
+    /// `recover` は GUI 死亡時の復旧、`remote serve` はデーモン本体、`orchestrator resume` は
+    /// 打ったシェルのプロセスを起動コマンドに置き換える突然死からの復旧 = #2470。MCP からは
+    /// worker_status の `resume_command`（この 1 行）を `tako_send_input` で死んだペインへ送る）
+    const CLI_ONLY: &[&str] = &[
+        "master",
+        "solo",
+        "mcp serve",
+        "recover",
+        "remote serve",
+        "orchestrator resume",
+    ];
 
     fn leaf_commands() -> Vec<String> {
         fn walk(c: &clap::Command, prefix: &str, out: &mut Vec<String>) {

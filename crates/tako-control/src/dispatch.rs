@@ -24945,8 +24945,8 @@ fn resolve_caller_profile_with_role(
     // 旧形式のプロファイル・設定を実行時に検知して直す（#916 の二段構え 2 段目）。
     // 1 プロセス 1 回しか実際には走らないので、この頻繁な経路から呼んでも軽い
     let _ = crate::migrations::ensure_migrated();
-    let name = caller_profile_name(workspace, caller, role_suffix);
-    crate::orchestrator::master_launch::load_caller_profile(&name, launching)
+    let name = &caller_profile_name(workspace, caller, role_suffix);
+    crate::orchestrator::master_launch::load_caller_profile(name, launching)
 }
 
 /// 呼び出し元 master のプロファイル名（無ければ `default`）。読み込み（[`resolve_caller_profile_with_role`]）と
