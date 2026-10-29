@@ -284,14 +284,31 @@ impl PanelViewWire {
             .join("、")
     }
 
-    /// 不正値を弾くときに添える案内（GUI 表示名を先に出し、旧称は括弧で補足。#553 案 2）
+    /// 不正値を弾くときに添える案内（GUI 表示名を先に出し、旧称は括弧で補足。#553 案 2）。
+    /// MCP カタログの説明に載るので日本語のまま。断りは [`Self::values_hint_in`]
     pub fn values_hint() -> String {
+        Self::values_hint_in(tako_core::i18n::Lang::Ja)
+    }
+
+    /// [`Self::values_hint`] を表示言語を明示して引く（#2365。MCP の前段の断りに添える）
+    pub fn values_hint_in(lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
         let legacy = Self::LEGACY_VALUES
             .iter()
-            .map(|(old, new)| format!("{old} は {new} の旧称"))
+            .map(|(old, new)| match lang {
+                Ja => format!("{old} は {new} の旧称"),
+                En => format!("{old} is the old name of {new}"),
+            })
             .collect::<Vec<_>>()
-            .join("、");
-        format!("{}。{legacy}", Self::VALUES.join(" | "))
+            .join(match lang {
+                Ja => "、",
+                En => ", ",
+            });
+        let end = match lang {
+            Ja => "。",
+            En => "; ",
+        };
+        format!("{}{end}{legacy}", Self::VALUES.join(" | "))
     }
 }
 

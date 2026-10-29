@@ -31,6 +31,9 @@
 //! #2365 の続きで、action で操作を選ぶツールの断り（不明な action・不明な値・`<操作> には <鍵> が必要`）と、
 //! それらのツールが共有する設定の保存・置き場の断りを `Reason` の表へ足した。呼び手が候補を値で渡すので、
 //! 旧形の日本語の固定文の書き足しと、渡す候補・案内の日本語は dispatch のソースを読んで名指す（末尾）。
+//! #2365 の続きで、MCP の前段（`mcp/request.rs` の引数の組み立てと JSON-RPC の口）と CLI の前段
+//! （`tako-cli` の `build_request` とそれが呼ぶ補助）の断りを `Reason` の表へ足した。前段に日本語の
+//! 固定文を書き足すと英語表示でもその 1 か所だけ日本語で返るので、前段のソースを読んで名指す（最後）。
 //!
 //! このファイルは**独立したテストバイナリ**で、言語グローバルを触るのは
 //! `display_follows_the_display_language` の 1 本だけ（ほかは `text_in` で言語を引数に渡す）。
@@ -609,9 +612,59 @@ fn reason_index(r: &Reason) -> usize {
         Reason::PresetNameShape => 104,
         Reason::UnknownTheme { .. } => 105,
         Reason::UnfamiliarAction { .. } => 106,
+        // #2365 の続き: MCP の前段
+        Reason::ClickShape => 107,
+        Reason::ClickCell(_) => 108,
+        Reason::AxisXOrY => 109,
+        Reason::ReattachWithEnabled => 110,
+        Reason::TextNeedsType => 111,
+        Reason::InvalidValueBare { .. } => 112,
+        Reason::PathOrPaths => 113,
+        Reason::InvalidPanelView(_) => 114,
+        Reason::CannotParse(..) => 115,
+        Reason::AdoptNameMissing => 116,
+        Reason::MissingHint { .. } => 117,
+        Reason::SetNotObject => 118,
+        Reason::ActionMustGive { .. } => 119,
+        Reason::ModMcpAction => 120,
+        Reason::ModUiArgs(_) => 121,
+        Reason::RuleNotBool(_) => 122,
+        Reason::RulesShape => 123,
+        Reason::PasteGuardOnly(_) => 124,
+        Reason::OneOfListed { .. } => 125,
+        Reason::JsonEncodeFailed { .. } => 126,
+        Reason::FormatRangeIncomplete => 127,
+        Reason::UnknownMethod(_) => 128,
+        Reason::RequestNotJson => 129,
+        Reason::NotJson(_) => 130,
+        // #2365 の続き: CLI の前段
+        Reason::ResizeOneOf => 131,
+        Reason::PasteGuardTextUsage => 132,
+        Reason::PasteGuardUnallowId => 133,
+        Reason::StdinReadFailed(_) => 134,
+        Reason::BadMovement(_) => 135,
+        Reason::BadMotion(_) => 136,
+        Reason::BadLineOp(_) => 137,
+        Reason::ModDryRunOnly => 138,
+        Reason::ModBandOnOff => 139,
+        Reason::ModOnOffAfterBand => 140,
+        Reason::ReattachNeedsPane => 141,
+        Reason::ForegroundTarget => 142,
+        Reason::FileMoveArgs => 143,
+        Reason::FileCopyArgs => 144,
+        Reason::CopyOneAtATime => 145,
+        Reason::CopyPartlyFailed { .. } => 146,
+        Reason::CwdUnreadable(_) => 147,
+        Reason::EnvShape(_) => 148,
+        Reason::ModReportUnreadable(_) => 149,
+        Reason::ModReportNotJson(_) => 150,
+        Reason::PositionLine(_) => 151,
+        Reason::PositionColumn(_) => 152,
+        Reason::RangeShape(_) => 153,
+        Reason::ManyPartlyFailed { .. } => 154,
     }
 }
-const REASON_VARIANTS: usize = 107;
+const REASON_VARIANTS: usize = 155;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -785,6 +838,80 @@ fn reason_samples() -> Vec<Reason> {
             got: "bogus".into(),
             allowed: "check / fix",
         },
+        // #2365 の続き: MCP の前段
+        Reason::ClickShape,
+        Reason::ClickCell("row".into()),
+        Reason::AxisXOrY,
+        Reason::ReattachWithEnabled,
+        Reason::TextNeedsType,
+        Reason::InvalidValueBare {
+            key: "op",
+            got: "bogus".into(),
+        },
+        Reason::PathOrPaths,
+        Reason::InvalidPanelView("bogus".into()),
+        Reason::CannotParse(
+            "limits",
+            "invalid type: string \"x\", expected struct QueueLimits".into(),
+        ),
+        Reason::AdoptNameMissing,
+        Reason::MissingHint {
+            key: "action",
+            hint: "check / run",
+        },
+        Reason::SetNotObject,
+        Reason::ActionMustGive {
+            action: "rename",
+            key: "new_name",
+        },
+        Reason::ModMcpAction,
+        Reason::ModUiArgs("unknown field `x`".into()),
+        Reason::RuleNotBool("high_entropy".into()),
+        Reason::RulesShape,
+        Reason::PasteGuardOnly("enabled".into()),
+        Reason::OneOfListed {
+            key: "target",
+            allowed: "new-pane | split | tab".into(),
+        },
+        Reason::JsonEncodeFailed {
+            key: Some("criteria"),
+            error: "boom".into(),
+        },
+        Reason::FormatRangeIncomplete,
+        Reason::UnknownMethod("resources/list".into()),
+        Reason::RequestNotJson,
+        Reason::NotJson("expected value at line 1 column 1".into()),
+        // #2365 の続き: CLI の前段
+        Reason::ResizeOneOf,
+        Reason::PasteGuardTextUsage,
+        Reason::PasteGuardUnallowId,
+        Reason::StdinReadFailed("stream did not contain valid UTF-8".into()),
+        Reason::BadMovement("diagonal".into()),
+        Reason::BadMotion("sideways".into()),
+        Reason::BadLineOp("shuffle".into()),
+        Reason::ModDryRunOnly,
+        Reason::ModBandOnOff,
+        Reason::ModOnOffAfterBand,
+        Reason::ReattachNeedsPane,
+        Reason::ForegroundTarget,
+        Reason::FileMoveArgs,
+        Reason::FileCopyArgs,
+        Reason::CopyOneAtATime,
+        Reason::CopyPartlyFailed {
+            total: 3,
+            failed: 2,
+        },
+        Reason::CwdUnreadable("No such file or directory (os error 2)".into()),
+        Reason::EnvShape("NOEQ".into()),
+        Reason::ModReportUnreadable("stream did not contain valid UTF-8".into()),
+        Reason::ModReportNotJson("expected value at line 1 column 1".into()),
+        Reason::PositionLine("x:0".into()),
+        Reason::PositionColumn("1:y".into()),
+        Reason::RangeShape("1:0".into()),
+        Reason::ManyPartlyFailed {
+            total: 4,
+            failed: 1,
+        },
     ]
 }
 
@@ -900,6 +1027,61 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "名前は [a-z0-9-]{1,32}",
     "未知のテーマ: \"nope\"（target は dark / light / プリセット名。プリセット: mine / work）",
     "未知の action: bogus（check / fix）",
+    // #2365 の続き: MCP の前段（`mcp/request.rs` / `mcp/mod.rs` / `mcp/http.rs` と stdio ブリッジ）
+    "click は {\"row\": 行, \"col\": 桁}（0 始まりの表示セル）で指定する",
+    "click.row を 0 以上の整数で指定する",
+    "axis は \"x\" か \"y\" を指定する",
+    "enabled と reattach は併用できない（切替か再 attach のどちらか）",
+    "text は command=type と組で渡す",
+    "op が不正: bogus",
+    "path（または paths）を指定する",
+    "view が不正: bogus（fleet | orch | git | tasks | diagnostics | references | search | usage。\
+     tmux は fleet の旧称）",
+    "limits を解釈できない: invalid type: string \"x\", expected struct QueueLimits",
+    "name を指定する（プロファイル名 / プロジェクトキー）",
+    "action を指定する（check / run）",
+    "set はオブジェクト（キー → 値）",
+    "rename は new_name を指定する",
+    "action は status / on / off / band-on / band-off / ui / install / uninstall のどれか\
+     （report は MCP に無い）",
+    "action=ui の引数が読めない: unknown field `x`",
+    "rules.high_entropy は true / false で指定する",
+    "rules は {\"規則名\": true / false} で指定する",
+    "enabled は action=paste_guard のときだけ使える",
+    "target は new-pane | split | tab のいずれか",
+    "criteria の JSON 変換に失敗: boom",
+    "範囲の整形は line / column / end_line / end_column の 4 つをそろえて指定する（省略で文書全体）",
+    "メソッド resources/list は未対応",
+    "リクエストを JSON として解釈できない",
+    "JSON として解釈できない: expected value at line 1 column 1",
+    // #2365 の続き: CLI の前段（`tako-cli` の `build_request` とそれが呼ぶ補助）
+    "--dx / --dy / --share-x / --share-y のどれか 1 つを指定する",
+    "文字を渡せるのは `tako paste-guard check|allow|unallow|rule` だけ",
+    "外す許可の ID（`tako paste-guard` の allow[].id）か all を渡す",
+    "標準入力の読み取りに失敗: stream did not contain valid UTF-8",
+    "移動の単位は left / right / up / down / word-left / word-right / line-start / smart-home / \
+     line-end / doc-start / doc-end / page-up / page-down のどれか（\"diagonal\" は無い）",
+    "削除の単位は char-backward / char-forward / word-backward / word-forward / to-line-start / \
+     to-line-end のどれか（\"sideways\" は無い）",
+    "行の操作は duplicate-up / duplicate-down / move-up / move-down / indent / outdent / comment / \
+     uncomment / toggle-comment のどれか（\"shuffle\" は無い）",
+    "--dry-run は install / uninstall にだけ付ける（tako mod install --dry-run）",
+    "band には on か off を付ける（tako mod band off で帯を隠す）",
+    "on / off は band の後ろにだけ付ける（帯の切替は tako mod band on|off。画面の UI 設定は tako mod ui）",
+    "reattach には --pane N（再接続するペインの ID）が要る",
+    "ペイン ID か --tab のどちらかを指定する（tako backgrounded で確認）",
+    "移すものと移動先のフォルダを指定する（例: tako file move a.txt dst）",
+    "コピー元と貼り付け先のフォルダを指定する（例: tako file copy a.txt dst）",
+    "コピー元が複数のときは 1 件ずつ送る（file_copy_cli）",
+    "3 件中 2 件をコピーできなかった",
+    "作業ディレクトリを読めない: No such file or directory (os error 2)",
+    "--env は K=V の形で指定する（指定: \"NOEQ\"）",
+    "報告を stdin から読めない: stream did not contain valid UTF-8",
+    "報告の JSON を読めない: expected value at line 1 column 1",
+    "位置は 行:桁 で指定する（行が数値でない: x:0）",
+    "位置は 行:桁 で指定する（桁が数値でない: 1:y）",
+    "範囲は 行:桁-行:桁 で指定する（`-` が無い: 1:0）",
+    "4 件中 1 件をできなかった",
 ];
 
 /// #2365 より前の `preview_recovery_hint` の 3 つの文（外で消された / 外で変わった / 未保存だけ）
@@ -4593,4 +4775,194 @@ fn action_で選ぶツールの断りの値の埋め込みの境界() {
         ))
         .is_none()
     );
+}
+
+// ---- #2365 の続き: MCP の前段・CLI の前段の断り（前段のソースを読む番犬） ----
+//
+// 前段の断りは `Reason` の表（上）で日英を見る。表では見えないのは、前段に日本語の固定文
+// （`return Err("… を指定する".into())` / `format!("… が不正: {x}")`）を**書き足す**こと = 英語表示でも
+// その 1 か所だけ日本語で返る。前段のソースを読んで `file:line` で名指す。
+// `unreachable!` / `expect` の文（到達しない内部の印）とコメントは見ない
+
+const MCP_REQUEST_SRC: &str = include_str!("../src/mcp/request.rs");
+const MCP_REQUEST_PATH: &str = "crates/tako-control/src/mcp/request.rs";
+const MCP_MOD_SRC: &str = include_str!("../src/mcp/mod.rs");
+const MCP_MOD_PATH: &str = "crates/tako-control/src/mcp/mod.rs";
+const MCP_HTTP_SRC: &str = include_str!("../src/mcp/http.rs");
+const MCP_HTTP_PATH: &str = "crates/tako-control/src/mcp/http.rs";
+const CLI_MAIN_SRC: &str = include_str!("../../tako-cli/src/main.rs");
+const CLI_MAIN_PATH: &str = "crates/tako-cli/src/main.rs";
+
+/// 前段の走査の範囲: (path, ソース, 関数の頭)。関数の頭が `None` ならファイルの本体（単体テストの前まで）
+const FRONT_SCOPES: &[(&str, &str, Option<&str>)] = &[
+    // MCP: 引数の組み立て（ファイル全体）と JSON-RPC の口
+    (MCP_REQUEST_PATH, MCP_REQUEST_SRC, None),
+    (
+        MCP_MOD_PATH,
+        MCP_MOD_SRC,
+        Some("pub fn handle_message(message: &Value"),
+    ),
+    (
+        MCP_MOD_PATH,
+        MCP_MOD_SRC,
+        Some("fn call_tool(params: &Value"),
+    ),
+    (MCP_HTTP_PATH, MCP_HTTP_SRC, Some("fn handle_http(")),
+    // CLI: build_request とそれが（関数として）呼ぶ補助
+    (
+        CLI_MAIN_PATH,
+        CLI_MAIN_SRC,
+        Some("fn build_request(command: &Command)"),
+    ),
+    (
+        CLI_MAIN_PATH,
+        CLI_MAIN_SRC,
+        Some("    fn request(&self) -> Result<Request, String> {"),
+    ),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, Some("fn parse_position(")),
+    (
+        CLI_MAIN_PATH,
+        CLI_MAIN_SRC,
+        Some("fn parse_line_col_range("),
+    ),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, Some("fn parse_direction(")),
+    (
+        CLI_MAIN_PATH,
+        CLI_MAIN_SRC,
+        Some("fn paste_guard_check_text("),
+    ),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, Some("fn read_mod_report(")),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, Some("fn run_config_env(")),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, Some("fn build_criteria_json(")),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, Some("fn file_copy_requests(")),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, Some("fn file_copy_cli(")),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, Some("fn file_many_cli(")),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, Some("fn target_pane(")),
+];
+
+/// `src` の走査範囲の行（1 始まりの行番号つき）。関数の頭が見つからなければ `None`
+/// （走査の空振り = 改名で番犬が黙って何も見なくなるのを止める）
+fn front_scope_lines<'a>(src: &'a str, head: Option<&str>) -> Option<Vec<(usize, &'a str)>> {
+    let lines: Vec<&str> = src.lines().collect();
+    // 単体テストの mod の始まり（`#[cfg(test)] use …` の 1 行だけの印は始まりではない）
+    let tests = (0..lines.len())
+        .find(|&i| {
+            lines[i].starts_with("#[cfg(test)]")
+                && lines
+                    .get(i + 1)
+                    .is_some_and(|next| next.starts_with("mod "))
+        })
+        .unwrap_or(lines.len());
+    let (start, end) = match head {
+        None => (0, tests),
+        Some(head) => {
+            let start = lines[..tests].iter().position(|l| l.contains(head))?;
+            // 関数の終わり = 頭と同じ字下げの `}` の行
+            let indent = &lines[start][..lines[start].len() - lines[start].trim_start().len()];
+            let close = format!("{indent}}}");
+            let len = lines[start..tests].iter().position(|l| *l == close)?;
+            (start, start + len + 1)
+        }
+    };
+    Some(
+        lines[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (start + i + 1, *l))
+            .collect(),
+    )
+}
+
+/// 走査範囲の中で、断りに書き足された日本語の固定文の行（`unreachable!` / `expect` の文と
+/// コメントは外す。`unreachable!(` が行をまたぐときは閉じ括弧まで外す）
+fn front_japanese(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut internal_depth = 0i32;
+    for (line, code) in lines {
+        let trimmed = code.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if internal_depth == 0 && (code.contains("unreachable!(") || code.contains(".expect(")) {
+            internal_depth = 1;
+            let from = code
+                .find("unreachable!(")
+                .or_else(|| code.find(".expect("))
+                .unwrap_or(0);
+            // 閉じ括弧がその行に揃っていれば 0 へ戻る（呼び手の括弧も閉じる行は負にしない）
+            let tail = &code[from..];
+            internal_depth = (internal_depth + tail.matches('(').count() as i32
+                - tail.matches(')').count() as i32
+                - 1)
+            .max(0);
+            continue;
+        }
+        if internal_depth > 0 {
+            internal_depth += code.matches('(').count() as i32 - code.matches(')').count() as i32;
+            internal_depth = internal_depth.max(0);
+            continue;
+        }
+        for lit in line_literals(code) {
+            if let Some(c) = has_japanese(lit) {
+                out.push((*line, format!("（{c}）{}", code.trim())));
+                break;
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn mcp_と_cli_の前段の断りに日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, src, head) in FRONT_SCOPES {
+        let Some(lines) = front_scope_lines(src, *head) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{}` が見つからない（関数の改名で番犬が空振りする。\
+                 FRONT_SCOPES を直す）",
+                head.unwrap_or("<ファイル全体>")
+            ));
+            continue;
+        };
+        for (line, text) in front_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 前段の断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （tako_control::Reason へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 植えた日本語の断りを名指し、コメント・`unreachable!`（行をまたぐ形も）・
+/// `expect` は見逃す。範囲の終わりは頭と同じ字下げの `}` で、隣の関数へはみ出さない
+#[test]
+fn 前段の番犬は植えた日本語を名指しし内部の印とコメントは見逃す() {
+    let src = r#"fn front(x: u8) -> Result<u8, String> {
+    // 断りは日英（コメントの日本語は見ない）
+    if x == 0 {
+        return Err("x を指定する".into());
+    }
+    let y = Some(x).expect("1 件");
+    match x {
+        1 => unreachable!(
+            "到達しない（内部の印）"
+        ),
+        2 => return Err(format!("{x} が不正: 範囲の外")),
+        _ => {}
+    }
+    Ok(y)
+}
+fn next() {
+    let _ = "隣の関数（範囲の外）";
+}
+"#;
+    let lines = front_scope_lines(src, Some("fn front(")).expect("頭を引ける");
+    let found: Vec<usize> = front_japanese(&lines).into_iter().map(|(l, _)| l).collect();
+    assert_eq!(found, vec![4, 11], "植えた 2 か所だけを名指す");
+    assert!(front_scope_lines(src, Some("fn absent(")).is_none());
+    // ファイル全体（頭なし）は隣の関数も見る
+    let whole = front_scope_lines(src, None).expect("全体");
+    let found: Vec<usize> = front_japanese(&whole).into_iter().map(|(l, _)| l).collect();
+    assert_eq!(found, vec![4, 11, 17]);
 }

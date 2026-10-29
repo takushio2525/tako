@@ -343,7 +343,10 @@ phase_direct() {
   mcp="$(mcp_call tako_mod '{}' | python3 -I -c 'import json,sys; d=json.load(sys.stdin); print(any(r.get("state")=="reporting" for r in d.get("panes",[])))' 2>/dev/null)"
   check_eq "MCP tako_mod（status）にも同じ報告が出る" "True" "$mcp"
   mcp="$(mcp_call tako_mod '{"action":"report"}' 2>&1 || true)"
-  check_eq "MCP tako_mod は report を受け付けない" "true" "$(contains "$mcp" "report は MCP に無い")"
+  # 断りは表示言語に従う（#2365）ので日英どちらの形とも突き合わせる
+  refused="$(contains "$mcp" "report は MCP に無い")"
+  [ "$refused" = true ] || refused="$(contains "$mcp" "report is not available over MCP")"
+  check_eq "MCP tako_mod は report を受け付けない" "true" "$refused"
   # session.end（/exit）で報告を捨てる
   exit_claude "$p"
   if wait_for 30 field_is "panes.pane=$p.state" waiting; then pass "/exit（session.end）で報告が消える"; else fail "/exit 後も報告が残る（state=$(mod_field "panes.pane=$p.state")）"; fi

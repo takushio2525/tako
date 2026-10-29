@@ -136,7 +136,10 @@ fn handle_http(
         let error = json!({
             "jsonrpc": "2.0",
             "id": null,
-            "error": { "code": -32700, "message": "リクエストを JSON として解釈できない" },
+            "error": {
+                "code": -32700,
+                "message": crate::dispatch::Reason::RequestNotJson.to_string(),
+            },
         });
         return respond(request, 400, Some(error.to_string()));
     };

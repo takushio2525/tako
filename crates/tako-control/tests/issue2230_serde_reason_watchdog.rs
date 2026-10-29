@@ -67,13 +67,18 @@ const ALLOWED: &[Allow] = &[
     },
     Allow {
         file: "crates/tako-cli/src/main.rs",
-        needle: "報告の JSON を読めない",
+        needle: "Reason::ModReportNotJson(",
         why: "標準入力から受けた報告（呼び手がいま渡した入力）",
     },
     Allow {
         file: "crates/tako-cli/src/mcp_bridge.rs",
-        needle: "JSON として解釈できない",
+        needle: "Reason::NotJson(",
         why: "MCP クライアントが送った 1 行（stdio の入力）",
+    },
+    Allow {
+        file: "crates/tako-cli/src/mcp_bridge.rs",
+        needle: "JSON として解釈できない",
+        why: "カタログ係が受けた 1 行（親のブリッジが stdin へ渡す MCP の入力）",
     },
     Allow {
         file: "crates/tako-control/src/agents.rs",
@@ -147,12 +152,12 @@ const ALLOWED: &[Allow] = &[
     },
     Allow {
         file: "crates/tako-control/src/mcp/request.rs",
-        needle: "limits を解釈できない",
+        needle: "Reason::CannotParse(\"limits\"",
         why: "MCP の tools/call の引数",
     },
     Allow {
         file: "crates/tako-control/src/mcp/request.rs",
-        needle: "action=ui の引数が読めない",
+        needle: "Reason::ModUiArgs(",
         why: "MCP の tools/call の引数",
     },
     Allow {

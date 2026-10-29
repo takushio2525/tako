@@ -287,7 +287,10 @@ fn serve_until_end(catalog: Catalog) -> Result<(), Stop> {
             Err(e) => Some(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": null,
-                "error": { "code": -32700, "message": format!("JSON として解釈できない: {e}") },
+                "error": {
+                    "code": -32700,
+                    "message": tako_control::Reason::NotJson(e.to_string()).to_string(),
+                },
             })),
         };
         if let Some(response) = response {

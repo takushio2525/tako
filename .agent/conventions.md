@@ -219,6 +219,22 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   （`Reason` の表 + 末尾の節が dispatch のソースを読み、旧形の日本語の固定文の書き足しと、呼び手が渡す候補・
   案内の日本語を `file:line` で名指す）、実経路は `tests/issue2365_action_reasons_lang.rs`（GUI 無しの
   ホストへ IPC と同じ形の要求を渡し、68 ケースで英語表示に日本語が無いことと日本語の旧文との一致を見る）
+- #2365 の続きで、**MCP の前段**（`mcp/request.rs` の引数の組み立て・`mcp/mod.rs` の未対応のメソッド・
+  `mcp/http.rs` と stdio ブリッジの「JSON として解釈できない」）と **CLI の前段**（`tako-cli` の
+  `build_request` とそれが呼ぶ補助 = 位置・範囲の綴り・標準入力・`tako mod` の引数・`file move|copy` の
+  引数と終わりの行・`--env`）の断りを `Reason` へ移した（48 種）。既存の形で書ける文は既存のバリアントへ
+  寄せる（`action が不正` = `InvalidValue`・`<操作> には <鍵> が必要` = `ActionNeeds`・
+  `pane か direction` = `ExactlyOneOf`・`action は … のどれか` = `NotOneOf`）。名前表を持つ文
+  （編集の綴り・`tako_mod` の action・整形の範囲の鍵 `dispatch::LSP_FORMAT_RANGE_KEYS`）は表をバリアントの
+  中で引く。`tako_panel` の view の候補の旧称の説明は MCP カタログの説明に載るので `values_hint()` は
+  日本語のまま、断りは `PanelViewWire::values_hint_in(lang)`。MCP の前段は `Reason::…to_string()`
+  （GUI の表示言語 / ブリッジが起動時に設定から決めた言語）、CLI の前段は `front_err`。番犬は同じ
+  `issue1762_dispatch_error_lang.rs`（`Reason` の表 + 最後の節が前段のソースを読み、日本語の固定文の
+  書き足しを `file:line` で名指す。走査の範囲は `FRONT_SCOPES`）、実経路は tako-cli の
+  `tests/issue2365_front_lang.rs`（ビルドした `tako` を一時の data dir で叩き、CLI 21 + MCP 32 ケースで
+  英語表示に日本語が無いことと日本語の旧文とのバイト一致を見る。`TAKO_2365_FRONT_BIN` で修正前の
+  バイナリを叩ける = A/B）。文言で判定していた検証スクリプト（`test-reattach-1857.sh` /
+  `test-claude-mod-1879.sh`）は日英どちらの形とも突き合わせる
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
