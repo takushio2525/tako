@@ -690,9 +690,13 @@ fn reason_index(r: &Reason) -> usize {
         Reason::CriteriaEmpty => 176,
         Reason::GateNotFound(_) => 177,
         Reason::TaskGoneAfterRespond => 178,
+        // #2365 の続き: remote daemon が tako app へ繋ぐ口（remote.rs の AppIpcClient）
+        Reason::AppCannotConnect { .. } => 179,
+        Reason::AppRequestEncodeFailed(_) => 180,
+        Reason::AppNoReply => 181,
     }
 }
-const REASON_VARIANTS: usize = 179;
+const REASON_VARIANTS: usize = 182;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -853,7 +857,7 @@ fn reason_samples() -> Vec<Reason> {
         Reason::ThemeSetNeedsMode,
         Reason::ShortcutAddNeedsPath,
         Reason::ShortcutRemoveNeedsPath,
-        Reason::SaveSettingsFailed("Permission denied (os error 13)".into()),
+        Reason::SaveSettingsFailed(IoCause::Other("Permission denied (os error 13)".into())),
         Reason::DataDirUnresolved,
         Reason::UnknownColorKey("nosuch".into()),
         Reason::ReservedPresetName("dark".into()),
@@ -992,6 +996,13 @@ fn reason_samples() -> Vec<Reason> {
         Reason::CriteriaEmpty,
         Reason::GateNotFound("task-9".into()),
         Reason::TaskGoneAfterRespond,
+        // #2365 の続き: remote daemon → app
+        Reason::AppCannotConnect {
+            socket: "/tmp/tako/control.sock".into(),
+            error: "Connection refused (os error 61)".into(),
+        },
+        Reason::AppRequestEncodeFailed("key must be a string".into()),
+        Reason::AppNoReply,
     ]
 }
 
@@ -1194,6 +1205,10 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "criteria を 1 つ以上指定する",
     "ゲートが見つからない: task-9",
     "直前に更新したタスクが無い",
+    // #2365 の続き: remote.rs の AppIpcClient（日本語の文言が ipc.rs と違っていた 3 つ）
+    "tako app へ接続できない (/tmp/tako/control.sock): Connection refused (os error 61)",
+    "リクエストの構築に失敗: key must be a string",
+    "tako app から応答が返らなかった",
 ];
 
 /// #2365 より前の `preview_recovery_hint` の 3 つの文（外で消された / 外で変わった / 未保存だけ）
@@ -4870,7 +4885,7 @@ fn action_で選ぶツールの断りの値の埋め込みの境界() {
     assert!(many.text_in(Lang::En).ends_with("presets: a / b / c)"));
     // 書き出しの口の文は日英とも書き換えずに後ろへ付ける（空でも前置きだけ）
     for e in ["", "Read-only file system (os error 30)"] {
-        let r = Reason::SaveSettingsFailed(e.into());
+        let r = Reason::SaveSettingsFailed(IoCause::Other(e.into()));
         assert_eq!(r.text_in(Lang::Ja), format!("設定の保存に失敗: {e}"));
         assert_eq!(
             r.text_in(Lang::En),
@@ -5458,4 +5473,446 @@ fn 起動失敗の包みの境界() {
         assert_eq!(nested.lines().count(), 4, "{nested}");
         assert!(nested.contains("TAKO_PANE_ID=7"), "{nested}");
     }
+}
+
+// ---- #2365 の続き: 全部の置き場が共有する書き出し（config_io）・remote daemon → app の接続・
+// 置き場の口（settings / discovery / layout）の「データディレクトリを解決できない」 ----
+//
+// 書き出しの断り（`config_io::WriteError`）は (バリアント, 言語) の網羅 match。`String` を返す口
+// （`atomic_write` / `atomic_write_with_backup` / `rotate_backups` / `lock_exclusive`）は日本語のまま
+// = persist.log・日本語の枠の呼び手はそのまま使い、表示言語に従う枠を持つ置き場（ゲート・
+// チェックポイント・人がやること・実行設定）だけが型の口（`*_typed`）を通す。
+// データディレクトリの断りは 5 か所が `config_io::DataDirUnresolved` を `io::Error` に包み、表示は
+// 日本語のまま（診断ログ）・利用者へ返す枠は `IoCause` で枠と同じ言語に引く。
+// remote daemon → app の 9 行は `Reason`（上の表）へ移した。ここではソースを読んで、日本語の
+// 固定文の書き足し・日本語の口の呼び足し・`io::Error` の素の文での包みを `file:line` で名指す
+
+use tako_control::config_io::{DataDirUnresolved, IoCause, WriteError};
+
+const REMOTE_SRC: &str = include_str!("../src/remote.rs");
+const REMOTE_PATH: &str = "crates/tako-control/src/remote.rs";
+const SETTINGS_SRC: &str = include_str!("../src/settings.rs");
+const SETTINGS_PATH: &str = "crates/tako-control/src/settings.rs";
+const DISCOVERY_SRC: &str = include_str!("../src/discovery.rs");
+const DISCOVERY_PATH: &str = "crates/tako-control/src/discovery.rs";
+const LAYOUT_FILE_SRC: &str = include_str!("../src/layout.rs");
+const LAYOUT_FILE_PATH: &str = "crates/tako-control/src/layout.rs";
+const RUN_CONFIGS_SRC: &str = include_str!("../src/run_configs.rs");
+const RUN_CONFIGS_PATH: &str = "crates/tako-control/src/run_configs.rs";
+const LSP_MANAGER_SRC: &str = include_str!("../src/lsp/manager.rs");
+const LSP_MANAGER_PATH: &str = "crates/tako-control/src/lsp/manager.rs";
+
+/// `WriteError` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
+fn write_index(e: &WriteError) -> usize {
+    match e {
+        WriteError::NoParent(_) => 0,
+        WriteError::CreateDir(_) => 1,
+        WriteError::TmpWrite { .. } => 2,
+        WriteError::Rename { .. } => 3,
+        WriteError::BackupShift { .. } => 4,
+        WriteError::BackupCreate { .. } => 5,
+    }
+}
+const WRITE_VARIANTS: usize = 6;
+
+/// 見本と #2365 より前の固定文（`atomic_write` / `rotate_backups` が書いていた文を見本の値で展開）
+fn write_table() -> Vec<(WriteError, &'static str)> {
+    vec![
+        (
+            WriteError::NoParent("/".into()),
+            "親ディレクトリがない: /",
+        ),
+        (
+            WriteError::CreateDir("Not a directory (os error 20)".into()),
+            "ディレクトリの作成に失敗: Not a directory (os error 20)",
+        ),
+        (
+            WriteError::TmpWrite {
+                path: "/tmp/user-tasks.yaml.tmp.42.0".into(),
+                error: "Permission denied (os error 13)".into(),
+            },
+            "一時ファイルの書き込みに失敗 (/tmp/user-tasks.yaml.tmp.42.0): Permission denied (os error 13)",
+        ),
+        (
+            WriteError::Rename {
+                from: "/tmp/a.yaml.tmp.42.0".into(),
+                to: "/tmp/a.yaml".into(),
+                error: "Is a directory (os error 21)".into(),
+            },
+            "rename に失敗 (/tmp/a.yaml.tmp.42.0 → /tmp/a.yaml): Is a directory (os error 21)",
+        ),
+        (
+            WriteError::BackupShift {
+                path: "/tmp/a.yaml.bak.1".into(),
+                error: "Is a directory (os error 21)".into(),
+            },
+            "バックアップの繰り下げに失敗 (/tmp/a.yaml.bak.1): Is a directory (os error 21)",
+        ),
+        (
+            WriteError::BackupCreate {
+                path: "/tmp/a.yaml".into(),
+                error: "Is a directory (os error 21)".into(),
+            },
+            "バックアップの作成に失敗 (/tmp/a.yaml): Is a directory (os error 21)",
+        ),
+    ]
+}
+
+#[test]
+fn 書き出しの断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let errors: Vec<WriteError> = write_table().into_iter().map(|(e, _)| e).collect();
+    covers_all(&errors, write_index, WRITE_VARIANTS);
+    for (e, old) in write_table() {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                CONFIG_IO_SRC,
+                CONFIG_IO_PATH,
+                "impl WriteError {",
+                &debug,
+                lang,
+            )
+        };
+        assert_eq!(e.text_in(Lang::Ja), old, "{debug}（{}）", at(Lang::Ja));
+        bilingual_named(at, &debug, &e.text_in(Lang::Ja), &e.text_in(Lang::En));
+    }
+}
+
+/// 実ファイル: 日本語で返す口（persist.log・日本語の枠の呼び手が使う）は、型の口の日本語と同じ文を
+/// 返す（= 修正前と同じ文）。境界: 親が無い（空のパス）・親の途中がファイル・`.bak.1` が
+/// フォルダ（作れない）・`.bak.2` がフォルダ（繰り下げられない）
+#[test]
+fn 書き出しの日本語の口は型の口の日本語と同じ文を返す() {
+    use tako_control::config_io as io;
+    let dir = std::env::temp_dir().join(format!("tako-2365-write-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+
+    let mut seen = Vec::new();
+    // 親が無い
+    let typed = io::atomic_write_typed(std::path::Path::new(""), "x").expect_err("親が無い");
+    assert_eq!(typed, WriteError::NoParent(String::new()));
+    assert_eq!(
+        io::atomic_write(std::path::Path::new(""), "x").expect_err("親が無い"),
+        typed.text_in(Lang::Ja)
+    );
+    seen.push(typed);
+    // 親の途中がファイル（フォルダを作れない）
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, "x").expect("ファイル");
+    let target = blocker.join("sub").join("a.yaml");
+    let typed = io::atomic_write_typed(&target, "x").expect_err("作れない");
+    assert!(matches!(typed, WriteError::CreateDir(_)), "{typed:?}");
+    assert_eq!(
+        io::atomic_write(&target, "x").expect_err("作れない"),
+        typed.text_in(Lang::Ja)
+    );
+    seen.push(typed);
+    // `.bak.1` がフォルダ（本体を複製できない）
+    let path = dir.join("b.yaml");
+    std::fs::write(&path, "v1").expect("本体");
+    std::fs::create_dir_all(io::backup_path(&path, 1)).expect("bak.1 をフォルダに");
+    let typed = io::atomic_write_with_backup_typed(&path, "v2").expect_err("複製できない");
+    let WriteError::BackupCreate { path: named, .. } = &typed else {
+        panic!("BackupCreate になる: {typed:?}");
+    };
+    assert_eq!(named, &path.display().to_string());
+    assert_eq!(
+        io::atomic_write_with_backup(&path, "v2").expect_err("複製できない"),
+        typed.text_in(Lang::Ja)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "v1",
+        "本体は書き換えない"
+    );
+    seen.push(typed);
+    // `.bak.1` がファイルで `.bak.2` がフォルダ（繰り下げられない）
+    let path = dir.join("c.yaml");
+    std::fs::write(&path, "v1").expect("本体");
+    std::fs::write(io::backup_path(&path, 1), "v0").expect("bak.1");
+    std::fs::create_dir_all(io::backup_path(&path, 2)).expect("bak.2 をフォルダに");
+    let typed = io::rotate_backups_typed(&path).expect_err("繰り下げられない");
+    let WriteError::BackupShift { path: named, .. } = &typed else {
+        panic!("BackupShift になる: {typed:?}");
+    };
+    assert_eq!(named, &io::backup_path(&path, 1).display().to_string());
+    assert_eq!(
+        io::rotate_backups(&path).expect_err("繰り下げられない"),
+        typed.text_in(Lang::Ja)
+    );
+    seen.push(typed);
+
+    for e in &seen {
+        let en = e.text_in(Lang::En);
+        assert!(has_japanese(&en).is_none(), "{e:?} の英語に日本語: {en}");
+    }
+    assert!(dir.starts_with(std::env::temp_dir()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// データディレクトリの印: `io::Error` の表示（= persist.log・起動時の警告・日本語の枠）は #2365 より前と
+/// バイト一致のまま、利用者へ返す枠は `IoCause` で同じ言語に引ける。素の文字列で包んだ旧形は印として
+/// 読まない（5 か所が印で包んでいることは下のソースの番犬が見る）
+#[test]
+fn データディレクトリの印は表示が日本語のまま中身を表示言語で引ける() {
+    let e = DataDirUnresolved.io_error();
+    assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(e.to_string(), "データディレクトリを解決できない");
+    let cause = IoCause::of(&e);
+    assert_eq!(cause, IoCause::DataDirUnresolved);
+    assert_eq!(cause.text_in(Lang::Ja), "データディレクトリを解決できない");
+    assert_eq!(
+        cause.text_in(Lang::En),
+        Reason::DataDirUnresolved.text_in(Lang::En)
+    );
+    assert!(has_japanese(&cause.text_in(Lang::En)).is_none());
+    // OS の文は言語に依らずそのまま
+    let os = std::io::Error::from_raw_os_error(13);
+    assert_eq!(IoCause::of(&os), IoCause::Other(os.to_string()));
+    for lang in [Lang::Ja, Lang::En] {
+        assert_eq!(IoCause::of(&os).text_in(lang), os.to_string());
+    }
+    let legacy = std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "データディレクトリを解決できない",
+    );
+    assert!(matches!(IoCause::of(&legacy), IoCause::Other(_)));
+    // settings.json の書き出しの断りに包んでも枠と中身の言語がそろう
+    assert_eq!(
+        Reason::settings_save_failed(&e).text_in(Lang::Ja),
+        "設定の保存に失敗: データディレクトリを解決できない"
+    );
+    for cause in [
+        IoCause::DataDirUnresolved,
+        IoCause::Other("Read-only file system (os error 30)".into()),
+        IoCause::Other(String::new()),
+    ] {
+        let r = Reason::SaveSettingsFailed(cause.clone());
+        let en = r.text_in(Lang::En);
+        assert!(has_japanese(&en).is_none(), "{cause:?}: {en}");
+        assert_eq!(
+            en,
+            format!("failed to save the settings: {}", cause.text_in(Lang::En))
+        );
+        assert_eq!(
+            r.text_in(Lang::Ja),
+            format!("設定の保存に失敗: {}", cause.text_in(Lang::Ja))
+        );
+    }
+}
+
+/// 表示言語に従う枠を持つ置き場の書き出し（型の口を通すべき範囲）
+const TYPED_WRITE_SCOPES: &[(&str, &str, Span)] = &[
+    (
+        GATES_PATH,
+        GATES_SRC,
+        Span::Item("impl AcceptanceGateStore {"),
+    ),
+    (CHECKPOINTS_PATH, CHECKPOINTS_SRC, Span::Whole),
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        Span::Item("pub fn mutate_at<"),
+    ),
+    (
+        RUN_CONFIGS_PATH,
+        RUN_CONFIGS_SRC,
+        Span::Item("pub fn update_at<"),
+    ),
+];
+
+/// 日本語で返す口（型の口 `*_typed` の外側）
+const JA_WRITE_CALLS: [&str; 4] = [
+    "config_io::lock_exclusive(",
+    "config_io::atomic_write(",
+    "config_io::atomic_write_with_backup(",
+    "config_io::rotate_backups(",
+];
+
+#[test]
+fn 表示言語に従う置き場は書き出しと排他の日本語の口を呼ばない() {
+    let mut failures = Vec::new();
+    for (path, src, span) in TYPED_WRITE_SCOPES {
+        let Some(lines) = client_store_lines(src, span) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 {} が見つからない（改名で番犬が空振りする。\
+                 TYPED_WRITE_SCOPES を直す）",
+                span_name(span)
+            ));
+            continue;
+        };
+        for (line, code) in lines {
+            if code.trim_start().starts_with("//") {
+                continue;
+            }
+            if let Some(call) = JA_WRITE_CALLS.iter().find(|c| code.contains(*c)) {
+                failures.push(format!(
+                    "{path}:{line}: 表示言語に従う置き場が日本語の口 `{call}…)` を呼んでいる = 英語表示でも \
+                     書き出し・排他の断りが日本語で混ざる（`*_typed` を呼んで `.to_string()` で返す）: {}",
+                    code.trim()
+                ));
+            }
+        }
+    }
+    report_all(failures);
+}
+
+/// 書き出し・排他の口・remote daemon → app の接続・データディレクトリの印（日本語の固定文を書かない範囲。
+/// 日英の対は `text_in` の網羅 match にだけ置く）
+const IO_REFUSAL_SCOPES: &[(&str, &str, Span)] = &[
+    (
+        CONFIG_IO_PATH,
+        CONFIG_IO_SRC,
+        Span::Item("pub fn lock_exclusive("),
+    ),
+    (
+        CONFIG_IO_PATH,
+        CONFIG_IO_SRC,
+        Span::Item("pub fn lock_exclusive_typed("),
+    ),
+    (
+        CONFIG_IO_PATH,
+        CONFIG_IO_SRC,
+        Span::Item("pub fn atomic_write("),
+    ),
+    (
+        CONFIG_IO_PATH,
+        CONFIG_IO_SRC,
+        Span::Item("pub fn atomic_write_typed("),
+    ),
+    (
+        CONFIG_IO_PATH,
+        CONFIG_IO_SRC,
+        Span::Item("pub fn atomic_write_with_backup("),
+    ),
+    (
+        CONFIG_IO_PATH,
+        CONFIG_IO_SRC,
+        Span::Item("pub fn atomic_write_with_backup_typed("),
+    ),
+    (
+        CONFIG_IO_PATH,
+        CONFIG_IO_SRC,
+        Span::Item("pub fn rotate_backups("),
+    ),
+    (
+        CONFIG_IO_PATH,
+        CONFIG_IO_SRC,
+        Span::Item("pub fn rotate_backups_typed("),
+    ),
+    (
+        CONFIG_IO_PATH,
+        CONFIG_IO_SRC,
+        Span::Item("impl DataDirUnresolved {"),
+    ),
+    (CONFIG_IO_PATH, CONFIG_IO_SRC, Span::Item("impl IoCause {")),
+    (REMOTE_PATH, REMOTE_SRC, Span::Item("impl AppIpcClient {")),
+    (SETTINGS_PATH, SETTINGS_SRC, Span::Item("pub fn save(")),
+    (DISCOVERY_PATH, DISCOVERY_SRC, Span::Item("pub fn write(")),
+    (
+        DISCOVERY_PATH,
+        DISCOVERY_SRC,
+        Span::Item("pub fn write_instance_only("),
+    ),
+];
+
+#[test]
+fn 書き出しと接続と置き場の口の断りに日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, src, span) in IO_REFUSAL_SCOPES {
+        let Some(lines) = client_store_lines(src, span) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 {} が見つからない（改名で番犬が空振りする。\
+                 IO_REFUSAL_SCOPES を直す）",
+                span_name(span)
+            ));
+            continue;
+        };
+        for (line, text) in front_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 書き出し・接続・置き場の口の断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （config_io::WriteError / tako_control::Reason へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 置き場の口（settings / discovery / layout）は「データディレクトリを解決できない」を素の文字列で
+/// 包まない（印 `config_io::DataDirUnresolved` で包む = 利用者へ返す枠が `IoCause` で表示言語に引ける）
+#[test]
+fn 置き場の口はデータディレクトリの断りを印で包む() {
+    let mut failures = Vec::new();
+    for (path, src) in [
+        (SETTINGS_PATH, SETTINGS_SRC),
+        (DISCOVERY_PATH, DISCOVERY_SRC),
+        (LAYOUT_FILE_PATH, LAYOUT_FILE_SRC),
+    ] {
+        let lines = front_scope_lines(src, None).expect("ファイルの本体");
+        for (line, code) in lines {
+            if code.trim_start().starts_with("//") {
+                continue;
+            }
+            if line_literals(code)
+                .iter()
+                .any(|lit| lit.contains("データディレクトリを解決できない"))
+            {
+                failures.push(format!(
+                    "{path}:{line}: データディレクトリの断りを素の文字列で書いている = 利用者へ返す枠が \
+                     表示言語で引けない（`config_io::DataDirUnresolved.io_error()` で包む）: {}",
+                    code.trim()
+                ));
+            }
+        }
+    }
+    report_all(failures);
+}
+
+/// `settings::save(` の結果を同じ文の中で `e.to_string()`（= `io::Error` の日本語の表示）のまま
+/// 断りへ載せている行（1 始まり）。文の終わり（`;` で閉じる行）まで、最大 5 行を見る
+fn settings_save_raw_wraps(src: &str) -> Vec<usize> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if !l.contains("settings::save(") || l.trim_start().starts_with("//") {
+            continue;
+        }
+        for (j, next) in lines.iter().enumerate().skip(i).take(5) {
+            if next.contains("e.to_string()") && !next.trim_start().starts_with("//") {
+                out.push(j + 1);
+            }
+            if next.trim_end().ends_with(';') {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 表示言語に従う枠（`Reason::SaveSettingsFailed` / 素の `Operation` / LSP の `Note`）へ settings.json の
+/// 書き出しの断りを載せるときは `IoCause::of(&e)` を通す（素の `e.to_string()` は印を日本語で出す）
+#[test]
+fn settings_の書き出しの断りを素の文で包まない() {
+    let mut failures = Vec::new();
+    for (path, src) in [
+        (DISPATCH_PATH, DISPATCH_SRC),
+        (LSP_MANAGER_PATH, LSP_MANAGER_SRC),
+    ] {
+        for line in settings_save_raw_wraps(src) {
+            failures.push(format!(
+                "{path}:{line}: settings.json の書き出しの断りを `e.to_string()` のまま載せている = \
+                 データディレクトリの断りが英語表示でも日本語で混ざる（`Reason::settings_save_failed(&e)` か \
+                 `config_io::IoCause::of(&e)` を通す）"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 文の終わりで止まり、同じ文の中の素の包みだけを名指す
+#[test]
+fn settings_の書き出しの走査は文の終わりで止まる() {
+    let src = "fn a() {\n    let _ = crate::settings::save(&s);\n    x.map_err(|e| e.to_string());\n    crate::settings::save(&s)\n        .map_err(|e| DispatchError::Operation(e.to_string()))?;\n    // crate::settings::save(&s).map_err(|e| e.to_string())\n}\n";
+    assert_eq!(settings_save_raw_wraps(src), vec![5]);
 }

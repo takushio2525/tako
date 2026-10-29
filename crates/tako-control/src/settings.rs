@@ -677,12 +677,7 @@ impl ThemeWarningLog {
 
 /// 設定を書き出す。tmp へ書いて rename する（読み手と競合しない。discovery と同方式）
 pub fn save(settings: &Settings) -> io::Result<PathBuf> {
-    let path = settings_path().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "データディレクトリを解決できない",
-        )
-    })?;
+    let path = settings_path().ok_or_else(|| crate::config_io::DataDirUnresolved.io_error())?;
     save_to(&path, settings)?;
     Ok(path)
 }

@@ -1426,8 +1426,13 @@ pub fn load() -> Option<LayoutFile> {
 /// 読み込み（理由付き）。不在と破損を区別できるので、起動時の復元は
 /// こちらを使って失敗理由をログに残す（Issue #30）
 pub fn try_load() -> Result<LayoutFile, LayoutError> {
+    // 文は置き場の口の共通の印（#2365）。この理由は persist.log と `tako persist` の診断
+    // （日本語の枠）にだけ出るので日本語のまま
     let path = layout_path().ok_or_else(|| {
-        LayoutError::Io("データディレクトリを解決できない（HOME 未設定等）".into())
+        LayoutError::Io(format!(
+            "{}（HOME 未設定等）",
+            crate::config_io::DataDirUnresolved
+        ))
     })?;
     load_file(&path)
 }
@@ -1463,12 +1468,7 @@ pub fn save(layout: &LayoutFile) -> io::Result<PathBuf> {
             "空のレイアウト（タブ / ペイン 0 個）は保存しない（既存の layout.json を保護）",
         ));
     }
-    let path = layout_path().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "データディレクトリを解決できない",
-        )
-    })?;
+    let path = layout_path().ok_or_else(|| crate::config_io::DataDirUnresolved.io_error())?;
     backup_if_lossy(&path, layout, BACKUP_MIN_INTERVAL);
     save_to(&path, layout)?;
     Ok(path)

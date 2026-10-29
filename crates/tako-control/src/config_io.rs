@@ -120,14 +120,22 @@ impl std::fmt::Display for LockError {
 /// 同一プロセスのスレッドも直列化するので無事だが、ロック無しで直接呼ぶ経路がある
 /// （#638 が `shell_integration::write_state_file` で、#625 が `tmux-backend.conf` で
 /// 閉じたのと同じ穴）
+///
+/// 断りの文は日本語（呼び手の多くが日本語の枠の文や persist.log へ載せる）。表示言語で返したい
+/// 呼び手は [`atomic_write_typed`] で型のまま受ける（#2365）
 pub fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
+    atomic_write_typed(path, content).map_err(|e| e.text_in(tako_core::i18n::Lang::Ja))
+}
+
+/// [`atomic_write`] の本体。断りを型で返す（文は [`WriteError::text_in`] で言語を選んで引く）
+pub fn atomic_write_typed(path: &Path, content: &str) -> Result<(), WriteError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     let Some(parent) = path.parent() else {
-        return Err(format!("親ディレクトリがない: {}", path.display()));
+        return Err(WriteError::NoParent(path.display().to_string()));
     };
-    std::fs::create_dir_all(parent).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+    std::fs::create_dir_all(parent).map_err(|e| WriteError::CreateDir(e.to_string()))?;
     // pid でプロセス間の衝突を、連番で同一プロセス内の衝突を防ぐ
     // （同一ディレクトリ = 同一 FS なので rename できる）
     let tmp = sibling_with_suffix(
@@ -145,31 +153,103 @@ pub fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     })();
     if let Err(e) = write_result {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "一時ファイルの書き込みに失敗 ({}): {e}",
-            tmp.display()
-        ));
+        return Err(WriteError::TmpWrite {
+            path: tmp.display().to_string(),
+            error: e.to_string(),
+        });
     }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        format!(
-            "rename に失敗 ({} → {}): {e}",
-            tmp.display(),
-            path.display()
-        )
+        WriteError::Rename {
+            from: tmp.display().to_string(),
+            to: path.display().to_string(),
+            error: e.to_string(),
+        }
     })
 }
 
 /// アトミック書き込み + 世代バックアップ。
-/// 既存内容と同一なら何もしない（無変更の save でバックアップを回転させない）
+/// 既存内容と同一なら何もしない（無変更の save でバックアップを回転させない）。
+/// 断りの文は日本語（[`atomic_write`] と同じ。型のまま受けるのは [`atomic_write_with_backup_typed`]）
 pub fn atomic_write_with_backup(path: &Path, content: &str) -> Result<(), String> {
+    atomic_write_with_backup_typed(path, content).map_err(|e| e.text_in(tako_core::i18n::Lang::Ja))
+}
+
+/// [`atomic_write_with_backup`] の本体。断りを型で返す
+pub fn atomic_write_with_backup_typed(path: &Path, content: &str) -> Result<(), WriteError> {
     if let Ok(existing) = std::fs::read_to_string(path) {
         if existing == content {
             return Ok(());
         }
     }
-    rotate_backups(path)?;
-    atomic_write(path, content)
+    rotate_backups_typed(path)?;
+    atomic_write_typed(path, content)
+}
+
+/// 書き出しの口（[`atomic_write`] / [`atomic_write_with_backup`] / [`rotate_backups`]）の断り（#2365）。
+/// `error` は OS のエラー文（言語に依らずそのまま載せる）、パスは表記のまま埋める
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteError {
+    /// 書き出し先に親ディレクトリが無い（`path` は書き出し先）
+    NoParent(String),
+    /// 親ディレクトリを作れない
+    CreateDir(String),
+    /// 一時ファイルへ書けない（`path` は一時ファイル）
+    TmpWrite { path: String, error: String },
+    /// 一時ファイルを書き出し先へ rename できない
+    Rename {
+        from: String,
+        to: String,
+        error: String,
+    },
+    /// 世代バックアップを 1 世代繰り下げられない（`path` は繰り下げ元）
+    BackupShift { path: String, error: String },
+    /// 本体を `.bak.1` へ複製できない（`path` は本体）
+    BackupCreate { path: String, error: String },
+}
+
+impl WriteError {
+    /// 表示言語を明示しての文言（#2365）。(バリアント, 言語) の網羅 match で、日本語は
+    /// #2365 より前の固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NoParent(path), Ja) => format!("親ディレクトリがない: {path}"),
+            (Self::NoParent(path), En) => format!("there is no parent directory: {path}"),
+            (Self::CreateDir(e), Ja) => format!("ディレクトリの作成に失敗: {e}"),
+            (Self::CreateDir(e), En) => format!("failed to create the directory: {e}"),
+            (Self::TmpWrite { path, error }, Ja) => {
+                format!("一時ファイルの書き込みに失敗 ({path}): {error}")
+            }
+            (Self::TmpWrite { path, error }, En) => {
+                format!("failed to write the temporary file ({path}): {error}")
+            }
+            (Self::Rename { from, to, error }, Ja) => {
+                format!("rename に失敗 ({from} → {to}): {error}")
+            }
+            (Self::Rename { from, to, error }, En) => {
+                format!("failed to rename ({from} → {to}): {error}")
+            }
+            (Self::BackupShift { path, error }, Ja) => {
+                format!("バックアップの繰り下げに失敗 ({path}): {error}")
+            }
+            (Self::BackupShift { path, error }, En) => {
+                format!("failed to shift the backup ({path}): {error}")
+            }
+            (Self::BackupCreate { path, error }, Ja) => {
+                format!("バックアップの作成に失敗 ({path}): {error}")
+            }
+            (Self::BackupCreate { path, error }, En) => {
+                format!("failed to create the backup ({path}): {error}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
 }
 
 /// バックアップパス（`projects.yaml` → `projects.yaml.bak.<generation>`）
@@ -181,8 +261,14 @@ pub fn backup_path(path: &Path, generation: u32) -> PathBuf {
 /// 本体 → `.bak.1` は rename ではなく copy を使う（rename だと本体が一瞬消え、
 /// 並行プロセスの load が「ファイル不在 = 0 件」と誤読する窓を作るため）。
 /// `atomic_write_with_backup` は毎書き込みで回すが、呼び出し側が独自条件で
-/// 世代を残したい場合（layout.json の縮退保存ガード。#177）は単体でも使える
+/// 世代を残したい場合（layout.json の縮退保存ガード。#177）は単体でも使える。
+/// 断りの文は日本語（型のまま受けるのは [`rotate_backups_typed`]）
 pub fn rotate_backups(path: &Path) -> Result<(), String> {
+    rotate_backups_typed(path).map_err(|e| e.text_in(tako_core::i18n::Lang::Ja))
+}
+
+/// [`rotate_backups`] の本体。断りを型で返す
+pub fn rotate_backups_typed(path: &Path) -> Result<(), WriteError> {
     if !path.is_file() {
         return Ok(());
     }
@@ -190,13 +276,78 @@ pub fn rotate_backups(path: &Path) -> Result<(), String> {
         let from = backup_path(path, generation);
         if from.is_file() {
             let to = backup_path(path, generation + 1);
-            std::fs::rename(&from, &to)
-                .map_err(|e| format!("バックアップの繰り下げに失敗 ({}): {e}", from.display()))?;
+            std::fs::rename(&from, &to).map_err(|e| WriteError::BackupShift {
+                path: from.display().to_string(),
+                error: e.to_string(),
+            })?;
         }
     }
-    std::fs::copy(path, backup_path(path, 1))
-        .map_err(|e| format!("バックアップの作成に失敗 ({}): {e}", path.display()))?;
+    std::fs::copy(path, backup_path(path, 1)).map_err(|e| WriteError::BackupCreate {
+        path: path.display().to_string(),
+        error: e.to_string(),
+    })?;
     Ok(())
+}
+
+/// データディレクトリを解決できない（#2365）。置き場の口（settings / discovery / layout）が
+/// `io::Error` に包んで返す断りの印で、文は [`crate::Reason::DataDirUnresolved`] の日英の対を引く。
+///
+/// `Display`（= `io::Error` の表示）は**日本語のまま**: 呼び手の多くは persist.log・起動時の警告
+/// （診断ログは日本語。FR-2.42.21）か日本語の枠の文へ載せるので、#2365 より前とバイト一致させる。
+/// 利用者へ返す断りは [`IoCause::of`] で取り出して表示言語で引く
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataDirUnresolved;
+
+impl DataDirUnresolved {
+    /// この印を包んだ `io::Error`（種類は #2365 より前と同じ `Unsupported`）
+    pub fn io_error(self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::Unsupported, self)
+    }
+}
+
+impl std::fmt::Display for DataDirUnresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::Reason::DataDirUnresolved.text_in(tako_core::i18n::Lang::Ja))
+    }
+}
+
+impl std::error::Error for DataDirUnresolved {}
+
+/// 置き場の口が返した `io::Error` の中身を、表示言語で文にできる形で持つ（#2365）。
+/// 断りの枠（`Reason::SaveSettingsFailed` ほか）が表示言語に従うとき、中身もこれで同じ言語にそろえる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IoCause {
+    /// [`DataDirUnresolved`]
+    DataDirUnresolved,
+    /// それ以外（OS のエラー文など。言語に依らずそのまま載せる）
+    Other(String),
+}
+
+impl IoCause {
+    /// `io::Error` から取り出す（[`DataDirUnresolved`] を包んだものだけを見分ける）
+    pub fn of(e: &std::io::Error) -> Self {
+        match e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<DataDirUnresolved>())
+        {
+            Some(_) => Self::DataDirUnresolved,
+            None => Self::Other(e.to_string()),
+        }
+    }
+
+    /// 表示言語を明示しての文言
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        match self {
+            Self::DataDirUnresolved => crate::Reason::DataDirUnresolved.text_in(lang),
+            Self::Other(text) => text.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for IoCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
 }
 
 /// tmp ファイルの suffix。`seq` が書き込み 1 回ごとに進むので、同一プロセス内で

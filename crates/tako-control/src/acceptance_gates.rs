@@ -97,12 +97,14 @@ impl AcceptanceGateStore {
     }
 
     pub fn mutate_at<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
-        let _lock = crate::config_io::lock_exclusive(path)?;
+        // 排他・書き出しの断りは置き場の断りと同じ表示言語で返す（型の口。#2365）
+        let _lock = crate::config_io::lock_exclusive_typed(path).map_err(|e| e.to_string())?;
         let mut store = Self::load_from(path)?;
         let result = f(&mut store);
         let content = serde_yaml::to_string(&store)
             .map_err(|e| Reason::YamlEncodeFailed(e.to_string()).to_string())?;
-        crate::config_io::atomic_write_with_backup(path, &content)?;
+        crate::config_io::atomic_write_with_backup_typed(path, &content)
+            .map_err(|e| e.to_string())?;
         Ok(result)
     }
 

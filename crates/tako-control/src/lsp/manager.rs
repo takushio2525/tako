@@ -3095,7 +3095,9 @@ impl Shared {
                 let mut settings = crate::settings::load();
                 apply(&mut settings.lsp_init_options)?;
                 crate::settings::save(&settings).map_err(|e| {
-                    text::fill(text::OPTIONS_SAVE_FAILED, &[("error", &e.to_string())])
+                    // 置き場の口の印は枠（Note）と同じ表示言語で引く（#2365）
+                    let error = crate::config_io::IoCause::of(&e).to_string();
+                    text::fill(text::OPTIONS_SAVE_FAILED, &[("error", &error)])
                 })?;
             } else {
                 apply(&mut self.lock().init_overrides)?;

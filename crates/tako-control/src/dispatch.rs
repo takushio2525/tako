@@ -401,8 +401,9 @@ pub enum Reason {
     ShortcutAddNeedsPath,
     /// `remove には path が必要（id でも可）`（リモート閲覧のショートカット）
     ShortcutRemoveNeedsPath,
-    /// `設定の保存に失敗: <e>`（settings.json の書き出し。中身は書き出しの口が返した文）
-    SaveSettingsFailed(String),
+    /// `設定の保存に失敗: <e>`（settings.json の書き出し。中身は書き出しの口が返した `io::Error`。
+    /// 口の印 = データディレクトリを解決できない も枠と同じ言語で引く）
+    SaveSettingsFailed(crate::config_io::IoCause),
     /// `データディレクトリを解決できない`（置き場を data dir の下に持つ操作。
     /// 文の違う [`tako_core::paths::NoDataDir`] とは別。日本語を #2365 より前とそろえるため）
     DataDirUnresolved,
@@ -619,6 +620,18 @@ pub enum Reason {
     GateNotFound(String),
     /// `直前に更新したタスクが無い`（返答を積んだ直後に読み直せない = 置き場の内部の不整合）
     TaskGoneAfterRespond,
+    // ---- #2365 の続き: remote daemon が tako app へ繋ぐ口（`remote.rs` の `AppIpcClient`）の断り。
+    // 同じ意味の文は上の GUI へ繋ぐ口のバリアントを使う。ここに置くのは日本語の文言が `ipc.rs` と
+    // 違っていた 3 つ（日本語を #2365 より前とバイト一致させるため分け、英語は同じ意味の文を引く） ----
+    /// `tako app へ接続できない (<socket>): <error>`（英語は [`Self::CannotConnect`] と同じ文）
+    AppCannotConnect {
+        socket: String,
+        error: String,
+    },
+    /// `リクエストの構築に失敗: <error>`（英語は [`Self::RequestEncodeFailed`] と同じ文）
+    AppRequestEncodeFailed(String),
+    /// `tako app から応答が返らなかった`（英語は [`Self::NoReply`] と同じ文）
+    AppNoReply,
 }
 
 /// 整形の範囲を表す 4 つの鍵（#1683。MCP `tako_lsp` の format の range と
@@ -1124,8 +1137,10 @@ impl Reason {
             (Self::ShortcutRemoveNeedsPath, En) => {
                 "path is required for remove (an id also works)".to_string()
             }
-            (Self::SaveSettingsFailed(e), Ja) => format!("設定の保存に失敗: {e}"),
-            (Self::SaveSettingsFailed(e), En) => format!("failed to save the settings: {e}"),
+            (Self::SaveSettingsFailed(e), Ja) => format!("設定の保存に失敗: {}", e.text_in(Ja)),
+            (Self::SaveSettingsFailed(e), En) => {
+                format!("failed to save the settings: {}", e.text_in(En))
+            }
             (Self::DataDirUnresolved, Ja) => "データディレクトリを解決できない".to_string(),
             (Self::DataDirUnresolved, En) => "cannot resolve the data directory".to_string(),
             (Self::UnknownColorKey(key), Ja) => format!("未知の色キー: {key}"),
@@ -1525,6 +1540,20 @@ impl Reason {
             (Self::GateNotFound(task_id), En) => format!("acceptance gate not found: {task_id}"),
             (Self::TaskGoneAfterRespond, Ja) => "直前に更新したタスクが無い".to_string(),
             (Self::TaskGoneAfterRespond, En) => "the task updated just now is missing".to_string(),
+            (Self::AppCannotConnect { socket, error }, Ja) => {
+                format!("tako app へ接続できない ({socket}): {error}")
+            }
+            (Self::AppCannotConnect { socket, error }, En) => Self::CannotConnect {
+                socket: socket.clone(),
+                error: error.clone(),
+            }
+            .text_in(En),
+            (Self::AppRequestEncodeFailed(error), Ja) => format!("リクエストの構築に失敗: {error}"),
+            (Self::AppRequestEncodeFailed(error), En) => {
+                Self::RequestEncodeFailed(error.clone()).text_in(En)
+            }
+            (Self::AppNoReply, Ja) => "tako app から応答が返らなかった".to_string(),
+            (Self::AppNoReply, En) => Self::NoReply.text_in(En),
         }
     }
 
@@ -1536,6 +1565,12 @@ impl Reason {
     /// 前置きの無い理由の文として載せる
     pub fn operation(self) -> DispatchError {
         DispatchError::Operation(self.to_string())
+    }
+
+    /// settings.json を書けなかった断り（[`Self::SaveSettingsFailed`]）。書き出しの口の `io::Error` の
+    /// 中身（データディレクトリを解決できない の印）も枠と同じ表示言語で引けるよう型で持つ（#2365）
+    pub fn settings_save_failed(e: &std::io::Error) -> Self {
+        Self::SaveSettingsFailed(crate::config_io::IoCause::of(e))
     }
 
     /// 応答の文が「ペイン画面に選択肢ダイアログが無い」を言っているか（#2365）。
@@ -4432,7 +4467,7 @@ fn theme_color_write(
         apply_color_write(&mut settings, target, host.theme_mode(), write)?;
         if should_save {
             crate::settings::save(&settings)
-                .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                .map_err(|e| Reason::settings_save_failed(&e).operation())?;
         }
     }
     host.reload_theme();
@@ -10669,7 +10704,7 @@ fn dispatch_inner(
                             .map_err(DispatchError::InvalidParams)?;
                     }
                     crate::settings::save(&settings)
-                        .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                        .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                     Ok(crate::sleep_guard::status(settings.sleep_guard_config()).to_json())
                 }
                 // 手段（macOS = sudoers 登録 / Windows = 権限不要）は `sleep_guard` 側に
@@ -10682,7 +10717,7 @@ fn dispatch_inner(
                     let mut settings = crate::settings::load();
                     settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::WhileAgentsRunning;
                     crate::settings::save(&settings)
-                        .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                        .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                     Ok(serde_json::json!({
                         "result": result,
                         "lid_sleep_mode": "while-agents-running",
@@ -10698,7 +10733,7 @@ fn dispatch_inner(
                     let mut settings = crate::settings::load();
                     settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::Off;
                     crate::settings::save(&settings)
-                        .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                        .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                     Ok(serde_json::json!({
                         "result": result,
                         "lid_sleep_mode": "off",
@@ -10773,7 +10808,7 @@ fn dispatch_inner(
                         let mut settings = crate::settings::load();
                         settings.theme = next_theme.clone();
                         crate::settings::save(&settings)
-                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                            .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                     }
                     let mode = ThemeMode::parse(&next_theme).unwrap_or_default();
                     host.set_theme_mode(mode);
@@ -10879,7 +10914,7 @@ fn dispatch_inner(
                         );
                         settings.theme = n.to_string();
                         crate::settings::save(&settings)
-                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                            .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                     }
                     host.reload_theme();
                     Ok(serde_json::json!({ "ok": true, "name": n }))
@@ -10900,7 +10935,7 @@ fn dispatch_inner(
                             }
                         }
                         crate::settings::save(&settings)
-                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                            .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                     }
                     host.reload_theme();
                     Ok(serde_json::json!({ "ok": true }))
@@ -10915,7 +10950,7 @@ fn dispatch_inner(
                             settings.font_size = Some(s.clamp(8.0, 32.0));
                         }
                         crate::settings::save(&settings)
-                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                            .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                     }
                     host.reload_theme();
                     Ok(serde_json::json!({ "ok": true }))
@@ -11068,7 +11103,7 @@ fn dispatch_inner(
                         let mut settings = crate::settings::load();
                         settings.language = setting.as_str().into();
                         crate::settings::save(&settings)
-                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                            .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                     }
                     let resolved = setting.resolve();
                     host.set_ui_lang(setting, resolved);
@@ -11138,7 +11173,7 @@ fn dispatch_inner(
                         let mut settings = crate::settings::load();
                         settings.ui_mode = next.as_str().into();
                         crate::settings::save(&settings)
-                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                            .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                     }
                     host.set_ui_mode(next);
                     Ok(status_json(host))
@@ -11210,7 +11245,7 @@ fn dispatch_inner(
                         let mut settings = crate::settings::load();
                         settings.telemetry = enabled;
                         crate::settings::save(&settings)
-                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                            .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                     }
                     Ok(serde_json::json!({
                         "telemetry": enabled,
@@ -11257,7 +11292,7 @@ fn dispatch_inner(
                         let mut settings = crate::settings::load();
                         settings.limit_service = next.as_str().into();
                         crate::settings::save(&settings)
-                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                            .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                     }
                     host.set_limit_service(next);
                     Ok(status_json(next))
@@ -11417,7 +11452,7 @@ fn dispatch_inner(
                     settings.pane_log_total_max_mb = t;
                 }
                 crate::settings::save(&settings)
-                    .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                    .map_err(|e| Reason::settings_save_failed(&e).operation())?;
                 let config = settings.pane_log_config();
                 host.apply_pane_log_config(config);
                 Ok(pane_log_status_json(&config))
@@ -12368,8 +12403,9 @@ fn dispatch_inner(
                 let ext_lower = ext_key.to_ascii_lowercase();
                 if remove {
                     settings.runner_defaults.remove(&ext_lower);
-                    crate::settings::save(&settings)
-                        .map_err(|e| DispatchError::Operation(e.to_string()))?;
+                    crate::settings::save(&settings).map_err(|e| {
+                        DispatchError::Operation(crate::config_io::IoCause::of(&e).to_string())
+                    })?;
                     let effective = builtins.get(&ext_lower).cloned();
                     Ok(json!({
                         "ext": ext_lower,
@@ -12380,8 +12416,9 @@ fn dispatch_inner(
                     settings
                         .runner_defaults
                         .insert(ext_lower.clone(), cmd.clone());
-                    crate::settings::save(&settings)
-                        .map_err(|e| DispatchError::Operation(e.to_string()))?;
+                    crate::settings::save(&settings).map_err(|e| {
+                        DispatchError::Operation(crate::config_io::IoCause::of(&e).to_string())
+                    })?;
                     Ok(json!({
                         "ext": ext_lower,
                         "command": cmd,
