@@ -497,13 +497,13 @@ fn rpc(scratch: &Scratch, line: &str) -> Result<String, String> {
         let Ok(reply) = serde_json::from_str::<Value>(reply) else {
             continue;
         };
-        if reply["id"] == Value::from(0) {
+        if reply["id"] == 0 {
             continue;
         }
         if let Some(message) = reply["error"]["message"].as_str() {
             return Ok(message.to_string());
         }
-        if reply["result"]["isError"] == Value::Bool(true) {
+        if reply["result"]["isError"] == true {
             let text = reply["result"]["content"][0]["text"].as_str().unwrap_or("");
             return Ok(text.to_string());
         }
