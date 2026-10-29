@@ -71,10 +71,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# 項目 108 に入った印（= 項目 107 の判定は済んだ）
+ITEM108='TAKO_SELF_TEST_786|TAKO_SELF_TEST_SKIPPED: 108'
+
 # 項目 107 の判定が済んだ（= 項目 108 に入った）か、セルフテストが終わったか
 item107_settled() {
-  grep -qE "TAKO_SELF_TEST_786|TAKO_SELF_TEST_SKIPPED: 108|TAKO_APP_SELF_TEST_(FAILED|OK)" "$RUN_LOG"
+  grep -qE "${ITEM108}|TAKO_APP_SELF_TEST_(FAILED|OK)" "$RUN_LOG"
 }
+
+# 項目 108 に入る前（= 項目 107 まで）の行。止めた回は止めたこと自体で #872 の
+# 「最終項目より前に quit した」が FAILED として出るので、判定はこの範囲だけで見る
+upto_108() { awk -v pat="$ITEM108" '$0 ~ pat {exit} {print}' "$RUN_LOG"; }
 
 # 1 回分: TMPDIR を回ごとに分けてセルフテストを回す
 #   run_one <ラベル> <full か stop> [VAR=VAL ...]  → RUN_RC / RUN_LOG を残す
@@ -122,17 +129,20 @@ run_one() {
     fi
   done
   echo "    [$label] rc=$RUN_RC"
-  grep -E "TAKO_SELF_TEST_782|TAKO_SELF_TEST_2490|SKIPPED: 107|TAKO_APP_SELF_TEST_(FAILED|OK)" "$RUN_LOG" \
+  upto_108 | grep -E "TAKO_SELF_TEST_782|TAKO_SELF_TEST_2490|SKIPPED: 107|TAKO_APP_SELF_TEST_FAILED" \
     | cut -c1-240 | sed 's/^/      /'
+  if [ "$mode" = full ]; then
+    grep -E "^TAKO_APP_SELF_TEST_(FAILED|OK)" "$RUN_LOG" | cut -c1-240 | sed 's/^/      /'
+  fi
 }
 
 failed_osc() { grep -q "TAKO_APP_SELF_TEST_FAILED: 107: 裏タブでも OSC" "$RUN_LOG" && echo 1; }
 failed_any() { grep -q "TAKO_APP_SELF_TEST_FAILED" "$RUN_LOG" && echo 1; }
-# 項目 107 を通った = 108 に入った（または最後まで通った）・FAILED が無い
+# 項目 107 を通った = 108 に入った（または最後まで通った）・それより前に FAILED が無い
 passed_107() {
-  [ -z "$(failed_any)" ] \
-    && grep -qE "TAKO_SELF_TEST_786|TAKO_SELF_TEST_SKIPPED: 108|TAKO_APP_SELF_TEST_OK" "$RUN_LOG" \
-    && echo 1
+  grep -qE "${ITEM108}|TAKO_APP_SELF_TEST_OK" "$RUN_LOG" || return 0
+  upto_108 | grep -q "TAKO_APP_SELF_TEST_FAILED" && return 0
+  echo 1
 }
 deferred_ok() { grep -q "TAKO_SELF_TEST_2490: deferred req=0 reserved=true delivered=true" "$RUN_LOG" && echo 1; }
 not() { [ -z "$1" ] && echo 1; }
