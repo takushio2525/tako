@@ -35,15 +35,25 @@
 #   状態を見て、全部そろって完了していればそれを結論にする（確定はいつもどおり 2 回連続の観測）。
 #   上限は --timeout > TAKO_WAIT_PR_CHECKS_TIMEOUT > 既定（DEFAULT_TIMEOUT）の順で決まる。
 #
+# 届かない = 赤ではない（#1704）:
+#   `gh pr checks` が `error connecting to api.github.com` で 1 回落ちただけで 3 で終わり、
+#   CI が全緑の PR（#1669 / #1630）を呼び手が「赤」と混同した。接続エラーと読めるときだけ
+#   指数バックオフ（1, 2, 4, 8 秒）で 5 回まで試し、届かないままなら到達性を名指しした 1 行で 5 を返す。
+#   認証切れ・存在しない PR・空や壊れた応答はやり直さず従来どおり 3（判定は lib/gh-retry.sh の 1 実装）。
+#
 # 使い方: bash scripts/wait-pr-checks.sh <PR番号> [--timeout <秒>] [--interval <秒>]
 # 終了コード: 0 = 全部緑 / 1 = 失敗あり / 2 = タイムアウト / 3 = 引数・gh のエラー /
-#             4 = base と衝突していて CI の run が作られない
+#             4 = base と衝突していて CI の run が作られない /
+#             5 = GitHub API に届かない（接続エラーがやり直しても続いた。CI の結論ではない）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 衝突の判定・案内・終了コード（PR_CONFLICT_EXIT）は merge-pr.sh と共有する
 # shellcheck source=lib/pr-conflict.sh
 . "${SCRIPT_DIR}/lib/pr-conflict.sh"
+# gh の接続エラーのやり直しと到達性の終了コード（GH_UNREACHABLE_EXIT）も merge-pr.sh と共有する
+# shellcheck source=lib/gh-retry.sh
+. "${SCRIPT_DIR}/lib/gh-retry.sh"
 
 # 外部連携のチェック（GitHub App が PR ごとに 1 本出す）。ワークフローから導出できないぶんはここ
 EXTERNAL_CHECKS=("Cloudflare Pages")
@@ -91,9 +101,11 @@ usage() {
   同じ結論を 2 回連続で観測するまで確定しない（GitHub API の揺れ対策）。
   上限（既定 6600 秒）に達したら最後にもう一度状態を見て、そろっていればそれを結論にする。
   上限は --timeout か環境変数 TAKO_WAIT_PR_CHECKS_TIMEOUT（秒）で変えられる（--timeout が優先）。
+  gh が接続エラーで落ちたら 1, 2, 4, 8 秒あけて 5 回まで試す。
 
 終了コード: 0 = 全部緑 / 1 = 失敗あり / 2 = タイムアウト / 3 = 引数・gh のエラー /
-            4 = base と衝突していて CI の run が作られない（取り込んで push し直す）
+            4 = base と衝突していて CI の run が作られない（取り込んで push し直す）/
+            5 = GitHub API に届かない（CI の結論ではない。ネットワークが戻ってから打ち直す）
 USAGE
 }
 
@@ -222,15 +234,21 @@ done < <(expected_checks | awk '!seen[$0]++')
 CHECKS_RAW=""
 POLL_ERR=""
 POLL_RC=0
+# gh のエラーの中身が分かるときの言い方（空の応答・壊れた JSON）。空なら従来の言い方
+POLL_WHY=""
+# 戻り値: 0 = 採れた / 1 = gh のエラー（3 で終わる）/ 2 = GitHub に届かない（5 で終わる。#1704）
 poll_checks() {
-  local out err
-  err="$(mktemp)"
-  set +e
-  out="$(gh pr checks "${PR}" --json name,bucket,state,completedAt 2>"${err}")"
-  POLL_RC=$?
-  set -e
-  POLL_ERR="$(cat "${err}")"
-  rm -f "${err}"
+  local out jq_err
+  POLL_WHY=""
+  # 接続エラーだけはここでやり直す（やり直しは 1 回の観測の内側 = 2 回連続の確定はそのまま効く）
+  if ! gh_retry pr checks "${PR}" --json name,bucket,state,completedAt; then
+    POLL_RC="${GH_RC}"
+    POLL_ERR="${GH_ERR}"
+    return 2
+  fi
+  out="${GH_OUT}"
+  POLL_RC="${GH_RC}"
+  POLL_ERR="${GH_ERR}"
   # gh の終了コードは 0 = 全部 pass / 1 = 失敗あり / 8 = pending。どれも JSON は出る
   if [[ -z "${out}" ]]; then
     # チェックが 1 本も登録されていない間は gh がエラーで返る（run 開始前 = まだ待つ）
@@ -238,9 +256,17 @@ poll_checks() {
       CHECKS_RAW=""
       return 0
     fi
+    if [[ ${POLL_RC} -eq 0 ]]; then POLL_WHY="gh pr checks の応答が空"; fi
     return 1
   fi
-  CHECKS_RAW="$(jq -r '.[] | [.bucket, (.completedAt // ""), .name] | @tsv' <<<"${out}")" || return 1
+  jq_err="$(mktemp)"
+  if ! CHECKS_RAW="$(jq -r '.[] | [.bucket, (.completedAt // ""), .name] | @tsv' <<<"${out}" 2>"${jq_err}")"; then
+    POLL_WHY="gh pr checks の応答を JSON として読めない"
+    POLL_ERR="$(cat "${jq_err}")"
+    rm -f "${jq_err:?}"
+    return 1
+  fi
+  rm -f "${jq_err:?}"
   return 0
 }
 
@@ -356,8 +382,19 @@ PROBE_WARNED=0
 FINAL_POLLS=0
 
 while :; do
-  if ! poll_checks; then
-    echo "エラー: gh pr checks が失敗した（PR #${PR} / 終了コード ${POLL_RC}）" >&2
+  POLL_STATUS=0
+  poll_checks || POLL_STATUS=$?
+  if [[ ${POLL_STATUS} -eq 2 ]]; then
+    # 届かない = CI の結論ではない（#1704）。赤の 1・gh のエラーの 3 と終了コードで分ける
+    echo "到達不能: $(gh_unreachable_reason)。CI の結論ではない（赤でも時間切れでもない）。ネットワークが戻ってから同じコマンドを打ち直す" >&2
+    exit "${GH_UNREACHABLE_EXIT}"
+  fi
+  if [[ ${POLL_STATUS} -ne 0 ]]; then
+    if [[ -n "${POLL_WHY}" ]]; then
+      echo "エラー: ${POLL_WHY}（PR #${PR} / 終了コード ${POLL_RC}）" >&2
+    else
+      echo "エラー: gh pr checks が失敗した（PR #${PR} / 終了コード ${POLL_RC}）" >&2
+    fi
     if [[ -n "${POLL_ERR}" ]]; then echo "${POLL_ERR}" >&2; fi
     exit 3
   fi

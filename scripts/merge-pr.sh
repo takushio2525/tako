@@ -27,13 +27,17 @@
 # 終了コード: 0 = merge が成立している（**すでに MERGED だった再実行も 0** = #1430）/
 #             1 = merge しなかった（CI 失敗・BEHIND・BLOCKED・draft・merge されずに CLOSED 等）/
 #             2 = CI が揃わずタイムアウト / 3 = 引数・gh のエラー /
-#             4 = base と衝突している（#1365。待ち側と同じ値 = 判定も案内も 1 実装）
+#             4 = base と衝突している（#1365。待ち側と同じ値 = 判定も案内も 1 実装）/
+#             5 = GitHub API に届かない（#1704。待ち側と同じ値。CI の結論ではないので打ち直す）
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 衝突の判定・案内・終了コード（PR_CONFLICT_EXIT）は wait-pr-checks.sh と共有する
 # shellcheck source=lib/pr-conflict.sh
 . "${SCRIPT_DIR}/lib/pr-conflict.sh"
+# gh の接続エラーのやり直しと到達性の終了コード（GH_UNREACHABLE_EXIT）も待ち側と共有する（#1704）
+# shellcheck source=lib/gh-retry.sh
+. "${SCRIPT_DIR}/lib/gh-retry.sh"
 
 # A/B（検出力の確認・計測専用）。1 = **修正前**のまま gh の --delete-branch に後始末を任せる
 # 腕。worktree から実行するとリモート head ブランチが消え残る（#1347）。
@@ -76,7 +80,8 @@ while [[ $# -gt 0 ]]; do
 
 終了コード: 0 = merge が成立している（すでに MERGED だった再実行も 0）/
             1 = merge しなかった / 2 = タイムアウト / 3 = 引数・gh のエラー /
-            4 = base と衝突している（取り込んで push し直す）
+            4 = base と衝突している（取り込んで push し直す）/
+            5 = GitHub API に届かない（CI の結論ではない。ネットワークが戻ってから打ち直す）
 USAGE
       exit 0
       ;;
@@ -94,20 +99,24 @@ command -v gh >/dev/null 2>&1 || die "gh が見つからない（https://cli.git
 command -v jq >/dev/null 2>&1 || die "jq が見つからない（brew install jq）"
 
 PR_JSON=""
+# gh pr merge を呼んだ後か（届かなかったときの言い方が変わる。merge は成立しているかもしれない）
+MERGE_CALLED=0
 fetch_pr() {
-  local err rc
-  err="$(mktemp)"
-  set +e
-  PR_JSON="$(gh pr view "${PR}" --json number,state,isDraft,mergeable,mergeStateStatus,headRefName,headRefOid,baseRefName,isCrossRepository,title,url 2>"${err}")"
-  rc=$?
-  set -e
-  if [[ ${rc} -ne 0 || -z "${PR_JSON}" ]]; then
-    echo "エラー: gh pr view が失敗した（PR #${PR} / 終了コード ${rc}）" >&2
-    cat "${err}" >&2
-    rm -f "${err}"
+  # 接続エラーはやり直し、届かないままなら待ち側と同じ 5（#1704）
+  if ! gh_retry pr view "${PR}" --json number,state,isDraft,mergeable,mergeStateStatus,headRefName,headRefOid,baseRefName,isCrossRepository,title,url; then
+    if [[ ${MERGE_CALLED} -eq 1 ]]; then
+      echo "merge の成否を確かめられない: $(gh_unreachable_reason)。ネットワークが戻ってから同じコマンドを打ち直す（MERGED なら後始末だけ確かめて 0 で終わる）" >&2
+    else
+      echo "merge しない: $(gh_unreachable_reason)。CI の結論ではない。ネットワークが戻ってから同じコマンドを打ち直す" >&2
+    fi
+    exit "${GH_UNREACHABLE_EXIT}"
+  fi
+  PR_JSON="${GH_OUT}"
+  if [[ ${GH_RC} -ne 0 || -z "${PR_JSON}" ]]; then
+    echo "エラー: gh pr view が失敗した（PR #${PR} / 終了コード ${GH_RC}）" >&2
+    if [[ -n "${GH_ERR}" ]]; then echo "${GH_ERR}" >&2; fi
     exit 3
   fi
-  rm -f "${err}"
 }
 
 pr_field() { jq -r --arg k "$1" '.[$k] // "" | tostring' <<<"${PR_JSON}"; }
@@ -310,6 +319,9 @@ if [[ ${RC} -ne 0 ]]; then
   if [[ ${RC} -eq ${PR_CONFLICT_EXIT} ]]; then
     # 待ち側が案内を出しているので繰り返さない（#1365）
     echo "merge しない: base と衝突している（wait-pr-checks.sh の終了コード ${RC}）" >&2
+  elif [[ ${RC} -eq ${GH_UNREACHABLE_EXIT} ]]; then
+    # 届かない = 赤ではない（#1704）。「CI が揃っていない」と言うと赤と読まれる
+    echo "merge しない: GitHub API に届かない（wait-pr-checks.sh の終了コード ${RC}。CI の結論ではない）" >&2
   else
     echo "merge しない: CI が揃っていない（wait-pr-checks.sh の終了コード ${RC}）" >&2
   fi
@@ -327,6 +339,7 @@ set +e
 MERGE_OUT="$(gh pr merge "${PR}" --squash --delete-branch 2>&1)"
 MERGE_RC=$?
 set -e
+MERGE_CALLED=1
 if [[ -n "${MERGE_OUT}" ]]; then echo "${MERGE_OUT}"; fi
 
 # **gh の終了コードは merge の成否ではない**（#1430）。--delete-branch の後始末は
@@ -335,6 +348,12 @@ if [[ -n "${MERGE_OUT}" ]]; then echo "${MERGE_OUT}"; fi
 fetch_pr
 STATE="$(pr_field state)"
 if [[ "${STATE}" != "MERGED" ]]; then
+  # merge の呼び出し自体が届かなかった = 拒否ではない（#1704）。merge は呼び直さず
+  # （成否の分からない書き込みを重ねない）、打ち直しを案内して到達性の 5 で終わる
+  if [[ ${MERGE_RC} -ne 0 && "${GH_RETRY_LEGACY}" != "1" ]] && gh_unreachable_error "${MERGE_OUT}"; then
+    echo "merge しない: gh pr merge が GitHub API に届かなかった（PR の状態 ${STATE} / 最後: $(gh_first_line "${MERGE_OUT}")）。CI の結論ではない。ネットワークが戻ってから同じコマンドを打ち直す" >&2
+    exit "${GH_UNREACHABLE_EXIT}"
+  fi
   echo "merge に失敗した（PR の状態 ${STATE} / gh の終了コード ${MERGE_RC}）" >&2
   exit 1
 fi

@@ -15,13 +15,16 @@
 #   6. base と衝突していて **run が作られない**状態は待たずに 4 で終わる（#1365）
 #   7. skip されたチェック（docs だけの PR の macOS / Windows）は完了・緑として数える（#2084）
 #   8. 上限に達した = 失敗ではない。最後にもう一度見て、そろっていれば緑・赤の結論を出す（#2047）
+#   9. gh の一時的な接続エラーはやり直し、届かないままなら到達性の 5 で終わる（赤の 1 と分ける。#1704）
 # 併せて期待名の導出（pull_request で起動する job のみ / name 無しは job id）と、
 # merge-pr.sh が「揃っていないときに merge を呼ばない」ことも見る。
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$PWD"
 # 実行した人の環境の上限・A/B の腕を持ち込まない（Test 35 が既定の上限を見る）
-unset TAKO_WAIT_PR_CHECKS_TIMEOUT TAKO_2047_LEGACY
+unset TAKO_WAIT_PR_CHECKS_TIMEOUT TAKO_2047_LEGACY TAKO_1704_LEGACY TAKO_GH_RETRY_ATTEMPTS
+# gh のやり直しの待ち（既定 1, 2, 4, 8 秒）を 0 へ縮める。既定の値そのものは Test 40 が関数で見る
+export TAKO_GH_RETRY_BASE=0
 WAIT_SH="${REPO_ROOT}/scripts/wait-pr-checks.sh"
 MERGE_SH="${REPO_ROOT}/scripts/merge-pr.sh"
 
@@ -128,6 +131,12 @@ case "$1 ${2:-}" in
     f="${M}/view.${n}.json"
     [[ -f "${f}" ]] || f="${M}/view.json"
     [[ -f "${f}" ]] || { echo "mock: view の応答ファイルが無い" >&2; exit 1; }
+    # checks と同じく "ERR <終了コード> <本文>" で gh のエラーを模す（#1704 の接続エラー）
+    if head -1 "${f}" | grep -q '^ERR '; then
+      code="$(head -1 "${f}" | awk '{print $2}')"
+      sed -e '1s/^ERR [0-9]* //' "${f}" >&2
+      exit "${code}"
+    fi
     # merge 済みなら本物と同じく MERGED を返す（merge-pr.sh は状態で成否を決める）
     if [[ -f "${M}/merged" ]]; then jq '.state = "MERGED"' "${f}"; else cat "${f}"; fi
     exit 0
@@ -995,6 +1004,221 @@ if [[ "${MAC_LIMIT_MIN}" =~ ^[0-9]+$ && "${DEFAULT_SEC}" =~ ^[0-9]+$ ]]; then
 else
   ng "既定の上限と macOS の job の上限を読めない" "DEFAULT_TIMEOUT='${DEFAULT_SEC}' / timeout-minutes='${MAC_LIMIT_MIN}'"
 fi
+
+# ---------------------------------------------------------------- #1704: gh に届かない
+# 9/24 に PR #1669 / #1630 の worker が踏んだ形: CI は全緑なのに gh pr checks が 1 回だけ
+# `error connecting to api.github.com` で落ち、待ちが 3（gh のエラー）で終わった。
+# 呼び手は 3 と 1（赤）をどちらも「merge してはいけない」と読むので、ネットの瞬断が赤に化ける
+GH_DNS_ERR="ERR 1 error connecting to api.github.com
+check your internet connection or https://githubstatus.com"
+green_checks() {
+  checks_json "${CF}|pass|2026-09-24T04:24:00Z" "${MAC}|pass|2026-09-24T04:56:50Z" "${WIN}|pass|2026-09-24T04:49:33Z"
+}
+VIEW_OK='{"number":1669,"state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
+ "headRefName":"fix/1704-x","baseRefName":"main","title":"[修正] テスト用","url":"https://example.invalid/pr/1669"}'
+
+echo "== Test 36: gh が 1 回だけ届かなくても、やり直して緑なら 0（#1704）=="
+new_case t36
+printf '%s\n' "${GH_DNS_ERR}" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.2.json"
+out="$(run_wait 1669 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "1 回失敗 → 2 回目成功は 0" "${rc}" "0"
+assert_has "やり直したことを 1 行で出す" "gh pr checks が GitHub に届かない（1/5 回目: error connecting to api.github.com）" "${out}"
+assert_has "緑で揃ったと言う" "CI が全部緑で揃った（期待 3 本 / 報告 3 本）" "${out}"
+assert_eq "やり直しの 1 回 + 確定の 2 回連続の観測" "$(calls_of 'pr checks')" "3"
+
+# A/B: 修正前の腕（やり直さない）は同じ応答で 3 = gh のエラーになる。これが #1704 の症状そのもの
+new_case t36legacy
+printf '%s\n' "${GH_DNS_ERR}" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.2.json"
+out="$(TAKO_1704_LEGACY=1 run_wait 1669 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "修正前の腕は CI が全緑でも 3 で終わる" "${rc}" "3"
+assert_eq "修正前の腕はやり直さない" "$(calls_of 'pr checks')" "1"
+
+# 接続エラーの言い方は 1 つではない（gh は DNS だけを整形し、ほかは Go の原文のまま出す）
+i=0
+for msg in \
+  'Get "https://api.github.com/graphql": dial tcp: lookup api.github.com: no such host' \
+  'Post "https://api.github.com/graphql": read tcp 192.0.2.10:50000->198.51.100.7:443: read: connection reset by peer' \
+  'Post "https://api.github.com/graphql": net/http: TLS handshake timeout' \
+  'non-200 OK status code: 502 Bad Gateway body: ""' \
+  'HTTP 503: Service Unavailable (https://api.github.com/repos/o/r/commits/x)' \
+  'GraphQL: Something went wrong while executing your query. This may be the result of a timeout'; do
+  i=$((i + 1))
+  new_case "t36form${i}"
+  printf 'ERR 1 %s\n' "${msg}" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+  green_checks > "${TAKO_GH_MOCK_DIR}/checks.2.json"
+  out="$(run_wait 1669 --timeout 20 --interval 1)"
+  assert_eq "接続エラーの形 ${i} もやり直して 0（${msg:0:40}…）" "$?" "0"
+done
+
+echo "== Test 37: 届かないまま使い切ったら到達性の 5（赤の 1・gh のエラーの 3 と分ける。#1704）=="
+new_case t37
+printf '%s\n' "${GH_DNS_ERR}" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 1669 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "届かないままなら 5" "${rc}" "5"
+assert_eq "既定は 5 回試す" "$(calls_of 'pr checks')" "5"
+assert_has "到達性を名指しした 1 行の理由" "到達不能: GitHub API に届かない（gh pr checks を 5 回試して全部が接続エラー / 最後: error connecting to api.github.com）" "${out}"
+assert_has "CI の結論ではないと言い切る" "CI の結論ではない（赤でも時間切れでもない）" "${out}"
+assert_eq "理由は 1 行（到達不能の行は 1 本）" "$(grep -c '^到達不能: ' <<<"${out}")" "1"
+assert_hasnt "失敗のチェックがあるとは言わない" "失敗しているチェック" "${out}"
+assert_hasnt "gh のエラー（3）の言い方をしない" "gh pr checks が失敗した" "${out}"
+
+new_case t37n
+printf '%s\n' "${GH_DNS_ERR}" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(TAKO_GH_RETRY_ATTEMPTS=3 run_wait 1669 --timeout 20 --interval 1)"
+assert_eq "回数を変えても届かなければ 5" "$?" "5"
+assert_eq "TAKO_GH_RETRY_ATTEMPTS=3 なら 3 回で諦める" "$(calls_of 'pr checks')" "3"
+
+# 待っている途中の瞬断: 1 回目の観測が緑 → 2 回目の呼び出しが落ちる → やり直しで緑。
+# やり直しは 1 回の観測の内側なので、2 回連続の観測による確定はそのまま効く
+new_case t37mid
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+printf '%s\n' "${GH_DNS_ERR}" > "${TAKO_GH_MOCK_DIR}/checks.2.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.3.json"
+out="$(run_wait 1669 --timeout 20 --interval 1)"
+assert_eq "待ちの途中の瞬断もやり直して 0" "$?" "0"
+assert_eq "観測 2 回 + やり直し 1 回" "$(calls_of 'pr checks')" "3"
+
+echo "== Test 38: 既存の結論は届かなかったことに化けない（#1704）=="
+new_case t38red
+printf '%s\n' "${GH_DNS_ERR}" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+checks_json "${CF}|pass|2026-09-24T04:24:00Z" "${MAC}|fail|2026-09-24T04:56:50Z" "${WIN}|pass|2026-09-24T04:49:33Z" \
+  > "${TAKO_GH_MOCK_DIR}/checks.2.json"
+out="$(run_wait 1669 --timeout 20 --interval 1)"
+assert_eq "やり直した先が赤なら従来どおり 1" "$?" "1"
+assert_has "失敗の本数を出す" "失敗しているチェックが 1 本ある。merge してはいけない" "${out}"
+
+new_case t38auth
+printf 'ERR 1 HTTP 401: Bad credentials (https://api.github.com/graphql)\nTry authenticating with:  gh auth login\n' \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 1669 --timeout 20 --interval 1)"
+assert_eq "認証切れは接続エラーではない = 従来どおり 3" "$?" "3"
+assert_eq "認証切れはやり直さない" "$(calls_of 'pr checks')" "1"
+assert_has "gh の言い分をそのまま出す" "Bad credentials" "${out}"
+
+new_case t38nopr
+printf 'ERR 1 GraphQL: Could not resolve to a PullRequest with the number of 99999. (repository.pullRequest)\n' \
+  > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 99999 --timeout 20 --interval 1)"
+assert_eq "存在しない PR（could not resolve to …）は名前解決の失敗と取り違えず 3" "$?" "3"
+assert_eq "存在しない PR はやり直さない" "$(calls_of 'pr checks')" "1"
+
+new_case t38empty
+: > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 1669 --timeout 20 --interval 1)"
+assert_eq "応答が空（終了コード 0）は 3" "$?" "3"
+assert_has "空だったと言う" "gh pr checks の応答が空" "${out}"
+assert_eq "空の応答はやり直さない" "$(calls_of 'pr checks')" "1"
+
+new_case t38json
+printf '[{"name":"Cloudflare Pages","bucket":\n' > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_wait 1669 --timeout 20 --interval 1)"
+assert_eq "JSON が壊れていれば 3" "$?" "3"
+assert_has "JSON として読めないと言う" "gh pr checks の応答を JSON として読めない" "${out}"
+assert_eq "壊れた JSON はやり直さない" "$(calls_of 'pr checks')" "1"
+
+echo "== Test 39: merge-pr.sh も届かないことを 5 で返し、merge を呼ばない（#1704）=="
+new_case t39wait
+printf '%s\n' "${GH_DNS_ERR}" > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+printf '%s\n' "${VIEW_OK}" > "${TAKO_GH_MOCK_DIR}/view.json"
+out="$(run_merge 1669 --timeout 20 --interval 1)"
+rc=$?
+assert_eq "待ち側が 5 なら merge-pr.sh も 5" "${rc}" "5"
+assert_has "CI が揃っていないとは言わず、届かないと言う" "merge しない: GitHub API に届かない（wait-pr-checks.sh の終了コード 5。CI の結論ではない）" "${out}"
+assert_hasnt "CI が揃っていないとは言わない" "merge しない: CI が揃っていない" "${out}"
+assert_eq "merge を呼ばない" "$(calls_of 'pr merge')" "0"
+
+new_case t39view
+printf '%s\n' "${GH_DNS_ERR}" > "${TAKO_GH_MOCK_DIR}/view.1.json"
+printf '%s\n' "${VIEW_OK}" > "${TAKO_GH_MOCK_DIR}/view.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_merge 1669 --timeout 20 --interval 1)"
+assert_eq "gh pr view の 1 回の瞬断はやり直して merge まで進む（0）" "$?" "0"
+assert_has "やり直したことを出す" "gh pr view が GitHub に届かない（1/5 回目" "${out}"
+assert_eq "merge を 1 回呼ぶ" "$(calls_of 'pr merge')" "1"
+
+new_case t39viewdown
+printf '%s\n' "${GH_DNS_ERR}" > "${TAKO_GH_MOCK_DIR}/view.json"
+out="$(run_merge 1669 --timeout 20 --interval 1)"
+assert_eq "gh pr view が届かないままなら 5" "$?" "5"
+assert_has "merge しない理由に到達性を名指しする" "merge しない: GitHub API に届かない（gh pr view を 5 回試して全部が接続エラー" "${out}"
+assert_eq "CI を待たない" "$(calls_of 'pr checks')" "0"
+assert_eq "merge を呼ばない" "$(calls_of 'pr merge')" "0"
+
+# merge の後で状態を確かめられない = merge は成立しているかもしれない。打ち直せば
+# MERGED の再実行として 0 で終わる（#1430）ので、そう案内する
+new_case t39after
+printf '%s\n' "${VIEW_OK}" > "${TAKO_GH_MOCK_DIR}/view.1.json"
+printf '%s\n' "${VIEW_OK}" > "${TAKO_GH_MOCK_DIR}/view.2.json"
+printf '%s\n' "${GH_DNS_ERR}" > "${TAKO_GH_MOCK_DIR}/view.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+out="$(run_merge 1669 --timeout 20 --interval 1)"
+assert_eq "merge の後に状態を確かめられなければ 5" "$?" "5"
+assert_has "merge の成否が分からないと言う" "merge の成否を確かめられない: GitHub API に届かない" "${out}"
+assert_has "打ち直しで MERGED なら 0 と案内する" "MERGED なら後始末だけ確かめて 0 で終わる" "${out}"
+assert_eq "merge は呼んでいる" "$(calls_of 'pr merge')" "1"
+
+new_case t39merge
+printf '%s\n' "${VIEW_OK}" > "${TAKO_GH_MOCK_DIR}/view.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+: > "${TAKO_GH_MOCK_DIR}/merge.not-merged"
+echo 1 > "${TAKO_GH_MOCK_DIR}/merge.rc"
+printf 'error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com\n' \
+  > "${TAKO_GH_MOCK_DIR}/merge.err"
+out="$(run_merge 1669 --timeout 20 --interval 1)"
+assert_eq "gh pr merge が届かず merge されていなければ 5" "$?" "5"
+assert_has "merge しない理由に到達性を名指しする" "merge しない: gh pr merge が GitHub API に届かなかった" "${out}"
+
+new_case t39mergefail
+printf '%s\n' "${VIEW_OK}" > "${TAKO_GH_MOCK_DIR}/view.json"
+green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+: > "${TAKO_GH_MOCK_DIR}/merge.not-merged"
+echo 1 > "${TAKO_GH_MOCK_DIR}/merge.rc"
+printf 'GraphQL: Pull Request is not mergeable (mergePullRequest)\n' > "${TAKO_GH_MOCK_DIR}/merge.err"
+out="$(run_merge 1669 --timeout 20 --interval 1)"
+assert_eq "接続エラーではない merge の失敗は従来どおり 1" "$?" "1"
+assert_has "従来の言い方のまま" "merge に失敗した（PR の状態 OPEN" "${out}"
+
+echo "== Test 40: 接続エラーの判定とやり直しの間隔（lib/gh-retry.sh の関数。#1704）=="
+(
+  # shellcheck source=lib/gh-retry.sh
+  . "${REPO_ROOT}/scripts/lib/gh-retry.sh"
+  for e in "error connecting to api.github.com" "dial tcp: lookup api.github.com: no such host" \
+    "connect: connection refused" "read: connection reset by peer" "i/o timeout" \
+    "net/http: TLS handshake timeout" "context deadline exceeded (Client.Timeout exceeded while awaiting headers)" \
+    "unexpected EOF" "HTTP 502: Bad Gateway" "HTTP 504: Gateway Timeout" "connect: network is unreachable"; do
+    if gh_unreachable_error "${e}"; then echo "PASS 接続エラー: ${e}"; else echo "FAIL 接続エラーと読めない: ${e}"; fi
+  done
+  for e in "HTTP 401: Bad credentials" "To get started with GitHub CLI, please run:  gh auth login" \
+    "GraphQL: Could not resolve to a PullRequest with the number of 1. (repository.pullRequest)" \
+    "no checks reported on the 'x' branch" "HTTP 404: Not Found" "API rate limit exceeded for user ID 1." \
+    "HTTP 500: Internal Server Error" ""; do
+    if gh_unreachable_error "${e}"; then echo "FAIL 接続エラーと取り違える: ${e}"; else echo "PASS 接続エラーではない: ${e}"; fi
+  done
+  # 指数バックオフ: 既定は 1, 2, 4, 8 秒（5 回試す = 待ちは 4 回で計 15 秒 = 数十秒以内）。
+  # このテストは TAKO_GH_RETRY_BASE=0 で走るので、lib の既定値そのものから組み立てる
+  delays="" total=0 a=1
+  while [[ ${a} -lt ${GH_RETRY_DEFAULT_ATTEMPTS} ]]; do
+    d="$(gh_retry_delay "${GH_RETRY_DEFAULT_BASE}" "${a}")"
+    a=$((a + 1))
+    delays="${delays}${d} "
+    total=$((total + d))
+  done
+  echo "DELAYS ${delays}"
+  echo "TOTAL ${total}"
+) > "${TMP}/t40.out" 2>&1
+while IFS= read -r line; do
+  case "${line}" in
+    "PASS "*) ok "${line#PASS }" ;;
+    "FAIL "*) ng "${line#FAIL }" "判定の取り違え" ;;
+  esac
+done < "${TMP}/t40.out"
+assert_eq "既定の間隔は倍々（1, 2, 4, 8 秒）" "$(sed -n 's/^DELAYS //p' "${TMP}/t40.out")" "1 2 4 8 "
+assert_eq "既定の待ちの合計は 15 秒" "$(sed -n 's/^TOTAL //p' "${TMP}/t40.out")" "15"
 
 echo
 echo "=== 結果: PASS=${PASS} FAIL=${FAIL} ==="
