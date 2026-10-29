@@ -394,6 +394,7 @@ fn 器のサーバーへ引き上げた値を渡し器のシェルには起動�
         .map_or_else(|| "unlimited".to_string(), |h| h.to_string());
     let home = TempHome::new();
     fd_limit::arm_children(LAUNCH_SOFT);
+    // tako:caller-env-ok 器の段として登録するだけ（段は上限を下げて exec し、呼び出し元・接続先を読まない。#1716）
     fd_limit::register_container_exec(PathBuf::from(env!("CARGO_BIN_EXE_tako")));
 
     // ── 1. 修正後 ──────────────────────────────────────────────────────────────

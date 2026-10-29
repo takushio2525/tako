@@ -1294,6 +1294,26 @@ CI（env なし）では緑のテストが手元でだけ落ちる（偽の赤�
   `set_var` でプロセス全体の env を揃える（並列に走る他のテストが同じ env を読む）
 - lib の `src/` で子を起こすと `platform_parity` のコンソール窓の件数表に載る（製品の起動ではない旨の理由を書く）
 
+## CLI のテストは呼び出し元ペインの env を読まない（Issue #1716）
+
+**`tako` の実行ファイルの単体テスト（`crates/tako-cli/src/main.rs` ほか）は、テストのビルドでは
+`caller_pane` が env（`TAKO_PANE_ID`）を読まず、既定で「呼び出し元なし」（CI と同じ）を返す。**
+上の #2391 の CLI 版。`build_request` の `target_pane` は `--pane` が無ければ呼び出し元へ倒れるので、
+`--pane` を省略したテストは tako の中（シェルが env を継承している）でだけ通り CI で落ちていた。
+
+- 実物: PR #1706 の `openの行と桁は1始まりで負値と0を弾く` が `--pane` を省略し、worker の手元では通り
+  CI の macOS / Windows で「対象ペインを特定できない」と落ちた
+- **書き方**: 呼び出し元ありの腕を見るテストは `test_caller::with_caller(Some(n), || …)` で名指しする
+  （値はスレッドごとなので並走する他のテストへ漏れない）。有無の両方は `issue1958_both_caller_arms`。
+  `TAKO_TAB_ID` は tako-cli のどこも読まない（呼び出し元の手掛かりは `TAKO_PANE_ID` だけ）
+- **番犬**: `crates/tako-cli/tests/issue1716_caller_pane_env_watchdog.rs` が、差し替えを迂回する経路
+  （`TAKO_PANE_ID` の直読み・lib の中からの `caller_pane()`・実行ファイルのモジュールからの
+  `ipc::caller_pane` の名指し）と、製品の `tako` を子で起こすのに `TAKO_PANE_ID` / `TAKO_SOCKET` を
+  外す形（両方の `env_remove` / `env_clear()` / `TAKO_` の一掃）を持たない結合テストを `file:line` で
+  落とす。意図して製品の読みを見る行・env を外さずに起こしてよい起動（器の段として登録するだけ等）は
+  同じ行か 1 行上に `// tako:caller-env-ok <理由>`。
+  env の名前を定数で渡す読み・結合テストの起動箇所ごとの区別は見ない（既知の穴）
+
 ## lib のテストで A/B の env を立てない（Issue #2395）
 
 **`crates/*/src` のテストで、製品が実行時に読む env（A/B の `TAKO_*_LEGACY`・置き場の差し替え）を

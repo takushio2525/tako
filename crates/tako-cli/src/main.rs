@@ -28,13 +28,20 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 // IPC クライアントと MCP の stdio ブリッジは `tako-mcp`（#2021）と共有する 1 実装
 use tako_cli::ipc::{
-    caller_pane, resolve_caller_pane_via_app, send_request, send_request_classified, transport,
-    SendFailure, TransportError,
+    resolve_caller_pane_via_app, send_request, send_request_classified, transport, SendFailure,
+    TransportError,
 };
 use tako_cli::mcp_bridge;
 use tako_control::claude_mod::text::ModText;
 use tako_control::orchestrator::wait;
 use tako_control::protocol::{Axis, Direction, Request};
+
+// 呼び出し元ペイン（`TAKO_PANE_ID`。FR-2.1.1）。テストのビルドだけは env を読まない差し替えへ
+// 向ける（#1716。手元のシェルが継承した env でテストが通り CI で落ちる「偽の緑」を作らない）
+#[cfg(not(test))]
+use tako_cli::ipc::caller_pane;
+#[cfg(test)]
+use test_caller::caller_pane;
 
 /// ヘルプへ埋める「修飾 + クリック」の表記（実行プラットフォーム。Issue #763）。
 ///
@@ -14053,6 +14060,42 @@ fn print_result(command: &Command, result: &Value) {
     }
 }
 
+/// テストのビルドの呼び出し元ペイン（#1716）。
+///
+/// 製品の `caller_pane` は `TAKO_PANE_ID` を読むので、`--pane` を省略したテストは tako の中
+/// （シェルが env を継承している）で走らせたときだけ通り、CI（env 無し）で落ちていた
+/// （PR #1706）。テストのビルドでは env を読まず、既定は「呼び出し元なし」（CI と同じ）にする。
+/// 呼び出し元ありの腕を見たいテストは [`with_caller`](test_caller::with_caller) で名指しする。
+/// 迂回する経路（env の直読み・`ipc::caller_pane` の名指し）は
+/// `tests/issue1716_caller_pane_env_watchdog.rs` が `file:line` で落とす
+#[cfg(test)]
+mod test_caller {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLER: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// 名指しした呼び出し元（既定は無し）。env は読まない
+    pub fn caller_pane() -> Option<u64> {
+        CALLER.with(Cell::get)
+    }
+
+    /// `f` の間だけ呼び出し元を `pane` にする（抜けるとき・落ちたときに元へ戻す）。
+    /// 値はスレッドごと（libtest はテストを 1 本ずつ別のスレッドで走らせる）なので、
+    /// 並走する他のテストへは漏れない
+    pub fn with_caller<R>(pane: Option<u64>, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<u64>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CALLER.with(|c| c.set(self.0));
+            }
+        }
+        let _restore = Restore(CALLER.with(|c| c.replace(pane)));
+        f()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -14662,9 +14705,10 @@ mod tests {
     /// #1676: `--line` / `--column` は 1 始まり。**負値は CLI にしか見えない**
     /// （dispatch の `usize` は負値を持てない）ので、境界はここで見る。
     ///
-    /// `--pane` は必ず名指しする（省略すると `target_pane` が `TAKO_PANE_ID` を読み、
-    /// tako の**中**で走らせたときだけ通る = CI と手元で結果が割れる。実際に CI の
-    /// macOS / Windows 両方で踏んだ）。隣の `openは絶対パスとモード別名を解釈する` も同じ形
+    /// `--pane` は必ず名指しする（省略すると呼び出し元が無いので落ちる。PR #1706 では
+    /// `target_pane` が `TAKO_PANE_ID` を読み、tako の**中**で走らせたときだけ通って CI の
+    /// macOS / Windows 両方で落ちた。#1716 からテストのビルドは env を読まない）。
+    /// 隣の `openは絶対パスとモード別名を解釈する` も同じ形
     #[test]
     fn openの行と桁は1始まりで負値と0を弾く() {
         let abs = if cfg!(windows) {
@@ -15893,44 +15937,78 @@ mod tests {
         assert!(Cli::try_parse_from(["tako", "limit-resume", "yes"]).is_err());
     }
 
-    /// #1958: 呼び出し元（`TAKO_PANE_ID`）の**有無の両方の腕**を子プロセスで回す。
+    /// #1958: 呼び出し元の**有無の両方の腕**で同じ本体を回す。
     ///
-    /// env は起動時にしか変えられず、期待値を `caller_pane()` で書いたテストは CI（env 無し）だと
-    /// 「埋めない」逆戻りを見分けられない（期待値も逆戻りも `None`）。子では `TAKO_PANE_ID=4242`
-    /// と「無し」で同じテストを `--exact` で 1 本だけ走らせ、1 件通ったことまで確かめる
-    fn issue1958_both_caller_arms(test: &str) {
-        if std::env::var_os("TAKO_1958_CHILD").is_some() {
+    /// 期待値を `caller_pane()` で書いたテストは、呼び出し元が無い腕（CI と同じ）だけだと
+    /// 「埋めない」逆戻りを見分けられない（期待値も逆戻りも `None`）。#1716 からテストのビルドは
+    /// env を読まないので、子プロセスの `TAKO_PANE_ID` ではなく
+    /// [`test_caller::with_caller`] で呼び出し元を名指しして回す
+    fn issue1958_both_caller_arms(body: impl Fn()) {
+        for caller in [Some(4242), None] {
+            let arm = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                test_caller::with_caller(caller, &body)
+            }));
+            if let Err(panic) = arm {
+                eprintln!("呼び出し元 {caller:?} の腕で落ちた");
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+
+    /// #1716: テストのビルドは呼び出し元ペインの env（`TAKO_PANE_ID`）を読まない。
+    ///
+    /// `--pane` を省略したテストは、tako の中（シェルが env を継承している）でだけ通り CI（env 無し）で
+    /// 落ちていた（PR #1706）。env は起動時にしか変えられないので、tako の中のシェルと同じ env を
+    /// 持たせた 1 本だけの子（`rerun_alone`。本番の GUI の接続情報は外す）で、呼び出し元なし = CI と
+    /// 同じ結果になることを見る。呼び出し元ありの腕は `with_caller` で名指ししたときだけ
+    #[test]
+    fn issue1716_テストのビルドは呼び出し元ペインのenvを読まない() {
+        if tako_core::test_child::rerun_alone(
+            "tests::issue1716_テストのビルドは呼び出し元ペインのenvを読まない",
+            &["TAKO_SOCKET", "TAKO_TOKEN"],
+        ) {
             return;
         }
-        let exe = std::env::current_exe().expect("テストバイナリのパス");
-        for caller in [Some("4242"), None] {
-            let mut cmd = std::process::Command::new(&exe);
-            cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
-                .env("TAKO_1958_CHILD", "1");
-            match caller {
-                Some(pane) => cmd.env("TAKO_PANE_ID", pane),
-                None => cmd.env_remove("TAKO_PANE_ID"),
+        // 子の中だけ（他のテストは居ない。#2400）: tako の中のシェルと同じ形の env
+        std::env::set_var("TAKO_PANE_ID", "4242");
+        std::env::set_var("TAKO_TAB_ID", "7");
+        // tako:caller-env-ok 対照（子に env が本当に立っていること。立っていなければ下の None は空振り）
+        let product = tako_cli::ipc::caller_pane();
+        assert_eq!(product, Some(4242), "製品の読みは env を見る");
+        assert_eq!(caller_pane(), None, "テストのビルドは env を読まない");
+
+        let abs = if cfg!(windows) {
+            r"C:\tmp\a.rs"
+        } else {
+            "/tmp/a.rs"
+        };
+        let omitted = parse(&["tako", "open", abs, "--line", "42"]);
+        let err = build_request(&omitted).unwrap_err();
+        // 断りの文は設定の表示言語に従う（#2358）。どちらの言語でも同じ断りであればよい
+        let said = [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+            .into_iter()
+            .any(|lang| err == tako_control::NoTargetPaneAt::Cli.text_in(lang));
+        assert!(said, "{err}");
+        // 名指ししたときだけ呼び出し元が入る（抜けたら元の「無し」へ戻る）
+        test_caller::with_caller(Some(5), || {
+            let Request::OpenFile { pane, .. } = build_request(&omitted).unwrap() else {
+                panic!("OpenFile になる");
             };
-            let out = cmd.output().expect("自分自身を起動できる");
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert!(
-                out.status.success() && text.contains("1 passed"),
-                "TAKO_PANE_ID={caller:?} の腕が落ちた:\n{text}"
-            );
-        }
+            assert_eq!(pane, Some(5));
+        });
+        assert_eq!(caller_pane(), None);
     }
 
     /// #1958: `tako show-command` の `--pane` 省略は呼び出し元（TAKO_PANE_ID）。修正前は
     /// `args.pane` をそのまま送り、最簡形 `tako show-command "…"` が「対象ペインが未指定」で
     /// 断られていた。`--card` 指定は dispatch がカードの所在ペインを引くので埋めない。
-    /// 期待値は `caller_pane()` で書き、env の有無の両方を [`issue1958_both_caller_arms`] で回す
+    /// 期待値は `caller_pane()` で書き、呼び出し元の有無の両方を [`issue1958_both_caller_arms`] で回す
     #[test]
     fn issue1958_show_commandのpane省略は呼び出し元() {
-        issue1958_both_caller_arms("tests::issue1958_show_commandのpane省略は呼び出し元");
+        issue1958_both_caller_arms(issue1958_show_command_arm);
+    }
+
+    fn issue1958_show_command_arm() {
         let pane_of = |args: &[&str]| match build_request(&parse(args)) {
             Ok(Request::ShowCommand { pane, .. }) => Ok(pane),
             Ok(other) => panic!("ShowCommand になるはず: {other:?}"),
@@ -15978,7 +16056,10 @@ mod tests {
     /// #1958: `tako sessions link` の `--pane` 省略は呼び出し元（ヘルプの説明どおり。resume と同じ）
     #[test]
     fn issue1958_sessions_linkのpane省略は呼び出し元() {
-        issue1958_both_caller_arms("tests::issue1958_sessions_linkのpane省略は呼び出し元");
+        issue1958_both_caller_arms(issue1958_sessions_link_arm);
+    }
+
+    fn issue1958_sessions_link_arm() {
         let pane_of = |args: &[&str]| match build_request(&parse(args)).unwrap() {
             Request::Sessions { pane, .. } => pane,
             other => panic!("Sessions になるはず: {other:?}"),
