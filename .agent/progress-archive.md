@@ -670,3 +670,11 @@
 - 2026-10-28 #724: Windows の Web ビューの生成を App の借用の外で 1 本ずつ・Windows では ipc を付けない・生成中に落ちた Web ビューを次の起動で保留
 - 2026-10-28 #2247: 「Finder で表示」を tako 自身の NSWorkspace で Finder を前面へ出す 1 実装にし、プレビュー・設定画面も dispatch へ寄せた
 - 2026-10-28 #2426: #2413 の e2e の 2 件 = 起動待ちから起こした run の run_status が `launch_waiting` のまま残る・e2e が master の役割を付けていなかった
+- 2026-10-28 #1599: Windows の `platform::process::terminate` を実装・remote の停止 2 経路を `stop_verified_daemon` へ寄せ、止められなければ Err
+- 2026-10-28 #2450 CI の macOS ジョブの上限を 60 → 90 分へ・CI 待ちの既定 4800 → 6600 秒
+- 2026-10-28 #2434: Windows のアプリ内更新 = インストーラーの検査（取得元・大きさ・sha256・PE）→ 無言の起動 → tako が抜けてから入れ替え → 起動し直し
+- 2026-10-28 #2432: Windows のシェル統合を `$PROFILE` に書かず、ペインの PowerShell を `-NoExit -EncodedCommand` で起こして読ませる。旧ブロックは移行 `powershell_profile` が外す
+- 2026-10-28 #2435: Windows の `\` の形のパス（`C:\…`・UNC・`src\main.rs:10:5`）をリンクの候補にする・ignore 5 本を外す
+- 2026-10-28 #2445: wry 0.55.1 → 0.57.1・#724 の番犬を 0.57 の根拠へ・要素の全画面表示は切ったまま・背景の生成で前面に出ないことを番犬で固定
+- 2026-10-28 #641: 復元の直後に全ペインが PTY 死亡しても終了せず器なしのシェルで続ける `restore_guard`・連続 2 回で次の起動は復元を見送る
+- 2026-10-28 #1510: 初回起動で副作用の小さい setup の段を自動で走らせ、「次にやること」をバナーに出す・導入とログインはボタン 1 つの同意・`tako welcome next|auto|hide`

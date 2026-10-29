@@ -20,30 +20,6 @@
 
 ---
 
-## 2026-10-28（#1599: Windows の `platform::process::terminate` を実装・remote の停止 2 経路を `stop_verified_daemon` へ寄せ、止められなければ Err）
-- 注入で実プロセス 5 本 / 番犬 3 通りが名指しで FAILED・実 daemon で 3 経路を確認・カタログ +0 B。stale 経路は #2455。PR #2449
-
-## 2026-10-28（CI の macOS ジョブの上限を 60 → 90 分へ・CI 待ちの既定 4800 → 6600 秒）
-- PR の CI が重なると 60 分で打ち切られていた（10/27 に 2 本）。PR #2450
-
-## 2026-10-28（#2434: Windows のアプリ内更新 = インストーラーの検査（取得元・大きさ・sha256・PE）→ 無言の起動 → tako が抜けてから入れ替え → 起動し直し）
-- カタログ +194 B。実機の通しは未実測（Refs）。PR #2443
-
-## 2026-10-28（#2432: Windows のシェル統合を `$PROFILE` に書かず、ペインの PowerShell を `-NoExit -EncodedCommand` で起こして読ませる。旧ブロックは移行 `powershell_profile` が外す）
-- macOS の pwsh 実物で確認・Windows CI で Restricted 相当の e2e・カタログ +74 B。実機と psmux は未検証（Refs）。PR #2457
-
-## 2026-10-28（#2435: Windows の `\` の形のパス（`C:\…`・UNC・`src\main.rs:10:5`）をリンクの候補にする・ignore 5 本を外す）
-- 単体 68 本 + dispatch 2 本・CLI 実経路 8/8（macOS）・注入で 2 本が落ちる・カタログ +0 B。実機の Ctrl+クリックは未（Refs）。PR #2456
-
-## 2026-10-28（#2445: wry 0.55.1 → 0.57.1・#724 の番犬を 0.57 の根拠へ・要素の全画面表示は切ったまま・背景の生成で前面に出ないことを番犬で固定）
-- 隔離セルフテスト OK・実経路 PASS 16・カタログ +0 B。Windows 実機と全画面の出入りは未実測。PR #2451
-
-## 2026-10-28（#641: 復元の直後に全ペインが PTY 死亡しても終了せず器なしのシェルで続ける `restore_guard`・連続 2 回で次の起動は復元を見送る）
-- 隔離 GUI の実経路 PASS 43（修正前は終了 → 救済・見送り）・カタログ +0 B。Windows 実機は未確認。PR #2453
-
-## 2026-10-28（#1510: 初回起動で副作用の小さい setup の段を自動で走らせ、「次にやること」をバナーに出す・導入とログインはボタン 1 つの同意・`tako welcome next|auto|hide`）
-- 実経路 PASS 46（初回 / 未認証 / 完了 / オフライン / 途中で落とす）・カタログ +141 B。PR #2460
-
 ## 2026-10-28（#2455: PID ファイルが消えた remote daemon を `tako remote stop` で止める = 管理トークンの停止要求の応答から pid を得る・status に `pidless_listener`）
 - 隔離の実 daemon で修正前は生き残る → 修正後は `via: shutdown` で停止・注入で 4 本が FAILED・カタログ +0 B。PR #2463
 
@@ -79,3 +55,27 @@
 
 ## 2026-10-28（#2415: dispatch.rs の実 PTY テスト 3 本の fixture を `$SHELL -l` から `/bin/sh -c "exec sleep 600"` へ・番犬が素の `SpawnOptions::default()` を名指し）
 - 修正前 20/20 FAILED（ssh 探索の 5 秒に rc が alt screen へ入る形）→ 修正後 60/60 ok・カタログ +0 B。PR #2474
+
+## 2026-10-29（#2479: test_write_isolation の `shell_probe` を尽きたら落ちる状態待ち `wait_for_shell` へ寄せ、実行は出力にだけ出るマーカーで判定・番犬 issue1308 を広げた）
+- 修正前は毎回プロンプトの折り返しで 20 秒の窓を使い切って無言で通っていた → 修正後 0.4 秒・`stuck` / `deaf` は `TAKO_2479_WAIT` で落ちる・30 回 × 並列 1 / 4 全通過・カタログ +0 B。PR #2481
+
+## 2026-10-29（#2477: 子の走査が 1 瞬間だけ居た子を拾うと 60 秒 busy が残り項目 694(e) が間欠で落ちる → busy の集合が変わった回を次の tick で確かめ直す `settled_against`・A/B `TAKO_2477_LEGACY=1`）
+- 旧 + 注入で 694(e) が 14.5 秒で落ち、新 + 注入は 1.6 秒で通る・単体 30 回 × 並列 1 / 4 全通過・カタログ +0 B。PR #2483
+
+## 2026-10-29（#2470: 突然死の復旧案内を `tako orchestrator resume <worker_id>` にし、spawn と同じ組み立て（`--settings`・許可モード・env・role）で戻す）
+- 偽 claude の実経路で修正前は 4 つとも落ちる → 修正後は全部載る・無人の復旧は隣の CLI を絶対パスで打つ・カタログ +0 B。main の `supervisor_loop` が呼び手ゼロなのが判明（#665 にコメント）。PR #2482
+
+## 2026-10-29（#885: tako-app のペイン spawn と器の名前の予約を backend の入口 `wrap_spawn_for_pane` / `reserve_for_pane` 経由へ・組み立てを `wrap_options_for` の 1 実装にして psmux も通す）
+- 修正前後で器のペインの argv 6 種がバイト一致・不正な器の名前は器なしで起こして persist.log へ・カタログ +0 B。psmux の conf の差は #2484・Windows 実機は未（Refs）。PR #2485
+
+## 2026-10-29（#2365 の続き: action で選ぶツールの断り（不明な action・値・要る引数）と設定の保存・置き場・`tako_theme` の残りを `Reason` へ。87 か所・16 種、dispatch の日本語の断り 243 → 157）
+- 実経路で修正前 FAIL 68 / 28 → 修正後 0・日本語 68 + 77 本一致・注入 5 通りで名指し・カタログ +0 B。PR #2487
+
+## 2026-10-30（#2388: セルフテストの FAILED の出口も `on_app_quit` と同じ後片付け `cleanup_process_scoped` を上限 5 秒で通す・設定置き場を器より先に消す・番犬 `selftest_exit_cleanup_watchdog`）
+- 修正前の main で器・ソケット・設定置き場が残る → 修正後は残らない（実経路の A/B）・固まっても理由と rc=1 は保つ・カタログ +0 B。visual-test の出口は #2491。PR #2488
+
+## 2026-10-30（#2486: layout.json で表のペインどうしが同じ器の名前を持つと 2 本目の `-D` が 1 本目を切り離して閉じていた → 先のペインが器を持ち 2 本目以降は新しい器で起こす `restore_vessels`・FR-5.22）
+- 隔離 GUI で修正前 3→2 / 3→1 ペイン → 修正後 PASS 39・番犬の注入で main.rs を名指し・persist.log に 1 行・カタログ +0 B。PR #2489
+
+## 2026-10-30（#2365 の続き: MCP の前段 33 か所と CLI の前段 27 か所の断りを `Reason`（+48 種）へ）
+- 実経路 50 ケースで英語表示の日本語入り 50 → 0・日本語はバイト一致・カタログ +0 B。残りは dispatch の個別の文 約 157 か所ほか（Issue の最後のコメントの表）。PR #2492
