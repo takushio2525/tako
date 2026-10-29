@@ -4542,3 +4542,55 @@ fn action_で選ぶツールの断りの旧形の判定の境界() {
         vec![r#"a \"b\" c"#, "d", "tail"]
     );
 }
+
+/// 境界: 呼び手が埋める値（打たれた綴り・プリセットの一覧・OS の文）は日英どちらでも同じ形で埋まる
+#[test]
+fn action_で選ぶツールの断りの値の埋め込みの境界() {
+    // 打たれた綴りは Debug の引用（中の引用符はエスケープ）で、日英とも同じ表記
+    let quoted = Reason::UnknownValue {
+        key: "action",
+        got: "a\"b".into(),
+        allowed: "x / y".into(),
+    };
+    assert_eq!(
+        quoted.text_in(Lang::Ja),
+        "不明な action: \"a\\\"b\"（x / y のいずれか）"
+    );
+    assert_eq!(
+        quoted.text_in(Lang::En),
+        "unknown action: \"a\\\"b\" (one of x / y)"
+    );
+    // プリセットが無いときは「なし」/ none、複数は ` / ` で並べる
+    let none = Reason::UnknownTheme {
+        got: "x".into(),
+        presets: Vec::new(),
+    };
+    assert!(none.text_in(Lang::Ja).ends_with("プリセット: なし）"));
+    assert!(none.text_in(Lang::En).ends_with("presets: none)"));
+    let many = Reason::UnknownTheme {
+        got: "x".into(),
+        presets: vec!["a".into(), "b".into(), "c".into()],
+    };
+    assert!(many.text_in(Lang::Ja).ends_with("プリセット: a / b / c）"));
+    assert!(many.text_in(Lang::En).ends_with("presets: a / b / c)"));
+    // 書き出しの口の文は日英とも書き換えずに後ろへ付ける（空でも前置きだけ）
+    for e in ["", "Read-only file system (os error 30)"] {
+        let r = Reason::SaveSettingsFailed(e.into());
+        assert_eq!(r.text_in(Lang::Ja), format!("設定の保存に失敗: {e}"));
+        assert_eq!(
+            r.text_in(Lang::En),
+            format!("failed to save the settings: {e}")
+        );
+    }
+    // 候補の意味（lid_power_condition）は言語ごとに引き、日本語はカタログの説明と同じ文
+    assert_eq!(
+        tako_control::sleep_guard::PowerCondition::values_hint(),
+        tako_control::sleep_guard::PowerCondition::values_hint_in(Lang::Ja)
+    );
+    assert!(
+        has_japanese(&tako_control::sleep_guard::PowerCondition::values_hint_in(
+            Lang::En
+        ))
+        .is_none()
+    );
+}
