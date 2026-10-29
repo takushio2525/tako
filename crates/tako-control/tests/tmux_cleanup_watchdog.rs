@@ -268,15 +268,23 @@ fn サーバー回収は所有者の生死で判定し既定はdry_runである(
 
 /// #1192: 使い捨てソケット（`tako-iso-<自分の pid>` / `tako-st-<自分の pid>`）は
 /// 終了時に自分で片付ける。**明示指定された `TAKO_TMUX_SOCKET` には触らない**
-/// （再起動をまたいでセッションを残す検証が実在する = #770）
+/// （再起動をまたいでセッションを残す検証が実在する = #770）。
+/// 片付けはセルフテストの失敗の出口と共有する `cleanup_process_scoped` の 1 実装（#2388）なので、
+/// `on_app_quit` がそれを呼び、その本体が判定と kill を持つことを見る
+/// （失敗の出口からの配線は tako-app の番犬 `selftest_exit_cleanup_watchdog` が見る）
 #[test]
 fn 使い捨てbackendサーバーは終了時に自分で片付ける() {
     let root = workspace_root();
     let app = read(&root, "crates/tako-app/src/main.rs");
     let quit = code_only(&block_after(&app, "cx.on_app_quit("));
     assert!(
-        quit.contains("owns_disposable_socket") && quit.contains("kill_server"),
-        "終了時に使い捨て backend サーバーを片付けていない（#1192 の溜まる側）:\n{quit}"
+        quit.contains("cleanup_process_scoped("),
+        "終了時に使い捨て backend サーバーを片付けていない（#1192 の溜まる側。#2388 の 1 実装を呼ぶ）:\n{quit}"
+    );
+    let shared = code_only(&block_after(&app, "fn cleanup_process_scoped("));
+    assert!(
+        shared.contains("owns_disposable_socket") && shared.contains("kill_server"),
+        "終了時の後片付けの 1 実装が使い捨て backend サーバーを落としていない（#1192 / #2388）:\n{shared}"
     );
     let core = read_code(&root, "crates/tako-core/src/tmux_cleanup.rs");
     let owns = code_only(&block_after(&core, "pub fn owns_disposable_socket("));
