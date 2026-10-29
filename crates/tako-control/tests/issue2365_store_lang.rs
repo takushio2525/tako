@@ -483,7 +483,11 @@ fn old_ja(name: &str) -> String {
         "todo_store_broken" => {
             "user-tasks.yaml のパースに失敗: YAML の構文が壊れている（3 行 3 列）".into()
         }
-        "todo_store_dir" => format!("user-tasks.yaml の置き場を作れない: {}", os(17)),
+        // 親の位置にファイルがある = 既に在る（unix は EEXIST = 17・Windows は ERROR_ALREADY_EXISTS = 183）
+        "todo_store_dir" => format!(
+            "user-tasks.yaml の置き場を作れない: {}",
+            os(if cfg!(windows) { 183 } else { 17 })
+        ),
         "gate_store_unreadable" => format!("acceptance_gates.yaml の読み取りに失敗: {}", os(13)),
         "checkpoint_store_unreadable" => {
             format!("task_checkpoints.yaml の読み取りに失敗: {}", os(13))
