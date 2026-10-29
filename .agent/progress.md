@@ -20,33 +20,6 @@
 
 ---
 
-## 2026-10-28（#2455: PID ファイルが消えた remote daemon を `tako remote stop` で止める = 管理トークンの停止要求の応答から pid を得る・status に `pidless_listener`）
-- 隔離の実 daemon で修正前は生き残る → 修正後は `via: shutdown` で停止・注入で 4 本が FAILED・カタログ +0 B。PR #2463
-
-## 2026-10-28（#2448: テストが残す `sleep 600` は probe の「少し出してから固まる子」の孫 → `exec` にし、一巡の番犬がプロセスグループの残りを数える）
-- PR #2465
-
-## 2026-10-28（#2431: Windows の WebView2 のユーザーデータを `%LOCALAPPDATA%\tako\WebView2` へ（移行 `webview2_data`）・生成の失敗を無い / 古い / その他に分けて案内・check-health に版）
-- PR #2464
-
-## 2026-10-28（#2458: ipc の残骸のテストが全体実行で Live と読む = drop した受け口の fd を並走テストの子が握っていた → listen しないソケットで作る）
-- 修正前は 19,998 回中 6 回通る → 0 回・注入で修正前 5/5 FAILED → 修正後 5/5 ok・カタログ +0 B。PR #2467
-
-## 2026-10-28（#2454: Windows のペイン・言語サーバの子孫を Job Object で回収・ペインを閉じたときは GUI のアプリとその子孫を残す・境界 B30 `platform::job`）
-- Windows CI の実プロセスで孫の停止と GUI の子孫の残りを確認・カタログ +0 B。実機と psmux は未（Refs）。PR #2461
-
-## 2026-10-28（#2466: remote stop が起動 → 記録 5 秒超の本物の daemon を「pid 再利用」と断り state を消していた → 起動時刻を片側照合・断るときは state を残す）
-- 隔離の実 daemon で修正前は取り残す → 修正後は停止・注入で 4 本が落ちる・カタログ +0 B。PR #2468
-
-## 2026-10-28（#2424: 時間の番犬を束縛した関数の中だけで数える・#2413 の復元の時差のテストを gate の止めた時計で測る）
-- 注入で修正前は番犬が補助関数を 3 か所名指し・時差テストは 5/5 FAILED → 修正後 ok・カタログ +0 B。PR #2469
-
-## 2026-10-28（#2447: 再起動をまたぐ復元とカタログの再開にも spawn と同じ MCP の断片 = `worker_mcp_args` / `prepare_for_resume` の 1 実装）
-- 隔離 GUI の実経路で修正前は復元の断片 0 個 → 修正後は spawn と一致・カタログ +0 B。突然死の復旧案内は #2470。PR #2471
-
-## 2026-10-28（#2462: Windows の probe の打ち切り・`tako queue` の取り消し・AI 命名の上限・session-restart の孫を #2454 の Job の境界で回収 `KillScope`）
-- Windows CI の実プロセスで孫が止まり（旧アームでは残る）、普通に終わった子の常駐は残ることを確認・カタログ +0 B。実機は未（Refs）。PR #2472
-
 ## 2026-10-29（#2473: 復元・sessions resume・会話を保った再起動の worker を spawn と同じ `build_worker_cmd_in` の 1 実装へ。落ちていた --permission-mode auto・--remote-control 等を戻した）
 - 隔離 GUI + 偽 claude / codex で修正前 FAIL 6 → 修正後 PASS 26・番犬の注入 10 通り・カタログ +0 B。PR #2476
 
@@ -79,3 +52,30 @@
 
 ## 2026-10-30（#2365 の続き: MCP の前段 33 か所と CLI の前段 27 か所の断りを `Reason`（+48 種）へ）
 - 実経路 50 ケースで英語表示の日本語入り 50 → 0・日本語はバイト一致・カタログ +0 B。残りは dispatch の個別の文 約 157 か所ほか（Issue の最後のコメントの表）。PR #2492
+
+## 2026-10-30（#2490: 隔離セルフテストの項目 107 が #1979 の上限の時計を巻き戻さず間欠的に落ちる → 両方の時計を `open_redraw_windows` で空けてから流す・予約が流れる判定を追加・番犬 `selftest_redraw_window_watchdog`）
+- 注入 clock / piggyback で旧は FAILED（osc req=0）→ 新は通る・カタログ +0 B。PR #2493
+
+## 2026-10-30（#1704: wait-pr-checks.sh / merge-pr.sh の gh の接続エラーを `lib/gh-retry.sh` で 1, 2, 4, 8 秒あけて 5 回まで試し、届かないままなら到達性の終了コード 5・認証切れ等は従来どおり 3）
+- モックテスト 修正前 FAIL 50 → 修正後 PASS 273・カタログ +0 B。PR #2495
+
+## 2026-10-30（#2498: CI 待ちの既定の上限の記述（commands.md・`DEFAULT_TIMEOUT` のコメント）を 6600 秒・macOS の job 90 分へ・`release.sh --promote` の docs の PR で merge-pr.sh の 5 を「回線が戻ってから」と出し分け）
+- 昇格のモック Test 4c / 4d を追加（修正前は 3 件 FAIL → 修正後 142 pass）・カタログ +0 B。PR #2499
+
+## 2026-10-30（#2365 の続き: GUI へ繋ぐ口（ipc.rs・時間切れ・起動失敗の包み）と置き場（ゲート・チェックポイント・人がやること・TaskStore・YAML の理由）の断りを日英へ（Reason 155 → 179））
+- A/B: CLI / MCP 13 件・dispatch 30 件の英語表示の日本語入り → 0・日本語バイト一致・カタログ +0 B。PR #2497
+
+## 2026-10-30（#2496: 項目 108 / 110 の `measure_output_redraw` も `open_redraw_windows` で両方の時計を空ける。いまの並びでは対象はフォーカス中で落ちない = 潜在）
+- `unfocus` 注入で修正前は 108 / 110 とも FAILED → 修正後は通る・注入なし 4/4・番犬が `main.rs:<行>` を名指し・カタログ +0 B。PR #2500
+
+## 2026-10-30（#2501: CI 待ちの既定を書いた md・コメント・--help の数字を `DEFAULT_TIMEOUT` と ci.yml の job の上限に突き合わせる番犬 `issue2501_wait_timeout_docs_watchdog`。docs だけの PR でも ubuntu で走る）
+- 実ファイルへの注入 3 通りでファイルと行を名指しして落ち、戻すと緑・カタログ +0 B。PR #2502
+
+## 2026-10-30（#2365 の続き: config_io の書き出し 6 文 → `WriteError`・remote.rs の AppIpcClient 9 行 → `Reason`・データディレクトリの断り 5 か所 → `DataDirUnresolved` / `IoCause`）
+- 実経路 A/B で英語表示の日本語入り 置き場 5 → 0・remote daemon 4 → 0、日本語はバイト一致・カタログ +0 B。PR #2504
+
+## 2026-10-30（#1614: cargo test 中の bash の syntax error は shell_dialect の意図的な負の対照（`bash -n`）だった → stderr を取り込んで `syntax error` を assert）
+- 単体の stderr 2 行 → 0 行・注入 3 通りで FAILED・カタログ +0 B。PR #2503
+
+## 2026-10-30（#1622: 環境診断の外部の問い合わせ（`claude mcp list` ほか）を導入状況と重ね、check-health 9.7〜12.0 → 5.8〜6.4 秒・setup --check 9.0〜9.9 → 5.4〜5.9 秒。出力は sha256 まで一致）
+- 番犬は diagnostics.rs の待ち合いの単体テスト（直列へ戻す注入 4 通りで file:line を名指し）・実経路 22 / 22・カタログ +0 B。PR #2505
