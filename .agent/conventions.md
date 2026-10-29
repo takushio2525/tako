@@ -207,6 +207,18 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   番犬は同じ `issue1762_dispatch_error_lang.rs`（tako-core のエラー型の節 + 包みと理由の全組み合わせ）、
   実経路は `tests/issue2365_move_copy_lang.rs`（GUI 無しのホストへ dispatch を渡し、移動・コピー・
   まとめた操作・貼り付けの断りで英語表示に日本語が 1 字も無いことと日本語の旧文とのバイト一致を見る）
+- #2365 の続きで、**action で操作を選ぶツールの断り**（`tako_theme` / `tako_lang` / `tako_task_gate` …の
+  不明な action・不明な値・`<操作> には <鍵> が必要`）と、それらのツールが共有する設定の保存・置き場の
+  断りを `Reason` へ移した: `UnknownValue`（`不明な <鍵>: "<値>"（… のいずれか）`）/ `UnknownActionPlain` /
+  `UnknownActionListed` / `UnfamiliarAction`（旧形の言い回しの違い 3 つ）/ `UnknownLidPowerCondition` /
+  `ActionNeeds` / `ActionNeedsHint` / `SaveSettingsFailed` / `DataDirUnresolved` と、案内に言葉を含む 3 つ
+  （`ThemeSetNeedsMode` / `ShortcutAddNeedsPath` / `ShortcutRemoveNeedsPath`）、`tako_theme` の残り 4 つ。
+  呼び手は鍵の名前と候補を**値で渡す**（候補・形の案内は ASCII だけ。言葉が要る案内はバリアントにする）。
+  候補に意味を添える `PowerCondition::values_hint` は MCP カタログの説明に載るので日本語のままにし、
+  断りは `values_hint_in(lang)` で表示言語の意味を添える。番犬は同じ `issue1762_dispatch_error_lang.rs`
+  （`Reason` の表 + 末尾の節が dispatch のソースを読み、旧形の日本語の固定文の書き足しと、呼び手が渡す候補・
+  案内の日本語を `file:line` で名指す）、実経路は `tests/issue2365_action_reasons_lang.rs`（GUI 無しの
+  ホストへ IPC と同じ形の要求を渡し、68 ケースで英語表示に日本語が無いことと日本語の旧文との一致を見る）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

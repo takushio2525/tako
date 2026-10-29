@@ -28,6 +28,9 @@
 //! それを包む dispatch の「移動できない」「コピーできない」「N 件すべてできなかった」「貼り付けできない
 //! （N 件すべて）」）を理由ごと広げた（理由は tako-core のエラー型の節・包みは `Reason` の表と
 //! 「包みと理由の全組み合わせ」の節）。
+//! #2365 の続きで、action で操作を選ぶツールの断り（不明な action・不明な値・`<操作> には <鍵> が必要`）と、
+//! それらのツールが共有する設定の保存・置き場の断りを `Reason` の表へ足した。呼び手が候補を値で渡すので、
+//! 旧形の日本語の固定文の書き足しと、渡す候補・案内の日本語は dispatch のソースを読んで名指す（末尾）。
 //!
 //! このファイルは**独立したテストバイナリ**で、言語グローバルを触るのは
 //! `display_follows_the_display_language` の 1 本だけ（ほかは `text_in` で言語を引数に渡す）。
@@ -590,9 +593,25 @@ fn reason_index(r: &Reason) -> usize {
         Reason::PasteAllFailed(_) => 88,
         Reason::NothingToPaste => 89,
         Reason::AlreadyInFolder => 90,
+        Reason::UnknownValue { .. } => 91,
+        Reason::UnknownActionPlain { .. } => 92,
+        Reason::UnknownActionListed { .. } => 93,
+        Reason::UnknownLidPowerCondition(_) => 94,
+        Reason::ActionNeeds { .. } => 95,
+        Reason::ActionNeedsHint { .. } => 96,
+        Reason::ThemeSetNeedsMode => 97,
+        Reason::ShortcutAddNeedsPath => 98,
+        Reason::ShortcutRemoveNeedsPath => 99,
+        Reason::SaveSettingsFailed(_) => 100,
+        Reason::DataDirUnresolved => 101,
+        Reason::UnknownColorKey(_) => 102,
+        Reason::ReservedPresetName(_) => 103,
+        Reason::PresetNameShape => 104,
+        Reason::UnknownTheme { .. } => 105,
+        Reason::UnfamiliarAction { .. } => 106,
     }
 }
-const REASON_VARIANTS: usize = 91;
+const REASON_VARIANTS: usize = 107;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -727,6 +746,45 @@ fn reason_samples() -> Vec<Reason> {
         Reason::PasteAllFailed(vec!["reason one".into(), "reason two".into()]),
         Reason::NothingToPaste,
         Reason::AlreadyInFolder,
+        Reason::UnknownValue {
+            key: "action",
+            got: "bogus".into(),
+            allowed: "status / set".into(),
+        },
+        Reason::UnknownActionPlain {
+            got: "bogus".into(),
+            allowed: "list / revoke / role",
+        },
+        Reason::UnknownActionListed {
+            got: "bogus".into(),
+            allowed: "status | init | link | unlink | push | pull | list",
+        },
+        Reason::UnknownLidPowerCondition("bogus".into()),
+        Reason::ActionNeeds {
+            action: "show".into(),
+            key: "task_id",
+        },
+        Reason::ActionNeedsHint {
+            action: "set",
+            key: "value",
+            hint: "system / ja / en",
+        },
+        Reason::ThemeSetNeedsMode,
+        Reason::ShortcutAddNeedsPath,
+        Reason::ShortcutRemoveNeedsPath,
+        Reason::SaveSettingsFailed("Permission denied (os error 13)".into()),
+        Reason::DataDirUnresolved,
+        Reason::UnknownColorKey("nosuch".into()),
+        Reason::ReservedPresetName("dark".into()),
+        Reason::PresetNameShape,
+        Reason::UnknownTheme {
+            got: "nope".into(),
+            presets: vec!["mine".into(), "work".into()],
+        },
+        Reason::UnfamiliarAction {
+            got: "bogus".into(),
+            allowed: "check / fix",
+        },
     ]
 }
 
@@ -825,6 +883,23 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "貼り付けできない（2 件すべて）: reason one / reason two",
     "貼り付けるファイルがクリップボードに無い",
     "既にそのフォルダにある（何もしていない）",
+    "不明な action: \"bogus\"（status / set のいずれか）",
+    "不明な action: bogus（list / revoke / role）",
+    "不明な action: bogus。status | init | link | unlink | push | pull | list",
+    "不明な lid_power_condition: \"bogus\"（ac-only = AC 電源に接続しているときだけ / \
+     always = バッテリー駆動でも）",
+    "show には task_id が必要",
+    "set には value が必要（system / ja / en）",
+    "set には mode が必要（dark / light / プリセット名）",
+    "add には path が必要（絶対パス）",
+    "remove には path が必要（id でも可）",
+    "設定の保存に失敗: Permission denied (os error 13)",
+    "データディレクトリを解決できない",
+    "未知の色キー: nosuch",
+    "dark は予約名",
+    "名前は [a-z0-9-]{1,32}",
+    "未知のテーマ: \"nope\"（target は dark / light / プリセット名。プリセット: mine / work）",
+    "未知の action: bogus（check / fix）",
 ];
 
 /// #2365 より前の `preview_recovery_hint` の 3 つの文（外で消された / 外で変わった / 未保存だけ）
@@ -4285,4 +4360,185 @@ fn mod_の状態と帯の応答の文の腕の行を日英とも引ける() {
             );
         }
     }
+}
+
+// ---- #2365 の続き: action で操作を選ぶツールの断り（呼び手のソースを読む番犬） ----
+//
+// 不明な action・不明な値・操作に要る引数（`<操作> には <鍵> が必要`）と、それらのツールが共有する
+// 設定の保存・置き場の断りの 5 つの族は、dispatch の 80 か所の呼び手が鍵の名前と候補を値で `Reason`
+// （`UnknownValue` / `ActionNeeds` ほか）へ渡す。日英の対は上の `Reason` の表で見るが、次の 2 つは
+// 表では見えない:
+// (1) 呼び手が旧形の日本語の固定文（`DispatchError::InvalidParams(format!("不明な action: …"))`）を
+//     書き足す = 英語表示でもその 1 か所だけ日本語で返る
+// (2) 呼び手が渡す候補・形の案内（`allowed` / `hint`）に日本語を入れる = 英語の腕がそのまま埋める
+// どちらも dispatch のソースを読んで `file:line` で名指す
+
+/// dispatch の本体（単体テストの前まで）の行（1 始まりの行番号つき）。
+/// `impl Reason {` の本体（日英の対の表）とコメントの行は外す（そこの日本語は正しい）
+fn dispatch_code_lines() -> Vec<(usize, &'static str)> {
+    let lines: Vec<&'static str> = DISPATCH_SRC.lines().collect();
+    let tests = lines
+        .iter()
+        .position(|l| l.starts_with("#[cfg(test)]"))
+        .unwrap_or(lines.len());
+    let table = lines
+        .iter()
+        .position(|l| *l == "impl Reason {")
+        .expect("dispatch.rs に impl Reason { が無い");
+    let table_end = table
+        + lines[table..]
+            .iter()
+            .position(|l| *l == "}")
+            .expect("impl Reason の終わりが無い");
+    lines[..tests]
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !(table..=table_end).contains(i))
+        .filter(|(_, l)| !l.trim_start().starts_with("//"))
+        .map(|(i, l)| (i + 1, *l))
+        .collect()
+}
+
+/// 1 行の中の文字列リテラルの中身（`"…"`。行をまたぐものは行末まで）
+fn line_literals(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = None;
+    let mut escaped = false;
+    for (i, c) in line.char_indices() {
+        match start {
+            None if c == '"' => start = Some(i + 1),
+            None => {}
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(s) if c == '"' => {
+                out.push(&line[s..i]);
+                start = None;
+            }
+            Some(_) => {}
+        }
+    }
+    if let Some(s) = start {
+        out.push(&line[s..]);
+    }
+    out
+}
+
+/// 鍵・操作の名前（`task_id` / `set-color` / `{action}`）
+fn is_word(s: &str) -> bool {
+    let s = s
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(s);
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// 旧形の日本語の固定文なら、その族の名前
+fn old_form(lit: &str) -> Option<&'static str> {
+    if lit.starts_with("不明な ") {
+        return Some("不明な <鍵>: …（Reason::UnknownValue ほか）");
+    }
+    if lit.starts_with("設定の保存に失敗") {
+        return Some("設定の保存に失敗（Reason::SaveSettingsFailed）");
+    }
+    if lit.starts_with("データディレクトリを解決できない") {
+        return Some("データディレクトリを解決できない（Reason::DataDirUnresolved）");
+    }
+    if lit.starts_with("未知の") {
+        return Some("未知の <何か>: …（Reason::UnknownColorKey / UnknownTheme ほか）");
+    }
+    let (action, rest) = lit.split_once(" には ")?;
+    let (key, _) = rest.split_once(" が必要")?;
+    (is_word(action) && is_word(key))
+        .then_some("<操作> には <鍵> が必要（Reason::ActionNeeds / ActionNeedsHint）")
+}
+
+/// 候補・案内を値で受けるバリアント（呼び手の渡す文字列リテラルを見る）
+const VALUE_TAKING: [&str; 5] = [
+    "Reason::UnknownValue",
+    "Reason::UnknownActionPlain",
+    "Reason::UnknownActionListed",
+    "Reason::UnfamiliarAction",
+    "Reason::ActionNeeds",
+];
+
+#[test]
+fn action_で選ぶツールの断りの旧形の日本語が_dispatch_に残っていない() {
+    let mut failures = Vec::new();
+    for (line, code) in dispatch_code_lines() {
+        for lit in line_literals(code) {
+            if let Some(family) = old_form(lit) {
+                failures.push(format!(
+                    "{DISPATCH_PATH}:{line}: 旧形の日本語の固定文（{family} へ寄せる）: {}",
+                    code.trim()
+                ));
+            }
+        }
+    }
+    report_all(failures);
+}
+
+#[test]
+fn action_で選ぶツールの断りへ渡す候補と案内に日本語が無い() {
+    let lines = dispatch_code_lines();
+    let mut failures = Vec::new();
+    let mut sites = 0;
+    for (k, (line, code)) in lines.iter().enumerate() {
+        if !VALUE_TAKING.iter().any(|v| code.contains(v)) {
+            continue;
+        }
+        sites += 1;
+        // 組み立ての終わり（`}` を含む行）までの文字列リテラルを見る
+        for (at, part) in lines[k..lines.len().min(k + 8)].iter() {
+            for lit in line_literals(part) {
+                if let Some(c) = has_japanese(lit) {
+                    failures.push(format!(
+                        "{DISPATCH_PATH}:{at}: 断りへ渡す値に日本語（{c}）がある = 英語表示にも \
+                         そのまま出る（{line} 行目からの組み立て）: {}",
+                        part.trim()
+                    ));
+                }
+            }
+            if part.contains('}') {
+                break;
+            }
+        }
+    }
+    // 番犬自身の検査: 呼び手を拾えている（#2365 の続きの時点で 57 か所。
+    // 大きく減ったら走査の前提 = 1 行に `Reason::<名前>` が書かれる形が崩れている）
+    assert!(
+        sites >= 50,
+        "値で受けるバリアントの呼び手が {sites} 件しか見えない"
+    );
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 旧形の判定は旧文の 5 つの形に当たり、似た別の文には当たらない
+#[test]
+fn action_で選ぶツールの断りの旧形の判定の境界() {
+    for lit in [
+        "不明な action: {other:?}（status / set のいずれか）",
+        "不明な lid_power_condition: {pc:?}（{}）",
+        "設定の保存に失敗: {e}",
+        "データディレクトリを解決できない",
+        "未知の色キー: {k}",
+        "show には task_id が必要",
+        "{action} には id が必要",
+        "set には mode が必要（dark / light / プリセット名）",
+    ] {
+        assert!(old_form(lit).is_some(), "{lit}");
+    }
+    for lit in [
+        "不明なツール: {name}",
+        "read には pane または session_id が必要",
+        "データディレクトリが決まらない（HOME が無い）",
+        "unknown action: {got:?} (one of {allowed})",
+    ] {
+        assert!(old_form(lit).is_none(), "{lit}");
+    }
+    assert_eq!(
+        line_literals(r#"x("a \"b\" c", "d") "tail"#),
+        vec![r#"a \"b\" c"#, "d", "tail"]
+    );
 }

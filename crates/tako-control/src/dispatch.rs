@@ -357,6 +357,68 @@ pub enum Reason {
     NothingToPaste,
     /// 移す先が今いるフォルダ（断りではなく、移動の応答の `note`）
     AlreadyInFolder,
+    // ---- #2365 の続き: action で操作を選ぶツールの断り（不明な action・値・操作に要る引数）と、
+    // それらのツールが共有する設定の保存・置き場の断り。呼び手が鍵の名前と候補を値で渡す
+    // （候補・形の案内は ASCII だけ。英語の腕がそのまま埋めるので、番犬が呼び手のソースを読んで見る） ----
+    /// `不明な <key>: <got:?>（<allowed> のいずれか）`。`allowed` は候補を ` / ` で並べたもの
+    UnknownValue {
+        key: &'static str,
+        got: String,
+        allowed: String,
+    },
+    /// `不明な action: <got>（<allowed>）`（引用符も「のいずれか」も付けない旧形。remote の 3 つ）
+    UnknownActionPlain {
+        got: String,
+        allowed: &'static str,
+    },
+    /// `不明な action: <got>。<allowed>`（`tako config` の旧形）
+    UnknownActionListed {
+        got: String,
+        allowed: &'static str,
+    },
+    /// `未知の action: <got>（<allowed>）`（言い回しの違う旧形。Web ビュー・context-budget・引き継ぎファイル）
+    UnfamiliarAction {
+        got: String,
+        allowed: &'static str,
+    },
+    /// `不明な lid_power_condition: <got:?>（<受理値と意味>）`。意味も表示言語で引く
+    /// （[`crate::sleep_guard::PowerCondition::values_hint_in`]）
+    UnknownLidPowerCondition(String),
+    /// `<action> には <key> が必要`
+    ActionNeeds {
+        action: String,
+        key: &'static str,
+    },
+    /// `<action> には <key> が必要（<hint>）`。`hint` は値の候補か形
+    ActionNeedsHint {
+        action: &'static str,
+        key: &'static str,
+        hint: &'static str,
+    },
+    /// `set には mode が必要（dark / light / プリセット名）`（`tako theme`。案内に言葉を含む）
+    ThemeSetNeedsMode,
+    /// `add には path が必要（絶対パス）`（リモート閲覧のショートカット）
+    ShortcutAddNeedsPath,
+    /// `remove には path が必要（id でも可）`（リモート閲覧のショートカット）
+    ShortcutRemoveNeedsPath,
+    /// `設定の保存に失敗: <e>`（settings.json の書き出し。中身は書き出しの口が返した文）
+    SaveSettingsFailed(String),
+    /// `データディレクトリを解決できない`（置き場を data dir の下に持つ操作。
+    /// 文の違う [`tako_core::paths::NoDataDir`] とは別。日本語を #2365 より前とそろえるため）
+    DataDirUnresolved,
+    // ---- #2365 の続き: `tako theme` / MCP `tako_theme` に残っていた断り（ツールの断りを 1 本でそろえる） ----
+    /// `未知の色キー: <key>`
+    UnknownColorKey(String),
+    /// `<name> は予約名`（dark / light はプリセットの名前にできない）
+    ReservedPresetName(String),
+    /// `名前は [a-z0-9-]{1,32}`（プリセットの名前の形）
+    PresetNameShape,
+    /// `未知のテーマ: <got:?>（target は dark / light / プリセット名。プリセット: <presets>）`。
+    /// `presets` が空なら「なし」
+    UnknownTheme {
+        got: String,
+        presets: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for Reason {
@@ -802,6 +864,93 @@ impl Reason {
             (Self::NothingToPaste, En) => "no files to paste on the clipboard".to_string(),
             (Self::AlreadyInFolder, Ja) => "既にそのフォルダにある（何もしていない）".to_string(),
             (Self::AlreadyInFolder, En) => "already in that folder (nothing was done)".to_string(),
+            (Self::UnknownValue { key, got, allowed }, Ja) => {
+                format!("不明な {key}: {got:?}（{allowed} のいずれか）")
+            }
+            (Self::UnknownValue { key, got, allowed }, En) => {
+                format!("unknown {key}: {got:?} (one of {allowed})")
+            }
+            (Self::UnknownActionPlain { got, allowed }, Ja) => {
+                format!("不明な action: {got}（{allowed}）")
+            }
+            (Self::UnknownActionPlain { got, allowed }, En) => {
+                format!("unknown action: {got} ({allowed})")
+            }
+            (Self::UnknownActionListed { got, allowed }, Ja) => {
+                format!("不明な action: {got}。{allowed}")
+            }
+            (Self::UnknownActionListed { got, allowed }, En) => {
+                format!("unknown action: {got} (one of {allowed})")
+            }
+            (Self::UnfamiliarAction { got, allowed }, Ja) => {
+                format!("未知の action: {got}（{allowed}）")
+            }
+            (Self::UnfamiliarAction { got, allowed }, En) => {
+                format!("unknown action: {got} ({allowed})")
+            }
+            (Self::UnknownLidPowerCondition(got), Ja) => format!(
+                "不明な lid_power_condition: {got:?}（{}）",
+                crate::sleep_guard::PowerCondition::values_hint_in(Ja)
+            ),
+            (Self::UnknownLidPowerCondition(got), En) => format!(
+                "unknown lid_power_condition: {got:?} ({})",
+                crate::sleep_guard::PowerCondition::values_hint_in(En)
+            ),
+            (Self::ActionNeeds { action, key }, Ja) => format!("{action} には {key} が必要"),
+            (Self::ActionNeeds { action, key }, En) => format!("{key} is required for {action}"),
+            (Self::ActionNeedsHint { action, key, hint }, Ja) => {
+                format!("{action} には {key} が必要（{hint}）")
+            }
+            (Self::ActionNeedsHint { action, key, hint }, En) => {
+                format!("{key} is required for {action} ({hint})")
+            }
+            (Self::ThemeSetNeedsMode, Ja) => {
+                "set には mode が必要（dark / light / プリセット名）".to_string()
+            }
+            (Self::ThemeSetNeedsMode, En) => {
+                "mode is required for set (dark / light / a preset name)".to_string()
+            }
+            (Self::ShortcutAddNeedsPath, Ja) => "add には path が必要（絶対パス）".to_string(),
+            (Self::ShortcutAddNeedsPath, En) => {
+                "path is required for add (an absolute path)".to_string()
+            }
+            (Self::ShortcutRemoveNeedsPath, Ja) => {
+                "remove には path が必要（id でも可）".to_string()
+            }
+            (Self::ShortcutRemoveNeedsPath, En) => {
+                "path is required for remove (an id also works)".to_string()
+            }
+            (Self::SaveSettingsFailed(e), Ja) => format!("設定の保存に失敗: {e}"),
+            (Self::SaveSettingsFailed(e), En) => format!("failed to save the settings: {e}"),
+            (Self::DataDirUnresolved, Ja) => "データディレクトリを解決できない".to_string(),
+            (Self::DataDirUnresolved, En) => "cannot resolve the data directory".to_string(),
+            (Self::UnknownColorKey(key), Ja) => format!("未知の色キー: {key}"),
+            (Self::UnknownColorKey(key), En) => format!("unknown color key: {key}"),
+            (Self::ReservedPresetName(name), Ja) => format!("{name} は予約名"),
+            (Self::ReservedPresetName(name), En) => format!("{name} is a reserved name"),
+            (Self::PresetNameShape, Ja) => "名前は [a-z0-9-]{1,32}".to_string(),
+            (Self::PresetNameShape, En) => "the name must match [a-z0-9-]{1,32}".to_string(),
+            (Self::UnknownTheme { got, presets }, Ja) => {
+                let presets = if presets.is_empty() {
+                    "なし".to_string()
+                } else {
+                    presets.join(" / ")
+                };
+                format!(
+                    "未知のテーマ: {got:?}（target は dark / light / プリセット名。プリセット: {presets}）"
+                )
+            }
+            (Self::UnknownTheme { got, presets }, En) => {
+                let presets = if presets.is_empty() {
+                    "none".to_string()
+                } else {
+                    presets.join(" / ")
+                };
+                format!(
+                    "unknown theme: {got:?} (target is dark / light / a preset name; \
+                     presets: {presets})"
+                )
+            }
         }
     }
 
@@ -3625,15 +3774,11 @@ fn theme_target_name(
         return Ok(settings.theme.clone());
     };
     settings.known_theme_name(t).ok_or_else(|| {
-        let presets: Vec<&str> = settings.theme_presets.keys().map(String::as_str).collect();
-        let presets = if presets.is_empty() {
-            "なし".to_string()
-        } else {
-            presets.join(" / ")
-        };
-        DispatchError::InvalidParams(format!(
-            "未知のテーマ: {t:?}（target は dark / light / プリセット名。プリセット: {presets}）"
-        ))
+        Reason::UnknownTheme {
+            got: t.to_string(),
+            presets: settings.theme_presets.keys().cloned().collect(),
+        }
+        .invalid()
     })
 }
 
@@ -3713,7 +3858,7 @@ fn theme_color_write(
         apply_color_write(&mut settings, target, host.theme_mode(), write)?;
         if should_save {
             crate::settings::save(&settings)
-                .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+                .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
         }
     }
     host.reload_theme();
@@ -8873,10 +9018,12 @@ fn dispatch_inner(
                 let cleared = store.clear();
                 Ok(json!({ "cleared": cleared, "retained": store.retained() }))
             }
-            other => Err(DispatchError::InvalidParams(format!(
-                "不明な action: {other:?}（{} のいずれか）",
-                crate::workspace_search::ACTIONS.join(" / ")
-            ))),
+            other => Err(Reason::UnknownValue {
+                key: "action",
+                got: other.to_string(),
+                allowed: crate::workspace_search::ACTIONS.join(" / "),
+            }
+            .invalid()),
         },
 
         // #1683: 通常は prepare_offload が問い合わせを background へ出す。ここへ来るのは
@@ -9464,24 +9611,37 @@ fn dispatch_inner(
             "list" => crate::remote::devices_list().map_err(DispatchError::Operation),
             "revoke" => {
                 let id = device_id.ok_or_else(|| {
-                    DispatchError::Operation("revoke には device_id が必要".to_string())
+                    Reason::ActionNeeds {
+                        action: "revoke".into(),
+                        key: "device_id",
+                    }
+                    .operation()
                 })?;
                 crate::remote::devices_revoke(&id).map_err(DispatchError::Operation)
             }
             "role" => {
                 let id = device_id.ok_or_else(|| {
-                    DispatchError::Operation("role には device_id が必要".to_string())
+                    Reason::ActionNeeds {
+                        action: "role".into(),
+                        key: "device_id",
+                    }
+                    .operation()
                 })?;
                 let role = role.ok_or_else(|| {
-                    DispatchError::Operation(
-                        "role には role が必要（observe / interact / manage / admin）".to_string(),
-                    )
+                    Reason::ActionNeedsHint {
+                        action: "role",
+                        key: "role",
+                        hint: "observe / interact / manage / admin",
+                    }
+                    .operation()
                 })?;
                 crate::remote::devices_set_role(&id, &role).map_err(DispatchError::Operation)
             }
-            other => Err(DispatchError::Operation(format!(
-                "不明な action: {other}（list / revoke / role）"
-            ))),
+            other => Err(Reason::UnknownActionPlain {
+                got: other.to_string(),
+                allowed: "list / revoke / role",
+            }
+            .operation()),
         },
 
         // ショートカット（#1451）。ControlHost 不要（正本はファイル）なので
@@ -9512,9 +9672,11 @@ fn dispatch_inner(
                 crate::remote_setup::run_noninteractive(&parsed).map_err(DispatchError::Operation)
             }
             "check" => Ok(crate::remote_setup::check_status()),
-            other => Err(DispatchError::InvalidParams(format!(
-                "不明な action: {other}（run / check）"
-            ))),
+            other => Err(Reason::UnknownActionPlain {
+                got: other.to_string(),
+                allowed: "run / check",
+            }
+            .invalid()),
         },
 
         Request::Web {
@@ -9588,15 +9750,14 @@ fn dispatch_inner(
                 "open" => {
                     let url = url.ok_or_else(|| Reason::Required("url".into()).invalid())?;
                     if url.trim().is_empty() {
-                        return Err(DispatchError::InvalidParams(
-                            "URL が空です".into(),
-                        ));
+                        return Err(DispatchError::InvalidParams("URL が空です".into()));
                     }
                     split_and(host, pane, &|h, new_id| h.web_open(new_id, &url))
                 }
                 "show" => {
-                    let id =
-                        id.ok_or(DispatchError::InvalidParams("id は必須（web list で確認）".into()))?;
+                    let id = id.ok_or(DispatchError::InvalidParams(
+                        "id は必須（web list で確認）".into(),
+                    ))?;
                     // 既に表示中なら分割しない。focus 指定時のみフォーカス移動
                     let (_, showing) = host.web_target(Some(id), None).map_err(op_err)?;
                     if let Some(p) = showing {
@@ -9606,7 +9767,9 @@ fn dispatch_inner(
                             tree_mut(ws, tab).focus(target).map_err(op_err)?;
                             ws.activate_tab(tab).map_err(op_err)?;
                         }
-                        return Ok(json!({ "id": id, "pane": target.as_u64(), "already_shown": true }));
+                        return Ok(
+                            json!({ "id": id, "pane": target.as_u64(), "already_shown": true }),
+                        );
                     }
                     split_and(host, pane, &|h, new_id| h.web_show(new_id, id))
                 }
@@ -9627,10 +9790,9 @@ fn dispatch_inner(
                     Ok(json!({ "id": id, "closed": true }))
                 }
                 "navigate" => {
-                    let to =
-                        to.ok_or(DispatchError::InvalidParams(
-                            "to は必須（back / forward / reload / URL）".into(),
-                        ))?;
+                    let to = to.ok_or(DispatchError::InvalidParams(
+                        "to は必須（back / forward / reload / URL）".into(),
+                    ))?;
                     let (id, _) = host.web_target(id, pane).map_err(op_err)?;
                     host.web_navigate(id, &to).map_err(op_err)
                 }
@@ -9640,8 +9802,7 @@ fn dispatch_inner(
                     host.web_eval(id, &js).map_err(op_err)
                 }
                 "eval_result" => {
-                    let token =
-                        token.ok_or_else(|| Reason::Required("token".into()).invalid())?;
+                    let token = token.ok_or_else(|| Reason::Required("token".into()).invalid())?;
                     let (id, _) = host.web_target(id, pane).map_err(op_err)?;
                     host.web_eval_result(id, token).map_err(op_err)
                 }
@@ -9649,9 +9810,12 @@ fn dispatch_inner(
                     let (id, _) = host.web_target(id, pane).map_err(op_err)?;
                     host.web_read(id).map_err(op_err)
                 }
-                other => Err(DispatchError::InvalidParams(format!(
-                    "未知の action: {other}（open / list / show / hide / close / navigate / eval / eval_result / read）"
-                ))),
+                other => Err(Reason::UnfamiliarAction {
+                    got: other.to_string(),
+                    allowed:
+                        "open / list / show / hide / close / navigate / eval / eval_result / read",
+                }
+                .invalid()),
             }
         }
 
@@ -9698,10 +9862,14 @@ fn dispatch_inner(
                     }
                     Ok(host.update_card_status())
                 }
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / check / apply / apply-zip / repair / \
-                     open / card / card-dismiss / card-show のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "status / check / apply / apply-zip / repair / \
+                              open / card / card-dismiss / card-show"
+                        .into(),
+                }
+                .invalid()),
             }
         }
 
@@ -9713,9 +9881,12 @@ fn dispatch_inner(
                     crate::fda::open_settings().map_err(DispatchError::Operation)?;
                     Ok(serde_json::json!({ "opened": true }))
                 }
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / open のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "status / open".into(),
+                }
+                .invalid()),
             }
         }
 
@@ -9757,16 +9928,20 @@ fn dispatch_inner(
                 .map_err(DispatchError::Operation),
                 "path" => crate::setup_bootstrap::ensure_path_for(target)
                     .map_err(DispatchError::Operation),
-                "undo-path" => crate::setup_bootstrap::undo_path_for(target)
-                    .map_err(DispatchError::Operation),
+                "undo-path" => {
+                    crate::setup_bootstrap::undo_path_for(target).map_err(DispatchError::Operation)
+                }
                 // 自動導入が通らないときの引き継ぎ計画（#1057。**読み取り専用**）。
                 // 実際に相手を起こすのは端末を持つ側（CLI）か、AI なら
                 // `tako_orchestrator_spawn` / `tako_run` の仕事
                 "handoff" => crate::setup_bootstrap::handoff_plan_for(target, reason.as_deref())
                     .map_err(DispatchError::Operation),
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / status-all / install / path / undo-path / handoff のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "status / status-all / install / path / undo-path / handoff".into(),
+                }
+                .invalid()),
             }
         }
 
@@ -9791,9 +9966,12 @@ fn dispatch_inner(
                     },
                 )
                 .map_err(DispatchError::Operation),
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / install のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "status / install".into(),
+                }
+                .invalid()),
             }
         }
 
@@ -9841,9 +10019,12 @@ fn dispatch_inner(
                 "sync" => crate::agents_sync::run_sync(source.as_deref(), targets.as_deref())
                     .map_err(DispatchError::Operation),
                 "status" => crate::agents_sync::status().map_err(DispatchError::Operation),
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（sync / status のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "sync / status".into(),
+                }
+                .invalid()),
             }
         }
 
@@ -9867,9 +10048,12 @@ fn dispatch_inner(
                         settings.sleep_guard_mode =
                             crate::sleep_guard::SleepGuardMode::from_str_opt(m).ok_or_else(
                                 || {
-                                    DispatchError::InvalidParams(format!(
-                                    "不明な mode: {m:?}（off / on / while-agents-running のいずれか）"
-                                ))
+                                    Reason::UnknownValue {
+                                        key: "mode",
+                                        got: m.to_string(),
+                                        allowed: "off / on / while-agents-running".into(),
+                                    }
+                                    .invalid()
                                 },
                             )?;
                     }
@@ -9877,41 +10061,41 @@ fn dispatch_inner(
                         settings.sleep_guard_power =
                             crate::sleep_guard::PowerCondition::from_str_opt(pc).ok_or_else(
                                 || {
-                                    DispatchError::InvalidParams(format!(
-                                        "不明な power_condition: {pc:?}（ac-only / always のいずれか）"
-                                    ))
+                                    Reason::UnknownValue {
+                                        key: "power_condition",
+                                        got: pc.to_string(),
+                                        allowed: "ac-only / always".into(),
+                                    }
+                                    .invalid()
                                 },
                             )?;
                     }
                     if let Some(lsm) = lid_sleep_mode.as_deref() {
-                        settings.lid_sleep_mode =
-                            crate::sleep_guard::LidSleepMode::from_str_opt(lsm).ok_or_else(
-                                || {
-                                    DispatchError::InvalidParams(format!(
-                                        "不明な lid_sleep_mode: {lsm:?}（off / while-agents-running のいずれか）"
-                                    ))
-                                },
-                            )?;
+                        settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::from_str_opt(
+                            lsm,
+                        )
+                        .ok_or_else(|| {
+                            Reason::UnknownValue {
+                                key: "lid_sleep_mode",
+                                got: lsm.to_string(),
+                                allowed: "off / while-agents-running".into(),
+                            }
+                            .invalid()
+                        })?;
                     }
                     // #1473: 蓋閉じ継続の電源条件と残量下限（アイドルスリープ側とは別の軸）
                     if let Some(pc) = lid_power_condition.as_deref() {
                         settings.lid_sleep_power =
                             crate::sleep_guard::PowerCondition::from_str_opt(pc).ok_or_else(
-                                || {
-                                    DispatchError::InvalidParams(format!(
-                                        "不明な lid_power_condition: {pc:?}（{}）",
-                                        crate::sleep_guard::PowerCondition::values_hint()
-                                    ))
-                                },
+                                || Reason::UnknownLidPowerCondition(pc.to_string()).invalid(),
                             )?;
                     }
                     if let Some(floor) = lid_battery_floor {
-                        settings.lid_battery_floor =
-                            crate::sleep_guard::parse_battery_floor(floor)
-                                .map_err(DispatchError::InvalidParams)?;
+                        settings.lid_battery_floor = crate::sleep_guard::parse_battery_floor(floor)
+                            .map_err(DispatchError::InvalidParams)?;
                     }
                     crate::settings::save(&settings)
-                        .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+                        .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
                     Ok(crate::sleep_guard::status(settings.sleep_guard_config()).to_json())
                 }
                 // 手段（macOS = sudoers 登録 / Windows = 権限不要）は `sleep_guard` 側に
@@ -9922,10 +10106,9 @@ fn dispatch_inner(
                     let result = crate::sleep_guard::prepare_lid_control()
                         .map_err(DispatchError::Operation)?;
                     let mut settings = crate::settings::load();
-                    settings.lid_sleep_mode =
-                        crate::sleep_guard::LidSleepMode::WhileAgentsRunning;
+                    settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::WhileAgentsRunning;
                     crate::settings::save(&settings)
-                        .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+                        .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
                     Ok(serde_json::json!({
                         "result": result,
                         "lid_sleep_mode": "while-agents-running",
@@ -9941,7 +10124,7 @@ fn dispatch_inner(
                     let mut settings = crate::settings::load();
                     settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::Off;
                     crate::settings::save(&settings)
-                        .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+                        .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
                     Ok(serde_json::json!({
                         "result": result,
                         "lid_sleep_mode": "off",
@@ -9955,9 +10138,14 @@ fn dispatch_inner(
                         "result": "System Settings の Battery を開きました",
                     }))
                 }
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / set / install-lid-sleep / remove-lid-sleep / open-battery-settings のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "status / set / install-lid-sleep / remove-lid-sleep / \
+                              open-battery-settings"
+                        .into(),
+                }
+                .invalid()),
             }
         }
 
@@ -9999,26 +10187,19 @@ fn dispatch_inner(
                     let m = mode.as_deref();
                     let next_theme: String = match action {
                         "set" => {
-                            let m = m.ok_or_else(|| {
-                                DispatchError::InvalidParams(
-                                    "set には mode が必要（dark / light / プリセット名）".into(),
-                                )
-                            })?;
+                            let m = m.ok_or_else(|| Reason::ThemeSetNeedsMode.invalid())?;
                             m.to_string()
                         }
-                        _ => {
-                            match host.theme_mode() {
-                                ThemeMode::Dark => "light".into(),
-                                ThemeMode::Light => "dark".into(),
-                            }
-                        }
+                        _ => match host.theme_mode() {
+                            ThemeMode::Dark => "light".into(),
+                            ThemeMode::Light => "dark".into(),
+                        },
                     };
                     if should_save {
                         let mut settings = crate::settings::load();
                         settings.theme = next_theme.clone();
-                        crate::settings::save(&settings).map_err(|e| {
-                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
-                        })?;
+                        crate::settings::save(&settings)
+                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
                     }
                     let mode = ThemeMode::parse(&next_theme).unwrap_or_default();
                     host.set_theme_mode(mode);
@@ -10040,13 +10221,22 @@ fn dispatch_inner(
                 "colors" => theme_colors_response(&crate::settings::load(), target.as_deref()),
                 "set-color" => {
                     let k = key.as_deref().ok_or_else(|| {
-                        DispatchError::InvalidParams("set-color には key が必要".into())
+                        Reason::ActionNeeds {
+                            action: "set-color".into(),
+                            key: "key",
+                        }
+                        .invalid()
                     })?;
                     let v = value.as_deref().ok_or_else(|| {
-                        DispatchError::InvalidParams("set-color には value が必要（#RRGGBB）".into())
+                        Reason::ActionNeedsHint {
+                            action: "set-color",
+                            key: "value",
+                            hint: "#RRGGBB",
+                        }
+                        .invalid()
                     })?;
                     if !Theme::COLOR_KEYS.contains(&k) {
-                        return Err(DispatchError::InvalidParams(format!("未知の色キー: {k}")));
+                        return Err(Reason::UnknownColorKey(k.to_string()).invalid());
                     }
                     // 読めない値は保存より前に理由付きで返す（#1756: 非 ASCII で GUI ごと落ちていた）
                     parse_hex_color(v).map_err(|e| {
@@ -10059,7 +10249,11 @@ fn dispatch_inner(
                 }
                 "reset-color" => {
                     let k = key.as_deref().ok_or_else(|| {
-                        DispatchError::InvalidParams("reset-color には key が必要".into())
+                        Reason::ActionNeeds {
+                            action: "reset-color".into(),
+                            key: "key",
+                        }
+                        .invalid()
                     })?;
                     let write = ColorWrite::Reset { key: k };
                     theme_color_write(host, target.as_deref(), should_save, write)?;
@@ -10072,13 +10266,22 @@ fn dispatch_inner(
                 }
                 "save-preset" => {
                     let n = name.as_deref().ok_or_else(|| {
-                        DispatchError::InvalidParams("save-preset には name が必要".into())
+                        Reason::ActionNeeds {
+                            action: "save-preset".into(),
+                            key: "name",
+                        }
+                        .invalid()
                     })?;
                     if n == "dark" || n == "light" {
-                        return Err(DispatchError::InvalidParams(format!("{n} は予約名")));
+                        return Err(Reason::ReservedPresetName(n.to_string()).invalid());
                     }
-                    if !n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') || n.is_empty() || n.len() > 32 {
-                        return Err(DispatchError::InvalidParams("名前は [a-z0-9-]{1,32}".into()));
+                    if !n
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                        || n.is_empty()
+                        || n.len() > 32
+                    {
+                        return Err(Reason::PresetNameShape.invalid());
                     }
                     if should_save {
                         let mut settings = crate::settings::load();
@@ -10093,21 +10296,27 @@ fn dispatch_inner(
                                 }
                             }
                         }
-                        settings.theme_presets.insert(n.to_string(), crate::settings::ThemePreset {
-                            base: base_mode.as_str().into(),
-                            colors: diff,
-                        });
+                        settings.theme_presets.insert(
+                            n.to_string(),
+                            crate::settings::ThemePreset {
+                                base: base_mode.as_str().into(),
+                                colors: diff,
+                            },
+                        );
                         settings.theme = n.to_string();
-                        crate::settings::save(&settings).map_err(|e| {
-                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
-                        })?;
+                        crate::settings::save(&settings)
+                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
                     }
                     host.reload_theme();
                     Ok(serde_json::json!({ "ok": true, "name": n }))
                 }
                 "delete-preset" => {
                     let n = name.as_deref().ok_or_else(|| {
-                        DispatchError::InvalidParams("delete-preset には name が必要".into())
+                        Reason::ActionNeeds {
+                            action: "delete-preset".into(),
+                            key: "name",
+                        }
+                        .invalid()
                     })?;
                     if should_save {
                         let mut settings = crate::settings::load();
@@ -10116,9 +10325,8 @@ fn dispatch_inner(
                                 settings.theme = p.base;
                             }
                         }
-                        crate::settings::save(&settings).map_err(|e| {
-                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
-                        })?;
+                        crate::settings::save(&settings)
+                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
                     }
                     host.reload_theme();
                     Ok(serde_json::json!({ "ok": true }))
@@ -10132,16 +10340,20 @@ fn dispatch_inner(
                         if let Some(s) = font_size {
                             settings.font_size = Some(s.clamp(8.0, 32.0));
                         }
-                        crate::settings::save(&settings).map_err(|e| {
-                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
-                        })?;
+                        crate::settings::save(&settings)
+                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
                     }
                     host.reload_theme();
                     Ok(serde_json::json!({ "ok": true }))
                 }
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / set / toggle / colors / set-color / reset-color / reset-colors / save-preset / delete-preset / set-font のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "status / set / toggle / colors / set-color / reset-color / \
+                              reset-colors / save-preset / delete-preset / set-font"
+                        .into(),
+                }
+                .invalid()),
             }
         }
 
@@ -10228,9 +10440,11 @@ fn dispatch_inner(
                     .map_err(DispatchError::Operation),
                 "fix" => crate::context_budget::fix(&dir, profile.as_deref(), dry_run)
                     .map_err(DispatchError::Operation),
-                other => Err(DispatchError::InvalidParams(format!(
-                    "未知の action: {other}（check / fix）"
-                ))),
+                other => Err(Reason::UnfamiliarAction {
+                    got: other.to_string(),
+                    allowed: "check / fix",
+                }
+                .invalid()),
             }
         }
 
@@ -10260,22 +10474,27 @@ fn dispatch_inner(
                 "status" => Ok(status_json(host.ui_lang_setting())),
                 "set" => {
                     let v = value.as_deref().ok_or_else(|| {
-                        DispatchError::InvalidParams(
-                            "set には value が必要（system / ja / en）".into(),
-                        )
+                        Reason::ActionNeedsHint {
+                            action: "set",
+                            key: "value",
+                            hint: "system / ja / en",
+                        }
+                        .invalid()
                     })?;
                     let setting = LangSetting::parse(v).ok_or_else(|| {
-                        DispatchError::InvalidParams(format!(
-                            "不明な value: {v:?}（system / ja / en のいずれか）"
-                        ))
+                        Reason::UnknownValue {
+                            key: "value",
+                            got: v.to_string(),
+                            allowed: "system / ja / en".into(),
+                        }
+                        .invalid()
                     })?;
                     // 永続化（テスト・セルフテスト中はユーザー設定を汚さない。Theme と同方針）
                     if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
                         let mut settings = crate::settings::load();
                         settings.language = setting.as_str().into();
-                        crate::settings::save(&settings).map_err(|e| {
-                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
-                        })?;
+                        crate::settings::save(&settings)
+                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
                     }
                     let resolved = setting.resolve();
                     host.set_ui_lang(setting, resolved);
@@ -10285,9 +10504,12 @@ fn dispatch_inner(
                         "available": ["system", "ja", "en"],
                     }))
                 }
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / set のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "status / set".into(),
+                }
+                .invalid()),
             }
         }
 
@@ -10335,29 +10557,36 @@ fn dispatch_inner(
                     "chat_header": host.chat_header_ctx(),
                 })
             };
-            let apply = |host: &mut dyn ControlHost,
-                         next: UiMode|
-             -> Result<Value, DispatchError> {
-                // 永続化（テスト・セルフテスト中はユーザー設定を汚さない。Theme と同方針）
-                if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
-                    let mut settings = crate::settings::load();
-                    settings.ui_mode = next.as_str().into();
-                    crate::settings::save(&settings)
-                        .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
-                }
-                host.set_ui_mode(next);
-                Ok(status_json(host))
-            };
+            let apply =
+                |host: &mut dyn ControlHost, next: UiMode| -> Result<Value, DispatchError> {
+                    // 永続化（テスト・セルフテスト中はユーザー設定を汚さない。Theme と同方針）
+                    if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
+                        let mut settings = crate::settings::load();
+                        settings.ui_mode = next.as_str().into();
+                        crate::settings::save(&settings)
+                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
+                    }
+                    host.set_ui_mode(next);
+                    Ok(status_json(host))
+                };
             match action {
                 "status" => Ok(status_json(host)),
                 "set" => {
                     let raw = mode.as_deref().ok_or_else(|| {
-                        DispatchError::InvalidParams("set には mode が必要（terminal / gui）".into())
+                        Reason::ActionNeedsHint {
+                            action: "set",
+                            key: "mode",
+                            hint: "terminal / gui",
+                        }
+                        .invalid()
                     })?;
                     let next = UiMode::parse(raw).ok_or_else(|| {
-                        DispatchError::InvalidParams(format!(
-                            "不明な mode: {raw:?}（terminal / gui のいずれか）"
-                        ))
+                        Reason::UnknownValue {
+                            key: "mode",
+                            got: raw.to_string(),
+                            allowed: "terminal / gui".into(),
+                        }
+                        .invalid()
                     })?;
                     apply(host, next)
                 }
@@ -10375,9 +10604,12 @@ fn dispatch_inner(
                     json["released"] = serde_json::json!(action == "release");
                     Ok(json)
                 }
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / set / toggle / release / restore のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "status / set / toggle / release / restore".into(),
+                }
+                .invalid()),
             }
         }
 
@@ -10403,17 +10635,19 @@ fn dispatch_inner(
                     if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
                         let mut settings = crate::settings::load();
                         settings.telemetry = enabled;
-                        crate::settings::save(&settings).map_err(|e| {
-                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
-                        })?;
+                        crate::settings::save(&settings)
+                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
                     }
                     Ok(serde_json::json!({
                         "telemetry": enabled,
                     }))
                 }
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / on / off のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "status / on / off".into(),
+                }
+                .invalid()),
             }
         }
 
@@ -10430,29 +10664,37 @@ fn dispatch_inner(
                 "status" => Ok(status_json(host.limit_service())),
                 "set" => {
                     let s = service.as_deref().ok_or_else(|| {
-                        DispatchError::InvalidParams(
-                            "set には service が必要（claude / codex / agy）".into(),
-                        )
+                        Reason::ActionNeedsHint {
+                            action: "set",
+                            key: "service",
+                            hint: "claude / codex / agy",
+                        }
+                        .invalid()
                     })?;
                     let next = LS::parse(s).ok_or_else(|| {
-                        DispatchError::InvalidParams(format!(
-                            "不明な service: {s:?}（claude / codex / agy のいずれか）"
-                        ))
+                        Reason::UnknownValue {
+                            key: "service",
+                            got: s.to_string(),
+                            allowed: "claude / codex / agy".into(),
+                        }
+                        .invalid()
                     })?;
                     if !cfg!(test) && std::env::var_os("TAKO_SELF_TEST").is_none() {
                         let mut settings = crate::settings::load();
                         settings.limit_service = next.as_str().into();
-                        crate::settings::save(&settings).map_err(|e| {
-                            DispatchError::Operation(format!("設定の保存に失敗: {e}"))
-                        })?;
+                        crate::settings::save(&settings)
+                            .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
                     }
                     host.set_limit_service(next);
                     Ok(status_json(next))
                 }
                 "refresh" => Ok(host.refresh_limits()),
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / set / refresh のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "status / set / refresh".into(),
+                }
+                .invalid()),
             }
         }
 
@@ -10490,13 +10732,23 @@ fn dispatch_inner(
             )
             .map_err(DispatchError::Operation),
             "show" => {
-                let id =
-                    id.ok_or_else(|| DispatchError::InvalidParams("show には id が必要".into()))?;
+                let id = id.ok_or_else(|| {
+                    Reason::ActionNeeds {
+                        action: "show".into(),
+                        key: "id",
+                    }
+                    .invalid()
+                })?;
                 crate::sessions::show_payload(&id).map_err(DispatchError::Operation)
             }
             "resume" => {
-                let id =
-                    id.ok_or_else(|| DispatchError::InvalidParams("resume には id が必要".into()))?;
+                let id = id.ok_or_else(|| {
+                    Reason::ActionNeeds {
+                        action: "resume".into(),
+                        key: "id",
+                    }
+                    .invalid()
+                })?;
                 dispatch_sessions_resume(host, origin, &id, pane, tab, direction)
             }
             // #1069: Claude 公式 Remote Control の session URL
@@ -10530,9 +10782,12 @@ fn dispatch_inner(
                     })
                     .map_err(DispatchError::Operation)
             }
-            other => Err(DispatchError::InvalidParams(format!(
-                "不明な action: {other:?}（list / show / resume / link / usage のいずれか）"
-            ))),
+            other => Err(Reason::UnknownValue {
+                key: "action",
+                got: other.to_string(),
+                allowed: "list / show / resume / link / usage".into(),
+            }
+            .invalid()),
         },
 
         Request::Logs {
@@ -10545,9 +10800,8 @@ fn dispatch_inner(
             total_max_mb,
         } => match action.as_str() {
             "list" => {
-                let dir = tako_core::pane_log::log_dir().ok_or_else(|| {
-                    DispatchError::Operation("データディレクトリを解決できない".into())
-                })?;
+                let dir = tako_core::pane_log::log_dir()
+                    .ok_or_else(|| Reason::DataDirUnresolved.operation())?;
                 let files: Vec<Value> = tako_core::pane_log::list_files(&dir)
                     .into_iter()
                     .map(|f| {
@@ -10589,14 +10843,17 @@ fn dispatch_inner(
                     settings.pane_log_total_max_mb = t;
                 }
                 crate::settings::save(&settings)
-                    .map_err(|e| DispatchError::Operation(format!("設定の保存に失敗: {e}")))?;
+                    .map_err(|e| Reason::SaveSettingsFailed(e.to_string()).operation())?;
                 let config = settings.pane_log_config();
                 host.apply_pane_log_config(config);
                 Ok(pane_log_status_json(&config))
             }
-            other => Err(DispatchError::InvalidParams(format!(
-                "不明な action: {other:?}（list / read / status / set のいずれか）"
-            ))),
+            other => Err(Reason::UnknownValue {
+                key: "action",
+                got: other.to_string(),
+                allowed: "list / read / status / set".into(),
+            }
+            .invalid()),
         },
 
         Request::OpenDir { path, focus } => {
@@ -10893,9 +11150,12 @@ fn dispatch_inner(
                 recent.save();
                 Ok(json!({ "cleared": true }))
             }
-            other => Err(DispatchError::InvalidParams(format!(
-                "不明な action: {other:?}（list / clear のいずれか）"
-            ))),
+            other => Err(Reason::UnknownValue {
+                key: "action",
+                got: other.to_string(),
+                allowed: "list / clear".into(),
+            }
+            .invalid()),
         },
 
         Request::TaskCheckpoint {
@@ -10936,10 +11196,18 @@ fn dispatch_inner(
                 .map_err(DispatchError::Operation),
             "update" => {
                 let tid = task_id.ok_or_else(|| {
-                    DispatchError::InvalidParams("update には task_id が必要".into())
+                    Reason::ActionNeeds {
+                        action: "update".into(),
+                        key: "task_id",
+                    }
+                    .invalid()
                 })?;
                 let ph = phase.ok_or_else(|| {
-                    DispatchError::InvalidParams("update には phase が必要".into())
+                    Reason::ActionNeeds {
+                        action: "update".into(),
+                        key: "phase",
+                    }
+                    .invalid()
                 })?;
                 crate::task_checkpoints::update_phase_payload(
                     &tid,
@@ -10950,7 +11218,11 @@ fn dispatch_inner(
             }
             "resume" => {
                 let tid = task_id.ok_or_else(|| {
-                    DispatchError::InvalidParams("resume には task_id が必要".into())
+                    Reason::ActionNeeds {
+                        action: "resume".into(),
+                        key: "task_id",
+                    }
+                    .invalid()
                 })?;
                 dispatch_task_resume(
                     host,
@@ -10962,9 +11234,12 @@ fn dispatch_inner(
                     caller_role.as_deref(),
                 )
             }
-            other => Err(DispatchError::InvalidParams(format!(
-                "不明な action: {other:?}（checkpoint / list / update / resume のいずれか）"
-            ))),
+            other => Err(Reason::UnknownValue {
+                key: "action",
+                got: other.to_string(),
+                allowed: "checkpoint / list / update / resume".into(),
+            }
+            .invalid()),
         },
 
         Request::UserTask {
@@ -11019,26 +11294,46 @@ fn dispatch_inner(
         } => match action.as_str() {
             "set" => {
                 let tid = task_id.ok_or_else(|| {
-                    DispatchError::InvalidParams("set には task_id が必要".into())
+                    Reason::ActionNeeds {
+                        action: "set".into(),
+                        key: "task_id",
+                    }
+                    .invalid()
                 })?;
                 let cj = criteria_json.ok_or_else(|| {
-                    DispatchError::InvalidParams("set には criteria_json が必要".into())
+                    Reason::ActionNeeds {
+                        action: "set".into(),
+                        key: "criteria_json",
+                    }
+                    .invalid()
                 })?;
                 crate::acceptance_gates::set_gate_payload(&tid, &cj, cwd.as_deref())
                     .map_err(DispatchError::Operation)
             }
             "show" => {
                 let tid = task_id.ok_or_else(|| {
-                    DispatchError::InvalidParams("show には task_id が必要".into())
+                    Reason::ActionNeeds {
+                        action: "show".into(),
+                        key: "task_id",
+                    }
+                    .invalid()
                 })?;
                 crate::acceptance_gates::show_gate_payload(&tid).map_err(DispatchError::Operation)
             }
             "record_results" => {
                 let tid = task_id.ok_or_else(|| {
-                    DispatchError::InvalidParams("record_results には task_id が必要".into())
+                    Reason::ActionNeeds {
+                        action: "record_results".into(),
+                        key: "task_id",
+                    }
+                    .invalid()
                 })?;
                 let rj = results_json.ok_or_else(|| {
-                    DispatchError::InvalidParams("record_results には results_json が必要".into())
+                    Reason::ActionNeeds {
+                        action: "record_results".into(),
+                        key: "results_json",
+                    }
+                    .invalid()
                 })?;
                 crate::acceptance_gates::record_results_payload(
                     &tid,
@@ -11047,9 +11342,12 @@ fn dispatch_inner(
                 )
                 .map_err(DispatchError::Operation)
             }
-            other => Err(DispatchError::InvalidParams(format!(
-                "不明な action: {other:?}（set / show / record_results のいずれか）"
-            ))),
+            other => Err(Reason::UnknownValue {
+                key: "action",
+                got: other.to_string(),
+                allowed: "set / show / record_results".into(),
+            }
+            .invalid()),
         },
 
         Request::RunInteractive {
@@ -11557,9 +11855,12 @@ fn dispatch_inner(
                     let is_open = host.settings_window_open();
                     Ok(json!({ "open": is_open }))
                 }
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（open / status のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "open / status".into(),
+                }
+                .invalid()),
             }
         }
 
@@ -11575,9 +11876,12 @@ fn dispatch_inner(
                 "status" => dispatch_stale_binary_status(host, origin, pane),
                 "restart" => dispatch_stale_binary_restart(host, origin, pane),
                 "dismiss" => dispatch_stale_binary_dismiss(host, origin, pane),
-                other => Err(DispatchError::InvalidParams(format!(
-                    "不明な action: {other:?}（status / restart / dismiss のいずれか）"
-                ))),
+                other => Err(Reason::UnknownValue {
+                    key: "action",
+                    got: other.to_string(),
+                    allowed: "status / restart / dismiss".into(),
+                }
+                .invalid()),
             }
         }
 
@@ -11598,7 +11902,8 @@ fn dispatch_inner(
                 // [`welcome_land`] へ来る。ここは直の呼び手（同じスレッドで確かめる）
                 "next" => {
                     let step = crate::welcome::probe();
-                    let launch = crate::welcome::launch_for(&step, crate::welcome::default_dialect());
+                    let launch =
+                        crate::welcome::launch_for(&step, crate::welcome::default_dialect());
                     return welcome_next(host, step, launch);
                 }
                 // #1510: 自動の段（ネットワークの導入を含まない setup）をもう一度走らせる。
@@ -11622,9 +11927,12 @@ fn dispatch_inner(
                     }
                 }
                 other => {
-                    return Err(DispatchError::InvalidParams(format!(
-                        "不明な action: {other:?}（status / show / hide / dismiss / next / auto のいずれか）"
-                    )))
+                    return Err(Reason::UnknownValue {
+                        key: "action",
+                        got: other.to_string(),
+                        allowed: "status / show / hide / dismiss / next / auto".into(),
+                    }
+                    .invalid())
                 }
             }
             Ok(welcome_status(host))
@@ -11968,9 +12276,12 @@ fn dispatch_show_command(
             }))
         }
 
-        other => Err(DispatchError::InvalidParams(format!(
-            "不明な action: {other:?}（show / list / copy / run / dismiss のいずれか）"
-        ))),
+        other => Err(Reason::UnknownValue {
+            key: "action",
+            got: other.to_string(),
+            allowed: "show / list / copy / run / dismiss".into(),
+        }
+        .invalid()),
     }
 }
 
@@ -12669,8 +12980,8 @@ fn dispatch_logs_read(
     session_id: Option<&str>,
     lines: Option<usize>,
 ) -> Result<Value, DispatchError> {
-    let dir = tako_core::pane_log::log_dir()
-        .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
+    let dir =
+        tako_core::pane_log::log_dir().ok_or_else(|| Reason::DataDirUnresolved.operation())?;
     let (path, resolved_pane) = if let Some(sid) = session_id {
         let catalog = crate::sessions::SessionCatalog::load().map_err(DispatchError::Operation)?;
         let (_, entry) = catalog.resolve_id(sid).map_err(DispatchError::Operation)?;
@@ -14301,9 +14612,11 @@ pub fn dispatch_config_share(
         "push" => config_share::push(message, no_push),
         "pull" => config_share::pull(),
         other => {
-            return Err(DispatchError::Operation(format!(
-                "不明な action: {other}。status | init | link | unlink | push | pull | list"
-            )))
+            return Err(Reason::UnknownActionListed {
+                got: other.to_string(),
+                allowed: "status | init | link | unlink | push | pull | list",
+            }
+            .operation())
         }
     };
     result.map_err(DispatchError::Operation)
@@ -14615,8 +14928,7 @@ fn dispatch_remote_folder(
                     // 直してから `remote_root_order`（並び規則の正本）へ渡す
                     let opened_order: Vec<tako_core::remote_fs::RemoteFolder> =
                         t.remote_folders().iter().rev().cloned().collect();
-                    let order =
-                        tako_core::sidebar::remote_root_order(&opened_order, placement);
+                    let order = tako_core::sidebar::remote_root_order(&opened_order, placement);
                     let origin_of = |remote: &RemoteRef| {
                         opened_order
                             .iter()
@@ -14825,9 +15137,13 @@ fn dispatch_remote_folder(
             Ok(payload)
         }
 
-        other => Err(DispatchError::InvalidParams(format!(
-            "不明な action: {other:?}（open / close / list / ls / open-file / ssh-pane / pending / push / auto のいずれか）"
-        ))),
+        other => Err(Reason::UnknownValue {
+            key: "action",
+            got: other.to_string(),
+            allowed: "open / close / list / ls / open-file / ssh-pane / pending / push / auto"
+                .into(),
+        }
+        .invalid()),
     }
 }
 
@@ -15858,9 +16174,11 @@ pub fn dispatch_orchestrator_handoff_files(
                 "migrated": !summaries.is_empty(),
             }))
         }
-        other => Err(DispatchError::InvalidParams(format!(
-            "未知の action: {other}（list | show | write | migrate）"
-        ))),
+        other => Err(Reason::UnfamiliarAction {
+            got: other.to_string(),
+            allowed: "list | show | write | migrate",
+        }
+        .invalid()),
     }
 }
 
@@ -20977,9 +21295,7 @@ pub fn dispatch_remote_shortcuts(
     match action {
         "list" => Ok(listing(&crate::data_files::load_remote_shortcuts())),
         "add" => {
-            let target = path.ok_or_else(|| {
-                DispatchError::InvalidParams("add には path が必要（絶対パス）".to_string())
-            })?;
+            let target = path.ok_or_else(|| Reason::ShortcutAddNeedsPath.invalid())?;
             let mut file = crate::data_files::load_remote_shortcuts();
             let added = file
                 .add(std::path::Path::new(target), name, now)
@@ -20991,9 +21307,7 @@ pub fn dispatch_remote_shortcuts(
             Ok(out)
         }
         "remove" => {
-            let key = path.ok_or_else(|| {
-                DispatchError::InvalidParams("remove には path が必要（id でも可）".to_string())
-            })?;
+            let key = path.ok_or_else(|| Reason::ShortcutRemoveNeedsPath.invalid())?;
             let mut file = crate::data_files::load_remote_shortcuts();
             let removed = file
                 .remove(key, home.as_deref())
@@ -21004,9 +21318,11 @@ pub fn dispatch_remote_shortcuts(
             out["removed"] = json!(removed.id);
             Ok(out)
         }
-        other => Err(DispatchError::InvalidParams(format!(
-            "不明な action: {other}（list / add / remove）"
-        ))),
+        other => Err(Reason::UnknownActionPlain {
+            got: other.to_string(),
+            allowed: "list / add / remove",
+        }
+        .invalid()),
     }
 }
 
@@ -23396,8 +23712,8 @@ fn dispatch_user_task(
     origin: PaneOrigin,
     params: UserTaskParams,
 ) -> Result<Value, DispatchError> {
-    let path = crate::user_tasks::store_path()
-        .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
+    let path =
+        crate::user_tasks::store_path().ok_or_else(|| Reason::DataDirUnresolved.operation())?;
     let op_err = DispatchError::Operation;
 
     // 決着していない配送を畳み込む（読み書きのどの入口からでも 1 回。#1259 の
@@ -23473,10 +23789,12 @@ fn dispatch_user_task(
 
 /// 知らない action（dispatch の同期の腕と background の準備が同じ 1 つを返す）
 fn unknown_user_task_action(other: &str) -> DispatchError {
-    DispatchError::InvalidParams(format!(
-        "不明な action: {other:?}（add / list / show / update / done / dismiss / \
-         respond / expand / collapse のいずれか）"
-    ))
+    Reason::UnknownValue {
+        key: "action",
+        got: other.to_string(),
+        allowed: "add / list / show / update / done / dismiss / respond / expand / collapse".into(),
+    }
+    .invalid()
 }
 
 // --- 返答の 3 段（#2016） ---------------------------------------------------
@@ -23528,8 +23846,8 @@ pub fn user_task_respond_store(
             "user_task_respond_store が受けるのは respond だけ（{action:?}）"
         )));
     }
-    let path = crate::user_tasks::store_path()
-        .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
+    let path =
+        crate::user_tasks::store_path().ok_or_else(|| Reason::DataDirUnresolved.operation())?;
     let params = UserTaskParams {
         action: action.clone(),
         id: id.clone(),
@@ -23578,13 +23896,15 @@ fn user_task_respond_fields(
     DispatchError,
 > {
     let id = user_task_id(params)?;
-    let decision = crate::user_tasks::parse_decision(
-        params
-            .decision
-            .as_deref()
-            .ok_or_else(|| DispatchError::InvalidParams("respond には decision が必要".into()))?,
-    )
-    .map_err(DispatchError::InvalidParams)?;
+    let decision =
+        crate::user_tasks::parse_decision(params.decision.as_deref().ok_or_else(|| {
+            Reason::ActionNeeds {
+                action: "respond".into(),
+                key: "decision",
+            }
+            .invalid()
+        })?)
+        .map_err(DispatchError::InvalidParams)?;
     let via = match params.via.as_deref() {
         Some(v) => crate::user_tasks::parse_via(v).map_err(DispatchError::InvalidParams)?,
         None => match origin {
@@ -23740,7 +24060,13 @@ fn user_task_id(params: &UserTaskParams) -> Result<String, DispatchError> {
 fn required_user_task_id(action: &str, id: Option<&str>) -> Result<String, DispatchError> {
     id.filter(|s| !s.is_empty())
         .map(str::to_string)
-        .ok_or_else(|| DispatchError::InvalidParams(format!("{action} には id が必要")))
+        .ok_or_else(|| {
+            Reason::ActionNeeds {
+                action: action.to_string(),
+                key: "id",
+            }
+            .invalid()
+        })
 }
 
 /// `done` / `dismiss` の行き先（呼ぶ側は 2 つのどちらかであることを確かめてから呼ぶ）
@@ -24035,8 +24361,8 @@ pub fn user_task_list_load(
         )));
     }
     let filter = user_task_filter(status.as_deref(), kind.as_deref(), project.clone(), *all)?;
-    let path = crate::user_tasks::store_path()
-        .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
+    let path =
+        crate::user_tasks::store_path().ok_or_else(|| Reason::DataDirUnresolved.operation())?;
     // 書き戻しは読む前（書けば版が変わるので、続く読みが確定後の中身を拾う）。
     // 失敗しても一覧は出す（dispatch の畳み込みと同じく副次的な仕事）
     if !observed.is_empty() {
@@ -24180,8 +24506,8 @@ fn user_task_offload_prepare(
             "user_task_offload_prepare が受けるのは UserTask だけ".into(),
         ));
     };
-    let path = crate::user_tasks::store_path()
-        .ok_or_else(|| DispatchError::Operation("データディレクトリを解決できない".into()))?;
+    let path =
+        crate::user_tasks::store_path().ok_or_else(|| Reason::DataDirUnresolved.operation())?;
     // #2086: ② の仕事（引数の検査は済んだ形で渡す）
     let op = match params.action.as_str() {
         "list" => {
@@ -24353,10 +24679,13 @@ fn user_task_offloads(action: &str, via: Option<&str>) -> bool {
 fn user_task_add_fields(
     params: &UserTaskParams,
 ) -> Result<(String, Option<tako_core::user_task::TaskKind>), DispatchError> {
-    let title = params
-        .title
-        .clone()
-        .ok_or_else(|| DispatchError::InvalidParams("add には title が必要".into()))?;
+    let title = params.title.clone().ok_or_else(|| {
+        Reason::ActionNeeds {
+            action: "add".into(),
+            key: "title",
+        }
+        .invalid()
+    })?;
     let kind = params
         .kind
         .as_deref()
@@ -50821,10 +51150,11 @@ mod tests {
                 Some(Err(DispatchError::InvalidParams(_)))
             ));
         }
-        // 知らない action は同期の腕と同じ理由で断る
+        // 知らない action は同期の腕と同じ理由で断る（理由の文は表示言語 = #2365。日英どちらでも当てる）
         assert!(matches!(
             prepare_offload(&mut host, &t2086_req(t1479_params("frobnicate", None))),
-            Some(Err(DispatchError::InvalidParams(e))) if e.contains("不明な action")
+            Some(Err(DispatchError::InvalidParams(e)))
+                if e.contains("不明な action") || e.contains("unknown action")
         ));
         // 無い id は background の Err（UI スレッドへは戻らない）
         let job = t2086_prepare(&mut host, &t2086_req(t1479_params("show", Some("u-無い"))));

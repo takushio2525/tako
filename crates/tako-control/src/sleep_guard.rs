@@ -121,20 +121,34 @@ impl PowerCondition {
     }
 
     /// 各値の意味（`match` なので変種を足すとコンパイルが通らない = 値だけ増えて
-    /// 説明が古くなることがない。#1467）
+    /// 説明が古くなることがない。#1467）。MCP カタログ・CLI の案内と同じ日本語
     pub fn summary(self) -> &'static str {
-        match self {
-            Self::AcOnly => "ac-only = AC 電源に接続しているときだけ",
-            Self::Always => "always = バッテリー駆動でも",
+        self.summary_in(tako_core::i18n::Lang::Ja)
+    }
+
+    /// 各値の意味を表示言語を明示して引く（#2365。dispatch の断りが表示言語で添える）。
+    /// (変種, 言語) の網羅 match なので、変種を足すと日英の両方を書くまで通らない
+    pub fn summary_in(self, lang: tako_core::i18n::Lang) -> &'static str {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::AcOnly, Ja) => "ac-only = AC 電源に接続しているときだけ",
+            (Self::AcOnly, En) => "ac-only = only while on AC power",
+            (Self::Always, Ja) => "always = バッテリー駆動でも",
+            (Self::Always, En) => "always = also on battery",
         }
     }
 
-    /// MCP / CLI の案内文（受理値と意味を 1 行で）
+    /// MCP / CLI の案内文（受理値と意味を 1 行で。MCP カタログの説明に載るので日本語）
     pub fn values_hint() -> String {
+        Self::values_hint_in(tako_core::i18n::Lang::Ja)
+    }
+
+    /// [`Self::values_hint`] を表示言語を明示して引く（#2365。dispatch の断りに添える）
+    pub fn values_hint_in(lang: tako_core::i18n::Lang) -> String {
         Self::VALUES
             .iter()
             .filter_map(|v| Self::from_str_opt(v))
-            .map(|v| v.summary().to_string())
+            .map(|v| v.summary_in(lang).to_string())
             .collect::<Vec<_>>()
             .join(" / ")
     }
