@@ -74936,6 +74936,7 @@ mod self_test {
                         ledger_id: None,
                         cwd: None,
                         prompt_head: None,
+                        profile: None,
                     }) {
                         fail(&format!("87: worker を登録できない (#775。{e})"));
                     }
@@ -96995,6 +96996,7 @@ mod self_test {
                         ledger_id: None,
                         cwd: None,
                         prompt_head: None,
+                        profile: None,
                     }) {
                         fail(&format!("148: worker を登録できない (#775。{e})"));
                     }

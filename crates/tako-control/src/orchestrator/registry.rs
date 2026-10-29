@@ -168,6 +168,11 @@ pub struct WorkerEntry {
     /// `agent_exited` のとき、シェルが報告した終了コード（OSC 133;D。無ければ None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_exit_code: Option<i32>,
+    /// spawn した master のプロファイル名（#2470。`default` を含む）。突然死からの復旧
+    /// （`tako orchestrator resume <worker_id>`）が spawn と同じプロファイルで組むための記録。
+    /// #2470 前のファイルには無い = serde の default で None として読める（移行は要らない）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 /// 起動失敗の理由（Issue #1940）。綴りは `workers` の `launch_failure` にそのまま出る
@@ -374,6 +379,8 @@ pub struct RegisterSpawn {
     pub ledger_id: Option<String>,
     pub cwd: Option<String>,
     pub prompt_head: Option<String>,
+    /// spawn した master のプロファイル名（#2470）
+    pub profile: Option<String>,
 }
 
 /// spawn した worker をレジストリへ登録し、発番した worker ID を返す。
@@ -421,6 +428,7 @@ pub fn record_spawn(record: RegisterSpawn) -> Result<String, String> {
                 launch_failed_at: None,
                 launch_failure: None,
                 launch_exit_code: None,
+                profile: record.profile.clone(),
             },
         );
         reg.gc();
@@ -1013,13 +1021,40 @@ pub fn resend_command(entry: &WorkerEntry) -> Option<String> {
     Some(format!("tako send --pane {} '<同じ依頼文>'", entry.pane))
 }
 
-/// レジストリの session ID から復旧コマンドを組み立てる（#390: SIGSEGV 等の
-/// 突然死からの復旧提示）。claude のみ（--resume の互換が確認できているのは claude）。
-/// master はこのコマンドを死んだペインのシェルへ send_input するか、新ペインで実行する。
+/// 突然死からの復旧コマンド（#390: SIGSEGV 等の突然死からの復旧提示）。claude の worker で
+/// session ID を検出済みのときだけ出す（`--resume` の互換が確認できているのは claude）。
+/// master / supervisor はこの 1 行を**死んだペインのシェルへ送る**か、新しいペインで実行する。
 ///
-/// 会話が既定以外の config ディレクトリにあれば `CLAUDE_CONFIG_DIR` を前置する
-/// （`--account` で spawn した worker の会話は `~/.claude` に無い。Issue #652）
-pub fn resume_command(entry: &WorkerEntry) -> Option<String> {
+/// #2470: 案内は `tako orchestrator resume <worker_id>` の 1 行で、**起動コマンドは打った時点で**
+/// spawn と同じ組み立て（`resume_launch::registry_resume_launch` = `build_worker_cmd_in` に会話 ID を
+/// 渡す 1 実装）で組む。照会（worker_status / watch / workers）のたびに組むと、spawn と同じ判断のために
+/// user scope の `.claude.json`（1 本 260〜350 KB × アカウント数）を読むことになるので、ここは
+/// **ファイルを 1 つも読まない純関数**に保つ（番犬 `issue2470_resume_command_watchdog`）。
+/// #2470 前は `cd <cwd> && claude --model … --effort … --resume <id>` を組んでいて、#2412 の
+/// `--settings`（user scope の MCP を止める）・プロファイルの args（`--permission-mode auto`）と env・
+/// `TAKO_ORCHESTRATOR_ROLE` が落ちていた。A/B は `TAKO_2470_LEGACY=1`
+pub fn resume_command(worker_id: &str, entry: &WorkerEntry) -> Option<String> {
+    if legacy_2470() {
+        return legacy_resume_command(entry);
+    }
+    if entry.agent != "claude" || entry.session_id.is_none() || worker_id.is_empty() {
+        return None;
+    }
+    Some(format!("tako orchestrator resume {worker_id}"))
+}
+
+/// #2470 の A/B。`TAKO_2470_LEGACY=1` で**同一バイナリのまま**復旧の案内を修正前の
+/// `cd <cwd> && claude --model … --effort … --resume <id>` へ戻す
+/// （`tako orchestrator resume` もこの 1 行をそのままシェルで走らせる）
+pub fn legacy_2470() -> bool {
+    std::env::var("TAKO_2470_LEGACY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// 修正前（#2470 前）の復旧コマンド。照会のたびに会話の記録の所在を探し、会話が既定以外の
+/// config ディレクトリにあれば `CLAUDE_CONFIG_DIR` を前置する（#652）
+pub fn legacy_resume_command(entry: &WorkerEntry) -> Option<String> {
     let env_prefix = entry
         .session_id
         .as_deref()
@@ -1028,7 +1063,7 @@ pub fn resume_command(entry: &WorkerEntry) -> Option<String> {
     resume_command_with_env(entry, env_prefix.as_deref())
 }
 
-/// `resume_command` の本体（env プレフィクスを引数で受け取るテスト可能版）
+/// `legacy_resume_command` の本体（env プレフィクスを引数で受け取るテスト可能版）
 fn resume_command_with_env(entry: &WorkerEntry, env_prefix: Option<&str>) -> Option<String> {
     if entry.agent != "claude" {
         return None;
@@ -1388,7 +1423,7 @@ pub fn list_payload(
             "launch_failure": e.launch_failure,
             "launch_exit_code": e.launch_exit_code,
             "launch_failed_at": e.launch_failed_at,
-            "resume_command": resume_command(e),
+            "resume_command": resume_command(id, e),
             // #822: 利用上限後の自動復帰（FR-2.27）が有効か。ペインが生きていないときは
             // ペイン属性を読めない（番号が別ペインへ再利用されている可能性もある）ので null
             "limit_resume": pane_alive.then(|| limit_resume_panes.contains(&e.pane)),
@@ -1468,6 +1503,7 @@ mod tests {
             ledger_id: Some("L1".into()),
             cwd: Some("/tmp/proj".into()),
             prompt_head: Some("Issue #390: ...".into()),
+            profile: None,
         }
     }
 
@@ -1514,6 +1550,7 @@ mod tests {
                     launch_failed_at: None,
                     launch_failure: None,
                     launch_exit_code: None,
+                    profile: record.profile.clone(),
                 },
             );
             reg.gc();
@@ -2348,6 +2385,38 @@ mod tests {
         );
     }
 
+    /// #2470: 案内は打った時点で spawn と同じ組み立てを通す 1 行。照会のたびに組まない
+    /// （ファイルを読まない = 同じ入力なら常に同じ文字列・設定や会話の記録の有無に依らない）
+    #[test]
+    fn issue2470_resume_commandは打った時点で組む1行だけを返す() {
+        let entry = WorkerEntry {
+            agent: "claude".into(),
+            session_id: Some("abc-123".into()),
+            cwd: Some("/tmp/proj".into()),
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            profile: Some("p2470".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resume_command("7", &entry).as_deref(),
+            Some("tako orchestrator resume 7")
+        );
+        // 会話 ID 未検出・claude 以外・ID が空は案内しない（従来と同じ条件）
+        let no_sid = WorkerEntry {
+            session_id: None,
+            ..entry.clone()
+        };
+        assert!(resume_command("7", &no_sid).is_none());
+        let codex = WorkerEntry {
+            agent: "codex".into(),
+            ..entry.clone()
+        };
+        assert!(resume_command("7", &codex).is_none());
+        assert!(resume_command("", &entry).is_none());
+    }
+
+    /// 以下 2 本は修正前の形（`TAKO_2470_LEGACY=1` の腕 = `legacy_resume_command`）
     #[test]
     fn resume_commandはsession検出済みclaudeのみ組み立てる() {
         let entry = WorkerEntry {
@@ -2638,7 +2707,7 @@ mod tests {
         assert!(entry.dead_since.is_none(), "倒したら死亡マークは畳む");
         // #390 の追跡・復旧材料は closed でも残っている
         assert_eq!(entry.session_id.as_deref(), Some("sid-42"));
-        assert!(resume_command(entry).is_some());
+        assert!(resume_command(&id, entry).is_some());
         // ディスクにも反映されている
         let on_disk = WorkerRegistry::load_from(&path).unwrap();
         assert_eq!(on_disk.workers[&id].status, "closed");

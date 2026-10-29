@@ -2885,6 +2885,13 @@ enum OrchestratorCommand {
         #[arg(long)]
         all: bool,
     },
+    /// 突然死した worker の会話を、spawn と同じ起動（プロファイルの許可モード・env・MCP の絞り込み・
+    /// model / effort・アカウント）でこのシェルに戻す（#390 / #2470）。worker_status / watch / workers の
+    /// `resume_command` がこの 1 行。死んだペインのシェルで打つ。GUI が無くても動く
+    Resume {
+        /// worker ID（`tako orchestrator workers --all` の worker_id）
+        worker_id: String,
+    },
     /// worker 自動復旧 supervisor の操作（#401）
     Supervisor {
         /// status / set_mode / history
@@ -4652,6 +4659,10 @@ fn cli_main() -> ExitCode {
             tmux_session.as_deref(),
             timeout,
         ),
+        // #2470: レジストリ・プロファイル・会話の記録を読んでこのシェルで起動する（GUI を通さない）
+        Command::Orchestrator(OrchestratorCommand::Resume { ref worker_id }) => {
+            orchestrator_resume(worker_id)
+        }
         Command::Orchestrator(OrchestratorCommand::Projects(ref sub)) => {
             orchestrator_projects_cli(sub)
         }
@@ -5157,6 +5168,97 @@ fn print_sandbox_state(profile: &tako_control::orchestrator::Profile, profile_na
 
 /// `tako master [-profile]` — 新タブで claude をマスター system prompt 付きで起動する。
 /// `-<名前>` でプロファイルを指定、引数なしは default、旧形式（suffix のみ）も後方互換で動作
+/// 突然死した worker をこのシェルで戻す（#390 / #2470）。
+///
+/// 起動コマンドは spawn と同じ組み立て（`resume_launch::registry_resume_launch` = GUI の復元・
+/// `tako sessions resume` と同じ 1 実装）で、**打った時点で**組む。worker_status 等の照会は案内の
+/// 1 行（`tako orchestrator resume <worker_id>`）を返すだけでファイルを読まない。
+/// 案内は死んだペインのシェルへ送られる（supervisor の自動復旧も同じ）ので、新しいペインを
+/// 作らず**このプロセスを起動コマンドに置き換える**（ペイン番号・レジストリの追跡がそのまま続く）。
+/// A/B は `TAKO_2470_LEGACY=1`（修正前の案内 `cd <cwd> && claude … --resume <id>` をそのまま走らせる）
+fn orchestrator_resume(worker_id: &str) -> Result<(), String> {
+    use tako_control::orchestrator::registry;
+
+    // 旧形式の設定ファイルを検知して直す（#916。プロファイルを読む前に）
+    if let Some(notice) = tako_control::migrations::ensure_migrated() {
+        eprintln!("[情報] {notice}");
+    }
+    let reg = registry::WorkerRegistry::load()?;
+    let entry = reg.workers.get(worker_id).ok_or_else(|| {
+        format!(
+            "worker {worker_id} がレジストリに無い（`tako orchestrator workers --all` の worker_id を指定する）"
+        )
+    })?;
+    let sid: String = entry
+        .session_id
+        .as_deref()
+        .unwrap_or("-")
+        .chars()
+        .take(8)
+        .collect();
+    let (command, cwd) = if registry::legacy_2470() {
+        // 修正前の案内（cd を含む 1 行）。比較のために同じ走らせ方を通す
+        let cmd = registry::legacy_resume_command(entry)
+            .ok_or("この worker は修正前の案内を組めない（claude 以外 / 会話 ID 未検出）")?;
+        (cmd, None)
+    } else {
+        let launch = tako_control::resume_launch::registry_resume_launch(entry)?;
+        for w in &launch.warnings {
+            eprintln!("警告: {w}");
+        }
+        // MCP の絞り込みの設定ファイルを書く（spawn と同じ。下見では書かない作法）
+        launch.materialize()?;
+        eprintln!(
+            "worker {worker_id} の会話（{sid}…）を spawn と同じ起動で戻します（プロファイル: {}）",
+            launch.profile.as_deref().unwrap_or("-")
+        );
+        (launch.command, entry.cwd.clone().filter(|c| !c.is_empty()))
+    };
+    if let Some(cwd) = cwd {
+        std::env::set_current_dir(&cwd).map_err(|e| {
+            format!("worker の作業 dir {cwd} に移れない（worktree を消した等）: {e}")
+        })?;
+    }
+    run_launch_line(&command)
+}
+
+/// 組み立てた起動コマンドの 1 行（ペインのシェルへ打ち込むのと同じ文字列）をこの端末で走らせる（#2470）。
+///
+/// 方言は組み立てと同じ `launch_cmd::launch_dialect`。POSIX は `/bin/sh -c` で**このプロセスを置き換え**
+/// （終了コード・シグナル・端末はそのままエージェントへ渡る）、PowerShell は子として走らせて終了コードを返す
+fn run_launch_line(command: &str) -> Result<(), String> {
+    use tako_control::launch_cmd::{launch_dialect, ShellDialect};
+    let mut cmd = match launch_dialect() {
+        ShellDialect::Posix => {
+            let sh = if cfg!(unix) { "/bin/sh" } else { "sh" };
+            let mut c = std::process::Command::new(sh);
+            c.arg("-c").arg(command);
+            c
+        }
+        ShellDialect::PowerShell => {
+            let program = tako_core::platform::shell::default_shell()
+                .map(|s| s.program)
+                .unwrap_or_else(|| "powershell".into());
+            let mut c = std::process::Command::new(program);
+            c.args(["-NoLogo", "-NoProfile", "-Command", command]);
+            c
+        }
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        Err(format!("起動コマンドを走らせられない: {err}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = cmd
+            .status()
+            .map_err(|e| format!("起動コマンドを走らせられない: {e}"))?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
 fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     use tako_control::orchestrator;
 
@@ -11132,6 +11234,9 @@ fn build_request(command: &Command) -> Result<Request, String> {
         }
         Command::Orchestrator(OrchestratorCommand::Watch { .. }) => {
             unreachable!("orchestrator watch は run() を通らない")
+        }
+        Command::Orchestrator(OrchestratorCommand::Resume { .. }) => {
+            unreachable!("orchestrator resume は run() を通らない")
         }
         Command::Orchestrator(OrchestratorCommand::Projects(_)) => {
             unreachable!("orchestrator projects は run() を通らない")
