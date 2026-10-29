@@ -559,9 +559,10 @@ fn confは警告なしで受理されwarm_offが効く() {
 /// 器の能力で組むもの）を実 psmux に食わせて、警告が 1 行も出ないことを確かめる。
 ///
 /// 上の `confは警告なしで受理されwarm_offが効く` は psmux 版 conf
-/// （`backend::psmux::ensure_conf`）を見ているが、**tako-app のペイン spawn は今も
-/// `tmux_backend::wrap_options` を直接呼んでいる**（#885）ので、そちらの中身を
-/// 確かめないと #974 の再発を実機で検出できない
+/// （`backend::psmux::ensure_conf`）を見ているが、**本番のペイン spawn
+/// （#885 から `PsmuxBackend::wrap_spawn` → `tmux_backend::wrap_options_for`）が書くのは
+/// こちら**なので、こちらの中身を確かめないと #974 の再発を実機で検出できない
+/// （psmux 版 conf を本番へ寄せるかは #2484）
 #[test]
 fn 本番が書くconfも警告なしで受理される() {
     use tako_core::backend::SessionBackend;

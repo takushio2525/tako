@@ -580,6 +580,12 @@ impl ContainerPin {
         Self { backend, session }
     }
 
+    /// 固定が要るとき（Windows）だけ作る。unix は None（器への問い合わせもスレッドも作らない）。
+    /// `backend::wrap_spawn_for_pane` が配った器について使う（#885）
+    pub fn when_needed(backend: &'static dyn SessionBackend, session: SessionRef) -> Option<Self> {
+        console::pin_needed().then(|| Self::new(backend, session))
+    }
+
     /// 本番の器（[`crate::backend::backend`]）のセッション名から作る。
     /// 固定が要らない（unix）・名前が器の名前として使えないときは None
     pub fn for_session(name: &str) -> Option<Self> {
@@ -630,14 +636,6 @@ pub(crate) fn begin(
         start_container(pin, ticket);
     }
     gate
-}
-
-/// 器の内側の固定だけを門なしで走らせる（`backend::wrap_spawn_for_pane` 用。
-/// あちらは端末を起こす前に呼ばれるので保留の門を持てない）
-pub(crate) fn start_container_ungated(pin: ContainerPin) {
-    if console::pin_needed() {
-        start_container(pin, None);
-    }
 }
 
 /// 固定を遅らせる・諦めさせる注入（**検証用**。#2092）。

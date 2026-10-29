@@ -203,18 +203,20 @@ fn check_attach_only(app: &Views) -> Result<(), String> {
                 app.at(base, flag)
             )
         })?;
+    // 新しいペイン（new-session -A）は器の入口を通る（#885。tmux_backend::wrap_options の直呼びは
+    // issue885_spawn_via_backend_watchdog が落とす）
     let wrap = body
-        .find("tako_core::tmux_backend::wrap_options(")
+        .find("tako_core::backend::wrap_spawn_for_pane(")
         .ok_or_else(|| {
             format!(
-                "{} 新しいペインの wrap_options が消えている",
+                "{} 新しいペインの器の入口（backend::wrap_spawn_for_pane）が消えている",
                 app.at(base, 0)
             )
         })?;
     if !(flag < attach_only && attach_only < wrap) {
         return Err(format!(
             "{} 再 attach の分岐が new-session -A の分岐より後ろにある（印が立っていても \
-             wrap_options が先に効く）",
+             wrap_spawn_for_pane が先に効く）",
             app.at(base, attach_only)
         ));
     }

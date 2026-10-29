@@ -715,7 +715,13 @@ tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無
 - **spawn 経路**（`tako-core::tmux_backend::wrap_options`）: シェル直接 spawn の代わりに
   `tmux -L tako -f <conf> new-session -A -D -s tako-<rand>` を PTY 子プロセスにする。
   `-A` で「新規作成」と「再 attach」が同一コマンド（消えていたセッションは `-c` の
-  保存 cwd で開き直しになる）。`-D` で多重起動時は最新インスタンスへ収束
+  保存 cwd で開き直しになる）。`-D` で多重起動時は最新インスタンスへ収束。
+  **tako-app はこれを直接呼ばない**（#885）: `spawn_session` は `backend::wrap_spawn_for_pane`
+  （`reserve` = 器の名前の検査 #428 → 器の `wrap_spawn`）を通り、`TmuxBackend` はここへ委譲、
+  `PsmuxBackend` は器のオーナー記録（#177）を取ってから同じ組み立て（`wrap_options_for`）を呼ぶ。
+  記録はペインを閉じた・端末が終わったときに `SessionBackend::release` で外す。
+  器の内側の文字コード固定（#659）は `PaneSpawn::pin` として `TerminalSession::spawn_in` の門へ渡す。
+  直呼びへ戻すと番犬 `crates/tako-core/tests/issue885_spawn_via_backend_watchdog.rs` が file:line で落とす
 - **レイアウト**（`tako-control::layout` → `<data_dir>/layout.json`）: タブ / 分割ツリー /
   タイトル / role / cwd / セッション名を**ペイン・タブ ID ごと**保存し、復元時は同じ ID を
   再現（`Pane::restore` 等が採番カウンタを fetch_max で先へ進める）。これで tmux 内で

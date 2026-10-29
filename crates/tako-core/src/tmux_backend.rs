@@ -550,8 +550,34 @@ pub fn sync_conf(socket: &str) {
 
 /// SpawnOptions を tmux セッション経由に書き換える。
 /// `options.env`（TAKO_* 注入を含む）はクライアント経由でセッション作成時の環境になる。
-/// `options.cwd` は `-c` で渡す（既存セッションへの attach では tmux が無視する）
+/// `options.cwd` は `-c` で渡す（既存セッションへの attach では tmux が無視する）。
+///
+/// **本番のペインはこれを直接呼ばない**（#885）: tako-app の spawn は
+/// `backend::wrap_spawn_for_pane`（器の名前の検査 → 器の `wrap_spawn`）を通り、
+/// `TmuxBackend::wrap_spawn` がここへ委譲する。組み立ての本体は [`wrap_options_for`]
 pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> SpawnOptions {
+    wrap_options_for(
+        options,
+        crate::tmux::tmux_bin(),
+        crate::backend::capabilities().quotes_program,
+        socket,
+        session,
+    )
+}
+
+/// [`wrap_options`] の組み立ての本体。器のクライアントの実行ファイル（`program`）と、
+/// 内側コマンドの第 1 語の書き方（`quotes_program` = 器の能力。#881）を呼び出し側が決める。
+///
+/// tmux と psmux で argv の形を分けない 1 実装（#885）。`PsmuxBackend::wrap_spawn` が
+/// 自分の能力とクライアントでここを呼ぶ（本番の Windows が #885 まで走らせてきた形 =
+/// [`wrap_options`] と同じ並び・同じ conf）
+pub(crate) fn wrap_options_for(
+    options: SpawnOptions,
+    program: &str,
+    quotes_program: bool,
+    socket: &str,
+    session: &str,
+) -> SpawnOptions {
     // #2085: 同じ名前の器の前の死の書き出し（tako が居ない間に消えた器）を、
     // これから作る / 繋ぐ器の死と取り違えないよう先に消す
     if let Some(dir) = pane_died_dir() {
@@ -604,7 +630,10 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
         .clone()
         .or_else(crate::shell_integration::pane_shell)
     {
-        inner = Some(crate::backend::inner_command_line(&command));
+        inner = Some(crate::backend::compose_inner_command(
+            &command,
+            quotes_program,
+        ));
     }
     // #2367: GUI が fd 上限を引き上げたなら、器の中のペインの子は起動時の値へ戻す段
     // （GUI 自身の実行ファイル）を通す。残余引数が 2 個以上だと tmux は `execvp` で直に起こし
@@ -618,7 +647,7 @@ pub fn wrap_options(options: SpawnOptions, socket: &str, session: &str) -> Spawn
     }
     SpawnOptions {
         command: Some(SpawnCommand {
-            program: crate::tmux::tmux_bin().to_string(),
+            program: program.to_string(),
             args,
         }),
         ..options
