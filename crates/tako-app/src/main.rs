@@ -7075,6 +7075,8 @@ impl TakoApp {
                                 snapshot.as_ref().filter(|_| rescan_ssh || ssh_share),
                                 now,
                             );
+                            // 採り直した回は前回と突き合わせ、busy の集合が変わっていたら次の tick で
+                            // 確かめ直す（#2477。1 瞬間だけ居た子を 60 秒の保険まで残さない）
                             let running_state =
                                 if rescan_running || (share && !running_targets.is_empty()) {
                                     tako_control::agents::scan_running_children(
@@ -7083,6 +7085,7 @@ impl TakoApp {
                                         now,
                                         snapshot.as_ref(),
                                     )
+                                    .settled_against(&running_prev)
                                 } else {
                                     let mut state = running_prev;
                                     state.sleep_guard_active = sleep_guard_active;
@@ -39550,6 +39553,111 @@ mod self_test {
     /// - `nomenu` = 657 の `MenuInvoke` を送らずに成功を騙る（#657）
     fn inject_1153() -> String {
         std::env::var("TAKO_1153_INJECT").unwrap_or_default()
+    }
+
+    /// **#2477 の注入口**（項目 93 (e) = 694(e)）。`transient` で「子の走査が 1 瞬間だけ居た子を
+    /// 拾い、その子が指紋を動かさずに消える」順序を固定する（[`inject_transient_child_2477`]）。
+    /// 負荷は作らない（子は印のファイルを 0.1 秒ごとに見るだけ）
+    fn inject_2477() -> String {
+        std::env::var("TAKO_2477_INJECT").unwrap_or_default()
+    }
+
+    /// 子の走査の状態（#2477）。落ちたときに「何秒前の走査の結果か」「そのペインを何の状態で
+    /// 記録したか」「確かめ直し待ちか」を残す（busy が古い観測なのか今も居る子なのかを分ける）
+    fn running_scan_diag(app: &TakoApp, pane: PaneId) -> String {
+        let scan = &app.running_children_scan;
+        let recorded = scan
+            .targets
+            .iter()
+            .find(|t| t.pane == pane.as_u64())
+            .map(|t| t.command_state);
+        let age = scan
+            .scanned_at
+            .map(|t| format!("{:.1}s", t.elapsed().as_secs_f32()))
+            .unwrap_or_else(|| "-".to_string());
+        format!(
+            "scan_age={age} recorded={recorded:?} unconfirmed={} legacy_2477={}",
+            scan.unconfirmed,
+            tako_control::agents::legacy_2477()
+        )
+    }
+
+    /// #2477 の注入の本体。ペインのシェルに背景ジョブ（印のファイルが置かれるまで待つだけ）を
+    /// 1 本起こし、**走査がそれを最初に拾った直後**に印を置いて消す。消えるときシェルは何も
+    /// 打たないので OSC 133 の状態は Idle のまま = 指紋が動かない（実機で落ちた回と同じ形）。
+    ///
+    /// 走査は指紋が動かないと採り直さないので、拾わせる 1 回だけは `scanned_at` を空にして
+    /// 次の tick へ採取を頼む（= 別の理由の採り直しが居合わせた形の再現）。返すのは 1 行の所見と
+    /// 印のパス（**印は判定が済んでから呼び出し側が消す**。時間で消すと、混んだ機で子が印を
+    /// 見る前に消えて背景ジョブが残り、新しい経路まで落ちる）
+    async fn inject_transient_child_2477(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        sh: tako_core::platform::shell_dialect::ShellDialect,
+        pane: PaneId,
+    ) -> (String, Option<std::path::PathBuf>) {
+        if !sh.is_posix() {
+            return (format!("skipped=non-posix dialect={}", sh.label()), None);
+        }
+        let flag = std::env::temp_dir().join(format!(
+            "tako-st2477-{}-{}.flag",
+            std::process::id(),
+            pane.as_u64()
+        ));
+        remove_on_fail(&flag);
+        let _ = std::fs::remove_file(&flag);
+        let quoted = tako_core::shell::quote_for_shell(&flag.display().to_string());
+        // `{ … & }` の形の理由は `spawn_background_sleep`（背景ジョブをシェルの直接の子に保つ）
+        let cmd = format!("{{ until [ -e {quoted} ]; do sleep 0.1; done & }}");
+        let _ = window.update(cx, |app, _, _| app.queue_command_flow(pane, cmd));
+        let started = std::time::Instant::now();
+        let mut caught = None;
+        while started.elapsed() < Duration::from_secs(30) {
+            let seen = window
+                .update(cx, |app, _, _| {
+                    let flow_done = !app.command_flows.iter().any(|c| c.pane == pane);
+                    let idle = app.terminals.get(&pane).map(|s| s.command_state())
+                        == Some(CommandState::Idle);
+                    if app.pane_has_busy_children(pane) {
+                        let scan = &app.running_children_scan;
+                        let recorded = scan
+                            .targets
+                            .iter()
+                            .find(|t| t.pane == pane.as_u64())
+                            .map(|t| t.command_state);
+                        return Some((recorded, scan.unconfirmed));
+                    }
+                    // 打ち終えてシェルが戻ったら、次の tick で 1 回採ってもらう
+                    if flow_done && idle {
+                        app.running_children_scan.scanned_at = None;
+                    }
+                    None
+                })
+                .ok()
+                .flatten();
+            if seen.is_some() {
+                caught = seen;
+                break;
+            }
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+        }
+        // 拾えなくても印は必ず置く（背景ジョブを残さない）
+        let _ = std::fs::write(&flag, b"");
+        let note = match caught {
+            Some((recorded, unconfirmed)) => format!(
+                "caught=true recorded={recorded:?} unconfirmed={unconfirmed} waited={:.1}s \
+                 legacy_2477={}",
+                started.elapsed().as_secs_f32(),
+                tako_control::agents::legacy_2477()
+            ),
+            None => format!(
+                "caught=false waited={:.1}s",
+                started.elapsed().as_secs_f32()
+            ),
+        };
+        (note, Some(flag))
     }
 
     /// **#2013 の A/B の口**: 項目 93 (c)（#694 の判定表）を旧の固定 4 秒窓へ戻す。
@@ -79535,7 +79643,9 @@ mod self_test {
                 // 走らせた `tako --version` の後片付け待ちになる:
                 //
                 // - `command_state` は OSC 133 D が届くまで `Running` のまま
-                // - `busy_children` は sleep_guard の 2 秒 tick が更新するまで真のまま
+                // - `busy_children` は子の走査が採り直すまで真のまま。採り直しは指紋の変化か
+                //   「前回 busy の集合が変わった回の確かめ直し」（#2477）で起きる。#2477 より前は
+                //   確かめ直しが無く、指紋が Idle のまま 1 瞬間の子を拾うと 60 秒の保険まで残った
                 // - 生成直後の猶予（#720）が生きていれば `Preparing` に覆われる
                 //
                 // どれも時間で解けるので、1 回読みは**混み具合と無関係に**割れる
@@ -79568,6 +79678,18 @@ mod self_test {
                     .await;
                     println!("TAKO_SELF_TEST_1153_INJECT: busy running={running}");
                 }
+                // #2477 の注入 `transient`: 子の走査が**1 瞬間だけ居た子**を拾い、その子が指紋
+                // （OSC 133 の状態）を動かさずに消える順序を固定する。実機で落ちた回は (d2) の
+                // 前後でシェルが起こす数 ms の子（direnv の precmd・入力予測の子シェル・
+                // `tako --version` そのもの）を別の理由の採り直しが拾っていた。
+                // `TAKO_2477_LEGACY=1` と組むと旧経路は 60 秒の保険まで busy が残って落ちる
+                let flag_2477 = if inject_2477() == "transient" {
+                    let (note, flag) = inject_transient_child_2477(window, cx, sh, base).await;
+                    println!("TAKO_SELF_TEST_2477_INJECT: transient {note}");
+                    flag
+                } else {
+                    None
+                };
                 let restore_ok = if inject_1153() == "norestore" {
                     // 検出力の注入: restore を送らずに成功を騙る（待っても戻らない）
                     true
@@ -79609,7 +79731,13 @@ mod self_test {
                 // 落ちてからでは「まだ猶予中（#720）だった」のか「解除できなかった」のか
                 // 「restore が断られた」のかを区別できない
                 let e_diag = window
-                    .update(cx, |app, _, _| pane_display_diag(app, base))
+                    .update(cx, |app, _, _| {
+                        format!(
+                            "{} {}",
+                            pane_display_diag(app, base),
+                            running_scan_diag(app, base)
+                        )
+                    })
                     .unwrap_or_default();
                 println!(
                     "TAKO_SELF_TEST_694e: released={released} restore_ok={restore_ok} \
@@ -79620,6 +79748,10 @@ mod self_test {
                     legacy_1153(),
                     env_line()
                 );
+                // #2477 の注入の印は判定が済んでから消す（落ちた経路は remove_on_fail が消す）
+                if let Some(flag) = flag_2477 {
+                    let _ = std::fs::remove_file(flag);
+                }
                 check(
                     released && restore_ok && restored_display,
                     "「コマンド入力へ」でそのペインだけ解除 → restore で戻る (#694)",
