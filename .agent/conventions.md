@@ -289,6 +289,21 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   実経路は `tests/issue2365_dispatch_reasons_lang.rs`（GUI 無しのホストへ IPC と同じ形の要求を渡し、
   応答は画面とキーを差し替えた `DialogAccess` を `respond_via` へ渡す）。persist.log・応答の注記
   （adopt の判断の注記・accounts の既定パスの警告）・check-health の診断は対象外（日本語のまま）
+- #2365 の続きで、**dispatch の本体に残っていた断り**を移して仕上げた（59 種）: ジャンプ履歴の動かなかった
+  `reason`、LSP（choice / column / limit / item の値・`tako lsp` の上書きとサーバ名）、ワークスペース横断検索、
+  変更履歴の 1 行の展開、リモートフォルダ（`<key> が必要` = `KeyNeeded`）・config share・scrollback
+  （器の注記は `reach::no_detached_capture_note_in(lang)` で枠と同じ言語）、コマンドカード（リモートの 404 寄せは
+  `Reason::says_no_command_card` で日英を読む）・Code Runner、先取り（#1984）の答えが無かったときの
+  「確かめられなかった」3 種、コンフリクト解消・tmux・動画・ウィンドウ・引き継ぎの起動フォルダ、ファイルツリー、
+  supervisor・ledger・セッション再起動。**内部の取り違え**（利用者の入力では起きない = 呼び手の書き間違いでしか
+  出ない）は `expect` / `unreachable!` と同じ扱いで日本語のまま残す: `run_staged` で走らせる 16 種・
+  「〜の答えがまだ無い」7 種と「展開の準備ができなかった」・「〜が受けるのは〜だけ」と経路（via）の 6 種・
+  「書き込みでない要求」2 種・非同期 run の開始・ボタンの中身・カードの登録直後・実行設定でない要求・
+  resume コマンドの組み立て・`find_tab` 直後のタブ。ユーザータスクの配送の理由（置き場の中身）・setup 系
+  （`setup_mcp` / `tako setup` の起動と answers）・`map_err` で素通しする他モジュールの文（`LINE_ONE_BASED`・
+  `window_bounds` の理由ほか）も対象外。番犬は同じ節に足し、本体の範囲は単体テストの `mod` の始まりまで
+  （途中の `#[cfg(test)] fn` で切れて後ろを見ていなかったのを直した）。実経路は
+  `tests/issue2365_dispatch_rest_lang.rs`（unix。GUI 無しのホストへ IPC の受け口と同じ 3 段で要求を通す）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

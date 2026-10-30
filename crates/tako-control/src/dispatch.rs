@@ -830,6 +830,178 @@ pub enum Reason {
         session: String,
         socket: Option<String>,
     },
+    // ---- #2365 の続き: ジャンプ履歴・LSP・ワークスペース横断検索の断り ----
+    /// `これより前の履歴は無い`（断りではなく、動かなかった応答の `reason`）
+    JumpNoEarlier,
+    /// `これより先の履歴は無い`（同上）
+    JumpNoLater,
+    /// `choice は 1 始まり（候補の一覧の番号）`
+    ChoiceOneBased,
+    /// `column <column> は <line> 行目（<len> バイト）の文字の境界ではない`
+    ColumnNotCharBoundary {
+        column: usize,
+        line: usize,
+        len: usize,
+    },
+    /// `choice <choice> は候補（<count> か所）の外`（定義ジャンプの飛び先）
+    ChoiceOutsideTargets {
+        choice: usize,
+        count: usize,
+    },
+    /// `choice <choice> は候補（<total> 件）の外`（補完の候補）
+    ChoiceOutsideItems {
+        choice: usize,
+        total: usize,
+    },
+    /// `limit は 1 以上（返す候補の件数）`
+    LimitAtLeastOneCandidate,
+    /// `item を指定する（応答の id）`（参照・階層の結果）
+    ItemNeedsResponseId,
+    /// `set は action=options のときだけ使える`（`tako lsp` の上書き）
+    LspSetOnlyWithOptions,
+    /// `サーバ名が不正: <name>（<known>）`。`known` は ID を ` / ` で並べたもの
+    UnknownLspServer {
+        name: String,
+        known: String,
+    },
+    /// `この tako には右パネルの検索結果が無い（…）`（横断検索の置き場を持たない host）
+    WorkspaceSearchUnavailable,
+    /// `search には query（検索語）が要る`
+    WorkspaceSearchNeedsQuery,
+    /// `相対パス <path> の基準（ペインの cwd）が分からない。絶対パスで渡す`
+    RelativePathNoBase(String),
+    /// `探す範囲がホーム（またはルート）だけになる。…`
+    SearchRootsHomeOnly,
+    /// `open には item（結果の id。1 始まり）が要る`
+    OpenNeedsItem,
+    /// `右パネルに検索結果が無い（tako search <検索語> --show で出してから開く）`
+    NoShownSearchResults,
+    /// `item <item> は結果（<total> 件）の外`
+    ItemOutsideResults {
+        item: usize,
+        total: usize,
+    },
+    // ---- #2365 の続き: 変更履歴（プレビューの changelog）の断り ----
+    /// `変更履歴を取っている間にプレビューのファイルが変わった（履歴を置かない）`
+    ChangelogFileChanged,
+    /// `リポジトリ情報がない`
+    ChangelogNoRepo,
+    /// `ファイルパス情報がない`
+    ChangelogNoPath,
+    /// `差分を取っている間にプレビューのファイルが変わった（差分を置かない）`
+    DiffFileChanged,
+    /// `差分を取っている間に変更履歴が変わった（<error>）`
+    DiffChangelogChanged(String),
+    /// `差分を取っている間に変更履歴が入れ替わった（差分を置かない）`
+    DiffChangelogReplaced,
+    // ---- #2365 の続き: リモートフォルダ・config share・scrollback の断り ----
+    /// `<key> が必要`
+    KeyNeeded(&'static str),
+    /// ``開いていない: <what>（`list` で開いているものを確認できる）``。`what` が無ければ「リモートフォルダ」
+    RemoteFolderNotOpen(Option<String>),
+    /// ``押し出せていない保存はありません（`pending` で確認できます）``
+    NoPendingPush,
+    /// `link には対象（リポジトリのパスまたは URL）が必要です`
+    ConfigShareLinkNeedsTarget,
+    /// `ペイン <id> は器（永続化バックエンド）を持たないので履歴を読めない: <注記>`。注記は
+    /// [`crate::reach::no_detached_capture_note_in`] を同じ言語で引く
+    NoVesselForHistory(u64),
+    // ---- #2365 の続き: コマンドカード・Code Runner の断り ----
+    /// `コマンド提案カードは GUI（tako-app）が必要（この接続先には保管庫が無い）`
+    CardsNeedGui,
+    /// `このペインに表示中のコマンドカードが無い`（リモートの HTTP 層は [`Self::says_no_command_card`] で
+    /// 404 へ寄せる）
+    NoCardOnPane,
+    /// `クリップボードへ書き込めない（GUI が必要）`
+    ClipboardNeedsGui,
+    /// `scope / profile / … / target は path（対象ファイル）と一緒に渡す`（実行設定）
+    RunConfigNeedsPath,
+    /// `実行前の保存に失敗したので実行しない（pane <pane>: <error>）`
+    SaveBeforeRunFailed {
+        pane: u64,
+        error: String,
+    },
+    /// `ファイルを読めない（<path>: <error>）`
+    FileUnreadable {
+        path: String,
+        error: String,
+    },
+    /// `ファイルの読み取りに失敗（<path>: <error>）`
+    FileReadFailed {
+        path: String,
+        error: String,
+    },
+    // ---- #2365 の続き: 先取り（#1984）の答えが無かった断り・git・tmux・動画・ウィンドウ・引き継ぎ ----
+    /// `<agent> の CLI の所在を確かめられなかった（UI スレッドでは確かめない。もう一度呼ぶと確かめ直す）`
+    AgentCliUnchecked(&'static str),
+    /// `コンフリクトの状態を確かめられなかった（UI スレッドでは git を待たない。…）`
+    GitConflictUnchecked,
+    /// `tmux セッションを確かめられなかった（UI スレッドでは tmux を待たない。…）`
+    TmuxSessionUnchecked,
+    /// `コンフリクトが発生していません（解消エージェントを起動する状況ではありません）`
+    NoConflict,
+    /// `--servers はソケット置き場全体を対象にするので --socket（<socket>）とは併用できない。…`
+    ServersWithSocket(String),
+    /// `対象ペインは動画プレビューではない`
+    NotVideoPane,
+    /// `ウィンドウの位置・寸法を指定できない: <error>`
+    WindowGeometryInvalid(String),
+    /// `<error>\n  直すには: tako orchestrator profiles set <profile> --cwd <path>（解除は --clear-cwd）`
+    /// （引き継ぎの起動フォルダが壊れている）
+    ProfileCwdBroken {
+        error: String,
+        profile: String,
+    },
+    // ---- #2365 の続き: ファイルツリー（`tako tree`）の断り ----
+    /// `絶対パスを指定する`
+    NotAbsolutePath,
+    /// `指定フォルダはピン留めされていない: <path>`
+    FolderNotPinned(String),
+    /// `<key> は <allowed> のいずれか（受け取った値: <got>）`。`allowed` は候補を ` / ` で並べたもの（ASCII）
+    OneOfReceived {
+        key: &'static str,
+        allowed: String,
+        got: String,
+    },
+    /// `ファイルツリーはアクティブタブ（<active>）のものだけを出す（受け取った tab: <tab>）`
+    TreeOnlyActiveTab {
+        active: u64,
+        tab: u64,
+    },
+    /// ``ファイルツリーが閉じている（`tako panel --filetree on` で開く）``
+    FileTreeClosed,
+    /// `path（その行を選ぶ）と key（選んでいる行の上で押す）は同時に指定しない`
+    TreePathWithKey,
+    /// `ファイルツリーに見えていない行: <path>（畳んだフォルダの中・リモートの行は選べない）`
+    TreeRowNotVisible(String),
+    /// `ファイルツリーの行を選んでいない（先に path で選ぶ）`
+    TreeNoSelection,
+    // ---- #2365 の続き: orchestrator の supervisor・ledger・セッション再起動の断り ----
+    /// `mode は auto / notify_only / off のいずれかを指定`
+    SupervisorModeValue,
+    /// `supervisor の action は status / set_mode / history のいずれか（不明: '<action>'）`
+    SupervisorAction(String),
+    /// `project（前方一致プレフィックス）は必須`
+    LedgerPruneNeedsProject,
+    /// `不正な action '<action>'。使用可能: list, stats, record, amend, prune`
+    LedgerAction(String),
+    /// `mode が不正: <raw:?>（<values>。省略すると下見だけを返す）`
+    RestartModeInvalid {
+        raw: String,
+        values: String,
+    },
+    /// `pane <pane> の再開コマンドを組めないのでハーネス更新しない: <error>`（`error` が無ければ「理由不明」）
+    ResumeCommandUnbuildable {
+        pane: u64,
+        error: Option<String>,
+    },
+    /// `再開に要るファイルを書けないので建て直さない: <error>`
+    ResumeFilesUnwritable(String),
+    /// `エージェントのプロセス（pid <pid>）を終了できなかったので建て直さない: <error>`
+    AgentTerminateFailed {
+        pid: u32,
+        error: String,
+    },
 }
 
 /// ペイン ID の並び（`3, 5`）。複数ペインに当たった断りに添える
@@ -2285,6 +2457,354 @@ impl Reason {
                     None => "default server".to_string(),
                 }
             ),
+            (Self::JumpNoEarlier, Ja) => "これより前の履歴は無い".to_string(),
+            (Self::JumpNoEarlier, En) => "there is no earlier entry in the history".to_string(),
+            (Self::JumpNoLater, Ja) => "これより先の履歴は無い".to_string(),
+            (Self::JumpNoLater, En) => "there is no later entry in the history".to_string(),
+            (Self::ChoiceOneBased, Ja) => "choice は 1 始まり（候補の一覧の番号）".to_string(),
+            (Self::ChoiceOneBased, En) => {
+                "choice starts at 1 (the number in the list of candidates)".to_string()
+            }
+            (Self::ColumnNotCharBoundary { column, line, len }, Ja) => {
+                format!("column {column} は {line} 行目（{len} バイト）の文字の境界ではない")
+            }
+            (Self::ColumnNotCharBoundary { column, line, len }, En) => format!(
+                "column {column} is not on a character boundary of line {line} ({len} bytes)"
+            ),
+            (Self::ChoiceOutsideTargets { choice, count }, Ja) => {
+                format!("choice {choice} は候補（{count} か所）の外")
+            }
+            (Self::ChoiceOutsideTargets { choice, count }, En) => {
+                format!("choice {choice} is outside the candidates ({count} locations)")
+            }
+            (Self::ChoiceOutsideItems { choice, total }, Ja) => {
+                format!("choice {choice} は候補（{total} 件）の外")
+            }
+            (Self::ChoiceOutsideItems { choice, total }, En) => {
+                format!("choice {choice} is outside the candidates ({total} items)")
+            }
+            (Self::LimitAtLeastOneCandidate, Ja) => "limit は 1 以上（返す候補の件数）".to_string(),
+            (Self::LimitAtLeastOneCandidate, En) => {
+                "limit must be 1 or more (the number of candidates to return)".to_string()
+            }
+            (Self::ItemNeedsResponseId, Ja) => "item を指定する（応答の id）".to_string(),
+            (Self::ItemNeedsResponseId, En) => "pass item (the id from the response)".to_string(),
+            (Self::LspSetOnlyWithOptions, Ja) => "set は action=options のときだけ使える".to_string(),
+            (Self::LspSetOnlyWithOptions, En) => "set can be used only with action=options".to_string(),
+            (Self::UnknownLspServer { name, known }, Ja) => {
+                format!("サーバ名が不正: {name}（{known}）")
+            }
+            (Self::UnknownLspServer { name, known }, En) => {
+                format!("invalid server name: {name} ({known})")
+            }
+            (Self::WorkspaceSearchUnavailable, Ja) => {
+                "この tako には右パネルの検索結果が無い（GUI のプライマリで使う。出さない検索は使える）"
+                    .to_string()
+            }
+            (Self::WorkspaceSearchUnavailable, En) => {
+                "this tako has no search results in the right panel (use it on the primary GUI; \
+                 a search that is not shown still works)"
+                    .to_string()
+            }
+            (Self::WorkspaceSearchNeedsQuery, Ja) => "search には query（検索語）が要る".to_string(),
+            (Self::WorkspaceSearchNeedsQuery, En) => {
+                "search needs query (the search term)".to_string()
+            }
+            (Self::RelativePathNoBase(path), Ja) => {
+                format!("相対パス {path} の基準（ペインの cwd）が分からない。絶対パスで渡す")
+            }
+            (Self::RelativePathNoBase(path), En) => format!(
+                "the base of the relative path {path} (the pane's cwd) is unknown; \
+                 pass an absolute path"
+            ),
+            (Self::SearchRootsHomeOnly, Ja) => {
+                "探す範囲がホーム（またはルート）だけになる。フォルダへ cd するか、\
+                 ファイルツリーにフォルダを足す（tako tree add <フォルダ>）か、path で範囲を渡す"
+                    .to_string()
+            }
+            (Self::SearchRootsHomeOnly, En) => {
+                "the search would cover only the home folder (or the root). cd into a folder, \
+                 add a folder to the file tree (tako tree add <folder>), or pass the scope as path"
+                    .to_string()
+            }
+            (Self::OpenNeedsItem, Ja) => "open には item（結果の id。1 始まり）が要る".to_string(),
+            (Self::OpenNeedsItem, En) => {
+                "open needs item (the result id, starting at 1)".to_string()
+            }
+            (Self::NoShownSearchResults, Ja) => {
+                "右パネルに検索結果が無い（tako search <検索語> --show で出してから開く）".to_string()
+            }
+            (Self::NoShownSearchResults, En) => {
+                "there are no search results in the right panel \
+                 (show them with tako search <term> --show, then open)"
+                    .to_string()
+            }
+            (Self::ItemOutsideResults { item, total }, Ja) => {
+                format!("item {item} は結果（{total} 件）の外")
+            }
+            (Self::ItemOutsideResults { item, total }, En) => {
+                format!("item {item} is outside the results ({total} items)")
+            }
+            (Self::ChangelogFileChanged, Ja) => {
+                "変更履歴を取っている間にプレビューのファイルが変わった（履歴を置かない）".to_string()
+            }
+            (Self::ChangelogFileChanged, En) => {
+                "the preview's file changed while the change history was being read \
+                 (the history was not shown)"
+                    .to_string()
+            }
+            (Self::ChangelogNoRepo, Ja) => "リポジトリ情報がない".to_string(),
+            (Self::ChangelogNoRepo, En) => "there is no repository information".to_string(),
+            (Self::ChangelogNoPath, Ja) => "ファイルパス情報がない".to_string(),
+            (Self::ChangelogNoPath, En) => "there is no file path information".to_string(),
+            (Self::DiffFileChanged, Ja) => {
+                "差分を取っている間にプレビューのファイルが変わった（差分を置かない）".to_string()
+            }
+            (Self::DiffFileChanged, En) => {
+                "the preview's file changed while the diff was being taken \
+                 (the diff was not shown)"
+                    .to_string()
+            }
+            (Self::DiffChangelogChanged(error), Ja) => {
+                format!("差分を取っている間に変更履歴が変わった（{error}）")
+            }
+            (Self::DiffChangelogChanged(error), En) => {
+                format!("the change history changed while the diff was being taken ({error})")
+            }
+            (Self::DiffChangelogReplaced, Ja) => {
+                "差分を取っている間に変更履歴が入れ替わった（差分を置かない）".to_string()
+            }
+            (Self::DiffChangelogReplaced, En) => {
+                "the change history was replaced while the diff was being taken \
+                 (the diff was not shown)"
+                    .to_string()
+            }
+            (Self::KeyNeeded(key), Ja) => format!("{key} が必要"),
+            (Self::KeyNeeded(key), En) => format!("{key} is required"),
+            (Self::RemoteFolderNotOpen(what), Ja) => format!(
+                "開いていない: {}（`list` で開いているものを確認できる）",
+                what.as_deref().unwrap_or("リモートフォルダ")
+            ),
+            (Self::RemoteFolderNotOpen(what), En) => format!(
+                "not open: {} (see what is open with `list`)",
+                what.as_deref().unwrap_or("remote folder")
+            ),
+            (Self::NoPendingPush, Ja) => {
+                "押し出せていない保存はありません（`pending` で確認できます）".to_string()
+            }
+            (Self::NoPendingPush, En) => {
+                "there are no saves waiting to be pushed (check with `pending`)".to_string()
+            }
+            (Self::ConfigShareLinkNeedsTarget, Ja) => {
+                "link には対象（リポジトリのパスまたは URL）が必要です".to_string()
+            }
+            (Self::ConfigShareLinkNeedsTarget, En) => {
+                "link needs a target (a repository path or URL)".to_string()
+            }
+            (Self::NoVesselForHistory(pane), Ja) => format!(
+                "ペイン {pane} は器（永続化バックエンド）を持たないので履歴を読めない: {}",
+                crate::reach::no_detached_capture_note_in(Ja)
+            ),
+            (Self::NoVesselForHistory(pane), En) => format!(
+                "pane {pane} has no vessel (persistence backend), so its history cannot be read: {}",
+                crate::reach::no_detached_capture_note_in(En)
+            ),
+            (Self::CardsNeedGui, Ja) => {
+                "コマンド提案カードは GUI（tako-app）が必要（この接続先には保管庫が無い）".to_string()
+            }
+            (Self::CardsNeedGui, En) => {
+                "command cards need the GUI (tako-app); this endpoint has no card store".to_string()
+            }
+            (Self::NoCardOnPane, Ja) => "このペインに表示中のコマンドカードが無い".to_string(),
+            (Self::NoCardOnPane, En) => "no command card is shown on this pane".to_string(),
+            (Self::ClipboardNeedsGui, Ja) => "クリップボードへ書き込めない（GUI が必要）".to_string(),
+            (Self::ClipboardNeedsGui, En) => {
+                "cannot write to the clipboard (the GUI is needed)".to_string()
+            }
+            (Self::RunConfigNeedsPath, Ja) => {
+                "scope / profile / runtime / reset / args / env / cwd / before / board / port / \
+                 target は path（対象ファイル）と一緒に渡す"
+                    .to_string()
+            }
+            (Self::RunConfigNeedsPath, En) => {
+                "pass scope / profile / runtime / reset / args / env / cwd / before / board / \
+                 port / target together with path (the target file)"
+                    .to_string()
+            }
+            (Self::SaveBeforeRunFailed { pane, error }, Ja) => {
+                format!("実行前の保存に失敗したので実行しない（pane {pane}: {error}）")
+            }
+            (Self::SaveBeforeRunFailed { pane, error }, En) => {
+                format!("saving before the run failed, so it was not run (pane {pane}: {error})")
+            }
+            (Self::FileUnreadable { path, error }, Ja) => {
+                format!("ファイルを読めない（{path}: {error}）")
+            }
+            (Self::FileUnreadable { path, error }, En) => {
+                format!("cannot read the file ({path}: {error})")
+            }
+            (Self::FileReadFailed { path, error }, Ja) => {
+                format!("ファイルの読み取りに失敗（{path}: {error}）")
+            }
+            (Self::FileReadFailed { path, error }, En) => {
+                format!("failed to read the file ({path}: {error})")
+            }
+            (Self::AgentCliUnchecked(agent), Ja) => format!(
+                "{agent} の CLI の所在を確かめられなかった（UI スレッドでは確かめない。\
+                 もう一度呼ぶと確かめ直す）"
+            ),
+            (Self::AgentCliUnchecked(agent), En) => format!(
+                "could not check where the {agent} CLI is (it is not checked on the UI thread; \
+                 call again to check again)"
+            ),
+            (Self::GitConflictUnchecked, Ja) => {
+                "コンフリクトの状態を確かめられなかった（UI スレッドでは git を待たない。\
+                 もう一度呼ぶと確かめ直す）"
+                    .to_string()
+            }
+            (Self::GitConflictUnchecked, En) => {
+                "could not check the conflict state (the UI thread does not wait for git; \
+                 call again to check again)"
+                    .to_string()
+            }
+            (Self::TmuxSessionUnchecked, Ja) => {
+                "tmux セッションを確かめられなかった（UI スレッドでは tmux を待たない。\
+                 もう一度呼ぶと確かめ直す）"
+                    .to_string()
+            }
+            (Self::TmuxSessionUnchecked, En) => {
+                "could not check the tmux session (the UI thread does not wait for tmux; \
+                 call again to check again)"
+                    .to_string()
+            }
+            (Self::NoConflict, Ja) => {
+                "コンフリクトが発生していません（解消エージェントを起動する状況ではありません）"
+                    .to_string()
+            }
+            (Self::NoConflict, En) => {
+                "there is no conflict (nothing for a resolver agent to do)".to_string()
+            }
+            (Self::ServersWithSocket(socket), Ja) => format!(
+                "--servers はソケット置き場全体を対象にするので --socket（{socket}）とは併用できない。\
+                 1 つのサーバーの中を掃除するなら --servers を外す"
+            ),
+            (Self::ServersWithSocket(socket), En) => format!(
+                "--servers covers the whole socket folder, so it cannot be combined with \
+                 --socket ({socket}). To clean inside one server, drop --servers"
+            ),
+            (Self::NotVideoPane, Ja) => "対象ペインは動画プレビューではない".to_string(),
+            (Self::NotVideoPane, En) => "the target pane is not a video preview".to_string(),
+            (Self::WindowGeometryInvalid(error), Ja) => {
+                format!("ウィンドウの位置・寸法を指定できない: {error}")
+            }
+            (Self::WindowGeometryInvalid(error), En) => {
+                format!("cannot set the window position / size: {error}")
+            }
+            (Self::ProfileCwdBroken { error, profile }, Ja) => format!(
+                "{error}\n  直すには: tako orchestrator profiles set {profile} --cwd <path>（解除は --clear-cwd）"
+            ),
+            (Self::ProfileCwdBroken { error, profile }, En) => format!(
+                "{error}\n  To fix: tako orchestrator profiles set {profile} --cwd <path> \
+                 (clear it with --clear-cwd)"
+            ),
+            (Self::NotAbsolutePath, Ja) => "絶対パスを指定する".to_string(),
+            (Self::NotAbsolutePath, En) => "pass an absolute path".to_string(),
+            (Self::FolderNotPinned(path), Ja) => {
+                format!("指定フォルダはピン留めされていない: {path}")
+            }
+            (Self::FolderNotPinned(path), En) => format!("the folder is not pinned: {path}"),
+            (Self::OneOfReceived { key, allowed, got }, Ja) => {
+                format!("{key} は {allowed} のいずれか（受け取った値: {got}）")
+            }
+            (Self::OneOfReceived { key, allowed, got }, En) => {
+                format!("{key} must be one of {allowed} (got: {got})")
+            }
+            (Self::TreeOnlyActiveTab { active, tab }, Ja) => format!(
+                "ファイルツリーはアクティブタブ（{active}）のものだけを出す（受け取った tab: {tab}）"
+            ),
+            (Self::TreeOnlyActiveTab { active, tab }, En) => format!(
+                "the file tree shows only the active tab ({active}) (got tab: {tab})"
+            ),
+            (Self::FileTreeClosed, Ja) => {
+                "ファイルツリーが閉じている（`tako panel --filetree on` で開く）".to_string()
+            }
+            (Self::FileTreeClosed, En) => {
+                "the file tree is closed (open it with `tako panel --filetree on`)".to_string()
+            }
+            (Self::TreePathWithKey, Ja) => {
+                "path（その行を選ぶ）と key（選んでいる行の上で押す）は同時に指定しない".to_string()
+            }
+            (Self::TreePathWithKey, En) => {
+                "path (select that row) and key (press it on the selected row) \
+                 cannot be given together"
+                    .to_string()
+            }
+            (Self::TreeRowNotVisible(path), Ja) => format!(
+                "ファイルツリーに見えていない行: {path}（畳んだフォルダの中・リモートの行は選べない）"
+            ),
+            (Self::TreeRowNotVisible(path), En) => format!(
+                "the row is not visible in the file tree: {path} \
+                 (rows inside collapsed folders and remote rows cannot be selected)"
+            ),
+            (Self::TreeNoSelection, Ja) => {
+                "ファイルツリーの行を選んでいない（先に path で選ぶ）".to_string()
+            }
+            (Self::TreeNoSelection, En) => {
+                "no file tree row is selected (select one with path first)".to_string()
+            }
+            (Self::SupervisorModeValue, Ja) => {
+                "mode は auto / notify_only / off のいずれかを指定".to_string()
+            }
+            (Self::SupervisorModeValue, En) => {
+                "mode must be one of auto / notify_only / off".to_string()
+            }
+            (Self::SupervisorAction(action), Ja) => format!(
+                "supervisor の action は status / set_mode / history のいずれか（不明: '{action}'）"
+            ),
+            (Self::SupervisorAction(action), En) => format!(
+                "the supervisor action must be one of status / set_mode / history \
+                 (unknown: '{action}')"
+            ),
+            (Self::LedgerPruneNeedsProject, Ja) => {
+                "project（前方一致プレフィックス）は必須".to_string()
+            }
+            (Self::LedgerPruneNeedsProject, En) => {
+                "project (the prefix to match) is required".to_string()
+            }
+            (Self::LedgerAction(action), Ja) => {
+                format!("不正な action '{action}'。使用可能: list, stats, record, amend, prune")
+            }
+            (Self::LedgerAction(action), En) => format!(
+                "invalid action '{action}'. Available: list, stats, record, amend, prune"
+            ),
+            (Self::RestartModeInvalid { raw, values }, Ja) => {
+                format!("mode が不正: {raw:?}（{values}。省略すると下見だけを返す）")
+            }
+            (Self::RestartModeInvalid { raw, values }, En) => {
+                format!("invalid mode: {raw:?} ({values}; omit it to get only the preview)")
+            }
+            (Self::ResumeCommandUnbuildable { pane, error }, Ja) => format!(
+                "pane {pane} の再開コマンドを組めないのでハーネス更新しない: {}",
+                error.as_deref().unwrap_or("理由不明")
+            ),
+            (Self::ResumeCommandUnbuildable { pane, error }, En) => format!(
+                "cannot build the resume command for pane {pane}, so the harness is not \
+                 restarted: {}",
+                error.as_deref().unwrap_or("unknown reason")
+            ),
+            (Self::ResumeFilesUnwritable(error), Ja) => {
+                format!("再開に要るファイルを書けないので建て直さない: {error}")
+            }
+            (Self::ResumeFilesUnwritable(error), En) => format!(
+                "cannot write the files needed to resume, so the session is not rebuilt: {error}"
+            ),
+            (Self::AgentTerminateFailed { pid, error }, Ja) => format!(
+                "エージェントのプロセス（pid {pid}）を終了できなかったので建て直さない: {error}"
+            ),
+            (Self::AgentTerminateFailed { pid, error }, En) => format!(
+                "could not stop the agent process (pid {pid}), so the session is not \
+                 rebuilt: {error}"
+            ),
         }
     }
 
@@ -2334,6 +2854,15 @@ impl Reason {
     /// （日本語は #2365 より前と同じ「ダイアログが見つからない」の部分一致）
     pub fn says_no_choice_dialog(message: &str) -> bool {
         message.contains("ダイアログが見つからない") || message.contains("choice dialog not found")
+    }
+
+    /// 応答の文が「このペインに表示中のコマンドカードが無い」（[`Self::NoCardOnPane`]）を言っているか（#2365）。
+    ///
+    /// リモートの HTTP 層はカードの不在（PC 側で閉じられた）を 404 へ寄せる。日英どちらの形も
+    /// この 1 か所で読む（日本語は #2365 より前と同じ部分一致）
+    pub fn says_no_command_card(message: &str) -> bool {
+        message.contains("表示中のコマンドカードが無い")
+            || message.contains("no command card is shown on this pane")
     }
 }
 
@@ -2772,9 +3301,10 @@ fn jump(
             "moved": false,
             "action": action,
             "reason": match direction {
-                JumpDirection::Back => "これより前の履歴は無い",
-                JumpDirection::Forward => "これより先の履歴は無い",
-            },
+                JumpDirection::Back => Reason::JumpNoEarlier,
+                JumpDirection::Forward => Reason::JumpNoLater,
+            }
+            .to_string(),
             "dropped": dropped,
             "history": jump_summary_json(history),
         }));
@@ -2914,9 +3444,7 @@ pub fn lsp_goto_prepare(
         ));
     }
     if choice == Some(0) {
-        return Err(DispatchError::InvalidParams(
-            "choice は 1 始まり（候補の一覧の番号）".into(),
-        ));
+        return Err(Reason::ChoiceOneBased.invalid());
     }
     let (_, target) = resolve_pane(host.workspace(), pane)?;
     let Some((path, _)) = host.preview_state(target) else {
@@ -2960,10 +3488,12 @@ pub fn lsp_goto_prepare(
 /// 桁は丸めずに拒否する（`tako edit replace-range` と同じ。#1658）
 fn check_line_column(line_text: &str, line: usize, column: usize) -> Result<(), DispatchError> {
     if column > line_text.len() || !line_text.is_char_boundary(column) {
-        return Err(DispatchError::InvalidParams(format!(
-            "column {column} は {line} 行目（{} バイト）の文字の境界ではない",
-            line_text.len()
-        )));
+        return Err(Reason::ColumnNotCharBoundary {
+            column,
+            line,
+            len: line_text.len(),
+        }
+        .invalid());
     }
     Ok(())
 }
@@ -3292,9 +3822,10 @@ pub fn lsp_goto_land(
             ));
             return Ok(out);
         }
-        (count, Some(choice)) => answer.targets.get(choice - 1).ok_or_else(|| {
-            DispatchError::InvalidParams(format!("choice {choice} は候補（{count} か所）の外"))
-        })?,
+        (count, Some(choice)) => answer
+            .targets
+            .get(choice - 1)
+            .ok_or_else(|| Reason::ChoiceOutsideTargets { choice, count }.invalid())?,
     };
     out["chosen"] = json!(landing.choice.unwrap_or(1));
     if landing.placement == Placement::None {
@@ -3412,10 +3943,7 @@ fn source_gone_json(kind: tako_core::lsp::goto::GotoKind, mut out: Value) -> Val
 
 /// 横断検索の置き場を持たない host（セカンダリ等）の答え（#1694）
 fn workspace_search_unavailable() -> DispatchError {
-    DispatchError::Operation(
-        "この tako には右パネルの検索結果が無い（GUI のプライマリで使う。出さない検索は使える）"
-            .into(),
-    )
+    Reason::WorkspaceSearchUnavailable.operation()
 }
 
 /// 横断検索の準備（UI スレッド。#1694）。探す範囲を決め、`show` なら置き場へ登録して右パネルを
@@ -3432,8 +3960,7 @@ fn workspace_search_prepare(
     limit: Option<usize>,
 ) -> Result<crate::workspace_search::WorkspaceSearchJob, DispatchError> {
     use tako_core::workspace_search::{Options, Query};
-    let text = query
-        .ok_or_else(|| DispatchError::InvalidParams("search には query（検索語）が要る".into()))?;
+    let text = query.ok_or_else(|| Reason::WorkspaceSearchNeedsQuery.invalid())?;
     let query = Query {
         text: text.to_string(),
         regex: regex.unwrap_or(false),
@@ -3476,11 +4003,10 @@ fn workspace_search_roots(
         let mut dir = PathBuf::from(p);
         if dir.is_relative() {
             let (_, target) = resolve_pane_or_active(host.workspace(), pane)?;
-            let base = host.session(target).and_then(|s| s.cwd()).ok_or_else(|| {
-                DispatchError::InvalidParams(format!(
-                    "相対パス {p} の基準（ペインの cwd）が分からない。絶対パスで渡す"
-                ))
-            })?;
+            let base = host
+                .session(target)
+                .and_then(|s| s.cwd())
+                .ok_or_else(|| Reason::RelativePathNoBase(p.to_string()).invalid())?;
             dir = base.join(dir);
         }
         if !dir.is_dir() {
@@ -3501,11 +4027,7 @@ fn workspace_search_roots(
         })
         .collect();
     if roots.is_empty() {
-        return Err(DispatchError::InvalidParams(
-            "探す範囲がホーム（またはルート）だけになる。フォルダへ cd するか、\
-             ファイルツリーにフォルダを足す（tako tree add <フォルダ>）か、path で範囲を渡す"
-                .into(),
-        ));
+        return Err(Reason::SearchRootsHomeOnly.invalid());
     }
     Ok(roots)
 }
@@ -3559,25 +4081,19 @@ fn workspace_search_open(
     focus: Option<bool>,
 ) -> Result<Value, DispatchError> {
     use tako_core::lsp::goto::Placement;
-    let item = item.ok_or_else(|| {
-        DispatchError::InvalidParams("open には item（結果の id。1 始まり）が要る".into())
-    })?;
+    let item = item.ok_or_else(|| Reason::OpenNeedsItem.invalid())?;
     let store = host
         .workspace_search()
         .ok_or_else(workspace_search_unavailable)?;
-    let shown = store.shown().ok_or_else(|| {
-        DispatchError::InvalidParams(
-            "右パネルに検索結果が無い（tako search <検索語> --show で出してから開く）".into(),
-        )
-    })?;
+    let shown = store
+        .shown()
+        .ok_or_else(|| Reason::NoShownSearchResults.invalid())?;
     let total = shown.outcome.hits.len();
     let hit = item
         .checked_sub(1)
         .and_then(|i| shown.outcome.hits.get(i))
         .cloned()
-        .ok_or_else(|| {
-            DispatchError::InvalidParams(format!("item {item} は結果（{total} 件）の外"))
-        })?;
+        .ok_or_else(|| Reason::ItemOutsideResults { item, total }.invalid())?;
     let (tab, source) = resolve_pane_or_active(host.workspace(), pane)?;
     let source_path = host
         .preview_state(source)
@@ -4251,14 +4767,10 @@ pub fn lsp_completion_prepare(
         ));
     }
     if choice == Some(0) {
-        return Err(DispatchError::InvalidParams(
-            "choice は 1 始まり（候補の一覧の番号）".into(),
-        ));
+        return Err(Reason::ChoiceOneBased.invalid());
     }
     if limit == Some(0) {
-        return Err(DispatchError::InvalidParams(
-            "limit は 1 以上（返す候補の件数）".into(),
-        ));
+        return Err(Reason::LimitAtLeastOneCandidate.invalid());
     }
     let (_, target) = resolve_pane(host.workspace(), pane)?;
     let Some((path, _)) = host.preview_state(target) else {
@@ -4269,10 +4781,12 @@ pub fn lsp_completion_prepare(
         .map_err(DispatchError::InvalidParams)?;
     // 桁は丸めずに拒否する（`tako edit replace-range` と同じ。#1658）
     if column > source.line_text.len() || !source.line_text.is_char_boundary(column) {
-        return Err(DispatchError::InvalidParams(format!(
-            "column {column} は {line} 行目（{} バイト）の文字の境界ではない",
-            source.line_text.len()
-        )));
+        return Err(Reason::ColumnNotCharBoundary {
+            column,
+            line,
+            len: source.line_text.len(),
+        }
+        .invalid());
     }
     let Some(manager) = host.lsp() else {
         return Err(DispatchError::Operation(
@@ -4347,9 +4861,9 @@ pub fn lsp_completion_land(
     }
     let total = order.len();
     if let Some(choice) = landing.choice {
-        let index = *order.get(choice - 1).ok_or_else(|| {
-            DispatchError::InvalidParams(format!("choice {choice} は候補（{total} 件）の外"))
-        })?;
+        let index = *order
+            .get(choice - 1)
+            .ok_or_else(|| Reason::ChoiceOutsideItems { choice, total }.invalid())?;
         let item = &answer.items[index];
         // 待っているあいだに問い合わせたペインが閉じられた / 差し替わった / 本文が変わったら入れない
         let still_there = host
@@ -4533,10 +5047,12 @@ pub fn lsp_hover_prepare(
         .map_err(DispatchError::InvalidParams)?;
     // 桁は丸めずに拒否する（`tako edit replace-range` と同じ。#1658）
     if column > source.line_text.len() || !source.line_text.is_char_boundary(column) {
-        return Err(DispatchError::InvalidParams(format!(
-            "column {column} は {line} 行目（{} バイト）の文字の境界ではない",
-            source.line_text.len()
-        )));
+        return Err(Reason::ColumnNotCharBoundary {
+            column,
+            line,
+            len: source.line_text.len(),
+        }
+        .invalid());
     }
     let Some(manager) = host.lsp() else {
         return Err(DispatchError::Operation(
@@ -5012,8 +5528,7 @@ pub fn lsp_results(
     };
     store.retain_panes(|p| live.contains(&p));
     let target = store.resolve(pane.map(PaneId::from_raw));
-    let need_item =
-        || item.ok_or_else(|| DispatchError::InvalidParams("item を指定する（応答の id）".into()));
+    let need_item = || item.ok_or_else(|| Reason::ItemNeedsResponseId.invalid());
     let no_item = |item: usize, count: usize| {
         DispatchError::InvalidParams(text::fill(
             text::XREF_NO_ITEM_REASON,
@@ -6788,13 +7303,7 @@ fn agent_preflight(
             .map(|(_, found)| found.clone())
     }) {
         Probed::Answer(found) => found,
-        Probed::Missing => {
-            return Err(DispatchError::Operation(format!(
-                "{} の CLI の所在を確かめられなかった（UI スレッドでは確かめない。\
-                 もう一度呼ぶと確かめ直す）",
-                agent.as_str()
-            )))
-        }
+        Probed::Missing => return Err(Reason::AgentCliUnchecked(agent.as_str()).operation()),
         Probed::Outside => crate::orchestrator::agent_cli::preflight(agent),
     };
     found.map_err(|e| DispatchError::Operation(e.message()))
@@ -6884,10 +7393,7 @@ fn git_conflict_for(cwd: &Path) -> Result<(PathBuf, tako_core::ConflictState), D
             .map(|(_, found)| found.clone())
     }) {
         Probed::Answer(found) => found.ok_or_else(not_repo),
-        Probed::Missing => Err(op_err(
-            "コンフリクトの状態を確かめられなかった（UI スレッドでは git を待たない。\
-             もう一度呼ぶと確かめ直す）",
-        )),
+        Probed::Missing => Err(Reason::GitConflictUnchecked.operation()),
         Probed::Outside => {
             let repo = tako_core::git::repo_root(cwd).ok_or_else(not_repo)?;
             let state = tako_core::git::conflict_state(&repo);
@@ -7237,11 +7743,7 @@ fn preview_changelog_land(
     // 待っている間にペインが閉じた・別のファイルへ切り替わったら置かない（別のファイルの履歴を出さない）
     match host.preview_state(pane) {
         Some((now, _)) if Path::new(&now) == path => {}
-        Some(_) => {
-            return Err(DispatchError::Operation(
-                "変更履歴を取っている間にプレビューのファイルが変わった（履歴を置かない）".into(),
-            ))
-        }
+        Some(_) => return Err(Reason::ChangelogFileChanged.operation()),
         None => return Err(Reason::NotPreviewPane(pane.as_u64()).operation()),
     }
     let history = history.map_err(|e| DispatchError::Operation(e.to_string()))?;
@@ -7285,10 +7787,10 @@ fn preview_changelog_diff_prepare(
     }
     let repo = row
         .repo_root
-        .ok_or_else(|| DispatchError::Operation("リポジトリ情報がない".into()))?;
+        .ok_or_else(|| Reason::ChangelogNoRepo.operation())?;
     let rel = row
         .rel_path
-        .ok_or_else(|| DispatchError::Operation("ファイルパス情報がない".into()))?;
+        .ok_or_else(|| Reason::ChangelogNoPath.operation())?;
     Ok(ChangelogDiffStep::Expand(PreviewChangelogDiffJob {
         pane: target,
         path: PathBuf::from(path),
@@ -7313,24 +7815,16 @@ fn preview_changelog_diff_land(
     let PreviewChangelogDiffLanding { job, hunks } = landing;
     match host.preview_state(job.pane) {
         Some((now, _)) if Path::new(&now) == job.path => {}
-        Some(_) => {
-            return Err(DispatchError::Operation(
-                "差分を取っている間にプレビューのファイルが変わった（差分を置かない）".into(),
-            ))
-        }
+        Some(_) => return Err(Reason::DiffFileChanged.operation()),
         None => return Err(Reason::NotPreviewPane(job.pane.as_u64()).operation()),
     }
     let row = host
         .changelog_diff_target(job.pane, &job.hash)
-        .map_err(|e| {
-            DispatchError::Operation(format!("差分を取っている間に変更履歴が変わった（{e}）"))
-        })?;
+        .map_err(|e| Reason::DiffChangelogChanged(e.to_string()).operation())?;
     if row.repo_root.as_deref() != Some(job.repo.as_path())
         || row.rel_path.as_deref() != Some(job.rel.as_str())
     {
-        return Err(DispatchError::Operation(
-            "差分を取っている間に変更履歴が入れ替わった（差分を置かない）".into(),
-        ));
+        return Err(Reason::DiffChangelogReplaced.operation());
     }
     let hunks = hunks.map_err(|e| DispatchError::Operation(e.to_string()))?;
     host.set_changelog_diff(job.pane, &job.hash, Some(hunks))
@@ -8643,10 +9137,7 @@ fn dispatch_inner(
             // **黙って無視しない**（#1187 の教訓）。サーバー単位の回収はソケット置き場
             // 全体が対象なので、1 本を名指しする `--socket` とは併用できない
             if let Some(socket) = socket {
-                return Err(DispatchError::Operation(format!(
-                    "--servers はソケット置き場全体を対象にするので --socket（{socket}）とは併用できない。\
-                     1 つのサーバーの中を掃除するなら --servers を外す"
-                )));
+                return Err(Reason::ServersWithSocket(socket).operation());
             }
             Ok(tmux_cleanup_servers_reply(host.cleanup_tmux_servers(apply)))
         }
@@ -13111,11 +13602,7 @@ fn dispatch_inner(
                 || port.is_some()
                 || target.is_some()
             {
-                return Err(DispatchError::InvalidParams(
-                    "scope / profile / runtime / reset / args / env / cwd / before / board / port / \
-                     target は path（対象ファイル）と一緒に渡す"
-                        .into(),
-                ));
+                return Err(Reason::RunConfigNeedsPath.invalid());
             }
             let mut settings = crate::settings::load();
             let builtins: std::collections::BTreeMap<String, String> =
@@ -13404,9 +13891,7 @@ pub fn refresh_command_card_runs(host: &mut dyn ControlHost) -> bool {
 
 /// カード保管庫を持たないホスト（GUI 不在）向けのエラー
 fn cards_unsupported() -> DispatchError {
-    DispatchError::Operation(
-        "コマンド提案カードは GUI（tako-app）が必要（この接続先には保管庫が無い）".into(),
-    )
+    Reason::CardsNeedGui.operation()
 }
 
 /// `CommandCardError` → `DispatchError`。入力の不備は InvalidParams、
@@ -13414,7 +13899,7 @@ fn cards_unsupported() -> DispatchError {
 fn command_card_err(e: tako_core::CommandCardError) -> DispatchError {
     match e {
         tako_core::CommandCardError::CardNotFound { id } => DispatchError::Operation(if id == 0 {
-            "このペインに表示中のコマンドカードが無い".into()
+            Reason::NoCardOnPane.to_string()
         } else {
             e.to_string()
         }),
@@ -13526,9 +14011,7 @@ fn dispatch_show_command(
             let resolved_id_raw = resolved_id.as_u64();
             if action == "copy" {
                 if !host.queue_clipboard_copy(command.clone()) {
-                    return Err(DispatchError::Operation(
-                        "クリップボードへ書き込めない（GUI が必要）".into(),
-                    ));
+                    return Err(Reason::ClipboardNeedsGui.operation());
                 }
                 return Ok(json!({
                     "copied": true,
@@ -14216,10 +14699,11 @@ fn save_previews_before_run(
         .collect();
     for &pane in &dirty {
         host.save_preview(pane, false).map_err(|e| {
-            DispatchError::Operation(format!(
-                "実行前の保存に失敗したので実行しない（pane {}: {e}）",
-                pane.as_u64()
-            ))
+            Reason::SaveBeforeRunFailed {
+                pane: pane.as_u64(),
+                error: e.to_string(),
+            }
+            .operation()
         })?;
     }
     Ok(dirty)
@@ -14246,14 +14730,19 @@ fn run_pane_json(pane: &Pane) -> Value {
 fn read_file_head(path: &Path) -> Result<String, DispatchError> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).map_err(|e| {
-        DispatchError::Operation(format!("ファイルを読めない（{}: {e}）", path.display()))
+        Reason::FileUnreadable {
+            path: path.display().to_string(),
+            error: e.to_string(),
+        }
+        .operation()
     })?;
     let mut buf = vec![0u8; 16 * 1024];
     let n = file.read(&mut buf).map_err(|e| {
-        DispatchError::Operation(format!(
-            "ファイルの読み取りに失敗（{}: {e}）",
-            path.display()
-        ))
+        Reason::FileReadFailed {
+            path: path.display().to_string(),
+            error: e.to_string(),
+        }
+        .operation()
     })?;
     buf.truncate(n);
     Ok(String::from_utf8_lossy(&buf).into_owned())
@@ -15929,11 +16418,7 @@ pub fn dispatch_config_share(
         "list" => Ok(config_share::list()),
         "init" => config_share::init(path, remote),
         "link" => {
-            let target = target.ok_or_else(|| {
-                DispatchError::Operation(
-                    "link には対象（リポジトリのパスまたは URL）が必要です".into(),
-                )
-            })?;
+            let target = target.ok_or_else(|| Reason::ConfigShareLinkNeedsTarget.operation())?;
             config_share::link(target, path)
         }
         "unlink" => config_share::unlink(),
@@ -16090,7 +16575,7 @@ fn dispatch_remote_folder(
             .map(str::trim)
             .filter(|h| !h.is_empty())
             .map(str::to_string)
-            .ok_or_else(|| DispatchError::InvalidParams("host が必要".into()))
+            .ok_or_else(|| Reason::KeyNeeded("host").invalid())
     }
 
     fn need_path(path: &Option<String>) -> Result<String, DispatchError> {
@@ -16098,7 +16583,7 @@ fn dispatch_remote_folder(
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(str::to_string)
-            .ok_or_else(|| DispatchError::InvalidParams("path が必要".into()))
+            .ok_or_else(|| Reason::KeyNeeded("path").invalid())
     }
 
     /// 対象タブ（省略時はアクティブタブ）
@@ -16216,14 +16701,13 @@ fn dispatch_remote_folder(
                 }
             }
             if closed.is_empty() {
+                // 何も指定が無ければ「リモートフォルダ」（表示言語の語）を当てる
                 let what = match (want_host.as_deref(), want_path.as_deref()) {
-                    (Some(h), Some(p)) => format!("{h}:{p}"),
-                    (Some(h), None) => h.to_string(),
-                    (None, _) => "リモートフォルダ".to_string(),
+                    (Some(h), Some(p)) => Some(format!("{h}:{p}")),
+                    (Some(h), None) => Some(h.to_string()),
+                    (None, _) => None,
                 };
-                return Err(DispatchError::Operation(format!(
-                    "開いていない: {what}（`list` で開いているものを確認できる）"
-                )));
+                return Err(Reason::RemoteFolderNotOpen(what).operation());
             }
             // どのタブからも参照されなくなったホストは接続（ControlMaster）も畳む。
             // 開いたままにすると `ControlPersist` の間ずっと ssh が居座る
@@ -16386,9 +16870,7 @@ fn dispatch_remote_folder(
                 .map(|e| (e.host.clone(), e.path.clone()))
                 .collect();
             if targets.is_empty() {
-                return Err(DispatchError::Operation(
-                    "押し出せていない保存はありません（`pending` で確認できます）".into(),
-                ));
+                return Err(Reason::NoPendingPush.operation());
             }
             let mut pushed: Vec<Value> = Vec::new();
             let mut failed: Vec<Value> = Vec::new();
@@ -17726,9 +18208,11 @@ fn dispatch_orchestrator_handoff(
     // 約束に cwd も含める。プロファイルの cwd が壊れていたら**ペインを分割する前に**落とす
     // （存在しないフォルダで spawn すると後任が起動できず、前任を閉じる主体が居なくなる）
     let profile_cwd = profile.resolve_cwd().map_err(|e| {
-        op_err(format!(
-            "{e}\n  直すには: tako orchestrator profiles set {profile_name} --cwd <path>（解除は --clear-cwd）"
-        ))
+        Reason::ProfileCwdBroken {
+            error: e.to_string(),
+            profile: profile_name.to_string(),
+        }
+        .operation()
     })?;
     let home = orchestrator::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
     let resolved_cwd = if handoff_cwd_legacy() {
@@ -17902,9 +18386,7 @@ fn dispatch_git_resolve_agent(
     // #1989: リポジトリとコンフリクトの走査（git）は UI スレッドの dispatch では先取りを読む
     let (repo, state) = git_conflict_for(&git_pane_cwd(host, pane)?)?;
     if !state.is_active() {
-        return Err(op_err(
-            "コンフリクトが発生していません（解消エージェントを起動する状況ではありません）",
-        ));
+        return Err(Reason::NoConflict.operation());
     }
 
     // エージェント種別はプロファイル既定を土台にし、明示指定で上書きする（新系統を作らない）。
@@ -21235,9 +21717,7 @@ pub fn lsp_server_action(
     // #2035: 上書きは action=options だけ・サーバの ID が要る・キーの形は先に検査する
     if let Some(set) = set {
         if action != "options" {
-            return Err(DispatchError::InvalidParams(
-                "set は action=options のときだけ使える".into(),
-            ));
+            return Err(Reason::LspSetOnlyWithOptions.invalid());
         }
         if name.is_none() {
             return Err(DispatchError::InvalidParams(
@@ -21255,10 +21735,11 @@ pub fn lsp_server_action(
                 .iter()
                 .map(|s| s.id)
                 .collect();
-            return Err(DispatchError::InvalidParams(format!(
-                "サーバ名が不正: {name}（{}）",
-                known.join(" / ")
-            )));
+            return Err(Reason::UnknownLspServer {
+                name: name.to_string(),
+                known: known.join(" / "),
+            }
+            .invalid());
         }
     }
     let Some(manager) = manager else {
@@ -22422,9 +22903,7 @@ fn require_video_preview(
     target: PaneId,
 ) -> Result<(), DispatchError> {
     if host.preview_state(target).map(|(_, m)| m) != Some(PreviewModeWire::Video) {
-        return Err(DispatchError::Operation(
-            "対象ペインは動画プレビューではない".into(),
-        ));
+        return Err(Reason::NotVideoPane.operation());
     }
     Ok(())
 }
@@ -22618,12 +23097,8 @@ fn scrollback_target_session(host: &dyn ControlHost, spec: &str) -> Result<Strin
         crate::remote::ScrollbackTarget::Session(name) => Ok(name),
         crate::remote::ScrollbackTarget::Pane(id) => {
             let (_, target) = resolve_pane(host.workspace(), Some(id))?;
-            host.backend_session(target).ok_or_else(|| {
-                DispatchError::Operation(format!(
-                    "ペイン {id} は器（永続化バックエンド）を持たないので履歴を読めない: {}",
-                    crate::reach::no_detached_capture_note()
-                ))
-            })
+            host.backend_session(target)
+                .ok_or_else(|| Reason::NoVesselForHistory(id).operation())
         }
     }
 }
@@ -22830,9 +23305,8 @@ fn window_geometry_op(
         .window_frame(wid)
         .map(|f| wb::Rect::new(f.x, f.y, f.width, f.height))
         .unwrap_or_else(|| wb::default_rect(display));
-    let rect = wb::resolve(&spec, current, display, origin_default).map_err(|e| {
-        DispatchError::Operation(format!("ウィンドウの位置・寸法を指定できない: {e}"))
-    })?;
+    let rect = wb::resolve(&spec, current, display, origin_default)
+        .map_err(|e| Reason::WindowGeometryInvalid(e.to_string()).operation())?;
     host.request_window_geometry(
         wid,
         crate::protocol::WindowGeometry {
@@ -24834,10 +25308,7 @@ fn tmux_open_lookup(
             .map(|(_, found)| found.clone())
     }) {
         Probed::Answer(found) => found.map_err(DispatchError::Operation),
-        Probed::Missing => Err(op_err(
-            "tmux セッションを確かめられなかった（UI スレッドでは tmux を待たない。\
-             もう一度呼ぶと確かめ直す）",
-        )),
+        Probed::Missing => Err(Reason::TmuxSessionUnchecked.operation()),
         Probed::Outside => {
             compute_tmux_open_lookup(socket_arg, session).map_err(DispatchError::Operation)
         }
@@ -26659,7 +27130,7 @@ fn dispatch_tree_folder(
             let path_str = path.ok_or_else(|| Reason::Missing("path".into()).invalid())?;
             let abs = PathBuf::from(&path_str);
             if !abs.is_absolute() {
-                return Err(DispatchError::InvalidParams("絶対パスを指定する".into()));
+                return Err(Reason::NotAbsolutePath.invalid());
             }
             if !abs.is_dir() {
                 return Err(Reason::DirNotFound(path_str.to_string()).operation());
@@ -26689,10 +27160,7 @@ fn dispatch_tree_folder(
                 .get_tab_mut(tab_id)
                 .ok_or_else(|| Reason::TabGone.invalid())?;
             if !tab_mut.remove_pinned_folder(&canonical) {
-                return Err(DispatchError::Operation(format!(
-                    "指定フォルダはピン留めされていない: {}",
-                    canonical.display()
-                )));
+                return Err(Reason::FolderNotPinned(canonical.display().to_string()).operation());
             }
             host.sync_filetree();
             Ok(json!({ "status": "removed", "path": canonical.display().to_string() }))
@@ -26713,9 +27181,12 @@ fn dispatch_tree_folder(
                 .collect();
             Ok(json!({ "folders": folders, "tab": tab_id.as_u64() }))
         }
-        _ => Err(DispatchError::InvalidParams(format!(
-            "action は add / remove / list / roots / git-status のいずれか（受け取った値: {action}）"
-        ))),
+        _ => Err(Reason::OneOfReceived {
+            key: "action",
+            allowed: "add / remove / list / roots / git-status".into(),
+            got: action.to_string(),
+        }
+        .invalid()),
     }
 }
 
@@ -26752,20 +27223,12 @@ fn dispatch_tree_selection(
     if let Some(tab) = tab {
         let active = host.workspace().active_tab_id().as_u64();
         if tab != active {
-            return Err(DispatchError::InvalidParams(format!(
-                "ファイルツリーはアクティブタブ（{active}）のものだけを出す（受け取った tab: {tab}）"
-            )));
+            return Err(Reason::TreeOnlyActiveTab { active, tab }.invalid());
         }
     }
-    let closed = || {
-        DispatchError::Operation(
-            "ファイルツリーが閉じている（`tako panel --filetree on` で開く）".into(),
-        )
-    };
+    let closed = || Reason::FileTreeClosed.operation();
     match (path, key) {
-        (Some(_), Some(_)) => Err(DispatchError::InvalidParams(
-            "path（その行を選ぶ）と key（選んでいる行の上で押す）は同時に指定しない".into(),
-        )),
+        (Some(_), Some(_)) => Err(Reason::TreePathWithKey.invalid()),
         (None, None) => Ok(json!({ "selection": tree_selection_json(host.tree_selection()) })),
         (Some(path), None) => {
             if !host.filetree_visible() {
@@ -26781,9 +27244,7 @@ fn dispatch_tree_selection(
                     .find(|r| tako_core::platform::path::canonicalize_or_self(&r.path) == canon)
             });
             let Some(row) = row else {
-                return Err(DispatchError::Operation(format!(
-                    "ファイルツリーに見えていない行: {path}（畳んだフォルダの中・リモートの行は選べない）"
-                )));
+                return Err(Reason::TreeRowNotVisible(path).operation());
             };
             let before = host.tree_selection();
             let next = Selection::single(&row.path);
@@ -26798,18 +27259,18 @@ fn dispatch_tree_selection(
         (None, Some(name)) => {
             let key = Key::parse(&name).ok_or_else(|| {
                 let names: Vec<&str> = Key::ALL.iter().map(|k| k.as_str()).collect();
-                DispatchError::InvalidParams(format!(
-                    "key は {} のいずれか（受け取った値: {name}）",
-                    names.join(" / ")
-                ))
+                Reason::OneOfReceived {
+                    key: "key",
+                    allowed: names.join(" / "),
+                    got: name.clone(),
+                }
+                .invalid()
             })?;
             if !host.filetree_visible() {
                 return Err(closed());
             }
             let Some((prev, remote)) = host.tree_selection() else {
-                return Err(DispatchError::Operation(
-                    "ファイルツリーの行を選んでいない（先に path で選ぶ）".into(),
-                ));
+                return Err(Reason::TreeNoSelection.operation());
             };
             let mut out = json!({ "key": key.as_str() });
             if remote {
@@ -27159,11 +27620,7 @@ fn dispatch_orchestrator_supervisor(
         "set_mode" => {
             let sv_mode = mode
                 .and_then(supervisor::SupervisorMode::parse_mode)
-                .ok_or_else(|| {
-                    DispatchError::Operation(
-                        "mode は auto / notify_only / off のいずれかを指定".to_string(),
-                    )
-                })?;
+                .ok_or_else(|| Reason::SupervisorModeValue.operation())?;
             crate::orchestrator::Profile::mutate_named("default", |p| {
                 p.supervisor_mode = Some(sv_mode);
                 if let Some(ard) = auto_resume_dead {
@@ -27185,9 +27642,7 @@ fn dispatch_orchestrator_supervisor(
             let log = supervisor::read_audit_log(lines.unwrap_or(50));
             Ok(json!({ "audit_log": log }))
         }
-        _ => Err(DispatchError::Operation(format!(
-            "supervisor の action は status / set_mode / history のいずれか（不明: '{action}'）"
-        ))),
+        _ => Err(Reason::SupervisorAction(action.to_string()).operation()),
     }
 }
 
@@ -27247,16 +27702,12 @@ fn dispatch_orchestrator_ledger(p: LedgerParams) -> Result<Value, DispatchError>
             Ok(json!({"ok": true, "id": id, "post_issue": true}))
         }
         "prune" => {
-            let prefix = project.ok_or_else(|| {
-                DispatchError::InvalidParams("project（前方一致プレフィックス）は必須".into())
-            })?;
+            let prefix = project.ok_or_else(|| Reason::LedgerPruneNeedsProject.invalid())?;
             let removed = ledger::Ledger::mutate(|l| l.prune_by_project_prefix(&prefix))
                 .map_err(DispatchError::Operation)?;
             Ok(json!({"ok": true, "prefix": prefix, "removed": removed}))
         }
-        _ => Err(DispatchError::InvalidParams(format!(
-            "不正な action '{action}'。使用可能: list, stats, record, amend, prune"
-        ))),
+        _ => Err(Reason::LedgerAction(action.to_string()).invalid()),
     }
 }
 
@@ -27545,10 +27996,11 @@ fn dispatch_session_restart(
     let mode = match mode {
         None => None,
         Some(raw) => Some(SessionRestartMode::parse(raw).ok_or_else(|| {
-            DispatchError::InvalidParams(format!(
-                "mode が不正: {raw:?}（{}。省略すると下見だけを返す）",
-                SessionRestartMode::values_hint()
-            ))
+            Reason::RestartModeInvalid {
+                raw: raw.to_string(),
+                values: SessionRestartMode::values_hint(),
+            }
+            .invalid()
         })?),
     };
     let (_tab_id, pane_id) = resolve_pane(host.workspace(), pane)?;
@@ -27560,10 +28012,11 @@ fn dispatch_session_restart(
     let readiness = |m: SessionRestartMode| -> Result<(), String> {
         sr::can_restart(m, &plan.facts).map_err(|b| b.message(pane_raw, m))?;
         if m == SessionRestartMode::Harness && plan.launch.is_none() {
-            return Err(format!(
-                "pane {pane_raw} の再開コマンドを組めないのでハーネス更新しない: {}",
-                plan.resume_error.as_deref().unwrap_or("理由不明")
-            ));
+            return Err(Reason::ResumeCommandUnbuildable {
+                pane: pane_raw,
+                error: plan.resume_error.clone(),
+            }
+            .to_string());
         }
         Ok(())
     };
@@ -27647,9 +28100,9 @@ fn dispatch_session_restart(
                 .as_ref()
                 .ok_or_else(|| op_err("resume コマンドを組めなかった"))?;
             // 起動に要る system prompt は**終了させる前に**書く（書けなければ何も壊さずに断る）
-            launch.materialize().map_err(|e| {
-                op_err(format!("再開に要るファイルを書けないので建て直さない: {e}"))
-            })?;
+            launch
+                .materialize()
+                .map_err(|e| Reason::ResumeFilesUnwritable(e.to_string()).operation())?;
             // #1967: 落ちた後にシェルがプロンプトへ戻ったかの基準は**終了要求の前**に控える
             // （終了要求の後に読むと、もう戻った後の値を基準にしてしまいうる）
             let prompts_before = plan
@@ -27676,9 +28129,11 @@ fn dispatch_session_restart(
                         crate::diag::persist_log(&format!(
                             "セッション再起動: 断った pane={pane_raw} mode=harness 理由=terminate_failed"
                         ));
-                        return Err(DispatchError::Operation(format!(
-                            "エージェントのプロセス（pid {pid}）を終了できなかったので建て直さない: {e}"
-                        )));
+                        return Err(Reason::AgentTerminateFailed {
+                            pid,
+                            error: e.to_string(),
+                        }
+                        .operation());
                     }
                 }
             }
@@ -32337,7 +32792,12 @@ mod tests {
         assert!(host.previews[&preview].0.ends_with("a.rs"));
         let edge = jump_call(&mut host, "back", Some(root), None);
         assert_eq!(edge["moved"], json!(false));
-        assert_eq!(edge["reason"], json!("これより前の履歴は無い"));
+        // 理由は表示言語に従う（#2365）ので日英どちらでも見る
+        assert!(
+            edge["reason"] == json!("これより前の履歴は無い")
+                || edge["reason"] == json!("there is no earlier entry in the history"),
+            "{edge}"
+        );
         assert_eq!(edge["history"]["current"].as_u64(), Some(0));
         // 進む → b.rs:50、さらに進む → a.rs:7、その先は無い
         let fwd = jump_call(&mut host, "forward", Some(root), None);
@@ -32346,7 +32806,11 @@ mod tests {
         assert_eq!(fwd["location"]["line"].as_u64(), Some(7));
         let edge = jump_call(&mut host, "forward", Some(root), None);
         assert_eq!(edge["moved"], json!(false));
-        assert_eq!(edge["reason"], json!("これより先の履歴は無い"));
+        assert!(
+            edge["reason"] == json!("これより先の履歴は無い")
+                || edge["reason"] == json!("there is no later entry in the history"),
+            "{edge}"
+        );
         assert_eq!(
             jump_entries(&mut host),
             vec!["a.rs:30", "b.rs:50", ">a.rs:7"]
@@ -51189,10 +51653,8 @@ mod tests {
             PaneOrigin::Cli,
         )
         .unwrap_err();
-        assert!(
-            format!("{err}").contains("表示中のコマンドカードが無い"),
-            "{err}"
-        );
+        // 断りは表示言語に従う（#2365）ので、日英どちらの形も読む 1 実装で見る
+        assert!(Reason::says_no_command_card(&format!("{err}")), "{err}");
         // 範囲外のコマンド番号
         dispatch(
             &mut host,

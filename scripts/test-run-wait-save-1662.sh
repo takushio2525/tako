@@ -377,7 +377,7 @@ BEFORE_COUNT="$(pane_count)"
 RC=$?
 chmod 644 "$FIX/edit.sh"
 if [ "$RC" != 0 ]; then pass "保存できないと非 0（rc=${RC}）"; else fail "保存できないのに走らせた（古い内容が走る）"; fi
-if grep -q "実行前の保存に失敗" "$TMP/ro.log"; then pass "理由（実行前の保存に失敗）を返す"; else fail "理由が無い: $(tr '\n' ' ' < "$TMP/ro.log")"; fi
+if grep -q "実行前の保存に失敗\|saving before the run failed" "$TMP/ro.log"; then pass "理由（実行前の保存に失敗）を返す"; else fail "理由が無い: $(tr '\n' ' ' < "$TMP/ro.log")"; fi
 check_eq "実行ペインは作らない（ペイン数が変わらない）" "$BEFORE_COUNT" "$(pane_count)"
 check_eq "未保存の編集はそのまま残る（dirty=True）" "True" "$(dirty_of "$PREV")"
 echo "  （参考: 最初のペイン数 ${BASE}）"

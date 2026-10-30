@@ -43,6 +43,13 @@ check_contains() {
     *) fail "$1（'${2}' を含まない: ${3}）" ;;
   esac
 }
+# 日英どちらかを含む（動かなかった理由の文は表示言語に従う。#2365）
+check_contains_either() {
+  case "$4" in
+    *"$2"*|*"$3"*) pass "$1" ;;
+    *) fail "$1（'${2}' / '${3}' を含まない: ${4}）" ;;
+  esac
+}
 
 TMP="$(mktemp -d /tmp/tako-1677-XXXXXX)"
 APP_PID=""
@@ -139,10 +146,10 @@ echo "== ⑥a 空の履歴 =="
 OUT="$("$TAKO_BIN" jump back --pane "$ROOT" 2>&1)"; RC=$?
 echo "  back: $OUT (rc=$RC)"
 check_eq "空の履歴で back しても終了コード 0" "0" "$RC"
-check_contains "空の履歴で back は「前の履歴は無い」" "これより前の履歴は無い" "$OUT"
+check_contains_either "空の履歴で back は「前の履歴は無い」" "これより前の履歴は無い" "there is no earlier entry in the history" "$OUT"
 OUT="$("$TAKO_BIN" jump forward --pane "$ROOT" 2>&1)"; RC=$?
 check_eq "空の履歴で forward しても終了コード 0" "0" "$RC"
-check_contains "空の履歴で forward は「先の履歴は無い」" "これより先の履歴は無い" "$OUT"
+check_contains_either "空の履歴で forward は「先の履歴は無い」" "これより先の履歴は無い" "there is no later entry in the history" "$OUT"
 check_contains "空の list は積み方を案内する" "tako open <file> --line" "$("$TAKO_BIN" jump list 2>&1)"
 
 echo
@@ -263,7 +270,7 @@ start_gui "$TMP/app-legacy.log" TAKO_1677_LEGACY=1
 "$TAKO_BIN" open "$FIX/c.rs" --pane "$ROOT" --line 20 >/dev/null 2>&1
 check_eq "LEGACY では行指定の open でも何も積まれない" "" "$(entries)"
 OUT="$("$TAKO_BIN" jump back --pane "$ROOT" 2>&1)"
-check_contains "LEGACY では戻れない（= ①②の検査は #1677 以前を落とせる）" "これより前の履歴は無い" "$OUT"
+check_contains_either "LEGACY では戻れない（= ①②の検査は #1677 以前を落とせる）" "これより前の履歴は無い" "there is no earlier entry in the history" "$OUT"
 
 echo
 echo "== 結果: PASS=$PASS FAIL=$FAIL =="
