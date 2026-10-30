@@ -22,6 +22,9 @@
 //! - UI への状態の知らせは診断の口とは別（診断の口は URI だけ = #1679）で、GUI はそれを受けて描き直す
 //! - LSP のモジュールに npm / brew / winget 等の導入器を起こす値を書かない（グローバルを汚さない。
 //!   導入コマンドの案内は検出表 `servers.rs` の値だけ）
+//! - 取ってきたサーバは本番ではログインシェルで起こし、rc を読まない口（`plain_shell`）は e2e だけが
+//!   使う。e2e は開発者の rc を経由させず、initialize を本番の既定より短い実時間で切らない（#2509:
+//!   rc の `pyenv rehash` のロック待ちで、全体実行でだけ 4 件が `starting` のまま落ちた）
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -50,8 +53,9 @@ const GUI: &str = "crates/tako-app/src/lsp_status_ui.rs";
 const CORE_FETCH: &str = "crates/tako-core/src/lsp/fetch.rs";
 const ARCHIVE: &str = "crates/tako-control/src/lsp/archive.rs";
 const APP: &str = "crates/tako-app/src/main.rs";
+const E2E: &str = "crates/tako-control/tests/issue1944_lsp_fetch.rs";
 
-const FILES: &[&str] = &[FETCH, MANAGER, GUI, CORE_FETCH, ARCHIVE, APP];
+const FILES: &[&str] = &[FETCH, MANAGER, GUI, CORE_FETCH, ARCHIVE, APP, E2E];
 
 /// 導入器を起こす値（LSP のモジュールの文字列リテラルに現れてはいけない）
 const INSTALLERS: &[&str] = &[
@@ -152,6 +156,36 @@ const RULES: &[Rule] = &[
         must_not: &[],
         order: &[("if legacy() {", "data_dir()")],
         why: "`TAKO_1944_LEGACY=1` で取得が止まらない（A/B が効かない）",
+    },
+    Rule {
+        file: FETCH,
+        decl: "    pub fn from_env() -> Option<Self> {",
+        must: &["plain_shell: None,"],
+        must_not: &[],
+        order: &[],
+        why: "本番の設定がログインシェル以外で起こす（利用者の rc の PATH がサーバへ効かない。\
+              rc を読まない口は e2e 専用 = #2509）",
+    },
+    Rule {
+        file: FETCH,
+        decl: "fn plan_for(",
+        must: &[
+            "None => child_cmd::user_env_cli(&snippet, program, args),",
+            "Some(shell) =>",
+        ],
+        must_not: &[],
+        order: &[],
+        why: "取ってきたサーバの起こし方が本番のログインシェルを失う / rc を読まない口（#2509）が効かない",
+    },
+    Rule {
+        file: E2E,
+        decl: "fn manager(",
+        must: &["fetch.plain_shell = Some(", "DEFAULT_REQUEST_TIMEOUT"],
+        must_not: &[],
+        order: &[],
+        why: "e2e が開発者のログインシェル（rc の `pyenv rehash` はロックを最大 60 秒待ち、サーバの stdout を\
+              握ったまま残る）を通って起こす / initialize を本番の既定より短い実時間で切る（#2509: 全体実行で\
+              だけ取ってきた 4 件が `starting` のまま落ちた形に戻る）",
     },
     Rule {
         file: MANAGER,
@@ -444,6 +478,46 @@ fn 逆戻りを名指しできる() {
             "    inner.ui_refresh_wanted = true;\n    notify_diagnostics(inner, \"\");",
         ),
         "fn notify_refresh(inner: &mut Inner) {",
+    );
+    // L. e2e を開発者のログインシェルへ戻す（#2509 の直す前）
+    assert_named(
+        "L e2e がログインシェルを通る",
+        E2E,
+        (
+            "        fetch.plain_shell = Some(\"/bin/sh\".to_string());\n",
+            "",
+        ),
+        "fn manager(",
+    );
+    // M. e2e の initialize を 10 秒で切る（#2509 の直す前）
+    assert_named(
+        "M e2e の上限を縮める",
+        E2E,
+        (
+            "            DEFAULT_REQUEST_TIMEOUT\n",
+            "            Duration::from_secs(10)\n",
+        ),
+        "fn manager(",
+    );
+    // N. 本番の設定で rc を読まない口を使う
+    assert_named(
+        "N 本番で rc を読まない",
+        FETCH,
+        (
+            "            plain_shell: None,\n        })",
+            "            plain_shell: Some(\"/bin/sh\".to_string()),\n        })",
+        ),
+        "    pub fn from_env() -> Option<Self> {",
+    );
+    // O. 取ってきたサーバの起こし方からログインシェルを外す
+    assert_named(
+        "O ログインシェルを外す",
+        FETCH,
+        (
+            "        None => child_cmd::user_env_cli(&snippet, program, args),",
+            "        None => None,",
+        ),
+        "fn plan_for(",
     );
     // J. グローバルの npm を起こす
     assert_named(

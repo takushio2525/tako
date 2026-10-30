@@ -14,6 +14,23 @@
 //!
 //! A/B（検出力の実証）: `TAKO_1944_LEGACY=1` は本番の `FetchConfig::from_env` を `None` にする
 //! （このファイルは設定を自分で組むので、番犬 `issue1944_lsp_fetch_watchdog` がそちらを縛る）
+//!
+//! ## 起こし方は開発者の rc を経由させない（#2509）
+//!
+//! 取ってきたサーバは本番では `$SHELL -l -c 'exec …'`（ログインシェル）で起きる。開発者の rc は
+//! `eval "$(pyenv init --path)"` の `pyenv rehash` のようにロックを最大 60 秒待つうえ、その子は
+//! サーバの stdout を受け継ぐ。全体実行（前後でログインシェルが大量に起き・時間切れで殺される）で
+//! 取ってきた 4 件だけが落ちていた形はこれで、initialize を 10 秒で切って殺してもシェルだけが消え、
+//! 残った子が stdout を握るので EOF が来ず、`starting`・`crashes: 0` のまま 60 秒の待ちが尽きた
+//! （10/30 の 2 回とも同じ JSON。システムログでは偽サーバの exec が 60 秒のあいだ 1 度も無い）。
+//! 主題は取得と起動の経路なので、シェル片は本番と同じものを rc を読まない `/bin/sh -c` で起こし
+//! （`FetchConfig::plain_shell`）、initialize の上限は本番の既定（初回の起動を見込んだ値）に揃える
+//! （取ってきた物は毎回新しい実行ファイル = 初回 exec の検査を払う）。
+//!
+//! A/B は `TAKO_2509_LEGACY=1`（直す前の設定 = ログインシェル・10 秒）。注入は 2 つ:
+//! `SHELL=<rc が stdout を握った子で止まる偽のログインシェル>` で旧の腕が実物と同じ JSON で落ち、
+//! `TAKO_LSP_FAKE_START_DELAY_MS=<10 秒超>`（起動の遅い初回 exec）で旧の腕が上限で落ちる。
+//! どちらも新しい腕は通る
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -24,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tako_control::lsp::fetch::{self, FetchConfig, FetchError};
-use tako_control::lsp::manager::DEFAULT_IDLE_GRACE;
+use tako_control::lsp::manager::{DEFAULT_IDLE_GRACE, DEFAULT_REQUEST_TIMEOUT};
 use tako_control::lsp::{text, DocLink, Launch, LspConfig, LspManager};
 use tako_core::lsp::fetch::{Archive, Asset, Digest, Fetch, PlatformAsset};
 use tako_core::lsp::servers::{Arg, DocumentKind, InstallHint, RootScope, ServerSpec};
@@ -362,6 +379,14 @@ fn launcher(global: Arc<AtomicBool>, scratch: &Scratch) -> tako_control::lsp::ma
     })
 }
 
+/// A/B（#2509）: 直す前の設定（開発者のログインシェルで起こし、initialize を 10 秒で切る）
+fn legacy_2509() -> bool {
+    matches!(
+        std::env::var("TAKO_2509_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 fn manager(
     scratch: &Scratch,
     spec: &'static ServerSpec,
@@ -369,10 +394,16 @@ fn manager(
     base: &str,
     auto: bool,
 ) -> LspManager {
+    let legacy = legacy_2509();
     let config = LspConfig {
         table: std::slice::from_ref(spec),
         launcher: launcher(global, scratch),
-        request_timeout: Duration::from_secs(10),
+        // initialize は起動待ち（冒頭の #2509）。主題は上限ではないので本番の既定に揃える
+        request_timeout: if legacy {
+            Duration::from_secs(10)
+        } else {
+            DEFAULT_REQUEST_TIMEOUT
+        },
         shutdown_timeout: Duration::from_secs(5),
         idle_grace: DEFAULT_IDLE_GRACE,
         restart: RestartPolicy {
@@ -383,6 +414,10 @@ fn manager(
     };
     let mut fetch = FetchConfig::with_root(scratch.root(), Some(base.to_string()));
     fetch.auto = auto;
+    // 開発者のログインシェル（rc）を経由させない。シェル片は本番と同じ（冒頭の #2509。Windows は見ない）
+    if cfg!(unix) && !legacy {
+        fetch.plain_shell = Some("/bin/sh".to_string());
+    }
     LspManager::with_fetch(config, Some(fetch))
 }
 

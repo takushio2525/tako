@@ -2221,6 +2221,17 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     `SHELL` を偽のシェル（上がらない / プロンプトだけ出して打った行を実行しない）へ差し替える。
     番犬 `issue2479_シェルprobeは尽きたら落ちる状態待ちを通す`（`issue1308_pty_wait_watchdog`。
     固定窓と素の既定の検査も test_write_isolation.rs へ広げた）
+  - **製品が子をログインシェル越しに起こす経路も、e2e では rc を経由させない**（#2509）。
+    取ってきた言語サーバは本番では `$SHELL -l -c 'exec …'` で起きる（`fetch::plan_for`）。
+    `issue1944_lsp_fetch` の取ってきた 4 件は全体実行でだけ `starting`・`crashes: 0` のまま落ちた。
+    開発者の rc の `pyenv rehash`（`pyenv init --path` が出す）はロックを最大 60 秒待ち、
+    **サーバの stdout を受け継ぐ**ので、initialize の時間切れで殺してもシェルだけが消え、残った子が
+    stdout を握って EOF が来ない = 落ちたと数えず起こし直しもしない（システムログでは偽サーバの
+    exec が 60 秒のあいだ 1 度も無く、単独実行の 8 回は 1〜3 秒で exec）。e2e は同じシェル片を
+    rc を読まない `/bin/sh -c` で起こす口 `FetchConfig::plain_shell`（既定 `None` = 本番のまま）を
+    通し、initialize の上限は本番の既定（`DEFAULT_REQUEST_TIMEOUT`）に揃える。A/B は
+    `TAKO_2509_LEGACY=1`、注入は外から `SHELL` を「rc が stdout を握った子で止まる」偽のシェルへ。
+    番犬は `issue1944_lsp_fetch_watchdog`（e2e の `manager()` と本番の `from_env` / `plan_for`）
 - **background の重い処理の戻りを回数の窓で待たない**（#1890）。visual-test 節
   `large-file-decor` / `large-file-edit`（#1660）は、読み取り表示の塗りと編集開始の全文の塗り
   （どちらも background の syntect）を `for _ in 0..3000 { 10ms 待って描く }` / `0..6000` で
