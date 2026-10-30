@@ -1,0 +1,48 @@
+/*
+ * Java の見本
+ */
+package com.example.sample;
+
+import java.util.*;
+import java.util.function.Function;
+import static java.lang.Math.max;
+
+/** Javadoc {@link List} @param <T> 型 */
+@SuppressWarnings({"unchecked", "rawtypes"})
+public final class Box<T extends Comparable<? super T>> implements Iterable<T> {
+    private static final long SERIAL = 0x1FL;
+    private final List<T> items = new ArrayList<>();
+    protected volatile int count = 0b1010;
+
+    public Box(T... xs) { Collections.addAll(items, xs); }
+
+    @Override
+    public Iterator<T> iterator() { return items.iterator(); }
+
+    public <R> Box<R> map(Function<? super T, ? extends R> fn) {
+        var out = new Box<R>();
+        for (T x : items) out.items.add(fn.apply(x));
+        return out;
+    }
+
+    sealed interface Shape permits Circle, Square {}
+    record Circle(double r) implements Shape {}
+    record Square(double side) implements Shape {}
+
+    static double area(Shape s) {
+        return switch (s) {
+            case Circle c -> Math.PI * c.r() * c.r();
+            case Square q when q.side() > 0 -> q.side() * q.side();
+            default -> throw new IllegalArgumentException("unknown: " + s);
+        };
+    }
+
+    public static void main(String[] args) throws Exception {
+        String text = """
+            text block "quoted"
+            """;
+        char c = '\n'; float f = 1.5e-3f; int n = max(args.length, 1_000);
+        synchronized (Box.class) { System.out.printf("%s %c %f %d%n", text, c, f, n); }
+        label: for (int i = 0; i < n; i++) { if (i % 2 == 0) continue label; }
+    }
+}

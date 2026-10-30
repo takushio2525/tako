@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# bash の見本
+set -euo pipefail
+readonly NAME="${1:-default}" COUNT=$((2 + 3 * 4))
+declare -a items=("a b" 'c' $'d\te')
+declare -A map=([key]=value [other]="x y")
+
+log() { printf '%s %s\n' "$(date +%T)" "$*" >&2; }
+
+function cleanup {
+  local dir=${TMPDIR:?}/work
+  [[ -d $dir ]] && command rm -rf -- "${dir:?}"
+}
+trap cleanup EXIT INT
+
+for f in ./*.txt "${items[@]+"${items[@]}"}"; do
+  case "$f" in
+    *.txt|*.md) log "text: ${f%.*} ${f##*/} ${#f}" ;;
+    *) continue ;;
+  esac
+done
+
+while IFS=: read -r user _ uid _; do
+  if (( uid >= 1000 )) && [[ $user =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    echo "user=$user uid=$uid"
+  fi
+done < /etc/passwd
+
+cat <<-HEREDOC | sed 's/^/  /'
+	heredoc with $NAME and $(echo sub) and `echo backtick`
+	HEREDOC
+cat <<'RAW'
+raw $NOT_EXPANDED
+RAW
+result=$(grep -c "pattern" <(ls -1) 2>/dev/null || true)
+echo "${result:-0}" | tee >(wc -c) > /dev/null
+arr+=("x"); unset 'arr[0]'; export PATH="$HOME/bin:$PATH"
+echo "閉じない文字列

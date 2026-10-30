@@ -1,0 +1,61 @@
+// C# の見本
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace Sample.Geo;
+
+/// <summary>XML doc の <see cref="Point"/></summary>
+[Serializable]
+public sealed record Point(double X, double Y) : IComparable<Point>
+{
+    public static readonly Point Origin = new(0, 0);
+    public int CompareTo(Point? other) => X.CompareTo(other?.X ?? 0);
+}
+
+public partial class Repository<T> : IDisposable where T : class, new()
+{
+    private readonly List<T> _items = new();
+    private const int Max = 0x1F;
+    public event EventHandler<T>? Added;
+    public int Count => _items.Count;
+    public T this[int index] { get => _items[index]; set => _items[index] = value; }
+
+    public async Task<IReadOnlyList<T>> LoadAsync(string path, CancellationToken ct = default)
+    {
+        await using var stream = File.OpenRead(path);
+        var query = from item in _items
+                    where item != null
+                    orderby item.GetHashCode() descending
+                    select item;
+        return query.Take(Max).ToList();
+    }
+
+    public void Dispose() { GC.SuppressFinalize(this); }
+}
+
+public static class Program
+{
+    public static int Main(string[] args)
+    {
+        var name = args.Length > 0 ? args[0] : "world";
+        string verbatim = @"C:\path\""quoted""";
+        string interp = $"Hello, {name,-10:F2} {{literal}}";
+        string raw = """
+            raw "string"
+            """;
+        object o = 1.5e-3m;
+        switch (o)
+        {
+            case int i when i > 0: Console.WriteLine(i); break;
+            case decimal d: Console.WriteLine($"{d}"); break;
+            default: throw new InvalidOperationException(nameof(o));
+        }
+        #region 区切り
+        Func<int, int> sq = x => x * x;
+        #endregion
+        return sq(args.Length) + 1_000;
+    }
+}
+string broken = "閉じない文字列

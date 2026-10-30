@@ -1,0 +1,34 @@
+// JavaScript の見本
+'use strict';
+import defaultExport, { named as alias } from './module.js';
+export * from "./other.js";
+
+/**
+ * JSDoc の見本
+ * @param {string} name 名前
+ * @returns {Promise<number>}
+ */
+export default async function main(name, { retries = 3, ...rest } = {}, ...args) {
+  const re = /^(?:[a-z]+|\d{2,})\/[^/\n]*$/giu, half = total / 2 / count;
+  const tpl = tag`line ${args.length} and ${await fetch(`${base}/x`)}`;
+  let x = obj?.a?.[0]?.(1) ?? defaultValue;
+  x ||= 1; x &&= 2; x ??= 3; x **= 2; x >>>= 1;
+  const arrow = async (a, b = 2) => a + b;
+  class Shape extends Base {
+    #secret = 42;
+    static count = 0;
+    constructor(name) { super(name); this.name = name; }
+    get label() { return `${this.name}:${this.#secret}`; }
+    *[Symbol.iterator]() { yield* this.items; }
+  }
+  const obj2 = { method() {}, get g() { return 2; }, [computed]: 3, 'quoted': 4, async *gen() {} };
+  label: for (let i = 0; i < 10; i++) { if (i % 2) continue label; }
+  try { JSON.parse("{}"); } catch { /* 何もしない */ } finally { void 0; }
+  switch (typeof x) { case 'number': break; default: throw new TypeError('bad'); }
+  return 0x1F + 0b1010 + 0o17 + 1_000_000n + 1.5e-3 + .5;
+}
+const 名前 = 値?.長さ ?? "既定";
+document.querySelector('#app').addEventListener('click', e => console.log(e.target), { once: true });
+const broken = "unterminated
+let a = (1 + [2, { b: `x ${ y
+/* 閉じないコメント

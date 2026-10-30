@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""モジュールの docstring（複数行）
+"""
+from __future__ import annotations
+import re, sys
+from dataclasses import dataclass, field
+from typing import Generic, TypeVar, Optional
+
+T = TypeVar("T")
+
+@dataclass(frozen=True)
+class Box(Generic[T]):
+    value: T
+    tags: list[str] = field(default_factory=list)
+
+    def map(self, fn: "Callable[[T], U]") -> Box[U]:
+        return Box(fn(self.value), [*self.tags, "mapped"])
+
+    @property
+    def size(self) -> int: return len(self.tags)
+
+async def fetch(url: str, *, retries: int = 3, **kw) -> Optional[bytes]:
+    for i in range(retries):
+        try:
+            async with session.get(url, timeout=1.5e1) as resp:
+                return await resp.read()
+        except (TimeoutError, OSError) as err:
+            print(f"retry {i!r}: {err:>10} {{literal}}", file=sys.stderr)
+        finally:
+            pass
+    return None
+
+PATTERN = re.compile(r"^(?P<name>\w+)\s*=\s*(\d+|0x[0-9a-f]+)$", re.I)
+squares = {n: n ** 2 for n in range(10) if n % 2 == 0}
+lam = lambda x, /, y=0: x if x > y else (y := x)
+match command.split():
+    case [action, *rest] if action in ("go", "stop"): pass
+    case _: raise ValueError(b"bytes" + rb"raw\d")
+名前 = "Unicode の識別子"
+broken = "閉じない文字列
+s = '''閉じない三重引用符

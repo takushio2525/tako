@@ -1,0 +1,35 @@
+// C++ の見本
+#include <iostream>
+#include <memory>
+#include <vector>
+
+namespace geo::detail {
+template <typename T, std::size_t N = 3>
+class Vec final : public Base<T> {
+public:
+    constexpr Vec() noexcept = default;
+    explicit Vec(std::initializer_list<T> xs) : data_{} { std::copy(xs.begin(), xs.end(), data_); }
+    [[nodiscard]] T operator[](std::size_t i) const { return data_[i]; }
+    auto dot(const Vec& o) const -> T;
+    virtual ~Vec() override = default;
+private:
+    T data_[N];
+    static inline int count_ = 0;
+};
+}  // namespace geo::detail
+
+template <class F, class... Args>
+decltype(auto) call(F&& f, Args&&... args) { return std::forward<F>(f)(std::forward<Args>(args)...); }
+
+enum class Mode : std::uint8_t { Fast = 1, Safe };
+using Ptr = std::unique_ptr<int[]>;
+
+int main() {
+    auto lambda = [&, x = 1](int y) mutable -> int { return x += y; };
+    std::vector<int> v{1, 2, 3};
+    for (const auto& [i, x] : enumerate(v)) std::cout << i << ':' << x << '\n';
+    auto s = R"(raw "string")"s;
+    if constexpr (sizeof(void*) == 8) { static_assert(true, "64-bit"); }
+    try { throw std::runtime_error{"boom"}; } catch (const std::exception& e) { std::cerr << e.what(); }
+    co_return 0x1F'FF'FFull;
+}

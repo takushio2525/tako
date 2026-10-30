@@ -1,0 +1,36 @@
+/* C の見本 */
+#include <stdio.h>
+#include "local.h"
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define STR(x) #x
+#if defined(__APPLE__) && !defined(NDEBUG)
+#  pragma once
+#elif 0
+#error "unreachable"
+#endif
+
+typedef struct node { int value; struct node *next; } node_t;
+enum color { RED = 1, GREEN = 1 << 1, BLUE = 0x4 };
+static const char *names[] = { "red", "green", [2] = "blue" };
+extern volatile unsigned long long counter;
+
+static inline int sum(const int *xs, size_t n) {
+    int total = 0;
+    for (size_t i = 0; i < n; ++i) total += xs[i];
+    return total;
+}
+
+int main(int argc, char **argv) {
+    char buf[64] = {0};
+    float f = 1.5e-3f; double d = .5; long l = 10L; unsigned u = 7u;
+    node_t *head = malloc(sizeof *head);
+    if (!head) { perror("malloc"); return 1; }
+    switch (argc) { case 1: puts("one"); break; default: goto done; }
+    snprintf(buf, sizeof buf, "%s=%d\n", argv[0], MAX(argc, 2));
+    char c = '\'', w = L'x';
+done:
+    free(head);
+    return (int)(f + d + l + u + c + w);
+}
+// 壊れた行 "閉じない
+/* 閉じない

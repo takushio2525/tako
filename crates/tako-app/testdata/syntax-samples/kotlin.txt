@@ -1,0 +1,49 @@
+// Kotlin の見本
+@file:JvmName("Sample")
+package com.example.sample
+
+import kotlinx.coroutines.*
+import kotlin.math.max
+
+/** KDoc の [Point] */
+data class Point(val x: Double = 0.0, var y: Double = 1.5e-3) : Comparable<Point> {
+    override fun compareTo(other: Point): Int = x.compareTo(other.x)
+    companion object { const val MAX = 0x1F; val ORIGIN = Point() }
+}
+
+sealed interface Shape { data class Circle(val r: Double) : Shape; object Unit : Shape }
+
+enum class Mode(val code: Int) { FAST(1), SAFE(2); fun next() = values()[(ordinal + 1) % values().size] }
+
+inline fun <reified T : Any> List<*>.filterType(): List<T> = filterIsInstance<T>()
+
+suspend fun fetch(url: String, retries: Int = 3): Result<String> = coroutineScope {
+    repeat(retries) { attempt ->
+        try {
+            return@coroutineScope Result.success(withContext(Dispatchers.IO) { "body of $url #$attempt" })
+        } catch (e: Exception) {
+            println("retry ${attempt + 1}: ${e.message}")
+        } finally {
+            delay(100L)
+        }
+    }
+    Result.failure(IllegalStateException("gave up"))
+}
+
+fun area(s: Shape): Double = when (s) {
+    is Shape.Circle -> Math.PI * s.r * s.r
+    Shape.Unit -> 1.0
+}
+
+fun main(args: Array<String>) {
+    val names = listOf("a", "b").map { it.uppercase() }.filter { it != "C" }
+    val raw = """
+        raw "string" ${names.size}
+    """.trimIndent()
+    var n: Int? = null
+    n = n ?: max(args.size, 1_000)
+    val c = '\n'
+    loop@ for (i in 0 until 10 step 2) { if (i > 6) break@loop }
+    println("$names $raw $n $c ${area(Shape.Circle(2.0))}")
+}
+val broken = "閉じない文字列
