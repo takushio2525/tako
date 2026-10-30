@@ -24,9 +24,11 @@
 //! ホバー・エディタの全文の塗り直し（5,000 行以下）は UI スレッドで塗るので、
 //! **構文ごとの行数（[`plain_max_lines`]）以下の入力は元の正規表現の構文セット（[`plain_set`]）で
 //! 塗り**、それより大きい入力だけ前置き付き（[`syntax_set`]）で塗る。行数は言語ごとの損益分岐
-//! （冷えた構文セットで先頭 n 行を塗る所要が逆転する行数。TS 約 50 行〜CSS 約 1,300 行）の実測から
-//! 選んだ（`syntax_mirror::Target::plain_max_lines`）。2 つの構文セットは正規表現の文字列だけが違い、
-//! 構文・文脈の並びと番号は同じ（塗りの全記録が一致することを単体テストが確かめる）。
+//! （冷えた構文セットで先頭 n 行を塗る所要が逆転する行数。TS 約 50 行〜JS / CSS を埋め込む HTML
+//! 約 10,000 行）の実測から選んだ（`syntax_mirror::Target::plain_max_lines`）。TS を埋め込む
+//! Svelte / Vue の大きい入力は TS / TSX だけ前置き付きの構文セット（[`ts_only_set`] = #1917 と同じ）で
+//! 塗る（[`Variant`]）。どの構文セットも正規表現の文字列だけが違い、構文・文脈の並びと番号は同じ
+//! （塗りの全記録が一致することを単体テストが確かめる）。
 //!
 //! 表は `.agent/architecture.md`「構文の塗りの正規表現の前置き（#1917 / #1935）」。
 //!
@@ -45,16 +47,32 @@ use crate::syntax_mirror::{
 /// `build.rs` が作った、対象の構文の書き換え済みの文脈（`Vec<PrefilteredSyntax>` の bincode）
 static PREFILTERED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prefiltered-syntaxes.bin"));
 
-/// 対象外の構文の [`plain_max_lines`]。対象外の構文の正規表現は 2 つの構文セットで同じなので、
-/// 前置き付きで塗って効くのは埋め込みの対象（HTML 系・PHP・Svelte の中の JS / TS / CSS 等）だけ
-const OTHER_PLAIN_MAX_LINES: usize = 1_000;
+/// 対象外の構文の [`plain_max_lines`]。対象外の構文自身の正規表現は 2 つの構文セットで同じなので、
+/// 前置き付きで塗って効くのは埋め込みの対象（HTML 系・PHP・テンプレートの中の JS / CSS / HTML 等）だけ。
+/// 埋め込み先の前置きのコンパイル費で損益分岐が後ろへずれる（JS / CSS を埋め込む HTML の実測で
+/// 8,000〜12,000 行）ので、HTML と同じ 10,000 行
+const OTHER_PLAIN_MAX_LINES: usize = 10_000;
+
+/// 対象外のうち TS / TSX を埋め込む構文（`<script lang="ts">`）。#1917 から中の TS を全入力で
+/// 前置き付きで塗っていたので、TS と同じ行数を超えたら前置き付きで塗る（単体テストが two-face の
+/// 構文から洗い出した表と突き合わせる。Typst は文書の中のコード片なので対象外の既定のまま）
+const TS_EMBEDDERS: [&str; 2] = ["Svelte", "Vue Component"];
 
 /// `syntax` の入力をこの行数以下なら元の正規表現の構文セットで塗る（モジュールの doc「小さい入力は…」）
 pub(crate) fn plain_max_lines(syntax: &str) -> usize {
-    TARGETS
-        .iter()
-        .find(|target| target.name == syntax)
-        .map_or(OTHER_PLAIN_MAX_LINES, |target| target.plain_max_lines)
+    let by_name = |name: &str| {
+        TARGETS
+            .iter()
+            .find(|target| target.name == name)
+            .map(|target| target.plain_max_lines)
+    };
+    by_name(syntax).unwrap_or_else(|| {
+        if TS_EMBEDDERS.contains(&syntax) {
+            by_name("TypeScript").unwrap_or(OTHER_PLAIN_MAX_LINES)
+        } else {
+            OTHER_PLAIN_MAX_LINES
+        }
+    })
 }
 
 /// 書き換え前の挙動へ戻す（`TAKO_1917_LEGACY=1`。同一バイナリで A/B を取る入口）
@@ -74,10 +92,38 @@ pub(crate) fn split_by_size() -> bool {
     !legacy() && !legacy_1935()
 }
 
-/// 大きい入力（[`plain_max_lines`] 行超）の塗りに使う構文セット = 前置き付き
+/// 塗りに使う構文セットの種類（#1935）
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum Variant {
+    /// 元の正規表現（小さい入力・構文の解決）
+    #[default]
+    Plain,
+    /// TS / TSX だけ前置き付き（= #1917 の構文セット。TS を埋め込む Svelte / Vue の大きい入力）
+    TsOnly,
+    /// 対象の全構文が前置き付き（大きい入力）
+    All,
+}
+
+/// `syntax` の `lines` 行の入力を塗る構文セットの種類
+pub(crate) fn variant_for(syntax: &str, lines: usize) -> Variant {
+    if !split_by_size() || lines <= plain_max_lines(syntax) {
+        Variant::Plain
+    } else if TS_EMBEDDERS.contains(&syntax) {
+        // 中の CSS / JS まで前置き付きにすると、そのコンパイル費で冷えた 1 回目が #1917 より
+        // 10〜20 ms 遅くなる（合成の SFC の実測）。#1917 と同じ「TS だけ」で塗る
+        Variant::TsOnly
+    } else {
+        Variant::All
+    }
+}
+
+/// 大きい入力（[`plain_max_lines`] 行超）の塗りに使う構文セット = 対象の全構文が前置き付き
 pub(crate) fn syntax_set() -> SyntaxSet {
     if legacy() {
         return crate::syntax_extra::base_set();
+    }
+    if legacy_1935() {
+        return ts_only_set();
     }
     match built() {
         Ok(built) => syntect::dumps::from_uncompressed_data(&built.bytes)
@@ -86,14 +132,26 @@ pub(crate) fn syntax_set() -> SyntaxSet {
     }
 }
 
+/// TS / TSX だけ前置き付きの構文セット（= #1917 の構文セット。`TAKO_1935_LEGACY=1` でも使う）
+pub(crate) fn ts_only_set() -> SyntaxSet {
+    if legacy() {
+        return crate::syntax_extra::base_set();
+    }
+    match ts_only_bytes() {
+        Ok(bytes) => syntect::dumps::from_uncompressed_data(bytes)
+            .unwrap_or_else(|_| crate::syntax_extra::base_set()),
+        Err(_) => crate::syntax_extra::base_set(),
+    }
+}
+
 /// 小さい入力の塗りと構文の解決に使う構文セット = 元の正規表現。
-/// `TAKO_1935_LEGACY=1` では入力の大きさで分けないので、前置き付き（TS / TSX だけ）と同じもの
+/// `TAKO_1935_LEGACY=1` では入力の大きさで分けないので、TS / TSX だけ前置き付きのもの
 pub(crate) fn plain_set() -> SyntaxSet {
     if legacy() {
         return crate::syntax_extra::base_set();
     }
     if legacy_1935() {
-        return syntax_set();
+        return ts_only_set();
     }
     match built() {
         Ok(built) => syntect::dumps::from_uncompressed_data(&built.plain)
@@ -102,9 +160,9 @@ pub(crate) fn plain_set() -> SyntaxSet {
     }
 }
 
-/// 2 つの構文セットの直列化（どちらも `from_uncompressed_data` で読める形）
+/// 起動時に作る 2 つの構文セットの直列化（どちらも `from_uncompressed_data` で読める形）
 pub(crate) struct Built {
-    /// 前置き付き
+    /// 対象の全構文が前置き付き
     bytes: Vec<u8>,
     /// 元の正規表現（土台そのもの）
     plain: Vec<u8>,
@@ -125,6 +183,20 @@ pub(crate) fn built() -> &'static Result<Built, String> {
     BUILT.get_or_init(|| build(&crate::syntax_extra::base_set(), PREFILTERED))
 }
 
+/// TS / TSX だけ前置き付きの構文セットの直列化。Svelte / Vue の大きい入力を初めて塗るとき
+/// （と `TAKO_1935_LEGACY=1`）に、元の構文セットのバイト列へ差し込んで作る（release 1.6 ms・
+/// 塗りの初回は background で起きる。作ったら常駐する）
+fn ts_only_bytes() -> &'static Result<Vec<u8>, String> {
+    static TS_ONLY: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
+    TS_ONLY.get_or_init(|| {
+        let built = built().as_ref().map_err(String::clone)?;
+        splice(&built.plain, PREFILTERED, |name| {
+            LEGACY_1917_SYNTAXES.contains(&name)
+        })
+        .map(|spliced| spliced.bytes)
+    })
+}
+
 /// 起動時に専用スレッドで [`built`] を済ませておく（最初の塗りが UI スレッドでも構築を払わない。
 /// 構築中に塗りが来たら `OnceLock` が出来上がりを待つ）
 pub(crate) fn warm_up() {
@@ -136,26 +208,48 @@ pub(crate) fn warm_up() {
         .name("tako-syntax-prefilter".into())
         .spawn(|| {
             let _ = built();
+            if legacy_1935() {
+                let _ = ts_only_bytes();
+            }
         });
 }
 
-/// 土台の構文セットへ、ビルド時に書き換えた文脈（`prefiltered`）を差し込む
+/// 土台の構文セットへ、ビルド時に書き換えた文脈（`prefiltered`）を全部差し込む
 fn build(base: &SyntaxSet, prefiltered: &[u8]) -> Result<Built, String> {
     let original =
         bincode::serialize(base).map_err(|e| format!("構文セットを直列化できない: {e}"))?;
-    let mut set: SetMirror =
+    let set: SetMirror =
         bincode::deserialize(&original).map_err(|e| format!("構文セットの形が想定と違う: {e}"))?;
     // 鏡の並びが syntect と食い違っていれば、往復で元のバイト列に戻らない
     if bincode::serialize(&set).ok().as_deref() != Some(&original[..]) {
         return Err("構文セットの直列化が往復で元に戻らない（syntect の形が変わった）".into());
     }
+    let all = splice(&original, prefiltered, |_| true)?;
+    Ok(Built {
+        bytes: all.bytes,
+        plain: original,
+        patterns: all.patterns,
+        rewritten: all.rewritten,
+        skipped: all.skipped,
+    })
+}
+
+/// [`splice`] の結果
+struct Spliced {
+    bytes: Vec<u8>,
+    patterns: usize,
+    rewritten: usize,
+    skipped: Vec<String>,
+}
+
+/// 構文セットの直列化 `plain` の、`keep` が真の構文へ、ビルド時に書き換えた文脈を差し込む
+fn splice(plain: &[u8], prefiltered: &[u8], keep: fn(&str) -> bool) -> Result<Spliced, String> {
+    let mut set: SetMirror =
+        bincode::deserialize(plain).map_err(|e| format!("構文セットの形が想定と違う: {e}"))?;
     let generated: Vec<PrefilteredSyntax> = bincode::deserialize(prefiltered)
         .map_err(|e| format!("ビルド時に書き換えた文脈を読めない: {e}"))?;
     let (mut patterns, mut rewritten, mut skipped) = (0, 0, Vec::new());
-    for one in generated {
-        if legacy_1935() && !LEGACY_1917_SYNTAXES.contains(&one.name.as_str()) {
-            continue;
-        }
+    for one in generated.into_iter().filter(|one| keep(&one.name)) {
         let Some(syntax) = set
             .syntaxes
             .iter_mut()
@@ -175,9 +269,8 @@ fn build(base: &SyntaxSet, prefiltered: &[u8]) -> Result<Built, String> {
     }
     let bytes = bincode::serialize(&set)
         .map_err(|e| format!("前置き付きの構文セットを直列化できない: {e}"))?;
-    Ok(Built {
+    Ok(Spliced {
         bytes,
-        plain: original,
         patterns,
         rewritten,
         skipped,
@@ -747,16 +840,40 @@ mod tests {
                 "{syntax}"
             );
         }
+        // TS だけ前置き付き（Svelte / Vue の大きい入力）= TS / TSX は全部と同じ・ほかは元のまま
+        let ts_only = ts_only_set();
+        for syntax in ["TypeScript", "TypeScriptReact"] {
+            assert_eq!(
+                regexes(&ts_only, syntax),
+                regexes(&guarded, syntax),
+                "{syntax}"
+            );
+        }
+        for syntax in ["JavaScript", "CSS", "Rust"] {
+            assert_eq!(
+                regexes(&ts_only, syntax),
+                regexes(&base(), syntax),
+                "{syntax}"
+            );
+        }
+        assert_eq!(variant_for("Svelte", 51), Variant::TsOnly);
+        assert_eq!(variant_for("Svelte", 50), Variant::Plain);
+        assert_eq!(variant_for("HTML", 10_001), Variant::All);
+        assert_eq!(variant_for("HTML", 10_000), Variant::Plain);
     }
 
     /// 元の正規表現で塗る行数は構文ごと（損益分岐の実測。TS は #1917 から全入力を前置き付きで
-    /// 塗っていたので損益分岐ちょうどの 50 行・対象外は埋め込みの対象のために 1,000 行）
+    /// 塗っていたので損益分岐ちょうどの 50 行・JS / CSS を埋め込む HTML と対象外は 10,000 行・
+    /// TS を埋め込む Svelte / Vue は TS と同じ）
     #[test]
     fn 元の正規表現で塗る行数は構文ごとの損益分岐() {
         assert_eq!(plain_max_lines("TypeScript"), 50);
         assert_eq!(plain_max_lines("TypeScriptReact"), 50);
         assert_eq!(plain_max_lines("Rust"), 400);
         assert_eq!(plain_max_lines("CSS"), 1_600);
+        assert_eq!(plain_max_lines("HTML"), 10_000);
+        assert_eq!(plain_max_lines("Vue Component"), 50);
+        assert_eq!(plain_max_lines("Svelte"), 50);
         assert_eq!(plain_max_lines("JSON"), OTHER_PLAIN_MAX_LINES);
         assert_eq!(plain_max_lines("PHP Source"), OTHER_PLAIN_MAX_LINES);
         let mut names = target_syntaxes();
@@ -765,12 +882,44 @@ mod tests {
         assert_eq!(names.len(), TARGETS.len(), "対象の表に同じ構文が 2 行ある");
         for target in TARGETS {
             assert!(
-                (50..=5_000).contains(&target.plain_max_lines),
-                "{} の行数 {} が計測の範囲（50〜5,000 行）の外",
+                (50..=OTHER_PLAIN_MAX_LINES).contains(&target.plain_max_lines),
+                "{} の行数 {} が計測の範囲（50〜10,000 行）の外",
                 target.name,
                 target.plain_max_lines
             );
         }
+    }
+
+    /// 対象外で TS / TSX を埋め込む構文は [`TS_EMBEDDERS`]（と文書の中のコード片として持つ Typst）だけ。
+    /// two-face が TS を埋め込む構文を足したら、#1917 の挙動（中の TS を前置き付きで塗る）を
+    /// 保つかを決めて表へ足すこと
+    #[test]
+    fn tsを埋め込む対象外の構文は表にある() {
+        let set: SetMirror = bincode::deserialize(&bincode::serialize(&base()).unwrap()).unwrap();
+        let ts: Vec<usize> = ["TypeScript", "TypeScriptReact"]
+            .iter()
+            .map(|name| set.syntaxes.iter().position(|s| s.name == *name).unwrap())
+            .collect();
+        let mut embedders = Vec::new();
+        for (at, syntax) in set.syntaxes.iter().enumerate() {
+            if ts.contains(&at) || target_syntaxes().contains(&syntax.name.as_str()) {
+                continue;
+            }
+            let lazy: LazyMirror =
+                syntect::dumps::from_reader(&syntax.serialized_lazy_contexts[..]).unwrap();
+            let text = format!("{:?}", lazy.contexts);
+            if ts
+                .iter()
+                .any(|index| text.contains(&format!("syntax_index: {index},")))
+            {
+                embedders.push(syntax.name.as_str());
+            }
+        }
+        embedders.sort_unstable();
+        let mut expected: Vec<&str> = TS_EMBEDDERS.to_vec();
+        expected.push("Typst");
+        expected.sort_unstable();
+        assert_eq!(embedders, expected);
     }
 
     /// 塗りの所要の計測（release で手動実行する。#1917 / #1935）。
@@ -796,6 +945,14 @@ mod tests {
             t.elapsed(),
             PREFILTERED.len()
         );
+        // TS だけ前置き付きのバイト列も先に作る（アプリでは Svelte / Vue の大きい入力の初回に
+        // 1 回だけ作る。前後で同じ条件にして、作る費用は別に出す）
+        let t = Instant::now();
+        let ts_only = ts_only_bytes().as_ref().map(Vec::len);
+        eprintln!(
+            "[perf1917] TS だけ前置き付きの差し込み {:?}（{ts_only:?}）",
+            t.elapsed()
+        );
         let t = Instant::now();
         drop(syntax_set());
         eprintln!("[perf1917] 構文セットの取得 {:?}", t.elapsed());
@@ -817,10 +974,10 @@ mod tests {
                 syntax = name;
             }
             if std::env::var_os("TAKO_1917_PERF_COMPARE").is_some() {
-                let set = if text.lines().count() > plain_max_lines(&syntax) {
-                    syntax_set()
-                } else {
-                    plain_set()
+                let set = match variant_for(&syntax, text.lines().count()) {
+                    Variant::Plain => plain_set(),
+                    Variant::TsOnly => ts_only_set(),
+                    Variant::All => syntax_set(),
                 };
                 let (before, after) = (
                     painted(&base(), &syntax, &text),
@@ -933,6 +1090,32 @@ mod tests {
                     guard_only.as_secs_f64() * 1e3,
                     guard_len / count.max(1)
                 );
+            }
+        }
+        // 対象の構文を埋め込む構文（埋め込み先の前置きのコンパイル費が損益分岐を後ろへずらす）
+        if std::env::var_os("TAKO_1935_EMBEDS").is_some() {
+            let set: SetMirror = bincode::deserialize(&base_bytes).unwrap();
+            let targets: Vec<(usize, &str)> = TARGETS
+                .iter()
+                .filter_map(|target| {
+                    let at = set.syntaxes.iter().position(|s| s.name == target.name)?;
+                    Some((at, target.name))
+                })
+                .collect();
+            for (at, syntax) in set.syntaxes.iter().enumerate() {
+                let lazy: LazyMirror =
+                    syntect::dumps::from_reader(&syntax.serialized_lazy_contexts[..]).unwrap();
+                let text = format!("{:?}", lazy.contexts);
+                let embeds: Vec<&str> = targets
+                    .iter()
+                    .filter(|(index, _)| {
+                        *index != at && text.contains(&format!("syntax_index: {index},"))
+                    })
+                    .map(|(_, name)| *name)
+                    .collect();
+                if !embeds.is_empty() {
+                    eprintln!("[embeds1935]\t{}\t{}", syntax.name, embeds.join(","));
+                }
             }
         }
         let Some(table) = std::env::var_os("TAKO_1935_SURVEY_FILES") else {

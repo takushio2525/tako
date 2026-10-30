@@ -2157,8 +2157,8 @@ static SYNTAX_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub struct HighlightCache {
     /// 構文セットの世代（載せ直しを跨いだ状態は使えない）
     generation: u64,
-    /// 前置き付きの構文セットで塗ったか（#1935。行数の境目を跨いで入れ替わったら全文を塗り直す）
-    prefiltered: bool,
+    /// 塗った構文セットの種類（#1935。行数の境目を跨いで入れ替わったら全文を塗り直す）
+    variant: crate::syntax_prefilter::Variant,
     /// 解決した構文の名前。1 行目の shebang で変わりうるので毎回照合する
     syntax: String,
     /// 直前にハイライトしたテキスト（変わった範囲の突き合わせに使う）
@@ -2402,6 +2402,8 @@ pub struct SyntectHighlighter {
     /// 大きい入力（[`crate::syntax_prefilter::plain_max_lines`] 行超）の塗りに使う、正規表現へ
     /// 前置きを足した構文セット（#1917 / #1935）。大きい入力を初めて塗るときに載せる
     prefiltered: OnceLock<syntect::parsing::SyntaxSet>,
+    /// TS / TSX だけ前置き付きの構文セット（TS を埋め込む Svelte / Vue の大きい入力。#1935）
+    ts_only: OnceLock<syntect::parsing::SyntaxSet>,
     theme: syntect::highlighting::Theme,
     /// この構文セットの世代（#1648。[`HighlightCache`] の有効性判定に使う）
     generation: u64,
@@ -2421,28 +2423,38 @@ impl SyntectHighlighter {
         Self {
             syntaxes,
             prefiltered: OnceLock::new(),
+            ts_only: OnceLock::new(),
             theme,
             generation: SYNTAX_GENERATION.fetch_add(1, Ordering::Relaxed) + 1,
         }
     }
 
-    /// `syntax` の `lines` 行の入力を塗る構文セットと、それが前置き付きか（#1917 / #1935）。
+    /// `syntax` の `lines` 行の入力を塗る構文セットとその種類（#1917 / #1935）。
     /// 大きい入力は TS などの正規表現を「当たらない行で VM を起こさない」等価形へ書き換えた
     /// 構文セットで塗る（1 MB の TS 5.9 → 1.8 秒・JavaScript 3.8 → 1.9 秒）。小さい入力は
     /// 前置きのコンパイルの固定費を取り返せないので元の正規表現で塗る（UI スレッドで塗る
     /// チャットのコードブロック・エディタの全文の塗り直しの冷えた 1 回目を重くしない）。
-    /// 境目は構文ごとの損益分岐（TS 50 行〜CSS 1,600 行）
-    fn set_for(&self, syntax: &str, lines: usize) -> (&syntect::parsing::SyntaxSet, bool) {
-        if crate::syntax_prefilter::split_by_size()
-            && lines > crate::syntax_prefilter::plain_max_lines(syntax)
-        {
-            let set = self
+    /// 境目は構文ごとの損益分岐（TS 50 行〜HTML 10,000 行）
+    fn set_for(
+        &self,
+        syntax: &str,
+        lines: usize,
+    ) -> (
+        &syntect::parsing::SyntaxSet,
+        crate::syntax_prefilter::Variant,
+    ) {
+        use crate::syntax_prefilter::Variant;
+        let variant = crate::syntax_prefilter::variant_for(syntax, lines);
+        let set = match variant {
+            Variant::Plain => &self.syntaxes,
+            Variant::All => self
                 .prefiltered
-                .get_or_init(crate::syntax_prefilter::syntax_set);
-            (set, true)
-        } else {
-            (&self.syntaxes, false)
-        }
+                .get_or_init(crate::syntax_prefilter::syntax_set),
+            Variant::TsOnly => self
+                .ts_only
+                .get_or_init(crate::syntax_prefilter::ts_only_set),
+        };
+        (set, variant)
     }
 
     /// 構文の解決は小さい入力用の構文セットで行うので、塗る構文セットの同じ構文へ引き直す
@@ -2592,11 +2604,11 @@ impl SyntectHighlighter {
         allow_full: bool,
     ) -> bool {
         let syntax = self.syntax_for_path(path, text);
-        let (set, prefiltered) = self.set_for(&syntax.name, text.lines().count());
+        let (set, variant) = self.set_for(&syntax.name, text.lines().count());
         let syntax = Self::same_syntax_in(set, syntax);
         let reusable = !full_highlight_forced()
             && cache.generation == self.generation
-            && cache.prefiltered == prefiltered
+            && cache.variant == variant
             && cache.syntax == syntax.name
             && !cache.checkpoints.is_empty()
             && cache.starts.len() == lines.len();
@@ -2604,7 +2616,7 @@ impl SyntectHighlighter {
             self.refresh_incremental(set, text, cache, lines);
         } else if allow_full {
             self.refresh_full(set, syntax, text, cache, lines);
-            cache.prefiltered = prefiltered;
+            cache.variant = variant;
         } else {
             return false;
         }
@@ -5853,20 +5865,28 @@ mod syntax_resolution_tests {
     /// どちらで塗っても色は同じで、エディタは境目を跨いだら行状態を使わず全文から塗り直す
     #[test]
     fn 塗る構文セットは行数で選び境目の両側で色が同じ() {
+        use crate::syntax_prefilter::Variant;
         let limit = crate::syntax_prefilter::plain_max_lines("TypeScript");
         let hl = SyntectHighlighter::new();
-        assert!(
-            !hl.set_for("TypeScript", limit).1,
-            "境目ちょうどは元の正規表現"
+        let variant = |syntax: &str, lines: usize| hl.set_for(syntax, lines).1;
+        assert_eq!(
+            variant("TypeScript", limit),
+            Variant::Plain,
+            "境目ちょうどは元"
         );
-        assert!(
-            hl.set_for("TypeScript", limit + 1).1,
+        assert_eq!(
+            variant("TypeScript", limit + 1),
+            Variant::All,
             "境目を超えたら前置き付き"
         );
-        assert!(
-            !hl.set_for("CSS", limit + 1).1,
+        assert_eq!(
+            variant("CSS", limit + 1),
+            Variant::Plain,
             "境目は構文ごと（CSS は 1,600 行）"
         );
+        // TS を埋め込む Vue は TS だけ前置き付き（#1917 と同じ。中の CSS / JS のコンパイル費を足さない）
+        assert_eq!(variant("Vue Component", limit + 1), Variant::TsOnly);
+        assert_eq!(variant("Vue Component", limit), Variant::Plain);
         // 塗りの所要を debug でも小さく保つため、短い行を並べる
         let unit = "a = f(b, `c`); // d\n";
         let big = unit.repeat(limit + 1);
@@ -5884,9 +5904,9 @@ mod syntax_resolution_tests {
         let mut cache = HighlightCache::default();
         let mut lines = Vec::new();
         assert!(hl.refresh(path, &unit.repeat(limit), &mut cache, &mut lines, true));
-        assert!(!cache.prefiltered);
+        assert_eq!(cache.variant, Variant::Plain);
         assert!(hl.refresh(path, &big, &mut cache, &mut lines, true));
-        assert!(cache.prefiltered);
+        assert_eq!(cache.variant, Variant::All);
         assert_eq!(cache.relit(), limit + 1, "全文から塗り直していない");
         assert!(lines == by_run, "境目を跨いだ後の塗りが全文の塗りと違う");
     }

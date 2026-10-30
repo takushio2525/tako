@@ -116,9 +116,9 @@ fn 構文セットは書き換えの1実装から取る() {
     );
     let (line, set_for) = highlighter_fn(&src, "set_for");
     for needle in [
+        "crate::syntax_prefilter::variant_for(syntax, lines)",
         "crate::syntax_prefilter::syntax_set",
-        "crate::syntax_prefilter::plain_max_lines(syntax)",
-        "crate::syntax_prefilter::split_by_size()",
+        "crate::syntax_prefilter::ts_only_set",
     ] {
         assert!(
             set_for.contains(needle),
@@ -197,14 +197,20 @@ fn 書き換えは往復の検査と構造の検証を通す() {
     // 起動時の差し込み: 往復検査と、生成したときの土台の文脈との指紋の照合
     let src = read_code(PREFILTER);
     let (line, build) = fn_body(&src, PREFILTER, "build");
-    for needle in [
-        "bincode::serialize(&set)",
-        "&original[..]",
-        "Fingerprint::of(&syntax.serialized_lazy_contexts)",
+    let (splice_line, splice) = fn_body(&src, PREFILTER, "splice");
+    for (name, line, body, needle) in [
+        ("build", line, build, "bincode::serialize(&set)"),
+        ("build", line, build, "&original[..]"),
+        (
+            "splice",
+            splice_line,
+            splice,
+            "Fingerprint::of(&syntax.serialized_lazy_contexts)",
+        ),
     ] {
         assert!(
-            build.contains(needle),
-            "{PREFILTER}:{line}: `build` が `{needle}` を確かめていない。\n\
+            body.contains(needle),
+            "{PREFILTER}:{line}: `{name}` が `{needle}` を確かめていない。\n\
              syntect の直列化の形や two-face の版が変わったときに、壊れた・食い違った文脈を\n\
              差し込まず元へ戻る前提が崩れる（#1917 / #1935）"
         );
@@ -295,7 +301,7 @@ fn 塗りは入力の行数で構文セットを選ぶ() {
     }
     let (line, refresh) = highlighter_fn(&src, "refresh");
     assert!(
-        refresh.contains("cache.prefiltered == prefiltered"),
-        "{PREVIEW}:{line}: `refresh` が前置きの有無の入れ替わりで全文へ戻らない（#1935）"
+        refresh.contains("cache.variant == variant"),
+        "{PREVIEW}:{line}: `refresh` が構文セットの種類の入れ替わりで全文へ戻らない（#1935）"
     );
 }

@@ -48,7 +48,8 @@ pub(crate) const TARGETS: &[Target] = &[
     target("Bourne Again Shell (bash)", 800),
     target("YAML", 200),
     target("Markdown", 800),
-    target("HTML", 1_000),
+    // 埋め込みの JS / CSS の前置きのコンパイル費で損益分岐が 8,000〜12,000 行まで後ろへずれる
+    target("HTML", 10_000),
     target("Kotlin", 800),
 ];
 
