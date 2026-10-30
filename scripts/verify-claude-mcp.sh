@@ -26,9 +26,20 @@ if [ -z "${TAKO_VERIFY_CLAUDE_MCP_INNER:-}" ]; then
   run_heavy cargo build -p tako-cli --quiet
   unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_CLI TAKO_MCP_URL CLAUDE_CODE_PLUGIN_DIRS \
     TAKO_ORCHESTRATOR_ROLE
+  # env を落としても、CLI とブリッジはホストのソケットへ繋がらないと既定の置き場の control.json へ
+  # 縮退して本番 GUI へ繋ぐ（FR-2.2.9）。発見の置き場と data dir を一時の側へ向ける（#2527）。
+  # 順番待ち（run_heavy）は本番の GUI へ並ぶので、向けるのはその後
+  TAKO_VERIFY_CLAUDE_MCP_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tako-verify-mcp-XXXXXX")"
+  export TAKO_VERIFY_CLAUDE_MCP_TMP
+  export TAKO_DATA_DIR="$TAKO_VERIFY_CLAUDE_MCP_TMP/data"
+  export TAKO_DISCOVERY_DIR="$TAKO_VERIFY_CLAUDE_MCP_TMP/discovery"
   export TAKO_VERIFY_CLAUDE_MCP_INNER=1
   exec cargo run -p tako-control --example mcp_host --quiet -- bash "$0"
 fi
+# 外側が作った一時の置き場は内側が片付ける（外側は exec で居なくなる）。
+# set -e の下の EXIT trap は番人の 1 実装で張る（bash 3.2 で途中の死が 0 に化けない。#1864）
+. scripts/lib/exit-guard.sh
+tako_exit_trap '[ -z "${TAKO_VERIFY_CLAUDE_MCP_TMP:-}" ] || rm -rf "${TAKO_VERIFY_CLAUDE_MCP_TMP:?}"' "verify-claude-mcp の内側"
 
 # 叩くブリッジ（既定は dev の置き場 = 同じプロセスで続ける形）。.app の中の `Contents/MacOS/tako` を
 # 渡すと、隣の `tako-mcp` へ exec で引き渡される配布物の形を通す（#2021）
@@ -53,3 +64,4 @@ tree="$("$TAKO" list)" && grep -q '"type": "split"' <<<"$tree" || fail "HTTP 経
 echo "OK: Streamable HTTP で split が通った（claude の応答: $(head -1 <<<"$out")）"
 
 echo "VERIFY_CLAUDE_MCP_OK"
+tako_exit 0

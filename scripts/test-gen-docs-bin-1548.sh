@@ -33,6 +33,10 @@ command -v node >/dev/null 2>&1 || { echo "node が無い環境では走らな�
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/tako-1548-XXXXXX")"
 cleanup(){ rm -rf "$SANDBOX"; }
 trap cleanup EXIT
+# env を落としても CLI は既定の置き場（本番の data dir）を読む（表示言語の settings.json・発見ファイル）。
+# 採取を本番の設定に左右させず、本番へ繋ぐ道も残さない（#2527）
+export TAKO_DATA_DIR="$SANDBOX/data"
+export TAKO_DISCOVERY_DIR="$SANDBOX/discovery"
 
 FAKE="$SANDBOX/repo"
 FIX="$FAKE/fixtures"

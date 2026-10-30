@@ -5170,6 +5170,16 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
   tako CLI なら `TAKO_SOCKET` / `TAKO_PANE_ID`。先頭の `unset` か、その行の `env -u …` で落とす
   （`claude --version` の版の問い合わせは対象外）。「example ホストの中で再実行された側か」のような判定を
   `TAKO_SOCKET` の有無でしない（本番のペインにもある。`verify-claude-mcp.sh` は専用の印に直した）
+- **tako CLI は env を落としただけでは本番 GUI へ届く**（#2527）。`TAKO_SOCKET` が無い（か繋がらない）と、
+  CLI と remote daemon は発見ファイル（`<TAKO_DISCOVERY_DIR か data dir>/control.json` と `instances/`）を
+  読み、data dir の既定（`$HOME/Library/Application Support/tako`）に居る本番 GUI へ繋ぐ（FR-2.2.9）。
+  `TAKO_ISOLATED=1` が置き場を差し替えるのは GUI の起動時だけで、**CLI の置き場は変えない**。
+  `test-serve-watch.sh` は `unset` と `TAKO_ISOLATED=1` だけで `tako remote start` を回し、QR の画像を
+  本番のアクティブなタブへ開いた。検証スクリプトは tako CLI を起こす前に `TAKO_DATA_DIR` /
+  `TAKO_DISCOVERY_DIR` / `HOME` のどれかを一時の側へ向ける（先頭の `export TAKO_DATA_DIR="$TMP/data"` か、
+  その行の前置き）。順番待ち（`run_heavy` / `tako queue`）は本番の GUI へ並ぶのが仕様なので、向けるのは
+  その後にする。本番へ届くのが仕様の行（本番の順番待ちへ並ぶ `"$QUEUE" queue …`）だけ、その行か直前の行に
+  `# tako:prod-ok <理由>` を置いて外す（外れるのは発見の置き場の規則だけ）
 
 番犬は `crates/tako-control/tests/verification_isolation_watchdog.rs`。落とす一覧に、本番がペインへ配る名前
 （tako-app の `spawn_session` が積む `TAKO_*`・`backend::PANE_SCOPED_ENV`・`claude_mod::INJECTED_KEYS`・
@@ -5177,8 +5187,10 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
 設定 dir・`.zshrc` も見る。`scripts/test-*.sh` / `measure-*.sh` / `verify-*.sh` のうち、落とさずに
 claude / tako を起こす行は file:line で名指す（引用符の中 = ペインへ送る文字列と、ヒアドキュメントの
 本文は数えない。`"$BIN/claude"` のようにパスで起こす claude も数え、そのスクリプトが `>` で書き出した
-偽の claude だけを外す）。実経路は `scripts/test-isolated-gui-defaults-1970.sh`（`TAKO_1970_LEGACY_HELPER=<旧ヘルパ>`
-で A/B）。
+偽の claude だけを外す）。tako CLI は `$TAKO_BIN` / `$TAKO` / `…/tako` に加え、そのスクリプトが `…/tako` の
+パスを代入した変数（`OLD=/Applications/…/MacOS/tako` など）で起こす行も数え、発見の置き場を一時の側へ
+向けていなければ別の 1 行で名指す（#2527。`--version` / `--help` は数えない）。実経路は
+`scripts/test-isolated-gui-defaults-1970.sh`（`TAKO_1970_LEGACY_HELPER=<旧ヘルパ>` で A/B）。
 
 **眠った状態を手で再現する**（受け入れ検査用）: `pmset displaysleepnow` を撃つと面が眠り、
 `virtual-display.sh status` が「眠っている」に変わる（蓋閉じで内蔵が居ない機なら

@@ -3,13 +3,15 @@
 #
 # 偽の tailscale CLI（TAKO_TAILSCALE_BIN）と隔離した state ディレクトリで
 # 実 daemon（tako remote serve）を走らせ、「消える → 検知 → 張り直す」を実測する。
-# **本番の tailscale / serve 設定 / remote デーモンには一切触らない**
-# （tailscale の呼び出しは全部この偽物へ向く。state も mktemp 配下）。
+# **本番の tailscale / serve 設定 / remote デーモン / GUI / data dir には一切触らない**
+# （tailscale の呼び出しは全部この偽物へ向く。state・data dir・発見の置き場も mktemp 配下）。
 #
 # 使い方: bash scripts/test-serve-watch.sh
 set -euo pipefail
 
-# 本番 tako のペインから回しても CLI が本番の GUI へ繋がないよう、本番が配る env を落とす（#1970）
+# 本番 tako のペインから回しても CLI が本番の GUI へ繋がないよう、本番が配る env を落とす（#1970）。
+# env だけでは足りない（CLI と daemon は既定の置き場の control.json から本番 GUI を見つける）ので、
+# 下の「隔離した環境」で発見の置き場と data dir も一時の側へ向ける（#2527）
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,7 +37,8 @@ check_contains() {
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/tako-1049-XXXXXX")"
 cleanup() {
-  stop_daemon || true
+  # 隔離の不変条件などで stop_daemon の定義より前に抜けたときは呼ばない（command not found を出さない）
+  if declare -F stop_daemon > /dev/null; then stop_daemon || true; fi
   if [ -n "${PEER_PID:-}" ]; then kill "$PEER_PID" 2>/dev/null || true; fi
   rm -rf "$TMP"
 }
@@ -101,15 +104,27 @@ fi
 [ -x "$TAKO_BIN" ] || { echo "tako CLI が見つからない: $TAKO_BIN"; exit 1; }
 
 # --- 隔離した環境 -------------------------------------------------------------
+# 発見の置き場と data dir（#2527）: env を落としても CLI（`remote start` の QR を開く OpenFile）と
+# daemon（GUI を探す AppIpcClient）は `<data dir>/control.json` から GUI を探す。data dir の既定は
+# 本番の置き場で、TAKO_ISOLATED=1 は CLI の置き場を変えないので、ここを向けないと
+# QR のプレビューが本番のアクティブなタブに開く。
+# 順番待ち（上の run_heavy）は本番の GUI へ並ぶのが仕様なので、向けるのはその後
+export TAKO_DATA_DIR="$TMP/data"
+export TAKO_DISCOVERY_DIR="$TMP/discovery"
 export TAKO_REMOTE_STATE_DIR="$TMP/state"
 export TAKO_TAILSCALE_BIN="$FAKE_TS"
 export TAKO_1049_WATCH_SECS=2
 mkdir -p "$TAKO_REMOTE_STATE_DIR"
-# 本番へ書かない不変条件（万一 env が効いていなければここで落とす）
-case "$TAKO_REMOTE_STATE_DIR" in
-  "$TMP"/*) : ;;
-  *) echo "state ディレクトリが隔離されていない: $TAKO_REMOTE_STATE_DIR"; exit 1 ;;
-esac
+# 本番へ書かない・繋がない不変条件（万一 env が効いていなければここで落とす）
+for dir in "$TAKO_REMOTE_STATE_DIR" "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR"; do
+  case "$dir" in
+    "$TMP"/*) : ;;
+    *) echo "置き場が隔離されていない: $dir"; exit 1 ;;
+  esac
+done
+if "$TAKO_BIN" list > /dev/null 2>&1; then
+  echo "CLI が GUI へ繋がる（発見の置き場が隔離されていない。#2527）"; exit 1
+fi
 
 DAEMON_LOG="$TMP/daemon.log"
 

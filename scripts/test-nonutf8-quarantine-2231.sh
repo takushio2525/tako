@@ -240,6 +240,7 @@ if [ "$ONLY" != cli ]; then
   echo
   echo "== recent の「足して保存」（GUI の OpenDir と同じ口）を統合テストで =="
   echo "   cargo test --test issue2231_raw_quarantine_ab（既定 → TAKO_2231_LEGACY=1 を 1 本で並べる）"
+  # tako:prod-ok 本番の順番待ち（#1994）へ並ぶのが目的 = 本番の GUI へ届くのが仕様
   out=$(cd "$REPO_ROOT" && "$QUEUE" queue cargo test -p tako-control --test issue2231_raw_quarantine_ab -- --nocapture 2>&1)
   grep '\[2231-ab\]' <<<"$out" | sed "s#/[^ \"]*tako-2231-ab-#<tmp>/tako-2231-ab-#g; s/^/      /"
   if grep -q 'test result: ok. 1 passed' <<<"$out"; then
