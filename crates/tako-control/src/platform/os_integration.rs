@@ -290,7 +290,8 @@ impl OsIntegrationError {
             (Self::Absolutize(e), Ja) => format!("パスを絶対化できない: {e}"),
             (Self::Absolutize(e), En) => format!("cannot make the path absolute: {e}"),
             (Self::PathMissing(path), Ja) => format!("パスが存在しない: {path}"),
-            (Self::PathMissing(path), En) => format!("path not found: {path}"),
+            // dispatch の `Reason::PathNotFound` と同じ日本語なので英語も同じ文にそろえる
+            (Self::PathMissing(path), En) => format!("path does not exist: {path}"),
             (Self::ShellExecute { what, code }, _) => format!(
                 "{}: {}",
                 what.text_in(lang),

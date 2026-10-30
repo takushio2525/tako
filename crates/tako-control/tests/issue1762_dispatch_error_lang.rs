@@ -10087,9 +10087,8 @@ fn osのシェル連携と蓋閉じ継続の断りの包みと見つからない
         "failed to stop staying awake with the lid closed: cannot write the lid setting (Ac, rc=5)"
     );
 
-    // 「見つからない」系（パスが無い・ファイル / パス / DLL が見つからない）は英語にも ` not found`
+    // 「見つからない」系（ファイル / パス / DLL が見つからない）は英語にも ` not found`
     for e in [
-        OsIntegrationError::PathMissing("/x".into()),
         OsIntegrationError::ShellExecute {
             what: Launch::DefaultApp,
             code: 2,
@@ -10106,6 +10105,13 @@ fn osのシェル連携と蓋閉じ継続の断りの包みと見つからない
     ] {
         let en = e.text_in(Lang::En);
         assert!(E::says_not_found(&en), "{e:?}: {en}");
+    }
+    // 「パスが存在しない」は dispatch の `Reason::PathNotFound` と同じ文（日英とも）
+    for lang in [Lang::Ja, Lang::En] {
+        assert_eq!(
+            OsIntegrationError::PathMissing("/x".into()).text_in(lang),
+            Reason::PathNotFound("/x".into()).text_in(lang)
+        );
     }
 
     // JSON の理由: serde の誤りから採る形は #2365 より前の `json_reason` と同じ（日本語）

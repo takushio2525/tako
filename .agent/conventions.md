@@ -344,7 +344,7 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `tako_sleep_guard` / `tako_shell_integration` だけが型の口（`*_typed`）を通す。`pane_log::read_tail` は
   OS のエラーを返し、文は呼び手（`SessionRefusal::LogUnreadable`）が組む。「見つからない」系
   （カタログ・会話の記録）の英語は ` not found` を含む。**蓋閉じ継続の解除と Battery の設定を開く口は
-  中身が `platform::lid` / `os_integration` の文なので移していない**（それと一緒に移す）。`Ok` の文
+  中身が `platform::lid` / `os_integration` の文なので移していない**（それと一緒に移す = のちに移した。下の項）。`Ok` の文
   （手段の説明・削除不要）と resume の warnings は応答の注記なので対象外。番犬は同じ
   `issue1762_dispatch_error_lang.rs` の末尾の節（3 つの型の表・型の口の断りの組み立て = `Err(` / `.map_err(` /
   `.ok_or(` の中の日本語を名指す `SESSION_OS_REFUSAL_SCOPES`・dispatch が日本語の口を呼んでいないか
@@ -373,6 +373,32 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   突き合わせる。番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（tako-core の 6 型の表と、
   断りの組み立てに日本語の固定文を書き足していないかを見る `UPDATE_CORE_SCOPES`）と、更新の口の型の表は
   tako-app の `update_checker::tests::更新の口の断りは全バリアントが日英を持ち日本語は2365より前と一致`
+- #2365 の続きで、**OS のシェルに委ねる操作**（Finder / エクスプローラーで表示・既定アプリ / 指定のアプリで
+  開く・ゴミ箱へ移す = dispatch の `FileOpKind::Reveal` / `OpenDefault` / `OpenWith` / `Trash` とまとめたゴミ箱）と
+  **蓋閉じ継続の解除**（`remove-lid-sleep`）・**System Settings の Battery を開く口**（`open-battery-settings`）を、
+  枠と中身を一緒に移した。中身は `platform::os_integration::OsIntegrationError`（macOS の `open` / osascript /
+  Finder への頼み = `platform::finder_reveal`・Windows の explorer / `ShellExecuteW` / `SHFileOperationW`・
+  その他 unix の未対応。何をしようとしたかの `Launch`・未対応の操作の `OsFeature`・Windows の戻り値の説明
+  `shell_execute_reason` / `shfileop_reason` も含めて**実装の `cfg` の外**に置く = macOS の単体テストで Windows の
+  文の日英も検査できる）と `platform::lid::LidError`（記録の読み書き・解釈 = JSON の理由は tako-core の
+  `load_issue::JsonReason`・Windows の電源プラン）。URL の検査の理由は tako-core の `UrlBlocked::text_in`
+  （`as_str` / Display は日本語のまま = 診断ログ）。枠は `OsRefusal`（`SudoersRemoveFailed` /
+  `LidTeardownFailed` / `BatterySettingsUnopenable` / `BatterySettingsMacOnly`、ファイル操作は枠を持たず中身を
+  そのまま載せる `Integration`）。**`String` を返す従来の口（`os_integration::reveal` / `open_default` /
+  `open_with` / `move_to_trash` / `open_url` ほか・`lid::set_stay_awake` / `clear_residual`・
+  `sleep_guard::teardown_lid_control` / `remove_sudoers` / `open_battery_settings`）は日本語のまま**（GUI の UI・
+  CLI の手元の処理・persist.log はそのまま使う）。dispatch だけが型の口（`*_typed`）を通す。URL を開く口は
+  検査（`guarded_url`）を型の口の本体に置き、`String` の口は型の口へ委ねるだけ（#1376 の番犬が両方を見る）。
+  「パスが存在しない」は `Reason::PathNotFound` と同じ文（英語も同じ）、Windows の「見つからない」系
+  （`ShellExecuteW` の 2 / 3 / 32・`SHFileOperationW` の 0x402）の英語は ` not found` を含む。`Ok` の文
+  （解除の結果・sudoers 未登録・Battery を開いた）と残留復元を飛ばす理由（`should_clear_residual` = 診断ログ）は
+  対象外。番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（`OsIntegrationError` / `LidError` /
+  `Launch` / `OsFeature` / `UrlBlocked` / `JsonProblem` と戻り値の説明の表・`os_integration.rs` /
+  `finder_reveal.rs` / `lid.rs` の断りの組み立ての日本語の固定文・`JA_SESSION_OS_CALLS` に dispatch が
+  呼んではいけない日本語の口を 6 つ足した）、実経路は `tests/issue2365_os_integration_lang.rs`（macOS。`PATH` を
+  空の dir・Finder の記録先を無い dir・ゴミ箱の代わりの置き場を無い dir へ向けた注入で断らせ、GUI 無しの
+  ホストへ dispatch を日英で通す。最初に「無いアプリ名で開く」で注入が効いたことを確かめてから先へ進む。
+  蓋閉じ継続の解除は sudoers の登録の有無で経路が変わるので叩かない）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
