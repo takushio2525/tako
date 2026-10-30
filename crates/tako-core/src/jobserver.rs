@@ -108,7 +108,7 @@ pub fn auth(value: &str) -> Option<&str> {
 
 /// tako が作る fifo の名前か（`jobserver.fifo` / `tako-<16 桁>.jobserver.fifo`）
 pub fn is_tako_fifo(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     name == FILE_NAME || (name.starts_with("tako-") && name.ends_with(SHORT_SUFFIX))
 }
 
@@ -134,7 +134,7 @@ pub fn same_fifo(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
-    let name = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+    let name = |p: &str| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string();
     let (na, nb) = (name(a), name(b));
     na == nb && na.starts_with("tako-") && na.ends_with(SHORT_SUFFIX)
 }

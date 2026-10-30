@@ -501,6 +501,10 @@ pub fn start(secondary: bool) {
             settings_seen: Some((Instant::now(), settings_mtime())),
         });
     }
+    // この OS では札を配らない（Windows = #2000）ので、設定を見張るスレッドも要らない
+    if !SUPPORTED {
+        return;
+    }
     let spawned = std::thread::Builder::new()
         .name("tako-jobserver".into())
         .spawn(|| loop {
