@@ -20,24 +20,6 @@
 
 ---
 
-## 2026-10-30（#2496: 項目 108 / 110 の `measure_output_redraw` も `open_redraw_windows` で両方の時計を空ける。いまの並びでは対象はフォーカス中で落ちない = 潜在）
-- `unfocus` 注入で修正前は 108 / 110 とも FAILED → 修正後は通る・注入なし 4/4・番犬が `main.rs:<行>` を名指し・カタログ +0 B。PR #2500
-
-## 2026-10-30（#2501: CI 待ちの既定を書いた md・コメント・--help の数字を `DEFAULT_TIMEOUT` と ci.yml の job の上限に突き合わせる番犬 `issue2501_wait_timeout_docs_watchdog`。docs だけの PR でも ubuntu で走る）
-- 実ファイルへの注入 3 通りでファイルと行を名指しして落ち、戻すと緑・カタログ +0 B。PR #2502
-
-## 2026-10-30（#2365 の続き: config_io の書き出し 6 文 → `WriteError`・remote.rs の AppIpcClient 9 行 → `Reason`・データディレクトリの断り 5 か所 → `DataDirUnresolved` / `IoCause`）
-- 実経路 A/B で英語表示の日本語入り 置き場 5 → 0・remote daemon 4 → 0、日本語はバイト一致・カタログ +0 B。PR #2504
-
-## 2026-10-30（#1614: cargo test 中の bash の syntax error は shell_dialect の意図的な負の対照（`bash -n`）だった → stderr を取り込んで `syntax error` を assert）
-- 単体の stderr 2 行 → 0 行・注入 3 通りで FAILED・カタログ +0 B。PR #2503
-
-## 2026-10-30（#1622: 環境診断の外部の問い合わせ（`claude mcp list` ほか）を導入状況と重ね、check-health 9.7〜12.0 → 5.8〜6.4 秒・setup --check 9.0〜9.9 → 5.4〜5.9 秒。出力は sha256 まで一致）
-- 番犬は diagnostics.rs の待ち合いの単体テスト（直列へ戻す注入 4 通りで file:line を名指し）・実経路 22 / 22・カタログ +0 B。PR #2505
-
-## 2026-10-30（#1593: CHANGELOG の `## [Unreleased]` 5 つを最上段の 1 つへ（埋もれた 42 項目は出荷版の節へ・0.7.9 の 8 項目は消費済み）・夜間の挿入を `scripts/lib/changelog.sh` へ（A/B `TAKO_1593_LEGACY=1`）・番犬 `issue1593_changelog_unreleased_watchdog`）
-- 注入 2 通りで番犬が file:line で FAILED・test-release-retry 152 pass・カタログ +0 B。PR #2506
-
 ## 2026-10-30（#2365 の続き: dispatch の個別の断り（選択肢ダイアログへの応答・orchestrator・設定の保存・Web・メニュー・値の検証）82 か所を `Reason` へ（182 → 244 種）。CLI の handoffs / shortcuts の直呼びに表示言語の初期化）
 - 実経路 修正前 英語表示の日本語入り 49 / 49 → 0・CLI 7 / 7 → 0・日本語は全件バイト一致・注入 4 通りで名指し・カタログ +0 B。PR #2508
 
@@ -80,3 +62,23 @@
 
 ## 2026-10-30（#2365 の続き: GUI 側の口（ControlHost の実装）が組む断り 48 種を `HostRefusal` へ。dispatch は変えず GUI が表示言語で返す）
 - 隔離 GUI の A/B で英語表示の日本語入り 31 / 35 → 0 / 35・日本語は 35 件バイト一致・注入 3 通りで名指し・カタログ +0 B。PR #2530
+
+## 2026-10-30（#2531: `TAKO_ISOLATED=1` の CLI / MCP ブリッジ / remote daemon は置き場（`TAKO_DATA_DIR` / `TAKO_DISCOVERY_DIR`）の指定が無ければ既定（本番）の置き場の発見ファイルを読まず日英で断る（正本 `discovery::read_candidates`・順番待ちだけ例外・A/B `TAKO_2531_LEGACY=1`））
+- 本番役の隔離 GUI + 中継で修正前 接続 各 1・remote start 2 件・ペイン 1→2 → 修正後 0 件・1→1・番犬 `issue2531_isolated_discovery`・カタログ +0 B。PR #2535
+- 本番確認で #2531 を閉じた
+
+## 2026-10-30（#2365 の続き: sessions / resume_launch / pane_log の断り 11 か所を `SessionRefusal`・fda / sleep_guard / shell_integration の 4 か所を `OsRefusal` + tako-core の `SiError` へ。scripts の日本語だけの判定 3 か所も日英に）
+- 実経路の英語表示で日本語入り 21 → 0（隔離 GUI 16 → 0）・日本語はバイト一致・カタログ +0 B。蓋閉じの解除・Battery・os_integration・lid.rs は次のスライス。PR #2534
+
+## 2026-10-30（#2519 開け直し: Dock 起動の GUI は remote daemon の稼働中、2 秒ごとの `refresh_remote_state` が `daemon_status` を 2 回呼び、`tailscale::pick_candidate` が PATH に無い素の `tailscale` を 4 エントリ空振りしていた → unix では引けない素の名前を起こさない `try_unresolved_bare`・A/B `TAKO_2519_LEGACY=1`）
+- 隔離 GUI + 本物の contents-swap で差し替え後 60 秒の拒否 240 → 0（本番 3.9 件/秒と一致）・番犬が注入を tailscale.rs:190 / remote.rs:2521 で名指し・カタログ +0 B。PR #2536
+- 本番確認で #2519 を閉じた（tailscale を 1 tick に 6 本起こす件は #2539）
+
+## 2026-10-30（#2533: 17:37 の remote daemon の入れ替えの要求元は特定できず（desired の書き直し = 人向けの stop → start の対・自動 3 経路と GUI の dispatch は perf.log と記録で外れた）→ 頼む側の `daemon_stop_requested` / `daemon_start_requested` と daemon 側の `requester`（接続元を OS から引く・経路の名乗り・祖先 6 段の名前）を audit.log へ）
+- 実 daemon の A/B で修正前は要求元 0 行 → 修正後は CLI の pid・ペイン・祖先で名指せる・番犬 `issue2533_remote_request_origin_watchdog`・カタログ +0 B。Issue は Refs のまま。PR #2540
+
+## 2026-10-30（#2365 の続き: 更新の口（`UpdateRefusal` / `UpdateNote` / `CheckError` の中身 / `InstallerError`）と tako-core の 5 系統（`PlanRefusal` / `ViewRefusal` / `OutlineRefusal` / `Truncation::edit_refusal_in` / `ClickRefusal`）・変更履歴の打ち切り（`HistoryTimedOut::text_in`）を表示言語へ。scripts の 2150 / 1676 の判定は日英）
+- 実経路 23 ケースで英語表示の日本語入り 23 → 0・日本語は 23 / 23 バイト一致・注入 4 通りで名指し + E0004・カタログ +0 B。PR #2541
+
+## 2026-10-30（#2538: install の前から待っていた `tako queue` の包みが待ち明けに子を素の名前で起こし、PATH の空振りぶん拒否（本番 41 × 2 を 2 回。段 1 で install の手順ではないと確定）→ 受付の前に `exe::pin_before_wait` で引いた絶対パスで起こす・argv[0] は打った形のまま・A/B `TAKO_2519_LEGACY=1`）
+- 隔離の調停役 + 本物の contents-swap で待ち明けの拒否 10 → 0（2 回）・見え方 / 終了コード / シグナル / 127 は sha 一致・注入 3 通りで番犬が queue_wrapper.rs:577 / 378 を名指し・カタログ +0 B。本番確認待ちで Issue は開けたまま。PR #2542
