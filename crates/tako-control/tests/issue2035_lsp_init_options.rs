@@ -9,7 +9,9 @@
 //!
 //! 本番の manager（`LspManager::from_env`）が settings.json を読み書きすることと A/B
 //! （`TAKO_2035_LEGACY=1` = 何も送らない）は、同じテストバイナリを子プロセスで起こして測る
-//! （テストの env を書き換えない = 並列のテストと打ち消し合わない）。
+//! （テストの env を書き換えない = 並列のテストと打ち消し合わない）。子は rc を読まない `/bin/sh` と
+//! 一時の HOME で起こす（本番の解決はログインシェル越しに偽サーバを起こすので、開発者の rc を
+//! 経由させない = #2551。番犬 `issue2551_lsp_child_shell_watchdog`）。
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -328,6 +330,8 @@ fn 本番の口で送った値を出す子プロセス() {
 /// `vars` だけを立てた子プロセスで、本番の口が送った初期化オプションを測る
 fn probe(scratch: &Scratch, mode: &str, vars: &[(&str, &str)]) -> Value {
     let _ = std::fs::remove_file(scratch.log());
+    let home = scratch.0.join("home");
+    std::fs::create_dir_all(&home).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     // `--test-threads=1`: 子の出力の形を親の env（`RUST_TEST_THREADS`）に依らず 1 つに決める。
     // 直列の libtest は `test <名前> ... ` を改行せずに出すので、子の 1 行目はその後ろへつながる（#2248）
@@ -355,7 +359,14 @@ fn probe(scratch: &Scratch, mode: &str, vars: &[(&str, &str)]) -> Value {
         .env("TAKO_LSP_FAKE_LOG", scratch.log())
         .env("TAKO_LSP_AUTOSTART", "1")
         .env("TAKO_LSP_AUTO_FETCH", "0")
+        .env("HOME", &home)
         .envs(vars.iter().copied());
+    // 本番の解決は unix で `$SHELL -l -c 'exec …'` を起こす（差し替えの env の偽サーバも同じ）。
+    // 開発者の rc（`pyenv rehash` は残ったロックを最大 60 秒待つ）を偽サーバの前に走らせない
+    // 素のシェルにする（#2551: 全体実行でだけ 1 回目の initialize の待ちを使い切った）
+    if cfg!(unix) {
+        command.env("SHELL", "/bin/sh");
+    }
     let output = command.output().expect("子プロセスを起こせる");
     let stdout = String::from_utf8_lossy(&output.stdout);
     // 目印は行頭とは限らない（上の `--test-threads=1` で `test <名前> ... ` の後ろへ続く）

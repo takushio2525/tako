@@ -2509,6 +2509,14 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     （#1944 `manager()` / #1977 `managed_manager()` / #1956 `fetch_manager()`。#2514）。番犬は
     helper の外の `LspManager::with_fetch(` も名指すので、取得つきの e2e を足すときは helper を通すか
     `FETCH_MANAGER_HELPERS` へ足す
+  - **本番の解決（`default_launch`）を子プロセスで走らせる e2e も同じ**（#2551）。差し替えの env
+    （`TAKO_LSP_BIN_<ID>`）で偽サーバを指しても本番の解決は `$SHELL -l -c 'exec …'` を通るので、
+    `issue2035_lsp_init_options` の子（`LspManager::from_env`）は開発者の rc を読み、全体実行でだけ
+    「1 回目の initialize が 15s 以内に起きなかった」で落ちた（rehash のロック待ちの注入で再現。
+    15 秒の上限は状態待ちの上限で、真因ではない）。子へ `SHELL=/bin/sh` と一時の HOME を渡す
+    （`sh -l` は `~/.profile` を読む。主題がシェルなら偽のシェル）。番犬
+    `issue2551_lsp_child_shell_watchdog` が、`--exact` で起こす子のテスト関数が本番の解決を呼ぶ
+    （同じファイルの関数 1 段の間接も含む）のに `SHELL` / HOME を渡さない親を `file:line` で名指す
 - **background の重い処理の戻りを回数の窓で待たない**（#1890）。visual-test 節
   `large-file-decor` / `large-file-edit`（#1660）は、読み取り表示の塗りと編集開始の全文の塗り
   （どちらも background の syntect）を `for _ in 0..3000 { 10ms 待って描く }` / `0..6000` で
