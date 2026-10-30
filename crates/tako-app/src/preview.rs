@@ -526,6 +526,11 @@ pub struct DiskConflict {
     pub state: tako_core::DiskState,
     /// 利用者へ知らせた回数。検知した 1 回だけ知らせる（状態が変わったらもう 1 回）
     pub notices: u32,
+    /// リモート（SSH 先）への書き戻しが競合で断られたものか（#1833。`RemoteErrorKind::Conflict`）。
+    ///
+    /// ローカルの写しは tako 自身が書くので、写しの保存・監視では解けない
+    /// （解けるのは書き戻しが通ったとき = [`EditState::clear_remote_conflict`]）
+    pub remote: bool,
 }
 
 /// `TAKO_1659_LEGACY=1` で **#1659 前の挙動**へ戻す（同一バイナリで A/B を取る入口）:
@@ -534,6 +539,14 @@ pub struct DiskConflict {
 /// 判定は dispatch の 1 実装（`OpenFile` の差し替え回避も同じ口で戻る）
 pub fn external_change_legacy() -> bool {
     tako_control::dispatch::external_change_legacy()
+}
+
+/// `TAKO_1833_LEGACY=1` で **#1833 前の挙動**へ戻す（同一バイナリで A/B を取る入口）:
+/// 読み直しを undo で戻しても自動保存を止めない（= 外部変更を黙って上書きする）。
+/// 隔離の実経路 `scripts/test-external-change-1833.sh` の検出力の実証に使う
+pub fn reload_undo_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var_os("TAKO_1833_LEGACY").is_some())
 }
 
 /// `TAKO_1661_LEGACY=1` で **#1661 前の挙動**へ戻す（同一バイナリで A/B を取る入口）:
@@ -688,11 +701,32 @@ impl EditState {
     /// 同じ状態を何度検知しても回数は増えない（修正前は自動保存が 500ms ごとに
     /// 同じ競合を出し続けた）。知らせたら `true`
     pub fn note_conflict(&mut self, state: tako_core::DiskState) -> bool {
-        if self.conflict.is_some_and(|c| c.state == state) && !external_change_legacy() {
+        self.note_conflict_on(state, false)
+    }
+
+    /// リモート（SSH 先）への書き戻しが競合で断られた（#1833）。帯・`conflict` の応答・
+    /// 知らせる回数・自動保存の停止はローカルの競合と同じ 1 つの口を通る（修正前はヘッダの
+    /// 表示だけが「競合」になり、帯にも応答にも載らなかった）。知らせたら `true`
+    pub fn note_remote_conflict(&mut self) -> bool {
+        self.note_conflict_on(tako_core::DiskState::Changed, true)
+    }
+
+    /// 競合の記録の**ただ 1 つの書き手**（#1659 / #1833）。同じ状態・同じ相手（ローカル /
+    /// リモート）の競合なら知らせ直さない
+    fn note_conflict_on(&mut self, state: tako_core::DiskState, remote: bool) -> bool {
+        if self
+            .conflict
+            .is_some_and(|c| c.state == state && c.remote == remote)
+            && !external_change_legacy()
+        {
             return false;
         }
         let notices = self.conflict.map_or(0, |c| c.notices).saturating_add(1);
-        self.conflict = Some(DiskConflict { state, notices });
+        self.conflict = Some(DiskConflict {
+            state,
+            notices,
+            remote,
+        });
         self.save_status = Some(SaveStatus::Conflict);
         // 帯が文面を持つので、ヘッダの一時表示（「保存しました」等）は残さない
         self.message = None;
@@ -700,8 +734,18 @@ impl EditState {
         true
     }
 
-    /// 競合が解けた（#1659。上書き・読み直し・外で元に戻された）。解けたら `true`
+    /// 競合が解けた（#1659。上書き・読み直し・外で元に戻された）。解けたら `true`。
+    ///
+    /// 解かないものが 2 つある（#1833）: リモートの競合（ローカルの写しの保存・監視では
+    /// 解けない = [`Self::clear_remote_conflict`]）と、読み直しを undo で戻している間
+    /// （監視が「基準と同じ」を見ても本文は外部変更より前の版のまま。保存・読み直し・
+    /// redo で `TextBuffer::reload_undone` が外れてから解ける）
     pub fn clear_conflict(&mut self) -> bool {
+        if self.conflict.is_some_and(|c| c.remote)
+            || (self.buffer.reload_undone() && !reload_undo_legacy())
+        {
+            return false;
+        }
         self.conflict_diff = None;
         if self.conflict.take().is_none() {
             return false;
@@ -710,6 +754,35 @@ impl EditState {
             self.save_status = None;
         }
         true
+    }
+
+    /// リモートへの書き戻しが通った（#1833）。リモートの競合を解く。解けたら `true`
+    pub fn clear_remote_conflict(&mut self) -> bool {
+        if !self.conflict.is_some_and(|c| c.remote) {
+            return false;
+        }
+        self.conflict = None;
+        self.conflict_diff = None;
+        if self.save_status == Some(SaveStatus::Conflict) {
+            self.save_status = None;
+        }
+        true
+    }
+
+    /// 読み直しを undo で戻したなら、自動保存を止めて知らせる（#1833）。知らせたら `true`。
+    ///
+    /// 戻した本文は外部変更より前の版で、基準はディスク（外部変更）と同じなので、自動保存が
+    /// 回ると**外部変更を黙って上書きする**（Issue の本体）。自動保存が有効なら外部変更の
+    /// 競合として記録する（帯・`conflict` の応答・回数は #1659 と同じ口。競合中は自動保存が
+    /// 止まる）。自動保存が無効なら何もしない（保存は利用者の明示の操作 = 既存の挙動のまま）。
+    ///
+    /// 呼ぶのは undo の後・自動保存を入れたとき・自動保存の直前（[`Self::autosave_due`] も
+    /// 同じ条件を見るので、ここを外しても黙って上書きはしない）
+    pub fn hold_autosave_if_reload_undone(&mut self) -> bool {
+        if !self.autosave || !self.buffer.reload_undone() || reload_undo_legacy() {
+            return false;
+        }
+        self.note_conflict(tako_core::DiskState::Changed)
     }
 
     /// 保存・読み直しの失敗を競合として読むなら、その状態（#1659）
@@ -825,12 +898,16 @@ impl EditState {
     /// タイマーまで回し、dispatch（CLI / MCP）の編集は保留に入ったまま誰も保存しなかった
     ///
     /// **外部変更の競合中は対象にしない**（#1659）。保存しても断られるだけなので、
-    /// 回すと 500ms ごとに同じ競合を知らせ続ける。利用者が 2 択を選ぶまで止める
+    /// 回すと 500ms ごとに同じ競合を知らせ続ける。利用者が 2 択を選ぶまで止める。
+    /// **読み直しを undo で戻している間も対象にしない**（#1833。保存は通ってしまい、
+    /// 外部変更を黙って上書きする = [`Self::hold_autosave_if_reload_undone`]）
     fn autosave_due(&self) -> bool {
         self.autosave
             && self.editing
             && self.dirty()
             && (self.conflict.is_none() || external_change_legacy())
+            // #1833: 読み直しを undo で戻した本文を書くと外部変更を黙って上書きする
+            && (!self.buffer.reload_undone() || reload_undo_legacy())
     }
 }
 
@@ -5106,6 +5183,129 @@ mod tests {
         assert_eq!(autosave_due([(&1u64, &edit)], &pending), vec![1]);
         assert!(edit.note_conflict(tako_core::DiskState::Changed));
         assert_eq!(edit.conflict.map(|c| c.notices), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1833: 読み直しを undo で戻したら、自動保存 ON なら止めて競合として 1 回知らせる。
+    /// 監視が「基準と同じ」を見ても解かず、読み直しをやり直す / 保存すると解ける
+    #[test]
+    fn issue1833_読み直しを戻すと自動保存を止めて知らせる() {
+        let dir = autosave_dir("reload-undo-1833");
+        let pending = std::collections::HashSet::new();
+        let mut edit = edit_session(&dir, "reload.txt");
+        let path = edit.buffer.path().to_path_buf();
+        edit.buffer.set_text("mine\n".into());
+        std::fs::write(&path, "external\n").unwrap();
+        edit.buffer.reload_from_disk().unwrap();
+        assert!(!edit.hold_autosave_if_reload_undone(), "戻していない");
+
+        // undo 1 回 = 読み直しを戻す。自動保存の対象から外れ、競合として 1 回だけ知らせる
+        assert!(edit.buffer.undo());
+        assert!(edit.dirty());
+        assert!(
+            autosave_due([(&1u64, &edit)], &pending).is_empty(),
+            "戻した本文を自動保存で書くと外部変更を黙って上書きする"
+        );
+        assert!(edit.hold_autosave_if_reload_undone());
+        assert_eq!(
+            edit.conflict,
+            Some(DiskConflict {
+                state: tako_core::DiskState::Changed,
+                notices: 1,
+                remote: false,
+            })
+        );
+        // undo をもう 1 回（読み直しの前の編集まで戻る）でも知らせ直さない・止まったまま
+        assert!(edit.buffer.undo());
+        assert!(!edit.hold_autosave_if_reload_undone());
+        assert_eq!(edit.conflict.map(|c| c.notices), Some(1));
+        // 監視が「基準と同じ」を見ても帯は消さない（本文は外部変更より前の版のまま）
+        assert_eq!(
+            edit.buffer.observe_disk(Some(b"external\n")),
+            tako_core::DiskState::Unchanged
+        );
+        assert!(!edit.clear_conflict());
+        assert!(edit.conflict.is_some());
+
+        // redo 2 回で読み直しをやり直すと印が外れ、解ける
+        assert!(edit.buffer.redo());
+        assert!(edit.buffer.redo());
+        assert!(!edit.buffer.reload_undone());
+        assert!(!edit.dirty());
+        assert!(edit.clear_conflict());
+
+        // 戻して明示の保存（上書き）をすると印が外れ、自動保存の対象へ戻る
+        assert!(edit.buffer.undo());
+        assert!(edit.hold_autosave_if_reload_undone());
+        edit.buffer.save_overwrite().unwrap();
+        assert!(edit.clear_conflict());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+        edit.buffer.set_text("more\n".into());
+        assert_eq!(autosave_due([(&1u64, &edit)], &pending), vec![1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1833: 自動保存 OFF なら読み直しを戻しても何もしない（明示の保存は従来どおり通る）。
+    /// 読み直しを含まない undo では自動保存は止まらない
+    #[test]
+    fn issue1833_自動保存offと読み直しの無いundoでは止めない() {
+        let dir = autosave_dir("reload-undo-off-1833");
+        let pending = std::collections::HashSet::new();
+        let mut edit = edit_session(&dir, "off.txt");
+        let path = edit.buffer.path().to_path_buf();
+        edit.autosave = false;
+        edit.buffer.set_text("mine\n".into());
+        std::fs::write(&path, "external\n").unwrap();
+        edit.buffer.reload_from_disk().unwrap();
+        assert!(edit.buffer.undo());
+        assert!(!edit.hold_autosave_if_reload_undone());
+        assert!(edit.conflict.is_none());
+        edit.buffer.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine\n");
+
+        // 外部変更の無い普通の undo
+        let mut plain = edit_session(&dir, "plain.txt");
+        plain.buffer.set_text("one\n".into());
+        plain.buffer.set_text("two\n".into());
+        assert!(plain.buffer.undo());
+        assert!(!plain.hold_autosave_if_reload_undone());
+        assert_eq!(autosave_due([(&1u64, &plain)], &pending), vec![1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1833: リモートの競合はローカルと同じ口（帯・回数・自動保存の停止）で、ローカルの写しの
+    /// 保存・監視（`clear_conflict`）では解けず、書き戻しが通ったときだけ解ける
+    #[test]
+    fn issue1833_リモートの競合は書き戻しが通るまで解けない() {
+        let dir = autosave_dir("remote-1833");
+        let pending = std::collections::HashSet::new();
+        let mut edit = edit_session(&dir, "remote.txt");
+        edit.buffer.set_text("mine\n".into());
+        assert!(edit.note_remote_conflict());
+        assert!(!edit.note_remote_conflict(), "同じ競合は 1 回だけ知らせる");
+        assert_eq!(
+            edit.conflict,
+            Some(DiskConflict {
+                state: tako_core::DiskState::Changed,
+                notices: 1,
+                remote: true,
+            })
+        );
+        assert_eq!(edit.save_status, Some(SaveStatus::Conflict));
+        assert!(
+            autosave_due([(&1u64, &edit)], &pending).is_empty(),
+            "競合中は自動保存の対象にしない"
+        );
+        assert!(!edit.clear_conflict(), "写しの保存・監視では解けない");
+        assert!(edit.conflict.is_some());
+        assert!(edit.clear_remote_conflict());
+        assert!(edit.conflict.is_none());
+        assert_eq!(edit.save_status, None);
+        assert!(!edit.clear_remote_conflict());
+        // ローカルの競合は書き戻しの成功では解かない
+        assert!(edit.note_conflict(tako_core::DiskState::Changed));
+        assert!(!edit.clear_remote_conflict());
+        assert!(edit.clear_conflict());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

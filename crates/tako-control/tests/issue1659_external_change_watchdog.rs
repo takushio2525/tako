@@ -212,11 +212,12 @@ fn 競合中は自動保存を止める() {
     );
 }
 
-/// 2: 同じ競合を何度検知しても、知らせるのは 1 回だけ
+/// 2: 同じ競合を何度検知しても、知らせるのは 1 回だけ。
+///    書き手の本体はローカル / リモート（#1833）で 1 つの `note_conflict_on`
 #[test]
 fn 競合は新しく分かったときだけ知らせる() {
     let preview = source(PREVIEW);
-    let note = preview.require("note_conflict");
+    let note = preview.require("note_conflict_on");
     note.must_contain(
         "c.state == state",
         "既に同じ状態の競合を記録しているかを見ていない = 検知のたびに知らせ直す",
@@ -250,9 +251,9 @@ fn 競合の記録は1か所() {
             }
         }
     }
-    // 直書きしてよいのは note_conflict の本体の中だけ
+    // 直書きしてよいのは書き手の本体（`note_conflict_on`。#1833 でローカル / リモートを 1 つに）の中だけ
     let preview = source(PREVIEW);
-    let note = preview.require("note_conflict");
+    let note = preview.require("note_conflict_on");
     let inside = note.line..=note.line + note.text.lines().count();
     let outside: Vec<String> = offenders
         .iter()

@@ -545,7 +545,8 @@ impl TextEditError {
 pub enum DiskState {
     /// 基準のまま（外から変わっていない）
     Unchanged,
-    /// 外から書き換わった（中身が基準と違う）
+    /// 外から書き換わった（中身が基準と違う。読み直しを undo で戻した本文も
+    /// ディスクの外部変更より前の版なのでこちら = #1833）
     Changed,
     /// 外から消された
     Deleted,
@@ -587,6 +588,11 @@ enum EditKind {
     /// 選択の差し替え・範囲置換・全置換・全文差し替え。**まとめない**
     /// （1 回の操作として意味が閉じているので、まとめると戻しすぎになる）
     Replace,
+    /// ディスクからの読み直し（#1659 / #1833）。**まとめない**。
+    ///
+    /// 印を分けるのは、これを undo すると本文が「ディスクに載った外部変更より前の版」へ
+    /// 戻るため（[`TextBuffer::reload_undone`]。そのまま保存すると外部変更を上書きする）
+    Reload,
 }
 
 /// undo/redo 1 件ぶんの差分（#1651）。
@@ -1272,6 +1278,13 @@ pub struct TextBuffer {
     auto_close: bool,
     /// 自動で入れた閉じ括弧（#1759）。飛び越し（type-over）と `(|)` の ⌫ の対象
     auto_pairs: auto_close::AutoPairs,
+    /// 読み直し（[`EditKind::Reload`]）の差分を undo で戻したまま、やり直していない数（#1833）。
+    ///
+    /// 0 でない間の本文は**ディスクに載った外部変更より前の版**で、基準（`baseline`）は
+    /// 読み直した外部変更のまま。通常の保存は競合なく通る（= 外部変更を上書きする）ので、
+    /// 自動保存はこの間は止める（GUI の `EditState`）。0 へ戻るのは、その読み直しを redo した・
+    /// 保存した・もう一度読み直した・外で本文と同じ中身に書かれたとき
+    reloads_undone: usize,
 }
 
 /// 大文字小文字を区別しない検索のための小文字写しの置き場（#1653）。
@@ -1332,6 +1345,7 @@ impl TextBuffer {
             brackets: brackets::BracketCache::default(),
             auto_close: true,
             auto_pairs: auto_close::AutoPairs::default(),
+            reloads_undone: 0,
         })
     }
 
@@ -1357,6 +1371,7 @@ impl TextBuffer {
             brackets: brackets::BracketCache::default(),
             auto_close: true,
             auto_pairs: auto_close::AutoPairs::default(),
+            reloads_undone: 0,
         }
     }
 
@@ -2220,6 +2235,10 @@ impl TextBuffer {
         self.cursor = delta.cursor_before;
         self.anchor = delta.anchor_before;
         self.line_ending = delta.line_ending_before;
+        // 読み直しを戻した = 本文が外部変更より前の版へ戻った（#1833）
+        if delta.kind == EditKind::Reload {
+            self.reloads_undone = self.reloads_undone.saturating_add(1);
+        }
         self.redo_stack.push(delta);
         self.seal_undo_group();
         self.goal_column = None;
@@ -2237,6 +2256,10 @@ impl TextBuffer {
         self.cursor = delta.cursor_after;
         self.anchor = delta.anchor_after;
         self.line_ending = delta.line_ending_after;
+        // 戻した読み直しをやり直した（#1833）
+        if delta.kind == EditKind::Reload {
+            self.reloads_undone = self.reloads_undone.saturating_sub(1);
+        }
         self.undo_stack.push_back(delta);
         self.seal_undo_group();
         self.goal_column = None;
@@ -2830,6 +2853,7 @@ impl TextBuffer {
                     if current == self.text.as_bytes() {
                         // 外で書かれた中身が自分の本文と同じ。書き直す必要も競合も無い
                         self.baseline = current;
+                        self.reloads_undone = 0;
                         self.seal_undo_group();
                         return Ok(());
                     }
@@ -2846,6 +2870,8 @@ impl TextBuffer {
         }
         write_file(&self.path, self.text.as_bytes()).map_err(TextEditError::Write)?;
         self.baseline = self.text.as_bytes().to_vec();
+        // 書いた本文がディスクの中身 = 読み直しを戻した版でも、もう外部変更より前ではない（#1833）
+        self.reloads_undone = 0;
         // 保存したところが undo の切れ目（#1651）。
         // 「保存した姿」まで戻せる位置が履歴に残る
         self.seal_undo_group();
@@ -2882,9 +2908,21 @@ impl TextBuffer {
         }
         if current == self.text.as_bytes() {
             self.baseline = current.to_vec();
+            self.reloads_undone = 0;
             return DiskState::Unchanged;
         }
         DiskState::Changed
+    }
+
+    /// 本文が、読み直しを undo で取り消した版のままか（#1833）。
+    ///
+    /// `true` の間、ディスクには読み直した外部変更が載っていて、本文はそれより前の版。
+    /// 基準はディスクと同じなので**通常の保存は競合なく通り、外部変更を上書きする**
+    /// （明示の保存はそれを選んだ操作として通す）。自動保存はこの間は回さない
+    /// （GUI の `EditState::autosave_due`）。読み直しを redo する・保存する・もう一度
+    /// 読み直す・外で本文と同じ中身に書かれると `false` へ戻る
+    pub fn reload_undone(&self) -> bool {
+        self.reloads_undone > 0
     }
 
     /// ディスクから読み直す（#1659。`tako edit reload`）。**編集中の変更は捨てる**が、
@@ -2896,7 +2934,9 @@ impl TextBuffer {
     /// 読み直した中身から取り直す（`set_text` と同じ考え方。#1650 / #1654）。
     ///
     /// 消されていれば [`TextEditError::ExternalDeleted`]、上限を超えた・バイナリになった
-    /// なら [`TextEditError::NotEditable`] で、**どちらも本文を 1 バイトも触らない**
+    /// なら [`TextEditError::NotEditable`] で、**どちらも本文を 1 バイトも触らない**。
+    ///
+    /// 読み直しを undo で戻すと本文は外部変更より前の版になる（[`Self::reload_undone`]。#1833）
     pub fn reload_from_disk(&mut self) -> Result<(), TextEditError> {
         let bytes = self.read_disk()?.ok_or(TextEditError::ExternalDeleted)?;
         self.reload_from(bytes)
@@ -2929,12 +2969,15 @@ impl TextBuffer {
                 splices: &[Splice::new(range, replacement)],
                 cursor,
                 anchor: None,
-                kind: EditKind::Replace,
+                // 印を分ける: これを undo したら外部変更より前の版へ戻る（#1833）
+                kind: EditKind::Reload,
                 line_ending: Some(line_ending),
             });
             self.seal_undo_group();
         }
         self.baseline = bytes;
+        // 本文 = ディスクの中身。前に戻した読み直しはもう効いていない（#1833）
+        self.reloads_undone = 0;
         Ok(())
     }
 
@@ -2946,7 +2989,8 @@ impl TextBuffer {
         let current = self.read_disk()?;
         let state = match &current {
             None => DiskState::Deleted,
-            Some(bytes) if *bytes == self.baseline => DiskState::Unchanged,
+            // 読み直しを戻した本文は外部変更より前の版（#1833）。基準と同じでも変わっている側
+            Some(bytes) if *bytes == self.baseline && !self.reload_undone() => DiskState::Unchanged,
             Some(_) => DiskState::Changed,
         };
         let disk = current
@@ -4041,6 +4085,100 @@ mod tests {
             Err(TextEditError::InvalidUtf8)
         ));
         assert_eq!(buffer.text(), "mine text");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// #1833: 読み直しを undo で戻した本文は外部変更より前の版。印は undo / redo / 保存 /
+    /// 読み直し / 外で同じ中身にされたときに付け外しされる
+    #[test]
+    fn 読み直しを戻したかはundoとredoと保存と読み直しで付け外しされる() {
+        let path = path("reload-undone-1833");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        buffer.set_cursor(0, false);
+        buffer.insert("mine ");
+        std::fs::write(&path, "a\nexternal\n").unwrap();
+        buffer.reload_from_disk().unwrap();
+        assert!(!buffer.reload_undone(), "読み直した直後はディスクと同じ");
+        assert_eq!(buffer.disk_diff().unwrap().state, DiskState::Unchanged);
+
+        // 1 回目の undo = 読み直しを戻す。2 回目 = その前の自分の打鍵まで戻る（印は残る）
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "mine a\nb\n");
+        assert!(buffer.reload_undone());
+        assert_eq!(
+            buffer.disk_diff().unwrap().state,
+            DiskState::Changed,
+            "基準と同じでも本文は外部変更より前の版 = 変わっている側"
+        );
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "a\nb\n");
+        assert!(buffer.reload_undone(), "読み直しより前へ戻っても印は残る");
+        // 監視が同じ中身（基準）を見ても印は外れない
+        assert_eq!(
+            buffer.observe_disk(Some(b"a\nexternal\n")),
+            DiskState::Unchanged
+        );
+        assert!(buffer.reload_undone());
+
+        // redo 2 回で読み直しをやり直すと外れる
+        assert!(buffer.redo());
+        assert!(buffer.reload_undone(), "まだ読み直しはやり直していない");
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), "a\nexternal\n");
+        assert!(!buffer.reload_undone());
+
+        // 戻して明示の保存をすると外れる（保存は外部変更を上書きする選択として通る）
+        assert!(buffer.undo());
+        assert!(buffer.reload_undone());
+        buffer.save().unwrap();
+        assert!(!buffer.reload_undone());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mine a\nb\n");
+
+        // 戻して読み直すと外れる
+        std::fs::write(&path, "again\n").unwrap();
+        buffer.reload_from_disk().unwrap();
+        assert!(buffer.undo());
+        assert!(buffer.reload_undone());
+        buffer.reload_from_disk().unwrap();
+        assert!(!buffer.reload_undone());
+
+        // 戻した後に外で本文と同じ中身に書かれると外れる（どちらを採っても同じ）
+        assert!(buffer.undo());
+        assert!(buffer.reload_undone());
+        let mine = buffer.text().to_string();
+        assert_eq!(
+            buffer.observe_disk(Some(mine.as_bytes())),
+            DiskState::Unchanged
+        );
+        assert!(!buffer.reload_undone());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// #1833: 読み直しを含まない普通の undo / redo では印は付かない
+    #[test]
+    fn 読み直しを含まないundoでは印は付かない() {
+        let path = path("plain-undo-1833");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, "x\n").unwrap();
+        let mut buffer = TextBuffer::open(&path).unwrap();
+        buffer.insert("one ");
+        buffer.set_cursor(0, false);
+        buffer.insert("two ");
+        assert!(buffer.undo());
+        assert!(buffer.undo());
+        assert!(!buffer.reload_undone());
+        assert!(buffer.redo());
+        assert!(!buffer.reload_undone());
+        // 中身が同じ読み直しは履歴を積まない = 戻す読み直しも無い
+        std::fs::write(&path, buffer.text()).unwrap();
+        buffer.reload_from_disk().unwrap();
+        assert!(buffer.undo());
+        assert!(
+            !buffer.reload_undone(),
+            "戻ったのは打鍵（読み直しは積まれていない）"
+        );
         let _ = std::fs::remove_file(path);
     }
 

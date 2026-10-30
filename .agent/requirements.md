@@ -2218,7 +2218,8 @@ FR-3.5 実装メモ（2026-07-12、#126）:
   基準へ取り込む**。消されたファイルは `TextEditError::ExternalDeleted`（`DiskState::Deleted`）で
   書き換わりと区別する（通常の保存は作り直さない）
   - **上書き**: `TextBuffer::save_overwrite`（dispatch `PreviewSave { force: true }` / CLI
-    `tako edit save --force` / MCP `tako_preview_save` の `action=overwrite` / 帯の「上書き保存」）。
+    `tako edit save --force`（別名 `--overwrite` = MCP と同じ綴り。#1833）/ MCP `tako_preview_save` の
+    `action=overwrite` / 帯の「上書き保存」）。
     消されていれば作り直す（権限は新規ファイルの既定）。読み取り専用は上書きしない。
     リモート由来（FR-3.24.2）は `force` を `remote_fs::save_file` へそのまま渡す。
     `force: false` は wire に現れない（旧 GUI とバイト一致）。スマホの保存（FR-6.16）は常に false
@@ -2227,6 +2228,15 @@ FR-3.5 実装メモ（2026-07-12、#126）:
     （共通の先頭・末尾を削った中央 = `changed_span`）で、`apply_edit` を通る 1 回の編集として
     積むので **undo 1 回で自分の変更へ戻せる**（戻した変更は基準がディスクの中身なので競合せずに
     保存できる）。カーソルは同じ場所に残し、改行コードとインデントは読み直した中身から取り直す。
+    **読み直しを undo で戻した本文は外部変更より前の版**（#1833）: 読み直しの差分は
+    `EditKind::Reload` の印を持ち、`TextBuffer::reload_undone` が「戻したまま redo していない」間
+    `true`（保存・もう一度の読み直し・外で本文と同じ中身にされると外れる）。この間は
+    **自動保存の対象にしない**（`autosave_due`。修正前は戻した直後の自動保存が外部変更を黙って
+    上書きした = 監視が黙って追従した後の ⌘Z でも同じ）。自動保存 ON なら undo の時点（と自動保存を
+    入れた時点）で競合（`DiskState::Changed`）として記録し、帯・`conflict`・`notices` で知らせる。
+    自動保存 OFF なら何もしない（明示の保存は外部変更を上書きする選択として従来どおり通る）。
+    redo で読み直しをやり直して本文がディスクと同じに戻れば解ける。`disk_diff` の `state` も
+    この間は `changed`。A/B は `TAKO_1833_LEGACY=1`
     上限（#1660）超過・バイナリ・非 UTF-8・消された・リモート由来（写しを読み直しても最新に
     ならない）は本文を触らずに断る
   - **差分**: `TextBuffer::disk_diff` → `tako_core::text_diff::diff_lines`（`PreviewDiff` /
@@ -2235,12 +2245,23 @@ FR-3.5 実装メモ（2026-07-12、#126）:
     比べる（5 万行・2.8 MB で 2 行違い = debug ビルドの `tako edit diff` 往復込みで 30 ms）。編集距離 1,000 超は中央を 1 塊にした差分へ
     落とし（`approximate`）、出力は 5,000 行で打ち切る（`truncated`。件数は全体を数える）。
     応答の `diff` は `state` / `identical` / `added` / `removed` / `truncated` / `approximate` / `unified`
-  - **競合の状態**: `EditState::conflict`（`note_conflict` / `clear_conflict` の 1 か所で書く）。
+  - **リモートの競合（#1833）**: リモート由来（FR-3.24.2）の書き戻しが `RemoteErrorKind::Conflict` で
+    断られたら `EditState::note_remote_conflict` でローカルと同じ口へ記録する（帯・`conflict` の応答・
+    `notices`・自動保存の停止。応答の `conflict` に `remote: true`）。ローカルの写しは tako 自身が
+    書くので、写しの保存・監視（`clear_conflict`）では解けず、書き戻しが通ったとき
+    （`clear_remote_conflict`）だけ解ける。帯のボタンは上書き保存だけ（差分・読み直しはローカルの
+    写しが相手でリモートの今の中身を見ない）で、上書きは押し出しにも `force` を渡す。保存の断りには
+    ローカルの抜け方（`RecoveryHint`）を添えない（リモートの断りの文が強制保存を案内する）。
+    リモートの中身を採るのは `remote-folder open-file` の取り直し（写しの保存は済んでいて未保存の
+    変更が無いので、表示を差し替えて編集セッションごと競合も閉じる）。実経路は
+    `scripts/test-external-change-1833.sh`（偽の ssh / sftp）
+  - **競合の状態**: `EditState::conflict`（`note_conflict` / `note_remote_conflict` /
+    `clear_conflict` / `clear_remote_conflict`。書き手は `note_conflict_on` の 1 か所）。
     **知らせるのは新しく分かったときだけ**（同じ状態は何度検知しても `notices` を増やさない。
     書き換わった → 消されたのように状態が変わったらもう 1 回）。**競合中は自動保存の対象にしない**
     （`autosave_due`。500ms 待った後の `run_autosave` も見る）。解けるのは上書き・読み直しの成功と、
     監視が「外で元へ戻された / 自分と同じ中身に書かれた」を見たとき。編集系の応答すべてに
-    `conflict`（`state` / `notices` / `autosave_paused`）が載り（`preview_edit_reply` の 1 実装。
+    `conflict`（`state` / `notices` / `autosave_paused`。リモートなら `remote: true`）が載り（`preview_edit_reply` の 1 実装。
     競合していなければキーごと無い）、保存の失敗には抜け方（`Reason::RecoveryHint`。表示言語に従う = #2365）が添わる
   - **GUI の帯**: タイトルバーの直下に文面と「差分 / 上書き保存（消されていれば作り直して保存）/
     ディスクから読み直す」を出す。印は GPUI の矩形（絵文字を使わない）。差分はチェンジログと同じ

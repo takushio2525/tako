@@ -274,6 +274,13 @@ pub fn conflict_deleted() -> &'static str {
         "The file was deleted on disk. Your edits are kept"
     )
 }
+/// 帯の文面（リモートへの書き戻しが断られた。#1833）。ボタンは上書き保存だけ
+pub fn conflict_remote_changed() -> &'static str {
+    tr!(
+        "リモートのファイルが開いた後に変更されたため書き戻していません。編集中の内容は保持しています",
+        "The remote file changed since you opened it, so it was not overwritten. Your edits are kept"
+    )
+}
 /// 自動保存 ON のときだけ添える（競合中は止めている）
 pub fn conflict_autosave_paused() -> &'static str {
     tr!("自動保存は停止中", "Autosave paused")
