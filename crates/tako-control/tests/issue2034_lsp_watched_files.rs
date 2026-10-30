@@ -737,7 +737,8 @@ fn 実の_rust_analyzer_でリンクを通る根でも整形後の行で返る()
             got,
             status(&manager)["file_watch"]["active"].clone(),
         ));
-        manager.stop(None);
+        // 置き場（この回の scratch）を手放す前に止め終わるまで待つ（`stop` は待たない = #2555）
+        manager.shutdown_all(Duration::from_secs(2));
     }
     eprintln!("実の rust-analyzer（legacy, util.rs の行, 監視）: {lines:?}");
     assert_eq!(lines[0].1, Some(3), "新腕: 整形後の行（{lines:?}）");

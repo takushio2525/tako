@@ -15,7 +15,6 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,21 +25,22 @@ use tako_control::lsp::{DocLink, Launch, LspConfig, LspManager};
 use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
+use tako_core::test_residue::ScratchDir;
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
-/// 使い捨ての置き場（固定名を使わない = 並行する cargo test 同士で消し合わない。#1666）
-struct Scratch(PathBuf);
+/// 使い捨ての置き場（固定名を使わない = 並行する cargo test 同士で消し合わない。#1666）。
+/// 置き場は #1312 の `ScratchDir`（`tako-test-scratch-<pid>/` の下）: 消し損ねても終了時の後始末と
+/// `tako test-residue` が拾う（#2555 の前は TMPDIR 直下の `tako-2035-*` で、どちらにも載らなかった）。
+///
+/// 偽サーバを起こしたテストは**`shutdown_all` で止めてから**置き場を手放す。`stop` は止め終わるのを
+/// 待たずに返る（shutdown → exit は別スレッド）ので、その直後に置き場を消すと、偽サーバが `exit` を
+/// 受けて `received.jsonl` を作り直し、置き場が消え残る（#2555。番犬 `issue2555_lsp_stop_then_scope_end_watchdog`）
+struct Scratch(ScratchDir);
 
 impl Scratch {
     fn new(label: &str) -> Self {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "tako-2035-{label}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = ScratchDir::new(&format!("2035-{label}"));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("data")).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
@@ -61,12 +61,6 @@ impl Scratch {
 
     fn data_dir(&self) -> PathBuf {
         self.0.join("data")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -170,7 +164,7 @@ fn rust_analyzer_へは既定で_target_dir_を分ける指定を送る() {
     assert_eq!(row["running"][0]["sent"], sent);
     assert_eq!(row["running"][0]["current"], json!(true));
     assert_eq!(report["legacy"], json!(false));
-    manager.stop(None);
+    manager.shutdown_all(Duration::from_secs(2));
 }
 
 /// 既定を持たない行（pyright）へは何も送らない（変更前と同じ initialize）
@@ -184,7 +178,7 @@ fn 既定を持たないサーバへは送らない() {
     let report = lsp_server_action(Some(&manager), "options", Some("pyright"), None).unwrap();
     assert_eq!(report["servers"][0]["options"], json!([]));
     assert_eq!(report["servers"][0]["effective"], Value::Null);
-    manager.stop(None);
+    manager.shutdown_all(Duration::from_secs(2));
 }
 
 /// 受け入れ条件 3: 上書きは `options` の `set` で書き、動いているサーバには次の起動から効く
@@ -256,7 +250,7 @@ fn 上書きは次の起動から効き_null_で既定へ戻る() {
         nth_init_options(&scratch.log(), 3),
         json!({"cargo": {"targetDir": true}})
     );
-    manager.stop(None);
+    manager.shutdown_all(Duration::from_secs(2));
 }
 
 /// 上書きの入口の検査（CLI / MCP / dispatch で同じ 1 実装）: サーバの ID が要る・知らない ID・
@@ -324,7 +318,7 @@ fn 本番の口で送った値を出す子プロセス() {
     let _link = open(&manager, &file);
     let sent = nth_init_options(&log, 1);
     println!("TAKO_2035_PROBE sent={sent}");
-    manager.stop(None);
+    manager.shutdown_all(Duration::from_secs(2));
 }
 
 /// `vars` だけを立てた子プロセスで、本番の口が送った初期化オプションを測る
