@@ -4568,6 +4568,8 @@ main で既にアーカイブ済みのエントリが `progress.md` へ黙って
 - CI の番犬 `crates/tako-control/tests/issue1645_progress_revival_watchdog.rs` が
   `file:line` で落とし、`tako context-budget` / MCP `tako_context_budget` の
   violations にも同じ違反が出る。**rebase 後の目視は補助**
+- `tako master` / `tako setup` の起動前 1 行も予算超過とは分けて
+  「作業ログに rebase で戻った・重複したエントリ: N 件（fix では直らない）」と出す（#1715）
 - 直し方は 2 ファイルの復元:
   `git checkout origin/main -- .agent/progress.md .agent/progress-archive.md` で main の状態へ戻し、
   自分の 1 件を書き直してから push する（どちらの版が正かは機械には決まらないので自動では直さない）

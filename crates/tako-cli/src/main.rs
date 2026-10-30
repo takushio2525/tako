@@ -7557,11 +7557,10 @@ fn print_context_budget_check(out: &serde_json::Value) {
         println!("\n予算内");
         return;
     }
-    let fixable = out["fixable"].as_u64().unwrap_or(0);
-    println!("\n超過: {violations} 件（自動で直せる: {fixable} 件）");
-    if fixable > 0 {
-        // 既定値で済む引数は付けない（#322 の最簡形）
-        println!("いま直す: tako context-budget fix");
+    // `tako master` の起動前 1 行・MCP の応答と同じ 1 行（#1715。予算超過と
+    // 作業ログの復活・重複を言い分け、自動で直せるときだけ最簡形の `fix` を案内する = #322）
+    if let Some(line) = out["startup_line"].as_str() {
+        println!("\n{line}");
     }
     print_context_budget_proposals(out);
 }
