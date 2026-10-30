@@ -964,7 +964,10 @@ AppleSystemPolicy が読めずに 1 本ずつ拒否する。記録されるパ�
   （A/B は `TAKO_2513_LEGACY=1`・番犬 `crates/tako-control/tests/issue2513_tailscale_spawn_path_watchdog.rs`）
 - 再現は実行中のプロセスを本物の `install_bundle_in_place` で差し替え、
   `log show --predicate 'eventMessage CONTAINS "<作業 dir>"'` の `would not allow process` を数える
-  （絶対パスの spawn と PATH で当たった 1 回は記録されない・差し替えない対照は 0 件）
+  （絶対パスの spawn と PATH で当たった 1 回は記録されない・差し替えない対照は 0 件）。
+  **差し替えは対象のプロセスの起動から 1 秒以上置く**（#2538 の実測: 起動の 0.3 秒後に差し替えたプロセスは
+  その後の空振りが 1 件も拒否されず、1 秒後なら空振りの数だけ拒否される = 起動の直後に差し替える再現は
+  修正前でも 0 件の偽の対照になる）
 - **GUI も同じ**（#2519）: git / tmux の場所の解決（`bin_resolve`）が PATH で当たった名前を素の名前のまま
   持っていたので、2 秒ごとの定期更新（tmux 一覧・ファイルツリー・git・ペインログ）が install から GUI の
   再起動までの間 **876〜1,448 件 / install** の拒否を積んだ（本番の GUI の PATH は `/opt/homebrew/bin` が
