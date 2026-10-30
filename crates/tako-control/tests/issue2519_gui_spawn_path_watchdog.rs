@@ -134,17 +134,9 @@ fn bare_spawns(src: &str) -> Vec<(usize, String)> {
     out
 }
 
-/// `fn 名前(` の行（字下げ・`pub` / `pub(crate)` を問わない）
+/// `fn 名前(` の行（字下げ・可視性・前置キーワードを問わない。読み方は共有の 1 実装 = #1496）
 fn is_fn_line(line: &str, name: &str) -> bool {
-    let trimmed = line.trim_start();
-    let head = trimmed
-        .strip_prefix("pub(crate) ")
-        .or_else(|| trimmed.strip_prefix("pub(super) "))
-        .or_else(|| trimmed.strip_prefix("pub "))
-        .unwrap_or(trimmed);
-    head.strip_prefix("fn ")
-        .and_then(|r| r.strip_prefix(name))
-        .is_some_and(|r| r.starts_with(['(', '<']))
+    tako_core::source_scan::fn_head_name(line) == Some(name)
 }
 
 /// 関数の窓（宣言行の 1-based 行番号と、窓のバイト範囲）。終わりは宣言行と同じ字下げの `}`
@@ -446,6 +438,7 @@ fn fixture(tag: &str) -> Fixture {
 /// 子の env を本番の解決の入口へ揃える（run_alone! の子には他のテストが居ない）
 #[cfg(unix)]
 fn isolate_env(fx: &Fixture) {
+    tako_core::test_child::assert_alone("isolate_env");
     std::env::set_var("PATH", &fx.path);
     for key in [
         "TAKO_GIT_BIN",
