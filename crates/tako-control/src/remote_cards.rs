@@ -401,9 +401,10 @@ pub fn classify_error(status: u16, message: &str) -> (u16, &'static str) {
     if tako_core::CommandCardError::says_still_running(message) {
         return (409, "still_running");
     }
-    // 「見つからない」は表示言語で日英どちらにもなる（#1762）ので、読み方は 1 実装を通す
+    // 「見つからない」「表示中のカードが無い」は表示言語で日英どちらにもなる（#1762 / #2365）ので、
+    // 読み方は 1 実装を通す
     if crate::dispatch::DispatchError::says_not_found(message)
-        || message.contains("表示中のコマンドカードが無い")
+        || crate::dispatch::Reason::says_no_command_card(message)
     {
         return (404, "not_found");
     }
@@ -503,6 +504,9 @@ mod tests {
             assert_eq!(classify_error(400, &gone), (404, "not_found"), "{gone}");
             let range = C::IndexOutOfRange { index: 5, len: 1 }.text_in(lang);
             assert_eq!(classify_error(400, &range), (400, "rejected"), "{range}");
+            // dispatch の「このペインに表示中のコマンドカードが無い」も日英とも 404
+            let none = crate::dispatch::Reason::NoCardOnPane.text_in(lang);
+            assert_eq!(classify_error(400, &none), (404, "not_found"), "{none}");
         }
         assert_eq!(
             classify_error(400, "このペインに表示中のコマンドカードが無い"),

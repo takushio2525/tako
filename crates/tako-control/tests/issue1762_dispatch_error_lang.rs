@@ -763,9 +763,75 @@ fn reason_index(r: &Reason) -> usize {
         Reason::TmuxResizeShape => 241,
         Reason::NoTmuxSessionOnPane(_) => 242,
         Reason::TmuxSessionNotFound { .. } => 243,
+        // #2365 の続き: ジャンプ履歴・LSP・ワークスペース横断検索
+        Reason::JumpNoEarlier => 244,
+        Reason::JumpNoLater => 245,
+        Reason::ChoiceOneBased => 246,
+        Reason::ColumnNotCharBoundary { .. } => 247,
+        Reason::ChoiceOutsideTargets { .. } => 248,
+        Reason::ChoiceOutsideItems { .. } => 249,
+        Reason::LimitAtLeastOneCandidate => 250,
+        Reason::ItemNeedsResponseId => 251,
+        Reason::LspSetOnlyWithOptions => 252,
+        Reason::UnknownLspServer { .. } => 253,
+        Reason::WorkspaceSearchUnavailable => 254,
+        Reason::WorkspaceSearchNeedsQuery => 255,
+        Reason::RelativePathNoBase(_) => 256,
+        Reason::SearchRootsHomeOnly => 257,
+        Reason::OpenNeedsItem => 258,
+        Reason::NoShownSearchResults => 259,
+        Reason::ItemOutsideResults { .. } => 260,
+        // #2365 の続き: 変更履歴
+        Reason::ChangelogFileChanged => 261,
+        Reason::ChangelogNoRepo => 262,
+        Reason::ChangelogNoPath => 263,
+        Reason::DiffFileChanged => 264,
+        Reason::DiffChangelogChanged(_) => 265,
+        Reason::DiffChangelogReplaced => 266,
+        // #2365 の続き: リモートフォルダ・config share・scrollback
+        Reason::KeyNeeded(_) => 267,
+        Reason::RemoteFolderNotOpen(_) => 268,
+        Reason::NoPendingPush => 269,
+        Reason::ConfigShareLinkNeedsTarget => 270,
+        Reason::NoVesselForHistory(_) => 271,
+        // #2365 の続き: コマンドカード・Code Runner
+        Reason::CardsNeedGui => 272,
+        Reason::NoCardOnPane => 273,
+        Reason::ClipboardNeedsGui => 274,
+        Reason::RunConfigNeedsPath => 275,
+        Reason::SaveBeforeRunFailed { .. } => 276,
+        Reason::FileUnreadable { .. } => 277,
+        Reason::FileReadError { .. } => 278,
+        // #2365 の続き: 先取りの答えが無かった断り・git・tmux・動画・ウィンドウ・引き継ぎ
+        Reason::AgentCliUnchecked(_) => 279,
+        Reason::GitConflictUnchecked => 280,
+        Reason::TmuxSessionUnchecked => 281,
+        Reason::NoConflict => 282,
+        Reason::ServersWithSocket(_) => 283,
+        Reason::NotVideoPane => 284,
+        Reason::WindowGeometryInvalid(_) => 285,
+        Reason::ProfileCwdBroken { .. } => 286,
+        // #2365 の続き: ファイルツリー
+        Reason::NotAbsolutePath => 287,
+        Reason::FolderNotPinned(_) => 288,
+        Reason::OneOfReceived { .. } => 289,
+        Reason::TreeOnlyActiveTab { .. } => 290,
+        Reason::FileTreeClosed => 291,
+        Reason::TreePathWithKey => 292,
+        Reason::TreeRowNotVisible(_) => 293,
+        Reason::TreeNoSelection => 294,
+        // #2365 の続き: supervisor・ledger・セッション再起動
+        Reason::SupervisorModeValue => 295,
+        Reason::SupervisorAction(_) => 296,
+        Reason::LedgerPruneNeedsProject => 297,
+        Reason::LedgerAction(_) => 298,
+        Reason::RestartModeInvalid { .. } => 299,
+        Reason::ResumeCommandUnbuildable { .. } => 300,
+        Reason::ResumeFilesUnwritable(_) => 301,
+        Reason::AgentTerminateFailed { .. } => 302,
     }
 }
-const REASON_VARIANTS: usize = 244;
+const REASON_VARIANTS: usize = 303;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1202,6 +1268,110 @@ fn reason_samples() -> Vec<Reason> {
             session: "work".into(),
             socket: None,
         },
+        // #2365 の続き: ジャンプ履歴・LSP・ワークスペース横断検索
+        Reason::JumpNoEarlier,
+        Reason::JumpNoLater,
+        Reason::ChoiceOneBased,
+        Reason::ColumnNotCharBoundary {
+            column: 3,
+            line: 2,
+            len: 7,
+        },
+        Reason::ChoiceOutsideTargets {
+            choice: 4,
+            count: 2,
+        },
+        Reason::ChoiceOutsideItems {
+            choice: 9,
+            total: 5,
+        },
+        Reason::LimitAtLeastOneCandidate,
+        Reason::ItemNeedsResponseId,
+        Reason::LspSetOnlyWithOptions,
+        Reason::UnknownLspServer {
+            name: "nope".into(),
+            known: "rust-analyzer / pyright".into(),
+        },
+        Reason::WorkspaceSearchUnavailable,
+        Reason::WorkspaceSearchNeedsQuery,
+        Reason::RelativePathNoBase("src".into()),
+        Reason::SearchRootsHomeOnly,
+        Reason::OpenNeedsItem,
+        Reason::NoShownSearchResults,
+        Reason::ItemOutsideResults { item: 8, total: 3 },
+        // #2365 の続き: 変更履歴
+        Reason::ChangelogFileChanged,
+        Reason::ChangelogNoRepo,
+        Reason::ChangelogNoPath,
+        Reason::DiffFileChanged,
+        Reason::DiffChangelogChanged("unknown commit abc123".into()),
+        Reason::DiffChangelogReplaced,
+        // #2365 の続き: リモートフォルダ・config share・scrollback
+        Reason::KeyNeeded("host"),
+        Reason::RemoteFolderNotOpen(Some("devbox:/srv/app".into())),
+        Reason::NoPendingPush,
+        Reason::ConfigShareLinkNeedsTarget,
+        Reason::NoVesselForHistory(9),
+        // #2365 の続き: コマンドカード・Code Runner
+        Reason::CardsNeedGui,
+        Reason::NoCardOnPane,
+        Reason::ClipboardNeedsGui,
+        Reason::RunConfigNeedsPath,
+        Reason::SaveBeforeRunFailed {
+            pane: 6,
+            error: "Read-only file system (os error 30)".into(),
+        },
+        Reason::FileUnreadable {
+            path: "/tmp/x.py".into(),
+            error: "No such file or directory (os error 2)".into(),
+        },
+        Reason::FileReadError {
+            path: "/tmp/x.py".into(),
+            error: "Is a directory (os error 21)".into(),
+        },
+        // #2365 の続き: 先取りの答えが無かった断り・git・tmux・動画・ウィンドウ・引き継ぎ
+        Reason::AgentCliUnchecked("codex"),
+        Reason::GitConflictUnchecked,
+        Reason::TmuxSessionUnchecked,
+        Reason::NoConflict,
+        Reason::ServersWithSocket("tako-x".into()),
+        Reason::NotVideoPane,
+        Reason::WindowGeometryInvalid("x is not a number".into()),
+        Reason::ProfileCwdBroken {
+            error: "cwd does not exist: /tmp/gone".into(),
+            profile: "default".into(),
+        },
+        // #2365 の続き: ファイルツリー
+        Reason::NotAbsolutePath,
+        Reason::FolderNotPinned("/tmp/a".into()),
+        Reason::OneOfReceived {
+            key: "action",
+            allowed: "add / remove".into(),
+            got: "bogus".into(),
+        },
+        Reason::TreeOnlyActiveTab { active: 1, tab: 2 },
+        Reason::FileTreeClosed,
+        Reason::TreePathWithKey,
+        Reason::TreeRowNotVisible("/tmp/a/b.rs".into()),
+        Reason::TreeNoSelection,
+        // #2365 の続き: supervisor・ledger・セッション再起動
+        Reason::SupervisorModeValue,
+        Reason::SupervisorAction("bogus".into()),
+        Reason::LedgerPruneNeedsProject,
+        Reason::LedgerAction("bogus".into()),
+        Reason::RestartModeInvalid {
+            raw: "bogus".into(),
+            values: "harness | handoff".into(),
+        },
+        Reason::ResumeCommandUnbuildable {
+            pane: 5,
+            error: Some("no conversation".into()),
+        },
+        Reason::ResumeFilesUnwritable("Permission denied (os error 13)".into()),
+        Reason::AgentTerminateFailed {
+            pid: 4321,
+            error: "Operation not permitted (os error 1)".into(),
+        },
     ]
 }
 
@@ -1491,10 +1661,85 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "cols と rows の両方を指定するか、reset を使うこと",
     "ペイン 4 に tmux セッションがない（tmux 永続化が無効 / 直接 spawn / 取り込みビューでもない）",
     "tmux セッション work が見つからない（既定サーバー）。対象は `tako tmux list` で確認すること",
+    // #2365 の続き: dispatch のジャンプ履歴・LSP・ワークスペース横断検索
+    "これより前の履歴は無い",
+    "これより先の履歴は無い",
+    "choice は 1 始まり（候補の一覧の番号）",
+    "column 3 は 2 行目（7 バイト）の文字の境界ではない",
+    "choice 4 は候補（2 か所）の外",
+    "choice 9 は候補（5 件）の外",
+    "limit は 1 以上（返す候補の件数）",
+    "item を指定する（応答の id）",
+    "set は action=options のときだけ使える",
+    "サーバ名が不正: nope（rust-analyzer / pyright）",
+    "この tako には右パネルの検索結果が無い（GUI のプライマリで使う。出さない検索は使える）",
+    "search には query（検索語）が要る",
+    "相対パス src の基準（ペインの cwd）が分からない。絶対パスで渡す",
+    "探す範囲がホーム（またはルート）だけになる。フォルダへ cd するか、\
+     ファイルツリーにフォルダを足す（tako tree add <フォルダ>）か、path で範囲を渡す",
+    "open には item（結果の id。1 始まり）が要る",
+    "右パネルに検索結果が無い（tako search <検索語> --show で出してから開く）",
+    "item 8 は結果（3 件）の外",
+    // #2365 の続き: dispatch の変更履歴
+    "変更履歴を取っている間にプレビューのファイルが変わった（履歴を置かない）",
+    "リポジトリ情報がない",
+    "ファイルパス情報がない",
+    "差分を取っている間にプレビューのファイルが変わった（差分を置かない）",
+    "差分を取っている間に変更履歴が変わった（unknown commit abc123）",
+    "差分を取っている間に変更履歴が入れ替わった（差分を置かない）",
+    // #2365 の続き: dispatch のリモートフォルダ・config share・scrollback
+    "host が必要",
+    "開いていない: devbox:/srv/app（`list` で開いているものを確認できる）",
+    "押し出せていない保存はありません（`pending` で確認できます）",
+    "link には対象（リポジトリのパスまたは URL）が必要です",
+    // 後ろに `reach::no_detached_capture_note` が付く（[`reason_old_ja`]）
+    "ペイン 9 は器（永続化バックエンド）を持たないので履歴を読めない: ",
+    // #2365 の続き: dispatch のコマンドカード・Code Runner
+    "コマンド提案カードは GUI（tako-app）が必要（この接続先には保管庫が無い）",
+    "このペインに表示中のコマンドカードが無い",
+    "クリップボードへ書き込めない（GUI が必要）",
+    "scope / profile / runtime / reset / args / env / cwd / before / board / port / \
+     target は path（対象ファイル）と一緒に渡す",
+    "実行前の保存に失敗したので実行しない（pane 6: Read-only file system (os error 30)）",
+    "ファイルを読めない（/tmp/x.py: No such file or directory (os error 2)）",
+    "ファイルの読み取りに失敗（/tmp/x.py: Is a directory (os error 21)）",
+    // #2365 の続き: dispatch の先取り・git・tmux・動画・ウィンドウ・引き継ぎ
+    "codex の CLI の所在を確かめられなかった（UI スレッドでは確かめない。\
+     もう一度呼ぶと確かめ直す）",
+    "コンフリクトの状態を確かめられなかった（UI スレッドでは git を待たない。\
+     もう一度呼ぶと確かめ直す）",
+    "tmux セッションを確かめられなかった（UI スレッドでは tmux を待たない。\
+     もう一度呼ぶと確かめ直す）",
+    "コンフリクトが発生していません（解消エージェントを起動する状況ではありません）",
+    "--servers はソケット置き場全体を対象にするので --socket（tako-x）とは併用できない。\
+     1 つのサーバーの中を掃除するなら --servers を外す",
+    "対象ペインは動画プレビューではない",
+    "ウィンドウの位置・寸法を指定できない: x is not a number",
+    "cwd does not exist: /tmp/gone\n  直すには: tako orchestrator profiles set default --cwd <path>（解除は --clear-cwd）",
+    // #2365 の続き: dispatch のファイルツリー
+    "絶対パスを指定する",
+    "指定フォルダはピン留めされていない: /tmp/a",
+    "action は add / remove のいずれか（受け取った値: bogus）",
+    "ファイルツリーはアクティブタブ（1）のものだけを出す（受け取った tab: 2）",
+    "ファイルツリーが閉じている（`tako panel --filetree on` で開く）",
+    "path（その行を選ぶ）と key（選んでいる行の上で押す）は同時に指定しない",
+    "ファイルツリーに見えていない行: /tmp/a/b.rs（畳んだフォルダの中・リモートの行は選べない）",
+    "ファイルツリーの行を選んでいない（先に path で選ぶ）",
+    // #2365 の続き: dispatch の supervisor・ledger・セッション再起動
+    "mode は auto / notify_only / off のいずれかを指定",
+    "supervisor の action は status / set_mode / history のいずれか（不明: 'bogus'）",
+    "project（前方一致プレフィックス）は必須",
+    "不正な action 'bogus'。使用可能: list, stats, record, amend, prune",
+    "mode が不正: \"bogus\"（harness | handoff。省略すると下見だけを返す）",
+    "pane 5 の再開コマンドを組めないのでハーネス更新しない: no conversation",
+    "再開に要るファイルを書けないので建て直さない: Permission denied (os error 13)",
+    "エージェントのプロセス（pid 4321）を終了できなかったので建て直さない: \
+     Operation not permitted (os error 1)",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
-/// （#2365 より前も `project_handoff_template` = 表示言語の雛形を付けていた）が続く
+/// （#2365 より前も `project_handoff_template` = 表示言語の雛形を付けていた）が続く。
+/// 器を持たないペインの履歴の断りは、後ろに `reach::no_detached_capture_note`（#2365 より前も同じ注記）が続く
 fn reason_old_ja(r: &Reason) -> String {
     let fixed = REASON_OLD_JA[reason_index(r)];
     match r {
@@ -1502,6 +1747,9 @@ fn reason_old_ja(r: &Reason) -> String {
             "{fixed}{}",
             tako_core::handoff::project_handoff_template_in(Lang::Ja, "<project-key>")
         ),
+        Reason::NoVesselForHistory(_) => {
+            format!("{fixed}{}", tako_control::reach::no_detached_capture_note())
+        }
         _ => fixed.to_string(),
     }
 }
@@ -4980,12 +5228,20 @@ fn mod_の状態と帯の応答の文の腕の行を日英とも引ける() {
 // どちらも dispatch のソースを読んで `file:line` で名指す
 
 /// dispatch の本体（単体テストの前まで）の行（1 始まりの行番号つき）。
-/// `impl Reason {` の本体（日英の対の表）とコメントの行は外す（そこの日本語は正しい）
+/// `impl Reason {` の本体（日英の対の表）とコメントの行は外す（そこの日本語は正しい）。
+///
+/// 単体テストの始まりは `#[cfg(test)]` の次の行が `mod ` の所（[`front_scope_lines`] と同じ読み）。
+/// 本体の途中の `#[cfg(test)] fn …`（テスト用の 1 関数）で切ると、その後ろ（ファイルツリー・
+/// supervisor・セッション再起動ほか）を見ずに通っていた（#2365 の続きで直した）
 fn dispatch_code_lines() -> Vec<(usize, &'static str)> {
     let lines: Vec<&'static str> = DISPATCH_SRC.lines().collect();
-    let tests = lines
-        .iter()
-        .position(|l| l.starts_with("#[cfg(test)]"))
+    let tests = (0..lines.len())
+        .find(|&i| {
+            lines[i].starts_with("#[cfg(test)]")
+                && lines
+                    .get(i + 1)
+                    .is_some_and(|next| next.starts_with("mod "))
+        })
         .unwrap_or(lines.len());
     let table = lines
         .iter()
@@ -6248,6 +6504,39 @@ const DISPATCH_REASON_SCOPES: &[&str] = &[
     "fn git_pane_cwd(",
     "fn tmux_select_window_target(",
     "fn compute_tmux_open_lookup(",
+    // #2365 の続き: ジャンプ履歴・LSP・ワークスペース横断検索
+    "fn jump(",
+    "pub fn lsp_goto_prepare(",
+    "fn check_line_column(",
+    "fn workspace_search_unavailable(",
+    "fn workspace_search_prepare(",
+    "fn workspace_search_roots(",
+    "fn workspace_search_open(",
+    "pub fn lsp_completion_prepare(",
+    "pub fn lsp_hover_prepare(",
+    "pub fn lsp_server_action(",
+    // 変更履歴の差分・リモートフォルダ・config share・scrollback
+    "fn preview_changelog_diff_prepare(",
+    "fn preview_changelog_diff_land(",
+    "    fn need_host(",
+    "    fn need_path(",
+    "pub fn dispatch_config_share(",
+    "fn scrollback_target_session(",
+    // コマンドカード・Code Runner
+    "fn cards_unsupported(",
+    "fn command_card_err(",
+    "fn save_previews_before_run(",
+    "fn read_file_head(",
+    // 先取りの答えが無かった断り・動画・ウィンドウ
+    "fn agent_preflight(",
+    "fn git_conflict_for(",
+    "fn tmux_open_lookup(",
+    "fn require_video_preview(",
+    "fn window_geometry_op(",
+    // ファイルツリー・supervisor・ledger
+    "fn dispatch_tree_folder(",
+    "fn dispatch_orchestrator_supervisor(",
+    "fn dispatch_orchestrator_ledger(",
 ];
 
 /// 日本語の残る関数の中で移した断りの旧文の断片と、寄せた先のバリアント
@@ -6289,6 +6578,38 @@ const DISPATCH_MOVED_OLD_JA: &[(&str, &str)] = &[
     ("system prompt の書き出しに失敗", "SystemPromptWriteFailed"),
     ("ホームディレクトリが取得できない", "HomeDirUnknown"),
     ("worker レジストリを読めない", "WorkerRegistryUnreadable"),
+    // #2365 の続き: LSP の着地・結果（「答えがまだ無い」の内部の取り違えは日本語のまま残す）
+    ("か所）の外", "ChoiceOutsideTargets"),
+    ("件）の外", "ChoiceOutsideItems / ItemOutsideResults"),
+    ("（応答の id）", "ItemNeedsResponseId"),
+    // 変更履歴（応答の注記「git 管理外のファイル」は日本語のまま残す）
+    ("変更履歴を取っている間に", "ChangelogFileChanged"),
+    ("リポジトリ情報がない", "ChangelogNoRepo"),
+    ("ファイルパス情報がない", "ChangelogNoPath"),
+    // dispatch_inner・リモートフォルダ・コマンドの実行
+    ("ソケット置き場全体を対象にする", "ServersWithSocket"),
+    ("path（対象ファイル）と一緒に渡す", "RunConfigNeedsPath"),
+    ("で開いているものを確認できる", "RemoteFolderNotOpen"),
+    ("押し出せていない保存はありません", "NoPendingPush"),
+    ("クリップボードへ書き込めない", "ClipboardNeedsGui"),
+    // orchestrator（引き継ぎの起動フォルダ・コンフリクト解消）
+    ("（解除は --clear-cwd）", "ProfileCwdBroken"),
+    ("コンフリクトが発生していません", "NoConflict"),
+    // ファイルツリーの選択（応答の注記「リモート（SSH）の行は…」は日本語のまま残す）
+    ("ファイルツリーはアクティブタブ", "TreeOnlyActiveTab"),
+    ("ファイルツリーが閉じている", "FileTreeClosed"),
+    ("選んでいる行の上で押す", "TreePathWithKey"),
+    ("ファイルツリーに見えていない行", "TreeRowNotVisible"),
+    ("のいずれか（受け取った値: ", "OneOfReceived"),
+    ("ファイルツリーの行を選んでいない", "TreeNoSelection"),
+    // セッション再起動（persist.log の行は日本語のまま残す）
+    ("省略すると下見だけを返す", "RestartModeInvalid"),
+    (
+        "再開コマンドを組めないのでハーネス更新しない",
+        "ResumeCommandUnbuildable",
+    ),
+    ("再開に要るファイルを書けない", "ResumeFilesUnwritable"),
+    ("を終了できなかったので建て直さない", "AgentTerminateFailed"),
 ];
 
 /// [`DISPATCH_MOVED_OLD_JA`] の断片が dispatch の本体の文字列リテラルにある行（1 始まり）
@@ -6388,6 +6709,73 @@ fn b() {
             "断片「{fragment}」（{variant}）が Reason の日本語の文に無い"
         );
     }
+    // 本体の範囲は単体テストの mod まで届く（途中の `#[cfg(test)] fn` で切れて、後ろの関数を
+    // 見ずに通らない。#2365 の続き）
+    let body = dispatch_code_lines();
+    for head in [
+        "fn dispatch_tree_selection(",
+        "fn dispatch_session_restart(",
+    ] {
+        assert!(
+            body.iter().any(|(_, l)| l.contains(head)),
+            "dispatch の本体の範囲に `{head}` が入っていない"
+        );
+    }
+}
+
+/// 境界（#2365 の続き）: 値で腕を分けるもの（リモートフォルダの名前の有無・再開の理由の有無）を、
+/// 表の見本に載せていない側も日英で見る。器の注記と「表示中のカードが無い」の読みは枠と同じ言語
+#[test]
+fn dispatch_の残りの断りの値で分かれる腕の境界() {
+    let cases: Vec<(Reason, &str)> = vec![
+        (
+            Reason::RemoteFolderNotOpen(None),
+            "開いていない: リモートフォルダ（`list` で開いているものを確認できる）",
+        ),
+        (
+            Reason::ResumeCommandUnbuildable {
+                pane: 5,
+                error: None,
+            },
+            "pane 5 の再開コマンドを組めないのでハーネス更新しない: 理由不明",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (r, old) in &cases {
+        let (ja, en) = (r.text_in(Lang::Ja), r.text_in(Lang::En));
+        if ja != *old {
+            failures.push(format!(
+                "{r:?}: 日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}"
+            ));
+        }
+        if let Some(c) = has_japanese(&en) {
+            failures.push(format!("{r:?}: 英語に日本語（{c}）: {en}"));
+        }
+    }
+    // 器を持たないペインの断りに添える注記は枠と同じ言語（日本語は reach の従来の注記そのもの）
+    let vessel = Reason::NoVesselForHistory(3);
+    assert!(vessel
+        .text_in(Lang::Ja)
+        .ends_with(&tako_control::reach::no_detached_capture_note()));
+    assert!(vessel
+        .text_in(Lang::En)
+        .ends_with(&tako_control::reach::no_detached_capture_note_in(Lang::En)));
+    assert_eq!(
+        tako_control::reach::no_detached_capture_note(),
+        tako_control::reach::no_detached_capture_note_in(Lang::Ja)
+    );
+    // 「表示中のコマンドカードが無い」の読み（リモートの 404 寄せ）は日英の両方に当たり、他には当たらない
+    for lang in [Lang::Ja, Lang::En] {
+        let text = Reason::NoCardOnPane.text_in(lang);
+        assert!(Reason::says_no_command_card(&text), "{lang:?}: {text}");
+        assert!(Reason::says_no_command_card(
+            &E::Operation(text.clone()).text_in(lang)
+        ));
+        assert!(!Reason::says_no_command_card(
+            &Reason::CardsNeedGui.text_in(lang)
+        ));
+    }
+    report_all(failures);
 }
 
 /// 境界: 1 つのバリアントが値で腕を分けるもの（下見の案内・切り詰め・応答の案内のペイン・role の有無・

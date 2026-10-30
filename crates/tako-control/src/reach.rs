@@ -81,11 +81,23 @@ pub fn no_detached_access_note() -> String {
 
 /// このバックエンドに**採取**の到達手段が無いことの説明
 pub fn no_detached_capture_note() -> String {
-    format!(
-        "永続バックエンド（{}）にアウトオブプロセスの画面採取手段が無いため、\
-         tako-app が保持していないペインの画面・履歴は読めない",
-        backend().capabilities().label
-    )
+    no_detached_capture_note_in(tako_core::i18n::Lang::Ja)
+}
+
+/// [`no_detached_capture_note`] の言語を明示した形（#2365。dispatch の断りが枠と同じ言語で引く）。
+/// 日本語は #2365 より前の文とバイト一致
+pub fn no_detached_capture_note_in(lang: tako_core::i18n::Lang) -> String {
+    let label = backend().capabilities().label;
+    match lang {
+        tako_core::i18n::Lang::Ja => format!(
+            "永続バックエンド（{label}）にアウトオブプロセスの画面採取手段が無いため、\
+             tako-app が保持していないペインの画面・履歴は読めない"
+        ),
+        tako_core::i18n::Lang::En => format!(
+            "the persistence backend ({label}) has no out-of-process way to capture the screen, \
+             so the screen and history of a pane that tako-app does not hold cannot be read"
+        ),
+    }
 }
 
 impl PaneReach {
