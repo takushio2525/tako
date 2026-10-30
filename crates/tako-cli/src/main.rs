@@ -2568,8 +2568,9 @@ enum EditCommand {
     },
     /// 編集バッファをファイルへ保存する（外で変わっていたら書かずに断る）
     Save {
-        /// 外で変わっていても自分の変更で上書きする（消されていれば作り直す。#1659）
-        #[arg(long)]
+        /// 外で変わっていても自分の変更で上書きする（消されていれば作り直す。#1659）。
+        /// `--overwrite` は同じ意味の別名（MCP `tako_preview_save` の `action=overwrite` と同じ綴り。#1833）
+        #[arg(long, visible_alias = "overwrite")]
         force: bool,
         #[arg(long)]
         pane: Option<u64>,
@@ -15036,6 +15037,15 @@ mod tests {
                 force: true
             }
         );
+        // #1833: MCP の `action=overwrite` と同じ綴りの別名
+        let command = parse(&["tako", "edit", "save", "--overwrite", "--pane", "5"]);
+        assert_eq!(
+            build_request(&command).unwrap(),
+            Request::PreviewSave {
+                pane: Some(5),
+                force: true
+            }
+        );
         let command = parse(&["tako", "edit", "reload", "--pane", "5"]);
         assert_eq!(
             build_request(&command).unwrap(),
@@ -17090,7 +17100,8 @@ mod platform_matrix_parity {
         ("edit redo", "tako_preview_redo"),
         ("edit replace", "tako_preview_replace"),
         ("edit save", "tako_preview_save"),
-        // #1659: MCP は `tako_preview_save` の `action`（reload / diff。ツールを増やさない）
+        // #1659: MCP は `tako_preview_save` の `action`（reload / diff。ツールを増やさない）。
+        // 上書きは CLI `edit save --force`（別名 `--overwrite`。#1833）= MCP の `action=overwrite`
         ("edit reload", "tako_preview_save"),
         ("edit diff", "tako_preview_save"),
         ("edit search", "tako_preview_search"),

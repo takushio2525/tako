@@ -839,6 +839,9 @@ pub struct PreviewConflict {
     pub notices: u32,
     /// 自動保存が有効なのに競合で止めているか
     pub autosave_paused: bool,
+    /// リモート（SSH 先）への書き戻しが競合で断られたものか（#1833）。抜け方は上書き
+    /// （`tako edit save --force`）だけで、読み直し・差分はローカルの写しが相手なので使えない
+    pub remote: bool,
 }
 
 /// 整形（#1683）の材料（[`PreviewHost::preview_format_source`]）。**頼んだときの編集バッファ**の

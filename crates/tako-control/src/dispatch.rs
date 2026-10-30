@@ -4416,14 +4416,15 @@ fn preview_save(
     force: bool,
 ) -> Result<Value, DispatchError> {
     if let Err(message) = host.save_preview(target, force) {
-        // #1659: 外部変更で断られたなら抜け方を添える
+        // #1659: 外部変更で断られたなら抜け方を添える。リモートの競合（#1833）は添えない
+        // （読み直し・差分はローカルの写しが相手。断りの文が強制保存を案内している）
         return Err(match host.preview_conflict(target) {
-            Some(conflict) => Reason::SaveRefused {
+            Some(conflict) if !conflict.remote => Reason::SaveRefused {
                 message,
                 conflict: conflict.state,
             }
             .operation(),
-            None => DispatchError::Operation(message),
+            _ => DispatchError::Operation(message),
         });
     }
     let mut out = preview_edit_reply(host, target);
@@ -8438,6 +8439,10 @@ fn preview_edit_reply(host: &dyn ControlHost, target: PaneId) -> Value {
             "notices": conflict.notices,
             "autosave_paused": conflict.autosave_paused,
         });
+        // #1833: リモートへの書き戻しの競合（ローカルの競合はキーごと無い = 従来の形）
+        if conflict.remote {
+            out["conflict"]["remote"] = json!(true);
+        }
     }
     out
 }
@@ -29768,6 +29773,7 @@ mod tests {
                                 state,
                                 notices: 1,
                                 autosave_paused: false,
+                                remote: false,
                             },
                         );
                         return Err(error.to_string());
@@ -55930,6 +55936,7 @@ mod tests {
                 state: tako_core::DiskState::Changed,
                 notices: 1,
                 autosave_paused: true,
+                remote: false,
             },
         );
         assert!(lsp_format_on_save_prepare(&mut host, Some(pane), false).is_none());

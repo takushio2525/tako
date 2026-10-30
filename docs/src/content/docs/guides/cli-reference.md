@@ -765,11 +765,24 @@ tako edit --help    # 開始 / 全文適用 / 保存のサブコマンドを確�
 
 ```bash
 tako edit diff          # ディスク → 編集中の差分（何も変えない）
-tako edit save --force  # 自分の変更で上書きする（消されていたら作り直す）
+tako edit save --force  # 自分の変更で上書きする（消されていたら作り直す。--overwrite も同じ）
 tako edit reload        # ディスクから読み直す（自分の変更は tako edit undo 1 回で戻せる）
 ```
 
+MCP では `tako_preview_save` の `action` で同じ操作になります。
+
+| CLI | MCP `tako_preview_save` |
+|---|---|
+| `tako edit save` | `action` 省略（または `save`） |
+| `tako edit save --force`（別名 `--overwrite`） | `action=overwrite` |
+| `tako edit reload` | `action=reload` |
+| `tako edit diff` | `action=diff` |
+
 編集していないあいだにディスク側が変わったときは、帯を出さずにそのまま追従します。未保存の変更があるプレビューへ別のファイルを開くと、差し替えずに右へ分割して開きます。
+
+読み直した直後に `tako edit undo`（⌘Z、Windows は Ctrl+Z）で読み直しを取り消すと、本文はディスクの外部変更より前の版に戻ります。自動保存が ON なら、そのまま保存すると外部変更を上書きしてしまうので、自動保存を止めて同じ帯を出します。上書きするなら `tako edit save --force`、外部変更を採るなら `tako edit reload` か `tako edit redo` です。
+
+SSH 先のファイル（`tako remote-folder open-file`）は、開いた後にリモート側が変わっていると書き戻しを断り、同じ帯と応答の `conflict`（`remote: true`）に載ります。自分の変更で上書きするなら `tako edit save --force`、リモートの中身を採るならもう一度 `tako remote-folder open-file` で取り直します（編集は閉じて開き直しになります）。
 
 検索と置換は**大文字小文字を区別するのが既定**です（`value` で探しても `Value` には当たりません）。区別しないときは `-i`、単語単位で探すときは `-w` を付けます。
 

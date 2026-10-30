@@ -16853,6 +16853,8 @@ impl TakoApp {
                     },
                 );
                 if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
+                    // #1833: 書き戻せた = リモートの競合は解けた（上書き保存で抜けた回）
+                    edit.clear_remote_conflict();
                     edit.save_status = Some(preview::SaveStatus::Saved);
                     edit.message = Some(crate::ui_text::remote_folder::preview_pushed(
                         &remote.label(),
@@ -16877,14 +16879,15 @@ impl TakoApp {
                     },
                 );
                 if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
-                    edit.save_status = Some(
-                        if e.kind == tako_core::remote_fs::RemoteErrorKind::Conflict {
-                            preview::SaveStatus::Conflict
-                        } else {
-                            preview::SaveStatus::Error(message.clone())
-                        },
-                    );
-                    edit.message = Some(message.clone());
+                    if e.kind == tako_core::remote_fs::RemoteErrorKind::Conflict {
+                        // #1833: ローカルの競合と同じ口で記録する（帯・`conflict` の応答・回数・
+                        // 自動保存の停止）。修正前はヘッダの表示だけが「競合」で、帯にも応答にも
+                        // 載らなかった。帯が文面を持つのでヘッダへは書かない
+                        edit.note_remote_conflict();
+                    } else {
+                        edit.save_status = Some(preview::SaveStatus::Error(message.clone()));
+                        edit.message = Some(message.clone());
+                    }
                 }
                 Err(message)
             }
@@ -16913,12 +16916,13 @@ impl TakoApp {
         self.apply_remote_push_result(pane_id, &remote, &bytes, result)
     }
 
-    /// リモートへ**背景で**押し出す（GUI の ⌘S / 保存ボタン / 自動保存）。
+    /// リモートへ**背景で**押し出す（GUI の ⌘S / 保存ボタン / 自動保存 / 競合の帯の上書き保存）。
     ///
     /// ネットワーク I/O を UI スレッドで待たない（実測: ControlMaster に相乗りしても
     /// 1 バッチ 1〜2 秒。⌘S ごとに固まると #212 / #772 と同じ体感の悪化になる）。
-    /// 進行中にもう一度保存されたら、終わってから 1 回だけ押し直す（積み上げない）
-    fn push_preview_remote_async(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+    /// 進行中にもう一度保存されたら、終わってから 1 回だけ押し直す（積み上げない）。
+    /// `force` は競合を承知で上書きする（帯の「上書き保存」= `tako edit save --force`。#1833）
+    fn push_preview_remote_async(&mut self, pane_id: PaneId, force: bool, cx: &mut Context<Self>) {
         if Self::remote_edit_legacy() {
             return;
         }
@@ -16944,14 +16948,14 @@ impl TakoApp {
             let body = payload.clone();
             let result = cx
                 .background_spawn(async move {
-                    tako_core::remote_fs::save_file(&host, &path, &body, false)
+                    tako_core::remote_fs::save_file(&host, &path, &body, force)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 let _ = this.apply_remote_push_result(pane_id, &target, &payload, result);
                 if this.remote_push_again.remove(&pane_id) {
                     // 進行中に入った保存を 1 回だけ拾う
-                    this.push_preview_remote_async(pane_id, cx);
+                    this.push_preview_remote_async(pane_id, false, cx);
                 }
                 cx.notify();
             })
@@ -16996,7 +17000,7 @@ impl TakoApp {
         // ローカルの写しへ書くところまでは同期（速い・確実に残る）。
         // リモートへの押し出しは背景（UI スレッドで待たない）
         if self.save_preview_local(pane_id, false).is_ok() {
-            self.push_preview_remote_async(pane_id, cx);
+            self.push_preview_remote_async(pane_id, false, cx);
         }
         cx.notify();
     }
@@ -17010,6 +17014,8 @@ impl TakoApp {
         if undone {
             edit.message = None;
             edit.save_status = None;
+            // #1833: 読み直しを戻したなら、自動保存が外部変更を上書きする前に止めて知らせる
+            edit.hold_autosave_if_reload_undone();
             self.refresh_preview_from_editor(pane_id);
         }
         Ok(undone)
@@ -17020,10 +17026,16 @@ impl TakoApp {
             .preview_edits
             .get_mut(&pane_id)
             .ok_or(HostRefusal::EditNotStarted)?;
+        let held = edit.buffer.reload_undone();
         let redone = edit.buffer.redo();
         if redone {
             edit.message = None;
             edit.save_status = None;
+            // #1833: 戻した読み直しをやり直して本文がディスクの中身へ戻ったら、止めていた
+            // 自動保存の競合を解く（本文がディスクと違うままなら競合は残す）
+            if held && !edit.buffer.reload_undone() && !edit.dirty() {
+                edit.clear_conflict();
+            }
             self.refresh_preview_from_editor(pane_id);
         }
         Ok(redone)
@@ -17258,6 +17270,15 @@ impl TakoApp {
         {
             return;
         }
+        // #1833: 保留へ入れた後（500ms の間）に読み直しを戻した回。書くと外部変更を黙って上書きする
+        if let Some(edit) = self
+            .preview_edits
+            .get_mut(&pane_id)
+            .filter(|edit| edit.buffer.reload_undone() && !preview::reload_undo_legacy())
+        {
+            edit.hold_autosave_if_reload_undone();
+            return;
+        }
         match self.save_preview_local(pane_id, false) {
             Ok(()) => {
                 if let Some(edit) = self.preview_edits.get_mut(&pane_id) {
@@ -17267,7 +17288,7 @@ impl TakoApp {
                 // #966: リモート由来なら背景で押し出す（ローカルの写しだけ新しい
                 // 状態を残さない）。リモートの編集セッションは自動保存を既定 OFF に
                 // してあるので、ここへ来るのはユーザーが明示的に入れたときだけ
-                self.push_preview_remote_async(pane_id, cx);
+                self.push_preview_remote_async(pane_id, false, cx);
             }
             Err(msg) => {
                 // 外部変更は `save_preview_local` が競合として記録済み（文面で判定しない）
@@ -28399,6 +28420,7 @@ impl PreviewHost for TakoApp {
             state: conflict.state,
             notices: conflict.notices,
             autosave_paused: edit.autosave && !preview::external_change_legacy(),
+            remote: conflict.remote,
         })
     }
 
@@ -28420,6 +28442,8 @@ impl PreviewHost for TakoApp {
             .get_mut(&pane)
             .ok_or(HostRefusal::EditNotStarted)?;
         edit.autosave = enabled;
+        // #1833: 読み直しを戻した本文のまま自動保存を入れたら、回る前に止めて知らせる
+        edit.hold_autosave_if_reload_undone();
         Ok(())
     }
 

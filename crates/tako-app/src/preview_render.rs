@@ -5512,7 +5512,11 @@ impl TakoApp {
     ///
     /// ボタンは CLI / MCP と同じ口を呼ぶ（上書き = `save_preview_local(force)` =
     /// `tako edit save --force`、読み直し = `revert_preview_local` = `tako edit reload`、
-    /// 差分 = `TextBuffer::disk_diff` = `tako edit diff`）。印は絵文字を使わず GPUI の矩形で描く
+    /// 差分 = `TextBuffer::disk_diff` = `tako edit diff`）。印は絵文字を使わず GPUI の矩形で描く。
+    ///
+    /// リモート（SSH 先）の競合（#1833）は同じ帯に出し、ボタンは上書き保存だけにする。
+    /// 差分と読み直しはローカルの写しが相手で、リモートの今の中身を見ない（読み直しは
+    /// `remote_revert_unsupported` で断られる）ので、押しても抜けられないボタンを出さない
     fn render_conflict_bar(
         &self,
         pane_id: PaneId,
@@ -5523,6 +5527,7 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let deleted = conflict.state == tako_core::DiskState::Deleted;
+        let remote = conflict.remote;
         let key = pane_id.as_u64();
         // 実矩形は visual-test が実マウスで押すために記録する（キーは `<id>-<ペイン>`。
         // 検索欄のトグルと同じ置き方 = #1653）
@@ -5560,7 +5565,9 @@ impl TakoApp {
                     .size_full(),
                 )
         };
-        let message = if deleted {
+        let message = if remote {
+            crate::ui_text::preview::conflict_remote_changed()
+        } else if deleted {
             crate::ui_text::preview::conflict_deleted()
         } else {
             crate::ui_text::preview::conflict_changed()
@@ -5606,21 +5613,23 @@ impl TakoApp {
             .gap(px(6.0))
             .px(px(8.0))
             .py(px(4.0))
-            .child(
-                button(
-                    "preview-conflict-diff",
-                    if diff.is_some() {
-                        crate::ui_text::preview::conflict_hide_diff()
-                    } else {
-                        crate::ui_text::preview::conflict_show_diff()
-                    },
+            .when(!remote, |d| {
+                d.child(
+                    button(
+                        "preview-conflict-diff",
+                        if diff.is_some() {
+                            crate::ui_text::preview::conflict_hide_diff()
+                        } else {
+                            crate::ui_text::preview::conflict_show_diff()
+                        },
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_conflict_diff(pane_id);
+                        cx.notify();
+                    })),
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.toggle_conflict_diff(pane_id);
-                    cx.notify();
-                })),
-            )
+            })
             .child(
                 button(
                     "preview-conflict-overwrite",
@@ -5632,14 +5641,15 @@ impl TakoApp {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
-                    // ⌘S と同じく、リモート由来なら背景で押し出す（#966）
+                    // ⌘S と同じく、リモート由来なら背景で押し出す（#966）。上書きなので
+                    // リモートの競合も踏み越える（#1833。force 無しだと同じ競合で断られる）
                     if this.save_preview_local(pane_id, true).is_ok() {
-                        this.push_preview_remote_async(pane_id, cx);
+                        this.push_preview_remote_async(pane_id, true, cx);
                     }
                     cx.notify();
                 })),
             )
-            .when(!deleted, |d| {
+            .when(!deleted && !remote, |d| {
                 d.child(
                     button(
                         "preview-conflict-reload",
