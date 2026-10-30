@@ -68,6 +68,11 @@ pub struct FetchConfig {
     /// 取る OS / CPU（`std::env::consts` の綴り。検証で他の組を選ばせる口）
     pub os: &'static str,
     pub arch: &'static str,
+    /// 取ってきたサーバを起こすシェル（unix）。`None` = 利用者のログインシェル
+    /// （`$SHELL -l -c 'exec …'`。本番 = rc の PATH をサーバへ効かせる）。`Some(sh)` は同じシェル片を
+    /// `sh -c` で起こす（rc を読まない）。e2e が開発者の rc に起動を左右されないための口（#2509: rc の
+    /// `pyenv rehash` はロックを最大 60 秒待ち、サーバの stdout を握ったまま残る）。Windows は見ない
+    pub plain_shell: Option<String>,
 }
 
 impl FetchConfig {
@@ -86,6 +91,7 @@ impl FetchConfig {
             node_lookup: Arc::new(default_node_lookup),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
+            plain_shell: None,
         })
     }
 
@@ -98,6 +104,7 @@ impl FetchConfig {
             node_lookup: Arc::new(|_| None),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
+            plain_shell: None,
         }
     }
 
@@ -421,7 +428,7 @@ fn launch_plan(
             // 取れる行は固定の引数だけ（伴走・空のファイルを持たない = 表の単体が固定する）
             let args: Vec<&str> = spec.literal_args();
             Some(Managed {
-                plan: plan_for(&program, &args)?,
+                plan: plan_for(config, &program, &args)?,
                 program_path: program,
                 runtime: None,
                 runtime_source: None,
@@ -444,7 +451,7 @@ fn launch_plan(
                 lease_dirs.push(table::node_dir(&config.root, &table::NODE));
             }
             Some(Managed {
-                plan: plan_for(&node, &args)?,
+                plan: plan_for(config, &node, &args)?,
                 program_path: entry.clone(),
                 runtime: Some(node),
                 runtime_source: Some(source),
@@ -457,7 +464,7 @@ fn launch_plan(
 
 /// 起動計画（`default_launch` と同じくログインシェル経由 = サーバが cargo / python を見つけられる）。
 /// Windows はシェルを経由しない（`user_env_cli` は名前を PATH で引くので、置き場の絶対パスはそのまま起こす）
-fn plan_for(program: &str, args: &[&str]) -> Option<ChildCmd> {
+fn plan_for(config: &FetchConfig, program: &str, args: &[&str]) -> Option<ChildCmd> {
     if cfg!(windows) {
         return Some(ChildCmd {
             program: program.to_string(),
@@ -469,7 +476,14 @@ fn plan_for(program: &str, args: &[&str]) -> Option<ChildCmd> {
         snippet.push(' ');
         snippet.push_str(&tako_core::shell::quote_for_shell(arg));
     }
-    child_cmd::user_env_cli(&snippet, program, args)
+    match &config.plain_shell {
+        // #2509: rc を読まないシェルで同じシェル片を起こす（e2e の口。本番は None）
+        Some(shell) => Some(ChildCmd {
+            program: shell.clone(),
+            args: vec!["-c".to_string(), snippet],
+        }),
+        None => child_cmd::user_env_cli(&snippet, program, args),
+    }
 }
 
 /// 足りる Node.js: 利用者の PATH → tako が取ったもの。どちらも無ければ `None`
@@ -1204,5 +1218,38 @@ mod tests {
     fn 大きさの表記() {
         assert_eq!(format_mb(52_909_993), "52.9 MB");
         assert_eq!(format_mb(0), "0.0 MB");
+    }
+
+    /// #2509: 本番はログインシェルで起こし、口を渡したときだけ同じシェル片を rc を読まないシェルで起こす
+    #[cfg(unix)]
+    #[test]
+    fn 取ってきたサーバは既定でログインシェルを通り_plain_shell_なら_rc_を読まない() {
+        let config = FetchConfig::with_root(PathBuf::from("/x"), None);
+        assert!(config.plain_shell.is_none(), "検証用の既定も本番と同じ");
+        if let Some(prod) = FetchConfig::from_env() {
+            assert!(
+                prod.plain_shell.is_none(),
+                "本番の設定はログインシェルで起こす"
+            );
+        }
+        let login = plan_for(&config, "/x/a b/server", &["--stdio"]).expect("ログインシェルの計画");
+        assert_eq!(login.args.len(), 3, "{:?}", login.args);
+        assert_eq!(
+            (login.args[0].as_str(), login.args[1].as_str()),
+            ("-l", "-c")
+        );
+        let snippet = login.args[2].clone();
+        assert!(snippet.starts_with("exec "), "{snippet}");
+        let plain = FetchConfig {
+            plain_shell: Some("/bin/sh".to_string()),
+            ..config
+        };
+        let direct = plan_for(&plain, "/x/a b/server", &["--stdio"]).expect("rc を読まない計画");
+        assert_eq!(direct.program, "/bin/sh");
+        assert_eq!(
+            direct.args,
+            ["-c".to_string(), snippet],
+            "シェル片は本番と同じ"
+        );
     }
 }
