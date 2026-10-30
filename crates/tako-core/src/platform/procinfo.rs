@@ -149,7 +149,7 @@ pub fn image_path(pid: u32) -> Option<std::path::PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ancestor {
     pub pid: u32,
-    /// 起動時の名前（macOS は comm・Windows は在籍表の実行ファイル名・無ければ実行ファイル名）。
+    /// 起動時の名前（macOS は argv[0] の名前部分・Windows は在籍表の実行ファイル名・無ければ実行ファイル名）。
     /// パスは持たない。取れなければ空
     pub name: String,
 }
@@ -169,7 +169,7 @@ pub fn ancestry(pid: u32, depth: usize) -> Vec<Ancestor> {
         pid,
         depth,
         |p| entry(p).map(|e| e.ppid).or_else(|| imp::parent_pid(p)),
-        // 名前は起動時の名前を先に引く（macOS の comm。claude のように実体が `versions/<版>` に
+        // 名前は起動時の名前を先に引く（macOS は argv[0]。claude のように実体が `versions/<版>` に
         // ある実行ファイルを、実体のパスの名前（`2.1.301`）ではなく `claude` と読めるように）
         |p| {
             imp::short_name(p)
@@ -1211,11 +1211,13 @@ mod imp {
         rest.split_whitespace().nth(1)?.parse().ok()
     }
 
-    /// 起動時の名前（#2533）。macOS は `pbsi_comm`（exec に渡した名前。symlink 越しの起動なら
-    /// symlink 側の名前 = `claude`。最長 16 バイト）
+    /// 起動時の名前（#2533）。macOS は argv[0] の名前部分（comm = `pbsi_comm` は実体の
+    /// ファイル名で、claude が版の数字 `2.1.301` に見える）。argv を読めない別ユーザー・root の
+    /// プロセス（launchd 等）は comm へ落とす
     #[cfg(target_os = "macos")]
     pub(super) fn short_name(pid: u32) -> Option<String> {
-        crate::ports::short_info(i32::try_from(pid).ok()?).map(|(_, _, comm)| comm)
+        crate::ports::argv0_name(pid)
+            .or_else(|| crate::ports::short_info(i32::try_from(pid).ok()?).map(|(_, _, comm)| comm))
     }
 
     /// macOS 以外の unix は procfs の comm
