@@ -263,21 +263,31 @@ fn 書き換えはビルド時で起動時は差し込むだけ() {
             .contains("include_bytes!(concat!(env!(\"OUT_DIR\"), \"/prefiltered-syntaxes.bin\"))"),
         "{PREFILTER}: ビルド時に作った文脈を読んでいない（#1935）"
     );
-    // アプリ本体（テスト以外）は書き換えない = 書き換えのモジュールはテストのときだけ入る
+    // アプリ本体（テスト以外）は書き換えない = 書き換えのモジュールはテストのときだけ入る。
+    // 宣言は main.rs に置かない（main.rs の最初の `#[cfg(test)]` を本番とテストの境に読む走査がある）
     let main = read_code(MAIN);
-    let at = main
+    if let Some(at) = main.find("mod syntax_rewrite") {
+        panic!(
+            "{MAIN}:{}: `mod syntax_rewrite` を main.rs で宣言している。\n\
+             テストのときだけ `syntax_prefilter.rs` の中で宣言すること（#1935）",
+            line_at(&main, at)
+        );
+    }
+    let at = prefilter
         .find("mod syntax_rewrite;")
-        .unwrap_or_else(|| panic!("{MAIN}: `mod syntax_rewrite;` が見つからない（#1935）"));
+        .unwrap_or_else(|| panic!("{PREFILTER}: `mod syntax_rewrite;` が見つからない（#1935）"));
     assert!(
-        main[..at].trim_end().ends_with("#[cfg(test)]"),
-        "{MAIN}:{}: `mod syntax_rewrite` がテスト以外でも入っている。\n\
+        prefilter[..at]
+            .trim_end()
+            .ends_with("#[cfg(test)]\n#[path = \"syntax_rewrite.rs\"]"),
+        "{PREFILTER}:{}: `mod syntax_rewrite` がテスト以外でも入っている。\n\
          実行時に正規表現を書き換えると、全 214 構文で release 約 340 ms を起動のたびに払う（#1935）",
-        line_at(&main, at)
+        line_at(&prefilter, at)
     );
     // 差し込む側・塗る側のテスト以外のコードは書き換えを呼ばない
     for rel in [PREFILTER, PREVIEW] {
         let src = read_code(rel);
-        let body = src.split("#[cfg(test)]").next().unwrap_or(&src);
+        let body = src.split("#[cfg(test)]\nmod tests").next().unwrap_or(&src);
         if let Some(at) = body.find("syntax_rewrite::") {
             panic!(
                 "{rel}:{}: テスト以外から書き換えを呼んでいる（#1935）",

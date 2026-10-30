@@ -1,7 +1,7 @@
 //! 構文の塗りの正規表現の前置き（#1917 / #1935）を塗りの構文セットへ差し込み、
 //! 入力の大きさで「前置き付き」と「元の正規表現」の構文セットを使い分ける
 //!
-//! ## 前置き（書き換えそのものと等価性の根拠は [`crate::syntax_rewrite`]）
+//! ## 前置き（書き換えそのものと等価性の根拠は `syntax_rewrite.rs`）
 //!
 //! 先読み・後読みの多い構文定義では、fancy-regex が正規表現を「行の全バイト位置で VM を回す」
 //! 形で走らせるので、当たらない行でも VM が回る。正規表現 `R` を
@@ -43,6 +43,12 @@ use syntect::parsing::SyntaxSet;
 use crate::syntax_mirror::{
     Fingerprint, PrefilteredSyntax, SetMirror, LEGACY_1917_SYNTAXES, TARGETS,
 };
+
+/// 書き換えの本体（`build.rs` が `#[path]` で同じファイルを読む）。アプリは実行時に書き換えないので、
+/// 単体テスト（等価性・生成物が今のコードで作り直したものと一致すること）だけが使う
+#[cfg(test)]
+#[path = "syntax_rewrite.rs"]
+mod syntax_rewrite;
 
 /// `build.rs` が作った、対象の構文の書き換え済みの文脈（`Vec<PrefilteredSyntax>` の bincode）
 static PREFILTERED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prefiltered-syntaxes.bin"));
@@ -290,8 +296,8 @@ mod tests {
     use syntect::parsing::ParseState;
     use syntect::util::LinesWithEndings;
 
+    use super::syntax_rewrite::{rewrite, runs_on_vm, PARSE_FLAGS};
     use crate::syntax_mirror::LazyMirror;
-    use crate::syntax_rewrite::{rewrite, runs_on_vm, PARSE_FLAGS};
 
     /// 対象の構文ごとの見本（宣言・式・文字列・コメント・埋め込み・壊れた行を含む手書きの短いもの）
     const SAMPLES: &[(&str, &str)] = &[
@@ -475,7 +481,7 @@ mod tests {
     /// 1 バイトも違わない = 生成は入力だけで決まり（再現性）、古い生成物を使っていない
     #[test]
     fn ビルド時の生成物は今のコードで作り直したものと1バイトも違わない() {
-        let again = crate::syntax_rewrite::generate(
+        let again = super::syntax_rewrite::generate(
             &two_face::syntax::extra_newlines(),
             &target_syntaxes(),
         )
@@ -1031,7 +1037,7 @@ mod tests {
                     let t = Instant::now();
                     let mut memo = std::collections::HashMap::new();
                     one = Some(
-                        crate::syntax_rewrite::rewrite_syntax(
+                        super::syntax_rewrite::rewrite_syntax(
                             &syntax.name,
                             &syntax.serialized_lazy_contexts,
                             &mut memo,
@@ -1148,7 +1154,7 @@ mod tests {
             };
             let text = std::fs::read_to_string(path).unwrap();
             let small: String = text.lines().take(40).map(|l| format!("{l}\n")).collect();
-            let generated = crate::syntax_rewrite::generate(&base, &[name]).unwrap();
+            let generated = super::syntax_rewrite::generate(&base, &[name]).unwrap();
             let built = build(&base, &generated).unwrap();
             // 損益分岐: 先頭 n 行を、毎回作り直した（冷えた）構文セットで塗る
             if let Ok(sizes) = std::env::var("TAKO_1935_CROSS") {

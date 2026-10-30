@@ -71,9 +71,6 @@ mod status_bar;
 mod syntax_extra;
 mod syntax_mirror;
 mod syntax_prefilter;
-// 書き換えは build.rs が行う（#1935）。アプリ本体では単体テストだけが使う
-#[cfg(test)]
-mod syntax_rewrite;
 mod tab_bar;
 mod tab_shape;
 mod tasks_panel;
