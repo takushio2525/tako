@@ -18,11 +18,19 @@
 //! `setup_mcp_agents` を手元で呼ぶので、呼ぶ前に表示言語を決める（`init_local_lang`）。
 //!
 //! codex / agy への MCP 登録の断りは [`crate::agent_mcp::AgentMcpError`]（同じ網羅 match の形）が持つ。
-//! エージェント名の検証は orchestrator の [`crate::orchestrator::ConfigError`] を使う
+//! エージェント名の検証は orchestrator の [`crate::orchestrator::ConfigError`] を使う。
+//!
+//! エージェント CLI の導入の実行（`tako_setup_bootstrap` の install = インストーラの取得と実行）と PATH 通し
+//! （path / undo-path）の断りもここに置く。中身の tako-core の断り（profile の PATH ブロック
+//! [`PathBlockError`]・tako CLI の symlink [`LinkError`]・Windows のユーザー PATH [`UserPathError`]）は
+//! それぞれの型の `text_in` を包む（Windows だけが組む文も `cfg` の外の表 = macOS の番犬で日英を見る）
 
 use tako_core::claude_mod_ui::UiError;
 use tako_core::i18n::Lang;
 use tako_core::load_issue::{JsonReason, YamlReason};
+use tako_core::platform::user_path::UserPathError;
+use tako_core::shell_profile::PathBlockError;
+use tako_core::tako_cli_path::LinkError;
 
 use crate::orchestrator::ConfigError;
 use crate::DispatchError;
@@ -128,6 +136,70 @@ pub enum SetupRefusal {
     UnknownBootstrapAgent { got: String, allowed: String },
     /// ホームディレクトリを決められない（何も書かない）
     BootstrapHomeUnresolved,
+
+    // ---- エージェント CLI の導入の実行（`setup_bootstrap::install_for_typed`） ----
+    /// セルフテスト中の実インストール（dry_run でのみ呼べる）
+    InstallDuringSelfTest,
+    /// この環境では自動インストールを代行できない（`os` は OS の名前、`command` は公式の 1 行）
+    InstallNotDelegable { os: String, command: String },
+    /// インストーラの取得手段（curl / wget）が無い
+    NoDownloader,
+    /// 取得手段（curl / wget / PowerShell）・インストーラのインタプリタを起動できない
+    InstallerToolSpawn { program: String, error: String },
+    /// インストーラを取得できない
+    InstallerFetchFailed { url: String, detail: FetchDetail },
+    /// 取得したインストーラを読めない
+    InstallerUnreadable(String),
+    /// 取得した内容がインストーラでない（プロキシの HTML エラーページ等）
+    NotAnInstaller { url: String },
+    /// インストーラがメモリ不足で中断した（exit 137。`log` はインストーラの出力）
+    InstallerOutOfMemory { log: String },
+    /// インストーラが途中で強制終了した（exit 128 以上）
+    InstallerKilled { code: i32, log: String },
+    /// インストーラが失敗した（`troubleshoot_url` はその系統の公式ページ）
+    InstallerFailed {
+        product: String,
+        code: i32,
+        troubleshoot_url: String,
+        log: String,
+    },
+    /// インストーラは正常終了したのにランチャーを引けない（`launcher` は `~` 短縮の表示）
+    InstalledButMissing { launcher: String, command: String },
+
+    // ---- PATH 通し（`setup_bootstrap::ensure_path_for_typed` / `undo_path_for_typed`） ----
+    /// 使っているシェルの設定ファイルが分からない（`shell` は `$SHELL` の値 = 空なら不明、
+    /// `dirs` は通したいディレクトリの `~` 短縮の表示）
+    ShellProfileUnknown { shell: String, dirs: Vec<String> },
+    /// 使っているシェルの設定ファイルが分からない（PATH ブロックの取り除き）
+    ShellProfileUnknownForUndo,
+    /// Windows のユーザー PATH へ書いたのに読み直すと入っていない
+    UserPathNotReflected { dir: String },
+    /// profile の PATH ブロックの書き換えの断り（tako-core）
+    PathBlock(PathBlockError),
+    /// tako CLI の symlink の断り（tako-core）
+    CliLink(LinkError),
+    /// Windows のユーザー PATH の読み書きの断り（tako-core）
+    UserPath(UserPathError),
+}
+
+/// インストーラを取得できなかったときの添え書き（取得手段の stderr か、黙って落ちたときの終了コード）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchDetail {
+    /// 取得手段が stderr に何も出さずに非ゼロ終了した
+    Exit { program: String, code: i32 },
+    /// 取得手段の stderr（前後の空白を落としたもの。言語に依らずそのまま載せる）
+    Stderr(String),
+}
+
+impl FetchDetail {
+    fn text_in(&self, lang: Lang) -> String {
+        match (self, lang) {
+            (Self::Exit { program, code }, Lang::Ja) => format!("（{program} が exit {code}）"),
+            (Self::Exit { program, code }, Lang::En) => format!("({program} exited with {code})"),
+            (Self::Stderr(detail), Lang::Ja) => format!("（{detail}）"),
+            (Self::Stderr(detail), Lang::En) => format!("({detail})"),
+        }
+    }
 }
 
 impl SetupRefusal {
@@ -327,6 +399,157 @@ impl SetupRefusal {
             (Self::BootstrapHomeUnresolved, En) => {
                 "cannot determine the home directory (HOME is not set)".to_string()
             }
+
+            (Self::InstallDuringSelfTest, Ja) => {
+                "セルフテスト中は実インストールを行いません（dry_run でのみ呼べます）".to_string()
+            }
+            (Self::InstallDuringSelfTest, En) => {
+                "no real installation runs during the self-test (call it only with dry_run)"
+                    .to_string()
+            }
+            (Self::InstallNotDelegable { os, command }, Ja) => format!(
+                "この環境では tako が自動インストールを代行できません（{os}）。\n\
+                 次のコマンドを自分で実行してから `tako setup` をやり直してください:\n  {command}"
+            ),
+            (Self::InstallNotDelegable { os, command }, En) => format!(
+                "tako cannot run the installation for you in this environment ({os}).\n\
+                 Run the following command yourself, then run `tako setup` again:\n  {command}"
+            ),
+            (Self::NoDownloader, Ja) => {
+                "curl も wget も見つかりません。どちらかを導入してから再実行してください\n\
+                 （macOS なら通常 curl が標準で入っています）"
+                    .to_string()
+            }
+            (Self::NoDownloader, En) => {
+                "neither curl nor wget can be located. Install one of them, then try again\n\
+                 (on macOS, curl is normally installed by default)"
+                    .to_string()
+            }
+            (Self::InstallerToolSpawn { program, error }, Ja) => {
+                format!("{program} を起動できません: {error}")
+            }
+            (Self::InstallerToolSpawn { program, error }, En) => {
+                format!("cannot start {program}: {error}")
+            }
+            (Self::InstallerFetchFailed { url, detail }, Ja) => format!(
+                "インストーラを取得できませんでした: {url}\n\
+                 {}\n\
+                 ネットワーク接続とプロキシ設定を確認してから再実行してください。\n\
+                 社内プロキシ環境では {url} へのアクセス許可が要ることがあります",
+                detail.text_in(lang)
+            ),
+            (Self::InstallerFetchFailed { url, detail }, En) => format!(
+                "could not download the installer: {url}\n\
+                 {}\n\
+                 Check the network connection and the proxy settings, then try again.\n\
+                 Behind a corporate proxy, access to {url} may need to be allowed",
+                detail.text_in(lang)
+            ),
+            (Self::InstallerUnreadable(e), Ja) => format!("取得したインストーラを読めません: {e}"),
+            (Self::InstallerUnreadable(e), En) => {
+                format!("cannot read the downloaded installer: {e}")
+            }
+            (Self::NotAnInstaller { url }, Ja) => format!(
+                "取得した内容がインストーラではありません（{url} が HTML かエラーページを返しています）。\n\
+                 社内プロキシやネットワーク制限が疑われます。ブラウザで {url} を開いて中身を確認するか、\n\
+                 ネットワークを変えて再実行してください"
+            ),
+            (Self::NotAnInstaller { url }, En) => format!(
+                "the downloaded content is not an installer ({url} returned HTML or an error page).\n\
+                 A corporate proxy or a network restriction is likely. Open {url} in a browser to \
+                 check what it returns,\n\
+                 or try again on a different network"
+            ),
+            (Self::InstallerOutOfMemory { log }, Ja) => format!(
+                "インストールがメモリ不足で中断されました（exit 137）。\
+                 空きメモリを増やしてから再実行してください{}",
+                log_detail(log)
+            ),
+            (Self::InstallerOutOfMemory { log }, En) => format!(
+                "the installation stopped because memory ran out (exit 137). \
+                 Free up memory, then try again{}",
+                log_detail(log)
+            ),
+            (Self::InstallerKilled { code, log }, Ja) => format!(
+                "インストールが途中で強制終了しました（exit {code}）。\
+                 もう一度実行するか、上に出ているメッセージを確認してください{}",
+                log_detail(log)
+            ),
+            (Self::InstallerKilled { code, log }, En) => format!(
+                "the installation was killed partway through (exit {code}). \
+                 Run it again, or check the messages shown above{}",
+                log_detail(log)
+            ),
+            (
+                Self::InstallerFailed {
+                    product,
+                    code,
+                    troubleshoot_url,
+                    log,
+                },
+                Ja,
+            ) => format!(
+                "{product} のインストーラが失敗しました（exit {code}）。上に出ているエラーを確認してください。\
+                 解決しない場合は {troubleshoot_url} を参照してください{}",
+                log_detail(log)
+            ),
+            (
+                Self::InstallerFailed {
+                    product,
+                    code,
+                    troubleshoot_url,
+                    log,
+                },
+                En,
+            ) => format!(
+                "the {product} installer failed (exit {code}). Check the error shown above. \
+                 If that does not solve it, see {troubleshoot_url}{}",
+                log_detail(log)
+            ),
+            (Self::InstalledButMissing { launcher, command }, Ja) => format!(
+                "インストーラは正常終了しましたが {launcher} が見つかりません。\n\
+                 `{command}` を手で実行して、出力に出るエラーを確認してください"
+            ),
+            (Self::InstalledButMissing { launcher, command }, En) => format!(
+                "the installer finished without errors, but {launcher} cannot be located.\n\
+                 Run `{command}` by hand and check the errors in its output"
+            ),
+
+            (Self::ShellProfileUnknown { shell, dirs }, Ja) => format!(
+                "使っているシェル（{}）の設定ファイルが分かりません。\n\
+                 次の {} 行をご自身のシェルの設定ファイルへ追加してください:\n{}",
+                if shell.is_empty() { "不明" } else { shell },
+                dirs.len(),
+                export_lines(dirs),
+            ),
+            (Self::ShellProfileUnknown { shell, dirs }, En) => format!(
+                "cannot tell which settings file your shell ({}) uses.\n\
+                 Add the following {} to your shell's settings file:\n{}",
+                if shell.is_empty() { "unknown" } else { shell },
+                if dirs.len() == 1 {
+                    "line".to_string()
+                } else {
+                    format!("{} lines", dirs.len())
+                },
+                export_lines(dirs),
+            ),
+            (Self::ShellProfileUnknownForUndo, Ja) => {
+                "使っているシェルの設定ファイルが分かりません".to_string()
+            }
+            (Self::ShellProfileUnknownForUndo, En) => {
+                "cannot tell which settings file your shell uses".to_string()
+            }
+            (Self::UserPathNotReflected { dir }, Ja) => format!(
+                "ユーザー PATH へ {dir} を追加できませんでした（書き込み後も反映されていません）。\n\
+                 設定 → システム → バージョン情報 → 環境変数 から手で追加してください"
+            ),
+            (Self::UserPathNotReflected { dir }, En) => format!(
+                "could not add {dir} to the user PATH (it is still missing after writing).\n\
+                 Add it by hand from Settings → System → About → Environment Variables"
+            ),
+            (Self::PathBlock(e), _) => e.text_in(lang),
+            (Self::CliLink(e), _) => e.text_in(lang),
+            (Self::UserPath(e), _) => e.text_in(lang),
         }
     }
 
@@ -346,7 +569,15 @@ impl SetupRefusal {
     }
 }
 
-/// 導入器の出力の添え方（空なら添えない・あれば改行を挟む。#2365 より前の組み立てのまま）
+/// シェルの設定ファイルへ足してもらう行（`export PATH="<dir>:$PATH"` を 1 行ずつ。#2365 より前の組み立てのまま）
+fn export_lines(dirs: &[String]) -> String {
+    dirs.iter()
+        .map(|d| format!("  export PATH=\"{d}:$PATH\""))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 導入器・インストーラの出力の添え方（空なら添えない・あれば改行を挟む。#2365 より前の組み立てのまま）
 fn log_detail(log: &str) -> String {
     if log.trim().is_empty() {
         String::new()
@@ -366,5 +597,23 @@ impl std::error::Error for SetupRefusal {}
 impl From<ConfigError> for SetupRefusal {
     fn from(e: ConfigError) -> Self {
         Self::Profile(e)
+    }
+}
+
+impl From<PathBlockError> for SetupRefusal {
+    fn from(e: PathBlockError) -> Self {
+        Self::PathBlock(e)
+    }
+}
+
+impl From<LinkError> for SetupRefusal {
+    fn from(e: LinkError) -> Self {
+        Self::CliLink(e)
+    }
+}
+
+impl From<UserPathError> for SetupRefusal {
+    fn from(e: UserPathError) -> Self {
+        Self::UserPath(e)
     }
 }

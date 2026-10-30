@@ -223,20 +223,25 @@ impl LinkChange {
 /// **symlink ではない実体が居る場所は触らない**（[`LinkChange::Skipped`]）。
 /// ユーザーが自分で置いた `tako` を消す権利はセットアップに無い
 pub fn ensure_link(link: &Path, want: &Path) -> Result<LinkChange, String> {
+    ensure_link_typed(link, want).map_err(LinkError::into_ja)
+}
+
+/// [`ensure_link`] の型の口（#2365。断りを表示言語で返す dispatch の経路が通る）
+pub fn ensure_link_typed(link: &Path, want: &Path) -> Result<LinkChange, LinkError> {
     match link_state(link, want) {
         LinkState::Correct => Ok(LinkChange::Unchanged),
         LinkState::Occupied => Ok(LinkChange::Skipped),
         LinkState::Missing => {
             create_parent(link)?;
-            create_symlink(want, link)
-                .map_err(|e| format!("{} を作成できません: {e}", link.display()))?;
+            create_symlink(want, link)?;
             Ok(LinkChange::Created)
         }
         LinkState::Dangling { .. } | LinkState::Other { .. } => {
-            std::fs::remove_file(link)
-                .map_err(|e| format!("{} を置き換えられません: {e}", link.display()))?;
-            create_symlink(want, link)
-                .map_err(|e| format!("{} を作成できません: {e}", link.display()))?;
+            std::fs::remove_file(link).map_err(|e| LinkError::Replace {
+                path: link.display().to_string(),
+                error: e.to_string(),
+            })?;
+            create_symlink(want, link)?;
             Ok(LinkChange::Updated)
         }
     }
@@ -255,6 +260,11 @@ pub fn repair_dangling(link: &Path, want: &Path) -> Result<LinkChange, String> {
 
 /// 置いた symlink を取り除く。**symlink 以外は消さない**
 pub fn remove_link(link: &Path) -> Result<LinkChange, String> {
+    remove_link_typed(link).map_err(LinkError::into_ja)
+}
+
+/// [`remove_link`] の型の口（#2365）
+pub fn remove_link_typed(link: &Path) -> Result<LinkChange, LinkError> {
     if std::fs::symlink_metadata(link).is_err() {
         return Ok(LinkChange::Absent);
     }
@@ -262,35 +272,95 @@ pub fn remove_link(link: &Path) -> Result<LinkChange, String> {
         // ユーザーが置いた実体。消さない
         return Ok(LinkChange::Skipped);
     }
-    std::fs::remove_file(link).map_err(|e| format!("{} を削除できません: {e}", link.display()))?;
+    std::fs::remove_file(link).map_err(|e| LinkError::Remove {
+        path: link.display().to_string(),
+        error: e.to_string(),
+    })?;
     Ok(LinkChange::Removed)
 }
 
-fn create_parent(link: &Path) -> Result<(), String> {
+fn create_parent(link: &Path) -> Result<(), LinkError> {
     let Some(parent) = link.parent() else {
         return Ok(());
     };
-    std::fs::create_dir_all(parent)
-        .map_err(|e| format!("{} を作成できません: {e}", parent.display()))
+    std::fs::create_dir_all(parent).map_err(|e| LinkError::Create {
+        path: parent.display().to_string(),
+        error: e.to_string(),
+    })
 }
 
 #[cfg(unix)]
-fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
+fn create_symlink(target: &Path, link: &Path) -> Result<(), LinkError> {
+    std::os::unix::fs::symlink(target, link).map_err(|e| LinkError::Create {
+        path: link.display().to_string(),
+        error: e.to_string(),
+    })
 }
 
 /// Windows では [`plan_for`] が `link: None` を返すのでここへは来ない。
 /// 万一呼ばれたら**黙って成功させない**（権限が要ることを理由つきで返す）
 #[cfg(not(unix))]
-fn create_symlink(_target: &Path, link: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!(
-            "{} への symlink はこの OS では張れません（ユーザー環境変数 Path を使います）",
-            link.display()
-        ),
-    ))
+fn create_symlink(_target: &Path, link: &Path) -> Result<(), LinkError> {
+    Err(LinkError::SymlinkUnsupported {
+        path: link.display().to_string(),
+    })
 }
+
+/// tako CLI の symlink の張り替え・取り除きの断り（#2365）。
+///
+/// 日英の対は [`LinkError::text_in`] の (バリアント, 言語) の網羅 match の 1 か所（Windows だけの
+/// [`LinkError::SymlinkUnsupported`] も `cfg` の外のここに置くので、macOS の番犬で日英を見られる）。
+/// 日本語は #2365 より前の固定文とバイト一致（`tako-control/tests/issue1762_dispatch_error_lang.rs`）。
+/// `String` を返す口（[`ensure_link`] / [`remove_link`] / [`repair_dangling`]）は日本語のまま
+/// （起動時の張り直しの診断・CLI の `tako setup` の段）。`error` は OS のエラー文（言語に依らずそのまま
+/// 載せる）、パスは表記のまま埋める
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkError {
+    /// symlink（またはその置き場）を作れない
+    Create { path: String, error: String },
+    /// 切れた / 別の先を指す symlink を外せない（張り替えの前段）
+    Replace { path: String, error: String },
+    /// 置いた symlink を消せない
+    Remove { path: String, error: String },
+    /// この OS では symlink を張らない（Windows はユーザー環境変数 Path を使う）
+    SymlinkUnsupported { path: String },
+}
+
+impl LinkError {
+    /// 表示言語を明示しての文言（網羅 match = バリアントを足すと日英の両方を書くまで通らない）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Create { path, error }, Ja) => format!("{path} を作成できません: {error}"),
+            (Self::Create { path, error }, En) => format!("cannot create {path}: {error}"),
+            (Self::Replace { path, error }, Ja) => format!("{path} を置き換えられません: {error}"),
+            (Self::Replace { path, error }, En) => format!("cannot replace {path}: {error}"),
+            (Self::Remove { path, error }, Ja) => format!("{path} を削除できません: {error}"),
+            (Self::Remove { path, error }, En) => format!("cannot delete {path}: {error}"),
+            (Self::SymlinkUnsupported { path }, Ja) => format!(
+                "{path} を作成できません: {path} への symlink はこの OS では張れません\
+                 （ユーザー環境変数 Path を使います）"
+            ),
+            (Self::SymlinkUnsupported { path }, En) => format!(
+                "cannot create {path}: symlinks cannot be created at {path} on this OS \
+                 (the user environment variable Path is used instead)"
+            ),
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(crate::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for LinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for LinkError {}
 
 /// いま動いている tako CLI の実体（解決できなければ `None`）。
 ///

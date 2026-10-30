@@ -247,10 +247,11 @@ fn 通っているかの判定がプロセスのpathへ戻っていない() {
 fn undo_pathがsymlinkも外している() {
     let rel = "crates/tako-control/src/setup_bootstrap.rs";
     let text = read(rel);
+    // 本体は型の口 `undo_path_for_typed`（#2365。`undo_path_for` はその日本語の包み）
     let hits = hits_in_fn(&text, "tako_cli_path::remove_link");
     assert!(
-        hits.iter().any(|(_, f)| f == "undo_path_for"),
-        "{rel}: `undo_path_for` が tako CLI の symlink を外していない（#1502）。\n\
+        hits.iter().any(|(_, f)| f == "undo_path_for_typed"),
+        "{rel}: `undo_path_for_typed` が tako CLI の symlink を外していない（#1502）。\n\
          ブロックだけ消すと `~/.local/bin/tako` が残り、\n\
          「元へ戻せる」という `undo-path` の約束が破れる。\n\
          見つかった呼び出し: {}",

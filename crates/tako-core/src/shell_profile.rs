@@ -236,10 +236,20 @@ pub fn ensure_dirs_on_path_in(
     dirs: &[PathBuf],
     current_path: Option<&str>,
 ) -> Result<EnsureOutcome, String> {
+    ensure_dirs_on_path_in_typed(home, shell, dirs, current_path).map_err(PathBlockError::into_ja)
+}
+
+/// [`ensure_dirs_on_path_in`] の型の口（#2365。断りを表示言語で返す dispatch の経路が通る）
+pub fn ensure_dirs_on_path_in_typed(
+    home: &Path,
+    shell: ShellKind,
+    dirs: &[PathBuf],
+    current_path: Option<&str>,
+) -> Result<EnsureOutcome, PathBlockError> {
     let profile = home.join(shell.login_profile_rel());
     let dirs: Vec<PathBuf> = dedup(dirs);
     if dirs.is_empty() {
-        return Err("PATH へ通すディレクトリが 1 つもありません".to_string());
+        return Err(PathBlockError::NoDirs);
     }
     if current_path.is_some_and(|p| dirs.iter().all(|d| path_contains(p, d))) {
         return Ok(EnsureOutcome {
@@ -289,6 +299,14 @@ fn dedup(dirs: &[PathBuf]) -> Vec<PathBuf> {
 
 /// 置いたブロックを取り除く（元のバイト列へ完全に戻す）
 pub fn remove_from_profile_in(home: &Path, shell: ShellKind) -> Result<EnsureOutcome, String> {
+    remove_from_profile_in_typed(home, shell).map_err(PathBlockError::into_ja)
+}
+
+/// [`remove_from_profile_in`] の型の口（#2365）
+pub fn remove_from_profile_in_typed(
+    home: &Path,
+    shell: ShellKind,
+) -> Result<EnsureOutcome, PathBlockError> {
     let profile = home.join(shell.login_profile_rel());
     let original = read_bytes(&profile)?;
     if !MARKERS.present(&original) {
@@ -314,21 +332,78 @@ pub fn profile_has_block(profile: &Path) -> bool {
     std::fs::read(profile).is_ok_and(|bytes| MARKERS.present(&bytes))
 }
 
-fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
+fn read_bytes(path: &Path) -> Result<Vec<u8>, PathBlockError> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(e) => Err(format!("{} を読めません: {e}", path.display())),
+        Err(e) => Err(PathBlockError::Read {
+            path: path.display().to_string(),
+            error: e.to_string(),
+        }),
     }
 }
 
-fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<(), PathBlockError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("{} を作成できません: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| PathBlockError::CreateDir {
+            path: parent.display().to_string(),
+            error: e.to_string(),
+        })?;
     }
-    std::fs::write(path, bytes).map_err(|e| format!("{} へ書けません: {e}", path.display()))
+    std::fs::write(path, bytes).map_err(|e| PathBlockError::Write {
+        path: path.display().to_string(),
+        error: e.to_string(),
+    })
 }
+
+/// profile の PATH ブロックの書き換えの断り（#2365）。
+///
+/// 日英の対は [`PathBlockError::text_in`] の (バリアント, 言語) の網羅 match の 1 か所。日本語は #2365 より前の
+/// 固定文とバイト一致（`tako-control/tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。
+/// `String` を返す口（[`ensure_dir_on_path_in`] / [`ensure_dirs_on_path_in`] / [`remove_from_profile_in`]）は
+/// 日本語のまま（CLI の `tako setup` の段は枠が日本語）。`error` は OS のエラー文（言語に依らずそのまま載せる）、
+/// パスは表記のまま埋める
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathBlockError {
+    /// 通すディレクトリが 1 つも無い
+    NoDirs,
+    /// profile を読めない（無いのは空として扱うので、ここへは来ない）
+    Read { path: String, error: String },
+    /// profile の置き場（親ディレクトリ）を作れない
+    CreateDir { path: String, error: String },
+    /// profile へ書けない
+    Write { path: String, error: String },
+}
+
+impl PathBlockError {
+    /// 表示言語を明示しての文言（網羅 match = バリアントを足すと日英の両方を書くまで通らない）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NoDirs, Ja) => "PATH へ通すディレクトリが 1 つもありません".to_string(),
+            (Self::NoDirs, En) => "there is no directory to add to PATH".to_string(),
+            (Self::Read { path, error }, Ja) => format!("{path} を読めません: {error}"),
+            (Self::Read { path, error }, En) => format!("cannot read {path}: {error}"),
+            (Self::CreateDir { path, error }, Ja) => format!("{path} を作成できません: {error}"),
+            (Self::CreateDir { path, error }, En) => format!("cannot create {path}: {error}"),
+            (Self::Write { path, error }, Ja) => format!("{path} へ書けません: {error}"),
+            (Self::Write { path, error }, En) => format!("cannot write to {path}: {error}"),
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(crate::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for PathBlockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for PathBlockError {}
 
 #[cfg(test)]
 mod tests {

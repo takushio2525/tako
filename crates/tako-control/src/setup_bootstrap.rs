@@ -35,6 +35,7 @@
 //!   sudo 参照 49 箇所・`have_sudo_access`）。setup が黙って権限昇格を走らせない
 
 use crate::orchestrator::agent::WorkerAgent;
+use crate::setup_refusal::FetchDetail;
 use crate::SetupRefusal;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -1013,7 +1014,12 @@ fn login_shell_sees(dir: &Path) -> (bool, Option<tako_core::probe::TimeoutNotice
 /// 公式のトラブルシュートにも `syntax error near unexpected token '<'` として
 /// 載っている実在の失敗モードで、パイプのままだと利用者には理由が見えない
 pub fn install_for(agent: AgentKind, opts: InstallOptions) -> Result<Value, String> {
-    let plan = install_plan_for(agent)?;
+    install_for_typed(agent, opts).map_err(SetupRefusal::into_ja)
+}
+
+/// [`install_for`] の型の口（#2365。断りを表示言語で返す dispatch の経路が通る）
+pub fn install_for_typed(agent: AgentKind, opts: InstallOptions) -> Result<Value, SetupRefusal> {
+    let plan = install_plan_for_typed(agent)?;
     if opts.dry_run {
         return Ok(json!({
             "performed": false,
@@ -1026,17 +1032,13 @@ pub fn install_for(agent: AgentKind, opts: InstallOptions) -> Result<Value, Stri
     // **実インストールが実ホームへ走る**ことがないよう、ここで構造的に止める。
     // 過去にテストが実環境を壊した事故があるので、経路自体を塞いでおく
     if std::env::var_os("TAKO_SELF_TEST").is_some() {
-        return Err(
-            "セルフテスト中は実インストールを行いません（dry_run でのみ呼べます）".to_string(),
-        );
+        return Err(SetupRefusal::InstallDuringSelfTest);
     }
     if !plan.can_run || (legacy_mode() && cfg!(windows)) {
-        return Err(format!(
-            "この環境では tako が自動インストールを代行できません（{}）。\n\
-             次のコマンドを自分で実行してから `tako setup` をやり直してください:\n  {}",
-            std::env::consts::OS,
-            plan.official_command,
-        ));
+        return Err(SetupRefusal::InstallNotDelegable {
+            os: std::env::consts::OS.to_string(),
+            command: plan.official_command.clone(),
+        });
     }
     let script = fetch_installer(agent, &plan)?;
     let result = run_installer(agent, &script, opts.interactive);
@@ -1044,13 +1046,9 @@ pub fn install_for(agent: AgentKind, opts: InstallOptions) -> Result<Value, Stri
     let _ = std::fs::remove_file(&script);
     let log = result?;
 
-    let binary = resolve_binary_for(agent).ok_or_else(|| {
-        format!(
-            "インストーラは正常終了しましたが {} が見つかりません。\n\
-             `{}` を手で実行して、出力に出るエラーを確認してください",
-            display_path(&plan.launcher),
-            plan.official_command
-        )
+    let binary = resolve_binary_for(agent).ok_or_else(|| SetupRefusal::InstalledButMissing {
+        launcher: display_path(&plan.launcher),
+        command: plan.official_command.clone(),
     })?;
     Ok(json!({
         "performed": true,
@@ -1105,13 +1103,9 @@ $ProgressPreference = 'SilentlyContinue'\n\
 Invoke-WebRequest -UseBasicParsing -Uri $env:TAKO_FETCH_URL -OutFile $env:TAKO_FETCH_DEST\n";
 
 /// インストーラを一時ファイルへ取得する。取得できた中身が本物かまで見る
-fn fetch_installer(agent: AgentKind, plan: &InstallPlan) -> Result<PathBuf, String> {
+fn fetch_installer(agent: AgentKind, plan: &InstallPlan) -> Result<PathBuf, SetupRefusal> {
     let runner = recipe_for(agent).runner;
-    let downloader = Downloader::detect().ok_or_else(|| {
-        "curl も wget も見つかりません。どちらかを導入してから再実行してください\n\
-         （macOS なら通常 curl が標準で入っています）"
-            .to_string()
-    })?;
+    let downloader = Downloader::detect().ok_or(SetupRefusal::NoDownloader)?;
     // 拡張子はインタプリタが要求するもの（PowerShell は `.ps1` 以外を実行しない）
     let dest = std::env::temp_dir().join(format!(
         "tako-{}-install-{}.{}",
@@ -1146,42 +1140,40 @@ fn fetch_installer(agent: AgentKind, plan: &InstallPlan) -> Result<PathBuf, Stri
     let output = command
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|e| format!("{bin} を起動できません: {e}"))?;
+        .map_err(|e| SetupRefusal::InstallerToolSpawn {
+            program: bin.clone(),
+            error: e.to_string(),
+        })?;
 
     if !output.status.success() {
         let _ = std::fs::remove_file(&dest);
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
-        return Err(format!(
-            "インストーラを取得できませんでした: {}\n\
-             {}\n\
-             ネットワーク接続とプロキシ設定を確認してから再実行してください。\n\
-             社内プロキシ環境では {} へのアクセス許可が要ることがあります",
-            plan.source_url,
-            if detail.is_empty() {
-                format!("（{bin} が exit {}）", output.status.code().unwrap_or(-1))
+        return Err(SetupRefusal::InstallerFetchFailed {
+            url: plan.source_url.clone(),
+            detail: if detail.is_empty() {
+                FetchDetail::Exit {
+                    program: bin,
+                    code: output.status.code().unwrap_or(-1),
+                }
             } else {
-                format!("（{detail}）")
+                FetchDetail::Stderr(detail.to_string())
             },
-            plan.source_url,
-        ));
+        });
     }
 
     // 先頭だけ見る。`install.ps1` は `param(...)` → `Set-StrictMode` → …の順なので
     // 512 バイトあればどちらの署名も判定できる（実物で確認）
     let head = std::fs::read(&dest)
-        .map_err(|e| format!("取得したインストーラを読めません: {e}"))?
+        .map_err(|e| SetupRefusal::InstallerUnreadable(e.to_string()))?
         .into_iter()
         .take(512)
         .collect::<Vec<u8>>();
     if !agent_install::looks_like_installer(runner.signature, &head) {
         let _ = std::fs::remove_file(&dest);
-        return Err(format!(
-            "取得した内容がインストーラではありません（{} が HTML かエラーページを返しています）。\n\
-             社内プロキシやネットワーク制限が疑われます。ブラウザで {} を開いて中身を確認するか、\n\
-             ネットワークを変えて再実行してください",
-            plan.source_url, plan.source_url
-        ));
+        return Err(SetupRefusal::NotAnInstaller {
+            url: plan.source_url.clone(),
+        });
     }
     Ok(dest)
 }
@@ -1200,7 +1192,11 @@ pub struct InstallOptions {
 ///
 /// 端末があるときは出力をそのまま流す（インストーラは進捗と TUI を出す）。
 /// GUI 内 dispatch から呼ばれたときは端末が無いので捕捉し、失敗時の診断へ回す
-fn run_installer(agent: AgentKind, script: &Path, interactive: bool) -> Result<String, String> {
+fn run_installer(
+    agent: AgentKind,
+    script: &Path,
+    interactive: bool,
+) -> Result<String, SetupRefusal> {
     let r = recipe_for(agent);
     let runner = r.runner;
     // インタプリタと引数はプラットフォーム境界（B17）が持つデータから組む。
@@ -1225,13 +1221,19 @@ fn run_installer(agent: AgentKind, script: &Path, interactive: bool) -> Result<S
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()
-            .map_err(|e| format!("{shell} を起動できません: {e}"))?;
+            .map_err(|e| SetupRefusal::InstallerToolSpawn {
+                program: shell.clone(),
+                error: e.to_string(),
+            })?;
         (status, String::new())
     } else {
         let output = command
             .stdin(std::process::Stdio::null())
             .output()
-            .map_err(|e| format!("{shell} を起動できません: {e}"))?;
+            .map_err(|e| SetupRefusal::InstallerToolSpawn {
+                program: shell.clone(),
+                error: e.to_string(),
+            })?;
         let mut log = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.trim().is_empty() {
@@ -1246,29 +1248,19 @@ fn run_installer(agent: AgentKind, script: &Path, interactive: bool) -> Result<S
         return Ok(log);
     }
     let code = status.code().unwrap_or(-1);
-    let detail = if log.trim().is_empty() {
-        String::new()
-    } else {
-        format!("\n{}", log.trim())
-    };
+    // 出力の添え方（空なら添えない）は `SetupRefusal` の文の側が持つ
     Err(match code {
         // インストーラ自身が説明を出す終了コード
-        137 => format!(
-            "インストールがメモリ不足で中断されました（exit 137）。\
-             空きメモリを増やしてから再実行してください{detail}"
-        ),
-        c if c >= 128 => format!(
-            "インストールが途中で強制終了しました（exit {c}）。\
-             もう一度実行するか、上に出ているメッセージを確認してください{detail}"
-        ),
+        137 => SetupRefusal::InstallerOutOfMemory { log },
+        c if c >= 128 => SetupRefusal::InstallerKilled { code: c, log },
         // 案内先は**その系統の公式ページ**（claude のトラブルシュートを
         // codex / agy の失敗に出さない。#989 のエッジ検証で踏んだ）
-        c => format!(
-            "{} のインストーラが失敗しました（exit {c}）。上に出ているエラーを確認してください。\
-             解決しない場合は {} を参照してください{detail}",
-            agent.product(),
-            r.troubleshoot_url,
-        ),
+        c => SetupRefusal::InstallerFailed {
+            product: agent.product().to_string(),
+            code: c,
+            troubleshoot_url: r.troubleshoot_url.to_string(),
+            log,
+        },
     })
 }
 
@@ -1312,9 +1304,9 @@ const LEGACY_LINE: &str =
 /// tako CLI の symlink を張る（unix のみ。Windows は `link: None` なので何もしない）
 fn ensure_tako_cli_link(
     plan: &tako_cli_path::Placement,
-) -> Result<tako_cli_path::LinkChange, String> {
+) -> Result<tako_cli_path::LinkChange, SetupRefusal> {
     match plan.link.as_deref() {
-        Some(link) => tako_cli_path::ensure_link(link, &plan.source),
+        Some(link) => Ok(tako_cli_path::ensure_link_typed(link, &plan.source)?),
         None => Ok(tako_cli_path::LinkChange::Unchanged),
     }
 }
@@ -1392,8 +1384,9 @@ pub fn ensure_tako_cli_path() -> Result<Value, String> {
             "tako CLI の実体を解決できません（実行中バイナリの隣に tako がありません）".to_string(),
         );
     };
-    let link_change = ensure_tako_cli_link(&plan)?;
-    let path = ensure_dirs_on_path(&home, &desired_path_dirs(&home, Some(&plan)))?;
+    let link_change = ensure_tako_cli_link(&plan).map_err(SetupRefusal::into_ja)?;
+    let path = ensure_dirs_on_path(&home, &desired_path_dirs(&home, Some(&plan)))
+        .map_err(SetupRefusal::into_ja)?;
     Ok(json!({
         "link_change": link_change.as_str(),
         "path": path,
@@ -1493,27 +1486,16 @@ pub fn tako_cli_path_check_line() -> String {
 }
 
 /// `dirs` をログインシェルの PATH（Windows はユーザー環境変数）へ通す
-fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, String> {
+fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, SetupRefusal> {
     if user_path::is_supported() {
         return ensure_user_path_dirs(dirs);
     }
     let (shell, _) = shell_target();
     let Some(shell) = shell else {
-        let current = std::env::var("SHELL").unwrap_or_default();
-        return Err(format!(
-            "使っているシェル（{}）の設定ファイルが分かりません。\n\
-             次の {} 行をご自身のシェルの設定ファイルへ追加してください:\n{}",
-            if current.is_empty() {
-                "不明"
-            } else {
-                &current
-            },
-            dirs.len(),
-            dirs.iter()
-                .map(|d| format!("  export PATH=\"{}:$PATH\"", display_path(d)))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ));
+        return Err(SetupRefusal::ShellProfileUnknown {
+            shell: std::env::var("SHELL").unwrap_or_default(),
+            dirs: dirs.iter().map(|d| display_path(d)).collect(),
+        });
     };
     // 「書かなくてよいか」は**新しく開いたターミナルが見る PATH**で判定する（#1502）。
     // プロセスの PATH は親から受け継いだだけで、ログインシェルが同じとは限らない
@@ -1527,7 +1509,8 @@ fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, String> {
         (None, Some(_)) => None,
         (None, None) => Some(std::env::var("PATH").unwrap_or_default()),
     };
-    let outcome = shell_profile::ensure_dirs_on_path_in(home, shell, dirs, path_var.as_deref())?;
+    let outcome =
+        shell_profile::ensure_dirs_on_path_in_typed(home, shell, dirs, path_var.as_deref())?;
     // 実際にログインシェルから引けるようになったかを**確かめてから**返す。
     // 「書いたはず」で終わらせない（.zshrc へ書いて届かなかった類の失敗を検出する）。
     // 読み取りが打ち切られたなら尋ね直さない（同じログインシェルを上限まで待つだけ）
@@ -1551,7 +1534,12 @@ fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, String> {
 ///
 /// #1502 から **tako 自身の CLI もここで一緒に通す**（マーカーブロックは 1 組のまま）
 pub fn ensure_path_for(agent: AgentKind) -> Result<Value, String> {
-    let home = home_dir()?;
+    ensure_path_for_typed(agent).map_err(SetupRefusal::into_ja)
+}
+
+/// [`ensure_path_for`] の型の口（#2365）
+pub fn ensure_path_for_typed(agent: AgentKind) -> Result<Value, SetupRefusal> {
+    let home = home_dir_typed()?;
     let r = recipe_for(agent);
     let dir = r.launcher_dir_in(&home);
     let plan = tako_cli_placement(&home);
@@ -1602,7 +1590,7 @@ fn ensure_user_path(
     dir: &Path,
     tako: Option<&tako_cli_path::Placement>,
     link_change: tako_cli_path::LinkChange,
-) -> Result<Value, String> {
+) -> Result<Value, SetupRefusal> {
     let mut dirs = vec![dir.to_path_buf()];
     // #1502: tako 自身の CLI のディレクトリも同じ経路で足す（**末尾へ追記**なので
     // ユーザーが並べた優先順位は動かない）
@@ -1658,26 +1646,24 @@ fn user_path_note(agent: AgentKind, verified: bool, rereads: bool) -> String {
 ///
 /// unix と違いマーカーが無いので「ブロックごと書き直す」ができず、
 /// エントリ単位の追記になる。既に在るものは触らない（冪等）
-fn ensure_user_path_dirs(dirs: &[PathBuf]) -> Result<Value, String> {
+fn ensure_user_path_dirs(dirs: &[PathBuf]) -> Result<Value, SetupRefusal> {
     let process_path = std::env::var("PATH").unwrap_or_default();
     let mut change = PathChange::AlreadyOnPath;
     let mut process_has = true;
     for entry in dirs {
         process_has &= user_path::contains_entry(&process_path, entry);
-        let current = user_path::read()?;
+        let current = user_path::read_typed()?;
         // レジストリに既に在る = 新しいターミナルからは引ける
         if let Some(next) = user_path::append_entry(&current.raw, entry) {
-            user_path::write(&user_path::UserPathValue {
+            user_path::write_typed(&user_path::UserPathValue {
                 raw: next,
                 kind: current.kind.clone(),
             })?;
-            let after = user_path::read()?;
+            let after = user_path::read_typed()?;
             if !user_path::contains_entry(&after.raw, entry) {
-                return Err(format!(
-                    "ユーザー PATH へ {} を追加できませんでした（書き込み後も反映されていません）。\n\
-                     設定 → システム → バージョン情報 → 環境変数 から手で追加してください",
-                    display_path(entry)
-                ));
+                return Err(SetupRefusal::UserPathNotReflected {
+                    dir: display_path(entry),
+                });
             }
             change = PathChange::Installed;
         }
@@ -1701,11 +1687,16 @@ fn ensure_user_path_dirs(dirs: &[PathBuf]) -> Result<Value, String> {
 
 /// 置いた PATH ブロックを取り除く（元のバイト列へ戻す）
 pub fn undo_path_for(agent: AgentKind) -> Result<Value, String> {
-    let home = home_dir()?;
+    undo_path_for_typed(agent).map_err(SetupRefusal::into_ja)
+}
+
+/// [`undo_path_for`] の型の口（#2365）
+pub fn undo_path_for_typed(agent: AgentKind) -> Result<Value, SetupRefusal> {
+    let home = home_dir_typed()?;
     let plan = tako_cli_placement(&home);
     // #1502: tako が張った symlink も一緒に外す（**symlink 以外は消さない**）
     let link_change = match plan.as_ref().and_then(|p| p.link.as_deref()) {
-        Some(link) => tako_cli_path::remove_link(link)?,
+        Some(link) => tako_cli_path::remove_link_typed(link)?,
         None => tako_cli_path::LinkChange::Absent,
     };
     if user_path::is_supported() {
@@ -1717,8 +1708,8 @@ pub fn undo_path_for(agent: AgentKind) -> Result<Value, String> {
         );
     }
     let (shell, _) = shell_target();
-    let shell = shell.ok_or("使っているシェルの設定ファイルが分かりません")?;
-    let outcome = shell_profile::remove_from_profile_in(&home, shell)?;
+    let shell = shell.ok_or(SetupRefusal::ShellProfileUnknownForUndo)?;
+    let outcome = shell_profile::remove_from_profile_in_typed(&home, shell)?;
     Ok(json!({
         "agent": agent.as_str(),
         "shell": shell.as_str(),
@@ -1746,7 +1737,7 @@ fn undo_user_path(
     dir: &Path,
     tako: Option<&tako_cli_path::Placement>,
     link_change: tako_cli_path::LinkChange,
-) -> Result<Value, String> {
+) -> Result<Value, SetupRefusal> {
     let mut dirs = vec![dir.to_path_buf()];
     if let Some(plan) = tako {
         if !dirs.contains(&plan.dir) {
@@ -1755,9 +1746,9 @@ fn undo_user_path(
     }
     let mut change = PathChange::Absent;
     for entry in &dirs {
-        let current = user_path::read()?;
+        let current = user_path::read_typed()?;
         if let Some(next) = user_path::remove_entry(&current.raw, entry) {
-            user_path::write(&user_path::UserPathValue {
+            user_path::write_typed(&user_path::UserPathValue {
                 raw: next,
                 kind: current.kind.clone(),
             })?;

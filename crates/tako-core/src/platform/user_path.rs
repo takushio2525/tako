@@ -375,37 +375,107 @@ pub fn reach(dir: &Path) -> Reach {
 
 /// ユーザー PATH（`HKCU\Environment\Path`）の生の値を読む
 pub fn read() -> Result<UserPathValue, String> {
+    read_typed().map_err(UserPathError::into_ja)
+}
+
+/// [`read`] の型の口（#2365。断りを表示言語で返す dispatch の経路が通る）
+pub fn read_typed() -> Result<UserPathValue, UserPathError> {
     imp::read()
 }
 
 /// ユーザー PATH を書く（**種別を保って**書き戻す）
 pub fn write(value: &UserPathValue) -> Result<(), String> {
+    write_typed(value).map_err(UserPathError::into_ja)
+}
+
+/// [`write`] の型の口（#2365）
+pub fn write_typed(value: &UserPathValue) -> Result<(), UserPathError> {
     imp::write(value)
 }
 
 /// 新しく開いたターミナルが見る PATH（マシン + ユーザー）。
 /// 判定にだけ使うので、順序は Windows の実際の組み立てに合わせなくてよい
 pub fn effective() -> Result<String, String> {
-    imp::effective()
+    imp::effective().map_err(UserPathError::into_ja)
 }
+
+/// ユーザー PATH の読み書きの断り（#2365）。
+///
+/// 日英の対は [`UserPathError::text_in`] の (バリアント, 言語) の網羅 match の 1 か所。Windows の `imp` だけが
+/// 組む文もここ（`cfg` の外）に置くので、macOS の番犬で日英と #2365 より前の固定文とのバイト一致を見られる
+/// （`tako-control/tests/issue1762_dispatch_error_lang.rs`）。`String` を返す口（[`read`] / [`write`] /
+/// [`effective`] / [`parse_read_output`]）は日本語のまま。`error` / `stderr` は OS・PowerShell のエラー文
+/// （言語に依らずそのまま載せる）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserPathError {
+    /// このプラットフォームにはプロセス外に永続する PATH が無い（unix。呼び手は profile 経路へ行く）
+    Unsupported,
+    /// PowerShell を起動できない
+    Spawn { program: String, error: String },
+    /// PowerShell が非ゼロ終了（`stderr` は前後の空白を落としたもの）
+    Failed { code: i32, stderr: String },
+    /// 読み出しスクリプトの出力に目印の 2 行が無い（`output` は前後の空白を落とした出力）
+    BadOutput { output: String },
+}
+
+impl UserPathError {
+    /// 表示言語を明示しての文言（網羅 match = バリアントを足すと日英の両方を書くまで通らない）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Unsupported, Ja) => {
+                "このプラットフォームにはプロセス外に永続する PATH がありません\
+                 （profile 経路を使ってください）"
+                    .to_string()
+            }
+            (Self::Unsupported, En) => "this platform has no PATH that persists outside a process \
+                 (use the profile route)"
+                .to_string(),
+            (Self::Spawn { program, error }, Ja) => format!("{program} を起動できません: {error}"),
+            (Self::Spawn { program, error }, En) => format!("cannot start {program}: {error}"),
+            (Self::Failed { code, stderr }, Ja) => {
+                format!("PowerShell がユーザー PATH の操作に失敗しました（exit {code}）: {stderr}")
+            }
+            (Self::Failed { code, stderr }, En) => {
+                format!("PowerShell failed to update the user PATH (exit {code}): {stderr}")
+            }
+            (Self::BadOutput { output }, Ja) => {
+                format!("ユーザー PATH の読み出し結果を解釈できません: {output:?}")
+            }
+            (Self::BadOutput { output }, En) => {
+                format!("cannot interpret the output of reading the user PATH: {output:?}")
+            }
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(crate::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for UserPathError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for UserPathError {}
 
 #[cfg(not(windows))]
 mod imp {
-    use super::UserPathValue;
+    use super::{UserPathError, UserPathValue};
 
-    const UNSUPPORTED: &str =
-        "このプラットフォームにはプロセス外に永続する PATH がありません（profile 経路を使ってください）";
-
-    pub fn read() -> Result<UserPathValue, String> {
-        Err(UNSUPPORTED.to_string())
+    pub fn read() -> Result<UserPathValue, UserPathError> {
+        Err(UserPathError::Unsupported)
     }
 
-    pub fn write(_value: &UserPathValue) -> Result<(), String> {
-        Err(UNSUPPORTED.to_string())
+    pub fn write(_value: &UserPathValue) -> Result<(), UserPathError> {
+        Err(UserPathError::Unsupported)
     }
 
-    pub fn effective() -> Result<String, String> {
-        Err(UNSUPPORTED.to_string())
+    pub fn effective() -> Result<String, UserPathError> {
+        Err(UserPathError::Unsupported)
     }
 
     pub fn registry_paths() -> super::RegistryPaths {
@@ -415,7 +485,7 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use super::UserPathValue;
+    use super::{UserPathError, UserPathValue};
 
     /// 読み出しスクリプト。`DoNotExpandEnvironmentNames` で**生の値**を取る。
     ///
@@ -454,7 +524,7 @@ uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'\n\
 } catch { }\n";
 
     /// PowerShell を 1 回起こす。`-EncodedCommand` なので引用符もコードページも関与しない
-    fn run(script: &str, env: &[(&str, &str)]) -> Result<String, String> {
+    fn run(script: &str, env: &[(&str, &str)]) -> Result<String, UserPathError> {
         let program = crate::platform::exe::find("powershell")
             .or_else(|| crate::platform::exe::find("pwsh"))
             .unwrap_or_else(|| "powershell.exe".to_string());
@@ -473,24 +543,26 @@ uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'\n\
         let output = command
             .stdin(std::process::Stdio::null())
             .output()
-            .map_err(|e| format!("{program} を起動できません: {e}"))?;
+            .map_err(|e| UserPathError::Spawn {
+                program: program.clone(),
+                error: e.to_string(),
+            })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "PowerShell がユーザー PATH の操作に失敗しました（exit {}）: {}",
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
-            ));
+            return Err(UserPathError::Failed {
+                code: output.status.code().unwrap_or(-1),
+                stderr: stderr.trim().to_string(),
+            });
         }
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    pub fn read() -> Result<UserPathValue, String> {
+    pub fn read() -> Result<UserPathValue, UserPathError> {
         let out = run(READ_SCRIPT, &[])?;
-        super::parse_read_output(&out)
+        super::parse_read_output_typed(&out)
     }
 
-    pub fn write(value: &UserPathValue) -> Result<(), String> {
+    pub fn write(value: &UserPathValue) -> Result<(), UserPathError> {
         run(
             WRITE_SCRIPT,
             &[
@@ -501,7 +573,7 @@ uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'\n\
         Ok(())
     }
 
-    pub fn effective() -> Result<String, String> {
+    pub fn effective() -> Result<String, UserPathError> {
         let user = read()?.raw;
         let machine = std::env::var("PATH").unwrap_or_default();
         Ok(format!("{machine};{user}"))
@@ -628,6 +700,11 @@ fn decode_registry_string(units: &[u16]) -> String {
 
 /// 読み出しスクリプトの出力をほどく（**純粋関数**なので macOS からも検証できる）
 pub fn parse_read_output(stdout: &str) -> Result<UserPathValue, String> {
+    parse_read_output_typed(stdout).map_err(UserPathError::into_ja)
+}
+
+/// [`parse_read_output`] の型の口（#2365）
+pub fn parse_read_output_typed(stdout: &str) -> Result<UserPathValue, UserPathError> {
     let mut kind = None;
     let mut raw = None;
     for line in stdout.lines() {
@@ -639,10 +716,9 @@ pub fn parse_read_output(stdout: &str) -> Result<UserPathValue, String> {
     }
     match (raw, kind) {
         (Some(raw), Some(kind)) => Ok(UserPathValue { raw, kind }),
-        _ => Err(format!(
-            "ユーザー PATH の読み出し結果を解釈できません: {:?}",
-            stdout.trim()
-        )),
+        _ => Err(UserPathError::BadOutput {
+            output: stdout.trim().to_string(),
+        }),
     }
 }
 
