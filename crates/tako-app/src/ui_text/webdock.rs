@@ -26,20 +26,8 @@ pub fn held() -> &'static str {
         "tako quit while this web view was opening last time, so it was not reopened automatically"
     )
 }
-/// まだ wry の Web ビューが無いあいだの断り（#724。CLI / MCP の eval・focus 等の応答）。
-/// `state` は `web list` の `state`（queued / creating / held / failed）
-pub fn not_ready(id: u64, state: &str) -> String {
-    tr!(
-        format!(
-            "Web ビュー {id} はまだ開いていない（state = {state}。web list の state が ready になってから。\
-             held / failed は navigate で開き直す）"
-        ),
-        format!(
-            "Web view {id} is not open yet (state = {state}). Wait until its state in web list is ready; \
-             reopen a held or failed one with navigate"
-        )
-    )
-}
+// まだ wry の Web ビューが無いあいだの断り（#724。CLI / MCP の eval・navigate の応答）は
+// `tako_control::HostRefusal::WebViewNotReady` へ移した（#2365。GUI 側の口の断りの日英の表）
 
 #[cfg(test)]
 mod tests {
@@ -56,7 +44,6 @@ mod tests {
                 load_failed().to_string(),
                 creating().to_string(),
                 held().to_string(),
-                not_ready(3, "creating"),
             ]
         });
     }

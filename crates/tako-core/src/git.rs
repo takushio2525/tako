@@ -195,13 +195,130 @@ fn git_command(repo: &Path) -> Command {
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let out = run_git_raw(repo, args)?;
+    run_git_typed(repo, args).map_err(GitError::into_ja)
+}
+
+/// [`run_git`] の型の口（#2365）。失敗の stderr は git 自身の出力なので [`GitError::Failed`] でそのまま運ぶ
+fn run_git_typed(repo: &Path, args: &[&str]) -> Result<String, GitError> {
+    let out = run_git_raw_typed(repo, args)?;
     if out.success {
         Ok(out.stdout)
     } else {
-        Err(out.stderr.trim().to_string())
+        Err(GitError::Failed(out.stderr.trim().to_string()))
     }
 }
+
+/// git の書き込み系（ステージ・コミット・pull / push・ブランチの切替と作成・マージ・中止）の断り（#2365）。
+///
+/// 日英の対は [`GitError::text_in`] の (バリアント, 言語) の網羅 match の 1 か所。日本語は #2365 より前の
+/// 固定文とバイト一致（`tako-control/tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。
+/// `String` を返す従来の口（[`commit`] / [`checkout`] / [`validate_branch_name`] ほか）は日本語のまま
+/// （GUI の git パネルが直に呼ぶ）。dispatch（CLI / MCP）だけが型の口 `*_typed` を通る。
+/// [`GitError::Failed`] は git 自身の stderr（git のロケールの言語）で、日英とも同じ文をそのまま載せる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitError {
+    /// git を起動できない（中身は OS のエラー文）
+    Spawn(String),
+    /// git が失敗した（stderr をそのまま。tako は文を書かない）
+    Failed(String),
+    /// コミットメッセージが空（空白だけ）
+    EmptyCommitMessage,
+    /// ブランチ名が空
+    BranchNameEmpty,
+    /// ブランチ名が `-` で始まる（オプションと解釈される）
+    BranchNameLeadingDash,
+    /// ブランチ名に空白・制御文字がある
+    BranchNameSpace,
+    /// ブランチ名に使えない記号（`~^:?*[\`）がある
+    BranchNameChar(char),
+    /// ブランチ名に `..` / `@{` がある（または `@` そのもの）
+    BranchNameDots,
+    /// ブランチ名の `/` の使い方が不正（先頭・末尾・連続）
+    BranchNameSlash,
+    /// ブランチ名が `.` / `.lock` で終わる
+    BranchNameEnd,
+    /// ブランチ名の要素が `.` で始まる
+    BranchNameDotComponent,
+    /// 切替先・マージ元のブランチが無い（ローカルにもリモート追跡にも）
+    BranchMissing(String),
+    /// 作ろうとしたブランチが既にある
+    BranchExists(String),
+    /// 新しいブランチの基点が無い
+    StartPointMissing(String),
+    /// マージが失敗し、git が何も出力しなかった
+    MergeFailed,
+    /// 中止できる操作（merge / rebase / cherry-pick / revert）が進行中ではない
+    NothingToAbort,
+}
+
+impl GitError {
+    /// 表示言語を明示しての文言（網羅 match = バリアントを足すと日英の両方を書くまで通らない）。
+    /// 日本語の「見つかりません」は 404 へ寄せる読み（`見つからない` / ` not found`）に当たらないので、
+    /// 英語も ` not found` を使わず、日英で当たり方をそろえる
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Spawn(error), Ja) => format!("git を実行できない: {error}"),
+            (Self::Spawn(error), En) => format!("cannot run git: {error}"),
+            (Self::Failed(stderr), Ja | En) => stderr.clone(),
+            (Self::EmptyCommitMessage, Ja) => "コミットメッセージが空です".to_string(),
+            (Self::EmptyCommitMessage, En) => "the commit message is empty".to_string(),
+            (Self::BranchNameEmpty, Ja) => "ブランチ名が空です".to_string(),
+            (Self::BranchNameEmpty, En) => "the branch name is empty".to_string(),
+            (Self::BranchNameLeadingDash, Ja) => {
+                "ブランチ名を - で始めることはできません".to_string()
+            }
+            (Self::BranchNameLeadingDash, En) => "a branch name cannot start with -".to_string(),
+            (Self::BranchNameSpace, Ja) => "ブランチ名に空白・制御文字は使えません".to_string(),
+            (Self::BranchNameSpace, En) => {
+                "a branch name cannot contain spaces or control characters".to_string()
+            }
+            (Self::BranchNameChar(c), Ja) => format!("ブランチ名に {c} は使えません"),
+            (Self::BranchNameChar(c), En) => format!("a branch name cannot contain {c}"),
+            (Self::BranchNameDots, Ja) => "ブランチ名に .. や @{ は使えません".to_string(),
+            (Self::BranchNameDots, En) => "a branch name cannot contain .. or @{".to_string(),
+            (Self::BranchNameSlash, Ja) => "ブランチ名の / の使い方が不正です".to_string(),
+            (Self::BranchNameSlash, En) => {
+                "a branch name cannot start or end with / or contain //".to_string()
+            }
+            (Self::BranchNameEnd, Ja) => {
+                "ブランチ名を . や .lock で終わらせることはできません".to_string()
+            }
+            (Self::BranchNameEnd, En) => "a branch name cannot end with . or .lock".to_string(),
+            (Self::BranchNameDotComponent, Ja) => {
+                "ブランチ名の各要素を . で始めることはできません".to_string()
+            }
+            (Self::BranchNameDotComponent, En) => {
+                "no part of a branch name (between slashes) can start with .".to_string()
+            }
+            (Self::BranchMissing(name), Ja) => format!("ブランチ '{name}' が見つかりません"),
+            (Self::BranchMissing(name), En) => format!("branch '{name}' does not exist"),
+            (Self::BranchExists(name), Ja) => format!("ブランチ '{name}' はすでに存在します"),
+            (Self::BranchExists(name), En) => format!("branch '{name}' already exists"),
+            (Self::StartPointMissing(start), Ja) => format!("基点 '{start}' が見つかりません"),
+            (Self::StartPointMissing(start), En) => {
+                format!("start point '{start}' does not exist")
+            }
+            (Self::MergeFailed, Ja) => "マージに失敗しました".to_string(),
+            (Self::MergeFailed, En) => "the merge failed".to_string(),
+            (Self::NothingToAbort, Ja) => "中止できる操作が進行中ではありません".to_string(),
+            (Self::NothingToAbort, En) => "there is no operation in progress to abort".to_string(),
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(crate::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for GitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for GitError {}
 
 /// git の生の実行結果（#496）。
 /// `git merge` は「コンフリクトで終了コード 1」を正常な結果として返すため、
@@ -213,11 +330,16 @@ struct GitOutput {
 }
 
 fn run_git_raw(repo: &Path, args: &[&str]) -> Result<GitOutput, String> {
+    run_git_raw_typed(repo, args).map_err(GitError::into_ja)
+}
+
+/// [`run_git_raw`] の型の口（#2365）
+fn run_git_raw_typed(repo: &Path, args: &[&str]) -> Result<GitOutput, GitError> {
     let output = git_command(repo)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
-        .map_err(|e| format!("git を実行できない: {e}"))?;
+        .map_err(|e| GitError::Spawn(e.to_string()))?;
     Ok(GitOutput {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -1262,23 +1384,33 @@ pub fn show_commit(repo: &Path, hash: &str) -> Result<CommitDetail, String> {
 
 /// git add: 指定パスをステージングする。パスが空なら全変更（`git add -A`）
 pub fn stage(repo: &Path, paths: &[&str]) -> Result<String, String> {
+    stage_typed(repo, paths).map_err(GitError::into_ja)
+}
+
+/// [`stage`] の型の口（#2365）
+pub fn stage_typed(repo: &Path, paths: &[&str]) -> Result<String, GitError> {
     if paths.is_empty() {
-        run_git(repo, &["add", "-A"])
+        run_git_typed(repo, &["add", "-A"])
     } else {
         let mut args = vec!["add", "--"];
         args.extend(paths);
-        run_git(repo, &args)
+        run_git_typed(repo, &args)
     }
 }
 
 /// git reset HEAD: 指定パスをアンステージする。パスが空なら全アンステージ
 pub fn unstage(repo: &Path, paths: &[&str]) -> Result<String, String> {
+    unstage_typed(repo, paths).map_err(GitError::into_ja)
+}
+
+/// [`unstage`] の型の口（#2365）
+pub fn unstage_typed(repo: &Path, paths: &[&str]) -> Result<String, GitError> {
     if paths.is_empty() {
-        run_git(repo, &["reset", "HEAD"])
+        run_git_typed(repo, &["reset", "HEAD"])
     } else {
         let mut args = vec!["reset", "HEAD", "--"];
         args.extend(paths);
-        run_git(repo, &args)
+        run_git_typed(repo, &args)
     }
 }
 
@@ -1329,8 +1461,13 @@ pub fn commit_block(message: &str, has_changes: bool) -> Option<CommitBlock> {
 
 /// git commit -m: メッセージ付きコミット。`all` = true で `-a`（tracked のみ auto stage）
 pub fn commit(repo: &Path, message: &str, all: bool) -> Result<String, String> {
+    commit_typed(repo, message, all).map_err(GitError::into_ja)
+}
+
+/// [`commit`] の型の口（#2365）
+pub fn commit_typed(repo: &Path, message: &str, all: bool) -> Result<String, GitError> {
     if message.trim().is_empty() {
-        return Err("コミットメッセージが空です".to_string());
+        return Err(GitError::EmptyCommitMessage);
     }
     let mut args = vec!["commit"];
     if all {
@@ -1338,17 +1475,27 @@ pub fn commit(repo: &Path, message: &str, all: bool) -> Result<String, String> {
     }
     args.push("-m");
     args.push(message);
-    run_git(repo, &args)
+    run_git_typed(repo, &args)
 }
 
 /// git pull
 pub fn pull(repo: &Path) -> Result<String, String> {
-    run_git(repo, &["pull"])
+    pull_typed(repo).map_err(GitError::into_ja)
+}
+
+/// [`pull`] の型の口（#2365）
+pub fn pull_typed(repo: &Path) -> Result<String, GitError> {
+    run_git_typed(repo, &["pull"])
 }
 
 /// git push
 pub fn push(repo: &Path) -> Result<String, String> {
-    run_git(repo, &["push"])
+    push_typed(repo).map_err(GitError::into_ja)
+}
+
+/// [`push`] の型の口（#2365）
+pub fn push_typed(repo: &Path) -> Result<String, GitError> {
+    run_git_typed(repo, &["push"])
 }
 
 // ──────────────── ブランチ操作 / マージ / コンフリクト（#496）────────────────
@@ -1500,29 +1647,34 @@ fn describe_ref(repo: &Path, refname: &str) -> Option<String> {
 ///   （`git checkout -- x` は「ファイルの復元」になる）ので、名前側で弾くしかない
 /// - 実行前に理由を日本語で返す（git のエラーを読ませない）
 pub fn validate_branch_name(name: &str) -> Result<(), String> {
+    validate_branch_name_typed(name).map_err(GitError::into_ja)
+}
+
+/// [`validate_branch_name`] の型の口（#2365。dispatch が表示言語で断る）
+pub fn validate_branch_name_typed(name: &str) -> Result<(), GitError> {
     if name.is_empty() {
-        return Err("ブランチ名が空です".into());
+        return Err(GitError::BranchNameEmpty);
     }
     if name.starts_with('-') {
-        return Err("ブランチ名を - で始めることはできません".into());
+        return Err(GitError::BranchNameLeadingDash);
     }
     if name.chars().any(|c| c.is_control() || c == ' ') {
-        return Err("ブランチ名に空白・制御文字は使えません".into());
+        return Err(GitError::BranchNameSpace);
     }
     if let Some(c) = name.chars().find(|c| "~^:?*[\\".contains(*c)) {
-        return Err(format!("ブランチ名に {c} は使えません"));
+        return Err(GitError::BranchNameChar(c));
     }
     if name.contains("..") || name.contains("@{") || name == "@" {
-        return Err("ブランチ名に .. や @{ は使えません".into());
+        return Err(GitError::BranchNameDots);
     }
     if name.starts_with('/') || name.ends_with('/') || name.contains("//") {
-        return Err("ブランチ名の / の使い方が不正です".into());
+        return Err(GitError::BranchNameSlash);
     }
     if name.ends_with('.') || name.ends_with(".lock") {
-        return Err("ブランチ名を . や .lock で終わらせることはできません".into());
+        return Err(GitError::BranchNameEnd);
     }
     if name.split('/').any(|part| part.starts_with('.')) {
-        return Err("ブランチ名の各要素を . で始めることはできません".into());
+        return Err(GitError::BranchNameDotComponent);
     }
     Ok(())
 }
@@ -1600,7 +1752,7 @@ impl CheckoutPreview {
 }
 
 /// 切替対象の解決結果（ローカル / リモート追跡）
-fn resolve_checkout_target(repo: &Path, target: &str) -> Result<(String, bool), String> {
+fn resolve_checkout_target(repo: &Path, target: &str) -> Result<(String, bool), GitError> {
     if local_branch_exists(repo, target) {
         return Ok((target.to_string(), false));
     }
@@ -1614,11 +1766,16 @@ fn resolve_checkout_target(repo: &Path, target: &str) -> Result<(String, bool), 
         }
         return Ok((short.to_string(), false));
     }
-    Err(format!("ブランチ '{target}' が見つかりません"))
+    Err(GitError::BranchMissing(target.to_string()))
 }
 
 pub fn checkout_preview(repo: &Path, target: &str) -> Result<CheckoutPreview, String> {
-    validate_branch_name(target)?;
+    checkout_preview_typed(repo, target).map_err(GitError::into_ja)
+}
+
+/// [`checkout_preview`] の型の口（#2365）。下見の `blockers`（応答の値）は日本語のまま
+pub fn checkout_preview_typed(repo: &Path, target: &str) -> Result<CheckoutPreview, GitError> {
+    validate_branch_name_typed(target)?;
     let (resolved, creates_local_branch) = resolve_checkout_target(repo, target)?;
     let st = status(repo);
     let current = st.branch.clone();
@@ -1671,19 +1828,24 @@ pub fn checkout_preview(repo: &Path, target: &str) -> Result<CheckoutPreview, St
 
 /// ブランチを切り替える（#496）。`preview` の内容を承諾済みである前提で実行する
 pub fn checkout(repo: &Path, target: &str) -> Result<String, String> {
-    validate_branch_name(target)?;
+    checkout_typed(repo, target).map_err(GitError::into_ja)
+}
+
+/// [`checkout`] の型の口（#2365）
+pub fn checkout_typed(repo: &Path, target: &str) -> Result<String, GitError> {
+    validate_branch_name_typed(target)?;
     let (resolved, creates_local_branch) = resolve_checkout_target(repo, target)?;
     let out = if creates_local_branch {
         // リモート追跡ブランチ → 同名ローカルブランチを作って追跡設定つきで切り替える
-        run_git_raw(repo, &["checkout", "--track", &resolved])?
+        run_git_raw_typed(repo, &["checkout", "--track", &resolved])?
     } else {
-        run_git_raw(repo, &["checkout", &resolved])?
+        run_git_raw_typed(repo, &["checkout", &resolved])?
     };
     if out.success {
         // git checkout は進捗を stderr に出す。成功時はそちらが本文になる
         Ok(merge_streams(&out.stdout, &out.stderr))
     } else {
-        Err(out.stderr.trim().to_string())
+        Err(GitError::Failed(out.stderr.trim().to_string()))
     }
 }
 
@@ -1695,14 +1857,24 @@ pub fn create_branch(
     start_point: Option<&str>,
     switch: bool,
 ) -> Result<String, String> {
-    validate_branch_name(name)?;
+    create_branch_typed(repo, name, start_point, switch).map_err(GitError::into_ja)
+}
+
+/// [`create_branch`] の型の口（#2365）
+pub fn create_branch_typed(
+    repo: &Path,
+    name: &str,
+    start_point: Option<&str>,
+    switch: bool,
+) -> Result<String, GitError> {
+    validate_branch_name_typed(name)?;
     if local_branch_exists(repo, name) {
-        return Err(format!("ブランチ '{name}' はすでに存在します"));
+        return Err(GitError::BranchExists(name.to_string()));
     }
     if let Some(start) = start_point {
-        validate_branch_name(start)?;
+        validate_branch_name_typed(start)?;
         if !ref_exists(repo, start) {
-            return Err(format!("基点 '{start}' が見つかりません"));
+            return Err(GitError::StartPointMissing(start.to_string()));
         }
     }
     let mut args: Vec<&str> = if switch {
@@ -1713,11 +1885,11 @@ pub fn create_branch(
     if let Some(start) = start_point {
         args.push(start);
     }
-    let out = run_git_raw(repo, &args)?;
+    let out = run_git_raw_typed(repo, &args)?;
     if out.success {
         Ok(merge_streams(&out.stdout, &out.stderr))
     } else {
-        Err(out.stderr.trim().to_string())
+        Err(GitError::Failed(out.stderr.trim().to_string()))
     }
 }
 
@@ -1783,9 +1955,14 @@ impl MergePreview {
 }
 
 pub fn merge_preview(repo: &Path, target: &str) -> Result<MergePreview, String> {
-    validate_branch_name(target)?;
+    merge_preview_typed(repo, target).map_err(GitError::into_ja)
+}
+
+/// [`merge_preview`] の型の口（#2365）。下見の `blockers`（応答の値）は日本語のまま
+pub fn merge_preview_typed(repo: &Path, target: &str) -> Result<MergePreview, GitError> {
+    validate_branch_name_typed(target)?;
     if !ref_exists(repo, target) {
-        return Err(format!("ブランチ '{target}' が見つかりません"));
+        return Err(GitError::BranchMissing(target.to_string()));
     }
     let st = status(repo);
     let current = st.branch.clone();
@@ -1905,9 +2082,14 @@ pub struct MergeOutcome {
 /// ブランチを現在のブランチへマージする（#496）。
 /// コンフリクトは**エラーではなく結果**として返す（解消カードへ繋ぐため）
 pub fn merge(repo: &Path, target: &str, no_ff: bool) -> Result<MergeOutcome, String> {
-    validate_branch_name(target)?;
+    merge_typed(repo, target, no_ff).map_err(GitError::into_ja)
+}
+
+/// [`merge`] の型の口（#2365）
+pub fn merge_typed(repo: &Path, target: &str, no_ff: bool) -> Result<MergeOutcome, GitError> {
+    validate_branch_name_typed(target)?;
     if !ref_exists(repo, target) {
-        return Err(format!("ブランチ '{target}' が見つかりません"));
+        return Err(GitError::BranchMissing(target.to_string()));
     }
     // --no-edit: エディタが無い環境（GUI から起動した tako）でマージコミットを止めない
     let mut args = vec!["merge", "--no-edit"];
@@ -1915,7 +2097,7 @@ pub fn merge(repo: &Path, target: &str, no_ff: bool) -> Result<MergeOutcome, Str
         args.push("--no-ff");
     }
     args.push(target);
-    let out = run_git_raw(repo, &args)?;
+    let out = run_git_raw_typed(repo, &args)?;
     let text = merge_streams(&out.stdout, &out.stderr);
     if out.success {
         return Ok(MergeOutcome {
@@ -1934,23 +2116,28 @@ pub fn merge(repo: &Path, target: &str, no_ff: bool) -> Result<MergeOutcome, Str
         });
     }
     Err(if text.is_empty() {
-        "マージに失敗しました".to_string()
+        GitError::MergeFailed
     } else {
-        text
+        GitError::Failed(text)
     })
 }
 
 /// 進行中の操作を中止する（#496）。merge / rebase / cherry-pick / revert に対応
 pub fn abort_operation(repo: &Path) -> Result<(RepoOperation, String), String> {
+    abort_operation_typed(repo).map_err(GitError::into_ja)
+}
+
+/// [`abort_operation`] の型の口（#2365）
+pub fn abort_operation_typed(repo: &Path) -> Result<(RepoOperation, String), GitError> {
     let state = conflict_state(repo);
     let Some(args) = state.operation.abort_args() else {
-        return Err("中止できる操作が進行中ではありません".into());
+        return Err(GitError::NothingToAbort);
     };
-    let out = run_git_raw(repo, &args)?;
+    let out = run_git_raw_typed(repo, &args)?;
     if out.success {
         Ok((state.operation, merge_streams(&out.stdout, &out.stderr)))
     } else {
-        Err(out.stderr.trim().to_string())
+        Err(GitError::Failed(out.stderr.trim().to_string()))
     }
 }
 

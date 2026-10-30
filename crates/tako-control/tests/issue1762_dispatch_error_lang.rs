@@ -37,6 +37,9 @@
 //! #2365 の続きで、orchestrator の設定ファイル（projects / accounts / profiles）の読み書きとエージェント名の
 //! 検証の断り（`orchestrator::ConfigError`）にも広げた（末尾）。型の口の本体と、それを呼ぶ dispatch の
 //! 関数のソースも読んで名指す。
+//! #2365 の続きで、dispatch の `op_err` が載せる中身のうち日本語のまま残っていた git の書き込み系
+//! （tako-core の `git::GitError`）と GUI の Web ビューの navigate / eval と URL の検査（`HostRefusal`）にも
+//! 広げた（末尾）。`op_err` へ日本語の固定文を渡す書き足しも dispatch のソースを読んで名指す。
 //!
 //! このファイルは**独立したテストバイナリ**で、言語グローバルを触るのは
 //! `display_follows_the_display_language` の 1 本だけ（ほかは `text_in` で言語を引数に渡す）。
@@ -7642,9 +7645,18 @@ fn host_refusal_index(r: &HostRefusal) -> usize {
         HostRefusal::NoCodeBlockInMessage => 45,
         HostRefusal::NothingToCopy => 46,
         HostRefusal::FileTreeClosed => 47,
+        HostRefusal::WebViewNotReady { .. } => 48,
+        HostRefusal::WebBackFailed(_) => 49,
+        HostRefusal::WebForwardFailed(_) => 50,
+        HostRefusal::WebReloadFailed(_) => 51,
+        HostRefusal::WebLoadFailed(_) => 52,
+        HostRefusal::WebEvalFailed(_) => 53,
+        HostRefusal::UrlEmpty => 54,
+        HostRefusal::UrlHasWhitespace(_) => 55,
+        HostRefusal::UrlHasControlChar(_) => 56,
     }
 }
-const HOST_REFUSAL_VARIANTS: usize = 48;
+const HOST_REFUSAL_VARIANTS: usize = 57;
 
 /// (断り, #2365 より前に GUI が組んでいた日本語の固定文)。中身で腕を分けるもの
 /// （`LinkIndexOutOfRange` の total・`WebViewNotFound` の案内）は両方を載せる
@@ -7804,6 +7816,46 @@ fn host_refusal_table() -> Vec<(HostRefusal, String)> {
         (H::NoCodeBlockInMessage, "この発話にコードブロックが無い".into()),
         (H::NothingToCopy, "コピーする本文が無い".into()),
         (H::FileTreeClosed, "ファイルツリーが閉じている".into()),
+        // #2365 の続き（`op_err` の中身）: Web ビューの navigate / eval と URL の検査（`webview.rs`）。
+        // 生成前の断りは #2365 より前から `ui_text::webdock::not_ready` で日英だった（英語も下の検査で旧文と比べる）
+        (
+            H::WebViewNotReady {
+                id: 3,
+                state: "creating".into(),
+            },
+            "Web ビュー 3 はまだ開いていない（state = creating。web list の state が ready になってから。\
+             held / failed は navigate で開き直す）"
+                .into(),
+        ),
+        (
+            H::WebBackFailed("no history".into()),
+            "back 失敗: no history".into(),
+        ),
+        (
+            H::WebForwardFailed("no history".into()),
+            "forward 失敗: no history".into(),
+        ),
+        (
+            H::WebReloadFailed("WebView2 error".into()),
+            "reload 失敗: WebView2 error".into(),
+        ),
+        (
+            H::WebLoadFailed("WebView2 error".into()),
+            "URL 読み込み失敗: WebView2 error".into(),
+        ),
+        (
+            H::WebEvalFailed("WebView2 error".into()),
+            "eval 失敗: WebView2 error".into(),
+        ),
+        (H::UrlEmpty, "URL が空です".into()),
+        (
+            H::UrlHasWhitespace("https://a b".into()),
+            "URL に空白文字が含まれています（NSURL が解釈できない）: https://a b".into(),
+        ),
+        (
+            H::UrlHasControlChar("https://a\u{1}b".into()),
+            "URL に制御文字が含まれています（NSURL が解釈できない）: https://a\u{1}b".into(),
+        ),
     ]
 }
 
@@ -8015,6 +8067,14 @@ const HOST_IMPL_SCOPES: &[(&str, &str)] = &[
         "crates/tako-app/src/preview.rs",
         "pub(crate) fn search_jump<K>(",
     ),
+    // #2365 の続き（`op_err` の中身）: `web_navigate` / `web_eval` / `web_open` が委ねる Web ビューの口
+    ("crates/tako-app/src/webview.rs", "    pub fn queued("),
+    ("crates/tako-app/src/webview.rs", "    fn not_ready_error("),
+    ("crates/tako-app/src/webview.rs", "    pub fn navigate("),
+    ("crates/tako-app/src/webview.rs", "    fn navigate_pending("),
+    ("crates/tako-app/src/webview.rs", "    pub fn eval("),
+    ("crates/tako-app/src/webview.rs", "    pub fn retry("),
+    ("crates/tako-app/src/webview.rs", "pub fn validate_url("),
 ];
 
 /// 断りではない日本語の呼び出し（診断の出力 = persist.log / stderr は日本語のまま。内部の印も）
@@ -11626,4 +11686,450 @@ pub fn setup_mcp(tako_binary: &str) -> Result<(), String> {
         .map(|(l, _, _)| l)
         .collect();
     assert_eq!(found, vec![3, 6, 7], "日本語の口の 3 か所だけを名指す");
+}
+
+// ---- #2365 の続き: dispatch の `op_err` が載せる中身（git の書き込み系・Web ビュー・固定文） ----
+//
+// `op_err` は中身の `Display` をそのまま `Operation` の文にする。中身の大半（`PaneTreeError` /
+// `WorkspaceError` / `HostRefusal`）は日英済みで、日本語のまま残っていたのは次の 3 つだった:
+// (1) tako-core の git の書き込み系（`git.rs`。commit / pull / push / stage / unstage / ブランチの作成と
+//     切替 / マージ / 中止と、ブランチ名の検証）→ `tako_core::git::GitError`（型の口 `*_typed`）
+// (2) GUI の Web ビューの navigate / eval と URL の検査（`webview.rs`）→ `HostRefusal`（上の GUI 側の口の節）
+// (3) dispatch が `op_err("…")` へ渡していた日本語の固定文 2 つ（どちらも届かない経路）
+// ここでは (1) の表（全バリアントが日英・日本語は #2365 より前の固定文とバイト一致・見つからないの読みが
+// 日英で同じ）と、(1) の型の口の本体・dispatch の git の口・(3) の書き足しを `file:line` で名指す。
+// git 自身の stderr（`GitError::Failed`）は外部の出力なので日英とも同じ文をそのまま載せる
+
+// git.rs のソース（`GIT_SRC` / `GIT_PATH`）は変更履歴の打ち切りの節（#2541）と同じものを使う
+use tako_core::git::GitError;
+
+/// `GitError` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
+fn git_error_index(e: &GitError) -> usize {
+    match e {
+        GitError::Spawn(_) => 0,
+        GitError::Failed(_) => 1,
+        GitError::EmptyCommitMessage => 2,
+        GitError::BranchNameEmpty => 3,
+        GitError::BranchNameLeadingDash => 4,
+        GitError::BranchNameSpace => 5,
+        GitError::BranchNameChar(_) => 6,
+        GitError::BranchNameDots => 7,
+        GitError::BranchNameSlash => 8,
+        GitError::BranchNameEnd => 9,
+        GitError::BranchNameDotComponent => 10,
+        GitError::BranchMissing(_) => 11,
+        GitError::BranchExists(_) => 12,
+        GitError::StartPointMissing(_) => 13,
+        GitError::MergeFailed => 14,
+        GitError::NothingToAbort => 15,
+    }
+}
+
+const GIT_ERROR_VARIANTS: usize = 16;
+
+/// 見本と、#2365 より前の `git.rs` の固定文（`Failed` は git の stderr = 枠の無い素通し）
+fn git_error_table() -> Vec<(GitError, String)> {
+    let enoent = "No such file or directory (os error 2)";
+    let stderr = "fatal: pathspec 'nope.txt' did not match any files";
+    vec![
+        (
+            GitError::Spawn(enoent.into()),
+            format!("git を実行できない: {enoent}"),
+        ),
+        (GitError::Failed(stderr.into()), stderr.into()),
+        (
+            GitError::EmptyCommitMessage,
+            "コミットメッセージが空です".into(),
+        ),
+        (GitError::BranchNameEmpty, "ブランチ名が空です".into()),
+        (
+            GitError::BranchNameLeadingDash,
+            "ブランチ名を - で始めることはできません".into(),
+        ),
+        (
+            GitError::BranchNameSpace,
+            "ブランチ名に空白・制御文字は使えません".into(),
+        ),
+        (
+            GitError::BranchNameChar('~'),
+            "ブランチ名に ~ は使えません".into(),
+        ),
+        (
+            GitError::BranchNameDots,
+            "ブランチ名に .. や @{ は使えません".into(),
+        ),
+        (
+            GitError::BranchNameSlash,
+            "ブランチ名の / の使い方が不正です".into(),
+        ),
+        (
+            GitError::BranchNameEnd,
+            "ブランチ名を . や .lock で終わらせることはできません".into(),
+        ),
+        (
+            GitError::BranchNameDotComponent,
+            "ブランチ名の各要素を . で始めることはできません".into(),
+        ),
+        (
+            GitError::BranchMissing("nope".into()),
+            "ブランチ 'nope' が見つかりません".into(),
+        ),
+        (
+            GitError::BranchExists("main".into()),
+            "ブランチ 'main' はすでに存在します".into(),
+        ),
+        (
+            GitError::StartPointMissing("nope".into()),
+            "基点 'nope' が見つかりません".into(),
+        ),
+        (GitError::MergeFailed, "マージに失敗しました".into()),
+        (
+            GitError::NothingToAbort,
+            "中止できる操作が進行中ではありません".into(),
+        ),
+    ]
+}
+
+#[test]
+fn gitの書き込み系の断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let table = git_error_table();
+    covers_every(
+        &table.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        git_error_index,
+        GIT_ERROR_VARIANTS,
+        "GitError",
+    );
+    let mut failures = Vec::new();
+    for (e, old) in &table {
+        let debug = format!("{e:?}");
+        let at = |lang| where_written(GIT_SRC, GIT_PATH, "impl GitError {", &debug, lang);
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        if let GitError::Failed(stderr) = e {
+            // git の stderr は tako の文ではない: 日英とも手を加えずにそのまま
+            if ja != *stderr || en != *stderr {
+                failures.push(format!(
+                    "{}: {debug}: git の stderr に手を加えている\n  ja: {ja}\n  en: {en}",
+                    at(Lang::En)
+                ));
+            }
+        } else {
+            check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+        }
+        if e.clone().into_ja() != ja {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+    report_all(failures);
+}
+
+/// git の書き込み系の型の口の本体（断りの文は `GitError` にだけ置く）
+const GIT_TYPED_HEADS: [&str; 15] = [
+    "fn run_git_typed(",
+    "fn run_git_raw_typed(",
+    "pub fn validate_branch_name_typed(",
+    "pub fn stage_typed(",
+    "pub fn unstage_typed(",
+    "pub fn commit_typed(",
+    "pub fn pull_typed(",
+    "pub fn push_typed(",
+    "fn resolve_checkout_target(",
+    "pub fn checkout_preview_typed(",
+    "pub fn checkout_typed(",
+    "pub fn create_branch_typed(",
+    "pub fn merge_preview_typed(",
+    "pub fn merge_typed(",
+    "pub fn abort_operation_typed(",
+];
+
+/// 型の口の本体が呼んではいけない口（`String` を返す日本語の口・型を日本語の文へ戻す `into_ja` /
+/// `Lang::Ja`）。呼んで断りに載せると、中身だけ日本語のまま型の口を通り抜ける
+const JA_GIT_INNER_CALLS: [&str; 5] = [
+    "run_git(",
+    "run_git_raw(",
+    "validate_branch_name(",
+    "into_ja",
+    "Lang::Ja",
+];
+
+/// 型の口の本体で、日本語の口を呼んで断りに載せている行（断りを捨てる文 = 下見の材料は見ない）
+fn ja_git_inner_calls(lines: &[(usize, &str)]) -> Vec<(usize, &'static str, String)> {
+    let mut out = Vec::new();
+    for (i, (line, code)) in lines.iter().enumerate() {
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        if let Some(call) = JA_GIT_INNER_CALLS.iter().find(|c| code.contains(*c)) {
+            if !statement_discards_error(lines, i) {
+                out.push((*line, *call, code.trim().to_string()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn gitの型の口の断りに日本語の固定文が無く日本語の口を呼ばない() {
+    let mut failures = Vec::new();
+    for head in GIT_TYPED_HEADS {
+        let Some(lines) = front_scope_lines(GIT_SRC, Some(head)) else {
+            failures.push(format!(
+                "{GIT_PATH}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする。GIT_TYPED_HEADS を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in refusal_japanese(&lines) {
+            failures.push(format!(
+                "{GIT_PATH}:{line}: git の型の口の断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （GitError へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+        for (line, call, code) in ja_git_inner_calls(&lines) {
+            failures.push(format!(
+                "{GIT_PATH}:{line}: git の型の口が日本語の口 `{call}` を呼んでいる = 英語表示でも中身だけ \
+                 日本語で混ざる（`*_typed` を呼ぶ）: {code}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// dispatch が呼んではいけない git の日本語の口（型の口 `*_typed` の外側）
+const JA_GIT_CALLS: [&str; 12] = [
+    "git::commit(",
+    "git::pull(",
+    "git::push(",
+    "git::stage(",
+    "git::unstage(",
+    "git::create_branch(",
+    "git::abort_operation(",
+    "git::checkout_preview(",
+    "git::checkout(",
+    "git::merge_preview(",
+    "git::merge(",
+    "git::validate_branch_name(",
+];
+
+/// dispatch の git の書き込み系（`git_write_reply` と、そこから呼ぶ切替・マージの下見と実行）
+const GIT_DISPATCH_HEADS: [&str; 3] = [
+    "fn git_write_reply(",
+    "fn run_git_checkout(",
+    "fn run_git_merge(",
+];
+
+fn ja_git_calls(lines: &[(usize, &str)]) -> Vec<(usize, &'static str, String)> {
+    let mut out = Vec::new();
+    for (i, (line, code)) in lines.iter().enumerate() {
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        if let Some(call) = JA_GIT_CALLS.iter().find(|c| code.contains(*c)) {
+            if !statement_discards_error(lines, i) {
+                out.push((*line, *call, code.trim().to_string()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn dispatch_はgitの断りを日本語の口から載せない() {
+    let mut failures = Vec::new();
+    for head in GIT_DISPATCH_HEADS {
+        let Some(lines) = front_scope_lines(DISPATCH_SRC, Some(head)) else {
+            failures.push(format!(
+                "{DISPATCH_PATH}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする。GIT_DISPATCH_HEADS を直す）"
+            ));
+            continue;
+        };
+        for (line, call, code) in ja_git_calls(&lines) {
+            failures.push(format!(
+                "{DISPATCH_PATH}:{line}: dispatch が git の日本語の口 `{call}…)` の断りを載せている = 英語表示でも \
+                 中身だけ日本語で混ざる（`*_typed` を呼んで op_err で載せる）: {code}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// dispatch の本体で `op_err(` に日本語の固定文を渡している行（`op_err` は中身をそのまま文にするので、
+/// 日本語の固定文は英語表示にもそのまま出る）
+fn op_err_japanese(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (line, code) in lines {
+        let Some(at) = code.find("op_err(") else {
+            continue;
+        };
+        if let Some(c) = line_literals(&code[at..])
+            .iter()
+            .find_map(|lit| has_japanese(lit))
+        {
+            out.push((*line, format!("（{c}）{}", code.trim())));
+        }
+    }
+    out
+}
+
+#[test]
+fn dispatch_は_op_err_に日本語の固定文を渡さない() {
+    let mut failures = Vec::new();
+    for (line, text) in op_err_japanese(&dispatch_code_lines()) {
+        failures.push(format!(
+            "{DISPATCH_PATH}:{line}: `op_err` に日本語の固定文を渡している = 英語表示にもそのまま出る \
+             （Reason へバリアントを足すか、日英済みの断り（DispatchError / Reason / tako-core の型）を使う）: {text}"
+        ));
+    }
+    report_all(failures);
+}
+
+/// Web ビューの口（`webview.rs` と GUI の `impl WebViewHost`）は断りを日本語へ戻さない（stderr の診断は
+/// 口の外 = 描画の側で日本語を引く）
+#[test]
+fn web_ビューの口は断りを日本語へ戻さない() {
+    let mut failures = Vec::new();
+    let webview = read_repo_file("crates/tako-app/src/webview.rs");
+    let main = read_repo_file("crates/tako-app/src/main.rs");
+    let scopes: [(&str, &str, &str); 8] = [
+        (
+            "crates/tako-app/src/webview.rs",
+            &webview,
+            "    pub fn queued(",
+        ),
+        (
+            "crates/tako-app/src/webview.rs",
+            &webview,
+            "    fn not_ready_error(",
+        ),
+        (
+            "crates/tako-app/src/webview.rs",
+            &webview,
+            "    pub fn navigate(",
+        ),
+        (
+            "crates/tako-app/src/webview.rs",
+            &webview,
+            "    fn navigate_pending(",
+        ),
+        (
+            "crates/tako-app/src/webview.rs",
+            &webview,
+            "    pub fn eval(",
+        ),
+        (
+            "crates/tako-app/src/webview.rs",
+            &webview,
+            "    pub fn retry(",
+        ),
+        (
+            "crates/tako-app/src/webview.rs",
+            &webview,
+            "pub fn validate_url(",
+        ),
+        (
+            "crates/tako-app/src/main.rs",
+            &main,
+            "impl WebViewHost for TakoApp {",
+        ),
+    ];
+    for (path, src, head) in scopes {
+        let Some(lines) = item_lines(src, head) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする）"
+            ));
+            continue;
+        };
+        for (line, code) in lines {
+            if code.trim_start().starts_with("//") {
+                continue;
+            }
+            if code.contains("Lang::Ja") || code.contains("into_ja") {
+                failures.push(format!(
+                    "{path}:{line}: Web ビューの口が断りを日本語へ戻している = CLI / MCP の英語表示でも \
+                     日本語で返る（HostRefusal をそのまま `?` で載せる）: {}",
+                    code.trim()
+                ));
+            }
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 範囲が引け、植えた日本語・日本語の口の呼び足し・`op_err` の固定文を名指し、
+/// 断りを捨てる文（下見の材料）・コメント・定義の行は見逃す
+#[test]
+fn op_err_の中身の番犬の境界() {
+    for head in GIT_TYPED_HEADS {
+        assert!(
+            front_scope_lines(GIT_SRC, Some(head)).is_some(),
+            "{head} の範囲を引けない"
+        );
+    }
+    for head in GIT_DISPATCH_HEADS {
+        let lines = front_scope_lines(DISPATCH_SRC, Some(head)).expect("dispatch の git の口");
+        assert!(
+            lines.iter().any(|(_, c)| c.contains("_typed(")),
+            "{head} が型の口を呼んでいない（範囲が空振りしている）"
+        );
+    }
+    let src = r#"pub fn commit_typed(repo: &Path, message: &str) -> Result<String, GitError> {
+    // run_git(repo) はコメント
+    let changed = run_git(repo, &["diff"]).unwrap_or_default();
+    if message.is_empty() {
+        return Err(GitError::Failed("コミットメッセージが空です".into()));
+    }
+    let a = run_git(repo, &["commit"])?;
+    let b = validate_branch_name(message).map_err(|e| GitError::Failed(e))?;
+    run_git_typed(repo, &["commit"]).map_err(GitError::into_ja)
+}
+"#;
+    let lines = front_scope_lines(src, Some("pub fn commit_typed(")).expect("頭を引ける");
+    let found: Vec<usize> = refusal_japanese(&lines)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(found, vec![5], "型の中へ書き戻した日本語を名指す");
+    let found: Vec<usize> = ja_git_inner_calls(&lines)
+        .into_iter()
+        .map(|(l, _, _)| l)
+        .collect();
+    assert_eq!(
+        found,
+        vec![7, 8, 9],
+        "日本語の口の 3 か所だけを名指す（下見の材料は見逃す）"
+    );
+
+    let src = r#"fn run_git_checkout(repo: &Path) -> Result<Value, DispatchError> {
+    let p = tako_core::git::checkout_preview_typed(repo, branch).map_err(op_err)?;
+    let out = tako_core::git::checkout(repo, branch).map_err(op_err)?;
+    let ok = tako_core::git::validate_branch_name(branch).is_ok();
+    let t = ws.get_tab(tid).ok_or_else(|| op_err("タブが見つかりません"))?;
+    let u = ws.get_tab(tid).ok_or(DispatchError::TabNotFound(raw))?;
+    Err(op_err(e))
+}
+"#;
+    let lines: Vec<(usize, &str)> = src.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+    let found: Vec<usize> = ja_git_calls(&lines)
+        .into_iter()
+        .map(|(l, _, _)| l)
+        .collect();
+    assert_eq!(found, vec![3], "日本語の口の呼び出しだけを名指す");
+    let found: Vec<usize> = op_err_japanese(&lines)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(found, vec![5], "op_err の日本語の固定文だけを名指す");
+}
+
+/// 生成前の断り（#724）は #2365 より前から `ui_text::webdock::not_ready` で日英だった。`HostRefusal` へ
+/// 移しても英語も 1 バイトも変えない
+#[test]
+fn web_ビューの生成前の断りは移す前の英語ともバイト一致() {
+    let r = HostRefusal::WebViewNotReady {
+        id: 3,
+        state: "creating".into(),
+    };
+    assert_eq!(
+        r.text_in(Lang::En),
+        "Web view 3 is not open yet (state = creating). Wait until its state in web list is ready; \
+         reopen a held or failed one with navigate"
+    );
 }
