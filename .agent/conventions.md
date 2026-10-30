@@ -5191,7 +5191,9 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
 - **tako CLI は env を落としただけでは本番 GUI へ届く**（#2527）。`TAKO_SOCKET` が無い（か繋がらない）と、
   CLI と remote daemon は発見ファイル（`<TAKO_DISCOVERY_DIR か data dir>/control.json` と `instances/`）を
   読み、data dir の既定（`$HOME/Library/Application Support/tako`）に居る本番 GUI へ繋ぐ（FR-2.2.9）。
-  `TAKO_ISOLATED=1` が置き場を差し替えるのは GUI の起動時だけで、**CLI の置き場は変えない**。
+  `TAKO_ISOLATED=1` が置き場を差し替えるのは GUI の起動時だけで、**CLI の置き場は変えない**
+  （#2531 からは、印のある CLI / daemon が置き場を明示していなければ既定の置き場を読まずに日英の断りで
+  止まる = 本番へは届かないが、隔離 GUI へも繋がらない。順番待ちだけは印があっても本番の調停役へ並ぶ）。
   `test-serve-watch.sh` は `unset` と `TAKO_ISOLATED=1` だけで `tako remote start` を回し、QR の画像を
   本番のアクティブなタブへ開いた。検証スクリプトは tako CLI を起こす前に `TAKO_DATA_DIR` /
   `TAKO_DISCOVERY_DIR` / `HOME` のどれかを一時の側へ向ける（先頭の `export TAKO_DATA_DIR="$TMP/data"` か、

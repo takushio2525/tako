@@ -21,11 +21,21 @@
 //!   自分のファイルを削除する（クラッシュ残骸は次回の掃除と接続プローブが吸収）
 //! - セルフテストは `TAKO_DISCOVERY_DIR` で専用の一時ディレクトリへ隔離し、
 //!   メインの control.json には一切触らない
+//!
+//! ## 隔離の印（#2531）
+//!
+//! `TAKO_ISOLATED=1` の CLI / remote daemon が置き場（`TAKO_DISCOVERY_DIR` / `TAKO_DATA_DIR`）を
+//! 明示していなければ、繋ぎ先の候補（[`read_candidates`]）は既定（本番）の置き場を読まずに
+//! [`IsolatedWithoutDir`] を返す。tako-app は同じ印で起動すると両方を一時の側へ差し替える（#177）ので、
+//! 「隔離の印 = 本番の GUI に触らない」を CLI 側でもそろえる。例外は順番待ち（#1994）の調停役だけ
+//! （[`read_candidates_machine_wide`]。マシン全体で 1 つ = 隔離した検証のビルドも本番の順番待ちへ並ぶ）
 
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tako_core::i18n::Lang;
 
 /// 接続情報ファイルの中身。トークンを含むためログに出さないこと（`conventions.md`）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,10 +253,100 @@ pub fn read() -> Option<ControlInfo> {
     read_from(&info_path()?)
 }
 
+/// `TAKO_ISOLATED=1` なのに発見の置き場（`TAKO_DISCOVERY_DIR` / `TAKO_DATA_DIR`）を明示していないので、
+/// 既定（本番）の置き場の接続情報を読まなかった（#2531）。
+///
+/// `Display` は表示言語のグローバルを引く。CLI は GUI へ送るだけの枝でグローバルを決めないので、
+/// 利用者へ返す断りは [`Self::text_in`] に `settings::client_lang` を渡して組む
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsolatedWithoutDir;
+
+impl IsolatedWithoutDir {
+    /// 表示言語を明示しての文言
+    pub fn text_in(self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (Self, Lang::Ja) => {
+                "TAKO_ISOLATED=1 なので既定（本番）の置き場の接続情報は読まない（本番の tako へは\
+                 繋がない）。隔離した tako へ繋ぐには、その tako と同じ TAKO_DISCOVERY_DIR か \
+                 TAKO_DATA_DIR を指定するか、TAKO_SOCKET と TAKO_TOKEN を渡してください"
+            }
+            (Self, Lang::En) => {
+                "TAKO_ISOLATED=1 is set, so the connection info in the default (production) \
+                 location is not read (this never connects to the production tako). To reach an \
+                 isolated tako, set the same TAKO_DISCOVERY_DIR or TAKO_DATA_DIR as that tako, \
+                 or pass TAKO_SOCKET and TAKO_TOKEN"
+            }
+        }
+    }
+
+    /// 先に試した接続の失敗（死んだ `TAKO_SOCKET` 等。`cause` は同じ表示言語で組んだ文）の後ろへ
+    /// この断りを続けた 1 文
+    pub fn after(self, cause: &str, lang: Lang) -> String {
+        match lang {
+            Lang::Ja => format!("{cause}。{}", self.text_in(lang)),
+            Lang::En => format!("{cause}. {}", self.text_in(lang)),
+        }
+    }
+}
+
+impl std::fmt::Display for IsolatedWithoutDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text_in(tako_core::i18n::lang()))
+    }
+}
+
+impl std::error::Error for IsolatedWithoutDir {}
+
+/// 既定の置き場を読まない組み合わせか（#2531。純関数 = テストが env を書き換えない）。
+/// 隔離の印の読み方は tako-app の一括隔離（#177）と同じ `1` / `true` / `on`、置き場の空の値は
+/// 未設定と同じ（[`base_dir`] / `paths::data_dir` と同じ読み方）
+pub fn refuses_default_place(
+    isolated: Option<&str>,
+    discovery_dir: Option<&OsStr>,
+    data_dir: Option<&OsStr>,
+) -> bool {
+    tako_core::tmux_cleanup::is_isolated_value(isolated)
+        && discovery_dir.is_none_or(OsStr::is_empty)
+        && data_dir.is_none_or(OsStr::is_empty)
+}
+
+/// このプロセスの env で [`refuses_default_place`] を引く。A/B は `TAKO_2531_LEGACY=1`
+/// （修正前 = 隔離の印でも既定の置き場から繋ぐ）
+fn isolation_gate() -> Result<(), IsolatedWithoutDir> {
+    if std::env::var_os("TAKO_2531_LEGACY").is_some_and(|v| v == "1") {
+        return Ok(());
+    }
+    let refused = refuses_default_place(
+        std::env::var("TAKO_ISOLATED").ok().as_deref(),
+        std::env::var_os("TAKO_DISCOVERY_DIR").as_deref(),
+        std::env::var_os("TAKO_DATA_DIR").as_deref(),
+    );
+    if refused {
+        Err(IsolatedWithoutDir)
+    } else {
+        Ok(())
+    }
+}
+
+/// 繋ぎ先のフォールバック候補列（CLI の `send_request_classified` と remote daemon の
+/// `AppIpcClient::connect` が引く）。`TAKO_ISOLATED=1` で置き場を明示していなければ既定（本番）の
+/// 置き場を読まずに断る（#2531）。中身は [`read_candidates_machine_wide`] と同じ
+pub fn read_candidates() -> Result<Vec<ControlInfo>, IsolatedWithoutDir> {
+    isolation_gate()?;
+    Ok(candidates_in_base())
+}
+
+/// 順番待ち（#1994）の調停役を探す候補列。**隔離の印を見ない**: 調停役はマシン全体で 1 つ
+/// （本番の GUI の中）で、隔離した検証のビルド（`run_heavy` / `tako queue`）もそこへ並ぶのが仕様。
+/// 呼び手は CLI の順番待ちの口（`queue_send`）だけ（番犬 `issue2531_isolated_discovery` が固定する）
+pub fn read_candidates_machine_wide() -> Vec<ControlInfo> {
+    candidates_in_base()
+}
+
 /// フォールバック候補列: current → 各インスタンス（更新の新しい順）。
 /// 重複（同一ソケット）は除く。CLI は先頭から順に接続を試す（バグ (8) の恒久対策:
 /// current が一時インスタンスの残骸でも、生きているメインへ自動で届く）
-pub fn read_candidates() -> Vec<ControlInfo> {
+fn candidates_in_base() -> Vec<ControlInfo> {
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
     if let Some(info) = read() {
@@ -412,12 +512,12 @@ mod tests {
         write(&dead).unwrap();
         // current は死んだ一時インスタンスを指している
         assert_eq!(read().map(|i| i.pid), Some(dead_pid));
-        let candidates = read_candidates();
+        let candidates = read_candidates().expect("置き場を明示している");
         assert_eq!(candidates[0].pid, dead_pid, "先頭は current");
         // 死んだインスタンスのファイルは次の write で掃除される
         // （ソケットが生きて見えても pid が死んでいれば消える）
         write(&alive).unwrap();
-        let candidates = read_candidates();
+        let candidates = read_candidates().expect("置き場を明示している");
         assert!(
             candidates.iter().all(|c| c.pid != dead_pid),
             "死骸が掃除される: {candidates:?}"
@@ -436,14 +536,17 @@ mod tests {
             "current はプライマリのまま"
         );
         assert!(
-            read_candidates().iter().any(|c| c.pid == alive_pid + 1),
+            read_candidates()
+                .unwrap()
+                .iter()
+                .any(|c| c.pid == alive_pid + 1),
             "セカンダリはフォールバック候補列に載る"
         );
         cleanup(alive_pid + 1);
         // 明示終了のクリーンアップ: 自分のファイルと current が消える
         cleanup(alive_pid);
         assert_eq!(read(), None);
-        assert!(read_candidates().is_empty());
+        assert!(read_candidates().unwrap().is_empty());
 
         // 解釈できない残骸も、名前の pid が死んでいれば掃除される（#916）。
         // 旧実装は list_instances がパース失敗で列挙ごと落とすため永久に残った
@@ -460,5 +563,115 @@ mod tests {
 
         std::env::remove_var("TAKO_DISCOVERY_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod issue2531_tests {
+    use super::*;
+
+    /// 落ちたときに名指す判定の正本
+    fn gate_site() -> String {
+        let text = include_str!("discovery.rs");
+        let line = text
+            .lines()
+            .position(|l| l.contains("fn read_candidates("))
+            .map_or(0, |i| i + 1);
+        format!("crates/tako-control/src/discovery.rs:{line}（fn read_candidates）")
+    }
+
+    #[test]
+    fn 隔離の印で置き場の指定が無いときだけ既定の置き場を読まない() {
+        let set = Some(OsStr::new("/tmp/tk2531"));
+        let empty = Some(OsStr::new(""));
+        // (TAKO_ISOLATED, TAKO_DISCOVERY_DIR, TAKO_DATA_DIR, 既定の置き場を読まないか)
+        let cases = [
+            (Some("1"), None, None, true),
+            (Some("true"), None, None, true),
+            (Some("on"), None, None, true),
+            (Some("1"), empty, empty, true),
+            (Some("1"), set, None, false),
+            (Some("1"), None, set, false),
+            (Some("1"), empty, set, false),
+            (Some("0"), None, None, false),
+            (Some(""), None, None, false),
+            (Some("yes"), None, None, false),
+            (None, None, None, false),
+        ];
+        for (isolated, discovery, data, want) in cases {
+            assert_eq!(
+                refuses_default_place(isolated, discovery, data),
+                want,
+                "TAKO_ISOLATED={isolated:?} TAKO_DISCOVERY_DIR={discovery:?} TAKO_DATA_DIR={data:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 断りは日英で英語に日本語が混ざらない() {
+        let ja = IsolatedWithoutDir.text_in(Lang::Ja);
+        let en = IsolatedWithoutDir.text_in(Lang::En);
+        for text in [ja, en] {
+            for name in [
+                "TAKO_ISOLATED=1",
+                "TAKO_DISCOVERY_DIR",
+                "TAKO_DATA_DIR",
+                "TAKO_SOCKET",
+            ] {
+                assert!(text.contains(name), "何を指定すれば繋がるかが無い: {text}");
+            }
+        }
+        assert!(en.is_ascii(), "英語表示に日本語が混ざる: {en}");
+        assert_eq!(
+            IsolatedWithoutDir.after("cannot connect to the tako app (x: y)", Lang::En),
+            format!("cannot connect to the tako app (x: y). {en}")
+        );
+        assert_eq!(
+            IsolatedWithoutDir.after("tako アプリへ接続できない（x: y）", Lang::Ja),
+            format!("tako アプリへ接続できない（x: y）。{ja}")
+        );
+    }
+
+    #[test]
+    fn 候補列の門は隔離の印で断り順番待ちの口は既定の置き場を読む() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(候補列の門は隔離の印で断り順番待ちの口は既定の置き場を読む)
+        {
+            return;
+        }
+        for key in ["TAKO_DISCOVERY_DIR", "TAKO_DATA_DIR", "TAKO_2531_LEGACY"] {
+            std::env::remove_var(key);
+        }
+        // テストプロセスの既定の置き場（`paths::test_data_dir`。本番の置き場ではない）に接続情報を置く
+        let path = info_path().expect("テストの置き場は決まる");
+        let me = ControlInfo {
+            version: 1,
+            pid: std::process::id(),
+            socket: "/tmp/tk2531-unit.sock".into(),
+            token: "tk2531".into(),
+            mcp_url: None,
+        };
+        write_to(&path, &me).expect("接続情報を書ける");
+
+        std::env::set_var("TAKO_ISOLATED", "1");
+        assert_eq!(
+            read_candidates(),
+            Err(IsolatedWithoutDir),
+            "隔離の印・置き場の指定なしで既定の置き場を読んだ（判定の正本: {}）",
+            gate_site()
+        );
+        assert_eq!(
+            read_candidates_machine_wide(),
+            vec![me.clone()],
+            "順番待ちの口は隔離の印でも既定の置き場の調停役を引く"
+        );
+        // A/B の腕: 修正前は隔離の印でも既定の置き場から引いた
+        std::env::set_var("TAKO_2531_LEGACY", "1");
+        assert_eq!(read_candidates(), Ok(vec![me.clone()]));
+        std::env::remove_var("TAKO_2531_LEGACY");
+        // 印が無ければ従来どおり
+        std::env::set_var("TAKO_ISOLATED", "0");
+        assert_eq!(read_candidates(), Ok(vec![me]));
+        let _ = std::fs::remove_file(&path);
     }
 }

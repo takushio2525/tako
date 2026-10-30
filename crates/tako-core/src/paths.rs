@@ -437,19 +437,18 @@ pub fn default_data_dir() -> Option<PathBuf> {
     {
         std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
-            .map(|h| PathBuf::from(h).join("Library/Application Support/tako"))
+            .map(|h| default_data_dir_under_home(Path::new(&h)))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         std::env::var_os("XDG_DATA_HOME")
             .filter(|d| !d.is_empty())
-            .map(PathBuf::from)
+            .map(|d| PathBuf::from(d).join("tako"))
             .or_else(|| {
                 std::env::var_os("HOME")
                     .filter(|h| !h.is_empty())
-                    .map(|h| PathBuf::from(h).join(".local/share"))
+                    .map(|h| default_data_dir_under_home(Path::new(&h)))
             })
-            .map(|d| d.join("tako"))
     }
     // Windows のローミングプロファイル。%APPDATA% は通常セットされているが、
     // サービス起動など環境が痩せている場合に備えて %USERPROFILE% から組み立てる経路も持つ
@@ -464,6 +463,17 @@ pub fn default_data_dir() -> Option<PathBuf> {
                     .map(|h| PathBuf::from(h).join("AppData").join("Roaming"))
             })
             .map(|d| d.join("tako"))
+    }
+}
+
+/// unix の [`default_data_dir`] のうち HOME から組み立てる規則（`XDG_DATA_HOME` は見ない）。
+/// 子プロセスへ一時の HOME を渡すテストが、その子の既定の置き場を同じ 1 実装で求める口（#2531）
+#[cfg(unix)]
+pub fn default_data_dir_under_home(home: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/tako")
+    } else {
+        home.join(".local/share/tako")
     }
 }
 

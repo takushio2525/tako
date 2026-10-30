@@ -202,6 +202,14 @@ domain socket へ直送する経路で、画面解析もキー操作も伴わな
 
 FR-2.2.8 の「明確なエラー」は FR-2.2.9 の解決順（環境変数 → 接続情報ファイル）を
 すべて試した上での不在を意味する（tako が起動していれば、tako の外からでも接続できる）。
+**隔離の印（#2531）**: `TAKO_ISOLATED=1` の CLI / MCP ブリッジ / remote daemon は、`TAKO_DISCOVERY_DIR` /
+`TAKO_DATA_DIR` を明示していなければ接続情報ファイルを既定（本番）の置き場から読まない
+（tako-app の一括隔離 #177 と同じ「印 = 本番に触らない」）。CLI は何を指定すれば繋がるか
+（その tako と同じ置き場か `TAKO_SOCKET` + `TAKO_TOKEN`）を日英で返して止まり、先に試した
+env の失敗があれば並べる。判定の正本は `tako-control::discovery::read_candidates`。例外は順番待ち
+（`tako queue`。#1994）だけで、調停役はマシン全体で 1 つなので印があっても既定の置き場の GUI へ並ぶ
+（`read_candidates_machine_wide` → CLI の `queue_send`。番犬 `crates/tako-cli/tests/issue2531_isolated_discovery.rs`）。
+A/B は `TAKO_2531_LEGACY=1`。
 MCP stdio ブリッジ（`tako mcp serve`）のフォールバックは「環境変数がある = tako 内で
 起動されたブリッジ」に限る（tako 外のセッションで 0 ツールを保つ。FR-2.3.2 と整合）。
 

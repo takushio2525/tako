@@ -972,9 +972,10 @@ pub(crate) struct AppIpcClient {
 }
 
 impl AppIpcClient {
-    /// discovery 経由で稼働中の tako-app を探して接続する。見つからなければ None
+    /// discovery 経由で稼働中の tako-app を探して接続する。見つからなければ None。
+    /// `TAKO_ISOLATED=1` で置き場を明示していない daemon は既定（本番）の置き場を探さない（#2531）
     fn connect() -> Option<Self> {
-        for info in crate::discovery::read_candidates() {
+        for info in crate::discovery::read_candidates().ok()? {
             if Self::probe(&info.socket, &info.token) {
                 return Some(Self {
                     socket: info.socket,

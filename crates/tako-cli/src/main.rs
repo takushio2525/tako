@@ -28,8 +28,8 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::Value;
 // IPC クライアントと MCP の stdio ブリッジは `tako-mcp`（#2021）と共有する 1 実装
 use tako_cli::ipc::{
-    resolve_caller_pane_via_app, send_request, send_request_classified, transport, SendFailure,
-    TransportError,
+    resolve_caller_pane_via_app, send_request, send_request_classified, send_request_machine_wide,
+    transport, SendFailure, TransportError,
 };
 use tako_cli::mcp_bridge;
 use tako_control::claude_mod::text::ModText;
@@ -7714,6 +7714,8 @@ const QUEUE_OFFLINE_CPU_WINDOW: std::time::Duration = std::time::Duration::from_
 
 /// 順番待ちの要求を調停役へ送る（#1994）。`TAKO_QUEUE_SOCKET` を明示していればそこだけ
 /// （隔離の調停役。本番へ漏れない）、無ければいつもの解決（env → 発見ファイル）。
+/// 発見ファイルは `TAKO_ISOLATED=1` でも既定の置き場から引く（#2531。調停役はマシン全体で 1 つ =
+/// 隔離した検証のビルドも本番の順番待ちへ並ぶ。ほかの要求は隔離の印で既定の置き場を読まない）。
 /// 接続できない・応答の途中で切れた = 届かない、繋がったが上限まで応答しない = 応答しない（#2123）、
 /// 届いて断られた = 断られた
 fn queue_send(request: Request) -> Result<Value, tako_control::queue_wrapper::SendError> {
@@ -7727,7 +7729,7 @@ fn queue_send(request: Request) -> Result<Value, tako_control::queue_wrapper::Se
             Err(e) => Err(SendError::Unreachable(e.message())),
         };
     }
-    match send_request_classified(request, None) {
+    match send_request_machine_wide(request) {
         Ok(v) => Ok(v),
         Err(SendFailure::Unreachable(m) | SendFailure::Broken(m)) => Err(SendError::Unreachable(m)),
         Err(SendFailure::Timeout(limit)) => Err(SendError::Timeout(limit)),
