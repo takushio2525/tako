@@ -1233,7 +1233,11 @@ mod tests {
             );
         }
         let login = plan_for(&config, "/x/a b/server", &["--stdio"]).expect("ログインシェルの計画");
-        assert_eq!(login.args[..2], ["-l", "-c"], "{:?}", login.args);
+        assert_eq!(login.args.len(), 3, "{:?}", login.args);
+        assert_eq!(
+            (login.args[0].as_str(), login.args[1].as_str()),
+            ("-l", "-c")
+        );
         let snippet = login.args[2].clone();
         assert!(snippet.starts_with("exec "), "{snippet}");
         let plain = FetchConfig {
