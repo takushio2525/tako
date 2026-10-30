@@ -8793,9 +8793,10 @@ mod tests {
         };
         let before = generation_fields(&info);
 
-        // install の contents-swap と同じ形: 隣で作った新しいファイルを同じパスへ rename
+        // install の contents-swap と同じ形: 隣で作った新しいファイルを同じパスへ rename。
+        // 長さも変える（inode を持たない Windows でも、更新時刻の刻みに依らず別物と言える）
         let staged = dir.join("tako.staged");
-        std::fs::write(&staged, b"generation-2").unwrap();
+        std::fs::write(&staged, b"generation-two").unwrap();
         std::fs::rename(&staged, &exe).unwrap();
         let after = generation_fields(&info);
         std::env::set_var(crate::remote_generation::LEGACY_ENV, "1");
