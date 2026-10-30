@@ -313,7 +313,8 @@ pub fn find_in_process_path(name: &str) -> Option<String> {
 
 /// A/B: #2519 前へ戻す（長生きするプロセスが周期的に起こす外部コマンドを素の名前のまま起こす）。
 /// 立てると GUI の git / tmux（`bin_resolve`）・codex / agy の `lsof`・スリープ防止の
-/// `sudo` / `pmset` が PATH の空振りを繰り返す = Issue の症状の起点
+/// `sudo` / `pmset`・PATH に無い素の名前の `tailscale`（remote の状態の更新が 2 秒ごとに 2 回通る
+/// `tailscale::pick_candidate`）が PATH の空振りを繰り返す = Issue の症状の起点
 pub const ISSUE2519_LEGACY_ENV: &str = "TAKO_2519_LEGACY";
 
 /// [`ISSUE2519_LEGACY_ENV`] が立っているか（#2519 の A/B のゲートはここ 1 か所）
