@@ -39,7 +39,7 @@ pub enum SetupRefusal {
     /// MCP の設定ファイル（`~/.claude.json` / `.mcp.json`）を読めない
     McpConfigRead { path: String, error: String },
     /// MCP の設定ファイルを JSON として解釈できない（書き換えを中止した）
-    McpConfigUnparsable { path: String, reason: JsonReason },
+    McpConfigNotJson { path: String, reason: JsonReason },
     /// MCP の設定ファイルの `mcpServers` がオブジェクトでない
     McpServersNotObject,
     /// MCP の設定ファイルの置き場を作れない
@@ -146,12 +146,12 @@ impl SetupRefusal {
             }
             (Self::McpConfigRead { path, error }, Ja) => format!("{path} の読み取りに失敗: {error}"),
             (Self::McpConfigRead { path, error }, En) => format!("failed to read {path}: {error}"),
-            (Self::McpConfigUnparsable { path, reason }, Ja) => format!(
+            (Self::McpConfigNotJson { path, reason }, Ja) => format!(
                 "{path} を JSON として解釈できないので書き換えを中止した（{}）。\
                  内容を直すか退避してからやり直してください",
                 reason.text_in(lang)
             ),
-            (Self::McpConfigUnparsable { path, reason }, En) => format!(
+            (Self::McpConfigNotJson { path, reason }, En) => format!(
                 "stopped before rewriting {path} because it cannot be read as JSON ({}). \
                  Fix its contents or move it aside, then try again",
                 reason.text_in(lang)

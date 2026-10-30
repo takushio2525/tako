@@ -21445,7 +21445,7 @@ fn setup_mcp_direct(tako_binary: &str, scope: &McpScope) -> Result<(), SetupRefu
         if content.trim().is_empty() {
             serde_json::Map::new()
         } else {
-            serde_json::from_str(&content).map_err(|e| SetupRefusal::McpConfigUnparsable {
+            serde_json::from_str(&content).map_err(|e| SetupRefusal::McpConfigNotJson {
                 path: path.display().to_string(),
                 reason: tako_core::load_issue::JsonReason::of(&e),
             })?

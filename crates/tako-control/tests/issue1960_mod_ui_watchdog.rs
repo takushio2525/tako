@@ -530,9 +530,18 @@ fn all(s: &Sources) -> Vec<String> {
         &mut out,
         CONTROL_SETUP,
         &s.control_setup,
-        ("    pub fn validate(&self)", "    }"),
+        // 本体は型の口（`validate` は日本語の文へ写すだけ = 同じ 1 実装。#2365）
+        ("    pub fn validate_typed(&self)", "    }"),
         "claude_mod_ui::check_answers(",
-        "SetupAnswers::validate が mod_ui を検証していない（setup の途中で半端に止まる）",
+        "SetupAnswers::validate_typed が mod_ui を検証していない（setup の途中で半端に止まる）",
+    );
+    require(
+        &mut out,
+        CONTROL_SETUP,
+        &s.control_setup,
+        ("    pub fn validate(&self)", "    }"),
+        "self.validate_typed()",
+        "SetupAnswers::validate が型の口を通っていない（CLI の tako setup だけ mod_ui の検証が抜ける）",
     );
     require(
         &mut out,

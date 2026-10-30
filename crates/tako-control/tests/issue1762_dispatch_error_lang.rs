@@ -10250,7 +10250,7 @@ fn setup_refusal_index(r: &SetupRefusal) -> usize {
         S::ClaudeMcpAddSpawn(_) => 0,
         S::ClaudeMcpAddFailed { .. } => 1,
         S::McpConfigRead { .. } => 2,
-        S::McpConfigUnparsable { .. } => 3,
+        S::McpConfigNotJson { .. } => 3,
         S::McpServersNotObject => 4,
         S::McpConfigDirCreate { .. } => 5,
         S::McpConfigSerialize(_) => 6,
@@ -10347,7 +10347,7 @@ fn setup_refusal_table() -> Vec<(SetupRefusal, String)> {
             format!("/h/.claude.json の読み取りに失敗: {enoent}"),
         ),
         (
-            S::McpConfigUnparsable {
+            S::McpConfigNotJson {
                 path: "/h/.mcp.json".into(),
                 reason: tako_core::load_issue::JsonReason::of(&broken_json),
             },
@@ -10684,7 +10684,7 @@ fn setup系の断りの包みと載せ方() {
         assert!(SetupRefusal::ConfigParse(reason.clone())
             .text_in(lang)
             .ends_with(&reason.text_in(lang)));
-        assert!(SetupRefusal::McpConfigUnparsable {
+        assert!(SetupRefusal::McpConfigNotJson {
             path: "/x".into(),
             reason: json_reason.clone(),
         }
