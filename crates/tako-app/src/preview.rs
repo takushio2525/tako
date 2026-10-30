@@ -595,11 +595,11 @@ impl EditState {
             return Err(limit.edit_refusal());
         }
         if !matches!(preview.mode, PreviewMode::Code | PreviewMode::Markdown) {
-            return Err("テキスト以外のプレビューは編集できない".into());
+            return Err(tako_control::HostRefusal::NotTextForEdit.into());
         }
         let buffer = TextBuffer::open(&preview.path).map_err(|e| e.to_string())?;
         if buffer.text().contains('\0') {
-            return Err("バイナリファイルは編集できない".into());
+            return Err(tako_control::HostRefusal::BinaryNotEditable.into());
         }
         Ok(Self {
             buffer,
@@ -897,7 +897,7 @@ where
 {
     let edit = edits
         .get_mut(&pane)
-        .ok_or_else(|| "プレビューペインではない".to_string())?;
+        .ok_or(tako_control::HostRefusal::NotPreviewPane)?;
     let jump = edit.jump_to_search_hit(query, options, direction);
     if !search_selection_legacy() {
         sync_selection_copy(selections, pane, edit);
@@ -5482,7 +5482,13 @@ mod tests {
             SearchOptions::DEFAULT,
             None,
         );
-        assert_eq!(missing, Err("プレビューペインではない".to_string()));
+        // 断りの文は組んだその場の表示言語（#2365）。言語のグローバルは他のテストが動かすので日英のどちらかで見る
+        let refusal = tako_control::HostRefusal::NotPreviewPane;
+        assert!(
+            matches!(&missing, Err(m) if *m == refusal.text_in(tako_core::i18n::Lang::Ja)
+                || *m == refusal.text_in(tako_core::i18n::Lang::En)),
+            "{missing:?}"
+        );
     }
 
     /// 閲覧中（編集していない）のコード表示でも写しは揃う。描画中の Markdown は

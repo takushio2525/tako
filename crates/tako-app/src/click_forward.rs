@@ -573,7 +573,7 @@ impl TakoApp {
         let session = self
             .terminals
             .get(&pane)
-            .ok_or_else(|| format!("ペイン {} は端末ではない", pane.as_u64()))?;
+            .ok_or(tako_control::HostRefusal::NotTerminalPane(pane.as_u64()))?;
         let report =
             mf::decide(session.click_report(), false).map_err(mf::not_forwarded_message)?;
         let bytes = mf::click_pair(report, col, row)?;

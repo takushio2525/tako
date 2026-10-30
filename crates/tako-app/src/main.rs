@@ -104,8 +104,8 @@ use gpui::{
 use gpui_platform::application;
 use tako_control::sessions::RestorePlan;
 use tako_control::{
-    IncomingRequest, IpcServer, McpServer, PreviewHost, RemoteHost, SessionHost, SystemHost,
-    TmuxHost, UiStateHost, WebViewHost, WorkspaceHost,
+    HostRefusal, IncomingRequest, IpcServer, McpServer, PreviewHost, RemoteHost, SessionHost,
+    SystemHost, TmuxHost, UiStateHost, WebViewHost, WorkspaceHost,
 };
 use tako_core::claude_resume::legacy_1076;
 use tako_core::pane_log::CloseOrigin;
@@ -16591,7 +16591,7 @@ impl TakoApp {
 
     fn set_preview_editing_local(&mut self, pane_id: PaneId, enabled: bool) -> Result<(), String> {
         if !self.previews.contains_key(&pane_id) {
-            return Err("プレビューペインではない".into());
+            return Err(HostRefusal::NotPreviewPane.into());
         }
         // #966: リモートファイルも編集できる（段階 2）。ただし **mode のどこにも `w` が
         // 無いと分かっているもの**は読み取り専用のまま止める。
@@ -16744,7 +16744,7 @@ impl TakoApp {
         let edit = self
             .preview_edits
             .get_mut(&pane_id)
-            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+            .ok_or(HostRefusal::EditNotStarted)?;
         let result = if force {
             edit.buffer.save_overwrite()
         } else {
@@ -16781,7 +16781,7 @@ impl TakoApp {
         let edit = self
             .preview_edits
             .get_mut(&pane_id)
-            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+            .ok_or(HostRefusal::EditNotStarted)?;
         edit.buffer.reload_from_disk().map_err(|error| {
             if let Some(state) = preview::EditState::conflict_state_of(&error) {
                 edit.note_conflict(state);
@@ -16905,7 +16905,7 @@ impl TakoApp {
             return Ok(());
         };
         let Some(bytes) = self.preview_remote_payload(pane_id) else {
-            return Err("編集モードを開始していない".into());
+            return Err(HostRefusal::EditNotStarted.into());
         };
         self.preview_remote_push
             .insert(pane_id, RemotePush::Uploading);
@@ -17005,7 +17005,7 @@ impl TakoApp {
         let edit = self
             .preview_edits
             .get_mut(&pane_id)
-            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+            .ok_or(HostRefusal::EditNotStarted)?;
         let undone = edit.buffer.undo();
         if undone {
             edit.message = None;
@@ -17019,7 +17019,7 @@ impl TakoApp {
         let edit = self
             .preview_edits
             .get_mut(&pane_id)
-            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+            .ok_or(HostRefusal::EditNotStarted)?;
         let redone = edit.buffer.redo();
         if redone {
             edit.message = None;
@@ -17041,12 +17041,12 @@ impl TakoApp {
         let state = self
             .previews
             .get(&pane_id)
-            .ok_or_else(|| "プレビューペインではない".to_string())?;
+            .ok_or(HostRefusal::NotPreviewPane)?;
         if !matches!(
             state.mode,
             preview::PreviewMode::Code | preview::PreviewMode::Markdown
         ) {
-            return Err("テキスト以外のプレビュー（PDF・画像・動画）は検索欄を開けない".into());
+            return Err(HostRefusal::SearchBarNeedsText.into());
         }
         let mut edit = preview::EditState::open(state)?;
         edit.editing = false;
@@ -17168,9 +17168,9 @@ impl TakoApp {
         let edit = self
             .preview_edits
             .get_mut(&pane_id)
-            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+            .ok_or(HostRefusal::EditNotStarted)?;
         if !edit.editing {
-            return Err("編集モードが無効".into());
+            return Err(HostRefusal::EditingOff.into());
         }
         // 1 件 / 全置換のどちらも tako-core の 1 実装（#1653。カーソル以降の最初 → 先頭へラップ）
         let count = if all {
@@ -17410,7 +17410,7 @@ impl TakoApp {
             .preview_edits
             .get_mut(&pane_id)
             .filter(|edit| edit.editing)
-            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+            .ok_or(HostRefusal::EditNotStarted)?;
         let version = edit.buffer.version();
         if let Some(lines) = viewport_lines {
             edit.buffer.set_viewport_lines(lines);
@@ -17865,7 +17865,7 @@ impl TakoApp {
     ) -> Result<(), String> {
         use tako_core::paste_guard::Answer;
         let Some(pending) = self.pending_paste.take() else {
-            return Err("確認待ちの貼り付けが無い".into());
+            return Err(HostRefusal::NoPendingPaste.into());
         };
         let pane = pending.pane.as_u64();
         let outcome = match answer {
@@ -17884,9 +17884,7 @@ impl TakoApp {
                         pane,
                         &pending.report,
                     ));
-                    return Err(format!(
-                        "送り先のペイン {pane} が閉じている（貼り付けは捨てた）"
-                    ));
+                    return Err(HostRefusal::PasteTargetClosed(pane).into());
                 }
             },
             Answer::Cancel => {
@@ -21341,7 +21339,7 @@ impl TakoApp {
         }
         let path = match self.previews.get(&pane_id) {
             Some(state) => state.path.clone(),
-            None => return Err("対象ペインにプレビューが無い".into()),
+            None => return Err(HostRefusal::NoPreviewInPane.into()),
         };
         let resume = self.video_resume.get(&pane_id).copied();
         let player = match resume {
@@ -23205,7 +23203,7 @@ impl TakoApp {
         let handle = self
             .window_raw_handle
             .as_ref()
-            .ok_or("ウィンドウ初期化前のため Web ビューを作れない（直後に再試行）")?;
+            .ok_or(HostRefusal::WindowNotReady)?;
         // 閉じた窓の描画ビューを親にしない（#1837）。採り直しは render でしか
         // できないので、窓が 1 枚も無い（macOS で最後の窓を閉じた）あいだや、
         // 採り直さない腕（`TAKO_1837_LEGACY=web`）ではここで理由つきで断る
@@ -27266,13 +27264,10 @@ impl UiStateHost for TakoApp {
     fn backend_reattach(&mut self, pane: PaneId) -> Result<serde_json::Value, String> {
         use tako_core::backend_reattach::{SessionProbe, Status};
         let Some(name) = self.backend_sessions.get(&pane).cloned() else {
-            return Err(format!(
-                "ペイン {} は tmux のセッションを持たない（再 attach できるのは tmux 永続化のペインだけ）",
-                pane.as_u64()
-            ));
+            return Err(HostRefusal::NoBackendSession(pane.as_u64()).into());
         };
         if !self.terminals.contains_key(&pane) {
-            return Err(format!("ペイン {} が見つからない", pane.as_u64()));
+            return Err(tako_control::DispatchError::PaneNotFound(pane.as_u64()).to_string());
         }
         // クライアントが動いているペインは張り替えない（動いている attach を切ることになる）
         let client_gone = self
@@ -27280,19 +27275,17 @@ impl UiStateHost for TakoApp {
             .get(&pane)
             .is_some_and(|s| s.status() != Status::Attached);
         if !client_gone {
-            return Err(format!(
-                "ペイン {} の attach クライアントは動いている（再 attach は不要）",
-                pane.as_u64()
-            ));
+            return Err(HostRefusal::AttachClientAlive(pane.as_u64()).into());
         }
         // 手動の操作 1 回なのでここで聞く（上限つき）。終わったセッションへは撃たない
         let socket = tako_core::tmux_backend::socket_name();
         match tako_core::backend_reattach::probe_session(&socket, &name) {
             SessionProbe::SessionGone | SessionProbe::ServerGone => {
-                return Err(format!(
-                    "ペイン {} のセッション {name} は終わっている（再 attach できない。ペインは閉じてよい）",
-                    pane.as_u64()
-                ));
+                return Err(HostRefusal::BackendSessionEnded {
+                    pane: pane.as_u64(),
+                    name,
+                }
+                .into());
             }
             SessionProbe::Alive { .. } | SessionProbe::Unknown => {}
         }
@@ -27566,7 +27559,7 @@ impl PreviewHost for TakoApp {
         let preview = self
             .previews
             .get(&pane)
-            .ok_or_else(|| "プレビューペインではない".to_string())?;
+            .ok_or(HostRefusal::NotPreviewPane)?;
         let (is_pdf, total_pages) = match &preview.content {
             preview::PreviewContent::Pdf(data) => (true, data.total_pages),
             preview::PreviewContent::Loading if preview.mode == preview::PreviewMode::Pdf => {
@@ -27574,18 +27567,19 @@ impl PreviewHost for TakoApp {
             }
             preview::PreviewContent::Image(_) => (false, 1),
             _ if preview.mode == preview::PreviewMode::Image => (false, 1),
-            _ => return Err("ズーム操作は PDF・画像プレビューだけに対応する".into()),
+            _ => return Err(HostRefusal::ZoomNeedsPdfOrImage.into()),
         };
         let mut state = self.preview_view_state(pane).unwrap_or_default();
         state.apply(update)?;
         if state.page > total_pages {
-            return Err(format!(
-                "ページ範囲外: {}（全 {total_pages} ページ）",
-                state.page
-            ));
+            return Err(HostRefusal::PageOutOfRange {
+                page: state.page,
+                total: total_pages,
+            }
+            .into());
         }
         if !is_pdf && state.page != 1 {
-            return Err("画像プレビューの page は 1 だけ指定できる".into());
+            return Err(HostRefusal::ImagePageOnlyOne.into());
         }
 
         let handle = self.preview_scroll_handles.entry(pane).or_default().clone();
@@ -27612,14 +27606,14 @@ impl PreviewHost for TakoApp {
         let preview = self
             .previews
             .get(&pane)
-            .ok_or_else(|| "プレビューペインではない".to_string())?;
+            .ok_or(HostRefusal::NotPreviewPane)?;
         // 行指定の表示種別は dispatch が code へ倒してある（#1676）。ここで
         // `Code` 以外なのは「拡張子はテキストなのに中身が読めない」= 読み込みの
         // 劣化（`PreviewContent::Error`）だけなので、理由をそのまま返す
         let preview::PreviewContent::Code(lines) = &preview.content else {
             return Err(match &preview.content {
                 preview::PreviewContent::Error(message) => message.clone(),
-                _ => "テキストとして行を数えられない".into(),
+                _ => HostRefusal::LinesUncountable.into(),
             });
         };
         let total_lines = lines.len();
@@ -27687,7 +27681,7 @@ impl PreviewHost for TakoApp {
         let buffer = &self
             .preview_edits
             .get(&pane)
-            .ok_or_else(|| "編集モードを開始していない".to_string())?
+            .ok_or(HostRefusal::EditNotStarted)?
             .buffer;
         let range = match range {
             Some((start, end)) => {
@@ -27727,7 +27721,7 @@ impl PreviewHost for TakoApp {
         let edit = self
             .preview_edits
             .get_mut(&pane)
-            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+            .ok_or(HostRefusal::EditNotStarted)?;
         let applied = edit
             .buffer
             .apply_changes(changes, Some(expected_version))
@@ -27752,8 +27746,13 @@ impl PreviewHost for TakoApp {
         let preview = self
             .previews
             .get(&pane)
-            .ok_or_else(|| "プレビューペインではない".to_string())?;
-        let out_of_range = |count: usize| format!("{} 行目は無い（全 {count} 行）", line + 1);
+            .ok_or(HostRefusal::NotPreviewPane)?;
+        let out_of_range = |count: usize| {
+            String::from(HostRefusal::LineMissing {
+                line: line + 1,
+                count,
+            })
+        };
         // 編集セッションがあれば画面の本文はバッファ（未保存の変更を含む）
         if let Some(edit) = self.preview_edits.get(&pane) {
             let text = edit.buffer.text();
@@ -27768,10 +27767,7 @@ impl PreviewHost for TakoApp {
             });
         }
         let preview::PreviewContent::Code(lines) = &preview.content else {
-            return Err(
-                "コード表示のプレビューではない（Markdown のレンダリング表示・画像・PDF には原文の行が無い）"
-                    .into(),
-            );
+            return Err(HostRefusal::NotCodePreview.into());
         };
         let spans = lines.get(line).ok_or_else(|| out_of_range(lines.len()))?;
         Ok(tako_control::PreviewGotoSource {
@@ -27837,17 +27833,17 @@ impl PreviewHost for TakoApp {
         let preview = self
             .previews
             .get(&pane)
-            .ok_or_else(|| "プレビューペインではない".to_string())?;
+            .ok_or(HostRefusal::NotPreviewPane)?;
         let target = preview.outline.target(item)?;
         let handle = self.preview_scroll_handles.entry(pane).or_default().clone();
         match target {
             // 原文の行を指す目次は編集中にしか作らない（上で返している）
             tako_core::PreviewOutlineTarget::SourceLine { .. } => {
-                return Err("Markdown アウトラインの対象ではない".into());
+                return Err(HostRefusal::NotMarkdownOutline.into());
             }
             tako_core::PreviewOutlineTarget::MarkdownBlock { block } => {
                 if preview.mode != preview::PreviewMode::Markdown {
-                    return Err("Markdown アウトラインの対象ではない".into());
+                    return Err(HostRefusal::NotMarkdownOutline.into());
                 }
                 // #826: 仮想化した md 本文は `list` が器（1 item = 1 ブロック）。
                 // 論理位置で飛ばすので、**まだ一度も描かれていないブロック**へも届く
@@ -27863,13 +27859,14 @@ impl PreviewHost for TakoApp {
             }
             tako_core::PreviewOutlineTarget::PdfPage { page } => {
                 let preview::PreviewContent::Pdf(data) = &preview.content else {
-                    return Err("PDF アウトラインの対象ではない".into());
+                    return Err(HostRefusal::NotPdfOutline.into());
                 };
                 if page == 0 || page > data.total_pages {
-                    return Err(format!(
-                        "ページ範囲外: {page}（全 {} ページ）",
-                        data.total_pages
-                    ));
+                    return Err(HostRefusal::PageOutOfRange {
+                        page,
+                        total: data.total_pages,
+                    }
+                    .into());
                 }
                 handle.scroll_to_top_of_item(page - 1);
                 let mut view = self.preview_views.get(&pane).copied().unwrap_or_default();
@@ -27919,16 +27916,13 @@ impl PreviewHost for TakoApp {
     ) -> Result<serde_json::Value, String> {
         let links = self
             .preview_md_links(pane)
-            .ok_or_else(|| "Markdown プレビューではない".to_string())?;
-        let link = links
-            .get(index)
-            .ok_or_else(|| format!("リンクインデックス範囲外: {index}（全 {} 件）", links.len()))?;
-        let url = tako_core::md_links::browser_url(&link.url).ok_or_else(|| {
-            format!(
-                "ブラウザで開けないリンク（http / https のみ対応）: {}",
-                link.url
-            )
+            .ok_or(HostRefusal::NotMarkdownPreview)?;
+        let link = links.get(index).ok_or(HostRefusal::LinkIndexOutOfRange {
+            index,
+            total: Some(links.len()),
         })?;
+        let url = tako_core::md_links::browser_url(&link.url)
+            .ok_or_else(|| HostRefusal::LinkNotBrowsable(link.url.clone()))?;
         tako_control::platform::os_integration::open_url(url)?;
         Ok(serde_json::json!({
             "pane": pane.as_u64(),
@@ -27949,9 +27943,9 @@ impl PreviewHost for TakoApp {
         let preview = self
             .previews
             .get(&pane)
-            .ok_or_else(|| "プレビューペインではない".to_string())?;
+            .ok_or(HostRefusal::NotPreviewPane)?;
         let preview::PreviewContent::Markdown(blocks) = &preview.content else {
-            return Err("Markdown プレビューではない".into());
+            return Err(HostRefusal::NotMarkdownPreview.into());
         };
         let codes: Vec<String> = blocks
             .iter()
@@ -27963,14 +27957,12 @@ impl PreviewHost for TakoApp {
             })
             .collect();
         if codes.is_empty() {
-            return Err("コードブロックが無い".into());
+            return Err(HostRefusal::NoCodeBlock.into());
         }
         let index = index.unwrap_or(0);
-        let text = codes.get(index).ok_or_else(|| {
-            format!(
-                "コードブロック範囲外: {index}（全 {} 個。0 始まり）",
-                codes.len()
-            )
+        let text = codes.get(index).ok_or(HostRefusal::CodeBlockOutOfRange {
+            index,
+            total: codes.len(),
         })?;
         let lines = text.split('\n').count();
         let bytes = text.len();
@@ -28003,24 +27995,23 @@ impl PreviewHost for TakoApp {
         let preview = self
             .previews
             .get(&pane)
-            .ok_or_else(|| "プレビューペインではない".to_string())?;
+            .ok_or(HostRefusal::NotPreviewPane)?;
         let data = match &preview.content {
             preview::PreviewContent::Pdf(data) => data,
-            _ => return Err("PDF プレビューではない".into()),
+            _ => return Err(HostRefusal::NotPdfPreview.into()),
         };
         let link = data
             .links
             .links
             .get(index)
-            .ok_or_else(|| format!("リンクインデックス範囲外: {index}"))?;
+            .ok_or(HostRefusal::LinkIndexOutOfRange { index, total: None })?;
         match &link.target {
             tako_core::PdfLinkTarget::Url { url } => {
                 // md 経路（FR-3.3.2）と同じ規則で http / https だけを OS のハンドラへ
                 // 渡す（#1376）。理由は分類だけを返し、リンク文字列は載せない
                 // （PDF の内容。一覧が要るなら `tako preview-link-list`）
-                let url = tako_core::url_guard::check_browser_url(url).map_err(|reason| {
-                    format!("ブラウザで開けないリンク（http / https のみ対応）: {reason}")
-                })?;
+                let url = tako_core::url_guard::check_browser_url(url)
+                    .map_err(|reason| HostRefusal::LinkNotBrowsable(reason.to_string()))?;
                 tako_control::platform::os_integration::open_url(url)?;
                 Ok(serde_json::json!({
                     "pane": pane.as_u64(),
@@ -28052,13 +28043,13 @@ impl PreviewHost for TakoApp {
         let player = self
             .video_players
             .get_mut(&pane)
-            .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
+            .ok_or(HostRefusal::VideoPlayerNotRunning)?;
         if let Some(rate_str) = action.strip_prefix("rate:") {
             let rate: f32 = rate_str
                 .parse()
-                .map_err(|_| format!("不正な速度値: {rate_str}"))?;
+                .map_err(|_| HostRefusal::BadRate(rate_str.to_string()))?;
             if !(0.1..=4.0).contains(&rate) {
-                return Err(format!("速度は 0.1〜4.0 の範囲: {rate}"));
+                return Err(HostRefusal::RateOutOfRange(rate).into());
             }
             player.set_rate(rate);
             return Ok(format!("rate:{rate}"));
@@ -28098,7 +28089,7 @@ impl PreviewHost for TakoApp {
                 }
                 .to_string());
             }
-            _ => return Err(format!("不明なアクション: {action}")),
+            _ => return Err(HostRefusal::UnknownVideoAction(action.to_string()).into()),
         }
         let state_str = match player.state {
             video_player::PlaybackState::Playing => "playing",
@@ -28112,7 +28103,7 @@ impl PreviewHost for TakoApp {
         let player = self
             .video_players
             .get_mut(&pane)
-            .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
+            .ok_or(HostRefusal::VideoPlayerNotRunning)?;
         // UI のクリック・ドラッグ確定と同じ正確シーク。返す値は UI のつまみが
         // 指す位置（player.current_time）と一致する（#484）
         player.seek(seconds);
@@ -28125,7 +28116,7 @@ impl PreviewHost for TakoApp {
         let player = self
             .video_players
             .get_mut(&pane)
-            .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
+            .ok_or(HostRefusal::VideoPlayerNotRunning)?;
         player.set_volume(volume as f32);
         Ok(player.volume as f64)
     }
@@ -28155,7 +28146,7 @@ impl PreviewHost for TakoApp {
         let player = self
             .video_players
             .get(&pane)
-            .ok_or_else(|| "動画プレイヤーが起動していない".to_string())?;
+            .ok_or(HostRefusal::VideoPlayerNotRunning)?;
         Ok(tako_control::VideoStatus {
             position: player.current_time,
             duration: player.duration,
@@ -28395,7 +28386,7 @@ impl PreviewHost for TakoApp {
     fn preview_disk_diff(&self, pane: PaneId) -> Result<tako_core::DiskDiff, String> {
         self.preview_edits
             .get(&pane)
-            .ok_or_else(|| "編集モードを開始していない".to_string())?
+            .ok_or(HostRefusal::EditNotStarted)?
             .buffer
             .disk_diff()
             .map_err(|e| e.to_string())
@@ -28427,7 +28418,7 @@ impl PreviewHost for TakoApp {
         let edit = self
             .preview_edits
             .get_mut(&pane)
-            .ok_or_else(|| "編集モードを開始していない".to_string())?;
+            .ok_or(HostRefusal::EditNotStarted)?;
         edit.autosave = enabled;
         Ok(())
     }
@@ -28443,7 +28434,7 @@ impl PreviewHost for TakoApp {
             return self.open_preview_search_bar(pane);
         }
         if !self.previews.contains_key(&pane) {
-            return Err("プレビューペインではない".into());
+            return Err(HostRefusal::NotPreviewPane.into());
         }
         self.close_preview_search_bar(pane);
         Ok(())
@@ -28559,7 +28550,7 @@ impl PreviewHost for TakoApp {
         history: Option<tako_core::git::FileHistory>,
     ) -> Result<(), String> {
         if !self.previews.contains_key(&pane) {
-            return Err(format!("プレビューペインではない: {}", pane.as_u64()));
+            return Err(tako_control::Reason::NotPreviewPane(pane.as_u64()).to_string());
         }
         match history {
             None => {
@@ -28582,10 +28573,10 @@ impl PreviewHost for TakoApp {
         let data = self
             .preview_changelogs
             .get(&pane)
-            .ok_or("チェンジログビューが有効ではない")?;
+            .ok_or(HostRefusal::ChangelogOff)?;
         let entry = data
             .entry(hash)
-            .ok_or_else(|| format!("コミット {} が見つからない", hash))?;
+            .ok_or_else(|| HostRefusal::CommitNotFound(hash.to_string()))?;
         Ok(tako_control::ChangelogDiffTarget {
             hash: entry.commit.hash.clone(),
             expanded: entry.expanded_diff.is_some(),
@@ -28604,9 +28595,9 @@ impl PreviewHost for TakoApp {
         let entry = self
             .preview_changelogs
             .get_mut(&pane)
-            .ok_or("チェンジログビューが有効ではない")?
+            .ok_or(HostRefusal::ChangelogOff)?
             .entry_mut(hash)
-            .ok_or_else(|| format!("コミット {} が見つからない", hash))?;
+            .ok_or_else(|| HostRefusal::CommitNotFound(hash.to_string()))?;
         entry.expanded_diff = hunks;
         Ok(())
     }
@@ -28658,9 +28649,12 @@ impl WebViewHost for TakoApp {
                 .webviews
                 .iter_mut()
                 .find(|e| e.id.as_u64() == id)
-                .ok_or(format!("Web ビュー {id} が見つからない（web list で確認）"))?;
+                .ok_or(HostRefusal::WebViewNotFound {
+                    id,
+                    list_hint: true,
+                })?;
             if e.pane.is_some() {
-                return Err(format!("Web ビュー {id} は表示中"));
+                return Err(HostRefusal::WebViewShown(id).into());
             }
             e.pane = Some(pane);
         }
@@ -28722,11 +28716,12 @@ impl WebViewHost for TakoApp {
         pane: Option<u64>,
     ) -> Result<(u64, Option<PaneId>), String> {
         if let Some(id) = id {
-            let e = self
-                .webviews
-                .iter()
-                .find(|e| e.id.as_u64() == id)
-                .ok_or(format!("Web ビュー {id} が見つからない（web list で確認）"))?;
+            let e = self.webviews.iter().find(|e| e.id.as_u64() == id).ok_or(
+                HostRefusal::WebViewNotFound {
+                    id,
+                    list_hint: true,
+                },
+            )?;
             return Ok((id, e.pane));
         }
         if let Some(raw) = pane {
@@ -28734,17 +28729,15 @@ impl WebViewHost for TakoApp {
                 .webviews
                 .iter()
                 .find(|e| e.pane.map(|p| p.as_u64()) == Some(raw))
-                .ok_or(format!("ペイン {raw} に Web ビューは表示されていない"))?;
+                .ok_or(HostRefusal::NoWebViewInPane(raw))?;
             return Ok((e.id.as_u64(), e.pane));
         }
         let shown: Vec<&webview::WebViewEntry> =
             self.webviews.iter().filter(|e| e.pane.is_some()).collect();
         match shown.len() {
-            0 => Err("表示中の Web ビューが無い（id か pane で指定）".into()),
+            0 => Err(HostRefusal::NoShownWebView.into()),
             1 => Ok((shown[0].id.as_u64(), shown[0].pane)),
-            n => Err(format!(
-                "表示中の Web ビューが {n} 個ある（id か pane で指定）"
-            )),
+            n => Err(HostRefusal::ManyShownWebViews(n).into()),
         }
     }
 
@@ -28762,11 +28755,12 @@ impl WebViewHost for TakoApp {
     }
 
     fn web_navigate(&mut self, id: u64, to: &str) -> Result<serde_json::Value, String> {
-        let e = self
-            .webviews
-            .iter()
-            .find(|e| e.id.as_u64() == id)
-            .ok_or(format!("Web ビュー {id} が見つからない"))?;
+        let e = self.webviews.iter().find(|e| e.id.as_u64() == id).ok_or(
+            HostRefusal::WebViewNotFound {
+                id,
+                list_hint: false,
+            },
+        )?;
         e.navigate(to)?;
         let state = e.phase().as_str();
         // #724: 保留・生成失敗の navigate は生成し直しの依頼（生成待ちへ戻る）
@@ -28779,7 +28773,10 @@ impl WebViewHost for TakoApp {
             .webviews
             .iter_mut()
             .find(|e| e.id.as_u64() == id)
-            .ok_or(format!("Web ビュー {id} が見つからない"))?;
+            .ok_or(HostRefusal::WebViewNotFound {
+                id,
+                list_hint: false,
+            })?;
         let token = e.eval(js)?;
         Ok(serde_json::json!({
             "id": id,
@@ -28789,11 +28786,12 @@ impl WebViewHost for TakoApp {
     }
 
     fn web_eval_result(&mut self, id: u64, token: u64) -> Result<serde_json::Value, String> {
-        let e = self
-            .webviews
-            .iter()
-            .find(|e| e.id.as_u64() == id)
-            .ok_or(format!("Web ビュー {id} が見つからない"))?;
+        let e = self.webviews.iter().find(|e| e.id.as_u64() == id).ok_or(
+            HostRefusal::WebViewNotFound {
+                id,
+                list_hint: false,
+            },
+        )?;
         match e.take_eval_result(token) {
             Some(result) => {
                 let value: serde_json::Value =
@@ -28805,11 +28803,12 @@ impl WebViewHost for TakoApp {
     }
 
     fn web_read(&self, id: u64) -> Result<serde_json::Value, String> {
-        let e = self
-            .webviews
-            .iter()
-            .find(|e| e.id.as_u64() == id)
-            .ok_or(format!("Web ビュー {id} が見つからない"))?;
+        let e = self.webviews.iter().find(|e| e.id.as_u64() == id).ok_or(
+            HostRefusal::WebViewNotFound {
+                id,
+                list_hint: false,
+            },
+        )?;
         let err = e.error_state();
         Ok(serde_json::json!({
             "id": id,
@@ -28886,8 +28885,9 @@ impl SystemHost for TakoApp {
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
             let mut settings = tako_control::settings::load();
             settings.claude_mod = enabled;
-            tako_control::settings::save(&settings)
-                .map_err(|e| format!("設定を保存できない: {e}"))?;
+            tako_control::settings::save(&settings).map_err(|e| {
+                HostRefusal::SettingsNotSaved(tako_control::config_io::IoCause::of(&e))
+            })?;
         }
         self.claude_mod.enabled = enabled;
         Ok(())
@@ -28899,8 +28899,9 @@ impl SystemHost for TakoApp {
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
             let mut settings = tako_control::settings::load();
             settings.lsp_format_on_save = enabled;
-            tako_control::settings::save(&settings)
-                .map_err(|e| format!("設定を保存できない: {e}"))?;
+            tako_control::settings::save(&settings).map_err(|e| {
+                HostRefusal::SettingsNotSaved(tako_control::config_io::IoCause::of(&e))
+            })?;
         }
         self.lsp_format_on_save = enabled;
         Ok(())
@@ -28916,8 +28917,9 @@ impl SystemHost for TakoApp {
         if std::env::var_os("TAKO_SELF_TEST").is_none() {
             let mut settings = tako_control::settings::load();
             settings.editor_auto_close = enabled;
-            tako_control::settings::save(&settings)
-                .map_err(|e| format!("設定を保存できない: {e}"))?;
+            tako_control::settings::save(&settings).map_err(|e| {
+                HostRefusal::SettingsNotSaved(tako_control::config_io::IoCause::of(&e))
+            })?;
         }
         self.editor_auto_close = enabled;
         for edit in self.preview_edits.values_mut() {

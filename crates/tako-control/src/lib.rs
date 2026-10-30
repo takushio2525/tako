@@ -62,6 +62,8 @@ pub mod dispatch;
 pub mod fda;
 pub mod handoff_guard;
 pub mod host;
+/// GUI 側の口（ControlHost の実装）が自分で組む断りの日英の対（#2365）
+pub mod host_refusal;
 pub mod ipc;
 pub mod launch_cmd;
 pub mod launch_gate;
@@ -148,6 +150,7 @@ pub use host::{
     SessionHost, SystemHost, TmuxCleanupJob, TmuxHost, UiStateHost, VideoStatus, WebViewHost,
     WorkspaceHost,
 };
+pub use host_refusal::HostRefusal;
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
 
