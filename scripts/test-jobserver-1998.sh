@@ -27,7 +27,7 @@ PASS=0
 FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  [NG] $1"; }
-check() { if [ "$1" = 0 ]; then pass "$2"; else fail "$2"; fi; }
+check() { if [ "$1" = 0 ]; then pass "$2"; return 0; fi; fail "$2"; return 1; }
 
 # 短い一時 dir（深いと IPC の受け口のパスが sun_path の上限を超える = #1441。空白も入らない = fifo の置き場が
 # 設計書どおりの <data_dir>/resources/jobserver.fifo になる）
@@ -135,9 +135,9 @@ free_is() { [ "$(js free)" = "$1" ]; }
 free_below() { local f; f="$(js free)"; [ -n "$f" ] && [ "$f" -lt "$1" ]; }
 
 wait_prompt() {
-  local p=$1 i
+  local p=$1 i screen
   for i in $(seq 1 100); do
-    "$TAKO_BIN" read --pane "$p" 2>/dev/null | grep -q '%' && return 0
+    screen="$("$TAKO_BIN" read --pane "$p" 2>/dev/null)" && [[ "$screen" == *%* ]] && return 0
     sleep 0.2
   done
   return 1
@@ -197,6 +197,10 @@ three() {
   THREE_RUNS="$(wc -l < "$log" | tr -d ' ')"
   THREE_OVERLAP="$(overlap "$log")"
   THREE_PS="$(max_of "$TMP/logs/$round.ps")"
+  # 足した 2 枚は閉じる（窓の幅が足りずに後の分割が断られないように）
+  for p in $panes; do
+    [ "$p" = "$(first_pane)" ] || "$TAKO_BIN" close --pane "$p" >/dev/null 2>&1
+  done
 }
 
 # =====================================================================
@@ -288,7 +292,8 @@ check $? "⑥ fifo が置き場に無い"
 # GUI の居ない器のペイン（env に CARGO_MAKEFLAGS が残っている = セッションに固定した値を持つもの）で cargo を走らせる
 TPANE=""
 for s in $(tmux -L "$TAKO_TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev/null); do
-  if tmux -L "$TAKO_TMUX_SOCKET" show-environment -t "$s" CARGO_MAKEFLAGS 2>/dev/null | grep -qF "fifo:$FIFO"; then
+  senv="$(tmux -L "$TAKO_TMUX_SOCKET" show-environment -t "$s" CARGO_MAKEFLAGS 2>/dev/null)"
+  if [[ "$senv" == *"fifo:$FIFO"* ]]; then
     TPANE="$s"
     break
   fi
@@ -297,12 +302,17 @@ done
 check $? "⑥ 器のセッションに CARGO_MAKEFLAGS が固定されている（${TPANE}）"
 gen_ws "$TMP/ws-noui" 3 1500 "$TMP/logs/noui.log"
 tmux -L "$TAKO_TMUX_SOCKET" send-keys -t "$TPANE" \
-  "cd '$TMP/ws-noui' && printf 'CMF=[%s]\\n' \"\$CARGO_MAKEFLAGS\" > '$TMP/env-noui.txt' && CARGO_BUILD_JOBS=3 CARGO_TARGET_DIR='$TMP/t-noui' '$CARGO_BIN' build --offline -q; echo \$? > '$TMP/done-noui'" Enter
+  "cd '$TMP/ws-noui' && printf 'CMF=[%s]\\n' \"\$CARGO_MAKEFLAGS\" > '$TMP/env-noui.txt' && CARGO_BUILD_JOBS=3 CARGO_TARGET_DIR='$TMP/t-noui' '$CARGO_BIN' build --offline -q 2> '$TMP/noui.err'; echo \$? > '$TMP/done-noui'" Enter
 wait_done noui
 grep -qF "fifo:$FIFO" "$TMP/env-noui.txt"
 check $? "⑥ 器のペインの env は消えた fifo を指したまま（$(cat "$TMP/env-noui.txt")）"
-[ "$(cat "$TMP/done-noui")" = 0 ] && [ "$(overlap "$TMP/logs/noui.log")" -ge 2 ]
-check $? "⑥ cargo は成功し自前の並列で走る（終了 $(cat "$TMP/done-noui")・重なり $(overlap "$TMP/logs/noui.log")）"
+NOUI_OVERLAP="$(overlap "$TMP/logs/noui.log" 2>/dev/null)"
+[ "$(cat "$TMP/done-noui")" = 0 ] && [ "${NOUI_OVERLAP:-0}" -ge 2 ]
+if ! check $? "⑥ cargo は成功し自前の並列で走る（終了 $(cat "$TMP/done-noui")・重なり ${NOUI_OVERLAP:-0}）"; then
+  # 次に落ちたときに原因が残るように（cargo の stderr・記録・target の中身）
+  echo "    stderr: $(head -c 400 "$TMP/noui.err" 2>/dev/null)"
+  echo "    記録: $(wc -l < "$TMP/logs/noui.log" 2>/dev/null)・target: $(ls "$TMP/t-noui" 2>/dev/null | tr '\n' ' ')"
+fi
 
 # =====================================================================
 echo "== B: A/B（TAKO_1992_NO_JOBSERVER=1） =="

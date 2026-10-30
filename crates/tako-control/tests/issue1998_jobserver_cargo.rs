@@ -287,7 +287,7 @@ fn cargo_makeflagsは素のmakeの並列度を変えない() {
         cmd.env_remove(k);
     }
     let status = cmd.env(key, value).status().unwrap();
-    assert!(status.success());
+    assert!(status.success(), "make が失敗した: {status:?}");
     assert_eq!(runs(&log), 3);
     assert_eq!(
         overlap(&log),
