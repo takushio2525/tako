@@ -271,7 +271,8 @@ cli_arm() {
   echo "    N 展開 / 畳む / 初期コミット / 知らないハッシュ:"
   sed 's/^/      /' "$n"
   if [ "$(grep -c '"expanded": *true' "$n")" = "2" ] && [ "$(grep -c '"expanded": *false' "$n")" = "2" ] \
-    && grep -q "コミット nope が見つからない" "$n" && grep -q "\"hash\": *\"$A_SHORT\"" "$n"; then
+    && grep -Eq "コミット nope が見つからない|commit nope not found" "$n" \
+    && grep -q "\"hash\": *\"$A_SHORT\"" "$n"; then
     pass "${label}: N 展開・畳む・初期コミット（diff-tree へ落ちる）・知らないハッシュの失敗が従来どおり"
   else
     fail "${label}: N 応答が想定外"
