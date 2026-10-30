@@ -425,8 +425,8 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   取得と実行（`install_for_typed` → `fetch_installer` / `run_installer`。セルフテスト中・代行できない環境・取得手段が
   無い / 起動できない・取得の失敗（取得手段の stderr か終了コードを `FetchDetail` で添える）・中身がインストーラでない・
   終了コード 137 / 128 以上 / その他・入ったのに引けない）と PATH 通し（`ensure_path_for_typed` / `undo_path_for_typed` →
-  `ensure_dirs_on_path` / `ensure_user_path_dirs`。シェルの設定ファイルが分からない（unix では届かない = 種別の
-  分からない `$SHELL` も zsh と見なす `shell_target`。表で見る）・Windows のユーザー PATH へ書いても入らない）は `SetupRefusal` の 17 種、中身の tako-core の断りは `shell_profile::PathBlockError`（profile の PATH
+  `ensure_dirs_on_path` / `ensure_user_path_dirs`。シェルの設定ファイルが分からない（表で見る。unix では #2550 から
+  `$SHELL` が設定されていて種別の分からないシェルで届く = 実経路は `tests/issue2550_unknown_shell_path.rs`）・Windows のユーザー PATH へ書いても入らない）は `SetupRefusal` の 17 種、中身の tako-core の断りは `shell_profile::PathBlockError`（profile の PATH
   ブロック）・`tako_cli_path::LinkError`（tako CLI の symlink。Windows だけの「symlink を張れない」も `cfg` の外）・
   `platform::user_path::UserPathError`（Windows の PowerShell の起動・失敗・出力の解釈と、unix の非対応）で、
   `SetupRefusal` は包むだけ（`PathBlock` / `CliLink` / `UserPath`）。tako-core の口も `*_typed`（`ensure_dirs_on_path_in_typed` /

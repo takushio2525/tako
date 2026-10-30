@@ -731,13 +731,22 @@ fn shell_target() -> (Option<ShellKind>, Option<PathBuf>) {
         Err(_) => return (None, None),
     };
     let shell = std::env::var("SHELL").unwrap_or_default();
-    let kind = ShellKind::from_shell_path(&shell).or_else(|| {
-        // `$SHELL` が無い（GUI から起動した .app 等）ときは OS の既定を仮定する。
-        // macOS は 10.15 以降 zsh が既定
-        (!cfg!(windows)).then_some(ShellKind::Zsh)
-    });
+    let kind = shell_kind_for(&shell, cfg!(windows));
     let profile = kind.map(|k| home.join(k.login_profile_rel()));
     (kind, profile)
+}
+
+/// `$SHELL` の値からログインシェルの種別を決める（**純粋関数**。#2550）。
+///
+/// `$SHELL` が**空・未設定**（GUI から起動した .app 等）のときだけ OS の既定を仮定する
+/// （macOS は 10.15 以降 zsh が既定。空を未設定と読むのは `exe::user_shell` と同じ）。
+/// **設定されていて種別の分からないシェル**（nu・tcsh 等）は `None` = 書かずに追記する行を返して断る。
+/// #2550 より前はこれも zsh と見なし、そのシェルが読まない `.zprofile` へ書いて成功を返していた
+fn shell_kind_for(shell: &str, windows: bool) -> Option<ShellKind> {
+    if shell.is_empty() {
+        return (!windows).then_some(ShellKind::Zsh);
+    }
+    ShellKind::from_shell_path(shell)
 }
 
 /// いまの導入状況を調べる（読み取りだけ。副作用なし）。認証の問い合わせは上限なしで待つ
@@ -1925,6 +1934,44 @@ fn homebrew_json() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2550: 種別の分からない `$SHELL` を zsh と見なさない（空・未設定のときだけ OS の既定）
+    #[test]
+    fn 種別の分からないシェルはzshと見なさず空と未設定だけ既定を仮定する() {
+        for unknown in [
+            "/bin/tcsh",
+            "/opt/homebrew/bin/nu",
+            "/usr/bin/false",
+            "/usr/local/bin/elvish",
+            "/nonexistent/tako-2550/xonsh",
+            "  ",
+        ] {
+            for windows in [false, true] {
+                assert_eq!(
+                    shell_kind_for(unknown, windows),
+                    None,
+                    "{unknown:?}（windows={windows}）を既知のシェルと見なした = 読まれない profile へ書く"
+                );
+            }
+        }
+        // 空 = 未設定（`std::env::var` の失敗も空で来る）だけ OS の既定
+        assert_eq!(shell_kind_for("", false), Some(ShellKind::Zsh));
+        assert_eq!(shell_kind_for("", true), None);
+        // 既存の利用者の答えは変えない（存在しないパスでも名前で決まる）
+        for (shell, kind) in [
+            ("/bin/zsh", ShellKind::Zsh),
+            ("/nonexistent/tako-2550/zsh", ShellKind::Zsh),
+            ("/bin/bash", ShellKind::Bash),
+            ("/bin/sh", ShellKind::Bash),
+            ("/opt/homebrew/bin/fish", ShellKind::Fish),
+            (
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+                ShellKind::PowerShell,
+            ),
+        ] {
+            assert_eq!(shell_kind_for(shell, false), Some(kind), "{shell}");
+        }
+    }
 
     #[test]
     fn claude_auth_jsonから認証とプランを取得する() {
