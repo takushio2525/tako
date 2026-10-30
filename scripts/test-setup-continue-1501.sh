@@ -137,6 +137,11 @@ mkenv(){ # $1 = none|auth|unauth（claude）, $2 = none|auth（codex。省略は
   mkdir -p "$BIN" "$HOMEDIR" "$DATADIR"
   # exe::find（境界 B16）のログインシェル経由の解決を隔離 PATH に閉じ込める
   printf '#!/bin/sh\nif [ "$1" = "-l" ]; then shift; fi\nexec /bin/sh "$@"\n' > "$BIN/isosh"
+  # 既定のログインシェルは同じ中身を zsh の名前で置く（PATH の外）。PATH 通しの書き先は $SHELL の
+  # 名前で決まり、種別の分からない名前（isosh）は書かずに断る（#2550）。isosh は 13) で使う
+  mkdir -p "$BIN/login"
+  printf '#!/bin/sh\nif [ "$1" = "-l" ]; then shift; fi\nexec /bin/sh "$@"\n' > "$BIN/login/zsh"
+  chmod +x "$BIN/login/zsh"
   # brew: 呼ばれたら分かるように置くが、依存は N / 非対話で入れない前提
   printf '#!/bin/sh\necho "==> Pouring $2"\nexit 0\n' > "$BIN/brew"
   if [ "$1" = "none" ]; then
@@ -157,7 +162,7 @@ mkenv(){ # $1 = none|auth|unauth（claude）, $2 = none|auth（codex。省略は
 run_pipe(){ # run_pipe <出力先> -- <tako の引数...>
   local out="$1"; shift; shift
   env -i HOME="$HOMEDIR" TAKO_DATA_DIR="$DATADIR" TAKO_ISOLATED=1 \
-      SHELL="$BIN/isosh" TAKO_TMUX_BIN="$BIN/tmux" \
+      SHELL="${LOGIN_SHELL:-$BIN/login/zsh}" TAKO_TMUX_BIN="$BIN/tmux" \
       ${LEGACY:+TAKO_1501_LEGACY=1} ${REQDEP:+TAKO_1501_TEST_REQUIRED_DEP="$REQDEP"} \
       PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb LANG=ja_JP.UTF-8 \
       "$TAKO" "$@" < /dev/null > "$out" 2>&1
@@ -168,7 +173,7 @@ run_pty(){ # run_pty <出力先> <answers...> -- <tako の引数...>
   # 空配列の展開を守る形で書く（macOS 同梱の bash 3.2 は set -u 下で落ちる）
   local answers=(); while [ "${1:-}" != "--" ]; do answers+=(--answer "$1"); shift; done; shift
   env -i HOME="$HOMEDIR" TAKO_DATA_DIR="$DATADIR" TAKO_ISOLATED=1 \
-      SHELL="$BIN/isosh" TAKO_TMUX_BIN="$BIN/tmux" \
+      SHELL="${LOGIN_SHELL:-$BIN/login/zsh}" TAKO_TMUX_BIN="$BIN/tmux" \
       ${LEGACY:+TAKO_1501_LEGACY=1} ${REQDEP:+TAKO_1501_TEST_REQUIRED_DEP="$REQDEP"} \
       PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb LANG=ja_JP.UTF-8 \
       /usr/bin/python3 "$PTY" ${answers[@]+"${answers[@]}"} --timeout 90 \
@@ -178,7 +183,7 @@ run_pty(){ # run_pty <出力先> <answers...> -- <tako の引数...>
 run_dispatch(){ # run_dispatch <出力先> <answers json> — dispatch SetupRun / MCP tako_setup と同条件
   local out="$1"; local answers="$2"
   printf '%s' "$answers" | env -i HOME="$HOMEDIR" TAKO_DATA_DIR="$DATADIR" TAKO_ISOLATED=1 \
-      SHELL="$BIN/isosh" TAKO_TMUX_BIN="$BIN/tmux" \
+      SHELL="${LOGIN_SHELL:-$BIN/login/zsh}" TAKO_TMUX_BIN="$BIN/tmux" \
       ${LEGACY:+TAKO_1501_LEGACY=1} ${REQDEP:+TAKO_1501_TEST_REQUIRED_DEP="$REQDEP"} \
       PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb LANG=ja_JP.UTF-8 \
       "$TAKO" setup --yes --answers - > "$out" 2>&1
@@ -335,6 +340,20 @@ contains "同じ実行の中で再検出される"    "（インストール完�
 contains "残りはログインだけ"            "残り 1 件（ここから先は人の操作が必要です）:" "$SANDBOX/12.log"
 if [ -x "$BIN/tmux" ]; then ok "tmux の実体が置かれた"; else ng "tmux の実体が無い"; fi
 exists   "プロファイルもできる"          "$PROFILE"
+
+echo "== 13) 種別の分からないログインシェル（#2550）: profile へ書かずに見送り、setup は完走 =="
+mkenv unauth
+RC=$(LOGIN_SHELL="$BIN/isosh" run_pipe "$SANDBOX/13.log" -- setup)
+check    "終了コード 0"                  "$RC" "0"
+contains "PATH 設置は見送りと言う"       "[警告] tako CLI の PATH 設置を見送りました" "$SANDBOX/13.log"
+contains "理由は既存の断り"              "使っているシェル（$BIN/isosh）の設定ファイルが分かりません" "$SANDBOX/13.log"
+absent   "書いたとは言わない"            "[設置] tako CLI" "$SANDBOX/13.log"
+if [ -e "$HOMEDIR/.zprofile" ] || [ -e "$HOMEDIR/.bash_profile" ]; then
+  ng "そのシェルが読まない profile を書いた"
+else
+  ok "profile を書かない"
+fi
+contains "残りはログインのまま"          "残り 1 件（ここから先は人の操作が必要です）:" "$SANDBOX/13.log"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

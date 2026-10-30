@@ -8,9 +8,10 @@
 //! のように日本語のまま = dispatch が日本語の口（`install_for` / `ensure_path_for` / `undo_path_for`）の
 //! `Err(String)` を素通ししていた。
 //!
-//! 「使っているシェル（…）の設定ファイルが分かりません」の 2 文は unix では届かない（種別の分からない `$SHELL` も
-//! zsh と見なす = `setup_bootstrap::shell_target`。Windows はユーザー PATH の経路）ので、ここでは叩かず
-//! `issue1762_dispatch_error_lang.rs` の表で日英を見る。
+//! 「使っているシェル（…）の設定ファイルが分かりません」の 2 文はここでは叩かず、
+//! `issue1762_dispatch_error_lang.rs` の表で日英を見る。#2550 より前は unix で届かなかった（種別の分からない
+//! `$SHELL` も zsh と見なしていた）。届くようになった実経路（未知のシェルで書かずに断る）は
+//! `issue2550_unknown_shell_path.rs` が見る。
 //!
 //! **本物の環境を 1 つも書き換えない・本物のインストーラを取得も実行もしない**（bootstrap はネットから
 //! インストーラを取って走らせ、シェルの profile とユーザーの PATH を書く経路）:
