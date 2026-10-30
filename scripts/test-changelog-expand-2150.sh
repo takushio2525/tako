@@ -271,7 +271,8 @@ cli_arm() {
   echo "    N 展開 / 畳む / 初期コミット / 知らないハッシュ:"
   sed 's/^/      /' "$n"
   if [ "$(grep -c '"expanded": *true' "$n")" = "2" ] && [ "$(grep -c '"expanded": *false' "$n")" = "2" ] \
-    && grep -q "コミット nope が見つからない" "$n" && grep -q "\"hash\": *\"$A_SHORT\"" "$n"; then
+    && grep -Eq "コミット nope が見つからない|commit nope not found" "$n" \
+    && grep -q "\"hash\": *\"$A_SHORT\"" "$n"; then
     pass "${label}: N 展開・畳む・初期コミット（diff-tree へ落ちる）・知らないハッシュの失敗が従来どおり"
   else
     fail "${label}: N 応答が想定外"
@@ -365,7 +366,8 @@ cli_arm() {
     wait "$bg" 2>/dev/null
     "$TAKO_BIN" preview-changelog --pane "$P" > "$TMP/e1-state.json" 2>&1
     echo "    E1 取っている最中の off: ${took} 秒 / 展開: 終了コード $(cat "$TMP/e1.rc") / $(head -c 160 "$TMP/e1.out" | tr '\n' ' ') / その後 $(tr -d '\n' < "$TMP/e1-state.json")"
-    if ui_ok "$took" && [ "$(cat "$TMP/e1.rc")" != "0" ] && grep -q "変更履歴が変わった" "$TMP/e1.out" \
+    if ui_ok "$took" && [ "$(cat "$TMP/e1.rc")" != "0" ] \
+      && grep -Eq "変更履歴が変わった|the change history changed" "$TMP/e1.out" \
       && [ "$(jget changelog < "$TMP/e1-state.json")" = "false" ]; then
       pass "E1 取っている最中に変更履歴を閉じると、展開は置かずに理由つきで返る（閉じたまま）"
     else

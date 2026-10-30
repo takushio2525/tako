@@ -2485,9 +2485,22 @@ pub fn build_master_cmd_with_plan_in(
     tako_bin: &str,
     dialect: crate::launch_cmd::ShellDialect,
 ) -> Result<String, String> {
+    build_master_cmd_with_plan_in_typed(role_env, profile, plan, prompt_path, tako_bin, dialect)
+        .map_err(ConfigError::into_ja)
+}
+
+/// [`build_master_cmd_with_plan_in`] の型の口（会話の再開の断りを表示言語で返す dispatch が使う。#2365）
+pub fn build_master_cmd_with_plan_in_typed(
+    role_env: &str,
+    profile: &Profile,
+    plan: &EnvPlan,
+    prompt_path: &Path,
+    tako_bin: &str,
+    dialect: crate::launch_cmd::ShellDialect,
+) -> Result<String, ConfigError> {
     use crate::launch_cmd as lc;
-    profile.validate_env()?;
-    let agent = profile.resolve_master_agent()?;
+    profile.validate_env_typed()?;
+    let agent = profile.resolve_master_agent_typed()?;
     // Remote Control（#1068）は claude だけ・opt-in だけ・適格なときだけ。
     // 判定材料は「起動先が実際に見る env」なので plan を反映した後で集める
     let remote_control = remote_control_decision(profile, agent, plan);

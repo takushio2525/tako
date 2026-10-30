@@ -587,21 +587,31 @@ pub fn status() -> Status {
 /// 配置をやめた）。以前の版が置いた管理ブロックを取り除くのは自動移行の仕事
 /// （`tako-control::migrations`）で、ここで重ねて触らない
 pub fn install() -> Result<Vec<Change>, String> {
-    write_scripts().map_err(|e| format!("統合スクリプトを書き出せません: {e}"))?;
+    install_typed().map_err(SiError::into_ja)
+}
+
+/// [`install`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+pub fn install_typed() -> Result<Vec<Change>, SiError> {
+    write_scripts().map_err(|e| SiError::WriteScripts(e.to_string()))?;
     Ok(Vec::new())
 }
 
 /// 以前の版が `$PROFILE` に置いた管理ブロックを取り除く（[`strip_legacy_block`] の 1 実装）。
 /// 取り除くものが無ければ「解除する配置が無い」ことをエラーで返す
 pub fn uninstall() -> Result<Vec<Change>, String> {
+    uninstall_typed().map_err(SiError::into_ja)
+}
+
+/// [`uninstall`] の型の口
+pub fn uninstall_typed() -> Result<Vec<Change>, SiError> {
     let blocks = legacy_blocks();
     if blocks.is_empty() {
-        return Err(imp::NOTHING_TO_UNINSTALL.to_string());
+        return Err(SiError::NothingToUninstall(imp::DELIVERY));
     }
     blocks
         .into_iter()
         .map(|block| {
-            let kind = strip_legacy_block(&block.path, None)?;
+            let kind = strip_legacy_block_typed(&block.path, None)?;
             Ok(Change {
                 label: block.label,
                 path: block.path,
@@ -661,32 +671,130 @@ pub fn legacy_blocks_in(candidates: &[(String, PathBuf)]) -> Vec<LegacyBlock> {
 /// - `backup` を渡すと、書き換える前の中身をそこへ写す（既にあれば上書きしない =
 ///   最初の旧内容を潰さない）。写せなければ取り除かない
 pub fn strip_legacy_block(path: &Path, backup: Option<&Path>) -> Result<ChangeKind, String> {
+    strip_legacy_block_typed(path, backup).map_err(SiError::into_ja)
+}
+
+/// [`strip_legacy_block`] の型の口（`tako shell-integration uninstall` を dispatch が表示言語で断る。#2365）
+pub fn strip_legacy_block_typed(path: &Path, backup: Option<&Path>) -> Result<ChangeKind, SiError> {
+    let at = |path: &Path, e: std::io::Error| (path.display().to_string(), e.to_string());
     let current = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ChangeKind::Absent),
-        Err(e) => return Err(format!("{} を読めません: {e}", path.display())),
+        Err(e) => {
+            let (path, error) = at(path, e);
+            return Err(SiError::ProfileUnreadable { path, error });
+        }
     };
     if find_block(&current).is_none() {
         return Ok(ChangeKind::Absent);
     }
     if let Some(backup) = backup.filter(|b| !b.exists()) {
         std::fs::write(backup, &current).map_err(|e| {
-            format!(
-                "退避に失敗したので取り除かない（{}）: {e}",
-                backup.display()
-            )
+            let (path, error) = at(backup, e);
+            SiError::BackupFailed { path, error }
         })?;
     }
     let next = remove_block(&current);
     if split_bom(&next).1.iter().all(u8::is_ascii_whitespace) {
-        std::fs::remove_file(path)
-            .map_err(|e| format!("{} を削除できません: {e}", path.display()))?;
+        std::fs::remove_file(path).map_err(|e| {
+            let (path, error) = at(path, e);
+            SiError::ProfileDeleteFailed { path, error }
+        })?;
         return Ok(ChangeKind::Deleted);
     }
-    std::fs::write(path, &next)
-        .map_err(|e| format!("{} を書き換えられません: {e}", path.display()))?;
+    std::fs::write(path, &next).map_err(|e| {
+        let (path, error) = at(path, e);
+        SiError::ProfileRewriteFailed { path, error }
+    })?;
     Ok(ChangeKind::Removed)
 }
+
+/// シェル統合の配置操作（install / uninstall / 以前の版のブロックの取り除き）の断り（#2365）。
+///
+/// 日英の対は [`SiError::text_in`] の (バリアント, 言語) の網羅 match の 1 か所。日本語は #2365 より前の
+/// 固定文とバイト一致（`tako-control/tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。
+/// `String` を返す口（[`install`] / [`uninstall`] / [`strip_legacy_block`]）は日本語のまま
+/// （自動移行の persist.log・`tako setup` の段・CLI の手元の表示はそのまま使う）。
+/// `error` は OS のエラー文（言語に依らずそのまま載せる）、パスは表記のまま埋める
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiError {
+    /// 統合スクリプトを書き出せない
+    WriteScripts(String),
+    /// 解除する配置が無い（言い方は届け方ごと = unix の注入 / Windows の起動引数）
+    NothingToUninstall(Delivery),
+    /// `$PROFILE` を読めない
+    ProfileUnreadable { path: String, error: String },
+    /// 書き換える前の中身を退避できない（`path` は退避先）
+    BackupFailed { path: String, error: String },
+    /// 取り除いて空になった `$PROFILE` を消せない
+    ProfileDeleteFailed { path: String, error: String },
+    /// `$PROFILE` を書き換えられない
+    ProfileRewriteFailed { path: String, error: String },
+}
+
+impl SiError {
+    /// 表示言語を明示しての文言（網羅 match = バリアントを足すと日英の両方を書くまで通らない）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::WriteScripts(e), Ja) => format!("統合スクリプトを書き出せません: {e}"),
+            (Self::WriteScripts(e), En) => format!("cannot write the integration scripts: {e}"),
+            (Self::NothingToUninstall(Delivery::Automatic), Ja) => {
+                "この環境のシェル統合は環境変数の注入だけで完結するため、解除する配置がありません"
+                    .to_string()
+            }
+            (Self::NothingToUninstall(Delivery::Automatic), En) => {
+                "shell integration here works only by injecting environment variables, \
+                 so there is nothing to uninstall"
+                    .to_string()
+            }
+            (Self::NothingToUninstall(Delivery::Launch), Ja) => {
+                "この環境のシェル統合は tako がペインの PowerShell を起こすときの起動引数で読ませるため、\
+                 解除する配置がありません（以前の版が $PROFILE に置いた管理ブロックも残っていません）"
+                    .to_string()
+            }
+            (Self::NothingToUninstall(Delivery::Launch), En) => {
+                "shell integration here is loaded through the arguments tako passes when it starts \
+                 the pane's PowerShell, so there is nothing to uninstall (no block placed in \
+                 $PROFILE by an earlier version remains either)"
+                    .to_string()
+            }
+            (Self::ProfileUnreadable { path, error }, Ja) => format!("{path} を読めません: {error}"),
+            (Self::ProfileUnreadable { path, error }, En) => format!("cannot read {path}: {error}"),
+            (Self::BackupFailed { path, error }, Ja) => {
+                format!("退避に失敗したので取り除かない（{path}）: {error}")
+            }
+            (Self::BackupFailed { path, error }, En) => {
+                format!("not removed because the backup failed ({path}): {error}")
+            }
+            (Self::ProfileDeleteFailed { path, error }, Ja) => {
+                format!("{path} を削除できません: {error}")
+            }
+            (Self::ProfileDeleteFailed { path, error }, En) => {
+                format!("cannot delete {path}: {error}")
+            }
+            (Self::ProfileRewriteFailed { path, error }, Ja) => {
+                format!("{path} を書き換えられません: {error}")
+            }
+            (Self::ProfileRewriteFailed { path, error }, En) => {
+                format!("cannot rewrite {path}: {error}")
+            }
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(crate::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for SiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for SiError {}
 
 // --- ここから下はプラットフォーム非依存の純粋関数（macOS 上でも全部テストできる） ---
 
@@ -813,8 +921,8 @@ mod imp {
     /// zsh / bash / fish の正本にも書き先の扱いを入れていない。
     /// **通さない器を unix で採ることになったら、正本へ足してからここを true にする**
     pub(super) const SIDE_CHANNEL: bool = false;
-    pub(super) const NOTHING_TO_UNINSTALL: &str =
-        "この環境のシェル統合は環境変数の注入だけで完結するため、解除する配置がありません";
+    /// 届け方（`uninstall` の「解除する配置が無い」の言い方も決める = `SiError::NothingToUninstall`）
+    pub(super) const DELIVERY: Delivery = Delivery::Automatic;
 
     /// unix はシェルが拾う環境変数を撒くだけで届く（ユーザーのファイルを触らない）
     pub(super) fn injected_env(root: &Path, bash_path: &Path) -> Vec<(String, String)> {
@@ -851,7 +959,7 @@ mod imp {
 
     pub(super) fn status() -> Status {
         Status {
-            delivery: Delivery::Automatic,
+            delivery: DELIVERY,
             script: super::integration_root().map(|r| r.join("tako.bash")),
             launch_shell: None,
             legacy_blocks: Vec::new(),
@@ -875,9 +983,8 @@ mod imp {
     pub(super) const SHELLS: &str = "PowerShell 7 / Windows PowerShell 5.1";
     /// `tako.ps1` は `TAKO_OSC_SINK` があれば OSC を側路へ書く（#766）
     pub(super) const SIDE_CHANNEL: bool = true;
-    pub(super) const NOTHING_TO_UNINSTALL: &str =
-        "この環境のシェル統合は tako がペインの PowerShell を起こすときの起動引数で読ませるため、\
-         解除する配置がありません（以前の版が $PROFILE に置いた管理ブロックも残っていません）";
+    /// 届け方（`uninstall` の「解除する配置が無い」の言い方も決める = `SiError::NothingToUninstall`）
+    pub(super) const DELIVERY: Delivery = Delivery::Launch;
 
     /// Windows は起動引数で読ませる（[`pane_shell`]）ので、spawn 時に注入する環境変数は無い。
     /// POSIX 用の 3 点セットを撒いても PowerShell は 1 つも見ないため、ペインの
@@ -906,7 +1013,7 @@ mod imp {
 
     pub(super) fn status() -> Status {
         Status {
-            delivery: Delivery::Launch,
+            delivery: DELIVERY,
             script: super::integration_root().map(|r| r.join("tako.ps1")),
             launch_shell: powershell_default_shell(),
             legacy_blocks: super::legacy_blocks(),

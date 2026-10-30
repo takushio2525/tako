@@ -333,6 +333,23 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（`HostRefusal` の表と、GUI のソースを読んで
   日本語の断りの書き足しを `file:line` で名指す `HOST_IMPL_SCOPES`。診断の出力 = `eprintln!` / persist.log と
   まだ移していない断片 `HOST_DEFERRED` は外し、断片がソースから消えたら表から外すよう落とす）
+- #2365 の続きで、**会話のカタログ・会話の再開・端末ログの断り**（sessions.yaml の読み取り / パース・ID の
+  前方一致・resume の組み立て = `resume_launch` と worker の MCP の設定ファイルの書き出し・`tako logs read`）を
+  `tako_control::SessionRefusal`（網羅 match）へ、**OS の設定・統合の操作の断り**（フルディスクアクセス・
+  残量下限・蓋閉じ継続の登録・シェル統合）を `tako_control::OsRefusal` と tako-core の
+  `shell_integration::SiError` へ移した。形は `ConfigError` と同じで、**`String` を返す従来の口は日本語のまま**
+  （persist.log・復元の内訳・`tako orchestrator resume`・CLI の `tako fda` / `sleep-guard` /
+  `shell-integration` = GUI を通さない手元の処理で表示全体が日本語）。dispatch の `sessions list / show /
+  resume / link`・`logs read`・会話を保った再起動（下見の `resume_error` と実行の書き出し）・`tako_fda` /
+  `tako_sleep_guard` / `tako_shell_integration` だけが型の口（`*_typed`）を通す。`pane_log::read_tail` は
+  OS のエラーを返し、文は呼び手（`SessionRefusal::LogUnreadable`）が組む。「見つからない」系
+  （カタログ・会話の記録）の英語は ` not found` を含む。**蓋閉じ継続の解除と Battery の設定を開く口は
+  中身が `platform::lid` / `os_integration` の文なので移していない**（それと一緒に移す）。`Ok` の文
+  （手段の説明・削除不要）と resume の warnings は応答の注記なので対象外。番犬は同じ
+  `issue1762_dispatch_error_lang.rs` の末尾の節（3 つの型の表・型の口の断りの組み立て = `Err(` / `.map_err(` /
+  `.ok_or(` の中の日本語を名指す `SESSION_OS_REFUSAL_SCOPES`・dispatch が日本語の口を呼んでいないか
+  `JA_SESSION_OS_CALLS`）、実経路は `tests/issue2365_sessions_os_lang.rs`（unix。カタログ・置き場を一時の
+  場所へ向けて GUI 無しのホストへ dispatch を日英で通す。OS の設定を本当に変える操作は叩かない）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

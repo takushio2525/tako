@@ -75,6 +75,7 @@ pub mod mcp;
 pub mod migrations;
 pub mod net_stop;
 pub mod orchestrator;
+pub mod os_refusal;
 pub mod paste_guard;
 pub mod peer_messaging;
 pub mod platform;
@@ -104,6 +105,7 @@ pub mod restore_vessels;
 pub mod resume_launch;
 pub mod run_configs;
 pub mod runtime_probe;
+pub mod session_refusal;
 pub mod sessions;
 pub mod settings;
 pub mod setup;
@@ -153,6 +155,8 @@ pub use host::{
 pub use host_refusal::HostRefusal;
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
+pub use os_refusal::OsRefusal;
+pub use session_refusal::SessionRefusal;
 
 // --- claude session スキャンのイベント駆動トリガー（#368） ---
 use std::sync::atomic::{AtomicBool, Ordering};

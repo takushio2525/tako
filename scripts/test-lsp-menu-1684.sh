@@ -243,7 +243,8 @@ for pos in "2 1" "2 14" "2 23" "4 0"; do
     "$(printf '%s' "$R" | json '"%s %s" % (d["status"], ",".join(i["id"] for i in d["items"]))')"
 done
 BAD="$("$TAKO_BIN" lsp menu --pane "$A" --line 9 --column 0 2>&1)"
-case "$BAD" in *"行目は無い"*) pass "無い行は丸めずに拒否" ;; *) fail "無い行: $BAD" ;; esac
+# 断りの文は表示言語に従う（#2365）ので日英のどちらでも読む
+case "$BAD" in *"行目は無い"*|*"does not exist (total lines:"*) pass "無い行は丸めずに拒否" ;; *) fail "無い行: $BAD" ;; esac
 
 # 未導入（pyright の差し替え口が実行できないもの）・Markdown
 B="$(open_file "$P/tool.py")"
@@ -252,7 +253,10 @@ check_eq "未導入は not-installed 0 件" "not-installed " \
   "$(printf '%s' "$R" | json '"%s %s" % (d["status"], ",".join(i["id"] for i in d["items"]))')"
 M="$(open_file "$P/README.md")"
 RM="$("$TAKO_BIN" lsp menu --pane "$M" --line 3 --column 0 2>&1)"
-case "$RM" in *"コード表示のプレビューではない"*) pass "Markdown のレンダリング表示は理由つきで断る" ;; *) fail "Markdown: $RM" ;; esac
+case "$RM" in
+  *"コード表示のプレビューではない"*|*"not a code preview"*) pass "Markdown のレンダリング表示は理由つきで断る" ;;
+  *) fail "Markdown: $RM" ;;
+esac
 
 stop_isolated_gui "$APP_PID"
 APP_PID=""

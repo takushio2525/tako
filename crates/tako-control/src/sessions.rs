@@ -56,6 +56,8 @@ use serde_json::{json, Value};
 use tako_core::agent_support::Agent;
 use tako_core::platform::support::Platform;
 
+use crate::SessionRefusal;
+
 /// カタログに保持する最大エントリ数（last_seen_at の新しい順に残す）
 const MAX_ENTRIES: usize = 500;
 
@@ -211,22 +213,29 @@ impl SessionCatalog {
 
     /// パス指定 load。不在は空、パース失敗は Err（0 件に丸めない。#169）
     pub fn load_from(path: &Path) -> Result<Self, String> {
+        Self::load_from_typed(path).map_err(SessionRefusal::into_ja)
+    }
+
+    /// [`Self::load_from`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+    pub fn load_from_typed(path: &Path) -> Result<Self, SessionRefusal> {
         if !path.is_file() {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("sessions.yaml の読み取りに失敗: {e}"))?;
+            .map_err(|e| SessionRefusal::CatalogRead(e.to_string()))?;
         serde_yaml::from_str(&content).map_err(|e| {
-            format!(
-                "sessions.yaml のパースに失敗: {}",
-                tako_core::load_issue::yaml_error_reason(&e, &content)
-            )
+            SessionRefusal::CatalogParse(tako_core::load_issue::YamlReason::of(&e, &content))
         })
     }
 
     pub fn load() -> Result<Self, String> {
-        let path = catalog_path().ok_or("ホームディレクトリが取得できない")?;
-        Self::load_from(&path)
+        Self::load_typed().map_err(SessionRefusal::into_ja)
+    }
+
+    /// [`Self::load`] の型の口
+    pub fn load_typed() -> Result<Self, SessionRefusal> {
+        let path = catalog_path().ok_or(SessionRefusal::CatalogHomeUnresolved)?;
+        Self::load_from_typed(&path)
     }
 
     /// ロック付き read-modify-write（config_io。#169 と同型）
@@ -254,6 +263,15 @@ impl SessionCatalog {
 
     /// id の前方一致でエントリを解決する。複数一致は候補一覧つきのエラー
     pub fn resolve_id(&self, id_prefix: &str) -> Result<(&String, &SessionEntry), String> {
+        self.resolve_id_typed(id_prefix)
+            .map_err(SessionRefusal::into_ja)
+    }
+
+    /// [`Self::resolve_id`] の型の口
+    pub fn resolve_id_typed(
+        &self,
+        id_prefix: &str,
+    ) -> Result<(&String, &SessionEntry), SessionRefusal> {
         // 完全一致を最優先（他 ID の前方部分と衝突しても曖昧にならない）
         if let Some((id, entry)) = self.entries.get_key_value(id_prefix) {
             return Ok((id, entry));
@@ -264,18 +282,13 @@ impl SessionCatalog {
             .filter(|(id, _)| id.starts_with(id_prefix))
             .collect();
         match matches.len() {
-            0 => Err(format!(
-                "セッション '{id_prefix}' がカタログに見つからない（tako sessions list で確認）"
-            )),
+            0 => Err(SessionRefusal::SessionNotFound(id_prefix.to_string())),
             1 => Ok(matches[0]),
-            n => Err(format!(
-                "セッション '{id_prefix}' の候補が {n} 件ある（もう少し長い ID を指定）: {}",
-                matches
-                    .iter()
-                    .map(|(id, _)| short_id(id))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
+            n => Err(SessionRefusal::SessionAmbiguous {
+                prefix: id_prefix.to_string(),
+                count: n,
+                candidates: matches.iter().map(|(id, _)| short_id(id)).collect(),
+            }),
         }
     }
 }
@@ -910,7 +923,16 @@ pub fn list_payload(
     project: Option<&str>,
     limit: usize,
 ) -> Result<Value, String> {
-    let catalog = SessionCatalog::load()?;
+    list_payload_typed(role, project, limit).map_err(SessionRefusal::into_ja)
+}
+
+/// [`list_payload`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+pub fn list_payload_typed(
+    role: Option<&str>,
+    project: Option<&str>,
+    limit: usize,
+) -> Result<Value, SessionRefusal> {
+    let catalog = SessionCatalog::load_typed()?;
     let sessions: Vec<Value> = catalog
         .sorted_entries()
         .into_iter()
@@ -966,8 +988,13 @@ pub fn list_payload(
 
 /// `show` の応答ペイロード（メタ + 会話冒頭の抜粋 + transcript 情報）
 pub fn show_payload(id_prefix: &str) -> Result<Value, String> {
-    let catalog = SessionCatalog::load()?;
-    let (id, entry) = catalog.resolve_id(id_prefix)?;
+    show_payload_typed(id_prefix).map_err(SessionRefusal::into_ja)
+}
+
+/// [`show_payload`] の型の口
+pub fn show_payload_typed(id_prefix: &str) -> Result<Value, SessionRefusal> {
+    let catalog = SessionCatalog::load_typed()?;
+    let (id, entry) = catalog.resolve_id_typed(id_prefix)?;
     let transcript = crate::transcript::find_transcript(id);
     let transcript_info = transcript.as_ref().map(|path| {
         let meta = std::fs::metadata(path).ok();
@@ -998,6 +1025,15 @@ pub fn show_payload(id_prefix: &str) -> Result<Value, String> {
 /// `mcp_args` は worker の MCP の断片（[`resume_worker_mcp`] + [`resume_mcp_args`] = spawn と
 /// 同じ組み立て。#2447）。worker 以外は空
 pub fn resume_command(id: &str, entry: &SessionEntry, mcp_args: &str) -> Result<String, String> {
+    resume_command_typed(id, entry, mcp_args).map_err(SessionRefusal::into_ja)
+}
+
+/// [`resume_command`] の型の口（#2365）
+pub fn resume_command_typed(
+    id: &str,
+    entry: &SessionEntry,
+    mcp_args: &str,
+) -> Result<String, SessionRefusal> {
     let agent = agent_of(entry);
     resume_command_with_env(id, entry, conversation_env(agent, id).as_deref(), mcp_args)
 }
@@ -1098,17 +1134,13 @@ fn resume_command_with_env(
     entry: &SessionEntry,
     env_prefix: Option<&str>,
     mcp_args: &str,
-) -> Result<String, String> {
+) -> Result<String, SessionRefusal> {
     let agent = agent_of(entry);
-    let spec = tako_core::agent_resume::resume_spec(agent).ok_or_else(|| {
-        format!(
-            "agent '{}' のセッションは resume 非対応（対応: claude / codex / agy）",
-            agent.as_str()
-        )
-    })?;
+    let spec = tako_core::agent_resume::resume_spec(agent)
+        .ok_or_else(|| SessionRefusal::ResumeUnsupported(agent.as_str().to_string()))?;
     // 書式検証は全系統共通（パストラバーサル防止。codex / agy の会話 ID も UUID）
     if !crate::transcript::is_valid_session_id(id) {
-        return Err("session_id の形式が不正".into());
+        return Err(SessionRefusal::InvalidSessionId);
     }
     let role_env = match entry.kind.as_str() {
         "worker" => {
@@ -2062,7 +2094,9 @@ mod tests {
             agent: Some("local".into()),
             ..Default::default()
         };
-        let err = resume_command_with_env("abc", &local, None, "").unwrap_err();
+        let err = resume_command_with_env("abc", &local, None, "")
+            .unwrap_err()
+            .into_ja();
         assert!(err.contains("resume 非対応"), "{err}");
 
         // 書式検証（パストラバーサル防止）は全系統に効く

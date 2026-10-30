@@ -130,7 +130,7 @@ fn 再開の経路は_worker_の_mcp_を通す() {
     require(
         &resume,
         RESUME,
-        "crate::sessions::resume_command(session_id, entry, &mcp_args)",
+        "crate::sessions::resume_command_typed(session_id, entry, &mcp_args)",
         "カタログの再開が決めた断片をコマンドへ渡していない",
     );
     let worker = fn_body(&resume, RESUME, "fn resume_worker_launch(");
