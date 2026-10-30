@@ -162,7 +162,7 @@ fn 書き換えの対象は計測で選んだ21構文() {
     let decl = &src[at..at + src[at..].find("];").expect("宣言の終わり")];
     for name in MEASURED_TARGETS {
         assert!(
-            decl.contains(&format!("target(\"{name}\","))
+            decl.contains(&format!("target(\"{name}\",")),
             "{MIRROR}:{}: 書き換えの対象から \"{name}\" が抜けた（#1917 / #1935）\n\
              外すなら計測の表（.agent/architecture.md）と理由を添えて、この番犬の表も直すこと",
             line_at(&src, at)
