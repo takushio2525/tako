@@ -4321,15 +4321,15 @@ fn 呼び出しグラフが空振りしていない() {
         ),
         "モジュールのパスを末尾の名前だけで照合している（同名の別関数へ繋がる）"
     );
-    // `Type::f(`（`orchestrator::Profile::load`）。#2233 で self は表示用の読み込みへ移ったので、
-    // 標本は `Profile::load` を直接呼ぶ採用（adopt）にする
+    // `Type::f(`（`orchestrator::Profile::load_typed`）。#2233 で self は表示用の読み込みへ移ったので、
+    // 標本は `Profile` を直接読む採用（adopt）にする（#2365 で断りを表示言語で返す型の口へ移った）
     assert!(
         graph
             .callees(f("dispatch_orchestrator_adopt"))
             .into_iter()
-            .any(|g| graph.fns[g].name == "load"
+            .any(|g| graph.fns[g].name == "load_typed"
                 && graph.fns[g].owner == call_graph::Owner::Type("Profile".into())),
-        "`Type::f(` の解決が効いていない（`Profile::load`）"
+        "`Type::f(` の解決が効いていない（`Profile::load_typed`）"
     );
 
     // 辿らない領域が実コードで効いている（本文には呼び出しがあるのに、辺は無い）

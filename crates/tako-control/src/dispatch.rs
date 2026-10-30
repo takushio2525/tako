@@ -44297,7 +44297,12 @@ mod tests {
                 ..Default::default()
             })
             .expect_err("範囲外は拒否する");
-            assert!(err.to_string().contains("50〜60"), "{err}");
+            // 理由の文は表示言語に従う（#2365）
+            let text = err.to_string();
+            assert!(
+                text.contains("50〜60") || text.contains("between 50 and 60"),
+                "{err}"
+            );
         }
     }
 
