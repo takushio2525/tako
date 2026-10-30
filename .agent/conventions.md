@@ -980,14 +980,32 @@ AppleSystemPolicy が読めずに 1 本ずつ拒否する。記録されるパ�
     ディレクトリを順に見るだけ。持たないので古くならない）
   - GUI のプロセスの PATH は起動時の値のまま変わらない（tako-app は自分の PATH を書き換えない）。
     変わるのはファイルシステムの側だけなので、上の 2 つで素の名前と同じ場所に当たる
+  - **PATH で引けない素の名前は unix では起こさない**（開け直し。10/30 の本番）: Dock から起こした GUI の
+    PATH は `/usr/bin:/bin:/usr/sbin:/sbin` の 4 エントリ。remote daemon の稼働中は 2 秒ごとの
+    `refresh_remote_state` が `remote::daemon_status` を 2 回（そのまま + `admin_request` の中）呼び、
+    そのたびに `survey_variants` → `find_tailscale` → `tailscale::pick_candidate` が「引けなければ素の名前の
+    まま試す」で `tailscale --version` を起こして 4 エントリぶん空振りしていた（答えは後ろの固定の候補で
+    決まる無駄撃ち。差し替えの後は 2 秒ごとに 4 件 × 2 = 1,220 件 / 315 秒）。`find_in_process_path` は
+    `posix_spawnp` と同じ PATH を同じ順で見るので、引けない名前を起こしても空振りして「無い」に終わるだけ。
+    素の名前のまま試すのは引けないことが「PATH に無い」を意味しないとき（Windows・A/B）だけ
+    （`tailscale::try_unresolved_bare`）。起こさなかった素の名前も、動く候補が無ければ最後にログインシェルで
+    引き直す（#1816 の段は変わらない）。PATH の相対エントリ・空エントリにだけ在る CLI は試さない
   - 縛らない口: ユーザー操作で 1 回（`open` / `osascript` / Code Runner / LSP の起動）・1 日 1 回
     （アプリ内更新の `brew`）・オプトインの送信（telemetry の `hostname` 等）・macOS で届かない落ち先
     （`agents` の `ps` は libproc が先に答える）・既に絶対パスかログインシェルで引く口（claude・ssh・
-    ffmpeg・`/bin/ps`・`/usr/bin/ditto`）。remote daemon の `hostname` はスマホの要求ごと（#2518 の範囲）
+    ffmpeg・`/bin/ps`・`/usr/bin/ditto`）。remote daemon の `hostname` はスマホの要求ごと（#2518 の範囲）。
+    起動時に 1 回だけの口（`bin_resolve` の素の名前の `--version`・`backend` の `psmux -V`）は
+    install の差し替えより前に終わるので縛らない
+  - **洗い出しは実測で裏を取る**: 静的な洗い出し（#2522）は「どの状態で周期に乗るか」（remote daemon の
+    稼働中だけ等）を落としやすい。隔離 GUI へ `posix_spawn` / `posix_spawnp` を横取りする dylib を
+    `DYLD_INSERT_LIBRARIES` で積むと（cargo の debug ビルドは hardened runtime ではないので効く）、
+    起こした名前・結果・呼び手のスタックが取れる。本番の状態（daemon の稼働等）は隔離 data dir の
+    中で偽装する（`TAKO_REMOTE_STATE_DIR` を明示しないと隔離 GUI は自分専用の一時 dir を見る）
   - A/B は `TAKO_2519_LEGACY=1`（ゲートは `exe::issue2519_legacy` の 1 か所）。番犬
     `crates/tako-control/tests/issue2519_gui_spawn_path_watchdog.rs` が、git / tmux を絶対パスで持つこと
-    （実ファイルと実 PATH）・周期の口の表・本番コードの素の `git` / `tmux` のリテラルを file:line で見る。
-    **周期の口を足したら表（`PERIODIC`）にも載せる**
+    （実ファイルと実 PATH）・周期の口の表・本番コードの素の `git` / `tmux` のリテラル・remote の状態の更新が
+    通る口の表（`REMOTE_REFRESH`）・PATH に無い素の名前の tailscale を起こさないこと（相対エントリの先の
+    偽物が印を残すかで見る）を file:line で見る。**周期の口を足したら表（`PERIODIC` / `REMOTE_REFRESH`）にも載せる**
 
 ## OS に何かを「開かせる」前に形を確かめる（Issue #1376 / #1371）
 
