@@ -37,18 +37,20 @@ impl Action {
 /// 「いま実際にどうなっているか」を別呼び出しで確かめさせないため
 /// （AI が 1 往復で完結できる = 開発不変条件 5 の趣旨）
 pub fn run(action: Option<&str>) -> Result<Value, String> {
+    run_typed(action).map_err(crate::OsRefusal::into_ja)
+}
+
+/// [`run`] の型の口（断りを表示言語で返す dispatch = MCP `tako_shell_integration` が使う。#2365）。
+/// CLI の `tako shell-integration` は GUI を通さない手元の処理で表示全体が日本語なので [`run`] を使う
+pub fn run_typed(action: Option<&str>) -> Result<Value, crate::OsRefusal> {
     let raw = action.unwrap_or("status");
-    let action = Action::parse(raw).ok_or_else(|| {
-        format!(
-            "不明な action: {raw:?}（{} のいずれか）",
-            Action::VALUES.join(" / ")
-        )
-    })?;
+    let action = Action::parse(raw)
+        .ok_or_else(|| crate::OsRefusal::UnknownShellIntegrationAction(raw.to_string()))?;
 
     let changes = match action {
         Action::Status => Vec::new(),
-        Action::Install => si::install()?,
-        Action::Uninstall => si::uninstall()?,
+        Action::Install => si::install_typed()?,
+        Action::Uninstall => si::uninstall_typed()?,
     };
 
     let mut out = si::status().describe();

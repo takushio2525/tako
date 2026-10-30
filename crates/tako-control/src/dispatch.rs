@@ -19,7 +19,9 @@ use tako_core::{
 };
 
 use crate::orchestrator::ConfigError;
+use crate::os_refusal::OsRefusal;
 use crate::protocol::{error_code, Direction, FileOpKind, PreviewModeWire, Request};
+use crate::session_refusal::SessionRefusal;
 
 // ControlHost とサブトレイトは host.rs で定義（Issue #86）
 pub use crate::host::{
@@ -11717,7 +11719,7 @@ fn dispatch_inner(
             match action {
                 "status" => Ok(crate::fda::status_info().to_json()),
                 "open" => {
-                    crate::fda::open_settings().map_err(DispatchError::Operation)?;
+                    crate::fda::open_settings_typed().map_err(OsRefusal::operation)?;
                     Ok(serde_json::json!({ "opened": true }))
                 }
                 other => Err(Reason::UnknownValue {
@@ -11930,8 +11932,9 @@ fn dispatch_inner(
                             )?;
                     }
                     if let Some(floor) = lid_battery_floor {
-                        settings.lid_battery_floor = crate::sleep_guard::parse_battery_floor(floor)
-                            .map_err(DispatchError::InvalidParams)?;
+                        settings.lid_battery_floor =
+                            crate::sleep_guard::parse_battery_floor_typed(floor)
+                                .map_err(OsRefusal::invalid)?;
                     }
                     crate::settings::save(&settings)
                         .map_err(|e| Reason::settings_save_failed(&e).operation())?;
@@ -11942,8 +11945,8 @@ fn dispatch_inner(
                 // CLI（`tako sleep-guard install-lid-sleep`）と同じ関数を通るので
                 // 3 経路で挙動が食い違わない
                 "install-lid-sleep" => {
-                    let result = crate::sleep_guard::prepare_lid_control()
-                        .map_err(DispatchError::Operation)?;
+                    let result = crate::sleep_guard::prepare_lid_control_typed()
+                        .map_err(OsRefusal::operation)?;
                     let mut settings = crate::settings::load();
                     settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::WhileAgentsRunning;
                     crate::settings::save(&settings)
@@ -12288,7 +12291,7 @@ fn dispatch_inner(
         }
 
         Request::ShellIntegration { action } => {
-            crate::shell_integration::run(action.as_deref()).map_err(DispatchError::InvalidParams)
+            crate::shell_integration::run_typed(action.as_deref()).map_err(OsRefusal::invalid)
         }
 
         Request::Mod {
@@ -12564,12 +12567,12 @@ fn dispatch_inner(
             issue,
             show,
         } => match action.as_str() {
-            "list" => crate::sessions::list_payload(
+            "list" => crate::sessions::list_payload_typed(
                 role.as_deref(),
                 project.as_deref(),
                 limit.unwrap_or(30),
             )
-            .map_err(DispatchError::Operation),
+            .map_err(SessionRefusal::operation),
             "show" => {
                 let id = id.ok_or_else(|| {
                     Reason::ActionNeeds {
@@ -12578,7 +12581,7 @@ fn dispatch_inner(
                     }
                     .invalid()
                 })?;
-                crate::sessions::show_payload(&id).map_err(DispatchError::Operation)
+                crate::sessions::show_payload_typed(&id).map_err(SessionRefusal::operation)
             }
             "resume" => {
                 let id = id.ok_or_else(|| {
@@ -14808,8 +14811,11 @@ fn dispatch_logs_read(
     let dir =
         tako_core::pane_log::log_dir().ok_or_else(|| Reason::DataDirUnresolved.operation())?;
     let (path, resolved_pane) = if let Some(sid) = session_id {
-        let catalog = crate::sessions::SessionCatalog::load().map_err(DispatchError::Operation)?;
-        let (_, entry) = catalog.resolve_id(sid).map_err(DispatchError::Operation)?;
+        let catalog =
+            crate::sessions::SessionCatalog::load_typed().map_err(SessionRefusal::operation)?;
+        let (_, entry) = catalog
+            .resolve_id_typed(sid)
+            .map_err(SessionRefusal::operation)?;
         let from_entry = entry
             .log_file
             .as_deref()
@@ -14837,8 +14843,13 @@ fn dispatch_logs_read(
         return Err(Reason::ReadNeedsPaneOrSession.invalid());
     };
     let max_lines = lines.unwrap_or(200).clamp(1, 100_000);
-    let content =
-        tako_core::pane_log::read_tail(&path, max_lines).map_err(DispatchError::Operation)?;
+    let content = tako_core::pane_log::read_tail(&path, max_lines).map_err(|e| {
+        SessionRefusal::LogUnreadable {
+            path: path.display().to_string(),
+            error: e.to_string(),
+        }
+        .operation()
+    })?;
     Ok(json!({
         "path": path,
         "pane": resolved_pane,
@@ -14866,10 +14877,11 @@ fn dispatch_sessions_link(
 ) -> Result<Value, DispatchError> {
     // id 明示: カタログで前方一致を解いてから引く（agent 種別もカタログから取る）
     if let Some(prefix) = id_prefix {
-        let catalog = crate::sessions::SessionCatalog::load().map_err(DispatchError::Operation)?;
+        let catalog =
+            crate::sessions::SessionCatalog::load_typed().map_err(SessionRefusal::operation)?;
         let (session_id, entry) = catalog
-            .resolve_id(prefix)
-            .map_err(DispatchError::Operation)?;
+            .resolve_id_typed(prefix)
+            .map_err(SessionRefusal::operation)?;
         let agent = entry.agent.as_deref().unwrap_or("claude");
         let link = crate::claude_remote_link::link_for_agent_session(agent, Some(session_id));
         return Ok(json!({
@@ -14939,10 +14951,11 @@ fn dispatch_sessions_resume(
     tab: Option<u64>,
     direction: Option<Direction>,
 ) -> Result<Value, DispatchError> {
-    let catalog = crate::sessions::SessionCatalog::load().map_err(DispatchError::Operation)?;
+    let catalog =
+        crate::sessions::SessionCatalog::load_typed().map_err(SessionRefusal::operation)?;
     let (session_id, entry) = catalog
-        .resolve_id(id_prefix)
-        .map_err(DispatchError::Operation)?;
+        .resolve_id_typed(id_prefix)
+        .map_err(SessionRefusal::operation)?;
     let session_id = session_id.clone();
     let entry = entry.clone();
 
@@ -14991,9 +15004,11 @@ fn dispatch_sessions_resume(
         }),
         worker_launch: registry_launch_of_session(&session_id),
     };
-    let launch = crate::resume_launch::resume_launch(&session_id, &entry, &hints)
-        .map_err(DispatchError::Operation)?;
-    launch.materialize().map_err(DispatchError::Operation)?;
+    let launch = crate::resume_launch::resume_launch_typed(&session_id, &entry, &hints)
+        .map_err(SessionRefusal::operation)?;
+    launch
+        .materialize_typed()
+        .map_err(SessionRefusal::operation)?;
     let resume_cmd = launch.command.clone();
 
     let cwd = entry
@@ -27920,7 +27935,9 @@ fn build_session_restart_plan(host: &dyn ControlHost, pane_id: PaneId) -> Sessio
         worker_launch: registry_launch_of(pane_id),
     };
     let (launch, resume_error) = match session_id.as_deref() {
-        Some(id) => match crate::resume_launch::resume_launch_in(
+        // 組めない理由は応答の `resume_error` と断り（`ResumeCommandUnbuildable`）の中身になる =
+        // 枠と同じ表示言語で組む（#2365）
+        Some(id) => match crate::resume_launch::resume_launch_in_typed(
             id,
             &entry,
             &hints,
@@ -27931,7 +27948,7 @@ fn build_session_restart_plan(host: &dyn ControlHost, pane_id: PaneId) -> Sessio
             tako_core::session_restart::legacy_1967(),
         ) {
             Ok(l) => (Some(l), None),
-            Err(e) => (None, Some(e)),
+            Err(e) => (None, Some(e.to_string())),
         },
         None => (None, None),
     };
@@ -28115,9 +28132,10 @@ fn dispatch_session_restart(
                 .launch
                 .as_ref()
                 .ok_or_else(|| op_err("resume コマンドを組めなかった"))?;
-            // 起動に要る system prompt は**終了させる前に**書く（書けなければ何も壊さずに断る）
+            // 起動に要る system prompt は**終了させる前に**書く（書けなければ何も壊さずに断る）。
+            // 中身の文も枠と同じ表示言語（#2365）
             launch
-                .materialize()
+                .materialize_typed()
                 .map_err(|e| Reason::ResumeFilesUnwritable(e.to_string()).operation())?;
             // #1967: 落ちた後にシェルがプロンプトへ戻ったかの基準は**終了要求の前**に控える
             // （終了要求の後に読むと、もう戻った後の値を基準にしてしまいうる）

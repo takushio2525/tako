@@ -221,14 +221,14 @@ fn 復元の縛り(s: &Sources) -> Result<(), String> {
 
 /// 2. 再開の入口は worker_resume_launch の 1 実装で、spawn の材料をすべて渡す
 fn 入口の縛り(s: &Sources) -> Result<(), String> {
-    let entry = window(&s.resume, RESUME, "pub fn resume_launch_in(")?;
+    let entry = window(&s.resume, RESUME, "pub fn resume_launch_in_typed(")?;
     require(
         &entry,
         RESUME,
-        "worker_resume_launch(",
+        "worker_resume_launch_typed(",
         "`tako sessions resume` / 会話を保った再起動の worker が GUI の復元と別の組み立てを通っている",
     )?;
-    let route = window(&s.resume, RESUME, "pub fn worker_resume_launch(")?;
+    let route = window(&s.resume, RESUME, "pub fn worker_resume_launch_typed(")?;
     require(
         &route,
         RESUME,
@@ -424,7 +424,7 @@ fn 修正を戻す注入を名指しで落とす() {
             |s| {
                 swap(
                     &mut s.resume,
-                    "if let Some(launch) = worker_resume_launch(",
+                    "if let Some(launch) = worker_resume_launch_typed(",
                     "if let Some(launch) = catalog_worker_launch(",
                 )
             },

@@ -130,7 +130,7 @@ fn 再開コマンドは元の起動の正本を通す(s: &Sources) -> Result<()
     require(
         &master,
         RESUME,
-        "orchestrator::build_master_cmd_with_plan_in(",
+        "orchestrator::build_master_cmd_with_plan_in_typed(",
         "master / solo の再開が `tako master` と同じ組み立てを通っていない \
          = model / effort / system prompt / Remote Control が落ちる（#1967 の主題）",
     )?;
@@ -169,11 +169,11 @@ fn 再起動と_sessions_resume_は同じ組み立て(s: &Sources) -> Result<(),
     for (needle, call) in [
         (
             "fn build_session_restart_plan(",
-            "crate::resume_launch::resume_launch_in(",
+            "crate::resume_launch::resume_launch_in_typed(",
         ),
         (
             "fn dispatch_sessions_resume(",
-            "crate::resume_launch::resume_launch(",
+            "crate::resume_launch::resume_launch_typed(",
         ),
     ] {
         let win = need(&s.dispatch, DISPATCH, needle)?;
@@ -540,7 +540,7 @@ fn 逆戻りを名指しできる() {
             |s| {
                 replace_once(
                     &mut s.resume,
-                    "let launch = orchestrator::build_master_cmd_with_plan_in(",
+                    "let launch = orchestrator::build_master_cmd_with_plan_in_typed(",
                     "let launch = orchestrator::build_master_cmd_legacy(",
                 )
             },
@@ -562,7 +562,7 @@ fn 逆戻りを名指しできる() {
             |s| {
                 replace_once(
                     &mut s.dispatch,
-                    "Some(id) => match crate::resume_launch::resume_launch_in(",
+                    "Some(id) => match crate::resume_launch::resume_launch_in_typed(",
                     "Some(id) => match crate::sessions::resume_command(",
                 )
             },
@@ -573,7 +573,7 @@ fn 逆戻りを名指しできる() {
             |s| {
                 replace_once(
                     &mut s.dispatch,
-                    "let launch = crate::resume_launch::resume_launch(&session_id, &entry, &hints)",
+                    "let launch = crate::resume_launch::resume_launch_typed(&session_id, &entry, &hints)",
                     "let launch = crate::sessions::resume_command(&session_id, &entry)",
                 )
             },

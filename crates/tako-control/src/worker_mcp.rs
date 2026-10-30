@@ -334,14 +334,18 @@ pub fn settings_file_for(denied: &[String]) -> Result<(PathBuf, String), String>
 }
 
 /// 設定ファイルを書く。中身が同じファイルが既にあれば書かない
-fn write_settings(path: &Path, body: &str) -> Result<(), String> {
+fn write_settings(path: &Path, body: &str) -> Result<(), crate::SessionRefusal> {
     if std::fs::read_to_string(path).ok().as_deref() == Some(body) {
         return Ok(());
     }
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{} を作れない: {e}", dir.display()))?;
+        std::fs::create_dir_all(dir).map_err(|e| crate::SessionRefusal::McpSettingsDir {
+            dir: dir.display().to_string(),
+            error: e.to_string(),
+        })?;
     }
-    crate::config_io::atomic_write(path, body)
+    crate::config_io::atomic_write_typed(path, body)
+        .map_err(crate::SessionRefusal::McpSettingsWrite)
 }
 
 /// プロジェクトの `mcp_servers`（無ければ空 = tako だけ）
@@ -416,6 +420,12 @@ impl WorkerMcp {
     /// 設定ファイルを書く（中身が同じなら書かない）。起動の直前に呼ぶ
     /// （再開の下見では呼ばない = `resume_launch::ResumeLaunch::materialize` と同じ作法）
     pub fn materialize(&self) -> Result<(), String> {
+        self.materialize_typed()
+            .map_err(crate::SessionRefusal::into_ja)
+    }
+
+    /// [`Self::materialize`] の型の口（会話の再開の断りを表示言語で返す dispatch が使う。#2365）
+    pub fn materialize_typed(&self) -> Result<(), crate::SessionRefusal> {
         match (&self.settings_file, &self.settings_body) {
             (Some(path), Some(body)) => write_settings(Path::new(path), body),
             _ => Ok(()),

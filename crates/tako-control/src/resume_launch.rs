@@ -48,6 +48,7 @@ use std::path::{Path, PathBuf};
 use crate::orchestrator::{self, agent::WorkerAgent, EnvPlan, Profile, ProfileKind};
 use crate::sessions::SessionEntry;
 use crate::transcript::TranscriptLocation;
+use crate::SessionRefusal;
 use tako_core::agent_support::Agent;
 
 /// どの組み立てを通したか（応答の `recipe` と persist.log に出す安定した語彙）
@@ -171,17 +172,22 @@ impl ResumeLaunch {
     /// 起動に要るファイル（system prompt）を書き出す。`tako master` と同じく毎回書き直すので、
     /// ファイルが消えていても・プロファイルの規則が変わっていても今の内容で起動する
     pub fn materialize(&self) -> Result<(), String> {
+        self.materialize_typed().map_err(SessionRefusal::into_ja)
+    }
+
+    /// [`Self::materialize`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+    pub fn materialize_typed(&self) -> Result<(), SessionRefusal> {
         if let Some(mcp) = &self.worker_mcp {
-            mcp.materialize()?;
+            mcp.materialize_typed()?;
         }
         let Some((path, content)) = &self.prompt_file else {
             return Ok(());
         };
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .map_err(|e| format!("system prompt の保存先を作れない: {e}"))?;
+                .map_err(|e| SessionRefusal::PromptDir(e.to_string()))?;
         }
-        std::fs::write(path, content).map_err(|e| format!("system prompt の書き出しに失敗: {e}"))
+        std::fs::write(path, content).map_err(|e| SessionRefusal::PromptWrite(e.to_string()))
     }
 
     /// 書き出す system prompt のパス（検証・応答用）
@@ -193,15 +199,24 @@ impl ResumeLaunch {
 /// 再開コマンドを組む（I/O あり: 会話の記録を探す・プロファイルを読む）。
 ///
 /// `Err` = 再開できない（会話 ID の形が不正・記録が無い・プロファイルが壊れている 等）。
-/// 理由は利用者へそのまま出せる日本語
+/// 理由は利用者へそのまま出せる日本語（表示言語で返すのは [`resume_launch_typed`]）
 pub fn resume_launch(
     session_id: &str,
     entry: &SessionEntry,
     hints: &ResumeHints,
 ) -> Result<ResumeLaunch, String> {
+    resume_launch_typed(session_id, entry, hints).map_err(SessionRefusal::into_ja)
+}
+
+/// [`resume_launch`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+pub fn resume_launch_typed(
+    session_id: &str,
+    entry: &SessionEntry,
+    hints: &ResumeHints,
+) -> Result<ResumeLaunch, SessionRefusal> {
     let location = crate::transcript::locate_transcript(session_id);
     let codex_home = codex_rollout_home(session_id, entry);
-    resume_launch_in(
+    resume_launch_in_typed(
         session_id,
         entry,
         hints,
@@ -236,15 +251,33 @@ pub fn resume_launch_in(
     dialect: crate::launch_cmd::ShellDialect,
     legacy: bool,
 ) -> Result<ResumeLaunch, String> {
+    resume_launch_in_typed(
+        session_id, entry, hints, location, codex_home, tako_bin, dialect, legacy,
+    )
+    .map_err(SessionRefusal::into_ja)
+}
+
+/// [`resume_launch_in`] の型の口（#2365）
+#[allow(clippy::too_many_arguments)]
+pub fn resume_launch_in_typed(
+    session_id: &str,
+    entry: &SessionEntry,
+    hints: &ResumeHints,
+    location: Option<&TranscriptLocation>,
+    codex_home: Option<&Path>,
+    tako_bin: &str,
+    dialect: crate::launch_cmd::ShellDialect,
+    legacy: bool,
+) -> Result<ResumeLaunch, SessionRefusal> {
     if !crate::transcript::is_valid_session_id(session_id) {
-        return Err("session_id の形式が不正".into());
+        return Err(SessionRefusal::InvalidSessionId);
     }
     let agent = entry
         .agent
         .as_deref()
         .and_then(Agent::parse)
         .unwrap_or(Agent::Claude);
-    let catalog = || -> Result<ResumeLaunch, String> {
+    let catalog = || -> Result<ResumeLaunch, SessionRefusal> {
         // #2447: worker なら spawn と同じ MCP の断片（codex は `codex resume -c …`）。
         // 設定ファイルは下見では書かない（実行する側の materialize が書く）
         let worker_mcp = crate::sessions::resume_worker_mcp(agent, session_id, entry);
@@ -257,7 +290,7 @@ pub fn resume_launch_in(
             .map(|(_, mcp)| mcp.warnings.clone())
             .unwrap_or_default();
         Ok(ResumeLaunch {
-            command: crate::sessions::resume_command(session_id, entry, &mcp_args)?,
+            command: crate::sessions::resume_command_typed(session_id, entry, &mcp_args)?,
             recipe: ResumeRecipe::Catalog,
             profile: None,
             warnings,
@@ -270,7 +303,7 @@ pub fn resume_launch_in(
         return catalog();
     }
     // worker は spawn と同じ組み立て（GUI の復元と同じ 1 実装 = #2473）。対象外の系統（agy）はカタログ
-    if let Some(launch) = worker_resume_launch(
+    if let Some(launch) = worker_resume_launch_typed(
         session_id, entry, hints, location, codex_home, tako_bin, dialect,
     ) {
         return launch;
@@ -304,12 +337,8 @@ pub fn resume_launch_in(
 }
 
 /// claude の会話の記録が見つからないときの理由（利用者へそのまま出す）
-fn no_transcript(session_id: &str) -> String {
-    format!(
-        "会話 {} の記録（claude の transcript）が見つからない。\
-         削除されたか、登録されていない設定 dir にある（`tako orchestrator accounts list`）",
-        crate::sessions::short_id(session_id)
-    )
+fn no_transcript(session_id: &str) -> SessionRefusal {
+    SessionRefusal::TranscriptMissing(crate::sessions::short_id(session_id))
 }
 
 /// worker の再開コマンド（**GUI の復元・`tako sessions resume`・会話を保った再起動が共有する 1 実装**。#2473）。
@@ -326,6 +355,22 @@ pub fn worker_resume_launch(
     tako_bin: &str,
     dialect: crate::launch_cmd::ShellDialect,
 ) -> Option<Result<ResumeLaunch, String>> {
+    worker_resume_launch_typed(
+        session_id, entry, hints, location, codex_home, tako_bin, dialect,
+    )
+    .map(|r| r.map_err(SessionRefusal::into_ja))
+}
+
+/// [`worker_resume_launch`] の型の口（#2365）
+pub fn worker_resume_launch_typed(
+    session_id: &str,
+    entry: &SessionEntry,
+    hints: &ResumeHints,
+    location: Option<&TranscriptLocation>,
+    codex_home: Option<&Path>,
+    tako_bin: &str,
+    dialect: crate::launch_cmd::ShellDialect,
+) -> Option<Result<ResumeLaunch, SessionRefusal>> {
     use tako_core::agent_support::{keys, supports};
     if entry.kind != "worker" {
         return None;
@@ -344,7 +389,7 @@ pub fn worker_resume_launch(
     }
     let worker = WorkerAgent::try_from(agent).ok()?;
     if !crate::transcript::is_valid_session_id(session_id) {
-        return Some(Err("session_id の形式が不正".into()));
+        return Some(Err(SessionRefusal::InvalidSessionId));
     }
     Some(resume_worker_launch(
         session_id, worker, entry, hints, location, codex_home, tako_bin, dialect,
@@ -438,20 +483,19 @@ fn resume_profile_launch(
     location: &TranscriptLocation,
     tako_bin: &str,
     dialect: crate::launch_cmd::ShellDialect,
-) -> Result<ResumeLaunch, String> {
+) -> Result<ResumeLaunch, SessionRefusal> {
     let name = name.filter(|n| !n.is_empty()).unwrap_or(DEFAULT_PROFILE);
     let mut warnings = Vec::new();
     let (profile, profile_name) = load_profile_for_resume(kind, name, &mut warnings)?;
     // CLI の組み立てと同じ: 系統の解決は起動の前に（codex master の会話は claude で再開しない）
-    let master_agent = profile.resolve_master_agent()?;
+    let master_agent = profile.resolve_master_agent_typed()?;
     if master_agent != WorkerAgent::Claude {
-        return Err(format!(
-            "プロファイル '{profile_name}' のエージェントは {} なので claude の会話を\
-             その組み立てで再開できない（`tako sessions resume <id>` で開く）",
-            master_agent.as_str()
-        ));
+        return Err(SessionRefusal::MasterAgentNotClaude {
+            profile: profile_name,
+            agent: master_agent.as_str().to_string(),
+        });
     }
-    let mut plan = profile.resolved_env_plan_for_master()?;
+    let mut plan = profile.resolved_env_plan_for_master_typed()?;
     pin_config_dir(&mut plan, location, &mut warnings);
     let (role_env, prompt_name, prompt_content) = match kind {
         ProfileKind::Master => (
@@ -471,9 +515,9 @@ fn resume_profile_launch(
         ),
     };
     let prompt_path = orchestrator::config_dir()
-        .ok_or("ホームディレクトリが取得できない")?
+        .ok_or(orchestrator::ConfigError::HomeUnresolved)?
         .join(prompt_name);
-    let launch = orchestrator::build_master_cmd_with_plan_in(
+    let launch = orchestrator::build_master_cmd_with_plan_in_typed(
         &role_env,
         &profile,
         &plan,
@@ -506,7 +550,7 @@ fn resume_worker_launch(
     codex_home: Option<&Path>,
     tako_bin: &str,
     dialect: crate::launch_cmd::ShellDialect,
-) -> Result<ResumeLaunch, String> {
+) -> Result<ResumeLaunch, SessionRefusal> {
     let mut warnings = Vec::new();
     let name = hints
         .worker_profile
@@ -515,7 +559,7 @@ fn resume_worker_launch(
         .unwrap_or(DEFAULT_PROFILE);
     let (profile, profile_name) =
         load_profile_for_resume(ProfileKind::Master, name, &mut warnings)?;
-    profile.validate_env()?;
+    profile.validate_env_typed()?;
     // spawn と同じ env 計画（プロファイルの env + worker のアカウント）。そのうえで設定の置き場だけを
     // **会話の記録の所在**へ寄せる（spawn 時の `--account` は記録に無い / 記録の無い置き場で resume すると落ちる）
     let mut plan = worker_env_plan(&profile, &mut warnings);
@@ -615,10 +659,12 @@ fn load_profile_for_resume(
     kind: ProfileKind,
     name: &str,
     warnings: &mut Vec<String>,
-) -> Result<(Profile, String), String> {
+) -> Result<(Profile, String), SessionRefusal> {
     let exists = kind.path(name).map(|p| p.is_file()).unwrap_or(false);
     if exists {
-        return orchestrator::load_profile_of(kind, name).map(|p| (p, name.to_string()));
+        return orchestrator::load_profile_of_typed(kind, name)
+            .map(|p| (p, name.to_string()))
+            .map_err(SessionRefusal::from);
     }
     if name != DEFAULT_PROFILE {
         warnings.push(format!(

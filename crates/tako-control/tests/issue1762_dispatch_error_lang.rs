@@ -8127,3 +8127,686 @@ fn outside() {
     assert_eq!(found, vec![9, 12], "植えた 2 か所だけを名指す");
     assert!(item_lines(src, "impl Absent for TakoApp {").is_none());
 }
+
+// ---- #2365 の続き: 会話のカタログ・会話の再開・端末ログの断り（`SessionRefusal`）と、OS の設定・統合の
+// 操作（フルディスクアクセス・スリープ防止 / 蓋閉じ継続・シェル統合）の断り（`OsRefusal` + tako-core の
+// `shell_integration::SiError`） ----
+//
+// dispatch の `sessions` / `logs` / 会話を保った再起動の下見と `tako_fda` / `tako_sleep_guard` /
+// `tako_shell_integration` は、これらの口の `Err(String)`（日本語の固定文）を素通ししていた。日英の対は
+// 3 つの型の `text_in` の網羅 match に置き、従来の `String` の口は日本語のまま（persist.log・復元の内訳・
+// CLI の手元の表示）、dispatch だけが型の口（`*_typed`）を通す。ここでは
+// (1) 全バリアントの日英と旧文のバイト一致、(2) 型の口の本体の断りの組み立て（`Err(` / `.map_err(` /
+// `.ok_or(`）に日本語の固定文を書き足していないこと、(3) dispatch が日本語の口を呼んで断りに載せて
+// いないことを `file:line` で名指す。成功の応答の注記（`Ok` の文・warnings・osascript のスクリプト）は
+// 断りではないので見ない
+
+use tako_control::{OsRefusal, SessionRefusal};
+use tako_core::shell_integration::{Delivery, SiError};
+
+const SESSIONS_SRC: &str = include_str!("../src/sessions.rs");
+const SESSIONS_PATH: &str = "crates/tako-control/src/sessions.rs";
+const RESUME_LAUNCH_SRC: &str = include_str!("../src/resume_launch.rs");
+const RESUME_LAUNCH_PATH: &str = "crates/tako-control/src/resume_launch.rs";
+const WORKER_MCP_SRC: &str = include_str!("../src/worker_mcp.rs");
+const WORKER_MCP_PATH: &str = "crates/tako-control/src/worker_mcp.rs";
+const FDA_SRC: &str = include_str!("../src/fda.rs");
+const FDA_PATH: &str = "crates/tako-control/src/fda.rs";
+const SLEEP_GUARD_SRC: &str = include_str!("../src/sleep_guard.rs");
+const SLEEP_GUARD_PATH: &str = "crates/tako-control/src/sleep_guard.rs";
+const SHELL_INTEGRATION_SRC: &str = include_str!("../src/shell_integration.rs");
+const SHELL_INTEGRATION_PATH: &str = "crates/tako-control/src/shell_integration.rs";
+const CORE_SHELL_INTEGRATION_SRC: &str = include_str!("../../tako-core/src/shell_integration.rs");
+const CORE_SHELL_INTEGRATION_PATH: &str = "crates/tako-core/src/shell_integration.rs";
+const SESSION_REFUSAL_SRC: &str = include_str!("../src/session_refusal.rs");
+const SESSION_REFUSAL_PATH: &str = "crates/tako-control/src/session_refusal.rs";
+const OS_REFUSAL_SRC: &str = include_str!("../src/os_refusal.rs");
+const OS_REFUSAL_PATH: &str = "crates/tako-control/src/os_refusal.rs";
+
+/// `SessionRefusal` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
+fn session_refusal_index(r: &SessionRefusal) -> usize {
+    match r {
+        SessionRefusal::CatalogHomeUnresolved => 0,
+        SessionRefusal::CatalogRead(_) => 1,
+        SessionRefusal::CatalogParse(_) => 2,
+        SessionRefusal::SessionNotFound(_) => 3,
+        SessionRefusal::SessionAmbiguous { .. } => 4,
+        SessionRefusal::InvalidSessionId => 5,
+        SessionRefusal::ResumeUnsupported(_) => 6,
+        SessionRefusal::TranscriptMissing(_) => 7,
+        SessionRefusal::Config(_) => 8,
+        SessionRefusal::MasterAgentNotClaude { .. } => 9,
+        SessionRefusal::PromptDir(_) => 10,
+        SessionRefusal::PromptWrite(_) => 11,
+        SessionRefusal::McpSettingsDir { .. } => 12,
+        SessionRefusal::McpSettingsWrite(_) => 13,
+        SessionRefusal::LogUnreadable { .. } => 14,
+    }
+}
+const SESSION_REFUSAL_VARIANTS: usize = 15;
+
+/// 見本と #2365 より前の固定文（sessions / resume_launch / worker_mcp / pane_log が書いていた文を見本の値で展開）
+fn session_refusal_table() -> Vec<(SessionRefusal, String)> {
+    let yaml = YamlReason::Located {
+        kind: YamlProblem::Syntax,
+        at: Some((1, 11)),
+    };
+    vec![
+        (
+            SessionRefusal::CatalogHomeUnresolved,
+            "ホームディレクトリが取得できない".into(),
+        ),
+        (
+            SessionRefusal::CatalogRead("Permission denied (os error 13)".into()),
+            "sessions.yaml の読み取りに失敗: Permission denied (os error 13)".into(),
+        ),
+        (
+            SessionRefusal::CatalogParse(yaml.clone()),
+            format!("sessions.yaml のパースに失敗: {}", yaml.text_in(Lang::Ja)),
+        ),
+        (
+            SessionRefusal::SessionNotFound("nope".into()),
+            "セッション 'nope' がカタログに見つからない（tako sessions list で確認）".into(),
+        ),
+        (
+            SessionRefusal::SessionAmbiguous {
+                prefix: "aaaa".into(),
+                count: 2,
+                candidates: vec!["aaaa1111".into(), "aaaa2222".into()],
+            },
+            "セッション 'aaaa' の候補が 2 件ある（もう少し長い ID を指定）: aaaa1111, aaaa2222"
+                .into(),
+        ),
+        (
+            SessionRefusal::InvalidSessionId,
+            "session_id の形式が不正".into(),
+        ),
+        (
+            SessionRefusal::ResumeUnsupported("local".into()),
+            "agent 'local' のセッションは resume 非対応（対応: claude / codex / agy）".into(),
+        ),
+        (
+            SessionRefusal::TranscriptMissing("aaaa1111".into()),
+            "会話 aaaa1111 の記録（claude の transcript）が見つからない。\
+             削除されたか、登録されていない設定 dir にある（`tako orchestrator accounts list`）"
+                .into(),
+        ),
+        (
+            SessionRefusal::Config(ConfigError::ProfileEnvReserved(vec!["TAKO_SOCKET".into()])),
+            "プロファイルの env に tako 内部変数が含まれている（上書き禁止）: TAKO_SOCKET".into(),
+        ),
+        (
+            SessionRefusal::MasterAgentNotClaude {
+                profile: "codexm".into(),
+                agent: "codex".into(),
+            },
+            "プロファイル 'codexm' のエージェントは codex なので claude の会話を\
+             その組み立てで再開できない（`tako sessions resume <id>` で開く）"
+                .into(),
+        ),
+        (
+            SessionRefusal::PromptDir("Not a directory (os error 20)".into()),
+            "system prompt の保存先を作れない: Not a directory (os error 20)".into(),
+        ),
+        (
+            SessionRefusal::PromptWrite("Is a directory (os error 21)".into()),
+            "system prompt の書き出しに失敗: Is a directory (os error 21)".into(),
+        ),
+        (
+            SessionRefusal::McpSettingsDir {
+                dir: "/tmp/x2365".into(),
+                error: "Permission denied (os error 13)".into(),
+            },
+            "/tmp/x2365 を作れない: Permission denied (os error 13)".into(),
+        ),
+        (
+            SessionRefusal::McpSettingsWrite(WriteError::NoParent("/x2365".into())),
+            "親ディレクトリがない: /x2365".into(),
+        ),
+        (
+            SessionRefusal::LogUnreadable {
+                path: "/tmp/c1.log".into(),
+                error: "Permission denied (os error 13)".into(),
+            },
+            "ログを読めない (/tmp/c1.log): Permission denied (os error 13)".into(),
+        ),
+    ]
+}
+
+/// `OsRefusal` の通し番号
+fn os_refusal_index(r: &OsRefusal) -> usize {
+    match r {
+        OsRefusal::FdaPanelUnopenable => 0,
+        OsRefusal::FdaMacOnly => 1,
+        OsRefusal::BatteryFloorOutOfRange(_) => 2,
+        OsRefusal::LidUnsupported => 3,
+        OsRefusal::OsascriptFailed(_) => 4,
+        OsRefusal::UserCanceled => 5,
+        OsRefusal::SudoersInstallFailed(_) => 6,
+        OsRefusal::UnknownShellIntegrationAction(_) => 7,
+        OsRefusal::ShellIntegration(_) => 8,
+    }
+}
+const OS_REFUSAL_VARIANTS: usize = 9;
+
+/// `SiError`（tako-core）の通し番号
+fn si_error_index(e: &SiError) -> usize {
+    match e {
+        SiError::WriteScripts(_) => 0,
+        SiError::NothingToUninstall(Delivery::Automatic) => 1,
+        SiError::NothingToUninstall(Delivery::Launch) => 2,
+        SiError::ProfileUnreadable { .. } => 3,
+        SiError::BackupFailed { .. } => 4,
+        SiError::ProfileDeleteFailed { .. } => 5,
+        SiError::ProfileRewriteFailed { .. } => 6,
+    }
+}
+const SI_ERROR_VARIANTS: usize = 7;
+
+fn si_error_table() -> Vec<(SiError, &'static str)> {
+    let at = |path: &str| {
+        (
+            path.to_string(),
+            "Permission denied (os error 13)".to_string(),
+        )
+    };
+    let (p, e) = at("C:/Users/winuser/Documents/PowerShell/profile.ps1");
+    vec![
+        (
+            SiError::WriteScripts("Not a directory (os error 20)".into()),
+            "統合スクリプトを書き出せません: Not a directory (os error 20)",
+        ),
+        (
+            SiError::NothingToUninstall(Delivery::Automatic),
+            "この環境のシェル統合は環境変数の注入だけで完結するため、解除する配置がありません",
+        ),
+        (
+            SiError::NothingToUninstall(Delivery::Launch),
+            "この環境のシェル統合は tako がペインの PowerShell を起こすときの起動引数で読ませるため、\
+             解除する配置がありません（以前の版が $PROFILE に置いた管理ブロックも残っていません）",
+        ),
+        (
+            SiError::ProfileUnreadable {
+                path: p.clone(),
+                error: e.clone(),
+            },
+            "C:/Users/winuser/Documents/PowerShell/profile.ps1 を読めません: Permission denied (os error 13)",
+        ),
+        (
+            SiError::BackupFailed {
+                path: format!("{p}.pre-v1.bak"),
+                error: e.clone(),
+            },
+            "退避に失敗したので取り除かない（C:/Users/winuser/Documents/PowerShell/profile.ps1.pre-v1.bak）: \
+             Permission denied (os error 13)",
+        ),
+        (
+            SiError::ProfileDeleteFailed {
+                path: p.clone(),
+                error: e.clone(),
+            },
+            "C:/Users/winuser/Documents/PowerShell/profile.ps1 を削除できません: Permission denied (os error 13)",
+        ),
+        (
+            SiError::ProfileRewriteFailed { path: p, error: e },
+            "C:/Users/winuser/Documents/PowerShell/profile.ps1 を書き換えられません: Permission denied (os error 13)",
+        ),
+    ]
+}
+
+fn os_refusal_table() -> Vec<(OsRefusal, &'static str)> {
+    vec![
+        (
+            OsRefusal::FdaPanelUnopenable,
+            "システム設定のフルディスクアクセスパネルを開けませんでした",
+        ),
+        (
+            OsRefusal::FdaMacOnly,
+            "フルディスクアクセスは macOS 専用の機能です",
+        ),
+        (
+            OsRefusal::BatteryFloorOutOfRange(1),
+            "残量下限は 5〜90 の範囲で指定してください（指定値: 1）",
+        ),
+        (
+            OsRefusal::LidUnsupported,
+            "この OS では蓋閉じ継続に対応していません",
+        ),
+        (
+            OsRefusal::OsascriptFailed("No such file or directory (os error 2)".into()),
+            "osascript の実行に失敗: No such file or directory (os error 2)",
+        ),
+        (OsRefusal::UserCanceled, "ユーザーがキャンセルしました"),
+        (
+            OsRefusal::SudoersInstallFailed("ERROR: visudo".into()),
+            "sudoers 登録に失敗: ERROR: visudo",
+        ),
+        (
+            OsRefusal::UnknownShellIntegrationAction("bogus".into()),
+            "不明な action: \"bogus\"（status / install / uninstall のいずれか）",
+        ),
+        (
+            OsRefusal::ShellIntegration(SiError::NothingToUninstall(Delivery::Automatic)),
+            "この環境のシェル統合は環境変数の注入だけで完結するため、解除する配置がありません",
+        ),
+    ]
+}
+
+/// 表の 1 行の検査（日本語は旧文とバイト一致・英語に日本語が無い・日英が違う・`into_ja` は日本語の文）
+fn check_refusal_row(
+    failures: &mut Vec<String>,
+    what: String,
+    old: &str,
+    ja: String,
+    en: String,
+    into_ja: String,
+) {
+    if ja != old {
+        failures.push(format!(
+            "{what}: 日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}"
+        ));
+    }
+    if let Some(c) = has_japanese(&en) {
+        failures.push(format!("{what}: 英語に日本語（{c}）が混ざる: {en}"));
+    }
+    if ja == en {
+        failures.push(format!("{what}: 日英が同じ文（英語の書き忘れ）: {en}"));
+    }
+    if into_ja != ja {
+        failures.push(format!("{what}: into_ja が text_in(Ja) と違う"));
+    }
+}
+
+#[test]
+fn 会話とosの設定の断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let sessions = session_refusal_table();
+    let samples: Vec<SessionRefusal> = sessions.iter().map(|(r, _)| r.clone()).collect();
+    covers_every(
+        &samples,
+        session_refusal_index,
+        SESSION_REFUSAL_VARIANTS,
+        "SessionRefusal",
+    );
+    let os = os_refusal_table();
+    let samples: Vec<OsRefusal> = os.iter().map(|(r, _)| r.clone()).collect();
+    covers_every(&samples, os_refusal_index, OS_REFUSAL_VARIANTS, "OsRefusal");
+    let si = si_error_table();
+    let samples: Vec<SiError> = si.iter().map(|(e, _)| e.clone()).collect();
+    covers_every(&samples, si_error_index, SI_ERROR_VARIANTS, "SiError");
+
+    let mut failures = Vec::new();
+    for (r, old) in &sessions {
+        check_refusal_row(
+            &mut failures,
+            format!("{r:?}"),
+            old,
+            r.text_in(Lang::Ja),
+            r.text_in(Lang::En),
+            r.clone().into_ja(),
+        );
+    }
+    for (r, old) in &os {
+        check_refusal_row(
+            &mut failures,
+            format!("{r:?}"),
+            old,
+            r.text_in(Lang::Ja),
+            r.text_in(Lang::En),
+            r.clone().into_ja(),
+        );
+    }
+    for (e, old) in &si {
+        check_refusal_row(
+            &mut failures,
+            format!("{e:?}"),
+            old,
+            e.text_in(Lang::Ja),
+            e.text_in(Lang::En),
+            e.clone().into_ja(),
+        );
+    }
+    report_all(failures);
+}
+
+/// 「見つからない」系は英語にも ` not found` を含む（リモートの HTTP 層が 404 へ寄せる判定を日英でそろえる）。
+/// 候補が複数・形式の不正は「見つからない」ではない。包み（`Config` / `PromptDir` ほか）の中身も同じ言語
+#[test]
+fn 会話とosの設定の断りの見つからないの読みと包みの言語() {
+    for r in [
+        SessionRefusal::SessionNotFound("nope".into()),
+        SessionRefusal::TranscriptMissing("aaaa1111".into()),
+    ] {
+        for lang in [Lang::Ja, Lang::En] {
+            let text = r.text_in(lang);
+            assert!(E::says_not_found(&text), "{lang:?}: {text}");
+        }
+    }
+    for r in [
+        SessionRefusal::SessionAmbiguous {
+            prefix: "aaaa".into(),
+            count: 2,
+            candidates: vec!["aaaa1111".into(), "aaaa2222".into()],
+        },
+        SessionRefusal::InvalidSessionId,
+    ] {
+        for lang in [Lang::Ja, Lang::En] {
+            let text = r.text_in(lang);
+            assert!(!E::says_not_found(&text), "{lang:?}: {text}");
+        }
+    }
+    // 包みの文は中身の型の表と同じ文（2 か所に書いて食い違わない）
+    let config = ConfigError::ProfileNotFound {
+        kind: Some(ProfileKind::Master),
+        name: "p".into(),
+        path: "/tmp/p.yaml".into(),
+    };
+    let wrapped = SessionRefusal::Config(config.clone());
+    let write = WriteError::NoParent("/x".into());
+    for lang in [Lang::Ja, Lang::En] {
+        assert_eq!(wrapped.text_in(lang), config.text_in(lang));
+        assert_eq!(
+            SessionRefusal::McpSettingsWrite(write.clone()).text_in(lang),
+            write.text_in(lang)
+        );
+        assert_eq!(
+            SessionRefusal::PromptDir("e".into()).text_in(lang),
+            Reason::SystemPromptDirFailed("e".into()).text_in(lang)
+        );
+        assert_eq!(
+            OsRefusal::UnknownShellIntegrationAction("x".into()).text_in(lang),
+            Reason::UnknownValue {
+                key: "action",
+                got: "x".into(),
+                allowed: "status / install / uninstall".into(),
+            }
+            .text_in(lang)
+        );
+    }
+    // dispatch へ載せる口は枠（invalid parameter:）と中身を同じ言語で組む
+    assert_eq!(
+        E::InvalidParams(OsRefusal::BatteryFloorOutOfRange(91).text_in(Lang::En)).text_in(Lang::En),
+        "invalid parameter: the battery floor must be between 5 and 90 (got: 91)"
+    );
+}
+
+/// 断りの組み立ての中の日本語の固定文（`Err(` / `.map_err(` / `.ok_or(` / `.ok_or_else(` の呼び出しの
+/// 閉じ括弧まで）。成功の応答の注記（`Ok` の文・warnings・スクリプトの中身）とコメントは見ない
+fn refusal_japanese(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+    const MARKS: [&str; 4] = ["Err(", ".map_err(", ".ok_or(", ".ok_or_else("];
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    for (line, code) in lines {
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        // 断りの組み立ての中か（行をまたぐときは閉じ括弧まで）
+        let from = if depth > 0 {
+            Some(0)
+        } else {
+            MARKS.iter().filter_map(|m| code.find(m)).min()
+        };
+        let Some(from) = from else {
+            continue;
+        };
+        let tail = &code[from..];
+        depth =
+            (depth + tail.matches('(').count() as i32 - tail.matches(')').count() as i32).max(0);
+        if let Some(c) = line_literals(tail).iter().find_map(|lit| has_japanese(lit)) {
+            out.push((*line, format!("（{c}）{}", code.trim())));
+        }
+    }
+    out
+}
+
+/// 型の口の本体（断りの文は `SessionRefusal` / `OsRefusal` / `SiError` にだけ置く）
+const SESSION_OS_REFUSAL_SCOPES: &[(&str, &str, Span)] = &[
+    (
+        SESSIONS_PATH,
+        SESSIONS_SRC,
+        Span::Item("    pub fn load_from_typed("),
+    ),
+    (
+        SESSIONS_PATH,
+        SESSIONS_SRC,
+        Span::Item("    pub fn load_typed("),
+    ),
+    (
+        SESSIONS_PATH,
+        SESSIONS_SRC,
+        Span::Item("    pub fn resolve_id_typed("),
+    ),
+    (
+        SESSIONS_PATH,
+        SESSIONS_SRC,
+        Span::Item("pub fn list_payload_typed("),
+    ),
+    (
+        SESSIONS_PATH,
+        SESSIONS_SRC,
+        Span::Item("pub fn show_payload_typed("),
+    ),
+    (
+        SESSIONS_PATH,
+        SESSIONS_SRC,
+        Span::Item("pub fn resume_command_typed("),
+    ),
+    (
+        SESSIONS_PATH,
+        SESSIONS_SRC,
+        Span::Item("fn resume_command_with_env("),
+    ),
+    (
+        RESUME_LAUNCH_PATH,
+        RESUME_LAUNCH_SRC,
+        Span::Item("    pub fn materialize_typed("),
+    ),
+    (
+        RESUME_LAUNCH_PATH,
+        RESUME_LAUNCH_SRC,
+        Span::Item("pub fn resume_launch_typed("),
+    ),
+    (
+        RESUME_LAUNCH_PATH,
+        RESUME_LAUNCH_SRC,
+        Span::Item("pub fn resume_launch_in_typed("),
+    ),
+    (
+        RESUME_LAUNCH_PATH,
+        RESUME_LAUNCH_SRC,
+        Span::Item("fn no_transcript("),
+    ),
+    (
+        RESUME_LAUNCH_PATH,
+        RESUME_LAUNCH_SRC,
+        Span::Item("pub fn worker_resume_launch_typed("),
+    ),
+    (
+        RESUME_LAUNCH_PATH,
+        RESUME_LAUNCH_SRC,
+        Span::Item("fn resume_profile_launch("),
+    ),
+    (
+        RESUME_LAUNCH_PATH,
+        RESUME_LAUNCH_SRC,
+        Span::Item("fn resume_worker_launch("),
+    ),
+    (
+        RESUME_LAUNCH_PATH,
+        RESUME_LAUNCH_SRC,
+        Span::Item("fn load_profile_for_resume("),
+    ),
+    (
+        WORKER_MCP_PATH,
+        WORKER_MCP_SRC,
+        Span::Item("    pub fn materialize_typed("),
+    ),
+    (
+        WORKER_MCP_PATH,
+        WORKER_MCP_SRC,
+        Span::Item("fn write_settings("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn build_master_cmd_with_plan_in_typed("),
+    ),
+    (FDA_PATH, FDA_SRC, Span::Item("pub fn open_settings_typed(")),
+    (
+        SLEEP_GUARD_PATH,
+        SLEEP_GUARD_SRC,
+        Span::Item("pub fn parse_battery_floor_typed("),
+    ),
+    (
+        SLEEP_GUARD_PATH,
+        SLEEP_GUARD_SRC,
+        Span::Item("pub fn prepare_lid_control_typed("),
+    ),
+    (
+        SLEEP_GUARD_PATH,
+        SLEEP_GUARD_SRC,
+        Span::Item("pub fn install_sudoers_typed("),
+    ),
+    (
+        SHELL_INTEGRATION_PATH,
+        SHELL_INTEGRATION_SRC,
+        Span::Item("pub fn run_typed("),
+    ),
+    (
+        CORE_SHELL_INTEGRATION_PATH,
+        CORE_SHELL_INTEGRATION_SRC,
+        Span::Item("pub fn install_typed("),
+    ),
+    (
+        CORE_SHELL_INTEGRATION_PATH,
+        CORE_SHELL_INTEGRATION_SRC,
+        Span::Item("pub fn uninstall_typed("),
+    ),
+    (
+        CORE_SHELL_INTEGRATION_PATH,
+        CORE_SHELL_INTEGRATION_SRC,
+        Span::Item("pub fn strip_legacy_block_typed("),
+    ),
+    (
+        SESSION_REFUSAL_PATH,
+        SESSION_REFUSAL_SRC,
+        Span::Item("    pub fn operation("),
+    ),
+    (
+        OS_REFUSAL_PATH,
+        OS_REFUSAL_SRC,
+        Span::Item("    pub fn invalid("),
+    ),
+    (
+        OS_REFUSAL_PATH,
+        OS_REFUSAL_SRC,
+        Span::Item("    pub fn operation("),
+    ),
+];
+
+#[test]
+fn 会話とosの設定の型の口の断りに日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, src, span) in SESSION_OS_REFUSAL_SCOPES {
+        let Some(lines) = client_store_lines(src, span) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 {} が見つからない（改名で番犬が空振りする。\
+                 SESSION_OS_REFUSAL_SCOPES を直す）",
+                span_name(span)
+            ));
+            continue;
+        };
+        for (line, text) in refusal_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 型の口の断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （SessionRefusal / OsRefusal / SiError へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// dispatch が呼んではいけない日本語の口（型の口 `*_typed` の外側）。蓋閉じ継続の解除・Battery の
+/// 設定を開く口は中身が `platform::lid` / `os_integration` の文なので、それと一緒に移すまで載せない
+const JA_SESSION_OS_CALLS: [&str; 11] = [
+    "sessions::list_payload(",
+    "sessions::show_payload(",
+    "SessionCatalog::load()",
+    ".resolve_id(",
+    "resume_launch::resume_launch(",
+    "resume_launch::resume_launch_in(",
+    ".materialize()",
+    "fda::open_settings()",
+    "sleep_guard::parse_battery_floor(",
+    "sleep_guard::prepare_lid_control()",
+    "shell_integration::run(",
+];
+
+/// dispatch の本体で、日本語の口を呼んで断りに載せている行（断りを捨てる文は見ない）
+fn ja_session_os_calls(lines: &[(usize, &str)]) -> Vec<(usize, &'static str, String)> {
+    let mut out = Vec::new();
+    for (i, (line, code)) in lines.iter().enumerate() {
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        if let Some(call) = JA_SESSION_OS_CALLS.iter().find(|c| code.contains(*c)) {
+            if !statement_discards_error(lines, i) {
+                out.push((*line, *call, code.trim().to_string()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn dispatch_は会話とosの設定の断りを日本語の口から載せない() {
+    let lines = dispatch_code_lines();
+    let mut failures = Vec::new();
+    for (line, call, code) in ja_session_os_calls(&lines) {
+        failures.push(format!(
+            "{DISPATCH_PATH}:{line}: dispatch が日本語の口 `{call}…)` の断りを載せている = 英語表示でも \
+             中身だけ日本語で混ざる（`*_typed` を呼んで SessionRefusal / OsRefusal の operation / invalid で載せる）: {code}"
+        ));
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 断りの組み立ての中の日本語（行をまたぐ `Err(format!(` も）だけを名指し、
+/// `Ok` の文・warnings・コメント・断りを捨てる文は見逃す
+#[test]
+fn 会話とosの設定の番犬の境界() {
+    let src = r#"pub fn a_typed() -> Result<String, OsRefusal> {
+    // Err("コメントの日本語は見ない")
+    warnings.push(format!("既定プロファイルで再開した"));
+    if x {
+        return Ok("この OS では追加の権限も登録も不要です".to_string());
+    }
+    let p = path().ok_or("ホームディレクトリが取得できない")?;
+    let q = run().map_err(|e| OsRefusal::OsascriptFailed(e.to_string()))?;
+    Err(format!(
+        "sudoers 登録に失敗: {}",
+        detail
+    ))
+}
+"#;
+    let lines = front_scope_lines(src, Some("pub fn a_typed(")).expect("頭を引ける");
+    let found: Vec<usize> = refusal_japanese(&lines)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(found, vec![7, 10], "断りの日本語の 2 か所だけを名指す");
+
+    let dispatch = r#"fn d() {
+    // crate::sessions::show_payload(&id) はコメント
+    let a = crate::sessions::show_payload(&id).map_err(DispatchError::Operation)?;
+    let catalog = crate::sessions::SessionCatalog::load().ok();
+    let b = crate::sessions::show_payload_typed(&id).map_err(SessionRefusal::operation)?;
+    crate::shell_integration::run(action.as_deref()).map_err(DispatchError::InvalidParams)
+}
+"#;
+    let lines = front_scope_lines(dispatch, Some("fn d(")).expect("頭を引ける");
+    let found: Vec<usize> = ja_session_os_calls(&lines)
+        .into_iter()
+        .map(|(l, _, _)| l)
+        .collect();
+    assert_eq!(found, vec![3, 6], "日本語の口の 2 か所だけを名指す");
+}

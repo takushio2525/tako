@@ -907,10 +907,12 @@ pub fn latest_for_pane(dir: &Path, pane: u64) -> Option<PathBuf> {
         .map(|f| f.path.clone())
 }
 
-/// ファイル末尾の `max_lines` 行を返す（ペインあたり上限があるため全読みで足りる）
-pub fn read_tail(path: &Path, max_lines: usize) -> Result<String, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("ログを読めない ({}): {e}", path.display()))?;
+/// ファイル末尾の `max_lines` 行を返す（ペインあたり上限があるため全読みで足りる）。
+///
+/// 読めなかった理由は OS のエラーのまま返す。利用者へ出す断りの文（日英）は呼び手
+/// （`tako logs read` = tako-control の `SessionRefusal::LogUnreadable`）が表示言語で組む（#2365）
+pub fn read_tail(path: &Path, max_lines: usize) -> std::io::Result<String> {
+    let content = std::fs::read_to_string(path)?;
     let lines: Vec<&str> = content.lines().collect();
     let skip = lines.len().saturating_sub(max_lines);
     Ok(lines[skip..].join("\n"))

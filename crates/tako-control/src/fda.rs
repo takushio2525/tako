@@ -55,8 +55,13 @@ fn fda_probe_paths() -> Vec<PathBuf> {
 }
 
 /// macOS のシステム設定を開いてフルディスクアクセスのパネルを表示する。
-/// 成功したら Ok(())、開けなかったらエラーメッセージを返す
+/// 成功したら Ok(())、開けなかったらエラーメッセージ（日本語）を返す
 pub fn open_settings() -> Result<(), String> {
+    open_settings_typed().map_err(crate::OsRefusal::into_ja)
+}
+
+/// [`open_settings`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+pub fn open_settings_typed() -> Result<(), crate::OsRefusal> {
     #[cfg(target_os = "macos")]
     {
         // macOS 13+ のシステム設定 URL スキーム
@@ -69,11 +74,11 @@ pub fn open_settings() -> Result<(), String> {
                 return Ok(());
             }
         }
-        Err("システム設定のフルディスクアクセスパネルを開けませんでした".into())
+        Err(crate::OsRefusal::FdaPanelUnopenable)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Err("フルディスクアクセスは macOS 専用の機能です".into())
+        Err(crate::OsRefusal::FdaMacOnly)
     }
 }
 

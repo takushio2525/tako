@@ -34,6 +34,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::OsRefusal;
+
 /// update() で計算された busy_agents の最新値。status() が読み取る（#372）
 static BUSY_AGENTS: AtomicUsize = AtomicUsize::new(0);
 
@@ -168,14 +170,17 @@ pub const LID_BATTERY_FLOOR_MAX: u8 = 90;
 
 /// 残量下限の入力を検証する（CLI / MCP / 設定画面が同じ 1 実装を通る。#1473）
 pub fn parse_battery_floor(percent: i64) -> Result<u8, String> {
+    parse_battery_floor_typed(percent).map_err(OsRefusal::into_ja)
+}
+
+/// [`parse_battery_floor`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+pub fn parse_battery_floor_typed(percent: i64) -> Result<u8, OsRefusal> {
     let min = i64::from(LID_BATTERY_FLOOR_MIN);
     let max = i64::from(LID_BATTERY_FLOOR_MAX);
     if (min..=max).contains(&percent) {
         Ok(percent as u8)
     } else {
-        Err(format!(
-            "残量下限は {LID_BATTERY_FLOOR_MIN}〜{LID_BATTERY_FLOOR_MAX} の範囲で指定してください（指定値: {percent}）"
-        ))
+        Err(OsRefusal::BatteryFloorOutOfRange(percent))
     }
 }
 
@@ -970,12 +975,17 @@ pub fn lid_setup_pending() -> bool {
 /// macOS は sudoers 登録（管理者プロンプト）、Windows は権限が要らないので何もしない。
 /// **呼び出し側は OS を意識しない**
 pub fn prepare_lid_control() -> Result<String, String> {
+    prepare_lid_control_typed().map_err(OsRefusal::into_ja)
+}
+
+/// [`prepare_lid_control`] の型の口（#2365）。`Ok` の文（手段の説明）は日本語のまま
+pub fn prepare_lid_control_typed() -> Result<String, OsRefusal> {
     if !lid_control_supported() {
-        return Err("この OS では蓋閉じ継続に対応していません".to_string());
+        return Err(OsRefusal::LidUnsupported);
     }
     #[cfg(target_os = "macos")]
     {
-        install_sudoers()
+        install_sudoers_typed()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1007,6 +1017,11 @@ pub fn teardown_lid_control() -> Result<String, String> {
 
 /// osascript 経由で sudoers.d に書き込む（管理者プロンプト表示）
 pub fn install_sudoers() -> Result<String, String> {
+    install_sudoers_typed().map_err(OsRefusal::into_ja)
+}
+
+/// [`install_sudoers`] の型の口（#2365）
+pub fn install_sudoers_typed() -> Result<String, OsRefusal> {
     let script = format!(
         r#"do shell script "
 # visudo 検証用の一時ファイルに書き出し
@@ -1035,7 +1050,7 @@ echo 'OK: sudoers 登録完了'
     let output = std::process::Command::new("osascript")
         .args(["-e", &script])
         .output()
-        .map_err(|e| format!("osascript の実行に失敗: {e}"))?;
+        .map_err(|e| OsRefusal::OsascriptFailed(e.to_string()))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1043,12 +1058,13 @@ echo 'OK: sudoers 登録完了'
     if output.status.success() && stdout.contains("OK") {
         Ok(stdout)
     } else if stderr.contains("User canceled") || stderr.contains("(-128)") {
-        Err("ユーザーがキャンセルしました".to_string())
+        Err(OsRefusal::UserCanceled)
     } else {
-        Err(format!(
-            "sudoers 登録に失敗: {}",
-            if stderr.is_empty() { &stdout } else { &stderr }
-        ))
+        Err(OsRefusal::SudoersInstallFailed(if stderr.is_empty() {
+            stdout
+        } else {
+            stderr
+        }))
     }
 }
 
