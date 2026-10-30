@@ -5,6 +5,8 @@
 //! tako をインストールするだけで使える。
 
 pub mod agent;
+/// 設定ファイル（projects / accounts / profiles）の読み書きとエージェント名の検証の断り（#2365）
+pub mod config_error;
 pub mod handoff_store;
 pub mod ledger;
 pub mod master_launch;
@@ -18,6 +20,7 @@ use std::path::{Path, PathBuf};
 use tako_core::platform::support::{Note, Platform};
 
 pub use agent::WorkerAgent;
+pub use config_error::{ConfigError, ConfigFile};
 
 /// agent CLI の実在検査と分類済みの失敗（#983）
 pub mod agent_cli;
@@ -556,62 +559,105 @@ pub struct ResolvedAccount {
 
 impl AccountsConfig {
     pub fn load() -> Result<Self, String> {
-        let path = accounts_yaml_path().ok_or("ホームディレクトリが取得できない")?;
-        Self::load_from(&path)
+        Self::load_typed().map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::load`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+    pub fn load_typed() -> Result<Self, ConfigError> {
+        let path = accounts_yaml_path().ok_or(ConfigError::HomeUnresolved)?;
+        Self::load_from_typed(&path)
     }
 
     pub fn load_from(path: &Path) -> Result<Self, String> {
+        Self::load_from_typed(path).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::load_from`] の型の口
+    pub fn load_from_typed(path: &Path) -> Result<Self, ConfigError> {
         if !path.is_file() {
             return Ok(AccountsConfig {
                 accounts: std::collections::BTreeMap::new(),
             });
         }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("accounts.yaml の読み取りに失敗: {e}"))?;
-        serde_yaml::from_str(&content).map_err(|e| {
-            format!(
-                "accounts.yaml のパースに失敗: {}",
-                tako_core::load_issue::yaml_error_reason(&e, &content)
-            )
+        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Read {
+            file: ConfigFile::Accounts,
+            error: e.to_string(),
+        })?;
+        serde_yaml::from_str(&content).map_err(|e| ConfigError::Parse {
+            file: ConfigFile::Accounts,
+            reason: tako_core::load_issue::YamlReason::of(&e, &content),
         })
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = accounts_yaml_path().ok_or("ホームディレクトリが取得できない")?;
+        let path = accounts_yaml_path().ok_or_else(|| ConfigError::HomeUnresolved.into_ja())?;
         self.save_to(&path)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
+        self.save_to_typed(path).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::save_to`] の型の口
+    pub fn save_to_typed(&self, path: &Path) -> Result<(), ConfigError> {
         let content =
-            serde_yaml::to_string(self).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-        crate::config_io::atomic_write_with_backup(path, &content)
+            serde_yaml::to_string(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+        Ok(crate::config_io::atomic_write_with_backup_typed(
+            path, &content,
+        )?)
     }
 
     pub fn mutate<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
-        let path = accounts_yaml_path().ok_or("ホームディレクトリが取得できない")?;
-        Self::mutate_at(&path, f)
+        Self::mutate_typed(f).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::mutate`] の型の口
+    pub fn mutate_typed<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, ConfigError> {
+        let path = accounts_yaml_path().ok_or(ConfigError::HomeUnresolved)?;
+        Self::mutate_at_typed(&path, f)
     }
 
     pub fn mutate_at<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
-        let _lock = crate::config_io::lock_exclusive(path)?;
-        let mut config = Self::load_from(path)?;
+        Self::mutate_at_typed(path, f).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::mutate_at`] の型の口
+    pub fn mutate_at_typed<R>(
+        path: &Path,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, ConfigError> {
+        let _lock = crate::config_io::lock_exclusive_typed(path)?;
+        let mut config = Self::load_from_typed(path)?;
         let result = f(&mut config);
-        config.save_to(path)?;
+        config.save_to_typed(path)?;
         Ok(result)
     }
 
     /// アカウント名を解決する。未登録・エントリ不正なら Err
     pub fn resolve(&self, name: &str) -> Result<ResolvedAccount, String> {
+        self.resolve_typed(name).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::resolve`] の型の口
+    pub fn resolve_typed(&self, name: &str) -> Result<ResolvedAccount, ConfigError> {
         let entry = self
             .accounts
             .get(name)
-            .ok_or_else(|| format!("アカウント '{name}' が accounts.yaml に見つからない"))?;
+            .ok_or_else(|| ConfigError::AccountNotFound(name.to_string()))?;
         resolve_entry(name, entry)
     }
 
     /// 全アカウントを解決する。壊れたエントリは Err を保持したまま返す
     /// （list 表示で握り潰さず、直し方を出す）
     pub fn list_resolved(&self) -> Vec<(String, Result<ResolvedAccount, String>)> {
+        self.list_resolved_typed()
+            .into_iter()
+            .map(|(name, resolved)| (name, resolved.map_err(ConfigError::into_ja)))
+            .collect()
+    }
+
+    /// [`Self::list_resolved`] の型の口
+    pub fn list_resolved_typed(&self) -> Vec<(String, Result<ResolvedAccount, ConfigError>)> {
         self.accounts
             .iter()
             .map(|(name, entry)| (name.clone(), resolve_entry(name, entry)))
@@ -675,22 +721,12 @@ pub fn login_expired_account(session_id: Option<&str>) -> Option<serde_json::Val
 }
 
 /// アカウントエントリ 1 件を解決する（Issue #512 で config_dir / inherit の排他を検証）
-fn resolve_entry(name: &str, entry: &AccountEntry) -> Result<ResolvedAccount, String> {
+fn resolve_entry(name: &str, entry: &AccountEntry) -> Result<ResolvedAccount, ConfigError> {
     let config_dir = match (entry.inherit, entry.config_dir.as_deref()) {
         (false, Some(dir)) => AccountConfigDir::Path(expand_tilde(dir)),
         (true, None) => AccountConfigDir::Inherit,
-        (true, Some(_)) => {
-            return Err(format!(
-                "アカウント '{name}' は inherit: true と config_dir を同時に指定している\
-                 （既定の資格情報を使うなら config_dir を消す）"
-            ))
-        }
-        (false, None) => {
-            return Err(format!(
-                "アカウント '{name}' に config_dir が無い\
-                 （別 config dir なら config_dir を、既定の資格情報なら inherit: true を指定する）"
-            ))
-        }
+        (true, Some(_)) => return Err(ConfigError::AccountInheritWithDir(name.to_string())),
+        (false, None) => return Err(ConfigError::AccountNoConfigDir(name.to_string())),
     };
     Ok(ResolvedAccount {
         name: name.to_string(),
@@ -752,24 +788,34 @@ pub struct ResolvedProject {
 
 impl ProjectsConfig {
     pub fn load() -> Result<Self, String> {
-        let path = projects_yaml_path().ok_or("ホームディレクトリが取得できない")?;
-        Self::load_from(&path)
+        Self::load_typed().map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::load`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+    pub fn load_typed() -> Result<Self, ConfigError> {
+        let path = projects_yaml_path().ok_or(ConfigError::HomeUnresolved)?;
+        Self::load_from_typed(&path)
     }
 
     /// パス指定版 load（テスト用に公開）。
     /// ファイル不在は「初期状態」として空を返す。読み取り / パースの失敗は
     /// **0 件に丸めず Err を返す**（#169: 失敗を空として扱うと後続の save が全件を消す）
     pub fn load_from(path: &Path) -> Result<Self, String> {
+        Self::load_from_typed(path).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::load_from`] の型の口
+    pub fn load_from_typed(path: &Path) -> Result<Self, ConfigError> {
         if !path.is_file() {
             return Ok(ProjectsConfig::default());
         }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("projects.yaml の読み取りに失敗: {e}"))?;
-        serde_yaml::from_str(&content).map_err(|e| {
-            format!(
-                "projects.yaml のパースに失敗: {}",
-                tako_core::load_issue::yaml_error_reason(&e, &content)
-            )
+        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Read {
+            file: ConfigFile::Projects,
+            error: e.to_string(),
+        })?;
+        serde_yaml::from_str(&content).map_err(|e| ConfigError::Parse {
+            file: ConfigFile::Projects,
+            reason: tako_core::load_issue::YamlReason::of(&e, &content),
         })
     }
 
@@ -777,15 +823,22 @@ impl ProjectsConfig {
     /// 注意: `load()` → 変更 → `save()` の素朴な組み合わせは、間に割り込んだ
     /// 他プロセスの変更を巻き戻す。add / remove は必ず [`Self::mutate`] を使うこと
     pub fn save(&self) -> Result<(), String> {
-        let path = projects_yaml_path().ok_or("ホームディレクトリが取得できない")?;
+        let path = projects_yaml_path().ok_or_else(|| ConfigError::HomeUnresolved.into_ja())?;
         self.save_to(&path)
     }
 
     /// パス指定版 save（テスト用に公開）
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
+        self.save_to_typed(path).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::save_to`] の型の口
+    pub fn save_to_typed(&self, path: &Path) -> Result<(), ConfigError> {
         let content =
-            serde_yaml::to_string(self).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-        crate::config_io::atomic_write_with_backup(path, &content)
+            serde_yaml::to_string(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+        Ok(crate::config_io::atomic_write_with_backup_typed(
+            path, &content,
+        )?)
     }
 
     /// ロック付き read-modify-write（#169 の再発防止本体）。
@@ -794,16 +847,29 @@ impl ProjectsConfig {
     /// 更新が失われない。既存ファイルのパースに失敗した場合は **f を呼ばず、
     /// 一切書き込まずに** Err を返す
     pub fn mutate<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
-        let path = projects_yaml_path().ok_or("ホームディレクトリが取得できない")?;
-        Self::mutate_at(&path, f)
+        Self::mutate_typed(f).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::mutate`] の型の口
+    pub fn mutate_typed<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, ConfigError> {
+        let path = projects_yaml_path().ok_or(ConfigError::HomeUnresolved)?;
+        Self::mutate_at_typed(&path, f)
     }
 
     /// パス指定版 mutate（テスト用に公開）
     pub fn mutate_at<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
-        let _lock = crate::config_io::lock_exclusive(path)?;
-        let mut config = Self::load_from(path)?;
+        Self::mutate_at_typed(path, f).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::mutate_at`] の型の口
+    pub fn mutate_at_typed<R>(
+        path: &Path,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, ConfigError> {
+        let _lock = crate::config_io::lock_exclusive_typed(path)?;
+        let mut config = Self::load_from_typed(path)?;
         let result = f(&mut config);
-        config.save_to(path)?;
+        config.save_to_typed(path)?;
         Ok(result)
     }
 
@@ -819,13 +885,19 @@ impl ProjectsConfig {
     }
 
     pub fn resolve_cwd(&self, project: &str) -> Result<String, String> {
+        self.resolve_cwd_typed(project)
+            .map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::resolve_cwd`] の型の口
+    pub fn resolve_cwd_typed(&self, project: &str) -> Result<String, ConfigError> {
         let entry = self
             .projects
             .get(project)
-            .ok_or_else(|| format!("プロジェクト '{project}' が projects.yaml に見つからない"))?;
+            .ok_or_else(|| ConfigError::ProjectNotFound(project.to_string()))?;
         let cwd = expand_tilde(&entry.cwd);
         if !Path::new(&cwd).is_dir() {
-            return Err(format!("cwd が存在しない: {cwd}"));
+            return Err(ConfigError::ProjectCwdMissing(cwd));
         }
         Ok(cwd)
     }
@@ -1217,10 +1289,16 @@ impl Profile {
     /// master のエージェント種別を解決する（プロファイル → claude 既定）。
     /// 不正・未対応の種別は起動前のエラーとして返す（Issue #127）
     pub fn resolve_master_agent(&self) -> Result<WorkerAgent, String> {
+        self.resolve_master_agent_typed()
+            .map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::resolve_master_agent`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+    pub fn resolve_master_agent_typed(&self) -> Result<WorkerAgent, ConfigError> {
         match self.master_agent.as_deref() {
             None => Ok(WorkerAgent::Claude),
-            Some(name) => validate_master_agent(name)
-                .map_err(|e| format!("プロファイルの master_agent が不正: {e}")),
+            Some(name) => validate_master_agent_typed(name)
+                .map_err(|e| ConfigError::ProfileMasterAgent(Box::new(e))),
         }
     }
 
@@ -1283,14 +1361,23 @@ impl Profile {
     /// worker のエージェント種別を解決する（spawn の明示指定 → プロファイル既定 → claude）。
     /// 不正な種別名は spawn 時のエラーとして返す（Issue #120）
     pub fn resolve_worker_agent(&self, explicit: Option<&str>) -> Result<WorkerAgent, String> {
+        self.resolve_worker_agent_typed(explicit)
+            .map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::resolve_worker_agent`] の型の口
+    pub fn resolve_worker_agent_typed(
+        &self,
+        explicit: Option<&str>,
+    ) -> Result<WorkerAgent, ConfigError> {
         let name = explicit
             .or(self.worker_agent.as_deref())
             .unwrap_or("claude");
-        WorkerAgent::parse(name).map_err(|e| {
+        WorkerAgent::parse_typed(name).map_err(|e| {
             if explicit.is_some() {
                 e
             } else {
-                format!("プロファイルの worker_agent が不正: {e}")
+                ConfigError::ProfileWorkerAgent(Box::new(e))
             }
         })
     }
@@ -1298,15 +1385,21 @@ impl Profile {
     /// cwd を解決する（~ 展開 + 存在確認。Issue #500 Part 5）。
     /// None なら呼び出し元が従来挙動（ホームディレクトリ）を使う
     pub fn resolve_cwd(&self) -> Result<Option<std::path::PathBuf>, String> {
+        self.resolve_cwd_typed().map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::resolve_cwd`] の型の口
+    pub fn resolve_cwd_typed(&self) -> Result<Option<std::path::PathBuf>, ConfigError> {
         match self.cwd.as_deref() {
             None => Ok(None),
             Some(raw) => {
                 let expanded = expand_tilde(raw);
                 let path = std::path::PathBuf::from(&expanded);
                 if !path.is_dir() {
-                    Err(format!(
-                        "プロファイルの cwd が存在しない: {expanded}（元の指定: {raw}）"
-                    ))
+                    Err(ConfigError::ProfileCwdMissing {
+                        expanded,
+                        raw: raw.to_string(),
+                    })
                 } else {
                     Ok(Some(path))
                 }
@@ -1327,19 +1420,15 @@ impl Profile {
             Some(k) if !k.is_empty() => k,
             _ => return Ok(()),
         };
-        let mut missing: Vec<&str> = Vec::new();
-        for key in keys {
-            if !config.projects.contains_key(key) {
-                missing.push(key);
-            }
-        }
+        let missing: Vec<String> = keys
+            .iter()
+            .filter(|key| !config.projects.contains_key(*key))
+            .cloned()
+            .collect();
         if missing.is_empty() {
             Ok(())
         } else {
-            Err(format!(
-                "プロファイルの projects に projects.yaml に未登録のキーがある: {}",
-                missing.join(", ")
-            ))
+            Err(ConfigError::ProfileProjectsUnregistered(missing).into_ja())
         }
     }
 
@@ -1414,6 +1503,11 @@ impl Profile {
     /// プロファイルの env が内部予約変数を含んでいないか検証する（Issue #500）。
     /// 違反があればキー名のリストを返す
     pub fn validate_env(&self) -> Result<(), String> {
+        self.validate_env_typed().map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::validate_env`] の型の口
+    pub fn validate_env_typed(&self) -> Result<(), ConfigError> {
         let reserved: &[&str] = &[
             "TAKO_SOCKET",
             "TAKO_TOKEN",
@@ -1427,19 +1521,16 @@ impl Profile {
             "TAKO_PERSIST",
             "TAKO_DISCOVERY_DIR",
         ];
-        let violations: Vec<&str> = self
+        let violations: Vec<String> = self
             .env
             .keys()
             .filter(|k| reserved.contains(&k.as_str()))
-            .map(|k| k.as_str())
+            .cloned()
             .collect();
         if violations.is_empty() {
             Ok(())
         } else {
-            Err(format!(
-                "プロファイルの env に tako 内部変数が含まれている（上書き禁止）: {}",
-                violations.join(", ")
-            ))
+            Err(ConfigError::ProfileEnvReserved(violations))
         }
     }
 
@@ -1464,18 +1555,30 @@ impl Profile {
     /// master_account を accounts.yaml から解決する（Issue #547）。
     /// 未設定なら `Ok(None)`、登録されていない名前なら Err（起動前に落とす）
     pub fn resolve_master_account(&self) -> Result<Option<ResolvedAccount>, String> {
+        self.resolve_master_account_typed()
+            .map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::resolve_master_account`] の型の口
+    pub fn resolve_master_account_typed(&self) -> Result<Option<ResolvedAccount>, ConfigError> {
         let Some(name) = self.resolve_master_account_name() else {
             return Ok(None);
         };
-        let accounts = AccountsConfig::load()?;
-        accounts.resolve(name).map(Some)
+        let accounts = AccountsConfig::load_typed()?;
+        accounts.resolve_typed(name).map(Some)
     }
 
     /// master / solo 起動用の env 計画（Issue #547）。
     /// master_account を解決して worker と同じ規則で CLAUDE_CONFIG_DIR を
     /// 注入 / 解除する。master_account が無ければプロファイルの env のみ（従来どおり）
     pub fn resolved_env_plan_for_master(&self) -> Result<EnvPlan, String> {
-        let account = self.resolve_master_account()?;
+        self.resolved_env_plan_for_master_typed()
+            .map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::resolved_env_plan_for_master`] の型の口
+    pub fn resolved_env_plan_for_master_typed(&self) -> Result<EnvPlan, ConfigError> {
+        let account = self.resolve_master_account_typed()?;
         Ok(self.resolved_env_plan_with_account(account.as_ref()))
     }
 
@@ -1594,29 +1697,26 @@ impl Profile {
 
     /// プロファイルを YAML ファイルから読み込む
     pub fn load(name: &str) -> Result<Self, String> {
+        Self::load_typed(name).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::load`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+    pub fn load_typed(name: &str) -> Result<Self, ConfigError> {
         let path = profile_path(name)?;
         if !path.is_file() {
-            return Err(format!(
-                "プロファイル '{name}' が見つからない: {}",
-                path.display()
-            ));
+            return Err(ConfigError::ProfileNotFound {
+                kind: None,
+                name: name.to_string(),
+                path: path.display().to_string(),
+            });
         }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
-        serde_yaml::from_str(&content).map_err(|e| {
-            format!(
-                "プロファイルのパースに失敗: {}",
-                tako_core::load_issue::yaml_error_reason(&e, &content)
-            )
-        })
+        read_profile_file(&path)
     }
 
     /// プロファイルを YAML ファイルに保存する（アトミック書き込み + 世代バックアップ。#169）
     pub fn save(&self, name: &str) -> Result<PathBuf, String> {
-        let path = profile_path(name)?;
-        let content =
-            serde_yaml::to_string(self).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-        crate::config_io::atomic_write_with_backup(&path, &content)?;
+        let path = profile_path(name).map_err(ConfigError::into_ja)?;
+        write_profile_file(&path, self).map_err(ConfigError::into_ja)?;
         Ok(path)
     }
 
@@ -1627,29 +1727,21 @@ impl Profile {
         name: &str,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Result<(PathBuf, R), String> {
-        let path = profile_path(name)?;
-        let _lock = crate::config_io::lock_exclusive(&path)?;
-        let mut profile = Self::load_from_or_default(&path)?;
-        let result = f(&mut profile);
-        let content = serde_yaml::to_string(&profile)
-            .map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-        crate::config_io::atomic_write_with_backup(&path, &content)?;
-        Ok((path, result))
+        let path = profile_path(name).map_err(ConfigError::into_ja)?;
+        mutate_profile_at(&path, f).map_err(ConfigError::into_ja)
     }
 
     /// パス指定版 load。不在なら default、パース失敗は Err（テスト用に公開）
     pub fn load_from_or_default(path: &Path) -> Result<Self, String> {
+        Self::load_from_or_default_typed(path).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::load_from_or_default`] の型の口
+    pub fn load_from_or_default_typed(path: &Path) -> Result<Self, ConfigError> {
         if !path.is_file() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
-        serde_yaml::from_str(&content).map_err(|e| {
-            format!(
-                "プロファイルのパースに失敗: {}",
-                tako_core::load_issue::yaml_error_reason(&e, &content)
-            )
-        })
+        read_profile_file(path)
     }
 
     /// system prompt のパスを解決する。
@@ -2245,41 +2337,75 @@ pub fn solo_profiles_dir() -> Option<PathBuf> {
 
 /// solo 用にデフォルトのディレクトリとプロファイルを生成する
 pub fn ensure_solo_defaults() -> Result<PathBuf, String> {
-    ensure_defaults()?;
-    let dir = solo_profiles_dir().ok_or("ホームディレクトリが取得できない")?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+    ensure_solo_defaults_typed().map_err(ConfigError::into_ja)
+}
+
+/// [`ensure_solo_defaults`] の型の口
+pub fn ensure_solo_defaults_typed() -> Result<PathBuf, ConfigError> {
+    ensure_defaults_typed()?;
+    let dir = solo_profiles_dir().ok_or(ConfigError::HomeUnresolved)?;
+    std::fs::create_dir_all(&dir).map_err(|e| ConfigError::CreateDir(e.to_string()))?;
     let default_profile = dir.join("default.yaml");
     if !default_profile.is_file() {
         std::fs::write(&default_profile, SOLO_DEFAULT_PROFILE_YAML)
-            .map_err(|e| format!("default.yaml の書き込みに失敗: {e}"))?;
+            .map_err(|e| ConfigError::WriteDefaultProfile(e.to_string()))?;
     }
     Ok(dir)
 }
 
 /// solo 用のプロファイルパスを返す
-fn solo_profile_path(name: &str) -> Result<PathBuf, String> {
+fn solo_profile_path(name: &str) -> Result<PathBuf, ConfigError> {
     solo_profiles_dir()
         .map(|d| d.join(format!("{name}.yaml")))
-        .ok_or_else(|| "ホームディレクトリが取得できない".into())
+        .ok_or(ConfigError::HomeUnresolved)
 }
 
 /// solo 用のプロファイルを読み込む
 pub fn load_solo_profile(name: &str) -> Result<Profile, String> {
-    let path = solo_profile_path(name)?;
+    let path = solo_profile_path(name).map_err(ConfigError::into_ja)?;
     if !path.is_file() {
-        return Err(format!(
-            "solo プロファイル '{name}' が見つからない: {}",
-            path.display()
-        ));
+        return Err(ConfigError::ProfileNotFound {
+            kind: Some(ProfileKind::Solo),
+            name: name.to_string(),
+            path: path.display().to_string(),
+        }
+        .into_ja());
     }
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
-    serde_yaml::from_str(&content).map_err(|e| {
-        format!(
-            "プロファイルのパースに失敗: {}",
-            tako_core::load_issue::yaml_error_reason(&e, &content)
-        )
+    read_profile_file(&path).map_err(ConfigError::into_ja)
+}
+
+/// プロファイルの YAML を読む（読めない・解釈できないときの断りは型で返す。#2365）
+fn read_profile_file(path: &Path) -> Result<Profile, ConfigError> {
+    let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Read {
+        file: ConfigFile::Profile,
+        error: e.to_string(),
+    })?;
+    serde_yaml::from_str(&content).map_err(|e| ConfigError::Parse {
+        file: ConfigFile::Profile,
+        reason: tako_core::load_issue::YamlReason::of(&e, &content),
     })
+}
+
+/// プロファイルを YAML で書き出す（アトミック書き込み + 世代バックアップ。#169）
+fn write_profile_file(path: &Path, profile: &Profile) -> Result<(), ConfigError> {
+    let content =
+        serde_yaml::to_string(profile).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+    Ok(crate::config_io::atomic_write_with_backup_typed(
+        path, &content,
+    )?)
+}
+
+/// パス指定のロック付き read-modify-write（#169）。不在は default から始め、
+/// パースに失敗した既存ファイルは default に丸めず Err で中断する（丸めて save すると設定が消える）
+fn mutate_profile_at<R>(
+    path: &Path,
+    f: impl FnOnce(&mut Profile) -> R,
+) -> Result<(PathBuf, R), ConfigError> {
+    let _lock = crate::config_io::lock_exclusive_typed(path)?;
+    let mut profile = Profile::load_from_or_default_typed(path)?;
+    let result = f(&mut profile);
+    write_profile_file(path, &profile)?;
+    Ok((path.to_path_buf(), result))
 }
 
 /// solo 用のデフォルトプロファイルを返す（master より effort が低い）
@@ -2298,12 +2424,15 @@ pub fn solo_default_profile() -> Profile {
 /// `TAKO_*` が 15 個届く）。#986 で `caller_pane` の pid 祖先辿りも入ったので、
 /// 残る障害は system prompt だけ（#987）
 pub fn validate_master_agent(name: &str) -> Result<WorkerAgent, String> {
-    let agent = WorkerAgent::parse(name)?;
+    validate_master_agent_typed(name).map_err(ConfigError::into_ja)
+}
+
+/// [`validate_master_agent`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+pub fn validate_master_agent_typed(name: &str) -> Result<WorkerAgent, ConfigError> {
+    let agent = WorkerAgent::parse_typed(name)?;
     match agent {
         WorkerAgent::Claude | WorkerAgent::Codex => Ok(agent),
-        WorkerAgent::Agy => Err(
-            "agy は master 非対応（master は claude / codex のみ。worker としては利用可能）".into(),
-        ),
+        WorkerAgent::Agy => Err(ConfigError::MasterAgentUnsupported(agent)),
     }
 }
 
@@ -2624,10 +2753,10 @@ fn resolve_text_or_file(text: &str) -> String {
 }
 
 /// プロファイルのファイルパスを返す
-fn profile_path(name: &str) -> Result<PathBuf, String> {
+fn profile_path(name: &str) -> Result<PathBuf, ConfigError> {
     profiles_dir()
         .map(|d| d.join(format!("{name}.yaml")))
-        .ok_or_else(|| "ホームディレクトリが取得できない".into())
+        .ok_or(ConfigError::HomeUnresolved)
 }
 
 /// 利用可能なプロファイル名の一覧を返す
@@ -2656,13 +2785,15 @@ impl ProfileKind {
     pub const VALUES: &[&str] = &["master", "solo"];
 
     pub fn parse(s: &str) -> Result<Self, String> {
+        Self::parse_typed(s).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::parse`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+    pub fn parse_typed(s: &str) -> Result<Self, ConfigError> {
         match s {
             "master" => Ok(Self::Master),
             "solo" => Ok(Self::Solo),
-            other => Err(format!(
-                "kind が不正: '{other}'（{}）",
-                Self::VALUES.join(" / ")
-            )),
+            other => Err(ConfigError::InvalidKind(other.to_string())),
         }
     }
 
@@ -2699,21 +2830,30 @@ impl ProfileKind {
 
     /// ディレクトリとデフォルトプロファイルを用意する
     pub fn ensure_defaults(&self) -> Result<PathBuf, String> {
+        self.ensure_defaults_typed().map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::ensure_defaults`] の型の口
+    pub fn ensure_defaults_typed(&self) -> Result<PathBuf, ConfigError> {
         match self {
-            Self::Master => ensure_defaults().and_then(|_| {
-                profiles_dir().ok_or_else(|| "ホームディレクトリが取得できない".into())
-            }),
-            Self::Solo => ensure_solo_defaults(),
+            Self::Master => ensure_defaults_typed()
+                .and_then(|_| profiles_dir().ok_or(ConfigError::HomeUnresolved)),
+            Self::Solo => ensure_solo_defaults_typed(),
         }
     }
 
     /// このプロファイル種別の `<name>.yaml`（名前の検証つき）。
     /// #1453 の自動生成も同じ解決を通すので公開する
     pub fn path(&self, name: &str) -> Result<PathBuf, String> {
-        validate_profile_name(name)?;
+        self.path_typed(name).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::path`] の型の口
+    pub fn path_typed(&self, name: &str) -> Result<PathBuf, ConfigError> {
+        validate_profile_name_typed(name)?;
         self.dir()
             .map(|d| d.join(format!("{name}.yaml")))
-            .ok_or_else(|| "ホームディレクトリが取得できない".into())
+            .ok_or(ConfigError::HomeUnresolved)
     }
 }
 
@@ -2722,37 +2862,42 @@ impl ProfileKind {
 /// 先頭の `.` は隠しファイル・親ディレクトリ参照（`..`）になるため拒否し、
 /// 先頭の `-` は `tako master --x` としてオプション扱いされるため拒否する
 pub fn validate_profile_name(name: &str) -> Result<(), String> {
+    validate_profile_name_typed(name).map_err(ConfigError::into_ja)
+}
+
+/// [`validate_profile_name`] の型の口
+pub fn validate_profile_name_typed(name: &str) -> Result<(), ConfigError> {
     if name.is_empty() {
-        return Err("プロファイル名が空".into());
+        return Err(ConfigError::ProfileNameEmpty);
     }
     if name.starts_with('.') {
-        return Err(format!("プロファイル名は '.' で始められない: '{name}'"));
+        return Err(ConfigError::ProfileNameLeadingDot(name.to_string()));
     }
     if name.starts_with('-') {
-        return Err(format!(
-            "プロファイル名は '-' で始められない（起動コマンドのオプションと紛れる）: '{name}'"
-        ));
+        return Err(ConfigError::ProfileNameLeadingDash(name.to_string()));
     }
     if let Some(bad) = name
         .chars()
         .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '.'))
     {
-        return Err(format!(
-            "プロファイル名に使えない文字が含まれる: '{bad}'（英数字と - _ . のみ）"
-        ));
+        return Err(ConfigError::ProfileNameBadChar(bad));
     }
     Ok(())
 }
 
 /// 指定種別の利用可能なプロファイル名の一覧を返す
 pub fn list_profiles_of(kind: ProfileKind) -> Result<Vec<String>, String> {
+    list_profiles_of_typed(kind).map_err(ConfigError::into_ja)
+}
+
+/// [`list_profiles_of`] の型の口
+pub fn list_profiles_of_typed(kind: ProfileKind) -> Result<Vec<String>, ConfigError> {
     let dir = match kind.dir() {
         Some(d) if d.is_dir() => d,
         _ => return Ok(vec![]),
     };
     let mut names = Vec::new();
-    let entries = std::fs::read_dir(&dir)
-        .map_err(|e| format!("プロファイルディレクトリの読み取りに失敗: {e}"))?;
+    let entries = std::fs::read_dir(&dir).map_err(|e| ConfigError::ListProfiles(e.to_string()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
@@ -2767,22 +2912,20 @@ pub fn list_profiles_of(kind: ProfileKind) -> Result<Vec<String>, String> {
 
 /// 指定種別のプロファイルを読み込む（不在・パース失敗は Err）
 pub fn load_profile_of(kind: ProfileKind, name: &str) -> Result<Profile, String> {
-    let path = kind.path(name)?;
+    load_profile_of_typed(kind, name).map_err(ConfigError::into_ja)
+}
+
+/// [`load_profile_of`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+pub fn load_profile_of_typed(kind: ProfileKind, name: &str) -> Result<Profile, ConfigError> {
+    let path = kind.path_typed(name)?;
     if !path.is_file() {
-        return Err(format!(
-            "{} プロファイル '{name}' が見つからない: {}",
-            kind.as_str(),
-            path.display()
-        ));
+        return Err(ConfigError::ProfileNotFound {
+            kind: Some(kind),
+            name: name.to_string(),
+            path: path.display().to_string(),
+        });
     }
-    let content =
-        std::fs::read_to_string(&path).map_err(|e| format!("プロファイルの読み取りに失敗: {e}"))?;
-    serde_yaml::from_str(&content).map_err(|e| {
-        format!(
-            "プロファイルのパースに失敗: {}",
-            tako_core::load_issue::yaml_error_reason(&e, &content)
-        )
-    })
+    read_profile_file(&path)
 }
 
 /// 指定種別のプロファイルのロック付き read-modify-write（#169）。
@@ -2792,14 +2935,17 @@ pub fn mutate_profile_of<R>(
     name: &str,
     f: impl FnOnce(&mut Profile) -> R,
 ) -> Result<(PathBuf, R), String> {
-    let path = kind.path(name)?;
-    let _lock = crate::config_io::lock_exclusive(&path)?;
-    let mut profile = Profile::load_from_or_default(&path)?;
-    let result = f(&mut profile);
-    let content =
-        serde_yaml::to_string(&profile).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-    crate::config_io::atomic_write_with_backup(&path, &content)?;
-    Ok((path, result))
+    mutate_profile_of_typed(kind, name, f).map_err(ConfigError::into_ja)
+}
+
+/// [`mutate_profile_of`] の型の口
+pub fn mutate_profile_of_typed<R>(
+    kind: ProfileKind,
+    name: &str,
+    f: impl FnOnce(&mut Profile) -> R,
+) -> Result<(PathBuf, R), ConfigError> {
+    let path = kind.path_typed(name)?;
+    mutate_profile_at(&path, f)
 }
 
 /// プロファイルを新規作成する（既存があれば Err = 誤上書きを防ぐ）。
@@ -2809,15 +2955,24 @@ pub fn create_profile_of(
     name: &str,
     base: Option<Profile>,
 ) -> Result<(PathBuf, Profile), String> {
-    let path = kind.path(name)?;
-    kind.ensure_defaults()?;
+    create_profile_of_typed(kind, name, base).map_err(ConfigError::into_ja)
+}
+
+/// [`create_profile_of`] の型の口
+pub fn create_profile_of_typed(
+    kind: ProfileKind,
+    name: &str,
+    base: Option<Profile>,
+) -> Result<(PathBuf, Profile), ConfigError> {
+    let path = kind.path_typed(name)?;
+    kind.ensure_defaults_typed()?;
     let profile = base.unwrap_or_else(|| kind.default_profile());
     create_profile_at(&path, &profile).map_err(|e| match e {
-        CreateError::Exists => format!(
-            "{} プロファイル '{name}' は既に存在する（上書きするなら set を使う）",
-            kind.as_str()
-        ),
-        CreateError::Failed(msg) => msg,
+        CreateError::Exists => ConfigError::ProfileExists {
+            kind,
+            name: name.to_string(),
+        },
+        CreateError::Failed(e) => e,
     })?;
     Ok((path, profile))
 }
@@ -2825,50 +2980,49 @@ pub fn create_profile_of(
 /// `create_profile_of` の失敗理由（既存衝突だけは呼び出し側が文言を作る）
 pub enum CreateError {
     Exists,
-    Failed(String),
+    Failed(ConfigError),
 }
 
 /// パス指定版 create。**ロックを取ってから存在確認する**ので、並行 create で
 /// 「両方が不在と判断して片方が消える」TOCTOU が起きない（#169 と同じ方針）
 pub fn create_profile_at(path: &Path, profile: &Profile) -> Result<(), CreateError> {
-    let _lock = crate::config_io::lock_exclusive(path).map_err(CreateError::Failed)?;
+    let _lock =
+        crate::config_io::lock_exclusive_typed(path).map_err(|e| CreateError::Failed(e.into()))?;
     if path.is_file() {
         return Err(CreateError::Exists);
     }
-    let content = serde_yaml::to_string(profile)
-        .map_err(|e| CreateError::Failed(format!("YAML のシリアライズに失敗: {e}")))?;
-    crate::config_io::atomic_write_with_backup(path, &content).map_err(CreateError::Failed)
+    write_profile_file(path, profile).map_err(CreateError::Failed)
 }
 
 /// プロファイルを削除する。`default` は起動時のフォールバック先なので拒否する
 pub fn delete_profile_of(kind: ProfileKind, name: &str) -> Result<PathBuf, String> {
-    let path = kind.path(name)?;
+    delete_profile_of_typed(kind, name).map_err(ConfigError::into_ja)
+}
+
+/// [`delete_profile_of`] の型の口
+pub fn delete_profile_of_typed(kind: ProfileKind, name: &str) -> Result<PathBuf, ConfigError> {
+    let path = kind.path_typed(name)?;
     if name == "default" {
-        return Err(format!(
-            "既定プロファイル 'default' は削除できない（{} が参照する）",
-            kind.launch_bin()
-        ));
+        return Err(ConfigError::DefaultProfileUndeletable(kind));
     }
     delete_profile_at(&path).map_err(|e| {
-        e.unwrap_or_else(|| {
-            format!(
-                "{} プロファイル '{name}' が見つからない: {}",
-                kind.as_str(),
-                path.display()
-            )
+        e.unwrap_or_else(|| ConfigError::ProfileNotFound {
+            kind: Some(kind),
+            name: name.to_string(),
+            path: path.display().to_string(),
         })
     })?;
     Ok(path)
 }
 
 /// パス指定版 delete。`Err(None)` = 不在（呼び出し側が名前つきの文言を作る）
-pub fn delete_profile_at(path: &Path) -> Result<(), Option<String>> {
+pub fn delete_profile_at(path: &Path) -> Result<(), Option<ConfigError>> {
     if !path.is_file() {
         return Err(None);
     }
     // 削除も他プロセスの RMW と直列化する（#169 の config_io と同じロックを使う）
-    let _lock = crate::config_io::lock_exclusive(path).map_err(Some)?;
-    std::fs::remove_file(path).map_err(|e| Some(format!("プロファイルの削除に失敗: {e}")))
+    let _lock = crate::config_io::lock_exclusive_typed(path).map_err(|e| Some(e.into()))?;
+    std::fs::remove_file(path).map_err(|e| Some(ConfigError::DeleteProfile(e.to_string())))
 }
 
 // --- プロジェクト専用プロファイルの自動生成と採用（Issue #1453）--------------
@@ -3203,7 +3357,9 @@ pub fn ensure_project_profile(key: &str) -> ProfileGen {
         Ok(()) => ProfileGen::Created(path),
         // 並行生成で先を越された = 望みの状態になっている（冪等）
         Err(CreateError::Exists) => ProfileGen::Exists(path),
-        Err(CreateError::Failed(reason)) => ProfileGen::Skipped { reason },
+        Err(CreateError::Failed(reason)) => ProfileGen::Skipped {
+            reason: reason.into_ja(),
+        },
     }
 }
 
@@ -3469,21 +3625,26 @@ bypass_sandbox: false
 
 /// 初回実行時にデフォルトのディレクトリとファイルを生成する
 pub fn ensure_defaults() -> Result<PathBuf, String> {
-    let dir = config_dir().ok_or("ホームディレクトリが取得できない")?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+    ensure_defaults_typed().map_err(ConfigError::into_ja)
+}
+
+/// [`ensure_defaults`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+pub fn ensure_defaults_typed() -> Result<PathBuf, ConfigError> {
+    let dir = config_dir().ok_or(ConfigError::HomeUnresolved)?;
+    std::fs::create_dir_all(&dir).map_err(|e| ConfigError::CreateDir(e.to_string()))?;
     // projects.yaml が無ければ空テンプレートを作る。ロック付き mutate 経由なので
     // 「is_file 確認と書き込みの間に他プロセスが実データを書き、それを空で潰す」
     // TOCTOU が起きない（既存があれば内容不変でスキップ、破損なら Err で中断。#169）
     let yaml_path = dir.join("projects.yaml");
-    ProjectsConfig::mutate_at(&yaml_path, |_| ())?;
+    ProjectsConfig::mutate_at_typed(&yaml_path, |_| ())?;
     // デフォルトプロファイルが無ければ作成
-    let profiles = profiles_dir().ok_or("ホームディレクトリが取得できない")?;
+    let profiles = profiles_dir().ok_or(ConfigError::HomeUnresolved)?;
     std::fs::create_dir_all(&profiles)
-        .map_err(|e| format!("profiles ディレクトリの作成に失敗: {e}"))?;
+        .map_err(|e| ConfigError::CreateProfilesDir(e.to_string()))?;
     let default_profile = profiles.join("default.yaml");
     if !default_profile.is_file() {
         std::fs::write(&default_profile, DEFAULT_PROFILE_YAML)
-            .map_err(|e| format!("default.yaml の書き込みに失敗: {e}"))?;
+            .map_err(|e| ConfigError::WriteDefaultProfile(e.to_string()))?;
     }
     Ok(dir)
 }
