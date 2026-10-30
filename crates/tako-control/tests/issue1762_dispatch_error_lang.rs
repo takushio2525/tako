@@ -10842,13 +10842,10 @@ fn link_error_table() -> Vec<(LinkError, String)> {
             LinkError::SymlinkUnsupported {
                 path: "C:\\Users\\winuser\\.local\\bin\\tako".into(),
             },
+            // 外側の `{} を作成できません: {e}` の `{e}` に、io::Error に包んだ内側の文が入っていた
             format!(
-                "{} を作成できません: {}",
-                "C:\\Users\\winuser\\.local\\bin\\tako",
-                format!(
-                    "{} への symlink はこの OS では張れません（ユーザー環境変数 Path を使います）",
-                    "C:\\Users\\winuser\\.local\\bin\\tako"
-                )
+                "{} を作成できません: {} への symlink はこの OS では張れません（ユーザー環境変数 Path を使います）",
+                "C:\\Users\\winuser\\.local\\bin\\tako", "C:\\Users\\winuser\\.local\\bin\\tako"
             ),
         ),
     ]
