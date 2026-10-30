@@ -4375,7 +4375,7 @@ impl TakoApp {
         sel: tako_core::tree_select::Selection,
     ) -> Result<(), String> {
         if !self.filetree.visible {
-            return Err("ファイルツリーが閉じている".into());
+            return Err(tako_control::HostRefusal::FileTreeClosed.into());
         }
         let rows = self.filetree.rows();
         let lead = sel.lead.clone();

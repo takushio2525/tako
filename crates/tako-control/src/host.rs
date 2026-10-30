@@ -85,7 +85,7 @@ pub trait SessionHost {
         &mut self,
         _answer: tako_core::paste_guard::Answer,
     ) -> Result<(), String> {
-        Err("確認待ちの貼り付けが無い".into())
+        Err(crate::HostRefusal::NoPendingPaste.into())
     }
     /// 直接ペインへ AI のクリック（押す + 離す）を渡す（#1961）。PTY への書き込みだけ
     /// （子プロセスなし）。器のペインはここへ来ない（dispatch が background の

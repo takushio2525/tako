@@ -318,6 +318,21 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `CONFIG_REFUSAL_SCOPES`・対象の dispatch の関数が日本語の口を呼んで断りに載せていないか
   `CONFIG_DISPATCH_SCOPES`）、実経路は `tests/issue2365_orchestrator_config_lang.rs`（unix。置き場を一時の場所へ
   向けて CLI / MCP と同じ dispatch の関数と、GUI 無しのホストへの spawn / adopt を日英で断らせる）
+- #2365 の続きで、**GUI 側の口（ControlHost の実装）が組む断り**を `tako_control::HostRefusal`（網羅 match・
+  48 種）へ移した。dispatch は `host.*` の `Err(String)` をそのまま載せるので、文の言語は GUI（tako-app の
+  `impl *Host for TakoApp` と、口がそのまま委ねる補助 = プレビュー編集の `*_local`・貼り付けの確認・
+  クリック・チャットのコピー・ファイルツリー・`EditState::open`・`search_jump`）が決める。GUI は
+  `HostRefusal::…` を `?` / `.into()` で返し（`From<HostRefusal> for String` = 組んだその場の表示言語）、
+  dispatch 側は変えない。dispatch に同じ文の型が既にあるもの（`プレビューペインではない: <id>` =
+  `Reason::NotPreviewPane`・`ペイン <id> が見つからない` = `DispatchError::PaneNotFound`）はそちらを使う。
+  設定の保存の中身は `config_io::IoCause::of(&e)` で枠と同じ言語。「見つからない」系（コミット・Web ビュー）は
+  英語に ` not found` を含む。**中身が他モジュールの文の断りは枠だけ移さない**（混ざるため）: 更新の口
+  （`update_apply` / `apply_zip` / `repair` = `update_checker::CheckError` ほか）・`remote_start` / `stop`
+  （`remote.rs`）・tako-core の文（`open_plan` の行の丸め・`PreviewViewState::apply`・アウトライン・
+  `preview_limit` の編集の断り・`mouse_forward`）・`webview.rs` の生成の理由は Issue #2365 の表の残り。
+  番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（`HostRefusal` の表と、GUI のソースを読んで
+  日本語の断りの書き足しを `file:line` で名指す `HOST_IMPL_SCOPES`。診断の出力 = `eprintln!` / persist.log と
+  まだ移していない断片 `HOST_DEFERRED` は外し、断片がソースから消えたら表から外すよう落とす）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

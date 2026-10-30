@@ -5559,6 +5559,12 @@ fn front_scope_lines<'a>(src: &'a str, head: Option<&str>) -> Option<Vec<(usize,
 /// 走査範囲の中で、断りに書き足された日本語の固定文の行（`unreachable!` / `expect` の文と
 /// コメントは外す。`unreachable!(` が行をまたぐときは閉じ括弧まで外す）
 fn front_japanese(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+    japanese_outside(lines, &["unreachable!(", ".expect("])
+}
+
+/// [`front_japanese`] の本体。`internal` の呼び出し（内部の印・診断の出力）の中の日本語は見ない
+/// （呼び出しが行をまたぐときは閉じ括弧まで外す）
+fn japanese_outside(lines: &[(usize, &str)], internal: &[&str]) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut internal_depth = 0i32;
     for (line, code) in lines {
@@ -5566,12 +5572,10 @@ fn front_japanese(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
         if trimmed.starts_with("//") {
             continue;
         }
-        if internal_depth == 0 && (code.contains("unreachable!(") || code.contains(".expect(")) {
+        let first_internal = internal.iter().filter_map(|m| code.find(m)).min();
+        if internal_depth == 0 && first_internal.is_some() {
             internal_depth = 1;
-            let from = code
-                .find("unreachable!(")
-                .or_else(|| code.find(".expect("))
-                .unwrap_or(0);
+            let from = first_internal.unwrap_or(0);
             // 閉じ括弧がその行に揃っていれば 0 へ戻る（呼び手の括弧も閉じる行は負にしない）
             let tail = &code[from..];
             internal_depth = (internal_depth + tail.matches('(').count() as i32
@@ -7556,4 +7560,570 @@ fn dispatch_の設定の断りの番犬の境界() {
         .map(|(l, _, _)| l)
         .collect();
     assert_eq!(found, vec![3, 9], "日本語の口の 2 か所だけを名指す");
+}
+
+// ---- #2365 の続き: GUI 側の口（ControlHost の実装）が組む断り（`HostRefusal`） ----
+//
+// dispatch は `host.*` の `Err(String)` を `Operation` / `InvalidParams` の中身としてそのまま載せる。
+// GUI（tako-app の `impl *Host for TakoApp` と、そこから呼ぶ補助）が文を日本語で固定すると、英語表示でも
+// 理由だけ日本語で返る。日英の対は `tako_control::HostRefusal` に置き、ここで
+// (1) 表（全バリアントが日英・日本語は #2365 より前の固定文とバイト一致・見つからないの読み）と
+// (2) GUI のソースを読んで、日本語の断りの書き足しを `file:line` で名指す。
+// tako-app はバイナリ crate なので型は引けない = ソースをファイルとして読む
+
+use tako_control::HostRefusal;
+
+const HOST_REFUSAL_SRC: &str = include_str!("../src/host_refusal.rs");
+const HOST_REFUSAL_PATH: &str = "crates/tako-control/src/host_refusal.rs";
+
+/// バリアントの通し番号。**網羅 match**なので、バリアントを足すとここがコンパイルで落ちる
+/// = [`host_refusal_table`] に旧文（か新しい日本語）を足すまで通らない
+fn host_refusal_index(r: &HostRefusal) -> usize {
+    match r {
+        HostRefusal::NotPreviewPane => 0,
+        HostRefusal::ZoomNeedsPdfOrImage => 1,
+        HostRefusal::PageOutOfRange { .. } => 2,
+        HostRefusal::ImagePageOnlyOne => 3,
+        HostRefusal::LinesUncountable => 4,
+        HostRefusal::LineMissing { .. } => 5,
+        HostRefusal::NotCodePreview => 6,
+        HostRefusal::NotMarkdownOutline => 7,
+        HostRefusal::NotPdfOutline => 8,
+        HostRefusal::NotMarkdownPreview => 9,
+        HostRefusal::NotPdfPreview => 10,
+        HostRefusal::LinkIndexOutOfRange { .. } => 11,
+        HostRefusal::LinkNotBrowsable(_) => 12,
+        HostRefusal::NoCodeBlock => 13,
+        HostRefusal::CodeBlockOutOfRange { .. } => 14,
+        HostRefusal::EditNotStarted => 15,
+        HostRefusal::EditingOff => 16,
+        HostRefusal::NotTextForEdit => 17,
+        HostRefusal::BinaryNotEditable => 18,
+        HostRefusal::SearchBarNeedsText => 19,
+        HostRefusal::ChangelogOff => 20,
+        HostRefusal::CommitNotFound(_) => 21,
+        HostRefusal::NoPreviewInPane => 22,
+        HostRefusal::VideoPlayerNotRunning => 23,
+        HostRefusal::BadRate(_) => 24,
+        HostRefusal::RateOutOfRange(_) => 25,
+        HostRefusal::UnknownVideoAction(_) => 26,
+        HostRefusal::WebViewNotFound { .. } => 27,
+        HostRefusal::WebViewShown(_) => 28,
+        HostRefusal::NoWebViewInPane(_) => 29,
+        HostRefusal::NoShownWebView => 30,
+        HostRefusal::ManyShownWebViews(_) => 31,
+        HostRefusal::WindowNotReady => 32,
+        HostRefusal::SettingsNotSaved(_) => 33,
+        HostRefusal::NoBackendSession(_) => 34,
+        HostRefusal::AttachClientAlive(_) => 35,
+        HostRefusal::BackendSessionEnded { .. } => 36,
+        HostRefusal::NoPendingPaste => 37,
+        HostRefusal::PasteTargetClosed(_) => 38,
+        HostRefusal::NotTerminalPane(_) => 39,
+        HostRefusal::NotChatPane => 40,
+        HostRefusal::ChatNotLoaded => 41,
+        HostRefusal::NoAssistantMessage => 42,
+        HostRefusal::MessageOutOfRange { .. } => 43,
+        HostRefusal::MessageGone => 44,
+        HostRefusal::NoCodeBlockInMessage => 45,
+        HostRefusal::NothingToCopy => 46,
+        HostRefusal::FileTreeClosed => 47,
+    }
+}
+const HOST_REFUSAL_VARIANTS: usize = 48;
+
+/// (断り, #2365 より前に GUI が組んでいた日本語の固定文)。中身で腕を分けるもの
+/// （`LinkIndexOutOfRange` の total・`WebViewNotFound` の案内）は両方を載せる
+fn host_refusal_table() -> Vec<(HostRefusal, String)> {
+    use HostRefusal as H;
+    vec![
+        (H::NotPreviewPane, "プレビューペインではない".into()),
+        (
+            H::ZoomNeedsPdfOrImage,
+            "ズーム操作は PDF・画像プレビューだけに対応する".into(),
+        ),
+        (
+            H::PageOutOfRange { page: 9, total: 3 },
+            "ページ範囲外: 9（全 3 ページ）".into(),
+        ),
+        (
+            H::ImagePageOnlyOne,
+            "画像プレビューの page は 1 だけ指定できる".into(),
+        ),
+        (H::LinesUncountable, "テキストとして行を数えられない".into()),
+        (
+            H::LineMissing { line: 12, count: 4 },
+            "12 行目は無い（全 4 行）".into(),
+        ),
+        (
+            H::NotCodePreview,
+            "コード表示のプレビューではない（Markdown のレンダリング表示・画像・PDF には原文の行が無い）"
+                .into(),
+        ),
+        (H::NotMarkdownOutline, "Markdown アウトラインの対象ではない".into()),
+        (H::NotPdfOutline, "PDF アウトラインの対象ではない".into()),
+        (H::NotMarkdownPreview, "Markdown プレビューではない".into()),
+        (H::NotPdfPreview, "PDF プレビューではない".into()),
+        (
+            H::LinkIndexOutOfRange {
+                index: 7,
+                total: Some(2),
+            },
+            "リンクインデックス範囲外: 7（全 2 件）".into(),
+        ),
+        (
+            H::LinkIndexOutOfRange {
+                index: 7,
+                total: None,
+            },
+            "リンクインデックス範囲外: 7".into(),
+        ),
+        (
+            H::LinkNotBrowsable("file:///etc/hosts".into()),
+            "ブラウザで開けないリンク（http / https のみ対応）: file:///etc/hosts".into(),
+        ),
+        (H::NoCodeBlock, "コードブロックが無い".into()),
+        (
+            H::CodeBlockOutOfRange { index: 5, total: 2 },
+            "コードブロック範囲外: 5（全 2 個。0 始まり）".into(),
+        ),
+        (H::EditNotStarted, "編集モードを開始していない".into()),
+        (H::EditingOff, "編集モードが無効".into()),
+        (
+            H::NotTextForEdit,
+            "テキスト以外のプレビューは編集できない".into(),
+        ),
+        (H::BinaryNotEditable, "バイナリファイルは編集できない".into()),
+        (
+            H::SearchBarNeedsText,
+            "テキスト以外のプレビュー（PDF・画像・動画）は検索欄を開けない".into(),
+        ),
+        (H::ChangelogOff, "チェンジログビューが有効ではない".into()),
+        (
+            H::CommitNotFound("nope".into()),
+            "コミット nope が見つからない".into(),
+        ),
+        (H::NoPreviewInPane, "対象ペインにプレビューが無い".into()),
+        (H::VideoPlayerNotRunning, "動画プレイヤーが起動していない".into()),
+        (H::BadRate("fast".into()), "不正な速度値: fast".into()),
+        (H::RateOutOfRange(9.5), "速度は 0.1〜4.0 の範囲: 9.5".into()),
+        (
+            H::UnknownVideoAction("rewind".into()),
+            "不明なアクション: rewind".into(),
+        ),
+        (
+            H::WebViewNotFound {
+                id: 4,
+                list_hint: true,
+            },
+            "Web ビュー 4 が見つからない（web list で確認）".into(),
+        ),
+        (
+            H::WebViewNotFound {
+                id: 4,
+                list_hint: false,
+            },
+            "Web ビュー 4 が見つからない".into(),
+        ),
+        (H::WebViewShown(4), "Web ビュー 4 は表示中".into()),
+        (
+            H::NoWebViewInPane(8),
+            "ペイン 8 に Web ビューは表示されていない".into(),
+        ),
+        (
+            H::NoShownWebView,
+            "表示中の Web ビューが無い（id か pane で指定）".into(),
+        ),
+        (
+            H::ManyShownWebViews(3),
+            "表示中の Web ビューが 3 個ある（id か pane で指定）".into(),
+        ),
+        (
+            H::WindowNotReady,
+            "ウィンドウ初期化前のため Web ビューを作れない（直後に再試行）".into(),
+        ),
+        (
+            H::SettingsNotSaved(IoCause::Other("Permission denied (os error 13)".into())),
+            "設定を保存できない: Permission denied (os error 13)".into(),
+        ),
+        (
+            H::SettingsNotSaved(IoCause::DataDirUnresolved),
+            format!(
+                "設定を保存できない: {}",
+                Reason::DataDirUnresolved.text_in(Lang::Ja)
+            ),
+        ),
+        (
+            H::NoBackendSession(6),
+            "ペイン 6 は tmux のセッションを持たない（再 attach できるのは tmux 永続化のペインだけ）"
+                .into(),
+        ),
+        (
+            H::AttachClientAlive(6),
+            "ペイン 6 の attach クライアントは動いている（再 attach は不要）".into(),
+        ),
+        (
+            H::BackendSessionEnded {
+                pane: 6,
+                name: "tako-6".into(),
+            },
+            "ペイン 6 のセッション tako-6 は終わっている（再 attach できない。ペインは閉じてよい）"
+                .into(),
+        ),
+        (H::NoPendingPaste, "確認待ちの貼り付けが無い".into()),
+        (
+            H::PasteTargetClosed(2),
+            "送り先のペイン 2 が閉じている（貼り付けは捨てた）".into(),
+        ),
+        (H::NotTerminalPane(2), "ペイン 2 は端末ではない".into()),
+        (H::NotChatPane, "チャット表示のペインではない".into()),
+        (H::ChatNotLoaded, "会話がまだ読めていない".into()),
+        (
+            H::NoAssistantMessage,
+            "assistant の発話がまだ無い（--message で指定できる）".into(),
+        ),
+        (
+            H::MessageOutOfRange { index: 9, total: 3 },
+            "メッセージ範囲外: 9（全 3 件。0 始まり）".into(),
+        ),
+        (H::MessageGone, "その発話はもう表示されていない".into()),
+        (H::NoCodeBlockInMessage, "この発話にコードブロックが無い".into()),
+        (H::NothingToCopy, "コピーする本文が無い".into()),
+        (H::FileTreeClosed, "ファイルツリーが閉じている".into()),
+    ]
+}
+
+/// `HostRefusal` の日英の対を書いた行
+fn host_refusal_where(r: &HostRefusal, lang: Lang) -> String {
+    where_written(
+        HOST_REFUSAL_SRC,
+        HOST_REFUSAL_PATH,
+        "impl HostRefusal {",
+        &format!("{r:?}"),
+        lang,
+    )
+}
+
+#[test]
+fn gui_側の口の断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let table = host_refusal_table();
+    let samples: Vec<HostRefusal> = table.iter().map(|(r, _)| r.clone()).collect();
+    covers_every(
+        &samples,
+        host_refusal_index,
+        HOST_REFUSAL_VARIANTS,
+        "HostRefusal",
+    );
+    let mut failures = Vec::new();
+    for (r, old) in &table {
+        let (ja, en) = (r.text_in(Lang::Ja), r.text_in(Lang::En));
+        if ja != *old {
+            failures.push(format!(
+                "{}: {r:?} の日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}",
+                host_refusal_where(r, Lang::Ja)
+            ));
+        }
+        if let Some(c) = has_japanese(&en) {
+            failures.push(format!(
+                "{}: {r:?} の英語に日本語（{c}）が混ざる: {en}",
+                host_refusal_where(r, Lang::En)
+            ));
+        }
+        if en.trim().is_empty() || ja == en {
+            failures.push(format!(
+                "{}: {r:?} の英語が空か日本語と同じ文（英語の書き忘れ）: {en}",
+                host_refusal_where(r, Lang::En)
+            ));
+        }
+        // GUI は `String::from` / `?` で載せる = 組んだその場の表示言語の文（言語のグローバルは
+        // `display_follows_the_display_language` が動かすので、日英のどちらかであることだけを見る）
+        let shown = String::from(r.clone());
+        if shown != ja && shown != en {
+            failures.push(format!(
+                "{r:?}: String への変換が日英どちらの文とも違う: {shown}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 「見つからない」系は英語にも ` not found` を含む（リモートの HTTP 層が 404 へ寄せる判定を日英でそろえる）。
+/// 設定の保存の断りは中身（データディレクトリを解決できない）も枠と同じ言語になる
+#[test]
+fn gui_側の口の断りの見つからないの読みと中身の言語() {
+    let not_found = [
+        HostRefusal::CommitNotFound("abc".into()),
+        HostRefusal::WebViewNotFound {
+            id: 1,
+            list_hint: true,
+        },
+        HostRefusal::WebViewNotFound {
+            id: 1,
+            list_hint: false,
+        },
+    ];
+    for r in &not_found {
+        for lang in [Lang::Ja, Lang::En] {
+            let text = r.text_in(lang);
+            assert!(E::says_not_found(&text), "{lang:?}: {text}");
+        }
+    }
+    // 見つからない系でないものは英語でも当たらない（404 へ寄せすぎない）
+    for (r, _) in host_refusal_table() {
+        if matches!(
+            r,
+            HostRefusal::CommitNotFound(_) | HostRefusal::WebViewNotFound { .. }
+        ) {
+            continue;
+        }
+        for lang in [Lang::Ja, Lang::En] {
+            let text = r.text_in(lang);
+            assert!(!E::says_not_found(&text), "{r:?} {lang:?}: {text}");
+        }
+    }
+    let unresolved = HostRefusal::SettingsNotSaved(IoCause::DataDirUnresolved).text_in(Lang::En);
+    assert!(has_japanese(&unresolved).is_none(), "{unresolved}");
+    assert!(
+        unresolved.starts_with("cannot save the settings: "),
+        "{unresolved}"
+    );
+    // dispatch が載せる枠（operation failed: など）と中身が同じ言語でそろう
+    let wrapped = E::Operation(HostRefusal::EditNotStarted.text_in(Lang::En)).text_in(Lang::En);
+    assert!(has_japanese(&wrapped).is_none(), "{wrapped}");
+}
+
+/// GUI 側の口の本体（tako-app）: (path, 関数か impl の頭)。頭から、頭と同じ字下げの `}` まで
+const HOST_IMPL_SCOPES: &[(&str, &str)] = &[
+    (
+        "crates/tako-app/src/main.rs",
+        "impl WorkspaceHost for TakoApp {",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "impl SessionHost for TakoApp {",
+    ),
+    ("crates/tako-app/src/main.rs", "impl TmuxHost for TakoApp {"),
+    (
+        "crates/tako-app/src/main.rs",
+        "impl UiStateHost for TakoApp {",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "impl PreviewHost for TakoApp {",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "impl RemoteHost for TakoApp {",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "impl WebViewHost for TakoApp {",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "impl SystemHost for TakoApp {",
+    ),
+    // 口がそのまま委ねる補助（断りの文は口の断りとして CLI / MCP へ届く）
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn answer_pending_paste(",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn set_preview_editing_local(",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn apply_preview_text_local(",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn edit_preview_range_local(",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn edit_preview_ranges_local(",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn set_preview_cursor_local(",
+    ),
+    ("crates/tako-app/src/main.rs", "    fn save_preview_local("),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn revert_preview_local(",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn push_preview_remote_sync(",
+    ),
+    ("crates/tako-app/src/main.rs", "    fn preview_undo_local("),
+    ("crates/tako-app/src/main.rs", "    fn preview_redo_local("),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn open_preview_search_bar(",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn preview_search_local(",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn preview_replace_local(",
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn run_preview_command_local(",
+    ),
+    ("crates/tako-app/src/main.rs", "    fn ensure_video_player("),
+    ("crates/tako-app/src/main.rs", "    fn create_webview("),
+    (
+        "crates/tako-app/src/chat_view.rs",
+        "    pub(crate) fn chat_copy_dispatch(",
+    ),
+    (
+        "crates/tako-app/src/chat_view.rs",
+        "    pub(crate) fn copy_chat_message(",
+    ),
+    (
+        "crates/tako-app/src/click_forward.rs",
+        "    pub(crate) fn click_direct_pane(",
+    ),
+    (
+        "crates/tako-app/src/sidebar.rs",
+        "    pub(crate) fn host_set_tree_selection(",
+    ),
+    (
+        "crates/tako-app/src/preview.rs",
+        "    pub fn open(preview: &PreviewState)",
+    ),
+    (
+        "crates/tako-app/src/preview.rs",
+        "pub(crate) fn search_jump<K>(",
+    ),
+];
+
+/// 断りではない日本語の呼び出し（診断の出力 = persist.log / stderr は日本語のまま。内部の印も）
+const HOST_INTERNAL_CALLS: [&str; 6] = [
+    "unreachable!(",
+    ".expect(",
+    "eprintln!(",
+    "persist_diag(",
+    "persist_log(",
+    "webview_parent_diag(",
+];
+
+/// まだ移していない断りと、断りではない応答の注記（文の断片, 理由）。**断片がソースから消えたら
+/// ここから外す**（下の番犬が「古い」と落とす = 表が縮む方向にしか動かない）
+const HOST_DEFERRED: [(&str, &str); 3] = [
+    (
+        "更新チェックに失敗",
+        "更新の口（update_apply / apply_zip / repair）は中身の update_checker::CheckError ほかと 1 本で移す（Issue #2365 の表）",
+    ),
+    (
+        "の新しいバージョンが見つからない（既に最新版です）",
+        "同上（更新の口）",
+    ),
+    (
+        "結果は action=eval_result で回収",
+        "web_eval の成功の応答の注記（断りではない）",
+    ),
+];
+
+/// `start..` の範囲（頭と同じ字下げの `}` まで）。tako-app のソースは途中に `#[cfg(test)] mod` の
+/// 宣言を持つので、[`front_scope_lines`] の「単体テストの前まで」の切り方は使わない
+fn item_lines<'a>(src: &'a str, head: &str) -> Option<Vec<(usize, &'a str)>> {
+    let lines: Vec<&str> = src.lines().collect();
+    let start = lines.iter().position(|l| l.contains(head))?;
+    let indent = &lines[start][..lines[start].len() - lines[start].trim_start().len()];
+    let close = format!("{indent}}}");
+    let len = lines[start..].iter().position(|l| *l == close)?;
+    Some(
+        lines[start..=start + len]
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (start + i + 1, *l))
+            .collect(),
+    )
+}
+
+/// GUI 側の口の走査範囲の中で、断りに書かれた日本語の固定文の行（診断の出力・内部の印・
+/// [`HOST_DEFERRED`] は外す）
+fn host_japanese(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+    japanese_outside(lines, &HOST_INTERNAL_CALLS)
+        .into_iter()
+        .filter(|(_, text)| !HOST_DEFERRED.iter().any(|(frag, _)| text.contains(frag)))
+        .collect()
+}
+
+fn read_repo_file(path: &str) -> String {
+    let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(path);
+    std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("{path} が読めない: {e}"))
+}
+
+#[test]
+fn gui_側の口の本体に日本語の断りの固定文が無い() {
+    let mut failures = Vec::new();
+    let mut deferred_seen = [false; HOST_DEFERRED.len()];
+    for (path, head) in HOST_IMPL_SCOPES {
+        let src = read_repo_file(path);
+        let Some(lines) = item_lines(&src, head) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする。HOST_IMPL_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in host_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: GUI 側の口の断りに日本語の固定文がある = dispatch がそのまま載せ、英語表示にも出る \
+                 （tako_control::HostRefusal へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+        for (i, (frag, _)) in HOST_DEFERRED.iter().enumerate() {
+            if lines.iter().any(|(_, code)| code.contains(frag)) {
+                deferred_seen[i] = true;
+            }
+        }
+    }
+    for (i, (frag, why)) in HOST_DEFERRED.iter().enumerate() {
+        if !deferred_seen[i] {
+            failures.push(format!(
+                "HOST_DEFERRED の `{frag}`（{why}）がもうソースに無い = 移し終えたので表から外す"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 植えた日本語の断りを名指し、診断の出力（行をまたぐ `eprintln!` も）・`expect`・
+/// コメント・[`HOST_DEFERRED`] は見逃す。範囲は頭と同じ字下げの `}` までで、隣へはみ出さない
+#[test]
+fn gui_側の口の番犬は植えた日本語を名指しし診断と注記は見逃す() {
+    let src = r#"impl PreviewHost for TakoApp {
+    fn a(&mut self) -> Result<(), String> {
+        // コメントの日本語は見ない
+        eprintln!(
+            "warning: 設定を保存できない: {e}"
+        );
+        let p = self.previews.get(&pane).expect("確認済み");
+        if p.is_none() {
+            return Err("プレビューペインではない".into());
+        }
+        let t = codes.get(i).ok_or(HostRefusal::NoCodeBlock)?;
+        Err(format!("{n} 件が範囲外"))
+    }
+    fn b(&self) -> Value {
+        json!({ "hint": "結果は action=eval_result で回収（未完なら pending: true）" })
+    }
+}
+fn outside() {
+    let _ = "範囲の外";
+}
+"#;
+    let lines = item_lines(src, "impl PreviewHost for TakoApp {").expect("頭を引ける");
+    let found: Vec<usize> = host_japanese(&lines).into_iter().map(|(l, _)| l).collect();
+    assert_eq!(found, vec![9, 12], "植えた 2 か所だけを名指す");
+    assert!(item_lines(src, "impl Absent for TakoApp {").is_none());
 }

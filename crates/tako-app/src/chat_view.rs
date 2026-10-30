@@ -1449,24 +1449,25 @@ impl TakoApp {
     ) -> Result<serde_json::Value, String> {
         let message = self
             .chat_message_by_key(pane_id, key)
-            .ok_or_else(|| "その発話はもう表示されていない".to_string())?;
+            .ok_or(tako_control::HostRefusal::MessageGone)?;
         let text = match target {
             ChatCopyTarget::Message => self.chat_message_text(&message, markdown),
             ChatCopyTarget::Code(index) => {
                 let codes = self.chat_message_codes(&message);
                 if codes.is_empty() {
-                    return Err("この発話にコードブロックが無い".into());
+                    return Err(tako_control::HostRefusal::NoCodeBlockInMessage.into());
                 }
-                codes.get(index).cloned().ok_or_else(|| {
-                    format!(
-                        "コードブロック範囲外: {index}（全 {} 個。0 始まり）",
-                        codes.len()
-                    )
-                })?
+                codes
+                    .get(index)
+                    .cloned()
+                    .ok_or(tako_control::HostRefusal::CodeBlockOutOfRange {
+                        index,
+                        total: codes.len(),
+                    })?
             }
         };
         if text.is_empty() {
-            return Err("コピーする本文が無い".into());
+            return Err(tako_control::HostRefusal::NothingToCopy.into());
         }
         let lines = text.split('\n').count();
         let bytes = text.len();
@@ -1504,10 +1505,10 @@ impl TakoApp {
             .chat_panes
             .get(&pane_id)
             .cloned()
-            .ok_or_else(|| "チャット表示のペインではない".to_string())?;
+            .ok_or(tako_control::HostRefusal::NotChatPane)?;
         let visible = self.chat_visible_messages(pane_id, &state);
         if visible.is_empty() {
-            return Err("会話がまだ読めていない".into());
+            return Err(tako_control::HostRefusal::ChatNotLoaded.into());
         }
         if list {
             let messages: Vec<serde_json::Value> = visible
@@ -1540,15 +1541,13 @@ impl TakoApp {
             None => visible
                 .iter()
                 .rposition(|m| m.role == ChatRole::Assistant)
-                .ok_or("assistant の発話がまだ無い（--message で指定できる）")?,
+                .ok_or(tako_control::HostRefusal::NoAssistantMessage)?,
         };
         let key = visible
             .get(index)
-            .ok_or_else(|| {
-                format!(
-                    "メッセージ範囲外: {index}（全 {} 件。0 始まり）",
-                    visible.len()
-                )
+            .ok_or(tako_control::HostRefusal::MessageOutOfRange {
+                index,
+                total: visible.len(),
             })?
             .key;
         let target = code.map_or(ChatCopyTarget::Message, ChatCopyTarget::Code);
