@@ -304,6 +304,20 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `window_bounds` の理由ほか）も対象外。番犬は同じ節に足し、本体の範囲は単体テストの `mod` の始まりまで
   （途中の `#[cfg(test)] fn` で切れて後ろを見ていなかったのを直した）。実経路は
   `tests/issue2365_dispatch_rest_lang.rs`（unix。GUI 無しのホストへ IPC の受け口と同じ 3 段で要求を通す）
+- #2365 の続きで、**dispatch が素通ししていた orchestrator の設定ファイルの断り**（projects.yaml / accounts.yaml /
+  profiles の読み書き・プロファイル名と種別・エージェント名の検証・プロファイルの env / cwd / projects /
+  master_agent / worker_agent・ctx_threshold の範囲）を `tako_control::orchestrator::ConfigError`（網羅 match）へ
+  移した。`config_io` と同じく **`String` を返す従来の口（`ProjectsConfig::load` / `Profile::load` /
+  `WorkerAgent::parse` ほか）は日本語のまま**（`tako master` / `tako solo` の起動の流れ・persist.log・
+  `tako setup`・自動生成の `ProfileGen` の理由はそのまま使う）。断りを表示言語で返す dispatch の関数
+  （`orchestrator projects` / `profiles` / `accounts`・adopt・引き継ぎ・spawn・コンフリクト解消）だけが
+  型の口（`*_typed`）を呼び、`ConfigError::operation` / `invalid` で載せる（一覧の壊れたエントリの `error` も
+  同じ言語）。「見つからない」系の英語は ` not found` を含む。setup 系（`setup models` / `setup_mcp` の
+  エージェント名）・`ProfileGen` の理由・応答の注記（読めないプロファイルの warnings）は対象外。番犬は同じ
+  `issue1762_dispatch_error_lang.rs` の末尾の節（`ConfigError` の表・型の口の本体の日本語の固定文
+  `CONFIG_REFUSAL_SCOPES`・対象の dispatch の関数が日本語の口を呼んで断りに載せていないか
+  `CONFIG_DISPATCH_SCOPES`）、実経路は `tests/issue2365_orchestrator_config_lang.rs`（unix。置き場を一時の場所へ
+  向けて CLI / MCP と同じ dispatch の関数と、GUI 無しのホストへの spawn / adopt を日英で断らせる）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

@@ -40,15 +40,18 @@ impl WorkerAgent {
         }
     }
 
-    /// 種別名からパースする。未対応の名前は対応一覧つきのエラー
+    /// 種別名からパースする。未対応の名前は対応一覧つきのエラー（文は日本語。#2365）
     pub fn parse(s: &str) -> Result<Self, String> {
+        Self::parse_typed(s).map_err(super::ConfigError::into_ja)
+    }
+
+    /// [`Self::parse`] の型の口（断りを表示言語で返す dispatch が使う。#2365）
+    pub fn parse_typed(s: &str) -> Result<Self, super::ConfigError> {
         match s.trim() {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "agy" => Ok(Self::Agy),
-            other => Err(format!(
-                "未対応のエージェント種別 '{other}'（対応: claude / codex / agy）"
-            )),
+            other => Err(super::ConfigError::UnknownAgent(other.to_string())),
         }
     }
 

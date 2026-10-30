@@ -34,6 +34,9 @@
 //! #2365 の続きで、MCP の前段（`mcp/request.rs` の引数の組み立てと JSON-RPC の口）と CLI の前段
 //! （`tako-cli` の `build_request` とそれが呼ぶ補助）の断りを `Reason` の表へ足した。前段に日本語の
 //! 固定文を書き足すと英語表示でもその 1 か所だけ日本語で返るので、前段のソースを読んで名指す（最後）。
+//! #2365 の続きで、orchestrator の設定ファイル（projects / accounts / profiles）の読み書きとエージェント名の
+//! 検証の断り（`orchestrator::ConfigError`）にも広げた（末尾）。型の口の本体と、それを呼ぶ dispatch の
+//! 関数のソースも読んで名指す。
 //!
 //! このファイルは**独立したテストバイナリ**で、言語グローバルを触るのは
 //! `display_follows_the_display_language` の 1 本だけ（ほかは `text_in` で言語を引数に渡す）。
@@ -6903,4 +6906,654 @@ fn dispatch_の個別の断りの値で分かれる腕の境界() {
         .text_in(Lang::Ja)
         .contains(&tako_core::tmux::socket_label(None)));
     report_all(failures);
+}
+
+// ---- #2365 の続き: orchestrator の設定ファイル（projects / accounts / profiles）の読み書きと
+// エージェント名の検証の断り（`orchestrator::ConfigError`） ----
+//
+// 断りの文は `ConfigError::text_in` の (バリアント, 言語) の網羅 match の 1 か所。従来の `String` の口
+// （`ProjectsConfig::load` ほか）は日本語のまま = `tako master` の起動の流れ・persist.log・日本語の枠の
+// 呼び手はそのまま使い、断りを表示言語で返す dispatch（projects / profiles / accounts / adopt /
+// 引き継ぎ / spawn / コンフリクト解消）だけが型の口（`*_typed`）を通す。ここでは
+// (1) 全バリアントの日英と旧文のバイト一致、(2) 口の本体に日本語の固定文を書き足していないこと、
+// (3) dispatch の対象の関数が日本語の口を呼んで断りに載せていないことを `file:line` で名指す
+
+use tako_control::orchestrator::{ConfigError, ConfigFile, ProfileKind, WorkerAgent};
+
+const ORCH_MOD_SRC: &str = include_str!("../src/orchestrator/mod.rs");
+const ORCH_MOD_PATH: &str = "crates/tako-control/src/orchestrator/mod.rs";
+const ORCH_AGENT_SRC: &str = include_str!("../src/orchestrator/agent.rs");
+const ORCH_AGENT_PATH: &str = "crates/tako-control/src/orchestrator/agent.rs";
+const CONFIG_ERROR_SRC: &str = include_str!("../src/orchestrator/config_error.rs");
+const CONFIG_ERROR_PATH: &str = "crates/tako-control/src/orchestrator/config_error.rs";
+
+/// `ConfigError` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
+fn config_error_index(e: &ConfigError) -> usize {
+    match e {
+        ConfigError::HomeUnresolved => 0,
+        ConfigError::Read { .. } => 1,
+        ConfigError::Parse { .. } => 2,
+        ConfigError::Serialize(_) => 3,
+        ConfigError::Lock(_) => 4,
+        ConfigError::Write(_) => 5,
+        ConfigError::CreateDir(_) => 6,
+        ConfigError::CreateProfilesDir(_) => 7,
+        ConfigError::WriteDefaultProfile(_) => 8,
+        ConfigError::ListProfiles(_) => 9,
+        ConfigError::DeleteProfile(_) => 10,
+        ConfigError::ProfileNotFound { .. } => 11,
+        ConfigError::ProfileExists { .. } => 12,
+        ConfigError::DefaultProfileUndeletable(_) => 13,
+        ConfigError::InvalidKind(_) => 14,
+        ConfigError::ProfileNameEmpty => 15,
+        ConfigError::ProfileNameLeadingDot(_) => 16,
+        ConfigError::ProfileNameLeadingDash(_) => 17,
+        ConfigError::ProfileNameBadChar(_) => 18,
+        ConfigError::AccountNotFound(_) => 19,
+        ConfigError::AccountInheritWithDir(_) => 20,
+        ConfigError::AccountNoConfigDir(_) => 21,
+        ConfigError::ProjectNotFound(_) => 22,
+        ConfigError::ProjectCwdMissing(_) => 23,
+        ConfigError::UnknownAgent(_) => 24,
+        ConfigError::MasterAgentUnsupported(_) => 25,
+        ConfigError::ProfileMasterAgent(_) => 26,
+        ConfigError::ProfileWorkerAgent(_) => 27,
+        ConfigError::ProfileCwdMissing { .. } => 28,
+        ConfigError::ProfileProjectsUnregistered(_) => 29,
+        ConfigError::ProfileEnvReserved(_) => 30,
+        ConfigError::CtxThresholdOutOfRange(_) => 31,
+    }
+}
+const CONFIG_ERROR_VARIANTS: usize = 32;
+
+/// 見本と #2365 より前の固定文（`orchestrator` の口が書いていた文を見本の値で展開）
+fn config_error_table() -> Vec<(ConfigError, &'static str)> {
+    let yaml = YamlReason::Located {
+        kind: YamlProblem::Syntax,
+        at: Some((1, 11)),
+    };
+    let unknown = || ConfigError::UnknownAgent("gpt".into());
+    vec![
+        (ConfigError::HomeUnresolved, "ホームディレクトリが取得できない"),
+        (
+            ConfigError::Read {
+                file: ConfigFile::Projects,
+                error: "Permission denied (os error 13)".into(),
+            },
+            "projects.yaml の読み取りに失敗: Permission denied (os error 13)",
+        ),
+        (
+            ConfigError::Read {
+                file: ConfigFile::Accounts,
+                error: "Permission denied (os error 13)".into(),
+            },
+            "accounts.yaml の読み取りに失敗: Permission denied (os error 13)",
+        ),
+        (
+            ConfigError::Read {
+                file: ConfigFile::Profile,
+                error: "Is a directory (os error 21)".into(),
+            },
+            "プロファイルの読み取りに失敗: Is a directory (os error 21)",
+        ),
+        (
+            ConfigError::Parse {
+                file: ConfigFile::Projects,
+                reason: yaml.clone(),
+            },
+            "projects.yaml のパースに失敗: YAML の構文が壊れている（1 行 11 列）",
+        ),
+        (
+            ConfigError::Parse {
+                file: ConfigFile::Accounts,
+                reason: yaml.clone(),
+            },
+            "accounts.yaml のパースに失敗: YAML の構文が壊れている（1 行 11 列）",
+        ),
+        (
+            ConfigError::Parse {
+                file: ConfigFile::Profile,
+                reason: YamlReason::Located {
+                    kind: YamlProblem::Shape,
+                    at: None,
+                },
+            },
+            "プロファイルのパースに失敗: YAML の形が期待と違う",
+        ),
+        (
+            ConfigError::Serialize("x".into()),
+            "YAML のシリアライズに失敗: x",
+        ),
+        (
+            ConfigError::Lock(LockError::Open {
+                path: "/tmp/p.yaml.lock".into(),
+                error: "Is a directory (os error 21)".into(),
+            }),
+            "ロックファイルを開けない (/tmp/p.yaml.lock): Is a directory (os error 21)",
+        ),
+        (
+            ConfigError::Write(WriteError::NoParent("/".into())),
+            "親ディレクトリがない: /",
+        ),
+        (
+            ConfigError::CreateDir("Not a directory (os error 20)".into()),
+            "ディレクトリの作成に失敗: Not a directory (os error 20)",
+        ),
+        (
+            ConfigError::CreateProfilesDir("Not a directory (os error 20)".into()),
+            "profiles ディレクトリの作成に失敗: Not a directory (os error 20)",
+        ),
+        (
+            ConfigError::WriteDefaultProfile("Permission denied (os error 13)".into()),
+            "default.yaml の書き込みに失敗: Permission denied (os error 13)",
+        ),
+        (
+            ConfigError::ListProfiles("Permission denied (os error 13)".into()),
+            "プロファイルディレクトリの読み取りに失敗: Permission denied (os error 13)",
+        ),
+        (
+            ConfigError::DeleteProfile("Permission denied (os error 13)".into()),
+            "プロファイルの削除に失敗: Permission denied (os error 13)",
+        ),
+        (
+            ConfigError::ProfileNotFound {
+                kind: None,
+                name: "p".into(),
+                path: "/tmp/profiles/p.yaml".into(),
+            },
+            "プロファイル 'p' が見つからない: /tmp/profiles/p.yaml",
+        ),
+        (
+            ConfigError::ProfileNotFound {
+                kind: Some(ProfileKind::Master),
+                name: "p".into(),
+                path: "/tmp/profiles/p.yaml".into(),
+            },
+            "master プロファイル 'p' が見つからない: /tmp/profiles/p.yaml",
+        ),
+        (
+            ConfigError::ProfileNotFound {
+                kind: Some(ProfileKind::Solo),
+                name: "p".into(),
+                path: "/tmp/solo-profiles/p.yaml".into(),
+            },
+            "solo プロファイル 'p' が見つからない: /tmp/solo-profiles/p.yaml",
+        ),
+        (
+            ConfigError::ProfileExists {
+                kind: ProfileKind::Master,
+                name: "p".into(),
+            },
+            "master プロファイル 'p' は既に存在する（上書きするなら set を使う）",
+        ),
+        (
+            ConfigError::DefaultProfileUndeletable(ProfileKind::Master),
+            "既定プロファイル 'default' は削除できない（tako master が参照する）",
+        ),
+        (
+            ConfigError::DefaultProfileUndeletable(ProfileKind::Solo),
+            "既定プロファイル 'default' は削除できない（tako solo が参照する）",
+        ),
+        (
+            ConfigError::InvalidKind("bogus".into()),
+            "kind が不正: 'bogus'（master / solo）",
+        ),
+        (ConfigError::ProfileNameEmpty, "プロファイル名が空"),
+        (
+            ConfigError::ProfileNameLeadingDot("..".into()),
+            "プロファイル名は '.' で始められない: '..'",
+        ),
+        (
+            ConfigError::ProfileNameLeadingDash("-x".into()),
+            "プロファイル名は '-' で始められない（起動コマンドのオプションと紛れる）: '-x'",
+        ),
+        (
+            ConfigError::ProfileNameBadChar('/'),
+            "プロファイル名に使えない文字が含まれる: '/'（英数字と - _ . のみ）",
+        ),
+        (
+            ConfigError::AccountNotFound("a".into()),
+            "アカウント 'a' が accounts.yaml に見つからない",
+        ),
+        (
+            ConfigError::AccountInheritWithDir("a".into()),
+            "アカウント 'a' は inherit: true と config_dir を同時に指定している\
+             （既定の資格情報を使うなら config_dir を消す）",
+        ),
+        (
+            ConfigError::AccountNoConfigDir("a".into()),
+            "アカウント 'a' に config_dir が無い\
+             （別 config dir なら config_dir を、既定の資格情報なら inherit: true を指定する）",
+        ),
+        (
+            ConfigError::ProjectNotFound("k".into()),
+            "プロジェクト 'k' が projects.yaml に見つからない",
+        ),
+        (
+            ConfigError::ProjectCwdMissing("/x/k".into()),
+            "cwd が存在しない: /x/k",
+        ),
+        (
+            unknown(),
+            "未対応のエージェント種別 'gpt'（対応: claude / codex / agy）",
+        ),
+        (
+            ConfigError::MasterAgentUnsupported(WorkerAgent::Agy),
+            "agy は master 非対応（master は claude / codex のみ。worker としては利用可能）",
+        ),
+        (
+            ConfigError::ProfileMasterAgent(Box::new(unknown())),
+            "プロファイルの master_agent が不正: 未対応のエージェント種別 'gpt'（対応: claude / codex / agy）",
+        ),
+        (
+            ConfigError::ProfileMasterAgent(Box::new(ConfigError::MasterAgentUnsupported(
+                WorkerAgent::Agy,
+            ))),
+            "プロファイルの master_agent が不正: agy は master 非対応（master は claude / codex のみ。worker としては利用可能）",
+        ),
+        (
+            ConfigError::ProfileWorkerAgent(Box::new(unknown())),
+            "プロファイルの worker_agent が不正: 未対応のエージェント種別 'gpt'（対応: claude / codex / agy）",
+        ),
+        (
+            ConfigError::ProfileCwdMissing {
+                expanded: "/h/x".into(),
+                raw: "~/x".into(),
+            },
+            "プロファイルの cwd が存在しない: /h/x（元の指定: ~/x）",
+        ),
+        (
+            ConfigError::ProfileProjectsUnregistered(vec!["a".into(), "b".into()]),
+            "プロファイルの projects に projects.yaml に未登録のキーがある: a, b",
+        ),
+        (
+            ConfigError::ProfileEnvReserved(vec!["TAKO_SOCKET".into(), "TAKO_TOKEN".into()]),
+            "プロファイルの env に tako 内部変数が含まれている（上書き禁止）: TAKO_SOCKET, TAKO_TOKEN",
+        ),
+        (
+            ConfigError::CtxThresholdOutOfRange(10),
+            "ctx_threshold は 50〜60 の範囲で指定する: 10",
+        ),
+    ]
+}
+
+#[test]
+fn orchestrator_の設定の断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let table = config_error_table();
+    let samples: Vec<ConfigError> = table.iter().map(|(e, _)| e.clone()).collect();
+    covers_every(
+        &samples,
+        config_error_index,
+        CONFIG_ERROR_VARIANTS,
+        "ConfigError",
+    );
+    let mut failures = Vec::new();
+    for (e, old) in &table {
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        if ja != *old {
+            failures.push(format!(
+                "{e:?}: 日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}"
+            ));
+        }
+        if let Some(c) = has_japanese(&en) {
+            failures.push(format!("{e:?}: 英語に日本語（{c}）が混ざる: {en}"));
+        }
+        if ja == en {
+            failures.push(format!("{e:?}: 日英が同じ文（英語の書き忘れ）: {en}"));
+        }
+        // 日本語の口が使う文は日本語の文そのもの
+        if e.clone().into_ja() != ja {
+            failures.push(format!("{e:?}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+    report_all(failures);
+}
+
+/// 「見つからない」系は英語にも ` not found` を含む（リモートの HTTP 層が 404 へ寄せる判定を日英でそろえる）。
+/// 包み（`ProfileMasterAgent` ほか）の枠は表示言語で、中身も同じ言語になる
+#[test]
+fn orchestrator_の設定の断りの見つからないの読みと包みの言語() {
+    for e in [
+        ConfigError::ProfileNotFound {
+            kind: Some(ProfileKind::Solo),
+            name: "p".into(),
+            path: "/tmp/p.yaml".into(),
+        },
+        ConfigError::ProfileNotFound {
+            kind: None,
+            name: "p".into(),
+            path: "/tmp/p.yaml".into(),
+        },
+        ConfigError::AccountNotFound("a".into()),
+        ConfigError::ProjectNotFound("k".into()),
+    ] {
+        for lang in [Lang::Ja, Lang::En] {
+            let text = e.text_in(lang);
+            assert!(E::says_not_found(&text), "{lang:?}: {text}");
+        }
+    }
+    let wrapped = ConfigError::ProfileWorkerAgent(Box::new(ConfigError::UnknownAgent("x".into())));
+    assert_eq!(
+        wrapped.text_in(Lang::En),
+        "invalid worker_agent in the profile: unsupported agent kind 'x' (supported: claude / codex / agy)"
+    );
+    // dispatch へ載せる口は枠（invalid parameter:）と中身を同じ言語で組む
+    assert_eq!(
+        E::InvalidParams(wrapped.text_in(Lang::En)).text_in(Lang::En),
+        "invalid parameter: invalid worker_agent in the profile: unsupported agent kind 'x' \
+         (supported: claude / codex / agy)"
+    );
+}
+
+/// 型の口と、それを日本語で包む従来の口の本体（日本語の固定文を書かない範囲。文は `ConfigError` にだけ置く）
+const CONFIG_REFUSAL_SCOPES: &[(&str, &str, Span)] = &[
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("impl AccountsConfig {"),
+    ),
+    (ORCH_MOD_PATH, ORCH_MOD_SRC, Span::Item("fn resolve_entry(")),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("impl ProjectsConfig {"),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn resolve_master_agent_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn resolve_worker_agent_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn resolve_cwd_typed(&self) ->"),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn validate_projects_with("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn validate_env_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn resolve_master_account_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn resolved_env_plan_for_master_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn load_typed(name: &str)"),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn save(&self, name: &str)"),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn mutate_named<"),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn load_from_or_default_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn ensure_solo_defaults_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("fn solo_profile_path("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn load_solo_profile("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("fn read_profile_file("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("fn write_profile_file("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("fn mutate_profile_at<"),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn validate_master_agent_typed("),
+    ),
+    (ORCH_MOD_PATH, ORCH_MOD_SRC, Span::Item("fn profile_path(")),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("impl ProfileKind {"),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn validate_profile_name_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn list_profiles_of_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn load_profile_of_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn mutate_profile_of_typed<"),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn create_profile_of_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn create_profile_at("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn delete_profile_of_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn delete_profile_at("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn ensure_defaults_typed() ->"),
+    ),
+    (
+        ORCH_AGENT_PATH,
+        ORCH_AGENT_SRC,
+        Span::Item("    pub fn parse_typed("),
+    ),
+    (
+        CONFIG_ERROR_PATH,
+        CONFIG_ERROR_SRC,
+        Span::Item("    pub fn into_ja("),
+    ),
+    (
+        CONFIG_ERROR_PATH,
+        CONFIG_ERROR_SRC,
+        Span::Item("    pub fn invalid("),
+    ),
+    (
+        CONFIG_ERROR_PATH,
+        CONFIG_ERROR_SRC,
+        Span::Item("    pub fn operation("),
+    ),
+];
+
+#[test]
+fn orchestrator_の設定の口の本体に日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, src, span) in CONFIG_REFUSAL_SCOPES {
+        let Some(lines) = client_store_lines(src, span) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 {} が見つからない（改名で番犬が空振りする。\
+                 CONFIG_REFUSAL_SCOPES を直す）",
+                span_name(span)
+            ));
+            continue;
+        };
+        for (line, text) in front_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: orchestrator の設定の口に日本語の固定文がある = 英語表示にもそのまま出る \
+                 （orchestrator::ConfigError へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 断りを表示言語で返す dispatch の関数（orchestrator の設定を読み書きする所）
+const CONFIG_DISPATCH_SCOPES: &[&str] = &[
+    "pub fn dispatch_orchestrator_projects(",
+    "pub fn dispatch_orchestrator_projects_mcp(",
+    "fn dispatch_orchestrator_adopt(",
+    "pub fn dispatch_orchestrator_profiles(",
+    "pub fn dispatch_orchestrator_accounts(",
+    "fn dispatch_orchestrator_handoff(",
+    "fn dispatch_git_resolve_agent(",
+    "fn dispatch_orchestrator_spawn(",
+];
+
+/// 日本語で返す口（型の口 `*_typed` の外側）。`.path(` は名前を取る `ProfileKind::path`
+const JA_CONFIG_CALLS: [&str; 22] = [
+    "ProjectsConfig::load()",
+    "ProjectsConfig::mutate(",
+    "AccountsConfig::load()",
+    "AccountsConfig::mutate(",
+    "accounts.resolve(",
+    "config.resolve(",
+    ".resolve_cwd(",
+    ".resolve_worker_agent(",
+    ".resolve_master_agent()",
+    ".validate_env()",
+    ".resolved_env_plan_for_master()",
+    "Profile::load(",
+    "load_profile_of(",
+    "mutate_profile_of(",
+    "create_profile_of(",
+    "delete_profile_of(",
+    "list_profiles_of(",
+    "validate_master_agent(",
+    "ProfileKind::parse(",
+    "WorkerAgent::parse(",
+    "ensure_defaults()",
+    ".path(name)",
+];
+
+/// 文（呼び出しの行から `;` で終わる行まで）が断りを捨てている（`.ok()` / `unwrap_or` / `is_ok`）か
+fn statement_discards_error(lines: &[(usize, &str)], at: usize) -> bool {
+    let mut stmt = String::new();
+    for (_, code) in &lines[at..] {
+        stmt.push_str(code);
+        if code.trim_end().ends_with(';') || code.trim_end().ends_with('{') {
+            break;
+        }
+    }
+    [".ok()", "unwrap_or", ".is_ok()", ".is_err()", "if let Ok("]
+        .iter()
+        .any(|d| stmt.contains(d))
+}
+
+/// dispatch の対象の関数の中で、日本語の口を呼んで断りに載せている行
+fn ja_config_calls(lines: &[(usize, &str)]) -> Vec<(usize, &'static str, String)> {
+    let mut out = Vec::new();
+    for (i, (line, code)) in lines.iter().enumerate() {
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        if let Some(call) = JA_CONFIG_CALLS.iter().find(|c| code.contains(*c)) {
+            if !statement_discards_error(lines, i) {
+                out.push((*line, *call, code.trim().to_string()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn dispatch_は設定の断りを日本語の口から載せない() {
+    let mut failures = Vec::new();
+    for head in CONFIG_DISPATCH_SCOPES {
+        let Some(lines) = front_scope_lines(DISPATCH_SRC, Some(head)) else {
+            failures.push(format!(
+                "{DISPATCH_PATH}: 走査の範囲 `{head}` が見つからない（関数の改名で番犬が空振りする。\
+                 CONFIG_DISPATCH_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, call, code) in ja_config_calls(&lines) {
+            failures.push(format!(
+                "{DISPATCH_PATH}:{line}: 断りを表示言語で返す関数（`{head}`）が日本語の口 `{call}…)` の断りを \
+                 載せている = 英語表示でも中身だけ日本語で混ざる（`*_typed` を呼んで ConfigError::operation / \
+                 invalid で載せる）: {code}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 日本語の口を呼んで断りに載せた行だけを名指し、断りを捨てる文（`.ok()` /
+/// `unwrap_or`）・型の口・コメントは見逃す
+#[test]
+fn dispatch_の設定の断りの番犬の境界() {
+    let src = r#"fn a() -> Result<(), DispatchError> {
+    // ProjectsConfig::load() はコメント
+    let c = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
+    let ok = orchestrator::ProjectsConfig::load()
+        .map(|c| c.projects.len())
+        .unwrap_or(0);
+    let t = orchestrator::ProjectsConfig::load_typed().map_err(ConfigError::operation)?;
+    let a = profile
+        .resolve_worker_agent(agent)
+        .map_err(DispatchError::InvalidParams)?;
+    let b = profile.resolve_worker_agent_typed(agent).map_err(ConfigError::invalid)?;
+}
+"#;
+    let lines = front_scope_lines(src, Some("fn a(")).expect("頭を引ける");
+    let found: Vec<usize> = ja_config_calls(&lines)
+        .into_iter()
+        .map(|(l, _, _)| l)
+        .collect();
+    assert_eq!(found, vec![3, 9], "日本語の口の 2 か所だけを名指す");
 }

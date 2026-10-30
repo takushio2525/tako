@@ -295,7 +295,8 @@ fn scan_dispatch(src: &str) -> Vec<Offender> {
         Some((at, window)) => {
             let gen_line = line_with(at, &window, "ensure_project_profile(name)");
             let check = line_with(at, &window, "gen.warning()");
-            let load = line_with(at, &window, "Profile::load(name)");
+            // 採用先の読み込みは表示言語で断る型の口（#2365 の `Profile::load_typed`）
+            let load = line_with(at, &window, "Profile::load_typed(name)");
             match (gen_line, check, load) {
                 (Some(_), Some(c), Some(l)) if c < l => {}
                 (g, _, _) => push(

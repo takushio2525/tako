@@ -18,6 +18,7 @@ use tako_core::{
     Workspace,
 };
 
+use crate::orchestrator::ConfigError;
 use crate::protocol::{error_code, Direction, FileOpKind, PreviewModeWire, Request};
 
 // ControlHost とサブトレイトは host.rs で定義（Issue #86）
@@ -15124,7 +15125,8 @@ pub fn dispatch_orchestrator_projects(
     use crate::orchestrator;
     match action {
         "list" => {
-            let config = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
+            let config =
+                orchestrator::ProjectsConfig::load_typed().map_err(ConfigError::operation)?;
             let projects: Vec<Value> = config
                 .list_resolved()
                 .into_iter()
@@ -15144,12 +15146,12 @@ pub fn dispatch_orchestrator_projects(
         "add" => {
             let key = key.ok_or_else(|| Reason::Missing("key".into()).invalid())?;
             let cwd = cwd.ok_or_else(|| Reason::Missing("cwd".into()).invalid())?;
-            orchestrator::ensure_defaults().map_err(DispatchError::Operation)?;
+            orchestrator::ensure_defaults_typed().map_err(ConfigError::operation)?;
             // ロック付き read-modify-write（#169: 並行 add で他エントリを消さない）
-            orchestrator::ProjectsConfig::mutate(|config| {
+            orchestrator::ProjectsConfig::mutate_typed(|config| {
                 config.add(key.clone(), cwd.clone(), description);
             })
-            .map_err(DispatchError::Operation)?;
+            .map_err(ConfigError::operation)?;
             // #1453: 登録と同時に専用プロファイルを用意する（default から継承・
             // 既存は触らない・冪等）。**projects.yaml への登録より後**に呼ぶのは、
             // 生成が cwd を projects.yaml から読むから。作れなかった理由は
@@ -15180,8 +15182,8 @@ pub fn dispatch_orchestrator_projects(
         }
         "remove" => {
             let key = key.ok_or_else(|| Reason::Missing("key".into()).invalid())?;
-            let removed = orchestrator::ProjectsConfig::mutate(|config| config.remove(&key))
-                .map_err(DispatchError::Operation)?;
+            let removed = orchestrator::ProjectsConfig::mutate_typed(|config| config.remove(&key))
+                .map_err(ConfigError::operation)?;
             if !removed {
                 return Err(Reason::ProjectNotFound(key).operation());
             }
@@ -15218,7 +15220,7 @@ pub fn dispatch_orchestrator_projects_mcp(
         return Err(Reason::Missing("servers".into()).invalid());
     }
     let mut changed: Vec<String> = Vec::new();
-    let loaded = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
+    let loaded = orchestrator::ProjectsConfig::load_typed().map_err(ConfigError::operation)?;
     if !loaded.projects.contains_key(&key) {
         // 無いキーへの変更でファイルを書き直さない（世代バックアップを無駄に回さない）
         return Err(Reason::ProjectNotFound(key).operation());
@@ -15234,7 +15236,7 @@ pub fn dispatch_orchestrator_projects_mcp(
         loaded
     } else {
         // ロック付き read-modify-write（#169: 並行の変更を消さない）。無いキーは書かない
-        orchestrator::ProjectsConfig::mutate(|config| {
+        orchestrator::ProjectsConfig::mutate_typed(|config| {
             let entry = config.projects.get_mut(&key)?;
             for name in &servers {
                 let present = entry.mcp_servers.iter().any(|s| s == name);
@@ -15249,7 +15251,7 @@ pub fn dispatch_orchestrator_projects_mcp(
             entry.mcp_servers.sort();
             Some(config.clone())
         })
-        .map_err(DispatchError::Operation)?
+        .map_err(ConfigError::operation)?
         .ok_or_else(|| Reason::ProjectNotFound(key.clone()).operation())?
     };
     let cwd = config
@@ -15373,8 +15375,8 @@ fn dispatch_orchestrator_adopt(
 
     // 対象の解決: ① 既存プロファイル → ② projects.yaml のキー（その場で生成）→ ③ エラー
     let target_path = orchestrator::ProfileKind::Master
-        .path(name)
-        .map_err(DispatchError::InvalidParams)?;
+        .path_typed(name)
+        .map_err(ConfigError::invalid)?;
     let mut generated = ProfileGenReport::none();
     if !target_path.is_file() {
         let known_project = orchestrator::ProjectsConfig::load()
@@ -15401,7 +15403,7 @@ fn dispatch_orchestrator_adopt(
         }
         generated = ProfileGenReport::of(&gen);
     }
-    let target = orchestrator::Profile::load(name).map_err(DispatchError::Operation)?;
+    let target = orchestrator::Profile::load_typed(name).map_err(ConfigError::operation)?;
 
     let decision = orchestrator::decide_adopt(
         orchestrator::RunningMaster {
@@ -15773,29 +15775,31 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
     use crate::orchestrator;
     // 種別（master / solo）。省略時は従来どおり master（完全後方互換。#721）
     let kind = match params.kind.as_deref() {
-        Some(k) => orchestrator::ProfileKind::parse(k).map_err(DispatchError::InvalidParams)?,
+        Some(k) => orchestrator::ProfileKind::parse_typed(k).map_err(ConfigError::invalid)?,
         None => orchestrator::ProfileKind::Master,
     };
     match params.action.as_str() {
         "list" => {
-            let names = orchestrator::list_profiles_of(kind).map_err(DispatchError::Operation)?;
+            let names =
+                orchestrator::list_profiles_of_typed(kind).map_err(ConfigError::operation)?;
             let profiles: Vec<Value> = names
                 .iter()
-                .map(|n| match orchestrator::load_profile_of(kind, n) {
+                .map(|n| match orchestrator::load_profile_of_typed(kind, n) {
                     Ok(p) => profile_to_json(kind, n, &p),
                     // 壊れた yaml も一覧から隠さない（直し方は error 文言に入っている）。
-                    // default に丸めて表示すると「壊れていない」と誤認させる
-                    Err(e) => json!({ "name": n, "kind": kind.as_str(), "error": e }),
+                    // default に丸めて表示すると「壊れていない」と誤認させる。
+                    // 文は断りと同じ表示言語（#2365）
+                    Err(e) => json!({ "name": n, "kind": kind.as_str(), "error": e.to_string() }),
                 })
                 .collect();
             Ok(json!({ "kind": kind.as_str(), "profiles": profiles }))
         }
         "show" => {
             let name = params.name.as_deref().unwrap_or("default");
-            let profile = match orchestrator::load_profile_of(kind, name) {
+            let profile = match orchestrator::load_profile_of_typed(kind, name) {
                 Ok(p) => p,
                 Err(_) if name == "default" => kind.default_profile(),
-                Err(e) => return Err(DispatchError::Operation(e)),
+                Err(e) => return Err(e.operation()),
             };
             Ok(profile_to_json(kind, name, &profile))
         }
@@ -15803,8 +15807,8 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             let name = params
                 .name
                 .ok_or_else(|| Reason::Missing("name".into()).invalid())?;
-            let (path, profile) = orchestrator::create_profile_of(kind, &name, None)
-                .map_err(DispatchError::Operation)?;
+            let (path, profile) = orchestrator::create_profile_of_typed(kind, &name, None)
+                .map_err(ConfigError::operation)?;
             let mut result = profile_to_json(kind, &name, &profile);
             result["path"] = json!(path.display().to_string());
             result["created"] = json!(true);
@@ -15818,9 +15822,9 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                 .from
                 .ok_or_else(|| Reason::CopyFromMissing.invalid())?;
             let base =
-                orchestrator::load_profile_of(kind, &from).map_err(DispatchError::Operation)?;
-            let (path, profile) = orchestrator::create_profile_of(kind, &name, Some(base))
-                .map_err(DispatchError::Operation)?;
+                orchestrator::load_profile_of_typed(kind, &from).map_err(ConfigError::operation)?;
+            let (path, profile) = orchestrator::create_profile_of_typed(kind, &name, Some(base))
+                .map_err(ConfigError::operation)?;
             let mut result = profile_to_json(kind, &name, &profile);
             result["path"] = json!(path.display().to_string());
             result["copied_from"] = json!(from);
@@ -15830,8 +15834,8 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             let name = params
                 .name
                 .ok_or_else(|| Reason::Missing("name".into()).invalid())?;
-            let path =
-                orchestrator::delete_profile_of(kind, &name).map_err(DispatchError::Operation)?;
+            let path = orchestrator::delete_profile_of_typed(kind, &name)
+                .map_err(ConfigError::operation)?;
             Ok(json!({
                 "kind": kind.as_str(),
                 "name": name,
@@ -15867,14 +15871,14 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             }
             // エージェント名は設定時点で検証する（spawn / master 起動時の不意のエラーを防ぐ）
             if let Some(a) = params.worker_agent.as_deref() {
-                orchestrator::WorkerAgent::parse(a).map_err(DispatchError::InvalidParams)?;
+                orchestrator::WorkerAgent::parse_typed(a).map_err(ConfigError::invalid)?;
             }
             if let Some(a) = params.agent.as_deref() {
-                orchestrator::WorkerAgent::parse(a).map_err(DispatchError::InvalidParams)?;
+                orchestrator::WorkerAgent::parse_typed(a).map_err(ConfigError::invalid)?;
             }
             // master は claude / codex のみ（agy は非対応。#127）
             if let Some(a) = params.master_agent.as_deref() {
-                orchestrator::validate_master_agent(a).map_err(DispatchError::InvalidParams)?;
+                orchestrator::validate_master_agent_typed(a).map_err(ConfigError::invalid)?;
             }
             // worker_model_policy は mutate 閉包内から early return できないため事前に解析
             let policy = match params.worker_model_policy.as_deref() {
@@ -15903,8 +15907,8 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                             // 一時的に Profile で内部変数チェック
                             let mut tmp = orchestrator::Profile::default();
                             tmp.env.insert(k.to_string(), String::new());
-                            if let Err(e) = tmp.validate_env() {
-                                return Err(DispatchError::Operation(e));
+                            if let Err(e) = tmp.validate_env_typed() {
+                                return Err(e.operation());
                             }
                         }
                     }
@@ -15930,11 +15934,12 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     cwd: Some(raw.to_string()),
                     ..Default::default()
                 };
-                probe.resolve_cwd().map_err(DispatchError::InvalidParams)?;
+                probe.resolve_cwd_typed().map_err(ConfigError::invalid)?;
             }
             // #749: 閾値は範囲外を黙って丸めず、設定時点でエラーにする
             if let Some(v) = params.ctx_threshold {
-                tako_core::handoff::parse_ctx_threshold(v).map_err(DispatchError::InvalidParams)?;
+                tako_core::handoff::parse_ctx_threshold(v)
+                    .map_err(|_| ConfigError::CtxThresholdOutOfRange(v).invalid())?;
             }
             if params.ctx_threshold.is_some() && params.clear_ctx_threshold {
                 return Err(
@@ -15959,7 +15964,7 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
             let clear_cwd = params.clear_cwd;
             // ロック付き read-modify-write（#169）。パースできない既存プロファイルを
             // default に丸めて上書き保存すると設定が消えるため、Err で中断する
-            let (path, profile) = orchestrator::mutate_profile_of(kind, &name, |profile| {
+            let (path, profile) = orchestrator::mutate_profile_of_typed(kind, &name, |profile| {
                 if let Some(a) = params.master_agent {
                     profile.master_agent = Some(a);
                 } else if params.clear_master_agent {
@@ -16096,7 +16101,7 @@ pub fn dispatch_orchestrator_profiles(params: ProfilesParams) -> Result<Value, D
                     .retain(|_, c| *c != orchestrator::AgentWorkerConfig::default());
                 profile.clone()
             })
-            .map_err(DispatchError::Operation)?;
+            .map_err(ConfigError::operation)?;
             // 参照整合性の警告（[1m] モデル・未登録 project / アカウント）は
             // profile_to_json が profile_warnings から載せる（GUI / CLI / MCP 共通。#721）
             let mut result = profile_to_json(kind, &name, &profile);
@@ -17071,22 +17076,25 @@ pub fn dispatch_orchestrator_accounts(
     use crate::orchestrator;
     match action {
         "list" => {
-            let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
+            let config =
+                orchestrator::AccountsConfig::load_typed().map_err(ConfigError::operation)?;
             let accounts: Vec<Value> = config
-                .list_resolved()
+                .list_resolved_typed()
                 .into_iter()
                 .map(|(name, resolved)| match resolved {
                     Ok(a) => account_json(&a),
-                    // 壊れたエントリも隠さず出す（直し方は error 文言に入っている）
-                    Err(e) => json!({ "name": name, "error": e }),
+                    // 壊れたエントリも隠さず出す（直し方は error 文言に入っている。
+                    // 文は断りと同じ表示言語 = #2365）
+                    Err(e) => json!({ "name": name, "error": e.to_string() }),
                 })
                 .collect();
             Ok(json!({ "accounts": accounts }))
         }
         "show" => {
             let name = name.ok_or_else(|| Reason::Missing("name".into()).invalid())?;
-            let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
-            let a = config.resolve(name).map_err(DispatchError::Operation)?;
+            let config =
+                orchestrator::AccountsConfig::load_typed().map_err(ConfigError::operation)?;
+            let a = config.resolve_typed(name).map_err(ConfigError::operation)?;
             Ok(account_json(&a))
         }
         "add" => {
@@ -17122,12 +17130,13 @@ pub fn dispatch_orchestrator_accounts(
                 default_model: default_model.map(str::to_string),
                 default_effort: default_effort.map(str::to_string),
             };
-            orchestrator::AccountsConfig::mutate(|config| {
+            orchestrator::AccountsConfig::mutate_typed(|config| {
                 config.accounts.insert(name.to_string(), entry);
             })
-            .map_err(DispatchError::Operation)?;
-            let config = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
-            let a = config.resolve(name).map_err(DispatchError::Operation)?;
+            .map_err(ConfigError::operation)?;
+            let config =
+                orchestrator::AccountsConfig::load_typed().map_err(ConfigError::operation)?;
+            let a = config.resolve_typed(name).map_err(ConfigError::operation)?;
             let mut result = account_json(&a);
             if let Some(w) = warning {
                 result["warning"] = json!(w);
@@ -17136,10 +17145,10 @@ pub fn dispatch_orchestrator_accounts(
         }
         "remove" => {
             let name = name.ok_or_else(|| Reason::Missing("name".into()).invalid())?;
-            let removed = orchestrator::AccountsConfig::mutate(|config| {
+            let removed = orchestrator::AccountsConfig::mutate_typed(|config| {
                 config.accounts.remove(name).is_some()
             })
-            .map_err(DispatchError::Operation)?;
+            .map_err(ConfigError::operation)?;
             if removed {
                 Ok(json!({ "removed": name }))
             } else {
@@ -18160,15 +18169,17 @@ fn dispatch_orchestrator_handoff(
         .operation());
     }
     // env 検証（内部変数の上書き拒否。Issue #500）
-    profile.validate_env().map_err(DispatchError::Operation)?;
+    profile
+        .validate_env_typed()
+        .map_err(ConfigError::operation)?;
     // 引き継ぎ先の master も master_account を反映する（#547。CLI の master 起動と同じ規則）
     let profile_env = profile
-        .resolved_env_plan_for_master()
-        .map_err(DispatchError::Operation)?;
+        .resolved_env_plan_for_master_typed()
+        .map_err(ConfigError::operation)?;
 
     let master_agent = profile
-        .resolve_master_agent()
-        .map_err(DispatchError::InvalidParams)?;
+        .resolve_master_agent_typed()
+        .map_err(ConfigError::invalid)?;
     // #983: 後任 master の CLI が無ければ**ペインを分割する前に**落とす
     // （引き継ぎで後任が黙って死ぬと、前任を閉じる主体そのものが居なくなる）
     // #1984: 所在の確認は UI スレッドの dispatch では先取りした答えを読む
@@ -18207,7 +18218,7 @@ fn dispatch_orchestrator_handoff(
     // 「同プロファイル / 同アカウント / 同モデル / 同 effort で立て直す」という引き継ぎの
     // 約束に cwd も含める。プロファイルの cwd が壊れていたら**ペインを分割する前に**落とす
     // （存在しないフォルダで spawn すると後任が起動できず、前任を閉じる主体が居なくなる）
-    let profile_cwd = profile.resolve_cwd().map_err(|e| {
+    let profile_cwd = profile.resolve_cwd_typed().map_err(|e| {
         Reason::ProfileCwdBroken {
             error: e.to_string(),
             profile: profile_name.to_string(),
@@ -18401,11 +18412,13 @@ fn dispatch_git_resolve_agent(
         &None,
         CONFLICT_RESOLVER_LABEL,
     );
-    profile.validate_env().map_err(DispatchError::Operation)?;
+    profile
+        .validate_env_typed()
+        .map_err(ConfigError::operation)?;
     let profile_env = profile.resolved_env_plan();
     let worker_agent = profile
-        .resolve_worker_agent(agent)
-        .map_err(DispatchError::InvalidParams)?;
+        .resolve_worker_agent_typed(agent)
+        .map_err(ConfigError::invalid)?;
     // #983: CLI が無ければ**ペインを作る前に**落とす（作ってから流すと
     // ペインに `command not found` が出るだけで、tako は成功と報告してしまう）。
     // 所在の確認は UI スレッドの dispatch では先取りを読む（#1989）
@@ -18896,10 +18909,10 @@ fn dispatch_orchestrator_spawn(
 
     use crate::orchestrator;
 
-    let config = orchestrator::ProjectsConfig::load().map_err(DispatchError::Operation)?;
+    let config = orchestrator::ProjectsConfig::load_typed().map_err(ConfigError::operation)?;
     let cwd = config
-        .resolve_cwd(project)
-        .map_err(DispatchError::Operation)?;
+        .resolve_cwd_typed(project)
+        .map_err(ConfigError::operation)?;
 
     // エージェント種別と model / effort を解決する（#120）。明示指定 → プロファイル。
     // agent=claude は従来の worker_model_policy 解決を維持し、model が None に解決された
@@ -18933,16 +18946,19 @@ fn dispatch_orchestrator_spawn(
     }
 
     // Part 1: env 検証（内部変数の上書き拒否。Issue #500）
-    profile.validate_env().map_err(DispatchError::Operation)?;
+    profile
+        .validate_env_typed()
+        .map_err(ConfigError::operation)?;
 
     // #504: アカウント解決（spawn 指定 > worker_account > master_account）
     let account_name = profile.resolve_worker_account_name(account);
     let resolved_account = if let Some(acct_name) = account_name {
-        let accounts = orchestrator::AccountsConfig::load().map_err(DispatchError::Operation)?;
+        let accounts =
+            orchestrator::AccountsConfig::load_typed().map_err(ConfigError::operation)?;
         Some(
             accounts
-                .resolve(acct_name)
-                .map_err(DispatchError::Operation)?,
+                .resolve_typed(acct_name)
+                .map_err(ConfigError::operation)?,
         )
     } else {
         None
@@ -18950,8 +18966,8 @@ fn dispatch_orchestrator_spawn(
     let profile_env = profile.resolved_env_plan_with_account(resolved_account.as_ref());
 
     let worker_agent = profile
-        .resolve_worker_agent(agent)
-        .map_err(DispatchError::InvalidParams)?;
+        .resolve_worker_agent_typed(agent)
+        .map_err(ConfigError::invalid)?;
     // #983: agent CLI の実在検査。**ペイン分割・レジストリ登録より前**に落とすので、
     // 失敗しても空ペインも active エントリも残らない（不正 agent の検証と同じ位置）。
     // 無ければ「理由 + 次の一手」を返す（無言死を作らない）
@@ -42882,10 +42898,11 @@ mod tests {
         }
         // legacy ではプロファイルが無いまま = 採用の対象を解決できない
         let err = res.expect_err("legacy で採用が通った");
+        // 理由の文は表示言語に従う（#2365。プロファイルの「見つからない」も日英の両方を読む）
         assert!(
             format!("{err:?}").contains("プロファイルでもプロジェクトでもない")
                 || format!("{err:?}").contains("neither a profile nor a project")
-                || format!("{err:?}").contains("見つからない"),
+                || DispatchError::says_not_found(&format!("{err:?}")),
             "{err:?}"
         );
         assert_eq!(
@@ -44280,7 +44297,12 @@ mod tests {
                 ..Default::default()
             })
             .expect_err("範囲外は拒否する");
-            assert!(err.to_string().contains("50〜60"), "{err}");
+            // 理由の文は表示言語に従う（#2365）
+            let text = err.to_string();
+            assert!(
+                text.contains("50〜60") || text.contains("between 50 and 60"),
+                "{err}"
+            );
         }
     }
 
