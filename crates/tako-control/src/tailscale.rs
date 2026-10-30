@@ -100,14 +100,36 @@ pub fn detect_tailscale() -> Detection {
     let probe = |c: &str| probe_candidate(c, TAILSCALE_TIMEOUT);
     match std::env::var("TAKO_TAILSCALE_BIN") {
         // 明示指定は候補探索をせず、その名前 / パスだけを試す
-        Ok(bin) => pick_candidate(&[bin.as_str()], login_shell_lookup, probe),
-        Err(_) => pick_candidate(TAILSCALE_CANDIDATES, login_shell_lookup, probe),
+        Ok(bin) => pick_candidate(
+            &[bin.as_str()],
+            process_path_lookup,
+            login_shell_lookup,
+            probe,
+        ),
+        Err(_) => pick_candidate(
+            TAILSCALE_CANDIDATES,
+            process_path_lookup,
+            login_shell_lookup,
+            probe,
+        ),
     }
 }
 
 /// tailscale CLI のパスを解決する（remote が使う = 実行できるものだけ）
 pub fn find_tailscale() -> Option<String> {
     detect_tailscale().into_runnable()
+}
+
+/// A/B: #2513 前へ戻す（素の名前の候補をこのプロセスの PATH で引かず、素の名前のまま持つ）。
+/// 立てると remote daemon が 30 秒ごとに PATH の空振りを繰り返す = Issue の症状の起点
+pub const ISSUE2513_LEGACY_ENV: &str = "TAKO_2513_LEGACY";
+
+/// 素の名前をこのプロセスの PATH で絶対パスへ引く（#2513。境界 B16 の 1 実装）
+fn process_path_lookup(name: &str) -> Option<String> {
+    if std::env::var(ISSUE2513_LEGACY_ENV).is_ok_and(|v| v == "1") {
+        return None;
+    }
+    tako_core::platform::exe::find_in_process_path(name)
 }
 
 /// 素の名前をログインシェルの PATH で引く（#1816。待ちは `exe::find_bounded` の上限つきの 1 実装）
@@ -127,18 +149,35 @@ fn is_bare_name(candidate: &str) -> bool {
 /// 起こした痩せた PATH では、MacPorts / nix の置き場がプロセスの PATH に無い。固定の候補で
 /// 見つかる人 = App Store 版・brew 版にはログインシェルを起こさない）。
 /// それでも動く CLI が無ければ「在るが動かない」先頭の候補を返し、それも無ければ、
-/// ログインシェルを打ち切ったときは [`Detection::Unconfirmed`]・答えが出たときは [`Detection::Absent`]
+/// ログインシェルを打ち切ったときは [`Detection::Unconfirmed`]・答えが出たときは [`Detection::Absent`]。
+///
+/// 素の名前の候補は `resolve`（このプロセスの PATH）で**絶対パスへ引いてから**試し、答えにも
+/// その絶対パスを載せる（#2513）。素の名前のまま持つと、答えを握る remote daemon が 30 秒ごとの
+/// serve の監視で PATH の空振りを繰り返す。daemon は install をまたいで生き残るので、自分の
+/// 実行ファイルが差し替えで消えた後は空振り 1 回ごとに AppleSystemPolicy の拒否が出る
+/// （実測: 1 周期 2 回 × PATH の手前 11 エントリ = 22 本 / 31 秒）。引けなければ素の名前のまま
+/// 試す（従来と同じ答え）。同じ置き場は 2 度試さない（上限 10 秒を 2 度待たない）
 fn pick_candidate(
     candidates: &[&str],
+    mut resolve: impl FnMut(&str) -> Option<String>,
     mut lookup: impl FnMut(&str) -> tako_core::platform::exe::BoundedFind,
     mut probe: impl FnMut(&str) -> CandidateProbe,
 ) -> Detection {
     let mut unrunnable = None;
+    let mut tried: Vec<String> = Vec::new();
     for candidate in candidates {
-        match probe(candidate) {
-            CandidateProbe::Runnable => return Detection::Runnable(candidate.to_string()),
+        let target = is_bare_name(candidate)
+            .then(|| resolve(candidate))
+            .flatten()
+            .unwrap_or_else(|| candidate.to_string());
+        if tried.contains(&target) {
+            continue;
+        }
+        tried.push(target.clone());
+        match probe(&target) {
+            CandidateProbe::Runnable => return Detection::Runnable(target),
             CandidateProbe::Unrunnable => {
-                unrunnable.get_or_insert_with(|| candidate.to_string());
+                unrunnable.get_or_insert(target);
             }
             CandidateProbe::Absent => {}
         }
@@ -149,8 +188,8 @@ fn pick_candidate(
         if let Some(notice) = found.timeout {
             timeout.get_or_insert(notice);
         }
-        // 固定の候補で既に試した置き場は試し直さない（brew の置き場がログインシェルの PATH にもある等）
-        let Some(path) = found.path.filter(|p| !candidates.contains(&p.as_str())) else {
+        // 既に試した置き場は試し直さない（brew の置き場がログインシェルの PATH にもある等）
+        let Some(path) = found.path.filter(|p| !tried.contains(p)) else {
             continue;
         };
         match probe(&path) {
@@ -1273,6 +1312,16 @@ mod tests {
     fn pick_with(
         results: &[(&'static str, CandidateProbe)],
         extra: &[(&'static str, CandidateProbe)],
+        lookup: impl FnMut(&str) -> tako_core::platform::exe::BoundedFind,
+    ) -> (Detection, Vec<String>, Vec<String>) {
+        pick_resolving(results, extra, |_| None, lookup)
+    }
+
+    /// [`pick_with`] の、このプロセスの PATH での引き方（#2513）まで差し替える版
+    fn pick_resolving(
+        results: &[(&'static str, CandidateProbe)],
+        extra: &[(&'static str, CandidateProbe)],
+        resolve: impl FnMut(&str) -> Option<String>,
         mut lookup: impl FnMut(&str) -> tako_core::platform::exe::BoundedFind,
     ) -> (Detection, Vec<String>, Vec<String>) {
         let candidates: Vec<&str> = results.iter().map(|(c, _)| *c).collect();
@@ -1280,6 +1329,7 @@ mod tests {
         let mut looked_up = Vec::new();
         let detection = pick_candidate(
             &candidates,
+            resolve,
             |name| {
                 looked_up.push(name.to_string());
                 lookup(name)
@@ -1414,6 +1464,69 @@ mod tests {
         });
         assert_eq!(detection, Detection::Absent);
         assert!(looked_up.is_empty());
+    }
+
+    /// #2513: 素の名前の候補はこのプロセスの PATH で引いた**絶対パスで試し、絶対パスで持つ**。
+    /// 素の名前を probe にも答えにも渡さない（渡すと remote daemon の監視が PATH の空振りを繰り返す）
+    #[test]
+    fn 素の名前はこのプロセスのpathで引いた絶対パスで試して持つ() {
+        use CandidateProbe::*;
+        let (detection, tried, looked_up) = pick_resolving(
+            &[
+                ("tailscale", Absent),
+                (
+                    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                    Runnable,
+                ),
+            ],
+            &[("/usr/x/bin/tailscale", Runnable)],
+            |name| (name == "tailscale").then(|| "/usr/x/bin/tailscale".to_string()),
+            |_| panic!("PATH で見つかったのにログインシェルを引いた"),
+        );
+        assert_eq!(
+            detection,
+            Detection::Runnable("/usr/x/bin/tailscale".into())
+        );
+        assert_eq!(tried, vec!["/usr/x/bin/tailscale".to_string()]);
+        assert!(looked_up.is_empty());
+    }
+
+    /// #2513: このプロセスの PATH で引けない（Windows・PATH に無い）ときは素の名前のまま試す = 従来と同じ答え
+    #[test]
+    fn 素の名前が引けなければ素の名前のまま試す() {
+        use CandidateProbe::*;
+        let (detection, tried, _) = pick_resolving(
+            &[("tailscale", Runnable)],
+            &[],
+            |_| None,
+            |_| panic!("見つかったのにログインシェルを引いた"),
+        );
+        assert_eq!(detection, Detection::Runnable("tailscale".into()));
+        assert_eq!(tried, vec!["tailscale".to_string()]);
+    }
+
+    /// #2513: PATH で引いた置き場が固定の候補と同じなら試し直さない（固まる CLI の上限 10 秒を 2 度待たない）
+    #[test]
+    fn pathで引いた置き場が固定の候補と同じなら試し直さない() {
+        use CandidateProbe::*;
+        let (detection, tried, _) = pick_resolving(
+            &[
+                ("tailscale", Absent),
+                ("/opt/homebrew/bin/tailscale", Unrunnable),
+            ],
+            &[],
+            |_| Some("/opt/homebrew/bin/tailscale".to_string()),
+            |_| found_at("/opt/homebrew/bin/tailscale"),
+        );
+        assert_eq!(
+            detection,
+            Detection::Unrunnable("/opt/homebrew/bin/tailscale".into())
+        );
+        assert_eq!(
+            tried,
+            vec!["/opt/homebrew/bin/tailscale".to_string()],
+            "同じ置き場を 2 度試した"
+        );
     }
 
     /// 機械可読の 1 語は 4 通り（`check_status` の tailscale 項目の `status`。#1816）
