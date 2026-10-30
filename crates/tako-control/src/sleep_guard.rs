@@ -996,14 +996,20 @@ pub fn prepare_lid_control_typed() -> Result<String, OsRefusal> {
 /// 蓋閉じ継続の後始末（#697）。macOS は sudoers 削除 + `disablesleep 0`、
 /// Windows は倒してある lid action を元へ戻す
 pub fn teardown_lid_control() -> Result<String, String> {
+    teardown_lid_control_typed().map_err(OsRefusal::into_ja)
+}
+
+/// [`teardown_lid_control`] の型の口（#2365。枠と中身 = `platform::lid` の断りを同じ言語で組む）。
+/// `Ok` の文（解除の結果の説明）は日本語のまま
+pub fn teardown_lid_control_typed() -> Result<String, OsRefusal> {
     #[cfg(target_os = "macos")]
     {
-        remove_sudoers()
+        remove_sudoers_typed()
     }
     #[cfg(not(target_os = "macos"))]
     {
         // tako が動いていない状態で叩かれても、その場で元へ戻せるようにする
-        crate::platform::lid::set_stay_awake(false, false)
+        crate::platform::lid::set_stay_awake_typed(false, false)
             .map(|changed| {
                 if changed {
                     "蓋閉じ継続を解除し、電源プランの設定を元へ戻しました".to_string()
@@ -1011,7 +1017,7 @@ pub fn teardown_lid_control() -> Result<String, String> {
                     "蓋閉じ継続は有効化されていません（解除不要）".to_string()
                 }
             })
-            .map_err(|e| format!("蓋閉じ継続の解除に失敗: {e}"))
+            .map_err(OsRefusal::LidTeardownFailed)
     }
 }
 
@@ -1070,6 +1076,11 @@ echo 'OK: sudoers 登録完了'
 
 /// osascript 経由で sudoers.d から削除 + disablesleep 0
 pub fn remove_sudoers() -> Result<String, String> {
+    remove_sudoers_typed().map_err(OsRefusal::into_ja)
+}
+
+/// [`remove_sudoers`] の型の口（#2365）。`Ok` の文は日本語のまま
+pub fn remove_sudoers_typed() -> Result<String, OsRefusal> {
     if !is_sudoers_installed() {
         return Ok("sudoers は未登録です（削除不要）".to_string());
     }
@@ -1086,7 +1097,7 @@ echo 'OK: sudoers 削除完了・disablesleep 解除'
     let output = std::process::Command::new("osascript")
         .args(["-e", &script])
         .output()
-        .map_err(|e| format!("osascript の実行に失敗: {e}"))?;
+        .map_err(|e| OsRefusal::OsascriptFailed(e.to_string()))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1094,12 +1105,13 @@ echo 'OK: sudoers 削除完了・disablesleep 解除'
     if output.status.success() {
         Ok(stdout)
     } else if stderr.contains("User canceled") || stderr.contains("(-128)") {
-        Err("ユーザーがキャンセルしました".to_string())
+        Err(OsRefusal::UserCanceled)
     } else {
-        Err(format!(
-            "sudoers 削除に失敗: {}",
-            if stderr.is_empty() { &stdout } else { &stderr }
-        ))
+        Err(OsRefusal::SudoersRemoveFailed(if stderr.is_empty() {
+            stdout
+        } else {
+            stderr
+        }))
     }
 }
 
@@ -1497,17 +1509,23 @@ pub fn check_disablesleep_residual() {
 
 /// System Settings の Battery 設定画面を開く（フォールバック用）
 pub fn open_battery_settings() -> Result<(), String> {
+    open_battery_settings_typed().map_err(OsRefusal::into_ja)
+}
+
+/// [`open_battery_settings`] の型の口（#2365。枠と中身 = `os_integration::open_url` の断りを
+/// 同じ言語で組む）
+pub fn open_battery_settings_typed() -> Result<(), OsRefusal> {
     #[cfg(target_os = "macos")]
     {
-        crate::platform::os_integration::open_url(
+        crate::platform::os_integration::open_url_typed(
             "x-apple.systempreferences:com.apple.preference.battery",
         )
-        .map_err(|e| format!("System Settings を開けません: {e}"))?;
+        .map_err(OsRefusal::BatterySettingsUnopenable)?;
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Err("macOS 以外では非対応".to_string())
+        Err(OsRefusal::BatterySettingsMacOnly)
     }
 }
 

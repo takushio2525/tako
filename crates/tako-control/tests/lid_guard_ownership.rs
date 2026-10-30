@@ -4,13 +4,18 @@
 //! 振る舞いそのものは `platform::lid` の単体テストが見ている（macOS でも走る純粋判定）。
 //! ここが見るのは**構造**で、次の 3 つが崩れたら file:line で名指しする:
 //!
-//! 1. 記録は `config_io::atomic_write` で書く（`fs::write` の truncate → write の窓を作らない）
+//! 1. 記録は `config_io::atomic_write`（の型の口 `atomic_write_typed`）で書く（`fs::write` の
+//!    truncate → write の窓を作らない）
 //! 2. 記録を読めなかったら「記録なし」へ丸めず退避 + エラー（丸めると倒した 0 を
 //!    元値として書き戻し、ユーザーの蓋設定が永久に失われる = #1373 の症状 2）
 //! 3. 元値へ戻す（`restore`）のは、所有権を確かめてロックの下に居る経路だけ
 //!    （他インスタンスの上書きを奪って戻すのが #1373 の症状 1 = macOS の #449 と同型）
 //!
 //! Windows 実機が無くても崩れを検出できるよう、**ソースの構造**で見る。
+//!
+//! #2365 で断りを型（`LidError`）で返すようにしたので、本体は型の口（`set_stay_awake_typed` /
+//! `try_clear_residual`）にあり、`String` を返す従来の口（`set_stay_awake` / `clear_residual`）は
+//! そこへ委ねるだけ。検査は本体の側を見て、従来の口が本体を通ることも見る
 
 use std::path::{Path, PathBuf};
 
@@ -109,7 +114,7 @@ fn 記録の書き込みは原子書き込みを通る() {
     assert_goes_through(
         product(&text),
         "store_saved_at",
-        "config_io::atomic_write(",
+        "config_io::atomic_write_typed(",
         "並行プロセスの読み手に空 / 部分ファイルを見せないため。",
     );
 }
@@ -148,7 +153,7 @@ fn 書く経路はロックの下で読み直す() {
     assert_goes_through(
         text,
         "with_record",
-        "config_io::lock_exclusive(",
+        "config_io::lock_exclusive_typed(",
         "read-modify-write をプロセス間で直列化するため。",
     );
     assert_goes_through(
@@ -157,12 +162,24 @@ fn 書く経路はロックの下で読み直す() {
         "read_from(",
         "ロックを取ったあとはディスクが正（写しは他プロセスの書き込みを知らない）。",
     );
-    for entry in ["set_stay_awake", "clear_residual"] {
+    for entry in ["set_stay_awake_typed", "try_clear_residual"] {
         assert_goes_through(
             text,
             entry,
             "with_record(",
             "記録を書き換えるならロックの下に居ること。",
+        );
+    }
+    // `String` を返す従来の口は本体（型の口）へ委ねるだけ（#2365。自前で記録に触らない）
+    for (entry, body) in [
+        ("set_stay_awake", "set_stay_awake_typed("),
+        ("clear_residual", "try_clear_residual("),
+    ] {
+        assert_goes_through(
+            text,
+            entry,
+            body,
+            "断りの文の言語だけが違う 2 つの口で、記録の扱いを 2 本にしないため。",
         );
     }
 }
@@ -179,23 +196,23 @@ fn 解除は所有権を確かめてから行う() {
 
     // 毎 tick の入口が実行するのは `decide` が返した操作だけ。
     // ここが記録の出所を見ずに `restore` を呼んでいたのが #1373 の症状 1
-    let (line, body) = body_of(text, "set_stay_awake");
+    let (line, body) = body_of(text, "set_stay_awake_typed");
     for direct in ["restore(&", "restore(cur", "acquire(wanted"] {
         assert!(
             !body.contains(direct),
-            "{SRC}:{line}: fn set_stay_awake が所有権の判定を通さずに `{direct}` を呼んでいる\
+            "{SRC}:{line}: fn set_stay_awake_typed が所有権の判定を通さずに `{direct}` を呼んでいる\
              （`decide` を通すこと。#1373）"
         );
     }
     assert_goes_through(
         text,
-        "set_stay_awake",
+        "set_stay_awake_typed",
         "decide(",
         "「誰の記録か」の判定を 1 か所（decide）に留めるため。",
     );
     assert_goes_through(
         text,
-        "clear_residual",
+        "try_clear_residual",
         "may_touch(",
         "起動時の残留復元も、生きた所有者の記録は奪わない。",
     );

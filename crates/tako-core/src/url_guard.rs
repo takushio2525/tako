@@ -36,14 +36,26 @@ pub enum UrlBlocked {
 }
 
 impl UrlBlocked {
-    /// 診断ログ・エラー文へ載せる短い理由（**URL は含まない**）
+    /// 診断ログ・エラー文へ載せる短い理由（**URL は含まない**）。日本語
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::NoScheme => "スキームが無い",
-            Self::DriveLetter => "スキームではなくドライブレター",
-            Self::Scheme => "許可していないスキーム",
-            Self::ControlChar => "制御文字入り",
-            Self::NoHost => "ホスト部が無い",
+        self.text_in(crate::i18n::Lang::Ja)
+    }
+
+    /// 表示言語を明示しての理由（#2365。境界 B8 の断り `OsIntegrationError::UrlBlocked` が
+    /// 包みと同じ言語で引く）。(種類, 言語) の網羅 match で、日本語は [`Self::as_str`] の文
+    pub fn text_in(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NoScheme, Ja) => "スキームが無い",
+            (Self::NoScheme, En) => "no scheme",
+            (Self::DriveLetter, Ja) => "スキームではなくドライブレター",
+            (Self::DriveLetter, En) => "a drive letter, not a scheme",
+            (Self::Scheme, Ja) => "許可していないスキーム",
+            (Self::Scheme, En) => "a scheme that is not allowed",
+            (Self::ControlChar, Ja) => "制御文字入り",
+            (Self::ControlChar, En) => "contains control characters",
+            (Self::NoHost, Ja) => "ホスト部が無い",
+            (Self::NoHost, En) => "no host",
         }
     }
 }

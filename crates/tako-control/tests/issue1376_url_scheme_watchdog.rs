@@ -136,19 +136,36 @@ fn 提案チップの経路がスキーム検査を通っている() {
 }
 
 /// 3: 境界 B8 の保険。`open_url` / `open_url_wait` の**両方**が検査を通り、
-/// 判定は tako-core の 1 実装を呼ぶだけであること（B8 側に規則を書き写さない）
+/// 判定は tako-core の 1 実装を呼ぶだけであること（B8 側に規則を書き写さない）。
+///
+/// #2365 で断りを型で返す口（`*_typed`）を足したので、検査はその本体に置き、`String` の口は
+/// 型の口へ委ねるだけ（`imp::` を直に呼ばない）であることも見る
 #[test]
 fn 境界b8がスキーム検査を通っている() {
-    for signature in [
-        "\npub fn open_url(url: &str) -> Result<(), String> {",
-        "\npub fn open_url_wait(url: &str) -> Result<(), String> {",
+    for (signature, typed, typed_call) in [
+        (
+            "\npub fn open_url(url: &str) -> Result<(), String> {",
+            "\npub fn open_url_typed(url: &str) -> Result<(), OsIntegrationError> {",
+            "open_url_typed(url)",
+        ),
+        (
+            "\npub fn open_url_wait(url: &str) -> Result<(), String> {",
+            "\nfn open_url_wait_typed(url: &str) -> Result<(), OsIntegrationError> {",
+            "open_url_wait_typed(url)",
+        ),
     ] {
-        let (line, body) = fn_body(B8, signature);
+        let (line, body) = fn_body(B8, typed);
         assert!(
             body.contains("guarded_url(url)?"),
             "{B8}:{line}: 境界 B8 が検査（`guarded_url`）を通さずに OS のハンドラへ渡している。\n\
              経路側（#1376 の (a)）を 1 行外されても穴にならないための保険なので、\n\
              ここも必ず通してください:\n{body}"
+        );
+        let (line, body) = fn_body(B8, signature);
+        assert!(
+            body.contains(typed_call) && !body.contains("imp::"),
+            "{B8}:{line}: `String` の口が検査つきの型の口（`{typed_call}`）を通さずに OS のハンドラへ \
+             渡している（#1376 / #2365）:\n{body}"
         );
     }
 
