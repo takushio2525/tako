@@ -1583,7 +1583,10 @@ mod tests {
     fn 起こさなかった素の名前もログインシェルで引き直す() {
         use CandidateProbe::*;
         let (detection, tried, looked_up) = pick_resolving(
-            &[("tailscale", Runnable), ("/opt/homebrew/bin/tailscale", Absent)],
+            &[
+                ("tailscale", Runnable),
+                ("/opt/homebrew/bin/tailscale", Absent),
+            ],
             &[("/opt/local/bin/tailscale", Runnable)],
             |_| None,
             false,
@@ -1601,7 +1604,10 @@ mod tests {
 
         // ログインシェルにも無ければ「無い」（素の名前を起こした修正前と同じ答え）
         let (detection, tried, _) = pick_resolving(
-            &[("tailscale", Runnable), ("/opt/homebrew/bin/tailscale", Absent)],
+            &[
+                ("tailscale", Runnable),
+                ("/opt/homebrew/bin/tailscale", Absent),
+            ],
             &[],
             |_| None,
             false,

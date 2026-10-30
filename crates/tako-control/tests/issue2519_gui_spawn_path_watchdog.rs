@@ -83,7 +83,10 @@ const PERIODIC: &[(&str, &str, &str, &str)] = &[
 /// remote daemon の稼働中に毎回通る口（ファイル・関数）。ここに載せた関数は素の名前のリテラルで
 /// 子を起こしてはならない（tailscale は検出の正本 `detect_tailscale` が引いた場所で起こす）
 const REMOTE_REFRESH: &[(&str, &str)] = &[
-    ("crates/tako-app/src/remote_panel.rs", "refresh_remote_state"),
+    (
+        "crates/tako-app/src/remote_panel.rs",
+        "refresh_remote_state",
+    ),
     ("crates/tako-control/src/remote.rs", "daemon_status"),
     ("crates/tako-control/src/remote.rs", "admin_request"),
     ("crates/tako-control/src/tailscale.rs", "survey_variants"),
@@ -91,7 +94,10 @@ const REMOTE_REFRESH: &[(&str, &str)] = &[
     ("crates/tako-control/src/tailscale.rs", "detect_tailscale"),
     ("crates/tako-control/src/tailscale.rs", "pick_candidate"),
     ("crates/tako-control/src/tailscale.rs", "probe_candidate"),
-    ("crates/tako-control/src/tailscale.rs", "run_tailscale_within"),
+    (
+        "crates/tako-control/src/tailscale.rs",
+        "run_tailscale_within",
+    ),
 ];
 
 /// 6 の名指し先（検出の正本の候補の選び方）
@@ -595,8 +601,7 @@ fn 旧挙動は素の名前のまま持つ() {
 #[cfg(unix)]
 fn pick_candidate_location() -> String {
     let src = read(TAILSCALE);
-    let (at, _) =
-        fn_window(&src, "pick_candidate").expect("tailscale.rs に pick_candidate が在る");
+    let (at, _) = fn_window(&src, "pick_candidate").expect("tailscale.rs に pick_candidate が在る");
     format!("{TAILSCALE}:{at}")
 }
 
