@@ -409,7 +409,13 @@ impl TakoApp {
                 }
                 let result = cx
                     .background_executor()
-                    .spawn(async { tako_control::remote::spawn_daemon() })
+                    .spawn(async {
+                        // #2533: audit.log に「自動復帰が頼んだ」と残す
+                        tako_control::remote::with_origin(
+                            tako_control::remote::RequestOrigin::Autostart,
+                            tako_control::remote::spawn_daemon,
+                        )
+                    })
                     .await;
                 let err = match result {
                     Ok(info) => {
@@ -535,7 +541,13 @@ impl TakoApp {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { tako_control::remote::spawn_daemon() })
+                .spawn(async move {
+                    // #2533: audit.log に「リモートカードのボタンが頼んだ」と残す
+                    tako_control::remote::with_origin(
+                        tako_control::remote::RequestOrigin::Panel,
+                        tako_control::remote::spawn_daemon,
+                    )
+                })
                 .await;
             let _ = this.update(cx, |app, cx| {
                 app.remote.starting = false;
@@ -694,7 +706,12 @@ impl TakoApp {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { tako_control::remote::daemon_stop() })
+                .spawn(async move {
+                    tako_control::remote::with_origin(
+                        tako_control::remote::RequestOrigin::Panel,
+                        tako_control::remote::daemon_stop,
+                    )
+                })
                 .await;
             let _ = this.update(cx, |app, cx| {
                 app.remote.stopping = false;

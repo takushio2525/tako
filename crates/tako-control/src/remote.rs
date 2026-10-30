@@ -380,6 +380,148 @@ fn audit_serve(event: &str, extra: serde_json::Value) {
     );
 }
 
+// --- 停止・起動の要求元（#2533） ---------------------------------------------
+// install も GUI の再起動もしていない時刻に daemon が止められて起こし直され、audit.log には
+// **畳んだ daemon 自身の pid しか**残っていなかった（誰が頼んだのか追えない）。
+// 頼んだ側が「誰が・どの経路で」を自分で 1 行残し、daemon 側は管理 API の接続元を OS から
+// 引いて残す。両方の行は頼んだ側の pid で突き合わせられる
+
+/// daemon の停止・起動を頼んだ経路（#2533）。呼び手が [`with_origin`] で名乗る
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestOrigin {
+    /// `tako remote start` / `stop`（CLI のプロセスが自分で呼ぶ）
+    Cli,
+    /// GUI の dispatch（MCP `tako_remote_*`・CLI からの IPC・設定画面のボタン）
+    Dispatch,
+    /// GUI のリモートカードの起動 / 停止ボタン
+    Panel,
+    /// GUI 起動時の自動復帰（#1485。旧版の入れ替え #2518 もここから起きる）
+    Autostart,
+}
+
+impl RequestOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Dispatch => "dispatch",
+            Self::Panel => "panel",
+            Self::Autostart => "autostart",
+        }
+    }
+}
+
+/// 経路を名乗らなかった呼び出しの記録値（#2533 以後の呼び手で、[`with_origin`] の外）
+const ORIGIN_UNSPECIFIED: &str = "unspecified";
+
+/// 停止の要求で daemon へ経路を名乗るヘッダ（#2533。旧い daemon は読まずに捨てる）
+const REQUESTER_VIA_HEADER: &str = "x-tako-requester-via";
+
+thread_local! {
+    static REQUEST_ORIGIN: std::cell::Cell<Option<RequestOrigin>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `f` の間、このスレッドからの停止・起動の要求に経路を名乗らせる（#2533）。
+///
+/// `spawn_daemon` / `daemon_stop` のシグネチャを変えずに経路を渡すための口（番犬が
+/// シグネチャで縛っている = #1485 / #1599 / #2518）。名乗らない呼び出しは `unspecified` と
+/// 記録されるだけで、動作は変わらない
+pub fn with_origin<T>(origin: RequestOrigin, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<RequestOrigin>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REQUEST_ORIGIN.with(|o| o.set(self.0));
+        }
+    }
+    let _restore = Restore(REQUEST_ORIGIN.with(|o| o.replace(Some(origin))));
+    f()
+}
+
+/// いまのスレッドが名乗っている経路
+fn current_origin_str() -> &'static str {
+    REQUEST_ORIGIN
+        .with(|o| o.get())
+        .map_or(ORIGIN_UNSPECIFIED, RequestOrigin::as_str)
+}
+
+/// 名乗りを記録の値へ（既知の値だけ写す。ヘッダは管理トークンを持つ者しか送れないが、
+/// 任意の文字列を監査ログへ流し込ませない）
+fn origin_label(raw: &str) -> Option<&'static str> {
+    [
+        RequestOrigin::Cli,
+        RequestOrigin::Dispatch,
+        RequestOrigin::Panel,
+        RequestOrigin::Autostart,
+    ]
+    .into_iter()
+    .map(RequestOrigin::as_str)
+    .chain([ORIGIN_UNSPECIFIED])
+    .find(|label| *label == raw.trim())
+}
+
+/// 祖先を何段まで残すか（#2533）。CLI ← スクリプト ← シェル ← エージェント ← シェル ← 器、まで届く深さ
+const REQUESTER_ANCESTRY_DEPTH: usize = 6;
+
+/// 祖先を記録の形へ（`"<pid> <名前>"` を近い順に。名前は起動時の名前で、パスは載せない）
+fn ancestry_json(pid: u32) -> Value {
+    json!(
+        tako_core::platform::procinfo::ancestry(pid, REQUESTER_ANCESTRY_DEPTH)
+            .iter()
+            .map(|a| format!("{} {}", a.pid, a.name))
+            .collect::<Vec<_>>()
+    )
+}
+
+/// 頼んだ側が自分のことを audit.log へ 1 行残す（#2533）。pid と実行ファイルは
+/// [`crate::remote_auth::append_audit`] が載せる。
+///
+/// **残すのは識別だけ**: 経路・操作・相手の pid・ペイン番号・隔離の有無・祖先の名前。
+/// トークン・env の値・コマンドライン・パスは載せない（FR-6.8）
+fn audit_daemon_request(event: &str, op: &str, target_pid: Option<u32>) {
+    let pane = std::env::var("TAKO_PANE_ID")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let isolated =
+        tako_core::tmux_cleanup::is_isolated_value(std::env::var("TAKO_ISOLATED").ok().as_deref());
+    audit_serve(
+        event,
+        json!({
+            "via": current_origin_str(),
+            "op": op,
+            "target_pid": target_pid,
+            "pane": pane,
+            "isolated": isolated,
+            "ancestry": ancestry_json(std::process::id()),
+        }),
+    );
+}
+
+/// PID ファイルに記録された daemon の pid（停止を頼む相手。無ければ `None`）
+fn recorded_daemon_pid() -> Option<u32> {
+    parse_pid_file().ok().map(|info| info.pid)
+}
+
+/// 管理 API で停止を頼んできた相手（#2533。daemon 側の記録）。
+///
+/// pid は**名乗りではなく OS から**引く（ループバック TCP の接続元 = #1452 と同じ 1 実装）。
+/// UDS・引けない OS では `null`。経路だけはヘッダの名乗りを既知の値に限って写す
+/// （#2533 より前の呼び手はヘッダを送らないので `null`）
+fn shutdown_requester(
+    endpoint: &local_endpoint::Endpoint,
+    peer: Option<std::net::SocketAddr>,
+    via: Option<&str>,
+) -> Value {
+    let pid = crate::remote_role::admin_peer_pid(endpoint, peer);
+    json!({
+        "via": via.and_then(origin_label),
+        "pid": pid,
+        "exe": pid
+            .and_then(tako_core::platform::procinfo::image_path)
+            .map(|p| p.display().to_string()),
+        "ancestry": pid.map(ancestry_json),
+    })
+}
+
 /// 実 tailscale を叩く [`crate::remote_serve::ServeOps`]。
 /// **どの tailscaled へ話すかを handle に固定する**のが #1049 の要点。
 /// 固定した相手が公開したノードのままかは毎周期確かめる（[`Self::refresh_handle`]）
@@ -2917,11 +3059,14 @@ fn parse_etime(s: &str) -> Option<u64> {
 /// P0-4: PID + 実行ファイル + 起動時刻を照合し、無関係プロセスを kill しない。
 /// PID ファイルが無い場合はポート占有者を探して stale デーモンなら回収する
 pub fn daemon_stop() -> Result<Value, String> {
+    // #2533: 誰が・どの経路で止めたかを、止める前に残す
+    audit_daemon_request("daemon_stop_requested", "stop", recorded_daemon_pid());
     forget_if_stopped(daemon_stop_impl(false))
 }
 
 /// `--force` 付き停止。SIGTERM を試みた後 SIGKILL を送る
 pub fn daemon_force_stop() -> Result<Value, String> {
+    audit_daemon_request("daemon_stop_requested", "force_stop", recorded_daemon_pid());
     forget_if_stopped(daemon_stop_impl(true))
 }
 
@@ -3253,9 +3398,11 @@ fn send_admin_shutdown(
 
 /// shutdown の要求を送って応答全体を返す（#1599 / #2455 の 1 実装）
 fn post_admin_shutdown(endpoint: &local_endpoint::Endpoint, token: &str) -> Result<String, String> {
+    // #2533: 経路を名乗る（daemon は接続元の pid と合わせて `daemon_shutdown_requested` へ残す）
+    let via = current_origin_str();
     let request = format!(
         "POST {ADMIN_SHUTDOWN_PATH} HTTP/1.1\r\nHost: localhost\r\nX-Tako-Admin: {token}\r\n\
-         Content-Length: 0\r\nConnection: close\r\n\r\n"
+         X-Tako-Requester-Via: {via}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     local_endpoint::request_raw(endpoint, &request, Some(ADMIN_SHUTDOWN_TIMEOUT))
         .map_err(|e| format!("daemon へ届かない ({}): {e}", endpoint.describe()))
@@ -3449,6 +3596,9 @@ fn serve_binary_impl(
 /// Tailscale 未セットアップ時は子プロセスが不足項目を stderr に出して終了するため、
 /// その内容がこの関数の Err に載る（#282: `tako remote setup` への誘導）
 pub fn spawn_daemon() -> Result<Value, String> {
+    // #2533: 誰が・どの経路で起こしたかを残す（初回の起動では置き場がまだ無いので作っておく）
+    let _ = ensure_state_dir();
+    audit_daemon_request("daemon_start_requested", "start", None);
     // 既に起動中か確認
     let status = daemon_status();
     let mut renewed_from: Option<u32> = None;
@@ -3613,6 +3763,8 @@ pub fn spawn_daemon() -> Result<Value, String> {
 /// 旧版は動いたまま残る（起こし直せないのに止めて、動いていた daemon まで失わない）
 fn stop_stale_generation(status: &Value) -> Result<u32, String> {
     let pid = status["pid"].as_u64().unwrap_or(0) as u32;
+    // #2533: 入れ替えの停止も「誰が頼んだか」を残す（経路は起動を頼んだ呼び手のもの）
+    audit_daemon_request("daemon_stop_requested", "renew", Some(pid));
     let stopped = daemon_stop_impl(false);
     if daemon_status()["running"].as_bool() == Some(true) {
         let why = match stopped {
@@ -5778,8 +5930,20 @@ fn handle_admin_api(
         // 正体を確かめた pid の daemon か」を突き合わせてから終了を待つ
         (tiny_http::Method::Post, ADMIN_SHUTDOWN_PATH) => {
             ctx.shutdown.store(true, Ordering::Relaxed);
+            // #2533: 誰が頼んだかを残す。接続元は応答を返す前（接続が生きている間）に引く。
+            // この行の pid / exe は畳む daemon 自身なので、頼んだ側は `requester` に分けて載せる
+            let requester = shutdown_requester(
+                &ctx.endpoint,
+                peer,
+                header_value(&request, REQUESTER_VIA_HEADER).as_deref(),
+            );
             if let Ok(reg) = ctx.registry.lock() {
-                reg.audit("daemon_shutdown_requested", "", "", json!({}));
+                reg.audit(
+                    "daemon_shutdown_requested",
+                    "",
+                    "",
+                    json!({ "requester": requester }),
+                );
             }
             respond(
                 request,
@@ -10037,6 +10201,197 @@ mod tests {
 
         handle.join().expect("サーバースレッド");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// audit.log から `event` の行を順に読む（#2533）
+    fn audit_events(dir: &std::path::Path, event: &str) -> Vec<Value> {
+        std::fs::read_to_string(crate::remote_auth::audit_log_path(dir))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["event"] == json!(event))
+            .collect()
+    }
+
+    /// #2533: 停止の受け口が、頼んできた相手を**接続元から**引いて `daemon_shutdown_requested` へ
+    /// 残す（#2533 以前は畳む daemon 自身の pid しか無かった）。このテストのプロセス自身が
+    /// 接続元なので、pid・実行ファイル・祖先は自分のものになる。経路の名乗りは既知の値だけ写し、
+    /// 名乗らない旧い呼び手・知らない値は `null`。管理トークンは載らない。
+    /// state ファイルにも env にも依らない（到達先とトークンを直に渡す）
+    #[test]
+    fn 停止の受け口は頼んだ相手を接続元から引いて残す() {
+        let dir = std::env::temp_dir().join(format!(
+            "tako-2533-requester-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        let registry = DeviceRegistry::open(&dir).expect("レジストリ");
+        let (server, endpoint) =
+            local_endpoint::bind(&local_endpoint::EndpointSpec::Loopback).expect("bind");
+        let ctx = Arc::new(DaemonCtx {
+            registry: Mutex::new(registry),
+            ts_cli: "tailscale".to_string(),
+            admin_token: "test-admin-token".to_string(),
+            tmux_socket: "tako-test-2533".to_string(),
+            ws_connections: Mutex::new(HashMap::new()),
+            base_url: "https://example.tail0000.ts.net".to_string(),
+            expected_host: "example.tail0000.ts.net".to_string(),
+            endpoint: endpoint.clone(),
+            peer_rejects: Mutex::new(PeerRejectState::default()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        });
+        let app_conn = Arc::new(RwLock::new(AppConnection::new()));
+        let pane_mapping = Arc::new(RwLock::new(PaneMapping::new()));
+        let broadcasters = new_broadcaster_map();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..3 {
+                match server.recv_timeout(std::time::Duration::from_secs(5)) {
+                    Ok(Some(req)) => {
+                        handle_request_v2(req, &ctx, &app_conn, &pane_mapping, &broadcasters)
+                    }
+                    _ => break,
+                }
+            }
+        });
+        let me = std::process::id();
+        // ① 経路を名乗る停止（#2533 以後の送り手 = 本物の `post_admin_shutdown`）
+        assert_eq!(
+            with_origin(RequestOrigin::Panel, || send_admin_shutdown(
+                &endpoint,
+                "test-admin-token",
+                me
+            )),
+            Ok(())
+        );
+        // ② 名乗らない旧い送り手（ヘッダなし）③ 知らない値を名乗る送り手
+        for extra in ["", "X-Tako-Requester-Via: evil\"}{\r\n"] {
+            let raw = format!(
+                "POST {ADMIN_SHUTDOWN_PATH} HTTP/1.1\r\nHost: localhost\r\n\
+                 X-Tako-Admin: test-admin-token\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let resp = local_endpoint::request_raw(
+                &endpoint,
+                &raw,
+                Some(std::time::Duration::from_secs(5)),
+            )
+            .expect("応答");
+            assert_eq!(shutdown_acceptor_pid(&resp), Ok(me), "{resp}");
+        }
+        handle.join().expect("サーバースレッド");
+
+        let rows = audit_events(&dir, "daemon_shutdown_requested");
+        assert_eq!(rows.len(), 3, "{rows:#?}");
+        let vias: Vec<Value> = rows.iter().map(|r| r["requester"]["via"].clone()).collect();
+        assert_eq!(vias, vec![json!("panel"), Value::Null, Value::Null]);
+        // 接続元を OS から引ける OS（#841 の `loopback_tcp_peer`）では、頼んだのは自分
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            // 比べるのは名前（パスの表記は OS の API ごとに揺れる: /private の付け方・verbatim）
+            let name_of = |p: &std::path::Path| p.file_name().map(|n| n.to_owned());
+            let exe = std::env::current_exe().expect("自分の実行ファイル");
+            for row in &rows {
+                let who = &row["requester"];
+                assert_eq!(who["pid"], json!(me), "{row}");
+                assert_eq!(
+                    who["exe"]
+                        .as_str()
+                        .and_then(|p| name_of(std::path::Path::new(p))),
+                    name_of(&exe),
+                    "{row}"
+                );
+                let ancestry = who["ancestry"].as_array().expect("祖先が配列でない");
+                assert!(!ancestry.is_empty(), "祖先が空: {row}");
+            }
+        }
+        let raw = std::fs::read_to_string(crate::remote_auth::audit_log_path(&dir)).unwrap();
+        assert!(
+            !raw.contains("test-admin-token"),
+            "管理トークンが記録された"
+        );
+        assert!(!raw.contains("evil"), "知らない名乗りがそのまま記録された");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2533: 頼む側（`daemon_stop` / `spawn_daemon` の入口）は、動く前に自分のことを 1 行残す。
+    /// 経路（`with_origin`）・ペイン番号・祖先が載り、名乗らなければ `unspecified`。
+    /// 止める相手が居なくても「頼んだ」ことは残る（10/30 の入れ替えはこの行が無くて追えなかった）
+    #[test]
+    fn 頼んだ側は経路とペインと祖先を残す() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(頼んだ側は経路とペインと祖先を残す) {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("tako-2533-req-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("一時ディレクトリ");
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        std::env::set_var("TAKO_PANE_ID", "4242");
+
+        // daemon は居ない（PID ファイルも無い）= 止められないが、頼んだことは残る
+        assert!(with_origin(RequestOrigin::Cli, daemon_stop).is_err());
+        // 名乗らない呼び手
+        audit_daemon_request("daemon_start_requested", "start", None);
+
+        let stops = audit_events(&dir, "daemon_stop_requested");
+        assert_eq!(stops.len(), 1, "{stops:#?}");
+        let row = &stops[0];
+        assert_eq!(row["via"], json!("cli"));
+        assert_eq!(row["op"], json!("stop"));
+        assert_eq!(row["pane"], json!(4242));
+        assert_eq!(row["target_pid"], Value::Null);
+        assert_eq!(row["pid"], json!(std::process::id()));
+        #[cfg(any(target_os = "macos", windows))]
+        assert!(
+            row["ancestry"].as_array().is_some_and(|a| !a.is_empty()),
+            "祖先が空: {row}"
+        );
+        let starts = audit_events(&dir, "daemon_start_requested");
+        assert_eq!(starts.len(), 1, "{starts:#?}");
+        assert_eq!(starts[0]["via"], json!(ORIGIN_UNSPECIFIED));
+
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        std::env::remove_var("TAKO_PANE_ID");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2533: 経路の名乗りは抜けると元へ戻る（入れ子・panic でも）。名乗りの読み取りは既知の値だけ
+    #[test]
+    fn 経路の名乗りは抜けると元へ戻り既知の値だけを写す() {
+        assert_eq!(current_origin_str(), ORIGIN_UNSPECIFIED);
+        with_origin(RequestOrigin::Autostart, || {
+            assert_eq!(current_origin_str(), "autostart");
+            with_origin(RequestOrigin::Panel, || {
+                assert_eq!(current_origin_str(), "panel")
+            });
+            assert_eq!(current_origin_str(), "autostart");
+        });
+        assert_eq!(current_origin_str(), ORIGIN_UNSPECIFIED);
+        let caught = std::panic::catch_unwind(|| {
+            with_origin(RequestOrigin::Dispatch, || {
+                panic!("#2533 の注入: 名乗りの途中で落ちる")
+            })
+        });
+        assert!(caught.is_err());
+        assert_eq!(
+            current_origin_str(),
+            ORIGIN_UNSPECIFIED,
+            "panic で名乗りが残った"
+        );
+
+        for (raw, want) in [
+            ("cli", Some("cli")),
+            (" dispatch ", Some("dispatch")),
+            ("panel", Some("panel")),
+            ("autostart", Some("autostart")),
+            ("unspecified", Some("unspecified")),
+            ("CLI", None),
+            ("evil\"}{", None),
+            ("", None),
+        ] {
+            assert_eq!(origin_label(raw), want, "{raw:?}");
+        }
     }
 
     /// **#2455 の前提を実際の受け口で固定する**: PID ファイルが無いときの手掛かりは

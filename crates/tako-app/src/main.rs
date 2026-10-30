@@ -28604,12 +28604,15 @@ impl PreviewHost for TakoApp {
 }
 
 impl RemoteHost for TakoApp {
+    // #2533: dispatch（MCP・CLI からの IPC・設定画面）から頼んだことを audit.log に残す
     fn remote_start(&mut self) -> Result<serde_json::Value, String> {
-        tako_control::remote::spawn_daemon()
+        use tako_control::remote::{with_origin, RequestOrigin};
+        with_origin(RequestOrigin::Dispatch, tako_control::remote::spawn_daemon)
     }
 
     fn remote_stop(&mut self) -> Result<serde_json::Value, String> {
-        tako_control::remote::daemon_stop()
+        use tako_control::remote::{with_origin, RequestOrigin};
+        with_origin(RequestOrigin::Dispatch, tako_control::remote::daemon_stop)
     }
 
     fn remote_status(&self) -> serde_json::Value {
