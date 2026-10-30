@@ -162,11 +162,13 @@ pub use preview_cache::{
     preview_cache_bytes, PreviewCacheStats, PreviewPaneMemory, PREVIEW_CACHE_DEFAULT_MB,
     PREVIEW_CACHE_MAX_MB, PREVIEW_CACHE_MIN_MB,
 };
-pub use preview_outline::{PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget};
+pub use preview_outline::{
+    OutlineRefusal, PreviewOutline, PreviewOutlineItem, PreviewOutlineTarget,
+};
 pub use preview_reload::PreviewReloadState;
 pub use preview_view::{
-    PreviewViewState, PreviewViewUpdate, PreviewZoomCommand, PREVIEW_ZOOM_MAX, PREVIEW_ZOOM_MIN,
-    PREVIEW_ZOOM_STEP,
+    PreviewViewState, PreviewViewUpdate, PreviewZoomCommand, ViewRefusal, PREVIEW_ZOOM_MAX,
+    PREVIEW_ZOOM_MIN, PREVIEW_ZOOM_STEP,
 };
 pub use runner::{
     builtin_defaults, builtin_defaults_for, expand_variables, merged_defaults, merged_defaults_for,

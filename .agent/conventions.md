@@ -329,7 +329,7 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   英語に ` not found` を含む。**中身が他モジュールの文の断りは枠だけ移さない**（混ざるため）: 更新の口
   （`update_apply` / `apply_zip` / `repair` = `update_checker::CheckError` ほか）・`remote_start` / `stop`
   （`remote.rs`）・tako-core の文（`open_plan` の行の丸め・`PreviewViewState::apply`・アウトライン・
-  `preview_limit` の編集の断り・`mouse_forward`）・`webview.rs` の生成の理由は Issue #2365 の表の残り。
+  `preview_limit` の編集の断り・`mouse_forward`）・`webview.rs` の生成の理由は Issue #2365 の表の残り（更新の口と tako-core の文はのちに移した = 下の項）。
   番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（`HostRefusal` の表と、GUI のソースを読んで
   日本語の断りの書き足しを `file:line` で名指す `HOST_IMPL_SCOPES`。診断の出力 = `eprintln!` / persist.log と
   まだ移していない断片 `HOST_DEFERRED` は外し、断片がソースから消えたら表から外すよう落とす）
@@ -350,6 +350,29 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `.ok_or(` の中の日本語を名指す `SESSION_OS_REFUSAL_SCOPES`・dispatch が日本語の口を呼んでいないか
   `JA_SESSION_OS_CALLS`）、実経路は `tests/issue2365_sessions_os_lang.rs`（unix。カタログ・置き場を一時の
   場所へ向けて GUI 無しのホストへ dispatch を日英で通す。OS の設定を本当に変える操作は叩かない）
+- #2365 の続きで、**更新の口**（CLI / MCP `tako update apply` / `apply-zip` / `repair` と GUI の更新画面）と、
+  **tako-core の文を GUI がそのまま返していた 5 系統**・**変更履歴の取得の打ち切り**を移した。更新の口は枠
+  （「更新チェックに失敗」「<チャンネル>の新しいバージョンが見つからない」）と中身（確認の失敗
+  `update_checker::CheckError` = 中身も `NetworkCause` / `ParseCause` のバリアント・brew / zip / 再起動の断り・
+  Windows の `installer_update::InstallerError`）を 1 本で `update_checker::UpdateRefusal`（網羅 match）へ寄せ、
+  GUI の口は `update_checker::update_target(channel)?` を呼ぶだけ（枠の組み立てを main.rs に置かない）。
+  成功の `message`（Homebrew / ZIP / インストーラー / 修復）は `UpdateNote`、`update check` の
+  `rate_limit_note` と残り時間（旧 `ui_text::update::eta_*`）は言語を引数で受ける `rate_limit_note_in` /
+  `reset_eta_in`。`perform_update` / `perform_update_zip` / `repair_brew` / `restart_app` は `String` を返す口の
+  ままで、文は組んだその場の表示言語（型で受けるなら `repair_brew_typed`）。zip へ切り替える印
+  `[zip-fallback-available]`（`ZIP_FALLBACK_MARK`）は日英で同じ。`bundle_install::replace_bundle_in_place` の文は
+  枠を持たずにそのまま出す（`UpdateRefusal::BundleReplace`。日英は Issue #2365 の残り）。tako-core の 5 系統は
+  `open_plan::PlanRefusal`（行・桁の 1 始まり = 旧 `LINE_ONE_BASED` / `COLUMN_ONE_BASED` の定数は消した・
+  行を持たない種別）・`ViewRefusal`（ズーム / ページ / パン）・`OutlineRefusal`・`Truncation::edit_refusal_in`
+  （`to_json_in` の `limit.message` も同じ文）・`mouse_forward::ClickRefusal`（渡さない理由・表せない座標・
+  器へ問い合わせられない。どの文も理由の語を含む）で、各口は型で返し、`String` の口へは
+  `From<_> for String`（その場の表示言語）で `?` のまま載る。dispatch の行・桁の検査と CLI の前段
+  （`tako open --line 0`）も同じ `PlanRefusal`（CLI は `front_err` と同じ解決）。変更履歴の打ち切りは
+  `git::HistoryTimedOut::text_in`（段の名前と上限の env は日英どちらにも入る）。文言で判定していた
+  `scripts/test-changelog-expand-2150.sh`（H / M）と `scripts/test-open-line-1676.sh` は日英どちらの形とも
+  突き合わせる。番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（tako-core の 6 型の表と、
+  断りの組み立てに日本語の固定文を書き足していないかを見る `UPDATE_CORE_SCOPES`）と、更新の口の型の表は
+  tako-app の `update_checker::tests::更新の口の断りは全バリアントが日英を持ち日本語は2365より前と一致`
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

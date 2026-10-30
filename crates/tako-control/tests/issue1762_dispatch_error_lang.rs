@@ -8015,20 +8015,10 @@ const HOST_INTERNAL_CALLS: [&str; 6] = [
 
 /// まだ移していない断りと、断りではない応答の注記（文の断片, 理由）。**断片がソースから消えたら
 /// ここから外す**（下の番犬が「古い」と落とす = 表が縮む方向にしか動かない）
-const HOST_DEFERRED: [(&str, &str); 3] = [
-    (
-        "更新チェックに失敗",
-        "更新の口（update_apply / apply_zip / repair）は中身の update_checker::CheckError ほかと 1 本で移す（Issue #2365 の表）",
-    ),
-    (
-        "の新しいバージョンが見つからない（既に最新版です）",
-        "同上（更新の口）",
-    ),
-    (
-        "結果は action=eval_result で回収",
-        "web_eval の成功の応答の注記（断りではない）",
-    ),
-];
+const HOST_DEFERRED: [(&str, &str); 1] = [(
+    "結果は action=eval_result で回収",
+    "web_eval の成功の応答の注記（断りではない）",
+)];
 
 /// `start..` の範囲（頭と同じ字下げの `}` まで）。tako-app のソースは途中に `#[cfg(test)] mod` の
 /// 宣言を持つので、[`front_scope_lines`] の「単体テストの前まで」の切り方は使わない
@@ -8809,4 +8799,549 @@ fn 会話とosの設定の番犬の境界() {
         .map(|(l, _, _)| l)
         .collect();
     assert_eq!(found, vec![3, 6], "日本語の口の 2 か所だけを名指す");
+}
+
+// ---- #2365 の続き: 更新の口（tako-app の `update_checker`）と、tako-core の文を GUI がそのまま返す 5 系統
+// （`open_plan` の行・桁・行指定 = `PlanRefusal`・`PreviewViewState::apply` = `ViewRefusal`・
+// `PreviewOutline::target` = `OutlineRefusal`・`preview_limit::Truncation::edit_refusal`・`mouse_forward` の
+// クリック = `ClickRefusal`）と、変更履歴の取得の打ち切り（`git::HistoryTimedOut`） ----
+//
+// 以前は GUI（と dispatch）がこれらの日本語の固定文をそのまま返していた。日英の対は各型の `text_in` の
+// 網羅 match に置き、`Display` / `From<_> for String` は組んだその場の表示言語。更新の口の型
+// （`UpdateRefusal` / `UpdateNote` / `CheckError` / `InstallerError`）は tako-app（バイナリ）にあるので、
+// 表の検査は tako-app の単体テスト（`update_checker::tests::更新の口の断りは全バリアントが日英を持ち…`）が
+// 持ち、ここでは (1) tako-core の型の全バリアントの日英と旧文のバイト一致、(2) 断りの組み立て（`Err(` /
+// `.map_err(` / `.ok_or(`）に日本語の固定文を書き足していないことを `file:line` で名指す
+
+use tako_core::git::HistoryTimedOut;
+use tako_core::mouse_forward::{ClickRefusal, Encoding, TakoReason};
+use tako_core::open_plan::{PlanRefusal, PreviewRoute};
+use tako_core::{OutlineRefusal, ViewRefusal};
+
+const OPEN_PLAN_SRC: &str = include_str!("../../tako-core/src/open_plan.rs");
+const OPEN_PLAN_PATH: &str = "crates/tako-core/src/open_plan.rs";
+const PREVIEW_VIEW_SRC: &str = include_str!("../../tako-core/src/preview_view.rs");
+const PREVIEW_VIEW_PATH: &str = "crates/tako-core/src/preview_view.rs";
+const PREVIEW_OUTLINE_SRC: &str = include_str!("../../tako-core/src/preview_outline.rs");
+const PREVIEW_OUTLINE_PATH: &str = "crates/tako-core/src/preview_outline.rs";
+const PREVIEW_LIMIT_SRC: &str = include_str!("../../tako-core/src/preview_limit.rs");
+const PREVIEW_LIMIT_PATH: &str = "crates/tako-core/src/preview_limit.rs";
+const MOUSE_FORWARD_SRC: &str = include_str!("../../tako-core/src/mouse_forward.rs");
+const MOUSE_FORWARD_PATH: &str = "crates/tako-core/src/mouse_forward.rs";
+const GIT_SRC: &str = include_str!("../../tako-core/src/git.rs");
+const GIT_PATH: &str = "crates/tako-core/src/git.rs";
+const UPDATE_CHECKER_SRC: &str = include_str!("../../tako-app/src/update_checker.rs");
+const UPDATE_CHECKER_PATH: &str = "crates/tako-app/src/update_checker.rs";
+const INSTALLER_UPDATE_SRC: &str = include_str!("../../tako-app/src/platform/installer_update.rs");
+const INSTALLER_UPDATE_PATH: &str = "crates/tako-app/src/platform/installer_update.rs";
+
+/// 通し番号（網羅 match = バリアントを足すと見本の表を足すまでここが E0004 で落ちる）
+fn plan_refusal_index(r: &PlanRefusal) -> usize {
+    match r {
+        PlanRefusal::LineNotOneBased => 0,
+        PlanRefusal::ColumnNotOneBased => 1,
+        PlanRefusal::NoLinesIn(_) => 2,
+    }
+}
+const PLAN_REFUSAL_VARIANTS: usize = 3;
+
+fn view_refusal_index(r: &ViewRefusal) -> usize {
+    match r {
+        ViewRefusal::ZoomOutOfRange => 0,
+        ViewRefusal::PageZero => 1,
+        ViewRefusal::PanNotFinite => 2,
+    }
+}
+const VIEW_REFUSAL_VARIANTS: usize = 3;
+
+fn outline_refusal_index(r: &OutlineRefusal) -> usize {
+    match r {
+        OutlineRefusal::ItemZero => 0,
+        OutlineRefusal::OutOfRange { .. } => 1,
+    }
+}
+const OUTLINE_REFUSAL_VARIANTS: usize = 2;
+
+fn click_refusal_index(r: &ClickRefusal) -> usize {
+    match r {
+        ClickRefusal::NotForwarded(_) => 0,
+        ClickRefusal::Unrepresentable { .. } => 1,
+        ClickRefusal::ContainerUnresolved => 2,
+    }
+}
+const CLICK_REFUSAL_VARIANTS: usize = 3;
+
+fn truncation_index(t: &Truncation) -> usize {
+    match t {
+        Truncation::Bytes { .. } => 0,
+        Truncation::Lines { .. } => 1,
+    }
+}
+const TRUNCATION_VARIANTS: usize = 2;
+
+/// 見本と #2365 より前の日本語（旧実装の固定文を同じ値で組んだ文）
+fn plan_refusal_table() -> Vec<(PlanRefusal, &'static str)> {
+    vec![
+        (
+            PlanRefusal::LineNotOneBased,
+            "行番号は 1 始まり（0 以下は指定できない）",
+        ),
+        (
+            PlanRefusal::ColumnNotOneBased,
+            "桁番号は 1 始まり（0 以下は指定できない）",
+        ),
+        (
+            PlanRefusal::NoLinesIn(PreviewRoute::Image),
+            "行を指定して開けるのはテキスト（code / markdown）だけ: image",
+        ),
+        (
+            PlanRefusal::NoLinesIn(PreviewRoute::Pdf),
+            "行を指定して開けるのはテキスト（code / markdown）だけ: pdf",
+        ),
+    ]
+}
+
+fn view_refusal_table() -> Vec<(ViewRefusal, &'static str)> {
+    vec![
+        (
+            ViewRefusal::ZoomOutOfRange,
+            "ズーム倍率は 25%〜400% の範囲で指定する",
+        ),
+        (ViewRefusal::PageZero, "ページは 1 以上で指定する"),
+        (ViewRefusal::PanNotFinite, "パン量は有限の数で指定する"),
+    ]
+}
+
+fn outline_refusal_table() -> Vec<(OutlineRefusal, &'static str)> {
+    vec![
+        (
+            OutlineRefusal::ItemZero,
+            "アウトライン項目は 1 以上で指定する",
+        ),
+        (
+            OutlineRefusal::OutOfRange { item: 9, total: 3 },
+            "アウトライン項目の範囲外: 9（全 3 件）",
+        ),
+    ]
+}
+
+fn click_refusal_table() -> Vec<(ClickRefusal, &'static str)> {
+    vec![
+        (
+            ClickRefusal::NotForwarded(TakoReason::NotRequested),
+            "このペインのアプリはマウス報告を要求していない（not_requested）。シェル・less 等へのクリックは意味を持たないので渡さない",
+        ),
+        (
+            ClickRefusal::NotForwarded(TakoReason::CopyMode),
+            "器のペインが copy mode 中（copy_mode）。渡すと copy mode のキーとして解釈される",
+        ),
+        (
+            ClickRefusal::NotForwarded(TakoReason::Unresolved),
+            "クリックを渡せない（unresolved）",
+        ),
+        (
+            ClickRefusal::NotForwarded(TakoReason::Disabled),
+            "クリックを渡せない（disabled）",
+        ),
+        (
+            ClickRefusal::Unrepresentable {
+                row: 0,
+                col: 300,
+                encoding: Encoding::X10,
+            },
+            "座標 (row 0, col 300) は内側アプリの報告形式（X10）で表せない",
+        ),
+        (
+            ClickRefusal::ContainerUnresolved,
+            "器へ問い合わせられない（unresolved）",
+        ),
+    ]
+}
+
+fn truncation_refusal_table() -> Vec<(Truncation, &'static str)> {
+    vec![
+        (
+            Truncation::Bytes { size: 12_345_678 },
+            "大きさが上限を超えるため末尾を省略して表示しており、編集できない: 12.3 MB（上限 10 MB）",
+        ),
+        (
+            Truncation::Lines { lines: 100_001 },
+            "行数が上限を超えるため末尾を省略して表示しており、編集できない: 100,001 行（上限 100,000 行）",
+        ),
+    ]
+}
+
+const TIMED_OUT_OLD: &str = "変更履歴の取得を 3 秒で打ち切った（`git diff` が返らない。巨大なリポジトリ・ネットワーク上のフォルダ・ロック中の git を疑う。上限は env TAKO_CHANGELOG_GIT_TIMEOUT_SECS）";
+
+fn timed_out_sample() -> HistoryTimedOut {
+    HistoryTimedOut {
+        step: "diff",
+        budget: std::time::Duration::from_secs(3),
+    }
+}
+
+/// 1 行の検査（日本語は旧文とバイト一致・英語に日本語が無い・英語の書き忘れが無い・
+/// 「見つからない」の読みが日英でそろう）
+fn check_core_row(
+    failures: &mut Vec<String>,
+    at_ja: String,
+    at_en: String,
+    what: String,
+    old: &str,
+    ja: &str,
+    en: &str,
+) {
+    if ja != old {
+        failures.push(format!(
+            "{at_ja}: {what} の日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}"
+        ));
+    }
+    if let Some(c) = has_japanese(en) {
+        failures.push(format!(
+            "{at_en}: {what} の英語に日本語（{c}）が混ざる: {en}"
+        ));
+    }
+    if en.trim().is_empty() || ja == en {
+        failures.push(format!(
+            "{at_en}: {what} の英語が空か日本語と同じ文（英語の書き忘れ）: {en}"
+        ));
+    }
+    if E::says_not_found(ja) != E::says_not_found(en) {
+        failures.push(format!(
+            "{at_en}: {what} の「見つからない」の読みが日英で違う\n  ja: {ja}\n  en: {en}"
+        ));
+    }
+}
+
+#[test]
+fn 更新の口とcoreの文の断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let plan = plan_refusal_table();
+    covers_every(
+        &plan.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        plan_refusal_index,
+        PLAN_REFUSAL_VARIANTS,
+        "PlanRefusal",
+    );
+    let view = view_refusal_table();
+    covers_every(
+        &view.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        view_refusal_index,
+        VIEW_REFUSAL_VARIANTS,
+        "ViewRefusal",
+    );
+    let outline = outline_refusal_table();
+    covers_every(
+        &outline.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        outline_refusal_index,
+        OUTLINE_REFUSAL_VARIANTS,
+        "OutlineRefusal",
+    );
+    let click = click_refusal_table();
+    covers_every(
+        &click.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+        click_refusal_index,
+        CLICK_REFUSAL_VARIANTS,
+        "ClickRefusal",
+    );
+    let truncation = truncation_refusal_table();
+    covers_every(
+        &truncation.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        truncation_index,
+        TRUNCATION_VARIANTS,
+        "Truncation",
+    );
+
+    let mut failures = Vec::new();
+    let at = |src: &str, path: &str, from: &str, debug: String, lang: Lang| {
+        where_written(src, path, from, &debug, lang)
+    };
+    for (r, old) in plan {
+        let d = format!("{r:?}");
+        check_core_row(
+            &mut failures,
+            at(
+                OPEN_PLAN_SRC,
+                OPEN_PLAN_PATH,
+                "impl PlanRefusal {",
+                d.clone(),
+                Lang::Ja,
+            ),
+            at(
+                OPEN_PLAN_SRC,
+                OPEN_PLAN_PATH,
+                "impl PlanRefusal {",
+                d.clone(),
+                Lang::En,
+            ),
+            d,
+            old,
+            &r.text_in(Lang::Ja),
+            &r.text_in(Lang::En),
+        );
+    }
+    for (r, old) in view {
+        let d = format!("{r:?}");
+        check_core_row(
+            &mut failures,
+            at(
+                PREVIEW_VIEW_SRC,
+                PREVIEW_VIEW_PATH,
+                "impl ViewRefusal {",
+                d.clone(),
+                Lang::Ja,
+            ),
+            at(
+                PREVIEW_VIEW_SRC,
+                PREVIEW_VIEW_PATH,
+                "impl ViewRefusal {",
+                d.clone(),
+                Lang::En,
+            ),
+            d,
+            old,
+            &r.text_in(Lang::Ja),
+            &r.text_in(Lang::En),
+        );
+    }
+    for (r, old) in outline {
+        let d = format!("{r:?}");
+        check_core_row(
+            &mut failures,
+            at(
+                PREVIEW_OUTLINE_SRC,
+                PREVIEW_OUTLINE_PATH,
+                "impl OutlineRefusal {",
+                d.clone(),
+                Lang::Ja,
+            ),
+            at(
+                PREVIEW_OUTLINE_SRC,
+                PREVIEW_OUTLINE_PATH,
+                "impl OutlineRefusal {",
+                d.clone(),
+                Lang::En,
+            ),
+            d,
+            old,
+            &r.text_in(Lang::Ja),
+            &r.text_in(Lang::En),
+        );
+    }
+    for (r, old) in click {
+        let d = format!("{r:?}");
+        check_core_row(
+            &mut failures,
+            at(
+                MOUSE_FORWARD_SRC,
+                MOUSE_FORWARD_PATH,
+                "impl ClickRefusal {",
+                d.clone(),
+                Lang::Ja,
+            ),
+            at(
+                MOUSE_FORWARD_SRC,
+                MOUSE_FORWARD_PATH,
+                "impl ClickRefusal {",
+                d.clone(),
+                Lang::En,
+            ),
+            d,
+            old,
+            &r.text_in(Lang::Ja),
+            &r.text_in(Lang::En),
+        );
+        // 理由の語（`not_requested` ほか）は日英どちらにも入る（呼び手・検証が語で読む）
+        if let ClickRefusal::NotForwarded(reason) = r {
+            for lang in [Lang::Ja, Lang::En] {
+                let text = r.text_in(lang);
+                if !text.contains(reason.as_str()) {
+                    failures.push(format!(
+                        "{r:?} {lang:?}: 理由の語 {} が無い: {text}",
+                        reason.as_str()
+                    ));
+                }
+            }
+        }
+    }
+    for (t, old) in truncation {
+        let d = format!("{t:?}");
+        check_core_row(
+            &mut failures,
+            at(
+                PREVIEW_LIMIT_SRC,
+                PREVIEW_LIMIT_PATH,
+                "pub fn edit_refusal_in(",
+                d.clone(),
+                Lang::Ja,
+            ),
+            at(
+                PREVIEW_LIMIT_SRC,
+                PREVIEW_LIMIT_PATH,
+                "pub fn edit_refusal_in(",
+                d.clone(),
+                Lang::En,
+            ),
+            d,
+            old,
+            &t.edit_refusal_in(Lang::Ja),
+            &t.edit_refusal_in(Lang::En),
+        );
+        // `tako edit` の応答の `limit.message` も同じ言語の同じ文
+        if t.to_json_in(Lang::En)["message"] != t.edit_refusal_in(Lang::En).as_str() {
+            failures.push(format!(
+                "{t:?}: limit.message が edit_refusal_in(En) と違う"
+            ));
+        }
+    }
+    let timed = timed_out_sample();
+    let timed_at = format!(
+        "{GIT_PATH}:{}",
+        GIT_SRC
+            .lines()
+            .position(|l| l.contains("impl HistoryTimedOut {"))
+            .map_or(0, |i| i + 1)
+    );
+    check_core_row(
+        &mut failures,
+        timed_at.clone(),
+        timed_at,
+        "HistoryTimedOut".into(),
+        TIMED_OUT_OLD,
+        &timed.text_in(Lang::Ja),
+        &timed.text_in(Lang::En),
+    );
+    // 段の名前と上限の env は日英どちらにも入る（スクリプト・単体テストが読む）
+    for lang in [Lang::Ja, Lang::En] {
+        let text = timed.text_in(lang);
+        for needle in ["`git diff`", tako_core::git::CHANGELOG_TIMEOUT_ENV] {
+            if !text.contains(needle) {
+                failures.push(format!("HistoryTimedOut {lang:?}: {needle} が無い: {text}"));
+            }
+        }
+    }
+    report_all(failures);
+}
+
+/// 断りの組み立てに日本語の固定文を書き足してはいけない本体（日英の対は各型の `text_in` にだけ置く）。
+/// 更新の口は GUI の口（`impl SystemHost for TakoApp`）が委ねる先 = HOST_IMPL_SCOPES の外なのでここで見る
+const UPDATE_CORE_SCOPES: &[(&str, &str, Span)] = &[
+    (
+        OPEN_PLAN_PATH,
+        OPEN_PLAN_SRC,
+        Span::Item("pub fn preview_route_with_line("),
+    ),
+    (
+        OPEN_PLAN_PATH,
+        OPEN_PLAN_SRC,
+        Span::Item("pub fn clamp_line("),
+    ),
+    (
+        OPEN_PLAN_PATH,
+        OPEN_PLAN_SRC,
+        Span::Item("pub fn clamp_column("),
+    ),
+    (
+        PREVIEW_VIEW_PATH,
+        PREVIEW_VIEW_SRC,
+        Span::Item("    pub fn apply("),
+    ),
+    (
+        PREVIEW_OUTLINE_PATH,
+        PREVIEW_OUTLINE_SRC,
+        Span::Item("    pub fn target("),
+    ),
+    (
+        MOUSE_FORWARD_PATH,
+        MOUSE_FORWARD_SRC,
+        Span::Item("pub fn click_tmux("),
+    ),
+    (
+        MOUSE_FORWARD_PATH,
+        MOUSE_FORWARD_SRC,
+        Span::Item("pub fn click_pair("),
+    ),
+    (GIT_PATH, GIT_SRC, Span::Item("pub fn file_history(")),
+    (GIT_PATH, GIT_SRC, Span::Item("pub fn commit_file_diff(")),
+    (
+        UPDATE_CHECKER_PATH,
+        UPDATE_CHECKER_SRC,
+        Span::Item("    pub fn parse_typed("),
+    ),
+    (
+        UPDATE_CHECKER_PATH,
+        UPDATE_CHECKER_SRC,
+        Span::Item("pub fn repair_brew_typed("),
+    ),
+    (
+        UPDATE_CHECKER_PATH,
+        UPDATE_CHECKER_SRC,
+        Span::Item("pub fn check_all_channels("),
+    ),
+    (
+        UPDATE_CHECKER_PATH,
+        UPDATE_CHECKER_SRC,
+        Span::Item("pub fn update_target("),
+    ),
+    (
+        UPDATE_CHECKER_PATH,
+        UPDATE_CHECKER_SRC,
+        Span::Item("fn run_route("),
+    ),
+    (
+        UPDATE_CHECKER_PATH,
+        UPDATE_CHECKER_SRC,
+        Span::Item("fn refusal("),
+    ),
+    (
+        UPDATE_CHECKER_PATH,
+        UPDATE_CHECKER_SRC,
+        Span::Item("fn update_via_installer("),
+    ),
+    (
+        UPDATE_CHECKER_PATH,
+        UPDATE_CHECKER_SRC,
+        Span::Item("fn update_via_homebrew("),
+    ),
+    (
+        UPDATE_CHECKER_PATH,
+        UPDATE_CHECKER_SRC,
+        Span::Item("fn update_via_zip("),
+    ),
+    (
+        UPDATE_CHECKER_PATH,
+        UPDATE_CHECKER_SRC,
+        Span::Item("pub fn restart_app("),
+    ),
+    (
+        INSTALLER_UPDATE_PATH,
+        INSTALLER_UPDATE_SRC,
+        Span::Item("pub fn download("),
+    ),
+    (
+        INSTALLER_UPDATE_PATH,
+        INSTALLER_UPDATE_SRC,
+        Span::Item("pub fn launch("),
+    ),
+];
+
+#[test]
+fn 更新の口とcoreの文の断りの組み立てに日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, src, span) in UPDATE_CORE_SCOPES {
+        let Some(lines) = client_store_lines(src, span) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 {} が見つからない（改名で番犬が空振りする。UPDATE_CORE_SCOPES を直す）",
+                span_name(span)
+            ));
+            continue;
+        };
+        for (line, text) in refusal_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 断りの組み立てに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （UpdateRefusal / PlanRefusal / ViewRefusal / OutlineRefusal / ClickRefusal へバリアントを足し、\
+                 日英の対を text_in に書く）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
 }

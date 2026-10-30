@@ -438,12 +438,7 @@ pub fn send_tmux(target: &ScrollTarget, bytes: &[u8]) -> Result<(), String> {
 /// `click` の器の経路。background で呼ぶ）。GUI のクリックと同じ判断（[`decide`]）と
 /// 同じバイト列（[`click_report_bytes`]）を通る
 pub fn click_tmux(target: &ScrollTarget, col: usize, row: usize) -> Result<MouseReport, String> {
-    let flags = tmux_mouse_flags(target).ok_or_else(|| {
-        format!(
-            "器へ問い合わせられない（{}）",
-            TakoReason::Unresolved.as_str()
-        )
-    })?;
+    let flags = tmux_mouse_flags(target).ok_or(ClickRefusal::ContainerUnresolved)?;
     let report = decide(flags.report(), flags.in_mode).map_err(not_forwarded_message)?;
     let bytes = click_pair(report, col, row)?;
     send_tmux(target, &bytes)?;
@@ -451,34 +446,116 @@ pub fn click_tmux(target: &ScrollTarget, col: usize, row: usize) -> Result<Mouse
 }
 
 /// 押す + 離すのバイト列（AI のクリック）
-pub fn click_pair(report: MouseReport, col: usize, row: usize) -> Result<Vec<u8>, String> {
+pub fn click_pair(report: MouseReport, col: usize, row: usize) -> Result<Vec<u8>, ClickRefusal> {
     let mut bytes = Vec::new();
     for phase in [ClickPhase::Press, ClickPhase::Release] {
-        bytes.extend(
-            click_report_bytes(report, phase, col, row, false).ok_or_else(|| {
-                format!(
-                    "座標 (row {row}, col {col}) は内側アプリの報告形式（{:?}）で表せない",
-                    report.encoding
-                )
-            })?,
-        );
+        bytes.extend(click_report_bytes(report, phase, col, row, false).ok_or(
+            ClickRefusal::Unrepresentable {
+                row,
+                col,
+                encoding: report.encoding,
+            },
+        )?);
     }
     Ok(bytes)
 }
 
-/// 渡さなかった理由のメッセージ（AI のクリックのエラー本文。理由の語を必ず含める）
+/// 渡さなかった理由のメッセージ（AI のクリックのエラー本文。理由の語を必ず含める）。
+/// 表示言語は組んだその場の 1 回（#2365）
 pub fn not_forwarded_message(reason: TakoReason) -> String {
-    match reason {
-        TakoReason::NotRequested => format!(
-            "このペインのアプリはマウス報告を要求していない（{}）。\
-             シェル・less 等へのクリックは意味を持たないので渡さない",
-            reason.as_str()
-        ),
-        TakoReason::CopyMode => format!(
-            "器のペインが copy mode 中（{}）。渡すと copy mode のキーとして解釈される",
-            reason.as_str()
-        ),
-        other => format!("クリックを渡せない（{}）", other.as_str()),
+    ClickRefusal::NotForwarded(reason).to_string()
+}
+
+/// AI のクリック（CLI `tako click` / MCP `tako_send_input` の `click`）を渡せない断り（#1961。
+/// 日英は #2365）。日英の対は [`ClickRefusal::text_in`] の網羅 match の 1 か所で、日本語は
+/// #2365 より前の固定文とバイト一致。どの文も理由の語（`not_requested` ほか）を含む
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickRefusal {
+    /// [`decide`] が渡さないと決めた（理由の語を括弧に入れる）
+    NotForwarded(TakoReason),
+    /// `座標 (row <row>, col <col>) は内側アプリの報告形式（<encoding>）で表せない`
+    Unrepresentable {
+        row: usize,
+        col: usize,
+        encoding: Encoding,
+    },
+    /// `器へ問い合わせられない（unresolved）`（器のペインの報告の形を読めなかった）
+    ContainerUnresolved,
+}
+
+impl ClickRefusal {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NotForwarded(reason @ TakoReason::NotRequested), Ja) => format!(
+                "このペインのアプリはマウス報告を要求していない（{}）。\
+                 シェル・less 等へのクリックは意味を持たないので渡さない",
+                reason.as_str()
+            ),
+            (Self::NotForwarded(reason @ TakoReason::NotRequested), En) => format!(
+                "the app in this pane does not ask for mouse reports ({}); \
+                 a click means nothing to a shell, less and the like, so it is not passed",
+                reason.as_str()
+            ),
+            (Self::NotForwarded(reason @ TakoReason::CopyMode), Ja) => format!(
+                "器のペインが copy mode 中（{}）。渡すと copy mode のキーとして解釈される",
+                reason.as_str()
+            ),
+            (Self::NotForwarded(reason @ TakoReason::CopyMode), En) => format!(
+                "the container pane is in copy mode ({}); a click would be read as copy mode keys",
+                reason.as_str()
+            ),
+            (Self::NotForwarded(other), Ja) => {
+                format!("クリックを渡せない（{}）", other.as_str())
+            }
+            (Self::NotForwarded(other), En) => {
+                format!("cannot pass the click ({})", other.as_str())
+            }
+            (
+                Self::Unrepresentable {
+                    row,
+                    col,
+                    encoding,
+                },
+                Ja,
+            ) => format!(
+                "座標 (row {row}, col {col}) は内側アプリの報告形式（{encoding:?}）で表せない"
+            ),
+            (
+                Self::Unrepresentable {
+                    row,
+                    col,
+                    encoding,
+                },
+                En,
+            ) => format!(
+                "the position (row {row}, col {col}) cannot be expressed in the app's report format ({encoding:?})"
+            ),
+            (Self::ContainerUnresolved, Ja) => format!(
+                "器へ問い合わせられない（{}）",
+                TakoReason::Unresolved.as_str()
+            ),
+            (Self::ContainerUnresolved, En) => format!(
+                "cannot ask the container ({})",
+                TakoReason::Unresolved.as_str()
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ClickRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for ClickRefusal {}
+
+/// `Result<_, String>` の口から `?` でそのまま返せる（文はその場の表示言語）
+impl From<ClickRefusal> for String {
+    fn from(r: ClickRefusal) -> Self {
+        r.to_string()
     }
 }
 
@@ -742,6 +819,19 @@ mod tests {
         assert_eq!(decide(Some(SGR_DRAG), true), Err(TakoReason::CopyMode));
         assert_eq!(decide(Some(SGR_DRAG), false), Ok(SGR_DRAG));
         assert!(not_forwarded_message(TakoReason::NotRequested).contains("not_requested"));
+        // 理由の語は日英どちらの文にも入る（呼び手・検証が語で読む）
+        for lang in [crate::i18n::Lang::Ja, crate::i18n::Lang::En] {
+            for reason in [
+                TakoReason::NotRequested,
+                TakoReason::CopyMode,
+                TakoReason::Unresolved,
+            ] {
+                let text = ClickRefusal::NotForwarded(reason).text_in(lang);
+                assert!(text.contains(reason.as_str()), "{lang:?}: {text}");
+            }
+            let text = ClickRefusal::ContainerUnresolved.text_in(lang);
+            assert!(text.contains("unresolved"), "{lang:?}: {text}");
+        }
     }
 
     #[test]
@@ -789,6 +879,13 @@ mod tests {
             drag: false,
             encoding: Encoding::X10,
         };
-        assert!(click_pair(x10, 300, 0).is_err());
+        assert_eq!(
+            click_pair(x10, 300, 0),
+            Err(ClickRefusal::Unrepresentable {
+                row: 0,
+                col: 300,
+                encoding: Encoding::X10,
+            })
+        );
     }
 }

@@ -202,11 +202,11 @@ check_eq "桁の丸めも clamped に出る" "True" "$(field clamped "$OUT_COL")
 echo
 echo "== ④ 境界（0 / 負値 / 桁だけ） =="
 ERR_ZERO="$(open_line "$FIX/big.rs" --line 0)"
-check_contains "--line 0 はエラー" "行番号は 1 始まり" "$ERR_ZERO"
+check_contains_either "--line 0 はエラー" "行番号は 1 始まり" "line numbers start at 1" "$ERR_ZERO"
 ERR_NEG="$(open_line "$FIX/big.rs" --line -1)"
-check_contains "--line -1 はエラー" "行番号は 1 始まり" "$ERR_NEG"
+check_contains_either "--line -1 はエラー" "行番号は 1 始まり" "line numbers start at 1" "$ERR_NEG"
 ERR_COL0="$(open_line "$FIX/big.rs" --line 1 --column 0)"
-check_contains "--column 0 はエラー" "桁番号は 1 始まり" "$ERR_COL0"
+check_contains_either "--column 0 はエラー" "桁番号は 1 始まり" "column numbers start at 1" "$ERR_COL0"
 ERR_ONLY="$(open_line "$FIX/big.rs" --column 3)"
 check_contains "--column 単独はエラー" "line" "$ERR_ONLY"
 
@@ -224,7 +224,7 @@ echo "== ⑥ 行を持たない種別 =="
 PANES_BEFORE="$("$TAKO_BIN" list 2>/dev/null | grep -c '"id"')"
 ERR_PNG="$(open_line "$FIX/shot.png" --line 1)"
 PANES_AFTER="$("$TAKO_BIN" list 2>/dev/null | grep -c '"id"')"
-check_contains "画像に --line はエラー" "テキスト" "$ERR_PNG"
+check_contains_either "画像に --line はエラー" "テキスト" "only text" "$ERR_PNG"
 check_eq "落ちてもペインは増えない" "$PANES_BEFORE" "$PANES_AFTER"
 
 echo

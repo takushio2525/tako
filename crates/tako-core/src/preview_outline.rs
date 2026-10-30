@@ -50,19 +50,59 @@ impl PreviewOutline {
     }
 
     /// CLI / MCP / GUI 共通の 1 始まり項目番号をジャンプ先へ解決する。
-    pub fn target(&self, item: usize) -> Result<PreviewOutlineTarget, String> {
+    pub fn target(&self, item: usize) -> Result<PreviewOutlineTarget, OutlineRefusal> {
         if item == 0 {
-            return Err("アウトライン項目は 1 以上で指定する".into());
+            return Err(OutlineRefusal::ItemZero);
         }
         self.items
             .get(item - 1)
             .map(|entry| entry.target)
-            .ok_or_else(|| {
-                format!(
-                    "アウトライン項目の範囲外: {item}（全 {} 件）",
-                    self.items.len()
-                )
+            .ok_or(OutlineRefusal::OutOfRange {
+                item,
+                total: self.items.len(),
             })
+    }
+}
+
+/// アウトライン項目の指定の断り（日英は #2365）。日英の対は [`OutlineRefusal::text_in`] の
+/// 網羅 match の 1 か所で、日本語は #2365 より前の固定文とバイト一致
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutlineRefusal {
+    /// `アウトライン項目は 1 以上で指定する`
+    ItemZero,
+    /// `アウトライン項目の範囲外: <item>（全 <total> 件）`
+    OutOfRange { item: usize, total: usize },
+}
+
+impl OutlineRefusal {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::ItemZero, Ja) => "アウトライン項目は 1 以上で指定する".into(),
+            (Self::ItemZero, En) => "the outline item must be 1 or greater".into(),
+            (Self::OutOfRange { item, total }, Ja) => {
+                format!("アウトライン項目の範囲外: {item}（全 {total} 件）")
+            }
+            (Self::OutOfRange { item, total }, En) => {
+                format!("outline item out of range: {item} (total: {total})")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for OutlineRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for OutlineRefusal {}
+
+/// `Result<_, String>` の口から `?` でそのまま返せる（文はその場の表示言語）
+impl From<OutlineRefusal> for String {
+    fn from(r: OutlineRefusal) -> Self {
+        r.to_string()
     }
 }
 
@@ -88,8 +128,11 @@ mod tests {
             outline.target(2).unwrap(),
             PreviewOutlineTarget::MarkdownBlock { block: 3 }
         );
-        assert!(outline.target(0).is_err());
-        assert!(outline.target(3).is_err());
+        assert_eq!(outline.target(0), Err(OutlineRefusal::ItemZero));
+        assert_eq!(
+            outline.target(3),
+            Err(OutlineRefusal::OutOfRange { item: 3, total: 2 })
+        );
     }
 
     /// #1661: 編集中の目次は原文の行を指す。ワイヤの形は `kind` で見分ける

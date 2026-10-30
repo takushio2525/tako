@@ -81,25 +81,47 @@ impl Truncation {
         }
     }
 
-    /// 編集を断る理由（CLI / MCP のエラーと `limit.message`。日本語）
+    /// 編集を断る理由（CLI / MCP のエラーと `limit.message`）。表示言語は組んだその場の 1 回（#2365）
     pub fn edit_refusal(&self) -> String {
-        let what = match self {
-            Self::Bytes { .. } => "大きさ",
-            Self::Lines { .. } => "行数",
-        };
-        format!(
-            "{what}が上限を超えるため末尾を省略して表示しており、編集できない: {}",
-            self.detail_ja()
-        )
+        self.edit_refusal_in(crate::i18n::lang())
     }
 
-    /// `tako edit` の応答に載せる形（`limit`）
+    /// 編集を断る理由を表示言語を明示して組む（(バリアント, 言語) の網羅 match。日本語は
+    /// #2365 より前の固定文とバイト一致）
+    pub fn edit_refusal_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Bytes { .. }, Ja) => format!(
+                "大きさが上限を超えるため末尾を省略して表示しており、編集できない: {}",
+                self.detail_ja()
+            ),
+            (Self::Lines { .. }, Ja) => format!(
+                "行数が上限を超えるため末尾を省略して表示しており、編集できない: {}",
+                self.detail_ja()
+            ),
+            (Self::Bytes { .. }, En) => format!(
+                "cannot edit: the file is shown with its end left out because its size exceeds the limit: {}",
+                self.detail_en()
+            ),
+            (Self::Lines { .. }, En) => format!(
+                "cannot edit: the file is shown with its end left out because its line count exceeds the limit: {}",
+                self.detail_en()
+            ),
+        }
+    }
+
+    /// `tako edit` の応答に載せる形（`limit`）。`message` は組んだその場の表示言語
     pub fn to_json(&self) -> Value {
+        self.to_json_in(crate::i18n::lang())
+    }
+
+    /// [`Self::to_json`] の表示言語を明示する版
+    pub fn to_json_in(&self, lang: crate::i18n::Lang) -> Value {
         let mut out = json!({
             "reason": self.reason(),
             "max_bytes": MAX_BYTES,
             "max_lines": MAX_LINES,
-            "message": self.edit_refusal(),
+            "message": self.edit_refusal_in(lang),
         });
         match self {
             Self::Bytes { size } => out["bytes"] = json!(size),
@@ -186,12 +208,17 @@ mod tests {
         let lines = Truncation::Lines { lines: 123_456 };
         assert_eq!(lines.detail_ja(), "123,456 行（上限 100,000 行）");
         assert_eq!(lines.detail_en(), "123,456 lines (limit 100,000 lines)");
-        let json = lines.to_json();
+        let json = lines.to_json_in(crate::i18n::Lang::Ja);
         assert_eq!(json["reason"], "lines");
         assert_eq!(json["lines"], 123_456);
         assert_eq!(json["max_lines"], MAX_LINES);
         assert_eq!(json["max_bytes"], MAX_BYTES);
         assert!(json["message"].as_str().unwrap().contains("123,456 行"));
+        let json = lines.to_json_in(crate::i18n::Lang::En);
+        assert!(json["message"]
+            .as_str()
+            .unwrap()
+            .contains("123,456 lines (limit 100,000 lines)"));
 
         let bytes = Truncation::Bytes { size: 12_345_678 };
         assert_eq!(bytes.detail_ja(), "12.3 MB（上限 10 MB）");
@@ -200,7 +227,12 @@ mod tests {
         assert_eq!(json["reason"], "bytes");
         assert_eq!(json["bytes"], 12_345_678);
         assert!(json.get("lines").is_none());
-        assert!(bytes.edit_refusal().contains("12.3 MB（上限 10 MB）"));
+        assert!(bytes
+            .edit_refusal_in(crate::i18n::Lang::Ja)
+            .contains("12.3 MB（上限 10 MB）"));
+        assert!(bytes
+            .edit_refusal_in(crate::i18n::Lang::En)
+            .contains("12.3 MB (limit 10 MB)"));
     }
 
     #[test]

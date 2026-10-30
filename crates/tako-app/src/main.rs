@@ -29044,12 +29044,14 @@ impl SystemHost for TakoApp {
                 }
                 Ok(None) => serde_json::json!({ "available": false, "channel": specific.label() }),
                 Err(e) => {
+                    // `error` と `error_message` は同じ表示言語で組む（読むのは 1 回。#608 / #2365）
+                    let lang = tako_core::i18n::lang();
                     let mut json = serde_json::json!({
                         "available": false,
                         "channel": specific.label(),
-                        "error": e.to_json(),
+                        "error": e.to_json_in(lang),
                     });
-                    json["error_message"] = serde_json::Value::String(e.to_string());
+                    json["error_message"] = serde_json::Value::String(e.text_in(lang));
                     json
                 }
             },
@@ -29068,27 +29070,20 @@ impl SystemHost for TakoApp {
                     json
                 }
                 Err(e) => {
+                    let lang = tako_core::i18n::lang();
                     let mut json = serde_json::json!({
                         "available": false,
-                        "error": e.to_json(),
+                        "error": e.to_json_in(lang),
                     });
-                    json["error_message"] = serde_json::Value::String(e.to_string());
+                    json["error_message"] = serde_json::Value::String(e.text_in(lang));
                     json
                 }
             },
         }
     }
     fn update_apply(&mut self, channel: Option<&str>) -> Result<serde_json::Value, String> {
-        let ch: update_checker::Channel =
-            channel.unwrap_or("stable").parse().map_err(|e: String| e)?;
-        let info = update_checker::check_channel(ch)
-            .map_err(|e| format!("更新チェックに失敗: {e}"))?
-            .ok_or_else(|| {
-                format!(
-                    "{}の新しいバージョンが見つからない（既に最新版です）",
-                    ch.display_label()
-                )
-            })?;
+        // 断り（チャンネル・確認の失敗・新しい版が無い）は枠と中身を同じ表示言語で組む（#2365）
+        let info = update_checker::update_target(channel)?;
         // 差し替えの手段（#1042）や brew の結果は message に載る。dispatch が捨てると
         // CLI / MCP からは「何が起きたか」が一切見えないので通す
         let applied = update_checker::perform_update(&info)?;
@@ -29103,16 +29098,7 @@ impl SystemHost for TakoApp {
         Ok(json)
     }
     fn update_apply_zip(&mut self, channel: Option<&str>) -> Result<serde_json::Value, String> {
-        let ch: update_checker::Channel =
-            channel.unwrap_or("stable").parse().map_err(|e: String| e)?;
-        let info = update_checker::check_channel(ch)
-            .map_err(|e| format!("更新チェックに失敗: {e}"))?
-            .ok_or_else(|| {
-                format!(
-                    "{}の新しいバージョンが見つからない（既に最新版です）",
-                    ch.display_label()
-                )
-            })?;
+        let info = update_checker::update_target(channel)?;
         let applied = update_checker::perform_update_zip(&info)?;
         Ok(serde_json::json!({
             "updated": true,

@@ -107,43 +107,73 @@ pub enum InstallerError {
     NotInstalled,
 }
 
-impl std::fmt::Display for InstallerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Origin(url) => write!(
-                f,
+impl InstallerError {
+    /// 表示言語を明示しての文言（#2365。(バリアント, 言語) の網羅 match。日本語は #2365 より前の
+    /// 固定文とバイト一致）。更新の口の断り（`update_checker::UpdateRefusal`）が枠と同じ言語で引く
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Origin(url), Ja) => format!(
                 "インストーラーの取得元が tako の GitHub Releases ではないため取りに行かない: {url}"
             ),
-            Self::Unverifiable => write!(
-                f,
+            (Self::Origin(url), En) => format!(
+                "the installer does not come from tako's GitHub Releases, so it is not downloaded: {url}"
+            ),
+            (Self::Unverifiable, Ja) => {
                 "配布元がインストーラーのサイズか sha256 を示していないため、検査できないので起動しない"
-            ),
-            Self::Network(e) => write!(f, "インストーラーのダウンロードに失敗: {e}"),
-            Self::Http(status) => write!(
-                f,
-                "インストーラーのダウンロードに失敗（HTTP {status}）"
-            ),
-            Self::Size { got, want } => write!(
-                f,
+                    .into()
+            }
+            (Self::Unverifiable, En) => {
+                "the release does not give the installer's size or sha256, so it cannot be checked and is not started"
+                    .into()
+            }
+            (Self::Network(e), Ja) => format!("インストーラーのダウンロードに失敗: {e}"),
+            (Self::Network(e), En) => format!("the installer download failed: {e}"),
+            (Self::Http(status), Ja) => {
+                format!("インストーラーのダウンロードに失敗（HTTP {status}）")
+            }
+            (Self::Http(status), En) => format!("the installer download failed (HTTP {status})"),
+            (Self::Size { got, want }, Ja) => format!(
                 "インストーラーの大きさが配布元の値と合わない（受信 {got} バイト / 配布元 {want} バイト。\
                  途中で切れた可能性がある）"
             ),
-            Self::Digest => write!(
-                f,
-                "インストーラーの sha256 が配布元の値と合わないので起動しない"
+            (Self::Size { got, want }, En) => format!(
+                "the installer size does not match the release (received {got} bytes / release {want} bytes; \
+                 the download may have been cut off)"
             ),
-            Self::NotExecutable => write!(
-                f,
-                "受けたファイルが Windows の実行ファイルではないので起動しない"
-            ),
-            Self::Io(e) => write!(f, "インストーラーの保存に失敗: {e}"),
-            Self::Launch(e) => write!(f, "インストーラーを起動できない: {e}"),
-            Self::NotInstalled => write!(
-                f,
+            (Self::Digest, Ja) => {
+                "インストーラーの sha256 が配布元の値と合わないので起動しない".into()
+            }
+            (Self::Digest, En) => {
+                "the installer's sha256 does not match the release, so it is not started".into()
+            }
+            (Self::NotExecutable, Ja) => {
+                "受けたファイルが Windows の実行ファイルではないので起動しない".into()
+            }
+            (Self::NotExecutable, En) => {
+                "the downloaded file is not a Windows executable, so it is not started".into()
+            }
+            (Self::Io(e), Ja) => format!("インストーラーの保存に失敗: {e}"),
+            (Self::Io(e), En) => format!("cannot save the installer: {e}"),
+            (Self::Launch(e), Ja) => format!("インストーラーを起動できない: {e}"),
+            (Self::Launch(e), En) => format!("cannot start the installer: {e}"),
+            (Self::NotInstalled, Ja) => {
                 "この tako はインストーラーで入れた場所から動いていない（ポータブル版・開発ビルド）ため、\
                  アプリ内では更新できない。リリースページから同じ形式の配布物を取り直してください"
-            ),
+                    .into()
+            }
+            (Self::NotInstalled, En) => {
+                "this tako does not run from where the installer put it (a portable or development build), \
+                 so it cannot update itself. Download the same kind of package again from the release page"
+                    .into()
+            }
         }
+    }
+}
+
+impl std::fmt::Display for InstallerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
     }
 }
 

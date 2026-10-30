@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use tako_core::i18n::Lang;
 use tako_core::platform::release_assets::{self, Arch};
 use tako_core::platform::support::Platform;
 
@@ -129,16 +130,21 @@ impl std::fmt::Display for Channel {
     }
 }
 
-impl std::str::FromStr for Channel {
-    type Err = String;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
+impl Channel {
+    /// `stable` / `test` を読む（読めなければ断りの型で返す。#2365）
+    pub fn parse_typed(s: &str) -> Result<Self, UpdateRefusal> {
         match s {
             "stable" => Ok(Channel::Stable),
             "test" => Ok(Channel::Test),
-            _ => Err(format!(
-                "不明なチャンネル: {s:?}（stable / test のいずれか）"
-            )),
+            _ => Err(UpdateRefusal::UnknownChannel(s.to_string())),
         }
+    }
+}
+
+impl std::str::FromStr for Channel {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Channel::parse_typed(s).map_err(String::from)
     }
 }
 
@@ -191,53 +197,136 @@ pub struct ChannelUpdates {
     pub rate_limit_note: Option<String>,
 }
 
-/// 更新チェックのエラー（#59: エラーと「更新なし」を区別する）
+/// 更新チェックのエラー（#59: エラーと「更新なし」を区別する）。
+///
+/// 文は表示言語に従う（#2365）: 日英の対は [`CheckError::text_in`] と中身の
+/// [`NetworkCause::text_in`] / [`ParseCause::text_in`] の網羅 match で、日本語は #2365 より前の
+/// 固定文とバイト一致。tako が書く中身（404・想定外のステータス・読み取り / JSON の失敗）は文字列では
+/// なくバリアントで持つ（文字列で持つと作った時点の言語に固まり、英語の枠に日本語の中身が混ざる）
 #[derive(Debug, Clone)]
 pub enum CheckError {
     /// GitHub API / Web のレート制限（X-RateLimit-Reset の UNIX timestamp を含む）
     RateLimit { retry_after: Option<u64> },
     /// ネットワークエラー（DNS 解決失敗、接続タイムアウト等）
-    Network(String),
+    Network(NetworkCause),
     /// レスポンスのパースに失敗
-    Parse(String),
+    Parse(ParseCause),
 }
 
-impl std::fmt::Display for CheckError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CheckError::RateLimit {
-                retry_after: Some(ts),
-            } => {
-                write!(
-                    f,
-                    "GitHub レート制限中（リセット: {}）",
-                    format_reset_time(*ts)
-                )
+/// [`CheckError::Network`] の中身
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkCause {
+    /// HTTP の層の失敗（文は HTTP ライブラリのもの = 英語のまま）
+    Transport(String),
+    /// 404 = `リリースが見つからない（リポジトリ未公開または未リリース）`
+    ReleasesNotFound,
+    /// `予期しないステータスコード: <status>`
+    UnexpectedStatus(u16),
+}
+
+/// [`CheckError::Parse`] の中身（`<e>` はライブラリの文）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseCause {
+    /// `レスポンス読み取りエラー: <e>`
+    ReadBody(String),
+    /// `JSON パースエラー: <e>`
+    Json(String),
+}
+
+impl NetworkCause {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: Lang) -> String {
+        match (self, lang) {
+            (Self::Transport(e), _) => e.clone(),
+            (Self::ReleasesNotFound, Lang::Ja) => {
+                "リリースが見つからない（リポジトリ未公開または未リリース）".into()
             }
-            CheckError::RateLimit { retry_after: None } => {
-                write!(f, "GitHub レート制限中")
+            (Self::ReleasesNotFound, Lang::En) => {
+                "releases not found (the repository is private or has no release yet)".into()
             }
-            CheckError::Network(msg) => write!(f, "ネットワークエラー: {msg}"),
-            CheckError::Parse(msg) => write!(f, "レスポンス解析エラー: {msg}"),
+            (Self::UnexpectedStatus(status), Lang::Ja) => {
+                format!("予期しないステータスコード: {status}")
+            }
+            (Self::UnexpectedStatus(status), Lang::En) => {
+                format!("unexpected status code: {status}")
+            }
+        }
+    }
+}
+
+impl ParseCause {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: Lang) -> String {
+        match (self, lang) {
+            (Self::ReadBody(e), Lang::Ja) => format!("レスポンス読み取りエラー: {e}"),
+            (Self::ReadBody(e), Lang::En) => format!("cannot read the response body: {e}"),
+            (Self::Json(e), Lang::Ja) => format!("JSON パースエラー: {e}"),
+            (Self::Json(e), Lang::En) => format!("JSON parse error: {e}"),
         }
     }
 }
 
 impl CheckError {
+    /// 表示言語を明示しての文言（#2365。(バリアント, 言語) の網羅 match。中身も同じ言語で引く）
+    pub fn text_in(&self, lang: Lang) -> String {
+        match (self, lang) {
+            (
+                Self::RateLimit {
+                    retry_after: Some(ts),
+                },
+                Lang::Ja,
+            ) => {
+                format!(
+                    "GitHub レート制限中（リセット: {}）",
+                    reset_eta_in(*ts, lang)
+                )
+            }
+            (
+                Self::RateLimit {
+                    retry_after: Some(ts),
+                },
+                Lang::En,
+            ) => {
+                format!(
+                    "GitHub rate limit reached (resets {})",
+                    reset_eta_in(*ts, lang)
+                )
+            }
+            (Self::RateLimit { retry_after: None }, Lang::Ja) => "GitHub レート制限中".into(),
+            (Self::RateLimit { retry_after: None }, Lang::En) => "GitHub rate limit reached".into(),
+            (Self::Network(cause), Lang::Ja) => {
+                format!("ネットワークエラー: {}", cause.text_in(lang))
+            }
+            (Self::Network(cause), Lang::En) => format!("network error: {}", cause.text_in(lang)),
+            (Self::Parse(cause), Lang::Ja) => {
+                format!("レスポンス解析エラー: {}", cause.text_in(lang))
+            }
+            (Self::Parse(cause), Lang::En) => {
+                format!("response parse error: {}", cause.text_in(lang))
+            }
+        }
+    }
+
+    /// 応答の `error`（`message` は組んだその場の表示言語 = [`Self::to_string`] と同じ言語）
     pub fn to_json(&self) -> serde_json::Value {
+        self.to_json_in(tako_core::i18n::lang())
+    }
+
+    /// [`Self::to_json`] の表示言語を明示する版（`message` は中身だけ = #2365 より前と同じ形）
+    pub fn to_json_in(&self, lang: Lang) -> serde_json::Value {
         match self {
             CheckError::RateLimit { retry_after } => serde_json::json!({
                 "type": "rate_limit",
-                "message": self.to_string(),
+                "message": self.text_in(lang),
                 "retry_after": retry_after,
             }),
-            CheckError::Network(msg) => serde_json::json!({
+            CheckError::Network(cause) => serde_json::json!({
                 "type": "network",
-                "message": msg,
+                "message": cause.text_in(lang),
             }),
-            CheckError::Parse(msg) => serde_json::json!({
+            CheckError::Parse(cause) => serde_json::json!({
                 "type": "parse",
-                "message": msg,
+                "message": cause.text_in(lang),
             }),
         }
     }
@@ -259,21 +348,29 @@ impl CheckError {
     }
 }
 
-fn format_reset_time(unix_ts: u64) -> String {
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 表示言語は組んだその場の 1 回（中身も同じ言語 = #2365）
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
+/// レート制限が解けるまでの相対表記（`約N分後` / `in ~N min`）。言語を引数で受ける（#2365。
+/// 1 つの文の中で枠と同じ言語に引く。#608）
+fn reset_eta_in(unix_ts: u64, lang: Lang) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if unix_ts > now {
-        let remaining = unix_ts - now;
-        let minutes = remaining / 60;
-        if minutes > 0 {
-            crate::ui_text::update::eta_minutes(minutes)
-        } else {
-            crate::ui_text::update::eta_seconds(remaining)
-        }
-    } else {
-        crate::ui_text::update::eta_soon().into()
+    let remaining = unix_ts.saturating_sub(now);
+    let minutes = remaining / 60;
+    match (remaining, minutes, lang) {
+        (0, _, Lang::Ja) => "まもなく".into(),
+        (0, _, Lang::En) => "soon".into(),
+        (_, 0, Lang::Ja) => format!("約{remaining}秒後"),
+        (_, 0, Lang::En) => format!("in ~{remaining}s"),
+        (_, _, Lang::Ja) => format!("約{minutes}分後"),
+        (_, _, Lang::En) => format!("in ~{minutes} min"),
     }
 }
 
@@ -479,26 +576,31 @@ pub struct BrokenBrewDiagnosis {
     pub repair_command: String,
 }
 
-/// broken-brew の修復: `brew install --cask --force` で台帳を再締結する
+/// broken-brew の修復: `brew install --cask --force` で台帳を再締結する。
+/// 文は組んだその場の表示言語（#2365。型で受けるなら [`repair_brew_typed`]）
 pub fn repair_brew() -> Result<String, String> {
+    repair_brew_typed()
+        .map(|note| note.to_string())
+        .map_err(String::from)
+}
+
+/// [`repair_brew`] の型の口
+pub fn repair_brew_typed() -> Result<UpdateNote, UpdateRefusal> {
     let method = detect_install_method_full();
     if method != InstallMethod::BrokenBrew {
-        return Err(format!(
-            "現在の配布系統は {0} のため修復は不要です",
-            method.label()
-        ));
+        return Err(UpdateRefusal::RepairNotNeeded(method));
     }
     // #586: GUI プロセスからの起動なのでコンソールウィンドウを出させない
     let output =
         tako_core::platform::process::no_console_window(&mut std::process::Command::new("brew"))
             .args(["install", "--cask", "takushio2525/tako/tako", "--force"])
             .output()
-            .map_err(|e| format!("brew の実行に失敗: {e}"))?;
+            .map_err(|e| UpdateRefusal::BrewNotRun(e.to_string()))?;
     if output.status.success() {
-        Ok("brew の cask 台帳を再締結しました。以後 brew upgrade で更新できます".into())
+        Ok(UpdateNote::Repaired)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("brew install --force が失敗: {stderr}"))
+        Err(UpdateRefusal::BrewInstallFailed(stderr.into_owned()))
     }
 }
 
@@ -553,6 +655,15 @@ pub fn check_channel(channel: Channel) -> Result<Option<UpdateInfo>, CheckError>
         Channel::Stable => updates.stable,
         Channel::Test => updates.test,
     })
+}
+
+/// `tako update apply` / `apply-zip` が当てる版（チャンネルの省略は stable）。チャンネルが読めない・
+/// 確認に失敗した・新しい版が無いときは断る（#2365: 枠と中身を同じ言語で組む 1 か所）
+pub fn update_target(channel: Option<&str>) -> Result<UpdateInfo, UpdateRefusal> {
+    let channel = Channel::parse_typed(channel.unwrap_or("stable"))?;
+    check_channel(channel)
+        .map_err(UpdateRefusal::CheckFailed)?
+        .ok_or(UpdateRefusal::NoNewVersion(channel))
 }
 
 /// パース済みバージョン（`X.Y.Z` または `X.Y.Z-test.N`）
@@ -700,6 +811,22 @@ fn gh_auth_token() -> Option<String> {
     Some(token)
 }
 
+/// レート制限中にキャッシュを見せるときの補助表示（`rate_limit_note`。#416 / 日英は #2365）
+fn rate_limit_note_in(retry_after: Option<u64>, lang: Lang) -> String {
+    match (retry_after, lang) {
+        (Some(ts), Lang::Ja) => format!(
+            "GitHub API 制限中（キャッシュ表示・リセット: {}）",
+            reset_eta_in(ts, lang)
+        ),
+        (Some(ts), Lang::En) => format!(
+            "GitHub API rate limited (showing the cache; resets {})",
+            reset_eta_in(ts, lang)
+        ),
+        (None, Lang::Ja) => "GitHub API 制限中（キャッシュ表示）".into(),
+        (None, Lang::En) => "GitHub API rate limited (showing the cache)".into(),
+    }
+}
+
 /// 2 チャンネル同時チェック（GitHub API 1 リクエスト。#416）。
 /// gh CLI トークンがあれば認証付き（5000req/h）、なければ未認証（60req/h）。
 /// レート制限時はキャッシュがあれば rate_limit_note 付きで返す
@@ -719,7 +846,9 @@ pub fn check_all_channels() -> Result<ChannelUpdates, CheckError> {
         req = req.header("Authorization", &format!("Bearer {t}"));
     }
 
-    let resp = req.call().map_err(|e| CheckError::Network(e.to_string()))?;
+    let resp = req
+        .call()
+        .map_err(|e| CheckError::Network(NetworkCause::Transport(e.to_string())))?;
 
     let status = resp.status().as_u16();
     if status == 403 || status == 429 {
@@ -730,13 +859,7 @@ pub fn check_all_channels() -> Result<ChannelUpdates, CheckError> {
             .and_then(|s| s.parse::<u64>().ok());
         // キャッシュがあれば補助表示付きで返す
         if let Some(cached) = CACHED_UPDATES.lock().ok().and_then(|g| g.clone()) {
-            let note = match retry_after {
-                Some(ts) => format!(
-                    "GitHub API 制限中（キャッシュ表示・リセット: {}）",
-                    format_reset_time(ts)
-                ),
-                None => "GitHub API 制限中（キャッシュ表示）".into(),
-            };
+            let note = rate_limit_note_in(retry_after, tako_core::i18n::lang());
             return Ok(ChannelUpdates {
                 rate_limit_note: Some(note),
                 ..cached
@@ -745,22 +868,18 @@ pub fn check_all_channels() -> Result<ChannelUpdates, CheckError> {
         return Err(CheckError::RateLimit { retry_after });
     }
     if status == 404 {
-        return Err(CheckError::Network(
-            "リリースが見つからない（リポジトリ未公開または未リリース）".into(),
-        ));
+        return Err(CheckError::Network(NetworkCause::ReleasesNotFound));
     }
     if status != 200 {
-        return Err(CheckError::Network(format!(
-            "予期しないステータスコード: {status}"
-        )));
+        return Err(CheckError::Network(NetworkCause::UnexpectedStatus(status)));
     }
 
     let body: String = resp
         .into_body()
         .read_to_string()
-        .map_err(|e| CheckError::Parse(format!("レスポンス読み取りエラー: {e}")))?;
+        .map_err(|e| CheckError::Parse(ParseCause::ReadBody(e.to_string())))?;
     let releases: Vec<serde_json::Value> = serde_json::from_str(&body)
-        .map_err(|e| CheckError::Parse(format!("JSON パースエラー: {e}")))?;
+        .map_err(|e| CheckError::Parse(ParseCause::Json(e.to_string())))?;
 
     let result = parse_releases(&releases);
 
@@ -951,6 +1070,335 @@ impl Restart {
     }
 }
 
+/// 更新の口（CLI / MCP `tako update apply` / `apply-zip` / `repair` と GUI の更新画面）の断り（#2365）。
+///
+/// dispatch は GUI の口の `Err(String)` をそのまま載せるので、文の言語はここで決まる。日英の対は
+/// [`UpdateRefusal::text_in`] の (バリアント, 言語) の網羅 match の 1 か所で、日本語は #2365 より前の
+/// 固定文とバイト一致（`tests::更新の口の断りは全バリアントが日英を持ち日本語は2365より前と一致`）。
+/// 枠と中身（[`CheckError`]・[`installer_update::InstallerError`]）は同じ言語で引く。
+/// 「見つからない」系は英語にも ` not found` を含め、「見つかりません」系は含めない
+/// （`DispatchError::says_not_found` の当たり方を日英でそろえる）
+#[derive(Debug, Clone)]
+pub enum UpdateRefusal {
+    /// `不明なチャンネル: "<s>"（stable / test のいずれか）`
+    UnknownChannel(String),
+    /// `更新チェックに失敗: <CheckError>`
+    CheckFailed(CheckError),
+    /// `<安定版|テスト版>の新しいバージョンが見つからない（既に最新版です）`
+    NoNewVersion(Channel),
+    /// `<InstallerError::NotInstalled>（リリースページ: <url>）`（Windows のポータブル版）
+    PortableNotUpdatable { release_page: String },
+    /// `Windows には zip で差し替える経路が無い（…）。…（リリースページ: <url>）`
+    NoZipRouteOnWindows { release_page: String },
+    /// `配布系統 <label> では更新できない`
+    MethodCannotUpdate(InstallMethod),
+    /// `<InstallerError>。今の版のまま使えます（手動で入れるならリリースページ: <url>）`
+    InstallerRefused {
+        error: installer_update::InstallerError,
+        release_page: String,
+    },
+    /// `このリリースに Windows のインストーラーが見つからない（リリースページ: <url>）`
+    NoWindowsInstaller { release_page: String },
+    /// `brew の実行に失敗: <e>`
+    BrewNotRun(String),
+    /// `brew upgrade が失敗: <stderr>`（zip へ切り替えられるなら `[zip-fallback-available]` の行を添える）
+    BrewUpgradeFailed { stderr: String, zip_fallback: bool },
+    /// `ダウンロード用 ZIP アセットが見つかりません`
+    NoZipAsset,
+    /// `一時ディレクトリの作成に失敗: <e>`
+    TempDirFailed(String),
+    /// `ダウンロードに失敗: <e>`
+    DownloadFailed(String),
+    /// `ZIP ファイルの作成に失敗: <e>`
+    ZipCreateFailed(String),
+    /// `ダウンロードの書き込みに失敗: <e>`
+    DownloadWriteFailed(String),
+    /// `ditto による展開に失敗: <e>`
+    DittoNotRun(String),
+    /// `ZIP の展開に失敗: <stderr>`
+    UnzipFailed(String),
+    /// `展開した ZIP に tako.app が見つかりません`
+    NoAppInZip,
+    /// `bundle_install::replace_bundle_in_place` の断りをそのまま（tako-core の文。日英は Issue #2365 の
+    /// 残り = 枠を持たないので混ざらない）
+    BundleReplace(String),
+    /// `現在の配布系統は <label> のため修復は不要です`
+    RepairNotNeeded(InstallMethod),
+    /// `brew install --force が失敗: <stderr>`
+    BrewInstallFailed(String),
+    /// `.app バンドルのパスが特定できない（CLI 単体実行？）`
+    NoAppBundle,
+    /// `再起動に失敗: <e>`
+    RestartFailed(String),
+    /// `<InstallerError>`（起動し直す対象の exe が引けない）
+    Installer(installer_update::InstallerError),
+    /// `<InstallerError>。今の版のまま使えます`（インストーラーを起こせない）
+    InstallerNotLaunched(installer_update::InstallerError),
+}
+
+/// `brew upgrade` が失敗して zip へ切り替えられるときに添える行の印（#50。GUI と AI が読む目印 =
+/// 日英で同じ）
+pub const ZIP_FALLBACK_MARK: &str = "[zip-fallback-available]";
+
+impl UpdateRefusal {
+    /// 表示言語を明示しての文言（#2365）
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::UnknownChannel(s), Ja) => {
+                format!("不明なチャンネル: {s:?}（stable / test のいずれか）")
+            }
+            (Self::UnknownChannel(s), En) => {
+                format!("unknown channel: {s:?} (one of stable / test)")
+            }
+            (Self::CheckFailed(e), Ja) => format!("更新チェックに失敗: {}", e.text_in(lang)),
+            (Self::CheckFailed(e), En) => {
+                format!("the update check failed: {}", e.text_in(lang))
+            }
+            (Self::NoNewVersion(Channel::Stable), Ja) => {
+                "安定版の新しいバージョンが見つからない（既に最新版です）".into()
+            }
+            (Self::NoNewVersion(Channel::Test), Ja) => {
+                "テスト版の新しいバージョンが見つからない（既に最新版です）".into()
+            }
+            (Self::NoNewVersion(Channel::Stable), En) => {
+                "newer stable version not found (already up to date)".into()
+            }
+            (Self::NoNewVersion(Channel::Test), En) => {
+                "newer test version not found (already up to date)".into()
+            }
+            (Self::PortableNotUpdatable { release_page }, Ja) => format!(
+                "{}（リリースページ: {release_page}）",
+                installer_update::InstallerError::NotInstalled.text_in(lang)
+            ),
+            (Self::PortableNotUpdatable { release_page }, En) => format!(
+                "{} (release page: {release_page})",
+                installer_update::InstallerError::NotInstalled.text_in(lang)
+            ),
+            (Self::NoZipRouteOnWindows { release_page }, Ja) => format!(
+                "Windows には zip で差し替える経路が無い（zip は macOS の .app 用）。\
+                 `tako update apply` でインストーラーから更新してください（リリースページ: {release_page}）"
+            ),
+            (Self::NoZipRouteOnWindows { release_page }, En) => format!(
+                "Windows has no way to replace tako with a zip (the zip is for the macOS .app). \
+                 Update from the installer with `tako update apply` (release page: {release_page})"
+            ),
+            (Self::MethodCannotUpdate(method), Ja) => {
+                format!("配布系統 {} では更新できない", method.label())
+            }
+            (Self::MethodCannotUpdate(method), En) => {
+                format!("cannot update with the install method {}", method.label())
+            }
+            (
+                Self::InstallerRefused {
+                    error,
+                    release_page,
+                },
+                Ja,
+            ) => format!(
+                "{}。今の版のまま使えます（手動で入れるならリリースページ: {release_page}）",
+                error.text_in(lang)
+            ),
+            (
+                Self::InstallerRefused {
+                    error,
+                    release_page,
+                },
+                En,
+            ) => format!(
+                "{}. The current version keeps working (to install by hand, see the release page: {release_page})",
+                error.text_in(lang)
+            ),
+            (Self::NoWindowsInstaller { release_page }, Ja) => format!(
+                "このリリースに Windows のインストーラーが見つからない（リリースページ: {release_page}）"
+            ),
+            (Self::NoWindowsInstaller { release_page }, En) => format!(
+                "Windows installer not found in this release (release page: {release_page})"
+            ),
+            (Self::BrewNotRun(e), Ja) => format!("brew の実行に失敗: {e}"),
+            (Self::BrewNotRun(e), En) => format!("cannot run brew: {e}"),
+            (
+                Self::BrewUpgradeFailed {
+                    stderr,
+                    zip_fallback: false,
+                },
+                Ja,
+            ) => format!("brew upgrade が失敗: {stderr}"),
+            (
+                Self::BrewUpgradeFailed {
+                    stderr,
+                    zip_fallback: true,
+                },
+                Ja,
+            ) => format!(
+                "brew upgrade が失敗: {stderr}\n{ZIP_FALLBACK_MARK} brew 更新に失敗しました。\
+                 `tako update apply-zip` で zip 経由の更新が可能です"
+            ),
+            (
+                Self::BrewUpgradeFailed {
+                    stderr,
+                    zip_fallback: false,
+                },
+                En,
+            ) => format!("brew upgrade failed: {stderr}"),
+            (
+                Self::BrewUpgradeFailed {
+                    stderr,
+                    zip_fallback: true,
+                },
+                En,
+            ) => format!(
+                "brew upgrade failed: {stderr}\n{ZIP_FALLBACK_MARK} the brew update failed. \
+                 `tako update apply-zip` can update through the zip instead"
+            ),
+            (Self::NoZipAsset, Ja) => "ダウンロード用 ZIP アセットが見つかりません".into(),
+            (Self::NoZipAsset, En) => "the release has no ZIP asset to download".into(),
+            (Self::TempDirFailed(e), Ja) => format!("一時ディレクトリの作成に失敗: {e}"),
+            (Self::TempDirFailed(e), En) => format!("cannot create the temporary directory: {e}"),
+            (Self::DownloadFailed(e), Ja) => format!("ダウンロードに失敗: {e}"),
+            (Self::DownloadFailed(e), En) => format!("the download failed: {e}"),
+            (Self::ZipCreateFailed(e), Ja) => format!("ZIP ファイルの作成に失敗: {e}"),
+            (Self::ZipCreateFailed(e), En) => format!("cannot create the ZIP file: {e}"),
+            (Self::DownloadWriteFailed(e), Ja) => format!("ダウンロードの書き込みに失敗: {e}"),
+            (Self::DownloadWriteFailed(e), En) => format!("cannot write the download: {e}"),
+            (Self::DittoNotRun(e), Ja) => format!("ditto による展開に失敗: {e}"),
+            (Self::DittoNotRun(e), En) => format!("cannot extract with ditto: {e}"),
+            (Self::UnzipFailed(stderr), Ja) => format!("ZIP の展開に失敗: {stderr}"),
+            (Self::UnzipFailed(stderr), En) => format!("cannot extract the ZIP: {stderr}"),
+            (Self::NoAppInZip, Ja) => "展開した ZIP に tako.app が見つかりません".into(),
+            (Self::NoAppInZip, En) => "the extracted ZIP has no tako.app".into(),
+            (Self::BundleReplace(text), Ja | En) => text.clone(),
+            (Self::RepairNotNeeded(method), Ja) => {
+                format!("現在の配布系統は {} のため修復は不要です", method.label())
+            }
+            (Self::RepairNotNeeded(method), En) => format!(
+                "no repair is needed because the install method is {}",
+                method.label()
+            ),
+            (Self::BrewInstallFailed(stderr), Ja) => {
+                format!("brew install --force が失敗: {stderr}")
+            }
+            (Self::BrewInstallFailed(stderr), En) => {
+                format!("brew install --force failed: {stderr}")
+            }
+            (Self::NoAppBundle, Ja) => {
+                ".app バンドルのパスが特定できない（CLI 単体実行？）".into()
+            }
+            (Self::NoAppBundle, En) => {
+                "cannot find the path of the .app bundle (running the CLI alone?)".into()
+            }
+            (Self::RestartFailed(e), Ja) => format!("再起動に失敗: {e}"),
+            (Self::RestartFailed(e), En) => format!("the restart failed: {e}"),
+            (Self::Installer(error), Ja | En) => error.text_in(lang),
+            (Self::InstallerNotLaunched(error), Ja) => {
+                format!("{}。今の版のまま使えます", error.text_in(lang))
+            }
+            (Self::InstallerNotLaunched(error), En) => {
+                format!("{}. The current version keeps working", error.text_in(lang))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 表示言語は組んだその場の 1 回（枠と中身を同じ言語で引く）
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
+/// ControlHost の口は `Result<_, String>` なので、GUI は `?` でそのまま返せる（文はその場の表示言語）
+impl From<UpdateRefusal> for String {
+    fn from(r: UpdateRefusal) -> Self {
+        r.to_string()
+    }
+}
+
+/// 更新の適用・修復が済んだときの文（応答の `message` と更新画面。#2365）。日英の対は
+/// [`UpdateNote::text_in`] の網羅 match の 1 か所で、日本語は #2365 より前の固定文とバイト一致
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateNote {
+    /// `Homebrew で更新完了`
+    HomebrewDone,
+    /// `既に最新版です`（brew が「入っている」と答えた）
+    AlreadyLatest,
+    /// `ZIP で更新完了（差し替え: <手段>）`。`pin_may_drop` なら Dock のピンの注意を添える（#1042）
+    ZipDone {
+        strategy: &'static str,
+        pin_may_drop: bool,
+    },
+    /// `インストーラーで更新（v<版> の sha256 が配布元と一致。…）`（#2434）
+    InstallerReady { version: String },
+    /// `brew の cask 台帳を再締結しました。以後 brew upgrade で更新できます`
+    Repaired,
+}
+
+impl UpdateNote {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::HomebrewDone, Ja) => "Homebrew で更新完了".into(),
+            (Self::HomebrewDone, En) => "updated with Homebrew".into(),
+            (Self::AlreadyLatest, Ja) => "既に最新版です".into(),
+            (Self::AlreadyLatest, En) => "already up to date".into(),
+            (
+                Self::ZipDone {
+                    strategy,
+                    pin_may_drop: false,
+                },
+                Ja,
+            ) => format!("ZIP で更新完了（差し替え: {strategy}）"),
+            (
+                Self::ZipDone {
+                    strategy,
+                    pin_may_drop: true,
+                },
+                Ja,
+            ) => format!(
+                "ZIP で更新完了（差し替え: {strategy}。この環境ではアトミックな入れ替えが使えないため、\
+                 Dock のピン留めが外れることがあります）"
+            ),
+            (
+                Self::ZipDone {
+                    strategy,
+                    pin_may_drop: false,
+                },
+                En,
+            ) => format!("updated with the ZIP (replacement: {strategy})"),
+            (
+                Self::ZipDone {
+                    strategy,
+                    pin_may_drop: true,
+                },
+                En,
+            ) => format!(
+                "updated with the ZIP (replacement: {strategy}; this environment cannot swap atomically, \
+                 so the Dock pin may come off)"
+            ),
+            (Self::InstallerReady { version }, Ja) => format!(
+                "インストーラーで更新（v{version} の sha256 が配布元と一致。tako を終了して入れ替え、終わったら起動し直します）"
+            ),
+            (Self::InstallerReady { version }, En) => format!(
+                "updating with the installer (the sha256 of v{version} matches the release; tako quits, \
+                 the installer replaces it and starts it again)"
+            ),
+            (Self::Repaired, Ja) => {
+                "brew の cask 台帳を再締結しました。以後 brew upgrade で更新できます".into()
+            }
+            (Self::Repaired, En) => {
+                "re-registered tako in the brew cask list; brew upgrade works from now on".into()
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
 /// 配布系統ごとの適用経路（#2434）。**Windows の配布系統が macOS の経路
 /// （brew / zip の展開 / `.app` の差し替え）へ入らない**ことをここ 1 か所で決める
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -989,62 +1437,52 @@ fn zip_route(method: InstallMethod) -> ApplyRoute {
 }
 
 /// 更新を実行する（ブロッキング。background executor で呼ぶ）。
-/// broken-brew 状態では zip フォールバックを使う
+/// broken-brew 状態では zip フォールバックを使う。文は組んだその場の表示言語（#2365）
 pub fn perform_update(info: &UpdateInfo) -> Result<Applied, String> {
-    run_route(apply_route(detect_install_method_full()), info)
+    run_route(apply_route(detect_install_method_full()), info).map_err(String::from)
 }
 
 /// zip 強制更新（brew 失敗時のフォールバック用。macOS では配布系統を問わず zip で更新する）
 pub fn perform_update_zip(info: &UpdateInfo) -> Result<Applied, String> {
-    run_route(zip_route(detect_install_method_full()), info)
+    run_route(zip_route(detect_install_method_full()), info).map_err(String::from)
 }
 
-fn run_route(route: ApplyRoute, info: &UpdateInfo) -> Result<Applied, String> {
-    let open_bundle = |message| Applied {
-        message,
+fn run_route(route: ApplyRoute, info: &UpdateInfo) -> Result<Applied, UpdateRefusal> {
+    let open_bundle = |note: UpdateNote| Applied {
+        message: note.to_string(),
         restart: Restart::OpenBundle,
     };
     match route {
         ApplyRoute::Homebrew => update_via_homebrew(info).map(open_bundle),
         ApplyRoute::MacZip => update_via_zip(info).map(open_bundle),
         ApplyRoute::WindowsInstaller => update_via_installer(info),
-        ApplyRoute::Refuse(method) => Err(refusal_text(method, info)),
+        ApplyRoute::Refuse(method) => Err(refusal(method, info)),
     }
 }
 
 /// 適用できない配布系統の断り
-fn refusal_text(method: InstallMethod, info: &UpdateInfo) -> String {
+fn refusal(method: InstallMethod, info: &UpdateInfo) -> UpdateRefusal {
+    let release_page = info.html_url.clone();
     match method {
-        InstallMethod::WindowsPortable => format!(
-            "{}（リリースページ: {}）",
-            installer_update::InstallerError::NotInstalled,
-            info.html_url
-        ),
-        InstallMethod::WindowsInstaller => format!(
-            "Windows には zip で差し替える経路が無い（zip は macOS の .app 用）。\
-             `tako update apply` でインストーラーから更新してください（リリースページ: {}）",
-            info.html_url
-        ),
-        other => format!("配布系統 {} では更新できない", other.label()),
+        InstallMethod::WindowsPortable => UpdateRefusal::PortableNotUpdatable { release_page },
+        InstallMethod::WindowsInstaller => UpdateRefusal::NoZipRouteOnWindows { release_page },
+        other => UpdateRefusal::MethodCannotUpdate(other),
     }
 }
 
 /// Windows の腕（#2434）: インストーラーを取得元・サイズ・sha256・PE ヘッダで検査する。
 /// **ここではまだ起動しない**（起動は layout を保存してから `restart_app` が行う）。
 /// 失敗したら何も上書きしていない今の版のまま、理由とリリースページを返す
-fn update_via_installer(info: &UpdateInfo) -> Result<Applied, String> {
-    let fail = |e: installer_update::InstallerError| {
-        format!(
-            "{e}。今の版のまま使えます（手動で入れるならリリースページ: {}）",
-            info.html_url
-        )
+fn update_via_installer(info: &UpdateInfo) -> Result<Applied, UpdateRefusal> {
+    let fail = |error: installer_update::InstallerError| UpdateRefusal::InstallerRefused {
+        error,
+        release_page: info.html_url.clone(),
     };
     let (Some(url), Some(asset_name)) = (info.download_url.as_deref(), info.asset_name.as_deref())
     else {
-        return Err(format!(
-            "このリリースに Windows のインストーラーが見つからない（リリースページ: {}）",
-            info.html_url
-        ));
+        return Err(UpdateRefusal::NoWindowsInstaller {
+            release_page: info.html_url.clone(),
+        });
     };
     installer_update::check_origin(url, OWNER_REPO, asset_name).map_err(fail)?;
     let expected = installer_update::Expected {
@@ -1060,60 +1498,57 @@ fn update_via_installer(info: &UpdateInfo) -> Result<Applied, String> {
     let prepared = installer_update::download(&expected, &dir, &format!("tako/{CURRENT_VERSION}"))
         .map_err(fail)?;
     Ok(Applied {
-        message: format!(
-            "インストーラーで更新（v{} の sha256 が配布元と一致。tako を終了して入れ替え、終わったら起動し直します）",
-            info.version
-        ),
+        message: UpdateNote::InstallerReady {
+            version: info.version.clone(),
+        }
+        .to_string(),
         restart: Restart::RunInstaller(prepared),
     })
 }
 
-fn update_via_homebrew(info: &UpdateInfo) -> Result<String, String> {
+fn update_via_homebrew(info: &UpdateInfo) -> Result<UpdateNote, UpdateRefusal> {
     // #586: GUI プロセスからの起動なのでコンソールウィンドウを出させない
     let output =
         tako_core::platform::process::no_console_window(&mut std::process::Command::new("brew"))
             .args(["upgrade", "--cask", "takushio2525/tako/tako"])
             .output()
-            .map_err(|e| format!("brew の実行に失敗: {e}"))?;
+            .map_err(|e| UpdateRefusal::BrewNotRun(e.to_string()))?;
     if output.status.success() {
-        Ok("Homebrew で更新完了".into())
+        Ok(UpdateNote::HomebrewDone)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("already installed") {
-            Ok("既に最新版です".into())
+            Ok(UpdateNote::AlreadyLatest)
         } else {
             // brew 失敗時は zip フォールバック可能であることを含めてエラーを返す（#50）
-            let has_zip = info.download_url.is_some();
-            let fallback_hint = if has_zip {
-                "\n[zip-fallback-available] brew 更新に失敗しました。`tako update apply-zip` で zip 経由の更新が可能です"
-            } else {
-                ""
-            };
-            Err(format!("brew upgrade が失敗: {stderr}{fallback_hint}"))
+            Err(UpdateRefusal::BrewUpgradeFailed {
+                stderr: stderr.into_owned(),
+                zip_fallback: info.download_url.is_some(),
+            })
         }
     }
 }
 
-fn update_via_zip(info: &UpdateInfo) -> Result<String, String> {
+fn update_via_zip(info: &UpdateInfo) -> Result<UpdateNote, UpdateRefusal> {
     let url = info
         .download_url
         .as_deref()
-        .ok_or_else(|| "ダウンロード用 ZIP アセットが見つかりません".to_string())?;
+        .ok_or(UpdateRefusal::NoZipAsset)?;
 
     let tmp_dir = std::env::temp_dir().join("tako-update");
     let _ = std::fs::remove_dir_all(&tmp_dir);
-    std::fs::create_dir_all(&tmp_dir).map_err(|e| format!("一時ディレクトリの作成に失敗: {e}"))?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| UpdateRefusal::TempDirFailed(e.to_string()))?;
     let zip_path = tmp_dir.join("tako.zip");
 
     let mut body = ureq::get(url)
         .header("User-Agent", &format!("tako/{CURRENT_VERSION}"))
         .call()
-        .map_err(|e| format!("ダウンロードに失敗: {e}"))?
+        .map_err(|e| UpdateRefusal::DownloadFailed(e.to_string()))?
         .into_body();
-    let mut file =
-        std::fs::File::create(&zip_path).map_err(|e| format!("ZIP ファイルの作成に失敗: {e}"))?;
+    let mut file = std::fs::File::create(&zip_path)
+        .map_err(|e| UpdateRefusal::ZipCreateFailed(e.to_string()))?;
     std::io::copy(&mut body.as_reader(), &mut file)
-        .map_err(|e| format!("ダウンロードの書き込みに失敗: {e}"))?;
+        .map_err(|e| UpdateRefusal::DownloadWriteFailed(e.to_string()))?;
     drop(file);
 
     let output = std::process::Command::new("ditto")
@@ -1123,41 +1558,34 @@ fn update_via_zip(info: &UpdateInfo) -> Result<String, String> {
             &tmp_dir.to_string_lossy(),
         ])
         .output()
-        .map_err(|e| format!("ditto による展開に失敗: {e}"))?;
+        .map_err(|e| UpdateRefusal::DittoNotRun(e.to_string()))?;
     if !output.status.success() {
-        return Err(format!(
-            "ZIP の展開に失敗: {}",
-            String::from_utf8_lossy(&output.stderr)
+        return Err(UpdateRefusal::UnzipFailed(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
         ));
     }
 
-    let extracted_app = find_app_bundle(&tmp_dir)
-        .ok_or_else(|| "展開した ZIP に tako.app が見つかりません".to_string())?;
+    let extracted_app = find_app_bundle(&tmp_dir).ok_or(UpdateRefusal::NoAppInZip)?;
 
     // 置き場のパスを一度も空けずに差し替える（#1042）。
     // 「退避 → 新規コピー → 退避先を削除」にすると、Dock のピン（.app への file URL
     // ブックマーク）が退避先へ追従したところでその実体を消してしまい、ピンが外れる
     let dest = Path::new(APP_INSTALL_PATH);
     let strategy =
-        tako_core::platform::bundle_install::replace_bundle_in_place(dest, &extracted_app)?;
+        tako_core::platform::bundle_install::replace_bundle_in_place(dest, &extracted_app)
+            .map_err(UpdateRefusal::BundleReplace)?;
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
     // 旧実装が残した退避（更新の途中で落ちた世代）が在れば片付ける
     let _ = std::fs::remove_dir_all(Path::new("/Applications/tako.app.bak"));
 
     // 手段の語（contents-swap / swap / fresh / move-aside）を必ず載せる。
-    // dispatch の `message` からそのまま読めるので、CLI / MCP でも何が起きたか分かる（#1042）
-    if strategy.keeps_path_occupied() {
-        Ok(format!("ZIP で更新完了（差し替え: {}）", strategy.label()))
-    } else {
-        // swap が使えない環境。更新自体は済んでいるので成功だが、Dock のピンが
-        // 外れうることは伏せない（#1042）
-        Ok(format!(
-            "ZIP で更新完了（差し替え: {}。この環境ではアトミックな入れ替えが使えないため、\
-             Dock のピン留めが外れることがあります）",
-            strategy.label()
-        ))
-    }
+    // dispatch の `message` からそのまま読めるので、CLI / MCP でも何が起きたか分かる（#1042）。
+    // swap が使えない環境は、更新自体は済んでいるので成功だが、Dock のピンが外れうることは伏せない
+    Ok(UpdateNote::ZipDone {
+        strategy: strategy.label(),
+        pin_may_drop: !strategy.keeps_path_occupied(),
+    })
 }
 
 /// ディレクトリ内の *.app バンドルを再帰的に探す
@@ -1187,17 +1615,16 @@ fn find_app_bundle(dir: &Path) -> Option<PathBuf> {
 pub fn restart_app(restart: &Restart) -> Result<(), String> {
     match restart {
         Restart::OpenBundle => {
-            let bundle = app_bundle_path()
-                .ok_or_else(|| ".app バンドルのパスが特定できない（CLI 単体実行？）".to_string())?;
+            let bundle = app_bundle_path().ok_or(UpdateRefusal::NoAppBundle)?;
             tako_control::platform::os_integration::open_new_instance(&bundle)
-                .map_err(|e| format!("再起動に失敗: {e}"))?;
+                .map_err(|e| UpdateRefusal::RestartFailed(e.to_string()))?;
             Ok(())
         }
         Restart::RunInstaller(prepared) => {
-            let relaunch = installer_update::relaunch_target().map_err(|e| e.to_string())?;
+            let relaunch = installer_update::relaunch_target().map_err(UpdateRefusal::Installer)?;
             // 子は待たない（tako はこの後すぐ抜け、インストーラーが残って仕事をする）
             let child = installer_update::launch(prepared, std::process::id(), &relaunch)
-                .map_err(|e| format!("{e}。今の版のまま使えます"))?;
+                .map_err(UpdateRefusal::InstallerNotLaunched)?;
             tako_control::diag::persist_log(&format!(
                 "更新: インストーラーを起動した（pid {}・sha256 {}・ログ {}）。\
                  tako を終了し、インストール後にインストーラーが起動し直す（#2434）",
@@ -1372,14 +1799,16 @@ mod tests {
 
     #[test]
     fn test_check_error_display() {
-        let e = CheckError::Network("connection refused".into());
-        assert!(e.to_string().contains("connection refused"));
+        for lang in [Lang::Ja, Lang::En] {
+            let e = CheckError::Network(NetworkCause::Transport("connection refused".into()));
+            assert!(e.text_in(lang).contains("connection refused"));
 
+            let e = CheckError::Parse(ParseCause::Json("bad json".into()));
+            assert!(e.text_in(lang).contains("bad json"));
+        }
         let e = CheckError::RateLimit { retry_after: None };
-        assert!(e.to_string().contains("レート制限"));
-
-        let e = CheckError::Parse("bad json".into());
-        assert!(e.to_string().contains("bad json"));
+        assert!(e.text_in(Lang::Ja).contains("レート制限"));
+        assert!(e.text_in(Lang::En).contains("rate limit"));
     }
 
     #[test]
@@ -1391,14 +1820,25 @@ mod tests {
         assert_eq!(json["type"], "rate_limit");
         assert_eq!(json["retry_after"], 1234567890);
 
-        let e = CheckError::Network("timeout".into());
+        let e = CheckError::Network(NetworkCause::Transport("timeout".into()));
         let json = e.to_json();
         assert_eq!(json["type"], "network");
+        assert_eq!(json["message"], "timeout");
+        // tako が書く中身は表示言語に従う（#2365。`message` は中身だけ = 従来の形）
+        let e = CheckError::Network(NetworkCause::UnexpectedStatus(500));
+        assert_eq!(
+            e.to_json_in(Lang::Ja)["message"],
+            "予期しないステータスコード: 500"
+        );
+        assert_eq!(
+            e.to_json_in(Lang::En)["message"],
+            "unexpected status code: 500"
+        );
     }
 
     #[test]
     fn test_check_error_retry_duration() {
-        let e = CheckError::Network("timeout".into());
+        let e = CheckError::Network(NetworkCause::Transport("timeout".into()));
         assert_eq!(e.retry_duration(), RETRY_INTERVAL);
 
         let e = CheckError::RateLimit { retry_after: None };
@@ -1407,34 +1847,27 @@ mod tests {
 
     #[test]
     fn test_format_reset_time() {
-        // 遠い未来の timestamp → 「約N分後」形式
+        // 遠い未来の timestamp → 「約N分後」形式（言語は引数で渡す = グローバルに触らない。#2365）
         let future = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs()
             + 300;
-        // 比較の 2 点（実装の出力とカタログ）は**同じ言語のもと**で読む（#1274）。
-        // 表示言語はプロセス全体のグローバルなので、ロックの外で読み比べると
-        // 別スレッドのテストが切り替えた瞬間に日英を突き合わせて落ちる
-        crate::ui_text::tests_support::for_each_lang(|| {
-            let s = format_reset_time(future);
-            // 秒表記の頭（Ja: 「約」/ En: 「in ~」）。**バイトで切ると日本語で
-            // 文字境界を割って panic する**ので文字単位で取る
-            let secs_head: String = crate::ui_text::update::eta_seconds(0)
-                .chars()
-                .take_while(|c| !c.is_ascii_digit())
-                .collect();
-            // 言語カタログ依存（#435）: 分または秒の相対表記のどちらか
-            assert!(
-                s == crate::ui_text::update::eta_minutes(4)
-                    || s == crate::ui_text::update::eta_minutes(5)
-                    || s.contains(&secs_head),
-                "相対表記になっていない: {s:?}"
-            );
-
-            // 過去の timestamp → 「まもなく」
-            assert_eq!(format_reset_time(0), crate::ui_text::update::eta_soon());
-        });
+        let ja = reset_eta_in(future, Lang::Ja);
+        assert!(ja == "約4分後" || ja == "約5分後", "{ja:?}");
+        let en = reset_eta_in(future, Lang::En);
+        assert!(en == "in ~4 min" || en == "in ~5 min", "{en:?}");
+        // 1 分未満は秒
+        let near = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 30;
+        assert!(reset_eta_in(near, Lang::Ja).ends_with("秒後"));
+        assert!(reset_eta_in(near, Lang::En).ends_with('s'));
+        // 過去の timestamp → 「まもなく」
+        assert_eq!(reset_eta_in(0, Lang::Ja), "まもなく");
+        assert_eq!(reset_eta_in(0, Lang::En), "soon");
     }
 
     // --- broken-brew 判定ロジックの単体テスト（サブプロセス不要） ---
@@ -1528,10 +1961,16 @@ mod tests {
 
     #[test]
     fn test_repair_brew_rejects_non_broken() {
-        let result = repair_brew();
-        if detect_install_method_full() != InstallMethod::BrokenBrew {
-            assert!(result.is_err());
-            assert!(result.unwrap_err().contains("修復は不要"));
+        let result = repair_brew_typed();
+        let method = detect_install_method_full();
+        if method != InstallMethod::BrokenBrew {
+            let err = result.expect_err("壊れていない配布系統は修復しない");
+            assert!(
+                matches!(err, UpdateRefusal::RepairNotNeeded(m) if m == method),
+                "{err:?}"
+            );
+            assert!(err.text_in(Lang::Ja).contains("修復は不要"));
+            assert!(err.text_in(Lang::En).contains("no repair is needed"));
         }
     }
 
@@ -2418,7 +2857,8 @@ mod tests {
                 Some(&digest),
             ),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .text_in(Lang::Ja);
         assert!(err.contains("取得元"), "{err}");
         assert!(err.contains("今の版のまま使えます"), "{err}");
         assert!(
@@ -2430,7 +2870,8 @@ mod tests {
             ApplyRoute::WindowsInstaller,
             &windows_info(&good, Some(1), None),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .text_in(Lang::Ja);
         assert!(err.contains("sha256"), "{err}");
         assert!(err.contains("今の版のまま使えます"), "{err}");
         // ポータブル版
@@ -2438,14 +2879,16 @@ mod tests {
             ApplyRoute::Refuse(InstallMethod::WindowsPortable),
             &windows_info(&good, Some(1), Some(&digest)),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .text_in(Lang::Ja);
         assert!(err.contains("ポータブル版"), "{err}");
         // Windows での apply-zip
         let err = run_route(
             ApplyRoute::Refuse(InstallMethod::WindowsInstaller),
             &windows_info(&good, Some(1), Some(&digest)),
         )
-        .unwrap_err();
+        .unwrap_err()
+        .text_in(Lang::Ja);
         assert!(err.contains("tako update apply"), "{err}");
     }
 
@@ -2463,6 +2906,453 @@ mod tests {
         assert!(
             win.contains("更新していません") || win.contains("nothing was updated"),
             "{win}"
+        );
+    }
+
+    // --- #2365: 更新の口の断り・結果の文は表示言語に従う ---
+
+    fn has_japanese(s: &str) -> Option<char> {
+        s.chars()
+            .find(|c| matches!(*c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF))
+    }
+
+    /// 通し番号（網羅 match = バリアントを足すと見本の表を足すまでここが E0004 で落ちる）
+    fn refusal_index(r: &UpdateRefusal) -> usize {
+        match r {
+            UpdateRefusal::UnknownChannel(_) => 0,
+            UpdateRefusal::CheckFailed(_) => 1,
+            UpdateRefusal::NoNewVersion(_) => 2,
+            UpdateRefusal::PortableNotUpdatable { .. } => 3,
+            UpdateRefusal::NoZipRouteOnWindows { .. } => 4,
+            UpdateRefusal::MethodCannotUpdate(_) => 5,
+            UpdateRefusal::InstallerRefused { .. } => 6,
+            UpdateRefusal::NoWindowsInstaller { .. } => 7,
+            UpdateRefusal::BrewNotRun(_) => 8,
+            UpdateRefusal::BrewUpgradeFailed { .. } => 9,
+            UpdateRefusal::NoZipAsset => 10,
+            UpdateRefusal::TempDirFailed(_) => 11,
+            UpdateRefusal::DownloadFailed(_) => 12,
+            UpdateRefusal::ZipCreateFailed(_) => 13,
+            UpdateRefusal::DownloadWriteFailed(_) => 14,
+            UpdateRefusal::DittoNotRun(_) => 15,
+            UpdateRefusal::UnzipFailed(_) => 16,
+            UpdateRefusal::NoAppInZip => 17,
+            UpdateRefusal::BundleReplace(_) => 18,
+            UpdateRefusal::RepairNotNeeded(_) => 19,
+            UpdateRefusal::BrewInstallFailed(_) => 20,
+            UpdateRefusal::NoAppBundle => 21,
+            UpdateRefusal::RestartFailed(_) => 22,
+            UpdateRefusal::Installer(_) => 23,
+            UpdateRefusal::InstallerNotLaunched(_) => 24,
+        }
+    }
+    const REFUSAL_VARIANTS: usize = 25;
+
+    fn note_index(n: &UpdateNote) -> usize {
+        match n {
+            UpdateNote::HomebrewDone => 0,
+            UpdateNote::AlreadyLatest => 1,
+            UpdateNote::ZipDone { .. } => 2,
+            UpdateNote::InstallerReady { .. } => 3,
+            UpdateNote::Repaired => 4,
+        }
+    }
+    const NOTE_VARIANTS: usize = 5;
+
+    fn installer_error_index(e: &installer_update::InstallerError) -> usize {
+        use installer_update::InstallerError as I;
+        match e {
+            I::Origin(_) => 0,
+            I::Unverifiable => 1,
+            I::Network(_) => 2,
+            I::Http(_) => 3,
+            I::Size { .. } => 4,
+            I::Digest => 5,
+            I::NotExecutable => 6,
+            I::Io(_) => 7,
+            I::Launch(_) => 8,
+            I::NotInstalled => 9,
+        }
+    }
+    const INSTALLER_ERROR_VARIANTS: usize = 10;
+
+    const PAGE: &str = "https://github.com/takushio2525/tako/releases/tag/v99.0.0";
+
+    /// 見本と #2365 より前の日本語（旧実装の `format!` を同じ値で組んだ文）
+    fn installer_error_table() -> Vec<(installer_update::InstallerError, &'static str)> {
+        use installer_update::InstallerError as I;
+        vec![
+            (
+                I::Origin("https://example.com/x.exe".into()),
+                "インストーラーの取得元が tako の GitHub Releases ではないため取りに行かない: https://example.com/x.exe",
+            ),
+            (
+                I::Unverifiable,
+                "配布元がインストーラーのサイズか sha256 を示していないため、検査できないので起動しない",
+            ),
+            (
+                I::Network("connection reset".into()),
+                "インストーラーのダウンロードに失敗: connection reset",
+            ),
+            (I::Http(503), "インストーラーのダウンロードに失敗（HTTP 503）"),
+            (
+                I::Size { got: 10, want: 20 },
+                "インストーラーの大きさが配布元の値と合わない（受信 10 バイト / 配布元 20 バイト。途中で切れた可能性がある）",
+            ),
+            (
+                I::Digest,
+                "インストーラーの sha256 が配布元の値と合わないので起動しない",
+            ),
+            (
+                I::NotExecutable,
+                "受けたファイルが Windows の実行ファイルではないので起動しない",
+            ),
+            (I::Io("disk full".into()), "インストーラーの保存に失敗: disk full"),
+            (
+                I::Launch("access denied".into()),
+                "インストーラーを起動できない: access denied",
+            ),
+            (
+                I::NotInstalled,
+                "この tako はインストーラーで入れた場所から動いていない（ポータブル版・開発ビルド）ため、アプリ内では更新できない。リリースページから同じ形式の配布物を取り直してください",
+            ),
+        ]
+    }
+
+    fn refusal_table() -> Vec<(UpdateRefusal, String)> {
+        use installer_update::InstallerError as I;
+        let net = |c: NetworkCause| UpdateRefusal::CheckFailed(CheckError::Network(c));
+        vec![
+            (
+                UpdateRefusal::UnknownChannel("beta".into()),
+                "不明なチャンネル: \"beta\"（stable / test のいずれか）".into(),
+            ),
+            (
+                net(NetworkCause::Transport("io: Connection refused".into())),
+                "更新チェックに失敗: ネットワークエラー: io: Connection refused".into(),
+            ),
+            (
+                net(NetworkCause::ReleasesNotFound),
+                "更新チェックに失敗: ネットワークエラー: リリースが見つからない（リポジトリ未公開または未リリース）".into(),
+            ),
+            (
+                net(NetworkCause::UnexpectedStatus(502)),
+                "更新チェックに失敗: ネットワークエラー: 予期しないステータスコード: 502".into(),
+            ),
+            (
+                UpdateRefusal::CheckFailed(CheckError::Parse(ParseCause::ReadBody("eof".into()))),
+                "更新チェックに失敗: レスポンス解析エラー: レスポンス読み取りエラー: eof".into(),
+            ),
+            (
+                UpdateRefusal::CheckFailed(CheckError::Parse(ParseCause::Json("expected value".into()))),
+                "更新チェックに失敗: レスポンス解析エラー: JSON パースエラー: expected value".into(),
+            ),
+            (
+                UpdateRefusal::CheckFailed(CheckError::RateLimit { retry_after: None }),
+                "更新チェックに失敗: GitHub レート制限中".into(),
+            ),
+            (
+                UpdateRefusal::CheckFailed(CheckError::RateLimit {
+                    retry_after: Some(0),
+                }),
+                "更新チェックに失敗: GitHub レート制限中（リセット: まもなく）".into(),
+            ),
+            (
+                UpdateRefusal::NoNewVersion(Channel::Stable),
+                "安定版の新しいバージョンが見つからない（既に最新版です）".into(),
+            ),
+            (
+                UpdateRefusal::NoNewVersion(Channel::Test),
+                "テスト版の新しいバージョンが見つからない（既に最新版です）".into(),
+            ),
+            (
+                UpdateRefusal::PortableNotUpdatable {
+                    release_page: PAGE.into(),
+                },
+                format!(
+                    "{}（リリースページ: {PAGE}）",
+                    installer_error_table()[9].1
+                ),
+            ),
+            (
+                UpdateRefusal::NoZipRouteOnWindows {
+                    release_page: PAGE.into(),
+                },
+                format!(
+                    "Windows には zip で差し替える経路が無い（zip は macOS の .app 用）。`tako update apply` でインストーラーから更新してください（リリースページ: {PAGE}）"
+                ),
+            ),
+            (
+                UpdateRefusal::MethodCannotUpdate(InstallMethod::Zip),
+                "配布系統 zip では更新できない".into(),
+            ),
+            (
+                UpdateRefusal::InstallerRefused {
+                    error: I::Digest,
+                    release_page: PAGE.into(),
+                },
+                format!(
+                    "インストーラーの sha256 が配布元の値と合わないので起動しない。今の版のまま使えます（手動で入れるならリリースページ: {PAGE}）"
+                ),
+            ),
+            (
+                UpdateRefusal::NoWindowsInstaller {
+                    release_page: PAGE.into(),
+                },
+                format!("このリリースに Windows のインストーラーが見つからない（リリースページ: {PAGE}）"),
+            ),
+            (
+                UpdateRefusal::BrewNotRun("No such file or directory (os error 2)".into()),
+                "brew の実行に失敗: No such file or directory (os error 2)".into(),
+            ),
+            (
+                UpdateRefusal::BrewUpgradeFailed {
+                    stderr: "Error: boom".into(),
+                    zip_fallback: true,
+                },
+                "brew upgrade が失敗: Error: boom\n[zip-fallback-available] brew 更新に失敗しました。`tako update apply-zip` で zip 経由の更新が可能です".into(),
+            ),
+            (
+                UpdateRefusal::BrewUpgradeFailed {
+                    stderr: "Error: boom".into(),
+                    zip_fallback: false,
+                },
+                "brew upgrade が失敗: Error: boom".into(),
+            ),
+            (
+                UpdateRefusal::NoZipAsset,
+                "ダウンロード用 ZIP アセットが見つかりません".into(),
+            ),
+            (
+                UpdateRefusal::TempDirFailed("Permission denied (os error 13)".into()),
+                "一時ディレクトリの作成に失敗: Permission denied (os error 13)".into(),
+            ),
+            (
+                UpdateRefusal::DownloadFailed("http status: 404".into()),
+                "ダウンロードに失敗: http status: 404".into(),
+            ),
+            (
+                UpdateRefusal::ZipCreateFailed("Permission denied (os error 13)".into()),
+                "ZIP ファイルの作成に失敗: Permission denied (os error 13)".into(),
+            ),
+            (
+                UpdateRefusal::DownloadWriteFailed("No space left on device (os error 28)".into()),
+                "ダウンロードの書き込みに失敗: No space left on device (os error 28)".into(),
+            ),
+            (
+                UpdateRefusal::DittoNotRun("No such file or directory (os error 2)".into()),
+                "ditto による展開に失敗: No such file or directory (os error 2)".into(),
+            ),
+            (
+                UpdateRefusal::UnzipFailed("ditto: Couldn't read PKZip signature".into()),
+                "ZIP の展開に失敗: ditto: Couldn't read PKZip signature".into(),
+            ),
+            (
+                UpdateRefusal::NoAppInZip,
+                "展開した ZIP に tako.app が見つかりません".into(),
+            ),
+            (
+                UpdateRefusal::BundleReplace("replace failed: os error 1".into()),
+                "replace failed: os error 1".into(),
+            ),
+            (
+                UpdateRefusal::RepairNotNeeded(InstallMethod::Homebrew),
+                "現在の配布系統は homebrew のため修復は不要です".into(),
+            ),
+            (
+                UpdateRefusal::BrewInstallFailed("Error: boom".into()),
+                "brew install --force が失敗: Error: boom".into(),
+            ),
+            (
+                UpdateRefusal::NoAppBundle,
+                ".app バンドルのパスが特定できない（CLI 単体実行？）".into(),
+            ),
+            (
+                UpdateRefusal::RestartFailed("open: exit status 1".into()),
+                "再起動に失敗: open: exit status 1".into(),
+            ),
+            (
+                UpdateRefusal::Installer(I::Launch("not found".into())),
+                "インストーラーを起動できない: not found".into(),
+            ),
+            (
+                UpdateRefusal::InstallerNotLaunched(I::Launch("access denied".into())),
+                "インストーラーを起動できない: access denied。今の版のまま使えます".into(),
+            ),
+        ]
+    }
+
+    fn note_table() -> Vec<(UpdateNote, String)> {
+        vec![
+            (UpdateNote::HomebrewDone, "Homebrew で更新完了".into()),
+            (UpdateNote::AlreadyLatest, "既に最新版です".into()),
+            (
+                UpdateNote::ZipDone {
+                    strategy: "contents-swap",
+                    pin_may_drop: false,
+                },
+                "ZIP で更新完了（差し替え: contents-swap）".into(),
+            ),
+            (
+                UpdateNote::ZipDone {
+                    strategy: "fresh",
+                    pin_may_drop: true,
+                },
+                "ZIP で更新完了（差し替え: fresh。この環境ではアトミックな入れ替えが使えないため、Dock のピン留めが外れることがあります）".into(),
+            ),
+            (
+                UpdateNote::InstallerReady {
+                    version: "99.0.0".into(),
+                },
+                "インストーラーで更新（v99.0.0 の sha256 が配布元と一致。tako を終了して入れ替え、終わったら起動し直します）".into(),
+            ),
+            (
+                UpdateNote::Repaired,
+                "brew の cask 台帳を再締結しました。以後 brew upgrade で更新できます".into(),
+            ),
+        ]
+    }
+
+    /// 1 行の検査: 日本語が旧文とバイト一致・英語に日本語が無い・英語が空でも日本語と同じでもない
+    /// （中身をそのまま出すもの = 文字列を持つだけのバリアントは日英が同じでよい）
+    fn check_row(
+        what: &str,
+        ja: &str,
+        en: &str,
+        old: &str,
+        passthrough: bool,
+        failures: &mut Vec<String>,
+    ) {
+        if ja != old {
+            failures.push(format!(
+                "{what} の日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}"
+            ));
+        }
+        if let Some(c) = has_japanese(en) {
+            failures.push(format!("{what} の英語に日本語（{c}）が混ざる: {en}"));
+        }
+        if en.trim().is_empty() || (!passthrough && ja == en) {
+            failures.push(format!(
+                "{what} の英語が空か日本語と同じ（英語の書き忘れ）: {en}"
+            ));
+        }
+    }
+
+    #[test]
+    fn 更新の口の断りは全バリアントが日英を持ち日本語は2365より前と一致() {
+        let mut failures = Vec::new();
+        let refusals = refusal_table();
+        let mut seen = [false; REFUSAL_VARIANTS];
+        for (r, old) in &refusals {
+            seen[refusal_index(r)] = true;
+            let passthrough = matches!(r, UpdateRefusal::BundleReplace(_));
+            check_row(
+                &format!("{r:?}"),
+                &r.text_in(Lang::Ja),
+                &r.text_in(Lang::En),
+                old,
+                passthrough,
+                &mut failures,
+            );
+            // 「見つからない」の読み（リモートの 404 寄せ）は日英でそろう
+            let (ja, en) = (r.text_in(Lang::Ja), r.text_in(Lang::En));
+            if tako_control::DispatchError::says_not_found(&ja)
+                != tako_control::DispatchError::says_not_found(&en)
+            {
+                failures.push(format!(
+                    "{r:?}: 見つからないの読みが日英で違う\n  ja: {ja}\n  en: {en}"
+                ));
+            }
+            // zip へ切り替える印は日英で同じ（GUI と AI が読む）
+            if ja.contains(ZIP_FALLBACK_MARK) != en.contains(ZIP_FALLBACK_MARK) {
+                failures.push(format!("{r:?}: {ZIP_FALLBACK_MARK} の有無が日英で違う"));
+            }
+        }
+        for (i, hit) in seen.iter().enumerate() {
+            if !hit {
+                failures.push(format!(
+                    "UpdateRefusal の見本に無いバリアント（通し番号）: {i}"
+                ));
+            }
+        }
+        let mut seen = [false; NOTE_VARIANTS];
+        for (n, old) in note_table() {
+            seen[note_index(&n)] = true;
+            check_row(
+                &format!("{n:?}"),
+                &n.text_in(Lang::Ja),
+                &n.text_in(Lang::En),
+                &old,
+                false,
+                &mut failures,
+            );
+        }
+        for (i, hit) in seen.iter().enumerate() {
+            if !hit {
+                failures.push(format!(
+                    "UpdateNote の見本に無いバリアント（通し番号）: {i}"
+                ));
+            }
+        }
+        let mut seen = [false; INSTALLER_ERROR_VARIANTS];
+        for (e, old) in installer_error_table() {
+            seen[installer_error_index(&e)] = true;
+            check_row(
+                &format!("{e:?}"),
+                &e.text_in(Lang::Ja),
+                &e.text_in(Lang::En),
+                old,
+                false,
+                &mut failures,
+            );
+        }
+        for (i, hit) in seen.iter().enumerate() {
+            if !hit {
+                failures.push(format!(
+                    "InstallerError の見本に無いバリアント（通し番号）: {i}"
+                ));
+            }
+        }
+        // 制限中の注記（update check の応答と通知カード）
+        for (retry, old) in [
+            (None, "GitHub API 制限中（キャッシュ表示）"),
+            (
+                Some(0),
+                "GitHub API 制限中（キャッシュ表示・リセット: まもなく）",
+            ),
+        ] {
+            check_row(
+                &format!("rate_limit_note({retry:?})"),
+                &rate_limit_note_in(retry, Lang::Ja),
+                &rate_limit_note_in(retry, Lang::En),
+                old,
+                false,
+                &mut failures,
+            );
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// 応答の `error.message`（update check）も中身と同じ言語
+    #[test]
+    fn 更新の確認の失敗の応答は中身も表示言語() {
+        let e = CheckError::Network(NetworkCause::ReleasesNotFound);
+        let en = e.to_json_in(Lang::En);
+        assert_eq!(en["type"], "network");
+        assert!(
+            has_japanese(en["message"].as_str().unwrap()).is_none(),
+            "{en}"
+        );
+        assert_eq!(
+            e.to_json_in(Lang::Ja)["message"],
+            "リリースが見つからない（リポジトリ未公開または未リリース）"
+        );
+        let limited = CheckError::RateLimit {
+            retry_after: Some(0),
+        };
+        assert_eq!(
+            limited.to_json_in(Lang::En)["message"],
+            "GitHub rate limit reached (resets soon)"
         );
     }
 }
