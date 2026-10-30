@@ -191,8 +191,8 @@ fn generate_prefiltered_syntaxes() {
     println!("cargo:rerun-if-changed=src/syntax_rewrite.rs");
     println!("cargo:rerun-if-changed=src/syntax_mirror.rs");
     let names: Vec<&str> = syntax_mirror::TARGETS.iter().map(|t| t.name).collect();
-    let bytes = syntax_rewrite::generate(&two_face::syntax::extra_newlines(), &names)
-    .unwrap_or_else(|e| {
+    let generated = syntax_rewrite::generate(&two_face::syntax::extra_newlines(), &names);
+    let bytes = generated.unwrap_or_else(|e| {
         println!(
             "cargo::warning=塗りの正規表現の前置きを作れなかった（元の正規表現のまま塗る。#1935）: {e}"
         );
