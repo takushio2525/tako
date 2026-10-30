@@ -4,9 +4,6 @@
 
 ---
 
-- 2026-07-31 #691: GUI ライク表示モード（初心者向け UI）の詳細仕様策定 — docs のみ
-- 2026-07-31 #694: GUI モード G1 — モード基盤 + スターター 3 ボタン
-- 2026-07-31 #690: アップデート詳細のリリースノートを Markdown レンダリングへ
 - 2026-08-01 #721: プロファイル（master / solo）の GUI 編集
 - 2026-08-02 #725: チャットビューのテキスト選択・コピー
 - 2026-08-02 #738: 設定画面プロファイルタブの描画崩壊を根治
@@ -687,3 +684,12 @@
 - 2026-10-28 #2424: 時間の番犬を束縛した関数の中だけで数える・#2413 の復元の時差のテストを gate の止めた時計で測る
 - 2026-10-28 #2447: 再起動をまたぐ復元とカタログの再開にも spawn と同じ MCP の断片 = `worker_mcp_args` / `prepare_for_resume` の 1 実装
 - 2026-10-28 #2462: Windows の probe の打ち切り・`tako queue` の取り消し・AI 命名の上限・session-restart の孫を #2454 の Job の境界で回収 `KillScope`
+- 2026-10-29 #2473: 復元・sessions resume・会話を保った再起動の worker を spawn と同じ `build_worker_cmd_in` の 1 実装へ。落ちていた --permission-mode auto・--remote-control 等を戻した
+- 2026-10-28 #2446: 隔離セルフテストの項目 88 が本物の `tako setup` を完走させ項目 111 が落ちていた → `self_test::withdraw_launch` で取り下げ・番犬 `selftest_launch_withdraw_watchdog`
+- 2026-10-28 #2415: dispatch.rs の実 PTY テスト 3 本の fixture を `$SHELL -l` から `/bin/sh -c "exec sleep 600"` へ・番犬が素の `SpawnOptions::default()` を名指し
+- 2026-10-29 #2479: test_write_isolation の `shell_probe` を尽きたら落ちる状態待ち `wait_for_shell` へ寄せ、実行は出力にだけ出るマーカーで判定・番犬 issue1308 を広げた
+- 2026-10-29 #2477: 子の走査が 1 瞬間だけ居た子を拾うと 60 秒 busy が残り項目 694(e) が間欠で落ちる → busy の集合が変わった回を次の tick で確かめ直す `settled_against`・A/B `TAKO_2477_LEGACY=1`
+- 2026-10-29 #2470: 突然死の復旧案内を `tako orchestrator resume <worker_id>` にし、spawn と同じ組み立て（`--settings`・許可モード・env・role）で戻す
+- 2026-10-29 #885: tako-app のペイン spawn と器の名前の予約を backend の入口 `wrap_spawn_for_pane` / `reserve_for_pane` 経由へ・組み立てを `wrap_options_for` の 1 実装にして psmux も通す
+- 2026-10-29 #2365 の続き: action で選ぶツールの断り（不明な action・値・要る引数）と設定の保存・置き場・`tako_theme` の残りを `Reason` へ。87 か所・16 種、dispatch の日本語の断り 243 → 157
+- 2026-10-30 #2388: セルフテストの FAILED の出口も `on_app_quit` と同じ後片付け `cleanup_process_scoped` を上限 5 秒で通す・設定置き場を器より先に消す・番犬 `selftest_exit_cleanup_watchdog`

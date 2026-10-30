@@ -20,33 +20,6 @@
 
 ---
 
-## 2026-10-29（#2473: 復元・sessions resume・会話を保った再起動の worker を spawn と同じ `build_worker_cmd_in` の 1 実装へ。落ちていた --permission-mode auto・--remote-control 等を戻した）
-- 隔離 GUI + 偽 claude / codex で修正前 FAIL 6 → 修正後 PASS 26・番犬の注入 10 通り・カタログ +0 B。PR #2476
-
-## 2026-10-28（#2446: 隔離セルフテストの項目 88 が本物の `tako setup` を完走させ項目 111 が落ちていた → `self_test::withdraw_launch` で取り下げ・番犬 `selftest_launch_withdraw_watchdog`）
-- 修正前 `statusbar=Some(3)` → 修正後 `Some(100)`・カタログ +0 B。97(e) の本物の master の起動は残り。PR #2475
-
-## 2026-10-28（#2415: dispatch.rs の実 PTY テスト 3 本の fixture を `$SHELL -l` から `/bin/sh -c "exec sleep 600"` へ・番犬が素の `SpawnOptions::default()` を名指し）
-- 修正前 20/20 FAILED（ssh 探索の 5 秒に rc が alt screen へ入る形）→ 修正後 60/60 ok・カタログ +0 B。PR #2474
-
-## 2026-10-29（#2479: test_write_isolation の `shell_probe` を尽きたら落ちる状態待ち `wait_for_shell` へ寄せ、実行は出力にだけ出るマーカーで判定・番犬 issue1308 を広げた）
-- 修正前は毎回プロンプトの折り返しで 20 秒の窓を使い切って無言で通っていた → 修正後 0.4 秒・`stuck` / `deaf` は `TAKO_2479_WAIT` で落ちる・30 回 × 並列 1 / 4 全通過・カタログ +0 B。PR #2481
-
-## 2026-10-29（#2477: 子の走査が 1 瞬間だけ居た子を拾うと 60 秒 busy が残り項目 694(e) が間欠で落ちる → busy の集合が変わった回を次の tick で確かめ直す `settled_against`・A/B `TAKO_2477_LEGACY=1`）
-- 旧 + 注入で 694(e) が 14.5 秒で落ち、新 + 注入は 1.6 秒で通る・単体 30 回 × 並列 1 / 4 全通過・カタログ +0 B。PR #2483
-
-## 2026-10-29（#2470: 突然死の復旧案内を `tako orchestrator resume <worker_id>` にし、spawn と同じ組み立て（`--settings`・許可モード・env・role）で戻す）
-- 偽 claude の実経路で修正前は 4 つとも落ちる → 修正後は全部載る・無人の復旧は隣の CLI を絶対パスで打つ・カタログ +0 B。main の `supervisor_loop` が呼び手ゼロなのが判明（#665 にコメント）。PR #2482
-
-## 2026-10-29（#885: tako-app のペイン spawn と器の名前の予約を backend の入口 `wrap_spawn_for_pane` / `reserve_for_pane` 経由へ・組み立てを `wrap_options_for` の 1 実装にして psmux も通す）
-- 修正前後で器のペインの argv 6 種がバイト一致・不正な器の名前は器なしで起こして persist.log へ・カタログ +0 B。psmux の conf の差は #2484・Windows 実機は未（Refs）。PR #2485
-
-## 2026-10-29（#2365 の続き: action で選ぶツールの断り（不明な action・値・要る引数）と設定の保存・置き場・`tako_theme` の残りを `Reason` へ。87 か所・16 種、dispatch の日本語の断り 243 → 157）
-- 実経路で修正前 FAIL 68 / 28 → 修正後 0・日本語 68 + 77 本一致・注入 5 通りで名指し・カタログ +0 B。PR #2487
-
-## 2026-10-30（#2388: セルフテストの FAILED の出口も `on_app_quit` と同じ後片付け `cleanup_process_scoped` を上限 5 秒で通す・設定置き場を器より先に消す・番犬 `selftest_exit_cleanup_watchdog`）
-- 修正前の main で器・ソケット・設定置き場が残る → 修正後は残らない（実経路の A/B）・固まっても理由と rc=1 は保つ・カタログ +0 B。visual-test の出口は #2491。PR #2488
-
 ## 2026-10-30（#2486: layout.json で表のペインどうしが同じ器の名前を持つと 2 本目の `-D` が 1 本目を切り離して閉じていた → 先のペインが器を持ち 2 本目以降は新しい器で起こす `restore_vessels`・FR-5.22）
 - 隔離 GUI で修正前 3→2 / 3→1 ペイン → 修正後 PASS 39・番犬の注入で main.rs を名指し・persist.log に 1 行・カタログ +0 B。PR #2489
 
@@ -79,3 +52,30 @@
 
 ## 2026-10-30（#1622: 環境診断の外部の問い合わせ（`claude mcp list` ほか）を導入状況と重ね、check-health 9.7〜12.0 → 5.8〜6.4 秒・setup --check 9.0〜9.9 → 5.4〜5.9 秒。出力は sha256 まで一致）
 - 番犬は diagnostics.rs の待ち合いの単体テスト（直列へ戻す注入 4 通りで file:line を名指し）・実経路 22 / 22・カタログ +0 B。PR #2505
+
+## 2026-10-30（#1593: CHANGELOG の `## [Unreleased]` 5 つを最上段の 1 つへ（埋もれた 42 項目は出荷版の節へ・0.7.9 の 8 項目は消費済み）・夜間の挿入を `scripts/lib/changelog.sh` へ（A/B `TAKO_1593_LEGACY=1`）・番犬 `issue1593_changelog_unreleased_watchdog`）
+- 注入 2 通りで番犬が file:line で FAILED・test-release-retry 152 pass・カタログ +0 B。PR #2506
+
+## 2026-10-30（#2365 の続き: dispatch の個別の断り（選択肢ダイアログへの応答・orchestrator・設定の保存・Web・メニュー・値の検証）82 か所を `Reason` へ（182 → 244 種）。CLI の handoffs / shortcuts の直呼びに表示言語の初期化）
+- 実経路 修正前 英語表示の日本語入り 49 / 49 → 0・CLI 7 / 7 → 0・日本語は全件バイト一致・注入 4 通りで名指し・カタログ +0 B。PR #2508
+
+## 2026-10-30（#1716: tako-cli のテストのビルドは `caller_pane` を env を読まない `test_caller` へ向け、`--pane` 省略の偽の緑を塞ぐ・迂回と結合テストの env の外し忘れは番犬 `issue1716_caller_pane_env_watchdog` が file:line で落とす）
+- 修正前は env ありで通り env なしで落ちる → 修正後は両方で同じ断り・注入 4 種を名指し・カタログ +0 B。PR #2510
+
+## 2026-10-30（#2509: issue1944_lsp_fetch の取ってきた 4 件が全体実行でだけ `starting` で落ちる = ログインシェルの rc の `pyenv rehash` がロック待ちで stdout を握り、10 秒の kill 後も EOF が来ない → `FetchConfig::plain_shell` で rc を読まない `/bin/sh -c`・上限は本番の既定）
+- 注入（rc が stdout を握る偽の `$SHELL`）で旧は実物と同じ 4 件・同じ JSON で落ち新は 10 passed・全体実行 3 回で 1944 の FAILED 0・カタログ +0 B。PR #2511
+
+## 2026-10-30（#1715: context-budget の起動前 1 行を予算超過と作業ログの復活・重複で言い分ける・応答の `startup_line` を CLI / MCP / master の 1 実装に）
+- 修正前は復活だけで「予算超過: 1 件」・両方で復活が 1 行から消えていた → 修正後は 4 通り × 日英で言い分け・カタログ +0 B。PR #2512
+
+## 2026-10-30（#2365 の続き: dispatch 本体に残っていた断り 59 種（LSP・検索・変更履歴・リモートフォルダ・カード・Code Runner・ファイルツリー・supervisor・ledger・セッション再起動ほか）を `Reason` へ・番犬の本体の範囲が途中の `#[cfg(test)] fn` で切れていたのを直した）
+- 実経路 43 ケースで英語表示の日本語入り 43 → 0・日本語はバイト一致・カタログ +0 B。残りは setup 系 17 行と他モジュールの文。PR #2515
+
+## 2026-10-30（#2513: install 後の `.tako-replace-<pid>` の ASP 拒否 22 本 / 31 秒の真因は「GUI 配下の tako CLI」ではなく、install をまたいだ remote daemon の serve 監視が `tailscale` を素の名前で起こす PATH の空振り（親の消えた実行ファイルで検査される）→ 検出の正本が絶対パスで持つ `exe::find_in_process_path`・A/B `TAKO_2513_LEGACY=1`）
+- 実 daemon + 本物の install_bundle_in_place の A/B で差し替え後の拒否 42 → 0・注入で番犬が tailscale.rs:160 を名指し・カタログ +0 B。本番確認待ちで Issue は開けたまま。PR #2516
+
+## 2026-10-30（#2514: issue1977 / issue1956 の e2e も取得つきの manager を helper 1 か所で作り `plain_shell = /bin/sh`・本番の既定の上限を渡す。番犬が helper の外の `with_fetch` も名指す）
+- 注入（rc が stdout を握る偽の `$SHELL`）で 1977 は旧 FAILED → 新 8 passed。1956 は起動に届かない（旧新とも ok）ので helper 経由の一時テストで旧 FAILED → 新 ok・カタログ +0 B。PR #2517
+
+## 2026-10-30（#2365 の続き: dispatch が素通ししていた orchestrator の設定ファイル（projects / accounts / profiles）とエージェント名の検証の断りを `ConfigError`（32 種）へ・型の口 `*_typed`）
+- 実経路 36 ケースで英語表示の日本語入り 36 → 0・CLI 11 件で 10 → 0・日本語はバイト一致・カタログ +0 B。PR #2521
