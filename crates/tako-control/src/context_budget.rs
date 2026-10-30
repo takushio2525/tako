@@ -1049,7 +1049,11 @@ mod tests {
     fn 自動で直せない超過の名指しに復活を選ばない() {
         use tako_core::i18n::Lang;
         let over = json!({ "path": "~/r/.agent/activeContext.md", "metric": "lines", "actual": 92, "limit": 80 });
-        let r = budget_report(&[over.clone()], 0, &["~/r/.agent/progress.md:12"]);
+        let r = budget_report(
+            std::slice::from_ref(&over),
+            0,
+            &["~/r/.agent/progress.md:12"],
+        );
         assert_eq!(
             startup_line_in(&r, Lang::Ja).unwrap(),
             "起動時ロードが予算超過: 1 件（概算 1234 トークン）。\
