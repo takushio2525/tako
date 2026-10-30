@@ -111,6 +111,7 @@ pub mod settings;
 pub mod setup;
 pub mod setup_bootstrap;
 pub mod setup_deps;
+pub mod setup_refusal;
 pub mod setup_remaining;
 pub mod shell_integration;
 pub mod shelved_restore;
@@ -157,6 +158,7 @@ pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
 pub use os_refusal::OsRefusal;
 pub use session_refusal::SessionRefusal;
+pub use setup_refusal::SetupRefusal;
 
 // --- claude session スキャンのイベント駆動トリガー（#368） ---
 use std::sync::atomic::{AtomicBool, Ordering};

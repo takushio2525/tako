@@ -22,6 +22,7 @@ use crate::orchestrator::ConfigError;
 use crate::os_refusal::OsRefusal;
 use crate::protocol::{error_code, Direction, FileOpKind, PreviewModeWire, Request};
 use crate::session_refusal::SessionRefusal;
+use crate::setup_refusal::SetupRefusal;
 
 // ControlHost とサブトレイトは host.rs で定義（Issue #86）
 pub use crate::host::{
@@ -11739,7 +11740,7 @@ fn dispatch_inner(
         Request::SetupChanges => {
             // 読み取り専用・プロセス内完結（アプリ状態に依存しない）。
             // 追従の適用は `tako setup` の自動適用フロー側の責務（Issue #94）
-            crate::setup::changes_status().map_err(DispatchError::Operation)
+            crate::setup::changes_status_typed().map_err(SetupRefusal::operation)
         }
 
         Request::SetupBootstrap {
@@ -11753,14 +11754,14 @@ fn dispatch_inner(
             // 対象の系統。**省略時は claude**（#868 からの既定を変えない）。
             // 未知の名前は黙って claude にしない（別の系統を入れてしまうため）
             let target = match agent.as_deref() {
-                Some(name) => crate::setup_bootstrap::parse_agent(name)
-                    .map_err(DispatchError::InvalidParams)?,
+                Some(name) => crate::setup_bootstrap::parse_agent_typed(name)
+                    .map_err(SetupRefusal::invalid)?,
                 None => tako_core::platform::agent_install::AgentKind::Claude,
             };
             match action {
-                "status" => crate::setup_bootstrap::status_for(target)
+                "status" => crate::setup_bootstrap::status_for_typed(target)
                     .map(|s| s.to_json())
-                    .map_err(DispatchError::Operation),
+                    .map_err(SetupRefusal::operation),
                 // 3 系統ぶんを一度に（`tako setup --check` と同じ材料。#989）
                 "status-all" => Ok(crate::setup_bootstrap::status_all_json()),
                 "install" => crate::setup_bootstrap::install_for(
@@ -11780,8 +11781,10 @@ fn dispatch_inner(
                 // 自動導入が通らないときの引き継ぎ計画（#1057。**読み取り専用**）。
                 // 実際に相手を起こすのは端末を持つ側（CLI）か、AI なら
                 // `tako_orchestrator_spawn` / `tako_run` の仕事
-                "handoff" => crate::setup_bootstrap::handoff_plan_for(target, reason.as_deref())
-                    .map_err(DispatchError::Operation),
+                "handoff" => {
+                    crate::setup_bootstrap::handoff_plan_for_typed(target, reason.as_deref())
+                        .map_err(SetupRefusal::operation)
+                }
                 other => Err(Reason::UnknownValue {
                     key: "action",
                     got: other.to_string(),
@@ -11803,7 +11806,7 @@ fn dispatch_inner(
                     "deps": crate::setup_deps::status_json(),
                     "install_command": "tako setup deps install",
                 })),
-                "install" => crate::setup_deps::install(
+                "install" => crate::setup_deps::install_typed(
                     dep.as_deref(),
                     crate::setup_deps::DepInstallOptions {
                         dry_run: dry_run.unwrap_or(false),
@@ -11811,7 +11814,7 @@ fn dispatch_inner(
                         interactive: false,
                     },
                 )
-                .map_err(DispatchError::Operation),
+                .map_err(SetupRefusal::operation),
                 other => Err(Reason::UnknownValue {
                     key: "action",
                     got: other.to_string(),
@@ -11829,8 +11832,8 @@ fn dispatch_inner(
             let catalogs = match agent.as_deref() {
                 None | Some("") | Some("all") => agent_models::catalog_all(),
                 Some(name) => {
-                    let kind = crate::orchestrator::agent::WorkerAgent::parse(name)
-                        .map_err(DispatchError::InvalidParams)?;
+                    let kind = crate::orchestrator::agent::WorkerAgent::parse_typed(name)
+                        .map_err(ConfigError::invalid)?;
                     vec![agent_models::catalog(kind)]
                 }
             };
@@ -11846,11 +11849,10 @@ fn dispatch_inner(
         Request::SetupRun { answers } => {
             let answers_value = answers.clone().unwrap_or_else(|| serde_json::json!({}));
             let parsed: crate::setup::SetupAnswers = serde_json::from_value(answers_value)
-                .map_err(|e| DispatchError::InvalidParams(format!("setup answers が不正: {e}")))?;
-            parsed.validate().map_err(DispatchError::InvalidParams)?;
-            let answers_json = serde_json::to_string(&parsed).map_err(|e| {
-                DispatchError::Operation(format!("setup answers の JSON 化に失敗: {e}"))
-            })?;
+                .map_err(|e| SetupRefusal::AnswersMalformed(e.to_string()).invalid())?;
+            parsed.validate_typed().map_err(SetupRefusal::invalid)?;
+            let answers_json = serde_json::to_string(&parsed)
+                .map_err(|e| SetupRefusal::AnswersEncode(e.to_string()).operation())?;
             let tako_bin = resolve_tako_binary();
             run_setup_cli(&tako_bin, &answers_json)
         }
@@ -11862,9 +11864,9 @@ fn dispatch_inner(
         } => {
             let action = action.as_deref().unwrap_or("sync");
             match action {
-                "sync" => crate::agents_sync::run_sync(source.as_deref(), targets.as_deref())
-                    .map_err(DispatchError::Operation),
-                "status" => crate::agents_sync::status().map_err(DispatchError::Operation),
+                "sync" => crate::agents_sync::run_sync_typed(source.as_deref(), targets.as_deref())
+                    .map_err(SetupRefusal::operation),
+                "status" => crate::agents_sync::status_typed().map_err(SetupRefusal::operation),
                 other => Err(Reason::UnknownValue {
                     key: "action",
                     got: other.to_string(),
@@ -21179,7 +21181,18 @@ pub enum McpScope {
 /// 1. `claude` CLI があれば `claude mcp add` を使う（公式経路）
 /// 2. なければ設定ファイルを直接マージ編集（user → ~/.claude.json、project → cwd/.mcp.json）
 /// 3. 旧バージョンが残した ~/.claude/settings.json の mcpServers.tako を検出・掃除
+///
+/// 断りの文は**日本語のまま**（呼び手は CLI の `tako setup` = 枠が日本語の手元の処理）。
+/// 断りを表示言語で返す dispatch は [`setup_mcp_typed`] を通す（#2365）
 pub fn setup_mcp(tako_binary: &str, scope: &McpScope) -> Result<SetupMcpResult, DispatchError> {
+    setup_mcp_typed(tako_binary, scope).map_err(|e| DispatchError::Operation(e.into_ja()))
+}
+
+/// [`setup_mcp`] の型の口（#2365）
+pub fn setup_mcp_typed(
+    tako_binary: &str,
+    scope: &McpScope,
+) -> Result<SetupMcpResult, SetupRefusal> {
     let existing = read_mcp_registration(scope);
     if let Some(ref cmd) = existing {
         if !cmd.is_empty() && std::path::Path::new(cmd).is_file() {
@@ -21234,7 +21247,7 @@ pub fn setup_mcp_agents(
     use crate::orchestrator::agent::WorkerAgent;
 
     let explicit = match agent {
-        Some(name) => Some(WorkerAgent::parse(name).map_err(DispatchError::Operation)?),
+        Some(name) => Some(WorkerAgent::parse_typed(name).map_err(ConfigError::operation)?),
         None => None,
     };
     let targets: Vec<WorkerAgent> = match explicit {
@@ -21251,7 +21264,7 @@ pub fn setup_mcp_agents(
 
     for target in targets {
         if target == WorkerAgent::Claude {
-            let result = setup_mcp(&tako_bin, scope)?;
+            let result = setup_mcp_typed(&tako_bin, scope).map_err(SetupRefusal::operation)?;
             let mut entry = json!({
                 "agent": "claude",
                 "configured": result.configured,
@@ -21377,7 +21390,7 @@ fn setup_mcp_via_cli(
     claude_bin: &str,
     tako_binary: &str,
     scope: &McpScope,
-) -> Result<(), DispatchError> {
+) -> Result<(), SetupRefusal> {
     let scope_arg = match scope {
         McpScope::User => "user",
         McpScope::Project(_) => "project",
@@ -21412,22 +21425,22 @@ fn setup_mcp_via_cli(
     }
     let output = cmd
         .output()
-        .map_err(|e| DispatchError::Operation(format!("claude mcp add の実行に失敗: {e}")))?;
+        .map_err(|e| SetupRefusal::ClaudeMcpAddSpawn(e.to_string()))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(DispatchError::Operation(format!(
-            "claude mcp add が失敗 (exit {}): {stderr}",
-            output.status
-        )));
+        return Err(SetupRefusal::ClaudeMcpAddFailed {
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
     }
     Ok(())
 }
 
-fn setup_mcp_direct(tako_binary: &str, scope: &McpScope) -> Result<(), DispatchError> {
+fn setup_mcp_direct(tako_binary: &str, scope: &McpScope) -> Result<(), SetupRefusal> {
     let path = mcp_target_path(scope);
     let mut data: serde_json::Map<String, Value> = if path.is_file() {
-        let content = std::fs::read_to_string(&path).map_err(|e| {
-            DispatchError::Operation(format!("{} の読み取りに失敗: {e}", path.display()))
+        let content = std::fs::read_to_string(&path).map_err(|e| SetupRefusal::McpConfigRead {
+            path: path.display().to_string(),
+            error: e.to_string(),
         })?;
         // **既定値へ落として書き戻してはいけない**（#916）: ここは claude 自身の
         // 設定ファイル（`~/.claude.json` / `.mcp.json`）で、空 map から書き直すと
@@ -21437,13 +21450,9 @@ fn setup_mcp_direct(tako_binary: &str, scope: &McpScope) -> Result<(), DispatchE
         if content.trim().is_empty() {
             serde_json::Map::new()
         } else {
-            serde_json::from_str(&content).map_err(|e| {
-                DispatchError::Operation(format!(
-                    "{} を JSON として解釈できないので書き換えを中止した（{}）。\
-                     内容を直すか退避してからやり直してください",
-                    path.display(),
-                    tako_core::load_issue::json_error_reason(&e)
-                ))
+            serde_json::from_str(&content).map_err(|e| SetupRefusal::McpConfigNotJson {
+                path: path.display().to_string(),
+                reason: tako_core::load_issue::JsonReason::of(&e),
             })?
         }
     } else {
@@ -21453,7 +21462,7 @@ fn setup_mcp_direct(tako_binary: &str, scope: &McpScope) -> Result<(), DispatchE
     let servers = data.entry("mcpServers").or_insert_with(|| json!({}));
     let servers_obj = servers
         .as_object_mut()
-        .ok_or_else(|| DispatchError::Operation("mcpServers がオブジェクトでない".into()))?;
+        .ok_or(SetupRefusal::McpServersNotObject)?;
     servers_obj.insert(
         "tako".to_string(),
         json!({
@@ -21465,14 +21474,16 @@ fn setup_mcp_direct(tako_binary: &str, scope: &McpScope) -> Result<(), DispatchE
     );
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            DispatchError::Operation(format!("{} の作成に失敗: {e}", parent.display()))
+        std::fs::create_dir_all(parent).map_err(|e| SetupRefusal::McpConfigDirCreate {
+            path: parent.display().to_string(),
+            error: e.to_string(),
         })?;
     }
     let json = serde_json::to_string_pretty(&data)
-        .map_err(|e| DispatchError::Operation(format!("JSON のシリアライズに失敗: {e}")))?;
-    std::fs::write(&path, json).map_err(|e| {
-        DispatchError::Operation(format!("{} への書き込みに失敗: {e}", path.display()))
+        .map_err(|e| SetupRefusal::McpConfigSerialize(e.to_string()))?;
+    std::fs::write(&path, json).map_err(|e| SetupRefusal::McpConfigWrite {
+        path: path.display().to_string(),
+        error: e.to_string(),
     })?;
     Ok(())
 }
@@ -21598,13 +21609,13 @@ fn run_setup_cli_within(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| DispatchError::Operation(format!("tako setup の起動に失敗: {e}")))?;
+            .map_err(|e| SetupRefusal::SetupSpawn(e.to_string()).operation())?;
     child
         .stdin
         .take()
-        .ok_or_else(|| DispatchError::Operation("tako setup の標準入力を開けない".into()))?
+        .ok_or_else(|| SetupRefusal::SetupStdinUnavailable.operation())?
         .write_all(answers_json.as_bytes())
-        .map_err(|e| DispatchError::Operation(format!("setup answers の送信に失敗: {e}")))?;
+        .map_err(|e| SetupRefusal::AnswersSend(e.to_string()).operation())?;
     let (status, stdout, stderr, timed_out, waited) =
         match tako_core::probe::wait_with_timeout(child, "tako setup", budget) {
             tako_core::probe::Outcome::Done {
@@ -21619,9 +21630,7 @@ fn run_setup_cli_within(
                 ..
             } => (None, stdout, stderr, true, Some(waited.as_secs())),
             tako_core::probe::Outcome::Failed { reason, .. } => {
-                return Err(DispatchError::Operation(format!(
-                    "tako setup の完了待ちに失敗: {reason}"
-                )))
+                return Err(SetupRefusal::SetupWaitFailed(reason).operation())
             }
         };
     let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
@@ -21646,11 +21655,12 @@ fn run_setup_cli_within(
     }
     let status = status.expect("打ち切りでないなら終了コードがある");
     if !status.success() {
-        return Err(DispatchError::Operation(format!(
-            "tako setup が失敗しました (exit={}): {}",
-            status.code().unwrap_or(-1),
-            output
-        )));
+        // `output` は子の `tako setup` の出力（setup の枠 = 日本語のまま。外部コマンドの出力と同じ扱い）
+        return Err(SetupRefusal::SetupFailed {
+            code: status.code().unwrap_or(-1),
+            output,
+        }
+        .operation());
     }
     Ok(serde_json::json!({
         "completed": true,
@@ -47189,7 +47199,8 @@ mod tests {
         let err =
             setup_mcp_direct("/usr/local/bin/tako", &scope).expect_err("壊れた JSON では中止する");
         assert!(
-            format!("{err:?}").contains("解釈できない"),
+            err.text_in(tako_core::i18n::Lang::Ja)
+                .contains("解釈できない"),
             "理由を返す: {err:?}"
         );
         assert_eq!(

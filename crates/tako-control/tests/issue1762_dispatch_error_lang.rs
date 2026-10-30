@@ -225,6 +225,20 @@ fn display_follows_the_display_language() {
              context / cost / model / effort / tako（ui.json は書いていない）",
             "{lang:?}"
         );
+        // #2365 の続き: dispatch の setup 系の断り（MCP の `tako_setup` の answers ほか）は型の口が
+        // 表示言語で返す（上の CLI の `tako setup` の従来の口は日本語のまま）
+        for (r, _) in setup_refusal_table() {
+            assert_eq!(r.to_string(), r.text_in(lang), "{r:?} / {lang:?}");
+        }
+        for (e, _) in agent_mcp_table() {
+            assert_eq!(e.to_string(), e.text_in(lang), "{e:?} / {lang:?}");
+        }
+        let answers: tako_control::setup::SetupAnswers = serde_json::from_str(
+            r#"{"mod_ui": {"buttons": [{"kind": "slash", "value": "bash"}]}}"#,
+        )
+        .expect("answers の形");
+        let typed = answers.validate_typed().expect_err("許可リストの外");
+        assert_eq!(typed.to_string(), typed.text_in(lang), "{lang:?}");
         // #2365 の続き: tako mod ui の枠の文・引数の読み方の断り・排他の断り・語彙の説明・
         // 選べる値の一覧も同じグローバルを引く（CLI の表示と MCP の応答はこの表示）
         for (t, _, _) in ui_text_table() {
@@ -10198,4 +10212,764 @@ fn osのシェル連携と蓋閉じ継続の番犬の境界() {
         .map(|(l, _)| l)
         .collect();
     assert_eq!(found, vec![2, 4], "断りの日本語の 2 か所だけを名指す");
+}
+
+// ---- #2365 の続き: setup 系の断り（`SetupRefusal`）と codex / agy への MCP 登録の断り（`AgentMcpError`） ----
+//
+// dispatch の `tako_setup_mcp` / `tako_setup` / `tako_setup_changes` / `tako_agents_sync_rules` /
+// `tako_setup_deps` / `tako_setup_models` / `tako_setup_bootstrap`（系統名・status・handoff）は、以前は
+// dispatch 自身の日本語の固定文（claude への MCP 登録・子の `tako setup`・answers）と、中身の口
+// （`setup` / `agents_sync` / `setup_deps` / `setup_bootstrap` / `agent_mcp`）の `Err(String)` を素通し
+// していた。日英の対は 2 つの型の `text_in` の網羅 match に置き、従来の `String` の口は日本語のまま
+// （CLI の `tako setup` は枠が日本語 = FR-2.42.21）、dispatch だけが型の口（`*_typed`）を通す。ここでは
+// (1) 全バリアントの日英と旧文のバイト一致・「見つからない」の読みが日英で同じ、(2) 型の口の本体の断りの
+// 組み立て（`Err(` / `.map_err(` / `.ok_or(`）に日本語の固定文を書き足していないこと、(3) dispatch が
+// 日本語の口を呼んで断りに載せていないことを `file:line` で名指す。成功の応答の注記（`Ok` の文 =
+// 依存の `skipped` の detail・子の打ち切りの note・同期の未設定の message）は断りではないので見ない
+
+use tako_control::agent_mcp::AgentMcpError;
+use tako_control::SetupRefusal;
+
+const SETUP_REFUSAL_SRC: &str = include_str!("../src/setup_refusal.rs");
+const SETUP_REFUSAL_PATH: &str = "crates/tako-control/src/setup_refusal.rs";
+const AGENT_MCP_SRC: &str = include_str!("../src/agent_mcp.rs");
+const AGENT_MCP_PATH: &str = "crates/tako-control/src/agent_mcp.rs";
+const SETUP_SRC: &str = include_str!("../src/setup.rs");
+const SETUP_PATH: &str = "crates/tako-control/src/setup.rs";
+const AGENTS_SYNC_SRC: &str = include_str!("../src/agents_sync.rs");
+const AGENTS_SYNC_PATH: &str = "crates/tako-control/src/agents_sync.rs";
+const SETUP_DEPS_SRC: &str = include_str!("../src/setup_deps.rs");
+const SETUP_DEPS_PATH: &str = "crates/tako-control/src/setup_deps.rs";
+const SETUP_BOOTSTRAP_SRC: &str = include_str!("../src/setup_bootstrap.rs");
+const SETUP_BOOTSTRAP_PATH: &str = "crates/tako-control/src/setup_bootstrap.rs";
+
+/// `SetupRefusal` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
+fn setup_refusal_index(r: &SetupRefusal) -> usize {
+    use SetupRefusal as S;
+    match r {
+        S::ClaudeMcpAddSpawn(_) => 0,
+        S::ClaudeMcpAddFailed { .. } => 1,
+        S::McpConfigRead { .. } => 2,
+        S::McpConfigNotJson { .. } => 3,
+        S::McpServersNotObject => 4,
+        S::McpConfigDirCreate { .. } => 5,
+        S::McpConfigSerialize(_) => 6,
+        S::McpConfigWrite { .. } => 7,
+        S::AnswersMalformed(_) => 8,
+        S::AnswersEncode(_) => 9,
+        S::SetupSpawn(_) => 10,
+        S::SetupStdinUnavailable => 11,
+        S::AnswersSend(_) => 12,
+        S::SetupWaitFailed(_) => 13,
+        S::SetupFailed { .. } => 14,
+        S::SelectedAgent(_) => 15,
+        S::ProviderPlanKey(_) => 16,
+        S::InstructionEmpty => 17,
+        S::ProjectKeyEmpty => 18,
+        S::ProjectCwdEmpty(_) => 19,
+        S::LaunchAgent(_) => 20,
+        S::ModUi(_) => 21,
+        S::SleepMode(_) => 22,
+        S::SleepPower(_) => 23,
+        S::Profile(_) => 24,
+        S::ConfigHomeUnresolved => 25,
+        S::ConfigRead(_) => 26,
+        S::ConfigParse(_) => 27,
+        S::ChangelogParse(_) => 28,
+        S::ChangelogPlatform { .. } => 29,
+        S::SyncSourceUnset => 30,
+        S::SyncSourceMissing(_) => 31,
+        S::SyncSourceRead(_) => 32,
+        S::SyncSourceEmpty => 33,
+        S::UnknownDep { .. } => 34,
+        S::DepInstallerSpawn { .. } => 35,
+        S::DepInstallerFailed { .. } => 36,
+        S::DepMissingAfterInstall { .. } => 37,
+        S::UnknownBootstrapAgent { .. } => 38,
+        S::BootstrapHomeUnresolved => 39,
+    }
+}
+
+const SETUP_REFUSAL_VARIANTS: usize = 40;
+
+/// `AgentMcpError` の通し番号
+fn agent_mcp_index(e: &AgentMcpError) -> usize {
+    match e {
+        AgentMcpError::CliNotFound { .. } => 0,
+        AgentMcpError::ScopeUnsupported { .. } => 1,
+        AgentMcpError::Spawn { .. } => 2,
+        AgentMcpError::CommandFailed { .. } => 3,
+        AgentMcpError::NotReflected { .. } => 4,
+        AgentMcpError::NotSupportedHere { .. } => 5,
+    }
+}
+
+const AGENT_MCP_VARIANTS: usize = 6;
+
+/// `tako mod ui` に断られる answers（slash に許可リストの外のコマンド）の実物の `UiError`
+fn mod_ui_refusal() -> tako_core::claude_mod_ui::UiError {
+    let answers: tako_core::claude_mod_ui::UiAnswers =
+        serde_json::from_str(r#"{"buttons": [{"kind": "slash", "value": "bash"}]}"#)
+            .expect("answers の形");
+    tako_core::claude_mod_ui::check_answers(&answers).expect_err("許可リストの外は断られる")
+}
+
+/// 見本と、#2365 より前の固定文（dispatch・`setup` / `agents_sync` / `setup_deps` / `setup_bootstrap` の
+/// `format!` を見本の値で展開したもの）
+fn setup_refusal_table() -> Vec<(SetupRefusal, String)> {
+    use SetupRefusal as S;
+    let e = || "No such file or directory (os error 2)".to_string();
+    let enoent = e();
+    let broken_json =
+        serde_json::from_str::<serde_json::Value>("{ \"mcpServers\": ").expect_err("壊れている");
+    let broken_yaml_text = "setup: [broken\n";
+    let broken_yaml =
+        serde_yaml::from_str::<serde_yaml::Value>(broken_yaml_text).expect_err("壊れている");
+    let json_reason = tako_core::load_issue::json_error_reason(&broken_json);
+    let yaml_reason = tako_core::load_issue::yaml_error_reason(&broken_yaml, broken_yaml_text);
+    vec![
+        (
+            S::ClaudeMcpAddSpawn(e()),
+            format!("claude mcp add の実行に失敗: {enoent}"),
+        ),
+        (
+            S::ClaudeMcpAddFailed {
+                status: "exit status: 1".into(),
+                stderr: "boom\n".into(),
+            },
+            "claude mcp add が失敗 (exit exit status: 1): boom\n".into(),
+        ),
+        (
+            S::McpConfigRead {
+                path: "/h/.claude.json".into(),
+                error: e(),
+            },
+            format!("/h/.claude.json の読み取りに失敗: {enoent}"),
+        ),
+        (
+            S::McpConfigNotJson {
+                path: "/h/.mcp.json".into(),
+                reason: tako_core::load_issue::JsonReason::of(&broken_json),
+            },
+            format!(
+                "/h/.mcp.json を JSON として解釈できないので書き換えを中止した（{json_reason}）。\
+                 内容を直すか退避してからやり直してください"
+            ),
+        ),
+        (S::McpServersNotObject, "mcpServers がオブジェクトでない".into()),
+        (
+            S::McpConfigDirCreate {
+                path: "/h/p".into(),
+                error: e(),
+            },
+            format!("/h/p の作成に失敗: {enoent}"),
+        ),
+        (
+            S::McpConfigSerialize("e".into()),
+            "JSON のシリアライズに失敗: e".into(),
+        ),
+        (
+            S::McpConfigWrite {
+                path: "/h/.mcp.json".into(),
+                error: e(),
+            },
+            format!("/h/.mcp.json への書き込みに失敗: {enoent}"),
+        ),
+        (
+            S::AnswersMalformed("invalid type: integer `1`, expected a string".into()),
+            "setup answers が不正: invalid type: integer `1`, expected a string".into(),
+        ),
+        (
+            S::AnswersEncode("e".into()),
+            "setup answers の JSON 化に失敗: e".into(),
+        ),
+        (
+            S::SetupSpawn(e()),
+            format!("tako setup の起動に失敗: {enoent}"),
+        ),
+        (
+            S::SetupStdinUnavailable,
+            "tako setup の標準入力を開けない".into(),
+        ),
+        (
+            S::AnswersSend("Broken pipe (os error 32)".into()),
+            "setup answers の送信に失敗: Broken pipe (os error 32)".into(),
+        ),
+        (
+            S::SetupWaitFailed("e".into()),
+            "tako setup の完了待ちに失敗: e".into(),
+        ),
+        (
+            S::SetupFailed {
+                code: 3,
+                output: "out".into(),
+            },
+            "tako setup が失敗しました (exit=3): out".into(),
+        ),
+        (
+            S::SelectedAgent("x".into()),
+            "selected_agent は claude / codex / agy のいずれかです: x".into(),
+        ),
+        (
+            S::ProviderPlanKey("x".into()),
+            "provider_plans のキーは claude / gpt / google のいずれかです: x".into(),
+        ),
+        (
+            S::InstructionEmpty,
+            "instruction_content は空にできません".into(),
+        ),
+        (S::ProjectKeyEmpty, "projects のキーは空にできません".into()),
+        (
+            S::ProjectCwdEmpty("k".into()),
+            "projects.k.cwd は空にできません".into(),
+        ),
+        (
+            S::LaunchAgent("x".into()),
+            "launch_agent は claude / codex / agy / none のいずれかです: x".into(),
+        ),
+        (
+            S::ModUi(mod_ui_refusal()),
+            "mod_ui: slash で送れるのは許可リストのコマンドだけ。使える値: compact / clear / \
+             context / cost / model / effort / tako（ui.json は書いていない）"
+                .into(),
+        ),
+        (
+            S::SleepMode("x".into()),
+            "sleep_guard.mode は off / on / while-agents-running のいずれかです: x".into(),
+        ),
+        (
+            S::SleepPower("x".into()),
+            "sleep_guard.power は ac-only / always のいずれかです: x".into(),
+        ),
+        (
+            S::Profile(ConfigError::ProfileMasterAgent(Box::new(
+                ConfigError::UnknownAgent("x".into()),
+            ))),
+            "プロファイルの master_agent が不正: 未対応のエージェント種別 'x'（対応: claude / codex / agy）"
+                .into(),
+        ),
+        (
+            S::ConfigHomeUnresolved,
+            "ホームディレクトリが取得できない（$HOME 未設定）".into(),
+        ),
+        (
+            S::ConfigRead(e()),
+            format!("config.yaml の読み取りに失敗: {enoent}"),
+        ),
+        (
+            S::ConfigParse(YamlReason::of(&broken_yaml, broken_yaml_text)),
+            format!("config.yaml のパースに失敗: {yaml_reason}"),
+        ),
+        (
+            S::ChangelogParse(YamlReason::of(&broken_yaml, broken_yaml_text)),
+            format!("changes.yaml のパースに失敗: {yaml_reason}"),
+        ),
+        (
+            S::ChangelogPlatform {
+                revision: 7,
+                value: "linux".into(),
+            },
+            "changes.yaml revision 7 の platforms に未知の値: linux（macos / windows）".into(),
+        ),
+        (
+            S::SyncSourceUnset,
+            "共通ルールの正本パスが設定されていません。\n\
+             tako setup で設定するか、--source オプションで指定してください"
+                .into(),
+        ),
+        (
+            S::SyncSourceMissing("/h/rules.md".into()),
+            "正本ファイルが見つかりません: /h/rules.md\n\
+             ファイルを作成するか、tako setup で正本のパスを設定してください"
+                .into(),
+        ),
+        (
+            S::SyncSourceRead(e()),
+            format!("正本ファイルの読み取りに失敗: {enoent}"),
+        ),
+        (S::SyncSourceEmpty, "正本ファイルが空です".into()),
+        (
+            S::UnknownDep {
+                got: "x".into(),
+                allowed: "tmux / gh".into(),
+            },
+            "不明な依存: \"x\"（この環境の対象は tmux / gh）".into(),
+        ),
+        (
+            S::DepInstallerSpawn {
+                program: "/opt/homebrew/bin/brew".into(),
+                error: e(),
+            },
+            format!("/opt/homebrew/bin/brew を起動できません: {enoent}"),
+        ),
+        (
+            S::DepInstallerFailed {
+                command: "brew install tmux".into(),
+                code: 1,
+                log: "  Error: x \n".into(),
+            },
+            "brew install tmux が失敗しました（exit 1）。上に出ているエラーを確認してください\nError: x"
+                .into(),
+        ),
+        (
+            S::DepMissingAfterInstall {
+                command: "brew install tmux".into(),
+                bin: "tmux".into(),
+            },
+            "brew install tmux は正常終了しましたが tmux が見つかりません。\n\
+             ターミナルを開き直してから `tako setup deps` で確認してください"
+                .into(),
+        ),
+        (
+            S::UnknownBootstrapAgent {
+                got: "x".into(),
+                allowed: "claude / codex / agy".into(),
+            },
+            "不明なエージェント: \"x\"（claude / codex / agy のいずれか）".into(),
+        ),
+        (
+            S::BootstrapHomeUnresolved,
+            "ホームディレクトリを特定できません（HOME が未設定）".into(),
+        ),
+    ]
+}
+
+/// 見本と、#2365 より前の `Display` の文
+fn agent_mcp_table() -> Vec<(AgentMcpError, String)> {
+    use AgentMcpError as A;
+    let codex = WorkerAgent::Codex;
+    vec![
+        (
+            A::CliNotFound { agent: codex },
+            "codex CLI が見つからないので MCP 登録できません。次の一手: codex を導入して PATH を通してから \
+             tako setup-mcp --agent codex をやり直してください（導入の案内: https://developers.openai.com/codex/cli）"
+                .into(),
+        ),
+        (
+            A::ScopeUnsupported {
+                agent: WorkerAgent::Agy,
+                scope: "project",
+            },
+            "agy は scope=project の MCP 登録に対応していません（ユーザーグローバルのみ）。\
+             次の一手: --project を外して tako setup-mcp --agent agy を実行してください"
+                .into(),
+        ),
+        (
+            A::Spawn {
+                agent: codex,
+                detail: "Permission denied (os error 13)".into(),
+            },
+            "codex mcp add を起動できませんでした（Permission denied (os error 13)）。\
+             次の一手: which codex でパスを確認し、実行権限があるか見てください"
+                .into(),
+        ),
+        (
+            A::CommandFailed {
+                agent: codex,
+                code: None,
+                stderr: "  bad flag \n".into(),
+            },
+            "codex mcp add が失敗しました (exit signal): bad flag。\
+             次の一手: 同じコマンドを手で実行して出力を確認してください（codex mcp add --help）"
+                .into(),
+        ),
+        (
+            A::NotReflected { agent: codex },
+            "codex mcp add は成功したのに codex mcp list に tako が現れません（書式非対応・バージョン差の疑い）。\
+             次の一手: codex --version と codex mcp list の出力を添えて tako の Issue へ報告してください"
+                .into(),
+        ),
+        (
+            A::NotSupportedHere {
+                agent: WorkerAgent::Claude,
+            },
+            "claude の MCP 登録はこの経路では扱いません（claude は dispatch::setup_mcp が担当）".into(),
+        ),
+    ]
+}
+
+/// [`check_os_row`] に、「見つからない」の読みが日英で**同じ**こと（英語だけ ` not found` を含めて
+/// 404 へ寄るのも許さない）を足した 1 行の検査
+fn check_setup_row(
+    failures: &mut Vec<String>,
+    what: &str,
+    at: &dyn Fn(Lang) -> String,
+    old: &str,
+    ja: &str,
+    en: &str,
+) {
+    check_os_row(failures, what, at, old, ja, en);
+    if E::says_not_found(en) && !E::says_not_found(ja) {
+        failures.push(format!(
+            "{}: {what}: 日本語は「見つからない」と言わないのに英語に ` not found` がある \
+             （リモートの HTTP 層が英語表示だけ 404 へ寄せる）: {en}",
+            at(Lang::En)
+        ));
+    }
+}
+
+#[test]
+fn setup系の断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let mut failures = Vec::new();
+
+    let table = setup_refusal_table();
+    covers_every(
+        &table.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+        setup_refusal_index,
+        SETUP_REFUSAL_VARIANTS,
+        "SetupRefusal",
+    );
+    for (r, old) in &table {
+        let debug = format!("{r:?}");
+        let at = |lang| {
+            where_written(
+                SETUP_REFUSAL_SRC,
+                SETUP_REFUSAL_PATH,
+                "impl SetupRefusal {",
+                &debug,
+                lang,
+            )
+        };
+        let (ja, en) = (r.text_in(Lang::Ja), r.text_in(Lang::En));
+        check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+        if r.clone().into_ja() != ja {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+
+    let table = agent_mcp_table();
+    covers_every(
+        &table.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        agent_mcp_index,
+        AGENT_MCP_VARIANTS,
+        "AgentMcpError",
+    );
+    for (e, old) in &table {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                AGENT_MCP_SRC,
+                AGENT_MCP_PATH,
+                "    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {",
+                &debug,
+                lang,
+            )
+        };
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+    }
+    report_all(failures);
+}
+
+/// 包み（answers の `mod_ui: ` / profile の断り / config.yaml・changes.yaml のパース / MCP 設定の JSON）は
+/// 中身の型と同じ言語で組む・導入器の出力の添え方（空なら添えない）・dispatch の載せ方で 1 つの断りに
+/// 日英が混ざらない・answers の検証は型の口が表示言語、従来の口が日本語
+#[test]
+fn setup系の断りの包みと載せ方() {
+    let ui = mod_ui_refusal();
+    let profile = ConfigError::ProfileWorkerAgent(Box::new(ConfigError::UnknownAgent("x".into())));
+    let broken = "a: [\n";
+    let yaml = serde_yaml::from_str::<serde_yaml::Value>(broken).expect_err("壊れている");
+    let reason = YamlReason::of(&yaml, broken);
+    let json = serde_json::from_str::<serde_json::Value>("{").expect_err("壊れている");
+    let json_reason = tako_core::load_issue::JsonReason::of(&json);
+    for lang in [Lang::Ja, Lang::En] {
+        assert!(SetupRefusal::ModUi(ui.clone())
+            .text_in(lang)
+            .ends_with(&ui.text_in(lang)));
+        assert_eq!(
+            SetupRefusal::Profile(profile.clone()).text_in(lang),
+            profile.text_in(lang)
+        );
+        assert!(SetupRefusal::ConfigParse(reason.clone())
+            .text_in(lang)
+            .ends_with(&reason.text_in(lang)));
+        assert!(SetupRefusal::McpConfigNotJson {
+            path: "/x".into(),
+            reason: json_reason.clone(),
+        }
+        .text_in(lang)
+        .contains(&json_reason.text_in(lang)));
+        // 導入器の出力が空なら添えない（改行で終わらない）
+        let quiet = SetupRefusal::DepInstallerFailed {
+            command: "brew install tmux".into(),
+            code: 1,
+            log: " \n ".into(),
+        }
+        .text_in(lang);
+        assert!(!quiet.contains('\n'), "{quiet:?}");
+    }
+    // dispatch の載せ方そのまま（`invalid` = 前置き + 理由。前置きと理由の言語がそろう）
+    assert_eq!(
+        E::InvalidParams(SetupRefusal::SelectedAgent("x".into()).text_in(Lang::En))
+            .text_in(Lang::En),
+        "invalid parameter: selected_agent must be one of claude / codex / agy: x"
+    );
+    assert_eq!(
+        E::InvalidParams(SetupRefusal::SelectedAgent("x".into()).text_in(Lang::Ja))
+            .text_in(Lang::Ja),
+        "無効なパラメータ: selected_agent は claude / codex / agy のいずれかです: x"
+    );
+    // answers の検証: 型の口は中身の型を返し、従来の口（CLI の `tako setup`）は日本語の文
+    let answers: tako_control::setup::SetupAnswers =
+        serde_json::from_str(r#"{"sleep_guard": {"power": "battery"}}"#).expect("answers の形");
+    let typed = answers.validate_typed().expect_err("power の値が不正");
+    assert_eq!(typed, SetupRefusal::SleepPower("battery".into()));
+    assert_eq!(answers.validate().expect_err("同じ断り"), typed.into_ja());
+}
+
+/// 型の口の本体（断りの文は `SetupRefusal` / `AgentMcpError` / `ConfigError` にだけ置く）
+const SETUP_REFUSAL_SCOPES: &[(&str, &str, Span)] = &[
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        Span::Item("pub fn setup_mcp_typed("),
+    ),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        Span::Item("pub fn setup_mcp_agents("),
+    ),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        Span::Item("fn setup_mcp_via_cli("),
+    ),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        Span::Item("fn setup_mcp_direct("),
+    ),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        Span::Item("fn run_setup_cli_within("),
+    ),
+    (
+        SETUP_PATH,
+        SETUP_SRC,
+        Span::Item("    pub fn validate_typed("),
+    ),
+    (
+        SETUP_PATH,
+        SETUP_SRC,
+        Span::Item("pub fn config_yaml_path_typed("),
+    ),
+    (
+        SETUP_PATH,
+        SETUP_SRC,
+        Span::Item("pub fn load_config_typed("),
+    ),
+    (
+        SETUP_PATH,
+        SETUP_SRC,
+        Span::Item("pub fn load_config_from_typed("),
+    ),
+    (SETUP_PATH, SETUP_SRC, Span::Item("fn parse_changes(")),
+    (SETUP_PATH, SETUP_SRC, Span::Item("fn changes_for_typed(")),
+    (
+        SETUP_PATH,
+        SETUP_SRC,
+        Span::Item("pub fn changes_status_typed("),
+    ),
+    (
+        AGENTS_SYNC_PATH,
+        AGENTS_SYNC_SRC,
+        Span::Item("pub fn sync_rules("),
+    ),
+    (
+        AGENTS_SYNC_PATH,
+        AGENTS_SYNC_SRC,
+        Span::Item("pub fn check_sync_status("),
+    ),
+    (
+        AGENTS_SYNC_PATH,
+        AGENTS_SYNC_SRC,
+        Span::Item("pub fn run_sync_typed("),
+    ),
+    (
+        AGENTS_SYNC_PATH,
+        AGENTS_SYNC_SRC,
+        Span::Item("pub fn status_typed("),
+    ),
+    (
+        SETUP_DEPS_PATH,
+        SETUP_DEPS_SRC,
+        Span::Item("pub fn install_typed("),
+    ),
+    (
+        SETUP_DEPS_PATH,
+        SETUP_DEPS_SRC,
+        Span::Item("fn run_installer("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("pub fn parse_agent_typed("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("fn home_dir_typed("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("fn install_plan_for_typed("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("pub fn status_for_typed("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("fn status_with("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("pub fn handoff_plan_for_typed("),
+    ),
+];
+
+#[test]
+fn setup系の型の口の断りに日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, src, span) in SETUP_REFUSAL_SCOPES {
+        let Some(lines) = client_store_lines(src, span) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 {} が見つからない（改名で番犬が空振りする。SETUP_REFUSAL_SCOPES を直す）",
+                span_name(span)
+            ));
+            continue;
+        };
+        for (line, text) in refusal_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 型の口の断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （SetupRefusal へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// dispatch が呼んではいけない日本語の口（型の口 `*_typed` の外側）。`setup_mcp(&` は claude への
+/// MCP 登録の日本語の口（定義の行 `pub fn setup_mcp(tako_binary` には当たらない）。
+/// bootstrap の install / path / undo-path は中身（インストーラ・`shell_profile` / `tako_cli_path` /
+/// `user_path`）と一緒に次のスライスで移す（#2365 のコメントの表）
+const JA_SETUP_CALLS: [&str; 11] = [
+    "setup_mcp(&",
+    "setup::changes_status()",
+    "setup::load_config()",
+    "setup_bootstrap::parse_agent(",
+    "setup_bootstrap::status_for(",
+    "setup_bootstrap::handoff_plan_for(",
+    "setup_deps::install(",
+    "agents_sync::run_sync(",
+    "agents_sync::status()",
+    "WorkerAgent::parse(",
+    ".validate().map_err(",
+];
+
+/// dispatch の本体で、日本語の口を呼んで断りに載せている行（断りを捨てる文は見ない）
+fn ja_setup_calls(lines: &[(usize, &str)]) -> Vec<(usize, &'static str, String)> {
+    let mut out = Vec::new();
+    for (i, (line, code)) in lines.iter().enumerate() {
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        if let Some(call) = JA_SETUP_CALLS.iter().find(|c| code.contains(*c)) {
+            if !statement_discards_error(lines, i) {
+                out.push((*line, *call, code.trim().to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// dispatch の setup 系の分岐（`Request::SetupMcp` から `Request::AgentsSyncRules` の終わりまで）と、
+/// その先の関数（claude への MCP 登録・子の `tako setup`）。`orchestrator layout` の config.yaml の
+/// 読み書き（`setup::load_config()` / `mutate_config`）は別の行（#2365 の表の「config.yaml 1」）
+fn setup_dispatch_lines() -> Vec<(usize, &'static str)> {
+    let all = dispatch_code_lines();
+    let mut out = Vec::new();
+    let mut inside = false;
+    for (line, code) in all.iter().copied() {
+        if code.contains("Request::SetupMcp {") || code.contains("Request::SetupChanges =>") {
+            inside = true;
+        }
+        // 次の分岐の頭で止める（頭の行は範囲に入れない）
+        if code.contains("Request::VideoPlayback {") || code.contains("Request::SleepGuard {") {
+            inside = false;
+        }
+        if inside {
+            out.push((line, code));
+        }
+    }
+    for head in [
+        "pub fn setup_mcp_typed(",
+        "pub fn setup_mcp_agents(",
+        "fn run_setup_cli_within(",
+    ] {
+        out.extend(front_scope_lines(DISPATCH_SRC, Some(head)).unwrap_or_default());
+    }
+    out
+}
+
+#[test]
+fn dispatch_はsetup系の断りを日本語の口から載せない() {
+    let lines = setup_dispatch_lines();
+    assert!(
+        lines.iter().any(|(_, c)| c.contains("Request::AgentsSyncRules {")),
+        "dispatch の setup 系の分岐を引けない（範囲の印の改名で番犬が空振りする。setup_dispatch_lines を直す）"
+    );
+    let mut failures = Vec::new();
+    for (line, call, code) in ja_setup_calls(&lines) {
+        failures.push(format!(
+            "{DISPATCH_PATH}:{line}: dispatch が日本語の口 `{call}…)` の断りを載せている = 英語表示でも \
+             中身だけ日本語で混ざる（`*_typed` を呼んで SetupRefusal / ConfigError の operation / invalid で載せる）: {code}"
+        ));
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 型の口の範囲と dispatch の範囲が引け、植えた日本語・日本語の口の呼び足しを
+/// 名指し、断りを捨てる文と定義の行は見逃す
+#[test]
+fn setup系の番犬の境界() {
+    let lines = setup_dispatch_lines();
+    let has = |needle: &str| lines.iter().any(|(_, code)| code.contains(needle));
+    assert!(has("Request::SetupMcp {"), "setup-mcp の分岐は範囲の中");
+    assert!(has("Request::SetupRun {"), "tako setup の分岐は範囲の中");
+    assert!(
+        has("fn run_setup_cli_within("),
+        "子の tako setup は範囲の中"
+    );
+    assert!(!has("Request::VideoPlayback {"), "動画の分岐は範囲の外");
+    assert!(
+        !has("Request::SleepGuard {"),
+        "スリープ防止の分岐は範囲の外"
+    );
+
+    let src = r#"fn d() {
+    // crate::setup_deps::install(dep) はコメント
+    let a = crate::setup_deps::install(dep, opts).map_err(DispatchError::Operation)?;
+    let kind = WorkerAgent::parse(name).ok();
+    let b = crate::setup_deps::install_typed(dep, opts).map_err(SetupRefusal::operation)?;
+    let r = setup_mcp(&tako_bin, scope)?;
+    parsed.validate().map_err(DispatchError::InvalidParams)?;
+}
+pub fn setup_mcp(tako_binary: &str) -> Result<(), String> {
+    Err(SetupRefusal::SyncSourceRead(format!("正本ファイルの読み取りに失敗: {e}")))
+}
+"#;
+    let d = front_scope_lines(src, Some("fn d(")).expect("頭を引ける");
+    let found: Vec<usize> = ja_setup_calls(&d).into_iter().map(|(l, _, _)| l).collect();
+    assert_eq!(found, vec![3, 6, 7], "日本語の口の 3 か所だけを名指す");
+    let f = front_scope_lines(src, Some("pub fn setup_mcp(")).expect("頭を引ける");
+    assert!(ja_setup_calls(&f).is_empty(), "定義の行は呼び出しではない");
+    let found: Vec<usize> = refusal_japanese(&f).into_iter().map(|(l, _)| l).collect();
+    assert_eq!(found, vec![10], "型の中へ書き戻した日本語を名指す");
 }

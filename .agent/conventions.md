@@ -399,6 +399,30 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   空の dir・Finder の記録先を無い dir・ゴミ箱の代わりの置き場を無い dir へ向けた注入で断らせ、GUI 無しの
   ホストへ dispatch を日英で通す。最初に「無いアプリ名で開く」で注入が効いたことを確かめてから先へ進む。
   蓋閉じ継続の解除は sudoers の登録の有無で経路が変わるので叩かない）
+- #2365 の続きで、**dispatch の setup 系の断り**（MCP の `tako_setup_mcp` / `tako_setup` / `tako_setup_changes` /
+  `tako_agents_sync_rules` / `tako_setup_deps` / `tako_setup_models` / `tako_setup_bootstrap` の系統名・status・
+  handoff、設定画面の MCP 登録・同期）を、dispatch 自身の文（claude への MCP 登録 = `setup_mcp_via_cli` /
+  `setup_mcp_direct`・子の `tako setup` の起動と完了待ち・answers）と中身の口の文（`setup::SetupAnswers::validate` /
+  `load_config` / changes.yaml・`agents_sync`・`setup_deps::install` と導入器・`setup_bootstrap` の系統名とホーム）を
+  一緒に `tako_control::SetupRefusal`（40 種・網羅 match）へ移した。codex / agy への MCP 登録の断りは
+  `agent_mcp::AgentMcpError::text_in`（Display は表示言語）、エージェント名は orchestrator の `ConfigError`
+  （`WorkerAgent::parse_typed`・プロファイルの `resolve_*_agent_typed`）。**`String` を返す従来の口は日本語のまま**
+  （CLI の `tako setup` / `tako setup bootstrap` / `tako setup deps` / `tako agents sync-rules` は枠が日本語の手元の
+  処理 = FR-2.42.21。`dispatch::setup_mcp` も CLI の `tako setup` が使うので日本語の口のまま・dispatch は
+  `setup_mcp_typed`）。CLI の `tako setup` は `AgentMcpError` を `text_in(Lang::Ja)` で引く。CLI の `tako setup-mcp` は
+  dispatch の `setup_mcp_agents` を手元で呼ぶので、先に `init_local_lang()` を呼ぶ（呼ばないと日本語表示の人へ
+  理由だけ英語 = 静的既定）。子の `tako setup` の出力（`SetupFailed` の中身）は setup の枠なので日本語のまま
+  （外部コマンドの出力と同じ扱い）。「見つかりません」系（正本ファイル・導入後のコマンド）は日本語が
+  「見つからない」を含まないので英語も ` not found` を含めない（`CliNotFound` は含める）。`Ok` の文（依存の
+  `skipped` の detail・子の打ち切りの `note`・同期の未設定の `message`）は対象外。**bootstrap の install（インストーラの
+  取得・実行）/ path / undo-path は中身（tako-core の `shell_profile` / `tako_cli_path` / `user_path`）と一緒に次の
+  スライス**（dispatch はまだ日本語の口 `install_for` / `ensure_path_for` / `undo_path_for` を呼ぶ）。番犬は同じ
+  `issue1762_dispatch_error_lang.rs` の末尾の節（2 つの型の表・「見つからない」の読みが日英で同じ・型の口の本体の
+  断りの組み立ての日本語の固定文 `SETUP_REFUSAL_SCOPES`・dispatch の setup 系の分岐が日本語の口を呼んでいないか
+  `JA_SETUP_CALLS`）、実経路は `tests/issue2365_setup_lang.rs`（unix。`HOME` / data dir / orchestrator dir を一時へ・
+  `PATH` を空・`SHELL` を `/usr/bin/false` にして claude / codex / agy / brew を引けなくし（引けたら止まる）、壊れた
+  `~/.claude.json` / フォルダの `~/.claude.json` / 壊れた config.yaml / 無い・空の正本 / `HOME` を外す注入で断らせ、
+  GUI 無しのホストへ dispatch を日英で通す。answers が通る形は叩かない = 子の `tako setup` を起こさない）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

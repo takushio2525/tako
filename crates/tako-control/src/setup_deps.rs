@@ -572,16 +572,26 @@ pub struct DepInstallOptions {
 /// 導入済みのものは触らない（**冪等**）。手段が無い / 代行できないものは
 /// 実行せず理由つきで `skipped` に載せる（黙って飛ばさない）
 pub fn install(bin: Option<&str>, opts: DepInstallOptions) -> Result<Value, String> {
+    install_typed(bin, opts).map_err(crate::SetupRefusal::into_ja)
+}
+
+/// [`install`] の型の口（断りを表示言語で返す dispatch の `tako_setup_deps` が使う。#2365）。
+/// 従来の口（CLI の `tako setup deps install`・`tako setup` の依存の段 = 枠が日本語）は日本語のまま
+pub fn install_typed(
+    bin: Option<&str>,
+    opts: DepInstallOptions,
+) -> Result<Value, crate::SetupRefusal> {
     let all = status();
     if let Some(bin) = bin {
         if !all.iter().any(|s| s.dep.bin == bin) {
-            return Err(format!(
-                "不明な依存: {bin:?}（この環境の対象は {}）",
-                all.iter()
+            return Err(crate::SetupRefusal::UnknownDep {
+                got: bin.to_string(),
+                allowed: all
+                    .iter()
                     .map(|s| s.dep.bin)
                     .collect::<Vec<_>>()
-                    .join(" / ")
-            ));
+                    .join(" / "),
+            });
         }
     }
     let mut installed = Vec::new();
@@ -654,12 +664,10 @@ pub fn install(bin: Option<&str>, opts: DepInstallOptions) -> Result<Value, Stri
         match resolve(&state.dep) {
             Some(path) => installed.push(json!({ "bin": state.dep.bin, "path": path })),
             None => {
-                return Err(format!(
-                    "{} は正常終了しましたが {} が見つかりません。\n\
-                     ターミナルを開き直してから `tako setup deps` で確認してください",
-                    installer.command_line(),
-                    state.dep.bin
-                ))
+                return Err(crate::SetupRefusal::DepMissingAfterInstall {
+                    command: installer.command_line(),
+                    bin: state.dep.bin.to_string(),
+                })
             }
         }
     }
@@ -672,7 +680,11 @@ pub fn install(bin: Option<&str>, opts: DepInstallOptions) -> Result<Value, Stri
     }))
 }
 
-fn run_installer(program: &str, installer: DepInstaller, interactive: bool) -> Result<(), String> {
+fn run_installer(
+    program: &str,
+    installer: DepInstaller,
+    interactive: bool,
+) -> Result<(), crate::SetupRefusal> {
     let mut command = std::process::Command::new(program);
     // #586: GUI 内 dispatch から到達するのでコンソールウィンドウを出させない
     tako_core::platform::process::no_console_window(&mut command);
@@ -683,13 +695,19 @@ fn run_installer(program: &str, installer: DepInstaller, interactive: bool) -> R
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()
-            .map_err(|e| format!("{program} を起動できません: {e}"))?;
+            .map_err(|e| crate::SetupRefusal::DepInstallerSpawn {
+                program: program.to_string(),
+                error: e.to_string(),
+            })?;
         (status, String::new())
     } else {
         let output = command
             .stdin(std::process::Stdio::null())
             .output()
-            .map_err(|e| format!("{program} を起動できません: {e}"))?;
+            .map_err(|e| crate::SetupRefusal::DepInstallerSpawn {
+                program: program.to_string(),
+                error: e.to_string(),
+            })?;
         let mut log = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.trim().is_empty() {
@@ -703,16 +721,12 @@ fn run_installer(program: &str, installer: DepInstaller, interactive: bool) -> R
     if status.success() {
         return Ok(());
     }
-    let detail = if log.trim().is_empty() {
-        String::new()
-    } else {
-        format!("\n{}", log.trim())
-    };
-    Err(format!(
-        "{} が失敗しました（exit {}）。上に出ているエラーを確認してください{detail}",
-        installer.command_line(),
-        status.code().unwrap_or(-1)
-    ))
+    // 出力の添え方（空なら添えない・あれば改行を挟む）は断りの型の 1 か所が持つ
+    Err(crate::SetupRefusal::DepInstallerFailed {
+        command: installer.command_line(),
+        code: status.code().unwrap_or(-1),
+        log,
+    })
 }
 
 // --- 未検出の依存 1 件をその場で入れる（#1499 → #1509 で「体験」ごと 1 実装へ）---

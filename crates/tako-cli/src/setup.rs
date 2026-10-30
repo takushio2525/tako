@@ -1923,12 +1923,14 @@ fn configure_agent_mcp(agents: &[DetectedAgent]) -> Vec<Remaining> {
             }
             // setup 全体は止めない（他の設定は進めたい）が、無言にはしない
             Err(e) => {
+                // setup の枠は日本語なので、断りも日本語で引く（表示言語の Display は dispatch 用。#2365）
+                let e = e.text_in(tako_core::i18n::Lang::Ja);
                 eprintln!("  [警告] {} MCP: {e}", kind.as_str());
                 remaining.push(Remaining::with_detail(
                     RemainingKind::Mcp {
                         agent: kind.as_str().to_string(),
                     },
-                    vec![e.to_string()],
+                    vec![e],
                 ));
             }
         }

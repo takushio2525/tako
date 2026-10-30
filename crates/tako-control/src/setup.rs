@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use tako_core::platform::support::Platform;
 
+use crate::SetupRefusal;
+
 /// バイナリ埋め込みの setup changelog
 pub const CHANGES_YAML: &str = include_str!("../../../resources/setup/changes.yaml");
 
@@ -223,19 +225,22 @@ impl SetupAnswers {
         Ok(answers)
     }
 
+    /// answers の検証。断りの文は**日本語のまま**（呼び手は CLI の `tako setup` = 枠が日本語）。
+    /// 断りを表示言語で返す dispatch（MCP の `tako_setup`）は [`Self::validate_typed`] を通す（#2365）
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_typed().map_err(SetupRefusal::into_ja)
+    }
+
+    /// [`Self::validate`] の型の口（#2365）
+    pub fn validate_typed(&self) -> Result<(), SetupRefusal> {
         if let Some(agent) = self.selected_agent.as_deref() {
             if !matches!(agent, "claude" | "codex" | "agy") {
-                return Err(format!(
-                    "selected_agent は claude / codex / agy のいずれかです: {agent}"
-                ));
+                return Err(SetupRefusal::SelectedAgent(agent.to_string()));
             }
         }
         for provider in self.provider_plans.keys() {
             if !matches!(provider.as_str(), "claude" | "gpt" | "google") {
-                return Err(format!(
-                    "provider_plans のキーは claude / gpt / google のいずれかです: {provider}"
-                ));
+                return Err(SetupRefusal::ProviderPlanKey(provider.clone()));
             }
         }
         if self
@@ -243,48 +248,41 @@ impl SetupAnswers {
             .as_deref()
             .is_some_and(|content| content.trim().is_empty())
         {
-            return Err("instruction_content は空にできません".to_string());
+            return Err(SetupRefusal::InstructionEmpty);
         }
         if let Some(profile) = &self.profile {
-            profile.resolve_master_agent()?;
-            profile.resolve_worker_agent(None)?;
+            profile.resolve_master_agent_typed()?;
+            profile.resolve_worker_agent_typed(None)?;
         }
         if let Some(projects) = &self.projects {
             for (key, project) in projects {
                 if key.trim().is_empty() {
-                    return Err("projects のキーは空にできません".to_string());
+                    return Err(SetupRefusal::ProjectKeyEmpty);
                 }
                 if project.cwd.trim().is_empty() {
-                    return Err(format!("projects.{key}.cwd は空にできません"));
+                    return Err(SetupRefusal::ProjectCwdEmpty(key.clone()));
                 }
             }
         }
         if let Some(agent) = self.launch_agent.as_deref() {
             if !matches!(agent, "claude" | "codex" | "agy" | "none") {
-                return Err(format!(
-                    "launch_agent は claude / codex / agy / none のいずれかです: {agent}"
-                ));
+                return Err(SetupRefusal::LaunchAgent(agent.to_string()));
             }
         }
         if let Some(mod_ui) = &self.mod_ui {
             // 書く前に断る（setup の途中で半端に止まらない）。文言は CLI / MCP と同じ。
-            // setup の answers の断りはほかの項目も日本語なので、日本語で引く（#2365）
-            tako_core::claude_mod_ui::check_answers(mod_ui)
-                .map_err(|e| format!("mod_ui: {}", e.text_in(tako_core::i18n::Lang::Ja)))?;
+            // 言語は包み（`mod_ui: `）と同じ = CLI の `tako setup` は日本語、MCP は表示言語（#2365）
+            tako_core::claude_mod_ui::check_answers(mod_ui).map_err(SetupRefusal::ModUi)?;
         }
         if let Some(sleep) = &self.sleep_guard {
             if let Some(mode) = sleep.mode.as_deref() {
                 if !matches!(mode, "off" | "on" | "while-agents-running") {
-                    return Err(format!(
-                        "sleep_guard.mode は off / on / while-agents-running のいずれかです: {mode}"
-                    ));
+                    return Err(SetupRefusal::SleepMode(mode.to_string()));
                 }
             }
             if let Some(power) = sleep.power.as_deref() {
                 if !matches!(power, "ac-only" | "always") {
-                    return Err(format!(
-                        "sleep_guard.power は ac-only / always のいずれかです: {power}"
-                    ));
+                    return Err(SetupRefusal::SleepPower(power.to_string()));
                 }
             }
         }
@@ -463,9 +461,14 @@ impl Default for OrchestratorConfig {
 
 /// config.yaml のパス（orchestrator 設定ディレクトリ配下）
 pub fn config_yaml_path() -> Result<PathBuf, String> {
+    config_yaml_path_typed().map_err(SetupRefusal::into_ja)
+}
+
+/// [`config_yaml_path`] の型の口（#2365）
+pub fn config_yaml_path_typed() -> Result<PathBuf, SetupRefusal> {
     crate::orchestrator::config_dir()
         .map(|d| d.join("config.yaml"))
-        .ok_or_else(|| "ホームディレクトリが取得できない（$HOME 未設定）".into())
+        .ok_or(SetupRefusal::ConfigHomeUnresolved)
 }
 
 // --- setup ディレクトリの置き場（Issue #1019） -------------------------------
@@ -672,24 +675,31 @@ fn free_backup_path(dir: &Path) -> PathBuf {
 }
 
 pub fn load_config() -> Result<SetupConfig, String> {
-    let path = config_yaml_path()?;
-    load_config_from(&path)
+    load_config_typed().map_err(SetupRefusal::into_ja)
+}
+
+/// [`load_config`] の型の口（断りを表示言語で返す dispatch の `tako_setup_changes` /
+/// `tako_agents_sync_rules` が使う。#2365）
+pub fn load_config_typed() -> Result<SetupConfig, SetupRefusal> {
+    let path = config_yaml_path_typed()?;
+    load_config_from_typed(&path)
 }
 
 /// パス指定版 load（テスト用に公開）。
 /// 不在は default、パース失敗は Err（default に丸めて後続 save で消さない。#169）
 pub fn load_config_from(path: &Path) -> Result<SetupConfig, String> {
+    load_config_from_typed(path).map_err(SetupRefusal::into_ja)
+}
+
+/// [`load_config_from`] の型の口（#2365）
+pub fn load_config_from_typed(path: &Path) -> Result<SetupConfig, SetupRefusal> {
     if !path.is_file() {
         return Ok(SetupConfig::default());
     }
     let content =
-        std::fs::read_to_string(path).map_err(|e| format!("config.yaml の読み取りに失敗: {e}"))?;
-    serde_yaml::from_str(&content).map_err(|e| {
-        format!(
-            "config.yaml のパースに失敗: {}",
-            tako_core::load_issue::yaml_error_reason(&e, &content)
-        )
-    })
+        std::fs::read_to_string(path).map_err(|e| SetupRefusal::ConfigRead(e.to_string()))?;
+    serde_yaml::from_str(&content)
+        .map_err(|e| SetupRefusal::ConfigParse(tako_core::load_issue::YamlReason::of(&e, &content)))
 }
 
 /// 保存（アトミック書き込み + 世代バックアップ。#169）。
@@ -952,22 +962,19 @@ struct ChangesFile {
     changes: Vec<SetupChange>,
 }
 
-fn parse_changes(yaml: &str) -> Result<Vec<SetupChange>, String> {
+fn parse_changes(yaml: &str) -> Result<Vec<SetupChange>, SetupRefusal> {
     let file: ChangesFile = serde_yaml::from_str(yaml).map_err(|e| {
-        format!(
-            "changes.yaml のパースに失敗: {}",
-            tako_core::load_issue::yaml_error_reason(&e, yaml)
-        )
+        SetupRefusal::ChangelogParse(tako_core::load_issue::YamlReason::of(&e, yaml))
     })?;
     // 未知のプラットフォーム名は黙って無視せず弾く（書き間違いが配信漏れになるため）
     for c in &file.changes {
         if let Some(list) = &c.platforms {
             for p in list {
                 if Platform::parse(p).is_none() {
-                    return Err(format!(
-                        "changes.yaml revision {} の platforms に未知の値: {p}（macos / windows）",
-                        c.revision
-                    ));
+                    return Err(SetupRefusal::ChangelogPlatform {
+                        revision: c.revision,
+                        value: p.clone(),
+                    });
                 }
             }
         }
@@ -983,6 +990,11 @@ pub fn all_changes() -> Result<Vec<SetupChange>, String> {
 /// 指定プラットフォーム向けの changelog（`platforms:` で絞り込む）。
 /// **macOS 上から Windows 向けの配信内容を検証できる**ようにするため引数で受ける
 pub fn changes_for(platform: Platform) -> Result<Vec<SetupChange>, String> {
+    changes_for_typed(platform).map_err(SetupRefusal::into_ja)
+}
+
+/// [`changes_for`] の型の口（#2365）
+fn changes_for_typed(platform: Platform) -> Result<Vec<SetupChange>, SetupRefusal> {
     Ok(parse_changes(CHANGES_YAML)?
         .into_iter()
         .filter(|c| c.applies_to(platform))
@@ -1004,10 +1016,17 @@ pub fn pending_changes(applied_revision: u32) -> Result<Vec<SetupChange>, String
 
 /// アップデート追従の照会結果（CLI `--json` / MCP `tako_setup_changes` 共通のペイロード）
 pub fn changes_status() -> Result<Value, String> {
-    let config = load_config()?;
-    let current = current_revision()?;
+    changes_status_typed().map_err(SetupRefusal::into_ja)
+}
+
+/// [`changes_status`] の型の口（断りを表示言語で返す dispatch の `tako_setup_changes` が使う。#2365）
+pub fn changes_status_typed() -> Result<Value, SetupRefusal> {
+    let config = load_config_typed()?;
+    // [`current_revision`] / [`pending_changes`] と同じ材料（このプラットフォーム向けの全エントリ）
+    let all = changes_for_typed(Platform::current())?;
+    let current = all.iter().map(|c| c.revision).max().unwrap_or(0);
     let applied = config.setup.applied_revision;
-    let pending = pending_changes(applied)?;
+    let pending: Vec<SetupChange> = all.into_iter().filter(|c| c.revision > applied).collect();
     Ok(json!({
         "current_revision": current,
         "applied_revision": applied,
