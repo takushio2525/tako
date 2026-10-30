@@ -246,6 +246,7 @@ tako queue cargo test -p tako-core
   │  ① Enqueue（誰・何・優先度・pid・cwd の target dir・区分）→ 受付番号と順位
   │  ② Poll を 1 秒ごと（心拍を兼ねる）→ waiting{順位, 見込み, 理由} / granted{env}
   │  ③ 子を起こす（env: TAKO_QUEUE_JOB=<id>、CARGO_BUILD_JOBS / RUST_TEST_THREADS が未設定なら取り分）
+  │     子は ① の前に PATH で引いた絶対パスで起こす（argv[0] は打った形のまま。#2538）
   │  ④ Started{子の pid} → 以後 2 秒ごとに心拍
   │  ⑤ Done{終了コード, 経過, 最大メモリ} → 過去の記録へ。自分の終了コードは子と同じ
   ▼
