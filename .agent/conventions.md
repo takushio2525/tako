@@ -329,7 +329,7 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   英語に ` not found` を含む。**中身が他モジュールの文の断りは枠だけ移さない**（混ざるため）: 更新の口
   （`update_apply` / `apply_zip` / `repair` = `update_checker::CheckError` ほか）・`remote_start` / `stop`
   （`remote.rs`）・tako-core の文（`open_plan` の行の丸め・`PreviewViewState::apply`・アウトライン・
-  `preview_limit` の編集の断り・`mouse_forward`）・`webview.rs` の生成の理由は Issue #2365 の表の残り。
+  `preview_limit` の編集の断り・`mouse_forward`）・`webview.rs` の生成の理由は Issue #2365 の表の残り（更新の口と tako-core の文はのちに移した = 下の項）。
   番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（`HostRefusal` の表と、GUI のソースを読んで
   日本語の断りの書き足しを `file:line` で名指す `HOST_IMPL_SCOPES`。診断の出力 = `eprintln!` / persist.log と
   まだ移していない断片 `HOST_DEFERRED` は外し、断片がソースから消えたら表から外すよう落とす）
@@ -350,6 +350,29 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `.ok_or(` の中の日本語を名指す `SESSION_OS_REFUSAL_SCOPES`・dispatch が日本語の口を呼んでいないか
   `JA_SESSION_OS_CALLS`）、実経路は `tests/issue2365_sessions_os_lang.rs`（unix。カタログ・置き場を一時の
   場所へ向けて GUI 無しのホストへ dispatch を日英で通す。OS の設定を本当に変える操作は叩かない）
+- #2365 の続きで、**更新の口**（CLI / MCP `tako update apply` / `apply-zip` / `repair` と GUI の更新画面）と、
+  **tako-core の文を GUI がそのまま返していた 5 系統**・**変更履歴の取得の打ち切り**を移した。更新の口は枠
+  （「更新チェックに失敗」「<チャンネル>の新しいバージョンが見つからない」）と中身（確認の失敗
+  `update_checker::CheckError` = 中身も `NetworkCause` / `ParseCause` のバリアント・brew / zip / 再起動の断り・
+  Windows の `installer_update::InstallerError`）を 1 本で `update_checker::UpdateRefusal`（網羅 match）へ寄せ、
+  GUI の口は `update_checker::update_target(channel)?` を呼ぶだけ（枠の組み立てを main.rs に置かない）。
+  成功の `message`（Homebrew / ZIP / インストーラー / 修復）は `UpdateNote`、`update check` の
+  `rate_limit_note` と残り時間（旧 `ui_text::update::eta_*`）は言語を引数で受ける `rate_limit_note_in` /
+  `reset_eta_in`。`perform_update` / `perform_update_zip` / `repair_brew` / `restart_app` は `String` を返す口の
+  ままで、文は組んだその場の表示言語（型で受けるなら `repair_brew_typed`）。zip へ切り替える印
+  `[zip-fallback-available]`（`ZIP_FALLBACK_MARK`）は日英で同じ。`bundle_install::replace_bundle_in_place` の文は
+  枠を持たずにそのまま出す（`UpdateRefusal::BundleReplace`。日英は Issue #2365 の残り）。tako-core の 5 系統は
+  `open_plan::PlanRefusal`（行・桁の 1 始まり = 旧 `LINE_ONE_BASED` / `COLUMN_ONE_BASED` の定数は消した・
+  行を持たない種別）・`ViewRefusal`（ズーム / ページ / パン）・`OutlineRefusal`・`Truncation::edit_refusal_in`
+  （`to_json_in` の `limit.message` も同じ文）・`mouse_forward::ClickRefusal`（渡さない理由・表せない座標・
+  器へ問い合わせられない。どの文も理由の語を含む）で、各口は型で返し、`String` の口へは
+  `From<_> for String`（その場の表示言語）で `?` のまま載る。dispatch の行・桁の検査と CLI の前段
+  （`tako open --line 0`）も同じ `PlanRefusal`（CLI は `front_err` と同じ解決）。変更履歴の打ち切りは
+  `git::HistoryTimedOut::text_in`（段の名前と上限の env は日英どちらにも入る）。文言で判定していた
+  `scripts/test-changelog-expand-2150.sh`（H / M）と `scripts/test-open-line-1676.sh` は日英どちらの形とも
+  突き合わせる。番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（tako-core の 6 型の表と、
+  断りの組み立てに日本語の固定文を書き足していないかを見る `UPDATE_CORE_SCOPES`）と、更新の口の型の表は
+  tako-app の `update_checker::tests::更新の口の断りは全バリアントが日英を持ち日本語は2365より前と一致`
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
@@ -964,7 +987,10 @@ AppleSystemPolicy が読めずに 1 本ずつ拒否する。記録されるパ�
   （A/B は `TAKO_2513_LEGACY=1`・番犬 `crates/tako-control/tests/issue2513_tailscale_spawn_path_watchdog.rs`）
 - 再現は実行中のプロセスを本物の `install_bundle_in_place` で差し替え、
   `log show --predicate 'eventMessage CONTAINS "<作業 dir>"'` の `would not allow process` を数える
-  （絶対パスの spawn と PATH で当たった 1 回は記録されない・差し替えない対照は 0 件）
+  （絶対パスの spawn と PATH で当たった 1 回は記録されない・差し替えない対照は 0 件）。
+  **差し替えは対象のプロセスの起動から 1 秒以上置く**（#2538 の実測: 起動の 0.3 秒後に差し替えたプロセスは
+  その後の空振りが 1 件も拒否されず、1 秒後なら空振りの数だけ拒否される = 起動の直後に差し替える再現は
+  修正前でも 0 件の偽の対照になる）
 - **GUI も同じ**（#2519）: git / tmux の場所の解決（`bin_resolve`）が PATH で当たった名前を素の名前のまま
   持っていたので、2 秒ごとの定期更新（tmux 一覧・ファイルツリー・git・ペインログ）が install から GUI の
   再起動までの間 **876〜1,448 件 / install** の拒否を積んだ（本番の GUI の PATH は `/opt/homebrew/bin` が
@@ -1016,6 +1042,23 @@ AppleSystemPolicy が読めずに 1 本ずつ拒否する。記録されるパ�
     `tako remote status` / MCP `tako_remote_status` は今も `daemon_status`（引いた時点で系統を調べる = 検知の
     遅れは無い）。A/B は `TAKO_2539_LEGACY=1`・番犬 `crates/tako-control/tests/issue2539_remote_poll_tailscale_watchdog.rs`
     （走査 + 偽の tailscale での実測）・実測の手順は `scripts/measure-remote-poll-2539.sh`
+- **`tako queue` の包みも同じ**（#2538）: install の前から順番待ちしていた旧版の包みが、install の終わりで
+  枠が空いた瞬間に利用者のコマンドを素の名前で起こし、PATH の空振りの数だけ拒否された（10/30 の 20:30 と
+  21:23 の 2 回とも、待っていた包み 2 つ × 41 本 = 82 件。41 は包みを起こしたペインの PATH で cargo より前に
+  あるエントリの数）。install の手順の側ではないことは、拒否の塊の時刻が待っていた包みの開始と秒まで一致し、
+  差し替えの後に受け付けた包みは 0 件だったことで確かめた。周期ではなく待ち明けの 1 回だが、待ちは install を
+  またぐ:
+  - 受付の前に `exe::pin_before_wait` で argv[0] を引いて持ち（`queue_wrapper::Program`）、待ち明けも待たずに
+    走る経路もそこを起こす。起こす時点で消えていれば素の名前（= 修正前の起こし方）
+  - GUI の口（`find_in_process_path`）と違い、PATH の相対・空エントリも `posix_spawnp` と同じ順に見て、そこで
+    先に当たるなら引かない（包みはカレントディレクトリを変えないので `./node_modules/.bin` 等は子に当たる。
+    読み飛ばして後ろの絶対エントリへ寄せると、打った名前とは別の実行ファイルを起こす）
+  - argv[0] は `CommandExt::arg0` で打った形のまま渡す（`ps`・`$0`・argv[0] で振る舞いを決める rustup の
+    proxy）。`tako queue --json` の label は argv から組むので変わらない
+  - A/B は `TAKO_2519_LEGACY=1`（「長生きするプロセスの素の名前の起動へ戻す」で同じ意味）。番犬
+    `crates/tako-control/tests/issue2538_queue_wrapper_spawn_path_watchdog.rs` が `Command::new` の場所・
+    受付より前に引くこと（file:line）と、待ちの間に PATH の手前へ入った別物を起こさないこと（実ファイル・
+    実 PATH）を見る
 
 ## OS に何かを「開かせる」前に形を確かめる（Issue #1376 / #1371）
 

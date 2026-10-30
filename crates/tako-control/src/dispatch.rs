@@ -2965,12 +2965,12 @@ fn open_file(
     // ペインが増えてから落ちる、という後始末の要る失敗を作らない）
     if line == Some(0) {
         return Err(DispatchError::InvalidParams(
-            tako_core::open_plan::LINE_ONE_BASED.into(),
+            tako_core::open_plan::PlanRefusal::LineNotOneBased.to_string(),
         ));
     }
     if column == Some(0) {
         return Err(DispatchError::InvalidParams(
-            tako_core::open_plan::COLUMN_ONE_BASED.into(),
+            tako_core::open_plan::PlanRefusal::ColumnNotOneBased.to_string(),
         ));
     }
     if line.is_none() && column.is_some() {
@@ -3443,7 +3443,7 @@ pub fn lsp_goto_prepare(
     };
     if line == 0 {
         return Err(DispatchError::InvalidParams(
-            tako_core::open_plan::LINE_ONE_BASED.into(),
+            tako_core::open_plan::PlanRefusal::LineNotOneBased.to_string(),
         ));
     }
     if choice == Some(0) {
@@ -3705,7 +3705,7 @@ pub fn lsp_menu_prepare(
 ) -> Result<LspMenuJob, DispatchError> {
     if line == 0 {
         return Err(DispatchError::InvalidParams(
-            tako_core::open_plan::LINE_ONE_BASED.into(),
+            tako_core::open_plan::PlanRefusal::LineNotOneBased.to_string(),
         ));
     }
     let (_, target) = resolve_pane(host.workspace(), pane)?;
@@ -4495,7 +4495,7 @@ pub fn lsp_rename_prepare(
     use tako_core::lsp::rename::{check_new_name, NameError};
     if line == 0 {
         return Err(DispatchError::InvalidParams(
-            tako_core::open_plan::LINE_ONE_BASED.into(),
+            tako_core::open_plan::PlanRefusal::LineNotOneBased.to_string(),
         ));
     }
     if let Err(error) = check_new_name(new_name) {
@@ -4766,7 +4766,7 @@ pub fn lsp_completion_prepare(
 ) -> Result<LspCompletionJob, DispatchError> {
     if line == 0 {
         return Err(DispatchError::InvalidParams(
-            tako_core::open_plan::LINE_ONE_BASED.into(),
+            tako_core::open_plan::PlanRefusal::LineNotOneBased.to_string(),
         ));
     }
     if choice == Some(0) {
@@ -5038,7 +5038,7 @@ pub fn lsp_hover_prepare(
 ) -> Result<LspHoverJob, DispatchError> {
     if line == 0 {
         return Err(DispatchError::InvalidParams(
-            tako_core::open_plan::LINE_ONE_BASED.into(),
+            tako_core::open_plan::PlanRefusal::LineNotOneBased.to_string(),
         ));
     }
     let (_, target) = resolve_pane(host.workspace(), pane)?;
@@ -5224,7 +5224,7 @@ pub fn lsp_xref_prepare(
     })?;
     if line == 0 {
         return Err(DispatchError::InvalidParams(
-            tako_core::open_plan::LINE_ONE_BASED.into(),
+            tako_core::open_plan::PlanRefusal::LineNotOneBased.to_string(),
         ));
     }
     let (_, target) = resolve_pane(host.workspace(), pane)?;
@@ -35852,22 +35852,29 @@ mod tests {
         assert_eq!(column["clamped"].as_bool(), Some(true));
 
         // ③ 境界: 0 は 1 始まりの文言、桁だけの指定は行とセットを促す
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
+        let says = |err: &DispatchError, refusal: tako_core::open_plan::PlanRefusal| {
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| err.to_string().contains(&refusal.text_in(lang)))
+        };
         let zero_line = open(&mut host, &code, Some(0), None).unwrap_err();
         assert!(
-            zero_line
-                .to_string()
-                .contains(tako_core::open_plan::LINE_ONE_BASED),
+            says(
+                &zero_line,
+                tako_core::open_plan::PlanRefusal::LineNotOneBased
+            ),
             "{zero_line}"
         );
         let zero_column = open(&mut host, &code, Some(1), Some(0)).unwrap_err();
         assert!(
-            zero_column
-                .to_string()
-                .contains(tako_core::open_plan::COLUMN_ONE_BASED),
+            says(
+                &zero_column,
+                tako_core::open_plan::PlanRefusal::ColumnNotOneBased
+            ),
             "{zero_column}"
         );
         let only_column = open(&mut host, &code, None, Some(3)).unwrap_err();
-        // 断りの文は表示言語に従う（#2365）ので、日英どちらの形とも突き合わせる
         assert!(
             [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
                 .into_iter()
@@ -36533,8 +36540,14 @@ mod tests {
             .expect_err("上限を超えたプレビューは編集を始めない");
             refusals.push(err.to_string());
         }
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの正本の文とも突き合わせる
+        let over = Truncation::Lines {
+            lines: MAX_LINES + 1,
+        };
         assert!(
-            refusals[0].contains("100,001 行（上限 100,000 行）"),
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| refusals[0].contains(&over.edit_refusal_in(lang))),
             "断る文面に数えた行数と上限が載る: {}",
             refusals[0]
         );
@@ -36553,10 +36566,13 @@ mod tests {
         assert_eq!(status["limit"]["reason"], "lines");
         assert_eq!(status["limit"]["lines"], MAX_LINES + 1);
         assert_eq!(status["limit"]["max_lines"], MAX_LINES);
-        assert!(status["limit"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("100,001 行"));
+        let message = status["limit"]["message"].as_str().unwrap();
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| message == over.edit_refusal_in(lang)),
+            "{message}"
+        );
 
         // 上限の内側のプレビューは `limit` を載せない（無いことが「編集できる」の印）
         host.preview_limits.clear();
@@ -37452,7 +37468,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
         let msg = err.to_string();
-        assert!(msg.contains("打ち切った"), "{msg}");
+        // 打ち切りの文は表示言語に従う（#2365）ので、日英どちらの正本の文とも突き合わせる
+        let timed_out = tako_core::git::HistoryTimedOut {
+            step: "rev-parse --show-toplevel",
+            budget: std::time::Duration::from_millis(500),
+        };
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| msg.contains(&timed_out.text_in(lang))),
+            "{msg}"
+        );
         assert!(msg.contains("rev-parse"), "{msg}");
         assert!(
             !msg.contains("tako-2014-fifo"),
@@ -37680,7 +37706,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
         let msg = err.to_string();
-        assert!(msg.contains("打ち切った"), "{msg}");
+        let timed_out = tako_core::git::HistoryTimedOut {
+            step: "diff",
+            budget: std::time::Duration::from_millis(500),
+        };
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| msg.contains(&timed_out.text_in(lang))),
+            "{msg}"
+        );
         assert!(msg.contains("`git diff`"), "{msg}");
         assert!(
             !msg.contains("tako-2150-fifo"),

@@ -45,8 +45,54 @@ pub struct PreviewViewUpdate {
     pub pan_delta: Option<(f32, f32)>,
 }
 
+/// 表示の更新の断り（#234。日英は #2365）。日英の対は [`ViewRefusal::text_in`] の網羅 match の
+/// 1 か所で、日本語は #2365 より前の固定文とバイト一致
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewRefusal {
+    /// `ズーム倍率は 25%〜400% の範囲で指定する`（範囲は [`PREVIEW_ZOOM_MIN`] / [`PREVIEW_ZOOM_MAX`]）
+    ZoomOutOfRange,
+    /// `ページは 1 以上で指定する`
+    PageZero,
+    /// `パン量は有限の数で指定する`
+    PanNotFinite,
+}
+
+impl ViewRefusal {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        let (min, max) = (
+            (PREVIEW_ZOOM_MIN * 100.0) as u32,
+            (PREVIEW_ZOOM_MAX * 100.0) as u32,
+        );
+        match (self, lang) {
+            (Self::ZoomOutOfRange, Ja) => format!("ズーム倍率は {min}%〜{max}% の範囲で指定する"),
+            (Self::ZoomOutOfRange, En) => format!("zoom must be between {min}% and {max}%"),
+            (Self::PageZero, Ja) => "ページは 1 以上で指定する".into(),
+            (Self::PageZero, En) => "page must be 1 or greater".into(),
+            (Self::PanNotFinite, Ja) => "パン量は有限の数で指定する".into(),
+            (Self::PanNotFinite, En) => "pan must be a finite number".into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ViewRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for ViewRefusal {}
+
+/// `Result<_, String>` の口から `?` でそのまま返せる（文はその場の表示言語）
+impl From<ViewRefusal> for String {
+    fn from(r: ViewRefusal) -> Self {
+        r.to_string()
+    }
+}
+
 impl PreviewViewState {
-    pub fn apply(&mut self, update: PreviewViewUpdate) -> Result<(), String> {
+    pub fn apply(&mut self, update: PreviewViewUpdate) -> Result<(), ViewRefusal> {
         let previous_zoom = self.zoom;
         let mut scale_pan = false;
         if let Some(command) = update.zoom {
@@ -61,11 +107,7 @@ impl PreviewViewState {
                 }
                 PreviewZoomCommand::Set(zoom) => {
                     if !zoom.is_finite() || !(PREVIEW_ZOOM_MIN..=PREVIEW_ZOOM_MAX).contains(&zoom) {
-                        return Err(format!(
-                            "ズーム倍率は {}%〜{}% の範囲で指定する",
-                            (PREVIEW_ZOOM_MIN * 100.0) as u32,
-                            (PREVIEW_ZOOM_MAX * 100.0) as u32
-                        ));
+                        return Err(ViewRefusal::ZoomOutOfRange);
                     }
                     self.zoom = zoom;
                     scale_pan = true;
@@ -84,13 +126,13 @@ impl PreviewViewState {
         }
         if let Some(page) = update.page {
             if page == 0 {
-                return Err("ページは 1 以上で指定する".into());
+                return Err(ViewRefusal::PageZero);
             }
             self.page = page;
         }
         if let Some((x, y)) = update.pan_delta {
             if !x.is_finite() || !y.is_finite() {
-                return Err("パン量は有限の数で指定する".into());
+                return Err(ViewRefusal::PanNotFinite);
             }
             self.pan_x += x;
             self.pan_y += y;
@@ -165,17 +207,26 @@ mod tests {
     #[test]
     fn 不正な倍率とページを拒否する() {
         let mut state = PreviewViewState::default();
-        assert!(state
-            .apply(PreviewViewUpdate {
+        assert_eq!(
+            state.apply(PreviewViewUpdate {
                 zoom: Some(PreviewZoomCommand::Set(4.01)),
                 ..PreviewViewUpdate::default()
-            })
-            .is_err());
-        assert!(state
-            .apply(PreviewViewUpdate {
+            }),
+            Err(ViewRefusal::ZoomOutOfRange)
+        );
+        assert_eq!(
+            state.apply(PreviewViewUpdate {
                 page: Some(0),
                 ..PreviewViewUpdate::default()
-            })
-            .is_err());
+            }),
+            Err(ViewRefusal::PageZero)
+        );
+        assert_eq!(
+            state.apply(PreviewViewUpdate {
+                pan_delta: Some((f32::NAN, 0.0)),
+                ..PreviewViewUpdate::default()
+            }),
+            Err(ViewRefusal::PanNotFinite)
+        );
     }
 }

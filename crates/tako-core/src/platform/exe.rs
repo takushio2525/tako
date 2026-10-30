@@ -314,7 +314,8 @@ pub fn find_in_process_path(name: &str) -> Option<String> {
 /// A/B: #2519 前へ戻す（長生きするプロセスが周期的に起こす外部コマンドを素の名前のまま起こす）。
 /// 立てると GUI の git / tmux（`bin_resolve`）・codex / agy の `lsof`・スリープ防止の
 /// `sudo` / `pmset`・PATH に無い素の名前の `tailscale`（remote の状態の更新が 2 秒ごとに 2 回通る
-/// `tailscale::pick_candidate`）が PATH の空振りを繰り返す = Issue の症状の起点
+/// `tailscale::pick_candidate`）が PATH の空振りを繰り返す = Issue の症状の起点。
+/// `tako queue` の包みが待ち明けに子を素の名前で起こすのも同じ切り替えで戻る（[`pin_before_wait`]。#2538）
 pub const ISSUE2519_LEGACY_ENV: &str = "TAKO_2519_LEGACY";
 
 /// [`ISSUE2519_LEGACY_ENV`] が立っているか（#2519 の A/B のゲートはここ 1 か所）
@@ -337,6 +338,55 @@ pub fn resolve_for_spawn(name: &str) -> String {
         return name.to_string();
     }
     find_in_process_path(name).unwrap_or_else(|| name.to_string())
+}
+
+/// 待ってから起こす子の名前を、**待つ前に**このプロセスの PATH で絶対パスへ引いておく（#2538。
+/// `tako queue` の包み）。
+///
+/// 順番待ちの包みは install をまたいで何分も待つことがあり、待ち明けに素の名前で起こすと、自分の
+/// 実行ファイルが差し替えで消えた後の PATH の空振りが 1 本ずつ AppleSystemPolicy に拒否される
+/// （[`find_in_process_path`] の説明と同じ仕組み）。待つ前に引いた絶対パスを待ち明けに起こせば
+/// `posix_spawn` 1 回で済む。
+///
+/// [`find_in_process_path`] と違って、PATH の相対エントリ・空エントリ（= カレントディレクトリ）も
+/// `posix_spawnp` と同じ順に見る。包みはカレントディレクトリを変えずに子を起こすので、そこにある
+/// 実行ファイル（`./node_modules/.bin` 等）は素の名前のときも子に当たる。相対・空のエントリで先に
+/// 当たるときは引かずに `None`（素の名前のまま起こす = 修正前と同じ実行ファイル）。読み飛ばして後ろの
+/// 絶対エントリへ寄せると、利用者が打った名前とは別の実行ファイルを起こしてしまう。
+///
+/// パス（`/` を含む）・空の名前・見つからない・Windows・A/B の [`ISSUE2519_LEGACY_ENV`] は `None`
+pub fn pin_before_wait(name: &str) -> Option<String> {
+    if issue2519_legacy() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        let path = std::env::var_os("PATH");
+        pin_in_path_list(name, path.as_deref(), is_executable_file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// [`pin_before_wait`] の判定本体（env とファイルシステムを引数で受ける）
+#[cfg(unix)]
+fn pin_in_path_list(
+    name: &str,
+    path: Option<&std::ffi::OsStr>,
+    is_executable: impl Fn(&std::path::Path) -> bool,
+) -> Option<String> {
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let path = path.unwrap_or_else(|| std::ffi::OsStr::new(SPAWNP_DEFAULT_PATH));
+    let (found, dir) = std::env::split_paths(path)
+        .map(|dir| (dir.join(name), dir))
+        .find(|(candidate, _)| is_executable(candidate))?;
+    dir.is_absolute()
+        .then(|| found.to_string_lossy().into_owned())
 }
 
 /// libc の `posix_spawnp` が PATH 未設定のときに使う既定（`_PATH_DEFPATH`）
@@ -761,6 +811,59 @@ mod tests {
         assert_eq!(
             find_in_path_list("tool", Some(&path), is_executable_file).as_deref(),
             Some(c.join("tool").to_string_lossy().as_ref())
+        );
+    }
+
+    /// #2538: 待つ前に引く口は絶対エントリで最初に当たる絶対パスを返す（パス・空の名前は引かない・
+    /// PATH 未設定は libc の既定）
+    #[cfg(unix)]
+    #[test]
+    fn 待つ前に引く口は最初に当たる絶対パスを返す() {
+        let present = ["/b/tool", "/c/tool"];
+        let exec = |p: &std::path::Path| present.iter().any(|x| std::path::Path::new(x) == p);
+        let path = std::ffi::OsStr::new("/a:/b:/c");
+        assert_eq!(
+            pin_in_path_list("tool", Some(path), exec).as_deref(),
+            Some("/b/tool")
+        );
+        assert_eq!(pin_in_path_list("none", Some(path), exec), None);
+        let any = |_: &std::path::Path| true;
+        assert_eq!(pin_in_path_list("/x/tool", Some("/a".as_ref()), any), None);
+        assert_eq!(pin_in_path_list("x/tool", Some("/a".as_ref()), any), None);
+        assert_eq!(pin_in_path_list("", Some("/a".as_ref()), any), None);
+        assert_eq!(
+            pin_in_path_list("tool", None, any).as_deref(),
+            Some("/usr/bin/tool")
+        );
+    }
+
+    /// #2538: 相対・空のエントリ（カレントディレクトリ基準）で先に当たるなら引かない
+    /// （`posix_spawnp` はそこを起こすので、後ろの絶対エントリへ寄せると別の実行ファイルになる）。
+    /// 相対・空のエントリで当たらなければ、後ろの絶対エントリで当たる場所を返す
+    #[cfg(unix)]
+    #[test]
+    fn 相対エントリで先に当たるなら待つ前に引かない() {
+        let present = ["node_modules/.bin/tool", "tool", "/b/tool"];
+        let exec = |p: &std::path::Path| present.iter().any(|x| std::path::Path::new(x) == p);
+        assert_eq!(
+            pin_in_path_list("tool", Some("/a:node_modules/.bin:/b".as_ref()), exec),
+            None,
+            "相対エントリの先が当たる"
+        );
+        assert_eq!(
+            pin_in_path_list("tool", Some("/a::/b".as_ref()), exec),
+            None,
+            "空エントリ = カレントディレクトリが当たる"
+        );
+        assert_eq!(
+            pin_in_path_list("tool", Some("/a:rel:/b".as_ref()), exec).as_deref(),
+            Some("/b/tool"),
+            "相対エントリで当たらなければ後ろの絶対エントリ"
+        );
+        // 既存の口（周期の起動）は相対エントリを見ないまま（#2513 の答えは変えない）
+        assert_eq!(
+            find_in_path_list("tool", Some("/a:node_modules/.bin:/b".as_ref()), exec).as_deref(),
+            Some("/b/tool")
         );
     }
 

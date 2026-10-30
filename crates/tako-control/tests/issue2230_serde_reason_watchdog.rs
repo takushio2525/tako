@@ -172,8 +172,8 @@ const ALLOWED: &[Allow] = &[
     },
     Allow {
         file: "crates/tako-app/src/update_checker.rs",
-        needle: "JSON パースエラー",
-        why: "GitHub API の応答",
+        needle: "ParseCause::Json(",
+        why: "GitHub API の応答（文は `ParseCause::Json` の日英の対が組む = #2365）",
     },
 ];
 

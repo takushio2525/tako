@@ -32,6 +32,7 @@
 
 use std::path::{Path, PathBuf};
 
+use tako_core::i18n::Lang;
 use tako_core::preview_limit::{Truncation, MAX_BYTES, MAX_LINES};
 use tako_core::source_scan::fn_head_name;
 
@@ -195,24 +196,42 @@ fn 上限を超えたら理由と値を返す() {
         .expect("上限 + 1 行は省略する");
     let bytes = Truncation::judge(MAX_BYTES + 1, Some(MAX_BYTES as u64 + 1), 1)
         .expect("上限 + 1 バイトは省略する");
-    for (limit, value, reason) in [
-        (lines, "100,001 行（上限 100,000 行）", "lines"),
-        (bytes, "10 MB（上限 10 MB）", "bytes"),
+    // 断る文面は表示言語に従う（#2365）ので、日英それぞれの文に値と上限が載ることを見る
+    for (limit, values, reason) in [
+        (
+            lines,
+            [
+                (Lang::Ja, "100,001 行（上限 100,000 行）"),
+                (Lang::En, "100,001 lines (limit 100,000 lines)"),
+            ],
+            "lines",
+        ),
+        (
+            bytes,
+            [
+                (Lang::Ja, "10 MB（上限 10 MB）"),
+                (Lang::En, "10 MB (limit 10 MB)"),
+            ],
+            "bytes",
+        ),
     ] {
-        let refusal = limit.edit_refusal();
-        assert!(
-            refusal.contains(value),
-            "{LIMIT}: 断る文面に値と上限が無い（#1660。無言で断ると、なぜ編集できないかが \
-             分からない）: {refusal}"
-        );
-        let json = limit.to_json();
-        assert_eq!(json["reason"], reason, "{LIMIT}: limit.reason");
-        assert_eq!(json["max_lines"], MAX_LINES, "{LIMIT}: limit.max_lines");
-        assert_eq!(json["max_bytes"], MAX_BYTES, "{LIMIT}: limit.max_bytes");
-        assert_eq!(
-            json["message"], refusal,
-            "{LIMIT}: limit.message と断る文面は同じ"
-        );
+        for (lang, value) in values {
+            let refusal = limit.edit_refusal_in(lang);
+            assert!(
+                refusal.contains(value),
+                "{LIMIT}: 断る文面に値と上限が無い（#1660。無言で断ると、なぜ編集できないかが \
+                 分からない）: {refusal}"
+            );
+            let json = limit.to_json_in(lang);
+            assert_eq!(json["reason"], reason, "{LIMIT}: limit.reason");
+            assert_eq!(json["max_lines"], MAX_LINES, "{LIMIT}: limit.max_lines");
+            assert_eq!(json["max_bytes"], MAX_BYTES, "{LIMIT}: limit.max_bytes");
+            assert_eq!(
+                json["message"], refusal,
+                "{LIMIT}: limit.message と断る文面は同じ"
+            );
+        }
+        let value = values[0].1;
         assert!(
             limit
                 .detail_ja()

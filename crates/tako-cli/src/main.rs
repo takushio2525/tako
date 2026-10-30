@@ -9953,16 +9953,22 @@ fn build_request(command: &Command) -> Result<Request, String> {
         },
         Command::Open(args) => {
             // #1676: 負値・0 はここで弾く（文言の正本は open_plan。dispatch の
-            // `usize` は負値を持てないので、CLI 側だけがこの境界を見られる）
-            let one_based = |v: Option<i64>, message: &str| -> Result<Option<usize>, String> {
-                match v {
-                    Some(v) if v <= 0 => Err(format!("{message}: {v}")),
-                    Some(v) => Ok(Some(v as usize)),
-                    None => Ok(None),
-                }
-            };
-            let line = one_based(args.line, tako_core::open_plan::LINE_ONE_BASED)?;
-            let column = one_based(args.column, tako_core::open_plan::COLUMN_ONE_BASED)?;
+            // `usize` は負値を持てないので、CLI 側だけがこの境界を見られる）。
+            // 表示言語は前段の断り（`front_err`）と同じ解決（#2365）
+            use tako_core::open_plan::PlanRefusal;
+            let one_based =
+                |v: Option<i64>, refusal: PlanRefusal| -> Result<Option<usize>, String> {
+                    match v {
+                        Some(v) if v <= 0 => Err(format!(
+                            "{}: {v}",
+                            refusal.text_in(tako_control::settings::peek_lang_setting().resolve())
+                        )),
+                        Some(v) => Ok(Some(v as usize)),
+                        None => Ok(None),
+                    }
+                };
+            let line = one_based(args.line, PlanRefusal::LineNotOneBased)?;
+            let column = one_based(args.column, PlanRefusal::ColumnNotOneBased)?;
             Request::OpenFile {
                 pane: target_pane(args.pane)?,
                 path: absolutize(&args.path),
@@ -14750,12 +14756,19 @@ mod tests {
         };
         assert_eq!((line, column), (None, None));
 
-        // 0 と負値はエラー（文言の正本は open_plan の定数）
+        // 0 と負値はエラー（文言の正本は open_plan の `PlanRefusal`。表示言語は手元の設定で
+        // 決まる = 日英どちらの形とも突き合わせる。#2365）
+        use tako_core::open_plan::PlanRefusal;
+        let says = |err: &str, refusal: PlanRefusal| {
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| err.contains(&refusal.text_in(lang)))
+        };
         for value in ["0", "-1"] {
             let command = parse(&["tako", "open", abs, "--pane", "5", "--line", value]);
             let err = build_request(&command).unwrap_err();
             assert!(
-                err.contains(tako_core::open_plan::LINE_ONE_BASED) && err.contains(value),
+                says(&err, PlanRefusal::LineNotOneBased) && err.contains(value),
                 "--line {value}: {err}"
             );
             let command = parse(&[
@@ -14763,7 +14776,7 @@ mod tests {
             ]);
             let err = build_request(&command).unwrap_err();
             assert!(
-                err.contains(tako_core::open_plan::COLUMN_ONE_BASED) && err.contains(value),
+                says(&err, PlanRefusal::ColumnNotOneBased) && err.contains(value),
                 "--column {value}: {err}"
             );
         }
