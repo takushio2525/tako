@@ -1884,6 +1884,9 @@ tako queue cargo build       # 重い処理を順番待ちで走らせる（同�
 tako queue cancel 12345      # 受付番号（= 待っている tako queue の pid）の処理を取り消す
 tako queue limits            # 上限（同時数・空けておくメモリ・swap の警戒線・待ちの上限）を読む
 tako queue limits --max-jobs 2   # 同時に走らせる数を変える（--reset で機に合わせた既定へ）
+tako queue limits --jobserver off  # tako のペインの cargo が共有する札を配らない（既定 on。on で戻す）
+                             # 札は論理 CPU 数ぶん。tako queue を通さない cargo も、並ぶと全体でこの数 + 並んだ本数までに
+                             # 絞られる（tako queue の 1 行「cargo の札: 空き X / N」で見える）
 tako queue start 12          # メモリの逼迫で起動を待っている agent（spawn / run / 再起動後の復元）を今すぐ起こす
                              # （番号はペイン。逼迫しているあいだは spawn の応答の launch_gate が waiting になり、
                              # 圧が戻ると自動で起きる。再起動後の復元は master から 1 本ずつ時差で起きる）

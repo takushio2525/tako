@@ -243,7 +243,6 @@ fn 取り分と札を重ねると札が上限で取り分は見られない() {
     assert_eq!(fifo.available().unwrap(), 3, "札は全部返る");
 }
 
-
 #[test]
 fn cargo_makeflagsは素のmakeの並列度を変えない() {
     if !SUPPORTED {
