@@ -108,13 +108,9 @@ impl Scratch {
         self.dir.join("h")
     }
 
-    /// 既定の置き場（`tako_core::paths::default_data_dir` と同じ規則。XDG_DATA_HOME は子から外す）
+    /// 子の既定の置き場（`tako_core::paths::default_data_dir` と同じ 1 実装。XDG_DATA_HOME は子から外す）
     fn default_place(&self) -> PathBuf {
-        if cfg!(target_os = "macos") {
-            self.home().join("Library/Application Support/tako")
-        } else {
-            self.home().join(".local/share/tako")
-        }
+        tako_core::paths::default_data_dir_under_home(&self.home())
     }
 
     fn write_control(&self, dir: &Path) {
@@ -350,18 +346,15 @@ fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// その行を囲む関数の名前（上へ辿って最初の `fn <名前>(`。閉じ括弧は数えない素朴な判定）
+/// その行を囲む関数の名前（上へ辿って最初の関数の頭。閉じ括弧は数えない素朴な判定。
+/// 頭の読み方は番犬の共有ヘルパ = `pub(crate) fn` / `async fn` も頭と見る。#1496）
 fn enclosing_fn(lines: &[&str], at: usize) -> String {
     lines[..=at]
         .iter()
         .rev()
-        .find_map(|line| {
-            let (_, rest) = line.split_once("fn ")?;
-            let name = rest.split('(').next()?.trim();
-            (!name.is_empty() && name.chars().all(|c| c == '_' || c.is_alphanumeric()))
-                .then(|| name.to_string())
-        })
+        .find_map(|line| tako_core::source_scan::fn_head_name(line))
         .unwrap_or_default()
+        .to_string()
 }
 
 #[test]
