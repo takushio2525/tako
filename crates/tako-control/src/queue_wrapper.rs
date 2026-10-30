@@ -6,7 +6,8 @@
 //! ① 受付（poll = 1 件の全体を送る upsert）→ 順位と待つ理由
 //! ② 1 秒ごとの poll（心拍を兼ねる）→ waiting / granted{取り分}
 //! ③ 子を起こす（env: TAKO_QUEUE_JOB=<受付番号>、CARGO_BUILD_JOBS / RUST_TEST_THREADS が
-//!    未設定なら取り分）→ started（= 子の pid を載せた poll）
+//!    未設定なら取り分）→ started（= 子の pid を載せた poll）。子は ① の前に PATH で引いておいた
+//!    絶対パスで起こす（install をまたいだ待ちで PATH を空振りしない。argv[0] は打った形のまま。#2538）
 //! ④ 2 秒ごとの心拍（取り消しの印を受け取る）
 //! ⑤ done（終了コード）。自分の終了コードは子と同じ
 //! ```
@@ -347,12 +348,49 @@ fn note(message: &str) {
     eprintln!("tako queue: {message}");
 }
 
+/// 起こす子（#2538）。argv[0] を**待つ前**（install の差し替えで自分の実行ファイルが消える前）に
+/// このプロセスの PATH で絶対パスへ引いて持ち、待ち明けはそこを起こす。素の名前のまま起こすと、
+/// 差し替えの後の PATH の空振りが 1 本ずつ AppleSystemPolicy に拒否される（10/30 の本番で
+/// install の前から待っていた包み 2 つが 41 本ずつ）
+struct Program<'a> {
+    argv: &'a [String],
+    /// 待つ前に引いた絶対パス（引けない・相対エントリで当たる・Windows・A/B は `None` = 素の名前）
+    pinned: Option<String>,
+}
+
+impl<'a> Program<'a> {
+    fn pin(argv: &'a [String]) -> Self {
+        Self {
+            argv,
+            pinned: tako_core::platform::exe::pin_before_wait(&argv[0]),
+        }
+    }
+
+    /// 子のコマンド。持った絶対パスが起こす時点で消えていれば素の名前（= 修正前の起こし方）。
+    /// argv[0] は利用者が打った形のまま渡す（`ps` の見え方・argv[0] で振る舞いを決める rustup の proxy 等）
+    fn command(&self) -> Command {
+        let program = self
+            .pinned
+            .as_deref()
+            .filter(|p| tako_core::platform::exe::is_executable_file(Path::new(p)))
+            .unwrap_or(self.argv[0].as_str());
+        let mut cmd = Command::new(program);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.arg0(&self.argv[0]);
+        }
+        cmd.args(&self.argv[1..]);
+        cmd
+    }
+}
+
 /// 順番待ちせずに走らせる（入れ子・tako が居ない・調停役でない）
-fn run_direct(argv: &[String]) -> i32 {
-    match Command::new(&argv[0]).args(&argv[1..]).spawn() {
+fn run_direct(program: &Program) -> i32 {
+    match program.command().spawn() {
         Ok(mut child) => wait_plain(&mut child),
         Err(e) => {
-            note(&format!("{} を起動できない: {e}", argv[0]));
+            note(&format!("{} を起動できない: {e}", program.argv[0]));
             q::EXIT_SPAWN_FAILED
         }
     }
@@ -407,10 +445,13 @@ fn run_with(
         note("走らせるコマンドが無い（例: tako queue cargo build）");
         return 2;
     }
+    // 待つ前に子の場所を引いておく（待ちの間に install で自分の実行ファイルが置き換わっても、
+    // 待ち明けは PATH を空振りせずに起こす。#2538）
+    let program = Program::pin(argv);
     signals::install();
     // 入れ子: 外側の枠の中で即実行
     if nested {
-        return run_direct(argv);
+        return run_direct(&program);
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let mut wire = build_wire(argv, opts, &cwd);
@@ -419,20 +460,20 @@ fn run_with(
         Ok(v) => v,
         Err(SendError::Unreachable(_)) => {
             note("tako が起動していないので、順番待ちせずに走らせる");
-            return run_direct(argv);
+            return run_direct(&program);
         }
         Err(SendError::Timeout(limit)) => {
             note(&format!(
                 "tako が {} 秒応答しないので、順番待ちせずに走らせる（GUI が固まっている可能性）",
                 limit.as_secs()
             ));
-            return run_direct(argv);
+            return run_direct(&program);
         }
         Err(SendError::Rejected(m)) => {
             note(&format!(
                 "順番待ちを受けていない（{m}）ので、そのまま走らせる"
             ));
-            return run_direct(argv);
+            return run_direct(&program);
         }
     };
 
@@ -505,7 +546,7 @@ fn run_with(
                     } else {
                         "順番待ちの調停役を見失ったまま 60 秒たったので、待たずに走らせる"
                     });
-                    return run_direct(argv);
+                    return run_direct(&program);
                 }
                 std::thread::sleep(reconnect_delay(attempts).saturating_sub(POLL_INTERVAL));
                 attempts += 1;
@@ -515,7 +556,7 @@ fn run_with(
                 note(&format!(
                     "順番待ちを受けていない（{m}）ので、そのまま走らせる"
                 ));
-                return run_direct(argv);
+                return run_direct(&program);
             }
         }
     };
@@ -533,8 +574,8 @@ fn run_with(
     }
 
     // ---- 走らせる ----
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]).env(ENV_JOB, wire.id.to_string());
+    let mut cmd = program.command();
+    cmd.env(ENV_JOB, wire.id.to_string());
     cmd.envs(share_env(share, already_set));
     let mut child = match cmd.spawn() {
         Ok(c) => c,

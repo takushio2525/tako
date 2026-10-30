@@ -1006,6 +1006,23 @@ AppleSystemPolicy が読めずに 1 本ずつ拒否する。記録されるパ�
     （実ファイルと実 PATH）・周期の口の表・本番コードの素の `git` / `tmux` のリテラル・remote の状態の更新が
     通る口の表（`REMOTE_REFRESH`）・PATH に無い素の名前の tailscale を起こさないこと（相対エントリの先の
     偽物が印を残すかで見る）を file:line で見る。**周期の口を足したら表（`PERIODIC` / `REMOTE_REFRESH`）にも載せる**
+- **`tako queue` の包みも同じ**（#2538）: install の前から順番待ちしていた旧版の包みが、install の終わりで
+  枠が空いた瞬間に利用者のコマンドを素の名前で起こし、PATH の空振りの数だけ拒否された（10/30 の 20:30 と
+  21:23 の 2 回とも、待っていた包み 2 つ × 41 本 = 82 件。41 は包みを起こしたペインの PATH で cargo より前に
+  あるエントリの数）。install の手順の側ではないことは、拒否の塊の時刻が待っていた包みの開始と秒まで一致し、
+  差し替えの後に受け付けた包みは 0 件だったことで確かめた。周期ではなく待ち明けの 1 回だが、待ちは install を
+  またぐ:
+  - 受付の前に `exe::pin_before_wait` で argv[0] を引いて持ち（`queue_wrapper::Program`）、待ち明けも待たずに
+    走る経路もそこを起こす。起こす時点で消えていれば素の名前（= 修正前の起こし方）
+  - GUI の口（`find_in_process_path`）と違い、PATH の相対・空エントリも `posix_spawnp` と同じ順に見て、そこで
+    先に当たるなら引かない（包みはカレントディレクトリを変えないので `./node_modules/.bin` 等は子に当たる。
+    読み飛ばして後ろの絶対エントリへ寄せると、打った名前とは別の実行ファイルを起こす）
+  - argv[0] は `CommandExt::arg0` で打った形のまま渡す（`ps`・`$0`・argv[0] で振る舞いを決める rustup の
+    proxy）。`tako queue --json` の label は argv から組むので変わらない
+  - A/B は `TAKO_2519_LEGACY=1`（「長生きするプロセスの素の名前の起動へ戻す」で同じ意味）。番犬
+    `crates/tako-control/tests/issue2538_queue_wrapper_spawn_path_watchdog.rs` が `Command::new` の場所・
+    受付より前に引くこと（file:line）と、待ちの間に PATH の手前へ入った別物を起こさないこと（実ファイル・
+    実 PATH）を見る
 
 ## OS に何かを「開かせる」前に形を確かめる（Issue #1376 / #1371）
 
