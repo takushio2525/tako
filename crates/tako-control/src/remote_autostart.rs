@@ -154,6 +154,9 @@ pub struct AutostartInput {
     pub desired: bool,
     /// daemon が既に生きているか
     pub daemon_running: bool,
+    /// 生きている daemon が、同じパスのまま差し替わった旧版の実行ファイルで動いているか
+    /// （#2518。止めて起こし直せば新版になる = `remote_generation::Generation::renewable`）
+    pub daemon_stale: bool,
     /// この OS で daemon を起動できるか（`platform::support` のゲート）
     pub supported: bool,
     /// A/B（`TAKO_1485_LEGACY=1`）
@@ -175,7 +178,10 @@ pub fn autostart_decision(input: &AutostartInput) -> Result<(), AutostartSkip> {
     if !input.desired {
         return Err(AutostartSkip::NotDesired);
     }
-    if input.daemon_running {
+    // 旧版のまま動いている daemon は「既に起動している」に数えない（#2518）。
+    // install も GUI の再起動も daemon を入れ替えないので、ここで見送ると旧版が残り続ける。
+    // 起こす `spawn_daemon` が旧版を止めてから起こし直す
+    if input.daemon_running && !input.daemon_stale {
         return Err(AutostartSkip::AlreadyRunning);
     }
     Ok(())
@@ -204,9 +210,12 @@ pub const SUPPORT_KEY: &str = "tako_remote_start";
 /// マトリクス・env）だけを持つ。GUI はこれを background で呼び、**試行のたびに
 /// 引き直す**（待っている間に人が `tako remote start` / `stop` を打っているかもしれない）
 pub fn probe() -> Result<(), AutostartSkip> {
+    let status = crate::remote::daemon_status();
     autostart_decision(&AutostartInput {
         desired: crate::remote::read_desired().is_some(),
-        daemon_running: crate::remote::daemon_status()["running"].as_bool() == Some(true),
+        daemon_running: status["running"].as_bool() == Some(true),
+        // 判定は status の `serve_generation` を読むだけ（#2518。再計算しない）
+        daemon_stale: crate::remote_generation::renewable_in_status(&status),
         supported: platform_supported(),
         legacy: legacy_mode(),
     })
@@ -245,6 +254,9 @@ pub const RESULT_FAILED: &str = "failed";
 /// 失敗の分類（`spawn_daemon` が Err を返した）
 pub const REASON_SPAWN_FAILED: &str = "spawn-failed";
 
+/// 立て直しの分類: 旧版のまま動いていた daemon を新版へ入れ替えた（#2518。`result` は started）
+pub const REASON_REPLACED_GENERATION: &str = "replaced-generation";
+
 /// 記録へ載せる理由文の上限（文字数）。
 /// daemon の stderr はセットアップの不足項目を列挙してくるので長くなりうる
 pub const DETAIL_MAX_CHARS: usize = 300;
@@ -269,6 +281,20 @@ impl LastAutostart {
             reason: None,
             detail: None,
         }
+    }
+
+    /// `spawn_daemon` の成功応答から記録を作る（#2518）。
+    /// 旧版を止めて起こし直した（応答の `renewed`）ときは、そのことを `reason` / `detail` に残す
+    /// = 「GUI を起動したらスマホが一瞬切れた」の理由を status と persist.log から読める
+    pub fn started_from(at: u64, attempts: u32, info: &Value) -> Self {
+        let mut out = Self::started(at, attempts);
+        if let Some(pid) = info["renewed"]["previous_pid"].as_u64() {
+            out.reason = Some(REASON_REPLACED_GENERATION.to_string());
+            out.detail = Some(format!(
+                "旧版のまま動いていた daemon（PID {pid}）を止めて新版で起こし直しました"
+            ));
+        }
+        out
     }
 
     /// 立て直さなかった（理由つき）
@@ -385,6 +411,7 @@ mod tests {
         AutostartInput {
             desired,
             daemon_running: running,
+            daemon_stale: false,
             supported: true,
             legacy: false,
         }
@@ -411,6 +438,42 @@ mod tests {
         );
     }
 
+    /// #2518: install で同じパスのまま差し替わった旧版の daemon は「既に起動している」に
+    /// 数えない。数えると install も GUI の再起動も daemon を入れ替えない（Issue の症状）
+    #[test]
+    fn 旧版のまま動いていれば立て直す() {
+        let mut i = input(true, true);
+        i.daemon_stale = true;
+        assert_eq!(autostart_decision(&i), Ok(()));
+        // 意図が無い・A/B・未対応 OS は旧版でも起こさない（順序は #1485 のまま）
+        i.desired = false;
+        assert_eq!(autostart_decision(&i), Err(AutostartSkip::NotDesired));
+        i.desired = true;
+        i.legacy = true;
+        assert_eq!(autostart_decision(&i), Err(AutostartSkip::Disabled));
+        i.legacy = false;
+        i.supported = false;
+        assert_eq!(autostart_decision(&i), Err(AutostartSkip::Unsupported));
+    }
+
+    /// 入れ替えたことは started のまま理由に残る（result の値は増やさない = MCP の説明が嘘にならない）
+    #[test]
+    fn 入れ替えた起動は理由つきのstartedで残る() {
+        let renewed = LastAutostart::started_from(
+            10,
+            1,
+            &json!({ "running": true, "renewed": { "previous_pid": 4321, "reason": "replaced" } }),
+        );
+        assert_eq!(renewed.result, RESULT_STARTED);
+        assert_eq!(renewed.reason.as_deref(), Some(REASON_REPLACED_GENERATION));
+        assert!(renewed.detail.as_deref().unwrap().contains("PID 4321"));
+        assert!(renewed.log_line().contains("分類=replaced-generation"));
+        assert!(!renewed.is_failure());
+
+        let fresh = LastAutostart::started_from(10, 2, &json!({ "running": true }));
+        assert_eq!(fresh, LastAutostart::started(10, 2));
+    }
+
     #[test]
     fn 未対応osでは記録があっても起こさない() {
         let mut i = input(true, false);
@@ -431,6 +494,7 @@ mod tests {
             let i = AutostartInput {
                 desired,
                 daemon_running: running,
+                daemon_stale: false,
                 supported,
                 legacy: true,
             };

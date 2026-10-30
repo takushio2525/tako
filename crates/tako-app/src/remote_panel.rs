@@ -353,7 +353,12 @@ impl TakoApp {
     ///
     /// Mac の再起動直後は tailscaled がまだ上がっていないので、失敗しても
     /// [`tako_control::remote_autostart::BACKOFF_SECS`] のバックオフで数回試す。
-    /// 諦めたら**黙らない**: 理由を persist.log と起動パネルへ出す（#1399 / #1446 ④）
+    /// 諦めたら**黙らない**: 理由を persist.log と起動パネルへ出す（#1399 / #1446 ④）。
+    ///
+    /// daemon が**旧版のまま**動いている（install で同じパスのまま差し替わった。#2518）ときも
+    /// ここで立て直す（`spawn_daemon` が止めて起こし直す）。スマホの接続は一瞬切れるが、
+    /// 利用者の操作の切れ目は待たない: daemon はスマホの操作を GUI へ中継するので、
+    /// GUI の再起動の間はもともと操作が通らない。その切れ目に重ねるのがいちばん短い
     pub(crate) fn spawn_remote_autostart(&mut self, cx: &mut Context<Self>) {
         use tako_control::remote_autostart as autostart;
 
@@ -407,13 +412,15 @@ impl TakoApp {
                     .spawn(async { tako_control::remote::spawn_daemon() })
                     .await;
                 let err = match result {
-                    Ok(_) => {
+                    Ok(info) => {
                         let n = attempts;
                         cx.background_executor()
                             .spawn(async move {
-                                autostart::record_outcome(&autostart::LastAutostart::started(
+                                // 旧版を入れ替えた（#2518）ならそのことも残す
+                                autostart::record_outcome(&autostart::LastAutostart::started_from(
                                     autostart::now_epoch_secs(),
                                     n,
+                                    &info,
                                 ));
                             })
                             .await;

@@ -6224,6 +6224,12 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
 fn remote_start() -> Result<(), String> {
     let result = tako_control::remote::spawn_daemon()?;
     println!("{}", pretty_json(&result));
+    // #2518: 旧版のまま動いていた daemon を入れ替えたなら、スマホが一瞬切れた理由を言う
+    if let Some(pid) = result["renewed"]["previous_pid"].as_u64() {
+        eprintln!(
+            "旧版のまま動いていたリモート daemon（PID {pid}）を止めて、新版で起動し直しました。"
+        );
+    }
     if let Some(url) = result["url"].as_str() {
         match tako_control::remote::generate_qr_png(url) {
             Ok(path) => {
@@ -6298,6 +6304,10 @@ fn remote_status() -> Result<(), String> {
                 eprintln!("  次の一手: {next}");
             }
         }
+    }
+    // 旧版のまま動いている daemon も埋もれさせない（#2518。判定は status の欄を読むだけ）
+    if let Some(detail) = status["serve_generation"]["detail"].as_str() {
+        eprintln!("{detail}");
     }
     println!("{}", pretty_json(&status));
     Ok(())

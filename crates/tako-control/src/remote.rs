@@ -2016,15 +2016,19 @@ pub fn run_daemon() -> io::Result<()> {
     // デバイスレジストリを開く（devices.json 破損時は黙って全失効させず起動を拒否する）
     let registry = DeviceRegistry::open(&state_dir()).map_err(io::Error::other)?;
 
-    // PID ファイル: 実行ファイルパスと起動時刻も記録（P0-4 の stop 照合用）
+    // PID ファイル: 実行ファイルパスと起動時刻も記録（P0-4 の stop 照合用）。
+    // 4 行目は実行ファイルの識別（#2518）。同じパスのまま差し替わった（install の
+    // contents-swap）ことを GUI 起動時・status が見分けるための材料で、パスの文字列では言えない
+    let exe = std::env::current_exe().unwrap_or_default();
     let pid_info = format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}",
         std::process::id(),
-        std::env::current_exe().unwrap_or_default().display(),
+        exe.display(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        crate::remote_generation::self_stamp_line(&exe),
     );
     write_secret_file(&pid_path(), &pid_info)
         .map_err(|e| io::Error::other(format!("PID ファイルの書き出しに失敗: {e}")))?;
@@ -2572,6 +2576,12 @@ pub fn daemon_status() -> Value {
     if let Some(w) = crate::remote_serve::degraded_warning(&fields) {
         warnings.push(w);
     }
+    // daemon の世代（#2518）。install も GUI の再起動も daemon を入れ替えないので、
+    // 同じパスのまま差し替わった旧版が動き続けていることをここで言う
+    if let Some((field, warning)) = generation_fields(&pid_info) {
+        status["serve_generation"] = field;
+        warnings.extend(warning);
+    }
     if !warnings.is_empty() {
         status["warnings"] = json!(warnings);
     }
@@ -2647,11 +2657,43 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// PID ファイルの内容を解析する。
-/// 形式: 行1=PID, 行2=実行ファイルパス, 行3=起動時刻(unix epoch sec)
+/// 形式: 行1=PID, 行2=実行ファイルパス, 行3=起動時刻(unix epoch sec),
+/// 行4=実行ファイルの識別（#2518。それより前の daemon には無い）
 struct PidInfo {
     pid: u32,
     exe: Option<String>,
     start_time: Option<u64>,
+    /// 起動時の実行ファイルの識別（#2518。無い = それより前の daemon）
+    stamp: Option<crate::remote_generation::ExeStamp>,
+}
+
+/// daemon の世代を判定する（#2518。`daemon_status` の `serve_generation` の 1 実装）。
+///
+/// **比べるのは記録したファイルの識別と、いまそのパスに在るファイルの識別**で、
+/// パスの文字列ではない（同じパスのまま中身が替わるのが #2518 の症状）。
+/// 判定は `remote_generation::judge` の純関数 1 本。PID ファイルにパスが無ければ判定しない
+fn generation_of(info: &PidInfo) -> Option<crate::remote_generation::Generation> {
+    let exe = info.exe.as_deref().filter(|e| !e.is_empty())?;
+    let now = crate::remote_generation::observe(std::path::Path::new(exe));
+    Some(crate::remote_generation::judge(
+        info.stamp.as_ref(),
+        info.start_time,
+        &now,
+    ))
+}
+
+/// `serve_generation` の欄と、旧版なら `warnings` へ足す 1 行（#2518）。
+/// A/B（`TAKO_2518_LEGACY=1`）では載せない = 読む側（自動復帰・`spawn_daemon`）も #2518 前に戻る
+fn generation_fields(info: &PidInfo) -> Option<(Value, Option<String>)> {
+    if crate::remote_generation::legacy_mode() {
+        return None;
+    }
+    let generation = generation_of(info)?;
+    let binary = info.exe.as_deref().unwrap_or("");
+    Some((
+        crate::remote_generation::status_field(generation, binary, info.pid),
+        crate::remote_generation::stale_detail(generation, binary, info.pid),
+    ))
 }
 
 fn parse_pid_file() -> Result<PidInfo, String> {
@@ -2669,10 +2711,12 @@ fn parse_pid_file() -> Result<PidInfo, String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let start_time = lines.next().and_then(|s| s.trim().parse::<u64>().ok());
+    let stamp = lines.next().and_then(crate::remote_generation::decode);
     Ok(PidInfo {
         pid,
         exe,
         start_time,
+        stamp,
     })
 }
 
@@ -3406,6 +3450,7 @@ fn serve_binary_impl(
 pub fn spawn_daemon() -> Result<Value, String> {
     // 既に起動中か確認
     let status = daemon_status();
+    let mut renewed_from: Option<u32> = None;
     if status["running"].as_bool() == Some(true) {
         let running_exe = status["serve_binary"].as_str().unwrap_or("");
         let expected = serve_binary();
@@ -3416,7 +3461,13 @@ pub fn spawn_daemon() -> Result<Value, String> {
                  `tako remote stop` してから `tako remote start` で差し替えてください"
             ));
         }
-        return Err("リモートサーバーは既に起動中".to_string());
+        // #2518: パスが同じでも、そのパスのファイルが daemon の起動後に差し替わっていれば
+        // 旧版のコードで動いている（install の contents-swap）。**パスの文字列の一致だけで
+        // 「既に起動中」と返さない** — 返すと install も GUI の再起動も daemon を入れ替えない
+        if !crate::remote_generation::renewable_in_status(&status) {
+            return Err("リモートサーバーは既に起動中".to_string());
+        }
+        renewed_from = Some(stop_stale_generation(&status)?);
     }
 
     // stale な待ち受けの回収（PID ファイル消失 + プロセス死亡で state だけ残るケース）
@@ -3539,6 +3590,10 @@ pub fn spawn_daemon() -> Result<Value, String> {
     // 起動応答に serve へ使ったバイナリを含める（#432: start 直後に世代を確認できる）
     let mut info = info;
     info["serve_binary"] = json!(tako_bin);
+    // 旧版を止めて起こし直したことを応答で言う（#2518。GUI の自動復帰は last_autostart へ写す）
+    if let Some(pid) = renewed_from {
+        info["renewed"] = json!({ "previous_pid": pid, "reason": "replaced" });
+    }
 
     // #1485: 「ユーザーが起動していた」を残す。**起動が成った後だけ**書くので、
     // セットアップ不足で拒否された環境に意図だけが溜まることはない。
@@ -3546,6 +3601,29 @@ pub fn spawn_daemon() -> Result<Value, String> {
     set_desired();
 
     Ok(info)
+}
+
+/// 同じパスのまま差し替わった旧版の daemon を止める（#2518。`spawn_daemon` の入れ替えの前半）。
+///
+/// 止め方は `tako remote stop` と同じ `daemon_stop_impl`（正体を確かめてから畳ませる =
+/// #329 / #1599 / #2466）。ただし **`forget_if_stopped` は通さない**: 入れ替えは利用者の
+/// 「起動していた」を保ったまま行うもので、`desired` を消すと次の GUI 起動で戻らなくなる。
+/// 止まったかは結果の文字列ではなく現況（`daemon_status`）で見る。止まらなければ Err で、
+/// 旧版は動いたまま残る（起こし直せないのに止めて、動いていた daemon まで失わない）
+fn stop_stale_generation(status: &Value) -> Result<u32, String> {
+    let pid = status["pid"].as_u64().unwrap_or(0) as u32;
+    let stopped = daemon_stop_impl(false);
+    if daemon_status()["running"].as_bool() == Some(true) {
+        let why = match stopped {
+            Err(e) => e,
+            Ok(_) => "停止後も daemon が残っています".to_string(),
+        };
+        return Err(format!(
+            "旧版のまま動いているリモート daemon（PID {pid}）を止められなかったため、\
+             入れ替えていません: {why}"
+        ));
+    }
+    Ok(pid)
 }
 
 /// 起動した daemon 子プロセスを刈り取る専用スレッドを立てる（#619）。
@@ -3724,6 +3802,7 @@ fn kill_stale_daemon(
             pid,
             exe: None,
             start_time: None,
+            stamp: None,
         };
         if !verify_pid_identity(&info) {
             // 確認は生きている相手にしか通らない。待ちの予算を過ぎてから確かめるまでの間に
@@ -8649,8 +8728,104 @@ mod tests {
         assert_eq!(info.pid, 12345);
         assert_eq!(info.exe, Some("/usr/bin/tako".to_string()));
         assert_eq!(info.start_time, Some(1700000000));
+        assert_eq!(info.stamp, None, "#2518 より前の 3 行形式は識別なし");
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2518: 4 行目の実行ファイルの識別を読む。読めない 4 行目は「記録なし」（3 行形式と同じ）
+    #[test]
+    fn parse_pid_fileは4行目の実行ファイルの識別を読む() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(parse_pid_fileは4行目の実行ファイルの識別を読む) {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("tako-test-2518-ppf-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        let pid_file = dir.join("tako-remote.pid");
+        std::fs::write(
+            &pid_file,
+            "12345\n/usr/bin/tako\n1700000000\nexe-v1:1:2:3:4\n",
+        )
+        .unwrap();
+        let with_stamp = parse_pid_file().expect("パースに成功");
+        std::fs::write(&pid_file, "12345\n/usr/bin/tako\n1700000000\nbroken\n").unwrap();
+        let broken = parse_pid_file().expect("パースに成功");
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(with_stamp.start_time, Some(1700000000));
+        assert_eq!(
+            with_stamp.stamp,
+            Some(crate::remote_generation::ExeStamp {
+                dev: 1,
+                ino: 2,
+                mtime_ns: 3,
+                len: 4
+            })
+        );
+        assert_eq!(broken.pid, 12345, "4 行目が読めなくても PID は読む");
+        assert_eq!(broken.stamp, None);
+    }
+
+    /// #2518: 同じパスのまま差し替わった実行ファイルを `serve_generation` で旧版と言う。
+    /// **パスの文字列は同じ**なので、#2518 前の比べ方（`serve_binary` と解決先の文字列）では
+    /// 見分けられない形を実ファイルで作る
+    #[test]
+    fn generation_fieldsは同じパスの差し替えを旧版と言う() {
+        if tako_core::run_alone!(generation_fieldsは同じパスの差し替えを旧版と言う)
+        {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(crate::remote_generation::LEGACY_ENV);
+        let dir = std::env::temp_dir().join(format!("tako-test-2518-gen-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let exe = dir.join("tako");
+        std::fs::write(&exe, b"generation-1").unwrap();
+        let info = PidInfo {
+            pid: 4242,
+            exe: Some(exe.display().to_string()),
+            start_time: Some(now_epoch_secs()),
+            stamp: crate::remote_generation::observe(&exe).stamp,
+        };
+        let before = generation_fields(&info);
+
+        // install の contents-swap と同じ形: 隣で作った新しいファイルを同じパスへ rename。
+        // 長さも変える（inode を持たない Windows でも、更新時刻の刻みに依らず別物と言える）
+        let staged = dir.join("tako.staged");
+        std::fs::write(&staged, b"generation-two").unwrap();
+        std::fs::rename(&staged, &exe).unwrap();
+        let after = generation_fields(&info);
+        std::env::set_var(crate::remote_generation::LEGACY_ENV, "1");
+        let legacy = generation_fields(&info);
+        std::env::remove_var(crate::remote_generation::LEGACY_ENV);
+        std::fs::remove_file(&exe).unwrap();
+        let missing = generation_fields(&info);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (field, warning) = before.expect("パスがあれば判定する");
+        assert_eq!(field["state"], "current");
+        assert_eq!(field["renewable"], false);
+        assert_eq!(warning, None);
+
+        let (field, warning) = after.expect("パスがあれば判定する");
+        assert_eq!(field["state"], "replaced", "{field}");
+        assert_eq!(field["basis"], "stamp");
+        assert_eq!(field["renewable"], true);
+        let warning = warning.expect("旧版は warnings に 1 行足す");
+        assert!(warning.contains("PID 4242"), "{warning}");
+
+        assert!(
+            legacy.is_none(),
+            "A/B では欄を載せない = 読む側も #2518 前に戻る"
+        );
+
+        let (field, _) = missing.expect("パスがあれば判定する");
+        assert_eq!(field["state"], "missing");
+        assert_eq!(field["renewable"], false, "起こし直す先が無いので止めない");
     }
 
     #[test]
@@ -8659,6 +8834,7 @@ mod tests {
             pid: 99_999_999,
             exe: None,
             start_time: None,
+            stamp: None,
         };
         assert!(!verify_pid_identity(&info));
     }
@@ -8719,6 +8895,7 @@ mod tests {
             pid: std::process::id(),
             exe: Some("/bin/zsh".to_string()),
             start_time: Some(0),
+            stamp: None,
         };
         assert!(
             !boundary_identity_confirmed(&reused),
@@ -8734,6 +8911,7 @@ mod tests {
             pid: 99_999_999,
             exe: Some("/usr/local/bin/tako".to_string()),
             start_time: Some(1_700_000_000),
+            stamp: None,
         };
         assert!(
             !boundary_identity_confirmed(&gone),
@@ -8743,6 +8921,7 @@ mod tests {
             pid: std::process::id(),
             exe: None,
             start_time: None,
+            stamp: None,
         };
         assert!(
             !boundary_identity_confirmed(&no_record),
@@ -8765,6 +8944,7 @@ mod tests {
                 .ok()
                 .map(|p| p.display().to_string()),
             start_time: tako_core::platform::procinfo::start_time_unix(std::process::id()),
+            stamp: None,
         };
         assert!(
             me.exe.is_some() && me.start_time.is_some(),
@@ -8786,6 +8966,7 @@ mod tests {
             pid: std::process::id(),
             exe: None,
             start_time: None,
+            stamp: None,
         };
         // 正常環境でも自プロセスは tako remote serve ではないため false
         assert!(!verify_pid_identity(&info));
@@ -8923,11 +9104,13 @@ mod tests {
             pid,
             exe: None,
             start_time: Some(now + 30),
+            stamp: None,
         });
         let reused = verify_pid_identity(&PidInfo {
             pid,
             exe: None,
             start_time: Some(now.saturating_sub(3600)),
+            stamp: None,
         });
         let _ = child.kill();
         let _ = child.wait();
