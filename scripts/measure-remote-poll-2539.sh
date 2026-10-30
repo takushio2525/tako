@@ -233,12 +233,12 @@ detect_delay() {
     if python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if ($expr) else 1)" "$TMP/st-$flag.json" 2>/dev/null; then
       now="$(python3 -c 'import time; print(time.time())')"
       python3 -c "print(f'{$now - $start:.1f}')"
-      rm -f "$TMP/$flag"
+      rm -f "${TMP:?}/${flag:?}"
       return 0
     fi
     sleep 0.2
   done
-  rm -f "$TMP/$flag"
+  rm -f "${TMP:?}/${flag:?}"
   echo "検知せず（180 秒）"
 }
 echo "== 劣化の検知の遅れ =="
