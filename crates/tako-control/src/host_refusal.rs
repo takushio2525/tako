@@ -148,7 +148,7 @@ impl HostRefusal {
                 format!("ページ範囲外: {page}（全 {total} ページ）")
             }
             (Self::PageOutOfRange { page, total }, En) => {
-                format!("page out of range: {page} ({total} pages in total)")
+                format!("page out of range: {page} (total pages: {total})")
             }
             (Self::ImagePageOnlyOne, Ja) => "画像プレビューの page は 1 だけ指定できる".into(),
             (Self::ImagePageOnlyOne, En) => "an image preview accepts only page 1".into(),
@@ -158,7 +158,7 @@ impl HostRefusal {
                 format!("{line} 行目は無い（全 {count} 行）")
             }
             (Self::LineMissing { line, count }, En) => {
-                format!("line {line} does not exist ({count} lines in total)")
+                format!("line {line} does not exist (total lines: {count})")
             }
             (Self::NotCodePreview, Ja) => {
                 "コード表示のプレビューではない\
@@ -182,7 +182,7 @@ impl HostRefusal {
                 None => format!("リンクインデックス範囲外: {index}"),
             },
             (Self::LinkIndexOutOfRange { index, total }, En) => match total {
-                Some(total) => format!("link index out of range: {index} ({total} in total)"),
+                Some(total) => format!("link index out of range: {index} (total: {total})"),
                 None => format!("link index out of range: {index}"),
             },
             (Self::LinkNotBrowsable(link), Ja) => {
@@ -197,7 +197,7 @@ impl HostRefusal {
                 format!("コードブロック範囲外: {index}（全 {total} 個。0 始まり）")
             }
             (Self::CodeBlockOutOfRange { index, total }, En) => {
-                format!("code block out of range: {index} ({total} in total, 0-based)")
+                format!("code block out of range: {index} (total: {total}, 0-based)")
             }
 
             (Self::EditNotStarted, Ja) => "編集モードを開始していない".into(),
@@ -313,7 +313,7 @@ impl HostRefusal {
                 format!("メッセージ範囲外: {index}（全 {total} 件。0 始まり）")
             }
             (Self::MessageOutOfRange { index, total }, En) => {
-                format!("message out of range: {index} ({total} in total, 0-based)")
+                format!("message out of range: {index} (total: {total}, 0-based)")
             }
             (Self::MessageGone, Ja) => "その発話はもう表示されていない".into(),
             (Self::MessageGone, En) => "that message is no longer shown".into(),
