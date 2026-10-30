@@ -334,6 +334,9 @@ fn production_pane_env() -> Vec<String> {
             .filter(|k| k.starts_with("TAKO_"))
             .map(|k| k.to_string()),
     );
+    // #1998: cargo の共有 jobserver（spawn_session が `jobserver::pane_env()` で積む名前）。受け継ぐと隔離 GUI の
+    // ペインの cargo が本番の札で絞られる（A/B の測定が本番の札の空きに左右される）
+    keys.push(tako_core::jobserver::ENV.to_string());
     keys.extend(ISSUE_1970_KEYS.iter().map(|k| k.to_string()));
     keys.sort();
     keys.dedup();

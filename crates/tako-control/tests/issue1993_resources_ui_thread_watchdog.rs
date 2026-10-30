@@ -62,6 +62,10 @@ const SCANS: &[(&str, &str)] = &[
         "機の値の採取（#1994。接続のスレッドだけが呼ぶ）",
     ),
     ("backend_pane_pids(", "`tmux list-panes -a`（子プロセス）"),
+    (
+        "jobserver_holders(",
+        "札を持ちうるプロセスを数える（覚えが古ければ走査する。#1998）",
+    ),
     ("process_parent_map(", "親子表の採取"),
     ("Command::new(", "子プロセスを起こす"),
     (".output()", "子プロセスを待つ"),

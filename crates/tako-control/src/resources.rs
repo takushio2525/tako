@@ -56,12 +56,14 @@ const MIN_CPU_WINDOW: Duration = Duration::from_millis(500);
 /// A/B（採取の費用の比較）: 背景スレッドを立てない。status は要求のたびにその場で採る
 const NO_SAMPLER_ENV: &str = "TAKO_1993_NO_SAMPLER";
 
-/// 読む env のキー（ペインの番号・どの tako の受け口か・隔離か・順番待ちの受付番号 = #1994）
-const ENV_KEYS: [&str; 4] = [
+/// 読む env のキー（ペインの番号・どの tako の受け口か・隔離か・順番待ちの受付番号 = #1994・
+/// 共有 jobserver の在りか = #1998）
+const ENV_KEYS: [&str; 5] = [
     "TAKO_PANE_ID",
     "TAKO_SOCKET",
     "TAKO_ISOLATED",
     crate::queue::ENV_JOB,
+    tako_core::jobserver::ENV,
 ];
 
 /// GUI から渡すペイン 1 つ
@@ -113,6 +115,8 @@ struct CachedDetails {
     socket: Option<String>,
     isolated: bool,
     queue_job: Option<u64>,
+    /// env の `CARGO_MAKEFLAGS` が指す tako の共有 jobserver の fifo（#1998）
+    jobserver_fifo: Option<String>,
 }
 
 #[derive(Default)]
@@ -280,6 +284,11 @@ fn refresh_processes(scan: &mut ScanState, now: Instant, interval: Duration) {
                     .env
                     .get(crate::queue::ENV_JOB)
                     .and_then(|v| v.trim().parse().ok()),
+                jobserver_fifo: d
+                    .env
+                    .get(tako_core::jobserver::ENV)
+                    .and_then(|v| tako_core::jobserver::tako_fifo(v))
+                    .map(str::to_string),
             },
         );
     }
@@ -346,6 +355,7 @@ fn refresh_processes(scan: &mut ScanState, now: Instant, interval: Duration) {
                 }),
                 isolated: d.is_some_and(|d| d.isolated),
                 queue_job: d.and_then(|d| d.queue_job),
+                jobserver_fifo: d.and_then(|d| d.jobserver_fifo.clone()),
             }
         })
         .collect();
@@ -502,6 +512,51 @@ pub fn pane_memory(since: Option<Instant>) -> Option<(Instant, HashMap<u64, u64>
             .map(|u| (u.pane, mb(u.memory)))
             .collect(),
     ))
+}
+
+/// `fifo` の札を持ちうるプロセス（同じ置き場の系統の fifo を指す cargo 系）の本数（#1998）。
+///
+/// 覚えの使い方は `tako_core::jobserver::scan_use`: 居る覚えは信じ、0 本の覚えは新しいときだけ信じる。
+/// それ以外（と `fresh` = 終了処理）は**このスレッドで採り直す**（約 20 ms）。**UI スレッドでは呼ばない**
+/// （札の番人の背景スレッドと終了処理だけが呼ぶ）。走査できない OS では `None`
+pub fn jobserver_holders(fifo: &std::path::Path, fresh: bool) -> Option<usize> {
+    use tako_core::jobserver::{holders, scan_use, ScanUse, FRESH_SCAN};
+    let fifo = fifo.to_str()?;
+    let own_pid = std::process::id();
+    // 覚え（数えた本数, 古さ, 走査の時刻）
+    let snapshot = |now: Instant| {
+        lock(published()).procs.as_ref().map(|s| {
+            (
+                holders(&s.samples, own_pid, fifo),
+                now.duration_since(s.at),
+                s.at,
+            )
+        })
+    };
+    let now = Instant::now();
+    let seen = snapshot(now);
+    let usable = if fresh {
+        seen.filter(|(_, age, _)| *age <= FRESH_SCAN)
+    } else {
+        seen.filter(|(n, age, _)| scan_use(Some((*n, *age))) != ScanUse::Refresh)
+    };
+    if let Some((n, _, _)) = usable {
+        return Some(n);
+    }
+    let mut scan = lock(scan_state());
+    // ロックを待つ間に採り直した走査があればそれを使う
+    let now = Instant::now();
+    if let Some((n, age, _)) = snapshot(now) {
+        if age <= FRESH_SCAN {
+            return Some(n);
+        }
+    }
+    let interval = scan_interval(lock(published()).wanted_until, now);
+    refresh_processes(&mut scan, now, interval);
+    // 採れなかった（走査できない OS・一覧を取れない）なら古い覚えを返さない（0 本と読み違えない）
+    snapshot(now)
+        .filter(|(_, _, at)| *at == now)
+        .map(|(n, _, _)| n)
 }
 
 /// IPC / MCP の `Request::Queue` に答える（**UI スレッドでは呼ばない**。`ipc::submit` の手前）。

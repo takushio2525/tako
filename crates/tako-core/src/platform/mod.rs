@@ -26,6 +26,8 @@ pub mod ime;
 pub mod install_info;
 /// 子孫をまとめて回収する入れ物（境界 B30。#2454）
 pub mod job;
+/// cargo の共有 jobserver の fifo（境界 B31。#1998）
+pub mod jobserver;
 pub mod keys;
 pub mod locale;
 pub mod path;

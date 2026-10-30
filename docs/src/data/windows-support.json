@@ -588,7 +588,7 @@
     {
       "key": "tako_queue",
       "status": "pending",
-      "note_ja": "PC 全体のメモリ・CPU とプロセスごとの消費の計測（境界 B29）は macOS だけ。Windows は機の値を「まだ採れない」と返す（#2000）",
+      "note_ja": "PC 全体のメモリ・CPU とプロセスごとの消費の計測（境界 B29）は macOS だけ。Windows は機の値を「まだ採れない」と返す（#2000）。tako のペインの cargo が共有する札（jobserver・境界 B31）も unix の fifo なので Windows では配らない（cargo は従来どおり自前の並列で走る。Windows の名前付きセマフォに cargo が従うかは未実測）",
       "evidence": "unverified"
     },
     {

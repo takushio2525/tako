@@ -1458,6 +1458,12 @@ fn cleanup_process_scoped(origin: &str, secondary: bool) -> ProcessScopedCleanup
         ));
         backend_socket
     });
+    // #1998: cargo の札の fifo。札を持ちうる cargo が居なければ置き場から消す（GUI の居ない間の cargo は
+    // パスが無いので従来どおり走る）。居れば残す（再起動した GUI が開き直して続ける）
+    let jobserver = tako_control::jobserver::shutdown();
+    if jobserver != "none" && !secondary {
+        persist_diag(&format!("{origin}: cargo の札の fifo: {jobserver}"));
+    }
     ProcessScopedCleanup {
         backend,
         agent_home,
@@ -4904,6 +4910,10 @@ impl TakoApp {
         // #1993: PC リソースの採取（機 2 秒・プロセス 5 秒）を背景スレッドで始める。
         // 受け口（IPC / MCP）の `Request::Queue` はこの覚えから答える
         tako_control::resources::start();
+        // #1998: cargo の全体並列の上限（共有 jobserver の札の番人）。fifo を開いて持ち、札は背景スレッドが
+        // 誰も持っていないと確かめてから足す。セカンダリは先行の tako の fifo のパスをペインへ渡すだけ。
+        // 下の復元より前に立てる（復元で起こすペインにも注入する）
+        tako_control::jobserver::start(secondary);
 
         // #1994: 重い処理の順番待ちの調停役。本番の 1 インスタンスだけが調停する（隔離・セルフテスト・
         // セカンダリは調停しない = 隔離ごとに別の待ち行列ができると全体で絞れない）。
@@ -10729,6 +10739,12 @@ impl TakoApp {
             if let Some(token) = &self.token {
                 options.env.push(("TAKO_TOKEN".into(), token.clone()));
             }
+        }
+        // #1998: cargo の全体並列の上限（`CARGO_MAKEFLAGS` の共有 jobserver。`MAKEFLAGS` は使わない =
+        // 素の make を並列にしない）。判断は tako-control の 1 実装（設定・A/B・OS・fifo を開けたか）で、
+        // ここは覚えを写すだけ。配らないときは足さない = cargo は従来どおり
+        if let Some((key, value)) = tako_control::jobserver::pane_env() {
+            options.env.push((key.into(), value));
         }
         // #1879: tako mod（Claude Code の mod）を読ませる env。判断は core の 1 実装
         // （設定 / A/B / 展開 / CLI / claude の版）で、注入しないときも理由を控える。

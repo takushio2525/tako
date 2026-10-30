@@ -696,6 +696,9 @@ pub struct LimitSettings {
     pub swap_guard_gb: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wait_min: Option<u32>,
+    /// cargo の共有 jobserver（#1998 = S6）。`None` = 既定の on（判断点 §11-5）。`Some(false)` で作らず注入しない
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jobserver: Option<bool>,
 }
 
 /// `tako queue limits` / MCP `tako_queue`（`action: "limits"`）の変更
@@ -709,6 +712,9 @@ pub struct LimitsPatch {
     pub swap_guard_gb: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wait_min: Option<u32>,
+    /// cargo の共有 jobserver の on / off（#1998）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jobserver: Option<bool>,
     /// すべて既定（機に合わせた値）へ戻す。他の項目と一緒なら、戻してから当てる
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reset: bool,
@@ -726,6 +732,11 @@ pub const MAX_WAIT_RANGE: (u32, u32) = (1, 24 * 60);
 pub const GB_RANGE: (f64, f64) = (0.0, 1024.0);
 
 impl LimitSettings {
+    /// cargo の共有 jobserver を使うか（キーが無ければ既定の on）
+    pub fn jobserver_on(&self) -> bool {
+        self.jobserver != Some(false)
+    }
+
     /// 変更を当てる（範囲外は何も変えずに理由を返す）
     pub fn apply(&mut self, patch: &LimitsPatch) -> Result<(), String> {
         let mut next = if patch.reset {
@@ -768,6 +779,10 @@ impl LimitSettings {
                 ));
             }
             next.max_wait_min = Some(m);
+        }
+        if let Some(on) = patch.jobserver {
+            // 既定（on）へ戻すときはキーを消す（既定のままなら設定ファイルへ書かない）
+            next.jobserver = (!on).then_some(false);
         }
         *self = next;
         Ok(())
@@ -1546,6 +1561,7 @@ mod tests {
             reserve_gb: Some(1.5),
             swap_guard_gb: Some(4.0),
             max_wait_min: Some(10),
+            jobserver: None,
         };
         let l = effective_limits(&set, Some(36 * GIB_MB));
         assert_eq!(
@@ -1608,6 +1624,40 @@ mod tests {
                 ..LimitSettings::default()
             },
             "reset は戻してから当てる"
+        );
+    }
+
+    #[test]
+    fn jobserverの切り替えは既定へ戻すとキーを消す() {
+        let mut s = LimitSettings::default();
+        assert!(
+            s.jobserver_on(),
+            "キーが無ければ on（#1998 の判断点 §11-5）"
+        );
+        s.apply(&LimitsPatch {
+            jobserver: Some(false),
+            ..LimitsPatch::default()
+        })
+        .unwrap();
+        assert_eq!(s.jobserver, Some(false));
+        assert!(!s.jobserver_on());
+        s.apply(&LimitsPatch {
+            jobserver: Some(true),
+            ..LimitsPatch::default()
+        })
+        .unwrap();
+        assert_eq!(s, LimitSettings::default(), "既定のままなら書き出さない");
+        s.jobserver = Some(false);
+        s.apply(&LimitsPatch {
+            reset: true,
+            ..LimitsPatch::default()
+        })
+        .unwrap();
+        assert!(s.jobserver_on(), "reset で既定へ");
+        let old: LimitSettings = serde_json::from_str(r#"{"max_jobs": 2}"#).unwrap();
+        assert!(
+            old.jobserver_on(),
+            "キーの無い旧ファイルはそのまま読めて on"
         );
     }
 

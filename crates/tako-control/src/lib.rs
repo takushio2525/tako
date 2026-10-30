@@ -65,6 +65,7 @@ pub mod host;
 /// GUI 側の口（ControlHost の実装）が自分で組む断りの日英の対（#2365）
 pub mod host_refusal;
 pub mod ipc;
+pub mod jobserver;
 pub mod launch_cmd;
 pub mod launch_gate;
 pub mod layout;

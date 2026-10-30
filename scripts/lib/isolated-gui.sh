@@ -197,6 +197,8 @@ ISOLATED_GUI_DROP_ENV=(
     CLAUDE_CODE_PLUGIN_DIRS TAKO_CLI
     # orchestrator の役割（launch_cmd が起動コマンドへ前置きする）
     TAKO_ORCHESTRATOR_ROLE
+    # cargo の共有 jobserver（tako_core::jobserver::ENV。#1998）。受け継ぐと隔離 GUI のペインの cargo が本番の札で絞られる
+    CARGO_MAKEFLAGS
     # シェル統合の控え（tako_core::shell_integration::INJECTED_KEYS のうち tako 固有のもの。
     # ZDOTDIR / PROMPT_COMMAND / XDG_DATA_DIRS は利用者も使う名前で、隔離 GUI が自分の値を積み直す）
     TAKO_ORIG_ZDOTDIR

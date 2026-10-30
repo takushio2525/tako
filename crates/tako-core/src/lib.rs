@@ -42,6 +42,7 @@ pub mod handoff_guard;
 pub mod header_layout;
 pub mod i18n;
 pub mod ipc_socket;
+pub mod jobserver;
 pub mod jump_history;
 pub mod limit_resume;
 pub mod limit_resume_all;
