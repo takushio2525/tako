@@ -46,6 +46,8 @@ UI_REPLY_LIMIT=8
 UI_OK_SECS=1.0
 # 修正後の上限（GUI へ渡す。既定 30 秒を検証のために縮める）
 GIT_LIMIT=3
+# 上限で打ち切った断りの目印（`tako_core::git::HistoryTimedOut`。表示言語に従う = 日英どちらかで当てる。#2365）
+GAVE_UP="打ち切った|gave up reading the change history"
 
 TMP="$(mktemp -d /tmp/tako-2150-XXXXXX)"
 ARM="$TMP/arm"
@@ -318,7 +320,7 @@ cli_arm() {
   fi
 
   if [ "$arm_name" = "new" ]; then
-    if [ "$rc" != "0" ] && grep -q "打ち切った" "$TMP/h.out" && grep -q "git diff" "$TMP/h.out" \
+    if [ "$rc" != "0" ] && grep -Eq "$GAVE_UP" "$TMP/h.out" && grep -q "git diff" "$TMP/h.out" \
       && awk -v t="$elapsed" -v l="$GIT_LIMIT" 'BEGIN { exit !(t + 0 >= l - 0.5 && t + 0 < l + 5) }'; then
       pass "${label}: H 上限（${GIT_LIMIT} 秒）で失敗として返る（${elapsed} 秒・理由つき）"
     else
@@ -350,7 +352,7 @@ cli_arm() {
     after="$(count "$CALLS")"
     echo "    M MCP の展開の最中: tako list ${took} 秒 / MCP tako_list_panes ${took_mcp} 秒 / 偽の git $((after - before)) 回 / 展開: 終了コード $(cat "$TMP/m.rc") / $(cat "$TMP/m.secs") 秒 / $(head -c 140 "$TMP/m.out" | tr '\n' ' ')"
     if [ "$((after - before))" -ge 1 ] && ui_ok "$took" && ui_ok "$took_mcp" && [ "$(cat "$TMP/m.rc")" = "3" ] \
-      && grep -q "打ち切った" "$TMP/m.out"; then
+      && grep -Eq "$GAVE_UP" "$TMP/m.out"; then
       pass "M MCP の展開でも最中の別の要求が即座に返り、上限で isError として返る"
     else
       fail "M MCP の展開の結末が想定外"

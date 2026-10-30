@@ -1,7 +1,8 @@
 //! アプリ内更新（#36 / #358 / #616）の通知カード・専用画面の文言（キー: update.*）
 //!
-//! CLI / MCP `tako update` と共有されるエラーメッセージ（brew 実行結果等）は
-//! 技術情報のため対象外（現状維持）。ここは GUI に出る文言のみ。
+//! CLI / MCP `tako update` と共有される断り・結果の文（確認の失敗・brew の実行結果・レート制限の
+//! 残り時間等）は `update_checker` の `UpdateRefusal` / `UpdateNote` / `CheckError` が日英の対を持つ
+//! （#2365）。ここは GUI だけに出る文言。
 //!
 //! #616 で表示先がステータスバー → 「上部通知カード + 専用ウィンドウ」へ移った。
 //! `banner_*` は案内の 1 行サマリとしてカード・専用画面の双方で使い続けている
@@ -123,15 +124,6 @@ pub fn channel_stable() -> &'static str {
 }
 pub fn channel_test() -> &'static str {
     tr!("テスト版", "test")
-}
-pub fn eta_minutes(minutes: u64) -> String {
-    tr!(format!("約{minutes}分後"), format!("in ~{minutes} min"))
-}
-pub fn eta_seconds(secs: u64) -> String {
-    tr!(format!("約{secs}秒後"), format!("in ~{secs}s"))
-}
-pub fn eta_soon() -> &'static str {
-    tr!("まもなく", "soon")
 }
 
 // --- #616: 上部通知カード ---
@@ -275,9 +267,6 @@ mod tests {
                 no_test_build().to_string(),
                 channel_stable().to_string(),
                 channel_test().to_string(),
-                eta_minutes(5),
-                eta_seconds(30),
-                eta_soon().to_string(),
                 // #616: 通知カード + 専用ウィンドウ
                 card_title().to_string(),
                 card_details().to_string(),

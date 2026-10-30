@@ -102,14 +102,60 @@ pub fn media_type(path: &Path) -> Option<&'static str> {
     file_type::identify(path)?.media_type
 }
 
-/// 行番号が 1 始まりであることの説明（0 以下を弾いたときの文言の正本）。
+/// 行・桁を指定して開くときの断り（#1676。日英は #2365）。
 ///
-/// CLI（負値を型で持てる `i64`）と dispatch（`usize` なので 0 だけ）の両方が
-/// この 1 本を出すので、入口が違っても同じ文言になる
-pub const LINE_ONE_BASED: &str = "行番号は 1 始まり（0 以下は指定できない）";
+/// CLI（負値を型で持てる `i64`）・dispatch（`usize` なので 0 だけ）・GUI（[`clamp_line`] /
+/// [`clamp_column`]）が同じ 1 本を出すので、入口が違っても同じ文言になる。日英の対は
+/// [`PlanRefusal::text_in`] の網羅 match の 1 か所で、日本語は #2365 より前の固定文とバイト一致
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanRefusal {
+    /// `行番号は 1 始まり（0 以下は指定できない）`
+    LineNotOneBased,
+    /// `桁番号は 1 始まり（0 以下は指定できない）`
+    ColumnNotOneBased,
+    /// `行を指定して開けるのはテキスト（code / markdown）だけ: <種別>`
+    NoLinesIn(PreviewRoute),
+}
 
-/// 桁番号が 1 始まりであることの説明（[`LINE_ONE_BASED`] の桁版）
-pub const COLUMN_ONE_BASED: &str = "桁番号は 1 始まり（0 以下は指定できない）";
+impl PlanRefusal {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::LineNotOneBased, Ja) => "行番号は 1 始まり（0 以下は指定できない）".into(),
+            (Self::LineNotOneBased, En) => {
+                "line numbers start at 1 (0 or less is not allowed)".into()
+            }
+            (Self::ColumnNotOneBased, Ja) => "桁番号は 1 始まり（0 以下は指定できない）".into(),
+            (Self::ColumnNotOneBased, En) => {
+                "column numbers start at 1 (0 or less is not allowed)".into()
+            }
+            (Self::NoLinesIn(route), Ja) => format!(
+                "行を指定して開けるのはテキスト（code / markdown）だけ: {}",
+                route.as_str()
+            ),
+            (Self::NoLinesIn(route), En) => format!(
+                "only text (code / markdown) can be opened at a line: {}",
+                route.as_str()
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for PlanRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for PlanRefusal {}
+
+/// `Result<_, String>` の口から `?` でそのまま返せる（文はその場の表示言語）
+impl From<PlanRefusal> for String {
+    fn from(r: PlanRefusal) -> Self {
+        r.to_string()
+    }
+}
 
 /// 行指定つきで開くときの表示種別を決める（純粋関数。Issue #1676）。
 ///
@@ -119,13 +165,12 @@ pub const COLUMN_ONE_BASED: &str = "桁番号は 1 始まり（0 以下は指定
 /// 1 ブロックに複数行が入る）ため、**`line` を渡された時点でソース表示へ倒す**。
 /// 画像・PDF・動画は行の概念を持たないのでエラーにする（PDF のページ送りは
 /// `PreviewView` の `page` が持つ別の操作）
-pub fn preview_route_with_line(route: PreviewRoute) -> Result<PreviewRoute, String> {
+pub fn preview_route_with_line(route: PreviewRoute) -> Result<PreviewRoute, PlanRefusal> {
     match route {
         PreviewRoute::Code | PreviewRoute::Markdown => Ok(PreviewRoute::Code),
-        PreviewRoute::Image | PreviewRoute::Pdf | PreviewRoute::Video => Err(format!(
-            "行を指定して開けるのはテキスト（code / markdown）だけ: {}",
-            route.as_str()
-        )),
+        PreviewRoute::Image | PreviewRoute::Pdf | PreviewRoute::Video => {
+            Err(PlanRefusal::NoLinesIn(route))
+        }
     }
 }
 
@@ -134,9 +179,9 @@ pub fn preview_route_with_line(route: PreviewRoute) -> Result<PreviewRoute, Stri
 /// 戻りは `(着地する行, 丸めたか)` で、行は 1 始まり。行数を超える要求は
 /// **末尾行へ丸める**（エラーにしない = 定義ジャンプの相手が古い行番号でも
 /// ファイルは開いて見せる）。空ファイルは行 1 を指す
-pub fn clamp_line(total_lines: usize, line: usize) -> Result<(usize, bool), String> {
+pub fn clamp_line(total_lines: usize, line: usize) -> Result<(usize, bool), PlanRefusal> {
     if line == 0 {
-        return Err(LINE_ONE_BASED.to_string());
+        return Err(PlanRefusal::LineNotOneBased);
     }
     let last = total_lines.max(1);
     if line > last {
@@ -150,9 +195,9 @@ pub fn clamp_line(total_lines: usize, line: usize) -> Result<(usize, bool), Stri
 ///
 /// `line_chars` はその行の**文字数**（UTF-8 のバイト数ではない）。行末の
 /// 次（`line_chars + 1`）までを有効な桁として受ける（キャレットが行末に立てる）
-pub fn clamp_column(line_chars: usize, column: usize) -> Result<(usize, bool), String> {
+pub fn clamp_column(line_chars: usize, column: usize) -> Result<(usize, bool), PlanRefusal> {
     if column == 0 {
-        return Err(COLUMN_ONE_BASED.to_string());
+        return Err(PlanRefusal::ColumnNotOneBased);
     }
     let last = line_chars + 1;
     if column > last {
@@ -253,7 +298,11 @@ mod tests {
         );
         for route in [PreviewRoute::Image, PreviewRoute::Pdf, PreviewRoute::Video] {
             let err = preview_route_with_line(route).unwrap_err();
-            assert!(err.contains(route.as_str()), "{route:?}: {err}");
+            assert_eq!(err, PlanRefusal::NoLinesIn(route));
+            for lang in [crate::i18n::Lang::Ja, crate::i18n::Lang::En] {
+                let text = err.text_in(lang);
+                assert!(text.contains(route.as_str()), "{route:?} {lang:?}: {text}");
+            }
         }
     }
 
@@ -267,7 +316,10 @@ mod tests {
         // 空ファイル（行が 1 本も無い）でも行 1 は範囲内（キャレットの置き場）
         assert_eq!(clamp_line(0, 1).unwrap(), (1, false));
         assert_eq!(clamp_line(0, 7).unwrap(), (1, true));
-        assert_eq!(clamp_line(5000, 0).unwrap_err(), LINE_ONE_BASED);
+        assert_eq!(
+            clamp_line(5000, 0).unwrap_err(),
+            PlanRefusal::LineNotOneBased
+        );
     }
 
     /// #1676: 桁は行末の次まで受ける（キャレットが行末に立てる）
@@ -277,7 +329,10 @@ mod tests {
         assert_eq!(clamp_column(10, 11).unwrap(), (11, false));
         assert_eq!(clamp_column(10, 12).unwrap(), (11, true));
         assert_eq!(clamp_column(0, 1).unwrap(), (1, false));
-        assert_eq!(clamp_column(10, 0).unwrap_err(), COLUMN_ONE_BASED);
+        assert_eq!(
+            clamp_column(10, 0).unwrap_err(),
+            PlanRefusal::ColumnNotOneBased
+        );
     }
 
     #[test]

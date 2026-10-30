@@ -436,15 +436,29 @@ pub struct HistoryTimedOut {
     pub budget: Duration,
 }
 
+impl HistoryTimedOut {
+    /// 表示言語を明示しての文言（#2365。日本語は #2365 より前の固定文とバイト一致）。
+    /// どちらの言語も段の名前（`git <段>`）と上限の env の名前を含む
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        let (secs, step) = (self.budget.as_secs(), self.step);
+        match lang {
+            crate::i18n::Lang::Ja => format!(
+                "変更履歴の取得を {secs} 秒で打ち切った（`git {step}` が返らない。巨大なリポジトリ・\
+                 ネットワーク上のフォルダ・ロック中の git を疑う。上限は env {CHANGELOG_TIMEOUT_ENV}）"
+            ),
+            crate::i18n::Lang::En => format!(
+                "gave up reading the change history after {secs} s (`git {step}` did not return; \
+                 suspect a huge repository, a folder on the network or a locked git. \
+                 The limit is env {CHANGELOG_TIMEOUT_ENV})"
+            ),
+        }
+    }
+}
+
 impl std::fmt::Display for HistoryTimedOut {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "変更履歴の取得を {} 秒で打ち切った（`git {}` が返らない。巨大なリポジトリ・\
-             ネットワーク上のフォルダ・ロック中の git を疑う。上限は env {CHANGELOG_TIMEOUT_ENV}）",
-            self.budget.as_secs(),
-            self.step
-        )
+        // 表示言語は組んだその場の 1 回（CLI / MCP の応答と GUI の通知）
+        f.write_str(&self.text_in(crate::i18n::lang()))
     }
 }
 
