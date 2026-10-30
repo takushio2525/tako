@@ -15,6 +15,13 @@
 //!
 //! 置き場はすべて一時 dir（作るときと消すときに一時 dir の配下であることを確かめる = 本番の
 //! data dir を触らない）。
+//!
+//! 置き場の版は本番では `$SHELL -l -c 'exec …'`（ログインシェル）で起きる。開発者の rc の
+//! `pyenv rehash` 等はロックを最大 60 秒待ち、サーバの stdout を握ったまま残る（#2509）ので、
+//! 2. の起こす検証は同じシェル片を rc を読まない `/bin/sh -c` で起こし（`FetchConfig::plain_shell`）、
+//! initialize の上限は本番の既定に揃える（#2514。`managed_manager` の 1 か所）。A/B は
+//! `TAKO_2509_LEGACY=1`（ログインシェル・10 秒）、注入は `SHELL=<rc が stdout を握った子で止まる偽の
+//! ログインシェル>`。旧の腕は `starting` のまま 60 秒の待ちが尽きて落ち、新しい腕は通る
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -23,7 +30,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tako_control::lsp::fetch::{self, FetchConfig};
-use tako_control::lsp::manager::{recheck_interval, DEFAULT_IDLE_GRACE, RECHECK_INTERVAL};
+use tako_control::lsp::manager::{
+    recheck_interval, DEFAULT_IDLE_GRACE, DEFAULT_REQUEST_TIMEOUT, RECHECK_INTERVAL,
+};
 use tako_control::lsp::{
     CompletionAnswer, CompletionRequest, DocLink, Launch, LspConfig, LspManager,
 };
@@ -407,15 +416,30 @@ fn reaped_child() -> tako_core::platform::process::ReapedChild {
     child
 }
 
+/// A/B（#2509 / #2514）: 直す前の設定（開発者のログインシェルで起こし、initialize を 10 秒で切る）
+fn legacy_2509() -> bool {
+    matches!(
+        std::env::var("TAKO_2509_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// 置き場の版から起こす manager（グローバルには無い = 置き場のものを使う。自動では取らない）
 fn managed_manager(spec: &'static ServerSpec, root: &Path) -> LspManager {
+    let legacy = legacy_2509();
     let config = LspConfig {
         table: std::slice::from_ref(spec),
         launcher: Arc::new(|spec: &ServerSpec| Launch::NotFound {
             program: spec.program.to_string(),
             override_env: None,
         }),
-        request_timeout: Duration::from_secs(10),
+        // 置き場の版は毎回写した新しい実行ファイル = initialize は起動待ち（冒頭の #2509）。
+        // 主題は上限ではないので本番の既定に揃える
+        request_timeout: if legacy {
+            Duration::from_secs(10)
+        } else {
+            DEFAULT_REQUEST_TIMEOUT
+        },
         shutdown_timeout: Duration::from_secs(5),
         idle_grace: DEFAULT_IDLE_GRACE,
         restart: RestartPolicy {
@@ -424,10 +448,14 @@ fn managed_manager(spec: &'static ServerSpec, root: &Path) -> LspManager {
         },
         raw_log_dir: None,
     };
-    let fetch = FetchConfig {
+    let mut fetch = FetchConfig {
         auto: false,
         ..FetchConfig::with_root(root.to_path_buf(), None)
     };
+    // 開発者のログインシェル（rc）を経由させない。シェル片は本番と同じ（冒頭の #2509。Windows は見ない）
+    if cfg!(unix) && !legacy {
+        fetch.plain_shell = Some("/bin/sh".to_string());
+    }
     LspManager::with_fetch(config, Some(fetch))
 }
 
