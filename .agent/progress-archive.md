@@ -693,3 +693,8 @@
 - 2026-10-29 #885: tako-app のペイン spawn と器の名前の予約を backend の入口 `wrap_spawn_for_pane` / `reserve_for_pane` 経由へ・組み立てを `wrap_options_for` の 1 実装にして psmux も通す
 - 2026-10-29 #2365 の続き: action で選ぶツールの断り（不明な action・値・要る引数）と設定の保存・置き場・`tako_theme` の残りを `Reason` へ。87 か所・16 種、dispatch の日本語の断り 243 → 157
 - 2026-10-30 #2388: セルフテストの FAILED の出口も `on_app_quit` と同じ後片付け `cleanup_process_scoped` を上限 5 秒で通す・設定置き場を器より先に消す・番犬 `selftest_exit_cleanup_watchdog`
+- 2026-10-30 #2486: layout.json で表のペインどうしが同じ器の名前を持つと 2 本目の `-D` が 1 本目を切り離して閉じていた → 先のペインが器を持ち 2 本目以降は新しい器で起こす `restore_vessels`・FR-5.22
+- 2026-10-30 #2365 の続き: MCP の前段 33 か所と CLI の前段 27 か所の断りを `Reason`（+48 種）へ
+- 2026-10-30 #2490: 隔離セルフテストの項目 107 が #1979 の上限の時計を巻き戻さず間欠的に落ちる → 両方の時計を `open_redraw_windows` で空けてから流す・予約が流れる判定を追加・番犬 `selftest_redraw_window_watchdog`
+- 2026-10-30 #1704: wait-pr-checks.sh / merge-pr.sh の gh の接続エラーを `lib/gh-retry.sh` で 1, 2, 4, 8 秒あけて 5 回まで試し、届かないままなら到達性の終了コード 5・認証切れ等は従来どおり 3
+- 2026-10-30 #2498: CI 待ちの既定の上限の記述（commands.md・`DEFAULT_TIMEOUT` のコメント）を 6600 秒・macOS の job 90 分へ・`release.sh --promote` の docs の PR で merge-pr.sh の 5 を「回線が戻って…

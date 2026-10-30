@@ -20,21 +20,6 @@
 
 ---
 
-## 2026-10-30（#2486: layout.json で表のペインどうしが同じ器の名前を持つと 2 本目の `-D` が 1 本目を切り離して閉じていた → 先のペインが器を持ち 2 本目以降は新しい器で起こす `restore_vessels`・FR-5.22）
-- 隔離 GUI で修正前 3→2 / 3→1 ペイン → 修正後 PASS 39・番犬の注入で main.rs を名指し・persist.log に 1 行・カタログ +0 B。PR #2489
-
-## 2026-10-30（#2365 の続き: MCP の前段 33 か所と CLI の前段 27 か所の断りを `Reason`（+48 種）へ）
-- 実経路 50 ケースで英語表示の日本語入り 50 → 0・日本語はバイト一致・カタログ +0 B。残りは dispatch の個別の文 約 157 か所ほか（Issue の最後のコメントの表）。PR #2492
-
-## 2026-10-30（#2490: 隔離セルフテストの項目 107 が #1979 の上限の時計を巻き戻さず間欠的に落ちる → 両方の時計を `open_redraw_windows` で空けてから流す・予約が流れる判定を追加・番犬 `selftest_redraw_window_watchdog`）
-- 注入 clock / piggyback で旧は FAILED（osc req=0）→ 新は通る・カタログ +0 B。PR #2493
-
-## 2026-10-30（#1704: wait-pr-checks.sh / merge-pr.sh の gh の接続エラーを `lib/gh-retry.sh` で 1, 2, 4, 8 秒あけて 5 回まで試し、届かないままなら到達性の終了コード 5・認証切れ等は従来どおり 3）
-- モックテスト 修正前 FAIL 50 → 修正後 PASS 273・カタログ +0 B。PR #2495
-
-## 2026-10-30（#2498: CI 待ちの既定の上限の記述（commands.md・`DEFAULT_TIMEOUT` のコメント）を 6600 秒・macOS の job 90 分へ・`release.sh --promote` の docs の PR で merge-pr.sh の 5 を「回線が戻ってから」と出し分け）
-- 昇格のモック Test 4c / 4d を追加（修正前は 3 件 FAIL → 修正後 142 pass）・カタログ +0 B。PR #2499
-
 ## 2026-10-30（#2365 の続き: GUI へ繋ぐ口（ipc.rs・時間切れ・起動失敗の包み）と置き場（ゲート・チェックポイント・人がやること・TaskStore・YAML の理由）の断りを日英へ（Reason 155 → 179））
 - A/B: CLI / MCP 13 件・dispatch 30 件の英語表示の日本語入り → 0・日本語バイト一致・カタログ +0 B。PR #2497
 
@@ -79,3 +64,19 @@
 
 ## 2026-10-30（#2365 の続き: dispatch が素通ししていた orchestrator の設定ファイル（projects / accounts / profiles）とエージェント名の検証の断りを `ConfigError`（32 種）へ・型の口 `*_typed`）
 - 実経路 36 ケースで英語表示の日本語入り 36 → 0・CLI 11 件で 10 → 0・日本語はバイト一致・カタログ +0 B。PR #2521
+
+## 2026-10-30（#2519: GUI が周期的に起こす git / tmux（bin_resolve の PATH の段）・codex / agy の lsof・sudo / pmset を PATH で引いた絶対パスで起こす・`exe::resolve_for_spawn` / `bin_resolve::Held`・A/B `TAKO_2519_LEGACY=1`）
+- 本物の contents-swap の再現で差し替え後 10 秒の拒否 204 → 0・番犬 `issue2519_gui_spawn_path_watchdog` が注入を file:line で名指し・カタログ +0 B。PR #2522
+
+## 2026-10-30（#2518: install をまたいで旧版のまま動く remote daemon を PID ファイル 4 行目の実行ファイルの識別（3 行の旧形式は ctime と起動時刻）で見分け、GUI 起動時の自動復帰と `tako remote start` が desired を保ったまま入れ替える・status に `serve_generation`・A/B `TAKO_2518_LEGACY=1`）
+- 本物の daemon + 本物の contents-swap の A/B で PASS 41・注入で番犬が remote.rs:3467 / remote_autostart.rs:218 を名指し・カタログ +0 B。PR #2523
+- 15:24 の install・GUI 再起動の本番確認で #2513 / #2518 / #2519 を閉じた
+
+## 2026-10-30（#2520: issue1977 の旧腕 3 本の `TAKO_1977_LEGACY` を `run_alone!` の子に閉じ、#2400 の番犬が目印つきで手で戻す対を `file:line` で名指す・既存 12 対は `KNOWN_RESTORE_PAIRS`・残りは #2525）
+- 注入で修正前 1 → 3 件の連鎖 → 修正後は注入した 1 件だけ（12 回）・カタログ +0 B。PR #2526
+
+## 2026-10-30（#2527: test-serve-watch.sh が既定の置き場の control.json から本番 GUI へ届いていた（remote start の QR の open_file と daemon の list）→ 発見の置き場と data dir を一時へ・同じ型 2 本も・番犬 `verification_isolation_watchdog` が tako CLI の行で発見の置き場を拘束・例外は `# tako:prod-ok`）
+- 本番役の隔離 GUI + 中継で修正前 接続 16 件・ペイン 1→2 → 修正後 0 件・1→1・カタログ +0 B。PR #2528
+
+## 2026-10-30（#2525: 目印つきで env を書き換えて手で戻す残り 5 ファイル・11 対を `run_alone!` の子へ寄せ、#2400 の番犬の `KNOWN_RESTORE_PAIRS` を issue2092 の 1 対だけに）
+- 注入で修正前は 1893 / 2034 / 1909 が後のテストへ連鎖（1 → 4 / 3 / 3 件）→ 修正後は注入した 1 本だけ・旧形への注入で番犬が 11 対を file:line で名指す・カタログ +0 B。PR #2529
