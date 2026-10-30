@@ -445,10 +445,12 @@ pub fn answer(request: &Request) -> Result<Value, DispatchError> {
     }
 }
 
-/// status の JSON へ順番待ちの節と agent の起動待ちの節（#2413）を足す（採らない。UI スレッドから呼んでよい）
+/// status の JSON へ順番待ちの節と agent の起動待ちの節（#2413）と cargo の札の節（#1998）を足す
+/// （採らない。札の空きは fifo を数えるだけ = `FIONREAD` 1 回。UI スレッドから呼んでよい）
 pub fn with_section(mut status: Value) -> Value {
     status["queue"] = status_section();
     status["launches"] = crate::launch_gate::status_section();
+    status["jobserver"] = crate::jobserver::status_section();
     status
 }
 
@@ -914,6 +916,8 @@ fn limits_json(limits: &Limits, configured: &LimitSettings) -> Value {
         "reserve_gb": gb_value(limits.reserve_mb),
         "swap_guard_gb": gb_value(limits.swap_guard_mb),
         "max_wait_min": limits.max_wait_min,
+        // cargo の共有 jobserver（#1998）。キーが無ければ既定の on
+        "jobserver": configured.jobserver_on(),
         "configured": configured,
     })
 }
@@ -928,6 +932,10 @@ fn set_limits(patch: LimitsPatch) -> Result<Value, DispatchError> {
             .map_err(DispatchError::InvalidParams)?;
         crate::settings::save(&settings)
             .map_err(|e| DispatchError::Operation(format!("設定を保存できない: {e}")))?;
+        // 札の番人へすぐ反映する（GUI が居ないときの書き込みは番人が mtime で拾う）
+        if patch.jobserver.is_some() || patch.reset {
+            crate::jobserver::apply_setting(settings.resources.jobserver_on());
+        }
     }
     let mut a = lock();
     a.settings = settings.resources.clone();

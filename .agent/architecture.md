@@ -1424,6 +1424,7 @@ MCP / CLI から受け、UI 層がレイアウト矩形に変換して描画す�
 | プロセスツリー / listen ポート | libproc | Toolhelp32 / GetExtendedTcpTable |
 | プロセスの停止（B5 の制御側 `platform::process::terminate`） | SIGTERM / SIGKILL | `TerminateProcess`（穏当な終了要求は無い = `force` に関わらず強制。#1599） |
 | 子孫の回収（B30 `platform::job`。ペインを閉じる・言語サーバを止める・打ち切り / 取り消し / 再起動） | 何もしない（PTY の HUP / stdin の EOF と kill / プロセスグループ・木への SIGTERM） | Job Object（`KILL_ON_JOB_CLOSE`。#2454 / #2462） |
+| cargo の共有 jobserver（B31 `platform::jobserver`。fifo の作成・`FIONREAD` で札を数える・札の出し入れ。#1998） | fifo（`mkfifo` + `O_RDWR \| O_NONBLOCK \| O_CLOEXEC`） | 対象外（`Unsupported`。名前付きセマフォは #2000） |
 | シェル統合 | zsh / bash / fish | PowerShell |
 
 trait で抽象化し、core/ と control/ は platform/ の trait のみに依存する。

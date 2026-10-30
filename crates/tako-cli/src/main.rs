@@ -4058,6 +4058,9 @@ enum QueueCommand {
         /// 待ちの上限（分。既定 30）
         #[arg(long)]
         max_wait_min: Option<u32>,
+        /// tako のペインの cargo が共有する札（jobserver。既定 on = 論理 CPU 数ぶん。#1998）
+        #[arg(long, value_parser = ["on", "off"])]
+        jobserver: Option<String>,
         /// すべて既定へ戻す
         #[arg(long)]
         reset: bool,
@@ -7862,6 +7865,7 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
             reserve_gb,
             swap_guard_gb,
             max_wait_min,
+            jobserver,
             reset,
             json,
         }) => {
@@ -7870,6 +7874,7 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
                 reserve_gb: *reserve_gb,
                 swap_guard_gb: *swap_guard_gb,
                 max_wait_min: *max_wait_min,
+                jobserver: jobserver.as_deref().map(|v| v == "on"),
                 reset: *reset,
             };
             let request = Request::Queue {
@@ -7941,17 +7946,29 @@ fn queue_status_cli(json: bool) -> Result<(), String> {
 /// 上限の 1 行
 fn print_queue_limits(v: &Value) {
     let configured = &v["configured"];
-    let set: Vec<String> = ["max_jobs", "reserve_gb", "swap_guard_gb", "max_wait_min"]
-        .iter()
-        .filter(|k| !configured[**k].is_null())
-        .map(|k| format!("{k}={}", configured[*k]))
-        .collect();
+    let set: Vec<String> = [
+        "max_jobs",
+        "reserve_gb",
+        "swap_guard_gb",
+        "max_wait_min",
+        "jobserver",
+    ]
+    .iter()
+    .filter(|k| !configured[**k].is_null())
+    .map(|k| format!("{k}={}", configured[*k]))
+    .collect();
     println!(
-        "同時 {} 件・予約 {} GB・swap の警戒線 {} GB・待ちの上限 {} 分（{}）",
+        "同時 {} 件・予約 {} GB・swap の警戒線 {} GB・待ちの上限 {} 分・cargo の札 {}（{}）",
         v["max_jobs"],
         v["reserve_gb"],
         v["swap_guard_gb"],
         v["max_wait_min"],
+        // 旧い GUI は欄を返さない（そのときは何も言わない）
+        match v["jobserver"].as_bool() {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "-",
+        },
         if set.is_empty() {
             "すべて機に合わせた既定".to_string()
         } else {
@@ -8231,6 +8248,47 @@ fn print_queue_status(v: &Value) {
     }
     print_queue_section(&v["queue"]);
     print_launches_section(&v["launches"]);
+    print_jobserver_section(&v["jobserver"]);
+}
+
+/// cargo の札の節の表示（#1998）。旧い GUI（節が無い）では何も出さない
+fn print_jobserver_section(j: &Value) {
+    if !j.is_object() {
+        return;
+    }
+    match j["state"].as_str() {
+        Some("active") => {
+            let mut line = format!(
+                "cargo の札: 空き {} / {}",
+                j["free"].as_u64().map_or("?".into(), |f| f.to_string()),
+                j["tokens"]
+            );
+            if let Some(h) = j["holders"].as_u64() {
+                line.push_str(&format!("（札を持ちうる cargo 系 {h} 本）"));
+            }
+            println!("{line}");
+            if let Some(r) = j["last_recount"].as_object() {
+                let added = r["added"].as_u64().unwrap_or(0);
+                let removed = r["removed"].as_u64().unwrap_or(0);
+                println!(
+                    "  直近の数え直し: 空き {} → {}{}（{}）",
+                    r["free_before"],
+                    if added > 0 { "+" } else { "-" },
+                    added.max(removed),
+                    if r["why"] == "over" {
+                        "多すぎた分を抜いた"
+                    } else {
+                        "誰も持っていないのに足りない分を足した"
+                    }
+                );
+            }
+        }
+        Some("follower") => println!("cargo の札: 先行の tako の札を使う（総数 {}）", j["tokens"]),
+        _ => println!(
+            "cargo の札: 配っていない — {}",
+            j["reason"].as_str().unwrap_or("?")
+        ),
+    }
 }
 
 /// agent の起動待ちの節の表示（#2413）。待ちも立ち上がり中も無ければ何も出さない

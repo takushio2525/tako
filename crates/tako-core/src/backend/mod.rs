@@ -166,10 +166,14 @@ pub const BACKEND_SOCKET_ENV: &str = "TAKO_BACKEND_SOCKET";
 /// - **設定で変わる**（[`crate::claude_mod::INJECTED_KEYS`]。#1879）: tako mod の展開先と CLI。
 ///   `tako mod off` にしても、前に注入した値がサーバーのグローバル環境に残っていれば
 ///   新しいペインへ漏れる
+/// - **版と設定で変わる**（[`crate::jobserver::ENV`]。#1998）: cargo の共有 jobserver。器のサーバーは
+///   注入しない旧版の tako の起動から何日も続くので、継承に任せると新しいペインへ届かない。
+///   注入しないペインでは固定しない（届く値は消えた fifo を指すので cargo は従来どおり走る）
 pub fn session_pinned_env(key: &str) -> bool {
     PANE_SCOPED_ENV.contains(&key)
         || crate::shell_integration::INJECTED_KEYS.contains(&key)
         || crate::claude_mod::INJECTED_KEYS.contains(&key)
+        || key == crate::jobserver::ENV
 }
 
 /// 器のセッション作成時に `-e` で固定する `(key, value)` の一覧。
@@ -1358,6 +1362,30 @@ mod pane_scoped_env_tests {
         assert_eq!(
             value(&pinned, crate::claude_mod::CLI_ENV),
             vec!["/a/tako".to_string()]
+        );
+    }
+
+    /// #1998: 器のサーバーが注入しない旧版の起動から続いていても、cargo の札の env が新しいペインへ届く
+    #[test]
+    fn cargoの札のenvはセッション作成時に固定される() {
+        let value =
+            crate::jobserver::makeflags(18, std::path::Path::new("/t/tako-0.jobserver.fifo"));
+        let on = vec![(crate::jobserver::ENV.to_string(), value.clone())];
+        let pinned = session_pinned_pairs(&on, "tako-unit");
+        assert!(
+            pinned
+                .iter()
+                .any(|(k, v)| k == crate::jobserver::ENV && *v == value),
+            "CARGO_MAKEFLAGS が `-e` で固定されない（器のグローバル環境に無いと届かない）: {pinned:?}"
+        );
+        let off = session_pinned_pairs(&[], "tako-unit");
+        assert!(
+            !off.iter().any(|(k, _)| k == crate::jobserver::ENV),
+            "注入しないペインでは固定しない"
+        );
+        assert!(
+            !session_pinned_env("MAKEFLAGS"),
+            "素の make の env は触らない"
         );
     }
 

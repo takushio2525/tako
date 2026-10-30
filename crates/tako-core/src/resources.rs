@@ -198,6 +198,9 @@ pub struct ProcSample {
     /// env の `TAKO_QUEUE_JOB`（順番待ちを通った処理の受付番号。#1994）。
     /// プラットフォームバイナリは env が読めないので、木は wrapper の子孫でも辿る（[`managed_view`]）
     pub queue_job: Option<u64>,
+    /// env の `CARGO_MAKEFLAGS` が指す tako の共有 jobserver の fifo のパス（#1998。tako の fifo でなければ `None`。
+    /// 札を持ちうるかの判定は [`crate::jobserver::holders`]）
+    pub jobserver_fifo: Option<String>,
 }
 
 impl ProcSample {
@@ -801,6 +804,7 @@ mod tests {
             env_pane: None,
             isolated: false,
             queue_job: None,
+            jobserver_fifo: None,
         }
     }
 

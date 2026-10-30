@@ -143,8 +143,13 @@ fifo が無い（パスだけ渡す）:        exit 0・警告なし（cargo は
 - **`CARGO_MAKEFLAGS` で渡せば GNU make を巻き込まない**（`MAKEFLAGS` にすると、`-j` 無しの素の `make` まで
   並列で走り出し、並列に耐えない Makefile を壊す）
 - fifo が無ければ黙って従来の挙動 = **tako が居なくても壊れない**
-- **取り分（`CARGO_BUILD_JOBS`）と共有 jobserver は厳しい方が効く**: `CARGO_BUILD_JOBS=1` + 札 4 枚 = 5.60 s、
-  `CARGO_BUILD_JOBS=8` + 札 0 枚 = 7.71 s（どちらも直列）。§4.3 の取り分と S6 の札は重ねて使える
+- ~~**取り分（`CARGO_BUILD_JOBS`）と共有 jobserver は厳しい方が効く**: `CARGO_BUILD_JOBS=1` + 札 4 枚 = 5.60 s、
+  `CARGO_BUILD_JOBS=8` + 札 0 枚 = 7.71 s（どちらも直列）。§4.3 の取り分と S6 の札は重ねて使える~~
+  → **S6（#1998）の実測で改めた**: 受け継いだ jobserver があると cargo は `CARGO_BUILD_JOBS`（`-j`）を**見ない**。
+  眠るビルドスクリプト 6 本の重なりは jobs 1 / 2 / 3 / 8 のどれでも 札 0 枚 = 1・札 1 枚 = 2・札 4 枚 = 4
+  （jobserver なしは jobs のとおり 1 / 2 / 3）。上の「直列」は所要時間からの推定で、区間を数えると jobs=1 + 札 4 は
+  直列ではなかった。厳しい方が効くのは札の方が厳しい向きだけで、**tako のペインの cargo では取り分の代わりに札が
+  上限になる**（§9.7）
 
 ### 1.7 予算の残り
 
@@ -307,7 +312,7 @@ tako-control の調停役（シングルトン。tako-app の起動時に立つ�
 | 子が起動できない | wrapper は 127（`sh` と同じ）と理由を出し、枠を返す |
 | 調停役の判断が例外 | その回は割り当てない（待ちのまま）。次の tick で再判断。persist.log へ 1 行 |
 | 機の値が採れない | 同時数の条件だけで判断（メモリの条件を飛ばす）。status に `machine: unavailable` と理由 |
-| 札の数え違い（S6） | 管理下の cargo が 0 本になった時点で札を N 枚へ戻す（§9.4） |
+| 札の数え違い（S6） | 管理下の cargo が 0 本になった時点で札を N 枚へ戻す（§9.4・§9.7） |
 
 ### 4.6 GUI が居ないときの読み取り
 
@@ -495,12 +500,16 @@ S2 の「先頭が入れなければ後ろも待つ」は、先頭が**同じ ta
 ### 9.4 cargo の全体並列（S6）
 
 - tako-app が `<data_dir>/resources/jobserver.fifo` を作って開いたまま持ち、札を `論理 CPU 数` 枚入れる。
-  `spawn_session`（`crates/tako-app/src/main.rs:9377`）の env に `CARGO_MAKEFLAGS=-j<N> --jobserver-auth=fifo:<path>` を足す
+  `spawn_session` の env に `CARGO_MAKEFLAGS=-j<N> --jobserver-auth=fifo:<path>` を足す
+  （**data dir のパスに空白があるときは置き場を変える** = §9.7）
 - fifo の中身は**誰かが開いている間だけ**残る。GUI の再起動の間は走っている cargo が開いているので札は残り、
   起動時に札を足すと二重になる → 「管理下の cargo が 0 本のときに N 枚へ揃える」で数え違いを直す
 - 器のペインは作った時の env を持ち続けるので、**パスは固定**（世代ごとに変えない）
-- 順番待ちの取り分（`CARGO_BUILD_JOBS`）と重なっても厳しい方が効く（§1.6 で実測）ので、両方を入れて矛盾しない
+- 順番待ちの取り分（`CARGO_BUILD_JOBS`）と重なっても矛盾しない（**S6 の実測で改めた**: 受け継いだ jobserver が
+  あると cargo は取り分を見ないので、tako のペインの cargo は札が上限になる。全体の同時数は N + 並んだ cargo の
+  本数で、取り分の合計（≤ CPU 数）と同じ桁。取り分は `RUST_TEST_THREADS` とペインの外の cargo には効く。§1.6・§9.7）
 - 既定 on（判断点 §11-5）・`settings.json` の `resources.jobserver` と A/B の `TAKO_1992_NO_JOBSERVER=1` で切れる
+- 実装で決めた差分と細部は §9.7（正は FR-2.43.13 とコード）
 
 ### 9.5 #1945（上限後の自動復帰）との関係
 
@@ -559,6 +568,25 @@ MCP の子が起きない構成:                          1.1s 2 本 353 MB → 
 | orphan の自動復帰（#191）・`tako tmux open` | 待たせない | 走っている器へ付け直すだけ（新しいプロセスを起こさない） |
 | 自動命名（`claude -p`） | 待たせない | 常駐しない短命の 1 回 |
 
+### 9.7 S6（#1998）の実装で決めたこと
+
+| 項目 | 決めたこと | 理由 |
+|---|---|---|
+| fifo の置き場 | `<data_dir>/resources/jobserver.fifo` に空白が無ければそこ（Linux・隔離の一時 dir）。あれば `<temp_dir>/tako-<data dir の 16 桁>.jobserver.fifo` → `/tmp/…`（`tako_core::jobserver::fifo_path`）。どれにも空白があれば注入しない | **macOS の data dir は `Library/Application Support` で空白を含む**。jobserver クレートは `CARGO_MAKEFLAGS` を空白で区切って読むので、パスが途中で切れて cargo は黙って自前の並列へ戻る（2026-10-31 の実測: 札 0 枚の fifo で空白なしのパスは重なり 1、空白入りは 3）。逃がし方は IPC ソケットの先例（`ipc_socket` の短いパス）と同じで、ハッシュなので再起動をまたいで固定 |
+| 管理下の cargo | env の `CARGO_MAKEFLAGS` が**同じ置き場の系統**の fifo（パスが同じか、逃がし先の名前 `tako-<data dir の 16 桁>.jobserver.fifo` が同じ = 同じ data dir）を指し、名前が cargo 系（cargo / `cargo-*` / rustc / rustdoc / clippy-driver / `build-script-*` / make）のプロセス（`tako_core::jobserver::holders`）。env は既存の走査が新しいプロセスだけ読み（`ENV_KEYS` に 1 つ足しただけ）、覚えには fifo のパスを持たせ、本数は数え直しのときに番人のパスで数える | ペインの全プロセス（シェル・agent・MCP サーバー）が同じ env を持つので env だけでは数えられない。node のビルド系・テストの実行体は札を取らないので外す（常駐する dev サーバーが数え直しを止め続けない）。名前で揃えるのは `$TMPDIR` の違う起動をまたいだ前の世代の cargo も数えるため。**別の data dir の tako（本番と隔離の GUI）の cargo は数えない**（数えると 8 本前後の worker がビルドし続ける本番の cargo が隔離の検証の数え直しを止め続け、逆も起きる） |
+| 札の数え方 | `FIONREAD` を**読みだけで開いた別の fd** へ（札の出し入れは読み書き両方の fd） | macOS の fifo は読み側と書き側の 2 つのソケットで、読み書き両方の fd への `FIONREAD` は読み側の値を書き側の値（常に 0）で上書きして返す（XNU の `fifo_ioctl`。5 枚入れて 0 と読めた実測） |
+| 順番待ちの取り分との関係 | tako のペインの cargo は**札が上限**（受け継いだ jobserver があると cargo は `CARGO_BUILD_JOBS` を見ない）。順番待ちの wrapper は取り分を今までどおり渡す（`RUST_TEST_THREADS` と、ペインの外 = `CARGO_MAKEFLAGS` の無い cargo には効く）。回帰テスト `issue1998_jobserver_cargo` の `取り分と札を重ねると札が上限で取り分は見られない` が「札 0 枚なら jobs 8 でも直列」「jobs 1 でも札 3 枚なら 2〜4 本並ぶ」を固定する | 2026-10-31 の実測（jobs 1 / 2 / 3 / 8 × 札 0 / 1 / 4 = 重なりは札だけで決まる）。設計書 §1.6 の S0 の「jobs=1 + 札 4 = 直列」は所要時間からの推定で誤り。全体の同時数は N + K で、取り分の合計（≤ CPU 数）と同じ桁なので、順番待ちのメモリの見込みの前提は崩れない |
+| 数え直し | 背景スレッド `tako-jobserver`（2 秒ごと）が `FIONREAD` で空きを数える（読まない）。N 枚より多ければいつでも抜く。少なければ管理下の cargo を数え、**0 本と新しい走査（1 秒以内）で確かめたときだけ**足す。0 本の覚えが古ければ採り直す（約 20 ms・ロックの外）。確かめている間に空きが動いたら（0 本と読んだ後に始まった cargo が取った）その回は足さない | 足しすぎる側（N を超える）へ倒れない。誰も持っていなければ fifo の中身 = 全部の札なので、足りない分は持ち逃げ（cargo を kill した）か作りたて。多すぎる分を抜いても並列が減るだけ |
+| 走査の頻度 | 増やさない。管理下の cargo が居る覚え（30 秒以内）は信じて待つので、強制の採り直しは「0 本の覚えが古いのに足りない」ときだけ（最大でも普段の走査 1 回あたり 1 回） | 普段の走査（30 秒）の費用の見積もり（§2.2）を崩さない |
+| 終了 | 管理下の cargo が 0 本（その場で採り直す）なら fifo を消す。居れば残す（`cleanup_process_scoped` = セルフテストの失敗の出口も同じ） | 残すと GUI の居ない間の cargo は札 0 枚の fifo を開いて直列になる。消せばパスが無いので従来どおり。cargo が走っている間の再起動は残して同じ fifo を開き直す（札は cargo が持ったまま続く） |
+| 置き場から消えた | 毎周 inode を見比べ、消されていたら作り直す（古い fifo を開いている cargo は古い札で続く。新しい fifo は誰も持っていなくなってから足す） | 一時 dir の掃除・手で消した。作り直さないと新しいペインの cargo が従来どおりの並列に戻ったまま |
+| 置き場に fifo 以外 | 触らずに注入しない（status の `code: error`） | 消して作り直さない。注入しなければ cargo は従来どおり = 札待ちで止まる経路を作らない |
+| 設定の切り替え | `tako queue limits --jobserver on\|off`（MCP `tako_queue` の `limits.jobserver`・`settings.json` の `resources.jobserver`。既定 on のときはキーを書かない）。off で注入をやめ fifo を閉じて消す（前に作ったペインの cargo も次の起動からは従来どおり）、on で作り直す。番人は設定ファイルの mtime も 2 秒ごとに見る（GUI が居ないときに書いた分） | 「切った」の意味を「新しいペインだけ」に留めると、器のペインに残った env の cargo が絞られ続けて利用者の意図と食い違う |
+| セカンダリ・隔離 | セカンダリ（同じ data dir の先行の tako が居る）は fifo を持たずパスだけ渡す。隔離の GUI は自分の data dir の fifo を持つ（本番の札とは別）。札の枚数の注入 `TAKO_1998_INJECT_TOKENS` は隔離 / テストのプロセスだけが読む | 同じ fifo を 2 つの番人が数え直すと二重に足しうる。隔離の検証が本番の fifo を触らない |
+| 状況 | `tako queue` / MCP `tako_queue` の status に `jobserver` 節（`state` active / follower / off・`code` / `reason`・`tokens`・`free`・`in_use`・`holders`・`last_recount`・`recreated`・`value`）。CLI は「cargo の札: 空き X / N（札を持ちうる cargo 系 K 本）」の 1 行 | resources ビュー（S3 #1995）は未着地。S3 は同じ節を読む |
+| Windows | 対象外（境界 B31 `platform::jobserver` は `Unsupported`。対応マトリクス `tako_queue` の Windows = Pending #2000 の理由文に足した） | jobserver の Windows 側は名前付きセマフォで、cargo が外から渡したものに従うかは未実測（S8） |
+| GUI が落ちた後 | 異常終了で fifo が残ると、次の GUI が立つまでの間に器のペインで始めた cargo は札 0 枚 = 暗黙の 1 枚で直列（止まりはしない）。次の GUI は同じ fifo を開き直し、その cargo が終わってから N 枚にする | 落ちた瞬間に後片付けする口が無い。直列でも進むので「永久に札待ち」にはならない |
+
 ## 10. Windows と MATRIX（論点 9）
 
 - **platform の対応マトリクス**（`crates/tako-core/src/platform/support.rs`。キーは MCP ツール名と 1:1）: `tako_queue` を足す。
@@ -602,7 +630,7 @@ MCP の子が起きない構成:                          1.1s 2 本 353 MB → 
 | S3 | #1995 | 右パネルの `resources` ビューとステータスバーの 1 区画 | S1（待ち行列の欄は S2） | M |
 | S4 | #1996 | 優先度（4 段・変更・エイジング）と終わりの見込み（`N/M`・過去の所要時間） | S2 | M |
 | S5 | #1997 | AI の運用（spawn の `machine` / `advice`・guide・fleet の列・agent 能力マトリクスの 1 行・一括復帰の実測） | S2 | M |
-| S6 | #1998 | cargo の全体並列の上限（共有 jobserver の注入と札の数え直し） | S1 | M |
+| S6 | #1998 | cargo の全体並列の上限（共有 jobserver の注入と札の数え直し）（✅ 実装の差分は §9.7） | S1 | M |
 | S7 | #1999 | スマホ（PWA）の状況カードと `#/resources` | S3・S4 | S〜M |
 | S8 | #2000 | Windows の実装と実機の実測（B29 の Windows 側・Job Object・メモリ圧の合成・jobserver のセマフォ）・MATRIX を Supported へ | S1・S2（S6） | M |
 

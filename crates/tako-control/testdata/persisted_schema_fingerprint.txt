@@ -39,7 +39,7 @@ Ledger: entries
 LedgerEntry: id, ts, project, label, issue, task_type, model, model_actual, effort, agent, duration_seconds, ctx_percent, had_error, outcome, rounds, note, post_issue, amend_note
 LimitObservation: login, key_from, kind, percent, resets_at, observed_at, recorded_at, source
 LimitSeenLayout: notice, detected_at
-LimitSettings: max_jobs, reserve_gb, swap_guard_gb, max_wait_min
+LimitSettings: max_jobs, reserve_gb, swap_guard_gb, max_wait_min, jobserver
 ManagedMark: schema, managed_by, tako_version, content_hash, files
 NodeLayout: Pane, Split, axis, ratio, first, second
 OrchestratorConfig: auto_close, auto_push

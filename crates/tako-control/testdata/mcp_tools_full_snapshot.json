@@ -2366,7 +2366,7 @@
     "name": "tako_check_health"
   },
   {
-    "description": "PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動きどれだけ食っているかを返す。panes はメモリの多いペイン上位（agent_mb = agent と MCP サーバー）。worker を増やす前・ビルドの前に空きを確かめる。queue 節は `tako queue <コマンド>` の順番待ち（実行中・待ち・上限）。cancel は id（受付番号）を取り消す。limits は上限の読み書き（省略で読むだけ）。順番待ちで走らせるのは CLI だけ。launches 節はメモリ逼迫で起動を待つ agent（spawn / run / 復元）、start は id（そのペイン）を今すぐ起こす。",
+    "description": "PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理（ビルド・テスト・ブラウザ・隔離 GUI）がどのペイン / worker / tako の外で動きどれだけ食っているかを返す。panes はメモリの多いペイン上位（agent_mb = agent と MCP サーバー）。worker を増やす前・ビルドの前に空きを確かめる。queue 節は `tako queue <コマンド>` の順番待ち（実行中・待ち・上限）。cancel は id（受付番号）を取り消す。limits は上限の読み書き（省略で読むだけ）。順番待ちで走らせるのは CLI だけ。launches 節はメモリ逼迫で起動を待つ agent（spawn / run / 復元）、start は id（そのペイン）を今すぐ起こす。jobserver 節は tako のペインの cargo が共有する札（空き / 総数）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -2384,7 +2384,7 @@
           "type": "integer"
         },
         "limits": {
-          "description": "max_jobs / reserve_gb / swap_guard_gb / max_wait_min / reset",
+          "description": "max_jobs / reserve_gb / swap_guard_gb / max_wait_min / jobserver / reset",
           "type": "object"
         }
       },

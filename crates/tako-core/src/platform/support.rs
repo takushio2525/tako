@@ -253,8 +253,8 @@ pub mod notes {
     /// PC リソースの計測（境界 B29。#1993）。Windows 側は未実装で、`tako queue` は機の値を
     /// 「この OS ではまだ採れない」と返す（S8 = #2000 で実装と実機の実測）
     pub const WIN_RESOURCES_UNIMPLEMENTED: Note = Note::new(
-        "PC 全体のメモリ・CPU とプロセスごとの消費の計測（境界 B29）は macOS だけ。Windows は機の値を「まだ採れない」と返す（#2000）",
-        "Measuring machine-wide memory / CPU and per-process usage (boundary B29) is macOS only. On Windows the machine values are reported as not available yet (#2000)",
+        "PC 全体のメモリ・CPU とプロセスごとの消費の計測（境界 B29）は macOS だけ。Windows は機の値を「まだ採れない」と返す（#2000）。tako のペインの cargo が共有する札（jobserver・境界 B31）も unix の fifo なので Windows では配らない（cargo は従来どおり自前の並列で走る。Windows の名前付きセマフォに cargo が従うかは未実測）",
+        "Measuring machine-wide memory / CPU and per-process usage (boundary B29) is macOS only. On Windows the machine values are reported as not available yet (#2000). The shared cargo jobserver for tako panes (boundary B31) is a unix fifo, so it is not handed out on Windows (cargo keeps its own parallelism; whether cargo follows a Windows named semaphore passed from outside has not been measured)",
     );
 
     pub const WIN_LSP_REAL_SERVER_UNMEASURED: Note = Note::new(
