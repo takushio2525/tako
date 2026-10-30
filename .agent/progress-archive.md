@@ -699,3 +699,9 @@
 - 2026-10-30 #1704: wait-pr-checks.sh / merge-pr.sh の gh の接続エラーを `lib/gh-retry.sh` で 1, 2, 4, 8 秒あけて 5 回まで試し、届かないままなら到達性の終了コード 5・認証切れ等は従来どおり 3
 - 2026-10-30 #2498: CI 待ちの既定の上限の記述（commands.md・`DEFAULT_TIMEOUT` のコメント）を 6600 秒・macOS の job 90 分へ・`release.sh --promote` の docs の PR で merge-pr.sh の 5 を「回線が戻って…
 - 2026-10-30 #2365 の続き: GUI へ繋ぐ口（ipc.rs・時間切れ・起動失敗の包み）と置き場（ゲート・チェックポイント・人がやること・TaskStore・YAML の理由）の断りを日英へ（Reason 155 → 179）
+- 2026-10-30 #2496: 項目 108 / 110 の `measure_output_redraw` も `open_redraw_windows` で両方の時計を空ける。いまの並びでは対象はフォーカス中で落ちない = 潜在
+- 2026-10-30 #2501: CI 待ちの既定を書いた md・コメント・--help の数字を `DEFAULT_TIMEOUT` と ci.yml の job の上限に突き合わせる番犬 `issue2501_wait_timeout_docs_watchdog`。docs だけの PR でも ubuntu…
+- 2026-10-30 #2365 の続き: config_io の書き出し 6 文 → `WriteError`・remote.rs の AppIpcClient 9 行 → `Reason`・データディレクトリの断り 5 か所 → `DataDirUnresolved` / `IoCause`
+- 2026-10-30 #1614: cargo test 中の bash の syntax error は shell_dialect の意図的な負の対照（`bash -n`）だった → stderr を取り込んで `syntax error` を assert
+- 2026-10-30 #1622: 環境診断の外部の問い合わせ（`claude mcp list` ほか）を導入状況と重ね、check-health 9.7〜12.0 → 5.8〜6.4 秒・setup --check 9.0〜9.9 → 5.4〜5.9 秒。出力は sha256 まで一致
+- 2026-10-30 #1593: CHANGELOG の `## [Unreleased]` 5 つを最上段の 1 つへ（埋もれた 42 項目は出荷版の節へ・0.7.9 の 8 項目は消費済み）・夜間の挿入を `scripts/lib/changelog.sh` へ（A/B `TAKO_1593_LEGACY=…
