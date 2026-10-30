@@ -313,6 +313,7 @@ if [ "$ONLY" != cli ]; then
   echo
   echo "== run-configs.json の保存（tako run-config / MCP の本体）を統合テストで =="
   echo "   cargo test --test issue2238_nonutf8_quarantine_ab（既定 → TAKO_2238_LEGACY=1 を 1 本で並べる）"
+  # tako:prod-ok 本番の順番待ち（#1994）へ並ぶのが目的 = 本番の GUI へ届くのが仕様
   out=$(cd "$REPO_ROOT" && "$QUEUE" queue cargo test -p tako-control --test issue2238_nonutf8_quarantine_ab -- --nocapture 2>&1)
   grep '\[2238-ab\]' <<<"$out" | sed "s#/[^ \"]*tako-2238-ab-#<tmp>/tako-2238-ab-#g; s/^/      /"
   if grep -q 'test result: ok. 1 passed' <<<"$out"; then

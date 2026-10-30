@@ -16,6 +16,11 @@
 //! 止め・`CLAUDE_CONFIG_DIR` を一時の側へ向けること（本番がペインへ配る名前は本番側の正本から
 //! 集めて突き合わせる）と、検証スクリプトが自分のプロセスで claude / tako を起こす前に
 //! 落としていること（`rel:line` で名指す）を拘束する。
+//!
+//! **#2527**: env を落としても tako CLI は発見ファイル（既定の data dir の `control.json`）から
+//! 本番 GUI へ繋ぐ。`test-serve-watch.sh` の `tako remote start` が QR の画像を本番のアクティブな
+//! タブへ開いた。tako CLI を起こす行は、発見の置き場（`TAKO_DATA_DIR` / `TAKO_DISCOVERY_DIR` /
+//! `HOME`）を一時の側へ向けていることも拘束する（`# tako:prod-ok <理由>` の行だけ外す）。
 
 use std::path::{Path, PathBuf};
 
@@ -258,6 +263,15 @@ const ISSUE_1970_KEYS: &[&str] = &[
 /// 残すと CLI は本番の GUI へ繋がり、本番のペインを自分として扱う（#1449 / #1450）
 const TAKO_CLI_KEYS: &[&str] = &["TAKO_SOCKET", "TAKO_PANE_ID"];
 
+/// 検証スクリプトが **tako CLI** を起こす前に、どれか 1 つを一時の側へ向けていなければならない名前（#2527）。
+///
+/// `TAKO_SOCKET` を落としても CLI は止まらない: 環境変数が無ければ発見ファイル
+/// （`<TAKO_DISCOVERY_DIR か data dir>/control.json` と `instances/`）を読み、既定の置き場
+/// （`$HOME/Library/Application Support/tako`）に居る本番 GUI へ繋ぐ（FR-2.2.9）。
+/// `TAKO_ISOLATED=1` は CLI の data dir を変えないので隔離にならない。#2527 では
+/// `test-serve-watch.sh` の `tako remote start` が QR の画像を本番のアクティブなタブへ開いた
+const DISCOVERY_KEYS: &[&str] = &["TAKO_DATA_DIR", "TAKO_DISCOVERY_DIR", "HOME"];
+
 /// ヘルパの `ISOLATED_GUI_DROP_ENV=( … )` に並んだ名前（コメント行と行末コメントは除く）
 fn helper_drop_env(src: &str) -> Vec<String> {
     let start = src
@@ -389,13 +403,69 @@ struct Launch {
     /// 同じコマンドの `env -u K`（`env -i` なら全部）で落としている名前
     env_drops: Vec<String>,
     env_clear: bool,
+    /// 同じコマンドの前置き（`K=V cmd` / `env K=V cmd`）で差し替えている名前（#2527）
+    env_sets: Vec<String>,
 }
 
-/// 走査の結果: 起こすコマンドの一覧と、ファイル全体の `unset` で落としている名前
+/// 走査の結果: 起こすコマンドの一覧と、ファイル全体の `unset` で落としている名前・
+/// `export` で子へ渡している名前
 #[derive(Debug, Default)]
 struct ScriptScan {
     launches: Vec<Launch>,
     unset: Vec<String>,
+    /// `export K=V` / `export K` / `declare -x K` と、常に export 済みの `HOME` への代入（#2527）
+    exported: Vec<String>,
+    /// このスクリプトが `…/tako` のパスを代入した変数（`OLD=/Applications/…/MacOS/tako` 等）。
+    /// `"$OLD" file copy …` も tako CLI を起こす行として数える（#2527）
+    tako_vars: Vec<String>,
+    /// 監査済みの例外宣言 `# tako:prod-ok <理由>` が効く行（宣言の行とその次の行。理由の無い宣言は無効）。
+    /// 本番の GUI へ届くのが仕様の行だけに付ける（本番の順番待ちへ並ぶ `tako queue` = #1994）。
+    /// 外れるのは発見の置き場の規則だけ（env を落とす規則は外れない）
+    prod_ok: Vec<usize>,
+}
+
+/// `# tako:prod-ok <理由>` の宣言が効く行番号（1 始まり。宣言の行とその次の行）
+fn prod_ok_lines(src: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (i, l) in src.lines().enumerate() {
+        let declared = l
+            .split("# tako:prod-ok")
+            .nth(1)
+            .is_some_and(|reason| !reason.trim().is_empty());
+        if declared {
+            out.extend([i + 1, i + 2]);
+        }
+    }
+    out
+}
+
+/// `/tako` で終わるパスを代入した変数の名前（`NAME=…/tako` / `export NAME="${X:-…/tako}"` / `local NAME=…`）
+fn tako_path_vars(src: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in src.lines() {
+        let mut rest = line.trim_start();
+        for kw in ["export ", "local ", "readonly "] {
+            if let Some(r) = rest.strip_prefix(kw) {
+                rest = r.trim_start();
+            }
+        }
+        let Some(eq) = rest.find('=') else { continue };
+        let name = &rest[..eq];
+        if name.is_empty()
+            || !name
+                .chars()
+                .enumerate()
+                .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+        {
+            continue;
+        }
+        let value = rest[eq + 1..].split([' ', '\t', ';']).next().unwrap_or("");
+        let value = unquote(value);
+        if value.trim_end_matches('}').ends_with("/tako") && !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -413,21 +483,37 @@ fn unquote(word: &str) -> String {
     word.chars().filter(|c| *c != '"' && *c != '\'').collect()
 }
 
-/// 1 つのコマンド（単語の列）から、起こすもの・`env -u`・`unset` を読む
+/// 代入の単語（`K=V` / `K+=V` / `export` の引数の `K`）の名前
+fn assigned_name(word: &str) -> String {
+    let bare = unquote(word);
+    let end = bare.find(['=', '+']).unwrap_or(bare.len());
+    bare[..end].to_string()
+}
+
+/// 1 つのコマンド（単語の列）から、起こすもの・`env -u`・`unset`・`export` を読む
 fn classify(words: &[String], line: usize, scan: &mut ScriptScan) {
     let mut i = 0;
     let mut env_drops = Vec::new();
     let mut env_clear = false;
+    let mut env_sets = Vec::new();
     loop {
-        let Some(w) = words.get(i) else { return };
+        let Some(w) = words.get(i) else {
+            // 代入だけの文。`HOME` は常に export 済みなので、代入がそのまま子へ渡る（#2527）
+            if env_sets.iter().any(|k| k == "HOME") {
+                scan.exported.push("HOME".to_string());
+            }
+            return;
+        };
         let bare = unquote(w);
         // 前置き（代入・exec 等）は読み飛ばす。`command -v` は在るかの確認なので読み飛ばさない
         let lookup = bare == "command" && words.get(i + 1).is_some_and(|n| n.starts_with('-'));
         // 後ろに単語が続く配列の展開（`${extra[@]+"${extra[@]}"} "$BIN/claude"`）は前置きの
         // `VAR=VAL` の束として読み飛ばす（コマンドは後ろの単語）
         let spread = bare.starts_with("${") && bare.contains("[@]") && words.len() > i + 1;
-        if is_assignment(w)
-            || matches!(bare.as_str(), "exec" | "nohup" | "time" | "!")
+        if is_assignment(w) {
+            env_sets.push(assigned_name(w));
+            i += 1;
+        } else if matches!(bare.as_str(), "exec" | "nohup" | "time" | "!")
             || (bare == "command" && !lookup)
             || spread
         {
@@ -468,6 +554,20 @@ fn classify(words: &[String], line: usize, scan: &mut ScriptScan) {
         );
         return;
     }
+    let args = &words[i + 1..];
+    let declares_export = matches!(cmd.as_str(), "declare" | "typeset")
+        && args.iter().any(|a| {
+            let a = unquote(a);
+            a.starts_with('-') && a.contains('x')
+        });
+    if cmd == "export" || declares_export {
+        scan.exported.extend(
+            args.iter()
+                .filter(|w| !unquote(w).starts_with('-'))
+                .map(|w| assigned_name(w)),
+        );
+        return;
+    }
     // パスで起こす claude（`"$BIN/claude"` = 実物を PATH の外から symlink で置く形）も数える
     let what = if cmd == "claude" || cmd.ends_with("/claude") {
         // 版の問い合わせは会話も mod も MCP も起こさない（mod の下限の判定で使う）
@@ -482,7 +582,20 @@ fn classify(words: &[String], line: usize, scan: &mut ScriptScan) {
         cmd.as_str(),
         "tako" | "$TAKO_BIN" | "${TAKO_BIN}" | "$TAKO" | "${TAKO}"
     ) || cmd.ends_with("/tako")
+        || scan
+            .tako_vars
+            .iter()
+            .any(|v| cmd == format!("${v}") || cmd == format!("${{{v}}}"))
     {
+        // 版・使い方の表示は clap がその場で返す（GUI へも data dir へも行かない）
+        if args.first().is_some_and(|a| {
+            matches!(
+                unquote(a).as_str(),
+                "--version" | "-V" | "--help" | "-h" | "help"
+            )
+        }) {
+            return;
+        }
         "tako"
     } else {
         return;
@@ -493,6 +606,7 @@ fn classify(words: &[String], line: usize, scan: &mut ScriptScan) {
         cmd: raw.clone(),
         env_drops,
         env_clear,
+        env_sets,
     });
 }
 
@@ -711,7 +825,11 @@ fn heredoc_marker(line: &str) -> Option<(String, bool)> {
 
 /// シェルスクリプト 1 本を走査する（ヒアドキュメントの本文は読まない = 書き出すスタブの中身）
 fn scan_script(src: &str) -> ScriptScan {
-    let mut scan = ScriptScan::default();
+    let mut scan = ScriptScan {
+        tako_vars: tako_path_vars(src),
+        prod_ok: prod_ok_lines(src),
+        ..ScriptScan::default()
+    };
     let lines: Vec<&str> = src.lines().collect();
     let mut idx = 0;
     while idx < lines.len() {
@@ -797,6 +915,26 @@ fn launch_violations(rel: &str, scan: &ScriptScan) -> Vec<String> {
             ));
         }
     }
+    // tako CLI は env を落としても既定の置き場の発見ファイルから本番 GUI を見つける（#2527）
+    let blind: Vec<&Launch> = scan
+        .launches
+        .iter()
+        .filter(|l| l.what == "tako" && !l.env_clear && !scan.prod_ok.contains(&l.line))
+        .filter(|l| {
+            !DISCOVERY_KEYS
+                .iter()
+                .any(|k| scan.exported.iter().any(|e| e == k) || l.env_sets.iter().any(|e| e == k))
+        })
+        .collect();
+    if let Some(first) = blind.first() {
+        out.push(format!(
+            "{rel}:{}: tako を起こす前に発見の置き場（{}）を一時の側へ向けていない\
+             （同じ形が {} 行。env を落としても CLI は既定の置き場の control.json から本番 GUI へ繋ぐ）",
+            first.line,
+            DISCOVERY_KEYS.join(" / "),
+            blind.len()
+        ));
+    }
     out
 }
 
@@ -840,9 +978,12 @@ fn 検証スクリプトは本番のenvを落としてからclaudeとtakoを起�
     );
     assert!(
         violations.is_empty(),
-        "本番 tako の env を落とさずに claude / tako を起こす検証スクリプトがある（#1970）。\
-         先頭で `unset {}` するか、その行を `env -u …` で起こす（tako CLI だけなら TAKO_SOCKET / TAKO_PANE_ID）:\n  {}",
+        "本番 tako の env を落とさずに claude / tako を起こす検証スクリプトがある（#1970 / #2527）。\
+         先頭で `unset {}` するか、その行を `env -u …` で起こす（tako CLI だけなら TAKO_SOCKET / TAKO_PANE_ID）。\
+         tako CLI は加えて発見の置き場を一時の側へ向ける（先頭で `export TAKO_DATA_DIR=\"$TMP/data\"` など。\
+         {} のどれか）:\n  {}",
         ISSUE_1970_KEYS.join(" "),
+        DISCOVERY_KEYS.join(" / "),
         violations.join("\n  ")
     );
 }
@@ -851,16 +992,36 @@ fn 検証スクリプトは本番のenvを落としてからclaudeとtakoを起�
 fn 走査は実際の持ち込みを検出する() {
     let all = ISSUE_1970_KEYS.join(" ");
     let cases: &[(&str, &str, usize)] = &[
-        // (説明, スクリプト, 名指す数)
-        ("落とさずに CLI", "\"$TAKO_BIN\" list\n", 1),
-        ("CLI の 2 つを落とす", "unset TAKO_SOCKET TAKO_PANE_ID\n\"$TAKO_BIN\" list\n", 0),
-        ("CLI の行で env -u", "env -u TAKO_SOCKET -u TAKO_PANE_ID TAKO_ISOLATED=1 \"$TAKO_BIN\" list\n", 0),
-        ("関数の中の CLI", "tk() { \"$TAKO_BIN\" \"$@\"; }\n", 1),
+        // (説明, スクリプト, 名指す数)。tako は「env を落としていない」と「発見の置き場が既定のまま」を別々に数える
+        ("落とさずに CLI", "\"$TAKO_BIN\" list\n", 2),
+        ("CLI の 2 つを落とす", "unset TAKO_SOCKET TAKO_PANE_ID\nexport TAKO_DATA_DIR=\"$T/d\"\n\"$TAKO_BIN\" list\n", 0),
+        ("CLI の行で env -u", "env -u TAKO_SOCKET -u TAKO_PANE_ID TAKO_ISOLATED=1 TAKO_DATA_DIR=\"$T\" \"$TAKO_BIN\" list\n", 0),
+        ("関数の中の CLI", "tk() { \"$TAKO_BIN\" \"$@\"; }\n", 2),
+        // #2527: env を落としても、発見の置き場が既定のままなら CLI は本番 GUI へ繋ぐ
+        ("#2527 の形（unset と TAKO_ISOLATED だけ）", "unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID\nTAKO_ISOLATED=1 \"$TAKO_BIN\" remote start\n", 1),
+        ("env -u と TAKO_ISOLATED だけ", "env -u TAKO_SOCKET -u TAKO_PANE_ID TAKO_ISOLATED=1 \"$TAKO_BIN\" list\n", 1),
+        ("ソケットを明示しても発見へ落ちる", "unset TAKO_SOCKET TAKO_PANE_ID\nTAKO_SOCKET=\"$S\" TAKO_TOKEN=\"$K\" \"$TAKO_BIN\" list\n", 1),
+        ("export しない代入は子へ渡らない", "unset TAKO_SOCKET TAKO_PANE_ID\nTAKO_DATA_DIR=\"$T\"\n\"$TAKO_BIN\" list\n", 1),
+        ("代入の後で名前だけ export", "unset TAKO_SOCKET TAKO_PANE_ID\nTAKO_DISCOVERY_DIR=\"$T\"\nexport TAKO_DISCOVERY_DIR\n\"$TAKO_BIN\" list\n", 0),
+        ("declare -x", "unset TAKO_SOCKET TAKO_PANE_ID\ndeclare -x TAKO_DATA_DIR=\"$T\"\n\"$TAKO_BIN\" list\n", 0),
+        ("HOME の代入（常に export 済み）", "unset TAKO_SOCKET TAKO_PANE_ID\nHOME=\"$T/h\"\n\"$TAKO_BIN\" list\n", 0),
+        ("行の前置きで HOME", "unset TAKO_SOCKET TAKO_PANE_ID\nHOME=\"$T/h\" \"$TAKO_BIN\" list\n", 0),
+        ("関数の中の前置き", "unset TAKO_SOCKET TAKO_PANE_ID\ntk() { TAKO_DATA_DIR=\"$D\" \"$TAKO_BIN\" \"$@\"; }\n", 0),
+        ("env -i の tako", "env -i PATH=/bin \"$TAKO_BIN\" list\n", 0),
+        ("tako の版の問い合わせ", "v=$(\"$TAKO_BIN\" --version)\n", 0),
+        ("パスを代入した変数の旧版", "unset TAKO_SOCKET TAKO_PANE_ID\nOLD=\"/Applications/tako.app/Contents/MacOS/tako\"\nh=\"$(\"$OLD\" file copy a b 2>&1)\"\n", 1),
+        ("既定値つきで代入した変数", "OLD_TAKO_BIN=\"${OLD_TAKO_BIN:-/Applications/tako.app/Contents/MacOS/tako}\"\nunset TAKO_SOCKET TAKO_PANE_ID\nexport TAKO_DATA_DIR=\"$T\"\n\"$OLD_TAKO_BIN\" list\n", 0),
+        ("tako 以外を代入した変数", "BIN=\"$T/fake-tool\"\n\"$BIN\" list\n", 0),
+        ("本番の順番待ち（宣言あり・同じ行）", "unset TAKO_SOCKET TAKO_PANE_ID\nQ=\"/Applications/tako.app/Contents/MacOS/tako\"\n\"$Q\" queue cargo test # tako:prod-ok 本番の順番待ちへ並ぶ\n", 0),
+        ("本番の順番待ち（宣言あり・直前の行）", "unset TAKO_SOCKET TAKO_PANE_ID\n# tako:prod-ok 本番の順番待ちへ並ぶ\n\"$TAKO_BIN\" queue cargo test\n", 0),
+        ("理由の無い宣言は効かない", "unset TAKO_SOCKET TAKO_PANE_ID\n\"$TAKO_BIN\" queue cargo test # tako:prod-ok\n", 1),
+        ("宣言は 2 行先まで効かない", "unset TAKO_SOCKET TAKO_PANE_ID\n# tako:prod-ok 本番の順番待ちへ並ぶ\n\n\"$TAKO_BIN\" queue cargo test\n", 1),
+        ("宣言でも env を落とす規則は外れない", "\"$TAKO_BIN\" queue cargo test # tako:prod-ok 本番の順番待ちへ並ぶ\n", 1),
         ("ソケットだけ落とした claude", "unset TAKO_SOCKET TAKO_PANE_ID\nclaude -p hi\n", 1),
         ("置換の中の claude", "out=\"$(CLAUDE_CONFIG_DIR=x claude plugin validate .)\"\n", 1),
         ("if の後の claude", "if claude -p hi >/dev/null; then :; fi\n", 1),
         ("env -i の claude", "env -i PATH=/bin claude -p hi\n", 0),
-        ("ペインへ送る文字列", "unset TAKO_SOCKET TAKO_PANE_ID\n\"$TAKO_BIN\" send --pane 1 \"claude --model haiku\"\n", 0),
+        ("ペインへ送る文字列", "unset TAKO_SOCKET TAKO_PANE_ID\nexport TAKO_DATA_DIR=\"$T\"\n\"$TAKO_BIN\" send --pane 1 \"claude --model haiku\"\n", 0),
         ("ヒアドキュメントの本文", "cat > f <<'EOF'\nclaude -p hi\n\"$TAKO_BIN\" list\nEOF\n", 0),
         ("在るかの確認", "command -v claude >/dev/null || exit 0\n", 0),
         ("版の問い合わせ", "v=$(claude --version 2>/dev/null)\n", 0),
@@ -868,7 +1029,7 @@ fn 走査は実際の持ち込みを検出する() {
         ("symlink で置いた実物", "ln -sf \"$(command -v claude)\" \"$BIN/claude\"\n\"$BIN/claude\" plugin list\n", 1),
         ("書き出した偽の claude", "cat > \"$BIN/claude\" <<'EOF'\nexit 0\nEOF\n\"$BIN/claude\" --warm\n", 0),
         ("配列の展開の後ろの claude", "env -u TAKO_SOCKET HOME=\"$H\" ${extra[@]+\"${extra[@]}\"} \"$BIN/claude\" plugin list\n", 1),
-        ("内側の印で分ける", "if [ -z \"${INNER:-}\" ]; then\n  unset TAKO_SOCKET TAKO_PANE_ID\n  exec cargo run -- bash \"$0\"\nfi\n\"$TAKO\" list\n", 0),
+        ("内側の印で分ける", "if [ -z \"${INNER:-}\" ]; then\n  unset TAKO_SOCKET TAKO_PANE_ID\n  export TAKO_DATA_DIR=\"$T\"\n  exec cargo run -- bash \"$0\"\nfi\n\"$TAKO\" list\n", 0),
         ("case のパターン", "case \"$a\" in\n  claude) echo c ;;\nesac\n", 0),
         ("引用符の中の説明", "echo \"claude を起こす\"\n", 0),
         ("算術", "n=$((n + 1))\n", 0),
@@ -891,6 +1052,16 @@ fn 走査は実際の持ち込みを検出する() {
     );
     let src = format!("unset {all}\nclaude -p hi\n");
     assert!(launch_violations("t.sh", &scan_script(&src)).is_empty());
+    // 発見の置き場の名指しは最初の行と件数（#2527）
+    let src =
+        "unset TAKO_SOCKET TAKO_PANE_ID\n\n\"$TAKO_BIN\" remote start\n\"$TAKO_BIN\" remote stop\n";
+    let got = launch_violations("t.sh", &scan_script(src));
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(
+        got[0].starts_with("t.sh:3: tako を起こす前に発見の置き場")
+            && got[0].contains("同じ形が 2 行"),
+        "{got:?}"
+    );
 }
 
 // ---- ヘルパの挙動（偽の GUI と偽の面の係で起こす。窓は出さない）------------------------

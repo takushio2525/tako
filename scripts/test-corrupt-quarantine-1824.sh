@@ -171,6 +171,7 @@ if [ "$ONLY" != cli ]; then
   echo
   echo "== ② layout.json を 2 回壊して開いても 1 回目の中身が残る（+ recent.json の記録） =="
   echo "   cargo test --test issue1824_corrupt_quarantine_ab（既定 → TAKO_1824_LEGACY=1 を 1 本で並べる）"
+  # tako:prod-ok 本番の順番待ち（#1994）へ並ぶのが目的 = 本番の GUI へ届くのが仕様
   out=$(cd "$REPO_ROOT" && "$QUEUE" queue cargo test -p tako-control --test issue1824_corrupt_quarantine_ab -- --nocapture 2>&1)
   grep '\[1824-ab\]' <<<"$out" | sed "s#/[^ ]*tako-1824-ab-#<tmp>/tako-1824-ab-#g; s/^/      /"
   if grep -q 'test result: ok. 1 passed' <<<"$out"; then
