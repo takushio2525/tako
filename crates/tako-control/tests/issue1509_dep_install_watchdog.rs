@@ -55,8 +55,8 @@ const ALLOWED_LAUNCH: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/tako-app/src/update_checker.rs",
-        "repair_brew",
-        "broken-brew（tako 自身の cask 台帳）の修復（#50）",
+        "repair_brew_typed",
+        "broken-brew（tako 自身の cask 台帳）の修復（#50。文を表示言語で組む型の口 = #2365）",
     ),
     (
         "crates/tako-app/src/update_checker.rs",

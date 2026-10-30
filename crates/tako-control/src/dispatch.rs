@@ -36540,8 +36540,14 @@ mod tests {
             .expect_err("上限を超えたプレビューは編集を始めない");
             refusals.push(err.to_string());
         }
+        // 断りの文は表示言語に従う（#2365）ので、日英どちらの正本の文とも突き合わせる
+        let over = Truncation::Lines {
+            lines: MAX_LINES + 1,
+        };
         assert!(
-            refusals[0].contains("100,001 行（上限 100,000 行）"),
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| refusals[0].contains(&over.edit_refusal_in(lang))),
             "断る文面に数えた行数と上限が載る: {}",
             refusals[0]
         );
@@ -36560,10 +36566,13 @@ mod tests {
         assert_eq!(status["limit"]["reason"], "lines");
         assert_eq!(status["limit"]["lines"], MAX_LINES + 1);
         assert_eq!(status["limit"]["max_lines"], MAX_LINES);
-        assert!(status["limit"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("100,001 行"));
+        let message = status["limit"]["message"].as_str().unwrap();
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| message == over.edit_refusal_in(lang)),
+            "{message}"
+        );
 
         // 上限の内側のプレビューは `limit` を載せない（無いことが「編集できる」の印）
         host.preview_limits.clear();
@@ -37459,7 +37468,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
         let msg = err.to_string();
-        assert!(msg.contains("打ち切った"), "{msg}");
+        // 打ち切りの文は表示言語に従う（#2365）ので、日英どちらの正本の文とも突き合わせる
+        let timed_out = tako_core::git::HistoryTimedOut {
+            step: "rev-parse --show-toplevel",
+            budget: std::time::Duration::from_millis(500),
+        };
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| msg.contains(&timed_out.text_in(lang))),
+            "{msg}"
+        );
         assert!(msg.contains("rev-parse"), "{msg}");
         assert!(
             !msg.contains("tako-2014-fifo"),
@@ -37687,7 +37706,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
         let msg = err.to_string();
-        assert!(msg.contains("打ち切った"), "{msg}");
+        let timed_out = tako_core::git::HistoryTimedOut {
+            step: "diff",
+            budget: std::time::Duration::from_millis(500),
+        };
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| msg.contains(&timed_out.text_in(lang))),
+            "{msg}"
+        );
         assert!(msg.contains("`git diff`"), "{msg}");
         assert!(
             !msg.contains("tako-2150-fifo"),
