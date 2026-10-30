@@ -5,18 +5,15 @@
 //! 実 PTY で測る。#946 が疑った壊れ方（tako-app を起こした親の TERM がペインへ
 //! 素通しになる）は、このテストが `TAKO_946_INJECT=inherit` で再現できる。
 //!
-//! **このテストはプロセス env（TERM / COLORTERM）を書き換える**ので、専用の
-//! 統合テストバイナリに 1 本だけ置き、親 TERM の系統は 1 つの test 関数の中で
-//! 順に回す（同じバイナリに別のテストを足さないこと）。
+//! **このテストはプロセス env（TERM / COLORTERM）を書き換える**ので、どのテストも
+//! `run_alone!` の子（その 1 本だけが走るテストプロセス）の中で書き換える（#2525）。
+//! ペインはその子のプロセスから起きるので、「ペインが親の env を継ぐか」はそのまま測れる。
+//! 親のプロセスで書き換えて手で戻すと、間で落ちたとき同じバイナリの後のテストが
+//! 書き換えた値（`TAKO_946_INJECT=inherit` など）のまま走って連鎖で落ちる。
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tako_core::terminal::{SpawnCommand, SpawnOptions, TerminalSession};
-
-/// プロセス env を触る検査は直列化する（同じバイナリの 2 本が並走すると
-/// 互いの親 env を踏む）
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// 1 系統あたりの観測上限。`/bin/sh -c echo` が 1 行出すだけなので実測は数十 ms。
 /// 混んだ機でも足りるように広く採る（状態待ちなので空いていれば即返る）
@@ -69,14 +66,10 @@ fn observe_termchk() -> String {
     }
 }
 
-/// 親プロセスの TERM / COLORTERM を差し替えて 1 系統を測る
-// tako:env-write-ok このバイナリの 2 本はどちらも ENV_LOCK を取ってから親の env を差し替える（ペインが親の env を継ぐことを測るので、子へ値だけ渡す形にできない。#2400）
-fn with_parent_env(
-    term: Option<&str>,
-    colorterm: Option<&str>,
-    f: impl FnOnce() -> String,
-) -> String {
-    let (old_term, old_color) = (std::env::var_os("TERM"), std::env::var_os("COLORTERM"));
+/// ペインを起こすプロセス（`run_alone!` の子）の TERM / COLORTERM を差し替える。
+/// 子が終われば消えるので戻さない（系統を回すときは毎回両方を書き直す）
+fn set_parent_env(term: Option<&str>, colorterm: Option<&str>) {
+    tako_core::test_child::assert_alone("set_parent_env");
     match term {
         Some(v) => std::env::set_var("TERM", v),
         None => std::env::remove_var("TERM"),
@@ -85,16 +78,6 @@ fn with_parent_env(
         Some(v) => std::env::set_var("COLORTERM", v),
         None => std::env::remove_var("COLORTERM"),
     }
-    let out = f();
-    match old_term {
-        Some(v) => std::env::set_var("TERM", v),
-        None => std::env::remove_var("TERM"),
-    }
-    match old_color {
-        Some(v) => std::env::set_var("COLORTERM", v),
-        None => std::env::remove_var("COLORTERM"),
-    }
-    out
 }
 
 /// #946: ペインの端末申告は**親プロセスが何を名乗っていても**同じ。
@@ -104,7 +87,9 @@ fn with_parent_env(
 #[test]
 #[cfg(unix)]
 fn ペインのtermは親プロセスに依らない() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if tako_core::run_alone!(ペインのtermは親プロセスに依らない) {
+        return;
+    }
     let expected = tako_core::terminal::expected_termchk();
     for (term, colorterm) in [
         (Some("tmux-256color"), Some("truecolor")), // #946 が踏んだ形
@@ -114,7 +99,8 @@ fn ペインのtermは親プロセスに依らない() {
         (Some("xterm-256color"), Some("truecolor")), // 既定値そのもの
         (None, None),                                // .app（Finder 起動）相当
     ] {
-        let observed = with_parent_env(term, colorterm, observe_termchk);
+        set_parent_env(term, colorterm);
+        let observed = observe_termchk();
         assert_eq!(
             observed, expected,
             "親 TERM={term:?} COLORTERM={colorterm:?} でペインの申告が変わった"
@@ -128,12 +114,13 @@ fn ペインのtermは親プロセスに依らない() {
 /// **注入が効いているから通っている**ことをこのアームが示す
 #[test]
 #[cfg(unix)]
-// tako:env-write-ok このバイナリの 2 本はどちらも ENV_LOCK を取ってから親の env を差し替える（ペインが親の env を継ぐことを測るので、子へ値だけ渡す形にできない。#2400）
 fn 注入を外すと親のtermがペインへ素通しになる() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("TAKO_946_INJECT", "inherit");
-    let observed = with_parent_env(Some("tmux-256color"), Some("truecolor"), observe_termchk);
-    std::env::remove_var("TAKO_946_INJECT");
+    if tako_core::run_alone!(注入を外すと親のtermがペインへ素通しになる) {
+        return;
+    }
+    std::env::set_var("TAKO_946_INJECT", "inherit"); // 子の中だけ（他のテストは居ない）
+    set_parent_env(Some("tmux-256color"), Some("truecolor"));
+    let observed = observe_termchk();
     assert_eq!(
         observed, "tmux-256color,truecolor",
         "注入を外しても親の TERM が届いていない（注入口が効いていない）"

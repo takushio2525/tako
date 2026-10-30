@@ -42,7 +42,9 @@ const LIMIT: Duration = Duration::from_secs(30);
 /// まとめ送りの上限の 2 倍（旧腕で「待っても直らない」を見る・アイドルの区切り）
 const MAX_DELAY_2X: Duration = Duration::from_secs(2);
 
-/// A/B の env（`TAKO_2034_LEGACY`）を触るので、このファイルのテストは 1 本ずつ走る。
+/// このファイルのテストは 1 本ずつ走る。A/B の env（`TAKO_2034_LEGACY`）は旧腕を測るテストが
+/// `run_alone!` の子の中だけで立てる（親で立てると、戻す前に落ちたとき同じバイナリの後の新腕の
+/// テストが旧腕で走って連鎖で落ちる。#2525）。
 /// 新腕のテストは env に触らない = `TAKO_2034_LEGACY=1 cargo test …` で回すと名指しで落ちる（検出力の確認）
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -448,12 +450,12 @@ fn git_checkout_相当の差し替えを種別つきで知らせる() {
 /// 受け入れ条件 2（A/B）: 旧腕（`TAKO_2034_LEGACY=1`）は申告せず、登録を受けても見ない =
 /// 外で整形した後も古い行で答え、tako がディスクから読む抜粋は別の行（= 位置がずれる）
 #[test]
-// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 旧腕では外で整形した後も古い位置のまま() {
     let _serial = serial();
-    // 外から渡された A/B の値は終わったら戻す（`TAKO_2034_LEGACY=1` で全体を回すと新腕のテストが落ちる）
-    let outer = std::env::var_os("TAKO_2034_LEGACY");
-    std::env::set_var("TAKO_2034_LEGACY", "1");
+    if tako_core::run_alone!(旧腕では外で整形した後も古い位置のまま) {
+        return;
+    }
+    std::env::set_var("TAKO_2034_LEGACY", "1"); // 子の中だけ（他のテストは居ない）
     let scratch = Scratch::new("legacy");
     let main = scratch.write("src/main.rs", MAIN);
     scratch.write("src/lib.rs", LIB);
@@ -478,10 +480,6 @@ fn 旧腕では外で整形した後も古い位置のまま() {
     // 偽サーバは申告に関係なく登録を送る。旧腕は受けても見ない（登録の返事は null のまま）
     let watch = status(&manager)["file_watch"].clone();
     let registrations = server(&manager)["watched_files"]["registrations"].clone();
-    match outer {
-        Some(value) => std::env::set_var("TAKO_2034_LEGACY", value),
-        None => std::env::remove_var("TAKO_2034_LEGACY"),
-    }
     // workspace には #1686 の名前の変更の答えの受け方（workspaceEdit）が載るので、監視の申告だけを見る
     assert_eq!(
         declared["didChangeWatchedFiles"],
@@ -651,17 +649,20 @@ fn アイドルでは何も送らない() {
 /// 知らせるので整形後の行（tako の GUI は文書を実パスで開くので、この差は根がリンクを通る経路でだけ出る）
 #[test]
 #[ignore = "実の rust-analyzer が要る（TAKO_2034_REAL_RA）"]
-// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 実の_rust_analyzer_でリンクを通る根でも整形後の行で返る() {
     let _serial = serial();
     let Some(ra) = std::env::var_os("TAKO_2034_REAL_RA") else {
         eprintln!("TAKO_2034_REAL_RA が無いので測らない");
         return;
     };
+    if tako_core::run_alone!(実の_rust_analyzer_でリンクを通る根でも整形後の行で返る)
+    {
+        return;
+    }
     let ra = ra.to_string_lossy().into_owned();
-    let outer = std::env::var_os("TAKO_2034_LEGACY");
     let mut lines = Vec::new();
     for legacy in [false, true] {
+        // 子の中だけ（他のテストは居ない）
         if legacy {
             std::env::set_var("TAKO_2034_LEGACY", "1");
         } else {
@@ -737,10 +738,6 @@ fn 実の_rust_analyzer_でリンクを通る根でも整形後の行で返る()
             status(&manager)["file_watch"]["active"].clone(),
         ));
         manager.stop(None);
-    }
-    match outer {
-        Some(value) => std::env::set_var("TAKO_2034_LEGACY", value),
-        None => std::env::remove_var("TAKO_2034_LEGACY"),
     }
     eprintln!("実の rust-analyzer（legacy, util.rs の行, 監視）: {lines:?}");
     assert_eq!(lines[0].1, Some(3), "新腕: 整形後の行（{lines:?}）");

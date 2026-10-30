@@ -11,7 +11,8 @@
 //! 終わりはテストが決め（`--loading-until`）、読み込み中のサーバへ送る要求は manager が読み込み中と
 //! 知ってから送る（偽サーバは知らせを `READY_POLL` より遅らせて送る = 待たずに送れば必ず落ちる
 //! 順序をどの機でも演じる）。どちらも `common/lsp_fake_e2e.rs`（#1922）。
-//! env を読む A/B があるので、このファイルのテストは [`ENV_LOCK`] で 1 本ずつ走る。
+//! このファイルのテストは [`ENV_LOCK`] で 1 本ずつ走る。A/B の env（`TAKO_1893_LEGACY`）は旧挙動の
+//! テストが `run_alone!` の子の中だけで立てる（#2525）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +37,9 @@ use lsp_fake_e2e::LoadingGate;
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
-/// env（`TAKO_1893_LEGACY`）を触るテストがあるので、このファイルのテストは 1 本ずつ
+/// このファイルのテストは 1 本ずつ走る。A/B の env（`TAKO_1893_LEGACY`）は旧挙動のテストが
+/// `run_alone!` の子の中だけで立てる（親で立てると、戻す前に落ちたとき同じバイナリの後のテストが
+/// 旧挙動で走って連鎖で落ちる。#2525）
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -356,14 +359,18 @@ fn 読み込みが終わらなければ上限で_loading_を返す() {
 /// A/B: `TAKO_1893_LEGACY=1` のマウスの要求は #1893 の前 = 読み込み中の `null` で待たずに空で終わる
 /// （明示の要求は #1681 から待つので変わらない）。新しい検査はこの腕で名指しで落ちる
 #[test]
-// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 旧挙動のマウスの要求は読み込みを待たずに空で終わる() {
     let _env = serial();
+    if tako_core::run_alone!(旧挙動のマウスの要求は読み込みを待たずに空で終わる)
+    {
+        return;
+    }
     let scratch = Scratch::new("legacy");
     let main = scratch.write("src/main.rs", TEXT);
     let manager = LspManager::new(config(&scratch, "loading", &rules(false)));
     let _link = open_editing(&manager, &main);
     lsp_fake_e2e::wait_loading_known(&manager);
+    // 子の中だけ（他のテストは居ない）。後半の新しい挙動を同じサーバで見るので下ろす
     std::env::set_var("TAKO_1893_LEGACY", "1");
     let legacy = manager.hover(&mouse(&main, Duration::from_secs(10)));
     std::env::remove_var("TAKO_1893_LEGACY");
