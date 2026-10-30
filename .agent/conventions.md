@@ -2303,7 +2303,11 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     rc を読まない `/bin/sh -c` で起こす口 `FetchConfig::plain_shell`（既定 `None` = 本番のまま）を
     通し、initialize の上限は本番の既定（`DEFAULT_REQUEST_TIMEOUT`）に揃える。A/B は
     `TAKO_2509_LEGACY=1`、注入は外から `SHELL` を「rc が stdout を握った子で止まる」偽のシェルへ。
-    番犬は `issue1944_lsp_fetch_watchdog`（e2e の `manager()` と本番の `from_env` / `plan_for`）
+    番犬は `issue1944_lsp_fetch_watchdog`（e2e の `manager()` と本番の `from_env` / `plan_for`）。
+    取得つきの manager を作る e2e は**ファイルごとに 1 つの helper で作り、そこで口と上限を渡す**
+    （#1944 `manager()` / #1977 `managed_manager()` / #1956 `fetch_manager()`。#2514）。番犬は
+    helper の外の `LspManager::with_fetch(` も名指すので、取得つきの e2e を足すときは helper を通すか
+    `FETCH_MANAGER_HELPERS` へ足す
 - **background の重い処理の戻りを回数の窓で待たない**（#1890）。visual-test 節
   `large-file-decor` / `large-file-edit`（#1660）は、読み取り表示の塗りと編集開始の全文の塗り
   （どちらも background の syntect）を `for _ in 0..3000 { 10ms 待って描く }` / `0..6000` で

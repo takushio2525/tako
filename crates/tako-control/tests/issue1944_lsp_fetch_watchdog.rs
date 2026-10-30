@@ -25,6 +25,9 @@
 //! - 取ってきたサーバは本番ではログインシェルで起こし、rc を読まない口（`plain_shell`）は e2e だけが
 //!   使う。e2e は開発者の rc を経由させず、initialize を本番の既定より短い実時間で切らない（#2509:
 //!   rc の `pyenv rehash` のロック待ちで、全体実行でだけ 4 件が `starting` のまま落ちた）
+//! - 同じ約束を取得つきの manager を作る e2e の 3 本（#1944 / #1977 / #1956）すべてに効かせる。
+//!   取得つきの manager（`LspManager::with_fetch`）は e2e ごとに 1 つの helper の中だけで作り、
+//!   helper の外で作ったら名指す（新しいテストが口を通らずに作る形 = #2514）
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -54,8 +57,26 @@ const CORE_FETCH: &str = "crates/tako-core/src/lsp/fetch.rs";
 const ARCHIVE: &str = "crates/tako-control/src/lsp/archive.rs";
 const APP: &str = "crates/tako-app/src/main.rs";
 const E2E: &str = "crates/tako-control/tests/issue1944_lsp_fetch.rs";
+const E2E_1977: &str = "crates/tako-control/tests/issue1977_lsp_install_followup.rs";
+const E2E_1956: &str = "crates/tako-control/tests/issue1956_lsp_servers_wave2.rs";
 
-const FILES: &[&str] = &[FETCH, MANAGER, GUI, CORE_FETCH, ARCHIVE, APP, E2E];
+const FILES: &[&str] = &[
+    FETCH, MANAGER, GUI, CORE_FETCH, ARCHIVE, APP, E2E, E2E_1977, E2E_1956,
+];
+
+/// 取得つきの manager（`LspManager::with_fetch(`）を作ってよい場所: e2e ごとに 1 つの helper
+/// （そこで rc を読まない口と本番の既定の上限を渡す = [`RULES`] が縛る。#2514）
+const FETCH_MANAGER_HELPERS: &[(&str, &str)] = &[
+    (E2E, "fn manager("),
+    (E2E_1977, "fn managed_manager("),
+    (E2E_1956, "fn fetch_manager("),
+];
+
+/// #1977 / #1956 の e2e の helper の規則の理由（#1944 の e2e と同じ約束。#2514）
+const E2E_LOGIN_SHELL_WHY: &str =
+    "e2e が取ってきた / 置き場のサーバを開発者のログインシェル（rc の \
+     `pyenv rehash` はロックを最大 60 秒待ち、サーバの stdout を握ったまま残る）を通って起こす / \
+     initialize を本番の既定より短い実時間で切る（#2509 と同型。#2514）";
 
 /// 導入器を起こす値（LSP のモジュールの文字列リテラルに現れてはいけない）
 const INSTALLERS: &[&str] = &[
@@ -188,6 +209,22 @@ const RULES: &[Rule] = &[
               だけ取ってきた 4 件が `starting` のまま落ちた形に戻る）",
     },
     Rule {
+        file: E2E_1977,
+        decl: "fn managed_manager(",
+        must: &["fetch.plain_shell = Some(", "DEFAULT_REQUEST_TIMEOUT"],
+        must_not: &[],
+        order: &[],
+        why: E2E_LOGIN_SHELL_WHY,
+    },
+    Rule {
+        file: E2E_1956,
+        decl: "fn fetch_manager(",
+        must: &["fetch.plain_shell = Some(", "DEFAULT_REQUEST_TIMEOUT"],
+        must_not: &[],
+        order: &[],
+        why: E2E_LOGIN_SHELL_WHY,
+    },
+    Rule {
         file: MANAGER,
         decl: "    fn run_start(&self, key: &ServerKey, generation: u64) {",
         must: &["missing => match self.start_managed("],
@@ -281,6 +318,29 @@ fn installer_literals(file: &str, src: &str) -> Vec<String> {
     out
 }
 
+/// e2e の `file` で、取得つきの manager を helper `decl` の外で作っている行を名指す（helper の中の
+/// 口を通らない = 開発者のログインシェルで起こす。#2514）
+fn with_fetch_outside_helper(file: &str, src: &str, decl: &str) -> Vec<String> {
+    let Some((at, window)) = fn_window(src, decl) else {
+        return vec![format!(
+            "{file}:0 — `{decl}` が見つからない（走査が空振り）"
+        )];
+    };
+    let end = at + window.lines().count() - 1;
+    code_only(src)
+        .lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l))
+        .filter(|(n, l)| l.contains("LspManager::with_fetch(") && !(at..=end).contains(n))
+        .map(|(n, _)| {
+            format!(
+                "{file}:{n} — e2e が取得つきの manager を `{decl}` の外で作る（rc を読まない口 \
+                 `plain_shell` と本番の既定の上限を通らず、開発者のログインシェルで起こす = #2509 / #2514）"
+            )
+        })
+        .collect()
+}
+
 /// `file:line — 理由` の一覧（違反が無ければ空）
 fn scan(sources: &[(&'static str, String)]) -> Vec<String> {
     let src_of = |file: &str| &sources.iter().find(|(f, _)| *f == file).unwrap().1;
@@ -326,6 +386,9 @@ fn scan(sources: &[(&'static str, String)]) -> Vec<String> {
     for file in [FETCH, MANAGER, GUI, CORE_FETCH, ARCHIVE] {
         out.extend(installer_literals(file, src_of(file)));
     }
+    for (file, decl) in FETCH_MANAGER_HELPERS {
+        out.extend(with_fetch_outside_helper(file, src_of(file), decl));
+    }
     out
 }
 
@@ -351,6 +414,16 @@ fn 走査が空振りしていない() {
             "{}: `{}` の窓が短すぎる",
             rule.file,
             rule.decl
+        );
+    }
+    // helper の外の走査（#2514）は、helper 自身が取得つきの manager を作っていてこそ意味がある
+    for (file, decl) in FETCH_MANAGER_HELPERS {
+        let src = &sources.iter().find(|(f, _)| f == file).unwrap().1;
+        let (_, window) =
+            fn_window(src, decl).unwrap_or_else(|| panic!("{file}: `{decl}` の窓が採れない"));
+        assert!(
+            code_only(&window).contains("LspManager::with_fetch("),
+            "{file}: `{decl}` が取得つきの manager を作っていない（helper の外の走査が空振り）"
         );
     }
 }
@@ -518,6 +591,46 @@ fn 逆戻りを名指しできる() {
             "        None => None,",
         ),
         "fn plan_for(",
+    );
+    // P. #1977 の e2e を開発者のログインシェルへ戻す（#2514 の直す前）
+    assert_named(
+        "P 1977 の e2e がログインシェルを通る",
+        E2E_1977,
+        (
+            "        fetch.plain_shell = Some(\"/bin/sh\".to_string());\n",
+            "",
+        ),
+        "fn managed_manager(",
+    );
+    // Q. #1956 の e2e を開発者のログインシェルへ戻す（#2514 の直す前）
+    assert_named(
+        "Q 1956 の e2e がログインシェルを通る",
+        E2E_1956,
+        (
+            "        fetch.plain_shell = Some(\"/bin/sh\".to_string());\n",
+            "",
+        ),
+        "fn fetch_manager(",
+    );
+    // R. #1956 の e2e が helper を通らずに取得つきの manager を作る（#2514 の直す前の形）
+    assert_named(
+        "R 1956 の e2e が helper を迂回",
+        E2E_1956,
+        (
+            "    let (manager, fetch) = fetch_manager(config, root.clone(), origin.base.clone());",
+            "    let fetch = FetchConfig::with_root(root.clone(), Some(origin.base.clone()));\n    let manager = LspManager::with_fetch(config, Some(fetch.clone()));",
+        ),
+        "let manager = LspManager::with_fetch(config, Some(fetch.clone()));",
+    );
+    // S. #1977 の e2e の initialize を 10 秒で切る（#2514 の直す前）
+    assert_named(
+        "S 1977 の e2e の上限を縮める",
+        E2E_1977,
+        (
+            "            DEFAULT_REQUEST_TIMEOUT\n",
+            "            Duration::from_secs(10)\n",
+        ),
+        "fn managed_manager(",
     );
     // J. グローバルの npm を起こす
     assert_named(

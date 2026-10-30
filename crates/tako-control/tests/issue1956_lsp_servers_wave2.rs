@@ -14,6 +14,12 @@
 //! 実のサーバでの確認（波線・ホバー・常駐・起動時間・実の配布元からの取得）は
 //! `scripts/test-lsp-servers-1956.sh`（隔離 GUI）。候補の比較と採った順は
 //! `.agent/plans/2026-10-language-coverage.md` §8。
+//!
+//! 取得つきの manager は `fetch_manager` の 1 か所で作り、取ってきたサーバは開発者のログインシェル
+//! （rc）を経由させずに起こす（`FetchConfig::plain_shell`・initialize の上限は本番の既定。#2509 /
+//! #2514）。いまの 2 本は取得を必ず失敗させるので起こすまで届かない（rc が stdout を握る偽の
+//! `SHELL` を注入しても結果は変わらない = 実測）。取れる検証を足したときに rc の `pyenv rehash` 等へ
+//! 起動を左右されないための先回り。A/B は `TAKO_2509_LEGACY=1`
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tako_control::lsp::fetch::FetchConfig;
-use tako_control::lsp::manager::DEFAULT_IDLE_GRACE;
+use tako_control::lsp::manager::{DEFAULT_IDLE_GRACE, DEFAULT_REQUEST_TIMEOUT};
 use tako_control::lsp::{DocLink, Launch, LspConfig, LspManager};
 use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
@@ -115,6 +121,29 @@ fn config(scratch: &Scratch, asked: Arc<Mutex<Vec<String>>>) -> LspConfig {
         },
         raw_log_dir: None,
     }
+}
+
+/// A/B（#2509 / #2514）: 直す前の設定（開発者のログインシェルで起こし、initialize を 10 秒で切る）
+fn legacy_2509() -> bool {
+    matches!(
+        std::env::var("TAKO_2509_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// 取得つきの manager と、その取得の設定（配布元は `base`）。取ってきたサーバは同じシェル片を rc を
+/// 読まない `/bin/sh -c` で起こし、initialize の上限は本番の既定に揃える（冒頭の #2514。Windows は
+/// シェルを見ない）
+fn fetch_manager(mut config: LspConfig, root: PathBuf, base: String) -> (LspManager, FetchConfig) {
+    let legacy = legacy_2509();
+    if !legacy {
+        config.request_timeout = DEFAULT_REQUEST_TIMEOUT;
+    }
+    let mut fetch = FetchConfig::with_root(root, Some(base));
+    if cfg!(unix) && !legacy {
+        fetch.plain_shell = Some("/bin/sh".to_string());
+    }
+    (LspManager::with_fetch(config, Some(fetch.clone())), fetch)
 }
 
 fn received(scratch: &Scratch) -> Vec<Value> {
@@ -236,8 +265,7 @@ fn 未導入なら取れる行は取得に失敗した理由へ_取れない行�
         override_env: None,
     });
     let root = scratch.path("lsp-servers");
-    let fetch = FetchConfig::with_root(root.clone(), Some(origin.base.clone()));
-    let manager = LspManager::with_fetch(config, Some(fetch.clone()));
+    let (manager, fetch) = fetch_manager(config, root.clone(), origin.base.clone());
     let mut links = Vec::new();
     for spec in wave2() {
         let ext = spec.documents[0].extension;
@@ -427,11 +455,11 @@ fn 確かめに落ちた後に取得も失敗したら理由と導入コマン�
         program_path: format!("/opt/old/{}", spec.program),
         detail: "error: unexpected argument '--version' found".to_string(),
     });
-    let fetch = FetchConfig::with_root(
+    let (manager, _) = fetch_manager(
+        config,
         scratch.path("lsp-servers"),
-        Some(format!("http://127.0.0.1:{}", offline.port)),
+        format!("http://127.0.0.1:{}", offline.port),
     );
-    let manager = LspManager::with_fetch(config, Some(fetch));
     let spec = servers::find_in(servers::SERVERS, "texlab").unwrap();
     let path = scratch.file("doc/report.tex", "\\begin{document}\n");
     let mut link = DocLink::default();
