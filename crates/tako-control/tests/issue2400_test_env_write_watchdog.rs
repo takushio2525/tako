@@ -27,11 +27,24 @@
 //! コメントと文字列の中（他の番犬の注入用の断片や説明文）は数えない（`code_view` で潰す）。
 //! 製品のコード（`TAKO_SELF_TEST` のセルフテスト・visual-test を含む）は見ない（範囲外。#2400）。
 //!
+//! ## 目印で通しても、手で戻す対は落とす（#2520）
+//!
+//! 3 の目印の理由「全テストが同じロックで 1 本ずつ走る」は**並走**の話で、書き換えた後に
+//! **同じ関数の中で手で戻す**形（`set_var(K, ..)` … `remove_var(K)`）は、間で panic すると戻らない。
+//! ロックは毒になっても次のテストが取るので、同じバイナリで後に走るテストが書き換えた値を読んで
+//! 連鎖で落ち、本当の失敗を隠す（実物: `issue1977_lsp_install_followup` の旧腕が `TAKO_1977_LEGACY=1` を
+//! 残し、後の 2 本が旧腕で走って落ちた）。目印で通した書き換えのうち、いちばん内側の同じ関数の中で
+//! 同じ env を `;` を挟んで書き直すもの（`match` の腕どうしの `set_var` / `remove_var` は 1 つの書き換え）を
+//! `file:line` で落とす。`Drop` の中で戻す形は書き換えと関数が分かれるので落とさない（panic でも走る）。
+//! 既にある同じ形は [`KNOWN_RESTORE_PAIRS`] に件数と理由で載せ、増えても減っても落とす。
+//!
 //! ## 見逃す側へ倒れないための作り
 //!
 //! [`走査が空振りしていない`] で列挙と分類が実ファイルで生きていることを、
 //! [`注入した書き換えを名指しする`] で実ファイルへの注入（入口の無い書き換え・2 本目のテスト・
-//! 理由の無い目印・入口より前の書き換え）が `file:line` で名指しされることを確かめる。
+//! 理由の無い目印・入口より前の書き換え・目印つきの手で戻す対）が `file:line` で名指しされることを
+//! 確かめる（一覧の件数のずれ = 増えた・減った・無くなったも）。[`KNOWN_RESTORE_PAIRS`] の件数の一致は、
+//! 手で戻す対の判定が実ファイルで生きている証拠を兼ねる。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -54,6 +67,41 @@ const GUARDS: &[&str] = &[
 
 /// 理由つきで通す目印
 const MARKER: &str = "tako:env-write-ok";
+
+/// 目印で通した書き換えを同じ関数の中で手で戻す対が既にあるファイルと、その中の対の数・理由
+/// （#2520。増えても減っても落とす = 直したら件数を下げるか行を消す）
+const KNOWN_RESTORE_PAIRS: &[(&str, usize, &str)] = &[
+    (
+        "crates/tako-control/tests/issue1893_lsp_hover_followup.rs",
+        1,
+        "#2525 で子の中へ寄せる残り（`TAKO_1893_LEGACY`）",
+    ),
+    (
+        "crates/tako-control/tests/issue1909_lsp_completion_ticket.rs",
+        1,
+        "#2525 で子の中へ寄せる残り（`TAKO_1909_INJECT_HOLD`）",
+    ),
+    (
+        "crates/tako-control/tests/issue2034_lsp_watched_files.rs",
+        2,
+        "#2525 で子の中へ寄せる残り（`TAKO_2034_LEGACY`。1 つは `#[ignore]` の実測用）",
+    ),
+    (
+        "crates/tako-control/tests/lid_residual_windows.rs",
+        4,
+        "#2525 で子の中へ寄せる残り（`TAKO_DATA_DIR`。`#![cfg(windows)]`）",
+    ),
+    (
+        "crates/tako-core/tests/pane_term_env.rs",
+        3,
+        "#2525 の残り（`TERM` / `COLORTERM` はペインが親の env を継ぐことを測るので親で書く = `Drop` で戻す形へ）",
+    ),
+    (
+        "crates/tako-core/tests/issue2092_pin_hold.rs",
+        1,
+        "漏れない: 全テストが頭で通す `serial()` が `ENV_KEYS` を消すので、間で panic して残っても次のテストの頭で消える",
+    ),
+];
 
 /// どこのコードか
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +128,8 @@ enum Pass {
 struct Scan {
     violations: Vec<String>,
     passed: BTreeMap<Pass, usize>,
+    /// 目印で通した書き換えを手で戻す対（ファイル → (書き換えの行, env の第 1 引数)。#2520）
+    restore_pairs: BTreeMap<String, Vec<(usize, String)>>,
 }
 
 impl Scan {
@@ -207,6 +257,8 @@ fn scan_file(rel: &str, raw: &str, kind: Kind, scan: &mut Scan) {
     let single_test_binary = kind == Kind::Integration
         && region.matches("#[test]").count() + region.matches("#[tokio::test").count() == 1;
     let ranges = fn_ranges(&region);
+    // 目印で通した書き換え（位置, いちばん内側の関数の頭, env の第 1 引数）
+    let mut marked: Vec<(usize, Option<usize>, String)> = Vec::new();
     for needle in NEEDLES {
         for (at, _) in region.match_indices(needle) {
             if at > 0 && is_ident_byte(region.as_bytes()[at - 1]) {
@@ -229,13 +281,17 @@ fn scan_file(rel: &str, raw: &str, kind: Kind, scan: &mut Scan) {
                     continue;
                 }
             }
+            let arg = first_arg(raw, at, needle);
             if has_marker(raw, at, outer.map(|(h, _)| h)) {
                 *scan.passed.entry(Pass::Marked).or_default() += 1;
+                let inner = ranges
+                    .iter()
+                    .filter(|(h, e)| *h <= at && at <= *e)
+                    .max_by_key(|(h, _)| *h)
+                    .map(|(h, _)| *h);
+                marked.push((at, inner, arg.to_string()));
                 continue;
             }
-            let rest = &raw[at + needle.len()..];
-            // 第 1 引数（区切りは ASCII なので文字境界。固定幅では切らない = #2043）
-            let arg = rest[..rest.find([',', ')', '\n']).unwrap_or(rest.len())].trim();
             scan.violations.push(format!(
                 "{rel}:{}: テストがプロセスの env を書き換えている（{needle}{arg}…）。env はプロセスに 1 つで、\
                  同じテストバイナリの中で並走する他のテストが同じ値を読む（#2400）。\
@@ -246,6 +302,91 @@ fn scan_file(rel: &str, raw: &str, kind: Kind, scan: &mut Scan) {
             ));
         }
     }
+    let pairs = hand_restores(&region, marked);
+    if !pairs.is_empty() {
+        scan.restore_pairs
+            .entry(rel.to_string())
+            .or_default()
+            .extend(pairs.into_iter().map(|(at, key)| (line_of(raw, at), key)));
+    }
+}
+
+/// 書き換えの第 1 引数（env の名前の式）。区切りは ASCII なので文字境界（固定幅では切らない = #2043）
+fn first_arg<'a>(raw: &'a str, at: usize, needle: &str) -> &'a str {
+    let rest = raw[at + needle.len()..].trim_start();
+    rest[..rest.find([',', ')', '\n']).unwrap_or(rest.len())].trim()
+}
+
+/// 目印で通した書き換えのうち、いちばん内側の同じ関数の中で同じ env を `;` を挟んで後から
+/// 書き直すもの（手で戻す対。#2520）を、対ごとに最初の書き換えの位置と env で返す。
+/// `match` の腕どうし（`Some(v) => set_var(K, v), None => remove_var(K)`）は `;` を挟まないので
+/// 1 つの書き換え。`Drop` の中で戻す形は書き換えと関数が分かれるので対にならない
+fn hand_restores(
+    region: &str,
+    mut marked: Vec<(usize, Option<usize>, String)>,
+) -> Vec<(usize, String)> {
+    marked.sort_by_key(|(at, _, _)| *at);
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut paired: Vec<(usize, &str)> = Vec::new();
+    for (i, (at, inner, key)) in marked.iter().enumerate() {
+        let Some(inner) = *inner else {
+            continue;
+        };
+        if paired.contains(&(inner, key.as_str())) {
+            continue;
+        }
+        let restored = marked[i + 1..]
+            .iter()
+            .any(|(later, later_inner, later_key)| {
+                *later_inner == Some(inner) && later_key == key && region[*at..*later].contains(';')
+            });
+        if restored {
+            paired.push((inner, key));
+            out.push((*at, key.clone()));
+        }
+    }
+    out
+}
+
+/// 手で戻す対の判定（#2520）。`known`（本番は [`KNOWN_RESTORE_PAIRS`]）に無いファイルの対は 1 つずつ
+/// `file:line` で、載っているファイルは対の数が宣言と違えば対の行を並べて落とす。宣言したファイルの
+/// 対が無くなったことは全ファイルを見た走査（`whole`）でだけ落とす
+fn restore_findings(scan: &Scan, known: &[(&str, usize, &str)], whole: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    for (rel, pairs) in &scan.restore_pairs {
+        if known.iter().any(|(f, _, _)| f == rel) {
+            continue;
+        }
+        for (line, key) in pairs {
+            out.push(format!(
+                "{rel}:{line}: テストが env（{key}）を書き換え、同じ関数の中で手で戻している。間で panic すると\
+                 戻らず、同じテストバイナリで後に走るテストが書き換えた値を読んで連鎖で落ちる（#2520。目印の\
+                 「1 本ずつ走る」は並走を防ぐだけで、この漏れは防がない）。\
+                 → テストの頭で `if tako_core::run_alone!(<テスト名>) {{ return; }}` を通して子の中で書く\
+                 （戻しは要らない）か、製品の関数へ値を引数で渡す。親で書くしかないなら `Drop` で戻す（panic でも走る）"
+            ));
+        }
+    }
+    for (file, want, why) in known {
+        let pairs = scan.restore_pairs.get(*file);
+        if pairs.is_none() && !whole {
+            continue;
+        }
+        let got = pairs.map_or(0, Vec::len);
+        if got != *want {
+            let lines: Vec<String> = pairs
+                .into_iter()
+                .flatten()
+                .map(|(line, key)| format!("{file}:{line}（{key}）"))
+                .collect();
+            out.push(format!(
+                "{file}: 目印つきで手で戻す対が {got} 件（宣言は {want} 件。理由: {why}）。\
+                 増えたなら子の中で書く（`run_alone!`）、減ったなら KNOWN_RESTORE_PAIRS を直す: {}",
+                lines.join(" / ")
+            ));
+        }
+    }
+    out
 }
 
 /// `crates/*/tests` の `.rs` を（リポジトリルートからの相対パス, 置き場）で列挙する
@@ -316,6 +457,13 @@ fn scan_repo() -> (Scan, usize) {
 fn テストはプロセスのenvを書き換えて並走するテストへ漏らさない() {
     let (scan, _) = scan_repo();
     assert!(scan.violations.is_empty(), "{}", scan.violations.join("\n"));
+}
+
+#[test]
+fn 目印で通した書き換えを手で戻して後のテストへ漏らさない() {
+    let (scan, _) = scan_repo();
+    let found = restore_findings(&scan, KNOWN_RESTORE_PAIRS, true);
+    assert!(found.is_empty(), "{}", found.join("\n"));
 }
 
 #[test]
@@ -436,5 +584,102 @@ fn 注入した書き換えを名指しする() {
     assert!(
         violations(rel, text, Kind::LibTests).is_empty(),
         "数えないものを名指した"
+    );
+
+    // (6) #2520: issue1977 の旧腕を直す前の形（目印つきで書き換え、同じ関数の中で手で戻す）へ戻すと
+    // 名指す。目印だけ（戻さない）は手で戻す対と数えず、`Drop` で戻す形（issue1930）も名指さない
+    let restores = |rel: &str, text: &str| {
+        let mut scan = Scan::default();
+        scan_file(rel, text, Kind::Integration, &mut scan);
+        assert!(
+            scan.violations.is_empty(),
+            "{rel} の目印か入口が効いていない: {:?}",
+            scan.violations
+        );
+        restore_findings(&scan, KNOWN_RESTORE_PAIRS, false)
+    };
+    let rel = "crates/tako-control/tests/issue1977_lsp_install_followup.rs";
+    let src = read(rel);
+    assert!(restores(rel, &src).is_empty(), "現行の {rel} を名指した");
+    let guard = "fn 旧挙動では片付けない() {\n    let _env = serial();\n    \
+                 if tako_core::run_alone!(旧挙動では片付けない) {\n        return;\n    }\n";
+    assert!(src.contains(guard), "注入 (6) の足場（旧腕の入口）が無い");
+    let marked_only = src.replacen(
+        guard,
+        "// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない\n\
+         fn 旧挙動では片付けない() {\n    let _env = serial();\n",
+        1,
+    );
+    assert!(
+        restores(rel, &marked_only).is_empty(),
+        "戻さない目印つきの書き換えを手で戻す対と数えた"
+    );
+    let read_back = "    let cleanup = manager.status(None)[\"fetch\"][\"cleanup\"].clone();\n";
+    assert!(
+        marked_only.contains(read_back),
+        "注入 (6) の足場（片付けの読み出し）が無い"
+    );
+    let injected = marked_only.replacen(
+        read_back,
+        &format!("{read_back}    std::env::remove_var(\"TAKO_1977_LEGACY\");\n"),
+        1,
+    );
+    let body = injected.find("fn 旧挙動では片付けない()").expect("旧腕");
+    let want = line_of(
+        &injected,
+        body + injected[body..]
+            .find("std::env::set_var(")
+            .expect("旧腕の書き換え"),
+    );
+    let v = restores(rel, &injected);
+    assert!(
+        v.iter().any(|m| m.starts_with(&format!("{rel}:{want}:"))),
+        "注入 (6) を {rel}:{want} で名指せない: {v:?}"
+    );
+    let rel = "crates/tako-control/tests/issue1930_lsp_stale_empty.rs";
+    let src = read(rel);
+    assert!(
+        src.contains("impl Drop for Restore") && src.contains("tako:env-write-ok"),
+        "注入 (6) の対照（目印つきで Drop で戻す形）が無い"
+    );
+    assert!(
+        restores(rel, &src).is_empty(),
+        "Drop で戻す形を手で戻す対と名指した"
+    );
+
+    // (7) 一覧に載ったファイルは件数で縛る: 対を足す（増えた）・宣言より少ない（直したのに一覧が古い）・
+    // 無くなった、のどれも名指す。本物の issue1893（1 対）を使う
+    let rel = "crates/tako-control/tests/issue1893_lsp_hover_followup.rs";
+    let src = read(rel);
+    let scan_of = |text: &str| {
+        let mut scan = Scan::default();
+        scan_file(rel, text, Kind::Integration, &mut scan);
+        scan
+    };
+    let declared = |n: usize| [(rel, n, "注入")];
+    assert!(
+        restore_findings(&scan_of(&src), &declared(1), true).is_empty(),
+        "宣言どおりの 1 対を名指した"
+    );
+    let added = format!(
+        "{src}\n#[test]\n// tako:env-write-ok 注入\nfn 二つ目の対() {{\n    \
+         std::env::set_var(\"TAKO_1893_LEGACY\", \"1\");\n    let _ = 1;\n    \
+         std::env::remove_var(\"TAKO_1893_LEGACY\");\n}}\n"
+    );
+    let v = restore_findings(&scan_of(&added), &declared(1), false);
+    assert!(
+        v.iter()
+            .any(|m| m.starts_with(&format!("{rel}: 目印つきで手で戻す対が 2 件（宣言は 1 件"))),
+        "増えた対を名指せない: {v:?}"
+    );
+    let v = restore_findings(&scan_of(&src), &declared(2), true);
+    assert!(
+        v.iter().any(|m| m.contains("1 件（宣言は 2 件")),
+        "減った対（一覧が古い）を名指せない: {v:?}"
+    );
+    let v = restore_findings(&Scan::default(), &declared(1), true);
+    assert!(
+        v.iter().any(|m| m.contains("0 件（宣言は 1 件")),
+        "対が無くなったファイルを名指せない: {v:?}"
     );
 }

@@ -49,8 +49,9 @@ use lsp_fake_e2e::LoadingGate;
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
-/// A/B の env（`TAKO_1977_LEGACY`）とシェル統合の合図（プロセス全体で 1 つ）を触るので、
-/// このファイルのテストは 1 本ずつ走る
+/// シェル統合の合図（プロセス全体で 1 つ）を触るので、このファイルのテストは 1 本ずつ走る。
+/// A/B の env（`TAKO_1977_LEGACY`）は旧腕のテストが `run_alone!` の子の中だけで立てる
+/// （親で立てると、戻す前に落ちたとき同じバイナリの後のテストが旧腕で走って連鎖で落ちる。#2520）
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -253,10 +254,12 @@ fn 状態を送らないサーバの握手直後の空は最初の診断まで�
 
 /// A/B（検出力の実証）: #1977 の前は、猶予が明けた後の空がそのまま 0 件で確定する（同じ順序）
 #[test]
-// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 旧挙動では猶予の後の空がそのまま確定する() {
     let _env = serial();
-    std::env::set_var("TAKO_1977_LEGACY", "1");
+    if tako_core::run_alone!(旧挙動では猶予の後の空がそのまま確定する) {
+        return;
+    }
+    std::env::set_var("TAKO_1977_LEGACY", "1"); // 子の中だけ（他のテストは居ない）
     let scratch = Scratch::new("warm-legacy");
     let main = scratch.write("src/main.rs", TEXT);
     let manager = LspManager::new(quiet_config(&scratch));
@@ -270,7 +273,6 @@ fn 旧挙動では猶予の後の空がそのまま確定する() {
     scratch.gate().finish();
     let answer = asking.join().expect("補完のスレッド").expect("補完の答え");
     lsp_fake_e2e::stop_and_settle(&manager, &scratch.log());
-    std::env::remove_var("TAKO_1977_LEGACY");
     assert_eq!(
         warming["loading"],
         json!(false),
@@ -674,9 +676,11 @@ fn 書けない置き場では消さずに理由を返す() {
 
 /// A/B: 旧腕（`TAKO_1977_LEGACY=1`）は起こしても片付けない
 #[test]
-// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 旧挙動では片付けない() {
     let _env = serial();
+    if tako_core::run_alone!(旧挙動では片付けない) {
+        return;
+    }
     let scratch = Scratch::new("sweep-legacy");
     let root = scratch.root();
     let spec = binary_spec(&scratch, "v2");
@@ -684,12 +688,11 @@ fn 旧挙動では片付けない() {
     place_version(&root, ID, "v2", 200, true);
     let doc = scratch.write("proj/main.fakesweep", "y\n");
     scratch.write("proj/sweep.marker", "");
-    std::env::set_var("TAKO_1977_LEGACY", "1");
+    std::env::set_var("TAKO_1977_LEGACY", "1"); // 子の中だけ（他のテストは居ない）
     let manager = managed_manager(spec, &root);
     let _link = open_editing(&manager, &doc, "y\n");
     wait_state(&manager, "running");
     let cleanup = manager.status(None)["fetch"]["cleanup"].clone();
-    std::env::remove_var("TAKO_1977_LEGACY");
     assert!(cleanup.is_null(), "{cleanup:#}");
     assert_eq!(listing(&root), ["fake-sweep/v1", "fake-sweep/v2"]);
     manager.shutdown_all(Duration::from_secs(5));
@@ -799,17 +802,19 @@ fn シェル統合の合図は引き直しを待たず間隔は直前の_1_巡�
 
 /// 間隔の決め方（下限 15 秒・時間 × 50・上限 5 分。旧腕は固定の 15 秒）
 #[test]
-// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 引き直しの間隔は直前の_1_巡の_50_倍を下限と上限に収める() {
     let _env = serial();
+    if tako_core::run_alone!(引き直しの間隔は直前の_1_巡の_50_倍を下限と上限に収める)
+    {
+        return;
+    }
     let secs = |ms: u64| recheck_interval(Some(Duration::from_millis(ms))).as_secs();
     assert_eq!(recheck_interval(None), RECHECK_INTERVAL);
     // 実測した普通の rc（0.3 秒）は下限のまま、重い rc（2 秒）は 100 秒
     assert_eq!(secs(300), 15);
     assert_eq!(secs(2_000), 100);
     assert_eq!(secs(60_000), 300);
-    std::env::set_var("TAKO_1977_LEGACY", "1");
+    std::env::set_var("TAKO_1977_LEGACY", "1"); // 子の中だけ（他のテストは居ない）
     let legacy = recheck_interval(Some(Duration::from_secs(2)));
-    std::env::remove_var("TAKO_1977_LEGACY");
     assert_eq!(legacy, RECHECK_INTERVAL);
 }
