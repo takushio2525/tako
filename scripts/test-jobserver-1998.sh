@@ -150,7 +150,7 @@ new_pane() {
   wait_prompt "$p" || return 1
   echo "$p"
 }
-run_in() { "$TAKO_BIN" send --pane "$1" "$2" >/dev/null; }
+run_in() { "$TAKO_BIN" send --pane "$1" "$2" >/dev/null 2>&1; }
 
 # cargo_cmd <workspace> <tag>: ペインで打つ cargo（取り分の CARGO_BUILD_JOBS は外す = 包まない cargo の既定）
 cargo_cmd() {
@@ -174,8 +174,8 @@ launch() {
   FIFO="$TAKO_DATA_DIR/resources/jobserver.fifo"
   ISOLATED_GUI_BOUNDS=${ISOLATED_GUI_BOUNDS:-0,0,1200,800}
   launch_isolated_gui "$TMP/app-$name.log" TAKO_PERSIST=1 TAKO_AUTO_RENAME=0 "$@" || exit $?
-  wait_isolated_gui "$TMP/app-$name.log" || { fail "隔離 GUI（$name）に繋がらない"; exit 1; }
-  wait_prompt "$(first_pane)" || { fail "最初のペインのプロンプトが出ない（$name）"; exit 1; }
+  wait_isolated_gui "$TMP/app-$name.log" || { fail "隔離 GUI（${name}）に繋がらない"; exit 1; }
+  wait_prompt "$(first_pane)" || { fail "最初のペインのプロンプトが出ない（${name}）"; exit 1; }
 }
 
 # three <回の名前> <クレート数> <眠る ms>: 3 枚のペインで包まない cargo を並べ、区間の最大と ps の最大を返す
@@ -226,9 +226,9 @@ check $? "MAKEFLAGS は配らない（$(cat "$TMP/env-a-mf.txt")）"
 
 echo "-- ① 包まない cargo を 3 本（5 クレート × 1.5 秒） --"
 three on 5 1500
-echo "  ビルドスクリプト $THREE_RUNS 本・区間の最大 $THREE_OVERLAP・ps（rustc + ビルドスクリプト）の最大 $THREE_PS"
+echo "  ビルドスクリプト $THREE_RUNS 本・区間の最大 ${THREE_OVERLAP}・ps（rustc + ビルドスクリプト）の最大 $THREE_PS"
 [ "$THREE_RUNS" = 15 ] && [ "$THREE_OVERLAP" -le $((N + 3)) ] && [ "$THREE_PS" -le $((N + 3)) ]
-check $? "① 同時数 ≤ N + 3 = $((N + 3))（区間 $THREE_OVERLAP・ps $THREE_PS）"
+check $? "① 同時数 ≤ N + 3 = $((N + 3))（区間 ${THREE_OVERLAP}・ps ${THREE_PS}）"
 ON_OVERLAP=$THREE_OVERLAP
 wait_until 10 free_is $N
 check $? "① 終われば札は $N 枚へ戻る（free=$(js free)）"
@@ -242,10 +242,10 @@ check $? "③ 札が貸し出された（free=$(js free)）"
 wait_until 10 free_below $((N - 1))
 KPID="$(cat "$TMP/kill.pid" 2>/dev/null)"
 kill -9 "$KPID" 2>/dev/null
-check $? "③ cargo（pid $KPID）を kill -9"
+check $? "③ cargo（pid ${KPID}）を kill -9"
 sleep 0.5
 LEAK_FREE="$(js free)"
-echo "  kill 直後の空き $LEAK_FREE / $N（孤児のビルドスクリプトは眠り終えるまで札を持ちうる）"
+echo "  kill 直後の空き $LEAK_FREE / ${N}（孤児のビルドスクリプトは眠り終えるまで札を持ちうる）"
 wait_until 60 free_is $N
 check $? "③ 誰も持っていなくなってから札が $N 枚へ戻る（free=$(js free)）"
 RECOUNT="$(status | jq -c '.jobserver.last_recount')"
@@ -294,7 +294,7 @@ for s in $(tmux -L "$TAKO_TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev
   fi
 done
 [ -n "$TPANE" ]
-check $? "⑥ 器のセッションに CARGO_MAKEFLAGS が固定されている（$TPANE）"
+check $? "⑥ 器のセッションに CARGO_MAKEFLAGS が固定されている（${TPANE}）"
 gen_ws "$TMP/ws-noui" 3 1500 "$TMP/logs/noui.log"
 tmux -L "$TAKO_TMUX_SOCKET" send-keys -t "$TPANE" \
   "cd '$TMP/ws-noui' && printf 'CMF=[%s]\\n' \"\$CARGO_MAKEFLAGS\" > '$TMP/env-noui.txt' && CARGO_BUILD_JOBS=3 CARGO_TARGET_DIR='$TMP/t-noui' '$CARGO_BIN' build --offline -q; echo \$? > '$TMP/done-noui'" Enter
@@ -310,9 +310,9 @@ launch b TAKO_1992_NO_JOBSERVER=1 TAKO_1998_INJECT_TOKENS=$N
 [ "$(js state)" = off ] && [ "$(js code)" = legacy ] && [ ! -e "$FIFO" ]
 check $? "A/B は fifo を作らず配らない（code=$(js code)）"
 three ab 5 1500
-echo "  ビルドスクリプト $THREE_RUNS 本・区間の最大 $THREE_OVERLAP・ps の最大 $THREE_PS"
+echo "  ビルドスクリプト $THREE_RUNS 本・区間の最大 ${THREE_OVERLAP}・ps の最大 $THREE_PS"
 [ "$THREE_OVERLAP" -gt $((N + 3)) ]
-check $? "① A/B では N + 3 = $((N + 3)) を超える（区間 $THREE_OVERLAP / 札あり $ON_OVERLAP）"
+check $? "① A/B では N + 3 = $((N + 3)) を超える（区間 $THREE_OVERLAP / 札あり ${ON_OVERLAP}）"
 stop_isolated_gui
 
 # =====================================================================
@@ -338,9 +338,9 @@ wait_until 15 free_is $N
 check $? "② 終われば札は $N 枚（free=$(js free)）"
 js free >> "$TMP/logs/restart.free"
 RMAX="$(grep -E '^[0-9]+$' "$TMP/logs/restart.free" | sort -n | tail -1)"
-echo "  再起動後の空きの最大 $RMAX（$(grep -cE '^[0-9]+$' "$TMP/logs/restart.free") 回）・区間の最大 $(overlap "$TMP/logs/restart.log")"
+echo "  再起動後の空きの最大 ${RMAX}（$(grep -cE '^[0-9]+$' "$TMP/logs/restart.free") 回）・区間の最大 $(overlap "$TMP/logs/restart.log")"
 [ "$(cat "$TMP/done-r")" = 0 ] && [ -n "$RMAX" ] && [ "$RMAX" -le "$N" ]
-check $? "② 再起動をまたいでも札は N = $N を超えない（空きの最大 $RMAX）"
+check $? "② 再起動をまたいでも札は N = $N を超えない（空きの最大 ${RMAX}）"
 [ "$(overlap "$TMP/logs/restart.log")" -le $((N + 1)) ]
 check $? "② 1 本の cargo の同時数 ≤ N + 1 = $((N + 1))"
 stop_isolated_gui
@@ -352,7 +352,7 @@ launch n1 TAKO_1998_INJECT_TOKENS=$N
 wait_until 10 free_is $N
 check $? "⑤ 札 1 枚（free=$(js free)）"
 three n1 4 1200
-echo "  ビルドスクリプト $THREE_RUNS 本・区間の最大 $THREE_OVERLAP・ps の最大 $THREE_PS"
+echo "  ビルドスクリプト $THREE_RUNS 本・区間の最大 ${THREE_OVERLAP}・ps の最大 $THREE_PS"
 [ "$THREE_RUNS" = 12 ] && [ "$THREE_OVERLAP" -le $((N + 3)) ] && [ "$THREE_PS" -le $((N + 3)) ]
 check $? "⑤ N = 1 の機でも同時数 ≤ N + 3 = $((N + 3))"
 stop_isolated_gui
