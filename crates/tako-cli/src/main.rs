@@ -5009,6 +5009,9 @@ fn cli_main() -> ExitCode {
 /// MCP セットアップ（アプリ未起動でも動作）。書き先の正本は `dispatch::mcp_target_path`
 /// （claude = `~/.claude.json` / `--project` = `<cwd>/.mcp.json`。codex / agy は各 CLI の `mcp add`）
 fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
+    // dispatch の `setup_mcp_agents` は理由の文を組んだ時点の表示言語で文字列にする（#2365）。
+    // 呼ぶ前に決めておかないと、日本語表示の人へ理由の文だけ英語（静的既定）で出る
+    init_local_lang();
     let (scope, scope_label) = if args.project {
         let cwd = std::env::current_dir()
             .map_err(|e| format!("カレントディレクトリの取得に失敗: {e}"))?;

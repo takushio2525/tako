@@ -35,6 +35,7 @@
 //!   sudo 参照 49 箇所・`have_sudo_access`）。setup が黙って権限昇格を走らせない
 
 use crate::orchestrator::agent::WorkerAgent;
+use crate::SetupRefusal;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use tako_core::platform::agent_install::{self, AgentKind, InstallRecipe};
@@ -122,17 +123,23 @@ pub fn agent_flag(agent: AgentKind) -> String {
 }
 
 /// 文字列から系統を決める。**未知の名前は黙って claude にしない**
-/// （取り違えたまま別の系統を入れてしまうため）
+/// （取り違えたまま別の系統を入れてしまうため）。
+///
+/// 断りの文は日本語のまま（呼び手は CLI の `tako setup bootstrap` = 枠が日本語の手元の処理）。
+/// 断りを表示言語で返す dispatch（MCP の `tako_setup_bootstrap`）は [`parse_agent_typed`] を通す（#2365）
 pub fn parse_agent(value: &str) -> Result<AgentKind, String> {
-    AgentKind::parse(value).ok_or_else(|| {
-        format!(
-            "不明なエージェント: {value:?}（{} のいずれか）",
-            AgentKind::ALL
-                .iter()
-                .map(|a| a.as_str())
-                .collect::<Vec<_>>()
-                .join(" / ")
-        )
+    parse_agent_typed(value).map_err(SetupRefusal::into_ja)
+}
+
+/// [`parse_agent`] の型の口（#2365）
+pub fn parse_agent_typed(value: &str) -> Result<AgentKind, SetupRefusal> {
+    AgentKind::parse(value).ok_or_else(|| SetupRefusal::UnknownBootstrapAgent {
+        got: value.to_string(),
+        allowed: AgentKind::ALL
+            .iter()
+            .map(|a| a.as_str())
+            .collect::<Vec<_>>()
+            .join(" / "),
     })
 }
 
@@ -318,8 +325,12 @@ fn timeout_json(notice: &tako_core::probe::TimeoutNotice) -> Value {
 
 /// ホームディレクトリ。**取得できない環境では何も書かない**
 fn home_dir() -> Result<PathBuf, String> {
-    tako_core::paths::home_dir()
-        .ok_or_else(|| "ホームディレクトリを特定できません（HOME が未設定）".to_string())
+    home_dir_typed().map_err(SetupRefusal::into_ja)
+}
+
+/// [`home_dir`] の型の口（#2365）
+fn home_dir_typed() -> Result<PathBuf, SetupRefusal> {
+    tako_core::paths::home_dir().ok_or(SetupRefusal::BootstrapHomeUnresolved)
 }
 
 fn display_path(path: &Path) -> String {
@@ -455,7 +466,12 @@ pub fn legacy_privilege_line() -> bool {
 
 /// 「何をどこに入れるか」
 pub fn install_plan_for(agent: AgentKind) -> Result<InstallPlan, String> {
-    let home = home_dir()?;
+    install_plan_for_typed(agent).map_err(SetupRefusal::into_ja)
+}
+
+/// [`install_plan_for`] の型の口（#2365）
+fn install_plan_for_typed(agent: AgentKind) -> Result<InstallPlan, SetupRefusal> {
+    let home = home_dir_typed()?;
     Ok(plan_from(&recipe_for(agent), &home))
 }
 
@@ -726,6 +742,11 @@ fn shell_target() -> (Option<ShellKind>, Option<PathBuf>) {
 /// いまの導入状況を調べる（読み取りだけ。副作用なし）。認証の問い合わせは上限なしで待つ
 /// （setup の経路。環境診断は [`status_for_within`]）
 pub fn status_for(agent: AgentKind) -> Result<BootstrapState, String> {
+    status_for_typed(agent).map_err(SetupRefusal::into_ja)
+}
+
+/// [`status_for`] の型の口（断りを表示言語で返す dispatch の `tako_setup_bootstrap` が使う。#2365）
+pub fn status_for_typed(agent: AgentKind) -> Result<BootstrapState, SetupRefusal> {
     status_with(agent, |binary| (auth_state_for(agent, binary), None))
 }
 
@@ -735,6 +756,7 @@ pub fn status_for_within(
     budget: std::time::Duration,
 ) -> Result<BootstrapState, String> {
     status_with(agent, |binary| auth_state_within(agent, binary, budget))
+        .map_err(SetupRefusal::into_ja)
 }
 
 /// 導入状況の組み立て。認証の問い合わせ方（上限の有無）は呼び手が `auth` で渡す
@@ -742,8 +764,8 @@ pub fn status_for_within(
 fn status_with(
     agent: AgentKind,
     auth: impl FnOnce(&str) -> (AuthState, Option<tako_core::probe::TimeoutNotice>),
-) -> Result<BootstrapState, String> {
-    let home = home_dir()?;
+) -> Result<BootstrapState, SetupRefusal> {
+    let home = home_dir_typed()?;
     let r = recipe_for(agent);
     let plan = plan_from(&r, &home);
     // [`resolve_binary_for`] と同じ順（PATH → インストーラの置き場所）。PATH の探索の答えは
@@ -1850,7 +1872,15 @@ pub fn handoff_prompt_text(plan: &InstallPlan, reason: Option<&str>) -> String {
 /// 引き継ぎの計画。CLI・MCP が同じ内容を見る（`available` が false なら
 /// 従来どおり公式コマンドの案内へ落とす）
 pub fn handoff_plan_for(agent: AgentKind, reason: Option<&str>) -> Result<Value, String> {
-    let plan = install_plan_for(agent)?;
+    handoff_plan_for_typed(agent, reason).map_err(SetupRefusal::into_ja)
+}
+
+/// [`handoff_plan_for`] の型の口（#2365）
+pub fn handoff_plan_for_typed(
+    agent: AgentKind,
+    reason: Option<&str>,
+) -> Result<Value, SetupRefusal> {
+    let plan = install_plan_for_typed(agent)?;
     let candidates = handoff_candidates_for(agent);
     let prompt = handoff_prompt_text(&plan, reason);
     let recommended = candidates.first();

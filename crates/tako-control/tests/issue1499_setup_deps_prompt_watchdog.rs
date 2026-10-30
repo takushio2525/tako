@@ -359,9 +359,13 @@ fn issue1499_導入は1実装を通る() {
     ];
     for (rel, _) in expected {
         let src = production(rel);
+        // `install_typed` は `install` の型の口（断りを表示言語で返す dispatch が使う。#2365）で、
+        // `install` は日本語の文へ写すだけ = 同じ導入の 1 実装
         assert!(
-            src.contains("setup_deps::install(") || src.contains("crate::setup_deps::install("),
-            "{rel}: 導入は `setup_deps::install` を通すこと（#1057 / #1499）"
+            src.contains("setup_deps::install(")
+                || src.contains("crate::setup_deps::install(")
+                || src.contains("setup_deps::install_typed("),
+            "{rel}: 導入は `setup_deps::install`（型の口 `install_typed`）を通すこと（#1057 / #1499）"
         );
     }
     // 依存の導入コマンドを自前で組み立てていない（正本は setup_deps::run_installer）

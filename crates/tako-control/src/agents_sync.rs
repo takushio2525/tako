@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+use crate::SetupRefusal;
+
 pub const BEGIN_MARKER: &str = "<!-- BEGIN SYNCED COMMON RULES -->";
 pub const END_MARKER: &str = "<!-- END SYNCED COMMON RULES -->";
 
@@ -279,20 +281,21 @@ fn sync_one(agent: AgentKind, source_content: &str) -> SyncResult {
 }
 
 /// 全対象エージェントに対して同期を実行
-pub fn sync_rules(source_path: &Path, targets: &[AgentKind]) -> Result<Vec<SyncResult>, String> {
+pub fn sync_rules(
+    source_path: &Path,
+    targets: &[AgentKind],
+) -> Result<Vec<SyncResult>, SetupRefusal> {
     if !source_path.is_file() {
-        return Err(format!(
-            "正本ファイルが見つかりません: {}\n\
-             ファイルを作成するか、tako setup で正本のパスを設定してください",
-            source_path.display()
+        return Err(SetupRefusal::SyncSourceMissing(
+            source_path.display().to_string(),
         ));
     }
 
     let source_content = std::fs::read_to_string(source_path)
-        .map_err(|e| format!("正本ファイルの読み取りに失敗: {e}"))?;
+        .map_err(|e| SetupRefusal::SyncSourceRead(e.to_string()))?;
 
     if source_content.trim().is_empty() {
-        return Err("正本ファイルが空です".into());
+        return Err(SetupRefusal::SyncSourceEmpty);
     }
 
     let results: Vec<SyncResult> = targets
@@ -303,7 +306,7 @@ pub fn sync_rules(source_path: &Path, targets: &[AgentKind]) -> Result<Vec<SyncR
 }
 
 /// 同期状態のチェック（--check 用）。各エージェントのブロック内容が正本と一致しているか
-pub fn check_sync_status(source_path: &Path, targets: &[AgentKind]) -> Result<Value, String> {
+pub fn check_sync_status(source_path: &Path, targets: &[AgentKind]) -> Result<Value, SetupRefusal> {
     if !source_path.is_file() {
         return Ok(json!({
             "configured": true,
@@ -315,7 +318,7 @@ pub fn check_sync_status(source_path: &Path, targets: &[AgentKind]) -> Result<Va
     }
 
     let source_content = std::fs::read_to_string(source_path)
-        .map_err(|e| format!("正本ファイルの読み取りに失敗: {e}"))?;
+        .map_err(|e| SetupRefusal::SyncSourceRead(e.to_string()))?;
 
     let expected_block = emit_synced_block(&source_content);
 
@@ -365,22 +368,29 @@ pub fn check_sync_status(source_path: &Path, targets: &[AgentKind]) -> Result<Va
     }))
 }
 
-/// MCP / CLI 共通のエントリポイント: 設定を読んで同期を実行し JSON を返す
+/// MCP / CLI 共通のエントリポイント: 設定を読んで同期を実行し JSON を返す。
+///
+/// 断りの文は**日本語のまま**（呼び手は CLI の `tako agents sync-rules` = 表示が日本語の手元の処理）。
+/// 断りを表示言語で返す dispatch（MCP の `tako_agents_sync_rules`・設定画面）は [`run_sync_typed`] を通す（#2365）
 pub fn run_sync(
     source_override: Option<&str>,
     targets_override: Option<&[String]>,
 ) -> Result<Value, String> {
-    let config = crate::setup::load_config()?;
+    run_sync_typed(source_override, targets_override).map_err(SetupRefusal::into_ja)
+}
+
+/// [`run_sync`] の型の口（#2365）
+pub fn run_sync_typed(
+    source_override: Option<&str>,
+    targets_override: Option<&[String]>,
+) -> Result<Value, SetupRefusal> {
+    let config = crate::setup::load_config_typed()?;
     let sync_config = &config.agents_sync;
 
     let source_path = source_override
         .map(PathBuf::from)
         .or_else(|| sync_config.source_path.as_ref().map(PathBuf::from))
-        .ok_or(
-            "共通ルールの正本パスが設定されていません。\n\
-             tako setup で設定するか、--source オプションで指定してください"
-                .to_string(),
-        )?;
+        .ok_or(SetupRefusal::SyncSourceUnset)?;
 
     let targets = match targets_override {
         Some(list) => list.iter().filter_map(|s| AgentKind::parse(s)).collect(),
@@ -391,9 +401,14 @@ pub fn run_sync(
     Ok(json!({ "results": results }))
 }
 
-/// 同期状態の照会（MCP / CLI 共通）
+/// 同期状態の照会（MCP / CLI 共通）。断りの文は日本語のまま（[`run_sync`] と同じ）
 pub fn status() -> Result<Value, String> {
-    let config = crate::setup::load_config()?;
+    status_typed().map_err(SetupRefusal::into_ja)
+}
+
+/// [`status`] の型の口（#2365）
+pub fn status_typed() -> Result<Value, SetupRefusal> {
+    let config = crate::setup::load_config_typed()?;
     let sync_config = &config.agents_sync;
 
     match &sync_config.source_path {

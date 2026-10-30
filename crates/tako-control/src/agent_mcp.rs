@@ -84,11 +84,15 @@ impl AgentMcpError {
     }
 }
 
-impl std::fmt::Display for AgentMcpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CliNotFound { agent } => write!(
-                f,
+impl AgentMcpError {
+    /// 表示言語を明示しての文言（#2365）。(バリアント, 言語) の網羅 match なので、バリアントを足すと
+    /// 日英の両方を書くまでコンパイルが通らない。日本語は #2365 より前の `Display` とバイト一致
+    /// （`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。CLI の `tako setup`（枠が日本語）は
+    /// `text_in(Lang::Ja)` で引き、断りを表示言語で返す dispatch は `Display`（表示言語）で引く
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::CliNotFound { agent }, Ja) => format!(
                 "{} CLI が見つからないので MCP 登録できません。\
                  次の一手: {} を導入して PATH を通してから tako setup-mcp --agent {} をやり直してください（導入の案内: {}）",
                 agent.as_str(),
@@ -96,39 +100,69 @@ impl std::fmt::Display for AgentMcpError {
                 agent.as_str(),
                 install_hint(*agent),
             ),
-            Self::ScopeUnsupported { agent, scope } => write!(
-                f,
+            (Self::CliNotFound { agent }, En) => format!(
+                "{} CLI not found, so tako cannot register the MCP server. \
+                 Next step: install {}, put it on PATH, then run tako setup-mcp --agent {} again (install guide: {})",
+                agent.as_str(),
+                agent.as_str(),
+                agent.as_str(),
+                install_hint(*agent),
+            ),
+            (Self::ScopeUnsupported { agent, scope }, Ja) => format!(
                 "{} は scope={scope} の MCP 登録に対応していません（ユーザーグローバルのみ）。\
                  次の一手: --{scope} を外して tako setup-mcp --agent {} を実行してください",
                 agent.as_str(),
                 agent.as_str(),
             ),
-            Self::Spawn { agent, detail } => write!(
-                f,
+            (Self::ScopeUnsupported { agent, scope }, En) => format!(
+                "{} does not support MCP registration with scope={scope} (user-global only). \
+                 Next step: drop --{scope} and run tako setup-mcp --agent {}",
+                agent.as_str(),
+                agent.as_str(),
+            ),
+            (Self::Spawn { agent, detail }, Ja) => format!(
                 "{} mcp add を起動できませんでした（{detail}）。\
                  次の一手: which {} でパスを確認し、実行権限があるか見てください",
                 agent.as_str(),
                 agent.as_str(),
             ),
-            Self::CommandFailed {
-                agent,
-                code,
-                stderr,
-            } => {
-                let code = code
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| "signal".to_string());
-                write!(
-                    f,
-                    "{} mcp add が失敗しました (exit {code}): {}。\
-                     次の一手: 同じコマンドを手で実行して出力を確認してください（{} mcp add --help）",
-                    agent.as_str(),
-                    stderr.trim(),
-                    agent.as_str(),
-                )
-            }
-            Self::NotReflected { agent } => write!(
-                f,
+            (Self::Spawn { agent, detail }, En) => format!(
+                "could not start {} mcp add ({detail}). \
+                 Next step: check its path with which {} and make sure it is executable",
+                agent.as_str(),
+                agent.as_str(),
+            ),
+            (
+                Self::CommandFailed {
+                    agent,
+                    code,
+                    stderr,
+                },
+                Ja,
+            ) => format!(
+                "{} mcp add が失敗しました (exit {}): {}。\
+                 次の一手: 同じコマンドを手で実行して出力を確認してください（{} mcp add --help）",
+                agent.as_str(),
+                exit_code_text(*code),
+                stderr.trim(),
+                agent.as_str(),
+            ),
+            (
+                Self::CommandFailed {
+                    agent,
+                    code,
+                    stderr,
+                },
+                En,
+            ) => format!(
+                "{} mcp add failed (exit {}): {}. \
+                 Next step: run the same command by hand and check its output ({} mcp add --help)",
+                agent.as_str(),
+                exit_code_text(*code),
+                stderr.trim(),
+                agent.as_str(),
+            ),
+            (Self::NotReflected { agent }, Ja) => format!(
                 "{} mcp add は成功したのに {} mcp list に tako が現れません（書式非対応・バージョン差の疑い）。\
                  次の一手: {} --version と {} mcp list の出力を添えて tako の Issue へ報告してください",
                 agent.as_str(),
@@ -136,12 +170,36 @@ impl std::fmt::Display for AgentMcpError {
                 agent.as_str(),
                 agent.as_str(),
             ),
-            Self::NotSupportedHere { agent } => write!(
-                f,
+            (Self::NotReflected { agent }, En) => format!(
+                "{} mcp add succeeded, but tako does not appear in {} mcp list (an unsupported format or a version difference is suspected). \
+                 Next step: report it in a tako Issue with the output of {} --version and {} mcp list",
+                agent.as_str(),
+                agent.as_str(),
+                agent.as_str(),
+                agent.as_str(),
+            ),
+            (Self::NotSupportedHere { agent }, Ja) => format!(
                 "{} の MCP 登録はこの経路では扱いません（claude は dispatch::setup_mcp が担当）",
                 agent.as_str(),
             ),
+            (Self::NotSupportedHere { agent }, En) => format!(
+                "this path does not handle MCP registration for {} (dispatch::setup_mcp handles claude)",
+                agent.as_str(),
+            ),
         }
+    }
+}
+
+/// 終了コードの表示（シグナルで止まったときは `signal`）
+fn exit_code_text(code: Option<i32>) -> String {
+    code.map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".to_string())
+}
+
+impl std::fmt::Display for AgentMcpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 表示言語は dispatch の断りと同じグローバル（#2365）
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
     }
 }
 
@@ -750,23 +808,29 @@ mod tests {
 
     #[test]
     fn 未導入と非対応スコープのエラーは理由と次の一手を両方言う() {
+        // 文面は日英を明示して見る（Display は表示言語のグローバル = 並列のテストで変わりうる。#2365）
+        use tako_core::i18n::Lang;
         let e = AgentMcpError::CliNotFound {
             agent: WorkerAgent::Codex,
         };
-        let msg = e.to_string();
         assert_eq!(e.kind(), "cli_not_found");
-        assert!(msg.contains("codex"), "{msg}");
-        assert!(msg.contains("次の一手"), "{msg}");
-        assert!(msg.contains("tako setup-mcp --agent codex"), "{msg}");
+        for (lang, next) in [(Lang::Ja, "次の一手"), (Lang::En, "Next step")] {
+            let msg = e.text_in(lang);
+            assert!(msg.contains("codex"), "{msg}");
+            assert!(msg.contains(next), "{msg}");
+            assert!(msg.contains("tako setup-mcp --agent codex"), "{msg}");
+        }
 
         let e = AgentMcpError::ScopeUnsupported {
             agent: WorkerAgent::Agy,
             scope: "project",
         };
-        let msg = e.to_string();
         assert_eq!(e.kind(), "scope_unsupported");
-        assert!(msg.contains("project"), "{msg}");
-        assert!(msg.contains("次の一手"), "{msg}");
+        for (lang, next) in [(Lang::Ja, "次の一手"), (Lang::En, "Next step")] {
+            let msg = e.text_in(lang);
+            assert!(msg.contains("project"), "{msg}");
+            assert!(msg.contains(next), "{msg}");
+        }
     }
 
     #[test]
@@ -798,11 +862,16 @@ mod tests {
         ];
         let mut kinds = std::collections::HashSet::new();
         for e in &all {
-            let msg = e.to_string();
-            assert!(!msg.is_empty(), "{:?}", e);
-            // NotSupportedHere は配線ミスの内部エラーなので次の一手は要らない
-            if !matches!(e, AgentMcpError::NotSupportedHere { .. }) {
-                assert!(msg.contains("次の一手"), "次の一手が無い: {msg}");
+            for (lang, next) in [
+                (tako_core::i18n::Lang::Ja, "次の一手"),
+                (tako_core::i18n::Lang::En, "Next step"),
+            ] {
+                let msg = e.text_in(lang);
+                assert!(!msg.is_empty(), "{:?}", e);
+                // NotSupportedHere は配線ミスの内部エラーなので次の一手は要らない
+                if !matches!(e, AgentMcpError::NotSupportedHere { .. }) {
+                    assert!(msg.contains(next), "次の一手が無い: {msg}");
+                }
             }
             assert!(kinds.insert(e.kind()), "kind が重複: {}", e.kind());
         }

@@ -246,7 +246,13 @@ fn issue1524_導入の直呼びは名指しの経路だけ() {
         offenders.extend(offenders_in(
             &body,
             &rel,
-            &[DIRECT_INSTALL, "crate::setup_deps::install("],
+            // `install_typed` は `install` の型の口（断りを表示言語で返す dispatch が使う。#2365）=
+            // 同じ導入の 1 実装なので、直呼びの棚卸しも同じ許可リストで見る
+            &[
+                DIRECT_INSTALL,
+                "crate::setup_deps::install(",
+                "setup_deps::install_typed(",
+            ],
             ALLOWED_DIRECT,
         ));
     }

@@ -1,0 +1,370 @@
+//! setup 系（claude への MCP 登録・`tako setup` の非対話実行と answers の検証・setup の設定 config.yaml・
+//! 共通ルール同期・依存の導入・エージェント CLI の導入の系統名とホーム）の断り（#2365）。
+//!
+//! dispatch の `tako_setup_mcp` / `tako_setup` / `tako_setup_changes` / `tako_agents_sync_rules` /
+//! `tako_setup_deps` / `tako_setup_bootstrap` は、以前は dispatch 自身の日本語の固定文と、中身の口
+//! （`setup` / `agents_sync` / `setup_deps` / `setup_bootstrap`）の `Err(String)`（日本語の固定文）を
+//! `Operation` / `InvalidParams` の中身としてそのまま載せていたので、英語表示でも理由だけ日本語で返った。
+//! 日英の対は [`SetupRefusal::text_in`] の (バリアント, 言語) の網羅 match の 1 か所に置く
+//! （形は [`crate::OsRefusal`] と同じ）。日本語は #2365 より前の固定文とバイト一致
+//! （`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。
+//!
+//! # 口は 2 つ
+//!
+//! 従来の口（`setup::SetupAnswers::validate` / `setup::load_config` / `agents_sync::run_sync` /
+//! `setup_deps::install` / `setup_bootstrap::parse_agent` ほか）は `String` を返し、文は**日本語のまま**
+//! （CLI の `tako setup` は枠が日本語の手元の処理 = FR-2.42.21 の「setup は日本語」）。断りを表示言語で
+//! 返す dispatch だけが型の口（`*_typed`）を通す。CLI の `tako setup-mcp` は dispatch の
+//! `setup_mcp_agents` を手元で呼ぶので、呼ぶ前に表示言語を決める（`init_local_lang`）。
+//!
+//! codex / agy への MCP 登録の断りは [`crate::agent_mcp::AgentMcpError`]（同じ網羅 match の形）が持つ。
+//! エージェント名の検証は orchestrator の [`crate::orchestrator::ConfigError`] を使う
+
+use tako_core::claude_mod_ui::UiError;
+use tako_core::i18n::Lang;
+use tako_core::load_issue::{JsonReason, YamlReason};
+
+use crate::orchestrator::ConfigError;
+use crate::DispatchError;
+
+/// setup 系の断り。`error` / `detail` / `stderr` / `output` / `log` は OS・外部コマンド・serde のエラー文と
+/// 子の出力（言語に依らずそのまま載せる）。パス・名前・値は表記のまま埋める
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetupRefusal {
+    // ---- claude への MCP 登録（`dispatch::setup_mcp`） ----
+    /// `claude mcp add` を起動できない
+    ClaudeMcpAddSpawn(String),
+    /// `claude mcp add` が非ゼロ終了（`status` は終了状態の表示 = `exit status: 1`）
+    ClaudeMcpAddFailed { status: String, stderr: String },
+    /// MCP の設定ファイル（`~/.claude.json` / `.mcp.json`）を読めない
+    McpConfigRead { path: String, error: String },
+    /// MCP の設定ファイルを JSON として解釈できない（書き換えを中止した）
+    McpConfigUnparsable { path: String, reason: JsonReason },
+    /// MCP の設定ファイルの `mcpServers` がオブジェクトでない
+    McpServersNotObject,
+    /// MCP の設定ファイルの置き場を作れない
+    McpConfigDirCreate { path: String, error: String },
+    /// MCP の設定を JSON にできない
+    McpConfigSerialize(String),
+    /// MCP の設定ファイルへ書けない
+    McpConfigWrite { path: String, error: String },
+
+    // ---- `tako setup` の非対話実行（MCP の `tako_setup`） ----
+    /// answers が JSON の形として読めない（`error` は serde の文）
+    AnswersMalformed(String),
+    /// answers を JSON にできない
+    AnswersEncode(String),
+    /// 子の `tako setup` を起動できない
+    SetupSpawn(String),
+    /// 子の `tako setup` の標準入力を開けない
+    SetupStdinUnavailable,
+    /// 子の `tako setup` へ answers を送れない
+    AnswersSend(String),
+    /// 子の `tako setup` の完了待ちに失敗
+    SetupWaitFailed(String),
+    /// 子の `tako setup` が非ゼロ終了（`output` は子の出力 = setup の枠なので日本語のまま）
+    SetupFailed { code: i32, output: String },
+
+    // ---- answers の検証（`setup::SetupAnswers::validate`） ----
+    /// `selected_agent` が claude / codex / agy のどれでもない
+    SelectedAgent(String),
+    /// `provider_plans` のキーが claude / gpt / google のどれでもない
+    ProviderPlanKey(String),
+    /// `instruction_content` が空
+    InstructionEmpty,
+    /// `projects` のキーが空
+    ProjectKeyEmpty,
+    /// `projects.<key>.cwd` が空
+    ProjectCwdEmpty(String),
+    /// `launch_agent` が claude / codex / agy / none のどれでもない
+    LaunchAgent(String),
+    /// `mod_ui` が `tako mod ui` に断られる値
+    ModUi(UiError),
+    /// `sleep_guard.mode` が off / on / while-agents-running のどれでもない
+    SleepMode(String),
+    /// `sleep_guard.power` が ac-only / always のどれでもない
+    SleepPower(String),
+    /// `profile` のエージェント名が不正（orchestrator の断り）
+    Profile(ConfigError),
+
+    // ---- setup の設定（config.yaml）と埋め込みの変更履歴（changes.yaml） ----
+    /// config.yaml の置き場（ホームディレクトリ）を決められない
+    ConfigHomeUnresolved,
+    /// config.yaml を読めない
+    ConfigRead(String),
+    /// config.yaml を解釈できない（種類と位置だけ = 中身を引用しない #2230）
+    ConfigParse(YamlReason),
+    /// 埋め込みの changes.yaml を解釈できない（ビルドの取り違えでしか起きない）
+    ChangelogParse(YamlReason),
+    /// 埋め込みの changes.yaml の platforms に未知の値
+    ChangelogPlatform { revision: u32, value: String },
+
+    // ---- 共通ルール同期（`agents_sync`） ----
+    /// 正本のパスが設定されていない
+    SyncSourceUnset,
+    /// 正本のファイルが無い
+    SyncSourceMissing(String),
+    /// 正本のファイルを読めない
+    SyncSourceRead(String),
+    /// 正本のファイルが空
+    SyncSourceEmpty,
+
+    // ---- 依存の導入（`setup_deps::install`） ----
+    /// 不明な依存の名前（`allowed` はこの環境の対象を ` / ` で並べたもの）
+    UnknownDep { got: String, allowed: String },
+    /// 導入器（brew / winget）を起動できない
+    DepInstallerSpawn { program: String, error: String },
+    /// 導入器が非ゼロ終了（`log` は導入器の出力。空でなければ先頭に改行を付けて載せる）
+    DepInstallerFailed {
+        command: String,
+        code: i32,
+        log: String,
+    },
+    /// 導入器は正常終了したのにコマンドを引けない
+    DepMissingAfterInstall { command: String, bin: String },
+
+    // ---- エージェント CLI の導入（`setup_bootstrap`。系統名とホームの解決） ----
+    /// 不明な系統名（`allowed` は系統を ` / ` で並べたもの）
+    UnknownBootstrapAgent { got: String, allowed: String },
+    /// ホームディレクトリを決められない（何も書かない）
+    BootstrapHomeUnresolved,
+}
+
+impl SetupRefusal {
+    /// 表示言語を明示しての文言。(バリアント, 言語) の網羅 match なので、バリアントを足すと
+    /// 日英の両方を書くまでコンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::ClaudeMcpAddSpawn(e), Ja) => format!("claude mcp add の実行に失敗: {e}"),
+            (Self::ClaudeMcpAddSpawn(e), En) => format!("failed to run claude mcp add: {e}"),
+            (Self::ClaudeMcpAddFailed { status, stderr }, Ja) => {
+                format!("claude mcp add が失敗 (exit {status}): {stderr}")
+            }
+            (Self::ClaudeMcpAddFailed { status, stderr }, En) => {
+                format!("claude mcp add failed ({status}): {stderr}")
+            }
+            (Self::McpConfigRead { path, error }, Ja) => format!("{path} の読み取りに失敗: {error}"),
+            (Self::McpConfigRead { path, error }, En) => format!("failed to read {path}: {error}"),
+            (Self::McpConfigUnparsable { path, reason }, Ja) => format!(
+                "{path} を JSON として解釈できないので書き換えを中止した（{}）。\
+                 内容を直すか退避してからやり直してください",
+                reason.text_in(lang)
+            ),
+            (Self::McpConfigUnparsable { path, reason }, En) => format!(
+                "stopped before rewriting {path} because it cannot be read as JSON ({}). \
+                 Fix its contents or move it aside, then try again",
+                reason.text_in(lang)
+            ),
+            (Self::McpServersNotObject, Ja) => "mcpServers がオブジェクトでない".to_string(),
+            (Self::McpServersNotObject, En) => "mcpServers is not an object".to_string(),
+            (Self::McpConfigDirCreate { path, error }, Ja) => {
+                format!("{path} の作成に失敗: {error}")
+            }
+            (Self::McpConfigDirCreate { path, error }, En) => {
+                format!("failed to create {path}: {error}")
+            }
+            (Self::McpConfigSerialize(e), Ja) => format!("JSON のシリアライズに失敗: {e}"),
+            (Self::McpConfigSerialize(e), En) => format!("failed to serialize the JSON: {e}"),
+            (Self::McpConfigWrite { path, error }, Ja) => {
+                format!("{path} への書き込みに失敗: {error}")
+            }
+            (Self::McpConfigWrite { path, error }, En) => {
+                format!("failed to write {path}: {error}")
+            }
+
+            (Self::AnswersMalformed(e), Ja) => format!("setup answers が不正: {e}"),
+            (Self::AnswersMalformed(e), En) => format!("the setup answers are malformed: {e}"),
+            (Self::AnswersEncode(e), Ja) => format!("setup answers の JSON 化に失敗: {e}"),
+            (Self::AnswersEncode(e), En) => {
+                format!("failed to encode the setup answers as JSON: {e}")
+            }
+            (Self::SetupSpawn(e), Ja) => format!("tako setup の起動に失敗: {e}"),
+            (Self::SetupSpawn(e), En) => format!("failed to start tako setup: {e}"),
+            (Self::SetupStdinUnavailable, Ja) => "tako setup の標準入力を開けない".to_string(),
+            (Self::SetupStdinUnavailable, En) => {
+                "cannot open the standard input of tako setup".to_string()
+            }
+            (Self::AnswersSend(e), Ja) => format!("setup answers の送信に失敗: {e}"),
+            (Self::AnswersSend(e), En) => format!("failed to send the setup answers: {e}"),
+            (Self::SetupWaitFailed(reason), Ja) => format!("tako setup の完了待ちに失敗: {reason}"),
+            (Self::SetupWaitFailed(reason), En) => {
+                format!("failed to wait for tako setup to finish: {reason}")
+            }
+            (Self::SetupFailed { code, output }, Ja) => {
+                format!("tako setup が失敗しました (exit={code}): {output}")
+            }
+            (Self::SetupFailed { code, output }, En) => {
+                format!("tako setup failed (exit={code}): {output}")
+            }
+
+            (Self::SelectedAgent(got), Ja) => {
+                format!("selected_agent は claude / codex / agy のいずれかです: {got}")
+            }
+            (Self::SelectedAgent(got), En) => {
+                format!("selected_agent must be one of claude / codex / agy: {got}")
+            }
+            (Self::ProviderPlanKey(got), Ja) => {
+                format!("provider_plans のキーは claude / gpt / google のいずれかです: {got}")
+            }
+            (Self::ProviderPlanKey(got), En) => {
+                format!("each provider_plans key must be one of claude / gpt / google: {got}")
+            }
+            (Self::InstructionEmpty, Ja) => "instruction_content は空にできません".to_string(),
+            (Self::InstructionEmpty, En) => "instruction_content cannot be empty".to_string(),
+            (Self::ProjectKeyEmpty, Ja) => "projects のキーは空にできません".to_string(),
+            (Self::ProjectKeyEmpty, En) => "a projects key cannot be empty".to_string(),
+            (Self::ProjectCwdEmpty(key), Ja) => format!("projects.{key}.cwd は空にできません"),
+            (Self::ProjectCwdEmpty(key), En) => format!("projects.{key}.cwd cannot be empty"),
+            (Self::LaunchAgent(got), Ja) => {
+                format!("launch_agent は claude / codex / agy / none のいずれかです: {got}")
+            }
+            (Self::LaunchAgent(got), En) => {
+                format!("launch_agent must be one of claude / codex / agy / none: {got}")
+            }
+            (Self::ModUi(e), _) => format!("mod_ui: {}", e.text_in(lang)),
+            (Self::SleepMode(got), Ja) => format!(
+                "sleep_guard.mode は off / on / while-agents-running のいずれかです: {got}"
+            ),
+            (Self::SleepMode(got), En) => format!(
+                "sleep_guard.mode must be one of off / on / while-agents-running: {got}"
+            ),
+            (Self::SleepPower(got), Ja) => {
+                format!("sleep_guard.power は ac-only / always のいずれかです: {got}")
+            }
+            (Self::SleepPower(got), En) => {
+                format!("sleep_guard.power must be one of ac-only / always: {got}")
+            }
+            (Self::Profile(e), _) => e.text_in(lang),
+
+            (Self::ConfigHomeUnresolved, Ja) => {
+                "ホームディレクトリが取得できない（$HOME 未設定）".to_string()
+            }
+            (Self::ConfigHomeUnresolved, En) => {
+                "cannot determine the home directory ($HOME is not set)".to_string()
+            }
+            (Self::ConfigRead(e), Ja) => format!("config.yaml の読み取りに失敗: {e}"),
+            (Self::ConfigRead(e), En) => format!("failed to read config.yaml: {e}"),
+            (Self::ConfigParse(reason), Ja) => {
+                format!("config.yaml のパースに失敗: {}", reason.text_in(lang))
+            }
+            (Self::ConfigParse(reason), En) => {
+                format!("failed to parse config.yaml: {}", reason.text_in(lang))
+            }
+            (Self::ChangelogParse(reason), Ja) => {
+                format!("changes.yaml のパースに失敗: {}", reason.text_in(lang))
+            }
+            (Self::ChangelogParse(reason), En) => {
+                format!("failed to parse changes.yaml: {}", reason.text_in(lang))
+            }
+            (Self::ChangelogPlatform { revision, value }, Ja) => format!(
+                "changes.yaml revision {revision} の platforms に未知の値: {value}（macos / windows）"
+            ),
+            (Self::ChangelogPlatform { revision, value }, En) => format!(
+                "unknown value in the platforms of changes.yaml revision {revision}: {value} \
+                 (macos / windows)"
+            ),
+
+            (Self::SyncSourceUnset, Ja) => "共通ルールの正本パスが設定されていません。\n\
+                 tako setup で設定するか、--source オプションで指定してください"
+                .to_string(),
+            (Self::SyncSourceUnset, En) => "the path of the shared rules file is not set.\n\
+                 Set it with tako setup, or pass it with the --source option"
+                .to_string(),
+            (Self::SyncSourceMissing(path), Ja) => format!(
+                "正本ファイルが見つかりません: {path}\n\
+                 ファイルを作成するか、tako setup で正本のパスを設定してください"
+            ),
+            (Self::SyncSourceMissing(path), En) => format!(
+                "the shared rules file does not exist: {path}\n\
+                 Create the file, or set its path with tako setup"
+            ),
+            (Self::SyncSourceRead(e), Ja) => format!("正本ファイルの読み取りに失敗: {e}"),
+            (Self::SyncSourceRead(e), En) => {
+                format!("failed to read the shared rules file: {e}")
+            }
+            (Self::SyncSourceEmpty, Ja) => "正本ファイルが空です".to_string(),
+            (Self::SyncSourceEmpty, En) => "the shared rules file is empty".to_string(),
+
+            (Self::UnknownDep { got, allowed }, Ja) => {
+                format!("不明な依存: {got:?}（この環境の対象は {allowed}）")
+            }
+            (Self::UnknownDep { got, allowed }, En) => {
+                format!("unknown dependency: {got:?} (the ones for this environment: {allowed})")
+            }
+            (Self::DepInstallerSpawn { program, error }, Ja) => {
+                format!("{program} を起動できません: {error}")
+            }
+            (Self::DepInstallerSpawn { program, error }, En) => {
+                format!("cannot start {program}: {error}")
+            }
+            (Self::DepInstallerFailed { command, code, log }, Ja) => format!(
+                "{command} が失敗しました（exit {code}）。上に出ているエラーを確認してください{}",
+                log_detail(log)
+            ),
+            (Self::DepInstallerFailed { command, code, log }, En) => format!(
+                "{command} failed (exit {code}). Check the error shown above{}",
+                log_detail(log)
+            ),
+            (Self::DepMissingAfterInstall { command, bin }, Ja) => format!(
+                "{command} は正常終了しましたが {bin} が見つかりません。\n\
+                 ターミナルを開き直してから `tako setup deps` で確認してください"
+            ),
+            (Self::DepMissingAfterInstall { command, bin }, En) => format!(
+                "{command} finished without errors, but {bin} cannot be located.\n\
+                 Reopen the terminal, then check with `tako setup deps`"
+            ),
+
+            (Self::UnknownBootstrapAgent { got, allowed }, Ja) => {
+                format!("不明なエージェント: {got:?}（{allowed} のいずれか）")
+            }
+            (Self::UnknownBootstrapAgent { got, allowed }, En) => {
+                format!("unknown agent: {got:?} (one of {allowed})")
+            }
+            (Self::BootstrapHomeUnresolved, Ja) => {
+                "ホームディレクトリを特定できません（HOME が未設定）".to_string()
+            }
+            (Self::BootstrapHomeUnresolved, En) => {
+                "cannot determine the home directory (HOME is not set)".to_string()
+            }
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(Lang::Ja)
+    }
+
+    /// 「無効なパラメータ: 」の断りへ載せる（枠と同じ表示言語で組む）
+    pub fn invalid(self) -> DispatchError {
+        DispatchError::InvalidParams(self.to_string())
+    }
+
+    /// 前置きの無い理由の文として載せる（表示言語で組む）
+    pub fn operation(self) -> DispatchError {
+        DispatchError::Operation(self.to_string())
+    }
+}
+
+/// 導入器の出力の添え方（空なら添えない・あれば改行を挟む。#2365 より前の組み立てのまま）
+fn log_detail(log: &str) -> String {
+    if log.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n{}", log.trim())
+    }
+}
+
+impl std::fmt::Display for SetupRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
+impl std::error::Error for SetupRefusal {}
+
+impl From<ConfigError> for SetupRefusal {
+    fn from(e: ConfigError) -> Self {
+        Self::Profile(e)
+    }
+}

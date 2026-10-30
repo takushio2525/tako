@@ -92,8 +92,8 @@ const ALLOWED: &[Allow] = &[
     },
     Allow {
         file: "crates/tako-control/src/dispatch.rs",
-        needle: "setup answers が不正",
-        why: "setup の answers（IPC / MCP の引数）",
+        needle: "SetupRefusal::AnswersMalformed(",
+        why: "setup の answers（IPC / MCP の引数。#2365 で文を SetupRefusal へ移した）",
     },
     Allow {
         file: "crates/tako-control/src/remote.rs",
