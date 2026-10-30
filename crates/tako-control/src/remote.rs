@@ -2660,19 +2660,77 @@ pub fn daemon_pid_if_alive() -> Option<u32> {
     is_process_alive(info.pid).then_some(info.pid)
 }
 
-pub fn daemon_status() -> Value {
-    let pid_info = match parse_pid_file() {
-        Ok(info) => info,
-        Err(_) => return with_autostart_fields(with_pidless_listener(json!({ "running": false }))),
+/// A/B: #2539 前へ戻す（生死だけを知りたい口 = GUI の 2 秒ごとの状態の更新と `admin_request` が
+/// [`daemon_status`] を丸ごと引く）。立てると daemon の稼働中は GUI が 1 tick に tailscale の系統の
+/// 調査を 2 回（= 2 秒ごとに tailscale の CLI を 6 本）起こす = Issue の症状
+pub const ISSUE2539_LEGACY_ENV: &str = "TAKO_2539_LEGACY";
+
+/// PID ファイルが指す daemon の生死（[`daemon_status`] と [`daemon_running`] の判定の 1 実装。#2539）
+enum Liveness {
+    /// PID ファイルが無い・読めない
+    NoPidFile,
+    /// PID ファイルはあるがプロセスが死んでいる（残骸は掃除済み）
+    Dead,
+    /// 生きている
+    Alive(PidInfo),
+}
+
+/// daemon の生死を見る。死んでいれば state の残骸を掃除する（書き込みがある。読み取りだけの口は
+/// [`daemon_pid_if_alive`]）。**tailscale には話しかけない**
+fn liveness() -> Liveness {
+    let Ok(info) = parse_pid_file() else {
+        return Liveness::NoPidFile;
     };
-    let pid_num = pid_info.pid;
-    if !is_process_alive(pid_num) {
+    if !is_process_alive(info.pid) {
         // #445: TAKO_ISOLATED が有効なら他インスタンスの state を消さない（二重防御）
         if !is_isolated() {
             cleanup_state_files();
         }
-        return with_autostart_fields(json!({ "running": false }));
+        return Liveness::Dead;
     }
+    Liveness::Alive(info)
+}
+
+/// daemon が動いているか（`daemon_status()["running"]` と同じ答え。#2539）。
+///
+/// 生死だけを知りたい口（GUI の 2 秒ごとの状態の更新・[`admin_request`]・端末の操作）はこれを引く。
+/// [`daemon_status`] は表示の欄（2 系統の同居の警告 = `tailscale::survey_variants`）のために
+/// tailscale の CLI を最大 3 本起こすので、生死の判定に使うと daemon の稼働中は GUI が
+/// 2 秒ごとに 6 本（そのまま 1 回 + `admin_request` の中で 1 回）起こし続けた。
+/// 死んだ daemon の残骸の掃除は [`daemon_status`] と同じ [`liveness`] を通る
+pub fn daemon_running() -> bool {
+    if std::env::var(ISSUE2539_LEGACY_ENV).is_ok_and(|v| v == "1") {
+        return legacy_running_via_status();
+    }
+    matches!(liveness(), Liveness::Alive(_))
+}
+
+/// #2539 前の生死の判定（A/B 用。[`daemon_status`] を丸ごと引く = tailscale の系統の調査つき）
+fn legacy_running_via_status() -> bool {
+    daemon_status()["running"].as_bool() == Some(true)
+}
+
+/// GUI の状態の更新が 2 秒ごとに引く admin state（#2539。`refresh_remote_state` の中身の 1 実装）。
+/// daemon が止まっていれば `{"running": false}`。1 回の呼び出しで tailscale を起こさない
+pub fn poll_admin_state() -> Result<Value, String> {
+    if daemon_running() {
+        admin_request("GET", "/api/admin/state", None)
+    } else {
+        Ok(json!({ "running": false }))
+    }
+}
+
+/// daemon の状態の全欄（`tako remote status` / MCP `tako_remote_status` / 自動復帰の判断が読む）。
+/// 引くたびに 2 系統の同居を調べる（tailscale の CLI を最大 3 本）ので、生死だけなら [`daemon_running`]（#2539）
+pub fn daemon_status() -> Value {
+    let pid_info = match liveness() {
+        Liveness::Alive(info) => info,
+        Liveness::NoPidFile => {
+            return with_autostart_fields(with_pidless_listener(json!({ "running": false })))
+        }
+        Liveness::Dead => return with_autostart_fields(json!({ "running": false })),
+    };
+    let pid_num = pid_info.pid;
     // URL ファイル（起動時に確定した固定 ts.net URL）から接続リンクを再構成する。
     // #283: URL に token は含まれない（QR も固定 URL のみ）
     let base_url = std::fs::read_to_string(url_path())
@@ -3993,8 +4051,8 @@ fn kill_stale_daemon(
 /// `platform::local_endpoint` が吸収するので、ここは HTTP/1.1 を自前で組むだけ
 /// （外部依存を増やさないため）
 pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
-    let status = daemon_status();
-    if status["running"].as_bool() != Some(true) {
+    // 見るのは生死だけ（#2539。`daemon_status` は表示の欄のために tailscale を起こす）
+    if !daemon_running() {
         return Err("リモートサーバーが起動していない".to_string());
     }
     let endpoint = current_endpoint()
@@ -4074,7 +4132,7 @@ pub fn legacy_1452() -> bool {
 pub fn devices_set_role(device_id: &str, role_str: &str) -> Result<Value, String> {
     let next = crate::remote_auth::DeviceRole::parse(role_str)
         .ok_or_else(|| format!("不正な role: {role_str}（observe / interact / manage / admin）"))?;
-    let running = daemon_status()["running"].as_bool() == Some(true);
+    let running = daemon_running();
     // 現 role は daemon 稼働中でも**同じ答え**（稼働中は admin state、停止中は
     // devices.json。どちらも `devices_list` の 1 実装が吸収する）
     let current = devices_list()?["devices"]
@@ -4112,7 +4170,7 @@ pub fn devices_set_role(device_id: &str, role_str: &str) -> Result<Value, String
 /// 登録済みデバイスの一覧（CLI `tako remote devices list` / MCP / GUI から使う）。
 /// daemon 稼働中は admin API（接続状態込み）、停止中は devices.json を直接読む
 pub fn devices_list() -> Result<Value, String> {
-    if daemon_status()["running"].as_bool() == Some(true) {
+    if daemon_running() {
         return admin_request("GET", "/api/admin/state", None);
     }
     let reg = DeviceRegistry::open(&state_dir())?;
@@ -4123,7 +4181,7 @@ pub fn devices_list() -> Result<Value, String> {
 /// デバイスの登録を失効させる（CLI `tako remote devices revoke` / MCP / GUI から使う）。
 /// daemon 稼働中は admin API 経由（接続中 WS の即時切断込み）、停止中はレジストリ直接編集
 pub fn devices_revoke(device_id: &str) -> Result<Value, String> {
-    if daemon_status()["running"].as_bool() == Some(true) {
+    if daemon_running() {
         return admin_request(
             "POST",
             "/api/admin/devices/revoke",

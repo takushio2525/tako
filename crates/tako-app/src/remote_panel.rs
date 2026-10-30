@@ -28,7 +28,7 @@
 //! |---|---|---|---|---|
 //! | 起動ボタン | `remote::spawn_daemon` | `RemoteStart`（`RemoteHost::remote_start`） | `tako remote start` | `tako_remote_start` |
 //! | 停止ボタン（= kill switch。確認つき） | `remote::daemon_stop` | `RemoteStop`（`RemoteHost::remote_stop`） | `tako remote stop` | `tako_remote_stop` |
-//! | 状態ポーリング | `remote::daemon_status` | `RemoteStatus` | `tako remote status` | `tako_remote_status` |
+//! | 状態ポーリング | `remote::poll_admin_state`（生死は `remote::daemon_running` = tailscale を起こさない。#2539） | `RemoteStatus` / `RemoteDevices{list}` | `tako remote status` / `tako remote devices list` | `tako_remote_status` / `tako_remote_devices` |
 //! | 不足項目の確認 | `remote_setup::check_status` | `RemoteSetup{action:"check"}` | `tako remote setup --answers`（check） | `tako_remote_setup` |
 //! | 端末の失効 | admin API `/devices/revoke` | `RemoteDevices{revoke}` | `tako remote devices revoke` | `tako_remote_devices` |
 
@@ -299,14 +299,9 @@ impl TakoApp {
         cx.spawn(async move |this, cx| {
             let value = cx
                 .background_executor()
-                .spawn(async move {
-                    // daemon 稼働中のときだけ admin state を取得する
-                    if tako_control::remote::daemon_status()["running"].as_bool() == Some(true) {
-                        tako_control::remote::admin_request("GET", "/api/admin/state", None)
-                    } else {
-                        Ok(serde_json::json!({ "running": false }))
-                    }
-                })
+                // daemon 稼働中のときだけ admin state を取得する。生死は PID ファイルだけで見る
+                // （#2539。`daemon_status` は表示の欄のために tailscale を起こすので、2 秒ごとに引かない）
+                .spawn(async move { tako_control::remote::poll_admin_state() })
                 .await;
             let _ = this.update(cx, |app, cx| {
                 let before_running = app.remote.running;

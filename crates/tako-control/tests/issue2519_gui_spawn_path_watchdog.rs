@@ -87,6 +87,11 @@ const REMOTE_REFRESH: &[(&str, &str)] = &[
         "crates/tako-app/src/remote_panel.rs",
         "refresh_remote_state",
     ),
+    // #2539 から 2 秒ごとに通るのは poll_admin_state → daemon_running → liveness（tailscale を起こさない）。
+    // daemon_status は A/B（TAKO_2539_LEGACY=1）と `tako remote status` の口として残す
+    ("crates/tako-control/src/remote.rs", "poll_admin_state"),
+    ("crates/tako-control/src/remote.rs", "daemon_running"),
+    ("crates/tako-control/src/remote.rs", "liveness"),
     ("crates/tako-control/src/remote.rs", "daemon_status"),
     ("crates/tako-control/src/remote.rs", "admin_request"),
     ("crates/tako-control/src/tailscale.rs", "survey_variants"),
@@ -455,7 +460,10 @@ fn 逆戻りを名指しできる() {
     assert!(!hits.is_empty(), "Held を外しても名指しされない");
 
     // 5: remote の状態の更新が通る口へ素の名前の起動を足す
-    let (rel, func) = REMOTE_REFRESH[1];
+    let (rel, func) = *REMOTE_REFRESH
+        .iter()
+        .find(|(_, f)| *f == "daemon_status")
+        .expect("REMOTE_REFRESH に daemon_status が在る");
     let src = read(rel);
     let head = "pub fn daemon_status() -> Value {";
     let at = src.find(head).expect("remote.rs に daemon_status が在る");
