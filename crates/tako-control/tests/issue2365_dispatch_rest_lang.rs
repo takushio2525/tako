@@ -662,8 +662,11 @@ fn expand_old(old: &str, pane: u64, tab: u64, locked: &std::path::Path) -> Strin
         .replace("<note>", &tako_control::reach::no_detached_capture_note())
 }
 
+/// このバイナリのテストは 1 本だけ（`TAKO_DATA_DIR` と表示言語をプロセスで 1 つ書き換えるので、
+/// 並走する別のテストを作らない = #2400）。比べ方の検査（差し込みの境界）も先頭でここから呼ぶ
 #[test]
 fn dispatch_の残りの断りは表示言語に従う() {
+    expand_boundaries();
     // 読む置き場（リモートの保存待ち・ledger など）を一時の場所へ向ける。断る前に書く経路は無い
     let data = std::env::temp_dir().join(format!("tako-2365l-{}", std::process::id()));
     std::fs::create_dir_all(&data).expect("一時の data dir");
@@ -737,9 +740,8 @@ fn expand_with_seen(old: &str, seen: &str, locked: &std::path::Path) -> String {
     expand_old(old, pane, tab, locked)
 }
 
-/// 番犬自身の検査: 差し込みは観測した数字で埋まり、前置きが違えば埋めない（= 比較で落ちる）
-#[test]
-fn 旧文の差し込みの境界() {
+/// 比べ方自身の検査: 差し込みは観測した数字で埋まり、前置きが違えば埋めない（= 比較で落ちる）
+fn expand_boundaries() {
     let locked = std::path::Path::new("/tmp/l");
     assert_eq!(
         expand_with_seen("ペイン <pane> は器: x", "ペイン 42 は器: x", locked),

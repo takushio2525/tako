@@ -927,7 +927,7 @@ pub enum Reason {
         error: String,
     },
     /// `ファイルの読み取りに失敗（<path>: <error>）`
-    FileReadFailed {
+    FileReadError {
         path: String,
         error: String,
     },
@@ -2643,10 +2643,10 @@ impl Reason {
             (Self::FileUnreadable { path, error }, En) => {
                 format!("cannot read the file ({path}: {error})")
             }
-            (Self::FileReadFailed { path, error }, Ja) => {
+            (Self::FileReadError { path, error }, Ja) => {
                 format!("ファイルの読み取りに失敗（{path}: {error}）")
             }
-            (Self::FileReadFailed { path, error }, En) => {
+            (Self::FileReadError { path, error }, En) => {
                 format!("failed to read the file ({path}: {error})")
             }
             (Self::AgentCliUnchecked(agent), Ja) => format!(
@@ -14738,7 +14738,7 @@ fn read_file_head(path: &Path) -> Result<String, DispatchError> {
     })?;
     let mut buf = vec![0u8; 16 * 1024];
     let n = file.read(&mut buf).map_err(|e| {
-        Reason::FileReadFailed {
+        Reason::FileReadError {
             path: path.display().to_string(),
             error: e.to_string(),
         }
@@ -33532,7 +33532,11 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(out_of_range.contains("2 件"), "{out_of_range}");
+        // 断りは表示言語に従う（#2365）ので日英どちらでも見る
+        assert!(
+            out_of_range.contains("2 件") || out_of_range.contains("(2 items)"),
+            "{out_of_range}"
+        );
         // 版が違えば入れない（問い合わせのあいだに打った）
         let stale = lsp_completion_land(
             &mut host,
@@ -34265,7 +34269,9 @@ mod tests {
             .req(),
         );
         assert!(
-            matches!(&home_only, Err(DispatchError::InvalidParams(m)) if m.contains("ホーム")),
+            // 断りは表示言語に従う（#2365）ので日英どちらでも見る
+            matches!(&home_only, Err(DispatchError::InvalidParams(m))
+                if m.contains("ホーム") || m.contains("home folder")),
             "{home_only:?}"
         );
         // 範囲を省く = タブのファイルツリーのルート（ここではピン留めしたフォルダ）
@@ -37372,7 +37378,12 @@ mod tests {
             panic!("UI スレッドの続き");
         };
         let err = finish_offload(&mut host, next, PaneOrigin::Cli).expect_err("置かない");
-        assert!(err.to_string().contains("ファイルが変わった"), "{err}");
+        // 断りは表示言語に従う（#2365）ので日英どちらでも見る
+        assert!(
+            err.to_string().contains("ファイルが変わった")
+                || err.to_string().contains("file changed"),
+            "{err}"
+        );
         assert!(host.preview_changelogs.is_empty());
     }
 
@@ -37526,7 +37537,12 @@ mod tests {
         let next = stage(&mut host);
         dispatch(&mut host, off.clone(), PaneOrigin::Cli).expect("閉じる");
         let err = finish_offload(&mut host, next, PaneOrigin::Cli).expect_err("置かない");
-        assert!(err.to_string().contains("変更履歴が変わった"), "{err}");
+        // 枠は表示言語に従う（#2365）ので日英どちらでも見る。中身は host の文のまま
+        assert!(
+            err.to_string().contains("変更履歴が変わった")
+                || err.to_string().contains("change history changed"),
+            "{err}"
+        );
         assert!(err.to_string().contains("有効ではない"), "{err}");
         let err = dispatch(
             &mut host,
@@ -37544,7 +37560,12 @@ mod tests {
         host.previews
             .insert(root, ("/tmp/other.rs".into(), PreviewModeWire::Code));
         let err = finish_offload(&mut host, next, PaneOrigin::Cli).expect_err("置かない");
-        assert!(err.to_string().contains("ファイルが変わった"), "{err}");
+        // 断りは表示言語に従う（#2365）ので日英どちらでも見る
+        assert!(
+            err.to_string().contains("ファイルが変わった")
+                || err.to_string().contains("file changed"),
+            "{err}"
+        );
         // 取っている間に別のパスの変更履歴へ入れ替わった（同じコミットが並ぶのでハッシュでは見分けられない）
         host.previews
             .insert(root, (file.clone(), PreviewModeWire::Code));
@@ -37554,7 +37575,10 @@ mod tests {
             .expect("履歴")
             .rel_path = Some("other.txt".into());
         let err = finish_offload(&mut host, next, PaneOrigin::Cli).expect_err("置かない");
-        assert!(err.to_string().contains("入れ替わった"), "{err}");
+        assert!(
+            err.to_string().contains("入れ替わった") || err.to_string().contains("was replaced"),
+            "{err}"
+        );
         assert!(host.preview_changelog_diffs.is_empty());
         // 同じファイルの変更履歴を開き直しただけなら置く
         dispatch(&mut host, changelog_on(root), PaneOrigin::Cli).expect("開き直す");
@@ -54428,10 +54452,11 @@ mod tests {
             );
             // 違う鍵の答えは使わない（別の pid・別の agent・別の器）
             assert_eq!(caller_pane_by_pid(&host, 1), None);
-            assert!(agent_preflight(WorkerAgent::Codex)
-                .unwrap_err()
-                .to_string()
-                .contains("確かめられなかった"));
+            // 断りは表示言語に従う（#2365）ので、文ではなく寄せた先の理由と比べる
+            assert_eq!(
+                agent_preflight(WorkerAgent::Codex).unwrap_err().to_string(),
+                Reason::AgentCliUnchecked(WorkerAgent::Codex.as_str()).to_string()
+            );
             assert_eq!(restart_scan(Some("other")).0, None);
         });
         // 答えが空の内側: どれも子プロセスを起こさず、待たない側の値を返す
@@ -54832,14 +54857,19 @@ mod tests {
                 .to_string()
                 .contains("gone が見つからない"));
             // 違う鍵の答えは使わない
-            assert!(git_conflict_for(Path::new("/elsewhere"))
-                .unwrap_err()
-                .to_string()
-                .contains("確かめられなかった"));
-            assert!(tmux_open_lookup(Some("other"), "gone")
-                .unwrap_err()
-                .to_string()
-                .contains("確かめられなかった"));
+            // 断りは表示言語に従う（#2365）ので、文ではなく寄せた先の理由と比べる
+            assert_eq!(
+                git_conflict_for(Path::new("/elsewhere"))
+                    .unwrap_err()
+                    .to_string(),
+                Reason::GitConflictUnchecked.to_string()
+            );
+            assert_eq!(
+                tmux_open_lookup(Some("other"), "gone")
+                    .unwrap_err()
+                    .to_string(),
+                Reason::TmuxSessionUnchecked.to_string()
+            );
         });
     }
 
@@ -57703,7 +57733,12 @@ mod tests {
         };
         assert_eq!(sel(&mut host, None, None), json!({ "selection": null }));
         let err = issue1908_sel(&mut host, None, Some("down")).unwrap_err();
-        assert!(err.to_string().contains("選んでいない"), "{err}");
+        // 断りは表示言語に従う（#2365）ので日英どちらでも見る
+        assert!(
+            err.to_string().contains("選んでいない")
+                || err.to_string().contains("no file tree row"),
+            "{err}"
+        );
         // 行を選ぶ（同じ行を選び直しても変わらない）
         let v = sel(&mut host, Some("/w/a.txt"), None);
         assert_eq!(v["selection"]["paths"], json!(["/w/a.txt"]));
@@ -57805,7 +57840,12 @@ mod tests {
             "語彙を全部挙げる: {bad}"
         );
         let hidden = issue1908_sel(&mut host, Some("/w/d/zzz"), None).unwrap_err();
-        assert!(hidden.to_string().contains("見えていない"), "{hidden}");
+        // 断りは表示言語に従う（#2365）ので日英どちらでも見る
+        assert!(
+            hidden.to_string().contains("見えていない")
+                || hidden.to_string().contains("not visible"),
+            "{hidden}"
+        );
         let other_tab = dispatch(
             &mut host,
             Request::TreeSelection {
@@ -57816,8 +57856,10 @@ mod tests {
             PaneOrigin::Mcp,
         )
         .unwrap_err();
+        // 断りは表示言語に従う（#2365）ので日英どちらでも見る
         assert!(
-            other_tab.to_string().contains("アクティブタブ"),
+            other_tab.to_string().contains("アクティブタブ")
+                || other_tab.to_string().contains("only the active tab"),
             "{other_tab}"
         );
         // リモート（SSH）の行はキーで動かさない（#1895 の ⇧↑ / ⇧↓ と同じ）

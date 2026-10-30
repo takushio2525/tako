@@ -801,7 +801,7 @@ fn reason_index(r: &Reason) -> usize {
         Reason::RunConfigNeedsPath => 275,
         Reason::SaveBeforeRunFailed { .. } => 276,
         Reason::FileUnreadable { .. } => 277,
-        Reason::FileReadFailed { .. } => 278,
+        Reason::FileReadError { .. } => 278,
         // #2365 の続き: 先取りの答えが無かった断り・git・tmux・動画・ウィンドウ・引き継ぎ
         Reason::AgentCliUnchecked(_) => 279,
         Reason::GitConflictUnchecked => 280,
@@ -1325,7 +1325,7 @@ fn reason_samples() -> Vec<Reason> {
             path: "/tmp/x.py".into(),
             error: "No such file or directory (os error 2)".into(),
         },
-        Reason::FileReadFailed {
+        Reason::FileReadError {
             path: "/tmp/x.py".into(),
             error: "Is a directory (os error 21)".into(),
         },
