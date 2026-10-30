@@ -870,7 +870,8 @@ mod iokit {
         if DISPLAY_SLEEP_SENT.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        let _ = std::process::Command::new("pmset")
+        // GUI のスリープ防止の周期から起こすので PATH で引いた絶対パスで起こす（#2519）
+        let _ = std::process::Command::new(tako_core::platform::exe::resolve_for_spawn("pmset"))
             .arg("displaysleepnow")
             .output();
         DISPLAY_SLEEP_SENT.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1092,7 +1093,8 @@ pub fn set_disablesleep(enable: bool) -> Result<(), String> {
         return Err("sudoers 未登録（tako setup --lid-sleep で登録してください）".to_string());
     }
     let val = if enable { "1" } else { "0" };
-    let output = std::process::Command::new("sudo")
+    // GUI のスリープ防止の周期が状態の変わり目ごとに起こすので PATH で引いた絶対パスで起こす（#2519）
+    let output = std::process::Command::new(tako_core::platform::exe::resolve_for_spawn("sudo"))
         .args(["-n", "/usr/bin/pmset", "-a", "disablesleep", val])
         .output()
         .map_err(|e| format!("pmset の実行に失敗: {e}"))?;

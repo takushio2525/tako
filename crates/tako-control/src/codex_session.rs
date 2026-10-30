@@ -367,8 +367,10 @@ pub fn thread_id_from_lsof(out: &str) -> Option<String> {
 pub fn thread_id_for_pid(pid: u32) -> Option<String> {
     // GUI から到達する経路なのでコンソール窓の抑止を通す（#628 / #586）。
     // なお `lsof` は POSIX の道具で Windows には無い（Windows の codex 対応は
-    // ロックの持ち主を別の手段で引く必要がある）
-    let mut cmd = std::process::Command::new("lsof");
+    // ロックの持ち主を別の手段で引く必要がある）。
+    // GUI の会話 ID の走査が 30 秒ごとに codex のペインぶん起こすので、PATH で引いた
+    // 絶対パスで起こす（#2519。素の名前だと PATH の空振りごとに子が一瞬作られる）
+    let mut cmd = std::process::Command::new(tako_core::platform::exe::resolve_for_spawn("lsof"));
     cmd.args(["-p", &pid.to_string(), "-Fn"]);
     tako_core::platform::process::no_console_window(&mut cmd);
     let out = cmd.output().ok()?;

@@ -13,13 +13,14 @@ use std::time::{Duration, Instant};
 
 use crate::theme::Rgb;
 
-/// git バイナリの場所（tmux_bin と同パターン、プロセス内 1 回解決）
+/// git バイナリの場所（tmux_bin と同パターン、プロセス内 1 回解決。PATH で当たったときも
+/// 絶対パスを返す = #2519）
 pub fn git_bin() -> &'static str {
-    static BIN: OnceLock<String> = OnceLock::new();
-    BIN.get_or_init(resolve_git_bin)
+    static BIN: OnceLock<crate::bin_resolve::Held> = OnceLock::new();
+    BIN.get_or_init(resolve_git_bin).current()
 }
 
-fn resolve_git_bin() -> String {
+fn resolve_git_bin() -> crate::bin_resolve::Held {
     crate::resolve_bin(
         "TAKO_GIT_BIN",
         "git",

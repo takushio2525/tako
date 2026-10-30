@@ -311,6 +311,33 @@ pub fn find_in_process_path(name: &str) -> Option<String> {
     }
 }
 
+/// A/B: #2519 前へ戻す（長生きするプロセスが周期的に起こす外部コマンドを素の名前のまま起こす）。
+/// 立てると GUI の git / tmux（`bin_resolve`）・codex / agy の `lsof`・スリープ防止の
+/// `sudo` / `pmset` が PATH の空振りを繰り返す = Issue の症状の起点
+pub const ISSUE2519_LEGACY_ENV: &str = "TAKO_2519_LEGACY";
+
+/// [`ISSUE2519_LEGACY_ENV`] が立っているか（#2519 の A/B のゲートはここ 1 か所）
+pub fn issue2519_legacy() -> bool {
+    std::env::var(ISSUE2519_LEGACY_ENV).is_ok_and(|v| v == "1")
+}
+
+/// 長生きするプロセスが外部コマンドを起こす直前の名前（#2519）。
+///
+/// 素の名前を**起こすたびに**このプロセスの PATH で引き直し（[`find_in_process_path`]。
+/// ディレクトリを順に見るだけで子は起こさない）、当たった絶対パスを返す。起こす側は
+/// `posix_spawn` 1 回で済み、PATH の手前のエントリの空振りが無い。毎回引き直すので、
+/// 起動後に PATH の手前へ入った版（Homebrew の導入等）も、消えた版の後ろの版も、
+/// 素の名前で起こしたときと同じ場所に当たる（持ち続けて古くなる答えが無い）。
+///
+/// 引けないとき（Windows・PATH に無い・パスを渡された・A/B の [`ISSUE2519_LEGACY_ENV`]）は
+/// 受け取った名前のまま返す = 従来と同じ起こし方
+pub fn resolve_for_spawn(name: &str) -> String {
+    if issue2519_legacy() {
+        return name.to_string();
+    }
+    find_in_process_path(name).unwrap_or_else(|| name.to_string())
+}
+
 /// libc の `posix_spawnp` が PATH 未設定のときに使う既定（`_PATH_DEFPATH`）
 #[cfg(unix)]
 const SPAWNP_DEFAULT_PATH: &str = "/usr/bin:/bin";

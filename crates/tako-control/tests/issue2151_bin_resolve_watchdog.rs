@@ -294,14 +294,14 @@ fn 打ち切りの知らせの受け口をmainが渡している() {
 #[test]
 fn 逆戻りを名指しできる() {
     let src = read(BIN_RESOLVE);
-    let bounded = "crate::probe::output_with_timeout(name, &[version_flag], left())";
+    let bounded = "crate::probe::output_with_timeout(&target, &[version_flag], left())";
     assert!(
         src.contains(bounded),
         "注入の目印が本文に無い（番犬の注入を追従させること）"
     );
     let unbounded = src.replace(
         bounded,
-        "std::process::Command::new(name).arg(version_flag).output()",
+        "std::process::Command::new(&target).arg(version_flag).output()",
     );
     let hits = scan_bin_resolve(&unbounded);
     assert!(
