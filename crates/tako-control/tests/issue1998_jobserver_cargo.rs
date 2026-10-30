@@ -70,7 +70,9 @@ fn main() {{
     std::thread::sleep(std::time::Duration::from_millis({sleep_ms}));
     let e = now();
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open({log:?}).unwrap();
-    writeln!(f, "{name} {{s}} {{e}}").unwrap();
+    // 1 行を 1 回の write で（`writeln!` は部品ごとに write するので、並んだビルドスクリプトの行が混ざる）
+    let line = format!("{name} {{s}} {{e}}\n");
+    f.write_all(line.as_bytes()).unwrap();
 }}
 "#
             ),
@@ -122,8 +124,13 @@ fn overlap(log: &Path) -> usize {
     for line in text.lines() {
         let mut parts = line.split_whitespace().skip(1);
         if let (Some(s), Some(e)) = (parts.next(), parts.next()) {
-            events.push((s.parse().unwrap(), 1));
-            events.push((e.parse().unwrap(), -1));
+            let at = |v: &str| {
+                v.parse::<u128>().unwrap_or_else(|err| {
+                    panic!("区間の記録の行が壊れている（{err}）: {line:?}\n{text}")
+                })
+            };
+            events.push((at(s), 1));
+            events.push((at(e), -1));
         }
     }
     events.sort();

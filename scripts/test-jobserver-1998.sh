@@ -87,7 +87,9 @@ fn main() {
     std::thread::sleep(std::time::Duration::from_millis($ms));
     let e = now();
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open("$log").unwrap();
-    writeln!(f, "$c {s} {e}").unwrap();
+    // 1 行を 1 回の write で（writeln! は部品ごとに write するので、並んだビルドスクリプトの行が混ざる）
+    let line = format!("$c {s} {e}\n");
+    f.write_all(line.as_bytes()).unwrap();
 }
 RS
   done
