@@ -984,6 +984,8 @@ client_tty = backend セッションの pane_tty）ため、backend を先に見
   `command -v` の順で解決・キャッシュ）を全 tmux 呼び出しで使う。
   解決（`git_bin()` と共通の `tako_core::bin_resolve`）は全体で 5 秒の締め切りを持ち、
   rc が固まるログインシェルを打ち切ったら素の名前へ落として理由を persist.log へ残す（#2151）。
+  PATH の名前で当たったときも絶対パスで持つ（#2519。素の名前だと起こすたびに PATH を空振りし、
+  install の差し替えで GUI の実行ファイルが消えた後は空振りごとに AppleSystemPolicy の拒否が出る）。
   ② 明示コマンドは `terminal::login_shell_command`（`$SHELL -l -c "…"`）で包んで spawn する
   （ユーザーの PATH・環境で実行。直接 exec しない）
 - **Dock 起動の .app はロケール環境変数もゼロ → tmux クライアントが C ロケールになり、

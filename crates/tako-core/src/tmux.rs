@@ -26,13 +26,14 @@ pub const TMUX_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// 見えない（2026-06-12 実機リグレッション: tmuxview が空 + バックエンド永続化が
 /// 沈黙劣化）。解決順: `TAKO_TMUX_BIN` → PATH → 既知の場所 → ログインシェルの
 /// `command -v`（autorename の claude 解決と同じ手口）。不在なら "tmux" を返し、
-/// 呼び出し側は実行失敗として無害に劣化する
+/// 呼び出し側は実行失敗として無害に劣化する。PATH で当たったときもその絶対パスを返す
+/// （#2519。素の名前だと起こすたびに PATH を空振りする = `bin_resolve` の冒頭）
 pub fn tmux_bin() -> &'static str {
-    static BIN: OnceLock<String> = OnceLock::new();
-    BIN.get_or_init(resolve_tmux_bin)
+    static BIN: OnceLock<crate::bin_resolve::Held> = OnceLock::new();
+    BIN.get_or_init(resolve_tmux_bin).current()
 }
 
-fn resolve_tmux_bin() -> String {
+fn resolve_tmux_bin() -> crate::bin_resolve::Held {
     crate::resolve_bin(
         "TAKO_TMUX_BIN",
         "tmux",

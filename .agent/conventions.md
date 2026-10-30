@@ -919,6 +919,29 @@ AppleSystemPolicy が読めずに 1 本ずつ拒否する。記録されるパ�
 - 再現は実行中のプロセスを本物の `install_bundle_in_place` で差し替え、
   `log show --predicate 'eventMessage CONTAINS "<作業 dir>"'` の `would not allow process` を数える
   （絶対パスの spawn と PATH で当たった 1 回は記録されない・差し替えない対照は 0 件）
+- **GUI も同じ**（#2519）: git / tmux の場所の解決（`bin_resolve`）が PATH で当たった名前を素の名前のまま
+  持っていたので、2 秒ごとの定期更新（tmux 一覧・ファイルツリー・git・ペインログ）が install から GUI の
+  再起動までの間 **876〜1,448 件 / install** の拒否を積んだ（本番の GUI の PATH は `/opt/homebrew/bin` が
+  12 番目 = 1 回 11 本）。いまの形と、持った絶対パスが古くならないか:
+  - **git / tmux**（`git_bin()` / `tmux_bin()`）: PATH の段は `find_in_process_path` で引いた絶対パスで
+    `--version` を試し、通ればそれを `bin_resolve::Held` に持つ。持つのは PATH のエントリを繋いだパス
+    （symlink を解かない）なので `brew upgrade` をまたいでも同じ場所を指す。起こす直前に `Held::current` が
+    stat 1 回で在るかを見て、消えていたら素の名前へ戻る（= 修正前の起こし方）。起動後に PATH の手前へ
+    別の版が入っても GUI の再起動までは持った場所を使う（既知の場所・ログインシェルの段が前から持つ
+    性質と同じ。tmux は動いている器のサーバーと版が揃い続ける側に倒れる）
+  - **それ以外の周期の口**（codex / agy の会話 ID の `lsof` = 30 秒ごと × ペイン・スリープ防止の
+    `sudo` / `pmset`）: `exe::resolve_for_spawn` で**起こすたびに**引き直す（子を起こさず
+    ディレクトリを順に見るだけ。持たないので古くならない）
+  - GUI のプロセスの PATH は起動時の値のまま変わらない（tako-app は自分の PATH を書き換えない）。
+    変わるのはファイルシステムの側だけなので、上の 2 つで素の名前と同じ場所に当たる
+  - 縛らない口: ユーザー操作で 1 回（`open` / `osascript` / Code Runner / LSP の起動）・1 日 1 回
+    （アプリ内更新の `brew`）・オプトインの送信（telemetry の `hostname` 等）・macOS で届かない落ち先
+    （`agents` の `ps` は libproc が先に答える）・既に絶対パスかログインシェルで引く口（claude・ssh・
+    ffmpeg・`/bin/ps`・`/usr/bin/ditto`）。remote daemon の `hostname` はスマホの要求ごと（#2518 の範囲）
+  - A/B は `TAKO_2519_LEGACY=1`（ゲートは `exe::issue2519_legacy` の 1 か所）。番犬
+    `crates/tako-control/tests/issue2519_gui_spawn_path_watchdog.rs` が、git / tmux を絶対パスで持つこと
+    （実ファイルと実 PATH）・周期の口の表・本番コードの素の `git` / `tmux` のリテラルを file:line で見る。
+    **周期の口を足したら表（`PERIODIC`）にも載せる**
 
 ## OS に何かを「開かせる」前に形を確かめる（Issue #1376 / #1371）
 

@@ -28,6 +28,25 @@
 //! 打ち切りで失うのは「既知の場所にも PATH にも無く、ログインシェルだけが知っている git / tmux」で、
 //! そのときは `TAKO_GIT_BIN` / `TAKO_TMUX_BIN` で場所を渡せる（persist.log の行がそれを案内する）
 //!
+//! ## PATH で当たった名前も絶対パスで持つ（Issue #2519）
+//!
+//! 修正前は PATH の名前で当たると**素の名前**（`git` / `tmux`）のまま持ち、起こすたびに
+//! `posix_spawnp` が PATH を手前から試していた。空振り 1 回ごとにカーネルが**親の実行ファイルのまま**の
+//! 子を一瞬作るので、install の差し替え（`bundle_install` の `.tako-replace-<pid>`）で GUI の実行ファイルが
+//! 消えた後は、その子が AppleSystemPolicy に 1 本ずつ拒否された（実測: 2 秒ごとの定期更新が git / tmux を
+//! 約 7 回 × PATH の手前 11 エントリ = install 1 回あたり 876〜1,448 件。GUI を再起動するまで続く）。
+//!
+//! - PATH の段は素の名前を境界 B16 の `exe::find_in_process_path`（このプロセスの PATH を
+//!   `posix_spawnp` と同じ順で見る・子を起こさない）で**先に絶対パスへ引き**、その場所で `--version` を
+//!   試して、通ればその絶対パスを持つ。引けなければ素の名前のまま試す（Windows は常にこちら）
+//! - 持つのは PATH のエントリを繋いだパス（symlink を解かない）なので、`brew upgrade` で中身が
+//!   入れ替わっても同じ場所を指し続ける。起こす直前に [`Held::current`] が stat 1 回で在るかを確かめ、
+//!   消えていたら（`brew uninstall` 等）素の名前へ戻る = 修正前と同じ起こし方（PATH の後ろの版に当たる）
+//! - 起動後に PATH の手前へ別の版が入っても、GUI の再起動までは持った場所を使い続ける。既知の場所・
+//!   ログインシェルの段が修正前から持っていた性質と同じで、tmux は動いている器のサーバーと版を
+//!   揃え続けられる側に倒れる。GUI は install のたびに再起動するので古いまま残る期間は短い
+//! - A/B は `TAKO_2519_LEGACY=1`（ゲートは `exe::issue2519_legacy` の 1 か所）
+//!
 //! ## A/B と注入
 //!
 //! - `TAKO_2151_LEGACY=1` で修正前の解決（上限なし・知らせなし）へ戻る。ゲートは
@@ -35,6 +54,7 @@
 //! - `TAKO_2151_INJECT=skip-known-paths:<名前>[,<名前>…]` で、その名前の既知の場所の段を飛ばす
 //!   （検証専用）。macOS には `/usr/bin/git` が必ずあるので、これが無いとログインシェルの段へ届かない
 
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -91,6 +111,37 @@ pub(crate) enum Source {
     BareName,
 }
 
+/// 持っている場所（`git_bin()` / `tmux_bin()` の `OnceLock` の中身。#2519）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Held {
+    path: String,
+    /// PATH の名前で当たって絶対パスへ寄せたときの素の名前（それ以外の段で決まったときは `None`）
+    bare: Option<&'static str>,
+}
+
+impl Held {
+    /// 起こす直前の場所。
+    ///
+    /// PATH で当たって寄せた絶対パスが消えていたら素の名前を返す（[`crate::platform::exe::is_executable_file`]
+    /// の stat 1 回。子は起こさない）。素の名前は修正前の起こし方そのもので、PATH の後ろの版に当たる。
+    /// 環境変数・既知の場所・ログインシェルで決まった場所は修正前から絶対パスで持っていたので確かめない
+    pub(crate) fn current(&self) -> &str {
+        match self.bare {
+            Some(bare) if !crate::platform::exe::is_executable_file(Path::new(&self.path)) => bare,
+            _ => &self.path,
+        }
+    }
+
+    /// 解決の結果から持つ形を作る（PATH の段で絶対パスへ寄せたときだけ素の名前を覚える）
+    fn from_resolved(name: &'static str, resolved: &Resolved) -> Self {
+        let bare = (resolved.source == Source::Path && resolved.path != name).then_some(name);
+        Self {
+            path: resolved.path.clone(),
+            bare,
+        }
+    }
+}
+
 /// 解決の結果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Resolved {
@@ -134,23 +185,42 @@ impl Resolved {
 /// `git_bin()` / `tmux_bin()` の解決（呼び手の `OnceLock` の初期化から 1 回だけ呼ばれる）
 pub(crate) fn resolve_bin(
     env_var: &str,
-    name: &str,
+    name: &'static str,
     version_flag: &str,
     candidates: &[&str],
-) -> String {
+) -> Held {
     // 注入は「既知の場所が無い機」を作るもの = 新旧どちらの腕にも効かせる（A/B を同じ条件で並べる）
     let skip_known = inject_skips_known_paths(std::env::var(INJECT_ENV).ok().as_deref(), name);
     let known: &[&str] = if skip_known { &[] } else { candidates };
     if crate::probe::issue2151_legacy() {
-        return resolve_bin_legacy(env_var, name, version_flag, known);
+        return Held {
+            path: resolve_bin_legacy(env_var, name, version_flag, known),
+            bare: None,
+        };
     }
     let shell = login_shell();
     let budget = resolve_timeout();
-    let resolved = resolve_within(env_var, name, version_flag, known, shell.as_deref(), budget);
+    let resolved = resolve_within(
+        env_var,
+        name,
+        version_flag,
+        known,
+        shell.as_deref(),
+        budget,
+        in_process_path,
+    );
     if let Some(line) = resolved.log_line(name, env_var, budget) {
         NOTICES.emit(&line);
     }
-    resolved.path
+    Held::from_resolved(name, &resolved)
+}
+
+/// 素の名前をこのプロセスの PATH で絶対パスへ引く（#2519。境界 B16 の 1 実装。A/B では引かない）
+fn in_process_path(name: &str) -> Option<String> {
+    if crate::platform::exe::issue2519_legacy() {
+        return None;
+    }
+    crate::platform::exe::find_in_process_path(name)
 }
 
 /// 場所を尋ねるログインシェル（Windows には `$SHELL` も `command -v` も無いので尋ねない）
@@ -168,7 +238,10 @@ fn login_shell() -> Option<String> {
 /// 解決の本体（ログインシェルと締め切りを差し替えてテストで固定するために分けてある）。
 ///
 /// `budget` は全体の締め切りで、子プロセスを待つ段（`--version` とログインシェル）には
-/// その残りだけを渡す。`Duration::MAX` でも溢れない（残りは `saturating_sub` で数える）
+/// その残りだけを渡す。`Duration::MAX` でも溢れない（残りは `saturating_sub` で数える）。
+///
+/// `in_path` は素の名前をこのプロセスの PATH で絶対パスへ引く口（#2519。本番は
+/// `exe::find_in_process_path`）。引けた場所で `--version` を試し、通ればその絶対パスを持つ
 pub(crate) fn resolve_within(
     env_var: &str,
     name: &str,
@@ -176,6 +249,7 @@ pub(crate) fn resolve_within(
     candidates: &[&str],
     shell: Option<&str>,
     budget: Duration,
+    in_path: impl Fn(&str) -> Option<String>,
 ) -> Resolved {
     if let Some(bin) = std::env::var_os(env_var) {
         if !bin.is_empty() {
@@ -189,11 +263,15 @@ pub(crate) fn resolve_within(
     let start = Instant::now();
     let left = || budget.saturating_sub(start.elapsed());
     let mut timeouts = Vec::new();
+    // #2519: PATH で当たる場所を先に絶対パスへ引き、その場所を試してそのまま持つ。素の名前で持つと
+    // 起こすたびに PATH の手前を空振りし、install の差し替えで実行ファイルが消えた後は空振りごとに
+    // AppleSystemPolicy の拒否が出る。引けなければ素の名前のまま試す（従来と同じ答え）
+    let target = in_path(name).unwrap_or_else(|| name.to_string());
     // #586: 存在確認も GUI プロセスから走る（コンソールウィンドウの抑止は `output_with_timeout` が持つ）
-    match crate::probe::output_with_timeout(name, &[version_flag], left()) {
+    match crate::probe::output_with_timeout(&target, &[version_flag], left()) {
         crate::probe::Outcome::Done { status, .. } if status.success() => {
             return Resolved {
-                path: name.into(),
+                path: target,
                 source: Source::Path,
                 timeouts,
             };
@@ -439,6 +517,7 @@ mod tests {
                 &[],
                 Some(&shell),
                 Duration::from_secs(1),
+                |_| None,
             ));
         });
         let got = rx
@@ -495,6 +574,7 @@ mod tests {
                     &[],
                     Some(&shell),
                     Duration::from_secs(2),
+                    |_| None,
                 )
                 .path
             });
@@ -545,6 +625,7 @@ mod tests {
             &[known.as_str()],
             None,
             Duration::from_secs(1),
+            |_| None,
         );
         assert_eq!(got.source, Source::KnownPath, "{got:?}");
         assert_eq!(got.path, known);
@@ -572,6 +653,7 @@ mod tests {
             &[],
             Some(&shell),
             DEFAULT_RESOLVE_TIMEOUT,
+            |_| None,
         );
         assert_eq!(
             got,
@@ -587,7 +669,9 @@ mod tests {
         );
     }
 
-    /// 受け入れ条件 2: 通常の環境（このテストのプロセスの PATH と `$SHELL`）では修正前と同じ場所になる
+    /// 受け入れ条件 2: 通常の環境（このテストのプロセスの PATH と `$SHELL`）では修正前と同じ場所になる。
+    /// 修正前が素の名前（PATH の段）だったものは、#2519 から同じ PATH で引いた絶対パスになる
+    /// （`posix_spawnp` が当てていたのと同じ実行ファイル）
     #[test]
     fn 通常の環境では修正前と同じ場所になる() {
         let shell = login_shell();
@@ -620,14 +704,141 @@ mod tests {
                 candidates,
                 shell.as_deref(),
                 DEFAULT_RESOLVE_TIMEOUT,
+                crate::platform::exe::find_in_process_path,
             );
             assert!(new.timeouts.is_empty(), "{name}: {new:?}");
+            let legacy = resolve_bin_legacy(env_var, name, flag, candidates);
+            let expected = if legacy == name {
+                crate::platform::exe::find_in_process_path(name).unwrap_or(legacy)
+            } else {
+                legacy
+            };
+            assert_eq!(new.path, expected, "{name}");
+        }
+    }
+
+    /// #2519: PATH で当たる名前は**引いた絶対パスで `--version` を試し、その絶対パスを持つ**。
+    /// 素の名前（ここでは PATH に無い名前）を試していないことを、絶対パスの側だけが残す印で確かめる
+    #[cfg(unix)]
+    #[test]
+    fn pathで当たる名前は絶対パスで試して持つ() {
+        let dir = crate::test_residue::ScratchDir::new("bin-resolve-2519-abs");
+        let mark = dir.path().join("probed");
+        let found = fake_bin(
+            dir.path(),
+            "found-git",
+            &format!("echo \"$@\" > '{}'\nexit 0", mark.display()),
+        );
+        let found_for_lookup = found.clone();
+        let got = resolve_within(
+            "TAKO_2519_TEST_UNSET",
+            "tako-2519-absent",
+            "--version",
+            &[],
+            None,
+            DEFAULT_RESOLVE_TIMEOUT,
+            move |name| (name == "tako-2519-absent").then(|| found_for_lookup.clone()),
+        );
+        assert_eq!(
+            got,
+            Resolved {
+                path: found.clone(),
+                source: Source::Path,
+                timeouts: Vec::new(),
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&mark)
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("--version"),
+            "引いた絶対パスで `--version` を試していない"
+        );
+        let held = Held::from_resolved("tako-2519-absent", &got);
+        assert_eq!(held.bare, Some("tako-2519-absent"));
+        assert_eq!(held.current(), found);
+    }
+
+    /// #2519: 引けない（Windows・PATH に無い・A/B）ときは素の名前のまま試し、素の名前を持つ = 従来と同じ
+    #[cfg(unix)]
+    #[test]
+    fn 引けなければ素の名前のまま試す() {
+        let dir = crate::test_residue::ScratchDir::new("bin-resolve-2519-bare");
+        // パスを名前として渡す = 素の名前の段がそのまま起こせる形（引き手は呼ばれても None）
+        let git = fake_bin(dir.path(), "plain-git", "exit 0");
+        let got = resolve_within(
+            "TAKO_2519_TEST_UNSET",
+            &git,
+            "--version",
+            &[],
+            None,
+            DEFAULT_RESOLVE_TIMEOUT,
+            |_| None,
+        );
+        assert_eq!(got.source, Source::Path, "{got:?}");
+        assert_eq!(got.path, git);
+        let held = Held {
+            path: got.path.clone(),
+            bare: None,
+        };
+        assert_eq!(held.current(), git);
+    }
+
+    /// #2519: 寄せた絶対パスが消えたら素の名前へ戻る（修正前の起こし方 = PATH の後ろの版に当たる）。
+    /// 戻ってきたら（brew の付け直し等）また絶対パスを使う。PATH 以外の段で決めた場所は確かめない
+    #[cfg(unix)]
+    #[test]
+    fn 寄せた絶対パスが消えたら素の名前へ戻る() {
+        let dir = crate::test_residue::ScratchDir::new("bin-resolve-2519-gone");
+        let path = fake_bin(dir.path(), "gone-git", "exit 0");
+        let held = Held {
+            path: path.clone(),
+            bare: Some("git"),
+        };
+        assert_eq!(held.current(), path);
+        std::fs::remove_file(&path).expect("消す");
+        assert_eq!(held.current(), "git", "消えた絶対パスを起こし続けている");
+        let known = Held {
+            path: path.clone(),
+            bare: None,
+        };
+        assert_eq!(
+            known.current(),
+            path,
+            "PATH 以外の段の場所は従来どおりそのまま"
+        );
+        fake_bin(dir.path(), "gone-git", "exit 0");
+        assert_eq!(held.current(), path, "戻ってきた絶対パスを使っていない");
+    }
+
+    /// #2519: PATH 以外の段で決まった結果は素の名前を覚えない（消えても素の名前へ落とさない = 従来どおり）
+    #[test]
+    fn path以外の段の結果は素の名前を覚えない() {
+        for source in [
+            Source::Env,
+            Source::KnownPath,
+            Source::LoginShell,
+            Source::BareName,
+        ] {
+            let resolved = Resolved {
+                path: "/x/git".into(),
+                source,
+                timeouts: Vec::new(),
+            };
             assert_eq!(
-                new.path,
-                resolve_bin_legacy(env_var, name, flag, candidates),
-                "{name}"
+                Held::from_resolved("git", &resolved).bare,
+                None,
+                "{source:?}"
             );
         }
+        // PATH の段でも素の名前のまま持った（引けなかった）なら覚える必要が無い
+        let bare = Resolved {
+            path: "git".into(),
+            source: Source::Path,
+            timeouts: Vec::new(),
+        };
+        assert_eq!(Held::from_resolved("git", &bare).bare, None);
     }
 
     #[test]
