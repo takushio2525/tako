@@ -250,9 +250,10 @@ fn macosの実体はnsworkspaceで子のopen_rはabの腕だけ() {
         .split_once("FileOpKind::Reveal => {")
         .map(|(_, rest)| &rest[..rest.find("FileOpKind::").unwrap_or(rest.len())])
         .expect("dispatch の `FileOpKind::Reveal` の腕が見つからない（#2247）");
+    // dispatch は断りを表示言語で返す型の口（`reveal_typed`。中身は同じ `imp::reveal`）を通す（#2365）
     assert!(
-        arm.contains("os_integration::reveal("),
-        "dispatch の op=reveal が `os_integration::reveal` を通っていない（#2247）:\n{arm}"
+        arm.contains("os_integration::reveal_typed("),
+        "dispatch の op=reveal が `os_integration::reveal_typed` を通っていない（#2247 / #2365）:\n{arm}"
     );
     let os = code_only(&read("crates/tako-control/src/platform/os_integration.rs"));
     let mac = os

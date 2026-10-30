@@ -12,16 +12,20 @@
 //! **日本語のまま**（CLI の `tako fda` / `tako sleep-guard` / `tako shell-integration` は GUI を通さない
 //! 手元の処理で、表示全体が日本語）。断りを表示言語で返す dispatch だけが型の口（`*_typed`）を通す。
 //!
-//! # まだ移していないもの（中身が他モジュールの文）
+//! # 枠と中身を一緒に移したもの
 //!
-//! 蓋閉じ継続の解除（`sleep_guard::teardown_lid_control`。Windows の中身は `platform::lid` の文）と
-//! System Settings の Battery を開く口（`sleep_guard::open_battery_settings`。中身は
-//! `platform::os_integration::open_url` の文）は、枠だけ移すと 1 つの断りに日英が混ざるので、
-//! `platform::lid` / `os_integration` を移す Issue #2365 の続きのスライスで中身ごと移す
+//! 蓋閉じ継続の解除（`sleep_guard::teardown_lid_control_typed`。Windows の中身は `platform::lid` の
+//! [`LidError`]）と System Settings の Battery を開く口（`sleep_guard::open_battery_settings_typed`。
+//! 中身は `platform::os_integration` の [`OsIntegrationError`]）は、枠だけ移すと 1 つの断りに日英が
+//! 混ざるので、中身の型を包んで同じ言語で組む。ファイル操作（Finder / エクスプローラーで表示・
+//! 既定アプリ / 指定のアプリで開く・ゴミ箱へ移す）の断りは枠を持たず中身をそのまま載せる
+//! （[`OsRefusal::Integration`]）
 
 use tako_core::i18n::Lang;
 use tako_core::shell_integration::SiError;
 
+use crate::platform::lid::LidError;
+use crate::platform::os_integration::OsIntegrationError;
 use crate::sleep_guard::{LID_BATTERY_FLOOR_MAX, LID_BATTERY_FLOOR_MIN};
 use crate::{DispatchError, Reason};
 
@@ -46,6 +50,19 @@ pub enum OsRefusal {
     UserCanceled,
     /// sudoers の登録に失敗（`detail` は osascript の出力）
     SudoersInstallFailed(String),
+    /// sudoers の削除に失敗（`detail` は osascript の出力）
+    SudoersRemoveFailed(String),
+    /// 蓋閉じ継続の解除に失敗（macOS 以外。中身は `platform::lid` の断り）
+    LidTeardownFailed(LidError),
+    /// System Settings の Battery を開けない（中身は `os_integration` の断り）
+    BatterySettingsUnopenable(OsIntegrationError),
+    /// macOS 以外（System Settings の Battery は macOS の画面）
+    BatterySettingsMacOnly,
+
+    // ---- OS のシェルに委ねるファイル操作 ----
+    /// Finder / エクスプローラーで表示・既定アプリ / 指定のアプリで開く・ゴミ箱へ移すの断り
+    /// （枠を持たず、文は `os_integration` の表のまま）
+    Integration(OsIntegrationError),
 
     // ---- シェル統合 ----
     /// `tako_shell_integration` の action が status / install / uninstall のどれでもない
@@ -87,6 +104,28 @@ impl OsRefusal {
             (Self::SudoersInstallFailed(detail), En) => {
                 format!("failed to install the sudoers entry: {detail}")
             }
+            (Self::SudoersRemoveFailed(detail), Ja) => format!("sudoers 削除に失敗: {detail}"),
+            (Self::SudoersRemoveFailed(detail), En) => {
+                format!("failed to remove the sudoers entry: {detail}")
+            }
+            (Self::LidTeardownFailed(e), Ja) => {
+                format!("蓋閉じ継続の解除に失敗: {}", e.text_in(lang))
+            }
+            (Self::LidTeardownFailed(e), En) => format!(
+                "failed to stop staying awake with the lid closed: {}",
+                e.text_in(lang)
+            ),
+            (Self::BatterySettingsUnopenable(e), Ja) => {
+                format!("System Settings を開けません: {}", e.text_in(lang))
+            }
+            (Self::BatterySettingsUnopenable(e), En) => {
+                format!("cannot open System Settings: {}", e.text_in(lang))
+            }
+            (Self::BatterySettingsMacOnly, Ja) => "macOS 以外では非対応".to_string(),
+            (Self::BatterySettingsMacOnly, En) => {
+                "the Battery pane in System Settings is macOS-only".to_string()
+            }
+            (Self::Integration(e), _) => e.text_in(lang),
             (Self::UnknownShellIntegrationAction(got), _) => Reason::UnknownValue {
                 key: "action",
                 got: got.clone(),
@@ -124,5 +163,11 @@ impl std::error::Error for OsRefusal {}
 impl From<SiError> for OsRefusal {
     fn from(e: SiError) -> Self {
         Self::ShellIntegration(e)
+    }
+}
+
+impl From<OsIntegrationError> for OsRefusal {
+    fn from(e: OsIntegrationError) -> Self {
+        Self::Integration(e)
     }
 }

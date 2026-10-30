@@ -356,9 +356,148 @@ fn with_claim(saved: Option<&SavedLidState>) -> Option<(&SavedLidState, RecordCl
     Some((saved, claim))
 }
 
+/// 蓋閉じ継続の上書き・復元の断り（#2365）。`error` / `detail` は OS のエラー文（言語に依らず
+/// そのまま載せる）、パスは表記のまま、`rc` は Win32 の戻り値。
+///
+/// 日英の対は [`Self::text_in`] の (バリアント, 言語) の網羅 match の 1 か所に置く。Windows の
+/// 電源プランの文もここ（実装の `cfg` の外）に置くので、macOS の単体テストで日英を検査できる。
+/// 従来の口（[`set_stay_awake`] / [`clear_residual`]）は `String` を返し、文は**日本語のまま**
+/// （周期の更新と起動時の残留復元は診断ログへ流すだけ）。断りを表示言語で返す dispatch の
+/// 蓋閉じ継続の解除（`sleep_guard::teardown_lid_control_typed`）だけが型の口を通す
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LidError {
+    /// 記録を読めない（権限など）
+    RecordRead { path: String, error: String },
+    /// 記録を解釈できない（`quarantined` は退避先。写せなければ `None`）
+    RecordUnparsable {
+        path: String,
+        reason: tako_core::load_issue::JsonReason,
+        quarantined: Option<String>,
+    },
+    /// データディレクトリが解決できない
+    DataDirUnresolved,
+    /// 戻す記録が無い
+    NothingToRestore,
+    /// 記録の電源プランの GUID を解釈できない（値は記録のまま）
+    BadSchemeGuid(String),
+    /// 記録のロックを取れない（文は `config_io::LockError` の表）
+    Lock(crate::config_io::LockError),
+    /// 記録を書けない（文は `config_io::WriteError` の表）
+    Write(crate::config_io::WriteError),
+    /// 記録を JSON にできない（serde の文言のまま）
+    Serialize(String),
+    /// Windows: 現在の電源プランを引けない
+    ActiveScheme(u32),
+    /// Windows: 蓋の設定を読めない
+    ReadSetting { rail: Rail, rc: u32 },
+    /// Windows: 蓋の設定を書けない（5 = ERROR_ACCESS_DENIED = グループポリシーで固定）
+    WriteSetting { rail: Rail, rc: u32 },
+    /// Windows: 電源プランを適用できない
+    ApplyScheme(u32),
+    /// この OS では蓋の設定を扱えない
+    Unsupported,
+}
+
+impl LidError {
+    /// 表示言語を明示しての文言。(バリアント, 言語) の網羅 match なので、バリアントを足すと
+    /// 日英の両方を書くまでコンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    /// （`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::RecordRead { path, error }, Ja) => {
+                format!("記録を読めません（{path}）: {error}")
+            }
+            (Self::RecordRead { path, error }, En) => {
+                format!("cannot read the record ({path}): {error}")
+            }
+            (
+                Self::RecordUnparsable {
+                    path,
+                    reason,
+                    quarantined,
+                },
+                Ja,
+            ) => {
+                let where_to = match quarantined {
+                    Some(dest) => format!("。内容は {dest} へ退避しました"),
+                    None => String::new(),
+                };
+                format!(
+                    "蓋閉じ継続の記録を解釈できません（{path}）: {}{where_to}",
+                    reason.text_in(lang)
+                )
+            }
+            (
+                Self::RecordUnparsable {
+                    path,
+                    reason,
+                    quarantined,
+                },
+                En,
+            ) => {
+                let where_to = match quarantined {
+                    Some(dest) => format!("; its contents were saved to {dest}"),
+                    None => String::new(),
+                };
+                format!(
+                    "cannot parse the lid-close record ({path}): {}{where_to}",
+                    reason.text_in(lang)
+                )
+            }
+            (Self::DataDirUnresolved, Ja) => "データディレクトリが解決できません".to_string(),
+            (Self::DataDirUnresolved, En) => "cannot resolve the data directory".to_string(),
+            (Self::NothingToRestore, Ja) => "戻す記録がありません".to_string(),
+            (Self::NothingToRestore, En) => "there is no record to restore".to_string(),
+            (Self::BadSchemeGuid(scheme), Ja) => {
+                format!("記録の GUID を解釈できません: {scheme}")
+            }
+            (Self::BadSchemeGuid(scheme), En) => {
+                format!("cannot parse the power plan GUID in the record: {scheme}")
+            }
+            (Self::Lock(e), _) => e.text_in(lang),
+            (Self::Write(e), _) => e.text_in(lang),
+            // 日本語は #2365 より前と同じ serde の文言のまま（英語は何の失敗かを添える）
+            (Self::Serialize(e), Ja) => e.clone(),
+            (Self::Serialize(e), En) => format!("cannot serialize the record: {e}"),
+            (Self::ActiveScheme(rc), Ja) => format!("PowerGetActiveScheme に失敗（rc={rc}）"),
+            (Self::ActiveScheme(rc), En) => format!("PowerGetActiveScheme failed (rc={rc})"),
+            (Self::ReadSetting { rail, rc }, Ja) => {
+                format!("蓋の設定を読めません（{rail:?}, rc={rc}）")
+            }
+            (Self::ReadSetting { rail, rc }, En) => {
+                format!("cannot read the lid setting ({rail:?}, rc={rc})")
+            }
+            (Self::WriteSetting { rail, rc }, Ja) => {
+                format!("蓋の設定を書けません（{rail:?}, rc={rc}）")
+            }
+            (Self::WriteSetting { rail, rc }, En) => {
+                format!("cannot write the lid setting ({rail:?}, rc={rc})")
+            }
+            (Self::ApplyScheme(rc), Ja) => format!("電源プランを適用できません（rc={rc}）"),
+            (Self::ApplyScheme(rc), En) => format!("cannot apply the power plan (rc={rc})"),
+            (Self::Unsupported, Ja) => "この OS では蓋の設定を扱えません".to_string(),
+            (Self::Unsupported, En) => "this OS has no lid setting to change".to_string(),
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(tako_core::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for LidError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
+impl std::error::Error for LidError {}
+
 /// 記録の読み取り結果。`Err` = 解釈できない。
 /// **「記録なし」へ丸めない**（丸めると #1373 の症状 2 が起きる）
-type RecordRead = Result<Option<SavedLidState>, String>;
+type RecordRead = Result<Option<SavedLidState>, LidError>;
 
 /// 記録のメモリ上の写し。外側の `None` = まだディスクから読んでいない。
 ///
@@ -393,22 +532,24 @@ fn read_from(path: &std::path::Path) -> RecordRead {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("記録を読めません（{}）: {e}", path.display())),
+        Err(e) => {
+            return Err(LidError::RecordRead {
+                path: path.display().to_string(),
+                error: e.to_string(),
+            })
+        }
     };
     match serde_json::from_str::<SavedLidState>(&text) {
         Ok(state) => Ok(Some(state)),
         Err(e) => {
             let quarantine =
                 tako_core::migration::quarantine_unreadable(path, &tako_core::migration::FsIo);
-            let where_to = match quarantine {
-                Some(dest) => format!("。内容は {} へ退避しました", dest.path.display()),
-                None => String::new(),
-            };
-            Err(format!(
-                "蓋閉じ継続の記録を解釈できません（{}）: {}{where_to}",
-                path.display(),
-                tako_core::load_issue::json_error_reason(&e)
-            ))
+            Err(LidError::RecordUnparsable {
+                path: path.display().to_string(),
+                // 種類と位置だけ（中身を引用しない = #2230）。文は包みと同じ言語で引く
+                reason: tako_core::load_issue::JsonReason::of(&e),
+                quarantined: quarantine.map(|dest| dest.path.display().to_string()),
+            })
         }
     }
 }
@@ -434,24 +575,25 @@ fn load_saved_from(path: Option<&std::path::Path>) -> RecordRead {
 /// 「排他ロックは「書くと決まってから」取る」）
 fn with_record<T>(
     path: &std::path::Path,
-    f: impl FnOnce(Option<SavedLidState>) -> Result<T, String>,
-) -> Result<T, String> {
-    let _lock = crate::config_io::lock_exclusive(path)?;
+    f: impl FnOnce(Option<SavedLidState>) -> Result<T, LidError>,
+) -> Result<T, LidError> {
+    let _lock = crate::config_io::lock_exclusive_typed(path).map_err(LidError::Lock)?;
     let fresh = read_from(path);
     *lock_cache() = Some(fresh.clone());
     f(fresh?)
 }
 
-fn store_saved(state: &SavedLidState) -> Result<(), String> {
-    let path = state_path().ok_or_else(|| "データディレクトリが解決できません".to_string())?;
+fn store_saved(state: &SavedLidState) -> Result<(), LidError> {
+    let path = state_path().ok_or(LidError::DataDirUnresolved)?;
     store_saved_at(&path, state)
 }
 
 /// 記録を書く。**原子書き込み**（tmp + fsync + rename）を通すので、並行プロセスの
 /// 読み手には旧内容か新内容しか見えない（#169 の窓をここにも作らない = #1373 の症状 2）
-fn store_saved_at(path: &std::path::Path, state: &SavedLidState) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
-    crate::config_io::atomic_write(path, &text)?;
+fn store_saved_at(path: &std::path::Path, state: &SavedLidState) -> Result<(), LidError> {
+    let text =
+        serde_json::to_string_pretty(state).map_err(|e| LidError::Serialize(e.to_string()))?;
+    crate::config_io::atomic_write_typed(path, &text).map_err(LidError::Write)?;
     *lock_cache() = Some(Ok(Some(state.clone())));
     Ok(())
 }
@@ -501,6 +643,11 @@ pub fn is_active() -> bool {
 /// 同じ状態への再要求は何もしない（毎 tick 呼ばれる前提）。
 /// **他の tako が保持している記録には触らない**（#1373）
 pub fn set_stay_awake(enable: bool, include_battery: bool) -> Result<bool, String> {
+    set_stay_awake_typed(enable, include_battery).map_err(LidError::into_ja)
+}
+
+/// [`set_stay_awake`] の型の口（#2365。dispatch の蓋閉じ継続の解除が表示言語で断る）
+pub fn set_stay_awake_typed(enable: bool, include_battery: bool) -> Result<bool, LidError> {
     if !supported() {
         return Ok(false);
     }
@@ -511,7 +658,7 @@ pub fn set_stay_awake(enable: bool, include_battery: bool) -> Result<bool, Strin
         return Ok(false);
     }
     // 2) 書くと決まった。ロックの下で読み直し、同じ判定をやり直してから実行する
-    let path = state_path().ok_or_else(|| "データディレクトリが解決できません".to_string())?;
+    let path = state_path().ok_or(LidError::DataDirUnresolved)?;
     with_record(&path, |fresh| {
         let action = decide(enable, wanted, with_claim(fresh.as_ref()));
         run_action(action, fresh.as_ref(), wanted)
@@ -523,11 +670,11 @@ fn run_action(
     action: LidAction,
     saved: Option<&SavedLidState>,
     wanted: &[Rail],
-) -> Result<bool, String> {
+) -> Result<bool, LidError> {
     match action {
         LidAction::Nothing => Ok(false),
         LidAction::Restore => {
-            let saved = saved.ok_or_else(|| "戻す記録がありません".to_string())?;
+            let saved = saved.ok_or(LidError::NothingToRestore)?;
             restore(saved).map(|()| true)
         }
         LidAction::RestoreThenAcquire => {
@@ -545,6 +692,14 @@ pub fn clear_residual(
     is_isolated: bool,
     other_instance_running: bool,
 ) -> Result<Option<String>, String> {
+    try_clear_residual(is_isolated, other_instance_running).map_err(LidError::into_ja)
+}
+
+/// [`clear_residual`] の本体（断りは型。起動時の診断ログへ日本語で流す）
+fn try_clear_residual(
+    is_isolated: bool,
+    other_instance_running: bool,
+) -> Result<Option<String>, LidError> {
     if !supported() {
         return Ok(None);
     }
@@ -557,7 +712,7 @@ pub fn clear_residual(
     if with_claim(saved.as_ref()).is_some_and(|(_, claim)| !may_touch(claim)) {
         return Ok(None);
     }
-    let path = state_path().ok_or_else(|| "データディレクトリが解決できません".to_string())?;
+    let path = state_path().ok_or(LidError::DataDirUnresolved)?;
     with_record(&path, |fresh| {
         let Some(fresh) = fresh else {
             return Ok(None); // 待っている間に他プロセスが片付けた
@@ -574,7 +729,7 @@ pub fn clear_residual(
 }
 
 /// 倒す。元値を**保存してから**書く（保存前に落ちても残留しない順序）
-fn acquire(rails: &[Rail]) -> Result<(), String> {
+fn acquire(rails: &[Rail]) -> Result<(), LidError> {
     let scheme = imp::active_scheme()?;
     let mut state = SavedLidState {
         scheme: imp::guid_to_string(&scheme),
@@ -605,9 +760,9 @@ fn acquire(rails: &[Rail]) -> Result<(), String> {
 /// **呼んでよいのは [`run_action`] と [`clear_residual`] だけ**（どちらも
 /// [`may_touch`] を通したうえで [`with_record`] のロックの下に居る）。
 /// ここを直接呼ぶと #1373 の「他プロセスの記録を戻す」が復活する
-fn restore(saved: &SavedLidState) -> Result<(), String> {
+fn restore(saved: &SavedLidState) -> Result<(), LidError> {
     let scheme = imp::guid_from_string(&saved.scheme)
-        .ok_or_else(|| format!("記録の GUID を解釈できません: {}", saved.scheme))?;
+        .ok_or_else(|| LidError::BadSchemeGuid(saved.scheme.clone()))?;
     for (rail, original) in saved.entries() {
         // 読めない（プランが消された等）なら諦めて記録だけ捨てる
         let Ok(current) = imp::read(&scheme, rail) else {
@@ -624,7 +779,7 @@ fn restore(saved: &SavedLidState) -> Result<(), String> {
 
 #[cfg(windows)]
 mod imp {
-    use super::Rail;
+    use super::{LidError, Rail};
     use std::ffi::c_void;
 
     pub(super) const SUPPORTED: bool = true;
@@ -701,12 +856,12 @@ mod imp {
     }
 
     /// 現在アクティブな電源プランの GUID
-    pub(super) fn active_scheme() -> Result<Guid, String> {
+    pub(super) fn active_scheme() -> Result<Guid, LidError> {
         let mut ptr: *mut Guid = std::ptr::null_mut();
         // SAFETY: 出力先はスタック上のポインタ。成功時のみ中身を読む
         let rc = unsafe { PowerGetActiveScheme(std::ptr::null_mut(), &mut ptr) };
         if rc != ERROR_SUCCESS || ptr.is_null() {
-            return Err(format!("PowerGetActiveScheme に失敗（rc={rc}）"));
+            return Err(LidError::ActiveScheme(rc));
         }
         // SAFETY: rc が成功 かつ 非 NULL。API 仕様どおり LocalFree で解放する
         let guid = unsafe { *ptr };
@@ -715,7 +870,7 @@ mod imp {
         Ok(guid)
     }
 
-    pub(super) fn read(scheme: &Guid, rail: Rail) -> Result<u32, String> {
+    pub(super) fn read(scheme: &Guid, rail: Rail) -> Result<u32, LidError> {
         let mut value: u32 = 0;
         // SAFETY: 入力はすべて生存する参照、出力先はスタック上の u32
         let rc = unsafe {
@@ -737,12 +892,12 @@ mod imp {
             }
         };
         if rc != ERROR_SUCCESS {
-            return Err(format!("蓋の設定を読めません（{rail:?}, rc={rc}）"));
+            return Err(LidError::ReadSetting { rail, rc });
         }
         Ok(value)
     }
 
-    pub(super) fn write(scheme: &Guid, rail: Rail, value: u32) -> Result<(), String> {
+    pub(super) fn write(scheme: &Guid, rail: Rail, value: u32) -> Result<(), LidError> {
         // SAFETY: 入力はすべて生存する参照
         let rc = unsafe {
             match rail {
@@ -764,17 +919,17 @@ mod imp {
         };
         if rc != ERROR_SUCCESS {
             // 5 = ERROR_ACCESS_DENIED。グループポリシーで固定されている環境が該当
-            return Err(format!("蓋の設定を書けません（{rail:?}, rc={rc}）"));
+            return Err(LidError::WriteSetting { rail, rc });
         }
         Ok(())
     }
 
     /// 書いた値を有効化する。**これを呼ばないと反映されない**
-    pub(super) fn apply(scheme: &Guid) -> Result<(), String> {
+    pub(super) fn apply(scheme: &Guid) -> Result<(), LidError> {
         // SAFETY: scheme は生存する参照
         let rc = unsafe { PowerSetActiveScheme(std::ptr::null_mut(), scheme) };
         if rc != ERROR_SUCCESS {
-            return Err(format!("電源プランを適用できません（rc={rc}）"));
+            return Err(LidError::ApplyScheme(rc));
         }
         Ok(())
     }
@@ -796,7 +951,7 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    use super::Rail;
+    use super::{LidError, Rail};
 
     /// macOS は `sleep_guard` の clamshell + pmset 実装が担当するのでここへは来ない。
     /// Linux 等は蓋の動作を触る共通の仕組みが無い
@@ -811,17 +966,17 @@ mod imp {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) struct Guid;
 
-    pub(super) fn active_scheme() -> Result<Guid, String> {
-        Err("この OS では蓋の設定を扱えません".to_string())
+    pub(super) fn active_scheme() -> Result<Guid, LidError> {
+        Err(LidError::Unsupported)
     }
-    pub(super) fn read(_scheme: &Guid, _rail: Rail) -> Result<u32, String> {
-        Err("この OS では蓋の設定を扱えません".to_string())
+    pub(super) fn read(_scheme: &Guid, _rail: Rail) -> Result<u32, LidError> {
+        Err(LidError::Unsupported)
     }
-    pub(super) fn write(_scheme: &Guid, _rail: Rail, _value: u32) -> Result<(), String> {
-        Err("この OS では蓋の設定を扱えません".to_string())
+    pub(super) fn write(_scheme: &Guid, _rail: Rail, _value: u32) -> Result<(), LidError> {
+        Err(LidError::Unsupported)
     }
-    pub(super) fn apply(_scheme: &Guid) -> Result<(), String> {
-        Err("この OS では蓋の設定を扱えません".to_string())
+    pub(super) fn apply(_scheme: &Guid) -> Result<(), LidError> {
+        Err(LidError::Unsupported)
     }
     pub(super) fn guid_to_string(_g: &Guid) -> String {
         String::new()
@@ -1197,11 +1352,25 @@ mod tests {
             let path = scratch.path().join(format!("lid-guard-{tag}.json"));
             std::fs::write(&path, body).expect("壊れた記録を置ける");
             let err = read_from(&path).expect_err("記録なしへ丸めない");
-            assert!(
-                err.contains("解釈できません"),
-                "理由が出ていない（{tag}）: {err}"
-            );
             let quarantine = tako_core::migration::quarantine_path(&path);
+            // 日本語は #2365 より前の組み立て（`json_error_reason` + 退避先）とバイト一致
+            let serde_err = serde_json::from_str::<SavedLidState>(body).expect_err("壊れている");
+            let old_ja = format!(
+                "蓋閉じ継続の記録を解釈できません（{}）: {}。内容は {} へ退避しました",
+                path.display(),
+                tako_core::load_issue::json_error_reason(&serde_err),
+                quarantine.display()
+            );
+            let ja = err.text_in(tako_core::i18n::Lang::Ja);
+            assert_eq!(ja, old_ja, "理由が #2365 より前と違う（{tag}）");
+            // 英語表示は理由も退避先の言い方も英語（パスは表記のまま）
+            let en = err.text_in(tako_core::i18n::Lang::En);
+            assert!(
+                en.starts_with("cannot parse the lid-close record (")
+                    && en.contains("; its contents were saved to ")
+                    && !en.contains("JSON の"),
+                "英語表示に日本語が混ざる（{tag}）: {en}"
+            );
             assert_eq!(
                 std::fs::read_to_string(&quarantine).ok().as_deref(),
                 Some(body),

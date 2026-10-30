@@ -30,8 +30,355 @@
 //!   `sleep_guard`）の内側に留める。「OS シェルに何かを開かせる」操作ではないうえ、
 //!   汎用の昇格 API を B8 に置くと危険な踏み台になる。Windows の B9 実装
 //!   （`SetThreadExecutionState`）は sudoers 相当を必要としないため、そもそも対応物が無い
+//!
+//! ## 断りの文（#2365）
+//!
+//! 断りは [`OsIntegrationError`] の (バリアント, 言語) の網羅 match の 1 か所に置く。
+//! **macOS / Windows / その他の実装の文をすべて `cfg` の外に置く**ので、Windows の
+//! `ShellExecuteW` / `SHFileOperationW` の説明も macOS の単体テストで日英を検査できる。
+//! 従来の口（[`reveal`] ほか）は `String` を返し、文は**日本語のまま**（GUI の UI・診断ログが
+//! そのまま使う）。断りを表示言語で返す dispatch だけが型の口（`*_typed`）を通す
 
 use std::path::Path;
+
+use tako_core::i18n::Lang;
+use tako_core::url_guard::UrlBlocked;
+
+/// OS のシェルに委ねる操作（[`OsIntegrationError::Spawn`] / [`OsIntegrationError::ShellExecute`]
+/// の枠）。何をしようとして失敗したかの短い言い方
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Launch {
+    /// Finder で表示（macOS の `open -R`。#2247 の A/B）
+    Finder,
+    /// エクスプローラーで表示（Windows の `explorer.exe /select,`）
+    Explorer,
+    /// 既定アプリで開く
+    DefaultApp,
+    /// アプリを指定して開く（値は指定のまま）
+    App(String),
+    /// 既定のテキストエディタで開く
+    TextEditor,
+    /// URL を開く
+    Url,
+    /// アプリを新しいプロセスとして起動する（macOS の `open -n`）
+    NewInstance,
+    /// アプリ選択ダイアログ（Windows の `openas`）
+    AppPicker,
+}
+
+impl Launch {
+    /// (操作, 言語) の網羅 match。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Finder, Ja) => "Finder を開けない".to_string(),
+            (Self::Finder, En) => "cannot open Finder".to_string(),
+            (Self::Explorer, Ja) => "エクスプローラーを開けない".to_string(),
+            (Self::Explorer, En) => "cannot open File Explorer".to_string(),
+            (Self::DefaultApp, Ja) => "デフォルトアプリで開けない".to_string(),
+            (Self::DefaultApp, En) => "cannot open with the default app".to_string(),
+            (Self::App(app), Ja) => format!("アプリ '{app}' で開けない"),
+            (Self::App(app), En) => format!("cannot open with the app '{app}'"),
+            (Self::TextEditor, Ja) => "テキストエディタで開けない".to_string(),
+            (Self::TextEditor, En) => "cannot open in a text editor".to_string(),
+            (Self::Url, Ja) => "URL を開けない".to_string(),
+            (Self::Url, En) => "cannot open the URL".to_string(),
+            (Self::NewInstance, Ja) => "アプリを起動できない".to_string(),
+            (Self::NewInstance, En) => "cannot launch the app".to_string(),
+            (Self::AppPicker, Ja) => "アプリ選択ダイアログを開けない".to_string(),
+            (Self::AppPicker, En) => "cannot open the app chooser".to_string(),
+        }
+    }
+}
+
+/// この環境に実装が無い操作（[`OsIntegrationError::Unsupported`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsFeature {
+    /// ファイルマネージャでの表示
+    Reveal,
+    /// 既定アプリで開く
+    OpenDefault,
+    /// アプリを指定して開く
+    OpenWith,
+    /// アプリ選択ダイアログ
+    AppPicker,
+    /// テキストエディタで開く
+    TextEditor,
+    /// アプリの新規プロセス起動
+    NewInstance,
+    /// ゴミ箱への移動
+    Trash,
+}
+
+impl OsFeature {
+    /// (操作, 言語) の網羅 match。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(self, lang: Lang) -> &'static str {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Reveal, Ja) => "ファイルマネージャでの表示",
+            (Self::Reveal, En) => "showing a file in the file manager",
+            (Self::OpenDefault, Ja) => "既定アプリで開く操作",
+            (Self::OpenDefault, En) => "opening with the default app",
+            (Self::OpenWith, Ja) => "アプリを指定して開く操作",
+            (Self::OpenWith, En) => "opening with a chosen app",
+            (Self::AppPicker, Ja) => "アプリ選択ダイアログ",
+            (Self::AppPicker, En) => "the app chooser",
+            (Self::TextEditor, Ja) => "テキストエディタで開く操作",
+            (Self::TextEditor, En) => "opening in a text editor",
+            (Self::NewInstance, Ja) => "アプリの新規プロセス起動",
+            (Self::NewInstance, En) => "launching the app as a new process",
+            (Self::Trash, Ja) => "ゴミ箱への移動",
+            (Self::Trash, En) => "moving to the Trash",
+        }
+    }
+}
+
+/// OS のシェルに委ねる操作の断り（#2365）。`error` / `detail` は OS・外部コマンドのエラー文
+/// （言語に依らずそのまま載せる）、パスは表記のまま埋める。
+///
+/// macOS の Finder への頼み（`platform::finder_reveal`）・Windows の `ShellExecuteW` /
+/// `SHFileOperationW` の戻り値の説明もここに置く（実装の `cfg` の外 = macOS でも日英を検査できる）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OsIntegrationError {
+    // ---- 共通 ----
+    /// URL の検査で止めた（理由は分類だけ。**URL そのものは載せない** = #1376）
+    UrlBlocked(UrlBlocked),
+    /// ランチャ（`open` / `explorer.exe` / `xdg-open`）を起こせない
+    Spawn { what: Launch, error: String },
+    /// この環境に実装が無い（その他 unix の全般・Windows の新規プロセス起動）
+    Unsupported(OsFeature),
+
+    // ---- macOS / その他 unix: 待つ版の URL ----
+    /// macOS: `open` コマンドを実行できない
+    OpenCommandFailed(String),
+    /// その他 unix: URL ハンドラ（`xdg-open`）を実行できない
+    UrlHandlerFailed(String),
+    /// URL のハンドラが失敗の終了状態で終わった（`status` は終了状態の表記）
+    UrlExitStatus { status: String, url: String },
+
+    // ---- macOS: アプリ選択・ゴミ箱 ----
+    /// アプリ選択の osascript を起こせない
+    OsascriptSpawn(String),
+    /// アプリ選択をキャンセルした
+    AppPickCanceled,
+    /// アプリ選択が空のパスを返した
+    AppPathEmpty,
+    /// ゴミ箱へ移せない（Finder への頼み・検証用の置き場 `TAKO_TRASH_DIR` への移動）
+    TrashFailed(String),
+    /// 検証用の置き場へ移す対象に名前が無い（パスは表記のまま）
+    TrashNoName(String),
+
+    // ---- macOS: Finder への頼み（`platform::finder_reveal`。#2247） ----
+    /// AppKit を読み込めない
+    AppKitUnavailable,
+    /// NSWorkspace を使えない
+    WorkspaceUnavailable,
+    /// NSString へ渡す文字列に NUL がある
+    NulInString,
+    /// NSString を作れない
+    NsStringFailed,
+    /// ファイルの URL へ渡すパスに NUL がある
+    NulInPath(String),
+    /// ファイルの URL を作れない
+    FileUrlFailed(String),
+    /// 検証の記録: ファイルの URL からパスを読み戻せない
+    RecordPathUnreadable,
+    /// 検証の記録（`TAKO_REVEAL_RECORD`）を書けない
+    RecordWrite { path: String, error: String },
+
+    // ---- Windows ----
+    /// パスに NUL がある（Win32 へ渡すと手前で切れて別のパスを指す）
+    PathHasNul,
+    /// `explorer.exe /select,` へ渡すパスに引用符がある
+    PathHasQuote,
+    /// パスを絶対化できない
+    Absolutize(String),
+    /// パスが存在しない（パスは絶対化した表記）
+    PathMissing(String),
+    /// `ShellExecuteW` が失敗（`code` は戻り値。説明は [`shell_execute_reason`]）
+    ShellExecute { what: Launch, code: isize },
+    /// `SHFileOperationW` が失敗（`code` は戻り値。説明は [`shfileop_reason`]）
+    TrashShellOp(i32),
+    /// 「完全に削除しますか？」を断った（ごみ箱へ入れられない対象）
+    TrashAborted,
+}
+
+impl OsIntegrationError {
+    /// 表示言語を明示しての文言。(バリアント, 言語) の網羅 match なので、バリアントを足すと
+    /// 日英の両方を書くまでコンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    /// （`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::UrlBlocked(reason), Ja) => {
+                format!("この URL は開けない（{}）", reason.text_in(lang))
+            }
+            (Self::UrlBlocked(reason), En) => {
+                format!("cannot open this URL ({})", reason.text_in(lang))
+            }
+            (Self::Spawn { what, error }, _) => format!("{}: {error}", what.text_in(lang)),
+            (Self::Unsupported(feature), Ja) => {
+                format!(
+                    "{}はこのプラットフォームでは未対応です",
+                    feature.text_in(lang)
+                )
+            }
+            (Self::Unsupported(feature), En) => {
+                format!(
+                    "{} is not supported on this platform",
+                    feature.text_in(lang)
+                )
+            }
+            (Self::OpenCommandFailed(e), Ja) => format!("open コマンドの実行に失敗: {e}"),
+            (Self::OpenCommandFailed(e), En) => format!("failed to run the open command: {e}"),
+            (Self::UrlHandlerFailed(e), Ja) => format!("URL ハンドラの実行に失敗: {e}"),
+            (Self::UrlHandlerFailed(e), En) => format!("failed to run the URL handler: {e}"),
+            (Self::UrlExitStatus { status, url }, Ja) => {
+                format!("URL を開けない（終了コード {status}）: {url}")
+            }
+            (Self::UrlExitStatus { status, url }, En) => {
+                format!("cannot open the URL (exit code {status}): {url}")
+            }
+            (Self::OsascriptSpawn(e), Ja) => format!("osascript 起動に失敗: {e}"),
+            (Self::OsascriptSpawn(e), En) => format!("failed to start osascript: {e}"),
+            (Self::AppPickCanceled, Ja) => "アプリ選択がキャンセルされた".to_string(),
+            (Self::AppPickCanceled, En) => "the app selection was canceled".to_string(),
+            (Self::AppPathEmpty, Ja) => "アプリパスが空".to_string(),
+            (Self::AppPathEmpty, En) => "the app path is empty".to_string(),
+            (Self::TrashFailed(e), Ja) => format!("ゴミ箱への移動に失敗: {e}"),
+            (Self::TrashFailed(e), En) => format!("failed to move to the Trash: {e}"),
+            (Self::TrashNoName(path), Ja) => {
+                format!("ゴミ箱への移動に失敗: 名前が無い: {path}")
+            }
+            (Self::TrashNoName(path), En) => {
+                format!("failed to move to the Trash: the path has no file name: {path}")
+            }
+            (Self::AppKitUnavailable, Ja) => "Finder を開けない: AppKit を読み込めない".to_string(),
+            (Self::AppKitUnavailable, En) => {
+                "cannot open Finder: AppKit could not be loaded".to_string()
+            }
+            (Self::WorkspaceUnavailable, Ja) => {
+                "Finder を開けない: NSWorkspace を使えない".to_string()
+            }
+            (Self::WorkspaceUnavailable, En) => {
+                "cannot open Finder: NSWorkspace is unavailable".to_string()
+            }
+            (Self::NulInString, Ja) => "NUL を含む文字列".to_string(),
+            (Self::NulInString, En) => "the string contains a NUL character".to_string(),
+            (Self::NsStringFailed, Ja) => "NSString を作れない".to_string(),
+            (Self::NsStringFailed, En) => "cannot create an NSString".to_string(),
+            (Self::NulInPath(path), Ja) => format!("NUL を含むパス: {path}"),
+            (Self::NulInPath(path), En) => format!("the path contains a NUL character: {path}"),
+            (Self::FileUrlFailed(path), Ja) => format!("ファイルの URL を作れない: {path}"),
+            (Self::FileUrlFailed(path), En) => {
+                format!("cannot create a file URL for: {path}")
+            }
+            (Self::RecordPathUnreadable, Ja) => "ファイルの URL からパスを読み戻せない".to_string(),
+            (Self::RecordPathUnreadable, En) => {
+                "cannot read the path back from the file URL".to_string()
+            }
+            (Self::RecordWrite { path, error }, Ja) => {
+                format!("記録を書けない（{path}）: {error}")
+            }
+            (Self::RecordWrite { path, error }, En) => {
+                format!("cannot write the record ({path}): {error}")
+            }
+            (Self::PathHasNul, Ja) => "パスに NUL 文字が含まれている".to_string(),
+            (Self::PathHasNul, En) => "the path contains a NUL character".to_string(),
+            (Self::PathHasQuote, Ja) => "パスに引用符が含まれている".to_string(),
+            (Self::PathHasQuote, En) => "the path contains a double quote".to_string(),
+            (Self::Absolutize(e), Ja) => format!("パスを絶対化できない: {e}"),
+            (Self::Absolutize(e), En) => format!("cannot make the path absolute: {e}"),
+            (Self::PathMissing(path), Ja) => format!("パスが存在しない: {path}"),
+            (Self::PathMissing(path), En) => format!("path not found: {path}"),
+            (Self::ShellExecute { what, code }, _) => format!(
+                "{}: {}",
+                what.text_in(lang),
+                shell_execute_reason(*code, lang)
+            ),
+            (Self::TrashShellOp(code), Ja) => {
+                format!("ごみ箱への移動に失敗: {}", shfileop_reason(*code, lang))
+            }
+            (Self::TrashShellOp(code), En) => format!(
+                "failed to move to the Recycle Bin: {}",
+                shfileop_reason(*code, lang)
+            ),
+            (Self::TrashAborted, Ja) => "ごみ箱への移動が取り消された".to_string(),
+            (Self::TrashAborted, En) => "moving to the Recycle Bin was canceled".to_string(),
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for OsIntegrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
+impl std::error::Error for OsIntegrationError {}
+
+/// `ShellExecuteW` の失敗の説明（shellapi.h の `SE_ERR_*` と Win32 エラーが混在する）。
+/// (戻り値, 言語) の網羅 match で、日本語は #2365 より前の固定文とバイト一致
+pub fn shell_execute_reason(rc: isize, lang: Lang) -> String {
+    use Lang::{En, Ja};
+    let text = match (rc, lang) {
+        (0, Ja) => "メモリまたはリソース不足",
+        (0, En) => "out of memory or resources",
+        (2, Ja) => "ファイルが見つからない",
+        (2, En) => "file not found",
+        (3, Ja) => "パスが見つからない",
+        (3, En) => "path not found",
+        (5, Ja) => "アクセスが拒否された",
+        (5, En) => "access denied",
+        (8, Ja) => "メモリ不足",
+        (8, En) => "out of memory",
+        (26, Ja) => "共有違反",
+        (26, En) => "sharing violation",
+        (27, Ja) => "ファイルの関連付けが不完全または無効",
+        (27, En) => "the file association is incomplete or invalid",
+        (28, Ja) => "タイムアウト",
+        (28, En) => "timed out",
+        (29, Ja) => "DDE トランザクションに失敗",
+        (29, En) => "the DDE transaction failed",
+        (31, Ja) => "この種類のファイルに関連付けられたアプリが無い",
+        (31, En) => "no app is associated with this type of file",
+        (32, Ja) => "関連付けられた DLL が見つからない",
+        (32, En) => "the associated DLL was not found",
+        (other, Ja) => return format!("ShellExecuteW が {other} を返した"),
+        (other, En) => return format!("ShellExecuteW returned {other}"),
+    };
+    text.to_string()
+}
+
+/// `SHFileOperationW` の戻り値の説明（Win32 エラーコードではなく shell 独自の `DE_*`）。
+/// (戻り値, 言語) の網羅 match で、日本語は #2365 より前の固定文とバイト一致
+pub fn shfileop_reason(code: i32, lang: Lang) -> String {
+    use Lang::{En, Ja};
+    let text = match (code, lang) {
+        (0x71, Ja) => "同じファイルを指している",
+        (0x71, En) => "the source and the destination are the same file",
+        (0x74, Ja) => "ルートディレクトリは操作できない",
+        (0x74, En) => "the root directory cannot be operated on",
+        (0x75, Ja) => "操作が取り消された",
+        (0x75, En) => "the operation was canceled",
+        (0x78, Ja) => "アクセスが拒否された",
+        (0x78, En) => "access denied",
+        (0x79, Ja) => "パスが MAX_PATH（260 文字）を超えている",
+        (0x79, En) => "the path exceeds MAX_PATH (260 characters)",
+        (0x7C, Ja) => "パスが不正",
+        (0x7C, En) => "invalid path",
+        (0x402, Ja) => "パスが見つからない（または不正）",
+        (0x402, En) => "path not found (or invalid)",
+        (other, Ja) => return format!("SHFileOperationW が 0x{other:X} を返した"),
+        (other, En) => return format!("SHFileOperationW returned 0x{other:X}"),
+    };
+    text.to_string()
+}
 
 /// OS のファイルマネージャ。**UI の表記を出し分けるための値**（#617）。
 ///
@@ -69,6 +416,11 @@ pub fn file_manager() -> FileManager {
 /// CLI は GUI へ頼むだけで、自分のプロセスからは呼ばない（GUI が居なければ他の操作と同じく
 /// 「繋がらない」で断る）
 pub fn reveal(path: &Path) -> Result<(), String> {
+    reveal_typed(path).map_err(OsIntegrationError::into_ja)
+}
+
+/// [`reveal`] の型の口（#2365。dispatch が表示言語で断る）
+pub fn reveal_typed(path: &Path) -> Result<(), OsIntegrationError> {
     imp::reveal(path)
 }
 
@@ -94,17 +446,27 @@ fn reveal_record() -> Option<std::path::PathBuf> {
 
 /// 既定アプリで開く
 pub fn open_default(path: &Path) -> Result<(), String> {
+    open_default_typed(path).map_err(OsIntegrationError::into_ja)
+}
+
+/// [`open_default`] の型の口（#2365）
+pub fn open_default_typed(path: &Path) -> Result<(), OsIntegrationError> {
     imp::open_default(path)
 }
 
 /// アプリ名（またはアプリのパス）を指定して開く
 pub fn open_with(app: &str, path: &Path) -> Result<(), String> {
+    open_with_typed(app, path).map_err(OsIntegrationError::into_ja)
+}
+
+/// [`open_with`] の型の口（#2365）
+pub fn open_with_typed(app: &str, path: &Path) -> Result<(), OsIntegrationError> {
     imp::open_with(app, path)
 }
 
 /// 既定のテキストエディタで開く（macOS の `open -t` 相当）
 pub fn open_in_text_editor(path: &Path) -> Result<(), String> {
-    imp::open_in_text_editor(path)
+    imp::open_in_text_editor(path).map_err(OsIntegrationError::into_ja)
 }
 
 /// URL を既定ブラウザ / ハンドラで開く（起動するだけで完了は待たない）。
@@ -118,6 +480,11 @@ pub fn open_in_text_editor(path: &Path) -> Result<(), String> {
 /// （ローカルの実行ファイルパス・UNC パス・`file:` URL）も開くので、ここを素通りさせると
 /// 第三者由来の PDF / 画面のリンク 1 クリックで任意のプログラムが起動しうる
 pub fn open_url(url: &str) -> Result<(), String> {
+    open_url_typed(url).map_err(OsIntegrationError::into_ja)
+}
+
+/// [`open_url`] の型の口（#2365）
+pub fn open_url_typed(url: &str) -> Result<(), OsIntegrationError> {
     imp::open_url(guarded_url(url)?)
 }
 
@@ -126,9 +493,8 @@ pub fn open_url(url: &str) -> Result<(), String> {
 ///
 /// **エラーへ URL そのものを載せない**。呼び出し元の URL は PDF / ペインの内容に
 /// 相当し、エラー文は診断ログへ流れる（AGENTS.md の絶対ルール）
-fn guarded_url(url: &str) -> Result<&str, String> {
-    tako_core::url_guard::check_os_handler_url(url)
-        .map_err(|reason| format!("この URL は開けない（{reason}）"))
+fn guarded_url(url: &str) -> Result<&str, OsIntegrationError> {
+    tako_core::url_guard::check_os_handler_url(url).map_err(OsIntegrationError::UrlBlocked)
 }
 
 /// URL を開き、**ハンドラを起動できたかまで確かめる**。
@@ -139,6 +505,11 @@ fn guarded_url(url: &str) -> Result<&str, String> {
 /// **ハンドラ本体（ブラウザや設定アプリ）の終了は待たない**。呼び出し側が知りたいのは
 /// 「この URL を開けるハンドラがあるか」だけなので、粒度はこれで揃っている
 pub fn open_url_wait(url: &str) -> Result<(), String> {
+    open_url_wait_typed(url).map_err(OsIntegrationError::into_ja)
+}
+
+/// [`open_url_wait`] の本体（#2365。検査は型の口の側で通す = `String` の口は委ねるだけ）
+fn open_url_wait_typed(url: &str) -> Result<(), OsIntegrationError> {
     imp::open_url_wait(guarded_url(url)?)
 }
 
@@ -181,7 +552,7 @@ pub fn windows_url_launch(url: &str) -> WindowsUrlLaunch {
 /// アプリケーションを**新しいプロセスとして**起動する（macOS の `open -n` 相当）。
 /// 自動更新後の再起動（B14）が使う
 pub fn open_new_instance(app: &Path) -> Result<(), String> {
-    imp::open_new_instance(app)
+    imp::open_new_instance(app).map_err(OsIntegrationError::into_ja)
 }
 
 /// 「このアプリで開く…」= OS のアプリ選択 UI を出し、選ばれたアプリでパスを開く。
@@ -191,7 +562,7 @@ pub fn open_new_instance(app: &Path) -> Result<(), String> {
 /// **選択と起動が分かれていない**ため、`pick_application()` のような部品に割ると
 /// Windows 側が表現できない。キャンセルはエラー（呼び出し側は無視してよい）
 pub fn open_with_dialog(path: &Path) -> Result<(), String> {
-    imp::open_with_dialog(path)
+    imp::open_with_dialog(path).map_err(OsIntegrationError::into_ja)
 }
 
 /// パスをゴミ箱へ移す（**完全削除にはしない**）。
@@ -211,6 +582,11 @@ pub fn open_with_dialog(path: &Path) -> Result<(), String> {
 /// fixture を入れない**ため。#1860 の `TAKO_FILE_PASTEBOARD` と同じ作法）。本物のゴミ箱と同じく
 /// 同名があれば番号を付けて入れる（上書きしない）
 pub fn move_to_trash(path: &Path) -> Result<(), String> {
+    move_to_trash_typed(path).map_err(OsIntegrationError::into_ja)
+}
+
+/// [`move_to_trash`] の型の口（#2365）
+pub fn move_to_trash_typed(path: &Path) -> Result<(), OsIntegrationError> {
     if let Some(dir) = std::env::var_os("TAKO_TRASH_DIR").filter(|v| !v.is_empty()) {
         return move_into_test_trash(Path::new(&dir), path);
     }
@@ -218,17 +594,17 @@ pub fn move_to_trash(path: &Path) -> Result<(), String> {
 }
 
 /// `TAKO_TRASH_DIR` の行き先へ移す（同名があれば「名前 2」「名前 3」… = 上書きしない）
-fn move_into_test_trash(dir: &Path, path: &Path) -> Result<(), String> {
+fn move_into_test_trash(dir: &Path, path: &Path) -> Result<(), OsIntegrationError> {
     let name = path
         .file_name()
-        .ok_or_else(|| format!("ゴミ箱への移動に失敗: 名前が無い: {}", path.display()))?;
+        .ok_or_else(|| OsIntegrationError::TrashNoName(path.display().to_string()))?;
     let mut to = dir.join(name);
     let mut n = 2;
     while std::fs::symlink_metadata(&to).is_ok() {
         to = dir.join(format!("{} {n}", name.to_string_lossy()));
         n += 1;
     }
-    std::fs::rename(path, &to).map_err(|e| format!("ゴミ箱への移動に失敗: {e}"))
+    std::fs::rename(path, &to).map_err(|e| OsIntegrationError::TrashFailed(e.to_string()))
 }
 
 /// デスクトップ通知を出す（best-effort）。
@@ -245,75 +621,75 @@ pub fn notify(title: &str, message: &str) -> bool {
 mod imp {
     use super::*;
 
-    pub fn reveal(path: &Path) -> Result<(), String> {
+    pub fn reveal(path: &Path) -> Result<(), OsIntegrationError> {
         if super::reveal_legacy_2247() {
             // 修正前の形（#2247 の A/B）: 子の `open -R`。成功しても Finder が前に出てこなかった
-            return spawn_open(&["-R".as_ref(), path.as_os_str()], "Finder を開けない");
+            return spawn_open(&["-R".as_ref(), path.as_os_str()], Launch::Finder);
         }
         crate::platform::finder_reveal::reveal(path, super::reveal_record().as_deref())
     }
 
-    pub fn open_default(path: &Path) -> Result<(), String> {
-        spawn_open(&[path.as_os_str()], "デフォルトアプリで開けない")
+    pub fn open_default(path: &Path) -> Result<(), OsIntegrationError> {
+        spawn_open(&[path.as_os_str()], Launch::DefaultApp)
     }
 
-    pub fn open_with(app: &str, path: &Path) -> Result<(), String> {
+    pub fn open_with(app: &str, path: &Path) -> Result<(), OsIntegrationError> {
         spawn_open(
             &["-a".as_ref(), app.as_ref(), path.as_os_str()],
-            &format!("アプリ '{app}' で開けない"),
+            Launch::App(app.to_string()),
         )
     }
 
-    pub fn open_in_text_editor(path: &Path) -> Result<(), String> {
-        spawn_open(
-            &["-t".as_ref(), path.as_os_str()],
-            "テキストエディタで開けない",
-        )
+    pub fn open_in_text_editor(path: &Path) -> Result<(), OsIntegrationError> {
+        spawn_open(&["-t".as_ref(), path.as_os_str()], Launch::TextEditor)
     }
 
-    pub fn open_url(url: &str) -> Result<(), String> {
-        spawn_open(&[url.as_ref()], "URL を開けない")
+    pub fn open_url(url: &str) -> Result<(), OsIntegrationError> {
+        spawn_open(&[url.as_ref()], Launch::Url)
     }
 
-    pub fn open_url_wait(url: &str) -> Result<(), String> {
+    pub fn open_url_wait(url: &str) -> Result<(), OsIntegrationError> {
         let status = std::process::Command::new("open")
             .arg(url)
             .status()
-            .map_err(|e| format!("open コマンドの実行に失敗: {e}"))?;
+            .map_err(|e| OsIntegrationError::OpenCommandFailed(e.to_string()))?;
         if status.success() {
             Ok(())
         } else {
-            Err(format!("URL を開けない（終了コード {status}）: {url}"))
+            Err(OsIntegrationError::UrlExitStatus {
+                status: status.to_string(),
+                url: url.to_string(),
+            })
         }
     }
 
-    pub fn open_new_instance(app: &Path) -> Result<(), String> {
-        spawn_open(&["-n".as_ref(), app.as_os_str()], "アプリを起動できない")
+    pub fn open_new_instance(app: &Path) -> Result<(), OsIntegrationError> {
+        spawn_open(&["-n".as_ref(), app.as_os_str()], Launch::NewInstance)
     }
 
     /// macOS は「選択」と「起動」が別操作なので、境界の内側で 2 段を組む
-    pub fn open_with_dialog(path: &Path) -> Result<(), String> {
+    pub fn open_with_dialog(path: &Path) -> Result<(), OsIntegrationError> {
         let app = pick_application()?;
         open_with(&app.to_string_lossy(), path)
     }
 
-    fn pick_application() -> Result<std::path::PathBuf, String> {
+    fn pick_application() -> Result<std::path::PathBuf, OsIntegrationError> {
         let output = std::process::Command::new("osascript")
             .arg("-e")
             .arg("POSIX path of (choose application as alias)")
             .output()
-            .map_err(|e| format!("osascript 起動に失敗: {e}"))?;
+            .map_err(|e| OsIntegrationError::OsascriptSpawn(e.to_string()))?;
         if !output.status.success() {
-            return Err("アプリ選択がキャンセルされた".into());
+            return Err(OsIntegrationError::AppPickCanceled);
         }
         let app_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if app_path.is_empty() {
-            return Err("アプリパスが空".into());
+            return Err(OsIntegrationError::AppPathEmpty);
         }
         Ok(std::path::PathBuf::from(app_path))
     }
 
-    pub fn move_to_trash(path: &Path) -> Result<(), String> {
+    pub fn move_to_trash(path: &Path) -> Result<(), OsIntegrationError> {
         // argv 経由でパスを受け取るため、スクリプト本体にパスは一切現れない
         const SCRIPT: &str = "on run argv\n\
             tell application \"Finder\" to delete (POSIX file (item 1 of argv) as alias)\n\
@@ -323,10 +699,10 @@ mod imp {
             .arg(SCRIPT)
             .arg(path)
             .output()
-            .map_err(|e| format!("ゴミ箱への移動に失敗: {e}"))?;
+            .map_err(|e| OsIntegrationError::TrashFailed(e.to_string()))?;
         if !out.status.success() {
             let msg = String::from_utf8_lossy(&out.stderr);
-            return Err(format!("ゴミ箱への移動に失敗: {msg}"));
+            return Err(OsIntegrationError::TrashFailed(msg.into_owned()));
         }
         Ok(())
     }
@@ -346,12 +722,15 @@ mod imp {
             .is_ok()
     }
 
-    fn spawn_open(args: &[&std::ffi::OsStr], what: &str) -> Result<(), String> {
+    fn spawn_open(args: &[&std::ffi::OsStr], what: Launch) -> Result<(), OsIntegrationError> {
         std::process::Command::new("open")
             .args(args)
             .spawn()
             .map(|_| ())
-            .map_err(|e| format!("{what}: {e}"))
+            .map_err(|e| OsIntegrationError::Spawn {
+                what,
+                error: e.to_string(),
+            })
     }
 }
 
@@ -459,10 +838,10 @@ mod imp {
 
     /// UTF-16 + NUL 終端。途中に NUL があると Win32 側でそこまでしか読まれず
     /// **別のパスを指してしまう**ので、切り詰めずエラーにする
-    fn wide(s: &OsStr) -> Result<Vec<u16>, String> {
+    fn wide(s: &OsStr) -> Result<Vec<u16>, OsIntegrationError> {
         let mut buf: Vec<u16> = s.encode_wide().collect();
         if buf.contains(&0) {
-            return Err("パスに NUL 文字が含まれている".into());
+            return Err(OsIntegrationError::PathHasNul);
         }
         buf.push(0);
         Ok(buf)
@@ -473,8 +852,8 @@ mod imp {
     /// `std::fs::canonicalize` は使わない。返るのが `\\?\C:\…`（verbatim 形式）で、
     /// explorer も `SHFileOperationW` もこの形式を解釈できないため。
     /// `std::path::absolute` は `.` / `..` の正規化までで済み、シェルが読める形を保つ
-    pub(super) fn absolute(path: &Path) -> Result<std::path::PathBuf, String> {
-        std::path::absolute(path).map_err(|e| format!("パスを絶対化できない: {e}"))
+    pub(super) fn absolute(path: &Path) -> Result<std::path::PathBuf, OsIntegrationError> {
+        std::path::absolute(path).map_err(|e| OsIntegrationError::Absolutize(e.to_string()))
     }
 
     /// `ShellExecuteW` の薄いラッパー。`verb` が `None` なら既定の動詞
@@ -482,8 +861,8 @@ mod imp {
         verb: Option<&str>,
         file: &OsStr,
         parameters: Option<&OsStr>,
-        what: &str,
-    ) -> Result<(), String> {
+        what: Launch,
+    ) -> Result<(), OsIntegrationError> {
         let verb_w = verb.map(|v| wide(OsStr::new(v))).transpose()?;
         let file_w = wide(file)?;
         let params_w = parameters.map(wide).transpose()?;
@@ -504,39 +883,8 @@ mod imp {
         if rc > SHELL_EXECUTE_SUCCESS_MIN {
             Ok(())
         } else {
-            Err(format!("{what}: {}", describe_shell_execute_error(rc)))
-        }
-    }
-
-    /// `ShellExecuteW` のエラー（shellapi.h の `SE_ERR_*` と Win32 エラーが混在する）
-    fn describe_shell_execute_error(rc: isize) -> String {
-        match rc {
-            0 => "メモリまたはリソース不足".into(),
-            2 => "ファイルが見つからない".into(),
-            3 => "パスが見つからない".into(),
-            5 => "アクセスが拒否された".into(),
-            8 => "メモリ不足".into(),
-            26 => "共有違反".into(),
-            27 => "ファイルの関連付けが不完全または無効".into(),
-            28 => "タイムアウト".into(),
-            29 => "DDE トランザクションに失敗".into(),
-            31 => "この種類のファイルに関連付けられたアプリが無い".into(),
-            32 => "関連付けられた DLL が見つからない".into(),
-            other => format!("ShellExecuteW が {other} を返した"),
-        }
-    }
-
-    /// `SHFileOperationW` の戻り値（Win32 エラーコードではなく shell 独自の `DE_*`）
-    fn describe_shfileop_error(code: i32) -> String {
-        match code {
-            0x71 => "同じファイルを指している".into(),
-            0x74 => "ルートディレクトリは操作できない".into(),
-            0x75 => "操作が取り消された".into(),
-            0x78 => "アクセスが拒否された".into(),
-            0x79 => "パスが MAX_PATH（260 文字）を超えている".into(),
-            0x7C => "パスが不正".into(),
-            0x402 => "パスが見つからない（または不正）".into(),
-            other => format!("SHFileOperationW が 0x{other:X} を返した"),
+            // 戻り値の説明（`SE_ERR_*` と Win32 エラー）は cfg の外の `shell_execute_reason`
+            Err(OsIntegrationError::ShellExecute { what, code: rc })
         }
     }
 
@@ -553,9 +901,9 @@ mod imp {
     /// 正しい形は **パスだけを引用符でくくる** `/select,"C:\a b\c.txt"`。
     /// `raw_arg` で組み立てるため、引数の切れ目を壊しうる `"` を含むパスは拒否する
     /// （Windows のファイル名に `"` は使えないので、実在のパスを取りこぼすことはない）
-    pub(super) fn select_argument(abs: &Path) -> Result<OsString, String> {
+    pub(super) fn select_argument(abs: &Path) -> Result<OsString, OsIntegrationError> {
         if abs.as_os_str().encode_wide().any(|c| c == u16::from(b'"')) {
-            return Err("パスに引用符が含まれている".into());
+            return Err(OsIntegrationError::PathHasQuote);
         }
         let mut arg = OsString::from("/select,\"");
         arg.push(abs.as_os_str());
@@ -563,12 +911,12 @@ mod imp {
         Ok(arg)
     }
 
-    pub fn reveal(path: &Path) -> Result<(), String> {
+    pub fn reveal(path: &Path) -> Result<(), OsIntegrationError> {
         let abs = absolute(path)?;
         // 存在しないパスを渡すと explorer は**既定フォルダ（ドキュメント）を開いて**しまう。
         // 「押したら関係ない窓が出た」より「開けなかった」と言う方が親切なので先に弾く
         if std::fs::symlink_metadata(&abs).is_err() {
-            return Err(format!("パスが存在しない: {}", abs.display()));
+            return Err(OsIntegrationError::PathMissing(abs.display().to_string()));
         }
         let mut cmd = std::process::Command::new("explorer.exe");
         // 自動クォートを避けるため raw_arg で渡す（上の doc の理由）
@@ -578,51 +926,44 @@ mod imp {
         tako_core::platform::process::no_console_window(&mut cmd)
             .spawn()
             .map(|_| ())
-            .map_err(|e| format!("エクスプローラーを開けない: {e}"))
+            .map_err(|e| OsIntegrationError::Spawn {
+                what: Launch::Explorer,
+                error: e.to_string(),
+            })
     }
 
-    pub fn open_default(path: &Path) -> Result<(), String> {
+    pub fn open_default(path: &Path) -> Result<(), OsIntegrationError> {
         let abs = absolute(path)?;
-        shell_execute(
-            Some("open"),
-            abs.as_os_str(),
-            None,
-            "デフォルトアプリで開けない",
-        )
+        shell_execute(Some("open"), abs.as_os_str(), None, Launch::DefaultApp)
     }
 
-    pub fn open_with(app: &str, path: &Path) -> Result<(), String> {
+    pub fn open_with(app: &str, path: &Path) -> Result<(), OsIntegrationError> {
         let abs = absolute(path)?;
         shell_execute(
             Some("open"),
             OsStr::new(app),
             Some(&quoted_argument(abs.as_os_str())),
-            &format!("アプリ '{app}' で開けない"),
+            Launch::App(app.to_string()),
         )
     }
 
     /// Windows の「このアプリで開く…」は `openas` verb そのもの。
     /// 選択ダイアログの表示とアプリ起動を OS が 1 操作で行う
-    pub fn open_with_dialog(path: &Path) -> Result<(), String> {
+    pub fn open_with_dialog(path: &Path) -> Result<(), OsIntegrationError> {
         let abs = absolute(path)?;
-        shell_execute(
-            Some("openas"),
-            abs.as_os_str(),
-            None,
-            "アプリ選択ダイアログを開けない",
-        )
+        shell_execute(Some("openas"), abs.as_os_str(), None, Launch::AppPicker)
     }
 
     /// Windows に「既定のテキストエディタ」という概念（macOS の `open -t`）は無い。
     /// 拡張子の関連付け（`open_default`）だとテキストエディタで開くとは限らないので、
     /// 必ずテキストとして開ける メモ帳 を使う
-    pub fn open_in_text_editor(path: &Path) -> Result<(), String> {
+    pub fn open_in_text_editor(path: &Path) -> Result<(), OsIntegrationError> {
         let abs = absolute(path)?;
         shell_execute(
             Some("open"),
             OsStr::new("notepad.exe"),
             Some(&quoted_argument(abs.as_os_str())),
-            "テキストエディタで開けない",
+            Launch::TextEditor,
         )
     }
 
@@ -638,13 +979,13 @@ mod imp {
 
     /// URL も `ShellExecuteW` で開く（#1371）。引数の組み方は境界の外に置いた
     /// [`windows_url_launch`] が正本で、macOS からも同じ形を検査できる
-    pub fn open_url(url: &str) -> Result<(), String> {
+    pub fn open_url(url: &str) -> Result<(), OsIntegrationError> {
         let launch = windows_url_launch(url);
         shell_execute(
             launch.verb,
             OsStr::new(&launch.file),
             launch.parameters.as_deref().map(OsStr::new),
-            "URL を開けない",
+            Launch::Url,
         )
     }
 
@@ -654,23 +995,23 @@ mod imp {
     ///
     /// **`ShellExecuteExW` + `SEE_MASK_NOCLOSEPROCESS` は使わない**。返るのはハンドラ本体
     /// （ブラウザ / 設定アプリ）のハンドルなので、待つとユーザーがそれを閉じるまで返らない
-    pub fn open_url_wait(url: &str) -> Result<(), String> {
+    pub fn open_url_wait(url: &str) -> Result<(), OsIntegrationError> {
         open_url(url)
     }
 
-    pub fn open_new_instance(_app: &Path) -> Result<(), String> {
+    pub fn open_new_instance(_app: &Path) -> Result<(), OsIntegrationError> {
         // 自動更新（B14）の Windows 経路はインストーラー起動 → 自プロセス終了なので
         // 「同じアプリをもう 1 つ起こす」対応物が無い（#528）
-        Err("アプリの新規プロセス起動はこのプラットフォームでは未対応です".into())
+        Err(OsIntegrationError::Unsupported(OsFeature::NewInstance))
     }
 
-    pub fn move_to_trash(path: &Path) -> Result<(), String> {
+    pub fn move_to_trash(path: &Path) -> Result<(), OsIntegrationError> {
         // FOF_ALLOWUNDO は**絶対パスでないとごみ箱へ入らず完全削除になる**（MSDN 明記）
         let abs = absolute(path)?;
         // 壊れたシンボリックリンクも対象にしたいので exists() ではなくメタデータで見る。
         // 存在しないパスに対する SHFileOperationW の戻り値に依存しないためでもある
         if std::fs::symlink_metadata(&abs).is_err() {
-            return Err(format!("パスが存在しない: {}", abs.display()));
+            return Err(OsIntegrationError::PathMissing(abs.display().to_string()));
         }
         // pFrom は二重 NUL 終端（複数パスを並べられる形式。1 件でも終端は 2 つ要る）
         let mut from = wide(abs.as_os_str())?;
@@ -691,15 +1032,13 @@ mod imp {
         // 使わないポインタ（p_to / hNameMappings / lpszProgressTitle）は仕様どおり NULL
         let code = unsafe { SHFileOperationW(&mut op) };
         if code != 0 {
-            return Err(format!(
-                "ごみ箱への移動に失敗: {}",
-                describe_shfileop_error(code)
-            ));
+            // 戻り値の説明（shell 独自の `DE_*`）は cfg の外の `shfileop_reason`
+            return Err(OsIntegrationError::TrashShellOp(code));
         }
         // 「完全に削除しますか？」をユーザーが断ったときはここに落ちる（戻り値は 0）。
         // 消えていないので成功と報告してはいけない
         if op.f_any_operations_aborted != 0 {
-            return Err("ごみ箱への移動が取り消された".into());
+            return Err(OsIntegrationError::TrashAborted);
         }
         Ok(())
     }
@@ -722,43 +1061,49 @@ mod imp {
 mod imp {
     use super::*;
 
-    pub fn reveal(_path: &Path) -> Result<(), String> {
-        Err(unsupported("ファイルマネージャでの表示"))
+    pub fn reveal(_path: &Path) -> Result<(), OsIntegrationError> {
+        Err(OsIntegrationError::Unsupported(OsFeature::Reveal))
     }
 
-    pub fn open_default(_path: &Path) -> Result<(), String> {
-        Err(unsupported("既定アプリで開く操作"))
+    pub fn open_default(_path: &Path) -> Result<(), OsIntegrationError> {
+        Err(OsIntegrationError::Unsupported(OsFeature::OpenDefault))
     }
 
-    pub fn open_with(_app: &str, _path: &Path) -> Result<(), String> {
-        Err(unsupported("アプリを指定して開く操作"))
+    pub fn open_with(_app: &str, _path: &Path) -> Result<(), OsIntegrationError> {
+        Err(OsIntegrationError::Unsupported(OsFeature::OpenWith))
     }
 
-    pub fn open_with_dialog(_path: &Path) -> Result<(), String> {
-        Err(unsupported("アプリ選択ダイアログ"))
+    pub fn open_with_dialog(_path: &Path) -> Result<(), OsIntegrationError> {
+        Err(OsIntegrationError::Unsupported(OsFeature::AppPicker))
     }
 
-    pub fn open_in_text_editor(_path: &Path) -> Result<(), String> {
-        Err(unsupported("テキストエディタで開く操作"))
+    pub fn open_in_text_editor(_path: &Path) -> Result<(), OsIntegrationError> {
+        Err(OsIntegrationError::Unsupported(OsFeature::TextEditor))
     }
 
     /// URL だけは非 macOS でも従来から動いていた（`open_preview` の cfg 分岐）。
     /// その挙動をそのままここへ引き取る
-    pub fn open_url(url: &str) -> Result<(), String> {
+    pub fn open_url(url: &str) -> Result<(), OsIntegrationError> {
         url_command(url)
             .spawn()
             .map(|_| ())
-            .map_err(|e| format!("URL を開けない: {e}"))
+            .map_err(|e| OsIntegrationError::Spawn {
+                what: Launch::Url,
+                error: e.to_string(),
+            })
     }
 
-    pub fn open_url_wait(url: &str) -> Result<(), String> {
+    pub fn open_url_wait(url: &str) -> Result<(), OsIntegrationError> {
         let status = url_command(url)
             .status()
-            .map_err(|e| format!("URL ハンドラの実行に失敗: {e}"))?;
+            .map_err(|e| OsIntegrationError::UrlHandlerFailed(e.to_string()))?;
         if status.success() {
             Ok(())
         } else {
-            Err(format!("URL を開けない（終了コード {status}）: {url}"))
+            Err(OsIntegrationError::UrlExitStatus {
+                status: status.to_string(),
+                url: url.to_string(),
+            })
         }
     }
 
@@ -768,21 +1113,17 @@ mod imp {
         cmd
     }
 
-    pub fn open_new_instance(_app: &Path) -> Result<(), String> {
-        Err(unsupported("アプリの新規プロセス起動"))
+    pub fn open_new_instance(_app: &Path) -> Result<(), OsIntegrationError> {
+        Err(OsIntegrationError::Unsupported(OsFeature::NewInstance))
     }
 
     /// **削除へ劣化させない**。ゴミ箱のつもりで完全削除するくらいなら失敗した方がよい
-    pub fn move_to_trash(_path: &Path) -> Result<(), String> {
-        Err(unsupported("ゴミ箱への移動"))
+    pub fn move_to_trash(_path: &Path) -> Result<(), OsIntegrationError> {
+        Err(OsIntegrationError::Unsupported(OsFeature::Trash))
     }
 
     pub fn notify(_title: &str, _message: &str) -> bool {
         false
-    }
-
-    fn unsupported(what: &str) -> String {
-        format!("{what}はこのプラットフォームでは未対応です")
     }
 }
 

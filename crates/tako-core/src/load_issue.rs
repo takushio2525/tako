@@ -57,14 +57,95 @@ pub fn legacy_2238() -> bool {
 /// 読んだ値をそのまま含む（実測）。診断ログ（persist.log）とテレメトリへファイルの中身を
 /// 出さないため、種類と位置（行・列）だけにする
 pub fn json_reason(e: &serde_json::Error) -> String {
-    use serde_json::error::Category;
-    let kind = match e.classify() {
-        Category::Syntax => "JSON の構文が壊れている",
-        Category::Eof => "JSON が途中で切れている",
-        Category::Data => "JSON の形が期待と違う",
-        Category::Io => "読み取りに失敗",
-    };
-    format!("{kind}（{} 行 {} 列）", e.line(), e.column())
+    JsonReason::located(e).text_in(Lang::Ja)
+}
+
+/// JSON を解釈できなかった理由を、表示言語で引ける形で持つ（#2365。[`YamlReason`] の JSON 版）。
+///
+/// 中身は [`json_reason`] と同じ「種類と位置だけ」（ファイルの中身を引用しない = #2230）。
+/// 利用者へ返す断り（蓋閉じ継続の記録の解釈 = `tako_control::platform::lid::LidError`）は包みと
+/// 同じ言語で [`Self::text_in`] を引く。persist.log へ流れる [`json_reason`] /
+/// [`json_error_reason`] は日本語のまま（診断ログは日本語固定 = FR-2.42.21）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonReason {
+    /// 種類と位置（行・列。serde_json の `line()` / `column()` のまま）
+    Located {
+        kind: JsonProblem,
+        line: usize,
+        column: usize,
+    },
+    /// `TAKO_2230_LEGACY=1` の修正前の形（serde の素の文言。英語のまま）
+    Raw(String),
+}
+
+/// [`JsonReason`] の種類（serde_json の `Category` と 1:1）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonProblem {
+    /// 構文として読めない
+    Syntax,
+    /// 途中で切れている
+    Eof,
+    /// 読めるが形が期待と違う
+    Data,
+    /// 読み取りに失敗
+    Io,
+}
+
+impl JsonProblem {
+    /// (種類, 言語) の網羅 match。日本語は #2365 より前の [`json_reason`] とバイト一致
+    pub fn text_in(self, lang: Lang) -> &'static str {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Syntax, Ja) => "JSON の構文が壊れている",
+            (Self::Syntax, En) => "the JSON syntax is broken",
+            (Self::Eof, Ja) => "JSON が途中で切れている",
+            (Self::Eof, En) => "the JSON is cut off",
+            (Self::Data, Ja) => "JSON の形が期待と違う",
+            (Self::Data, En) => "the JSON does not have the expected shape",
+            (Self::Io, Ja) => "読み取りに失敗",
+            (Self::Io, En) => "failed to read",
+        }
+    }
+}
+
+impl JsonReason {
+    /// 種類と位置を採る
+    pub fn located(e: &serde_json::Error) -> Self {
+        use serde_json::error::Category;
+        let kind = match e.classify() {
+            Category::Syntax => JsonProblem::Syntax,
+            Category::Eof => JsonProblem::Eof,
+            Category::Data => JsonProblem::Data,
+            Category::Io => JsonProblem::Io,
+        };
+        Self::Located {
+            kind,
+            line: e.line(),
+            column: e.column(),
+        }
+    }
+
+    /// [`json_error_reason`] の表示言語版（`TAKO_2230_LEGACY=1` なら素の文言）
+    pub fn of(e: &serde_json::Error) -> Self {
+        if legacy_raw_serde_reason() {
+            return Self::Raw(e.to_string());
+        }
+        Self::located(e)
+    }
+
+    /// (形, 言語) の網羅 match
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Located { kind, line, column }, Ja) => {
+                format!("{}（{line} 行 {column} 列）", kind.text_in(lang))
+            }
+            (Self::Located { kind, line, column }, En) => {
+                format!("{} (line {line}, column {column})", kind.text_in(lang))
+            }
+            (Self::Raw(raw), _) => raw.clone(),
+        }
+    }
 }
 
 /// YAML を解釈できなかった理由を**中身を含めずに**言う（#2230。[`json_reason`] の YAML 版）。

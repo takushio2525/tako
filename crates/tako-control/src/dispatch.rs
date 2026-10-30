@@ -10382,8 +10382,8 @@ fn dispatch_inner(
                     if !path.exists() {
                         return Err(Reason::PathNotFound(path.display().to_string()).operation());
                     }
-                    crate::platform::os_integration::reveal(&path)
-                        .map_err(DispatchError::Operation)?;
+                    crate::platform::os_integration::reveal_typed(&path)
+                        .map_err(|e| OsRefusal::from(e).operation())?;
                     Ok(json!({ "revealed": path.display().to_string() }))
                 }
                 FileOpKind::OpenTerminal => {
@@ -10446,8 +10446,8 @@ fn dispatch_inner(
                     if !path.exists() {
                         return Err(Reason::PathNotFound(path.display().to_string()).operation());
                     }
-                    crate::platform::os_integration::open_default(&path)
-                        .map_err(DispatchError::Operation)?;
+                    crate::platform::os_integration::open_default_typed(&path)
+                        .map_err(|e| OsRefusal::from(e).operation())?;
                     Ok(json!({ "opened": path.display().to_string() }))
                 }
                 FileOpKind::OpenWith => {
@@ -10455,8 +10455,8 @@ fn dispatch_inner(
                         return Err(Reason::PathNotFound(path.display().to_string()).operation());
                     }
                     let app_name = name.ok_or_else(|| Reason::AppNameMissing.invalid())?;
-                    crate::platform::os_integration::open_with(&app_name, &path)
-                        .map_err(DispatchError::Operation)?;
+                    crate::platform::os_integration::open_with_typed(&app_name, &path)
+                        .map_err(|e| OsRefusal::from(e).operation())?;
                     Ok(json!({ "opened": path.display().to_string(), "app": app_name }))
                 }
                 // #1182: ファイル / ディレクトリの振り分けだけをここで決め、開く実体は
@@ -11961,8 +11961,8 @@ fn dispatch_inner(
                     }))
                 }
                 "remove-lid-sleep" => {
-                    let result = crate::sleep_guard::teardown_lid_control()
-                        .map_err(DispatchError::Operation)?;
+                    let result = crate::sleep_guard::teardown_lid_control_typed()
+                        .map_err(OsRefusal::operation)?;
                     let mut settings = crate::settings::load();
                     settings.lid_sleep_mode = crate::sleep_guard::LidSleepMode::Off;
                     crate::settings::save(&settings)
@@ -11974,8 +11974,8 @@ fn dispatch_inner(
                     }))
                 }
                 "open-battery-settings" => {
-                    crate::sleep_guard::open_battery_settings()
-                        .map_err(DispatchError::Operation)?;
+                    crate::sleep_guard::open_battery_settings_typed()
+                        .map_err(OsRefusal::operation)?;
                     Ok(serde_json::json!({
                         "result": "System Settings の Battery を開きました",
                     }))
@@ -23835,7 +23835,8 @@ fn trash_one(path: &std::path::Path) -> Result<Value, DispatchError> {
     if !path.exists() {
         return Err(Reason::PathNotFound(path.display().to_string()).operation());
     }
-    crate::platform::os_integration::move_to_trash(path).map_err(DispatchError::Operation)?;
+    crate::platform::os_integration::move_to_trash_typed(path)
+        .map_err(|e| OsRefusal::from(e).operation())?;
     Ok(json!({ "trashed": path.display().to_string() }))
 }
 

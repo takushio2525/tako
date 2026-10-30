@@ -8131,6 +8131,8 @@ fn outside() {
 // いないことを `file:line` で名指す。成功の応答の注記（`Ok` の文・warnings・osascript のスクリプト）は
 // 断りではないので見ない
 
+use tako_control::platform::lid::{LidError, Rail};
+use tako_control::platform::os_integration::{Launch, OsFeature, OsIntegrationError};
 use tako_control::{OsRefusal, SessionRefusal};
 use tako_core::shell_integration::{Delivery, SiError};
 
@@ -8275,9 +8277,14 @@ fn os_refusal_index(r: &OsRefusal) -> usize {
         OsRefusal::SudoersInstallFailed(_) => 6,
         OsRefusal::UnknownShellIntegrationAction(_) => 7,
         OsRefusal::ShellIntegration(_) => 8,
+        OsRefusal::SudoersRemoveFailed(_) => 9,
+        OsRefusal::LidTeardownFailed(_) => 10,
+        OsRefusal::BatterySettingsUnopenable(_) => 11,
+        OsRefusal::BatterySettingsMacOnly => 12,
+        OsRefusal::Integration(_) => 13,
     }
 }
-const OS_REFUSAL_VARIANTS: usize = 9;
+const OS_REFUSAL_VARIANTS: usize = 14;
 
 /// `SiError`（tako-core）の通し番号
 fn si_error_index(e: &SiError) -> usize {
@@ -8378,6 +8385,32 @@ fn os_refusal_table() -> Vec<(OsRefusal, &'static str)> {
         (
             OsRefusal::ShellIntegration(SiError::NothingToUninstall(Delivery::Automatic)),
             "この環境のシェル統合は環境変数の注入だけで完結するため、解除する配置がありません",
+        ),
+        // ---- #2365 の続き: 枠と中身（`platform::lid` / `os_integration`）を一緒に移したもの ----
+        (
+            OsRefusal::SudoersRemoveFailed("ERROR: rm".into()),
+            "sudoers 削除に失敗: ERROR: rm",
+        ),
+        (
+            OsRefusal::LidTeardownFailed(LidError::WriteSetting {
+                rail: Rail::Ac,
+                rc: 5,
+            }),
+            "蓋閉じ継続の解除に失敗: 蓋の設定を書けません（Ac, rc=5）",
+        ),
+        (
+            OsRefusal::BatterySettingsUnopenable(OsIntegrationError::Spawn {
+                what: Launch::Url,
+                error: "No such file or directory (os error 2)".into(),
+            }),
+            "System Settings を開けません: URL を開けない: No such file or directory (os error 2)",
+        ),
+        (OsRefusal::BatterySettingsMacOnly, "macOS 以外では非対応"),
+        (
+            OsRefusal::Integration(OsIntegrationError::TrashFailed(
+                "No such file or directory (os error 2)".into(),
+            )),
+            "ゴミ箱への移動に失敗: No such file or directory (os error 2)",
         ),
     ]
 }
@@ -8657,6 +8690,21 @@ const SESSION_OS_REFUSAL_SCOPES: &[(&str, &str, Span)] = &[
         Span::Item("pub fn install_sudoers_typed("),
     ),
     (
+        SLEEP_GUARD_PATH,
+        SLEEP_GUARD_SRC,
+        Span::Item("pub fn teardown_lid_control_typed("),
+    ),
+    (
+        SLEEP_GUARD_PATH,
+        SLEEP_GUARD_SRC,
+        Span::Item("pub fn remove_sudoers_typed("),
+    ),
+    (
+        SLEEP_GUARD_PATH,
+        SLEEP_GUARD_SRC,
+        Span::Item("pub fn open_battery_settings_typed("),
+    ),
+    (
         SHELL_INTEGRATION_PATH,
         SHELL_INTEGRATION_SRC,
         Span::Item("pub fn run_typed("),
@@ -8716,8 +8764,9 @@ fn 会話とosの設定の型の口の断りに日本語の固定文が無い() 
 }
 
 /// dispatch が呼んではいけない日本語の口（型の口 `*_typed` の外側）。蓋閉じ継続の解除・Battery の
-/// 設定を開く口は中身が `platform::lid` / `os_integration` の文なので、それと一緒に移すまで載せない
-const JA_SESSION_OS_CALLS: [&str; 11] = [
+/// 設定を開く口とファイル操作（`os_integration`）は、中身の `platform::lid` / `os_integration` の文と
+/// 一緒に移した（#2365 の続き）
+const JA_SESSION_OS_CALLS: [&str; 17] = [
     "sessions::list_payload(",
     "sessions::show_payload(",
     "SessionCatalog::load()",
@@ -8729,6 +8778,12 @@ const JA_SESSION_OS_CALLS: [&str; 11] = [
     "sleep_guard::parse_battery_floor(",
     "sleep_guard::prepare_lid_control()",
     "shell_integration::run(",
+    "sleep_guard::teardown_lid_control()",
+    "sleep_guard::open_battery_settings()",
+    "os_integration::reveal(",
+    "os_integration::open_default(",
+    "os_integration::open_with(",
+    "os_integration::move_to_trash(",
 ];
 
 /// dispatch の本体で、日本語の口を呼んで断りに載せている行（断りを捨てる文は見ない）
@@ -9344,4 +9399,794 @@ fn 更新の口とcoreの文の断りの組み立てに日本語の固定文が�
         }
     }
     report_all(failures);
+}
+
+// ---- #2365 の続き: OS のシェルに委ねる操作（`platform::os_integration` / `platform::finder_reveal`）と
+// 蓋閉じ継続の上書き・復元（`platform::lid`）の断り ----
+//
+// dispatch の Finder / エクスプローラーで表示・既定アプリ / 指定のアプリで開く・ゴミ箱へ移す・
+// 蓋閉じ継続の解除・System Settings の Battery を開くは、以前は中身の `Err(String)`（日本語の固定文）を
+// 素通ししていた。枠（`OsRefusal`）だけ移すと 1 つの断りに日英が混ざるので、中身の型
+// （`OsIntegrationError` / `LidError` と、その中で引く tako-core の `UrlBlocked` / `JsonReason`）と
+// 一緒に移した。Windows の `ShellExecuteW` / `SHFileOperationW` の説明と電源プランの文も `cfg` の外の
+// 表に置いたので、macOS のこのテストで日英を検査できる。
+
+use tako_control::platform::os_integration::{shell_execute_reason, shfileop_reason};
+use tako_core::load_issue::{JsonProblem, JsonReason};
+use tako_core::url_guard::UrlBlocked;
+
+const OS_INTEGRATION_SRC: &str = include_str!("../src/platform/os_integration.rs");
+const OS_INTEGRATION_PATH: &str = "crates/tako-control/src/platform/os_integration.rs";
+const FINDER_REVEAL_SRC: &str = include_str!("../src/platform/finder_reveal.rs");
+const FINDER_REVEAL_PATH: &str = "crates/tako-control/src/platform/finder_reveal.rs";
+const LID_SRC: &str = include_str!("../src/platform/lid.rs");
+const LID_PATH: &str = "crates/tako-control/src/platform/lid.rs";
+const URL_GUARD_SRC: &str = include_str!("../../tako-core/src/url_guard.rs");
+const URL_GUARD_PATH: &str = "crates/tako-core/src/url_guard.rs";
+
+/// `OsIntegrationError` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
+fn os_integration_index(e: &OsIntegrationError) -> usize {
+    match e {
+        OsIntegrationError::UrlBlocked(_) => 0,
+        OsIntegrationError::Spawn { .. } => 1,
+        OsIntegrationError::Unsupported(_) => 2,
+        OsIntegrationError::OpenCommandFailed(_) => 3,
+        OsIntegrationError::UrlHandlerFailed(_) => 4,
+        OsIntegrationError::UrlExitStatus { .. } => 5,
+        OsIntegrationError::OsascriptSpawn(_) => 6,
+        OsIntegrationError::AppPickCanceled => 7,
+        OsIntegrationError::AppPathEmpty => 8,
+        OsIntegrationError::TrashFailed(_) => 9,
+        OsIntegrationError::TrashNoName(_) => 10,
+        OsIntegrationError::AppKitUnavailable => 11,
+        OsIntegrationError::WorkspaceUnavailable => 12,
+        OsIntegrationError::NulInString => 13,
+        OsIntegrationError::NsStringFailed => 14,
+        OsIntegrationError::NulInPath(_) => 15,
+        OsIntegrationError::FileUrlFailed(_) => 16,
+        OsIntegrationError::RecordPathUnreadable => 17,
+        OsIntegrationError::RecordWrite { .. } => 18,
+        OsIntegrationError::PathHasNul => 19,
+        OsIntegrationError::PathHasQuote => 20,
+        OsIntegrationError::Absolutize(_) => 21,
+        OsIntegrationError::PathMissing(_) => 22,
+        OsIntegrationError::ShellExecute { .. } => 23,
+        OsIntegrationError::TrashShellOp(_) => 24,
+        OsIntegrationError::TrashAborted => 25,
+    }
+}
+
+const OS_INTEGRATION_VARIANTS: usize = 26;
+
+/// `LidError` の通し番号
+fn lid_error_index(e: &LidError) -> usize {
+    match e {
+        LidError::RecordRead { .. } => 0,
+        LidError::RecordUnparsable { .. } => 1,
+        LidError::DataDirUnresolved => 2,
+        LidError::NothingToRestore => 3,
+        LidError::BadSchemeGuid(_) => 4,
+        LidError::Lock(_) => 5,
+        LidError::Write(_) => 6,
+        LidError::Serialize(_) => 7,
+        LidError::ActiveScheme(_) => 8,
+        LidError::ReadSetting { .. } => 9,
+        LidError::WriteSetting { .. } => 10,
+        LidError::ApplyScheme(_) => 11,
+        LidError::Unsupported => 12,
+    }
+}
+
+const LID_ERROR_VARIANTS: usize = 13;
+
+/// `Launch` の通し番号
+fn launch_index(l: &Launch) -> usize {
+    match l {
+        Launch::Finder => 0,
+        Launch::Explorer => 1,
+        Launch::DefaultApp => 2,
+        Launch::App(_) => 3,
+        Launch::TextEditor => 4,
+        Launch::Url => 5,
+        Launch::NewInstance => 6,
+        Launch::AppPicker => 7,
+    }
+}
+
+/// `OsFeature` の通し番号
+fn os_feature_index(f: &OsFeature) -> usize {
+    match f {
+        OsFeature::Reveal => 0,
+        OsFeature::OpenDefault => 1,
+        OsFeature::OpenWith => 2,
+        OsFeature::AppPicker => 3,
+        OsFeature::TextEditor => 4,
+        OsFeature::NewInstance => 5,
+        OsFeature::Trash => 6,
+    }
+}
+
+/// `UrlBlocked` の通し番号
+fn url_blocked_index(b: &UrlBlocked) -> usize {
+    match b {
+        UrlBlocked::NoScheme => 0,
+        UrlBlocked::DriveLetter => 1,
+        UrlBlocked::Scheme => 2,
+        UrlBlocked::ControlChar => 3,
+        UrlBlocked::NoHost => 4,
+    }
+}
+
+/// `JsonProblem` の通し番号
+fn json_problem_index(p: &JsonProblem) -> usize {
+    match p {
+        JsonProblem::Syntax => 0,
+        JsonProblem::Eof => 1,
+        JsonProblem::Data => 2,
+        JsonProblem::Io => 3,
+    }
+}
+
+/// 見本と、#2365 より前の固定文（`os_integration` / `finder_reveal` の macOS・Windows・その他の実装の文）
+fn os_integration_table() -> Vec<(OsIntegrationError, &'static str)> {
+    use OsIntegrationError as O;
+    let e = || "No such file or directory (os error 2)".to_string();
+    vec![
+        (
+            O::UrlBlocked(UrlBlocked::Scheme),
+            "この URL は開けない（許可していないスキーム）",
+        ),
+        (
+            O::Spawn {
+                what: Launch::DefaultApp,
+                error: e(),
+            },
+            "デフォルトアプリで開けない: No such file or directory (os error 2)",
+        ),
+        (
+            O::Unsupported(OsFeature::Trash),
+            "ゴミ箱への移動はこのプラットフォームでは未対応です",
+        ),
+        (
+            O::OpenCommandFailed(e()),
+            "open コマンドの実行に失敗: No such file or directory (os error 2)",
+        ),
+        (
+            O::UrlHandlerFailed(e()),
+            "URL ハンドラの実行に失敗: No such file or directory (os error 2)",
+        ),
+        (
+            O::UrlExitStatus {
+                status: "exit status: 1".into(),
+                url: "https://example.com/".into(),
+            },
+            "URL を開けない（終了コード exit status: 1）: https://example.com/",
+        ),
+        (
+            O::OsascriptSpawn(e()),
+            "osascript 起動に失敗: No such file or directory (os error 2)",
+        ),
+        (O::AppPickCanceled, "アプリ選択がキャンセルされた"),
+        (O::AppPathEmpty, "アプリパスが空"),
+        (
+            O::TrashFailed(e()),
+            "ゴミ箱への移動に失敗: No such file or directory (os error 2)",
+        ),
+        (
+            O::TrashNoName("/".into()),
+            "ゴミ箱への移動に失敗: 名前が無い: /",
+        ),
+        (
+            O::AppKitUnavailable,
+            "Finder を開けない: AppKit を読み込めない",
+        ),
+        (
+            O::WorkspaceUnavailable,
+            "Finder を開けない: NSWorkspace を使えない",
+        ),
+        (O::NulInString, "NUL を含む文字列"),
+        (O::NsStringFailed, "NSString を作れない"),
+        (O::NulInPath("/tmp/a".into()), "NUL を含むパス: /tmp/a"),
+        (
+            O::FileUrlFailed("/tmp/a".into()),
+            "ファイルの URL を作れない: /tmp/a",
+        ),
+        (
+            O::RecordPathUnreadable,
+            "ファイルの URL からパスを読み戻せない",
+        ),
+        (
+            O::RecordWrite {
+                path: "/tmp/x/reveal.log".into(),
+                error: e(),
+            },
+            "記録を書けない（/tmp/x/reveal.log）: No such file or directory (os error 2)",
+        ),
+        (O::PathHasNul, "パスに NUL 文字が含まれている"),
+        (O::PathHasQuote, "パスに引用符が含まれている"),
+        (
+            O::Absolutize("The system cannot find the path specified. (os error 3)".into()),
+            "パスを絶対化できない: The system cannot find the path specified. (os error 3)",
+        ),
+        (
+            O::PathMissing(r"C:\tmp\a.txt".into()),
+            r"パスが存在しない: C:\tmp\a.txt",
+        ),
+        (
+            O::ShellExecute {
+                what: Launch::Url,
+                code: 31,
+            },
+            "URL を開けない: この種類のファイルに関連付けられたアプリが無い",
+        ),
+        (
+            O::TrashShellOp(0x78),
+            "ごみ箱への移動に失敗: アクセスが拒否された",
+        ),
+        (O::TrashAborted, "ごみ箱への移動が取り消された"),
+    ]
+}
+
+/// 枠（何をしようとしたか）の全種と、#2365 より前の `spawn_open` / `shell_execute` の文
+fn launch_table() -> Vec<(Launch, &'static str)> {
+    vec![
+        (Launch::Finder, "Finder を開けない: e"),
+        (Launch::Explorer, "エクスプローラーを開けない: e"),
+        (Launch::DefaultApp, "デフォルトアプリで開けない: e"),
+        (
+            Launch::App("Preview".into()),
+            "アプリ 'Preview' で開けない: e",
+        ),
+        (Launch::TextEditor, "テキストエディタで開けない: e"),
+        (Launch::Url, "URL を開けない: e"),
+        (Launch::NewInstance, "アプリを起動できない: e"),
+        (Launch::AppPicker, "アプリ選択ダイアログを開けない: e"),
+    ]
+}
+
+/// 未対応の操作の全種と、#2365 より前の `unsupported(…)` の文（Windows の新規プロセス起動も同じ文）
+fn os_feature_table() -> Vec<(OsFeature, &'static str)> {
+    vec![
+        (
+            OsFeature::Reveal,
+            "ファイルマネージャでの表示はこのプラットフォームでは未対応です",
+        ),
+        (
+            OsFeature::OpenDefault,
+            "既定アプリで開く操作はこのプラットフォームでは未対応です",
+        ),
+        (
+            OsFeature::OpenWith,
+            "アプリを指定して開く操作はこのプラットフォームでは未対応です",
+        ),
+        (
+            OsFeature::AppPicker,
+            "アプリ選択ダイアログはこのプラットフォームでは未対応です",
+        ),
+        (
+            OsFeature::TextEditor,
+            "テキストエディタで開く操作はこのプラットフォームでは未対応です",
+        ),
+        (
+            OsFeature::NewInstance,
+            "アプリの新規プロセス起動はこのプラットフォームでは未対応です",
+        ),
+        (
+            OsFeature::Trash,
+            "ゴミ箱への移動はこのプラットフォームでは未対応です",
+        ),
+    ]
+}
+
+/// URL の検査の理由の全種と、#2365 より前の `guarded_url` の文
+fn url_blocked_table() -> Vec<(UrlBlocked, &'static str)> {
+    vec![
+        (
+            UrlBlocked::NoScheme,
+            "この URL は開けない（スキームが無い）",
+        ),
+        (
+            UrlBlocked::DriveLetter,
+            "この URL は開けない（スキームではなくドライブレター）",
+        ),
+        (
+            UrlBlocked::Scheme,
+            "この URL は開けない（許可していないスキーム）",
+        ),
+        (
+            UrlBlocked::ControlChar,
+            "この URL は開けない（制御文字入り）",
+        ),
+        (UrlBlocked::NoHost, "この URL は開けない（ホスト部が無い）"),
+    ]
+}
+
+/// `ShellExecuteW` の戻り値の全種（と表に無い値）と、#2365 より前の `describe_shell_execute_error` の文
+const SHELL_EXECUTE_OLD: [(isize, &str); 12] = [
+    (0, "メモリまたはリソース不足"),
+    (2, "ファイルが見つからない"),
+    (3, "パスが見つからない"),
+    (5, "アクセスが拒否された"),
+    (8, "メモリ不足"),
+    (26, "共有違反"),
+    (27, "ファイルの関連付けが不完全または無効"),
+    (28, "タイムアウト"),
+    (29, "DDE トランザクションに失敗"),
+    (31, "この種類のファイルに関連付けられたアプリが無い"),
+    (32, "関連付けられた DLL が見つからない"),
+    (1155, "ShellExecuteW が 1155 を返した"),
+];
+
+/// `SHFileOperationW` の戻り値の全種（と表に無い値）と、#2365 より前の `describe_shfileop_error` の文
+const SHFILEOP_OLD: [(i32, &str); 8] = [
+    (0x71, "同じファイルを指している"),
+    (0x74, "ルートディレクトリは操作できない"),
+    (0x75, "操作が取り消された"),
+    (0x78, "アクセスが拒否された"),
+    (0x79, "パスが MAX_PATH（260 文字）を超えている"),
+    (0x7C, "パスが不正"),
+    (0x402, "パスが見つからない（または不正）"),
+    (0x10, "SHFileOperationW が 0x10 を返した"),
+];
+
+/// 見本と、#2365 より前の `platform::lid` の文（Windows の電源プランの文を含む）
+fn lid_error_table() -> Vec<(LidError, String)> {
+    let lock = LockError::Acquire {
+        path: "/d/lid-guard.json.lock".into(),
+        error: "Resource temporarily unavailable (os error 35)".into(),
+    };
+    let write = WriteError::NoParent("/x".into());
+    vec![
+        (
+            LidError::RecordRead {
+                path: "/d/lid-guard.json".into(),
+                error: "Permission denied (os error 13)".into(),
+            },
+            "記録を読めません（/d/lid-guard.json）: Permission denied (os error 13)".into(),
+        ),
+        (
+            LidError::RecordUnparsable {
+                path: "/d/lid-guard.json".into(),
+                reason: JsonReason::Located {
+                    kind: JsonProblem::Syntax,
+                    line: 1,
+                    column: 2,
+                },
+                quarantined: Some("/d/lid-guard.json.unreadable.bak".into()),
+            },
+            "蓋閉じ継続の記録を解釈できません（/d/lid-guard.json）: JSON の構文が壊れている（1 行 2 列）。\
+             内容は /d/lid-guard.json.unreadable.bak へ退避しました"
+                .into(),
+        ),
+        (
+            LidError::DataDirUnresolved,
+            "データディレクトリが解決できません".into(),
+        ),
+        (LidError::NothingToRestore, "戻す記録がありません".into()),
+        (
+            LidError::BadSchemeGuid("zz".into()),
+            "記録の GUID を解釈できません: zz".into(),
+        ),
+        // ロック・書き出しの文は `config_io` の表（そちらの節が #2365 より前の文と突き合わせる）
+        (LidError::Lock(lock.clone()), lock.text_in(Lang::Ja)),
+        (LidError::Write(write.clone()), write.text_in(Lang::Ja)),
+        // 日本語は serde の文言のまま（#2365 より前の `e.to_string()`）
+        (
+            LidError::Serialize("key must be a string".into()),
+            "key must be a string".into(),
+        ),
+        (
+            LidError::ActiveScheme(2),
+            "PowerGetActiveScheme に失敗（rc=2）".into(),
+        ),
+        (
+            LidError::ReadSetting {
+                rail: Rail::Ac,
+                rc: 2,
+            },
+            "蓋の設定を読めません（Ac, rc=2）".into(),
+        ),
+        (
+            LidError::WriteSetting {
+                rail: Rail::Dc,
+                rc: 5,
+            },
+            "蓋の設定を書けません（Dc, rc=5）".into(),
+        ),
+        (
+            LidError::ApplyScheme(5),
+            "電源プランを適用できません（rc=5）".into(),
+        ),
+        (
+            LidError::Unsupported,
+            "この OS では蓋の設定を扱えません".into(),
+        ),
+    ]
+}
+
+/// 表の 1 行の検査（日本語は旧文とバイト一致・英語に日本語が無い・日英が違う）。落ちたら日英の対を
+/// 書いた行（`file:line`）を添える
+fn check_os_row(
+    failures: &mut Vec<String>,
+    what: &str,
+    at: &dyn Fn(Lang) -> String,
+    old: &str,
+    ja: &str,
+    en: &str,
+) {
+    if ja != old {
+        failures.push(format!(
+            "{}: {what}: 日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}",
+            at(Lang::Ja)
+        ));
+    }
+    if let Some(c) = has_japanese(en) {
+        failures.push(format!(
+            "{}: {what}: 英語に日本語（{c}）が混ざる: {en}",
+            at(Lang::En)
+        ));
+    }
+    if ja == en {
+        failures.push(format!(
+            "{}: {what}: 日英が同じ文（英語の書き忘れ）: {en}",
+            at(Lang::En)
+        ));
+    }
+    // 「見つからない」系は英語にも ` not found` を含める（リモートの HTTP 層が 404 へ寄せる判定）
+    if E::says_not_found(ja) && !E::says_not_found(en) {
+        failures.push(format!(
+            "{}: {what}: 日本語は「見つからない」なのに英語に ` not found` が無い: {en}",
+            at(Lang::En)
+        ));
+    }
+}
+
+#[test]
+fn osのシェル連携と蓋閉じ継続の断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致(
+) {
+    let mut failures = Vec::new();
+
+    let table = os_integration_table();
+    let samples: Vec<OsIntegrationError> = table.iter().map(|(e, _)| e.clone()).collect();
+    covers_every(
+        &samples,
+        os_integration_index,
+        OS_INTEGRATION_VARIANTS,
+        "OsIntegrationError",
+    );
+    for (e, old) in &table {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                OS_INTEGRATION_SRC,
+                OS_INTEGRATION_PATH,
+                "impl OsIntegrationError {",
+                &debug,
+                lang,
+            )
+        };
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        check_os_row(&mut failures, &debug, &at, old, &ja, &en);
+        if e.clone().into_ja() != ja {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+
+    // 枠の全種（`Spawn` で包んで見る）・未対応の全種・URL の検査の全種
+    let launches = launch_table();
+    covers_every(
+        &launches.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>(),
+        launch_index,
+        8,
+        "Launch",
+    );
+    for (what, old) in &launches {
+        let e = OsIntegrationError::Spawn {
+            what: what.clone(),
+            error: "e".into(),
+        };
+        let debug = format!("{what:?}");
+        let at = |lang| {
+            where_written(
+                OS_INTEGRATION_SRC,
+                OS_INTEGRATION_PATH,
+                "impl Launch {",
+                &debug,
+                lang,
+            )
+        };
+        check_os_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &e.text_in(Lang::Ja),
+            &e.text_in(Lang::En),
+        );
+    }
+    let features = os_feature_table();
+    covers_every(
+        &features.iter().map(|(f, _)| *f).collect::<Vec<_>>(),
+        os_feature_index,
+        7,
+        "OsFeature",
+    );
+    for (feature, old) in &features {
+        let e = OsIntegrationError::Unsupported(*feature);
+        let debug = format!("{feature:?}");
+        let at = |lang| {
+            where_written(
+                OS_INTEGRATION_SRC,
+                OS_INTEGRATION_PATH,
+                "impl OsFeature {",
+                &debug,
+                lang,
+            )
+        };
+        check_os_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &e.text_in(Lang::Ja),
+            &e.text_in(Lang::En),
+        );
+    }
+    let blocked = url_blocked_table();
+    covers_every(
+        &blocked.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+        url_blocked_index,
+        5,
+        "UrlBlocked",
+    );
+    for (reason, old) in &blocked {
+        let e = OsIntegrationError::UrlBlocked(*reason);
+        let debug = format!("{reason:?}");
+        let at = |lang| {
+            where_written(
+                URL_GUARD_SRC,
+                URL_GUARD_PATH,
+                "impl UrlBlocked {",
+                &debug,
+                lang,
+            )
+        };
+        check_os_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &e.text_in(Lang::Ja),
+            &e.text_in(Lang::En),
+        );
+        // 診断ログへ流す従来の口（`as_str` / Display）は日本語のまま
+        if format!("この URL は開けない（{reason}）") != *old {
+            failures.push(format!(
+                "{debug}: UrlBlocked の Display が #2365 より前と違う"
+            ));
+        }
+    }
+
+    // Windows の戻り値の説明（cfg の外の表 = macOS でも検査できる）
+    for (code, old) in SHELL_EXECUTE_OLD {
+        let at = |_| format!("{OS_INTEGRATION_PATH}（shell_execute_reason の {code} の腕）");
+        check_os_row(
+            &mut failures,
+            &format!("ShellExecuteW {code}"),
+            &at,
+            old,
+            &shell_execute_reason(code, Lang::Ja),
+            &shell_execute_reason(code, Lang::En),
+        );
+    }
+    for (code, old) in SHFILEOP_OLD {
+        let at = |_| format!("{OS_INTEGRATION_PATH}（shfileop_reason の 0x{code:X} の腕）");
+        check_os_row(
+            &mut failures,
+            &format!("SHFileOperationW 0x{code:X}"),
+            &at,
+            old,
+            &shfileop_reason(code, Lang::Ja),
+            &shfileop_reason(code, Lang::En),
+        );
+    }
+
+    let lid = lid_error_table();
+    let samples: Vec<LidError> = lid.iter().map(|(e, _)| e.clone()).collect();
+    covers_every(&samples, lid_error_index, LID_ERROR_VARIANTS, "LidError");
+    for (e, old) in &lid {
+        let debug = format!("{e:?}");
+        let at = |lang| where_written(LID_SRC, LID_PATH, "impl LidError {", &debug, lang);
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        check_os_row(&mut failures, &debug, &at, old, &ja, &en);
+        if e.clone().into_ja() != ja {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+
+    // JSON の理由（tako-core。lid の記録の解釈が包みと同じ言語で引く）
+    let problems = [
+        (JsonProblem::Syntax, "JSON の構文が壊れている（3 行 5 列）"),
+        (JsonProblem::Eof, "JSON が途中で切れている（3 行 5 列）"),
+        (JsonProblem::Data, "JSON の形が期待と違う（3 行 5 列）"),
+        (JsonProblem::Io, "読み取りに失敗（3 行 5 列）"),
+    ];
+    covers_every(
+        &problems.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        json_problem_index,
+        4,
+        "JsonProblem",
+    );
+    for (kind, old) in problems {
+        let r = JsonReason::Located {
+            kind,
+            line: 3,
+            column: 5,
+        };
+        let debug = format!("{kind:?}");
+        let at = |lang| {
+            where_written(
+                LOAD_ISSUE_SRC,
+                LOAD_ISSUE_PATH,
+                "impl JsonProblem {",
+                &debug,
+                lang,
+            )
+        };
+        check_os_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &r.text_in(Lang::Ja),
+            &r.text_in(Lang::En),
+        );
+    }
+    report_all(failures);
+}
+
+/// 包み（`OsRefusal` の解除・Battery・ファイル操作 / `LidError` のロック・書き出し）の文は中身の型の表と
+/// 同じ言語で組む・「見つからない」系は英語にも ` not found` を含む・JSON の理由は serde の誤りから
+/// 採ると #2365 より前の `json_reason` と同じ・素の文言の A/B（`TAKO_2230_LEGACY`）の形は日英で同じ
+#[test]
+fn osのシェル連携と蓋閉じ継続の断りの包みと見つからないの読み() {
+    let inner = OsIntegrationError::Spawn {
+        what: Launch::Url,
+        error: "e".into(),
+    };
+    let lid = LidError::WriteSetting {
+        rail: Rail::Ac,
+        rc: 5,
+    };
+    let lock = LockError::CreateDir("e".into());
+    let write = WriteError::NoParent("/x".into());
+    for lang in [Lang::Ja, Lang::En] {
+        assert_eq!(
+            OsRefusal::Integration(inner.clone()).text_in(lang),
+            inner.text_in(lang)
+        );
+        assert!(OsRefusal::BatterySettingsUnopenable(inner.clone())
+            .text_in(lang)
+            .ends_with(&inner.text_in(lang)));
+        assert!(OsRefusal::LidTeardownFailed(lid.clone())
+            .text_in(lang)
+            .ends_with(&lid.text_in(lang)));
+        assert_eq!(
+            LidError::Lock(lock.clone()).text_in(lang),
+            lock.text_in(lang)
+        );
+        assert_eq!(
+            LidError::Write(write.clone()).text_in(lang),
+            write.text_in(lang)
+        );
+    }
+    // 英語表示の枠と中身が 1 つの断りで混ざらない（dispatch の載せ方そのまま）
+    let en = E::Operation(OsRefusal::LidTeardownFailed(lid).text_in(Lang::En)).text_in(Lang::En);
+    assert_eq!(
+        en,
+        "failed to stop staying awake with the lid closed: cannot write the lid setting (Ac, rc=5)"
+    );
+
+    // 「見つからない」系（パスが無い・ファイル / パス / DLL が見つからない）は英語にも ` not found`
+    for e in [
+        OsIntegrationError::PathMissing("/x".into()),
+        OsIntegrationError::ShellExecute {
+            what: Launch::DefaultApp,
+            code: 2,
+        },
+        OsIntegrationError::ShellExecute {
+            what: Launch::DefaultApp,
+            code: 3,
+        },
+        OsIntegrationError::ShellExecute {
+            what: Launch::DefaultApp,
+            code: 32,
+        },
+        OsIntegrationError::TrashShellOp(0x402),
+    ] {
+        let en = e.text_in(Lang::En);
+        assert!(E::says_not_found(&en), "{e:?}: {en}");
+    }
+
+    // JSON の理由: serde の誤りから採る形は #2365 より前の `json_reason` と同じ（日本語）
+    for body in ["", "{", "not json", "{\"a\":}"] {
+        let err = serde_json::from_str::<serde_json::Value>(body).expect_err("壊れている");
+        let r = JsonReason::located(&err);
+        assert_eq!(
+            r.text_in(Lang::Ja),
+            tako_core::load_issue::json_reason(&err),
+            "{body:?}"
+        );
+        assert!(has_japanese(&r.text_in(Lang::En)).is_none(), "{body:?}");
+    }
+    let raw = JsonReason::Raw("expected value at line 1 column 1".into());
+    assert_eq!(raw.text_in(Lang::Ja), raw.text_in(Lang::En));
+}
+
+/// lid.rs の走査の範囲（ファイルの本体から、残留復元を飛ばす理由 = 診断ログだけへ流す
+/// `should_clear_residual` を除く）
+fn lid_scope_lines() -> Option<Vec<(usize, &'static str)>> {
+    let whole = front_scope_lines(LID_SRC, None)?;
+    let skip = front_scope_lines(LID_SRC, Some("pub fn should_clear_residual("))?;
+    let (from, to) = (skip.first()?.0, skip.last()?.0);
+    Some(
+        whole
+            .into_iter()
+            .filter(|(line, _)| *line < from || *line > to)
+            .collect(),
+    )
+}
+
+/// 断りの組み立ての中の日本語（`OsIntegrationError` / `LidError` の外に書いた文）を名指す範囲
+fn os_lid_scopes() -> Vec<(&'static str, Option<Vec<(usize, &'static str)>>)> {
+    vec![
+        (
+            OS_INTEGRATION_PATH,
+            front_scope_lines(OS_INTEGRATION_SRC, None),
+        ),
+        (
+            FINDER_REVEAL_PATH,
+            front_scope_lines(FINDER_REVEAL_SRC, None),
+        ),
+        (LID_PATH, lid_scope_lines()),
+    ]
+}
+
+#[test]
+fn osのシェル連携と蓋閉じ継続の断りの組み立てに日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, lines) in os_lid_scopes() {
+        let Some(lines) = lines else {
+            failures.push(format!(
+                "{path}: 走査の範囲が見つからない（改名で番犬が空振りする。os_lid_scopes を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in refusal_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 断りの組み立てに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （OsIntegrationError / LidError へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: lid.rs の範囲は残留復元の skip 理由（診断ログ）を外し、それ以外は外さない
+#[test]
+fn osのシェル連携と蓋閉じ継続の番犬の境界() {
+    let lines = lid_scope_lines().expect("lid.rs の範囲を引ける");
+    let has = |needle: &str| lines.iter().any(|(_, code)| code.contains(needle));
+    assert!(!has("のためスキップ"), "skip 理由（診断ログ）は範囲の外");
+    assert!(has("fn read_from("), "記録の読み取りは範囲の中");
+    assert!(has("fn restore("), "復元は範囲の中");
+    assert!(has("pub(super) fn apply("), "OS ごとの実装は範囲の中");
+    // 範囲の中に植えた日本語の断りは名指される（`map_err` の閉包の中・行をまたぐ `Err(format!(`）
+    let planted = "fn a() -> Result<(), LidError> {\n    let x = f().map_err(|e| LidError::Serialize(format!(\"書けない: {e}\")))?;\n    Err(LidError::BadSchemeGuid(format!(\n        \"解釈できない: {}\",\n        s\n    )))\n}\n";
+    let lines = front_scope_lines(planted, Some("fn a(")).expect("頭を引ける");
+    let found: Vec<usize> = refusal_japanese(&lines)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(found, vec![2, 4], "断りの日本語の 2 か所だけを名指す");
 }

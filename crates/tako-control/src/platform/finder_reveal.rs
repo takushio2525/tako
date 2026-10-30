@@ -25,6 +25,8 @@ use std::path::Path;
 /// 記録の 1 行の頭（OS に依らず読めるよう `os_integration` に置く）
 pub use super::os_integration::REVEAL_RECORD_MARK as RECORD_MARK;
 
+use super::os_integration::OsIntegrationError;
+
 /// 前面を譲る相手（ファイルビューア = Finder）
 const FINDER_BUNDLE_ID: &str = "com.apple.finder";
 
@@ -124,19 +126,19 @@ unsafe fn ns_app() -> Id {
     }
 }
 
-unsafe fn ns_string(text: &str) -> Result<Id, String> {
-    let c = CString::new(text).map_err(|_| "NUL を含む文字列".to_string())?;
+unsafe fn ns_string(text: &str) -> Result<Id, OsIntegrationError> {
+    let c = CString::new(text).map_err(|_| OsIntegrationError::NulInString)?;
     let s = send_cstr(class(c"NSString"), c"stringWithUTF8String:", c.as_ptr());
     if s.is_null() {
-        return Err("NSString を作れない".into());
+        return Err(OsIntegrationError::NsStringFailed);
     }
     Ok(s)
 }
 
 /// パスのバイト列そのままでファイルの URL を作る（空白・日本語・UTF-8 でない名前も崩さない）
-unsafe fn file_url(path: &Path) -> Result<Id, String> {
+unsafe fn file_url(path: &Path) -> Result<Id, OsIntegrationError> {
     let c = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| format!("NUL を含むパス: {}", path.display()))?;
+        .map_err(|_| OsIntegrationError::NulInPath(path.display().to_string()))?;
     let is_dir = std::fs::metadata(path).is_ok_and(|m| m.is_dir());
     let f: unsafe extern "C" fn(Id, Sel, *const c_char, u8, Id) -> Id =
         std::mem::transmute(objc_msgSend as *const c_void);
@@ -148,25 +150,27 @@ unsafe fn file_url(path: &Path) -> Result<Id, String> {
         std::ptr::null(),
     );
     if url.is_null() {
-        return Err(format!("ファイルの URL を作れない: {}", path.display()));
+        return Err(OsIntegrationError::FileUrlFailed(
+            path.display().to_string(),
+        ));
     }
     Ok(url)
 }
 
 /// Finder の窓で `path` を選んで前面へ出す（`record` があれば記録だけして開かない）
-pub(crate) fn reveal(path: &Path, record: Option<&Path>) -> Result<(), String> {
+pub(crate) fn reveal(path: &Path, record: Option<&Path>) -> Result<(), OsIntegrationError> {
     let _pool = Pool::new();
     // SAFETY: AppKit の公開 API を、各セレクタの宣言どおりの型で呼ぶ。作ったものは
     // すべて自動解放（上のプールが戻す）
     unsafe {
         if !ensure_appkit() {
-            return Err("Finder を開けない: AppKit を読み込めない".into());
+            return Err(OsIntegrationError::AppKitUnavailable);
         }
         let url = file_url(path)?;
         let urls = send1(class(c"NSArray"), c"arrayWithObject:", url);
         let workspace = send(class(c"NSWorkspace"), c"sharedWorkspace");
         if urls.is_null() || workspace.is_null() {
-            return Err("Finder を開けない: NSWorkspace を使えない".into());
+            return Err(OsIntegrationError::WorkspaceUnavailable);
         }
         let app = ns_app();
         let can_yield =
@@ -189,10 +193,10 @@ pub(crate) fn reveal(path: &Path, record: Option<&Path>) -> Result<(), String> {
 
 /// 検証の記録: `<RECORD_MARK>\t<URL が指すパス>\tyield=<0|1>` を 1 行足す。
 /// パスは作った NSURL から読み戻したバイト列（AppKit へ渡すものそのもの）
-unsafe fn write_record(record: &Path, url: Id, can_yield: bool) -> Result<(), String> {
+unsafe fn write_record(record: &Path, url: Id, can_yield: bool) -> Result<(), OsIntegrationError> {
     let repr = send(url, c"fileSystemRepresentation") as *const c_char;
     if repr.is_null() {
-        return Err("ファイルの URL からパスを読み戻せない".into());
+        return Err(OsIntegrationError::RecordPathUnreadable);
     }
     let mut line = Vec::new();
     line.extend_from_slice(RECORD_MARK.as_bytes());
@@ -204,7 +208,10 @@ unsafe fn write_record(record: &Path, url: Id, can_yield: bool) -> Result<(), St
         .append(true)
         .open(record)
         .and_then(|mut f| f.write_all(&line))
-        .map_err(|e| format!("記録を書けない（{}）: {e}", record.display()))
+        .map_err(|e| OsIntegrationError::RecordWrite {
+            path: record.display().to_string(),
+            error: e.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -274,6 +281,13 @@ mod tests {
         std::fs::write(&target, "x").expect("fixture");
         let err = reveal(&target, Some(&dir.0.join("無い dir").join("reveal.log")))
             .expect_err("書けない記録先");
-        assert!(err.starts_with("記録を書けない"), "{err}");
+        assert!(
+            matches!(err, OsIntegrationError::RecordWrite { .. }),
+            "{err:?}"
+        );
+        let ja = err.text_in(tako_core::i18n::Lang::Ja);
+        assert!(ja.starts_with("記録を書けない"), "{ja}");
+        let en = err.text_in(tako_core::i18n::Lang::En);
+        assert!(en.starts_with("cannot write the record"), "{en}");
     }
 }
