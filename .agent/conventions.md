@@ -886,6 +886,25 @@ ANSI コードページ**（英語版 = CP1252 / 日本語版 = CP932）とし�
   シェルの組み込み（`command -v printf` → `printf`）・別名の定義・rc の挨拶文が「見つかった」に化けた。
   パス（`/` を含む名前）はシェルへ渡さずにその場で `is_executable_file` で確かめる
 
+## 長生きするプロセスは素の名前で子を起こし続けない（Issue #2513）
+
+素の名前（`Command::new("tailscale")`）は起こすたびに `posix_spawnp` が PATH を手前から試し、
+**空振り 1 回ごとにカーネルが親の実行ファイルのままの子を一瞬作る**。install の差し替え
+（`bundle_install` の `.tako-replace-<pid>`）で親の実行ファイルが消えた後は、その子を
+AppleSystemPolicy が読めずに 1 本ずつ拒否する。記録されるパスは exec 先ではなく**親の**
+実行ファイル（一時置き場のパス）なので、「tako が一時置き場から起こされている」と読み違えやすい。
+
+- 実物（#2513）: install をまたいで生き残った `tako remote serve` daemon の serve 監視
+  （30 秒ごとに `tailscale` を 2 回）が、PATH の手前 11 エントリで空振りして **22 本 / 31 秒**。
+  daemon は GUI の再起動では入れ替わらないので、daemon を止めるまで 15 時間続いた
+- **周期的に・長く子を起こす口は、起こす前に絶対パスへ寄せる**。引き方は境界 B16 の
+  `exe::find_in_process_path`（このプロセスの PATH を `posix_spawnp` と同じ順で見る・子を起こさない）。
+  tailscale は検出の正本（`tailscale::pick_candidate`）が引いた絶対パスを答えに載せる
+  （A/B は `TAKO_2513_LEGACY=1`・番犬 `crates/tako-control/tests/issue2513_tailscale_spawn_path_watchdog.rs`）
+- 再現は実行中のプロセスを本物の `install_bundle_in_place` で差し替え、
+  `log show --predicate 'eventMessage CONTAINS "<作業 dir>"'` の `would not allow process` を数える
+  （絶対パスの spawn と PATH で当たった 1 回は記録されない・差し替えない対照は 0 件）
+
 ## OS に何かを「開かせる」前に形を確かめる（Issue #1376 / #1371）
 
 境界 B8（`os_integration::open_url`）が呼ぶのは **OS の既定ハンドラ**（macOS の `open` /

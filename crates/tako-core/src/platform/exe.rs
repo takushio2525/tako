@@ -281,6 +281,58 @@ pub(crate) fn login_shell_find(
     BoundedFind { path, timeout }
 }
 
+/// 素の名前を**このプロセスの PATH** で引き、`posix_spawnp` が当てるのと同じ実行ファイルの
+/// 絶対パスを返す（#2513）。子を起こさない（ディレクトリを順に見るだけ）。
+///
+/// 長生きするプロセスが素の名前のまま子を起こし続けると、PATH の手前のエントリで
+/// 空振りするたびにカーネルが**親の実行ファイルのまま**の子を一瞬作る。親の実行ファイルが
+/// install の差し替え（`bundle_install` の `.tako-replace-<pid>`）で消えた後は、その子を
+/// AppleSystemPolicy が読めずに 1 本ずつ拒否する（実測: remote daemon の 30 秒ごとの
+/// `tailscale` で 22 本 / 31 秒・GUI を再起動しても止まらない）。起こす前に絶対パスへ
+/// 寄せておけば `posix_spawn` 1 回で済み、空振りが無い。
+///
+/// [`find`] と違って**ログインシェルに聞かない**（答えは「今この PATH で起こしたら当たる場所」
+/// でなければならない）。パス（`/` を含む）・空の名前・見つからないときは `None`（呼び手は
+/// 素の名前のまま起こす = 従来と同じ答え）。PATH の空エントリと相対エントリは見ない
+/// （カレントディレクトリ次第の答えを長生きするプロセスへ持たせない）。
+///
+/// Windows は `None`（`CreateProcessW` の探索は空振りごとに子を作らないので寄せる理由が無く、
+/// `PATHEXT` を足す規則を二重に持たない）
+pub fn find_in_process_path(name: &str) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let path = std::env::var_os("PATH");
+        find_in_path_list(name, path.as_deref(), is_executable_file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+/// libc の `posix_spawnp` が PATH 未設定のときに使う既定（`_PATH_DEFPATH`）
+#[cfg(unix)]
+const SPAWNP_DEFAULT_PATH: &str = "/usr/bin:/bin";
+
+/// [`find_in_process_path`] の判定本体（env とファイルシステムを引数で受ける）
+#[cfg(unix)]
+fn find_in_path_list(
+    name: &str,
+    path: Option<&std::ffi::OsStr>,
+    is_executable: impl Fn(&std::path::Path) -> bool,
+) -> Option<String> {
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    let path = path.unwrap_or_else(|| std::ffi::OsStr::new(SPAWNP_DEFAULT_PATH));
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+        .map(|found| found.to_string_lossy().into_owned())
+}
+
 /// 場所を尋ねるログインシェル（`$SHELL`。空・未設定なら `/bin/sh`）。
 /// [`find`] と git / tmux の場所の解決（`bin_resolve`。#2151）が同じ規則で読む
 #[cfg(unix)]
@@ -627,6 +679,62 @@ fn resolve_with_pathext(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2513: このプロセスの PATH を `posix_spawnp` と同じ順で引き、最初に当たる絶対パスを返す
+    #[cfg(unix)]
+    #[test]
+    fn 素の名前はこのプロセスのpathの最初に当たる絶対パスへ引く() {
+        let present = ["/b/tool", "/c/tool"];
+        let exec = |p: &std::path::Path| present.iter().any(|x| std::path::Path::new(x) == p);
+        let path = std::ffi::OsStr::new("/a:/b:/c");
+        assert_eq!(
+            find_in_path_list("tool", Some(path), exec).as_deref(),
+            Some("/b/tool")
+        );
+        assert_eq!(find_in_path_list("none", Some(path), exec), None);
+    }
+
+    /// #2513: パス・空の名前は引かない。PATH の空エントリと相対エントリは見ない。
+    /// PATH 未設定は libc の既定（`/usr/bin:/bin`）で引く
+    #[cfg(unix)]
+    #[test]
+    fn パスと相対エントリは引かずpath未設定は既定で引く() {
+        let any = |_: &std::path::Path| true;
+        assert_eq!(find_in_path_list("/x/tool", Some("/a".as_ref()), any), None);
+        assert_eq!(find_in_path_list("x/tool", Some("/a".as_ref()), any), None);
+        assert_eq!(find_in_path_list("", Some("/a".as_ref()), any), None);
+        assert_eq!(
+            find_in_path_list("tool", Some(":rel:/a".as_ref()), any).as_deref(),
+            Some("/a/tool")
+        );
+        assert_eq!(
+            find_in_path_list("tool", None, any).as_deref(),
+            Some("/usr/bin/tool")
+        );
+    }
+
+    /// #2513: 実ファイルで、実行ビットの無いファイルとディレクトリを飛ばして当たる
+    #[cfg(unix)]
+    #[test]
+    fn 実行できないファイルとディレクトリは飛ばす() {
+        let dir = crate::test_residue::ScratchDir::new("exe-process-path");
+        let (a, b, c) = (
+            dir.path().join("a"),
+            dir.path().join("b"),
+            dir.path().join("c"),
+        );
+        for d in [&a, &b, &c] {
+            std::fs::create_dir_all(d).expect("一時 dir");
+        }
+        std::fs::write(a.join("tool"), "#!/bin/sh\n").expect("実行ビット無し");
+        std::fs::create_dir_all(b.join("tool")).expect("同名のディレクトリ");
+        crate::fake_exec::write_script(&c.join("tool"), "#!/bin/sh\n");
+        let path = std::env::join_paths([&a, &b, &c]).expect("PATH");
+        assert_eq!(
+            find_in_path_list("tool", Some(&path), is_executable_file).as_deref(),
+            Some(c.join("tool").to_string_lossy().as_ref())
+        );
+    }
 
     /// 偽のログインシェル（`-l -c <script>` を無視して本文を実行する）を置く。
     /// 作った時点で空打ちして、初回 exec の検査を探索の上限の外で済ませる（#2222）
