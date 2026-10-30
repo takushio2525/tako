@@ -10131,7 +10131,7 @@ fn osのシェル連携と蓋閉じ継続の断りの包みと見つからない
 
 /// lid.rs の走査の範囲（ファイルの本体から、残留復元を飛ばす理由 = 診断ログだけへ流す
 /// `should_clear_residual` を除く）
-fn lid_scope_lines() -> Option<Vec<(usize, &'static str)>> {
+fn lid_scope_lines() -> ScopeLines {
     let whole = front_scope_lines(LID_SRC, None)?;
     let skip = front_scope_lines(LID_SRC, Some("pub fn should_clear_residual("))?;
     let (from, to) = (skip.first()?.0, skip.last()?.0);
@@ -10143,8 +10143,11 @@ fn lid_scope_lines() -> Option<Vec<(usize, &'static str)>> {
     )
 }
 
+/// 走査の範囲の行（行番号, 中身）。範囲が見つからなければ `None`
+type ScopeLines = Option<Vec<(usize, &'static str)>>;
+
 /// 断りの組み立ての中の日本語（`OsIntegrationError` / `LidError` の外に書いた文）を名指す範囲
-fn os_lid_scopes() -> Vec<(&'static str, Option<Vec<(usize, &'static str)>>)> {
+fn os_lid_scopes() -> Vec<(&'static str, ScopeLines)> {
     vec![
         (
             OS_INTEGRATION_PATH,
