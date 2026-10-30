@@ -268,7 +268,8 @@ const TAKO_CLI_KEYS: &[&str] = &["TAKO_SOCKET", "TAKO_PANE_ID"];
 /// `TAKO_SOCKET` を落としても CLI は止まらない: 環境変数が無ければ発見ファイル
 /// （`<TAKO_DISCOVERY_DIR か data dir>/control.json` と `instances/`）を読み、既定の置き場
 /// （`$HOME/Library/Application Support/tako`）に居る本番 GUI へ繋ぐ（FR-2.2.9）。
-/// `TAKO_ISOLATED=1` は CLI の data dir を変えないので隔離にならない。#2527 では
+/// `TAKO_ISOLATED=1` は CLI の data dir を変えない（#2531 から印のある CLI は既定の置き場の発見ファイルを
+/// 読まずに断るが、印を付けない行・順番待ち・data dir の設定ファイルは既定の置き場のまま）。#2527 では
 /// `test-serve-watch.sh` の `tako remote start` が QR の画像を本番のアクティブなタブへ開いた
 const DISCOVERY_KEYS: &[&str] = &["TAKO_DATA_DIR", "TAKO_DISCOVERY_DIR", "HOME"];
 

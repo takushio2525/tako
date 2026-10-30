@@ -120,10 +120,35 @@ pub fn send_request_via(request: Request, origin: Option<&str>) -> Result<Value,
     send_request_classified(request, origin).map_err(SendFailure::message)
 }
 
-/// [`send_request_via`] の本体。届かなかったのか、届いて操作が失敗したのかを分けて返す
+/// [`send_request_via`] の本体。届かなかったのか、届いて操作が失敗したのかを分けて返す。
+///
+/// `TAKO_ISOLATED=1` で発見の置き場を明示していなければ、既定（本番）の置き場へは縮退せず
+/// 何を指定すれば繋がるかを返して止まる（#2531。`discovery::read_candidates` の門）
 pub fn send_request_classified(
     request: Request,
     origin: Option<&str>,
+) -> Result<Value, SendFailure> {
+    send_request_with(request, origin, tako_control::discovery::read_candidates)
+}
+
+/// 順番待ち（#1994）の要求だけが使う口。調停役はマシン全体で 1 つ（本番の GUI の中）なので、
+/// 隔離の印（#2531）があっても既定の置き場から探す = 隔離した検証のビルドも本番の順番待ちへ並ぶ。
+/// 呼び手は CLI の `queue_send` だけ（番犬 `issue2531_isolated_discovery` が固定する）
+pub fn send_request_machine_wide(request: Request) -> Result<Value, SendFailure> {
+    send_request_with(request, None, || {
+        Ok(tako_control::discovery::read_candidates_machine_wide())
+    })
+}
+
+/// ①環境変数 → ②`candidates` の候補列の順に試す 1 実装（[`send_request_classified`] /
+/// [`send_request_machine_wide`] の違いは候補列の引き方だけ）
+fn send_request_with(
+    request: Request,
+    origin: Option<&str>,
+    candidates: impl FnOnce() -> Result<
+        Vec<tako_control::discovery::ControlInfo>,
+        tako_control::discovery::IsolatedWithoutDir,
+    >,
 ) -> Result<Value, SendFailure> {
     let env_pair = match (std::env::var("TAKO_SOCKET"), std::env::var("TAKO_TOKEN")) {
         (Ok(socket), Ok(token)) if !socket.is_empty() && !token.is_empty() => Some((socket, token)),
@@ -144,7 +169,18 @@ pub fn send_request_classified(
     // 除外キーは (socket, token) ペア（socket だけで除外すると「正しいソケット +
     // 古いトークン」の認証失敗から正トークンで再試行できなくなる）
     let mut tried: Vec<(String, String)> = env_pair.iter().cloned().collect();
-    for info in tako_control::discovery::read_candidates() {
+    let candidates = match candidates() {
+        Ok(candidates) => candidates,
+        // 隔離の印で既定の置き場を読まなかった（#2531）。先に試した env の失敗があれば並べて返す
+        Err(refused) => {
+            let lang = tako_control::settings::client_lang();
+            return Err(SendFailure::Unreachable(match last_failure {
+                Some(stale) => refused.after(&stale.message(), lang),
+                None => refused.text_in(lang).to_string(),
+            }));
+        }
+    };
+    for info in candidates {
         let key = (info.socket.clone(), info.token.clone());
         if tried.contains(&key) {
             continue;
