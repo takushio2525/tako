@@ -27,11 +27,8 @@ serde_json.workspace = true
 # プレビューペイン: コードハイライト（FR-3.2）と Markdown パース（FR-3.3）
 syntect.workspace = true
 two-face.workspace = true
-# TS の塗りの前置き（#1917。syntax_prefilter.rs）。どれも syntect の依存と同じ版
-fancy-regex.workspace = true
+# 構文セットの直列化の鏡（#1917 / #1954 / #1935。syntax_mirror.rs）。syntect の依存と同じ版
 bincode.workspace = true
-flate2.workspace = true
-regex-syntax.workspace = true
 pulldown-cmark.workspace = true
 notify.workspace = true
 image.workspace = true
@@ -56,6 +53,22 @@ lopdf.workspace = true
 # 配布バイナリへは入らない（起動時は直列化した構文定義を読むだけ）
 [build-dependencies]
 syntect = { workspace = true, features = ["yaml-load"] }
+# 塗りの正規表現の前置き（#1917 / #1935）をビルド時に書き換える（build.rs の
+# `generate_prefiltered_syntaxes` = src/syntax_rewrite.rs）。two-face 以外は上の syntect が
+# ビルド依存として既に引いている版そのもの（ホスト向けに増えるコンパイルは two-face だけ）
+two-face.workspace = true
+fancy-regex.workspace = true
+regex-syntax.workspace = true
+bincode.workspace = true
+flate2.workspace = true
+serde.workspace = true
+
+# 書き換えの等価性の単体テスト（syntax_rewrite.rs / syntax_prefilter.rs）。
+# アプリ本体は書き換えないので、実行時の依存には入れない
+[dev-dependencies]
+fancy-regex.workspace = true
+regex-syntax.workspace = true
+flate2.workspace = true
 
 # アイコン / バージョン情報リソースの埋め込み（#587。build.rs 参照）。
 # cfg(windows) を付けて macOS のビルドグラフに載せない

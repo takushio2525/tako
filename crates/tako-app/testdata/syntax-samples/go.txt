@@ -1,0 +1,54 @@
+// Package sample は Go の見本
+package sample
+
+import (
+	"context"
+	"errors"
+	"fmt"
+)
+
+type Shape interface {
+	Area() float64
+}
+
+type Point[T ~int | ~float64] struct {
+	X, Y T `json:"x,omitempty"`
+}
+
+const (
+	A = iota
+	B
+	Pi = 3.14_15e0
+)
+
+var ErrEmpty = errors.New("empty")
+
+func (p *Point[T]) Add(o Point[T]) Point[T] { return Point[T]{p.X + o.X, p.Y + o.Y} }
+
+func Fetch(ctx context.Context, urls ...string) (n int, err error) {
+	ch := make(chan string, len(urls))
+	defer close(ch)
+	for i, u := range urls {
+		go func(i int, u string) { ch <- fmt.Sprintf("%d:%q", i, u) }(i, u)
+	}
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case s, ok := <-ch:
+		if !ok {
+			return 0, ErrEmpty
+		}
+		n = len(s)
+	}
+	raw := `raw
+string`
+	r := 'x'
+	switch v := any(n).(type) {
+	case int:
+		_ = v
+	default:
+		panic("unreachable")
+	}
+	_ = raw + string(r) + "é"
+	return
+}

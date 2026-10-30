@@ -1,0 +1,48 @@
+-- Lua の見本
+--[[ 複数行の
+コメント ]]
+local json = require("json")
+local M = {}
+M.__index = M
+
+local DEFAULTS <const> = { size = 10, name = "box", [1] = true }
+
+function M.new(opts)
+  local self = setmetatable({}, M)
+  opts = opts or {}
+  self.size = opts.size or DEFAULTS.size
+  self.items = {}
+  return self
+end
+
+function M:push(...)
+  for i = 1, select("#", ...) do
+    local v = select(i, ...)
+    if type(v) == "table" and #v > 0 then
+      table.insert(self.items, v)
+    elseif v ~= nil then
+      self.items[#self.items + 1] = { v }
+    end
+  end
+  return self
+end
+
+local function fib(n)
+  if n < 2 then return n end
+  return fib(n - 1) + fib(n - 2)
+end
+
+for k, v in pairs(DEFAULTS) do
+  print(string.format("%s = %q", tostring(k), tostring(v)))
+end
+
+local s = [[long
+string]] .. [==[with ]] inside]==]
+local n = 0x1F + 1.5e-3 + 10 // 3 + 2 ^ 8
+while n > 0 do n = n - 1 end
+repeat n = n + 1 until n >= 3
+goto done
+::done::
+print(fib(10), s, n, json.encode(M.new():push(1, "two", { 3 }).items))
+return M
+local broken = "閉じない文字列

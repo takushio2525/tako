@@ -2157,6 +2157,8 @@ static SYNTAX_GENERATION: AtomicU64 = AtomicU64::new(0);
 pub struct HighlightCache {
     /// 構文セットの世代（載せ直しを跨いだ状態は使えない）
     generation: u64,
+    /// 塗った構文セットの種類（#1935。行数の境目を跨いで入れ替わったら全文を塗り直す）
+    variant: crate::syntax_prefilter::Variant,
     /// 解決した構文の名前。1 行目の shebang で変わりうるので毎回照合する
     syntax: String,
     /// 直前にハイライトしたテキスト（変わった範囲の突き合わせに使う）
@@ -2395,7 +2397,13 @@ fn common_suffix_len(a: &[u8], b: &[u8], limit: usize) -> usize {
 
 /// syntect 実装（bat / delta と同系の定番。純 Rust 構成 = regex-fancy）
 pub struct SyntectHighlighter {
+    /// 小さい入力の塗りと構文の解決に使う構文セット = 元の正規表現（#1935）
     syntaxes: syntect::parsing::SyntaxSet,
+    /// 大きい入力（[`crate::syntax_prefilter::plain_max_lines`] 行超）の塗りに使う、正規表現へ
+    /// 前置きを足した構文セット（#1917 / #1935）。大きい入力を初めて塗るときに載せる
+    prefiltered: OnceLock<syntect::parsing::SyntaxSet>,
+    /// TS / TSX だけ前置き付きの構文セット（TS を埋め込む Svelte / Vue の大きい入力。#1935）
+    ts_only: OnceLock<syntect::parsing::SyntaxSet>,
     theme: syntect::highlighting::Theme,
     /// この構文セットの世代（#1648。[`HighlightCache`] の有効性判定に使う）
     generation: u64,
@@ -2405,8 +2413,8 @@ impl SyntectHighlighter {
     fn new() -> Self {
         // bat 由来の拡張構文セット（TOML・TypeScript・Dockerfile 等 213 構文。#320）+ two-face に
         // 無い構文（PowerShell。#1954 = `syntax_extra`）の 214 構文。
-        // TS / TSX の正規表現だけ「当たらない行で VM を起こさない」等価形へ書き換えたもの（#1917）
-        let syntaxes = crate::syntax_prefilter::syntax_set();
+        // 小さい入力は元の正規表現で塗る（前置きのコンパイルの固定費を取り返せない。#1935）
+        let syntaxes = crate::syntax_prefilter::plain_set();
         let mut themes = syntect::highlighting::ThemeSet::load_defaults().themes;
         let theme = themes
             .remove("base16-eighties.dark")
@@ -2414,9 +2422,48 @@ impl SyntectHighlighter {
             .unwrap_or_default();
         Self {
             syntaxes,
+            prefiltered: OnceLock::new(),
+            ts_only: OnceLock::new(),
             theme,
             generation: SYNTAX_GENERATION.fetch_add(1, Ordering::Relaxed) + 1,
         }
+    }
+
+    /// `syntax` の `lines` 行の入力を塗る構文セットとその種類（#1917 / #1935）。
+    /// 大きい入力は TS などの正規表現を「当たらない行で VM を起こさない」等価形へ書き換えた
+    /// 構文セットで塗る（1 MB の TS 5.9 → 1.8 秒・JavaScript 3.8 → 1.9 秒）。小さい入力は
+    /// 前置きのコンパイルの固定費を取り返せないので元の正規表現で塗る（UI スレッドで塗る
+    /// チャットのコードブロック・エディタの全文の塗り直しの冷えた 1 回目を重くしない）。
+    /// 境目は構文ごとの損益分岐（TS 50 行〜HTML 10,000 行）
+    fn set_for(
+        &self,
+        syntax: &str,
+        lines: usize,
+    ) -> (
+        &syntect::parsing::SyntaxSet,
+        crate::syntax_prefilter::Variant,
+    ) {
+        use crate::syntax_prefilter::Variant;
+        let variant = crate::syntax_prefilter::variant_for(syntax, lines);
+        let set = match variant {
+            Variant::Plain => &self.syntaxes,
+            Variant::All => self
+                .prefiltered
+                .get_or_init(crate::syntax_prefilter::syntax_set),
+            Variant::TsOnly => self
+                .ts_only
+                .get_or_init(crate::syntax_prefilter::ts_only_set),
+        };
+        (set, variant)
+    }
+
+    /// 構文の解決は小さい入力用の構文セットで行うので、塗る構文セットの同じ構文へ引き直す
+    /// （2 つの構文セットは構文・文脈の並びが同じで、正規表現の文字列だけが違う。#1935）
+    fn same_syntax_in<'a>(
+        set: &'a syntect::parsing::SyntaxSet,
+        syntax: &'a syntect::parsing::SyntaxReference,
+    ) -> &'a syntect::parsing::SyntaxReference {
+        set.find_syntax_by_name(&syntax.name).unwrap_or(syntax)
     }
 
     /// 読み取り / 編集で共用する構文解決。本文の手掛かり（`.m` = MATLAB / Objective-C。#1953）→
@@ -2483,8 +2530,14 @@ impl SyntectHighlighter {
     /// `load_defaults_newlines` の構文は改行込みの入力を前提にする。`str::lines()` で
     /// 改行を落とすと shell の shebang 後などで状態遷移が閉じず、標準言語でも行全体が
     /// 同じ色になる。パーサには改行を渡し、UI の 1 行要素からは末尾改行だけ除く。
-    fn step(&self, theme: &ThemeHighlighter, state: &mut LineState, line: &str) -> Line {
-        let regions = match state.parse.parse_line(line, &self.syntaxes) {
+    fn step(
+        &self,
+        set: &syntect::parsing::SyntaxSet,
+        theme: &ThemeHighlighter,
+        state: &mut LineState,
+        line: &str,
+    ) -> Line {
+        let regions = match state.parse.parse_line(line, set) {
             Ok(ops) => syntect::highlighting::HighlightIterator::new(
                 &mut state.highlight,
                 &ops[..],
@@ -2529,16 +2582,19 @@ impl SyntectHighlighter {
 
     fn run(&self, syntax: &syntect::parsing::SyntaxReference, text: &str) -> Vec<Line> {
         use syntect::util::LinesWithEndings;
+        let (set, _) = self.set_for(&syntax.name, text.lines().count());
+        let syntax = Self::same_syntax_in(set, syntax);
         let theme = ThemeHighlighter::new(&self.theme);
         let mut state = self.initial_state(syntax, &theme);
         LinesWithEndings::from(text)
-            .map(|line| self.step(&theme, &mut state, line))
+            .map(|line| self.step(set, &theme, &mut state, line))
             .collect()
     }
 
     /// 編集中の再ハイライト（#1648）。`lines` をその場で差し替え、実際に走らせた行数を
     /// `cache.relit` へ記録する。キャッシュが使えない条件（初回・構文が変わった・
-    /// 構文セットを載せ直した・行数が食い違う）なら全文へ落ちる
+    /// 構文セットを載せ直した・塗る構文セットが前置きの有無で入れ替わった・行数が食い違う）
+    /// なら全文へ落ちる
     fn refresh(
         &self,
         path: &Path,
@@ -2548,15 +2604,19 @@ impl SyntectHighlighter {
         allow_full: bool,
     ) -> bool {
         let syntax = self.syntax_for_path(path, text);
+        let (set, variant) = self.set_for(&syntax.name, text.lines().count());
+        let syntax = Self::same_syntax_in(set, syntax);
         let reusable = !full_highlight_forced()
             && cache.generation == self.generation
+            && cache.variant == variant
             && cache.syntax == syntax.name
             && !cache.checkpoints.is_empty()
             && cache.starts.len() == lines.len();
         if reusable {
-            self.refresh_incremental(text, cache, lines);
+            self.refresh_incremental(set, text, cache, lines);
         } else if allow_full {
-            self.refresh_full(syntax, text, cache, lines);
+            self.refresh_full(set, syntax, text, cache, lines);
+            cache.variant = variant;
         } else {
             return false;
         }
@@ -2567,6 +2627,7 @@ impl SyntectHighlighter {
     /// 全文を走らせてキャッシュを作り直す
     fn refresh_full(
         &self,
+        set: &syntect::parsing::SyntaxSet,
         syntax: &syntect::parsing::SyntaxReference,
         text: &str,
         cache: &mut HighlightCache,
@@ -2581,7 +2642,7 @@ impl SyntectHighlighter {
             if index > 0 && index % HIGHLIGHT_STRIDE == 0 {
                 checkpoints.push((index, Arc::new(SavedState::of(&state))));
             }
-            lines.push(self.step(&theme, &mut state, line));
+            lines.push(self.step(set, &theme, &mut state, line));
         }
         cache.generation = self.generation;
         cache.syntax.clear();
@@ -2605,7 +2666,13 @@ impl SyntectHighlighter {
     /// 行で打ち切る**（#1660。10 万行の末尾まで走ると UI スレッドが約 2 秒止まる）。
     /// 打ち切った後ろは文字だけ正しい行（前回の色 / 平文）にして、全文の塗りを
     /// background へ出す印（`SeedState::Wanted`）を立てる
-    fn refresh_incremental(&self, text: &str, cache: &mut HighlightCache, lines: &mut Vec<Line>) {
+    fn refresh_incremental(
+        &self,
+        set: &syntect::parsing::SyntaxSet,
+        text: &str,
+        cache: &mut HighlightCache,
+        lines: &mut Vec<Line>,
+    ) {
         let new = text.as_bytes();
         let old_len = lines.len();
         let (head, tail, new_starts) = changed_lines(cache, text);
@@ -2679,7 +2746,7 @@ impl SyntectHighlighter {
             }
             let end = new_starts.get(cursor + 1).copied().unwrap_or(new.len());
             let line = &text[new_starts[cursor]..end];
-            fresh.push(self.step(&theme, &mut state, line));
+            fresh.push(self.step(set, &theme, &mut state, line));
             cursor += 1;
         }
 
@@ -5793,6 +5860,56 @@ pub(crate) mod extra_samples_1954;
 #[cfg(test)]
 mod syntax_resolution_tests {
     use super::*;
+
+    /// #1935: 塗る構文セットは入力の行数で選ぶ（境目以下は元の正規表現・超えたら前置き付き）。
+    /// どちらで塗っても色は同じで、エディタは境目を跨いだら行状態を使わず全文から塗り直す
+    #[test]
+    fn 塗る構文セットは行数で選び境目の両側で色が同じ() {
+        use crate::syntax_prefilter::Variant;
+        let limit = crate::syntax_prefilter::plain_max_lines("TypeScript");
+        let hl = SyntectHighlighter::new();
+        let variant = |syntax: &str, lines: usize| hl.set_for(syntax, lines).1;
+        assert_eq!(
+            variant("TypeScript", limit),
+            Variant::Plain,
+            "境目ちょうどは元"
+        );
+        assert_eq!(
+            variant("TypeScript", limit + 1),
+            Variant::All,
+            "境目を超えたら前置き付き"
+        );
+        assert_eq!(
+            variant("CSS", limit + 1),
+            Variant::Plain,
+            "境目は構文ごと（CSS は 1,600 行）"
+        );
+        // TS を埋め込む Vue は TS だけ前置き付き（#1917 と同じ。中の CSS / JS のコンパイル費を足さない）
+        assert_eq!(variant("Vue Component", limit + 1), Variant::TsOnly);
+        assert_eq!(variant("Vue Component", limit), Variant::Plain);
+        // 塗りの所要を debug でも小さく保つため、短い行を並べる
+        let unit = "a = f(b, `c`); // d\n";
+        let big = unit.repeat(limit + 1);
+        let path = Path::new("sample.ts");
+        let by_run = hl.highlight(path, &big);
+        // 同じ本文を元の正規表現の構文セットで 1 行ずつ塗ったもの
+        let theme = ThemeHighlighter::new(&hl.theme);
+        let syntax = hl.syntaxes.find_syntax_by_name("TypeScript").unwrap();
+        let mut state = hl.initial_state(syntax, &theme);
+        let by_plain: Vec<Line> = syntect::util::LinesWithEndings::from(big.as_str())
+            .map(|line| hl.step(&hl.syntaxes, &theme, &mut state, line))
+            .collect();
+        assert!(by_run == by_plain, "前置き付きで塗った色が元と違う");
+        // エディタ: 境目以下で塗った行状態は、境目を跨いだら使わず全文から塗り直す
+        let mut cache = HighlightCache::default();
+        let mut lines = Vec::new();
+        assert!(hl.refresh(path, &unit.repeat(limit), &mut cache, &mut lines, true));
+        assert_eq!(cache.variant, Variant::Plain);
+        assert!(hl.refresh(path, &big, &mut cache, &mut lines, true));
+        assert_eq!(cache.variant, Variant::All);
+        assert_eq!(cache.relit(), limit + 1, "全文から塗り直していない");
+        assert!(lines == by_run, "境目を跨いだ後の塗りが全文の塗りと違う");
+    }
 
     fn assert_syntax(filename: &str, expected: &str) {
         let hl = SyntectHighlighter::new();

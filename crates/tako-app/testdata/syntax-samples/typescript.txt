@@ -1,0 +1,56 @@
+/**
+ * JSDoc の見本 {@link Foo} @param {string} name 名前
+ * @returns {Promise<number>} 数
+ */
+import { readFile } from "node:fs/promises";
+import type { Config as Cfg } from './config';
+export * as utils from "./utils";
+
+declare module "x" { export const y: number; }
+namespace Outer.Inner { export enum Kind { A = 1, B = A << 2, C = "c" } }
+const enum Flags { None = 0, Read = 1 << 0, Write = 1 << 1 }
+
+@sealed
+export abstract class Shape<T extends object = {}> implements Drawable {
+  #secret = 42;
+  private static readonly cache = new Map<string, Shape<any>>();
+  protected abstract area(): number;
+  constructor(public readonly name: string, private opts?: Partial<T>) { super(); }
+  get label(): string { return `${this.name}:${this.#secret}`; }
+  set label(v) { this.name = v as unknown as string; }
+  async *walk(this: Shape<T>, depth = 0): AsyncGenerator<T, void, unknown> {
+    for await (const item of this.items ?? []) yield item!;
+  }
+} // Shape の終わり（行頭の `}` だけの行は #1399 の番犬がテストの終わりと読むので避ける）
+
+type Mapped<T> = { readonly [K in keyof T as `get${Capitalize<string & K>}`]-?: () => T[K] };
+type Cond<T> = T extends (infer U)[] ? U : T extends Promise<infer V> ? V : never;
+type Tuple = [first: string, second?: number, ...rest: boolean[]];
+interface Point { x: number; y: number; readonly z?: number; [key: string]: unknown }
+function isPoint(v: unknown): v is Point { return typeof v === "object" && v !== null && "x" in v; }
+function assert(cond: unknown, msg?: string): asserts cond { if (!cond) throw new Error(msg); }
+
+export default async function main<T,>(argv: readonly string[]): Promise<number> {
+  const re = /^(?:[a-z]+|\d{2,})\/[^/\n]*$/giu, half = total / 2 / count;
+  const tpl = tag`line ${argv.length} and ${await readFile("a", "utf8")}`;
+  let x = obj?.a?.[0]?.(1) ?? defaultValue!;
+  x ||= 1; x &&= 2; x ??= 3; x **= 2; x >>>= 1;
+  const fn = async <U,>(a: U, { b, c = 2 }: { b: string; c?: number }, ...rest: U[]) => a;
+  const arrow = (a: number): a is 1 => a === 1;
+  const obj2 = { method() { return 1; }, get g() { return 2; }, [computed]: 3, 'quoted': 4, async *gen() {} };
+  if (x < 10 && y > 2) { console.log(x as number, <string>y, satisfiesCheck satisfies object); }
+  switch (kind) { case Kind.A: break; default: return -1; }
+  label: for (let i = 0; i < 10; i++) { if (i % 2) continue label; }
+  try { JSON.parse("{}"); } catch { /* 何もしない */ } finally { void 0; }
+  return 0x1F + 0b1010 + 0o17 + 1_000_000n + 1.5e-3;
+} // main の終わり
+
+// Unicode の識別子と文字列
+const 名前 = 値?.長さ ?? "既定";
+class Ünïcödé { ñ = 1; }
+
+// 壊れた行（閉じない文字列・コメント・括弧）
+const broken = "unterminated
+let a = (1 + [2, { b: `x ${ y
+/* 閉じないコメント
+const after = 1;

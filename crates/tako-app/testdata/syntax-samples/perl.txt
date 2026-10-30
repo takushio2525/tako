@@ -1,0 +1,46 @@
+#!/usr/bin/perl
+# Perl の見本
+use strict;
+use warnings;
+use List::Util qw(sum max);
+
+our $VERSION = '1.02';
+my %map = (key => 'value', 'other' => "x $VERSION");
+my @items = (1 .. 10);
+my $ref = { list => [@items], code => sub { return $_[0] * 2 } };
+
+sub greet {
+    my ($name, %opts) = @_;
+    $name //= 'world';
+    return sprintf("Hello, %s! %d\n", $name, $opts{count} // 0);
+}
+
+for my $i (grep { $_ % 2 == 0 } @items) {
+    next if $i > 8;
+    print "even: $i\n";
+}
+
+while (my $line = <STDIN>) {
+    chomp $line;
+    if ($line =~ m{^(\w+)\s*=\s*(.*)$}x) {
+        $map{$1} = $2;
+    } elsif ($line =~ s/foo/bar/g) {
+        print STDERR "replaced\n";
+    }
+    (my $copy = $line) =~ tr/a-z/A-Z/;
+}
+
+my $text = <<"END";
+heredoc $VERSION @{[ sum(@items) ]}
+END
+my $raw = q{single 'quoted'} . qq{double "quoted" $VERSION};
+my @words = qw(alpha beta gamma);
+open(my $fh, '<', 'file.txt') or die "cannot open: $!";
+local $/ = undef;
+printf "%s %d\n", $ref->{list}[0], max(@items) unless 0;
+__END__
+=pod
+
+POD の本文
+
+=cut

@@ -1,0 +1,56 @@
+// Swift の見本
+import Foundation
+import SwiftUI
+
+/// doc コメント
+@MainActor
+public final class ViewModel<Item: Identifiable & Sendable>: ObservableObject {
+    @Published private(set) var items: [Item] = []
+    private let queue = DispatchQueue(label: "sample", qos: .userInitiated)
+    static let shared = ViewModel<Row>()
+
+    init(items: [Item] = []) { self.items = items }
+
+    func load(from url: URL) async throws -> Int {
+        let (data, response) = try await URLSession.shared.data(from: url)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            throw URLError(.badServerResponse)
+        }
+        return data.count
+    }
+
+    deinit { print("deinit \(Self.self)") }
+}
+
+enum Shape: CaseIterable, Codable {
+    case circle(radius: Double)
+    case square(side: Double)
+    var area: Double {
+        switch self {
+        case .circle(let r): return .pi * r * r
+        case let .square(s) where s > 0: return s * s
+        default: return 0
+        }
+    }
+}
+
+protocol Drawable { func draw() -> String }
+extension Int: Drawable { func draw() -> String { "\(self)" } }
+
+struct ContentView: View {
+    @State private var count = 0x1F
+    var body: some View {
+        VStack(spacing: 8) {
+            Text("count: \(count)").font(.headline)
+            Button("増やす") { count += 1 }
+        }
+    }
+}
+
+let closure: (Int, Int) -> Int = { $0 + $1 }
+let multi = """
+    multi-line "string"
+    """
+let regex = /(\d+)-(\w+)/
+if #available(macOS 14, *) { print(closure(1, 2), multi, 1.5e-3, 1_000) }
+let broken = "閉じない文字列

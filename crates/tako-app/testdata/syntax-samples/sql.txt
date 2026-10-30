@@ -1,0 +1,38 @@
+-- SQL の見本
+/* 複数行の
+   コメント */
+CREATE TABLE IF NOT EXISTS users (
+    id          BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name        VARCHAR(255) NOT NULL DEFAULT '',
+    email       TEXT UNIQUE,
+    created_at  TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    score       NUMERIC(10, 2) CHECK (score >= 0),
+    CONSTRAINT fk_team FOREIGN KEY (team_id) REFERENCES teams (id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_users_name ON users (lower(name));
+
+INSERT INTO users (name, email, score) VALUES
+    ('Alice', 'alice@example.com', 1.5e2),
+    ('O''Brien', NULL, 0);
+
+WITH ranked AS (
+    SELECT u.id, u.name, t.title,
+           ROW_NUMBER() OVER (PARTITION BY t.id ORDER BY u.score DESC) AS rn
+    FROM users AS u
+    LEFT JOIN teams t ON t.id = u.team_id
+    WHERE u.created_at >= DATE '2026-01-01'
+      AND u.name LIKE 'A%' ESCAPE '\'
+      AND u.id IN (SELECT user_id FROM sessions GROUP BY user_id HAVING COUNT(*) > 3)
+)
+SELECT r.*, CASE WHEN r.rn = 1 THEN 'top' ELSE 'other' END AS tier,
+       COALESCE(NULLIF(r.title, ''), "fallback") AS title
+FROM ranked r
+ORDER BY r.rn ASC, r.name
+LIMIT 10 OFFSET 20;
+
+UPDATE users SET score = score * 1.1 WHERE id = $1 RETURNING id;
+DELETE FROM sessions WHERE expires_at < NOW() - INTERVAL '30 days';
+BEGIN; SAVEPOINT s1; ROLLBACK TO s1; COMMIT;
+GRANT SELECT, INSERT ON users TO reader;
+SELECT 'closing quote missing

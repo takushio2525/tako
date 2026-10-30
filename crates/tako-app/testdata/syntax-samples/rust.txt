@@ -1,0 +1,46 @@
+//! モジュールの doc（`code` と [リンク](crate::x)）
+#![allow(dead_code)]
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::{self, Display};
+
+/// 構造体の doc
+#[derive(Debug, Clone, PartialEq)]
+pub struct Point<T: Copy + Default = f64> {
+    pub x: T,
+    y: T,
+}
+
+pub enum Shape<'a> { Circle { r: f32 }, Poly(&'a [Point]), Unit }
+
+impl<T: Copy + Default + Display> Display for Point<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
+    }
+}
+
+pub trait Area { const SIDES: u8 = 0; fn area(&self) -> f64; }
+
+macro_rules! square { ($e:expr) => { $e * $e }; }
+
+async fn fetch(url: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let raw = r#"raw "string" with # sign"#;
+    let bytes = b"bytes\x00\n";
+    let ch = '\u{1F600}';
+    let n = 0x1F_u32 + 0o17 + 0b1010 + 1_000i64 as u32 + 1.5e-3 as u32;
+    let closure = |a: i32, b| -> i32 { a + b };
+    let label = 'outer: loop { break 'outer 42; };
+    if let Some(v @ 1..=9) = Some(3) { println!("{v} {}", square!(n)); }
+    match url.len() { 0 => return Err("empty".into()), x if x > 10 => {}, _ => unreachable!() }
+    let map: HashMap<&str, Vec<u8>> = HashMap::new();
+    let _ = (raw, bytes, ch, closure, label, map, BTreeMap::<u8, u8>::new());
+    Ok(format!("{url:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn 名前() { assert_eq!(Point { x: 1.0, y: 2.0 }.to_string(), "(1, 2)"); }
+} // tests の終わり
+// 壊れた行: let s = "閉じない文字列
+/* 閉じないコメント

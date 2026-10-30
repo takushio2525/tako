@@ -1,0 +1,15 @@
+import React, { useState } from "react";
+type Props = { title: string; items?: readonly string[] };
+export const List: React.FC<Props> = ({ title, items = [] }) => {
+  const [open, setOpen] = useState<boolean>(false);
+  const generic = <T,>(v: T) => v;
+  return (
+    <section className="list" data-open={open} onClick={() => setOpen(o => !o)}>
+      <h2>{title} &amp; more</h2>
+      {items.length > 0 ? (
+        <ul>{items.map((item, i) => <li key={i}>{item}</li>)}</ul>
+      ) : <Empty<string> fallback={<span>none</span>} />}
+      {/* JSX のコメント */}
+    </section>
+  );
+};

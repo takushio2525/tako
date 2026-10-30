@@ -1,0 +1,40 @@
+# YAML の見本
+%YAML 1.2
+---
+name: CI
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request: {}
+env: &defaults
+  RUST_BACKTRACE: 1
+  LANG: "ja_JP.UTF-8"
+jobs:
+  build:
+    <<: *defaults
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - name: 実行
+        run: |
+          cargo build --release
+          echo "done: $GITHUB_SHA"
+      - name: folded
+        run: >-
+          echo one
+          echo two
+      - if: ${{ failure() && github.event_name == 'push' }}
+        run: echo 'single ''quoted'''
+numbers: [0x1F, 0o17, 1.5e-3, .inf, -.Inf, .NaN, ~, null, true, no]
+date: 2026-10-31T02:20:00+09:00
+? complex key
+: complex value
+tagged: !!str 123
+binary: !!binary R0lGODlhDAAMAIQAAP
+...

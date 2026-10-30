@@ -24,6 +24,17 @@
 //!
 //! もう 1 つの役目は、two-face に無い構文（#1954。`syntaxes/` の `.sublime-syntax`）をビルド時に
 //! syntect の構文定義へ読んでおくこと（`compile_extra_syntaxes`。全ターゲット・全プロファイル）。
+//!
+//! 3 つ目は、構文の塗りの正規表現へ前置きを足した文脈をビルド時に作っておくこと
+//! （`generate_prefiltered_syntaxes`。#1917 / #1935。全ターゲット・全プロファイル）。
+
+// 書き換えの本体と直列化の鏡はアプリと同じファイルを読む（起動時に差し込む側と形を揃える）。
+// 鏡のうち実行時だけが使う定数（#1935 の A/B の対象表）はここでは読まない
+#[allow(dead_code)]
+#[path = "src/syntax_mirror.rs"]
+mod syntax_mirror;
+#[path = "src/syntax_rewrite.rs"]
+mod syntax_rewrite;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -35,6 +46,9 @@ fn main() {
 
     // two-face に無い構文（#1954）。全ターゲットで要るので Windows の判定より前に置く
     compile_extra_syntaxes();
+
+    // 塗りの正規表現の前置き（#1917 / #1935）。同上
+    generate_prefiltered_syntaxes();
 
     // `cfg!(target_os = "windows")` はビルドスクリプト自身（= ホスト）を指してしまうので使わない。
     // CARGO_CFG_TARGET_OS が「これから作るバイナリ」の OS。
@@ -164,6 +178,30 @@ fn compile_extra_syntaxes() {
         .join("extra-syntaxes.bin");
     std::fs::write(&out, syntect::dumps::dump_binary(&defs))
         .unwrap_or_else(|e| panic!("{} を書けない（#1954）: {e}", out.display()));
+}
+
+/// 対象の構文（`src/syntax_mirror.rs` の `TARGETS`）の文脈の正規表現へ「当たらない行で
+/// VM を起こさない」等価な前置きを足し、`OUT_DIR/prefiltered-syntaxes.bin` へ置く（#1917 / #1935）。
+/// 起動時は `src/syntax_prefilter.rs` がこれを土台の構文セットへ差し込むだけで、正規表現は読まない
+/// （実行時に書き換えると全 214 構文で release 約 340 ms・debug はその約 10 倍かかる）。
+///
+/// 書き換えられなければ（syntect の直列化の形が変わった等）警告を出して空の表を置く。
+/// そのときアプリは元の正規表現のまま塗り、単体テスト（`syntax_prefilter::tests`）が名指しで落ちる
+fn generate_prefiltered_syntaxes() {
+    println!("cargo:rerun-if-changed=src/syntax_rewrite.rs");
+    println!("cargo:rerun-if-changed=src/syntax_mirror.rs");
+    let names: Vec<&str> = syntax_mirror::TARGETS.iter().map(|t| t.name).collect();
+    let generated = syntax_rewrite::generate(&two_face::syntax::extra_newlines(), &names);
+    let bytes = generated.unwrap_or_else(|e| {
+        println!(
+            "cargo::warning=塗りの正規表現の前置きを作れなかった（元の正規表現のまま塗る。#1935）: {e}"
+        );
+        bincode::serialize(&Vec::<syntax_mirror::PrefilteredSyntax>::new()).expect("空の表")
+    });
+    let out = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"))
+        .join("prefiltered-syntaxes.bin");
+    std::fs::write(&out, bytes)
+        .unwrap_or_else(|e| panic!("{} を書けない（#1935）: {e}", out.display()));
 }
 
 /// `{{名前}}` を構文の変数で展開する（変数の中の変数も。syntect の文脈の正規表現と同じ扱い）

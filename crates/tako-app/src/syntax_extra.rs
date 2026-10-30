@@ -7,7 +7,7 @@
 //!
 //! ## 足し方（既存の構文は 1 バイトも変えない）
 //!
-//! 1. 既存の構文セットを直列化の鏡（[`crate::syntax_prefilter`] の `SetMirror`）へ解く
+//! 1. 既存の構文セットを直列化の鏡（[`crate::syntax_mirror`] の `SetMirror`）へ解く
 //! 2. 足す構文がほかの構文を名指す参照（PowerShell → C# / 正規表現）を、syntect の builder に
 //!    結ばせる。builder へは既存の構文と**同じ並び・同じ名前・同じ scope の身代わり**を入れ、
 //!    名指される構文の身代わりにだけ本物と同じ名前の文脈（中身は空）を持たせる。builder は
@@ -30,7 +30,7 @@ use std::sync::OnceLock;
 use syntect::parsing::syntax_definition::{Context, ContextReference, MatchOperation, Pattern};
 use syntect::parsing::{Scope, SyntaxDefinition, SyntaxSet, SyntaxSetBuilder};
 
-use crate::syntax_prefilter::{LazyMirror, SetMirror};
+use crate::syntax_mirror::{LazyMirror, SetMirror};
 
 /// `build.rs` が `syntaxes/` の YAML から作った構文定義（zlib + bincode の `Vec<SyntaxDefinition>`）
 static EXTRA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/extra-syntaxes.bin"));
@@ -164,7 +164,7 @@ mod tests {
     use super::*;
     use std::io::Read;
 
-    use crate::syntax_prefilter::ReferenceMirror;
+    use crate::syntax_mirror::ReferenceMirror;
 
     fn mirror(set: &SyntaxSet) -> SetMirror {
         bincode::deserialize(&bincode::serialize(set).unwrap()).unwrap()
