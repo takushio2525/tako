@@ -9462,7 +9462,7 @@ const OS_INTEGRATION_VARIANTS: usize = 26;
 fn lid_error_index(e: &LidError) -> usize {
     match e {
         LidError::RecordRead { .. } => 0,
-        LidError::RecordUnparsable { .. } => 1,
+        LidError::RecordMalformed { .. } => 1,
         LidError::DataDirUnresolved => 2,
         LidError::NothingToRestore => 3,
         LidError::BadSchemeGuid(_) => 4,
@@ -9745,7 +9745,7 @@ fn lid_error_table() -> Vec<(LidError, String)> {
             "記録を読めません（/d/lid-guard.json）: Permission denied (os error 13)".into(),
         ),
         (
-            LidError::RecordUnparsable {
+            LidError::RecordMalformed {
                 path: "/d/lid-guard.json".into(),
                 reason: JsonReason::Located {
                     kind: JsonProblem::Syntax,

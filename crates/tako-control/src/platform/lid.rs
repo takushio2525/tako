@@ -369,7 +369,7 @@ pub enum LidError {
     /// 記録を読めない（権限など）
     RecordRead { path: String, error: String },
     /// 記録を解釈できない（`quarantined` は退避先。写せなければ `None`）
-    RecordUnparsable {
+    RecordMalformed {
         path: String,
         reason: tako_core::load_issue::JsonReason,
         quarantined: Option<String>,
@@ -412,7 +412,7 @@ impl LidError {
                 format!("cannot read the record ({path}): {error}")
             }
             (
-                Self::RecordUnparsable {
+                Self::RecordMalformed {
                     path,
                     reason,
                     quarantined,
@@ -429,7 +429,7 @@ impl LidError {
                 )
             }
             (
-                Self::RecordUnparsable {
+                Self::RecordMalformed {
                     path,
                     reason,
                     quarantined,
@@ -544,7 +544,7 @@ fn read_from(path: &std::path::Path) -> RecordRead {
         Err(e) => {
             let quarantine =
                 tako_core::migration::quarantine_unreadable(path, &tako_core::migration::FsIo);
-            Err(LidError::RecordUnparsable {
+            Err(LidError::RecordMalformed {
                 path: path.display().to_string(),
                 // 種類と位置だけ（中身を引用しない = #2230）。文は包みと同じ言語で引く
                 reason: tako_core::load_issue::JsonReason::of(&e),
