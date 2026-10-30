@@ -649,11 +649,12 @@ fn 逆戻りを名指しできる() {
     );
 
     // 注入 4: 止まっているときの応答から意図を落とす（黙る形へ戻る）。
-    // PID ファイルが無い分岐は、まだ応答している待ち受けも添える（#2455）
+    // PID ファイルが無い分岐は、まだ応答している待ち受けも添える（#2455）。
+    // 生死の判定は #2539 から `liveness` の 1 実装（`Liveness::NoPidFile` の分岐）
     let mut s = sources(&root);
     s.remote = base.remote.replace(
-        "Err(_) => return with_autostart_fields(with_pidless_listener(json!({ \"running\": false }))),",
-        "Err(_) => return with_pidless_listener(json!({ \"running\": false })),",
+        "return with_autostart_fields(with_pidless_listener(json!({ \"running\": false })))",
+        "return with_pidless_listener(json!({ \"running\": false }))",
     );
     assert!(s.remote != base.remote, "注入 4 の対象が見つからない");
     let found = all(&s);

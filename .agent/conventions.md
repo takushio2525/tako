@@ -1006,6 +1006,16 @@ AppleSystemPolicy が読めずに 1 本ずつ拒否する。記録されるパ�
     （実ファイルと実 PATH）・周期の口の表・本番コードの素の `git` / `tmux` のリテラル・remote の状態の更新が
     通る口の表（`REMOTE_REFRESH`）・PATH に無い素の名前の tailscale を起こさないこと（相対エントリの先の
     偽物が印を残すかで見る）を file:line で見る。**周期の口を足したら表（`PERIODIC` / `REMOTE_REFRESH`）にも載せる**
+  - **生死だけを知りたい口は `remote::daemon_status` を引かない**（#2539）: `daemon_status` は表示の欄
+    （2 系統の同居の警告）のために `tailscale::survey_variants` で tailscale の CLI を最大 3 本
+    （`--version` / `status --json` / `--socket … status --json`）起こす。GUI の 2 秒ごとの状態の更新は
+    `remote::poll_admin_state`（生死は `remote::daemon_running` = PID ファイルと生存確認だけ。死んだ daemon の
+    残骸の掃除は `daemon_status` と同じ `liveness` の 1 実装）を通り、`admin_request` と端末の操作
+    （`devices_list` / `devices_revoke` / `devices_set_role`）も `daemon_running` で見る。修正前は daemon の
+    稼働中、1 tick に 2 回（そのまま + `admin_request` の中）= 2 秒ごとに 6 本で、GUI はその結果を使っていなかった。
+    `tako remote status` / MCP `tako_remote_status` は今も `daemon_status`（引いた時点で系統を調べる = 検知の
+    遅れは無い）。A/B は `TAKO_2539_LEGACY=1`・番犬 `crates/tako-control/tests/issue2539_remote_poll_tailscale_watchdog.rs`
+    （走査 + 偽の tailscale での実測）・実測の手順は `scripts/measure-remote-poll-2539.sh`
 
 ## OS に何かを「開かせる」前に形を確かめる（Issue #1376 / #1371）
 
