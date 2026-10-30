@@ -779,6 +779,36 @@ fn procargs2_argv(buf: &[u8]) -> Option<String> {
     (!args.is_empty()).then(|| args.join(" "))
 }
 
+/// argv[0] の名前部分（#2533。パスと引数は捨てる）。読めなければ `None`
+/// （別ユーザー・root のプロセス・既に死んだ pid）。
+///
+/// 祖先の記録で、**起動したときの名前**を出すために使う。comm（`pbsi_comm`）は実体の
+/// ファイル名なので、`~/.local/bin/claude` → `versions/2.1.301` のように版の数字で
+/// 置かれた実行ファイルが `2.1.301` に見える（`ps` が `claude` と出すのは argv[0] を見るから）
+#[cfg(target_os = "macos")]
+pub(crate) fn argv0_name(pid: u32) -> Option<String> {
+    procargs2_argv0_name(&procargs2(pid)?)
+}
+
+/// `KERN_PROCARGS2` から argv[0] の名前部分を取り出す（純粋関数）
+#[cfg(target_os = "macos")]
+fn procargs2_argv0_name(buf: &[u8]) -> Option<String> {
+    if buf.len() < 4 || u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) == 0 {
+        return None;
+    }
+    let body = &buf[4..];
+    // exec path（最初の NUL まで）と詰めの NUL を飛ばす
+    let mut pos = body.iter().position(|&b| b == 0)? + 1;
+    while body.get(pos) == Some(&0) {
+        pos += 1;
+    }
+    let rest = body.get(pos..)?;
+    let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+    let argv0 = String::from_utf8_lossy(&rest[..end]);
+    let name = argv0.rsplit('/').next().unwrap_or_default().trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 /// `KERN_PROCARGS2` のレイアウトを解く（純粋関数）。
 /// `[argc: u32][exec path\0][詰めの \0…][argv × argc][env…][\0]`
 #[cfg(target_os = "macos")]
@@ -1558,5 +1588,25 @@ mod tests {
         cut.extend_from_slice(b"/bin/x\0x\0y");
         assert_eq!(procargs2_argv(&cut).as_deref(), Some("x y"));
         assert_eq!(procargs2_argv(&[1, 0]), None);
+    }
+
+    #[test]
+    fn procargs2のargv0は名前だけを取る() {
+        // 版の数字の実体を symlink 越しに起動した claude（#2533）: 名前は argv[0] 側
+        let mut buf = 3u32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/x/versions/2.1.301\0\0\0/x/bin/claude\0--model\0m\0HOME=/x\0\0");
+        assert_eq!(procargs2_argv0_name(&buf).as_deref(), Some("claude"));
+        // パスの無い argv[0]・ログインシェルの `-zsh` はそのまま
+        let mut login = 1u32.to_ne_bytes().to_vec();
+        login.extend_from_slice(b"/bin/zsh\0-zsh\0\0");
+        assert_eq!(procargs2_argv0_name(&login).as_deref(), Some("-zsh"));
+        // argc = 0・空の argv[0]・壊れた入力は None（panic しない）
+        let mut empty = 0u32.to_ne_bytes().to_vec();
+        empty.extend_from_slice(b"/bin/x\0\0");
+        assert_eq!(procargs2_argv0_name(&empty), None);
+        let mut blank = 1u32.to_ne_bytes().to_vec();
+        blank.extend_from_slice(b"/bin/x\0\0/\0");
+        assert_eq!(procargs2_argv0_name(&blank), None);
+        assert_eq!(procargs2_argv0_name(&[1, 0]), None);
     }
 }

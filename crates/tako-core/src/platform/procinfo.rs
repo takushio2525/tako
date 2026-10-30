@@ -145,6 +145,76 @@ pub fn image_path(pid: u32) -> Option<std::path::PathBuf> {
     imp::image_path(pid)
 }
 
+/// プロセスの祖先の 1 段（#2533）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ancestor {
+    pub pid: u32,
+    /// 起動時の名前（macOS は argv[0] の名前部分・Windows は在籍表の実行ファイル名・無ければ実行ファイル名）。
+    /// パスは持たない。取れなければ空
+    pub name: String,
+}
+
+/// `pid` の親から上へ、近い順に最大 `depth` 段の祖先（#2533）。
+///
+/// 「誰がこのプロセスを起こしたか」を記録へ残す材料（remote daemon の停止・起動を頼んだ
+/// `tako` を、それを打ったシェル・スクリプト・エージェントまで後から名指す）。
+/// 名前だけでパスは返さない（記録へホームパスを撒かない）。
+/// 親を引けない段（既に居ない / 取得手段が無い OS）・pid 0 / 1・循環で止まる
+pub fn ancestry(pid: u32, depth: usize) -> Vec<Ancestor> {
+    // Windows は 1 回の在籍表で辿る（段ごとに Toolhelp を取り直さない）。
+    // unix は段ごとに libproc / procfs へ聞く（在籍表を持たない = `None`）
+    let table = snapshot_checked();
+    let entry = |p: u32| table.as_ref().and_then(|t| t.iter().find(|e| e.pid == p));
+    walk_ancestry(
+        pid,
+        depth,
+        |p| entry(p).map(|e| e.ppid).or_else(|| imp::parent_pid(p)),
+        // 名前は起動時の名前を先に引く（macOS は argv[0]。claude のように実体が `versions/<版>` に
+        // ある実行ファイルを、実体のパスの名前（`2.1.301`）ではなく `claude` と読めるように）
+        |p| {
+            imp::short_name(p)
+                .filter(|n| !n.is_empty())
+                .or_else(|| entry(p).map(|e| e.name.clone()))
+                .or_else(|| {
+                    image_path(p)
+                        .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+                })
+                .unwrap_or_default()
+        },
+    )
+}
+
+/// [`ancestry`] の辿り方（純関数。親と名前の引き方を差し替えてテストする）
+fn walk_ancestry(
+    pid: u32,
+    depth: usize,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    name_of: impl Fn(u32) -> String,
+) -> Vec<Ancestor> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::from([pid]);
+    let mut cur = pid;
+    while out.len() < depth {
+        let Some(parent) = parent_of(cur) else {
+            break;
+        };
+        // 0 = 親なし（Windows の System Idle・引けなかった値）。pid の再利用で輪になっても止まる
+        if parent == 0 || !seen.insert(parent) {
+            break;
+        }
+        out.push(Ancestor {
+            pid: parent,
+            name: name_of(parent),
+        });
+        // 1（launchd / init）より上は無い
+        if parent == 1 {
+            break;
+        }
+        cur = parent;
+    }
+    out
+}
+
 /// プロセス 1 件の**コマンドラインつき**スナップショット（#1282）。
 ///
 /// [`ProcEntry`] は名前と親子だけを持つ。器（tmux / psmux）を名前付きパイプ越しに
@@ -808,6 +878,17 @@ mod imp {
         }
     }
 
+    /// 親 pid（#2533）。Windows は在籍表（[`super::ancestry`] が 1 回だけ取る）から引くので、
+    /// ここは表に無い pid の分だけ = 引く手段が無い
+    pub(super) fn parent_pid(_pid: u32) -> Option<u32> {
+        None
+    }
+
+    /// 起動時の名前（#2533）。Windows は在籍表の実行ファイル名を使う
+    pub(super) fn short_name(_pid: u32) -> Option<String> {
+        None
+    }
+
     fn invalid_handle() -> Handle {
         -1isize as Handle
     }
@@ -1113,6 +1194,38 @@ mod imp {
     #[cfg(not(target_os = "macos"))]
     pub(super) fn image_path(pid: u32) -> Option<std::path::PathBuf> {
         std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+
+    /// 親 pid（#2533）。macOS は libproc の `PROC_PIDT_SHORTBSDINFO`（別ユーザーでも取れる）
+    #[cfg(target_os = "macos")]
+    pub(super) fn parent_pid(pid: u32) -> Option<u32> {
+        crate::ports::short_info(i32::try_from(pid).ok()?).map(|(ppid, _, _)| ppid)
+    }
+
+    /// macOS 以外の unix は procfs の stat の 4 欄目。2 欄目（comm）は空白や括弧を
+    /// 含みうるので、最後の `)` より後ろを読む
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn parent_pid(pid: u32) -> Option<u32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = &stat[stat.rfind(')')? + 1..];
+        rest.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    /// 起動時の名前（#2533）。macOS は argv[0] の名前部分（comm = `pbsi_comm` は実体の
+    /// ファイル名で、claude が版の数字 `2.1.301` に見える）。argv を読めない別ユーザー・root の
+    /// プロセス（launchd 等）は comm へ落とす
+    #[cfg(target_os = "macos")]
+    pub(super) fn short_name(pid: u32) -> Option<String> {
+        crate::ports::argv0_name(pid)
+            .or_else(|| crate::ports::short_info(i32::try_from(pid).ok()?).map(|(_, _, comm)| comm))
+    }
+
+    /// macOS 以外の unix は procfs の comm
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn short_name(pid: u32) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|s| s.trim_end().to_string())
     }
 
     /// unix はソケットの所有ユーザーを引けるので、自分の uid も返せる
@@ -1505,6 +1618,73 @@ mod tests {
         // System Idle Process を root にすると親無しプロセス群を全部拾ってしまう
         let procs = vec![p(0, 0, "idle"), p(4, 0, "System"), p(100, 4, "smss.exe")];
         assert_eq!(descendants_of(&procs, 0), HashSet::from([0]));
+    }
+
+    #[test]
+    fn 祖先は近い順に段数までで止まる() {
+        // 10 ← 20 ← 30 ← 40 ← 1
+        let parent = |p: u32| match p {
+            10 => Some(20),
+            20 => Some(30),
+            30 => Some(40),
+            40 => Some(1),
+            _ => None,
+        };
+        let name = |p: u32| format!("p{p}");
+        let pids = |v: Vec<Ancestor>| v.iter().map(|a| a.pid).collect::<Vec<_>>();
+        assert_eq!(pids(walk_ancestry(10, 2, parent, name)), vec![20, 30]);
+        // 1 より上は無い・段数に余りがあっても 1 で止まる
+        let all = walk_ancestry(10, 9, parent, name);
+        assert_eq!(pids(all.clone()), vec![20, 30, 40, 1]);
+        assert_eq!(all[0].name, "p20");
+        // 親を引けない段で止まる
+        assert!(walk_ancestry(99, 5, parent, name).is_empty());
+    }
+
+    #[test]
+    fn 祖先の輪や0の親で止まる() {
+        let name = |_| String::new();
+        // pid 再利用で 10 ← 20 ← 10 の輪になった
+        let ring = |p: u32| match p {
+            10 => Some(20),
+            20 => Some(10),
+            _ => None,
+        };
+        let got: Vec<u32> = walk_ancestry(10, 9, ring, name)
+            .iter()
+            .map(|a| a.pid)
+            .collect();
+        assert_eq!(got, vec![20]);
+        // 親 0（Windows の System Idle）は載せない
+        assert!(walk_ancestry(4, 9, |_| Some(0), name).is_empty());
+    }
+
+    /// 実機の OS へ問い合わせる（**両プラットフォームで走る**）。#2533 の要求元の記録は
+    /// この 1 本に載っているので、親を引けない形へ戻すとここが落ちる
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn 自プロセスの親を祖先の先頭として引ける() {
+        let me = std::process::id();
+        let chain = ancestry(me, 3);
+        let first = chain.first().expect("自プロセスの親が引けない");
+        #[cfg(unix)]
+        assert_eq!(first.pid, std::os::unix::process::parent_id());
+        #[cfg(windows)]
+        {
+            let procs = snapshot_checked().expect("在籍表が取れない");
+            let mine = procs
+                .iter()
+                .find(|e| e.pid == me)
+                .expect("自分が載っていない");
+            assert_eq!(first.pid, mine.ppid);
+        }
+        // 名前は実行ファイル名だけ（パスを持ち回らない）
+        assert!(!first.name.is_empty(), "親の名前が空: {chain:?}");
+        assert!(
+            !first.name.contains('/') && !first.name.contains('\\'),
+            "名前にパスが混ざっている: {}",
+            first.name
+        );
     }
 
     /// 実機の OS へ問い合わせる（**両プラットフォームで走る**）。#936 の

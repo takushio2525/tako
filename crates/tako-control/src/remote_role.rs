@@ -375,23 +375,27 @@ fn extra_trusted_admin_names() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// 管理 API へ繋いできたプロセスの pid（#1452 / #2533。役割の昇格の判定と停止の要求元の記録が
+/// 同じ 1 実装を引く）。ループバック TCP の接続元を OS から引く。
+/// UDS（接続元 pid を引く口が無い = accept 済み fd が手に入らない）・引けないときは `None`
+pub fn admin_peer_pid(endpoint: &Endpoint, peer: Option<SocketAddr>) -> Option<u32> {
+    let Endpoint::Loopback(local_port) = endpoint else {
+        return None;
+    };
+    let peer = peer?;
+    tako_core::platform::procinfo::loopback_tcp_peer(peer.port(), *local_port)
+        .map(|found| found.pid)
+}
+
 /// 管理 API の接続元が tako-app かを引く（#841 の `verify_peer` と同じ材料・同じ順）。
 ///
 /// 所有者は見ない: 管理 API はもともとローカル管理トークン（0600）で同一ユーザーに
 /// 限られていて、ここで撃ち分けたいのは**同じユーザーの中の GUI と CLI** だから
 pub fn verify_admin_caller(endpoint: &Endpoint, peer: Option<SocketAddr>) -> CallerCheck {
-    let Endpoint::Loopback(local_port) = endpoint else {
-        // UDS: 接続元 pid を引く口が無い（accept 済み fd が手に入らない）
+    let Some(pid) = admin_peer_pid(endpoint, peer) else {
         return CallerCheck::Unavailable;
     };
-    let Some(peer) = peer else {
-        return CallerCheck::Unavailable;
-    };
-    let Some(found) = tako_core::platform::procinfo::loopback_tcp_peer(peer.port(), *local_port)
-    else {
-        return CallerCheck::Unavailable;
-    };
-    let Some(path) = tako_core::platform::procinfo::image_path(found.pid) else {
+    let Some(path) = tako_core::platform::procinfo::image_path(pid) else {
         return CallerCheck::Unavailable;
     };
     let name = path

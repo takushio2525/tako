@@ -425,7 +425,8 @@ fn scan_gui(panel: &str, main: &str) -> Vec<Offender> {
             if !code.contains("autostart::attempts_max()") {
                 push("試行回数の上限が無い（諦めずに回り続ける）".into());
             }
-            if !code.contains("remote::spawn_daemon()") {
+            // 呼び方は直呼びでも経路の名乗り（#2533 の `with_origin(…, remote::spawn_daemon)`）でもよい
+            if !code.contains("remote::spawn_daemon") {
                 push(
                     "起動が `spawn_daemon`（起動ボタン / CLI / MCP と同一実体）を\
                      通っていない（経路が 2 本になる）"

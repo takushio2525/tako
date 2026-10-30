@@ -6222,7 +6222,9 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
 /// QR は恒久固定 URL のみ（#283: secret を含まない。初回接続時に Mac 側で
 /// ペアリング承認ダイアログが表示される）
 fn remote_start() -> Result<(), String> {
-    let result = tako_control::remote::spawn_daemon()?;
+    use tako_control::remote::{with_origin, RequestOrigin};
+    // #2533: audit.log に「CLI から頼んだ」と残す
+    let result = with_origin(RequestOrigin::Cli, tako_control::remote::spawn_daemon)?;
     println!("{}", pretty_json(&result));
     // #2518: 旧版のまま動いていた daemon を入れ替えたなら、スマホが一瞬切れた理由を言う
     if let Some(pid) = result["renewed"]["previous_pid"].as_u64() {
@@ -6265,10 +6267,12 @@ fn remote_start() -> Result<(), String> {
 
 /// `tako remote stop` — デーモンを PID ファイルから kill する
 fn remote_stop(force: bool) -> Result<(), String> {
+    use tako_control::remote::{with_origin, RequestOrigin};
+    // #2533: audit.log に「CLI から頼んだ」と残す
     let result = if force {
-        tako_control::remote::daemon_force_stop()?
+        with_origin(RequestOrigin::Cli, tako_control::remote::daemon_force_stop)?
     } else {
-        tako_control::remote::daemon_stop()?
+        with_origin(RequestOrigin::Cli, tako_control::remote::daemon_stop)?
     };
     println!("{}", pretty_json(&result));
     eprintln!("リモートサーバーを停止しました");
