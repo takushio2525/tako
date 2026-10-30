@@ -120,16 +120,6 @@ fn code_only(text: &str) -> String {
         .join("\n")
 }
 
-/// 関数の宣言なら、その名前
-fn fn_name(line: &str) -> Option<&str> {
-    let t = line.trim_start();
-    let rest = t
-        .strip_prefix("pub fn ")
-        .or_else(|| t.strip_prefix("fn "))?;
-    let end = rest.find(['(', '<'])?;
-    Some(&rest[..end])
-}
-
 /// 宣言行 `start`（0-based）の関数の終わり（0-based）。宣言行と同じ字下げの `}`
 fn fn_end(lines: &[&str], start: usize) -> usize {
     let indent = lines[start].len() - lines[start].trim_start().len();
@@ -142,12 +132,15 @@ fn fn_end(lines: &[&str], start: usize) -> usize {
         .map_or(lines.len() - 1, |(i, _)| i)
 }
 
-/// 関数ごとの（名前, 宣言行, 終わり）（0-based）
+/// 関数ごとの（名前, 宣言行, 終わり）（0-based）。関数の頭は共有ヘルパで読む
+/// （`pub(crate) fn` / `async fn` も頭と見る = #1496）
 fn functions(lines: &[&str]) -> Vec<(String, usize, usize)> {
     lines
         .iter()
         .enumerate()
-        .filter_map(|(i, l)| fn_name(l).map(|n| (n.to_string(), i, fn_end(lines, i))))
+        .filter_map(|(i, l)| {
+            tako_core::source_scan::fn_head_name(l).map(|n| (n.to_string(), i, fn_end(lines, i)))
+        })
         .collect()
 }
 
