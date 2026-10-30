@@ -69,33 +69,8 @@ const GUARDS: &[&str] = &[
 const MARKER: &str = "tako:env-write-ok";
 
 /// 目印で通した書き換えを同じ関数の中で手で戻す対が既にあるファイルと、その中の対の数・理由
-/// （#2520。増えても減っても落とす = 直したら件数を下げるか行を消す）
+/// （#2520。増えても減っても落とす = 直したら件数を下げるか行を消す。#2525 で漏れる 5 ファイルを子の中へ寄せた）
 const KNOWN_RESTORE_PAIRS: &[(&str, usize, &str)] = &[
-    (
-        "crates/tako-control/tests/issue1893_lsp_hover_followup.rs",
-        1,
-        "#2525 で子の中へ寄せる残り（`TAKO_1893_LEGACY`）",
-    ),
-    (
-        "crates/tako-control/tests/issue1909_lsp_completion_ticket.rs",
-        1,
-        "#2525 で子の中へ寄せる残り（`TAKO_1909_INJECT_HOLD`）",
-    ),
-    (
-        "crates/tako-control/tests/issue2034_lsp_watched_files.rs",
-        2,
-        "#2525 で子の中へ寄せる残り（`TAKO_2034_LEGACY`。1 つは `#[ignore]` の実測用）",
-    ),
-    (
-        "crates/tako-control/tests/lid_residual_windows.rs",
-        4,
-        "#2525 で子の中へ寄せる残り（`TAKO_DATA_DIR`。`#![cfg(windows)]`）",
-    ),
-    (
-        "crates/tako-core/tests/pane_term_env.rs",
-        3,
-        "#2525 の残り（`TERM` / `COLORTERM` はペインが親の env を継ぐことを測るので親で書く = `Drop` で戻す形へ）",
-    ),
     (
         "crates/tako-core/tests/issue2092_pin_hold.rs",
         1,
@@ -648,8 +623,8 @@ fn 注入した書き換えを名指しする() {
     );
 
     // (7) 一覧に載ったファイルは件数で縛る: 対を足す（増えた）・宣言より少ない（直したのに一覧が古い）・
-    // 無くなった、のどれも名指す。本物の issue1893（1 対）を使う
-    let rel = "crates/tako-control/tests/issue1893_lsp_hover_followup.rs";
+    // 無くなった、のどれも名指す。一覧に残る本物の issue2092（1 対）を使う（#2525 で issue1893 から移した）
+    let rel = "crates/tako-core/tests/issue2092_pin_hold.rs";
     let src = read(rel);
     let scan_of = |text: &str| {
         let mut scan = Scan::default();
@@ -663,8 +638,8 @@ fn 注入した書き換えを名指しする() {
     );
     let added = format!(
         "{src}\n#[test]\n// tako:env-write-ok 注入\nfn 二つ目の対() {{\n    \
-         std::env::set_var(\"TAKO_1893_LEGACY\", \"1\");\n    let _ = 1;\n    \
-         std::env::remove_var(\"TAKO_1893_LEGACY\");\n}}\n"
+         std::env::set_var(\"TAKO_2092_LEGACY\", \"1\");\n    let _ = 1;\n    \
+         std::env::remove_var(\"TAKO_2092_LEGACY\");\n}}\n"
     );
     let v = restore_findings(&scan_of(&added), &declared(1), false);
     assert!(

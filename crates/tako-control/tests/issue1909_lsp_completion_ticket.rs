@@ -18,8 +18,8 @@
 //! 順序は実時間に任せない: 「背景が走り出す前に取り消す」はテストの手で順に呼ぶか、背景の走り出しを
 //! 合図のファイルまで止める注入（`TAKO_1909_INJECT_HOLD`）で作る。読み込みの終わりは
 //! `common/lsp_fake_e2e.rs`（#1922）の合図で決める。サーバへ届いた数は、manager が「送った」直後に
-//! 数えず `wait_received` で偽サーバのログに載るのを待ってから数える（#2163）。env を触るので、
-//! このファイルのテストは 1 本ずつ。
+//! 数えず `wait_received` で偽サーバのログに載るのを待ってから数える（#2163）。このファイルの
+//! テストは 1 本ずつ走り、注入の env は注入のテストが `run_alone!` の子の中だけで立てる（#2525）。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,7 +43,9 @@ use lsp_fake_e2e::LoadingGate;
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
-/// env（`TAKO_1909_INJECT_HOLD`）を触るテストがあるので、このファイルのテストは 1 本ずつ
+/// このファイルのテストは 1 本ずつ走る。注入の env（`TAKO_1909_INJECT_HOLD`）は注入のテストが
+/// `run_alone!` の子の中だけで立てる（親で立てると、戻す前に落ちたとき同じバイナリの後のテストの
+/// 要求が合図のファイルを待って止まり、連鎖で落ちる。#2525）
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -406,9 +408,12 @@ fn 説明の補いも閉じた取り消しを追い越さない() {
 /// （`inflight` = 1）、合図まで止まる。その間に UI が一覧を閉じ、合図で走り出す。先に取った番号なら
 /// サーバへ届かずに抜け、旧い形（背景で取る）なら取り消しを追い越して読み込み待ちに残る
 #[test]
-// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 背景の走り出しを止める注入でも先に取った番号は取り消しで抜ける() {
     let _env = serial();
+    if tako_core::run_alone!(背景の走り出しを止める注入でも先に取った番号は取り消しで抜ける)
+    {
+        return;
+    }
     let scratch = Scratch::new("inject");
     let main = scratch.write("src/main.rs", TEXT);
     let manager = LspManager::new(config(&scratch, &rules(false)));
@@ -417,7 +422,7 @@ fn 背景の走り出しを止める注入でも先に取った番号は取り�
 
     for (label, legacy) in [("fixed", false), ("legacy", true)] {
         let hold = scratch.0.join(format!("hold-{label}"));
-        std::env::set_var("TAKO_1909_INJECT_HOLD", &hold);
+        std::env::set_var("TAKO_1909_INJECT_HOLD", &hold); // 子の中だけ（他のテストは居ない）
         let ticket = if legacy {
             None
         } else {
@@ -446,6 +451,5 @@ fn 背景の走り出しを止める注入でも先に取った番号は取り�
             .expect("済んだ後に答えを受け取る");
         assert_eq!(inflight(&manager, "completion"), 0);
     }
-    std::env::remove_var("TAKO_1909_INJECT_HOLD");
     manager.shutdown_all(Duration::from_secs(2));
 }

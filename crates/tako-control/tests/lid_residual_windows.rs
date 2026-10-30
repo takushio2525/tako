@@ -4,8 +4,9 @@
 //! ここでは「倒す → 記録が残る → tako が落ちる → 次回起動で元へ戻る」という
 //! **安全性の肝**を実際の電源プランに対して通す。
 //!
-//! 統合テストは 1 ファイル 1 プロセスなので、`TAKO_DATA_DIR` を差し替えても
-//! 他のテストへ漏れない（単体テスト側で環境変数を触るとレースになる）。
+//! `TAKO_DATA_DIR` の差し替えは各テストが `run_alone!` の子の中だけで行う（#2525）。
+//! 同じバイナリの親で差し替えて手で戻すと、間で落ちたとき後のテストへ値と `lid` の
+//! プロセス内の状態が残って連鎖で落ちる（単体テスト側で環境変数を触るとレースになる）。
 //!
 //! **本番の記録ファイルには触らない**が、電源プランの値そのものは機械全体で共有なので、
 //! どの経路で失敗しても最後に必ず元へ戻す。
@@ -112,9 +113,9 @@ mod probe {
     }
 }
 
-/// この 3 本は **プロセス共有の `TAKO_DATA_DIR`** と **機械全体で 1 つの電源プラン**を
-/// 触るので、並列に走らせるとお互いの後始末を踏む（`cargo test` は既定で並列）。
-/// 各テストの先頭でこの錠を取って直列化する
+/// このファイルのテストは **機械全体で 1 つの電源プラン**を触るので、並列に走らせると
+/// お互いの後始末を踏む（`cargo test` は既定で並列）。各テストの先頭（`run_alone!` より前）で
+/// この錠を取って直列化する（親が錠を持ったまま子を待つので、子どうしも並走しない）
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// 直列化の錠を取る。**`Restore` より先に宣言する**こと
@@ -140,12 +141,15 @@ impl Drop for Restore {
 
 /// 受け入れ条件 1・2: 倒れること、そして落ちても次回起動で戻ること
 #[test]
-// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 倒したあと落ちても次回起動の残留復元で元へ戻る() {
     let _serial = serial();
+    if tako_core::run_alone!(倒したあと落ちても次回起動の残留復元で元へ戻る)
+    {
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("tako-lid-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
-    // SAFETY: 統合テストは 1 ファイル 1 プロセス。この差し替えは他テストへ漏れない
+    // SAFETY: 子の中だけ（他のテストは居ない）。この差し替えは他テストへ漏れない
     unsafe { std::env::set_var("TAKO_DATA_DIR", &dir) };
 
     let original = probe::read_ac();
@@ -178,8 +182,6 @@ fn 倒したあと落ちても次回起動の残留復元で元へ戻る() {
     assert!(!record.exists(), "記録が破棄されている");
     assert!(!lid::is_active(), "保持していない状態に戻る");
 
-    // SAFETY: 上で設定した変数を戻す
-    unsafe { std::env::remove_var("TAKO_DATA_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -188,12 +190,14 @@ fn 倒したあと落ちても次回起動の残留復元で元へ戻る() {
 /// 蓋の設定は電源プランに書かれる永続設定なので、電源要求と違って OS が回収してくれない。
 /// ここが抜けると「tako を終了したら蓋を閉じてもスリープしない PC」が出来上がる
 #[test]
-// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn 正常終了で蓋設定が元へ戻る() {
     let _serial = serial();
+    if tako_core::run_alone!(正常終了で蓋設定が元へ戻る) {
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("tako-lid-exit-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
-    // SAFETY: 統合テストは 1 ファイル 1 プロセス
+    // SAFETY: 子の中だけ（他のテストは居ない）
     unsafe { std::env::set_var("TAKO_DATA_DIR", &dir) };
 
     let original = probe::read_ac();
@@ -212,8 +216,6 @@ fn 正常終了で蓋設定が元へ戻る() {
     );
     assert!(!dir.join("lid-guard.json").exists(), "記録も破棄されている");
 
-    // SAFETY: 同上
-    unsafe { std::env::remove_var("TAKO_DATA_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -226,12 +228,14 @@ fn 正常終了で蓋設定が元へ戻る() {
 /// `Attributes = 1` で UI から隠されていて、値を明示的に書いたあとでも `/query` には
 /// 現れない（実測。`/qh` なら `LIDACTION` として出る）
 #[test]
-// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn powercfgの目でもlidactionが倒れて見える() {
     let _serial = serial();
+    if tako_core::run_alone!(powercfgの目でもlidactionが倒れて見える) {
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("tako-lid-pcfg-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
-    // SAFETY: 統合テストは 1 ファイル 1 プロセス
+    // SAFETY: 子の中だけ（他のテストは居ない）
     unsafe { std::env::set_var("TAKO_DATA_DIR", &dir) };
 
     let original = probe::read_ac();
@@ -272,19 +276,20 @@ fn powercfgの目でもlidactionが倒れて見える() {
         "powercfg から見ても元の値へ戻っている"
     );
 
-    // SAFETY: 同上
-    unsafe { std::env::remove_var("TAKO_DATA_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// 受け入れ条件 3: ユーザーが自分で設定を変えていたら、解除で勝手に戻さない
 #[test]
-// tako:env-write-ok このバイナリの全テストが serial() で 1 本ずつ走るので、並走する読み手が居ない（#2400）
 fn ユーザーが蓋設定を変えていたら解除で上書きしない() {
     let _serial = serial();
+    if tako_core::run_alone!(ユーザーが蓋設定を変えていたら解除で上書きしない)
+    {
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("tako-lid-user-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
-    // SAFETY: 同上
+    // SAFETY: 子の中だけ（他のテストは居ない）
     unsafe { std::env::set_var("TAKO_DATA_DIR", &dir) };
 
     let original = probe::read_ac();
@@ -305,7 +310,5 @@ fn ユーザーが蓋設定を変えていたら解除で上書きしない() {
         "ユーザーが変えた値を tako が巻き戻してはいけない"
     );
 
-    // SAFETY: 同上
-    unsafe { std::env::remove_var("TAKO_DATA_DIR") };
     let _ = std::fs::remove_dir_all(&dir);
 }
