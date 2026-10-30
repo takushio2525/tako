@@ -685,10 +685,6 @@ fn run_installer(
     installer: DepInstaller,
     interactive: bool,
 ) -> Result<(), crate::SetupRefusal> {
-    let spawn_failed = |e: std::io::Error| crate::SetupRefusal::DepInstallerSpawn {
-        program: program.to_string(),
-        error: e.to_string(),
-    };
     let mut command = std::process::Command::new(program);
     // #586: GUI 内 dispatch から到達するのでコンソールウィンドウを出させない
     tako_core::platform::process::no_console_window(&mut command);
@@ -699,13 +695,19 @@ fn run_installer(
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
             .status()
-            .map_err(spawn_failed)?;
+            .map_err(|e| crate::SetupRefusal::DepInstallerSpawn {
+                program: program.to_string(),
+                error: e.to_string(),
+            })?;
         (status, String::new())
     } else {
         let output = command
             .stdin(std::process::Stdio::null())
             .output()
-            .map_err(spawn_failed)?;
+            .map_err(|e| crate::SetupRefusal::DepInstallerSpawn {
+                program: program.to_string(),
+                error: e.to_string(),
+            })?;
         let mut log = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr);
         if !stderr.trim().is_empty() {
