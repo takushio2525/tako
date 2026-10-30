@@ -139,16 +139,15 @@ const BROKEN_PROJECTS: &str = "projects: [\n";
 const BROKEN_ACCOUNTS: &str = "accounts:\n  a: [\n";
 const BROKEN_PROFILE: &str = "effort: [1, 2]\n";
 
+/// 要求を 1 つ通す呼び方（ホストとそのペイン ID を受ける）
+type Invoke = Box<dyn Fn(&mut Host, u64) -> Result<Value, DispatchError>>;
+
 /// 断りを引き出す呼び方
 enum Call {
     /// 断り（`Err`）の文
-    Err(Box<dyn Fn(&mut Host, u64) -> Result<Value, DispatchError>>),
+    Err(Invoke),
     /// 成功の応答の中の文（一覧の壊れたエントリの `error`）。`(呼び方, JSON の配列の鍵, name)`
-    Entry(
-        Box<dyn Fn(&mut Host, u64) -> Result<Value, DispatchError>>,
-        &'static str,
-        &'static str,
-    ),
+    Entry(Invoke, &'static str, &'static str),
 }
 
 struct Case {
