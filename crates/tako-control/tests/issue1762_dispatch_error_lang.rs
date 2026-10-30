@@ -10225,10 +10225,20 @@ fn osのシェル連携と蓋閉じ継続の番犬の境界() {
 // (1) 全バリアントの日英と旧文のバイト一致・「見つからない」の読みが日英で同じ、(2) 型の口の本体の断りの
 // 組み立て（`Err(` / `.map_err(` / `.ok_or(`）に日本語の固定文を書き足していないこと、(3) dispatch が
 // 日本語の口を呼んで断りに載せていないことを `file:line` で名指す。成功の応答の注記（`Ok` の文 =
-// 依存の `skipped` の detail・子の打ち切りの note・同期の未設定の message）は断りではないので見ない
+// 依存の `skipped` の detail・子の打ち切りの note・同期の未設定の message）は断りではないので見ない。
+//
+// bootstrap の install（インストーラの取得と実行）/ path / undo-path は、中身の tako-core の断り（profile の
+// PATH ブロック `PathBlockError`・tako CLI の symlink `LinkError`・Windows のユーザー PATH `UserPathError`）と
+// 一緒に移した。Windows だけが組む文も `cfg` の外の表に置いたので、macOS のこのテストで日英を見る。型の口の
+// 本体が tako-core の日本語の口（`String` を返す従来の口）や `into_ja` を呼んで中身を日本語へ戻していないことも
+// `file:line` で名指す
 
 use tako_control::agent_mcp::AgentMcpError;
+use tako_control::setup_refusal::FetchDetail;
 use tako_control::SetupRefusal;
+use tako_core::platform::user_path::UserPathError;
+use tako_core::shell_profile::PathBlockError;
+use tako_core::tako_cli_path::LinkError;
 
 const SETUP_REFUSAL_SRC: &str = include_str!("../src/setup_refusal.rs");
 const SETUP_REFUSAL_PATH: &str = "crates/tako-control/src/setup_refusal.rs";
@@ -10242,6 +10252,12 @@ const SETUP_DEPS_SRC: &str = include_str!("../src/setup_deps.rs");
 const SETUP_DEPS_PATH: &str = "crates/tako-control/src/setup_deps.rs";
 const SETUP_BOOTSTRAP_SRC: &str = include_str!("../src/setup_bootstrap.rs");
 const SETUP_BOOTSTRAP_PATH: &str = "crates/tako-control/src/setup_bootstrap.rs";
+const SHELL_PROFILE_SRC: &str = include_str!("../../tako-core/src/shell_profile.rs");
+const SHELL_PROFILE_PATH: &str = "crates/tako-core/src/shell_profile.rs";
+const TAKO_CLI_PATH_SRC: &str = include_str!("../../tako-core/src/tako_cli_path.rs");
+const TAKO_CLI_PATH_PATH: &str = "crates/tako-core/src/tako_cli_path.rs";
+const USER_PATH_SRC: &str = include_str!("../../tako-core/src/platform/user_path.rs");
+const USER_PATH_PATH: &str = "crates/tako-core/src/platform/user_path.rs";
 
 /// `SetupRefusal` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
 fn setup_refusal_index(r: &SetupRefusal) -> usize {
@@ -10287,10 +10303,61 @@ fn setup_refusal_index(r: &SetupRefusal) -> usize {
         S::DepMissingAfterInstall { .. } => 37,
         S::UnknownBootstrapAgent { .. } => 38,
         S::BootstrapHomeUnresolved => 39,
+        S::InstallDuringSelfTest => 40,
+        S::InstallNotDelegable { .. } => 41,
+        S::NoDownloader => 42,
+        S::InstallerToolSpawn { .. } => 43,
+        S::InstallerFetchFailed { .. } => 44,
+        S::InstallerUnreadable(_) => 45,
+        S::NotAnInstaller { .. } => 46,
+        S::InstallerOutOfMemory { .. } => 47,
+        S::InstallerKilled { .. } => 48,
+        S::InstallerFailed { .. } => 49,
+        S::InstalledButMissing { .. } => 50,
+        S::ShellProfileUnknown { .. } => 51,
+        S::ShellProfileUnknownForUndo => 52,
+        S::UserPathNotReflected { .. } => 53,
+        S::PathBlock(_) => 54,
+        S::CliLink(_) => 55,
+        S::UserPath(_) => 56,
     }
 }
 
-const SETUP_REFUSAL_VARIANTS: usize = 40;
+const SETUP_REFUSAL_VARIANTS: usize = 57;
+
+/// tako-core の 3 型（bootstrap の path / undo-path の中身）の通し番号
+fn path_block_index(e: &PathBlockError) -> usize {
+    match e {
+        PathBlockError::NoDirs => 0,
+        PathBlockError::Read { .. } => 1,
+        PathBlockError::CreateDir { .. } => 2,
+        PathBlockError::Write { .. } => 3,
+    }
+}
+
+const PATH_BLOCK_VARIANTS: usize = 4;
+
+fn link_error_index(e: &LinkError) -> usize {
+    match e {
+        LinkError::Create { .. } => 0,
+        LinkError::Replace { .. } => 1,
+        LinkError::Remove { .. } => 2,
+        LinkError::SymlinkUnsupported { .. } => 3,
+    }
+}
+
+const LINK_ERROR_VARIANTS: usize = 4;
+
+fn user_path_index(e: &UserPathError) -> usize {
+    match e {
+        UserPathError::Unsupported => 0,
+        UserPathError::Spawn { .. } => 1,
+        UserPathError::Failed { .. } => 2,
+        UserPathError::BadOutput { .. } => 3,
+    }
+}
+
+const USER_PATH_VARIANTS: usize = 4;
 
 /// `AgentMcpError` の通し番号
 fn agent_mcp_index(e: &AgentMcpError) -> usize {
@@ -10531,6 +10598,299 @@ fn setup_refusal_table() -> Vec<(SetupRefusal, String)> {
             S::BootstrapHomeUnresolved,
             "ホームディレクトリを特定できません（HOME が未設定）".into(),
         ),
+        (
+            S::InstallDuringSelfTest,
+            "セルフテスト中は実インストールを行いません（dry_run でのみ呼べます）".into(),
+        ),
+        (
+            S::InstallNotDelegable {
+                os: "linux".into(),
+                command: INSTALL_CMD.into(),
+            },
+            format!(
+                "この環境では tako が自動インストールを代行できません（{}）。\n\
+                 次のコマンドを自分で実行してから `tako setup` をやり直してください:\n  {}",
+                "linux", INSTALL_CMD,
+            ),
+        ),
+        (
+            S::NoDownloader,
+            "curl も wget も見つかりません。どちらかを導入してから再実行してください\n\
+             （macOS なら通常 curl が標準で入っています）"
+                .into(),
+        ),
+        (
+            S::InstallerToolSpawn {
+                program: "/usr/bin/curl".into(),
+                error: e(),
+            },
+            format!("{} を起動できません: {enoent}", "/usr/bin/curl"),
+        ),
+        (
+            S::InstallerFetchFailed {
+                url: INSTALL_URL.into(),
+                detail: FetchDetail::Stderr("curl: (6) Could not resolve host: claude.ai".into()),
+            },
+            old_fetch_failed("（curl: (6) Could not resolve host: claude.ai）"),
+        ),
+        (
+            S::InstallerFetchFailed {
+                url: INSTALL_URL.into(),
+                detail: FetchDetail::Exit {
+                    program: "/usr/bin/curl".into(),
+                    code: 22,
+                },
+            },
+            old_fetch_failed(&format!("（{} が exit {}）", "/usr/bin/curl", 22)),
+        ),
+        (
+            S::InstallerUnreadable(e()),
+            format!("取得したインストーラを読めません: {enoent}"),
+        ),
+        (
+            S::NotAnInstaller {
+                url: INSTALL_URL.into(),
+            },
+            format!(
+                "取得した内容がインストーラではありません（{} が HTML かエラーページを返しています）。\n\
+                 社内プロキシやネットワーク制限が疑われます。ブラウザで {} を開いて中身を確認するか、\n\
+                 ネットワークを変えて再実行してください",
+                INSTALL_URL, INSTALL_URL
+            ),
+        ),
+        (
+            S::InstallerOutOfMemory {
+                log: "  Killed \n".into(),
+            },
+            format!(
+                "インストールがメモリ不足で中断されました（exit 137）。\
+                 空きメモリを増やしてから再実行してください{}",
+                "\nKilled"
+            ),
+        ),
+        (
+            S::InstallerKilled {
+                code: 143,
+                log: String::new(),
+            },
+            format!(
+                "インストールが途中で強制終了しました（exit {}）。\
+                 もう一度実行するか、上に出ているメッセージを確認してください{}",
+                143, ""
+            ),
+        ),
+        (
+            S::InstallerFailed {
+                product: "Codex CLI".into(),
+                code: 1,
+                troubleshoot_url: "https://learn.chatgpt.com/docs/codex/cli".into(),
+                log: "error: x\n".into(),
+            },
+            format!(
+                "{} のインストーラが失敗しました（exit {}）。上に出ているエラーを確認してください。\
+                 解決しない場合は {} を参照してください{}",
+                "Codex CLI", 1, "https://learn.chatgpt.com/docs/codex/cli", "\nerror: x"
+            ),
+        ),
+        (
+            S::InstalledButMissing {
+                launcher: "~/.local/bin/claude".into(),
+                command: INSTALL_CMD.into(),
+            },
+            format!(
+                "インストーラは正常終了しましたが {} が見つかりません。\n\
+                 `{}` を手で実行して、出力に出るエラーを確認してください",
+                "~/.local/bin/claude", INSTALL_CMD
+            ),
+        ),
+        (
+            S::ShellProfileUnknown {
+                shell: "/usr/bin/false".into(),
+                dirs: vec!["~/.local/bin".into()],
+            },
+            format!(
+                "使っているシェル（{}）の設定ファイルが分かりません。\n\
+                 次の {} 行をご自身のシェルの設定ファイルへ追加してください:\n{}",
+                "/usr/bin/false", 1, "  export PATH=\"~/.local/bin:$PATH\""
+            ),
+        ),
+        (
+            S::ShellProfileUnknown {
+                shell: String::new(),
+                dirs: vec!["~/.local/bin".into(), "/opt/tako/bin".into()],
+            },
+            format!(
+                "使っているシェル（{}）の設定ファイルが分かりません。\n\
+                 次の {} 行をご自身のシェルの設定ファイルへ追加してください:\n{}",
+                "不明",
+                2,
+                "  export PATH=\"~/.local/bin:$PATH\"\n  export PATH=\"/opt/tako/bin:$PATH\""
+            ),
+        ),
+        (
+            S::ShellProfileUnknownForUndo,
+            "使っているシェルの設定ファイルが分かりません".into(),
+        ),
+        (
+            S::UserPathNotReflected {
+                dir: "~\\.local\\bin".into(),
+            },
+            format!(
+                "ユーザー PATH へ {} を追加できませんでした（書き込み後も反映されていません）。\n\
+                 設定 → システム → バージョン情報 → 環境変数 から手で追加してください",
+                "~\\.local\\bin"
+            ),
+        ),
+        (
+            S::PathBlock(PathBlockError::Write {
+                path: "/h/.zprofile".into(),
+                error: e(),
+            }),
+            format!("{} へ書けません: {enoent}", "/h/.zprofile"),
+        ),
+        (
+            S::CliLink(LinkError::Remove {
+                path: "/h/.local/bin/tako".into(),
+                error: e(),
+            }),
+            format!("{} を削除できません: {enoent}", "/h/.local/bin/tako"),
+        ),
+        (
+            S::UserPath(UserPathError::Unsupported),
+            "このプラットフォームにはプロセス外に永続する PATH がありません（profile 経路を使ってください）"
+                .into(),
+        ),
+    ]
+}
+
+/// 見本の公式インストーラ（取得元と 1 行）
+const INSTALL_URL: &str = "https://claude.ai/install.sh";
+const INSTALL_CMD: &str = "curl -fsSL https://claude.ai/install.sh | bash";
+
+/// #2365 より前の `fetch_installer` の取得失敗の文（`detail` は括弧つきの添え書き）
+fn old_fetch_failed(detail: &str) -> String {
+    format!(
+        "インストーラを取得できませんでした: {}\n\
+         {}\n\
+         ネットワーク接続とプロキシ設定を確認してから再実行してください。\n\
+         社内プロキシ環境では {} へのアクセス許可が要ることがあります",
+        INSTALL_URL, detail, INSTALL_URL,
+    )
+}
+
+/// tako-core の profile の PATH ブロックの断りの見本と、#2365 より前の `shell_profile` の固定文
+fn path_block_table() -> Vec<(PathBlockError, String)> {
+    let enoent = "No such file or directory (os error 2)";
+    let p = "/h/.zprofile";
+    vec![
+        (
+            PathBlockError::NoDirs,
+            "PATH へ通すディレクトリが 1 つもありません".into(),
+        ),
+        (
+            PathBlockError::Read {
+                path: p.into(),
+                error: enoent.into(),
+            },
+            format!("{} を読めません: {enoent}", p),
+        ),
+        (
+            PathBlockError::CreateDir {
+                path: "/h".into(),
+                error: enoent.into(),
+            },
+            format!("{} を作成できません: {enoent}", "/h"),
+        ),
+        (
+            PathBlockError::Write {
+                path: p.into(),
+                error: enoent.into(),
+            },
+            format!("{} へ書けません: {enoent}", p),
+        ),
+    ]
+}
+
+/// tako CLI の symlink の断りの見本と、#2365 より前の `tako_cli_path` の固定文（Windows だけの
+/// `SymlinkUnsupported` は、io::Error に包んだ文を「作成できません」が包んでいた形のまま）
+fn link_error_table() -> Vec<(LinkError, String)> {
+    let enoent = "No such file or directory (os error 2)";
+    let l = "/h/.local/bin/tako";
+    vec![
+        (
+            LinkError::Create {
+                path: l.into(),
+                error: enoent.into(),
+            },
+            format!("{} を作成できません: {enoent}", l),
+        ),
+        (
+            LinkError::Replace {
+                path: l.into(),
+                error: enoent.into(),
+            },
+            format!("{} を置き換えられません: {enoent}", l),
+        ),
+        (
+            LinkError::Remove {
+                path: l.into(),
+                error: enoent.into(),
+            },
+            format!("{} を削除できません: {enoent}", l),
+        ),
+        (
+            LinkError::SymlinkUnsupported {
+                path: "C:\\Users\\winuser\\.local\\bin\\tako".into(),
+            },
+            format!(
+                "{} を作成できません: {}",
+                "C:\\Users\\winuser\\.local\\bin\\tako",
+                format!(
+                    "{} への symlink はこの OS では張れません（ユーザー環境変数 Path を使います）",
+                    "C:\\Users\\winuser\\.local\\bin\\tako"
+                )
+            ),
+        ),
+    ]
+}
+
+/// Windows のユーザー PATH の断りの見本と、#2365 より前の `user_path` の固定文
+fn user_path_table() -> Vec<(UserPathError, String)> {
+    vec![
+        (
+            UserPathError::Unsupported,
+            "このプラットフォームにはプロセス外に永続する PATH がありません（profile 経路を使ってください）"
+                .into(),
+        ),
+        (
+            UserPathError::Spawn {
+                program: "powershell.exe".into(),
+                error: "Access is denied. (os error 5)".into(),
+            },
+            format!(
+                "{} を起動できません: {}",
+                "powershell.exe", "Access is denied. (os error 5)"
+            ),
+        ),
+        (
+            UserPathError::Failed {
+                code: 1,
+                stderr: "Access is denied.".into(),
+            },
+            format!(
+                "PowerShell がユーザー PATH の操作に失敗しました（exit {}）: {}",
+                1, "Access is denied."
+            ),
+        ),
+        (
+            UserPathError::BadOutput {
+                output: "TAKO_KIND=ExpandString".into(),
+            },
+            format!(
+                "ユーザー PATH の読み出し結果を解釈できません: {:?}",
+                "TAKO_KIND=ExpandString"
+            ),
+        ),
     ]
 }
 
@@ -10658,6 +11018,80 @@ fn setup系の断りは全バリアントが日英を持ち日本語は2365よ�
         let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
         check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
     }
+
+    // bootstrap の path / undo-path の中身（tako-core の 3 型）
+    let table = path_block_table();
+    covers_every(
+        &table.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        path_block_index,
+        PATH_BLOCK_VARIANTS,
+        "PathBlockError",
+    );
+    for (e, old) in &table {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                SHELL_PROFILE_SRC,
+                SHELL_PROFILE_PATH,
+                "impl PathBlockError {",
+                &debug,
+                lang,
+            )
+        };
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+        if e.clone().into_ja() != ja {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+    let table = link_error_table();
+    covers_every(
+        &table.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        link_error_index,
+        LINK_ERROR_VARIANTS,
+        "LinkError",
+    );
+    for (e, old) in &table {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                TAKO_CLI_PATH_SRC,
+                TAKO_CLI_PATH_PATH,
+                "impl LinkError {",
+                &debug,
+                lang,
+            )
+        };
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+        if e.clone().into_ja() != ja {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+    let table = user_path_table();
+    covers_every(
+        &table.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        user_path_index,
+        USER_PATH_VARIANTS,
+        "UserPathError",
+    );
+    for (e, old) in &table {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                USER_PATH_SRC,
+                USER_PATH_PATH,
+                "impl UserPathError {",
+                &debug,
+                lang,
+            )
+        };
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+        if e.clone().into_ja() != ja {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
     report_all(failures);
 }
 
@@ -10716,6 +11150,78 @@ fn setup系の断りの包みと載せ方() {
     let typed = answers.validate_typed().expect_err("power の値が不正");
     assert_eq!(typed, SetupRefusal::SleepPower("battery".into()));
     assert_eq!(answers.validate().expect_err("同じ断り"), typed.into_ja());
+
+    // bootstrap: 中身の型（tako-core）を包む断りは中身と同じ言語で組む・インストーラの出力の添え方
+    // （空なら添えない）・従来の口（tako-core の `String` の口）は日本語
+    let block = PathBlockError::NoDirs;
+    let link = LinkError::SymlinkUnsupported {
+        path: "C:\\x".into(),
+    };
+    let user = UserPathError::Failed {
+        code: 1,
+        stderr: "e".into(),
+    };
+    for lang in [Lang::Ja, Lang::En] {
+        assert_eq!(
+            SetupRefusal::from(block.clone()).text_in(lang),
+            block.text_in(lang)
+        );
+        assert_eq!(
+            SetupRefusal::from(link.clone()).text_in(lang),
+            link.text_in(lang)
+        );
+        assert_eq!(
+            SetupRefusal::from(user.clone()).text_in(lang),
+            user.text_in(lang)
+        );
+        for quiet in [
+            SetupRefusal::InstallerOutOfMemory { log: " \n".into() },
+            SetupRefusal::InstallerKilled {
+                code: 130,
+                log: String::new(),
+            },
+        ] {
+            let text = quiet.text_in(lang);
+            assert!(!text.contains('\n'), "{text:?}");
+        }
+    }
+    // 英語の「1 行 / N 行」
+    let one = SetupRefusal::ShellProfileUnknown {
+        shell: String::new(),
+        dirs: vec!["~/.local/bin".into()],
+    };
+    assert!(one
+        .text_in(Lang::En)
+        .contains("(unknown) uses.\nAdd the following line to"));
+    // 従来の口（tako-core）: 日本語の文
+    let home = std::env::temp_dir().join(format!("tako-2365b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("一時の HOME");
+    assert_eq!(
+        tako_core::shell_profile::ensure_dirs_on_path_in(
+            &home,
+            tako_core::shell_profile::ShellKind::Zsh,
+            &[],
+            None
+        )
+        .expect_err("空は断る"),
+        block.text_in(Lang::Ja)
+    );
+    assert_eq!(
+        tako_core::shell_profile::ensure_dirs_on_path_in_typed(
+            &home,
+            tako_core::shell_profile::ShellKind::Zsh,
+            &[],
+            None
+        )
+        .expect_err("空は断る"),
+        PathBlockError::NoDirs
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    assert_eq!(
+        tako_core::platform::user_path::parse_read_output("x").expect_err("目印が無い"),
+        UserPathError::BadOutput { output: "x".into() }.text_in(Lang::Ja)
+    );
 }
 
 /// 型の口の本体（断りの文は `SetupRefusal` / `AgentMcpError` / `ConfigError` にだけ置く）
@@ -10832,7 +11338,130 @@ const SETUP_REFUSAL_SCOPES: &[(&str, &str, Span)] = &[
         SETUP_BOOTSTRAP_SRC,
         Span::Item("pub fn handoff_plan_for_typed("),
     ),
+    // bootstrap の install / path / undo-path（BOOTSTRAP_TYPED_HEADS）と中身の tako-core の 3 型
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("pub fn install_for_typed("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("fn fetch_installer("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("fn run_installer("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("fn ensure_tako_cli_link("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("fn ensure_dirs_on_path("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("pub fn ensure_path_for_typed("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("fn ensure_user_path("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("fn ensure_user_path_dirs("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("pub fn undo_path_for_typed("),
+    ),
+    (
+        SETUP_BOOTSTRAP_PATH,
+        SETUP_BOOTSTRAP_SRC,
+        Span::Item("fn undo_user_path("),
+    ),
+    // tako-core はファイルの本体ごと（Windows の `imp` も字面で見る）
+    (SHELL_PROFILE_PATH, SHELL_PROFILE_SRC, Span::Whole),
+    (TAKO_CLI_PATH_PATH, TAKO_CLI_PATH_SRC, Span::Whole),
+    (USER_PATH_PATH, USER_PATH_SRC, Span::Whole),
 ];
+
+/// bootstrap の install / path / undo-path の型の口の本体（dispatch から下の段）
+const BOOTSTRAP_TYPED_HEADS: [&str; 10] = [
+    "pub fn install_for_typed(",
+    "fn fetch_installer(",
+    "fn run_installer(",
+    "fn ensure_tako_cli_link(",
+    "fn ensure_dirs_on_path(",
+    "pub fn ensure_path_for_typed(",
+    "fn ensure_user_path(",
+    "fn ensure_user_path_dirs(",
+    "pub fn undo_path_for_typed(",
+    "fn undo_user_path(",
+];
+
+/// 型の口の本体が呼んではいけない口（tako-core と setup_bootstrap の `String` を返す日本語の口・
+/// 型を日本語の文へ戻す `into_ja` / `Lang::Ja`）。呼ぶと中身だけ日本語のまま型の口を通り抜ける
+const JA_BOOTSTRAP_INNER_CALLS: [&str; 12] = [
+    "shell_profile::ensure_dirs_on_path_in(",
+    "shell_profile::ensure_dir_on_path_in(",
+    "shell_profile::remove_from_profile_in(",
+    "tako_cli_path::ensure_link(",
+    "tako_cli_path::remove_link(",
+    "user_path::read()",
+    "user_path::write(",
+    "install_plan_for(",
+    "home_dir()",
+    "into_ja",
+    "Lang::Ja",
+    "parse_read_output(",
+];
+
+/// 型の口の本体で、日本語の口を呼んで断りに載せている行（断りを捨てる文は見ない）
+fn ja_bootstrap_inner_calls(lines: &[(usize, &str)]) -> Vec<(usize, &'static str, String)> {
+    let mut out = Vec::new();
+    for (i, (line, code)) in lines.iter().enumerate() {
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        if let Some(call) = JA_BOOTSTRAP_INNER_CALLS.iter().find(|c| code.contains(*c)) {
+            if !statement_discards_error(lines, i) {
+                out.push((*line, *call, code.trim().to_string()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn bootstrap_の型の口は中身の日本語の口を呼ばない() {
+    let mut failures = Vec::new();
+    for head in BOOTSTRAP_TYPED_HEADS {
+        let Some(lines) = front_scope_lines(SETUP_BOOTSTRAP_SRC, Some(head)) else {
+            failures.push(format!(
+                "{SETUP_BOOTSTRAP_PATH}: 走査の範囲 `{head}` が見つからない\
+                 （改名で番犬が空振りする。BOOTSTRAP_TYPED_HEADS を直す）"
+            ));
+            continue;
+        };
+        for (line, call, code) in ja_bootstrap_inner_calls(&lines) {
+            failures.push(format!(
+                "{SETUP_BOOTSTRAP_PATH}:{line}: 型の口が日本語の口 `{call}` を呼んでいる = 英語表示でも \
+                 中身だけ日本語で混ざる（tako-core の `*_typed` を呼び、SetupRefusal の包みで載せる）: {code}"
+            ));
+        }
+    }
+    report_all(failures);
+}
 
 #[test]
 fn setup系の型の口の断りに日本語の固定文が無い() {
@@ -10856,16 +11485,17 @@ fn setup系の型の口の断りに日本語の固定文が無い() {
 }
 
 /// dispatch が呼んではいけない日本語の口（型の口 `*_typed` の外側）。`setup_mcp(&` は claude への
-/// MCP 登録の日本語の口（定義の行 `pub fn setup_mcp(tako_binary` には当たらない）。
-/// bootstrap の install / path / undo-path は中身（インストーラ・`shell_profile` / `tako_cli_path` /
-/// `user_path`）と一緒に次のスライスで移す（#2365 のコメントの表）
-const JA_SETUP_CALLS: [&str; 11] = [
+/// MCP 登録の日本語の口（定義の行 `pub fn setup_mcp(tako_binary` には当たらない）
+const JA_SETUP_CALLS: [&str; 14] = [
     "setup_mcp(&",
     "setup::changes_status()",
     "setup::load_config()",
     "setup_bootstrap::parse_agent(",
     "setup_bootstrap::status_for(",
     "setup_bootstrap::handoff_plan_for(",
+    "setup_bootstrap::install_for(",
+    "setup_bootstrap::ensure_path_for(",
+    "setup_bootstrap::undo_path_for(",
     "setup_deps::install(",
     "agents_sync::run_sync(",
     "agents_sync::status()",
@@ -10972,4 +11602,31 @@ pub fn setup_mcp(tako_binary: &str) -> Result<(), String> {
     assert!(ja_setup_calls(&f).is_empty(), "定義の行は呼び出しではない");
     let found: Vec<usize> = refusal_japanese(&f).into_iter().map(|(l, _)| l).collect();
     assert_eq!(found, vec![10], "型の中へ書き戻した日本語を名指す");
+
+    // bootstrap の型の口: 範囲が引け、中身の日本語の口の呼び足しを名指し、捨てる文とコメントは見逃す
+    for head in BOOTSTRAP_TYPED_HEADS {
+        assert!(
+            front_scope_lines(SETUP_BOOTSTRAP_SRC, Some(head)).is_some(),
+            "{head} の範囲を引けない"
+        );
+    }
+    assert!(
+        has("crate::setup_bootstrap::install_for_typed("),
+        "bootstrap の install は dispatch の範囲の中"
+    );
+    let src = r#"fn ensure_dirs_on_path(home: &Path) -> Result<Value, SetupRefusal> {
+    // shell_profile::ensure_dirs_on_path_in(home) はコメント
+    let a = shell_profile::ensure_dirs_on_path_in(home, shell, dirs, None).map_err(|e| SetupRefusal::InstallerUnreadable(e))?;
+    let on = user_path::read().map(|v| v.raw).unwrap_or_default();
+    let b = shell_profile::ensure_dirs_on_path_in_typed(home, shell, dirs, None)?;
+    let c = tako_cli_path::remove_link_typed(link).map_err(LinkError::into_ja);
+    let d = install_plan_for(agent)?;
+}
+"#;
+    let d = front_scope_lines(src, Some("fn ensure_dirs_on_path(")).expect("頭を引ける");
+    let found: Vec<usize> = ja_bootstrap_inner_calls(&d)
+        .into_iter()
+        .map(|(l, _, _)| l)
+        .collect();
+    assert_eq!(found, vec![3, 6, 7], "日本語の口の 3 か所だけを名指す");
 }

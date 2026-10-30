@@ -414,15 +414,34 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   理由だけ英語 = 静的既定）。子の `tako setup` の出力（`SetupFailed` の中身）は setup の枠なので日本語のまま
   （外部コマンドの出力と同じ扱い）。「見つかりません」系（正本ファイル・導入後のコマンド）は日本語が
   「見つからない」を含まないので英語も ` not found` を含めない（`CliNotFound` は含める）。`Ok` の文（依存の
-  `skipped` の detail・子の打ち切りの `note`・同期の未設定の `message`）は対象外。**bootstrap の install（インストーラの
-  取得・実行）/ path / undo-path は中身（tako-core の `shell_profile` / `tako_cli_path` / `user_path`）と一緒に次の
-  スライス**（dispatch はまだ日本語の口 `install_for` / `ensure_path_for` / `undo_path_for` を呼ぶ）。番犬は同じ
+  `skipped` の detail・子の打ち切りの `note`・同期の未設定の `message`）は対象外。番犬は同じ
   `issue1762_dispatch_error_lang.rs` の末尾の節（2 つの型の表・「見つからない」の読みが日英で同じ・型の口の本体の
   断りの組み立ての日本語の固定文 `SETUP_REFUSAL_SCOPES`・dispatch の setup 系の分岐が日本語の口を呼んでいないか
   `JA_SETUP_CALLS`）、実経路は `tests/issue2365_setup_lang.rs`（unix。`HOME` / data dir / orchestrator dir を一時へ・
   `PATH` を空・`SHELL` を `/usr/bin/false` にして claude / codex / agy / brew を引けなくし（引けたら止まる）、壊れた
   `~/.claude.json` / フォルダの `~/.claude.json` / 壊れた config.yaml / 無い・空の正本 / `HOME` を外す注入で断らせ、
   GUI 無しのホストへ dispatch を日英で通す。answers が通る形は叩かない = 子の `tako setup` を起こさない）
+- #2365 の続きで、**`tako_setup_bootstrap` の install / path / undo-path の断り**を中身ごと移した: インストーラの
+  取得と実行（`install_for_typed` → `fetch_installer` / `run_installer`。セルフテスト中・代行できない環境・取得手段が
+  無い / 起動できない・取得の失敗（取得手段の stderr か終了コードを `FetchDetail` で添える）・中身がインストーラでない・
+  終了コード 137 / 128 以上 / その他・入ったのに引けない）と PATH 通し（`ensure_path_for_typed` / `undo_path_for_typed` →
+  `ensure_dirs_on_path` / `ensure_user_path_dirs`。シェルの設定ファイルが分からない（unix では届かない = 種別の
+  分からない `$SHELL` も zsh と見なす `shell_target`。表で見る）・Windows のユーザー PATH へ書いても入らない）は `SetupRefusal` の 17 種、中身の tako-core の断りは `shell_profile::PathBlockError`（profile の PATH
+  ブロック）・`tako_cli_path::LinkError`（tako CLI の symlink。Windows だけの「symlink を張れない」も `cfg` の外）・
+  `platform::user_path::UserPathError`（Windows の PowerShell の起動・失敗・出力の解釈と、unix の非対応）で、
+  `SetupRefusal` は包むだけ（`PathBlock` / `CliLink` / `UserPath`）。tako-core の口も `*_typed`（`ensure_dirs_on_path_in_typed` /
+  `remove_from_profile_in_typed` / `ensure_link_typed` / `remove_link_typed` / `read_typed` / `write_typed` /
+  `parse_read_output_typed`）を足し、**`String` を返す従来の口は日本語のまま**（CLI の `tako setup bootstrap` と
+  `tako setup` の段・起動時の symlink の張り直し `repair_dangling`）。型の口の本体は tako-core の日本語の口・`into_ja` /
+  `Lang::Ja` を呼ばない（番犬 `bootstrap_の型の口は中身の日本語の口を呼ばない` = `BOOTSTRAP_TYPED_HEADS` /
+  `JA_BOOTSTRAP_INNER_CALLS`）。インストーラ・取得手段の出力と OS のエラー文は言語に依らずそのまま載せる。
+  「見つかりません」（取得手段・入ったのに引けない）は日本語が「見つからない」を含まないので英語も ` not found` を
+  含めない（`cannot be located`）。応答の注記（`Ok` の `note`）は対象外。実経路は `tests/issue2365_bootstrap_lang.rs`
+  （unix。`HOME` / data / orchestrator / `CLAUDE_CONFIG_DIR` / `TMPDIR` を一時へ・`PATH` を空・`SHELL` は
+  `command -v` に砂場の偽物だけを答える偽のログインシェル（名前で profile の種別が決まる）にし、**本物のインストーラを
+  取らない・走らせない**: 取得は偽の curl（HTML / 偽のインストーラを書くか失敗する）、実行は偽の bash / sh（取得物を
+  読まずに終了コードだけ返す）。フォルダの `.zprofile`・書けないホーム・`HOME` を外す注入で断らせ、GUI 無しのホストへ
+  dispatch を日英で通す。最初に claude / codex / agy / brew / curl / wget / bash / sh を引けないことを確かめる）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

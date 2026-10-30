@@ -11764,7 +11764,7 @@ fn dispatch_inner(
                     .map_err(SetupRefusal::operation),
                 // 3 系統ぶんを一度に（`tako setup --check` と同じ材料。#989）
                 "status-all" => Ok(crate::setup_bootstrap::status_all_json()),
-                "install" => crate::setup_bootstrap::install_for(
+                "install" => crate::setup_bootstrap::install_for_typed(
                     target,
                     crate::setup_bootstrap::InstallOptions {
                         dry_run: dry_run.unwrap_or(false),
@@ -11772,12 +11772,11 @@ fn dispatch_inner(
                         interactive: false,
                     },
                 )
-                .map_err(DispatchError::Operation),
-                "path" => crate::setup_bootstrap::ensure_path_for(target)
-                    .map_err(DispatchError::Operation),
-                "undo-path" => {
-                    crate::setup_bootstrap::undo_path_for(target).map_err(DispatchError::Operation)
-                }
+                .map_err(SetupRefusal::operation),
+                "path" => crate::setup_bootstrap::ensure_path_for_typed(target)
+                    .map_err(SetupRefusal::operation),
+                "undo-path" => crate::setup_bootstrap::undo_path_for_typed(target)
+                    .map_err(SetupRefusal::operation),
                 // 自動導入が通らないときの引き継ぎ計画（#1057。**読み取り専用**）。
                 // 実際に相手を起こすのは端末を持つ側（CLI）か、AI なら
                 // `tako_orchestrator_spawn` / `tako_run` の仕事
