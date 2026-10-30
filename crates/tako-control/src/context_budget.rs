@@ -470,6 +470,8 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
     let mut total_tokens = 0usize;
     let mut violations = 0usize;
     let mut fixable = 0usize;
+    // #1715: 復活・重複は `violations` に含めつつ別にも数える（直し方が違う）
+    let mut revived_entries = 0usize;
     let mut proposals: Vec<Value> = Vec::new();
 
     let items_json: Vec<Value> = items
@@ -516,6 +518,7 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
             let (archive_label, revived) = progress_revivals(it);
             for r in &revived {
                 violations += 1;
+                revived_entries += 1;
                 let v = r.violation();
                 proposals.push(json!({
                     "path": format!("{}:{}", it.label, r.line),
@@ -546,7 +549,7 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
         }));
     }
 
-    Ok(json!({
+    let mut out = json!({
         "cwd": display_path(cwd),
         "profile": profile.unwrap_or("default"),
         "items": items_json,
@@ -557,11 +560,16 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
         },
         "violations": violations,
         "fixable": fixable,
+        "revived_entries": revived_entries,
         "proposals": proposals,
         "budget": budget_json(),
         "fix_command": "tako context-budget fix",
         "ok": violations == 0,
-    }))
+    });
+    // #1715: `tako master` / `tako setup` の起動前 1 行と同じものを応答にも載せる
+    // （CLI の表示・MCP の応答・起動前の 1 行がこの 1 か所から出る）
+    out["startup_line"] = json!(startup_line_in(&out, tako_core::i18n::lang()));
+    Ok(out)
 }
 
 /// 予算表そのもの（規約文との一致をテストで固定するため応答にも載せる）
@@ -693,49 +701,112 @@ pub fn fix(cwd: &Path, profile: Option<&str>, dry_run: bool) -> Result<Value, St
 /// `tako setup` / `tako master` が出す 1 行（#322 の最簡形）。
 /// 超過が無ければ `None`（黙って素通りする）。
 ///
+/// 実体は `report` の応答の `startup_line`（#1715）。CLI `tako context-budget` の
+/// 表示と MCP `tako_context_budget` の応答も同じ 1 行を出す
+pub fn startup_line(cwd: &Path, profile: Option<&str>) -> Option<String> {
+    let r = report(cwd, profile).ok()?;
+    r["startup_line"].as_str().map(str::to_string)
+}
+
+/// 棚卸しの結果から起動前の 1 行を組む（言語を明示する純粋関数）。
+///
 /// #1154: **自動で直せるものが 1 件も無いときに `fix` を案内しない**
 /// （`fix` は作業ログの移送しかできないので、system prompt が超えているときに
 /// 「いま直す: fix（自動で直せる 0 件）」を出すのは嘘の案内になる）。
-/// その場合は代わりに**何が超えているか**を 1 行で名指しする
-pub fn startup_line(cwd: &Path, profile: Option<&str>) -> Option<String> {
-    let r = report(cwd, profile).ok()?;
+/// その場合は代わりに**何が超えているか**を 1 行で名指しする。
+///
+/// #1715: **予算超過と作業ログの復活・重複（`revived_entries`）を言い分ける**。
+/// 直し方が違う（前者は `fix` で直る / 後者は `fix` では直らず、main から 2 ファイルを
+/// 戻して自分の 1 件だけ書き直す）ので、復活は予算超過の件数に混ぜず別の文で名指しする
+fn startup_line_in(r: &Value, lang: tako_core::i18n::Lang) -> Option<String> {
     let violations = r["violations"].as_u64().unwrap_or(0);
     if violations == 0 {
         return None;
     }
+    let revived = r["revived_entries"].as_u64().unwrap_or(0);
+    let over = violations.saturating_sub(revived);
     let tokens = r["totals"]["est_tokens"].as_u64().unwrap_or(0);
     let fixable = r["fixable"].as_u64().unwrap_or(0);
-    if fixable > 0 {
-        return Some(match tako_core::i18n::lang() {
-            tako_core::i18n::Lang::Ja => format!(
-                "起動時ロードが予算超過: {violations} 件（概算 {tokens} トークン）。\
-                 いま直す: tako context-budget fix（自動で直せる {fixable} 件）",
+    let ja = lang == tako_core::i18n::Lang::Ja;
+
+    let mut parts: Vec<String> = Vec::new();
+    // 末尾の「内訳の引き方」。自動で直せるものだけなら `fix` の案内で足りるので付けない
+    let mut tail: Option<&str> = None;
+    if over > 0 {
+        parts.push(if ja {
+            format!("起動時ロードが予算超過: {over} 件（概算 {tokens} トークン）")
+        } else {
+            format!("Startup load is over budget: {over} item(s) (~{tokens} tokens)")
+        });
+        if fixable > 0 {
+            parts.push(if ja {
+                format!("いま直す: tako context-budget fix（自動で直せる {fixable} 件）")
+            } else {
+                format!("Fix now: tako context-budget fix ({fixable} auto-fixable)")
+            });
+        } else {
+            parts.extend(worst_proposal(r));
+            tail = Some(if ja {
+                "内訳: tako context-budget"
+            } else {
+                "Breakdown: tako context-budget"
+            });
+        }
+    }
+    if revived > 0 {
+        // どこに戻ったかを 1 か所名指しする（全件は `tako context-budget` が出す）
+        let first = first_revival(r).unwrap_or("?");
+        let at = match (revived > 1, ja) {
+            (false, _) => first.to_string(),
+            (true, true) => format!("{first} ほか"),
+            (true, false) => format!("{first} and more"),
+        };
+        parts.push(match (over > 0, ja) {
+            (false, true) => format!(
+                "作業ログに rebase で戻った・重複したエントリ: {revived} 件（{at}。fix では直らない）"
             ),
-            tako_core::i18n::Lang::En => format!(
-                "Startup load is over budget: {violations} item(s) (~{tokens} tokens). \
-                 Fix now: tako context-budget fix ({fixable} auto-fixable)",
+            (true, true) => format!(
+                "ほかに作業ログに rebase で戻った・重複したエントリ: {revived} 件（{at}。fix では直らない）"
+            ),
+            (false, false) => format!(
+                "Work log entries revived or duplicated by a rebase: {revived} ({at}; fix cannot repair them)"
+            ),
+            (true, false) => format!(
+                "Also, work log entries revived or duplicated by a rebase: {revived} ({at}; fix cannot repair them)"
             ),
         });
+        tail = Some(match (over > 0, ja) {
+            (false, true) => "直し方: tako context-budget",
+            (true, true) => "内訳と直し方: tako context-budget",
+            (false, false) => "How to fix: tako context-budget",
+            (true, false) => "Breakdown and how to fix: tako context-budget",
+        });
     }
-    let worst = worst_proposal(&r);
-    Some(match tako_core::i18n::lang() {
-        tako_core::i18n::Lang::Ja => format!(
-            "起動時ロードが予算超過: {violations} 件（概算 {tokens} トークン）。{worst}\
-             内訳: tako context-budget",
-        ),
-        tako_core::i18n::Lang::En => format!(
-            "Startup load is over budget: {violations} item(s) (~{tokens} tokens). {worst}\
-             Breakdown: tako context-budget",
-        ),
-    })
+    parts.extend(tail.map(str::to_string));
+    Some(parts.join(if ja { "。" } else { ". " }))
+}
+
+/// 復活・重複の最初の 1 件の `file:line`（`report` の提案から）
+fn first_revival(report: &Value) -> Option<&str> {
+    report["proposals"]
+        .as_array()?
+        .iter()
+        .find(|p| p["metric"] == budget::Metric::RevivedEntries.as_str())
+        .and_then(|p| p["path"].as_str())
 }
 
 /// 1 行で名指しする対象。**master 自身の system prompt を優先する**
 /// （`tako master` はこれからその prompt を渡すところで、master 自身は
-/// 自分の prompt の大きさを他の手段では知れない）。無ければ超過分が最大のもの
-fn worst_proposal(report: &Value) -> String {
+/// 自分の prompt の大きさを他の手段では知れない）。無ければ超過分が最大のもの。
+/// 作業ログの復活・重複は予算超過ではないので選ばない（#1715。別の文で名指しする）
+fn worst_proposal(report: &Value) -> Option<String> {
     let empty = vec![];
-    let proposals = report["proposals"].as_array().unwrap_or(&empty);
+    let proposals: Vec<&Value> = report["proposals"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter(|p| p["metric"] != budget::Metric::RevivedEntries.as_str())
+        .collect();
     let over = |p: &Value| {
         p["actual"]
             .as_u64()
@@ -753,17 +824,15 @@ fn worst_proposal(report: &Value) -> String {
         .iter()
         .filter(|p| prompt_paths.contains(&p["path"].as_str().unwrap_or_default()))
         .max_by_key(|p| over(p))
-        .or_else(|| proposals.iter().max_by_key(|p| over(p)));
-    match pick {
-        Some(p) => format!(
-            "{}: {} {} > {}。",
-            p["path"].as_str().unwrap_or("?"),
-            p["metric"].as_str().unwrap_or("?"),
-            p["actual"].as_u64().unwrap_or(0),
-            p["limit"].as_u64().unwrap_or(0),
-        ),
-        None => String::new(),
-    }
+        .or_else(|| proposals.iter().max_by_key(|p| over(p)))?;
+    // 句点は組む側が言語で選ぶ（英語の 1 行に和文の句点が混ざっていた。#1715）
+    Some(format!(
+        "{}: {} {} > {}",
+        pick["path"].as_str().unwrap_or("?"),
+        pick["metric"].as_str().unwrap_or("?"),
+        pick["actual"].as_u64().unwrap_or(0),
+        pick["limit"].as_u64().unwrap_or(0),
+    ))
 }
 
 #[cfg(test)]
@@ -874,10 +943,10 @@ mod tests {
                 { "path": "master system prompt（p）", "metric": "bytes", "actual": 30000, "limit": 24576 },
             ],
         });
-        let line = worst_proposal(&report);
-        assert!(
-            line.starts_with("master system prompt（p）: bytes 30000 > 24576"),
-            "master 自身の prompt を優先して名指しする: {line}"
+        let line = worst_proposal(&report).unwrap();
+        assert_eq!(
+            line, "master system prompt（p）: bytes 30000 > 24576",
+            "master 自身の prompt を優先して名指しする"
         );
 
         // system prompt が超えていなければ超過分が最大のものを名指しする
@@ -888,10 +957,134 @@ mod tests {
                 { "path": "~/.claude/CLAUDE.md", "metric": "bytes", "actual": 90000, "limit": 24576 },
             ],
         });
-        assert!(worst_proposal(&report).starts_with("~/.claude/CLAUDE.md: bytes 90000 > 24576"));
+        assert_eq!(
+            worst_proposal(&report).unwrap(),
+            "~/.claude/CLAUDE.md: bytes 90000 > 24576"
+        );
 
         // 提案が無ければ黙る（1 行に余計な句読点を出さない）
-        assert_eq!(worst_proposal(&json!({})), "");
+        assert_eq!(worst_proposal(&json!({})), None);
+    }
+
+    /// #1715 の素材: 棚卸しの応答のうち 1 行が読む欄だけを持つ形
+    fn budget_report(over: &[Value], fixable: u64, revived: &[&str]) -> Value {
+        let mut proposals: Vec<Value> = over.to_vec();
+        proposals.extend(revived.iter().map(
+            |path| json!({ "path": path, "metric": "revived_entries", "actual": 1, "limit": 0 }),
+        ));
+        json!({
+            "items": [],
+            "totals": { "est_tokens": 1234 },
+            "violations": over.len() + fixable as usize + revived.len(),
+            "fixable": fixable,
+            "revived_entries": revived.len(),
+            "proposals": proposals,
+        })
+    }
+
+    /// #1715: 復活だけ / 超過だけ / 両方 で文言が変わる（日英とも）。
+    /// 復活は予算超過の件数に混ぜず、`fix` では直らないと言う
+    #[test]
+    fn 起動前の1行は予算超過と作業ログの復活を言い分ける() {
+        use tako_core::i18n::Lang;
+        let lines = |r: &Value| {
+            (
+                startup_line_in(r, Lang::Ja).unwrap(),
+                startup_line_in(r, Lang::En).unwrap(),
+            )
+        };
+
+        // 復活だけ
+        let (ja, en) = lines(&budget_report(&[], 0, &["~/r/.agent/progress.md:12"]));
+        assert_eq!(
+            ja,
+            "作業ログに rebase で戻った・重複したエントリ: 1 件\
+             （~/r/.agent/progress.md:12。fix では直らない）。直し方: tako context-budget"
+        );
+        assert_eq!(
+            en,
+            "Work log entries revived or duplicated by a rebase: 1 \
+             (~/r/.agent/progress.md:12; fix cannot repair them). How to fix: tako context-budget"
+        );
+
+        // 超過だけ（自動で直せる）: #1154 以前からの文言のまま
+        let (ja, en) = lines(&budget_report(&[], 2, &[]));
+        assert_eq!(
+            ja,
+            "起動時ロードが予算超過: 2 件（概算 1234 トークン）。\
+             いま直す: tako context-budget fix（自動で直せる 2 件）"
+        );
+        assert_eq!(
+            en,
+            "Startup load is over budget: 2 item(s) (~1234 tokens). \
+             Fix now: tako context-budget fix (2 auto-fixable)"
+        );
+
+        // 両方（自動で直せる超過 + 復活 2 件）: 超過の件数に復活を混ぜない
+        let (ja, en) = lines(&budget_report(
+            &[],
+            2,
+            &["~/r/.agent/progress.md:30", "~/r/.agent/progress.md:40"],
+        ));
+        assert_eq!(
+            ja,
+            "起動時ロードが予算超過: 2 件（概算 1234 トークン）。\
+             いま直す: tako context-budget fix（自動で直せる 2 件）。\
+             ほかに作業ログに rebase で戻った・重複したエントリ: 2 件\
+             （~/r/.agent/progress.md:30 ほか。fix では直らない）。内訳と直し方: tako context-budget"
+        );
+        assert_eq!(
+            en,
+            "Startup load is over budget: 2 item(s) (~1234 tokens). \
+             Fix now: tako context-budget fix (2 auto-fixable). \
+             Also, work log entries revived or duplicated by a rebase: 2 \
+             (~/r/.agent/progress.md:30 and more; fix cannot repair them). \
+             Breakdown and how to fix: tako context-budget"
+        );
+    }
+
+    /// #1715: 自動で直せない超過と復活が並んだときは、名指しを予算超過の側から選ぶ
+    /// （復活の提案 `actual 1 > limit 0` を「超えているもの」として拾っていた）
+    #[test]
+    fn 自動で直せない超過の名指しに復活を選ばない() {
+        use tako_core::i18n::Lang;
+        let over = json!({ "path": "~/r/.agent/activeContext.md", "metric": "lines", "actual": 92, "limit": 80 });
+        let r = budget_report(
+            std::slice::from_ref(&over),
+            0,
+            &["~/r/.agent/progress.md:12"],
+        );
+        assert_eq!(
+            startup_line_in(&r, Lang::Ja).unwrap(),
+            "起動時ロードが予算超過: 1 件（概算 1234 トークン）。\
+             ~/r/.agent/activeContext.md: lines 92 > 80。\
+             ほかに作業ログに rebase で戻った・重複したエントリ: 1 件\
+             （~/r/.agent/progress.md:12。fix では直らない）。内訳と直し方: tako context-budget"
+        );
+        assert_eq!(
+            startup_line_in(&r, Lang::En).unwrap(),
+            "Startup load is over budget: 1 item(s) (~1234 tokens). \
+             ~/r/.agent/activeContext.md: lines 92 > 80. \
+             Also, work log entries revived or duplicated by a rebase: 1 \
+             (~/r/.agent/progress.md:12; fix cannot repair them). \
+             Breakdown and how to fix: tako context-budget"
+        );
+
+        // 超過だけ（自動で直せない）: 日本語は #1154 の文言のまま。英語は句点だけ直る
+        let r = budget_report(&[over], 0, &[]);
+        assert_eq!(
+            startup_line_in(&r, Lang::Ja).unwrap(),
+            "起動時ロードが予算超過: 1 件（概算 1234 トークン）。\
+             ~/r/.agent/activeContext.md: lines 92 > 80。内訳: tako context-budget"
+        );
+        assert_eq!(
+            startup_line_in(&r, Lang::En).unwrap(),
+            "Startup load is over budget: 1 item(s) (~1234 tokens). \
+             ~/r/.agent/activeContext.md: lines 92 > 80. Breakdown: tako context-budget"
+        );
+
+        // 違反が無ければ黙る
+        assert_eq!(startup_line_in(&budget_report(&[], 0, &[]), Lang::Ja), None);
     }
 
     /// #1539: MCP カタログは cwd にもプロファイルにも依らず必ず 1 件載る。
