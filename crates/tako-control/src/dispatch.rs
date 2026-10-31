@@ -38163,11 +38163,20 @@ mod tests {
         let DispatchError::Operation(message) = err else {
             panic!("Operation エラーでない: {err:?}");
         };
+        // 断りは表示言語の文（#2365）。テストは言語グローバルに触らないので日英どちらかで見る
+        let says = |message: &str, ja: &str, en: &str| message.contains(ja) || message.contains(en);
         assert!(
-            message.contains("window 0 のリサイズに失敗した"),
+            says(
+                &message,
+                "window 0 のリサイズに失敗した",
+                "failed to resize window 0"
+            ),
             "{message}"
         );
-        assert!(message.contains("動いていない"), "{message}");
+        assert!(
+            says(&message, "動いていない", "is not running"),
+            "{message}"
+        );
         assert!(
             !message.contains('/'),
             "ソケットパスが露出している: {message}"
@@ -38194,7 +38203,8 @@ mod tests {
         };
         assert!(message.contains(&missing), "{message}");
         assert!(
-            message.contains("既定サーバー") && message.contains("tako バックエンド"),
+            (message.contains("既定サーバー") && message.contains("tako バックエンド"))
+                || (message.contains("default server") && message.contains("tako backend")),
             "どこを見たかが書かれていない: {message}"
         );
         assert!(!message.contains('/'), "パスが露出している: {message}");
@@ -38355,7 +38365,12 @@ mod tests {
         let DispatchError::Operation(message) = err else {
             panic!("Operation エラーでない: {err:?}");
         };
-        assert!(message.contains("window 9 の選択に失敗した"), "{message}");
+        // 断りは表示言語の文（#2365）。テストは言語グローバルに触らないので日英どちらかで見る
+        assert!(
+            message.contains("window 9 の選択に失敗した")
+                || message.contains("failed to select window 9"),
+            "{message}"
+        );
         assert!(message.contains(wrapper), "{message}");
         assert!(
             !message.contains('/'),
