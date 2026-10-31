@@ -11,8 +11,9 @@
 //! 読み書きの口（`ProjectsConfig::load` ほか）は従来どおり `String` を返し、文は**日本語のまま**
 //! （呼び手の多くは persist.log・`tako master` の起動の流れ・日本語の枠の文へ載せる）。
 //! 断りを表示言語で返す dispatch（CLI / MCP の `orchestrator projects` / `profiles` / `accounts`・
-//! spawn・引き継ぎ・adopt・`ledger`・`handoffs write`・`supervisor set_mode`）だけが型の口（`*_typed`）を通し、枠（`invalid parameter:` ほか）と
-//! 中身を同じ言語にそろえる（1 つの断りの中で日英を混ぜない）。
+//! spawn・引き継ぎ・adopt・`ledger`・`handoffs write`・`supervisor set_mode`）だけが
+//! 型の口（`*_typed`）を通し、枠（`invalid parameter:` ほか）と中身を同じ言語にそろえる
+//! （1 つの断りの中で日英を混ぜない）。
 //! 設定ファイルの中身になる文はここに無い（断りだけ）
 
 use tako_core::i18n::Lang;
