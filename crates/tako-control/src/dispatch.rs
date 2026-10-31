@@ -43676,8 +43676,10 @@ mod tests {
                     .join(" / ")
             })
             .unwrap_or_default();
+        // 注記は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらかで見る）
         assert!(
-            warnings.contains("master / solo のペインではない"),
+            warnings.contains("master / solo のペインではない")
+                || warnings.contains("not a master / solo pane"),
             "既定へ落ちた理由が出ていない: {result}"
         );
     }
@@ -43714,12 +43716,15 @@ mod tests {
         .unwrap();
         assert_eq!(result["pane_id"].as_u64(), Some(solo));
         let warnings = result["warnings"].to_string();
+        // 注記は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらかで見る）
         assert!(
-            warnings.contains("solo の profile は起動時の env"),
+            warnings.contains("solo の profile は起動時の env")
+                || warnings.contains("a solo profile lives only in the env"),
             "solo 向けの理由になっていない: {result}"
         );
         assert!(
-            !warnings.contains("master / solo のペインではない"),
+            !warnings.contains("master / solo のペインではない")
+                && !warnings.contains("not a master / solo pane"),
             "solo のペインを「solo ではない」と言っている: {result}"
         );
     }
@@ -51630,7 +51635,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v["stale"], false);
-        assert!(v["reason"].as_str().unwrap().contains("対象外"));
+        // 注記は組んだ時点の表示言語（#2365。日英のどちらか）
+        let reason = v["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("対象外") || reason.contains("not subject to stale detection"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -54237,7 +54247,11 @@ mod tests {
         assert_eq!(plan.tab, None, "新しいタブを作る");
         assert_eq!(plan.anchor, master, "spawned_by は master のまま");
         let reason = plan.reason.expect("理由が載る");
-        assert!(reason.contains("31 桁"), "{reason}");
+        // 注記は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらかで見る）
+        assert!(
+            reason.contains("31 桁") || reason.contains("31 columns"),
+            "{reason}"
+        );
         assert!(
             reason.contains("min-worker-cols"),
             "次の一手が載る: {reason}"
@@ -54608,7 +54622,11 @@ mod tests {
         let plan = plan_worker_placement(&host, tab, master, &layout, PlacementArm::SplitTabs);
         assert_eq!(plan.kind, "same_tab");
         let reason = plan.reason.expect("理由が載る");
-        assert!(reason.contains("ウィンドウ"), "{reason}");
+        // 注記は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらかで見る）
+        assert!(
+            reason.contains("ウィンドウ") || reason.contains("window"),
+            "{reason}"
+        );
         assert_eq!(host.ws.tabs().len(), 1, "無駄なタブを作らない");
     }
 

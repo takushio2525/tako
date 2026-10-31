@@ -1546,8 +1546,12 @@ mod tests {
         let got = registry_resume_launch_in(&entry, Some(&loc), "/opt/tako", ShellDialect::Posix)
             .unwrap();
         assert_eq!(got.profile.as_deref(), Some("default"));
+        // 警告は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらかで見る）
+        let note = crate::ReplyNote::ResumeNoProfileRecord;
         assert!(
-            got.warnings[0].contains("プロファイルの記録が無い"),
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .iter()
+                .any(|&lang| got.warnings[0] == note.text_in(lang)),
             "{:?}",
             got.warnings
         );
