@@ -8937,22 +8937,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1632 の読み戻し 1 件（名前・Win32 の読み戻し・Windows では icacls の ACE の行）
+    type Issue1632Seen = (
+        &'static str,
+        tako_core::platform::private_file::Inspection,
+        Vec<String>,
+    );
+
     /// #1632 の場面: 置き場（state_dir）とトークン・QR を、remote の実際の書き手で作って読み戻す。
     ///
     /// 置き場とトークンは**わざと誰でも読める形にしてから**始める（#1632 前の版が残した形 +
     /// 明示の Everyone）。既に在る置き場・既に在るトークンを上書きしても緩さが残らないことまで見る。
     /// 読み戻しは Win32（境界の [`tako_core::platform::private_file::inspect`]）と、Windows では
     /// 別の口の icacls の 2 通り。どちらも CI のログへ `TAKO1632_<tag>` の行で残す（`--nocapture`）
-    fn issue1632_scenario(
-        tag: &str,
-    ) -> (
-        tako_core::test_residue::ScratchDir,
-        Vec<(
-            &'static str,
-            tako_core::platform::private_file::Inspection,
-            Vec<String>,
-        )>,
-    ) {
+    fn issue1632_scenario(tag: &str) -> (tako_core::test_residue::ScratchDir, Vec<Issue1632Seen>) {
         // env を書き換えるので、呼び手は `run_alone!` の子の中（#2400）
         tako_core::test_child::assert_alone("issue1632_scenario");
         // 使い捨ての置き場（呼び手のスコープで消える = #1312）
