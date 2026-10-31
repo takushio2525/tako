@@ -31,6 +31,8 @@ pub mod jobserver;
 pub mod keys;
 pub mod locale;
 pub mod path;
+/// 本人だけが読み書きできるファイル・置き場（境界 B32。#1632）
+pub mod private_file;
 pub mod process;
 pub mod procinfo;
 pub mod program_path;
