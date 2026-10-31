@@ -1383,7 +1383,7 @@ fn run_dependency_check(
             ("[任意]", "任意")
         };
         eprintln!("  {mark} {}: 見つかりません（{kind}）", dep.bin);
-        eprintln!("      用途: {}", dep.purpose);
+        eprintln!("      用途: {}", dep.purpose.ja());
         if !dep.required {
             eprintln!("      無くても tako 自体は動きますが、上記の機能が使えません");
         }
@@ -1403,6 +1403,8 @@ fn run_dependency_check(
                 writer: &mut stderr,
                 reader: &mut reader,
                 indent: "      ",
+                // `tako setup` の依存段は日本語（#2365。表示言語に従うのは `--check` だけ）
+                lang: tako_core::i18n::Lang::Ja,
             },
         )
         // `Err` は**案内の書き出しが壊れたとき**だけ（導入の失敗は中で警告へ
@@ -3221,9 +3223,18 @@ fn mark_setup_complete(
 /// **ここに判断を書かない**（#1505）。項目・判定・人へ出す行の正本は
 /// `tako_control::diagnostics`（`tako check-health` / MCP `tako_check_health` も
 /// そこを読む）で、この関数は見出しを出して結果を並べるだけ。
-/// 番犬 `issue1505_diagnostics_single_source` が正本以外から項目を組む形を落とす
+/// 番犬 `issue1505_diagnostics_single_source` が正本以外から項目を組む形を落とす。
+///
+/// 出力は表示言語に従う（#2365。check-health と字面まで同じ診断の行なので、`tako setup` の本体が
+/// 日本語でも `--check` は check-health と同じ言語で出す）。診断の正本は表示言語のグローバルを読むので、
+/// 組む前に決める
 pub fn run_check() -> Result<(), String> {
-    eprintln!("tako セットアップ 環境チェック");
+    crate::init_local_lang();
+    let lang = tako_core::i18n::lang();
+    eprintln!(
+        "{}",
+        tako_control::HealthText::SetupCheckTitle.text_in(lang)
+    );
     eprintln!("─────────────────────────────");
 
     let report = tako_control::diagnostics::collect();
@@ -3231,7 +3242,7 @@ pub fn run_check() -> Result<(), String> {
         eprintln!("{line}");
     }
     // 人へ残る作業（#1501）。`tako setup` の末尾と**同じ 1 実装**で締める
-    for line in setup_remaining::render(&setup_remaining::summarize(report.remaining())) {
+    for line in setup_remaining::render_in(&setup_remaining::summarize(report.remaining()), lang) {
         eprintln!("{line}");
     }
     Ok(())
@@ -4163,7 +4174,7 @@ mod tests {
         let mac = setup_deps::deps(Platform::MacOs);
         let tmux = mac.iter().find(|d| d.bin == "tmux").expect("tmux が要る");
         assert!(!tmux.required);
-        assert!(tmux.purpose.contains("tako remote"));
+        assert!(tmux.purpose.ja().contains("tako remote"));
         assert_eq!(
             tmux.installer,
             Some(DepInstaller::Brew { pkg: "tmux" }),

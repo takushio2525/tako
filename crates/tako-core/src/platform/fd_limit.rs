@@ -89,9 +89,14 @@ pub const CONTAINER_FDS_PER_PANE: u64 = 3;
 /// この OS で上げる・数える対象か（macOS だけ。Windows は [`NOT_APPLICABLE_REASON`]）
 pub const APPLICABLE: bool = cfg!(target_os = "macos");
 
-/// 上限の仕組みが無い OS（Windows）で `tako check-health` が出す理由
-pub const NOT_APPLICABLE_REASON: &str = "Windows のハンドルは 1 プロセス 2^24 本まで使え、\
-     macOS の RLIMIT_NOFILE（Finder 起動の既定 256）に当たる小さい既定の上限が無い";
+/// 上限の仕組みが無い OS（Windows）で `tako check-health` が出す理由（表示言語は呼び手が選ぶ。#2365）
+pub const NOT_APPLICABLE_REASON: crate::platform::support::Note =
+    crate::platform::support::Note::new(
+        "Windows のハンドルは 1 プロセス 2^24 本まで使え、\
+     macOS の RLIMIT_NOFILE（Finder 起動の既定 256）に当たる小さい既定の上限が無い",
+        "Windows allows up to 2^24 handles per process and has no small default limit like \
+     macOS's RLIMIT_NOFILE (256 by default when started from Finder)",
+    );
 
 /// 起動時の引き上げの結果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

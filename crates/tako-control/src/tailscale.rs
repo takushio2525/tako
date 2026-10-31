@@ -85,6 +85,14 @@ impl Detection {
 /// [1/5]・MCP `tako_remote_setup` が同じ文面を出す。#1797 / #1816）。入れ直すと 2 系統目になる
 pub const UNRUNNABLE_HINT: &str = "入れ直す前に、Tailscale の起動し直しか更新を試してください";
 
+/// [`UNRUNNABLE_HINT`] を表示言語で（`tako check-health` / `tako setup --check` の依存の行。#2365）
+pub fn unrunnable_hint_in(lang: tako_core::i18n::Lang) -> &'static str {
+    match lang {
+        tako_core::i18n::Lang::Ja => UNRUNNABLE_HINT,
+        tako_core::i18n::Lang::En => "Before reinstalling, try restarting or updating Tailscale",
+    }
+}
+
 /// 候補 1 つを試した結果
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateProbe {

@@ -724,37 +724,66 @@ impl Placement {
     /// `warning`、窓を開かずに終わった = 目的どおりの拒否なので `error`（起動しなかった
     /// 理由が要る）。当たっているときは黙る = 通常起動と同じ
     pub fn health_issue(&self) -> Option<serde_json::Value> {
+        self.health_issue_in(crate::i18n::Lang::Ja)
+    }
+
+    /// [`Self::health_issue`] を表示言語で（check-health の `issues`。#2365）。
+    /// `reason` は起動時に記録した文（[`miss_reason`]）をそのまま載せる
+    pub fn health_issue_in(&self, lang: crate::i18n::Lang) -> Option<serde_json::Value> {
+        use crate::i18n::Lang::{En, Ja};
         let spec = self.requested.as_deref()?;
         if self.resolved.is_some() {
             return None;
         }
-        let reason = self.reason.as_deref().unwrap_or("不明");
+        let reason = self.reason.as_deref().unwrap_or(match lang {
+            Ja => "不明",
+            En => "unknown",
+        });
         let available = self.available.join(", ");
+        let retries = self.retries;
         let (level, message) = if self.refused {
             // 一覧が空（#1160）と、面は見えているのに明示の指定を見失った（#1697）は直し方が違う
-            let what = if self.available.is_empty() {
-                "が列挙に出ない"
-            } else {
-                "がどの面にも当たらない"
-            };
+            let listed = !self.available.is_empty();
             (
                 "error",
-                format!(
-                    "検証用 GUI の置き先 {spec} {what}ので窓を開かずに終了した\
-                     （理由={reason} / 候補=[{available}] / やり直し={} 回）。\
-                     scripts/lib/virtual-display.sh ensure で用意できる",
-                    self.retries,
-                ),
+                match (listed, lang) {
+                    (false, Ja) => format!(
+                        "検証用 GUI の置き先 {spec} が列挙に出ないので窓を開かずに終了した\
+                         （理由={reason} / 候補=[{available}] / やり直し={retries} 回）。\
+                         scripts/lib/virtual-display.sh ensure で用意できる"
+                    ),
+                    (true, Ja) => format!(
+                        "検証用 GUI の置き先 {spec} がどの面にも当たらないので窓を開かずに終了した\
+                         （理由={reason} / 候補=[{available}] / やり直し={retries} 回）。\
+                         scripts/lib/virtual-display.sh ensure で用意できる"
+                    ),
+                    (false, En) => format!(
+                        "the verification GUI's display {spec} is not listed, so tako quit without \
+                         opening a window (reason={reason} / candidates=[{available}] / \
+                         retries={retries}). scripts/lib/virtual-display.sh ensure prepares it"
+                    ),
+                    (true, En) => format!(
+                        "the verification GUI's display {spec} matches no screen, so tako quit \
+                         without opening a window (reason={reason} / candidates=[{available}] / \
+                         retries={retries}). scripts/lib/virtual-display.sh ensure prepares it"
+                    ),
+                },
             )
         } else {
             (
                 "warning",
-                format!(
-                    "ディスプレイ {spec} が見つからないので既定の面へ開いている\
-                     （理由={reason} / 候補=[{available}] / やり直し={} 回）。\
-                     scripts/lib/virtual-display.sh ensure で用意できる",
-                    self.retries,
-                ),
+                match lang {
+                    Ja => format!(
+                        "ディスプレイ {spec} が見つからないので既定の面へ開いている\
+                         （理由={reason} / 候補=[{available}] / やり直し={retries} 回）。\
+                         scripts/lib/virtual-display.sh ensure で用意できる"
+                    ),
+                    En => format!(
+                        "display {spec} was not found, so the window opened on the default screen \
+                         (reason={reason} / candidates=[{available}] / retries={retries}). \
+                         scripts/lib/virtual-display.sh ensure prepares it"
+                    ),
+                },
             )
         };
         Some(serde_json::json!({

@@ -411,19 +411,37 @@ impl ListenerCheck {
         matches!(self, ListenerCheck::Missing | ListenerCheck::ReplacedDead)
     }
 
-    /// 人が読む理由（persist.log・check-health）
+    /// 人が読む理由（persist.log。日本語）
     pub fn reason(self) -> &'static str {
-        match self {
-            ListenerCheck::Ours => "受け口はパスに繋がっている",
-            ListenerCheck::Missing => "ソケットファイルが消えていた",
-            ListenerCheck::ReplacedDead => {
+        self.reason_in(crate::i18n::Lang::Ja)
+    }
+
+    /// 人が読む理由を表示言語で（check-health の `ipc.watch` と申告。#2365）
+    pub fn reason_in(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (ListenerCheck::Ours, Ja) => "受け口はパスに繋がっている",
+            (ListenerCheck::Ours, En) => "the endpoint is attached to the path",
+            (ListenerCheck::Missing, Ja) => "ソケットファイルが消えていた",
+            (ListenerCheck::Missing, En) => "the socket file was gone",
+            (ListenerCheck::ReplacedDead, Ja) => {
                 "ソケットファイルが別の実体に置き換わり、誰も受けていなかった"
             }
-            ListenerCheck::ForeignLive => {
+            (ListenerCheck::ReplacedDead, En) => {
+                "the socket file was replaced by another one, and nobody was listening"
+            }
+            (ListenerCheck::ForeignLive, Ja) => {
                 "ソケットファイルが別の受け口に置き換わっている（生きているので奪わずに待つ）"
             }
-            ListenerCheck::NotSocket => {
+            (ListenerCheck::ForeignLive, En) => {
+                "the socket file was replaced by another endpoint (it is alive, so tako waits \
+                 without taking it over)"
+            }
+            (ListenerCheck::NotSocket, Ja) => {
                 "ソケットのパスにソケットではないファイルがある（触らずに待つ）"
+            }
+            (ListenerCheck::NotSocket, En) => {
+                "a file that is not a socket sits at the socket path (tako waits without touching it)"
             }
         }
     }
@@ -591,17 +609,32 @@ impl Occupant {
         }
     }
 
-    /// 人が読む理由（persist.log・check-health）
+    /// 人が読む理由（persist.log。日本語）
     pub fn reason(self) -> String {
-        match self {
-            Occupant::Vacant => "ソケットファイルが無い".into(),
-            Occupant::Live => "繋がった（生きた受け口が居る）".into(),
-            Occupant::Busy { pid } => format!(
+        self.reason_in(crate::i18n::Lang::Ja)
+    }
+
+    /// 人が読む理由を表示言語で（check-health の `ipc.fixed_path`。#2365）
+    pub fn reason_in(self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        let tries = LIVENESS_RETRY_DELAYS_MS.len() + 1;
+        match (self, lang) {
+            (Occupant::Vacant, Ja) => "ソケットファイルが無い".into(),
+            (Occupant::Vacant, En) => "there is no socket file".into(),
+            (Occupant::Live, Ja) => "繋がった（生きた受け口が居る）".into(),
+            (Occupant::Live, En) => "connected (a live endpoint is there)".into(),
+            (Occupant::Busy { pid }, Ja) => format!(
                 "繋がらないが、接続情報の持ち主（pid {pid}）が生きている（受け口が一時的に満杯か詰まっている）"
             ),
-            Occupant::Dead => format!(
-                "{} 回繋いでも繋がらず、生きた持ち主の記録も無い（残骸）",
-                LIVENESS_RETRY_DELAYS_MS.len() + 1
+            (Occupant::Busy { pid }, En) => format!(
+                "cannot connect, but the owner of the connection info (pid {pid}) is alive \
+                 (the endpoint is busy or stuck for now)"
+            ),
+            (Occupant::Dead, Ja) => {
+                format!("{tries} 回繋いでも繋がらず、生きた持ち主の記録も無い（残骸）")
+            }
+            (Occupant::Dead, En) => format!(
+                "no connection after {tries} tries, and no live owner is recorded (leftover)"
             ),
         }
     }

@@ -73,14 +73,28 @@ impl Step {
     /// 引数なしの `describe()` は置いていない。3 系統を並べて出す画面で
     /// 「Claude Code をインストールします」が codex の段に出ると嘘になる
     pub fn describe_for(self, agent: AgentKind) -> String {
-        match self {
-            Self::Install => format!("{} をインストールします", agent.product()),
-            Self::Path => format!(
+        self.describe_for_in(agent, tako_core::i18n::Lang::Ja)
+    }
+
+    /// [`Self::describe_for`] を表示言語で（`tako check-health` / `tako setup --check` の段の行。#2365。
+    /// `tako setup` の本体は日本語の口のまま）
+    pub fn describe_for_in(self, agent: AgentKind, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Install, Ja) => format!("{} をインストールします", agent.product()),
+            (Self::Install, En) => format!("install {}", agent.product()),
+            (Self::Path, Ja) => format!(
                 "{} コマンドをどのターミナルからも使えるようにします",
                 agent.as_str()
             ),
-            Self::Auth => format!("{}にログインします", account_label(agent)),
-            Self::Ready => "導入は済んでいます".to_string(),
+            (Self::Path, En) => format!(
+                "make the {} command available from any terminal",
+                agent.as_str()
+            ),
+            (Self::Auth, Ja) => format!("{}にログインします", account_label(agent)),
+            (Self::Auth, En) => format!("sign in to your {}", account_label_in(agent, lang)),
+            (Self::Ready, Ja) => "導入は済んでいます".to_string(),
+            (Self::Ready, En) => "setup is done".to_string(),
         }
     }
 }
@@ -90,10 +104,19 @@ impl Step {
 /// 実測で確かめた呼び名だけを書く: codex は `codex login status` が
 /// `Logged in using ChatGPT` を返す / agy は公式 docs の sign-in が Google アカウント
 pub fn account_label(agent: AgentKind) -> &'static str {
-    match agent {
-        AgentKind::Claude => "Claude アカウント",
-        AgentKind::Codex => "ChatGPT アカウント",
-        AgentKind::Agy => "Google アカウント",
+    account_label_in(agent, tako_core::i18n::Lang::Ja)
+}
+
+/// [`account_label`] を表示言語で（#2365）
+pub fn account_label_in(agent: AgentKind, lang: tako_core::i18n::Lang) -> &'static str {
+    use tako_core::i18n::Lang::{En, Ja};
+    match (agent, lang) {
+        (AgentKind::Claude, Ja) => "Claude アカウント",
+        (AgentKind::Claude, En) => "Claude account",
+        (AgentKind::Codex, Ja) => "ChatGPT アカウント",
+        (AgentKind::Codex, En) => "ChatGPT account",
+        (AgentKind::Agy, Ja) => "Google アカウント",
+        (AgentKind::Agy, En) => "Google account",
     }
 }
 
@@ -266,6 +289,11 @@ impl BootstrapState {
         self.step.describe_for(self.agent)
     }
 
+    /// [`Self::step_description`] を表示言語で（#2365）
+    pub fn step_description_in(&self, lang: tako_core::i18n::Lang) -> String {
+        self.step.describe_for_in(self.agent, lang)
+    }
+
     /// 段（未導入 / PATH に無い）がログインシェルの打ち切りのせいで決まっているときの知らせ
     /// （#1532 / #1533）。`Some` なら、その段は**確かめられなかった**のであって事実ではない。
     /// 呼び手はそれを「未導入」「PATH に無い」と言わず、導入や PATH の書き込みへ進まない。
@@ -422,17 +450,29 @@ fn with_new_tab_note(mut lines: Vec<String>, note: Option<String>) -> Vec<String
 /// tako の新しいタブはレジストリの PATH を読み直す（`user_path::pane_path`）ので、
 /// tako 自体の再起動は要らない。外のターミナルも、新しく開けば同じ値を読む
 pub fn new_tab_note(state: &BootstrapState) -> Option<String> {
-    state
-        .needs_new_tab()
-        .then(|| new_tab_note_text(state.agent))
+    new_tab_note_in(state, tako_core::i18n::Lang::Ja)
 }
 
-fn new_tab_note_text(agent: AgentKind) -> String {
-    format!(
-        "このタブは {} の置き場所が PATH に入る前に開いたので、ここからはまだ引けません。\
-         tako で新しいタブを開いてから打ってください（tako の再起動は要りません）",
-        agent.as_str()
-    )
+/// [`new_tab_note`] を表示言語で（`tako check-health` / `tako setup --check` の残り作業。#2365）
+pub fn new_tab_note_in(state: &BootstrapState, lang: tako_core::i18n::Lang) -> Option<String> {
+    state
+        .needs_new_tab()
+        .then(|| new_tab_note_text_in(state.agent, lang))
+}
+
+fn new_tab_note_text_in(agent: AgentKind, lang: tako_core::i18n::Lang) -> String {
+    match lang {
+        tako_core::i18n::Lang::Ja => format!(
+            "このタブは {} の置き場所が PATH に入る前に開いたので、ここからはまだ引けません。\
+             tako で新しいタブを開いてから打ってください（tako の再起動は要りません）",
+            agent.as_str()
+        ),
+        tako_core::i18n::Lang::En => format!(
+            "This tab was opened before the {} location was added to PATH, so it cannot find it \
+             yet. Open a new tab in tako and run it there (no need to restart tako)",
+            agent.as_str()
+        ),
+    }
 }
 
 /// `TAKO_1129_LEGACY=1` で修正前（tako が `claude auth login` を起こす）へ戻す。
@@ -1361,6 +1401,17 @@ pub fn legacy_no_tako_cli_path() -> bool {
 const LEGACY_LINE: &str =
     "  [legacy] tako CLI の PATH 設置は TAKO_1502_LEGACY=1 で無効（#1502 前の挙動）";
 
+/// [`LEGACY_LINE`] を表示言語で（`--check` の行。#2365）
+fn legacy_line_in(lang: tako_core::i18n::Lang) -> &'static str {
+    match lang {
+        tako_core::i18n::Lang::Ja => LEGACY_LINE,
+        tako_core::i18n::Lang::En => {
+            "  [legacy] putting the tako CLI on PATH is off with TAKO_1502_LEGACY=1 \
+             (the behavior before #1502)"
+        }
+    }
+}
+
 /// tako CLI の symlink を張る（unix のみ。Windows は `link: None` なので何もしない）
 fn ensure_tako_cli_link(
     plan: &tako_cli_path::Placement,
@@ -1373,17 +1424,33 @@ fn ensure_tako_cli_link(
 
 /// tako CLI の設置状況を JSON 節にする（`ensure_path_for` / `check-health` / `--check` が同じ材料を読む）
 pub fn tako_cli_path_json() -> Value {
+    tako_cli_path_json_in(tako_core::i18n::Lang::Ja)
+}
+
+/// [`tako_cli_path_json`] の `reason`（解決できなかった理由）を表示言語で（check-health の
+/// `tako_cli_path` 節と `--check` の行。#2365）。判定は同じ 1 実装
+pub fn tako_cli_path_json_in(lang: tako_core::i18n::Lang) -> Value {
+    use tako_core::i18n::Lang::{En, Ja};
     if legacy_no_tako_cli_path() {
-        return json!({ "resolved": false, "reason": "TAKO_1502_LEGACY=1（#1502 前の挙動）" });
+        let reason = match lang {
+            Ja => "TAKO_1502_LEGACY=1（#1502 前の挙動）",
+            En => "TAKO_1502_LEGACY=1 (the behavior before #1502)",
+        };
+        return json!({ "resolved": false, "reason": reason });
     }
     let Ok(home) = home_dir() else {
-        return json!({ "resolved": false, "reason": "ホームディレクトリを特定できません" });
+        let reason = match lang {
+            Ja => "ホームディレクトリを特定できません",
+            En => "cannot determine the home directory",
+        };
+        return json!({ "resolved": false, "reason": reason });
     };
     let Some(plan) = tako_cli_placement(&home) else {
-        return json!({
-            "resolved": false,
-            "reason": "tako CLI の実体を解決できません（実行中バイナリの隣に tako がありません）",
-        });
+        let reason = match lang {
+            Ja => "tako CLI の実体を解決できません（実行中バイナリの隣に tako がありません）",
+            En => "cannot resolve the tako CLI (there is no tako next to the running binary)",
+        };
+        return json!({ "resolved": false, "reason": reason });
     };
     let state = plan
         .link
@@ -1536,17 +1603,27 @@ pub fn run_tako_cli_path_stage() -> String {
     }
 }
 
-/// `tako setup --check` の 1 行（#1502）。**判定は [`tako_cli_path_json`] の 1 実装**
-pub fn tako_cli_path_check_line() -> String {
+/// `tako setup --check` の 1 行（#1502）。**判定は [`tako_cli_path_json`] の 1 実装**。
+///
+/// check-health と `--check` が同じ文を出す診断の正本（#1505）。どちらも表示言語で組む（#2365）
+pub fn tako_cli_path_check_line(lang: tako_core::i18n::Lang) -> String {
+    use tako_core::i18n::Lang::{En, Ja};
     if legacy_no_tako_cli_path() {
-        return LEGACY_LINE.to_string();
+        return legacy_line_in(lang).to_string();
     }
-    let state = tako_cli_path_json();
+    let state = tako_cli_path_json_in(lang);
     if !state["resolved"].as_bool().unwrap_or(false) {
-        return format!(
-            "  [警告] tako CLI の PATH: 確認できません（{}）",
-            state["reason"].as_str().unwrap_or("理由不明")
-        );
+        let reason = state["reason"].as_str();
+        return match lang {
+            Ja => format!(
+                "  [警告] tako CLI の PATH: 確認できません（{}）",
+                reason.unwrap_or("理由不明")
+            ),
+            En => format!(
+                "  [warning] tako CLI on PATH: cannot check ({})",
+                reason.unwrap_or("unknown reason")
+            ),
+        };
     }
     let dir = state["dir_display"].as_str().unwrap_or("?");
     // ログインシェルの PATH を上限内に読めなかった（#1532）。このプロセスの PATH で代わりに答えた
@@ -1554,40 +1631,53 @@ pub fn tako_cli_path_check_line() -> String {
     // （リンクが切れているのは PATH と関係なく確かな不足なので、下の理由へ進む）
     if let Some(secs) = state["dir_on_path_unconfirmed"]["waited_secs"].as_u64() {
         if state["link_state"].as_str() != Some("dangling") {
-            return format!(
-                "  [警告] tako CLI の PATH: 確認できません（ログインシェルが {secs} 秒で応答なし）\n\
-                 \x20        .zprofile などが入力を待っていないか確かめてください"
-            );
+            return match lang {
+                Ja => format!(
+                    "  [警告] tako CLI の PATH: 確認できません（ログインシェルが {secs} 秒で応答なし）\n\
+                     \x20        .zprofile などが入力を待っていないか確かめてください"
+                ),
+                En => format!(
+                    "  [warning] tako CLI on PATH: cannot check (the login shell did not respond \
+                     in {secs} s)\n\
+                     \x20        Check that files such as .zprofile are not waiting for input"
+                ),
+            };
         }
     }
     if state["usable"].as_bool().unwrap_or(false) {
-        return format!("  [OK] tako CLI の PATH: 外部ターミナルからも使えます（{dir}）");
+        return match lang {
+            Ja => format!("  [OK] tako CLI の PATH: 外部ターミナルからも使えます（{dir}）"),
+            En => format!("  [OK] tako CLI on PATH: usable from other terminals too ({dir})"),
+        };
     }
     // **状態ごとに違う理由を出す**（「使えません」だけだと、まだ設置していないのか
     // `.app` を動かして切れたのかが分からず、次の一手が選べない）
-    let reason = match state["link_state"].as_str() {
-        Some("dangling") => "リンクの指す先が消えています（tako.app を移動しましたか？）",
-        Some("missing") if state["dir_on_path"].as_bool().unwrap_or(false) => {
-            "まだ設置していません"
-        }
-        _ if !state["dir_on_path"].as_bool().unwrap_or(false) => "設置先が PATH に入っていません",
-        _ => "まだ設置していません",
+    let on_path = state["dir_on_path"].as_bool().unwrap_or(false);
+    let reason = match (state["link_state"].as_str(), on_path, lang) {
+        (Some("dangling"), _, Ja) => "リンクの指す先が消えています（tako.app を移動しましたか？）",
+        (Some("dangling"), _, En) => "the link target is gone (did you move tako.app?)",
+        (_, false, Ja) => "設置先が PATH に入っていません",
+        (_, false, En) => "the install location is not on PATH",
+        (_, true, Ja) => "まだ設置していません",
+        (_, true, En) => "not installed yet",
+    };
+    let head = match lang {
+        Ja => format!("  [不足] tako CLI の PATH: 外部ターミナルからは使えません（{reason}）"),
+        En => format!("  [missing] tako CLI on PATH: not usable from other terminals ({reason})"),
     };
     // 種別の分からないシェルで置き場所が PATH に無い（#2564）: `tako setup bootstrap path` は
     // PATH の段で同じ断りに止まるので誘導せず、足すディレクトリを示す
     // （判定は check-health の `cli_in_path` と同じ 1 実装 = #2576）
     if let Some(hint) = tako_cli_dir_by_hand(&state) {
-        // この行は check-health と `--check` が同じ文を出す診断の正本（#1505）。2 つは表示言語の
-        // 決め方が違うので、1 行目（日本語）と同じく言語を固定して組む（表示言語で組むと食い違う）
         return format!(
-            "  [不足] tako CLI の PATH: 外部ターミナルからは使えません（{reason}）\n{}",
-            PathByHandNote::CliCheckHint { dir: hint }.text_in(tako_core::i18n::Lang::Ja)
+            "{head}\n{}",
+            PathByHandNote::CliCheckHint { dir: hint }.text_in(lang)
         );
     }
-    format!(
-        "  [不足] tako CLI の PATH: 外部ターミナルからは使えません（{reason}）\n\
-         \x20        tako setup bootstrap path で設置できます"
-    )
+    match lang {
+        Ja => format!("{head}\n\x20        tako setup bootstrap path で設置できます"),
+        En => format!("{head}\n\x20        tako setup bootstrap path installs it"),
+    }
 }
 
 /// tako CLI の置き場所を、利用者が自分のシェルの設定ファイルで PATH へ足すしかないなら、その置き場所
@@ -1632,21 +1722,23 @@ pub fn tako_cli_dir_by_hand_for(
 /// `injected` = tako が開くシェルへ自動で足している CLI の置き場所（#601。在れば tako の中では打てる = info）、
 /// `by_hand_dir` = [`tako_cli_dir_by_hand`]。足すしかない（種別の分からないシェルで置き場所が PATH に無い）なら
 /// `tako setup bootstrap path` は同じ断りで止まるので誘導せず、`--check` の行と同じ案内（足す置き場所）で
-/// 閉じる（#2576）。check-health の診断は表示言語を解決しないので日本語で固定する（#1505 / #2564 と同じ）
+/// 閉じる（#2576）。文は check-health の表示言語で組む（`--check` の行と同じ言語。#2365）
 pub fn tako_cli_in_path_issue(
     injected: Option<&Path>,
     by_hand_dir: Option<String>,
+    lang: tako_core::i18n::Lang,
 ) -> (&'static str, String) {
+    use tako_core::i18n::Lang::{En, Ja};
     let by_hand = by_hand_dir.map(|dir| {
         PathByHandNote::CliCheckHint { dir }
-            .text_in(tako_core::i18n::Lang::Ja)
+            .text_in(lang)
             .trim_start()
             .to_string()
     });
     // 注入が効いていれば tako の中では打てる = 致命ではない。外部ターミナルでも使いたい人向けの
     // 案内に落とす（level を下げても対処法は示し続ける）。#1502 からは手順ではなく 1 コマンド（#322）
-    match (injected, by_hand) {
-        (Some(dir), None) => (
+    match (injected, by_hand, lang) {
+        (Some(dir), None, Ja) => (
             "info",
             format!(
                 "tako CLI は PATH に無いが、tako が開くシェルには {} を自動で追加するので \
@@ -1655,7 +1747,16 @@ pub fn tako_cli_in_path_issue(
                 dir.display()
             ),
         ),
-        (Some(dir), Some(hint)) => (
+        (Some(dir), None, En) => (
+            "info",
+            format!(
+                "the tako CLI is not on PATH, but tako adds {} to the shells it opens, so `tako` \
+                 works inside tako (#601). To use it from other terminals too, run \
+                 tako setup bootstrap path (#1502)",
+                dir.display()
+            ),
+        ),
+        (Some(dir), Some(hint), Ja) => (
             "info",
             format!(
                 "tako CLI は PATH に無いが、tako が開くシェルには {} を自動で追加するので \
@@ -1663,13 +1764,31 @@ pub fn tako_cli_in_path_issue(
                 dir.display()
             ),
         ),
-        (None, None) => (
+        (Some(dir), Some(hint), En) => (
+            "info",
+            format!(
+                "the tako CLI is not on PATH, but tako adds {} to the shells it opens, so `tako` \
+                 works inside tako (#601). To use it from other terminals too: {hint}",
+                dir.display()
+            ),
+        ),
+        (None, None, Ja) => (
             "error",
             "tako CLI が PATH に見つからない。tako setup bootstrap path で設置するか、\
              scripts/build-app.sh --install でインストールすること"
                 .to_string(),
         ),
-        (None, Some(hint)) => ("error", format!("tako CLI が PATH に見つからない。{hint}")),
+        (None, None, En) => (
+            "error",
+            "the tako CLI is not found on PATH. Install it with tako setup bootstrap path or \
+             scripts/build-app.sh --install"
+                .to_string(),
+        ),
+        (None, Some(hint), Ja) => ("error", format!("tako CLI が PATH に見つからない。{hint}")),
+        (None, Some(hint), En) => (
+            "error",
+            format!("the tako CLI is not found on PATH. {hint}"),
+        ),
     }
 }
 
@@ -1678,19 +1797,32 @@ pub fn tako_cli_in_path_issue(
 /// `by_hand` = [`tako_cli_dir_by_hand`] が当たる（種別の分からないシェルで置き場所が PATH に無い）。当たるなら
 /// `tako setup bootstrap path` はリンクを張り直した後の PATH の段で同じ断りに止まる（堂々巡り）ので誘導せず、
 /// 起動時の張り直し（tako-app の `repair_tako_cli_link`。シェルに依らず、切れているときだけ張り直す）で閉じる。
-/// PATH へ足す案内は同じ判定の `cli_in_path` / `--check` の行が受け持つ。check-health の診断は表示言語を
-/// 解決しないので日本語で固定する（#1505 / #2576 と同じ）
-pub fn tako_cli_link_issue(link_display: &str, by_hand: bool) -> String {
-    if by_hand {
-        return format!(
+/// PATH へ足す案内は同じ判定の `cli_in_path` / `--check` の行が受け持つ。文は check-health の表示言語で
+/// 組む（#2365）
+pub fn tako_cli_link_issue(
+    link_display: &str,
+    by_hand: bool,
+    lang: tako_core::i18n::Lang,
+) -> String {
+    use tako_core::i18n::Lang::{En, Ja};
+    match (by_hand, lang) {
+        (true, Ja) => format!(
             "tako CLI のリンク（{link_display}）の指す先が消えている。tako.app を移動・入れ直した場合は、\
              その tako を起動し直すと張り直される（#1502）"
-        );
+        ),
+        (true, En) => format!(
+            "the tako CLI link ({link_display}) points to something that is gone. If you moved or \
+             reinstalled tako.app, starting that tako again recreates the link (#1502)"
+        ),
+        (false, Ja) => format!(
+            "tako CLI のリンク（{link_display}）の指す先が消えている。tako.app を移動・削除した場合は \
+             tako setup bootstrap path で張り直すこと（#1502）"
+        ),
+        (false, En) => format!(
+            "the tako CLI link ({link_display}) points to something that is gone. If you moved or \
+             deleted tako.app, recreate it with tako setup bootstrap path (#1502)"
+        ),
     }
-    format!(
-        "tako CLI のリンク（{link_display}）の指す先が消えている。tako.app を移動・削除した場合は \
-         tako setup bootstrap path で張り直すこと（#1502）"
-    )
 }
 
 /// `dirs` をログインシェルの PATH（Windows はユーザー環境変数）へ通す
@@ -2795,7 +2927,7 @@ mod tests {
     #[test]
     fn 新しいタブの1行は次の1手の手前に入る() {
         let base = auth_instructions_for(AgentKind::Claude);
-        let note = new_tab_note_text(AgentKind::Claude);
+        let note = new_tab_note_text_in(AgentKind::Claude, tako_core::i18n::Lang::Ja);
         let lines = with_new_tab_note(base.clone(), Some(note.clone()));
         let at_note = lines.iter().position(|l| *l == note).expect("1 行が入る");
         let at_next = lines

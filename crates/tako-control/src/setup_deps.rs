@@ -38,7 +38,8 @@
 use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
-use tako_core::platform::support::Platform;
+use tako_core::i18n::Lang;
+use tako_core::platform::support::{Note, Platform};
 
 /// 導入手段。**tako が実行を代行してよいか**は手段ごとに決まる
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,52 +95,69 @@ pub struct ExternalDep {
     pub bin: &'static str,
     /// 必須依存か（false = 任意。無くても tako 自体は動く）
     pub required: bool,
-    /// 影響する機能
-    pub purpose: &'static str,
+    /// 影響する機能（日英の対。JSON と `tako setup` は日本語、check-health / `--check` は表示言語 = #2365）
+    pub purpose: Note,
     /// 導入手段（None = 手段が無いので案内のみ）
     pub installer: Option<DepInstaller>,
-    /// 手段が使えないときの案内
-    pub hint: &'static str,
+    /// 手段が使えないときの案内（日英の対。URL は同じ）
+    pub hint: Note,
 }
 
 /// そのプラットフォームの依存表（**純粋関数**なので macOS から Windows 側も検証できる）
 pub fn deps(platform: Platform) -> Vec<ExternalDep> {
+    // URL のように日英で同じ案内
+    let same = |text: &'static str| Note::new(text, text);
     let container = match platform {
         Platform::MacOs => ExternalDep {
             bin: "tmux",
             required: false,
-            purpose: "リモート接続（tako remote）・再起動時のセッション完全復元・オーケストレーターの worker 管理",
+            purpose: Note::new(
+                "リモート接続（tako remote）・再起動時のセッション完全復元・オーケストレーターの worker 管理",
+                "remote access (tako remote), full session restore after restart, and orchestrator worker management",
+            ),
             installer: Some(DepInstaller::Brew { pkg: "tmux" }),
-            hint: "https://github.com/tmux/tmux/wiki/Installing",
+            hint: same("https://github.com/tmux/tmux/wiki/Installing"),
         },
         // Windows の器は psmux（tmux 互換 CLI の別実装）。**`tmux` を探しても見つからない**
         Platform::Windows => ExternalDep {
             bin: "psmux",
             required: false,
-            purpose: "再起動時のセッション完全復元・オーケストレーターの worker 管理",
+            purpose: Note::new(
+                "再起動時のセッション完全復元・オーケストレーターの worker 管理",
+                "full session restore after restart and orchestrator worker management",
+            ),
             installer: Some(DepInstaller::Winget {
                 pkg: "marlocarlo.psmux",
             }),
-            hint: "https://github.com/marlocarlo/psmux",
+            hint: same("https://github.com/marlocarlo/psmux"),
         },
     };
     let git = ExternalDep {
         bin: "git",
         required: false,
-        purpose: "git パネル（ブランチ・コミットグラフ・diff 表示）",
+        purpose: Note::new(
+            "git パネル（ブランチ・コミットグラフ・diff 表示）",
+            "the git panel (branches, commit graph, and diff view)",
+        ),
         installer: match platform {
             Platform::MacOs => Some(DepInstaller::Brew { pkg: "git" }),
             Platform::Windows => Some(DepInstaller::Winget { pkg: "Git.Git" }),
         },
         hint: match platform {
-            Platform::MacOs => "xcode-select --install でも導入できます",
-            Platform::Windows => "https://git-scm.com/download/win",
+            Platform::MacOs => Note::new(
+                "xcode-select --install でも導入できます",
+                "xcode-select --install also installs it",
+            ),
+            Platform::Windows => same("https://git-scm.com/download/win"),
         },
     };
     let tailscale = ExternalDep {
         bin: "tailscale",
         required: false,
-        purpose: "スマホからのリモート接続（tako remote。WireGuard E2E 暗号化）",
+        purpose: Note::new(
+            "スマホからのリモート接続（tako remote。WireGuard E2E 暗号化）",
+            "remote access from a phone (tako remote; WireGuard end-to-end encryption)",
+        ),
         installer: match platform {
             Platform::MacOs => Some(DepInstaller::Brew { pkg: "tailscale" }),
             Platform::Windows => Some(DepInstaller::Winget {
@@ -147,8 +165,11 @@ pub fn deps(platform: Platform) -> Vec<ExternalDep> {
             }),
         },
         hint: match platform {
-            Platform::MacOs => "App Store で「Tailscale」を検索、または brew install tailscale",
-            Platform::Windows => "https://tailscale.com/download/windows",
+            Platform::MacOs => Note::new(
+                "App Store で「Tailscale」を検索、または brew install tailscale",
+                "search for \"Tailscale\" in the App Store, or brew install tailscale",
+            ),
+            Platform::Windows => same("https://tailscale.com/download/windows"),
         },
     };
     vec![container, git, tailscale]
@@ -204,7 +225,15 @@ pub struct DepStatus {
 /// 「在るが動かない」依存の 1 句（[`DepStatus::unrunnable_text`] と、JSON から組み直す
 /// `tako setup deps` の表示が通す 1 実装。#1816）
 pub fn unrunnable_line(bin: &str, path: &str) -> String {
-    format!("{bin}: 在りますが実行できません（{path}）")
+    unrunnable_line_in(bin, path, Lang::Ja)
+}
+
+/// [`unrunnable_line`] を表示言語で（check-health / `--check` の依存の行。#2365）
+pub fn unrunnable_line_in(bin: &str, path: &str, lang: Lang) -> String {
+    match lang {
+        Lang::Ja => format!("{bin}: 在りますが実行できません（{path}）"),
+        Lang::En => format!("{bin}: present but cannot run ({path})"),
+    }
 }
 
 impl DepStatus {
@@ -214,7 +243,7 @@ impl DepStatus {
             "bin": self.dep.bin,
             "found": self.found,
             "required": self.dep.required,
-            "purpose": self.dep.purpose,
+            "purpose": self.dep.purpose.ja(),
             "install_command": installer.map(DepInstaller::command_line),
             // 手段があっても代行できないことがある（Windows の winget）
             "can_run": self.can_tako_install(),
@@ -222,7 +251,7 @@ impl DepStatus {
             "install_dir": self
                 .installer_path()
                 .and_then(|program| installer.and_then(|i| install_dir(i, program))),
-            "hint": self.dep.hint,
+            "hint": self.dep.hint.ja(),
             // #1533: 検出を上限で打ち切った（null = 確かめた答え。立っていて found が null なら不明）
             "lookup_timeout": self.unconfirmed().map(|n| json!({
                 "label": n.label,
@@ -249,10 +278,15 @@ impl DepStatus {
     /// 在るが動かないときに人へ出す 1 句（`tako setup` の依存段・`--check` が同じ文面を出す。#1816）。
     /// `[OK]` とは言わない: 在るので入れ直させないが、remote は使えない
     pub fn unrunnable_text(&self) -> Option<String> {
+        self.unrunnable_text_in(Lang::Ja)
+    }
+
+    /// [`Self::unrunnable_text`] を表示言語で（#2365）
+    pub fn unrunnable_text_in(&self, lang: Lang) -> Option<String> {
         self.found
             .as_deref()
             .filter(|_| self.unrunnable())
-            .map(|path| unrunnable_line(self.dep.bin, path))
+            .map(|path| unrunnable_line_in(self.dep.bin, path, lang))
     }
 
     /// 見つからないのが検出の打ち切りのせい（= 確かめられなかった）ならその知らせ（#1533）
@@ -264,11 +298,21 @@ impl DepStatus {
 
     /// 打ち切りのときに人へ出す 1 句（`tako setup` / `--check` / `tako remote setup` が同じ文面を出す）
     pub fn unconfirmed_text(&self) -> Option<String> {
-        self.unconfirmed().map(|n| {
-            format!(
-                "{}: 確認できません（ログインシェルが {} 秒で応答なし）",
-                self.dep.bin, n.waited_secs
-            )
+        self.unconfirmed_text_in(Lang::Ja)
+    }
+
+    /// [`Self::unconfirmed_text`] を表示言語で（#2365）
+    pub fn unconfirmed_text_in(&self, lang: Lang) -> Option<String> {
+        let bin = self.dep.bin;
+        self.unconfirmed().map(|n| match lang {
+            Lang::Ja => format!(
+                "{bin}: 確認できません（ログインシェルが {} 秒で応答なし）",
+                n.waited_secs
+            ),
+            Lang::En => format!(
+                "{bin}: cannot check (the login shell did not respond in {} s)",
+                n.waited_secs
+            ),
         })
     }
 
@@ -341,10 +385,21 @@ impl GuideReason {
     /// 「聞けたはずなのに聞かなかった」ときだけ理由を人へ出す
     /// （`CannotRun` / `CheckOnly` は直前の表示が既に理由を語っている）
     pub fn note(self) -> Option<&'static str> {
-        match self {
-            Self::CannotRun | Self::CheckOnly => None,
-            Self::Legacy => Some("（TAKO_1499_LEGACY=1 のため確認を省きました）"),
-            Self::NoTerminal => Some("（端末が無いので確認を省きました）"),
+        self.note_in(Lang::Ja)
+    }
+
+    /// [`Self::note`] を表示言語で（#2365）
+    pub fn note_in(self, lang: Lang) -> Option<&'static str> {
+        match (self, lang) {
+            (Self::CannotRun | Self::CheckOnly, _) => None,
+            (Self::Legacy, Lang::Ja) => Some("（TAKO_1499_LEGACY=1 のため確認を省きました）"),
+            (Self::Legacy, Lang::En) => {
+                Some("(skipped the question because of TAKO_1499_LEGACY=1)")
+            }
+            (Self::NoTerminal, Lang::Ja) => Some("（端末が無いので確認を省きました）"),
+            (Self::NoTerminal, Lang::En) => {
+                Some("(skipped the question because there is no terminal)")
+            }
         }
     }
 }
@@ -624,7 +679,7 @@ pub fn install_typed(
             skipped.push(json!({
                 "bin": state.dep.bin,
                 "reason": "no_installer",
-                "detail": format!("自動導入の手段がありません: {}", state.dep.hint),
+                "detail": format!("自動導入の手段がありません: {}", state.dep.hint.ja()),
             }));
             continue;
         };
@@ -647,7 +702,7 @@ pub fn install_typed(
                     "{} が見つかりません。{} を導入するか、{} を参照してください",
                     installer.program(),
                     installer.program(),
-                    state.dep.hint
+                    state.dep.hint.ja()
                 ),
             }));
             continue;
@@ -746,6 +801,9 @@ pub struct DepPromptIo<'a> {
     pub reader: &'a mut dyn BufRead,
     /// 行頭の字下げ（`tako setup` は 6 マス / `tako remote setup` は 2 マス）
     pub indent: &'a str,
+    /// 案内・確認の文の言語（`tako setup` / `tako remote setup` は日本語、`--check` /
+    /// check-health の読み取りの文脈は表示言語 = #2365）
+    pub lang: Lang,
 }
 
 /// [`offer_and_install`] の結末。**呼び手はこれを見て次を決める**
@@ -759,47 +817,75 @@ pub enum DepOutcome {
 
 /// 「何を・どの導入器で・どこへ入れるか」の 1 行（#1499。聞く前に必ず見せる）
 pub fn install_plan_line(state: &DepStatus) -> Option<String> {
+    install_plan_line_in(state, Lang::Ja)
+}
+
+/// [`install_plan_line`] を表示言語で（check-health / `--check` の依存の行。#2365）
+pub fn install_plan_line_in(state: &DepStatus, lang: Lang) -> Option<String> {
     let installer = state.dep.installer?;
     let command = installer.command_line();
     let Some(program) = state.installer_path() else {
-        return Some(format!("導入: {command}"));
+        return Some(match lang {
+            Lang::Ja => format!("導入: {command}"),
+            Lang::En => format!("install: {command}"),
+        });
     };
     let program_display = tako_core::paths::shorten_home(program);
-    Some(match install_dir(installer, program) {
-        Some(dir) => format!(
-            "導入: {command}（導入器 {program_display} → {} へ入ります）",
-            tako_core::paths::shorten_home(&dir)
-        ),
-        None => format!("導入: {command}（導入器 {program_display}）"),
+    let dir = install_dir(installer, program).map(|dir| tako_core::paths::shorten_home(&dir));
+    Some(match (dir, lang) {
+        (Some(dir), Lang::Ja) => {
+            format!("導入: {command}（導入器 {program_display} → {dir} へ入ります）")
+        }
+        (Some(dir), Lang::En) => {
+            format!("install: {command} (installer {program_display} → goes into {dir})")
+        }
+        (None, Lang::Ja) => format!("導入: {command}（導入器 {program_display}）"),
+        (None, Lang::En) => format!("install: {command} (installer {program_display})"),
     })
 }
 
 /// tako が代行できないときに「人が打つべきコマンド」の 1 行
 pub fn manual_hint_line(state: &DepStatus) -> String {
+    manual_hint_line_in(state, Lang::Ja)
+}
+
+/// [`manual_hint_line`] を表示言語で（#2365）
+pub fn manual_hint_line_in(state: &DepStatus, lang: Lang) -> String {
     let dep = state.dep;
+    let hint = dep.hint.text_in(lang);
     let Some(installer) = dep.installer else {
-        return format!("導入方法: {}", dep.hint);
+        return match lang {
+            Lang::Ja => format!("導入方法: {hint}"),
+            Lang::En => format!("how to install: {hint}"),
+        };
     };
     // brew が無いのは macOS で一番多い詰まり方。Homebrew は管理者パスワードを
     // 求めるため tako は導入を代行しない（#868）
-    let note = if installer.program() == "brew" && state.installer_path().is_none() {
-        "（要 Homebrew: https://brew.sh）"
-    } else {
-        ""
+    let needs_brew = installer.program() == "brew" && state.installer_path().is_none();
+    let note = match (needs_brew, lang) {
+        (false, _) => "",
+        (true, Lang::Ja) => "（要 Homebrew: https://brew.sh）",
+        (true, Lang::En) => " (needs Homebrew: https://brew.sh)",
     };
-    format!(
-        "導入方法: {}{note} / {}",
-        installer.command_line(),
-        dep.hint
-    )
+    let command = installer.command_line();
+    match lang {
+        Lang::Ja => format!("導入方法: {command}{note} / {hint}"),
+        Lang::En => format!("how to install: {command}{note} / {hint}"),
+    }
 }
 
 /// 「いま入れる」の最簡形案内（#322）。導入手段が無い依存には出さない
 pub fn deps_install_hint(state: &DepStatus) -> Option<String> {
+    deps_install_hint_in(state, Lang::Ja)
+}
+
+/// [`deps_install_hint`] を表示言語で（#2365）
+pub fn deps_install_hint_in(state: &DepStatus, lang: Lang) -> Option<String> {
     let command = state.dep.installer?.command_line();
-    Some(format!(
-        "いま入れる: tako setup deps install   （{command} 相当）"
-    ))
+    Some(match lang {
+        Lang::Ja => format!("いま入れる: tako setup deps install   （{command} 相当）"),
+        Lang::En => format!("install now: tako setup deps install   (same as {command})"),
+    })
 }
 
 /// 未検出の依存 1 件について「次に打つ 1 行」（#1507。`tako setup` の末尾の要約用）。
@@ -821,53 +907,61 @@ pub fn next_step_line(state: &DepStatus) -> String {
 /// 判断は [`offer_for`]（理由を返す純粋関数）・導入は [`install`]・再検出は
 /// [`resolve`] を通る。**導入器をここ以外で起こさない**のが #1509 の不変条件で、
 /// 番犬 `crates/tako-control/tests/issue1509_dep_install_watchdog.rs` が
-/// 直叩きの再登場を `file:line` で落とす
+/// 直叩きの再登場を `file:line` で落とす。
+///
+/// 文の言語は `io.lang`（`tako setup` / `tako remote setup` は日本語、`--check` の読み取りは表示言語。#2365）
 pub fn offer_and_install(
     state: &DepStatus,
     ctx: DepOfferContext,
     io: &mut DepPromptIo<'_>,
 ) -> Result<DepOutcome, String> {
     let dep = state.dep;
+    let lang = io.lang;
     // 導入済みかを確かめられなかった（#1533）。「見つかりません」「インストールしますか」とは言わない
-    if let Some(text) = state.unconfirmed_text() {
+    if let Some(text) = state.unconfirmed_text_in(lang) {
         say(io, &text)?;
         say(
             io,
-            ".zprofile などのログインシェルの設定が入力を待っていないか確かめてください（入れずに進みます）",
+            match lang {
+                Lang::Ja => ".zprofile などのログインシェルの設定が入力を待っていないか確かめてください（入れずに進みます）",
+                Lang::En => "Check that login shell settings such as .zprofile are not waiting for input (continuing without installing)",
+            },
         )?;
         return Ok(DepOutcome::NotInstalled);
     }
     match offer_for(state.can_tako_install(), ctx) {
         DepOffer::Guide(GuideReason::CannotRun) => {
-            say(io, &manual_hint_line(state))?;
+            say(io, &manual_hint_line_in(state, lang))?;
             return Ok(DepOutcome::NotInstalled);
         }
         DepOffer::Guide(reason) => {
             say_plan(io, state)?;
-            if let Some(hint) = deps_install_hint(state) {
+            if let Some(hint) = deps_install_hint_in(state, lang) {
                 say(io, &hint)?;
             }
             // 「聞けたはずなのに聞かなかった」ときだけ理由を出す
-            if let Some(note) = reason.note() {
+            if let Some(note) = reason.note_in(lang) {
                 say(io, note)?;
             }
             return Ok(DepOutcome::NotInstalled);
         }
         DepOffer::Ask => {
             say_plan(io, state)?;
-            write!(
-                io.writer,
-                "{}{} をインストールしますか？ [y/N]: ",
-                io.indent, dep.bin
-            )
-            .map_err(|e| e.to_string())?;
+            let question = match lang {
+                Lang::Ja => format!("{} をインストールしますか？ [y/N]: ", dep.bin),
+                Lang::En => format!("Install {}? [y/N]: ", dep.bin),
+            };
+            write!(io.writer, "{}{question}", io.indent).map_err(|e| e.to_string())?;
             let _ = io.writer.flush();
             let mut input = String::new();
             if io.reader.read_line(&mut input).is_err() {
                 writeln!(io.writer).map_err(|e| e.to_string())?;
                 say(
                     io,
-                    "入力を読めませんでした（後から `tako setup deps install` で導入できます）",
+                    match lang {
+                        Lang::Ja => "入力を読めませんでした（後から `tako setup deps install` で導入できます）",
+                        Lang::En => "Could not read the input (you can install it later with `tako setup deps install`)",
+                    },
                 )?;
                 return Ok(DepOutcome::NotInstalled);
             }
@@ -875,14 +969,27 @@ pub fn offer_and_install(
             if answer != "y" && answer != "yes" {
                 say(
                     io,
-                    "スキップしました（後から `tako setup deps install` で導入できます）",
+                    match lang {
+                        Lang::Ja => {
+                            "スキップしました（後から `tako setup deps install` で導入できます）"
+                        }
+                        Lang::En => {
+                            "Skipped (you can install it later with `tako setup deps install`)"
+                        }
+                    },
                 )?;
                 return Ok(DepOutcome::NotInstalled);
             }
         }
         DepOffer::AutoInstall => {
             say_plan(io, state)?;
-            say(io, "--yes のため確認を省略してインストールします")?;
+            say(
+                io,
+                match lang {
+                    Lang::Ja => "--yes のため確認を省略してインストールします",
+                    Lang::En => "Installing without asking because of --yes",
+                },
+            )?;
         }
     }
     match install(
@@ -900,8 +1007,12 @@ pub fn offer_and_install(
         }
         Err(e) => {
             // 導入に失敗しても**呼び手を止めない**。次の一手へ落とす（#1499）
-            say(io, &format!("[警告] {e}"))?;
-            if let Some(hint) = deps_install_hint(state) {
+            let tag = match lang {
+                Lang::Ja => "[警告]",
+                Lang::En => "[warning]",
+            };
+            say(io, &format!("{tag} {e}"))?;
+            if let Some(hint) = deps_install_hint_in(state, lang) {
                 say(io, &hint)?;
             }
             Ok(DepOutcome::NotInstalled)
@@ -911,7 +1022,7 @@ pub fn offer_and_install(
 
 /// 導入計画の 1 行を出す（手段が無い依存では何も出ない）
 fn say_plan(io: &mut DepPromptIo<'_>, state: &DepStatus) -> Result<(), String> {
-    match install_plan_line(state) {
+    match install_plan_line_in(state, io.lang) {
         Some(line) => say(io, &line),
         None => Ok(()),
     }
@@ -945,8 +1056,14 @@ mod tests {
                     "{platform:?}: 必須の依存を増やさない（{}）",
                     dep.bin
                 );
-                assert!(!dep.purpose.is_empty(), "{} の purpose が空", dep.bin);
-                assert!(!dep.hint.is_empty(), "{} の hint が空", dep.bin);
+                assert!(!dep.purpose.ja().is_empty(), "{} の purpose が空", dep.bin);
+                assert!(
+                    !dep.purpose.en().is_empty(),
+                    "{} の purpose（英語）が空",
+                    dep.bin
+                );
+                assert!(!dep.hint.ja().is_empty(), "{} の hint が空", dep.bin);
+                assert!(!dep.hint.en().is_empty(), "{} の hint（英語）が空", dep.bin);
             }
         }
     }
@@ -1121,9 +1238,12 @@ mod tests {
             dep: ExternalDep {
                 bin: "tailscale",
                 required: false,
-                purpose: "テスト",
+                purpose: Note::new("テスト", "test"),
                 installer,
-                hint: "App Store で「Tailscale」を検索",
+                hint: Note::new(
+                    "App Store で「Tailscale」を検索",
+                    "search for Tailscale in the App Store",
+                ),
             },
             found: None,
             installer_found: installer_found.map(str::to_string),
@@ -1142,6 +1262,7 @@ mod tests {
                 writer: &mut out,
                 reader: &mut reader,
                 indent: "  ",
+                lang: Lang::Ja,
             },
         )
         .expect("書き出しは失敗しない");
