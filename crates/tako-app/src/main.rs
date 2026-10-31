@@ -21371,14 +21371,10 @@ impl TakoApp {
     ///
     /// #2009: 裏で手放したプレイヤーは控えた再生状態（位置・速度・音量・ミュート・ループ）で
     /// 開き直す。表に戻した描画・CLI / MCP の操作のどちらから来ても同じ 1 本を通る
-    fn ensure_video_player(&mut self, pane_id: PaneId) -> Result<(), String> {
-        self.ensure_video_player_typed(pane_id)
-            .map_err(String::from)
-    }
-
-    /// [`Self::ensure_video_player`] の型の口（#2365。CLI / MCP へは表示言語の文、stderr の診断へは
-    /// 日本語の文 = `start_video_player`）
-    fn ensure_video_player_typed(&mut self, pane_id: PaneId) -> Result<(), HostRefusal> {
+    ///
+    /// 断りは型で返す（#2365。CLI / MCP の口は `?` で表示言語の文、stderr の診断へは日本語の文 =
+    /// `start_video_player`）
+    fn ensure_video_player(&mut self, pane_id: PaneId) -> Result<(), HostRefusal> {
         if self.video_players.contains_key(&pane_id) {
             return Ok(());
         }
@@ -21412,7 +21408,7 @@ impl TakoApp {
         if self.video_players.contains_key(&pane_id) {
             return;
         }
-        match self.ensure_video_player_typed(pane_id) {
+        match self.ensure_video_player(pane_id) {
             Ok(()) => {
                 if let Some(player) = self.video_players.get_mut(&pane_id) {
                     player.play();

@@ -8265,10 +8265,6 @@ const HOST_IMPL_SCOPES: &[(&str, &str)] = &[
         "    fn run_preview_command_local(",
     ),
     ("crates/tako-app/src/main.rs", "    fn ensure_video_player("),
-    (
-        "crates/tako-app/src/main.rs",
-        "    fn ensure_video_player_typed(",
-    ),
     ("crates/tako-app/src/main.rs", "    fn create_webview("),
     (
         "crates/tako-app/src/chat_view.rs",
@@ -15480,7 +15476,7 @@ const GUI_CALLER_SCOPES: &[GuiCallerScope] = &[
     ),
     (
         "crates/tako-app/src/main.rs",
-        Some("    fn ensure_video_player_typed("),
+        Some("    fn ensure_video_player("),
         &[],
     ),
     (
