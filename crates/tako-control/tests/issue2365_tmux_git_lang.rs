@@ -85,8 +85,23 @@ fn has_japanese(s: &str) -> Option<char> {
         .find(|c| matches!(*c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF))
 }
 
-/// 器のソケット名（`TAKO_TMUX_SOCKET`。TMUX_TMPDIR が一時の場所なのでプロセスごとに分けなくてよい）
-const SOCK: &str = "tk";
+#[path = "common/tmux_e2e.rs"]
+mod tmux_e2e;
+
+/// 器のソケット名（`TAKO_TMUX_SOCKET`。このプロセス専用 = 残骸掃除が拾える形。#1300 / #1874）
+fn sock() -> &'static str {
+    tmux_e2e::socket_for("2365")
+}
+
+/// 器のセッションを返す（このプロセスの最後の 1 本なら器ごと畳んでソケットファイルまで消す。#1866）。
+/// 失敗の経路でも走るよう Drop に置く
+struct SessionGuard;
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        tmux_e2e::release_session(sock(), SESSION);
+    }
+}
 /// 器に置くセッション
 const SESSION: &str = "s2365";
 /// どこにも無いセッション
@@ -291,77 +306,78 @@ fn cases(tmux: bool) -> Vec<Case> {
     use Old::{Exact, External, Prefix};
     let mut out = Vec::new();
     if tmux {
-        let sock = |suffix: &str| format!("{SOCK}-{suffix}");
+        // 偽の tmux が失敗の形を選ぶソケット名（器の名前 + 末尾）
+        let faked = |suffix: &str| format!("{}-{suffix}", sock());
         out.extend([
             plain(
                 "tmux kill（どこにも無いセッション）",
                 req(kill(None, NOSUCH, None)),
                 Exact(
                     "tmux セッション nosuch-2365 が見つからない（既定サーバーと tako バックエンド\
-                     （socket: tk）のどちらにも無い）。対象は `tako tmux list` で確認すること",
+                     （socket: <sock>）のどちらにも無い）。対象は `tako tmux list` で確認すること",
                 ),
             ),
             plain(
                 "tmux kill（器に無いセッション）",
-                req(kill(Some(SOCK), NOSUCH, None)),
+                req(kill(Some(sock()), NOSUCH, None)),
                 Exact(
                     "セッション nosuch-2365 の kill に失敗した: tmux セッション nosuch-2365 が \
-                     socket: tk に無い。対象は `tako tmux list` で確認すること",
+                     socket: <sock> に無い。対象は `tako tmux list` で確認すること",
                 ),
             ),
             plain(
                 "tmux kill（無い window）",
-                req(kill(Some(SOCK), SESSION, Some(9))),
+                req(kill(Some(sock()), SESSION, Some(9))),
                 Exact(
                     "window 9 の kill に失敗した: その window が tmux セッション s2365\
-                     （socket: tk）に無い。対象は `tako tmux list` で確認すること",
+                     （socket: <sock>）に無い。対象は `tako tmux list` で確認すること",
                 ),
             ),
             plain(
                 "tmux resize（無い window）",
-                req(resize(SOCK, false)),
+                req(resize(sock(), false)),
                 Exact(
                     "window 9 のリサイズに失敗した: その window が tmux セッション s2365\
-                     （socket: tk）に無い。対象は `tako tmux list` で確認すること",
+                     （socket: <sock>）に無い。対象は `tako tmux list` で確認すること",
                 ),
             ),
             plain(
                 "tmux resize --reset（無い window）",
-                req(resize(SOCK, true)),
+                req(resize(sock(), true)),
                 Exact(
                     "window 9 のサイズ解除に失敗した: その window が tmux セッション s2365\
-                     （socket: tk）に無い。対象は `tako tmux list` で確認すること",
+                     （socket: <sock>）に無い。対象は `tako tmux list` で確認すること",
                 ),
             ),
             plain(
                 "tmux kill（サーバーが動いていない）",
-                req(kill(Some(&sock("dead")), SESSION, None)),
+                req(kill(Some(&faked("dead")), SESSION, None)),
                 Exact(
-                    "セッション s2365 の kill に失敗した: tmux サーバー（socket: tk-dead）が\
+                    "セッション s2365 の kill に失敗した: tmux サーバー（socket: <sock>-dead）が\
                      動いていない。対象は `tako tmux list` で確認すること",
                 ),
             ),
             plain(
                 "tmux kill（tmux が理由を返さない）",
-                req(kill(Some(&sock("silent")), SESSION, None)),
+                req(kill(Some(&faked("silent")), SESSION, None)),
                 Exact(
                     "セッション s2365 の kill に失敗した: tmux が理由を返さずに失敗した\
-                     （socket: tk-silent）。対象は `tako tmux list` で確認すること",
+                     （socket: <sock>-silent）。対象は `tako tmux list` で確認すること",
                 ),
             ),
             plain(
                 "tmux kill（tmux の文にパス）",
-                req(kill(Some(&sock("path")), SESSION, None)),
+                req(kill(Some(&faked("path")), SESSION, None)),
                 Exact(
-                    "セッション s2365 の kill に失敗した: tmux が失敗した（socket: tk-path）: \
+                    "セッション s2365 の kill に失敗した: tmux が失敗した（socket: <sock>-path）: \
                      lost server <path> oops。対象は `tako tmux list` で確認すること",
                 ),
             ),
             plain(
                 "tmux kill（tmux が応答しない）",
-                req(kill(Some(&sock("hang")), SESSION, None)),
+                req(kill(Some(&faked("hang")), SESSION, None)),
                 Exact(
-                    "セッション s2365 の kill に失敗した: tmux が失敗した（socket: tk-hang）: \
+                    "セッション s2365 の kill に失敗した: tmux が失敗した（socket: <sock>-hang）: \
                      tmux が 5 秒応答しないので打ち切った。対象は `tako tmux list` で確認すること",
                 ),
             ),
@@ -376,7 +392,7 @@ fn cases(tmux: bool) -> Vec<Case> {
                 workers: None,
                 old_ja: Exact(
                     "window 9 の選択に失敗した: その window が tmux セッション s2365\
-                     （socket: tk）に無い。対象は `tako tmux list` で確認すること",
+                     （socket: <sock>）に無い。対象は `tako tmux list` で確認すること",
                 ),
             },
             plain(
@@ -390,7 +406,7 @@ fn cases(tmux: bool) -> Vec<Case> {
                 }),
                 Exact(
                     "tmux セッション nosuch-2365 が見つからない（既定サーバーと tako バックエンド\
-                     （socket: tk）のどちらにも無い）。対象は `tako tmux list` で確認すること",
+                     （socket: <sock>）のどちらにも無い）。対象は `tako tmux list` で確認すること",
                 ),
             ),
         ]);
@@ -641,6 +657,7 @@ fn with_pane(request: Request, id: u64) -> Request {
 fn expand_old(old: &str, root: &Path, c: &Case) -> String {
     let cfg = c.config.map(|p| config_dir(root, p)).unwrap_or_default();
     old.replace("<cfg>", &cfg.display().to_string())
+        .replace("<sock>", sock())
 }
 
 fn matches_old(got: &str, c: &Case, root: &Path) -> Result<(), String> {
@@ -732,11 +749,32 @@ fn tmuxとgitとworkerの解決ほかの断りは表示言語に従う() {
     // tmux: 既定のサーバーも `-L` のソケットも一時の TMUX_TMPDIR の下（本番の `tmux -L tako` に届かない）
     std::env::remove_var("TMUX");
     std::env::set_var("TMUX_TMPDIR", &root);
-    std::env::set_var("TAKO_TMUX_SOCKET", SOCK);
+    std::env::set_var("TAKO_TMUX_SOCKET", sock());
     // git の文は英語に固定する（外部の文が日英で同じことを見る）
     std::env::set_var("LANG", "C");
     std::env::remove_var("LC_ALL");
     std::env::remove_var("LC_MESSAGES");
+    // 器（本物の tmux。共通の 1 実装 = 設定ファイルを読まない・期限つき・理由を連れて返る）は
+    // 偽のログインシェルを置く**前に**起こす（器は `$SHELL -c` でセッションのコマンドを走らせる）
+    let _guard = match &real {
+        Some(real) => {
+            let fake = root.join("fake-tmux");
+            write_exec(
+                &fake,
+                &FAKE_TMUX.replace("@REAL@", &real.display().to_string()),
+            );
+            std::env::set_var("TAKO_TMUX_BIN", &fake);
+            let guard = SessionGuard;
+            if let Err(diag) = tmux_e2e::new_session(sock(), &["-d", "-s", SESSION, "sleep 600"]) {
+                panic!("器のセッションを作れない: {diag}");
+            }
+            Some(guard)
+        }
+        None => {
+            eprintln!("tmux が無いので tmux のケースを外す");
+            None
+        }
+    };
     let fakebin = root.join("fakebin");
     std::fs::create_dir_all(&fakebin).unwrap();
     write_exec(&fakebin.join("claude"), FAILING);
@@ -746,33 +784,6 @@ fn tmuxとgitとworkerの解決ほかの断りは表示言語に従う() {
     let mut dirs = vec![fakebin.clone()];
     dirs.extend(std::env::split_paths(&path));
     std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
-    if let Some(real) = &real {
-        let fake = root.join("fake-tmux");
-        write_exec(
-            &fake,
-            &FAKE_TMUX.replace("@REAL@", &real.display().to_string()),
-        );
-        std::env::set_var("TAKO_TMUX_BIN", &fake);
-        // 器（本物の tmux。設定ファイルは読まない）
-        let status = std::process::Command::new(real)
-            .env("SHELL", "/bin/sh")
-            .args([
-                "-L",
-                SOCK,
-                "-f",
-                "/dev/null",
-                "new-session",
-                "-d",
-                "-s",
-                SESSION,
-            ])
-            .arg("sleep 600")
-            .status()
-            .expect("tmux を起こせる");
-        assert!(status.success(), "器のセッションを作れない");
-    } else {
-        eprintln!("tmux が無いので tmux のケースを外す");
-    }
     make_repo(&root.join("repo"));
     make_places(&root);
 
@@ -869,11 +880,7 @@ fn tmuxとgitとworkerの解決ほかの断りは表示言語に従う() {
         failures.push("断ったのに workers.yaml を書き換えた".into());
     }
 
-    if let Some(real) = &real {
-        let _ = std::process::Command::new(real)
-            .args(["-L", SOCK, "kill-server"])
-            .status();
-    }
+    drop(_guard);
     restore_places(&root);
     let _ = std::fs::remove_dir_all(&root);
     eprintln!(

@@ -81,7 +81,7 @@ impl AgentScanError {
                     .to_string()
             }
             (Self::ScanFailed, En) => {
-                "claude agents --json failed (the claude CLI is missing or exited abnormally)"
+                "claude agents --json failed (the claude CLI was not found or exited abnormally)"
                     .to_string()
             }
             (Self::NotUtf8(error), Ja) => format!("出力が UTF-8 でない: {error}"),
