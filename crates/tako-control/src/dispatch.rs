@@ -16624,7 +16624,8 @@ pub fn dispatch_config_share(
             .operation())
         }
     };
-    result.map_err(DispatchError::Operation)
+    // 断り（`ShareRefusal`）は表示言語で組む（#2365）
+    result.map_err(config_share::ShareRefusal::operation)
 }
 
 /// SSH ペインの argv（#919）。

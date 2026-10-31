@@ -512,7 +512,7 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   （表示言語で判定が変わらない）。tmux 自身の stderr は外部の出力で日英とも同じ（パスらしいトークンだけ伏せる）。
   ほかに、コミットの詳細（`git::show_commit_typed` / `GitError::CommitUnparsable`）・エディタへの打鍵
   （`EditorCommand::typed` → `TypeRefusal`）・言語サーバの初期化オプションのキーの形（`init_options::OptionRefusal`。
-  CLI の `--set` の読み取り `parse_assignment` は CLI の手元の処理なので日本語のまま）・worker の解決とレジストリの
+  CLI の `--set` の読み取り `parse_assignment` も次のスライスで同じ型を返す形へ）・worker の解決とレジストリの
   読み取り（`WorkerRegistry::load_typed` / `load_from_typed` / `resolve_typed` → `RegistryError`）・worker 配置の設定の
   config.yaml（`setup::mutate_config_typed` → `SetupConfigError`。読むだけは既存の `load_config_typed`）・エージェント
   一覧（`agents::list_agents_with_panes_typed` → `AgentScanError`）。`String` を返す従来の口は日本語のまま
@@ -520,6 +520,21 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `friendly_error` の全文の表・`TMUX_GIT_SCOPES`・`TMUX_DISPATCH_HEADS` / `JA_DISPATCH_CALLS`）と git の節
   （`show_commit_typed` / `run_git_show`）、実経路は `tests/issue2365_tmux_git_lang.rs`（本物の tmux を一時の
   `TMUX_TMPDIR` で起こし、失敗の形はソケット名で選ぶ偽の tmux。偽の claude とログインシェル）
+- #2365 の続きで、**AI 系設定の共有**（CLI `tako config` / MCP `tako_config_share`）の断りを
+  `config_share::ShareRefusal`（33 種）と `GitError`（git を起動できない / 失敗 + git 自身の stderr）へ寄せた
+  （`config_share/refusal.rs`）。`config_share` の口（`init` / `link` / `unlink` / `status` / `push` / `pull` /
+  `load_state` / `export_content` / `import_content`・`portable::strip_local_fields` / `restore_local_fields`）は
+  呼び手が dispatch だけなので、日本語の `String` の口を残さず**その場で型を返す**。応答の値に載る誤り文
+  （`push` の `push_error`・`status` の `files[].error`）も同じ型から表示言語で組む。`hint`（`Ok` の値）と既定の
+  コミットメッセージ（`[改善] tako 設定共有を更新` = git へ書く値。断りの git の引数にもそのまま出る）は対象外。
+  commit の「名前が未設定」の見分けは `GitError::mentions`（git の出力と引数だけを見る = 修正前の文全体の
+  `contains` と同じ範囲）。CLI の手元の処理も 3 か所を型へ: `tako orchestrator watch --worker`
+  （`init_local_lang()` + `load_typed` / `resolve_typed`。枠は `Reason::WorkerRegistryUnreadable`）・
+  `tako lsp options --set` の読み取り（`parse_assignment` が `OptionRefusal`（`NotAssignment` を足した）を返す）・
+  `tako remote agents`（`list_agents_with_panes_typed`）。番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節
+  （`ShareRefusal` / `GitError` の表・`CONFIG_SHARE_SCOPES`・`JA_SHARE_CLI_CALLS`・dispatch と CLI の口）、実経路は
+  `tests/issue2365_config_share_lang.rs`（`dispatch_config_share` を日英で叩く。置き場・git の設定・リモートは一時の
+  場所 = 無いパスと bare。git の包み `TAKO_GIT_BIN` を外して「起動できない」を作る）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

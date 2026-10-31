@@ -33,6 +33,9 @@ pub mod catalog;
 pub mod env;
 pub mod guard;
 pub mod portable;
+pub mod refusal;
+
+pub use refusal::{GitError, ShareRefusal};
 
 use catalog::{Class, Entry, Root};
 use serde::{Deserialize, Serialize};
@@ -59,64 +62,56 @@ pub struct ShareState {
     pub linked_at: Option<String>,
 }
 
-fn data_dir() -> Result<PathBuf, String> {
-    tako_core::paths::data_dir().ok_or_else(|| "データディレクトリを解決できません".to_string())
+fn data_dir() -> Result<PathBuf, ShareRefusal> {
+    tako_core::paths::data_dir().ok_or(ShareRefusal::DataDirUnresolved)
 }
 
-fn home_dir() -> Result<PathBuf, String> {
-    tako_core::paths::home_dir()
-        .ok_or_else(|| "ホームディレクトリを解決できません（$HOME 未設定）".to_string())
+fn home_dir() -> Result<PathBuf, ShareRefusal> {
+    tako_core::paths::home_dir().ok_or(ShareRefusal::HomeUnresolved)
 }
 
 /// 配線状態ファイルのパス
-pub fn state_path() -> Result<PathBuf, String> {
+pub fn state_path() -> Result<PathBuf, ShareRefusal> {
     Ok(data_dir()?.join(STATE_FILE))
 }
 
-pub fn load_state() -> Result<Option<ShareState>, String> {
+pub fn load_state() -> Result<Option<ShareState>, ShareRefusal> {
     let path = state_path()?;
     if !path.is_file() {
         return Ok(None);
     }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("配線状態の読み取りに失敗 ({}): {e}", path.display()))?;
-    serde_json::from_str(&content).map(Some).map_err(|e| {
-        format!(
-            "配線状態のパースに失敗 ({}): {}",
-            path.display(),
-            tako_core::load_issue::json_error_reason(&e)
-        )
-    })
+    let content = std::fs::read_to_string(&path).map_err(|e| ShareRefusal::StateRead {
+        path: path.display().to_string(),
+        error: e.to_string(),
+    })?;
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|e| ShareRefusal::StateParse {
+            path: path.display().to_string(),
+            reason: tako_core::load_issue::JsonReason::of(&e),
+        })
 }
 
-fn save_state(state: &ShareState) -> Result<(), String> {
+fn save_state(state: &ShareState) -> Result<(), ShareRefusal> {
     let path = state_path()?;
     let content = serde_json::to_string_pretty(state)
-        .map_err(|e| format!("配線状態のシリアライズに失敗: {e}"))?;
-    crate::config_io::atomic_write(&path, &content)
+        .map_err(|e| ShareRefusal::StateSerialize(e.to_string()))?;
+    Ok(crate::config_io::atomic_write_typed(&path, &content)?)
 }
 
 /// 配線済みリポジトリを取得する。未配線なら案内つきエラー
-fn linked_repo() -> Result<PathBuf, String> {
-    let state = load_state()?.ok_or_else(|| {
-        "設定共有が未配線です。`tako config init` で新規リポジトリを作るか、\n\
-         `tako config link <パス|URL>` で既存リポジトリに繋いでください"
-            .to_string()
-    })?;
+fn linked_repo() -> Result<PathBuf, ShareRefusal> {
+    let state = load_state()?.ok_or(ShareRefusal::NotLinked)?;
     let repo = PathBuf::from(&state.repo);
     if !repo.join(".git").exists() {
-        return Err(format!(
-            "配線先が git リポジトリではありません: {}\n\
-             `tako config link <パス|URL>` で繋ぎ直してください",
-            repo.display()
-        ));
+        return Err(ShareRefusal::LinkedNotGit(repo.display().to_string()));
     }
     Ok(repo)
 }
 
 // --- git 実行 ---------------------------------------------------------------
 
-fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
+fn git(repo: &Path, args: &[&str]) -> Result<String, GitError> {
     // #586: GUI プロセス（dispatch / MCP）から到達するのでコンソールウィンドウを出させない
     let output = tako_core::platform::process::no_console_window(&mut std::process::Command::new(
         tako_core::git::git_bin(),
@@ -124,13 +119,15 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
     .current_dir(repo)
     .args(args)
     .output()
-    .map_err(|e| format!("git の実行に失敗 ({}): {e}", args.join(" ")))?;
+    .map_err(|e| GitError::Spawn {
+        args: args.join(" "),
+        error: e.to_string(),
+    })?;
     if !output.status.success() {
-        return Err(format!(
-            "git {} が失敗しました:\n{}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        return Err(GitError::Failed {
+            args: args.join(" "),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -237,9 +234,11 @@ fn walk(root: Root, dir: &Path, prefix: &str, out: &mut Vec<String>) {
 }
 
 /// 実体の内容を共有用に変換する（ローカルフィールド除去 → ホームパスの可搬化）
-pub fn export_content(entry: &Entry, live: &Path) -> Result<String, String> {
-    let raw = std::fs::read_to_string(live)
-        .map_err(|e| format!("読み取りに失敗 ({}): {e}", live.display()))?;
+pub fn export_content(entry: &Entry, live: &Path) -> Result<String, ShareRefusal> {
+    let raw = std::fs::read_to_string(live).map_err(|e| ShareRefusal::FileUnreadable {
+        path: live.display().to_string(),
+        error: e.to_string(),
+    })?;
     let stripped = match portable::format_of(live) {
         Some(format) => portable::strip_local_fields(&raw, format, entry.local_fields)?,
         // 構造を持たないファイル（markdown 等）はフィールド操作の対象外
@@ -250,7 +249,7 @@ pub fn export_content(entry: &Entry, live: &Path) -> Result<String, String> {
 }
 
 /// 共有内容を実体用に変換する（可搬パスの展開 → ローカルフィールドの復元）
-pub fn import_content(entry: &Entry, shared: &str, live: &Path) -> Result<String, String> {
+pub fn import_content(entry: &Entry, shared: &str, live: &Path) -> Result<String, ShareRefusal> {
     let Some(format) = portable::format_of(live) else {
         // markdown 等は `~/…` のままが正しい表記なので展開しない（portable の設計判断）
         return Ok(shared.to_string());
@@ -289,17 +288,17 @@ fn load_manifest(repo: &Path) -> Manifest {
         .unwrap_or_default()
 }
 
-fn write_manifest(repo: &Path, files: &[String]) -> Result<(), String> {
+fn write_manifest(repo: &Path, files: &[String]) -> Result<(), ShareRefusal> {
     let manifest = Manifest {
         schema: manifest_schema(),
         generated_by: Some(format!("tako {}", env!("CARGO_PKG_VERSION"))),
         generated_at: Some(crate::sessions::now_iso()),
         files: files.to_vec(),
     };
-    let content =
-        serde_yaml::to_string(&manifest).map_err(|e| format!("manifest の生成に失敗: {e}"))?;
+    let content = serde_yaml::to_string(&manifest)
+        .map_err(|e| ShareRefusal::ManifestSerialize(e.to_string()))?;
     std::fs::write(repo.join(MANIFEST_FILE), content)
-        .map_err(|e| format!("manifest の書き込みに失敗: {e}"))
+        .map_err(|e| ShareRefusal::ManifestWrite(e.to_string()))
 }
 
 /// 共有リポジトリの README。何が入っていて何が入っていないかを人が読める形で残す
@@ -399,7 +398,7 @@ pub fn list_in(lang: tako_core::i18n::Lang) -> Value {
 
 /// 新しい共有リポジトリを作って配線する。
 /// `remote` を渡すと origin として登録し、初回 push まで行う
-pub fn init(path: Option<&str>, remote: Option<&str>) -> Result<Value, String> {
+pub fn init(path: Option<&str>, remote: Option<&str>) -> Result<Value, ShareRefusal> {
     let repo = resolve_repo_path(path)?;
     if repo.join(".git").exists() {
         // すでに git リポジトリなら init ではなく link 相当（作り直さない）
@@ -418,13 +417,9 @@ pub fn init(path: Option<&str>, remote: Option<&str>) -> Result<Value, String> {
             .map(|mut d| d.next().is_some())
             .unwrap_or(false)
     {
-        return Err(format!(
-            "{} は空でないディレクトリで、git リポジトリでもありません。\n\
-             別の場所を --path で指定するか、そこで git init してから `tako config link` してください",
-            repo.display()
-        ));
+        return Err(ShareRefusal::InitNotEmpty(repo.display().to_string()));
     }
-    std::fs::create_dir_all(&repo).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+    std::fs::create_dir_all(&repo).map_err(|e| ShareRefusal::CreateDir(e.to_string()))?;
     git(&repo, &["init"])?;
     if let Some(url) = remote {
         git(&repo, &["remote", "add", "origin", url])?;
@@ -444,10 +439,10 @@ pub fn init(path: Option<&str>, remote: Option<&str>) -> Result<Value, String> {
 }
 
 /// 既存リポジトリに配線する。`target` はローカルパスまたは git URL
-pub fn link(target: &str, path: Option<&str>) -> Result<Value, String> {
+pub fn link(target: &str, path: Option<&str>) -> Result<Value, ShareRefusal> {
     let target = target.trim();
     if target.is_empty() {
-        return Err("リポジトリのパスまたは URL を指定してください".into());
+        return Err(ShareRefusal::LinkTargetEmpty);
     }
     let repo = if is_git_url(target) {
         let dest = resolve_repo_path(path)?;
@@ -456,29 +451,19 @@ pub fn link(target: &str, path: Option<&str>) -> Result<Value, String> {
                 .map(|mut d| d.next().is_some())
                 .unwrap_or(false)
         {
-            return Err(format!(
-                "clone 先 {} が空ではありません。--path で別の場所を指定してください",
-                dest.display()
-            ));
+            return Err(ShareRefusal::CloneDestNotEmpty(dest.display().to_string()));
         }
-        let parent = dest
-            .parent()
-            .ok_or_else(|| "clone 先の親ディレクトリを解決できません".to_string())?;
-        std::fs::create_dir_all(parent).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+        let parent = dest.parent().ok_or(ShareRefusal::CloneParentUnresolved)?;
+        std::fs::create_dir_all(parent).map_err(|e| ShareRefusal::CreateDir(e.to_string()))?;
         git(parent, &["clone", target, &dest.to_string_lossy()])?;
         dest
     } else {
         let repo = expand_path(target)?;
         if !repo.is_dir() {
-            return Err(format!("ディレクトリが見つかりません: {}", repo.display()));
+            return Err(ShareRefusal::DirNotFound(repo.display().to_string()));
         }
         if !repo.join(".git").exists() {
-            return Err(format!(
-                "{} は git リポジトリではありません。\n\
-                 新規に作るなら `tako config init --path {}` を使ってください",
-                repo.display(),
-                repo.display()
-            ));
+            return Err(ShareRefusal::LinkNotGit(repo.display().to_string()));
         }
         repo
     };
@@ -500,11 +485,11 @@ pub fn link(target: &str, path: Option<&str>) -> Result<Value, String> {
 }
 
 /// 配線を外す（リポジトリ自体は消さない）
-pub fn unlink() -> Result<Value, String> {
+pub fn unlink() -> Result<Value, ShareRefusal> {
     let path = state_path()?;
     let state = load_state()?;
     if path.is_file() {
-        std::fs::remove_file(&path).map_err(|e| format!("配線状態の削除に失敗: {e}"))?;
+        std::fs::remove_file(&path).map_err(|e| ShareRefusal::StateRemove(e.to_string()))?;
     }
     Ok(json!({
         "action": "unlinked",
@@ -517,7 +502,7 @@ fn is_git_url(target: &str) -> bool {
     target.contains("://") || target.starts_with("git@") || target.ends_with(".git")
 }
 
-fn expand_path(raw: &str) -> Result<PathBuf, String> {
+fn expand_path(raw: &str) -> Result<PathBuf, ShareRefusal> {
     let expanded = crate::orchestrator::expand_tilde(raw);
     let path = PathBuf::from(&expanded);
     if path.is_absolute() {
@@ -525,10 +510,10 @@ fn expand_path(raw: &str) -> Result<PathBuf, String> {
     }
     std::env::current_dir()
         .map(|d| d.join(path))
-        .map_err(|e| format!("カレントディレクトリを解決できません: {e}"))
+        .map_err(|e| ShareRefusal::CwdUnresolved(e.to_string()))
 }
 
-fn resolve_repo_path(path: Option<&str>) -> Result<PathBuf, String> {
+fn resolve_repo_path(path: Option<&str>) -> Result<PathBuf, ShareRefusal> {
     match path {
         Some(p) => expand_path(p),
         None => Ok(home_dir()?.join(DEFAULT_REPO_DIR)),
@@ -536,7 +521,7 @@ fn resolve_repo_path(path: Option<&str>) -> Result<PathBuf, String> {
 }
 
 /// 現在の共有状態
-pub fn status() -> Result<Value, String> {
+pub fn status() -> Result<Value, ShareRefusal> {
     let Some(state) = load_state()? else {
         return Ok(json!({
             "linked": false,
@@ -575,7 +560,8 @@ pub fn status() -> Result<Value, String> {
         entries.push(json!({
             "path": file.repo_rel,
             "state": state_str,
-            "error": exported.err(),
+            // 誤り文は表示言語で組む（#2365。応答の値でも断りと同じ言語）
+            "error": exported.err().map(|e| e.to_string()),
         }));
     }
 
@@ -678,7 +664,7 @@ fn classify_repo_path(repo_rel: &str) -> Option<(Root, &'static Entry)> {
 }
 
 /// 実体 → リポジトリ。変換・検査・コミット・push まで
-pub fn push(message: Option<&str>, no_push: bool) -> Result<Value, String> {
+pub fn push(message: Option<&str>, no_push: bool) -> Result<Value, ShareRefusal> {
     let repo = linked_repo()?;
     let (files, unclassified) = collect_shared_files();
 
@@ -691,7 +677,7 @@ pub fn push(message: Option<&str>, no_push: bool) -> Result<Value, String> {
         staged.push((file.repo_rel.clone(), content));
     }
     if !findings.is_empty() {
-        return Err(guard::describe(&findings));
+        return Err(ShareRefusal::SecretsFound(findings));
     }
 
     // 2. 書き出し
@@ -699,15 +685,19 @@ pub fn push(message: Option<&str>, no_push: bool) -> Result<Value, String> {
     for (repo_rel, content) in &staged {
         let dest = repo.join(repo_rel);
         if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("ディレクトリの作成に失敗 ({}): {e}", parent.display()))?;
+            std::fs::create_dir_all(parent).map_err(|e| ShareRefusal::CreateDirAt {
+                path: parent.display().to_string(),
+                error: e.to_string(),
+            })?;
         }
         let changed = std::fs::read_to_string(&dest)
             .map(|c| c != *content)
             .unwrap_or(true);
         if changed {
-            std::fs::write(&dest, content)
-                .map_err(|e| format!("書き込みに失敗 ({}): {e}", dest.display()))?;
+            std::fs::write(&dest, content).map_err(|e| ShareRefusal::WriteFailed {
+                path: dest.display().to_string(),
+                error: e.to_string(),
+            })?;
         }
         written.push(repo_rel.clone());
     }
@@ -722,8 +712,10 @@ pub fn push(message: Option<&str>, no_push: bool) -> Result<Value, String> {
         }
         let path = repo.join(old);
         if path.is_file() {
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("削除に失敗 ({}): {e}", path.display()))?;
+            std::fs::remove_file(&path).map_err(|e| ShareRefusal::RemoveFailed {
+                path: path.display().to_string(),
+                error: e.to_string(),
+            })?;
             removed.push(old.clone());
         }
     }
@@ -731,9 +723,9 @@ pub fn push(message: Option<&str>, no_push: bool) -> Result<Value, String> {
     // 4. メタデータ
     write_manifest(&repo, &written)?;
     std::fs::write(repo.join(README_FILE), readme_text())
-        .map_err(|e| format!("README の書き込みに失敗: {e}"))?;
+        .map_err(|e| ShareRefusal::ReadmeWrite(e.to_string()))?;
     std::fs::write(repo.join(GITIGNORE_FILE), gitignore_text())
-        .map_err(|e| format!("gitignore の書き込みに失敗: {e}"))?;
+        .map_err(|e| ShareRefusal::GitignoreWrite(e.to_string()))?;
 
     // 5. tako が書いたパスだけを stage する。
     //    `git add -A` にすると、利用者が手で置いたファイル（秘匿かもしれない）まで
@@ -755,14 +747,10 @@ pub fn push(message: Option<&str>, no_push: bool) -> Result<Value, String> {
         let msg = message.unwrap_or("[改善] tako 設定共有を更新");
         git(&repo, &["commit", "-m", msg]).map_err(|e| {
             // 新しいデバイスでよく踏む。git のエラーは長いので、やることを 1 行で足す
-            if e.contains("tell me who you are") || e.contains("empty ident") {
-                format!(
-                    "{e}\n\nこのデバイスに git の名前が未設定です。次を実行してから再試行してください:\n  \
-                     git config --global user.name \"あなたの名前\"\n  \
-                     git config --global user.email \"you@example.com\""
-                )
+            if e.mentions("tell me who you are") || e.mentions("empty ident") {
+                ShareRefusal::CommitNoIdent(e)
             } else {
-                e
+                ShareRefusal::Git(e)
             }
         })?;
         commit_hash = git_opt(&repo, &["rev-parse", "--short", "HEAD"]);
@@ -778,6 +766,7 @@ pub fn push(message: Option<&str>, no_push: bool) -> Result<Value, String> {
             // 初回は upstream が無いので設定して再試行する
             Err(first) => match git(&repo, &["push", "-u", "origin", "HEAD"]) {
                 Ok(_) => pushed = true,
+                // 誤り文は表示言語で組む（#2365。応答の値でも断りと同じ言語）
                 Err(second) => push_error = Some(format!("{first}\n{second}")),
             },
         }
@@ -806,7 +795,7 @@ pub fn push(message: Option<&str>, no_push: bool) -> Result<Value, String> {
 }
 
 /// リポジトリ → 実体。取り込み前に git pull（remote があれば）
-pub fn pull() -> Result<Value, String> {
+pub fn pull() -> Result<Value, ShareRefusal> {
     let repo = linked_repo()?;
     let remote = remote_url(&repo);
     let mut fetched = false;
@@ -815,18 +804,11 @@ pub fn pull() -> Result<Value, String> {
         // 分岐していたら人が解決する（案内を返す）
         match git(&repo, &["pull", "--ff-only"]) {
             Ok(_) => fetched = true,
-            Err(e) => {
-                return Err(format!(
-                    "{e}\n\n\
-                     両方のデバイスで同じ設定を変更した可能性があります。次のどちらかで解決してください:\n\
-                     1. 共有リポジトリで解決する:\n   \
-                        cd {} && git pull --rebase   # 競合したら中身を直して git rebase --continue\n\
-                     2. このデバイスの内容を正とする:\n   \
-                        cd {} && git rebase --abort（実行中なら）→ tako config push\n\
-                     解決後にもう一度 `tako config pull` を実行してください",
-                    repo.display(),
-                    repo.display()
-                ));
+            Err(git) => {
+                return Err(ShareRefusal::PullDiverged {
+                    git,
+                    repo: repo.display().to_string(),
+                });
             }
         }
     }
@@ -853,8 +835,12 @@ pub fn pull() -> Result<Value, String> {
             .map(|(_, rest)| rest.to_string())
             .unwrap_or_default();
         let live = root_dir.join(&rel);
-        let shared = std::fs::read_to_string(repo.join(&repo_rel))
-            .map_err(|e| format!("読み取りに失敗 ({repo_rel}): {e}"))?;
+        let shared = std::fs::read_to_string(repo.join(&repo_rel)).map_err(|e| {
+            ShareRefusal::FileUnreadable {
+                path: repo_rel.clone(),
+                error: e.to_string(),
+            }
+        })?;
         let content = import_content(entry, &shared, &live)?;
         let before = std::fs::read_to_string(&live).ok();
         let action = if before.as_deref() == Some(content.as_str()) {
@@ -867,10 +853,10 @@ pub fn pull() -> Result<Value, String> {
         if action != "unchanged" {
             if let Some(parent) = live.parent() {
                 std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+                    .map_err(|e| ShareRefusal::CreateDir(e.to_string()))?;
             }
             // 既存内容は世代バックアップに退避してから置き換える（#169 の部品を再利用）
-            crate::config_io::atomic_write_with_backup(&live, &content)?;
+            crate::config_io::atomic_write_with_backup_typed(&live, &content)?;
         }
         // このデバイスで埋める必要がある値（資格情報の場所・env）を知らせる。
         // 「無くて当然」のもの（inherit なアカウント）は免除する
