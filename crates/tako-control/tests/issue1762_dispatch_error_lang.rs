@@ -8834,9 +8834,19 @@ fn 会話とosの設定の断りは全バリアントが日英を持ち日本語
 
     let mut failures = Vec::new();
     for (r, old) in &sessions {
+        // 日英の対を書いた行を添える（#2365 の続き: 落ちたときに腕を名指す）
+        let at = |lang| {
+            where_written(
+                SESSION_REFUSAL_SRC,
+                SESSION_REFUSAL_PATH,
+                "impl SessionRefusal {",
+                &format!("{r:?}"),
+                lang,
+            )
+        };
         check_refusal_row(
             &mut failures,
-            format!("{r:?}"),
+            format!("{r:?}（日本語 {} / 英語 {}）", at(Lang::Ja), at(Lang::En)),
             old,
             r.text_in(Lang::Ja),
             r.text_in(Lang::En),
