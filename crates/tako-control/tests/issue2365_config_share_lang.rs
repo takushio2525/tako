@@ -128,14 +128,22 @@ enum Old {
     Around(String, String),
 }
 
-/// 1 件の叩き方: 前準備（`n` は何回目か）・叩く（断りの文か、応答の値の誤り文）・旧文
+/// 前準備（`n` は何回目か）
+type Prep = Box<dyn Fn(&Ctx, usize)>;
+/// 叩く（断りの文か、応答の値の誤り文）
+type Act = Box<dyn Fn(&Ctx) -> String>;
+/// #2365 より前の文
+type OldOf = Box<dyn Fn(&Ctx) -> Old>;
+/// 後片付け（権限を戻す・env を戻す）
+type After = Box<dyn Fn(&Ctx)>;
+
+/// 1 件の叩き方
 struct Case {
     name: &'static str,
-    prep: Box<dyn Fn(&Ctx, usize)>,
-    act: Box<dyn Fn(&Ctx) -> String>,
-    old: Box<dyn Fn(&Ctx) -> Old>,
-    /// 後片付け（権限を戻す・env を戻す）
-    after: Box<dyn Fn(&Ctx)>,
+    prep: Prep,
+    act: Act,
+    old: OldOf,
+    after: After,
 }
 
 fn case(

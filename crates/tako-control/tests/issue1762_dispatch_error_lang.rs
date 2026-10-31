@@ -14864,6 +14864,9 @@ const JA_SHARE_CLI_CALLS: [&str; 7] = [
     "Lang::Ja",
 ];
 
+/// CLI の走査の範囲（関数の頭・枝の頭と終わり・`init_local_lang()` が要るか）
+type CliScope = (&'static str, Option<(&'static str, &'static str)>, bool);
+
 #[test]
 fn dispatchのconfig_shareとcliの手元の処理は日本語の口を呼ばない() {
     let mut failures = Vec::new();
@@ -14890,7 +14893,7 @@ fn dispatchのconfig_shareとcliの手元の処理は日本語の口を呼ばな
         }
     }
     // CLI の手元の処理: 型の口を呼び、呼ぶ前に表示言語を設定から決める
-    let cli_scopes: [(&str, Option<(&str, &str)>, bool); 4] = [
+    let cli_scopes: [CliScope; 4] = [
         ("fn config_share_local(", None, false),
         (
             "fn orchestrator_watch(",
