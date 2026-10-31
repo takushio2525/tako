@@ -926,9 +926,11 @@ mod tests {
             std::env::set_var("TAKO_PANE_ID", "7");
             std::env::set_var("CLAUDECODE", "1");
             std::env::set_var("GIT_EDITOR", "true");
+            // 区切りは起動時に当てる側と同じ OS の区切り（Windows は `;`）
+            let sep = crate::claude_mod::LIST_SEP;
             std::env::set_var(
                 "XDG_DATA_DIRS",
-                format!("{FISH}:/usr/local/share:/usr/share"),
+                format!("{FISH}{sep}/usr/local/share{sep}/usr/share"),
             );
             std::env::set_var("TAKO_ISOLATED", "1");
         };
