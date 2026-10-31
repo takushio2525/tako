@@ -3835,6 +3835,12 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   そのまま効く**（`atexit` + 次回起動時の pid 回収 + `tako test-residue` から見える）。
   `KINDS` へ種別を足したら CLI / MCP の案内も足す（番犬 `種別はcliとmcpの案内に載っている`）
 - 消す経路は `remove_scratch` の 1 本で、**一時ディレクトリ配下であることを確かめてから**消す
+- **言語サーバを起こした e2e は、置き場を手放す前に止め終わりまで待つ**（#2555）。
+  `LspManager::stop`（`tako lsp stop` と同じ口）は shutdown → exit を別スレッドへ渡して**待たずに返る**ので、
+  テストの最後を `stop` で終えると、置き場の削除と偽サーバの `exit` の書き込みが競って置き場が消え残る
+  （修正前は TMPDIR 直下の `tako-2035-*` が 263 個・`tako-2048-*` が 85 個。テストは緑のまま）。
+  止めるだけなら `shutdown_all`（同期）、stop の経路を見るなら `stopped` を待つ。番犬は
+  `crates/tako-control/tests/issue2555_lsp_stop_then_scope_end_watchdog.rs`（file:line で名指す）
 - 番犬は 2 段: `tako_core::test_residue` の
   `テストを一巡してもtmpdirに残骸が残らない`（**このテストバイナリをもう一度回して実際に数える**。
   個々のテストの成否では落とさず、残骸の件数だけを見る）と、

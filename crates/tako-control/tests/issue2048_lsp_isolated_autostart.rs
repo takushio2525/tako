@@ -12,7 +12,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,21 +22,19 @@ use tako_core::lsp::goto::GotoKind;
 use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
+use tako_core::test_residue::ScratchDir;
 
 const FAKE: &str = env!("CARGO_BIN_EXE_tako-lsp-fake");
 
-/// 使い捨ての置き場（固定名を使わない = 並行する cargo test 同士で消し合わない。#1666）
-struct Scratch(PathBuf);
+/// 使い捨ての置き場（固定名を使わない = 並行する cargo test 同士で消し合わない。#1666）。
+/// 置き場は #1312 の `ScratchDir`（`tako-test-scratch-<pid>/` の下）で、偽サーバを起こしたテストは
+/// **`shutdown_all` で止めてから**手放す（`stop` は止め終わるのを待たない = 直後に消すと偽サーバの
+/// `exit` の書き込みで置き場が消え残る。#2555）
+struct Scratch(ScratchDir);
 
 impl Scratch {
     fn new(label: &str) -> Self {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "tako-2048-{label}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = ScratchDir::new(&format!("2048-{label}"));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
         Self(dir)
@@ -53,12 +50,6 @@ impl Scratch {
 
     fn spawns(&self) -> PathBuf {
         self.0.join("spawns.txt")
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -185,7 +176,7 @@ fn 隔離では開いても起こさず_restart_で起きる() {
     });
     assert!(server_status(&manager)["reason"].is_null());
     assert!(!manager.document_server(&path).expect("ある").held);
-    manager.stop(None);
+    manager.shutdown_all(Duration::from_secs(2));
 }
 
 /// 隔離で起こさなかった器を明示の stop で止めたら、理由は「stop で止めた」へ替わる
@@ -223,7 +214,7 @@ fn 隔離でなければ開いた時点で起こす() {
         });
         assert_eq!(spawn_count(&scratch), 1);
         assert_eq!(manager.status(None)["autostart"], json!(true));
-        manager.stop(None);
+        manager.shutdown_all(Duration::from_secs(2));
     }
 }
 
