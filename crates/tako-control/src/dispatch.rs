@@ -9074,6 +9074,10 @@ fn dispatch_inner(
                             .iter()
                             .map(|&(row, sc, ec)| json!([row, sc, ec]))
                             .collect::<Vec<_>>(),
+                        // #2578: 行をまたいだリンクの折り返しの種類（soft = 端末の折り返し /
+                        // app = claude 等が改行 + 字下げで続けた形。null = 1 行に収まっている）。
+                        // spans は行ごとの位置で、app の字下げは含まない
+                        "wrap": link.wrap.map(|w| w.as_str()),
                     });
                     // パスは「cmd+クリックでどう開くか」まで答える（#1283 の受け入れ条件 3）。
                     // 対応表の正本は `tako_core::open_plan`
@@ -35283,6 +35287,69 @@ mod tests {
         assert_eq!(links[1]["open"], "markdown");
         // 未知の拡張子はテキストとして開く（読めなければ preview が「バイナリファイル」を出す）
         assert_eq!(links[2]["open"], "code");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2578: claude が改行 + 字下げで折り返した URL / パスを 1 本で返し、
+    /// 折り返しの種類（`wrap`）とまたがった各行の位置（`spans`）を載せる
+    #[test]
+    fn links_は折り返したurlとパスを1本で返し各行の位置を載せる_2578() {
+        let mut host = MockHost::new();
+        let dir = std::env::temp_dir().join(format!("tako_dispatch_2578_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir
+            .join("a-very-long-directory-name-for-the-wrap-test-2578")
+            .join("target-file-for-the-wrapped-link-check.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "").unwrap();
+        let url = format!(
+            "https://example.com/tako/issues/2578?first={}&second={}",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        let path = file.display().to_string();
+        // claude の返答と同じ形: 先頭行は `* ` + 前置き、続きは 2 桁の字下げで右端まで詰める
+        let cols = 50usize;
+        let fold = |lead: &str, token: &str| -> Vec<String> {
+            let mut rows = vec![format!("* {lead}")];
+            for ch in token.chars() {
+                if rows.last().unwrap().chars().count() == cols {
+                    rows.push("  ".to_string());
+                }
+                rows.last_mut().unwrap().push(ch);
+            }
+            rows
+        };
+        let mut lines = fold("See ", &url);
+        lines.extend(fold("Open ", &path));
+        lines.push("tako %".to_string());
+        let result = dispatch(
+            &mut host,
+            Request::Links {
+                pane: None,
+                text: Some(lines.join("\n")),
+                cols: Some(cols),
+                cwd: None,
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        let links = result["links"].as_array().unwrap();
+        assert_eq!(links.len(), 2, "{result:#}");
+        let (u, p) = (&links[0], &links[1]);
+        assert_eq!(u["target"], url.as_str());
+        assert_eq!(u["text"], url.as_str(), "下線の範囲は字下げを含まない");
+        assert_eq!(u["wrap"], "app");
+        let spans = u["spans"].as_array().unwrap();
+        assert!(spans.len() >= 3, "{u}");
+        assert_eq!(spans[0], json!([0, 6, cols]));
+        assert!(spans[1..].iter().all(|s| s[1] == 2), "{u}");
+        assert_eq!(
+            std::path::Path::new(p["target"].as_str().unwrap()),
+            file.as_path()
+        );
+        assert_eq!(p["wrap"], "app");
+        assert_eq!(p["open"], "code");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

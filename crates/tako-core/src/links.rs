@@ -4,7 +4,7 @@
 //! GPUI 非依存。UI 層は検出結果を使って cmd+ホバー下線や cmd+クリック開く処理を行う。
 
 use crate::platform::support::Platform;
-use crate::screen::Screen;
+use crate::screen::{Screen, ScreenLine};
 use std::{
     ops::Range,
     path::{Path, PathBuf},
@@ -20,6 +20,8 @@ pub struct DetectedLink {
     /// 画面上のスパン（行をまたぐ場合は複数）。各要素は (row, start_col, end_col)
     /// end_col は exclusive
     pub spans: Vec<(usize, usize, usize)>,
+    /// 行をまたいだときの折り返しの種類（`None` = 1 行に収まっている。#2578）
+    pub wrap: Option<LinkWrap>,
 }
 
 /// リンクの種別
@@ -29,11 +31,28 @@ pub enum LinkKind {
     Path,
 }
 
+/// リンクがまたいだ折り返しの種類（#2578）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkWrap {
+    /// 端末の折り返し（行が右端まで埋まって次の行の先頭へ続いた）
+    Soft,
+    /// アプリ自身の折り返し（claude などが改行して字下げした続き。字下げは飛ばしてつなぐ）
+    App,
+}
+
+impl LinkWrap {
+    /// CLI / MCP の応答の綴り
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinkWrap::Soft => "soft",
+            LinkWrap::App => "app",
+        }
+    }
+}
+
 /// 画面上のリンクを検出する（URL のみ。パス検出不要な呼び出し用）
 pub fn detect_links(screen: &Screen) -> Vec<DetectedLink> {
-    let mut links = Vec::new();
-    detect_urls(screen, &mut links);
-    links
+    detect_all(screen, None, legacy_1283(), legacy_2578())
 }
 
 /// 画面上のリンクを検出する。cwd を渡すとファイル/ディレクトリパスも検出する。
@@ -63,20 +82,93 @@ pub fn detect_links_with_home_in(
     home: Option<&Path>,
     legacy: bool,
 ) -> Vec<DetectedLink> {
-    let mut links = Vec::new();
-    detect_urls(screen, &mut links);
-    let url_links = links.clone();
+    detect_wrapped_in(screen, cwd, home, legacy, legacy_2578())
+}
+
+/// #2578 の A/B。`TAKO_2578_LEGACY=1` で**同一バイナリのまま**修正前の結合
+/// （右端まで埋まった行だけを次の行の先頭へ直結する）へ戻す
+pub fn legacy_2578() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2578_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// [`detect_links_with_home_in`] の本体（#2578 の A/B 用に折り返しの判断も引数で受け取る形）。
+/// GUI の cmd+クリック・ホバーの下線・cmd+右クリックのメニューと `tako links` は
+/// すべてここを通る（`detect_links_with_cwd` / `detect_links_with_home` の 1 実装）
+pub fn detect_wrapped_in(
+    screen: &Screen,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+    legacy: bool,
+    wrap_legacy: bool,
+) -> Vec<DetectedLink> {
+    detect_all(screen, Some((cwd, home)), legacy, wrap_legacy)
+}
+
+/// 検出の本体。`paths` が `None` なら URL だけを探す。
+///
+/// # 折り返しをまたぐリンク（#2578）
+///
+/// 1 回目は修正前と同じ結合（右端まで埋まった行だけを直結 = [`CombineMode::Base`]）で探す。
+/// **折り返しをまたがないリンクの答えはここで決まり、修正前と一致する**。
+/// 2 回目は全角の折り返しとアプリ自身の折り返し（claude が改行 + 字下げで続けた形）も
+/// つないだ結合（[`CombineMode::Extended`]）で探し、**新しくつないだ境目をまたぐリンク
+/// だけ**を、種別ごとに確かめてから採る（パス = 実在する / URL = 行の幅より長い =
+/// [`app_wrapped_url_plausible`]）。採ったリンクは 1 回目で途中まで見つかっていた
+/// リンクを置き換える（[`merge_wrapped`]）
+fn detect_all(
+    screen: &Screen,
+    paths: Option<(Option<&Path>, Option<&Path>)>,
+    legacy: bool,
+    wrap_legacy: bool,
+) -> Vec<DetectedLink> {
+    let cols = screen.cols;
+    let base = combined_screen_text(screen, CombineMode::Base);
+    let mut found = Vec::new();
+    detect_urls_in(&base, cols, wrap_legacy, &mut found);
     // パスの形の判定は実行中の OS の形で行う（#2435。`C:\…` を候補にするのは Windows だけ）
-    detect_paths(
-        screen,
+    let scan = paths.map(|(cwd, home)| PathScan {
+        cols,
         cwd,
         home,
-        &url_links,
-        &mut links,
         legacy,
-        Platform::current(),
-    );
-    links
+        wrap_legacy,
+        platform: Platform::current(),
+    });
+    if let Some(scan) = &scan {
+        let url_links: Vec<DetectedLink> = found.iter().map(|f| f.link.clone()).collect();
+        detect_paths_in(&base, scan, &url_links, false, &mut found);
+    }
+    let links: Vec<DetectedLink> = found.into_iter().map(|f| f.link).collect();
+    if wrap_legacy {
+        return links;
+    }
+
+    let extended = combined_screen_text(screen, CombineMode::Extended);
+    if !extended.seams.iter().any(|(_, seam)| seam.is_new()) {
+        return links;
+    }
+    let mut ext_found = Vec::new();
+    detect_urls_in(&extended, cols, false, &mut ext_found);
+    let ext_urls: Vec<DetectedLink> = ext_found.iter().map(|f| f.link.clone()).collect();
+    let mut wrapped: Vec<DetectedLink> = ext_found
+        .into_iter()
+        .filter(|f| {
+            extended.crosses_new_seam(&f.range) && app_wrapped_url_plausible(&extended, f, cols)
+        })
+        .map(|f| f.link)
+        .collect();
+    if let Some(scan) = &scan {
+        let mut ext_paths = Vec::new();
+        detect_paths_in(&extended, scan, &ext_urls, true, &mut ext_paths);
+        wrapped.extend(
+            ext_paths
+                .into_iter()
+                .filter(|f| extended.crosses_new_seam(&f.range))
+                .map(|f| f.link),
+        );
+    }
+    merge_wrapped(links, wrapped)
 }
 
 /// 画面テキスト（行の配列）からリンクを検出する（#1283）。
@@ -86,9 +178,9 @@ pub fn detect_links_with_home_in(
 /// GUI の cmd+クリックと**同じ判定**になる。CLI / MCP が「この画面テキストで
 /// リンクになるパス」を答えるための入口で、人手のクリック無しに検証できる形にするため。
 ///
-/// 列は「ASCII = 1 列 / それ以外 = 2 列」で数える（東アジア幅の近似）。返る
-/// スパンの列番号はこの近似に従うので、実画面の列と 1 列ずれることがある
-/// （どのパスがリンクになるかの判定には影響しない）。
+/// 列は実グリッドと同じ Unicode の東アジア幅で数える（#2578。以前は「ASCII = 1 列 /
+/// それ以外 = 2 列」の近似で、claude の行頭の印 `⏺` `❯` を 2 桁と数えて折り返しの
+/// 判定がずれた）。0 幅の結合文字は直前の文字と同じ列に積む。
 pub fn detect_in_lines(
     lines: &[String],
     cols: usize,
@@ -140,7 +232,16 @@ pub fn screen_from_lines(lines: &[String], cols: usize) -> Screen {
         let mut text = String::new();
         let mut col = 0usize;
         for ch in line.chars() {
-            let width = if ch.is_ascii() { 1 } else { 2 };
+            // 列は実グリッドと同じ東アジア幅で数える（#2578。alacritty も同じ表を引く）。
+            // 以前は「ASCII = 1 / それ以外 = 2」の近似で、claude の行頭の印（`⏺` `❯` = 1 桁）を
+            // 2 桁と数えて本文の列が 1 ずれ、アプリの折り返しの続きを見分けられなかった
+            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1);
+            if width == 0 {
+                // 0 幅の結合文字は直前の文字と同じ列に積む（実画面と同じ = #1387）
+                cell_cols.push(cell_cols.last().copied().unwrap_or(col));
+                text.push(ch);
+                continue;
+            }
             // 残り 1 列に全角は入らない（実端末は次の行へ送る）
             if col + width > cols {
                 push_row(
@@ -169,83 +270,394 @@ pub fn screen_from_lines(lines: &[String], cols: usize) -> Screen {
     }
 }
 
+/// 画面を 1 本の論理テキストへつないだもの。
+///
+/// URL とパスで同じ規則を使うことで、TUI の装飾付き折り返しでも検出範囲と
+/// hit-test 座標を一致させる。
+struct Combined {
+    text: String,
+    /// (combined 上の byte offset, row, col) の写像。改行マーカーは col = 画面の桁数
+    byte_map: Vec<(usize, usize, usize)>,
+    /// 行の境目でつないだ位置（つないだ先の最初の文字の byte offset）とつなぎ方。
+    /// 改行で区切った境目は持たない
+    seams: Vec<(usize, Seam)>,
+}
+
+/// 行の境目のつなぎ方（#2578）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Seam {
+    /// 右端まで埋まった行の続き（#1182 以来の物差し）。次の行の先頭から直結する
+    Soft,
+    /// 全角の折り返し（#2578）。行末の全角が右端まで埋めた形と、右端 1 桁に全角が入らず
+    /// 次の行へ送られた形。旧の物差し（最後の可視文字の**開始**列 + 1 が右端か）は
+    /// どちらも「埋まっていない」と読んでいた（`conventions.md` #1283 節の既知の限界）
+    WideSoft,
+    /// アプリ自身の折り返し（#2578）。claude などが語の途中や `/` `-` の手前で切り、
+    /// 続きを字下げして次の行に書いた形。**字下げを飛ばして**つなぐ（`indent` は飛ばす
+    /// 文字数 = 字下げの桁数）
+    App { indent: usize },
+}
+
+impl Seam {
+    /// 修正前の結合（[`CombineMode::Base`]）には無い境目か
+    fn is_new(self) -> bool {
+        !matches!(self, Seam::Soft)
+    }
+}
+
+/// 論理テキストの組み方（#2578）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CombineMode {
+    /// 修正前と同じ: 右端まで埋まった行だけを次の行の先頭へ直結する。
+    /// **折り返しをまたがないリンクの答えはこの結合だけで決まる**（受け入れ条件 4 の正本）
+    Base,
+    /// 全角の折り返しとアプリ自身の折り返しもつなぐ。ここで見つかったリンクは
+    /// 新しい境目をまたぐものだけを、確かめてから採る（[`detect_wrapped_in`]）
+    Extended,
+}
+
 /// 画面行を論理テキストへ連結し、各文字の画面座標を記録する。
 ///
 /// 右端まで埋まった行はターミナルの soft wrap とみなして次行へ直結し、それ以外は
-/// 改行で区切る。URL とパスで同じ規則を使うことで、TUI の装飾付き折り返しでも
-/// 検出範囲と hit-test 座標を一致させる。
-fn combined_screen_text(screen: &Screen) -> (String, Vec<(usize, usize, usize)>) {
-    let mut combined = String::new();
-    // (combined 上の byte offset, row, col) の写像
-    let mut byte_map = Vec::new();
-
+/// 改行で区切る（[`CombineMode::Base`]）。[`CombineMode::Extended`] は加えて
+/// 全角の折り返しとアプリ自身の折り返し（[`Seam`]）もつなぐ。
+fn combined_screen_text(screen: &Screen, mode: CombineMode) -> Combined {
+    let mut out = Combined {
+        text: String::new(),
+        byte_map: Vec::new(),
+        seams: Vec::new(),
+    };
+    // アプリの折り返しの境目（行の塊ごとの上限を見るので、先に画面全体で求める）
+    let app = match mode {
+        CombineMode::Base => Vec::new(),
+        CombineMode::Extended => app_wraps(screen),
+    };
+    // 前の行とアプリの折り返しでつないだとき、この行の先頭で飛ばす字下げの文字数
+    let mut skip = 0usize;
     for (row, line) in screen.lines.iter().enumerate() {
         let trimmed = line.text.trim_end();
-        for (char_idx, ch) in trimmed.chars().enumerate() {
-            let col = line.cell_cols.get(char_idx).copied().unwrap_or(char_idx);
-            let offset = combined.len();
-            combined.push(ch);
-            byte_map.push((offset, row, col));
+        for (char_idx, ch) in trimmed.chars().enumerate().skip(skip) {
+            out.byte_map
+                .push((out.text.len(), row, char_col(line, char_idx)));
+            out.text.push(ch);
         }
-        // 右端まで埋まっているか = **最後の「空白でない」文字が右端の列に在るか**。
-        //
-        // `line.cell_cols.last()` を見てはいけない（#1182）: 実画面の `ScreenLine.text`
-        // は**行末まで空白で埋まっている**（`screen::compose_line` は未使用セルも
-        // 押し込む）ので、`cell_cols.last()` は常に最終列 = **どの行も soft wrap 扱い**に
-        // なる。すると画面全体が改行なしの 1 本へ連結され、パストークンが次の行の
-        // 先頭と融合して実在しなくなる（実測: 隣接する 2 行に何か書かれているだけで
-        // ターミナル内のパスリンクが 1 つも検出されなかった）。
-        // 単体テストの `make_screen` は空白詰めをしないので、この形は再現しない
-        let last_visible_col = trimmed
-            .chars()
-            .count()
-            .checked_sub(1)
-            .and_then(|last_idx| line.cell_cols.get(last_idx).copied());
-        let line_fills_width = trimmed.chars().count() >= screen.cols
-            || last_visible_col.is_some_and(|col| col + 1 >= screen.cols);
-        if !line_fills_width {
-            let offset = combined.len();
-            combined.push('\n');
-            byte_map.push((offset, row, screen.cols));
+        skip = 0;
+        let app_indent = app.get(row).copied().flatten();
+        match seam_after(screen, row, mode, app_indent) {
+            Some(seam) => {
+                if let Seam::App { indent } = seam {
+                    skip = indent;
+                }
+                out.seams.push((out.text.len(), seam));
+            }
+            None => {
+                out.byte_map.push((out.text.len(), row, screen.cols));
+                out.text.push('\n');
+            }
         }
     }
+    out
+}
 
-    (combined, byte_map)
+/// `text` の `idx` 番目の文字が居る列
+fn char_col(line: &ScreenLine, idx: usize) -> usize {
+    line.cell_cols.get(idx).copied().unwrap_or(idx)
+}
+
+/// 文字の桁数（0 幅の結合文字も 1 と数える = 列の見積もりにだけ使う）
+fn char_cells(ch: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(ch)
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// 最後の可視文字の右端（exclusive）の列（#2578）。
+///
+/// 幅はグリッドから採る: 実画面の `ScreenLine` は行末まで空白で埋まっているので、
+/// 次のセルの列との差が文字の幅になる（全角は 2）。次のセルが無い = 右端の文字なので、
+/// そのときだけ文字の幅（Unicode の東アジア幅）で数える
+fn visible_end_col(line: &ScreenLine) -> Option<usize> {
+    let trimmed = line.text.trim_end();
+    let (idx, ch) = trimmed.chars().enumerate().last()?;
+    let col = char_col(line, idx);
+    let width = match line.cell_cols.get(idx + 1) {
+        Some(&next) if next > col => next - col,
+        _ => char_cells(ch),
+    };
+    Some(col + width)
+}
+
+/// 枠・罫線の文字か（表の列の区切り・引用の縦線。リンクの続きにはならない）
+fn is_frame_char(ch: char) -> bool {
+    matches!(ch, '|' | '\u{2500}'..='\u{259F}')
+}
+
+/// 行頭の印（`⏺` `❯` `-` `*` `•` `⎿` `1.` `12)` 等）か。
+///
+/// 英数字を含まない 1〜2 文字か、数字 + `.` / `)` を印とみなす。パスの始まりになる
+/// 文字（`/` `~` `.` 引用符・括弧）は印にしない
+fn is_marker(run: &str) -> bool {
+    let n = run.chars().count();
+    let symbol = (1..=2).contains(&n)
+        && run.chars().all(|c| {
+            !c.is_alphanumeric()
+                && !matches!(
+                    c,
+                    '/' | '~' | '.' | '\\' | '\'' | '"' | '`' | '(' | '[' | '<' | '{'
+                )
+        });
+    let numbered = (2..=4).contains(&n)
+        && run.ends_with(['.', ')'])
+        && run[..run.len() - 1].chars().all(|c| c.is_ascii_digit());
+    symbol || numbered
+}
+
+/// 行の本文が始まる列（#2578）。行頭の空白を飛ばし、続く印と空白も飛ばす。
+///
+/// claude の本文は `⏺ ` / `❯ ` / `  - ` の後ろから始まり、折り返した続きはこの列まで
+/// 字下げされる。アプリの折り返しの続きは「字下げがこの列と一致する行」だけにする
+fn content_col(line: &ScreenLine) -> Option<usize> {
+    let trimmed = line.text.trim_end();
+    let start = trimmed.chars().position(|c| c != ' ')?;
+    let rest: Vec<char> = trimmed.chars().skip(start).collect();
+    let run_len = rest.iter().take_while(|c| **c != ' ').count();
+    let run: String = rest[..run_len].iter().collect();
+    if is_marker(&run) {
+        let spaces = rest[run_len..].iter().take_while(|c| **c == ' ').count();
+        if spaces > 0 && run_len + spaces < rest.len() {
+            return Some(char_col(line, start + run_len + spaces));
+        }
+    }
+    Some(char_col(line, start))
+}
+
+/// `next` が形の上で `prev` の続き（アプリ自身の折り返し）に見えるなら、飛ばす字下げの
+/// 文字数を返す（#2578。行の上限は見ない = [`app_wraps`] が塊ごとに見る）。
+///
+/// 続きに見える形（すべて満たす）:
+/// - `prev` の最後の可視文字も `next` の本文の最初の文字も、空白・枠の文字ではない
+/// - `next` は 1 桁以上字下げされ、その字下げが `prev` の本文の列（[`content_col`]）と一致する
+/// - `next` の本文は新しい塊の印（`- ` `⏺ ` `1. `）でも、新しい URL（`https://`）でも始まらない
+///
+/// ここは**テキストの形**だけを見る。つないだ結果を採るかは種別ごとに確かめる
+/// （URL = [`app_wrapped_url_plausible`]・パス = 実在）
+fn app_continuation(prev: &ScreenLine, next: &ScreenLine) -> Option<usize> {
+    let last = prev.text.trim_end().chars().last()?;
+    if last.is_whitespace() || is_frame_char(last) {
+        return None;
+    }
+    let next_trimmed = next.text.trim_end();
+    let indent = next_trimmed.chars().take_while(|c| *c == ' ').count();
+    // 字下げは ASCII の空白なので byte 数 = 文字数
+    let body = &next_trimmed[indent..];
+    let first = body.chars().next()?;
+    if indent == 0 || is_frame_char(first) {
+        return None;
+    }
+    if content_col(prev) != Some(char_col(next, indent)) {
+        return None;
+    }
+    let word = body.split(' ').next().unwrap_or("");
+    if (word.len() < body.len() && is_marker(word)) || find_url_scheme(body) == Some(0) {
+        return None;
+    }
+    Some(indent)
+}
+
+/// アプリ自身の折り返しでつなぐ境目（#2578）。`out[row]` は `row` と次の行の境目で飛ばす
+/// 字下げの文字数（つながないなら `None`）。
+///
+/// **行の上限まで詰まった行だけ**をつなぐ。claude 2.1.301 は長い語を `/` `-` の位置に関係なく
+/// 行の上限の桁で（語の途中でも）切り、上限は返答（`⏺`）が右端・入力の写し（`❯`）が右端の
+/// 1 桁手前（実測）。上限より手前で終わった行の次の行は、空白を挟んだ次の語が入らずに
+/// 送られた形 = 別の語なのでつながない（長い URL の最後のかけらの後ろの `done.` を取り込まない）。
+///
+/// 上限は 1 行では分からない（右端の 1 桁手前で終わった行は、入力の写しなら上限・返答なら
+/// 送られた語の手前）ので、形でつながる行の塊（[`app_continuation`] の鎖）ごとに
+/// **いちばん長い行の右端**を上限とみなす（長い語を切った行は必ず上限まで詰まる）。
+/// 上限が画面の桁数 - 1 より手前の塊（切った行の無い地の文）はつながない。
+/// 全角は上限の 1 桁手前に入らなければ次の行へ送られるので、続きが全角なら 1 桁手前も上限とみなす
+fn app_wraps(screen: &Screen) -> Vec<Option<usize>> {
+    let lines = &screen.lines;
+    let shape: Vec<Option<usize>> = (0..lines.len())
+        .map(|row| {
+            lines
+                .get(row + 1)
+                .and_then(|next| app_continuation(&lines[row], next))
+        })
+        .collect();
+    let ends: Vec<Option<usize>> = lines.iter().map(visible_end_col).collect();
+    let mut out = vec![None; lines.len()];
+    let mut start = 0usize;
+    while start < lines.len() {
+        // 形でつながる行の塊 = start..=last
+        let mut last = start;
+        while shape[last].is_some() && last + 1 < lines.len() {
+            last += 1;
+        }
+        let limit = (start..=last)
+            .filter_map(|row| ends[row])
+            .max()
+            .unwrap_or(0);
+        if limit + 1 >= screen.cols {
+            for row in start..last {
+                let (Some(indent), Some(end)) = (shape[row], ends[row]) else {
+                    continue;
+                };
+                let wide = lines[row + 1]
+                    .text
+                    .chars()
+                    .nth(indent)
+                    .is_some_and(|c| char_cells(c) == 2);
+                if end >= limit || (wide && end + 1 == limit) {
+                    out[row] = Some(indent);
+                }
+            }
+        }
+        start = last + 1;
+    }
+    out
+}
+
+/// `row` の行と次の行の境目のつなぎ方（`None` = 改行で区切る）。
+/// `app_indent` は [`app_wraps`] が求めたアプリの折り返しの字下げ（[`CombineMode::Extended`] だけ）
+fn seam_after(
+    screen: &Screen,
+    row: usize,
+    mode: CombineMode,
+    app_indent: Option<usize>,
+) -> Option<Seam> {
+    let line = &screen.lines[row];
+    let cols = screen.cols;
+    let trimmed = line.text.trim_end();
+    // 右端まで埋まっているか = **最後の「空白でない」文字が右端の列に在るか**。
+    //
+    // `line.cell_cols.last()` を見てはいけない（#1182）: 実画面の `ScreenLine.text`
+    // は**行末まで空白で埋まっている**（`screen::compose_line` は未使用セルも
+    // 押し込む）ので、`cell_cols.last()` は常に最終列 = **どの行も soft wrap 扱い**に
+    // なる。すると画面全体が改行なしの 1 本へ連結され、パストークンが次の行の
+    // 先頭と融合して実在しなくなる（実測: 隣接する 2 行に何か書かれているだけで
+    // ターミナル内のパスリンクが 1 つも検出されなかった）。
+    // 単体テストの `make_screen` は空白詰めをしないので、この形は再現しない
+    let last_visible_col = trimmed
+        .chars()
+        .count()
+        .checked_sub(1)
+        .and_then(|last_idx| line.cell_cols.get(last_idx).copied());
+    let filled =
+        trimmed.chars().count() >= cols || last_visible_col.is_some_and(|col| col + 1 >= cols);
+    let next = match (mode, screen.lines.get(row + 1)) {
+        (CombineMode::Extended, Some(next)) => next,
+        _ => return filled.then_some(Seam::Soft),
+    };
+    if let Some(indent) = app_indent {
+        return Some(Seam::App { indent });
+    }
+    if filled {
+        return Some(Seam::Soft);
+    }
+    // 全角の折り返し: 端末は字下げせずに行頭から続ける
+    let end = visible_end_col(line)?;
+    let first = next.text.chars().next().filter(|c| !c.is_whitespace())?;
+    (end >= cols || (end + 1 == cols && char_cells(first) == 2)).then_some(Seam::WideSoft)
+}
+
+/// 検出の途中結果（論理テキスト上の byte 範囲つき）
+struct Found {
+    link: DetectedLink,
+    range: Range<usize>,
+}
+
+impl Combined {
+    /// byte 範囲がまたぐ境目（範囲の内側 = 先頭より後ろ・末尾より前にあるもの）
+    fn seams_within(&self, range: &Range<usize>) -> impl Iterator<Item = (usize, Seam)> + '_ {
+        let (start, end) = (range.start, range.end);
+        self.seams
+            .iter()
+            .copied()
+            .filter(move |&(offset, _)| start < offset && offset < end)
+    }
+
+    /// 修正前の結合に無い境目（[`Seam::is_new`]）をまたぐか
+    fn crosses_new_seam(&self, range: &Range<usize>) -> bool {
+        self.seams_within(range).any(|(_, seam)| seam.is_new())
+    }
+
+    /// byte 範囲がどの折り返しをまたいだか。アプリの折り返しを 1 つでもまたげば
+    /// `App`、端末の折り返しだけなら `Soft`
+    fn wrap_of(&self, range: &Range<usize>) -> Option<LinkWrap> {
+        let mut wrap = None;
+        for (_, seam) in self.seams_within(range) {
+            match seam {
+                Seam::App { .. } => return Some(LinkWrap::App),
+                Seam::Soft | Seam::WideSoft => wrap = Some(LinkWrap::Soft),
+            }
+        }
+        wrap
+    }
+
+    fn spans(&self, range: &Range<usize>, cols: usize) -> Vec<(usize, usize, usize)> {
+        byte_offsets_to_spans(&self.byte_map, range.start, range.end, cols)
+    }
+
+    fn found(
+        &self,
+        kind: LinkKind,
+        target: String,
+        range: Range<usize>,
+        cols: usize,
+    ) -> Option<Found> {
+        let spans = self.spans(&range, cols);
+        if spans.is_empty() {
+            return None;
+        }
+        let wrap = self.wrap_of(&range);
+        Some(Found {
+            link: DetectedLink {
+                kind,
+                target,
+                spans,
+                wrap,
+            },
+            range,
+        })
+    }
 }
 
 /// URL（http:// / https://）を検出する。
 /// 行末で折り返された URL は次行の先頭と連結して 1 つの URL として扱う。
-fn detect_urls(screen: &Screen, out: &mut Vec<DetectedLink>) {
-    let (combined, byte_map) = combined_screen_text(screen);
-
-    // URL パターンの検出
+///
+/// `wrap_legacy` は #2578 の A/B（真なら、つないだ境目の直後の別の URL で切らない）
+fn detect_urls_in(combined: &Combined, cols: usize, wrap_legacy: bool, out: &mut Vec<Found>) {
+    let text = &combined.text;
     let mut search_start = 0;
-    while search_start < combined.len() {
+    while search_start < text.len() {
         // http:// または https:// を探す
-        let rest = &combined[search_start..];
-        let scheme_pos = find_url_scheme(rest);
-        let Some(scheme_offset) = scheme_pos else {
+        let Some(scheme_offset) = find_url_scheme(&text[search_start..]) else {
             break;
         };
         let abs_start = search_start + scheme_offset;
 
         // URL の終端を見つける
-        let url_end = find_url_end(&combined, abs_start);
-        let url = &combined[abs_start..url_end];
+        let mut url_end = find_url_end(text, abs_start);
+        // #2578: つないだ境目の直後で**別の URL が始まる**なら、そこで切る。
+        // 行末ちょうどで終わった URL の次の行に別の URL が来る形（隣り合う 2 本）を
+        // 1 本へ融合させない（`:` と `/` は URL の文字なので、終端の判定では止まらない）
+        let next_url_at_seam = combined
+            .seams_within(&(abs_start..url_end))
+            .find(|&(offset, _)| find_url_scheme(&text[offset..]) == Some(0));
+        if let Some((seam, _)) = next_url_at_seam.filter(|_| !wrap_legacy) {
+            url_end = strip_url_trailing(text, abs_start, seam);
+        }
 
-        if url.len() > 10 {
-            // byte_map から spans を構築
-            let spans = byte_offsets_to_spans(&byte_map, abs_start, url_end, screen.cols);
-            if !spans.is_empty() {
-                out.push(DetectedLink {
-                    kind: LinkKind::Url,
-                    target: url.to_string(),
-                    spans,
-                });
+        if url_end - abs_start > 10 {
+            let target = text[abs_start..url_end].to_string();
+            if let Some(found) = combined.found(LinkKind::Url, target, abs_start..url_end, cols) {
+                out.push(found);
             }
         }
 
-        search_start = url_end;
+        search_start = url_end.max(abs_start + 1);
     }
 }
 
@@ -335,7 +747,11 @@ fn find_url_end(text: &str, start: usize) -> usize {
         }
     }
 
-    // 末尾の句読点を剥がす（"http://example.com." のピリオド等）
+    strip_url_trailing(text, start, end)
+}
+
+/// URL の末尾の句読点を剥がした終端を返す（"http://example.com." のピリオド等）
+fn strip_url_trailing(text: &str, start: usize, mut end: usize) -> usize {
     while end > start {
         let last = text[start..end].chars().last().unwrap();
         if matches!(last, '.' | ',' | ';' | ':' | '!' | '?') {
@@ -344,7 +760,6 @@ fn find_url_end(text: &str, start: usize) -> usize {
             break;
         }
     }
-
     end
 }
 
@@ -385,28 +800,51 @@ fn byte_offsets_to_spans(
     spans
 }
 
+/// パスの検出の材料（[`detect_paths_in`] の引数をまとめたもの）
+struct PathScan<'a> {
+    cols: usize,
+    cwd: Option<&'a Path>,
+    home: Option<&'a Path>,
+    /// #1283 の A/B
+    legacy: bool,
+    /// #2578 の A/B
+    wrap_legacy: bool,
+    platform: Platform,
+}
+
 /// ファイル/ディレクトリパスを検出する。
 /// 行ごとにパスらしきトークンを抽出し、cwd 基準の相対解決 / `~` 展開 / 絶対パスで
 /// 実在チェックに通ったものだけリンク化する。URL と重複する範囲はスキップ。
-fn detect_paths(
-    screen: &Screen,
-    cwd: Option<&Path>,
-    home: Option<&Path>,
+///
+/// `only_new_seams` が真なら、修正前の結合に無い境目（[`Seam::is_new`]）をまたぐ
+/// トークンだけを調べる（#2578 の 2 回目の走査。実在チェックの syscall を増やさない）
+fn detect_paths_in(
+    combined: &Combined,
+    scan: &PathScan<'_>,
     existing_links: &[DetectedLink],
-    out: &mut Vec<DetectedLink>,
-    legacy: bool,
-    platform: Platform,
+    only_new_seams: bool,
+    out: &mut Vec<Found>,
 ) {
-    let (text, byte_map) = combined_screen_text(screen);
-    for (token, byte_range) in extract_path_tokens(&text, legacy, platform) {
-        let full_spans =
-            byte_offsets_to_spans(&byte_map, byte_range.start, byte_range.end, screen.cols);
+    let PathScan {
+        cols,
+        cwd,
+        home,
+        legacy,
+        wrap_legacy,
+        platform,
+    } = *scan;
+    for (token, byte_range) in extract_path_tokens(&combined.text, legacy, platform) {
+        if only_new_seams && !combined.crosses_new_seam(&byte_range) {
+            continue;
+        }
+        let full_spans = combined.spans(&byte_range, cols);
         if full_spans.is_empty() || overlaps_existing(existing_links, &full_spans) {
             continue;
         }
 
         // 地の文が食い込んだトークンに備えて候補を長い順に試す（#1283）。
         // トークン全体が最初の候補なので、今まで引けていた形は定義上そのまま引ける
+        let mut hit = false;
         for (rel_start, candidate) in path_candidates_in(&token, legacy, platform) {
             // 行番号サフィックスを分離（`src/main.rs:42:5` → `src/main.rs`）
             let path_part = strip_line_col_suffix(candidate);
@@ -414,19 +852,154 @@ fn detect_paths(
                 continue;
             };
             let start = byte_range.start + rel_start;
-            let spans =
-                byte_offsets_to_spans(&byte_map, start, start + candidate.len(), screen.cols);
-            if spans.is_empty() {
-                continue;
+            let target = resolved.to_string_lossy().into_owned();
+            if let Some(found) =
+                combined.found(LinkKind::Path, target, start..start + candidate.len(), cols)
+            {
+                out.push(found);
+                hit = true;
+                break;
             }
-            out.push(DetectedLink {
-                kind: LinkKind::Path,
-                target: resolved.to_string_lossy().into_owned(),
-                spans,
-            });
-            break;
+        }
+        if !hit && !wrap_legacy && !split_at_seams(combined, scan, &token, &byte_range, out) {
+            file_before_last_seam(combined, scan, &token, &byte_range, out);
         }
     }
+}
+
+/// つないだトークンが実在しないとき、**最後の境目の手前が実在するファイル**ならそこまでを返す（#2578）。
+///
+/// 行より長いパスの最後のかけらがたまたま行の上限ちょうどで終わり、後ろの語（`done.`）だけが
+/// 次の行へ送られた形は、テキストだけでは語の途中で切った形と見分けられず、つなぐと実在しなく
+/// なってパスが 1 本も返らなかった。採るのは**ファイル**で、境目の後ろが区切り（`/`、Windows は `\` も）で
+/// 始まらないときだけ（ディレクトリは採らない = `…/src` + `-old/x.txt` のように折り返した実在しない
+/// パスの途中で、別のディレクトリを開いてしまうため）
+fn file_before_last_seam(
+    combined: &Combined,
+    scan: &PathScan<'_>,
+    token: &str,
+    byte_range: &Range<usize>,
+    out: &mut Vec<Found>,
+) {
+    let Some((offset, _)) = combined.seams_within(byte_range).last() else {
+        return;
+    };
+    let cut = offset - byte_range.start;
+    let rest = &token[cut..];
+    if rest.starts_with('/') || (scan.platform == Platform::Windows && rest.starts_with('\\')) {
+        return;
+    }
+    let prefix = &token[..cut];
+    let resolved = is_path_like(prefix, scan.platform)
+        .then(|| {
+            resolve_path(
+                strip_line_col_suffix(prefix),
+                scan.cwd,
+                scan.home,
+                scan.platform,
+            )
+        })
+        .flatten()
+        .filter(|path| path.is_file());
+    if let Some(resolved) = resolved {
+        let target = resolved.to_string_lossy().into_owned();
+        let range = byte_range.start..byte_range.start + cut;
+        if let Some(found) = combined.found(LinkKind::Path, target, range, scan.cols) {
+            out.push(found);
+        }
+    }
+}
+
+/// つないだトークンが実在しないとき、境目で分けた**どの片も**実在するなら別々のパスとして返す（#2578）。
+///
+/// 行末ちょうどで終わったパスの次の行が別のパスで始まる形（隣り合う 2 本）は、右端まで
+/// 埋まった行を直結する物差しでは 1 本へ融合して実在しなくなり、**どちらもリンクに
+/// ならなかった**。片方だけ実在する形は採らない（本当に折り返した実在しないパスの
+/// 途中までを開いてしまう = #2578 の症状そのものになるため）
+fn split_at_seams(
+    combined: &Combined,
+    scan: &PathScan<'_>,
+    token: &str,
+    byte_range: &Range<usize>,
+    out: &mut Vec<Found>,
+) -> bool {
+    let mut cuts: Vec<usize> = combined
+        .seams_within(byte_range)
+        .map(|(offset, _)| offset - byte_range.start)
+        .collect();
+    if cuts.is_empty() {
+        return false;
+    }
+    cuts.push(token.len());
+    let mut pieces: Vec<(Range<usize>, PathBuf)> = Vec::new();
+    let mut start = 0usize;
+    for end in cuts {
+        let piece = &token[start..end];
+        let resolved = is_path_like(piece, scan.platform)
+            .then(|| {
+                resolve_path(
+                    strip_line_col_suffix(piece),
+                    scan.cwd,
+                    scan.home,
+                    scan.platform,
+                )
+            })
+            .flatten();
+        let Some(resolved) = resolved else {
+            return false;
+        };
+        pieces.push((byte_range.start + start..byte_range.start + end, resolved));
+        start = end;
+    }
+    for (range, resolved) in pieces {
+        let target = resolved.to_string_lossy().into_owned();
+        if let Some(found) = combined.found(LinkKind::Path, target, range, scan.cols) {
+            out.push(found);
+        }
+    }
+    true
+}
+
+/// アプリの折り返しをまたいでつないだ URL を採ってよいか（#2578）。
+///
+/// アプリ（claude の描画等）は語の境目で折り返し、**語の途中で切るのはその語が 1 行に
+/// 収まらないときだけ**（収まる URL は行ごと次の行へ送る = 2.1.301 の実測）。だから本当に
+/// 途中で切れた URL は、字下げを除いた行の幅より長い。行末でちょうど終わった URL の
+/// 次の行に地の文が続く形（たまたま行末で終わっただけ）は、つないでも行の幅に収まるので採らない
+fn app_wrapped_url_plausible(combined: &Combined, found: &Found, cols: usize) -> bool {
+    let width = found.link.target.chars().map(char_cells).sum::<usize>();
+    combined
+        .seams_within(&found.range)
+        .all(|(_, seam)| match seam {
+            Seam::App { indent } => width > cols.saturating_sub(indent),
+            Seam::Soft | Seam::WideSoft => true,
+        })
+}
+
+/// 修正前の結合で見つけたリンクへ、折り返しをまたいで見つけたリンクを重ねる（#2578）。
+///
+/// 重なった修正前のリンク（途中で切れていたもの）は、最初の 1 本の位置を新しいリンクで
+/// 置き換え、残りは外す。重なりが無ければ末尾に足す。新しいリンクが 1 本も無ければ
+/// 修正前の答えをそのまま返す（受け入れ条件 4）
+fn merge_wrapped(mut base: Vec<DetectedLink>, wrapped: Vec<DetectedLink>) -> Vec<DetectedLink> {
+    for link in wrapped {
+        let overlapped: Vec<usize> = base
+            .iter()
+            .enumerate()
+            .filter(|(_, old)| overlaps_existing(std::slice::from_ref(*old), &link.spans))
+            .map(|(idx, _)| idx)
+            .collect();
+        match overlapped.split_first() {
+            Some((&first, rest)) => {
+                base[first] = link;
+                for &idx in rest.iter().rev() {
+                    base.remove(idx);
+                }
+            }
+            None => base.push(link),
+        }
+    }
+    base
 }
 
 /// 削った候補の上限（実在チェックの syscall は cmd+ホバー毎に走る）
@@ -1867,6 +2440,30 @@ mod tests {
         }
     }
 
+    /// 修正前の結合でパスだけを探す（OS の形を引数で渡す単体の入口。#2435）
+    fn detect_paths(
+        screen: &Screen,
+        cwd: Option<&Path>,
+        home: Option<&Path>,
+        existing: &[DetectedLink],
+        out: &mut Vec<DetectedLink>,
+        legacy: bool,
+        platform: Platform,
+    ) {
+        let scan = PathScan {
+            cols: screen.cols,
+            cwd,
+            home,
+            legacy,
+            wrap_legacy: false,
+            platform,
+        };
+        let mut found = Vec::new();
+        let base = combined_screen_text(screen, CombineMode::Base);
+        detect_paths_in(&base, &scan, existing, false, &mut found);
+        out.extend(found.into_iter().map(|f| f.link));
+    }
+
     /// `~\` は Windows でだけホームへ展開する（実在チェックまで通す。ホームは引数で注入）。
     /// 1 階層の名前にしているのは、macOS では `\` がファイル名の 1 文字で、
     /// `~\a\b` を `join` すると別のパスになるため
@@ -1962,5 +2559,522 @@ mod tests {
         );
         assert!(path_targets(&links).is_empty());
         cleanup_test_dir(&dir);
+    }
+
+    // --- #2578: 折り返しをまたぐ URL / パス ---------------------------------------------
+    //
+    // 材料の形は claude 2.1.301 を 124 桁のペインで動かした実測から採った
+    // （`scripts/test-wrapped-links-2578.sh` の claude の節で同じ形を実物に描かせる）:
+    // - 返答（`⏺ `）は右端の桁まで詰めて語の途中で切るか、`/` `-` の手前で切る。続きは 2 桁の字下げ
+    // - 入力の写し（`❯ `）は右端の 1 桁手前で切る。続きは 2 桁の字下げ
+    // - 1 行に収まる URL / パスは切らずに行ごと次の行へ送る
+
+    /// 実グリッドと同じ列の数え方（Unicode の東アジア幅）で、行末まで空白詰めした画面を作る
+    fn grid_screen(lines: &[String], cols: usize) -> Screen {
+        Screen {
+            cols,
+            rows: lines.len(),
+            lines: lines
+                .iter()
+                .map(|text| {
+                    let mut cell_cols = Vec::new();
+                    let mut padded = String::new();
+                    let mut col = 0usize;
+                    for ch in text.chars() {
+                        cell_cols.push(col);
+                        padded.push(ch);
+                        col += char_cells(ch);
+                    }
+                    while col < cols {
+                        cell_cols.push(col);
+                        padded.push(' ');
+                        col += 1;
+                    }
+                    ScreenLine {
+                        text: padded,
+                        runs: Vec::new(),
+                        cell_cols,
+                    }
+                })
+                .collect(),
+            cursor: None,
+            ime_cursor: None,
+            display_offset: 0,
+            fract: 0.0,
+            extra_bottom: None,
+        }
+    }
+
+    /// 端末の自動折り返し（1 行を幅で折る。全角が残り 1 桁に入らなければ次の行へ送る）
+    fn soft_rows(line: &str, cols: usize) -> Vec<String> {
+        let mut rows = vec![String::new()];
+        let mut col = 0usize;
+        for ch in line.chars() {
+            let width = char_cells(ch);
+            if col + width > cols {
+                rows.push(String::new());
+                col = 0;
+            }
+            rows.last_mut().unwrap().push(ch);
+            col += width;
+        }
+        rows
+    }
+
+    /// claude と同じ形の折り返し: 先頭行は `marker` + 空白 + `lead`、続きは本文の列まで
+    /// 字下げして `edge` 桁まで詰める（語の途中で切る。全角は残り 1 桁に入らなければ送る）
+    fn app_rows(marker: &str, lead: &str, token: &str, tail: &str, edge: usize) -> Vec<String> {
+        let indent = marker.chars().map(char_cells).sum::<usize>() + 1;
+        let pad = " ".repeat(indent);
+        let mut row = format!("{marker} {lead}");
+        let mut col: usize = row.chars().map(char_cells).sum();
+        let mut rows = Vec::new();
+        for ch in token.chars() {
+            let width = char_cells(ch);
+            if col + width > edge {
+                rows.push(std::mem::replace(&mut row, pad.clone()));
+                col = indent;
+            }
+            row.push(ch);
+            col += width;
+        }
+        if col + 1 + tail.len() > edge {
+            rows.push(std::mem::replace(&mut row, format!("{pad}{tail}")));
+        } else {
+            row.push(' ');
+            row.push_str(tail);
+        }
+        rows.push(row);
+        rows
+    }
+
+    /// 前後に別の行を挟んだ画面（実画面ではプロンプトや次の発話が必ず並ぶ）
+    fn framed(rows: Vec<String>) -> Vec<String> {
+        let mut lines = vec!["tako % run".to_string()];
+        lines.extend(rows);
+        lines.push(String::new());
+        lines.push("❯".to_string());
+        lines
+    }
+
+    /// 修正後と修正前（`TAKO_2578_LEGACY=1` と同じ判断）の答え
+    fn both_arms(
+        lines: &[String],
+        cols: usize,
+        cwd: Option<&Path>,
+    ) -> (Vec<DetectedLink>, Vec<DetectedLink>) {
+        let screen = grid_screen(lines, cols);
+        (
+            detect_wrapped_in(&screen, cwd, None, false, false),
+            detect_wrapped_in(&screen, cwd, None, false, true),
+        )
+    }
+
+    fn long_url() -> String {
+        format!(
+            "https://example.com/tako/issues/2578/wrap-check?first={}&second={}#end",
+            "a".repeat(40),
+            "b".repeat(60)
+        )
+    }
+
+    fn setup_2578_dir(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = setup_test_dir(&format!("2578_{name}"));
+        let long = dir
+            .join("a-very-long-directory-name-for-the-wrap-test")
+            .join("another-quite-long-directory-segment-0123456789")
+            .join("target-file-for-the-wrapped-link-check.txt");
+        let wide = dir
+            .join("日本語のフォルダ名を長くしたもの")
+            .join("さらに深い階層のフォルダ")
+            .join("資料（最新）の長いファイル名です.txt");
+        for path in [&long, &wide] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        (dir, long, wide)
+    }
+
+    /// 期待の全体が 1 本だけ返り、途中で切れた target（期待の真の接頭辞）が無い
+    fn assert_whole<'a>(links: &'a [DetectedLink], want: &str, ctx: &str) -> &'a DetectedLink {
+        let whole: Vec<&DetectedLink> = links.iter().filter(|l| l.target == want).collect();
+        let cut: Vec<&str> = links
+            .iter()
+            .map(|l| l.target.as_str())
+            .filter(|t| *t != want && want.starts_with(t))
+            .collect();
+        assert!(
+            whole.len() == 1 && cut.is_empty(),
+            "{ctx}: 全体 {} 本・途中で切れた target {cut:?}\n  links={links:#?}",
+            whole.len()
+        );
+        whole[0]
+    }
+
+    #[test]
+    fn claudeの返答が右端で切って字下げしたurlを1本で返す_2578() {
+        let url = long_url();
+        let cols = 60;
+        let rows = app_rows("⏺", "See ", &url, "for details.", cols);
+        assert!(
+            rows.len() >= 4,
+            "3 行以上にまたがる材料になっていない: {rows:?}"
+        );
+        let lines = framed(rows);
+        let (new, legacy) = both_arms(&lines, cols, None);
+        let link = assert_whole(&new, &url, "修正後");
+        assert_eq!(link.wrap, Some(LinkWrap::App));
+        // またがった各行の位置: 先頭は `⏺ See ` の後ろ（6 桁目）、続きは字下げの後ろ（2 桁目）
+        let rows_of: Vec<usize> = link.spans.iter().map(|s| s.0).collect();
+        assert_eq!(rows_of, (1..1 + link.spans.len()).collect::<Vec<_>>());
+        let lead: usize = "⏺ See ".chars().map(char_cells).sum();
+        let indent: usize = "⏺".chars().map(char_cells).sum::<usize>() + 1;
+        assert_eq!(link.spans[0].1, lead);
+        assert!(
+            link.spans[1..].iter().all(|s| s.1 == indent),
+            "{:?}",
+            link.spans
+        );
+        // 画面に見えている文字列（下線の範囲）は字下げを含まない = target と一致する
+        assert_eq!(screen_text_of(&grid_screen(&lines, cols), link), url);
+        // 修正前は 1 行目までで切れていた（#2578 の症状）
+        assert!(
+            legacy
+                .iter()
+                .any(|l| l.target != url && url.starts_with(&l.target)),
+            "修正前の腕が症状を再現しない: {legacy:#?}"
+        );
+    }
+
+    #[test]
+    fn 入力の写しは右端の1桁手前で切る形も1本で返す_2578() {
+        let url = long_url();
+        let cols = 70;
+        let lines = framed(app_rows("❯", "Echo verbatim: See ", &url, "now", cols - 1));
+        let (new, _) = both_arms(&lines, cols, None);
+        assert_eq!(
+            assert_whole(&new, &url, "右端の 1 桁手前").wrap,
+            Some(LinkWrap::App)
+        );
+    }
+
+    #[test]
+    fn 行の上限で切れば区切りの手前でも1本で返し上限より手前で終わった行はつながない_2578() {
+        // 2.1.301 の実測（P1 / P8 / P9〜P11）: claude は `/` `-` の位置に関係なく行の上限の桁で
+        // 切る。境目がたまたま `/` や `-` の手前に来ても、上限まで詰めた行の続きとしてつなぐ
+        let url = "https://example.com/seg-01-abcdefgh/seg-02-abcdefgh/seg-03-abcdefgh/seg-04-abcdefgh/end";
+        let head = "⏺ P1 see https://example.com/seg-01-abcdefgh/seg-02-abcdefgh";
+        let cols: usize = head.chars().map(char_cells).sum();
+        let lines = framed(vec![
+            head.to_string(),
+            "  /seg-03-abcdefgh/seg-04-abcdefgh/end for more".to_string(),
+        ]);
+        let (new, _) = both_arms(&lines, cols, None);
+        assert_whole(&new, url, "/ の手前で上限");
+
+        let (dir, long, _) = setup_2578_dir("hyphen");
+        let shown = long.display().to_string();
+        let cut = shown.find("-0123456789").unwrap();
+        let head = format!("⏺ Open {}", &shown[..cut]);
+        let cols: usize = head.chars().map(char_cells).sum();
+        let lines = framed(vec![head.clone(), format!("  {} next.", &shown[cut..])]);
+        let (new, legacy) = both_arms(&lines, cols, None);
+        assert_eq!(
+            assert_whole(&new, &shown, "- の手前で上限").wrap,
+            Some(LinkWrap::App)
+        );
+        assert!(!legacy.iter().any(|l| l.target == shown), "{legacy:#?}");
+
+        // 上限より 2 桁以上手前で終わった行の次の行は、空白を挟んだ次の語が入らずに送られた形
+        // （別の語）。長い URL / パスの最後のかけらの後ろの語を取り込まない
+        let (new, legacy) = both_arms(&lines, cols + 2, None);
+        assert_eq!(new, legacy, "上限まで詰まっていない行をつないだ");
+        // 長い URL の最後のかけらが上限の手前で終わり、後ろの語（`done.`）だけが次の行へ
+        // 送られた形（URL は行より長いので、URL の確かめだけでは止まらない）
+        let url = long_url();
+        let mut seen = 0;
+        for cols in 40..=72 {
+            let rows = app_rows("⏺", "See ", &url, "done.", cols);
+            let short = rows.len() >= 2 && rows[rows.len() - 2].chars().count() + 2 <= cols;
+            if rows.last().map(String::as_str) == Some("  done.") && short {
+                seen += 1;
+                let (new, _) = both_arms(&framed(rows), cols, None);
+                assert_whole(&new, &url, &format!("cols={cols}"));
+            }
+        }
+        assert!(seen > 0, "後ろの語だけが送られる幅が 1 つも無い");
+        cleanup_test_dir(&dir);
+    }
+
+    /// 3 行以上 / 全角の混ざるパス / 幅を変えた直後（折り返し位置が変わる）を、
+    /// 端末の折り返しとアプリの折り返しの両方で、**幅を 1 桁ずつ変えて**見る。
+    /// 全角が右端にかかる 2 つの形（右端まで埋める / 残り 1 桁に入らず送る）はどちらかの幅で必ず踏む
+    #[test]
+    fn 幅を変えても折り返した全体を1本で返す_2578() {
+        let (dir, long, wide) = setup_2578_dir("widths");
+        let url = long_url();
+        let targets = [
+            url.clone(),
+            long.display().to_string(),
+            wide.display().to_string(),
+        ];
+        let mut wide_edges = 0usize;
+        let mut known_limit = 0usize;
+        for cols in 40..=72 {
+            for want in &targets {
+                let is_url = want == &url;
+                let soft = framed(soft_rows(&format!("WIDE: {want}"), cols));
+                let app = framed(app_rows("⏺", "Also ", want, "done.", cols));
+                for (form, lines) in [("soft", &soft), ("app", &app)] {
+                    // 既知の限界: URL の最後のかけらがたまたま行の上限ちょうどで終わり、後ろの語だけが
+                    // 次の行へ送られた形は、語の途中で切った形と見分けられない（別の単体が固定する）
+                    let tail_row = lines.iter().rposition(|l| l == "  done.");
+                    if form == "app"
+                        && is_url
+                        && tail_row.is_some_and(|i| width_of(&lines[i - 1]) == cols)
+                    {
+                        known_limit += 1;
+                        continue;
+                    }
+                    let (new, _) = both_arms(lines, cols, None);
+                    let ctx = format!("{form} cols={cols} want={want}\n{}", lines.join("\n"));
+                    let link = assert_whole(&new, want, &ctx);
+                    assert_eq!(
+                        link.kind,
+                        if is_url {
+                            LinkKind::Url
+                        } else {
+                            LinkKind::Path
+                        },
+                        "{ctx}"
+                    );
+                    assert!(link.spans.len() >= 2, "{ctx}: 折り返していない材料");
+                }
+                // 全角の右端の形を踏んだ回数（材料が穴を突いていることの確認）
+                if want == &targets[2] {
+                    let screen = grid_screen(&soft, cols);
+                    wide_edges += combined_screen_text(&screen, CombineMode::Extended)
+                        .seams
+                        .iter()
+                        .filter(|(_, seam)| *seam == Seam::WideSoft)
+                        .count();
+                }
+            }
+        }
+        assert!(wide_edges > 0, "全角が右端にかかる形を 1 度も踏んでいない");
+        // 外したのは限界の形だけ（33 幅のうち数幅 = 行の幅分の 1 程度）
+        assert!(
+            known_limit <= 3,
+            "限界の形で外した幅が多すぎる: {known_limit}"
+        );
+        cleanup_test_dir(&dir);
+    }
+
+    fn width_of(line: &str) -> usize {
+        line.chars().map(char_cells).sum()
+    }
+
+    /// **既知の限界**（#2578）: 行より長い URL の最後のかけらがたまたま行の上限ちょうどで終わり、
+    /// 後ろの語だけが次の行へ送られると、その語までつなぐ。テキストだけでは「語の途中で上限で
+    /// 切った」形と見分けられない（パスは実在で確かめるので起きない）。直したらこの単体を反転する
+    #[test]
+    fn 既知の限界_上限ちょうどで終わった長いurlは次の語までつなぐ_2578() {
+        // 1 行目 = `⏺ <lead>` + 語の前半（上限まで）/ 2 行目 = 字下げ + 語の残り（ちょうど上限で終わる）/
+        // 3 行目 = 送られた次の語。2 行目がちょうど上限になる桁数を計算で決める
+        fn two_rows(lead_a: &str, lead_b: &str, token: &str) -> (Vec<String>, usize) {
+            let lead = if (token.len() + 2 + 2 + lead_a.len()) % 2 == 0 {
+                lead_a
+            } else {
+                lead_b
+            };
+            let head = 2 + lead.len();
+            let cols = (token.len() + 2 + head) / 2;
+            let cut = cols - head;
+            let lines = framed(vec![
+                format!("⏺ {lead}{}", &token[..cut]),
+                format!("  {}", &token[cut..]),
+                "  done.".to_string(),
+            ]);
+            assert_eq!(width_of(&lines[1]), cols, "{lines:?}");
+            assert_eq!(width_of(&lines[2]), cols, "{lines:?}");
+            (lines, cols)
+        }
+        let url = long_url();
+        let (lines, cols) = two_rows("See ", "See: ", &url);
+        let (new, _) = both_arms(&lines, cols, None);
+        let targets: Vec<&str> = new.iter().map(|l| l.target.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec![format!("{url}done")],
+            "限界の形が変わった（直したなら反転する）"
+        );
+
+        // パスは実在で確かめるので、同じ形でもつながない
+        let (dir, long, _) = setup_2578_dir("limit_path");
+        let shown = long.display().to_string();
+        let (lines, cols) = two_rows("Open ", "Open: ", &shown);
+        let (new, _) = both_arms(&lines, cols, None);
+        assert_whole(&new, &shown, "上限ちょうどのパス");
+        cleanup_test_dir(&dir);
+    }
+
+    #[test]
+    fn 行末ちょうどで終わる別々の2本はつながない_2578() {
+        // URL: 2 本とも幅ちょうど（右端まで埋まる = 端末の折り返しと区別が付かない形）
+        let a = "https://a.example.com/first/xxxxxxxxxxxxxxxxxxx";
+        let cols = a.len();
+        let b_head = "https://b.example.com/second/";
+        let b = format!("{b_head}{}", "y".repeat(cols - b_head.len()));
+        let b = b.as_str();
+        let lines = framed(vec![a.to_string(), b.to_string()]);
+        let (new, _) = both_arms(&lines, cols, None);
+        assert_whole(&new, a, "1 本目");
+        assert_whole(&new, b, "2 本目");
+        // アプリの形（字下げした次の行が別の URL で始まる）
+        let lines = framed(vec![format!("⏺ {a}"), format!("  {b}")]);
+        let (new, _) = both_arms(&lines, cols + 2, None);
+        assert_whole(&new, a, "字下げの 1 本目");
+        assert_whole(&new, b, "字下げの 2 本目");
+
+        // パス: 1 本目が幅ちょうどで、次の行が別のパスで始まる（両 OS で同じ答えになる相対形）
+        let dir = setup_test_dir("2578_two_paths");
+        let (one, two) = ("deep/nested/file.txt", "src/main.rs");
+        let lines = framed(vec![one.to_string(), two.to_string()]);
+        let (new, legacy) = both_arms(&lines, one.len(), Some(&dir));
+        assert_whole(&new, &dir.join(one).to_string_lossy(), "パスの 1 本目");
+        assert_whole(&new, &dir.join(two).to_string_lossy(), "パスの 2 本目");
+        // 修正前は 1 本へ融合して実在せず、どちらもリンクにならなかった
+        assert!(path_targets(&legacy).is_empty(), "{legacy:#?}");
+        cleanup_test_dir(&dir);
+    }
+
+    /// 誤ってつなげない形（受け入れ条件 3）。どれも修正前と同じ答えになる
+    #[test]
+    fn アプリの折り返しと読まない形はつながない_2578() {
+        // 右端ちょうどで終わる URL（`⏺ ` + 前置き + URL = 画面の桁数）
+        let url = "https://example.com/docs/page-0123456789";
+        let head = format!("⏺ The doc is {url}");
+        let cols: usize = head.chars().map(char_cells).sum();
+        let cases: Vec<(&str, Vec<String>)> = vec![
+            (
+                // 文の途中の改行: たまたま右端で終わった URL の次の行に地の文が続く
+                // （つないでも行の幅に収まる = アプリが語の途中で切る理由が無い）
+                "文の途中の改行",
+                vec![head.clone(), "  and the rest of the sentence.".to_string()],
+            ),
+            (
+                // 字下げの違う行（本文の列 2 ではなく 4）
+                "字下げの違う行",
+                vec![head.clone(), "    deeper indented line".to_string()],
+            ),
+            (
+                // 新しい塊の印で始まる行
+                "新しい項目",
+                vec![head.clone(), "  - next item".to_string()],
+            ),
+            (
+                // 表の列（右端は枠の文字）
+                "表の列",
+                vec![
+                    format!("│ {url}     │"),
+                    "│ second cell text                             │".to_string(),
+                ],
+            ),
+            (
+                // 隣り合う別の行（右端に届かない行の次に、字下げの無い行）
+                "隣り合う別の行",
+                vec![format!("see {url}"), "continued-without-indent".to_string()],
+            ),
+            (
+                // 行末の 1 桁手前で終わり、次の語は残りに入る（P6 の自然な形の縮小版）
+                "次の語が入る行",
+                vec![format!("⏺ Doc: {url}"), "  ok".to_string()],
+            ),
+        ];
+        for (name, rows) in cases {
+            let lines = framed(rows);
+            let (new, legacy) = both_arms(&lines, cols, None);
+            assert_eq!(new, legacy, "{name}: 修正前と答えが変わった");
+            let urls: Vec<&str> = new
+                .iter()
+                .filter(|l| l.kind == LinkKind::Url)
+                .map(|l| l.target.as_str())
+                .collect();
+            assert_eq!(urls, vec![url], "{name}");
+        }
+
+        // パス: つないだら実在しない（右端で終わったパスの次の行に地の文）
+        let dir = setup_test_dir("2578_no_join_path");
+        let file = dir.join("deep/nested/file.txt").display().to_string();
+        let row = format!("⏺ Open {file}");
+        let cols = row.chars().map(char_cells).sum::<usize>();
+        let lines = framed(vec![row, "  next.".to_string()]);
+        let (new, legacy) = both_arms(&lines, cols, None);
+        assert_eq!(new, legacy);
+        assert_whole(&new, &file, "つなぐと実在しないパス");
+        cleanup_test_dir(&dir);
+    }
+
+    /// 折り返していないリンクの答えは修正前と 1 ビットも変わらない（受け入れ条件 4）
+    #[test]
+    fn 折り返していないリンクは修正前と一致する_2578() {
+        let dir = setup_test_dir("2578_same");
+        let abs = dir.join("deep/nested/file.txt").display().to_string();
+        let screens: Vec<(Vec<String>, usize)> = vec![
+            (
+                vec![
+                    "./README.md 更新".into(),
+                    "src/main.rs:12 で失敗".into(),
+                    "~ ❯".into(),
+                ],
+                120,
+            ),
+            (
+                vec![
+                    "Visit https://example.com for info".into(),
+                    "  https://a.com and http://b.com/path end".into(),
+                    format!("  ⎿  {abs}:3:5"),
+                    format!("    {abs}"),
+                ],
+                120,
+            ),
+            (
+                vec![
+                    "| https://example.com/a | `src/main.rs` |".into(),
+                    "見て `src/main.rs`、開いて。".into(),
+                    "- item https://en.wikipedia.org/wiki/Rust_(programming_language)".into(),
+                    "  continued text".into(),
+                ],
+                80,
+            ),
+        ];
+        for (lines, cols) in screens {
+            let (new, legacy) = both_arms(&lines, cols, Some(&dir));
+            assert!(!new.is_empty(), "材料にリンクが無い: {lines:?}");
+            assert_eq!(new, legacy, "{lines:?}");
+            assert!(new.iter().all(|l| l.wrap.is_none()), "{new:#?}");
+        }
+        cleanup_test_dir(&dir);
+    }
+
+    /// `tako links --text` の経路（`screen_from_lines`）でも、実物の claude の画面の写し
+    /// （行頭の印 `⏺` `❯` は実画面で 1 桁）をそのまま渡してつなげる
+    #[test]
+    fn text経路でもclaudeの印のままつなぐ_2578() {
+        assert_eq!(
+            (char_cells('⏺'), char_cells('❯')),
+            (1, 1),
+            "実画面の幅と違う"
+        );
+        let url = long_url();
+        let cols = 58;
+        let mut lines = app_rows("❯", "Echo verbatim: See ", &url, "now", cols - 1);
+        lines.push(String::new());
+        lines.extend(app_rows("⏺", "See ", &url, "now", cols));
+        let links = detect_in_lines(&lines, cols, None, None);
+        let whole: Vec<&DetectedLink> = links.iter().filter(|l| l.target == url).collect();
+        assert_eq!(whole.len(), 2, "{links:#?}");
+        assert!(whole.iter().all(|l| l.wrap == Some(LinkWrap::App)));
+        assert_eq!(links.len(), 2, "途中で切れた URL が残っている: {links:#?}");
     }
 }
