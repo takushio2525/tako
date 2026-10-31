@@ -79,13 +79,21 @@
 #   クリップボードはここでは守れない（GUI のコピーは OS の汎用ペーストボードへ直に書く）ので、
 #   Copy を押す確認は隔離 tmux（`set-clipboard off`）で行う（#1963）
 #
+# **ヘルパの中の tako CLI は起こした隔離 GUI へだけ繋ぐ**（#2598）: 関数は呼び手の env で走るので、
+#   素の `"$TAKO_BIN" list` は呼び手が本番 tako のペインなら本番の `TAKO_SOCKET` へ、env を落としていても
+#   既定の置き場（`$HOME` の data dir の control.json）の本番 GUI へ届く（PR #2596 の検証で 1 回）。
+#   ヘルパの中の CLI はすべて `iso_cli` を通す = 本番の env を `env -u` で落とし、`TAKO_ISOLATED=1` と
+#   GUI へ渡したのと同じ発見の置き場（`ISOLATED_GUI_DISCOVERY_DIR`）を付ける。GUI へ届く
+#   `TAKO_DISCOVERY_DIR` が空なら、ログの置き場の隣の一時 dir を決めて GUI にも渡す（GUI 自身の既定は
+#   pid 入りの一時 dir で、ヘルパからは見えない）。A/B は `TAKO_2598_LEGACY=1`（呼び手の env のまま叩く）
+#
 # 使い方:
 #   . scripts/lib/isolated-gui.sh        # 関数として読む（直接実行はしない）
 #
 #   isolated_gui_bins                    # TAKO_BIN / APP_BIN を決め、今の木から建てる（毎回 cargo に任せる。#1643）
 #   isolated_gui_bins visual-test        # visual-test の節を回すなら feature を求める（自前で cargo build しない）
 #   launch_isolated_gui "$TMP/app.log" || exit $?   # 印と面の指定の判定 → ensure → uuid の突き合わせ → 起動（pid は $ISOLATED_GUI_PID）
-#   wait_isolated_gui                    # `tako list` が通るまで待つ（任意）
+#   wait_isolated_gui                    # 起こした GUI へ `tako list` が通るまで待つ（任意。本番へは届かない = #2598）
 #   stop_isolated_gui                    # 自分で起こした pid だけを落とし、ペインのプロセスが終わるまで待つ（#2588）
 #
 #   起動ごとに env を足したいときは `VAR=VAL` を並べる（`export` を汚さない）:
@@ -219,6 +227,10 @@ ISOLATED_GUI_DROP_ENV=(
 # 直前の `launch_isolated_gui` が GUI へ渡した `CLAUDE_CONFIG_DIR`（#1970。呼び出し側が並べたならその値。
 # 空 = 外した = GUI の一時の HOME の `.claude` を claude が使う）
 ISOLATED_GUI_CLAUDE_CONFIG_DIR=""
+
+# 直前の `launch_isolated_gui` が GUI へ渡した `TAKO_DISCOVERY_DIR`（#2598。並べた値 → export された値 →
+# どちらも空ならログの置き場の隣の一時 dir）。GUI はここへ接続情報（control.json）を書き、`iso_cli` が読む
+ISOLATED_GUI_DISCOVERY_DIR=""
 
 # 利用者のホーム（既定の `.zshrc` を書かない範囲。#1970）。**差し替えは番犬のモックのためだけ**
 # （空 = パスワードの登録から引く。$HOME は検証スクリプトが差し替えていることがあるので使わない）
@@ -575,24 +587,75 @@ launch_isolated_gui() {
     fi
     ISOLATED_GUI_CLAUDE_CONFIG_DIR=$claude_config
 
+    # 接続情報の置き場（#2598）。ヘルパの中の CLI（iso_cli）が同じ置き場を読み、この GUI へだけ繋ぐ。
+    # 値は 1 つに決める: 並べた `TAKO_DISCOVERY_DIR=`（最後が勝つ）→ export された値 → どちらも空なら
+    # ログの置き場の隣の一時 dir（GUI 自身の既定は pid 入りの一時 dir で、ヘルパからは見えない）。
+    # 決めた値は面の指定と同じく最後に置く（空の指定は未指定と同じに読む = CLI が読めない置き場を作らない）
+    local discovery="${TAKO_DISCOVERY_DIR-}"
+    local -a discovery_args=()
+    for arg in "$@"; do
+        case "$arg" in TAKO_DISCOVERY_DIR=*) discovery=${arg#TAKO_DISCOVERY_DIR=} ;; esac
+    done
+    if [ "${TAKO_2598_LEGACY:-0}" != 1 ]; then
+        if [ -z "$discovery" ]; then
+            local disc_parent
+            disc_parent=$(iso_phys_dir "$(dirname "$log")") || { iso_err "ログの置き場の dir が無い: $log"; return 1; }
+            discovery="$disc_parent/isolated-discovery"
+            mkdir -p "$discovery" || { iso_err "一時の発見の置き場を作れない: $discovery"; return 1; }
+        fi
+        discovery_args+=("TAKO_DISCOVERY_DIR=${discovery}")
+    fi
+    ISOLATED_GUI_DISCOVERY_DIR=$discovery
+
     # zsh の初回設定メニューが入力を食わないよう、一時の HOME へ既定の .zshrc（#1970 / #1945）
     iso_default_zshrc "$@" || true
     # 呼び出し側が並べた `VAR=VAL` は既定より後ろ = そちらが勝つ。
-    # 検証用 GUI の印と面の指定だけは最後に置く = GUI へ届くのは必ず `TAKO_ISOLATED=1` と
-    # 判定を通った面の指定（判定をすり抜ける道が増えても、印を偽にして届ける道は無い。#1760 / #1784）
-    env ${drop_args[@]+"${drop_args[@]}"} ${env_args[@]+"${env_args[@]}"} "$@" "TAKO_ISOLATED=1" "TAKO_DISPLAY=${display}" "$APP_BIN" > "$log" 2>&1 &
+    # 検証用 GUI の印と面の指定と発見の置き場だけは最後に置く = GUI へ届くのは必ず `TAKO_ISOLATED=1` と
+    # 判定を通った面の指定（判定をすり抜ける道が増えても、印を偽にして届ける道は無い。#1760 / #1784）と、
+    # iso_cli が読むのと同じ置き場（#2598）
+    env ${drop_args[@]+"${drop_args[@]}"} ${env_args[@]+"${env_args[@]}"} "$@" "TAKO_ISOLATED=1" "TAKO_DISPLAY=${display}" ${discovery_args[@]+"${discovery_args[@]}"} "$APP_BIN" > "$log" 2>&1 &
     ISOLATED_GUI_PID=$!
     return 0
 }
 
-# CLI が繋がるまで待つ。繋がらなければログの末尾を出して非ゼロ
+# 隔離 GUI へ tako CLI を 1 回送る（#2598）。**ヘルパの中の tako CLI はすべてここを通す**
+# （番犬 verification_isolation_watchdog が scripts/lib/ の素の `"$TAKO_BIN"` を file:line で名指す）。
+#
+#   iso_cli <tako の引数…>
+#
+# 関数は呼び手の env で走るので、素で叩くと呼び手が本番 tako のペインなら本番の `TAKO_SOCKET` へ、
+# env を落としていても既定の置き場（`$HOME` の data dir）の本番 GUI へ届く。ここでは
+# - 本番 tako が配る env（`ISOLATED_GUI_DROP_ENV`。`TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` ほか）を落とす
+# - `TAKO_ISOLATED=1`（#2531 以後の CLI は置き場の指定が無ければ本番の置き場を読まずに断る）
+# - 発見の置き場は直前の `launch_isolated_gui` が GUI へ渡したもの（無ければ呼び手の export。
+#   それも無ければ空 = 隔離の印で本番の置き場は読まない）
+# A/B は `TAKO_2598_LEGACY=1`（修正前 = 呼び手の env のまま叩く）
+iso_cli() {
+    [ -n "${TAKO_BIN:-}" ] || { iso_err "TAKO_BIN が空（先に isolated_gui_bins を呼ぶ）"; return 1; }
+    if [ "${TAKO_2598_LEGACY:-0}" = 1 ]; then
+        # tako:prod-ok A/B の旧挙動（#2598 の修正前 = 呼び手の env のまま。本番役へ届くことを数える側）
+        "$TAKO_BIN" "$@"
+        return
+    fi
+    local -a drop_args=()
+    local key
+    for key in ${ISOLATED_GUI_DROP_ENV[@]+"${ISOLATED_GUI_DROP_ENV[@]}"}; do
+        drop_args+=(-u "$key")
+    done
+    env -u TAKO_SOCKET -u TAKO_PANE_ID ${drop_args[@]+"${drop_args[@]}"} \
+        TAKO_ISOLATED=1 TAKO_DISCOVERY_DIR="${ISOLATED_GUI_DISCOVERY_DIR:-${TAKO_DISCOVERY_DIR-}}" \
+        "$TAKO_BIN" "$@"
+}
+
+# 起こした隔離 GUI へ CLI が繋がるまで待つ（繋ぐのは iso_cli = 本番へは届かない。#2598）。
+# 繋がらなければログの末尾を出して非ゼロ
 #
 #   wait_isolated_gui [ログの置き場] [試行回数]
 wait_isolated_gui() {
     local log="${1:-}" tries="${2:-$ISOLATED_GUI_WAIT_TRIES}" i
     [ -n "${TAKO_BIN:-}" ] || { iso_err "TAKO_BIN が空（先に isolated_gui_bins を呼ぶ）"; return 1; }
     for i in $(seq 1 "$tries"); do
-        if "$TAKO_BIN" list >/dev/null 2>&1; then return 0; fi
+        if iso_cli list >/dev/null 2>&1; then return 0; fi
         sleep 0.1
     done
     echo "tako-app へ接続できない:"
@@ -702,7 +765,8 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     echo "使い方: . ${0}   # source して関数を使う（直接実行する口は無い）" >&2
     echo "  isolated_gui_bins [feature…]         TAKO_BIN / APP_BIN を決め、今の木から求める feature で建てる（毎回 cargo に任せる）" >&2
     echo "  launch_isolated_gui <log> [VAR=VAL…] 仮想ディスプレイを起こして隔離 GUI を起動（用意できなければ起動せず 4・tako-vd 以外の面の指定と偽の TAKO_ISOLATED と物理画面を指す TAKO_VD_NAME は起動せず 2）" >&2
-    echo "  wait_isolated_gui [log] [試行回数]    tako list が通るまで待つ" >&2
+    echo "  wait_isolated_gui [log] [試行回数]    起こした GUI へ tako list が通るまで待つ（本番へは届かない）" >&2
+    echo "  iso_cli <tako の引数…>               起こした GUI へだけ tako CLI を送る（本番の env を落とし、GUI と同じ発見の置き場）" >&2
     echo "  stop_isolated_gui [pid]              自分で起こした pid だけを落とし、ペインのプロセスが終わるまで待つ" >&2
     exit 1
 fi
