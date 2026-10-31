@@ -369,7 +369,9 @@ fn check_owner_only_modes(files: &[(String, String)]) {
     let mut found = Vec::new();
     for (rel, source) in files {
         for (line, func, mode) in owner_only_modes_outside(source, rel) {
-            found.push(format!("{rel}:{line} `fn {func}` が `{mode}` を境界の外で当てている"));
+            found.push(format!(
+                "{rel}:{line} `fn {func}` が `{mode}` を境界の外で当てている"
+            ));
         }
     }
     assert!(
@@ -399,7 +401,10 @@ fn production_sources() -> Vec<(String, String)> {
     }
     let root = repo_root();
     let mut paths = Vec::new();
-    for krate in std::fs::read_dir(root.join("crates")).expect("crates/ を読める").flatten() {
+    for krate in std::fs::read_dir(root.join("crates"))
+        .expect("crates/ を読める")
+        .flatten()
+    {
         walk(&krate.path().join("src"), &mut paths);
     }
     paths.sort();
@@ -500,7 +505,10 @@ pub(crate) fn write_to(path: &Path, info: &ControlInfo) -> io::Result<()> {
     // 同じ形は広い走査でも名指される（許し札に無い関数の 0o700 / 0o600）
     let found = owner_only_modes_outside(&production_range::code_view_of(legacy), discovery);
     assert_eq!(found.len(), 2, "① 広い走査が 2 か所を名指さない: {found:?}");
-    assert!(found.iter().all(|(_, func, _)| func == "write_to"), "{found:?}");
+    assert!(
+        found.iter().all(|(_, func, _)| func == "write_to"),
+        "{found:?}"
+    );
 
     // ② 現行の書き手へ素の書き込みを足す（境界の呼び出しを残したままでも落ちる）
     let lib = "crates/tako-control/src/lib.rs";
@@ -526,11 +534,18 @@ pub(crate) fn write_to(path: &Path, info: &ControlInfo) -> io::Result<()> {
     );
     assert_ne!(back, salt, "③ の足場（塩の create_new）が見つからない");
     assert!(
-        fails(&|| check_secret_writer(&back, writer(usage, "\npub(crate) fn load_or_create_salt("))),
+        fails(&|| check_secret_writer(
+            &back,
+            writer(usage, "\npub(crate) fn load_or_create_salt(")
+        )),
         "③ 塩の unix だけの mode を見逃した"
     );
     let found = owner_only_modes_outside(&back, usage);
-    assert_eq!(found.len(), 1, "③ 広い走査が塩の 0o600 を名指さない: {found:?}");
+    assert_eq!(
+        found.len(),
+        1,
+        "③ 広い走査が塩の 0o600 を名指さない: {found:?}"
+    );
     assert_eq!(found[0].1, "load_or_create_salt");
 
     // ④ 受け取りが素の OpenOptions へ戻る
@@ -540,7 +555,10 @@ pub(crate) fn write_to(path: &Path, info: &ControlInfo) -> io::Result<()> {
         "    let _ = std::fs::OpenOptions::new().write(true).open(&target_path);\n    if let Err(e) = save_received_file(&target_path, &file_data) {",
         1,
     );
-    assert_ne!(upload, remote, "④ の足場（handle_upload の書き込み）が見つからない");
+    assert_ne!(
+        upload, remote,
+        "④ の足場（handle_upload の書き込み）が見つからない"
+    );
     assert!(
         fails(&|| check_secret_writer(&upload, writer(REMOTE, "\nfn handle_upload("))),
         "④ 受け取りの素の OpenOptions を見逃した"

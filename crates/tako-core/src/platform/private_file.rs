@@ -798,7 +798,11 @@ mod tests {
         assert!(got.owner_only && !got.inherits, "{got:?}");
         let again = create_new(&fresh).expect_err("在るので作らない");
         assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "salt", "中身は残る");
+        assert_eq!(
+            std::fs::read_to_string(&fresh).unwrap(),
+            "salt",
+            "中身は残る"
+        );
     }
 
     /// 中身の多い置き場を絞る: 中に在ったものも本人だけを受け継ぎ、2 回目は形が変わらない（#2581。

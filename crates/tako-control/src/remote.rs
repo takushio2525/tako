@@ -9234,7 +9234,8 @@ mod tests {
     #[test]
     fn issue2581_旧アームでは秘密のファイルが継承のまま() {
         // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
-        if tako_core::run_alone!(issue2581_旧アームでは秘密のファイルが継承のまま) {
+        if tako_core::run_alone!(issue2581_旧アームでは秘密のファイルが継承のまま)
+        {
             return;
         }
         std::env::set_var(tako_core::platform::private_file::ENV_LEGACY, "1");
