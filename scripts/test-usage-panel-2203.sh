@@ -85,6 +85,8 @@ use_case() {
   export TAKO_USAGE_CONFIG_DIRS="$base/cfg"
   SOCKETS="$SOCKETS $TAKO_TMUX_SOCKET"
   mkdir -p "$TAKO_DATA_DIR/usage" "$TAKO_DISCOVERY_DIR" "$TAKO_ORCHESTRATOR_DIR" "$base/cfg"
+  # 下の検査は日本語の行を読むので表示言語を固定する（#2365 以後、CLI の行は表示言語に従う）
+  printf '{"language":"ja"}' > "$TAKO_DATA_DIR/settings.json"
 }
 
 jf() {

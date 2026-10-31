@@ -74760,9 +74760,10 @@ mod self_test {
                                 v["placement"].as_str() == Some("same_tab")
                                     && v["auto_shrink_font"].as_bool() == Some(true)
                                     && v["min_worker_font_scale"].as_f64().is_some()
-                                    && v["effective_policy"]
-                                        .as_str()
-                                        .is_some_and(|s| s.contains("タブ分けなし"))
+                                    // 方針の 1 行は表示言語（#2365）
+                                    && v["effective_policy"].as_str().is_some_and(|s| {
+                                        s.contains("タブ分けなし") || s.contains("no tab split")
+                                    })
                             });
                             check(
                                 policy_ok,

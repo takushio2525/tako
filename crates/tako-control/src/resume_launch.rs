@@ -403,10 +403,11 @@ pub fn worker_resume_launch_typed(
 /// [`worker_resume_launch`]（spawn の `build_worker_cmd_in` に会話 ID を渡す）。MCP の絞り込み（#2412 の
 /// `--settings`）もここで spawn と同じ判断を通すので、user scope の `.claude.json` を読むのは
 /// **打った時点の 1 回だけ**（照会の `registry::resume_command` は読まない）。
-/// 設定ファイルは下見では書かないので、実行する側が [`ResumeLaunch::materialize`] を呼ぶ
+/// 設定ファイルは下見では書かないので、実行する側が [`ResumeLaunch::materialize_typed`] を呼ぶ。
+/// 断りは表示言語で引ける型（#2365。呼び手は CLI の `tako orchestrator resume` だけ）
 pub fn registry_resume_launch(
     entry: &crate::orchestrator::registry::WorkerEntry,
-) -> Result<ResumeLaunch, String> {
+) -> Result<ResumeLaunch, SessionRefusal> {
     let location = entry
         .session_id
         .as_deref()
@@ -425,22 +426,18 @@ pub fn registry_resume_launch_in(
     location: Option<&TranscriptLocation>,
     tako_bin: &str,
     dialect: crate::launch_cmd::ShellDialect,
-) -> Result<ResumeLaunch, String> {
+) -> Result<ResumeLaunch, SessionRefusal> {
     // 案内（`registry::resume_command`）と同じ条件。codex / agy の突然死からの復旧は能力マトリクスの
     // `worker_death_resume`（#975）
     if entry.agent != "claude" {
-        return Err(format!(
-            "突然死からの復旧は claude の worker だけ（この worker は {}）",
-            if entry.agent.is_empty() {
-                "agent 未記録"
-            } else {
-                entry.agent.as_str()
-            }
+        return Err(SessionRefusal::DeathResumeClaudeOnly(
+            Some(entry.agent.clone()).filter(|a| !a.is_empty()),
         ));
     }
-    let session_id = entry.session_id.as_deref().ok_or(
-        "この worker は会話 ID が未検出なので再開できない（起動直後に落ちた・まだ走査されていない）",
-    )?;
+    let session_id = entry
+        .session_id
+        .as_deref()
+        .ok_or(SessionRefusal::DeathResumeNoSession)?;
     // spawn の記録をカタログのメタの形へ写す（kind = worker なので spawn と同じ組み立てを通る）
     let catalog = SessionEntry {
         kind: "worker".into(),
@@ -460,17 +457,14 @@ pub fn registry_resume_launch_in(
             effort: entry.effort.clone(),
         }),
     };
-    let mut launch = worker_resume_launch(
+    let mut launch = worker_resume_launch_typed(
         session_id, &catalog, &hints, location, None, tako_bin, dialect,
     )
-    .ok_or("この worker の系統は spawn と同じ組み立てで再開できない")??;
+    .ok_or(SessionRefusal::DeathResumeUnbuildable)??;
     if entry.profile.is_none() {
-        launch.warnings.insert(
-            0,
-            "spawn した master のプロファイルの記録が無い（#2470 より前に spawn した worker）ので、\
-             既定プロファイルの設定で組んだ"
-                .to_string(),
-        );
+        launch
+            .warnings
+            .insert(0, crate::ReplyNote::ResumeNoProfileRecord.to_string());
     }
     Ok(launch)
 }
@@ -1552,8 +1546,12 @@ mod tests {
         let got = registry_resume_launch_in(&entry, Some(&loc), "/opt/tako", ShellDialect::Posix)
             .unwrap();
         assert_eq!(got.profile.as_deref(), Some("default"));
+        // 警告は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらかで見る）
+        let note = crate::ReplyNote::ResumeNoProfileRecord;
         assert!(
-            got.warnings[0].contains("プロファイルの記録が無い"),
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .iter()
+                .any(|&lang| got.warnings[0] == note.text_in(lang)),
             "{:?}",
             got.warnings
         );
@@ -1568,18 +1566,25 @@ mod tests {
             agent: "codex".into(),
             ..entry.clone()
         };
+        // 断りは型（#2365）。日本語は #2365 より前の文のまま
+        let ja = tako_core::i18n::Lang::Ja;
         let err = registry_resume_launch_in(&codex, Some(&loc), "/opt/tako", ShellDialect::Posix)
             .unwrap_err();
-        assert!(err.contains("claude の worker だけ"), "{err}");
+        assert_eq!(
+            err,
+            SessionRefusal::DeathResumeClaudeOnly(Some("codex".into()))
+        );
+        assert!(err.text_in(ja).contains("claude の worker だけ"), "{err}");
         let no_sid = WorkerEntry {
             session_id: None,
             ..entry.clone()
         };
         let err = registry_resume_launch_in(&no_sid, Some(&loc), "/opt/tako", ShellDialect::Posix)
             .unwrap_err();
-        assert!(err.contains("会話 ID が未検出"), "{err}");
+        assert_eq!(err, SessionRefusal::DeathResumeNoSession);
+        assert!(err.text_in(ja).contains("会話 ID が未検出"), "{err}");
         let err =
             registry_resume_launch_in(&entry, None, "/opt/tako", ShellDialect::Posix).unwrap_err();
-        assert!(err.contains("記録"), "{err}");
+        assert!(err.text_in(ja).contains("記録"), "{err}");
     }
 }

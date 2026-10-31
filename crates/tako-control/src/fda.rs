@@ -102,13 +102,15 @@ impl FdaStatus {
         serde_json::json!({
             "granted": self.granted,
             "platform_supported": self.platform_supported,
+            // 組んだ時点の表示言語（#2365。CLI の直呼びは呼ぶ前に表示言語を決める）
             "description": if !self.platform_supported {
-                "macOS 以外のプラットフォームでは TCC は適用されません"
+                crate::ReplyNote::FdaNotApplicable
             } else if self.granted {
-                "フルディスクアクセスが付与済みです。フォルダアクセスの許可ダイアログは表示されません"
+                crate::ReplyNote::FdaGrantedDescription
             } else {
-                "フルディスクアクセスが未付与です。フォルダアクセス時に許可ダイアログが表示されることがあります"
+                crate::ReplyNote::FdaNotGrantedDescription
             }
+            .to_string()
         })
     }
 }

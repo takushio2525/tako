@@ -99,6 +99,8 @@ pub mod remote_serve;
 pub mod remote_setup;
 pub mod remote_ssh;
 pub mod remote_tasks;
+/// 応答の値に載せる注記と CLI の手元の行の文（#2365。断りではない文の日英）
+pub mod reply_note;
 pub mod resources;
 /// 復元の直後の全滅ガード（#641。全ペイン PTY 死亡で終了せず救済・連続したら復元を見送る）
 pub mod restore_guard;
@@ -160,6 +162,7 @@ pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
 pub use os_refusal::OsRefusal;
 pub use remote_refusal::RemoteRefusal;
+pub use reply_note::ReplyNote;
 pub use session_refusal::SessionRefusal;
 pub use setup_refusal::SetupRefusal;
 

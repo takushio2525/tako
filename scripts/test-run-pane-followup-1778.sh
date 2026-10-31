@@ -75,6 +75,8 @@ export TAKO_PANE_LOG_DIR="$TMP/panelogs"
 export TAKO_WORKERS_FILE="$TMP/workers.yaml"
 export TAKO_TMUX_SOCKET="$TMUX_SOCKET"
 mkdir -p "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR" "$TAKO_ORCHESTRATOR_DIR"
+# 下の検査は日本語の行を読むので表示言語を固定する（#2365 以後、CLI の行は表示言語に従う）
+printf '{"language":"ja"}' > "$TAKO_DATA_DIR/settings.json"
 for d in "$HOME" "$TAKO_DATA_DIR" "$TAKO_ORCHESTRATOR_DIR" "$TAKO_PANE_LOG_DIR"; do
   case "$d" in
     "$TMP"/*) : ;;

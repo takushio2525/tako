@@ -258,7 +258,8 @@ fn 打った時点の組み立ては_1_実装を通る() {
             "CLI が spawn と同じ組み立てを通らずに起動コマンドを作っている",
         ),
         (
-            "launch.materialize()",
+            // 断りを表示言語で返す型の口（#2365）
+            "launch.materialize_typed()",
             "MCP の絞り込みの設定ファイルを書かずに起動する（--settings のファイルが無い）",
         ),
         (
@@ -281,7 +282,8 @@ fn 打った時点の組み立ては_1_実装を通る() {
     require(
         &inner,
         RESUME,
-        "worker_resume_launch(",
+        // 断りを表示言語で返す型の口（#2365。中身は同じ 1 実装）
+        "worker_resume_launch_typed(",
         "復旧が GUI の復元・`tako sessions resume` と別の組み立てを通っている",
     );
     for needle in ["build_worker_cmd", "--settings", "--model"] {

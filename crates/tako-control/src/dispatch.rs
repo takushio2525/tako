@@ -21,6 +21,7 @@ use tako_core::{
 use crate::orchestrator::ConfigError;
 use crate::os_refusal::OsRefusal;
 use crate::protocol::{error_code, Direction, FileOpKind, PreviewModeWire, Request};
+use crate::reply_note::ReplyNote;
 use crate::session_refusal::SessionRefusal;
 use crate::setup_refusal::SetupRefusal;
 
@@ -1062,6 +1063,48 @@ pub enum Reason {
         before: usize,
         kept: usize,
         archived: usize,
+    },
+    // ---- #2365 の続き: CLI の手元の処理の断り（CLI `main.rs` が自分で組んでいた文。`error: …` に出る） ----
+    /// `カレントディレクトリの取得に失敗: <error>`（`tako setup-mcp --project`）
+    CurrentDirFailed(String),
+    /// `cwd が取れない: <error>`（`tako context-budget`。文の違う [`Self::CwdUnavailable`] / [`Self::CwdUnreadable`] とは別）
+    CwdNotObtained(String),
+    /// `worker <id> がレジストリに無い（…）`（`tako orchestrator resume`）
+    WorkerNotInRegistry(String),
+    /// 修正前の案内を組めない（`tako orchestrator resume` の A/B `TAKO_2470_LEGACY=1` の腕）
+    LegacyResumeUnbuildable,
+    /// `worker の作業 dir <cwd> に移れない（…）: <error>`
+    WorkerCwdUnreachable {
+        cwd: String,
+        error: String,
+    },
+    /// `起動コマンドを走らせられない: <error>`
+    LaunchLineFailed(String),
+    /// `tako orchestrator watch` の対象（ペイン ID / `--worker`）が無い
+    WatchTargetMissing,
+    /// `tako usage --show` で GUI が動いていない
+    UsageShowNeedsGui,
+    /// `tako queue` の優先度が読めない（`got` は受け取った値）
+    QueuePriorityUnknown(String),
+    /// `tako queue --max-wait` の時間が読めない（`got` は受け取った値）
+    QueueDurationUnreadable(String),
+    /// `tako queue --max-wait` の単位が読めない（`unit` は数字の後ろ）
+    QueueDurationUnitUnknown(String),
+    /// `tako queue --max-wait` が 0 秒
+    QueueWaitTooShort,
+    /// `tako queue serve` に `TAKO_QUEUE_SOCKET` が無い
+    QueueSocketRequired,
+    /// `tako queue serve` に `TAKO_TOKEN` が無い
+    QueueTokenRequired,
+    /// `--wait` の要求に GUI が pane ID を返さなかった（`command` は `run` / `run-interactive`）
+    RunNoPaneId(&'static str),
+    /// `--wait` で待ったコマンドが 0 以外で終わった
+    RunExitedWithCode(i64),
+    /// `--wait` が上限まで待って打ち切った（実行は止めない。`env` は上限を変える env の名前）
+    RunWaitTimedOut {
+        pane: u64,
+        secs: u64,
+        env: &'static str,
     },
 }
 
@@ -2962,6 +3005,111 @@ impl Reason {
             ) => format!(
                 "{label}: the entry count does not add up after the move (before {before} / kept \
                  {kept} + moved {archived}), so nothing is written"
+            ),
+            // ---- #2365 の続き: CLI の手元の処理の断り ----
+            (Self::CurrentDirFailed(error), Ja) => {
+                format!("カレントディレクトリの取得に失敗: {error}")
+            }
+            (Self::CurrentDirFailed(error), En) => {
+                format!("failed to get the current directory: {error}")
+            }
+            (Self::CwdNotObtained(error), Ja) => format!("cwd が取れない: {error}"),
+            (Self::CwdNotObtained(error), En) => format!("cannot get the cwd: {error}"),
+            (Self::WorkerNotInRegistry(worker), Ja) => format!(
+                "worker {worker} がレジストリに無い（`tako orchestrator workers --all` の worker_id を指定する）"
+            ),
+            (Self::WorkerNotInRegistry(worker), En) => format!(
+                "worker {worker} is not in the registry (pass a worker_id from \
+                 `tako orchestrator workers --all`)"
+            ),
+            (Self::LegacyResumeUnbuildable, Ja) => {
+                "この worker は修正前の案内を組めない（claude 以外 / 会話 ID 未検出）".into()
+            }
+            (Self::LegacyResumeUnbuildable, En) => {
+                "cannot build the pre-fix command for this worker (not claude / no conversation ID \
+                 detected)"
+                    .into()
+            }
+            (Self::WorkerCwdUnreachable { cwd, error }, Ja) => {
+                format!("worker の作業 dir {cwd} に移れない（worktree を消した等）: {error}")
+            }
+            (Self::WorkerCwdUnreachable { cwd, error }, En) => format!(
+                "cannot move to the worker's working dir {cwd} (the worktree was removed, etc.): \
+                 {error}"
+            ),
+            (Self::LaunchLineFailed(error), Ja) => {
+                format!("起動コマンドを走らせられない: {error}")
+            }
+            (Self::LaunchLineFailed(error), En) => {
+                format!("cannot run the launch command: {error}")
+            }
+            (Self::WatchTargetMissing, Ja) => {
+                "ペイン ID または --worker を指定してください\
+                 （tako orchestrator watch <PANE_ID> / --worker <ID>）"
+                    .into()
+            }
+            (Self::WatchTargetMissing, En) => {
+                "pass a pane ID or --worker (tako orchestrator watch <PANE_ID> / --worker <ID>)"
+                    .into()
+            }
+            (Self::UsageShowNeedsGui, Ja) => {
+                "tako が動いていないので右パネルには出せない（--show を外すとこのまま読める）".into()
+            }
+            (Self::UsageShowNeedsGui, En) => {
+                "tako is not running, so it cannot be shown in the right panel (drop --show to \
+                 read it as is)"
+                    .into()
+            }
+            (Self::QueuePriorityUnknown(got), Ja) => {
+                format!("優先度は top / high / normal / low（受け取った値: {got}）")
+            }
+            (Self::QueuePriorityUnknown(got), En) => {
+                format!("the priority is top / high / normal / low (got: {got})")
+            }
+            (Self::QueueDurationUnreadable(got), Ja) => {
+                format!("時間を読めない: {got}（例: 90s / 10m / 1h）")
+            }
+            (Self::QueueDurationUnreadable(got), En) => {
+                format!("cannot read the time: {got} (e.g. 90s / 10m / 1h)")
+            }
+            (Self::QueueDurationUnitUnknown(unit), Ja) => {
+                format!("時間の単位を読めない: {unit}（s / m / h）")
+            }
+            (Self::QueueDurationUnitUnknown(unit), En) => {
+                format!("cannot read the time unit: {unit} (s / m / h)")
+            }
+            (Self::QueueWaitTooShort, Ja) => "待ちの上限は 1 秒以上".into(),
+            (Self::QueueWaitTooShort, En) => "the wait limit must be 1 second or more".into(),
+            (Self::QueueSocketRequired, Ja) => {
+                "TAKO_QUEUE_SOCKET が要る（本番の調停役と取り合わないよう、\
+                 隔離の調停役は明示したときだけ立てる）"
+                    .into()
+            }
+            (Self::QueueSocketRequired, En) => {
+                "TAKO_QUEUE_SOCKET is required (an isolated arbiter starts only when it is named, \
+                 so it does not compete with the production one)"
+                    .into()
+            }
+            (Self::QueueTokenRequired, Ja) => {
+                "TAKO_TOKEN が要る（繋ぐ側の tako queue も同じ値を持つ）".into()
+            }
+            (Self::QueueTokenRequired, En) => {
+                "TAKO_TOKEN is required (the connecting tako queue holds the same value)".into()
+            }
+            (Self::RunNoPaneId(command), Ja) => format!("{command} が pane ID を返さなかった"),
+            (Self::RunNoPaneId(command), En) => format!("{command} did not return a pane ID"),
+            (Self::RunExitedWithCode(code), Ja) => format!("コマンドが exit code {code} で終了"),
+            (Self::RunExitedWithCode(code), En) => {
+                format!("the command exited with exit code {code}")
+            }
+            (Self::RunWaitTimedOut { pane, secs, env }, Ja) => format!(
+                "まだ実行中です（pane {pane}。{secs} 秒待って打ち切りました。実行は止めていません）。\
+                 続きは `tako run-interactive-status {pane}`。上限は {env} で変えられます"
+            ),
+            (Self::RunWaitTimedOut { pane, secs, env }, En) => format!(
+                "still running (pane {pane}; stopped waiting after {secs} seconds; the command \
+                 keeps running). Check it with `tako run-interactive-status {pane}`. Change the \
+                 limit with {env}"
             ),
         }
     }
@@ -7916,7 +8064,7 @@ fn preview_changelog_land(
         "commits": commits,
     });
     if !in_repo {
-        out["message"] = json!("git 管理外のファイル");
+        out["message"] = json!(ReplyNote::ChangelogUntracked.to_string());
     }
     Ok(out)
 }
@@ -8621,9 +8769,10 @@ fn disk_diff_json(diff: &tako_core::DiskDiff, path: &str) -> Value {
         "removed": diff.diff.removed,
         "truncated": diff.diff.truncated,
         "approximate": diff.diff.approximate,
-        "unified": diff
-            .diff
-            .unified(&format!("{path}（ディスク）"), &format!("{path}（編集中）")),
+        "unified": diff.diff.unified(
+            &ReplyNote::DiskDiffDisk(path.to_string()).to_string(),
+            &ReplyNote::DiskDiffEditing(path.to_string()).to_string()
+        ),
     })
 }
 
@@ -9676,11 +9825,8 @@ fn dispatch_inner(
                 "shell": "zsh",
                 "provider": "zsh-autosuggestions",
                 "version": tako_core::shell_integration::AUTOSUGGEST_VERSION,
-                "applies_to": "既存ペインを含む tako 内の zsh（次のプロンプトから反映）",
-                "note": "ユーザーが自前で zsh-autosuggestions を導入しているペインでは \
-                    tako は注入せず、この設定も効かない（二重注入ガード）。\
-                    Tab 確定が働くのはゴースト表示中かつカーソルが行末のときだけで、\
-                    それ以外の Tab は従来の補完のまま（tab=false にすると常に補完）",
+                "applies_to": ReplyNote::AutosuggestAppliesTo.to_string(),
+                "note": ReplyNote::AutosuggestNote.to_string(),
             }))
         }
 
@@ -12000,7 +12146,7 @@ fn dispatch_inner(
                     .iter()
                     .map(agent_models::ModelCatalog::to_json)
                     .collect::<Vec<_>>(),
-                "apply_command": "tako orchestrator profiles set <プロファイル> --model <id> --effort <値>",
+                "apply_command": ReplyNote::ModelsApplyCommand.to_string(),
             }))
         }
 
@@ -12142,7 +12288,7 @@ fn dispatch_inner(
                     crate::sleep_guard::open_battery_settings_typed()
                         .map_err(OsRefusal::operation)?;
                     Ok(serde_json::json!({
-                        "result": "System Settings の Battery を開きました",
+                        "result": ReplyNote::BatterySettingsOpened.to_string(),
                     }))
                 }
                 other => Err(Reason::UnknownValue {
@@ -15892,9 +16038,7 @@ fn profile_to_json(
     // 狭いだけなので、何に効くのかを正しく言う（黙って狭めない）
     if limit_resume_resolved && kind == orchestrator::ProfileKind::Solo {
         let mut warnings: Vec<Value> = v["warnings"].as_array().cloned().unwrap_or_default();
-        warnings.push(json!(
-            "solo プロファイルは worker を spawn しないので、limit_resume が効くのは `tako solo` で立てた本人のペインだけです（worker への配布はありません）。\n  ペイン単位で切り替えるには `tako limit-resume on --pane <id>` を使ってください"
-        ));
+        warnings.push(json!(ReplyNote::SoloLimitResumeScope.to_string()));
         v["warnings"] = Value::Array(warnings);
     }
     // codex のサンドボックス解除（#981）。値そのものは常に返す（既定 false でも
@@ -15915,9 +16059,7 @@ fn profile_to_json(
             .contains_key(orchestrator::WorkerAgent::Codex.as_str());
     if codex_in_use && codex_skip_requested && !profile.bypass_sandbox {
         let mut warnings: Vec<Value> = v["warnings"].as_array().cloned().unwrap_or_default();
-        warnings.push(json!(
-            "codex は承認スキップとサンドボックス解除が同じフラグ（--dangerously-bypass-approvals-and-sandbox）なので、bypass_sandbox が false のあいだ skip_permissions は効きません（コマンド実行に承認プロンプトが出ます）。\n  外す場合は `--bypass-sandbox true`（サンドボックスと承認が両方無効になります）"
-        ));
+        warnings.push(json!(ReplyNote::CodexBypassSandboxOff.to_string()));
         v["warnings"] = Value::Array(warnings);
     }
     // Remote Control の opt-in（#1068）。値そのものは常に返す（bypass_sandbox と同じ理由 =
@@ -15939,12 +16081,12 @@ fn profile_to_json(
                     });
                     let mut warnings: Vec<Value> =
                         v["warnings"].as_array().cloned().unwrap_or_default();
-                    warnings.push(json!(format!(
-                        "remote_control: true ですが、この環境では有効にできません（{}）。\n  {} / {}",
-                        blocked.detail(),
-                        blocked.reason().text(),
-                        blocked.next_step().text()
-                    )));
+                    warnings.push(json!(ReplyNote::ProfileRemoteControlBlocked {
+                        detail: blocked.detail().to_string(),
+                        reason: blocked.reason(),
+                        next_step: blocked.next_step(),
+                    }
+                    .to_string()));
                     v["warnings"] = Value::Array(warnings);
                 }
             }
@@ -17302,14 +17444,7 @@ pub fn dispatch_orchestrator_accounts(
             // 既存ログインが見えなくなる）。登録は通すが必ず警告する
             let warning = config_dir
                 .filter(|cd| orchestrator::is_claude_default_config_dir(cd))
-                .map(|cd| {
-                    format!(
-                        "config_dir '{cd}' は claude の既定パスです。既定パスを明示指定すると \
-                         CLAUDE_CONFIG_DIR が設定された状態になり、claude が Keychain の別エントリ\
-                         （ハッシュ付き）を見に行くため既存ログインが未ログイン扱いになります。\
-                         既定の資格情報をそのまま使うなら inherit=true で登録してください（#512）"
-                    )
-                });
+                .map(|cd| ReplyNote::AccountsDefaultConfigDir(cd.to_string()).to_string());
             if let Some(w) = &warning {
                 eprintln!("warning: {w}");
             }
@@ -17357,20 +17492,17 @@ pub fn dispatch_orchestrator_accounts(
 
 /// 有効なレイアウト方針を人が読む 1 行にする（#1439。CLI / MCP で同じ文）
 fn effective_policy_text(cfg: &tako_core::SpawnLayoutConfig) -> String {
-    if cfg.min_worker_cols == 0 {
-        return "worker は常に spawn 元と同じタブへ置く（タブ分けなし）。桁数の保証なし（min_worker_cols=0）".to_string();
-    }
-    if !cfg.auto_shrink_font {
-        return format!(
-            "worker は常に spawn 元と同じタブへ置く（タブ分けなし）。下限 {} 桁を割っても自動縮小はしない（auto_shrink_font=false）",
-            cfg.min_worker_cols
-        );
-    }
-    format!(
-        "worker は常に spawn 元と同じタブへ置く（タブ分けなし）。下限 {} 桁を割るときは worker ペインのフォントを自動で縮め、床は既定サイズの {}%（届かなければ床で置き cols_short を立てる）",
-        cfg.min_worker_cols,
-        (cfg.min_worker_font_scale * 100.0).round() as i32
-    )
+    let note = if cfg.min_worker_cols == 0 {
+        ReplyNote::PolicySameTabNoGuarantee
+    } else if !cfg.auto_shrink_font {
+        ReplyNote::PolicySameTabNoShrink(cfg.min_worker_cols)
+    } else {
+        ReplyNote::PolicySameTabShrink {
+            min_cols: cfg.min_worker_cols,
+            floor_pct: (cfg.min_worker_font_scale * 100.0).round() as i32,
+        }
+    };
+    note.to_string()
 }
 
 /// （二重実装を作らない。#83 の教訓）。
@@ -17658,28 +17790,28 @@ fn dispatch_orchestrator_self(
         let label = pane_role.as_deref().unwrap_or("null");
         // solo のペインを名指しされたときに「solo ではない」と言わない（役割ラベルの
         // 語彙は `orchestrator-solo:<名前>` で、profile は env 側にしか無い）
-        let why = if label.starts_with("orchestrator-solo") {
-            "solo の profile は起動時の env（`solo:<名前>`）にしか無く、ペインの role ラベルからは解けない"
-        } else {
-            "master / solo のペインではない"
-        };
-        warnings.push(format!(
-            "pane {}（role={label}）の profile が {} へ落ちている: {why}。\
-             master を名指しするか、`--pane` を省いて呼び出し元を解決させる",
-            pane_id.as_u64(),
-            profile_name
-        ));
+        warnings.push(
+            ReplyNote::SelfProfileDefaulted {
+                pane: pane_id.as_u64(),
+                role: label.to_string(),
+                profile: profile_name.to_string(),
+                solo_pane: label.starts_with("orchestrator-solo"),
+            }
+            .to_string(),
+        );
     }
     // 範囲外の手書き設定は黙って丸めず、丸めたことを応答に出す（#749）
     if threshold.clamped() {
         result["ctx_threshold_raw"] = json!(threshold.raw);
-        warnings.push(format!(
-            "ctx_threshold={} は値域外のため {} へ丸めた（{}〜{}）",
-            threshold.raw,
-            ctx_threshold,
-            tako_core::handoff::CTX_THRESHOLD_MIN,
-            tako_core::handoff::CTX_THRESHOLD_MAX
-        ));
+        warnings.push(
+            ReplyNote::CtxThresholdClamped {
+                raw: threshold.raw,
+                value: ctx_threshold,
+                min: tako_core::handoff::CTX_THRESHOLD_MIN,
+                max: tako_core::handoff::CTX_THRESHOLD_MAX,
+            }
+            .to_string(),
+        );
     }
     if !warnings.is_empty() {
         result["warnings"] = json!(warnings);
@@ -18561,10 +18693,11 @@ fn dispatch_orchestrator_handoff(
         // （旧 master を特定できなかった = 安全側に倒した）
         "previous_master_pane_id": previous_pane.map(PaneId::as_u64),
         "previous_master_close": if previous_pane.is_some() {
-            "後任 master が引き継ぎ確認後に閉じる"
+            ReplyNote::PreviousMasterClosedBySuccessor
         } else {
-            "旧 master ペインを特定できなかったため閉じない"
-        },
+            ReplyNote::PreviousMasterKept
+        }
+        .to_string(),
     }))
 }
 
@@ -18894,17 +19027,23 @@ fn describe_font_fit(fit: Option<crate::worker_font::AppliedFit>, min_cols: u16)
         .font_size
         .map(|s| format!("{s:.1}pt"))
         .unwrap_or_else(|| "-".to_string());
-    if fit.fit.cols_short {
-        Some(format!(
-            "同じタブに置いた。フォントを床の {pct}%（{size}）まで縮めたが {} 桁で下限 {min_cols} 桁に届かない。\n  直すには: ウィンドウを広げる / worker を減らす / tako orchestrator layout --min-worker-cols <桁>",
-            fit.fit.cols
-        ))
+    let cols = fit.fit.cols;
+    let note = if fit.fit.cols_short {
+        ReplyNote::FontFitShort {
+            pct,
+            size,
+            cols,
+            min_cols,
+        }
     } else {
-        Some(format!(
-            "同じタブに置き、worker ペインのフォントを {pct}%（{size}）へ縮めて {} 桁を確保した（下限 {min_cols} 桁）",
-            fit.fit.cols
-        ))
-    }
+        ReplyNote::FontFitShrunk {
+            pct,
+            size,
+            cols,
+            min_cols,
+        }
+    };
+    Some(note.to_string())
 }
 
 /// worker の置き先を決める（#1132 → #1439 で方針を変更）。
@@ -18956,10 +19095,13 @@ fn plan_worker_placement(
             tab: Some(tab_id),
             anchor: target,
             kind: "same_tab",
-            reason: Some(format!(
-                "ウィンドウ幅がそもそも下限に届かない（タブ全幅 {} 桁 < 下限 {min_cols} 桁）ので同じタブへ置いた。\n  直すには: ウィンドウを広げる / 文字サイズを下げる / tako orchestrator layout --min-worker-cols <桁>",
-                full_tab_cols.unwrap_or(0)
-            )),
+            reason: Some(
+                ReplyNote::PlacementWindowTooNarrow {
+                    full_cols: full_tab_cols.unwrap_or(0),
+                    min_cols,
+                }
+                .to_string(),
+            ),
             predicted_cols: Some(predicted),
             min_cols,
         };
@@ -18985,10 +19127,15 @@ fn plan_worker_placement(
                     tab: Some(tab.id()),
                     anchor: local_anchor,
                     kind: "overflow_tab",
-                    reason: Some(format!(
-                        "同じタブへ置くと worker ペインが {predicted} 桁（下限 {min_cols} 桁）になるので、\n  すでにこの master の worker が居るタブ {} へ置いた（{cols} 桁）",
-                        tab.id().as_u64()
-                    )),
+                    reason: Some(
+                        ReplyNote::PlacementOverflowTab {
+                            predicted,
+                            min_cols,
+                            tab: tab.id().as_u64(),
+                            cols,
+                        }
+                        .to_string(),
+                    ),
                     predicted_cols: Some(cols),
                     min_cols,
                 };
@@ -19001,9 +19148,13 @@ fn plan_worker_placement(
         tab: None,
         anchor: target,
         kind: "new_tab",
-        reason: Some(format!(
-            "同じタブへ置くと worker ペインが {predicted} 桁（下限 {min_cols} 桁）になるので、新しいタブへ置いた。\n  同じタブへ詰めたいときは: tako orchestrator layout --min-worker-cols <桁>（0 で保証しない）"
-        )),
+        reason: Some(
+            ReplyNote::PlacementNewTab {
+                predicted,
+                min_cols,
+            }
+            .to_string(),
+        ),
         predicted_cols: full_tab_cols,
         min_cols,
     }
@@ -19498,12 +19649,12 @@ fn dispatch_orchestrator_spawn(
     // #1068: opt-in しているのに Remote Control が有効にならなかったときは理由を残す。
     // ここで黙ると「スマホの一覧に出ない」の原因が辿れなくなる
     if let Some(blocked) = &remote_control.blocked {
-        let message = format!(
-            "remote_control: true ですが有効にできませんでした（{}）。{} / {}",
-            blocked.detail(),
-            blocked.reason().text(),
-            blocked.next_step().text()
-        );
+        let message = ReplyNote::SpawnRemoteControlBlocked {
+            detail: blocked.detail().to_string(),
+            reason: blocked.reason(),
+            next_step: blocked.next_step(),
+        }
+        .to_string();
         eprintln!("warning: {message}");
         launch_warnings.push(json!({
             "kind": format!("remote_control_{}", blocked.kind()),
@@ -20569,24 +20720,16 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         let screen_permission =
             permission_dialog.is_some() || screen_choice.as_deref() == Some("plan_confirm");
         if turn.awaits_answer() && status == "waiting" && screen_choice.is_none() {
-            warnings.push(format!(
-                "mod は {} を報告しているが、画面に選択肢ダイアログが見えない\
-                 （respond は画面のダイアログを読むので、画面に出るまで応答できない）",
-                turn.as_str()
-            ));
+            warnings.push(ReplyNote::ModTurnWithoutDialog(turn.as_str().to_string()).to_string());
         }
         if !turn.awaits_answer() && screen_permission {
-            let why = if classic_events == Some(false) {
-                "classic 系のイベントが mod へ届かない環境（classic_events=false）では、\
-                 ルールの無い ask の権限ダイアログを mod から拾えない\
-                 （ask ルール由来なら次の報告 = 1 秒以内で揃う）"
-            } else {
-                "mod の報告がまだ追いついていない"
-            };
-            warnings.push(format!(
-                "画面に権限ダイアログがあるが mod は {}（{why}。画面の検出を採用）",
-                turn.as_str()
-            ));
+            warnings.push(
+                ReplyNote::PermissionDialogUnreported {
+                    turn: turn.as_str().to_string(),
+                    classic_events_off: classic_events == Some(false),
+                }
+                .to_string(),
+            );
         }
     }
     warnings.extend(ctx.as_ref().and_then(crate::claude_ctx::window_warning));
@@ -20717,7 +20860,7 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
         if !screen_busy {
             status = "stalled".to_string();
             stalled_info = Some(json!({
-                "detail": "busy と判定されたが実行中の子プロセスが無く、画面の busy パターンも無い",
+                "detail": ReplyNote::StalledWithoutChildren.to_string(),
                 "recommended_action": "check_and_resume",
             }));
         }
@@ -21820,8 +21963,7 @@ fn run_setup_cli_within(
             "waited_secs": waited,
             "probe_timeouts": probe_timeouts,
             "output": output,
-            "note": "tako setup が上限内に終わらなかったので打ち切った。\
-                     ターミナルで tako setup を実行して続きを確認すること",
+            "note": ReplyNote::SetupTimedOut.to_string(),
         }));
     }
     let status = status.expect("打ち切りでないなら終了コードがある");
@@ -27495,7 +27637,7 @@ fn dispatch_tree_selection(
                 // （#1895 の ⇧↑ / ⇧↓ と同じ）
                 out["selection"] = tree_selection_json(Some((prev, true)));
                 out["changed"] = json!(false);
-                out["note"] = json!("リモート（SSH）の行はキーで動かさない");
+                out["note"] = json!(ReplyNote::TreeRemoteRowStays.to_string());
                 return Ok(out);
             }
             let rows = host.tree_rows();
@@ -28398,11 +28540,7 @@ fn dispatch_session_restart(
             resp["mode"] = json!(mode.as_str());
             resp["command"] = json!(command);
             resp["terminated_pid"] = json!(plan.agent_pid);
-            resp["note"] = json!(
-                "エージェントのプロセスを終了させ、落ちてシェルが戻ったのを確かめてから \
-                 元の起動と同じ引数 + --resume の行を送達確認つきで送る（会話はそのまま続く）。\
-                 送った後もすぐ落ちないかを見張り、結果は tako session-restart の last_restart に出る"
-            );
+            resp["note"] = json!(ReplyNote::SessionRestartHarness.to_string());
             Ok(resp)
         }
         SessionRestartMode::Handoff => {
@@ -28420,12 +28558,7 @@ fn dispatch_session_restart(
             resp["mode"] = json!(mode.as_str());
             resp["prompt_len"] = json!(prompt.len());
             resp["handoff_path"] = json!(plan.handoff_path);
-            resp["note"] = json!(
-                "引き継ぎの書き直しと tako_orchestrator_handoff の呼び出しを master へ依頼した。\
-                 後任 master が同じタブに立ち、引き継ぎを確認してから前任のペインを閉じる \
-                 （前任を閉じるのは後任なので、後任の起動が失敗しても master を失わない）。\
-                 依頼が届いたかは tako session-restart の handoff_delivery に出る"
-            );
+            resp["note"] = json!(ReplyNote::SessionRestartHandoff.to_string());
             Ok(resp)
         }
     }
@@ -28483,7 +28616,7 @@ fn finish_stale_status(ctx: &StaleStatusCtx) -> Value {
         None => {
             return json!({
                 "stale": false,
-                "reason": "バックエンドセッションなし（stale 検知対象外）",
+                "reason": ReplyNote::StaleNoBackend.to_string(),
                 "pane": ctx.pane,
             });
         }
@@ -40651,7 +40784,14 @@ mod tests {
         .unwrap();
         assert_eq!(v["status"], "waiting");
         let w = v["warnings"][0].as_str().unwrap_or_default();
-        assert!(w.contains("画面に選択肢ダイアログが見えない"), "{w}");
+        // 注記は組んだ時点の表示言語（#2365）。表示言語はプロセス全体の状態なので日英のどちらかで見る
+        let note = ReplyNote::ModTurnWithoutDialog("permission".into());
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .iter()
+                .any(|&lang| w == note.text_in(lang)),
+            "{w}"
+        );
     }
 
     /// #1880: 報告が無ければ今の経路のまま（理由つき）。pane の同一性が崩れたら mod も捨てる
@@ -43536,8 +43676,10 @@ mod tests {
                     .join(" / ")
             })
             .unwrap_or_default();
+        // 注記は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらかで見る）
         assert!(
-            warnings.contains("master / solo のペインではない"),
+            warnings.contains("master / solo のペインではない")
+                || warnings.contains("not a master / solo pane"),
             "既定へ落ちた理由が出ていない: {result}"
         );
     }
@@ -43574,12 +43716,15 @@ mod tests {
         .unwrap();
         assert_eq!(result["pane_id"].as_u64(), Some(solo));
         let warnings = result["warnings"].to_string();
+        // 注記は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらかで見る）
         assert!(
-            warnings.contains("solo の profile は起動時の env"),
+            warnings.contains("solo の profile は起動時の env")
+                || warnings.contains("a solo profile lives only in the env"),
             "solo 向けの理由になっていない: {result}"
         );
         assert!(
-            !warnings.contains("master / solo のペインではない"),
+            !warnings.contains("master / solo のペインではない")
+                && !warnings.contains("not a master / solo pane"),
             "solo のペインを「solo ではない」と言っている: {result}"
         );
     }
@@ -51490,7 +51635,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v["stale"], false);
-        assert!(v["reason"].as_str().unwrap().contains("対象外"));
+        // 注記は組んだ時点の表示言語（#2365。日英のどちらか）
+        let reason = v["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("対象外") || reason.contains("not subject to stale detection"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -54097,7 +54247,11 @@ mod tests {
         assert_eq!(plan.tab, None, "新しいタブを作る");
         assert_eq!(plan.anchor, master, "spawned_by は master のまま");
         let reason = plan.reason.expect("理由が載る");
-        assert!(reason.contains("31 桁"), "{reason}");
+        // 注記は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらかで見る）
+        assert!(
+            reason.contains("31 桁") || reason.contains("31 columns"),
+            "{reason}"
+        );
         assert!(
             reason.contains("min-worker-cols"),
             "次の一手が載る: {reason}"
@@ -54468,7 +54622,11 @@ mod tests {
         let plan = plan_worker_placement(&host, tab, master, &layout, PlacementArm::SplitTabs);
         assert_eq!(plan.kind, "same_tab");
         let reason = plan.reason.expect("理由が載る");
-        assert!(reason.contains("ウィンドウ"), "{reason}");
+        // 注記は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらかで見る）
+        assert!(
+            reason.contains("ウィンドウ") || reason.contains("window"),
+            "{reason}"
+        );
         assert_eq!(host.ws.tabs().len(), 1, "無駄なタブを作らない");
     }
 
@@ -54592,10 +54750,11 @@ mod tests {
             resolved.min_worker_font_scale,
             tako_core::spawn_layout::DEFAULT_MIN_WORKER_FONT_SCALE
         );
+        // 方針の 1 行は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらか）
+        let policy = effective_policy_text(&resolved);
         assert!(
-            effective_policy_text(&resolved).contains("タブ分けなし"),
-            "有効な方針の 1 行がタブ分けなしを言っていない: {}",
-            effective_policy_text(&resolved)
+            policy.contains("タブ分けなし") || policy.contains("no tab split"),
+            "有効な方針の 1 行がタブ分けなしを言っていない: {policy}"
         );
     }
 

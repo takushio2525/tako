@@ -232,6 +232,11 @@ fn 文字ラベルはsetup_rsの語彙と同じ() {
             .expect("setup.rs");
     let main = std::fs::read_to_string(emoji_scan::repo_root().join("crates/tako-cli/src/main.rs"))
         .expect("main.rs");
+    // #2365: CLI の手元の行の一部は日英を持つ `ReplyNote` へ移った（日本語の腕に同じ字面が残る）
+    let reply_note = std::fs::read_to_string(
+        emoji_scan::repo_root().join("crates/tako-control/src/reply_note.rs"),
+    )
+    .expect("reply_note.rs");
     for label in ["[OK]", "[情報]", "[警告]", "[不足]", "[任意]", "[失敗]"] {
         assert!(
             setup.contains(label),
@@ -246,6 +251,9 @@ fn 文字ラベルはsetup_rsの語彙と同じ() {
         "[OK] エージェント共通ルール同期: 最新",
         "[不足] 正本ファイルが見つかりません",
     ] {
-        assert!(main.contains(placed), "main.rs に {placed:?} が無い");
+        assert!(
+            main.contains(placed) || reply_note.contains(placed),
+            "main.rs（と移した先の reply_note.rs）に {placed:?} が無い"
+        );
     }
 }
