@@ -100,7 +100,7 @@ fn refusals_write_nothing(dir: &Path) -> Vec<String> {
             } else {
                 "書き換えた"
             };
-            failures.push(format!("断ったのに {what}: {}", path.display()));
+            failures.push(format!("断ったのに{what}: {}", path.display()));
         }
         let mut bak = path.clone().into_os_string();
         bak.push(".bak.1");
