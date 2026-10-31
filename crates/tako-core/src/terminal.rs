@@ -1596,8 +1596,8 @@ impl TerminalSession {
     /// 全角を自分で検査する**こと（#1132 のとおり worker のペインは 21〜25 桁まで
     /// 狭まるので、狭いほど行末が全角になる確率は上がる）。限界は
     /// `visible_lines_filled_は行末の全角を取りこぼす` が固定し、兄弟実装
-    /// `links::combined_screen_text` の同じ穴は `.agent/conventions.md` の
-    /// #1283 節に並べてある
+    /// `links::combined_screen_text` の同じ穴（#2578 で最後の可視文字の右端の列を
+    /// 見るよう直した）は `.agent/conventions.md` の #1283 節に並べてある
     pub fn visible_lines_filled(&self) -> Vec<(String, bool)> {
         use alacritty_terminal::index::Line;
         use alacritty_terminal::term::cell::LineLength;
