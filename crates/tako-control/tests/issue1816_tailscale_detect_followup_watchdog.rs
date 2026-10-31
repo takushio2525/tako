@@ -366,7 +366,8 @@ fn remote_setupの検出の段は1回だけ引く() {
     // (関数, 検出の段の次 = 系統を決める段の入口)
     for (name, next_step) in [
         ("run_interactive", "choose_variant_interactive("),
-        ("run_noninteractive", "decide_variant("),
+        // #2365: 非対話の経路は表示言語で断る型の口を呼ぶ
+        ("run_noninteractive", "decide_variant_typed("),
     ] {
         let (body, base) = fn_body(REMOTE_SETUP, name);
         let step = body.find(next_step).unwrap_or_else(|| {

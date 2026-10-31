@@ -6331,15 +6331,18 @@ fn remote_status() -> Result<(), String> {
 /// `.agent/requirements.md` FR-6.5 / FR-6.21）。`role` に強いものを渡すと断られるので、
 /// 「上げられない」ことを CLI からそのまま観測できる
 fn remote_devices(command: RemoteDevicesCommand) -> Result<(), String> {
+    // 断り（`RemoteRefusal`）は表示言語で文にするので、呼ぶ前に設定から決める（#2365）
+    init_local_lang();
     let result = match command {
-        RemoteDevicesCommand::List => tako_control::remote::devices_list()?,
+        RemoteDevicesCommand::List => tako_control::remote::devices_list(),
         RemoteDevicesCommand::Role { device_id, role } => {
-            tako_control::remote::devices_set_role(&device_id, &role)?
+            tako_control::remote::devices_set_role(&device_id, &role)
         }
         RemoteDevicesCommand::Revoke { device_id } => {
-            tako_control::remote::devices_revoke(&device_id)?
+            tako_control::remote::devices_revoke(&device_id)
         }
-    };
+    }
+    .map_err(|e| e.to_string())?;
     println!("{}", pretty_json(&result));
     Ok(())
 }
@@ -6371,15 +6374,21 @@ fn remote_setup_cli(
     tailscale: Option<&str>,
 ) -> Result<(), String> {
     if let Some(json_str) = answers_json {
+        // 非対話の経路の断り（`RemoteRefusal`）は表示言語で文にするので、呼ぶ前に設定から決める（#2365。
+        // 対話のウィザードは日本語の表示のまま）
+        init_local_lang();
         let mut answers: tako_control::remote_setup::RemoteSetupAnswers =
-            serde_json::from_str(json_str).map_err(|e| format!("answers JSON が不正: {e}"))?;
+            serde_json::from_str(json_str).map_err(|e| {
+                tako_control::RemoteRefusal::SetupAnswersJsonInvalid(e.to_string()).to_string()
+            })?;
         if yes {
             answers.yes = Some(true);
         }
         if let Some(v) = tailscale {
             answers.tailscale = Some(v.to_string());
         }
-        let result = tako_control::remote_setup::run_noninteractive(&answers)?;
+        let result =
+            tako_control::remote_setup::run_noninteractive(&answers).map_err(|e| e.to_string())?;
         println!("{}", pretty_json(&result));
     } else {
         let mut stdout = std::io::stdout();
@@ -6405,14 +6414,19 @@ fn remote_agents() -> Result<(), String> {
 
 /// `tako remote messages` — transcript の末尾を正規化 JSON で表示する
 fn remote_messages(session_id: &str, tail: usize) -> Result<(), String> {
-    let result = tako_control::transcript::read_messages(session_id, tail)?;
+    // 断りは表示言語で文にする（#2365。日本語の口 `read_messages` は daemon が PWA へ返す本文用）
+    init_local_lang();
+    let result = tako_control::transcript::read_messages_typed(session_id, tail)
+        .map_err(|e| e.to_string())?;
     println!("{}", pretty_json(&result));
     Ok(())
 }
 
 /// `tako remote scrollback` — ペインのスクロールバック履歴をプレーンテキストで表示する
 fn remote_scrollback(pane_id: &str, lines: u32) -> Result<(), String> {
-    let result = tako_control::remote::scrollback(pane_id, lines)?;
+    // 断り（`RemoteRefusal`）は表示言語で文にするので、呼ぶ前に設定から決める（#2365）
+    init_local_lang();
+    let result = tako_control::remote::scrollback(pane_id, lines).map_err(|e| e.to_string())?;
     for line in result {
         println!("{line}");
     }
@@ -6892,6 +6906,8 @@ fn usage_local(args: &UsageArgs) -> Result<(), String> {
     // 背景と同じく上限つきで読み進める）。届かなければ開けない理由を言って止まる
     let payload =
         if args.show {
+            // 引数の断り（`Reason` の Display）は表示言語で組むので、確かめる前に決める（#2365）
+            init_local_lang();
             query.parsed()?;
             let request = Request::Sessions {
                 action: "usage".into(),

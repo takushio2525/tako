@@ -440,15 +440,19 @@ pub enum Refresh {
 }
 
 impl UsageQuery {
-    /// 段と期間を読む（知らない値は候補つきで断る）
+    /// 段と期間を読む（知らない値は候補つきで断る）。断りの文は表示言語（`Reason` の Display。
+    /// 呼び手は dispatch と、表示言語を設定から決めてから呼ぶ CLI の手元の処理だけ。#2365）
     pub fn parsed(&self) -> Result<(By, Window), String> {
+        self.parsed_typed().map_err(|r| r.to_string())
+    }
+
+    /// [`Self::parsed`] の型の口（言語を引数で選べる形。単体テストが日本語の文を見る）
+    pub fn parsed_typed(&self) -> Result<(By, Window), crate::Reason> {
         let by = match self.by.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             None => By::Project,
-            Some(s) => By::parse(s).ok_or_else(|| {
-                format!(
-                    "不明な by: {s:?}（{} のいずれか）",
-                    By::ALL.map(By::as_str).join(" / ")
-                )
+            Some(s) => By::parse(s).ok_or_else(|| crate::Reason::UsageByUnknown {
+                got: s.to_string(),
+                allowed: By::ALL.map(By::as_str).join(" / "),
             })?,
         };
         let window = match self
@@ -458,40 +462,47 @@ impl UsageQuery {
             .filter(|s| !s.is_empty())
         {
             None => Window::SevenDay,
-            Some(s) => Window::parse(s).ok_or_else(|| {
-                format!(
-                    "不明な window: {s:?}（{} のいずれか）",
-                    Window::ALL.map(Window::as_str).join(" / ")
-                )
+            Some(s) => Window::parse(s).ok_or_else(|| crate::Reason::UsageWindowUnknown {
+                got: s.to_string(),
+                allowed: Window::ALL.map(Window::as_str).join(" / "),
             })?,
         };
-        self.filters()?;
+        self.filters_typed()?;
         Ok((by, window))
     }
 
     /// 絞り込み（`project` / `issue`）を読む（空は「絞らない」。読めない値は書き方つきで断る）
     pub fn filters(&self) -> Result<(Option<ProjectFilter<'_>>, Option<IssueFilter>), String> {
+        self.filters_typed().map_err(|r| r.to_string())
+    }
+
+    /// [`Self::filters`] の型の口
+    #[allow(clippy::type_complexity)]
+    pub fn filters_typed(
+        &self,
+    ) -> Result<(Option<ProjectFilter<'_>>, Option<IssueFilter>), crate::Reason> {
         fn set(v: &Option<String>) -> Option<&str> {
             v.as_deref().filter(|s| !s.trim().is_empty())
         }
         let project = match set(&self.project) {
             None => None,
             Some(s) => Some(ProjectFilter::parse(s).ok_or_else(|| {
-                format!(
-                    "読めない project: {s:?}（<キー> / project:<キー> / profile:<名前> / {}）",
-                    ProjectFilter::UNCLASSIFIED
-                )
+                crate::Reason::UsageProjectUnreadable {
+                    got: s.to_string(),
+                    unclassified: ProjectFilter::UNCLASSIFIED,
+                }
             })?),
         };
-        let issue = match set(&self.issue) {
-            None => None,
-            Some(s) => Some(IssueFilter::parse(s).ok_or_else(|| {
-                format!(
-                    "読めない issue: {s:?}（番号 / #番号 / {}）",
-                    IssueFilter::MISSING
-                )
-            })?),
-        };
+        let issue =
+            match set(&self.issue) {
+                None => None,
+                Some(s) => Some(IssueFilter::parse(s).ok_or_else(|| {
+                    crate::Reason::UsageIssueUnreadable {
+                        got: s.to_string(),
+                        missing: IssueFilter::MISSING,
+                    }
+                })?),
+            };
         Ok((project, issue))
     }
 }
@@ -998,6 +1009,7 @@ fn index_tick_for_gui() {
 mod tests {
     use super::*;
     use tako_core::claude_mod::ModRateLimit;
+    use tako_core::i18n::Lang::Ja;
     use tako_core::usage::KeyFrom;
 
     const UUID_A: &str = "aaaaaaaa-1111-4222-8333-444444444444";
@@ -1463,7 +1475,8 @@ mod tests {
                 issue: issue.map(str::to_string),
                 ..UsageQuery::default()
             };
-            let e = bad.parsed().unwrap_err();
+            // 文は表示言語に従う（並走するテストが言語を切り替えうるので日本語を明示して見る。#2365）
+            let e = bad.parsed_typed().unwrap_err().text_in(Ja);
             assert!(e.contains(want), "{e}");
         }
         // 知らない段・期間は候補つきで断る
@@ -1471,13 +1484,17 @@ mod tests {
             by: Some("branch".into()),
             ..UsageQuery::default()
         };
-        let e = bad.parsed().unwrap_err();
+        let e = bad.parsed_typed().unwrap_err().text_in(Ja);
         assert!(e.contains("project / issue"), "{e}");
         let bad = UsageQuery {
             window: Some("1y".into()),
             ..UsageQuery::default()
         };
-        assert!(bad.parsed().unwrap_err().contains("5h / 7d"));
+        assert!(bad
+            .parsed_typed()
+            .unwrap_err()
+            .text_in(Ja)
+            .contains("5h / 7d"));
     }
 
     #[test]

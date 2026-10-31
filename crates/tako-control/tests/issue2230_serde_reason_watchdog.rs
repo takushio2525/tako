@@ -62,8 +62,8 @@ const ALLOWED: &[Allow] = &[
     },
     Allow {
         file: "crates/tako-cli/src/main.rs",
-        needle: "answers JSON が不正",
-        why: "利用者がいま渡した --answers（CLI の引数）。誤りは同じ画面へ返る",
+        needle: "RemoteRefusal::SetupAnswersJsonInvalid(",
+        why: "利用者がいま渡した --answers（CLI の引数）。誤りは同じ画面へ返る（#2365 で文を RemoteRefusal へ移した）",
     },
     Allow {
         file: "crates/tako-cli/src/main.rs",
@@ -99,6 +99,11 @@ const ALLOWED: &[Allow] = &[
         file: "crates/tako-control/src/remote.rs",
         needle: "応答を解釈できない",
         why: "リモート / daemon の HTTP・IPC の応答",
+    },
+    Allow {
+        file: "crates/tako-control/src/remote.rs",
+        needle: "RemoteRefusal::DaemonResponseParse(",
+        why: "daemon の admin API の HTTP の応答（ファイルではない。#2365 で文を RemoteRefusal へ移した）",
     },
     Allow {
         file: "crates/tako-control/src/remote.rs",

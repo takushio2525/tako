@@ -120,19 +120,26 @@ fn candidates_of(survey: &tailscale::VariantSurvey) -> Vec<tailscale::VariantCan
 /// 非対話で系統を決めて保存する。`explicit` があればそれを最優先で使う。
 ///
 /// **GUI 決め打ちはしない**: 使える系統が 1 つならそれ、複数なら「現にノード実体として
-/// 応答している方」を選び、根拠を返す（呼び出し側が応答・表示に載せる）
+/// 応答している方」を選び、根拠を返す（呼び出し側が応答・表示に載せる）。
+///
+/// 断りの文は日本語のまま（日本語の対話のウィザードが使う。#2365）。CLI / MCP の非対話の経路は
+/// 表示言語で返す [`decide_variant_typed`] を通る
 pub fn decide_variant(explicit: Option<&str>) -> Result<VariantDecision, String> {
+    decide_variant_typed(explicit).map_err(crate::RemoteRefusal::into_ja)
+}
+
+/// [`decide_variant`] の型の口
+pub fn decide_variant_typed(
+    explicit: Option<&str>,
+) -> Result<VariantDecision, crate::RemoteRefusal> {
+    use crate::RemoteRefusal;
     let survey = tailscale::survey_variants();
     let candidates: Vec<String> = survey.probes.iter().map(|p| p.summary()).collect();
 
     if let Some(key) = explicit.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let variant = tailscale::TailscaleVariant::parse(key).ok_or_else(|| {
-            format!(
-                "Tailscale 系統の指定が不正です: {key}（auto | gui | standalone）。\
-                 standalone を選ぶには tailscaled の LocalAPI socket が必要です"
-            )
-        })?;
-        tailscale::save_variant(&variant)?;
+        let variant = tailscale::TailscaleVariant::parse(key)
+            .ok_or_else(|| RemoteRefusal::TailscaleVariantInvalid(key.to_string()))?;
+        tailscale::save_variant_typed(&variant)?;
         return Ok(VariantDecision {
             reason: format!("指定により {} を使います", variant.describe()),
             variant,
@@ -162,8 +169,8 @@ pub fn decide_variant(explicit: Option<&str>) -> Result<VariantDecision, String>
         });
     };
     let variant = tailscale::TailscaleVariant::parse(key)
-        .ok_or_else(|| format!("Tailscale 系統を解決できない: {key}"))?;
-    tailscale::save_variant(&variant)?;
+        .ok_or_else(|| RemoteRefusal::TailscaleVariantUnresolved(key.to_string()))?;
+    tailscale::save_variant_typed(&variant)?;
     Ok(VariantDecision {
         reason,
         variant,
@@ -214,7 +221,10 @@ pub fn configure_serve(cli: &str) -> Result<ServeStep, String> {
 
 /// ウィザードの非対話実行（dispatch / MCP から呼ばれる。CLI の対話版は tako-cli 側）。
 /// 各ステップを順に実行し、結果を返す。失敗したステップで停止する。
-pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, String> {
+///
+/// 断りは [`crate::RemoteRefusal`]（表示言語で文にする。#2365。各段の `message` は応答の値で、
+/// ここでは扱わない）
+pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, crate::RemoteRefusal> {
     let mut result = RemoteSetupResult {
         success: false,
         ts_net_url: None,
@@ -237,7 +247,7 @@ pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, String>
     }
 
     // Step 1.5: 使う Tailscale 系統を決める（#1038: GUI 版 / standalone が同居しうる）
-    let decision = decide_variant(answers.tailscale.as_deref())?;
+    let decision = decide_variant_typed(answers.tailscale.as_deref())?;
     result.steps.push(SetupStepResult {
         step: "tailscale_variant",
         status: if decision.coexisting {
@@ -274,7 +284,7 @@ pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, String>
     let dns_name = status
         .dns_name
         .as_deref()
-        .ok_or_else(|| "MagicDNS 名を取得できません".to_string())?;
+        .ok_or(crate::RemoteRefusal::MagicDnsMissing)?;
     let ts_url = format!("https://{dns_name}");
 
     // Step 3: serve 設定（既定のループバック TCP はポートが起動時に決まるので後回し）

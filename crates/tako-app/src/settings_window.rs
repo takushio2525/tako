@@ -3267,8 +3267,9 @@ impl SettingsWindow {
                 self.message = None;
                 self.refresh_tab_status(cx);
             }
-            // 昇格を断られた（呼び出し元が GUI でない）ときもここに出る = 黙って落ちない
-            Err(e) => self.message = Some((e, true)),
+            // 昇格を断られた（呼び出し元が GUI でない）ときもここに出る = 黙って落ちない。
+            // 文は画面の表示言語（`RemoteRefusal` の Display。#2365）
+            Err(e) => self.message = Some((e.to_string(), true)),
         }
         cx.notify();
     }

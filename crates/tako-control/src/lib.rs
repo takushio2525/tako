@@ -93,6 +93,7 @@ pub mod remote_files;
 pub mod remote_generation;
 pub mod remote_launch;
 pub mod remote_preview;
+pub mod remote_refusal;
 pub mod remote_role;
 pub mod remote_serve;
 pub mod remote_setup;
@@ -158,6 +159,7 @@ pub use host_refusal::HostRefusal;
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
 pub use os_refusal::OsRefusal;
+pub use remote_refusal::RemoteRefusal;
 pub use session_refusal::SessionRefusal;
 pub use setup_refusal::SetupRefusal;
 

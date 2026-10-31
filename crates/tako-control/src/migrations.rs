@@ -1507,18 +1507,24 @@ pub fn setup_lines() -> Vec<String> {
 
 /// 移行の結果を JSON へ（**CLI と MCP はここ 1 本を通る** = 1:1 が構造的に保たれる）。
 ///
-/// `action` = "status"（既定。見るだけ）/ "run"（当てる）。`only` でファイル種別を絞る
+/// `action` = "status"（既定。見るだけ）/ "run"（当てる）。`only` でファイル種別を絞る。
+/// 知らない値の断りは表示言語（`Reason` の Display。呼び手は dispatch と、表示言語を設定から決めてから
+/// 呼ぶ CLI の手元の処理だけ。#2365）
 pub fn report_json(action: &str, only: Option<&str>) -> Result<serde_json::Value, String> {
     let mode = match action {
         "status" | "check" => Mode::Check,
         "run" | "apply" => Mode::Apply,
-        other => return Err(format!("不明な action: {other}（status | run）")),
+        other => return Err(crate::Reason::MigrateActionUnknown(other.to_string()).to_string()),
     };
     let only = match only {
         None => None,
         Some(name) => Some(SchemaId::parse(name).ok_or_else(|| {
             let names: Vec<&str> = SchemaId::all().iter().map(|i| i.as_str()).collect();
-            format!("不明なファイル種別: {name}（{}）", names.join(" | "))
+            crate::Reason::MigrateSchemaUnknown {
+                got: name.to_string(),
+                allowed: names.join(" | "),
+            }
+            .to_string()
         })?),
     };
     let report = if mode == Mode::Apply {
