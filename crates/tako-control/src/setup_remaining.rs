@@ -45,6 +45,10 @@ pub enum RemainingKind {
     AgentInstall(AgentKind),
     /// エージェント CLI の PATH 通し
     AgentPath(AgentKind),
+    /// エージェント CLI の PATH 通しを、利用者が自分のシェルの設定ファイルで行う（#2564）。
+    /// 種別の分からないシェル（tcsh・nu 等）は tako が設定ファイルを書けず、`tako setup bootstrap path` も
+    /// 同じ断りで止まるので、**次の 1 行を持たない**（理由の行に足すディレクトリの一覧を載せる）
+    AgentPathByHand(AgentKind),
     /// エージェント CLI へのログイン（ブラウザ操作。tako は代行しない = #1129）
     AgentLogin(AgentKind),
     /// エージェント CLI が 1 つも無い（どの系統でもよい）
@@ -64,7 +68,8 @@ impl RemainingKind {
     pub fn title(&self) -> String {
         match self {
             Self::AgentInstall(agent) => format!("{} の導入", agent.product()),
-            Self::AgentPath(agent) => {
+            // 見出しは同じ（違うのは「次の 1 行」が無いことと理由の行 = #2564）
+            Self::AgentPath(agent) | Self::AgentPathByHand(agent) => {
                 format!(
                     "{} コマンドをどのターミナルからも使えるようにする",
                     agent.as_str()
@@ -99,6 +104,8 @@ impl RemainingKind {
                 "tako setup bootstrap path{}",
                 setup_bootstrap::agent_flag(*agent)
             )),
+            // そのコマンドも同じ断りで止まる（堂々巡り = #2564）。打てる 1 行は無い
+            Self::AgentPathByHand(_) => None,
             // ログインコマンドの正本は `agent_cli::auth_command`（無い系統は推測で埋めない）
             Self::AgentLogin(agent) => {
                 crate::orchestrator::agent_cli::auth_command((*agent).into()).map(str::to_string)
@@ -144,6 +151,16 @@ impl RemainingKind {
         }
     }
 
+    /// [`Self::for_step`] に「PATH を利用者が自分のシェルの設定ファイルで足すしかないか」
+    /// （`setup_bootstrap::path_by_hand`）を足したもの（**純粋関数**。#2564）。
+    /// 足すしかないなら PATH の段は [`Self::AgentPathByHand`]（次の 1 行を持たない）へ写す
+    pub fn for_step_by_hand(step: Step, agent: AgentKind, by_hand: bool) -> Option<Self> {
+        match (Self::for_step(step, agent), by_hand) {
+            (Some(Self::AgentPath(agent)), true) => Some(Self::AgentPathByHand(agent)),
+            (kind, _) => kind,
+        }
+    }
+
     /// 並び順。**一番手前の段から**（導入 → PATH → ログイン → MCP → 依存）。
     /// 人は上から順に片付ければよい形にする
     fn order(&self) -> u8 {
@@ -151,7 +168,7 @@ impl RemainingKind {
             Self::AgentStatusUnknown => 0,
             Self::AgentMissing => 1,
             Self::AgentInstall(_) => 2,
-            Self::AgentPath(_) => 3,
+            Self::AgentPath(_) | Self::AgentPathByHand(_) => 3,
             Self::AgentLogin(_) => 4,
             Self::Mcp { .. } => 5,
             Self::Dep { .. } => 6,
@@ -180,6 +197,20 @@ impl Remaining {
     /// 段が返した理由を持たせて 1 件作る（**黙って捨てない**）
     pub fn with_detail(kind: RemainingKind, detail: Vec<String>) -> Self {
         Self { kind, detail }
+    }
+
+    /// PATH を自分のシェルの設定ファイルで足す 1 件（#2564）。理由の行は `tako setup bootstrap path` と
+    /// 同じ断りの**全文**（足すディレクトリの一覧つき）。要点 1 行へ縮めると一覧が落ち、次に何を
+    /// すればよいかが残らない（「次の 1 行」も無いので、一覧がこの件の唯一の手がかり）
+    pub fn path_by_hand(
+        agent: AgentKind,
+        refusal: &crate::SetupRefusal,
+        lang: tako_core::i18n::Lang,
+    ) -> Self {
+        Self::with_detail(
+            RemainingKind::AgentPathByHand(agent),
+            refusal.text_in(lang).lines().map(str::to_string).collect(),
+        )
     }
 
     /// いまの導入状況から言えることを添える（#2428）。ログインの段で、このタブからは引けないが
@@ -282,6 +313,58 @@ pub fn legacy_stop(items: &[Remaining]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2564: 種別の分からないシェルの PATH の段は `tako setup bootstrap path` へ誘導しない
+    /// （同じ断りで止まる = 堂々巡り）。次の 1 行を持たず、理由の行に足すディレクトリの一覧を全文で載せる
+    #[test]
+    fn 未知のシェルのpathの残りは同じ断りで止まるコマンドを案内しない() {
+        use tako_core::i18n::Lang;
+        // 写し: PATH の段だけが置き換わる（ほかの段は by_hand でも従来どおり）
+        assert_eq!(
+            RemainingKind::for_step_by_hand(Step::Path, AgentKind::Claude, true),
+            Some(RemainingKind::AgentPathByHand(AgentKind::Claude))
+        );
+        assert_eq!(
+            RemainingKind::for_step_by_hand(Step::Path, AgentKind::Claude, false),
+            Some(RemainingKind::AgentPath(AgentKind::Claude))
+        );
+        for step in [Step::Install, Step::Auth, Step::Ready] {
+            assert_eq!(
+                RemainingKind::for_step_by_hand(step, AgentKind::Codex, true),
+                RemainingKind::for_step(step, AgentKind::Codex),
+                "{step:?}"
+            );
+        }
+        let refusal = crate::SetupRefusal::ShellProfileUnknown {
+            shell: "/bin/tcsh".into(),
+            dirs: vec!["$HOME/.local/bin".into()],
+        };
+        for lang in [Lang::Ja, Lang::En] {
+            let item = Remaining::path_by_hand(AgentKind::Claude, &refusal, lang);
+            assert_eq!(item.kind.command(), None, "{lang:?}");
+            assert_eq!(
+                item.kind.title(),
+                RemainingKind::AgentPath(AgentKind::Claude).title()
+            );
+            // 要点 1 行へ縮めない（一覧がこの件の唯一の手がかり）
+            assert_eq!(item.detail.join("\n"), refusal.text_in(lang), "{lang:?}");
+            let text = render(&summarize(vec![item])).join("\n");
+            assert!(!text.contains("bootstrap path"), "{lang:?}: {text}");
+            assert!(
+                text.lines().any(|line| line.trim() == "$HOME/.local/bin"),
+                "{lang:?}: {text}"
+            );
+        }
+        // 並びは PATH の位置（導入 → PATH → ログイン）
+        let ordered = summarize(vec![
+            Remaining::new(RemainingKind::AgentLogin(AgentKind::Claude)),
+            Remaining::path_by_hand(AgentKind::Claude, &refusal, Lang::Ja),
+        ]);
+        assert_eq!(
+            ordered[0].kind,
+            RemainingKind::AgentPathByHand(AgentKind::Claude)
+        );
+    }
 
     #[test]
     fn 同じログインが二重に出ない() {

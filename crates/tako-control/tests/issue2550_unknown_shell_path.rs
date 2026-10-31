@@ -119,19 +119,13 @@ fn hint_problems(text: &str) -> Vec<String> {
 
 /// 未知のシェルへの案内を組む 3 か所（失敗の文に file:line で載せる = どこを戻したかを名指す。#2557）
 fn hint_sources() -> String {
-    let at = |path: &str, src: &str, needle: &str| match src
-        .lines()
-        .position(|line| line.contains(needle))
-    {
-        Some(i) => format!("{path}:{}", i + 1),
-        None => format!("{path}（{needle} が見つからない）"),
-    };
+    let at = locate;
     format!(
         "並び = {} → {}、文 = {}",
         at(
             "crates/tako-control/src/setup_bootstrap.rs",
             include_str!("../src/setup_bootstrap.rs"),
-            "SetupRefusal::ShellProfileUnknown {",
+            "fn unknown_shell_refusal(",
         ),
         at(
             "crates/tako-core/src/shell_profile.rs",
@@ -144,6 +138,14 @@ fn hint_sources() -> String {
             "fn dir_lines(",
         ),
     )
+}
+
+/// `needle` が最初に出る行を `path:line` で返す（失敗の文で直す場所を名指す）
+fn locate(path: &str, src: &str, needle: &str) -> String {
+    match src.lines().position(|line| line.contains(needle)) {
+        Some(i) => format!("{path}:{}", i + 1),
+        None => format!("{path}（{needle} が見つからない）"),
+    }
 }
 
 fn has_japanese(s: &str) -> Option<char> {
@@ -365,6 +367,74 @@ fn 種別の分からないシェルはzshと見なさずprofileへ書かずに�
         }
     }
 
+    // ---- #2564: 案内どおり足し終えた未知のシェルは断らない ----
+    // 断りが示した一覧（`$HOME/…`）をそのまま PATH へ足すと、path は書かずに `already_on_path` を返す。
+    // 修正前は足し終えても同じ断り = `tako setup` が「足してください」を出し続けた（形を変えた堂々巡り）。
+    // 偽のシェルは何も答えないので、見え方はプロセスの PATH（本物の tcsh も `-l -c` を受け付けずこちら）
+    let mut closed = 0;
+    for (label, shell) in &unknown[..2] {
+        let home = fresh_home(&root, &format!("{label}-added"));
+        set_shell(Some(shell));
+        i18n::set_lang(Lang::Ja);
+        let listed: Vec<PathBuf> = match dispatch(&bootstrap("path")) {
+            Ok(v) => {
+                failures.push(format!("{label}（足す前）: 断られずに通った: {v}"));
+                continue;
+            }
+            Err(text) => text
+                .lines()
+                .filter_map(|line| line.strip_prefix("  "))
+                .map(|dir| match dir.strip_prefix("$HOME/") {
+                    Some(rel) => home.join(rel),
+                    None => PathBuf::from(dir),
+                })
+                .collect(),
+        };
+        if listed.is_empty() {
+            failures.push(format!("{label}: 断りに足すディレクトリが無い"));
+            continue;
+        }
+        let path = std::env::join_paths(listed.iter().chain([&root.join("empty-path")]))
+            .expect("PATH を組める");
+        std::env::set_var("PATH", &path);
+        let before = written_files(&home);
+        for (via, result) in [
+            ("dispatch", dispatch(&bootstrap("path"))),
+            (
+                "CLI の口",
+                setup_bootstrap::ensure_path_for(AgentKind::Claude),
+            ),
+        ] {
+            println!("{label}（足し終えた）の {via}: {result:?}");
+            match result {
+                Ok(v) if v["change"] == "already_on_path"
+                    && v["wrote"] == false
+                    && v["verified"] == true
+                    && v["shell"].is_null()
+                    && v["profile"].is_null() =>
+                {
+                    closed += 1;
+                }
+                other => failures.push(format!(
+                    "{label}（足し終えた）の {via}: 断らずに already_on_path を返さない（#2564。判定は {}）: {other:?}",
+                    locate(
+                        "crates/tako-control/src/setup_bootstrap.rs",
+                        include_str!("../src/setup_bootstrap.rs"),
+                        "fn unknown_shell_path(",
+                    )
+                )),
+            }
+        }
+        if written_files(&home) != before {
+            failures.push(format!("{label}（足し終えた）: ホームのファイルを書いた"));
+        }
+        // undo-path は従来どおり断る（そのシェルの設定ファイルは分からないまま）
+        if let Ok(v) = dispatch(&bootstrap("undo-path")) {
+            failures.push(format!("{label}（足し終えた）の undo-path が通った: {v}"));
+        }
+        std::env::set_var("PATH", root.join("empty-path"));
+    }
+
     // ---- 既存の利用者（空・未設定 = OS の既定・zsh / bash / sh / fish）: 従来どおりのファイル ----
     i18n::set_lang(Lang::Ja);
     let known: [(&str, Option<String>, &str, &str); 7] = [
@@ -430,6 +500,9 @@ fn 種別の分からないシェルはzshと見なさずprofileへ書かずに�
     println!(
         "種別の分からないシェルで断った: {refused} / {}（4 シェル × 日英 × path / undo-path）",
         unknown.len() * 4
+    );
+    println!(
+        "足し終えた未知のシェルで断らなかった: {closed} / 4（tcsh / nu × dispatch / CLI の口）"
     );
     println!("既存の書き先を保った: {kept} / {}", known.len());
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));

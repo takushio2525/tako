@@ -637,9 +637,28 @@ fn shortest_bootstrap_remaining(states: &BootstrapStates) -> Option<Remaining> {
         .find(|(agent, _)| *agent == target)
         .map(|(_, state)| state)
     {
-        Some(Ok(state)) => RemainingKind::for_step(state.step, target)
-            .map(Remaining::new)
-            .map(|item| item.noting_state(state)),
+        // 種別の分からないシェルの PATH の段は、`tako setup bootstrap path` へ誘導せず（同じ断りで
+        // 止まる）、その断りの全文（足すディレクトリの一覧）を理由の行に載せる（#2564）
+        Some(Ok(state)) => RemainingKind::for_step_by_hand(
+            state.step,
+            target,
+            crate::setup_bootstrap::path_by_hand(state),
+        )
+        .map(|kind| match kind {
+            RemainingKind::AgentPathByHand(agent) => {
+                // 診断は check-health と `--check` が同じ文を出す正本（#1505）。2 つは表示言語の
+                // 決め方が違う（`tako setup` は settings.json・check-health は解決しない）ので、
+                // ほかの項目（`summary_in(Lang::Ja)`）と同じく言語を固定して組む
+                match crate::setup_bootstrap::path_by_hand_refusal() {
+                    Some(refusal) => {
+                        Remaining::path_by_hand(agent, &refusal, tako_core::i18n::Lang::Ja)
+                    }
+                    None => Remaining::new(kind),
+                }
+            }
+            kind => Remaining::new(kind),
+        })
+        .map(|item| item.noting_state(state)),
         Some(Err(e)) => Some(Remaining::with_detail(
             RemainingKind::AgentStatusUnknown,
             vec![e.clone()],
