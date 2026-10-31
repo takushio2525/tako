@@ -4222,12 +4222,23 @@ Markdown / PDF のリンク注釈 / ポート検知の提案チップ）。OS �
 A/B は `TAKO_1038_LEGACY=1`（UDS 固定 + 自己疎通チェック無し = #1038 前）、
 502 の経路は `TAKO_1038_INJECT_UNREACHABLE=1` で決定的に踏める。
 
-### remote の秘密のファイルの置き場（境界 B32。#1632）
+### remote の秘密のファイルの置き場（境界 B32。#1632 / #2581）
 
 管理トークン・QR（トークン入り URL）・pid / url / port・devices.json などは `<data_dir>/remote/`
 （`state_dir`）に置き、**本人だけが読める形**にする。書き手は `remote.rs` の 3 つ
 （`ensure_state_dir` / `write_secret_file` / `restrict_permissions`）で、OS の差は境界
 `tako_core::platform::private_file` の中に閉じる（`remote.rs` に `cfg` を書かない）。
+
+#2581 で、remote の外の秘密の書き手も同じ境界を通る:
+
+| 書き手 | 書くもの | 境界の口 |
+|---|---|---|
+| `discovery::write_to` | IPC の接続情報 `control.json` と `instances/control-<pid>.json`（トークン入り）。置き場は data dir そのもの | `restrict_dir` → `create` → `restrict` |
+| `load_or_create_token_at`（tako-control の lib） | IPC / MCP の常設トークン `<data_dir>/token` | `create` → `restrict` |
+| `usage::load_or_create_salt` | usage の鍵の塩 `<data_dir>/machine_id` | `create_new` |
+| `ShortcutsFile::save_to` | `remote/remote_shortcuts.json`（管理トークンと同じ置き場） | `restrict_dir` → `restrict` |
+| `remote::save_received_file` | スマホから受け取ったファイル（#287 P2-1。置き場 `.tako-remote-uploads/` はペインの作業ディレクトリなので絞らない） | `create` → `restrict` |
+| `tmux_backend::ensure_pane_died_dir` | ペインの最後の出力の置き場（#2085） | `restrict_dir` |
 
 | | unix | Windows |
 |---|---|---|
@@ -4240,13 +4251,21 @@ A/B は `TAKO_1038_LEGACY=1`（UDS 固定 + 自己疎通チェック無し = #10
   同じ 2 者だけを受け継ぐ。SYSTEM を残すのは OS の保守（バックアップ・索引）を止めないため
 - **#1632 まで Windows は no-op**で、置き場も中身も `%APPDATA%\tako` の継承まかせだった
   （data dir は Roaming = 移動プロファイル・フォルダのリダイレクトでサーバーの共有に置かれうる）
-- 当てられないとき（ACL を持たない FAT / exFAT・一部の共有）は呼び手を止めず修正前の継承へ落ちる
-  （unix の chmod の失敗と同じ扱い）。効いているかは `private_file::inspect` で読み戻せる
+- Windows で当てられないとき（ACL を持たない FAT / exFAT・一部の共有・DACL を書き換える権利が無い）は、
+  在るものには `Ok` を返して修正前の継承のまま続ける（無いものは unix の chmod と同じく Err）。
+  トークンが Err だと GUI は IPC / MCP ごと立たず、control.json が書けないと CLI が GUI を見つけられない
+  ので、ACL が無いだけの置き場でそれを起こさない（#2581）。unix の腕の失敗はこれまでどおり返る。
+  効いているかは `private_file::inspect` で読み戻せる
+- control.json の置き場は data dir そのもの（unix は起動のたびに 0700）。Windows の継承を切った
+  OI / CI の DACL は、`SetNamedSecurityInfoW` が data dir の中身全体へ受け継ぎを配り直す = unix の
+  0700 と同じく data dir の中は本人だけになる。配り直しを毎回しないよう、既に同じ DACL なら当て直さない
 - A/B は `TAKO_1632_LEGACY=1`（Windows は DACL に触らない）。CI の Windows ジョブが実ファイルの
-  ACL を Win32 と icacls で読み戻す（`remote::tests::issue1632_*`）。no-op へ戻す形は番犬
+  ACL を Win32 と icacls で読み戻す（`remote::tests::issue1632_*` / `issue2581_*`）。no-op へ戻す形・
+  書き手が境界を通らない形・境界の外で本人だけの mode（`0o600` / `0o700`）を当てる新しい書き手は番犬
   `crates/tako-control/tests/issue1632_private_file_watchdog.rs` が `file:line` で落とす
-- 同じ unix だけの絞り方が残っている所（直していない）: IPC の `control.json`（`discovery.rs`）・
-  `ipc.rs`・`usage.rs`・`remote_shortcuts.rs`・スマホから受け取ったファイル（`remote.rs` の受信）
+- 境界を通さないもの（秘密を含まない unix だけの実体。番犬の `OWNER_ONLY_MODE_ALLOWED`）: IPC の受け口の
+  ソケット（`ipc.rs`。Windows は名前付きパイプ = カーネルオブジェクトで、トークン認証が二段目）・
+  ソケットの参照ファイル（`ipc_socket::write_pointer`）・remote API のソケット・jobserver の fifo
 
 ### Tailscale 系統の同居（#1038）
 

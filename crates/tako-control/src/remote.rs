@@ -6980,38 +6980,13 @@ fn handle_upload(
         }
     };
 
-    // ファイル書き込み（所有者のみ読み書き可。#287 P2-1）
-    use std::io::Write;
-    let mut file = match std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&target_path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            return respond(
-                request,
-                500,
-                Some(json!({ "error": format!("ファイル書き込みに失敗: {e}") }).to_string()),
-            );
-        }
-    };
-    if let Err(e) = file.write_all(&file_data) {
+    // ファイル書き込み（所有者のみ読み書き可。#287 P2-1 / #2581）
+    if let Err(e) = save_received_file(&target_path, &file_data) {
         return respond(
             request,
             500,
             Some(json!({ "error": format!("ファイル書き込みに失敗: {e}") }).to_string()),
         );
-    }
-    drop(file);
-
-    // 所有者のみ読み書き可（0o600）。リモート端末から受信したファイルは
-    // 本人以外がアクセスする必要がない（#287 P2-1）
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&target_path, std::fs::Permissions::from_mode(0o600));
     }
 
     // canonicalize で traversal していないことを最終確認
@@ -7050,6 +7025,18 @@ fn handle_upload(
             .to_string(),
         ),
     )
+}
+
+/// リモート端末から受け取ったファイルを本人だけが読み書きできる形で書く（#287 P2-1。本人以外が
+/// 触る必要がない）。unix は 0600、Windows は中身を書く前に継承を切った本人 + SYSTEM の DACL
+/// （境界 `platform::private_file`・#2581）。同じ名前を上書きしたときも書いた後で絞り直す
+/// （作るときの mode は既に在るファイルへ効かない）。置き場（`.tako-remote-uploads/`）は
+/// ペインの作業ディレクトリの中なので、unix と同じく絞らない
+fn save_received_file(path: &std::path::Path, data: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    tako_core::platform::private_file::create(path)?.write_all(data)?;
+    let _ = tako_core::platform::private_file::restrict(path);
+    Ok(())
 }
 
 /// multipart/form-data の boundary を抽出する
@@ -9072,6 +9059,204 @@ mod tests {
                 );
             } else {
                 let want = if *label == "dir" { "0700" } else { "0600" };
+                assert_eq!(got.detail, want, "{label}");
+            }
+        }
+    }
+
+    /// #2581 の場面: 秘密を含む残りの書き手（IPC の接続情報 control.json と `instances/`・IPC / MCP の
+    /// 常設トークン・usage の鍵の塩・`remote/remote_shortcuts.json`・スマホから受け取ったファイル）を
+    /// 実際の書き手で作り、#1632 と同じ 2 通り（Win32 / icacls）で読み戻す。
+    ///
+    /// 書き手ごとに別の置き場を**わざと誰でも読める形にしてから**始め（明示の Everyone を中へも
+    /// 受け継がせる）、前の版が残した緩い control.json・短すぎるトークン・shortcuts・受け取り済みの
+    /// ファイルを上書きしても緩さが残らないことまで見る。CI のログへ `TAKO2581_<tag>` の行で残す
+    fn issue2581_scenario(tag: &str) -> (tako_core::test_residue::ScratchDir, Vec<Issue1632Seen>) {
+        // 使い捨ての置き場（呼び手のスコープで消える = #1312）
+        let held = tako_core::test_residue::ScratchDir::new(&format!("2581-{tag}"));
+        let root = held.path().to_path_buf();
+        let loose_dir = |name: &str| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            issue1632_loosen(&dir, true);
+            dir
+        };
+        let loose_file = |path: &std::path::Path, content: &str| {
+            std::fs::write(path, content).unwrap();
+            issue1632_loosen(path, false);
+        };
+
+        // control.json の置き場（本番は data dir そのもの）と instances/
+        let disc = loose_dir("disc");
+        let instances = disc.join("instances");
+        std::fs::create_dir_all(&instances).unwrap();
+        issue1632_loosen(&instances, true);
+        let control = disc.join("control.json");
+        loose_file(&control, "{}");
+        let instance = instances.join("control-4242.json");
+        let info = crate::discovery::ControlInfo {
+            version: 1,
+            pid: 4242,
+            socket: "sock-2581".into(),
+            token: "t".repeat(64),
+            mcp_url: Some("http://127.0.0.1:1/mcp".into()),
+        };
+        crate::discovery::write_to(&instance, &info).expect("instances/ へ書ける");
+        crate::discovery::write_to(&control, &info).expect("control.json を書ける");
+        // 読む側の形は変えていない（同じ JSON がそのまま戻る）
+        let back: crate::discovery::ControlInfo =
+            serde_json::from_str(&std::fs::read_to_string(&control).unwrap()).unwrap();
+        assert_eq!(back, info);
+        // 境界を通らずに data dir へ作られるもの（ログ・設定と同じ形）
+        let disc_plain = disc.join("plain.txt");
+        std::fs::write(&disc_plain, "x").unwrap();
+
+        // IPC / MCP の常設トークン（短すぎる前のファイルを書き直す経路）
+        let tok_dir = loose_dir("tok");
+        let token = tok_dir.join("token");
+        loose_file(&token, "short");
+        let made = crate::load_or_create_token_at(&token).expect("トークンを作れる");
+        assert!(made.len() >= 32);
+        assert_eq!(std::fs::read_to_string(&token).unwrap(), made);
+
+        // usage の鍵の塩（無いときだけ作る経路）
+        let salt = loose_dir("salt").join("machine_id");
+        let salted = crate::usage::load_or_create_salt(&salt).expect("塩を作れる");
+        assert_eq!(std::fs::read_to_string(&salt).unwrap(), salted);
+
+        // remote/remote_shortcuts.json（置き場ごと。前の版の緩いファイルを上書きする）
+        let remote_dir = loose_dir("remote");
+        let shortcuts = remote_dir.join("remote_shortcuts.json");
+        loose_file(&shortcuts, "{}");
+        tako_core::remote_shortcuts::ShortcutsFile::default()
+            .save_to(&shortcuts)
+            .expect("shortcuts を書ける");
+
+        // スマホから受け取ったファイル（新しく作る・同じ名前を上書きする）
+        let uploads = loose_dir("cwd").join(".tako-remote-uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        issue1632_loosen(&uploads, true);
+        let upload_new = uploads.join("photo.jpg");
+        save_received_file(&upload_new, b"jpeg").expect("受け取ったファイルを書ける");
+        let upload_over = uploads.join("again.txt");
+        loose_file(&upload_over, "old");
+        save_received_file(&upload_over, b"new").expect("上書きできる");
+        assert_eq!(std::fs::read(&upload_over).unwrap(), b"new");
+
+        let mut out = Vec::new();
+        for (label, path) in [
+            ("disc", &disc),
+            ("instances", &instances),
+            ("control", &control),
+            ("instance", &instance),
+            ("disc_plain", &disc_plain),
+            ("token", &token),
+            ("salt", &salt),
+            ("shortcuts_dir", &remote_dir),
+            ("shortcuts", &shortcuts),
+            ("uploads_dir", &uploads),
+            ("upload_new", &upload_new),
+            ("upload_over", &upload_over),
+        ] {
+            let got = tako_core::platform::private_file::inspect(path).expect("読み戻せる");
+            println!(
+                "TAKO2581_{tag} {label} owner_only={} inherits={} {}",
+                got.owner_only, got.inherits, got.detail
+            );
+            let aces = if cfg!(windows) {
+                issue1632_icacls(path)
+            } else {
+                Vec::new()
+            };
+            for ace in &aces {
+                println!("TAKO2581_{tag} {label} icacls {ace}");
+            }
+            out.push((label, got, aces));
+        }
+        (held, out)
+    }
+
+    /// #2581 の場面で、書き手が絞らないもの（data dir へ素で作られたもの・受け取りの置き場）
+    const ISSUE2581_UNRESTRICTED: [&str; 2] = ["disc_plain", "uploads_dir"];
+    /// #2581 の場面で、置き場（unix は 0700）のもの
+    const ISSUE2581_DIRS: [&str; 3] = ["disc", "instances", "shortcuts_dir"];
+
+    /// **#2581**: control.json と `instances/`・トークン・塩・shortcuts・受け取ったファイルが本人だけになり、
+    /// 継承が切れている（Windows は本人 + SYSTEM）。unix は修正前と同じ mode（置き場 0700・ファイル 0600）。
+    /// env を書き換えないので親のプロセスで走る
+    #[test]
+    fn issue2581_秘密を含む残りのファイルも本人だけが読める() {
+        let (_held, seen) = issue2581_scenario("FIX");
+        for (label, got, aces) in &seen {
+            match *label {
+                // data dir へ素で作られたものは、Windows では置き場の 2 者だけを受け継ぐ
+                // （unix は置き場の 0700 が守る = 修正前と同じ）
+                "disc_plain" => {
+                    if cfg!(windows) {
+                        assert!(got.owner_only && got.inherits, "{label}: {got:?}");
+                        assert_eq!(aces.len(), 2, "{label}: {aces:?}");
+                        assert!(aces.iter().all(|a| a.contains("(I)")), "{label}: {aces:?}");
+                    }
+                }
+                // 受け取りの置き場はペインの作業ディレクトリの中なので、unix と同じく絞らない
+                "uploads_dir" => {
+                    assert!(!got.owner_only, "{label} を絞っている: {got:?}");
+                    if !cfg!(windows) {
+                        assert_eq!(got.detail, "0755", "{label}");
+                    }
+                }
+                _ => {
+                    assert!(got.owner_only, "{label} が本人だけになっていない: {got:?}");
+                    assert!(!got.inherits, "{label} の継承が切れていない: {got:?}");
+                    if cfg!(windows) {
+                        // 別の口（icacls）でも 2 者だけ・受け継いだ ACE（`(I)`）が無い・SYSTEM が居る
+                        assert_eq!(aces.len(), 2, "{label}: {aces:?}");
+                        assert!(!aces.iter().any(|a| a.contains("(I)")), "{label}: {aces:?}");
+                        assert!(
+                            aces.iter().any(|a| a.contains("SYSTEM")),
+                            "{label}: {aces:?}"
+                        );
+                    } else {
+                        let want = if ISSUE2581_DIRS.contains(label) {
+                            "0700"
+                        } else {
+                            "0600"
+                        };
+                        assert_eq!(got.detail, want, "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// **#2581 の旧アーム**（`TAKO_1632_LEGACY=1` = 修正前）: Windows は緩めた Everyone が残る =
+    /// 上の読み戻しが修正前と修正後を見分けられることの陰性対照。unix は旧アームでも同じ mode
+    #[test]
+    fn issue2581_旧アームでは秘密のファイルが継承のまま() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2581_旧アームでは秘密のファイルが継承のまま) {
+            return;
+        }
+        std::env::set_var(tako_core::platform::private_file::ENV_LEGACY, "1");
+        let (_held, seen) = issue2581_scenario("LEGACY");
+        std::env::remove_var(tako_core::platform::private_file::ENV_LEGACY);
+        for (label, got, aces) in &seen {
+            if ISSUE2581_UNRESTRICTED.contains(label) {
+                continue;
+            }
+            if cfg!(windows) {
+                assert!(
+                    !got.owner_only,
+                    "{label} が旧アームで本人だけになっている: {got:?}"
+                );
+                assert!(got.inherits, "{label}: {got:?}");
+                assert!(aces.iter().any(|a| a.contains("(I)")), "{label}: {aces:?}");
+            } else {
+                let want = if ISSUE2581_DIRS.contains(label) {
+                    "0700"
+                } else {
+                    "0600"
+                };
                 assert_eq!(got.detail, want, "{label}");
             }
         }

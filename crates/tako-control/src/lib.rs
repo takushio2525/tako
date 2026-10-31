@@ -195,7 +195,15 @@ pub fn load_or_create_token() -> std::io::Result<String> {
     let Some(path) = tako_core::paths::data_dir().map(|d| d.join("token")) else {
         return generate_token();
     };
-    if let Ok(content) = std::fs::read_to_string(&path) {
+    load_or_create_token_at(&path)
+}
+
+/// [`load_or_create_token`] の置き場を指定する本体。トークンは本人だけが読める形で書く
+/// （unix は 0600、Windows は継承を切った本人 + SYSTEM の DACL = 境界 `platform::private_file`・#2581）。
+/// 中身を書くのは絞った後
+fn load_or_create_token_at(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Write as _;
+    if let Ok(content) = std::fs::read_to_string(path) {
         let token = content.trim().to_string();
         if token.len() >= 32 {
             return Ok(token);
@@ -205,11 +213,8 @@ pub fn load_or_create_token() -> std::io::Result<String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, &token)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    tako_core::platform::private_file::create(path)?.write_all(token.as_bytes())?;
+    // 短すぎて書き直した前のファイル（作るときの mode は既に在るファイルへ効かない）も揃える
+    tako_core::platform::private_file::restrict(path)?;
     Ok(token)
 }
