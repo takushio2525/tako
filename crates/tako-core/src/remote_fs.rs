@@ -1086,6 +1086,15 @@ pub fn pane_failure_rule() -> SshFailureRule {
 /// [`is_client_failure`] へ寄せ、文面には**実際の終了コード**を載せる。
 /// どこまでを失敗と見なすかは [`SshFailureRule`] で受け取るので、
 /// **この関数は純粋なまま**（A/B の env は [`pane_failure_rule`] が吸収する）
+///
+/// # #2594: 戻りのシェルにもシェル統合を載せる
+///
+/// このスクリプトは `$SHELL -l -i -c "/bin/sh -c '…'"` の内側で走り、外側の zsh が統合の
+/// `ZDOTDIR` を食っている（[`crate::shell_integration::Relaunch`] の doc）。何もせずに
+/// `exec $SHELL -l` すると戻りの zsh にだけ統合が載らず、cwd の追従・コマンドの状態・
+/// 履歴の向け直し（#1253）が効かない。`relaunch`（呼び手は
+/// [`crate::shell_integration::relaunch`] を渡す）を戻る直前に当て直して、素のペインと
+/// 同じ起こし方へ揃える。空なら #2594 前と同じ文字列
 pub fn ssh_pane_script(
     dialect: crate::platform::shell_dialect::ShellDialect,
     argv: &[String],
@@ -1093,6 +1102,7 @@ pub fn ssh_pane_script(
     cd_to: Option<&str>,
     lang: Lang,
     rule: SshFailureRule,
+    relaunch: &crate::shell_integration::Relaunch,
 ) -> String {
     use crate::platform::shell_dialect::ShellDialect;
 
@@ -1147,8 +1157,10 @@ pub fn ssh_pane_script(
                     )
                 })
                 .unwrap_or_default();
+            // #2594: 戻る直前に素のペインと同じ統合の env を当て直す（空なら何も足さない）
+            let reapply = posix_export_line(&relaunch.env);
             format!(
-                "printf '%s\\n' {banner};\n{cd}{cmd}\n                 __tako_code=$?;\n                 if [ \"$__tako_code\" -eq {SSH_ERROR_EXIT} ]; then\n                 printf '%s\\n%s\\n%s\\n' {failed} {next} {hold};\n                 exec \"${{SHELL:-/bin/sh}}\" -l;\n                 fi\n",
+                "printf '%s\\n' {banner};\n{cd}{cmd}\n                 __tako_code=$?;\n                 if [ \"$__tako_code\" -eq {SSH_ERROR_EXIT} ]; then\n                 printf '%s\\n%s\\n%s\\n' {failed} {next} {hold};\n                 {reapply}exec \"${{SHELL:-/bin/sh}}\" -l;\n                 fi\n",
                 banner = crate::shell::quote_for_shell(&connecting),
                 failed = crate::shell::quote_for_shell(&failed),
                 next = crate::shell::quote_for_shell(next),
@@ -1197,14 +1209,48 @@ pub fn ssh_pane_script(
                 ),
                 SshFailureRule::ExitCode255 => ShellDialect::PowerShell.quote_arg(&failed),
             };
+            // #2594: 入れ子で起こす PowerShell にも、素のペインと同じ起動引数で統合を読ませる
+            // （空なら何も足さない = #2594 前の `-NoLogo` だけ）
+            let mut reapply = String::new();
+            for arg in &relaunch.powershell_args {
+                reapply.push(' ');
+                reapply.push_str(&ShellDialect::PowerShell.quote_arg(arg));
+            }
             format!(
-                "Write-Host {banner};\n{cd}& {cmd};\n                 $__tako_code = $LASTEXITCODE;\n                 if ({cond}) {{\n                 Write-Host {failed_expr};\n                 Write-Host {next};\n                 Write-Host {hold};\n                 & (Get-Process -Id $PID).Path -NoLogo;\n                 }}\n",
+                "Write-Host {banner};\n{cd}& {cmd};\n                 $__tako_code = $LASTEXITCODE;\n                 if ({cond}) {{\n                 Write-Host {failed_expr};\n                 Write-Host {next};\n                 Write-Host {hold};\n                 & (Get-Process -Id $PID).Path -NoLogo{reapply};\n                 }}\n",
                 banner = ShellDialect::PowerShell.quote_arg(&connecting),
                 next = ShellDialect::PowerShell.quote_arg(next),
                 hold = ShellDialect::PowerShell.quote_arg(hold),
             )
         }
     }
+}
+
+/// 戻りのシェルへ当て直す env を 1 行の `export` にする（#2594。純粋関数）。
+///
+/// 空なら空文字（= #2594 前の文字列から 1 バイトも変えない）。値は要るときに単引用符で囲む
+/// （`quote_for_shell`。macOS の既定 data dir は `Application Support` の空白を含み、
+/// `PROMPT_COMMAND` は `source '<パス>'` で単引用符を含む）。名前はシェルの変数名として通るものだけを使う
+/// （組の出どころは tako 自身の表だが、名前が崩れていたら 1 行ごと壊れるので落とす）
+fn posix_export_line(env: &[(String, String)]) -> String {
+    let pairs: Vec<String> = env
+        .iter()
+        .filter(|(k, _)| is_shell_name(k))
+        .map(|(k, v)| format!("{k}={}", crate::shell::quote_for_shell(v)))
+        .collect();
+    if pairs.is_empty() {
+        return String::new();
+    }
+    format!("export {};\n                 ", pairs.join(" "))
+}
+
+/// POSIX シェルの変数名として通るか（英字か `_` で始まり、英数字と `_` だけ）
+fn is_shell_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 fn spawn_capture(bin: &str, args: &[String], stdin_text: Option<&str>) -> std::io::Result<Output> {
@@ -2513,6 +2559,7 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
                 None,
                 lang,
                 SshFailureRule::ClientFailure,
+                &crate::shell_integration::Relaunch::default(),
             );
             // 接続前のバナー（旧実装は完全な空画面だった。#919 の実測）
             assert!(posix.contains("printf"), "{posix}");
@@ -2540,6 +2587,7 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
                 None,
                 lang,
                 SshFailureRule::ClientFailure,
+                &crate::shell_integration::Relaunch::default(),
             );
             assert!(ps.contains("Write-Host"), "{ps}");
             assert!(ps.contains("$LASTEXITCODE"), "{ps}");
@@ -2590,6 +2638,7 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
             None,
             Lang::Ja,
             SshFailureRule::ClientFailure,
+            &crate::shell_integration::Relaunch::default(),
         );
         assert!(now.contains("$__tako_code -lt 0"), "{now}");
         assert!(now.contains("$__tako_code -gt 255"), "{now}");
@@ -2609,6 +2658,7 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
             None,
             Lang::Ja,
             SshFailureRule::ExitCode255,
+            &crate::shell_integration::Relaunch::default(),
         );
         assert!(!legacy.contains("-lt 0"), "{legacy}");
         assert!(!legacy.contains("$null -eq"), "{legacy}");
@@ -2633,6 +2683,7 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
                 None,
                 lang,
                 SshFailureRule::ClientFailure,
+                &crate::shell_integration::Relaunch::default(),
             );
             let b = ssh_pane_script(
                 ShellDialect::Posix,
@@ -2641,6 +2692,7 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
                 None,
                 lang,
                 SshFailureRule::ExitCode255,
+                &crate::shell_integration::Relaunch::default(),
             );
             assert_eq!(a, b);
             assert!(a.contains(&format!("-eq {SSH_ERROR_EXIT}")), "{a}");
@@ -2668,6 +2720,7 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
             Some("/srv/app"),
             Lang::Ja,
             SshFailureRule::ClientFailure,
+            &crate::shell_integration::Relaunch::default(),
         );
         assert!(with.contains("/srv/app"), "{with}");
         let without = ssh_pane_script(
@@ -2677,6 +2730,7 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
             None,
             Lang::Ja,
             SshFailureRule::ClientFailure,
+            &crate::shell_integration::Relaunch::default(),
         );
         assert!(!without.contains("/srv/app"), "{without}");
     }
@@ -2698,10 +2752,164 @@ drwx******    1 -        -           49152 Aug 23 22:34 dev
             None,
             Lang::Ja,
             SshFailureRule::ClientFailure,
+            &crate::shell_integration::Relaunch::default(),
         );
         // 単引用符で 1 語に括られている（`/a b/c.sock` が 2 語へ割れない）
         assert!(posix.contains("'-o'") || posix.contains("-o"), "{posix}");
         assert!(posix.contains("'ControlPath=\"/a b/c.sock\"'"), "{posix}");
+    }
+
+    /// #2594 の検査に使う「当て直す組」。値に空白と単引用符を混ぜる（macOS の既定 data dir と
+    /// `PROMPT_COMMAND` の実物の形）
+    fn relaunch_2594() -> crate::shell_integration::Relaunch {
+        crate::shell_integration::Relaunch {
+            env: vec![
+                ("ZDOTDIR".into(), "/a b/shell-integration/zsh".into()),
+                (
+                    "PROMPT_COMMAND".into(),
+                    "source '/a b/shell-integration/tako.bash'".into(),
+                ),
+                ("XDG_DATA_DIRS".into(), "/a b/fish-data:/usr/share".into()),
+                // 名前として通らない組は落とす（1 行ごと壊さない）
+                ("BAD NAME".into(), "x".into()),
+            ],
+            powershell_args: vec![
+                "-NoExit".into(),
+                "-EncodedCommand".into(),
+                "QQBCAEMA".into(),
+            ],
+        }
+    }
+
+    /// #2594: 戻る直前（失敗の枝の中・`exec` の直前）に統合の env を当て直す。
+    /// 空の組との差はその 1 行だけ = 空なら #2594 前と同じ文字列
+    #[test]
+    fn 戻りのシェルへ統合を当て直すのは失敗の枝の_exec_の直前だけ() {
+        use crate::platform::shell_dialect::ShellDialect;
+        let argv = vec!["/usr/bin/ssh".to_string(), "win".to_string()];
+        for lang in [Lang::Ja, Lang::En] {
+            let script = |relaunch: &crate::shell_integration::Relaunch| {
+                ssh_pane_script(
+                    ShellDialect::Posix,
+                    &argv,
+                    "win",
+                    Some("/srv/app"),
+                    lang,
+                    SshFailureRule::ClientFailure,
+                    relaunch,
+                )
+            };
+            let legacy = script(&crate::shell_integration::Relaunch::default());
+            let now = script(&relaunch_2594());
+            assert!(!legacy.contains("export "), "{legacy}");
+            let export = "export ZDOTDIR='/a b/shell-integration/zsh' \
+                          PROMPT_COMMAND='source '\\''/a b/shell-integration/tako.bash'\\''' \
+                          XDG_DATA_DIRS='/a b/fish-data:/usr/share';\n                 ";
+            assert!(now.contains(export), "{now}");
+            assert!(!now.contains("BAD NAME"), "{now}");
+            // 差は export の 1 行だけ（空なら #2594 前と 1 バイトも変わらない）
+            assert_eq!(now.replacen(export, "", 1), legacy);
+            // 置き場所: 失敗の枝の中で、戻りの `exec` の直前（接続中の ssh には何も足さない）
+            let at = now.find("export ").unwrap();
+            assert!(
+                now.find(&format!("-eq {SSH_ERROR_EXIT} ]; then")).unwrap() < at,
+                "{now}"
+            );
+            assert_eq!(
+                now.find("exec \"${SHELL:-/bin/sh}\" -l").unwrap(),
+                at + export.len(),
+                "{now}"
+            );
+
+            let ps_script = |relaunch: &crate::shell_integration::Relaunch| {
+                ssh_pane_script(
+                    ShellDialect::PowerShell,
+                    &argv,
+                    "win",
+                    None,
+                    lang,
+                    SshFailureRule::ClientFailure,
+                    relaunch,
+                )
+            };
+            let ps_legacy = ps_script(&crate::shell_integration::Relaunch::default());
+            let ps_now = ps_script(&relaunch_2594());
+            let args = " '-NoExit' '-EncodedCommand' 'QQBCAEMA'";
+            assert!(
+                ps_now.contains(&format!("& (Get-Process -Id $PID).Path -NoLogo{args};")),
+                "{ps_now}"
+            );
+            assert_eq!(ps_now.replacen(args, "", 1), ps_legacy);
+            assert!(
+                ps_legacy.contains("& (Get-Process -Id $PID).Path -NoLogo;"),
+                "{ps_legacy}"
+            );
+        }
+    }
+
+    /// #2594: 実際に `/bin/sh` で走らせて、戻りのシェルが当て直した組を**そのまま**受け取る
+    /// （空白・単引用符の引用が崩れない）。ssh の代わりに exit 255 で落ちるコマンド、
+    /// 戻りのシェルの代わりに env を印字して終わる偽物を使う
+    #[cfg(unix)]
+    #[test]
+    fn 戻りのシェルは当て直した組をそのまま受け取る() {
+        use crate::platform::shell_dialect::ShellDialect;
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = crate::test_residue::ScratchDir::new("ssh-relaunch-2594");
+        let fake_shell = scratch.path().join("fake-shell");
+        std::fs::write(
+            &fake_shell,
+            "#!/bin/sh\n\
+             printf 'ZDOTDIR=%s\\n' \"${ZDOTDIR-<unset>}\"\n\
+             printf 'PROMPT_COMMAND=%s\\n' \"${PROMPT_COMMAND-<unset>}\"\n\
+             printf 'XDG_DATA_DIRS=%s\\n' \"${XDG_DATA_DIRS-<unset>}\"\n\
+             printf 'ARGS=%s\\n' \"$*\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string(), "exit 255".into()];
+        let run = |relaunch: &crate::shell_integration::Relaunch| {
+            let script = ssh_pane_script(
+                ShellDialect::Posix,
+                &argv,
+                "win",
+                None,
+                Lang::En,
+                SshFailureRule::ClientFailure,
+                relaunch,
+            );
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c")
+                .arg(&script)
+                .env("SHELL", &fake_shell)
+                .env_remove("ZDOTDIR")
+                .env_remove("PROMPT_COMMAND")
+                .env_remove("XDG_DATA_DIRS")
+                .stdin(std::process::Stdio::null());
+            // 子プロセスの起動は境界 B14 を通す（`#[cfg(unix)]` だが番犬 platform_parity の約束に揃える）
+            crate::platform::process::no_console_window(&mut cmd);
+            let out = cmd.output().expect("/bin/sh を起こせる");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let now = run(&relaunch_2594());
+        assert!(
+            now.contains("ZDOTDIR=/a b/shell-integration/zsh\n"),
+            "{now}"
+        );
+        assert!(
+            now.contains("PROMPT_COMMAND=source '/a b/shell-integration/tako.bash'\n"),
+            "{now}"
+        );
+        assert!(
+            now.contains("XDG_DATA_DIRS=/a b/fish-data:/usr/share\n"),
+            "{now}"
+        );
+        // ログインシェルとして起こす形（`-l`）は変えない
+        assert!(now.contains("ARGS=-l\n"), "{now}");
+        // 空の組（= #2594 前）は何も当て直さない = 戻りのシェルに統合の env が届かない
+        let legacy = run(&crate::shell_integration::Relaunch::default());
+        assert!(legacy.contains("ZDOTDIR=<unset>\n"), "{legacy}");
+        assert!(legacy.contains("ARGS=-l\n"), "{legacy}");
     }
 
     #[test]

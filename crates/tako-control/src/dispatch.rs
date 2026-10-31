@@ -13019,6 +13019,8 @@ fn dispatch_inner(
                 dir.as_deref(),
                 tako_core::i18n::lang(),
                 tako_core::remote_fs::pane_failure_rule(),
+                // #2594: ssh の失敗・切断で戻るローカルのシェルにも、素のペインと同じ統合を載せる
+                &tako_core::shell_integration::relaunch(),
             );
             let command = tako_core::platform::shell::script_pane_command(&script);
 
