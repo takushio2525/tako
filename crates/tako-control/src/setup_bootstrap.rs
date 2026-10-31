@@ -740,7 +740,8 @@ fn shell_target() -> (Option<ShellKind>, Option<PathBuf>) {
 ///
 /// `$SHELL` が**空・未設定**（GUI から起動した .app 等）のときだけ OS の既定を仮定する
 /// （macOS は 10.15 以降 zsh が既定。空を未設定と読むのは `exe::user_shell` と同じ）。
-/// **設定されていて種別の分からないシェル**（nu・tcsh 等）は `None` = 書かずに追記する行を返して断る。
+/// **設定されていて種別の分からないシェル**（nu・tcsh 等）は `None` = 書かずに PATH へ足すディレクトリを返して断る
+/// （構文はそのシェルの書き方に任せる = #2557）。
 /// #2550 より前はこれも zsh と見なし、そのシェルが読まない `.zprofile` へ書いて成功を返していた
 fn shell_kind_for(shell: &str, windows: bool) -> Option<ShellKind> {
     if shell.is_empty() {
@@ -1501,9 +1502,11 @@ fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, SetupRefu
     }
     let (shell, _) = shell_target();
     let Some(shell) = shell else {
+        // 足すディレクトリは書く行と同じ `$HOME/…` の式で重複なし（#2557。`~` 短縮の表示は
+        // sh の `export` に包まれて二重引用符の中に入り、sh 系では展開されなかった）
         return Err(SetupRefusal::ShellProfileUnknown {
             shell: std::env::var("SHELL").unwrap_or_default(),
-            dirs: dirs.iter().map(|d| display_path(d)).collect(),
+            dirs: shell_profile::dirs_for_unknown_shell(home, dirs),
         });
     };
     // 「書かなくてよいか」は**新しく開いたターミナルが見る PATH**で判定する（#1502）。

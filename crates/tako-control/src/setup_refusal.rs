@@ -168,7 +168,8 @@ pub enum SetupRefusal {
 
     // ---- PATH 通し（`setup_bootstrap::ensure_path_for_typed` / `undo_path_for_typed`） ----
     /// 使っているシェルの設定ファイルが分からない（`shell` は `$SHELL` の値 = 空なら不明、
-    /// `dirs` は通したいディレクトリの `~` 短縮の表示）
+    /// `dirs` は PATH へ足すディレクトリの `$HOME/…` の式で重複なし =
+    /// `shell_profile::dirs_for_unknown_shell`。#2557）
     ShellProfileUnknown { shell: String, dirs: Vec<String> },
     /// 使っているシェルの設定ファイルが分からない（PATH ブロックの取り除き）
     ShellProfileUnknownForUndo,
@@ -517,21 +518,32 @@ impl SetupRefusal {
 
             (Self::ShellProfileUnknown { shell, dirs }, Ja) => format!(
                 "使っているシェル（{}）の設定ファイルが分かりません。\n\
-                 次の {} 行をご自身のシェルの設定ファイルへ追加してください:\n{}",
+                 次のディレクトリを PATH の先頭へ足す設定を、そのシェルの書き方で\
+                 ご自身のシェルの設定ファイルへ追加してください{}:\n{}",
                 if shell.is_empty() { "不明" } else { shell },
-                dirs.len(),
-                export_lines(dirs),
+                if mentions_home(dirs) {
+                    "（$HOME はホームディレクトリ）"
+                } else {
+                    ""
+                },
+                dir_lines(dirs),
             ),
             (Self::ShellProfileUnknown { shell, dirs }, En) => format!(
                 "cannot tell which settings file your shell ({}) uses.\n\
-                 Add the following {} to your shell's settings file:\n{}",
+                 Add the following {} to the front of PATH in your shell's settings file, \
+                 written in that shell's own syntax{}:\n{}",
                 if shell.is_empty() { "unknown" } else { shell },
                 if dirs.len() == 1 {
-                    "line".to_string()
+                    "directory"
                 } else {
-                    format!("{} lines", dirs.len())
+                    "directories"
                 },
-                export_lines(dirs),
+                if mentions_home(dirs) {
+                    " ($HOME is your home directory)"
+                } else {
+                    ""
+                },
+                dir_lines(dirs),
             ),
             (Self::ShellProfileUnknownForUndo, Ja) => {
                 "使っているシェルの設定ファイルが分かりません".to_string()
@@ -569,12 +581,22 @@ impl SetupRefusal {
     }
 }
 
-/// シェルの設定ファイルへ足してもらう行（`export PATH="<dir>:$PATH"` を 1 行ずつ。#2365 より前の組み立てのまま）
-fn export_lines(dirs: &[String]) -> String {
+/// 種別の分からないシェルの利用者へ示す、PATH へ足すディレクトリ（1 行 1 個・字下げ 2）。
+///
+/// **そのシェルの構文で包まない**（#2557）: 以前は sh の `export PATH="<dir>:$PATH"` を出していたが、
+/// 対象は tcsh（`setenv`）・nu（`$env.PATH`）のように sh の構文が通らないシェルで、
+/// sh 系では二重引用符の中の `~` も展開されなかった。並びの組み立て（`$HOME/…` の式・重複なし）は
+/// `tako_core::shell_profile::dirs_for_unknown_shell` の 1 実装
+fn dir_lines(dirs: &[String]) -> String {
     dirs.iter()
-        .map(|d| format!("  export PATH=\"{d}:$PATH\""))
+        .map(|d| format!("  {d}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 並びに `$HOME` 相対の式があるか（あれば「$HOME はホームディレクトリ」と添える）
+fn mentions_home(dirs: &[String]) -> bool {
+    dirs.iter().any(|d| d.starts_with("$HOME/"))
 }
 
 /// 導入器・インストーラの出力の添え方（空なら添えない・あれば改行を挟む。#2365 より前の組み立てのまま）

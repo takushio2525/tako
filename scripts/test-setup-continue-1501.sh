@@ -347,6 +347,13 @@ RC=$(LOGIN_SHELL="$BIN/isosh" run_pipe "$SANDBOX/13.log" -- setup)
 check    "終了コード 0"                  "$RC" "0"
 contains "PATH 設置は見送りと言う"       "[警告] tako CLI の PATH 設置を見送りました" "$SANDBOX/13.log"
 contains "理由は既存の断り"              "使っているシェル（$BIN/isosh）の設定ファイルが分かりません" "$SANDBOX/13.log"
+# 足すディレクトリは書く行と同じ `$HOME/…` の式で 1 回だけ・sh の行を推測して出さない（#2557。
+# 修正前は `  export PATH="~/.local/bin:$PATH"` が tako CLI と 3 系統のランチャーの数 = 4 行並んだ）
+# shellcheck disable=SC2016
+check    "足すディレクトリは 1 回だけ"   "$(grep -cxF '  $HOME/.local/bin' "$SANDBOX/13.log")" "1"
+absent   "sh の行を推測しない"           'export PATH=' "$SANDBOX/13.log"
+# shellcheck disable=SC2088
+absent   "~ 短縮を案内しない"            '~/.local/bin' "$SANDBOX/13.log"
 absent   "書いたとは言わない"            "[設置] tako CLI" "$SANDBOX/13.log"
 if [ -e "$HOMEDIR/.zprofile" ] || [ -e "$HOMEDIR/.bash_profile" ]; then
   ng "そのシェルが読まない profile を書いた"

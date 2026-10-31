@@ -10763,28 +10763,43 @@ fn setup_refusal_table() -> Vec<(SetupRefusal, String)> {
                 "~/.local/bin/claude", INSTALL_CMD
             ),
         ),
+        // #2557 で案内の行を改めた（1 行目は #2365 より前のまま）: sh の `export PATH="~/…:$PATH"` を
+        // やめ、足すディレクトリ（`$HOME/…` の式・重複なし）だけを並べ、構文はそのシェルの書き方に任せる
         (
             S::ShellProfileUnknown {
                 shell: "/usr/bin/false".into(),
-                dirs: vec!["~/.local/bin".into()],
+                dirs: vec!["$HOME/.local/bin".into()],
             },
             format!(
                 "使っているシェル（{}）の設定ファイルが分かりません。\n\
-                 次の {} 行をご自身のシェルの設定ファイルへ追加してください:\n{}",
-                "/usr/bin/false", 1, "  export PATH=\"~/.local/bin:$PATH\""
+                 次のディレクトリを PATH の先頭へ足す設定を、そのシェルの書き方で\
+                 ご自身のシェルの設定ファイルへ追加してください（$HOME はホームディレクトリ）:\n{}",
+                "/usr/bin/false", "  $HOME/.local/bin"
             ),
         ),
         (
             S::ShellProfileUnknown {
                 shell: String::new(),
-                dirs: vec!["~/.local/bin".into(), "/opt/tako/bin".into()],
+                dirs: vec!["$HOME/.local/bin".into(), "/opt/tako/bin".into()],
             },
             format!(
                 "使っているシェル（{}）の設定ファイルが分かりません。\n\
-                 次の {} 行をご自身のシェルの設定ファイルへ追加してください:\n{}",
-                "不明",
-                2,
-                "  export PATH=\"~/.local/bin:$PATH\"\n  export PATH=\"/opt/tako/bin:$PATH\""
+                 次のディレクトリを PATH の先頭へ足す設定を、そのシェルの書き方で\
+                 ご自身のシェルの設定ファイルへ追加してください（$HOME はホームディレクトリ）:\n{}",
+                "不明", "  $HOME/.local/bin\n  /opt/tako/bin"
+            ),
+        ),
+        // home の外だけなら `$HOME` の注記を添えない
+        (
+            S::ShellProfileUnknown {
+                shell: "/bin/tcsh".into(),
+                dirs: vec!["/opt/tako/bin".into()],
+            },
+            format!(
+                "使っているシェル（{}）の設定ファイルが分かりません。\n\
+                 次のディレクトリを PATH の先頭へ足す設定を、そのシェルの書き方で\
+                 ご自身のシェルの設定ファイルへ追加してください:\n{}",
+                "/bin/tcsh", "  /opt/tako/bin"
             ),
         ),
         (
@@ -11242,14 +11257,25 @@ fn setup系の断りの包みと載せ方() {
             assert!(!text.contains('\n'), "{text:?}");
         }
     }
-    // 英語の「1 行 / N 行」
+    // 英語の「1 個 / N 個」と `$HOME` の注記（#2557）
     let one = SetupRefusal::ShellProfileUnknown {
         shell: String::new(),
-        dirs: vec!["~/.local/bin".into()],
+        dirs: vec!["$HOME/.local/bin".into()],
     };
-    assert!(one
-        .text_in(Lang::En)
-        .contains("(unknown) uses.\nAdd the following line to"));
+    assert_eq!(
+        one.text_in(Lang::En),
+        "cannot tell which settings file your shell (unknown) uses.\n\
+         Add the following directory to the front of PATH in your shell's settings file, \
+         written in that shell's own syntax ($HOME is your home directory):\n  $HOME/.local/bin"
+    );
+    let two = SetupRefusal::ShellProfileUnknown {
+        shell: "/bin/tcsh".into(),
+        dirs: vec!["/opt/tako/bin".into(), "/opt/x/bin".into()],
+    };
+    assert!(two.text_in(Lang::En).contains(
+        "Add the following directories to the front of PATH in your shell's settings file, \
+         written in that shell's own syntax:\n  /opt/tako/bin\n  /opt/x/bin"
+    ));
     // 従来の口（tako-core）: 日本語の文
     let home = std::env::temp_dir().join(format!("tako-2365b-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
