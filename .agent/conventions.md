@@ -5357,6 +5357,17 @@ stop_isolated_gui                     # 自分で起こした pid だけを落�
 置き先の中央 960x600 のまま。窓の実寸を測る検証の実測値を動かさないため）。
 落とすのは `stop_isolated_gui` = **自分で起こした pid だけ**で、
 `pkill -f tako` のような名前一致は本番 GUI と他 worker に当たるので使わない。
+**`stop_isolated_gui` は GUI のペインのプロセスが終わるまで待ってから返す**（#2588）。GUI が
+終わると PTY が切れてペインのシェルへ SIGHUP が届くが、シェルは終わる前に書く（zsh は HUP で
+履歴を保存する = 一時の HOME の `.zsh_history`）。GUI の pid だけを待って返していた頃は、直後の
+`rm -rf "$TMP"` とその書き込みが競って「Directory not empty」で落ち、exit-guard の trap の中の
+`set -e` で PASS / FAIL 0 のまま rc=1 になった（`test-remote-launch-1449.sh`）。待つのは GUI を
+落とす前に控えた「GUI とは別の端末を持つ子孫」（= ペインのシェルとその子）だけで、端末を持たない
+子（GUI が起こす remote daemon・言語サーバ）は巻き込まない。上限（`ISOLATED_GUI_PANE_EXIT_TRIES`・
+既定 5 秒）を過ぎて居座るものは、控えた pid のうち起動時刻が一致するものだけへ TERM → KILL を
+送る。だから**呼び手は返った直後に一時 dir を消してよく、待ちや rm の打ち直しを自前で足さない**。
+番犬は `crates/tako-control/tests/issue2588_stop_waits_pane_exit.rs`（zsh の `zpty` で PTY を握る
+偽の GUI に本物の `stop_isolated_gui` を当て、ペインを待たずに返る逆戻りを file:line で落とす）。
 
 **バイナリは `isolated_gui_bins [feature …]` が毎回今の木から建てる**（#1643）。鮮度と feature の
 判定は cargo の fingerprint に任せる（最新なら cargo は何もしない）。以前は 2 本のどちらかが
