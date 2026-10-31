@@ -37,57 +37,27 @@ fn repo_root() -> PathBuf {
         .expect("リポジトリルート")
 }
 
-/// ソースを読み、行コメント（`//` から行末）を同じバイト数の空白へ置き換えて返す
-/// （コメントアウトした呼び出しを「ある」と数えない。バイト位置・行番号はずれない）
+// 本番コードの範囲取りは 1 実装（#1420）。**切らずにテスト領域だけを潰す**ので、
+// ファイル途中のテスト用ヘルパで走査範囲が消えない
+#[path = "common/production_range.rs"]
+mod production_range;
+
+/// 本番コードだけの眺め（テスト領域とコメントを同じバイト数の空白へ潰す = 行番号はずれない）。
+/// コメントアウトした呼び出しを「ある」と数えない
+fn code_of(src: &str, rel: &str, floor: bool) -> String {
+    let production = if floor {
+        production_range::production(src, rel)
+    } else {
+        production_range::scan(src).text
+    };
+    production_range::code_view::without_comments(&production)
+}
+
+/// 本番コードだけの眺めで読む（下限つき = 黙って縮んだら落ちる）
 fn read(rel: &str) -> String {
     let src = std::fs::read_to_string(repo_root().join(rel))
         .unwrap_or_else(|e| panic!("{rel} を読めない: {e}"));
-    strip_line_comments(&src)
-}
-
-fn strip_line_comments(src: &str) -> String {
-    let mut bytes = src.as_bytes().to_vec();
-    let mut i = 0;
-    let mut in_str = false;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if in_str => i += 1,
-            // 文字リテラルの `'"'` は文字列の始まりではない
-            b'\''
-                if !in_str
-                    && bytes.get(i + 1) == Some(&b'"')
-                    && bytes.get(i + 2) == Some(&b'\'') =>
-            {
-                i += 2
-            }
-            b'"' => in_str = !in_str,
-            b'\n' => in_str = false,
-            b'/' if !in_str && bytes.get(i + 1) == Some(&b'/') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    bytes[i] = b' ';
-                    i += 1;
-                }
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    // 置き換えたのは行末までの全バイト（多バイト文字は丸ごと空白になる）なので UTF-8 のまま
-    String::from_utf8(bytes).expect("コメントを空白にしても UTF-8")
-}
-
-#[test]
-fn issue2610_番犬はコメントアウトした呼び出しを数えない() {
-    let src = "a();\n// this.flush_layout_writer(\"x\");\nlet u = \"https://x\"; b(); // 説明\n";
-    let code = strip_line_comments(src);
-    assert_eq!(code.len(), src.len(), "バイト位置がずれた");
-    assert!(!code.contains("flush_layout_writer"));
-    assert!(
-        code.contains("\"https://x\"; b();"),
-        "文字列の中の // を消した"
-    );
-    assert!(!code.contains("説明"));
+    code_of(&src, rel, true)
 }
 
 /// バイト位置の行番号（1 始まり）
@@ -95,11 +65,15 @@ fn line_at(src: &str, at: usize) -> usize {
     src[..at].matches('\n').count() + 1
 }
 
-/// `open` の位置から始まる `{` に対応する `}` の位置（文字列・コメントの中の括弧は数えない粗い版。
-/// 対象の関数はその形を持たない）
+/// `open` の位置から始まる `{` に対応する `}` の位置。文字列・コメントの中の括弧は数えない
+/// （`format!("{why}…")` 等。バイト長を保つコードだけの眺めの上で数えるので位置はそのまま使える）
 fn block_end(src: &str, open: usize) -> usize {
-    let bytes = src.as_bytes();
-    let start = src[open..].find('{').map(|i| open + i).expect("`{` がある");
+    let code = production_range::code_view_of(src);
+    let bytes = code.as_bytes();
+    let start = code[open..]
+        .find('{')
+        .map(|i| open + i)
+        .expect("`{` がある");
     let mut depth = 0usize;
     for (i, b) in bytes.iter().enumerate().skip(start) {
         match b {
@@ -197,14 +171,14 @@ fn issue2610_layout_jsonへ直に書くのは書き手とab枝だけ() {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            let text = strip_line_comments(&std::fs::read_to_string(&path).unwrap());
-            // テストの中（番犬が綴りを並べる箇所）は数えない
-            let code_end = text.find("\n#[cfg(test)]").unwrap_or(text.len());
+            // テスト領域（番犬が綴りを並べる箇所）とコメントは数えない。小さなファイルもあるので
+            // 下限は見ない（main.rs / update_window.rs は他のテストが下限つきで読む）
+            let text = code_of(&std::fs::read_to_string(&path).unwrap(), &rel, false);
             for needle in [
                 "tako_control::layout::save(",
                 "tako_control::layout::remove()",
             ] {
-                for at in all_at(&text[..code_end], needle) {
+                for at in all_at(&text, needle) {
                     let ok = allowed
                         .iter()
                         .any(|(file, range)| *file == rel && range.contains(&at));
