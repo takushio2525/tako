@@ -607,6 +607,8 @@ impl AccountsConfig {
         )?)
     }
 
+    /// ロック付き read-modify-write。閉包の値によらず書き戻す = **断る閉包は渡さない**
+    /// （断るなら [`Self::try_mutate_typed`]。#2569）
     pub fn mutate<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
         Self::mutate_typed(f).map_err(ConfigError::into_ja)
     }
@@ -626,10 +628,31 @@ impl AccountsConfig {
         path: &Path,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Result<R, ConfigError> {
+        Self::try_mutate_at_typed(path, |c| Ok::<R, std::convert::Infallible>(f(c)))
+            .map(|r| r.unwrap_or_else(|never| match never {}))
+    }
+
+    /// 断れるロック付き read-modify-write（#2569）。閉包が `Err` を返したら**書き戻さない**
+    /// （accounts.yaml が無ければ作らない・手で書いた形も世代バックアップも変えない）。
+    /// 外側の `Err` は読み書きの断り、内側は閉包の値
+    pub fn try_mutate_typed<R, E>(
+        f: impl FnOnce(&mut Self) -> Result<R, E>,
+    ) -> Result<Result<R, E>, ConfigError> {
+        let path = accounts_yaml_path().ok_or(ConfigError::HomeUnresolved)?;
+        Self::try_mutate_at_typed(&path, f)
+    }
+
+    /// [`Self::try_mutate_typed`] のパス指定版（accounts.yaml の読み書きの本体はここ 1 つ）
+    pub fn try_mutate_at_typed<R, E>(
+        path: &Path,
+        f: impl FnOnce(&mut Self) -> Result<R, E>,
+    ) -> Result<Result<R, E>, ConfigError> {
         let _lock = crate::config_io::lock_exclusive_typed(path)?;
         let mut config = Self::load_from_typed(path)?;
         let result = f(&mut config);
-        config.save_to_typed(path)?;
+        if result.is_ok() {
+            config.save_to_typed(path)?;
+        }
         Ok(result)
     }
 
@@ -845,7 +868,8 @@ impl ProjectsConfig {
     /// `projects.yaml.lock` の排他ロック下で load → f → save を行い、
     /// 複数プロセス（GUI の MCP dispatch / CLI / 複数 master）の並行 add / remove でも
     /// 更新が失われない。既存ファイルのパースに失敗した場合は **f を呼ばず、
-    /// 一切書き込まずに** Err を返す
+    /// 一切書き込まずに** Err を返す。閉包の値によらず書き戻す = **断る閉包は渡さない**
+    /// （断るなら [`Self::try_mutate_typed`]。#2569）
     pub fn mutate<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
         Self::mutate_typed(f).map_err(ConfigError::into_ja)
     }
@@ -866,10 +890,31 @@ impl ProjectsConfig {
         path: &Path,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Result<R, ConfigError> {
+        Self::try_mutate_at_typed(path, |c| Ok::<R, std::convert::Infallible>(f(c)))
+            .map(|r| r.unwrap_or_else(|never| match never {}))
+    }
+
+    /// 断れるロック付き read-modify-write（#2569）。閉包が `Err` を返したら**書き戻さない**
+    /// （projects.yaml が無ければ作らない・手で書いた形も世代バックアップも変えない）。
+    /// 外側の `Err` は読み書きの断り、内側は閉包の値
+    pub fn try_mutate_typed<R, E>(
+        f: impl FnOnce(&mut Self) -> Result<R, E>,
+    ) -> Result<Result<R, E>, ConfigError> {
+        let path = projects_yaml_path().ok_or(ConfigError::HomeUnresolved)?;
+        Self::try_mutate_at_typed(&path, f)
+    }
+
+    /// [`Self::try_mutate_typed`] のパス指定版（projects.yaml の読み書きの本体はここ 1 つ）
+    pub fn try_mutate_at_typed<R, E>(
+        path: &Path,
+        f: impl FnOnce(&mut Self) -> Result<R, E>,
+    ) -> Result<Result<R, E>, ConfigError> {
         let _lock = crate::config_io::lock_exclusive_typed(path)?;
         let mut config = Self::load_from_typed(path)?;
         let result = f(&mut config);
-        config.save_to_typed(path)?;
+        if result.is_ok() {
+            config.save_to_typed(path)?;
+        }
         Ok(result)
     }
 

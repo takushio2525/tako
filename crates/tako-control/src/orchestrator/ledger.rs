@@ -162,7 +162,8 @@ impl Ledger {
         )?)
     }
 
-    /// ロック付き read-modify-write
+    /// ロック付き read-modify-write。閉包の値によらず書き戻す = **断る閉包は渡さない**
+    /// （断るなら [`Self::try_mutate_typed`]。#2569）
     pub fn mutate<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
         Self::mutate_typed(f).map_err(ConfigError::into_ja)
     }
@@ -179,10 +180,31 @@ impl Ledger {
 
     /// [`Self::mutate_at`] の型の口
     fn mutate_at_typed<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R, ConfigError> {
+        Self::try_mutate_at_typed(path, |l| Ok::<R, std::convert::Infallible>(f(l)))
+            .map(|r| r.unwrap_or_else(|never| match never {}))
+    }
+
+    /// 断れるロック付き read-modify-write（#2569）。閉包が `Err` を返したら**書き戻さない**
+    /// （台帳が無ければ作らない・手で書いた台帳の形も世代バックアップも変えない）。
+    /// 外側の `Err` は読み書きの断り（ロック・読めない・解析できない・書けない）、内側は閉包の値
+    pub fn try_mutate_typed<R, E>(
+        f: impl FnOnce(&mut Self) -> Result<R, E>,
+    ) -> Result<Result<R, E>, ConfigError> {
+        let path = ledger_path().ok_or(ConfigError::HomeUnresolved)?;
+        Self::try_mutate_at_typed(&path, f)
+    }
+
+    /// [`Self::try_mutate_typed`] のパス指定版（台帳の読み書きの本体はここ 1 つ）
+    fn try_mutate_at_typed<R, E>(
+        path: &Path,
+        f: impl FnOnce(&mut Self) -> Result<R, E>,
+    ) -> Result<Result<R, E>, ConfigError> {
         let _lock = crate::config_io::lock_exclusive_typed(path)?;
         let mut ledger = Self::load_from_typed(path)?;
         let result = f(&mut ledger);
-        ledger.save_to_typed(path)?;
+        if result.is_ok() {
+            ledger.save_to_typed(path)?;
+        }
         Ok(result)
     }
 
@@ -465,7 +487,19 @@ pub fn record_outcome_typed(
     note: Option<&str>,
 ) -> Result<(), ConfigError> {
     validate_outcome_typed(outcome)?;
-    Ledger::mutate_typed(|l| {
+    let path = ledger_path().ok_or(ConfigError::HomeUnresolved)?;
+    record_outcome_at(&path, id, outcome, rounds, note)
+}
+
+/// [`record_outcome_typed`] のパス指定版。無いエントリは断って台帳を書かない（#2569）
+fn record_outcome_at(
+    path: &Path,
+    id: &str,
+    outcome: &str,
+    rounds: Option<u32>,
+    note: Option<&str>,
+) -> Result<(), ConfigError> {
+    Ledger::try_mutate_at_typed(path, |l| {
         let entry = l
             .find_mut(id)
             .ok_or_else(|| ConfigError::LedgerEntryNotFound(id.to_string()))?;
@@ -483,7 +517,13 @@ pub fn amend_entry(id: &str, amend_note: &str) -> Result<(), String> {
 
 /// [`amend_entry`] の型の口
 pub fn amend_entry_typed(id: &str, amend_note: &str) -> Result<(), ConfigError> {
-    Ledger::mutate_typed(|l| {
+    let path = ledger_path().ok_or(ConfigError::HomeUnresolved)?;
+    amend_entry_at(&path, id, amend_note)
+}
+
+/// [`amend_entry_typed`] のパス指定版。無いエントリは断って台帳を書かない（#2569）
+fn amend_entry_at(path: &Path, id: &str, amend_note: &str) -> Result<(), ConfigError> {
+    Ledger::try_mutate_at_typed(path, |l| {
         let entry = l
             .find_mut(id)
             .ok_or_else(|| ConfigError::LedgerEntryNotFound(id.to_string()))?;
@@ -1038,5 +1078,100 @@ mod tests {
             after.entries[0].model_actual.as_deref(),
             Some("claude-opus-5")
         );
+    }
+
+    /// 手で書いた台帳（コメントと flow 形式 = tako が書く形とバイトが違う。書き戻すと形が変わる）
+    const HAND_LEDGER_2569: &str = "# 手で書いた台帳\nentries:\n  - {id: spawn_a, ts: t, project: tako, task_type: docs, model: opus}\n";
+
+    /// ファイルの指紋（中身・mtime）。書き戻せば一時ファイルからの rename で mtime も変わる
+    fn fingerprint_2569(path: &Path) -> Option<(Vec<u8>, std::time::SystemTime)> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((std::fs::read(path).ok()?, meta.modified().ok()?))
+    }
+
+    /// 閉包が断ったら台帳を書き戻さない（#2569）: 台帳が無ければ作らず、手で書いた台帳は
+    /// バイト・mtime とも変えず、世代バックアップも回さない。断りの値はそのまま返る
+    #[test]
+    fn 断る閉包は台帳を書き戻さない_2569() {
+        let dir = tako_core::test_residue::ScratchDir::new("ledger-2569");
+        // 台帳の無い置き場
+        let absent = dir.path().join("absent").join("ledger.yaml");
+        let got = Ledger::try_mutate_at_typed(&absent, |l| {
+            l.entries.clear();
+            Err::<(), _>("断る")
+        });
+        assert_eq!(got, Ok(Err("断る")), "閉包の断りは内側で返る");
+        assert!(
+            !absent.exists(),
+            "断ったのに台帳を作った: {}",
+            absent.display()
+        );
+        for got in [
+            record_outcome_at(&absent, "nope2569", "pass", None, None),
+            amend_entry_at(&absent, "nope2569", "x"),
+        ] {
+            assert_eq!(
+                got,
+                Err(ConfigError::LedgerEntryNotFound("nope2569".into()))
+            );
+            assert!(
+                !absent.exists(),
+                "断ったのに台帳を作った: {}",
+                absent.display()
+            );
+        }
+
+        // 手で書いた台帳の置き場
+        let hand = dir.path().join("hand").join("ledger.yaml");
+        std::fs::create_dir_all(hand.parent().unwrap()).unwrap();
+        std::fs::write(&hand, HAND_LEDGER_2569).unwrap();
+        let before = fingerprint_2569(&hand);
+        for got in [
+            record_outcome_at(&hand, "nope2569", "pass", Some(2), Some("n")),
+            amend_entry_at(&hand, "nope2569", "x"),
+        ] {
+            assert_eq!(
+                got,
+                Err(ConfigError::LedgerEntryNotFound("nope2569".into()))
+            );
+            assert_eq!(
+                fingerprint_2569(&hand),
+                before,
+                "断ったのに手で書いた台帳を書き換えた"
+            );
+            assert!(!sibling(&hand, ".bak.1").exists(), "断ったのに世代を回した");
+        }
+
+        // 壊れた台帳は読みの断り（閉包を呼ばない）で、壊れたファイルを上書きしない
+        let broken = dir.path().join("broken").join("ledger.yaml");
+        std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+        std::fs::write(&broken, "entries: [\n").unwrap();
+        let got = record_outcome_at(&broken, "spawn_a", "pass", None, None);
+        assert!(
+            matches!(got, Err(ConfigError::Parse { .. })),
+            "壊れた台帳は解析の断り: {got:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&broken).unwrap(), "entries: [\n");
+
+        // 断らなければ従来どおり書く（手で書いた形は tako の形へ揃う）
+        record_outcome_at(&hand, "spawn_a", "rework", Some(2), Some("again")).unwrap();
+        amend_entry_at(&hand, "spawn_a", "late").unwrap();
+        let after = Ledger::load_from(&hand).unwrap();
+        let e = &after.entries[0];
+        assert_eq!(
+            (e.outcome.as_deref(), e.rounds, e.note.as_deref()),
+            (Some("rework"), Some(2), Some("again"))
+        );
+        assert_eq!(
+            (e.post_issue, e.amend_note.as_deref()),
+            (true, Some("late"))
+        );
+        assert!(sibling(&hand, ".bak.1").exists(), "書いたときは世代を回す");
+    }
+
+    fn sibling(path: &Path, suffix: &str) -> PathBuf {
+        let mut name = path.file_name().unwrap().to_os_string();
+        name.push(suffix);
+        path.with_file_name(name)
     }
 }
