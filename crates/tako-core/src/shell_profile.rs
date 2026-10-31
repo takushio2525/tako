@@ -25,10 +25,17 @@
 //! `bash` なら `/bin/sh` を指す symlink でも `.bash_profile`）。tako の問い合わせも `$SHELL` のパスのまま
 //! 起こすので、判定は実行ファイルの名前で揃う
 //!
+//! bash のログインは `.bash_profile` → `.bash_login` → `.profile` の**最初に在る 1 つだけ**を読む
+//! （#2602 の実測）。`.profile` / `.bash_login` だけを持つ人に `.bash_profile` を新しく作ると、その時点から
+//! 元のファイルの中身（PATH・環境変数）が `bash -l` から消えるので、bash は**その 1 つ**へ書く
+//! （[`ShellKind::login_profile_in`]。どれも無ければ `.bash_profile`）
+//!
 //! ## 書き換えの規則
 //!
 //! ブロックの読み書きは [`crate::text_block`] に委ねる（区切り改行 1 個・
 //! 元バイト列への完全復帰の不変条件はそこが唯一の実装）。本文は **ASCII だけ**で書く。
+//! ブロックを外して 0 バイトになったファイル（= tako が書く前は無かった）は、空のまま残さず消す
+//! （空の `.bash_profile` が以後の `bash -l` で `.profile` を覆い隠す。#2602）
 
 use crate::text_block::BlockMarkers;
 use std::path::{Path, PathBuf};
@@ -47,6 +54,19 @@ pub const ISSUE2592_LEGACY_ENV: &str = "TAKO_2592_LEGACY";
 pub fn issue2592_legacy() -> bool {
     std::env::var(ISSUE2592_LEGACY_ENV).is_ok_and(|v| v == "1")
 }
+
+/// #2602 の A/B の env（`1` で bash は常に `.bash_profile` へ書き、ブロックを外して 0 バイトになった
+/// ファイルを空のまま残す = #2602 前の形。どちらも `bash -l` が `.profile` / `.bash_login` を読まなくなる）
+pub const ISSUE2602_LEGACY_ENV: &str = "TAKO_2602_LEGACY";
+
+/// [`ISSUE2602_LEGACY_ENV`] が立っているか（#2602 の A/B のゲートはここ 1 か所）
+pub fn issue2602_legacy() -> bool {
+    std::env::var(ISSUE2602_LEGACY_ENV).is_ok_and(|v| v == "1")
+}
+
+/// bash のログインが読む profile の候補（`$HOME` 相対）。bash は**この順で最初に在る 1 つだけ**を読む
+/// （bash(1) の INVOCATION。#2602 で一時 HOME に全部の組み合わせを置いて `bash -l` で実測）
+pub const BASH_LOGIN_PROFILES: [&str; 3] = [".bash_profile", ".bash_login", ".profile"];
 
 /// profile の書式を決めるシェル種別
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +124,25 @@ impl ShellKind {
             // PowerShell の `$PROFILE.CurrentUserAllHosts`（#525 で実パスを解決する）
             Self::PowerShell => "Documents/PowerShell/profile.ps1",
         }
+    }
+
+    /// `home` で**実際に書く** profile（#2602）。path・undo-path・status の `profile` がこの 1 実装を引く。
+    ///
+    /// bash だけは [`BASH_LOGIN_PROFILES`] の最初に在るもの（= `bash -l` が読む唯一のファイル）。
+    /// どれも無ければ [`Self::login_profile_rel`]（`.bash_profile`）。`.profile` / `.bash_login` だけの人に
+    /// `.bash_profile` を作ると、その中身が `bash -l` から消える（#2602 前の形）。
+    /// 他の種別は読むファイルが 1 つなので [`Self::login_profile_rel`] のまま
+    pub fn login_profile_in(self, home: &Path) -> PathBuf {
+        if self == Self::Bash && !issue2602_legacy() {
+            if let Some(found) = BASH_LOGIN_PROFILES
+                .iter()
+                .map(|rel| home.join(rel))
+                .find(|path| path.is_file())
+            {
+                return found;
+            }
+        }
+        home.join(self.login_profile_rel())
     }
 
     /// 書き先を移す前にこの種別の利用者へ書いていた profile（`$HOME` 相対）。`undo-path` が併せて
@@ -304,7 +343,7 @@ pub fn ensure_dirs_on_path_in_typed(
     dirs: &[PathBuf],
     current_path: Option<&str>,
 ) -> Result<EnsureOutcome, PathBlockError> {
-    let profile = home.join(shell.login_profile_rel());
+    let profile = shell.login_profile_in(home);
     let dirs: Vec<PathBuf> = dedup(dirs);
     if dirs.is_empty() {
         return Err(PathBlockError::NoDirs);
@@ -365,7 +404,7 @@ pub fn remove_from_profile_in_typed(
     home: &Path,
     shell: ShellKind,
 ) -> Result<EnsureOutcome, PathBlockError> {
-    remove_block_at(shell, home.join(shell.login_profile_rel()))
+    remove_block_at(shell, shell.login_profile_in(home))
 }
 
 /// 書き先を移す前の profile（[`ShellKind::previous_profile_rel`]）に残ったブロックを取り除く（#2592）。
@@ -380,7 +419,15 @@ pub fn remove_from_previous_profile_in_typed(
         .transpose()
 }
 
-/// `profile` から tako のブロックを取り除く（元のバイト列へ完全に戻す。無ければ触らない）
+/// `profile` から tako のブロックを取り除く（元のバイト列へ完全に戻す。無ければ触らない）。
+///
+/// 外して 0 バイトになったら**ファイルごと消す**（#2602）。text_block は無いファイルを空として読むので、
+/// tako が作ったファイルは外すと 0 バイトになる。空の `.bash_profile` を残すと、以後の `bash -l` が
+/// `.bash_login` / `.profile` を読まなくなる（tako が書く前の状態ではない）。書く前から 0 バイトのファイルが
+/// 在った場合も消える（無いと 0 バイトを区別する印を持たない。zsh / fish / sh の profile は空と無いで
+/// 挙動が同じ）。作った親ディレクトリ（fish の `~/.config/fish`）は残す。
+/// symlink（dotfiles の管理など）は tako が作ったものではないので消さず、従来どおり指す先を元のバイト列へ戻す
+/// （symlink を消すとリンクだけが消え、指す先にブロックが残る）
 fn remove_block_at(shell: ShellKind, profile: PathBuf) -> Result<EnsureOutcome, PathBlockError> {
     let original = read_bytes(&profile)?;
     if !MARKERS.present(&original) {
@@ -392,7 +439,16 @@ fn remove_block_at(shell: ShellKind, profile: PathBuf) -> Result<EnsureOutcome, 
         });
     }
     let updated = MARKERS.remove(&original);
-    write_bytes(&profile, &updated)?;
+    let is_symlink =
+        std::fs::symlink_metadata(&profile).is_ok_and(|meta| meta.file_type().is_symlink());
+    if updated.is_empty() && !is_symlink && !issue2602_legacy() {
+        std::fs::remove_file(&profile).map_err(|e| PathBlockError::Write {
+            path: profile.display().to_string(),
+            error: e.to_string(),
+        })?;
+    } else {
+        write_bytes(&profile, &updated)?;
+    }
     Ok(EnsureOutcome {
         shell,
         profile,
@@ -884,6 +940,104 @@ mod tests {
         let both = joined_path(&["/usr/bin", &a.to_string_lossy(), &b.to_string_lossy()]);
         let out2 = ensure_dirs_on_path_in(&home, ShellKind::Zsh, &[a, b], Some(&both)).unwrap();
         assert_eq!(out2.change, PathChange::AlreadyOnPath);
+        cleanup(&home);
+    }
+
+    /// #2602: bash は `bash -l` が読む唯一のファイル（`.bash_profile` → `.bash_login` → `.profile` の
+    /// 最初に在るもの）へ書く。他の種別は在るファイルに左右されない
+    /// （本物の `bash -l` との突き合わせは `tako-control/tests/issue2602_bash_profile_shadow_watchdog.rs`）
+    #[test]
+    fn bashはログインで読まれる唯一のprofileへ書く() {
+        let cases: [(&[&str], &str); 7] = [
+            (&[], ".bash_profile"),
+            (&[".profile"], ".profile"),
+            (&[".bash_login"], ".bash_login"),
+            (&[".bash_login", ".profile"], ".bash_login"),
+            (&[".bash_profile", ".profile"], ".bash_profile"),
+            (&[".bash_profile", ".bash_login"], ".bash_profile"),
+            (
+                &[".bash_profile", ".bash_login", ".profile"],
+                ".bash_profile",
+            ),
+        ];
+        for (i, (existing, want)) in cases.into_iter().enumerate() {
+            let home = temp_home(&format!("bash-login-{i}"));
+            for rel in existing {
+                std::fs::write(home.join(rel), "# user\n").unwrap();
+            }
+            assert_eq!(
+                ShellKind::Bash.login_profile_in(&home),
+                home.join(want),
+                "{existing:?}"
+            );
+            let out = ensure_dir_on_path_in(
+                &home,
+                ShellKind::Bash,
+                &home.join(".local/bin"),
+                Some("/usr/bin"),
+            )
+            .unwrap();
+            assert_eq!(out.profile, home.join(want), "{existing:?}");
+            assert_eq!(
+                ShellKind::Zsh.login_profile_in(&home),
+                home.join(".zprofile")
+            );
+            assert_eq!(ShellKind::Sh.login_profile_in(&home), home.join(".profile"));
+            cleanup(&home);
+        }
+    }
+
+    /// #2602: tako が作ったファイルはブロックを外すと消える（空の `.bash_profile` を残すと、以後の
+    /// `bash -l` が `.profile` を読まない）。利用者の行が在るファイルは元のバイト列へ戻る（上の roundtrip）
+    #[test]
+    fn 作ったprofileは除去で消える() {
+        let home = temp_home("created");
+        let dir = home.join(".local/bin");
+        for shell in [
+            ShellKind::Zsh,
+            ShellKind::Bash,
+            ShellKind::Sh,
+            ShellKind::Fish,
+        ] {
+            let out = ensure_dir_on_path_in(&home, shell, &dir, Some("/usr/bin")).unwrap();
+            assert_eq!(out.change, PathChange::Installed, "{shell:?}");
+            assert!(out.profile.is_file(), "{shell:?}");
+            let removed = remove_from_profile_in(&home, shell).unwrap();
+            assert_eq!(removed.change, PathChange::Removed, "{shell:?}");
+            assert!(
+                !out.profile.exists(),
+                "{shell:?}: 作った {} が 0 バイトで残った",
+                out.profile.display()
+            );
+        }
+        cleanup(&home);
+    }
+
+    /// #2602: symlink の profile（dotfiles の管理など）は外して 0 バイトになっても消さない。
+    /// 消すとリンクだけが消え、指す先にブロックが残る
+    #[cfg(unix)]
+    #[test]
+    fn symlinkのprofileは除去で消さず指す先を戻す() {
+        let home = temp_home("symlink");
+        std::fs::create_dir_all(home.join("dotfiles")).unwrap();
+        let target = home.join("dotfiles/zprofile");
+        std::fs::write(&target, "").unwrap();
+        std::os::unix::fs::symlink(&target, home.join(".zprofile")).unwrap();
+        let dir = home.join(".local/bin");
+        ensure_dir_on_path_in(&home, ShellKind::Zsh, &dir, Some("/usr/bin")).unwrap();
+        assert!(profile_has_block(&target), "symlink の指す先へ書いていない");
+        let removed = remove_from_profile_in(&home, ShellKind::Zsh).unwrap();
+        assert_eq!(removed.change, PathChange::Removed);
+        assert!(
+            std::fs::symlink_metadata(home.join(".zprofile"))
+                .is_ok_and(|m| m.file_type().is_symlink()),
+            "symlink を消した"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"",
+            "指す先が元へ戻っていない"
+        );
         cleanup(&home);
     }
 
