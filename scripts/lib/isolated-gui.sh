@@ -86,7 +86,7 @@
 #   isolated_gui_bins visual-test        # visual-test の節を回すなら feature を求める（自前で cargo build しない）
 #   launch_isolated_gui "$TMP/app.log" || exit $?   # 印と面の指定の判定 → ensure → uuid の突き合わせ → 起動（pid は $ISOLATED_GUI_PID）
 #   wait_isolated_gui                    # `tako list` が通るまで待つ（任意）
-#   stop_isolated_gui                    # 自分で起こした pid だけを落とす
+#   stop_isolated_gui                    # 自分で起こした pid だけを落とし、ペインのプロセスが終わるまで待つ（#2588）
 #
 #   起動ごとに env を足したいときは `VAR=VAL` を並べる（`export` を汚さない）:
 #   launch_isolated_gui "$TMP/app-legacy.log" TAKO_1487_LEGACY=1
@@ -169,6 +169,10 @@ ISOLATED_GUI_BOUNDS=${ISOLATED_GUI_BOUNDS:-}
 
 # `tako list` が通るまで待つ上限（0.1 秒 × この回数）
 ISOLATED_GUI_WAIT_TRIES=${ISOLATED_GUI_WAIT_TRIES:-200}
+
+# GUI を落とした後、ペインのプロセスが終わるのを待つ上限（0.1 秒 × この回数。#2588）。
+# 過ぎても居座るものは、控えた pid だけへ TERM → KILL を送る
+ISOLATED_GUI_PANE_EXIT_TRIES=${ISOLATED_GUI_PANE_EXIT_TRIES:-50}
 
 # 直前の `launch_isolated_gui` が起こした pid（呼び出し側はこれを自分の変数へ受ける）
 ISOLATED_GUI_PID=""
@@ -596,21 +600,99 @@ wait_isolated_gui() {
     return 1
 }
 
-# 自分で起こした隔離 GUI を落とす。**明示 pid だけ**（名前一致では殺さない）
+# GUI のペインのプロセスを「pid 起動時刻」の行で並べる（#2588）。
+#
+#   iso_pane_processes <GUI の pid>
+#
+# ペインのプロセス = GUI の子孫のうち、**GUI 自身とは別の端末**を制御端末に持つもの（GUI が開いた
+# PTY のシェルとその子）。端末を持たない子孫（GUI が起こす remote daemon・言語サーバ）と、GUI と同じ
+# 端末の子孫（端末から走らせた検証で GUI が受け継いだ端末）は数えない = GUI の再起動をまたいで残す
+# はずの daemon（#2518）を巻き込まない。起動時刻は pid の使い回しで別人を撃たないための印
+iso_pane_processes() {
+    local root="$1" own
+    own=$(ps -o tty= -p "$root" 2>/dev/null | tr -d ' ')
+    ps -A -o pid= -o ppid= -o tty= -o lstart= 2>/dev/null | awk -v root="$root" -v own="$own" '
+        { pid = $1; parent[pid] = $2; tty[pid] = $3; $1 = $2 = $3 = ""; sub(/^ +/, ""); start[pid] = $0; order[++n] = pid }
+        END {
+            mine[root] = 1
+            do {
+                grown = 0
+                for (i = 1; i <= n; i++) {
+                    p = order[i]
+                    if (!(p in mine) && (parent[p] in mine)) { mine[p] = 1; grown = 1 }
+                }
+            } while (grown)
+            for (i = 1; i <= n; i++) {
+                p = order[i]
+                if (p != root && (p in mine) && tty[p] != "??" && tty[p] != "?" && tty[p] != own) print p, start[p]
+            }
+        }'
+    return 0
+}
+
+# 控えた行（iso_pane_processes の出力）のうち、まだ同じプロセスとして生きている pid を並べる。
+# 起動時刻が変わった pid は使い回し = 別人なので数えない。ゾンビはもう書かないので数えない
+iso_pane_alive() {
+    local pid start now
+    while read -r pid start; do
+        [ -n "$pid" ] || continue
+        now=$(ps -o stat= -o lstart= -p "$pid" 2>/dev/null | awk '{ s = $1; $1 = ""; sub(/^ +/, ""); if (s !~ /^Z/) print }')
+        [ -n "$now" ] && [ "$now" = "$start" ] && printf '%s\n' "$pid"
+    done <<< "${1-}"
+    return 0
+}
+
+# 控えたペインのプロセスが終わるまで待つ（#2588）。
+#
+#   iso_reap_panes <iso_pane_processes の出力>
+#
+# GUI が終わると PTY が切れてペインのシェルへ SIGHUP が届くが、シェルは**終わる前に書く**
+# （zsh は HUP で履歴を保存する = 呼び手の一時の HOME の .zsh_history）。GUI の pid だけを待って
+# 返すと、呼び手が直後に消す一時 dir とその書き込みが競り、`rm -rf` が「Directory not empty」で
+# 落ちる（#2588: test-remote-launch-1449.sh が PASS 38 / FAIL 0 のまま rc=1）。
+# 上限（ISOLATED_GUI_PANE_EXIT_TRIES）を過ぎて居座るものは、控えた pid だけへ TERM → KILL
+iso_reap_panes() {
+    local panes="${1-}" i sig alive
+    [ -n "$panes" ] || return 0
+    for i in $(seq 1 "$ISOLATED_GUI_PANE_EXIT_TRIES"); do
+        [ -z "$(iso_pane_alive "$panes")" ] && return 0
+        sleep 0.1
+    done
+    for sig in TERM KILL; do
+        alive=$(iso_pane_alive "$panes")
+        [ -n "$alive" ] || return 0
+        echo "隔離 GUI のペインのプロセスが終わらないので ${sig} を送る: $(echo $alive)" >&2
+        # 起動時刻で確かめた直後の pid だけを撃つ（名前一致では撃たない）。複数の pid を語に割る
+        # shellcheck disable=SC2086
+        kill -"$sig" $alive 2>/dev/null || true
+        for i in $(seq 1 10); do
+            [ -z "$(iso_pane_alive "$panes")" ] && return 0
+            sleep 0.1
+        done
+    done
+    return 0
+}
+
+# 自分で起こした隔離 GUI を落とす。**明示 pid だけ**（名前一致では殺さない）。
+# GUI のペインのプロセスが終わるまで待ってから返す（#2588。呼び手は返った直後に一時 dir を消してよい）
 #
 #   stop_isolated_gui [pid]
 stop_isolated_gui() {
-    local pid="${1:-$ISOLATED_GUI_PID}" i
+    local pid="${1:-$ISOLATED_GUI_PID}" i panes
     [ -n "$pid" ] || return 0
+    # ペインのプロセスは GUI を落とす**前**に控える（落ちた後は launchd の子になり、GUI から辿れない）
+    panes=$(iso_pane_processes "$pid")
     kill "$pid" 2>/dev/null || true
     # 素直に終わるのを待ってから、居座るときだけ強く落とす
     for i in $(seq 1 50); do
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.1
     done
-    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    # 確かめた直後に終わっていても後片付けを止めない（呼び手の trap は set -e のまま走る）
+    { kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null; } || true
     wait "$pid" 2>/dev/null || true
     [ "$pid" = "${ISOLATED_GUI_PID:-}" ] && ISOLATED_GUI_PID=""
+    iso_reap_panes "$panes"
     return 0
 }
 
@@ -621,6 +703,6 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     echo "  isolated_gui_bins [feature…]         TAKO_BIN / APP_BIN を決め、今の木から求める feature で建てる（毎回 cargo に任せる）" >&2
     echo "  launch_isolated_gui <log> [VAR=VAL…] 仮想ディスプレイを起こして隔離 GUI を起動（用意できなければ起動せず 4・tako-vd 以外の面の指定と偽の TAKO_ISOLATED と物理画面を指す TAKO_VD_NAME は起動せず 2）" >&2
     echo "  wait_isolated_gui [log] [試行回数]    tako list が通るまで待つ" >&2
-    echo "  stop_isolated_gui [pid]              自分で起こした pid だけを落とす" >&2
+    echo "  stop_isolated_gui [pid]              自分で起こした pid だけを落とし、ペインのプロセスが終わるまで待つ" >&2
     exit 1
 fi
