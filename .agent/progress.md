@@ -20,25 +20,6 @@
 
 ---
 
-## 2026-10-31（#2555: LSP の e2e が `stop`（待たずに返る）の直後に置き場を消し、偽サーバの `exit` の書き込みで `tako-2035-*` / `tako-2048-*` が消え残っていた → テストの最後は `shutdown_all`・置き場は `ScratchDir`・番犬 `issue2555_lsp_stop_then_scope_end_watchdog`）
-- 修正前 10 回で 2035 は 20 個・2048 は 2 個 → 修正後 0 個・SIGKILL の残りは test-residue が数える・注入で番犬が 4 行を名指す・既存の 257 個を片付け・カタログ +0 B。PR #2558
-
-## 2026-10-31（#2557: setup bootstrap の未知のシェルへの断りが `export PATH="~/.local/bin:$PATH"` を 4 行重ねていた → tako-core `shell_profile::dirs_for_unknown_shell`（書く行と同じ `$HOME/…`・重複なし）でディレクトリだけ並べ、構文はそのシェルの書き方に任せる）
-- CLI / MCP（日英）とも 4 行 → 1 行・既知のシェル 7 種の rc と応答はバイト一致・注入 3 通りで file:line を名指し・カタログ +0 B。PR #2563
-
-## 2026-10-31（#2561: MCP 設定のテストの `mcp_test_dir` と #944 の番犬の `scratch` を `ScratchDir` へ寄せ、子をプロセスグループの頭で起こして刈り取る前に孫を止める・番犬 `issue2561_temp_dir_helper_watchdog`）
-- 修正前は専用の TMPDIR で 3 回走らせると 7→14→21 個（944 は偽 agy の注入で 3→6→9 個）、修正後はどちらも 0→0→0 個。本物の `$TMPDIR` から 976 個を消した（失敗 0）・カタログ +0 B。PR #2562
-
-## 2026-10-31（#2365 の続き: 委任台帳・引き継ぎの書き込み・supervisor・後任 master の起動コマンドを `ConfigError`、非同期 run・手順書を `Reason`、設定値の範囲・paste-guard を tako-core の `RangeRefusal` / `PolicyRefusal` へ。置き場 21 か所は #2497 で済みと確認）
-- 隔離 GUI の A/B で英語表示の日本語入り 24 / 24 → 0 / 24・日本語は sha256 一致・注入 12 か所を名指し + E0004・カタログ +0 B。PR #2565
-
-## 2026-10-31（#2566: IPC のテストの偽の受け口を `ScratchDir` の下へ・dispatch / orchestrator のテストの補助が設定の置き場の OnceLock を後始末なしで先に初期化するのを外す・#2561 の番犬を String / ソケット / OnceLock の初期化子へ広げる）
-- 修正前は専用の TMPDIR で 3 回走らせると `tk2123*` 3→6→9・dispatch-config 1→2→3、修正後はどちらも 0→0→0。本物の `$TMPDIR` から 341 個を消した（失敗 0）・カタログ +0 B。PR #2568
-
-## 2026-10-31（#2559: GUI をペインから再起動すると自動命名の `claude -p` がペインの識別と mod の注入を受け継ぎ、master の `mod_turn` / `session_id` / `rate_limits` を haiku の報告で上書きしていた → 起動形で `helper_env` を外す + CLI が祖先を添え GUI がペインの外の報告を `foreign` で捨てる（A/B `TAKO_2559_LEGACY=1`））
-- 隔離 GUI + 偽 claude で修正前は上書き・`ended` で報告消失 → 修正後 0・番犬 `issue2559_helper_report_watchdog`・カタログ +0 B。PR #2567
-- 本番確認で #2559 を閉じた
-
 ## 2026-10-31（#2569: 台帳 / projects.yaml / accounts.yaml の `mutate` が閉包の断りでも書き戻し 0 件のファイル作成・手書きの形の書き直しをしていた → `try_mutate_typed`（Err なら書かない）へ寄せ、番犬 `issue2569_refusal_writeback` が file:line で名指す）
 - 実経路（CLI / MCP・日英）で修正前 NG 32 → 修正後 0・出力 128 ファイルがバイト一致・カタログ +0 B。PR #2572
 
@@ -81,3 +62,19 @@
 
 ## 2026-10-31（#2588: 隔離 GUI の後片付けで `stop_isolated_gui` が GUI の pid だけを待って返し、SIGHUP を受けたペイン（SSH ペインの統合の無い zsh）の履歴保存と直後の `rm -rf "$TMP"` が競って rc=1 → GUI を落とす前にペインのプロセス（別の端末を持つ子孫）を控え、終わるまで待つ・居座りは TERM → KILL・番犬 `issue2588_stop_waits_pane_exit`）
 - 本物の 1449 で修正前 + 注入 rc=1 → 修正後 + 同じ注入 rc=0・注入なし 5 / 5 rc=0（PASS 38 / FAIL 0・残骸 0）・逆戻りを番犬が file:line で名指し・カタログ +0 B。PR #2591
+
+## 2026-10-31（#2577: tcsh / csh のログインシェルへ `-l -c` を渡さず、argv[0] を `-<名>` にした `-c 'exec /bin/sh -c $argv[1]:q'` の形で起こす。表 `exe::login_invocation` の 1 実装へ寄せ、`ChildCmd::command` が argv[0] を当てる。A/B `TAKO_2577_LEGACY=1`）
+- 砂場の check-health で tcsh / csh / 別名は修正前 claude 未検出・git 不明 → 修正後どちらも検出。zsh / bash / sh / fish / 空はバイト一致・番犬 `issue2577_csh_login_shell_watchdog`・カタログ +0 B。PR #2593
+
+## 2026-10-31（#2365 の続き: GUI 側 = git パネルの 13 呼び出しを型の口へ・動画 `VideoRefusal`・Web ビューの親 `HostRefusal::WebViewParentDetached`・ファイルのクリップボード `ClipboardWriteError`・`.app` の差し替え `BundleError` / `SwapCause`・プレビューのリンク / アプリを選んで開く / 再起動は os_integration の型の口）
+- 隔離 GUI の CLI / MCP で英語表示の日本語入り 8 / 8 → 0 / 8・日本語は sha256 一致・GUI 無しの実経路 4 / 4 → 0・注入 6 通りを名指し + E0004・カタログ +0 B。PR #2596
+
+## 2026-11-01（#2594: SSH ペインが ssh の失敗・切断後に戻るローカルのシェルに統合が載らなかった → 戻る直前に素のペインと同じ統合（`shell_integration::relaunch`）を当て直す。A/B `TAKO_2594_LEGACY=1`）
+- 隔離 GUI の A/B で戻りのシェルが `unknown → failed`・cwd 追従・HISTFILE が素のペインと同じ（器あり・切断・bash も）・番犬が呼び手を file:line で名指し・カタログ +0 B。PR #2599
+- 02:53 に `3638362` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）。本番 GUI の SSH ペインの戻りのシェルが state=failed / cwd 追従 = 素のペインと一致した本番確認で #2594 を閉じた
+
+## 2026-11-01（#2592: `SHELL` の名前が sh のとき setup が `~/.bash_profile` へ書き、`sh -l` は `~/.profile` だけを読むので段が path に残っていた → `ShellKind::Sh`（`~/.profile`）・undo は移す前の `.bash_profile` のブロックも外す・A/B `TAKO_2592_LEGACY=1`）
+- 砂場の CLI で修正前は verified=false・next_step=path、修正後は verified=true・auth。既知のシェル 8 種は 15 ファイルずつバイト一致。注入 2 通りを番犬が file:line で名指し。カタログ +0 B。PR #2600
+
+## 2026-11-01（#2598: `wait_isolated_gui` の素の `tako list` が呼び手の env（本番の `TAKO_SOCKET` / 既定の置き場）で本番 GUI へ届き、隔離 GUI が立つ前に返っていた → ヘルパの CLI を `iso_cli`（本番の env を落とし GUI と同じ発見の置き場）へ・置き場が空ならログの隣に決めて GUI にも渡す・番犬が `scripts/lib/*.sh` を「その行で隔離」の規則で読む（A/B `TAKO_2598_LEGACY=1`））
+- 本番役の隔離 GUI + 中継で修正前は 7 通り中 6 通りで本番役へ届く（1 回の待ちで 1 件・launch を通さない待ちは 30 件）→ 修正後 0 件・代表 2 本の rc と PASS / FAIL は一致・カタログ +0 B。PR #2601
