@@ -370,7 +370,7 @@ fn 種別の分からないシェルはzshと見なさずprofileへ書かずに�
     // ---- #2564: 案内どおり足し終えた未知のシェルは断らない ----
     // 断りが示した一覧（`$HOME/…`）をそのまま PATH へ足すと、path は書かずに `already_on_path` を返す。
     // 修正前は足し終えても同じ断り = `tako setup` が「足してください」を出し続けた（形を変えた堂々巡り）。
-    // 偽のシェルは何も答えないので、見え方はプロセスの PATH（本物の tcsh も `-l -c` を受け付けずこちら）
+    // 偽のシェルは何も答えないので、見え方はプロセスの PATH（本物の tcsh は #2577 から `.login` を読んだ PATH を答える）
     let mut closed = 0;
     for (label, shell) in &unknown[..2] {
         let home = fresh_home(&root, &format!("{label}-added"));

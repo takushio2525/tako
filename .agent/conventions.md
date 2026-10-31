@@ -1535,6 +1535,17 @@ codex 0.154.0 はセッションの終わりに **SIGTERM**、agy はセッシ�
   打ち切りを persist.log へ名前ごとに 1 行残す（受け口は `bin_resolve::set_notice_sink`）。番犬
   `crates/tako-control/tests/issue1533_login_shell_timeout_watchdog.rs`、実経路
   `bash scripts/test-login-shell-timeout-1532.sh`、A/B `TAKO_1532_LEGACY=1`
+- **ログインシェルの起こし方はシェル種別の表 `platform::exe::login_invocation` の 1 実装で決める**（#2577）。
+  tcsh / csh は `-l` を唯一の引数としてしか受け付けず、`$SHELL -l -c …` が毎回 `Unknown option: '-l'` で
+  落ちていた（探索・PATH の読み取り・CLI の子のすべて。修正前の砂場の check-health でログインシェルでだけ
+  通る PATH の claude も、プロセスの PATH の `/usr/bin/git` も見つからない）。csh / tcsh（名前か symlink の先の
+  名前）は argv[0] を `-<名>`（login(1) と同じログインシェルの印）にして `-c 'exec /bin/sh -c $argv[1]:q' <片>`
+  で起こす = 本物のログインと同じ順で `.login` を読み、POSIX の片は `/bin/sh` が走らせる。それ以外
+  （sh / bash / zsh / dash / ksh / fish ほか）は `-l -c` のまま。`child_cmd::ChildCmd` は argv[0] の欄を
+  持たないので、`ChildCmd::command` が args の並びから `exe::login_arg0` で当てる。`-l` と `-c` を並べた argv を
+  表と A/B の旧経路（`_legacy`）の外に書くと番犬
+  `crates/tako-control/tests/issue2577_csh_login_shell_watchdog.rs` が file:line で落とす（本物の tcsh の実経路も
+  同じファイル）。A/B `TAKO_2577_LEGACY=1`。対話のペインのシェル（`platform::shell`）はこの表を通さない（#1945）
 - **子プロセスでない相手を聞き直して待つときも同じ**（#1662）。`tako run --wait` は実行ペインの
   終わりを IPC で 2 秒ごとに聞き直す無限ループで、サーバーを走らせると永久に返らなかった。
   聞き直しは `tako_core::probe::poll_with_timeout` の 1 実装を通す（眠りは残り時間で頭打ち・
