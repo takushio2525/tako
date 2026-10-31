@@ -655,7 +655,7 @@
       "status": "pending",
       "note_ja": "remote デーモンの起動に unix 前提の処理（setsid / シグナルマスク）が残っており、Windows 実機での通し確認も未了（停止は #1599 で境界の終了要求と admin API の shutdown へ寄せた）",
       "evidence": "unit-test",
-      "evidence_detail": "実機の cargo test で remote::tests の 2 件（daemon_stop_impl / is_process_alive）が失敗。うち is_process_alive は「非 unix では常に false」という製品側の穴で #1557 で解消し、daemon_stop_impl が見ていた正体確認の素通りは #1616 で解消（どちらも実機の再測は未了）"
+      "evidence_detail": "実機の cargo test で remote::tests の 2 件（daemon_stop_impl / is_process_alive）が失敗。うち is_process_alive は「非 unix では常に false」という製品側の穴で #1557 で解消し、daemon_stop_impl が見ていた正体確認の素通りは #1616 で解消（どちらも実機の再測は未了）。トークン・QR などの秘密のファイルと置き場は、#1632 まで何もせず %APPDATA% の ACL の継承まかせだったが、境界 platform::private_file が継承を切った本人 + SYSTEM だけの DACL で作るようにした（unix の 0600 / 0700 に当たる）。CI の Windows ジョブが実ファイルの ACL を Win32 と icacls の 2 通りで読み戻し、旧アーム（TAKO_1632_LEGACY=1）では継承のままなことも同じ回で確かめている"
     },
     {
       "key": "tako_remote_status",
