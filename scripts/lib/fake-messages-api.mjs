@@ -16,6 +16,8 @@
 // #1964: 「Reply with code blocks」なら 2 つのコードブロック（157 字・改行なしの長いコマンドと Python）を
 // 含む Markdown、「Run this command: <cmd>」なら要求の tools にある Bash をその command で呼び、結果が
 // 来たら「RUN-DONE」と答える（チャット風の描画 = 吹き出し・コードのコピー・ツールの要約を実物で見る材料）。
+// #2578: 「Echo verbatim: <本文>」なら <本文> をそのまま答える（claude が長い URL / パスを自分で
+// 折り返して字下げする形を、実物の描画で作る材料。` | ` は改行に読み替える = 1 行の send で複数行を返す）。
 //
 // 使い方: node scripts/lib/fake-messages-api.mjs <port>   （127.0.0.1 だけで待つ）
 import http from 'node:http'
@@ -92,6 +94,7 @@ function answer(body) {
   const word = /Reply with exactly one word: ([A-Za-z0-9_-]+)/.exec(text)
   const lines = /Reply with (\d+) numbered lines/.exec(text)
   const count = lines ? Math.min(500, Math.max(1, Number(lines[1]))) : 0
+  const echo = /Echo verbatim: (.+)$/m.exec(text)
   const call = summarize || isToolResult(last?.content) ? null : (cardCall(body, text) ?? bashCall(body, text))
   const reply = summarize
     ? 'SUMMARY-1962: the conversation so far was a short check.'
@@ -99,6 +102,8 @@ function answer(body) {
       ? lastToolName(messages) === 'Bash'
         ? 'RUN-DONE'
         : 'CARD-DONE'
+      : echo
+        ? echo[1].trim().split(' | ').join('\n')
       : word
         ? word[1]
         : count > 0
