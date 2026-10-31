@@ -103,16 +103,13 @@ pub(crate) fn state_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp/tako-remote"))
 }
 
-/// state_dir を 0700 で確保する
+/// state_dir を本人だけが入れる形で確保する（unix は 0700・Windows は継承を切った本人 +
+/// SYSTEM の DACL を中へ受け継がせる。境界 `platform::private_file`。#1632）
 fn ensure_state_dir() -> io::Result<std::path::PathBuf> {
     let dir = state_dir();
     std::fs::create_dir_all(&dir)
         .map_err(|e| io::Error::other(format!("state ディレクトリの作成に失敗: {e}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
+    let _ = tako_core::platform::private_file::restrict_dir(&dir);
     Ok(dir)
 }
 
@@ -695,8 +692,10 @@ fn serve_watch_loop(
     }
 }
 
-/// 秘密を含むファイルを作成時から 0600 で書き込む。
-/// temp → atomic rename で symlink race を防ぐ。
+/// 秘密を含むファイルを作成時から本人だけが読み書きできる形（unix は 0600・Windows は継承を
+/// 切った本人 + SYSTEM の DACL。#1632）で書き込む。
+/// temp → atomic rename で symlink race を防ぐ（既に在るファイルは新しい temp ごと置き換わるので、
+/// 前の版が書いた緩い権限は残らない）。
 /// devices.json（remote_auth）も identity 情報を含むため同じ経路で書く
 pub(crate) fn write_state_file(path: &std::path::Path, content: &str) -> io::Result<()> {
     write_secret_file(path, content)
@@ -712,40 +711,21 @@ fn write_secret_file(path: &std::path::Path, content: &str) -> io::Result<()> {
         std::process::id()
     ));
     {
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(content.as_bytes())?;
-            f.sync_all()?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&tmp, content)?;
-        }
+        use std::io::Write;
+        // 中身を書く前に絞る（境界 `platform::private_file`。#1632）
+        let mut f = tako_core::platform::private_file::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
-/// ファイルを所有者のみ読み書き可（0o600）に制限する。unix 以外では何もしない。
+/// ファイルを本人だけが読み書きできる形（unix は 0o600・Windows は継承を切った本人 + SYSTEM の
+/// DACL。境界 `platform::private_file`。#1632）に絞る。
 /// トークン・QR（トークン入り URL を含む）など秘密を含むファイルに使う（#104）
 fn restrict_permissions(path: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
+    let _ = tako_core::platform::private_file::restrict(path);
 }
 
 /// 稼働中 daemon の痕跡（pid / トークン / 待ち受け / URL / 自己検査）を消す。
@@ -8909,6 +8889,9 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "パーミッションは 0600: {mode:o}");
         }
+        // 両 OS で本人だけ（Windows は継承を切った DACL。#1632）
+        let got = tako_core::platform::private_file::inspect(&path).expect("読み戻せる");
+        assert!(got.owner_only && !got.inherits, "{got:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8930,7 +8913,183 @@ mod tests {
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "ディレクトリパーミッションは 0700: {mode:o}");
         }
+        // 両 OS で本人だけ（Windows は継承を切った DACL。#1632）
+        let got = tako_core::platform::private_file::inspect(&dir).expect("読み戻せる");
+        assert!(got.owner_only && !got.inherits, "{got:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1632 の場面: 置き場（state_dir）とトークン・QR を、remote の実際の書き手で作って読み戻す。
+    ///
+    /// 置き場とトークンは**わざと誰でも読める形にしてから**始める（#1632 前の版が残した形 +
+    /// 明示の Everyone）。既に在る置き場・既に在るトークンを上書きしても緩さが残らないことまで見る。
+    /// 読み戻しは Win32（境界の [`tako_core::platform::private_file::inspect`]）と、Windows では
+    /// 別の口の icacls の 2 通り。どちらも CI のログへ `TAKO1632_<tag>` の行で残す（`--nocapture`）
+    fn issue1632_scenario(
+        tag: &str,
+    ) -> (
+        tako_core::test_residue::ScratchDir,
+        Vec<(
+            &'static str,
+            tako_core::platform::private_file::Inspection,
+            Vec<String>,
+        )>,
+    ) {
+        // env を書き換えるので、呼び手は `run_alone!` の子の中（#2400）
+        tako_core::test_child::assert_alone("issue1632_scenario");
+        // 使い捨ての置き場（呼び手のスコープで消える = #1312）
+        let held = tako_core::test_residue::ScratchDir::new(&format!("1632-{tag}"));
+        let dir = held.path().to_path_buf();
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        let token = token_path();
+        issue1632_loosen(&dir, true);
+        std::fs::write(&token, "old-token").unwrap();
+        issue1632_loosen(&token, false);
+
+        ensure_state_dir().expect("置き場を確保できる");
+        write_secret_file(&token, "new-token").expect("トークンを書ける");
+        let qr = generate_qr_png("https://example.invalid/#token=abc123").expect("QR を作れる");
+        // 境界を通らずに置き場へ作られるもの（監査ログ・shortcuts.json と同じ形）
+        let plain = dir.join("plain.txt");
+        std::fs::write(&plain, "x").unwrap();
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+        assert_eq!(std::fs::read_to_string(&token).unwrap(), "new-token");
+
+        let mut out = Vec::new();
+        for (label, path) in [
+            ("dir", &dir),
+            ("token", &token),
+            ("qr", &qr),
+            ("plain", &plain),
+        ] {
+            let got = tako_core::platform::private_file::inspect(path).expect("読み戻せる");
+            println!(
+                "TAKO1632_{tag} {label} owner_only={} inherits={} {}",
+                got.owner_only, got.inherits, got.detail
+            );
+            let aces = if cfg!(windows) {
+                issue1632_icacls(path)
+            } else {
+                Vec::new()
+            };
+            for ace in &aces {
+                println!("TAKO1632_{tag} {label} icacls {ace}");
+            }
+            out.push((label, got, aces));
+        }
+        (held, out)
+    }
+
+    /// 誰でも読める形へ緩める（#1632 前の版が残しうる形の再現）
+    fn issue1632_loosen(path: &std::path::Path, is_dir: bool) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = if is_dir { 0o755 } else { 0o644 };
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        if cfg!(windows) {
+            // Everyone（S-1-1-0）へ明示の読み取り。置き場は中へも受け継がせる
+            let grant = if is_dir {
+                "*S-1-1-0:(OI)(CI)(R)"
+            } else {
+                "*S-1-1-0:(R)"
+            };
+            let mut cmd = std::process::Command::new("icacls");
+            tako_core::platform::process::no_console_window(&mut cmd);
+            let out = cmd
+                .arg(path)
+                .args(["/grant", grant])
+                .output()
+                .expect("icacls を起こせる");
+            assert!(
+                out.status.success(),
+                "icacls /grant: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+
+    /// icacls が読んだ ACE の行（`:(` を含む行。1 行目はパスの後ろに最初の ACE が続く）
+    fn issue1632_icacls(path: &std::path::Path) -> Vec<String> {
+        let mut cmd = std::process::Command::new("icacls");
+        tako_core::platform::process::no_console_window(&mut cmd);
+        let out = cmd.arg(path).output().expect("icacls を起こせる");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let path_text = path.display().to_string();
+        text.lines()
+            .filter(|l| l.contains(":("))
+            .map(|l| l.replace(&path_text, "").trim().to_string())
+            .collect()
+    }
+
+    /// **#1632**: 置き場・トークン・QR が本人だけになり、継承が切れている（Windows は本人 + SYSTEM）。
+    /// unix は修正前と同じ mode（置き場 0700・トークンと QR 0600）
+    #[test]
+    fn issue1632_トークンとqrの置き場は本人だけが読める() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1632_トークンとqrの置き場は本人だけが読める)
+        {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_held, seen) = issue1632_scenario("FIX");
+        for (label, got, aces) in &seen {
+            if *label == "plain" {
+                // 境界を通らないものは、Windows では置き場の 2 者だけを受け継ぐ（unix は置き場の 0700 が守る）
+                if cfg!(windows) {
+                    assert!(got.owner_only && got.inherits, "{label}: {got:?}");
+                    assert_eq!(aces.len(), 2, "{label}: {aces:?}");
+                    assert!(aces.iter().all(|a| a.contains("(I)")), "{label}: {aces:?}");
+                }
+                continue;
+            }
+            assert!(got.owner_only, "{label} が本人だけになっていない: {got:?}");
+            assert!(!got.inherits, "{label} の継承が切れていない: {got:?}");
+            if cfg!(windows) {
+                // 別の口（icacls）でも 2 者だけ・受け継いだ ACE（`(I)`）が無い・SYSTEM が居る
+                assert_eq!(aces.len(), 2, "{label}: {aces:?}");
+                assert!(!aces.iter().any(|a| a.contains("(I)")), "{label}: {aces:?}");
+                assert!(
+                    aces.iter().any(|a| a.contains("SYSTEM")),
+                    "{label}: {aces:?}"
+                );
+            } else {
+                let want = if *label == "dir" { "0700" } else { "0600" };
+                assert_eq!(got.detail, want, "{label}");
+            }
+        }
+    }
+
+    /// **#1632 の旧アーム**（`TAKO_1632_LEGACY=1` = 修正前）: Windows は置き場もトークンも QR も
+    /// 継承のままで、緩めた Everyone が残る = 上の読み戻しが修正前と修正後を見分けられることの陰性対照。
+    /// unix は旧アームでも変わらない（修正前から 0700 / 0600）
+    #[test]
+    fn issue1632_旧アームでは置き場が継承のまま() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue1632_旧アームでは置き場が継承のまま) {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(tako_core::platform::private_file::ENV_LEGACY, "1");
+        let (_held, seen) = issue1632_scenario("LEGACY");
+        std::env::remove_var(tako_core::platform::private_file::ENV_LEGACY);
+        for (label, got, aces) in &seen {
+            if *label == "plain" {
+                continue;
+            }
+            if cfg!(windows) {
+                assert!(
+                    !got.owner_only,
+                    "{label} が旧アームで本人だけになっている: {got:?}"
+                );
+                assert!(got.inherits, "{label}: {got:?}");
+                assert!(aces.iter().any(|a| a.contains("(I)")), "{label}: {aces:?}");
+            } else {
+                let want = if *label == "dir" { "0700" } else { "0600" };
+                assert_eq!(got.detail, want, "{label}");
+            }
+        }
     }
 
     // --- P0-4 テスト ---

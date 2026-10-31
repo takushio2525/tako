@@ -562,6 +562,14 @@ jobs:
         run: cargo test -p tako-control --test issue2462_kill_paths_windows -- --nocapture
       - name: 子孫の回収の実行検査（#2462。AI 命名の打ち切りの孫）
         run: cargo test -p tako-app --bin tako-app -- autorename::tests::issue2462 --nocapture
+      # #1632: remote のトークン・QR の置き場の ACL（`SetNamedSecurityInfoW` で継承を切った本人 +
+      # SYSTEM の DACL）も **macOS では 1 行も実行できない** FFI。実ファイルの ACL を Win32 と icacls の
+      # 2 通りで読み戻し、旧アーム（`TAKO_1632_LEGACY=1`）では継承のままなことも同じ回で見る。
+      # 全数より手前に名指しで置く（#1282 と同じ理由）。--nocapture は読み戻した ACL の行（TAKO1632_*）をログへ残すため
+      - name: 本人だけの ACL の実行検査（#1632。境界 platform::private_file）
+        run: cargo test -p tako-core --lib platform::private_file -- --nocapture
+      - name: remote の秘密のファイルの ACL の実行検査（#1632。置き場・トークン・QR）
+        run: cargo test -p tako-control --lib -- remote::tests::issue1632 remote::tests::write_secret_file remote::tests::ensure_state_dir --nocapture
       # **ワークスペース全体のテストを blocking にする**（#1278 / #583）。
       # #583 は「POSIX 前提の既存失敗が残っているあいだ非ブロッキング」で据え置いていたが、
       # そのあいだに未検出が溜まり、実機で 19 → 24 件まで増えていた（#1278）。

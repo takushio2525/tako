@@ -4222,6 +4222,32 @@ Markdown / PDF のリンク注釈 / ポート検知の提案チップ）。OS �
 A/B は `TAKO_1038_LEGACY=1`（UDS 固定 + 自己疎通チェック無し = #1038 前）、
 502 の経路は `TAKO_1038_INJECT_UNREACHABLE=1` で決定的に踏める。
 
+### remote の秘密のファイルの置き場（境界 B32。#1632）
+
+管理トークン・QR（トークン入り URL）・pid / url / port・devices.json などは `<data_dir>/remote/`
+（`state_dir`）に置き、**本人だけが読める形**にする。書き手は `remote.rs` の 3 つ
+（`ensure_state_dir` / `write_secret_file` / `restrict_permissions`）で、OS の差は境界
+`tako_core::platform::private_file` の中に閉じる（`remote.rs` に `cfg` を書かない）。
+
+| | unix | Windows |
+|---|---|---|
+| 置き場 | 0700 | 継承を切った DACL（本人 + SYSTEM。OI / CI で中へ受け継がせる） |
+| ファイル | 0600 で作る / 0600 に絞る | 中身を書く前に、継承を切った DACL（本人 + SYSTEM） |
+
+- Windows は SDDL `D:P(A;;FA;;;<本人の SID>)(A;;FA;;;SY)` を `SetNamedSecurityInfoW`
+  （`PROTECTED_DACL_SECURITY_INFORMATION`）で当てる。DACL ごと置き換えるので、前の版が書いた
+  緩い ACE は残らない。置き場に付けると、境界を通らずに中へ作られるもの（監査ログ・shortcuts.json）も
+  同じ 2 者だけを受け継ぐ。SYSTEM を残すのは OS の保守（バックアップ・索引）を止めないため
+- **#1632 まで Windows は no-op**で、置き場も中身も `%APPDATA%\tako` の継承まかせだった
+  （data dir は Roaming = 移動プロファイル・フォルダのリダイレクトでサーバーの共有に置かれうる）
+- 当てられないとき（ACL を持たない FAT / exFAT・一部の共有）は呼び手を止めず修正前の継承へ落ちる
+  （unix の chmod の失敗と同じ扱い）。効いているかは `private_file::inspect` で読み戻せる
+- A/B は `TAKO_1632_LEGACY=1`（Windows は DACL に触らない）。CI の Windows ジョブが実ファイルの
+  ACL を Win32 と icacls で読み戻す（`remote::tests::issue1632_*`）。no-op へ戻す形は番犬
+  `crates/tako-control/tests/issue1632_private_file_watchdog.rs` が `file:line` で落とす
+- 同じ unix だけの絞り方が残っている所（直していない）: IPC の `control.json`（`discovery.rs`）・
+  `ipc.rs`・`usage.rs`・`remote_shortcuts.rs`・スマホから受け取ったファイル（`remote.rs` の受信）
+
 ### Tailscale 系統の同居（#1038）
 
 macOS では GUI 版（システム拡張）と standalone `tailscaled` が**同時に動きうる**。
