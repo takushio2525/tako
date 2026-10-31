@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use tako_core::handoff::{self as ho, HANDOFF_PROJECTS_DIR};
 
-use super::{config_dir, ProjectsConfig};
+use super::{config_dir, ConfigError, ProjectsConfig};
 
 /// `handoff/` ディレクトリ
 pub fn handoff_dir() -> Option<PathBuf> {
@@ -49,19 +49,31 @@ pub fn read_project_handoff(key: &str) -> Option<String> {
     read_non_empty(&path)
 }
 
-/// プロジェクト単位の引き継ぎを書く（ディレクトリ作成 + アトミック + 世代バックアップ）
+/// プロジェクト単位の引き継ぎを書く（ディレクトリ作成 + アトミック + 世代バックアップ）。
+///
+/// 断りの文は日本語（自動移行・GUI の書き戻しは persist.log へ載せる）。表示言語で返したい
+/// dispatch（CLI / MCP の `handoffs write`）は [`write_project_handoff_typed`] を通す（#2365）
 pub fn write_project_handoff(key: &str, content: &str) -> Result<PathBuf, String> {
+    write_project_handoff_typed(key, content).map_err(ConfigError::into_ja)
+}
+
+/// [`write_project_handoff`] の型の口
+pub fn write_project_handoff_typed(key: &str, content: &str) -> Result<PathBuf, ConfigError> {
     let path = project_handoff_path(key)
-        .ok_or_else(|| format!("プロジェクトキーがファイル名として使えない: {key}"))?;
-    write_file(&path, content)?;
+        .ok_or_else(|| ConfigError::HandoffKeyUnusable(key.to_string()))?;
+    write_file_typed(&path, content)?;
     Ok(path)
 }
 
 /// プロファイル運用メモを書く
 pub fn write_profile_memo(profile: &str, content: &str) -> Result<PathBuf, String> {
-    let path = super::handoff_path(profile)
-        .ok_or_else(|| "ホームディレクトリが取得できない".to_string())?;
-    write_file(&path, content)?;
+    write_profile_memo_typed(profile, content).map_err(ConfigError::into_ja)
+}
+
+/// [`write_profile_memo`] の型の口
+pub fn write_profile_memo_typed(profile: &str, content: &str) -> Result<PathBuf, ConfigError> {
+    let path = super::handoff_path(profile).ok_or(ConfigError::HomeUnresolved)?;
+    write_file_typed(&path, content)?;
     Ok(path)
 }
 
@@ -115,12 +127,16 @@ fn read_non_empty(path: &Path) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-fn write_file(path: &Path, content: &str) -> Result<(), String> {
+fn write_file_typed(path: &Path, content: &str) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("引き継ぎの置き場を作れない: {} ({e})", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| ConfigError::HandoffDirCreate {
+            dir: parent.display().to_string(),
+            error: e.to_string(),
+        })?;
     }
-    crate::config_io::atomic_write_with_backup(path, content)
+    Ok(crate::config_io::atomic_write_with_backup_typed(
+        path, content,
+    )?)
 }
 
 // --- 自動移行 ---------------------------------------------------------------

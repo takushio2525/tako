@@ -462,6 +462,26 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   呼び出し `GIT_TYPED_HEADS` / `JA_GIT_INNER_CALLS`・dispatch の git の口 `JA_GIT_CALLS`・`op_err` へ渡す日本語の
   固定文・Web ビューの口の `Lang::Ja`）、実経路は `tests/issue2365_op_err_lang.rs`（一時のリポジトリで CLI / MCP と
   同じ background の本体 `OffloadJob::GitWrite` を日英で走らせる。`LANG=C` で git の stderr を英語に固定）
+- #2365 の続きで、**orchestrator の委任台帳・引き継ぎファイルの書き込み・supervisor の set_mode・後任 master の起動
+  コマンド**の断りを `ConfigError` へ寄せた（`ConfigFile::Ledger` と 4 種 = `LedgerEntryNotFound` /
+  `LedgerOutcomeInvalid` / `HandoffKeyUnusable` / `HandoffDirCreate`。型の口は `Ledger::load_typed` / `mutate_typed`・
+  `record_outcome_typed` / `amend_entry_typed`・`write_project_handoff_typed` / `write_profile_memo_typed`・
+  `Profile::mutate_named_typed`・`build_master_cmd_typed` / `build_master_cmd_in_typed`）。**`String` を返す従来の口は
+  日本語のまま**（spawn の自動記録・実際のモデルの書き込み・引き継ぎの自動移行 = stderr / persist.log）で、dispatch と
+  CLI の `tako orchestrator ledger`（手元の処理。`gate_cli` と同じく `init_local_lang()` で出口の枠 `error:` と言語を
+  そろえる）だけが型の口を通る。spawn の自動記録の `task_type` の検証（`validate_task_type`）は stderr の警告にしか
+  出ないので対象外。非同期 run の照会・回収の「run_id が見つからない」・dispatch の「非同期 run の開始は受け口が処理
+  する」・手順書の「未知の topic」は `Reason` の 3 種（`wait.rs` / `guide.rs` は `String` の口のまま文を表示言語で
+  引く = 呼び手は dispatch と、表示言語を設定から読んでから呼ぶ CLI の手元の処理だけ）。手順書の `warnings`
+  （読めないプロファイルを既定で組んだ注記）は `Ok` の値なので対象外。tako-core の設定値の範囲（`preview_cache_bytes` /
+  `scrollback::validate_lines` / `redraw_limit::validate_fps`）は `setting_range::RangeRefusal`、paste-guard の
+  許可リストと規則（`Policy::allow_text` / `unallow` / `set_rule`）は `paste_guard::PolicyRefusal`（`TaskRefusal` と
+  同じく `Result<_, String>` のまま `Display` が表示言語。呼び手は dispatch と、文を捨てて既定へ倒す GUI の起動時の
+  読み込みだけ）。置き場（gates / checkpoints / user_tasks）は #2497 で日英済みだった（dispatch の直渡しのままでも
+  中身が `Reason` / `TaskRefusal` の `Display`）。番犬は同じ `issue1762_dispatch_error_lang.rs`（`ConfigError` / `Reason`
+  の表・`CONFIG_REFUSAL_SCOPES` / `CONFIG_DISPATCH_SCOPES` / `JA_CONFIG_CALLS` を広げ、落ちたときは日英の対の行を
+  `file:line` で添える・末尾の節 = `RangeRefusal` / `PolicyRefusal` の表と `RUN_VALUE_SCOPES`・CLI の `ledger_cli`）、
+  実経路は `tests/issue2365_ledger_values_lang.rs`（GUI 無しのホストへ MCP と同じ dispatch を日英で通す 20 ケース）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

@@ -48,12 +48,11 @@ impl Default for ScrollbackStatus {
 }
 
 /// 明示指定（CLI / MCP / 設定画面）の検証。範囲外は**黙って丸めず**理由を返す。
-/// ユーザーが打った値と実際に効く値がずれたまま進むほうが分かりにくい
+/// ユーザーが打った値と実際に効く値がずれたまま進むほうが分かりにくい。
+/// 断りの文は表示言語（`setting_range::RangeRefusal`。#2365）
 pub fn validate_lines(lines: usize) -> Result<usize, String> {
     if !(MIN_LINES..=MAX_LINES).contains(&lines) {
-        return Err(format!(
-            "lines は {MIN_LINES}〜{MAX_LINES} の範囲で指定する（既定 {DEFAULT_LINES}）"
-        ));
+        return Err(crate::setting_range::RangeRefusal::ScrollbackLines.to_string());
     }
     Ok(lines)
 }

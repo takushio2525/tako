@@ -1006,6 +1006,16 @@ pub enum Reason {
         pid: u32,
         error: String,
     },
+    // ---- #2365 の続き: orchestrator の非同期 run・手順書の断り ----
+    /// `run_id '<id>' が見つからない`
+    RunIdNotFound(String),
+    /// `非同期 run の開始は受け口（IPC / MCP）が処理する要求で、dispatch では実行できない`
+    RunStartOutsideReceiver,
+    /// `未知の topic: <got>（引けるのは <topics>）`。`topics` は topic 名を ` / ` で並べたもの（ASCII）
+    GuideTopicUnknown {
+        got: String,
+        topics: String,
+    },
 }
 
 /// ペイン ID の並び（`3, 5`）。複数ペインに当たった断りに添える
@@ -2809,6 +2819,24 @@ impl Reason {
                 "could not stop the agent process (pid {pid}), so the session is not \
                  rebuilt: {error}"
             ),
+            (Self::RunIdNotFound(id), Ja) => format!("run_id '{id}' が見つからない"),
+            // ` not found` を含める（`DispatchError::says_not_found` の当たり方を日英でそろえる）
+            (Self::RunIdNotFound(id), En) => format!("run_id '{id}' not found"),
+            (Self::RunStartOutsideReceiver, Ja) => {
+                "非同期 run の開始は受け口（IPC / MCP）が処理する要求で、dispatch では実行できない"
+                    .to_string()
+            }
+            (Self::RunStartOutsideReceiver, En) => {
+                "starting an asynchronous run is handled by the receiver (IPC / MCP), \
+                 not by dispatch"
+                    .to_string()
+            }
+            (Self::GuideTopicUnknown { got, topics }, Ja) => {
+                format!("未知の topic: {got}（引けるのは {topics}）")
+            }
+            (Self::GuideTopicUnknown { got, topics }, En) => {
+                format!("unknown topic: {got} (available: {topics})")
+            }
         }
     }
 
@@ -11355,10 +11383,7 @@ fn dispatch_inner(
         // 非同期 run の開始（#1745）は受け口（`ipc::submit`）が spawn と完了待ちに分けて
         // 頼むので、ここへは来ない。UI スレッドの上では spawn の完了を待てないため、
         // 直に届いたら黙って固まらずに断る
-        Request::OrchestratorRunStart { .. } => Err(DispatchError::Operation(
-            "非同期 run の開始は受け口（IPC / MCP）が処理する要求で、dispatch では実行できない"
-                .into(),
-        )),
+        Request::OrchestratorRunStart { .. } => Err(Reason::RunStartOutsideReceiver.operation()),
 
         // 非同期 run の進捗照会・結果回収（#121）。レジストリはプロセス内グローバルで
         // ControlHost 不要のため dispatch で直接呼ぶ
@@ -17969,8 +17994,8 @@ pub fn dispatch_orchestrator_handoff_files(
             };
             match (project, profile) {
                 (Some(key), None) => {
-                    let path = store::write_project_handoff(key, &text)
-                        .map_err(DispatchError::Operation)?;
+                    let path = store::write_project_handoff_typed(key, &text)
+                        .map_err(ConfigError::operation)?;
                     Ok(json!({
                         "project": key,
                         "path": path.display().to_string(),
@@ -17979,8 +18004,8 @@ pub fn dispatch_orchestrator_handoff_files(
                     }))
                 }
                 (None, Some(name)) => {
-                    let path =
-                        store::write_profile_memo(name, &text).map_err(DispatchError::Operation)?;
+                    let path = store::write_profile_memo_typed(name, &text)
+                        .map_err(ConfigError::operation)?;
                     Ok(json!({
                         "profile": name,
                         "path": path.display().to_string(),
@@ -18232,8 +18257,9 @@ fn dispatch_orchestrator_handoff(
         .map_err(|e| Reason::SystemPromptWriteFailed(e.to_string()).operation())?;
     let tako_bin = tako_binary();
     // ペインを分割する**前**に組み立てる（失敗したときに空ペインだけ残さない）
-    let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)
-        .map_err(DispatchError::Operation)?;
+    let master_cmd =
+        orchestrator::build_master_cmd_typed(&role_env, &profile, &prompt_path, &tako_bin)
+            .map_err(ConfigError::operation)?;
 
     // #1055: 起動フォルダは **プロファイルの cwd → 前任 master の cwd → ホーム** の順。
     // 以前はホーム決め打ちで、プロファイルの `cwd` すら読んでいなかった。master の動作環境は
@@ -27670,7 +27696,7 @@ fn dispatch_orchestrator_supervisor(
             let sv_mode = mode
                 .and_then(supervisor::SupervisorMode::parse_mode)
                 .ok_or_else(|| Reason::SupervisorModeValue.operation())?;
-            crate::orchestrator::Profile::mutate_named("default", |p| {
+            crate::orchestrator::Profile::mutate_named_typed("default", |p| {
                 p.supervisor_mode = Some(sv_mode);
                 if let Some(ard) = auto_resume_dead {
                     p.auto_resume_dead = Some(ard);
@@ -27679,7 +27705,7 @@ fn dispatch_orchestrator_supervisor(
                     p.supervisor_max_retries = Some(mr);
                 }
             })
-            .map_err(DispatchError::Operation)?;
+            .map_err(ConfigError::operation)?;
             Ok(json!({
                 "mode": sv_mode.as_str(),
                 "auto_resume_dead": auto_resume_dead.unwrap_or(false),
@@ -27710,7 +27736,7 @@ fn dispatch_orchestrator_ledger(p: LedgerParams) -> Result<Value, DispatchError>
     use crate::orchestrator::ledger;
     match action.as_str() {
         "list" => {
-            let ledger = ledger::Ledger::load().map_err(DispatchError::Operation)?;
+            let ledger = ledger::Ledger::load_typed().map_err(ConfigError::operation)?;
             let mut entries: Vec<&ledger::LedgerEntry> = ledger.entries.iter().collect();
             if let Some(ref p) = project {
                 entries.retain(|e| e.project == *p);
@@ -27729,7 +27755,7 @@ fn dispatch_orchestrator_ledger(p: LedgerParams) -> Result<Value, DispatchError>
             }))
         }
         "stats" => {
-            let ledger = ledger::Ledger::load().map_err(DispatchError::Operation)?;
+            let ledger = ledger::Ledger::load_typed().map_err(ConfigError::operation)?;
             let stats = ledger.stats();
             Ok(json!({
                 "stats": stats,
@@ -27740,20 +27766,20 @@ fn dispatch_orchestrator_ledger(p: LedgerParams) -> Result<Value, DispatchError>
         "record" => {
             let id = id.ok_or_else(|| Reason::Required("id".into()).invalid())?;
             let outcome = outcome.ok_or_else(|| Reason::Required("outcome".into()).invalid())?;
-            ledger::record_outcome(&id, &outcome, rounds, note.as_deref())
-                .map_err(DispatchError::Operation)?;
+            ledger::record_outcome_typed(&id, &outcome, rounds, note.as_deref())
+                .map_err(ConfigError::operation)?;
             Ok(json!({"ok": true, "id": id, "outcome": outcome}))
         }
         "amend" => {
             let id = id.ok_or_else(|| Reason::Required("id".into()).invalid())?;
             let note = note.ok_or_else(|| Reason::Required("note".into()).invalid())?;
-            ledger::amend_entry(&id, &note).map_err(DispatchError::Operation)?;
+            ledger::amend_entry_typed(&id, &note).map_err(ConfigError::operation)?;
             Ok(json!({"ok": true, "id": id, "post_issue": true}))
         }
         "prune" => {
             let prefix = project.ok_or_else(|| Reason::LedgerPruneNeedsProject.invalid())?;
-            let removed = ledger::Ledger::mutate(|l| l.prune_by_project_prefix(&prefix))
-                .map_err(DispatchError::Operation)?;
+            let removed = ledger::Ledger::mutate_typed(|l| l.prune_by_project_prefix(&prefix))
+                .map_err(ConfigError::operation)?;
             Ok(json!({"ok": true, "prefix": prefix, "removed": removed}))
         }
         _ => Err(Reason::LedgerAction(action.to_string()).invalid()),

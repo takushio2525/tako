@@ -1727,8 +1727,16 @@ impl Profile {
         name: &str,
         f: impl FnOnce(&mut Self) -> R,
     ) -> Result<(PathBuf, R), String> {
-        let path = profile_path(name).map_err(ConfigError::into_ja)?;
-        mutate_profile_at(&path, f).map_err(ConfigError::into_ja)
+        Self::mutate_named_typed(name, f).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::mutate_named`] の型の口（`supervisor set_mode` の dispatch が使う。#2365）
+    pub fn mutate_named_typed<R>(
+        name: &str,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<(PathBuf, R), ConfigError> {
+        let path = profile_path(name)?;
+        mutate_profile_at(&path, f)
     }
 
     /// パス指定版 load。不在なら default、パース失敗は Err（テスト用に公開）
@@ -2446,7 +2454,17 @@ pub fn build_master_cmd(
     prompt_path: &Path,
     tako_bin: &str,
 ) -> Result<String, String> {
-    build_master_cmd_in(
+    build_master_cmd_typed(role_env, profile, prompt_path, tako_bin).map_err(ConfigError::into_ja)
+}
+
+/// [`build_master_cmd`] の型の口（引き継ぎの後任を立てる dispatch が使う。#2365）
+pub fn build_master_cmd_typed(
+    role_env: &str,
+    profile: &Profile,
+    prompt_path: &Path,
+    tako_bin: &str,
+) -> Result<String, ConfigError> {
+    build_master_cmd_in_typed(
         role_env,
         profile,
         prompt_path,
@@ -2463,13 +2481,25 @@ pub fn build_master_cmd_in(
     tako_bin: &str,
     dialect: crate::launch_cmd::ShellDialect,
 ) -> Result<String, String> {
+    build_master_cmd_in_typed(role_env, profile, prompt_path, tako_bin, dialect)
+        .map_err(ConfigError::into_ja)
+}
+
+/// [`build_master_cmd_in`] の型の口
+pub fn build_master_cmd_in_typed(
+    role_env: &str,
+    profile: &Profile,
+    prompt_path: &Path,
+    tako_bin: &str,
+    dialect: crate::launch_cmd::ShellDialect,
+) -> Result<String, ConfigError> {
     // env 検証（内部変数の上書きを拒否。Issue #500）
-    profile.validate_env()?;
+    profile.validate_env_typed()?;
     // env 計画をコマンド先頭で注入する。direnv より後勝ちで上書き / 解除する。
     // master_account があれば worker と同じ規則でアカウントの config dir を反映する
     // （未登録アカウントはここで Err = 起動前に落ちる。Issue #547）
-    let plan = profile.resolved_env_plan_for_master()?;
-    build_master_cmd_with_plan_in(role_env, profile, &plan, prompt_path, tako_bin, dialect)
+    let plan = profile.resolved_env_plan_for_master_typed()?;
+    build_master_cmd_with_plan_in_typed(role_env, profile, &plan, prompt_path, tako_bin, dialect)
 }
 
 /// env 計画を呼び出し側が決めて組み立てる（#1967）。
