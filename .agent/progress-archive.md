@@ -4,7 +4,6 @@
 
 ---
 
-- 2026-08-01 #721: プロファイル（master / solo）の GUI 編集
 - 2026-08-02 #725: チャットビューのテキスト選択・コピー
 - 2026-08-02 #738: 設定画面プロファイルタブの描画崩壊を根治
 - 2026-08-02 #737: チャット入力欄の重なり描画 + IME 位置ズレ + 追加要件 3〜5
@@ -705,3 +704,12 @@
 - 2026-10-30 #1614: cargo test 中の bash の syntax error は shell_dialect の意図的な負の対照（`bash -n`）だった → stderr を取り込んで `syntax error` を assert
 - 2026-10-30 #1622: 環境診断の外部の問い合わせ（`claude mcp list` ほか）を導入状況と重ね、check-health 9.7〜12.0 → 5.8〜6.4 秒・setup --check 9.0〜9.9 → 5.4〜5.9 秒。出力は sha256 まで一致
 - 2026-10-30 #1593: CHANGELOG の `## [Unreleased]` 5 つを最上段の 1 つへ（埋もれた 42 項目は出荷版の節へ・0.7.9 の 8 項目は消費済み）・夜間の挿入を `scripts/lib/changelog.sh` へ（A/B `TAKO_1593_LEGACY=…
+- 2026-10-30 #2365 の続き: dispatch の個別の断り（選択肢ダイアログへの応答・orchestrator・設定の保存・Web・メニュー・値の検証）82 か所を `Reason` へ（182 → 244 種）。CLI の handoffs / shortcuts の直呼びに表示言語の初期化
+- 2026-10-30 #1716: tako-cli のテストのビルドは `caller_pane` を env を読まない `test_caller` へ向け、`--pane` 省略の偽の緑を塞ぐ・迂回と結合テストの env の外し忘れは番犬 `issue1716_caller_pane_env_watchdo…
+- 2026-10-30 #2509: issue1944_lsp_fetch の取ってきた 4 件が全体実行でだけ `starting` で落ちる = ログインシェルの rc の `pyenv rehash` がロック待ちで stdout を握り、10 秒の kill 後も EOF が来ない → `FetchCon…
+- 2026-10-30 #1715: context-budget の起動前 1 行を予算超過と作業ログの復活・重複で言い分ける・応答の `startup_line` を CLI / MCP / master の 1 実装に
+- 2026-10-30 #2365 の続き: dispatch 本体に残っていた断り 59 種（LSP・検索・変更履歴・リモートフォルダ・カード・Code Runner・ファイルツリー・supervisor・ledger・セッション再起動ほか）を `Reason` へ・番犬の本体の範囲が途中の `#[cfg(tes…
+- 2026-10-30 #2513: install 後の `.tako-replace-<pid>` の ASP 拒否 22 本 / 31 秒の真因は「GUI 配下の tako CLI」ではなく、install をまたいだ remote daemon の serve 監視が `tailscale` を素の名前で起…
+- 2026-10-30 #2514: issue1977 / issue1956 の e2e も取得つきの manager を helper 1 か所で作り `plain_shell = /bin/sh`・本番の既定の上限を渡す。番犬が helper の外の `with_fetch` も名指す
+- 2026-10-30 #2365 の続き: dispatch が素通ししていた orchestrator の設定ファイル（projects / accounts / profiles）とエージェント名の検証の断りを `ConfigError`（32 種）へ・型の口 `*_typed`
+- 2026-10-30 #2519: GUI が周期的に起こす git / tmux（bin_resolve の PATH の段）・codex / agy の lsof・sudo / pmset を PATH で引いた絶対パスで起こす・`exe::resolve_for_spawn` / `bin_resolve:…
