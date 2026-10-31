@@ -142,10 +142,34 @@ impl ShellKind {
             (Self::PowerShell, None) => crate::shell_integration::powershell_ascii_literal(
                 &dir.to_string_lossy().replace('/', "\\"),
             ),
-            (_, Some(rel)) => format!("$HOME/{}", rel.to_string_lossy().replace('\\', "/")),
-            (_, None) => dir.to_string_lossy().replace('\\', "/"),
+            (_, _) => home_relative_expr(dir, home),
         }
     }
+}
+
+/// `dir` を指す `$HOME` 相対の式（home 配下でなければ絶対パス。区切りは `/`）。
+/// sh 系と fish の [`ShellKind::dir_expr`] と、種別の分からないシェルへの案内
+/// （[`dirs_for_unknown_shell`]）が同じ 1 本を通る
+fn home_relative_expr(dir: &Path, home: &Path) -> String {
+    match dir.strip_prefix(home) {
+        Ok(rel) => format!("$HOME/{}", rel.to_string_lossy().replace('\\', "/")),
+        Err(_) => dir.to_string_lossy().replace('\\', "/"),
+    }
+}
+
+/// 種別の分からないシェル（nu・tcsh 等）の利用者へ示す「PATH へ足すディレクトリ」の並び（#2557）。
+///
+/// 書く行と同じ `$HOME/…` の式で組み、順序を保って重複を落とす（macOS は tako CLI と
+/// 3 系統のランチャーがみな `~/.local/bin` = 1 個になる）。**そのシェルの構文は推測しない**:
+/// 行の形（`export` / `setenv` / `$env.PATH`）を決めるのは利用者で、ここはディレクトリだけを返す。
+/// #2557 より前は `~` 短縮の表示を sh の `export PATH="…"` に包み、重複も並べていた
+/// （sh / bash / zsh は二重引用符の中の `~` を展開しない = 文字どおりの `~/.local/bin` が PATH に入る。
+/// tcsh は展開するが、`export` が無いので行ごと通らない。2026-10-31 実測）
+pub fn dirs_for_unknown_shell(home: &Path, dirs: &[PathBuf]) -> Vec<String> {
+    dedup(dirs)
+        .iter()
+        .map(|d| home_relative_expr(d, home))
+        .collect()
 }
 
 /// PATH 文字列に `dir` が含まれるか（区切りは OS 依存）
@@ -619,6 +643,53 @@ mod tests {
     fn home配下でないディレクトリは絶対パスで書く() {
         let expr = ShellKind::Zsh.dir_expr(Path::new("/opt/tools/bin"), Path::new("/home/u"));
         assert_eq!(expr, "/opt/tools/bin");
+    }
+
+    /// #2557: 種別の分からないシェルへの案内は、書く行と同じ `$HOME/…` の式で・重複なしで・
+    /// ディレクトリだけ（sh の `export` などの構文を推測して包まない）
+    #[test]
+    fn 未知のシェルへの案内は書く行と同じ式で重複なしのディレクトリだけ() {
+        let home = Path::new("/home/u");
+        let local = home.join(".local/bin");
+        // macOS の形: tako CLI と 3 系統のランチャーがみな同じ置き場所 = 1 個
+        assert_eq!(
+            dirs_for_unknown_shell(
+                home,
+                &[local.clone(), local.clone(), local.clone(), local.clone()]
+            ),
+            vec!["$HOME/.local/bin".to_string()]
+        );
+        // 順序を保って重複だけ落とす。home 配下でなければ絶対パス
+        let opt = PathBuf::from("/opt/tako/bin");
+        let got = dirs_for_unknown_shell(home, &[opt.clone(), local.clone(), opt.clone()]);
+        assert_eq!(
+            got,
+            vec!["/opt/tako/bin".to_string(), "$HOME/.local/bin".to_string()]
+        );
+        // 書く行（sh 系・fish）の式と同じ
+        for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+            assert_eq!(got[1], kind.dir_expr(&local, home), "{kind:?}");
+            assert_eq!(got[0], kind.dir_expr(&opt, home), "{kind:?}");
+        }
+        for d in &got {
+            assert!(
+                !d.contains('~') && !d.contains('"') && !d.contains("PATH"),
+                "{d}"
+            );
+        }
+        // Windows の区切りでも `/` の式になる（文の表は cfg の外）
+        let win_home = Path::new(r"C:\Users\winuser");
+        let win_dir = PathBuf::from(r"C:\Users\winuser\.local\bin");
+        assert_eq!(
+            dirs_for_unknown_shell(win_home, &[win_dir]),
+            if cfg!(windows) {
+                vec!["$HOME/.local/bin".to_string()]
+            } else {
+                // unix の Path は `\` を区切りと見ないので home 配下と判定されない
+                vec!["C:/Users/winuser/.local/bin".to_string()]
+            }
+        );
+        assert!(dirs_for_unknown_shell(home, &[]).is_empty());
     }
 
     #[test]

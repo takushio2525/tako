@@ -9,9 +9,9 @@
 //! 見るもの（GUI の代わりのホストへ CLI / MCP と同じ dispatch を日英で通す。CLI の `tako setup bootstrap` が
 //! 呼ぶ日本語の口 `ensure_path_for` / `undo_path_for` も同じ答えか）:
 //!
-//! - 未知のシェル: path は追記する行つきの断り、undo-path は断り、どちらもホームのファイルを 1 つも
-//!   書き換えない（tako CLI の symlink だけは PATH より先に張る = #1502 の順のまま）。status の
-//!   `shell` / `profile` は null
+//! - 未知のシェル: path は足すディレクトリ（`$HOME/…`・重複なし・構文は包まない = #2557）つきの断り、
+//!   undo-path は断り、どちらもホームのファイルを 1 つも書き換えない（tako CLI の symlink だけは
+//!   PATH より先に張る = #1502 の順のまま）。status の `shell` / `profile` は null
 //! - `SHELL` が空・未設定: 従来どおり `~/.zprofile`。zsh / bash / sh / fish（存在しないパスの zsh を含む）:
 //!   従来どおりのファイル
 //!
@@ -77,6 +77,74 @@ const FAKE_SHELL: &str = "#!/bin/sh\n# #2550 の偽のログインシェル: 何
 
 /// tako が profile へ置くブロックの 1 行目（`shell_profile` の目印）
 const BLOCK_BEGIN: &str = "# >>> tako PATH >>>";
+
+/// 未知のシェルへの path の断りが示す「足すディレクトリ」の誤り（#2557）。
+///
+/// 案内は字下げ 2 の行に 1 個ずつ。`$HOME/…` の式（書く行と同じ = `shell_profile::dirs_for_unknown_shell`）で
+/// 重複なし・そのシェルの構文を推測して包まない。修正前は `  export PATH="~/.local/bin:$PATH"` が
+/// ランチャーの数だけ並んだ（sh 系は二重引用符の中の `~` を展開しない・tcsh / nu では sh の構文が通らない）。
+/// 組み立ての場所は [`hint_sources`] が失敗の文へ file:line で載せる
+fn hint_problems(text: &str) -> Vec<String> {
+    let dirs: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("  "))
+        .collect();
+    let mut problems = Vec::new();
+    if dirs.is_empty() {
+        problems.push("足すディレクトリが 1 つも載っていない".to_string());
+    }
+    for (i, dir) in dirs.iter().enumerate() {
+        if dirs[..i].contains(dir) {
+            problems.push(format!("同じディレクトリが重ねて並ぶ: {dir}"));
+        }
+        if dir.contains('~') {
+            problems.push(format!("`~` 短縮の表示（書く行は `$HOME/…`）: {dir}"));
+        }
+        for syntax in ["export", "setenv", "$env", "PATH", "\"", "'", "=", ";"] {
+            if dir.contains(syntax) {
+                problems.push(format!(
+                    "シェルの構文（{syntax}）を推測して包んでいる: {dir}"
+                ));
+            }
+        }
+        if !dir.starts_with("$HOME/") && !dir.starts_with('/') {
+            problems.push(format!("`$HOME/…` の式でも絶対パスでもない: {dir}"));
+        }
+    }
+    if !dirs.contains(&"$HOME/.local/bin") {
+        problems.push("ランチャーの置き場所（$HOME/.local/bin）が載っていない".to_string());
+    }
+    problems
+}
+
+/// 未知のシェルへの案内を組む 3 か所（失敗の文に file:line で載せる = どこを戻したかを名指す。#2557）
+fn hint_sources() -> String {
+    let at = |path: &str, src: &str, needle: &str| match src
+        .lines()
+        .position(|line| line.contains(needle))
+    {
+        Some(i) => format!("{path}:{}", i + 1),
+        None => format!("{path}（{needle} が見つからない）"),
+    };
+    format!(
+        "並び = {} → {}、文 = {}",
+        at(
+            "crates/tako-control/src/setup_bootstrap.rs",
+            include_str!("../src/setup_bootstrap.rs"),
+            "SetupRefusal::ShellProfileUnknown {",
+        ),
+        at(
+            "crates/tako-core/src/shell_profile.rs",
+            include_str!("../../tako-core/src/shell_profile.rs"),
+            "pub fn dirs_for_unknown_shell(",
+        ),
+        at(
+            "crates/tako-control/src/setup_refusal.rs",
+            include_str!("../src/setup_refusal.rs"),
+            "fn dir_lines(",
+        ),
+    )
+}
 
 fn has_japanese(s: &str) -> Option<char> {
     s.chars()
@@ -239,10 +307,13 @@ fn 種別の分からないシェルはzshと見なさずprofileへ書かずに�
                     "[{lang:?}] {label} の {action}: 既存の断りではない\n  want: {want_head}…\n  got:  {text}"
                 ));
             }
-            if *action == "path" && !text.contains("export PATH=\"") {
-                failures.push(format!(
-                    "[{lang:?}] {label} の path: 追記する行が載っていない: {text}"
-                ));
+            if *action == "path" {
+                for problem in hint_problems(text) {
+                    failures.push(format!(
+                        "[{lang:?}] {label} の path: 足すディレクトリの案内が誤り（#2557。{}）: {problem}\n  got: {text}",
+                        hint_sources()
+                    ));
+                }
             }
             if *lang == Lang::En {
                 if let Some(ch) = has_japanese(text) {
