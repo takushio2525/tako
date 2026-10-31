@@ -770,6 +770,20 @@ pub fn path_by_hand_refusal() -> Option<SetupRefusal> {
     if !path_by_hand_for(shell_target().0, user_path::is_supported()) {
         return None;
     }
+    unknown_shell_refusal_here()
+}
+
+/// [`path_by_hand`] がこの導入状況で当たるなら、[`path_by_hand_refusal`] と同じ断り。
+/// 初回起動の導線の「次にやること」が PATH の段で引く（#2576）
+pub fn path_by_hand_refusal_for(state: &BootstrapState) -> Option<SetupRefusal> {
+    if !path_by_hand(state) {
+        return None;
+    }
+    unknown_shell_refusal_here()
+}
+
+/// いまのホームで `tako setup bootstrap path` が足すディレクトリを並べた、種別の分からないシェルの断り
+fn unknown_shell_refusal_here() -> Option<SetupRefusal> {
     let home = home_dir().ok()?;
     let dirs = desired_path_dirs(&home, tako_cli_placement(&home).as_ref());
     Some(unknown_shell_refusal(&home, &dirs))
@@ -1559,20 +1573,8 @@ pub fn tako_cli_path_check_line() -> String {
     };
     // 種別の分からないシェルで置き場所が PATH に無い（#2564）: `tako setup bootstrap path` は
     // PATH の段で同じ断りに止まるので誘導せず、足すディレクトリを示す
-    // （PATH に在ってリンクだけ無い / 切れているなら bootstrap path は通る = 従来の案内のまま）
-    if !state["dir_on_path"].as_bool().unwrap_or(false)
-        && path_by_hand_for(shell_target().0, user_path::is_supported())
-    {
-        let hint = match home_dir() {
-            Ok(home) => shell_profile::dirs_for_unknown_shell(
-                &home,
-                &[PathBuf::from(state["dir"].as_str().unwrap_or_default())],
-            )
-            .into_iter()
-            .next(),
-            Err(_) => None,
-        }
-        .unwrap_or_else(|| dir.to_string());
+    // （判定は check-health の `cli_in_path` と同じ 1 実装 = #2576）
+    if let Some(hint) = tako_cli_dir_by_hand(&state) {
         // この行は check-health と `--check` が同じ文を出す診断の正本（#1505）。2 つは表示言語の
         // 決め方が違うので、1 行目（日本語）と同じく言語を固定して組む（表示言語で組むと食い違う）
         return format!(
@@ -1584,6 +1586,89 @@ pub fn tako_cli_path_check_line() -> String {
         "  [不足] tako CLI の PATH: 外部ターミナルからは使えません（{reason}）\n\
          \x20        tako setup bootstrap path で設置できます"
     )
+}
+
+/// tako CLI の置き場所を、利用者が自分のシェルの設定ファイルで PATH へ足すしかないなら、その置き場所
+/// （`$HOME/…` の式）。`state` は [`tako_cli_path_json`]。`tako setup --check` の行と check-health の
+/// `cli_in_path` が同じ判定を通る（#2564 / #2576）
+pub fn tako_cli_dir_by_hand(state: &Value) -> Option<String> {
+    tako_cli_dir_by_hand_for(
+        state,
+        path_by_hand_for(shell_target().0, user_path::is_supported()),
+        home_dir().ok().as_deref(),
+    )
+}
+
+/// [`tako_cli_dir_by_hand`] の判断（**純粋関数**。`by_hand` = [`path_by_hand_for`] の答え）。
+///
+/// 置き場所が PATH に在る（リンクだけ無い / 切れている）なら `tako setup bootstrap path` は通るので None
+/// （従来の案内のまま）。ホームを解決できなければ表示用のパスで示す
+pub fn tako_cli_dir_by_hand_for(
+    state: &Value,
+    by_hand: bool,
+    home: Option<&Path>,
+) -> Option<String> {
+    if !by_hand
+        || !state["resolved"].as_bool().unwrap_or(false)
+        || state["dir_on_path"].as_bool().unwrap_or(false)
+    {
+        return None;
+    }
+    home.and_then(|home| {
+        shell_profile::dirs_for_unknown_shell(
+            home,
+            &[PathBuf::from(state["dir"].as_str().unwrap_or_default())],
+        )
+        .into_iter()
+        .next()
+    })
+    .or_else(|| Some(state["dir_display"].as_str().unwrap_or("?").to_string()))
+}
+
+/// check-health の `cli_in_path`（tako CLI が外部ターミナルの PATH に見つからない）の (level, 文)（**純粋関数**）。
+///
+/// `injected` = tako が開くシェルへ自動で足している CLI の置き場所（#601。在れば tako の中では打てる = info）、
+/// `by_hand_dir` = [`tako_cli_dir_by_hand`]。足すしかない（種別の分からないシェルで置き場所が PATH に無い）なら
+/// `tako setup bootstrap path` は同じ断りで止まるので誘導せず、`--check` の行と同じ案内（足す置き場所）で
+/// 閉じる（#2576）。check-health の診断は表示言語を解決しないので日本語で固定する（#1505 / #2564 と同じ）
+pub fn tako_cli_in_path_issue(
+    injected: Option<&Path>,
+    by_hand_dir: Option<String>,
+) -> (&'static str, String) {
+    let by_hand = by_hand_dir.map(|dir| {
+        PathByHandNote::CliCheckHint { dir }
+            .text_in(tako_core::i18n::Lang::Ja)
+            .trim_start()
+            .to_string()
+    });
+    // 注入が効いていれば tako の中では打てる = 致命ではない。外部ターミナルでも使いたい人向けの
+    // 案内に落とす（level を下げても対処法は示し続ける）。#1502 からは手順ではなく 1 コマンド（#322）
+    match (injected, by_hand) {
+        (Some(dir), None) => (
+            "info",
+            format!(
+                "tako CLI は PATH に無いが、tako が開くシェルには {} を自動で追加するので \
+                 tako の中では `tako` が使える（#601）。外部ターミナルでも使いたい場合は \
+                 tako setup bootstrap path を実行すること（#1502）",
+                dir.display()
+            ),
+        ),
+        (Some(dir), Some(hint)) => (
+            "info",
+            format!(
+                "tako CLI は PATH に無いが、tako が開くシェルには {} を自動で追加するので \
+                 tako の中では `tako` が使える（#601）。外部ターミナルでも使いたい場合は、{hint}",
+                dir.display()
+            ),
+        ),
+        (None, None) => (
+            "error",
+            "tako CLI が PATH に見つからない。tako setup bootstrap path で設置するか、\
+             scripts/build-app.sh --install でインストールすること"
+                .to_string(),
+        ),
+        (None, Some(hint)) => ("error", format!("tako CLI が PATH に見つからない。{hint}")),
+    }
 }
 
 /// `dirs` をログインシェルの PATH（Windows はユーザー環境変数）へ通す

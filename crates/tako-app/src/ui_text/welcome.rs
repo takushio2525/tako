@@ -138,6 +138,30 @@ pub fn path_button() -> &'static str {
     tr!("PATH を通す", "Fix PATH")
 }
 
+/// 種別の分からないシェル（tcsh・nu 等）の PATH の段（#2576）。tako がそのシェルの設定ファイルを書けないので、
+/// 足すディレクトリ（`dirs`。下の行に並ぶ `$HOME/…` の式）を利用者に足してもらう
+pub fn path_by_hand_step(agent: &str, dirs: &[String]) -> String {
+    let home = dirs.iter().any(|dir| dir.starts_with("$HOME"));
+    tr!(
+        format!(
+            "{agent} コマンドをどのターミナルからも使えるようにする（このシェルの設定ファイルは tako が書けないので、\
+             下のディレクトリをご自身で PATH へ足してください{}）",
+            if home { "。$HOME はホームディレクトリ" } else { "" }
+        ),
+        format!(
+            "Make the {agent} command available in every terminal (tako cannot edit this shell's settings \
+             file; add the {} below to PATH yourself{})",
+            if dirs.len() == 1 { "directory" } else { "directories" },
+            if home { ". $HOME is your home directory" } else { "" }
+        )
+    )
+}
+
+/// 足し終えたかを確かめ直す（自動の段をもう一度走らせ、次の段へ進める）
+pub fn path_by_hand_button() -> &'static str {
+    tr!("確かめ直す", "Check again")
+}
+
 pub fn login_step(account: &str) -> String {
     tr!(
         format!("{account}にログインする（ブラウザが開きます）"),
@@ -228,6 +252,9 @@ mod tests {
                 install_manual_button().to_string(),
                 path_step("claude"),
                 path_button().to_string(),
+                path_by_hand_step("claude", &["$HOME/.local/bin".to_string()]),
+                path_by_hand_step("claude", &["/opt/a".to_string(), "/opt/b".to_string()]),
+                path_by_hand_button().to_string(),
                 login_button().to_string(),
                 ready_step().to_string(),
                 unknown_step("x"),

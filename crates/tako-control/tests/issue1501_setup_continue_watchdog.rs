@@ -278,7 +278,7 @@ fn 未知のシェルのpathは同じ断りで止まるコマンドへ誘導し�
     const BOOTSTRAP: &str = "crates/tako-control/src/setup_bootstrap.rs";
     let mut failures = Vec::new();
     // (ファイル, 関数, 在るべき口, 在ってはいけない口 = 型を落とす日本語の口・誘導の写し)
-    let wiring: [(&str, &str, &[&str], &[&str]); 4] = [
+    let wiring: [(&str, &str, &[&str], &[&str]); 5] = [
         (
             SETUP,
             "run_bootstrap_for",
@@ -305,10 +305,17 @@ fn 未知のシェルのpathは同じ断りで止まるコマンドへ誘導し�
             &["ShellProfileUnknown", "PathByHandNote::CliStage("],
             &[],
         ),
+        // 判定は check-health の `cli_in_path` と同じ 1 実装（#2576。そちらの配線は issue2576 の番犬）
         (
             BOOTSTRAP,
             "tako_cli_path_check_line",
-            &["path_by_hand_for(", "PathByHandNote::CliCheckHint"],
+            &["tako_cli_dir_by_hand(", "PathByHandNote::CliCheckHint"],
+            &[],
+        ),
+        (
+            BOOTSTRAP,
+            "tako_cli_dir_by_hand",
+            &["path_by_hand_for("],
             &[],
         ),
     ];

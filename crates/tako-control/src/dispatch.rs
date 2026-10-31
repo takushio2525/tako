@@ -22212,26 +22212,13 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
             ),
         }));
     } else if !cli_in_path {
-        // 注入が効いていれば tako の中では打てる = 致命ではない。外部ターミナルでも
-        // 使いたい人向けの案内に落とす（level を下げても対処法は示し続ける）。
-        // #1502 からは**手順ではなく 1 コマンド**を出す（#322 の最簡形）
-        let (level, message) = match injected_cli_dir.as_deref() {
-            Some(dir) => (
-                "info",
-                format!(
-                    "tako CLI は PATH に無いが、tako が開くシェルには {} を自動で追加するので \
-                     tako の中では `tako` が使える（#601）。外部ターミナルでも使いたい場合は \
-                     tako setup bootstrap path を実行すること（#1502）",
-                    dir.display()
-                ),
-            ),
-            None => (
-                "error",
-                "tako CLI が PATH に見つからない。tako setup bootstrap path で設置するか、\
-                 scripts/build-app.sh --install でインストールすること"
-                    .to_string(),
-            ),
-        };
+        // 注入が効いていれば tako の中では打てる = 致命ではない（level を下げても対処法は示し続ける）。
+        // 種別の分からないシェルで置き場所が PATH に無いなら、`tako setup bootstrap path` は同じ断りで
+        // 止まるので誘導せず、`--check` の行と同じ判定・案内（足す置き場所）で閉じる（#2576）
+        let (level, message) = crate::setup_bootstrap::tako_cli_in_path_issue(
+            injected_cli_dir.as_deref(),
+            crate::setup_bootstrap::tako_cli_dir_by_hand(&tako_cli_path),
+        );
         issues.push(json!({
             "level": level,
             "check": "cli_in_path",
