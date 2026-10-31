@@ -1253,6 +1253,15 @@ mod tests {
     }
 
     fn run_offer(state: &DepStatus, ctx: DepOfferContext, input: &str) -> (DepOutcome, String) {
+        run_offer_in(state, ctx, input, Lang::Ja)
+    }
+
+    fn run_offer_in(
+        state: &DepStatus,
+        ctx: DepOfferContext,
+        input: &str,
+        lang: Lang,
+    ) -> (DepOutcome, String) {
         let mut out: Vec<u8> = Vec::new();
         let mut reader = input.as_bytes();
         let outcome = offer_and_install(
@@ -1262,11 +1271,51 @@ mod tests {
                 writer: &mut out,
                 reader: &mut reader,
                 indent: "  ",
-                lang: Lang::Ja,
+                lang,
             },
         )
         .expect("書き出しは失敗しない");
         (outcome, String::from_utf8(out).expect("UTF-8"))
+    }
+
+    /// #2365: 読み取りの文脈（`--check` / check-health の依存の行）は表示言語で案内する。英語に日本語が
+    /// 混ざらない（手段が無い・brew が無い・tako が入れられる・検出を打ち切った）。`tako setup` の段は日本語のまま
+    #[test]
+    fn 読み取りの文脈の案内は表示言語で出す() {
+        let check = DepOfferContext {
+            stage_installs: false,
+            review: false,
+            assume_yes: false,
+            stdin_is_terminal: false,
+            legacy: false,
+        };
+        let japanese = |s: &str| {
+            s.chars()
+                .find(|c| matches!(*c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF))
+        };
+        let brew = DepInstaller::Brew { pkg: "tailscale" };
+        let mut timed_out = fake_status(Some(brew), Some("/opt/homebrew/bin/brew"));
+        timed_out.lookup_timeout = Some(tako_core::probe::TimeoutNotice {
+            label: tako_core::probe::label("zsh", &["-l", "-c", "command -v tailscale"]),
+            waited_secs: 5,
+        });
+        let cases = [
+            fake_status(None, None),
+            fake_status(Some(brew), None),
+            fake_status(Some(brew), Some("/opt/homebrew/bin/brew")),
+            timed_out,
+        ];
+        for state in &cases {
+            let (_, ja) = run_offer_in(state, check, "", Lang::Ja);
+            let (_, en) = run_offer_in(state, check, "", Lang::En);
+            assert!(
+                !ja.trim().is_empty() && !en.trim().is_empty(),
+                "{ja} / {en}"
+            );
+            assert_eq!(japanese(&en), None, "英語の案内に日本語が混ざる: {en}");
+            assert_eq!(ja.lines().count(), en.lines().count(), "{ja}\n---\n{en}");
+            assert_eq!(run_offer(state, check, "").1, ja, "日本語は従来の口と同じ");
+        }
     }
 
     fn ask_ctx() -> DepOfferContext {

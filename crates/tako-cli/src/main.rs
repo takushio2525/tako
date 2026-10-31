@@ -6844,7 +6844,7 @@ fn mod_install_local(args: &ModArgs) -> Result<(), String> {
 }
 
 /// 設定 dir ごとの skills/tako の行（`tako mod` と `tako mod install|uninstall` と `tako check-health` で
-/// 共通。組み立ては tako-control の 1 本）。`lang` は行の枠の言語（check-health は日本語。#2365）
+/// 共通。組み立ては tako-control の 1 本）。`lang` は行の枠の言語（どれも表示言語。#2365）
 fn print_mod_skills(skills: &Value, lang: tako_core::i18n::Lang) {
     for line in tako_control::claude_mod::text::skills_lines(skills, lang) {
         println!("{line}");
@@ -8648,7 +8648,7 @@ fn fd_limit_line(fd: &Value, lang: tako_core::i18n::Lang) -> Option<String> {
         _ => None,
     };
     if let Some(note) = note {
-        line.push('・');
+        line.push_str(&HealthText::NoteSeparator.text_in(lang));
         line.push_str(&note.text_in(lang));
     }
     Some(line)
@@ -8682,7 +8682,7 @@ fn fd_container_line(fd: &Value, lang: tako_core::i18n::Lang) -> Option<String> 
         _ => None,
     };
     if let Some(note) = note {
-        line.push('・');
+        line.push_str(&HealthText::NoteSeparator.text_in(lang));
         line.push_str(&note.text_in(lang));
     }
     Some(line)

@@ -1471,6 +1471,30 @@ mod tests {
         assert_eq!(v["retries"], 0);
         assert_eq!(v["verification"], false);
         assert!(none.health_issue().is_none());
+
+        // #2365: check-health の表示言語で組む。英語の枠に日本語が混ざらない（理由は起動時の記録 =
+        // ここでは ASCII の見本）・重さは言語で変わらない。面が見えているのに外した拒否（#1697）も同じ
+        let japanese = |s: &str| {
+            s.chars()
+                .find(|c| matches!(*c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF))
+        };
+        let lost = Placement {
+            available: vec!["Built-in".into()],
+            ..refused.clone()
+        };
+        for p in [&fell_back, &refused, &lost] {
+            let p = Placement {
+                reason: Some("no match".into()),
+                ..p.clone()
+            };
+            let ja = p.health_issue_in(crate::i18n::Lang::Ja).expect("申告する");
+            let en = p.health_issue_in(crate::i18n::Lang::En).expect("申告する");
+            assert_eq!(ja["level"], en["level"]);
+            assert_eq!(Some(ja.clone()), p.health_issue(), "日本語は従来の口と同じ");
+            let msg = en["message"].as_str().unwrap_or_default();
+            assert_eq!(japanese(msg), None, "英語の申告に日本語が混ざる: {msg}");
+            assert!(msg.contains("virtual-display.sh ensure"), "{msg}");
+        }
     }
 
     /// やり直していないときログに回数を足さない（通常起動のログを増やさない）

@@ -453,6 +453,8 @@ pub enum HealthText {
     },
     /// `tako setup --check` の見出し
     SetupCheckTitle,
+    /// 1 行の中の補足の区切り（`fd: …・起動時 …`）
+    NoteSeparator,
 }
 
 /// 器の tmux サーバーの上限の決まり方（[`HealthText::FdContainerNear`] の後ろに足す 1 句）
@@ -1534,6 +1536,8 @@ impl HealthText {
             ),
             (Self::SetupCheckTitle, Ja) => "tako セットアップ 環境チェック".into(),
             (Self::SetupCheckTitle, En) => "tako setup environment check".into(),
+            (Self::NoteSeparator, Ja) => "・".into(),
+            (Self::NoteSeparator, En) => "; ".into(),
         }
     }
 }

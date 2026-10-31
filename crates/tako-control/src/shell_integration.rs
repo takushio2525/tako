@@ -311,6 +311,38 @@ mod stage_tests {
 
     const PWSH: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
 
+    /// #2365: `--check` / check-health の行は表示言語で組む。どの届け方・注記でも英語に日本語が混ざらず、
+    /// 行の数は日本語と同じ（器が OSC を落とす理由の文は tako-core が組んだものをそのまま載せる）
+    #[test]
+    fn 点検の行は表示言語で組む() {
+        let japanese = |s: &str| {
+            s.chars()
+                .find(|c| matches!(*c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF))
+        };
+        let mut with_legacy = windows_status(Some(PWSH));
+        with_legacy.legacy_blocks = vec![legacy("PowerShell")];
+        let mut blocked = unix_status();
+        blocked.blocked_by_backend = Some("psmux drops OSC".into());
+        for status in [
+            unix_status(),
+            windows_status(Some(PWSH)),
+            windows_status(None),
+            with_legacy,
+            blocked,
+        ] {
+            for phase in [Phase::Setup, Phase::Check] {
+                let ja = state_lines(&status, phase, Lang::Ja);
+                let en = state_lines(&status, phase, Lang::En);
+                assert_eq!(ja.len(), en.len(), "{ja:?} / {en:?}");
+                for line in &en {
+                    assert_eq!(japanese(line), None, "英語の行に日本語が混ざる: {line}");
+                }
+            }
+        }
+        assert_eq!(japanese(legacy_line_in(Lang::En)), None);
+        assert_eq!(legacy_line_in(Lang::Ja), LEGACY_LINE);
+    }
+
     #[test]
     fn 注入で完結する環境は1行だけ言う() {
         let lines = state_lines(&unix_status(), Phase::Setup, Lang::Ja);

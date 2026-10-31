@@ -16234,6 +16234,17 @@ const CLI_NOTE_SCOPES: &[&str] = &[
     "fn wait_run_pane(",
     "fn run_wait_timed_out_message(",
     "    fn message(&self) -> Option<String> {",
+    // #2365: check-health 一式（行は `HealthText` から引く）
+    "fn check_health_cli(",
+    "fn print_check_health(",
+    "fn print_check_health_mod(",
+    "fn fd_limit_line(",
+    "fn fd_container_line(",
+    "fn print_ipc_section(",
+    "fn ipc_recovery_lines(",
+    "fn pipe_line(",
+    "fn local_gui_report(",
+    "fn alive_unreachable_next(",
 ];
 
 /// CLI `main.rs` でまだ断りに日本語の固定文を持つ関数（頭, 理由）。**断りを移し終えたら外す**
@@ -16250,10 +16261,6 @@ const CLI_REFUSAL_DEFERRED: &[(&str, &str)] = &[
     (
         "fn new_tab_target(",
         "master / solo の起動の流れ（中の型の口と案内の行と 1 本で移す）",
-    ),
-    (
-        "fn check_health_cli(",
-        "check-health 一式（tako setup --check と共有する diagnostics の行と 1 本で移す）",
     ),
     (
         "fn recover_local(",
@@ -16479,4 +16486,887 @@ fn cli_の手元の断りの番犬の境界() {
     assert_eq!(found, vec![1, 5, 7, 12], "植えた 4 か所だけを名指す");
     assert_eq!(strip_line_comment("a // b"), "a ");
     assert_eq!(strip_line_comment("\"x // y\" // z"), "\"x // y\" ");
+}
+
+// ---- #2365 の続き: check-health 一式（`HealthText`）と、`tako setup --check` と共有する診断 ----
+//
+// check-health の CLI の表示・dispatch の `issues`・環境診断（`diagnostics.rs` = `tako setup --check` と
+// 同じ行）の文は `HealthText` が日英を持つ。他モジュールの文（setup_bootstrap / shell_integration /
+// setup_deps / setup_remaining / tako-core の理由）は各モジュールの `_in(lang)` が持つ。ここでは
+// (1) `HealthText` の全バリアントの日英と、#2365 より前の固定文とのバイト一致（腕の行を名指す）
+// (2) 診断・dispatch の check-health・`tako setup --check` の組み立てに日本語の固定文が無く、
+//     日本語の口（`Lang::Ja` 固定・`_in` の無い旧い口）を呼んでいない
+// (3) 共有する他モジュールの `_in(lang)` の英語に日本語が混ざらない
+// を見る
+
+use tako_control::{ContainerLimitNote, HealthText};
+
+const HEALTH_TEXT_SRC: &str = include_str!("../src/health_text.rs");
+const HEALTH_TEXT_PATH: &str = "crates/tako-control/src/health_text.rs";
+const DIAGNOSTICS_SRC: &str = include_str!("../src/diagnostics.rs");
+const DIAGNOSTICS_PATH: &str = "crates/tako-control/src/diagnostics.rs";
+const SETUP_CLI_SRC: &str = include_str!("../../tako-cli/src/setup.rs");
+const SETUP_CLI_PATH: &str = "crates/tako-cli/src/setup.rs";
+
+/// `HealthText` の通し番号（網羅 match）
+fn health_text_index(t: &HealthText) -> usize {
+    use HealthText as H;
+    match t {
+        H::UnknownReason => 0,
+        H::Unknown => 1,
+        H::LoginShellWaitHint => 2,
+        H::AuthUnknown { .. } => 3,
+        H::StepUnknown { .. } => 4,
+        H::AgentUnknown { .. } => 5,
+        H::AgentCliUnconfirmed(_) => 6,
+        H::AgentCliNone => 7,
+        H::AgentCliNoneHint => 8,
+        H::AgentCliReady(_) => 9,
+        H::AgentDone(_) => 10,
+        H::AgentStatusUnreadable { .. } => 11,
+        H::AgentsUnconfirmed { .. } => 12,
+        H::AgentsHeading => 13,
+        H::AgentsNoneFound => 14,
+        H::AgentsDetected(_) => 15,
+        H::SignedIn => 16,
+        H::SignedOut => 17,
+        H::PlanUnknown => 18,
+        H::AgentDetectedLine { .. } => 19,
+        H::AgentUnconfirmedLine { .. } => 20,
+        H::RoleCodex => 21,
+        H::RoleAgy => 22,
+        H::DepNotFound { .. } => 23,
+        H::DepPurpose(_) => 24,
+        H::DepOptionalNote => 25,
+        H::FdaGranted => 26,
+        H::FdaNotGranted => 27,
+        H::FdaNotGrantedDetail => 28,
+        H::McpRegistered(_) => 29,
+        H::McpPathGone(_) => 30,
+        H::McpRegisteredPath(_) => 31,
+        H::McpRepairHint => 32,
+        H::McpClaudeUnconfirmed { .. } => 33,
+        H::McpNotRegistered(_) => 34,
+        H::McpEnvMissing(_) => 35,
+        H::McpNoTools => 36,
+        H::McpReinstall(_) => 37,
+        H::McpUnknown(_) => 38,
+        H::ConfigNoHome => 39,
+        H::ConfigNotCreated => 40,
+        H::ConfigUnreadable(_) => 41,
+        H::SetupIncomplete => 42,
+        H::SetupDone(_) => 43,
+        H::UpdateLatest(_) => 44,
+        H::UpdatePending(_) => 45,
+        H::UpdateUnknown(_) => 46,
+        H::UpdateUnapplied(_) => 47,
+        H::DefaultAgent(_) => 48,
+        H::Plans(_) => 49,
+        H::InstructionsExist(_) => 50,
+        H::InstructionsMissing(_) => 51,
+        H::SyncNotConfigured => 52,
+        H::SyncUpToDate => 53,
+        H::SyncOutdated => 54,
+        H::SyncSourceMissing(_) => 55,
+        H::SyncOther(_) => 56,
+        H::SyncFailed(_) => 57,
+        H::SleepOff => 58,
+        H::SleepOn { .. } => 59,
+        H::LidOff => 60,
+        H::LidSudoersMissing => 61,
+        H::LidOn => 62,
+        H::ShareLinked(_) => 63,
+        H::ShareLinkedUsage => 64,
+        H::ShareBroken(_) => 65,
+        H::ShareRelink(_) => 66,
+        H::ShareUnlinked => 67,
+        H::ShareManaged { .. } => 68,
+        H::ShareAdopt(_) => 69,
+        H::ShareDuplicate => 70,
+        H::ShareFresh(_) => 71,
+        H::ShareFreshWhat => 72,
+        H::ShareFreshSafe => 73,
+        H::ProfilesCount { .. } => 74,
+        H::ProfilesNone => 75,
+        H::ProfilesFailed(_) => 76,
+        H::RemoteStoppedUnexpectedly => 77,
+        H::RemoteStartHint => 78,
+        H::RemoteStopped => 79,
+        H::RemoteUnreachable => 80,
+        H::RemoteStatusHint => 81,
+        H::RemoteRunning(_) => 82,
+        H::IpcUp => 83,
+        H::IpcDown => 84,
+        H::IpcDownReason(_) => 85,
+        H::IpcNoDataDir => 86,
+        H::IpcTooDeep => 87,
+        H::IpcPathTooLong { .. } => 88,
+        H::IpcShallowerHint => 89,
+        H::IpcAppNotRunning => 90,
+        H::CliPathUnconfirmed(_) => 91,
+        H::VersionUnconfirmed { .. } => 92,
+        H::VersionMismatch { .. } => 93,
+        H::TmuxMissing => 94,
+        H::PersistOff => 95,
+        H::IpcNotBoundTooLong { .. } => 96,
+        H::IpcNotBound(_) => 97,
+        H::IpcDetachedStuck { .. } => 98,
+        H::IpcDetached { .. } => 99,
+        H::PipeDown { .. } => 100,
+        H::FdRaiseFailed { .. } => 101,
+        H::FdNearExhaustion { .. } => 102,
+        H::FdContainerNear { .. } => 103,
+        H::FdContainerUnreachable { .. } => 104,
+        H::EncodingPinGaveUp { .. } => 105,
+        H::ModNoReport { .. } => 106,
+        H::AppUnreachable(_) => 107,
+        H::ConnectionUnreachable(_) => 108,
+        H::AppUnreachableRefusal => 109,
+        H::Healthy(_) => 110,
+        H::Versions { .. } => 111,
+        H::FdUsage { .. } => 112,
+        H::FdRaised { .. } => 113,
+        H::FdAlreadyEnough(_) => 114,
+        H::FdHardCapped(_) => 115,
+        H::FdFailed(_) => 116,
+        H::FdLegacy => 117,
+        H::ContainerNotRunning => 118,
+        H::ContainerUnreachable(_) => 119,
+        H::ContainerUsage { .. } => 120,
+        H::ContainerRaised(_) => 121,
+        H::ContainerPredates(_) => 122,
+        H::ContainerLegacy => 123,
+        H::ContainerLaunchValue => 124,
+        H::IpcEndpoint(_) => 125,
+        H::IpcErrorLine(_) => 126,
+        H::WatchCounts { .. } => 127,
+        H::WatchLastRebind { .. } => 128,
+        H::WatchRebindError(_) => 129,
+        H::PipeDownLine { .. } => 130,
+        H::PipeOk(_) => 131,
+        H::PipeOkWithOutages { .. } => 132,
+        H::PipeLastRecovery { .. } => 133,
+        H::FixedPathHeld(_) => 134,
+        H::FixedPathReclaimed(_) => 135,
+        H::GuiAliveUnreachable { .. } => 136,
+        H::SocketRefused => 137,
+        H::SocketMissing => 138,
+        H::NotConnected => 139,
+        H::GuiNotRunning(_) => 140,
+        H::GuiReachable(_) => 141,
+        H::NextStep(_) => 142,
+        H::StartTako => 143,
+        H::AliveUnreachableNext { .. } => 144,
+        H::SetupCheckTitle => 145,
+        H::NoteSeparator => 146,
+    }
+}
+const HEALTH_TEXT_VARIANTS: usize = 147;
+
+/// 見本と #2365 より前の固定文（diagnostics / dispatch / CLI `main.rs` / setup.rs が書いていた文を見本の値で展開）。
+/// 値は英語の検査が日本語の混入を値のせいにしないよう ASCII だけで書く。中身で腕を分けるバリアントは両方を並べる。
+/// `IpcNotBoundTooLong` だけは旧文の途中に字下げの空白 13 個ずつが紛れ込んでいた（`\` の継続が抜けていた）ので、
+/// 空白を外した形を正とする（意図した差。PR に書く）
+fn health_text_table() -> Vec<(HealthText, String)> {
+    use HealthText as H;
+    let s = |v: &str| v.to_string();
+    vec![
+        (H::UnknownReason, s("理由不明")),
+        (H::Unknown, s("不明")),
+        (H::LoginShellWaitHint, s(".zprofile などのログインシェルの設定が入力を待っていないか確かめてください")),
+        (H::AuthUnknown { secs: 10 }, s("認証: 不明（10 秒で応答なし）")),
+        (H::StepUnknown { install: true, secs: 5 }, s("導入: 不明（ログインシェルが 5 秒で応答なし）")),
+        (H::StepUnknown { install: false, secs: 5 }, s("PATH: 不明（ログインシェルが 5 秒で応答なし）")),
+        (H::AgentUnknown { agent: s("claude"), text: s("X") }, s("claude のX")),
+        (H::AgentCliUnconfirmed(s("claude X")), s("エージェント CLI の導入: 使える系統を確かめられません（claude X）")),
+        (H::AgentCliNone, s("エージェント CLI の導入: 使える系統がありません")),
+        (H::AgentCliNoneHint, s("         tako setup を実行すると、ここから最後まで案内します")),
+        (H::AgentCliReady(s("claude / codex")), s("エージェント CLI の導入: 使える系統 claude / codex（導入 / PATH / ログイン）")),
+        (H::AgentDone(s("claude")), s("claude: 完了")),
+        (H::AgentStatusUnreadable { agent: s("agy"), error: s("boom") }, s("agy: 確認できません（boom）")),
+        (H::AgentsUnconfirmed { names: s("claude / agy"), secs: 5 }, s("claude / agy を確かめられません（ログインシェルが 5 秒で応答なし）")),
+        (H::AgentsHeading, s("  エージェント CLI:")),
+        (H::AgentsNoneFound, s("claude / codex / agy のいずれも見つかりません")),
+        (H::AgentsDetected(s("claude")), s("検出: claude")),
+        (H::SignedIn, s("認証済み")),
+        (H::SignedOut, s("未認証")),
+        (H::PlanUnknown, s("プラン不明")),
+        (H::AgentDetectedLine { agent: s("claude"), path: s("/opt/fake/bin/claude"), auth: s("max") }, s("    [検出] claude: /opt/fake/bin/claude（max）")),
+        (H::AgentUnconfirmedLine { agent: s("agy"), secs: 5 }, s("    [警告] agy: 確かめられません（ログインシェルが 5 秒で応答なし）")),
+        (H::RoleCodex, s("Codex: master 起動時にも一時注入")),
+        (H::RoleAgy, s("agy: worker 専用（master は非対応）")),
+        (H::DepNotFound { bin: s("tmux"), required: false }, s("tmux: 見つかりません（任意）")),
+        (H::DepNotFound { bin: s("tmux"), required: true }, s("tmux: 見つかりません（必須）")),
+        (H::DepPurpose(s("git panel")), s("      用途: git panel")),
+        (H::DepOptionalNote, s("      無くても tako 自体は動きますが、上記の機能が使えません")),
+        (H::FdaGranted, s("フルディスクアクセス: 付与済み（許可ダイアログは表示されません）")),
+        (H::FdaNotGranted, s("フルディスクアクセス: 未付与（推奨）")),
+        (
+            H::FdaNotGrantedDetail,
+            [
+                "      macOS が「tako.app から、ほかのアプリからのデータへのアクセス権を",
+                "      求められています」と頻繁に表示する原因です。フルディスクアクセスを",
+                "      付与すると、このダイアログが出なくなります。",
+                "      設定方法: システム設定 → プライバシーとセキュリティ → フルディスクアクセス → tako を追加",
+                "      付与方法: tako fda open でシステム設定を開き、tako を追加してください",
+            ]
+            .join("\n"),
+        ),
+        (H::McpRegistered(s("Claude")), s("Claude MCP: tako が登録済み")),
+        (H::McpPathGone(s("codex")), s("codex MCP: 登録済みだがパスが消失しています")),
+        (H::McpRegisteredPath(s("/opt/tako mcp serve")), s("         登録パス: /opt/tako mcp serve")),
+        (H::McpRepairHint, s("         tako setup または tako setup-mcp で修復できます")),
+        (H::McpClaudeUnconfirmed { label: s("claude mcp list"), secs: 10 }, s("Claude MCP: 登録状態を確認できません（claude mcp list が 10 秒で応答なし）")),
+        (H::McpNotRegistered(s("agy")), s("agy MCP: tako が未登録（tako setup-mcp で登録できます）")),
+        (H::McpEnvMissing(s("codex")), s("codex MCP: 登録済みだが tako と通信する env の転送設定がありません")),
+        (H::McpNoTools, s("         そのままだとツールが 0 個になります")),
+        (H::McpReinstall(s("codex")), s("         tako setup-mcp --agent codex で入れ直せます")),
+        (H::McpUnknown(s("agy")), s("agy MCP: 登録状態を確認できません（agy mcp list を手で確認してください）")),
+        (H::ConfigNoHome, s("config.yaml: 置き場を特定できません（HOME が未設定）")),
+        (H::ConfigNotCreated, s("config.yaml: 未作成")),
+        (H::ConfigUnreadable(s("bad yaml")), s("config.yaml: 読めません（bad yaml）")),
+        (H::SetupIncomplete, s("セットアップ: 未完了")),
+        (H::SetupDone(Some(s("2026-11-01T00:00:00Z"))), s("セットアップ: 完了済み (2026-11-01T00:00:00Z)")),
+        (H::SetupDone(None), s("セットアップ: 完了済み (日時不明)")),
+        (H::UpdateLatest(12), s("アップデート追従: 最新（rev 12）")),
+        (H::UpdatePending(3), s("アップデート追従: 未適用の setup 変更が 3 件（tako setup --changes で詳細）")),
+        (H::UpdateUnknown(s("io")), s("アップデート追従: 確認できません（io）")),
+        (H::UpdateUnapplied(12), s("アップデート追従: 未適用（現在の setup リビジョンは 12）")),
+        (H::DefaultAgent(s("claude")), s("既定エージェント: claude")),
+        (H::Plans(s("anthropic=max")), s("申告・検出プラン: anthropic=max")),
+        (H::InstructionsExist(s("~/.claude/CLAUDE.md")), s("~/.claude/CLAUDE.md: 存在します")),
+        (H::InstructionsMissing(s("~/.claude/CLAUDE.md")), s("~/.claude/CLAUDE.md: 未作成")),
+        (H::SyncNotConfigured, s("エージェント共通ルール同期: 未設定")),
+        (H::SyncUpToDate, s("エージェント共通ルール同期: 最新")),
+        (H::SyncOutdated, s("エージェント共通ルール同期: ずれあり（tako agents sync-rules で同期）")),
+        (H::SyncSourceMissing(s("~/rules.md")), s("エージェント共通ルール同期: 正本が見つからない (~/rules.md)")),
+        (H::SyncOther(s("weird")), s("エージェント共通ルール同期: weird")),
+        (H::SyncFailed(s("io")), s("エージェント共通ルール同期: 確認失敗 (io)")),
+        (H::SleepOff, s("スリープ防止: 無効（tako sleep-guard set --mode while-agents-running で有効化）")),
+        (H::SleepOn { mode: s("while-agents-running"), power: s("ac-only") }, s("スリープ防止: mode=while-agents-running, power=ac-only")),
+        (H::LidOff, s("蓋閉じ防止: 未設定（tako sleep-guard install-lid-sleep で有効化）")),
+        (H::LidSudoersMissing, s("蓋閉じ防止: while-agents-running だが sudoers 未登録（tako sleep-guard install-lid-sleep で登録）")),
+        (H::LidOn, s("蓋閉じ防止: while-agents-running")),
+        (H::ShareLinked(s("git@x:y.git")), s("  [OK] 設定共有: 配線済み（git@x:y.git）")),
+        (H::ShareLinkedUsage, s("       差分は `tako config status`、同期は `tako config push` / `pull`")),
+        (H::ShareBroken(s("/x")), s("  [警告] 設定共有: 配線先が git リポジトリではありません（/x）")),
+        (H::ShareRelink(s("tako config link /x")), s("         `tako config link /x` で繋ぎ直せます")),
+        (H::ShareUnlinked, s("  [情報] 設定共有: 未配線")),
+        (H::ShareManaged { path: s("~/.claude"), repo: s("git@x"), same: true }, s("         ~/.claude は既に git@x で管理されています（tako の置き場と一致）")),
+        (H::ShareManaged { path: s("~/.claude"), repo: s("git@x"), same: false }, s("         ~/.claude は既に git@x で管理されています（tako の置き場とは別）")),
+        (H::ShareAdopt(s("tako config link git@x")), s("         同じリポジトリへ相乗りするなら `tako config link git@x`")),
+        (H::ShareDuplicate, s("         別のリポジトリを作ると同じ内容が 2 箇所に並びます（二重管理）")),
+        (H::ShareFresh(s("tako config init")), s("  [情報] 設定共有: 未配線（複数デバイスで同じ AI 設定を使うなら `tako config init`）")),
+        (H::ShareFreshWhat, s("         claude のグローバル指示と tako の宣言的設定を git 1 本で共有します")),
+        (H::ShareFreshSafe, s("         秘匿情報とこのマシン固有の状態は共有対象から構造的に外れます")),
+        (H::ProfilesCount { count: 2, names: s("default, work") }, s("プロファイル: 2 個（default, work）")),
+        (H::ProfilesNone, s("プロファイル: 未作成（tako master で自動生成されます）")),
+        (H::ProfilesFailed(s("io")), s("プロファイル: 確認失敗 (io)")),
+        (H::RemoteStoppedUnexpectedly, s("リモート公開: 前回は公開していましたが、いまは止まっています")),
+        (H::RemoteStartHint, s("         tako remote start で公開し直せます")),
+        (H::RemoteStopped, s("リモート公開: 停止中（スマホから使うなら tako remote start）")),
+        (H::RemoteUnreachable, s("リモート公開: 稼働中ですが tailnet からは届いていません")),
+        (H::RemoteStatusHint, s("         tako remote status で詳細を確認できます")),
+        (H::RemoteRunning(123), s("リモート公開: 稼働中（pid 123）")),
+        (H::IpcUp, s("IPC の受け口: 立っています（tako CLI / MCP が届きます）")),
+        (H::IpcDown, s("IPC の受け口: 立っていません（tako CLI / MCP は届きません）")),
+        (H::IpcDownReason(Some(s("EADDRINUSE"))), s("         理由: EADDRINUSE")),
+        (H::IpcDownReason(None), s("         理由: 理由不明")),
+        (H::IpcNoDataDir, s("IPC の受け口: データディレクトリを特定できません")),
+        (H::IpcTooDeep, s("IPC の受け口: データディレクトリが深すぎます（tako CLI / MCP は届きません）")),
+        (H::IpcPathTooLong { bytes: 120, limit: 104 }, s("         ソケットパスが 120 バイトで上限 104 バイトを超えています")),
+        (H::IpcShallowerHint, s("         もっと浅い TAKO_DATA_DIR で起動し直してください")),
+        (H::IpcAppNotRunning, s("IPC の受け口: 届きません（tako アプリが起動していません）")),
+        (H::CliPathUnconfirmed(5), s("tako CLI が PATH に在るかを確かめられない（ログインシェルが 5 秒で応答しない）。.zprofile などのログインシェルの設定が入力を待っていないか確かめること（#1533）")),
+        (H::VersionUnconfirmed { label: s("tako --version"), secs: 5 }, s("CLI バージョンを確かめられない（`tako --version` が 5 秒で応答しない）")),
+        (H::VersionMismatch { cli: Some(s("0.8.38")), app: s("0.8.39") }, s("CLI バージョン (0.8.38) とアプリバージョン (0.8.39) が不一致。build-app.sh --install で最新の CLI をインストールすること")),
+        (H::VersionMismatch { cli: None, app: s("0.8.39") }, s("CLI バージョン (不明) とアプリバージョン (0.8.39) が不一致。build-app.sh --install で最新の CLI をインストールすること")),
+        (H::TmuxMissing, s("tmux がインストールされていない。タブ構成の保存・復元は機能するが、実行中プロセス・画面内容の復元（完全復元）は使えない。brew install tmux でインストール可能")),
+        (H::PersistOff, s("セッション永続化が無効。tako persist on で有効にすると、tako 再起動時にプロセスと画面内容が復元される")),
+        (H::IpcNotBoundTooLong { bytes: 120, limit: 104 }, s("IPC の受け口が立っていない（tako CLI / MCP は届かない）: データディレクトリが深く、ソケットパスが 120 バイトで上限 104 バイトを超えている。もっと浅い TAKO_DATA_DIR で起動し直すこと")),
+        (H::IpcNotBound(Some(s("EADDRINUSE"))), s("IPC の受け口が立っていない（tako CLI / MCP は届かない）: EADDRINUSE")),
+        (H::IpcNotBound(None), s("IPC の受け口が立っていない（tako CLI / MCP は届かない）: 理由不明")),
+        (H::IpcDetachedStuck { reason: s("R"), error: s("E"), secs: 2 }, s("IPC の受け口がソケットのパスから切り離されている（tako CLI / MCP の stdio は届かない）: R・張り直せない（E）。2 秒ごとにやり直す。戻らなければ tako を再起動する（#2002）")),
+        (H::IpcDetached { reason: s("R"), secs: 2 }, s("IPC の受け口がソケットのパスから切り離されている（tako CLI / MCP の stdio は届かない）: R。同じデータディレクトリで別の tako が動いていないか確かめる。そのファイルが消えれば 2 秒以内に張り直す（#2002）")),
+        (H::PipeDown { error: Some(s("E")), streak: 3, max_secs: 30 }, s("IPC の名前付きパイプの待ち受けを作れていない（tako CLI / MCP の stdio は届かない）: E・3 回続けて失敗。間を置いて（最長 30 秒ごとに）作り直している。戻らなければ tako を再起動する（#2361）")),
+        (H::FdRaiseFailed { error: Some(s("EPERM")), soft: Some(256) }, s("起動時にファイル記述子（fd）の上限を引き上げられなかった（EPERM）。soft 256 のまま動いているので、ペインが増えると tako CLI / MCP が届かなくなる。tako を再起動しても直らなければ launchctl limit maxfiles で上限を確かめる（#2359）")),
+        (H::FdRaiseFailed { error: None, soft: None }, s("起動時にファイル記述子（fd）の上限を引き上げられなかった（理由不明）。soft ? のまま動いているので、ペインが増えると tako CLI / MCP が届かなくなる。tako を再起動しても直らなければ launchctl limit maxfiles で上限を確かめる（#2359）")),
+        (H::FdNearExhaustion { open: 170, soft: 200, percent: 85, remaining: 30, per_pane: 4, not_raised: Some(s("hard_capped")) }, s("ファイル記述子（fd）の使用が上限に近い: 170 / 200 本（85%・残り 30 本）。上限に達すると tako CLI / MCP が届かなくなり（繋がっても GUI がすぐ閉じる）、新しいペインも開けない。使っていないペイン・タブを閉じること（1 ペインで約 4 本）。起動時に上限を引き上げていない（hard_capped）。ペインの数に比べて多すぎるなら漏れの疑いがあるので persist.log を添えて報告する（#2359）")),
+        (H::FdNearExhaustion { open: 170, soft: 200, percent: 85, remaining: 30, per_pane: 4, not_raised: None }, s("ファイル記述子（fd）の使用が上限に近い: 170 / 200 本（85%・残り 30 本）。上限に達すると tako CLI / MCP が届かなくなり（繋がっても GUI がすぐ閉じる）、新しいペインも開けない。使っていないペイン・タブを閉じること（1 ペインで約 4 本）。ペインの数に比べて多すぎるなら漏れの疑いがあるので persist.log を添えて報告する（#2359）")),
+        (H::FdContainerNear { pid: 77, open: 210, soft: 256, percent: 82, remaining: 46, per_pane: 3, limit: ContainerLimitNote::Raised }, s("器の tmux サーバー（pid 77）のファイル記述子（fd）の使用が上限に近い: 210 / 256 本（82%・残り 46 本）。上限に達すると器に新しいペインを作れず（create window failed: fork failed: Too many open files）、器への問い合わせ（画面の読み取り・生死の確認）もすべて返らなくなる。使っていないペインを閉じること（器の 1 ペインで約 3 本）（#2367）")),
+        (H::FdContainerNear { pid: 77, open: 210, soft: 256, percent: 82, remaining: 46, per_pane: 3, limit: ContainerLimitNote::Predates { soft: 256, capacity: 83 } }, s("器の tmux サーバー（pid 77）のファイル記述子（fd）の使用が上限に近い: 210 / 256 本（82%・残り 46 本）。上限に達すると器に新しいペインを作れず（create window failed: fork failed: Too many open files）、器への問い合わせ（画面の読み取り・生死の確認）もすべて返らなくなる。使っていないペインを閉じること（器の 1 ペインで約 3 本）。このサーバーは fd の上限の引き上げより前に起きたので起動時の 256 のまま（約 83 ペインで詰まる）。上がるのは次にサーバーが起きたとき（器のセッションがすべて終わった後。tako を再起動しても器は残るので上がらない）（#2367）")),
+        (H::FdContainerNear { pid: 77, open: 210, soft: 256, percent: 82, remaining: 46, per_pane: 3, limit: ContainerLimitNote::Legacy }, s("器の tmux サーバー（pid 77）のファイル記述子（fd）の使用が上限に近い: 210 / 256 本（82%・残り 46 本）。上限に達すると器に新しいペインを作れず（create window failed: fork failed: Too many open files）、器への問い合わせ（画面の読み取り・生死の確認）もすべて返らなくなる。使っていないペインを閉じること（器の 1 ペインで約 3 本）。TAKO_2367_LEGACY のため引き上げた値を渡していない（#2367）")),
+        (H::FdContainerNear { pid: 77, open: 210, soft: 256, percent: 82, remaining: 46, per_pane: 3, limit: ContainerLimitNote::LaunchValue(None) }, s("器の tmux サーバー（pid 77）のファイル記述子（fd）の使用が上限に近い: 210 / 256 本（82%・残り 46 本）。上限に達すると器に新しいペインを作れず（create window failed: fork failed: Too many open files）、器への問い合わせ（画面の読み取り・生死の確認）もすべて返らなくなる。使っていないペインを閉じること（器の 1 ペインで約 3 本）。tako 自身が起動時に上限を引き上げていない（記録なし）ので器も起動時の値のまま（#2367）")),
+        (H::FdContainerUnreachable { reason: s("R"), last: Some((77, Some(256), Some(300))), per_pane: 3 }, s("器の tmux サーバーに問い合わせが届かない（R）。fd の上限に届いたサーバーは生きたまま、すべての問い合わせをこう返す（tmux 3.6b）。前に読めたサーバー（pid 77）は soft 256・いまの使用数は 300 本。上限に届いているなら、使っていないペインを閉じると戻る（器の 1 ペインで約 3 本）（#2367）")),
+        (H::FdContainerUnreachable { reason: s("R"), last: None, per_pane: 3 }, s("器の tmux サーバーに問い合わせが届かない（R）。fd の上限に届いたサーバーは生きたまま、すべての問い合わせをこう返す（tmux 3.6b）。上限に届いているなら、使っていないペインを閉じると戻る（器の 1 ペインで約 3 本）（#2367）")),
+        (H::EncodingPinGaveUp { pane: 4, reasons: s("shell: E") }, s("ペイン 4 の文字コードを UTF-8 に固定できなかった（shell: E）。このペインで UTF-8 のバイト列を書く子（type・CRT の printf 等）の出力は化ける。そのペインで chcp 65001 を実行すると直る（#2092）")),
+        (H::ModNoReport { count: 2, lines: s("a / b") }, s("claude が動いているのに mod の報告が無いペインが 2 個（a / b）。詳しくは tako mod")),
+        (H::AppUnreachable(s("refused")), s("tako アプリへ届かない（refused）")),
+        (H::ConnectionUnreachable(s("refused")), s("接続: 届かない（refused）")),
+        (H::AppUnreachableRefusal, s("tako アプリへ届かない（上の ipc 節が受け口の実測）")),
+        (H::Healthy(true), s("健全性: 問題なし")),
+        (H::Healthy(false), s("健全性: 指摘あり")),
+        (H::Versions { app: s("0.8.39"), cli: Some(s("0.8.39")) }, s("バージョン: app=0.8.39 cli=0.8.39")),
+        (H::Versions { app: s("0.8.39"), cli: None }, s("バージョン: app=0.8.39 cli=不明")),
+        (H::FdUsage { open: s("121"), soft: s("10240"), percent: s("1") }, s("fd: 121 / 10240 本（1%）")),
+        (H::FdRaised { launch: s("256"), soft: s("10240") }, s("起動時 256 → 10240 に引き上げ（ペインのシェルには 256）")),
+        (H::FdAlreadyEnough(s("10240")), s("起動時から 10240（引き上げは不要）")),
+        (H::FdHardCapped(s("200")), s("hard が 200 で引き上げられない（起動時のまま）")),
+        (H::FdFailed(Some(s("EPERM"))), s("引き上げに失敗（EPERM）")),
+        (H::FdFailed(None), s("引き上げに失敗（理由不明）")),
+        (H::FdLegacy, s("引き上げない（TAKO_2359_LEGACY）")),
+        (H::ContainerNotRunning, s("器の tmux サーバー: 起きていない")),
+        (H::ContainerUnreachable(Some(s("R"))), s("器の tmux サーバー: 問い合わせが届かない（R）")),
+        (H::ContainerUnreachable(None), s("器の tmux サーバー: 問い合わせが届かない（理由不明）")),
+        (H::ContainerUsage { open: s("90"), soft: s("10240"), percent: s("0") }, s("器の tmux サーバー: 90 / 10240 本（0%）")),
+        (H::ContainerRaised(s("10240")), s("引き上げた値を受け継いだ（器のペインのシェルには 10240）")),
+        (H::ContainerPredates(s("83")), s("引き上げより前に起きたので起動時のまま（約 83 ペインで詰まる。次にサーバーが起きたとき上がる）")),
+        (H::ContainerLegacy, s("引き上げない（TAKO_2367_LEGACY）")),
+        (H::ContainerLaunchValue, s("tako が引き上げていないので起動時のまま")),
+        (H::IpcEndpoint(s("/tmp/x.sock")), s("  受け口: /tmp/x.sock")),
+        (H::IpcErrorLine(s("E")), s("  理由: E")),
+        (H::WatchCounts { secs: 2, checks: 10, rebinds: 1 }, s("  見張り: 2 秒ごと・確認 10 回・張り直し 1 回")),
+        (H::WatchLastRebind { secs_ago: 5, reason: s("R") }, s("（最後: 5 秒前・R）")),
+        (H::WatchRebindError(s("E")), s("  張り直せない理由: E")),
+        (H::PipeDownLine { streak: 3, error: Some(s("E")), retry_ms: 500, max_secs: 30 }, s("  パイプの待ち受け: 作れていない（3 回続けて失敗・E）。500 ms 後に作り直す（最長 30 秒ごと）。この間は tako CLI / MCP の stdio が届かない（#2361）")),
+        (H::PipeOk(30), s("  パイプの待ち受け: 正常（作れなければ最長 30 秒ごとに作り直す）")),
+        (H::PipeOkWithOutages { outages: 2, failures: 5 }, s("  パイプの待ち受け: 正常・これまでに途切れ 2 回（作れなかった 5 回）")),
+        (H::PipeLastRecovery { secs_ago: 7, failures: 3, error: s("E") }, s("（最後: 7 秒前に 3 回続けて作れなかった後に戻った・E）")),
+        (H::FixedPathHeld(s("R")), s("  固定パス: 生きた受け口が居たので奪わずに一時パスで立てた（R）。同じデータディレクトリの別の tako が動いている = このウィンドウはセカンダリ（#2360）")),
+        (H::FixedPathReclaimed(s("R")), s("  固定パス: 起動時に残骸を消して張り直した（R）（#2360）")),
+        (H::GuiAliveUnreachable { pid: 9, why: s("W") }, s("  GUI: 動いている（pid 9）のに受け口が応答しない（W）")),
+        (H::SocketRefused, s("ソケットファイルはあるが誰も受けていない")),
+        (H::SocketMissing, s("ソケットファイルが無い")),
+        (H::NotConnected, s("繋がらない")),
+        (H::GuiNotRunning(9), s("  GUI: 動いていない（接続情報の pid 9 は居ない）")),
+        (H::GuiReachable(9), s("  GUI: 動いている（pid 9）・受け口にも繋がる（届かない理由は「接続:」の行）")),
+        (H::NextStep(s("N")), s("  次の一手: N")),
+        (H::StartTako, s("tako を起動する")),
+        (H::AliveUnreachableNext { windows: true, secs: 30 }, s("tako はパイプの待ち受けを作れなければ最長 30 秒ごとに作り直す。少し待って tako check-health をもう一度。戻らなければ tako を再起動する（#2361）")),
+        (H::AliveUnreachableNext { windows: false, secs: 2 }, s("tako は受け口を 2 秒ごとに確かめて張り直す。少し待って tako check-health をもう一度。戻らなければ tako を再起動する（#2002）")),
+        (H::SetupCheckTitle, s("tako セットアップ 環境チェック")),
+        (H::NoteSeparator, s("・")),
+    ]
+}
+
+/// `HealthText` の日英の対を書いた行
+fn health_text_where(t: &HealthText, lang: Lang) -> String {
+    where_written(
+        HEALTH_TEXT_SRC,
+        HEALTH_TEXT_PATH,
+        "impl HealthText {",
+        &format!("{t:?}"),
+        lang,
+    )
+}
+
+#[test]
+fn check_healthの文は全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let table = health_text_table();
+    let samples: Vec<HealthText> = table.iter().map(|(t, _)| t.clone()).collect();
+    covers_every(
+        &samples,
+        health_text_index,
+        HEALTH_TEXT_VARIANTS,
+        "HealthText",
+    );
+    let mut failures = Vec::new();
+    for (t, old) in &table {
+        let (ja, en) = (t.text_in(Lang::Ja), t.text_in(Lang::En));
+        if ja != *old {
+            failures.push(format!(
+                "{}: {t:?} の日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}",
+                health_text_where(t, Lang::Ja)
+            ));
+        }
+        if let Some(c) = has_japanese(&en) {
+            failures.push(format!(
+                "{}: {t:?} の英語に日本語（{c}）が混ざる: {en}",
+                health_text_where(t, Lang::En)
+            ));
+        }
+        if en.trim().is_empty() || ja == en {
+            failures.push(format!(
+                "{}: {t:?} の英語が空か日本語と同じ文（英語の書き忘れ）: {en}",
+                health_text_where(t, Lang::En)
+            ));
+        }
+        let shown = t.to_string();
+        if shown != ja && shown != en {
+            failures.push(format!(
+                "{t:?}: 表示（to_string）が日英どちらの文とも違う: {shown}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 診断（`diagnostics.rs`）の本体のうち、日本語の口として残す関数（頭）。網羅 match の日英の表・
+/// `tako setup` の本体が呼ぶ日本語の口（中で `Lang::Ja` を渡すだけ）・他所が組んだ行のラベルを
+/// 日英のどちらでも読む `status_from_line`
+const DIAG_JA_KEPT: &[&str] = &[
+    "fn status_from_line(",
+    "    pub fn label(self) -> &'static str {",
+    "    pub fn label_in(self, lang: Lang) -> &'static str {",
+    "    pub fn to_json(&self) -> Value {",
+    "pub fn config_share_lines(",
+];
+
+/// check-health を組む dispatch の関数（頭）
+const DISPATCH_HEALTH_SCOPES: &[&str] = &[
+    "fn collect_check_health_ctx(",
+    "fn finish_check_health(",
+    "fn ipc_describe(",
+    "fn ipc_fixed_path_describe(",
+    "fn ipc_watch_describe(",
+    "fn ipc_pipe_issue(",
+    "fn ipc_watch_issue(",
+    "fn fd_limit_describe(",
+    "fn fd_limit_issues(",
+    "fn fd_limit_container_issues(",
+    "fn terminal_queries_section(",
+    "fn encoding_pin_issues(",
+    "fn ipc_health_issue(",
+];
+
+/// 診断・check-health の組み立てで呼んではいけない日本語の口（`_in(lang)` の無い旧い口と `Lang::Ja` の固定）
+const HEALTH_JA_CALLS: &[&str] = &[
+    "Lang::Ja",
+    ".step_description()",
+    "Remaining::new(",
+    ".title()",
+    "::render(",
+    ".noting_state(",
+    ".unrunnable_text()",
+    ".unconfirmed_text()",
+    "UNRUNNABLE_HINT",
+    "degraded_warning(",
+    "check_line()",
+    "tako_cli_path_check_line()",
+    "tako_cli_path_json()",
+    "config_share_lines(",
+    "health_issue()",
+    "claude_mod::health_issues)",
+    "claude_mod::health_issues(",
+    "occupant.reason()",
+    "c.reason()",
+    ".reason.reason()",
+];
+
+/// 走査範囲の中で、日本語の文字リテラル（`'・'` の形）を書いた行（コメントは外す）。
+/// 文字列リテラルを読む [`line_literals`] は `'` を見ないので、ここで拾う
+fn japanese_char_literals(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (line, raw) in lines {
+        let chars: Vec<char> = strip_line_comment(raw).chars().collect();
+        let hit = chars
+            .windows(3)
+            .any(|w| w[0] == '\'' && w[2] == '\'' && has_japanese(&w[1].to_string()).is_some());
+        if hit {
+            out.push((*line, raw.trim().to_string()));
+        }
+    }
+    out
+}
+
+/// 走査範囲の中で、日本語の口の呼び出しを書いた行（コメントは外す）
+fn health_ja_calls(lines: &[(usize, &str)]) -> Vec<(usize, &'static str, String)> {
+    let mut out = Vec::new();
+    for (line, raw) in lines {
+        let code = strip_line_comment(raw);
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        if let Some(call) = HEALTH_JA_CALLS.iter().find(|c| code.contains(**c)) {
+            out.push((*line, *call, raw.trim().to_string()));
+        }
+    }
+    out
+}
+
+/// 診断の本体（単体テストの mod の前まで）から、日本語の口として残す関数の行を除いたもの
+fn diagnostics_scope_lines() -> Vec<(usize, &'static str)> {
+    let all = front_scope_lines(DIAGNOSTICS_SRC, None).expect("diagnostics.rs の本体を引ける");
+    let kept: Vec<(usize, usize)> = DIAG_JA_KEPT
+        .iter()
+        .map(|head| {
+            let lines = item_lines(DIAGNOSTICS_SRC, head).unwrap_or_else(|| {
+                panic!(
+                    "{DIAGNOSTICS_PATH}: DIAG_JA_KEPT の `{head}` が見つからない（改名なら直す）"
+                )
+            });
+            (lines[0].0, lines[lines.len() - 1].0)
+        })
+        .collect();
+    all.into_iter()
+        .filter(|(line, _)| !kept.iter().any(|(a, b)| (*a..=*b).contains(line)))
+        .collect()
+}
+
+/// 診断に載る内部の印（日本語のまま残す）
+const HEALTH_INTERNAL: [&str; 4] = [
+    "unreachable!(",
+    ".expect(",
+    "debug_assert!(",
+    "persist_log(",
+];
+
+/// 走査範囲の中の日本語（文字列リテラル + 文字リテラル。内部の印とコメントは外す）
+fn health_japanese(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+    let mut out = japanese_outside(lines, &HEALTH_INTERNAL);
+    out.extend(japanese_char_literals(lines));
+    out.sort();
+    out.dedup_by_key(|(line, _)| *line);
+    out
+}
+
+#[test]
+fn check_healthと診断の組み立てに日本語の固定文と日本語の口が無い() {
+    let mut failures = Vec::new();
+    let diag = diagnostics_scope_lines();
+    for (line, text) in health_japanese(&diag) {
+        failures.push(format!(
+            "{DIAGNOSTICS_PATH}:{line}: 診断（check-health と `tako setup --check` の行）に日本語の固定文がある = \
+             英語表示にもそのまま出る（tako_control::HealthText へバリアントを足す）: {text}"
+        ));
+    }
+    for (line, call, text) in health_ja_calls(&diag) {
+        failures.push(format!(
+            "{DIAGNOSTICS_PATH}:{line}: 診断が日本語の口（`{call}`）を呼ぶ = 英語表示でもその文だけ日本語で出る \
+             （`_in(lang)` の口へ表示言語を渡す）: {text}"
+        ));
+    }
+    for head in DISPATCH_HEALTH_SCOPES {
+        let Some(lines) = front_scope_lines(DISPATCH_SRC, Some(head)) else {
+            failures.push(format!(
+                "{DISPATCH_PATH}: 走査の範囲 `{head}` が見つからない（関数の改名で番犬が空振りする。\
+                 DISPATCH_HEALTH_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in health_japanese(&lines) {
+            failures.push(format!(
+                "{DISPATCH_PATH}:{line}: check-health を組む関数（`{head}`）に日本語の固定文がある = \
+                 英語表示にもそのまま出る（tako_control::HealthText へバリアントを足す）: {text}"
+            ));
+        }
+        for (line, call, text) in health_ja_calls(&lines) {
+            failures.push(format!(
+                "{DISPATCH_PATH}:{line}: check-health を組む関数（`{head}`）が日本語の口（`{call}`）を呼ぶ: {text}"
+            ));
+        }
+    }
+    // CLI の表示（日本語の固定文は `CLI_NOTE_SCOPES` の番犬が見る）は `Lang::Ja` で固定しない
+    for head in [
+        "fn check_health_cli(",
+        "fn print_check_health(",
+        "fn print_check_health_mod(",
+        "fn fd_limit_line(",
+        "fn fd_container_line(",
+        "fn print_ipc_section(",
+        "fn ipc_recovery_lines(",
+        "fn pipe_line(",
+        "fn local_gui_report(",
+        "fn alive_unreachable_next(",
+    ] {
+        let lines = front_scope_lines(CLI_MAIN_SRC, Some(head))
+            .unwrap_or_else(|| panic!("{CLI_MAIN_PATH}: `{head}` が見つからない"));
+        for (line, text) in japanese_char_literals(&lines) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}:{line}: check-health の表示（`{head}`）に日本語の文字リテラルがある = 英語表示にもそのまま出る: {text}"
+            ));
+        }
+        for (line, call, text) in health_ja_calls(&lines) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}:{line}: check-health の表示（`{head}`）が日本語の口（`{call}`）を呼ぶ: {text}"
+            ));
+        }
+    }
+    // `tako setup --check`（見出し・末尾の残り作業）
+    match front_scope_lines(SETUP_CLI_SRC, Some("pub fn run_check(")) {
+        Some(lines) => {
+            for (line, text) in health_japanese(&lines) {
+                failures.push(format!(
+                    "{SETUP_CLI_PATH}:{line}: `tako setup --check` に日本語の固定文がある = 英語表示にもそのまま出る \
+                     （tako_control::HealthText へ）: {text}"
+                ));
+            }
+            for (line, call, text) in health_ja_calls(&lines) {
+                failures.push(format!(
+                    "{SETUP_CLI_PATH}:{line}: `tako setup --check` が日本語の口（`{call}`）を呼ぶ: {text}"
+                ));
+            }
+            if !lines.iter().any(|(_, l)| l.contains("init_local_lang()")) {
+                failures.push(format!(
+                    "{SETUP_CLI_PATH}: `run_check` が診断を組む前に表示言語を決めていない（init_local_lang）= \
+                     英語の設定でも既定の言語で出る"
+                ));
+            }
+        }
+        None => failures.push(format!(
+            "{SETUP_CLI_PATH}: `pub fn run_check(` が見つからない（改名なら直す）"
+        )),
+    }
+    // GUI へ届かないときの CLI の手元の診断も、組む前に表示言語を決める
+    let local = front_scope_lines(CLI_MAIN_SRC, Some("fn check_health_cli(")).unwrap_or_default();
+    let init_at = local
+        .iter()
+        .find(|(_, l)| l.contains("init_local_lang()"))
+        .map(|(n, _)| *n);
+    let collect_at = local
+        .iter()
+        .find(|(_, l)| l.contains("diagnostics::collect()"))
+        .map(|(n, _)| *n);
+    if !matches!((init_at, collect_at), (Some(i), Some(c)) if i < c) {
+        failures.push(format!(
+            "{CLI_MAIN_PATH}: `check_health_cli` が手元の診断（diagnostics::collect）を組む前に表示言語を決めていない \
+             （init_local_lang = {init_at:?} / collect = {collect_at:?}）"
+        ));
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 日本語の固定文と日本語の口を名指し、コメント・内部の印・`_in` の口は見逃す
+#[test]
+fn check_healthの番犬の境界() {
+    let src = [
+        (1, "    let a = HealthText::IpcUp.text_in(lang);"),
+        (2, "    let b = \"IPC の受け口: 立っています\";"),
+        (3, "    // コメントの「日本語」と Lang::Ja は見ない"),
+        (
+            4,
+            "    let c = slot.take().expect(\"背景の問い合わせが答えを置いている\");",
+        ),
+        (5, "    let d = state.step_description();"),
+        (6, "    let e = state.step_description_in(lang);"),
+        (7, "    let f = Remaining::new(kind);"),
+        (8, "    let g = Remaining::new_in(kind, lang);"),
+        (9, "    let h = x.text_in(Lang::Ja);"),
+        (
+            10,
+            "    let i = crate::remote_serve::degraded_warning_in(&fields, lang);",
+        ),
+        (11, "        line.push('・');"),
+        (12, "        let sep = '/'; // '・' はコメント"),
+    ];
+    let ja: Vec<usize> = japanese_outside(&src, &HEALTH_INTERNAL)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(ja, vec![2], "日本語の固定文だけを名指す");
+    let chars: Vec<usize> = japanese_char_literals(&src)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(
+        chars,
+        vec![11],
+        "日本語の文字リテラルだけを名指し、コメントの中は見逃す"
+    );
+    let calls: Vec<usize> = health_ja_calls(&src)
+        .into_iter()
+        .map(|(l, _, _)| l)
+        .collect();
+    assert_eq!(
+        calls,
+        vec![5, 7, 9],
+        "日本語の口だけを名指し、`_in` の口は見逃す"
+    );
+}
+
+/// 共有する文の 1 件の検査（日本語は従来の口と同じ・英語に日本語が混ざらない・英語の書き忘れが無い）
+fn check_shared(failures: &mut Vec<String>, what: &str, ja_old: &str, ja: &str, en: &str) {
+    if ja != ja_old {
+        failures.push(format!(
+            "{what}: 日本語が従来の口と違う\n  want: {ja_old}\n  got:  {ja}"
+        ));
+    }
+    if let Some(c) = has_japanese(en) {
+        failures.push(format!("{what}: 英語に日本語（{c}）が混ざる: {en}"));
+    }
+    if en.trim().is_empty() != ja.trim().is_empty() || (ja == en && has_japanese(ja).is_some()) {
+        failures.push(format!("{what}: 英語が空か日本語と同じ文: {en}"));
+    }
+}
+
+/// 診断と共有する他モジュールの文（`_in(lang)`）: 英語に日本語が混ざらず、日本語は従来の口と同じ
+#[test]
+fn 診断と共有する他モジュールの文は表示言語で組む() {
+    use tako_control::setup_bootstrap::{self, Step};
+    use tako_control::setup_remaining::{self, Remaining, RemainingKind};
+    use tako_core::ipc_socket::{ListenerCheck, Occupant};
+    use tako_core::platform::agent_install::AgentKind;
+    let mut f = Vec::new();
+    for agent in AgentKind::ALL {
+        for step in [Step::Install, Step::Path, Step::Auth, Step::Ready] {
+            check_shared(
+                &mut f,
+                &format!("Step::{step:?}.describe_for_in({agent:?})"),
+                &step.describe_for(agent),
+                &step.describe_for_in(agent, Lang::Ja),
+                &step.describe_for_in(agent, Lang::En),
+            );
+        }
+        check_shared(
+            &mut f,
+            &format!("account_label_in({agent:?})"),
+            setup_bootstrap::account_label(agent),
+            setup_bootstrap::account_label_in(agent, Lang::Ja),
+            setup_bootstrap::account_label_in(agent, Lang::En),
+        );
+    }
+    let kinds = [
+        RemainingKind::AgentInstall(AgentKind::Claude),
+        RemainingKind::AgentPath(AgentKind::Codex),
+        RemainingKind::AgentPathByHand(AgentKind::Agy),
+        RemainingKind::AgentLogin(AgentKind::Claude),
+        RemainingKind::AgentMissing,
+        RemainingKind::AgentStatusUnknown,
+        RemainingKind::Mcp {
+            agent: "claude".into(),
+        },
+        RemainingKind::Dep { bin: "tmux".into() },
+        RemainingKind::ShellIntegration,
+    ];
+    for kind in &kinds {
+        check_shared(
+            &mut f,
+            &format!("{kind:?}.title_in"),
+            &kind.title(),
+            &kind.title_in(Lang::Ja),
+            &kind.title_in(Lang::En),
+        );
+        check_shared(
+            &mut f,
+            &format!("{kind:?}.default_detail_in"),
+            &kind.default_detail().join("\n"),
+            &kind.default_detail_in(Lang::Ja).join("\n"),
+            &kind.default_detail_in(Lang::En).join("\n"),
+        );
+    }
+    let items: Vec<Remaining> = kinds.iter().cloned().map(Remaining::new).collect();
+    let items_en: Vec<Remaining> = kinds
+        .iter()
+        .cloned()
+        .map(|k| Remaining::new_in(k, Lang::En))
+        .collect();
+    check_shared(
+        &mut f,
+        "setup_remaining::render_in",
+        &setup_remaining::render(&items).join("\n"),
+        &setup_remaining::render_in(&items, Lang::Ja).join("\n"),
+        &setup_remaining::render_in(&items_en, Lang::En).join("\n"),
+    );
+    check_shared(
+        &mut f,
+        "tailscale::unrunnable_hint_in",
+        tako_control::tailscale::UNRUNNABLE_HINT,
+        tako_control::tailscale::unrunnable_hint_in(Lang::Ja),
+        tako_control::tailscale::unrunnable_hint_in(Lang::En),
+    );
+    check_shared(
+        &mut f,
+        "setup_deps::unrunnable_line_in",
+        &tako_control::setup_deps::unrunnable_line("tailscale", "/opt/x"),
+        &tako_control::setup_deps::unrunnable_line_in("tailscale", "/opt/x", Lang::Ja),
+        &tako_control::setup_deps::unrunnable_line_in("tailscale", "/opt/x", Lang::En),
+    );
+    for platform in [
+        tako_core::platform::support::Platform::MacOs,
+        tako_core::platform::support::Platform::Windows,
+    ] {
+        for dep in tako_control::setup_deps::deps(platform) {
+            for (what, note) in [("purpose", dep.purpose), ("hint", dep.hint)] {
+                check_shared(
+                    &mut f,
+                    &format!("{platform:?} の {} の {what}", dep.bin),
+                    note.ja(),
+                    note.text_in(Lang::Ja),
+                    note.text_in(Lang::En),
+                );
+            }
+        }
+    }
+    let degraded = serde_json::json!({ "degraded": { "reason": "R", "next_step": "N" } });
+    check_shared(
+        &mut f,
+        "remote_serve::degraded_warning_in",
+        &tako_control::remote_serve::degraded_warning(&degraded).unwrap_or_default(),
+        &tako_control::remote_serve::degraded_warning_in(&degraded, Lang::Ja).unwrap_or_default(),
+        &tako_control::remote_serve::degraded_warning_in(&degraded, Lang::En).unwrap_or_default(),
+    );
+    for (injected, by_hand) in [
+        (Some(std::path::Path::new("/opt/tako/bin")), None),
+        (
+            Some(std::path::Path::new("/opt/tako/bin")),
+            Some("/opt/x".to_string()),
+        ),
+        (None, None),
+        (None, Some("/opt/x".to_string())),
+    ] {
+        let (level_ja, ja) =
+            setup_bootstrap::tako_cli_in_path_issue(injected, by_hand.clone(), Lang::Ja);
+        let (level_en, en) =
+            setup_bootstrap::tako_cli_in_path_issue(injected, by_hand.clone(), Lang::En);
+        if level_ja != level_en {
+            f.push(format!(
+                "tako_cli_in_path_issue: level が言語で変わる（{level_ja} / {level_en}）"
+            ));
+        }
+        check_shared(
+            &mut f,
+            &format!("tako_cli_in_path_issue({injected:?}, {by_hand:?})"),
+            &ja,
+            &ja,
+            &en,
+        );
+    }
+    for by_hand in [false, true] {
+        let ja = setup_bootstrap::tako_cli_link_issue("/opt/x", by_hand, Lang::Ja);
+        check_shared(
+            &mut f,
+            &format!("tako_cli_link_issue({by_hand})"),
+            &ja,
+            &ja,
+            &setup_bootstrap::tako_cli_link_issue("/opt/x", by_hand, Lang::En),
+        );
+    }
+    for c in [
+        ListenerCheck::Ours,
+        ListenerCheck::Missing,
+        ListenerCheck::ReplacedDead,
+        ListenerCheck::ForeignLive,
+        ListenerCheck::NotSocket,
+    ] {
+        check_shared(
+            &mut f,
+            &format!("ListenerCheck::{c:?}.reason_in"),
+            c.reason(),
+            c.reason_in(Lang::Ja),
+            c.reason_in(Lang::En),
+        );
+    }
+    for o in [
+        Occupant::Vacant,
+        Occupant::Live,
+        Occupant::Busy { pid: 42 },
+        Occupant::Dead,
+    ] {
+        check_shared(
+            &mut f,
+            &format!("Occupant::{o:?}.reason_in"),
+            &o.reason(),
+            &o.reason_in(Lang::Ja),
+            &o.reason_in(Lang::En),
+        );
+    }
+    let na = tako_core::platform::fd_limit::NOT_APPLICABLE_REASON;
+    check_shared(
+        &mut f,
+        "fd_limit::NOT_APPLICABLE_REASON",
+        na.ja(),
+        na.text_in(Lang::Ja),
+        na.text_in(Lang::En),
+    );
+    report_all(f);
 }
