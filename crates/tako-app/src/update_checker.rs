@@ -1119,17 +1119,17 @@ pub enum UpdateRefusal {
     UnzipFailed(String),
     /// `展開した ZIP に tako.app が見つかりません`
     NoAppInZip,
-    /// `bundle_install::replace_bundle_in_place` の断りをそのまま（tako-core の文。日英は Issue #2365 の
-    /// 残り = 枠を持たないので混ざらない）
-    BundleReplace(String),
+    /// `bundle_install::replace_bundle_in_place` の断り（tako-core の `BundleError`。枠を持たずに
+    /// 中身を同じ言語で引く）
+    BundleReplace(tako_core::platform::bundle_install::BundleError),
     /// `現在の配布系統は <label> のため修復は不要です`
     RepairNotNeeded(InstallMethod),
     /// `brew install --force が失敗: <stderr>`
     BrewInstallFailed(String),
     /// `.app バンドルのパスが特定できない（CLI 単体実行？）`
     NoAppBundle,
-    /// `再起動に失敗: <e>`
-    RestartFailed(String),
+    /// `再起動に失敗: <e>`（中身は `os_integration::open_new_instance_typed` の断り）
+    RestartFailed(tako_control::platform::os_integration::OsIntegrationError),
     /// `<InstallerError>`（起動し直す対象の exe が引けない）
     Installer(installer_update::InstallerError),
     /// `<InstallerError>。今の版のまま使えます`（インストーラーを起こせない）
@@ -1267,7 +1267,7 @@ impl UpdateRefusal {
             (Self::UnzipFailed(stderr), En) => format!("cannot extract the ZIP: {stderr}"),
             (Self::NoAppInZip, Ja) => "展開した ZIP に tako.app が見つかりません".into(),
             (Self::NoAppInZip, En) => "the extracted ZIP has no tako.app".into(),
-            (Self::BundleReplace(text), Ja | En) => text.clone(),
+            (Self::BundleReplace(e), Ja | En) => e.text_in(lang),
             (Self::RepairNotNeeded(method), Ja) => {
                 format!("現在の配布系統は {} のため修復は不要です", method.label())
             }
@@ -1287,8 +1287,8 @@ impl UpdateRefusal {
             (Self::NoAppBundle, En) => {
                 "cannot find the path of the .app bundle (running the CLI alone?)".into()
             }
-            (Self::RestartFailed(e), Ja) => format!("再起動に失敗: {e}"),
-            (Self::RestartFailed(e), En) => format!("the restart failed: {e}"),
+            (Self::RestartFailed(e), Ja) => format!("再起動に失敗: {}", e.text_in(lang)),
+            (Self::RestartFailed(e), En) => format!("the restart failed: {}", e.text_in(lang)),
             (Self::Installer(error), Ja | En) => error.text_in(lang),
             (Self::InstallerNotLaunched(error), Ja) => {
                 format!("{}。今の版のまま使えます", error.text_in(lang))
@@ -1616,8 +1616,8 @@ pub fn restart_app(restart: &Restart) -> Result<(), String> {
     match restart {
         Restart::OpenBundle => {
             let bundle = app_bundle_path().ok_or(UpdateRefusal::NoAppBundle)?;
-            tako_control::platform::os_integration::open_new_instance(&bundle)
-                .map_err(|e| UpdateRefusal::RestartFailed(e.to_string()))?;
+            tako_control::platform::os_integration::open_new_instance_typed(&bundle)
+                .map_err(UpdateRefusal::RestartFailed)?;
             Ok(())
         }
         Restart::RunInstaller(prepared) => {
@@ -3021,6 +3021,8 @@ mod tests {
 
     fn refusal_table() -> Vec<(UpdateRefusal, String)> {
         use installer_update::InstallerError as I;
+        use tako_control::platform::os_integration::{Launch, OsIntegrationError};
+        use tako_core::platform::bundle_install::{BundleError, SwapCause};
         let net = |c: NetworkCause| UpdateRefusal::CheckFailed(CheckError::Network(c));
         vec![
             (
@@ -3152,8 +3154,13 @@ mod tests {
                 "展開した ZIP に tako.app が見つかりません".into(),
             ),
             (
-                UpdateRefusal::BundleReplace("replace failed: os error 1".into()),
-                "replace failed: os error 1".into(),
+                UpdateRefusal::BundleReplace(BundleError::SwapFailed {
+                    dest: "/Applications/tako.app".into(),
+                    cause: SwapCause::Os("Operation not permitted (os error 1)".into()),
+                }),
+                "/Applications/tako.app の入れ替えに失敗: Operation not permitted (os error 1)\
+                 （/Applications/tako.app は変更していません）"
+                    .into(),
             ),
             (
                 UpdateRefusal::RepairNotNeeded(InstallMethod::Homebrew),
@@ -3168,8 +3175,11 @@ mod tests {
                 ".app バンドルのパスが特定できない（CLI 単体実行？）".into(),
             ),
             (
-                UpdateRefusal::RestartFailed("open: exit status 1".into()),
-                "再起動に失敗: open: exit status 1".into(),
+                UpdateRefusal::RestartFailed(OsIntegrationError::Spawn {
+                    what: Launch::NewInstance,
+                    error: "No such file or directory (os error 2)".into(),
+                }),
+                "再起動に失敗: アプリを起動できない: No such file or directory (os error 2)".into(),
             ),
             (
                 UpdateRefusal::Installer(I::Launch("not found".into())),
@@ -3215,14 +3225,7 @@ mod tests {
 
     /// 1 行の検査: 日本語が旧文とバイト一致・英語に日本語が無い・英語が空でも日本語と同じでもない
     /// （中身をそのまま出すもの = 文字列を持つだけのバリアントは日英が同じでよい）
-    fn check_row(
-        what: &str,
-        ja: &str,
-        en: &str,
-        old: &str,
-        passthrough: bool,
-        failures: &mut Vec<String>,
-    ) {
+    fn check_row(what: &str, ja: &str, en: &str, old: &str, failures: &mut Vec<String>) {
         if ja != old {
             failures.push(format!(
                 "{what} の日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}"
@@ -3231,7 +3234,7 @@ mod tests {
         if let Some(c) = has_japanese(en) {
             failures.push(format!("{what} の英語に日本語（{c}）が混ざる: {en}"));
         }
-        if en.trim().is_empty() || (!passthrough && ja == en) {
+        if en.trim().is_empty() || ja == en {
             failures.push(format!(
                 "{what} の英語が空か日本語と同じ（英語の書き忘れ）: {en}"
             ));
@@ -3245,13 +3248,11 @@ mod tests {
         let mut seen = [false; REFUSAL_VARIANTS];
         for (r, old) in &refusals {
             seen[refusal_index(r)] = true;
-            let passthrough = matches!(r, UpdateRefusal::BundleReplace(_));
             check_row(
                 &format!("{r:?}"),
                 &r.text_in(Lang::Ja),
                 &r.text_in(Lang::En),
                 old,
-                passthrough,
                 &mut failures,
             );
             // 「見つからない」の読み（リモートの 404 寄せ）は日英でそろう
@@ -3283,7 +3284,6 @@ mod tests {
                 &n.text_in(Lang::Ja),
                 &n.text_in(Lang::En),
                 &old,
-                false,
                 &mut failures,
             );
         }
@@ -3302,7 +3302,6 @@ mod tests {
                 &e.text_in(Lang::Ja),
                 &e.text_in(Lang::En),
                 old,
-                false,
                 &mut failures,
             );
         }
@@ -3326,7 +3325,6 @@ mod tests {
                 &rate_limit_note_in(retry, Lang::Ja),
                 &rate_limit_note_in(retry, Lang::En),
                 old,
-                false,
                 &mut failures,
             );
         }

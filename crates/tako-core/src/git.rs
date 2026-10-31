@@ -213,7 +213,8 @@ fn run_git_typed(repo: &Path, args: &[&str]) -> Result<String, GitError> {
 /// 日英の対は [`GitError::text_in`] の (バリアント, 言語) の網羅 match の 1 か所。日本語は #2365 より前の
 /// 固定文とバイト一致（`tako-control/tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。
 /// `String` を返す従来の口（[`commit`] / [`checkout`] / [`validate_branch_name`] ほか）は日本語のまま
-/// （GUI の git パネルが直に呼ぶ）。dispatch（CLI / MCP）だけが型の口 `*_typed` を通る。
+/// （呼び手は単体テスト・結果を捨てる口だけ）。dispatch（CLI / MCP）と GUI の git パネルは型の口
+/// `*_typed` を通り、表示言語で引く。
 /// [`GitError::Failed`] は git 自身の stderr（git のロケールの言語）で、日英とも同じ文をそのまま載せる
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {

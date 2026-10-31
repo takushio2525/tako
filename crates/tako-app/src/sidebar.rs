@@ -5121,8 +5121,9 @@ impl TakoApp {
 /// OS のアプリ選択 UI でアプリを選び、指定ファイルをそのアプリで開く。
 /// プラットフォーム差（macOS = 選択ダイアログ + `open -a` / Windows = `openas` verb）は
 /// 境界 B8（`platform::os_integration`）の内側にある（#617）
+/// 断りは表示言語の文（通知欄へそのまま出す。#2365）
 fn pick_app_and_open(path: &std::path::Path) -> Result<(), String> {
-    tako_control::platform::os_integration::open_with_dialog(path)
+    tako_control::platform::os_integration::open_with_dialog_typed(path).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

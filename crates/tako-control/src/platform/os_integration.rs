@@ -36,8 +36,10 @@
 //! 断りは [`OsIntegrationError`] の (バリアント, 言語) の網羅 match の 1 か所に置く。
 //! **macOS / Windows / その他の実装の文をすべて `cfg` の外に置く**ので、Windows の
 //! `ShellExecuteW` / `SHFileOperationW` の説明も macOS の単体テストで日英を検査できる。
-//! 従来の口（[`reveal`] ほか）は `String` を返し、文は**日本語のまま**（GUI の UI・診断ログが
-//! そのまま使う）。断りを表示言語で返す dispatch だけが型の口（`*_typed`）を通す
+//! 従来の口（[`reveal`] ほか）は `String` を返し、文は**日本語のまま**（診断ログと、結果を捨てる
+//! 呼び手が使う）。断りを利用者へ見せる口（dispatch・GUI の通知欄・更新の断り・プレビューのリンク）は
+//! 型の口（`*_typed`）を通して表示言語で引く。GUI だけが呼ぶ「アプリを選んで開く」と「新しいプロセスで
+//! 起動」は型の口だけを持つ
 
 use std::path::Path;
 
@@ -551,9 +553,9 @@ pub fn windows_url_launch(url: &str) -> WindowsUrlLaunch {
 }
 
 /// アプリケーションを**新しいプロセスとして**起動する（macOS の `open -n` 相当）。
-/// 自動更新後の再起動（B14）が使う
-pub fn open_new_instance(app: &Path) -> Result<(), String> {
-    imp::open_new_instance(app).map_err(OsIntegrationError::into_ja)
+/// 自動更新後の再起動（B14）が使う（断りは `UpdateRefusal::RestartFailed` が表示言語で包む = #2365）
+pub fn open_new_instance_typed(app: &Path) -> Result<(), OsIntegrationError> {
+    imp::open_new_instance(app)
 }
 
 /// 「このアプリで開く…」= OS のアプリ選択 UI を出し、選ばれたアプリでパスを開く。
@@ -561,9 +563,10 @@ pub fn open_new_instance(app: &Path) -> Result<(), String> {
 /// **1 操作として境界に置く**。macOS は「アプリ選択ダイアログ → `open -a`」の 2 段だが、
 /// Windows の対応物は `openas` verb（「このファイルを開く方法を選んでください」）で
 /// **選択と起動が分かれていない**ため、`pick_application()` のような部品に割ると
-/// Windows 側が表現できない。キャンセルはエラー（呼び出し側は無視してよい）
-pub fn open_with_dialog(path: &Path) -> Result<(), String> {
-    imp::open_with_dialog(path).map_err(OsIntegrationError::into_ja)
+/// Windows 側が表現できない。キャンセルはエラー（呼び出し側は無視してよい）。
+/// 呼び手はファイルツリーの通知欄だけなので型の口だけを持つ（表示言語で引く = #2365）
+pub fn open_with_dialog_typed(path: &Path) -> Result<(), OsIntegrationError> {
+    imp::open_with_dialog(path)
 }
 
 /// パスをゴミ箱へ移す（**完全削除にはしない**）。

@@ -3,7 +3,7 @@
 //! ## なぜ macOS と別の腕が要るか
 //!
 //! macOS は zip を展開して `.app` を差し替え、`open -n` で起動し直す（`ditto` /
-//! `bundle_install` / `os_integration::open_new_instance`）。Windows の配布物は
+//! `bundle_install` / `os_integration::open_new_instance_typed`）。Windows の配布物は
 //! Inno Setup のインストーラー（`tako-<tag>-windows-x86_64.exe`。#587）で、
 //! **動いている exe は自分では上書きできない**。そこで差し替えはインストーラーに任せ、
 //! tako は「検査して起動して抜ける」だけを受け持つ。

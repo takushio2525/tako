@@ -327,12 +327,10 @@ fn win32_window_alive(_hwnd: isize) -> bool {
     true
 }
 
-/// 親が窓に載っていないので Web ビューを作らない理由（#1837。CLI / MCP の応答と
-/// persist.log の同じ 1 文）
-pub fn detached_parent_error() -> String {
-    "Web ビューの親（tako の窓）が閉じているので Web ビューを作れない。\
-     tako の窓を開いてから開き直す（#1837）"
-        .to_string()
+/// 親が窓に載っていないので Web ビューを作らない理由（#1837）。CLI / MCP の応答・`web list` の
+/// `error` は表示言語の文（`HostRefusal::WebViewParentDetached`。#2365）、persist.log へは日本語の文
+pub fn detached_parent_error() -> HostRefusal {
+    HostRefusal::WebViewParentDetached
 }
 
 /// フレーム同期をルート render で行う新経路（#838）を切る逃げ道
@@ -538,7 +536,7 @@ impl WebViewEntry {
         // 届く前に断る = tako 全体を落とさない）。macOS の wry は親の NSWindow を
         // `ns_view.window().unwrap()` で引くので、渡すと panic する
         if !window.attached() {
-            return Err(detached_parent_error());
+            return Err(detached_parent_error().into());
         }
         if let Ok(mut s) = shared.lock() {
             s.create_failure = None;
@@ -790,7 +788,7 @@ impl WebViewEntry {
             return Err(self.not_ready_error().into());
         };
         if !self.in_window() {
-            return Err(detached_parent_error());
+            return Err(detached_parent_error().into());
         }
         view.focus().map_err(|e| e.to_string())
     }
@@ -1809,13 +1807,17 @@ mod tests {
         }
     }
 
-    /// 親が閉じているときの理由は CLI / MCP の応答と persist.log で同じ 1 文（#1837）
+    /// 親が閉じているときの理由は何をすればよいかを言う（#1837）。persist.log は日本語の文、
+    /// CLI / MCP の応答は表示言語の文（#2365）
     #[test]
     fn issue1837_親が閉じているときの理由は何をすればよいかを言う() {
-        let reason = detached_parent_error();
+        let reason = detached_parent_error().text_in(tako_core::i18n::Lang::Ja);
         assert!(reason.contains("Web ビューの親"));
         assert!(reason.contains("窓を開いて"));
         assert!(reason.contains("#1837"));
+        // 英語表示でも何をすればよいかを言う（#2365）
+        let en = detached_parent_error().text_in(tako_core::i18n::Lang::En);
+        assert!(en.contains("tako window") && en.contains("#1837"), "{en}");
     }
 
     /// `src` の `offset` が何行目か（1 始まり。番犬の名指し用）

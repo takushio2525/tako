@@ -29,11 +29,119 @@
 use std::path::PathBuf;
 
 use tako_core::file_clipboard::{OsFiles, OsPeek};
+use tako_core::i18n::Lang;
 
-/// OS のクリップボードへファイルを書く（`cut` = 切り取り）。返り値は書いた後の変更番号
-pub fn write(paths: &[PathBuf], cut: bool) -> Result<u64, String> {
+/// OS のクリップボードへ書けない理由（#2365。dispatch の応答の `os_note` に表示言語の文で載る）。
+///
+/// 日英の対は [`ClipboardWriteError::text_in`] の (バリアント, 言語) の網羅 match の 1 か所。
+/// macOS / Windows / その他の実装の文をすべて `cfg` の外に置くので、Windows の文も macOS の単体テストで
+/// 日英を検査できる。日本語は #2365 より前の固定文とバイト一致。`error` は OS のエラー文（そのまま載せる）、
+/// パスは表記のまま埋める
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardWriteError {
+    /// 書くファイルが無い
+    NoFiles,
+    // ---- macOS（NSPasteboard） ----
+    /// NSString へ渡す文字列に NUL がある
+    NulInText,
+    /// NSString を作れない
+    NsStringFailed,
+    /// AppKit を読み込めない
+    AppKitUnavailable,
+    /// ペーストボードを開けない
+    PasteboardUnavailable,
+    /// ファイルの URL へ渡すパスに NUL がある
+    NulInPath(String),
+    /// ファイルの URL を作れない
+    FileUrlFailed(String),
+    /// ペーストボードの項目を作れない
+    ItemCreateFailed,
+    /// ペーストボードの項目に書けない
+    ItemWriteFailed,
+    /// ペーストボードへ書けない
+    WriteFailed,
+    // ---- Windows（CF_HDROP） ----
+    /// クリップボードを開けない（ほかのアプリが使っている）
+    ClipboardBusy,
+    /// `GlobalAlloc` が失敗した
+    GlobalAllocFailed,
+    /// `GlobalLock` が失敗した
+    GlobalLockFailed,
+    /// `SetClipboardData` が失敗した
+    SetDataFailed(String),
+    /// `EmptyClipboard` が失敗した
+    EmptyFailed(String),
+    // ---- その他 ----
+    /// この OS は未対応（tako の中だけで貼れる）
+    Unsupported,
+}
+
+impl ClipboardWriteError {
+    /// 表示言語を明示しての文言（網羅 match = バリアントを足すと日英の両方を書くまで通らない）
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NoFiles, Ja) => "書くファイルが無い".into(),
+            (Self::NoFiles, En) => "no files to write".into(),
+            (Self::NulInText, Ja) => "NUL を含む文字列".into(),
+            (Self::NulInText, En) => "the string contains NUL".into(),
+            (Self::NsStringFailed, Ja) => "NSString を作れない".into(),
+            (Self::NsStringFailed, En) => "cannot create an NSString".into(),
+            (Self::AppKitUnavailable, Ja) => {
+                "NSPasteboard が使えない（AppKit を読み込めない）".into()
+            }
+            (Self::AppKitUnavailable, En) => {
+                "NSPasteboard is unavailable (cannot load AppKit)".into()
+            }
+            (Self::PasteboardUnavailable, Ja) => "ペーストボードを開けない".into(),
+            (Self::PasteboardUnavailable, En) => "cannot open the pasteboard".into(),
+            (Self::NulInPath(path), Ja) => format!("NUL を含むパス: {path}"),
+            (Self::NulInPath(path), En) => format!("the path contains NUL: {path}"),
+            (Self::FileUrlFailed(path), Ja) => format!("ファイルの URL を作れない: {path}"),
+            (Self::FileUrlFailed(path), En) => format!("cannot create the file URL: {path}"),
+            (Self::ItemCreateFailed, Ja) => "ペーストボードの項目を作れない".into(),
+            (Self::ItemCreateFailed, En) => "cannot create a pasteboard item".into(),
+            (Self::ItemWriteFailed, Ja) => "ペーストボードの項目に書けない".into(),
+            (Self::ItemWriteFailed, En) => "cannot write to a pasteboard item".into(),
+            (Self::WriteFailed, Ja) => "ペーストボードへ書けない".into(),
+            (Self::WriteFailed, En) => "cannot write to the pasteboard".into(),
+            (Self::ClipboardBusy, Ja) => {
+                "クリップボードを開けない（ほかのアプリが使っている）".into()
+            }
+            (Self::ClipboardBusy, En) => {
+                "cannot open the clipboard (another app is using it)".into()
+            }
+            (Self::GlobalAllocFailed, Ja) => "GlobalAlloc に失敗".into(),
+            (Self::GlobalAllocFailed, En) => "GlobalAlloc failed".into(),
+            (Self::GlobalLockFailed, Ja) => "GlobalLock に失敗".into(),
+            (Self::GlobalLockFailed, En) => "GlobalLock failed".into(),
+            (Self::SetDataFailed(error), Ja) => format!("SetClipboardData に失敗: {error}"),
+            (Self::SetDataFailed(error), En) => format!("SetClipboardData failed: {error}"),
+            (Self::EmptyFailed(error), Ja) => format!("クリップボードを空にできない: {error}"),
+            (Self::EmptyFailed(error), En) => format!("cannot empty the clipboard: {error}"),
+            (Self::Unsupported, Ja) => {
+                "この OS ではファイルのクリップボードに未対応（tako の中だけで貼れる）".into()
+            }
+            (Self::Unsupported, En) => {
+                "this OS does not support the file clipboard (paste works only inside tako)".into()
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ClipboardWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
+impl std::error::Error for ClipboardWriteError {}
+
+/// OS のクリップボードへファイルを書く（`cut` = 切り取り）。返り値は書いた後の変更番号。
+/// 呼び手は GUI の口だけ（`os_file_clipboard_write`）なので、断りは型のまま返す（#2365）
+pub fn write(paths: &[PathBuf], cut: bool) -> Result<u64, ClipboardWriteError> {
     if paths.is_empty() {
-        return Err("書くファイルが無い".into());
+        return Err(ClipboardWriteError::NoFiles);
     }
     imp::write(pasteboard_name().as_deref(), paths, cut)
 }
@@ -147,6 +255,8 @@ mod imp {
 
     use tako_core::file_clipboard::{OsFiles, OsPeek};
 
+    use super::ClipboardWriteError;
+
     type Id = *const c_void;
     type Sel = *const c_void;
 
@@ -250,11 +360,11 @@ mod imp {
         })
     }
 
-    unsafe fn ns_string(text: &str) -> Result<Id, String> {
-        let c = CString::new(text).map_err(|_| "NUL を含む文字列".to_string())?;
+    unsafe fn ns_string(text: &str) -> Result<Id, ClipboardWriteError> {
+        let c = CString::new(text).map_err(|_| ClipboardWriteError::NulInText)?;
         let s = send_cstr(class(c"NSString"), c"stringWithUTF8String:", c.as_ptr());
         if s.is_null() {
-            return Err("NSString を作れない".into());
+            return Err(ClipboardWriteError::NsStringFailed);
         }
         Ok(s)
     }
@@ -265,9 +375,9 @@ mod imp {
         f(recv, sel(name), a)
     }
 
-    unsafe fn pasteboard(name: Option<&str>) -> Result<Id, String> {
+    unsafe fn pasteboard(name: Option<&str>) -> Result<Id, ClipboardWriteError> {
         if !ensure_appkit() {
-            return Err("NSPasteboard が使えない（AppKit を読み込めない）".into());
+            return Err(ClipboardWriteError::AppKitUnavailable);
         }
         let cls = class(c"NSPasteboard");
         let pb = match name {
@@ -275,15 +385,15 @@ mod imp {
             None => send(cls, c"generalPasteboard"),
         };
         if pb.is_null() {
-            return Err("ペーストボードを開けない".into());
+            return Err(ClipboardWriteError::PasteboardUnavailable);
         }
         Ok(pb)
     }
 
     /// パスのバイト列そのままでファイルの URL を作る（UTF-8 でない名前も崩さない）
-    unsafe fn file_url(path: &Path) -> Result<Id, String> {
+    unsafe fn file_url(path: &Path) -> Result<Id, ClipboardWriteError> {
         let c = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| format!("NUL を含むパス: {}", path.display()))?;
+            .map_err(|_| ClipboardWriteError::NulInPath(path.display().to_string()))?;
         let is_dir = std::fs::metadata(path).is_ok_and(|m| m.is_dir());
         let f: unsafe extern "C" fn(Id, Sel, *const c_char, u8, Id) -> Id =
             std::mem::transmute(objc_msgSend as *const c_void);
@@ -295,12 +405,18 @@ mod imp {
             std::ptr::null(),
         );
         if url.is_null() {
-            return Err(format!("ファイルの URL を作れない: {}", path.display()));
+            return Err(ClipboardWriteError::FileUrlFailed(
+                path.display().to_string(),
+            ));
         }
         Ok(url)
     }
 
-    pub(super) fn write(name: Option<&str>, paths: &[PathBuf], _cut: bool) -> Result<u64, String> {
+    pub(super) fn write(
+        name: Option<&str>,
+        paths: &[PathBuf],
+        _cut: bool,
+    ) -> Result<u64, ClipboardWriteError> {
         let _pool = Pool::new();
         // SAFETY: AppKit の公開 API を、各セレクタの宣言どおりの型で呼ぶ。作ったものは
         // 自動解放（`alloc`/`init` の 1 つは配列へ入れた後に release する）
@@ -315,7 +431,7 @@ mod imp {
                 let absolute = send(url, c"absoluteString");
                 let item = send(send(class(c"NSPasteboardItem"), c"alloc"), c"init");
                 if item.is_null() || absolute.is_null() {
-                    return Err("ペーストボードの項目を作れない".into());
+                    return Err(ClipboardWriteError::ItemCreateFailed);
                 }
                 let mut ok = send_bool2(item, c"setString:forType:", absolute, url_type);
                 if i == 0 {
@@ -324,12 +440,12 @@ mod imp {
                 send1(items, c"addObject:", item);
                 send(item, c"release");
                 if !ok {
-                    return Err("ペーストボードの項目に書けない".into());
+                    return Err(ClipboardWriteError::ItemWriteFailed);
                 }
             }
             send_isize(pb, c"clearContents");
             if !send_bool1(pb, c"writeObjects:", items) {
-                return Err("ペーストボードへ書けない".into());
+                return Err(ClipboardWriteError::WriteFailed);
             }
             Ok(send_isize(pb, c"changeCount") as u64)
         }
@@ -401,7 +517,7 @@ mod imp {
     }
 
     /// `NSPasteboardURLReadingFileURLsOnlyKey`（AppKit の定数。読み込み済みの AppKit から引く）
-    unsafe fn file_urls_only_key() -> Result<Id, String> {
+    unsafe fn file_urls_only_key() -> Result<Id, ClipboardWriteError> {
         let sym = libc::dlsym(
             libc::RTLD_DEFAULT,
             c"NSPasteboardURLReadingFileURLsOnlyKey".as_ptr(),
@@ -469,6 +585,8 @@ mod imp {
 
     use tako_core::file_clipboard::{OsFiles, OsPeek};
 
+    use super::ClipboardWriteError;
+
     #[link(name = "user32")]
     extern "system" {
         fn OpenClipboard(owner: *mut c_void) -> i32;
@@ -500,7 +618,7 @@ mod imp {
     struct Opened;
 
     impl Opened {
-        fn open() -> Result<Self, String> {
+        fn open() -> Result<Self, ClipboardWriteError> {
             for _ in 0..10 {
                 // SAFETY: 所有者なし（gpui の書き込みと同じ開き方）
                 if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
@@ -508,7 +626,7 @@ mod imp {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Err("クリップボードを開けない（ほかのアプリが使っている）".into())
+            Err(ClipboardWriteError::ClipboardBusy)
         }
     }
 
@@ -526,23 +644,22 @@ mod imp {
     }
 
     /// 開いている間に呼ぶ。成功したら中身の持ち主は OS（解放しない）
-    unsafe fn set_bytes(format: u32, data: &[u8]) -> Result<(), String> {
+    unsafe fn set_bytes(format: u32, data: &[u8]) -> Result<(), ClipboardWriteError> {
         let mem = GlobalAlloc(GMEM_MOVEABLE, data.len().max(1));
         if mem.is_null() {
-            return Err("GlobalAlloc に失敗".into());
+            return Err(ClipboardWriteError::GlobalAllocFailed);
         }
         let ptr = GlobalLock(mem);
         if ptr.is_null() {
             GlobalFree(mem);
-            return Err("GlobalLock に失敗".into());
+            return Err(ClipboardWriteError::GlobalLockFailed);
         }
         std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
         GlobalUnlock(mem);
         if SetClipboardData(format, mem).is_null() {
             GlobalFree(mem);
-            return Err(format!(
-                "SetClipboardData に失敗: {}",
-                std::io::Error::last_os_error()
+            return Err(ClipboardWriteError::SetDataFailed(
+                std::io::Error::last_os_error().to_string(),
             ));
         }
         Ok(())
@@ -564,7 +681,11 @@ mod imp {
         Some(bytes)
     }
 
-    pub(super) fn write(_name: Option<&str>, paths: &[PathBuf], cut: bool) -> Result<u64, String> {
+    pub(super) fn write(
+        _name: Option<&str>,
+        paths: &[PathBuf],
+        cut: bool,
+    ) -> Result<u64, ClipboardWriteError> {
         let wide: Vec<Vec<u16>> = paths
             .iter()
             .map(|p| p.as_os_str().encode_wide().collect())
@@ -586,9 +707,8 @@ mod imp {
             // SAFETY: 開いている間に、宣言どおりの型で呼ぶ
             unsafe {
                 if EmptyClipboard() == 0 {
-                    return Err(format!(
-                        "クリップボードを空にできない: {}",
-                        std::io::Error::last_os_error()
+                    return Err(ClipboardWriteError::EmptyFailed(
+                        std::io::Error::last_os_error().to_string(),
                     ));
                 }
                 set_bytes(CF_HDROP, &drop_files)?;
@@ -659,12 +779,14 @@ mod imp {
 
     use tako_core::file_clipboard::{OsFiles, OsPeek};
 
+    use super::ClipboardWriteError;
+
     pub(super) fn write(
         _name: Option<&str>,
         _paths: &[PathBuf],
         _cut: bool,
-    ) -> Result<u64, String> {
-        Err("この OS ではファイルのクリップボードに未対応（tako の中だけで貼れる）".into())
+    ) -> Result<u64, ClipboardWriteError> {
+        Err(ClipboardWriteError::Unsupported)
     }
 
     pub(super) fn read(_name: Option<&str>) -> OsFiles {

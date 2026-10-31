@@ -21371,18 +21371,22 @@ impl TakoApp {
     ///
     /// #2009: 裏で手放したプレイヤーは控えた再生状態（位置・速度・音量・ミュート・ループ）で
     /// 開き直す。表に戻した描画・CLI / MCP の操作のどちらから来ても同じ 1 本を通る
-    fn ensure_video_player(&mut self, pane_id: PaneId) -> Result<(), String> {
+    ///
+    /// 断りは型で返す（#2365。CLI / MCP の口は `?` で表示言語の文、stderr の診断へは日本語の文 =
+    /// `start_video_player`）
+    fn ensure_video_player(&mut self, pane_id: PaneId) -> Result<(), HostRefusal> {
         if self.video_players.contains_key(&pane_id) {
             return Ok(());
         }
         let path = match self.previews.get(&pane_id) {
             Some(state) => state.path.clone(),
-            None => return Err(HostRefusal::NoPreviewInPane.into()),
+            None => return Err(HostRefusal::NoPreviewInPane),
         };
         let resume = self.video_resume.get(&pane_id).copied();
         let player = match resume {
             Some(resume) => {
-                let mut player = video_player::VideoPlayer::open_at(&path, resume.position)?;
+                let mut player = video_player::VideoPlayer::open_at(&path, resume.position)
+                    .map_err(HostRefusal::VideoOpen)?;
                 player.set_rate(resume.rate);
                 player.set_volume(resume.volume);
                 if resume.muted {
@@ -21392,7 +21396,7 @@ impl TakoApp {
                 player.ended = resume.ended;
                 player
             }
-            None => video_player::VideoPlayer::open(&path)?,
+            None => video_player::VideoPlayer::open(&path).map_err(HostRefusal::VideoOpen)?,
         };
         self.video_resume.remove(&pane_id);
         self.video_players.insert(pane_id, player);
@@ -21413,7 +21417,10 @@ impl TakoApp {
                 cx.notify();
             }
             Err(e) => {
-                eprintln!("動画プレイヤー起動失敗: {e}");
+                eprintln!(
+                    "動画プレイヤー起動失敗: {}",
+                    e.text_in(tako_core::i18n::Lang::Ja)
+                );
             }
         }
     }
@@ -23251,8 +23258,8 @@ impl TakoApp {
         // 採り直さない腕（`TAKO_1837_LEGACY=web`）ではここで理由つきで断る
         if !self.webview_parent_live() {
             let reason = webview::detached_parent_error();
-            webview_parent_diag(&reason);
-            return Err(reason);
+            webview_parent_diag(&reason.text_in(tako_core::i18n::Lang::Ja));
+            return Err(reason.into());
         }
         let id = webview::WebViewId(self.webview_next_id);
         if webview::async_build_enabled() {
@@ -23339,8 +23346,9 @@ impl TakoApp {
                 .position(|e| e.phase() == webview::WebViewPhase::Queued)?;
             if !self.webview_parent_live() {
                 let reason = webview::detached_parent_error();
-                webview_parent_diag(&reason);
-                self.webviews[idx].fail(&reason);
+                webview_parent_diag(&reason.text_in(tako_core::i18n::Lang::Ja));
+                // `web list` の error は表示言語の文（#2365）
+                self.webviews[idx].fail(&reason.to_string());
                 continue;
             }
             let parent = self.window_raw_handle.as_ref()?;
@@ -27965,7 +27973,8 @@ impl PreviewHost for TakoApp {
         })?;
         let url = tako_core::md_links::browser_url(&link.url)
             .ok_or_else(|| HostRefusal::LinkNotBrowsable(link.url.clone()))?;
-        tako_control::platform::os_integration::open_url(url)?;
+        // OS へ渡せなかった断りは表示言語で返す（#2365）
+        tako_control::platform::os_integration::open_url_typed(url).map_err(|e| e.to_string())?;
         Ok(serde_json::json!({
             "pane": pane.as_u64(),
             "action": "opened_url",
@@ -28054,7 +28063,8 @@ impl PreviewHost for TakoApp {
                 // （PDF の内容。一覧が要るなら `tako preview-link-list`）
                 let url = tako_core::url_guard::check_browser_url(url)
                     .map_err(|reason| HostRefusal::LinkNotBrowsable(reason.to_string()))?;
-                tako_control::platform::os_integration::open_url(url)?;
+                tako_control::platform::os_integration::open_url_typed(url)
+                    .map_err(|e| e.to_string())?;
                 Ok(serde_json::json!({
                     "pane": pane.as_u64(),
                     "action": "opened_url",
@@ -28569,7 +28579,8 @@ impl PreviewHost for TakoApp {
         paths: &[std::path::PathBuf],
         cut: bool,
     ) -> Result<u64, String> {
-        tako_control::platform::file_clipboard::write(paths, cut)
+        // 書けなかった理由は応答の `os_note` に表示言語の文で載る（#2365）
+        tako_control::platform::file_clipboard::write(paths, cut).map_err(|e| e.to_string())
     }
 
     fn os_file_clipboard_read(&self) -> tako_core::file_clipboard::OsFiles {

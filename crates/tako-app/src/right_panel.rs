@@ -5011,14 +5011,14 @@ impl TakoApp {
                 .spawn(async move {
                     let repo = std::path::Path::new(&repo_root);
                     let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-                    tako_core::git::stage(repo, &refs)
+                    tako_core::git::stage_typed(repo, &refs)
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
                 app.git_busy = None;
                 match result {
                     Ok(_) => app.git_set_feedback(format!("staged: {label}"), false, cx),
-                    Err(e) => app.git_set_feedback(e, true, cx),
+                    Err(e) => app.git_set_feedback(e.to_string(), true, cx),
                 }
                 app.refresh_git(cx);
             });
@@ -5043,14 +5043,14 @@ impl TakoApp {
                 .spawn(async move {
                     let repo = std::path::Path::new(&repo_root);
                     let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-                    tako_core::git::unstage(repo, &refs)
+                    tako_core::git::unstage_typed(repo, &refs)
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
                 app.git_busy = None;
                 match result {
                     Ok(_) => app.git_set_feedback(format!("unstaged: {label}"), false, cx),
-                    Err(e) => app.git_set_feedback(e, true, cx),
+                    Err(e) => app.git_set_feedback(e.to_string(), true, cx),
                 }
                 app.refresh_git(cx);
             });
@@ -5139,7 +5139,7 @@ impl TakoApp {
                 .background_executor()
                 .spawn(async move {
                     let repo = std::path::Path::new(&repo_root);
-                    tako_core::git::commit(repo, &message, all)
+                    tako_core::git::commit_typed(repo, &message, all)
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
@@ -5153,7 +5153,7 @@ impl TakoApp {
                         if app.git_commit.text().trim().is_empty() {
                             app.git_commit.set_text(restore);
                         }
-                        app.git_set_feedback(e, true, cx);
+                        app.git_set_feedback(e.to_string(), true, cx);
                     }
                 }
                 app.refresh_git(cx);
@@ -5191,11 +5191,11 @@ impl TakoApp {
                 .background_executor()
                 .spawn(async move {
                     let repo = std::path::Path::new(&repo_root);
-                    let preview = tako_core::git::checkout_preview(repo, &branch_for_task)?;
+                    let preview = tako_core::git::checkout_preview_typed(repo, &branch_for_task)?;
                     if !preview.blockers.is_empty() || (!confirm && preview.needs_confirmation()) {
-                        return Ok::<_, String>((preview, None));
+                        return Ok::<_, tako_core::git::GitError>((preview, None));
                     }
-                    let out = tako_core::git::checkout(repo, &branch_for_task)?;
+                    let out = tako_core::git::checkout_typed(repo, &branch_for_task)?;
                     Ok((preview, Some(out)))
                 })
                 .await;
@@ -5212,7 +5212,7 @@ impl TakoApp {
                         };
                         app.git_set_feedback(msg, false, cx);
                     }
-                    Err(e) => app.git_set_feedback(e, true, cx),
+                    Err(e) => app.git_set_feedback(e.to_string(), true, cx),
                 }
                 app.refresh_git(cx);
             });
@@ -5256,11 +5256,11 @@ impl TakoApp {
                 .background_executor()
                 .spawn(async move {
                     let repo = std::path::Path::new(&repo_root);
-                    let preview = tako_core::git::merge_preview(repo, &branch_for_task)?;
+                    let preview = tako_core::git::merge_preview_typed(repo, &branch_for_task)?;
                     if !confirm || !preview.blockers.is_empty() {
-                        return Ok::<_, String>((preview, None));
+                        return Ok::<_, tako_core::git::GitError>((preview, None));
                     }
-                    let outcome = tako_core::git::merge(repo, &branch_for_task, false)?;
+                    let outcome = tako_core::git::merge_typed(repo, &branch_for_task, false)?;
                     Ok((preview, Some(outcome)))
                 })
                 .await;
@@ -5285,7 +5285,7 @@ impl TakoApp {
                             );
                         }
                     }
-                    Err(e) => app.git_set_feedback(e, true, cx),
+                    Err(e) => app.git_set_feedback(e.to_string(), true, cx),
                 }
                 app.refresh_git(cx);
             });
@@ -5320,8 +5320,8 @@ impl TakoApp {
             return;
         }
         // 名前の不正は git を呼ぶ前に理由つきで返す（押しても無反応にしない）
-        if let Err(e) = tako_core::git::validate_branch_name(&name) {
-            self.git_set_feedback(e, true, cx);
+        if let Err(e) = tako_core::git::validate_branch_name_typed(&name) {
+            self.git_set_feedback(e.to_string(), true, cx);
             return;
         }
         if !self.git_begin_op("branch", cx) {
@@ -5335,7 +5335,7 @@ impl TakoApp {
                 .background_executor()
                 .spawn(async move {
                     let repo = std::path::Path::new(&repo_root);
-                    tako_core::git::create_branch(repo, &name, start.as_deref(), true)
+                    tako_core::git::create_branch_typed(repo, &name, start.as_deref(), true)
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
@@ -5349,7 +5349,7 @@ impl TakoApp {
                         };
                         app.git_set_feedback(msg, false, cx);
                     }
-                    Err(e) => app.git_set_feedback(e, true, cx),
+                    Err(e) => app.git_set_feedback(e.to_string(), true, cx),
                 }
                 app.refresh_git(cx);
             });
@@ -5367,7 +5367,7 @@ impl TakoApp {
                 .background_executor()
                 .spawn(async move {
                     let repo = std::path::Path::new(&repo_root);
-                    tako_core::git::abort_operation(repo)
+                    tako_core::git::abort_operation_typed(repo)
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
@@ -5381,7 +5381,7 @@ impl TakoApp {
                         };
                         app.git_set_feedback(msg, false, cx);
                     }
-                    Err(e) => app.git_set_feedback(e, true, cx),
+                    Err(e) => app.git_set_feedback(e.to_string(), true, cx),
                 }
                 app.refresh_git(cx);
             });
@@ -5492,7 +5492,7 @@ impl TakoApp {
                 .background_executor()
                 .spawn(async move {
                     let repo = std::path::Path::new(&repo_root);
-                    tako_core::git::pull(repo)
+                    tako_core::git::pull_typed(repo)
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
@@ -5506,7 +5506,7 @@ impl TakoApp {
                         };
                         app.git_set_feedback(msg, false, cx);
                     }
-                    Err(e) => app.git_set_feedback(e, true, cx),
+                    Err(e) => app.git_set_feedback(e.to_string(), true, cx),
                 }
                 app.refresh_git(cx);
             });
@@ -5524,7 +5524,7 @@ impl TakoApp {
                 .background_executor()
                 .spawn(async move {
                     let repo = std::path::Path::new(&repo_root);
-                    tako_core::git::push(repo)
+                    tako_core::git::push_typed(repo)
                 })
                 .await;
             let _ = this.update(cx, |app: &mut TakoApp, cx| {
@@ -5533,7 +5533,7 @@ impl TakoApp {
                     Ok(out) => {
                         app.git_set_feedback(git_result_summary(&out, "push done"), false, cx)
                     }
-                    Err(e) => app.git_set_feedback(e, true, cx),
+                    Err(e) => app.git_set_feedback(e.to_string(), true, cx),
                 }
                 app.refresh_git(cx);
             });
