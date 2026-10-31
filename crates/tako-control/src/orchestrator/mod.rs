@@ -7574,12 +7574,8 @@ worker_agents:
         let _guard = MASTER_ACCOUNT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        test_config_dir_override().get_or_init(|| {
-            let dir =
-                std::env::temp_dir().join(format!("tako-orch-test-config-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&dir);
-            dir
-        });
+        // 置き場は `config_dir` がテストで必ず倒す隔離先（`test_config_dir` = 後始末つき）。
+        // 同じ OnceLock を先に初期化すると後始末の無い dir が勝ち、絞って走らせた回に消え残る（#2566）
         let path = accounts_yaml_path().expect("隔離 config_dir");
         let saved = std::fs::read_to_string(&path).ok();
         std::fs::write(&path, yaml).expect("accounts.yaml を書ける");

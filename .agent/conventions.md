@@ -3867,9 +3867,15 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   **子プロセスへ `HOME` を渡すテストは、呼び手が消していても器に置く**: 子が起こした実 agent CLI の孫
   （agy の更新器）が子の終了後に書き戻すと、消した後に作り直される（修正前は `tako-944-*` が 12 個）。
   `test_write_isolation` は子を自分のプロセスグループの頭で起こし、子を刈り取る前（`WNOWAIT`）に
-  グループへ残った孫を止める（`output_reaping_group`）。番犬は
-  `crates/tako-control/tests/issue2561_temp_dir_helper_watchdog.rs`（作って素の `PathBuf` を返す補助を、
-  消さない呼び手か `HOME` を渡すファイルのときに file:line で名指す）
+  グループへ残った孫を止める（`output_reaping_group`）。**ソケットも同じ**（#2566）: 偽の受け口は
+  器の下へ `bind` し、接続先と器を一緒に持つ型で返す（修正前は `tk2123-*.sock` が 333 個）。
+  器の下は `$TMPDIR` 直下より深いので、`tako_core::ipc_socket::max_path_bytes` に収まるかを先に確かめる。
+  **orchestrator の設定の置き場の `OnceLock` をテストの補助で初期化しない**（#2566）: `config_dir` は
+  テストで必ず後始末つきの `tako-test-orchestrator-<pid>` へ倒すので、補助が先に自前の dir で
+  初期化すると実行順しだいで後始末の無い dir が勝つ（修正前は `tako-dispatch-test-config-*` が 14 個）。
+  番犬は `crates/tako-control/tests/issue2561_temp_dir_helper_watchdog.rs`（作って素の `PathBuf` / `String` を
+  返す補助を、消さない呼び手か `HOME` を渡すファイルのとき、`get_or_init` の初期化子が後始末なしで
+  `$TMPDIR` の下へ作るときに file:line で名指す）
 - 番犬は 2 段: `tako_core::test_residue` の
   `テストを一巡してもtmpdirに残骸が残らない`（**このテストバイナリをもう一度回して実際に数える**。
   個々のテストの成否では落とさず、残骸の件数だけを見る）と、
