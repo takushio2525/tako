@@ -508,7 +508,7 @@ pub fn login_form(shell: &str) -> LoginForm {
             .is_some_and(|name| matches!(name, "csh" | "tcsh"))
     };
     let path = std::path::Path::new(shell);
-    if csh_named(path) || std::fs::canonicalize(path).is_ok_and(|real| csh_named(&real)) {
+    if csh_named(path) || super::path::canonicalize(path).is_ok_and(|real| csh_named(&real)) {
         LoginForm::Argv0
     } else {
         LoginForm::Flag
@@ -975,10 +975,7 @@ mod tests {
         let alias = alias.display().to_string();
         let got = login_invocation(&alias, "true");
         assert_eq!(got.arg0.as_deref(), Some("-mysh"), "{got:?}");
-        assert_eq!(
-            got.args[..2],
-            ["-c".to_string(), CSH_LOGIN_SCRIPT.to_string()]
-        );
+        assert_eq!(got.args, ["-c", CSH_LOGIN_SCRIPT, "true"]);
         let dangling = dir.path().join("gone");
         std::os::unix::fs::symlink(dir.path().join("nowhere/tcsh"), &dangling).expect("symlink");
         assert_eq!(
