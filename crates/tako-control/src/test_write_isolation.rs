@@ -139,7 +139,7 @@ mod tests {
         // 起こし直す。諦めたときは各回の終了状態（コード / シグナル）を出力の末尾へ残す
         let mut statuses: Vec<String> = Vec::new();
         let out = loop {
-            let out = cmd.output().expect("子テストプロセスを起こせる");
+            let out = output_reaping_group(&mut cmd).expect("子テストプロセスを起こせる");
             let reached = out.status.success() || !out.stdout.is_empty() || !out.stderr.is_empty();
             if reached || statuses.len() + 1 >= SILENT_CHILD_ATTEMPTS {
                 break out;
@@ -156,6 +156,72 @@ mod tests {
             ));
         }
         (out.status.success(), stdout, files_under(fake_home))
+    }
+
+    /// 子を**自分のプロセスグループの頭**で起こして出力を集め、子が終わったら、刈り取る前に
+    /// グループへ残った孫を止める（#2561）。
+    ///
+    /// 旧挙動の腕（`TAKO_944_LEGACY=1`）の子は実 agent CLI を起こし、CLI が残した孫
+    /// （agy の更新器）は子の終了後も空の `HOME` へ `.gemini/antigravity-cli/updater/` を書き戻す。
+    /// 呼び手が置き場を消した後に書かれると dir が作り直されて消え残るので、置き場を手放す前に止める。
+    /// グループへ送るのは子をまだ刈り取っていない間（`WNOWAIT` で終了だけを見る）なので、
+    /// 番号が別のグループへ使い回されていることは無い（`probe::kill_on_timeout` と同じ約束）。
+    /// グループを抜けた孫（`setsid`）と Windows の孫は止められない = 置き場の器（[`scratch`]）が受け持つ
+    fn output_reaping_group(
+        cmd: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Output> {
+        use std::io::Read;
+        use std::process::Stdio;
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(cmd, 0);
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        // 両方のパイプを並行して読む（片方が詰まって子が止まらないように。`Command::output` と同じ）
+        let mut out_pipe = child.stdout.take().expect("stdout はパイプ");
+        let mut err_pipe = child.stderr.take().expect("stderr はパイプ");
+        let out = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out_pipe.read_to_end(&mut buf);
+            buf
+        });
+        let err = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = err_pipe.read_to_end(&mut buf);
+            buf
+        });
+        #[cfg(unix)]
+        if let (Ok(pid), Ok(id)) = (
+            libc::pid_t::try_from(child.id()),
+            libc::id_t::try_from(child.id()),
+        ) {
+            // SAFETY: 自分が起こした子の終了を刈り取らずに待ち（siginfo は読み捨てる）、
+            // その子が率いるグループへ送るだけ。子はゾンビのまま番号を持っているので使い回されない
+            unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                let exited = loop {
+                    let rc =
+                        libc::waitid(libc::P_PID, id, &mut info, libc::WEXITED | libc::WNOWAIT);
+                    if rc == 0 {
+                        break true;
+                    }
+                    if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        break false;
+                    }
+                };
+                if exited {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
+        let status = child.wait()?;
+        Ok(std::process::Output {
+            status,
+            stdout: out.join().unwrap_or_default(),
+            stderr: err.join().unwrap_or_default(),
+        })
     }
 
     /// このテストバイナリを**`deps/` の外**（一時 dir）へ置き直したパス（#1811）。
@@ -201,19 +267,15 @@ mod tests {
         .clone()
     }
 
-    /// 使い捨ての空ディレクトリ（テスト間で衝突しない名前）
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "tako-944-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("一時ディレクトリを作れる");
-        dir
+    /// 子へ渡す空の `HOME` の置き場（#1312 の `ScratchDir` = スコープを抜けると消える器）。
+    ///
+    /// 修正前は `$TMPDIR` 直下へ `tako-944-<タグ>-<pid>-<時刻>` を作り、呼び手が子の直後に消していた。
+    /// 旧挙動の腕では子が起こした実 agent CLI の孫（agy の更新器）が子の終了後にこの `HOME` へ
+    /// 書き戻し、消した後に作り直された dir が誰にも回収されずに残った（10/31 実測 12 個。#2561）。
+    /// 孫は [`output_reaping_group`] が止めるが、グループを抜けた孫は止められないので、
+    /// 消し損ねても器の親（`tako-test-scratch-<pid>`）ごと終了時・次回起動時に回収される置き場に置く
+    fn scratch(tag: &str) -> tako_core::test_residue::ScratchDir {
+        tako_core::test_residue::ScratchDir::new(&format!("944-{tag}"))
     }
 
     /// **tako の書き込みではない**ので数から除くもの（#1278）。
@@ -517,7 +579,7 @@ mod tests {
     fn テストプロセスは本番相当の置き場へ何も書かない() {
         let fake_home = scratch("fakehome");
         let (ok, stdout, created) = run_child(&fake_home, None, false);
-        let _ = std::fs::remove_dir_all(&fake_home);
+        drop(fake_home);
 
         assert!(ok, "子テストが失敗した\n{stdout}");
         assert!(
@@ -538,7 +600,7 @@ mod tests {
     fn legacyへ倒すと本番相当の置き場へ書いてしまう() {
         let fake_home = scratch("legacy");
         let (ok, stdout, created) = run_child(&fake_home, None, true);
-        let _ = std::fs::remove_dir_all(&fake_home);
+        drop(fake_home);
 
         assert!(ok, "子テストが失敗した\n{stdout}");
         let has = |needle: &str| created.iter().any(|f| f.contains(needle));
@@ -576,7 +638,7 @@ mod tests {
     fn claudeの設定エントリはテスト実行で増えない() {
         let seed = r#"{"installMethod":"brew","projects":{"/work/real-project":{"hasTrustDialogAccepted":true}}}"#;
 
-        let prepare = |tag: &str| -> PathBuf {
+        let prepare = |tag: &str| -> tako_core::test_residue::ScratchDir {
             let home = scratch(tag);
             std::fs::create_dir_all(home.join(".claude")).expect(".claude を作れる");
             for name in [".claude.json", ".claude/.claude.json"] {
@@ -608,7 +670,7 @@ mod tests {
                 "{name} のエントリが変わった（#1030）"
             );
         }
-        let _ = std::fs::remove_dir_all(&home);
+        drop(home);
 
         // A/B: 隔離を切ると同じ子がエントリを足す
         let home = prepare("cfgcount-legacy");
@@ -619,7 +681,7 @@ mod tests {
             after.len() > 1,
             "旧挙動でエントリが増えていない（検出力が無い）: {after:?}"
         );
-        let _ = std::fs::remove_dir_all(&home);
+        drop(home);
     }
 
     /// #1253: **検証プロセスはユーザーのシェル履歴へ書かない**。
@@ -637,7 +699,7 @@ mod tests {
                   HISTSIZE=2000\n\
                   SAVEHIST=1000\n\
                   setopt INC_APPEND_HISTORY\n";
-        let prepare = |tag: &str| -> PathBuf {
+        let prepare = |tag: &str| -> tako_core::test_residue::ScratchDir {
             let home = scratch(tag);
             std::fs::write(home.join(".zshrc"), rc).expect("rc を置ける");
             std::fs::write(home.join(".zshenv"), "").expect("rc を置ける");
@@ -663,7 +725,7 @@ mod tests {
 
         let home = prepare("histfix");
         let (ok, stdout, created) = run_child_with(&home, None, false, &[(SHELL_PROBE_ENV, "1")]);
-        let _ = std::fs::remove_dir_all(&home);
+        drop(home);
         assert!(ok, "子テストが失敗した\n{stdout}");
         probed(&stdout);
         assert!(
@@ -681,7 +743,7 @@ mod tests {
             false,
             &[(SHELL_PROBE_ENV, "1"), ("TAKO_1253_LEGACY", "1")],
         );
-        let _ = std::fs::remove_dir_all(&home);
+        drop(home);
         assert!(ok, "子テストが失敗した\n{stdout}");
         probed(&stdout);
         if history_files(&created).is_empty() {
@@ -755,7 +817,7 @@ mod tests {
 
         let home = scratch("agentcli");
         let (ok, stdout, created) = run_child(&home, None, false);
-        let _ = std::fs::remove_dir_all(&home);
+        drop(home);
         assert!(ok, "子テストが失敗した\n{stdout}");
         assert!(
             cli_made(&created).is_empty(),
@@ -769,7 +831,7 @@ mod tests {
         // ログインシェルが `~/.local/bin` を PATH へ入れないので食い違う）
         let home = scratch("agentcli-legacy");
         let (ok, stdout, created) = run_child(&home, None, true);
-        let _ = std::fs::remove_dir_all(&home);
+        drop(home);
         assert!(ok, "子テストが失敗した\n{stdout}");
         // `--nocapture` の libtest は `test <名前> ... ` を**改行せずに**出すので、
         // 子の 1 行目はその後ろへ連結される。行頭ではなく**部分一致**で拾う
@@ -805,7 +867,7 @@ mod tests {
 
         let (ok, stdout, in_home) = run_child(&fake_home, Some(&data_dir), false);
         let in_data = files_under(&data_dir);
-        let _ = std::fs::remove_dir_all(&base);
+        drop(base);
 
         assert!(ok, "子テストが失敗した\n{stdout}");
         assert!(

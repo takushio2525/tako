@@ -47130,17 +47130,17 @@ mod tests {
         assert_eq!(result_single.unwrap().1.as_u64(), pane_a);
     }
 
-    fn mcp_test_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("tako-mcp-test-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// MCP 設定のテストの置き場（#1312 の `ScratchDir` = スコープを抜けると消える器）。
+    /// 修正前は `$TMPDIR` 直下へ `tako-mcp-test-<名前>-<pid>` を作って返し、呼び手のどれも
+    /// 消していなかった（`cargo test` 1 回で 7 個ずつ積もり、10/31 実測 957 個。#2561）
+    fn mcp_test_dir(name: &str) -> tako_core::test_residue::ScratchDir {
+        tako_core::test_residue::ScratchDir::new(&format!("mcp-test-{name}"))
     }
 
     #[test]
     fn setup_mcp_direct_新規登録() {
         let dir = mcp_test_dir("direct-new");
-        let scope = McpScope::Project(dir.clone());
+        let scope = McpScope::Project(dir.to_path_buf());
         let target = dir.join(".mcp.json");
         setup_mcp_direct("/usr/local/bin/tako", &scope).unwrap();
         let content: serde_json::Value =
@@ -47162,7 +47162,7 @@ mod tests {
             }
         });
         std::fs::write(&target, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
-        let scope = McpScope::Project(dir.clone());
+        let scope = McpScope::Project(dir.to_path_buf());
         setup_mcp_direct("/usr/local/bin/tako", &scope).unwrap();
         let content: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
@@ -47191,7 +47191,7 @@ mod tests {
             }
         });
         std::fs::write(&target, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
-        let scope = McpScope::Project(dir.clone());
+        let scope = McpScope::Project(dir.to_path_buf());
         let cmd = read_mcp_registration(&scope);
         assert_eq!(cmd, Some(exe.display().to_string()));
     }
@@ -47204,7 +47204,7 @@ mod tests {
         let target = dir.join(".mcp.json");
         let broken = "{ \"mcpServers\": { \"other\": ";
         std::fs::write(&target, broken).unwrap();
-        let scope = McpScope::Project(dir.clone());
+        let scope = McpScope::Project(dir.to_path_buf());
         let err =
             setup_mcp_direct("/usr/local/bin/tako", &scope).expect_err("壊れた JSON では中止する");
         assert!(
@@ -47225,7 +47225,7 @@ mod tests {
         let dir = mcp_test_dir("direct-empty");
         let target = dir.join(".mcp.json");
         std::fs::write(&target, "  \n").unwrap();
-        let scope = McpScope::Project(dir.clone());
+        let scope = McpScope::Project(dir.to_path_buf());
         setup_mcp_direct("/usr/local/bin/tako", &scope).expect("空なら登録できる");
         let content: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
@@ -47250,7 +47250,7 @@ mod tests {
             }
         });
         std::fs::write(&target, serde_json::to_string_pretty(&existing).unwrap()).unwrap();
-        let scope = McpScope::Project(dir.clone());
+        let scope = McpScope::Project(dir.to_path_buf());
         setup_mcp_direct("/new/stable/tako", &scope).unwrap();
         let content: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
