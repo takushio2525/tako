@@ -3841,6 +3841,15 @@ Dock のピン留めは `.app` への **file URL ブックマーク**（`com.app
   （修正前は TMPDIR 直下の `tako-2035-*` が 263 個・`tako-2048-*` が 85 個。テストは緑のまま）。
   止めるだけなら `shutdown_all`（同期）、stop の経路を見るなら `stopped` を待つ。番犬は
   `crates/tako-control/tests/issue2555_lsp_stop_then_scope_end_watchdog.rs`（file:line で名指す）
+- **置き場を作る補助は素の `PathBuf` を返さず、器（`ScratchDir`）を返す**（#2561）。素の `PathBuf` は
+  後始末を呼び手に預けるので、呼び手が消さなければ `$TMPDIR` 直下に独自名で積もり、#1296 の回収にも
+  `tako test-residue` にも載らない（修正前は MCP 設定のテストの `tako-mcp-test-*` が 957 個）。
+  **子プロセスへ `HOME` を渡すテストは、呼び手が消していても器に置く**: 子が起こした実 agent CLI の孫
+  （agy の更新器）が子の終了後に書き戻すと、消した後に作り直される（修正前は `tako-944-*` が 12 個）。
+  `test_write_isolation` は子を自分のプロセスグループの頭で起こし、子を刈り取る前（`WNOWAIT`）に
+  グループへ残った孫を止める（`output_reaping_group`）。番犬は
+  `crates/tako-control/tests/issue2561_temp_dir_helper_watchdog.rs`（作って素の `PathBuf` を返す補助を、
+  消さない呼び手か `HOME` を渡すファイルのときに file:line で名指す）
 - 番犬は 2 段: `tako_core::test_residue` の
   `テストを一巡してもtmpdirに残骸が残らない`（**このテストバイナリをもう一度回して実際に数える**。
   個々のテストの成否では落とさず、残骸の件数だけを見る）と、
