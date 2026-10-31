@@ -33025,6 +33025,17 @@ fn main() {
     // #2367: 器（tmux）の中のペインの子を起動時の fd 上限へ戻す段として起きたなら、soft を下げて
     // シェルを exec する（戻らない）。**ほかの初期化より前**（段はスレッドも窓も持たない）
     tako_core::platform::fd_limit::exec_container_child_if_requested();
+    // #2570: ペインの中から起こし直されたなら、そのペインの中でだけ意味を持つ env（ペインの識別・
+    // 起こした tako への接続・mod の起床条件・claude のセッションの印・GIT_EDITOR=true・重なった
+    // XDG_DATA_DIRS ほか）を自分の env から外す。ペインは「GUI の env + 注入」で作るので、残すと
+    // 新しいペインと GUI がペインの外で起こす子へ素通しになる。**器の段の後**（段は器のペインの中で
+    // 起こされ、ペインの env をシェルへ渡す）・**スレッドを起こす前**（env の書き換えは別スレッドの
+    // 読みと競る）。外す名前の正本は `tako_core::host_env::STRIP`。A/B は `TAKO_2570_LEGACY=1`
+    let inherited_env = tako_core::host_env::apply_at_startup();
+    // unix は外した env のまま自分を exec し直す（同じ pid・argv・fd）。exec の時点の env の塊（`ps eww`・
+    // 資源の走査が読む値）はプロセスの中で書き換えても変わらず、GUI 自身と子を起こしたペインのプロセスとして
+    // 数えるため。戻るのは起こし直さないとき（何も外していない・A/B・起こし直した後・Windows）と失敗だけ
+    let reexec_error = tako_core::host_env::reexec_if_stripped(&inherited_env);
     // Issue #168: メインスレッド・ストール診断。重い区間（dispatch / render /
     // save_layout 等）の 2 秒超え継続を drop を待たず perf.log に記録する
     // #782: ここ（GUI プロセスのメインスレッド）を基準に、以後 perf_span は
@@ -33162,6 +33173,17 @@ fn main() {
     // 起動時の値を戻す構えもここで決まる）。persist.log の置き場は上の隔離の env で決まるので
     // その後。上げられなくても起動は続ける（記録だけ。A/B は `TAKO_2359_LEGACY=1`）
     persist_diag(&tako_core::platform::fd_limit::raise_at_startup().log_line());
+    // #2570: 起動の最初に外した名前を persist.log へ（隔離の置き場が決まった後 = 隔離 GUI が本番の
+    // persist.log へ書かない）。名前だけで値は載せない（トークンを含む）
+    if let Some(line) = inherited_env.log_line() {
+        persist_diag(&line);
+    }
+    if let Some(e) = reexec_error {
+        persist_diag(&format!(
+            "起動時の env（#2570）: 外した env で自分を起こし直せなかった（外したまま続ける。ps eww と資源の走査は\
+             起動時の env を見る）: {e}"
+        ));
+    }
     // #2367: 器の tmux サーバーにも引き上げた値を渡す。器の中のペインの子はこの実行ファイル
     // 自身（main の 2 文目の段）を通して起動時の値へ戻すので、自分を段として置く。
     // 置けなければ（実行ファイルの場所が読めない）器は修正前どおり起動時の値で起きる

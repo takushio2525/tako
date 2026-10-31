@@ -40,6 +40,7 @@ pub mod git_tree;
 pub mod handoff;
 pub mod handoff_guard;
 pub mod header_layout;
+pub mod host_env;
 pub mod i18n;
 pub mod ipc_socket;
 pub mod jobserver;

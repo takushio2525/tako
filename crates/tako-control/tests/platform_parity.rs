@@ -962,6 +962,12 @@ fn コンソール窓を抑止していない子プロセス起動が増えて�
         ),
         ("crates/tako-core/src/git.rs", 6, "テストモジュール内"),
         (
+            "crates/tako-core/src/host_env.rs",
+            1,
+            "ペインの中から起こされた GUI が外した env のまま自分を起こし直す exec（#2570。`#[cfg(unix)]`）。\
+             プロセスの像を入れ替えるだけで子プロセスも窓も作らない（Windows は起こし直さない）",
+        ),
+        (
             "crates/tako-core/src/paths.rs",
             1,
             "テストモジュール内（#2391）。**自分と同じテストバイナリ**を `TAKO_DATA_DIR` を組んだ子として \
