@@ -35303,7 +35303,11 @@ mod tests {
             let DispatchError::InvalidParams(message) = error else {
                 panic!("{bad} が InvalidParams で弾かれていない");
             };
-            assert!(message.contains("1〜60"), "範囲を言う: {message}");
+            // 断りの文は表示言語に従う（#2365）。並走するテストが言語を切り替えうるので日英どちらでも見る
+            assert!(
+                message.contains("1〜60") || message.contains("between 1 and 60"),
+                "範囲を言う: {message}"
+            );
         }
         assert_eq!(
             host.redraw_limit.unfocused_fps, 12,
