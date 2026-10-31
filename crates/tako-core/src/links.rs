@@ -2882,7 +2882,7 @@ mod tests {
         // 1 行目 = `⏺ <lead>` + 語の前半（上限まで）/ 2 行目 = 字下げ + 語の残り（ちょうど上限で終わる）/
         // 3 行目 = 送られた次の語。2 行目がちょうど上限になる桁数を計算で決める
         fn two_rows(lead_a: &str, lead_b: &str, token: &str) -> (Vec<String>, usize) {
-            let lead = if (token.len() + 2 + 2 + lead_a.len()) % 2 == 0 {
+            let lead = if (token.len() + 2 + 2 + lead_a.len()).is_multiple_of(2) {
                 lead_a
             } else {
                 lead_b
