@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::tailscale::{WhoisError, WhoisInfo};
+use crate::RemoteRefusal;
 
 /// interact session の idle timeout 既定値（最終入力からこの時間で session 終了）
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -159,26 +160,32 @@ pub struct DeviceRegistry {
 impl DeviceRegistry {
     /// state ディレクトリ配下の devices.json を読み込んで開く。
     /// ファイル不在は空レジストリ。破損 JSON は読み捨てず起動エラーにする
-    /// （黙って全デバイス失効させない）
+    /// （黙って全デバイス失効させない）。
+    ///
+    /// 断りの文は日本語のまま（daemon の起動時の断り。#2365）。CLI / MCP（dispatch）は表示言語で返す
+    /// [`Self::open_typed`] を通る
     pub fn open(state_dir: &std::path::Path) -> Result<Self, String> {
+        Self::open_typed(state_dir).map_err(RemoteRefusal::into_ja)
+    }
+
+    /// [`Self::open`] の型の口
+    pub fn open_typed(state_dir: &std::path::Path) -> Result<Self, RemoteRefusal> {
         let path = state_dir.join("devices.json");
         let audit_path = state_dir.join("audit.log");
         let devices = match std::fs::read_to_string(&path) {
             Ok(content) => {
-                let file: DevicesFile = serde_json::from_str(&content).map_err(|e| {
-                    format!(
-                        "devices.json の解釈に失敗（{}）: {}",
-                        path.display(),
-                        tako_core::load_issue::json_error_reason(&e)
-                    )
-                })?;
+                let file: DevicesFile =
+                    serde_json::from_str(&content).map_err(|e| RemoteRefusal::DevicesParse {
+                        path: path.display().to_string(),
+                        reason: tako_core::load_issue::JsonReason::of(&e),
+                    })?;
                 file.devices
                     .into_iter()
                     .map(|d| (d.id.clone(), d))
                     .collect()
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(e) => return Err(format!("devices.json の読み取りに失敗: {e}")),
+            Err(e) => return Err(RemoteRefusal::DevicesRead(e.to_string())),
         };
         let idle_timeout = std::env::var("TAKO_REMOTE_IDLE_TIMEOUT_SECS")
             .ok()
@@ -205,6 +212,11 @@ impl DeviceRegistry {
     /// devices.json へ永続化する（0600・atomic rename。secrets ではないが
     /// identity 情報を含むため secret ファイルと同じ扱い）
     fn save(&self) -> Result<(), String> {
+        self.save_typed().map_err(RemoteRefusal::into_ja)
+    }
+
+    /// [`Self::save`] の型の口
+    fn save_typed(&self) -> Result<(), RemoteRefusal> {
         let file = DevicesFile {
             devices: {
                 let mut v: Vec<Device> = self.devices.values().cloned().collect();
@@ -213,9 +225,9 @@ impl DeviceRegistry {
             },
         };
         let content = serde_json::to_string_pretty(&file)
-            .map_err(|e| format!("devices.json の構築に失敗: {e}"))?;
+            .map_err(|e| RemoteRefusal::DevicesBuild(e.to_string()))?;
         crate::remote::write_state_file(&self.path, &content)
-            .map_err(|e| format!("devices.json の書き込みに失敗: {e}"))
+            .map_err(|e| RemoteRefusal::DevicesWrite(e.to_string()))
     }
 
     /// 登録済みデバイスを返す（未登録は None）
@@ -368,13 +380,18 @@ impl DeviceRegistry {
     /// デバイスを失効させる。登録を削除し、interact session も破棄する。
     /// WS の即時切断は呼び出し側（daemon）が broadcaster 経由で行う
     pub fn revoke(&mut self, device_id: &str) -> Result<Device, String> {
+        self.revoke_typed(device_id).map_err(RemoteRefusal::into_ja)
+    }
+
+    /// [`Self::revoke`] の型の口（daemon の admin API は断りの `kind` を本文へ載せる。#2365）
+    pub fn revoke_typed(&mut self, device_id: &str) -> Result<Device, RemoteRefusal> {
         let device = self
             .devices
             .remove(device_id)
-            .ok_or_else(|| format!("登録されていないデバイス: {device_id}"))?;
+            .ok_or_else(|| RemoteRefusal::DeviceNotRegistered(device_id.to_string()))?;
         self.pending.remove(device_id);
         self.interact_sessions.remove(device_id);
-        self.save()?;
+        self.save_typed()?;
         self.audit(
             "device_revoked",
             device_id,
@@ -403,17 +420,27 @@ impl DeviceRegistry {
         device_id: &str,
         role: DeviceRole,
     ) -> Result<(Device, Option<PendingRequest>), String> {
+        self.set_role_typed(device_id, role)
+            .map_err(RemoteRefusal::into_ja)
+    }
+
+    /// [`Self::set_role`] の型の口（daemon の admin API は断りの `kind` を本文へ載せる。#2365）
+    pub fn set_role_typed(
+        &mut self,
+        device_id: &str,
+        role: DeviceRole,
+    ) -> Result<(Device, Option<PendingRequest>), RemoteRefusal> {
         let device = self
             .devices
             .get_mut(device_id)
-            .ok_or_else(|| format!("登録されていないデバイス: {device_id}"))?;
+            .ok_or_else(|| RemoteRefusal::DeviceNotRegistered(device_id.to_string()))?;
         let before = device.role;
         device.role = role;
         device.last_seen = now_epoch();
         let device = device.clone();
         let resolved = self.pending.remove(device_id);
         self.denied.remove(device_id);
-        self.save()?;
+        self.save_typed()?;
         self.audit(
             "role_changed",
             device_id,

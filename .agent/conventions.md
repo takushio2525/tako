@@ -482,6 +482,26 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   の表・`CONFIG_REFUSAL_SCOPES` / `CONFIG_DISPATCH_SCOPES` / `JA_CONFIG_CALLS` を広げ、落ちたときは日英の対の行を
   `file:line` で添える・末尾の節 = `RangeRefusal` / `PolicyRefusal` の表と `RUN_VALUE_SCOPES`・CLI の `ledger_cli`）、
   実経路は `tests/issue2365_ledger_values_lang.rs`（GUI 無しのホストへ MCP と同じ dispatch を日英で通す 20 ケース）
+- #2365 の続きで、**対応マトリクス（`agent_support::report` / `platform::report`）・設定の移行
+  （`migrations::report_json`）・使用量の内訳（`UsageQuery::parsed` / `filters`）・起動時ロードの予算
+  （`context_budget::fix`）**の知らない値の断りを `Reason` の 10 種へ寄せた（`Result<_, String>` のまま `Display` が
+  表示言語。呼び手は dispatch と、表示言語を設定から決めてから呼ぶ CLI の手元の処理だけ。usage の単体テストは
+  型の口 `parsed_typed` / `filters_typed` で日本語を明示して見る）。**remote 系**（会話の末尾・端末の一覧 / 失効 /
+  降格・daemon の admin API・スクロールバック・リモートのセットアップ）は新しい `tako_control::RemoteRefusal`
+  （31 種 + 包みの `DaemonMessage` / `ScrollbackCause`）。dispatch と CLI だけが呼ぶ口（`remote::devices_*` /
+  `admin_request` / `scrollback` / `scrollback_session` / `parse_scrollback_target` / `remote_setup::run_noninteractive`）は
+  この型を返し、daemon・対話のウィザードも使う口（`transcript::read_messages` / `DeviceRegistry::open` / `revoke` /
+  `set_role` / `remote_setup::decide_variant` / `tailscale::save_variant`）は**日本語の `String` の口を残して**
+  型の口 `*_typed` を足した（daemon が PWA へ返す本文・起動時の断り・日本語の対話のウィザード）。daemon の admin API は
+  断りの本文に従来の日本語の `error` と並べて `kind`（`device_not_registered` + `device_id` / 既存の
+  `upgrade_requires_gui`）を返し、頼んだ側が `RemoteRefusal::from_admin_body` で**呼び手の表示言語で組み直す**
+  （daemon の表示言語は起動した時点のまま。`kind` の無い本文 = 旧版の daemon・その他の断りは `error` をそのまま）。
+  GUI の設定 → リモートの断り（`admin_request` を直に呼ぶ）も画面の表示言語になる。CLI の `tako remote messages /
+  devices / scrollback / setup --answers` は `init_local_lang()` で出口の枠と言語をそろえる（対話のウィザードは日本語の
+  まま）。各段の `message` と系統を決めた `reason`（`Ok` の値）は対象外。番犬は同じ `issue1762_dispatch_error_lang.rs`
+  の末尾の節（`Reason` の表・`RemoteRefusal` の表と包みの組み合わせ・本文の往復・`USAGE_REMOTE_SCOPES` /
+  `JA_REMOTE_CALLS`・dispatch と CLI の remote 系の口）、実経路は `tests/issue2365_usage_remote_lang.rs`
+  （GUI 無しのホストへ MCP と同じ dispatch を日英で通す 27 ケース。偽の tailscale と一時の state / tmux ソケット）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

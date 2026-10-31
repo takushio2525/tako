@@ -200,7 +200,8 @@ fn ペインidとセッション名の両方でscrollbackが返る() {
 
     // 解決できないペイン ID は**理由つきで**断る（黙って空を返さない）
     let err = tako_control::remote::scrollback("999999", 10)
-        .expect_err("解決できないペイン ID が成功してしまった");
+        .expect_err("解決できないペイン ID が成功してしまった")
+        .to_string();
     assert!(err.contains("999999"), "理由に対象が出ていない: {err}");
 }
 

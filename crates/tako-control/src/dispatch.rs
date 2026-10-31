@@ -1016,6 +1016,53 @@ pub enum Reason {
         got: String,
         topics: String,
     },
+    // ---- #2365 の続き: 対応マトリクス・設定の移行・使用量の内訳・起動時ロードの予算の断り ----
+    /// `未知の agent: <got>（<allowed>）`。`allowed` は系統名を ` / ` で並べたもの
+    AgentUnknown {
+        got: String,
+        allowed: String,
+    },
+    /// `未知の状態: <got>（<allowed>）`（agent-support / platform の `status`）
+    SupportStatusUnknown {
+        got: String,
+        allowed: String,
+    },
+    /// `未知のプラットフォーム: <got>（macos / windows）`
+    PlatformUnknown(String),
+    /// `不明な action: <got>（status | run）`（tako migrate）
+    MigrateActionUnknown(String),
+    /// `不明なファイル種別: <got>（<allowed>）`。`allowed` は種別を ` | ` で並べたもの
+    MigrateSchemaUnknown {
+        got: String,
+        allowed: String,
+    },
+    /// `不明な by: <got:?>（<allowed> のいずれか）`（使用量の内訳の段）
+    UsageByUnknown {
+        got: String,
+        allowed: String,
+    },
+    /// `不明な window: <got:?>（<allowed> のいずれか）`（使用量の内訳の期間）
+    UsageWindowUnknown {
+        got: String,
+        allowed: String,
+    },
+    /// `読めない project: <got:?>（<キー> / project:<キー> / profile:<名前> / <unclassified>）`
+    UsageProjectUnreadable {
+        got: String,
+        unclassified: &'static str,
+    },
+    /// `読めない issue: <got:?>（番号 / #番号 / <missing>）`
+    UsageIssueUnreadable {
+        got: String,
+        missing: &'static str,
+    },
+    /// `<label>: 移送でエントリ数が合わない（前 <before> / 残 <kept> + 移送 <archived>）ので書き込まない`
+    BudgetEntriesMismatch {
+        label: String,
+        before: usize,
+        kept: usize,
+        archived: usize,
+    },
 }
 
 /// ペイン ID の並び（`3, 5`）。複数ペインに当たった断りに添える
@@ -2837,6 +2884,85 @@ impl Reason {
             (Self::GuideTopicUnknown { got, topics }, En) => {
                 format!("unknown topic: {got} (available: {topics})")
             }
+            (Self::AgentUnknown { got, allowed }, Ja) => {
+                format!("未知の agent: {got}（{allowed}）")
+            }
+            (Self::AgentUnknown { got, allowed }, En) => {
+                format!("unknown agent: {got} ({allowed})")
+            }
+            (Self::SupportStatusUnknown { got, allowed }, Ja) => {
+                format!("未知の状態: {got}（{allowed}）")
+            }
+            (Self::SupportStatusUnknown { got, allowed }, En) => {
+                format!("unknown status: {got} ({allowed})")
+            }
+            (Self::PlatformUnknown(got), Ja) => {
+                format!("未知のプラットフォーム: {got}（macos / windows）")
+            }
+            (Self::PlatformUnknown(got), En) => {
+                format!("unknown platform: {got} (macos / windows)")
+            }
+            (Self::MigrateActionUnknown(got), Ja) => {
+                format!("不明な action: {got}（status | run）")
+            }
+            (Self::MigrateActionUnknown(got), En) => {
+                format!("unknown action: {got} (status | run)")
+            }
+            (Self::MigrateSchemaUnknown { got, allowed }, Ja) => {
+                format!("不明なファイル種別: {got}（{allowed}）")
+            }
+            (Self::MigrateSchemaUnknown { got, allowed }, En) => {
+                format!("unknown file type: {got} ({allowed})")
+            }
+            (Self::UsageByUnknown { got, allowed }, Ja) => {
+                format!("不明な by: {got:?}（{allowed} のいずれか）")
+            }
+            (Self::UsageByUnknown { got, allowed }, En) => {
+                format!("unknown by: {got:?} (one of {allowed})")
+            }
+            (Self::UsageWindowUnknown { got, allowed }, Ja) => {
+                format!("不明な window: {got:?}（{allowed} のいずれか）")
+            }
+            (Self::UsageWindowUnknown { got, allowed }, En) => {
+                format!("unknown window: {got:?} (one of {allowed})")
+            }
+            (Self::UsageProjectUnreadable { got, unclassified }, Ja) => format!(
+                "読めない project: {got:?}（<キー> / project:<キー> / profile:<名前> / {unclassified}）"
+            ),
+            (Self::UsageProjectUnreadable { got, unclassified }, En) => format!(
+                "cannot read project: {got:?} (<key> / project:<key> / profile:<name> / \
+                 {unclassified})"
+            ),
+            (Self::UsageIssueUnreadable { got, missing }, Ja) => {
+                format!("読めない issue: {got:?}（番号 / #番号 / {missing}）")
+            }
+            (Self::UsageIssueUnreadable { got, missing }, En) => {
+                format!("cannot read issue: {got:?} (number / #number / {missing})")
+            }
+            (
+                Self::BudgetEntriesMismatch {
+                    label,
+                    before,
+                    kept,
+                    archived,
+                },
+                Ja,
+            ) => format!(
+                "{label}: 移送でエントリ数が合わない（前 {before} / 残 {kept} + 移送 {archived}）\
+                 ので書き込まない"
+            ),
+            (
+                Self::BudgetEntriesMismatch {
+                    label,
+                    before,
+                    kept,
+                    archived,
+                },
+                En,
+            ) => format!(
+                "{label}: the entry count does not add up after the move (before {before} / kept \
+                 {kept} + moved {archived}), so nothing is written"
+            ),
         }
     }
 
@@ -11472,8 +11598,8 @@ fn dispatch_inner(
         Request::RemoteAgents => remote_agents_reply(),
 
         Request::RemoteMessages { session_id, tail } => {
-            crate::transcript::read_messages(&session_id, tail.unwrap_or(30))
-                .map_err(DispatchError::Operation)
+            crate::transcript::read_messages_typed(&session_id, tail.unwrap_or(30))
+                .map_err(crate::RemoteRefusal::operation)
         }
 
         // ペアリング済み端末の管理（#283 / #1452）。
@@ -11487,7 +11613,7 @@ fn dispatch_inner(
             device_id,
             role,
         } => match action.as_str() {
-            "list" => crate::remote::devices_list().map_err(DispatchError::Operation),
+            "list" => crate::remote::devices_list().map_err(crate::RemoteRefusal::operation),
             "revoke" => {
                 let id = device_id.ok_or_else(|| {
                     Reason::ActionNeeds {
@@ -11496,7 +11622,7 @@ fn dispatch_inner(
                     }
                     .operation()
                 })?;
-                crate::remote::devices_revoke(&id).map_err(DispatchError::Operation)
+                crate::remote::devices_revoke(&id).map_err(crate::RemoteRefusal::operation)
             }
             "role" => {
                 let id = device_id.ok_or_else(|| {
@@ -11514,7 +11640,7 @@ fn dispatch_inner(
                     }
                     .operation()
                 })?;
-                crate::remote::devices_set_role(&id, &role).map_err(DispatchError::Operation)
+                crate::remote::devices_set_role(&id, &role).map_err(crate::RemoteRefusal::operation)
             }
             other => Err(Reason::UnknownActionPlain {
                 got: other.to_string(),
@@ -11535,7 +11661,7 @@ fn dispatch_inner(
             // ここから使うと自分自身への入れ子 IPC になる
             let session = scrollback_target_session(host, &pane_id)?;
             let result = crate::remote::scrollback_session(&session, lines.unwrap_or(1000))
-                .map_err(DispatchError::Operation)?;
+                .map_err(crate::RemoteRefusal::operation)?;
             Ok(json!({ "lines": result }))
         }
 
@@ -11545,10 +11671,11 @@ fn dispatch_inner(
                     .map(serde_json::from_value)
                     .transpose()
                     .map_err(|e| {
-                        DispatchError::InvalidParams(format!("remote setup answers が不正: {e}"))
+                        crate::RemoteRefusal::SetupAnswersInvalid(e.to_string()).invalid()
                     })?
                     .unwrap_or_default();
-                crate::remote_setup::run_noninteractive(&parsed).map_err(DispatchError::Operation)
+                crate::remote_setup::run_noninteractive(&parsed)
+                    .map_err(crate::RemoteRefusal::operation)
             }
             "check" => Ok(crate::remote_setup::check_status()),
             other => Err(Reason::UnknownActionPlain {
@@ -23175,7 +23302,7 @@ pub fn dispatch_remote_shortcuts(
 /// 落とすと remote 側の CLI 用フォールバック（IPC で app へ問い合わせる）へ流れ、
 /// tako-app が自分自身へ接続する形になる
 fn scrollback_target_session(host: &dyn ControlHost, spec: &str) -> Result<String, DispatchError> {
-    match crate::remote::parse_scrollback_target(spec).map_err(DispatchError::InvalidParams)? {
+    match crate::remote::parse_scrollback_target(spec).map_err(crate::RemoteRefusal::invalid)? {
         crate::remote::ScrollbackTarget::Session(name) => Ok(name),
         crate::remote::ScrollbackTarget::Pane(id) => {
             let (_, target) = resolve_pane(host.workspace(), Some(id))?;

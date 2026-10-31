@@ -2461,14 +2461,18 @@ pub(crate) enum ScrollbackTarget {
 ///   ここで剥がしておかないと到達解決の時点で `InvalidSession` になる
 /// - 全桁が数字なら tako PaneId（MCP / CLI が渡す既定の形）
 /// - それ以外は器のセッション名
-pub(crate) fn parse_scrollback_target(spec: &str) -> Result<ScrollbackTarget, String> {
+pub(crate) fn parse_scrollback_target(
+    spec: &str,
+) -> Result<ScrollbackTarget, crate::RemoteRefusal> {
     let spec = spec.trim();
     if spec.is_empty() {
-        return Err("ペイン ID / セッション名が空".to_string());
+        return Err(crate::RemoteRefusal::ScrollbackTargetEmpty);
     }
     let head = spec.split(':').next().unwrap_or("").trim();
     if head.is_empty() {
-        return Err(format!("対象指定 '{spec}' からセッション名を取り出せない"));
+        return Err(crate::RemoteRefusal::ScrollbackTargetNoSession(
+            spec.to_string(),
+        ));
     }
     if head.len() == spec.len() {
         if let Ok(id) = head.parse::<u64>() {
@@ -2490,10 +2494,12 @@ pub(crate) fn parse_scrollback_target(spec: &str) -> Result<ScrollbackTarget, St
 ///
 /// **CLI 用の入口**。数値の PaneId は稼働中の tako-app へ IPC で問い合わせて
 /// 器のセッション名へ解決する。app の内側（dispatch）は解決を自分で済ませて
-/// [`scrollback_session`] を呼ぶので、この関数を通らない
-pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
+/// [`scrollback_session`] を呼ぶので、この関数を通らない。
+///
+/// 断りは [`crate::RemoteRefusal`]（表示言語で文にする。#2365）
+pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, crate::RemoteRefusal> {
     if legacy_scrollback_enabled() {
-        return scrollback_legacy(pane_id, lines);
+        return scrollback_legacy(pane_id, lines).map_err(crate::RemoteRefusal::ScrollbackLegacy);
     }
     let session = resolve_scrollback_session(pane_id)?;
     scrollback_session(&session, lines)
@@ -2504,32 +2510,29 @@ pub fn scrollback(pane_id: &str, lines: u32) -> Result<Vec<String>, String> {
 /// [`scrollback`] と違い**この関数は IPC を張らない**。dispatch は tako-app の
 /// 内側で走るので、そこから `AppIpcClient` を使うと**自分自身への入れ子 IPC**になり、
 /// 要求を捌く側（UI スレッド）が自分の応答を待つ形になりうる
-pub fn scrollback_session(session: &str, lines: u32) -> Result<Vec<String>, String> {
+pub fn scrollback_session(session: &str, lines: u32) -> Result<Vec<String>, crate::RemoteRefusal> {
+    use crate::remote_refusal::ScrollbackCause;
     if legacy_scrollback_enabled() {
-        return scrollback_legacy(session, lines);
+        return scrollback_legacy(session, lines).map_err(crate::RemoteRefusal::ScrollbackLegacy);
     }
-    let (session_ref, capture) = crate::reach::detached_capture(session).ok_or_else(|| {
-        format!(
-            "セッション {session} の履歴を読めない: {}",
-            crate::reach::no_detached_capture_note()
-        )
-    })?;
+    let unreadable = |cause| crate::RemoteRefusal::ScrollbackUnreadable {
+        session: session.to_string(),
+        cause,
+    };
+    let (session_ref, capture) = crate::reach::detached_capture(session)
+        .ok_or_else(|| unreadable(ScrollbackCause::NoCapture))?;
     capture
         .capture_scrollback(&session_ref, lines as usize)
-        .map_err(|e| format!("セッション {session} の履歴を読めない: {e}"))
+        .map_err(|e| unreadable(ScrollbackCause::Backend(e)))
 }
 
 /// 対象指定 → 器のセッション名（**CLI 経路だけ**が通る。数値 ID は IPC で解決する）
-fn resolve_scrollback_session(spec: &str) -> Result<String, String> {
+fn resolve_scrollback_session(spec: &str) -> Result<String, crate::RemoteRefusal> {
     match parse_scrollback_target(spec)? {
         ScrollbackTarget::Session(name) => Ok(name),
-        ScrollbackTarget::Pane(id) => backend_session_of_pane(id).ok_or_else(|| {
-            format!(
-                "ペイン {id} の器のセッションを解決できない\
-                 （tako-app が起動していて、そのペインが器を持っているかを確認する。\
-                 セッション名を直接渡すこともできる）"
-            )
-        }),
+        ScrollbackTarget::Pane(id) => {
+            backend_session_of_pane(id).ok_or(crate::RemoteRefusal::ScrollbackPaneUnresolved(id))
+        }
     }
 }
 
@@ -2692,7 +2695,7 @@ fn legacy_running_via_status() -> bool {
 
 /// GUI の状態の更新が 2 秒ごとに引く admin state（#2539。`refresh_remote_state` の中身の 1 実装）。
 /// daemon が止まっていれば `{"running": false}`。1 回の呼び出しで tailscale を起こさない
-pub fn poll_admin_state() -> Result<Value, String> {
+pub fn poll_admin_state() -> Result<Value, crate::RemoteRefusal> {
     if daemon_running() {
         admin_request("GET", "/api/admin/state", None)
     } else {
@@ -4029,16 +4032,23 @@ fn kill_stale_daemon(
 /// 稼働中 daemon の admin API を叩く最小 HTTP クライアント。
 /// 待ち受けの実体（既定 = ループバック TCP / `TAKO_REMOTE_ENDPOINT=unix` = UDS）は
 /// `platform::local_endpoint` が吸収するので、ここは HTTP/1.1 を自前で組むだけ
-/// （外部依存を増やさないため）
-pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
+/// （外部依存を増やさないため）。
+///
+/// 断りは [`crate::RemoteRefusal`]（表示言語で文にする。#2365）。daemon が `kind` を添えて断った本文
+/// （端末が登録されていない・昇格は画面からだけ）は、呼び手の表示言語で組み直す
+pub fn admin_request(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Value, crate::RemoteRefusal> {
+    use crate::RemoteRefusal;
     // 見るのは生死だけ（#2539。`daemon_status` は表示の欄のために tailscale を起こす）
     if !daemon_running() {
-        return Err("リモートサーバーが起動していない".to_string());
+        return Err(RemoteRefusal::DaemonNotRunning);
     }
-    let endpoint = current_endpoint()
-        .ok_or("リモートサーバーの待ち受け先を特定できない（state ファイルが無い）")?;
+    let endpoint = current_endpoint().ok_or(RemoteRefusal::DaemonEndpointUnknown)?;
     let token = std::fs::read_to_string(token_path())
-        .map_err(|e| format!("管理トークンの読み取りに失敗: {e}"))?
+        .map_err(|e| RemoteRefusal::AdminTokenRead(e.to_string()))?
         .trim()
         .to_string();
 
@@ -4054,28 +4064,30 @@ pub fn admin_request(method: &str, path: &str, body: Option<&Value>) -> Result<V
         &request,
         Some(std::time::Duration::from_secs(10)),
     )
-    .map_err(|e| format!("daemon との通信に失敗 ({}): {e}", endpoint.describe()))?;
+    .map_err(|e| RemoteRefusal::DaemonUnreachable {
+        endpoint: endpoint.describe(),
+        error: e.to_string(),
+    })?;
     let (head, body) = response
         .split_once("\r\n\r\n")
-        .ok_or("daemon の応答が不正（ヘッダ境界なし）")?;
+        .ok_or(RemoteRefusal::DaemonResponseNoHeader)?;
     let status_code: u16 = head
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
-        .ok_or("daemon の応答が不正（ステータス行なし）")?;
+        .ok_or(RemoteRefusal::DaemonResponseNoStatus)?;
     let value: Value = if body.trim().is_empty() {
         Value::Null
     } else {
         serde_json::from_str(body.trim())
-            .map_err(|e| format!("daemon の応答を解釈できない: {e}"))?
+            .map_err(|e| RemoteRefusal::DaemonResponseParse(e.to_string()))?
     };
     if !(200..300).contains(&status_code) {
-        let msg = value["error"]
-            .as_str()
-            .unwrap_or("不明なエラー")
-            .to_string();
-        return Err(format!("daemon がエラーを返した ({status_code}): {msg}"));
+        return Err(RemoteRefusal::DaemonError {
+            status: status_code,
+            message: RemoteRefusal::from_admin_body(&value),
+        });
     }
     Ok(value)
 }
@@ -4109,9 +4121,12 @@ pub fn legacy_1452() -> bool {
 /// 番犬 `issue1452_role_grant_watchdog` がソース走査で縛る。
 ///
 /// daemon 稼働中は admin API（接続中 WS の切断込み）、停止中はレジストリ直接編集
-pub fn devices_set_role(device_id: &str, role_str: &str) -> Result<Value, String> {
+///
+/// 断りは [`crate::RemoteRefusal`]（表示言語で文にする。#2365）
+pub fn devices_set_role(device_id: &str, role_str: &str) -> Result<Value, crate::RemoteRefusal> {
+    use crate::RemoteRefusal;
     let next = crate::remote_auth::DeviceRole::parse(role_str)
-        .ok_or_else(|| format!("不正な role: {role_str}（observe / interact / manage / admin）"))?;
+        .ok_or_else(|| RemoteRefusal::RoleInvalid(role_str.to_string()))?;
     let running = daemon_running();
     // 現 role は daemon 稼働中でも**同じ答え**（稼働中は admin state、停止中は
     // devices.json。どちらも `devices_list` の 1 実装が吸収する）
@@ -4123,12 +4138,14 @@ pub fn devices_set_role(device_id: &str, role_str: &str) -> Result<Value, String
                 .and_then(|d| d["role"].as_str())
                 .and_then(crate::remote_auth::DeviceRole::parse)
         })
-        .ok_or_else(|| format!("登録されていないデバイス: {device_id}"))?;
+        .ok_or_else(|| RemoteRefusal::DeviceNotRegistered(device_id.to_string()))?;
     let change = crate::remote_role::classify(Some(current), next);
-    if let crate::remote_role::GrantDecision::Deny { message, .. } =
+    // 断りの文は daemon の 403（`GrantDecision::Deny` の日本語の `message`）と同じ事実を、
+    // 呼び手の表示言語で言う
+    if let crate::remote_role::GrantDecision::Deny { .. } =
         crate::remote_role::decide(change, crate::remote_role::CallerCheck::NotGui)
     {
-        return Err(message);
+        return Err(RemoteRefusal::UpgradeRequiresGui);
     }
     if running {
         // 弱める側だけが HTTP へ行く（接続中 WS の切断と監査は daemon 側で起こる）
@@ -4138,8 +4155,8 @@ pub fn devices_set_role(device_id: &str, role_str: &str) -> Result<Value, String
             Some(&json!({ "device_id": device_id, "role": next.as_str() })),
         );
     }
-    let mut reg = DeviceRegistry::open(&state_dir())?;
-    let (device, _) = reg.set_role(device_id, next)?;
+    let mut reg = DeviceRegistry::open_typed(&state_dir())?;
+    let (device, _) = reg.set_role_typed(device_id, next)?;
     Ok(json!({
         "changed": true,
         "change": change.as_str(),
@@ -4149,18 +4166,18 @@ pub fn devices_set_role(device_id: &str, role_str: &str) -> Result<Value, String
 
 /// 登録済みデバイスの一覧（CLI `tako remote devices list` / MCP / GUI から使う）。
 /// daemon 稼働中は admin API（接続状態込み）、停止中は devices.json を直接読む
-pub fn devices_list() -> Result<Value, String> {
+pub fn devices_list() -> Result<Value, crate::RemoteRefusal> {
     if daemon_running() {
         return admin_request("GET", "/api/admin/state", None);
     }
-    let reg = DeviceRegistry::open(&state_dir())?;
+    let reg = DeviceRegistry::open_typed(&state_dir())?;
     let devices: Vec<Value> = reg.devices().iter().map(device_json).collect();
     Ok(json!({ "running": false, "devices": devices, "pending": [], "connections": {} }))
 }
 
 /// デバイスの登録を失効させる（CLI `tako remote devices revoke` / MCP / GUI から使う）。
 /// daemon 稼働中は admin API 経由（接続中 WS の即時切断込み）、停止中はレジストリ直接編集
-pub fn devices_revoke(device_id: &str) -> Result<Value, String> {
+pub fn devices_revoke(device_id: &str) -> Result<Value, crate::RemoteRefusal> {
     if daemon_running() {
         return admin_request(
             "POST",
@@ -4168,8 +4185,8 @@ pub fn devices_revoke(device_id: &str) -> Result<Value, String> {
             Some(&json!({ "device_id": device_id })),
         );
     }
-    let mut reg = DeviceRegistry::open(&state_dir())?;
-    let device = reg.revoke(device_id)?;
+    let mut reg = DeviceRegistry::open_typed(&state_dir())?;
+    let device = reg.revoke_typed(device_id)?;
     Ok(json!({ "revoked": true, "device": device_json(&device) }))
 }
 
@@ -5884,7 +5901,8 @@ fn handle_admin_api(
                         request,
                         404,
                         Some(
-                            json!({ "error": format!("登録されていないデバイス: {device_id}") })
+                            crate::RemoteRefusal::DeviceNotRegistered(device_id.to_string())
+                                .admin_body()
                                 .to_string(),
                         ),
                     );
@@ -5901,7 +5919,7 @@ fn handle_admin_api(
                     Some(json!({ "error": message, "kind": code }).to_string()),
                 );
             }
-            let result = ctx.registry.lock().unwrap().set_role(device_id, next);
+            let result = ctx.registry.lock().unwrap().set_role_typed(device_id, next);
             match result {
                 Ok((device, resolved)) => {
                     audit_role_allowed(ctx, &device, "set_role", &change, caller);
@@ -5929,7 +5947,7 @@ fn handle_admin_api(
                         ),
                     )
                 }
-                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+                Err(e) => respond(request, 404, Some(e.admin_body().to_string())),
             }
         }
         // デバイス失効（CLI / MCP / GUI の revoke。接続中 WS は即時切断）
@@ -5947,7 +5965,7 @@ fn handle_admin_api(
                     Some(json!({ "error": "device_id が必要" }).to_string()),
                 );
             };
-            let result = ctx.registry.lock().unwrap().revoke(device_id);
+            let result = ctx.registry.lock().unwrap().revoke_typed(device_id);
             match result {
                 Ok(device) => {
                     disconnect_device_ws(broadcasters, device_id);
@@ -5959,7 +5977,7 @@ fn handle_admin_api(
                         ),
                     )
                 }
-                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+                Err(e) => respond(request, 404, Some(e.admin_body().to_string())),
             }
         }
         // daemon を畳む（#1599。`tako remote stop` の穏当な停止 = OS を問わない受け口）。
