@@ -1545,7 +1545,13 @@ codex 0.154.0 はセッションの終わりに **SIGTERM**、agy はセッシ�
   持たないので、`ChildCmd::command` が args の並びから `exe::login_arg0` で当てる。`-l` と `-c` を並べた argv を
   表と A/B の旧経路（`_legacy`）の外に書くと番犬
   `crates/tako-control/tests/issue2577_csh_login_shell_watchdog.rs` が file:line で落とす（本物の tcsh の実経路も
-  同じファイル）。A/B `TAKO_2577_LEGACY=1`。対話のペインのシェル（`platform::shell`）はこの表を通さない（#1945）
+  同じファイル）。A/B `TAKO_2577_LEGACY=1`。明示コマンドの無い対話のペインのシェル（`platform::shell::default_shell`
+  = `$SHELL -l`）はこの表を通さない（#1945）。**明示コマンドを持つペイン**（`platform::shell::login_shell_command`）は
+  csh 系だけ表の行を引き、PTY の子へ argv[0] を渡す口が無いぶん `exec -a` を持つシェルの段を挟む
+  （`posix_argv0_command`。候補 `ARGV0_TRAMPOLINES` = `/bin` → `/usr/bin` → `/usr/local/bin` の zsh / bash から在るもの。
+  macOS は `/bin/zsh -fc 'exec -a "$0" "$@"'`。どれも無ければ argv[0] なしの非ログインの `-c` で起こす）。
+  器（tmux）の内側コマンドの 1 行は default-shell（`$SHELL`）が `-c` で解釈するので、csh 系なら `shell::quote_for_csh`（単引用符の中の `!` と改行の前に `\`）で組む（#2597。番犬
+  `crates/tako-control/tests/issue2597_csh_pane_command_watchdog.rs`・A/B `TAKO_2597_LEGACY=1`）
 - **子プロセスでない相手を聞き直して待つときも同じ**（#1662）。`tako run --wait` は実行ペインの
   終わりを IPC で 2 秒ごとに聞き直す無限ループで、サーバーを走らせると永久に返らなかった。
   聞き直しは `tako_core::probe::poll_with_timeout` の 1 実装を通す（眠りは残り時間で頭打ち・

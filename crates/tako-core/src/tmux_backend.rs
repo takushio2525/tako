@@ -1255,11 +1255,38 @@ pub fn socket_dir() -> Option<std::path::PathBuf> {
 /// 語のリストを sh -c 安全な 1 つのコマンド文字列へ組み立てる
 /// （terminal::login_shell_command とも共有する）
 pub(crate) fn shell_quoted(command: &SpawnCommand) -> String {
+    shell_quoted_with(command, crate::shell::quote_for_shell)
+}
+
+/// [`shell_quoted`] の語の引用を差し替えられる形
+fn shell_quoted_with(command: &SpawnCommand, quote: fn(&str) -> String) -> String {
     std::iter::once(&command.program)
         .chain(command.args.iter())
-        .map(|w| crate::shell::quote_for_shell(w))
+        .map(|w| quote(w))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// 器（tmux）へ渡す内側コマンドの 1 行（#2597）。
+///
+/// tmux はこの 1 行を default-shell（= サーバーを起こしたクライアントの `$SHELL`）の `-c` で解釈する
+/// （#2367 の段 `fd_limit::container_exec_plan` も同じ `$SHELL -c`）。csh / tcsh は単引用符の中でも `!` と
+/// 改行を解釈するので、明示コマンドの片（`hold_on_failure_command` / `run_pane_command` は複数行）が
+/// `Unmatched '''.` で崩れ、ペインが「実行中」のまま止まっていた（2026-11-01 実測）。`$SHELL` が csh 系なら
+/// csh の引用（`shell::quote_for_csh`）で組む。csh 系でない・A/B（`TAKO_2597_LEGACY=1`）は [`shell_quoted`] のまま
+pub(crate) fn container_command_line(command: &SpawnCommand) -> String {
+    container_command_line_for(command, std::env::var("SHELL").ok().as_deref())
+}
+
+/// [`container_command_line`] の判断部（`shell` = 器の default-shell になる `$SHELL`）
+pub(crate) fn container_command_line_for(command: &SpawnCommand, shell: Option<&str>) -> String {
+    let csh = !crate::platform::shell::issue2597_legacy()
+        && shell.is_some_and(crate::platform::exe::is_csh_family);
+    if csh {
+        shell_quoted_with(command, crate::shell::quote_for_csh)
+    } else {
+        shell_quoted(command)
+    }
 }
 
 /// テストの器の名前の接頭辞。**残骸掃除（[`TmuxTestGuard`]）はこの接頭辞の器しか拾わない**
@@ -4442,6 +4469,60 @@ set -gq copy-mode-position-format ''
         assert_eq!(super::parse_pane_facts(""), super::PaneFacts::default());
         // pid 0 は「取れなかった」と同じ扱い（張ると誰も書かないファイルを読む）
         assert_eq!(super::parse_pane_facts("/dev/ttys012\t0").pid, None);
+    }
+}
+
+/// #2597: 器の内側コマンドの 1 行は default-shell（`$SHELL`）が csh 系のときだけ csh の引用
+#[cfg(test)]
+mod container_line_2597_tests {
+    use super::*;
+
+    fn multi_line() -> SpawnCommand {
+        SpawnCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo 'a!b'\nexit 3".into()],
+        }
+    }
+
+    #[test]
+    fn csh系でない器の1行は修正前とバイト一致() {
+        for shell in [
+            None,
+            Some("/bin/zsh"),
+            Some("/bin/bash"),
+            Some("/bin/sh"),
+            Some("/opt/homebrew/bin/fish"),
+            Some(""),
+        ] {
+            assert_eq!(
+                container_command_line_for(&multi_line(), shell),
+                shell_quoted(&multi_line()),
+                "{shell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn csh系の器の1行はびっくりと改行を逃がす() {
+        if crate::platform::shell::issue2597_legacy() {
+            return;
+        }
+        for shell in ["/bin/tcsh", "/bin/csh"] {
+            let got = container_command_line_for(&multi_line(), Some(shell));
+            assert_eq!(
+                got, "/bin/sh -c 'echo '\\''a\\!b'\\''\\\nexit 3'",
+                "{shell}"
+            );
+        }
+        // `!` も改行も無い 1 行は csh 系でも同じ
+        let plain = SpawnCommand {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo hi".into()],
+        };
+        assert_eq!(
+            container_command_line_for(&plain, Some("/bin/tcsh")),
+            shell_quoted(&plain)
+        );
     }
 }
 

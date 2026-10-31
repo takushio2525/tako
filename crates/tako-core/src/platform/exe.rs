@@ -466,7 +466,8 @@ pub fn issue2577_legacy() -> bool {
 
 /// ログインシェルの起こし方（#2577）。**シェル種別ごとの起こし方の表はここ 1 か所**で、ログインシェルへ
 /// 尋ねる口（[`ask_login_shell`]）と、ユーザーの環境で CLI を走らせる子（`child_cmd::user_env_cli`）が
-/// [`login_invocation`] でこの表を引く。
+/// [`login_invocation`] でこの表を引く。明示コマンドを持つペイン（`platform::shell::login_shell_command`）も
+/// csh 系の行を引く（PTY の子は argv[0] を渡す口が無いので `exec -a` の段を 1 つ挟む。#2597）。
 ///
 /// | 種別 | 当たるシェル | 起こし方 |
 /// |---|---|---|
@@ -502,17 +503,23 @@ pub fn login_form(shell: &str) -> LoginForm {
     if issue2577_legacy() {
         return LoginForm::Flag;
     }
+    if is_csh_family(shell) {
+        LoginForm::Argv0
+    } else {
+        LoginForm::Flag
+    }
+}
+
+/// `shell` が csh / tcsh か（名前か、symlink の先の名前で判定）。起こし方の表（[`login_form`]）と、
+/// 器の内側コマンドを csh の引用で組むか（`tmux_backend::container_command_line`。#2597）が同じ判定を引く
+pub fn is_csh_family(shell: &str) -> bool {
     let csh_named = |path: &std::path::Path| {
         path.file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| matches!(name, "csh" | "tcsh"))
     };
     let path = std::path::Path::new(shell);
-    if csh_named(path) || super::path::canonicalize(path).is_ok_and(|real| csh_named(&real)) {
-        LoginForm::Argv0
-    } else {
-        LoginForm::Flag
-    }
+    csh_named(path) || super::path::canonicalize(path).is_ok_and(|real| csh_named(&real))
 }
 
 /// ログインシェルを 1 回起こす argv（[`login_invocation`] の答え）

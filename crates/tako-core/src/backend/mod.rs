@@ -823,13 +823,15 @@ pub fn inner_command_line(command: &crate::terminal::SpawnCommand) -> String {
     compose_inner_command(command, capabilities().quotes_program)
 }
 
-/// [`inner_command_line`] の判断部（純粋関数。**macOS からも両分岐をテストできる**）
+/// [`inner_command_line`] の判断部（**macOS からも両分岐をテストできる**。tmux の腕は `$SHELL` が
+/// csh 系かだけを見る = `tmux_backend::container_command_line`。#2597）
 pub(crate) fn compose_inner_command(
     command: &crate::terminal::SpawnCommand,
     quotes_program: bool,
 ) -> String {
     if quotes_program {
-        return crate::tmux_backend::shell_quoted(command);
+        // 器の default-shell（利用者の `$SHELL`）が csh 系なら csh の引用で組む（#2597）
+        return crate::tmux_backend::container_command_line(command);
     }
     psmux::inner_command(command)
 }
