@@ -20,11 +20,18 @@
 //! 起こしたペインのプロセスとして数えるため。Windows は exec が無いのでプロセスの中で外すだけ（ペインと
 //! 子へは届かない。資源の走査は Windows では未実装 = #2000）。A/B は [`LEGACY_ENV`]（何も外さず起こし
 //! 直さない = #2570 前の形）
+//!
+//! remote daemon（`tako remote serve`）も同じ表と同じ判断で外す（#2582。ペインの中から CLI の
+//! `tako remote start` で起こすと CLI の env を丸ごと受け継いで常駐していた）。daemon は CLI の `main` が
+//! [`apply_at_startup_for`] に [`DAEMON_LEGACY_ENV`] と [`LEGACY_ENV`] を渡して当てる
 
 use std::ffi::OsString;
 
 /// 何も外さない A/B の入口（#2570 前の形 = GUI は起こした側の env をそのまま持つ）
 pub const LEGACY_ENV: &str = "TAKO_2570_LEGACY";
+/// remote daemon が何も外さない A/B の入口（#2582 前の形）。daemon は [`LEGACY_ENV`] も見る
+/// （GUI の A/B を受け継いだ daemon は GUI と同じく修正前の形）
+pub const DAEMON_LEGACY_ENV: &str = "TAKO_2582_LEGACY";
 /// 起こし直した後の自分へ「外したもの」を渡す印（[`reexec_if_stripped`] が立て、[`apply_at_startup`] が
 /// 読んで消す）。値は起こしたペインの番号と外した名前だけ（値は載せない）
 pub const REEXEC_ENV: &str = "TAKO_2570_REEXEC";
@@ -430,7 +437,7 @@ impl Carried {
 
 impl Applied {
     /// 外した・抜いた名前（並びは表の順）
-    fn names(&self) -> Vec<&'static str> {
+    pub fn names(&self) -> Vec<&'static str> {
         self.plan
             .remove
             .iter()
@@ -475,6 +482,12 @@ impl Applied {
 /// 起動の最初に自分の env から外す（GUI の `main` だけが呼ぶ。**スレッドを起こす前**に呼ぶこと =
 /// env の書き換えは同じプロセスの別スレッドの読みと競る）
 pub fn apply_at_startup() -> Applied {
+    apply_at_startup_for(&[LEGACY_ENV])
+}
+
+/// [`apply_at_startup`] の A/B の入口を選べる形（`legacy_envs` のどれかが空でなければ何も外さない）。
+/// remote daemon は [`DAEMON_LEGACY_ENV`] と [`LEGACY_ENV`] を渡す（#2582）
+pub fn apply_at_startup_for(legacy_envs: &[&str]) -> Applied {
     // 起こし直した後の自分なら、前の自分が外したものを受け取って印を消す（子へ渡さない）
     let reexeced = std::env::var(REEXEC_ENV).ok().map(|v| Carried::decode(&v));
     if std::env::var_os(REEXEC_ENV).is_some() {
@@ -483,7 +496,9 @@ pub fn apply_at_startup() -> Applied {
     let get = |name: &str| std::env::var_os(name);
     let plan = plan(&get, crate::claude_mod::LIST_SEP);
     let from_pane = std::env::var("TAKO_PANE_ID").ok();
-    let legacy = std::env::var_os(LEGACY_ENV).is_some_and(|v| !v.is_empty());
+    let legacy = legacy_envs
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()));
     if !legacy {
         for name in &plan.remove {
             std::env::remove_var(name);
@@ -961,5 +976,23 @@ mod tests {
         assert_eq!(std::env::var("TAKO_PANE_ID").as_deref(), Ok("7"));
         assert_eq!(std::env::var("GIT_EDITOR").as_deref(), Ok("true"));
         assert!(applied.log_line().is_some_and(|l| l.contains(LEGACY_ENV)));
+        // remote daemon の口（#2582）: GUI の A/B を受け継いでいれば daemon も外さない
+        let daemon = [DAEMON_LEGACY_ENV, LEGACY_ENV];
+        assert!(apply_at_startup_for(&daemon).legacy);
+        assert_eq!(std::env::var("TAKO_PANE_ID").as_deref(), Ok("7"));
+        // daemon の A/B だけなら daemon は外さず、GUI の口は見ない（外す）
+        std::env::remove_var(LEGACY_ENV);
+        std::env::set_var(DAEMON_LEGACY_ENV, "1");
+        let applied = apply_at_startup_for(&daemon);
+        assert!(applied.legacy);
+        assert_eq!(std::env::var("GIT_EDITOR").as_deref(), Ok("true"));
+        let applied = apply_at_startup();
+        assert!(!applied.legacy);
+        assert!(std::env::var_os("TAKO_PANE_ID").is_none());
+        // 空の値は A/B ではない
+        set();
+        std::env::set_var(DAEMON_LEGACY_ENV, "");
+        assert!(!apply_at_startup_for(&daemon).legacy);
+        assert!(std::env::var_os("GIT_EDITOR").is_none());
     }
 }

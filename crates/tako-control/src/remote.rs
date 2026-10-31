@@ -2039,6 +2039,79 @@ fn describe_panic(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+// --- 起こした側の env（#2582）--------------------------------------------------
+// ペインの中から CLI（`tako remote start`）で起こした daemon は CLI の env を丸ごと受け継ぎ、ペインの
+// 識別（`TAKO_PANE_ID`）・起こした GUI への接続・claude のセッションの印・`GIT_EDITOR=true` を持ったまま
+// 常駐していた（`ps eww` と資源の走査はそのペインのプロセスとして数え、daemon が起こす子へも素通し）。
+// GUI（#2570）と同じ正本 `tako_core::host_env::STRIP` で外し、起こし直しの要否も同じ判断で決める。
+// GUI の自動復帰で起きた daemon は GUI が外した後の env を受け継ぐので、外すものが無く何もしない
+
+/// daemon を起こす引数（[`spawn_daemon`] が渡す形の正本。CLI の `main` の門 [`is_serve_invocation`] も
+/// これで見分ける = 食い違うと外さない daemon ができる）
+pub const SERVE_ARGS: [&str; 2] = ["remote", "serve"];
+
+/// この起動は daemon（`tako remote serve`）か（`args` は argv[0] を除いたもの）。
+/// `--help` などが付いたものは daemon ではない（clap が答えて終わる）
+pub fn is_serve_invocation(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    let args: Vec<_> = args.into_iter().collect();
+    args.len() == SERVE_ARGS.len() && args.iter().zip(SERVE_ARGS).all(|(a, b)| a == b)
+}
+
+/// 起動の最初に外した結果と、起こし直せなかったときの理由（[`run_daemon`] が audit.log へ名前だけ残す）
+static STARTUP_ENV: OnceLock<(tako_core::host_env::Applied, Option<String>)> = OnceLock::new();
+
+/// daemon の起動の最初に、ペインの中でだけ意味を持つ env を外す（#2582）。
+///
+/// **CLI の `main` がスレッドを起こす前に、daemon の起動（[`is_serve_invocation`]）のときだけ呼ぶ**
+/// （普段の CLI は呼んだペインの `TAKO_PANE_ID` / `TAKO_SOCKET` を使うので外さない）。unix は外した env の
+/// まま自分を exec し直す（同じ pid・argv = PID ファイルと正体の確かめ #2518 / #2533 はそのまま）。
+/// A/B は `TAKO_2582_LEGACY=1`（GUI から受け継いだ `TAKO_2570_LEGACY` も同じ）
+pub fn strip_inherited_env_at_startup() {
+    use tako_core::host_env;
+    let applied =
+        host_env::apply_at_startup_for(&[host_env::DAEMON_LEGACY_ENV, host_env::LEGACY_ENV]);
+    let exec_error = host_env::reexec_if_stripped(&applied).map(|e| e.to_string());
+    let _ = STARTUP_ENV.set((applied, exec_error));
+}
+
+/// [`strip_inherited_env_at_startup`] の結果を audit.log へ残す（外すものが無ければ書かない）
+fn audit_startup_env() {
+    if let Some((applied, exec_error)) = STARTUP_ENV.get() {
+        if let Some(extra) = startup_env_record(applied, exec_error.as_deref()) {
+            audit_serve("daemon_startup_env", extra);
+        }
+    }
+}
+
+/// audit.log の `daemon_startup_env` の中身（純関数。**名前だけ**で値は載せない = トークンを含む）。
+///
+/// `action`: `exec`（外して起こし直した）/ `in_process`（外したが起こし直していない = Windows か exec の
+/// 失敗）/ `legacy`（A/B で外していない）。何もしていなければ None（GUI の自動復帰の daemon = 修正前と同じ）
+fn startup_env_record(
+    applied: &tako_core::host_env::Applied,
+    exec_error: Option<&str>,
+) -> Option<Value> {
+    let (action, pane, names) = if let Some(carried) = &applied.reexeced {
+        ("exec", carried.from_pane.as_deref(), carried.names.clone())
+    } else if applied.plan.is_empty() {
+        return None;
+    } else {
+        let names = applied.names().iter().map(|n| n.to_string()).collect();
+        let action = if applied.legacy {
+            "legacy"
+        } else {
+            "in_process"
+        };
+        (action, applied.from_pane.as_deref(), names)
+    };
+    Some(json!({
+        "action": action,
+        "pane": pane.and_then(|p| p.trim().parse::<u64>().ok()),
+        "names": names,
+        "exec_error": exec_error,
+    }))
+}
+
 /// 独立デーモンとして HTTP サーバーを起動し、SIGTERM まで待機する。
 /// `tako remote serve` から呼ばれる内部用関数。
 ///
@@ -2058,6 +2131,8 @@ pub fn run_daemon() -> io::Result<()> {
     tako_core::i18n::set_lang(crate::settings::load().lang_setting().resolve());
     // P0-3: state ディレクトリを 0700 で確保する（UDS の bind 先にもなる）
     ensure_state_dir()?;
+    // #2582: 起動の最初（CLI の main）に外した env を名前だけ残す（待ち受けの前 = 起動に失敗しても残る）
+    audit_startup_env();
     let spec = endpoint_spec().map_err(io::Error::other)?;
     if let local_endpoint::EndpointSpec::Unix(ref sock) = spec {
         // エンドポイントのパス長チェック（unix の sun_path 制約に由来）
@@ -3681,14 +3756,13 @@ pub fn spawn_daemon() -> Result<Value, String> {
     }
 
     let tako_bin = serve_binary();
-    let args = vec!["remote".to_string(), "serve".to_string()];
 
     let mut cmd = Command::new(&tako_bin);
     // #586: GUI（リモートパネルの起動ボタン）から立てるので、console サブシステムの
     // tako CLI がコンソールウィンドウを出さないようにする。`configure_daemon_child` は
     // Windows では何もしない（unix の setsid 相当が無い）ので、ここで塞ぐ必要がある
     tako_core::platform::process::no_console_window(&mut cmd);
-    cmd.args(&args)
+    cmd.args(SERVE_ARGS)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -7346,6 +7420,96 @@ mod urlencoding {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2582: daemon の門は `tako remote serve` ちょうどだけ（`--help` や別のサブコマンドでは外さない）
+    #[test]
+    fn issue2582_daemonの門はserveの起動だけ() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(is_serve_invocation(args(&SERVE_ARGS)));
+        assert!(is_serve_invocation(args(&["remote", "serve"])));
+        for other in [
+            &["remote", "serve", "--help"][..],
+            &["remote", "start"],
+            &["mcp", "serve"],
+            &["serve", "remote"],
+            &["remote"],
+            &[],
+        ] {
+            assert!(!is_serve_invocation(args(other)), "{other:?}");
+        }
+    }
+
+    /// #2582: audit.log の 1 行は名前だけ（値 = トークン・セッション ID を載せない）。外すものが無ければ書かない
+    #[test]
+    fn issue2582_起動時に外したenvの記録は名前だけで何もしなければ書かない() {
+        use tako_core::host_env::{plan, Applied, Carried};
+        let env: HashMap<&str, &str> = [
+            ("TAKO_PANE_ID", "7"),
+            ("TAKO_TOKEN", "token-not-for-logs"),
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_SESSION_ID", "session-not-for-logs"),
+            ("GIT_EDITOR", "true"),
+            ("TAKO_ISOLATED", "1"),
+        ]
+        .into_iter()
+        .collect();
+        let get = |n: &str| env.get(n).map(std::ffi::OsString::from);
+        let applied = Applied {
+            legacy: false,
+            from_pane: Some("7".into()),
+            plan: plan(&get, ':'),
+            reexeced: None,
+        };
+        // 外したが起こし直していない（Windows か exec の失敗）
+        let row = startup_env_record(&applied, Some("No such file or directory (os error 2)"))
+            .expect("1 行");
+        assert_eq!(row["action"], "in_process");
+        assert_eq!(row["pane"], 7);
+        assert_eq!(row["exec_error"], "No such file or directory (os error 2)");
+        let names = row["names"].as_array().expect("names");
+        for want in [
+            "TAKO_PANE_ID",
+            "TAKO_TOKEN",
+            "CLAUDECODE",
+            "CLAUDE_CODE_SESSION_ID",
+            "GIT_EDITOR",
+        ] {
+            assert!(names.contains(&json!(want)), "{want}: {row}");
+        }
+        assert!(
+            !names.contains(&json!("TAKO_ISOLATED")),
+            "隔離の指定まで外した: {row}"
+        );
+        let text = row.to_string();
+        assert!(
+            !text.contains("token-not-for-logs") && !text.contains("session-not-for-logs"),
+            "{text}"
+        );
+        // A/B（外していない）
+        let legacy = Applied {
+            legacy: true,
+            ..applied.clone()
+        };
+        assert_eq!(
+            startup_env_record(&legacy, None).expect("1 行")["action"],
+            "legacy"
+        );
+        // 起こし直した後の自分（前の自分が外した名前を印で受け取った）
+        let reexeced = Applied {
+            reexeced: Some(Carried {
+                from_pane: Some("7".into()),
+                names: vec!["TAKO_PANE_ID".into(), "GIT_EDITOR".into()],
+            }),
+            ..Applied::default()
+        };
+        let row = startup_env_record(&reexeced, None).expect("1 行");
+        assert_eq!(row["action"], "exec");
+        assert_eq!(row["pane"], 7);
+        assert_eq!(row["names"], json!(["TAKO_PANE_ID", "GIT_EDITOR"]));
+        assert_eq!(row["exec_error"], Value::Null);
+        // 何もしていない（GUI の自動復帰の daemon = GUI が外した後の env）は書かない
+        assert_eq!(startup_env_record(&Applied::default(), None), None);
+    }
 
     /// #2050: スマホの入力の応答。確認の段で送らなかったら 409 と伏せ字、警告だけの段は 200 に
     /// 伏せ字を添え、当たらない入力は今までどおり 200 だけ

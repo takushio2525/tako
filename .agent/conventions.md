@@ -5486,6 +5486,9 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
   隔離の指定（`TAKO_DATA_DIR` / `TAKO_TMUX_SOCKET` / `TAKO_SESSIONS_FILE` ほか = `host_env::KEPT`）は
   ペインへそのまま届くので、**ペインの中から隔離 GUI を起こすときは置き場とソケットを明示する**
   （明示しないと起こした側の GUI の置き場を共有する）
+- **remote daemon（`tako remote serve`）も起動の最初に同じ正本で外す**（#2582・FR-2.1.6）。外すのは CLI の
+  `main` の門（`remote::is_serve_invocation`）を通った起動だけなので、**daemon を起こす引数は
+  `remote::SERVE_ARGS` を使い、直書きしない**（番犬 `issue2582_daemon_inherited_pane_env_watchdog`）
 - **HOME を本物のままにした起動では、ペインのシェルが利用者の rc を読む**。rc が `CLAUDE_CONFIG_DIR` を
   export していれば、ペインで打った claude は本物の設定 dir を使う（GUI の env では止められない）。
   ペインの claude まで隔離するなら一時の HOME か ZDOTDIR を並べる（既存の検証の大半はそうしている）
