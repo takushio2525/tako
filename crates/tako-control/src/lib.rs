@@ -98,6 +98,7 @@ pub mod remote_role;
 pub mod remote_serve;
 pub mod remote_setup;
 pub mod remote_ssh;
+pub mod remote_starting;
 pub mod remote_tasks;
 /// 応答の値に載せる注記と CLI の手元の行の文（#2365。断りではない文の日英）
 pub mod reply_note;

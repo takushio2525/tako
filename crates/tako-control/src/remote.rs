@@ -367,6 +367,71 @@ pub fn write_last_autostart(last: &crate::remote_autostart::LastAutostart) {
     }
 }
 
+/// daemon を起こしている途中の印（#2608）。`spawn_daemon` が書き、抜けるときに消す。
+/// `tako remote status`（別プロセス）が読み、新しい daemon の待ち受けを
+/// 「PID ファイルの無い待ち受け」（#2455）と取り違えないようにする
+pub fn starting_path() -> std::path::PathBuf {
+    state_dir().join("tako-remote.starting")
+}
+
+fn read_starting_marker() -> Option<crate::remote_starting::StartingMarker> {
+    let raw = std::fs::read_to_string(starting_path()).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// `spawn_daemon` を抜けるまで「起こしている途中」の印を置く（#2608）。
+///
+/// **書くのは `spawn_daemon` だけ**（テストは印の書き消しを確かめるために直に使う）。
+/// Drop で消すので、Err の早期 return でも panic の巻き戻しでも消える。プロセスごと落ちて
+/// 消し損ねた印は、status が書き手の生死と期限で効かせない（`remote_starting::is_active`）。
+/// 消すのは**自分が書いた印だけ**（後から別の起動が書き直した印は消さない）
+pub struct StartingGuard {
+    marker: crate::remote_starting::StartingMarker,
+}
+
+impl StartingGuard {
+    /// 印を置く。`previous_pid` は入れ替えなら止める旧版の pid（#2518）。
+    /// 書けなくても起動は止めない（status の案内が #2608 前に戻るだけ）
+    pub fn begin(previous_pid: Option<u32>) -> Self {
+        let marker = crate::remote_starting::StartingMarker {
+            at: now_epoch_secs(),
+            pid: std::process::id(),
+            via: current_origin_str().to_string(),
+            previous_pid,
+        };
+        if let Ok(json) = serde_json::to_string(&marker) {
+            let _ = ensure_state_dir();
+            let _ = write_secret_file(&starting_path(), &json);
+        }
+        Self { marker }
+    }
+}
+
+impl Drop for StartingGuard {
+    fn drop(&mut self) {
+        if read_starting_marker().as_ref() == Some(&self.marker) {
+            let _ = std::fs::remove_file(starting_path());
+        }
+    }
+}
+
+/// いま効いている「起こしている途中」の印（#2608）。判定は `remote_starting::is_active` の
+/// 1 実装で、ここは材料（書き手の生死・起動時刻・今の時刻）を集めるだけ。
+/// A/B（`TAKO_2608_LEGACY=1`）では見ない = #2608 前の status
+fn start_in_progress() -> Option<crate::remote_starting::StartingMarker> {
+    if crate::remote_starting::legacy_mode() {
+        return None;
+    }
+    let marker = read_starting_marker()?;
+    let alive = is_process_alive(marker.pid);
+    let started = if alive {
+        tako_core::platform::procinfo::start_time_unix(marker.pid)
+    } else {
+        None
+    };
+    crate::remote_starting::is_active(&marker, now_epoch_secs(), alive, started).then_some(marker)
+}
+
 /// serve の増減を audit.log へ残す（#1049: 「何が消したか」を後から追えるように）。
 /// pid と実行ファイルが載るので、世代違いの tako が犯人なら名指しできる
 fn audit_serve(event: &str, extra: serde_json::Value) {
@@ -2786,7 +2851,9 @@ pub fn daemon_status() -> Value {
         Liveness::NoPidFile => {
             return with_autostart_fields(with_pidless_listener(json!({ "running": false })))
         }
-        Liveness::Dead => return with_autostart_fields(json!({ "running": false })),
+        Liveness::Dead => {
+            return with_autostart_fields(with_start_in_progress(json!({ "running": false })))
+        }
     };
     let pid_num = pid_info.pid;
     // URL ファイル（起動時に確定した固定 ts.net URL）から接続リンクを再構成する。
@@ -2860,7 +2927,9 @@ pub fn daemon_status() -> Value {
     if let Some(n) = devices {
         status["devices"] = json!(n);
     }
-    with_autostart_fields(status)
+    // 入れ替えの途中（旧版がまだ動いている / 新版が PID ファイルを書いた直後）も言う（#2608）。
+    // 旧版の warnings が勧める `tako remote start` を、進行中の入れ替えに重ねさせない
+    with_autostart_fields(with_start_in_progress(status))
 }
 
 /// PID ファイルが無いときの状態へ、まだ応答している待ち受けを添える（#2455）。
@@ -2868,9 +2937,19 @@ pub fn daemon_status() -> Value {
 /// `running` は PID ファイルで決まるので false のまま。ただし記録された待ち受けがまだ応答して
 /// いれば、PID ファイルだけが消えた daemon が動き続けている（スマホからは繋がるのに
 /// `running: false` としか言わなかった）ので、その待ち受けと止め方を添える。
-/// 普段の停止状態は到達先の記録も消えているので、接続は試さない
+/// 普段の停止状態は到達先の記録も消えているので、接続は試さない。
+///
+/// **起こしている途中なら、応答している待ち受けは起動中の新しい daemon のもの**（#2608）。
+/// 新しい daemon は待ち受けを開いてから tailscale の serve を張り終えて PID ファイルを書くので、
+/// その間は #2455 と同じ形に見える。stop を案内すると立ち上がったばかりの daemon を止めさせるので、
+/// `pidless_listener` の代わりに `starting` を返し、待って読み直すことを言う
 fn with_pidless_listener(mut status: Value) -> Value {
-    if let Some(endpoint) = current_endpoint().filter(local_endpoint::probe_alive) {
+    let listener = current_endpoint().filter(local_endpoint::probe_alive);
+    if let Some(marker) = start_in_progress() {
+        let described = listener.as_ref().map(|e| e.describe());
+        return with_start_marker(status, &marker, described.as_deref());
+    }
+    if let Some(endpoint) = listener {
         status["pidless_listener"] = json!(endpoint.describe());
         status["warnings"] = json!([format!(
             "PID ファイルが無いのに、記録された待ち受け（{}）が応答しています。\
@@ -2878,6 +2957,31 @@ fn with_pidless_listener(mut status: Value) -> Value {
              止めずに確かめる手順を返します）",
             endpoint.describe()
         )]);
+    }
+    status
+}
+
+/// 起こしている途中なら `starting` と、待って読み直す 1 行を載せる（#2608）
+fn with_start_in_progress(status: Value) -> Value {
+    match start_in_progress() {
+        Some(marker) => with_start_marker(status, &marker, None),
+        None => status,
+    }
+}
+
+/// 印を status へ写す（形は `remote_starting::status_field` の 1 実装）。
+/// 1 行は既にある `warnings` の後ろへ足す（旧版の 1 行などを消さない）
+fn with_start_marker(
+    mut status: Value,
+    marker: &crate::remote_starting::StartingMarker,
+    listener: Option<&str>,
+) -> Value {
+    let now = now_epoch_secs();
+    status["starting"] = crate::remote_starting::status_field(marker, now, listener);
+    let line = json!(crate::remote_starting::detail(marker, now));
+    match status["warnings"].as_array_mut() {
+        Some(list) => list.push(line),
+        None => status["warnings"] = json!([line]),
     }
     status
 }
@@ -3717,7 +3821,7 @@ pub fn spawn_daemon() -> Result<Value, String> {
     audit_daemon_request("daemon_start_requested", "start", None);
     // 既に起動中か確認
     let status = daemon_status();
-    let mut renewed_from: Option<u32> = None;
+    let mut renewing: Option<u32> = None;
     if status["running"].as_bool() == Some(true) {
         let running_exe = status["serve_binary"].as_str().unwrap_or("");
         let expected = serve_binary();
@@ -3734,8 +3838,18 @@ pub fn spawn_daemon() -> Result<Value, String> {
         if !crate::remote_generation::renewable_in_status(&status) {
             return Err("リモートサーバーは既に起動中".to_string());
         }
-        renewed_from = Some(stop_stale_generation(&status)?);
+        // pid の読み方は `stop_stale_generation` と同じ（running の応答は必ず pid を持つ）
+        renewing = Some(status["pid"].as_u64().unwrap_or(0) as u32);
     }
+
+    // #2608: ここから抜けるまで（旧版の停止 → 新版が待ち受けを開く → serve を張る → PID ファイル
+    // → 起動情報）を「起こしている途中」として残す。別プロセスの status が、新版の待ち受けを
+    // 「PID ファイルの無い待ち受け」（#2455）と読んで stop を案内しないため。抜けると消える
+    let _starting = StartingGuard::begin(renewing);
+    let renewed_from = match renewing {
+        Some(_) => Some(stop_stale_generation(&status)?),
+        None => None,
+    };
 
     // stale な待ち受けの回収（PID ファイル消失 + プロセス死亡で state だけ残るケース）
     if let Some(ep) = current_endpoint() {
