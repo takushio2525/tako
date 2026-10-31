@@ -4570,6 +4570,13 @@ fn main() -> ExitCode {
     // #2367: 器（tmux）の中のペインの子を起動時の fd 上限へ戻す段（製品が段に使うのは GUI 自身。
     // CLI でも同じ段が動くのは、実 tmux のテストが段を実物の実行ファイルで通すため）
     tako_core::platform::fd_limit::exec_container_child_if_requested();
+    // #2582: remote daemon（`tako remote serve`）はペインの中の CLI から起こすと、そのペインの env
+    // （TAKO_PANE_ID・接続・claude のセッションの印・GIT_EDITOR=true ほか）を持ったまま常駐する。GUI（#2570）と
+    // 同じ正本で外し、unix は exec し直す（スレッドを起こす前 = env の書き換えが別スレッドの読みと競らない）。
+    // 普段の CLI は呼んだペインの env を使うので外さない
+    if tako_control::remote::is_serve_invocation(std::env::args_os().skip(1)) {
+        tako_control::remote::strip_inherited_env_at_startup();
+    }
     // #1758 / #1805: 読み手が先に閉じたパイプへの出力で panic しない（標準出力 → 静かに 0 /
     // 標準エラー → 行を捨てて続ける）。tako-core / tako-control の出力も同じ口を通るので、
     // CLI の経路で走るライブラリ側の `eprintln!` にも効く（`cli_main` のスレッドより前）
