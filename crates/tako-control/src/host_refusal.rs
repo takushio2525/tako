@@ -92,6 +92,25 @@ pub enum HostRefusal {
     ManyShownWebViews(usize),
     /// `ウィンドウ初期化前のため Web ビューを作れない（直後に再試行）`
     WindowNotReady,
+    /// `Web ビュー <id> はまだ開いていない（state = <state>。…）`（#724。wry の Web ビューがまだ無い。
+    /// `state` は `web list` の `state` = queued / creating / held / failed）
+    WebViewNotReady { id: u64, state: String },
+    /// `back 失敗: <cause>`（cause は wry のエラー文）
+    WebBackFailed(String),
+    /// `forward 失敗: <cause>`
+    WebForwardFailed(String),
+    /// `reload 失敗: <cause>`
+    WebReloadFailed(String),
+    /// `URL 読み込み失敗: <cause>`
+    WebLoadFailed(String),
+    /// `eval 失敗: <cause>`
+    WebEvalFailed(String),
+    /// `URL が空です`（Web ビューの URL の検査 = `webview::validate_url`。dispatch の `Reason::UrlEmpty` と同じ文）
+    UrlEmpty,
+    /// `URL に空白文字が含まれています（NSURL が解釈できない）: <url>`
+    UrlHasWhitespace(String),
+    /// `URL に制御文字が含まれています（NSURL が解釈できない）: <url>`
+    UrlHasControlChar(String),
 
     // ---- 設定の保存 ----
     /// `設定を保存できない: <cause>`（中身も枠と同じ表示言語 = [`crate::config_io::IoCause`]）
@@ -259,6 +278,38 @@ impl HostRefusal {
             }
             (Self::WindowNotReady, En) => {
                 "cannot create a web view before the window is ready (retry shortly)".into()
+            }
+            (Self::WebViewNotReady { id, state }, Ja) => format!(
+                "Web ビュー {id} はまだ開いていない（state = {state}。web list の state が ready になってから。\
+                 held / failed は navigate で開き直す）"
+            ),
+            (Self::WebViewNotReady { id, state }, En) => format!(
+                "Web view {id} is not open yet (state = {state}). Wait until its state in web list is ready; \
+                 reopen a held or failed one with navigate"
+            ),
+            (Self::WebBackFailed(cause), Ja) => format!("back 失敗: {cause}"),
+            (Self::WebBackFailed(cause), En) => format!("back failed: {cause}"),
+            (Self::WebForwardFailed(cause), Ja) => format!("forward 失敗: {cause}"),
+            (Self::WebForwardFailed(cause), En) => format!("forward failed: {cause}"),
+            (Self::WebReloadFailed(cause), Ja) => format!("reload 失敗: {cause}"),
+            (Self::WebReloadFailed(cause), En) => format!("reload failed: {cause}"),
+            (Self::WebLoadFailed(cause), Ja) => format!("URL 読み込み失敗: {cause}"),
+            (Self::WebLoadFailed(cause), En) => format!("failed to load the URL: {cause}"),
+            (Self::WebEvalFailed(cause), Ja) => format!("eval 失敗: {cause}"),
+            (Self::WebEvalFailed(cause), En) => format!("eval failed: {cause}"),
+            (Self::UrlEmpty, Ja) => "URL が空です".into(),
+            (Self::UrlEmpty, En) => "the URL is empty".into(),
+            (Self::UrlHasWhitespace(url), Ja) => {
+                format!("URL に空白文字が含まれています（NSURL が解釈できない）: {url}")
+            }
+            (Self::UrlHasWhitespace(url), En) => {
+                format!("the URL contains whitespace (NSURL cannot parse it): {url}")
+            }
+            (Self::UrlHasControlChar(url), Ja) => {
+                format!("URL に制御文字が含まれています（NSURL が解釈できない）: {url}")
+            }
+            (Self::UrlHasControlChar(url), En) => {
+                format!("the URL contains control characters (NSURL cannot parse it): {url}")
             }
 
             (Self::SettingsNotSaved(cause), Ja) => {

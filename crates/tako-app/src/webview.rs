@@ -18,6 +18,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tako_control::HostRefusal;
 use tako_core::PaneId;
 
 /// Web ビューの生成を **gpui の App を借用していないところ**で 1 本ずつ行うか（#724 の W1）。
@@ -684,8 +685,11 @@ impl WebViewEntry {
     }
 
     /// まだ wry の Web ビューが無いあいだの断り（#724。CLI / MCP の eval 等の応答）
-    fn not_ready_error(&self) -> String {
-        crate::ui_text::webdock::not_ready(self.id.as_u64(), self.phase.get().as_str())
+    fn not_ready_error(&self) -> HostRefusal {
+        HostRefusal::WebViewNotReady {
+            id: self.id.as_u64(),
+            state: self.phase.get().as_str().to_string(),
+        }
     }
 
     /// 最初の読み込みが終わったか（#724 の W4 の印を外す合図）
@@ -783,7 +787,7 @@ impl WebViewEntry {
     /// 生成前は理由つきで断る（#724）
     pub fn focus(&self) -> Result<(), String> {
         let Some(view) = self.view.as_ref() else {
-            return Err(self.not_ready_error());
+            return Err(self.not_ready_error().into());
         };
         if !self.in_window() {
             return Err(detached_parent_error());
@@ -895,17 +899,19 @@ impl WebViewEntry {
 
     /// ナビゲーション操作。`to` は "back" / "forward" / "reload" / URL 文字列。
     /// wry の Web ビューがまだ無いとき（#724）は [`Self::navigate_pending`]
-    pub fn navigate(&self, to: &str) -> Result<(), String> {
+    ///
+    /// 断りは表示言語の [`HostRefusal`]（#2365。CLI / MCP の応答へは GUI の口が `?` で載せる）
+    pub fn navigate(&self, to: &str) -> Result<(), HostRefusal> {
         let Some(view) = self.view.as_ref() else {
             return self.navigate_pending(to);
         };
         match to {
             "back" => view
                 .evaluate_script("history.back();")
-                .map_err(|e| format!("back 失敗: {e}")),
+                .map_err(|e| HostRefusal::WebBackFailed(e.to_string())),
             "forward" => view
                 .evaluate_script("history.forward();")
-                .map_err(|e| format!("forward 失敗: {e}")),
+                .map_err(|e| HostRefusal::WebForwardFailed(e.to_string())),
             "reload" => {
                 // エラー状態なら失敗した URL をリトライ
                 if let Ok(s) = self.shared.lock() {
@@ -914,7 +920,8 @@ impl WebViewEntry {
                         return self.navigate(&url);
                     }
                 }
-                view.reload().map_err(|e| format!("reload 失敗: {e}"))
+                view.reload()
+                    .map_err(|e| HostRefusal::WebReloadFailed(e.to_string()))
             }
             url => {
                 let url = normalize_url(url);
@@ -932,7 +939,7 @@ impl WebViewEntry {
                     }
                 }
                 view.load_url(&url)
-                    .map_err(|e| format!("URL 読み込み失敗: {e}"))
+                    .map_err(|e| HostRefusal::WebLoadFailed(e.to_string()))
             }
         }
     }
@@ -944,7 +951,7 @@ impl WebViewEntry {
     ///   呼び出し側（`TakoApp::wake_webview_builder`）
     /// - 生成待ち: URL なら生成する URL を差し替える（back / forward / reload は何もしない）
     /// - 生成中: 断る（作り終えてから navigate する）
-    fn navigate_pending(&self, to: &str) -> Result<(), String> {
+    fn navigate_pending(&self, to: &str) -> Result<(), HostRefusal> {
         let phase = self.phase.get();
         let target = match to {
             "back" | "forward" | "reload" => None,
@@ -974,7 +981,7 @@ impl WebViewEntry {
     /// JS を非同期評価する。結果は後で `take_eval_result(token)` で回収する。
     /// dispatch は UI スレッドで走るため、ここで結果を同期待ちしてはならない
     /// （wry のコールバックも UI スレッド配送 = 待つとデッドロック）
-    pub fn eval(&mut self, js: &str) -> Result<u64, String> {
+    pub fn eval(&mut self, js: &str) -> Result<u64, HostRefusal> {
         let Some(view) = self.view.as_ref() else {
             return Err(self.not_ready_error());
         };
@@ -990,7 +997,7 @@ impl WebViewEntry {
                 s.eval_results.insert(token, result);
             }
         })
-        .map_err(|e| format!("eval 失敗: {e}"))?;
+        .map_err(|e| HostRefusal::WebEvalFailed(e.to_string()))?;
         Ok(token)
     }
 
@@ -1086,7 +1093,7 @@ impl WebViewEntry {
             let s = self.shared.lock().map_err(|_| "lock error".to_string())?;
             s.failed_url.clone().unwrap_or_else(|| s.url.clone())
         };
-        self.navigate(&url)
+        Ok(self.navigate(&url)?)
     }
 }
 
@@ -1583,19 +1590,15 @@ pub fn normalize_url(input: &str) -> String {
 /// 正規化済み URL を wry へ渡す前に検証する。
 /// NSURL(string:) が nil を返す文字列（空白・制御文字を含む等）を弾き、
 /// wry 内部の unwrap による panic（#334）を防ぐ
-pub fn validate_url(url: &str) -> Result<(), String> {
+pub fn validate_url(url: &str) -> Result<(), HostRefusal> {
     if url.is_empty() {
-        return Err("URL が空です".into());
+        return Err(HostRefusal::UrlEmpty);
     }
     if url.chars().any(|c| c.is_ascii_whitespace()) {
-        return Err(format!(
-            "URL に空白文字が含まれています（NSURL が解釈できない）: {url}"
-        ));
+        return Err(HostRefusal::UrlHasWhitespace(url.to_string()));
     }
     if url.bytes().any(|b| b < 0x20) {
-        return Err(format!(
-            "URL に制御文字が含まれています（NSURL が解釈できない）: {url}"
-        ));
+        return Err(HostRefusal::UrlHasControlChar(url.to_string()));
     }
     Ok(())
 }

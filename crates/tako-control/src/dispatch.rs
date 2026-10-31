@@ -8096,24 +8096,26 @@ fn git_write_reply(cwd: &Path, request: Request) -> Result<Value, DispatchError>
     // 同じリポジトリへの書き込みは 1 本ずつ（conflicts は読むだけなので並べてよい）
     let _turn = (!matches!(request, Request::GitConflicts { .. })).then(|| git_write_turn(&repo));
     match request {
-        Request::GitCommit { message, all, .. } => tako_core::git::commit(&repo, &message, all)
-            .map(|out| json!({ "committed": true, "output": out.trim() }))
-            .map_err(op_err),
-        Request::GitPull { .. } => tako_core::git::pull(&repo)
+        Request::GitCommit { message, all, .. } => {
+            tako_core::git::commit_typed(&repo, &message, all)
+                .map(|out| json!({ "committed": true, "output": out.trim() }))
+                .map_err(op_err)
+        }
+        Request::GitPull { .. } => tako_core::git::pull_typed(&repo)
             .map(|out| json!({ "pulled": true, "output": out.trim() }))
             .map_err(op_err),
-        Request::GitPush { .. } => tako_core::git::push(&repo)
+        Request::GitPush { .. } => tako_core::git::push_typed(&repo)
             .map(|out| json!({ "pushed": true, "output": out.trim() }))
             .map_err(op_err),
         Request::GitStage { paths, .. } => {
             let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-            tako_core::git::stage(&repo, &path_refs)
+            tako_core::git::stage_typed(&repo, &path_refs)
                 .map(|_| json!({ "staged": true, "paths": paths }))
                 .map_err(op_err)
         }
         Request::GitUnstage { paths, .. } => {
             let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
-            tako_core::git::unstage(&repo, &path_refs)
+            tako_core::git::unstage_typed(&repo, &path_refs)
                 .map(|_| json!({ "unstaged": true, "paths": paths }))
                 .map_err(op_err)
         }
@@ -8128,7 +8130,7 @@ fn git_write_reply(cwd: &Path, request: Request) -> Result<Value, DispatchError>
         } => {
             // 既定は「作って切り替える」（#322: 既定動作を賢くする）
             let switch = checkout.unwrap_or(true);
-            tako_core::git::create_branch(&repo, &name, start_point.as_deref(), switch)
+            tako_core::git::create_branch_typed(&repo, &name, start_point.as_deref(), switch)
                 .map(|out| {
                     json!({
                         "created": name,
@@ -8146,7 +8148,7 @@ fn git_write_reply(cwd: &Path, request: Request) -> Result<Value, DispatchError>
             no_ff,
             ..
         } => run_git_merge(&repo, &branch, confirm, no_ff),
-        Request::GitMergeAbort { .. } => tako_core::git::abort_operation(&repo)
+        Request::GitMergeAbort { .. } => tako_core::git::abort_operation_typed(&repo)
             .map(|(op, out)| {
                 json!({
                     "aborted": op.as_str(),
@@ -8197,7 +8199,7 @@ fn git_write_turn(repo: &Path) -> std::sync::MutexGuard<'static, ()> {
 
 /// GitCheckout（#496）。`confirm` = false のときは破壊的になり得る場合に実行せず提示を返す
 fn run_git_checkout(repo: &Path, branch: &str, confirm: bool) -> Result<Value, DispatchError> {
-    let preview = tako_core::git::checkout_preview(repo, branch).map_err(op_err)?;
+    let preview = tako_core::git::checkout_preview_typed(repo, branch).map_err(op_err)?;
     let preview_json = json!({
         "target": preview.target,
         "current": preview.current,
@@ -8225,7 +8227,7 @@ fn run_git_checkout(repo: &Path, branch: &str, confirm: bool) -> Result<Value, D
             "preview": preview_json,
         }));
     }
-    let out = tako_core::git::checkout(repo, branch).map_err(op_err)?;
+    let out = tako_core::git::checkout_typed(repo, branch).map_err(op_err)?;
     Ok(json!({
         "checked_out": true,
         "requires_confirmation": false,
@@ -8243,7 +8245,7 @@ fn run_git_merge(
     confirm: bool,
     no_ff: bool,
 ) -> Result<Value, DispatchError> {
-    let preview = tako_core::git::merge_preview(repo, branch).map_err(op_err)?;
+    let preview = tako_core::git::merge_preview_typed(repo, branch).map_err(op_err)?;
     let preview_json = json!({
         "target": preview.target,
         "current": preview.current,
@@ -8271,7 +8273,7 @@ fn run_git_merge(
             "preview": preview_json,
         }));
     }
-    let outcome = tako_core::git::merge(repo, branch, no_ff).map_err(op_err)?;
+    let outcome = tako_core::git::merge_typed(repo, branch, no_ff).map_err(op_err)?;
     let state = tako_core::git::conflict_state(repo);
     Ok(json!({
         "merged": !outcome.conflicted,
@@ -18456,7 +18458,8 @@ fn dispatch_git_resolve_agent(
         let focused = host
             .workspace()
             .get_tab(tid)
-            .ok_or_else(|| op_err("タブが見つかりません"))?
+            // find_tab が同じ一覧から引いた id なので届かない（届いたら同じ断り = 日英）
+            .ok_or(DispatchError::TabNotFound(raw_tab))?
             .tree()
             .focused();
         (tid, focused)
@@ -28146,7 +28149,14 @@ fn dispatch_session_restart(
             let launch = plan
                 .launch
                 .as_ref()
-                .ok_or_else(|| op_err("resume コマンドを組めなかった"))?;
+                // readiness が先に同じ理由で断るので届かない（届いたら同じ断り = 日英）
+                .ok_or_else(|| {
+                    Reason::ResumeCommandUnbuildable {
+                        pane: pane_raw,
+                        error: plan.resume_error.clone(),
+                    }
+                    .operation()
+                })?;
             // 起動に要る system prompt は**終了させる前に**書く（書けなければ何も壊さずに断る）。
             // 中身の文も枠と同じ表示言語（#2365）
             launch

@@ -22700,7 +22700,11 @@ impl TakoApp {
                             if let Some(e) = this.webviews.iter().find(|e| e.pane == Some(pane_id))
                             {
                                 if let Err(err) = e.navigate(to) {
-                                    eprintln!("warning: webview navigate({to}) 失敗: {err}");
+                                    // stderr の診断は日本語のまま（#2365。表示言語に従うのは CLI / MCP の応答）
+                                    eprintln!(
+                                        "warning: webview navigate({to}) 失敗: {}",
+                                        err.text_in(tako_core::i18n::Lang::Ja)
+                                    );
                                 }
                             }
                             // #724: 保留・生成失敗の再読み込みは生成し直しの依頼

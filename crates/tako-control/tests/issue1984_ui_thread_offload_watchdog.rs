@@ -2980,7 +2980,7 @@ fn 走査が空振りしていない() {
             "OffloadJob::GitWrite {",
         ),
         (&s.dispatch, "fn run_reply(self)", "git_write_reply("),
-        (&s.dispatch, "fn git_write_reply(", "git::push("),
+        (&s.dispatch, "fn git_write_reply(", "git::push_typed("),
         (
             &s.main,
             "match app.orphan_cleanup_plan(",

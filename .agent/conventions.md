@@ -442,6 +442,26 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   取らない・走らせない**: 取得は偽の curl（HTML / 偽のインストーラを書くか失敗する）、実行は偽の bash / sh（取得物を
   読まずに終了コードだけ返す）。フォルダの `.zprofile`・書けないホーム・`HOME` を外す注入で断らせ、GUI 無しのホストへ
   dispatch を日英で通す。最初に claude / codex / agy / brew / curl / wget / bash / sh を引けないことを確かめる）
+- #2365 の続きで、**dispatch の `op_err` が載せる中身**のうち日本語のまま残っていたものを移した（`op_err` は
+  中身の `Display` をそのまま `Operation` の文にする。PaneTree / Workspace = #2358・GUI の Web ビューの選び方 =
+  `HostRefusal` は日英済みだった）: tako-core の git の書き込み系（`git.rs` の commit / pull / push / stage / unstage /
+  ブランチの作成と切替 / マージ / 中止とその下見・ブランチ名の検証）は `git::GitError`（16 種・網羅 match）と型の口
+  `*_typed`（`commit_typed` / `checkout_preview_typed` / `validate_branch_name_typed` ほか。内部の `run_git_typed` /
+  `run_git_raw_typed`）。**`String` を返す従来の口は日本語のまま**（GUI の git パネル `right_panel.rs` が直に呼ぶ）で、
+  dispatch（`git_write_reply` / `run_git_checkout` / `run_git_merge`）だけが型の口を通る。git 自身の stderr は
+  `GitError::Failed` で日英とも手を加えずに載せる（git のロケールの言語のまま = 外部の出力）。「見つかりません」系
+  （ブランチ・基点）は日本語が「見つからない」を含まないので英語も ` not found` を含めない（`does not exist`）。
+  checkout / merge の下見の `blockers`（`Ok` の応答の値）は対象外。GUI の Web ビューの navigate / eval と URL の検査
+  （`webview.rs` の `navigate` / `navigate_pending` / `eval` / `validate_url` と生成前の断り = 旧
+  `ui_text::webdock::not_ready`）は `HostRefusal` の 9 種を返す型にし、GUI の口は `?` で載せる（`queued` の URL の
+  検査 = `web open` も同じ文）。描画の側の stderr の診断（戻る / 進むボタンの失敗）だけは `text_in(Lang::Ja)` で
+  日本語のまま。生成の断り `detached_parent_error`（persist.log と同じ文）は Issue #2365 の表の残り。dispatch が
+  `op_err("…")` へ渡していた日本語の固定文 2 つ（届かない経路）は `DispatchError::TabNotFound` /
+  `Reason::ResumeCommandUnbuildable` へ寄せた。番犬は同じ `issue1762_dispatch_error_lang.rs`（`HostRefusal` の表と
+  `HOST_IMPL_SCOPES` に webview.rs の口を足した・末尾の節 = `GitError` の表・型の口の本体の日本語の固定文と日本語の口の
+  呼び出し `GIT_TYPED_HEADS` / `JA_GIT_INNER_CALLS`・dispatch の git の口 `JA_GIT_CALLS`・`op_err` へ渡す日本語の
+  固定文・Web ビューの口の `Lang::Ja`）、実経路は `tests/issue2365_op_err_lang.rs`（一時のリポジトリで CLI / MCP と
+  同じ background の本体 `OffloadJob::GitWrite` を日英で走らせる。`LANG=C` で git の stderr を英語に固定）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
