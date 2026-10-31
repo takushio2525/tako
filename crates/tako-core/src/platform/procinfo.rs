@@ -184,6 +184,24 @@ pub fn ancestry(pid: u32, depth: usize) -> Vec<Ancestor> {
     )
 }
 
+/// `pid` の親から上へ、近い順に最大 `depth` 段の祖先の pid だけ（#2559）。
+///
+/// [`ancestry`] と同じ辿り方で名前を引かない（argv を読まない分軽い）。`tako mod report` が
+/// 報告ごとに送り、GUI が送り主がペインの中かを見分ける材料（`claude_mod::report_origin`）
+pub fn ancestor_pids(pid: u32, depth: usize) -> Vec<u32> {
+    let table = snapshot_checked();
+    let entry = |p: u32| table.as_ref().and_then(|t| t.iter().find(|e| e.pid == p));
+    walk_ancestry(
+        pid,
+        depth,
+        |p| entry(p).map(|e| e.ppid).or_else(|| imp::parent_pid(p)),
+        |_| String::new(),
+    )
+    .into_iter()
+    .map(|a| a.pid)
+    .collect()
+}
+
 /// [`ancestry`] の辿り方（純関数。親と名前の引き方を差し替えてテストする）
 fn walk_ancestry(
     pid: u32,
@@ -1685,6 +1703,17 @@ mod tests {
             "名前にパスが混ざっている: {}",
             first.name
         );
+    }
+
+    /// #2559: pid だけの祖先は名前つきの祖先と同じ並び（`tako mod report` が送る材料）
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn pidだけの祖先は名前つきと同じ並び() {
+        let me = std::process::id();
+        let named: Vec<u32> = ancestry(me, 4).iter().map(|a| a.pid).collect();
+        let pids = ancestor_pids(me, 4);
+        assert!(!pids.is_empty(), "自プロセスの親が引けない");
+        assert_eq!(pids, named);
     }
 
     /// 実機の OS へ問い合わせる（**両プラットフォームで走る**）。#936 の

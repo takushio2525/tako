@@ -331,7 +331,9 @@ S1〜S6 には入れない。
   （`tmux_backend.rs` の `set -g update-environment 'TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL'`）にも足す
 - tako 自身が app プロセスから起こす `claude -p`（自動リネーム `autorename.rs` 等）には**注入しない**
   （ペインの env だけ。自動リネームは `--strict-mcp-config` で軽く走らせている経路なので、mod を
-  載せて重くしない）
+  載せて重くしない）。**GUI 自身の env に残った分も外す**（#2559）: GUI をペインの中から起こし直すと
+  そのペインの `TAKO_PANE_ID` と注入の env が GUI に残り、子の `claude -p` が受け継いで mod（設定 dir の
+  `skills/tako` からも読まれる）を起こしていた。外す名前は `claude_mod::helper_env` / `HELPER_DROP_ENV`
 
 ### 3.4 版の下限と止め方
 
@@ -389,6 +391,9 @@ S1〜S6 には入れない。
 
 - 呼び出し元のペインは CLI の既定（`TAKO_PANE_ID`）で決まる。orphan 復元で番号が変わった
   ペインは dispatch の `stale_pane_map`（#210）がそのまま解決する
+- CLI は自分の祖先の pid（`ancestry`。unix だけ）も添え、GUI は「祖先に GUI がいて、その直下の子が
+  どのペインの pty の子でもない」報告（= GUI がペインの外で起こした claude）をそのペインに記録しない
+  （#2559。`claude_mod::report_origin`。決められないときは受け付ける）
 - **会話の本文・プロンプト・ツールの引数は載せない**（AGENTS.md の絶対ルール。`pending_tool` は
   ツール名だけ）。`rate_limits` は**アカウント単位**の値なので、tako 側で `CLAUDE_CONFIG_DIR`
   （mod が env から読んで渡す。ログには出さない）ごとに束ね、最新の `observed_at` を採る

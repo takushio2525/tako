@@ -115,7 +115,15 @@ fn observe() -> Vec<Seen> {
     };
     let mcp = |host: &mut Host, path: &Path, request: UiRequest| -> String {
         host.ui_path = Some(path.to_path_buf());
-        match tako_control::claude_mod::run(host, Some("ui"), None, None, Some(request), false) {
+        match tako_control::claude_mod::run(
+            host,
+            Some("ui"),
+            None,
+            None,
+            None,
+            Some(request),
+            false,
+        ) {
             Ok(v) => v.to_string(),
             Err(e) => e.to_string(),
         }

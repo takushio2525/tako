@@ -1197,6 +1197,7 @@ pub(super) fn build_request(
                 action,
                 report: None,
                 pane: None,
+                ancestry: None,
                 ui,
                 dry_run: bool_arg(args, "dry_run")?.unwrap_or(false),
             }

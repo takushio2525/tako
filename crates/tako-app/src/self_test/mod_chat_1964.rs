@@ -276,6 +276,7 @@ pub(super) async fn mod_chat_visual(
             action: Some("ui".into()),
             report: None,
             pane: None,
+            ancestry: None,
             ui: Some(tako_core::claude_mod_ui::UiRequest {
                 op: Some("set".into()),
                 key: Some("chat.place".into()),

@@ -10,7 +10,7 @@
 //! | `band-on` / `band-off` | Claude Code の画面の帯を出す / 隠す（S3 #1881。正本は ui.json の `band.hidden` = #1960。報告の応答で全 mod へ中継） | `tako mod band on` / `off` | `tako_mod` |
 //! | `ui` | 定型の UI 設定 ui.json の表示と変更（#1960。本体は [`crate::claude_mod_ui`]） | `tako mod ui …`（ローカル処理） | `tako_mod` |
 //! | `install` / `uninstall` | 設定 dir ごとの `skills/tako` へ写しを置く / 印つきの写しだけ外す（S7-1 #1959。`dry_run` で判断だけ） | `tako mod install` / `uninstall [--dry-run]`（ローカル処理） | `tako_mod` |
-//! | `report` | mod からの状態報告。応答は tako 側のスナップショット（帯・サイドバーの材料） | `tako mod report`（stdin） | **出さない** |
+//! | `report` | mod からの状態報告。応答は tako 側のスナップショット（帯・サイドバーの材料）。GUI がペインの外で起こした claude の報告は記録しない（#2559。`accepted: "foreign"`） | `tako mod report`（stdin） | **出さない** |
 //!
 //! `report` を MCP に載せないのは、AI が叩くと**自分の状態を偽って注入できるだけ**で、
 //! AI にとっての等価物（読む側の `tako_mod` / `tako_orchestrator_self`）は別にあるから
@@ -254,6 +254,7 @@ pub fn run(
     action: Option<&str>,
     report: Option<Value>,
     pane: Option<u64>,
+    ancestry: Option<Vec<u32>>,
     ui: Option<tako_core::claude_mod_ui::UiRequest>,
     dry_run: bool,
 ) -> Result<Value, DispatchError> {
@@ -303,7 +304,7 @@ pub fn run(
         "ui" => {
             crate::claude_mod_ui::run(&ui_path(host)?, &ui.unwrap_or_default()).map_err(ui_error)
         }
-        "report" => accept_report(host, report, pane),
+        "report" => accept_report(host, report, pane, ancestry.as_deref()),
         other => Err(DispatchError::InvalidParams(
             ModText::UnknownAction {
                 action: other.into(),
@@ -346,12 +347,28 @@ fn accept_report(
     host: &mut dyn ControlHost,
     report: Option<Value>,
     pane: Option<u64>,
+    ancestry: Option<&[u32]>,
 ) -> Result<Value, DispatchError> {
     let value = report.ok_or_else(|| {
         DispatchError::InvalidParams("report には報告の JSON が要る（stdin で渡す）".into())
     })?;
     let parsed = core::parse_report(value).map_err(DispatchError::InvalidParams)?;
     let pane_id = resolve_reporting_pane(host, pane)?;
+    // #2559: GUI がペインの外で起こした claude（自動命名の `claude -p` 等）の報告は、受け継いだ
+    // `TAKO_PANE_ID` のペインのものとして記録しない。帯のトグルの取り込みより前に見る
+    // （補助の報告で ui.json も動かさない）。`ended` でそのペインの主の報告を消させない
+    if let core::ReportOrigin::HostHelper { .. } = report_origin_of(host, ancestry) {
+        let hub = host
+            .claude_mod_mut()
+            .ok_or_else(|| DispatchError::Operation("この tako は mod の報告を受けない".into()))?;
+        let accepted = hub.reject_foreign(pane_id.as_u64(), Instant::now());
+        return Ok(json!({
+            "accepted": accepted.as_str(),
+            "pane": pane_id.as_u64(),
+            "fresh_for_ms": core::FRESH_FOR.as_millis() as u64,
+            "tako": snapshot(host, pane_id, accepted, core::s3_legacy()),
+        }));
+    }
     // #1960: 帯のトグルの正本は ui.json。mod の中で切り替えた（`$.store` の時刻が新しい）なら取り込む
     if let (Some(band), Some(path), false) = (
         parsed.band.as_ref(),
@@ -381,6 +398,27 @@ fn accept_report(
         "fresh_for_ms": core::FRESH_FOR.as_millis() as u64,
         "tako": snapshot(host, pane_id, accepted, core::s3_legacy()),
     }))
+}
+
+/// 報告の送り主の居場所（#2559。判断は [`core::report_origin`]）。祖先を送らない CLI・A/B
+/// （`TAKO_2559_LEGACY`）は決めない。材料はこの GUI の pid と全ペインの pty の直下の子の pid で、
+/// 1 つでも分からないペインがあれば決めない（主のセッションの報告を捨てる側へ倒さない）
+fn report_origin_of(host: &dyn ControlHost, ancestry: Option<&[u32]>) -> core::ReportOrigin {
+    let Some(chain) = ancestry.filter(|_| !core::helper_legacy()) else {
+        return core::ReportOrigin::Unknown;
+    };
+    let mut children = Vec::new();
+    // 退避中のペイン（バックグラウンド）も数える: 表示中のタブだけを見ると、退避した直結のペインの
+    // 主のセッションが「ペインの外」に見えて捨てられる
+    for pane in host.workspace().all_panes() {
+        match host.session(pane.id()).map(|s| s.child_pid()) {
+            Some(Some(pid)) => children.push(pid),
+            Some(None) => return core::ReportOrigin::Unknown,
+            // 端末の無いペイン（プレビュー・Web ビュー）には claude が居ない
+            None => {}
+        }
+    }
+    core::report_origin(chain, std::process::id(), Some(&children))
 }
 
 /// 報告の応答に載せる tako 側のスナップショット（設計書 §2.3）。
@@ -660,6 +698,13 @@ fn pane_row(
     });
     if !reason.is_null() {
         row["reason"] = reason;
+    }
+    // #2559: ペインの外の claude の報告を捨てた回数（自動命名の `claude -p` が受け継いだペインの識別で送った等）
+    if let Some(foreign) = hub.foreign.get(&raw) {
+        row["foreign_reports"] = json!({
+            "count": foreign.count,
+            "last_age_ms": now.saturating_duration_since(foreign.last).as_millis() as u64,
+        });
     }
     if let Some(s) = stored {
         row["report"] = report_json(s, now);

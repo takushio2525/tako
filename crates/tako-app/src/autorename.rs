@@ -477,6 +477,34 @@ fn run_learning_strict(
     }
 }
 
+/// 命名の `claude -p` の起動形（引数と env）。
+///
+/// #2559: 子は**どのペインの claude でもない**。GUI をペインの中から起こし直すと（master の install +
+/// 再起動）GUI 自身の env にそのペインの識別と mod の注入が残り、子が受け継いで mod（設定 dir の
+/// `skills/tako` からも読まれる）を起こし、そのペインの報告として haiku の 1 ターンを送っていた
+/// （master の `mod_turn` / `session_id` / `rate_limits` の上書き・終わりの `ended` で報告ごと消える）。
+/// 差分は `tako_core::claude_mod::helper_env` の 1 実装。A/B は `TAKO_2559_LEGACY=1`
+fn claude_command(bin: &Path, strict: bool) -> std::process::Command {
+    let mut command = std::process::Command::new(bin);
+    // #586: GUI プロセスからの起動なので Windows でコンソールウィンドウを出させない
+    tako_core::platform::process::no_console_window(&mut command);
+    command.args(["-p", "--model", MODEL]);
+    if strict {
+        command.arg(STRICT_MCP_FLAG);
+    }
+    if !tako_core::claude_mod::helper_legacy() {
+        let inherited = std::env::var(tako_core::claude_mod::PLUGIN_DIRS_ENV).ok();
+        let sep = tako_core::claude_mod::LIST_SEP;
+        for (key, value) in tako_core::claude_mod::helper_env(inherited.as_deref(), sep) {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+    }
+    command
+}
+
 /// claude -p を 1 回だけ起こして stdout を読む。
 ///
 /// `timeout` は本番では [`CLAUDE_TIMEOUT`] 固定で、テストだけが短い値を渡す
@@ -485,16 +513,11 @@ fn run_learning_strict(
 /// もう一度上限まで待つ = 命名 1 回が最悪 2 倍になる）
 fn spawn_claude(bin: &Path, prompt: &str, strict: bool, timeout: Duration) -> ClaudeRun {
     use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     let started = Instant::now();
-    let mut command = Command::new(bin);
-    command.args(["-p", "--model", MODEL]);
-    if strict {
-        command.arg(STRICT_MCP_FLAG);
-    }
-    // #586: GUI プロセスからの起動なので Windows でコンソールウィンドウを出させない
-    let mut child = match tako_core::platform::process::no_console_window(&mut command)
+    let mut command = claude_command(bin, strict);
+    let mut child = match command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2022,6 +2045,35 @@ TAIL
             before, after,
             "打ち間違いだけでリネームが発火してはならない"
         );
+    }
+
+    /// #2559: 命名の子へペインの識別・mod の起床条件・claude のセッションの印を渡さない。
+    /// GUI をペインの中から起こし直すと GUI の env に残るので、起動形で必ず外す（GUI の env を
+    /// 書き換えずに `get_envs` の「外す」印で見る）
+    #[test]
+    fn issue2559_命名の子へペインの識別とmodの起床条件を渡さない() {
+        for strict in [true, false] {
+            let command = claude_command(Path::new("claude"), strict);
+            let removed: Vec<String> = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(key, _)| key.to_string_lossy().into_owned())
+                .collect();
+            for key in [
+                "TAKO_PANE_ID",
+                "TAKO_TAB_ID",
+                tako_core::claude_mod::CLI_ENV,
+                "CLAUDECODE",
+                "CLAUDE_CODE_SESSION_ID",
+                "CLAUDE_CODE_CHILD_SESSION",
+            ] {
+                assert!(
+                    removed.iter().any(|k| k == key),
+                    "autorename.rs:{} の claude_command が {key} を外していない（strict={strict}）: {removed:?}",
+                    line_of(&autorename_source(), "fn claude_command(")
+                );
+            }
+        }
     }
 
     /// このファイルの本文（番犬はソースを走査する。#760）
