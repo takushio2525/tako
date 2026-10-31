@@ -16,6 +16,10 @@
 //! [`LoginShellPath::timeout`] で呼び手へ運ぶ。上限なしで待つ形へ戻すと番犬
 //! `issue1533_login_shell_timeout_watchdog` が file:line で落とす。
 //!
+//! 起こし方（`-l -c` か、`-l` を受け付けない csh / tcsh の argv[0] の形か）はシェル種別の表
+//! [`login_invocation`] が決める（#2577。ユーザーの環境で CLI を走らせる `child_cmd` も同じ表を引く）。
+//! 表を通さずに `-l -c` を並べると番犬 `issue2577_csh_login_shell_watchdog` が file:line で落とす。
+//!
 //! 一方 **Windows には `$SHELL` も `command -v` も無い**ので、この実装は例外なく
 //! `None` を返す。実測（2026-07-27・Windows 11）では claude / git が導入済みでも
 //! `tako setup` が「claude / codex / agy のいずれも見つかりません」で停止した。
@@ -202,12 +206,17 @@ fn ask_login_shell(
     path: Option<&str>,
     budget: std::time::Duration,
 ) -> crate::probe::Outcome {
-    let args = ["-l", "-c", script];
+    // 起こし方はシェル種別の表（csh / tcsh は `-l -c` を受け付けない = #2577）
+    let invocation = login_invocation(shell, script);
     let mut command = std::process::Command::new(shell);
-    command.args(args);
+    if let Some(arg0) = &invocation.arg0 {
+        std::os::unix::process::CommandExt::arg0(&mut command, arg0);
+    }
+    command.args(&invocation.args);
     if let Some(path) = path {
         command.env("PATH", path);
     }
+    let args: Vec<&str> = invocation.args.iter().map(String::as_str).collect();
     crate::probe::group_output_with_timeout(
         &mut command,
         &crate::probe::label(shell, &args),
@@ -443,6 +452,110 @@ pub fn fallback_login_shell() -> &'static str {
     } else {
         "/bin/sh"
     }
+}
+
+/// #2577 の A/B の env（`1` で csh / tcsh のログインシェルにも `-l -c` を渡す = #2577 前の形。
+/// tcsh / csh は `-l` を唯一の引数としてしか受け付けないので、問い合わせが毎回
+/// `Unknown option: '-l'` で失敗し、ログインシェルでだけ通る PATH のコマンドを引けない）
+pub const ISSUE2577_LEGACY_ENV: &str = "TAKO_2577_LEGACY";
+
+/// [`ISSUE2577_LEGACY_ENV`] が立っているか（#2577 の A/B のゲートはここ 1 か所）
+pub fn issue2577_legacy() -> bool {
+    std::env::var(ISSUE2577_LEGACY_ENV).is_ok_and(|v| v == "1")
+}
+
+/// ログインシェルの起こし方（#2577）。**シェル種別ごとの起こし方の表はここ 1 か所**で、ログインシェルへ
+/// 尋ねる口（[`ask_login_shell`]）と、ユーザーの環境で CLI を走らせる子（`child_cmd::user_env_cli`）が
+/// [`login_invocation`] でこの表を引く。
+///
+/// | 種別 | 当たるシェル | 起こし方 |
+/// |---|---|---|
+/// | [`LoginForm::Flag`] | sh / bash / zsh / dash / ksh / fish ほか（csh 系でないすべて） | `<shell> -l -c <片>`（#2577 前からの形のまま） |
+/// | [`LoginForm::Argv0`] | csh / tcsh（名前か、symlink の先の名前で判定） | argv[0] を `-<名>` にして `<shell> -c 'exec /bin/sh -c $argv[1]:q' <片>` |
+///
+/// 実測（2026-10-31・macOS 同梱の tcsh 6.21。砂場の HOME の `.login` でだけ足した PATH のコマンドを
+/// `command -v` で聞く）: `tcsh -l -c …` は `Unknown option: '-l'` で rc=1（csh も同じ）。sh / bash / zsh /
+/// dash / ksh は `-l -c` で答える。argv[0] の先頭の `-` は login(1) がログインシェルを起こすときの印で、
+/// tcsh / csh はこれを見て本物のログインと同じ順（`/etc/csh.cshrc` → `/etc/csh.login` → `~/.tcshrc` →
+/// `~/.login`）で読む（`$?loginsh` も立つ）。片は POSIX の構文（`command -v` / `unset` / `exec`）なので
+/// csh に解釈させず `/bin/sh` へ渡す。`$argv[1]:q` は `-c` の後ろの引数を 1 語のまま置換なしで展開する
+/// （改行・`!`・引用符を含む片も崩れない = 実測）。
+///
+/// 試して捨てた形: `tcsh -l` の標準入力に片を渡す（対話扱いになり、警告が stdout へ混ざる）・
+/// `tcsh -c` で `.login` を `source` する模倣（`/etc/csh.login` の path_helper と `~/.tcshrc` の順が本物と
+/// 逆になり、PATH の並びが変わる）。fish は `-l -c` を受け付けるので Flag のまま。
+/// nu など POSIX の片そのものが通らないシェルはこの表の外（別の問題）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginForm {
+    /// `<shell> -l -c <片>`
+    Flag,
+    /// argv[0] を `-<名>` にして `-c` で [`CSH_LOGIN_SCRIPT`] を渡す（csh / tcsh）
+    Argv0,
+}
+
+/// csh 系のログインシェルへ `-c` で渡す 1 行。`-c` の後ろの引数（POSIX の片）を `/bin/sh` へそのまま渡す
+pub const CSH_LOGIN_SCRIPT: &str = "exec /bin/sh -c $argv[1]:q";
+
+/// `shell` の起こし方（[`LoginForm`] の表）。名前が `csh` / `tcsh` か、symlink の先がそうなら
+/// [`LoginForm::Argv0`]。`TAKO_2577_LEGACY=1` では常に [`LoginForm::Flag`]（#2577 前の形）
+pub fn login_form(shell: &str) -> LoginForm {
+    if issue2577_legacy() {
+        return LoginForm::Flag;
+    }
+    let csh_named = |path: &std::path::Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "csh" | "tcsh"))
+    };
+    let path = std::path::Path::new(shell);
+    if csh_named(path) || std::fs::canonicalize(path).is_ok_and(|real| csh_named(&real)) {
+        LoginForm::Argv0
+    } else {
+        LoginForm::Flag
+    }
+}
+
+/// ログインシェルを 1 回起こす argv（[`login_invocation`] の答え）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginInvocation {
+    /// 起こす実行ファイル（`$SHELL` の値のまま）
+    pub program: String,
+    /// argv[0]。`None` は `program` のまま（[`LoginForm::Flag`]）
+    pub arg0: Option<String>,
+    /// argv[1..]
+    pub args: Vec<String>,
+}
+
+/// ログインシェル `shell` に POSIX の片 `script` を走らせる argv（[`LoginForm`] の表を引く 1 実装。#2577）
+pub fn login_invocation(shell: &str, script: &str) -> LoginInvocation {
+    match login_form(shell) {
+        LoginForm::Flag => LoginInvocation {
+            program: shell.to_string(),
+            arg0: None,
+            args: vec!["-l".into(), "-c".into(), script.to_string()],
+        },
+        LoginForm::Argv0 => LoginInvocation {
+            program: shell.to_string(),
+            arg0: Some(login_arg0_name(shell)),
+            args: vec!["-c".into(), CSH_LOGIN_SCRIPT.into(), script.to_string()],
+        },
+    }
+}
+
+/// argv[0] の欄を持たない起動計画（`child_cmd::ChildCmd`）が [`LoginForm::Argv0`] の形なら、当てる argv[0]。
+/// args が [`login_invocation`] の Argv0 の並び（`-c` / [`CSH_LOGIN_SCRIPT`] / 片）のときだけ当たる
+pub fn login_arg0(program: &str, args: &[String]) -> Option<String> {
+    let argv0_form = args.len() == 3 && args[0] == "-c" && args[1] == CSH_LOGIN_SCRIPT;
+    argv0_form.then(|| login_arg0_name(program))
+}
+
+/// ログインシェルの印の argv[0]（`-` + 実行ファイル名）
+fn login_arg0_name(shell: &str) -> String {
+    let name = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(shell);
+    format!("-{name}")
 }
 
 /// 「実行できる通常ファイル」か。symlink は追う（`which` と同じ判定）。
@@ -784,6 +897,111 @@ fn resolve_with_pathext(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2577: csh 系でないシェルは `-l -c` のまま（#2577 前と同じ argv）、csh / tcsh だけ argv[0] の形
+    #[test]
+    fn ログインシェルの起こし方はcsh系だけargv0の形() {
+        let script = "command -v tako2577";
+        for shell in [
+            "/bin/zsh",
+            "/bin/bash",
+            "/bin/sh",
+            "/bin/dash",
+            "/bin/ksh",
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+            "/nonexistent/tako-2577/nu",
+            // 名前が csh / tcsh と一致しないものは csh 系と見なさない（symlink の先で判定する）
+            "/nonexistent/tako-2577/tcsh6",
+            "/nonexistent/tako-2577/xcsh",
+        ] {
+            assert_eq!(login_form(shell), LoginForm::Flag, "{shell}");
+            assert_eq!(
+                login_invocation(shell, script),
+                LoginInvocation {
+                    program: shell.to_string(),
+                    arg0: None,
+                    args: vec!["-l".into(), "-c".into(), script.into()],
+                },
+                "{shell}: #2577 前の argv から変わった"
+            );
+        }
+        for (shell, arg0) in [
+            ("/bin/tcsh", "-tcsh"),
+            ("/bin/csh", "-csh"),
+            ("/usr/local/bin/tcsh", "-tcsh"),
+            // 存在しないパスも名前で決める（起こせないのは #2577 前と同じ）
+            ("/nonexistent/tako-2577/tcsh", "-tcsh"),
+        ] {
+            let got = login_invocation(shell, script);
+            assert_eq!(login_form(shell), LoginForm::Argv0, "{shell}");
+            assert_eq!(
+                got,
+                LoginInvocation {
+                    program: shell.to_string(),
+                    arg0: Some(arg0.into()),
+                    args: vec!["-c".into(), CSH_LOGIN_SCRIPT.into(), script.into()],
+                },
+                "{shell}"
+            );
+            assert!(
+                !got.args.iter().any(|a| a == "-l"),
+                "{shell}: csh 系へ `-l` を渡すと `Unknown option: '-l'` で必ず落ちる（#2577）"
+            );
+            assert_eq!(
+                login_arg0(&got.program, &got.args).as_deref(),
+                Some(arg0),
+                "argv[0] の欄を持たない計画からも同じ argv[0] を引ける"
+            );
+        }
+        // Flag の形と、似ていても違う並びには argv[0] を当てない
+        let flag = login_invocation("/bin/zsh", script);
+        assert_eq!(login_arg0(&flag.program, &flag.args), None);
+        let other: Vec<String> = vec!["-c".into(), "exec /bin/sh".into(), script.into()];
+        assert_eq!(login_arg0("/bin/tcsh", &other), None);
+    }
+
+    /// #2577: symlink の別名（名前が csh / tcsh でない）も、指す先が csh / tcsh なら argv[0] の形。
+    /// argv[0] は呼んだ名前（tcsh / csh は先頭の `-` だけを見る）。指す先が無い symlink は名前だけで決める
+    #[cfg(unix)]
+    #[test]
+    fn symlinkの別名もcsh系として起こす() {
+        let dir = crate::test_residue::ScratchDir::new("exe-2577-alias");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).expect("一時の dir");
+        crate::fake_exec::write_script(&real.join("tcsh"), "#!/bin/sh\nexit 0\n");
+        let alias = dir.path().join("mysh");
+        std::os::unix::fs::symlink(real.join("tcsh"), &alias).expect("symlink");
+        let alias = alias.display().to_string();
+        let got = login_invocation(&alias, "true");
+        assert_eq!(got.arg0.as_deref(), Some("-mysh"), "{got:?}");
+        assert_eq!(
+            got.args[..2],
+            ["-c".to_string(), CSH_LOGIN_SCRIPT.to_string()]
+        );
+        let dangling = dir.path().join("gone");
+        std::os::unix::fs::symlink(dir.path().join("nowhere/tcsh"), &dangling).expect("symlink");
+        assert_eq!(
+            login_form(&dangling.display().to_string()),
+            LoginForm::Flag,
+            "指す先が無い = 名前（gone）で決める"
+        );
+    }
+
+    /// #2577 の A/B: `TAKO_2577_LEGACY=1` で csh / tcsh にも `-l -c` を渡す（#2577 前の形）
+    #[test]
+    fn ab_2577でcsh系にもlとcを渡す形へ戻る() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if crate::run_alone!(ab_2577でcsh系にもlとcを渡す形へ戻る) {
+            return;
+        }
+        std::env::set_var(ISSUE2577_LEGACY_ENV, "1");
+        let got = login_invocation("/bin/tcsh", "true");
+        assert_eq!(got.arg0, None);
+        assert_eq!(got.args, ["-l", "-c", "true"]);
+        std::env::remove_var(ISSUE2577_LEGACY_ENV);
+        assert_eq!(login_form("/bin/tcsh"), LoginForm::Argv0);
+    }
 
     /// #2583: `$SHELL` が空・未設定のログインシェルは setup の PATH 通しの既定と同じ（macOS は zsh）。
     /// 設定されていればその値のまま。`TAKO_2583_LEGACY=1` で #2583 前の `/bin/sh` へ戻る

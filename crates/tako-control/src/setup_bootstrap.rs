@@ -1740,7 +1740,8 @@ fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, SetupRefu
 /// 断りは「このディレクトリをご自身の設定ファイルへ足してください」なので、利用者が足し終えた後も
 /// 断り続けると、案内どおりにしたのに `tako setup` が同じ案内を出し続ける（形を変えた堂々巡り）。
 /// 見え方の判定は既知のシェルと同じ「新しく開いたターミナルが見る PATH」（読めなければプロセスの
-/// PATH。tcsh は `-l -c` を受け付けないのでこちらになる）で、上限で打ち切ったときは確かめられない = 断る
+/// PATH。tcsh / csh も `.login` を読んだ PATH を答える = `-l -c` を使わない起こし方。#2577）で、
+/// 上限で打ち切ったときは確かめられない = 断る
 fn unknown_shell_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, SetupRefusal> {
     let read = tako_core::platform::exe::login_shell_path();
     let path_var = match (&read.value, &read.timeout) {

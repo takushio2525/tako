@@ -38,9 +38,15 @@ pub struct ChildCmd {
 impl ChildCmd {
     /// 実行用の [`std::process::Command`] を組む。
     ///
-    /// GUI から数秒おきに呼ばれる経路があるので、コンソールウィンドウは出さない（#586）
+    /// GUI から数秒おきに呼ばれる経路があるので、コンソールウィンドウは出さない（#586）。
+    /// csh / tcsh のログインシェルの形（[`crate::platform::exe::login_arg0`]）なら argv[0] を
+    /// `-<名>` にする（この構造体は argv[0] の欄を持たない = args の並びが印。#2577）
     pub fn command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
+        #[cfg(unix)]
+        if let Some(arg0) = crate::platform::exe::login_arg0(&self.program, &self.args) {
+            std::os::unix::process::CommandExt::arg0(&mut command, arg0);
+        }
         command.args(&self.args);
         super::process::no_console_window(&mut command);
         command
@@ -53,7 +59,7 @@ impl ChildCmd {
 ///
 /// | 引数 | 使う側 |
 /// |---|---|
-/// | `posix_snippet` | unix（`<$SHELL> -l -c <シェル片>`） |
+/// | `posix_snippet` | unix（`<$SHELL> -l -c <シェル片>`。csh / tcsh は argv[0] の形 = #2577） |
 /// | `program` / `args` | Windows（PATH で解決した実体を直接起動） |
 ///
 /// 2 通りに分かれるのは、POSIX 側だけが「rc に勝つための env 前置き」をシェル片へ
@@ -99,15 +105,19 @@ mod imp {
     }
 }
 
-/// ログインシェルへシェル片を渡す形（純粋関数）。
+/// ログインシェルへシェル片を渡す形（`shell` の種別だけを見る。起こし方の表は
+/// [`crate::platform::exe::login_invocation`] の 1 実装 = 探索と同じ。#2577）。
 ///
 /// `-l` はユーザーの profile を読ませるため（`.app` の痩せた PATH 対策）で、
-/// **この形が macOS の従来の挙動そのもの**。1 バイトも変えない
+/// **csh 系でないシェルではこの形が macOS の従来の挙動そのもの**。1 バイトも変えない。
+/// csh / tcsh は `-l -c` を受け付けないので、argv[0] を `-<名>` にする形（argv[0] は
+/// [`ChildCmd::command`] が args の並びから当てる）
 #[cfg_attr(not(unix), allow(dead_code))]
 fn login_shell_snippet(shell: &str, snippet: &str) -> ChildCmd {
+    let invocation = crate::platform::exe::login_invocation(shell, snippet);
     ChildCmd {
-        program: shell.to_string(),
-        args: vec!["-l".into(), "-c".into(), snippet.to_string()],
+        program: invocation.program,
+        args: invocation.args,
     }
 }
 
@@ -135,6 +145,60 @@ mod tests {
                 "-c".to_string(),
                 "unset CLAUDE_CONFIG_DIR; claude agents --json".to_string(),
             ]
+        );
+    }
+
+    /// #2577: csh / tcsh は `-l -c` を受け付けないので argv[0] の形（探索と同じ表 = `exe::login_invocation`）
+    #[test]
+    fn cshとtcshはargv0の形でシェル片を渡す() {
+        let snippet = "unset CLAUDE_CONFIG_DIR; claude agents --json";
+        for shell in ["/bin/tcsh", "/bin/csh"] {
+            let got = login_shell_snippet(shell, snippet);
+            assert_eq!(got.program, shell);
+            assert_eq!(
+                got.args,
+                vec![
+                    "-c".to_string(),
+                    crate::platform::exe::CSH_LOGIN_SCRIPT.to_string(),
+                    snippet.to_string(),
+                ]
+            );
+        }
+    }
+
+    /// #2577: 本物の tcsh で、計画（argv[0] の欄を持たない）から組んだ子がログインシェルとして `~/.login` を
+    /// 読み、POSIX の片を `/bin/sh` で走らせる（`unset` が env に効く・改行と引用符が崩れない）。
+    /// tcsh の無い環境では何もしない（macOS は同梱）
+    #[cfg(unix)]
+    #[test]
+    fn 本物のtcshでログインシェルとして片を走らせる() {
+        if !std::path::Path::new("/bin/tcsh").exists() {
+            eprintln!("/bin/tcsh が無いので飛ばす");
+            return;
+        }
+        let home = crate::test_residue::ScratchDir::new("child-cmd-2577");
+        std::fs::write(home.path().join(".login"), "setenv TAKO_2577_LOGIN read\n")
+            .expect(".login を書く");
+        let snippet = "unset TAKO_2577_X; printf '%s|%s|' \"${TAKO_2577_LOGIN-none}\" \"${TAKO_2577_X-unset}\"\nprintf \"%s\" 'a!b \"q\"'";
+        let plan = login_shell_snippet("/bin/tcsh", snippet);
+        let out = plan
+            .command()
+            .env("HOME", home.path())
+            .env("TAKO_2577_X", "leak")
+            .env_remove("TAKO_2577_LOGIN")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("tcsh を起こせる");
+        assert!(
+            out.status.success(),
+            "{:?} {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "read|unset|a!b \"q\"",
+            "ログインシェルの印（argv[0]）が当たっていないか、片が csh に解釈された"
         );
     }
 
