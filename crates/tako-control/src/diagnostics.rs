@@ -646,9 +646,12 @@ fn shortest_bootstrap_remaining(states: &BootstrapStates) -> Option<Remaining> {
         )
         .map(|kind| match kind {
             RemainingKind::AgentPathByHand(agent) => {
+                // 診断は check-health と `--check` が同じ文を出す正本（#1505）。2 つは表示言語の
+                // 決め方が違う（`tako setup` は settings.json・check-health は解決しない）ので、
+                // ほかの項目（`summary_in(Lang::Ja)`）と同じく言語を固定して組む
                 match crate::setup_bootstrap::path_by_hand_refusal() {
                     Some(refusal) => {
-                        Remaining::path_by_hand(agent, &refusal, tako_core::i18n::lang())
+                        Remaining::path_by_hand(agent, &refusal, tako_core::i18n::Lang::Ja)
                     }
                     None => Remaining::new(kind),
                 }

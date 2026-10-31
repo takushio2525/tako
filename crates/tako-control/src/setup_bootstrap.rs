@@ -1573,9 +1573,11 @@ pub fn tako_cli_path_check_line() -> String {
             Err(_) => None,
         }
         .unwrap_or_else(|| dir.to_string());
+        // この行は check-health と `--check` が同じ文を出す診断の正本（#1505）。2 つは表示言語の
+        // 決め方が違うので、1 行目（日本語）と同じく言語を固定して組む（表示言語で組むと食い違う）
         return format!(
             "  [不足] tako CLI の PATH: 外部ターミナルからは使えません（{reason}）\n{}",
-            PathByHandNote::CliCheckHint { dir: hint }.text_in(tako_core::i18n::lang())
+            PathByHandNote::CliCheckHint { dir: hint }.text_in(tako_core::i18n::Lang::Ja)
         );
     }
     format!(
