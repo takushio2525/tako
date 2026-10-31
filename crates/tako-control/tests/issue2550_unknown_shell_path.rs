@@ -13,7 +13,7 @@
 //!   undo-path は断り、どちらもホームのファイルを 1 つも書き換えない（tako CLI の symlink だけは
 //!   PATH より先に張る = #1502 の順のまま）。status の `shell` / `profile` は null
 //! - `SHELL` が空・未設定: 従来どおり `~/.zprofile`。zsh / bash / sh / fish（存在しないパスの zsh を含む）:
-//!   従来どおりのファイル
+//!   従来どおりのファイル（sh だけは #2592 で `~/.bash_profile` → `~/.profile`）
 //!
 //! **本物の環境を 1 つも書き換えない**: `HOME` / `TAKO_DATA_DIR` / `TAKO_ORCHESTRATOR_DIR` /
 //! `CLAUDE_CONFIG_DIR` / `TMPDIR` は一時の置き場の下、`PATH` は空の dir、`SHELL` は何も答えずに終わる
@@ -448,7 +448,8 @@ fn 種別の分からないシェルはzshと見なさずprofileへ書かずに�
             ".zprofile",
         ),
         ("bash", Some(fake("bash")), "bash", ".bash_profile"),
-        ("sh", Some(fake("sh")), "bash", ".bash_profile"),
+        // #2592: sh のログインが読むのは `.profile` だけ（#2592 前は bash と見なして `.bash_profile`）
+        ("sh", Some(fake("sh")), "sh", ".profile"),
         (
             "fish",
             Some(fake("fish")),

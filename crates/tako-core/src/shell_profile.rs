@@ -16,8 +16,14 @@
 //!   `.zshrc` にだけ書くと `zsh -l -c` からは見えない
 //!
 //! よって **ログインシェルの profile**（zsh = `.zprofile` / bash = `.bash_profile` /
-//! fish = `config.fish`）へ書く。これならユーザーの端末（macOS の Terminal・iTerm2 は
+//! sh = `.profile` / fish = `config.fish`）へ書く。これならユーザーの端末（macOS の Terminal・iTerm2 は
 //! 既定でログインシェル）と tako 自身の解決の**両方**に効く。
+//!
+//! sh を bash と分けるのは #2592 の実測（2026-11-01・一時 HOME の全 profile に印を置いて `-l -c` で起こす）:
+//! bash は argv[0] の名前が `sh` だと sh モードで起き、ログインで `.profile` **だけ**を読む
+//! （macOS の `/bin/sh` は bash 3.2 の sh モード。dash・sh の名前で起こした zsh も `.profile`。名前が
+//! `bash` なら `/bin/sh` を指す symlink でも `.bash_profile`）。tako の問い合わせも `$SHELL` のパスのまま
+//! 起こすので、判定は実行ファイルの名前で揃う
 //!
 //! ## 書き換えの規則
 //!
@@ -33,11 +39,23 @@ const BLOCK_END: &str = "# <<< tako PATH <<<";
 
 const MARKERS: BlockMarkers = BlockMarkers::new(BLOCK_BEGIN, BLOCK_END);
 
+/// #2592 の A/B の env（`1` で名前 `sh` のシェルを bash と見なし、`.bash_profile` へ書く = #2592 前の形。
+/// `sh -l` は `.profile` だけを読むので、書いた後も新しいターミナルの PATH に置き場所が見えない）
+pub const ISSUE2592_LEGACY_ENV: &str = "TAKO_2592_LEGACY";
+
+/// [`ISSUE2592_LEGACY_ENV`] が立っているか（#2592 の A/B のゲートはここ 1 か所）
+pub fn issue2592_legacy() -> bool {
+    std::env::var(ISSUE2592_LEGACY_ENV).is_ok_and(|v| v == "1")
+}
+
 /// profile の書式を決めるシェル種別
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
     Zsh,
     Bash,
+    /// 名前が `sh` のシェル（macOS は bash の sh モード・Linux は dash ほか）。行の形は bash と同じ
+    /// POSIX の `case` / `export` で、書き先だけが違う（#2592）
+    Sh,
     Fish,
     PowerShell,
 }
@@ -47,6 +65,7 @@ impl ShellKind {
         match self {
             Self::Zsh => "zsh",
             Self::Bash => "bash",
+            Self::Sh => "sh",
             Self::Fish => "fish",
             Self::PowerShell => "powershell",
         }
@@ -62,7 +81,9 @@ impl ShellKind {
             .trim_end_matches(".exe");
         match name {
             "zsh" => Some(Self::Zsh),
-            "bash" | "sh" => Some(Self::Bash),
+            "bash" => Some(Self::Bash),
+            "sh" if issue2592_legacy() => Some(Self::Bash),
+            "sh" => Some(Self::Sh),
             "fish" => Some(Self::Fish),
             "pwsh" | "powershell" => Some(Self::PowerShell),
             _ => None,
@@ -77,9 +98,22 @@ impl ShellKind {
         match self {
             Self::Zsh => ".zprofile",
             Self::Bash => ".bash_profile",
+            // sh のログインが読むのは `.profile` だけ（モジュール冒頭の #2592 の実測）
+            Self::Sh => ".profile",
             Self::Fish => ".config/fish/config.fish",
             // PowerShell の `$PROFILE.CurrentUserAllHosts`（#525 で実パスを解決する）
             Self::PowerShell => "Documents/PowerShell/profile.ps1",
+        }
+    }
+
+    /// 書き先を移す前にこの種別の利用者へ書いていた profile（`$HOME` 相対）。`undo-path` が併せて
+    /// tako のブロックを外す（移した後の書き先だけを外すと、移す前に置いたブロックが二度と消えない）。
+    ///
+    /// sh は #2592 より前 bash と見なして `.bash_profile` へ書いていた
+    pub fn previous_profile_rel(self) -> Option<&'static str> {
+        match self {
+            Self::Sh => Some(Self::Bash.login_profile_rel()),
+            Self::Zsh | Self::Bash | Self::Fish | Self::PowerShell => None,
         }
     }
 
@@ -94,7 +128,7 @@ impl ShellKind {
     fn stanza(self, dir_expr: &str) -> String {
         match self {
             // `case` は sh / bash / zsh 共通
-            Self::Zsh | Self::Bash => format!(
+            Self::Zsh | Self::Bash | Self::Sh => format!(
                 "case \":$PATH:\" in\n\
                  \x20 *\":{dir_expr}:\"*) ;;\n\
                  \x20 *) export PATH=\"{dir_expr}:$PATH\" ;;\n\
@@ -331,7 +365,23 @@ pub fn remove_from_profile_in_typed(
     home: &Path,
     shell: ShellKind,
 ) -> Result<EnsureOutcome, PathBlockError> {
-    let profile = home.join(shell.login_profile_rel());
+    remove_block_at(shell, home.join(shell.login_profile_rel()))
+}
+
+/// 書き先を移す前の profile（[`ShellKind::previous_profile_rel`]）に残ったブロックを取り除く（#2592）。
+/// 移していない種別は `None`（ファイルを読みもしない）
+pub fn remove_from_previous_profile_in_typed(
+    home: &Path,
+    shell: ShellKind,
+) -> Result<Option<EnsureOutcome>, PathBlockError> {
+    shell
+        .previous_profile_rel()
+        .map(|rel| remove_block_at(shell, home.join(rel)))
+        .transpose()
+}
+
+/// `profile` から tako のブロックを取り除く（元のバイト列へ完全に戻す。無ければ触らない）
+fn remove_block_at(shell: ShellKind, profile: PathBuf) -> Result<EnsureOutcome, PathBlockError> {
     let original = read_bytes(&profile)?;
     if !MARKERS.present(&original) {
         return Ok(EnsureOutcome {
@@ -481,6 +531,36 @@ mod tests {
         assert_ne!(ShellKind::Zsh.login_profile_rel(), ".zshrc");
         assert_eq!(ShellKind::Bash.login_profile_rel(), ".bash_profile");
         assert_ne!(ShellKind::Bash.login_profile_rel(), ".bashrc");
+    }
+
+    /// #2592: 名前 `sh` は bash と分ける。sh のログインが読むのは `.profile` だけ
+    /// （本物のシェルとの突き合わせは `tako-control/tests/issue2592_sh_profile_watchdog.rs`）
+    #[test]
+    fn shはログインで読まれるprofileを選び行の形はbashと同じ() {
+        for shell in ["/bin/sh", "/usr/bin/sh", "sh"] {
+            assert_eq!(
+                ShellKind::from_shell_path(shell),
+                Some(ShellKind::Sh),
+                "{shell}"
+            );
+        }
+        assert_eq!(ShellKind::Sh.as_str(), "sh");
+        assert_eq!(ShellKind::Sh.login_profile_rel(), ".profile");
+        assert_eq!(ShellKind::Sh.previous_profile_rel(), Some(".bash_profile"));
+        for kind in [
+            ShellKind::Zsh,
+            ShellKind::Bash,
+            ShellKind::Fish,
+            ShellKind::PowerShell,
+        ] {
+            assert_eq!(kind.previous_profile_rel(), None, "{kind:?}");
+        }
+        let exprs = ["$HOME/.local/bin".to_string()];
+        assert_eq!(
+            ShellKind::Sh.block(&exprs),
+            ShellKind::Bash.block(&exprs),
+            "sh の行は bash と同じ POSIX の case / export"
+        );
     }
 
     /// PATH の区切りは OS 依存（`:` / `;`）。**fixture も `std::env::join_paths` で

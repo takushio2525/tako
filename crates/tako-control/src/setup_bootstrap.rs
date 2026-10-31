@@ -1956,14 +1956,24 @@ pub fn undo_path_for_typed(agent: AgentKind) -> Result<Value, SetupRefusal> {
     let (shell, _) = shell_target();
     let shell = shell.ok_or(SetupRefusal::ShellProfileUnknownForUndo)?;
     let outcome = shell_profile::remove_from_profile_in_typed(&home, shell)?;
-    Ok(json!({
+    // #2592: 書き先を移した種別（sh = 移す前は `.bash_profile`）は、移す前に置いたブロックも外す
+    let previous = shell_profile::remove_from_previous_profile_in_typed(&home, shell)?;
+    let mut value = json!({
         "agent": agent.as_str(),
         "shell": shell.as_str(),
         "profile": outcome.profile.display().to_string(),
         "change": outcome.change.as_str(),
         "tako_cli_link_change": link_change.as_str(),
         "tako_cli_link": plan.as_ref().and_then(|p| p.link.as_ref()).map(|l| l.display().to_string()),
-    }))
+    });
+    // 移していない種別（zsh / bash / fish）の応答は #2592 前と同じ形のまま（欄を足さない）
+    if let Some(previous) = previous {
+        value["previous_profile"] = json!({
+            "profile": previous.profile.display().to_string(),
+            "change": previous.change.as_str(),
+        });
+    }
+    Ok(value)
 }
 
 /// Windows のユーザー PATH からランチャーの置き場所のエントリを取り除く。
@@ -2237,7 +2247,8 @@ mod tests {
             ("/bin/zsh", ShellKind::Zsh),
             ("/nonexistent/tako-2550/zsh", ShellKind::Zsh),
             ("/bin/bash", ShellKind::Bash),
-            ("/bin/sh", ShellKind::Bash),
+            // #2592: sh は bash と分ける（sh のログインは `.profile` だけを読む）
+            ("/bin/sh", ShellKind::Sh),
             ("/opt/homebrew/bin/fish", ShellKind::Fish),
             (
                 r"C:\Program Files\PowerShell\7\pwsh.exe",
