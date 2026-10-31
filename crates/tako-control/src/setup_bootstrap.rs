@@ -35,7 +35,7 @@
 //!   sudo 参照 49 箇所・`have_sudo_access`）。setup が黙って権限昇格を走らせない
 
 use crate::orchestrator::agent::WorkerAgent;
-use crate::setup_refusal::FetchDetail;
+use crate::setup_refusal::{FetchDetail, PathByHandNote};
 use crate::SetupRefusal;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -750,6 +750,40 @@ fn shell_kind_for(shell: &str, windows: bool) -> Option<ShellKind> {
     ShellKind::from_shell_path(shell)
 }
 
+/// PATH を tako が書けず、利用者が自分のシェルの設定ファイルで足すしかないか（**純粋関数**。#2564）。
+///
+/// 種別の分からないシェル（unix）だけが当たる。Windows はユーザー環境変数へ書くので当たらない
+/// （`shell` は Windows では常に `None`）。当たるときは `tako setup bootstrap path` も同じ断り
+/// （[`SetupRefusal::ShellProfileUnknown`]）で止まるので、`tako setup` の段・`--check` はそこへ誘導しない
+pub fn path_by_hand_for(shell: Option<ShellKind>, user_path_supported: bool) -> bool {
+    shell.is_none() && !user_path_supported
+}
+
+/// [`path_by_hand_for`] をこの導入状況で引く
+pub fn path_by_hand(state: &BootstrapState) -> bool {
+    path_by_hand_for(state.shell, user_path::is_supported())
+}
+
+/// 種別の分からないシェルなら、`tako setup bootstrap path` が返すのと同じ断り（足すディレクトリの一覧つき）。
+/// `tako setup --check` の残り作業がこれを理由の行に載せる（#2564）
+pub fn path_by_hand_refusal() -> Option<SetupRefusal> {
+    if !path_by_hand_for(shell_target().0, user_path::is_supported()) {
+        return None;
+    }
+    let home = home_dir().ok()?;
+    let dirs = desired_path_dirs(&home, tako_cli_placement(&home).as_ref());
+    Some(unknown_shell_refusal(&home, &dirs))
+}
+
+/// 種別の分からないシェルの断り。足すディレクトリは書く行と同じ `$HOME/…` の式で重複なし（#2557。
+/// `~` 短縮の表示は sh の `export` に包まれて二重引用符の中に入り、sh 系では展開されなかった）
+fn unknown_shell_refusal(home: &Path, dirs: &[PathBuf]) -> SetupRefusal {
+    SetupRefusal::ShellProfileUnknown {
+        shell: std::env::var("SHELL").unwrap_or_default(),
+        dirs: shell_profile::dirs_for_unknown_shell(home, dirs),
+    }
+}
+
 /// いまの導入状況を調べる（読み取りだけ。副作用なし）。認証の問い合わせは上限なしで待つ
 /// （setup の経路。環境診断は [`status_for_within`]）
 pub fn status_for(agent: AgentKind) -> Result<BootstrapState, String> {
@@ -1385,18 +1419,40 @@ fn dir_on_path(dir: &Path) -> (bool, Option<tako_core::probe::TimeoutNotice>) {
 /// `tako setup` の段としても、`tako setup bootstrap path` の一部としても、
 /// ここ 1 本を通る
 pub fn ensure_tako_cli_path() -> Result<Value, String> {
-    if legacy_no_tako_cli_path() {
-        return Err("TAKO_1502_LEGACY=1（#1502 前の挙動）".to_string());
+    ensure_tako_cli_path_inner().map_err(CliPathError::into_ja)
+}
+
+/// [`ensure_tako_cli_path`] の失敗。種別の分からないシェルの断りを段の文で見分けるために型で持つ（#2564）
+enum CliPathError {
+    /// 従来の日本語の文（#1502 の legacy・ホーム・実体の解決）
+    Text(String),
+    Refusal(SetupRefusal),
+}
+
+impl CliPathError {
+    fn into_ja(self) -> String {
+        match self {
+            Self::Text(text) => text,
+            Self::Refusal(refusal) => refusal.into_ja(),
+        }
     }
-    let home = home_dir()?;
+}
+
+fn ensure_tako_cli_path_inner() -> Result<Value, CliPathError> {
+    if legacy_no_tako_cli_path() {
+        return Err(CliPathError::Text(
+            "TAKO_1502_LEGACY=1（#1502 前の挙動）".to_string(),
+        ));
+    }
+    let home = home_dir().map_err(CliPathError::Text)?;
     let Some(plan) = tako_cli_placement(&home) else {
-        return Err(
+        return Err(CliPathError::Text(
             "tako CLI の実体を解決できません（実行中バイナリの隣に tako がありません）".to_string(),
-        );
+        ));
     };
-    let link_change = ensure_tako_cli_link(&plan).map_err(SetupRefusal::into_ja)?;
+    let link_change = ensure_tako_cli_link(&plan).map_err(CliPathError::Refusal)?;
     let path = ensure_dirs_on_path(&home, &desired_path_dirs(&home, Some(&plan)))
-        .map_err(SetupRefusal::into_ja)?;
+        .map_err(CliPathError::Refusal)?;
     Ok(json!({
         "link_change": link_change.as_str(),
         "path": path,
@@ -1413,7 +1469,7 @@ pub fn run_tako_cli_path_stage() -> String {
         return LEGACY_LINE.to_string();
     }
     let before = tako_cli_path_json();
-    match ensure_tako_cli_path() {
+    match ensure_tako_cli_path_inner() {
         Ok(value) => {
             let after = &value["tako_cli"];
             let dir = after["dir_display"].as_str().unwrap_or("?");
@@ -1432,10 +1488,16 @@ pub fn run_tako_cli_path_stage() -> String {
                     after["source_display"].as_str().unwrap_or("?")
                 ));
             }
-            line.push_str(&format!(
-                "\n         PATH: {} （元に戻すには tako setup bootstrap undo-path）",
-                dir
-            ));
+            // 種別の分からないシェル（#2564）は PATH を書いていない（利用者が足し終えていた）ので、
+            // 戻す PATH のブロックが無い = undo-path へ誘導しない（そのシェルでは undo-path も断る）
+            if value["path"]["shell"].is_null() {
+                line.push_str(&format!("\n         PATH: {dir}"));
+            } else {
+                line.push_str(&format!(
+                    "\n         PATH: {} （元に戻すには tako setup bootstrap undo-path）",
+                    dir
+                ));
+            }
             if !value["path"]["verified"].as_bool().unwrap_or(false) {
                 line.push_str(
                     "\n         いま開いているターミナルには反映されません（開き直すと有効）",
@@ -1443,11 +1505,17 @@ pub fn run_tako_cli_path_stage() -> String {
             }
             line
         }
+        // 種別の分からないシェル（#2564）: `tako setup bootstrap path` も同じ断りで止まるので誘導せず、
+        // 足すディレクトリの一覧で閉じる
+        Err(CliPathError::Refusal(refusal @ SetupRefusal::ShellProfileUnknown { .. })) => {
+            PathByHandNote::CliStage(refusal).text_in(tako_core::i18n::lang())
+        }
         // 止めない。理由と次の一手だけ出す
         Err(e) => format!(
-            "  [警告] tako CLI の PATH 設置を見送りました: {e}\n\
+            "  [警告] tako CLI の PATH 設置を見送りました: {}\n\
              \x20        tako の中では tako が打てます（#601）。\n\
-             \x20        外部ターミナルでも使うなら tako setup bootstrap path を実行してください"
+             \x20        外部ターミナルでも使うなら tako setup bootstrap path を実行してください",
+            e.into_ja()
         ),
     }
 }
@@ -1489,6 +1557,27 @@ pub fn tako_cli_path_check_line() -> String {
         _ if !state["dir_on_path"].as_bool().unwrap_or(false) => "設置先が PATH に入っていません",
         _ => "まだ設置していません",
     };
+    // 種別の分からないシェルで置き場所が PATH に無い（#2564）: `tako setup bootstrap path` は
+    // PATH の段で同じ断りに止まるので誘導せず、足すディレクトリを示す
+    // （PATH に在ってリンクだけ無い / 切れているなら bootstrap path は通る = 従来の案内のまま）
+    if !state["dir_on_path"].as_bool().unwrap_or(false)
+        && path_by_hand_for(shell_target().0, user_path::is_supported())
+    {
+        let hint = match home_dir() {
+            Ok(home) => shell_profile::dirs_for_unknown_shell(
+                &home,
+                &[PathBuf::from(state["dir"].as_str().unwrap_or_default())],
+            )
+            .into_iter()
+            .next(),
+            Err(_) => None,
+        }
+        .unwrap_or_else(|| dir.to_string());
+        return format!(
+            "  [不足] tako CLI の PATH: 外部ターミナルからは使えません（{reason}）\n{}",
+            PathByHandNote::CliCheckHint { dir: hint }.text_in(tako_core::i18n::lang())
+        );
+    }
     format!(
         "  [不足] tako CLI の PATH: 外部ターミナルからは使えません（{reason}）\n\
          \x20        tako setup bootstrap path で設置できます"
@@ -1502,12 +1591,7 @@ fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, SetupRefu
     }
     let (shell, _) = shell_target();
     let Some(shell) = shell else {
-        // 足すディレクトリは書く行と同じ `$HOME/…` の式で重複なし（#2557。`~` 短縮の表示は
-        // sh の `export` に包まれて二重引用符の中に入り、sh 系では展開されなかった）
-        return Err(SetupRefusal::ShellProfileUnknown {
-            shell: std::env::var("SHELL").unwrap_or_default(),
-            dirs: shell_profile::dirs_for_unknown_shell(home, dirs),
-        });
+        return unknown_shell_path(home, dirs);
     };
     // 「書かなくてよいか」は**新しく開いたターミナルが見る PATH**で判定する（#1502）。
     // プロセスの PATH は親から受け継いだだけで、ログインシェルが同じとは限らない
@@ -1539,6 +1623,47 @@ fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, SetupRefu
         "verified": verified,
         // #1532: ログインシェルの PATH の読み取りを上限で打ち切った（`verified` は確かめていない）
         "login_shell_timeout": read.timeout.as_ref().map(timeout_json),
+    }))
+}
+
+/// 種別の分からないシェルの PATH 通し（#2550 / #2557 / #2564）。設定ファイルは書かない。
+///
+/// 足すディレクトリが**もう PATH に見えている**なら断らずに `already_on_path` を返す（#2564）。
+/// 断りは「このディレクトリをご自身の設定ファイルへ足してください」なので、利用者が足し終えた後も
+/// 断り続けると、案内どおりにしたのに `tako setup` が同じ案内を出し続ける（形を変えた堂々巡り）。
+/// 見え方の判定は既知のシェルと同じ「新しく開いたターミナルが見る PATH」（読めなければプロセスの
+/// PATH。tcsh は `-l -c` を受け付けないのでこちらになる）で、上限で打ち切ったときは確かめられない = 断る
+fn unknown_shell_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, SetupRefusal> {
+    let read = tako_core::platform::exe::login_shell_path();
+    let path_var = match (&read.value, &read.timeout) {
+        (Some(path), _) => Some(path.clone()),
+        (None, Some(_)) => None,
+        (None, None) => Some(std::env::var("PATH").unwrap_or_default()),
+    };
+    let visible = !dirs.is_empty()
+        && path_var
+            .as_deref()
+            .is_some_and(|path| dirs.iter().all(|d| shell_profile::path_contains(path, d)));
+    if !visible {
+        return Err(unknown_shell_refusal(home, dirs));
+    }
+    let mut seen: Vec<&PathBuf> = Vec::new();
+    for dir in dirs {
+        if !seen.contains(&dir) {
+            seen.push(dir);
+        }
+    }
+    Ok(json!({
+        // 書き先は無い（種別の分からないシェルの設定ファイルは書かない）
+        "shell": Value::Null,
+        "profile": Value::Null,
+        "profile_display": Value::Null,
+        "dirs": seen.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+        "dirs_display": seen.iter().map(|d| display_path(d)).collect::<Vec<_>>(),
+        "change": PathChange::AlreadyOnPath.as_str(),
+        "wrote": false,
+        "verified": true,
+        "login_shell_timeout": Value::Null,
     }))
 }
 
@@ -1973,6 +2098,32 @@ mod tests {
             ),
         ] {
             assert_eq!(shell_kind_for(shell, false), Some(kind), "{shell}");
+        }
+    }
+
+    /// #2564: PATH を利用者が自分で足すしかないのは「unix の種別の分からないシェル」だけ。
+    /// 既知のシェルと Windows（ユーザー環境変数へ書く）は従来どおり `tako setup bootstrap path` で通る
+    #[test]
+    fn pathを自分で足すしかないのはunixの種別の分からないシェルだけ() {
+        for (shell, windows) in [("/bin/tcsh", false), ("/usr/local/bin/nu", false)] {
+            assert!(
+                path_by_hand_for(shell_kind_for(shell, windows), windows),
+                "{shell}"
+            );
+        }
+        for (shell, windows) in [
+            ("/bin/zsh", false),
+            ("/bin/bash", false),
+            ("/opt/homebrew/bin/fish", false),
+            ("", false),
+            // Windows は `$SHELL` が無く種別は None だが、ユーザー環境変数へ書くので当たらない
+            ("", true),
+            ("/bin/tcsh", true),
+        ] {
+            assert!(
+                !path_by_hand_for(shell_kind_for(shell, windows), windows),
+                "{shell} / windows={windows}"
+            );
         }
     }
 

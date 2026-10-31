@@ -1076,12 +1076,21 @@ fn run_bootstrap_for(
     if state.step == Step::Path {
         eprintln!();
         eprintln!("  [2/3] {}", Step::Path.describe_for(target));
-        let result = match setup_bootstrap::ensure_path_for(target) {
+        let result = match setup_bootstrap::ensure_path_for_typed(target) {
             Ok(result) => result,
+            // 種別の分からないシェル（#2564）: `tako setup bootstrap path` も同じ断りで止まるので、
+            // 残りの 1 件は次の 1 行を持たず、足すディレクトリの一覧（断りの全文）を理由に載せる
+            Err(refusal @ tako_control::SetupRefusal::ShellProfileUnknown { .. }) => {
+                let item = Remaining::path_by_hand(target, &refusal, tako_core::i18n::lang());
+                for line in &item.detail {
+                    eprintln!("  {line}");
+                }
+                return vec![item];
+            }
             Err(e) => {
                 return stuck(
                     RemainingKind::AgentPath(target),
-                    format!("[2/3] PATH の設定に失敗しました。\n{e}"),
+                    format!("[2/3] PATH の設定に失敗しました。\n{}", e.into_ja()),
                 )
             }
         };

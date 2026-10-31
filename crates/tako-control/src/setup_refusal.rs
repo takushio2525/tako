@@ -581,6 +581,63 @@ impl SetupRefusal {
     }
 }
 
+/// 種別の分からないシェルの利用者へ、PATH を自分のシェルの設定ファイルへ足してもらう案内（#2564）。
+///
+/// tako はそのシェルの設定ファイルを書けないので、`tako setup bootstrap path` も同じ断り
+/// （[`SetupRefusal::ShellProfileUnknown`]）で止まる。`tako setup` の段・`--check` がそこへ誘導すると
+/// 堂々巡りになるので、**コマンドを示さず**、足すディレクトリで閉じる
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathByHandNote {
+    /// `tako setup` の tako CLI の PATH の段。中身は `bootstrap path` と同じ断り（足すディレクトリの一覧つき）
+    CliStage(SetupRefusal),
+    /// `tako setup --check` の tako CLI の PATH の行の 2 行目（`dir` は足すディレクトリの `$HOME/…` の式）
+    CliCheckHint { dir: String },
+}
+
+impl PathByHandNote {
+    /// 表示言語を明示しての文（**言語グローバルに触らない**。`SetupRefusal::text_in` と同じ規約）
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        let home_note = |dir: &str, ja: bool| match (mentions_home(&[dir.to_string()]), ja) {
+            (false, _) => "",
+            (true, true) => "（$HOME はホームディレクトリ）",
+            (true, false) => " ($HOME is your home directory)",
+        };
+        match (self, lang) {
+            (Self::CliStage(refusal), Ja) => format!(
+                "  [警告] tako CLI の PATH 設置を見送りました: {}\n\
+                 \x20        tako の中では tako が打てます（#601）。\n\
+                 \x20        外部ターミナルでも使うなら、上のディレクトリをご自身のシェルの設定ファイルへ\
+                 足せば完了です",
+                refusal.text_in(Ja)
+            ),
+            (Self::CliStage(refusal), En) => format!(
+                "  [warning] the tako CLI was not put on PATH: {}\n\
+                 \x20        Inside tako, the tako command already works (#601).\n\
+                 \x20        To use it from other terminals too, add the {} above to your \
+                 shell's settings file; that completes it",
+                refusal.text_in(En),
+                match refusal {
+                    SetupRefusal::ShellProfileUnknown { dirs, .. } if dirs.len() == 1 => {
+                        "directory"
+                    }
+                    _ => "directories",
+                }
+            ),
+            (Self::CliCheckHint { dir }, Ja) => format!(
+                "\x20        使っているシェルの設定ファイルは tako が書けないので、{dir} を\
+                 そのシェルの書き方で PATH へ足してください{}",
+                home_note(dir, true)
+            ),
+            (Self::CliCheckHint { dir }, En) => format!(
+                "\x20        tako cannot write your shell's settings file; add {dir} to PATH there \
+                 in that shell's own syntax{}",
+                home_note(dir, false)
+            ),
+        }
+    }
+}
+
 /// 種別の分からないシェルの利用者へ示す、PATH へ足すディレクトリ（1 行 1 個・字下げ 2）。
 ///
 /// **そのシェルの構文で包まない**（#2557）: 以前は sh の `export PATH="<dir>:$PATH"` を出していたが、
@@ -637,5 +694,68 @@ impl From<LinkError> for SetupRefusal {
 impl From<UserPathError> for SetupRefusal {
     fn from(e: UserPathError) -> Self {
         Self::UserPath(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #2564: 種別の分からないシェルへの案内は `tako setup bootstrap path` へ誘導しない
+    /// （同じ断りで止まる = 堂々巡り）。日英とも足すディレクトリで閉じ、英語表示に日本語が混ざらない
+    #[test]
+    fn pathを自分で足す案内は同じ断りで止まるコマンドへ誘導しない() {
+        let one = SetupRefusal::ShellProfileUnknown {
+            shell: "/bin/tcsh".into(),
+            dirs: vec!["$HOME/.local/bin".into()],
+        };
+        let two = SetupRefusal::ShellProfileUnknown {
+            shell: "/usr/local/bin/nu".into(),
+            dirs: vec!["$HOME/.local/bin".into(), "/opt/tako/bin".into()],
+        };
+        let notes = [
+            PathByHandNote::CliStage(one.clone()),
+            PathByHandNote::CliStage(two.clone()),
+            PathByHandNote::CliCheckHint {
+                dir: "$HOME/.local/bin".into(),
+            },
+            PathByHandNote::CliCheckHint {
+                dir: "/opt/tako/bin".into(),
+            },
+        ];
+        for note in &notes {
+            for lang in [Lang::Ja, Lang::En] {
+                let text = note.text_in(lang);
+                assert!(!text.contains("bootstrap"), "{note:?} / {lang:?}: {text}");
+                assert!(text.contains("PATH"), "{note:?} / {lang:?}: {text}");
+                if lang == Lang::En {
+                    assert!(
+                        !text.chars().any(|c| matches!(
+                            c as u32,
+                            0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF
+                        )),
+                        "{note:?}: 英語表示に日本語: {text}"
+                    );
+                }
+            }
+        }
+        // 段の文は断りの全文（足すディレクトリの一覧）を含む
+        for (refusal, lang) in [(&one, Lang::Ja), (&two, Lang::En)] {
+            let text = PathByHandNote::CliStage(refusal.clone()).text_in(lang);
+            assert!(text.contains(&refusal.text_in(lang)), "{text}");
+        }
+        // 英語の単複は断りの中の個数に合わせる
+        assert!(PathByHandNote::CliStage(one)
+            .text_in(Lang::En)
+            .contains("add the directory above"));
+        assert!(PathByHandNote::CliStage(two)
+            .text_in(Lang::En)
+            .contains("add the directories above"));
+        // `$HOME` の注記は home 配下のときだけ
+        let hint = |dir: &str, lang| PathByHandNote::CliCheckHint { dir: dir.into() }.text_in(lang);
+        assert!(hint("$HOME/.local/bin", Lang::Ja).ends_with("（$HOME はホームディレクトリ）"));
+        assert!(hint("$HOME/.local/bin", Lang::En).ends_with(" ($HOME is your home directory)"));
+        assert!(!hint("/opt/tako/bin", Lang::Ja).contains("ホームディレクトリ"));
+        assert!(!hint("/opt/tako/bin", Lang::En).contains("home directory"));
     }
 }

@@ -265,3 +265,89 @@ fn 実経路テストが登録されている() {
         ".github/workflows/ci.yml に test-setup-continue-1501.sh の登録が無い（#1501）"
     );
 }
+
+/// 7: 種別の分からないシェル（tcsh・nu 等）で、`tako setup` / `--check` が
+/// `tako setup bootstrap path` へ誘導する形へ戻らない（#2564）。
+///
+/// そのコマンドも同じ断り（`SetupRefusal::ShellProfileUnknown`）で止まるので、誘導すると堂々巡りになる。
+/// 判断（写し・文面）は `setup_remaining` / `setup_refusal` の単体テストが見る。ここは**配線**だけ:
+/// 段が断りを型のまま受けて足すディレクトリの一覧で閉じる口（`Remaining::path_by_hand` /
+/// `PathByHandNote`）を通っていること。外れた場所を file:line で名指す
+#[test]
+fn 未知のシェルのpathは同じ断りで止まるコマンドへ誘導しない() {
+    const BOOTSTRAP: &str = "crates/tako-control/src/setup_bootstrap.rs";
+    let mut failures = Vec::new();
+    // (ファイル, 関数, 在るべき口, 在ってはいけない口 = 型を落とす日本語の口・誘導の写し)
+    let wiring: [(&str, &str, &[&str], &[&str]); 4] = [
+        (
+            SETUP,
+            "run_bootstrap_for",
+            &[
+                "ensure_path_for_typed(",
+                "ShellProfileUnknown",
+                "Remaining::path_by_hand(",
+            ],
+            &["setup_bootstrap::ensure_path_for("],
+        ),
+        (
+            DIAGNOSTICS,
+            "shortest_bootstrap_remaining",
+            &[
+                "RemainingKind::for_step_by_hand(",
+                "path_by_hand_refusal(",
+                "Remaining::path_by_hand(",
+            ],
+            &["RemainingKind::for_step("],
+        ),
+        (
+            BOOTSTRAP,
+            "run_tako_cli_path_stage",
+            &["ShellProfileUnknown", "PathByHandNote::CliStage("],
+            &[],
+        ),
+        (
+            BOOTSTRAP,
+            "tako_cli_path_check_line",
+            &["path_by_hand_for(", "PathByHandNote::CliCheckHint"],
+            &[],
+        ),
+    ];
+    for (rel, name, want, forbid) in wiring {
+        let text = production(rel);
+        let head = text
+            .lines()
+            .enumerate()
+            .find(|(_, line)| is_top_level_fn_head(line) && fn_head_name(line) == Some(name))
+            .map(|(index, _)| index + 1);
+        let Some(head) = head else {
+            failures.push(format!(
+                "{rel}: `fn {name}` が無い（改名したなら番犬も追うこと）"
+            ));
+            continue;
+        };
+        let body = fn_body(&text, name);
+        for needle in want {
+            if !body
+                .iter()
+                .any(|(_, line)| is_code(line) && line.contains(needle))
+            {
+                failures.push(format!(
+                    "{rel}:{head}: `fn {name}` が `{needle}` を通っていない = 種別の分からないシェルで \
+                     `tako setup bootstrap path` へ誘導する形へ戻った（#2564。そのコマンドも同じ断りで止まる）"
+                ));
+            }
+        }
+        for needle in forbid {
+            for (line_no, line) in &body {
+                if is_code(line) && line.contains(needle) {
+                    failures.push(format!(
+                        "{rel}:{line_no}: `fn {name}` が `{needle}` を呼んでいる（#2564。断りの型が落ちて、\
+                         種別の分からないシェルを見分けられない）: {}",
+                        line.trim()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}

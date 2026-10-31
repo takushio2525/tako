@@ -361,6 +361,55 @@ else
   ok "profile を書かない"
 fi
 contains "残りはログインのまま"          "残り 1 件（ここから先は人の操作が必要です）:" "$SANDBOX/13.log"
+# `tako setup bootstrap path` も同じ断りで止まるので、そこへ誘導しない（#2564。修正前は
+# 「外部ターミナルでも使うなら tako setup bootstrap path を実行してください」= 堂々巡り）
+absent   "同じ断りで止まるコマンドへ誘導しない" "tako setup bootstrap path" "$SANDBOX/13.log"
+contains "足すディレクトリで閉じる"      "上のディレクトリをご自身のシェルの設定ファイルへ足せば完了です" "$SANDBOX/13.log"
+
+# claude の公式インストーラの置き場（PATH の外）へ claude を移す = bootstrap の段が PATH を通そうとする形
+move_claude_off_path(){ mkdir -p "$HOMEDIR/.local/bin" && mv -f "$BIN/claude" "$HOMEDIR/.local/bin/claude"; }
+
+echo "== 14) 種別の分からないシェル + claude が PATH の外（#2564）: 残りも --check も bootstrap path へ誘導しない =="
+mkenv unauth
+move_claude_off_path
+RC=$(LOGIN_SHELL="$BIN/isosh" run_pipe "$SANDBOX/14.log" -- setup)
+check    "終了コード 0"                  "$RC" "0"
+absent   "同じ断りで止まるコマンドへ誘導しない" "tako setup bootstrap path" "$SANDBOX/14.log"
+contains "残りに PATH の 1 件がある"     "claude コマンドをどのターミナルからも使えるようにする" "$SANDBOX/14.log"
+# 残りの理由の行（字下げ 5 + 断りの字下げ 2）に足すディレクトリ。要点 1 行へ縮めると落ちていた
+# shellcheck disable=SC2016
+check    "残りの理由に足すディレクトリ"  "$(grep -cxF '       $HOME/.local/bin' "$SANDBOX/14.log")" "1"
+contains "残りはここから再開と言う"      "済んだら tako setup をもう一度実行してください" "$SANDBOX/14.log"
+RC=$(LOGIN_SHELL="$BIN/isosh" run_pipe "$SANDBOX/14c.log" -- setup --check)
+check    "--check も終了コード 0"        "$RC" "0"
+absent   "--check も誘導しない"          "tako setup bootstrap path" "$SANDBOX/14c.log"
+# shellcheck disable=SC2016
+contains "--check は足すディレクトリを示す" '$HOME/.local/bin をそのシェルの書き方で PATH へ足してください' "$SANDBOX/14c.log"
+# shellcheck disable=SC2016
+check    "--check の残りにも足すディレクトリ" "$(grep -cxF '       $HOME/.local/bin' "$SANDBOX/14c.log")" "1"
+
+echo "== 15) 種別の分からないシェルで案内どおり足し終えた（#2564）: setup は見送りと言わず、2 回目は使えると言う =="
+mkenv unauth
+move_claude_off_path
+# 利用者が自分の設定ファイルへ足し終えた形（ログインシェルが $HOME/.local/bin を PATH の先頭へ足す）。
+# 名前は種別の分からないシェルのまま
+printf '#!/bin/sh\nif [ "$1" = "-l" ]; then shift; PATH="$HOME/.local/bin:$PATH"; export PATH; fi\nexec /bin/sh "$@"\n' > "$BIN/isosh-added"
+chmod +x "$BIN/isosh-added"
+RC=$(LOGIN_SHELL="$BIN/isosh-added" run_pipe "$SANDBOX/15a.log" -- setup)
+check    "終了コード 0"                  "$RC" "0"
+RC=$(LOGIN_SHELL="$BIN/isosh-added" run_pipe "$SANDBOX/15b.log" -- setup)
+check    "2 回目も終了コード 0"          "$RC" "0"
+absent   "見送りと言わない"              "PATH 設置を見送りました" "$SANDBOX/15a.log"
+absent   "2 回目も見送りと言わない"      "PATH 設置を見送りました" "$SANDBOX/15b.log"
+contains "2 回目は使えると言う"          "[OK] tako CLI: どのターミナルからも使えます" "$SANDBOX/15b.log"
+# tako はそのシェルの設定ファイルへ書いていない = 戻す PATH のブロックが無い（undo-path も断る）
+absent   "書いていない PATH を戻す案内をしない" "bootstrap undo-path" "$SANDBOX/15a.log"
+absent   "PATH の残りが無い"             "claude コマンドをどのターミナルからも使えるようにする" "$SANDBOX/15b.log"
+if [ -e "$HOMEDIR/.zprofile" ] || [ -e "$HOMEDIR/.bash_profile" ]; then
+  ng "そのシェルが読まない profile を書いた"
+else
+  ok "profile を書かない"
+fi
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"
