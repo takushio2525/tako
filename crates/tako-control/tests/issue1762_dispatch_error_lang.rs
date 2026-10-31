@@ -13425,6 +13425,7 @@ fn type_refusal_index(r: &TypeRefusal) -> usize {
 fn option_refusal_index(r: &OptionRefusal) -> usize {
     match r {
         OptionRefusal::KeyShape(_) => 0,
+        OptionRefusal::NotAssignment(_) => 1,
     }
 }
 
@@ -13797,14 +13798,21 @@ fn 打鍵と初期化オプションとレジストリとconfig_yamlとエージ
         );
     }
 
-    let options = [(
-        OptionRefusal::KeyShape("bad key".into()),
-        "キーの形が不正: \"bad key\"（ドット区切りの経路。例: cargo.targetDir）".to_string(),
-    )];
+    let options = [
+        (
+            OptionRefusal::KeyShape("bad key".into()),
+            "キーの形が不正: \"bad key\"（ドット区切りの経路。例: cargo.targetDir）".to_string(),
+        ),
+        // CLI の `--set` の読み取り（`parse_assignment`。#2365 の続きで型へ）
+        (
+            OptionRefusal::NotAssignment("cargo.targetDir".into()),
+            "--set は KEY=VALUE の形: \"cargo.targetDir\"（例: cargo.targetDir=false）".to_string(),
+        ),
+    ];
     covers_every(
         &options.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
         option_refusal_index,
-        1,
+        2,
         "OptionRefusal",
     );
     for (r, old) in &options {
@@ -13826,9 +13834,6 @@ fn 打鍵と初期化オプションとレジストリとconfig_yamlとエージ
             &r.text_in(Lang::Ja),
             &r.text_in(Lang::En),
         );
-        if r.clone().into_ja() != r.text_in(Lang::Ja) {
-            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
-        }
     }
 
     let yaml = YamlReason::Located {
@@ -14069,6 +14074,12 @@ const TMUX_GIT_SCOPES: &[(&str, &str, &str, &[&str])] = &[
         &["into_ja", "Lang::Ja"],
     ),
     (
+        INIT_OPTIONS_PATH,
+        INIT_OPTIONS_SRC,
+        "pub fn parse_assignment(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
         REGISTRY_PATH,
         REGISTRY_SRC,
         "    pub fn load_from_typed(",
@@ -14284,5 +14295,680 @@ fn next() {
         calls,
         vec![(5, "run_tmux(")],
         "日本語の口だけを名指し、捨てる文と型の口（*_typed）は見逃す"
+    );
+}
+
+// ---- #2365 の続き: AI 系設定の共有（`tako config` / MCP `tako_config_share`）と CLI の手元の処理
+// （`tako orchestrator watch --worker`・`tako lsp options --set` の読み取り・`tako remote agents`）----
+//
+// 修正前は dispatch の `dispatch_config_share` が `config_share`（`mod.rs` / `portable.rs` / `guard.rs`）の
+// `Err(String)`（日本語の固定文）を素通しし、CLI の手元の 3 か所は日本語の口（`WorkerRegistry::load` /
+// `resolve`・`parse_assignment`・`list_agents_with_panes`）と枠の固定文で断っていた。ここでは
+// `ShareRefusal` / `GitError` の表（全バリアントが日英・日本語は #2365 より前の固定文とバイト一致）と、
+// 型の口の本体・dispatch・CLI の口に日本語の固定文と日本語の口の呼び出しが無いことを `file:line` で名指す
+
+use tako_control::config_share::guard::Finding;
+use tako_control::config_share::{GitError as ShareGitError, ShareRefusal};
+
+const CONFIG_SHARE_SRC: &str = include_str!("../src/config_share/mod.rs");
+const CONFIG_SHARE_PATH: &str = "crates/tako-control/src/config_share/mod.rs";
+const PORTABLE_SRC: &str = include_str!("../src/config_share/portable.rs");
+const PORTABLE_PATH: &str = "crates/tako-control/src/config_share/portable.rs";
+const SHARE_REFUSAL_SRC: &str = include_str!("../src/config_share/refusal.rs");
+const SHARE_REFUSAL_PATH: &str = "crates/tako-control/src/config_share/refusal.rs";
+
+fn share_git_index(e: &ShareGitError) -> usize {
+    match e {
+        ShareGitError::Spawn { .. } => 0,
+        ShareGitError::Failed { .. } => 1,
+    }
+}
+
+fn share_refusal_index(r: &ShareRefusal) -> usize {
+    match r {
+        ShareRefusal::DataDirUnresolved => 0,
+        ShareRefusal::HomeUnresolved => 1,
+        ShareRefusal::CwdUnresolved(_) => 2,
+        ShareRefusal::StateRead { .. } => 3,
+        ShareRefusal::StateParse { .. } => 4,
+        ShareRefusal::StateSerialize(_) => 5,
+        ShareRefusal::StateRemove(_) => 6,
+        ShareRefusal::Write(_) => 7,
+        ShareRefusal::NotLinked => 8,
+        ShareRefusal::LinkedNotGit(_) => 9,
+        ShareRefusal::Git(_) => 10,
+        ShareRefusal::CommitNoIdent(_) => 11,
+        ShareRefusal::PullDiverged { .. } => 12,
+        ShareRefusal::ReadFailed { .. } => 13,
+        ShareRefusal::YamlParse(_) => 14,
+        ShareRefusal::YamlEmit(_) => 15,
+        ShareRefusal::JsonParse(_) => 16,
+        ShareRefusal::JsonEmit(_) => 17,
+        ShareRefusal::SecretsFound(_) => 18,
+        ShareRefusal::InitNotEmpty(_) => 19,
+        ShareRefusal::CreateDir(_) => 20,
+        ShareRefusal::LinkTargetEmpty => 21,
+        ShareRefusal::CloneDestNotEmpty(_) => 22,
+        ShareRefusal::CloneParentUnresolved => 23,
+        ShareRefusal::DirNotFound(_) => 24,
+        ShareRefusal::LinkNotGit(_) => 25,
+        ShareRefusal::CreateDirAt { .. } => 26,
+        ShareRefusal::WriteFailed { .. } => 27,
+        ShareRefusal::RemoveFailed { .. } => 28,
+        ShareRefusal::ManifestSerialize(_) => 29,
+        ShareRefusal::ManifestWrite(_) => 30,
+        ShareRefusal::ReadmeWrite(_) => 31,
+        ShareRefusal::GitignoreWrite(_) => 32,
+    }
+}
+const SHARE_REFUSAL_VARIANTS: usize = 33;
+
+const SHARE_EACCES: &str = "Permission denied (os error 13)";
+const SHARE_REPO: &str = "/tmp/t2365/tako-config-sync";
+const SHARE_STATE: &str = "/tmp/t2365/data/config-share.json";
+
+fn share_git_failed() -> ShareGitError {
+    ShareGitError::Failed {
+        args: "pull --ff-only".into(),
+        stderr: "fatal: '/tmp/t2365/nope.git' does not appear to be a git repository".into(),
+    }
+}
+
+fn share_git_commit() -> ShareGitError {
+    ShareGitError::Failed {
+        args: "commit -m x".into(),
+        stderr: "Author identity unknown\n\n*** Please tell me who you are.".into(),
+    }
+}
+
+/// `config_share::GitError` の見本と #2365 より前の文（`config_share::git` の固定文を見本の値で展開したもの）
+fn share_git_table() -> Vec<(ShareGitError, String)> {
+    vec![
+        (
+            ShareGitError::Spawn {
+                args: "init".into(),
+                error: "No such file or directory (os error 2)".into(),
+            },
+            "git の実行に失敗 (init): No such file or directory (os error 2)".to_string(),
+        ),
+        (
+            share_git_failed(),
+            "git pull --ff-only が失敗しました:\n\
+             fatal: '/tmp/t2365/nope.git' does not appear to be a git repository"
+                .to_string(),
+        ),
+    ]
+}
+
+/// `ShareRefusal` の見本と #2365 より前の文（`config_share` / `portable` / `guard` の固定文を見本の値で
+/// 展開したもの。値は ASCII = 英語側の検査で値の日本語を拾わない）
+fn share_refusal_table() -> Vec<(ShareRefusal, String)> {
+    vec![
+        (
+            ShareRefusal::DataDirUnresolved,
+            "データディレクトリを解決できません".into(),
+        ),
+        (
+            ShareRefusal::HomeUnresolved,
+            "ホームディレクトリを解決できません（$HOME 未設定）".into(),
+        ),
+        (
+            ShareRefusal::CwdUnresolved("No such file or directory (os error 2)".into()),
+            "カレントディレクトリを解決できません: No such file or directory (os error 2)".into(),
+        ),
+        (
+            ShareRefusal::StateRead {
+                path: SHARE_STATE.into(),
+                error: SHARE_EACCES.into(),
+            },
+            format!("配線状態の読み取りに失敗 ({SHARE_STATE}): {SHARE_EACCES}"),
+        ),
+        (
+            ShareRefusal::StateParse {
+                path: SHARE_STATE.into(),
+                reason: JsonReason::Located {
+                    kind: JsonProblem::Syntax,
+                    line: 1,
+                    column: 2,
+                },
+            },
+            format!("配線状態のパースに失敗 ({SHARE_STATE}): JSON の構文が壊れている（1 行 2 列）"),
+        ),
+        (
+            ShareRefusal::StateSerialize("key must be a string".into()),
+            "配線状態のシリアライズに失敗: key must be a string".into(),
+        ),
+        (
+            ShareRefusal::StateRemove(SHARE_EACCES.into()),
+            format!("配線状態の削除に失敗: {SHARE_EACCES}"),
+        ),
+        (
+            ShareRefusal::Write(WriteError::TmpWrite {
+                path: "/tmp/t2365/data/config-share.json.tmp.1.0".into(),
+                error: SHARE_EACCES.into(),
+            }),
+            format!(
+                "一時ファイルの書き込みに失敗 (/tmp/t2365/data/config-share.json.tmp.1.0): {SHARE_EACCES}"
+            ),
+        ),
+        (
+            ShareRefusal::NotLinked,
+            "設定共有が未配線です。`tako config init` で新規リポジトリを作るか、\n\
+             `tako config link <パス|URL>` で既存リポジトリに繋いでください"
+                .into(),
+        ),
+        (
+            ShareRefusal::LinkedNotGit(SHARE_REPO.into()),
+            format!(
+                "配線先が git リポジトリではありません: {SHARE_REPO}\n\
+                 `tako config link <パス|URL>` で繋ぎ直してください"
+            ),
+        ),
+        (
+            ShareRefusal::Git(share_git_failed()),
+            "git pull --ff-only が失敗しました:\n\
+             fatal: '/tmp/t2365/nope.git' does not appear to be a git repository"
+                .into(),
+        ),
+        (
+            ShareRefusal::CommitNoIdent(share_git_commit()),
+            "git commit -m x が失敗しました:\nAuthor identity unknown\n\n*** Please tell me who you are.\
+             \n\nこのデバイスに git の名前が未設定です。次を実行してから再試行してください:\n  \
+             git config --global user.name \"あなたの名前\"\n  \
+             git config --global user.email \"you@example.com\""
+                .into(),
+        ),
+        (
+            ShareRefusal::PullDiverged {
+                git: share_git_failed(),
+                repo: SHARE_REPO.into(),
+            },
+            format!(
+                "git pull --ff-only が失敗しました:\n\
+                 fatal: '/tmp/t2365/nope.git' does not appear to be a git repository\n\n\
+                 両方のデバイスで同じ設定を変更した可能性があります。次のどちらかで解決してください:\n\
+                 1. 共有リポジトリで解決する:\n   \
+                    cd {SHARE_REPO} && git pull --rebase   # 競合したら中身を直して git rebase --continue\n\
+                 2. このデバイスの内容を正とする:\n   \
+                    cd {SHARE_REPO} && git rebase --abort（実行中なら）→ tako config push\n\
+                 解決後にもう一度 `tako config pull` を実行してください"
+            ),
+        ),
+        (
+            ShareRefusal::ReadFailed {
+                path: "tako/orchestrator/accounts.yaml".into(),
+                error: SHARE_EACCES.into(),
+            },
+            format!("読み取りに失敗 (tako/orchestrator/accounts.yaml): {SHARE_EACCES}"),
+        ),
+        (
+            ShareRefusal::YamlParse(YamlReason::Located {
+                kind: YamlProblem::Syntax,
+                at: Some((2, 1)),
+            }),
+            "YAML のパースに失敗: YAML の構文が壊れている（2 行 1 列）".into(),
+        ),
+        (
+            ShareRefusal::YamlEmit("infinite recursion".into()),
+            "YAML の出力に失敗: infinite recursion".into(),
+        ),
+        (
+            ShareRefusal::JsonParse(JsonReason::Located {
+                kind: JsonProblem::Eof,
+                line: 3,
+                column: 1,
+            }),
+            "JSON のパースに失敗: JSON が途中で切れている（3 行 1 列）".into(),
+        ),
+        (
+            ShareRefusal::JsonEmit("key must be a string".into()),
+            "JSON の出力に失敗: key must be a string".into(),
+        ),
+        (
+            ShareRefusal::SecretsFound(vec![
+                Finding {
+                    path: "claude/CLAUDE.md".into(),
+                    line: 3,
+                    kind: "secret-looking assignment",
+                },
+                Finding {
+                    path: "tako/settings.json".into(),
+                    line: 7,
+                    kind: "GitHub personal access token",
+                },
+            ]),
+            "秘匿情報らしき内容が共有対象に含まれています。取り除いてから再実行してください:\n  \
+             - claude/CLAUDE.md:3 (secret-looking assignment)\n  \
+             - tako/settings.json:7 (GitHub personal access token)"
+                .into(),
+        ),
+        (
+            ShareRefusal::InitNotEmpty(SHARE_REPO.into()),
+            format!(
+                "{SHARE_REPO} は空でないディレクトリで、git リポジトリでもありません。\n\
+                 別の場所を --path で指定するか、そこで git init してから `tako config link` してください"
+            ),
+        ),
+        (
+            ShareRefusal::CreateDir("Not a directory (os error 20)".into()),
+            "ディレクトリの作成に失敗: Not a directory (os error 20)".into(),
+        ),
+        (
+            ShareRefusal::LinkTargetEmpty,
+            "リポジトリのパスまたは URL を指定してください".into(),
+        ),
+        (
+            ShareRefusal::CloneDestNotEmpty(SHARE_REPO.into()),
+            format!("clone 先 {SHARE_REPO} が空ではありません。--path で別の場所を指定してください"),
+        ),
+        (
+            ShareRefusal::CloneParentUnresolved,
+            "clone 先の親ディレクトリを解決できません".into(),
+        ),
+        (
+            ShareRefusal::DirNotFound(SHARE_REPO.into()),
+            format!("ディレクトリが見つかりません: {SHARE_REPO}"),
+        ),
+        (
+            ShareRefusal::LinkNotGit(SHARE_REPO.into()),
+            format!(
+                "{SHARE_REPO} は git リポジトリではありません。\n\
+                 新規に作るなら `tako config init --path {SHARE_REPO}` を使ってください"
+            ),
+        ),
+        (
+            ShareRefusal::CreateDirAt {
+                path: format!("{SHARE_REPO}/tako"),
+                error: SHARE_EACCES.into(),
+            },
+            format!("ディレクトリの作成に失敗 ({SHARE_REPO}/tako): {SHARE_EACCES}"),
+        ),
+        (
+            ShareRefusal::WriteFailed {
+                path: format!("{SHARE_REPO}/claude/CLAUDE.md"),
+                error: SHARE_EACCES.into(),
+            },
+            format!("書き込みに失敗 ({SHARE_REPO}/claude/CLAUDE.md): {SHARE_EACCES}"),
+        ),
+        (
+            ShareRefusal::RemoveFailed {
+                path: format!("{SHARE_REPO}/claude/old.md"),
+                error: SHARE_EACCES.into(),
+            },
+            format!("削除に失敗 ({SHARE_REPO}/claude/old.md): {SHARE_EACCES}"),
+        ),
+        (
+            ShareRefusal::ManifestSerialize("infinite recursion".into()),
+            "manifest の生成に失敗: infinite recursion".into(),
+        ),
+        (
+            ShareRefusal::ManifestWrite("Is a directory (os error 21)".into()),
+            "manifest の書き込みに失敗: Is a directory (os error 21)".into(),
+        ),
+        (
+            ShareRefusal::ReadmeWrite(SHARE_EACCES.into()),
+            format!("README の書き込みに失敗: {SHARE_EACCES}"),
+        ),
+        (
+            ShareRefusal::GitignoreWrite(SHARE_EACCES.into()),
+            format!("gitignore の書き込みに失敗: {SHARE_EACCES}"),
+        ),
+    ]
+}
+
+#[test]
+fn config_shareの断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let mut failures = Vec::new();
+    let gits = share_git_table();
+    covers_every(
+        &gits.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        share_git_index,
+        2,
+        "config_share::GitError",
+    );
+    for (e, old) in &gits {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                SHARE_REFUSAL_SRC,
+                SHARE_REFUSAL_PATH,
+                "impl GitError {",
+                &debug,
+                lang,
+            )
+        };
+        check_setup_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &e.text_in(Lang::Ja),
+            &e.text_in(Lang::En),
+        );
+    }
+    let table = share_refusal_table();
+    covers_every(
+        &table.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+        share_refusal_index,
+        SHARE_REFUSAL_VARIANTS,
+        "ShareRefusal",
+    );
+    for (r, old) in &table {
+        let debug = format!("{r:?}");
+        let at = |lang| {
+            where_written(
+                SHARE_REFUSAL_SRC,
+                SHARE_REFUSAL_PATH,
+                "impl ShareRefusal {",
+                &debug,
+                lang,
+            )
+        };
+        check_setup_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &r.text_in(Lang::Ja),
+            &r.text_in(Lang::En),
+        );
+        // dispatch へ載せる口（`operation`）は表示言語の文をそのまま運ぶ
+        let shown = r.clone().operation().text_in(Lang::En);
+        if shown != r.to_string() {
+            failures.push(format!(
+                "{debug}: operation() が表示言語の文と違う（{SHARE_REFUSAL_PATH}）: {shown}"
+            ));
+        }
+    }
+    // commit の「名前が未設定」の見分けは git の出力（と引数）だけを見る（枠の日本語に依らない）
+    if !share_git_commit().mentions("tell me who you are")
+        || share_git_failed().mentions("empty ident")
+    {
+        failures.push(format!(
+            "{SHARE_REFUSAL_PATH}: GitError::mentions が git の出力を見ていない"
+        ));
+    }
+    report_all(failures);
+}
+
+/// 型の口の本体（断りの文は `refusal.rs` の型にだけ置く）と、そこが呼んではならない日本語の口
+/// （`String` を返す書き出しの口・日本語の serde の理由・型を日本語の文へ戻す `into_ja` / `Lang::Ja`）
+const CONFIG_SHARE_SCOPES: &[(&str, &str, &str, &[&str])] = &[
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "fn data_dir(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "fn home_dir(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "pub fn load_state(",
+        &["json_error_reason(", "json_reason(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "fn save_state(",
+        &["atomic_write(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "fn linked_repo(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "fn git(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "pub fn export_content(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "pub fn import_content(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "fn write_manifest(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "pub fn init(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "pub fn link(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "pub fn unlink(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "fn expand_path(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "pub fn status(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "pub fn push(",
+        &["guard::describe(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        CONFIG_SHARE_PATH,
+        CONFIG_SHARE_SRC,
+        "pub fn pull(",
+        &["atomic_write_with_backup(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        PORTABLE_PATH,
+        PORTABLE_SRC,
+        "pub fn strip_local_fields(",
+        &[
+            "yaml_error_reason(",
+            "json_error_reason(",
+            "into_ja",
+            "Lang::Ja",
+        ],
+    ),
+    (
+        PORTABLE_PATH,
+        PORTABLE_SRC,
+        "pub fn restore_local_fields(",
+        &[
+            "yaml_error_reason(",
+            "json_error_reason(",
+            "into_ja",
+            "Lang::Ja",
+        ],
+    ),
+];
+
+#[test]
+fn config_shareの型の口に日本語の固定文が無く日本語の口を呼ばない() {
+    let mut failures = Vec::new();
+    for (path, src, head, calls) in CONFIG_SHARE_SCOPES {
+        let Some(lines) = front_scope_lines(src, Some(head)) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{}` が見つからない（改名で番犬が空振りする。CONFIG_SHARE_SCOPES を直す）",
+                head.trim()
+            ));
+            continue;
+        };
+        for (line, text) in refusal_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 型の口の断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （ShareRefusal へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+        for (line, call, code) in ja_inner_calls(&lines, calls) {
+            failures.push(format!(
+                "{path}:{line}: 型の口が日本語の口 `{call}` を呼んでいる = 英語表示でも中身だけ \
+                 日本語で混ざる（型の口を呼ぶ）: {code}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// `head` の行から `end` を含む行の手前まで（関数の一部の枝だけを見る）
+fn block_lines<'a>(src: &'a str, head: &str, end: &str) -> Option<Vec<(usize, &'a str)>> {
+    let lines: Vec<(usize, &str)> = src.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+    let start = lines.iter().position(|(_, l)| l.contains(head))?;
+    let stop = lines[start + 1..]
+        .iter()
+        .position(|(_, l)| l.contains(end))
+        .map(|at| start + 1 + at)?;
+    Some(lines[start..stop].to_vec())
+}
+
+/// dispatch の `tako_config_share` の口と CLI の手元の処理（`tako config`・`orchestrator watch --worker`・
+/// `lsp options --set`・`remote agents`）が呼んではならない日本語の口と、型を日本語の文へ戻す呼び出し
+const JA_SHARE_CLI_CALLS: [&str; 7] = [
+    "DispatchError::Operation)",
+    "WorkerRegistry::load()",
+    "reg.resolve(",
+    "list_agents_with_panes(",
+    "parse_assignment(item)?",
+    "into_ja",
+    "Lang::Ja",
+];
+
+#[test]
+fn dispatchのconfig_shareとcliの手元の処理は日本語の口を呼ばない() {
+    let mut failures = Vec::new();
+    // dispatch の口: 断りを型のまま表示言語の文で載せる
+    match front_scope_lines(DISPATCH_SRC, Some("pub fn dispatch_config_share(")) {
+        None => failures.push(format!(
+            "{DISPATCH_PATH}: 走査の範囲 `pub fn dispatch_config_share(` が見つからない"
+        )),
+        Some(lines) => {
+            for (line, call, code) in ja_inner_calls(&lines, &JA_SHARE_CLI_CALLS) {
+                failures.push(format!(
+                    "{DISPATCH_PATH}:{line}: dispatch が config share の断りを `{call}` で載せている \
+                     = 英語表示でも日本語で混ざる（ShareRefusal::operation で載せる）: {code}"
+                ));
+            }
+            if !lines
+                .iter()
+                .any(|(_, l)| l.contains("ShareRefusal::operation"))
+            {
+                failures.push(format!(
+                    "{DISPATCH_PATH}: dispatch_config_share が断りを ShareRefusal::operation で載せていない"
+                ));
+            }
+        }
+    }
+    // CLI の手元の処理: 型の口を呼び、呼ぶ前に表示言語を設定から決める
+    let cli_scopes: [(&str, Option<(&str, &str)>, bool); 4] = [
+        ("fn config_share_local(", None, false),
+        (
+            "fn orchestrator_watch(",
+            Some((
+                "let pane = if let Some(worker_id) = worker {",
+                "    } else {",
+            )),
+            true,
+        ),
+        ("fn remote_agents(", None, true),
+        (
+            "fn request(&self) -> Result<Request, String> {",
+            Some((
+                "Self::Options { name, set, .. } => {",
+                "Request::LspServer {",
+            )),
+            false,
+        ),
+    ];
+    for (head, block, needs_init) in cli_scopes {
+        let lines = match block {
+            None => front_scope_lines(CLI_MAIN_SRC, Some(head)),
+            Some((from, end)) => block_lines(CLI_MAIN_SRC, from, end),
+        };
+        let Some(lines) = lines else {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする）"
+            ));
+            continue;
+        };
+        for (line, call, code) in ja_inner_calls(&lines, &JA_SHARE_CLI_CALLS) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}:{line}: CLI の手元の処理が日本語の口 `{call}` を呼んでいる \
+                 = 英語表示でも断りが日本語で出る: {code}"
+            ));
+        }
+        for (line, text) in japanese_outside(&lines, &["unreachable!(", ".expect(", "eprintln!("]) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}:{line}: CLI の手元の処理の断りに日本語の固定文がある: {text}"
+            ));
+        }
+        if needs_init && !lines.iter().any(|(_, l)| l.contains("init_local_lang()")) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}: `{head}` が表示言語を設定から決めていない（init_local_lang() を呼ぶ）"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 枝の切り出しは `head` の行から `end` の手前までで、見つからなければ空振りを言う
+#[test]
+fn config_shareとcliの手元の番犬の境界() {
+    let src = "fn f() {\n    let pane = if let Some(w) = worker {\n        a();\n    } else {\n        b();\n    };\n}\n";
+    let lines = block_lines(src, "let pane = if let Some(w) = worker {", "    } else {")
+        .expect("枝を切り出せる");
+    assert_eq!(
+        lines.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+        vec![2, 3],
+        "枝の頭から else の手前まで"
+    );
+    assert!(block_lines(src, "無い頭", "    } else {").is_none());
+    let calls: Vec<(usize, &str)> = ja_inner_calls(
+        &[
+            (1, "    result.map_err(DispatchError::Operation)"),
+            (
+                2,
+                "    result.map_err(config_share::ShareRefusal::operation)",
+            ),
+        ],
+        &JA_SHARE_CLI_CALLS,
+    )
+    .into_iter()
+    .map(|(l, c, _)| (l, c))
+    .collect();
+    assert_eq!(
+        calls,
+        vec![(1, "DispatchError::Operation)")],
+        "素の String を載せる形だけを名指す"
     );
 }

@@ -27,6 +27,9 @@
 
 use std::path::Path;
 
+use super::ShareRefusal;
+use tako_core::load_issue::{JsonReason, YamlReason};
+
 /// 区切り文字。Windows 実機が無くても両方を検証できるよう、引数で受ける純粋関数にする
 /// （`platform::support` の「macOS 上から Windows 側を検証できる」と同じ考え方）
 pub const UNIX_SEP: char = '/';
@@ -186,51 +189,45 @@ pub enum Format {
 }
 
 /// 共有コピーからローカルフィールドを取り除く。
-/// パースできない内容は**そのまま返さず失敗させる**（壊れた設定を無検査で共有に載せない）
+/// パースできない内容は**そのまま返さず失敗させる**（壊れた設定を無検査で共有に載せない）。
+/// 断りは表示言語で組む型（[`ShareRefusal`]。#2365）
 pub fn strip_local_fields(
     content: &str,
     format: Format,
     fields: &[&str],
-) -> Result<String, String> {
+) -> Result<String, ShareRefusal> {
     if fields.is_empty() {
         return Ok(content.to_string());
     }
     match format {
         Format::Yaml => {
-            let mut value: serde_yaml::Value = serde_yaml::from_str(content).map_err(|e| {
-                format!(
-                    "YAML のパースに失敗: {}",
-                    tako_core::load_issue::yaml_error_reason(&e, content)
-                )
-            })?;
+            let mut value: serde_yaml::Value = serde_yaml::from_str(content)
+                .map_err(|e| ShareRefusal::YamlParse(YamlReason::of(&e, content)))?;
             for field in fields {
                 yaml_remove(&mut value, &split_field_path(field));
             }
-            serde_yaml::to_string(&value).map_err(|e| format!("YAML の出力に失敗: {e}"))
+            serde_yaml::to_string(&value).map_err(|e| ShareRefusal::YamlEmit(e.to_string()))
         }
         Format::Json => {
-            let mut value: serde_json::Value = serde_json::from_str(content).map_err(|e| {
-                format!(
-                    "JSON のパースに失敗: {}",
-                    tako_core::load_issue::json_error_reason(&e)
-                )
-            })?;
+            let mut value: serde_json::Value = serde_json::from_str(content)
+                .map_err(|e| ShareRefusal::JsonParse(JsonReason::of(&e)))?;
             for field in fields {
                 json_remove(&mut value, &split_field_path(field));
             }
-            serde_json::to_string_pretty(&value).map_err(|e| format!("JSON の出力に失敗: {e}"))
+            serde_json::to_string_pretty(&value).map_err(|e| ShareRefusal::JsonEmit(e.to_string()))
         }
     }
 }
 
 /// 取り込み時に、ローカルの値を共有内容へ戻す。
-/// ローカルに値が無ければ何もしない（= 共有側の「欠けている」状態が残る）
+/// ローカルに値が無ければ何もしない（= 共有側の「欠けている」状態が残る）。
+/// 断りは表示言語で組む型（[`ShareRefusal`]。#2365）
 pub fn restore_local_fields(
     shared: &str,
     local: Option<&str>,
     format: Format,
     fields: &[&str],
-) -> Result<String, String> {
+) -> Result<String, ShareRefusal> {
     if fields.is_empty() {
         return Ok(shared.to_string());
     }
@@ -239,12 +236,8 @@ pub fn restore_local_fields(
     };
     match format {
         Format::Yaml => {
-            let mut target: serde_yaml::Value = serde_yaml::from_str(shared).map_err(|e| {
-                format!(
-                    "YAML のパースに失敗: {}",
-                    tako_core::load_issue::yaml_error_reason(&e, shared)
-                )
-            })?;
+            let mut target: serde_yaml::Value = serde_yaml::from_str(shared)
+                .map_err(|e| ShareRefusal::YamlParse(YamlReason::of(&e, shared)))?;
             let source: serde_yaml::Value = match serde_yaml::from_str(local) {
                 Ok(v) => v,
                 // ローカルが壊れていても取り込みは進める（ローカル値の復元だけ諦める）
@@ -253,15 +246,11 @@ pub fn restore_local_fields(
             for field in fields {
                 yaml_restore(&mut target, &source, &split_field_path(field));
             }
-            serde_yaml::to_string(&target).map_err(|e| format!("YAML の出力に失敗: {e}"))
+            serde_yaml::to_string(&target).map_err(|e| ShareRefusal::YamlEmit(e.to_string()))
         }
         Format::Json => {
-            let mut target: serde_json::Value = serde_json::from_str(shared).map_err(|e| {
-                format!(
-                    "JSON のパースに失敗: {}",
-                    tako_core::load_issue::json_error_reason(&e)
-                )
-            })?;
+            let mut target: serde_json::Value = serde_json::from_str(shared)
+                .map_err(|e| ShareRefusal::JsonParse(JsonReason::of(&e)))?;
             let source: serde_json::Value = match serde_json::from_str(local) {
                 Ok(v) => v,
                 Err(_) => return Ok(shared.to_string()),
@@ -269,7 +258,7 @@ pub fn restore_local_fields(
             for field in fields {
                 json_restore(&mut target, &source, &split_field_path(field));
             }
-            serde_json::to_string_pretty(&target).map_err(|e| format!("JSON の出力に失敗: {e}"))
+            serde_json::to_string_pretty(&target).map_err(|e| ShareRefusal::JsonEmit(e.to_string()))
         }
     }
 }

@@ -1405,7 +1405,11 @@ impl LspCommand {
             Self::Options { name, set, .. } => {
                 let mut map = serde_json::Map::new();
                 for item in set {
-                    let (key, value) = tako_core::lsp::init_options::parse_assignment(item)?;
+                    // 断り（`OptionRefusal`）は表示言語で文にする（#2365。GUI へ送る前の手元の読み取り）
+                    let (key, value) = tako_core::lsp::init_options::parse_assignment(item)
+                        .map_err(|e| {
+                            e.text_in(tako_control::settings::peek_lang_setting().resolve())
+                        })?;
                     map.insert(key, value);
                 }
                 Request::LspServer {
@@ -5658,10 +5662,15 @@ fn orchestrator_watch(
     let mut tmux_session = tmux_session.map(str::to_string);
     let pane = if let Some(worker_id) = worker {
         // レジストリからペイン・追跡キーを解決（watch ループは IPC 断でも回り続ける
-        // 設計のため、レジストリ解決も CLI プロセス内で行い tako 本体に依存しない）
-        let reg =
-            WorkerRegistry::load().map_err(|e| format!("worker レジストリを読めない: {e}"))?;
-        let (_, entry) = reg.resolve(worker_id)?;
+        // 設計のため、レジストリ解決も CLI プロセス内で行い tako 本体に依存しない）。
+        // 断り（`RegistryError`）は表示言語で文にするので、呼ぶ前に設定から決める（#2365）
+        init_local_lang();
+        let reg = WorkerRegistry::load_typed().map_err(|e| {
+            front_err(tako_control::Reason::WorkerRegistryUnreadable(
+                e.to_string(),
+            ))
+        })?;
+        let (_, entry) = reg.resolve_typed(worker_id).map_err(|e| e.to_string())?;
         session_id = session_id.or_else(|| entry.session_id.clone());
         tmux_session = tmux_session.or_else(|| entry.tmux_session.clone());
         entry.pane
@@ -6404,7 +6413,11 @@ fn remote_serve() -> Result<(), String> {
 
 /// `tako remote agents` — claude agents --json + tmux ペイン対応付けを表示する
 fn remote_agents() -> Result<(), String> {
-    let mut result = tako_control::agents::list_agents_with_panes(None)?;
+    // 断り（`AgentScanError`）は表示言語で文にするので、呼ぶ前に設定から決める（#2365。
+    // 日本語の口 `list_agents_with_panes` は daemon と監視の記録用）
+    init_local_lang();
+    let mut result =
+        tako_control::agents::list_agents_with_panes_typed(None).map_err(|e| e.to_string())?;
     // #1069: 公式リンク（claude.ai/code）。HTTP の /api/agents と dispatch の
     // RemoteAgents と**同じ 1 実装**を通す（CLI はローカル処理なので自分で呼ぶ）
     tako_control::claude_remote_link::attach_to_agents(&mut result);

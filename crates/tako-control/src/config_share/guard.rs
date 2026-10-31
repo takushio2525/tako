@@ -3,6 +3,7 @@
 //! 一次防御はカタログ（ホワイトリスト）。ここは**二次防御**で、共有対象と分類した
 //! ファイルの中身に秘匿情報らしき文字列が入っていないかを書き出し直前に検査する。
 //! 引っかかったら push を**止める**（黙って除外すると同期が壊れたことに気付けない）。
+//! 断りの文は `ShareRefusal::SecretsFound`（場所と種類だけ。日英の対は `refusal.rs`。#2365）
 //!
 //! 誤検出で push が止まると実害が大きいので、パターンは
 //! 「まず間違いなく秘匿」と言えるものだけに絞る。
@@ -149,18 +150,6 @@ fn secret_assignment(line: &str) -> Option<&'static str> {
     Some("secret-looking assignment")
 }
 
-/// 検出結果を人が読めるエラー文にする（値は出さない）
-pub fn describe(findings: &[Finding]) -> String {
-    let mut lines = vec![
-        "秘匿情報らしき内容が共有対象に含まれています。取り除いてから再実行してください:"
-            .to_string(),
-    ];
-    for f in findings {
-        lines.push(format!("  - {}:{} ({})", f.path, f.line, f.kind));
-    }
-    lines.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,9 +202,13 @@ secret: ${MY_SECRET}
 
     #[test]
     fn 検出結果に値そのものを含めない() {
+        // 断りの文（`ShareRefusal::SecretsFound`。#2365）は日英とも場所と種類だけ
         let findings = scan("f", "token: EXAMPLEEXAMPLEEXAMPLEEXAMPLE");
-        let text = describe(&findings);
-        assert!(!text.contains("EXAMPLE"), "値が漏れている: {text}");
+        for lang in [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En] {
+            let text = super::super::ShareRefusal::SecretsFound(findings.clone()).text_in(lang);
+            assert!(!text.contains("EXAMPLE"), "値が漏れている: {text}");
+            assert!(text.contains("f:1"), "場所が無い: {text}");
+        }
     }
 
     #[test]

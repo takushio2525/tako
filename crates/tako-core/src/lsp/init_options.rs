@@ -150,6 +150,8 @@ pub fn validate_key(key: &str) -> Result<(), OptionRefusal> {
 pub enum OptionRefusal {
     /// キーの形が不正（ドット区切りの経路でない）
     KeyShape(String),
+    /// CLI の `--set` が `KEY=VALUE` の形でない（中身は打った文字のまま）
+    NotAssignment(String),
 }
 
 impl OptionRefusal {
@@ -163,12 +165,13 @@ impl OptionRefusal {
             (Self::KeyShape(key), En) => {
                 format!("malformed key: {key:?} (a dot-separated path, e.g. cargo.targetDir)")
             }
+            (Self::NotAssignment(text), Ja) => {
+                format!("--set は KEY=VALUE の形: {text:?}（例: cargo.targetDir=false）")
+            }
+            (Self::NotAssignment(text), En) => {
+                format!("--set takes the form KEY=VALUE: {text:?} (e.g. cargo.targetDir=false)")
+            }
         }
-    }
-
-    /// 日本語の文（CLI の `--set` の読み取り = 手元の処理の口）
-    pub fn into_ja(self) -> String {
-        self.text_in(crate::i18n::Lang::Ja)
     }
 }
 
@@ -184,13 +187,13 @@ pub fn parse_value(text: &str) -> Value {
     serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.to_string()))
 }
 
-/// CLI の `--set KEY=VALUE` を 1 つ読む
-pub fn parse_assignment(text: &str) -> Result<(String, Value), String> {
+/// CLI の `--set KEY=VALUE` を 1 つ読む。断りは表示言語で組む型（呼び手は CLI の手元の処理だけ。#2365）
+pub fn parse_assignment(text: &str) -> Result<(String, Value), OptionRefusal> {
     let (key, value) = text
         .split_once('=')
-        .ok_or_else(|| format!("--set は KEY=VALUE の形: {text:?}（例: cargo.targetDir=false）"))?;
+        .ok_or_else(|| OptionRefusal::NotAssignment(text.to_string()))?;
     let key = key.trim();
-    validate_key(key).map_err(OptionRefusal::into_ja)?;
+    validate_key(key)?;
     Ok((key.to_string(), parse_value(value.trim())))
 }
 
