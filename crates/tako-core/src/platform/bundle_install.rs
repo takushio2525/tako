@@ -39,6 +39,128 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::i18n::Lang;
+
+/// 差し替えの断り（#2365）。日英の対は [`BundleError::text_in`] の (バリアント, 言語) の網羅 match の
+/// 1 か所。日本語は #2365 より前の固定文とバイト一致（`tako-control/tests/issue1762_dispatch_error_lang.rs`
+/// が突き合わせる）。呼び手は GUI の更新（`UpdateRefusal::BundleReplace`）だけなので、日本語の
+/// `String` の口は持たない。OS の理由（`error`）は io のエラーの文をそのまま載せる。
+/// 日本語の「見つかりません」は 404 へ寄せる読みに当たらないので、英語も ` not found` を使わない
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BundleError {
+    /// 差し替え元（展開した新版）が無い
+    SourceMissing(String),
+    /// 置き場のパスにファイル名が無い
+    DestInvalid(String),
+    /// 置き場が空のときの rename 1 回が失敗した（置き場は変えていない）
+    InstallFailed { dest: String, error: String },
+    /// 入れ替え（`RENAME_SWAP`）が失敗した（置き場は変えていない）
+    SwapFailed { dest: String, cause: SwapCause },
+    /// #1042 前の手順（A/B）で置き場を `.bak` へ退避できない
+    BackupFailed { dest: String, error: String },
+    /// 退避 → 設置へ落ちたときに置き場を退避できない（置き場は変えていない）
+    AsideFailed { dest: String, error: String },
+    /// 退避 → 設置へ落ちたときに新版を置けない（退避は戻す）
+    PlaceFailed { dest: String, error: String },
+    /// 置き場の親ディレクトリが取れない
+    ParentMissing(String),
+    /// 置き場の隣に作業用ディレクトリを作れない
+    StagingCreateFailed { parent: String, error: String },
+    /// `ditto` を起動できない（macOS）
+    DittoSpawn(String),
+    /// バンドルの複製が失敗した（macOS は `ditto` の stderr・その他は io のエラー）
+    CopyFailed(String),
+}
+
+/// 入れ替えが失敗した理由（[`BundleError::SwapFailed`] の中身）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapCause {
+    /// パスを C の文字列へ渡せない（NUL を含む）
+    NulInPath,
+    /// OS の理由（io のエラーの文）
+    Os(String),
+}
+
+impl SwapCause {
+    /// 表示言語を明示しての文言
+    pub fn text_in(&self, lang: Lang) -> String {
+        match (self, lang) {
+            (Self::NulInPath, Lang::Ja) => "パスに NUL が含まれています".to_string(),
+            (Self::NulInPath, Lang::En) => "the path contains a NUL byte".to_string(),
+            (Self::Os(error), Lang::Ja | Lang::En) => error.clone(),
+        }
+    }
+}
+
+impl BundleError {
+    /// 表示言語を明示しての文言（網羅 match = バリアントを足すと日英の両方を書くまで通らない）
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::SourceMissing(path), Ja) => format!("差し替え元が見つかりません: {path}"),
+            (Self::SourceMissing(path), En) => {
+                format!("the replacement bundle does not exist: {path}")
+            }
+            (Self::DestInvalid(dest), Ja) => format!("置き場のパスが不正です: {dest}"),
+            (Self::DestInvalid(dest), En) => format!("the install path is invalid: {dest}"),
+            (Self::InstallFailed { dest, error }, Ja) => {
+                format!("{dest} への設置に失敗: {error}（{dest} は変更していません）")
+            }
+            (Self::InstallFailed { dest, error }, En) => {
+                format!("installing to {dest} failed: {error} ({dest} was not changed)")
+            }
+            (Self::SwapFailed { dest, cause }, Ja) => format!(
+                "{dest} の入れ替えに失敗: {}（{dest} は変更していません）",
+                cause.text_in(Ja)
+            ),
+            (Self::SwapFailed { dest, cause }, En) => format!(
+                "swapping in the new {dest} failed: {} ({dest} was not changed)",
+                cause.text_in(En)
+            ),
+            (Self::BackupFailed { dest, error }, Ja) => {
+                format!("{dest} のバックアップに失敗: {error}")
+            }
+            (Self::BackupFailed { dest, error }, En) => {
+                format!("backing up {dest} failed: {error}")
+            }
+            (Self::AsideFailed { dest, error }, Ja) => {
+                format!("{dest} の退避に失敗: {error}（{dest} は変更していません）")
+            }
+            (Self::AsideFailed { dest, error }, En) => {
+                format!("moving {dest} aside failed: {error} ({dest} was not changed)")
+            }
+            (Self::PlaceFailed { dest, error }, Ja) => format!("{dest} への設置に失敗: {error}"),
+            (Self::PlaceFailed { dest, error }, En) => {
+                format!("installing to {dest} failed: {error}")
+            }
+            (Self::ParentMissing(dest), Ja) => {
+                format!("置き場の親ディレクトリが取れません: {dest}")
+            }
+            (Self::ParentMissing(dest), En) => {
+                format!("cannot get the parent directory of the install path: {dest}")
+            }
+            (Self::StagingCreateFailed { parent, error }, Ja) => {
+                format!("作業用ディレクトリの作成に失敗: {error}（{parent} に書き込めますか）")
+            }
+            (Self::StagingCreateFailed { parent, error }, En) => format!(
+                "creating the work directory failed: {error} (check that {parent} is writable)"
+            ),
+            (Self::DittoSpawn(error), Ja) => format!("ditto の実行に失敗: {error}"),
+            (Self::DittoSpawn(error), En) => format!("cannot run ditto: {error}"),
+            (Self::CopyFailed(detail), Ja) => format!("バンドルの複製に失敗: {detail}"),
+            (Self::CopyFailed(detail), En) => format!("copying the bundle failed: {detail}"),
+        }
+    }
+}
+
+impl std::fmt::Display for BundleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for BundleError {}
+
 /// 差し替えに使った手段（診断・テスト用）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplaceStrategy {
@@ -83,12 +205,12 @@ impl ReplaceStrategy {
 ///
 /// 成功しても失敗しても、作業用に作ったステージ用ディレクトリは片付ける。
 /// **入れ替えの手前で失敗したときは `dest` に一切触っていない**。
-pub fn replace_bundle_in_place(dest: &Path, new_bundle: &Path) -> Result<ReplaceStrategy, String> {
+pub fn replace_bundle_in_place(
+    dest: &Path,
+    new_bundle: &Path,
+) -> Result<ReplaceStrategy, BundleError> {
     if !new_bundle.exists() {
-        return Err(format!(
-            "差し替え元が見つかりません: {}",
-            new_bundle.display()
-        ));
+        return Err(BundleError::SourceMissing(new_bundle.display().to_string()));
     }
     if legacy_move_aside_forced() {
         legacy_replace(dest, new_bundle)?;
@@ -96,7 +218,7 @@ pub fn replace_bundle_in_place(dest: &Path, new_bundle: &Path) -> Result<Replace
     }
     let name = dest
         .file_name()
-        .ok_or_else(|| format!("置き場のパスが不正です: {}", dest.display()))?
+        .ok_or_else(|| BundleError::DestInvalid(dest.display().to_string()))?
         .to_os_string();
 
     // 隣にステージする（同一ボリュームであることが rename / swap の前提）
@@ -106,12 +228,9 @@ pub fn replace_bundle_in_place(dest: &Path, new_bundle: &Path) -> Result<Replace
 
     if !dest.exists() {
         // 置き場が空 → rename 1 回でアトミックに置ける（窓ゼロ）
-        std::fs::rename(&staged, dest).map_err(|e| {
-            format!(
-                "{} への設置に失敗: {e}（{} は変更していません）",
-                dest.display(),
-                dest.display()
-            )
+        std::fs::rename(&staged, dest).map_err(|e| BundleError::InstallFailed {
+            dest: dest.display().to_string(),
+            error: e.to_string(),
         })?;
         return Ok(ReplaceStrategy::FreshInstall);
     }
@@ -127,7 +246,7 @@ pub fn replace_bundle_in_place(dest: &Path, new_bundle: &Path) -> Result<Replace
                 // 置き場は壊れていない
                 tracing::warn!(
                     "Contents の入れ替えに失敗したのでバンドルごと入れ替えます: {}",
-                    e.reason()
+                    e.cause().text_in(Lang::Ja)
                 );
             }
         }
@@ -139,16 +258,14 @@ pub fn replace_bundle_in_place(dest: &Path, new_bundle: &Path) -> Result<Replace
             // 落ちる先は旧挙動。更新できないより「ピンが外れるかもしれない」を選ぶ
             tracing::warn!(
                 "アトミックな入れ替えが使えないため退避 → 設置へ落ちます: {}",
-                e.reason()
+                e.cause().text_in(Lang::Ja)
             );
         }
         Err(e) => {
-            return Err(format!(
-                "{} の入れ替えに失敗: {}（{} は変更していません）",
-                dest.display(),
-                e.reason(),
-                dest.display()
-            ));
+            return Err(BundleError::SwapFailed {
+                dest: dest.display().to_string(),
+                cause: e.cause(),
+            });
         }
     }
 
@@ -170,13 +287,15 @@ fn legacy_move_aside_forced() -> bool {
 ///
 /// 複製が途中で失敗すると、**壊れたバンドルと退避先の両方が残る**（復旧の rename は
 /// 置き場が空でないと通らないため）。これも当時の挙動そのまま
-fn legacy_replace(dest: &Path, new_bundle: &Path) -> Result<(), String> {
+fn legacy_replace(dest: &Path, new_bundle: &Path) -> Result<(), BundleError> {
     // 当時のリテラルと同じ `<置き場>.bak`
     let backup = PathBuf::from(format!("{}.bak", dest.display()));
     if dest.exists() {
         let _ = std::fs::remove_dir_all(&backup);
-        std::fs::rename(dest, &backup)
-            .map_err(|e| format!("{} のバックアップに失敗: {e}", dest.display()))?;
+        std::fs::rename(dest, &backup).map_err(|e| BundleError::BackupFailed {
+            dest: dest.display().to_string(),
+            error: e.to_string(),
+        })?;
     }
     if let Err(e) = imp::copy_bundle(new_bundle, dest) {
         if backup.exists() {
@@ -192,7 +311,7 @@ fn legacy_replace(dest: &Path, new_bundle: &Path) -> Result<(), String> {
 ///
 /// 同一ボリュームなら rename で一瞬（コピーが要らない）。またいでいるときだけ
 /// 実コピーへ落ちる（macOS は署名・拡張属性を保つ `ditto`）。
-fn stage_bundle(new_bundle: &Path, staged: &Path) -> Result<(), String> {
+fn stage_bundle(new_bundle: &Path, staged: &Path) -> Result<(), BundleError> {
     if std::fs::rename(new_bundle, staged).is_ok() {
         return Ok(());
     }
@@ -200,19 +319,19 @@ fn stage_bundle(new_bundle: &Path, staged: &Path) -> Result<(), String> {
 }
 
 /// 旧挙動: 置き場を退避してから新版を設置する。**置き場が一瞬空く**
-fn move_aside_replace(dest: &Path, staged: &Path, staging_dir: &Path) -> Result<(), String> {
+fn move_aside_replace(dest: &Path, staged: &Path, staging_dir: &Path) -> Result<(), BundleError> {
     let aside = staging_dir.join("previous");
-    std::fs::rename(dest, &aside).map_err(|e| {
-        format!(
-            "{} の退避に失敗: {e}（{} は変更していません）",
-            dest.display(),
-            dest.display()
-        )
+    std::fs::rename(dest, &aside).map_err(|e| BundleError::AsideFailed {
+        dest: dest.display().to_string(),
+        error: e.to_string(),
     })?;
     if let Err(e) = std::fs::rename(staged, dest) {
         // 設置に失敗したら退避を戻す（best-effort。ここで失敗すると置き場が空のまま残る）
         let _ = std::fs::rename(&aside, dest);
-        return Err(format!("{} への設置に失敗: {e}", dest.display()));
+        return Err(BundleError::PlaceFailed {
+            dest: dest.display().to_string(),
+            error: e.to_string(),
+        });
     }
     Ok(())
 }
@@ -223,10 +342,10 @@ struct StagingDir {
 }
 
 impl StagingDir {
-    fn create_next_to(dest: &Path) -> Result<Self, String> {
+    fn create_next_to(dest: &Path) -> Result<Self, BundleError> {
         let parent = dest
             .parent()
-            .ok_or_else(|| format!("置き場の親ディレクトリが取れません: {}", dest.display()))?;
+            .ok_or_else(|| BundleError::ParentMissing(dest.display().to_string()))?;
         // Finder に見えないようドット始まり。同時実行と残骸の衝突を避けるため pid を混ぜる。
         //
         // ここは `/Applications` の直下なので、#837 が実測した「Launch Services は
@@ -236,11 +355,9 @@ impl StagingDir {
         // 登録される窓へ届かない。#837 の「Finder の候補に tako が 2 つ並ぶ」は起こさない
         let dir = parent.join(format!(".tako-replace-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            format!(
-                "作業用ディレクトリの作成に失敗: {e}（{} に書き込めますか）",
-                parent.display()
-            )
+        std::fs::create_dir_all(&dir).map_err(|e| BundleError::StagingCreateFailed {
+            parent: parent.display().to_string(),
+            error: e.to_string(),
         })?;
         Ok(Self { dir })
     }
@@ -263,12 +380,19 @@ impl Drop for StagingDir {
 /// 「never constructed」の警告になるため（プラットフォームで死ぬ変種を作らない）
 struct SwapError {
     unsupported: bool,
+    /// パスを C の文字列へ渡せなかった（NUL を含む）。真なら `source` は使わない
+    nul_in_path: bool,
     source: std::io::Error,
 }
 
 impl SwapError {
-    fn reason(&self) -> &std::io::Error {
-        &self.source
+    /// 断りへ載せる理由（#2365。文は [`SwapCause::text_in`] で引く）
+    fn cause(&self) -> SwapCause {
+        if self.nul_in_path {
+            SwapCause::NulInPath
+        } else {
+            SwapCause::Os(self.source.to_string())
+        }
     }
 }
 
@@ -298,7 +422,7 @@ fn has_only_contents(bundle: &Path) -> bool {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::SwapError;
+    use super::{BundleError, SwapError};
     use std::path::Path;
 
     /// 2 つのパスの中身をアトミックに入れ替える（`renamex_np` + `RENAME_SWAP`）
@@ -309,10 +433,8 @@ mod imp {
         let to_c = |p: &Path| {
             CString::new(p.as_os_str().as_bytes()).map_err(|_| SwapError {
                 unsupported: false,
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "パスに NUL が含まれています",
-                ),
+                nul_in_path: true,
+                source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
             })
         };
         let ca = to_c(a)?;
@@ -330,12 +452,13 @@ mod imp {
         );
         Err(SwapError {
             unsupported,
+            nul_in_path: false,
             source: err,
         })
     }
 
     /// 署名・拡張属性を保ったままバンドルを複製する（`ditto`）
-    pub(super) fn copy_bundle(src: &Path, dest: &Path) -> Result<(), String> {
+    pub(super) fn copy_bundle(src: &Path, dest: &Path) -> Result<(), BundleError> {
         // #628 / #586: GUI プロセスから呼ばれうるのでコンソール窓を出させない
         // （unix では no-op だが、境界の規約を全ファイルで揃えておく）
         let output = crate::platform::process::no_console_window(&mut std::process::Command::new(
@@ -344,13 +467,12 @@ mod imp {
         .arg(src)
         .arg(dest)
         .output()
-        .map_err(|e| format!("ditto の実行に失敗: {e}"))?;
+        .map_err(|e| BundleError::DittoSpawn(e.to_string()))?;
         if output.status.success() {
             Ok(())
         } else {
-            Err(format!(
-                "バンドルの複製に失敗: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+            Err(BundleError::CopyFailed(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ))
         }
     }
@@ -358,24 +480,25 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    use super::SwapError;
+    use super::{BundleError, SwapError};
     use std::path::Path;
+
+    /// 「使えない」の理由。落とし先へ進むときの診断（`tracing::warn!`）にだけ出る = 断りではない
+    const NO_ATOMIC_SWAP: &str = "このプラットフォームにアトミックな入れ替えはありません";
 
     /// macOS 以外に `RENAME_SWAP` 相当は無いので、常に「使えない」を返して
     /// 呼び出し側を退避 → 設置へ落とす
     pub(super) fn swap_paths(_a: &Path, _b: &Path) -> Result<(), SwapError> {
         Err(SwapError {
             unsupported: true,
-            source: std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "このプラットフォームにアトミックな入れ替えはありません",
-            ),
+            nul_in_path: false,
+            source: std::io::Error::new(std::io::ErrorKind::Unsupported, NO_ATOMIC_SWAP),
         })
     }
 
     /// 素の再帰コピー（拡張属性は扱わない）
-    pub(super) fn copy_bundle(src: &Path, dest: &Path) -> Result<(), String> {
-        copy_dir_all(src, dest).map_err(|e| format!("バンドルの複製に失敗: {e}"))
+    pub(super) fn copy_bundle(src: &Path, dest: &Path) -> Result<(), BundleError> {
+        copy_dir_all(src, dest).map_err(|e| BundleError::CopyFailed(e.to_string()))
     }
 
     fn copy_dir_all(src: &Path, dest: &Path) -> std::io::Result<()> {
@@ -538,7 +661,14 @@ mod tests {
         let missing = root.dir.join("new/tako.app");
 
         let err = replace_bundle_in_place(&dest, &missing).expect_err("失敗すること");
-        assert!(err.contains("差し替え元"), "理由が分かる文面: {err}");
+        assert!(
+            matches!(&err, BundleError::SourceMissing(p) if p == &missing.display().to_string()),
+            "理由が分かる断り: {err:?}"
+        );
+        assert!(
+            err.text_in(Lang::Ja).contains("差し替え元"),
+            "理由が分かる文面: {err:?}"
+        );
         assert_eq!(version_of(&dest), "0.8.0", "旧版が生きていること");
     }
 

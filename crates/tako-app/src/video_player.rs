@@ -3,9 +3,14 @@
 //! AVPlayer + AVPlayerItemVideoOutput でデコード済みフレームを
 //! RGBA ビットマップとして取得し、GPUI の img() で描画する。
 //! PDF 描画（preview.rs pdf_render）と同じ raw objc FFI パターン。
+//!
+//! 開けない理由は `tako_control::VideoRefusal`（日英の対は 1 か所・#2365）で返す。
+//! CLI / MCP（`tako_video_*`）の断りは GUI の口がその場の表示言語の文にする
 
 #[cfg(target_os = "macos")]
 use std::ffi::c_void;
+
+use tako_control::VideoRefusal;
 
 #[cfg(target_os = "macos")]
 #[link(name = "AVFoundation", kind = "framework")]
@@ -261,31 +266,29 @@ unsafe impl Send for VideoPlayer {}
 
 #[cfg(target_os = "macos")]
 impl VideoPlayer {
-    /// 動画ファイルからプレイヤーを初期化する
-    pub fn open(path: &std::path::Path) -> Result<Self, String> {
+    /// 動画ファイルからプレイヤーを初期化する（断りは表示言語で引く型 = #2365）
+    pub fn open(path: &std::path::Path) -> Result<Self, VideoRefusal> {
         Self::open_at(path, 0.0)
     }
 
     /// 動画ファイルからプレイヤーを初期化し、`start` 秒の絵を最初のフレームにする（#2009）。
     /// 裏で手放したプレイヤーを表に戻したとき、先頭の絵を挟まずに止めた位置から見せる
-    pub fn open_at(path: &std::path::Path, start: f64) -> Result<Self, String> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| "パスが UTF-8 でない".to_string())?;
+    pub fn open_at(path: &std::path::Path, start: f64) -> Result<Self, VideoRefusal> {
+        let path_str = path.to_str().ok_or(VideoRefusal::PathNotUtf8)?;
 
         unsafe {
             // NSURL fileURLWithPath:
             let ns_string = msg_class_str("NSString", "stringWithUTF8String:", path_str)?;
             let url = msg_send_id(get_class("NSURL"), sel("fileURLWithPath:"), ns_string);
             if url.is_null() {
-                return Err("URL を生成できない".into());
+                return Err(VideoRefusal::UrlUnbuildable);
             }
 
             // AVPlayerItem itemWithURL:
             let player_item =
                 msg_send_id(get_class("AVPlayerItem"), sel("playerItemWithURL:"), url);
             if player_item.is_null() {
-                return Err("AVPlayerItem を生成できない".into());
+                return Err(VideoRefusal::PlayerItemUnbuildable);
             }
             // retain
             let _: *const c_void = msg_send_no_arg(player_item, sel("retain"));
@@ -315,7 +318,7 @@ impl VideoPlayer {
                 pixel_attrs,
             );
             if video_output.is_null() {
-                return Err("AVPlayerItemVideoOutput を生成できない".into());
+                return Err(VideoRefusal::VideoOutputUnbuildable);
             }
 
             // AVPlayerItem に VideoOutput を追加
@@ -328,7 +331,7 @@ impl VideoPlayer {
                 player_item,
             );
             if player.is_null() {
-                return Err("AVPlayer を生成できない".into());
+                return Err(VideoRefusal::PlayerUnbuildable);
             }
             let _: *const c_void = msg_send_no_arg(player, sel("retain"));
 
@@ -342,7 +345,7 @@ impl VideoPlayer {
             let status: isize = msg_send_status(player_item, sel("status"));
             // AVPlayerItemStatusFailed = 2
             if status == 2 {
-                return Err("動画の読み込みに失敗した".into());
+                return Err(VideoRefusal::LoadFailed);
             }
 
             // 動画の長さを取得する。AVPlayerItem.duration は readyToPlay に
@@ -704,8 +707,8 @@ unsafe fn msg_class_str(
     class_name: &str,
     sel_name: &str,
     arg: &str,
-) -> Result<*const c_void, String> {
-    let cstr = std::ffi::CString::new(arg).map_err(|_| "CString 変換失敗".to_string())?;
+) -> Result<*const c_void, VideoRefusal> {
+    let cstr = std::ffi::CString::new(arg).map_err(|_| VideoRefusal::NulInString)?;
     let cls = get_class(class_name);
     let selector = sel(sel_name);
     // ARM64 では variadic 呼び出しの引数がスタックに置かれるため、
@@ -714,7 +717,10 @@ unsafe fn msg_class_str(
         std::mem::transmute(objc_msgSend as *const c_void);
     let result = f(cls, selector, cstr.as_ptr() as *const c_void);
     if result.is_null() {
-        return Err(format!("{class_name} {sel_name} が null を返した"));
+        return Err(VideoRefusal::ObjcNull {
+            class: class_name.to_string(),
+            selector: sel_name.to_string(),
+        });
     }
     Ok(result)
 }
@@ -908,11 +914,11 @@ pub struct VideoPlayer {
 
 #[cfg(not(target_os = "macos"))]
 impl VideoPlayer {
-    pub fn open(_path: &std::path::Path) -> Result<Self, String> {
-        Err("動画再生は macOS でのみ対応".into())
+    pub fn open(_path: &std::path::Path) -> Result<Self, VideoRefusal> {
+        Err(VideoRefusal::MacOnly)
     }
-    pub fn open_at(_path: &std::path::Path, _start: f64) -> Result<Self, String> {
-        Err("動画再生は macOS でのみ対応".into())
+    pub fn open_at(_path: &std::path::Path, _start: f64) -> Result<Self, VideoRefusal> {
+        Err(VideoRefusal::MacOnly)
     }
     pub fn play(&mut self) {}
     pub fn pause(&mut self) {}

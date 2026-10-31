@@ -155,7 +155,7 @@ pub use host::{
     SessionHost, SystemHost, TmuxCleanupJob, TmuxHost, UiStateHost, VideoStatus, WebViewHost,
     WorkspaceHost,
 };
-pub use host_refusal::HostRefusal;
+pub use host_refusal::{HostRefusal, VideoRefusal};
 pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
 pub use os_refusal::OsRefusal;

@@ -111,6 +111,13 @@ pub enum HostRefusal {
     UrlHasWhitespace(String),
     /// `URL に制御文字が含まれています（NSURL が解釈できない）: <url>`
     UrlHasControlChar(String),
+    /// `Web ビューの親（tako の窓）が閉じているので Web ビューを作れない。…（#1837）`
+    /// （GUI は persist.log へは日本語の文で残す = 診断）
+    WebViewParentDetached,
+
+    // ---- 動画のプレビュー ----
+    /// 動画プレイヤーを用意できない（`video_player::VideoPlayer::open` の断り。枠を持たずに中身をそのまま）
+    VideoOpen(VideoRefusal),
 
     // ---- 設定の保存 ----
     /// `設定を保存できない: <cause>`（中身も枠と同じ表示言語 = [`crate::config_io::IoCause`]）
@@ -311,6 +318,18 @@ impl HostRefusal {
             (Self::UrlHasControlChar(url), En) => {
                 format!("the URL contains control characters (NSURL cannot parse it): {url}")
             }
+            (Self::WebViewParentDetached, Ja) => {
+                "Web ビューの親（tako の窓）が閉じているので Web ビューを作れない。\
+                 tako の窓を開いてから開き直す（#1837）"
+                    .into()
+            }
+            (Self::WebViewParentDetached, En) => {
+                "cannot create the web view because its parent (the tako window) is closed. \
+                 Open a tako window and open it again (#1837)"
+                    .into()
+            }
+
+            (Self::VideoOpen(cause), Ja | En) => cause.text_in(lang),
 
             (Self::SettingsNotSaved(cause), Ja) => {
                 format!("設定を保存できない: {}", cause.text_in(Ja))
@@ -374,6 +393,64 @@ impl HostRefusal {
             (Self::NothingToCopy, En) => "nothing to copy".into(),
             (Self::FileTreeClosed, Ja) => "ファイルツリーが閉じている".into(),
             (Self::FileTreeClosed, En) => "the file tree is closed".into(),
+        }
+    }
+}
+
+/// 動画プレイヤーを用意できない理由（#2365。tako-app の `video_player` が組む。macOS は AVFoundation の
+/// 生成の失敗、その他の OS は未対応）。実装の `cfg` の外に置くので、Windows の文も macOS の単体テストで
+/// 日英を検査できる。日本語は #2365 より前の固定文とバイト一致
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VideoRefusal {
+    /// `パスが UTF-8 でない`
+    PathNotUtf8,
+    /// `CString 変換失敗`（Objective-C へ渡す文字列に NUL がある）
+    NulInString,
+    /// `<class> <selector> が null を返した`
+    ObjcNull { class: String, selector: String },
+    /// `URL を生成できない`
+    UrlUnbuildable,
+    /// `AVPlayerItem を生成できない`
+    PlayerItemUnbuildable,
+    /// `AVPlayerItemVideoOutput を生成できない`
+    VideoOutputUnbuildable,
+    /// `AVPlayer を生成できない`
+    PlayerUnbuildable,
+    /// `動画の読み込みに失敗した`（AVPlayerItem の status が failed）
+    LoadFailed,
+    /// `動画再生は macOS でのみ対応`
+    MacOnly,
+}
+
+impl VideoRefusal {
+    /// (バリアント, 言語) の網羅 match
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::PathNotUtf8, Ja) => "パスが UTF-8 でない".into(),
+            (Self::PathNotUtf8, En) => "the path is not UTF-8".into(),
+            (Self::NulInString, Ja) => "CString 変換失敗".into(),
+            (Self::NulInString, En) => {
+                "cannot convert the string to a C string (it contains NUL)".into()
+            }
+            (Self::ObjcNull { class, selector }, Ja) => {
+                format!("{class} {selector} が null を返した")
+            }
+            (Self::ObjcNull { class, selector }, En) => format!("{class} {selector} returned null"),
+            (Self::UrlUnbuildable, Ja) => "URL を生成できない".into(),
+            (Self::UrlUnbuildable, En) => "cannot create the file URL".into(),
+            (Self::PlayerItemUnbuildable, Ja) => "AVPlayerItem を生成できない".into(),
+            (Self::PlayerItemUnbuildable, En) => "cannot create the AVPlayerItem".into(),
+            (Self::VideoOutputUnbuildable, Ja) => "AVPlayerItemVideoOutput を生成できない".into(),
+            (Self::VideoOutputUnbuildable, En) => {
+                "cannot create the AVPlayerItemVideoOutput".into()
+            }
+            (Self::PlayerUnbuildable, Ja) => "AVPlayer を生成できない".into(),
+            (Self::PlayerUnbuildable, En) => "cannot create the AVPlayer".into(),
+            (Self::LoadFailed, Ja) => "動画の読み込みに失敗した".into(),
+            (Self::LoadFailed, En) => "failed to load the video".into(),
+            (Self::MacOnly, Ja) => "動画再生は macOS でのみ対応".into(),
+            (Self::MacOnly, En) => "video playback is supported only on macOS".into(),
         }
     }
 }

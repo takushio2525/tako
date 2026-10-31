@@ -7864,9 +7864,11 @@ fn host_refusal_index(r: &HostRefusal) -> usize {
         HostRefusal::UrlEmpty => 54,
         HostRefusal::UrlHasWhitespace(_) => 55,
         HostRefusal::UrlHasControlChar(_) => 56,
+        HostRefusal::WebViewParentDetached => 57,
+        HostRefusal::VideoOpen(_) => 58,
     }
 }
-const HOST_REFUSAL_VARIANTS: usize = 57;
+const HOST_REFUSAL_VARIANTS: usize = 59;
 
 /// (断り, #2365 より前に GUI が組んでいた日本語の固定文)。中身で腕を分けるもの
 /// （`LinkIndexOutOfRange` の total・`WebViewNotFound` の案内）は両方を載せる
@@ -8066,6 +8068,17 @@ fn host_refusal_table() -> Vec<(HostRefusal, String)> {
             H::UrlHasControlChar("https://a\u{1}b".into()),
             "URL に制御文字が含まれています（NSURL が解釈できない）: https://a\u{1}b".into(),
         ),
+        // #2365 の続き（GUI 側）: 旧 `webview::detached_parent_error` と `video_player` の文
+        (
+            H::WebViewParentDetached,
+            "Web ビューの親（tako の窓）が閉じているので Web ビューを作れない。\
+             tako の窓を開いてから開き直す（#1837）"
+                .into(),
+        ),
+        (
+            H::VideoOpen(tako_control::VideoRefusal::LoadFailed),
+            "動画の読み込みに失敗した".into(),
+        ),
     ]
 }
 
@@ -8252,6 +8265,10 @@ const HOST_IMPL_SCOPES: &[(&str, &str)] = &[
         "    fn run_preview_command_local(",
     ),
     ("crates/tako-app/src/main.rs", "    fn ensure_video_player("),
+    (
+        "crates/tako-app/src/main.rs",
+        "    fn ensure_video_player_typed(",
+    ),
     ("crates/tako-app/src/main.rs", "    fn create_webview("),
     (
         "crates/tako-app/src/chat_view.rs",
@@ -14974,4 +14991,596 @@ fn config_shareとcliの手元の番犬の境界() {
         vec![(1, "DispatchError::Operation)")],
         "素の String を載せる形だけを名指す"
     );
+}
+
+// ---- #2365 の続き: GUI 側（git パネル・「このアプリで開く…」・プレビューのリンク・更新の差し替えと再起動・
+// 動画・ファイルのクリップボード・Web ビューの親） ----
+//
+// 修正前は GUI の UI と GUI の口が日本語の `String` の口（`git::commit` ほか・`os_integration::open_url` /
+// `open_with_dialog` / `open_new_instance`）を直に呼び、tako-app の他モジュール（`video_player`・
+// `webview::detached_parent_error`）と、GUI だけが呼ぶ境界（`platform::file_clipboard::write`・tako-core の
+// `bundle_install::replace_bundle_in_place`）が日本語の固定文で断っていたので、英語表示でも git パネル・
+// 通知欄・CLI / MCP の応答（`tako_video_*` / `web open` / ファイルのコピーの `os_note` / プレビューのリンク /
+// 更新）に日本語が出た。ここでは
+// (1) 新しい型（`VideoRefusal` / `ClipboardWriteError` / `BundleError` + `SwapCause`）の表（全バリアントが
+//     日英・日本語は #2365 より前の固定文とバイト一致）
+// (2) 境界と tako-app の他モジュールの本体の断りの組み立てに日本語の固定文が無いこと
+// (3) GUI の呼び手が日本語の口を呼ばず、断りを `Lang::Ja` / `into_ja` で日本語へ戻していないこと
+//     （診断 = stderr / persist.log へ日本語で残す呼び出しは見ない）
+// を `file:line` で名指す
+
+use tako_control::platform::file_clipboard::ClipboardWriteError;
+use tako_control::VideoRefusal;
+use tako_core::platform::bundle_install::{BundleError, SwapCause};
+
+const FILE_CLIPBOARD_SRC: &str = include_str!("../src/platform/file_clipboard.rs");
+const FILE_CLIPBOARD_PATH: &str = "crates/tako-control/src/platform/file_clipboard.rs";
+const BUNDLE_SRC: &str = include_str!("../../tako-core/src/platform/bundle_install.rs");
+const BUNDLE_PATH: &str = "crates/tako-core/src/platform/bundle_install.rs";
+
+fn video_refusal_index(r: &VideoRefusal) -> usize {
+    match r {
+        VideoRefusal::PathNotUtf8 => 0,
+        VideoRefusal::NulInString => 1,
+        VideoRefusal::ObjcNull { .. } => 2,
+        VideoRefusal::UrlUnbuildable => 3,
+        VideoRefusal::PlayerItemUnbuildable => 4,
+        VideoRefusal::VideoOutputUnbuildable => 5,
+        VideoRefusal::PlayerUnbuildable => 6,
+        VideoRefusal::LoadFailed => 7,
+        VideoRefusal::MacOnly => 8,
+    }
+}
+const VIDEO_REFUSAL_VARIANTS: usize = 9;
+
+fn clipboard_write_index(e: &ClipboardWriteError) -> usize {
+    match e {
+        ClipboardWriteError::NoFiles => 0,
+        ClipboardWriteError::NulInText => 1,
+        ClipboardWriteError::NsStringFailed => 2,
+        ClipboardWriteError::AppKitUnavailable => 3,
+        ClipboardWriteError::PasteboardUnavailable => 4,
+        ClipboardWriteError::NulInPath(_) => 5,
+        ClipboardWriteError::FileUrlFailed(_) => 6,
+        ClipboardWriteError::ItemCreateFailed => 7,
+        ClipboardWriteError::ItemWriteFailed => 8,
+        ClipboardWriteError::WriteFailed => 9,
+        ClipboardWriteError::ClipboardBusy => 10,
+        ClipboardWriteError::GlobalAllocFailed => 11,
+        ClipboardWriteError::GlobalLockFailed => 12,
+        ClipboardWriteError::SetDataFailed(_) => 13,
+        ClipboardWriteError::EmptyFailed(_) => 14,
+        ClipboardWriteError::Unsupported => 15,
+    }
+}
+const CLIPBOARD_WRITE_VARIANTS: usize = 16;
+
+fn bundle_error_index(e: &BundleError) -> usize {
+    match e {
+        BundleError::SourceMissing(_) => 0,
+        BundleError::DestInvalid(_) => 1,
+        BundleError::InstallFailed { .. } => 2,
+        BundleError::SwapFailed { .. } => 3,
+        BundleError::BackupFailed { .. } => 4,
+        BundleError::AsideFailed { .. } => 5,
+        BundleError::PlaceFailed { .. } => 6,
+        BundleError::ParentMissing(_) => 7,
+        BundleError::StagingCreateFailed { .. } => 8,
+        BundleError::DittoSpawn(_) => 9,
+        BundleError::CopyFailed(_) => 10,
+    }
+}
+const BUNDLE_ERROR_VARIANTS: usize = 11;
+
+fn swap_cause_index(c: &SwapCause) -> usize {
+    match c {
+        SwapCause::NulInPath => 0,
+        SwapCause::Os(_) => 1,
+    }
+}
+
+const GUI_EPERM: &str = "Operation not permitted (os error 1)";
+const GUI_APP: &str = "/Applications/tako.app";
+
+/// `video_player` の見本と #2365 より前の文
+fn video_refusal_table() -> Vec<(VideoRefusal, String)> {
+    vec![
+        (VideoRefusal::PathNotUtf8, "パスが UTF-8 でない".into()),
+        (VideoRefusal::NulInString, "CString 変換失敗".into()),
+        (
+            VideoRefusal::ObjcNull {
+                class: "NSString".into(),
+                selector: "stringWithUTF8String:".into(),
+            },
+            "NSString stringWithUTF8String: が null を返した".into(),
+        ),
+        (VideoRefusal::UrlUnbuildable, "URL を生成できない".into()),
+        (
+            VideoRefusal::PlayerItemUnbuildable,
+            "AVPlayerItem を生成できない".into(),
+        ),
+        (
+            VideoRefusal::VideoOutputUnbuildable,
+            "AVPlayerItemVideoOutput を生成できない".into(),
+        ),
+        (
+            VideoRefusal::PlayerUnbuildable,
+            "AVPlayer を生成できない".into(),
+        ),
+        (VideoRefusal::LoadFailed, "動画の読み込みに失敗した".into()),
+        (VideoRefusal::MacOnly, "動画再生は macOS でのみ対応".into()),
+    ]
+}
+
+/// `platform::file_clipboard` の見本と #2365 より前の文（macOS / Windows / その他の実装の固定文）
+fn clipboard_write_table() -> Vec<(ClipboardWriteError, String)> {
+    let path = "/tmp/t2365/a b.txt";
+    let win = "The handle is invalid. (os error 6)";
+    vec![
+        (ClipboardWriteError::NoFiles, "書くファイルが無い".into()),
+        (ClipboardWriteError::NulInText, "NUL を含む文字列".into()),
+        (
+            ClipboardWriteError::NsStringFailed,
+            "NSString を作れない".into(),
+        ),
+        (
+            ClipboardWriteError::AppKitUnavailable,
+            "NSPasteboard が使えない（AppKit を読み込めない）".into(),
+        ),
+        (
+            ClipboardWriteError::PasteboardUnavailable,
+            "ペーストボードを開けない".into(),
+        ),
+        (
+            ClipboardWriteError::NulInPath(path.into()),
+            format!("NUL を含むパス: {path}"),
+        ),
+        (
+            ClipboardWriteError::FileUrlFailed(path.into()),
+            format!("ファイルの URL を作れない: {path}"),
+        ),
+        (
+            ClipboardWriteError::ItemCreateFailed,
+            "ペーストボードの項目を作れない".into(),
+        ),
+        (
+            ClipboardWriteError::ItemWriteFailed,
+            "ペーストボードの項目に書けない".into(),
+        ),
+        (
+            ClipboardWriteError::WriteFailed,
+            "ペーストボードへ書けない".into(),
+        ),
+        (
+            ClipboardWriteError::ClipboardBusy,
+            "クリップボードを開けない（ほかのアプリが使っている）".into(),
+        ),
+        (
+            ClipboardWriteError::GlobalAllocFailed,
+            "GlobalAlloc に失敗".into(),
+        ),
+        (
+            ClipboardWriteError::GlobalLockFailed,
+            "GlobalLock に失敗".into(),
+        ),
+        (
+            ClipboardWriteError::SetDataFailed(win.into()),
+            format!("SetClipboardData に失敗: {win}"),
+        ),
+        (
+            ClipboardWriteError::EmptyFailed(win.into()),
+            format!("クリップボードを空にできない: {win}"),
+        ),
+        (
+            ClipboardWriteError::Unsupported,
+            "この OS ではファイルのクリップボードに未対応（tako の中だけで貼れる）".into(),
+        ),
+    ]
+}
+
+/// `bundle_install` の見本と #2365 より前の文（`<dest>` を見本の値で展開したもの）
+fn bundle_error_table() -> Vec<(BundleError, String)> {
+    let staged = "/tmp/t2365/tako.app";
+    let dest = || GUI_APP.to_string();
+    let e = || GUI_EPERM.to_string();
+    vec![
+        (
+            BundleError::SourceMissing(staged.into()),
+            format!("差し替え元が見つかりません: {staged}"),
+        ),
+        (
+            BundleError::DestInvalid("/".into()),
+            "置き場のパスが不正です: /".into(),
+        ),
+        (
+            BundleError::InstallFailed {
+                dest: dest(),
+                error: e(),
+            },
+            format!("{GUI_APP} への設置に失敗: {GUI_EPERM}（{GUI_APP} は変更していません）"),
+        ),
+        (
+            BundleError::SwapFailed {
+                dest: dest(),
+                cause: SwapCause::Os(e()),
+            },
+            format!("{GUI_APP} の入れ替えに失敗: {GUI_EPERM}（{GUI_APP} は変更していません）"),
+        ),
+        (
+            BundleError::BackupFailed {
+                dest: dest(),
+                error: e(),
+            },
+            format!("{GUI_APP} のバックアップに失敗: {GUI_EPERM}"),
+        ),
+        (
+            BundleError::AsideFailed {
+                dest: dest(),
+                error: e(),
+            },
+            format!("{GUI_APP} の退避に失敗: {GUI_EPERM}（{GUI_APP} は変更していません）"),
+        ),
+        (
+            BundleError::PlaceFailed {
+                dest: dest(),
+                error: e(),
+            },
+            format!("{GUI_APP} への設置に失敗: {GUI_EPERM}"),
+        ),
+        (
+            BundleError::ParentMissing("/".into()),
+            "置き場の親ディレクトリが取れません: /".into(),
+        ),
+        (
+            BundleError::StagingCreateFailed {
+                parent: "/Applications".into(),
+                error: e(),
+            },
+            format!(
+                "作業用ディレクトリの作成に失敗: {GUI_EPERM}（/Applications に書き込めますか）"
+            ),
+        ),
+        (
+            BundleError::DittoSpawn("No such file or directory (os error 2)".into()),
+            "ditto の実行に失敗: No such file or directory (os error 2)".into(),
+        ),
+        (
+            BundleError::CopyFailed("ditto: /tmp/t2365/x: No space left on device".into()),
+            "バンドルの複製に失敗: ditto: /tmp/t2365/x: No space left on device".into(),
+        ),
+    ]
+}
+
+#[test]
+fn gui側の動画とクリップボードと差し替えの断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致(
+) {
+    let mut failures = Vec::new();
+
+    let videos = video_refusal_table();
+    covers_every(
+        &videos.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+        video_refusal_index,
+        VIDEO_REFUSAL_VARIANTS,
+        "VideoRefusal",
+    );
+    for (r, old) in &videos {
+        let debug = format!("{r:?}");
+        let at = |lang| {
+            where_written(
+                HOST_REFUSAL_SRC,
+                HOST_REFUSAL_PATH,
+                "impl VideoRefusal {",
+                &debug,
+                lang,
+            )
+        };
+        let (ja, en) = (r.text_in(Lang::Ja), r.text_in(Lang::En));
+        check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+        // GUI の口は枠を持たずに中身をそのまま載せる（`HostRefusal::VideoOpen`）
+        for lang in [Lang::Ja, Lang::En] {
+            if HostRefusal::VideoOpen(r.clone()).text_in(lang) != r.text_in(lang) {
+                failures.push(format!(
+                    "{HOST_REFUSAL_PATH}: HostRefusal::VideoOpen({debug}) が中身と違う文を返す（{lang:?}）"
+                ));
+            }
+        }
+    }
+
+    let clips = clipboard_write_table();
+    covers_every(
+        &clips.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        clipboard_write_index,
+        CLIPBOARD_WRITE_VARIANTS,
+        "ClipboardWriteError",
+    );
+    for (e, old) in &clips {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                FILE_CLIPBOARD_SRC,
+                FILE_CLIPBOARD_PATH,
+                "impl ClipboardWriteError {",
+                &debug,
+                lang,
+            )
+        };
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+    }
+
+    let bundles = bundle_error_table();
+    covers_every(
+        &bundles.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        bundle_error_index,
+        BUNDLE_ERROR_VARIANTS,
+        "BundleError",
+    );
+    for (e, old) in &bundles {
+        let debug = format!("{e:?}");
+        let at = |lang| where_written(BUNDLE_SRC, BUNDLE_PATH, "impl BundleError {", &debug, lang);
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+    }
+    // 入れ替えの理由: NUL は tako の文（日英）、OS の理由は io のエラーの文をそのまま
+    let causes = [
+        (
+            SwapCause::NulInPath,
+            "パスに NUL が含まれています".to_string(),
+        ),
+        (SwapCause::Os(GUI_EPERM.into()), GUI_EPERM.to_string()),
+    ];
+    covers_every(
+        &causes.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(),
+        swap_cause_index,
+        2,
+        "SwapCause",
+    );
+    for (c, old) in &causes {
+        let debug = format!("{c:?}");
+        let at = |lang| where_written(BUNDLE_SRC, BUNDLE_PATH, "impl SwapCause {", &debug, lang);
+        let (ja, en) = (c.text_in(Lang::Ja), c.text_in(Lang::En));
+        if let SwapCause::Os(error) = c {
+            if ja != *error || en != *error {
+                failures.push(format!(
+                    "{}: {debug}: OS の理由に手を加えている\n  ja: {ja}\n  en: {en}",
+                    at(Lang::En)
+                ));
+            }
+        } else {
+            check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+        }
+    }
+    report_all(failures);
+}
+
+/// 境界と tako-app の他モジュールの本体（断りの組み立てに日本語の固定文を置かない。`None` = 単体テストの
+/// 前までの全体 = macOS / Windows / その他の実装をまとめて見る）
+const GUI_SIDE_BODIES: &[(&str, Option<&str>)] = &[
+    (BUNDLE_PATH, None),
+    (FILE_CLIPBOARD_PATH, None),
+    ("crates/tako-app/src/video_player.rs", None),
+    (
+        "crates/tako-app/src/webview.rs",
+        Some("pub fn detached_parent_error("),
+    ),
+];
+
+#[test]
+fn gui側の境界とtako_appの他モジュールの断りに日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, head) in GUI_SIDE_BODIES {
+        let src = read_repo_file(path);
+        let Some(lines) = front_scope_lines(&src, *head) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{}` が見つからない（改名で番犬が空振りする。GUI_SIDE_BODIES を直す）",
+                head.unwrap_or("（全体）")
+            ));
+            continue;
+        };
+        let mut found = refusal_japanese(&lines);
+        // 断りを返すだけの関数（`detached_parent_error`）は本体の日本語の固定文すべてを見る
+        if head.is_some() {
+            found.extend(front_japanese(&lines));
+        }
+        found.sort();
+        found.dedup();
+        for (line, text) in found {
+            failures.push(format!(
+                "{path}:{line}: 断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （VideoRefusal / ClipboardWriteError / BundleError / HostRefusal へバリアントを足し、\
+                 日英の対を text_in に書く）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// `lines` の中で、`tokens` を断りの組み立てに使っている行（`internal` = 診断の出力の呼び出しの中は見ない。
+/// 呼び出しが行をまたぐときは閉じ括弧まで外す）。`Lang::Ja` / `into_ja` で断りを日本語へ戻す書き戻しを拾う
+fn tokens_outside<'a>(
+    lines: &[(usize, &str)],
+    tokens: &[&'a str],
+    internal: &[&str],
+) -> Vec<(usize, &'a str, String)> {
+    let mut out = Vec::new();
+    let mut internal_depth = 0i32;
+    for (line, code) in lines {
+        let code_part = code.split("//").next().unwrap_or("");
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        let first_internal = internal.iter().filter_map(|m| code_part.find(m)).min();
+        if internal_depth == 0 {
+            if let Some(from) = first_internal {
+                let tail = &code_part[from..];
+                internal_depth =
+                    (tail.matches('(').count() as i32 - tail.matches(')').count() as i32).max(0);
+                continue;
+            }
+        } else {
+            internal_depth +=
+                code_part.matches('(').count() as i32 - code_part.matches(')').count() as i32;
+            internal_depth = internal_depth.max(0);
+            continue;
+        }
+        if let Some(token) = tokens.iter().find(|t| code_part.contains(*t)) {
+            out.push((*line, *token, code.trim().to_string()));
+        }
+    }
+    out
+}
+
+/// 断りを日本語へ戻す書き方
+const JA_WRITEBACK: [&str; 2] = ["Lang::Ja", "into_ja"];
+
+/// GUI の git パネルが呼んではならない日本語の口（`String` を返す従来の口）
+const JA_GIT_PANEL_CALLS: [&str; 12] = [
+    "git::stage(",
+    "git::unstage(",
+    "git::commit(",
+    "git::pull(",
+    "git::push(",
+    "git::validate_branch_name(",
+    "git::checkout_preview(",
+    "git::checkout(",
+    "git::create_branch(",
+    "git::merge_preview(",
+    "git::merge(",
+    "git::abort_operation(",
+];
+
+/// GUI の呼び手（path, 関数の頭 = `None` は単体テストの前までの全体, 呼んではならない日本語の口）
+type GuiCallerScope = (&'static str, Option<&'static str>, &'static [&'static str]);
+
+const GUI_CALLER_SCOPES: &[GuiCallerScope] = &[
+    (
+        "crates/tako-app/src/right_panel.rs",
+        None,
+        &JA_GIT_PANEL_CALLS,
+    ),
+    (
+        "crates/tako-app/src/sidebar.rs",
+        Some("fn pick_app_and_open("),
+        &["open_with_dialog("],
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        Some("    fn follow_preview_md_link("),
+        &["os_integration::open_url("],
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        Some("    fn follow_preview_pdf_link("),
+        &["os_integration::open_url("],
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        Some("    fn os_file_clipboard_write("),
+        &[],
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        Some("    fn ensure_video_player_typed("),
+        &[],
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        Some("    fn start_video_player("),
+        &[],
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        Some("    fn create_webview("),
+        &[],
+    ),
+    (
+        "crates/tako-app/src/main.rs",
+        Some("    fn take_webview_build_job("),
+        &[],
+    ),
+    (
+        "crates/tako-app/src/webview.rs",
+        Some("    fn build_view("),
+        &[],
+    ),
+    (
+        "crates/tako-app/src/webview.rs",
+        Some("    pub fn focus("),
+        &[],
+    ),
+    (
+        "crates/tako-app/src/update_checker.rs",
+        Some("fn update_via_zip("),
+        &[],
+    ),
+    (
+        "crates/tako-app/src/update_checker.rs",
+        Some("pub fn restart_app("),
+        &["open_new_instance("],
+    ),
+];
+
+#[test]
+fn gui側の呼び手は日本語の口を呼ばず断りを日本語へ戻さない() {
+    let mut failures = Vec::new();
+    for (path, head, calls) in GUI_CALLER_SCOPES {
+        let src = read_repo_file(path);
+        let lines = match head {
+            None => front_scope_lines(&src, None),
+            Some(head) => item_lines(&src, head),
+        };
+        let Some(lines) = lines else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{}` が見つからない（改名で番犬が空振りする。GUI_CALLER_SCOPES を直す）",
+                head.unwrap_or("（全体）")
+            ));
+            continue;
+        };
+        for (line, call, code) in ja_inner_calls(&lines, calls) {
+            failures.push(format!(
+                "{path}:{line}: GUI が日本語の口 `{call}` を呼んでいる = 英語表示でも断りが日本語で出る \
+                 （型の口 *_typed を呼ぶ）: {code}"
+            ));
+        }
+        for (line, token, code) in tokens_outside(&lines, &JA_WRITEBACK, &HOST_INTERNAL_CALLS) {
+            failures.push(format!(
+                "{path}:{line}: GUI が断りを `{token}` で日本語へ戻している = 英語表示でも日本語で出る \
+                 （診断の出力の中だけ日本語にしてよい）: {code}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 書き戻しは診断の出力の外だけを名指し（行をまたぐ `eprintln!` の中は見逃す）、
+/// 日本語の口は `*_typed` を見逃す
+#[test]
+fn gui側の呼び手の番犬の境界() {
+    let src = [
+        (
+            1,
+            "        let out = tako_core::git::commit_typed(repo, &m, all);",
+        ),
+        (
+            2,
+            "        let out = tako_core::git::commit(repo, &m, all);",
+        ),
+        (3, "        eprintln!("),
+        (4, "            \"失敗: {}\","),
+        (5, "            e.text_in(tako_core::i18n::Lang::Ja)"),
+        (6, "        );"),
+        (7, "        webview_parent_diag(&reason.text_in(Lang::Ja));"),
+        (8, "        return Err(reason.text_in(Lang::Ja));"),
+        (9, "        // コメントの Lang::Ja は見ない"),
+    ];
+    let calls: Vec<usize> = ja_inner_calls(&src, &JA_GIT_PANEL_CALLS)
+        .into_iter()
+        .map(|(l, _, _)| l)
+        .collect();
+    assert_eq!(calls, vec![2], "日本語の口だけを名指し、型の口は見逃す");
+    let writebacks: Vec<usize> = tokens_outside(&src, &JA_WRITEBACK, &HOST_INTERNAL_CALLS)
+        .into_iter()
+        .map(|(l, _, _)| l)
+        .collect();
+    assert_eq!(writebacks, vec![8], "診断の出力の外の書き戻しだけを名指す");
 }
