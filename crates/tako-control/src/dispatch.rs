@@ -15230,11 +15230,14 @@ pub fn dispatch_orchestrator_projects(
         }
         "remove" => {
             let key = key.ok_or_else(|| Reason::Missing("key".into()).invalid())?;
-            let removed = orchestrator::ProjectsConfig::mutate_typed(|config| config.remove(&key))
-                .map_err(ConfigError::operation)?;
-            if !removed {
-                return Err(Reason::ProjectNotFound(key).operation());
-            }
+            // 無いキーは断って書き戻さない（projects.yaml を作らない・手で書いた形を変えない。#2569）
+            orchestrator::ProjectsConfig::try_mutate_typed(|config| {
+                config
+                    .remove(&key)
+                    .then_some(())
+                    .ok_or_else(|| Reason::ProjectNotFound(key.clone()).operation())
+            })
+            .map_err(ConfigError::operation)??;
             Ok(json!({ "removed": key }))
         }
         _ => Err(Reason::InvalidValue {
@@ -15283,9 +15286,13 @@ pub fn dispatch_orchestrator_projects_mcp(
     let config = if action == "mcp" || !would_change {
         loaded
     } else {
-        // ロック付き read-modify-write（#169: 並行の変更を消さない）。無いキーは書かない
-        orchestrator::ProjectsConfig::mutate_typed(|config| {
-            let entry = config.projects.get_mut(&key)?;
+        // ロック付き read-modify-write（#169: 並行の変更を消さない）。無いキーは断って書き戻さない
+        // （上の下見の後に消えた場合。#2569）
+        orchestrator::ProjectsConfig::try_mutate_typed(|config| {
+            let entry = config
+                .projects
+                .get_mut(&key)
+                .ok_or_else(|| Reason::ProjectNotFound(key.clone()).operation())?;
             for name in &servers {
                 let present = entry.mcp_servers.iter().any(|s| s == name);
                 if adding && !present {
@@ -15297,10 +15304,9 @@ pub fn dispatch_orchestrator_projects_mcp(
                 }
             }
             entry.mcp_servers.sort();
-            Some(config.clone())
+            Ok(config.clone())
         })
-        .map_err(ConfigError::operation)?
-        .ok_or_else(|| Reason::ProjectNotFound(key.clone()).operation())?
+        .map_err(ConfigError::operation)??
     };
     let cwd = config
         .list_resolved()
@@ -17193,15 +17199,16 @@ pub fn dispatch_orchestrator_accounts(
         }
         "remove" => {
             let name = name.ok_or_else(|| Reason::Missing("name".into()).invalid())?;
-            let removed = orchestrator::AccountsConfig::mutate_typed(|config| {
-                config.accounts.remove(name).is_some()
+            // 無い名前は断って書き戻さない（accounts.yaml を作らない・手で書いた形を変えない。#2569）
+            orchestrator::AccountsConfig::try_mutate_typed(|config| {
+                config
+                    .accounts
+                    .remove(name)
+                    .map(|_| ())
+                    .ok_or_else(|| Reason::AccountNotRegistered(name.to_string()).operation())
             })
-            .map_err(ConfigError::operation)?;
-            if removed {
-                Ok(json!({ "removed": name }))
-            } else {
-                Err(Reason::AccountNotRegistered(name.to_string()).operation())
-            }
+            .map_err(ConfigError::operation)??;
+            Ok(json!({ "removed": name }))
         }
         other => Err(Reason::InvalidValue {
             key: "action",

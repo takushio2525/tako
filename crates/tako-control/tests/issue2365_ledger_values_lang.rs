@@ -444,9 +444,9 @@ fn expand_old(old: &str, dir: &Path) -> String {
 
 /// 断られたあとも何も書いていない（台帳・プロファイル・引き継ぎファイル）。
 ///
-/// 例外は空の置き場の台帳: 無いエントリへの record / amend は、`Ledger::mutate` が閉包の断りでも
-/// 読んだ台帳を書き戻すので 0 件の ledger.yaml ができる（#2365 より前から同じ = この PR の範囲外。
-/// 中身が 0 件であることだけを見る）
+/// 空の置き場の台帳も例外にしない: 無いエントリへの record / amend は断って台帳を書き戻さない
+/// = ledger.yaml を作らない（#2569。以前は `Ledger::mutate` が閉包の断りでも書き戻し、0 件の
+/// ledger.yaml ができていた）
 fn nothing_written(dirs: &[(PathBuf, Dir)]) -> Vec<String> {
     let mut out = Vec::new();
     for (dir, kind) in dirs {
@@ -457,17 +457,6 @@ fn nothing_written(dirs: &[(PathBuf, Dir)]) -> Vec<String> {
                 (Dir::Broken, "profiles/default.yaml") => Some(BROKEN_PROFILE),
                 (Dir::Blocked, "handoff") => Some("not a folder\n"),
                 (Dir::Unreadable, "ledger.yaml") => continue,
-                (Dir::Ok, "ledger.yaml") if path.exists() => {
-                    let entries = tako_control::orchestrator::ledger::Ledger::load_from(&path)
-                        .map(|l| l.entries.len());
-                    if entries != Ok(0) {
-                        out.push(format!(
-                            "断ったのに台帳へ書いた（{entries:?}）: {}",
-                            path.display()
-                        ));
-                    }
-                    continue;
-                }
                 _ => None,
             };
             match expected {

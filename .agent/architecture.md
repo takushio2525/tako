@@ -1532,6 +1532,12 @@ lid-guard.json が使う）:
 - **fail-loud**: パースに失敗した既存ファイルへの mutate は f を呼ばず一切書き込まず
   Err。「default / 0 件に丸めて上書き」を全経路から排除
   （dispatch の profiles set にあった `unwrap_or_default()` 握りつぶしも修正）
+- **断った操作は書き戻さない**（#2569）: `mutate` は閉包の値によらず書き戻すので、断る閉包
+  （無いエントリへの台帳の record / amend・無いキーの projects remove / mcp・無い名前の accounts remove）は
+  `try_mutate_typed`（閉包が `Err` なら書き戻さない）を通す。書き戻すと無いファイルを 0 件で作り、
+  手で書いた形（コメント）を tako の形へ書き直し、世代バックアップを 1 つ回す。台帳 / projects.yaml /
+  accounts.yaml の 3 つにあり、`mutate` は `try_mutate` の上に載る（読み書きの本体は 1 つ）。
+  断る閉包を `mutate` 系へ渡すと番犬 `issue2569_refusal_writeback` が file:line で落とす
 - **世代バックアップ**: 内容が変わる書き込みの直前に `.bak.1`〜`.bak.3` を
   ローテーション（本体 → .bak.1 は copy。rename だと本体不在の瞬間が生まれるため）。
   内容不変の save は書き込みもバックアップ回転もしない
