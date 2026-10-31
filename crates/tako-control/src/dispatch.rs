@@ -12304,9 +12304,10 @@ fn dispatch_inner(
             action,
             report,
             pane,
+            ancestry,
             ui,
             dry_run,
-        } => crate::claude_mod::run(host, action.as_deref(), report, pane, ui, dry_run),
+        } => crate::claude_mod::run(host, action.as_deref(), report, pane, ancestry, ui, dry_run),
 
         Request::Lang { action, value } => {
             use tako_core::i18n::{self, LangSetting};
@@ -55981,6 +55982,7 @@ mod tests {
             action: Some(action.into()),
             report,
             pane,
+            ancestry: None,
             ui: None,
             dry_run: false,
         }
@@ -56005,6 +56007,7 @@ mod tests {
                 action: None,
                 report: None,
                 pane: None,
+                ancestry: None,
                 ui: None,
                 dry_run: false,
             },
@@ -56027,6 +56030,76 @@ mod tests {
         .unwrap();
         assert_eq!(out["accepted"], "ended");
         assert!(host.claude_mod.reports.is_empty());
+    }
+
+    /// #2559: GUI がペインの外で起こした claude（祖先に GUI がいて、その直下の子がどのペインの pty の
+    /// 子でもない）の報告はそのペインに記録しない。主の報告はそのまま残り、補助の `ended` でも消えない。
+    /// 祖先を送らない CLI（古い CLI・Windows）と GUI を通らない祖先（器のペイン）は従来どおり受け付ける
+    #[test]
+    fn issue2559_ペインの外のclaudeの報告はそのペインに記録しない() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        let gui = std::process::id();
+        let report = |body: Value, ancestry: Option<Vec<u32>>| Request::Mod {
+            action: Some("report".into()),
+            report: Some(body),
+            pane: Some(pane),
+            ancestry,
+            ui: None,
+            dry_run: false,
+        };
+        // 主のセッション（器のペイン = 器のサーバーは launchd の子で、祖先に GUI がいない）
+        let mut main = mod_report_body("idle");
+        main["session_id"] = json!("main");
+        let out = dispatch(
+            &mut host,
+            report(main, Some(vec![900_002, 900_001, 1])),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["accepted"], "stored");
+        // 自動命名の子: CLI → claude → GUI（GUI の直下の子 900_010 はペインの pty の子ではない）
+        let mut helper = mod_report_body("busy");
+        helper["session_id"] = json!("autorename");
+        helper["model"] = json!("claude-haiku-4-5-20251001");
+        let helper_chain = vec![900_011, 900_010, gui, 1];
+        let out = dispatch(
+            &mut host,
+            report(helper.clone(), Some(helper_chain.clone())),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["accepted"], "foreign", "{out}");
+        assert_eq!(out["pane"], pane);
+        let kept = &host.claude_mod.reports[&pane].report;
+        assert_eq!(kept.session_id.as_deref(), Some("main"));
+        assert_eq!(kept.turn.as_str(), "idle");
+        let mut ended = helper.clone();
+        ended["ended"] = json!(true);
+        let out = dispatch(
+            &mut host,
+            report(ended, Some(helper_chain)),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(out["accepted"], "foreign");
+        assert!(
+            host.claude_mod.reports.contains_key(&pane),
+            "補助の ended で主の報告が消えた"
+        );
+        // `tako mod` の行に捨てた回数が出て、報告は主のまま
+        let status = dispatch(
+            &mut host,
+            mod_request("status", None, None),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let row = &status["panes"][0];
+        assert_eq!(row["foreign_reports"]["count"], 2, "{status}");
+        assert_eq!(row["report"]["session_id"], "main");
+        // 祖先を送らない CLI は従来どおり受け付ける
+        let out = dispatch(&mut host, report(helper, None), PaneOrigin::Cli).unwrap();
+        assert_eq!(out["accepted"], "stored");
     }
 
     /// #1881: 報告の応答に帯・サイドバーの材料（view）が載る。worker は右パネル orch と同じ
@@ -56174,6 +56247,7 @@ mod tests {
             action: Some("ui".into()),
             report: None,
             pane: None,
+            ancestry: None,
             ui: Some(serde_json::from_value(ui).unwrap()),
             dry_run: false,
         }
@@ -56564,6 +56638,7 @@ mod tests {
             action: Some(action.into()),
             report: None,
             pane: None,
+            ancestry: None,
             ui: None,
             dry_run,
         };

@@ -9374,6 +9374,23 @@ fn lsp_server_local(request: &Request) -> Result<Value, String> {
     .map_err(local_dispatch_err)
 }
 
+/// `tako mod report` の送り主の祖先（#2559。自分自身から上へ近い順の pid）。GUI はこれで、ペインの外で
+/// 起こした claude（自動命名の `claude -p` が GUI の env の `TAKO_PANE_ID` を受け継いだ等）の報告を
+/// そのペインに記録しない。**unix だけ**: Windows は器（psmux）のサーバーと GUI の親子を実機で
+/// 確かめていないので材料を送らない（= GUI は従来どおり受け付ける。自動命名の子の env は送る側で外す）
+fn report_ancestry() -> Option<Vec<u32>> {
+    if !cfg!(unix) {
+        return None;
+    }
+    let me = std::process::id();
+    let mut chain = vec![me];
+    chain.extend(tako_core::platform::procinfo::ancestor_pids(
+        me,
+        tako_core::claude_mod::REPORT_ANCESTRY_DEPTH,
+    ));
+    Some(chain)
+}
+
 /// `tako mod report` の stdin（mod が組んだ報告の JSON。#1879）
 fn read_mod_report() -> Result<Value, String> {
     use std::io::Read;
@@ -10548,11 +10565,13 @@ fn build_request(command: &Command) -> Result<Request, String> {
         Command::Autorename(args) => Request::AutoRename {
             enabled: args.state.as_deref().map(|s| s == "on"),
         },
-        // #1879: mod からの報告。stdin の JSON をそのまま渡し、送り主は TAKO_PANE_ID
+        // #1879: mod からの報告。stdin の JSON をそのまま渡し、送り主は TAKO_PANE_ID。
+        // #2559: 自分の祖先も添える（GUI がペインの外で起こした claude の報告を見分ける）
         Command::Mod(args) if args.action.as_deref() == Some("report") => Request::Mod {
             action: Some("report".into()),
             report: Some(read_mod_report()?),
             pane: caller_pane(),
+            ancestry: report_ancestry(),
             ui: None,
             dry_run: false,
         },
@@ -10570,6 +10589,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             ),
             report: None,
             pane: None,
+            ancestry: None,
             ui: None,
             dry_run: false,
         },
@@ -10588,6 +10608,7 @@ fn build_request(command: &Command) -> Result<Request, String> {
             action: args.action.clone(),
             report: None,
             pane: None,
+            ancestry: None,
             ui: None,
             dry_run: false,
         },

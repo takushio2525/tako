@@ -2892,6 +2892,7 @@ mod tests {
                 action: Some("install".into()),
                 report: None,
                 pane: None,
+                ancestry: None,
                 ui: None,
                 dry_run: true,
             }
@@ -2902,6 +2903,7 @@ mod tests {
                 action: Some("uninstall".into()),
                 report: None,
                 pane: None,
+                ancestry: None,
                 ui: None,
                 dry_run: false,
             }

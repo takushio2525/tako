@@ -113,6 +113,33 @@ pub const CARD_CLICK_LEGACY_ENV: &str = "TAKO_2159_LEGACY";
 /// チャット風の描画を mod でする前（S7-6 #1964）へ戻す A/B の入口。応答の `view` に `chat` を載せない
 /// （mod はチャットを描かない）・GUI モードのチャット表示は mod の報告を見ずに GPUI のチャットビューのまま
 pub const CHAT_LEGACY_ENV: &str = "TAKO_1964_LEGACY";
+/// ペインの外の claude の報告をペインへ記録しない前（#2559）へ戻す A/B の入口。自動命名の `claude -p` へ
+/// GUI の env をそのまま渡し（[`helper_env`] を当てない）、報告の送り主の居場所（[`report_origin`]）を見ない
+pub const HELPER_LEGACY_ENV: &str = "TAKO_2559_LEGACY";
+/// GUI がペインの外で起こす claude（自動命名の `claude -p`）へ渡さない env（#2559。[`helper_env`]）。
+///
+/// ペインの識別・mod の起床条件（`register.ts` の `wake` が見る `TAKO_PANE_ID` と [`CLI_ENV`]）・
+/// 呼び出し元の claude のセッションの印（子セッション扱い・呼び出し元の会話の連絡口）。
+/// [`PLUGIN_DIRS_ENV`] は利用者自身の分を残すので別に扱う
+pub const HELPER_DROP_ENV: &[&str] = &[
+    "TAKO_PANE_ID",
+    "TAKO_TAB_ID",
+    "TAKO_ORCHESTRATOR_ROLE",
+    CLI_ENV,
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_PID",
+];
+/// `tako mod report` の CLI が送る自分の祖先の段数（#2559。[`report_origin`] の材料）。
+/// claude の中のシェル・入れ子の claude を挟んでも GUI か launchd に届く深さ
+pub const REPORT_ANCESTRY_DEPTH: usize = 16;
 
 /// env の一覧の区切り（PATH と同じ。macOS / Linux は `:`、Windows は `;`）
 pub const LIST_SEP: char = if cfg!(windows) { ';' } else { ':' };
@@ -561,6 +588,78 @@ pub fn session_legacy() -> bool {
 /// #1891 の A/B（[`NO_REPORT_LEGACY_ENV`]）が立っているか
 pub fn no_report_legacy() -> bool {
     std::env::var_os(NO_REPORT_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// #2559 の A/B（[`HELPER_LEGACY_ENV`]）が立っているか
+pub fn helper_legacy() -> bool {
+    std::env::var_os(HELPER_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// GUI がペインの外で起こす claude（自動命名の `claude -p`）の env の差分（#2559）。`None` は外す。
+///
+/// GUI をペインの中から起こし直すと（master の install + 再起動）、GUI 自身の env にそのペインの
+/// 識別・mod の注入・呼び出し元の claude のセッションの印が残り、子の claude が受け継ぐ。mod は注入の
+/// env が無くても設定 dir の `skills/tako`（#1959）から読まれ、`TAKO_PANE_ID` と [`CLI_ENV`] が
+/// そろうと起きて、受け継いだペインの報告として送っていた（master の `mod_turn` / `session_id` /
+/// `rate_limits` が haiku の 1 ターンで上書きされ、終わりの `ended` でそのペインの報告が消えた）。
+/// [`HELPER_DROP_ENV`] を外し、[`PLUGIN_DIRS_ENV`] は tako の mod の置き場だけを抜く
+/// （利用者自身の分は残す = [`pane_env`] と同じ規則。tako の分が無ければ触らない）
+pub fn helper_env(
+    inherited_plugin_dirs: Option<&str>,
+    sep: char,
+) -> Vec<(&'static str, Option<String>)> {
+    let mut out: Vec<(&'static str, Option<String>)> =
+        HELPER_DROP_ENV.iter().map(|key| (*key, None)).collect();
+    if inherited_plugin_dirs.is_some_and(|v| v.split(sep).any(is_tako_mod_entry)) {
+        let user = user_entries(inherited_plugin_dirs, sep);
+        out.push((
+            PLUGIN_DIRS_ENV,
+            (!user.is_empty()).then(|| user.join(&sep.to_string())),
+        ));
+    }
+    out
+}
+
+/// mod の報告の送り主がどこで動いているか（#2559。[`report_origin`] が決める）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportOrigin {
+    /// 決めない = 今までどおり受け付ける（祖先を送らない CLI・GUI を通らない祖先 = 器のペインや
+    /// tako の外・pty の直下の子の pid が分からないペインがある）
+    Unknown,
+    /// GUI の直下の子がペインの pty の直下の子 = 直結のペインの中
+    InPane,
+    /// GUI の直下の子がどのペインの pty の直下の子でもない = GUI がペインの外で起こした補助
+    /// （自動命名の `claude -p` 等）の子孫。`child` はその GUI の直下の子の pid
+    HostHelper { child: u32 },
+}
+
+/// mod の報告の送り主がペインの中か、GUI がペインの外で起こした補助の子孫かを決める（#2559）。
+///
+/// - `chain`: 送り主（`tako mod report` の CLI）自身から上へ近い順の pid（CLI が送る）
+/// - `host`: 報告を受ける GUI の pid
+/// - `pane_children`: 全ペインの pty の直下の子（シェル / 器のクライアント）の pid。1 つでも分からない
+///   ペインがあれば `None`
+///
+/// **捨てる側へ倒すのは「祖先に GUI がいて、その直下の子がどのペインの pty の子でもない」ときだけ**。
+/// 器（tmux）のペインの claude は器のサーバー（daemon 化して親は launchd）の下にいて GUI を通らない
+/// ので [`ReportOrigin::Unknown`]（= 受け付ける）。同じペインで主のセッションが入れ替わった・入れ子の
+/// claude を起こした場合もペインの中なので受け付ける（主のセッションの報告を捨てる誤りを作らない）
+pub fn report_origin(chain: &[u32], host: u32, pane_children: Option<&[u32]>) -> ReportOrigin {
+    let Some(at) = chain.iter().position(|&pid| pid == host) else {
+        return ReportOrigin::Unknown;
+    };
+    // 送り主が GUI 自身（at == 0）= 補助の子孫ではない
+    let Some(child) = at.checked_sub(1).map(|i| chain[i]) else {
+        return ReportOrigin::Unknown;
+    };
+    let Some(children) = pane_children else {
+        return ReportOrigin::Unknown;
+    };
+    if children.contains(&child) {
+        ReportOrigin::InPane
+    } else {
+        ReportOrigin::HostHelper { child }
+    }
 }
 
 /// 一覧の 1 項目が tako の mod の置き場か（どのインスタンスの data dir でも）。
@@ -1467,6 +1566,15 @@ pub struct ModHub {
     /// GUI の定期処理が汲み出し、鍵の解決と `<data_dir>/usage/` への追記は背景で行う
     /// （UI スレッドでファイルを読み書きしない）。上限は [`crate::usage::MAX_PENDING`]
     pub pending_usage: Vec<crate::usage::PendingUsage>,
+    /// ペインの外の claude の報告を捨てた記録（#2559。ペイン → 回数と最後の時刻）。`tako mod` の行に出す
+    pub foreign: HashMap<u64, ForeignReports>,
+}
+
+/// ペインの外の claude（[`ReportOrigin::HostHelper`]）の報告を捨てた記録（#2559）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForeignReports {
+    pub count: u64,
+    pub last: Instant,
 }
 
 /// [`ModHub::accept`] の結果
@@ -1477,6 +1585,8 @@ pub enum Accepted {
     Ended,
     /// `dormant` を受けた（mod は休眠に入り、これを最後に報告を止める。#1959）
     Dormant,
+    /// ペインの外の claude の報告なので、そのペインには記録しなかった（#2559。[`ModHub::reject_foreign`]）
+    Foreign,
 }
 
 impl Accepted {
@@ -1485,6 +1595,7 @@ impl Accepted {
             Accepted::Stored => "stored",
             Accepted::Ended => "ended",
             Accepted::Dormant => "dormant",
+            Accepted::Foreign => "foreign",
         }
     }
 }
@@ -1515,6 +1626,18 @@ impl ModHub {
                 off: injection.off_reason().cloned(),
             },
         );
+    }
+
+    /// ペインの外の claude（[`ReportOrigin::HostHelper`]）の報告を、そのペインのものとして記録せずに
+    /// 捨てる（#2559）。報告・休眠・設定 dir・使用量の材料のどれにも触れず、捨てた回数だけを残す
+    pub fn reject_foreign(&mut self, pane: u64, now: Instant) -> Accepted {
+        let entry = self.foreign.entry(pane).or_insert(ForeignReports {
+            count: 0,
+            last: now,
+        });
+        entry.count += 1;
+        entry.last = now;
+        Accepted::Foreign
     }
 
     /// 報告を受け取る。`ended` ならそのペインの報告を捨てる
@@ -1629,6 +1752,7 @@ impl ModHub {
         self.injections.remove(&pane);
         self.reports.remove(&pane);
         self.dormant.remove(&pane);
+        self.foreign.remove(&pane);
     }
 
     /// まだ置きに行っていない、報告で見えた設定 dir を取り出す（#1959）
@@ -4815,5 +4939,96 @@ mod tests {
             env_has_injection(&env(&[("PATH", "/bin"), (PLUGIN_DIRS_ENV, &ours)]), None),
             None
         );
+    }
+
+    /// #2559: 自動命名の `claude -p` へ渡さない env。mod の起床条件（`TAKO_PANE_ID` と `TAKO_CLI`）と
+    /// ペインの識別・claude のセッションの印は外し、plugin dir は tako の分だけを抜く
+    #[test]
+    fn issue2559_補助のclaudeへペインの識別とmodの起床条件を渡さない() {
+        let env = helper_env(None, ':');
+        for key in [
+            "TAKO_PANE_ID",
+            "TAKO_TAB_ID",
+            CLI_ENV,
+            "CLAUDE_CODE_SESSION_ID",
+        ] {
+            assert!(env.contains(&(key, None)), "{key} を外していない: {env:?}");
+        }
+        // plugin dir を継承していない / 利用者自身の分だけなら触らない
+        assert!(!env.iter().any(|(k, _)| *k == PLUGIN_DIRS_ENV));
+        assert!(!helper_env(Some("/mine"), ':')
+            .iter()
+            .any(|(k, _)| *k == PLUGIN_DIRS_ENV));
+        // tako の分が混ざっていればそれだけ抜く（利用者自身の分は残す・tako の分だけなら外す）
+        assert!(helper_env(Some("/p/claude-mod/tako:/mine"), ':')
+            .contains(&(PLUGIN_DIRS_ENV, Some("/mine".into()))));
+        assert!(helper_env(Some("/p/claude-mod/tako"), ':').contains(&(PLUGIN_DIRS_ENV, None)));
+        assert!(helper_env(Some(r"C:\p\claude-mod\tako;D:\mine"), ';')
+            .contains(&(PLUGIN_DIRS_ENV, Some(r"D:\mine".into()))));
+    }
+
+    /// #2559: 送り主の居場所。捨てる側（HostHelper）へ倒すのは「祖先に GUI がいて、その直下の子が
+    /// どのペインの pty の子でもない」ときだけ。決められないときはすべて受け付ける側（Unknown）
+    #[test]
+    fn issue2559_送り主の居場所はguiの直下の子で決める() {
+        const GUI: u32 = 100;
+        let panes = [200, 300];
+        // 自動命名の子: CLI(11) → claude(10) → GUI
+        assert_eq!(
+            report_origin(&[11, 10, GUI, 1], GUI, Some(&panes)),
+            ReportOrigin::HostHelper { child: 10 }
+        );
+        // 直結のペインの主のセッション: CLI → claude → シェル(200) → GUI
+        assert_eq!(
+            report_origin(&[21, 20, 200, GUI, 1], GUI, Some(&panes)),
+            ReportOrigin::InPane
+        );
+        // 同じペインで主のセッションが入れ子の claude を起こした / 入れ替わった（ペインの中のまま）
+        assert_eq!(
+            report_origin(&[31, 30, 29, 28, 300, GUI, 1], GUI, Some(&panes)),
+            ReportOrigin::InPane
+        );
+        // 器のペイン: 器のサーバーは daemon 化して親は launchd = GUI を通らない
+        assert_eq!(
+            report_origin(&[41, 40, 39, 38, 1], GUI, Some(&panes)),
+            ReportOrigin::Unknown
+        );
+        // 祖先を送らない CLI（空）・送り主が GUI 自身・pty の子が分からないペインがある
+        assert_eq!(report_origin(&[], GUI, Some(&panes)), ReportOrigin::Unknown);
+        assert_eq!(
+            report_origin(&[GUI, 1], GUI, Some(&panes)),
+            ReportOrigin::Unknown
+        );
+        assert_eq!(
+            report_origin(&[11, 10, GUI, 1], GUI, None),
+            ReportOrigin::Unknown
+        );
+    }
+
+    /// #2559: ペインの外の報告を捨てても、そのペインの主の報告・休眠・設定 dir・使用量の材料は動かない
+    #[test]
+    fn issue2559_捨てた報告はペインの記録に触れない() {
+        let t0 = Instant::now();
+        let mut hub = ModHub::new(true);
+        let main = report_with(
+            Some("/cfg/main"),
+            vec![limit("seven_day", 35.0, "2026-11-06T00:00:00.000Z", 1)],
+        );
+        assert_eq!(hub.accept(7, main.clone(), t0), Accepted::Stored);
+        let pending = hub.pending_usage.len();
+        let dirs = hub.reported_config_dirs.clone();
+        for _ in 0..3 {
+            assert_eq!(hub.reject_foreign(7, t0), Accepted::Foreign);
+        }
+        let stored = hub.fresh_report(7, t0).expect("主の報告が残る");
+        assert_eq!(stored.session_id, main.session_id);
+        assert_eq!(stored.rate_limits, main.rate_limits);
+        assert_eq!(hub.pending_usage.len(), pending);
+        assert_eq!(hub.reported_config_dirs, dirs);
+        assert!(hub.dormant.is_empty());
+        assert_eq!(hub.foreign[&7].count, 3);
+        // ペインを閉じたら捨てた記録も消える（ID の再利用で前任の記録を出さない）
+        hub.forget_pane(7);
+        assert!(!hub.foreign.contains_key(&7));
     }
 }

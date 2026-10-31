@@ -127,7 +127,7 @@ fn run_case(dir: &std::path::Path, name: &str, action: &str, hub: Option<ModHub>
         hub,
         ui_path: sub.join("ui.json"),
     };
-    match tako_control::claude_mod::run(&mut host, Some(action), None, None, None, false) {
+    match tako_control::claude_mod::run(&mut host, Some(action), None, None, None, None, false) {
         Ok(v) => v.to_string(),
         Err(e) => e.to_string(),
     }
