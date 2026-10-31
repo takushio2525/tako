@@ -90,6 +90,42 @@ pub const TYPE_COMMAND: &str = "type";
 /// 長い本文は範囲編集（`tako edit replace-range` / `tako_preview_edit_range`）で 1 回に入れる
 pub const TYPE_MAX_CHARS: usize = 1000;
 
+/// `type` の中身を打鍵に並べられない理由（#2365）。日英の対は [`TypeRefusal::text_in`] の網羅 match の
+/// 1 か所で、日本語は #2365 より前の固定文とバイト一致
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeRefusal {
+    /// 打つ文字が空
+    Empty,
+    /// 上限（[`TYPE_MAX_CHARS`]）を超える（中身は指定された文字数）
+    TooLong(usize),
+}
+
+impl TypeRefusal {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Empty, Ja) => format!("command={TYPE_COMMAND} には打つ文字（text）が要る"),
+            (Self::Empty, En) => format!("command={TYPE_COMMAND} needs the text to type"),
+            (Self::TooLong(len), Ja) => format!(
+                "command={TYPE_COMMAND} は 1 回 {TYPE_MAX_CHARS} 文字まで（{len} 文字）。\
+                 長い本文は tako edit replace-range（MCP は tako_preview_edit_range）で入れる"
+            ),
+            (Self::TooLong(len), En) => format!(
+                "command={TYPE_COMMAND} takes up to {TYPE_MAX_CHARS} characters at a time \
+                 ({len} characters); put long text in with tako edit replace-range \
+                 (MCP: tako_preview_edit_range)"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for TypeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
 impl EditorCommand {
     /// CLI / MCP の綴りから引く（`indent` / `outdent` / `newline` / `line-<行操作>`）
     pub fn from_edit_name(name: &str) -> Option<Self> {
@@ -116,17 +152,13 @@ impl EditorCommand {
 
     /// `type` の中身（#1759）: `text` を 1 文字ずつの打鍵に並べる。空と上限超えは断る
     /// （1 文字ずつ GUI の打鍵と同じ口を通るので、括弧の自動閉じと飛び越しが効く）
-    pub fn typed(text: &str) -> Result<Vec<Self>, String> {
+    pub fn typed(text: &str) -> Result<Vec<Self>, TypeRefusal> {
         let commands: Vec<Self> = text.chars().map(Self::Type).collect();
         if commands.is_empty() {
-            return Err(format!("command={TYPE_COMMAND} には打つ文字（text）が要る"));
+            return Err(TypeRefusal::Empty);
         }
         if commands.len() > TYPE_MAX_CHARS {
-            return Err(format!(
-                "command={TYPE_COMMAND} は 1 回 {TYPE_MAX_CHARS} 文字まで（{} 文字）。\
-                 長い本文は tako edit replace-range（MCP は tako_preview_edit_range）で入れる",
-                commands.len()
-            ));
+            return Err(TypeRefusal::TooLong(commands.len()));
         }
         Ok(commands)
     }
@@ -903,7 +935,11 @@ mod tests {
             TYPE_MAX_CHARS
         );
         let err = EditorCommand::typed(&"x".repeat(TYPE_MAX_CHARS + 1)).unwrap_err();
-        assert!(err.contains("replace-range"), "{err}");
+        assert_eq!(err, TypeRefusal::TooLong(TYPE_MAX_CHARS + 1));
+        for lang in [crate::i18n::Lang::Ja, crate::i18n::Lang::En] {
+            let text = err.text_in(lang);
+            assert!(text.contains("replace-range"), "{text}");
+        }
         // 打鍵として当てると自動閉じと飛び越しが効く（GUI の文字入力と同じ口）
         let mut buffer = TextBuffer::from_text(std::path::PathBuf::from("t.rs"), String::new());
         for command in EditorCommand::typed("f(x)").unwrap() {

@@ -87,6 +87,8 @@ const FORBIDDEN_ON_UI: &[(&str, &str)] = &[
         "同期の採り直し（`tmux list-windows -a`）",
     ),
     ("run_tmux(", "tmux を起こす"),
+    // #2365: 断りを型で返す口（中身は同じ `run_bounded`）
+    ("run_tmux_typed(", "tmux を起こす"),
     ("tmux::query(", "tmux を起こす"),
     ("Command::new(", "子プロセスを起こす"),
     ("process_parent_map(", "親子表の採取"),

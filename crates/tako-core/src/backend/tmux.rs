@@ -352,7 +352,7 @@ impl DetachedAccess for TmuxBackend {
         rows: u32,
     ) -> Result<(), BackendError> {
         crate::tmux::resize_window(self.sock(), session.as_str(), window, cols, rows)
-            .map_err(BackendError::Operation)
+            .map_err(|e| BackendError::Operation(e.into_ja()))
     }
 }
 

@@ -82,7 +82,8 @@ const ALLOWED: &[Allow] = &[
     },
     Allow {
         file: "crates/tako-control/src/agents.rs",
-        needle: "JSON パースエラー",
+        // #2365: 断りは `AgentScanError::NotJson`（日英の文は型が組む）
+        needle: "AgentScanError::NotJson(",
         why: "`claude agents --json` の出力（子プロセスの標準出力）",
     },
     Allow {
@@ -592,12 +593,12 @@ fn 本物の口へ植えた回帰を名指せる() {
             "serde_yaml::from_str(&text).map_err(|e| e.to_string())",
             "e.to_string()",
         ),
-        // rustfmt が折った位置引数（`"…{}",\n e\n)`）も拾う（#2365 で projects.yaml と ledger.yaml の
-        // 口が型の断り `ConfigError` へ移ったので、同じ形の残る workers.yaml の口へ植える）
+        // rustfmt が折った位置引数（`"…{}",\n e\n)`）も拾う（#2365 で projects.yaml・ledger.yaml・workers.yaml の
+        // 口が型の断りへ移ったので、同じ形の残る設定の移行（projects.yaml の読み直し）の口へ植える）
         (
-            "crates/tako-control/src/orchestrator/registry.rs",
-            "\"workers.yaml のパースに失敗: {}\",\n                tako_core::load_issue::yaml_error_reason(&e, content)",
-            "\"workers.yaml のパースに失敗: {}\",\n                e",
+            "crates/tako-control/src/migrations.rs",
+            "\"projects.yaml として読めない: {}\",\n                tako_core::load_issue::yaml_error_reason(&e, text)",
+            "\"projects.yaml として読めない: {}\",\n                e",
             "\n                e",
         ),
     ] {

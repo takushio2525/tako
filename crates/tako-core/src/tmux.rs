@@ -438,10 +438,12 @@ pub fn session_group(socket: Option<&str>, name: &str) -> Option<String> {
 /// **list に出ていたセッションに届かない**（#1190 の症状）。探す順は list の並びと
 /// 同じ「既定サーバー → tako バックエンド」。明示された socket はそのまま尊重する
 /// （`--socket` を付けさせないのが #322 の「最も簡単なコマンド」原則にも合う）
+///
+/// 断りは [`TmuxRefusal::SessionNowhere`]（文は表示言語で引く。#2365）
 pub fn resolve_session_socket(
     socket: Option<&str>,
     session: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, TmuxRefusal> {
     resolve_session_socket_with(
         socket,
         session,
@@ -457,7 +459,7 @@ pub(crate) fn resolve_session_socket_with(
     session: &str,
     backend: &str,
     exists: impl Fn(Option<&str>, &str) -> bool,
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, TmuxRefusal> {
     if std::env::var("TAKO_1190_LEGACY").as_deref() == Ok("1") {
         return Ok(socket.map(str::to_string));
     }
@@ -473,20 +475,21 @@ pub(crate) fn resolve_session_socket_with(
     if exists(Some(backend), session) {
         return Ok(Some(backend.to_string()));
     }
-    Err(format!(
-        "tmux セッション {session} が見つからない（既定サーバーと tako バックエンド\
-         （socket: {backend}）のどちらにも無い）。対象は `tako tmux list` で確認すること"
-    ))
+    Err(TmuxRefusal::SessionNowhere {
+        session: session.to_string(),
+        backend: backend.to_string(),
+    })
 }
 
-/// セッションを kill する。誤爆防止の確認は呼び出し側（UI / AI）の責務
-pub fn kill_session(socket: Option<&str>, name: &str) -> Result<(), String> {
-    run_tmux(socket, &["kill-session", "-t", &exact_target(name)]).map(|_| ())
+/// セッションを kill する。誤爆防止の確認は呼び出し側（UI / AI）の責務。
+/// 失敗は型で返す（#2365。診断へ載せる呼び手は [`TmuxRunError::into_ja`]）
+pub fn kill_session(socket: Option<&str>, name: &str) -> Result<(), TmuxRunError> {
+    run_tmux_typed(socket, &["kill-session", "-t", &exact_target(name)]).map(|_| ())
 }
 
 /// window を kill する（`session:index` 指定）
-pub fn kill_window(socket: Option<&str>, session: &str, window: u32) -> Result<(), String> {
-    run_tmux(
+pub fn kill_window(socket: Option<&str>, session: &str, window: u32) -> Result<(), TmuxRunError> {
+    run_tmux_typed(
         socket,
         &[
             "kill-window",
@@ -506,8 +509,8 @@ pub fn resize_window(
     window: u32,
     cols: u32,
     rows: u32,
-) -> Result<(), String> {
-    run_tmux(
+) -> Result<(), TmuxRunError> {
+    run_tmux_typed(
         socket,
         &[
             "resize-window",
@@ -534,7 +537,11 @@ pub fn resize_window(
 ///
 /// `-A` に失敗しても（`-A` を解さない器 = psmux 等）オプションの解除は行い、
 /// **エラーはそのまま返す**（黙って「成功」を返すのが #1186 の本質だったため）
-pub fn reset_window_size(socket: Option<&str>, session: &str, window: u32) -> Result<(), String> {
+pub fn reset_window_size(
+    socket: Option<&str>,
+    session: &str,
+    window: u32,
+) -> Result<(), TmuxRunError> {
     let target = exact_target(&format!("{session}:{window}"));
     // A/B 計測用（#1186）: `TAKO_1186_LEGACY=1` で旧実装（オプション解除のみ = 戻らない）
     // へ戻す。`TAKO_1186_INJECT=nooption` は回帰注入で、実サイズは戻るが
@@ -543,12 +550,12 @@ pub fn reset_window_size(socket: Option<&str>, session: &str, window: u32) -> Re
     let resized = if legacy {
         Ok(String::new())
     } else {
-        run_tmux(socket, &["resize-window", "-t", &target, "-A"])
+        run_tmux_typed(socket, &["resize-window", "-t", &target, "-A"])
     };
     let cleared = if std::env::var("TAKO_1186_INJECT").as_deref() == Ok("nooption") {
         Ok(String::new())
     } else {
-        run_tmux(
+        run_tmux_typed(
             socket,
             &["set-window-option", "-t", &target, "-u", "window-size"],
         )
@@ -560,8 +567,8 @@ pub fn reset_window_size(socket: Option<&str>, session: &str, window: u32) -> Re
 /// `session` には**そのクライアントが実際に attach しているセッション**を渡すこと
 /// （取り込みビューは `tako-view-*` ラッパー）。grouped ラッパーは元と window 群を
 /// 共有しつつ表示 window だけが独立するので、元へ向けると親の表示を巻き込む（#1185）
-pub fn select_window(socket: Option<&str>, session: &str, index: u32) -> Result<(), String> {
-    run_tmux(
+pub fn select_window(socket: Option<&str>, session: &str, index: u32) -> Result<(), TmuxRunError> {
+    run_tmux_typed(
         socket,
         &[
             "select-window",
@@ -575,9 +582,16 @@ pub fn select_window(socket: Option<&str>, session: &str, index: u32) -> Result<
 /// tmux サーバーの呼び名（エラー文面・診断用）。**ソケットの絶対パスは出さない**
 /// （`/private/tmp/tmux-<uid>/default` のような実パスの露出は #927 の方針に反する）
 pub fn socket_label(socket: Option<&str>) -> String {
-    match socket {
-        Some(name) => format!("socket: {name}"),
-        None => "既定サーバー".to_string(),
+    socket_label_in(socket, crate::i18n::Lang::Ja)
+}
+
+/// [`socket_label`] の表示言語を明示する版（#2365）
+pub fn socket_label_in(socket: Option<&str>, lang: crate::i18n::Lang) -> String {
+    use crate::i18n::Lang::{En, Ja};
+    match (socket, lang) {
+        (Some(name), Ja | En) => format!("socket: {name}"),
+        (None, Ja) => "既定サーバー".to_string(),
+        (None, En) => "default server".to_string(),
     }
 }
 
@@ -596,38 +610,251 @@ fn scrub_paths(raw: &str) -> String {
         .join(" ")
 }
 
-/// tmux の生 stderr を tako の規約に沿った日本語へ包む（#1185 / #1190）。
-/// 生のまま返すと (1) 英語のまま (2) `error connecting to /private/tmp/tmux-<uid>/default`
+/// tmux の生の失敗を tako の規約に沿った文へ包む（#1185 / #1190。日英は #2365）。
+/// 生のまま返すと (1) tmux の英語のまま (2) `error connecting to /private/tmp/tmux-<uid>/default`
 /// のようにソケットの絶対パスが露出する (3) どのサーバー・どのセッションの話か
 /// 分からない、の 3 点で規約に反する。
-/// `action` は「何をしようとしたか」を日本語で渡す（例: `window 3 の選択`）
-pub fn friendly_error(action: &str, socket: Option<&str>, session: &str, raw: &str) -> String {
-    let server = socket_label(socket);
-    let lower = raw.to_ascii_lowercase();
-    let cause = if lower.contains("no server running") || lower.contains("error connecting to") {
-        format!("tmux サーバー（{server}）が動いていない")
-    } else if lower.contains("can't find session") || lower.contains("session not found") {
-        format!("tmux セッション {session} が {server} に無い")
-    } else if lower.contains("can't find window") {
-        format!("その window が tmux セッション {session}（{server}）に無い")
-    } else if lower.contains("no such file or directory") {
-        format!("tmux サーバー（{server}）へ接続できない")
-    } else if raw.trim().is_empty() {
-        format!("tmux が理由を返さずに失敗した（{server}）")
-    } else {
-        format!("tmux が失敗した（{server}）: {}", scrub_paths(raw))
-    };
-    // 半角英数で終わる action は「killに」と詰まって読めないので 1 マス空ける
-    let joiner = if action
-        .chars()
-        .last()
-        .is_some_and(|c| c.is_ascii_alphanumeric())
-    {
-        " "
-    } else {
-        ""
-    };
-    format!("{action}{joiner}に失敗した: {cause}。対象は `tako tmux list` で確認すること")
+/// `action` は「何をしようとしたか」（文は [`TmuxAction::text_in`]）
+pub fn friendly_error(
+    action: TmuxAction,
+    socket: Option<&str>,
+    session: &str,
+    raw: &TmuxRunError,
+) -> TmuxRefusal {
+    TmuxRefusal::Failed {
+        action,
+        socket: socket.map(str::to_string),
+        session: session.to_string(),
+        cause: TmuxCause::classify(raw),
+    }
+}
+
+/// tmux を起こして待った失敗（#2365）。日英の対は [`TmuxRunError::text_in`] の網羅 match の 1 か所で、
+/// 日本語は #2365 より前の固定文とバイト一致（`tako-control/tests/issue1762_dispatch_error_lang.rs`）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxRunError {
+    /// tmux が失敗した（stderr をそのまま。tako は文を書かない）
+    Failed(String),
+    /// 上限（秒）まで応答しないので打ち切った（#1979）
+    TimedOut(u64),
+    /// tmux を起こせない（中身は OS のエラー文）
+    Spawn(String),
+}
+
+impl TmuxRunError {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Failed(stderr), Ja | En) => stderr.clone(),
+            (Self::TimedOut(secs), Ja) => format!("tmux が {secs} 秒応答しないので打ち切った"),
+            (Self::TimedOut(secs), En) => {
+                format!("tmux did not respond for {secs} seconds, so it was cut off")
+            }
+            (Self::Spawn(error), Ja) => format!("tmux を実行できない: {error}"),
+            (Self::Spawn(error), En) => format!("cannot run tmux: {error}"),
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(crate::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for TmuxRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+/// tmux のセッション操作で何をしようとしたか（[`friendly_error`] の文の頭）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxAction {
+    /// セッションの kill
+    KillSession(String),
+    /// window の kill
+    KillWindow(u32),
+    /// window のリサイズ
+    ResizeWindow(u32),
+    /// window のサイズ解除（#1186）
+    ResetWindowSize(u32),
+    /// window の選択（#1185）
+    SelectWindow(u32),
+}
+
+impl TmuxAction {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::KillSession(name), Ja) => format!("セッション {name} の kill"),
+            (Self::KillSession(name), En) => format!("kill session {name}"),
+            (Self::KillWindow(index), Ja) => format!("window {index} の kill"),
+            (Self::KillWindow(index), En) => format!("kill window {index}"),
+            (Self::ResizeWindow(index), Ja) => format!("window {index} のリサイズ"),
+            (Self::ResizeWindow(index), En) => format!("resize window {index}"),
+            (Self::ResetWindowSize(index), Ja) => format!("window {index} のサイズ解除"),
+            (Self::ResetWindowSize(index), En) => format!("reset the size of window {index}"),
+            (Self::SelectWindow(index), Ja) => format!("window {index} の選択"),
+            (Self::SelectWindow(index), En) => format!("select window {index}"),
+        }
+    }
+}
+
+/// tmux が失敗した理由の読み（[`friendly_error`] が生の失敗から決める）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxCause {
+    /// サーバーが動いていない
+    NoServer,
+    /// そのセッションがサーバーに無い
+    NoSession,
+    /// その window がセッションに無い
+    NoWindow,
+    /// サーバーへ接続できない
+    Unreachable,
+    /// tmux が理由を返さなかった
+    Silent,
+    /// 読めない失敗（文は生のまま載せ、パスらしいトークンだけ伏せる）
+    Other(TmuxRunError),
+}
+
+impl TmuxCause {
+    /// 生の失敗から理由を読む。**判定は修正前と同じ日本語の生の文で行う**（#2365。表示言語で
+    /// 答えが変わらない = 起動できない理由に「No such file or directory」を含めば接続できない扱い）
+    pub fn classify(raw: &TmuxRunError) -> Self {
+        let text = raw.text_in(crate::i18n::Lang::Ja);
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("no server running") || lower.contains("error connecting to") {
+            Self::NoServer
+        } else if lower.contains("can't find session") || lower.contains("session not found") {
+            Self::NoSession
+        } else if lower.contains("can't find window") {
+            Self::NoWindow
+        } else if lower.contains("no such file or directory") {
+            Self::Unreachable
+        } else if text.trim().is_empty() {
+            Self::Silent
+        } else {
+            Self::Other(raw.clone())
+        }
+    }
+
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）。`socket` / `session` は
+    /// どのサーバー・どのセッションの話か（ソケットの絶対パスは出さない）
+    pub fn text_in(&self, lang: crate::i18n::Lang, socket: Option<&str>, session: &str) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        let server = socket_label_in(socket, lang);
+        match (self, lang) {
+            (Self::NoServer, Ja) => format!("tmux サーバー（{server}）が動いていない"),
+            (Self::NoServer, En) => format!("the tmux server ({server}) is not running"),
+            (Self::NoSession, Ja) => format!("tmux セッション {session} が {server} に無い"),
+            (Self::NoSession, En) => {
+                format!("tmux session {session} does not exist on {server}")
+            }
+            (Self::NoWindow, Ja) => {
+                format!("その window が tmux セッション {session}（{server}）に無い")
+            }
+            (Self::NoWindow, En) => {
+                format!("that window does not exist in tmux session {session} ({server})")
+            }
+            (Self::Unreachable, Ja) => format!("tmux サーバー（{server}）へ接続できない"),
+            (Self::Unreachable, En) => format!("cannot connect to the tmux server ({server})"),
+            (Self::Silent, Ja) => format!("tmux が理由を返さずに失敗した（{server}）"),
+            (Self::Silent, En) => format!("tmux failed without giving a reason ({server})"),
+            (Self::Other(raw), Ja) => {
+                format!(
+                    "tmux が失敗した（{server}）: {}",
+                    scrub_paths(&raw.text_in(Ja))
+                )
+            }
+            (Self::Other(raw), En) => {
+                format!("tmux failed ({server}): {}", scrub_paths(&raw.text_in(En)))
+            }
+        }
+    }
+}
+
+/// tmux のセッション操作の断り（#2365。CLI `tako tmux kill / resize / select-window / open`）。
+/// 日英の対は [`TmuxRefusal::text_in`] の網羅 match の 1 か所で、日本語は #2365 より前の固定文と
+/// バイト一致。どの文も対象の確かめ方（`tako tmux list`）を添える
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TmuxRefusal {
+    /// socket 省略時に既定サーバーにも tako バックエンドにもセッションが無い（[`resolve_session_socket`]）
+    SessionNowhere { session: String, backend: String },
+    /// tmux が失敗した（[`friendly_error`]）
+    Failed {
+        action: TmuxAction,
+        socket: Option<String>,
+        session: String,
+        cause: TmuxCause,
+    },
+}
+
+impl TmuxRefusal {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::SessionNowhere { session, backend }, Ja) => format!(
+                "tmux セッション {session} が見つからない（既定サーバーと tako バックエンド\
+                 （socket: {backend}）のどちらにも無い）。対象は `tako tmux list` で確認すること"
+            ),
+            (Self::SessionNowhere { session, backend }, En) => format!(
+                "tmux session {session} not found (on neither the default server nor the tako \
+                 backend (socket: {backend})). Check the target with `tako tmux list`"
+            ),
+            (
+                Self::Failed {
+                    action,
+                    socket,
+                    session,
+                    cause,
+                },
+                Ja,
+            ) => {
+                let action = action.text_in(Ja);
+                // 半角英数で終わる action は「killに」と詰まって読めないので 1 マス空ける
+                let joiner = if action
+                    .chars()
+                    .last()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                {
+                    " "
+                } else {
+                    ""
+                };
+                format!(
+                    "{action}{joiner}に失敗した: {}。対象は `tako tmux list` で確認すること",
+                    cause.text_in(Ja, socket.as_deref(), session)
+                )
+            }
+            (
+                Self::Failed {
+                    action,
+                    socket,
+                    session,
+                    cause,
+                },
+                En,
+            ) => format!(
+                "failed to {}: {}. Check the target with `tako tmux list`",
+                action.text_in(En),
+                cause.text_in(En, socket.as_deref(), session)
+            ),
+        }
+    }
+
+    /// 日本語の文（診断・テスト）
+    pub fn into_ja(self) -> String {
+        self.text_in(crate::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for TmuxRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
 }
 
 /// 特定 window のペイン内容をテキストとして取得する（ホバープレビュー用）。
@@ -1085,7 +1312,7 @@ pub(crate) fn run_tmux_at(path: &std::path::Path, args: &[&str]) -> Result<Strin
     crate::platform::process::no_console_window(&mut command);
     command.env_remove("LC_ALL").env("LC_CTYPE", "UTF-8");
     command.arg("-S").arg(path);
-    run_bounded(command, args)
+    run_bounded(command, args).map_err(TmuxRunError::into_ja)
 }
 
 /// tmux CLI 実行。サーバー未起動（list 系の "no server running"）はエラー文字列を返す
@@ -1094,6 +1321,11 @@ pub(crate) fn run_tmux_at(path: &std::path::Path, args: &[&str]) -> Result<Strin
 /// **待ちには上限がある**（[`TMUX_QUERY_TIMEOUT`]。#1979）。打ち切ったら `Err`
 /// = 呼び手は「サーバー未起動」と同じく無害に劣化する
 pub(crate) fn run_tmux(socket: Option<&str>, args: &[&str]) -> Result<String, String> {
+    run_bounded(tmux_command(socket), args).map_err(TmuxRunError::into_ja)
+}
+
+/// [`run_tmux`] の型の口（#2365。失敗を [`TmuxRunError`] のまま返す = 表示言語で文を引ける）
+pub(crate) fn run_tmux_typed(socket: Option<&str>, args: &[&str]) -> Result<String, TmuxRunError> {
     run_bounded(tmux_command(socket), args)
 }
 
@@ -1110,17 +1342,22 @@ pub fn query(socket: Option<&str>, args: &[&str]) -> Result<String, String> {
 /// 長生きの子（器のサーバー・ペインのシェル）へ書き手が漏れると、**子が終わっても**
 /// EOF が来ずに返らない（#1768 で同じ穴を実測）。2026-10-10 の本番ハングは
 /// メインスレッドがこの形（`ps` の `output()` の `poll`）で 10 分止まった
-fn run_bounded(mut command: Command, args: &[&str]) -> Result<String, String> {
+///
+/// 失敗は型で返す（#2365。tmux 自身の失敗は stderr を [`TmuxRunError::Failed`] でそのまま運ぶ）。
+/// `String` を返す口（[`run_tmux`] / [`run_tmux_at`]）は [`TmuxRunError::into_ja`] で従来の日本語へ戻す
+fn run_bounded(mut command: Command, args: &[&str]) -> Result<String, TmuxRunError> {
     command.args(args);
     // A/B（`TAKO_1979_LEGACY=1`）: 修正前の上限なしの待ち
     if crate::probe::issue1979_legacy() {
         let output = command
             .output()
-            .map_err(|e| format!("tmux を実行できない: {e}"))?;
+            .map_err(|e| TmuxRunError::Spawn(e.to_string()))?;
         return if output.status.success() {
             Ok(String::from_utf8_lossy(&output.stdout).into_owned())
         } else {
-            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+            Err(TmuxRunError::Failed(
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            ))
         };
     }
     let label = crate::probe::label("tmux", args);
@@ -1133,16 +1370,15 @@ fn run_bounded(mut command: Command, args: &[&str]) -> Result<String, String> {
             if status.success() {
                 Ok(String::from_utf8_lossy(&stdout).into_owned())
             } else {
-                Err(String::from_utf8_lossy(&stderr).trim().to_string())
+                Err(TmuxRunError::Failed(
+                    String::from_utf8_lossy(&stderr).trim().to_string(),
+                ))
             }
         }
-        crate::probe::Outcome::TimedOut { waited, .. } => Err(format!(
-            "tmux が {} 秒応答しないので打ち切った",
-            waited.as_secs()
-        )),
-        crate::probe::Outcome::Failed { reason, .. } => {
-            Err(format!("tmux を実行できない: {reason}"))
+        crate::probe::Outcome::TimedOut { waited, .. } => {
+            Err(TmuxRunError::TimedOut(waited.as_secs()))
         }
+        crate::probe::Outcome::Failed { reason, .. } => Err(TmuxRunError::Spawn(reason)),
     }
 }
 
@@ -1359,7 +1595,9 @@ mod tests {
             Ok(None)
         );
         // どちらにも無ければ「どこを見たか」を日本語で返す（パスは出さない）
-        let err = resolve_session_socket_with(None, "mywork", "tako", nowhere).unwrap_err();
+        let err = resolve_session_socket_with(None, "mywork", "tako", nowhere)
+            .unwrap_err()
+            .into_ja();
         assert!(err.contains("mywork"), "{err}");
         assert!(
             err.contains("既定サーバー") && err.contains("socket: tako"),
@@ -1372,8 +1610,11 @@ mod tests {
     /// #1190: 生の tmux エラーを日本語へ包み、ソケットの絶対パスを出さない
     #[test]
     fn tmuxの生エラーを日本語へ包む() {
-        let msg = friendly_error(
-            "window 4 の kill",
+        let ja = |action, socket, session, raw: &str| {
+            friendly_error(action, socket, session, &TmuxRunError::Failed(raw.into())).into_ja()
+        };
+        let msg = ja(
+            TmuxAction::KillWindow(4),
             Some("tkrev0909"),
             "tako-02695e295bb1",
             "error connecting to /private/tmp/tmux-501/default (No such file or directory)",
@@ -1386,24 +1627,39 @@ mod tests {
             "ソケットの絶対パスが露出している: {msg}"
         );
 
-        let msg = friendly_error("window 9 の選択", None, "mywork", "can't find window: 9");
+        let msg = ja(
+            TmuxAction::SelectWindow(9),
+            None,
+            "mywork",
+            "can't find window: 9",
+        );
         assert!(msg.contains("window 9 の選択に失敗した"), "詰め方: {msg}");
         assert!(msg.contains("window が tmux セッション mywork"), "{msg}");
         assert!(msg.contains("既定サーバー"), "{msg}");
 
-        let msg = friendly_error("kill", Some("s"), "x", "can't find session: x");
+        let msg = ja(
+            TmuxAction::KillSession("x".into()),
+            Some("s"),
+            "x",
+            "can't find session: x",
+        );
         assert!(
             msg.contains("tmux セッション x が socket: s に無い"),
             "{msg}"
         );
 
         // 未知の文面は素通しするが、パスらしいトークンだけは伏せる
-        let msg = friendly_error("resize", None, "x", "lost server /tmp/tmux-0/x oops");
+        let msg = ja(
+            TmuxAction::ResizeWindow(1),
+            None,
+            "x",
+            "lost server /tmp/tmux-0/x oops",
+        );
         assert!(msg.contains("lost server <path> oops"), "{msg}");
         assert!(!msg.contains("/tmp/"), "{msg}");
 
         // 理由が空でも「成功」に見える文面にはしない
-        let msg = friendly_error("resize", None, "x", "   ");
+        let msg = ja(TmuxAction::ResizeWindow(1), None, "x", "   ");
         assert!(msg.contains("失敗した"), "{msg}");
     }
 
