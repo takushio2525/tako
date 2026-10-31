@@ -20,33 +20,6 @@
 
 ---
 
-## 2026-10-30（#2365 の続き: dispatch の個別の断り（選択肢ダイアログへの応答・orchestrator・設定の保存・Web・メニュー・値の検証）82 か所を `Reason` へ（182 → 244 種）。CLI の handoffs / shortcuts の直呼びに表示言語の初期化）
-- 実経路 修正前 英語表示の日本語入り 49 / 49 → 0・CLI 7 / 7 → 0・日本語は全件バイト一致・注入 4 通りで名指し・カタログ +0 B。PR #2508
-
-## 2026-10-30（#1716: tako-cli のテストのビルドは `caller_pane` を env を読まない `test_caller` へ向け、`--pane` 省略の偽の緑を塞ぐ・迂回と結合テストの env の外し忘れは番犬 `issue1716_caller_pane_env_watchdog` が file:line で落とす）
-- 修正前は env ありで通り env なしで落ちる → 修正後は両方で同じ断り・注入 4 種を名指し・カタログ +0 B。PR #2510
-
-## 2026-10-30（#2509: issue1944_lsp_fetch の取ってきた 4 件が全体実行でだけ `starting` で落ちる = ログインシェルの rc の `pyenv rehash` がロック待ちで stdout を握り、10 秒の kill 後も EOF が来ない → `FetchConfig::plain_shell` で rc を読まない `/bin/sh -c`・上限は本番の既定）
-- 注入（rc が stdout を握る偽の `$SHELL`）で旧は実物と同じ 4 件・同じ JSON で落ち新は 10 passed・全体実行 3 回で 1944 の FAILED 0・カタログ +0 B。PR #2511
-
-## 2026-10-30（#1715: context-budget の起動前 1 行を予算超過と作業ログの復活・重複で言い分ける・応答の `startup_line` を CLI / MCP / master の 1 実装に）
-- 修正前は復活だけで「予算超過: 1 件」・両方で復活が 1 行から消えていた → 修正後は 4 通り × 日英で言い分け・カタログ +0 B。PR #2512
-
-## 2026-10-30（#2365 の続き: dispatch 本体に残っていた断り 59 種（LSP・検索・変更履歴・リモートフォルダ・カード・Code Runner・ファイルツリー・supervisor・ledger・セッション再起動ほか）を `Reason` へ・番犬の本体の範囲が途中の `#[cfg(test)] fn` で切れていたのを直した）
-- 実経路 43 ケースで英語表示の日本語入り 43 → 0・日本語はバイト一致・カタログ +0 B。残りは setup 系 17 行と他モジュールの文。PR #2515
-
-## 2026-10-30（#2513: install 後の `.tako-replace-<pid>` の ASP 拒否 22 本 / 31 秒の真因は「GUI 配下の tako CLI」ではなく、install をまたいだ remote daemon の serve 監視が `tailscale` を素の名前で起こす PATH の空振り（親の消えた実行ファイルで検査される）→ 検出の正本が絶対パスで持つ `exe::find_in_process_path`・A/B `TAKO_2513_LEGACY=1`）
-- 実 daemon + 本物の install_bundle_in_place の A/B で差し替え後の拒否 42 → 0・注入で番犬が tailscale.rs:160 を名指し・カタログ +0 B。本番確認待ちで Issue は開けたまま。PR #2516
-
-## 2026-10-30（#2514: issue1977 / issue1956 の e2e も取得つきの manager を helper 1 か所で作り `plain_shell = /bin/sh`・本番の既定の上限を渡す。番犬が helper の外の `with_fetch` も名指す）
-- 注入（rc が stdout を握る偽の `$SHELL`）で 1977 は旧 FAILED → 新 8 passed。1956 は起動に届かない（旧新とも ok）ので helper 経由の一時テストで旧 FAILED → 新 ok・カタログ +0 B。PR #2517
-
-## 2026-10-30（#2365 の続き: dispatch が素通ししていた orchestrator の設定ファイル（projects / accounts / profiles）とエージェント名の検証の断りを `ConfigError`（32 種）へ・型の口 `*_typed`）
-- 実経路 36 ケースで英語表示の日本語入り 36 → 0・CLI 11 件で 10 → 0・日本語はバイト一致・カタログ +0 B。PR #2521
-
-## 2026-10-30（#2519: GUI が周期的に起こす git / tmux（bin_resolve の PATH の段）・codex / agy の lsof・sudo / pmset を PATH で引いた絶対パスで起こす・`exe::resolve_for_spawn` / `bin_resolve::Held`・A/B `TAKO_2519_LEGACY=1`）
-- 本物の contents-swap の再現で差し替え後 10 秒の拒否 204 → 0・番犬 `issue2519_gui_spawn_path_watchdog` が注入を file:line で名指し・カタログ +0 B。PR #2522
-
 ## 2026-10-30（#2518: install をまたいで旧版のまま動く remote daemon を PID ファイル 4 行目の実行ファイルの識別（3 行の旧形式は ctime と起動時刻）で見分け、GUI 起動時の自動復帰と `tako remote start` が desired を保ったまま入れ替える・status に `serve_generation`・A/B `TAKO_2518_LEGACY=1`）
 - 本物の daemon + 本物の contents-swap の A/B で PASS 41・注入で番犬が remote.rs:3467 / remote_autostart.rs:218 を名指し・カタログ +0 B。PR #2523
 - 15:24 の install・GUI 再起動の本番確認で #2513 / #2518 / #2519 を閉じた
@@ -82,3 +55,33 @@
 
 ## 2026-10-30（#2538: install の前から待っていた `tako queue` の包みが待ち明けに子を素の名前で起こし、PATH の空振りぶん拒否（本番 41 × 2 を 2 回。段 1 で install の手順ではないと確定）→ 受付の前に `exe::pin_before_wait` で引いた絶対パスで起こす・argv[0] は打った形のまま・A/B `TAKO_2519_LEGACY=1`）
 - 隔離の調停役 + 本物の contents-swap で待ち明けの拒否 10 → 0（2 回）・見え方 / 終了コード / シグナル / 127 は sha 一致・注入 3 通りで番犬が queue_wrapper.rs:577 / 378 を名指し・カタログ +0 B。本番確認待ちで Issue は開けたまま。PR #2542
+
+## 2026-10-31（#2365 の続き: dispatch のファイル操作 4 種と蓋閉じ継続の解除・Battery の断りを中身（`OsIntegrationError` 26 種・`LidError` 13 種・tako-core の `JsonReason` / `UrlBlocked::text_in`）ごと表示言語へ。Windows の文も cfg の外の表）
+- 実経路テストで英語表示の日本語入り 6 / 7 → 0 / 7・隔離 GUI の CLI / MCP 11 / 12 → 0 / 12・日本語は sha256 一致・注入 5 通りで名指し・カタログ +0 B。PR #2545
+
+## 2026-10-31（#2539: GUI の 2 秒ごとの remote の状態の更新が daemon の生死の判定で `daemon_status` を 2 回引き、tailscale を 2 秒ごとに 6 本起こしていた → `remote::daemon_running`（PID ファイルだけ）/ `poll_admin_state`・A/B `TAKO_2539_LEGACY=1`）
+- 隔離 GUI + 偽 tailscale の 60 秒で GUI 由来 173.8 → 0 本/分・子の CPU 366 → 7 ms/分・status の sha と検知の遅れは不変・番犬 `issue2539_remote_poll_tailscale_watchdog`・カタログ +0 B。PR #2543
+- 本番確認で #2539 を閉じた（再起動後の本番 GUI の子に tailscale 0 本・陽性対照つき）
+
+## 2026-10-31（#1833: 読み直しを undo で戻した直後の自動保存が外部変更を上書きするのを止める（`EditKind::Reload` / `TextBuffer::reload_undone`・A/B `TAKO_1833_LEGACY=1`）・リモートの競合を帯と `conflict`（`remote: true`）・`notices` に載せる・CLI `tako edit save --force` に別名 `--overwrite`）
+- 実経路 38 / 38（修正前は 1A / 1B とも外部変更が消え、リモートは conflict 無し）・番犬の注入 4 通りで file:line を名指し・カタログ +0 B。PR #2546
+
+## 2026-10-31（#2365 の続き: dispatch の setup 系の断り（MCP 登録・子の tako setup・answers・config.yaml / changes.yaml・共通ルール同期・依存の導入・導入の系統名とホーム）を `SetupRefusal`（40 種）と `AgentMcpError::text_in` へ。CLI の setup-mcp の直呼びに表示言語の初期化）
+- 実経路（隔離 GUI へ MCP 18 + CLI 3）で英語表示の日本語入り 20 / 21 → 0 / 21・日本語は 21 件 sha256 一致・注入 4 通りで file:line を名指し + E0004・カタログ +0 B。PR #2547
+
+## 2026-10-31（#1998: tako のペインへ共有 jobserver（`CARGO_MAKEFLAGS` の fifo）を注入し包まない cargo も札で絞る・器へは -e で固定・macOS の data dir の空白は一時 dir へ逃がす・受け継いだ jobserver があると cargo は `CARGO_BUILD_JOBS` を見ないと実測で確認（設計書 §9.7））
+- 実経路で 3 本並べて N + 3 = 7 に対し 7（A/B 11）・再起動をまたいで空きの最大 = N・kill で失った 4 枚を数え直しで戻した・カタログ +98 B。PR #2548
+- 本番確認済み（再起動後に作ったペインに `CARGO_MAKEFLAGS`・`tako queue` に「cargo の札: 空き 18 / 18」）
+
+## 2026-10-31（#2365 の続き: bootstrap の install / path / undo-path の断りを、中身（インストーラの取得と実行・tako-core の `PathBlockError` / `LinkError` / `UserPathError`）ごと `SetupRefusal`（40 → 57 種）へ）
+- 隔離 GUI の A/B で英語表示の日本語入り 16 / 16 → 0 / 16・日本語は sha256 一致・実経路テストは 19 / 19 → 0 / 19・注入 5 通りで名指し + E0004・カタログ +0 B。PR #2549
+
+## 2026-10-31（#1935: 構文の塗りの前置き（#1917）を 21 構文へ広げ、書き換えを build.rs へ移し、構文ごとの損益分岐以下は元の正規表現で塗る（Svelte / Vue は TS だけ前置き付き）。A/B `TAKO_1935_LEGACY=1`）
+- 1 MB の冷えた 1 回目 JS 3.75 → 1.88 秒・C# 3.16 → 1.03 秒ほか 19 言語で 22〜67% 短縮・境目 +1 行は同じか速い・全記録 48 件一致・常駐 +0.96 MB・バイナリ +231 KB・カタログ +0 B。PR #2552
+
+## 2026-10-31（#2551: issue2035 の子プロセス（本番の解決 = `$SHELL -l -c`）が開発者の rc の `pyenv rehash` のロック待ちで 1 回目の initialize の 15 秒を使い切る → 子へ `SHELL=/bin/sh` と一時の HOME・番犬 `issue2551_lsp_child_shell_watchdog`）
+- 修正前は rehash のロック待ちの注入で同じ文言で FAILED → 修正後は同じ注入で ok・注入なし 10 回連続 ok・番犬が逆戻り 4 通りを file:line で名指し・カタログ +0 B。PR #2553
+
+## 2026-10-31（#2550: setup bootstrap の PATH 通しが種別の分からない `$SHELL`（nu・tcsh 等）を zsh と見なして `.zprofile` へ書いていた → `shell_kind_for` で空・未設定のときだけ OS の既定、未知は既存の断りで止める）
+- 砂場の CLI で修正前 rc=0・`.zprofile` を書く → 修正後 rc=1・書かない（4 シェル）・既知 7 種はファイルと応答がバイト一致・注入で単体と実経路が file:line で落ちる・カタログ +0 B。PR #2554
+- 09:07 に `5d3f73d` を install・GUI 再起動の本番確認で #2538 も閉じた（install をまたいだ `tako queue` の包みの待ち明けで拒否 0）。断りの案内文の誤りは #2557
