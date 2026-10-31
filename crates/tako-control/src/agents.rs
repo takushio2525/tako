@@ -37,15 +37,74 @@ pub fn list_agents_scoped(
     freshness: AgentScanFreshness,
     scope: &ScanScope,
 ) -> Result<Vec<Value>, String> {
+    list_agents_scoped_typed(freshness, scope).map_err(AgentScanError::into_ja)
+}
+
+/// [`list_agents_scoped`] の型の口（#2365。dispatch の一覧が表示言語の文で断る）
+pub fn list_agents_scoped_typed(
+    freshness: AgentScanFreshness,
+    scope: &ScanScope,
+) -> Result<Vec<Value>, AgentScanError> {
     let stdout = crate::orchestrator::run_claude_agents_json_scoped(freshness, scope)
-        .ok_or("claude agents --json の実行に失敗（claude CLI が見つからないか異常終了）")?;
-    let text = String::from_utf8(stdout).map_err(|e| format!("出力が UTF-8 でない: {e}"))?;
+        .ok_or(AgentScanError::ScanFailed)?;
+    let text = String::from_utf8(stdout).map_err(|e| AgentScanError::NotUtf8(e.to_string()))?;
     let parsed: Value =
-        serde_json::from_str(&text).map_err(|e| format!("JSON パースエラー: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| AgentScanError::NotJson(e.to_string()))?;
     let Some(items) = parsed.as_array() else {
-        return Err("claude agents --json の出力が配列でない".into());
+        return Err(AgentScanError::NotArray);
     };
     Ok(items.iter().map(normalize_agent).collect())
+}
+
+/// `claude agents --json` で一覧を作れない理由（#2365。CLI `tako remote agents` / MCP `tako_remote_agents`）。
+/// 日英の対は [`AgentScanError::text_in`] の網羅 match の 1 か所で、日本語は #2365 より前の固定文と
+/// バイト一致。`String` を返す従来の口（[`list_agents`] ほか）は日本語のまま（監視・走査の記録）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentScanError {
+    /// 走査が答えを返さない（claude CLI が無い・異常終了）
+    ScanFailed,
+    /// 出力が UTF-8 でない（中身は変換のエラー文）
+    NotUtf8(String),
+    /// 出力が JSON でない（中身は serde のエラー文）
+    NotJson(String),
+    /// 出力が配列でない
+    NotArray,
+}
+
+impl AgentScanError {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::ScanFailed, Ja) => {
+                "claude agents --json の実行に失敗（claude CLI が見つからないか異常終了）"
+                    .to_string()
+            }
+            (Self::ScanFailed, En) => {
+                "claude agents --json failed (the claude CLI is missing or exited abnormally)"
+                    .to_string()
+            }
+            (Self::NotUtf8(error), Ja) => format!("出力が UTF-8 でない: {error}"),
+            (Self::NotUtf8(error), En) => format!("the output is not UTF-8: {error}"),
+            (Self::NotJson(error), Ja) => format!("JSON パースエラー: {error}"),
+            (Self::NotJson(error), En) => format!("JSON parse error: {error}"),
+            (Self::NotArray, Ja) => "claude agents --json の出力が配列でない".to_string(),
+            (Self::NotArray, En) => {
+                "the output of claude agents --json is not an array".to_string()
+            }
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(tako_core::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for AgentScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
 }
 
 /// `claude agents --json` の 1 エントリをリモート API 向けに正規化する
@@ -1125,9 +1184,14 @@ pub(crate) fn is_descendant_of(
 /// エージェント一覧に tmux ペイン対応を付与した完全版を返す（remote / dispatch / CLI 共用）。
 /// `socket` 省略時は tako バックエンドソケットを使う
 pub fn list_agents_with_panes(socket: Option<&str>) -> Result<Value, String> {
+    list_agents_with_panes_typed(socket).map_err(AgentScanError::into_ja)
+}
+
+/// [`list_agents_with_panes`] の型の口（#2365。dispatch RemoteAgents が表示言語の文で断る）
+pub fn list_agents_with_panes_typed(socket: Option<&str>) -> Result<Value, AgentScanError> {
     // 表示用の一覧（`tako remote agents` / dispatch RemoteAgents / remote デーモン）なので
     // 30 秒古くてよい（#1011）
-    let mut agents = list_agents_with_freshness(AgentScanFreshness::Ui)?;
+    let mut agents = list_agents_scoped_typed(AgentScanFreshness::Ui, &ScanScope::All)?;
     let panes = match socket {
         // 明示ソケット指定（remote デーモンの tmux 直参照）は従来どおり tmux CLI
         Some(s) => tmux_pane_pids(Some(s)),

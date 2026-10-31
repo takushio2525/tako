@@ -3085,7 +3085,7 @@ impl Shared {
         if let (Some(set), Some(name)) = (set, name) {
             let apply = |all: &mut BTreeMap<String, init_options::Overrides>| {
                 let entry = all.entry(name.to_string()).or_default();
-                init_options::apply(entry, set)?;
+                init_options::apply(entry, set).map_err(|e| e.to_string())?;
                 if entry.is_empty() {
                     all.remove(name);
                 }

@@ -163,6 +163,11 @@ const RAW: &[(&str, &str)] = &[
         "list_agents_with_panes(",
         "`claude agents --json` + 器の `list-panes -a`",
     ),
+    // #2365: 断りを表示言語で返す型の口（中身は同じ走査）
+    (
+        "list_agents_with_panes_typed(",
+        "`claude agents --json` + 器の `list-panes -a`",
+    ),
     ("fetch_tmux_sessions(", "`tmux list-sessions` ほか数本"),
     ("tmux::list_sessions(", "`tmux list-sessions` ほか数本"),
     ("backend_pane_pids(", "器の `list-panes -a`"),

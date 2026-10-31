@@ -128,7 +128,7 @@ fn insert_path(root: &mut Map<String, Value>, key: &str, value: Value) {
 }
 
 /// キーの形の検査（空でない段をドットでつなぐ。段は ASCII の英数字と `_` / `-`）
-pub fn validate_key(key: &str) -> Result<(), String> {
+pub fn validate_key(key: &str) -> Result<(), OptionRefusal> {
     let ok = !key.is_empty()
         && key.split('.').all(|segment| {
             !segment.is_empty()
@@ -139,9 +139,42 @@ pub fn validate_key(key: &str) -> Result<(), String> {
     if ok {
         Ok(())
     } else {
-        Err(format!(
-            "キーの形が不正: {key:?}（ドット区切りの経路。例: cargo.targetDir）"
-        ))
+        Err(OptionRefusal::KeyShape(key.to_string()))
+    }
+}
+
+/// 初期化オプションの上書きを断る理由（#2365。CLI `tako lsp options --set` / MCP `tako_lsp_server` の
+/// `set`）。日英の対は [`OptionRefusal::text_in`] の網羅 match の 1 か所で、日本語は #2365 より前の
+/// 固定文とバイト一致
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptionRefusal {
+    /// キーの形が不正（ドット区切りの経路でない）
+    KeyShape(String),
+}
+
+impl OptionRefusal {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::KeyShape(key), Ja) => {
+                format!("キーの形が不正: {key:?}（ドット区切りの経路。例: cargo.targetDir）")
+            }
+            (Self::KeyShape(key), En) => {
+                format!("malformed key: {key:?} (a dot-separated path, e.g. cargo.targetDir)")
+            }
+        }
+    }
+
+    /// 日本語の文（CLI の `--set` の読み取り = 手元の処理の口）
+    pub fn into_ja(self) -> String {
+        self.text_in(crate::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for OptionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
     }
 }
 
@@ -157,13 +190,13 @@ pub fn parse_assignment(text: &str) -> Result<(String, Value), String> {
         .split_once('=')
         .ok_or_else(|| format!("--set は KEY=VALUE の形: {text:?}（例: cargo.targetDir=false）"))?;
     let key = key.trim();
-    validate_key(key)?;
+    validate_key(key).map_err(OptionRefusal::into_ja)?;
     Ok((key.to_string(), parse_value(value.trim())))
 }
 
 /// 上書きを当てる: 値なら入れ、`null` なら消す（= 表の既定へ戻す）。キーは先に検査する
 /// （1 つでも不正なら何も変えない）
-pub fn apply(overrides: &mut Overrides, set: &Map<String, Value>) -> Result<(), String> {
+pub fn apply(overrides: &mut Overrides, set: &Map<String, Value>) -> Result<(), OptionRefusal> {
     for key in set.keys() {
         validate_key(key)?;
     }

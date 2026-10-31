@@ -7998,8 +7998,8 @@ fn preview_changelog_diff_land(
 /// スマホの一覧（`RemoteAgents`）の応答（同期の腕と #1984 の background の 1 実装）。
 /// ControlHost 不要（エージェント一覧と会話ログはどのプロセスでも取得できる）
 fn remote_agents_reply() -> Result<Value, DispatchError> {
-    let mut result =
-        crate::agents::list_agents_with_panes(None).map_err(DispatchError::Operation)?;
+    let mut result = crate::agents::list_agents_with_panes_typed(None)
+        .map_err(|e| DispatchError::Operation(e.to_string()))?;
     // #1069: 公式リンクは HTTP の /api/agents と同じ 1 実装で付ける
     // （AI が見る値とスマホの一覧が食い違わない = 開発不変条件）
     crate::claude_remote_link::attach_to_agents(&mut result);
@@ -8026,11 +8026,11 @@ fn resolve_worker_query(
 ) -> Result<WorkerQuery, DispatchError> {
     use crate::orchestrator::registry::WorkerRegistry;
     if let Some(worker_id) = worker {
-        let reg = WorkerRegistry::load()
+        let reg = WorkerRegistry::load_typed()
             .map_err(|e| Reason::WorkerRegistryUnreadable(e.to_string()).operation())?;
         let (_, entry) = reg
-            .resolve(worker_id)
-            .map_err(DispatchError::InvalidParams)?;
+            .resolve_typed(worker_id)
+            .map_err(|e| DispatchError::InvalidParams(e.to_string()))?;
         return Ok(WorkerQuery {
             pane_id: entry.pane,
             session_id: session_id.or_else(|| entry.session_id.clone()),
@@ -8202,10 +8202,10 @@ fn finish_workers_list(
         // GC の失敗（ロック競合・書き込み不能）で一覧まで落とさない。読むだけへ縮退する
         registry::sweep_dead(&live_backends, live_panes).or_else(|e| {
             eprintln!("warning: worker レジストリの GC に失敗: {e}");
-            registry::WorkerRegistry::load()
+            registry::WorkerRegistry::load_typed()
         })
     } else {
-        registry::WorkerRegistry::load()
+        registry::WorkerRegistry::load_typed()
     }
     .map_err(|e| Reason::WorkerRegistryUnreadable(e.to_string()).operation())?;
     Ok(registry::list_payload(
@@ -8506,7 +8506,8 @@ fn run_git_diff(cwd: &Path, target: Option<&str>) -> Result<Value, DispatchError
 
 fn run_git_show(cwd: &Path, hash: &str, file: Option<&str>) -> Result<Value, DispatchError> {
     let repo = tako_core::git::repo_root(cwd).ok_or_else(|| Reason::NotGitRepo.operation())?;
-    let detail = tako_core::git::show_commit(&repo, hash).map_err(DispatchError::Operation)?;
+    let detail = tako_core::git::show_commit_typed(&repo, hash)
+        .map_err(|e| DispatchError::Operation(e.to_string()))?;
     let mut result = json!({
         "hash": detail.hash,
         "author_name": detail.author_name,
@@ -10278,7 +10279,7 @@ fn dispatch_inner(
             // #1759: `type` は打つ文字を 1 文字ずつ GUI の文字の打鍵と同じ口へ通す
             let commands = if command == TYPE_COMMAND {
                 EditorCommand::typed(text.as_deref().unwrap_or_default())
-                    .map_err(DispatchError::Operation)?
+                    .map_err(|e| DispatchError::Operation(e.to_string()))?
             } else if text.is_some() {
                 return Err(Reason::TextOnlyForType(command).operation());
             } else {
@@ -17414,7 +17415,7 @@ pub fn dispatch_orchestrator_layout(
         || auto_shrink_font.is_some()
         || min_worker_font_scale.is_some();
     let resolved = if changed {
-        crate::setup::mutate_config(|config| {
+        crate::setup::mutate_config_typed(|config| {
             if let Some(p) = policy {
                 config.spawn_layout.policy = Some(p.as_str().to_string());
             }
@@ -17435,10 +17436,10 @@ pub fn dispatch_orchestrator_layout(
             }
             config.spawn_layout.resolve()
         })
-        .map_err(DispatchError::Operation)?
+        .map_err(|e| DispatchError::Operation(e.to_string()))?
     } else {
-        crate::setup::load_config()
-            .map_err(DispatchError::Operation)?
+        crate::setup::load_config_typed()
+            .map_err(|e| DispatchError::Operation(e.to_string()))?
             .spawn_layout
             .resolve()
     };
@@ -21935,7 +21936,7 @@ pub fn lsp_server_action(
         }
         for key in set.keys() {
             tako_core::lsp::init_options::validate_key(key)
-                .map_err(DispatchError::InvalidParams)?;
+                .map_err(|e| DispatchError::InvalidParams(e.to_string()))?;
         }
     }
     if let Some(name) = name {
@@ -23785,13 +23786,18 @@ fn op_err(e: impl std::fmt::Display) -> DispatchError {
 /// tmux 操作の失敗を tako の規約に沿ったエラーへ包む（#1190）。生の stderr は
 /// 英語 + ソケットの絶対パスを含み、どのサーバー・どのセッションの話かも分からない。
 /// A/B 計測用に `TAKO_1190_LEGACY=1` で旧挙動（生の stderr を素通し）へ戻せる
-fn tmux_error(action: &str, socket: Option<&str>, session: &str, raw: &str) -> DispatchError {
+fn tmux_error(
+    action: tako_core::tmux::TmuxAction,
+    socket: Option<&str>,
+    session: &str,
+    raw: &tako_core::tmux::TmuxRunError,
+) -> DispatchError {
     if std::env::var("TAKO_1190_LEGACY").as_deref() == Ok("1") {
         return DispatchError::Operation(raw.to_string());
     }
-    DispatchError::Operation(tako_core::tmux::friendly_error(
-        action, socket, session, raw,
-    ))
+    DispatchError::Operation(
+        tako_core::tmux::friendly_error(action, socket, session, raw).to_string(),
+    )
 }
 
 fn validate_name(name: &str) -> Result<(), DispatchError> {
@@ -24822,16 +24828,16 @@ fn tmux_kill_reply(
 ) -> Result<Value, DispatchError> {
     // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190）
     let socket = tako_core::tmux::resolve_session_socket(socket, session)
-        .map_err(DispatchError::Operation)?;
+        .map_err(|e| DispatchError::Operation(e.to_string()))?;
     match window {
         Some(index) => tako_core::tmux::kill_window(socket.as_deref(), session, index),
         None => tako_core::tmux::kill_session(socket.as_deref(), session),
     }
     .map_err(|e| {
         tmux_error(
-            &match window {
-                Some(index) => format!("window {index} の kill"),
-                None => format!("セッション {session} の kill"),
+            match window {
+                Some(index) => tako_core::tmux::TmuxAction::KillWindow(index),
+                None => tako_core::tmux::TmuxAction::KillSession(session.to_string()),
             },
             socket.as_deref(),
             session,
@@ -24852,11 +24858,11 @@ fn tmux_resize_reply(
 ) -> Result<Value, DispatchError> {
     // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190）
     let socket = tako_core::tmux::resolve_session_socket(socket, session)
-        .map_err(DispatchError::Operation)?;
+        .map_err(|e| DispatchError::Operation(e.to_string()))?;
     if reset {
         tako_core::tmux::reset_window_size(socket.as_deref(), session, window).map_err(|e| {
             tmux_error(
-                &format!("window {window} のサイズ解除"),
+                tako_core::tmux::TmuxAction::ResetWindowSize(window),
                 socket.as_deref(),
                 session,
                 &e,
@@ -24872,7 +24878,7 @@ fn tmux_resize_reply(
     tako_core::tmux::resize_window(socket.as_deref(), session, window, cols, rows).map_err(
         |e| {
             tmux_error(
-                &format!("window {window} のリサイズ"),
+                tako_core::tmux::TmuxAction::ResizeWindow(window),
                 socket.as_deref(),
                 session,
                 &e,
@@ -25380,12 +25386,15 @@ fn tmux_select_window_reply(
 ) -> Result<Value, DispatchError> {
     tako_core::tmux::select_window(resolved.socket.as_deref(), &resolved.target, window).map_err(
         |e| {
-            DispatchError::Operation(tako_core::tmux::friendly_error(
-                &format!("window {window} の選択"),
-                resolved.socket.as_deref(),
-                &resolved.target,
-                &e,
-            ))
+            DispatchError::Operation(
+                tako_core::tmux::friendly_error(
+                    tako_core::tmux::TmuxAction::SelectWindow(window),
+                    resolved.socket.as_deref(),
+                    &resolved.target,
+                    &e,
+                )
+                .to_string(),
+            )
         },
     )?;
     Ok(json!({
@@ -25488,7 +25497,8 @@ fn compute_tmux_open_lookup(
 ) -> Result<TmuxOpenLookup, String> {
     // socket 省略時は list と同じ「既定サーバー → tako バックエンド」で探す（#1190。
     // kill / resize / open で解決を揃える）。明示指定はそのまま尊重する
-    let socket = tako_core::tmux::resolve_session_socket(socket_arg, session)?;
+    let socket =
+        tako_core::tmux::resolve_session_socket(socket_arg, session).map_err(|e| e.to_string())?;
     // 存在しないセッション名は分割前に弾く（D&D 経路では起こらないが、
     // CLI / MCP からのタイポで空ペインだけが生えるのを防ぐ）。
     // socket 省略時は上の解決が存在を証明しているので、明示指定のときだけ確認する

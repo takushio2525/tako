@@ -715,8 +715,15 @@ pub fn save_config(config: &SetupConfig) -> Result<(), String> {
 /// ロック付き read-modify-write（#169）。
 /// パースに失敗した既存 config.yaml は上書きせず Err で中断する
 pub fn mutate_config<R>(f: impl FnOnce(&mut SetupConfig) -> R) -> Result<R, String> {
-    let path = config_yaml_path()?;
-    mutate_config_at(&path, f)
+    mutate_config_typed(f).map_err(SetupConfigError::into_ja)
+}
+
+/// [`mutate_config`] の型の口（#2365。CLI `tako orchestrator layout` / MCP の dispatch が通る）
+pub fn mutate_config_typed<R>(
+    f: impl FnOnce(&mut SetupConfig) -> R,
+) -> Result<R, SetupConfigError> {
+    let path = config_yaml_path_typed().map_err(SetupConfigError::Load)?;
+    mutate_config_at_typed(&path, f)
 }
 
 /// パス指定版 mutate（テスト用に公開）
@@ -724,13 +731,62 @@ pub fn mutate_config_at<R>(
     path: &Path,
     f: impl FnOnce(&mut SetupConfig) -> R,
 ) -> Result<R, String> {
-    let _lock = crate::config_io::lock_exclusive(path)?;
-    let mut config = load_config_from(path)?;
+    mutate_config_at_typed(path, f).map_err(SetupConfigError::into_ja)
+}
+
+/// [`mutate_config_at`] の型の口（#2365）
+pub fn mutate_config_at_typed<R>(
+    path: &Path,
+    f: impl FnOnce(&mut SetupConfig) -> R,
+) -> Result<R, SetupConfigError> {
+    let _lock = crate::config_io::lock_exclusive_typed(path).map_err(SetupConfigError::Lock)?;
+    let mut config = load_config_from_typed(path).map_err(SetupConfigError::Load)?;
     let result = f(&mut config);
     let content =
-        serde_yaml::to_string(&config).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-    crate::config_io::atomic_write_with_backup(path, &content)?;
+        serde_yaml::to_string(&config).map_err(|e| SetupConfigError::Serialize(e.to_string()))?;
+    crate::config_io::atomic_write_with_backup_typed(path, &content)
+        .map_err(SetupConfigError::Write)?;
     Ok(result)
+}
+
+/// config.yaml の read-modify-write（[`mutate_config_typed`]）の断り（#2365）。日英の対は
+/// [`SetupConfigError::text_in`] の網羅 match の 1 か所で、日本語は #2365 より前の文とバイト一致
+/// （置き場・読み取り・解析は [`SetupRefusal`]、ロックと書き出しは `config_io` の型の文をそのまま使う）
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetupConfigError {
+    /// 置き場を決められない・読めない・解析できない
+    Load(SetupRefusal),
+    /// 排他ロックを取れない
+    Lock(crate::config_io::LockError),
+    /// YAML に書き出せない
+    Serialize(String),
+    /// 書き出せない
+    Write(crate::config_io::WriteError),
+}
+
+impl SetupConfigError {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Load(refusal), Ja | En) => refusal.text_in(lang),
+            (Self::Lock(error), Ja | En) => error.text_in(lang),
+            (Self::Serialize(error), Ja) => format!("YAML のシリアライズに失敗: {error}"),
+            (Self::Serialize(error), En) => format!("failed to serialize YAML: {error}"),
+            (Self::Write(error), Ja | En) => error.text_in(lang),
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(tako_core::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for SetupConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
 }
 
 // --- グローバル指示ファイルと同梱推奨ルールの項目レベル比較（Issue #322） ---

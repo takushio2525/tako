@@ -74,6 +74,70 @@ pub fn registry_path() -> Option<PathBuf> {
     }
 }
 
+/// worker レジストリの読み取りと worker の解決の断り（#2365。CLI `tako orchestrator watch / report /
+/// workers` / MCP の worker 指定）。日英の対は [`RegistryError::text_in`] の網羅 match の 1 か所で、
+/// 日本語は #2365 より前の固定文とバイト一致。`String` を返す従来の口（[`WorkerRegistry::load`] /
+/// [`WorkerRegistry::resolve`] ほか）は日本語のまま（spawn の記録・CLI の手元の処理・stderr）
+#[derive(Debug, Clone, PartialEq)]
+pub enum RegistryError {
+    /// workers.yaml の置き場（ホームディレクトリ）を決められない
+    HomeUnresolved,
+    /// workers.yaml を読めない（中身は OS のエラー文）
+    Read(String),
+    /// workers.yaml を YAML として解釈できない
+    Parse(tako_core::load_issue::YamlReason),
+    /// その worker ID がレジストリに無い
+    NotFound(String),
+    /// 前方一致の候補が 2 件以上ある
+    Ambiguous { id: String, candidates: Vec<String> },
+}
+
+impl RegistryError {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match）。「見つからない」は英語も ` not found`
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::HomeUnresolved, Ja) => "ホームディレクトリが取得できない".to_string(),
+            (Self::HomeUnresolved, En) => "cannot resolve the home directory".to_string(),
+            (Self::Read(error), Ja) => format!("workers.yaml の読み取りに失敗: {error}"),
+            (Self::Read(error), En) => format!("failed to read workers.yaml: {error}"),
+            (Self::Parse(reason), Ja) => {
+                format!("workers.yaml のパースに失敗: {}", reason.text_in(lang))
+            }
+            (Self::Parse(reason), En) => {
+                format!("failed to parse workers.yaml: {}", reason.text_in(lang))
+            }
+            (Self::NotFound(id), Ja) => format!(
+                "worker '{id}' がレジストリに見つからない（tako orchestrator workers で確認）"
+            ),
+            (Self::NotFound(id), En) => format!(
+                "worker '{id}' not found in the registry (check with tako orchestrator workers)"
+            ),
+            (Self::Ambiguous { id, candidates }, Ja) => format!(
+                "worker '{id}' の候補が {} 件ある（完全な ID を指定）: {}",
+                candidates.len(),
+                candidates.join(", ")
+            ),
+            (Self::Ambiguous { id, candidates }, En) => format!(
+                "worker '{id}' matches {} candidates (give the full ID): {}",
+                candidates.len(),
+                candidates.join(", ")
+            ),
+        }
+    }
+
+    /// 従来の `String` の口が返す文（日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(tako_core::i18n::Lang::Ja)
+    }
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
 /// レジストリ本体（workers.yaml のスキーマ）
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerRegistry {
@@ -257,13 +321,18 @@ impl WorkerRegistry {
     ///
     /// 中身が前回と同じなら解釈し直さずに写しを返す（#1968）
     pub fn load_from(path: &Path) -> Result<Self, String> {
+        Self::load_from_typed(path).map_err(RegistryError::into_ja)
+    }
+
+    /// [`Self::load_from`] の型の口（#2365。dispatch が表示言語の文で断る）
+    pub fn load_from_typed(path: &Path) -> Result<Self, RegistryError> {
         if !path.is_file() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("workers.yaml の読み取りに失敗: {e}"))?;
+        let content =
+            std::fs::read_to_string(path).map_err(|e| RegistryError::Read(e.to_string()))?;
         if crate::diag::issue1968_legacy() {
-            return Self::parse(&content);
+            return Self::parse_typed(&content);
         }
         {
             let cache = LOAD_CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -273,24 +342,25 @@ impl WorkerRegistry {
                 }
             }
         }
-        let registry = Self::parse(&content)?;
+        let registry = Self::parse_typed(&content)?;
         *LOAD_CACHE.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((path.to_path_buf(), content, registry.clone()));
         Ok(registry)
     }
 
-    fn parse(content: &str) -> Result<Self, String> {
-        serde_yaml::from_str(content).map_err(|e| {
-            format!(
-                "workers.yaml のパースに失敗: {}",
-                tako_core::load_issue::yaml_error_reason(&e, content)
-            )
-        })
+    fn parse_typed(content: &str) -> Result<Self, RegistryError> {
+        serde_yaml::from_str(content)
+            .map_err(|e| RegistryError::Parse(tako_core::load_issue::YamlReason::of(&e, content)))
     }
 
     pub fn load() -> Result<Self, String> {
-        let path = registry_path().ok_or("ホームディレクトリが取得できない")?;
-        Self::load_from(&path)
+        Self::load_typed().map_err(RegistryError::into_ja)
+    }
+
+    /// [`Self::load`] の型の口（#2365）
+    pub fn load_typed() -> Result<Self, RegistryError> {
+        let path = registry_path().ok_or(RegistryError::HomeUnresolved)?;
+        Self::load_from_typed(&path)
     }
 
     /// ロック付き read-modify-write（config_io。#169 と同型）
@@ -312,6 +382,12 @@ impl WorkerRegistry {
 
     /// worker ID（完全一致 → 前方一致）でエントリを解決する
     pub fn resolve(&self, id_prefix: &str) -> Result<(&String, &WorkerEntry), String> {
+        self.resolve_typed(id_prefix)
+            .map_err(RegistryError::into_ja)
+    }
+
+    /// [`Self::resolve`] の型の口（#2365。dispatch が表示言語の文で断る）
+    pub fn resolve_typed(&self, id_prefix: &str) -> Result<(&String, &WorkerEntry), RegistryError> {
         if let Some((id, entry)) = self.workers.get_key_value(id_prefix) {
             return Ok((id, entry));
         }
@@ -321,18 +397,12 @@ impl WorkerRegistry {
             .filter(|(id, _)| id.starts_with(id_prefix))
             .collect();
         match matches.len() {
-            0 => Err(format!(
-                "worker '{id_prefix}' がレジストリに見つからない（tako orchestrator workers で確認）"
-            )),
+            0 => Err(RegistryError::NotFound(id_prefix.to_string())),
             1 => Ok(matches[0]),
-            n => Err(format!(
-                "worker '{id_prefix}' の候補が {n} 件ある（完全な ID を指定）: {}",
-                matches
-                    .iter()
-                    .map(|(id, _)| id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
+            _ => Err(RegistryError::Ambiguous {
+                id: id_prefix.to_string(),
+                candidates: matches.iter().map(|(id, _)| id.to_string()).collect(),
+            }),
         }
     }
 

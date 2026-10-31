@@ -502,6 +502,24 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   の末尾の節（`Reason` の表・`RemoteRefusal` の表と包みの組み合わせ・本文の往復・`USAGE_REMOTE_SCOPES` /
   `JA_REMOTE_CALLS`・dispatch と CLI の remote 系の口）、実経路は `tests/issue2365_usage_remote_lang.rs`
   （GUI 無しのホストへ MCP と同じ dispatch を日英で通す 27 ケース。偽の tailscale と一時の state / tmux ソケット）
+- #2365 の続きで、**tmux のセッション操作**（kill / resize / select-window / open / 器へのクリック）の断りを tako-core の
+  `tmux::TmuxRefusal`（どこにも無いセッション / 失敗 = `TmuxAction` × `TmuxCause`）と `TmuxRunError`（tmux を起こして
+  待った失敗 = stderr・打ち切り・起動できない）へ寄せた。`kill_session` / `kill_window` / `resize_window` /
+  `reset_window_size` / `select_window` / `resolve_session_socket` / `friendly_error` は**名前を変えずに型を返す**
+  （offload の番犬が `tmux::kill_session(` などの綴りで UI スレッドを見ているので `*_typed` へ逃がさない。
+  診断へ載せる GUI / backend の呼び手は `into_ja` で従来の日本語）。失敗の判定（サーバーが動いていない・
+  セッション / window が無い・接続できない・理由なし・その他）は**修正前と同じ日本語の生の文**で行う
+  （表示言語で判定が変わらない）。tmux 自身の stderr は外部の出力で日英とも同じ（パスらしいトークンだけ伏せる）。
+  ほかに、コミットの詳細（`git::show_commit_typed` / `GitError::CommitUnparsable`）・エディタへの打鍵
+  （`EditorCommand::typed` → `TypeRefusal`）・言語サーバの初期化オプションのキーの形（`init_options::OptionRefusal`。
+  CLI の `--set` の読み取り `parse_assignment` は CLI の手元の処理なので日本語のまま）・worker の解決とレジストリの
+  読み取り（`WorkerRegistry::load_typed` / `load_from_typed` / `resolve_typed` → `RegistryError`）・worker 配置の設定の
+  config.yaml（`setup::mutate_config_typed` → `SetupConfigError`。読むだけは既存の `load_config_typed`）・エージェント
+  一覧（`agents::list_agents_with_panes_typed` → `AgentScanError`）。`String` を返す従来の口は日本語のまま
+  （stderr / persist.log / CLI の手元の処理）。番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（各型の表と
+  `friendly_error` の全文の表・`TMUX_GIT_SCOPES`・`TMUX_DISPATCH_HEADS` / `JA_DISPATCH_CALLS`）と git の節
+  （`show_commit_typed` / `run_git_show`）、実経路は `tests/issue2365_tmux_git_lang.rs`（本物の tmux を一時の
+  `TMUX_TMPDIR` で起こし、失敗の形はソケット名で選ぶ偽の tmux。偽の claude とログインシェル）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

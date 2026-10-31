@@ -249,6 +249,8 @@ pub enum GitError {
     MergeFailed,
     /// 中止できる操作（merge / rebase / cherry-pick / revert）が進行中ではない
     NothingToAbort,
+    /// コミットの詳細を読めない（`git log -1` の出力の欄が足りない = 範囲指定でコミットが 0 件など）
+    CommitUnparsable(String),
 }
 
 impl GitError {
@@ -303,6 +305,10 @@ impl GitError {
             (Self::MergeFailed, En) => "the merge failed".to_string(),
             (Self::NothingToAbort, Ja) => "中止できる操作が進行中ではありません".to_string(),
             (Self::NothingToAbort, En) => "there is no operation in progress to abort".to_string(),
+            (Self::CommitUnparsable(hash), Ja) => format!("コミット {hash} の情報を解析できない"),
+            (Self::CommitUnparsable(hash), En) => {
+                format!("cannot parse the details of commit {hash}")
+            }
         }
     }
 
@@ -1259,8 +1265,13 @@ pub struct CommitDetail {
 /// 変更ファイル一覧を取る（`git show --stat` より機械可読）。
 /// 初期コミット（親なし）は `--root` を付けて対応する
 pub fn show_commit(repo: &Path, hash: &str) -> Result<CommitDetail, String> {
+    show_commit_typed(repo, hash).map_err(GitError::into_ja)
+}
+
+/// [`show_commit`] の型の口（#2365。CLI `tako git show` / MCP `tako_git_show` の dispatch が通る）
+pub fn show_commit_typed(repo: &Path, hash: &str) -> Result<CommitDetail, GitError> {
     const DETAIL_FORMAT: &str = "%H\x01%an\x01%ae\x01%ai\x01%cn\x01%ce\x01%ci\x01%s\x01%b\x01%P";
-    let meta_raw = run_git(
+    let meta_raw = run_git_typed(
         repo,
         &["log", "-1", &format!("--format={DETAIL_FORMAT}"), hash],
     )?;
@@ -1270,7 +1281,7 @@ pub fn show_commit(repo: &Path, hash: &str) -> Result<CommitDetail, String> {
     // body 内に \x01 が入ることは現実的に無いが、分割は先頭 7 + 末尾 1 で固定して安全に取る
     let fields: Vec<&str> = meta_raw.splitn(8, '\x01').collect();
     if fields.len() < 8 {
-        return Err(format!("コミット {hash} の情報を解析できない"));
+        return Err(GitError::CommitUnparsable(hash.to_string()));
     }
     // fields[7] = "subject\x01body\x01parents" — 末尾から parents を分離
     let rest = fields[7];

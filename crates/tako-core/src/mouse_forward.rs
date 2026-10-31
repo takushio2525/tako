@@ -35,7 +35,7 @@ use std::sync::OnceLock;
 use alacritty_terminal::term::TermMode;
 
 use crate::scroll::ScrollTarget;
-use crate::tmux::run_tmux;
+use crate::tmux::{run_tmux, run_tmux_typed, TmuxRunError};
 
 /// 既定は on（Issue #1961 の判断）
 pub const DEFAULT_ENABLED: bool = true;
@@ -422,8 +422,13 @@ pub fn tmux_mouse_flags(target: &ScrollTarget) -> Option<TmuxMouseFlags> {
 }
 
 /// 器のペインへ報告のバイト列を直接注入する（`send-keys -H`。#167 と同じ経路。
-/// background で呼ぶ）。失敗は返すだけ（呼び手が診断へ残す）
+/// background で呼ぶ）。失敗は返すだけ（呼び手が診断へ残す = 日本語の文）
 pub fn send_tmux(target: &ScrollTarget, bytes: &[u8]) -> Result<(), String> {
+    send_tmux_typed(target, bytes).map_err(TmuxRunError::into_ja)
+}
+
+/// [`send_tmux`] の型の口（#2365。AI のクリックの断りは表示言語で引く）
+fn send_tmux_typed(target: &ScrollTarget, bytes: &[u8]) -> Result<(), TmuxRunError> {
     if bytes.is_empty() {
         return Ok(());
     }
@@ -431,7 +436,7 @@ pub fn send_tmux(target: &ScrollTarget, bytes: &[u8]) -> Result<(), String> {
     let mut args: Vec<String> = vec!["send-keys".into(), "-t".into(), t, "-H".into()];
     args.extend(bytes.iter().map(|b| format!("{b:02x}")));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_tmux(socket, &arg_refs).map(|_| ())
+    run_tmux_typed(socket, &arg_refs).map(|_| ())
 }
 
 /// AI のクリック（押す + 離す）を器のペインへ渡す（CLI `tako click` / MCP `tako_send_input` の
@@ -441,7 +446,7 @@ pub fn click_tmux(target: &ScrollTarget, col: usize, row: usize) -> Result<Mouse
     let flags = tmux_mouse_flags(target).ok_or(ClickRefusal::ContainerUnresolved)?;
     let report = decide(flags.report(), flags.in_mode).map_err(not_forwarded_message)?;
     let bytes = click_pair(report, col, row)?;
-    send_tmux(target, &bytes)?;
+    send_tmux_typed(target, &bytes).map_err(|e| e.to_string())?;
     Ok(report)
 }
 

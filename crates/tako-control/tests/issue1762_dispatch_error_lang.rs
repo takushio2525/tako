@@ -11958,10 +11958,11 @@ fn git_error_index(e: &GitError) -> usize {
         GitError::StartPointMissing(_) => 13,
         GitError::MergeFailed => 14,
         GitError::NothingToAbort => 15,
+        GitError::CommitUnparsable(_) => 16,
     }
 }
 
-const GIT_ERROR_VARIANTS: usize = 16;
+const GIT_ERROR_VARIANTS: usize = 17;
 
 /// 見本と、#2365 より前の `git.rs` の固定文（`Failed` は git の stderr = 枠の無い素通し）
 fn git_error_table() -> Vec<(GitError, String)> {
@@ -12023,6 +12024,11 @@ fn git_error_table() -> Vec<(GitError, String)> {
             GitError::NothingToAbort,
             "中止できる操作が進行中ではありません".into(),
         ),
+        // コミットの詳細（`show_commit`。#2365 の 2 本目の続き）
+        (
+            GitError::CommitUnparsable("HEAD..HEAD".into()),
+            "コミット HEAD..HEAD の情報を解析できない".into(),
+        ),
     ]
 }
 
@@ -12059,7 +12065,7 @@ fn gitの書き込み系の断りは全バリアントが日英を持ち日本�
 }
 
 /// git の書き込み系の型の口の本体（断りの文は `GitError` にだけ置く）
-const GIT_TYPED_HEADS: [&str; 15] = [
+const GIT_TYPED_HEADS: [&str; 16] = [
     "fn run_git_typed(",
     "fn run_git_raw_typed(",
     "pub fn validate_branch_name_typed(",
@@ -12075,6 +12081,7 @@ const GIT_TYPED_HEADS: [&str; 15] = [
     "pub fn merge_preview_typed(",
     "pub fn merge_typed(",
     "pub fn abort_operation_typed(",
+    "pub fn show_commit_typed(",
 ];
 
 /// 型の口の本体が呼んではいけない口（`String` を返す日本語の口・型を日本語の文へ戻す `into_ja` /
@@ -12130,7 +12137,7 @@ fn gitの型の口の断りに日本語の固定文が無く日本語の口を�
 }
 
 /// dispatch が呼んではいけない git の日本語の口（型の口 `*_typed` の外側）
-const JA_GIT_CALLS: [&str; 12] = [
+const JA_GIT_CALLS: [&str; 13] = [
     "git::commit(",
     "git::pull(",
     "git::push(",
@@ -12143,13 +12150,16 @@ const JA_GIT_CALLS: [&str; 12] = [
     "git::merge_preview(",
     "git::merge(",
     "git::validate_branch_name(",
+    "git::show_commit(",
 ];
 
-/// dispatch の git の書き込み系（`git_write_reply` と、そこから呼ぶ切替・マージの下見と実行）
-const GIT_DISPATCH_HEADS: [&str; 3] = [
+/// dispatch の git の書き込み系（`git_write_reply` と、そこから呼ぶ切替・マージの下見と実行）と
+/// コミットの詳細（`run_git_show`）
+const GIT_DISPATCH_HEADS: [&str; 4] = [
     "fn git_write_reply(",
     "fn run_git_checkout(",
     "fn run_git_merge(",
+    "fn run_git_show(",
 ];
 
 fn ja_git_calls(lines: &[(usize, &str)]) -> Vec<(usize, &'static str, String)> {
@@ -13336,5 +13346,943 @@ fn next() {
         calls,
         vec![(6, "decide_variant(")],
         "日本語の口だけを名指し、型の口（*_typed）は見逃す"
+    );
+}
+
+// ---- #2365 の続き: tmux のセッション操作（kill / resize / select-window / open / 器へのクリック）・
+// エディタへの打鍵（edit type）・言語サーバの初期化オプション・worker の解決とレジストリの読み取り・
+// worker 配置の設定（orchestrator layout の config.yaml）・エージェント一覧（remote agents）----
+//
+// 修正前は dispatch が tako-core の `tmux.rs`（`resolve_session_socket` / `friendly_error` と、tmux を
+// 起こして待った失敗）・`editor_keys.rs`・`init_options.rs` と、tako-control の `registry.rs`・`setup.rs`・
+// `agents.rs` の `Err(String)`（日本語の固定文）を素通ししていた。tmux 自身の stderr（`TmuxRunError::Failed`）
+// は外部の出力なので日英とも同じ文をそのまま載せる（パスらしいトークンだけは伏せる = #1190）。
+// ここでは各型の表（全バリアントが日英・日本語は #2365 より前の固定文とバイト一致）と、型の口の本体・
+// dispatch の口に日本語の固定文と日本語の口の呼び出しが無いことを `file:line` で名指す
+
+use tako_control::agents::AgentScanError;
+use tako_control::orchestrator::registry::RegistryError;
+use tako_control::setup::SetupConfigError;
+use tako_control::SetupRefusal as Sr;
+use tako_core::lsp::init_options::OptionRefusal;
+use tako_core::platform::editor_keys::TypeRefusal;
+use tako_core::tmux::{TmuxAction, TmuxCause, TmuxRefusal, TmuxRunError};
+
+const TMUX_SRC: &str = include_str!("../../tako-core/src/tmux.rs");
+const TMUX_PATH: &str = "crates/tako-core/src/tmux.rs";
+const EDITOR_KEYS_SRC: &str = include_str!("../../tako-core/src/platform/editor_keys.rs");
+const EDITOR_KEYS_PATH: &str = "crates/tako-core/src/platform/editor_keys.rs";
+const INIT_OPTIONS_SRC: &str = include_str!("../../tako-core/src/lsp/init_options.rs");
+const INIT_OPTIONS_PATH: &str = "crates/tako-core/src/lsp/init_options.rs";
+const REGISTRY_SRC: &str = include_str!("../src/orchestrator/registry.rs");
+const REGISTRY_PATH: &str = "crates/tako-control/src/orchestrator/registry.rs";
+const AGENTS_SRC: &str = include_str!("../src/agents.rs");
+const AGENTS_PATH: &str = "crates/tako-control/src/agents.rs";
+
+fn tmux_run_index(e: &TmuxRunError) -> usize {
+    match e {
+        TmuxRunError::Failed(_) => 0,
+        TmuxRunError::TimedOut(_) => 1,
+        TmuxRunError::Spawn(_) => 2,
+    }
+}
+
+fn tmux_action_index(a: &TmuxAction) -> usize {
+    match a {
+        TmuxAction::KillSession(_) => 0,
+        TmuxAction::KillWindow(_) => 1,
+        TmuxAction::ResizeWindow(_) => 2,
+        TmuxAction::ResetWindowSize(_) => 3,
+        TmuxAction::SelectWindow(_) => 4,
+    }
+}
+
+fn tmux_cause_index(c: &TmuxCause) -> usize {
+    match c {
+        TmuxCause::NoServer => 0,
+        TmuxCause::NoSession => 1,
+        TmuxCause::NoWindow => 2,
+        TmuxCause::Unreachable => 3,
+        TmuxCause::Silent => 4,
+        TmuxCause::Other(_) => 5,
+    }
+}
+
+fn tmux_refusal_index(r: &TmuxRefusal) -> usize {
+    match r {
+        TmuxRefusal::SessionNowhere { .. } => 0,
+        TmuxRefusal::Failed { .. } => 1,
+    }
+}
+
+fn type_refusal_index(r: &TypeRefusal) -> usize {
+    match r {
+        TypeRefusal::Empty => 0,
+        TypeRefusal::TooLong(_) => 1,
+    }
+}
+
+fn option_refusal_index(r: &OptionRefusal) -> usize {
+    match r {
+        OptionRefusal::KeyShape(_) => 0,
+    }
+}
+
+fn registry_error_index(e: &RegistryError) -> usize {
+    match e {
+        RegistryError::HomeUnresolved => 0,
+        RegistryError::Read(_) => 1,
+        RegistryError::Parse(_) => 2,
+        RegistryError::NotFound(_) => 3,
+        RegistryError::Ambiguous { .. } => 4,
+    }
+}
+
+fn setup_config_index(e: &SetupConfigError) -> usize {
+    match e {
+        SetupConfigError::Load(_) => 0,
+        SetupConfigError::Lock(_) => 1,
+        SetupConfigError::Serialize(_) => 2,
+        SetupConfigError::Write(_) => 3,
+    }
+}
+
+fn agent_scan_index(e: &AgentScanError) -> usize {
+    match e {
+        AgentScanError::ScanFailed => 0,
+        AgentScanError::NotUtf8(_) => 1,
+        AgentScanError::NotJson(_) => 2,
+        AgentScanError::NotArray => 3,
+    }
+}
+
+const TMUX_EACCES: &str = "Permission denied (os error 13)";
+const TMUX_ENOENT: &str = "No such file or directory (os error 2)";
+const TMUX_FRAME: &str = "。対象は `tako tmux list` で確認すること";
+
+/// tmux の断りの見本 1 行（見本の Debug・日英の文・#2365 より前の日本語・日英の対を書いた行）
+struct TmuxRow {
+    debug: String,
+    ja: String,
+    en: String,
+    old: String,
+    at: String,
+}
+
+/// tmux の断りの見本と #2365 より前の日本語
+fn tmux_rows() -> Vec<TmuxRow> {
+    let mut rows = Vec::new();
+    let mut push = |debug: String, ja: String, en: String, old: String, at: String| {
+        rows.push(TmuxRow {
+            debug,
+            ja,
+            en,
+            old,
+            at,
+        });
+    };
+    let run_at =
+        |debug: &str, lang| where_written(TMUX_SRC, TMUX_PATH, "impl TmuxRunError {", debug, lang);
+    for (e, old) in [
+        (
+            TmuxRunError::TimedOut(5),
+            "tmux が 5 秒応答しないので打ち切った".to_string(),
+        ),
+        (
+            TmuxRunError::Spawn(TMUX_EACCES.into()),
+            format!("tmux を実行できない: {TMUX_EACCES}"),
+        ),
+    ] {
+        let debug = format!("{e:?}");
+        let at = run_at(&debug, Lang::En);
+        push(debug, e.text_in(Lang::Ja), e.text_in(Lang::En), old, at);
+    }
+    let action_at =
+        |debug: &str, lang| where_written(TMUX_SRC, TMUX_PATH, "impl TmuxAction {", debug, lang);
+    for (a, old) in [
+        (TmuxAction::KillSession("x".into()), "セッション x の kill"),
+        (TmuxAction::KillWindow(4), "window 4 の kill"),
+        (TmuxAction::ResizeWindow(9), "window 9 のリサイズ"),
+        (TmuxAction::ResetWindowSize(9), "window 9 のサイズ解除"),
+        (TmuxAction::SelectWindow(9), "window 9 の選択"),
+    ] {
+        let debug = format!("{a:?}");
+        let at = action_at(&debug, Lang::En);
+        push(
+            debug,
+            a.text_in(Lang::Ja),
+            a.text_in(Lang::En),
+            old.to_string(),
+            at,
+        );
+    }
+    let cause_at =
+        |debug: &str, lang| where_written(TMUX_SRC, TMUX_PATH, "impl TmuxCause {", debug, lang);
+    for (c, old) in [
+        (
+            TmuxCause::NoServer,
+            "tmux サーバー（socket: tk）が動いていない",
+        ),
+        (
+            TmuxCause::NoSession,
+            "tmux セッション s が socket: tk に無い",
+        ),
+        (
+            TmuxCause::NoWindow,
+            "その window が tmux セッション s（socket: tk）に無い",
+        ),
+        (
+            TmuxCause::Unreachable,
+            "tmux サーバー（socket: tk）へ接続できない",
+        ),
+        (
+            TmuxCause::Silent,
+            "tmux が理由を返さずに失敗した（socket: tk）",
+        ),
+        (
+            TmuxCause::Other(TmuxRunError::Failed(
+                "lost server /tmp/tmux-0/x oops".into(),
+            )),
+            "tmux が失敗した（socket: tk）: lost server <path> oops",
+        ),
+        (
+            TmuxCause::Other(TmuxRunError::TimedOut(5)),
+            "tmux が失敗した（socket: tk）: tmux が 5 秒応答しないので打ち切った",
+        ),
+    ] {
+        let debug = format!("{c:?}");
+        let at = cause_at(&debug, Lang::En);
+        push(
+            debug,
+            c.text_in(Lang::Ja, Some("tk"), "s"),
+            c.text_in(Lang::En, Some("tk"), "s"),
+            old.to_string(),
+            at,
+        );
+    }
+    let refusal_at =
+        |debug: &str, lang| where_written(TMUX_SRC, TMUX_PATH, "impl TmuxRefusal {", debug, lang);
+    let nowhere = TmuxRefusal::SessionNowhere {
+        session: "mywork".into(),
+        backend: "tako".into(),
+    };
+    let debug = format!("{nowhere:?}");
+    let at = refusal_at(&debug, Lang::En);
+    push(
+        debug,
+        nowhere.text_in(Lang::Ja),
+        nowhere.text_in(Lang::En),
+        format!(
+            "tmux セッション mywork が見つからない（既定サーバーと tako バックエンド\
+             （socket: tako）のどちらにも無い）{TMUX_FRAME}"
+        ),
+        at,
+    );
+    // 生の失敗を包んだ全文（修正前の `friendly_error` と同じ判定・同じ詰め方）
+    for (action, socket, session, raw, old) in [
+        (
+            TmuxAction::KillWindow(4),
+            Some("tkrev0909"),
+            "tako-02695e295bb1",
+            TmuxRunError::Failed(
+                "error connecting to /private/tmp/tmux-501/default (No such file or directory)"
+                    .into(),
+            ),
+            format!("window 4 の kill に失敗した: tmux サーバー（socket: tkrev0909）が動いていない{TMUX_FRAME}"),
+        ),
+        (
+            TmuxAction::SelectWindow(9),
+            None,
+            "mywork",
+            TmuxRunError::Failed("can't find window: 9".into()),
+            format!("window 9 の選択に失敗した: その window が tmux セッション mywork（既定サーバー）に無い{TMUX_FRAME}"),
+        ),
+        (
+            TmuxAction::KillSession("x".into()),
+            Some("s"),
+            "x",
+            TmuxRunError::Failed("can't find session: x".into()),
+            format!("セッション x の kill に失敗した: tmux セッション x が socket: s に無い{TMUX_FRAME}"),
+        ),
+        (
+            TmuxAction::ResizeWindow(2),
+            None,
+            "x",
+            TmuxRunError::Failed("lost server /tmp/tmux-0/x oops".into()),
+            format!("window 2 のリサイズに失敗した: tmux が失敗した（既定サーバー）: lost server <path> oops{TMUX_FRAME}"),
+        ),
+        (
+            TmuxAction::ResetWindowSize(2),
+            None,
+            "x",
+            TmuxRunError::Failed("   ".into()),
+            format!("window 2 のサイズ解除に失敗した: tmux が理由を返さずに失敗した（既定サーバー）{TMUX_FRAME}"),
+        ),
+        (
+            TmuxAction::KillSession("x".into()),
+            Some("s"),
+            "x",
+            TmuxRunError::TimedOut(5),
+            format!("セッション x の kill に失敗した: tmux が失敗した（socket: s）: tmux が 5 秒応答しないので打ち切った{TMUX_FRAME}"),
+        ),
+        (
+            TmuxAction::KillWindow(1),
+            Some("s"),
+            "x",
+            TmuxRunError::Spawn(TMUX_ENOENT.into()),
+            format!("window 1 の kill に失敗した: tmux サーバー（socket: s）へ接続できない{TMUX_FRAME}"),
+        ),
+        (
+            TmuxAction::KillWindow(1),
+            Some("s"),
+            "x",
+            TmuxRunError::Spawn(TMUX_EACCES.into()),
+            format!("window 1 の kill に失敗した: tmux が失敗した（socket: s）: tmux を実行できない: {TMUX_EACCES}{TMUX_FRAME}"),
+        ),
+        (
+            TmuxAction::SelectWindow(3),
+            Some("s"),
+            "x",
+            TmuxRunError::Failed("session not found: x".into()),
+            format!("window 3 の選択に失敗した: tmux セッション x が socket: s に無い{TMUX_FRAME}"),
+        ),
+    ] {
+        let r = tako_core::tmux::friendly_error(action, socket, session, &raw);
+        let debug = format!("{r:?}");
+        let at = refusal_at("Failed", Lang::En);
+        push(debug, r.text_in(Lang::Ja), r.text_in(Lang::En), old, at);
+    }
+    rows
+}
+
+#[test]
+fn tmuxの断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    covers_every(
+        &[
+            TmuxRunError::Failed("x".into()),
+            TmuxRunError::TimedOut(5),
+            TmuxRunError::Spawn("x".into()),
+        ],
+        tmux_run_index,
+        3,
+        "TmuxRunError",
+    );
+    covers_every(
+        &[
+            TmuxAction::KillSession("x".into()),
+            TmuxAction::KillWindow(1),
+            TmuxAction::ResizeWindow(1),
+            TmuxAction::ResetWindowSize(1),
+            TmuxAction::SelectWindow(1),
+        ],
+        tmux_action_index,
+        5,
+        "TmuxAction",
+    );
+    covers_every(
+        &[
+            TmuxCause::NoServer,
+            TmuxCause::NoSession,
+            TmuxCause::NoWindow,
+            TmuxCause::Unreachable,
+            TmuxCause::Silent,
+            TmuxCause::Other(TmuxRunError::TimedOut(1)),
+        ],
+        tmux_cause_index,
+        6,
+        "TmuxCause",
+    );
+    covers_every(
+        &[
+            TmuxRefusal::SessionNowhere {
+                session: "x".into(),
+                backend: "y".into(),
+            },
+            tako_core::tmux::friendly_error(
+                TmuxAction::KillWindow(1),
+                None,
+                "x",
+                &TmuxRunError::Failed("can't find window: 1".into()),
+            ),
+        ],
+        tmux_refusal_index,
+        2,
+        "TmuxRefusal",
+    );
+    let mut failures = Vec::new();
+    for TmuxRow {
+        debug,
+        ja,
+        en,
+        old,
+        at,
+    } in tmux_rows()
+    {
+        let at = |_: Lang| at.clone();
+        check_setup_row(&mut failures, &debug, &at, &old, &ja, &en);
+        // ソケットのパス・ホームのパスを応答へ出さない（#927 / #1190）
+        if en.contains("/private/") || en.contains("/tmp/") {
+            failures.push(format!("{debug}: 英語にパスが出る: {en}"));
+        }
+    }
+    // tmux 自身の stderr は外部の出力: 日英とも手を加えずにそのまま
+    let raw = TmuxRunError::Failed("can't find session: x".into());
+    if raw.text_in(Lang::Ja) != "can't find session: x"
+        || raw.text_in(Lang::En) != "can't find session: x"
+    {
+        failures.push(format!(
+            "{}: tmux の stderr に手を加えている",
+            where_written(
+                TMUX_SRC,
+                TMUX_PATH,
+                "impl TmuxRunError {",
+                "Failed",
+                Lang::En
+            )
+        ));
+    }
+    for e in [
+        TmuxRunError::TimedOut(5),
+        TmuxRunError::Spawn(TMUX_EACCES.into()),
+        raw,
+    ] {
+        if e.clone().into_ja() != e.text_in(Lang::Ja) {
+            failures.push(format!("{e:?}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+    report_all(failures);
+}
+
+#[test]
+fn 打鍵と初期化オプションとレジストリとconfig_yamlとエージェント一覧の断りは全バリアントが日英を持ち日本語は2365より前とバイト一致(
+) {
+    let mut failures = Vec::new();
+
+    let types = [
+        (
+            TypeRefusal::Empty,
+            "command=type には打つ文字（text）が要る".to_string(),
+        ),
+        (
+            TypeRefusal::TooLong(1001),
+            "command=type は 1 回 1000 文字まで（1001 文字）。\
+             長い本文は tako edit replace-range（MCP は tako_preview_edit_range）で入れる"
+                .to_string(),
+        ),
+    ];
+    covers_every(
+        &types.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+        type_refusal_index,
+        2,
+        "TypeRefusal",
+    );
+    for (r, old) in &types {
+        let debug = format!("{r:?}");
+        let at = |lang| {
+            where_written(
+                EDITOR_KEYS_SRC,
+                EDITOR_KEYS_PATH,
+                "impl TypeRefusal {",
+                &debug,
+                lang,
+            )
+        };
+        check_setup_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &r.text_in(Lang::Ja),
+            &r.text_in(Lang::En),
+        );
+    }
+
+    let options = [(
+        OptionRefusal::KeyShape("bad key".into()),
+        "キーの形が不正: \"bad key\"（ドット区切りの経路。例: cargo.targetDir）".to_string(),
+    )];
+    covers_every(
+        &options.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+        option_refusal_index,
+        1,
+        "OptionRefusal",
+    );
+    for (r, old) in &options {
+        let debug = format!("{r:?}");
+        let at = |lang| {
+            where_written(
+                INIT_OPTIONS_SRC,
+                INIT_OPTIONS_PATH,
+                "impl OptionRefusal {",
+                &debug,
+                lang,
+            )
+        };
+        check_setup_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &r.text_in(Lang::Ja),
+            &r.text_in(Lang::En),
+        );
+        if r.clone().into_ja() != r.text_in(Lang::Ja) {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+
+    let yaml = YamlReason::Located {
+        kind: YamlProblem::Syntax,
+        at: Some((2, 1)),
+    };
+    let registry = [
+        (
+            RegistryError::HomeUnresolved,
+            "ホームディレクトリが取得できない".to_string(),
+        ),
+        (
+            RegistryError::Read(TMUX_EACCES.into()),
+            format!("workers.yaml の読み取りに失敗: {TMUX_EACCES}"),
+        ),
+        (
+            RegistryError::Parse(yaml.clone()),
+            format!("workers.yaml のパースに失敗: {}", yaml.text_in(Lang::Ja)),
+        ),
+        (
+            RegistryError::NotFound("nosuch".into()),
+            "worker 'nosuch' がレジストリに見つからない（tako orchestrator workers で確認）"
+                .to_string(),
+        ),
+        (
+            RegistryError::Ambiguous {
+                id: "1".into(),
+                candidates: vec!["10".into(), "11".into()],
+            },
+            "worker '1' の候補が 2 件ある（完全な ID を指定）: 10, 11".to_string(),
+        ),
+    ];
+    covers_every(
+        &registry.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        registry_error_index,
+        5,
+        "RegistryError",
+    );
+    for (e, old) in &registry {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                REGISTRY_SRC,
+                REGISTRY_PATH,
+                "impl RegistryError {",
+                &debug,
+                lang,
+            )
+        };
+        check_setup_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &e.text_in(Lang::Ja),
+            &e.text_in(Lang::En),
+        );
+        if e.clone().into_ja() != e.text_in(Lang::Ja) {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+
+    let write = WriteError::TmpWrite {
+        path: "/x/config.yaml.tmp".into(),
+        error: TMUX_EACCES.into(),
+    };
+    let configs = [
+        (
+            SetupConfigError::Load(Sr::ConfigHomeUnresolved),
+            Sr::ConfigHomeUnresolved.text_in(Lang::Ja),
+        ),
+        (
+            SetupConfigError::Lock(LockError::CreateDir(TMUX_EACCES.into())),
+            format!("ディレクトリの作成に失敗: {TMUX_EACCES}"),
+        ),
+        (
+            SetupConfigError::Serialize("bad".into()),
+            "YAML のシリアライズに失敗: bad".to_string(),
+        ),
+        (
+            SetupConfigError::Write(write.clone()),
+            write.text_in(Lang::Ja),
+        ),
+    ];
+    covers_every(
+        &configs.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        setup_config_index,
+        4,
+        "SetupConfigError",
+    );
+    for (e, old) in &configs {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                SETUP_SRC,
+                SETUP_PATH,
+                "impl SetupConfigError {",
+                &debug,
+                lang,
+            )
+        };
+        check_setup_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &e.text_in(Lang::Ja),
+            &e.text_in(Lang::En),
+        );
+        if e.clone().into_ja() != e.text_in(Lang::Ja) {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+
+    let agents = [
+        (
+            AgentScanError::ScanFailed,
+            "claude agents --json の実行に失敗（claude CLI が見つからないか異常終了）".to_string(),
+        ),
+        (
+            AgentScanError::NotUtf8("invalid utf-8 sequence of 1 bytes from index 0".into()),
+            "出力が UTF-8 でない: invalid utf-8 sequence of 1 bytes from index 0".to_string(),
+        ),
+        (
+            AgentScanError::NotJson("expected value at line 1 column 1".into()),
+            "JSON パースエラー: expected value at line 1 column 1".to_string(),
+        ),
+        (
+            AgentScanError::NotArray,
+            "claude agents --json の出力が配列でない".to_string(),
+        ),
+    ];
+    covers_every(
+        &agents.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>(),
+        agent_scan_index,
+        4,
+        "AgentScanError",
+    );
+    for (e, old) in &agents {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                AGENTS_SRC,
+                AGENTS_PATH,
+                "impl AgentScanError {",
+                &debug,
+                lang,
+            )
+        };
+        check_setup_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &e.text_in(Lang::Ja),
+            &e.text_in(Lang::En),
+        );
+        if e.clone().into_ja() != e.text_in(Lang::Ja) {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+    report_all(failures);
+}
+
+/// 型の口の本体（断りの文は上の型にだけ置く）と、そこが呼んではならない日本語の口
+/// （`String` を返す従来の口・型を日本語の文へ戻す `into_ja` / `Lang::Ja`）
+const TMUX_GIT_SCOPES: &[(&str, &str, &str, &[&str])] = &[
+    (
+        TMUX_PATH,
+        TMUX_SRC,
+        "fn run_bounded(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        TMUX_PATH,
+        TMUX_SRC,
+        "pub fn kill_session(",
+        &["run_tmux(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        TMUX_PATH,
+        TMUX_SRC,
+        "pub fn kill_window(",
+        &["run_tmux(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        TMUX_PATH,
+        TMUX_SRC,
+        "pub fn resize_window(",
+        &["run_tmux(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        TMUX_PATH,
+        TMUX_SRC,
+        "pub fn reset_window_size(",
+        &["run_tmux(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        TMUX_PATH,
+        TMUX_SRC,
+        "pub fn select_window(",
+        &["run_tmux(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        TMUX_PATH,
+        TMUX_SRC,
+        "pub(crate) fn resolve_session_socket_with(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        TMUX_PATH,
+        TMUX_SRC,
+        "pub fn friendly_error(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        MOUSE_FORWARD_PATH,
+        MOUSE_FORWARD_SRC,
+        "pub fn click_tmux(",
+        &["send_tmux(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        EDITOR_KEYS_PATH,
+        EDITOR_KEYS_SRC,
+        "    pub fn typed(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        INIT_OPTIONS_PATH,
+        INIT_OPTIONS_SRC,
+        "pub fn validate_key(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        INIT_OPTIONS_PATH,
+        INIT_OPTIONS_SRC,
+        "pub fn apply(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        REGISTRY_PATH,
+        REGISTRY_SRC,
+        "    pub fn load_from_typed(",
+        &["load_from(", "Self::parse(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        REGISTRY_PATH,
+        REGISTRY_SRC,
+        "    pub fn load_typed(",
+        &["load_from(", "into_ja", "Lang::Ja"],
+    ),
+    (
+        REGISTRY_PATH,
+        REGISTRY_SRC,
+        "    pub fn resolve_typed(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        SETUP_PATH,
+        SETUP_SRC,
+        "pub fn mutate_config_at_typed<",
+        &[
+            "load_config_from(",
+            "lock_exclusive(",
+            "atomic_write_with_backup(",
+            "into_ja",
+            "Lang::Ja",
+        ],
+    ),
+    (
+        SETUP_PATH,
+        SETUP_SRC,
+        "pub fn mutate_config_typed<",
+        &[
+            "config_yaml_path(",
+            "mutate_config_at(",
+            "into_ja",
+            "Lang::Ja",
+        ],
+    ),
+    (
+        AGENTS_PATH,
+        AGENTS_SRC,
+        "pub fn list_agents_scoped_typed(",
+        &["into_ja", "Lang::Ja"],
+    ),
+    (
+        AGENTS_PATH,
+        AGENTS_SRC,
+        "pub fn list_agents_with_panes_typed(",
+        &[
+            "list_agents_with_freshness(",
+            "list_agents_scoped(",
+            "into_ja",
+            "Lang::Ja",
+        ],
+    ),
+];
+
+/// 走査範囲の中で日本語の口を呼んで断りに載せている行（断りを捨てる文は見ない）
+fn ja_inner_calls<'a>(lines: &[(usize, &str)], calls: &[&'a str]) -> Vec<(usize, &'a str, String)> {
+    let mut out = Vec::new();
+    for (i, (line, code)) in lines.iter().enumerate() {
+        let code_part = code.split("//").next().unwrap_or("");
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        if let Some(call) = calls.iter().find(|c| code_part.contains(*c)) {
+            if !statement_discards_error(lines, i) {
+                out.push((*line, *call, code.trim().to_string()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn tmuxと打鍵とレジストリほかの型の口に日本語の固定文が無く日本語の口を呼ばない() {
+    let mut failures = Vec::new();
+    for (path, src, head, calls) in TMUX_GIT_SCOPES {
+        let Some(lines) = front_scope_lines(src, Some(head)) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{}` が見つからない（改名で番犬が空振りする。TMUX_GIT_SCOPES を直す）",
+                head.trim()
+            ));
+            continue;
+        };
+        for (line, text) in refusal_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 型の口の断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （型へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+        for (line, call, code) in ja_inner_calls(&lines, calls) {
+            failures.push(format!(
+                "{path}:{line}: 型の口が日本語の口 `{call}` を呼んでいる = 英語表示でも中身だけ \
+                 日本語で混ざる（型の口を呼ぶ）: {code}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// dispatch の口（tmux の 5 つの本体・worker の解決と一覧・配置の設定・エージェント一覧・初期化オプション）が
+/// 呼んではならない日本語の口と、型を日本語の文へ戻す呼び出し
+const JA_DISPATCH_CALLS: [&str; 7] = [
+    "WorkerRegistry::load()",
+    "reg.resolve(",
+    "setup::mutate_config(",
+    "setup::load_config()",
+    "agents::list_agents_with_panes(",
+    "into_ja",
+    "Lang::Ja",
+];
+
+const TMUX_DISPATCH_HEADS: [&str; 10] = [
+    "fn tmux_error(",
+    "fn tmux_kill_reply(",
+    "fn tmux_resize_reply(",
+    "fn tmux_select_window_reply(",
+    "fn compute_tmux_open_lookup(",
+    "fn pane_click_tmux_reply(",
+    "fn resolve_worker_query(",
+    "fn finish_workers_list(",
+    "fn dispatch_orchestrator_layout(",
+    "fn remote_agents_reply(",
+];
+
+#[test]
+fn dispatchのtmuxとworkerの解決と配置の設定とエージェント一覧の口は日本語の口を呼ばない() {
+    let mut failures = Vec::new();
+    for head in TMUX_DISPATCH_HEADS
+        .iter()
+        .copied()
+        .chain(["pub fn lsp_server_action("])
+    {
+        let Some(lines) = front_scope_lines(DISPATCH_SRC, Some(head)) else {
+            failures.push(format!(
+                "{DISPATCH_PATH}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする。TMUX_DISPATCH_HEADS を直す）"
+            ));
+            continue;
+        };
+        for (line, call, code) in ja_inner_calls(&lines, &JA_DISPATCH_CALLS) {
+            failures.push(format!(
+                "{DISPATCH_PATH}:{line}: dispatch が日本語の口 `{call}` の断りを載せている = 英語表示でも \
+                 中身だけ日本語で混ざる（型の口を呼んで表示言語の文で載せる）: {code}"
+            ));
+        }
+        for (line, text) in japanese_outside(&lines, &["unreachable!(", ".expect(", "eprintln!("]) {
+            failures.push(format!(
+                "{DISPATCH_PATH}:{line}: dispatch の断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （tako-core の型 / Reason へ寄せる）: {text}"
+            ));
+        }
+    }
+    // エディタへの打鍵（`edit type`）の腕: 型を日本語の文へ戻さない
+    let lines: Vec<(usize, &str)> = DISPATCH_SRC
+        .lines()
+        .enumerate()
+        .map(|(i, l)| (i + 1, l))
+        .collect();
+    match lines
+        .iter()
+        .position(|(_, l)| l.contains("EditorCommand::typed("))
+    {
+        None => failures.push(format!(
+            "{DISPATCH_PATH}: `EditorCommand::typed(` が見つからない（改名で番犬が空振りする）"
+        )),
+        Some(at) => {
+            for (line, code) in &lines[at..(at + 3).min(lines.len())] {
+                if code.contains("into_ja") || code.contains("Lang::Ja") {
+                    failures.push(format!(
+                        "{DISPATCH_PATH}:{line}: 打鍵の断りを日本語の文へ戻している: {}",
+                        code.trim()
+                    ));
+                }
+            }
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 型の口へ書き戻した日本語の固定文と日本語の口の呼び出しを名指し、
+/// 断りを捨てる文・コメント・型の口（`*_typed`）は見逃す
+#[test]
+fn tmuxとレジストリほかの番犬の境界() {
+    let src = r#"pub fn kill_session(socket: Option<&str>, name: &str) -> Result<(), TmuxRunError> {
+    // 断りは表示言語（コメントの日本語は見ない）
+    let _ = run_tmux(socket, &["has-session"]).ok();
+    run_tmux_typed(socket, &["kill-session"]).map(|_| ())?;
+    run_tmux(socket, &["kill-session"]).map(|_| ())?;
+    Err(format!("tmux セッション {name} が無い"))
+}
+fn next() {
+    let _ = "隣の関数（範囲の外）";
+}
+"#;
+    let lines = front_scope_lines(src, Some("pub fn kill_session(")).expect("頭を引ける");
+    let ja: Vec<usize> = refusal_japanese(&lines)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(
+        ja,
+        vec![6],
+        "断りの固定文だけを名指し、コメントと隣は見逃す"
+    );
+    let calls: Vec<(usize, &str)> = ja_inner_calls(&lines, &["run_tmux(", "into_ja"])
+        .into_iter()
+        .map(|(l, c, _)| (l, c))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![(5, "run_tmux(")],
+        "日本語の口だけを名指し、捨てる文と型の口（*_typed）は見逃す"
     );
 }
