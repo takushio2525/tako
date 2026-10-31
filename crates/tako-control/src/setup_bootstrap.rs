@@ -739,7 +739,8 @@ fn shell_target() -> (Option<ShellKind>, Option<PathBuf>) {
 /// `$SHELL` の値からログインシェルの種別を決める（**純粋関数**。#2550）。
 ///
 /// `$SHELL` が**空・未設定**（GUI から起動した .app 等）のときだけ OS の既定を仮定する
-/// （macOS は 10.15 以降 zsh が既定。空を未設定と読むのは `exe::user_shell` と同じ）。
+/// （macOS は 10.15 以降 zsh が既定。空を未設定と読むのは `exe::user_shell` と同じで、そこが同じ既定の
+/// ログインシェル [`tako_core::platform::exe::fallback_login_shell`] に尋ねる = 書いた `.zprofile` を読む。#2583）。
 /// **設定されていて種別の分からないシェル**（nu・tcsh 等）は `None` = 書かずに PATH へ足すディレクトリを返して断る
 /// （構文はそのシェルの書き方に任せる = #2557）。
 /// #2550 より前はこれも zsh と見なし、そのシェルが読まない `.zprofile` へ書いて成功を返していた
@@ -1671,6 +1672,26 @@ pub fn tako_cli_in_path_issue(
     }
 }
 
+/// check-health の `tako_cli_link`（設置した tako CLI のリンクの指す先が消えている）の文（**純粋関数**。#2583）。
+///
+/// `by_hand` = [`tako_cli_dir_by_hand`] が当たる（種別の分からないシェルで置き場所が PATH に無い）。当たるなら
+/// `tako setup bootstrap path` はリンクを張り直した後の PATH の段で同じ断りに止まる（堂々巡り）ので誘導せず、
+/// 起動時の張り直し（tako-app の `repair_tako_cli_link`。シェルに依らず、切れているときだけ張り直す）で閉じる。
+/// PATH へ足す案内は同じ判定の `cli_in_path` / `--check` の行が受け持つ。check-health の診断は表示言語を
+/// 解決しないので日本語で固定する（#1505 / #2576 と同じ）
+pub fn tako_cli_link_issue(link_display: &str, by_hand: bool) -> String {
+    if by_hand {
+        return format!(
+            "tako CLI のリンク（{link_display}）の指す先が消えている。tako.app を移動・入れ直した場合は、\
+             その tako を起動し直すと張り直される（#1502）"
+        );
+    }
+    format!(
+        "tako CLI のリンク（{link_display}）の指す先が消えている。tako.app を移動・削除した場合は \
+         tako setup bootstrap path で張り直すこと（#1502）"
+    )
+}
+
 /// `dirs` をログインシェルの PATH（Windows はユーザー環境変数）へ通す
 fn ensure_dirs_on_path(home: &Path, dirs: &[PathBuf]) -> Result<Value, SetupRefusal> {
     if user_path::is_supported() {
@@ -2035,8 +2056,24 @@ pub fn handoff_candidates_for(target: AgentKind) -> Vec<HandoffCandidate> {
 /// 代行を頼む指示文（**純粋関数**なので文面をテストで固定できる）。
 ///
 /// 「何を・どこへ・どうやって入れるか」と「やってはいけないこと」を書く。
-/// 認証はブラウザ操作が要るので**代行させない**（ユーザーへ依頼させる）
+/// 認証はブラウザ操作が要るので**代行させない**（ユーザーへ依頼させる）。
+/// PATH の段は `tako setup bootstrap path` で通る形（既知のシェル・Windows）。種別の分からないシェルの文は
+/// [`handoff_prompt_text_for`]
 pub fn handoff_prompt_text(plan: &InstallPlan, reason: Option<&str>) -> String {
+    handoff_prompt_text_for(plan, reason, None)
+}
+
+/// [`handoff_prompt_text`] の本体（**純粋関数**。#2583）。
+///
+/// `by_hand` は PATH を利用者が自分のシェルの設定ファイルで足すしかないときの断り
+/// （[`path_by_hand_refusal`] = `tako setup bootstrap path` が返すのと同じ断り）。在れば PATH の段は
+/// そのコマンドを示さず（同じ断りで止まる = #2564 / #2576 と同じ堂々巡り）、断りの全文を利用者へ伝えて
+/// 足してもらう依頼にする（そのシェルの設定ファイルは tako が書かない = 代行させない。#2557）
+pub fn handoff_prompt_text_for(
+    plan: &InstallPlan,
+    reason: Option<&str>,
+    by_hand: Option<&SetupRefusal>,
+) -> String {
     let reason = reason.unwrap_or("tako の自動インストールが通らなかった");
     // 系統名は `--agent` の値にそのまま使える形で出す（AI がコマンドを組めるように）
     let agent = plan.agent;
@@ -2051,6 +2088,21 @@ pub fn handoff_prompt_text(plan: &InstallPlan, reason: Option<&str>) -> String {
         .unwrap_or("公式手順のログイン");
     // claude は既定なので `--agent` を付けない（#322 の最簡形）
     let flag = kind.map(agent_flag).unwrap_or_default();
+    let path_step = match by_hand {
+        Some(refusal) => format!(
+            "3. `next_step` が `path` なら**ユーザーへ次の案内をそのまま伝えて PATH の追加を依頼する**\n\
+             \x20  （このシェルの設定ファイルは tako が書けないので代行しない）:\n\
+             {}\n\
+             \x20  追加してもらったら 2 から確かめ直す\n",
+            refusal
+                .text_in(tako_core::i18n::Lang::Ja)
+                .lines()
+                .map(|line| format!("   > {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+        None => format!("3. `next_step` が `path` なら `tako setup bootstrap path{flag}` を実行する\n"),
+    };
     format!(
         "tako から引き継ぎ: {product}（{agent} CLI）の導入を代行してください。\n\
          \n\
@@ -2068,7 +2120,7 @@ pub fn handoff_prompt_text(plan: &InstallPlan, reason: Option<&str>) -> String {
          \x20  ネットワーク・プロキシ・ディスク容量などの原因を切り分けて対処する\n\
          2. `tako setup bootstrap status{flag} --json` で `next_step` を確認する\n\
          \x20  （`install` のままなら導入できていない）\n\
-         3. `next_step` が `path` なら `tako setup bootstrap path{flag}` を実行する\n\
+         {path_step}\
          4. `next_step` が `auth` なら**ユーザーへ `{auth_command}` の実行を依頼する**\n\
          \x20  （ブラウザ操作が要るので代行しない）\n\
          5. `next_step` が `ready` になったら `tako setup` を実行して設定を完了させる\n\
@@ -2097,7 +2149,14 @@ pub fn handoff_plan_for_typed(
 ) -> Result<Value, SetupRefusal> {
     let plan = install_plan_for_typed(agent)?;
     let candidates = handoff_candidates_for(agent);
-    let prompt = handoff_prompt_text(&plan, reason);
+    // 種別の分からないシェルでは `tako setup bootstrap path` も同じ断りで止まるので、PATH の段は
+    // 利用者への依頼にする（判定は `tako setup` の残り・welcome と同じ 1 実装。#2583）
+    let by_hand = if tako_core::platform::exe::issue2583_legacy() {
+        None
+    } else {
+        path_by_hand_refusal()
+    };
+    let prompt = handoff_prompt_text_for(&plan, reason, by_hand.as_ref());
     let recommended = candidates.first();
     Ok(json!({
         "agent": agent.as_str(),
@@ -2186,6 +2245,26 @@ mod tests {
         ] {
             assert_eq!(shell_kind_for(shell, false), Some(kind), "{shell}");
         }
+    }
+
+    /// #2583: `$SHELL` が空・未設定のとき、setup が書く profile の種別と、ログインシェルの問い合わせ
+    /// （`exe::user_shell` の既定）が起こすシェルの種別が同じ（食い違うと書いた profile が読まれず、
+    /// 初回起動の導線の段が `path` のまま残る）。macOS だけ（他の unix に zsh が在るとは限らない）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shellが空か未設定のときsetupが書くprofileと問い合わせるシェルの種別が同じ() {
+        let asked = tako_core::platform::exe::fallback_login_shell();
+        assert_eq!(
+            ShellKind::from_shell_path(asked),
+            shell_kind_for("", false),
+            "setup は {:?} の profile へ書くが、ログインシェルの問い合わせは {asked} で起こす",
+            shell_kind_for("", false)
+        );
+        assert_eq!(
+            ShellKind::Zsh.login_profile_rel(),
+            ".zprofile",
+            "zsh のログインシェルが読む profile"
+        );
     }
 
     /// #2564: PATH を利用者が自分で足すしかないのは「unix の種別の分からないシェル」だけ。
@@ -2478,6 +2557,47 @@ mod tests {
                 "{platform:?}: 別プラットフォームの手順が混ざっている: {prompt}"
             );
         }
+    }
+
+    /// #2583: 種別の分からないシェルでは PATH の段が `tako setup bootstrap path`（同じ断りで止まる）を示さず、
+    /// 同じ断りの全文を利用者へ伝えて足してもらう依頼になる。それ以外の段は既定の口と同じ行のまま
+    #[test]
+    fn 未知のシェルの引き継ぎの指示文はpathの段で同じ断りで止まるコマンドを示さない() {
+        let plan = plan_for(Platform::MacOs, Path::new("/tmp/h"));
+        let refusal = SetupRefusal::ShellProfileUnknown {
+            shell: "/bin/tcsh".to_string(),
+            dirs: vec!["$HOME/.local/bin".to_string()],
+        };
+        let known = handoff_prompt_text(&plan, None);
+        let by_hand = handoff_prompt_text_for(&plan, None, Some(&refusal));
+        assert!(!by_hand.contains("bootstrap path"), "{by_hand}");
+        assert!(by_hand.contains("代行しない"), "{by_hand}");
+        // 断りの全文（どのシェルか・足すディレクトリ）を引用の形で伝える
+        for line in refusal.text_in(tako_core::i18n::Lang::Ja).lines() {
+            assert!(
+                by_hand.lines().any(|l| l == format!("   > {line}")),
+                "断りの行 {line:?} を伝えていない: {by_hand}"
+            );
+        }
+        // PATH の段の他は同じ（差し替えるのは段 3 だけ）
+        let without_step3 = |text: &str| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut in_step3 = false;
+            for line in text.lines() {
+                if line.starts_with("3. ") {
+                    in_step3 = true;
+                } else if line.starts_with("4. ") {
+                    in_step3 = false;
+                }
+                if !in_step3 {
+                    out.push(line.to_string());
+                }
+            }
+            out
+        };
+        assert_eq!(without_step3(&known), without_step3(&by_hand));
+        assert!(known
+            .contains("3. `next_step` が `path` なら `tako setup bootstrap path` を実行する\n"));
     }
 
     /// 引き継ぎ先に**入れる対象自身**を選ばない（入れる対象なので候補になりえない）。

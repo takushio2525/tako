@@ -460,7 +460,8 @@ fn 種別の分からないシェルはzshと見なさずprofileへ書かずに�
     for (label, shell, kind, profile) in &known {
         let home = fresh_home(&root, label);
         set_shell(shell.as_deref());
-        // 空・未設定では本物の `/bin/sh -l` に尋ねる。そこで本物の claude を引ける環境なら status は
+        // 空・未設定では本物のログインシェル（`exe::fallback_login_shell`。macOS は `/bin/zsh -l` = #2583）に
+        // 尋ねる。そこで本物の claude を引ける環境なら status は
         // 認証の問い合わせで本物を起こすので叩かず、書き先の答えは path の応答だけで見る
         let status = if tako_core::platform::exe::find("claude").is_some() {
             println!("{label}: 本物の claude を引けるので status は叩かない");
