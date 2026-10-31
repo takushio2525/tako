@@ -198,11 +198,12 @@ run_mode() { # $1 = direct | persist
   [ "${wide_n:-0}" -eq 3 ] && pass "$mode soft: 全角のパス 3 本（前置き 3 通り）がすべて 1 本ずつ返る" \
     || fail "$mode soft: 全角のパスが ${wide_n:-0} / 3 本しか返らない"
 
-  # pair: 行末ちょうど幅いっぱいで終わる別々の 2 本（1 本へ融合させない）
+  # pair: 行末ちょうど幅いっぱいで終わる別々の 2 本（1 本へ融合させない）。2 本目の後ろは空行
+  # （幅ちょうどの行のすぐ次に地の文を置くと、端末の折り返しと見分けられない = 修正前からの限界）
   local u1 u2
   u1="$(exact_url a.example.com "$cols")"
   u2="$(exact_url b.example.com "$cols")"
-  printf '%s\n%s\nEND-PAIR\n' "$u1" "$u2" > "$TMP/pair.txt"
+  printf '%s\n%s\n\nEND-PAIR\n' "$u1" "$u2" > "$TMP/pair.txt"
   tk send --pane "$p" "clear; cat '$TMP/pair.txt'" >/dev/null
   wait_for 15 screen_has "$p" END-PAIR || unmeasured "$mode pair: 出力が出ない"
   judge "$mode pair" "$p" "$TMP/$mode-pair.json" "$u1" "$u2"
