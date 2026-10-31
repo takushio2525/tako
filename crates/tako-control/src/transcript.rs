@@ -185,14 +185,24 @@ pub fn resume_env_prefix(session_id: &str) -> Option<String> {
 }
 
 /// transcript の末尾 `tail` 件を正規化 JSON で返す。
-/// 返り値: `{ "session_id": ..., "messages": [...] }`
+/// 返り値: `{ "session_id": ..., "messages": [...] }`。
+///
+/// 断りの文は日本語のまま（daemon が PWA へ返す本文。#2365）。CLI / MCP（dispatch）は表示言語で返す
+/// [`read_messages_typed`] を通る
 pub fn read_messages(session_id: &str, tail: usize) -> Result<Value, String> {
+    read_messages_typed(session_id, tail).map_err(crate::RemoteRefusal::into_ja)
+}
+
+/// [`read_messages`] の型の口（断りは [`crate::RemoteRefusal`]。表示言語で文にする）
+pub fn read_messages_typed(session_id: &str, tail: usize) -> Result<Value, crate::RemoteRefusal> {
+    use crate::RemoteRefusal;
     if !is_valid_session_id(session_id) {
-        return Err("session_id の形式が不正（英数とハイフンのみ）".into());
+        return Err(RemoteRefusal::SessionIdInvalid);
     }
     let path = find_transcript(session_id)
-        .ok_or_else(|| format!("session {session_id} の transcript が見つからない"))?;
-    let file = std::fs::File::open(&path).map_err(|e| format!("transcript を開けない: {e}"))?;
+        .ok_or_else(|| RemoteRefusal::TranscriptNotFound(session_id.to_string()))?;
+    let file =
+        std::fs::File::open(&path).map_err(|e| RemoteRefusal::TranscriptOpen(e.to_string()))?;
     let reader = std::io::BufReader::new(file);
     let messages = normalize_lines(reader.lines().map_while(Result::ok), tail);
     Ok(json!({

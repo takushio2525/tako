@@ -44,6 +44,9 @@
 //! set_mode・後任 master の起動コマンド（`ConfigError` の表と型の口の走査）、非同期 run と手順書の断り
 //! （`Reason` の表と wait.rs / guide.rs の走査）、設定値の範囲（tako-core の `RangeRefusal`）と
 //! paste-guard の許可リスト・規則（`PolicyRefusal`）にも広げた（末尾）。
+//! #2365 の続きで、対応マトリクス・設定の移行・使用量の内訳・起動時ロードの予算の断り（`Reason` の表）と、
+//! remote 系の断り（会話の末尾・端末の登録・daemon の admin API・スクロールバック・リモートのセットアップ =
+//! `RemoteRefusal`）にも広げた（最後）。型の口の本体と、それを呼ぶ dispatch と CLI の口も読んで名指す。
 //!
 //! このファイルは**独立したテストバイナリ**で、言語グローバルを触るのは
 //! `display_follows_the_display_language` の 1 本だけ（ほかは `text_in` で言語を引数に渡す）。
@@ -857,9 +860,20 @@ fn reason_index(r: &Reason) -> usize {
         Reason::RunIdNotFound(_) => 303,
         Reason::RunStartOutsideReceiver => 304,
         Reason::GuideTopicUnknown { .. } => 305,
+        // #2365 の続き: 対応マトリクス・設定の移行・使用量の内訳・起動時ロードの予算
+        Reason::AgentUnknown { .. } => 306,
+        Reason::SupportStatusUnknown { .. } => 307,
+        Reason::PlatformUnknown(_) => 308,
+        Reason::MigrateActionUnknown(_) => 309,
+        Reason::MigrateSchemaUnknown { .. } => 310,
+        Reason::UsageByUnknown { .. } => 311,
+        Reason::UsageWindowUnknown { .. } => 312,
+        Reason::UsageProjectUnreadable { .. } => 313,
+        Reason::UsageIssueUnreadable { .. } => 314,
+        Reason::BudgetEntriesMismatch { .. } => 315,
     }
 }
-const REASON_VARIANTS: usize = 306;
+const REASON_VARIANTS: usize = 316;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1406,6 +1420,42 @@ fn reason_samples() -> Vec<Reason> {
             got: "bogus".into(),
             topics: "spawn / watch".into(),
         },
+        Reason::AgentUnknown {
+            got: "gemini".into(),
+            allowed: "claude / codex / agy / local".into(),
+        },
+        Reason::SupportStatusUnknown {
+            got: "broken".into(),
+            allowed: "supported / degraded / pending / unsupported".into(),
+        },
+        Reason::PlatformUnknown("linux".into()),
+        Reason::MigrateActionUnknown("apply-all".into()),
+        Reason::MigrateSchemaUnknown {
+            got: "bogus".into(),
+            allowed: "settings | layout".into(),
+        },
+        Reason::UsageByUnknown {
+            got: "branch".into(),
+            allowed: "project / issue".into(),
+        },
+        Reason::UsageWindowUnknown {
+            got: "1y".into(),
+            allowed: "5h / 7d".into(),
+        },
+        Reason::UsageProjectUnreadable {
+            got: "project:".into(),
+            unclassified: "none",
+        },
+        Reason::UsageIssueUnreadable {
+            got: "abc".into(),
+            missing: "none",
+        },
+        Reason::BudgetEntriesMismatch {
+            label: ".agent/progress.md".into(),
+            before: 21,
+            kept: 15,
+            archived: 5,
+        },
     ]
 }
 
@@ -1773,6 +1823,18 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "run_id 'run-9' が見つからない",
     "非同期 run の開始は受け口（IPC / MCP）が処理する要求で、dispatch では実行できない",
     "未知の topic: bogus（引けるのは spawn / watch）",
+    // #2365 の続き: 対応マトリクス（agent_support.rs / platform）・設定の移行（migrations.rs）・
+    // 使用量の内訳（usage.rs）・起動時ロードの予算（context_budget.rs）
+    "未知の agent: gemini（claude / codex / agy / local）",
+    "未知の状態: broken（supported / degraded / pending / unsupported）",
+    "未知のプラットフォーム: linux（macos / windows）",
+    "不明な action: apply-all（status | run）",
+    "不明なファイル種別: bogus（settings | layout）",
+    "不明な by: \"branch\"（project / issue のいずれか）",
+    "不明な window: \"1y\"（5h / 7d のいずれか）",
+    "読めない project: \"project:\"（<キー> / project:<キー> / profile:<名前> / none）",
+    "読めない issue: \"abc\"（番号 / #番号 / none）",
+    ".agent/progress.md: 移送でエントリ数が合わない（前 21 / 残 15 + 移送 5）ので書き込まない",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
@@ -12619,4 +12681,660 @@ fn cli_の台帳の手元の処理は日本語の口を呼ばない() {
         ));
     }
     report_all(failures);
+}
+
+// ---- #2365 の続き: 対応マトリクス・設定の移行・使用量の内訳・起動時ロードの予算（`Reason` の表）と、
+// remote 系（会話の末尾・端末の登録・daemon の admin API・スクロールバック・リモートのセットアップ =
+// `RemoteRefusal`） ----
+
+use tako_control::remote_refusal::{DaemonMessage, ScrollbackCause};
+use tako_control::RemoteRefusal;
+
+const REMOTE_REFUSAL_SRC: &str = include_str!("../src/remote_refusal.rs");
+const REMOTE_REFUSAL_PATH: &str = "crates/tako-control/src/remote_refusal.rs";
+const AGENT_SUPPORT_SRC: &str = include_str!("../src/agent_support.rs");
+const AGENT_SUPPORT_PATH: &str = "crates/tako-control/src/agent_support.rs";
+const PLATFORM_MOD_SRC: &str = include_str!("../src/platform/mod.rs");
+const PLATFORM_MOD_PATH: &str = "crates/tako-control/src/platform/mod.rs";
+const MIGRATIONS_SRC: &str = include_str!("../src/migrations.rs");
+const MIGRATIONS_PATH: &str = "crates/tako-control/src/migrations.rs";
+const USAGE_SRC: &str = include_str!("../src/usage.rs");
+const USAGE_PATH: &str = "crates/tako-control/src/usage.rs";
+const CONTEXT_BUDGET_SRC: &str = include_str!("../src/context_budget.rs");
+const CONTEXT_BUDGET_PATH: &str = "crates/tako-control/src/context_budget.rs";
+const TRANSCRIPT_SRC: &str = include_str!("../src/transcript.rs");
+const TRANSCRIPT_PATH: &str = "crates/tako-control/src/transcript.rs";
+const REMOTE_AUTH_SRC: &str = include_str!("../src/remote_auth.rs");
+const REMOTE_AUTH_PATH: &str = "crates/tako-control/src/remote_auth.rs";
+const TAILSCALE_SRC: &str = include_str!("../src/tailscale.rs");
+const TAILSCALE_PATH: &str = "crates/tako-control/src/tailscale.rs";
+const REMOTE_SETUP_SRC: &str = include_str!("../src/remote_setup.rs");
+const REMOTE_SETUP_PATH: &str = "crates/tako-control/src/remote_setup.rs";
+
+/// `RemoteRefusal` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
+fn remote_refusal_index(r: &RemoteRefusal) -> usize {
+    match r {
+        RemoteRefusal::SessionIdInvalid => 0,
+        RemoteRefusal::TranscriptNotFound(_) => 1,
+        RemoteRefusal::TranscriptOpen(_) => 2,
+        RemoteRefusal::DevicesRead(_) => 3,
+        RemoteRefusal::DevicesParse { .. } => 4,
+        RemoteRefusal::DevicesBuild(_) => 5,
+        RemoteRefusal::DevicesWrite(_) => 6,
+        RemoteRefusal::DeviceNotRegistered(_) => 7,
+        RemoteRefusal::RoleInvalid(_) => 8,
+        RemoteRefusal::UpgradeRequiresGui => 9,
+        RemoteRefusal::DaemonNotRunning => 10,
+        RemoteRefusal::DaemonEndpointUnknown => 11,
+        RemoteRefusal::AdminTokenRead(_) => 12,
+        RemoteRefusal::DaemonUnreachable { .. } => 13,
+        RemoteRefusal::DaemonResponseNoHeader => 14,
+        RemoteRefusal::DaemonResponseNoStatus => 15,
+        RemoteRefusal::DaemonResponseParse(_) => 16,
+        RemoteRefusal::DaemonError { .. } => 17,
+        RemoteRefusal::ScrollbackTargetEmpty => 18,
+        RemoteRefusal::ScrollbackTargetNoSession(_) => 19,
+        RemoteRefusal::ScrollbackUnreadable { .. } => 20,
+        RemoteRefusal::ScrollbackPaneUnresolved(_) => 21,
+        RemoteRefusal::ScrollbackLegacy(_) => 22,
+        RemoteRefusal::SetupAnswersInvalid(_) => 23,
+        RemoteRefusal::SetupAnswersJsonInvalid(_) => 24,
+        RemoteRefusal::TailscaleVariantInvalid(_) => 25,
+        RemoteRefusal::TailscaleVariantUnresolved(_) => 26,
+        RemoteRefusal::VariantStateDirUnresolved => 27,
+        RemoteRefusal::VariantStateDirCreate(_) => 28,
+        RemoteRefusal::VariantSave(_) => 29,
+        RemoteRefusal::MagicDnsMissing => 30,
+    }
+}
+const REMOTE_REFUSAL_VARIANTS: usize = 31;
+
+/// `DaemonMessage` / `ScrollbackCause` の通し番号（網羅 match）
+fn daemon_message_index(m: &DaemonMessage) -> usize {
+    match m {
+        DaemonMessage::Refusal(_) => 0,
+        DaemonMessage::Text(_) => 1,
+        DaemonMessage::Missing => 2,
+    }
+}
+fn scrollback_cause_index(c: &ScrollbackCause) -> usize {
+    match c {
+        ScrollbackCause::NoCapture => 0,
+        ScrollbackCause::Backend(_) => 1,
+    }
+}
+
+const EACCES: &str = "Permission denied (os error 13)";
+const TMUX_NO_SERVER: &str = "no server running on /private/tmp/tmux-501/tako-x";
+
+/// 見本と #2365 より前の固定文（`transcript.rs` / `remote.rs` / `remote_auth.rs` / `remote_role.rs` /
+/// `remote_setup.rs` / `tailscale.rs` / dispatch / CLI が書いていた文）。中身の文（OS・serde・tmux）は ASCII
+fn remote_refusal_table() -> Vec<(RemoteRefusal, String)> {
+    let note = tako_control::reach::no_detached_capture_note();
+    vec![
+        (
+            RemoteRefusal::SessionIdInvalid,
+            "session_id の形式が不正（英数とハイフンのみ）".into(),
+        ),
+        (
+            RemoteRefusal::TranscriptNotFound("abc-1".into()),
+            "session abc-1 の transcript が見つからない".into(),
+        ),
+        (
+            RemoteRefusal::TranscriptOpen(EACCES.into()),
+            format!("transcript を開けない: {EACCES}"),
+        ),
+        (
+            RemoteRefusal::DevicesRead(EACCES.into()),
+            format!("devices.json の読み取りに失敗: {EACCES}"),
+        ),
+        (
+            RemoteRefusal::DevicesParse {
+                path: "/tmp/s/devices.json".into(),
+                reason: JsonReason::Located {
+                    kind: JsonProblem::Eof,
+                    line: 2,
+                    column: 0,
+                },
+            },
+            "devices.json の解釈に失敗（/tmp/s/devices.json）: JSON が途中で切れている（2 行 0 列）"
+                .into(),
+        ),
+        (
+            RemoteRefusal::DevicesBuild("key must be a string".into()),
+            "devices.json の構築に失敗: key must be a string".into(),
+        ),
+        (
+            RemoteRefusal::DevicesWrite(EACCES.into()),
+            format!("devices.json の書き込みに失敗: {EACCES}"),
+        ),
+        (
+            RemoteRefusal::DeviceNotRegistered("dev-1".into()),
+            "登録されていないデバイス: dev-1".into(),
+        ),
+        (
+            RemoteRefusal::RoleInvalid("boss".into()),
+            "不正な role: boss（observe / interact / manage / admin）".into(),
+        ),
+        (
+            RemoteRefusal::UpgradeRequiresGui,
+            "権限を上げる操作は tako の画面（設定 → リモート、または承認ダイアログ）からのみ行えます。\
+             CLI / MCP / スマホからは降格と削除だけができます"
+                .into(),
+        ),
+        (
+            RemoteRefusal::DaemonNotRunning,
+            "リモートサーバーが起動していない".into(),
+        ),
+        (
+            RemoteRefusal::DaemonEndpointUnknown,
+            "リモートサーバーの待ち受け先を特定できない（state ファイルが無い）".into(),
+        ),
+        (
+            RemoteRefusal::AdminTokenRead(EACCES.into()),
+            format!("管理トークンの読み取りに失敗: {EACCES}"),
+        ),
+        (
+            RemoteRefusal::DaemonUnreachable {
+                endpoint: "127.0.0.1:50123".into(),
+                error: "Connection refused (os error 61)".into(),
+            },
+            "daemon との通信に失敗 (127.0.0.1:50123): Connection refused (os error 61)".into(),
+        ),
+        (
+            RemoteRefusal::DaemonResponseNoHeader,
+            "daemon の応答が不正（ヘッダ境界なし）".into(),
+        ),
+        (
+            RemoteRefusal::DaemonResponseNoStatus,
+            "daemon の応答が不正（ステータス行なし）".into(),
+        ),
+        (
+            RemoteRefusal::DaemonResponseParse("expected value at line 1 column 1".into()),
+            "daemon の応答を解釈できない: expected value at line 1 column 1".into(),
+        ),
+        (
+            RemoteRefusal::DaemonError {
+                status: 404,
+                message: DaemonMessage::Refusal(Box::new(RemoteRefusal::DeviceNotRegistered(
+                    "dev-1".into(),
+                ))),
+            },
+            "daemon がエラーを返した (404): 登録されていないデバイス: dev-1".into(),
+        ),
+        (
+            RemoteRefusal::ScrollbackTargetEmpty,
+            "ペイン ID / セッション名が空".into(),
+        ),
+        (
+            RemoteRefusal::ScrollbackTargetNoSession(":0.1".into()),
+            "対象指定 ':0.1' からセッション名を取り出せない".into(),
+        ),
+        (
+            RemoteRefusal::ScrollbackUnreadable {
+                session: "tako-x".into(),
+                cause: ScrollbackCause::NoCapture,
+            },
+            format!("セッション tako-x の履歴を読めない: {note}"),
+        ),
+        (
+            RemoteRefusal::ScrollbackPaneUnresolved(7),
+            "ペイン 7 の器のセッションを解決できない（tako-app が起動していて、そのペインが器を持っているかを\
+             確認する。セッション名を直接渡すこともできる）"
+                .into(),
+        ),
+        (
+            RemoteRefusal::ScrollbackLegacy("tmux capture-pane failed".into()),
+            "tmux capture-pane failed".into(),
+        ),
+        (
+            RemoteRefusal::SetupAnswersInvalid(
+                "invalid type: string \"x\", expected a boolean".into(),
+            ),
+            "remote setup answers が不正: invalid type: string \"x\", expected a boolean".into(),
+        ),
+        (
+            RemoteRefusal::SetupAnswersJsonInvalid("EOF while parsing a value".into()),
+            "answers JSON が不正: EOF while parsing a value".into(),
+        ),
+        (
+            RemoteRefusal::TailscaleVariantInvalid("bogus".into()),
+            "Tailscale 系統の指定が不正です: bogus（auto | gui | standalone）。\
+             standalone を選ぶには tailscaled の LocalAPI socket が必要です"
+                .into(),
+        ),
+        (
+            RemoteRefusal::TailscaleVariantUnresolved("bogus".into()),
+            "Tailscale 系統を解決できない: bogus".into(),
+        ),
+        (
+            RemoteRefusal::VariantStateDirUnresolved,
+            "state ディレクトリを解決できない".into(),
+        ),
+        (
+            RemoteRefusal::VariantStateDirCreate("File exists (os error 17)".into()),
+            "state ディレクトリの作成に失敗: File exists (os error 17)".into(),
+        ),
+        (
+            RemoteRefusal::VariantSave(EACCES.into()),
+            format!("Tailscale 系統の保存に失敗: {EACCES}"),
+        ),
+        (
+            RemoteRefusal::MagicDnsMissing,
+            "MagicDNS 名を取得できません".into(),
+        ),
+    ]
+}
+
+/// 包みの組み合わせ（daemon の本文の 3 形・スクロールバックの理由の 2 形）と #2365 より前の文
+fn remote_wrapped_table() -> Vec<(RemoteRefusal, String)> {
+    let backend = BackendError::Operation(TMUX_NO_SERVER.into());
+    vec![
+        (
+            RemoteRefusal::DaemonError {
+                status: 403,
+                message: DaemonMessage::Refusal(Box::new(RemoteRefusal::UpgradeRequiresGui)),
+            },
+            "daemon がエラーを返した (403): 権限を上げる操作は tako の画面（設定 → リモート、または\
+             承認ダイアログ）からのみ行えます。CLI / MCP / スマホからは降格と削除だけができます"
+                .into(),
+        ),
+        (
+            RemoteRefusal::DaemonError {
+                status: 400,
+                message: DaemonMessage::Text("device_id required".into()),
+            },
+            "daemon がエラーを返した (400): device_id required".into(),
+        ),
+        (
+            RemoteRefusal::DaemonError {
+                status: 500,
+                message: DaemonMessage::Missing,
+            },
+            "daemon がエラーを返した (500): 不明なエラー".into(),
+        ),
+        (
+            RemoteRefusal::ScrollbackUnreadable {
+                session: "tako-x".into(),
+                cause: ScrollbackCause::Backend(backend),
+            },
+            format!("セッション tako-x の履歴を読めない: {TMUX_NO_SERVER}"),
+        ),
+    ]
+}
+
+#[test]
+fn remote系の断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let table = remote_refusal_table();
+    covers_every(
+        &table.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+        remote_refusal_index,
+        REMOTE_REFUSAL_VARIANTS,
+        "RemoteRefusal",
+    );
+    let wrapped = remote_wrapped_table();
+    let mut messages = Vec::new();
+    let mut causes = Vec::new();
+    for (r, _) in table.iter().chain(&wrapped) {
+        match r {
+            RemoteRefusal::DaemonError { message, .. } => messages.push(message.clone()),
+            RemoteRefusal::ScrollbackUnreadable { cause, .. } => causes.push(cause.clone()),
+            _ => {}
+        }
+    }
+    covers_every(&messages, daemon_message_index, 3, "DaemonMessage");
+    covers_every(&causes, scrollback_cause_index, 2, "ScrollbackCause");
+
+    let mut failures = Vec::new();
+    for (r, old) in table.iter().chain(&wrapped) {
+        let debug = format!("{r:?}");
+        let at = |lang| {
+            where_written(
+                REMOTE_REFUSAL_SRC,
+                REMOTE_REFUSAL_PATH,
+                "impl RemoteRefusal {",
+                &debug,
+                lang,
+            )
+        };
+        let (ja, en) = (r.text_in(Lang::Ja), r.text_in(Lang::En));
+        if let RemoteRefusal::ScrollbackLegacy(text) = r {
+            // 修正前の再現（A/B の腕）の文は tako が組まない: 日英とも手を加えずにそのまま
+            if ja != *text || en != *text {
+                failures.push(format!(
+                    "{}: {debug}: 修正前の再現の文に手を加えている\n  ja: {ja}\n  en: {en}",
+                    at(Lang::En)
+                ));
+            }
+        } else {
+            check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+        }
+        if r.clone().into_ja() != ja {
+            failures.push(format!("{debug}: into_ja が text_in(Ja) と違う"));
+        }
+    }
+    report_all(failures);
+}
+
+/// daemon の admin API の本文（`admin_body`）を頼んだ側（`from_admin_body`）が読み直すと、同じ断りに戻る。
+/// `error` は修正前と同じ日本語（PWA・旧版の頼み手が読む）、`kind` の無い本文は `error` をそのまま載せる
+#[test]
+fn daemonの断りの本文はkindで呼び手の言語に組み直せる() {
+    let mut failures = Vec::new();
+    for r in [
+        RemoteRefusal::DeviceNotRegistered("dev-1".into()),
+        RemoteRefusal::UpgradeRequiresGui,
+    ] {
+        let body = r.admin_body();
+        if body["error"].as_str() != Some(r.text_in(Lang::Ja).as_str()) {
+            failures.push(format!("{r:?}: 本文の error が日本語の旧文と違う: {body}"));
+        }
+        match RemoteRefusal::from_admin_body(&body) {
+            DaemonMessage::Refusal(back) if *back == r => {}
+            other => failures.push(format!("{r:?}: 本文 {body} を読み直すと {other:?}")),
+        }
+    }
+    // kind の無い本文（旧版の daemon・それ以外の断り）は error をそのまま、error も無ければ「不明」
+    let plain = serde_json::json!({ "error": "device_id が必要" });
+    if RemoteRefusal::from_admin_body(&plain) != DaemonMessage::Text("device_id が必要".into()) {
+        failures.push(format!(
+            "kind の無い本文 {plain} の error をそのまま載せていない"
+        ));
+    }
+    if RemoteRefusal::from_admin_body(&serde_json::json!({})) != DaemonMessage::Missing {
+        failures.push("error の無い本文を「不明」にしていない".into());
+    }
+    // kind が登録されていない端末なのに device_id が無い本文は組み直さない（error をそのまま）
+    let partial = serde_json::json!({ "error": "x", "kind": "device_not_registered" });
+    if RemoteRefusal::from_admin_body(&partial) != DaemonMessage::Text("x".into()) {
+        failures.push(format!("device_id の無い本文 {partial} を組み直している"));
+    }
+    report_all(failures);
+}
+
+/// 型の口の本体（断りの文は `Reason` / `RemoteRefusal` にだけ置く。日本語の固定文を書かない範囲）。
+/// `internal` は走査から外す呼び出し（`Ok` の値の注記 = 系統を決めた理由・各段の message）
+const USAGE_REMOTE_SCOPES: &[(&str, &str, &str, &[&str])] = &[
+    (
+        AGENT_SUPPORT_PATH,
+        AGENT_SUPPORT_SRC,
+        "pub fn report(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        PLATFORM_MOD_PATH,
+        PLATFORM_MOD_SRC,
+        "pub fn report(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        MIGRATIONS_PATH,
+        MIGRATIONS_SRC,
+        "pub fn report_json(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        USAGE_PATH,
+        USAGE_SRC,
+        "    pub fn parsed_typed(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        USAGE_PATH,
+        USAGE_SRC,
+        "    pub fn filters_typed(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        CONTEXT_BUDGET_PATH,
+        CONTEXT_BUDGET_SRC,
+        "pub fn fix(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        TRANSCRIPT_PATH,
+        TRANSCRIPT_SRC,
+        "pub fn read_messages_typed(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_AUTH_PATH,
+        REMOTE_AUTH_SRC,
+        "    pub fn open_typed(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_AUTH_PATH,
+        REMOTE_AUTH_SRC,
+        "    fn save_typed(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_AUTH_PATH,
+        REMOTE_AUTH_SRC,
+        "    pub fn revoke_typed(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_AUTH_PATH,
+        REMOTE_AUTH_SRC,
+        "    pub fn set_role_typed(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_PATH,
+        REMOTE_SRC,
+        "pub fn admin_request(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_PATH,
+        REMOTE_SRC,
+        "pub fn devices_set_role(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_PATH,
+        REMOTE_SRC,
+        "pub fn devices_list(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_PATH,
+        REMOTE_SRC,
+        "pub fn devices_revoke(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_PATH,
+        REMOTE_SRC,
+        "pub(crate) fn parse_scrollback_target(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_PATH,
+        REMOTE_SRC,
+        "pub fn scrollback(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_PATH,
+        REMOTE_SRC,
+        "pub fn scrollback_session(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_PATH,
+        REMOTE_SRC,
+        "fn resolve_scrollback_session(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        TAILSCALE_PATH,
+        TAILSCALE_SRC,
+        "pub fn save_variant_typed(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REMOTE_SETUP_PATH,
+        REMOTE_SETUP_SRC,
+        "pub fn decide_variant_typed(",
+        &["unreachable!(", ".expect(", "reason: "],
+    ),
+    (
+        REMOTE_SETUP_PATH,
+        REMOTE_SETUP_SRC,
+        "pub fn run_noninteractive(",
+        &["unreachable!(", ".expect(", "message: "],
+    ),
+];
+
+/// 型の口が呼んではならない日本語の口（`String` を返す従来の口。断りの文が日本語で固定される）
+const JA_REMOTE_CALLS: [&str; 7] = [
+    "read_messages(",
+    "DeviceRegistry::open(",
+    ".save()",
+    ".revoke(",
+    ".set_role(",
+    "save_variant(",
+    "decide_variant(",
+];
+
+/// 行の中の日本語の口の呼び出し（コメントは外す）
+fn ja_remote_calls(lines: &[(usize, &str)]) -> Vec<(usize, &'static str, String)> {
+    let mut out = Vec::new();
+    for (line, code) in lines {
+        let code_part = code.split("//").next().unwrap_or("");
+        for call in JA_REMOTE_CALLS {
+            if code_part.contains(call) {
+                out.push((*line, call, code.trim().to_string()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn 使用量と対応表と移行とremote系の型の口に日本語の固定文が無く日本語の口を呼ばない() {
+    let mut failures = Vec::new();
+    for (path, src, head, internal) in USAGE_REMOTE_SCOPES {
+        let Some(lines) = run_value_lines(src, head) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{}` が見つからない（改名で番犬が空振りする。USAGE_REMOTE_SCOPES を直す）",
+                head.trim()
+            ));
+            continue;
+        };
+        for (line, text) in japanese_outside(&lines, internal) {
+            failures.push(format!(
+                "{path}:{line}: 断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （Reason / RemoteRefusal へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+        for (line, call, code) in ja_remote_calls(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 型の口が日本語の口 `{call}…` を呼んでいる = 英語表示でも断りが日本語で返る \
+                 （`*_typed` を呼ぶ）: {code}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// dispatch の remote 系の腕と、CLI の手元の処理（`tako remote messages / devices / scrollback / setup`）は
+/// 型の口を通り、CLI は呼ぶ前に表示言語を設定から決める
+#[test]
+fn dispatchとcliのremote系の口は日本語の口を呼ばない() {
+    let mut failures = Vec::new();
+    for head in [
+        "        Request::RemoteMessages { session_id, tail } =>",
+        "        Request::RemoteSetup { action, answers } =>",
+    ] {
+        let Some(lines) = run_value_lines(DISPATCH_SRC, head) else {
+            failures.push(format!(
+                "{DISPATCH_PATH}: 走査の範囲 `{}` が見つからない（改名で番犬が空振りする）",
+                head.trim()
+            ));
+            continue;
+        };
+        for (line, call, code) in ja_remote_calls(&lines) {
+            failures.push(format!(
+                "{DISPATCH_PATH}:{line}: dispatch が日本語の口 `{call}…` を呼んでいる: {code}"
+            ));
+        }
+        for (line, text) in japanese_outside(&lines, &["unreachable!(", ".expect("]) {
+            failures.push(format!(
+                "{DISPATCH_PATH}:{line}: dispatch の remote 系の腕に日本語の固定文がある: {text}"
+            ));
+        }
+    }
+    for head in [
+        "fn remote_devices(",
+        "fn remote_messages(",
+        "fn remote_scrollback(",
+        "fn remote_setup_cli(",
+    ] {
+        let Some(lines) = front_scope_lines(CLI_MAIN_SRC, Some(head)) else {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする）"
+            ));
+            continue;
+        };
+        for (line, call, code) in ja_remote_calls(&lines) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}:{line}: CLI の手元の処理が日本語の口 `{call}…` を呼んでいる \
+                 = 英語表示でも断りが日本語で出る: {code}"
+            ));
+        }
+        for (line, text) in japanese_outside(&lines, &["unreachable!(", ".expect("]) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}:{line}: CLI の手元の処理の断りに日本語の固定文がある: {text}"
+            ));
+        }
+        if !lines.iter().any(|(_, l)| l.contains("init_local_lang()")) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}: `{head}` が表示言語を設定から決めていない（init_local_lang() を呼ぶ）"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 型の口へ書き戻した日本語の固定文と日本語の口の呼び出しを名指し、`Ok` の値の注記
+/// （`message: ` / `reason: `）とコメントは見逃す
+#[test]
+fn 使用量とremote系の番犬の境界() {
+    let src = r#"pub fn run_noninteractive(answers: &A) -> Result<Value, RemoteRefusal> {
+    // 断りは表示言語（コメントの日本語は見ない）
+    result.steps.push(Step {
+        message: format!("固定 URL: {ts_url}"),
+    });
+    let decision = decide_variant(answers.tailscale.as_deref())?;
+    let dns = status.dns.ok_or_else(|| "MagicDNS 名を取得できません".to_string())?;
+    let typed = decide_variant_typed(None)?;
+    Ok(json!({}))
+}
+fn next() {
+    let _ = "隣の関数（範囲の外）";
+}
+"#;
+    let lines = run_value_lines(src, "pub fn run_noninteractive(").expect("頭を引ける");
+    let ja: Vec<usize> = japanese_outside(&lines, &["unreachable!(", ".expect(", "message: "])
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(
+        ja,
+        vec![7],
+        "断りの固定文だけを名指し、注記とコメントと隣は見逃す"
+    );
+    let calls: Vec<(usize, &str)> = ja_remote_calls(&lines)
+        .into_iter()
+        .map(|(l, c, _)| (l, c))
+        .collect();
+    assert_eq!(
+        calls,
+        vec![(6, "decide_variant(")],
+        "日本語の口だけを名指し、型の口（*_typed）は見逃す"
+    );
 }

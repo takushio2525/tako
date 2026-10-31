@@ -18,23 +18,31 @@ const STATUSES: [&str; 4] = ["supported", "degraded", "pending", "unsupported"];
 ///
 /// `agent` 省略時は**全系統ぶんの表**（docs 生成と俯瞰用）、
 /// 指定時はその系統だけを返す。`status` 省略時は全件。
+///
+/// 知らない値の断りは表示言語（`Reason` の Display。呼び手は dispatch と、表示言語を設定から決めてから
+/// 呼ぶ CLI の手元の処理だけ。#2365）
 pub fn report(agent: Option<&str>, status: Option<&str>) -> Result<Value, String> {
     let target = match agent {
         Some(a) => Some(Agent::parse(a).ok_or_else(|| {
-            format!(
-                "未知の agent: {a}（{}）",
-                Agent::ALL
+            crate::Reason::AgentUnknown {
+                got: a.to_string(),
+                allowed: Agent::ALL
                     .iter()
                     .map(|x| x.as_str())
                     .collect::<Vec<_>>()
-                    .join(" / ")
-            )
+                    .join(" / "),
+            }
+            .to_string()
         })?),
         None => None,
     };
     if let Some(s) = status {
         if !STATUSES.contains(&s) {
-            return Err(format!("未知の状態: {s}（{}）", STATUSES.join(" / ")));
+            return Err(crate::Reason::SupportStatusUnknown {
+                got: s.to_string(),
+                allowed: STATUSES.join(" / "),
+            }
+            .to_string());
         }
     }
 

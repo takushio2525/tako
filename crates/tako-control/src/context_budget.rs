@@ -635,13 +635,15 @@ pub fn fix(cwd: &Path, profile: Option<&str>, dry_run: bool) -> Result<Value, St
         let plan = budget::plan_prune(&it.text, &archive_text, today);
 
         if !plan.entries_preserved() {
-            return Err(format!(
-                "{}: 移送でエントリ数が合わない（前 {} / 残 {} + 移送 {}）ので書き込まない",
-                it.label,
-                plan.entries_before,
-                plan.kept.len(),
-                plan.archived.len()
-            ));
+            // 表示言語（`Reason` の Display。呼び手は dispatch と、表示言語を設定から決めてから呼ぶ
+            // CLI の手元の処理だけ。#2365）
+            return Err(crate::Reason::BudgetEntriesMismatch {
+                label: it.label.clone(),
+                before: plan.entries_before,
+                kept: plan.kept.len(),
+                archived: plan.archived.len(),
+            }
+            .to_string());
         }
         if plan.is_noop() {
             changes.push(json!({

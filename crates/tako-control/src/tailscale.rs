@@ -826,15 +826,23 @@ pub fn saved_variant() -> Option<TailscaleVariant> {
     TailscaleVariant::parse(&raw)
 }
 
-/// 選択を保存する。以後の `tako remote start` はこの系統へ話しかける
+/// 選択を保存する。以後の `tako remote start` はこの系統へ話しかける。
+/// 断りの文は日本語のまま（#2365。表示言語で返す口は [`save_variant_typed`]）
 pub fn save_variant(variant: &TailscaleVariant) -> Result<(), String> {
+    save_variant_typed(variant).map_err(crate::RemoteRefusal::into_ja)
+}
+
+/// [`save_variant`] の型の口（`tako remote setup` の非対話の経路 = CLI / MCP が通る）
+pub fn save_variant_typed(variant: &TailscaleVariant) -> Result<(), crate::RemoteRefusal> {
+    use crate::RemoteRefusal;
     let dir = selection_path()
         .parent()
         .map(|d| d.to_path_buf())
-        .ok_or("state ディレクトリを解決できない")?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("state ディレクトリの作成に失敗: {e}"))?;
+        .ok_or(RemoteRefusal::VariantStateDirUnresolved)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| RemoteRefusal::VariantStateDirCreate(e.to_string()))?;
     crate::remote::write_state_file(&selection_path(), variant.key())
-        .map_err(|e| format!("Tailscale 系統の保存に失敗: {e}"))
+        .map_err(|e| RemoteRefusal::VariantSave(e.to_string()))
 }
 
 /// 保存済みの選択を消す（自動判定へ戻す）

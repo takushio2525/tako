@@ -117,7 +117,10 @@ pub fn known_limitations_markdown(platform: Platform) -> String {
 ///
 /// `known_limitations` を立てると、リリースノート用の Known limitations 節
 /// （#594）を `known_limitations_markdown` フィールドに載せる。既定で載せないのは
-/// AI が診断で叩く経路の応答を膨らませないため
+/// AI が診断で叩く経路の応答を膨らませないため。
+///
+/// 知らない値の断りは表示言語（`Reason` の Display。呼び手は dispatch と、表示言語を設定から決めてから
+/// 呼ぶ CLI の手元の処理だけ。#2365）
 pub fn report(
     platform: Option<&str>,
     status: Option<&str>,
@@ -125,13 +128,17 @@ pub fn report(
 ) -> Result<Value, String> {
     let target = match platform {
         Some(p) => Platform::parse(p)
-            .ok_or_else(|| format!("未知のプラットフォーム: {p}（macos / windows）"))?,
+            .ok_or_else(|| crate::Reason::PlatformUnknown(p.to_string()).to_string())?,
         None => Platform::current(),
     };
     if let Some(s) = status {
         const KNOWN: [&str; 4] = ["supported", "degraded", "pending", "unsupported"];
         if !KNOWN.contains(&s) {
-            return Err(format!("未知の状態: {s}（{}）", KNOWN.join(" / ")));
+            return Err(crate::Reason::SupportStatusUnknown {
+                got: s.to_string(),
+                allowed: KNOWN.join(" / "),
+            }
+            .to_string());
         }
     }
     let features: Vec<Value> = support::features(target, status)

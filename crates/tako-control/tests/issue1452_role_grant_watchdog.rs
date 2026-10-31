@@ -270,8 +270,9 @@ fn リクエストの起票と権限変更の失敗が無言にならない() {
         .find("\n    }\n")
         .map(|i| admin_at + i)
         .unwrap_or(settings.len());
+    // #2365: 断りは `RemoteRefusal`（画面の表示言語で文にする）
     assert!(
-        settings[admin_at..body_end].contains("self.message = Some((e, true))"),
+        settings[admin_at..body_end].contains("self.message = Some((e.to_string(), true))"),
         "crates/tako-app/src/settings_window.rs:{}: 権限変更の失敗を画面へ出していない\n\
          （昇格を断られたことが分からないと、ユーザーは押し続ける）",
         settings[..admin_at].lines().count() + 1
