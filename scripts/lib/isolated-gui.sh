@@ -187,7 +187,10 @@ ISOLATED_GUI_FOREIGN_REASON=""
 # 残すと検証の claude / tako が本番の GUI・本番の mod・呼び出し元の会話へ繋がる。
 # 呼び出し側が `VAR=VAL` を並べたものは落とさない（並べた値が届く）。
 # **本番側で注入する env を増やしたら、ここにも足す**（番犬 verification_isolation_watchdog が
-# tako-app の spawn_session と tako-core の表から突き合わせて落とす）
+# tako-app の spawn_session と tako-core の表から突き合わせて落とす）。
+# #2570 以後は GUI 自身も起動の最初に外す（正本 `tako_core::host_env::STRIP`）。ここは #2570 より前の
+# バイナリ（修正前の木の A/B）のために残す。**ここに載せる名前は STRIP にも載せる**
+# （番犬 issue2570_inherited_pane_env_watchdog が file:line で落とす）
 ISOLATED_GUI_DROP_ENV=(
     # 制御プレーン（tako-app の spawn_session が積む）
     TAKO_SOCKET TAKO_TOKEN TAKO_MCP_URL TAKO_PANE_ID TAKO_TAB_ID

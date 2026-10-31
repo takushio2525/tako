@@ -5393,6 +5393,12 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
 | 本物の claude の設定 dir を使わせない | export された `CLAUDE_CONFIG_DIR` は使わない。GUI の HOME が一時の dir なら外すだけ（claude はその HOME の `.claude`）、利用者のホームのままならログの置き場の隣の一時 dir（`$ISOLATED_GUI_CLAUDE_CONFIG_DIR`） | 本物の認証で実物の claude を動かす検証だけが `CLAUDE_CONFIG_DIR="$CCD"` を並べる（`test-claude-mod-1879.sh` ほか mod の 4 本） |
 | 既定の `.zshrc` | GUI の ZDOTDIR（無ければ HOME）が利用者のホームの外で、zsh の rc が 1 つも無ければ固定プロンプト（`tako %1~ %% `）の `.zshrc` を置く。zsh の初回設定メニューが `tako send` の入力を食う（#1945）・画面に実ユーザー名を出さない（#927） | 自分の rc を先に置けば書かない |
 
+- **#2570 以後は GUI 自身も起動の最初にペインの中でだけ意味を持つ env を外す**（正本
+  `tako_core::host_env::STRIP`・FR-2.1.5）。`ISOLATED_GUI_DROP_ENV` は #2570 より前のバイナリのために残し、
+  **載せる名前は `STRIP` にも載せる**（番犬 `issue2570_inherited_pane_env_watchdog`）。GUI が外さない
+  隔離の指定（`TAKO_DATA_DIR` / `TAKO_TMUX_SOCKET` / `TAKO_SESSIONS_FILE` ほか = `host_env::KEPT`）は
+  ペインへそのまま届くので、**ペインの中から隔離 GUI を起こすときは置き場とソケットを明示する**
+  （明示しないと起こした側の GUI の置き場を共有する）
 - **HOME を本物のままにした起動では、ペインのシェルが利用者の rc を読む**。rc が `CLAUDE_CONFIG_DIR` を
   export していれば、ペインで打った claude は本物の設定 dir を使う（GUI の env では止められない）。
   ペインの claude まで隔離するなら一時の HOME か ZDOTDIR を並べる（既存の検証の大半はそうしている）

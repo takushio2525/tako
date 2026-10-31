@@ -610,14 +610,21 @@ pub fn helper_env(
 ) -> Vec<(&'static str, Option<String>)> {
     let mut out: Vec<(&'static str, Option<String>)> =
         HELPER_DROP_ENV.iter().map(|key| (*key, None)).collect();
-    if inherited_plugin_dirs.is_some_and(|v| v.split(sep).any(is_tako_mod_entry)) {
-        let user = user_entries(inherited_plugin_dirs, sep);
-        out.push((
-            PLUGIN_DIRS_ENV,
-            (!user.is_empty()).then(|| user.join(&sep.to_string())),
-        ));
+    if let Some(user) = inherited_plugin_dirs.and_then(|v| without_tako_mod(v, sep)) {
+        out.push((PLUGIN_DIRS_ENV, user));
     }
     out
+}
+
+/// [`PLUGIN_DIRS_ENV`] の値から tako の mod の置き場を抜いた残り（利用者自身の分）。
+/// tako の分が無ければ `None`（触らない）、残りが無ければ `Some(None)`（名前ごと外す）。
+/// 補助の子（[`helper_env`]）と、ペインの中から起こされた GUI 自身（`host_env`。#2570）が使う
+pub(crate) fn without_tako_mod(value: &str, sep: char) -> Option<Option<String>> {
+    if !value.split(sep).any(is_tako_mod_entry) {
+        return None;
+    }
+    let user = user_entries(Some(value), sep);
+    Some((!user.is_empty()).then(|| user.join(&sep.to_string())))
 }
 
 /// mod の報告の送り主がどこで動いているか（#2559。[`report_origin`] が決める）
