@@ -285,6 +285,13 @@ impl TakoApp {
                 Some(txt::path_button().to_string()),
                 false,
             ),
+            // #2576: そのシェルの設定ファイルは tako が書けない = 足すディレクトリを見せ、ボタンは確かめ直す
+            Some(NextStep::PathByHand { agent, dirs, .. }) => (
+                next(txt::path_by_hand_step(agent.as_str(), dirs)),
+                Some(dirs.join("  ")),
+                Some(txt::path_by_hand_button().to_string()),
+                false,
+            ),
             Some(NextStep::Login { agent, .. }) => (
                 next(txt::login_step(&txt::account(*agent))),
                 None,

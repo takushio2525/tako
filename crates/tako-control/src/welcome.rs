@@ -45,6 +45,7 @@ use tako_core::platform::shell_dialect::ShellDialect;
 
 use crate::settings::Settings;
 use crate::setup_bootstrap::{BootstrapState, InstallPlan, Step};
+use crate::SetupRefusal;
 
 /// バナーを出すか（純関数。テストと実運用が同じ判定を通る）。
 ///
@@ -343,6 +344,15 @@ pub enum NextStep {
     Install { agent: AgentKind, plan: InstallPlan },
     /// PATH を通す（自動の段が受け持つ）
     Path { agent: AgentKind },
+    /// PATH を、利用者が自分のシェルの設定ファイルで足す（#2576）。種別の分からないシェル（tcsh・nu 等）は
+    /// tako が設定ファイルを書けず、`tako setup bootstrap path` も自動の段も同じ断りで止まる（堂々巡り）ので、
+    /// 打つコマンドを持たない。`shell` / `dirs` はその断り（[`SetupRefusal::ShellProfileUnknown`]）の中身 =
+    /// 足すディレクトリの一覧（`$HOME/…` の式・重複なし）
+    PathByHand {
+        agent: AgentKind,
+        shell: String,
+        dirs: Vec<String>,
+    },
     /// ログインする（ブラウザ操作。ボタンでペインを開いてコマンドを打つ）
     Login {
         agent: AgentKind,
@@ -360,7 +370,8 @@ impl NextStep {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Install { .. } => "install",
-            Self::Path { .. } => "path",
+            // 段は同じ PATH（違うのは打つコマンドが無いこと = #2576）
+            Self::Path { .. } | Self::PathByHand { .. } => "path",
             Self::Login { .. } => "login",
             Self::Master { .. } => "master",
             Self::Unknown { .. } => "unknown",
@@ -371,18 +382,21 @@ impl NextStep {
         match self {
             Self::Install { agent, .. }
             | Self::Path { agent }
+            | Self::PathByHand { agent, .. }
             | Self::Login { agent, .. }
             | Self::Master { agent } => Some(*agent),
             Self::Unknown { .. } => None,
         }
     }
 
-    /// 人が自分で打つならこれ（#322 の最簡形。claude には `--agent` を付けない）
-    pub fn command(&self) -> String {
+    /// 人が自分で打つならこれ（#322 の最簡形。claude には `--agent` を付けない）。
+    /// `None` = 打てるコマンドが無い（[`Self::PathByHand`]。そのコマンドも同じ断りで止まる = #2576）
+    pub fn command(&self) -> Option<String> {
         let flag = |agent: &AgentKind| crate::setup_bootstrap::agent_flag(*agent);
-        match self {
+        Some(match self {
             Self::Install { agent, .. } => format!("tako setup bootstrap install{}", flag(agent)),
             Self::Path { agent } => format!("tako setup bootstrap path{}", flag(agent)),
+            Self::PathByHand { .. } => return None,
             Self::Login { agent, .. } => {
                 crate::orchestrator::agent_cli::auth_command((*agent).into())
                     .unwrap_or(agent.as_str())
@@ -390,10 +404,27 @@ impl NextStep {
             }
             Self::Master { .. } => MASTER_COMMAND.to_string(),
             Self::Unknown { .. } => SETUP_COMMAND.to_string(),
+        })
+    }
+
+    /// [`Self::PathByHand`] の断り（`tako setup bootstrap path` が返すのと同じ。足すディレクトリの一覧つき）
+    pub fn path_by_hand_refusal(&self) -> Option<SetupRefusal> {
+        match self {
+            Self::PathByHand { shell, dirs, .. } => Some(SetupRefusal::ShellProfileUnknown {
+                shell: shell.clone(),
+                dirs: dirs.clone(),
+            }),
+            _ => None,
         }
     }
 
+    /// 機械が読む形（文は表示言語）
     pub fn to_json(&self) -> Value {
+        self.to_json_in(tako_core::i18n::lang())
+    }
+
+    /// 表示言語を明示しての [`Self::to_json`]（**言語グローバルに触らない**）
+    pub fn to_json_in(&self, lang: tako_core::i18n::Lang) -> Value {
         let mut out = json!({
             "kind": self.kind(),
             "agent": self.agent().map(AgentKind::as_str),
@@ -401,6 +432,13 @@ impl NextStep {
         });
         match self {
             Self::Install { plan, .. } => out["install_plan"] = plan.to_json(),
+            // #2576: 打つコマンドの代わりに、足すディレクトリと断りの全文を載せる
+            Self::PathByHand { dirs, .. } => {
+                out["dirs"] = json!(dirs);
+                if let Some(refusal) = self.path_by_hand_refusal() {
+                    out["note"] = json!(refusal.text_in(lang));
+                }
+            }
             Self::Unknown { reason } => out["reason"] = json!(reason),
             _ => {}
         }
@@ -413,12 +451,23 @@ fn can_lead(agent: AgentKind) -> bool {
     tako_core::agent_support::supports(agent.into(), tako_core::agent_support::keys::MASTER_LAUNCH)
 }
 
-/// 導入状況から「次にやること」を決める（**純関数**）。
+/// 導入状況から「次にやること」を決める。
 ///
 /// master を起こせる系統（claude / codex）だけを見る。1 つでも使えれば master、無ければ
 /// [`crate::setup_bootstrap::choose_target`] と同じ順（途中まで入っているものを先に仕上げる →
-/// 推奨 = claude）で 1 系統を選ぶ。確かめられなかった系統があれば導入へ進めない（#1532 / #1533）
+/// 推奨 = claude）で 1 系統を選ぶ。確かめられなかった系統があれば導入へ進めない（#1532 / #1533）。
+/// PATH の段で種別の分からないシェルなら、`tako setup bootstrap path` と同じ断り（足すディレクトリの一覧）を
+/// 引いて [`NextStep::PathByHand`] にする（#2576。判定は `tako setup` の残りと同じ 1 実装 = #2564）
 pub fn next_step(states: &[(AgentKind, Result<BootstrapState, String>)]) -> NextStep {
+    next_step_with(states, &crate::setup_bootstrap::path_by_hand_refusal_for)
+}
+
+/// [`next_step`] の本体（**純関数**）。`by_hand` は PATH を利用者が自分のシェルの設定ファイルで足すしかないときの
+/// 断り（[`crate::setup_bootstrap::path_by_hand_refusal_for`]。テストは差し替える）
+fn next_step_with(
+    states: &[(AgentKind, Result<BootstrapState, String>)],
+    by_hand: &dyn Fn(&BootstrapState) -> Option<SetupRefusal>,
+) -> NextStep {
     let leaders: Vec<(AgentKind, Result<BootstrapState, String>)> = states
         .iter()
         .filter(|(agent, _)| can_lead(*agent))
@@ -462,7 +511,14 @@ pub fn next_step(states: &[(AgentKind, Result<BootstrapState, String>)]) -> Next
             agent: target,
             plan: state.plan.clone(),
         },
-        Step::Path => NextStep::Path { agent: target },
+        Step::Path => match by_hand(state) {
+            Some(SetupRefusal::ShellProfileUnknown { shell, dirs }) => NextStep::PathByHand {
+                agent: target,
+                shell,
+                dirs,
+            },
+            _ => NextStep::Path { agent: target },
+        },
         Step::Auth => NextStep::Login {
             agent: target,
             binary: state.binary.clone(),
@@ -508,6 +564,10 @@ pub fn launch_for(step: &NextStep, dialect: ShellDialect) -> Launch {
             ),
         },
         NextStep::Path { .. } => Launch::Auto,
+        // #2576: 自動の段もそのシェルの設定ファイルは書けないが、走らせ直すと足し終えたかを確かめ直し
+        // （足し終えていれば tako CLI の段は already_on_path）、続きの段（MCP 登録など）も当て直して次の段へ進む。
+        // 同じ断りで止まるコマンドをタブへ打たない
+        NextStep::PathByHand { .. } => Launch::Auto,
         NextStep::Login { agent, binary } => Launch::Pane {
             title: "login",
             line: login_line(dialect, *agent, binary.as_deref()),
@@ -600,6 +660,7 @@ impl Onboarding {
             });
         let mut effects = Effects::default();
         if !self.auto_running() {
+            // 自分で足すしかない PATH（`PathByHand`）は走らせ直さない（自動の段も同じ断りで止まる = #2576）
             if matches!(next, NextStep::Path { .. }) && !self.path_retried {
                 self.path_retried = true;
                 effects.run_auto = true;
@@ -784,7 +845,8 @@ mod tests {
             launcher_dir_on_process_path: step != Step::Path,
             profile: None,
             profile_has_block: false,
-            shell: None,
+            // 既知のシェル（#2576 の「自分で足すしかない」は当たらない。当たる形は `next_step_with` で差し替える）
+            shell: Some(tako_core::shell_profile::ShellKind::Zsh),
             step,
             plan: plan_from(&recipe_for(agent), home),
             auth_timeout: None,
@@ -881,7 +943,7 @@ mod tests {
             (Agy, Step::Install),
         ]));
         assert_eq!(step, NextStep::Master { agent: Codex });
-        assert_eq!(step.command(), "tako master");
+        assert_eq!(step.command().as_deref(), Some("tako master"));
     }
 
     #[test]
@@ -895,7 +957,10 @@ mod tests {
         ]));
         assert_eq!(step.kind(), "install", "{step:?}");
         assert_eq!(step.agent(), Some(Claude));
-        assert_eq!(step.command(), "tako setup bootstrap install");
+        assert_eq!(
+            step.command().as_deref(),
+            Some("tako setup bootstrap install")
+        );
     }
 
     #[test]
@@ -909,7 +974,7 @@ mod tests {
                 binary: Some("/home/testuser/.local/bin/codex".into())
             }
         );
-        assert_eq!(step.command(), "codex login");
+        assert_eq!(step.command().as_deref(), Some("codex login"));
         assert_eq!(
             next_step(&states(&[(Claude, Step::Path)])),
             NextStep::Path { agent: Claude }
@@ -926,7 +991,7 @@ mod tests {
         });
         let step = next_step(&[(Claude, Ok(unconfirmed))]);
         assert_eq!(step.kind(), "unknown", "{step:?}");
-        assert_eq!(step.command(), "tako setup");
+        assert_eq!(step.command().as_deref(), Some("tako setup"));
         let step = next_step(&[(Claude, Err("読めない".into())), (Codex, Err("x".into()))]);
         assert_eq!(
             step,
@@ -1105,6 +1170,83 @@ mod tests {
         });
         assert!(!o.apply_step(path.clone(), t0).run_auto);
         assert!(!o.apply_step(path, t0).run_auto);
+    }
+
+    /// #2576: 種別の分からないシェルの PATH の段は、同じ断りで止まる `tako setup bootstrap path` を示さず、
+    /// 足すディレクトリの一覧（`tako setup bootstrap path` と同じ断りの全文）で閉じる。ボタンは確かめ直し
+    /// （自動の段）で、確かめた直後の 1 回きりの走らせ直しもしない（自動の段も同じ断りで止まる）
+    #[test]
+    fn issue2576_自分で足すしかないpathは同じ断りで止まるコマンドを示さない() {
+        use tako_core::i18n::Lang;
+        use tako_core::platform::shell_dialect::ShellDialect::{Posix, PowerShell};
+        let refusal = SetupRefusal::ShellProfileUnknown {
+            shell: "/bin/tcsh".into(),
+            dirs: vec!["$HOME/.local/bin".into(), "/opt/tako/bin".into()],
+        };
+        let path = states(&[
+            (AgentKind::Claude, Step::Path),
+            (AgentKind::Codex, Step::Install),
+        ]);
+        let step = next_step_with(&path, &|_| Some(refusal.clone()));
+        assert_eq!(
+            step,
+            NextStep::PathByHand {
+                agent: AgentKind::Claude,
+                shell: "/bin/tcsh".into(),
+                dirs: vec!["$HOME/.local/bin".into(), "/opt/tako/bin".into()],
+            }
+        );
+        assert_eq!(step.kind(), "path");
+        assert_eq!(step.agent(), Some(AgentKind::Claude));
+        assert_eq!(step.command(), None);
+        assert_eq!(step.path_by_hand_refusal(), Some(refusal.clone()));
+        for lang in [Lang::Ja, Lang::En] {
+            let value = step.to_json_in(lang);
+            assert!(value["command"].is_null(), "{value}");
+            assert_eq!(value["dirs"], json!(["$HOME/.local/bin", "/opt/tako/bin"]));
+            assert_eq!(value["note"], json!(refusal.text_in(lang)));
+            assert!(!value.to_string().contains("bootstrap path"), "{value}");
+        }
+        for dialect in [Posix, PowerShell] {
+            assert_eq!(launch_for(&step, dialect), Launch::Auto);
+        }
+        let mut o = Onboarding::default();
+        assert!(!o.apply_step(step, Instant::now()).run_auto);
+        // 当たらない（既知のシェル・Windows）なら従来どおり `tako setup bootstrap path`。種別の分からないシェル
+        // 以外の断りが来ても、段の写しは変えない
+        for by_hand in [None, Some(SetupRefusal::ShellProfileUnknownForUndo)] {
+            let step = next_step_with(&path, &|_| by_hand.clone());
+            assert_eq!(
+                step,
+                NextStep::Path {
+                    agent: AgentKind::Claude
+                }
+            );
+            assert_eq!(
+                step.to_json_in(Lang::En),
+                json!({ "kind": "path", "agent": "claude", "command": "tako setup bootstrap path" })
+            );
+        }
+        // 実物の判定（`path_by_hand_refusal_for`）は既知のシェルの導入状況では当たらない
+        assert_eq!(
+            next_step(&path),
+            NextStep::Path {
+                agent: AgentKind::Claude
+            }
+        );
+        // Windows はユーザー環境変数へ書くので、`$SHELL` が無い（種別 None = Windows の実際の形）導入状況でも
+        // 当たらない（Windows の CI で実物の判定を通す）
+        #[cfg(windows)]
+        {
+            let mut windows = state(AgentKind::Claude, Step::Path);
+            windows.shell = None;
+            assert_eq!(
+                next_step(&[(AgentKind::Claude, Ok(windows))]),
+                NextStep::Path {
+                    agent: AgentKind::Claude
+                }
+            );
+        }
     }
 
     #[test]
