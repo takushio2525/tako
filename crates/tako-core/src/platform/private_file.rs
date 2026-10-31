@@ -15,6 +15,7 @@
 //! |---|---|---|
 //! | 置き場（[`restrict_dir`]） | 0700 | 継承を切った DACL（本人 + SYSTEM。OI / CI で中へ受け継がせる） |
 //! | ファイルを作る（[`create`]） | 0600 で作る（既に在れば mode は変えない = `OpenOptions` の仕様） | 作って中身を書く前に、継承を切った DACL（本人 + SYSTEM） |
+//! | 無いときだけ作る（[`create_new`]） | 0600 で作る（在れば `AlreadyExists`） | 作って中身を書く前に、継承を切った DACL（本人 + SYSTEM） |
 //! | 既に在るファイル（[`restrict`]） | 0600 | 継承を切った DACL（本人 + SYSTEM） |
 //! | 読み戻し（[`inspect`]） | mode | DACL の SDDL |
 //!
@@ -26,15 +27,28 @@
 //! SYSTEM を残すのは OS の保守（バックアップ・索引・ウイルス対策）を止めないため（OpenSSH の秘密鍵の
 //! 検査と同じ線引き）。Administrators は入れない（必要なら所有権を取って入れる = 黙っては読めない）。
 //!
-//! **失敗しても呼び手を止めない**（呼び手が `let _ =` で捨てる）のは unix の chmod と同じ扱い:
-//! ACL を持たない置き場（FAT / exFAT・一部のネットワーク共有）でも remote が動かなくなるより、
-//! 修正前と同じ継承へ落ちる方を選ぶ。効いているかは [`inspect`] で読み戻せる
-//! （Windows の CI が Win32 と icacls の 2 通りで確かめる = `remote::tests::issue1632_*`）。
+//! **Windows で DACL を当てられなくても呼び手を止めない**: 在るものに当てられなかったとき
+//! （ACL を持たない置き場 = FAT / exFAT・一部のネットワーク共有、DACL を書き換える権利が無い）は
+//! `Ok` を返し、修正前と同じ継承のまま続ける（[`create`] / [`create_new`] は開けたファイルを返す）。
+//! IPC のトークン（`load_or_create_token`）が Err になると GUI は IPC / MCP ごと立たず、
+//! control.json が書けないと CLI が GUI を見つけられない（#2581）ので、ACL が無いだけの置き場で
+//! それを起こさない。**無いもの**は unix の chmod と同じく Err（`NotFound`）。unix の腕の失敗は
+//! これまでどおりそのまま返る（呼び手の `?` も修正前と同じ）。効いているかは [`inspect`] で読み戻せる
+//! （Windows の CI が Win32 と icacls の 2 通りで確かめる = `remote::tests::issue1632_*` / `issue2581_*`）。
 //!
-//! unix の腕は #1632 の前に `remote.rs` が直に呼んでいたものと同じ呼び出し（同じ mode・同じ syscall）。
-//! A/B は `TAKO_1632_LEGACY=1`（Windows は DACL に触らない = #1632 前。unix は変わらない）。
-//! 番犬 `crates/tako-control/tests/issue1632_private_file_watchdog.rs` が、Windows の腕が
-//! no-op へ戻ること・`remote.rs` が境界を通らずに書くことを `file:line` で落とす。
+//! Windows の腕は、既に同じ DACL（継承を切った本人 + SYSTEM の 2 つだけ）が当たっていれば当て直さない。
+//! 置き場へ当てるたびに `SetNamedSecurityInfoW` が中身全体へ受け継ぎを配り直すので、data dir
+//! （control.json の置き場 = GUI の起動ごとに呼ぶ）では 2 回目以降をその手間なしで済ませる（#2581）。
+//!
+//! 通るもの: remote の秘密（#1632）・IPC の接続情報 control.json と `instances/`・IPC / MCP の常設
+//! トークン `token`・usage の鍵の塩 `machine_id`・`remote/remote_shortcuts.json`・スマホから
+//! 受け取ったファイル・ペインの最後の出力の置き場（#2581）。unix の腕の chmod / mode は、それぞれが
+//! 前に直に当てていたものと同じ（置き場 0700・ファイル 0600。仕上がりの mode は修正前と一致）。
+//! control.json・トークン・受け取ったファイルは作る時点から 0600 で開く（前は書き終えてから
+//! 0600 にしていたので、その間の隙が無くなった）。A/B は `TAKO_1632_LEGACY=1`（Windows は DACL に触らない =
+//! #1632 / #2581 前。unix は変わらない）。番犬 `crates/tako-control/tests/issue1632_private_file_watchdog.rs` が、
+//! Windows の腕が no-op へ戻ること・秘密の書き手が境界を通らずに書くこと・境界の外で本人だけの
+//! mode を当てる新しい書き手を `file:line` で落とす。
 
 use std::fs::File;
 use std::io;
@@ -64,6 +78,12 @@ pub fn restrict_dir(dir: &Path) -> io::Result<()> {
 /// 既に在れば切り詰める
 pub fn create(path: &Path) -> io::Result<File> {
     imp::create(path)
+}
+
+/// [`create`] の「無いときだけ作る」版（既に在れば `AlreadyExists`。他のプロセスと競って先に
+/// 書いた方を使う呼び手のため = usage の鍵の塩）
+pub fn create_new(path: &Path) -> io::Result<File> {
+    imp::create_new(path)
 }
 
 /// 既に在るファイルを本人だけが読み書きできる形にする
@@ -171,6 +191,50 @@ fn is_user(trustee: &str, user_sid: &str) -> bool {
         || (trustee == "LG" && user_sid.starts_with("S-1-5-21-") && user_sid.ends_with("-501"))
 }
 
+/// 読み戻した DACL が [`owner_only_sddl`] で当てる形そのもの（継承を切った、本人と SYSTEM への
+/// フルアクセスの 2 つだけ・受け継がせ方も同じ）か。そうなら当て直さない（#2581）。
+///
+/// [`judge_sddl`] より厳しい: 本人だけでも権利が欠けている・受け継がせ方が違う・ACE が多いなら偽
+/// （= 当て直して揃える）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn already_applied(sddl: &str, user_sid: &str, kind: Kind) -> bool {
+    let Some(start) = sddl.find("D:") else {
+        return false;
+    };
+    let dacl = &sddl[start + 2..];
+    let flags_end = dacl.find('(').unwrap_or(dacl.len());
+    let flags = &dacl[..flags_end];
+    if !flags.contains('P') || flags.contains("NO_ACCESS_CONTROL") {
+        return false;
+    }
+    let inherit = match kind {
+        Kind::File => "",
+        Kind::Dir => "OICI",
+    };
+    let aces = sddl_aces(&dacl[flags_end..]);
+    let trustees: Vec<&str> = aces
+        .iter()
+        .filter_map(|ace| full_access_trustee(ace, inherit))
+        .collect();
+    aces.len() == 2
+        && trustees.len() == 2
+        && trustees.iter().any(|t| is_user(t, user_sid))
+        && trustees.contains(&"SY")
+}
+
+/// `A;<inherit>;FA;;;<受け手>` の形の ACE なら受け手を返す
+#[cfg_attr(not(windows), allow(dead_code))]
+fn full_access_trustee<'a>(ace: &'a str, inherit: &str) -> Option<&'a str> {
+    let fields: Vec<&'a str> = ace.split(';').collect();
+    (fields.len() == 6
+        && fields[0] == "A"
+        && fields[1] == inherit
+        && fields[2] == "FA"
+        && fields[3].is_empty()
+        && fields[4].is_empty())
+    .then(|| fields[5])
+}
+
 #[cfg(unix)]
 mod imp {
     use super::Inspection;
@@ -188,6 +252,14 @@ mod imp {
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+
+    pub fn create_new(path: &Path) -> io::Result<File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
             .mode(0o600)
             .open(path)
     }
@@ -286,7 +358,7 @@ mod imp {
     }
 
     pub fn restrict_dir(dir: &Path) -> io::Result<()> {
-        apply(dir, Kind::Dir)
+        keep_going(apply(dir, Kind::Dir))
     }
 
     pub fn create(path: &Path) -> io::Result<File> {
@@ -300,11 +372,35 @@ mod imp {
         Ok(file)
     }
 
+    pub fn create_new(path: &Path) -> io::Result<File> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        // 呼び手はこの後で中身を書く。絞れなかったら修正前と同じ継承へ落ちる（モジュール冒頭）
+        let _ = apply(path, Kind::File);
+        Ok(file)
+    }
+
     pub fn restrict(path: &Path) -> io::Result<()> {
-        apply(path, Kind::File)
+        keep_going(apply(path, Kind::File))
+    }
+
+    /// 在るものに当てられなかったときは修正前の継承のまま続ける（モジュール冒頭）。
+    /// 無いものは unix の chmod と同じく Err を返す
+    fn keep_going(applied: io::Result<()>) -> io::Result<()> {
+        match applied {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
     }
 
     pub fn inspect(path: &Path) -> io::Result<Inspection> {
+        Ok(super::judge_sddl(&read_sddl(path)?, &user_sid()?))
+    }
+
+    /// 今の DACL を SDDL の文字列で読む
+    fn read_sddl(path: &Path) -> io::Result<String> {
         let name = wide_path(path);
         let mut dacl: *mut c_void = null_mut();
         let mut sd: *mut c_void = null_mut();
@@ -344,7 +440,7 @@ mod imp {
         };
         // SAFETY: GetNamedSecurityInfoW が LocalAlloc した記述子を 1 度だけ解放する（dacl はその内側）
         unsafe { LocalFree(sd) };
-        Ok(super::judge_sddl(&sddl?, &user_sid()?))
+        sddl
     }
 
     /// 継承を切った本人 + SYSTEM だけの DACL を当てる（`TAKO_1632_LEGACY=1` では触らない）
@@ -352,7 +448,12 @@ mod imp {
         if std::env::var(super::ENV_LEGACY).is_ok_and(|v| v == "1") {
             return Ok(());
         }
-        let sddl = wide(&super::owner_only_sddl(&user_sid()?, kind));
+        let user_sid = user_sid()?;
+        // 既に同じ形なら当て直さない（置き場は当てるたびに中身全体へ受け継ぎを配り直す。#2581）
+        if read_sddl(path).is_ok_and(|now| super::already_applied(&now, &user_sid, kind)) {
+            return Ok(());
+        }
+        let sddl = wide(&super::owner_only_sddl(&user_sid, kind));
         let mut sd: *mut c_void = null_mut();
         // SAFETY: sddl は NUL 終端の生存するバッファ、sd はスタック上の変数。大きさの出力は任意
         let ok = unsafe {
@@ -572,6 +673,60 @@ mod tests {
         assert!(!judge_sddl("D:P(A;;FA;;;LA)(A;;FA;;;SY)", USER).owner_only);
     }
 
+    #[test]
+    fn 当てる形そのものだけを当て済みと読む() {
+        // 組んだ形・当てた後の書き出しの形（AI の印・別名）は当て済み
+        assert!(already_applied(
+            &owner_only_sddl(USER, Kind::File),
+            USER,
+            Kind::File
+        ));
+        assert!(already_applied(
+            "D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;S-1-5-21-111-222-333-1001)",
+            USER,
+            Kind::Dir
+        ));
+        assert!(already_applied(
+            "D:PAI(A;;FA;;;LA)(A;;FA;;;SY)",
+            "S-1-5-21-111-222-333-500",
+            Kind::File
+        ));
+        let cases = [
+            // 受け継がせ方が違う（ファイルの形を置き場に・その逆）
+            (owner_only_sddl(USER, Kind::File), Kind::Dir),
+            (owner_only_sddl(USER, Kind::Dir), Kind::File),
+            // 継承を切っていない（置き場の中で受け継いだだけ）
+            (
+                "D:AI(A;ID;FA;;;S-1-5-21-111-222-333-1001)(A;ID;FA;;;SY)".into(),
+                Kind::File,
+            ),
+            // 本人だけでも権利が欠けている
+            (
+                "D:P(A;;FR;;;S-1-5-21-111-222-333-1001)(A;;FA;;;SY)".into(),
+                Kind::File,
+            ),
+            // ACE が多い（拒否でも揃え直す）
+            (
+                "D:P(D;;FA;;;WD)(A;;FA;;;S-1-5-21-111-222-333-1001)(A;;FA;;;SY)".into(),
+                Kind::File,
+            ),
+            // SYSTEM が無い・本人が無い
+            (
+                "D:P(A;;FA;;;S-1-5-21-111-222-333-1001)(A;;FA;;;S-1-5-21-111-222-333-1001)".into(),
+                Kind::File,
+            ),
+            ("D:P(A;;FA;;;SY)(A;;FA;;;SY)".into(), Kind::File),
+            ("D:NO_ACCESS_CONTROL".into(), Kind::File),
+            (String::new(), Kind::File),
+        ];
+        for (sddl, kind) in cases {
+            assert!(
+                !already_applied(&sddl, USER, kind),
+                "当て済みと読んではいけない: {sddl} ({kind:?})"
+            );
+        }
+    }
+
     /// 使い捨ての置き場（スコープで消える = #1312）
     fn scratch(name: &str) -> crate::test_residue::ScratchDir {
         crate::test_residue::ScratchDir::new(&format!("1632-{name}"))
@@ -622,5 +777,72 @@ mod tests {
         assert!(inspect(&missing).is_err());
         assert!(restrict(&missing).is_err());
         assert!(restrict_dir(&dir.join("missing-dir")).is_err());
+        assert!(create_new(&dir.join("no-parent").join("x")).is_err());
+    }
+
+    /// 無いときだけ作る口: 作ったものは本人だけ・在れば作らない（#2581。usage の鍵の塩）
+    #[test]
+    fn 無いときだけ作る口は本人だけで作り在れば断る() {
+        let dir = scratch("create-new");
+        let fresh = dir.join("salt");
+        {
+            use std::io::Write;
+            let mut f = create_new(&fresh).expect("無いので作れる");
+            f.write_all(b"salt").expect("書ける");
+        }
+        let got = inspect(&fresh).expect("読み戻せる");
+        println!(
+            "TAKO2581_CORE create_new owner_only={} inherits={} {}",
+            got.owner_only, got.inherits, got.detail
+        );
+        assert!(got.owner_only && !got.inherits, "{got:?}");
+        let again = create_new(&fresh).expect_err("在るので作らない");
+        assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&fresh).unwrap(),
+            "salt",
+            "中身は残る"
+        );
+    }
+
+    /// 中身の多い置き場を絞る: 中に在ったものも本人だけを受け継ぎ、2 回目は形が変わらない（#2581。
+    /// control.json の置き場 = data dir は GUI の起動ごとに絞る）。配り直しにかかった時間を CI の記録に出す
+    #[test]
+    fn 中身の多い置き場を絞ると中も受け継ぎ2回目は形が変わらない() {
+        let held = scratch("many");
+        let dir = held.path().to_path_buf();
+        let mut files = 0usize;
+        for d in 0..20 {
+            let sub = dir.join(format!("d{d}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for f in 0..50 {
+                std::fs::write(sub.join(format!("f{f}.txt")), "x").unwrap();
+                files += 1;
+            }
+        }
+        let child = dir.join("d7").join("f9.txt");
+        let before = inspect(&child).expect("読み戻せる");
+        let first = std::time::Instant::now();
+        restrict_dir(&dir).expect("絞れる");
+        let first_ms = first.elapsed().as_millis();
+        let shaped = inspect(&dir).expect("読み戻せる");
+        let again = std::time::Instant::now();
+        restrict_dir(&dir).expect("2 回目も通る");
+        let again_ms = again.elapsed().as_millis();
+        let reshaped = inspect(&dir).expect("読み戻せる");
+        let inner = inspect(&child).expect("読み戻せる");
+        println!(
+            "TAKO2581_CORE many files={files} first_ms={first_ms} again_ms={again_ms} dir={} child_before={} child_after owner_only={} inherits={} {}",
+            shaped.detail, before.detail, inner.owner_only, inner.inherits, inner.detail
+        );
+        assert!(shaped.owner_only && !shaped.inherits, "{shaped:?}");
+        assert_eq!(shaped.detail, reshaped.detail, "2 回目で形が変わった");
+        if cfg!(windows) {
+            // Windows は置き場の ACL が中を守らない（辿る権利の検査が無い）ので、中身へ配り直す
+            assert!(inner.owner_only && inner.inherits, "{inner:?}");
+        } else {
+            // unix は置き場の 0700 が中へ辿らせない。中のファイルの mode は変えない（修正前と同じ）
+            assert_eq!(before.detail, inner.detail);
+        }
     }
 }

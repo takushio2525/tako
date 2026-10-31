@@ -425,6 +425,8 @@ tailnet 越しに読み出せる（`~/.ssh/id_*` や `.env` を含む）。#1079
   ファイル 0600、Windows は継承を切った本人 + SYSTEM だけの DACL で塞ぐ（境界
   `platform::private_file`。**#1632 まで Windows は何もせず `%APPDATA%\tako` の継承まかせ**で、
   移動プロファイル・フォルダのリダイレクトのように継承の広い環境ではその広さが秘密に及んだ）。
+  スマホから受け取ったファイル・`remote/remote_shortcuts.json`、remote の外の IPC の接続情報
+  （control.json）と常設トークンも #2581 で同じ境界を通る。
   Administrators は DACL に入れないが、所有権を取れば読める（OS レベルの権限であり防護範囲外）
 - **別 OS ユーザーからの daemon への到達（TCP 接続そのもの）は、既定
   （ループバック TCP）では受容するリスク**。同一マシンなら誰でも

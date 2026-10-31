@@ -226,23 +226,16 @@ impl ShortcutsFile {
         self.save_to(&path)
     }
 
-    /// 指定パスへ書く。親ディレクトリは 0700 で作る（`remote/` と同じ基準）
+    /// 指定パスへ書く。親ディレクトリとファイルは本人だけにする（`remote/` と同じ基準。unix は
+    /// 0700 / 0600、Windows は継承を切った本人 + SYSTEM の DACL = 境界 `platform::private_file`・#2581）
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
+            let _ = crate::platform::private_file::restrict_dir(parent);
         }
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, json)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
+        let _ = crate::platform::private_file::restrict(path);
         Ok(())
     }
 

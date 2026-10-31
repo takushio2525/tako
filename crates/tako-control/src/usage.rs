@@ -275,14 +275,9 @@ pub(crate) fn load_or_create_salt(path: &Path) -> Result<String, String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("塩の置き場を作れない: {}", e.kind()))?;
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    match options.open(path) {
+    // 本人だけが読める形で作る（unix は 0600、Windows は中身を書く前に継承を切った本人 + SYSTEM の
+    // DACL = 境界 `platform::private_file`・#2581）
+    match tako_core::platform::private_file::create_new(path) {
         Ok(mut file) => {
             file.write_all(fresh.as_bytes())
                 .map_err(|e| format!("塩を書けない: {}", e.kind()))?;

@@ -3,7 +3,8 @@
 //! トークンとソケットパスはアプリ起動毎に変わる（トークンはメモリ生成、ソケットは
 //! PID 入りパス）ため、環境変数しか手段が無いとアプリ再起動後に外部の長寿命プロセス
 //! （tmux 内のエージェント等）が繋ぎ直せない。アプリは起動時に接続情報を
-//! **ユーザー専用パーミッション（ファイル 0600 / ディレクトリ 0700）**で書き出し、
+//! **ユーザー専用パーミッション（ファイル 0600 / ディレクトリ 0700。Windows は継承を切った
+//! 本人 + SYSTEM の DACL = 境界 `platform::private_file`・#2581）**で書き出し、
 //! CLI は環境変数が無い・古い（接続不可 / 認証失敗）場合にこのファイルへ
 //! フォールバックする。
 //!
@@ -228,7 +229,9 @@ pub fn socket_alive(_socket: &str) -> bool {
     true
 }
 
-fn write_to(path: &Path, info: &ControlInfo) -> io::Result<()> {
+/// 接続情報を 1 つ書く（tmp に書いて rename）。`remote::tests::issue2581_*` も直に呼ぶ
+pub(crate) fn write_to(path: &Path, info: &ControlInfo) -> io::Result<()> {
+    use std::io::Write as _;
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "親ディレクトリが無い"))?;
@@ -236,14 +239,13 @@ fn write_to(path: &Path, info: &ControlInfo) -> io::Result<()> {
     let json = serde_json::to_string_pretty(info)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // トークンを含むためユーザー専用にする（ソケットの 0600 と同じ防御線）
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
+    // トークンを含むためユーザー専用にする（ソケットの 0600 と同じ防御線。unix は 0700 / 0600、
+    // Windows は継承を切った本人 + SYSTEM の DACL = 境界 `platform::private_file`・#2581）。
+    // 中身を書くのは置き場とファイルを絞った後
+    tako_core::platform::private_file::restrict_dir(dir)?;
+    tako_core::platform::private_file::create(&tmp)?.write_all(json.as_bytes())?;
+    // 前の回の残骸（作るときの mode は既に在るファイルへ効かない）も同じ形へ揃える
+    tako_core::platform::private_file::restrict(&tmp)?;
     std::fs::rename(&tmp, path)
 }
 

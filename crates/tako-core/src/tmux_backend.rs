@@ -434,16 +434,13 @@ pub fn sweep_pane_died_dumps(dir: &Path, max_age: std::time::Duration) -> usize 
     removed
 }
 
-/// 置き場を作る（#2085）。ペインの中身が入るので本人だけが読める形にする
+/// 置き場を作る（#2085）。ペインの中身が入るので本人だけが読める形にする（unix は 0700、
+/// Windows は継承を切った本人 + SYSTEM の DACL = 境界 `platform::private_file`・#2581）
 fn ensure_pane_died_dir(dir: &Path) {
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
+    let _ = crate::platform::private_file::restrict_dir(dir);
 }
 
 /// A/B の適用（**純関数**）。`TAKO_974_LEGACY=1` は器の能力を無視して全部書く
