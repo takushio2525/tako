@@ -21,6 +21,14 @@
 //! 本番 GUI へ繋ぐ。`test-serve-watch.sh` の `tako remote start` が QR の画像を本番のアクティブな
 //! タブへ開いた。tako CLI を起こす行は、発見の置き場（`TAKO_DATA_DIR` / `TAKO_DISCOVERY_DIR` /
 //! `HOME`）を一時の側へ向けていることも拘束する（`# tako:prod-ok <理由>` の行だけ外す）。
+//!
+//! **#2598**: 上の走査は `scripts/test-*.sh` などの検証スクリプトだけを読み、検証スクリプトが source する
+//! ヘルパ（`scripts/lib/*.sh`）を読んでいなかった。呼び手から見ればヘルパは関数呼び出しなので、
+//! `wait_isolated_gui` の中の素の `"$TAKO_BIN" list` は呼び手の env（本番の `TAKO_SOCKET` / 既定の置き場）で
+//! 本番 GUI へ届いた（PR #2596 の検証で 1 回）。ヘルパの関数は呼び手の env で走るので、ヘルパの tako を
+//! 起こす行は**その行で**本番の env を落とし発見の置き場を向けていることを拘束し（ファイル先頭の
+//! `unset` / `export` は数えない）、`wait_isolated_gui` が `iso_cli` を通して起こした GUI と同じ置き場へ
+//! 繋ぐことをヘルパを実際に走らせて見る。
 
 use std::path::{Path, PathBuf};
 
@@ -591,13 +599,15 @@ fn classify(words: &[String], line: usize, scan: &mut ScriptScan) {
             .iter()
             .any(|v| cmd == format!("${v}") || cmd == format!("${{{v}}}"))
     {
-        // 版・使い方の表示は clap がその場で返す（GUI へも data dir へも行かない）
+        // 版・使い方の表示は clap がその場で返す（GUI へも data dir へも行かない）。
+        // サブコマンドの使い方（`tako queue --help` = queue.sh が順番待ちを知っているかを見る形）も同じ
         if args.first().is_some_and(|a| {
             matches!(
                 unquote(a).as_str(),
                 "--version" | "-V" | "--help" | "-h" | "help"
             )
-        }) {
+        }) || args.iter().any(|a| unquote(a) == "--help")
+        {
             return;
         }
         "tako"
@@ -646,6 +656,9 @@ impl ShellLine<'_> {
                 }
             };
         }
+        // `|` 以外の区切りの直後で数えたコマンドの数。対応の無い `)`（case のパターン）を見たら
+        // ここまで戻す = `tako | default)` の `|` で並べた選択肢をコマンドとして数えない（#2598）
+        let mut pattern_start = self.out.len();
         while self.i < self.chars.len() {
             let c = self.chars[self.i];
             match c {
@@ -665,6 +678,9 @@ impl ShellLine<'_> {
                 '#' if word.is_none() => break,
                 ';' | '&' | '|' | '\n' => {
                     end_cmd!();
+                    if c != '|' {
+                        pattern_start = self.out.len();
+                    }
                     self.i += 1;
                 }
                 '(' => {
@@ -672,6 +688,7 @@ impl ShellLine<'_> {
                     end_cmd!();
                     self.i += 1;
                     self.list(true);
+                    pattern_start = self.out.len();
                 }
                 ')' => {
                     self.i += 1;
@@ -679,7 +696,8 @@ impl ShellLine<'_> {
                         end_cmd!();
                         return;
                     }
-                    // 対応の無い `)` は case のパターン = コマンドではない
+                    // 対応の無い `)` は case のパターン = コマンドではない（`|` で並べた選択肢も）
+                    self.out.truncate(pattern_start);
                     words.clear();
                     word = None;
                 }
@@ -992,6 +1010,165 @@ fn 検証スクリプトは本番のenvを落としてからclaudeとtakoを起�
     );
 }
 
+// ---- ヘルパ（scripts/lib/*.sh）の走査（#2598）-------------------------------------------
+
+/// 検証スクリプトが source するヘルパ（`scripts/lib/*.sh`）
+fn helper_scripts() -> Vec<String> {
+    let dir = repo_root().join("scripts/lib");
+    let mut out: Vec<String> = std::fs::read_dir(&dir)
+        .expect("scripts/lib/ を読む")
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| n.ends_with(".sh"))
+        .map(|n| format!("scripts/lib/{n}"))
+        .collect();
+    out.sort();
+    assert!(
+        out.iter().any(|r| r == ISOLATED_GUI_REL),
+        "scripts/lib/ の走査に {ISOLATED_GUI_REL} が無い（走査範囲の取り方が壊れている）: {out:?}"
+    );
+    out
+}
+
+/// ヘルパの中で tako CLI を素の env で起こす行（#2598）。
+///
+/// ヘルパの関数は**呼び手の env で走る**ので、ファイル先頭の `unset` / `export` では隔離できない
+/// （source した呼び手の env を書き換えるのはヘルパの仕事ではなく、検証スクリプトの走査とは数え方が違う）。
+/// tako を起こすコマンドごとに、**その行の** `env -u TAKO_SOCKET -u TAKO_PANE_ID`（か `env -i`）と
+/// 発見の置き場の前置き（`TAKO_DISCOVERY_DIR=…` など）を求める。本番へ届くのが仕様の行（本番の順番待ち・
+/// A/B の旧挙動の腕）だけ `# tako:prod-ok <理由>` で外す。名指すのは 1 行ずつ（ヘルパは数が少ない）
+fn helper_violations(rel: &str, scan: &ScriptScan) -> Vec<String> {
+    scan.launches
+        .iter()
+        .filter(|l| l.what == "tako" && !l.env_clear && !scan.prod_ok.contains(&l.line))
+        .filter_map(|l| {
+            let mut missing: Vec<&str> = TAKO_CLI_KEYS
+                .iter()
+                .copied()
+                .filter(|k| !l.env_drops.iter().any(|d| d == k))
+                .collect();
+            if !DISCOVERY_KEYS
+                .iter()
+                .any(|k| l.env_sets.iter().any(|e| e == k))
+            {
+                missing.push("発見の置き場");
+            }
+            (!missing.is_empty()).then(|| {
+                format!(
+                    "{rel}:{}: ヘルパの中で tako を呼び手の env のまま起こしている（その行に無いもの: {missing:?}）。\
+                     呼び手が本番 tako のペインなら本番の GUI へ届く",
+                    l.line
+                )
+            })
+        })
+        .collect()
+}
+
+/// シェルの関数 `name() {` の本体（次の行頭の `}` まで）。無ければ None
+fn shell_fn_body<'a>(src: &'a str, name: &str) -> Option<&'a str> {
+    let start = src.find(&format!("\n{name}() {{"))? + 1;
+    let end = src[start..].find("\n}\n")? + start;
+    Some(&src[start..end])
+}
+
+#[test]
+fn ヘルパの中のtakoは起こした隔離guiへだけ繋ぐ() {
+    let mut violations = Vec::new();
+    for rel in helper_scripts() {
+        violations.extend(helper_violations(&rel, &scan_script(&read(&rel))));
+    }
+    // 空振りしていない: isolated-gui.sh の隔離の env 付きの行（iso_cli）を tako の起動として数えている
+    let src = read(ISOLATED_GUI_REL);
+    let scan = scan_script(&src);
+    let isolated = scan
+        .launches
+        .iter()
+        .filter(|l| l.what == "tako" && !scan.prod_ok.contains(&l.line))
+        .count();
+    assert!(
+        isolated >= 1,
+        "{ISOLATED_GUI_REL}: 隔離の env を付けて tako を起こす行（iso_cli）を走査が拾っていない（走査が壊れているか、\
+         iso_cli が消えた）: {:?}",
+        scan.launches
+    );
+    assert!(
+        violations.is_empty(),
+        "検証スクリプトが source するヘルパの中で tako CLI を呼び手の env のまま起こしている（#2598）。\
+         ヘルパの関数は呼び手の env で走るので、呼び手が本番 tako のペインなら本番の TAKO_SOCKET へ、\
+         env を落としていても既定の置き場の本番 GUI へ届く。isolated-gui.sh の中は iso_cli を通し、\
+         他のヘルパはその行で `env -u TAKO_SOCKET -u TAKO_PANE_ID` と発見の置き場（{}）を付ける。\
+         本番へ届くのが仕様の行だけ `# tako:prod-ok <理由>`:\n  {}",
+        DISCOVERY_KEYS.join(" / "),
+        violations.join("\n  ")
+    );
+    // 待ちは iso_cli を通す（素の tako に戻した形は上の走査が名指す。ここは呼び出しが消えていないことだけ）
+    let wait = shell_fn_body(&src, "wait_isolated_gui")
+        .unwrap_or_else(|| panic!("{ISOLATED_GUI_REL}: wait_isolated_gui() が見つからない"));
+    assert!(
+        wait.contains("iso_cli list"),
+        "{ISOLATED_GUI_REL}: wait_isolated_gui が iso_cli で待っていない（#2598）"
+    );
+}
+
+#[test]
+fn ヘルパの走査は素のenvのtakoを名指す() {
+    let cases: &[(&str, &str, usize)] = &[
+        // (説明, ヘルパ, 名指す数)
+        ("関数の中の素の CLI", "w() {\n  \"$TAKO_BIN\" list\n}\n", 1),
+        // 検証スクリプトなら通る形でも、ヘルパでは数えない（関数は呼び手の env で走る）
+        ("ファイル先頭の unset と export", "unset TAKO_SOCKET TAKO_PANE_ID\nexport TAKO_DATA_DIR=\"$T\"\nw() { \"$TAKO_BIN\" list; }\n", 1),
+        ("その行で落として置き場を向ける", "env -u TAKO_SOCKET -u TAKO_PANE_ID ${d[@]+\"${d[@]}\"} \\\n  TAKO_ISOLATED=1 TAKO_DISCOVERY_DIR=\"$D\" \\\n  \"$TAKO_BIN\" \"$@\"\n", 0),
+        ("落とすが置き場が既定のまま", "env -u TAKO_SOCKET -u TAKO_PANE_ID TAKO_ISOLATED=1 \"$TAKO_BIN\" list\n", 1),
+        ("置き場だけ向けて落とさない", "TAKO_DISCOVERY_DIR=\"$D\" \"$TAKO_BIN\" list\n", 1),
+        ("ソケットだけ落とす", "env -u TAKO_SOCKET TAKO_DISCOVERY_DIR=\"$D\" \"$TAKO_BIN\" list\n", 1),
+        ("env -i", "env -i PATH=/bin \"$TAKO_BIN\" list\n", 0),
+        ("本番へ届くのが仕様（宣言あり）", "# tako:prod-ok 本番の順番待ちへ並ぶ\n\"$TAKO_BIN\" queue cargo build\n", 0),
+        ("理由の無い宣言は効かない", "\"$TAKO_BIN\" list # tako:prod-ok\n", 1),
+        ("サブコマンドの使い方", "case \"$(tako queue --help 2>/dev/null)\" in *x*) : ;; esac\n", 0),
+        // case のパターンの `|` で並べた選択肢（tmux-socket.sh の `tako | default | */*)`）はコマンドではない
+        ("case のパターンの選択肢", "case \"$n\" in\n  tako | default | */*) echo x ;;\nesac\n", 0),
+        ("case の本体の素の CLI", "case \"$n\" in\n  a | b) \"$TAKO_BIN\" list ;;\nesac\n", 1),
+    ];
+    for (what, src, want) in cases {
+        let got = helper_violations("lib.sh", &scan_script(src));
+        assert_eq!(got.len(), *want, "{what}: {src:?} → {got:?}");
+    }
+    let got = helper_violations("lib.sh", &scan_script("w() {\n\n  \"$TAKO_BIN\" list\n}\n"));
+    assert!(
+        got.len() == 1 && got[0].starts_with("lib.sh:3: ヘルパの中で tako"),
+        "{got:?}"
+    );
+
+    // 逆戻りの注入（現行のヘルパから作る。ファイルは触らない）: 待ちの iso_cli を素の CLI へ戻すと、
+    // その行を file:line で名指す
+    let src = read(ISOLATED_GUI_REL);
+    let wait =
+        shell_fn_body(&src, "wait_isolated_gui").expect("wait_isolated_gui() が見つからない");
+    let wait_at = src.find(wait).expect("本体の位置");
+    let injected = format!(
+        "{}{}{}",
+        &src[..wait_at],
+        wait.replacen("iso_cli list", "\"$TAKO_BIN\" list", 1),
+        &src[wait_at + wait.len()..]
+    );
+    assert_ne!(injected, src, "注入が当たっていない");
+    let line = injected
+        .lines()
+        .position(|l| l.contains("\"$TAKO_BIN\" list >/dev/null"))
+        .expect("注入した行")
+        + 1;
+    let got = helper_violations(ISOLATED_GUI_REL, &scan_script(&injected));
+    assert_eq!(
+        got.len(),
+        1,
+        "待ちを素の CLI へ戻した形を名指していない: {got:?}"
+    );
+    assert!(
+        got[0].starts_with(&format!("{ISOLATED_GUI_REL}:{line}: ")),
+        "名指した行が違う（注入した行は {line}）: {got:?}"
+    );
+}
+
 #[test]
 fn 走査は実際の持ち込みを検出する() {
     let all = ISSUE_1970_KEYS.join(" ");
@@ -1035,6 +1212,7 @@ fn 走査は実際の持ち込みを検出する() {
         ("配列の展開の後ろの claude", "env -u TAKO_SOCKET HOME=\"$H\" ${extra[@]+\"${extra[@]}\"} \"$BIN/claude\" plugin list\n", 1),
         ("内側の印で分ける", "if [ -z \"${INNER:-}\" ]; then\n  unset TAKO_SOCKET TAKO_PANE_ID\n  export TAKO_DATA_DIR=\"$T\"\n  exec cargo run -- bash \"$0\"\nfi\n\"$TAKO\" list\n", 0),
         ("case のパターン", "case \"$a\" in\n  claude) echo c ;;\nesac\n", 0),
+        ("case のパターンの | で並べた選択肢", "case \"$a\" in\n  tako | claude) echo c ;;\nesac\n", 0),
         ("引用符の中の説明", "echo \"claude を起こす\"\n", 0),
         ("算術", "n=$((n + 1))\n", 0),
     ];
@@ -1302,5 +1480,164 @@ fn 既定のzshrcは利用者のホームと既存のrcへ書かない() {
     assert!(
         !prof.join(".zshrc").exists(),
         ".zprofile があるのに .zshrc を足した"
+    );
+}
+
+// ---- 待ちの CLI の挙動（偽の GUI と偽の CLI で走らせる。#2598）----------------------------
+
+/// CLI の偽物。受け取った env を丸ごと書き出して成功する（= 待ちは 1 回目で返る）
+#[cfg(unix)]
+const STUB_CLI_2598: &str = "#!/bin/bash\nenv > \"$STUB_CLI_OUT\"\n";
+
+/// ヘルパを source して（`launch` なら `launch_isolated_gui` を 1 回呼んでから）`wait_isolated_gui` を呼び、
+/// 偽の GUI と偽の CLI が受け取った env を返す（GUI を起こさなければ None）。
+/// `env` は呼び出し元の env（本番のペインに見立てる）、`args` は `launch_isolated_gui` へ並べる `VAR=VAL`
+#[cfg(unix)]
+fn wait_with(
+    scratch: &Scratch1970,
+    tag: &str,
+    env: &[(&str, &str)],
+    args: &[&str],
+    launch: bool,
+) -> (
+    Option<std::collections::BTreeMap<String, String>>,
+    std::collections::BTreeMap<String, String>,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let run = scratch.dir(tag);
+    let vd = run.join("virtual-display.sh");
+    let app = run.join("app");
+    let cli = run.join("tako");
+    for (path, body) in [
+        (&vd, STUB_VD_1970),
+        (&app, STUB_APP_1970),
+        (&cli, STUB_CLI_2598),
+    ] {
+        std::fs::write(path, body).expect("偽物を書く");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let gui_out = run.join("gui.env");
+    let cli_out = run.join("cli.env");
+    let script = r#"
+. "$HELPER"
+APP_BIN="$STUB_APP_BIN"
+TAKO_BIN="$STUB_CLI_BIN"
+if [ -n "$STUB_LAUNCH" ]; then
+    launch_isolated_gui "$STUB_RUN/app.log" "$@" || exit $?
+    wait "$ISOLATED_GUI_PID"
+fi
+wait_isolated_gui "$STUB_RUN/app.log" 3
+"#;
+    let mut cmd = std::process::Command::new("/bin/bash");
+    cmd.arg("-c")
+        .arg(script)
+        .arg("wait_with")
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("TAKO_VD_NAME", "tako-vd-watchdog-1970-absent")
+        .env("HELPER", repo_root().join(ISOLATED_GUI_REL))
+        .env("ISOLATED_GUI_VD", &vd)
+        .env("ISOLATED_GUI_REAL_HOME", scratch.dir("realhome"))
+        .env("STUB_APP_BIN", &app)
+        .env("STUB_CLI_BIN", &cli)
+        .env("STUB_RUN", &run)
+        .env("STUB_ENV_OUT", &gui_out)
+        .env("STUB_CLI_OUT", &cli_out)
+        .env("STUB_LAUNCH", if launch { "1" } else { "" });
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let status = cmd.status().expect("/bin/bash を起こす");
+    assert!(
+        status.success(),
+        "{tag}: wait_isolated_gui が失敗した: {status:?}"
+    );
+    let parse = |p: &Path| -> std::collections::BTreeMap<String, String> {
+        std::fs::read_to_string(p)
+            .unwrap_or_else(|e| panic!("{tag}: {} を読めない: {e}", p.display()))
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    (launch.then(|| parse(&gui_out)), parse(&cli_out))
+}
+
+#[cfg(unix)]
+#[test]
+fn 待ちのcliは本番のenvを落とし起こしたguiと同じ置き場へ繋ぐ() {
+    let scratch = Scratch1970::new("wait2598");
+    let home = scratch.dir("home");
+    let env = production_like_env(&home);
+    let env_ref: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let leaked = |m: &std::collections::BTreeMap<String, String>| -> Vec<String> {
+        m.iter()
+            .filter(|(_, v)| v.as_str() == "prod-1970")
+            .map(|(k, _)| k.clone())
+            .collect()
+    };
+    let disc =
+        |m: &std::collections::BTreeMap<String, String>| m.get("TAKO_DISCOVERY_DIR").cloned();
+
+    // 置き場を渡さない起動（ヘルパの使い方の例の形）: ログの置き場の隣の一時 dir を GUI と CLI の両方へ
+    let (gui, cli) = wait_with(&scratch, "none", &env_ref, &[], true);
+    let gui = gui.expect("偽の GUI が起きていない");
+    assert!(
+        leaked(&cli).is_empty(),
+        "本番の env が待ちの CLI へ届いた: {:?}",
+        leaked(&cli)
+    );
+    assert_eq!(cli.get("TAKO_ISOLATED").map(String::as_str), Some("1"));
+    let want = scratch.0.join("none/isolated-discovery");
+    assert_eq!(disc(&gui).as_deref(), want.to_str(), "GUI へ渡した置き場");
+    assert_eq!(
+        disc(&cli),
+        disc(&gui),
+        "待ちの CLI が GUI と違う置き場を読む"
+    );
+    assert!(want.is_dir(), "一時の発見の置き場が作られていない");
+
+    // 並べた置き場 → GUI と CLI に同じ値
+    let mine = scratch.dir("mine-disc");
+    let mine_arg = format!("TAKO_DISCOVERY_DIR={}", mine.display());
+    let (gui, cli) = wait_with(&scratch, "arg", &env_ref, &[&mine_arg], true);
+    assert_eq!(disc(&gui.expect("GUI")).as_deref(), mine.to_str());
+    assert_eq!(disc(&cli).as_deref(), mine.to_str());
+    assert!(leaked(&cli).is_empty(), "{:?}", leaked(&cli));
+
+    // export された置き場 → 同じ値。空の指定は未指定と同じ（CLI が読めない置き場を作らない）
+    let exported = scratch.dir("exported-disc");
+    let mut env_exp = env_ref.clone();
+    env_exp.push(("TAKO_DISCOVERY_DIR", exported.to_str().expect("utf8")));
+    let (gui, cli) = wait_with(&scratch, "export", &env_exp, &[], true);
+    assert_eq!(disc(&gui.expect("GUI")).as_deref(), exported.to_str());
+    assert_eq!(disc(&cli).as_deref(), exported.to_str());
+    let (gui, cli) = wait_with(&scratch, "empty", &env_exp, &["TAKO_DISCOVERY_DIR="], true);
+    let want = scratch.0.join("empty/isolated-discovery");
+    assert_eq!(disc(&gui.expect("GUI")).as_deref(), want.to_str());
+    assert_eq!(disc(&cli).as_deref(), want.to_str());
+
+    // launch を通さずに待つ: 置き場は呼び手の export、無ければ空 + 隔離の印（本番の既定の置き場は読まない）
+    let (_, cli) = wait_with(&scratch, "nolaunch-exp", &env_exp, &[], false);
+    assert_eq!(disc(&cli).as_deref(), exported.to_str());
+    assert!(leaked(&cli).is_empty(), "{:?}", leaked(&cli));
+    let (_, cli) = wait_with(&scratch, "nolaunch", &env_ref, &[], false);
+    assert_eq!(disc(&cli).as_deref(), Some(""));
+    assert_eq!(cli.get("TAKO_ISOLATED").map(String::as_str), Some("1"));
+    assert!(leaked(&cli).is_empty(), "{:?}", leaked(&cli));
+
+    // A/B の旧挙動の腕（TAKO_2598_LEGACY=1）は呼び手の env のまま = 本番の TAKO_SOCKET が届く（数え方が生きている）
+    let mut env_legacy = env_ref.clone();
+    env_legacy.push(("TAKO_2598_LEGACY", "1"));
+    let (gui, cli) = wait_with(&scratch, "legacy", &env_legacy, &[], true);
+    assert_eq!(
+        cli.get("TAKO_SOCKET").map(String::as_str),
+        Some("prod-1970")
+    );
+    assert_eq!(
+        disc(&gui.expect("GUI")),
+        None,
+        "旧挙動の腕は GUI へ置き場を足さない"
     );
 }

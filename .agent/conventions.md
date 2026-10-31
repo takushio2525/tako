@@ -5384,7 +5384,7 @@ gpui のシェーダー = metallib）入り、署名の名義（Apple Developmen
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 isolated_gui_bins visual-test || exit 1   # TAKO_BIN / APP_BIN を決め、今の木から求める feature で建てる（#1643）
 launch_isolated_gui "$TMP/app.log" || exit $?   # 印と面の指定の判定 → ensure → uuid の突き合わせ → 起動（pid は $ISOLATED_GUI_PID）
-wait_isolated_gui "$TMP/app.log"      # `tako list` が通るまで待つ（任意）
+wait_isolated_gui "$TMP/app.log"      # 起こした GUI へ `tako list` が通るまで待つ（任意。本番へは届かない = #2598）
 stop_isolated_gui                     # 自分で起こした pid だけを落とす
 ```
 
@@ -5531,6 +5531,7 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
 | 自動リネームを止める | `TAKO_AUTO_RENAME=0`（export された値は尊重する） | `TAKO_AUTO_RENAME=1 TAKO_CLAUDE_BIN=<偽の claude>` を並べる（`test-solo-tab-title-2127.sh`） |
 | 本物の claude の設定 dir を使わせない | export された `CLAUDE_CONFIG_DIR` は使わない。GUI の HOME が一時の dir なら外すだけ（claude はその HOME の `.claude`）、利用者のホームのままならログの置き場の隣の一時 dir（`$ISOLATED_GUI_CLAUDE_CONFIG_DIR`） | 本物の認証で実物の claude を動かす検証だけが `CLAUDE_CONFIG_DIR="$CCD"` を並べる（`test-claude-mod-1879.sh` ほか mod の 4 本） |
 | 既定の `.zshrc` | GUI の ZDOTDIR（無ければ HOME）が利用者のホームの外で、zsh の rc が 1 つも無ければ固定プロンプト（`tako %1~ %% `）の `.zshrc` を置く。zsh の初回設定メニューが `tako send` の入力を食う（#1945）・画面に実ユーザー名を出さない（#927） | 自分の rc を先に置けば書かない |
+| 発見の置き場を決める（#2598） | GUI へ届く `TAKO_DISCOVERY_DIR` が空ならログの置き場の隣の `isolated-discovery`（`$ISOLATED_GUI_DISCOVERY_DIR`）。待ち（`wait_isolated_gui` → `iso_cli`）は同じ置き場を読み、この GUI へだけ繋ぐ | `TAKO_DISCOVERY_DIR=<dir>` を並べるか export する（空の指定は未指定と同じに読む） |
 
 - **#2570 以後は GUI 自身も起動の最初にペインの中でだけ意味を持つ env を外す**（正本
   `tako_core::host_env::STRIP`・FR-2.1.5）。`ISOLATED_GUI_DROP_ENV` は #2570 より前のバイナリのために残し、
@@ -5574,6 +5575,20 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
   その行の前置き）。順番待ち（`run_heavy` / `tako queue`）は本番の GUI へ並ぶのが仕様なので、向けるのは
   その後にする。本番へ届くのが仕様の行（本番の順番待ちへ並ぶ `"$QUEUE" queue …`）だけ、その行か直前の行に
   `# tako:prod-ok <理由>` を置いて外す（外れるのは発見の置き場の規則だけ）
+- **ヘルパ（`scripts/lib/*.sh`）の中の tako CLI は、その行で隔離する**（#2598）。ヘルパの関数は呼び手の env で
+  走るので、`wait_isolated_gui` の素の `"$TAKO_BIN" list` は、呼び手が本番 tako のペインなら本番の
+  `TAKO_SOCKET` へ、env を落としていても既定の置き場の本番 GUI へ届いた（PR #2596 の検証で 1 回。本番役の
+  隔離 GUI で数えると修正前は 1 回の待ちで 1 件・待ちは隔離 GUI が立つ前に 0.0 秒で返る）。
+  `isolated-gui.sh` の中の CLI はすべて `iso_cli` を通す（本番の env = `ISOLATED_GUI_DROP_ENV` を `env -u` で
+  落とし、`TAKO_ISOLATED=1` と、直前の `launch_isolated_gui` が GUI へ渡したのと同じ
+  `TAKO_DISCOVERY_DIR` = `$ISOLATED_GUI_DISCOVERY_DIR` を付ける）。`launch_isolated_gui` は GUI へ届く
+  `TAKO_DISCOVERY_DIR` が空なら、ログの置き場の隣の `isolated-discovery` を決めて GUI にも渡す
+  （GUI 自身の既定は pid 入りの一時 dir で、ヘルパからは見えない）。検証スクリプトが自分で叩く CLI も、
+  その置き場（`$ISOLATED_GUI_DISCOVERY_DIR`）を指せば同じ GUI へ繋がる。ファイル先頭の `unset` / `export` は
+  ヘルパでは数えない（source した呼び手の env を書き換えない）。A/B は `TAKO_2598_LEGACY=1`
+  （呼び手の env のまま叩き、GUI へ置き場を足さない）。ヘルパで本番へ届くのが仕様の行（A/B の旧挙動の腕）は
+  `# tako:prod-ok <理由>` で外す（ヘルパでは env を落とす規則も外れる。順番待ちの `run_heavy` は
+  `${_TAKO_QUEUE_BIN:-tako}` で起こすので走査に掛からない）
 
 番犬は `crates/tako-control/tests/verification_isolation_watchdog.rs`。落とす一覧に、本番がペインへ配る名前
 （tako-app の `spawn_session` が積む `TAKO_*`・`backend::PANE_SCOPED_ENV`・`claude_mod::INJECTED_KEYS`・
@@ -5583,7 +5598,11 @@ claude / tako を起こす行は file:line で名指す（引用符の中 = ペ�
 本文は数えない。`"$BIN/claude"` のようにパスで起こす claude も数え、そのスクリプトが `>` で書き出した
 偽の claude だけを外す）。tako CLI は `$TAKO_BIN` / `$TAKO` / `…/tako` に加え、そのスクリプトが `…/tako` の
 パスを代入した変数（`OLD=/Applications/…/MacOS/tako` など）で起こす行も数え、発見の置き場を一時の側へ
-向けていなければ別の 1 行で名指す（#2527。`--version` / `--help` は数えない）。実経路は
+向けていなければ別の 1 行で名指す（#2527。`--version` / `--help` は数えない。`tako queue --help` のように
+サブコマンドの後ろの `--help` も数えない）。`scripts/lib/*.sh` は別の規則で読み、tako を起こす行が
+その行で `TAKO_SOCKET` / `TAKO_PANE_ID` を落とし発見の置き場を向けていなければ 1 行ずつ file:line で名指す
+（#2598。現行のヘルパの待ちを素の CLI へ戻した注入を名指すことも固定する）。偽の GUI と偽の CLI でヘルパを
+走らせ、待ちの CLI が本番の env を受け取らず GUI と同じ置き場を読むことも見る。実経路は
 `scripts/test-isolated-gui-defaults-1970.sh`（`TAKO_1970_LEGACY_HELPER=<旧ヘルパ>` で A/B）。
 
 **眠った状態を手で再現する**（受け入れ検査用）: `pmset displaysleepnow` を撃つと面が眠り、
