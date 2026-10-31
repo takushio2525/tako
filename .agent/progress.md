@@ -20,26 +20,6 @@
 
 ---
 
-## 2026-10-31（#1998: tako のペインへ共有 jobserver（`CARGO_MAKEFLAGS` の fifo）を注入し包まない cargo も札で絞る・器へは -e で固定・macOS の data dir の空白は一時 dir へ逃がす・受け継いだ jobserver があると cargo は `CARGO_BUILD_JOBS` を見ないと実測で確認（設計書 §9.7））
-- 実経路で 3 本並べて N + 3 = 7 に対し 7（A/B 11）・再起動をまたいで空きの最大 = N・kill で失った 4 枚を数え直しで戻した・カタログ +98 B。PR #2548
-- 本番確認済み（再起動後に作ったペインに `CARGO_MAKEFLAGS`・`tako queue` に「cargo の札: 空き 18 / 18」）
-
-## 2026-10-31（#2365 の続き: bootstrap の install / path / undo-path の断りを、中身（インストーラの取得と実行・tako-core の `PathBlockError` / `LinkError` / `UserPathError`）ごと `SetupRefusal`（40 → 57 種）へ）
-- 隔離 GUI の A/B で英語表示の日本語入り 16 / 16 → 0 / 16・日本語は sha256 一致・実経路テストは 19 / 19 → 0 / 19・注入 5 通りで名指し + E0004・カタログ +0 B。PR #2549
-
-## 2026-10-31（#1935: 構文の塗りの前置き（#1917）を 21 構文へ広げ、書き換えを build.rs へ移し、構文ごとの損益分岐以下は元の正規表現で塗る（Svelte / Vue は TS だけ前置き付き）。A/B `TAKO_1935_LEGACY=1`）
-- 1 MB の冷えた 1 回目 JS 3.75 → 1.88 秒・C# 3.16 → 1.03 秒ほか 19 言語で 22〜67% 短縮・境目 +1 行は同じか速い・全記録 48 件一致・常駐 +0.96 MB・バイナリ +231 KB・カタログ +0 B。PR #2552
-
-## 2026-10-31（#2551: issue2035 の子プロセス（本番の解決 = `$SHELL -l -c`）が開発者の rc の `pyenv rehash` のロック待ちで 1 回目の initialize の 15 秒を使い切る → 子へ `SHELL=/bin/sh` と一時の HOME・番犬 `issue2551_lsp_child_shell_watchdog`）
-- 修正前は rehash のロック待ちの注入で同じ文言で FAILED → 修正後は同じ注入で ok・注入なし 10 回連続 ok・番犬が逆戻り 4 通りを file:line で名指し・カタログ +0 B。PR #2553
-
-## 2026-10-31（#2550: setup bootstrap の PATH 通しが種別の分からない `$SHELL`（nu・tcsh 等）を zsh と見なして `.zprofile` へ書いていた → `shell_kind_for` で空・未設定のときだけ OS の既定、未知は既存の断りで止める）
-- 砂場の CLI で修正前 rc=0・`.zprofile` を書く → 修正後 rc=1・書かない（4 シェル）・既知 7 種はファイルと応答がバイト一致・注入で単体と実経路が file:line で落ちる・カタログ +0 B。PR #2554
-- 09:07 に `5d3f73d` を install・GUI 再起動の本番確認で #2538 も閉じた（install をまたいだ `tako queue` の包みの待ち明けで拒否 0）。断りの案内文の誤りは #2557
-
-## 2026-10-31（#2365 の続き: dispatch の `op_err` が載せる中身のうち日本語のままだった git の書き込み系（tako-core `GitError` 16 種・型の口 `*_typed`）と GUI の Web ビューの navigate / eval・URL の検査（`HostRefusal` 9 種）・固定文 2 つを表示言語へ）
-- 実経路 隔離 GUI へ CLI 12 + MCP 4 で英語表示の日本語入り 15 → 0・日本語はバイト一致・GUI 無しの実経路 14 / 15 → 0 / 15・カタログ +0 B。PR #2556
-
 ## 2026-10-31（#2555: LSP の e2e が `stop`（待たずに返る）の直後に置き場を消し、偽サーバの `exit` の書き込みで `tako-2035-*` / `tako-2048-*` が消え残っていた → テストの最後は `shutdown_all`・置き場は `ScratchDir`・番犬 `issue2555_lsp_stop_then_scope_end_watchdog`）
 - 修正前 10 回で 2035 は 20 個・2048 は 2 個 → 修正後 0 個・SIGKILL の残りは test-residue が数える・注入で番犬が 4 行を名指す・既存の 257 個を片付け・カタログ +0 B。PR #2558
 
@@ -83,3 +63,21 @@
 
 ## 2026-10-31（#2581: control.json と instances/・IPC のトークン・usage の塩・shortcuts・スマホから受け取ったファイル・ペインの最後の出力の置き場を境界 `platform::private_file` へ寄せ、Windows も本人 + SYSTEM だけの DACL に。境界は当てられない置き場で呼び手を止めず・同じ DACL は当て直さない）
 - CI の Windows で Win32 と icacls の読み戻し・隔離 GUI の A/B で unix の mode と CLI / MCP の接続が修正前と一致・番犬が境界の外の本人だけの mode を file:line で名指す・カタログ +0 B。PR #2584
+
+## 2026-10-31（#2578: claude 等が改行 + 字下げで折り返した URL / パスを cmd+クリック・ホバー・cmd+右クリック・`tako links` で 1 本にする。修正前の結合で決めてから新しい境目だけ確かめて重ねる・塊ごとの行の上限・`wrap` を応答へ・A/B `TAKO_2578_LEGACY=1`）
+- 実経路で修正後 PASS 24 / 修正前 FAIL 20（直結・器 × 端末 / アプリ / 実物の claude）・注入 3 通りで番犬が file:line を名指し・カタログ +0 B。PR #2586
+- Closes で閉じたが実画面の cmd+クリックが未実測なので master が開け直した（人の確認待ち = `tako todo`）
+
+## 2026-10-31（#2582: ペインの中から CLI で起こした remote daemon がペインの env（識別・接続・claude の印・`GIT_EDITOR=true`）を持ったまま常駐していた → CLI の `main` が `tako remote serve` のときだけ `host_env::STRIP` で外し exec し直す（audit.log `daemon_startup_env`・A/B `TAKO_2582_LEGACY=1`））
+- 隔離 GUI の A/B で CLI から起こした daemon の印 32 → 0・自動復帰の daemon は修正前と一致・番犬 `issue2582_daemon_inherited_pane_env_watchdog` + 実プロセスのテスト・カタログ +0 B。PR #2585
+- 本番確認（ペインの CLI から remote stop → start・本番 daemon の env にペインの印 0・陽性対照 = 同じペインの claude にはある・audit.log に `daemon_startup_env`）で #2582 を閉じた
+
+## 2026-10-31（#2365 の続き: `tako config` の断り 33 種を `ShareRefusal` / `GitError`（その場で型を返す）へ、CLI の手元 3 か所（watch --worker・lsp options --set・remote agents）を型の口へ。応答の push_error / files[].error も表示言語）
+- 実経路 23 ケースで英語の日本語入り 23 → 0・CLI 27 / 28 → 0 / 28（日本語 28 / 28 sha256 一致）・隔離 GUI の MCP 19 / 19 → 0 / 19・注入 6 か所を名指し + E0004・カタログ +0 B。PR #2589
+
+## 2026-10-31（#2583: setup の PATH の案内の残り = SHELL 未設定の問い合わせを setup の既定 zsh へ揃える（`exe::fallback_login_shell`・child_cmd も 1 実装）・handoff の PATH の段と check-health の `tako_cli_link` は未知のシェルで bootstrap path を示さない（A/B `TAKO_2583_LEGACY=1`））
+- 砂場の CLI と隔離 GUI で修正前は path が残る / 誘導 1 → 修正後は auth・login へ進む / 誘導 0・既知のシェル 12 種はバイト一致・注入 7 通りで file:line を名指し・カタログ +0 B。PR #2590
+- 23:36 に `3f031cc` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）
+
+## 2026-10-31（#2588: 隔離 GUI の後片付けで `stop_isolated_gui` が GUI の pid だけを待って返し、SIGHUP を受けたペイン（SSH ペインの統合の無い zsh）の履歴保存と直後の `rm -rf "$TMP"` が競って rc=1 → GUI を落とす前にペインのプロセス（別の端末を持つ子孫）を控え、終わるまで待つ・居座りは TERM → KILL・番犬 `issue2588_stop_waits_pane_exit`）
+- 本物の 1449 で修正前 + 注入 rc=1 → 修正後 + 同じ注入 rc=0・注入なし 5 / 5 rc=0（PASS 38 / FAIL 0・残骸 0）・逆戻りを番犬が file:line で名指し・カタログ +0 B。PR #2591
