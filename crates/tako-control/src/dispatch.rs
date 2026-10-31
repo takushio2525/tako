@@ -38244,12 +38244,9 @@ mod tests {
         let _guard = TEST_PROJECT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        orchestrator::test_config_dir_override().get_or_init(|| {
-            let dir = std::env::temp_dir()
-                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&dir);
-            dir
-        });
+        // 置き場は `config_dir` がテストでは必ず倒す隔離先（`tako-test-orchestrator-<pid>`・
+        // 終了時の後始末つき）。ここで同じ OnceLock を先に初期化すると後始末の無い dir が勝ち、
+        // テストの実行順しだいで `$TMPDIR` に消え残っていた（#2566）
         let _ = orchestrator::ensure_defaults();
         let key = "_tako_test_109_";
         let mut config = orchestrator::ProjectsConfig::load().unwrap();
@@ -43432,13 +43429,8 @@ mod tests {
         let _guard = TEST_PROJECT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        orchestrator::test_config_dir_override().get_or_init(|| {
-            let dir = std::env::temp_dir()
-                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&dir);
-            dir
-        });
-        let path = orchestrator::handoff_path(profile).expect("override 済み");
+        // 置き場は `config_dir` の隔離先（後始末つき）。先に初期化しない（#2566。with_test_project と同じ）
+        let path = orchestrator::handoff_path(profile).expect("テストの隔離先");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("handoff ディレクトリ");
         }
@@ -43691,13 +43683,8 @@ mod tests {
         let _guard = TEST_PROJECT_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        crate::orchestrator::test_config_dir_override().get_or_init(|| {
-            let dir = std::env::temp_dir()
-                .join(format!("tako-dispatch-test-config-{}", std::process::id()));
-            let _ = std::fs::create_dir_all(&dir);
-            dir
-        });
-        let path = crate::orchestrator::handoff_path(profile).expect("override 済み");
+        // 置き場は `config_dir` の隔離先（後始末つき）。先に初期化しない（#2566）
+        let path = crate::orchestrator::handoff_path(profile).expect("テストの隔離先");
         let _ = std::fs::remove_file(&path);
 
         let (mut host, pane) = master_host(&format!("orchestrator-master:{profile}"));

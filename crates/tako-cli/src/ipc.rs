@@ -727,24 +727,53 @@ mod tests {
             ReplyAfter(Duration),
         }
 
+        /// 偽の受け口の接続先（`&endpoint` で `&str` として渡せる）。
+        ///
+        /// unix はソケットを置いた器（#1312 の `ScratchDir`）を一緒に持ち、テストの終わりに
+        /// スコープを抜けるとソケットごと消える。修正前は `$TMPDIR` 直下へ
+        /// `tk2123-<pid>-<タグ>.sock` を `bind` したまま誰も消さず、`cargo test` 1 回で 3 個ずつ
+        /// 積もっていた（10/31 実測 333 個。#2566）
+        struct Endpoint {
+            addr: String,
+            #[cfg(unix)]
+            _dir: tako_core::test_residue::ScratchDir,
+        }
+
+        impl std::ops::Deref for Endpoint {
+            type Target = str;
+            fn deref(&self) -> &str {
+                &self.addr
+            }
+        }
+
         /// 受け口を 1 本立てて、1 接続だけ `fake` の通りに振る舞う。戻り値は接続先
         #[cfg(unix)]
-        fn serve(tag: &str, fake: Fake) -> String {
+        fn serve(tag: &str, fake: Fake) -> Endpoint {
             use std::os::unix::net::UnixListener;
-            let path =
-                std::env::temp_dir().join(format!("tk2123-{}-{tag}.sock", std::process::id()));
-            let _ = std::fs::remove_file(&path);
+            let dir = tako_core::test_residue::ScratchDir::new(&format!("2123-{tag}"));
+            let path = dir.join("s.sock");
+            // 器の下は `$TMPDIR` 直下より深いので、`sun_path` の上限に収まることを先に確かめる
+            // （収まらない機では bind が理由の分からない失敗になる。長さだけ出す = #927）
+            assert!(
+                tako_core::ipc_socket::path_bytes(&path) <= tako_core::ipc_socket::max_path_bytes(),
+                "偽の受け口のソケットのパスが sun_path の上限を超える（{} / {} バイト。TMPDIR が深い）",
+                tako_core::ipc_socket::path_bytes(&path),
+                tako_core::ipc_socket::max_path_bytes()
+            );
             let listener = UnixListener::bind(&path).expect("受け口を作れる");
             std::thread::spawn(move || {
                 if let Ok((stream, _)) = listener.accept() {
                     behave(stream.try_clone().expect("複製できる"), stream, fake);
                 }
             });
-            path.to_string_lossy().into_owned()
+            Endpoint {
+                addr: path.to_string_lossy().into_owned(),
+                _dir: dir,
+            }
         }
 
         #[cfg(windows)]
-        fn serve(tag: &str, fake: Fake) -> String {
+        fn serve(tag: &str, fake: Fake) -> Endpoint {
             use tako_control::platform::named_pipe;
             let name = format!(r"\\.\pipe\tako-test-2123-{}-{tag}", std::process::id());
             let instance = named_pipe::create_server_instance(&name, true).expect("パイプを作れる");
@@ -753,7 +782,7 @@ mod tests {
                     behave(stream.try_clone().expect("複製できる"), stream, fake);
                 }
             });
-            name
+            Endpoint { addr: name }
         }
 
         fn behave<R: std::io::Read, W: std::io::Write>(
