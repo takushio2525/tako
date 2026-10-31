@@ -75,13 +75,11 @@ mod imp {
         Some(super::login_shell_snippet(&user_shell(), posix_snippet))
     }
 
-    /// `platform::shell` と同じ解決（あちらは PTY 用なので `-l` 付きの
-    /// [`crate::terminal::SpawnCommand`] を返す。ここが要るのは実行ファイル名だけ）
+    /// 探索（[`crate::platform::exe::find`]）と同じログインシェル（#2583）。走らせる CLI は探索で
+    /// 見つけたものなので、`$SHELL` が空・未設定のときの既定が食い違うと、見つけた PATH と違う PATH の
+    /// シェルで起こすことになる（写しを持たず 1 実装を通す。対話のペインの `platform::shell` は別）
     fn user_shell() -> String {
-        std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into())
+        crate::platform::exe::user_shell()
     }
 }
 
@@ -179,6 +177,38 @@ mod tests {
                 "echo tako877".to_string()
             ],
             "ログインシェルへシェル片を渡す形が崩れている: {plan:?}"
+        );
+    }
+
+    /// #2583: 走らせるシェルは探索（`exe::find`）と同じログインシェル。`$SHELL` が空・未設定でも
+    /// 探索と同じ既定（setup の PATH 通しの既定 = macOS は zsh）で起こす
+    #[cfg(unix)]
+    #[test]
+    fn shellが空か未設定でも探索と同じログインシェルで走らせる() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if crate::run_alone!(shellが空か未設定でも探索と同じログインシェルで走らせる)
+        {
+            return;
+        }
+        std::env::remove_var(crate::platform::exe::ISSUE2583_LEGACY_ENV);
+        for shell in [None, Some(""), Some("/bin/bash")] {
+            match shell {
+                Some(value) => std::env::set_var("SHELL", value),
+                None => std::env::remove_var("SHELL"),
+            }
+            let plan = user_env_cli("echo tako2583", "echo", &["tako2583"]).expect("計画を組める");
+            assert_eq!(
+                plan.program,
+                crate::platform::exe::user_shell(),
+                "SHELL={shell:?}: 探索と違うシェルで走らせる"
+            );
+        }
+        std::env::remove_var("SHELL");
+        let plan = user_env_cli("echo tako2583", "echo", &["tako2583"]).expect("計画を組める");
+        assert_eq!(
+            plan.program,
+            crate::platform::exe::fallback_login_shell(),
+            "未設定の既定"
         );
     }
 

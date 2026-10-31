@@ -411,11 +411,38 @@ fn find_in_path_list(
         .map(|found| found.to_string_lossy().into_owned())
 }
 
-/// 場所を尋ねるログインシェル（`$SHELL`。空・未設定なら `/bin/sh`）。
-/// [`find`] と git / tmux の場所の解決（`bin_resolve`。#2151）が同じ規則で読む
+/// 場所を尋ねるログインシェル（`$SHELL`。空・未設定なら [`fallback_login_shell`]）。
+/// [`find`] と git / tmux の場所の解決（`bin_resolve`。#2151）と、見つけた CLI をユーザーの環境で
+/// 走らせる子（`child_cmd::user_env_cli`。#2583）が同じ規則で読む
 #[cfg(unix)]
 pub(crate) fn user_shell() -> String {
     imp::user_shell()
+}
+
+/// #2583 の A/B の env（`1` で `$SHELL` が空・未設定のログインシェルを `/bin/sh` へ戻し、
+/// setup の PATH の案内を種別の分からないシェルでも `tako setup bootstrap path` へ誘導する形へ戻す）
+pub const ISSUE2583_LEGACY_ENV: &str = "TAKO_2583_LEGACY";
+
+/// [`ISSUE2583_LEGACY_ENV`] が立っているか（#2583 の A/B のゲートはここ 1 か所）
+pub fn issue2583_legacy() -> bool {
+    std::env::var(ISSUE2583_LEGACY_ENV).is_ok_and(|v| v == "1")
+}
+
+/// `$SHELL` が空・未設定のときに仮定するログインシェル（#2583）。
+///
+/// **setup の PATH 通しと同じ既定**: setup は空・未設定を OS の既定（macOS は 10.15 以降 zsh）と見なして
+/// `~/.zprofile` へ書く（`setup_bootstrap::shell_kind_for`。#2550）。#2583 より前はここだけ `/bin/sh`
+/// （`~/.profile` だけを読む = 2026-10-31 実測）へ落ちていたので、書いた後もログインシェルの PATH に
+/// その置き場所が見えず、初回起動の導線の段・`next_step` が `path` のまま残った。
+/// zsh が在るとは限らない他の unix は従来どおり `/bin/sh`。
+/// 対話のペインのシェル（`platform::shell` / 器の段）はここを通さない（`$SHELL` が空・未設定の zsh を
+/// 新しい HOME で対話で起こすと初回設定メニューが入力を食う = #1945）
+pub fn fallback_login_shell() -> &'static str {
+    if cfg!(target_os = "macos") && !issue2583_legacy() {
+        "/bin/zsh"
+    } else {
+        "/bin/sh"
+    }
 }
 
 /// 「実行できる通常ファイル」か。symlink は追う（`which` と同じ判定）。
@@ -481,7 +508,7 @@ mod imp {
         std::env::var("SHELL")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "/bin/sh".into())
+            .unwrap_or_else(|| super::fallback_login_shell().into())
     }
 
     pub fn is_executable(_path: &std::path::Path, meta: &std::fs::Metadata) -> bool {
@@ -757,6 +784,42 @@ fn resolve_with_pathext(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2583: `$SHELL` が空・未設定のログインシェルは setup の PATH 通しの既定と同じ（macOS は zsh）。
+    /// 設定されていればその値のまま。`TAKO_2583_LEGACY=1` で #2583 前の `/bin/sh` へ戻る
+    #[cfg(unix)]
+    #[test]
+    fn shellが空か未設定のログインシェルはsetupの既定と同じ() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if crate::run_alone!(shellが空か未設定のログインシェルはsetupの既定と同じ)
+        {
+            return;
+        }
+        let want = if cfg!(target_os = "macos") {
+            "/bin/zsh"
+        } else {
+            "/bin/sh"
+        };
+        std::env::remove_var(ISSUE2583_LEGACY_ENV);
+        std::env::remove_var("SHELL");
+        assert_eq!(user_shell(), want, "未設定");
+        std::env::set_var("SHELL", "");
+        assert_eq!(user_shell(), want, "空");
+        // 設定されていれば種別も存在も問わずそのまま（未知のシェルの扱いは setup の側 = #2550）
+        for shell in [
+            "/bin/bash",
+            "/usr/local/bin/tcsh",
+            "/nonexistent/tako-2583/nu",
+        ] {
+            std::env::set_var("SHELL", shell);
+            assert_eq!(user_shell(), shell);
+        }
+        std::env::set_var(ISSUE2583_LEGACY_ENV, "1");
+        std::env::remove_var("SHELL");
+        assert_eq!(user_shell(), "/bin/sh", "A/B の旧挙動");
+        std::env::set_var("SHELL", "/bin/bash");
+        assert_eq!(user_shell(), "/bin/bash", "A/B でも設定された値はそのまま");
+    }
 
     /// #2513: このプロセスの PATH を `posix_spawnp` と同じ順で引き、最初に当たる絶対パスを返す
     #[cfg(unix)]

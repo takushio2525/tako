@@ -22234,13 +22234,16 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     // 設置済みなのにリンクの指す先が消えている（`.app` を移動・削除した）。
     // PATH には在るので `cli_in_path` だけでは拾えない状態を名指しする
     if tako_cli_path["link_state"].as_str() == Some("dangling") {
+        // 種別の分からないシェルで置き場所が PATH に無いなら、`tako setup bootstrap path` は張り直した後の
+        // PATH の段で同じ断りに止まるので誘導しない（判定は `cli_in_path` と同じ 1 実装。#2583）
+        let by_hand = !tako_core::platform::exe::issue2583_legacy()
+            && crate::setup_bootstrap::tako_cli_dir_by_hand(&tako_cli_path).is_some();
         issues.push(json!({
             "level": "warning",
             "check": "tako_cli_link",
-            "message": format!(
-                "tako CLI のリンク（{}）の指す先が消えている。tako.app を移動・削除した場合は \
-                 tako setup bootstrap path で張り直すこと（#1502）",
+            "message": crate::setup_bootstrap::tako_cli_link_issue(
                 tako_cli_path["link_display"].as_str().unwrap_or("?"),
+                by_hand,
             ),
         }));
     }
