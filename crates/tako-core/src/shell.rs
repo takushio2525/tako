@@ -19,6 +19,16 @@ pub fn quote_for_shell(word: &str) -> String {
     }
 }
 
+/// [`quote_for_shell`] の csh / tcsh 版（#2597）。csh は単引用符の中でも `!`（履歴置換 = `'!x'` は
+/// `x: Event not found.`）と改行（`Unmatched '''.`）を解釈するので、その 2 つの前にだけ `\` を置く。
+/// 単引用符の中の `\!` は `!`、`\` + 改行は改行になり、それ以外の `\` はそのまま残る（tcsh 6.21 / csh で実測）。
+/// どちらも含まない語は [`quote_for_shell`] とバイト一致（`!` と改行は素のままの語に入らない）
+pub fn quote_for_csh(word: &str) -> String {
+    quote_for_shell(word)
+        .replace('!', "\\!")
+        .replace('\n', "\\\n")
+}
+
 /// 複数のパスをシェル安全にクオートしてスペース区切りで結合する。
 /// ターミナルへの D&D パス挿入用
 pub fn quote_paths_for_shell(paths: &[impl AsRef<Path>]) -> String {
@@ -105,6 +115,90 @@ mod tests {
     #[test]
     fn バックスラッシュ含み() {
         assert_eq!(quote_for_shell("a\\b"), "'a\\b'");
+    }
+
+    /// #2597: csh の引用は `!` と改行の前にだけ `\` を足す。どちらも無い語は POSIX とバイト一致
+    #[test]
+    fn cshの引用はびっくりと改行だけを足す() {
+        assert_eq!(quote_for_csh("a!b"), "'a\\!b'");
+        assert_eq!(quote_for_csh("a\nb"), "'a\\\nb'");
+        assert_eq!(quote_for_csh("it's!\n"), "'it'\\''s\\!\\\n'");
+        for word in [
+            "/usr/bin/ls",
+            "",
+            "my file",
+            "it's",
+            "$HOME `x`",
+            "a\\b",
+            "日本語",
+            "~/x",
+        ] {
+            assert_eq!(quote_for_csh(word), quote_for_shell(word), "{word:?}");
+        }
+    }
+
+    /// #2597 の実経路: 本物の tcsh / csh が `-c` の 1 行を解釈して元の語へ戻す（`-f` = rc を読まない）
+    #[cfg(unix)]
+    #[test]
+    fn cshの引用は本物のtcshで元の語へ戻る() {
+        let words = [
+            "plain",
+            "a b",
+            "it's",
+            "!x",
+            "a!b",
+            "a\\!b",
+            "line1\nline2\n",
+            "end\\",
+            "a\\\nb",
+            "$HOME `date`",
+            "日本語!",
+            "q\\\\!",
+            "'",
+            "",
+        ];
+        let line = |quote: fn(&str) -> String| {
+            std::iter::once("printf '%s\\0'".to_string())
+                .chain(words.iter().map(|w| quote(w)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let want: Vec<u8> = words
+            .iter()
+            .flat_map(|w| [w.as_bytes(), b"\0"].concat())
+            .collect();
+        let run = |shell: &str, line: &str| {
+            std::process::Command::new(shell)
+                .args(["-f", "-c", line])
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("csh を起こせる")
+        };
+        let mut tried = 0;
+        for shell in ["/bin/tcsh", "/bin/csh"] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            tried += 1;
+            let out = run(shell, &line(quote_for_csh));
+            assert!(
+                out.status.success(),
+                "{shell}: {:?} {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(out.stdout, want, "{shell}");
+            // 修正前の POSIX の引用は同じ語で崩れる（同じテストの中の A/B）
+            let before = run(shell, &line(quote_for_shell));
+            assert!(
+                !before.status.success() || before.stdout != want,
+                "{shell}: POSIX の引用でも通ってしまう = 検査が csh の差を見ていない"
+            );
+        }
+        if tried == 0 {
+            eprintln!("tcsh / csh が無いので実経路は飛ばす（macOS は同梱）");
+        }
     }
 
     #[test]
