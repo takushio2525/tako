@@ -955,13 +955,14 @@ pub fn run_start(
     }))
 }
 
-/// 非同期 run の進捗を返す。run_id が不明なら Err
+/// 非同期 run の進捗を返す。run_id が不明なら Err（文は表示言語 = `Reason` の Display。
+/// 呼び手は CLI / MCP の dispatch だけ。#2365）
 pub fn run_status(run_id: &str) -> Result<Value, String> {
     let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
     let entry = reg
         .entries
         .get(run_id)
-        .ok_or_else(|| format!("run_id '{run_id}' が見つからない"))?;
+        .ok_or_else(|| crate::Reason::RunIdNotFound(run_id.to_string()).to_string())?;
 
     let completed = entry.completed.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(c) = completed.as_ref() {
@@ -1029,7 +1030,7 @@ pub fn run_result(run_id: &str, exec: Exec) -> Result<Value, String> {
     let entry = reg
         .entries
         .get(run_id)
-        .ok_or_else(|| format!("run_id '{run_id}' が見つからない"))?;
+        .ok_or_else(|| crate::Reason::RunIdNotFound(run_id.to_string()).to_string())?;
 
     let completed = entry.completed.lock().unwrap_or_else(|e| e.into_inner());
     if completed.is_none() {

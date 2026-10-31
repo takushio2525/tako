@@ -310,6 +310,8 @@ pub fn master_corpus() -> String {
 }
 
 /// CLI / MCP が返す JSON。`topic` 省略で一覧、指定で全文。
+/// 知らない topic の断りは表示言語（`Reason` の Display。CLI の手元の処理も表示言語を
+/// 設定から読んでから呼ぶ。#2365）。
 ///
 /// プレースホルダはプロファイルで解決するので、prompt に焼かれている値
 /// （引き継ぎ閾値・タブ命名規約）と guide の記述がずれない
@@ -351,7 +353,11 @@ pub fn json(topic: Option<&str>, profile_name: &str) -> Result<Value, String> {
         }),
         Some(t) => {
             let g = find(t).ok_or_else(|| {
-                format!("未知の topic: {t}（引けるのは {}）", topics().join(" / "))
+                crate::Reason::GuideTopicUnknown {
+                    got: t.to_string(),
+                    topics: topics().join(" / "),
+                }
+                .to_string()
             })?;
             let text = text_of(g);
             json!({

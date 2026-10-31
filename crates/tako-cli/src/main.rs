@@ -12164,13 +12164,16 @@ fn run_config_env(
 /// 委任台帳のローカル処理（YAML I/O のみ。IPC 不要。#292）
 fn ledger_cli(sub: &LedgerCommand) -> Result<(), String> {
     use tako_control::orchestrator::ledger;
+    // 台帳の断り（`ConfigError`）を出口の枠（`error:`）と同じ表示言語で組む（#2365。`gate_cli` と同じ）
+    init_local_lang();
+    let shown = |e: tako_control::orchestrator::ConfigError| e.to_string();
     match sub {
         LedgerCommand::List {
             project,
             task_type,
             limit,
         } => {
-            let l = ledger::Ledger::load()?;
+            let l = ledger::Ledger::load_typed().map_err(shown)?;
             let mut entries: Vec<&ledger::LedgerEntry> = l.entries.iter().collect();
             if let Some(p) = project {
                 entries.retain(|e| e.project == *p);
@@ -12191,7 +12194,7 @@ fn ledger_cli(sub: &LedgerCommand) -> Result<(), String> {
             Ok(())
         }
         LedgerCommand::Stats => {
-            let l = ledger::Ledger::load()?;
+            let l = ledger::Ledger::load_typed().map_err(shown)?;
             let stats = l.stats();
             let result = serde_json::json!({
                 "stats": stats,
@@ -12207,17 +12210,19 @@ fn ledger_cli(sub: &LedgerCommand) -> Result<(), String> {
             rounds,
             note,
         } => {
-            ledger::record_outcome(id, outcome, *rounds, note.as_deref())?;
+            ledger::record_outcome_typed(id, outcome, *rounds, note.as_deref()).map_err(shown)?;
             println!("recorded: {id} -> {outcome}");
             Ok(())
         }
         LedgerCommand::Amend { id, note } => {
-            ledger::amend_entry(id, note)?;
+            ledger::amend_entry_typed(id, note).map_err(shown)?;
             println!("amended: {id} (post_issue=true)");
             Ok(())
         }
         LedgerCommand::Prune { project_prefix } => {
-            let removed = ledger::Ledger::mutate(|l| l.prune_by_project_prefix(project_prefix))?;
+            let removed =
+                ledger::Ledger::mutate_typed(|l| l.prune_by_project_prefix(project_prefix))
+                    .map_err(shown)?;
             println!("pruned: {removed} entries with project prefix '{project_prefix}'");
             Ok(())
         }

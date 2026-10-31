@@ -377,6 +377,71 @@ impl AllowEntry {
 
 /// settings.json の `paste_guard_policy` 節（#2050）。
 /// **旧ファイルは節ごと無くても既定（確認・許可なし・全規則）で読める**（各キーも default）
+/// 許可リスト・規則の操作（`tako paste-guard allow / unallow / rule`）の断り（#2365）。
+///
+/// 操作は `Result<_, String>` のまま、文はここ 1 か所の日英の対から引く（形は
+/// `user_task::TaskRefusal` と同じ (バリアント, 言語) の網羅 match）。表示（`Display`）は表示言語の
+/// グローバルに従う（呼び手は dispatch だけ = 枠の `invalid parameter:` と同じ言語になる）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyRefusal {
+    /// 足すと許可リストが [`MAX_ALLOW`] 件を超える（`now` は今の件数・`adding` は足す件数）
+    AllowListFull { now: usize, adding: usize },
+    /// 外す行の指定が ID（16 進 4 文字以上）でも `all` でもない
+    UnallowIdForm(String),
+    /// その ID の行が許可リストに無い
+    UnallowNoMatch(String),
+    /// その ID が複数の行に当たる
+    UnallowAmbiguous { id: String, hits: usize },
+    /// 知らない規則の名前
+    UnknownRule(String),
+}
+
+impl PolicyRefusal {
+    /// (バリアント, 言語) の網羅 match。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::AllowListFull { now, adding }, Ja) => {
+                format!("許可リストは {MAX_ALLOW} 件まで（今 {now} 件・足す {adding} 件）")
+            }
+            (Self::AllowListFull { now, adding }, En) => format!(
+                "the allow list holds up to {MAX_ALLOW} entries (now {now}, adding {adding})"
+            ),
+            (Self::UnallowIdForm(id), Ja) => {
+                format!("外す行は ID（16 進 4 文字以上）か all で指定する（指定: {id}）")
+            }
+            (Self::UnallowIdForm(id), En) => format!(
+                "give the row to remove as an ID (4 or more hex characters) or all (given: {id})"
+            ),
+            // 日本語が「見つからない」を含まない（404 へ寄らない）ので、英語も ` not found` を含めない
+            (Self::UnallowNoMatch(id), Ja) => format!("許可リストに ID {id} の行が無い"),
+            (Self::UnallowNoMatch(id), En) => format!("the allow list has no row with ID {id}"),
+            (Self::UnallowAmbiguous { id, hits }, Ja) => {
+                format!("ID {id} に {hits} 行が当たる（もっと長く指定する）")
+            }
+            (Self::UnallowAmbiguous { id, hits }, En) => {
+                format!("ID {id} matches {hits} rows (give a longer ID)")
+            }
+            (Self::UnknownRule(name), Ja) => format!("規則 {name} は無い（{}）", rule_names()),
+            (Self::UnknownRule(name), En) => {
+                format!("there is no rule {name} ({})", rule_names())
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for PolicyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+/// 規則の名前を ` / ` で並べたもの（[`Rule::ALL`] の並び）
+fn rule_names() -> String {
+    let names: Vec<&str> = Rule::ALL.iter().map(|r| r.as_str()).collect();
+    names.join(" / ")
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
     #[serde(default, skip_serializing_if = "Mode::is_confirm")]
@@ -423,11 +488,11 @@ impl Policy {
             });
         }
         if self.allow.len() + added.len() > MAX_ALLOW {
-            return Err(format!(
-                "許可リストは {MAX_ALLOW} 件まで（今 {} 件・足す {} 件）",
-                self.allow.len(),
-                added.len()
-            ));
+            return Err(PolicyRefusal::AllowListFull {
+                now: self.allow.len(),
+                adding: added.len(),
+            }
+            .to_string());
         }
         self.allow.extend(added.iter().cloned());
         Ok(added)
@@ -442,9 +507,7 @@ impl Policy {
             return Ok(before);
         }
         if id.len() < 4 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(format!(
-                "外す行は ID（16 進 4 文字以上）か all で指定する（指定: {id}）"
-            ));
+            return Err(PolicyRefusal::UnallowIdForm(id.to_string()).to_string());
         }
         let id = id.to_ascii_lowercase();
         let hits = self
@@ -453,21 +516,19 @@ impl Policy {
             .filter(|a| a.fingerprint.starts_with(&id))
             .count();
         match hits {
-            0 => Err(format!("許可リストに ID {id} の行が無い")),
+            0 => Err(PolicyRefusal::UnallowNoMatch(id).to_string()),
             1 => {
                 self.allow.retain(|a| !a.fingerprint.starts_with(&id));
                 Ok(1)
             }
-            n => Err(format!("ID {id} に {n} 行が当たる（もっと長く指定する）")),
+            hits => Err(PolicyRefusal::UnallowAmbiguous { id, hits }.to_string()),
         }
     }
 
     /// 規則の有効 / 無効を切り替える（名前は [`Rule::as_str`]。知らない名前は `Err`）
     pub fn set_rule(&mut self, name: &str, enabled: bool) -> Result<(), String> {
-        let rule = Rule::parse(name).ok_or_else(|| {
-            let names: Vec<&str> = Rule::ALL.iter().map(|r| r.as_str()).collect();
-            format!("規則 {name} は無い（{}）", names.join(" / "))
-        })?;
+        let rule = Rule::parse(name)
+            .ok_or_else(|| PolicyRefusal::UnknownRule(name.to_string()).to_string())?;
         self.disabled_rules.retain(|r| r != rule.as_str());
         if !enabled {
             self.disabled_rules.push(rule.as_str().to_string());

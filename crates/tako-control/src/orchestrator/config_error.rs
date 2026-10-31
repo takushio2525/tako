@@ -1,5 +1,6 @@
 //! orchestrator の設定ファイル（projects.yaml / accounts.yaml / profiles）の読み書きと
-//! エージェント名の検証の断り（#2365）。
+//! エージェント名の検証の断り（#2365）。同じ置き場の委任台帳（ledger.yaml）と引き継ぎファイル
+//! （`handoff/`）の読み書きの断りもここに置く（文の形が同じ = 読めない・解析できない・書けない）。
 //!
 //! 日英の対は [`ConfigError::text_in`] の (バリアント, 言語) の網羅 match の 1 か所に置く
 //! （形は [`crate::config_io::WriteError`] と同じ）。日本語は #2365 より前の固定文とバイト一致
@@ -10,8 +11,9 @@
 //! 読み書きの口（`ProjectsConfig::load` ほか）は従来どおり `String` を返し、文は**日本語のまま**
 //! （呼び手の多くは persist.log・`tako master` の起動の流れ・日本語の枠の文へ載せる）。
 //! 断りを表示言語で返す dispatch（CLI / MCP の `orchestrator projects` / `profiles` / `accounts`・
-//! spawn・引き継ぎ・adopt）だけが型の口（`*_typed`）を通し、枠（`invalid parameter:` ほか）と
-//! 中身を同じ言語にそろえる（1 つの断りの中で日英を混ぜない）。
+//! spawn・引き継ぎ・adopt・`ledger`・`handoffs write`・`supervisor set_mode`）だけが
+//! 型の口（`*_typed`）を通し、枠（`invalid parameter:` ほか）と中身を同じ言語にそろえる
+//! （1 つの断りの中で日英を混ぜない）。
 //! 設定ファイルの中身になる文はここに無い（断りだけ）
 
 use tako_core::i18n::Lang;
@@ -31,6 +33,8 @@ pub enum ConfigFile {
     Accounts,
     /// `profiles/<name>.yaml` / `solo-profiles/<name>.yaml`
     Profile,
+    /// `ledger.yaml`（委任台帳）
+    Ledger,
 }
 
 /// orchestrator の設定ファイルの読み書きとエージェント名の検証の断り。
@@ -108,6 +112,14 @@ pub enum ConfigError {
     ProfileEnvReserved(Vec<String>),
     /// ctx_threshold が範囲の外
     CtxThresholdOutOfRange(u32),
+    /// 委任台帳にその ID のエントリが無い
+    LedgerEntryNotFound(String),
+    /// 検収結果（outcome）が pass / rework / fail のどれでもない
+    LedgerOutcomeInvalid(String),
+    /// プロジェクトキーが引き継ぎファイルの名前に使えない
+    HandoffKeyUnusable(String),
+    /// 引き継ぎの置き場のディレクトリを作れない（`dir` は作ろうとしたパス）
+    HandoffDirCreate { dir: String, error: String },
 }
 
 impl ConfigError {
@@ -122,11 +134,13 @@ impl ConfigError {
                 ConfigFile::Projects => format!("projects.yaml の読み取りに失敗: {error}"),
                 ConfigFile::Accounts => format!("accounts.yaml の読み取りに失敗: {error}"),
                 ConfigFile::Profile => format!("プロファイルの読み取りに失敗: {error}"),
+                ConfigFile::Ledger => format!("ledger.yaml の読み取りに失敗: {error}"),
             },
             (Self::Read { file, error }, En) => match file {
                 ConfigFile::Projects => format!("failed to read projects.yaml: {error}"),
                 ConfigFile::Accounts => format!("failed to read accounts.yaml: {error}"),
                 ConfigFile::Profile => format!("failed to read the profile: {error}"),
+                ConfigFile::Ledger => format!("failed to read ledger.yaml: {error}"),
             },
             (Self::Parse { file, reason }, Ja) => {
                 let reason = reason.text_in(lang);
@@ -134,6 +148,7 @@ impl ConfigError {
                     ConfigFile::Projects => format!("projects.yaml のパースに失敗: {reason}"),
                     ConfigFile::Accounts => format!("accounts.yaml のパースに失敗: {reason}"),
                     ConfigFile::Profile => format!("プロファイルのパースに失敗: {reason}"),
+                    ConfigFile::Ledger => format!("ledger.yaml のパースに失敗: {reason}"),
                 }
             }
             (Self::Parse { file, reason }, En) => {
@@ -142,6 +157,7 @@ impl ConfigError {
                     ConfigFile::Projects => format!("cannot parse projects.yaml: {reason}"),
                     ConfigFile::Accounts => format!("cannot parse accounts.yaml: {reason}"),
                     ConfigFile::Profile => format!("cannot parse the profile: {reason}"),
+                    ConfigFile::Ledger => format!("cannot parse ledger.yaml: {reason}"),
                 }
             }
             (Self::Serialize(e), Ja) => format!("YAML のシリアライズに失敗: {e}"),
@@ -324,6 +340,27 @@ impl ConfigError {
                 tako_core::handoff::CTX_THRESHOLD_MIN,
                 tako_core::handoff::CTX_THRESHOLD_MAX
             ),
+            (Self::LedgerEntryNotFound(id), Ja) => format!("エントリ '{id}' が見つからない"),
+            // ` not found` を含める（`DispatchError::says_not_found` の当たり方を日英でそろえる）
+            (Self::LedgerEntryNotFound(id), En) => format!("ledger entry '{id}' not found"),
+            (Self::LedgerOutcomeInvalid(got), Ja) => {
+                format!("不正な outcome '{got}'。使用可能: pass, rework, fail")
+            }
+            (Self::LedgerOutcomeInvalid(got), En) => {
+                format!("invalid outcome '{got}'. Allowed: pass, rework, fail")
+            }
+            (Self::HandoffKeyUnusable(key), Ja) => {
+                format!("プロジェクトキーがファイル名として使えない: {key}")
+            }
+            (Self::HandoffKeyUnusable(key), En) => {
+                format!("the project key cannot be used as a file name: {key}")
+            }
+            (Self::HandoffDirCreate { dir, error }, Ja) => {
+                format!("引き継ぎの置き場を作れない: {dir} ({error})")
+            }
+            (Self::HandoffDirCreate { dir, error }, En) => {
+                format!("cannot create the handoff folder: {dir} ({error})")
+            }
         }
     }
 

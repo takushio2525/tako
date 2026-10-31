@@ -90,11 +90,10 @@ impl PreviewCacheStats {
     }
 }
 
+/// 上限（MB）を検証して bytes へ。範囲外の断りは表示言語（`setting_range::RangeRefusal`。#2365）
 pub fn preview_cache_bytes(max_mb: u64) -> Result<u64, String> {
     if !(PREVIEW_CACHE_MIN_MB..=PREVIEW_CACHE_MAX_MB).contains(&max_mb) {
-        return Err(format!(
-            "max_mb は {PREVIEW_CACHE_MIN_MB}〜{PREVIEW_CACHE_MAX_MB} の範囲で指定する"
-        ));
+        return Err(crate::setting_range::RangeRefusal::PreviewCacheMb.to_string());
     }
     Ok(max_mb * 1024 * 1024)
 }

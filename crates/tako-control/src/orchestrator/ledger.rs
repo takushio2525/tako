@@ -8,6 +8,10 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use tako_core::load_issue::YamlReason;
+
+use super::{ConfigError, ConfigFile};
+
 /// task_type の統制語彙（Issue #292）。勝手に増やさない
 const VALID_TASK_TYPES: &[&str] = &[
     "bugfix-rooted",
@@ -103,50 +107,82 @@ pub struct Ledger {
 }
 
 impl Ledger {
+    // 読み書きの口は 2 つ（#2365。`ConfigError` の作法）: `String` を返す口は日本語のまま
+    // （spawn の自動記録・実際のモデルの書き込みの失敗の stderr）、断りを表示言語で返す
+    // MCP の `tako_orchestrator_ledger`（dispatch）と CLI の `tako orchestrator ledger`（手元の処理）は
+    // 型の口（`*_typed`）を通す
+
     pub fn load() -> Result<Self, String> {
-        let path = ledger_path().ok_or("ホームディレクトリが取得できない")?;
-        Self::load_from(&path)
+        Self::load_typed().map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::load`] の型の口
+    pub fn load_typed() -> Result<Self, ConfigError> {
+        let path = ledger_path().ok_or(ConfigError::HomeUnresolved)?;
+        Self::load_from_typed(&path)
     }
 
     pub fn load_from(path: &Path) -> Result<Self, String> {
+        Self::load_from_typed(path).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::load_from`] の型の口
+    pub fn load_from_typed(path: &Path) -> Result<Self, ConfigError> {
         if !path.is_file() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| format!("ledger.yaml の読み取りに失敗: {e}"))?;
+        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Read {
+            file: ConfigFile::Ledger,
+            error: e.to_string(),
+        })?;
         if content.trim().is_empty() {
             return Ok(Self::default());
         }
-        serde_yaml::from_str(&content).map_err(|e| {
-            format!(
-                "ledger.yaml のパースに失敗: {}",
-                tako_core::load_issue::yaml_error_reason(&e, &content)
-            )
+        serde_yaml::from_str(&content).map_err(|e| ConfigError::Parse {
+            file: ConfigFile::Ledger,
+            reason: YamlReason::of(&e, &content),
         })
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = ledger_path().ok_or("ホームディレクトリが取得できない")?;
+        let path = ledger_path().ok_or_else(|| ConfigError::HomeUnresolved.into_ja())?;
         self.save_to(&path)
     }
 
     pub fn save_to(&self, path: &Path) -> Result<(), String> {
+        self.save_to_typed(path).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::save_to`] の型の口
+    fn save_to_typed(&self, path: &Path) -> Result<(), ConfigError> {
         let content =
-            serde_yaml::to_string(self).map_err(|e| format!("YAML のシリアライズに失敗: {e}"))?;
-        crate::config_io::atomic_write_with_backup(path, &content)
+            serde_yaml::to_string(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+        Ok(crate::config_io::atomic_write_with_backup_typed(
+            path, &content,
+        )?)
     }
 
     /// ロック付き read-modify-write
     pub fn mutate<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
-        let path = ledger_path().ok_or("ホームディレクトリが取得できない")?;
-        Self::mutate_at(&path, f)
+        Self::mutate_typed(f).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::mutate`] の型の口
+    pub fn mutate_typed<R>(f: impl FnOnce(&mut Self) -> R) -> Result<R, ConfigError> {
+        let path = ledger_path().ok_or(ConfigError::HomeUnresolved)?;
+        Self::mutate_at_typed(&path, f)
     }
 
     pub fn mutate_at<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R, String> {
-        let _lock = crate::config_io::lock_exclusive(path)?;
-        let mut ledger = Self::load_from(path)?;
+        Self::mutate_at_typed(path, f).map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::mutate_at`] の型の口
+    fn mutate_at_typed<R>(path: &Path, f: impl FnOnce(&mut Self) -> R) -> Result<R, ConfigError> {
+        let _lock = crate::config_io::lock_exclusive_typed(path)?;
+        let mut ledger = Self::load_from_typed(path)?;
         let result = f(&mut ledger);
-        ledger.save_to(path)?;
+        ledger.save_to_typed(path)?;
         Ok(result)
     }
 
@@ -376,7 +412,7 @@ pub fn record_spawn(
 /// 実際に使われたモデルを書く（#1638。worker レジストリが transcript で確かめたとき 1 回だけ呼ぶ）。
 /// 既に書いてあれば変えない（spawn 時の解決先を残す）。エントリが無ければ何もしない
 pub fn record_model_actual(id: &str, actual: &str) -> Result<(), String> {
-    let path = ledger_path().ok_or("ホームディレクトリが取得できない")?;
+    let path = ledger_path().ok_or_else(|| ConfigError::HomeUnresolved.into_ja())?;
     record_model_actual_at(&path, id, actual)
 }
 
@@ -400,11 +436,14 @@ pub fn record_model_actual_at(path: &Path, id: &str, actual: &str) -> Result<(),
 
 /// outcome の検証
 pub fn validate_outcome(o: &str) -> Result<(), String> {
+    validate_outcome_typed(o).map_err(ConfigError::into_ja)
+}
+
+/// [`validate_outcome`] の型の口
+fn validate_outcome_typed(o: &str) -> Result<(), ConfigError> {
     match o {
         "pass" | "rework" | "fail" => Ok(()),
-        _ => Err(format!(
-            "不正な outcome '{o}'。使用可能: pass, rework, fail"
-        )),
+        _ => Err(ConfigError::LedgerOutcomeInvalid(o.to_string())),
     }
 }
 
@@ -415,11 +454,21 @@ pub fn record_outcome(
     rounds: Option<u32>,
     note: Option<&str>,
 ) -> Result<(), String> {
-    validate_outcome(outcome)?;
-    Ledger::mutate(|l| {
+    record_outcome_typed(id, outcome, rounds, note).map_err(ConfigError::into_ja)
+}
+
+/// [`record_outcome`] の型の口
+pub fn record_outcome_typed(
+    id: &str,
+    outcome: &str,
+    rounds: Option<u32>,
+    note: Option<&str>,
+) -> Result<(), ConfigError> {
+    validate_outcome_typed(outcome)?;
+    Ledger::mutate_typed(|l| {
         let entry = l
             .find_mut(id)
-            .ok_or_else(|| format!("エントリ '{id}' が見つからない"))?;
+            .ok_or_else(|| ConfigError::LedgerEntryNotFound(id.to_string()))?;
         entry.outcome = Some(outcome.to_string());
         entry.rounds = rounds;
         entry.note = note.map(str::to_string);
@@ -429,10 +478,15 @@ pub fn record_outcome(
 
 /// 事後修正
 pub fn amend_entry(id: &str, amend_note: &str) -> Result<(), String> {
-    Ledger::mutate(|l| {
+    amend_entry_typed(id, amend_note).map_err(ConfigError::into_ja)
+}
+
+/// [`amend_entry`] の型の口
+pub fn amend_entry_typed(id: &str, amend_note: &str) -> Result<(), ConfigError> {
+    Ledger::mutate_typed(|l| {
         let entry = l
             .find_mut(id)
-            .ok_or_else(|| format!("エントリ '{id}' が見つからない"))?;
+            .ok_or_else(|| ConfigError::LedgerEntryNotFound(id.to_string()))?;
         entry.post_issue = true;
         entry.amend_note = Some(amend_note.to_string());
         Ok(())

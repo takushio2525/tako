@@ -30,13 +30,11 @@ pub const MIN_UNFOCUSED_FPS: u32 = 1;
 pub const MAX_UNFOCUSED_FPS: u32 = FOCUSED_FPS;
 
 /// 明示指定（CLI / MCP）の検証。範囲外は**黙って丸めず**理由を返す
-/// （打った値と効く値がずれたまま進むほうが分かりにくい。`scrollback::validate_lines` と同じ）
+/// （打った値と効く値がずれたまま進むほうが分かりにくい。`scrollback::validate_lines` と同じ）。
+/// 断りの文は表示言語（`setting_range::RangeRefusal`。#2365）
 pub fn validate_fps(fps: u32) -> Result<u32, String> {
     if !(MIN_UNFOCUSED_FPS..=MAX_UNFOCUSED_FPS).contains(&fps) {
-        return Err(format!(
-            "unfocused_fps は {MIN_UNFOCUSED_FPS}〜{MAX_UNFOCUSED_FPS} の範囲で指定する\
-             （既定 {DEFAULT_UNFOCUSED_FPS}。フォーカス中のペインは常に {FOCUSED_FPS}）"
-        ));
+        return Err(crate::setting_range::RangeRefusal::UnfocusedFps.to_string());
     }
     Ok(fps)
 }
@@ -110,6 +108,9 @@ mod tests {
 
     #[test]
     fn 明示指定は範囲外を理由つきで弾く() {
+        // 断りの文は表示言語に従う（#2365）。言語グローバルを排他して日英それぞれで見る
+        // （排他しないと、並走する言語追従のテストが英語にした窓で日本語の検査が落ちる）
+        let _guard = crate::i18n::testing::lang_guard();
         assert_eq!(
             validate_fps(DEFAULT_UNFOCUSED_FPS),
             Ok(DEFAULT_UNFOCUSED_FPS)
@@ -117,8 +118,12 @@ mod tests {
         assert_eq!(validate_fps(MIN_UNFOCUSED_FPS), Ok(MIN_UNFOCUSED_FPS));
         assert_eq!(validate_fps(MAX_UNFOCUSED_FPS), Ok(MAX_UNFOCUSED_FPS));
         for bad in [0, MAX_UNFOCUSED_FPS + 1, u32::MAX] {
+            crate::i18n::set_lang(crate::i18n::Lang::Ja);
             let err = validate_fps(bad).expect_err("範囲外は弾く");
             assert!(err.contains("1〜60"), "範囲を言う: {err}");
+            crate::i18n::set_lang(crate::i18n::Lang::En);
+            let err = validate_fps(bad).expect_err("範囲外は弾く");
+            assert!(err.contains("between 1 and 60"), "範囲を言う: {err}");
         }
     }
 

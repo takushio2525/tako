@@ -40,6 +40,10 @@
 //! #2365 の続きで、dispatch の `op_err` が載せる中身のうち日本語のまま残っていた git の書き込み系
 //! （tako-core の `git::GitError`）と GUI の Web ビューの navigate / eval と URL の検査（`HostRefusal`）にも
 //! 広げた（末尾）。`op_err` へ日本語の固定文を渡す書き足しも dispatch のソースを読んで名指す。
+//! #2365 の続きで、orchestrator の委任台帳（ledger.yaml）・引き継ぎファイルの書き込み・supervisor の
+//! set_mode・後任 master の起動コマンド（`ConfigError` の表と型の口の走査）、非同期 run と手順書の断り
+//! （`Reason` の表と wait.rs / guide.rs の走査）、設定値の範囲（tako-core の `RangeRefusal`）と
+//! paste-guard の許可リスト・規則（`PolicyRefusal`）にも広げた（末尾）。
 //!
 //! このファイルは**独立したテストバイナリ**で、言語グローバルを触るのは
 //! `display_follows_the_display_language` の 1 本だけ（ほかは `text_in` で言語を引数に渡す）。
@@ -849,9 +853,13 @@ fn reason_index(r: &Reason) -> usize {
         Reason::ResumeCommandUnbuildable { .. } => 300,
         Reason::ResumeFilesUnwritable(_) => 301,
         Reason::AgentTerminateFailed { .. } => 302,
+        // #2365 の続き: orchestrator の非同期 run・手順書
+        Reason::RunIdNotFound(_) => 303,
+        Reason::RunStartOutsideReceiver => 304,
+        Reason::GuideTopicUnknown { .. } => 305,
     }
 }
-const REASON_VARIANTS: usize = 303;
+const REASON_VARIANTS: usize = 306;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1392,6 +1400,12 @@ fn reason_samples() -> Vec<Reason> {
             pid: 4321,
             error: "Operation not permitted (os error 1)".into(),
         },
+        Reason::RunIdNotFound("run-9".into()),
+        Reason::RunStartOutsideReceiver,
+        Reason::GuideTopicUnknown {
+            got: "bogus".into(),
+            topics: "spawn / watch".into(),
+        },
     ]
 }
 
@@ -1755,6 +1769,10 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "再開に要るファイルを書けないので建て直さない: Permission denied (os error 13)",
     "エージェントのプロセス（pid 4321）を終了できなかったので建て直さない: \
      Operation not permitted (os error 1)",
+    // #2365 の続き: orchestrator の非同期 run（wait.rs・dispatch の固定文）・手順書（guide.rs）
+    "run_id 'run-9' が見つからない",
+    "非同期 run の開始は受け口（IPC / MCP）が処理する要求で、dispatch では実行できない",
+    "未知の topic: bogus（引けるのは spawn / watch）",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
@@ -1799,6 +1817,7 @@ fn reason_is_not_found(r: &Reason) -> bool {
             | Reason::CheckpointNotFound(_)
             | Reason::GateNotFound(_)
             | Reason::TmuxSessionNotFound { .. }
+            | Reason::RunIdNotFound(_)
     )
 }
 
@@ -6947,6 +6966,10 @@ const ORCH_AGENT_SRC: &str = include_str!("../src/orchestrator/agent.rs");
 const ORCH_AGENT_PATH: &str = "crates/tako-control/src/orchestrator/agent.rs";
 const CONFIG_ERROR_SRC: &str = include_str!("../src/orchestrator/config_error.rs");
 const CONFIG_ERROR_PATH: &str = "crates/tako-control/src/orchestrator/config_error.rs";
+const LEDGER_SRC: &str = include_str!("../src/orchestrator/ledger.rs");
+const LEDGER_PATH: &str = "crates/tako-control/src/orchestrator/ledger.rs";
+const HANDOFF_STORE_SRC: &str = include_str!("../src/orchestrator/handoff_store.rs");
+const HANDOFF_STORE_PATH: &str = "crates/tako-control/src/orchestrator/handoff_store.rs";
 
 /// `ConfigError` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
 fn config_error_index(e: &ConfigError) -> usize {
@@ -6983,9 +7006,14 @@ fn config_error_index(e: &ConfigError) -> usize {
         ConfigError::ProfileProjectsUnregistered(_) => 29,
         ConfigError::ProfileEnvReserved(_) => 30,
         ConfigError::CtxThresholdOutOfRange(_) => 31,
+        // #2365 の続き: 委任台帳（ledger.yaml）と引き継ぎファイルの書き込み
+        ConfigError::LedgerEntryNotFound(_) => 32,
+        ConfigError::LedgerOutcomeInvalid(_) => 33,
+        ConfigError::HandoffKeyUnusable(_) => 34,
+        ConfigError::HandoffDirCreate { .. } => 35,
     }
 }
-const CONFIG_ERROR_VARIANTS: usize = 32;
+const CONFIG_ERROR_VARIANTS: usize = 36;
 
 /// 見本と #2365 より前の固定文（`orchestrator` の口が書いていた文を見本の値で展開）
 fn config_error_table() -> Vec<(ConfigError, &'static str)> {
@@ -7040,6 +7068,41 @@ fn config_error_table() -> Vec<(ConfigError, &'static str)> {
                 },
             },
             "プロファイルのパースに失敗: YAML の形が期待と違う",
+        ),
+        // #2365 の続き: 委任台帳（`ledger.rs` が書いていた文）
+        (
+            ConfigError::Read {
+                file: ConfigFile::Ledger,
+                error: "Permission denied (os error 13)".into(),
+            },
+            "ledger.yaml の読み取りに失敗: Permission denied (os error 13)",
+        ),
+        (
+            ConfigError::Parse {
+                file: ConfigFile::Ledger,
+                reason: yaml.clone(),
+            },
+            "ledger.yaml のパースに失敗: YAML の構文が壊れている（1 行 11 列）",
+        ),
+        (
+            ConfigError::LedgerEntryNotFound("spawn_9".into()),
+            "エントリ 'spawn_9' が見つからない",
+        ),
+        (
+            ConfigError::LedgerOutcomeInvalid("bogus".into()),
+            "不正な outcome 'bogus'。使用可能: pass, rework, fail",
+        ),
+        // 引き継ぎファイルの書き込み（`handoff_store.rs` が書いていた文）
+        (
+            ConfigError::HandoffKeyUnusable("../x".into()),
+            "プロジェクトキーがファイル名として使えない: ../x",
+        ),
+        (
+            ConfigError::HandoffDirCreate {
+                dir: "/x/handoff/projects".into(),
+                error: "Not a directory (os error 20)".into(),
+            },
+            "引き継ぎの置き場を作れない: /x/handoff/projects (Not a directory (os error 20))",
         ),
         (
             ConfigError::Serialize("x".into()),
@@ -7211,16 +7274,34 @@ fn orchestrator_の設定の断りは全バリアントが日英を持ち日本�
     let mut failures = Vec::new();
     for (e, old) in &table {
         let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        // 落ちたときは日英の対を書いた行（`file:line`）を添える
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                CONFIG_ERROR_SRC,
+                CONFIG_ERROR_PATH,
+                "impl ConfigError {",
+                &debug,
+                lang,
+            )
+        };
         if ja != *old {
             failures.push(format!(
-                "{e:?}: 日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}"
+                "{e:?}: 日本語が #2365 より前と違う（{}）\n  want: {old}\n  got:  {ja}",
+                at(Lang::Ja)
             ));
         }
         if let Some(c) = has_japanese(&en) {
-            failures.push(format!("{e:?}: 英語に日本語（{c}）が混ざる: {en}"));
+            failures.push(format!(
+                "{e:?}: 英語に日本語（{c}）が混ざる（{}）: {en}",
+                at(Lang::En)
+            ));
         }
         if ja == en {
-            failures.push(format!("{e:?}: 日英が同じ文（英語の書き忘れ）: {en}"));
+            failures.push(format!(
+                "{e:?}: 日英が同じ文（英語の書き忘れ。{}）: {en}",
+                at(Lang::En)
+            ));
         }
         // 日本語の口が使う文は日本語の文そのもの
         if e.clone().into_ja() != ja {
@@ -7247,6 +7328,7 @@ fn orchestrator_の設定の断りの見つからないの読みと包みの言�
         },
         ConfigError::AccountNotFound("a".into()),
         ConfigError::ProjectNotFound("k".into()),
+        ConfigError::LedgerEntryNotFound("spawn_9".into()),
     ] {
         for lang in [Lang::Ja, Lang::En] {
             let text = e.text_in(lang);
@@ -7328,6 +7410,59 @@ const CONFIG_REFUSAL_SCOPES: &[(&str, &str, Span)] = &[
         ORCH_MOD_PATH,
         ORCH_MOD_SRC,
         Span::Item("    pub fn mutate_named<"),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("    pub fn mutate_named_typed<"),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn build_master_cmd_typed("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn build_master_cmd_in_typed("),
+    ),
+    // 委任台帳（台帳の中身の集計・spawn の自動記録の task_type の検証は断りの外 = 走査しない）
+    (LEDGER_PATH, LEDGER_SRC, Span::Item("impl Ledger {")),
+    (
+        LEDGER_PATH,
+        LEDGER_SRC,
+        Span::Item("pub fn record_model_actual("),
+    ),
+    (
+        LEDGER_PATH,
+        LEDGER_SRC,
+        Span::Item("fn validate_outcome_typed("),
+    ),
+    (
+        LEDGER_PATH,
+        LEDGER_SRC,
+        Span::Item("pub fn record_outcome_typed("),
+    ),
+    (
+        LEDGER_PATH,
+        LEDGER_SRC,
+        Span::Item("pub fn amend_entry_typed("),
+    ),
+    // 引き継ぎファイルの書き込み（自動移行の persist.log の文は外す）
+    (
+        HANDOFF_STORE_PATH,
+        HANDOFF_STORE_SRC,
+        Span::Item("pub fn write_project_handoff_typed("),
+    ),
+    (
+        HANDOFF_STORE_PATH,
+        HANDOFF_STORE_SRC,
+        Span::Item("pub fn write_profile_memo_typed("),
+    ),
+    (
+        HANDOFF_STORE_PATH,
+        HANDOFF_STORE_SRC,
+        Span::Item("fn write_file_typed("),
     ),
     (
         ORCH_MOD_PATH,
@@ -7474,10 +7609,14 @@ const CONFIG_DISPATCH_SCOPES: &[&str] = &[
     "fn dispatch_orchestrator_handoff(",
     "fn dispatch_git_resolve_agent(",
     "fn dispatch_orchestrator_spawn(",
+    // #2365 の続き: 委任台帳・引き継ぎファイルの書き込み・supervisor の set_mode
+    "fn dispatch_orchestrator_ledger(",
+    "pub fn dispatch_orchestrator_handoff_files(",
+    "fn dispatch_orchestrator_supervisor(",
 ];
 
 /// 日本語で返す口（型の口 `*_typed` の外側）。`.path(` は名前を取る `ProfileKind::path`
-const JA_CONFIG_CALLS: [&str; 22] = [
+const JA_CONFIG_CALLS: [&str; 30] = [
     "ProjectsConfig::load()",
     "ProjectsConfig::mutate(",
     "AccountsConfig::load()",
@@ -7500,6 +7639,15 @@ const JA_CONFIG_CALLS: [&str; 22] = [
     "WorkerAgent::parse(",
     "ensure_defaults()",
     ".path(name)",
+    // #2365 の続き: 委任台帳・引き継ぎファイルの書き込み・supervisor・後任 master の起動コマンド
+    "Ledger::load()",
+    "Ledger::mutate(",
+    "ledger::record_outcome(",
+    "ledger::amend_entry(",
+    "write_project_handoff(",
+    "write_profile_memo(",
+    "mutate_named(",
+    "build_master_cmd(",
 ];
 
 /// 文（呼び出しの行から `;` で終わる行まで）が断りを捨てている（`.ok()` / `unwrap_or` / `is_ok`）か
@@ -12158,4 +12306,317 @@ fn web_ビューの生成前の断りは移す前の英語ともバイト一致(
         "Web view 3 is not open yet (state = creating). Wait until its state in web list is ready; \
          reopen a held or failed one with navigate"
     );
+}
+
+// ---- #2365 の続き: orchestrator の非同期 run・手順書（`Reason`）と、設定値の範囲・paste-guard の
+// 許可リストと規則（tako-core の `RangeRefusal` / `PolicyRefusal`） ----
+//
+// 委任台帳・引き継ぎファイルの書き込み・supervisor・後任 master の起動コマンドは `ConfigError` の表と
+// その走査（上の orchestrator の設定の節）へ足した。ここでは
+// (1) tako-core の 2 型の全バリアントが日英を持ち日本語は #2365 より前の固定文とバイト一致、
+// (2) 検証の口と非同期 run・手順書の口の本体に日本語の固定文を書き足していないこと（`file:line`）を見る。
+// これらの口は `String` を返すまま文を表示言語で引く（`TaskRefusal` と同じ作法 = 呼び手が dispatch と、
+// 表示言語を設定から読んでから呼ぶ CLI の手元の処理だけ）
+
+use tako_core::paste_guard::PolicyRefusal;
+use tako_core::setting_range::RangeRefusal;
+
+const WAIT_SRC: &str = include_str!("../src/orchestrator/wait.rs");
+const WAIT_PATH: &str = "crates/tako-control/src/orchestrator/wait.rs";
+const GUIDE_SRC: &str = include_str!("../src/orchestrator/guide.rs");
+const GUIDE_PATH: &str = "crates/tako-control/src/orchestrator/guide.rs";
+const SETTING_RANGE_SRC: &str = include_str!("../../tako-core/src/setting_range.rs");
+const SETTING_RANGE_PATH: &str = "crates/tako-core/src/setting_range.rs";
+const PREVIEW_CACHE_SRC: &str = include_str!("../../tako-core/src/preview_cache.rs");
+const PREVIEW_CACHE_PATH: &str = "crates/tako-core/src/preview_cache.rs";
+const SCROLLBACK_SRC: &str = include_str!("../../tako-core/src/scrollback.rs");
+const SCROLLBACK_PATH: &str = "crates/tako-core/src/scrollback.rs";
+const REDRAW_LIMIT_SRC: &str = include_str!("../../tako-core/src/redraw_limit.rs");
+const REDRAW_LIMIT_PATH: &str = "crates/tako-core/src/redraw_limit.rs";
+const PASTE_GUARD_SRC: &str = include_str!("../../tako-core/src/paste_guard.rs");
+const PASTE_GUARD_PATH: &str = "crates/tako-core/src/paste_guard.rs";
+
+/// `RangeRefusal` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
+fn range_refusal_index(r: &RangeRefusal) -> usize {
+    match r {
+        RangeRefusal::PreviewCacheMb => 0,
+        RangeRefusal::ScrollbackLines => 1,
+        RangeRefusal::UnfocusedFps => 2,
+    }
+}
+const RANGE_REFUSALS: usize = 3;
+
+/// 見本と #2365 より前の固定文（`preview_cache_bytes` / `validate_lines` / `validate_fps` が書いていた文）
+const RANGE_REFUSAL_TABLE: [(RangeRefusal, &str); RANGE_REFUSALS] = [
+    (
+        RangeRefusal::PreviewCacheMb,
+        "max_mb は 256〜8192 の範囲で指定する",
+    ),
+    (
+        RangeRefusal::ScrollbackLines,
+        "lines は 100〜100000 の範囲で指定する（既定 10000）",
+    ),
+    (
+        RangeRefusal::UnfocusedFps,
+        "unfocused_fps は 1〜60 の範囲で指定する（既定 30。フォーカス中のペインは常に 60）",
+    ),
+];
+
+/// `PolicyRefusal` の通し番号（網羅 match）
+fn policy_refusal_index(r: &PolicyRefusal) -> usize {
+    match r {
+        PolicyRefusal::AllowListFull { .. } => 0,
+        PolicyRefusal::UnallowIdForm(_) => 1,
+        PolicyRefusal::UnallowNoMatch(_) => 2,
+        PolicyRefusal::UnallowAmbiguous { .. } => 3,
+        PolicyRefusal::UnknownRule(_) => 4,
+    }
+}
+const POLICY_REFUSALS: usize = 5;
+
+/// 見本と #2365 より前の固定文（`Policy::allow_text` / `unallow` / `set_rule` が書いていた文）
+fn policy_refusal_table() -> Vec<(PolicyRefusal, String)> {
+    let rules: Vec<&str> = tako_core::paste_guard::Rule::ALL
+        .iter()
+        .map(|r| r.as_str())
+        .collect();
+    vec![
+        (
+            PolicyRefusal::AllowListFull {
+                now: 199,
+                adding: 2,
+            },
+            "許可リストは 200 件まで（今 199 件・足す 2 件）".to_string(),
+        ),
+        (
+            PolicyRefusal::UnallowIdForm("xy".into()),
+            "外す行は ID（16 進 4 文字以上）か all で指定する（指定: xy）".to_string(),
+        ),
+        (
+            PolicyRefusal::UnallowNoMatch("abcd".into()),
+            "許可リストに ID abcd の行が無い".to_string(),
+        ),
+        (
+            PolicyRefusal::UnallowAmbiguous {
+                id: "abcd".into(),
+                hits: 2,
+            },
+            "ID abcd に 2 行が当たる（もっと長く指定する）".to_string(),
+        ),
+        (
+            PolicyRefusal::UnknownRule("bogus".into()),
+            format!("規則 bogus は無い（{}）", rules.join(" / ")),
+        ),
+    ]
+}
+
+#[test]
+fn 設定値の範囲とpaste_guardの断りは全バリアントが日英を持ち日本語は2365より前とバイト一致() {
+    let ranges: Vec<RangeRefusal> = RANGE_REFUSAL_TABLE.iter().map(|(r, _)| *r).collect();
+    covers_all(&ranges, range_refusal_index, RANGE_REFUSALS);
+    for (r, old) in RANGE_REFUSAL_TABLE {
+        let debug = format!("{r:?}");
+        let at = |lang| {
+            where_written(
+                SETTING_RANGE_SRC,
+                SETTING_RANGE_PATH,
+                "impl RangeRefusal {",
+                &debug,
+                lang,
+            )
+        };
+        assert_eq!(r.text_in(Lang::Ja), old, "{debug}（{}）", at(Lang::Ja));
+        bilingual_named(at, &debug, &r.text_in(Lang::Ja), &r.text_in(Lang::En));
+    }
+    let table = policy_refusal_table();
+    let policies: Vec<PolicyRefusal> = table.iter().map(|(r, _)| r.clone()).collect();
+    covers_all(&policies, policy_refusal_index, POLICY_REFUSALS);
+    for (r, old) in &table {
+        let debug = format!("{r:?}");
+        let at = |lang| {
+            where_written(
+                PASTE_GUARD_SRC,
+                PASTE_GUARD_PATH,
+                "impl PolicyRefusal {",
+                &debug,
+                lang,
+            )
+        };
+        assert_eq!(&r.text_in(Lang::Ja), old, "{debug}（{}）", at(Lang::Ja));
+        bilingual_named(at, &debug, &r.text_in(Lang::Ja), &r.text_in(Lang::En));
+        // 「見つからない」の読み（リモートの 404 寄せ）には日英とも当たらない（日本語が「無い」で言うため）
+        for lang in [Lang::Ja, Lang::En] {
+            assert!(!E::says_not_found(&r.text_in(lang)), "{debug} / {lang:?}");
+        }
+    }
+}
+
+/// 検証の口と非同期 run・手順書の口（日本語の固定文を書かない範囲）。`internal` は走査から外す呼び出し
+/// （手順書の `warnings` = 読めないプロファイルを既定で組んだことの注記は断りではない）
+const RUN_VALUE_SCOPES: &[(&str, &str, &str, &[&str])] = &[
+    (
+        WAIT_PATH,
+        WAIT_SRC,
+        "pub fn run_status(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        WAIT_PATH,
+        WAIT_SRC,
+        "pub fn run_result(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        GUIDE_PATH,
+        GUIDE_SRC,
+        "pub fn json(",
+        &["unreachable!(", ".expect(", "unreadable.map("],
+    ),
+    (
+        PREVIEW_CACHE_PATH,
+        PREVIEW_CACHE_SRC,
+        "pub fn preview_cache_bytes(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        SCROLLBACK_PATH,
+        SCROLLBACK_SRC,
+        "pub fn validate_lines(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        REDRAW_LIMIT_PATH,
+        REDRAW_LIMIT_SRC,
+        "pub fn validate_fps(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        PASTE_GUARD_PATH,
+        PASTE_GUARD_SRC,
+        "    pub fn allow_text(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        PASTE_GUARD_PATH,
+        PASTE_GUARD_SRC,
+        "    pub fn unallow(",
+        &["unreachable!(", ".expect("],
+    ),
+    (
+        PASTE_GUARD_PATH,
+        PASTE_GUARD_SRC,
+        "    pub fn set_rule(",
+        &["unreachable!(", ".expect("],
+    ),
+    // dispatch の非同期 run の開始の断り（受け口を通らずに届いたとき）
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "        Request::OrchestratorRunStart { .. } =>",
+        &["unreachable!(", ".expect("],
+    ),
+];
+
+/// 範囲の行。dispatch の `match` の腕（`=>` で始まる 1 行）はその行だけ
+fn run_value_lines<'a>(src: &'a str, head: &str) -> Option<Vec<(usize, &'a str)>> {
+    if head.trim_end().ends_with("=>") {
+        let at = src.lines().position(|l| l.contains(head))?;
+        // 腕の式が終わる行（`,` で終わる）まで
+        let lines: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .skip(at)
+            .map(|(i, l)| (i + 1, l))
+            .collect();
+        let end = lines
+            .iter()
+            .position(|(_, l)| l.trim_end().ends_with(','))
+            .map_or(lines.len(), |i| i + 1);
+        return Some(lines[..end].to_vec());
+    }
+    front_scope_lines(src, Some(head))
+}
+
+#[test]
+fn 非同期runと手順書と設定値の検証の口に日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, src, head, internal) in RUN_VALUE_SCOPES {
+        let Some(lines) = run_value_lines(src, head) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{}` が見つからない（改名で番犬が空振りする。RUN_VALUE_SCOPES を直す）",
+                head.trim()
+            ));
+            continue;
+        };
+        for (line, text) in japanese_outside(&lines, internal) {
+            failures.push(format!(
+                "{path}:{line}: 断りに日本語の固定文がある = 英語表示にもそのまま出る \
+                 （Reason / tako-core の RangeRefusal・PolicyRefusal へバリアントを足し、日英の対を \
+                 text_in に書く）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 手順書の `warnings`（`unreadable.map(` の中）は見逃し、断りへ書き戻した日本語と、
+/// dispatch の腕の固定文だけを名指す
+#[test]
+fn 非同期runと手順書の番犬の境界() {
+    let src = r#"pub fn json(topic: Option<&str>) -> Result<Value, String> {
+    let warning = unreadable.map(|why| {
+        format!(
+            "{why}。手順書の値は組み込み既定で組み立てた"
+        )
+    });
+    let g = find(t).ok_or_else(|| format!("未知の topic: {t}"))?;
+    Ok(json!({}))
+}
+fn dispatch() {
+    match request {
+        Request::OrchestratorRunStart { .. } => Err(DispatchError::Operation(
+            "dispatch では実行できない".into(),
+        )),
+        Request::Other => Ok(()),
+    }
+}
+"#;
+    let lines = run_value_lines(src, "pub fn json(").expect("頭を引ける");
+    let found: Vec<usize> =
+        japanese_outside(&lines, &["unreachable!(", ".expect(", "unreadable.map("])
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+    assert_eq!(found, vec![7], "断りの 1 か所だけを名指し、注記は見逃す");
+    let lines = run_value_lines(src, "        Request::OrchestratorRunStart { .. } =>")
+        .expect("腕を引ける");
+    let found: Vec<usize> = japanese_outside(&lines, &["unreachable!(", ".expect("])
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(found, vec![13], "腕の固定文だけを名指し、隣の腕は見ない");
+}
+
+/// CLI の `tako orchestrator ledger`（手元の処理）も台帳の断りを型の口から表示言語で組む
+/// （出口の枠 `error:` と同じ言語。日本語の口を呼ぶと英語表示でも中身だけ日本語で出る）
+#[test]
+fn cli_の台帳の手元の処理は日本語の口を呼ばない() {
+    let Some(lines) = front_scope_lines(CLI_MAIN_SRC, Some("fn ledger_cli(")) else {
+        panic!(
+            "{CLI_MAIN_PATH}: 走査の範囲 `fn ledger_cli(` が見つからない（改名で番犬が空振りする）"
+        );
+    };
+    let mut failures = Vec::new();
+    for (line, call, code) in ja_config_calls(&lines) {
+        failures.push(format!(
+            "{CLI_MAIN_PATH}:{line}: CLI の台帳の手元の処理が日本語の口 `{call}…)` の断りを返している \
+             = 英語表示でも中身だけ日本語で出る（`*_typed` を呼んで表示言語で文字列にする）: {code}"
+        ));
+    }
+    if !lines.iter().any(|(_, l)| l.contains("init_local_lang()")) {
+        failures.push(format!(
+            "{CLI_MAIN_PATH}: `fn ledger_cli(` が表示言語を設定から決めていない（init_local_lang() を呼ぶ）"
+        ));
+    }
+    report_all(failures);
 }
