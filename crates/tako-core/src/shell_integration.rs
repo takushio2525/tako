@@ -98,6 +98,60 @@ fn disabled() -> bool {
     std::env::var_os("TAKO_NO_SHELL_INTEGRATION").is_some_and(|v| !v.is_empty())
 }
 
+/// 素のペインのシェルが spawn で受け取る tako の env の組（#2594 で 1 本にした）。
+///
+/// = 検証プロセスの履歴の置き場（#1253。[`crate::paths::verification_histfile_env`]）+
+/// 統合の 3 点セット（[`env`]）。器なしのペイン（`TerminalSession::spawn_in`）はこれを積み、
+/// SSH ペインが ssh の失敗・切断の後にローカルのシェルへ戻るとき（[`relaunch`]）も
+/// **同じ組**を当て直す。片方だけに足すと、戻りのシェルだけ統合や履歴の向け直しが外れる
+/// （#2594 の症状そのもの）
+pub fn pane_shell_env() -> Vec<(String, String)> {
+    let mut out = crate::paths::verification_histfile_env();
+    out.extend(env().iter().cloned());
+    out
+}
+
+/// ペインの中で**もう一度ログインシェルを起こす**ときに当て直す統合（#2594）。
+///
+/// SSH ペイン（`remote_fs::ssh_pane_script`）は ssh が失敗・切断すると `exec "$SHELL" -l` で
+/// ローカルのシェルへ戻る。このスクリプトは `$SHELL -l -i -c "/bin/sh -c '…'"`
+/// （`login_shell_command`）の内側で走るので、外側の zsh が統合の `.zshenv` を読んだ時点で
+/// `ZDOTDIR` は利用者の値へ戻され `TAKO_ORIG_ZDOTDIR` も消える（`zshenv.zsh` が孫の zsh へ
+/// 統合を漏らさないための作り）。そのため戻りの zsh にだけ統合が載らず、cwd の追従（OSC 7）・
+/// コマンドの状態（OSC 133）・履歴の向け直し（#1253）が効かなかった。macOS の `/etc/zshrc` が
+/// `HISTFILE` を代入し直すので、検証では一時 HOME の `.zsh_history` へ、本番の HOME なら
+/// 利用者の本物の履歴へ書いていた（#2588 の後片付けと競った書き手）。
+///
+/// 空（`Default`）は #2594 前 = 何も当て直さない。A/B は `TAKO_2594_LEGACY=1`
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Relaunch {
+    /// POSIX: 戻りのシェルを `exec` する直前に export する組（[`pane_shell_env`] = 素のペインと同じ）
+    pub env: Vec<(String, String)>,
+    /// PowerShell: 入れ子で起こす PowerShell へ足す起動引数（素のペインの [`pane_shell`] と
+    /// 同じ読ませ方 = [`powershell_pane_args`]）。unix は空（POSIX の戻りは `env` が担う）
+    pub powershell_args: Vec<String>,
+}
+
+/// [`Relaunch`] をこのプロセスの統合から組む（#2594）
+pub fn relaunch() -> Relaunch {
+    if relaunch_legacy() {
+        return Relaunch::default();
+    }
+    Relaunch {
+        env: pane_shell_env(),
+        powershell_args: if disabled() {
+            Vec::new()
+        } else {
+            imp::relaunch_powershell_args()
+        },
+    }
+}
+
+/// `TAKO_2594_LEGACY=1` で #2594 前（戻りのシェルへ何も当て直さない）へ戻す = 同一バイナリで A/B が取れる
+fn relaunch_legacy() -> bool {
+    std::env::var_os("TAKO_2594_LEGACY").is_some()
+}
+
 /// スクリプト一式を置くディレクトリ（`<data_dir>/shell-integration`）
 pub fn integration_root() -> Option<PathBuf> {
     data_dir().map(|d| d.join("shell-integration"))
@@ -816,12 +870,18 @@ impl std::error::Error for SiError {}
 pub fn powershell_pane_command(program: &str, script: &Path) -> crate::terminal::SpawnCommand {
     crate::terminal::SpawnCommand {
         program: program.to_string(),
-        args: vec![
-            "-NoExit".to_string(),
-            "-EncodedCommand".to_string(),
-            crate::platform::shell::encode_powershell_command(&powershell_bootstrap(script)),
-        ],
+        args: powershell_pane_args(script),
     }
+}
+
+/// [`powershell_pane_command`] の起動引数（純粋関数）。SSH ペインがローカルへ戻るときに
+/// 入れ子で起こす PowerShell も同じものを足す（[`Relaunch::powershell_args`]。#2594）
+pub fn powershell_pane_args(script: &Path) -> Vec<String> {
+    vec![
+        "-NoExit".to_string(),
+        "-EncodedCommand".to_string(),
+        crate::platform::shell::encode_powershell_command(&powershell_bootstrap(script)),
+    ]
 }
 
 /// [`powershell_pane_command`] が渡すコマンド本文。パスは ASCII だけの式で埋める
@@ -957,6 +1017,11 @@ mod imp {
         None
     }
 
+    /// 戻りのシェルも env で届く（[`super::Relaunch::env`]）ので起動引数は足さない（#2594）
+    pub(super) fn relaunch_powershell_args() -> Vec<String> {
+        Vec::new()
+    }
+
     pub(super) fn status() -> Status {
         Status {
             delivery: DELIVERY,
@@ -1002,6 +1067,18 @@ mod imp {
         // 読みに行く時点でスクリプトが在るようにする
         let _ = super::env();
         Some(super::powershell_pane_command(&program, &script))
+    }
+
+    /// SSH ペインがローカルへ戻るときに起こす PowerShell へ足す引数（#2594）。
+    /// 起こすのは常に PowerShell（スクリプトを走らせている自分自身）なので、既定シェルが
+    /// PowerShell かどうか（[`pane_shell`] の条件）は問わない
+    pub(super) fn relaunch_powershell_args() -> Vec<String> {
+        let Some(root) = super::integration_root() else {
+            return Vec::new();
+        };
+        // 書き出しはプロセスで 1 回（[`pane_shell`] と同じ理由）
+        let _ = super::env();
+        super::powershell_pane_args(&root.join("tako.ps1"))
     }
 
     /// 素のペインの既定シェル（PowerShell のときだけ。cmd.exe へ落ちた環境は `None`）
@@ -1974,6 +2051,43 @@ mod delivery_tests {
         assert!(status.legacy_blocks.is_empty());
         assert_eq!(status.launch_shell, None);
         assert_eq!(status.describe()["delivery"], "automatic");
+    }
+
+    /// #2594: SSH ペインの戻りのシェルへ当て直す組は、素のペインの spawn が積む組と同じ
+    /// （片方だけに足すと戻りのシェルだけ外れる）。unix は env で、Windows は起動引数で届く
+    #[test]
+    fn 戻りのシェルへ当て直す組は素のペインと同じ() {
+        let relaunch = relaunch();
+        assert_eq!(relaunch.env, pane_shell_env());
+        // 統合の 3 点セットも検証の履歴の置き場（#1253）も漏れなく入っている
+        for pair in env()
+            .iter()
+            .chain(&crate::paths::verification_histfile_env())
+        {
+            assert!(relaunch.env.contains(pair), "{pair:?} が無い: {relaunch:?}");
+        }
+        if cfg!(windows) {
+            let script = integration_root().expect("置き場").join("tako.ps1");
+            assert_eq!(relaunch.powershell_args, powershell_pane_args(&script));
+            assert!(script.exists(), "{script:?} が無い");
+        } else {
+            assert!(relaunch.powershell_args.is_empty(), "{relaunch:?}");
+            assert!(
+                relaunch.env.iter().any(|(k, _)| k == "ZDOTDIR"),
+                "{relaunch:?}"
+            );
+        }
+    }
+
+    /// #2594 の A/B: `TAKO_2594_LEGACY=1` は何も当て直さない（= #2594 前の戻りのシェル）
+    #[test]
+    fn legacyでは戻りのシェルへ何も当て直さない() {
+        if crate::run_alone!(legacyでは戻りのシェルへ何も当て直さない) {
+            return;
+        }
+        // 子の中だけ（他のテストは居ない。#2400）
+        unsafe { std::env::set_var("TAKO_2594_LEGACY", "1") };
+        assert_eq!(relaunch(), Relaunch::default());
     }
 
     /// Windows の素のペインは、既定シェル（PowerShell）へ統合を読ませる引数を足したもの
