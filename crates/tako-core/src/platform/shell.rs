@@ -26,9 +26,27 @@ pub fn default_shell() -> Option<SpawnCommand> {
 /// 「素のペインでは `npm` が引けるのに、カードの実行ペインでは command not found」に
 /// なっていた（#1031 実発）。`-i` を足して**素のペインと同じ読み込み順**へ揃える。
 ///
-/// `TAKO_1031_LEGACY=1` で #1031 前（`-l -c` = 非対話）へ戻せる = 同一バイナリで A/B が取れる
+/// **csh / tcsh は `-l` を唯一の引数としてしか受け付けない**（#2597。`tcsh -l -i -c …` は
+/// `Unknown option: '-l'` で rc=1 = ペインが何も残さず消えていた）。`$SHELL` が csh 系なら起こし方の表
+/// （`exe::login_invocation` の csh 系の行 = argv[0] を `-<名>` にして `-c` で片を `/bin/sh` へ渡す。#2577）を
+/// 引く。PTY の子は alacritty が `Command::new(program).args(args)` で起こし argv[0] を渡す口が無いので、
+/// `exec -a` を持つシェルを 1 段挟む（[`posix_argv0_command`]）。`-i` は渡さない: tcsh 6.21 は `-c` のとき
+/// `-i` を付けても `prompt` を立てず、`~/.tcshrc` はどの tcsh も読む = 読み込みは付けても付けなくても同じ
+/// （2026-11-01 実測）。
+///
+/// `TAKO_1031_LEGACY=1` で #1031 前（`-l -c` = 非対話）へ戻せる = 同一バイナリで A/B が取れる。
+/// `TAKO_2597_LEGACY=1`（[`ISSUE2597_LEGACY_ENV`]）で csh 系も `-l -i -c` へ戻る
 pub fn login_shell_command(command: SpawnCommand) -> SpawnCommand {
     imp::login_shell_command(command)
+}
+
+/// #2597 の A/B の env（`1` で csh / tcsh の利用者の明示コマンドのペインも `$SHELL -l -i -c` で起こし、
+/// 器の内側コマンドも POSIX の引用のまま組む = #2597 前の形）
+pub const ISSUE2597_LEGACY_ENV: &str = "TAKO_2597_LEGACY";
+
+/// [`ISSUE2597_LEGACY_ENV`] が立っているか（#2597 の A/B のゲートはここ 1 か所）
+pub fn issue2597_legacy() -> bool {
+    std::env::var(ISSUE2597_LEGACY_ENV).is_ok_and(|v| v == "1")
 }
 
 /// コマンドが**失敗したときだけ**ペインを残す形に包む（#1031）。
@@ -577,9 +595,18 @@ mod imp {
 /// `.bashrc` ではなく `.bash_profile` を読む（= `-i` の有無で読むファイルが変わらない）が、
 /// これも素のペイン（`bash -l` を tty で起こす）と同じなので**揃っている**のが正しい。
 ///
-/// フラグの並びを `-l -i -c` に固定するのは、`-c` の直後がスクリプト本体である必要があるため
+/// フラグの並びを `-l -i -c` に固定するのは、`-c` の直後がスクリプト本体である必要があるため。
+///
+/// csh / tcsh（起こし方の表 `exe::login_form` が `LoginForm::Argv0` と答えるシェル）だけは表の csh 系の行を
+/// 引き、[`posix_argv0_command`] で argv[0] を当てる（#2597。`-l` を渡すと必ず落ちる）
 #[cfg_attr(windows, allow(dead_code))]
 fn posix_login_shell_command(shell: &str, script: &str, interactive: bool) -> SpawnCommand {
+    use crate::platform::exe::{login_form, login_invocation, LoginForm};
+    if !issue2597_legacy() && login_form(shell) == LoginForm::Argv0 {
+        return posix_argv0_command(&login_invocation(shell, script), &|p| {
+            std::path::Path::new(p).exists()
+        });
+    }
     let mut args = vec!["-l".to_string()];
     if interactive {
         args.push("-i".to_string());
@@ -589,6 +616,59 @@ fn posix_login_shell_command(shell: &str, script: &str, interactive: bool) -> Sp
     SpawnCommand {
         program: shell.to_string(),
         args,
+    }
+}
+
+/// argv[0] を当てる段（実行ファイルと `-c` までのフラグ）。`exec -a` を持つ zsh / bash を、先頭から**在るもの**で
+/// 選ぶ（macOS は `/bin/zsh` が必ず在る。zsh の無い Linux は `/bin/bash` か `/usr/bin/bash`、FreeBSD の ports は
+/// `/usr/local/bin`）。zsh の `-f` は利用者の rc（`ZDOTDIR` のシェル統合も）を読まない。bash の `--posix` は
+/// 非対話で `BASH_ENV` も読まない。どれも無ければ [`posix_argv0_command`] は argv[0] を当てずに起こす
+const ARGV0_TRAMPOLINES: &[(&str, &[&str])] = &[
+    ("/bin/zsh", &["-fc"]),
+    ("/bin/bash", &["--posix", "-c"]),
+    ("/usr/bin/zsh", &["-fc"]),
+    ("/usr/bin/bash", &["--posix", "-c"]),
+    ("/usr/local/bin/zsh", &["-fc"]),
+    ("/usr/local/bin/bash", &["--posix", "-c"]),
+];
+
+/// argv[0] を当てる段のスクリプト。`$0` = 当てる argv[0]、`"$@"` = 実行ファイルと引数
+const ARGV0_EXEC: &str = "exec -a \"$0\" \"$@\"";
+
+/// 起こし方の表の答え（`exe::login_invocation`）を、argv[0] の欄を持たない [`SpawnCommand`] にする（#2597）。
+///
+/// PTY の子は alacritty が `Command::new(program).args(args)` で起こすので argv[0] を渡す口が無い。
+/// argv[0] を当てる行（csh / tcsh = `-tcsh`）は `exec -a` を持つシェルを 1 段挟み（[`ARGV0_TRAMPOLINES`]）、
+/// そこから本来の argv を exec する。alacritty 自身も macOS の login 経由の起動で同じ
+/// `/bin/zsh -fc 'exec -a -<名> <shell>'` を使っている。段は exec で消えるのでプロセスの深さは変わらない。
+/// 段がどれも無い unix では argv[0] を当てずに起こす（csh 系は非ログイン = `~/.login` を読まないが、
+/// `.tcshrc` は読み、`-l` で必ず落ちるよりよい）。`exists` を渡すのは段の有無を macOS の単体から固定するため
+#[cfg_attr(windows, allow(dead_code))]
+fn posix_argv0_command(
+    invocation: &crate::platform::exe::LoginInvocation,
+    exists: &dyn Fn(&str) -> bool,
+) -> SpawnCommand {
+    let trampoline = ARGV0_TRAMPOLINES
+        .iter()
+        .find(|(program, _)| exists(program));
+    match (&invocation.arg0, trampoline) {
+        (Some(arg0), Some((program, flags))) => {
+            let mut args: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            args.extend([
+                ARGV0_EXEC.to_string(),
+                arg0.clone(),
+                invocation.program.clone(),
+            ]);
+            args.extend(invocation.args.iter().cloned());
+            SpawnCommand {
+                program: program.to_string(),
+                args,
+            }
+        }
+        _ => SpawnCommand {
+            program: invocation.program.clone(),
+            args: invocation.args.clone(),
+        },
     }
 }
 
@@ -1215,6 +1295,10 @@ mod tests_1031 {
             std::env::var_os("TAKO_1031_LEGACY").is_none(),
             "A/B の env が立ったままではこの検査に意味が無い"
         );
+        // csh / tcsh の利用者の手元では表の csh 系の行（`-l` を渡さない）になる（#2597。tests_2597 が見る）
+        if std::env::var("SHELL").is_ok_and(|s| crate::platform::exe::is_csh_family(&s)) {
+            return;
+        }
         let got = login_shell_command(cmd(&["/bin/echo", "hi"]));
         assert_eq!(
             got.args
@@ -1531,6 +1615,188 @@ mod tests_1031 {
             "args={:?}",
             got.args
         );
+    }
+}
+
+/// #2597: csh / tcsh の利用者の明示コマンドのペイン
+#[cfg(test)]
+mod tests_2597 {
+    use super::*;
+    use crate::platform::exe::{LoginInvocation, CSH_LOGIN_SCRIPT};
+
+    const SCRIPT: &str = "'/bin/sh' '-c' 'echo \"$x\"\nexit 3'";
+
+    fn tcsh_invocation() -> LoginInvocation {
+        LoginInvocation {
+            program: "/bin/tcsh".into(),
+            arg0: Some("-tcsh".into()),
+            args: vec!["-c".into(), CSH_LOGIN_SCRIPT.into(), SCRIPT.into()],
+        }
+    }
+
+    /// argv[0] を当てる段（macOS は `/bin/zsh -fc`）。段の後ろに表の argv がそのまま並ぶ
+    #[test]
+    fn argv0の行はzshの段から起こす() {
+        let got = posix_argv0_command(&tcsh_invocation(), &|p| p == "/bin/zsh");
+        assert_eq!(got.program, "/bin/zsh");
+        assert_eq!(
+            got.args,
+            vec![
+                "-fc",
+                "exec -a \"$0\" \"$@\"",
+                "-tcsh",
+                "/bin/tcsh",
+                "-c",
+                CSH_LOGIN_SCRIPT,
+                SCRIPT
+            ]
+        );
+    }
+
+    /// zsh が無い unix は bash の段（`exec -a` は bash も持つ。`--posix` = `BASH_ENV` を読まない）。
+    /// `/bin` に無ければ `/usr/bin`（usr 統合の Linux）→ `/usr/local/bin`（FreeBSD の ports）
+    #[test]
+    fn zshが無ければbashの段から起こす() {
+        for bash in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
+            let got = posix_argv0_command(&tcsh_invocation(), &|p| p == bash);
+            assert_eq!(got.program, bash);
+            assert_eq!(
+                got.args,
+                vec![
+                    "--posix",
+                    "-c",
+                    ARGV0_EXEC,
+                    "-tcsh",
+                    "/bin/tcsh",
+                    "-c",
+                    CSH_LOGIN_SCRIPT,
+                    SCRIPT
+                ]
+            );
+        }
+        // zsh が `/usr/bin` に在れば、`/bin/bash` より先の候補でも zsh を使わない（表の順 = /bin が先）
+        let got = posix_argv0_command(&tcsh_invocation(), &|p| {
+            p == "/usr/bin/zsh" || p == "/bin/bash"
+        });
+        assert_eq!(got.program, "/bin/bash");
+    }
+
+    /// 本物の段で tcsh がログインとして起きる（`$?loginsh` が立つ。unix・在るとき）。zsh の段・bash の段の
+    /// 両方を見て、段が無いとき（argv[0] なし）は非ログインで起きることも見る。`-f` で rc を 1 つも読ませない
+    /// （`.login` を読むところまでは `tako-control` の番犬 `issue2597_csh_pane_command_watchdog` の砂場が見る）
+    #[cfg(unix)]
+    #[test]
+    fn 本物の段でtcshはログインとして起きる() {
+        if !std::path::Path::new("/bin/tcsh").exists() {
+            return;
+        }
+        let inv = LoginInvocation {
+            program: "/bin/tcsh".into(),
+            arg0: Some("-tcsh".into()),
+            args: vec![
+                "-f".into(),
+                "-c".into(),
+                "if ($?loginsh) then\necho login\nelse\necho none\nendif".into(),
+            ],
+        };
+        let run = |got: SpawnCommand| {
+            let out = std::process::Command::new(&got.program)
+                .args(&got.args)
+                .env("PATH", "/usr/bin:/bin")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("起こせる");
+            assert!(out.status.success(), "{got:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        for trampoline in ["/bin/zsh", "/bin/bash"] {
+            if std::path::Path::new(trampoline).exists() {
+                let got = posix_argv0_command(&inv, &|p| p == trampoline);
+                assert_eq!(got.program, trampoline);
+                assert_eq!(run(got), "login", "{trampoline} の段");
+            }
+        }
+        // 段が無い = argv[0] なしの非ログイン（`.login` は読まない）が、起きはする
+        assert_eq!(run(posix_argv0_command(&inv, &|_| false)), "none");
+    }
+
+    /// 段がどれも無ければ argv[0] を当てずに表の argv のまま（非ログインでも `-l` で落ちるよりよい）
+    #[test]
+    fn 段が無ければargv0を当てずに起こす() {
+        let got = posix_argv0_command(&tcsh_invocation(), &|_| false);
+        assert_eq!(got.program, "/bin/tcsh");
+        assert_eq!(got.args, vec!["-c", CSH_LOGIN_SCRIPT, SCRIPT]);
+    }
+
+    /// argv[0] を当てない行（csh 系でないシェル）は段を挟まない
+    #[test]
+    fn argv0の無い行は段を挟まない() {
+        let flag = LoginInvocation {
+            program: "/bin/zsh".into(),
+            arg0: None,
+            args: vec!["-l".into(), "-c".into(), SCRIPT.into()],
+        };
+        let got = posix_argv0_command(&flag, &|_| true);
+        assert_eq!(got.program, "/bin/zsh");
+        assert_eq!(got.args, flag.args);
+    }
+
+    /// csh 系は `-l` を渡さず表の csh 系の行（`-c` + `CSH_LOGIN_SCRIPT` + 片）を引く。
+    /// 段の有無は実行環境の FS で決まる（Windows では段が無い = 表の argv のまま）ので、末尾 3 語で見る
+    #[test]
+    fn cshとtcshへはlを渡さず表の行を引く() {
+        if crate::platform::exe::issue2577_legacy() || issue2597_legacy() {
+            return;
+        }
+        for shell in ["/bin/tcsh", "/bin/csh", "/usr/local/bin/tcsh"] {
+            for interactive in [true, false] {
+                let got = posix_login_shell_command(shell, SCRIPT, interactive);
+                assert!(
+                    !got.args.iter().any(|a| a == "-l" || a == "-i"),
+                    "{shell}: {got:?}"
+                );
+                let n = got.args.len();
+                assert!(n >= 3, "{shell}: {got:?}");
+                assert_eq!(
+                    &got.args[n - 3..],
+                    ["-c", CSH_LOGIN_SCRIPT, SCRIPT],
+                    "{shell}: {got:?}"
+                );
+                if got.program != shell {
+                    // 段を挟んだ形: 段の後ろに argv[0]（`-<名>`）と本来の実行ファイル
+                    let name = std::path::Path::new(shell).file_name().unwrap();
+                    let arg0 = format!("-{}", name.to_string_lossy());
+                    assert_eq!(&got.args[n - 5..n - 3], [arg0.as_str(), shell]);
+                }
+            }
+        }
+    }
+
+    /// csh 系でないシェルの argv は #2597 前とバイト一致（`$SHELL -l [-i] -c <片>`）
+    #[test]
+    fn csh系でないシェルは修正前とバイト一致() {
+        if crate::platform::exe::issue2577_legacy() {
+            return;
+        }
+        for shell in [
+            "/bin/zsh",
+            "/bin/bash",
+            "/bin/sh",
+            "/bin/dash",
+            "/bin/ksh",
+            "/opt/homebrew/bin/fish",
+            "/usr/local/bin/fish",
+            "/usr/bin/nu",
+        ] {
+            for (interactive, want) in [
+                (true, vec!["-l", "-i", "-c", SCRIPT]),
+                (false, vec!["-l", "-c", SCRIPT]),
+            ] {
+                let got = posix_login_shell_command(shell, SCRIPT, interactive);
+                assert_eq!(got.program, shell);
+                assert_eq!(got.args, want, "{shell}");
+            }
+        }
     }
 }
 

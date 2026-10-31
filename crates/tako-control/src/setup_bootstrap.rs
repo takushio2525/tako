@@ -2382,6 +2382,9 @@ mod tests {
             ("/bin/bash", ShellKind::Bash),
             // #2592: sh は bash と分ける（sh のログインは `.profile` だけを読む）
             ("/bin/sh", ShellKind::Sh),
+            // #2603: dash / ksh もログインで `.profile` を読む（本物で確かめた名前だけ）
+            ("/bin/dash", ShellKind::Sh),
+            ("/bin/ksh", ShellKind::Sh),
             ("/opt/homebrew/bin/fish", ShellKind::Fish),
             (
                 r"C:\Program Files\PowerShell\7\pwsh.exe",
