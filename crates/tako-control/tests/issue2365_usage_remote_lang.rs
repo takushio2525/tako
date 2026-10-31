@@ -505,11 +505,10 @@ fn nothing_written(root: &Path) -> Vec<String> {
             _ => None,
         };
         match expected {
-            Some(text) => {
-                if std::fs::read_to_string(&devices).unwrap_or_default() != text {
-                    out.push(format!("断ったのに書き換えた: {}", devices.display()));
-                }
+            Some(text) if std::fs::read_to_string(&devices).unwrap_or_default() != text => {
+                out.push(format!("断ったのに書き換えた: {}", devices.display()));
             }
+            Some(_) => {}
             None if devices.exists() => {
                 out.push(format!("断ったのに作った: {}", devices.display()))
             }
