@@ -4,21 +4,17 @@
 > 過去ログは `progress.md`、フェーズ計画は `roadmap.md` を見ること。
 > 予算は **80 行以内**（`tako context-budget`）。過去ターンの実装詳細はここに書かない。
 
-## 現在の対象（2026-10-31 朝）
+## 現在の対象（2026-10-31 夜）
 
-- main = `5d3f73d`（#2550 / PR #2554 まで）。10/31 は作業ログの docs PR を除いて 9 本着地（#2545 / #2543 / #2546 / #2547 / #2548 / #2549 / #2552 / #2553 / #2554。着地は 1 件ずつ progress.md）。/Applications は 10/31 09:07 に `5d3f73d` を install・GUI 再起動済み（画面ロック中・Dock 起動と同じ痩せた PATH・復元失敗 0・remote daemon は replaced-generation で新版・jobserver の fifo を札 18 枚で作り直し）
-- **#2539 / #2538 / #1998 は本番確認の上で閉じた**（#2539 = 再起動後の本番 GUI の子に tailscale 0 本・陽性対照つき / #2538 = install をまたいで待った `tako queue` の包みの待ち明けで ASP 拒否 0 / #1998 = 再起動後に作ったペインに `CARGO_MAKEFLAGS`・`tako queue` に「cargo の札: 空き 18 / 18」）。#2533 は記録の改善（PR #2540）で Refs のまま = 次に起きたら audit.log の `daemon_stop_requested` / `requester` で要求元を名指す。#2518 以後、install 後は GUI を再起動するだけで remote daemon も新版へ入れ替わる（手で stop / start しない）
-- **対応中**: #2365 の次のスライス = `op_err` を通る断り（git の書き込み系・Web ビュー。PR #2556）/ #2555（`tako-2035-*` の一時 dir の消し残し）。10/31 に起票した #2550 / #2551 は着地して閉じた・#2557（未知のシェルへの断りの案内文の誤り）は未着手
+- main = `037c907`（#2581 / PR #2584 まで）。10/31 は作業ログの docs PR を除いて 24 本着地（朝までの 9 本 = #2545〜#2554・後半の 15 本 = #2556〜#2584。着地は 1 件ずつ progress.md）。/Applications は 10/31 19:03 に `3aac66e`（PR #2574 まで）を install・GUI 再起動済み（master のペインから `open -a` = #2570 の再 exec の経路で正常起動・復元失敗 0・remote daemon は replaced-generation）。#2579 / #2580 / #2584 は未 install
+- **#2559 / #2570 は本番確認の上で閉じた**（#2559 = 自動命名の `claude -p` の mod 報告が master の状態を上書き / #2570 = ペインから起こし直した GUI がペインの env を持ち込む）。#2533 は記録の改善（PR #2540）で Refs のまま = 次に起きたら audit.log の `daemon_stop_requested` / `requester` で要求元を名指す。#2518 以後、install 後は GUI を再起動するだけで remote daemon も新版へ入れ替わる（手で stop / start しない）
+- **対応中**: #2582（remote daemon がペインの env を受け継ぐ・PR #2585）/ #2578（ユーザー依頼: cmd+クリックの URL / パスがペインの幅の折り返しで切れる・PR #2586）
 - **10/27 ユーザー依頼: Windows 版を日常で使えるようにする（エピック #467）**。実機なしで直せるものは着地済み（#724 Web ビュー・#2428 PATH・#2434 アプリ内更新・#2432 シェル統合・#2435 パスのリンク・#1599 / #2454 / #2462 プロセスの停止・#2431 WebView2・#641 起動ループ・#1510 初回起動・#2445 wry・#885 spawn の backend 経由）。どれも Windows 実機（ssh の `win`・10/27 から未接続）での確認が残るので Refs で開けてある。CI は両 OS で緑が既定
 - **usage 分析（エピック #2192）**: S1〜S5 は着地（S1 の `<data_dir>/usage/limits.jsonl` は 10/17 から本番で記録中）。設計書 `.agent/plans/2026-10-usage-analytics.md`
 - 版は **v0.8.39**（10/20 以降の夜間のテスト版）。安定版は `scripts/release.sh --promote <tag>` で昇格する
 - **人待ちの正本は `tako todo`**。ここにも引き継ぎにも**列挙しない**（#1450 B4）
-- **検証用 GUI は常設の仮想ディスプレイ `tako-vd` へ出す**（#1141 / #1150 / #1160。ユーザーの
-  メイン画面に窓を出さない）。検証スクリプトからは `. scripts/lib/isolated-gui.sh` の 1 実装で
-  立てる（#1490）。窓の位置・寸法は `TAKO_WINDOW_BOUNDS` / `tako window move|resize`（**AX 禁止** = #1442）
-- **ビルドした CLI は `env -u TAKO_SOCKET -u TAKO_PANE_ID TAKO_ISOLATED=1 TAKO_DATA_DIR=<短い一時 dir>`
-  で叩く**（作業シェルは本番 GUI の socket を継承している）。status 読みは
-  `/Applications/tako.app/Contents/MacOS/tako`（PATH 先頭の `target` が stale なことがある）
+- **検証用 GUI は常設の仮想ディスプレイ `tako-vd` へ出す**（#1141 / #1150 / #1160。ユーザーのメイン画面に窓を出さない）。検証スクリプトからは `. scripts/lib/isolated-gui.sh` の 1 実装で立てる（#1490）。窓の位置・寸法は `TAKO_WINDOW_BOUNDS` / `tako window move|resize`（**AX 禁止** = #1442）
+- **ビルドした CLI は `env -u TAKO_SOCKET -u TAKO_PANE_ID TAKO_ISOLATED=1 TAKO_DATA_DIR=<短い一時 dir>` で叩く**（作業シェルは本番 GUI の socket を継承している）。status 読みは `/Applications/tako.app/Contents/MacOS/tako`（PATH 先頭の `target` が stale なことがある）
 - **重い処理（cargo build / test / clippy・build-app.sh）は `tako queue <コマンド>` を通す**（#1994。
   同時数・空きメモリ・メモリ圧で割り当てる）。負荷を生成して再現しない（注入で再現する）
 - **書いたシェルは macOS 同梱の bash 3.2 で通す**（空配列は `${arr[@]+"${arr[@]}"}`。番犬が
@@ -39,8 +35,11 @@
   同じ器の名前が layout.json で重なったら先のペインが器を持ち、2 本目以降は新しい器で起こす（#2486・FR-5.22）
 - **長生きするプロセス（GUI・remote daemon・待ちの長い queue の包み）は外部コマンドを素の名前で起こし続けない**（#2513 / #2519 / #2538）。PATH で見つけたものは `exe::find_in_process_path` で絶対パスに持つ（起こすたびに引き直す口は `exe::resolve_for_spawn`・待ってから起こす口は `exe::pin_before_wait`。install の差し替え後は PATH の空振りが AppleSystemPolicy の拒否になる）。規約は `.agent/conventions.md` の同名の節。GUI の 2 秒ごとの daemon の生死は PID ファイルだけで見る（`remote::daemon_running`・#2539）
 - **#2531 以後、`TAKO_ISOLATED=1` で置き場（`TAKO_DATA_DIR` / `TAKO_DISCOVERY_DIR`）の指定が無い CLI / MCP ブリッジ / daemon は本番へ繋がず日英で断る**（`tako queue` だけ例外 = 本番の順番待ちへ並ぶ。正本 `discovery::read_candidates`・A/B `TAKO_2531_LEGACY=1`・本番確認済み）。検証スクリプトの側は番犬 `verification_isolation_watchdog` が発見の置き場を拘束する（#2527）
-- **テストが env を書き換えるなら `run_alone!` の子の中で**（#2520 / #2525）。目印つきで手で戻す形は番犬 `issue2400_test_env_write_watchdog` が file:line で落とす。既知の残りは issue2092 の 1 対だけ
-- **英語表示の断りは日英へ寄せている途中（#2365）**。dispatch 本体は済み（`Reason`・orchestrator の設定は `ConfigError` の型の口 `*_typed`・GUI 側の口は `HostRefusal`・会話系は `SessionRefusal`・OS の設定は `OsRefusal` / `SiError`・更新の口は `UpdateRefusal`・setup 系と bootstrap は `SetupRefusal`・OS のシェル連携と蓋閉じ・Battery は `OsIntegrationError` / `LidError`・tako-core は `PlanRefusal` ほか）。残り（`op_err` ほか）は Issue の最後のコメントの表
+- **テストが env を書き換えるなら `run_alone!` の子の中で**（#2520 / #2525）。目印つきで手で戻す形は番犬 `issue2400_test_env_write_watchdog` が file:line で落とす。既知の残りは issue2092 の 1 対だけ。**テストの使い捨ての置き場は `ScratchDir` で作る**（#2555 / #2561 / #2566。素の `PathBuf` / `String` を返す補助は番犬 `issue2561_temp_dir_helper_watchdog` が落とす）
+- **英語表示の断りは日英へ寄せている途中（#2365）**。dispatch 本体は済み（`Reason`・orchestrator の設定は `ConfigError` の型の口 `*_typed`・GUI 側の口は `HostRefusal`・会話系は `SessionRefusal`・OS の設定は `OsRefusal` / `SiError`・更新の口は `UpdateRefusal`・setup 系と bootstrap は `SetupRefusal`・OS のシェル連携と蓋閉じ・Battery は `OsIntegrationError` / `LidError`・remote 系は `RemoteRefusal`・tmux は `TmuxRefusal`・tako-core は `PlanRefusal` / `GitError` / `RangeRefusal` / `PolicyRefusal` ほか）。残りは Issue の最後のコメントの表（次は config_share = `tako config`）
+- **本人だけが読むべきファイル（トークン・QR・control.json ほか）は境界 B32 `platform::private_file` を通す**（#1632 / #2581。Windows は本人 + SYSTEM だけの DACL・unix は同じ呼び出し）。境界の外で本人だけの mode を当てると番犬が file:line で名指す
+- **台帳 / projects.yaml / accounts.yaml の変更は `try_mutate_typed`（Err なら書かない）を通す**（#2569。断りで書き戻す形は番犬 `issue2569_refusal_writeback` が名指す）
+- **#2570 以後、GUI は main の最初でペインの env（`tako_core::host_env::STRIP`）を外し、unix は exec し直す**（A/B `TAKO_2570_LEGACY=1`）。remote daemon の同じ件は #2582（対応中）
 - **LSP の e2e で取ってきたサーバは `FetchConfig::plain_shell`（rc を読まない `/bin/sh -c`）で起こす**（#2509 / #2514。開発者のログインシェルの rc が stdout を握って落ちる）
 - **CLI のテストのビルドは `--pane` 省略で手元の `TAKO_PANE_ID` を読まない**（#1716・番犬 `issue1716_caller_pane_env_watchdog`）。**CHANGELOG の `## [Unreleased]` は最上段の 1 つだけ**（#1593・番犬 `issue1593_changelog_unreleased_watchdog`）
 - **変数を使う rm は `${var:?}` の形**（#2306）。番犬 `rmの引数で空になると広い場所を指す変数はvar_qで止める` が全 `.sh` を見る（例外は `# tako:rm-var-ok <理由>`）
@@ -61,7 +60,8 @@
 ## 次の一手
 
 - 蓋が開いて tako-vd が描けるとき: #2537（LSP の右クリックメニューの項目が 12 のうち 6）/ #2478（項目 128 の間欠）/ #2425（起動待ちの帯・UI）/
-  #1902（visual-test の回数の窓）/ #1899 の 2 点目 / #2491 / #2228 / #2045（横断置換）。#2557（未知のシェルへの断りの案内文の誤り）は CLI の文なので蓋閉じでも着手できる見込み。実機が要る: #937・#2484 ほか #467 配下（#2429 / #2430 / #2433）。#2392 は再発待ち（11/8 に閉じる）
+  #1902（visual-test の回数の窓）/ #1899 の 2 点目 / #2491 / #2228 / #2045（横断置換）。実機が要る: #937・#2484 ほか #467 配下（#2429 / #2430 / #2433）。#2392 は再発待ち（11/8 に閉じる）
+- 次の候補: #2577（tcsh の `-l -c`）/ #2583（setup の PATH の案内の残り 3 件）/ #2365 の次のスライス（config_share = `tako config`）
 - **夜間リリースは 10/21 から出ていない**（リリースする役の旧 Mac が offline）。人待ちは `tako todo`
 - 相談リスト（[提案]・自動実装しない）: #2019 / #2022 / #2307 ほか。判断の正本は Issue と `tako todo`
 

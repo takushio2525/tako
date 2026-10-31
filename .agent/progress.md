@@ -20,55 +20,6 @@
 
 ---
 
-## 2026-10-30（#2518: install をまたいで旧版のまま動く remote daemon を PID ファイル 4 行目の実行ファイルの識別（3 行の旧形式は ctime と起動時刻）で見分け、GUI 起動時の自動復帰と `tako remote start` が desired を保ったまま入れ替える・status に `serve_generation`・A/B `TAKO_2518_LEGACY=1`）
-- 本物の daemon + 本物の contents-swap の A/B で PASS 41・注入で番犬が remote.rs:3467 / remote_autostart.rs:218 を名指し・カタログ +0 B。PR #2523
-- 15:24 の install・GUI 再起動の本番確認で #2513 / #2518 / #2519 を閉じた
-
-## 2026-10-30（#2520: issue1977 の旧腕 3 本の `TAKO_1977_LEGACY` を `run_alone!` の子に閉じ、#2400 の番犬が目印つきで手で戻す対を `file:line` で名指す・既存 12 対は `KNOWN_RESTORE_PAIRS`・残りは #2525）
-- 注入で修正前 1 → 3 件の連鎖 → 修正後は注入した 1 件だけ（12 回）・カタログ +0 B。PR #2526
-
-## 2026-10-30（#2527: test-serve-watch.sh が既定の置き場の control.json から本番 GUI へ届いていた（remote start の QR の open_file と daemon の list）→ 発見の置き場と data dir を一時へ・同じ型 2 本も・番犬 `verification_isolation_watchdog` が tako CLI の行で発見の置き場を拘束・例外は `# tako:prod-ok`）
-- 本番役の隔離 GUI + 中継で修正前 接続 16 件・ペイン 1→2 → 修正後 0 件・1→1・カタログ +0 B。PR #2528
-
-## 2026-10-30（#2525: 目印つきで env を書き換えて手で戻す残り 5 ファイル・11 対を `run_alone!` の子へ寄せ、#2400 の番犬の `KNOWN_RESTORE_PAIRS` を issue2092 の 1 対だけに）
-- 注入で修正前は 1893 / 2034 / 1909 が後のテストへ連鎖（1 → 4 / 3 / 3 件）→ 修正後は注入した 1 本だけ・旧形への注入で番犬が 11 対を file:line で名指す・カタログ +0 B。PR #2529
-
-## 2026-10-30（#2365 の続き: GUI 側の口（ControlHost の実装）が組む断り 48 種を `HostRefusal` へ。dispatch は変えず GUI が表示言語で返す）
-- 隔離 GUI の A/B で英語表示の日本語入り 31 / 35 → 0 / 35・日本語は 35 件バイト一致・注入 3 通りで名指し・カタログ +0 B。PR #2530
-
-## 2026-10-30（#2531: `TAKO_ISOLATED=1` の CLI / MCP ブリッジ / remote daemon は置き場（`TAKO_DATA_DIR` / `TAKO_DISCOVERY_DIR`）の指定が無ければ既定（本番）の置き場の発見ファイルを読まず日英で断る（正本 `discovery::read_candidates`・順番待ちだけ例外・A/B `TAKO_2531_LEGACY=1`））
-- 本番役の隔離 GUI + 中継で修正前 接続 各 1・remote start 2 件・ペイン 1→2 → 修正後 0 件・1→1・番犬 `issue2531_isolated_discovery`・カタログ +0 B。PR #2535
-- 本番確認で #2531 を閉じた
-
-## 2026-10-30（#2365 の続き: sessions / resume_launch / pane_log の断り 11 か所を `SessionRefusal`・fda / sleep_guard / shell_integration の 4 か所を `OsRefusal` + tako-core の `SiError` へ。scripts の日本語だけの判定 3 か所も日英に）
-- 実経路の英語表示で日本語入り 21 → 0（隔離 GUI 16 → 0）・日本語はバイト一致・カタログ +0 B。蓋閉じの解除・Battery・os_integration・lid.rs は次のスライス。PR #2534
-
-## 2026-10-30（#2519 開け直し: Dock 起動の GUI は remote daemon の稼働中、2 秒ごとの `refresh_remote_state` が `daemon_status` を 2 回呼び、`tailscale::pick_candidate` が PATH に無い素の `tailscale` を 4 エントリ空振りしていた → unix では引けない素の名前を起こさない `try_unresolved_bare`・A/B `TAKO_2519_LEGACY=1`）
-- 隔離 GUI + 本物の contents-swap で差し替え後 60 秒の拒否 240 → 0（本番 3.9 件/秒と一致）・番犬が注入を tailscale.rs:190 / remote.rs:2521 で名指し・カタログ +0 B。PR #2536
-- 本番確認で #2519 を閉じた（tailscale を 1 tick に 6 本起こす件は #2539）
-
-## 2026-10-30（#2533: 17:37 の remote daemon の入れ替えの要求元は特定できず（desired の書き直し = 人向けの stop → start の対・自動 3 経路と GUI の dispatch は perf.log と記録で外れた）→ 頼む側の `daemon_stop_requested` / `daemon_start_requested` と daemon 側の `requester`（接続元を OS から引く・経路の名乗り・祖先 6 段の名前）を audit.log へ）
-- 実 daemon の A/B で修正前は要求元 0 行 → 修正後は CLI の pid・ペイン・祖先で名指せる・番犬 `issue2533_remote_request_origin_watchdog`・カタログ +0 B。Issue は Refs のまま。PR #2540
-
-## 2026-10-30（#2365 の続き: 更新の口（`UpdateRefusal` / `UpdateNote` / `CheckError` の中身 / `InstallerError`）と tako-core の 5 系統（`PlanRefusal` / `ViewRefusal` / `OutlineRefusal` / `Truncation::edit_refusal_in` / `ClickRefusal`）・変更履歴の打ち切り（`HistoryTimedOut::text_in`）を表示言語へ。scripts の 2150 / 1676 の判定は日英）
-- 実経路 23 ケースで英語表示の日本語入り 23 → 0・日本語は 23 / 23 バイト一致・注入 4 通りで名指し + E0004・カタログ +0 B。PR #2541
-
-## 2026-10-30（#2538: install の前から待っていた `tako queue` の包みが待ち明けに子を素の名前で起こし、PATH の空振りぶん拒否（本番 41 × 2 を 2 回。段 1 で install の手順ではないと確定）→ 受付の前に `exe::pin_before_wait` で引いた絶対パスで起こす・argv[0] は打った形のまま・A/B `TAKO_2519_LEGACY=1`）
-- 隔離の調停役 + 本物の contents-swap で待ち明けの拒否 10 → 0（2 回）・見え方 / 終了コード / シグナル / 127 は sha 一致・注入 3 通りで番犬が queue_wrapper.rs:577 / 378 を名指し・カタログ +0 B。本番確認待ちで Issue は開けたまま。PR #2542
-
-## 2026-10-31（#2365 の続き: dispatch のファイル操作 4 種と蓋閉じ継続の解除・Battery の断りを中身（`OsIntegrationError` 26 種・`LidError` 13 種・tako-core の `JsonReason` / `UrlBlocked::text_in`）ごと表示言語へ。Windows の文も cfg の外の表）
-- 実経路テストで英語表示の日本語入り 6 / 7 → 0 / 7・隔離 GUI の CLI / MCP 11 / 12 → 0 / 12・日本語は sha256 一致・注入 5 通りで名指し・カタログ +0 B。PR #2545
-
-## 2026-10-31（#2539: GUI の 2 秒ごとの remote の状態の更新が daemon の生死の判定で `daemon_status` を 2 回引き、tailscale を 2 秒ごとに 6 本起こしていた → `remote::daemon_running`（PID ファイルだけ）/ `poll_admin_state`・A/B `TAKO_2539_LEGACY=1`）
-- 隔離 GUI + 偽 tailscale の 60 秒で GUI 由来 173.8 → 0 本/分・子の CPU 366 → 7 ms/分・status の sha と検知の遅れは不変・番犬 `issue2539_remote_poll_tailscale_watchdog`・カタログ +0 B。PR #2543
-- 本番確認で #2539 を閉じた（再起動後の本番 GUI の子に tailscale 0 本・陽性対照つき）
-
-## 2026-10-31（#1833: 読み直しを undo で戻した直後の自動保存が外部変更を上書きするのを止める（`EditKind::Reload` / `TextBuffer::reload_undone`・A/B `TAKO_1833_LEGACY=1`）・リモートの競合を帯と `conflict`（`remote: true`）・`notices` に載せる・CLI `tako edit save --force` に別名 `--overwrite`）
-- 実経路 38 / 38（修正前は 1A / 1B とも外部変更が消え、リモートは conflict 無し）・番犬の注入 4 通りで file:line を名指し・カタログ +0 B。PR #2546
-
-## 2026-10-31（#2365 の続き: dispatch の setup 系の断り（MCP 登録・子の tako setup・answers・config.yaml / changes.yaml・共通ルール同期・依存の導入・導入の系統名とホーム）を `SetupRefusal`（40 種）と `AgentMcpError::text_in` へ。CLI の setup-mcp の直呼びに表示言語の初期化）
-- 実経路（隔離 GUI へ MCP 18 + CLI 3）で英語表示の日本語入り 20 / 21 → 0 / 21・日本語は 21 件 sha256 一致・注入 4 通りで file:line を名指し + E0004・カタログ +0 B。PR #2547
-
 ## 2026-10-31（#1998: tako のペインへ共有 jobserver（`CARGO_MAKEFLAGS` の fifo）を注入し包まない cargo も札で絞る・器へは -e で固定・macOS の data dir の空白は一時 dir へ逃がす・受け継いだ jobserver があると cargo は `CARGO_BUILD_JOBS` を見ないと実測で確認（設計書 §9.7））
 - 実経路で 3 本並べて N + 3 = 7 に対し 7（A/B 11）・再起動をまたいで空きの最大 = N・kill で失った 4 枚を数え直しで戻した・カタログ +98 B。PR #2548
 - 本番確認済み（再起動後に作ったペインに `CARGO_MAKEFLAGS`・`tako queue` に「cargo の札: 空き 18 / 18」）
@@ -85,3 +36,50 @@
 ## 2026-10-31（#2550: setup bootstrap の PATH 通しが種別の分からない `$SHELL`（nu・tcsh 等）を zsh と見なして `.zprofile` へ書いていた → `shell_kind_for` で空・未設定のときだけ OS の既定、未知は既存の断りで止める）
 - 砂場の CLI で修正前 rc=0・`.zprofile` を書く → 修正後 rc=1・書かない（4 シェル）・既知 7 種はファイルと応答がバイト一致・注入で単体と実経路が file:line で落ちる・カタログ +0 B。PR #2554
 - 09:07 に `5d3f73d` を install・GUI 再起動の本番確認で #2538 も閉じた（install をまたいだ `tako queue` の包みの待ち明けで拒否 0）。断りの案内文の誤りは #2557
+
+## 2026-10-31（#2365 の続き: dispatch の `op_err` が載せる中身のうち日本語のままだった git の書き込み系（tako-core `GitError` 16 種・型の口 `*_typed`）と GUI の Web ビューの navigate / eval・URL の検査（`HostRefusal` 9 種）・固定文 2 つを表示言語へ）
+- 実経路 隔離 GUI へ CLI 12 + MCP 4 で英語表示の日本語入り 15 → 0・日本語はバイト一致・GUI 無しの実経路 14 / 15 → 0 / 15・カタログ +0 B。PR #2556
+
+## 2026-10-31（#2555: LSP の e2e が `stop`（待たずに返る）の直後に置き場を消し、偽サーバの `exit` の書き込みで `tako-2035-*` / `tako-2048-*` が消え残っていた → テストの最後は `shutdown_all`・置き場は `ScratchDir`・番犬 `issue2555_lsp_stop_then_scope_end_watchdog`）
+- 修正前 10 回で 2035 は 20 個・2048 は 2 個 → 修正後 0 個・SIGKILL の残りは test-residue が数える・注入で番犬が 4 行を名指す・既存の 257 個を片付け・カタログ +0 B。PR #2558
+
+## 2026-10-31（#2557: setup bootstrap の未知のシェルへの断りが `export PATH="~/.local/bin:$PATH"` を 4 行重ねていた → tako-core `shell_profile::dirs_for_unknown_shell`（書く行と同じ `$HOME/…`・重複なし）でディレクトリだけ並べ、構文はそのシェルの書き方に任せる）
+- CLI / MCP（日英）とも 4 行 → 1 行・既知のシェル 7 種の rc と応答はバイト一致・注入 3 通りで file:line を名指し・カタログ +0 B。PR #2563
+
+## 2026-10-31（#2561: MCP 設定のテストの `mcp_test_dir` と #944 の番犬の `scratch` を `ScratchDir` へ寄せ、子をプロセスグループの頭で起こして刈り取る前に孫を止める・番犬 `issue2561_temp_dir_helper_watchdog`）
+- 修正前は専用の TMPDIR で 3 回走らせると 7→14→21 個（944 は偽 agy の注入で 3→6→9 個）、修正後はどちらも 0→0→0 個。本物の `$TMPDIR` から 976 個を消した（失敗 0）・カタログ +0 B。PR #2562
+
+## 2026-10-31（#2365 の続き: 委任台帳・引き継ぎの書き込み・supervisor・後任 master の起動コマンドを `ConfigError`、非同期 run・手順書を `Reason`、設定値の範囲・paste-guard を tako-core の `RangeRefusal` / `PolicyRefusal` へ。置き場 21 か所は #2497 で済みと確認）
+- 隔離 GUI の A/B で英語表示の日本語入り 24 / 24 → 0 / 24・日本語は sha256 一致・注入 12 か所を名指し + E0004・カタログ +0 B。PR #2565
+
+## 2026-10-31（#2566: IPC のテストの偽の受け口を `ScratchDir` の下へ・dispatch / orchestrator のテストの補助が設定の置き場の OnceLock を後始末なしで先に初期化するのを外す・#2561 の番犬を String / ソケット / OnceLock の初期化子へ広げる）
+- 修正前は専用の TMPDIR で 3 回走らせると `tk2123*` 3→6→9・dispatch-config 1→2→3、修正後はどちらも 0→0→0。本物の `$TMPDIR` から 341 個を消した（失敗 0）・カタログ +0 B。PR #2568
+
+## 2026-10-31（#2559: GUI をペインから再起動すると自動命名の `claude -p` がペインの識別と mod の注入を受け継ぎ、master の `mod_turn` / `session_id` / `rate_limits` を haiku の報告で上書きしていた → 起動形で `helper_env` を外す + CLI が祖先を添え GUI がペインの外の報告を `foreign` で捨てる（A/B `TAKO_2559_LEGACY=1`））
+- 隔離 GUI + 偽 claude で修正前は上書き・`ended` で報告消失 → 修正後 0・番犬 `issue2559_helper_report_watchdog`・カタログ +0 B。PR #2567
+- 本番確認で #2559 を閉じた
+
+## 2026-10-31（#2569: 台帳 / projects.yaml / accounts.yaml の `mutate` が閉包の断りでも書き戻し 0 件のファイル作成・手書きの形の書き直しをしていた → `try_mutate_typed`（Err なら書かない）へ寄せ、番犬 `issue2569_refusal_writeback` が file:line で名指す）
+- 実経路（CLI / MCP・日英）で修正前 NG 32 → 修正後 0・出力 128 ファイルがバイト一致・カタログ +0 B。PR #2572
+
+## 2026-10-31（#2365 の続き: 対応マトリクス・移行・使用量・起動時ロードの予算の断りを `Reason` の 10 種、remote 系（会話の末尾・端末・daemon の admin API・スクロールバック・セットアップ）を新しい `RemoteRefusal`（31 種）へ。daemon の本文に `kind` を添えて呼び手の言語で組み直す）
+- 実経路で英語表示の日本語入り dispatch 27 / 27・CLI 18 / 22・MCP 15 / 15 → 0・日本語は sha256 一致・注入 6 通りで名指し + E0004・カタログ +0 B。PR #2573
+
+## 2026-10-31（#2564: 未知のシェルで tako setup が同じ断りで止まる `tako setup bootstrap path` へ誘導していた → 残りは `AgentPathByHand`（次の 1 行なし・理由に足すディレクトリの全文）、tako CLI の段と `--check` は一覧で閉じる、足し終えたら断らず already_on_path）
+- 未知のシェル 12 本で誘導 0・既知のシェル 60 ファイルがバイト一致・注入 5 通りで file:line を名指し・カタログ +0 B。PR #2571
+
+## 2026-10-31（#1632: remote のトークン・QR・状態ファイルの置き場を Windows でも本人 + SYSTEM だけの DACL（継承を切る）にする。境界 B32 `platform::private_file`・A/B `TAKO_1632_LEGACY=1`・unix は同じ呼び出し）
+- CI の Windows ジョブで Win32 と icacls の読み戻し（修正後 2 者・`(I)` 無し / 旧アームは継承のまま）・番犬が no-op への戻しを file:line で名指す・カタログ +0 B。PR #2575
+
+## 2026-10-31（#2570: ペインの中から起こし直した GUI がペインの env（識別・接続・claude の印・`GIT_EDITOR=true`・重なった `XDG_DATA_DIRS`）を新しいペインと子へ素通しにしていた → `tako_core::host_env::STRIP` を main の最初で外し unix は exec し直す（A/B `TAKO_2570_LEGACY=1`））
+- 隔離 GUI の A/B でペインと子の env が Dock 起動相当と一致・`ps eww` も外れる・番犬 `issue2570_inherited_pane_env_watchdog`・カタログ +0 B。PR #2574
+- 19:03 に `3aac66e` を install・GUI 再起動（master のペインから `open -a` = この再 exec の経路・復元失敗 0）の本番確認で #2570 を閉じた
+
+## 2026-10-31（#2365 の続き: tmux のセッション操作（`TmuxRefusal` / `TmuxRunError`。口は名前のまま型を返す）・git show・edit type・LSP の初期化オプション・worker の解決とレジストリ・layout の config.yaml・remote agents の断りを表示言語へ）
+- GUI 無しの実経路で英語の日本語入り 26 / 27 → 0（残り 1 は git の stderr）・隔離 GUI の CLI / MCP 18 / 18 → 0 / 18・日本語は sha256 一致・注入 6 か所を名指し + E0004・カタログ +0 B。PR #2579
+
+## 2026-10-31（#2576: 未知のシェルで welcome の次の一手と check-health の cli_in_path が `tako setup bootstrap path` へ誘導していた → welcome は `NextStep::PathByHand`（段は path のまま command null・dirs と断りの全文）、check-health は `--check` と同じ判定 `tako_cli_dir_by_hand` + `tako_cli_in_path_issue`（日本語固定））
+- 未知のシェル 4 ケース × 5 出力で誘導 0・既知のシェルと足し終えた後の 48 ファイルがバイト一致・注入 5 通りで file:line を名指し・カタログ +0 B。PR #2580
+
+## 2026-10-31（#2581: control.json と instances/・IPC のトークン・usage の塩・shortcuts・スマホから受け取ったファイル・ペインの最後の出力の置き場を境界 `platform::private_file` へ寄せ、Windows も本人 + SYSTEM だけの DACL に。境界は当てられない置き場で呼び手を止めず・同じ DACL は当て直さない）
+- CI の Windows で Win32 と icacls の読み戻し・隔離 GUI の A/B で unix の mode と CLI / MCP の接続が修正前と一致・番犬が境界の外の本人だけの mode を file:line で名指す・カタログ +0 B。PR #2584
