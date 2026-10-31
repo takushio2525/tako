@@ -136,18 +136,18 @@ impl Case {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // 手元のペイン（このテストを走らせたもの）の印と A/B を持ち込まない
+        // 手元のペイン（このテストを走らせたもの）の印・接続・隔離の指定・A/B（`TAKO_` で始まるもの）と、
+        // claude のセッションの印ほか `STRIP` の名前を持ち込まない（#1716。必要なものは下で並べ直す）
+        for (name, _) in std::env::vars_os() {
+            let name = name.to_string_lossy();
+            if name.starts_with("TAKO_") {
+                cmd.env_remove(name.as_ref());
+            }
+        }
         for s in host_env::STRIP {
             for name in s.names {
                 cmd.env_remove(name);
             }
-        }
-        for name in [
-            host_env::LEGACY_ENV,
-            host_env::DAEMON_LEGACY_ENV,
-            host_env::REEXEC_ENV,
-        ] {
-            cmd.env_remove(name);
         }
         cmd.env("TAKO_ISOLATED", "1")
             .env("TAKO_DATA_DIR", self.root.join("data"))
