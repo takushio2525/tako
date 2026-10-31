@@ -9925,7 +9925,9 @@ fn dispatch_inner(
                 // 起動時に orphan 自動復帰した tmux セッション数（Issue #191）
                 "recovered_count": host.recovered_sessions_count(),
                 // 保存の内訳（#1425）: calls / skipped（変化検出で省いた）/
-                // captured / written / reconciled（保険で突き合わせた）
+                // captured / written / reconciled（保険で突き合わせた）。
+                // #2610: 背景の書き手の coalesced（合流）/ failed / max_write_ms / pending と、
+                // ペインログの Mutex が握られていて前回の取り込み位置を使った pane_log_busy
                 "save_layout": host.layout_save_stats(),
                 "log_path": crate::diag::persist_log_path()
                     .map(|p| p.display().to_string()),

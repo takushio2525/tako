@@ -70,6 +70,7 @@ pub mod launch_cmd;
 pub mod launch_gate;
 pub mod layout;
 pub mod layout_reconcile;
+pub mod layout_writer;
 pub mod limit_stop;
 pub mod lsp;
 pub mod mcp;
