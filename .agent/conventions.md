@@ -535,6 +535,21 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   （`ShareRefusal` / `GitError` の表・`CONFIG_SHARE_SCOPES`・`JA_SHARE_CLI_CALLS`・dispatch と CLI の口）、実経路は
   `tests/issue2365_config_share_lang.rs`（`dispatch_config_share` を日英で叩く。置き場・git の設定・リモートは一時の
   場所 = 無いパスと bare。git の包み `TAKO_GIT_BIN` を外して「起動できない」を作る）
+- #2365 の続きで、**断りではない文**（dispatch が `Ok` の応答の値へ載せる注記 = `note` / `warnings` /
+  `placement_reason` / `applies_to` / `effective_policy` / `previous_master_close` ほかと、CLI が手元の処理で断りと
+  同じ出力に並べる行 = `tako orchestrator resume` の案内・`tako telemetry` / `tako fda` の状態・`tako run --wait` の
+  進み具合）を `tako_control::ReplyNote`（`reply_note.rs`。網羅 match・`Display` は組んだその場の表示言語）へ、
+  **CLI `main.rs` が自分で組んでいた断り**（`error: …` に出る文。watch の対象なし・resume・`usage --show`・`queue` の
+  優先度と待ちの上限（`queue_wrapper::parse_duration` は `Reason` を返す）と `queue serve` の env・`run --wait`・
+  cwd が取れない 2 種・標準入力）を `Reason` の 17 種へ、突然死からの復旧の断り（`resume_launch::registry_resume_launch`
+  は呼び手が CLI だけなので**その場で型を返す**）を `SessionRefusal` の 3 種へ寄せた。CLI は `cli_lang()`
+  （= `front_err` と同じ解決。グローバルに触らない）で文を引き、型の口の `Display` を使う枝（resume・fda の `to_json`）
+  だけ先に `init_local_lang()`。中身に他モジュールの文を載せる注記（読めないプロファイルの理由 = #2256 の系統・
+  `profile_warnings`・`window_warning`・`launch.warnings` の中身）は対象外。番犬は同じ `issue1762_dispatch_error_lang.rs`
+  の末尾の節（`ReplyNote` の表・`DISPATCH_NOTE_SCOPES` / `DISPATCH_NOTE_OLD_JA`・CLI の `CLI_NOTE_SCOPES` と
+  **断りの括弧の中（`Err` / `ok_or` / `ok_or_else` / `map_err`）と `error:` の行の日本語**を main.rs 全体で見る走査。
+  まだ移していない関数は `CLI_REFUSAL_DEFERRED` に理由つきで並べ、移し終えたら外さないと落ちる）、実経路は
+  `crates/tako-cli/tests/issue2365_cli_local_lang.rs`（GUI 無しの CLI を日英で叩く。A/B は `TAKO_2365_CLI_BIN`）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

@@ -35,6 +35,7 @@ use tako_cli::mcp_bridge;
 use tako_control::claude_mod::text::ModText;
 use tako_control::orchestrator::wait;
 use tako_control::protocol::{Axis, Direction, Request};
+use tako_control::{Reason, ReplyNote};
 
 // 呼び出し元ペイン（`TAKO_PANE_ID`。FR-2.1.1）。テストのビルドだけは env を読まない差し替えへ
 // 向ける（#1716。手元のシェルが継承した env でテストが通り CI で落ちる「偽の緑」を作らない）
@@ -4755,7 +4756,12 @@ fn cli_main() -> ExitCode {
                             match std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
                                 Ok(_) => buf,
                                 Err(e) => {
-                                    eprintln!("エラー: 標準入力の読み取りに失敗: {e}");
+                                    let lang = cli_lang();
+                                    eprintln!(
+                                        "{}: {}",
+                                        ReplyNote::ErrorLabel.text_in(lang),
+                                        Reason::StdinReadFailed(e.to_string()).text_in(lang)
+                                    );
                                     return ExitCode::FAILURE;
                                 }
                             }
@@ -5029,7 +5035,7 @@ fn setup_mcp_local(args: &SetupMcpArgs) -> Result<(), String> {
     init_local_lang();
     let (scope, scope_label) = if args.project {
         let cwd = std::env::current_dir()
-            .map_err(|e| format!("カレントディレクトリの取得に失敗: {e}"))?;
+            .map_err(|e| front_err(Reason::CurrentDirFailed(e.to_string())))?;
         (tako_control::dispatch::McpScope::Project(cwd), "project")
     } else {
         (tako_control::dispatch::McpScope::User, "global")
@@ -5206,16 +5212,18 @@ fn print_sandbox_state(profile: &tako_control::orchestrator::Profile, profile_na
 fn orchestrator_resume(worker_id: &str) -> Result<(), String> {
     use tako_control::orchestrator::registry;
 
+    // 断り・案内・型の口の文（移行の知らせ・レジストリ・会話の再開）を表示言語で組む（#2365）
+    init_local_lang();
+    let lang = tako_core::i18n::lang();
     // 旧形式の設定ファイルを検知して直す（#916。プロファイルを読む前に）
     if let Some(notice) = tako_control::migrations::ensure_migrated() {
-        eprintln!("[情報] {notice}");
+        eprintln!("{} {notice}", ReplyNote::InfoLabel.text_in(lang));
     }
-    let reg = registry::WorkerRegistry::load()?;
-    let entry = reg.workers.get(worker_id).ok_or_else(|| {
-        format!(
-            "worker {worker_id} がレジストリに無い（`tako orchestrator workers --all` の worker_id を指定する）"
-        )
-    })?;
+    let reg = registry::WorkerRegistry::load_typed().map_err(|e| e.text_in(lang))?;
+    let entry = reg
+        .workers
+        .get(worker_id)
+        .ok_or_else(|| Reason::WorkerNotInRegistry(worker_id.to_string()).text_in(lang))?;
     let sid: String = entry
         .session_id
         .as_deref()
@@ -5226,24 +5234,31 @@ fn orchestrator_resume(worker_id: &str) -> Result<(), String> {
     let (command, cwd) = if registry::legacy_2470() {
         // 修正前の案内（cd を含む 1 行）。比較のために同じ走らせ方を通す
         let cmd = registry::legacy_resume_command(entry)
-            .ok_or("この worker は修正前の案内を組めない（claude 以外 / 会話 ID 未検出）")?;
+            .ok_or_else(|| Reason::LegacyResumeUnbuildable.text_in(lang))?;
         (cmd, None)
     } else {
-        let launch = tako_control::resume_launch::registry_resume_launch(entry)?;
+        let launch = tako_control::resume_launch::registry_resume_launch(entry)
+            .map_err(|e| e.text_in(lang))?;
         for w in &launch.warnings {
-            eprintln!("警告: {w}");
+            eprintln!("{}: {w}", ReplyNote::WarningLabel.text_in(lang));
         }
         // MCP の絞り込みの設定ファイルを書く（spawn と同じ。下見では書かない作法）
-        launch.materialize()?;
-        eprintln!(
-            "worker {worker_id} の会話（{sid}…）を spawn と同じ起動で戻します（プロファイル: {}）",
-            launch.profile.as_deref().unwrap_or("-")
-        );
+        launch.materialize_typed().map_err(|e| e.text_in(lang))?;
+        let resuming = ReplyNote::ResumingWorker {
+            worker: worker_id.to_string(),
+            session: sid,
+            profile: launch.profile.as_deref().unwrap_or("-").to_string(),
+        };
+        eprintln!("{}", resuming.text_in(lang));
         (launch.command, entry.cwd.clone().filter(|c| !c.is_empty()))
     };
     if let Some(cwd) = cwd {
         std::env::set_current_dir(&cwd).map_err(|e| {
-            format!("worker の作業 dir {cwd} に移れない（worktree を消した等）: {e}")
+            Reason::WorkerCwdUnreachable {
+                cwd: cwd.clone(),
+                error: e.to_string(),
+            }
+            .text_in(lang)
         })?;
     }
     run_launch_line(&command)
@@ -5275,13 +5290,13 @@ fn run_launch_line(command: &str) -> Result<(), String> {
     {
         use std::os::unix::process::CommandExt;
         let err = cmd.exec();
-        Err(format!("起動コマンドを走らせられない: {err}"))
+        Err(front_err(Reason::LaunchLineFailed(err.to_string())))
     }
     #[cfg(not(unix))]
     {
         let status = cmd
             .status()
-            .map_err(|e| format!("起動コマンドを走らせられない: {e}"))?;
+            .map_err(|e| front_err(Reason::LaunchLineFailed(e.to_string())))?;
         std::process::exit(status.code().unwrap_or(1));
     }
 }
@@ -5683,10 +5698,7 @@ fn orchestrator_watch(
         entry.pane
     } else {
         let Some(p) = pane else {
-            return Err(
-                "ペイン ID または --worker を指定してください（tako orchestrator watch <PANE_ID> / --worker <ID>）"
-                    .to_string(),
-            );
+            return Err(front_err(Reason::WatchTargetMissing));
         };
         // pane 指定でも欠けた追跡キーはレジストリで補完（読めなければ従来動作）
         if session_id.is_none() || tmux_session.is_none() {
@@ -6455,6 +6467,8 @@ fn remote_scrollback(pane_id: &str, lines: u32) -> Result<(), String> {
 
 fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
     let mut settings = tako_control::settings::load();
+    // 状態の行と保存の断りは表示言語（#2365）
+    let lang = cli_lang();
     match sub {
         TelemetryCommand::Status => {
             let recent = tako_control::telemetry::recent_count();
@@ -6467,11 +6481,14 @@ fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
             } else {
                 eprintln!("telemetry: OFF");
             }
-            eprintln!("  直近のレポート件数: {recent}");
+            eprintln!("{}", ReplyNote::TelemetryRecent(recent).text_in(lang));
             if queued > 0 {
-                eprintln!("  未送信キュー: {queued}");
+                eprintln!("{}", ReplyNote::TelemetryQueued(queued).text_in(lang));
             }
-            eprintln!("  ログ: {log_path}");
+            eprintln!(
+                "{}",
+                ReplyNote::TelemetryLog(log_path.clone()).text_in(lang)
+            );
             let json = serde_json::json!({
                 "telemetry": settings.telemetry,
                 "recent_reports": recent,
@@ -6484,7 +6501,7 @@ fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
         TelemetryCommand::On => {
             settings.telemetry = true;
             tako_control::settings::save(&settings)
-                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
+                .map_err(|e| Reason::settings_save_failed(&e).text_in(lang))?;
             tako_control::telemetry::set_enabled(true);
             eprintln!("telemetry: ON");
             Ok(())
@@ -6492,7 +6509,7 @@ fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
         TelemetryCommand::Off => {
             settings.telemetry = false;
             tako_control::settings::save(&settings)
-                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
+                .map_err(|e| Reason::settings_save_failed(&e).text_in(lang))?;
             tako_control::telemetry::set_enabled(false);
             eprintln!("telemetry: OFF");
             Ok(())
@@ -6501,17 +6518,18 @@ fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
 }
 
 fn fda_local(sub: &FdaCommand) -> Result<(), String> {
+    // 状態の行・JSON の description・断りは表示言語（#2365。`to_json` は表示言語のグローバルを引く）
+    init_local_lang();
+    let lang = tako_core::i18n::lang();
     match sub {
         FdaCommand::Status => {
             let status = tako_control::fda::status_info();
             if status.granted {
-                eprintln!("[OK] フルディスクアクセス: 付与済み");
+                eprintln!("{}", ReplyNote::FdaGranted.text_in(lang));
             } else {
-                eprintln!("[任意] フルディスクアクセス: 未付与");
-                eprintln!(
-                    "  フォルダアクセス時に macOS の許可ダイアログが表示されることがあります"
-                );
-                eprintln!("  付与方法: tako fda open → システム設定で tako を追加");
+                eprintln!("{}", ReplyNote::FdaNotGranted.text_in(lang));
+                eprintln!("{}", ReplyNote::FdaDialogMayAppear.text_in(lang));
+                eprintln!("{}", ReplyNote::FdaHowToGrant.text_in(lang));
             }
             println!(
                 "{}",
@@ -6520,10 +6538,8 @@ fn fda_local(sub: &FdaCommand) -> Result<(), String> {
             Ok(())
         }
         FdaCommand::Open => {
-            tako_control::fda::open_settings()?;
-            eprintln!(
-                "システム設定を開きました。tako を「フルディスクアクセス」に追加してください"
-            );
+            tako_control::fda::open_settings_typed().map_err(|e| e.text_in(lang))?;
+            eprintln!("{}", ReplyNote::FdaSettingsOpened.text_in(lang));
             Ok(())
         }
     }
@@ -6924,39 +6940,35 @@ fn usage_local(args: &UsageArgs) -> Result<(), String> {
     };
     // #2203: `--show` は画面を動かすので tako へ送る（答えは同じ `usage_payload`。索引は GUI の
     // 背景と同じく上限つきで読み進める）。届かなければ開けない理由を言って止まる
-    let payload =
-        if args.show {
-            // 引数の断り（`Reason` の Display）は表示言語で組むので、確かめる前に決める（#2365）
-            init_local_lang();
-            query.parsed()?;
-            let request = Request::Sessions {
-                action: "usage".into(),
-                id: None,
-                role: None,
-                project: query.project.clone(),
-                limit: query.limit,
-                pane: None,
-                tab: None,
-                direction: None,
-                by: query.by.clone(),
-                window: query.window.clone(),
-                account: query.account.clone(),
-                issue: query.issue.clone(),
-                show: Some(true),
-            };
-            match send_request_classified(request, None) {
-                Ok(value) => value,
-                Err(SendFailure::Unreachable(_)) => return Err(
-                    "tako が動いていないので右パネルには出せない（--show を外すとこのまま読める）"
-                        .into(),
-                ),
-                Err(e) => return Err(e.message()),
-            }
-        } else {
-            // 置き場が決まらない断り（`paths::NoDataDir`）は表示言語で組まれるので、呼ぶ前に決める（#2365）
-            init_local_lang();
-            tako_control::usage::usage_payload(&query, tako_control::usage::Refresh::Full)?
+    let payload = if args.show {
+        // 引数の断り（`Reason` の Display）は表示言語で組むので、確かめる前に決める（#2365）
+        init_local_lang();
+        query.parsed()?;
+        let request = Request::Sessions {
+            action: "usage".into(),
+            id: None,
+            role: None,
+            project: query.project.clone(),
+            limit: query.limit,
+            pane: None,
+            tab: None,
+            direction: None,
+            by: query.by.clone(),
+            window: query.window.clone(),
+            account: query.account.clone(),
+            issue: query.issue.clone(),
+            show: Some(true),
         };
+        match send_request_classified(request, None) {
+            Ok(value) => value,
+            Err(SendFailure::Unreachable(_)) => return Err(front_err(Reason::UsageShowNeedsGui)),
+            Err(e) => return Err(e.message()),
+        }
+    } else {
+        // 置き場が決まらない断り（`paths::NoDataDir`）は表示言語で組まれるので、呼ぶ前に決める（#2365）
+        init_local_lang();
+        tako_control::usage::usage_payload(&query, tako_control::usage::Refresh::Full)?
+    };
     let update = &payload["index"]["update"];
     if update["bytes_read"].as_u64().unwrap_or(0) >= 256 * 1024 * 1024 {
         eprintln!(
@@ -7561,7 +7573,9 @@ fn context_budget_local(args: &ContextBudgetArgs) -> Result<(), String> {
     tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
     let cwd = match args.cwd {
         Some(ref c) => std::path::PathBuf::from(tako_control::orchestrator::expand_tilde(c)),
-        None => std::env::current_dir().map_err(|e| format!("cwd が取れない: {e}"))?,
+        None => {
+            std::env::current_dir().map_err(|e| front_err(Reason::CwdNotObtained(e.to_string())))?
+        }
     };
     let fixing = args.action.as_deref() == Some("fix");
     let out = if fixing {
@@ -7809,7 +7823,10 @@ fn queue_run_cli(args: &QueueArgs) -> ExitCode {
         Some(p) => match tako_core::queue::Priority::parse(p) {
             Some(p) => p,
             None => {
-                eprintln!("error: 優先度は top / high / normal / low（受け取った値: {p}）");
+                eprintln!(
+                    "error: {}",
+                    front_err(Reason::QueuePriorityUnknown(p.to_string()))
+                );
                 return ExitCode::from(2);
             }
         },
@@ -7823,7 +7840,7 @@ fn queue_run_cli(args: &QueueArgs) -> ExitCode {
         None => None,
         Some(Ok(d)) => Some(d),
         Some(Err(e)) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", front_err(e));
             return ExitCode::from(2);
         }
     };
@@ -7939,13 +7956,12 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
             Ok(())
         }
         Some(QueueCommand::Serve) => {
-            let socket = tako_control::queue::explicit_socket().ok_or(
-                "TAKO_QUEUE_SOCKET が要る（本番の調停役と取り合わないよう、隔離の調停役は明示したときだけ立てる）",
-            )?;
+            let socket = tako_control::queue::explicit_socket()
+                .ok_or_else(|| front_err(Reason::QueueSocketRequired))?;
             let token = std::env::var("TAKO_TOKEN")
                 .ok()
                 .filter(|t| !t.is_empty())
-                .ok_or("TAKO_TOKEN が要る（繋ぐ側の tako queue も同じ値を持つ）")?;
+                .ok_or_else(|| front_err(Reason::QueueTokenRequired))?;
             tako_control::queue::serve_headless(&socket, token).map_err(|e| e.to_string())
         }
         Some(QueueCommand::Run(_)) => unreachable!("cli_main が queue_run_cli へ回す"),
@@ -12290,13 +12306,15 @@ fn ledger_cli(sub: &LedgerCommand) -> Result<(), String> {
 fn run_interactive_wait(command: &Command) -> Result<WaitEnd, String> {
     let request = build_request(command)?;
     let result = send_request(request)?;
+    let lang = cli_lang();
     let pane = result["pane"]
         .as_u64()
-        .ok_or("run-interactive が pane ID を返さなかった")?;
-    println!(
-        "pane {pane} で対話コマンドを起動しました（status: {}）",
-        result["status"].as_str().unwrap_or("?")
-    );
+        .ok_or_else(|| Reason::RunNoPaneId("run-interactive").text_in(lang))?;
+    let started = ReplyNote::RunInteractiveStarted {
+        pane,
+        status: result["status"].as_str().unwrap_or("?").to_string(),
+    };
+    println!("{}", started.text_in(lang));
     wait_run_pane(pane)
 }
 
@@ -12304,13 +12322,15 @@ fn run_interactive_wait(command: &Command) -> Result<WaitEnd, String> {
 fn run_wait(command: &Command) -> Result<WaitEnd, String> {
     let request = build_request(command)?;
     let result = send_request(request)?;
+    let lang = cli_lang();
     let pane = result["pane"]
         .as_u64()
-        .ok_or("run が pane ID を返さなかった")?;
-    println!(
-        "pane {pane} でコマンドを実行中（command: {}）",
-        result["command"].as_str().unwrap_or("?")
-    );
+        .ok_or_else(|| Reason::RunNoPaneId("run").text_in(lang))?;
+    let started = ReplyNote::RunStarted {
+        pane,
+        command: result["command"].as_str().unwrap_or("?").to_string(),
+    };
+    println!("{}", started.text_in(lang));
     // #1662: 走らせる前に保存した未保存の編集（無ければ出さない）
     if let Some(saved) = result["saved_panes"]
         .as_array()
@@ -12318,8 +12338,8 @@ fn run_wait(command: &Command) -> Result<WaitEnd, String> {
     {
         let panes: Vec<String> = saved.iter().map(Value::to_string).collect();
         println!(
-            "実行前に未保存の編集を保存しました（pane {}）",
-            panes.join(", ")
+            "{}",
+            ReplyNote::RunSavedBefore(panes.join(", ")).text_in(lang)
         );
     }
     wait_run_pane(pane)
@@ -12358,7 +12378,7 @@ impl WaitEnd {
     fn message(&self) -> Option<String> {
         match self {
             WaitEnd::Exited(0) => None,
-            WaitEnd::Exited(code) => Some(format!("コマンドが exit code {code} で終了")),
+            WaitEnd::Exited(code) => Some(front_err(Reason::RunExitedWithCode(*code))),
             WaitEnd::TimedOut(message) => Some(message.clone()),
         }
     }
@@ -12391,7 +12411,10 @@ fn wait_exit_code(result: Result<WaitEnd, String>) -> ExitCode {
 fn wait_run_pane(pane: u64) -> Result<WaitEnd, String> {
     use tako_core::probe::{poll_with_timeout, run_wait_timeout, Polled};
     let budget = run_wait_timeout();
-    println!("終わるまで最長 {} 秒待ちます", budget.as_secs());
+    println!(
+        "{}",
+        ReplyNote::RunWaitBudget(budget.as_secs()).text_in(cli_lang())
+    );
     let polled = poll_with_timeout(budget, RUN_WAIT_POLL, || {
         let status = send_request(Request::RunInteractiveStatus {
             pane,
@@ -12426,14 +12449,18 @@ fn run_wait_timed_out(
     })
 }
 
-/// 上限で打ち切ったときの 1 行（続きの聞き方は最簡形 = #322）
+/// 上限で打ち切ったときの 1 行（続きの聞き方は最簡形 = #322）。表示言語で組む（#2365）
 fn run_wait_timed_out_message(pane: u64, budget: std::time::Duration) -> String {
-    format!(
-        "まだ実行中です（pane {pane}。{} 秒待って打ち切りました。実行は止めていません）。\
-         続きは `tako run-interactive-status {pane}`。上限は {} で変えられます",
-        budget.as_secs(),
-        tako_core::probe::RUN_WAIT_TIMEOUT_ENV
-    )
+    front_err(run_wait_timed_out_reason(pane, budget))
+}
+
+/// [`run_wait_timed_out_message`] の文の型（表示言語を明示して引ける）
+fn run_wait_timed_out_reason(pane: u64, budget: std::time::Duration) -> Reason {
+    Reason::RunWaitTimedOut {
+        pane,
+        secs: budget.as_secs(),
+        env: tako_core::probe::RUN_WAIT_TIMEOUT_ENV,
+    }
 }
 
 /// run --list: ファイルの実行プロファイル一覧を表示する（実行しない）
@@ -12700,7 +12727,13 @@ fn init_local_lang() {
 
 /// dispatch へ送る前に CLI が手元で断る文（#2365）。表示言語は [`local_dispatch_err`] と同じ解決
 fn front_err(reason: tako_control::Reason) -> String {
-    reason.text_in(tako_control::settings::peek_lang_setting().resolve())
+    reason.text_in(cli_lang())
+}
+
+/// CLI が手元で組む断り・行の表示言語（#2365）。前置き（[`local_dispatch_err`]）と同じ解決で、
+/// 表示言語のグローバルには触らない（呼ぶたびに settings.json を読む = 手元の処理の 1 回分）
+fn cli_lang() -> tako_core::i18n::Lang {
+    tako_control::settings::peek_lang_setting().resolve()
 }
 
 /// `tako sessions list` の人間向け表示（1 セッション 1 行 + pending 節）
@@ -16720,7 +16753,8 @@ mod tests {
         assert_eq!(v["timed_out"], true, "{v}");
         assert_eq!(v["waited_secs"], 600, "{v}");
         assert_eq!(v["limit_secs"], 600, "{v}");
-        let msg = run_wait_timed_out_message(7, budget);
+        // 文は表示言語で組む（#2365）。表示言語は設定次第なので、日本語を明示して見る
+        let msg = run_wait_timed_out_reason(7, budget).text_in(tako_core::i18n::Lang::Ja);
         assert!(msg.contains("まだ実行中"), "{msg}");
         assert!(msg.contains("`tako run-interactive-status 7`"), "{msg}");
         assert!(msg.contains("TAKO_RUN_WAIT_TIMEOUT_SECS"), "{msg}");
@@ -16745,7 +16779,9 @@ mod tests {
             .message()
             .is_some_and(|m| m.contains("exit code 7")));
         let budget = std::time::Duration::from_secs(3);
-        let timed_out = WaitEnd::TimedOut(run_wait_timed_out_message(7, budget));
+        let timed_out = WaitEnd::TimedOut(
+            run_wait_timed_out_reason(7, budget).text_in(tako_core::i18n::Lang::Ja),
+        );
         assert_eq!(timed_out.exit_code(), 124);
         assert_eq!(RUN_WAIT_TIMED_OUT_EXIT, 124);
         assert!(timed_out

@@ -95,6 +95,13 @@ impl Env {
         )
         .unwrap();
         env.write_registry(Some(PROFILE), Some(SID));
+        // 断り・案内は表示言語に従う（#2365）。下の検査は日本語の文を見るので表示言語を固定する
+        // （書かないと system = 実行環境のロケールで決まり、CI と手元で答えが変わる）
+        std::fs::write(
+            env.dir.path().join("settings.json"),
+            "{\"language\":\"ja\"}",
+        )
+        .unwrap();
         env
     }
 

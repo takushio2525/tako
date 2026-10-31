@@ -52,7 +52,7 @@
 //! `display_follows_the_display_language` の 1 本だけ（ほかは `text_in` で言語を引数に渡す）。
 
 use tako_control::DispatchError as E;
-use tako_control::{NoTargetPaneAt, Reason};
+use tako_control::{NoTargetPaneAt, Reason, ReplyNote};
 use tako_core::dialog::ConfirmBlock;
 use tako_core::i18n::{self, Lang};
 use tako_core::load_issue::{YamlProblem, YamlReason};
@@ -871,9 +871,27 @@ fn reason_index(r: &Reason) -> usize {
         Reason::UsageProjectUnreadable { .. } => 313,
         Reason::UsageIssueUnreadable { .. } => 314,
         Reason::BudgetEntriesMismatch { .. } => 315,
+        // #2365 の続き: CLI の手元の処理の断り（CLI `main.rs` / `queue_wrapper::parse_duration`）
+        Reason::CurrentDirFailed(_) => 316,
+        Reason::CwdNotObtained(_) => 317,
+        Reason::WorkerNotInRegistry(_) => 318,
+        Reason::LegacyResumeUnbuildable => 319,
+        Reason::WorkerCwdUnreachable { .. } => 320,
+        Reason::LaunchLineFailed(_) => 321,
+        Reason::WatchTargetMissing => 322,
+        Reason::UsageShowNeedsGui => 323,
+        Reason::QueuePriorityUnknown(_) => 324,
+        Reason::QueueDurationUnreadable(_) => 325,
+        Reason::QueueDurationUnitUnknown(_) => 326,
+        Reason::QueueWaitTooShort => 327,
+        Reason::QueueSocketRequired => 328,
+        Reason::QueueTokenRequired => 329,
+        Reason::RunNoPaneId(_) => 330,
+        Reason::RunExitedWithCode(_) => 331,
+        Reason::RunWaitTimedOut { .. } => 332,
     }
 }
-const REASON_VARIANTS: usize = 316;
+const REASON_VARIANTS: usize = 333;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1456,6 +1474,30 @@ fn reason_samples() -> Vec<Reason> {
             kept: 15,
             archived: 5,
         },
+        Reason::CurrentDirFailed("Permission denied (os error 13)".into()),
+        Reason::CwdNotObtained("No such file or directory (os error 2)".into()),
+        Reason::WorkerNotInRegistry("99".into()),
+        Reason::LegacyResumeUnbuildable,
+        Reason::WorkerCwdUnreachable {
+            cwd: "/tmp/wt".into(),
+            error: "No such file or directory (os error 2)".into(),
+        },
+        Reason::LaunchLineFailed("No such file or directory (os error 2)".into()),
+        Reason::WatchTargetMissing,
+        Reason::UsageShowNeedsGui,
+        Reason::QueuePriorityUnknown("urgent".into()),
+        Reason::QueueDurationUnreadable("x".into()),
+        Reason::QueueDurationUnitUnknown("d".into()),
+        Reason::QueueWaitTooShort,
+        Reason::QueueSocketRequired,
+        Reason::QueueTokenRequired,
+        Reason::RunNoPaneId("run"),
+        Reason::RunExitedWithCode(3),
+        Reason::RunWaitTimedOut {
+            pane: 7,
+            secs: 600,
+            env: "TAKO_RUN_WAIT_TIMEOUT_SECS",
+        },
     ]
 }
 
@@ -1835,6 +1877,25 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "読めない project: \"project:\"（<キー> / project:<キー> / profile:<名前> / none）",
     "読めない issue: \"abc\"（番号 / #番号 / none）",
     ".agent/progress.md: 移送でエントリ数が合わない（前 21 / 残 15 + 移送 5）ので書き込まない",
+    // #2365 の続き: CLI の手元の処理の断り（CLI `main.rs` / `queue_wrapper::parse_duration`）
+    "カレントディレクトリの取得に失敗: Permission denied (os error 13)",
+    "cwd が取れない: No such file or directory (os error 2)",
+    "worker 99 がレジストリに無い（`tako orchestrator workers --all` の worker_id を指定する）",
+    "この worker は修正前の案内を組めない（claude 以外 / 会話 ID 未検出）",
+    "worker の作業 dir /tmp/wt に移れない（worktree を消した等）: No such file or directory (os error 2)",
+    "起動コマンドを走らせられない: No such file or directory (os error 2)",
+    "ペイン ID または --worker を指定してください（tako orchestrator watch <PANE_ID> / --worker <ID>）",
+    "tako が動いていないので右パネルには出せない（--show を外すとこのまま読める）",
+    "優先度は top / high / normal / low（受け取った値: urgent）",
+    "時間を読めない: x（例: 90s / 10m / 1h）",
+    "時間の単位を読めない: d（s / m / h）",
+    "待ちの上限は 1 秒以上",
+    "TAKO_QUEUE_SOCKET が要る（本番の調停役と取り合わないよう、隔離の調停役は明示したときだけ立てる）",
+    "TAKO_TOKEN が要る（繋ぐ側の tako queue も同じ値を持つ）",
+    "run が pane ID を返さなかった",
+    "コマンドが exit code 3 で終了",
+    "まだ実行中です（pane 7。600 秒待って打ち切りました。実行は止めていません）。\
+     続きは `tako run-interactive-status 7`。上限は TAKO_RUN_WAIT_TIMEOUT_SECS で変えられます",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
@@ -6687,7 +6748,7 @@ const DISPATCH_MOVED_OLD_JA: &[(&str, &str)] = &[
     ("か所）の外", "ChoiceOutsideTargets"),
     ("件）の外", "ChoiceOutsideItems / ItemOutsideResults"),
     ("（応答の id）", "ItemNeedsResponseId"),
-    // 変更履歴（応答の注記「git 管理外のファイル」は日本語のまま残す）
+    // 変更履歴（応答の注記「git 管理外のファイル」は ReplyNote へ移した = 末尾の節で見る）
     ("変更履歴を取っている間に", "ChangelogFileChanged"),
     ("リポジトリ情報がない", "ChangelogNoRepo"),
     ("ファイルパス情報がない", "ChangelogNoPath"),
@@ -6700,7 +6761,7 @@ const DISPATCH_MOVED_OLD_JA: &[(&str, &str)] = &[
     // orchestrator（引き継ぎの起動フォルダ・コンフリクト解消）
     ("（解除は --clear-cwd）", "ProfileCwdBroken"),
     ("コンフリクトが発生していません", "NoConflict"),
-    // ファイルツリーの選択（応答の注記「リモート（SSH）の行は…」は日本語のまま残す）
+    // ファイルツリーの選択（応答の注記「リモート（SSH）の行は…」は ReplyNote へ移した = 末尾の節で見る）
     ("ファイルツリーはアクティブタブ", "TreeOnlyActiveTab"),
     ("ファイルツリーが閉じている", "FileTreeClosed"),
     ("選んでいる行の上で押す", "TreePathWithKey"),
@@ -8470,9 +8531,13 @@ fn session_refusal_index(r: &SessionRefusal) -> usize {
         SessionRefusal::McpSettingsDir { .. } => 12,
         SessionRefusal::McpSettingsWrite(_) => 13,
         SessionRefusal::LogUnreadable { .. } => 14,
+        // #2365 の続き: 突然死からの復旧（`resume_launch::registry_resume_launch`）
+        SessionRefusal::DeathResumeClaudeOnly(_) => 15,
+        SessionRefusal::DeathResumeNoSession => 16,
+        SessionRefusal::DeathResumeUnbuildable => 17,
     }
 }
-const SESSION_REFUSAL_VARIANTS: usize = 15;
+const SESSION_REFUSAL_VARIANTS: usize = 18;
 
 /// 見本と #2365 より前の固定文（sessions / resume_launch / worker_mcp / pane_log が書いていた文を見本の値で展開）
 fn session_refusal_table() -> Vec<(SessionRefusal, String)> {
@@ -8558,6 +8623,19 @@ fn session_refusal_table() -> Vec<(SessionRefusal, String)> {
                 error: "Permission denied (os error 13)".into(),
             },
             "ログを読めない (/tmp/c1.log): Permission denied (os error 13)".into(),
+        ),
+        (
+            SessionRefusal::DeathResumeClaudeOnly(Some("codex".into())),
+            "突然死からの復旧は claude の worker だけ（この worker は codex）".into(),
+        ),
+        (
+            SessionRefusal::DeathResumeNoSession,
+            "この worker は会話 ID が未検出なので再開できない（起動直後に落ちた・まだ走査されていない）"
+                .into(),
+        ),
+        (
+            SessionRefusal::DeathResumeUnbuildable,
+            "この worker の系統は spawn と同じ組み立てで再開できない".into(),
         ),
     ]
 }
@@ -15579,4 +15657,816 @@ fn gui側の呼び手の番犬の境界() {
         .map(|(l, _, _)| l)
         .collect();
     assert_eq!(writebacks, vec![8], "診断の出力の外の書き戻しだけを名指す");
+}
+
+// ---- #2365 の続き: 応答の注記（`ReplyNote`）と、CLI の手元の断り・同じ出力に並ぶ行 ----
+//
+// dispatch が `Ok` の応答の値へ載せる注記（`note` / `warnings` / `placement_reason` ほか）と、CLI が手元の
+// 処理で断りと同じ出力に並べる行は `ReplyNote`、CLI の手元の断りは `Reason`（上の表）が日英を持つ。ここでは
+// (1) `ReplyNote` の全バリアントの日英と、#2365 より前の固定文とのバイト一致（腕の行を名指す）
+// (2) 注記を移した dispatch の関数に日本語の固定文が無い・移した旧文が dispatch の本体へ戻っていない
+// (3) CLI `main.rs`: 移し終えた関数に日本語の固定文が無い・断り（`Err` / `ok_or` / `map_err` の括弧の中と
+//     `error:` の行）に日本語の固定文が無い（まだ移していない関数は [`CLI_REFUSAL_DEFERRED`] に理由つき）
+// を見る
+
+const REPLY_NOTE_SRC: &str = include_str!("../src/reply_note.rs");
+const REPLY_NOTE_PATH: &str = "crates/tako-control/src/reply_note.rs";
+
+/// `ReplyNote` の通し番号（網羅 match）
+fn reply_note_index(n: &ReplyNote) -> usize {
+    match n {
+        ReplyNote::ChangelogUntracked => 0,
+        ReplyNote::DiskDiffDisk(_) => 1,
+        ReplyNote::DiskDiffEditing(_) => 2,
+        ReplyNote::TreeRemoteRowStays => 3,
+        ReplyNote::AutosuggestAppliesTo => 4,
+        ReplyNote::AutosuggestNote => 5,
+        ReplyNote::ModelsApplyCommand => 6,
+        ReplyNote::BatterySettingsOpened => 7,
+        ReplyNote::SetupTimedOut => 8,
+        ReplyNote::SoloLimitResumeScope => 9,
+        ReplyNote::CodexBypassSandboxOff => 10,
+        ReplyNote::ProfileRemoteControlBlocked { .. } => 11,
+        ReplyNote::AccountsDefaultConfigDir(_) => 12,
+        ReplyNote::PolicySameTabNoGuarantee => 13,
+        ReplyNote::PolicySameTabNoShrink(_) => 14,
+        ReplyNote::PolicySameTabShrink { .. } => 15,
+        ReplyNote::SelfProfileDefaulted { .. } => 16,
+        ReplyNote::CtxThresholdClamped { .. } => 17,
+        ReplyNote::PreviousMasterClosedBySuccessor => 18,
+        ReplyNote::PreviousMasterKept => 19,
+        ReplyNote::FontFitShort { .. } => 20,
+        ReplyNote::FontFitShrunk { .. } => 21,
+        ReplyNote::PlacementWindowTooNarrow { .. } => 22,
+        ReplyNote::PlacementOverflowTab { .. } => 23,
+        ReplyNote::PlacementNewTab { .. } => 24,
+        ReplyNote::SpawnRemoteControlBlocked { .. } => 25,
+        ReplyNote::ModTurnWithoutDialog(_) => 26,
+        ReplyNote::PermissionDialogUnreported { .. } => 27,
+        ReplyNote::StalledWithoutChildren => 28,
+        ReplyNote::StaleNoBackend => 29,
+        ReplyNote::SessionRestartHarness => 30,
+        ReplyNote::SessionRestartHandoff => 31,
+        ReplyNote::ResumeNoProfileRecord => 32,
+        ReplyNote::ResumingWorker { .. } => 33,
+        ReplyNote::ErrorLabel => 34,
+        ReplyNote::WarningLabel => 35,
+        ReplyNote::InfoLabel => 36,
+        ReplyNote::TelemetryRecent(_) => 37,
+        ReplyNote::TelemetryQueued(_) => 38,
+        ReplyNote::TelemetryLog(_) => 39,
+        ReplyNote::FdaGranted => 40,
+        ReplyNote::FdaNotGranted => 41,
+        ReplyNote::FdaDialogMayAppear => 42,
+        ReplyNote::FdaHowToGrant => 43,
+        ReplyNote::FdaSettingsOpened => 44,
+        ReplyNote::RunInteractiveStarted { .. } => 45,
+        ReplyNote::RunStarted { .. } => 46,
+        ReplyNote::RunSavedBefore(_) => 47,
+        ReplyNote::RunWaitBudget(_) => 48,
+        ReplyNote::FdaNotApplicable => 49,
+        ReplyNote::FdaGrantedDescription => 50,
+        ReplyNote::FdaNotGrantedDescription => 51,
+    }
+}
+const REPLY_NOTE_VARIANTS: usize = 52;
+
+/// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
+const RC_REASON: tako_core::platform::support::Note =
+    tako_core::platform::support::Note::new("理由", "the reason");
+const RC_NEXT: tako_core::platform::support::Note =
+    tako_core::platform::support::Note::new("次の一手", "the next step");
+
+/// 見本と #2365 より前の固定文（dispatch / resume_launch / CLI `main.rs` が書いていた文を見本の値で展開）。
+/// 中身で腕を分けるバリアント（`SelfProfileDefaulted` / `PermissionDialogUnreported`）は両方の値を並べる
+fn reply_note_table() -> Vec<(ReplyNote, String)> {
+    vec![
+        (ReplyNote::ChangelogUntracked, "git 管理外のファイル".into()),
+        (ReplyNote::DiskDiffDisk("a.rs".into()), "a.rs（ディスク）".into()),
+        (ReplyNote::DiskDiffEditing("a.rs".into()), "a.rs（編集中）".into()),
+        (
+            ReplyNote::TreeRemoteRowStays,
+            "リモート（SSH）の行はキーで動かさない".into(),
+        ),
+        (
+            ReplyNote::AutosuggestAppliesTo,
+            "既存ペインを含む tako 内の zsh（次のプロンプトから反映）".into(),
+        ),
+        (
+            ReplyNote::AutosuggestNote,
+            "ユーザーが自前で zsh-autosuggestions を導入しているペインでは \
+                    tako は注入せず、この設定も効かない（二重注入ガード）。\
+                    Tab 確定が働くのはゴースト表示中かつカーソルが行末のときだけで、\
+                    それ以外の Tab は従来の補完のまま（tab=false にすると常に補完）"
+                .into(),
+        ),
+        (
+            ReplyNote::ModelsApplyCommand,
+            "tako orchestrator profiles set <プロファイル> --model <id> --effort <値>".into(),
+        ),
+        (
+            ReplyNote::BatterySettingsOpened,
+            "System Settings の Battery を開きました".into(),
+        ),
+        (
+            ReplyNote::SetupTimedOut,
+            "tako setup が上限内に終わらなかったので打ち切った。\
+                     ターミナルで tako setup を実行して続きを確認すること"
+                .into(),
+        ),
+        (
+            ReplyNote::SoloLimitResumeScope,
+            "solo プロファイルは worker を spawn しないので、limit_resume が効くのは `tako solo` で立てた本人のペインだけです（worker への配布はありません）。\n  ペイン単位で切り替えるには `tako limit-resume on --pane <id>` を使ってください".into(),
+        ),
+        (
+            ReplyNote::CodexBypassSandboxOff,
+            "codex は承認スキップとサンドボックス解除が同じフラグ（--dangerously-bypass-approvals-and-sandbox）なので、bypass_sandbox が false のあいだ skip_permissions は効きません（コマンド実行に承認プロンプトが出ます）。\n  外す場合は `--bypass-sandbox true`（サンドボックスと承認が両方無効になります）".into(),
+        ),
+        (
+            ReplyNote::ProfileRemoteControlBlocked {
+                detail: "ANTHROPIC_API_KEY".into(),
+                reason: RC_REASON,
+                next_step: RC_NEXT,
+            },
+            "remote_control: true ですが、この環境では有効にできません（ANTHROPIC_API_KEY）。\n  理由 / 次の一手"
+                .into(),
+        ),
+        (
+            ReplyNote::AccountsDefaultConfigDir("/Users/testuser/.claude".into()),
+            "config_dir '/Users/testuser/.claude' は claude の既定パスです。既定パスを明示指定すると \
+             CLAUDE_CONFIG_DIR が設定された状態になり、claude が Keychain の別エントリ\
+             （ハッシュ付き）を見に行くため既存ログインが未ログイン扱いになります。\
+             既定の資格情報をそのまま使うなら inherit=true で登録してください（#512）"
+                .into(),
+        ),
+        (
+            ReplyNote::PolicySameTabNoGuarantee,
+            "worker は常に spawn 元と同じタブへ置く（タブ分けなし）。桁数の保証なし（min_worker_cols=0）".into(),
+        ),
+        (
+            ReplyNote::PolicySameTabNoShrink(80),
+            "worker は常に spawn 元と同じタブへ置く（タブ分けなし）。下限 80 桁を割っても自動縮小はしない（auto_shrink_font=false）".into(),
+        ),
+        (
+            ReplyNote::PolicySameTabShrink {
+                min_cols: 80,
+                floor_pct: 60,
+            },
+            "worker は常に spawn 元と同じタブへ置く（タブ分けなし）。下限 80 桁を割るときは worker ペインのフォントを自動で縮め、床は既定サイズの 60%（届かなければ床で置き cols_short を立てる）".into(),
+        ),
+        (
+            ReplyNote::SelfProfileDefaulted {
+                pane: 5,
+                role: "null".into(),
+                profile: "default".into(),
+                solo_pane: false,
+            },
+            "pane 5（role=null）の profile が default へ落ちている: master / solo のペインではない。\
+             master を名指しするか、`--pane` を省いて呼び出し元を解決させる"
+                .into(),
+        ),
+        (
+            ReplyNote::SelfProfileDefaulted {
+                pane: 6,
+                role: "orchestrator-solo:tako".into(),
+                profile: "default".into(),
+                solo_pane: true,
+            },
+            "pane 6（role=orchestrator-solo:tako）の profile が default へ落ちている: \
+             solo の profile は起動時の env（`solo:<名前>`）にしか無く、ペインの role ラベルからは解けない。\
+             master を名指しするか、`--pane` を省いて呼び出し元を解決させる"
+                .into(),
+        ),
+        (
+            ReplyNote::CtxThresholdClamped {
+                raw: 99,
+                value: 60,
+                min: 50,
+                max: 60,
+            },
+            "ctx_threshold=99 は値域外のため 60 へ丸めた（50〜60）".into(),
+        ),
+        (
+            ReplyNote::PreviousMasterClosedBySuccessor,
+            "後任 master が引き継ぎ確認後に閉じる".into(),
+        ),
+        (
+            ReplyNote::PreviousMasterKept,
+            "旧 master ペインを特定できなかったため閉じない".into(),
+        ),
+        (
+            ReplyNote::FontFitShort {
+                pct: 60,
+                size: "7.2pt".into(),
+                cols: 58,
+                min_cols: 80,
+            },
+            "同じタブに置いた。フォントを床の 60%（7.2pt）まで縮めたが 58 桁で下限 80 桁に届かない。\n  直すには: ウィンドウを広げる / worker を減らす / tako orchestrator layout --min-worker-cols <桁>".into(),
+        ),
+        (
+            ReplyNote::FontFitShrunk {
+                pct: 75,
+                size: "9.0pt".into(),
+                cols: 80,
+                min_cols: 80,
+            },
+            "同じタブに置き、worker ペインのフォントを 75%（9.0pt）へ縮めて 80 桁を確保した（下限 80 桁）".into(),
+        ),
+        (
+            ReplyNote::PlacementWindowTooNarrow {
+                full_cols: 70,
+                min_cols: 80,
+            },
+            "ウィンドウ幅がそもそも下限に届かない（タブ全幅 70 桁 < 下限 80 桁）ので同じタブへ置いた。\n  直すには: ウィンドウを広げる / 文字サイズを下げる / tako orchestrator layout --min-worker-cols <桁>".into(),
+        ),
+        (
+            ReplyNote::PlacementOverflowTab {
+                predicted: 60,
+                min_cols: 80,
+                tab: 3,
+                cols: 120,
+            },
+            "同じタブへ置くと worker ペインが 60 桁（下限 80 桁）になるので、\n  すでにこの master の worker が居るタブ 3 へ置いた（120 桁）".into(),
+        ),
+        (
+            ReplyNote::PlacementNewTab {
+                predicted: 60,
+                min_cols: 80,
+            },
+            "同じタブへ置くと worker ペインが 60 桁（下限 80 桁）になるので、新しいタブへ置いた。\n  同じタブへ詰めたいときは: tako orchestrator layout --min-worker-cols <桁>（0 で保証しない）".into(),
+        ),
+        (
+            ReplyNote::SpawnRemoteControlBlocked {
+                detail: "ANTHROPIC_API_KEY".into(),
+                reason: RC_REASON,
+                next_step: RC_NEXT,
+            },
+            "remote_control: true ですが有効にできませんでした（ANTHROPIC_API_KEY）。理由 / 次の一手"
+                .into(),
+        ),
+        (
+            ReplyNote::ModTurnWithoutDialog("permission".into()),
+            "mod は permission を報告しているが、画面に選択肢ダイアログが見えない\
+             （respond は画面のダイアログを読むので、画面に出るまで応答できない）"
+                .into(),
+        ),
+        (
+            ReplyNote::PermissionDialogUnreported {
+                turn: "busy".into(),
+                classic_events_off: true,
+            },
+            "画面に権限ダイアログがあるが mod は busy（classic 系のイベントが mod へ届かない環境\
+             （classic_events=false）では、ルールの無い ask の権限ダイアログを mod から拾えない\
+             （ask ルール由来なら次の報告 = 1 秒以内で揃う）。画面の検出を採用）"
+                .into(),
+        ),
+        (
+            ReplyNote::PermissionDialogUnreported {
+                turn: "busy".into(),
+                classic_events_off: false,
+            },
+            "画面に権限ダイアログがあるが mod は busy（mod の報告がまだ追いついていない。画面の検出を採用）"
+                .into(),
+        ),
+        (
+            ReplyNote::StalledWithoutChildren,
+            "busy と判定されたが実行中の子プロセスが無く、画面の busy パターンも無い".into(),
+        ),
+        (
+            ReplyNote::StaleNoBackend,
+            "バックエンドセッションなし（stale 検知対象外）".into(),
+        ),
+        (
+            ReplyNote::SessionRestartHarness,
+            "エージェントのプロセスを終了させ、落ちてシェルが戻ったのを確かめてから \
+             元の起動と同じ引数 + --resume の行を送達確認つきで送る（会話はそのまま続く）。\
+             送った後もすぐ落ちないかを見張り、結果は tako session-restart の last_restart に出る"
+                .into(),
+        ),
+        (
+            ReplyNote::SessionRestartHandoff,
+            "引き継ぎの書き直しと tako_orchestrator_handoff の呼び出しを master へ依頼した。\
+             後任 master が同じタブに立ち、引き継ぎを確認してから前任のペインを閉じる \
+             （前任を閉じるのは後任なので、後任の起動が失敗しても master を失わない）。\
+             依頼が届いたかは tako session-restart の handoff_delivery に出る"
+                .into(),
+        ),
+        (
+            ReplyNote::ResumeNoProfileRecord,
+            "spawn した master のプロファイルの記録が無い（#2470 より前に spawn した worker）ので、\
+             既定プロファイルの設定で組んだ"
+                .into(),
+        ),
+        (
+            ReplyNote::ResumingWorker {
+                worker: "7".into(),
+                session: "0123abcd".into(),
+                profile: "tako".into(),
+            },
+            "worker 7 の会話（0123abcd…）を spawn と同じ起動で戻します（プロファイル: tako）".into(),
+        ),
+        (ReplyNote::ErrorLabel, "エラー".into()),
+        (ReplyNote::WarningLabel, "警告".into()),
+        (ReplyNote::InfoLabel, "[情報]".into()),
+        (ReplyNote::TelemetryRecent(3), "  直近のレポート件数: 3".into()),
+        (ReplyNote::TelemetryQueued(2), "  未送信キュー: 2".into()),
+        (ReplyNote::TelemetryLog("/tmp/t.log".into()), "  ログ: /tmp/t.log".into()),
+        (ReplyNote::FdaGranted, "[OK] フルディスクアクセス: 付与済み".into()),
+        (ReplyNote::FdaNotGranted, "[任意] フルディスクアクセス: 未付与".into()),
+        (
+            ReplyNote::FdaDialogMayAppear,
+            "  フォルダアクセス時に macOS の許可ダイアログが表示されることがあります".into(),
+        ),
+        (
+            ReplyNote::FdaHowToGrant,
+            "  付与方法: tako fda open → システム設定で tako を追加".into(),
+        ),
+        (
+            ReplyNote::FdaSettingsOpened,
+            "システム設定を開きました。tako を「フルディスクアクセス」に追加してください".into(),
+        ),
+        (
+            ReplyNote::RunInteractiveStarted {
+                pane: 7,
+                status: "running".into(),
+            },
+            "pane 7 で対話コマンドを起動しました（status: running）".into(),
+        ),
+        (
+            ReplyNote::RunStarted {
+                pane: 7,
+                command: "cargo test".into(),
+            },
+            "pane 7 でコマンドを実行中（command: cargo test）".into(),
+        ),
+        (
+            ReplyNote::RunSavedBefore("3, 5".into()),
+            "実行前に未保存の編集を保存しました（pane 3, 5）".into(),
+        ),
+        (ReplyNote::RunWaitBudget(600), "終わるまで最長 600 秒待ちます".into()),
+        (
+            ReplyNote::FdaNotApplicable,
+            "macOS 以外のプラットフォームでは TCC は適用されません".into(),
+        ),
+        (
+            ReplyNote::FdaGrantedDescription,
+            "フルディスクアクセスが付与済みです。フォルダアクセスの許可ダイアログは表示されません"
+                .into(),
+        ),
+        (
+            ReplyNote::FdaNotGrantedDescription,
+            "フルディスクアクセスが未付与です。フォルダアクセス時に許可ダイアログが表示されることがあります"
+                .into(),
+        ),
+    ]
+}
+
+/// `ReplyNote` の日英の対を書いた行
+fn reply_note_where(n: &ReplyNote, lang: Lang) -> String {
+    where_written(
+        REPLY_NOTE_SRC,
+        REPLY_NOTE_PATH,
+        "impl ReplyNote {",
+        &format!("{n:?}"),
+        lang,
+    )
+}
+
+#[test]
+fn 応答の注記は全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let table = reply_note_table();
+    let samples: Vec<ReplyNote> = table.iter().map(|(n, _)| n.clone()).collect();
+    covers_every(&samples, reply_note_index, REPLY_NOTE_VARIANTS, "ReplyNote");
+    let mut failures = Vec::new();
+    for (n, old) in &table {
+        let (ja, en) = (n.text_in(Lang::Ja), n.text_in(Lang::En));
+        if ja != *old {
+            failures.push(format!(
+                "{}: {n:?} の日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}",
+                reply_note_where(n, Lang::Ja)
+            ));
+        }
+        if let Some(c) = has_japanese(&en) {
+            failures.push(format!(
+                "{}: {n:?} の英語に日本語（{c}）が混ざる: {en}",
+                reply_note_where(n, Lang::En)
+            ));
+        }
+        if en.trim().is_empty() || ja == en {
+            failures.push(format!(
+                "{}: {n:?} の英語が空か日本語と同じ文（英語の書き忘れ）: {en}",
+                reply_note_where(n, Lang::En)
+            ));
+        }
+        // dispatch は `to_string()` で載せる = 組んだその場の表示言語の文（言語のグローバルは
+        // `display_follows_the_display_language` が動かすので、日英のどちらかであることだけを見る）
+        let shown = String::from(n.clone());
+        if shown != ja && shown != en {
+            failures.push(format!(
+                "{n:?}: String への変換が日英どちらの文とも違う: {shown}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 注記の中身の言語: Remote Control の理由・次の一手（日英の `Note`）は枠と同じ言語で載る。
+/// 突然死からの復旧の断りの「agent 未記録」も同じ言語（記録の無い worker）
+#[test]
+fn 応答の注記の中身は枠と同じ言語で載る() {
+    for lang in [Lang::Ja, Lang::En] {
+        for n in [
+            ReplyNote::ProfileRemoteControlBlocked {
+                detail: "ANTHROPIC_API_KEY".into(),
+                reason: RC_REASON,
+                next_step: RC_NEXT,
+            },
+            ReplyNote::SpawnRemoteControlBlocked {
+                detail: "ANTHROPIC_API_KEY".into(),
+                reason: RC_REASON,
+                next_step: RC_NEXT,
+            },
+        ] {
+            let text = n.text_in(lang);
+            assert!(
+                text.contains(RC_REASON.text_in(lang)) && text.contains(RC_NEXT.text_in(lang)),
+                "{lang:?} の枠に別の言語の中身が載る: {text}"
+            );
+        }
+        let none = SessionRefusal::DeathResumeClaudeOnly(None).text_in(lang);
+        match lang {
+            Lang::Ja => assert!(none.contains("agent 未記録"), "{none}"),
+            Lang::En => assert!(has_japanese(&none).is_none(), "{none}"),
+        }
+    }
+}
+
+/// 注記を全部 `ReplyNote` へ移した dispatch の関数（頭）。persist.log・GUI の stderr の診断は
+/// 日本語のまま残すので外して読む
+const DISPATCH_NOTE_SCOPES: &[&str] = &[
+    "fn effective_policy_text(",
+    "fn describe_font_fit(",
+    "fn plan_worker_placement(",
+    "fn disk_diff_json(",
+    "fn preview_changelog_land(",
+    "fn finish_stale_status(",
+    "fn dispatch_tree_selection(",
+    "fn run_setup_cli_within(",
+];
+
+/// 走査の中で見ない呼び出し（診断の出力・内部の印）
+const DISPATCH_NOTE_INTERNAL: [&str; 4] =
+    ["unreachable!(", ".expect(", "persist_log(", "eprintln!("];
+
+/// 日本語の残る関数（`dispatch_inner` ほか）の中で移した注記の旧文の断片と、寄せた先のバリアント
+const DISPATCH_NOTE_OLD_JA: &[(&str, &str)] = &[
+    ("git 管理外のファイル", "ChangelogUntracked"),
+    ("（ディスク）", "DiskDiffDisk"),
+    ("（編集中）", "DiskDiffEditing"),
+    ("行はキーで動かさない", "TreeRemoteRowStays"),
+    ("次のプロンプトから反映", "AutosuggestAppliesTo"),
+    ("二重注入ガード", "AutosuggestNote"),
+    ("<プロファイル> --model", "ModelsApplyCommand"),
+    ("Battery を開きました", "BatterySettingsOpened"),
+    ("上限内に終わらなかったので打ち切った", "SetupTimedOut"),
+    ("worker への配布はありません", "SoloLimitResumeScope"),
+    ("skip_permissions は効きません", "CodexBypassSandboxOff"),
+    (
+        "この環境では有効にできません",
+        "ProfileRemoteControlBlocked",
+    ),
+    ("は claude の既定パスです", "AccountsDefaultConfigDir"),
+    ("（タブ分けなし）", "PolicySameTab*"),
+    ("の profile が", "SelfProfileDefaulted"),
+    ("ペインの role ラベルからは解けない", "SelfProfileDefaulted"),
+    ("は値域外のため", "CtxThresholdClamped"),
+    ("引き継ぎ確認後に閉じる", "PreviousMasterClosedBySuccessor"),
+    ("特定できなかったため閉じない", "PreviousMasterKept"),
+    ("フォントを床の", "FontFitShort"),
+    ("桁を確保した", "FontFitShrunk"),
+    ("そもそも下限に届かない", "PlacementWindowTooNarrow"),
+    ("の worker が居るタブ", "PlacementOverflowTab"),
+    ("新しいタブへ置いた", "PlacementNewTab"),
+    ("有効にできませんでした", "SpawnRemoteControlBlocked"),
+    ("画面に選択肢ダイアログが見えない", "ModTurnWithoutDialog"),
+    ("画面の検出を採用", "PermissionDialogUnreported"),
+    ("画面の busy パターンも無い", "StalledWithoutChildren"),
+    ("stale 検知対象外", "StaleNoBackend"),
+    ("last_restart に出る", "SessionRestartHarness"),
+    ("handoff_delivery に出る", "SessionRestartHandoff"),
+];
+
+/// dispatch の外で応答の値の注記を組む口（path, ソース, 頭）。中身を全部 `ReplyNote` へ移したもの
+const NOTE_ITEM_SCOPES: &[(&str, &str, &str)] = &[(
+    "crates/tako-control/src/fda.rs",
+    include_str!("../src/fda.rs"),
+    "impl FdaStatus {",
+)];
+
+#[test]
+fn 注記を移したdispatchの関数に日本語の固定文が無く旧文も戻っていない() {
+    let mut failures = Vec::new();
+    for (path, src, head) in NOTE_ITEM_SCOPES {
+        let Some(lines) = item_lines(src, head) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする。NOTE_ITEM_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in japanese_outside(&lines, &DISPATCH_NOTE_INTERNAL) {
+            failures.push(format!(
+                "{path}:{line}: 注記を ReplyNote へ移した口（`{head}`）に日本語の固定文がある = \
+                 英語表示にもそのまま出る（tako_control::ReplyNote へバリアントを足す）: {text}"
+            ));
+        }
+    }
+    for head in DISPATCH_NOTE_SCOPES {
+        let Some(lines) = front_scope_lines(DISPATCH_SRC, Some(head)) else {
+            failures.push(format!(
+                "{DISPATCH_PATH}: 走査の範囲 `{head}` が見つからない（関数の改名で番犬が空振りする。\
+                 DISPATCH_NOTE_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in japanese_outside(&lines, &DISPATCH_NOTE_INTERNAL) {
+            failures.push(format!(
+                "{DISPATCH_PATH}:{line}: 注記を ReplyNote へ移した関数（`{head}`）に日本語の固定文がある = \
+                 英語表示にもそのまま出る（tako_control::ReplyNote へバリアントを足し、日英の対を text_in に書く）: {text}"
+            ));
+        }
+    }
+    for (line, code) in dispatch_code_lines() {
+        for lit in line_literals(code) {
+            for (fragment, variant) in DISPATCH_NOTE_OLD_JA {
+                if lit.contains(fragment) {
+                    failures.push(format!(
+                        "{DISPATCH_PATH}:{line}: 移した注記の旧文（「{fragment}」）が日本語の固定文で戻っている = \
+                         英語表示にもそのまま出る（ReplyNote::{variant} を使う）"
+                    ));
+                }
+            }
+        }
+    }
+    report_all(failures);
+}
+
+/// CLI `main.rs` の関数のうち、断りと同じ出力に並ぶ行まで全部 `Reason` / `ReplyNote` へ移したもの（頭）
+const CLI_NOTE_SCOPES: &[&str] = &[
+    "fn setup_mcp_local(",
+    "fn orchestrator_resume(",
+    "fn run_launch_line(",
+    "fn telemetry_local(",
+    "fn fda_local(",
+    "fn context_budget_local(",
+    "fn queue_run_cli(",
+    "fn run_interactive_wait(",
+    "fn run_wait(",
+    "fn wait_run_pane(",
+    "fn run_wait_timed_out_message(",
+    "    fn message(&self) -> Option<String> {",
+];
+
+/// CLI `main.rs` でまだ断りに日本語の固定文を持つ関数（頭, 理由）。**断りを移し終えたら外す**
+/// （下の番犬が「古い」と落とす = 表が縮む方向にしか動かない）。Issue #2365 の段 1 の表と同じ切り分け
+const CLI_REFUSAL_DEFERRED: &[(&str, &str)] = &[
+    (
+        "fn orchestrator_master(",
+        "master / solo の起動の流れ（中の型の口と案内の行と 1 本で移す）",
+    ),
+    (
+        "fn orchestrator_solo(",
+        "master / solo の起動の流れ（中の型の口と案内の行と 1 本で移す）",
+    ),
+    (
+        "fn new_tab_target(",
+        "master / solo の起動の流れ（中の型の口と案内の行と 1 本で移す）",
+    ),
+    (
+        "fn check_health_cli(",
+        "check-health 一式（tako setup --check と共有する diagnostics の行と 1 本で移す）",
+    ),
+    (
+        "fn recover_local(",
+        "recover 一式（中身の LayoutError と一覧・復元の結果と 1 本で移す）",
+    ),
+    (
+        "fn recover_apply(",
+        "recover 一式（中身の LayoutError と一覧・復元の結果と 1 本で移す）",
+    ),
+    (
+        "fn sleep_guard_local(",
+        "sleep-guard 一式（状態の表示と 1 本で移す）",
+    ),
+    (
+        "fn lsp_server_local(",
+        "届かない内部の断り（呼び手が LspServer の要求だけを渡す）",
+    ),
+    (
+        "fn run_list(",
+        "届かない内部の断り（呼び手が run --list の要求だけを渡す）",
+    ),
+];
+
+/// 行の `//` から後ろ（文字列リテラルの中の `//` は外さない）
+fn strip_line_comment(line: &str) -> &str {
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut prev_slash = false;
+    for (i, c) in line.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_str = true;
+                prev_slash = false;
+            }
+            '/' if prev_slash => return &line[..i - 1],
+            '/' => prev_slash = true,
+            _ => prev_slash = false,
+        }
+    }
+    line
+}
+
+/// 断りの口（`Err(` / `.ok_or(` / `.ok_or_else(` / `.map_err(`）の括弧の中にある、日本語を含む文字列
+/// リテラルの行と、`eprintln!("error: …")` / `eprintln!("エラー…")` の行の日本語。括弧の対応は文字列
+/// リテラルの中を数えず、行をまたいで追う。コメントは見ない
+fn japanese_in_refusals(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+    const OPENERS: [&str; 4] = ["Err(", ".ok_or(", ".ok_or_else(", ".map_err("];
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    for (line, raw) in lines {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        let code = strip_line_comment(raw);
+        let mut flagged = false;
+        if code.contains("eprintln!(\"error:") || code.contains("eprintln!(\"エラー") {
+            if let Some(c) = line_literals(code).into_iter().find_map(has_japanese) {
+                out.push((*line, format!("（{c}）{}", raw.trim())));
+                flagged = true;
+            }
+        }
+        let mut lit_start = if in_str { Some(0) } else { None };
+        let mut escaped = false;
+        let chars: Vec<(usize, char)> = code.char_indices().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let (pos, c) = chars[i];
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                    let lit = &code[lit_start.unwrap_or(0)..pos];
+                    if depth > 0 && !flagged {
+                        if let Some(ch) = has_japanese(lit) {
+                            out.push((*line, format!("（{ch}）{}", raw.trim())));
+                            flagged = true;
+                        }
+                    }
+                }
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_str = true;
+                lit_start = Some(pos + 1);
+                i += 1;
+                continue;
+            }
+            if depth == 0 {
+                let opener = OPENERS.iter().find(|op| code[pos..].starts_with(**op));
+                if let Some(op) = opener {
+                    // `Err(` は識別子の途中（`MyErr(`）を外す
+                    let prev = code[..pos].chars().next_back();
+                    let inside_ident = op.starts_with('E')
+                        && prev.is_some_and(|p| p.is_alphanumeric() || p == '_');
+                    if !inside_ident {
+                        depth = 1;
+                        i += op.chars().count();
+                        continue;
+                    }
+                }
+            } else if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+            }
+            i += 1;
+        }
+        // 行をまたぐ文字列リテラル（`\` の継続）は行末までを見る
+        if in_str && depth > 0 && !flagged {
+            if let Some(ch) = has_japanese(&code[lit_start.unwrap_or(0)..]) {
+                out.push((*line, format!("（{ch}）{}", raw.trim())));
+            }
+        }
+    }
+    out
+}
+
+/// CLI `main.rs` の本体（単体テストの mod の前まで）の行
+fn cli_code_lines() -> Vec<(usize, &'static str)> {
+    front_scope_lines(CLI_MAIN_SRC, None).expect("CLI main.rs の本体を引ける")
+}
+
+#[test]
+fn cli_の手元の断りと移した関数に日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for head in CLI_NOTE_SCOPES {
+        let Some(lines) = front_scope_lines(CLI_MAIN_SRC, Some(head)) else {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}: 走査の範囲 `{head}` が見つからない（関数の改名で番犬が空振りする。\
+                 CLI_NOTE_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in front_japanese(&lines) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}:{line}: 断りと行を移した CLI の関数（`{head}`）に日本語の固定文がある = \
+                 英語表示にもそのまま出る（断りは tako_control::Reason、行は tako_control::ReplyNote へ）: {text}"
+            ));
+        }
+    }
+    // まだ移していない関数の範囲は外す（表から外したら見る）
+    let mut deferred: Vec<(usize, usize, usize)> = Vec::new();
+    for (i, (head, _)) in CLI_REFUSAL_DEFERRED.iter().enumerate() {
+        match front_scope_lines(CLI_MAIN_SRC, Some(head)) {
+            Some(lines) => {
+                let (first, last) = (lines[0].0, lines[lines.len() - 1].0);
+                deferred.push((i, first, last));
+            }
+            None => failures.push(format!(
+                "{CLI_MAIN_PATH}: CLI_REFUSAL_DEFERRED の `{head}` が見つからない（改名なら直す・消えたなら外す）"
+            )),
+        }
+    }
+    let mut deferred_hit = vec![false; CLI_REFUSAL_DEFERRED.len()];
+    for (line, text) in japanese_in_refusals(&cli_code_lines()) {
+        if let Some((i, _, _)) = deferred
+            .iter()
+            .find(|(_, first, last)| (*first..=*last).contains(&line))
+        {
+            deferred_hit[*i] = true;
+            continue;
+        }
+        failures.push(format!(
+            "{CLI_MAIN_PATH}:{line}: CLI の手元の断りに日本語の固定文がある = 英語表示でも `error: <日本語>` で出る \
+             （tako_control::Reason へバリアントを足し、front_err で表示言語の文にする）: {text}"
+        ));
+    }
+    for (i, (head, why)) in CLI_REFUSAL_DEFERRED.iter().enumerate() {
+        if !deferred_hit[i] {
+            failures.push(format!(
+                "CLI_REFUSAL_DEFERRED の `{head}`（{why}）にもう日本語の断りが無い = 移し終えたので表から外す"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 断りの括弧の中（行をまたぐ形も）と `error:` の行の日本語だけを名指し、括弧の外
+/// （`Err(e) => eprintln!(…)` の後ろ）・型の口・コメント・`MyErr(` は見逃す
+#[test]
+fn cli_の手元の断りの番犬の境界() {
+    let src = [
+        (1, "    let p = x.ok_or(\"ペインが無い\")?;"),
+        (
+            2,
+            "    let q = y.map_err(|e| front_err(Reason::CwdNotObtained(e.to_string())))?;",
+        ),
+        (3, "        Err(e) => eprintln!(\"QR を作れない: {e}\"),"),
+        (4, "    return Err(format!("),
+        (5, "        \"世代は 1〜3 で指定（指定: {g}）\""),
+        (6, "    ));"),
+        (7, "    eprintln!(\"error: 優先度が読めない\");"),
+        (8, "    eprintln!(\"error: {}\", front_err(e));"),
+        (9, "    // Err(\"コメントの日本語は見ない\")"),
+        (10, "    let r = MyErr(\"識別子の途中\");"),
+        (11, "    let s = z.ok_or_else(|| \"continued \\"),
+        (12, "        文字列\".to_string())?;"),
+        (
+            13,
+            "    let t = w.ok_or(Reason::QueueTokenRequired); // 断り（コメント）",
+        ),
+    ];
+    let found: Vec<usize> = japanese_in_refusals(&src)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    assert_eq!(found, vec![1, 5, 7, 12], "植えた 4 か所だけを名指す");
+    assert_eq!(strip_line_comment("a // b"), "a ");
+    assert_eq!(strip_line_comment("\"x // y\" // z"), "\"x // y\" ");
 }

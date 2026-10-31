@@ -60,6 +60,13 @@ pub enum SessionRefusal {
     McpSettingsDir { dir: String, error: String },
     /// worker の MCP の設定ファイルを書き出せない
     McpSettingsWrite(WriteError),
+    /// 突然死からの復旧（`tako orchestrator resume`）は claude の worker だけ（`agent` は記録の系統名。
+    /// 未記録なら `None`）
+    DeathResumeClaudeOnly(Option<String>),
+    /// 突然死からの復旧: 会話 ID が未検出
+    DeathResumeNoSession,
+    /// 突然死からの復旧: その系統は spawn と同じ組み立てで再開できない
+    DeathResumeUnbuildable,
 
     // ---- 端末ログ ----
     /// 端末ログを読めない（`path` はログファイル）
@@ -150,6 +157,29 @@ impl SessionRefusal {
             }
             (Self::LogUnreadable { path, error }, En) => {
                 format!("cannot read the log ({path}): {error}")
+            }
+            (Self::DeathResumeClaudeOnly(agent), Ja) => format!(
+                "突然死からの復旧は claude の worker だけ（この worker は {}）",
+                agent.as_deref().unwrap_or("agent 未記録")
+            ),
+            (Self::DeathResumeClaudeOnly(agent), En) => format!(
+                "recovery from a sudden death is only for claude workers (this worker is {})",
+                agent.as_deref().unwrap_or("no agent recorded")
+            ),
+            (Self::DeathResumeNoSession, Ja) => {
+                "この worker は会話 ID が未検出なので再開できない（起動直後に落ちた・まだ走査されていない）"
+                    .into()
+            }
+            (Self::DeathResumeNoSession, En) => {
+                "cannot resume this worker because no conversation ID was detected (it exited \
+                 right after starting / it has not been scanned yet)"
+                    .into()
+            }
+            (Self::DeathResumeUnbuildable, Ja) => {
+                "この worker の系統は spawn と同じ組み立てで再開できない".into()
+            }
+            (Self::DeathResumeUnbuildable, En) => {
+                "this worker's agent cannot be resumed with the same launch as spawn".into()
             }
         }
     }

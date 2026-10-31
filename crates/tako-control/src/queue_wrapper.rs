@@ -81,8 +81,8 @@ pub struct Options {
     pub label: Option<String>,
 }
 
-/// `--max-wait` の値を読む: `90s` / `10m` / `1h` / 単位なしは分
-pub fn parse_duration(s: &str) -> Result<Duration, String> {
+/// `--max-wait` の値を読む: `90s` / `10m` / `1h` / 単位なしは分。断りは表示言語で引ける型（#2365。呼び手は CLI）
+pub fn parse_duration(s: &str) -> Result<Duration, crate::Reason> {
     let s = s.trim();
     let (num, unit) = match s.char_indices().find(|(_, c)| !c.is_ascii_digit()) {
         Some((i, _)) => (&s[..i], &s[i..]),
@@ -90,15 +90,15 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     };
     let n: u64 = num
         .parse()
-        .map_err(|_| format!("時間を読めない: {s}（例: 90s / 10m / 1h）"))?;
+        .map_err(|_| crate::Reason::QueueDurationUnreadable(s.to_string()))?;
     let secs = match unit {
         "s" => n,
         "m" => n * 60,
         "h" => n * 3600,
-        other => return Err(format!("時間の単位を読めない: {other}（s / m / h）")),
+        other => return Err(crate::Reason::QueueDurationUnitUnknown(other.to_string())),
     };
     if secs == 0 {
-        return Err("待ちの上限は 1 秒以上".into());
+        return Err(crate::Reason::QueueWaitTooShort);
     }
     Ok(Duration::from_secs(secs))
 }
