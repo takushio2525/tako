@@ -6348,6 +6348,10 @@ fn remote_status() -> Result<(), String> {
     if let Some(detail) = status["serve_generation"]["detail"].as_str() {
         eprintln!("{detail}");
     }
+    // 起こしている途中（自動復帰の入れ替えほか）は止めずに待つことを言う（#2608。欄を読むだけ）
+    if let Some(detail) = status["starting"]["detail"].as_str() {
+        eprintln!("{detail}");
+    }
     println!("{}", pretty_json(&status));
     Ok(())
 }

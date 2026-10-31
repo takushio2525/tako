@@ -415,11 +415,12 @@ fn パスの文字列だけで比べる形へ戻すと名指しする() {
     let base = sources(&root);
     assert!(all(&base).is_empty(), "注入の前は緑であること");
 
-    // 注入 1: #2518 前の spawn_daemon（パスが一致したら「既に起動中」で返す）
+    // 注入 1: #2518 前の spawn_daemon（パスが一致したら「既に起動中」で返す）。
+    // 旧版を止める呼び出しは #2608 から起こしている途中の印の後ろ（`match renewing`）にある
     let mut s = sources(&root);
     s.remote = inject(
         &base.remote,
-        "        if !crate::remote_generation::renewable_in_status(&status) {\n            return Err(\"リモートサーバーは既に起動中\".to_string());\n        }\n        renewed_from = Some(stop_stale_generation(&status)?);\n",
+        "        if !crate::remote_generation::renewable_in_status(&status) {\n            return Err(\"リモートサーバーは既に起動中\".to_string());\n        }\n",
         "        return Err(\"リモートサーバーは既に起動中\".to_string());\n",
         "パスの文字列だけで比べる spawn_daemon",
     );
