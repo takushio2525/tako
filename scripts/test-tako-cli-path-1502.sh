@@ -22,6 +22,9 @@
 # 空配列の `"${arr[@]}"` を未定義として落とす。#1499 の実測。`.agent/conventions.md`）
 
 set -uo pipefail
+# check-health / `tako setup --check` は表示言語に従う（#2365）。判定は日本語の字面なので、OS の言語に
+# 依らず日本語表示へ固定する（settings.json の language が system のときだけ効く）
+export TAKO_LANG=ja
 
 # **本番 GUI を指す env を最初に落とす**。tako のペインの中から走らせると
 # `TAKO_SOCKET` / `TAKO_TOKEN` / `TAKO_PANE_ID` が隔離 GUI へも継承され、

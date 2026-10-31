@@ -267,7 +267,13 @@ fn 依存段の表示は在るが動かないをokより先に言い分ける() 
             "dep[\"runnable\"]",
             "\"  [OK] {bin}: {path}\"",
         ),
-        (DIAGNOSTICS, "dep_items", "unrunnable_text()", "Status::Ok"),
+        // 診断は表示言語の口（#2365。`--check` / check-health は表示言語に従う）
+        (
+            DIAGNOSTICS,
+            "dep_items",
+            "unrunnable_text_in(",
+            "Status::Ok",
+        ),
     ];
     for (rel, name, distinguish, ok) in cases {
         let (body, base) = fn_body(rel, name);

@@ -397,7 +397,7 @@ fn 判定を書き足すと名指しされる() {
 
     // CLI に文面を直書きする
     let cli = code(CLI, &read(CLI));
-    let anchor = "fn print_check_health_mod(section: &Value) {\n";
+    let anchor = "fn print_check_health_mod(section: &Value, lang: tako_core::i18n::Lang) {\n";
     assert!(cli.contains(anchor), "CLI の注入の目印が見つからない");
     let injected = cli.replacen(
         anchor,

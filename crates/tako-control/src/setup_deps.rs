@@ -1295,8 +1295,9 @@ mod tests {
         };
         let brew = DepInstaller::Brew { pkg: "tailscale" };
         let mut timed_out = fake_status(Some(brew), Some("/opt/homebrew/bin/brew"));
+        let lookup = "command -v tailscale";
         timed_out.lookup_timeout = Some(tako_core::probe::TimeoutNotice {
-            label: tako_core::probe::label("zsh", &["-l", "-c", "command -v tailscale"]),
+            label: tako_core::probe::label("zsh", &["-l", "-c", lookup]),
             waited_secs: 5,
         });
         let cases = [

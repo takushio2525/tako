@@ -26,6 +26,9 @@
 # （= 未実測。検証を「通った」と読ませない。番号は isolated-gui.sh の
 # ISOLATED_GUI_RC_NO_DISPLAY にそろえる = #1744）。
 set -uo pipefail
+# check-health / `tako setup --check` は表示言語に従う（#2365）。判定は日本語の字面なので、OS の言語に
+# 依らず日本語表示へ固定する（settings.json の language が system のときだけ効く）
+export TAKO_LANG=ja
 
 # **本番 GUI を指す env を最初に落とす**（tako のペインから走らせると継承され、
 # CLI が隔離インスタンスではなくユーザーの本番 GUI を触る）

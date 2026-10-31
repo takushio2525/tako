@@ -323,7 +323,7 @@ pub fn render_in(items: &[Remaining], lang: Lang) -> Vec<String> {
     let mut out = vec![
         String::new(),
         match lang {
-            Lang::Ja => format!("残り {count} 件（ここから先は人の操作が必要です）:"),
+            Lang::Ja => format!("残り {} 件（ここから先は人の操作が必要です）:", count),
             Lang::En => format!("{count} left (these need you from here on):"),
         },
     ];
