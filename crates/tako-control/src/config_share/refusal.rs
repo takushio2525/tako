@@ -97,7 +97,7 @@ pub enum ShareRefusal {
 
     // ---- 変換（`portable`） ----
     /// 読めない（`path` は実体のパスかリポジトリ相対のパス）
-    ReadFailed { path: String, error: String },
+    FileUnreadable { path: String, error: String },
     /// YAML を解釈できない
     YamlParse(YamlReason),
     /// YAML に書き出せない
@@ -227,8 +227,8 @@ impl ShareRefusal {
                  Then run `tako config pull` again",
                 git.text_in(lang)
             ),
-            (Self::ReadFailed { path, error }, Ja) => format!("読み取りに失敗 ({path}): {error}"),
-            (Self::ReadFailed { path, error }, En) => format!("failed to read ({path}): {error}"),
+            (Self::FileUnreadable { path, error }, Ja) => format!("読み取りに失敗 ({path}): {error}"),
+            (Self::FileUnreadable { path, error }, En) => format!("failed to read ({path}): {error}"),
             (Self::YamlParse(reason), Ja) => {
                 format!("YAML のパースに失敗: {}", reason.text_in(lang))
             }

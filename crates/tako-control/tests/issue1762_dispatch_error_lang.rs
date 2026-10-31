@@ -14339,7 +14339,7 @@ fn share_refusal_index(r: &ShareRefusal) -> usize {
         ShareRefusal::Git(_) => 10,
         ShareRefusal::CommitNoIdent(_) => 11,
         ShareRefusal::PullDiverged { .. } => 12,
-        ShareRefusal::ReadFailed { .. } => 13,
+        ShareRefusal::FileUnreadable { .. } => 13,
         ShareRefusal::YamlParse(_) => 14,
         ShareRefusal::YamlEmit(_) => 15,
         ShareRefusal::JsonParse(_) => 16,
@@ -14495,7 +14495,7 @@ fn share_refusal_table() -> Vec<(ShareRefusal, String)> {
             ),
         ),
         (
-            ShareRefusal::ReadFailed {
+            ShareRefusal::FileUnreadable {
                 path: "tako/orchestrator/accounts.yaml".into(),
                 error: SHARE_EACCES.into(),
             },

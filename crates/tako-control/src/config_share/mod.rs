@@ -235,7 +235,7 @@ fn walk(root: Root, dir: &Path, prefix: &str, out: &mut Vec<String>) {
 
 /// 実体の内容を共有用に変換する（ローカルフィールド除去 → ホームパスの可搬化）
 pub fn export_content(entry: &Entry, live: &Path) -> Result<String, ShareRefusal> {
-    let raw = std::fs::read_to_string(live).map_err(|e| ShareRefusal::ReadFailed {
+    let raw = std::fs::read_to_string(live).map_err(|e| ShareRefusal::FileUnreadable {
         path: live.display().to_string(),
         error: e.to_string(),
     })?;
@@ -836,7 +836,7 @@ pub fn pull() -> Result<Value, ShareRefusal> {
             .unwrap_or_default();
         let live = root_dir.join(&rel);
         let shared = std::fs::read_to_string(repo.join(&repo_rel)).map_err(|e| {
-            ShareRefusal::ReadFailed {
+            ShareRefusal::FileUnreadable {
                 path: repo_rel.clone(),
                 error: e.to_string(),
             }
