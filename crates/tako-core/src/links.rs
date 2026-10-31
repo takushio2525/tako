@@ -407,8 +407,9 @@ fn is_marker(run: &str) -> bool {
                 )
         });
     let numbered = (2..=4).contains(&n)
-        && run.ends_with(['.', ')'])
-        && run[..run.len() - 1].chars().all(|c| c.is_ascii_digit());
+        && run
+            .strip_suffix(['.', ')'])
+            .is_some_and(|digits| digits.chars().all(|c| c.is_ascii_digit()));
     symbol || numbered
 }
 
@@ -2678,8 +2679,8 @@ mod tests {
         )
     }
 
-    fn setup_2578_dir(name: &str) -> (PathBuf, PathBuf, PathBuf) {
-        let dir = setup_test_dir(&format!("2578_{name}"));
+    /// 呼び手が作った置き場（`setup_test_dir`。後始末も呼び手）へ、長いパスと全角のパスの実物を置く
+    fn put_2578_files(dir: &Path) -> (PathBuf, PathBuf) {
         let long = dir
             .join("a-very-long-directory-name-for-the-wrap-test")
             .join("another-quite-long-directory-segment-0123456789")
@@ -2692,7 +2693,7 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "").unwrap();
         }
-        (dir, long, wide)
+        (long, wide)
     }
 
     /// 期待の全体が 1 本だけ返り、途中で切れた target（期待の真の接頭辞）が無い
@@ -2772,7 +2773,8 @@ mod tests {
         let (new, _) = both_arms(&lines, cols, None);
         assert_whole(&new, url, "/ の手前で上限");
 
-        let (dir, long, _) = setup_2578_dir("hyphen");
+        let dir = setup_test_dir("2578_hyphen");
+        let (long, _) = put_2578_files(&dir);
         let shown = long.display().to_string();
         let cut = shown.find("-0123456789").unwrap();
         let head = format!("⏺ Open {}", &shown[..cut]);
@@ -2811,7 +2813,8 @@ mod tests {
     /// 全角が右端にかかる 2 つの形（右端まで埋める / 残り 1 桁に入らず送る）はどちらかの幅で必ず踏む
     #[test]
     fn 幅を変えても折り返した全体を1本で返す_2578() {
-        let (dir, long, wide) = setup_2578_dir("widths");
+        let dir = setup_test_dir("2578_widths");
+        let (long, wide) = put_2578_files(&dir);
         let url = long_url();
         let targets = [
             url.clone(),
@@ -2910,7 +2913,8 @@ mod tests {
         );
 
         // パスは実在で確かめるので、同じ形でもつながない
-        let (dir, long, _) = setup_2578_dir("limit_path");
+        let dir = setup_test_dir("2578_limit_path");
+        let (long, _) = put_2578_files(&dir);
         let shown = long.display().to_string();
         let (lines, cols) = two_rows("Open ", "Open: ", &shown);
         let (new, _) = both_arms(&lines, cols, None);

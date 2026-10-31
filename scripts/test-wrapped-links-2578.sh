@@ -52,11 +52,13 @@ FAKE_PID=""
 cleanup() {
   stop_isolated_gui
   [ -n "$FAKE_PID" ] && kill "$FAKE_PID" 2>/dev/null
-  # 自分の隔離ソケットの tmux サーバーだけを落とす（本番の -L tako には触れない）
-  tmux -L "$SOCK" kill-server 2>/dev/null
+  # 自分の隔離ソケットの tmux サーバーだけを、ソケットファイルまで落とす（本番の -L tako には触れない）
+  tmux_socket_kill "$SOCK"
   if [ -z "${KEEP:-}" ]; then rm -rf "${TMP:?}"; else echo "一時 dir: $TMP"; fi
 }
 
+# shellcheck source=lib/tmux-socket.sh
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
 isolated_gui_bins || exit 1
@@ -106,7 +108,17 @@ wait_for() {
   done
   return 1
 }
-screen_has() { tk read --pane "$1" 2>/dev/null | grep -q -- "$2"; }
+# 画面に $2 が出ているか（pipefail の下で早く抜ける読み手へパイプしない = 一度受けてから見る）
+screen_has() {
+  local out
+  out="$(tk read --pane "$1" 2>/dev/null)" && [[ "$out" == *"$2"* ]]
+}
+# claude の答えが出たか（入力の写しと答えで END-CLAUDE が 2 回）
+claude_answered() {
+  local out
+  out="$(tk read --pane "$1" 2>/dev/null)" || return 1
+  [ "$(grep -c END-CLAUDE <<<"$out")" -ge 2 ]
+}
 
 # links の結果を判定する。$1 = 見出し / $2 = ペイン / $3 = 結果の置き場 / 残り = 期待の全体（URL / パス）
 judge() {
@@ -174,7 +186,7 @@ run_mode() { # $1 = direct | persist
     HOME="$TMP/home" ZDOTDIR="$TMP/zdot" SHELL=/bin/zsh \
     TAKO_PERSIST="$persist" TAKO_AUTO_RENAME=0 \
     TAKO_SESSIONS_FILE="$TMP/sessions-$mode.yaml" TAKO_PANE_LOG_DIR="$TMP/panelogs-$mode" \
-    TAKO_TMUX_SOCKET="$SOCK" ${legacy_env[@]+"${legacy_env[@]}"} || return $?
+    TAKO_TMUX_SOCKET="$SOCK" ${legacy_env[@]+"${legacy_env[@]}"} || exit $?
   if ! wait_isolated_gui "$TMP/$mode.log" 300; then
     fail "$mode: 隔離 GUI の CLI が繋がらない"
     stop_isolated_gui
@@ -247,7 +259,7 @@ run_mode() { # $1 = direct | persist
     if wait_for 60 screen_has "$q" 'for agents'; then
       sleep 2
       tk send --pane "$q" "Echo verbatim: See $URL for details. | Open $LONG_PATH next. | Also $WIDE_PATH done. | END-CLAUDE" >/dev/null 2>&1
-      if wait_for 60 sh -c "'$TAKO_BIN' read --pane '$q' | grep -c END-CLAUDE | grep -q 2"; then
+      if wait_for 60 claude_answered "$q"; then
         sleep 1
         tk read --pane "$q" > "$TMP/$mode-claude.txt" 2>&1
         judge "$mode claude" "$q" "$TMP/$mode-claude.json" "$URL" "$LONG_PATH" "$WIDE_PATH"
@@ -259,7 +271,7 @@ run_mode() { # $1 = direct | persist
     fi
   fi
   stop_isolated_gui
-  tmux -L "$SOCK" kill-server 2>/dev/null
+  tmux_socket_kill "$SOCK"
   return 0
 }
 
