@@ -724,7 +724,8 @@ fn decode_base64url(input: &str) -> Option<Vec<u8>> {
     Some(output)
 }
 
-/// ログインシェルの種別と profile
+/// ログインシェルの種別と profile（path / undo-path が書く・外すのと同じ 1 実装 =
+/// `ShellKind::login_profile_in`。bash は `bash -l` が実際に読むファイル。#2602）
 fn shell_target() -> (Option<ShellKind>, Option<PathBuf>) {
     let home = match home_dir() {
         Ok(home) => home,
@@ -732,7 +733,7 @@ fn shell_target() -> (Option<ShellKind>, Option<PathBuf>) {
     };
     let shell = std::env::var("SHELL").unwrap_or_default();
     let kind = shell_kind_for(&shell, cfg!(windows));
-    let profile = kind.map(|k| home.join(k.login_profile_rel()));
+    let profile = kind.map(|k| k.login_profile_in(&home));
     (kind, profile)
 }
 

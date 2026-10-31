@@ -453,7 +453,10 @@ fn shのundo_pathは書き先を移す前のブロックも外す() {
     }
 
     // ---- bash（既知のシェル）: .bash_profile だけを外し、.profile のブロックには触らない ----
+    // `.bash_profile` を持つ人（#2602 以後、bash の書き先は `bash -l` が読む唯一のファイル。
+    // `.bash_profile` が無く `.profile` だけなら `.profile` が bash の書き先になる）
     let home = fresh_home(&root, "bash");
+    std::fs::write(home.join(".bash_profile"), USER_LINE).expect("利用者の .bash_profile");
     let dirs = [home.join(".local/bin")];
     tako_core::shell_profile::ensure_dirs_on_path_in(&home, ShellKind::Sh, &dirs, None)
         .expect(".profile のブロック");
@@ -470,8 +473,11 @@ fn shのundo_pathは書き先を移す前のブロックも外す() {
             undo_at()
         ));
     }
-    if read(&home, ".bash_profile").is_some_and(|t| t.contains(BLOCK_BEGIN)) {
-        failures.push("bash: undo-path の後も ~/.bash_profile にブロックが残る".to_string());
+    if read(&home, ".bash_profile").as_deref() != Some(USER_LINE) {
+        failures.push(format!(
+            "bash: undo-path の後の ~/.bash_profile が元のバイト列に戻らない: {:?}",
+            read(&home, ".bash_profile")
+        ));
     }
     if matches!(&undo, Ok(v) if v.get("previous_profile").is_some()) {
         failures.push(format!(
