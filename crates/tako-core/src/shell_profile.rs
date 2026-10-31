@@ -30,6 +30,11 @@
 //! 元のファイルの中身（PATH・環境変数）が `bash -l` から消えるので、bash は**その 1 つ**へ書く
 //! （[`ShellKind::login_profile_in`]。どれも無ければ `.bash_profile`）
 //!
+//! 名前が `dash` / `ksh` のシェルも sh と同じ `.profile` へ書く（#2603 の実測。一時 HOME の全 profile に印:
+//! macOS 同梱の `/bin/dash` と `/bin/ksh`（ksh93u+）は `-l -c`・argv[0] の `-<名>`・対話ログインのどれでも
+//! `.profile` を読む。tako の問い合わせの起こし方 `exe::login_invocation` も両方 `-l -c`）。
+//! 手元で確かめられない POSIX 系（mksh・pdksh・oksh・yash・posh・ash ほか）は寄せずに未知のシェルのまま
+//!
 //! ## 書き換えの規則
 //!
 //! ブロックの読み書きは [`crate::text_block`] に委ねる（区切り改行 1 個・
@@ -64,6 +69,20 @@ pub fn issue2602_legacy() -> bool {
     std::env::var(ISSUE2602_LEGACY_ENV).is_ok_and(|v| v == "1")
 }
 
+/// #2603 の A/B の env（`1` で名前 `dash` / `ksh` のシェルを種別の分からないシェルへ戻す = #2603 前の形。
+/// 書かずに断り、利用者が自分で `.profile` へ足すしかない）
+pub const ISSUE2603_LEGACY_ENV: &str = "TAKO_2603_LEGACY";
+
+/// [`ISSUE2603_LEGACY_ENV`] が立っているか（#2603 の A/B のゲートはここ 1 か所）
+pub fn issue2603_legacy() -> bool {
+    std::env::var(ISSUE2603_LEGACY_ENV).is_ok_and(|v| v == "1")
+}
+
+/// sh と同じ `.profile` へ書く POSIX 系のシェルの名前（`sh` のほか。#2603）。
+/// **本物をログインで起こして `.profile` を読むと確かめたものだけ**を並べる（モジュール冒頭の実測。
+/// 確かめていない名前を足すと `tako-control/tests/issue2603_dash_ksh_profile_watchdog.rs` が落ちる）
+pub const SH_PROFILE_SHELLS: [&str; 2] = ["dash", "ksh"];
+
 /// bash のログインが読む profile の候補（`$HOME` 相対）。bash は**この順で最初に在る 1 つだけ**を読む
 /// （bash(1) の INVOCATION。#2602 で一時 HOME に全部の組み合わせを置いて `bash -l` で実測）
 pub const BASH_LOGIN_PROFILES: [&str; 3] = [".bash_profile", ".bash_login", ".profile"];
@@ -73,8 +92,9 @@ pub const BASH_LOGIN_PROFILES: [&str; 3] = [".bash_profile", ".bash_login", ".pr
 pub enum ShellKind {
     Zsh,
     Bash,
-    /// 名前が `sh` のシェル（macOS は bash の sh モード・Linux は dash ほか）。行の形は bash と同じ
-    /// POSIX の `case` / `export` で、書き先だけが違う（#2592）
+    /// 名前が `sh` のシェル（macOS は bash の sh モード・Linux は dash ほか）と、名前が
+    /// [`SH_PROFILE_SHELLS`]（dash / ksh。#2603）のシェル。どれもログインで `~/.profile` を読む。
+    /// 行の形は bash と同じ POSIX の `case` / `export` で、書き先だけが違う（#2592）
     Sh,
     Fish,
     PowerShell,
@@ -104,6 +124,7 @@ impl ShellKind {
             "bash" => Some(Self::Bash),
             "sh" if issue2592_legacy() => Some(Self::Bash),
             "sh" => Some(Self::Sh),
+            name if SH_PROFILE_SHELLS.contains(&name) && !issue2603_legacy() => Some(Self::Sh),
             "fish" => Some(Self::Fish),
             "pwsh" | "powershell" => Some(Self::PowerShell),
             _ => None,
@@ -587,6 +608,37 @@ mod tests {
         assert_ne!(ShellKind::Zsh.login_profile_rel(), ".zshrc");
         assert_eq!(ShellKind::Bash.login_profile_rel(), ".bash_profile");
         assert_ne!(ShellKind::Bash.login_profile_rel(), ".bashrc");
+    }
+
+    /// #2603: 名前が dash / ksh のシェルも sh と同じ `.profile` へ。確かめていない POSIX 系は未知のまま
+    /// （本物のシェルとの突き合わせは `tako-control/tests/issue2603_dash_ksh_profile_watchdog.rs`）
+    #[test]
+    fn dashとkshはshと同じprofileへ書き確かめていない名前は寄せない() {
+        for shell in [
+            "/bin/dash",
+            "/usr/bin/dash",
+            "/bin/ksh",
+            "/usr/bin/ksh",
+            "ksh",
+        ] {
+            assert_eq!(
+                ShellKind::from_shell_path(shell),
+                Some(ShellKind::Sh),
+                "{shell}"
+            );
+        }
+        for shell in [
+            "/bin/mksh",
+            "/usr/bin/pdksh",
+            "/usr/bin/oksh",
+            "/usr/bin/yash",
+            "/bin/posh",
+            "/bin/ash",
+            "/usr/bin/ksh93",
+            "/bin/dash2",
+        ] {
+            assert_eq!(ShellKind::from_shell_path(shell), None, "{shell}");
+        }
     }
 
     /// #2592: 名前 `sh` は bash と分ける。sh のログインが読むのは `.profile` だけ
