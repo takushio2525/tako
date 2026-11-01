@@ -3234,6 +3234,8 @@ struct TakoApp {
     chat_clear_confirm: Option<PaneId>,
     /// 送信・承認が失敗したときの表示（ペイン, 文言, 時刻）。時間経過で消える
     chat_action_error: Option<(PaneId, String, std::time::Instant)>,
+    /// 承認カードの応答を background で待っているペイン（#2639。押し直しを無視する）
+    chat_respond_pending: std::collections::HashSet<PaneId>,
     /// 本文が長い発話を畳んでいるか（#716。既定は畳む = 会話が読める）。
     /// キーは (ペイン, 発話の内容キー) で、`chat_expanded` と同じ流儀
     chat_long_expanded: std::collections::HashSet<(PaneId, u64)>,
@@ -5544,6 +5546,7 @@ impl TakoApp {
             chat_caret_bounds: std::rc::Rc::new(std::cell::Cell::new(None)),
             chat_clear_confirm: None,
             chat_action_error: None,
+            chat_respond_pending: std::collections::HashSet::new(),
             chat_long_expanded: std::collections::HashSet::new(),
             chat_text_index: HashMap::new(),
             chat_selections: HashMap::new(),

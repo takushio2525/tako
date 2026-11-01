@@ -1006,17 +1006,56 @@ impl TakoApp {
     }
 
     /// 承認カードのボタン押下（#716 / §2.3）。
-    /// `OrchestratorRespond` はダイアログの実在を再検証してから選択キーを送る（#319）
+    /// `OrchestratorRespond` はダイアログの実在を再検証してから選択キーを送る（#319）。
+    ///
+    /// #2639: 応答の手順は番号キー / Enter の後に 400ms ずつ待つので、IPC の受け口と同じ
+    /// `prepare_offload` → background → 着地を通し、UI スレッドで待たない（届き方の解決と、届かない
+    /// ときの断りは UI スレッドで同じ形に返る）。待つ間は同じペインの押し直しを無視し、着地で修正前と
+    /// 同じく成功ならカードを消し・失敗なら文言を出す。background へ出さない形（A/B の
+    /// `TAKO_2639_LEGACY=1` 等）は従来どおり同期で dispatch する
     fn chat_respond(&mut self, pane_id: PaneId, choice: usize, cx: &mut Context<Self>) {
-        let result = tako_control::dispatch(
-            self,
-            tako_control::protocol::Request::OrchestratorRespond {
-                pane_id: pane_id.as_u64(),
-                choice: Some(choice.to_string()),
-                caller_role: None,
-            },
-            PaneOrigin::User,
-        );
+        if self.chat_respond_pending.contains(&pane_id) {
+            return;
+        }
+        let request = tako_control::protocol::Request::OrchestratorRespond {
+            pane_id: pane_id.as_u64(),
+            choice: Some(choice.to_string()),
+            caller_role: None,
+        };
+        let job = match tako_control::prepare_offload(self, &request) {
+            None => {
+                let result = tako_control::dispatch(self, request, PaneOrigin::User);
+                self.chat_respond_landed(pane_id, result, cx);
+                return;
+            }
+            Some(Err(e)) => {
+                self.chat_respond_landed(pane_id, Err(e), cx);
+                return;
+            }
+            Some(Ok(job)) => job,
+        };
+        self.chat_respond_pending.insert(pane_id);
+        let staged = cx
+            .background_executor()
+            .spawn(async move { job.run_staged() });
+        cx.spawn(async move |this, cx| {
+            let outcome = staged.await;
+            let result = crate::drive_offload(this.clone(), outcome, PaneOrigin::User, cx).await;
+            let _ = this.update(cx, |app: &mut Self, cx| {
+                app.chat_respond_pending.remove(&pane_id);
+                app.chat_respond_landed(pane_id, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 承認カードの応答の着地（同期の腕と background の 1 実装。#2639）
+    fn chat_respond_landed(
+        &mut self,
+        pane_id: PaneId,
+        result: Result<serde_json::Value, tako_control::DispatchError>,
+        cx: &mut Context<Self>,
+    ) {
         match result {
             Ok(_) => {
                 self.chat_action_error = None;
