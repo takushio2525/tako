@@ -210,12 +210,7 @@ impl DeviceRegistry {
     }
 
     /// devices.json へ永続化する（0600・atomic rename。secrets ではないが
-    /// identity 情報を含むため secret ファイルと同じ扱い）
-    fn save(&self) -> Result<(), String> {
-        self.save_typed().map_err(RemoteRefusal::into_ja)
-    }
-
-    /// [`Self::save`] の型の口
+    /// identity 情報を含むため secret ファイルと同じ扱い）。断りは `RemoteRefusal`
     fn save_typed(&self) -> Result<(), RemoteRefusal> {
         let file = DevicesFile {
             devices: {
@@ -322,10 +317,20 @@ impl DeviceRegistry {
     /// 保留リクエストを承認する（Mac GUI 専用経路から呼ばれる）。
     /// role は承認時にダイアログで選び直せる（省略時は要求 role）
     pub fn approve(&mut self, device_id: &str, role: Option<DeviceRole>) -> Result<Device, String> {
+        self.approve_typed(device_id, role)
+            .map_err(RemoteRefusal::into_ja)
+    }
+
+    /// [`Self::approve`] の型の口（daemon の admin API は daemon の表示言語で本文にする。#2365）
+    pub fn approve_typed(
+        &mut self,
+        device_id: &str,
+        role: Option<DeviceRole>,
+    ) -> Result<Device, RemoteRefusal> {
         let req = self
             .pending
             .remove(device_id)
-            .ok_or_else(|| format!("保留中のペアリング要求が無い: {device_id}"))?;
+            .ok_or_else(|| RemoteRefusal::PairingRequestNotPending(device_id.to_string()))?;
         let role = role.unwrap_or(req.requested_role);
         let now = now_epoch();
         let device = match self.devices.get(device_id) {
@@ -345,7 +350,7 @@ impl DeviceRegistry {
             },
         };
         self.devices.insert(device_id.to_string(), device.clone());
-        self.save()?;
+        self.save_typed()?;
         self.audit(
             match req.kind {
                 RequestKind::Pair => "pair_approved",
@@ -360,10 +365,15 @@ impl DeviceRegistry {
 
     /// 保留リクエストを拒否する（Mac GUI 専用経路から呼ばれる）
     pub fn deny(&mut self, device_id: &str) -> Result<(), String> {
+        self.deny_typed(device_id).map_err(RemoteRefusal::into_ja)
+    }
+
+    /// [`Self::deny`] の型の口（daemon の admin API は daemon の表示言語で本文にする。#2365）
+    pub fn deny_typed(&mut self, device_id: &str) -> Result<(), RemoteRefusal> {
         let req = self
             .pending
             .remove(device_id)
-            .ok_or_else(|| format!("保留中のペアリング要求が無い: {device_id}"))?;
+            .ok_or_else(|| RemoteRefusal::PairingRequestNotPending(device_id.to_string()))?;
         self.denied.insert(device_id.to_string(), Instant::now());
         self.audit(
             match req.kind {
@@ -610,25 +620,21 @@ pub fn identify(
     forwarded_for: Option<&str>,
     forwarded_host: Option<&str>,
     expected_host: &str,
-) -> Result<Identity, String> {
+) -> Result<Identity, RemoteRefusal> {
     let Some(xff) = forwarded_for else {
         return Ok(Identity::Local);
     };
     // X-Forwarded-For は「client, proxy1, proxy2」形式がありうる。先頭が接続元
     let ip = xff.split(',').next().unwrap_or("").trim().to_string();
     if ip.is_empty() {
-        return Err("X-Forwarded-For が空".into());
+        return Err(RemoteRefusal::ForwardedForEmpty);
     }
     // XFF がある場合、X-Forwarded-Host も serve が付与するはず。
     // 欠落または期待値と不一致なら偽装の可能性が高い
     match forwarded_host {
-        None => {
-            return Err(
-                "X-Forwarded-For はあるが X-Forwarded-Host が欠落（serve 経由でない可能性）".into(),
-            );
-        }
+        None => return Err(RemoteRefusal::ForwardedHostMissing),
         Some(xfh) if !host_matches(xfh, expected_host) => {
-            return Err(format!("X-Forwarded-Host が期待値と不一致（受信: {xfh}）"));
+            return Err(RemoteRefusal::ForwardedHostMismatch(xfh.to_string()));
         }
         _ => {}
     }
@@ -644,10 +650,8 @@ pub fn identify(
             }
             Ok(Identity::Tailnet(info))
         }
-        Err(WhoisError::PeerNotFound) => Err(format!(
-            "接続元 {ip} は tailnet 上のノードではない（whois: peer not found）"
-        )),
-        Err(WhoisError::Failed(e)) => Err(format!("接続元の identity 検証に失敗: {e}")),
+        Err(WhoisError::PeerNotFound) => Err(RemoteRefusal::PeerNotInTailnet(ip)),
+        Err(WhoisError::Failed(e)) => Err(RemoteRefusal::WhoisFailed(e)),
     }
 }
 
@@ -940,7 +944,7 @@ mod tests {
             "mac.tail1234.ts.net",
         );
         assert!(result.is_err(), "XFH 欠落は偽装として拒否されるべき");
-        assert!(result.unwrap_err().contains("X-Forwarded-Host が欠落"));
+        assert_eq!(result.unwrap_err(), RemoteRefusal::ForwardedHostMissing);
     }
 
     #[test]
@@ -955,7 +959,10 @@ mod tests {
             "mac.tail1234.ts.net",
         );
         assert!(result.is_err(), "XFH 不一致は偽装として拒否されるべき");
-        assert!(result.unwrap_err().contains("不一致"));
+        assert!(matches!(
+            result.unwrap_err(),
+            RemoteRefusal::ForwardedHostMismatch(_)
+        ));
     }
 
     #[test]
