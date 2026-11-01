@@ -528,6 +528,18 @@ pub fn with_origin<T>(origin: RequestOrigin, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// A/B: #1555 前へ戻す（IPC と設定画面の `RemoteStart` を UI スレッドで同期に待つ）
+pub const START_OFFLOAD_LEGACY_ENV: &str = "TAKO_1555_LEGACY";
+
+/// `RemoteStart` を background へ出さず、修正前と同じく UI スレッドで待つか（#1555 の A/B）。
+/// 要求のたびに読む（テストが `run_alone!` の子で切り替えられるよう、値を覚えない）
+pub fn start_offload_legacy() -> bool {
+    matches!(
+        std::env::var(START_OFFLOAD_LEGACY_ENV).ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// いまのスレッドが名乗っている経路
 fn current_origin_str() -> &'static str {
     REQUEST_ORIGIN

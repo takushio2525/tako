@@ -203,6 +203,8 @@ pub struct SettingsWindow {
     edit_bounds: Option<Bounds<Pixels>>,
     /// 操作結果のメッセージ（本文, エラーか）
     message: Option<(String, bool)>,
+    /// リモートの「開始」を background で待っている間（#1555。押し直しを無視し、ボタンを「起動中…」にする）
+    remote_starting: bool,
     status: StatusCache,
     /// Code Runner 新規追加行の確定前バッファ
     runner_new_ext: String,
@@ -252,6 +254,7 @@ impl SettingsWindow {
             ime: None,
             edit_bounds: None,
             message: None,
+            remote_starting: false,
             status: StatusCache::default(),
             runner_new_ext: String::new(),
             runner_new_cmd: String::new(),
@@ -312,6 +315,57 @@ impl SettingsWindow {
             Ok(_) => self.message = Some((success, false)),
             Err(e) => self.message = Some((e, true)),
         }
+    }
+
+    /// リモートの「開始」（#1555）。IPC の受け口と同じ `prepare_offload` → background → 着地を通し、
+    /// daemon の起動を UI スレッドで待たない（UI スレッドで待つと、起動の途中で GUI の IPC へ probe を
+    /// 送る daemon と子の読み取りの上限 10 秒まで待ち合い、その間 GUI が止まる）。
+    /// background へ出さない形（A/B の `TAKO_1555_LEGACY=1` 等）は従来どおり同期で dispatch する
+    fn remote_start_off_ui(&mut self, cx: &mut Context<Self>) {
+        if self.remote_starting {
+            return;
+        }
+        let Some(app) = self.tako_app.upgrade() else {
+            self.message = Some((txt::error_app_gone().to_string(), true));
+            return;
+        };
+        let request = Request::RemoteStart {};
+        let prepared = app.update(cx, |app, _| tako_control::prepare_offload(app, &request));
+        let job = match prepared {
+            None => {
+                self.run_with_message(request, txt::msg_remote_started().to_string(), cx);
+                self.refresh_tab_status(cx);
+                return;
+            }
+            Some(Err(e)) => {
+                self.message = Some((e.to_string(), true));
+                return;
+            }
+            Some(Ok(job)) => job,
+        };
+        self.remote_starting = true;
+        self.message = None;
+        cx.notify();
+        let weak_app = self.tako_app.clone();
+        let staged = cx
+            .background_executor()
+            .spawn(async move { job.run_staged() });
+        cx.spawn(async move |this, cx| {
+            let outcome = staged.await;
+            let origin = tako_core::pane::PaneOrigin::User;
+            let result = crate::drive_offload(weak_app, outcome, origin, cx).await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                this.remote_starting = false;
+                this.settings = settings::load();
+                this.message = Some(match result {
+                    Ok(_) => (txt::msg_remote_started().to_string(), false),
+                    Err(e) => (e.to_string(), true),
+                });
+                this.refresh_tab_status(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 「設定ファイルを Finder で表示」（#2247）: 他の入口と同じ dispatch `FileOpKind::Reveal`
@@ -3020,18 +3074,16 @@ impl SettingsWindow {
                                 }),
                             )
                         } else {
+                            // #1555: 起動は background で待つ（押し直しは無視し、待つ間は「起動中…」）
                             self.button(
                                 "remote-start",
-                                txt::remote_start(),
+                                if self.remote_starting {
+                                    crate::ui_text::remote::start_button_busy()
+                                } else {
+                                    txt::remote_start()
+                                },
                                 BtnKind::Primary,
-                                cx.listener(|this, _, _, cx| {
-                                    this.run_with_message(
-                                        Request::RemoteStart {},
-                                        txt::msg_remote_started().to_string(),
-                                        cx,
-                                    );
-                                    this.refresh_tab_status(cx);
-                                }),
+                                cx.listener(|this, _, _, cx| this.remote_start_off_ui(cx)),
                             )
                         }),
                 ),
