@@ -116,7 +116,7 @@ start_gui() {
     sleep 0.1
   done
   if [ "$(T "$name" list | jqv '.tabs | length')" != "1" ]; then
-    echo "繋がった先が隔離インスタンスではない（$name）。中止する。"
+    echo "繋がった先が隔離インスタンスではない（${name}）。中止する。"
     tail -20 "$d/app.log"
     exit 1
   fi
