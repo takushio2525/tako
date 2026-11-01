@@ -5649,6 +5649,7 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
 | 本物の claude の設定 dir を使わせない | export された `CLAUDE_CONFIG_DIR` は使わない。GUI の HOME が一時の dir なら外すだけ（claude はその HOME の `.claude`）、利用者のホームのままならログの置き場の隣の一時 dir（`$ISOLATED_GUI_CLAUDE_CONFIG_DIR`） | 本物の認証で実物の claude を動かす検証だけが `CLAUDE_CONFIG_DIR="$CCD"` を並べる（`test-claude-mod-1879.sh` ほか mod の 4 本） |
 | 既定の `.zshrc` | GUI の ZDOTDIR（無ければ HOME）が利用者のホームの外で、zsh の rc が 1 つも無ければ固定プロンプト（`tako %1~ %% `）の `.zshrc` を置く。zsh の初回設定メニューが `tako send` の入力を食う（#1945）・画面に実ユーザー名を出さない（#927） | 自分の rc を先に置けば書かない |
 | 発見の置き場を決める（#2598） | GUI へ届く `TAKO_DISCOVERY_DIR` が空ならログの置き場の隣の `isolated-discovery`（`$ISOLATED_GUI_DISCOVERY_DIR`）。待ち（`wait_isolated_gui` → `iso_cli`）は同じ置き場を読み、この GUI へだけ繋ぐ | `TAKO_DISCOVERY_DIR=<dir>` を並べるか export する（空の指定は未指定と同じに読む） |
+| ペインの zsh に利用者の rc を読ませない（#2627） | rc を読む dir（並べた / export された `ZDOTDIR`、無ければ `HOME`）が利用者のホームの中（か確かめられない）なら、ログの置き場の隣の `isolated-zdotdir`（`$ISOLATED_GUI_ZDOTDIR`。既定の `.zshrc` だけ）を `ZDOTDIR` として**並べた値より後ろに**置く。呼び手の一時の HOME / ZDOTDIR の rc はそのまま読む | 利用者の rc が要る検証だけ `TAKO_ISO_USER_RC=1` を並べる（export でもよい）。その行か直前の行に `# tako:user-rc-ok <理由>`（下の箇条） |
 
 - **#2570 以後は GUI 自身も起動の最初にペインの中でだけ意味を持つ env を外す**（正本
   `tako_core::host_env::STRIP`・FR-2.1.5）。`ISOLATED_GUI_DROP_ENV` は #2570 より前のバイナリのために残し、
@@ -5659,9 +5660,21 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
 - **remote daemon（`tako remote serve`）も起動の最初に同じ正本で外す**（#2582・FR-2.1.6）。外すのは CLI の
   `main` の門（`remote::is_serve_invocation`）を通った起動だけなので、**daemon を起こす引数は
   `remote::SERVE_ARGS` を使い、直書きしない**（番犬 `issue2582_daemon_inherited_pane_env_watchdog`）
-- **HOME を本物のままにした起動では、ペインのシェルが利用者の rc を読む**。rc が `CLAUDE_CONFIG_DIR` を
-  export していれば、ペインで打った claude は本物の設定 dir を使う（GUI の env では止められない）。
-  ペインの claude まで隔離するなら一時の HOME か ZDOTDIR を並べる（既存の検証の大半はそうしている）
+- **HOME を本物のままにした起動でも、ペインの zsh に利用者の rc を読ませない**（#2627）。ペインは
+  ログイン zsh なので、以前は利用者の rc（pyenv / fnm / conda の初期化）がペインごとに走った。GUI が
+  終わると PTY が切れてペインへ SIGHUP が重ねて届き（zsh がジョブへ配る分と、zsh の終了でカーネルが
+  前面のグループへ送る分）、rc の `pyenv rehash` の EXIT の trap が 2 度目の HUP で `rm` の途中に断たれる。
+  shim のロック（`<pyenv root>/shims/.pyenv-shim`）が利用者の環境に残り、以後のログイン zsh（本番のペインも）
+  が 60 秒待った（#1556 の worker が踏んだ。`stop_isolated_gui` の TERM / KILL は 1 度も出ていない = 後片付けの
+  待ちを延ばしても直らない。GUI のどの終了でも起きる）。いまは `launch_isolated_gui` がペインの zsh を砂場の
+  ZDOTDIR へ向ける（上の表）。PATH などの env は GUI の env をそのまま継ぐ（`exe::find` の `command -v` は
+  継いだ PATH で引ける。`login_shell_path` は PATH を launchd の既定へ戻して聞くので、利用者の rc の PATH を
+  測る検証は一時の HOME に自分の rc を置く = 既存の検証はそうしている）。rc の `CLAUDE_CONFIG_DIR` も
+  ペインへ届かない。**利用者の rc が要る検証だけ** `TAKO_ISO_USER_RC=1` を並べ、その行か直前の行
+  （継続した 1 つのコマンドは先頭の行の直前でもよい）に `# tako:user-rc-ok <理由>` を書く（理由の無い宣言は
+  無効）。zsh 以外（`SHELL=/bin/bash` 等）は ZDOTDIR を読まないので、HOME が利用者のホームのままなら
+  ヘルパが stderr へ「未対策」と 1 行出す（一時の HOME を並べる）。A/B は `TAKO_2627_LEGACY=1`（export でも
+  並べてもよい。使えるのは実経路テスト `scripts/test-isolated-gui-user-rc-2627.sh` だけ）
 - **セルフテスト（`TAKO_SELF_TEST=1`）が起動コマンドを積む項目は、見たら取り下げる**（#2446）。セルフテストは
   HOME を本物のまま起こすので、項目が積んだ `claude`（worker の spawn）や `tako setup`（パレットの run-setup）が
   走ると、ペインのシェルが利用者の rc の `CLAUDE_CONFIG_DIR` を拾い、本物のアカウントで claude が起きる。
@@ -5721,6 +5734,14 @@ claude / tako を起こす行は file:line で名指す（引用符の中 = ペ�
 （#2598。現行のヘルパの待ちを素の CLI へ戻した注入を名指すことも固定する）。偽の GUI と偽の CLI でヘルパを
 走らせ、待ちの CLI が本番の env を受け取らず GUI と同じ置き場を読むことも見る。実経路は
 `scripts/test-isolated-gui-defaults-1970.sh`（`TAKO_1970_LEGACY_HELPER=<旧ヘルパ>` で A/B）。
+#2627 は同じ番犬が、`launch_isolated_gui` が判定（`iso_user_rc_sandbox_needed`）を呼び、起動の行で砂場の
+ZDOTDIR（`rc_args`）を `"$@"` より後ろに置くことを file:line で拘束し（外す・前へ動かす・判定を呼ばない
+注入をそれぞれの行で名指すことも固定する）、偽の GUI でヘルパを走らせて向け方の規則（利用者のホーム /
+その中の ZDOTDIR / export された ZDOTDIR は砂場・呼び手の一時の dir はそのまま・opt-in と旧挙動は手を
+付けない・0 は opt-in ではない・zsh 以外は「未対策」）を見る。検証スクリプトと `scripts/lib/*.sh` の
+`TAKO_ISO_USER_RC=<0 / 空 以外>` に理由の宣言が無い行と、`TAKO_2627_LEGACY` を実経路テストの外で立てる行は
+file:line で名指す。実経路は `scripts/test-isolated-gui-user-rc-2627.sh`（砂場の dir を
+`ISOLATED_GUI_REAL_HOME` で利用者のホームに見立て、偽の pyenv のロックで旧 / 新 / opt-in / 呼び手の HOME を回す）。
 
 **眠った状態を手で再現する**（受け入れ検査用）: `pmset displaysleepnow` を撃つと面が眠り、
 `virtual-display.sh status` が「眠っている」に変わる（蓋閉じで内蔵が居ない機なら

@@ -71,9 +71,8 @@
 #     設定 dir）。GUI の HOME が一時の dir なら外すだけ（claude はその HOME の `.claude` を使う）、HOME が
 #     利用者のホームのままならログの置き場の隣の一時 dir（ISOLATED_GUI_CLAUDE_CONFIG_DIR）。本物の認証で
 #     実物の claude を動かす検証だけが `CLAUDE_CONFIG_DIR="$CCD"` を並べて明示する。
-#     **HOME を本物のままにするとペインのシェルは利用者の rc を読む**ので、rc が `CLAUDE_CONFIG_DIR` を
-#     export していればペインの claude は本物の設定 dir を使う（GUI の env では止められない）。
-#     ペインの claude まで隔離するなら一時の HOME か ZDOTDIR を並べる
+#     HOME を本物のままにしたペインの zsh も #2627 以後は利用者の rc を読まない（下の節）ので、rc が
+#     `CLAUDE_CONFIG_DIR` を export していてもペインの claude へは届かない（zsh 以外のシェルは届く）
 #   - GUI の HOME（か ZDOTDIR）が利用者のホームの外で、zsh の rc が 1 つも無ければ既定の `.zshrc`
 #     （固定プロンプト。実ユーザー名・ホスト名を画面へ出さない = #927）を置く。**利用者のホームの中には書かない**
 #   クリップボードはここでは守れない（GUI のコピーは OS の汎用ペーストボードへ直に書く）ので、
@@ -86,6 +85,24 @@
 #   GUI へ渡したのと同じ発見の置き場（`ISOLATED_GUI_DISCOVERY_DIR`）を付ける。GUI へ届く
 #   `TAKO_DISCOVERY_DIR` が空なら、ログの置き場の隣の一時 dir を決めて GUI にも渡す（GUI 自身の既定は
 #   pid 入りの一時 dir で、ヘルパからは見えない）。A/B は `TAKO_2598_LEGACY=1`（呼び手の env のまま叩く）
+#
+# **隔離 GUI のペインの zsh は既定で利用者の rc を読まない**（#2627）: ペインはログイン zsh で、rc を読む
+#   dir（`ZDOTDIR`、無ければ `HOME`）が利用者のホームなら、利用者の rc（pyenv / fnm / conda の初期化）が
+#   ペインごとに走る。GUI が終わる（stop_isolated_gui の最初の kill を含む）と PTY が切れてペインへ SIGHUP が
+#   重ねて届き（zsh がジョブへ配る分と、zsh の終了でカーネルが前面のグループへ送る分）、rc の途中の処理の
+#   後片付け（`pyenv rehash` の EXIT の trap の `rm`）が 2 度目の HUP で断たれて**残骸が利用者の環境に残る**
+#   （#1556 の worker が踏んだ: pyenv の shim のロックが残り、本番のペインを含む新しいログイン zsh が 60 秒
+#   待った。後片付けの TERM / KILL は出ていない = 待ちを延ばしても直らない）。いまは rc を読む dir が
+#   利用者のホームの中（か確かめられない）なら、ログの置き場の隣の一時 dir（ISOLATED_GUI_ZDOTDIR =
+#   `<ログの dir>/isolated-zdotdir`。既定の .zshrc だけを置く）を `ZDOTDIR` として**最後に**置く
+#   （並べた `ZDOTDIR=` が利用者のホームの中でも勝つ）。
+#   呼び手の一時の HOME / ZDOTDIR（利用者のホームの外）の rc は従来どおり読む。PATH などの env は
+#   GUI の env をそのまま継ぐ（exe::find の `command -v` は継いだ PATH で引ける）。
+#   **利用者の rc が要る検証だけ** `TAKO_ISO_USER_RC=1` を並べる（export でもよい）。その行か直前の行に
+#   `# tako:user-rc-ok <理由>` を書く（理由の無い opt-in は番犬 verification_isolation_watchdog が
+#   file:line で名指す）。zsh 以外（`SHELL=/bin/bash` 等）は ZDOTDIR を読まないので、HOME が利用者の
+#   ホームのままなら stderr へ「未対策」と 1 行出す（一時の HOME を並べる）。A/B は `TAKO_2627_LEGACY=1`
+#   （export でも並べてもよい = 旧挙動: rc を読む dir に手を付けない）
 #
 # 使い方:
 #   . scripts/lib/isolated-gui.sh        # 関数として読む（直接実行はしない）
@@ -103,6 +120,9 @@
 #   launch_isolated_gui "$TMP/app.log" TAKO_AUTO_RENAME=1 TAKO_CLAUDE_BIN="$FAKE/claude"   # 自動命名を見る
 #   launch_isolated_gui "$TMP/app.log" CLAUDE_CONFIG_DIR="$CCD"   # 本物の認証で実物の claude を動かす
 #   （GUI へ渡した設定 dir は $ISOLATED_GUI_CLAUDE_CONFIG_DIR に残る。空なら一時の HOME の .claude）
+#   # tako:user-rc-ok <利用者の rc が要る理由>
+#   launch_isolated_gui "$TMP/app.log" TAKO_ISO_USER_RC=1   # ペインの zsh に利用者の rc を読ませる（#2627）
+#   （ペインの zsh へ向けた砂場は $ISOLATED_GUI_ZDOTDIR に残る。空なら向けなかった）
 #
 # **落とすのは自分で起こした pid だけ**（`pkill -f tako` / `killall tako-app` は
 #   本番 `/Applications/tako.app` にも他 worker の隔離インスタンスにも当たる。
@@ -232,7 +252,13 @@ ISOLATED_GUI_CLAUDE_CONFIG_DIR=""
 # どちらも空ならログの置き場の隣の一時 dir）。GUI はここへ接続情報（control.json）を書き、`iso_cli` が読む
 ISOLATED_GUI_DISCOVERY_DIR=""
 
-# 利用者のホーム（既定の `.zshrc` を書かない範囲。#1970）。**差し替えは番犬のモックのためだけ**
+# 直前の `launch_isolated_gui` がペインの zsh へ向けた砂場の `ZDOTDIR`（#2627。空 = 向けなかった =
+# 呼び手の一時の HOME / ZDOTDIR の rc を読む・`TAKO_ISO_USER_RC=1`・`TAKO_2627_LEGACY=1`）
+ISOLATED_GUI_ZDOTDIR=""
+
+# 利用者のホーム（既定の `.zshrc` を書かない範囲・ペインの zsh に rc を読ませない範囲。#1970 / #2627）。
+# **差し替えは番犬のモックと、実経路テストで砂場の dir を利用者のホームに見立てるためだけ**（#2627 の
+# test-isolated-gui-user-rc-2627.sh。本物の rc や ~/.pyenv を使わずに再現する）
 # （空 = パスワードの登録から引く。$HOME は検証スクリプトが差し替えていることがあるので使わない）
 ISOLATED_GUI_REAL_HOME=${ISOLATED_GUI_REAL_HOME:-}
 
@@ -459,13 +485,17 @@ iso_outside_real_home() {
     return 0
 }
 
-# GUI へ届く値（#1970）: 並べた `NAME=…` の最後 → export された値。名前は HOME / ZDOTDIR だけ
+# GUI へ届く値（#1970）: 並べた `NAME=…` の最後 → export された値。名前は HOME / ZDOTDIR / SHELL と
+# #2627 の切り替え（TAKO_ISO_USER_RC / TAKO_2627_LEGACY）だけ
 iso_gui_env() {
     local name="$1" value="" arg
     shift
     case "$name" in
         HOME) value=${HOME-} ;;
         ZDOTDIR) value=${ZDOTDIR-} ;;
+        SHELL) value=${SHELL-} ;;
+        TAKO_ISO_USER_RC) value=${TAKO_ISO_USER_RC-} ;;
+        TAKO_2627_LEGACY) value=${TAKO_2627_LEGACY-} ;;
         *) return 1 ;;
     esac
     for arg in "$@"; do
@@ -493,6 +523,45 @@ iso_default_zshrc() {
         [ -e "$dir/$f" ] && return 1
     done
     printf '%s\n' "$ISOLATED_GUI_ZSHRC" > "$dir/.zshrc" || return 1
+    return 0
+}
+
+# ペインの zsh が rc を読む dir を砂場へ向けるか（#2627）。向けるなら 0。
+#
+#   iso_user_rc_sandbox_needed [VAR=VAL …]   （launch_isolated_gui の引数をそのまま渡す）
+#
+# 向けないのは、A/B の旧挙動（`TAKO_2627_LEGACY=1`）・利用者の rc の明示の opt-in（`TAKO_ISO_USER_RC=1`）・
+# rc を読む dir（GUI へ届く ZDOTDIR、無ければ HOME。どちらも iso_gui_env の順）が利用者のホームの外
+# （呼び手の一時の dir = その rc は呼び手が置いたもの）のときだけ。利用者のホームの中か**確かめられない**
+# とき（dir が無い・ホームを引けない）は向ける側へ倒す
+iso_user_rc_sandbox_needed() {
+    local dir
+    [ "$(iso_gui_env TAKO_2627_LEGACY "$@")" = 1 ] && return 1
+    [ "$(iso_gui_env TAKO_ISO_USER_RC "$@")" = 1 ] && return 1
+    dir=$(iso_gui_env ZDOTDIR "$@")
+    [ -n "$dir" ] || dir=$(iso_gui_env HOME "$@")
+    iso_outside_real_home "$dir" && return 1
+    return 0
+}
+
+# ペインの zsh へ向ける砂場の ZDOTDIR を用意し、ISOLATED_GUI_ZDOTDIR へ置く（#2627）。
+#
+#   iso_prepare_rc_sandbox <ログの置き場>
+#
+# 置き場はログの dir の隣（呼び手が一時 dir ごと消す。isolated-claude-config と同じ）。中身は既定の
+# .zshrc だけ（初回設定メニューを出さない・実ユーザー名とホスト名を画面へ出さない = #1970 / #927）。
+# **ここは利用者の rc の置き場ではないので、ホームの中か外かを問わず書く**（ログの dir が利用者の
+# ホームの中でも、既定の .zshrc が無いと初回設定メニューが入力を食う）
+iso_prepare_rc_sandbox() {
+    local parent dir
+    ISOLATED_GUI_ZDOTDIR=""
+    parent=$(iso_phys_dir "$(dirname "${1-}")") || { iso_err "ログの置き場の dir が無い: ${1-}"; return 1; }
+    dir="$parent/isolated-zdotdir"
+    mkdir -p "$dir" || { iso_err "砂場の ZDOTDIR を作れない: $dir"; return 1; }
+    if [ ! -e "$dir/.zshrc" ]; then
+        printf '%s\n' "$ISOLATED_GUI_ZSHRC" > "$dir/.zshrc" || { iso_err "砂場の .zshrc を書けない: $dir"; return 1; }
+    fi
+    ISOLATED_GUI_ZDOTDIR=$dir
     return 0
 }
 
@@ -607,13 +676,33 @@ launch_isolated_gui() {
     fi
     ISOLATED_GUI_DISCOVERY_DIR=$discovery
 
+    # ペインの zsh に利用者の rc を読ませない（#2627）。rc を読む dir が利用者のホームの中なら砂場の
+    # ZDOTDIR を最後に置く（並べた `ZDOTDIR=` が利用者のホームの中でも、opt-in の無い限り勝たせない）
+    local -a rc_args=()
+    ISOLATED_GUI_ZDOTDIR=""
+    if iso_user_rc_sandbox_needed "$@"; then
+        iso_prepare_rc_sandbox "$log" || return 1
+        rc_args+=("ZDOTDIR=${ISOLATED_GUI_ZDOTDIR}")
+        for arg in "$@"; do
+            case "$arg" in
+                ZDOTDIR=*) echo "並べた ${arg} は利用者のホームの中（か実在しない）なので、ペインの zsh は砂場（${ISOLATED_GUI_ZDOTDIR}）の rc を読む（利用者の rc が要る検証は TAKO_ISO_USER_RC=1。#2627）" >&2 ;;
+            esac
+        done
+        local shell
+        shell=$(iso_gui_env SHELL "$@")
+        case "${shell##*/}" in
+            zsh | '') ;;
+            *) echo "未対策: SHELL=${shell} は ZDOTDIR を読まないので、ペインのシェルは利用者のホームの rc を読む（読ませないなら一時の HOME を並べる。#2627）" >&2 ;;
+        esac
+    fi
+
     # zsh の初回設定メニューが入力を食わないよう、一時の HOME へ既定の .zshrc（#1970 / #1945）
-    iso_default_zshrc "$@" || true
+    iso_default_zshrc "$@" ${rc_args[@]+"${rc_args[@]}"} || true
     # 呼び出し側が並べた `VAR=VAL` は既定より後ろ = そちらが勝つ。
-    # 検証用 GUI の印と面の指定と発見の置き場だけは最後に置く = GUI へ届くのは必ず `TAKO_ISOLATED=1` と
-    # 判定を通った面の指定（判定をすり抜ける道が増えても、印を偽にして届ける道は無い。#1760 / #1784）と、
-    # iso_cli が読むのと同じ置き場（#2598）
-    env ${drop_args[@]+"${drop_args[@]}"} ${env_args[@]+"${env_args[@]}"} "$@" "TAKO_ISOLATED=1" "TAKO_DISPLAY=${display}" ${discovery_args[@]+"${discovery_args[@]}"} "$APP_BIN" > "$log" 2>&1 &
+    # 検証用 GUI の印と面の指定と発見の置き場と砂場の ZDOTDIR だけは最後に置く = GUI へ届くのは必ず
+    # `TAKO_ISOLATED=1` と判定を通った面の指定（判定をすり抜ける道が増えても、印を偽にして届ける道は無い。
+    # #1760 / #1784）と、iso_cli が読むのと同じ置き場（#2598）と、利用者の rc を読まない ZDOTDIR（#2627）
+    env ${drop_args[@]+"${drop_args[@]}"} ${env_args[@]+"${env_args[@]}"} "$@" "TAKO_ISOLATED=1" "TAKO_DISPLAY=${display}" ${discovery_args[@]+"${discovery_args[@]}"} ${rc_args[@]+"${rc_args[@]}"} "$APP_BIN" > "$log" 2>&1 &
     ISOLATED_GUI_PID=$!
     return 0
 }
@@ -765,6 +854,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     echo "使い方: . ${0}   # source して関数を使う（直接実行する口は無い）" >&2
     echo "  isolated_gui_bins [feature…]         TAKO_BIN / APP_BIN を決め、今の木から求める feature で建てる（毎回 cargo に任せる）" >&2
     echo "  launch_isolated_gui <log> [VAR=VAL…] 仮想ディスプレイを起こして隔離 GUI を起動（用意できなければ起動せず 4・tako-vd 以外の面の指定と偽の TAKO_ISOLATED と物理画面を指す TAKO_VD_NAME は起動せず 2）" >&2
+    echo "                                       ペインの zsh は利用者の rc を読まない（読ませるのは TAKO_ISO_USER_RC=1 + # tako:user-rc-ok <理由>）" >&2
     echo "  wait_isolated_gui [log] [試行回数]    起こした GUI へ tako list が通るまで待つ（本番へは届かない）" >&2
     echo "  iso_cli <tako の引数…>               起こした GUI へだけ tako CLI を送る（本番の env を落とし、GUI と同じ発見の置き場）" >&2
     echo "  stop_isolated_gui [pid]              自分で起こした pid だけを落とし、ペインのプロセスが終わるまで待つ" >&2
