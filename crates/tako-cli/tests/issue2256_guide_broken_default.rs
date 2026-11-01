@@ -41,6 +41,14 @@ impl Env {
         if let Some(body) = default_yaml {
             std::fs::write(env.default_yaml(), body).expect("default.yaml を置ける");
         }
+        // 警告の行（見出しと理由の文）は表示言語に従う（#2365）。書かないと system = 実行環境の
+        // ロケールで決まり、英語の CI では `warning:` と英語の理由になる。このテストは日本語の文を見る
+        // （英語表示は `issue2365_profile_unreadable_cli_lang.rs` が見る）
+        std::fs::write(
+            env.dir.path().join("settings.json"),
+            "{\"language\":\"ja\"}",
+        )
+        .expect("settings.json を置ける");
         env
     }
 

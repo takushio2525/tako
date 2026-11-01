@@ -1044,8 +1044,13 @@ fn project_profile_reports(mode: Mode) -> Vec<FileReport> {
                     Ok(()) => FileOutcome::Created {
                         reason: PROFILE_AUTO_CREATED,
                     },
+                    // 移行の記録の理由は日本語（persist.log と同じ枠。`tako migrate` の理由の
+                    // 日英は移行機構のスライス = Issue #2365 の表）
                     Err(why) => FileOutcome::Failed {
-                        reason: format!("{why}。default を継承できないので作らない"),
+                        reason: format!(
+                            "{}。default を継承できないので作らない",
+                            why.text_in(tako_core::i18n::Lang::Ja)
+                        ),
                     },
                 };
                 Some(FileReport {
@@ -1069,11 +1074,17 @@ fn project_profile_reports(mode: Mode) -> Vec<FileReport> {
             // 既にある = 揃っている（記録に出さない。毎回 N 行増えるのを避ける）
             orchestrator::ProfileGen::Exists(_) => None,
             // 継承元を読めない（#1825）も同じく「中止」として記録へ残す（persist.log と通知）
-            orchestrator::ProfileGen::Skipped { reason }
-            | orchestrator::ProfileGen::NotInherited { reason } => Some(FileReport {
+            orchestrator::ProfileGen::Skipped { reason } => Some(FileReport {
                 id: SchemaId::Profiles,
                 path: PathBuf::from(format!("{key}.yaml")),
                 outcome: FileOutcome::Failed { reason },
+            }),
+            orchestrator::ProfileGen::NotInherited { reason } => Some(FileReport {
+                id: SchemaId::Profiles,
+                path: PathBuf::from(format!("{key}.yaml")),
+                outcome: FileOutcome::Failed {
+                    reason: reason.text_in(tako_core::i18n::Lang::Ja),
+                },
             }),
         })
         .collect()

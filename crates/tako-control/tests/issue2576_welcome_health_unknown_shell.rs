@@ -138,9 +138,22 @@ fn 未知のシェルのwelcomeは同じ断りで止まるコマンドを示さ�
         std::fs::set_permissions(at, std::fs::Permissions::from_mode(0o755)).expect("実行ビット");
     };
     executable(&root.join("home/.local/bin/claude"), FAKE_CLAUDE);
+    // 偽のシェルは名前ごとに 1 度だけ作り、作ったその場で 1 回起こして**終わるまで待つ**（#2644）。
+    // macOS は新しく書いた実行ファイルの初回 exec に検査を挟み（手元の実測で初回 130〜390ms・2 回目以降
+    // 4〜9ms・ファイルごと）、全体並列の負荷ではそれが確かめの上限（ログインシェルの問い合わせ 5 秒）を
+    // 越えて、段が打ち切りの「不明」（`ログインシェルが 5 秒で応答しない`）になっていた。初回の検査を
+    // 測る窓の外で払い終えてから確かめる（待つのは時間ではなく、起こした偽物が終わったこと）
     let fake = |name: &str| -> String {
         let at = root.join("fakesh").join(name);
-        executable(&at, FAKE_SHELL);
+        if !at.exists() {
+            executable(&at, FAKE_SHELL);
+            std::process::Command::new(&at)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("偽のシェルを 1 回起こせる");
+        }
         at.display().to_string()
     };
     // 確かめは claude を引けたら認証の問い合わせで起こすので、偽のシェルの下で本物を引けないことを先に確かめる

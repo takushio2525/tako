@@ -8095,7 +8095,7 @@ fn probe_needs(host: &dyn ControlHost, request: &Request) -> Option<ProbeNeeds> 
                 host.workspace(),
                 pane.map(PaneId::from_raw),
                 &None,
-                CONFLICT_RESOLVER_LABEL,
+                crate::orchestrator::CallerLaunch::ConflictResolver,
             )
             .profile;
             Some(ProbeNeeds {
@@ -15735,7 +15735,10 @@ pub fn dispatch_orchestrator_projects(
             let warnings: Vec<String> = gen
                 .warning()
                 .map(|w| {
-                    crate::diag::persist_log(&format!("[projects add] {key}: {w}"));
+                    crate::diag::persist_log(&format!(
+                        "[projects add] {key}: {}",
+                        w.text_in(Lang::Ja)
+                    ));
                     w.to_string()
                 })
                 .into_iter()
@@ -15748,7 +15751,7 @@ pub fn dispatch_orchestrator_projects(
                 "profile_path": gen.path().map(|p| p.display().to_string()),
                 "warnings": warnings,
             });
-            if let Some(reason) = gen.skip_reason() {
+            if let Some(reason) = gen.skip_reason_in(tako_core::i18n::lang()) {
                 result["profile_note"] = json!(reason);
             }
             Ok(result)
@@ -15977,7 +15980,7 @@ fn dispatch_orchestrator_adopt(
         // #1825: default を継承できずに作っていない = 採用先が無い。
         // 「見つからない」ではなく理由（直し方つき）で止め、persist.log にも残す
         if let Some(w) = gen.warning() {
-            crate::diag::persist_log(&format!("[adopt] {name}: {w}"));
+            crate::diag::persist_log(&format!("[adopt] {name}: {}", w.text_in(Lang::Ja)));
             return Err(DispatchError::Operation(w.to_string()));
         }
         generated = ProfileGenReport::of(&gen);
@@ -15993,11 +15996,13 @@ fn dispatch_orchestrator_adopt(
         name,
         &target,
     );
+    // 文は `ProfileFallback::Adopt` の 1 か所（表示言語。#2365）
     let launched_note = launched_note.map(|why| {
-        format!(
-            "{why}。起動時のプロファイル '{launched_as}' の代わりに組み込み既定と比べて採用を判断した\
-             （system prompt・master の系統の食い違いの判断が実際と違いうる）。直すと次の採用から効く"
-        )
+        orchestrator::ProfileFallback::Adopt {
+            why,
+            launched_as: launched_as.clone(),
+        }
+        .to_string()
     });
     let mut warnings = match decision {
         // 断る理由も組み込み既定と比べた結果でありうるので、読めない理由を添える
@@ -18020,7 +18025,7 @@ fn dispatch_orchestrator_self(
     });
     // 運用メモが膨らんでいたら肥大の再発なので警告する（#915 要件 3）
     let mut warnings: Vec<String> = migration.warnings.clone();
-    warnings.extend(profile_note);
+    warnings.extend(profile_note.map(|note| note.to_string()));
     warnings.extend(
         memo_content
             .as_deref()
@@ -18707,7 +18712,7 @@ fn dispatch_orchestrator_handoff(
 
     // プロファイルの読み込み（#2233: `tako master` と同じ 1 実装。読めなければ組み込み既定で
     // 立てるが黙らない = 応答の warnings・persist.log・後任の system prompt。引き継ぎは止めない）
-    let orchestrator::master_launch::LaunchProfile {
+    let orchestrator::master_launch::SuccessorProfile {
         profile,
         warning: load_warning,
     } = orchestrator::master_launch::load_successor_profile(profile_name);
@@ -18945,9 +18950,6 @@ fn dispatch_orchestrator_handoff(
     }))
 }
 
-/// コンフリクト解消エージェントの呼び名（読めないプロファイルの理由文に入る。#2256）
-const CONFLICT_RESOLVER_LABEL: &str = "コンフリクト解消エージェント";
-
 /// GitResolveAgent — コンフリクト解消エージェントの起動（#496 Part 2）。
 ///
 /// 既存の spawn 基盤（`orchestrator::agent` のコマンド構築 + 事前信頼 + PromptFlow）を
@@ -18979,7 +18981,7 @@ fn dispatch_git_resolve_agent(
         host.workspace(),
         caller_pane,
         &None,
-        CONFLICT_RESOLVER_LABEL,
+        orchestrator::CallerLaunch::ConflictResolver,
     );
     profile
         .validate_env_typed()
@@ -19136,7 +19138,9 @@ fn dispatch_git_resolve_agent(
 
     // #2256: 立てた後で 1 回だけ記録する（立てる前に断られたら「立てる」と書かない）
     if let Some(w) = &profile_warning {
-        crate::diag::persist_log(&format!("[git-resolve] pane={}: {w}", new_id.as_u64()));
+        // persist.log は日本語（応答の `warnings` は下で表示言語。#2365）
+        let ja = w.text_in(Lang::Ja);
+        crate::diag::persist_log(&format!("[git-resolve] pane={}: {ja}", new_id.as_u64()));
     }
 
     let mut v = json!({
@@ -19173,7 +19177,7 @@ fn dispatch_git_resolve_agent(
     // #2256: 呼び出し元のプロファイルを読めず組み込み既定で立てた理由（読めたときは載らない =
     // 正常時の応答は不変。GUI の「解消エージェント」ボタンもこれを画面へ出す）
     if let Some(w) = profile_warning {
-        v["warnings"] = json!([w]);
+        v["warnings"] = json!([w.to_string()]);
     }
     Ok(v)
 }
@@ -19547,8 +19551,8 @@ pub struct SpawnPlaced {
     launch: crate::orchestrator::ResolvedWorkerLaunch,
     remote_control: crate::claude_remote::RemoteControlDecision,
     account_name: Option<String>,
-    /// #2256: 呼び出し元 master のプロファイルを読めなかった理由
-    profile_warning: Option<String>,
+    /// #2256: 呼び出し元 master のプロファイルを読めなかった理由（#2365 の型。応答は表示言語・persist.log は日本語で組む）
+    profile_warning: Option<crate::orchestrator::ProfileFallback>,
     /// #2470: 読んだプロファイルの名前（レジストリへ記録する）
     caller_profile: String,
     window_title: String,
@@ -19927,11 +19931,14 @@ impl SpawnPlaced {
         // 届くまで遅くなる。理由と次の一手を応答の warnings へ載せる
         let mut launch_warnings: Vec<Value> = Vec::new();
         if let Some(w) = profile_warning {
-            crate::diag::persist_log(&format!("[spawn] pane={}: {w}", new_id.as_u64()));
+            // persist.log は日本語・応答の `message` は表示言語（#2365。表示言語はプロセス全体の値なので、
+            // この段が background で走っても UI スレッドで組んでいた頃と同じ言語になる）
+            let ja = w.text_in(Lang::Ja);
+            crate::diag::persist_log(&format!("[spawn] pane={}: {ja}", new_id.as_u64()));
             launch_warnings.push(json!({
                 "kind": "profile_unreadable",
                 "agent": worker_agent.as_str(),
-                "message": w,
+                "message": w.to_string(),
             }));
         }
         // #2412: 絞り込みが効かない / 名前が見つからないことは黙らせない（spawn は止めない）
@@ -27941,7 +27948,7 @@ fn spawn_caller_profile(
         host.workspace(),
         pane.map(PaneId::from_raw),
         &role_suffix,
-        "worker",
+        crate::orchestrator::CallerLaunch::Worker,
     );
     (role_suffix, loaded)
 }
@@ -27954,7 +27961,7 @@ fn resolve_caller_profile_with_role(
     workspace: &tako_core::Workspace,
     caller: Option<PaneId>,
     role_suffix: &Option<String>,
-    launching: &str,
+    launching: crate::orchestrator::CallerLaunch,
 ) -> crate::orchestrator::master_launch::LaunchProfile {
     // 旧形式のプロファイル・設定を実行時に検知して直す（#916 の二段構え 2 段目）。
     // 1 プロセス 1 回しか実際には走らないので、この頻繁な経路から呼んでも軽い
@@ -28562,7 +28569,7 @@ fn dispatch_orchestrator_supervisor(
                 "audit_log": log,
             });
             if let Some(note) = profile_note {
-                v["warnings"] = json!([note]);
+                v["warnings"] = json!([note.to_string()]);
             }
             Ok(v)
         }

@@ -56,7 +56,7 @@ use std::path::{Path, PathBuf};
 
 use tako_core::i18n::Lang;
 
-use crate::orchestrator::{self, Profile};
+use crate::orchestrator::{self, CallerLaunch, ConfigError, Profile, ProfileFallback};
 
 /// master を立てるための組み立て結果。**ペインを作る前に全部揃う**
 /// （組み立てで失敗したときに空のタブ / ペインを残さないため）
@@ -155,6 +155,8 @@ impl MasterLaunchPlan {
 pub fn plan(profile_name: &str) -> Result<MasterLaunchPlan, String> {
     // 読み込みは CLI と同じ 1 実装（#2227。読めない default は立てるが warning を持つ）
     let LaunchProfile { profile, warning } = load_profile(profile_name)?;
+    // スマホの「+ master」・返答の配送の起動の流れは日本語のまま（表示言語は別スライス = Issue #2365 の表）
+    let warning = warning.map(|w| w.text_in(Lang::Ja));
 
     profile.validate_env()?;
     let cwd = profile.resolve_cwd()?;
@@ -205,7 +207,18 @@ pub fn plan(profile_name: &str) -> Result<MasterLaunchPlan, String> {
 #[derive(Debug, Clone)]
 pub struct LaunchProfile {
     pub profile: Profile,
-    /// 立てるが利用者に必ず見せる理由（`None` = 黙ってよい）
+    /// 立てるが利用者に必ず見せる理由（`None` = 黙ってよい）。型で持ち、利用者へ見せる口
+    /// （CLI の警告の行・応答の `warnings`・本人の system prompt）は表示言語、persist.log は
+    /// 日本語で組む（#2365）
+    pub warning: Option<ProfileFallback>,
+}
+
+/// 引き継ぎの後任のプロファイル（[`load_successor_profile`] の結果）。後任の起動の流れの
+/// 表示言語は別スライス（Issue #2365 の表）なので、理由は日本語の文のまま持つ
+#[derive(Debug, Clone)]
+pub struct SuccessorProfile {
+    pub profile: Profile,
+    /// 立てるが前任・後任・利用者に必ず見せる理由（`None` = 黙ってよい）
     pub warning: Option<String>,
 }
 
@@ -229,9 +242,8 @@ pub fn load_profile(name: &str) -> Result<LaunchProfile, String> {
 
 /// [`load_profile`] の断りを表示言語で組む口（CLI の `tako master`。#2365）。
 ///
-/// 「見つからない」に #1825 の理由（[`orchestrator::missing_project_profile_reason`]。persist.log と
-/// 共有する日本語の文）を足す形は、枠だけ訳すと 1 つの断りに日英が混ざるので日本語のまま返す
-/// （読めないプロファイルの理由 = #2256 の系統と一緒に移す。Issue #2365 の表）
+/// 「見つからない」に #1825 の理由（[`orchestrator::missing_project_profile_reason`]）を足す形も
+/// 型（[`ConfigError::ProjectProfileMissing`]）で組むので、断りは表示言語・persist.log は日本語
 pub fn load_profile_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> {
     if legacy_profile_load() {
         let profile = match Profile::load_typed(name) {
@@ -252,7 +264,7 @@ pub fn load_profile_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> 
                 .map_err(|e| e.text_in(lang))?,
         );
         if let Some(w) = &loaded.warning {
-            crate::diag::persist_log(&format!("[master] {name}: {w}"));
+            crate::diag::persist_log(&format!("[master] {name}: {}", w.text_in(Lang::Ja)));
         }
         return Ok(loaded);
     }
@@ -263,9 +275,15 @@ pub fn load_profile_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> 
         }),
         Err(e) => match orchestrator::missing_project_profile_reason(name) {
             Some(why) => {
-                let msg = format!("{}。{why}", e.into_ja());
-                crate::diag::persist_log(&format!("[master] {name}: {msg}"));
-                Err(msg)
+                let refusal = ConfigError::ProjectProfileMissing {
+                    not_found: Box::new(e),
+                    why: Box::new(why),
+                };
+                crate::diag::persist_log(&format!(
+                    "[master] {name}: {}",
+                    refusal.text_in(Lang::Ja)
+                ));
+                Err(refusal.text_in(lang))
             }
             None => Err(e.text_in(lang)),
         },
@@ -282,15 +300,18 @@ pub fn load_profile_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> 
 ///
 /// 以前は `Profile::load(..).unwrap_or_default()` で、後任だけ個人ルールの抜けた master が
 /// 黙って立っていた（実測）。`TAKO_2233_LEGACY=1` で修正前へ戻す
-pub fn load_successor_profile(name: &str) -> LaunchProfile {
+pub fn load_successor_profile(name: &str) -> SuccessorProfile {
     if orchestrator::legacy_silent_default_rest() {
-        return LaunchProfile {
+        return SuccessorProfile {
             profile: Profile::load(name).unwrap_or_default(),
             warning: None,
         };
     }
     match load_profile(name) {
-        Ok(loaded) => loaded,
+        Ok(loaded) => SuccessorProfile {
+            profile: loaded.profile,
+            warning: loaded.warning.map(|w| w.text_in(Lang::Ja)),
+        },
         Err(e) => {
             // 前任と後任が読む文なので、どのプロファイルか・何が抜けるかまで言う
             // （パース失敗の文にはプロファイルの名前が無い）
@@ -300,7 +321,7 @@ pub fn load_successor_profile(name: &str) -> LaunchProfile {
                  後任を立てる。プロファイルを直すと次の起動から効く"
             );
             crate::diag::persist_log(&format!("[master] {name}: {w}"));
-            LaunchProfile {
+            SuccessorProfile {
                 profile: Profile::default(),
                 warning: Some(w),
             }
@@ -309,8 +330,8 @@ pub fn load_successor_profile(name: &str) -> LaunchProfile {
 }
 
 /// 呼び出し元 master のプロファイルで **master / solo 本人ではないエージェント**を立てる経路
-/// （worker の spawn・コンフリクト解消エージェント）の読み込み（#2256）。`launching` は立てるものの
-/// 名前（「worker」等。理由文に入る）。
+/// （worker の spawn・コンフリクト解消エージェント）の読み込み（#2256）。`launching` は立てるもの
+/// （理由文に入る。表示言語で組めるよう型で受ける = #2365）。
 ///
 /// 読み方は default の起動・継承元と同じ 1 実装（[`orchestrator::profile_base_at`] = 無い =
 /// 組み込み既定・空 = 設定なし・読めない = 中身を退避して理由）。読めなくても**止めずに**組み込み
@@ -320,7 +341,7 @@ pub fn load_successor_profile(name: &str) -> LaunchProfile {
 /// **ここでは記録しない**: background の先取り（`dispatch::probe_needs`）が同じ解決を通るので、
 /// persist.log と応答の `warnings` へ出すのは立てた dispatch だけにする。
 /// 以前は `Profile::load(..).unwrap_or_default()` で黙っていた。`TAKO_2256_LEGACY=1` で修正前へ戻す
-pub fn load_caller_profile(name: &str, launching: &str) -> LaunchProfile {
+pub fn load_caller_profile(name: &str, launching: CallerLaunch) -> LaunchProfile {
     if orchestrator::legacy_silent_default_2256() {
         return LaunchProfile {
             profile: Profile::load(name).unwrap_or_default(),
@@ -342,11 +363,11 @@ pub fn load_caller_profile(name: &str, launching: &str) -> LaunchProfile {
         },
         Err(why) => LaunchProfile {
             profile: kind.default_profile(),
-            warning: Some(format!(
-                "{why}。呼び出し元 master のプロファイル '{name}' の設定（worker のモデル・effort・\
-                 agent・アカウント・env・projects の制限）を使わず、組み込み既定で {launching} を\
-                 立てる。直すと次から効く"
-            )),
+            warning: Some(ProfileFallback::CallerLaunch {
+                why,
+                name: name.to_string(),
+                launching,
+            }),
         },
     }
 }
@@ -382,7 +403,7 @@ pub fn load_solo_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> {
                 .map_err(|e| e.text_in(lang))?,
         );
         if let Some(w) = &loaded.warning {
-            crate::diag::persist_log(&format!("[solo] {name}: {w}"));
+            crate::diag::persist_log(&format!("[solo] {name}: {}", w.text_in(Lang::Ja)));
         }
         return Ok(loaded);
     }
@@ -398,7 +419,7 @@ pub fn load_solo_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> {
 ///
 /// 読み方は専用プロファイルの継承元と同じ 1 実装（[`orchestrator::profile_base_at`]。
 /// 無い = 種別の組み込み既定・空 = 設定なし・読めない = 退避して `Err`）。`Err` を握りつぶさず
-/// warning にする
+/// warning にする（文は [`ProfileFallback::DefaultLaunch`] の 1 か所）
 pub fn load_default_at(kind: orchestrator::ProfileKind, path: &Path) -> LaunchProfile {
     match orchestrator::profile_base_at(kind, path) {
         Ok(profile) => LaunchProfile {
@@ -407,11 +428,7 @@ pub fn load_default_at(kind: orchestrator::ProfileKind, path: &Path) -> LaunchPr
         },
         Err(why) => LaunchProfile {
             profile: kind.default_profile(),
-            warning: Some(format!(
-                "{why}。default.yaml の個人ルール（prompt_blocks）・モデルなどの設定を使わず、\
-                 組み込み既定で {} を立てる。default.yaml を直すと次の起動から効く",
-                kind.as_str()
-            )),
+            warning: Some(ProfileFallback::DefaultLaunch { why, kind }),
         },
     }
 }
@@ -662,8 +679,9 @@ mod tests {
             let loaded = load_default_at(M, &path);
             let w = loaded
                 .warning
-                .as_deref()
-                .expect("黙って組み込み既定へ落としている");
+                .as_ref()
+                .expect("黙って組み込み既定へ落としている")
+                .text_in(Lang::Ja);
             assert!(
                 w.contains(&path.display().to_string())
                     && w.contains("組み込み既定")
@@ -703,8 +721,9 @@ mod tests {
         let loaded = load_default_at(S, &path);
         let w = loaded
             .warning
-            .as_deref()
-            .expect("黙って solo の既定へ落としている");
+            .as_ref()
+            .expect("黙って solo の既定へ落としている")
+            .text_in(Lang::Ja);
         assert!(
             w.contains(&path.display().to_string()) && w.contains("組み込み既定で solo を立てる"),
             "どのファイルか・何を立てるかが無い: {w}"

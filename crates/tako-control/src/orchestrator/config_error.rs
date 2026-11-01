@@ -15,6 +15,15 @@
 //! 型の口（`*_typed`）を通し、枠（`invalid parameter:` ほか）と中身を同じ言語にそろえる
 //! （1 つの断りの中で日英を混ぜない）。
 //! 設定ファイルの中身になる文はここに無い（断りだけ）
+//!
+//! # 読めないプロファイルの理由（#2256 の系統）
+//!
+//! 起動・継承元・表示・判定の経路がプロファイルを読めないときの理由は
+//! [`UnreadableProfile`]（`<path> を読めない（<原因>）`）を芯にし、止めずに組み込み既定で進む経路の
+//! 知らせは [`ProfileFallback`]、#1825 の「作らなかった」は [`ConfigError::ProjectProfileNotInherited`]
+//! で持つ。利用者へ返す口（応答の `warnings`・断り・CLI の警告の行・check-health）は表示言語、
+//! persist.log（日本語の診断ログ）は `text_in(Lang::Ja)` で同じ型から組む。以前は persist.log と
+//! 共有する日本語の `String` だったので、英語表示でも理由だけ日本語のまま混ざった
 
 use tako_core::i18n::Lang;
 use tako_core::load_issue::YamlReason;
@@ -120,6 +129,17 @@ pub enum ConfigError {
     HandoffKeyUnusable(String),
     /// 引き継ぎの置き場のディレクトリを作れない（`dir` は作ろうとしたパス）
     HandoffDirCreate { dir: String, error: String },
+    /// プロファイルを読めない（#2256 の系統の理由の芯。継承元・`tako migrate status` の予告が使う）
+    ProfileUnreadable(UnreadableProfile),
+    /// 継承元の default.yaml を読めないので専用プロファイル `key` を作らなかった（#1825。
+    /// `why` は読めない理由 = [`Self::ProfileUnreadable`] か置き場を決められない断り）
+    ProjectProfileNotInherited { key: String, why: Box<ConfigError> },
+    /// `tako master -<key>` の専用プロファイルが無く、その理由が #1825（作っていない）。
+    /// `not_found` は「見つからない」、`why` は [`Self::ProjectProfileNotInherited`]（#2227）
+    ProjectProfileMissing {
+        not_found: Box<ConfigError>,
+        why: Box<ConfigError>,
+    },
 }
 
 impl ConfigError {
@@ -361,6 +381,26 @@ impl ConfigError {
             (Self::HandoffDirCreate { dir, error }, En) => {
                 format!("cannot create the handoff folder: {dir} ({error})")
             }
+            (Self::ProfileUnreadable(why), _) => why.text_in(lang),
+            (Self::ProjectProfileNotInherited { key, why }, Ja) => format!(
+                "{}。default を継承できないので専用プロファイル '{key}' は作らなかった\
+                 （組み込み既定で作ると個人ルール・モデルが抜けたまま残る）。\
+                 default.yaml を直すと tako migrate run（GUI の次の起動でも自動）で作られる",
+                why.text_in(lang)
+            ),
+            (Self::ProjectProfileNotInherited { key, why }, En) => format!(
+                "{}. The dedicated profile '{key}' was not created because default cannot be \
+                 inherited (creating it from the built-in defaults would leave it without the \
+                 personal rules and model). Fix default.yaml and tako migrate run (or the next \
+                 GUI launch, automatically) creates it",
+                why.text_in(lang)
+            ),
+            (Self::ProjectProfileMissing { not_found, why }, Ja) => {
+                format!("{}。{}", not_found.text_in(lang), why.text_in(lang))
+            }
+            (Self::ProjectProfileMissing { not_found, why }, En) => {
+                format!("{}; {}", not_found.text_in(lang), why.text_in(lang))
+            }
         }
     }
 
@@ -397,5 +437,193 @@ impl From<LockError> for ConfigError {
 impl From<WriteError> for ConfigError {
     fn from(e: WriteError) -> Self {
         Self::Write(e)
+    }
+}
+
+/// 読めないプロファイルの原因（#2256 の系統。`orchestrator::read_profile_base_at` が返す）
+#[derive(Debug, Clone, PartialEq)]
+pub enum UnreadableCause {
+    /// 読み取りに失敗（OS のエラー文。言語に依らずそのまま載せる）
+    Read(String),
+    /// YAML として解釈できない（種類と位置だけ = #2230）
+    Parse(YamlReason),
+}
+
+impl UnreadableCause {
+    /// (形, 言語) の網羅 match。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Read(e), Ja) => format!("読み取りに失敗: {e}"),
+            (Self::Read(e), En) => format!("read failed: {e}"),
+            (Self::Parse(reason), _) => reason.text_in(lang),
+        }
+    }
+}
+
+/// 読めない中身を退避したか（起動の経路 = `orchestrator::profile_base_at` だけが退避する）
+#[derive(Debug, Clone, PartialEq)]
+pub enum Quarantine {
+    /// `<name>.unreadable[.<n>].bak` へ移した（退避先のパス）
+    Moved(String),
+    /// 退避できなかった（元のファイルには触っていない）
+    Failed,
+}
+
+/// 読めないプロファイル（`<path> を読めない（<原因>）`）。#2256 の系統の理由の芯で、起動・継承元・
+/// 表示・判定の経路が共有する。利用者へ見せる口（CLI / MCP / GUI）は表示言語で、persist.log は
+/// 日本語で [`Self::text_in`] を引く
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnreadableProfile {
+    /// 読もうとしたファイル
+    pub path: String,
+    pub cause: UnreadableCause,
+    /// 退避の結果（`None` = 読むだけの経路 = 退避の文を足さない）
+    pub quarantine: Option<Quarantine>,
+}
+
+impl UnreadableProfile {
+    /// (形, 言語) の網羅 match。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        let (path, cause) = (&self.path, self.cause.text_in(lang));
+        match (&self.quarantine, lang) {
+            (None, Ja) => format!("{path} を読めない（{cause}）"),
+            (None, En) => format!("cannot read {path} ({cause})"),
+            (Some(Quarantine::Moved(to)), Ja) => {
+                format!("{path} を読めない（{cause}）。中身は {to} に退避した")
+            }
+            (Some(Quarantine::Moved(to)), En) => {
+                format!("cannot read {path} ({cause}); its contents were moved to {to}")
+            }
+            (Some(Quarantine::Failed), Ja) => format!(
+                "{path} を読めない（{cause}）。退避はできなかったが default.yaml そのものには触っていない"
+            ),
+            (Some(Quarantine::Failed), En) => format!(
+                "cannot read {path} ({cause}); its contents could not be set aside, \
+                 but the file itself was not touched"
+            ),
+        }
+    }
+}
+
+/// 呼び出し元 master のプロファイルで立てるもの（[`ProfileFallback::CallerLaunch`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallerLaunch {
+    /// worker（`orchestrator spawn`）
+    Worker,
+    /// コンフリクト解消エージェント（`git resolve`）
+    ConflictResolver,
+}
+
+impl CallerLaunch {
+    pub fn text_in(self, lang: Lang) -> &'static str {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Worker, Ja) => "worker",
+            (Self::Worker, En) => "the worker",
+            (Self::ConflictResolver, Ja) => "コンフリクト解消エージェント",
+            (Self::ConflictResolver, En) => "the conflict-resolution agent",
+        }
+    }
+}
+
+/// 読めないプロファイルの代わりに組み込み既定で立てた / 答えた / 判断したことの知らせ
+/// （#2227 / #2233 / #2256）。理由（[`UnreadableProfile`]）に、何を既定で代えたかと直すと
+/// いつ効くかを足す。止めずに進む経路の `warnings`・CLI の警告の行・persist.log が同じ文を引く
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProfileFallback {
+    /// 読めない default.yaml の代わりに組み込み既定で master / solo を立てる（#2227 / #2233）
+    DefaultLaunch {
+        why: UnreadableProfile,
+        kind: ProfileKind,
+    },
+    /// 呼び出し元 master のプロファイル `name` の代わりに組み込み既定で `launching` を立てる（#2256）
+    CallerLaunch {
+        why: UnreadableProfile,
+        name: String,
+        launching: CallerLaunch,
+    },
+    /// 起動時のプロファイル `launched_as` の代わりに組み込み既定と比べて採用を判断した（#2256）
+    Adopt {
+        why: UnreadableProfile,
+        launched_as: String,
+    },
+    /// 手順書を組み込み既定で組み立て、個人ルールの on-demand 部は読めていない（#2256）
+    Guide(UnreadableProfile),
+    /// 表示している値は組み込み既定（`orchestrator self` / `supervisor status` ほか。#2233）
+    Display(UnreadableProfile),
+}
+
+impl ProfileFallback {
+    /// (バリアント, 言語) の網羅 match。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::DefaultLaunch { why, kind }, Ja) => format!(
+                "{}。default.yaml の個人ルール（prompt_blocks）・モデルなどの設定を使わず、\
+                 組み込み既定で {} を立てる。default.yaml を直すと次の起動から効く",
+                why.text_in(lang),
+                kind.as_str()
+            ),
+            (Self::DefaultLaunch { why, kind }, En) => format!(
+                "{}. Starting the {} on tako's built-in defaults, without the personal rules \
+                 (prompt_blocks), model and other settings in default.yaml. Fix default.yaml \
+                 and it takes effect from the next launch",
+                why.text_in(lang),
+                kind.as_str()
+            ),
+            (Self::CallerLaunch { why, name, launching }, Ja) => format!(
+                "{}。呼び出し元 master のプロファイル '{name}' の設定（worker のモデル・effort・\
+                 agent・アカウント・env・projects の制限）を使わず、組み込み既定で {} を\
+                 立てる。直すと次から効く",
+                why.text_in(lang),
+                launching.text_in(lang)
+            ),
+            (Self::CallerLaunch { why, name, launching }, En) => format!(
+                "{}. Starting {} on tako's built-in defaults, without the settings of the \
+                 calling master's profile '{name}' (the worker's model, effort, agent, account, \
+                 env and projects limit). Fix it and it takes effect from the next time",
+                why.text_in(lang),
+                launching.text_in(lang)
+            ),
+            (Self::Adopt { why, launched_as }, Ja) => format!(
+                "{}。起動時のプロファイル '{launched_as}' の代わりに組み込み既定と比べて採用を判断した\
+                 （system prompt・master の系統の食い違いの判断が実際と違いうる）。直すと次の採用から効く",
+                why.text_in(lang)
+            ),
+            (Self::Adopt { why, launched_as }, En) => format!(
+                "{}. The adoption was judged against tako's built-in defaults instead of the \
+                 launch profile '{launched_as}' (the judgment of a system prompt or master agent \
+                 mismatch may differ from reality). Fix it and it takes effect from the next adoption",
+                why.text_in(lang)
+            ),
+            (Self::Guide(why), Ja) => format!(
+                "{}。手順書の値（引き継ぎの閾値など）はこのファイルではなく組み込み既定で組み立てた。\
+                 個人ルールの on-demand 部（local-rules）は読めていない。直すと次の呼び出しから効く",
+                why.text_in(lang)
+            ),
+            (Self::Guide(why), En) => format!(
+                "{}. The guide's values (such as the handoff threshold) were built from tako's \
+                 built-in defaults, not from this file, and the on-demand part of the personal \
+                 rules (local-rules) could not be read. Fix it and it takes effect from the next call",
+                why.text_in(lang)
+            ),
+            (Self::Display(why), Ja) => format!(
+                "{}。表示している値はこのファイルではなく組み込み既定。直すと次の呼び出しから効く",
+                why.text_in(lang)
+            ),
+            (Self::Display(why), En) => format!(
+                "{}. The values shown are tako's built-in defaults, not this file's. Fix it and \
+                 it takes effect from the next call",
+                why.text_in(lang)
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ProfileFallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
     }
 }

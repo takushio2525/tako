@@ -5358,6 +5358,8 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         profile,
         warning: load_warning,
     } = orchestrator::master_launch::load_profile_in(profile_name, lang)?;
+    // 理由は表示言語で（`警告:` 行と本人の system prompt の両方。persist.log は日本語で書き済み。#2365）
+    let load_warning = load_warning.map(|w| w.text_in(lang));
     if let Some(w) = &load_warning {
         eprintln!("{}: {w}", ReplyNote::WarningLabel.text_in(lang));
     }
@@ -5611,6 +5613,8 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         profile,
         warning: load_warning,
     } = orchestrator::master_launch::load_solo_in(profile_name, lang)?;
+    // 理由は表示言語で（`警告:` 行と本人の system prompt の両方。persist.log は日本語で書き済み。#2365）
+    let load_warning = load_warning.map(|w| w.text_in(lang));
     if let Some(w) = &load_warning {
         eprintln!("{}: {w}", ReplyNote::WarningLabel.text_in(lang));
     }
@@ -6083,7 +6087,7 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
                 _ => {}
             }
             for w in &warnings {
-                eprintln!("警告: {w}");
+                eprintln!("{}: {w}", ReplyNote::WarningLabel.text_in(cli_lang()));
             }
             Ok(())
         }
@@ -7493,7 +7497,7 @@ fn orchestrator_guide_local(
     // #2256: 読めないプロファイルで既定値から組み立てたことは画面にも出す（本文は stdout のまま）
     for w in out["warnings"].as_array().into_iter().flatten() {
         if let Some(w) = w.as_str() {
-            eprintln!("警告: {w}");
+            eprintln!("{}: {w}", ReplyNote::WarningLabel.text_in(cli_lang()));
         }
     }
     if as_json {

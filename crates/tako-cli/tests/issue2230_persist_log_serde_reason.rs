@@ -213,6 +213,9 @@ fn profileの型違いの値をpersist_logとpromptへ載せない() {
     for legacy in [true, false] {
         let env = Env::new();
         env.put("orchestrator/profiles/default.yaml", body.as_bytes());
+        // 警告の行と system prompt の理由は表示言語に従う（#2365）。このテストは日本語の位置の文を
+        // 見るので日本語表示で回す（書かないと英語の CI では英語の理由になる）
+        env.put("settings.json", b"{\"language\":\"ja\"}");
         let added = env.add_project(legacy);
         let master = env.master(legacy);
         let report = env.migrate("run", legacy);

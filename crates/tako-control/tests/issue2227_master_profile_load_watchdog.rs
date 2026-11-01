@@ -650,7 +650,7 @@ fn scan_cli(src: &str) -> Vec<Offender> {
         &[Rule {
             fn_needle: "fn orchestrator_guide_local(",
             needs: &[(
-                "eprintln!(\"警告: {w}\")",
+                "eprintln!(\"{}: {w}\", ReplyNote::WarningLabel",
                 "guide が読めないプロファイルの理由を `警告:` 行で画面へ出していない（#2256）",
             )],
             bans: &[],
@@ -696,7 +696,7 @@ fn scan_dispatch(src: &str) -> Vec<Offender> {
         ),
         (
             "fn dispatch_orchestrator_self(",
-            "warnings.extend(profile_note)",
+            "warnings.extend(profile_note",
             "self が読めない理由を `warnings` へ出していない（#2233）",
         ),
         (
@@ -781,7 +781,7 @@ fn scan_dispatch(src: &str) -> Vec<Offender> {
                         "解消エージェントが読み込みの warning を受け取っていない（#2256）",
                     ),
                     (
-                        "v[\"warnings\"] = json!([w]);",
+                        "v[\"warnings\"] = json!([w.to_string()]);",
                         "解消エージェントが既定で立てた理由を応答の `warnings` へ載せていない（#2256）",
                     ),
                     (
@@ -1177,7 +1177,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: DISPATCH,
             fn_needle: "fn dispatch_orchestrator_self(",
-            from: "warnings.extend(profile_note);",
+            from: "warnings.extend(profile_note.map(|note| note.to_string()));",
             to: "let _ = profile_note;",
             marker: "fn dispatch_orchestrator_self(",
         },
@@ -1193,7 +1193,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: DISPATCH,
             fn_needle: "fn dispatch_orchestrator_supervisor(",
-            from: "v[\"warnings\"] = json!([note]);",
+            from: "v[\"warnings\"] = json!([note.to_string()]);",
             to: "let _ = note;",
             marker: "fn dispatch_orchestrator_supervisor(",
         },
@@ -1225,7 +1225,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: LAUNCH,
             fn_needle: "pub fn load_solo_in(",
-            from: "crate::diag::persist_log(&format!(\"[solo] {name}: {w}\"));",
+            from: "crate::diag::persist_log(&format!(\"[solo] {name}: {}\", w.text_in(Lang::Ja)));",
             to: "let _ = w;",
             marker: "pub fn load_solo_in(",
         },
@@ -1274,8 +1274,8 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: LAUNCH,
             fn_needle: "pub fn load_caller_profile(",
-            from: "warning: Some(format!(",
-            to: "warning: None, _w: (format!(",
+            from: "warning: Some(ProfileFallback::CallerLaunch {",
+            to: "warning: None, _w: (ProfileFallback::CallerLaunch {",
             marker: "pub fn load_caller_profile(",
         },
         // 注入 26: spawn の呼び出し元の解決が修正前そのもの
@@ -1298,7 +1298,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: DISPATCH,
             fn_needle: "fn record(self) -> SpawnRecorded",
-            from: "crate::diag::persist_log(&format!(\"[spawn] pane={}: {w}\", new_id.as_u64()));",
+            from: "crate::diag::persist_log(&format!(\"[spawn] pane={}: {ja}\", new_id.as_u64()));",
             to: "let _ = &w;",
             marker: "fn record(self) -> SpawnRecorded",
         },
@@ -1306,7 +1306,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: DISPATCH,
             fn_needle: "fn dispatch_git_resolve_agent(",
-            from: "v[\"warnings\"] = json!([w]);",
+            from: "v[\"warnings\"] = json!([w.to_string()]);",
             to: "let _ = w;",
             marker: "fn dispatch_git_resolve_agent(",
         },
@@ -1314,7 +1314,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: DISPATCH,
             fn_needle: "fn dispatch_git_resolve_agent(",
-            from: "crate::diag::persist_log(&format!(\"[git-resolve] pane={}: {w}\", new_id.as_u64()));",
+            from: "crate::diag::persist_log(&format!(\"[git-resolve] pane={}: {ja}\", new_id.as_u64()));",
             to: "let _ = w;",
             marker: "fn dispatch_git_resolve_agent(",
         },
@@ -1386,7 +1386,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: CLI,
             fn_needle: "fn orchestrator_guide_local(",
-            from: "eprintln!(\"警告: {w}\");",
+            from: "eprintln!(\"{}: {w}\", ReplyNote::WarningLabel.text_in(cli_lang()));",
             to: "let _ = w;",
             marker: "fn orchestrator_guide_local(",
         },
