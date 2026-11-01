@@ -14,6 +14,7 @@ use std::process::ExitCode;
 
 use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
+use tako_core::i18n::LangSetting;
 use tako_core::{Pane, PaneId, PaneOrigin, SpawnOptions, TerminalSession, Workspace};
 
 use tako_control::{
@@ -24,6 +25,8 @@ use tako_control::{
 /// セッションを持たないヘッドレスホスト（dispatch の検証用）
 struct HeadlessHost {
     workspace: Workspace,
+    /// 表示言語の設定値（`tako lang`。GUI と同じく切り替えをその場でグローバルへ反映する。#2365）
+    lang_setting: LangSetting,
 }
 
 impl WorkspaceHost for HeadlessHost {
@@ -50,7 +53,15 @@ impl SessionHost for HeadlessHost {
 }
 
 impl TmuxHost for HeadlessHost {}
-impl UiStateHost for HeadlessHost {}
+impl UiStateHost for HeadlessHost {
+    fn ui_lang_setting(&self) -> LangSetting {
+        self.lang_setting
+    }
+    fn set_ui_lang(&mut self, setting: LangSetting, resolved: tako_core::i18n::Lang) {
+        self.lang_setting = setting;
+        tako_core::i18n::set_lang(resolved);
+    }
+}
 impl PreviewHost for HeadlessHost {}
 impl WebViewHost for HeadlessHost {}
 impl RemoteHost for HeadlessHost {}
@@ -62,6 +73,10 @@ fn main() -> ExitCode {
         eprintln!("usage: mcp_host <command> [args...]");
         return ExitCode::from(2);
     }
+    // 表示言語は GUI と同じく設定から決める（#2365。決めないと静的既定 = 英語のまま、
+    // 口の既定の断り `HostRefusal::Default*` も dispatch の理由の文も設定に従わない）
+    let lang_setting = tako_control::settings::peek_lang_setting();
+    tako_core::i18n::set_lang(lang_setting.resolve());
 
     let (tx, mut rx) = unbounded::<IncomingRequest>();
     let token = tako_control::generate_token().expect("CSPRNG は使える前提の検証ツール");
@@ -70,6 +85,7 @@ fn main() -> ExitCode {
 
     let mut host = HeadlessHost {
         workspace: Workspace::new("1", Pane::new(PaneOrigin::User)),
+        lang_setting,
     };
     let root_pane = host.workspace.active_tab().tree().focused();
     let tab_id = host.workspace.active_tab_id();
