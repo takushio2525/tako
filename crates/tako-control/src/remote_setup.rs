@@ -199,6 +199,8 @@ pub fn configure_serve(cli: &str) -> Result<ServeStep, String> {
         crate::platform::local_endpoint::EndpointSpec::Loopback => return Ok(ServeStep::Deferred),
         crate::platform::local_endpoint::EndpointSpec::Unix(path) => path,
     };
+    // #2619: 隔離中（TAKO_ISOLATED）は本物の tailscale の serve を張らない
+    crate::remote_isolated_serve::check().map_err(|r| r.to_string())?;
     let target = tailscale::proxy_target_for_socket(&sock);
     match tailscale::serve_state(cli).map_err(|e| format!("serve 状態の取得に失敗: {e}"))? {
         ServeState::Proxy(ref existing) if *existing == target => {

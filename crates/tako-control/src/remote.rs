@@ -1825,6 +1825,9 @@ fn setup_incomplete_error(status: &crate::tailscale::SetupStatus) -> io::Error {
 fn establish_tailscale_serve(
     endpoint: &local_endpoint::Endpoint,
 ) -> io::Result<(crate::tailscale::ServeHandle, String)> {
+    // #2619: daemon の中の最後の守り（`tako remote serve` を直に起こした隔離の砂場）。
+    // 起動の入口 `spawn_daemon` が先に断るので、ここで断るのは入口を通らない起動だけ
+    crate::remote_isolated_serve::check().map_err(|r| io::Error::other(r.to_string()))?;
     let status = crate::tailscale::setup_status();
     if !status.ready() {
         return Err(setup_incomplete_error(&status));
@@ -3869,6 +3872,14 @@ pub fn spawn_daemon() -> Result<Value, String> {
     // #2533: 誰が・どの経路で起こしたかを残す（初回の起動では置き場がまだ無いので作っておく）
     let _ = ensure_state_dir();
     audit_daemon_request("daemon_start_requested", "start", None);
+    // #2619: 隔離中（TAKO_ISOLATED）は本物の tailscale の serve を張らない。serve はこの機械の
+    // ノード単位の状態で砂場の外にあり、起こした daemon は既定の tailscale へ張る（本番の公開と
+    // 同じノードなら、本番の待ち受けを「前回のポートの残骸」と読んで張り替える）。子を起こす前・
+    // 印を置く前に断る（検証モード・偽の tailscale・明示の opt-in は通す = `remote_isolated_serve`）
+    if let Err(refusal) = crate::remote_isolated_serve::check() {
+        audit_daemon_request("isolated_serve_refused", "start", None);
+        return Err(refusal.to_string());
+    }
     // #2613: 別の起動が daemon を起こしている途中（#2608 の印が効いている）なら、2 本目を起こさずに断る。
     // 見るのは状態を読むより前: 区間内の start は、入れ替えの途中の旧版を自分も「入れ替える相手」と
     // 読んで止めに行き子を起こす（daemon が 2 本になり、PID ファイルに載らない 1 本が残る）か、
