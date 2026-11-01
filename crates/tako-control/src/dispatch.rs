@@ -20716,6 +20716,9 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
     // 提案が出ているあいだ倒せず本番 pane 1636 / 1761 / 1775 / 1784 のように
     // 永久 busy になる。属性が取れない経路（素の tmux capture）では従来どおり
     // 文字列判定へ落ち、倒せなかった理由を `idle_override_blocked` に残す
+    //
+    // #1721: 狭いペインでは claude が申告の行を内訳の途中で折り返すので、判定は折り返しを
+    // つないで読む。それでも読めず状態行が幅で切れていれば `status_line_truncated` を残す
     let mut idle_despite_primary_busy = false;
     let mut idle_override_blocked: Option<&'static str> = None;
     if status == "busy" && agents_authoritative && has_children {
@@ -41944,6 +41947,246 @@ mod tests {
         let prose = I1273_IDLE_WITH_BACKGROUND.replace(
             "✻ Worked for 1m 11s · done 2:54 PM · 1 shell, 1 monitor still running",
             "⏺ ビルド · the dev server is still running",
+        );
+        assert_eq!(
+            crate::orchestrator::wait::background_work_summary(&prose),
+            None
+        );
+    }
+
+    // --- #1721: 狭いペインで申告の行が折り返されても背景作業つき入力待ちを idle と読む ---
+    //
+    // 写しは実採取（2026-11-01 / claude 2.1.301・一時の設定 dir + 偽 Messages API・器あり・
+    // 隔離 GUI）。mod を載せない claude（一次シグナル = `claude agents --json`）に背景の
+    // `sleep` を残してターンを終わらせた画面。修正前の実測は 36 桁・24 桁とも
+    // `busy / agents-auto / idle_override_blocked: null / background_work: null`、
+    // 同じ手順の 124 桁は `idle / idle_despite_primary_busy: true / background_work: "1 shell"`。
+    // 写しは採取した行のまま（ターンの終わりの行と入力欄のあいだの空行だけ 1 行に詰めた）
+
+    /// 36 桁: 内訳が `· 1` と `shell still running` に割れる（どちらの行も申告の形にならない）
+    const I1721_IDLE_36: &str = "\
+❯ Run in background: sleep 1700
+
+  Ran 1 shell command
+
+⏺ RUN-DONE
+
+✻ Crunched for 0s · done 6:12 PM · 1
+  shell still running
+
+────────────────────────────────────
+❯
+────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · ← f…";
+
+    /// 24 桁: 3 行に折り返し、状態行は `…` も無く名詞ごと落ちる（Issue の `· 1` と同じ形）
+    const I1721_IDLE_24: &str = "\
+❯ Run in background:
+  sleep 1700
+
+  Ran 1 shell command
+
+⏺ RUN-DONE
+
+✻ Brewed for 0s · done
+  6:16 PM · 1 shell
+  still running
+
+────────────────────────
+❯
+────────────────────────
+  ⏵⏵ auto mode on · 1";
+
+    /// 50 桁（tako の帯つき）: `still` と `running` のあいだで折り返す
+    const I1721_IDLE_50: &str = "\
+❯ Run in background: sleep 1700
+
+  Ran 1 shell command
+
+⏺ RUN-DONE
+
+✻ Brewed for 0s · done 6:10 PM · 1 shell still
+  running
+
+tako | pane 2 | tab 2 [ compact ]             [-]
+
+──────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · ← for agents · ↓ …";
+
+    /// 受け入れ条件 2: 実採取の狭い画面 3 枚がすべて idle に倒れ、内訳も読める
+    #[test]
+    fn issue1721_折り返した申告でも背景作業つき入力待ちはidleになる() {
+        for (cols, screen) in [
+            (36, I1721_IDLE_36),
+            (24, I1721_IDLE_24),
+            (50, I1721_IDLE_50),
+        ] {
+            let mut r = i1273_resolved(screen);
+            r.status_source = "agents-auto".into();
+            let v = apply_worker_status_corrections(r).unwrap();
+            assert_eq!(v["status"], "idle", "{cols} 桁: {v}");
+            assert_eq!(v["idle_despite_primary_busy"], true, "{cols} 桁");
+            assert_eq!(v["background_work"], "1 shell", "{cols} 桁");
+            assert_eq!(v["idle_override_blocked"], Value::Null, "{cols} 桁");
+            // 一次シグナルの出所は偽らない（watch の need_streak は 3 のまま）
+            assert_eq!(v["status_source"], "agents-auto", "{cols} 桁");
+        }
+    }
+
+    /// A/B: 同じ画面を修正前の読み方（つながない）で読むと申告が取れない = 実測の修正前
+    /// （`background_work: null` → 覆す根拠が無い）。env で判定ごと戻す A/B は
+    /// `tests/issue1721_legacy_ab.rs`
+    #[test]
+    fn issue1721_legacyでは同じ画面を覆せない() {
+        let claude = Some(tako_core::agent_support::Agent::Claude);
+        for screen in [I1721_IDLE_36, I1721_IDLE_24, I1721_IDLE_50] {
+            assert_eq!(
+                crate::orchestrator::wait::background_work_summary_with(
+                    screen, claude, false, true
+                ),
+                None,
+                "{screen}"
+            );
+            assert_eq!(
+                crate::orchestrator::wait::background_work_summary_with(
+                    screen, claude, false, false
+                )
+                .as_deref(),
+                Some("1 shell")
+            );
+            let fixed = crate::orchestrator::wait::input_waiting_with_background_work_in(
+                screen, false, claude, None, false, false,
+            );
+            assert_eq!(fixed.overriding(), Some("1 shell"));
+        }
+    }
+
+    /// 36 桁で**次のターンを生成中**（実採取・mod なし）。前のターンの申告が折り返したまま残り、
+    /// スピナーは `✳ Gitifying…` だけ（経過時間も `esc to interrupt` も落ちる）
+    const I1721_BUSY_36: &str = "\
+⏺ RUN-DONE
+
+✻ Crunched for 0s · done 6:20 PM · 1
+  shell still running
+
+❯ Reply slowly: 60
+
+✳ Gitifying…
+  ⎿  Tip: Running multiple Claude
+     sessions? Press ← on an empty
+     prompt to see them all in one
+     place
+
+────────────────────────────────────
+❯
+────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · esc…";
+
+    /// 同じく生成中（実採取・mod あり = tako の帯つき）
+    const I1721_BUSY_36_MOD: &str = "\
+⏺ RUN-DONE
+
+✻ Sautéed for 0s · done 6:20 PM · 1
+  shell still running
+
+❯ Reply slowly: 60
+
+· Wrangling…
+  ⎿  Tip: Start with small features
+     or bug fixes, tell Claude to
+     propose a plan, and verify its
+     suggested edits
+tako | pane 2 [ compact ]       [-]
+
+────────────────────────────────────
+❯
+────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell · esc…";
+
+    /// 受け入れ条件 2: スピナーの行がある狭い画面は修正前と同じく busy。
+    /// 前のターンの折り返した申告をつないで読んでも、下に次の依頼とスピナーがあるので採らない
+    /// （ガードを外した版の実測は mod あり / なしとも偽 idle = `idle_despite_primary_busy: true`）
+    #[test]
+    fn issue1721_生成中の狭い画面は前のターンの申告で覆さない() {
+        for (source, screen) in [("agents-auto", I1721_BUSY_36), ("mod", I1721_BUSY_36_MOD)] {
+            let mut r = i1273_resolved(screen);
+            r.status_source = source.into();
+            let v = apply_worker_status_corrections(r).unwrap();
+            assert_eq!(v["status"], "busy", "{source}: {v}");
+            assert_eq!(v["idle_despite_primary_busy"], false, "{source}");
+            // 状態行（`esc to interrupt` を載せる行）が切れているので、決められない理由はそれ
+            assert_eq!(
+                v["idle_override_blocked"], "status_line_truncated",
+                "{source}"
+            );
+            // 修正前の読み方でも申告は取れない（= 修正前と同じ busy）
+            assert_eq!(
+                crate::orchestrator::wait::background_work_summary_with(
+                    screen,
+                    Some(tako_core::agent_support::Agent::Claude),
+                    false,
+                    true,
+                ),
+                None
+            );
+        }
+    }
+
+    /// 申告まで切れて読めない狭い画面は覆さず、理由を `status_line_truncated` で残す
+    /// （24 桁の写しのターンの終わりの行を `…` で切った変種 = 折り返さず切る版の claude が来ても安全側）
+    #[test]
+    fn issue1721_申告が切れて読めなければ理由を残してbusyのまま() {
+        for screen in [
+            I1721_IDLE_24.replace("  6:16 PM · 1 shell\n  still running", "  6:16 PM · 1 sh…"),
+            I1721_IDLE_36.replace(
+                "✻ Crunched for 0s · done 6:12 PM · 1\n  shell still running",
+                "✻ Crunched for 0s · done 6:12 PM · …",
+            ),
+        ] {
+            let mut r = i1273_resolved(&screen);
+            r.status_source = "agents-auto".into();
+            let v = apply_worker_status_corrections(r).unwrap();
+            assert_eq!(v["status"], "busy", "{screen}");
+            assert_eq!(v["idle_despite_primary_busy"], false);
+            assert_eq!(v["background_work"], Value::Null);
+            assert_eq!(
+                v["idle_override_blocked"], "status_line_truncated",
+                "{screen}"
+            );
+        }
+    }
+
+    /// 状態行が切れていなければ理由は名指さない（広いペインで申告が無い = 従来どおり null）
+    #[test]
+    fn issue1721_状態行が切れていなければ理由はnullのまま() {
+        let without = I1273_IDLE_WITH_BACKGROUND
+            .replace(" · 1 shell, 1 monitor still running", "")
+            .replace(" · 1 shell, 1 monitor · ← for agents", " · ← for agents");
+        let v = apply_worker_status_corrections(i1273_resolved(&without)).unwrap();
+        assert_eq!(v["status"], "busy");
+        assert_eq!(v["idle_override_blocked"], Value::Null);
+    }
+
+    /// 入力欄に人の下書きがある狭い画面は覆さない（#1273 の安全側は折り返しでも同じ）
+    #[test]
+    fn issue1721_狭い画面でも下書きがあれば覆さない() {
+        let drafted = I1721_IDLE_36.replace("\n❯\n", "\n❯ draft by human\n");
+        let mut r = i1273_resolved(&drafted);
+        r.input_style = Some(tako_core::InputStyle::User);
+        let v = apply_worker_status_corrections(r).unwrap();
+        assert_eq!(v["status"], "busy");
+        assert_eq!(v["idle_despite_primary_busy"], false);
+    }
+
+    /// 本文の段落が折り返して `· 3 shells` / `  still running` に割れても、行頭が字下げなしの
+    /// 頭から続いていなければつながない・つないでも内訳の形でなければ拾わない
+    #[test]
+    fn issue1721_折り返しをつないでも本文は申告と読まない() {
+        let prose = I1721_IDLE_36.replace(
+            "✻ Crunched for 0s · done 6:12 PM · 1\n  shell still running",
+            "⏺ the build · step three is\n  still running",
         );
         assert_eq!(
             crate::orchestrator::wait::background_work_summary(&prose),

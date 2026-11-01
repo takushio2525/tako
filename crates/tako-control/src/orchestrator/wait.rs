@@ -1587,9 +1587,9 @@ fn looks_like_background_items(summary: &str) -> bool {
 /// **系統は画面から見分ける**（#984 の `detect_screen_agent`）。呼び出し側が
 /// レジストリの宣言を持っているなら [`background_work_summary_for`] へ渡すほうが正確。
 ///
-/// **狭いペインでは取れない**: どの CLI もこの行をペイン幅で `…` に切るので、
-/// 申告ごと落ちると `None` になる（#1015 と同じ制約）。取れないときは
-/// 呼び出し側が従来どおり一次シグナルを信じる = 安全側に倒れる
+/// **狭いペイン**: claude はこの行を 2 桁の字下げで折り返すので、つないで読む（#1721）。
+/// 幅で `…` に切られて申告ごと落ちると `None` になる（#1015 と同じ制約。codex / agy は
+/// 自分で切る）。取れないときは呼び出し側が従来どおり一次シグナルを信じる = 安全側に倒れる
 pub fn background_work_summary(output: &str) -> Option<String> {
     background_work_summary_for(output, detect_screen_agent(output))
 }
@@ -1619,30 +1619,210 @@ pub(crate) fn background_work_summary_in(
     agent: Option<Agent>,
     legacy: bool,
 ) -> Option<String> {
+    background_work_summary_with(output, agent, legacy, legacy_1721())
+}
+
+/// [`background_work_summary_in`] に #1721 の A/B（折り返しをつないで読むか）も引数で渡す版。
+/// **判断を引数に置く**ので env グローバルを触らずに新旧どちらも検査できる
+/// （結合テストの番犬からも呼ぶので公開している）
+pub fn background_work_summary_with(
+    output: &str,
+    agent: Option<Agent>,
+    legacy: bool,
+    legacy_wrap: bool,
+) -> Option<String> {
     // 旧挙動: 系統を問わず claude の状態行だけを読む（codex / agy は常に None）
     if legacy {
-        return claude_background_work_summary(output);
+        return claude_background_work_summary_in(output, legacy_wrap);
     }
     match agent {
         Some(Agent::Codex) => codex_background_work_summary(output),
         Some(Agent::Agy) => agy_background_work_summary(output),
         // claude と**系統不明**は claude の状態行を読む（#1273 から挙動不変）。
         // ローカル LLM（#991）は系統そのものが成立していないので同じ扱い
-        _ => claude_background_work_summary(output),
+        _ => claude_background_work_summary_in(output, legacy_wrap),
     }
 }
 
-/// claude の状態行から内訳を読む（#1273 の実装。**挙動は変えない**）
-fn claude_background_work_summary(output: &str) -> Option<String> {
-    tail_lines(output, BUSY_STRONG_TAIL)
+/// claude の状態行から内訳を読む（#1273 の実装 + #1721 の折り返し）。
+///
+/// 1 行に収まった申告は #1273 の読み方のまま（**挙動は変えない**）。読めなかったときだけ、
+/// 狭いペインで claude が折り返した行をつなぎ直して同じ読み方を当てる（#1721）。
+/// `legacy_wrap = true`（`TAKO_1721_LEGACY=1`）でつなぎ直しをしない = 修正前
+pub(crate) fn claude_background_work_summary_in(output: &str, legacy_wrap: bool) -> Option<String> {
+    let one_line = tail_lines(output, BUSY_STRONG_TAIL)
         .iter()
-        .find_map(|line| {
-            let head = line.rsplit_once(BACKGROUND_STILL_RUNNING)?.0;
-            // 状態行の組み立ては ` · <内訳> still running`。
-            // **区切りが無い行は本文とみなす**（`rsplit_once` は `·` が無ければ None）
-            let summary = head.rsplit_once('·')?.1.trim();
-            looks_like_background_items(summary).then(|| summary.to_string())
-        })
+        .find_map(|line| background_declaration(line));
+    if one_line.is_some() || legacy_wrap {
+        return one_line;
+    }
+    // 下の行から見る（1 行の読み方の `tail_lines` と同じ向き = 画面のいちばん新しい申告を採る）。
+    // **申告が画面の最後のメッセージであること**も求める（前のターンの申告を読まない）
+    let lines: Vec<&str> = output.lines().collect();
+    claude_wrapped_lines(output)
+        .iter()
+        .rev()
+        .filter(|(_, end)| nothing_after_turn_end(&lines, *end))
+        .find_map(|(line, _)| background_declaration(line))
+}
+
+/// ターンの終わりの行（物理行 `end` で終わる）より下、入力欄までに claude の新しい
+/// メッセージが無いか（#1721）。
+///
+/// ## なぜ要るか
+///
+/// 狭いペインでは**生成中の目印も切れる**。実採取（claude 2.1.301・36 桁・次のターンを生成中）:
+///
+/// ```text
+/// ✻ Crunched for 0s · done 6:20 PM · 1     ← 前のターンの申告（折り返し）
+///   shell still running
+///
+/// ❯ Reply slowly: 60                       ← 次のターンの依頼
+///
+/// ✳ Gitifying…                             ← スピナー（経過時間と `esc to interrupt` が落ちる）
+///   ⎿  Tip: Running multiple Claude
+/// ────────────────────────────────────
+/// ❯
+/// ────────────────────────────────────
+///   ⏵⏵ auto mode on · 1 shell · esc…       ← `esc to interrupt` も `…` で切れる
+/// ```
+///
+/// `screen_looks_busy` はこの画面で何も引けない。前のターンの申告をつないで読むと
+/// **生成中を入力待ちと誤報する**（つなぐ前は読めなかったので busy のままだった）。
+/// claude は申告をターンが終わったときにしか描かないので、申告が入力欄の直前の
+/// メッセージである（下に依頼 `❯ …` もスピナーも無い）ことまで見れば取り違えない。
+///
+/// 間に置いてよいのは空行・入力欄の枠（`─` だけの行）・英数字で始まる行（tako mod の帯
+/// `tako | pane 2 [ compact ] [-]`）だけ。claude のメッセージの頭（`❯` / `⏺` / スピナーの印）と
+/// その字下げの続き（`⎿  Tip:` 等）があれば前のターンの申告とみなす。語ではなく形で見る（#1015）
+fn nothing_after_turn_end(lines: &[&str], end: usize) -> bool {
+    let Some(input) = lines.iter().rposition(|l| l.trim_start().starts_with('❯')) else {
+        return false;
+    };
+    if input <= end {
+        return false;
+    }
+    lines[end + 1..input].iter().all(|l| {
+        let t = l.trim();
+        t.is_empty()
+            || t.chars().all(|c| c == '─')
+            || l.chars().next().is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// 1 行（または折り返しをつないだ論理行）から背景作業の内訳を読む（#1273）
+fn background_declaration(line: &str) -> Option<String> {
+    let head = line.rsplit_once(BACKGROUND_STILL_RUNNING)?.0;
+    // 状態行の組み立ては ` · <内訳> still running`。
+    // **区切りが無い行は本文とみなす**（`rsplit_once` は `·` が無ければ None）
+    let summary = head.rsplit_once('·')?.1.trim();
+    looks_like_background_items(summary).then(|| summary.to_string())
+}
+
+/// claude が幅で折り返した行の続きの字下げ（#1721）。
+///
+/// claude はメッセージの行を「印（`✻` / `⏺` 等）+ 空白 + 本文」で描き、本文が幅に収まらないと
+/// **本文の桁（2 桁目）へ字下げした行**へ語の切れ目で送る。実採取（claude 2.1.301・
+/// 一時の設定 dir + 偽 API・器あり）:
+///
+/// ```text
+/// 50 桁: ✻ Brewed for 0s · done 6:10 PM · 1 shell still
+///          running
+/// 36 桁: ✻ Crunched for 0s · done 6:11 PM · 1
+///          shell still running
+/// ```
+///
+/// 36 桁では内訳が `· 1` と `shell still running` に割れ、どちらの物理行も
+/// ` · <内訳> still running` の形にならないので 1 行の読み方では拾えない
+/// （Issue #1721 の 37 桁の worker がこれで永久 busy になっていた）
+const CLAUDE_WRAP_INDENT: &str = "  ";
+
+/// 1 つの論理行としてつなぐ続きの行の上限（#1721）。
+/// 申告の行は 70 字前後（`✻ Worked for 1m 11s · done 2:54 PM · 1 shell, 1 monitor still running`）
+/// なので、20 桁でも 4〜5 行に収まる。上限は本文の長い段落を延々とつながないための歯止め
+const CLAUDE_WRAP_MAX_CONTINUATIONS: usize = 6;
+
+/// 画面の末尾（[`BUSY_STRONG_TAIL`] 個の非空行の範囲）で、claude が折り返した行を
+/// 論理行へつなぎ直す（#1721）。
+///
+/// 頭 = 字下げの無い行、続き = [`CLAUDE_WRAP_INDENT`] ちょうどの字下げの後に文字が来る行。
+/// 返すのは**続きを 1 行以上つないだ論理行だけ**（1 行に収まった行は 1 行の読み方が既に見ている）と、
+/// その最後の物理行の位置。空行は折り返しの途中には入らないので、空行で論理行は切れる。
+///
+/// つないだ結果に申告の形（` · <数で始まる内訳> still running`）を要求するのは
+/// [`background_declaration`] の側なので、フッター（`  ⏵⏵ …` も 2 桁の字下げ）を
+/// 区切り線へつないでも申告には化けない
+fn claude_wrapped_lines(output: &str) -> Vec<(String, usize)> {
+    let lines: Vec<&str> = output.lines().collect();
+    // 末尾 BUSY_STRONG_TAIL 個の非空行が始まる物理行（1 行の読み方と同じ範囲を見る）
+    let start = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, l)| !l.trim().is_empty())
+        .take(BUSY_STRONG_TAIL)
+        .last()
+        .map_or(lines.len(), |(i, _)| i);
+    let is_head = |l: &str| l.chars().next().is_some_and(|c| !c.is_whitespace());
+    let is_continuation = |l: &str| {
+        l.strip_prefix(CLAUDE_WRAP_INDENT)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| !c.is_whitespace())
+    };
+    let mut joined = Vec::new();
+    let mut i = start;
+    while i < lines.len() {
+        if !is_head(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let mut logical = lines[i].trim_end().to_string();
+        let mut next = i + 1;
+        while next < lines.len()
+            && next - i <= CLAUDE_WRAP_MAX_CONTINUATIONS
+            && is_continuation(lines[next])
+        {
+            logical.push(' ');
+            logical.push_str(lines[next].trim());
+            next += 1;
+        }
+        if next > i + 1 {
+            joined.push((logical, next - 1));
+        }
+        i = next;
+    }
+    joined
+}
+
+/// 背景作業の申告が**幅で切られて読めない**画面か（#1721）。
+///
+/// claude は入力欄の下の状態行（`⏵⏵ auto mode on · 1 shell · ← for agents`）をペイン幅で切る。
+/// 切り方は 2 通りを実採取した（claude 2.1.301）:
+///
+/// | 桁 | 状態行 | 切れの印 |
+/// |---|---|---|
+/// | 36 | `⏵⏵ auto mode on · 1 shell · ← f…` | 行末の `…` |
+/// | 24 | `⏵⏵ auto mode on · 1` | 最後の項目が数だけ（名詞ごと落ちる。Issue #1721 の `· 1` と同じ形） |
+///
+/// この行も背景作業の件数を載せるので、ここが切れていてターンの終わりの行からも申告が
+/// 読めないときは「背景作業だけが残っている」とも「そうでない」とも言えない。そのときに
+/// 一次シグナルの busy を覆さなかった理由を `idle_override_blocked` へ残すための判定
+/// （**覆す根拠には使わない**）。語ではなく形で見る（#1015）。
+///
+/// 見るのは**入力欄より下の行**だけ（会話本文の `…` で終わる行を拾わない）
+fn claude_status_line_truncated(output: &str) -> bool {
+    let lines: Vec<&str> = output.lines().collect();
+    let Some(input) = lines.iter().rposition(|l| l.trim_start().starts_with('❯')) else {
+        return false;
+    };
+    lines[input + 1..].iter().any(|l| {
+        let t = l.trim_end();
+        // 数だけの項目は claude の状態行には無い（件数は必ず `<数> <名詞>`）= 名詞が切られた
+        let bare_count = t
+            .rsplit_once(" · ")
+            .is_some_and(|(_, last)| !last.is_empty() && last.chars().all(|c| c.is_ascii_digit()));
+        t.ends_with('…') || bare_count
+    })
 }
 
 /// codex / agy のフッター行を ` · ` 区切りの項目へ割る（#1277）。
@@ -1792,7 +1972,9 @@ pub fn input_waiting_with_background_work(
 
 /// 旧挙動かどうかを明示して判定する（#1273 / #1297 の A/B）。
 /// **判断を引数に置く**ので env グローバルを触らずに新旧どちらも検査できる
-/// （公開関数はこれに [`legacy_1273`] / [`legacy_1297`] を渡すだけ = env が唯一の差になる）
+/// （公開関数はこれに [`legacy_1273`] / [`legacy_1297`] を渡すだけ = env が唯一の差になる）。
+/// 申告の読み方の A/B（#1277 / #1721）は中で env を読む。読み方の新旧は
+/// [`background_work_summary_with`] の引数で検査する
 pub fn input_waiting_with_background_work_in(
     output: &str,
     collapsed: bool,
@@ -1839,7 +2021,16 @@ pub fn input_waiting_with_background_work_in(
     if draft == InputDraft::Present {
         return BackgroundIdle::No;
     }
-    let Some(work) = background_work_summary_for(output, Some(agent)) else {
+    // #1721 の A/B（`TAKO_1721_LEGACY=1`）は申告の読み方（折り返しをつなぐか）と下の理由の
+    // 両方を修正前へ戻す。読み方の新旧は `background_work_summary_with` の引数で検査する
+    let legacy_wrap = legacy_1721();
+    let Some(work) = background_work_summary_with(output, Some(agent), legacy_1277(), legacy_wrap)
+    else {
+        // 入力待ちに見えて生成中の目印も無いのに申告が読めない。状態行が幅で切れていれば
+        // それを理由として残す（#1721。覆さないのは従来どおり = 読めないものは根拠にしない）
+        if !legacy_wrap && claude_status_line_truncated(output) {
+            return BackgroundIdle::StatusLineTruncated;
+        }
         return BackgroundIdle::No;
     };
     match draft {
@@ -1866,6 +2057,8 @@ pub enum BackgroundIdle {
     /// 入力欄に文字はあるが**属性が取れず**、人の下書きと claude の AI ゴースト提案を
     /// 見分けられないので覆さない（#1297。値は背景作業の内訳 = 報告用）
     DraftIndistinguishable(String),
+    /// 入力待ちに見えるが、背景作業の申告が読めず状態行も幅で切れているので覆さない（#1721）
+    StatusLineTruncated,
 }
 
 impl BackgroundIdle {
@@ -1882,10 +2075,19 @@ impl BackgroundIdle {
     pub fn blocked_reason(&self) -> Option<&'static str> {
         match self {
             Self::DraftIndistinguishable(_) => Some(INPUT_DRAFT_UNREADABLE),
+            Self::StatusLineTruncated => Some(STATUS_LINE_TRUNCATED),
             _ => None,
         }
     }
 }
+
+/// `idle_despite_primary_busy` を倒せなかった理由コード（#1721）。
+///
+/// 意味は「入力待ちに見えて生成中の目印も無いが、背景作業の申告（ターンの終わりの行の
+/// `· <内訳> still running`）が読めず、入力欄の下の状態行もペイン幅で切れている
+/// （行末の `…` か、名詞が落ちて数だけになった最後の項目）」。
+/// 背景作業だけが残っているのかを画面から決められないので覆さない。ペインを広げると読める
+pub const STATUS_LINE_TRUNCATED: &str = "status_line_truncated";
 
 /// `idle_despite_primary_busy` を倒せなかった理由コード（#1297）。
 ///
@@ -1966,6 +2168,14 @@ pub fn legacy_1273() -> bool {
 pub fn legacy_1297() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var("TAKO_1297_LEGACY").map(|v| v == "1") == Ok(true))
+}
+
+/// #1721 の A/B。`TAKO_1721_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （狭いペインで折り返した申告をつながず、幅で切れた画面の理由も出さない =
+/// 背景作業が残るあいだ busy のまま・`idle_override_blocked` は null）
+pub fn legacy_1721() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_1721_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
 /// #1277 の A/B。`TAKO_1277_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
@@ -5450,5 +5660,136 @@ esc to cancel                      Claude Opus 4.6 (Thinking)";
             None,
             "本文の `2 tasks` を項目として読んでいる"
         );
+    }
+}
+
+/// #1721: 狭いペインで claude が折り返した申告をつないで読む。
+///
+/// 写しの形は実採取（2026-11-01 / claude 2.1.301・一時の設定 dir + 偽 Messages API・
+/// 器あり・隔離 GUI の 50 / 36 / 24 桁）。画面全体の写しは `dispatch` の #1721 の節にある
+#[cfg(test)]
+mod issue1721_wrapped_declarations {
+    use super::*;
+
+    /// 折り返しの位置ごとに同じ内訳が読める（20 桁で 4 行に割れる長い内訳も含む）
+    #[test]
+    fn i1721_折り返しの位置によらず内訳を読む() {
+        let cases = [
+            // 内訳の途中（36 桁の実採取）
+            (
+                "✻ Crunched for 0s · done 6:12 PM · 1\n  shell still running",
+                "1 shell",
+            ),
+            // `still` と `running` のあいだ（50 桁の実採取）
+            (
+                "✻ Brewed for 0s · done 6:10 PM · 1 shell still\n  running",
+                "1 shell",
+            ),
+            // 3 行（24 桁の実採取）
+            (
+                "✻ Brewed for 0s · done\n  6:16 PM · 1 shell\n  still running",
+                "1 shell",
+            ),
+            // 区切りの直後で割れ、内訳がカンマで続く
+            (
+                "✻ Worked for 1m 11s · done 2:54 PM ·\n  1 shell, 1 monitor still running",
+                "1 shell, 1 monitor",
+            ),
+            (
+                "✻ Worked for 1m 11s ·\n  done 2:54 PM · 1\n  shell, 1 monitor\n  still running",
+                "1 shell, 1 monitor",
+            ),
+        ];
+        for (turn_end, want) in cases {
+            let screen =
+                format!("⏺ RUN-DONE\n\n{turn_end}\n\n──────────\n❯\n──────────\n  ⏵⏵ auto mode on");
+            assert_eq!(
+                claude_background_work_summary_in(&screen, false).as_deref(),
+                Some(want),
+                "{turn_end}"
+            );
+            assert_eq!(
+                claude_background_work_summary_in(&screen, true),
+                None,
+                "修正前の読み方（1 行ずつ）では読めない形のはず: {turn_end}"
+            );
+        }
+    }
+
+    /// 申告より下に次の依頼やスピナーがある = 前のターンの申告なので読まない。
+    /// 間が空行・枠・tako の帯だけなら読む
+    #[test]
+    fn i1721_申告が最後のメッセージのときだけ読む() {
+        let turn_end = "✻ Crunched for 0s · done 6:20 PM · 1\n  shell still running\n";
+        let input = "────────\n❯\n────────\n  ⏵⏵ auto mode on · 1 shell · esc…";
+        for (between, want) in [
+            ("\n", Some("1 shell")),
+            ("\ntako | pane 2 [ compact ]       [-]\n\n", Some("1 shell")),
+            ("\n❯ Reply slowly: 60\n\n✳ Gitifying…\n", None),
+            (
+                "\n· Wrangling…\n  ⎿  Tip: Start with small features\n",
+                None,
+            ),
+            ("\n⏺ Background command completed\n", None),
+            ("\n  ⎿  Tip: indented leftovers\n", None),
+        ] {
+            let screen = format!("⏺ RUN-DONE\n\n{turn_end}{between}{input}");
+            assert_eq!(
+                claude_background_work_summary_in(&screen, false).as_deref(),
+                want,
+                "{screen}"
+            );
+        }
+        // 入力欄が無い画面（申告の下に入力欄が来ない）も読まない
+        assert_eq!(claude_background_work_summary_in(turn_end, false), None);
+    }
+
+    /// 1 行に収まった申告は #1273 の読み方のまま（つなぎ直しは読めなかったときだけ）
+    #[test]
+    fn i1721_一行の申告は従来どおり読む() {
+        let screen = "✻ Worked for 1m 11s · done 2:54 PM · 1 shell, 1 monitor still running\n❯ \n";
+        assert_eq!(
+            claude_background_work_summary_in(screen, false).as_deref(),
+            Some("1 shell, 1 monitor")
+        );
+        assert_eq!(
+            claude_background_work_summary_in(screen, true).as_deref(),
+            Some("1 shell, 1 monitor")
+        );
+    }
+
+    /// 空行・字下げの深い行・字下げの無い行ではつながない（折り返しの続きではない）
+    #[test]
+    fn i1721_折り返しの続きでない行はつながない() {
+        for screen in [
+            // 空行を挟む
+            "✻ Crunched for 0s · done 6:12 PM · 1\n\n  shell still running\n❯\n",
+            // 4 桁の字下げ（コードブロック等）
+            "✻ Crunched for 0s · done 6:12 PM · 1\n    shell still running\n❯\n",
+            // 字下げの無い行（別の段落）
+            "✻ Crunched for 0s · done 6:12 PM · 1\nshell still running\n❯\n",
+        ] {
+            assert_eq!(
+                claude_background_work_summary_in(screen, false),
+                None,
+                "{screen}"
+            );
+        }
+    }
+
+    /// 状態行の切れの印は入力欄より下だけを見る（本文の `…` で終わる行・`· 3` を拾わない）
+    #[test]
+    fn i1721_状態行の切れは入力欄より下だけで見る() {
+        assert!(claude_status_line_truncated(
+            "❯\n  ⏵⏵ auto mode on · 1 shell · ← f…"
+        ));
+        assert!(claude_status_line_truncated("❯\n  ⏵⏵ auto mode on · 1"));
+        assert!(!claude_status_line_truncated(
+            "❯\n  ⏵⏵ auto mode on · 1 shell · ← for agents"
+        ));
+        assert!(!claude_status_line_truncated(
+            "⏺ Reading files…\n⏺ step · 3\n❯\n  ⏵⏵ auto mode on"
+        ));
+        assert!(!claude_status_line_truncated("⏺ no input box here · 3"));
     }
 }

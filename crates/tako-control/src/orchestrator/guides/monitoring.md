@@ -85,8 +85,12 @@ running (`background_work`, e.g. `1 shell, 1 monitor`). When that override fires
 `idle_despite_primary_busy` is true and `status_source` still says `agents`.
 Priority: a visible busy indicator always wins over the empty input box (claude
 draws the input box while generating too), and `Waiting for … to finish` — claude
-blocking *on* the background work — stays `busy`. On very narrow panes the status
-line is truncated, the evidence is lost, and the worker stays `busy` as before.
+blocking *on* the background work — stays `busy`. On narrow panes claude wraps
+that line mid-declaration; tako joins the wrapped rows (Issue #1721), but only
+when it is the last message above the input box (an older turn's line above a new
+request or spinner does not count). When the declaration cannot be read and the
+status line is cut by the pane width, the worker stays `busy` and
+`idle_override_blocked` says `status_line_truncated` — widen the pane or read it.
 
 ### When you receive WORKER_ERROR
 
