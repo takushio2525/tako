@@ -516,6 +516,10 @@ pub struct TerminalSession {
     /// コンソールのプロセスを止め、GUI のアプリとその子孫は残す（`Job::close_for_pane`）。
     /// unix・器のペイン・A/B の legacy・作れなかった回は None（従来どおり PTY を閉じるだけ）
     job: Option<crate::platform::job::Job>,
+    /// 閉じる（drop）ときに PTY 直下の子へ SIGHUP を送り、子の側が全部閉じるまで親側を
+    /// 読み捨ててから閉じるか（#2625。値は待つ上限）。器（tmux）の attach クライアントの
+    /// ペインだけが [`Self::hang_up_client_on_close`] で立てる。None = 従来どおり閉じる
+    hang_up_on_close: Option<std::time::Duration>,
 }
 
 /// [`TerminalSession::serial`] の払い出し元（0 は使わない）
@@ -775,9 +779,27 @@ impl TerminalSession {
                 pin_gate,
                 color_scheme_updates: false,
                 job,
+                hang_up_on_close: None,
             },
             rx,
         ))
+    }
+
+    /// 閉じる（drop）ときの順を「子へ SIGHUP → 子の側が全部閉じるまで親側を読み捨てる →
+    /// 閉じる」にする（#2625）。器（tmux）の attach クライアントのペイン用で、呼ぶかどうかは
+    /// [`crate::tmux_backend::hang_up_client_on_close`] が決める。
+    ///
+    /// 従来の順（読むのをやめる → SIGHUP → 子を wait → 親側を閉じる）だと、クライアントの tty の
+    /// 最後の close が tmux サーバーの中で起き、読まれない出力を抱えて約 600ms 戻らない =
+    /// 器のサーバー全体が止まる。待つのは PTY のスレッドで、呼び手（UI スレッド）は待たない
+    pub fn hang_up_client_on_close(&mut self) {
+        self.hang_up_on_close = Some(crate::pty_loop::HANG_UP_DRAIN_MAX);
+    }
+
+    /// [`Self::hang_up_client_on_close`] の待つ上限を指定する版（テスト用。unix のテストだけが使う）
+    #[cfg(all(test, unix))]
+    pub(crate) fn hang_up_client_on_close_within(&mut self, limit: std::time::Duration) {
+        self.hang_up_on_close = Some(limit);
     }
 
     /// PTY スレーブの tty 名（取得できない環境では None）
@@ -2151,8 +2173,13 @@ impl Drop for TerminalSession {
         if let Some(gate) = &self.pin_gate {
             gate.close();
         }
-        // IO スレッドへ終了を通知する（PTY が drop されシェルにも HUP が届く）
-        let _ = self.notifier.0.send(Msg::Shutdown);
+        // IO スレッドへ終了を通知する（PTY が drop されシェルにも HUP が届く）。
+        // #2625: 器の attach クライアントは、子の側が全部閉じるまで親側を読んでから閉じる
+        let msg = match (self.hang_up_on_close, self.child_pid) {
+            (Some(limit), Some(child)) => Msg::HangUpAndDrain { child, limit },
+            _ => Msg::Shutdown,
+        };
+        let _ = self.notifier.0.send(msg);
         // #2454: 子孫のうちコンソールのプロセスを止め、ペインから起こした GUI のアプリと
         // その子孫は残す（寿命の決まりは `platform::job`）。Job が無ければ何もしない
         self.release_descendants();
@@ -4456,5 +4483,188 @@ mod tests {
         assert!(!gate.scrolled_back());
         gate.note_wheel(1);
         assert!(gate.scrolled_back(), "1 報告で再び遡り中になる");
+    }
+
+    // --- #2625: 器の attach クライアントは、子の側が全部閉じるまで親側を読んでから閉じる ---
+    //
+    // tmux サーバーはクライアントが抜けるときにその tty へ後始末の出力を書き、tty の close は
+    // それが読まれるのを待つ。従来の閉じ方（読むのをやめる → SIGHUP → 子を wait → 閉じる）は
+    // 閉じる知らせの後に書かれた出力を誰も読まない。ここでは子が HUP の後に tty の
+    // バッファを超える量を書いてから終わる形で、その出力が読み切られることを確かめる
+    // （読まれなければ子は書き込みで止まり、印も書かずに終わらない = 時間では比べない）
+
+    /// HUP を受けたら `trap_body` を走らせて印（`$1`）を書いて終わるシェル
+    #[cfg(unix)]
+    fn spawn_hup_child(
+        marker: &std::path::Path,
+        trap_body: &str,
+    ) -> (TerminalSession, UnboundedReceiver<SessionEvent>) {
+        let script = format!(
+            "trap '{trap_body}printf hup > \"$1\"; exit 0' HUP; printf 'RE''ADY\\n'; while :; do sleep 0.05; done"
+        );
+        let (session, rx) = TerminalSession::spawn(
+            40,
+            4,
+            SpawnOptions {
+                command: Some(SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        script,
+                        "sh".to_string(),
+                        marker.display().to_string(),
+                    ],
+                }),
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+        wait_until("シェルの起動", || {
+            session.visible_lines().iter().any(|l| l.contains("READY"))
+        });
+        (session, rx)
+    }
+
+    /// 条件が真になるまで待つ（上限は混み具合で伸ばすだけ = #1308。実時間は比べない）
+    #[cfg(unix)]
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let busy = crate::wait_budget::machine_busy();
+        let budget =
+            crate::wait_budget::state_wait_budget(std::time::Duration::from_secs(20), busy);
+        let start = std::time::Instant::now();
+        while start.elapsed() < budget {
+            if done() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(done(), "{what} にならなかった");
+    }
+
+    /// pid がまだ回収されていないか（生きている・ゾンビ）。回収済みなら kill(2) が ESRCH を返す。
+    /// 子を回収するのは PTY のスレッド（`Pty` の drop）だけなので、偽になったら回収済み
+    #[cfg(unix)]
+    fn not_reaped(pid: u32) -> bool {
+        // SAFETY: kill(2) へシグナル 0（存在の確認だけ）を渡す
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// 失敗で抜けたとき、止まったままの子を残さない（書き込みで止まった子は PTY のスレッドの
+    /// wait を塞ぐ）。回収を見届けたら外す（外した後は撃たない = pid の再利用に当たらない）
+    #[cfg(unix)]
+    struct ReapGuard(Option<u32>);
+
+    #[cfg(unix)]
+    impl Drop for ReapGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0.filter(|pid| not_reaped(*pid)) {
+                // SAFETY: kill(2) へ値を渡すだけ。まだ回収されていない子の pid
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// 受け口が閉じたか（= PTY のスレッドが終わった）。届いていたイベントは `seen` へ移す
+    #[cfg(unix)]
+    fn rx_closed(rx: &mut UnboundedReceiver<SessionEvent>, seen: &mut Vec<SessionEvent>) -> bool {
+        loop {
+            match rx.try_recv() {
+                Ok(event) => seen.push(event),
+                Err(futures::channel::mpsc::TryRecvError::Closed) => return true,
+                Err(futures::channel::mpsc::TryRecvError::Empty) => return false,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn is_exit_event(event: &SessionEvent) -> bool {
+        matches!(
+            event,
+            SessionEvent::Term(TermEvent::ChildExit(_) | TermEvent::Exit)
+        )
+    }
+
+    /// HUP の後に tty とパイプのバッファを超える量（64 KiB）を書く（読まれなければ `tr` が tty への
+    /// 書き込みで止まり、パイプラインが終わらない）
+    #[cfg(unix)]
+    const FLOOD_AFTER_HUP: &str = "dd if=/dev/zero bs=1024 count=64 2>/dev/null | tr \"\\000\" x; ";
+
+    /// 読み切りの上限をテストでは十分長くする（混んだ CI で上限に当たって読むのをやめると、
+    /// 書き込みで止まった子を `Pty` の drop が待ち続ける = 確かめたいことが時間の話に化ける）
+    #[cfg(unix)]
+    const TEST_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    #[cfg(unix)]
+    #[test]
+    fn 器のクライアントの端末は閉じる知らせの後に書かれた出力も読み切ってから閉じる() {
+        let dir = crate::test_residue::ScratchDir::new("tako-2625-drain");
+        let marker = dir.path().join("hup");
+        let (mut session, mut rx) = spawn_hup_child(&marker, FLOOD_AFTER_HUP);
+        session.hang_up_client_on_close_within(TEST_DRAIN_LIMIT);
+        let child = session.child_pid().expect("子の pid");
+        let mut guard = ReapGuard(Some(child));
+        let mut seen = Vec::new();
+        let _ = rx_closed(&mut rx, &mut seen);
+        seen.clear();
+
+        drop(session);
+        // 閉じる知らせで子へ SIGHUP が届き、子が書いた 64 KiB を親側が読み切るので子は印まで進む
+        wait_until(
+            "子が HUP の後の出力を書き切って印を書く",
+            || marker.exists(),
+        );
+        wait_until("PTY のスレッドが終わる", || {
+            rx_closed(&mut rx, &mut seen)
+        });
+        wait_until("子の回収", || !not_reaped(child));
+        guard.0 = None;
+        assert!(
+            !seen.iter().any(is_exit_event),
+            "閉じたペインへ子の終了を知らせない（受け手はもう居ない）"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 器のクライアントの端末は子が上限までに終わらなくても後で回収して閉じる() {
+        let dir = crate::test_residue::ScratchDir::new("tako-2625-limit");
+        let marker = dir.path().join("hup");
+        // 子は HUP の後 0.3 秒たってから終わる（上限 50ms を過ぎてから）
+        let (mut session, mut rx) = spawn_hup_child(&marker, "sleep 0.3; ");
+        session.hang_up_client_on_close_within(std::time::Duration::from_millis(50));
+        let child = session.child_pid().expect("子の pid");
+        let mut guard = ReapGuard(Some(child));
+        let mut seen = Vec::new();
+
+        drop(session);
+        // 上限を過ぎたら従来どおり閉じる（`Pty` の drop が子を待って回収する）。止まったままにならない
+        wait_until("PTY のスレッドが終わる", || {
+            rx_closed(&mut rx, &mut seen)
+        });
+        wait_until("子の回収", || !not_reaped(child));
+        guard.0 = None;
+        assert!(marker.exists(), "子へ SIGHUP が届いている");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn 器でない端末の閉じ方は従来どおり() {
+        let dir = crate::test_residue::ScratchDir::new("tako-2625-plain");
+        let marker = dir.path().join("hup");
+        let (session, mut rx) = spawn_hup_child(&marker, "");
+        let child = session.child_pid().expect("子の pid");
+        let mut guard = ReapGuard(Some(child));
+        let mut seen = Vec::new();
+
+        drop(session);
+        // `Msg::Shutdown` → `Pty` の drop（SIGHUP → wait → 閉じる）
+        wait_until("PTY のスレッドが終わる", || {
+            rx_closed(&mut rx, &mut seen)
+        });
+        wait_until("子の回収", || !not_reaped(child));
+        guard.0 = None;
+        assert!(marker.exists(), "子へ SIGHUP が届いている");
     }
 }

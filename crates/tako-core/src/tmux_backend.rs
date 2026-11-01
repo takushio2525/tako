@@ -237,6 +237,31 @@ pub fn issue2085_legacy() -> bool {
     })
 }
 
+/// #2625 の A/B（`TAKO_2625_LEGACY=1`）。同一バイナリのまま修正前の閉じ方（読むのをやめる →
+/// SIGHUP → 子を wait → PTY の親側を閉じる）へ戻す。**ゲートはこの 1 か所**
+pub fn issue2625_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2625_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// 器のペインの端末を、閉じるときに attach クライアントを先に帰す順にするか（#2625）。
+///
+/// 器（tmux）のペインの PTY 直下の子は attach クライアントで、その tty は tmux サーバーも
+/// 開いている。従来の閉じ方（`Pty` の drop）は親側を読むのをやめてから閉じるので、tty の
+/// 最後の close がサーバーの中（`server_client_lost`）で起き、読まれない出力を抱えて約 600ms
+/// 戻らない（macOS で実測。その間は器のサーバー全体 = 他の器のペインの画面・tako が器へ打つ
+/// 命令が止まる）。真なら [`crate::TerminalSession::hang_up_client_on_close`] を立てる。
+///
+/// 偽: tmux 以外（psmux = Windows の ConPTY には tty の close が無い・器なし）・unix 以外・A/B
+pub fn hang_up_client_on_close() -> bool {
+    cfg!(unix) && crate::backend::choice() == crate::backend::Choice::Tmux && !issue2625_legacy()
+}
+
 /// 自ら閉じたペインの最後の出力の置き場（[`PANE_DIED_DIR`]）。データディレクトリが無ければ None
 pub fn pane_died_dir() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join(PANE_DIED_DIR))
