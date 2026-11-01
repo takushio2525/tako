@@ -132,7 +132,7 @@ make_data 0
 make_data 1 work
 make_data 3 work codex default
 make_data 4 gamma alpha delta beta
-make_data 84 "${MANY[@]}"
+make_data 84 ${MANY[@]+"${MANY[@]}"}
 check_eq "84 個の砂場" "84" "$(command ls "$TMP/data-84/orchestrator/profiles" | grep -c '\.yaml$')"
 
 # 期待（件数 / 言語 → --check の行・names）
@@ -159,7 +159,7 @@ expect_names() {
     1) sorted_json work ;;
     3) sorted_json work codex default ;;
     4) sorted_json gamma alpha delta beta ;;
-    84) sorted_json "${MANY[@]}" ;;
+    84) sorted_json ${MANY[@]+"${MANY[@]}"} ;;
   esac
 }
 
@@ -202,7 +202,7 @@ for n in 0 3 84; do
   done
 done
 OLD84="$(check_line "$TMP/out/old-check-84-ja.stderr")"
-JOINED="$(printf '%s\n' "${MANY[@]}" | LC_ALL=C sort | paste -sd ',' - | sed 's/,/, /g')"
+JOINED="$(printf '%s\n' ${MANY[@]+"${MANY[@]}"} | LC_ALL=C sort | paste -sd ',' - | sed 's/,/, /g')"
 check_eq "旧形は 1 行に全部並べる（84 個）" "  [OK] プロファイル: 84 個（${JOINED}）" "$OLD84"
 check_eq "旧形の 3 個は , 区切り" "  [OK] profiles: 3 (codex, default, work)" "$(check_line "$TMP/out/old-check-3-en.stderr")"
 
