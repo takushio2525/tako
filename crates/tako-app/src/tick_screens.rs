@@ -149,16 +149,18 @@ impl TickSource for TerminalSession {
 
 /// 背景で採った 1 ペインぶん（[`read`] が作る）。UI スレッドはここから読むだけで、端末のロックを取らない。
 ///
-/// 採っていないもの（入力欄・画面の外の履歴は、止まっている画面のときだけ採る）を各段が求めたら、
-/// 持っている手（[`PaneAccess`]）でその場で読む = 修正前と同じ答え（採る条件は各段が求める条件を
-/// 覆うので、通常は起きない）
+/// 解析を済ませていないもの（計画の後でキュー滞留・利用制限・ネット復帰の対象になったペイン）は、
+/// 採った行から同じ既定の実装で解く（UI スレッドの解析だけ・ロックは取らない）。採っていないもの
+/// （入力欄・画面の外の履歴は、止まっている画面のときだけ採る）を各段が求めたら、持っている手
+/// （[`PaneAccess`]）でその場で読む = 修正前と同じ答え（採る条件は各段が求める条件を覆うので、
+/// 通常は起きない）
 pub(crate) struct PaneTick {
     access: PaneAccess,
     alt: bool,
     /// 可視行のすべて（`alt_and_lines` の 1 回のロック）
     lines: Vec<String>,
     metrics: Option<AgentMetrics>,
-    queued_pending: bool,
+    queued_pending: Option<bool>,
     limit: RefCell<Option<LimitRead>>,
     net: Option<NetRead>,
     input: Option<Option<InputStatus>>,
@@ -197,27 +199,18 @@ impl TickSource for PaneTick {
     fn agent_metrics(&self) -> Option<AgentMetrics> {
         self.metrics.clone()
     }
-    fn queued_hint_pending(&self, _legacy_c3: bool) -> bool {
+    fn queued_hint_pending(&self, legacy_c3: bool) -> bool {
         self.queued_pending
+            .unwrap_or_else(|| RawLines(self).queued_hint_pending(legacy_c3))
     }
     fn limit_read(&self) -> LimitRead {
-        match self.limit.borrow_mut().take() {
-            Some(read) => read,
-            None => {
-                let lines = self.lines.clone();
-                LimitRead {
-                    fingerprint: limit_stop::screen_fingerprint(&lines),
-                    classified: limit_stop::classify_limit_stop(&lines),
-                    lines,
-                }
-            }
-        }
+        let taken = self.limit.borrow_mut().take();
+        taken.unwrap_or_else(|| RawLines(self).limit_read())
     }
     fn net_read(&self) -> NetRead {
-        match &self.net {
-            Some(read) => read.clone(),
-            None => TakoApp::read_net_screen(self),
-        }
+        self.net
+            .clone()
+            .unwrap_or_else(|| RawLines(self).net_read())
     }
 }
 
@@ -408,7 +401,7 @@ pub(crate) fn read(plan: TickPlan) -> TickScreens {
             alt,
             lines,
             metrics: None,
-            queued_pending: false,
+            queued_pending: None,
             limit: RefCell::new(None),
             net: None,
             input: None,
@@ -418,7 +411,7 @@ pub(crate) fn read(plan: TickPlan) -> TickScreens {
         // 行だけを持つ読み口として既定の実装を通す
         let raw = RawLines(&tick);
         let metrics = raw.agent_metrics();
-        let queued_pending = item.queued && raw.queued_hint_pending(plan.legacy_c3);
+        let queued_pending = item.queued.then(|| raw.queued_hint_pending(plan.legacy_c3));
         let limit = item.limit.then(|| raw.limit_read());
         let net = item.net.then(|| raw.net_read());
         // 入力欄（人の下書きの判定）は止まっている画面だけが求める: 利用制限の idle 型（#813）・
@@ -476,7 +469,8 @@ pub(crate) fn read(plan: TickPlan) -> TickScreens {
     TickScreens::Captured { panes, policies }
 }
 
-/// 背景で解析を走らせるための、行だけを持つ読み口（答えを持たない [`PaneTick`] を既定の実装へ通す）
+/// 採った行だけを読む口（[`PaneTick`] を trait の既定の実装 = 解析の 1 実装へ通す。背景の解析と、
+/// UI スレッドで解析を済ませていない対象の解き直しが使う）
 struct RawLines<'a>(&'a PaneTick);
 
 impl TickSource for RawLines<'_> {
@@ -580,52 +574,57 @@ mod tests {
             "画面が整わない: {:?}",
             session.visible_lines()
         );
-        let plan = TickPlan {
-            items: vec![PlanItem {
-                pane: PaneId::from_raw(7),
-                access: session.access(),
-                queued: true,
-                limit: true,
-                net: true,
-                has_backend: false,
-            }],
-            policies: Vec::new(),
-            legacy_c3: false,
-        };
-        let TickScreens::Captured { panes, .. } = read(plan) else {
-            panic!("背景の読みは Captured を返す");
-        };
-        let tick = panes.get(&PaneId::from_raw(7)).expect("採ったペイン");
         let live: &TerminalSession = &session;
-        assert_eq!(tick.is_alt_screen(), TickSource::is_alt_screen(live));
-        assert_eq!(tick.visible_lines(), TickSource::visible_lines(live));
-        assert_eq!(
-            tick.tail_lines(AGENT_TUI_TAIL_LINES),
-            TickSource::tail_lines(live, AGENT_TUI_TAIL_LINES)
-        );
-        assert_eq!(
-            format!("{:?}", tick.agent_metrics()),
-            format!("{:?}", TickSource::agent_metrics(live))
-        );
-        assert_eq!(tick.agent_metrics().and_then(|m| m.ctx_percent), Some(55));
-        assert_eq!(
-            tick.queued_hint_pending(false),
-            TickSource::queued_hint_pending(live, false)
-        );
-        let (a, b) = (tick.limit_read(), TickSource::limit_read(live));
-        assert_eq!(a.lines, b.lines);
-        assert_eq!(a.fingerprint, b.fingerprint);
-        assert_eq!(a.classified, b.classified);
-        assert!(matches!(a.classified, Some((LimitStopKind::Idle, _))));
-        assert_eq!(
-            format!("{:?}", tick.net_read()),
-            format!("{:?}", TickSource::net_read(live))
-        );
-        // 利用制限の idle 型で止まっている = 入力欄を採っている（UI スレッドでロックを取らない）
-        assert!(tick.input.is_some());
-        assert_eq!(
-            format!("{:?}", tick.analyze_input()),
-            format!("{:?}", TickSource::analyze_input(live))
-        );
+        // 計画で解析を頼んだ形（queued / limit / net）と、頼んでいない形（計画の後で対象になった
+        // ペイン = 採った行から同じ実装で解き直す）の両方が修正前の読みと同じ答えを返す
+        for wanted in [true, false] {
+            let plan = TickPlan {
+                items: vec![PlanItem {
+                    pane: PaneId::from_raw(7),
+                    access: session.access(),
+                    queued: wanted,
+                    limit: wanted,
+                    net: wanted,
+                    has_backend: false,
+                }],
+                policies: Vec::new(),
+                legacy_c3: false,
+            };
+            let TickScreens::Captured { panes, .. } = read(plan) else {
+                panic!("背景の読みは Captured を返す");
+            };
+            let tick = panes.get(&PaneId::from_raw(7)).expect("採ったペイン");
+            assert_eq!(tick.is_alt_screen(), TickSource::is_alt_screen(live));
+            assert_eq!(tick.visible_lines(), TickSource::visible_lines(live));
+            assert_eq!(
+                tick.tail_lines(AGENT_TUI_TAIL_LINES),
+                TickSource::tail_lines(live, AGENT_TUI_TAIL_LINES)
+            );
+            assert_eq!(
+                format!("{:?}", tick.agent_metrics()),
+                format!("{:?}", TickSource::agent_metrics(live))
+            );
+            assert_eq!(tick.agent_metrics().and_then(|m| m.ctx_percent), Some(55));
+            assert_eq!(
+                tick.queued_hint_pending(false),
+                TickSource::queued_hint_pending(live, false)
+            );
+            let (a, b) = (tick.limit_read(), TickSource::limit_read(live));
+            assert_eq!(a.lines, b.lines);
+            assert_eq!(a.fingerprint, b.fingerprint);
+            assert_eq!(a.classified, b.classified);
+            assert!(matches!(a.classified, Some((LimitStopKind::Idle, _))));
+            assert_eq!(
+                format!("{:?}", tick.net_read()),
+                format!("{:?}", TickSource::net_read(live))
+            );
+            // 利用制限の idle 型で止まっている = 頼んだ形では入力欄を採っている（UI スレッドでロックを
+            // 取らない）。頼んでいない形は持っている手でその場で読む（同じ答え）
+            assert_eq!(tick.input.is_some(), wanted);
+            assert_eq!(
+                format!("{:?}", tick.analyze_input()),
+                format!("{:?}", TickSource::analyze_input(live))
+            );
+        }
     }
 }

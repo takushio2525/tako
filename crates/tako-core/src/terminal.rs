@@ -155,7 +155,6 @@ fn default_home_dir() -> Option<PathBuf> {
 pub(crate) use crate::platform::shell::default_shell;
 pub use crate::platform::shell::login_shell_command;
 
-
 /// ロケール既定注入の純粋ロジック（テスト用に env 参照と分離）。
 /// LANG / LC_ALL / LC_CTYPE のどれも継承されないときだけ `LC_CTYPE=UTF-8` を返す
 fn default_locale_env(

@@ -19166,7 +19166,7 @@ impl TakoApp {
         })
     }
 
-    ///
+    /// 全ペインの画面から Claude / Codex のメトリクス（ctx% / 使用量）を集めてステータスバーへ写す。
     /// 画面は `screens` から読む（#2647: 定期更新は背景で採った 1 枚を渡す = UI スレッドで
     /// 端末のロックを取らない。定期更新の外から呼ぶ経路は `TickScreens::Live` = その場で読む）
     fn refresh_agent_metrics(&mut self, screens: &tick_screens::TickScreens) {

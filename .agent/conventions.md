@@ -5288,6 +5288,40 @@ main で既にアーカイブ済みのエントリが `progress.md` へ黙って
 **`<<<<<<<` が開いた領域の中にあるときだけ**マーカーとみなす（git は必ずこの順で書くので
 検出力は落ちない）。
 
+## 2 秒 tick の判定はペインの画面を UI スレッドで読まない（Issue #2647）
+
+2 秒ごとの定期更新（`periodic_prep`）の 5 つの段 — エージェントのメトリクス（`refresh_agent_metrics`。#357）・
+キュー滞留の救出（`drive_queued_message_recovery`。#572）・master の引き継ぎの知らせ（`drive_handoff_nudge`。#749）・
+利用制限からの自動復帰（`drive_limit_autoresume`。#813）・ネット復帰の再開（`drive_net_autoresume`。#2112）— は、
+以前はペインごとに UI スレッドで端末のロックを取って画面を組み、行を解析していた（エージェントのペイン 1 本あたり
+1 tick に約 6 回のロック）。ペインの数に比例して重く（隔離 GUI・debug ビルド・偽のエージェント 24 本で 5 段の合計
+p50 15.6ms / p95 23.0ms、うち利用制限の段が p50 11.9ms）、PTY のスレッドが出力の解析でロックを握っていれば
+その間も待つ（本番の perf.log 10/28〜11/02 で `periodic_prep` の専有 247 件・平均 76ms・最大 492ms）。
+
+- **UI スレッドはペインへの手を集めるだけ**（`tick_screens::plan`）: 対象のペインごとに `TerminalSession::access()`
+  （`PaneAccess` = スレッドを越えられる手。#1200 / #2646 と同じ）と、何を読むか（キュー滞留・利用制限・ネット復帰の
+  対象か）を写す。対象の数え方は段と同じ 1 実装（`limit_resume_targets` / `net_resume_targets`）を引く
+- **背景で 1 ペインにつき 1 回のロック**（`tick_screens::read`）: `PaneAccess::alt_and_lines` で alternate screen の印と
+  可視行のすべて（平文。`visible_lines` と 1 バイトも変わらない）を採り、各段の解析（メトリクス・キューのヒント・
+  `limit_stop::classify_limit_stop`・ネットの判定）を済ませる。装飾つきの画面（入力欄の下書きの判定）と画面の外の
+  履歴は、止まっている画面のときだけ採る。引き継ぎの閾値の設定（profiles/*.yaml）の読み直しもここ
+  （控えの TTL 30 秒が 5 秒以内に切れる master で、mod / 画面 / transcript のどれかの ctx% が下限以上のとき）
+- **解析の規則は 1 実装**: 各段は画面を `TickSource` 越しに読む。修正前の形（`TerminalSession` をその場で読む）と
+  背景で採った 1 枚（`PaneTick`）の両方がこれを満たし、解析は trait の既定の実装を両方が通る（背景はそれを先に
+  走らせて答えを持ち帰るだけ）。**判定（追跡・猶予・送るかどうか）は UI スレッドの各段が同じ関数で行う**ので、
+  判定の結果と発火の時機は変わらない（利用制限は判定を `classify_limit_stop`（背景）と `observe_classified`
+  （UI = ペインの記憶・構造化ソースの時刻を当てる部分）に分けた）
+- **段の本体で端末を直に引かない**（`self.terminals.get(` を書かない）。画面は `screens.source(&self.terminals, pane)`
+  から読む。採った後に開いたペインはその場で読み（判定の時機を変えないため。1 tick に数ミリ秒の窓で起きる）、
+  採った後に閉じたペインは読まない。定期更新の外から段を呼ぶ経路（セルフテスト・ステータスバーのクリック）は
+  `TickScreens::Live` を渡す = その場で読む
+- A/B は `TAKO_2647_LEGACY=1`（計画を作らず各段がその場で読む = 修正前。ゲートは `tick_screens::legacy()` の 1 か所）。
+  検証用の注入は `TAKO_2647_INJECT_READ_MS`（画面を読むロック 1 回ごとに待つ = PTY のスレッドがロックを握る状態の
+  再現）。番犬は `crates/tako-control/tests/issue2647_periodic_prep_offload_watchdog.rs`（段が端末を直に引く・
+  背景の読みを UI スレッドで呼ぶ・段へその場の読みを渡す・計画が画面や設定を読む・段が設定を直に読む・ゲートの
+  2 か所目を file:line で名指す）、同じ答えを返すことは `tick_screens` の単体テスト、実経路は
+  `scripts/test-periodic-prep-offload-2647.sh`
+
 ## 案内文の打鍵は正本から引く（Issue #1203）
 
 画面 / CLI / MCP に出す文章へ `⌘K` / `Cmd+Enter` のようなキー表記を**直書きしない**。

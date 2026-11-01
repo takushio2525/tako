@@ -48,11 +48,15 @@ case "$MODE" in
   net) conv+=("$ERR") ;;
   *) echo "unknown mode: $MODE" >&2; exit 2 ;;
 esac
-conv+=("" "$CLOSING")
+# 締めの行（`Worked for 0s`）は経過秒の印 = 生成中の判定（`claude_tui::is_busy`）が真になり、キュー滞留の
+# 救出は「画面が静止した」と見なさない。queued では出さない（キューが滞留する場面は締めの後の入力待ち）
+[ "$MODE" = "queued" ] || conv+=("" "$CLOSING")
 
+# 入力欄に出すのは先頭だけ（貼り付けの改行は空白に見せる = 区切り線を潰さない）
 input_view() {
-  local LC_ALL=en_US.UTF-8
-  printf '%s' "${buf:0:24}"
+  local LC_ALL=en_US.UTF-8 v
+  v="${buf:0:24}"
+  printf '%s' "${v//$'\n'/ }"
 }
 
 ROWS=24
@@ -91,7 +95,8 @@ draw() {
 now_ms() { /usr/bin/perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
 
 submit() {
-  printf '%s %s RECEIVED %s\n' "$(now_ms)" "$NAME" "$buf" >> "$LOG"
+  # 複数行の貼り付けは 1 行に畳んで記録する（改行は ⏎）
+  printf '%s %s RECEIVED %s\n' "$(now_ms)" "$NAME" "${buf//$'\n'/ ⏎ }" >> "$LOG"
   conv+=("❯ $(input_view)" "" "⏺ （偽）続きを受け取りました" "")
   buf=""
 }
@@ -159,6 +164,11 @@ while :; do
       fi
       ;;
     $'\n' | $'\r')
+      # 貼り付けの中の改行は入力欄の改行（claude と同じ = 送らない）
+      if [ -n "$in_paste" ]; then
+        buf="$buf"$'\n'
+        continue
+      fi
       printf '%s %s ENTER\n' "$(now_ms)" "$NAME" >> "$LOG"
       if [ -n "$buf" ]; then
         submit
