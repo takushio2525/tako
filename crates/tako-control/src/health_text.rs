@@ -214,10 +214,12 @@ pub enum HealthText {
     ShareFreshSafe,
 
     // ---- 診断: プロファイル ----
-    /// `プロファイル: N 個（…）`（`names` は `, ` で連ねた名前）
+    /// `プロファイル: N 個（…）`。`shown` は 1 行に並べる名前を連ねたもの、`rest` は並べなかった
+    /// 残りの個数（#1623。0 なら全部を並べた形 = 「他 N 個」を付けない）
     ProfilesCount {
         count: usize,
-        names: String,
+        shown: String,
+        rest: usize,
     },
     ProfilesNone,
     /// 確認に失敗（`error` は理由）
@@ -842,10 +844,18 @@ impl HealthText {
             }
 
             // ---- プロファイル ----
-            (Self::ProfilesCount { count, names }, Ja) => {
-                format!("プロファイル: {count} 個（{names}）")
+            (Self::ProfilesCount { count, shown, rest: 0 }, Ja) => {
+                format!("プロファイル: {count} 個（{shown}）")
             }
-            (Self::ProfilesCount { count, names }, En) => format!("profiles: {count} ({names})"),
+            (Self::ProfilesCount { count, shown, rest }, Ja) => {
+                format!("プロファイル: {count} 個（{shown} …他 {rest} 個）")
+            }
+            (Self::ProfilesCount { count, shown, rest: 0 }, En) => {
+                format!("profiles: {count} ({shown})")
+            }
+            (Self::ProfilesCount { count, shown, rest }, En) => {
+                format!("profiles: {count} ({shown} … {rest} more)")
+            }
             (Self::ProfilesNone, Ja) => {
                 "プロファイル: 未作成（tako master で自動生成されます）".into()
             }
