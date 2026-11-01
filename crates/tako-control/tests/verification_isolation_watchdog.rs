@@ -29,6 +29,13 @@
 //! 起こす行は**その行で**本番の env を落とし発見の置き場を向けていることを拘束し（ファイル先頭の
 //! `unset` / `export` は数えない）、`wait_isolated_gui` が `iso_cli` を通して起こした GUI と同じ置き場へ
 //! 繋ぐことをヘルパを実際に走らせて見る。
+//!
+//! **#2627**: 隔離 GUI のペインはログイン zsh で、HOME を本物のままにした検証では利用者の rc（pyenv の
+//! 初期化等）を読んでいた。GUI の終了でペインへ HUP が重ねて届き、rc の `pyenv rehash` の EXIT の trap が
+//! 途中で断たれて shim のロックが利用者の環境に残った（以後のログイン zsh が 60 秒待つ）。ヘルパが既定で
+//! ペインの zsh を砂場の ZDOTDIR へ向けること（並べた値より後ろに置く・判定を呼ぶ）を file:line で、
+//! 向け方の規則をヘルパを走らせて拘束し、利用者の rc を読ませる opt-in（`TAKO_ISO_USER_RC=1`）には
+//! 行ごとに理由（`# tako:user-rc-ok <理由>`）を求める。
 
 use std::path::{Path, PathBuf};
 
@@ -1297,6 +1304,17 @@ fn launch_with(
     env: &[(&str, &str)],
     args: &[&str],
 ) -> std::collections::BTreeMap<String, String> {
+    launch_capture(scratch, env, args).0
+}
+
+/// [`launch_with`] と同じ起こし方で、偽の GUI が受け取った env と**ヘルパの stderr** を返す
+/// （#2627 の案内の行を見る）
+#[cfg(unix)]
+fn launch_capture(
+    scratch: &Scratch1970,
+    env: &[(&str, &str)],
+    args: &[&str],
+) -> (std::collections::BTreeMap<String, String>, String) {
     use std::os::unix::fs::PermissionsExt;
     let run = scratch.dir("run");
     let vd = run.join("virtual-display.sh");
@@ -1332,17 +1350,20 @@ wait "$ISOLATED_GUI_PID"
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let status = cmd.status().expect("/bin/bash を起こす");
+    let output = cmd.output().expect("/bin/bash を起こす");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
-        status.success(),
-        "launch_isolated_gui が失敗した: {status:?}"
+        output.status.success(),
+        "launch_isolated_gui が失敗した: {:?}\n{stderr}",
+        output.status
     );
-    std::fs::read_to_string(&out)
+    let got = std::fs::read_to_string(&out)
         .expect("偽の GUI が起きていない")
         .lines()
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+        .collect();
+    (got, stderr)
 }
 
 /// 本番のペインに見立てた env（ヘルパが落とす名前すべてに本番の値を入れる）
@@ -1481,6 +1502,446 @@ fn 既定のzshrcは利用者のホームと既存のrcへ書かない() {
         !prof.join(".zshrc").exists(),
         ".zprofile があるのに .zshrc を足した"
     );
+}
+
+// ---- 隔離 GUI のペインの zsh に利用者の rc を読ませない（#2627）---------------------------
+
+/// 利用者の rc を読ませる opt-in の名前（#2627）
+const USER_RC_OPTIN: &str = "TAKO_ISO_USER_RC";
+
+/// opt-in に添える理由の宣言（`# tako:user-rc-ok <理由>`。宣言の行とその次の行に効く）
+const USER_RC_OK: &str = "# tako:user-rc-ok";
+
+/// A/B の旧挙動（rc を読む dir に手を付けない）の名前
+const USER_RC_LEGACY: &str = "TAKO_2627_LEGACY";
+
+/// 旧挙動の A/B を使ってよい検証スクリプト（#2627 の実経路テストだけ）
+const USER_RC_LEGACY_OK: &[&str] = &["scripts/test-isolated-gui-user-rc-2627.sh"];
+
+/// 行のうちコメントより前（空白の後の `#` からを落とす。引用符の中の `#` は数えない）
+fn shell_code(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut prev = ' ';
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' && prev.is_whitespace() => return &line[..i],
+            None => {}
+        }
+        prev = c;
+    }
+    line
+}
+
+/// 行の中の `NAME=値` が「立てる」値か（0 と空以外 = 立てる。変数は確かめられないので立てる側）。
+/// 引用符の中は、引用の先頭に書いた代入（`"NAME=1"` = 引数 1 つ）だけを数える
+/// （`echo "… NAME=1 …"` のような文の中の言及は数えない）
+fn sets_flag(code: &str, name: &str) -> bool {
+    let pat = format!("{name}=");
+    // 開いている引用符と、その位置
+    let mut quote: Option<(char, usize)> = None;
+    let mut prev: Option<char> = None;
+    for (i, c) in code.char_indices() {
+        match quote {
+            Some((q, _)) if c == q => {
+                quote = None;
+                prev = Some(c);
+                continue;
+            }
+            None if c == '"' || c == '\'' => {
+                quote = Some((c, i));
+                prev = Some(c);
+                continue;
+            }
+            _ => {}
+        }
+        if code[i..].starts_with(&pat) {
+            // 名前の一部（`XTAKO_ISO_USER_RC=`）は数えない
+            let word_start = !prev.is_some_and(|p| p.is_ascii_alphanumeric() || p == '_');
+            let assignment = quote.is_none_or(|(_, open)| open + 1 == i);
+            if word_start && assignment {
+                let value: String = code[i + pat.len()..]
+                    .chars()
+                    .take_while(|c| !c.is_whitespace() && *c != ';')
+                    .collect();
+                let value = value.trim_matches(['"', '\'']);
+                if !value.is_empty() && value != "0" {
+                    return true;
+                }
+            }
+        }
+        prev = Some(c);
+    }
+    false
+}
+
+/// 走査の結果（#2627）: 名指す行と、opt-in を見つけた数（走査の空振りを見分ける）
+#[derive(Debug, Default)]
+struct UserRcScan {
+    violations: Vec<String>,
+    optins: usize,
+}
+
+/// 利用者の rc を読ませる opt-in に理由の無い行と、旧挙動の A/B を実経路テストの外で立てる行（#2627）。
+///
+/// opt-in（`TAKO_ISO_USER_RC=<0 / 空 以外>`）はペインの zsh に利用者の rc を読ませる。後片付けや GUI の
+/// 終了が rc の途中を断つと利用者の環境（pyenv の shim のロック等）に残骸が残る（#1556 の worker が踏んだ）
+/// ので、使う行ごとに「なぜ利用者の rc が要るか」を `# tako:user-rc-ok <理由>` で残させる（宣言は同じ行の
+/// 行末か直前の行。継続行の途中には書けないので、継続した 1 つのコマンドは先頭の行の直前でもよい）。
+/// 旧挙動（`TAKO_2627_LEGACY`）は理由を書いても外さない（A/B の実経路テストだけが使う）。
+/// コメント行とヒアドキュメントの本文（書き出すスタブ）は読まない。名指すのは値を書いた物理行
+fn user_rc_scan(rel: &str, src: &str) -> UserRcScan {
+    let lines: Vec<&str> = src.lines().collect();
+    let reason_on = |i: usize| {
+        lines
+            .get(i)
+            .and_then(|l| l.split(USER_RC_OK).nth(1))
+            .is_some_and(|r| !r.trim().is_empty())
+    };
+    let legacy_ok = USER_RC_LEGACY_OK.contains(&rel);
+    let mut scan = UserRcScan::default();
+    let mut idx = 0;
+    while idx < lines.len() {
+        // 継続行（行末の `\`）を 1 つのコマンドとして読む
+        let start = idx;
+        while idx + 1 < lines.len() && lines[idx].ends_with('\\') {
+            idx += 1;
+        }
+        let end = idx;
+        idx += 1;
+        for i in start..=end {
+            let code = shell_code(lines[i]);
+            if code.trim_start().starts_with('#') || code.trim().is_empty() {
+                continue;
+            }
+            if sets_flag(code, USER_RC_OPTIN) {
+                scan.optins += 1;
+                let declared = reason_on(i)
+                    || (i > 0 && reason_on(i - 1))
+                    || (start > 0 && reason_on(start - 1))
+                    || reason_on(end);
+                if !declared {
+                    scan.violations.push(format!(
+                        "{rel}:{}: {USER_RC_OPTIN} でペインの zsh に利用者の rc を読ませているのに、理由の宣言（`{USER_RC_OK} <理由>`）が無い",
+                        i + 1
+                    ));
+                }
+            }
+            if !legacy_ok && sets_flag(code, USER_RC_LEGACY) {
+                scan.violations.push(format!(
+                    "{rel}:{}: {USER_RC_LEGACY}（ペインの zsh に利用者の rc を読ませる旧挙動）を A/B の実経路テストの外で立てている",
+                    i + 1
+                ));
+            }
+        }
+        // ヒアドキュメントの本文は読まない（書き出すスタブ）
+        let logical: String = lines[start..=end].join(" ");
+        if let Some((marker, strip_tabs)) = heredoc_marker(&logical) {
+            while idx < lines.len() {
+                let l = if strip_tabs {
+                    lines[idx].trim_start_matches('\t')
+                } else {
+                    lines[idx]
+                };
+                idx += 1;
+                if l == marker {
+                    break;
+                }
+            }
+        }
+    }
+    scan
+}
+
+#[test]
+fn 利用者のrcを読ませるoptinには理由を書く() {
+    let mut violations = Vec::new();
+    let mut optins = 0usize;
+    let mut scripts = verification_scripts();
+    // ヘルパの定義（isolated-gui.sh 自身）は opt-in の使い方の説明を持つので除く
+    scripts.extend(
+        helper_scripts()
+            .into_iter()
+            .filter(|r| r != ISOLATED_GUI_REL),
+    );
+    for rel in scripts {
+        let scan = user_rc_scan(&rel, &read(&rel));
+        optins += scan.optins;
+        violations.extend(scan.violations);
+    }
+    // 空振りしていない: #2627 の実経路テストの opt-in の腕（理由つき）を拾っている
+    assert!(
+        optins >= 1,
+        "{USER_RC_OPTIN} の opt-in を 1 つも拾っていない（走査が壊れているか、#2627 の実経路テストの opt-in の腕が消えた）"
+    );
+    assert!(
+        violations.is_empty(),
+        "隔離 GUI のペインの zsh に利用者の rc を読ませる行に理由が無い（#2627）。rc の途中を後片付けや GUI の終了が\
+         断つと、利用者の環境（pyenv の shim のロック等）に残骸が残る。本当に利用者の rc が要る検証だけ、その行か\
+         直前の行に `{USER_RC_OK} <理由>` を書く（要らないなら opt-in を外す = 既定の砂場の ZDOTDIR）:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+#[test]
+fn 利用者のrcのoptinの走査は理由の無い行を名指す() {
+    let cases: &[(&str, &str, usize)] = &[
+        // (説明, スクリプト, 名指す数)
+        ("理由の無い opt-in", "launch_isolated_gui \"$L\" TAKO_ISO_USER_RC=1\n", 1),
+        ("export の opt-in", "export TAKO_ISO_USER_RC=1\nlaunch_isolated_gui \"$L\"\n", 1),
+        ("引用符で囲んだ opt-in", "launch_isolated_gui \"$L\" \"TAKO_ISO_USER_RC=1\"\n", 1),
+        ("変数の値も opt-in と読む", "launch_isolated_gui \"$L\" TAKO_ISO_USER_RC=\"$X\"\n", 1),
+        ("直前の行の宣言", "# tako:user-rc-ok 利用者の rc の PATH を測る\nlaunch_isolated_gui \"$L\" TAKO_ISO_USER_RC=1\n", 0),
+        ("行末の宣言", "export TAKO_ISO_USER_RC=1 # tako:user-rc-ok 利用者の rc の PATH を測る\n", 0),
+        ("理由の無い宣言は効かない", "# tako:user-rc-ok\nlaunch_isolated_gui \"$L\" TAKO_ISO_USER_RC=1\n", 1),
+        ("宣言は 2 行先まで効かない", "# tako:user-rc-ok 利用者の rc の PATH を測る\n\nlaunch_isolated_gui \"$L\" TAKO_ISO_USER_RC=1\n", 1),
+        ("継続した 1 つのコマンドの先頭の直前の宣言", "# tako:user-rc-ok 利用者の rc の PATH を測る\nlaunch_isolated_gui \"$L\" \\\n  TAKO_DATA_DIR=\"$D\" \\\n  TAKO_ISO_USER_RC=1\n", 0),
+        ("継続した 1 つのコマンドに宣言が無い", "launch_isolated_gui \"$L\" \\\n  TAKO_ISO_USER_RC=1\n", 1),
+        ("0 は opt-in ではない", "launch_isolated_gui \"$L\" TAKO_ISO_USER_RC=0\n", 0),
+        ("unset は opt-in ではない", "unset TAKO_ISO_USER_RC TAKO_2627_LEGACY\n", 0),
+        ("コメントの中", "# launch_isolated_gui \"$L\" TAKO_ISO_USER_RC=1\n", 0),
+        ("ヒアドキュメントの本文", "cat > f <<'EOF'\nlaunch_isolated_gui \"$L\" TAKO_ISO_USER_RC=1\nEOF\n", 0),
+        ("名前の一部", "XTAKO_ISO_USER_RC=1 true\n", 0),
+        ("文の中の言及", "echo \"=== opt-in（TAKO_ISO_USER_RC=1）の腕 ===\"\n", 0),
+        ("引用の先頭の代入は数える", "args=(\"TAKO_ISO_USER_RC=1\" \"TAKO_DATA_DIR=$D\")\n", 1),
+        ("旧挙動を A/B の外で立てる", "launch_isolated_gui \"$L\" TAKO_2627_LEGACY=1\n", 1),
+        ("旧挙動は理由を書いても外さない", "# tako:user-rc-ok 理由\nexport TAKO_2627_LEGACY=1\n", 1),
+    ];
+    for (what, src, want) in cases {
+        let got = user_rc_scan("t.sh", src).violations;
+        assert_eq!(got.len(), *want, "{what}: {src:?} → {got:?}");
+    }
+    // 名指すのは値を書いた物理行
+    let got = user_rc_scan(
+        "t.sh",
+        "set -u\nlaunch_isolated_gui \"$L\" \\\n  TAKO_DATA_DIR=\"$D\" \\\n  TAKO_ISO_USER_RC=1\n",
+    )
+    .violations;
+    assert!(
+        got.len() == 1 && got[0].starts_with("t.sh:4: TAKO_ISO_USER_RC"),
+        "{got:?}"
+    );
+    // 旧挙動の A/B は #2627 の実経路テストだけが使える
+    assert!(user_rc_scan(
+        USER_RC_LEGACY_OK[0],
+        "launch_isolated_gui \"$L\" TAKO_2627_LEGACY=1\n"
+    )
+    .violations
+    .is_empty());
+}
+
+/// 隔離 GUI のヘルパの起動の行が、砂場の ZDOTDIR を並べた `VAR=VAL`（`"$@"`）より後ろに置いているか（#2627）。
+///
+/// 前に置くと、並べた `ZDOTDIR=`（利用者のホームの中）が勝ってペインの zsh が利用者の rc を読む。
+/// 判定（`iso_user_rc_sandbox_needed`）を呼ばなくなった形も名指す（行は `launch_isolated_gui() {`）
+fn helper_rc_sandbox_violations(rel: &str, src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let def_line = src
+        .lines()
+        .position(|l| l.starts_with("launch_isolated_gui() {"))
+        .map_or(0, |i| i + 1);
+    let Some(body) = shell_fn_body(src, "launch_isolated_gui") else {
+        return vec![format!("{rel}: launch_isolated_gui() が見つからない")];
+    };
+    let calls = body
+        .lines()
+        .map(shell_code)
+        .any(|l| l.contains("iso_user_rc_sandbox_needed \"$@\""));
+    if !calls {
+        out.push(format!(
+            "{rel}:{def_line}: launch_isolated_gui が iso_user_rc_sandbox_needed を呼んでいない = ペインの zsh へ砂場の ZDOTDIR を向けない"
+        ));
+    }
+    match src
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains("\"$APP_BIN\" > \"$log\""))
+    {
+        None => out.push(format!(
+            "{rel}: 隔離 GUI を起こす行（`\"$APP_BIN\" > \"$log\"`）が見つからない"
+        )),
+        Some((i, line)) => {
+            let args = line.find("\"$@\"");
+            let rc = line.find("${rc_args[@]");
+            if !matches!((args, rc), (Some(a), Some(r)) if r > a) {
+                out.push(format!(
+                    "{rel}:{}: 隔離 GUI を起こす行が砂場の ZDOTDIR（rc_args）を並べた `\"$@\"` より後ろに置いていない = 並べた ZDOTDIR が勝つ",
+                    i + 1
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn 隔離guiの起動は砂場のzdotdirを最後に置く() {
+    let src = read(ISOLATED_GUI_REL);
+    let got = helper_rc_sandbox_violations(ISOLATED_GUI_REL, &src);
+    assert!(
+        got.is_empty(),
+        "隔離 GUI のペインの zsh が利用者の rc を読む形へ戻っている（#2627）:\n  {}",
+        got.join("\n  ")
+    );
+
+    // 逆戻りの注入（現行のヘルパから作る。ファイルは触らない）: 起動の行から砂場を外す / 前へ動かす /
+    // 判定を呼ばない。どれも file:line で名指す
+    let lines: Vec<&str> = src.lines().collect();
+    let launch_idx = lines
+        .iter()
+        .position(|l| l.contains("\"$APP_BIN\" > \"$log\""))
+        .expect("起動の行");
+    let launch_line = launch_idx + 1;
+    // 起動の行だけを書き換えた全文（同じ綴りは iso_default_zshrc の行にもあるので全文の replacen は使わない）
+    let with_launch = |line: String| {
+        let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        out[launch_idx] = line;
+        out.join("\n") + "\n"
+    };
+    let rc = " ${rc_args[@]+\"${rc_args[@]}\"}";
+    let original = lines[launch_idx];
+    assert!(
+        original.contains(rc),
+        "起動の行に砂場の ZDOTDIR（rc_args）が無い: {original}"
+    );
+    let removed = with_launch(original.replacen(rc, "", 1));
+    let moved = with_launch(original.replacen(rc, "", 1).replacen(
+        " \"$@\" ",
+        &format!("{rc} \"$@\" "),
+        1,
+    ));
+    let not_called = src.replacen(
+        "if iso_user_rc_sandbox_needed \"$@\"; then",
+        "if false; then",
+        1,
+    );
+    let def_line = src
+        .lines()
+        .position(|l| l.starts_with("launch_isolated_gui() {"))
+        .expect("launch_isolated_gui() の行")
+        + 1;
+    for (what, injected, line) in [
+        ("起動の行から砂場を外す", &removed, launch_line),
+        ("砂場を並べた値より前へ動かす", &moved, launch_line),
+        ("判定を呼ばない", &not_called, def_line),
+    ] {
+        assert_ne!(injected, &src, "{what}: 注入が当たっていない");
+        let got = helper_rc_sandbox_violations(ISOLATED_GUI_REL, injected);
+        assert!(
+            got.len() == 1 && got[0].starts_with(&format!("{ISOLATED_GUI_REL}:{line}: ")),
+            "{what}: 逆戻りを {ISOLATED_GUI_REL}:{line} で名指していない: {got:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn 隔離guiのペインのzshは利用者のrcを読まない() {
+    let scratch = Scratch1970::new("userrc");
+    // 利用者のホームの見立て（launch_with が ISOLATED_GUI_REAL_HOME へ渡すのと同じ dir）
+    let real = scratch.dir("realhome");
+    let sandbox = scratch.0.join("run/isolated-zdotdir");
+    let real_env = production_like_env(&real);
+    let real_ref: Vec<(&str, &str)> = real_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let zdotdir = |got: &std::collections::BTreeMap<String, String>| got.get("ZDOTDIR").cloned();
+
+    // ① HOME が利用者のホーム → 砂場の ZDOTDIR（既定の .zshrc だけ）。利用者のホームには書かない
+    let got = launch_with(&scratch, &real_ref, &[]);
+    assert_eq!(
+        zdotdir(&got).as_deref(),
+        sandbox.to_str(),
+        "HOME が利用者のホームなのにペインの zsh を砂場へ向けていない"
+    );
+    let zshrc =
+        std::fs::read_to_string(sandbox.join(".zshrc")).expect("砂場に既定の .zshrc が無い");
+    assert!(zshrc.contains("PROMPT='tako %1~ %% '"), "{zshrc}");
+    assert!(
+        !real.join(".zshrc").exists(),
+        "利用者のホームへ .zshrc を書いた"
+    );
+
+    // ② 並べた ZDOTDIR が利用者のホームの中（~/.config/zsh の形）でも砂場が勝ち、その旨を 1 行出す
+    let inner = scratch.dir("realhome/.config/zsh");
+    let inner_arg = format!("ZDOTDIR={}", inner.display());
+    let (got, stderr) = launch_capture(&scratch, &real_ref, &[&inner_arg]);
+    assert_eq!(
+        zdotdir(&got).as_deref(),
+        sandbox.to_str(),
+        "並べた利用者の ZDOTDIR が勝った"
+    );
+    assert!(
+        stderr.contains("#2627"),
+        "並べた値を砂場へ替えた旨が出ていない: {stderr}"
+    );
+
+    // ③ export された ZDOTDIR が利用者のホームの中なら、HOME が一時の dir でも砂場
+    let tmp_home = scratch.dir("tmphome");
+    let inner_s = inner.display().to_string();
+    let mut tmp_env = production_like_env(&tmp_home);
+    tmp_env.push(("ZDOTDIR".into(), inner_s.clone()));
+    let tmp_ref: Vec<(&str, &str)> = tmp_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let got = launch_with(&scratch, &tmp_ref, &[]);
+    assert_eq!(
+        zdotdir(&got).as_deref(),
+        sandbox.to_str(),
+        "export された利用者の ZDOTDIR を砂場へ向けていない"
+    );
+
+    // ④ 呼び手の一時の HOME / ZDOTDIR（利用者のホームの外）の rc は従来どおり読む = 足さない・替えない
+    let home_env = production_like_env(&tmp_home);
+    let home_ref: Vec<(&str, &str)> = home_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let got = launch_with(&scratch, &home_ref, &[]);
+    assert_eq!(
+        zdotdir(&got),
+        None,
+        "呼び手の一時の HOME なのに ZDOTDIR を足した"
+    );
+    let zdot = scratch.dir("zdot");
+    let zdot_arg = format!("ZDOTDIR={}", zdot.display());
+    let got = launch_with(&scratch, &real_ref, &[&zdot_arg]);
+    assert_eq!(
+        zdotdir(&got).as_deref(),
+        zdot.to_str(),
+        "呼び手の一時の ZDOTDIR を替えた"
+    );
+
+    // ⑤ opt-in（並べる / export）と A/B の旧挙動は手を付けない。0 は opt-in ではない
+    for args in [&["TAKO_ISO_USER_RC=1"][..], &["TAKO_2627_LEGACY=1"][..]] {
+        let got = launch_with(&scratch, &real_ref, args);
+        assert_eq!(zdotdir(&got), None, "{args:?} なのに ZDOTDIR を足した");
+    }
+    let mut optin_env = real_ref.clone();
+    optin_env.push(("TAKO_ISO_USER_RC", "1"));
+    optin_env.push(("ZDOTDIR", &inner_s));
+    let got = launch_with(&scratch, &optin_env, &[]);
+    assert_eq!(
+        zdotdir(&got).as_deref(),
+        Some(inner_s.as_str()),
+        "export の opt-in なのに利用者の ZDOTDIR を替えた"
+    );
+    let got = launch_with(&scratch, &real_ref, &["TAKO_ISO_USER_RC=0"]);
+    assert_eq!(
+        zdotdir(&got).as_deref(),
+        sandbox.to_str(),
+        "TAKO_ISO_USER_RC=0 を opt-in と読んだ"
+    );
+
+    // ⑥ zsh 以外は ZDOTDIR を読まないので、利用者のホームのままなら「未対策」と 1 行出す（zsh は出さない）
+    let (_, stderr) = launch_capture(&scratch, &real_ref, &["SHELL=/bin/bash"]);
+    assert!(stderr.contains("未対策: SHELL=/bin/bash"), "{stderr}");
+    let (_, stderr) = launch_capture(&scratch, &real_ref, &["SHELL=/bin/zsh"]);
+    assert!(!stderr.contains("未対策"), "{stderr}");
 }
 
 // ---- 待ちの CLI の挙動（偽の GUI と偽の CLI で走らせる。#2598）----------------------------
