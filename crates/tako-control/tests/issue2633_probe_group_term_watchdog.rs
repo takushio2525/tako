@@ -294,20 +294,11 @@ mod live {
     /// 印が現れる / 消えるのを待つ外側の締め切り（「残っている」を判定するための上限。所要の assert ではない）
     const OUTER: Duration = Duration::from_secs(15);
 
-    fn write_script(path: &Path, body: &str) {
-        std::fs::write(path, body).expect("書ける");
-        let status = Command::new("chmod")
-            .arg("+x")
-            .arg(path)
-            .status()
-            .expect("chmod");
-        assert!(status.success());
-    }
-
-    /// pyenv の rehash の取り方を写した偽物（EXIT の trap を先に置き、noclobber でロックを作って眠る）
+    /// pyenv の rehash の取り方を写した偽物（EXIT の trap を先に置き、noclobber でロックを作って眠る）。
+    /// 書くのは偽の実行ファイルの 1 実装（実行権・作りたてのファイルの初回 exec の検査を上限の外で済ませる = #2222）
     fn fake_rehash(dir: &Path) -> std::path::PathBuf {
         let path = dir.join("pyenv-rehash");
-        write_script(
+        tako_core::fake_exec::write_script(
             &path,
             "#!/bin/bash\n\
              LOCK=\"$1\"; MARK=\"$2\"\n\
