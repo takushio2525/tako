@@ -154,7 +154,10 @@ const DISPATCH_RULES: &[(&str, &str)] = &[
     ("limit_resume_bulk", "all_panes()"),
 ];
 const DRIVER_RULES: &[(&str, &str)] = &[
-    ("drive_limit_autoresume", "all_panes()"),
+    // #2647: 対象の収集は段と背景の画面の計画（`tick_screens::plan`）が共有する 1 実装へ出た。
+    // 段はそれを引き、それが退避中まで見る
+    ("drive_limit_autoresume", "limit_resume_targets()"),
+    ("limit_resume_targets", "all_panes()"),
     ("limit_resume_detected", "all_panes()"),
 ];
 const CORE_RULES: &[(&str, &str)] = &[

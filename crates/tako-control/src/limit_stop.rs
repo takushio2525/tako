@@ -96,8 +96,12 @@ fn detect_limit_stop_from_screen(
 }
 
 /// 上限で止まっているかと、その型・根拠の 1 行（**時刻の基準に依らない**部分。#1710 で
-/// 解除時刻の解決と分けた = 判定は 1 回・解除時刻は告知の検知時刻から 1 回だけ解く）
-fn classify_limit_stop(lines: &[String]) -> Option<(LimitStopKind, String)> {
+/// 解除時刻の解決と分けた = 判定は 1 回・解除時刻は告知の検知時刻から 1 回だけ解く）。
+///
+/// 画面の行だけで決まる重い部分（ダイアログの検出・異常停止の照合）なので、GUI の 2 秒 tick は
+/// これを背景のスレッドで先に済ませ、UI スレッドは [`observe_classified`] で残り（ペインの記憶・
+/// 構造化ソースの時刻を当てる部分）だけを行う（#2647）
+pub fn classify_limit_stop(lines: &[String]) -> Option<(LimitStopKind, String)> {
     // ダイアログが入力欄を奪っているならそちらが優先（idle 判定より確実）。
     // usage_limit 以外のダイアログ（permission / plan 確認 / model 選択）では
     // **何も返さない** = 自動復帰は発動しない
@@ -175,7 +179,29 @@ pub fn observe_limit_stop(
     tz_offset: i32,
     hint: Option<&LimitHint>,
 ) -> Option<ObservedLimit> {
-    let (kind, message) = classify_limit_stop(lines)?;
+    observe_classified(
+        lines,
+        classify_limit_stop(lines),
+        seen,
+        now,
+        tz_offset,
+        hint,
+    )
+}
+
+/// [`observe_limit_stop`] の、判定（[`classify_limit_stop`]）を済ませた後の部分（#2647）。
+///
+/// `classified` は**同じ `lines`** を [`classify_limit_stop`] に通した結果でなければならない
+/// （GUI の 2 秒 tick は背景のスレッドで判定し、UI スレッドで行と一緒に受け取ってここへ渡す）
+pub fn observe_classified(
+    lines: &[String],
+    classified: Option<(LimitStopKind, String)>,
+    seen: Option<&LimitSeen>,
+    now: i64,
+    tz_offset: i32,
+    hint: Option<&LimitHint>,
+) -> Option<ObservedLimit> {
+    let (kind, message) = classified?;
     let notice = notice_key(lines, &message);
     let detected_at = tako_core::limit_resume::detected_at(seen, &notice, now);
     let mut stop = LimitStop {

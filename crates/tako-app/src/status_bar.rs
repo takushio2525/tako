@@ -1043,7 +1043,9 @@ impl TakoApp {
                                         .p(px(2.0))
                                         .hover(|d| d.bg(rgba(theme.surface_hover_strong)))
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.refresh_agent_metrics();
+                                            this.refresh_agent_metrics(
+                                                &crate::tick_screens::TickScreens::Live,
+                                            );
                                             cx.notify();
                                         }))
                                         .child(

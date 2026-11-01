@@ -104,7 +104,11 @@ fn メトリクス抽出は末尾窓の共有定数で採る() {
 }
 
 /// C3: `drive_queued_message_recovery` は**先に末尾窓でヒントの有無を見て**、
-/// ヒントが出ているペインに限って全画面を撮る（判定の前に全ペインを撮らない）
+/// ヒントが出ているペインに限って全画面を撮る（判定の前に全ペインを撮らない）。
+///
+/// #2647 以後、ヒントの判定の 1 実装は `TickSource::queued_hint_pending`（tick_screens.rs の既定の
+/// 実装。2 秒 tick では背景のスレッドが先に走らせ、A/B の修正前の形ではその場の端末へ通す）。
+/// 末尾窓で採るのはそこ、全画面を判定の後で採るのは段の本体、の 2 か所を見る
 #[test]
 fn キュー救出は判定の前に全画面を撮らない() {
     let root = workspace_root();
@@ -113,24 +117,42 @@ fn キュー救出は判定の前に全画面を撮らない() {
     let (body, line) = fn_body(&src, "drive_queued_message_recovery")
         .expect("drive_queued_message_recovery の定義");
 
-    let tail = body.find("tail_lines(");
     let hint = body
-        .find("queued_messages_pending")
+        .find("queued_hint_pending(")
         .expect("ヒント判定の呼び出しが無い（関数の中身が変わった）");
-    assert!(
-        tail.is_some_and(|t| t < hint),
-        "{}:{line} ヒント判定の材料を末尾窓で採っていない（判定の前に全ペインを撮っている。#1301 C3）",
-        main_rs.display()
-    );
     assert!(
         body[hint..].contains("visible_lines()"),
         "{}:{line} `state.observe` へ渡す全画面をヒント判定の後で採っていない（#1301 C3）",
         main_rs.display()
     );
     assert!(
+        !body[..hint].contains("visible_lines()"),
+        "{}:{line} ヒント判定の前に全画面を撮っている（#1301 C3）",
+        main_rs.display()
+    );
+
+    let tick_rs = root.join("crates/tako-app/src/tick_screens.rs");
+    let src = read_code(&tick_rs);
+    let (body, line) =
+        fn_body(&src, "queued_hint_pending").expect("TickSource::queued_hint_pending の定義");
+    let tail = body.find("tail_lines(");
+    let pending = body.find("queued_messages_pending").expect(
+        "ヒント判定の 1 実装が queued_messages_pending を呼んでいない（関数の中身が変わった）",
+    );
+    assert!(
+        tail.is_some_and(|t| t < pending),
+        "{}:{line} ヒント判定の材料を末尾窓で採っていない（判定の前に全ペインを撮っている。#1301 C3）",
+        tick_rs.display()
+    );
+    assert!(
         body.contains("AGENT_TUI_TAIL_LINES"),
         "{}:{line} 末尾窓の共有定数を使っていない（窓の値を直書きするとドリフトする。#1301）",
-        main_rs.display()
+        tick_rs.display()
+    );
+    assert!(
+        !body.contains("visible_lines()") || body.contains("legacy_c3"),
+        "{}:{line} ヒント判定が A/B の外で全画面を撮っている（#1301 C3）",
+        tick_rs.display()
     );
 }
 

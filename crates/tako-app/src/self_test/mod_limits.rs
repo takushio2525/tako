@@ -46,7 +46,7 @@ pub(super) async fn mod_limits_visual(
                 app.limit_service = tako_core::LimitService::Claude;
                 app.claude_mod
                     .accept(root.as_u64(), report.clone(), received);
-                app.refresh_agent_metrics();
+                app.refresh_agent_metrics(&crate::tick_screens::TickScreens::Live);
                 cx.notify();
                 (
                     app.agent_metrics.limit_5h,
