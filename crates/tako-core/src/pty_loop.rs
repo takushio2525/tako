@@ -113,6 +113,16 @@ fn is_peer_closed(err: &io::Error) -> bool {
     }
 }
 
+/// [`Msg::HangUpAndDrain`] で子の側が全部閉じるのを待つ上限（#2625）。
+///
+/// 器（tmux）の attach クライアントなら、SIGHUP から子の側が全部閉じるまでは実測 10〜25ms。
+/// 上限に達したら従来どおり閉じる（= tmux サーバーが最後の close で止まりうる形へ戻るだけ）
+pub const HANG_UP_DRAIN_MAX: Duration = Duration::from_secs(2);
+
+/// 同上の待ちで、読むものが無いときに次に読むまで寝る間隔
+#[cfg(unix)]
+const HANG_UP_DRAIN_POLL: Duration = Duration::from_millis(2);
+
 /// 読み取りバッファの初期サイズ。`MAX_LOCKED_READ` 以上の最小の 2 冪（64 KiB）。
 /// ロックが取れている通常経路はこのサイズで完結する
 const INITIAL_READ_BUFFER_SIZE: usize = 0x1_0000;
@@ -141,6 +151,16 @@ pub enum Msg {
     Input(Cow<'static, [u8]>),
     /// ループを終了する
     Shutdown,
+    /// 子（`child` = PTY 直下の子の pid）へ SIGHUP を送り、子の側（スレーブ）が全部閉じるまで
+    /// 親側を読み捨ててからループを終了する（#2625。unix だけ。他は [`Msg::Shutdown`] と同じ）。
+    ///
+    /// 器（tmux）の attach クライアントのペイン用。`Shutdown` の後の `Pty` の drop は
+    /// 「SIGHUP → 子を wait → 親側を閉じる」順で、そのとき親側はもう誰も読んでいない。
+    /// クライアントの tty は tmux サーバーも開いていて、その**最後の close はサーバーの中**
+    /// （`server_client_lost`）で起き、読まれない出力が残った tty の close が約 600ms 戻らない
+    /// = 器のサーバー全体（他の器のペインの画面・tako が器へ打つ命令）がその間止まる。
+    /// 親側を読み続けたまま閉じさせれば止まらない。`limit` を過ぎたら待たずに閉じる
+    HangUpAndDrain { child: u32, limit: Duration },
     /// PTY をリサイズする
     Resize(WindowSize),
 }
@@ -345,6 +365,9 @@ pub struct PtyLoop<T: EventedPty, U: EventListener> {
     /// **倒すのは「グリッドを読む直前」**でなければならない。倒した後に届いた出力は
     /// 次の `Wakeup` を立て直すので、取りこぼしにならない
     wakeup_pending: Arc<AtomicBool>,
+    /// [`Msg::HangUpAndDrain`] を受けて抜けたときの子の pid と待つ上限（#2625）。
+    /// **立つのは閉じる知らせで抜けたときだけ**（子の終了の腕・読み書きの失敗で抜けたら立たない）
+    hang_up: Option<(u32, Duration)>,
 }
 
 impl<T, U> PtyLoop<T, U>
@@ -368,6 +391,7 @@ where
             terminal,
             event_proxy,
             wakeup_pending,
+            hang_up: None,
         })
     }
 
@@ -393,6 +417,10 @@ where
                 Msg::Input(input) => state.write_list.push_back(input),
                 Msg::Resize(window_size) => self.pty.on_resize(window_size),
                 Msg::Shutdown => return false,
+                Msg::HangUpAndDrain { child, limit } => {
+                    self.hang_up = Some((child, limit));
+                    return false;
+                }
             }
         }
 
@@ -516,6 +544,50 @@ where
             }
         }
     }
+
+    /// 子へ SIGHUP を送り、子の側（スレーブ）が全部閉じるまで親側を読み捨てる（#2625）。
+    ///
+    /// 器（tmux）の attach クライアントは SIGHUP で抜け、tmux サーバーがその tty を閉じる。
+    /// その間も親側を読んでいるので、サーバーの close は読まれない出力を抱えて待たない。
+    /// 読んだバイトは捨てる（閉じたペインの画面はもう描かない・UI へイベントも送らない）。
+    /// 子の側が全部閉じたら macOS は EOF（0）、Linux は EIO が返る。`limit` を過ぎたら待たずに戻る
+    #[cfg(unix)]
+    fn hang_up_and_drain(&mut self, child: u32, limit: Duration) {
+        // SAFETY: kill(2) へ値を渡すだけ。子を回収する（= pid を手放す）のはこのループの
+        // 子の終了の腕と `Pty` の drop だけで、ここへ来るのは閉じる知らせで抜けたとき
+        // （子の終了の腕を通っていない）かつ `Pty` の drop より前 = pid はまだこの子のもの
+        unsafe {
+            libc::kill(child as libc::pid_t, libc::SIGHUP);
+        }
+        let started = Instant::now();
+        let mut buf = [0u8; 4096];
+        loop {
+            match self.pty.reader().read(&mut buf) {
+                // 子の側が全部閉じた（macOS）
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(err) => match err.kind() {
+                    ErrorKind::Interrupted => {}
+                    ErrorKind::WouldBlock => {
+                        if started.elapsed() >= limit {
+                            tracing::warn!(
+                                "PTY の子の側が {}ms で閉じなかったので待たずに閉じる（#2625）",
+                                limit.as_millis()
+                            );
+                            return;
+                        }
+                        std::thread::sleep(HANG_UP_DRAIN_POLL);
+                    }
+                    // 子の側が全部閉じた（Linux の EIO）か、もう読めない
+                    _ => return,
+                },
+            }
+        }
+    }
+
+    /// Windows（ConPTY）は従来どおり閉じる（#2625 は unix の tty の close の話）
+    #[cfg(not(unix))]
+    fn hang_up_and_drain(&mut self, _child: u32, _limit: Duration) {}
 
     #[inline]
     fn pty_write(&mut self, state: &mut State) -> io::Result<()> {
@@ -716,6 +788,12 @@ where
                             break 'event_loop;
                         }
                     }
+                }
+
+                // #2625: 閉じる知らせが器のクライアントを先に帰す形なら、子の側が全部閉じるまで
+                // 親側を読み捨ててから閉じる（`Pty` の drop より前 = 親側がまだ開いている）
+                if let Some((child, limit)) = self.hang_up.take() {
+                    self.hang_up_and_drain(child, limit);
                 }
 
                 // 監視対象はここでは drop されないので明示的に外す

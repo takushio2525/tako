@@ -4996,6 +4996,34 @@ OS で分岐すると「macOS だけ通る道」が増えて、この等価性�
   （上の約束の逆戻りを file:line で名指す）、順序・待たないこと・flush・見送り・panic・全体上限の
   順序は `pane_log_writer` の単体テスト
 
+## 器のペインの PTY は attach クライアントを先に帰してから閉じる（Issue #2625）
+
+器（tmux）のペインの PTY 直下の子は attach クライアントで、その tty は tmux サーバーも開いている
+（クライアントが fd を渡す）。従来の閉じ方（`Msg::Shutdown` → `Pty` の drop = 読むのをやめる →
+SIGHUP → 子を wait → 親側を閉じる）では、クライアントが抜けるときにサーバーがその tty へ書く
+後始末の出力を誰も読まず、tty の**最後の close がサーバーの中**（`server_client_lost`）で約 600ms
+戻らなかった（macOS の隔離 GUI で閉じるたびに外から打った `tmux ls` が 593〜606ms・tmux の sample で
+1 秒のうち 482 サンプルが `server_client_lost → close`）。tmux サーバーは 1 本のスレッドなので、
+その間は器のサーバー全体（他の器のペインの画面・tako が器へ打つ命令・`tako list` の器の一覧）が止まる。
+tako のメインスレッドは止まっていない（同じ区間の `tako scrollback` は 9〜16ms）。
+
+- **閉じ方は端末を起こした直後に決める**: `spawn_session` が器のペイン（`backend_session.is_some()`）の
+  端末に `TerminalSession::hang_up_client_on_close()` を立てる。判断は
+  `tako_core::tmux_backend::hang_up_client_on_close()` の 1 か所（unix・`backend::Choice::Tmux`・A/B でない）。
+  閉じる経路（× / ⌘W / CLI / MCP / タブ・窓ごと）はすべて端末の drop を通るので、経路ごとに書かない
+- **端末の drop は `Msg::HangUpAndDrain { child, limit }` を送るだけ**。子へのシグナルは drop から
+  送らない（PTY のスレッドが子を回収した後なら pid が別のプロセスへ再利用されうる）
+- **PTY のスレッドは閉じる知らせで抜けたときだけ、`Pty` を落とす前に `hang_up_and_drain` を通る**:
+  子へ SIGHUP → 子の側が全部閉じる（macOS は EOF・Linux は EIO）まで親側を読み捨てる → 閉じる。
+  読んだバイトは捨て、UI へイベントを送らない（漏れても #1857 の serial の照合と「端末の無いペイン」で捨てられる）。
+  上限（`pty_loop::HANG_UP_DRAIN_MAX` = 2 秒）を過ぎたら従来どおり閉じる。実測では SIGHUP から
+  子の側が閉じるまで 10〜25ms、閉じた器が `tmux ls` から消えるまで 25〜60ms（修正前は 630〜700ms）
+- 直接ペイン（器なし）・Windows（psmux = ConPTY には tty の close が無い）は従来どおり `Msg::Shutdown`
+- A/B は `TAKO_2625_LEGACY=1`（ゲートは `tmux_backend::issue2625_legacy()` の 1 か所）。番犬は
+  `crates/tako-control/tests/issue2625_backend_client_hangup_watchdog.rs`、閉じた後の出力を読み切ることは
+  `tako_core::terminal` の単体テスト、実経路（止まり・fd・子プロセス・ゾンビ・終了と復元・直接ペイン・A/B）は
+  `bash scripts/test-backend-close-2625.sh`
+
 ## 機械全体の設定を倒す記録には「所有者」を書く（Issue #1373 / #449）
 
 **`data_dir` の記録は複数の tako-app プロセスで共有される**（隔離されるのは

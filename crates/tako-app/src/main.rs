@@ -10881,7 +10881,7 @@ impl TakoApp {
         options
             .scrollback_lines
             .get_or_insert(self.scrollback_lines);
-        let (session, mut rx) =
+        let (mut session, mut rx) =
             match TerminalSession::spawn_in(INITIAL_COLS, INITIAL_ROWS, options, container_pin) {
                 Ok(spawned) => spawned,
                 Err(e) => {
@@ -10892,6 +10892,12 @@ impl TakoApp {
                     return Err(e);
                 }
             };
+        // #2625: 器（tmux）のペインは、閉じるときに attach クライアントを先に帰してから PTY を
+        // 閉じる（tty の最後の close を器のサーバーの中で起こさない = サーバー全体を止めない）。
+        // 閉じる経路（× / ⌘W / CLI / MCP / タブ・窓ごと）はすべて端末の drop を通るのでここで決める
+        if backend_session.is_some() && tako_core::tmux_backend::hang_up_client_on_close() {
+            session.hang_up_client_on_close();
+        }
         // #2367: 器の tmux サーバーの fd の上限を persist.log へ（サーバーが変わったときだけ 1 行。
         // 読むのは裏のスレッド = UI スレッドは止めない）
         if container_spawn {
