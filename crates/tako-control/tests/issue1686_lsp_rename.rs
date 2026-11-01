@@ -63,6 +63,8 @@ impl Drop for Scratch {
 
 /// 偽サーバの設定。`rules` が `None` なら `--rename` を渡さない（能力を申告しない）
 fn config(scratch: &Scratch, rules: Option<&Value>, extra: &[&str]) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let mut args = vec!["--log".to_string(), scratch.log().display().to_string()];
     if let Some(rules) = rules {
         let file = scratch.0.join("rename.json");

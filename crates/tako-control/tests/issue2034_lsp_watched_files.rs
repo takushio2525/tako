@@ -113,6 +113,8 @@ fn rs_watchers() -> Value {
 }
 
 fn config(scratch: &Scratch, watchers: &Value, extra: &[&str]) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let mut args = vec![
         "--scenario".to_string(),
         "normal".to_string(),

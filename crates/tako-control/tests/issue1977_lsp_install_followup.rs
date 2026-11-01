@@ -175,6 +175,8 @@ fn open_editing(manager: &LspManager, path: &Path, text: &str) -> DocLink {
 
 /// pyright 型の偽サーバ（読み込みの終わりは合図 = 実時間に任せない。済んだら候補を 2 つ返す）
 fn quiet_config(scratch: &Scratch) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let completion = scratch.write(
         "completion.json",
         &json!({ "items": [{ "label": "abc" }, { "label": "abd" }] }).to_string(),

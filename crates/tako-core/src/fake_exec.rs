@@ -31,9 +31,20 @@
 //!   CPU を焼かずに「検査の列が長い回」を作る。空打ちがあれば遅れは上限の外で消化される
 //!
 //! シェルのテストには同じ規則の `scripts/lib/fake-exec.sh` がある（env と空打ちの引数は共通）。
+//!
+//! ## cargo が作る実行ファイル（Issue #2228）
+//!
+//! cargo がリンクしたテスト用の実行ファイル（`CARGO_BIN_EXE_*` = 偽の言語サーバ `tako-lsp-fake`・
+//! 製品の `tako`）とその写しも新しいファイルなので、初回の exec に同じ検査を受ける。検査の長さは
+//! **大きさに比例**する（実測: 2 MB の `tako-lsp-fake` 0.16〜0.35 秒・12 MB の `tako-mcp` 0.33〜0.54 秒・
+//! 83 MB の debug の `tako` 1.4〜1.5 秒。2 回目からは 3〜9 ms）。テストの時計を回す前に
+//! [`warm_binary`] で 1 回空打ちする。テスト専用の実行ファイルは `main` の 1 文目で
+//! [`enter_test_binary`] を呼び、空打ちと注入（[`INJECT_FIRST_EXEC_ENV`]）を受ける。
+//! A/B は [`LEGACY_BIN_ENV`]（`TAKO_2228_LEGACY=1` = 空打ちしない）。
 
-use std::path::Path;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 空打ちの引数（スタブはこれを受けたら本文を走らせずに終わる）
 pub const WARM_ARG: &str = "tako-fake-exec-warm";
@@ -45,7 +56,10 @@ pub const WARM_BUDGET: Duration = Duration::from_secs(120);
 /// A/B: `1` なら空打ちしない（修正前の形）
 pub const LEGACY_ENV: &str = "TAKO_2222_LEGACY";
 
-/// 注入: 各スタブの初回の exec をこのミリ秒だけ遅らせる（検証専用）
+/// A/B: `1` なら cargo が作る実行ファイルを空打ちしない（[`warm_binary`] の修正前の形。#2228）
+pub const LEGACY_BIN_ENV: &str = "TAKO_2228_LEGACY";
+
+/// 注入: 各スタブ・cargo が作る実行ファイルの初回の exec をこのミリ秒だけ遅らせる（検証専用）
 pub const INJECT_FIRST_EXEC_ENV: &str = "TAKO_2222_INJECT_FIRST_EXEC_MS";
 
 /// スタブの本文（1 行目は shebang）へ、空打ちの行（と注入の行）を 2 行目に差し込む（純関数）。
@@ -96,8 +110,121 @@ pub fn write_script(path: &Path, text: &str) {
     }
 }
 
+/// cargo が作ったテスト用の実行ファイル（`CARGO_BIN_EXE_*`）とその写しを 1 回空打ちする（Issue #2228）。
+///
+/// **テストの時計（`wait_until` の締め切り・要求の上限）を回す前に呼ぶ**。同じファイル（パス・大きさ・
+/// 更新時刻が同じ = cargo が作り直していない）はプロセスで 1 回だけ起こし、同時に呼んだ他のスレッドは
+/// 空打ちが終わるまで待つ（待たずに時計を回すと、同じ検査の列の後ろに並ぶ）。写しは別のパス =
+/// もう 1 回起こす（コピーは新しいファイル）。
+///
+/// 起こすときの引数は [`WARM_ARG`] だけで、テスト専用の実行ファイルは [`enter_test_binary`] で本文を
+/// 走らせずに終わる。受け付けない実行ファイル（製品の `tako` = 知らない引数として断る）でも exec の
+/// 段は済むので、終了コードは問わない。[`LEGACY_BIN_ENV`] が `1` なら起こさない（修正前の形）。
+/// ファイルが無い・起こせないときは panic する（テストの組み立ての誤り）
+pub fn warm_binary(path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    if std::env::var(LEGACY_BIN_ENV).as_deref() == Ok("1") {
+        return;
+    }
+    let id = file_identity(path).unwrap_or_else(|| {
+        panic!(
+            "空打ちする実行ファイルが無い（cargo がまだ作っていない？）: {}",
+            path.display()
+        )
+    });
+    let key = (path.to_path_buf(), id);
+    static WARMED: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+    // 空打ちの間は握ったまま = 同時に呼んだスレッドは終わるまで待つ（検査は 1 本ずつ進むので、
+    // 別のファイルの空打ちを待たせても失うものは無い）
+    let mut warmed = WARMED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warmed.contains(&key) {
+        return;
+    }
+    warm(path);
+    warmed.push(key);
+}
+
+/// cargo が作るテスト用の実行ファイルの `main` の **1 文目**（Issue #2228）。
+///
+/// - [`INJECT_FIRST_EXEC_ENV`] があれば、この実行ファイルの**初回の exec**をその長さ遅らせる
+///   （スクリプトの注入行と同じ役 = [`inject_first_exec_delay_here`]）
+/// - 引数が [`WARM_ARG`] なら本文を走らせずに終わる（[`warm_binary`] の空打ち）
+pub fn enter_test_binary() {
+    inject_first_exec_delay_here();
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == WARM_ARG)
+    {
+        std::process::exit(0);
+    }
+}
+
+/// 注入（[`INJECT_FIRST_EXEC_ENV`]。検証専用）: 今の実行ファイルの初回の exec の検査を演じる（Issue #2228）。
+///
+/// 印は `<実行ファイル>.first-exec` に「ファイルの識別（大きさ・更新時刻）と検査の終わる時刻」を書く。
+/// 印が無い・識別が違う（cargo が作り直した）回が初回で、その回が終わる時刻を決めて眠る。**終わる前に
+/// 起きた他の exec も、その時刻まで眠る**（本物の検査も、済むまでは同じファイルのどの exec も待たせる）。
+/// env が無ければ何もしない。製品の `main` は debug ビルドでだけ呼ぶ（配布物の隣に印を書かない）
+pub fn inject_first_exec_delay_here() {
+    let Some(delay) = inject_first_exec_delay() else {
+        return;
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let wait = first_exec_wait(&exe, delay, unix_ms(SystemTime::now()));
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
+    }
+}
+
+/// 注入の印を読み書きして、今の exec が眠る長さを返す（`now_ms` は UNIX 時刻のミリ秒）
+fn first_exec_wait(exe: &Path, delay: Duration, now_ms: u128) -> Duration {
+    let Some(id) = file_identity(exe) else {
+        return Duration::ZERO;
+    };
+    let marker = marker_of(exe);
+    let recorded = std::fs::read_to_string(&marker).ok().and_then(|text| {
+        let (seen, until) = text.trim().split_once(' ')?;
+        (seen == id).then(|| until.parse::<u128>().ok()).flatten()
+    });
+    let until = recorded.unwrap_or_else(|| {
+        let until = now_ms + delay.as_millis();
+        // 書けなければ印なし = 次の exec も初回として眠る（検証が赤に倒れる側 = 見逃さない）
+        let _ = std::fs::write(&marker, format!("{id} {until}\n"));
+        until
+    });
+    Duration::from_millis(u64::try_from(until.saturating_sub(now_ms)).unwrap_or(u64::MAX))
+}
+
+/// 注入の印の置き場（スクリプトの注入行と同じ `<パス>.first-exec`）
+fn marker_of(exe: &Path) -> PathBuf {
+    let mut name = exe.as_os_str().to_owned();
+    name.push(".first-exec");
+    PathBuf::from(name)
+}
+
+/// ファイルの識別（大きさと更新時刻。cargo の作り直しで変わる）。読めなければ `None`
+fn file_identity(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let nanos = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some(format!("{}-{nanos}", meta.len()))
+}
+
+fn unix_ms(at: SystemTime) -> u128 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 /// 1 回空打ちして初回の検査を済ませる。終わらなかった回は stderr へ 1 行残して進む
-#[cfg(unix)]
 fn warm(path: &Path) {
     let program = path
         .to_str()
@@ -202,5 +329,89 @@ mod tests {
         );
         warm(&copy);
         assert!(dir.path().join("copy.first-exec").exists());
+    }
+
+    /// cargo の実行ファイルの注入の印（#2228）: 初回は遅れの全部を眠り、検査が終わるまでに起きた
+    /// 他の exec も同じ時刻まで眠り、済んだ後は眠らない。作り直した（識別が変わった）ファイルは
+    /// 初回に戻る。時刻は引数で渡す（実時間で測らない）
+    #[test]
+    fn 注入の印はファイルの識別と検査の終わる時刻で決まる() {
+        let dir = crate::test_residue::ScratchDir::new("fake-exec-2228-marker");
+        let exe = dir.path().join("bin");
+        std::fs::write(&exe, b"v1").unwrap();
+        let delay = Duration::from_millis(5_000);
+        assert_eq!(first_exec_wait(&exe, delay, 1_000_000), delay, "初回");
+        assert!(
+            dir.path().join("bin.first-exec").exists(),
+            "印は <実行ファイル>.first-exec"
+        );
+        assert_eq!(
+            first_exec_wait(&exe, delay, 1_002_000),
+            Duration::from_millis(3_000),
+            "検査の途中に起きた exec は終わる時刻まで"
+        );
+        assert_eq!(first_exec_wait(&exe, delay, 1_005_000), Duration::ZERO);
+        assert_eq!(
+            first_exec_wait(&exe, delay, 9_000_000),
+            Duration::ZERO,
+            "済んだ後"
+        );
+        // 大きさが変わる = cargo が作り直した
+        std::fs::write(&exe, b"v2 relinked").unwrap();
+        assert_eq!(
+            first_exec_wait(&exe, delay, 9_000_000),
+            delay,
+            "作り直したファイルは初回に戻る"
+        );
+        let missing = dir.path().join("missing");
+        assert_eq!(first_exec_wait(&missing, delay, 0), Duration::ZERO);
+    }
+
+    /// cargo の実行ファイルの空打ち（#2228）: 同じファイルは 1 回だけ起こし、同時に呼んだスレッドは
+    /// 空打ちが済んでから返る（返った時点で起こした跡がある = 呼び手の時計の中に検査を持ち込まない）。
+    /// 作り直したファイルはもう 1 回起こす。空打ちの行を持たない実行ファイル（製品の `tako` と同じく
+    /// 引数を問わず走って終わる形）で見る
+    #[cfg(unix)]
+    #[test]
+    fn 実行ファイルの空打ちは同じファイルに1回で同時の呼び手は済むまで待つ() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_residue::ScratchDir::new("fake-exec-2228-warm");
+        let ran = dir.path().join("ran");
+        let bin = dir.path().join("bin");
+        // 眠りは同時の呼び手が空打ちの途中に重なる幅を作るだけ（判定は跡の有無で、時間は測らない）
+        let body = format!(
+            "#!/bin/sh\n/bin/sleep 0.2\necho \"$1\" >> '{}'\n",
+            ran.display()
+        );
+        std::fs::write(&bin, &body).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let lines = || {
+            std::fs::read_to_string(&ran)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        std::thread::scope(|s| {
+            let callers: Vec<_> = (0..4)
+                .map(|_| {
+                    s.spawn(|| {
+                        warm_binary(&bin);
+                        lines()
+                    })
+                })
+                .collect();
+            for caller in callers {
+                assert_eq!(caller.join().unwrap(), 1, "返った時点で空打ちが済んでいる");
+            }
+        });
+        assert_eq!(
+            std::fs::read_to_string(&ran).unwrap(),
+            format!("{WARM_ARG}\n")
+        );
+        warm_binary(&bin);
+        assert_eq!(lines(), 1, "同じファイルは 2 度起こさない");
+        std::fs::write(&bin, format!("{body}# relinked\n")).unwrap();
+        warm_binary(&bin);
+        assert_eq!(lines(), 2, "作り直したファイルはもう 1 回起こす");
     }
 }

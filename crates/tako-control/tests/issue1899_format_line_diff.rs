@@ -73,6 +73,8 @@ impl Drop for Scratch {
 /// 偽サーバの設定。規則のファイルは manager ごとに分ける（サーバは最初の問い合わせで起きるので、
 /// 同じ置き場の 2 つ目の規則が 1 つ目を上書きすると両方が 2 つ目で答える）
 fn config(scratch: &Scratch, name: &str, rules: &Value) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let rules_path = scratch.0.join(format!("format-{name}.json"));
     std::fs::write(&rules_path, rules.to_string()).unwrap();
     let args = vec![

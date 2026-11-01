@@ -43,6 +43,8 @@ impl Drop for Scratch {
 }
 
 fn config(log: PathBuf, scenario: &str) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let args = vec![
         "--scenario".to_string(),
         scenario.to_string(),
