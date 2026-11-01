@@ -4903,6 +4903,45 @@ OS で分岐すると「macOS だけ通る道」が増えて、この等価性�
   （`calls` / `skipped` / `captured` / `written` / `reconciled`）で読める。
   A/B は `TAKO_1425_LEGACY=1`（旧の「組んでから比べる」を同一バイナリで再現）
 
+## layout.json の書き出しはメインスレッドで待たない（Issue #2610）
+
+`save_layout` は GUI のメインスレッドで走る。以前はここで書き出し（直前の版の読み直し・
+世代バックアップ・整形・write・rename）を同期し、冒頭でペインログの Mutex も待っていた。
+背景のペインログの取り込みは**追記の I/O の間ずっとその Mutex を握る**ので、ディスクが
+詰まるとどちらの経路でも GUI が丸ごと固まった（本番の perf.log で最大 98,982ms。
+隔離 GUI で I/O に 5 秒の遅れを注入すると、どちらの経路も `save_layout が 5000ms 前後` +
+「UI ストール = tako の専有」を再現した）。
+
+- **書き出しと削除は `tako_control::layout_writer::LayoutWriter` を通す**（tako-app の
+  `layout_writer`）。メインスレッドは状態の採取・変化検出・比較用の直列化だけを行い、
+  `post(layout)` で版を渡して戻る。layout.json を消すのも `remove_layout_file()`（書き手の
+  `post_remove`）。**tako-app から `layout::save` / `layout::remove` を直に呼ばない**
+  （書き手に渡した古い版が後から上書きして順序が崩れる）
+- 書き手のスレッドは 1 本・待ち枠は**最新の 1 件だけ**。書き出し中に来た版は最新以外を
+  書かずに捨てる（合流）。1 本が渡された順に書くので古い版が新しい版を上書きしない。
+  ファイルの置き換えは従来の `layout::save`（tmp + rename）なので、途中で落ちても
+  layout.json は前の版か新しい版のどちらか
+- **書けなかった版は保存済みに数えない**。書き手の `latest_failed()` が真なら `save_layout` の
+  冒頭で `last_saved_layout` を外し、その呼び出しで書き直す（理由は従来と同じ persist.log の
+  「保存失敗: …」）
+- **ペインログの取り込み位置は `try_lock` で読む**。握られていれば前回読めた値
+  （`pane_log_history`）で比べ・書き、次の呼び出しで追いつく（変化検出キーに載るので
+  取りこぼさない）。待ってでも最新を読むのは `refresh_pane_log_history()` だけ
+- **プロセスが抜ける・新しいプロセスが読む直前は書き終わりを待つ**:
+  `refresh_pane_log_history()` → `save_layout()` → `flush_layout_writer(why)` の順。
+  終了（`on_app_quit`。GPUI の終了の猶予 200ms では足りないので同期で待つ。`quitting` でも
+  待つ = 最後のタブの明示クローズの削除はその経路で来る。`cleanup_process_scoped` より前）と
+  更新の起動し直し（`finish_update` / `hand_over_to_installer`。macOS は `open -n` の新しい
+  プロセスがすぐ layout.json を読む）。待つ長さは従来の同期の書き出しと同じ（短くはならない）
+  で、1 秒を超えたら persist.log へ 1 行残す
+- 書き出し 1 件が 1 秒を超えたら perf.log へ「layout.json の書き出し（背景）が Nms」を残す
+  （メインスレッドの専有ではないが、ディスクの詰まりを後から読めるようにする）
+- 内訳は `tako persist` の `save_layout` に `coalesced` / `failed` / `max_write_ms` / `pending` /
+  `pane_log_busy` が加わる。A/B は `TAKO_2610_LEGACY=1`（メインスレッドで同期に書く・消す・
+  Mutex を待つ）。番犬は `crates/tako-control/tests/issue2610_save_layout_offload_watchdog.rs`
+  （上の約束の逆戻りを file:line で名指す）、書き手の順序・合流・失敗・panic は
+  `layout_writer` の単体テスト
+
 ## 機械全体の設定を倒す記録には「所有者」を書く（Issue #1373 / #449）
 
 **`data_dir` の記録は複数の tako-app プロセスで共有される**（隔離されるのは

@@ -1026,7 +1026,11 @@ impl TakoApp {
     fn finish_update(&mut self, applied: update_checker::Applied, cx: &mut Context<Self>) {
         self.update_state = UpdateState::Done(txt::restarting(&applied.message));
         cx.notify();
+        // #2610: macOS は `open -n` で新しいプロセスがすぐ layout.json を読むので、背景の書き手が
+        // 書き終えるまで待ってから起動し直す
+        self.refresh_pane_log_history();
         self.save_layout();
+        self.flush_layout_writer("更新の起動し直し");
         if let Err(e) = update_checker::restart_app(&applied.restart) {
             self.update_state = UpdateState::Failed(applied.restart.failed_text(&e));
             cx.notify();

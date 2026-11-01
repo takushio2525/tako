@@ -186,6 +186,13 @@ fn legacy_1425() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_1425_LEGACY").as_deref() == Ok("1"))
 }
 
+/// #2610 の A/B。`TAKO_2610_LEGACY=1` で**同一バイナリのまま**旧挙動
+/// （layout.json の書き出しと削除をメインスレッドで同期し、ペインログの Mutex も待つ）へ戻す
+fn legacy_2610() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("TAKO_2610_LEGACY").as_deref() == Ok("1"))
+}
+
 /// #1442 の A/B。`TAKO_1442_LEGACY=1` で**同一バイナリのまま**旧挙動
 /// （窓の位置・寸法を外から決められない = `TAKO_WINDOW_BOUNDS` を読まず、
 /// `window move` / `resize` も実適用しない）へ戻す。
@@ -2621,10 +2628,17 @@ struct TakoApp {
     backend_windows_at: Option<std::time::Instant>,
     /// tmux window のキャプチャテキスト（ホバープレビュー用。ポーリングで非アクティブ window を取得）
     window_captures: HashMap<(PaneId, u32), Vec<String>>,
-    /// 直近に保存できたレイアウト（変化したときだけ書き込むための比較用）
+    /// 直近に保存できたレイアウト（変化したときだけ書き込むための比較用）。
+    /// #2610 以後は「書き手へ渡した版」で、書けなかったら `save_layout` の冒頭で外す
     last_saved_layout: Option<SavedLayout>,
     /// `save_layout` の内訳（#1425。`tako persist` / MCP から読める）
     save_layout_stats: tako_control::layout::SaveStats,
+    /// layout.json の専用の書き手（#2610）。書き出しと削除はすべてここを通す
+    /// （メインスレッドで I/O を待たない・渡した順に書く）
+    layout_writer: tako_control::layout_writer::LayoutWriter,
+    /// ペインログの取り込み位置の写し（#2610。`save_layout` は Mutex を待たず、
+    /// 握られていればこの前回読めた値で比べ・書く）
+    pane_log_history: HashMap<u64, u64>,
     /// 起動時のレイアウト復元結果（人間可読 1 行。Issue #30 の診断用。
     /// `tako persist` / MCP `tako_persist` の `last_restore` として公開する）
     restore_report: Option<String>,
@@ -5307,6 +5321,9 @@ impl TakoApp {
             window_captures: HashMap::new(),
             last_saved_layout: None,
             save_layout_stats: tako_control::layout::SaveStats::default(),
+            // 書けなかった理由は従来と同じ persist.log の「保存失敗: …」の 1 行
+            layout_writer: tako_control::layout_writer::LayoutWriter::spawn(persist_diag),
+            pane_log_history: HashMap::new(),
             restore_report,
             restore_pruned: restore_prune.pruned.clone(),
             window_frame: None,
@@ -5732,7 +5749,9 @@ impl TakoApp {
                 }
                 // 蓋閉じ防止の解除（#218: 正常終了時に disablesleep を 0 に戻す）
                 tako_control::sleep_guard::cleanup_on_exit();
-                // 終了直前の構成を保存してから抜ける（Phase 5.5。セッションは残る = 永続化）
+                // 終了直前の構成を保存してから抜ける（Phase 5.5。セッションは残る = 永続化）。
+                // ペインログの取り込み位置は待ってでも最新を読む（#2610: save_layout 自身は待たない）
+                this.refresh_pane_log_history();
                 this.save_layout();
                 // persist ON（セッション生存）なら接続情報を残す: ソケットパス・トークンが
                 // 再起動後も同一のため、既存クライアントがそのまま再接続できる。
@@ -5741,6 +5760,10 @@ impl TakoApp {
                     tako_control::discovery::cleanup(std::process::id());
                 }
             }
+            // #2610: 背景の書き手へ渡した版（上の保存・最後のタブの明示クローズの削除）を
+            // 書き終えてから抜ける。quitting でも待つ（削除はその経路で来る）。下の後片付けが
+            // 検証起動の置き場を消すより前に待つ（消した後で書き戻さない）
+            this.flush_layout_writer("on_app_quit");
             // #1192 / #1253: このプロセスだけが使う資源（自分の pid から作った使い捨ての
             // backend サーバーとソケットファイル・検証起動の設定置き場）を片付ける。
             // セルフテストの失敗の出口（`self_test::fail`）と同じ 1 実装（#2388）
@@ -5981,6 +6004,9 @@ impl TakoApp {
                     let meta = app.pane_log_meta(pane);
                     app.pane_logs_lock()
                         .seed_history(pane.as_u64(), &meta, history as usize);
+                    // #2610: save_layout の写しにも同じ値を入れる（最初の保存で Mutex が
+                    // 握られていても、復元した取り込み位置を空で書かない）
+                    app.pane_log_history.insert(pane.as_u64(), history);
                 }
                 // このペインをどう起こすか（#1076）。判断とコマンドの形は
                 // `tako_control::sessions::restore_plan` が正本で、**役割 env /
@@ -12690,7 +12716,8 @@ impl TakoApp {
                 // （プライマリの復元情報を道連れにしない。Issue #113）
                 if std::env::var_os("TAKO_SELF_TEST").is_none() && !self.secondary {
                     if reason.is_explicit() {
-                        tako_control::layout::remove();
+                        // 書き手の列に並べる（#2610。消し終わりは on_app_quit が待つ）
+                        self.remove_layout_file();
                         persist_diag(&format!(
                             "layout.json 削除: 最後のペインの明示クローズ（発生源 {}。次回は空で起動）",
                             reason.origin().marker()
@@ -13032,15 +13059,43 @@ impl TakoApp {
     /// tmux 不在でも保存する（Issue #30: その場合 session は None になり、
     /// 復元時は保存 cwd で新シェルを開く「構造のみ永続化」として機能する）。
     /// セカンダリモードは書かない（プライマリの layout.json を汚さない。Issue #113。
-    /// tmux_persist=false で実質届かないが、persist トグル等の経路変更に耐える明示ガード）
+    /// tmux_persist=false で実質届かないが、persist トグル等の経路変更に耐える明示ガード）。
+    ///
+    /// **メインスレッドで I/O を待たない**（#2610）: 書き出し（直前の版の読み直し・整形・
+    /// write・rename）は `layout_writer` へ版を渡して戻り、ペインログの Mutex（背景の取り込みが
+    /// 追記の I/O の間ずっと握る）も待たない。以前はどちらもここで同期していて、ディスクが
+    /// 詰まると GUI が丸ごと固まった（本番で最大 98,982ms）。終了と新しいプロセスへの
+    /// 引き渡しの直前は `refresh_pane_log_history` → これ → `flush_layout_writer` の順に呼ぶ
     fn save_layout(&mut self) {
         if self.secondary || !self.tmux_persist || std::env::var_os("TAKO_SELF_TEST").is_some() {
             return;
         }
         // Issue #168: 2 秒ポーリング + dispatch 毎に呼ばれる。capture + 変化検出 +
-        // （変化時のみ）ディスク書き込みのメインスレッド専有を計測
+        // （変化時のみ）書き手へ渡すまでのメインスレッド専有を計測
         let _span = tako_control::diag::perf_span("save_layout");
         self.save_layout_stats.calls += 1;
+        // #2610: 書き手が最後に渡した版を書けなかったら、その版を「保存済み」に数えない
+        // （従来の「失敗したらキーを進めず次の tick でやり直す」と同じ。下の比較が通って書き直す）
+        if self.layout_writer.latest_failed() {
+            self.last_saved_layout = None;
+        }
+        // ペインログの取り込み位置（Issue #112 B。再起動後の差分取り込み基準として保存）。
+        // #2610: 背景の取り込みは追記の I/O の間この Mutex を握るので待たない。握られていれば
+        // 前回読めた値で比べ・書き、次の呼び出しで追いつく（変化検出キーに載るので取りこぼさない）
+        if legacy_2610() {
+            self.refresh_pane_log_history();
+        } else {
+            match self.pane_logs.try_lock() {
+                Ok(logs) => self.pane_log_history = Self::pane_log_history_of(&logs),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    self.pane_log_history = Self::pane_log_history_of(&poisoned.into_inner())
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    self.save_layout_stats.pane_log_busy += 1
+                }
+            }
+        }
+        let pane_log_history = &self.pane_log_history;
         let backend_sessions = &self.backend_sessions;
         let claude_resume_sessions = &self.claude_resume_sessions;
         let agent_resume_sessions = &self.agent_resume_sessions;
@@ -13050,13 +13105,6 @@ impl TakoApp {
         let webviews = &self.webviews;
         // #1446: SSH の追跡。借用のまま渡す（`PaneMetaRef` の作法と同じ）
         let ssh_tracked = &self.ssh_connect;
-        // ペインログの取り込み位置（Issue #112 B。再起動後の差分取り込み基準として保存）
-        let pane_log_history: HashMap<u64, u64> = self
-            .pane_logs_lock()
-            .all_logged_history()
-            .into_iter()
-            .map(|(pane, h)| (pane, h as u64))
-            .collect();
         // ペイン付帯情報は**借用のまま**組む（#1425）。保存形（`PaneMeta`）は
         // ペインあたり String を最大 7 本作るので、「変わっていないことの確認」に
         // 毎 tick それを払わない。落とすのは実際に変化があったときだけ
@@ -13167,18 +13215,72 @@ impl TakoApp {
             }
             return;
         }
-        match tako_control::layout::save(&layout) {
-            Ok(_) => {
-                self.save_layout_stats.written += 1;
-                self.last_saved_layout = Some(SavedLayout {
-                    key,
-                    json,
-                    skips: 0,
-                });
+        if legacy_2610() {
+            match tako_control::layout::save(&layout) {
+                Ok(_) => {
+                    self.save_layout_stats.written += 1;
+                    self.last_saved_layout = Some(SavedLayout {
+                        key,
+                        json,
+                        skips: 0,
+                    });
+                }
+                // 保存失敗は復元不能に直結するので診断ログにも残す（Issue #30）
+                Err(e) => persist_diag(&format!("保存失敗: {e}")),
             }
-            // 保存失敗は復元不能に直結するので診断ログにも残す（Issue #30）
-            Err(e) => persist_diag(&format!("保存失敗: {e}")),
+            return;
         }
+        // #2610: 書き出しは背景の書き手へ渡して戻る（I/O を待たない）。渡した版を保存済みとして
+        // 比べ、書けなかったら次の呼び出しの冒頭（`latest_failed`）で外して書き直す。
+        // 失敗の理由は書き手が従来と同じ「保存失敗: …」の行で persist.log へ残す（Issue #30）
+        self.layout_writer.post(layout);
+        self.last_saved_layout = Some(SavedLayout {
+            key,
+            json,
+            skips: 0,
+        });
+    }
+
+    /// ペインログの取り込み位置を待ってでも最新に読む（#2610）。`save_layout` は Mutex を
+    /// 待たないので、終了と新しいプロセスへの引き渡しの直前の保存だけはこれを先に呼び、
+    /// 再起動後の差分取り込みの基準を古くしない
+    fn refresh_pane_log_history(&mut self) {
+        let history = Self::pane_log_history_of(&self.pane_logs_lock());
+        self.pane_log_history = history;
+    }
+
+    /// ペインログの取り込み位置（ペイン → 取り込んだ履歴行数）を写す
+    fn pane_log_history_of(logs: &tako_core::pane_log::PaneLogManager) -> HashMap<u64, u64> {
+        logs.all_logged_history()
+            .into_iter()
+            .map(|(pane, h)| (pane, h as u64))
+            .collect()
+    }
+
+    /// 背景の書き手へ渡した layout.json の書き出し・削除が終わるまで待つ（#2610）。
+    /// 終了（GPUI の終了の猶予 200ms では足りない）と、新しいプロセスへの引き渡し（更新の
+    /// 起動し直し = 新しいプロセスが layout.json を読む）の直前に呼ぶ。待つ長さは従来の
+    /// 同期の書き出しと同じで短くはならないので、1 秒を超えたら persist.log へ残す
+    fn flush_layout_writer(&self, why: &str) {
+        let waited = self.layout_writer.flush();
+        if waited >= Duration::from_secs(1) && !self.secondary {
+            persist_diag(&format!(
+                "{why}: layout.json の書き出しを {}ms 待った（#2610）",
+                waited.as_millis()
+            ));
+        }
+    }
+
+    /// layout.json を消す（最後のペインの明示クローズ・永続化 OFF）。#2610 以後は書き手の列に
+    /// 並べる = 先に渡した版が消した後で書き戻さない。終了を伴う呼び手は `on_app_quit` の
+    /// `flush_layout_writer` が消し終わりを待つ
+    fn remove_layout_file(&mut self) {
+        if legacy_2610() {
+            tako_control::layout::remove();
+        } else {
+            self.layout_writer.post_remove();
+        }
+        self.last_saved_layout = None;
     }
 
     /// 1 回の `claude agents --json` 成功結果を「ペイン → claude セッション」へ落とす
@@ -15939,7 +16041,10 @@ impl TakoApp {
         let update_checker::Restart::RunInstaller(prepared) = restart else {
             return Ok(());
         };
+        // #2610: 起動し直した tako が読む前に書き終える（保存は背景の書き手へ渡すので待つ）
+        self.refresh_pane_log_history();
         self.save_layout();
+        self.flush_layout_writer("更新の起動し直し");
         update_checker::restart_app(restart).map_err(|e| restart.failed_text(&e))?;
         self.pending_update_quit = true;
         json["updated"] = false.into();
@@ -26494,8 +26599,7 @@ impl TmuxHost for TakoApp {
                 eprintln!("warning: 設定を保存できない: {e}");
             }
             if !enabled {
-                tako_control::layout::remove();
-                self.last_saved_layout = None;
+                self.remove_layout_file();
                 persist_diag("layout.json 削除: persist を OFF に切替（次回は空で起動）");
             }
         }
@@ -29023,7 +29127,16 @@ impl SystemHost for TakoApp {
     }
 
     fn layout_save_stats(&self) -> tako_control::layout::SaveStats {
-        self.save_layout_stats
+        // #2610: 書き出しの回数・合流・失敗は背景の書き手が数える（A/B の同期の道の分は手元）
+        let writer = self.layout_writer.stats();
+        tako_control::layout::SaveStats {
+            written: self.save_layout_stats.written + writer.written,
+            coalesced: writer.coalesced,
+            failed: writer.failed,
+            max_write_ms: writer.max_write_ms,
+            pending: writer.pending,
+            ..self.save_layout_stats
+        }
     }
 
     fn resolve_stale_pane(&self, stale: PaneId) -> Option<PaneId> {
