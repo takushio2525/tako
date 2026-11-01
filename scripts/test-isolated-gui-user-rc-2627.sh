@@ -180,7 +180,8 @@ for n in $(seq 1 "$RUNS"); do
     continue
   fi
   P=$(first_pane)
-  prompt_ready() { iso_cli read --pane "$P" 2>/dev/null | grep -q 'tako [^ ]* %'; }
+  # 画面を読み切ってから見る（pipefail の下で grep -q へ直に流すと、早く抜けた読み手で左辺が 141 になる）
+  prompt_ready() { local screen; screen=$(iso_cli read --pane "$P" 2>/dev/null) && grep -q 'tako [^ ]* %' <<<"$screen"; }
   if wait_for 30 prompt_ready; then
     pass "新 $n: ペインのプロンプトが砂場の既定の .zshrc の固定の形（tako … %）"
   else

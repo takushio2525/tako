@@ -1611,8 +1611,8 @@ fn user_rc_scan(rel: &str, src: &str) -> UserRcScan {
         }
         let end = idx;
         idx += 1;
-        for i in start..=end {
-            let code = shell_code(lines[i]);
+        for (i, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+            let code = shell_code(line);
             if code.trim_start().starts_with('#') || code.trim().is_empty() {
                 continue;
             }
