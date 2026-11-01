@@ -12931,9 +12931,10 @@ fn remote_refusal_index(r: &RemoteRefusal) -> usize {
         RemoteRefusal::DaemonStarting { .. } => 31,
         RemoteRefusal::DaemonStartingStop { .. } => 32,
         RemoteRefusal::IsolatedServe => 33,
+        RemoteRefusal::IsolatedInstall => 34,
     }
 }
-const REMOTE_REFUSAL_VARIANTS: usize = 34;
+const REMOTE_REFUSAL_VARIANTS: usize = 35;
 
 /// 起こしている途中の印の見本（#2613 の断りの表に使う）
 fn starting_marker(via: &str, previous_pid: Option<u32>) -> StartingMarker {
@@ -13148,6 +13149,14 @@ fn remote_refusal_table() -> Vec<(RemoteRefusal, String)> {
              利用者の serve 設定を書き換えるためです。serve を張らずに試すなら TAKO_REMOTE_TEST_MODE=1、\
              偽の tailscale で試すなら TAKO_TAILSCALE_BIN=<偽物のパス>、本物の serve まで確かめるなら \
              TAKO_REMOTE_ISOLATED_SERVE=1 を付けてください"
+                .into(),
+        ),
+        // #2624 で足した断り（#2365 より前の文は無いので、日本語の見本を固定する）
+        (
+            RemoteRefusal::IsolatedInstall,
+            "隔離中（TAKO_ISOLATED）なので、Tailscale を導入せずに止めました。導入はこの機械全体への\
+             インストールで、隔離の外にあるためです（偽の TAKO_TAILSCALE_BIN では導入器は偽物になりません）。\
+             導入まで確かめるなら TAKO_REMOTE_ISOLATED_SERVE=1 を付けてください"
                 .into(),
         ),
     ]

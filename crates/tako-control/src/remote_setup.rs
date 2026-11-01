@@ -617,8 +617,13 @@ pub fn run_interactive(
     let qr_path = match crate::remote::generate_qr_png(&ts_url) {
         Ok(path) => {
             writeln!(writer, "QR コード: {}", path.display()).map_err(|e| e.to_string())?;
-            // 既定の画像ビューアを起動する
-            let _ = crate::platform::os_integration::open_default(&path);
+            // 既定の画像ビューアを起動する。#2624: 隔離中は利用者の画面へ窓を出さない（パスは上の行）
+            if crate::remote_isolated_serve::allowed(crate::remote_isolated_serve::Op::OpenViewer) {
+                let _ = crate::platform::os_integration::open_default(&path);
+            } else {
+                writeln!(writer, "  （隔離中なので既定のビューアでは開きません）")
+                    .map_err(|e| e.to_string())?;
+            }
             Some(path.display().to_string())
         }
         Err(e) => {
@@ -672,6 +677,13 @@ fn install_tailscale(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Optio
         // もともと聞いていた経路なので対象外（legacy で聞かなくなるのは退行）
         legacy: false,
     };
+    // #2624: 隔離中は導入器を起こさない（導入はこの機械全体へのインストールで砂場の外。偽の
+    // TAKO_TAILSCALE_BIN では導入器は偽物にならない）。断りは表示言語。入れずに案内だけで終わる形
+    // （`--yes` も端末も無い）は従来どおり案内に任せる
+    if ctx.assume_yes || ctx.stdin_is_terminal {
+        crate::remote_isolated_serve::check_install()
+            .map_err(|r| r.text_in(crate::settings::peek_lang_setting().resolve()))?;
+    }
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let outcome = setup_deps::offer_and_install(

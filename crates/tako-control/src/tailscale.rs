@@ -132,18 +132,74 @@ pub fn find_tailscale() -> Option<String> {
 }
 
 /// 本物の tailscale の CLI の置き場（#2619: 隔離の門が `TAKO_TAILSCALE_BIN` の値を偽物か見分けるため）。
-/// 既定の候補のうちパスのものと、素の名前の候補をこのプロセスの PATH で引いたもの（候補は起こさない）
+/// 既定の候補のうちパスのものと、素の名前の候補をこのプロセスの PATH で引いたもの（候補は起こさない）。
+///
+/// Windows（#2624）は素の名前を `exe::find`（PATH + PATHEXT の走査だけ。子は起こさない）で引き、
+/// インストーラの既定の置き場（[`windows_install_paths`]）を足す。`find_in_process_path` は Windows で
+/// 常に `None` なので、#2624 前は本物の `C:\Program Files\Tailscale\tailscale.exe` を名指した値を偽物と読み、
+/// 隔離中に本物の serve を張れた。unix は従来どおり（`exe::find` はログインシェルを起こすので使わない）。
+/// A/B は `TAKO_2624_LEGACY=1`（Windows も unix と同じ引き方へ戻す）
 pub fn real_candidate_paths() -> Vec<std::path::PathBuf> {
-    TAILSCALE_CANDIDATES
+    let legacy = std::env::var(crate::remote_isolated_serve::LEGACY_2624_ENV)
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "on"));
+    if cfg!(windows) && !legacy {
+        real_candidate_paths_with(
+            TAILSCALE_CANDIDATES,
+            tako_core::platform::exe::find,
+            &windows_install_paths(|key| std::env::var_os(key)),
+        )
+    } else {
+        real_candidate_paths_with(
+            TAILSCALE_CANDIDATES,
+            tako_core::platform::exe::find_in_process_path,
+            &[],
+        )
+    }
+}
+
+/// [`real_candidate_paths`] の組み立て（純関数。引き方と足す置き場を差し替えて検査する）。
+/// 候補の並びと重なりは #2619 のまま（足す置き場だけ、既に在れば足さない）
+pub(crate) fn real_candidate_paths_with(
+    candidates: &[&str],
+    resolve_bare: impl Fn(&str) -> Option<String>,
+    install_paths: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = candidates
         .iter()
         .filter_map(|c| {
             if is_bare_name(c) {
-                tako_core::platform::exe::find_in_process_path(c).map(std::path::PathBuf::from)
+                resolve_bare(c).map(std::path::PathBuf::from)
             } else {
                 Some(std::path::PathBuf::from(c))
             }
         })
-        .collect()
+        .collect();
+    for path in install_paths {
+        if !out.contains(path) {
+            out.push(path.clone());
+        }
+    }
+    out
+}
+
+/// Windows の Tailscale のインストーラの既定の置き場（`%ProgramFiles%\Tailscale\tailscale.exe`。#2624）。
+/// 32bit のプロセスから見た `ProgramFiles` は x86 側を指すので `ProgramW6432` も引く（同じなら 1 つ）
+pub(crate) fn windows_install_paths(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for key in ["ProgramFiles", "ProgramW6432"] {
+        let Some(base) = var(key).filter(|b| !b.is_empty()) else {
+            continue;
+        };
+        let path = std::path::Path::new(&base)
+            .join("Tailscale")
+            .join("tailscale.exe");
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 /// A/B: #2513 前へ戻す（素の名前の候補をこのプロセスの PATH で引かず、素の名前のまま持つ）。
@@ -2236,5 +2292,84 @@ mod tests {
     fn 同時稼働していなければ警告を出さない() {
         let survey = VariantSurvey::default();
         assert!(coexistence_warning(&survey).is_none());
+    }
+
+    /// この OS で絶対パスになる見本（Windows は `C:\…`・unix は `/…`）
+    fn abs(rel: &str) -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::path::PathBuf::from(format!(r"C:\{rel}"))
+        } else {
+            std::path::PathBuf::from(format!("/{rel}"))
+        }
+    }
+
+    /// #2624: macOS（unix）の本物の置き場は #2619 のまま = 素の名前を PATH で引いたもの + 固定の候補。
+    /// 重なりも並びも変えない
+    #[test]
+    fn unixの本物の置き場は2619のまま() {
+        let resolved = "/opt/homebrew/bin/tailscale";
+        let got = real_candidate_paths_with(TAILSCALE_CANDIDATES, |_| Some(resolved.into()), &[]);
+        let want: Vec<std::path::PathBuf> = [
+            resolved,
+            "/opt/homebrew/bin/tailscale",
+            "/usr/local/bin/tailscale",
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        ]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+        assert_eq!(got, want);
+        // PATH で引けなければ素の名前の分は載らない（#2619 と同じ）
+        let got = real_candidate_paths_with(TAILSCALE_CANDIDATES, |_| None, &[]);
+        assert_eq!(got, want[1..].to_vec());
+    }
+
+    /// #2624: Windows のインストーラの既定の置き場を本物と読む（#2624 前は偽物と読み、隔離中に本物の
+    /// serve を張れた）。PATH で引いた置き場も本物、それ以外のパスは偽物のまま
+    #[test]
+    fn windowsのインストーラの置き場を本物と読む() {
+        let program_files = abs("Program Files");
+        let x86 = abs("Program Files (x86)");
+        // 64bit のプロセス: ProgramFiles と ProgramW6432 は同じ = 1 つ
+        let install = windows_install_paths(|key| match key {
+            "ProgramFiles" | "ProgramW6432" => Some(program_files.clone().into_os_string()),
+            _ => None,
+        });
+        let real_exe = program_files.join("Tailscale").join("tailscale.exe");
+        assert_eq!(install, vec![real_exe.clone()]);
+        // 32bit のプロセス: ProgramFiles は x86 側 → 64bit 側を ProgramW6432 で拾う
+        let install32 = windows_install_paths(|key| match key {
+            "ProgramFiles" => Some(x86.clone().into_os_string()),
+            "ProgramW6432" => Some(program_files.clone().into_os_string()),
+            _ => None,
+        });
+        assert!(install32.contains(&real_exe), "{install32:?}");
+        // 未設定・空は足さない
+        assert!(windows_install_paths(|_| None).is_empty());
+        assert!(windows_install_paths(|_| Some(std::ffi::OsString::new())).is_empty());
+
+        let on_path = abs("Tools").join("tailscale.exe");
+        let real = real_candidate_paths_with(
+            TAILSCALE_CANDIDATES,
+            |name| (name == "tailscale").then(|| on_path.display().to_string()),
+            &install,
+        );
+        let fake = |bin: &std::path::Path| {
+            crate::remote_isolated_serve::overrides_to_fake(
+                Some(bin.to_str().expect("utf-8")),
+                |p| p.to_path_buf(),
+                &real,
+            )
+        };
+        assert!(!fake(&real_exe), "インストーラの置き場を偽物と読んだ");
+        assert!(!fake(&on_path), "PATH で引いた置き場を偽物と読んだ");
+        assert!(fake(&abs("sandbox").join("fake-tailscale.exe")));
+        // 足す置き場が候補と重なれば 2 度載せない
+        let twice = real_candidate_paths_with(
+            TAILSCALE_CANDIDATES,
+            |_| None,
+            &[real_exe.clone(), real_exe],
+        );
+        assert_eq!(twice.len(), TAILSCALE_CANDIDATES.len() - 1 + 1);
     }
 }
