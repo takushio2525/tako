@@ -101,6 +101,8 @@ fn status_of(manager: &LspManager) -> Value {
 }
 
 fn config(launcher: tako_control::lsp::manager::Launcher) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     LspConfig {
         table: servers::SERVERS,
         launcher,
@@ -219,6 +221,8 @@ fn 既定の解決で伴走と空の設定ファイルを並べて起き_基板�
     std::fs::create_dir_all(&ide).unwrap();
     let als = ide.join(exe(ID));
     std::fs::copy(FAKE, &als).unwrap();
+    // 写しは新しいファイル = 初回 exec の検査をもう 1 回受ける。子の 30 秒の待ちの外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(&als);
     for companion in ["arduino-cli", "clangd"] {
         std::fs::copy(FAKE, ide.join(exe(companion))).unwrap();
     }

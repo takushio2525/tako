@@ -67,6 +67,8 @@ fn config(scratch: &Scratch, providers: Option<&Value>) -> LspConfig {
 
 /// `extra` = 偽サーバへ足す引数（順序の注入。#1930）
 fn config_with(scratch: &Scratch, providers: Option<&Value>, extra: Vec<String>) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let mut args = vec![
         "--scenario".to_string(),
         "normal".to_string(),

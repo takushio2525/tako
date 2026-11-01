@@ -94,6 +94,8 @@ impl Drop for Scratch {
 /// 偽サーバ（`scenario`。`loading` なら読み込みは `scratch.gate()` を終わらせるまで続く）。
 /// ホバーの規則は `rules`
 fn config(scratch: &Scratch, scenario: &str, rules: &Value) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     std::fs::write(scratch.rules(), rules.to_string()).unwrap();
     let mut args = vec![
         "--scenario".to_string(),

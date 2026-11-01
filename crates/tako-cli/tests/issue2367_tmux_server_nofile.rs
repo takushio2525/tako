@@ -396,6 +396,9 @@ fn 器のサーバーへ引き上げた値を渡し器のシェルには起動�
     fd_limit::arm_children(LAUNCH_SOFT);
     // tako:caller-env-ok 器の段として登録するだけ（段は上限を下げて exec し、呼び出し元・接続先を読まない。#1716）
     fd_limit::register_container_exec(PathBuf::from(env!("CARGO_BIN_EXE_tako")));
+    // 段（debug の CLI = 約 83 MB）の初回 exec の検査（約 1.4 秒〜）を、器の画面を待つ窓の外で済ませる（#2228）
+    // tako:caller-env-ok 空打ちは知らない引数として解析の段で断られる（呼び出し元・接続先を読まない）
+    tako_core::fake_exec::warm_binary(env!("CARGO_BIN_EXE_tako"));
 
     // ── 1. 修正後 ──────────────────────────────────────────────────────────────
     let socket = format!("tako-clitest-{}-nofile2367", std::process::id());

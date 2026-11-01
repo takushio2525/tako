@@ -101,6 +101,8 @@ fn wait_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
 
 /// どの行も偽サーバで起こす（`extra` は偽サーバへ足す引数）
 fn manager_with(scratch: &Scratch, scenario: &str, idle_grace: Duration) -> LspManager {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let mut args = vec![
         "--scenario".to_string(),
         scenario.to_string(),

@@ -77,6 +77,8 @@ fn fake_args(scratch: &Scratch, breaks: &str, extra: &[&str]) -> Vec<String> {
 }
 
 fn config_with(args: Vec<String>) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     LspConfig {
         table: servers::SERVERS,
         launcher: Arc::new(move |_spec: &ServerSpec| Launch::Found {

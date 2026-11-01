@@ -184,6 +184,13 @@
 //! `TAKO_LSP_FAKE_ARGV_LOG=<ファイル>`（#1951）: 起動のたびに自分の起動引数（0 番 = 実行ファイルを含む）を
 //! 1 行 1 JSON の配列で追記する。知らない引数は読み飛ばすので、検出表の行が組んだ引数（`-cli <パス>` 等）を
 //! そのまま受けて、何が並んだかを e2e が読める（env だけで指定する = 起動引数を汚さない）
+//!
+//! ## 初回 exec の空打ちと注入（#2228）
+//!
+//! cargo が作り直すたびに新しいファイルになり、macOS の初回 exec の検査を受ける。e2e は時計を回す前に
+//! `tako_core::fake_exec::warm_binary` で 1 回空打ちし（引数 `tako-fake-exec-warm` = 本文を走らせずに
+//! 終わる）、`TAKO_2222_INJECT_FIRST_EXEC_MS=<ms>` で初回の exec を遅らせる注入を受ける
+//! （どちらも `main` の 1 文目の `enter_test_binary`）
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -914,6 +921,8 @@ fn finish_loading(
 }
 
 fn main() {
+    // #2228: 初回 exec の注入と空打ち（空打ちなら本文を走らせずにここで終わる）
+    tako_core::fake_exec::enter_test_binary();
     let args: Vec<String> = std::env::args().collect();
     let scenario = arg_or_env(&args, "--scenario", "TAKO_LSP_FAKE_SCENARIO")
         .unwrap_or_else(|| "normal".into());

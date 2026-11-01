@@ -91,6 +91,8 @@ impl Drop for Scratch {
 }
 
 fn config(scratch: &Scratch) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let args = vec![
         "--diagnostics".to_string(),
         scratch.0.join("diagnostics.json").display().to_string(),

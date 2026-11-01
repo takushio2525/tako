@@ -67,6 +67,8 @@ impl Drop for Scratch {
 
 /// `xref` = `--xref` の規則（`None` なら渡さない = 参照・階層の能力を申告しないサーバ）
 fn config(scratch: &Scratch, xref: Option<&Value>) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let mut args = vec![
         "--scenario".to_string(),
         "normal".to_string(),

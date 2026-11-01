@@ -4572,6 +4572,11 @@ fn main() -> ExitCode {
     // #1811: 製品の入口を通ったと宣言する（**必ず 1 文目**。`cli_main` のスレッドより前）。
     // これが無いプロセスは置き場に関係なくテスト扱い = 本番の data dir / ホーム配下へ書かない
     tako_core::paths::mark_product_process();
+    // #2228: 初回 exec の検査を演じる注入（`TAKO_2222_INJECT_FIRST_EXEC_MS`。検証専用）。実 tmux の
+    // テストは debug の CLI を器の段として起こす（段は exec で抜ける）ので、段より前に置く。
+    // 配布物（release）には入れない = 実行ファイルの隣に印を書かない
+    #[cfg(debug_assertions)]
+    tako_core::fake_exec::inject_first_exec_delay_here();
     // #2367: 器（tmux）の中のペインの子を起動時の fd 上限へ戻す段（製品が段に使うのは GUI 自身。
     // CLI でも同じ段が動くのは、実 tmux のテストが段を実物の実行ファイルで通すため）
     tako_core::platform::fd_limit::exec_container_child_if_requested();

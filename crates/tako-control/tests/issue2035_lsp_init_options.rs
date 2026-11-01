@@ -65,6 +65,8 @@ impl Scratch {
 }
 
 fn config(scratch: &Scratch) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let args = vec![
         "--scenario".to_string(),
         "normal".to_string(),
@@ -323,6 +325,8 @@ fn 本番の口で送った値を出す子プロセス() {
 
 /// `vars` だけを立てた子プロセスで、本番の口が送った初期化オプションを測る
 fn probe(scratch: &Scratch, mode: &str, vars: &[(&str, &str)]) -> Value {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let _ = std::fs::remove_file(scratch.log());
     let home = scratch.0.join("home");
     std::fs::create_dir_all(&home).unwrap();

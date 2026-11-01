@@ -63,6 +63,8 @@ fn config(scratch: &Scratch, scenario: &str) -> LspConfig {
 
 /// `extra` は偽サーバへ足す引数（順序の注入など）
 fn config_with(scratch: &Scratch, scenario: &str, extra: &[&str]) -> LspConfig {
+    // 初回 exec の検査を時計の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
     let mut args = vec![
         "--scenario".to_string(),
         scenario.to_string(),
@@ -347,6 +349,8 @@ fn 起動直後に即死するサーバも上限で諦める() {
 fn タイムアウトした要求は取り消しを送り待ちの表から消える() {
     use tako_control::lsp::server::{Handlers, RpcError, ServerProcess};
     let scratch = Scratch::new("cancel");
+    // 初回 exec の検査を時計の外で済ませる（#2228。取り消しの受信の 10 秒は起動から数える）
+    tako_core::fake_exec::warm_binary(FAKE);
     let plan = ChildCmd {
         program: FAKE.to_string(),
         args: vec![
