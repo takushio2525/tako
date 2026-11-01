@@ -1082,6 +1082,15 @@ pub enum Reason {
     },
     /// `起動コマンドを走らせられない: <error>`
     LaunchLineFailed(String),
+    /// `セットアップに失敗: <cause>`（`tako master` / `tako solo` の既定の用意。中身は同じ言語の `ConfigError`）
+    LaunchSetupFailed(String),
+    /// `プロファイルの cwd に移動できない: <cwd> (<error>)`（`tako master` / `tako solo`）
+    ProfileCwdUnreachable {
+        cwd: String,
+        error: String,
+    },
+    /// `タブ作成の応答に pane が含まれない`（`tako master` / `tako solo` の新しいタブ）
+    TabNewNoPane,
     /// `tako orchestrator watch` の対象（ペイン ID / `--worker`）が無い
     WatchTargetMissing,
     /// `tako usage --show` で GUI が動いていない
@@ -3045,6 +3054,16 @@ impl Reason {
             (Self::LaunchLineFailed(error), En) => {
                 format!("cannot run the launch command: {error}")
             }
+            (Self::LaunchSetupFailed(cause), Ja) => format!("セットアップに失敗: {cause}"),
+            (Self::LaunchSetupFailed(cause), En) => format!("setup failed: {cause}"),
+            (Self::ProfileCwdUnreachable { cwd, error }, Ja) => {
+                format!("プロファイルの cwd に移動できない: {cwd} ({error})")
+            }
+            (Self::ProfileCwdUnreachable { cwd, error }, En) => {
+                format!("cannot move to the profile's cwd: {cwd} ({error})")
+            }
+            (Self::TabNewNoPane, Ja) => "タブ作成の応答に pane が含まれない".into(),
+            (Self::TabNewNoPane, En) => "the reply to the tab creation has no pane".into(),
             (Self::WatchTargetMissing, Ja) => {
                 "ペイン ID または --worker を指定してください\
                  （tako orchestrator watch <PANE_ID> / --worker <ID>）"

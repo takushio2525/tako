@@ -20,17 +20,6 @@
 
 ---
 
-## 2026-10-31（#2581: control.json と instances/・IPC のトークン・usage の塩・shortcuts・スマホから受け取ったファイル・ペインの最後の出力の置き場を境界 `platform::private_file` へ寄せ、Windows も本人 + SYSTEM だけの DACL に。境界は当てられない置き場で呼び手を止めず・同じ DACL は当て直さない）
-- CI の Windows で Win32 と icacls の読み戻し・隔離 GUI の A/B で unix の mode と CLI / MCP の接続が修正前と一致・番犬が境界の外の本人だけの mode を file:line で名指す・カタログ +0 B。PR #2584
-
-## 2026-10-31（#2578: claude 等が改行 + 字下げで折り返した URL / パスを cmd+クリック・ホバー・cmd+右クリック・`tako links` で 1 本にする。修正前の結合で決めてから新しい境目だけ確かめて重ねる・塊ごとの行の上限・`wrap` を応答へ・A/B `TAKO_2578_LEGACY=1`）
-- 実経路で修正後 PASS 24 / 修正前 FAIL 20（直結・器 × 端末 / アプリ / 実物の claude）・注入 3 通りで番犬が file:line を名指し・カタログ +0 B。PR #2586
-- Closes で閉じたが実画面の cmd+クリックが未実測なので master が開け直した（人の確認待ち = `tako todo`）
-
-## 2026-10-31（#2582: ペインの中から CLI で起こした remote daemon がペインの env（識別・接続・claude の印・`GIT_EDITOR=true`）を持ったまま常駐していた → CLI の `main` が `tako remote serve` のときだけ `host_env::STRIP` で外し exec し直す（audit.log `daemon_startup_env`・A/B `TAKO_2582_LEGACY=1`））
-- 隔離 GUI の A/B で CLI から起こした daemon の印 32 → 0・自動復帰の daemon は修正前と一致・番犬 `issue2582_daemon_inherited_pane_env_watchdog` + 実プロセスのテスト・カタログ +0 B。PR #2585
-- 本番確認（ペインの CLI から remote stop → start・本番 daemon の env にペインの印 0・陽性対照 = 同じペインの claude にはある・audit.log に `daemon_startup_env`）で #2582 を閉じた
-
 ## 2026-10-31（#2365 の続き: `tako config` の断り 33 種を `ShareRefusal` / `GitError`（その場で型を返す）へ、CLI の手元 3 か所（watch --worker・lsp options --set・remote agents）を型の口へ。応答の push_error / files[].error も表示言語）
 - 実経路 23 ケースで英語の日本語入り 23 → 0・CLI 27 / 28 → 0 / 28（日本語 28 / 28 sha256 一致）・隔離 GUI の MCP 19 / 19 → 0 / 19・注入 6 か所を名指し + E0004・カタログ +0 B。PR #2589
 
@@ -75,3 +64,13 @@
 ## 2026-11-01（#2365 の続き: check-health 一式と `tako setup --check` を表示言語へ。文は新しい `HealthText`（147 種）、共有の文は各モジュールの `_in(lang)`。`setup --check` は「setup は日本語」の枠から外した）
 - 英語表示の日本語入り: CLI 経路 12/12 → 0/12・隔離 GUI の CLI / MCP 3/3 → 0/3（問題 0 件でも同じ）。日本語は全件一致（意図した差は旧文の空白 1 か所）。注入 7 通りを名指し / E0004・カタログ +0 B。PR #2612
 - 09:09 に `31b5683` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）。再起動直後 90 秒の status 180 回で stop の案内 0（区間は starting.state=replacing）の本番確認で #2608 を閉じた
+
+## 2026-11-01（#2610: save_layout が layout.json の書き出しとペインログの Mutex 待ちでメインスレッドを止めていた（本番最大 99 秒）→ 専用の書き手スレッド 1 本（最新 1 件の合流・tmp + rename）+ `try_lock`、終了と起動し直しの前は書き終わりを待つ・A/B `TAKO_2610_LEGACY=1`）
+- 注入 5 秒で IPC 5,023ms → 18ms / ペインログ 4,840ms → 22ms・SIGKILL / 終了 / 順序 / 書けない dir を実経路で確認・番犬が逆戻り 4 種を file:line で名指し・カタログ +0 B。PR #2614
+
+## 2026-11-01（#2613: 起動・入れ替えの途中（#2608 の印が効いている間）の `tako remote start` が旧版を止めて daemon を 2 本にしていた / 印を消していた → `spawn_daemon` が状態を読む前に印を見て `RemoteRefusal::DaemonStarting` で断る・stop / `--force` も止めても戻るので `DaemonStartingStop` で断る（A/B `TAKO_2613_LEGACY=1`））
+- 実経路で修正前 FAIL 28（daemon 2 本・区間の残り 26 回が stop の案内）→ 修正後 PASS 59 / 0・番犬が注入 7 通りを file:line で名指し・カタログ +0 B。PR #2616
+
+## 2026-11-01（#2365 の続き: `tako master` / `tako solo` の起動の流れを表示言語へ。言語を移行より前に決め（日本語表示に英語の移行の知らせが混ざっていた）、断りは `Reason` 3 種と型の口、行は `ReplyNote` 26 種。host.rs の既定 26 種を `HostRefusal::Default*` へ・mcp_host が表示言語と切り替えに従う）
+- GUI 無しの CLI 19/23 → 0/23（日本語 14/23 一致・残り 9 は移行の知らせの修正）・隔離 GUI 10/10 → 0/10（日本語 10/10 一致）・mcp_host 12/12 → 0/12・注入 6 か所を名指し + E0004・カタログ +0 B。PR #2617
+- 11:29 に `00a3b4b` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）。再起動直後の入れ替えの区間に打った remote start / stop が両方断られ、daemon は 1 本のまま新版へ移った本番確認で #2613 を閉じた

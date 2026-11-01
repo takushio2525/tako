@@ -189,6 +189,73 @@ pub enum ReplyNote {
     RunSavedBefore(String),
     /// 終わるまで待つ上限（秒）
     RunWaitBudget(u64),
+
+    // ---- `tako master` / `tako solo` の起動の流れ ----
+    /// MCP の登録パス（`~/.claude.json` の `mcpServers.tako.command`）が消えている（2 行）
+    McpPathMissing(String),
+    /// `[警告] <source> のモデル '<model>' は 1M コンテキスト版のため…`（2 行。`profile_warnings` と共有）
+    OneMModelWarning { source: String, model: String },
+    /// `master を起動しました: <場所>`（場所は `LaunchTab*` / `LaunchInline` の文）
+    MasterLaunched(String),
+    /// `solo を起動しました: <場所>`
+    SoloLaunched(String),
+    /// `タブ '<title>'（ペイン <pane>）`
+    LaunchTabNamed { title: String, pane: u64 },
+    /// `新しいタブ（ペイン <pane>）`
+    LaunchNewTab(u64),
+    /// `ペイン <pane>（インライン）`
+    LaunchInline(u64),
+    /// `プロファイル: <profile>（エージェント: <agent>、モデル: <model>、effort: <effort>）`
+    LaunchProfile {
+        profile: String,
+        agent: String,
+        model: String,
+        effort: String,
+    },
+    /// `リミット後の自動復帰: 有効（プロファイル既定。#1140）`
+    LimitResumeOn,
+    /// `worker モデルポリシー: inherit（master と同じ <model> / <effort>）`
+    WorkerPolicyInherit { model: String, effort: String },
+    /// `worker モデルポリシー: inherit（master は <agent> のため claude worker へは非継承: …）`
+    WorkerPolicyInheritNonClaude {
+        agent: String,
+        model: String,
+        effort: String,
+    },
+    /// `worker モデルポリシー: fixed（<model> / <effort>）`
+    WorkerPolicyFixed { model: String, effort: String },
+    /// `worker モデルポリシー: delegate（master が判断）`
+    WorkerPolicyDelegate,
+    /// `projects 制限: <keys>`
+    ProjectsRestriction(String),
+    /// `ファイルツリーに追加: <names>`
+    TreeFoldersAdded(String),
+    /// `モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）`
+    SoloMode,
+    /// `アカウント: <name>（config dir: <dir>）`
+    MasterAccount { name: String, config_dir: String },
+    /// `アカウント: <name>（既定の資格情報 / CLAUDE_CONFIG_DIR 未設定）`
+    MasterAccountDefault(String),
+    /// `  有効にする場合: <command>`（Remote Control の入れ方）
+    RemoteControlEnableHint(String),
+    /// `  外す場合: <command>`（codex のサンドボックスの外し方）
+    SandboxBypassHint(String),
+    /// `TAKO_PANE_ID` が旧世代のペイン ID だった（2 行）
+    StalePaneIdRemapped { old: u64, pane: u64 },
+    /// `TAKO_PANE_ID` が呼び出し元ペインと一致しない（2 行）
+    PaneIdMismatch { old: u64, pane: u64 },
+    /// `  このシェルを使い続けるなら: unset TAKO_PANE_ID`
+    UnsetPaneIdHint,
+    /// 呼び出し元ペインを特定できない（`TAKO_PANE_ID` が今の tako に無い古い値）
+    CallerPaneUnknownStale(u64),
+    /// 呼び出し元ペインを特定できない（`TAKO_PANE_ID` 未設定）
+    CallerPaneUnknownUnset,
+    /// `  新しいタブを作ってそこで起動します`
+    LaunchingInNewTab,
+
+    // ---- GUI の居ないホスト（`host.rs` の既定 = `examples/mcp_host`）の応答の値 ----
+    /// ssh の自動検知の `reason`（GUI が居ないので読めない）
+    SshDetectionNoGui,
 }
 
 impl ReplyNote {
@@ -740,6 +807,165 @@ impl ReplyNote {
             (Self::RunWaitBudget(secs), Ja) => format!("終わるまで最長 {} 秒待ちます", secs),
             (Self::RunWaitBudget(secs), En) => {
                 format!("waiting up to {secs} seconds for it to finish")
+            }
+
+            (Self::McpPathMissing(cmd), Ja) => format!(
+                "[警告] MCP 登録パスが消失しています: {cmd}\n        \
+                 tako MCP なしで起動します。tako setup-mcp で修復してください。"
+            ),
+            (Self::McpPathMissing(cmd), En) => format!(
+                "[warning] the registered MCP path is gone: {cmd}\n        \
+                 starting without the tako MCP. Run tako setup-mcp to repair it."
+            ),
+            (Self::OneMModelWarning { source, model }, Ja) => format!(
+                "[警告] {source} のモデル '{model}' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  \
+                 起動に失敗する場合は `tako orchestrator profiles set <プロファイル名> --clear-model` で解除してください"
+            ),
+            (Self::OneMModelWarning { source, model }, En) => format!(
+                "[warning] the {source} model '{model}' is a 1M-context model, so it may not start \
+                 on the Pro plan (it is meant for the Max / API plans).\n  \
+                 If it fails to start, clear it with \
+                 `tako orchestrator profiles set <profile> --clear-model`"
+            ),
+            (Self::MasterLaunched(location), Ja) => format!("master を起動しました: {location}"),
+            (Self::MasterLaunched(location), En) => format!("launched master: {location}"),
+            (Self::SoloLaunched(location), Ja) => format!("solo を起動しました: {location}"),
+            (Self::SoloLaunched(location), En) => format!("launched solo: {location}"),
+            (Self::LaunchTabNamed { title, pane }, Ja) => format!("タブ '{title}'（ペイン {pane}）"),
+            (Self::LaunchTabNamed { title, pane }, En) => format!("tab '{title}' (pane {pane})"),
+            (Self::LaunchNewTab(pane), Ja) => format!("新しいタブ（ペイン {pane}）"),
+            (Self::LaunchNewTab(pane), En) => format!("a new tab (pane {pane})"),
+            (Self::LaunchInline(pane), Ja) => format!("ペイン {pane}（インライン）"),
+            (Self::LaunchInline(pane), En) => format!("pane {pane} (inline)"),
+            (
+                Self::LaunchProfile {
+                    profile,
+                    agent,
+                    model,
+                    effort,
+                },
+                Ja,
+            ) => format!(
+                "プロファイル: {profile}（エージェント: {agent}、モデル: {model}、effort: {effort}）"
+            ),
+            (
+                Self::LaunchProfile {
+                    profile,
+                    agent,
+                    model,
+                    effort,
+                },
+                En,
+            ) => format!("profile: {profile} (agent: {agent}, model: {model}, effort: {effort})"),
+            (Self::LimitResumeOn, Ja) => "リミット後の自動復帰: 有効（プロファイル既定。#1140）".into(),
+            (Self::LimitResumeOn, En) => {
+                "auto-resume after usage limits: on (profile default; #1140)".into()
+            }
+            (Self::WorkerPolicyInherit { model, effort }, Ja) => {
+                format!("worker モデルポリシー: inherit（master と同じ {model} / {effort}）")
+            }
+            (Self::WorkerPolicyInherit { model, effort }, En) => {
+                format!("worker model policy: inherit (same as master: {model} / {effort})")
+            }
+            (
+                Self::WorkerPolicyInheritNonClaude {
+                    agent,
+                    model,
+                    effort,
+                },
+                Ja,
+            ) => format!(
+                "worker モデルポリシー: inherit（master は {agent} のため claude worker へは非継承: {model} / {effort}）"
+            ),
+            (
+                Self::WorkerPolicyInheritNonClaude {
+                    agent,
+                    model,
+                    effort,
+                },
+                En,
+            ) => format!(
+                "worker model policy: inherit (the master is {agent}, so claude workers do not \
+                 inherit it: {model} / {effort})"
+            ),
+            (Self::WorkerPolicyFixed { model, effort }, Ja) => {
+                format!("worker モデルポリシー: fixed（{model} / {effort}）")
+            }
+            (Self::WorkerPolicyFixed { model, effort }, En) => {
+                format!("worker model policy: fixed ({model} / {effort})")
+            }
+            (Self::WorkerPolicyDelegate, Ja) => {
+                "worker モデルポリシー: delegate（master が判断）".into()
+            }
+            (Self::WorkerPolicyDelegate, En) => {
+                "worker model policy: delegate (the master decides)".into()
+            }
+            (Self::ProjectsRestriction(keys), Ja) => format!("projects 制限: {keys}"),
+            (Self::ProjectsRestriction(keys), En) => format!("projects restriction: {keys}"),
+            (Self::TreeFoldersAdded(names), Ja) => format!("ファイルツリーに追加: {names}"),
+            (Self::TreeFoldersAdded(names), En) => format!("added to the file tree: {names}"),
+            (Self::SoloMode, Ja) => {
+                "モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）".into()
+            }
+            (Self::SoloMode, En) => {
+                "mode: solo (no orchestration, one-to-one conversation, no worker spawns)".into()
+            }
+            (Self::MasterAccount { name, config_dir }, Ja) => {
+                format!("アカウント: {name}（config dir: {config_dir}）")
+            }
+            (Self::MasterAccount { name, config_dir }, En) => {
+                format!("account: {name} (config dir: {config_dir})")
+            }
+            (Self::MasterAccountDefault(name), Ja) => {
+                format!("アカウント: {name}（既定の資格情報 / CLAUDE_CONFIG_DIR 未設定）")
+            }
+            (Self::MasterAccountDefault(name), En) => {
+                format!("account: {name} (default credentials; CLAUDE_CONFIG_DIR not set)")
+            }
+            (Self::RemoteControlEnableHint(cmd), Ja) => format!("  有効にする場合: {cmd}"),
+            (Self::RemoteControlEnableHint(cmd), En) => format!("  to turn it on: {cmd}"),
+            (Self::SandboxBypassHint(cmd), Ja) => format!("  外す場合: {cmd}"),
+            (Self::SandboxBypassHint(cmd), En) => format!("  to turn it off: {cmd}"),
+            (Self::StalePaneIdRemapped { old, pane }, Ja) => format!(
+                "[情報] TAKO_PANE_ID={old} は旧世代のペイン ID です（アプリ再起動をまたいだ値）\n  \
+                 現世代のペイン {pane} へ読み替えて起動します"
+            ),
+            (Self::StalePaneIdRemapped { old, pane }, En) => format!(
+                "[info] TAKO_PANE_ID={old} is a pane ID from an earlier app session (the value \
+                 survived an app restart)\n  launching in pane {pane} of the current session \
+                 instead"
+            ),
+            (Self::PaneIdMismatch { old, pane }, Ja) => format!(
+                "[情報] TAKO_PANE_ID={old} は呼び出し元ペインと一致しません（シェルが古い値を持っています）\n  \
+                 実際の呼び出し元ペイン {pane} で起動します"
+            ),
+            (Self::PaneIdMismatch { old, pane }, En) => format!(
+                "[info] TAKO_PANE_ID={old} does not match the calling pane (this shell holds a \
+                 stale value)\n  launching in the actual calling pane {pane}"
+            ),
+            (Self::UnsetPaneIdHint, Ja) => {
+                "  このシェルを使い続けるなら: unset TAKO_PANE_ID".into()
+            }
+            (Self::UnsetPaneIdHint, En) => "  to keep using this shell: unset TAKO_PANE_ID".into(),
+            (Self::CallerPaneUnknownStale(old), Ja) => format!(
+                "[情報] 呼び出し元ペインを特定できません（TAKO_PANE_ID={old} は現在の tako に無い古い値）"
+            ),
+            (Self::CallerPaneUnknownStale(old), En) => format!(
+                "[info] cannot identify the calling pane (TAKO_PANE_ID={old} is a stale value the \
+                 running tako does not have)"
+            ),
+            (Self::CallerPaneUnknownUnset, Ja) => {
+                "[情報] 呼び出し元ペインを特定できません（TAKO_PANE_ID 未設定）".into()
+            }
+            (Self::CallerPaneUnknownUnset, En) => {
+                "[info] cannot identify the calling pane (TAKO_PANE_ID is not set)".into()
+            }
+            (Self::LaunchingInNewTab, Ja) => "  新しいタブを作ってそこで起動します".into(),
+            (Self::LaunchingInNewTab, En) => "  opening a new tab and launching there".into(),
+
+            (Self::SshDetectionNoGui, Ja) => "GUI が接続していないので検知状態を読めない".into(),
+            (Self::SshDetectionNoGui, En) => {
+                "cannot read the detection state because no GUI is connected".into()
             }
         }
     }

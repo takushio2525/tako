@@ -756,7 +756,7 @@ fn 注入_選んだペインと比べないと名指す() {
 fn 注入_ホストの既定が本物へ書くと名指す() {
     let host = injected(
         HOST,
-        "        Err(\"このホストは OS のクリップボードを使わない\".into())",
+        "        Err(crate::HostRefusal::DefaultNoOsClipboard.into())",
         "        crate::platform::file_clipboard::write(_paths, _cut)",
     );
     must_name(

@@ -1455,12 +1455,22 @@ impl Profile {
     /// projects に指定された key が全て projects.yaml に存在するか検証する（Issue #500 Part 7）。
     /// 未登録の key があれば起動時エラーにする
     pub fn validate_projects(&self) -> Result<(), String> {
-        let config = ProjectsConfig::load()?;
-        self.validate_projects_with(&config)
+        self.validate_projects_typed().map_err(ConfigError::into_ja)
+    }
+
+    /// [`Self::validate_projects`] の型の口（`tako master` の起動の流れが表示言語で組む。#2365）
+    pub fn validate_projects_typed(&self) -> Result<(), ConfigError> {
+        let config = ProjectsConfig::load_typed()?;
+        self.validate_projects_with_typed(&config)
     }
 
     /// ProjectsConfig を直接受け取る版（テスト用に公開）
     pub fn validate_projects_with(&self, config: &ProjectsConfig) -> Result<(), String> {
+        self.validate_projects_with_typed(config)
+            .map_err(ConfigError::into_ja)
+    }
+
+    fn validate_projects_with_typed(&self, config: &ProjectsConfig) -> Result<(), ConfigError> {
         let keys = match self.projects.as_ref() {
             Some(k) if !k.is_empty() => k,
             _ => return Ok(()),
@@ -1473,7 +1483,7 @@ impl Profile {
         if missing.is_empty() {
             Ok(())
         } else {
-            Err(ConfigError::ProfileProjectsUnregistered(missing).into_ja())
+            Err(ConfigError::ProfileProjectsUnregistered(missing))
         }
     }
 
@@ -2415,16 +2425,20 @@ fn solo_profile_path(name: &str) -> Result<PathBuf, ConfigError> {
 
 /// solo 用のプロファイルを読み込む
 pub fn load_solo_profile(name: &str) -> Result<Profile, String> {
-    let path = solo_profile_path(name).map_err(ConfigError::into_ja)?;
+    load_solo_profile_typed(name).map_err(ConfigError::into_ja)
+}
+
+/// [`load_solo_profile`] の型の口（`tako solo` の起動の流れが表示言語で組む。#2365）
+pub fn load_solo_profile_typed(name: &str) -> Result<Profile, ConfigError> {
+    let path = solo_profile_path(name)?;
     if !path.is_file() {
         return Err(ConfigError::ProfileNotFound {
             kind: Some(ProfileKind::Solo),
             name: name.to_string(),
             path: path.display().to_string(),
-        }
-        .into_ja());
+        });
     }
-    read_profile_file(&path).map_err(ConfigError::into_ja)
+    read_profile_file(&path)
 }
 
 /// プロファイルの YAML を読む（読めない・解釈できないときの断りは型で返す。#2365）
@@ -2737,14 +2751,28 @@ pub fn sandbox_bypass_hint_command(profile_name: &str) -> String {
 }
 
 /// 1M コンテキスト版モデル（`[1m]` サフィックス）への警告文を生成する。
-/// プロファイルへの明示 opt-in は尊重して起動は継続するため、警告のみ（Issue #27）
+/// プロファイルへの明示 opt-in は尊重して起動は継続するため、警告のみ（Issue #27）。
+/// 日本語の口（`profile_warnings` = 応答の `warnings`）。表示言語で組むのは [`one_m_model_warning_in`]
 pub fn one_m_model_warning(model: &str, source: &str) -> Option<String> {
+    one_m_model_warning_in(model, source, tako_core::i18n::Lang::Ja)
+}
+
+/// [`one_m_model_warning`] の表示言語を明示する口（`tako master` / `tako solo` の起動の流れ。#2365）
+pub fn one_m_model_warning_in(
+    model: &str,
+    source: &str,
+    lang: tako_core::i18n::Lang,
+) -> Option<String> {
     if !model.contains("[1m]") {
         return None;
     }
-    Some(format!(
-        "[警告] {source} のモデル '{model}' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  起動に失敗する場合は `tako orchestrator profiles set <プロファイル名> --clear-model` で解除してください"
-    ))
+    Some(
+        crate::ReplyNote::OneMModelWarning {
+            source: source.to_string(),
+            model: model.to_string(),
+        }
+        .text_in(lang),
+    )
 }
 
 // --- system prompt の組み立て（Issue #1154）---

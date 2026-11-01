@@ -96,7 +96,7 @@ pub trait SessionHost {
         _col: usize,
         _row: usize,
     ) -> Result<tako_core::mouse_forward::MouseReport, String> {
-        Err("このホストはクリックを渡せない".into())
+        Err(crate::HostRefusal::DefaultNoClick.into())
     }
     /// バックグラウンドから復帰させたペインのセッションを再接続する（FR-2.15.3）。
     /// セッション自体はバックグラウンド送り時に破棄していないため、UI 層で再描画するだけでよい場合が多い
@@ -474,7 +474,7 @@ pub trait UiStateHost {
         &mut self,
         _selection: tako_core::tree_select::Selection,
     ) -> Result<(), String> {
-        Err("このホストはファイルツリーを持たない".into())
+        Err(crate::HostRefusal::DefaultNoFileTree.into())
     }
     /// ファイルツリーのフォルダの行を開く / 畳む（← / → / Enter。#1908）
     fn set_tree_expanded(&mut self, _dir: &std::path::Path, _expanded: bool) {}
@@ -567,7 +567,7 @@ pub trait UiStateHost {
     /// ペインを器のセッションへ attach し直す（#1857。`tako persist reattach`）。
     /// 既定は GUI が居ない host = 再 attach する端末が無いのでエラー（騙らない）
     fn backend_reattach(&mut self, _pane: PaneId) -> Result<Value, String> {
-        Err("tako アプリ（GUI）が居ないので再 attach できない".into())
+        Err(crate::HostRefusal::DefaultReattachNeedsGui.into())
     }
 
     /// 読み込み中のリモートファイル（#1010）。ツリーがスピナーを出しているもの。
@@ -615,7 +615,7 @@ pub trait UiStateHost {
     fn ssh_auto_folder_status(&self) -> Value {
         serde_json::json!({
             "detection": "unavailable",
-            "reason": "GUI が接続していないので検知状態を読めない",
+            "reason": crate::ReplyNote::SshDetectionNoGui.to_string(),
             "sessions": [],
         })
     }
@@ -688,7 +688,7 @@ pub trait UiStateHost {
         _code: Option<usize>,
         _markdown: bool,
     ) -> Result<serde_json::Value, String> {
-        Err("チャットビューのコピーは未対応".into())
+        Err(crate::HostRefusal::DefaultChatCopy.into())
     }
     /// UI 表示言語の設定値（Issue #435。system / ja / en）
     fn ui_lang_setting(&self) -> tako_core::i18n::LangSetting {
@@ -779,7 +779,7 @@ pub trait UiStateHost {
     /// 「次にやること」のボタンを押す（#1510。ペインを開く・master を起こす・自動の段）。
     /// 実際に開くのは dispatch の後処理（Context が要る）。GUI が居ないホストは Err
     fn welcome_launch(&mut self, _launch: crate::welcome::Launch) -> Result<(), String> {
-        Err("ボタンを押す GUI が居ない".into())
+        Err(crate::HostRefusal::DefaultWelcomeNeedsGui.into())
     }
     /// 自動の段を走らせる（#1510）。既に走っていれば false（GUI が居ないホストも false）
     fn welcome_start_auto(&mut self) -> bool {
@@ -906,7 +906,7 @@ pub trait PreviewHost {
         _pane: PaneId,
         _update: PreviewViewUpdate,
     ) -> Result<PreviewViewState, String> {
-        Err("PDF・画像プレビューのズームは未対応".into())
+        Err(crate::HostRefusal::DefaultZoom.into())
     }
     /// 開いた直後にその行へ着地させる（FR-3.27 / #1676）。
     ///
@@ -919,7 +919,7 @@ pub trait PreviewHost {
         _line: usize,
         _column: Option<usize>,
     ) -> Result<PreviewLineTarget, String> {
-        Err("行ジャンプは未対応".into())
+        Err(crate::HostRefusal::DefaultLineJump.into())
     }
     /// プレビューの選択（#1684。右クリックメニューの「選択範囲を整形」を出すか・その範囲）。
     /// 行 1 始まり・桁 0 始まりの行内 UTF-8 バイト。選択が無い・空なら `None`
@@ -933,7 +933,7 @@ pub trait PreviewHost {
         _pane: PaneId,
         _line: usize,
     ) -> Result<PreviewGotoSource, String> {
-        Err("定義ジャンプは未対応".into())
+        Err(crate::HostRefusal::DefaultGotoDefinition.into())
     }
     /// 整形（FR-3.33 / #1683）の材料。**編集モードでなければ入る**（整形は編集。言語サーバも
     /// そこで起きる = FR-3.28）。`range` は行・桁（行 1 始まり・桁 0 始まりの UTF-8 バイト）で、
@@ -946,7 +946,7 @@ pub trait PreviewHost {
             tako_core::text_edit::TextPosition,
         )>,
     ) -> Result<PreviewFormatSource, String> {
-        Err("整形は未対応".into())
+        Err(crate::HostRefusal::DefaultFormat.into())
     }
     /// 整形の答えを編集バッファへ当てる（#1683。`TextBuffer::apply_changes` の 1 実装 =
     /// undo 1 回で戻る）。版が `expected_version` と違えば何も当てずに断る
@@ -956,7 +956,7 @@ pub trait PreviewHost {
         _changes: Vec<tako_core::text_edit::TextChange>,
         _expected_version: u64,
     ) -> Result<tako_core::text_edit::AppliedChanges, String> {
-        Err("整形は未対応".into())
+        Err(crate::HostRefusal::DefaultFormat.into())
     }
     /// code 表示のプレビューがいま見ている行（1 始まり。FR-3.29 / #1677）。
     ///
@@ -985,7 +985,7 @@ pub trait PreviewHost {
         _pane: PaneId,
         _item: usize,
     ) -> Result<PreviewOutlineTarget, String> {
-        Err("アウトラインナビゲーションは未対応".into())
+        Err(crate::HostRefusal::DefaultOutline.into())
     }
     /// PDF プレビュー内のリンク一覧（Issue #271）。
     fn preview_pdf_links(&self, _pane: PaneId) -> Option<tako_core::PdfLinks> {
@@ -997,7 +997,7 @@ pub trait PreviewHost {
         _pane: PaneId,
         _index: usize,
     ) -> Result<serde_json::Value, String> {
-        Err("PDF リンクフォローは未対応".into())
+        Err(crate::HostRefusal::DefaultPdfLink.into())
     }
     /// Markdown プレビュー内のリンク一覧（Issue #680）。md プレビューでなければ None。
     fn preview_md_links(&self, _pane: PaneId) -> Option<Vec<tako_core::MdLink>> {
@@ -1009,7 +1009,7 @@ pub trait PreviewHost {
         _pane: PaneId,
         _index: usize,
     ) -> Result<serde_json::Value, String> {
-        Err("Markdown リンクフォローは未対応".into())
+        Err(crate::HostRefusal::DefaultMarkdownLink.into())
     }
     /// Markdown プレビューのコードブロック全文をクリップボードへ入れる（Issue #680）。
     /// `index` は出現順の 0 始まり（省略時は先頭）。UI のコピーボタンと同じ経路。
@@ -1018,7 +1018,7 @@ pub trait PreviewHost {
         _pane: PaneId,
         _index: Option<usize>,
     ) -> Result<serde_json::Value, String> {
-        Err("コードブロックのコピーは未対応".into())
+        Err(crate::HostRefusal::DefaultCodeBlockCopy.into())
     }
     /// 表示中ファイルのライブリロード設定（Issue #233）。
     fn preview_reload_enabled(&self) -> bool {
@@ -1073,11 +1073,11 @@ pub trait PreviewHost {
     }
     /// 編集モード切替。開始時のファイル読み込み・UTF-8 検査は実装側が core API で行う。
     fn set_preview_editing(&mut self, _pane: PaneId, _enabled: bool) -> Result<(), String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// 編集バッファの全文置換。
     fn apply_preview_text(&mut self, _pane: PaneId, _text: String) -> Result<(), String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// 行・桁で指定した範囲の置き換え（#1658）。
     ///
@@ -1088,7 +1088,7 @@ pub trait PreviewHost {
         _pane: PaneId,
         _edit: &tako_core::text_edit::RangeEdit,
     ) -> Result<(), String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// ホバーの答えを GUI のその位置にカードとして出す（#1681。`tako lsp hover --show` /
     /// MCP `tako_lsp` の `show`）。`at` は問い合わせた位置（tako の座標 = 0 起点の行・行内の
@@ -1123,7 +1123,7 @@ pub trait PreviewHost {
         _primary: usize,
         _expected_version: Option<u64>,
     ) -> Result<(), String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// 編集カーソルと選択の設定（#1658）。本文は変えない
     fn set_preview_cursor(
@@ -1131,7 +1131,7 @@ pub trait PreviewHost {
         _pane: PaneId,
         _place: &tako_core::text_edit::CursorPlacement,
     ) -> Result<(), String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// 打鍵 1 つぶんの編集コマンド（#1652。単語・行・ページ単位の移動と削除）。
     ///
@@ -1144,7 +1144,7 @@ pub trait PreviewHost {
         _command: tako_core::platform::editor_keys::EditorCommand,
         _expected_version: Option<u64>,
     ) -> Result<(), String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// 編集バッファの文書状態（#1658）。版・行数・カーソル・選択・undo 履歴。
     ///
@@ -1158,16 +1158,16 @@ pub trait PreviewHost {
     /// `force`（#1659）なら外部変更があっても自分の変更で上書きする
     /// （`TextBuffer::save_overwrite`）。成功すれば外部変更の競合は解ける
     fn save_preview(&mut self, _pane: PaneId, _force: bool) -> Result<(), String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// 編集バッファをディスクの中身で読み直す（#1659。`TextBuffer::reload_from_disk`）。
     /// 成功すれば外部変更の競合は解ける。編集中の変更は undo 1 回で戻せる
     fn revert_preview(&mut self, _pane: PaneId) -> Result<(), String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// ディスク上のファイルと編集バッファの差分（#1659。`TextBuffer::disk_diff`）
     fn preview_disk_diff(&self, _pane: PaneId) -> Result<tako_core::DiskDiff, String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// 外部変更の競合（#1659）。競合していなければ `None`。
     ///
@@ -1178,11 +1178,11 @@ pub trait PreviewHost {
     }
     /// undo（#195）
     fn preview_undo(&mut self, _pane: PaneId) -> Result<bool, String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// redo（#195）
     fn preview_redo(&mut self, _pane: PaneId) -> Result<bool, String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// 自動保存の状態取得（#195）
     fn preview_autosave(&self, _pane: PaneId) -> Option<bool> {
@@ -1190,7 +1190,7 @@ pub trait PreviewHost {
     }
     /// 自動保存の設定変更（#195）
     fn set_preview_autosave(&mut self, _pane: PaneId, _enabled: bool) -> Result<(), String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// 今の検索の条件（#1653）。検索したことが無いペインは `None`（= 既定）。
     /// `PreviewSearch` がクエリを省略したときに引き継ぐ条件の出どころ
@@ -1206,12 +1206,12 @@ pub trait PreviewHost {
         _options: SearchOptions,
         _direction: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// 画面の検索欄を開く / 閉じる（#1873）。GUI の ⌘F・Escape と同じ口を通す
     /// （閲覧中の Markdown は閉じると描画へ戻る）。開けないプレビュー（PDF 等）は理由つきで断る
     fn set_preview_search_visible(&mut self, _pane: PaneId, _visible: bool) -> Result<(), String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// 画面の検索欄が開いているか（#1873）。プレビューペインでなければ `None`
     fn preview_search_visible(&self, _pane: PaneId) -> Option<bool> {
@@ -1226,7 +1226,7 @@ pub trait PreviewHost {
         _all: bool,
         _options: SearchOptions,
     ) -> Result<serde_json::Value, String> {
-        Err("プレビュー編集は未対応".into())
+        Err(crate::HostRefusal::DefaultPreviewEdit.into())
     }
     /// プレビューペインのチェンジログビュー状態（Issue #338）。
     /// `(enabled, commits_json)` を返す。enabled=true ならチェンジログ表示中。
@@ -1242,7 +1242,7 @@ pub trait PreviewHost {
         _pane: PaneId,
         _history: Option<tako_core::git::FileHistory>,
     ) -> Result<(), String> {
-        Err("チェンジログビューは未対応".into())
+        Err(crate::HostRefusal::DefaultChangelog.into())
     }
     /// チェンジログビューの 1 行（コミット）の展開の材料を写す（#2150）。`hash` は完全 / 短縮の
     /// どちらでもよい。実装はここで git を起こさない（UI スレッドで呼ばれる。キャッシュ済みの値だけ）
@@ -1251,7 +1251,7 @@ pub trait PreviewHost {
         _pane: PaneId,
         _hash: &str,
     ) -> Result<ChangelogDiffTarget, String> {
-        Err("チェンジログビューは未対応".into())
+        Err(crate::HostRefusal::DefaultChangelog.into())
     }
     /// チェンジログビューの 1 行の diff を置く / 外す（`None` = 折りたたむ。`hash` は完全なハッシュ）。
     ///
@@ -1263,7 +1263,7 @@ pub trait PreviewHost {
         _hash: &str,
         _hunks: Option<Vec<tako_core::DiffHunk>>,
     ) -> Result<(), String> {
-        Err("チェンジログビューは未対応".into())
+        Err(crate::HostRefusal::DefaultChangelog.into())
     }
     /// タブ内の既存プレビューペイン（OpenFile の再利用先。VSCode のプレビュータブ相当）
     fn preview_pane_of_tab(&self, _tab: TabId) -> Option<PaneId> {
@@ -1307,7 +1307,7 @@ pub trait PreviewHost {
         _paths: &[std::path::PathBuf],
         _cut: bool,
     ) -> Result<u64, String> {
-        Err("このホストは OS のクリップボードを使わない".into())
+        Err(crate::HostRefusal::DefaultNoOsClipboard.into())
     }
     /// OS のクリップボードのファイル（Finder / エクスプローラーでコピーしたもの。#1860）
     fn os_file_clipboard_read(&self) -> tako_core::file_clipboard::OsFiles {
@@ -1320,19 +1320,19 @@ pub trait PreviewHost {
     /// "toggle_mute" / "loop_on" / "loop_off" / "toggle_loop"）。
     /// 戻り値は現在の state（"playing" / "paused"）
     fn video_playback(&mut self, _pane: PaneId, _action: &str) -> Result<String, String> {
-        Err("動画再生は未対応".into())
+        Err(crate::HostRefusal::DefaultVideo.into())
     }
     /// 動画のシーク（秒）。戻り値は実際のシーク先の秒数
     fn video_seek(&mut self, _pane: PaneId, _seconds: f64) -> Result<f64, String> {
-        Err("動画再生は未対応".into())
+        Err(crate::HostRefusal::DefaultVideo.into())
     }
     /// 動画の音量設定（0.0〜1.0）。戻り値は設定後の音量
     fn video_volume(&mut self, _pane: PaneId, _volume: f64) -> Result<f64, String> {
-        Err("動画再生は未対応".into())
+        Err(crate::HostRefusal::DefaultVideo.into())
     }
     /// 動画プレイヤーの現在状態（UI のつまみ・時刻表示と同じ値。#484）
     fn video_status(&self, _pane: PaneId) -> Result<VideoStatus, String> {
-        Err("動画再生は未対応".into())
+        Err(crate::HostRefusal::DefaultVideo.into())
     }
 }
 
@@ -1370,11 +1370,11 @@ pub trait WebViewHost {
     /// 生成する。失敗時は Err を返し、呼び出し元がペインを巻き戻す。
     /// 成功時は `{ "id": u64, "pane": u64, "url": String }` を返す
     fn web_open(&mut self, _pane: PaneId, _url: &str) -> Result<Value, String> {
-        Err("Web ビューはこの環境では使えない".into())
+        Err(crate::HostRefusal::DefaultWebView.into())
     }
     /// dock 退避中の Web ビュー `id` をペインへ表示する（FR-3.8 / #155）
     fn web_show(&mut self, _pane: PaneId, _id: u64) -> Result<Value, String> {
-        Err("Web ビューはこの環境では使えない".into())
+        Err(crate::HostRefusal::DefaultWebView.into())
     }
     /// Web ビューの一覧（表示中 + dock 退避中）
     fn web_list(&self) -> Value {
@@ -1387,7 +1387,7 @@ pub trait WebViewHost {
         _id: Option<u64>,
         _pane: Option<u64>,
     ) -> Result<(u64, Option<PaneId>), String> {
-        Err("Web ビューはこの環境では使えない".into())
+        Err(crate::HostRefusal::DefaultWebView.into())
     }
     /// Web ビュー `id` を完全に破棄する。表示中だった場合はそのペイン ID を返す
     /// （ペイン自体の close は呼び出し元 = dispatch の責務）
@@ -1396,19 +1396,19 @@ pub trait WebViewHost {
     }
     /// ナビゲーション（`to` = "back" / "forward" / "reload" / URL）
     fn web_navigate(&mut self, _id: u64, _to: &str) -> Result<Value, String> {
-        Err("Web ビューはこの環境では使えない".into())
+        Err(crate::HostRefusal::DefaultWebView.into())
     }
     /// JS の非同期評価を発行し token を返す（結果は `web_eval_result` で回収）
     fn web_eval(&mut self, _id: u64, _js: &str) -> Result<Value, String> {
-        Err("Web ビューはこの環境では使えない".into())
+        Err(crate::HostRefusal::DefaultWebView.into())
     }
     /// eval 結果の回収。未完なら `{ "pending": true }`
     fn web_eval_result(&mut self, _id: u64, _token: u64) -> Result<Value, String> {
-        Err("Web ビューはこの環境では使えない".into())
+        Err(crate::HostRefusal::DefaultWebView.into())
     }
     /// URL・タイトル・読み込み状態を返す
     fn web_read(&self, _id: u64) -> Result<Value, String> {
-        Err("Web ビューはこの環境では使えない".into())
+        Err(crate::HostRefusal::DefaultWebView.into())
     }
 }
 
@@ -1420,11 +1420,11 @@ pub trait RemoteHost {
     /// リモートアクセス API サーバーを起動する。成功時は状態 JSON を返す。
     /// transport は Tailscale Serve のみ。未セットアップなら不足項目を列挙して拒否する（#282）
     fn remote_start(&mut self) -> Result<Value, String> {
-        Err("リモートアクセス API はこの環境では使えない".into())
+        Err(crate::HostRefusal::DefaultRemoteApi.into())
     }
     /// リモートアクセス API サーバーを停止する
     fn remote_stop(&mut self) -> Result<Value, String> {
-        Err("リモートアクセス API サーバーが起動していない".into())
+        Err(crate::HostRefusal::DefaultRemoteApiNotRunning.into())
     }
     /// リモートアクセス API サーバーの状態を返す
     fn remote_status(&self) -> Value {
@@ -1495,15 +1495,15 @@ pub trait SystemHost {
     /// 更新の実行（#403）。channel で対象チャンネルを指定（既定 stable）。
     /// UI 層は更新完了後に自動再起動する（dispatch は再起動しない）
     fn update_apply(&mut self, _channel: Option<&str>) -> Result<Value, String> {
-        Err("この環境では更新を実行できない".into())
+        Err(crate::HostRefusal::DefaultUpdate.into())
     }
     /// zip 強制更新（#50）。brew 失敗時のフォールバック。配布系統を問わず zip で更新する
     fn update_apply_zip(&mut self, _channel: Option<&str>) -> Result<Value, String> {
-        Err("この環境では更新を実行できない".into())
+        Err(crate::HostRefusal::DefaultUpdate.into())
     }
     /// broken-brew の修復（#50）。`brew install --cask --force` で台帳を再締結する
     fn update_repair(&mut self) -> Result<Value, String> {
-        Err("この環境では修復を実行できない".into())
+        Err(crate::HostRefusal::DefaultRepair.into())
     }
     /// アップデート専用画面を開く（Issue #616）
     fn open_update_window(&mut self) {}
@@ -1545,7 +1545,7 @@ pub trait SystemHost {
     }
     /// 保存時整形の切替（`tako lsp format-on-save on|off`・設定画面）。永続化は実装側の責務
     fn set_lsp_format_on_save(&mut self, _enabled: bool) -> Result<(), String> {
-        Err("保存時整形の設定は未対応".into())
+        Err(crate::HostRefusal::DefaultFormatOnSave.into())
     }
     /// 括弧の自動閉じの設定（#1759）の今の値。**既定 true**（GUI は settings.json の
     /// `editor_auto_close` を起動時に読んだ値を持ち、編集を始めるバッファへ渡す）
@@ -1555,7 +1555,7 @@ pub trait SystemHost {
     /// 括弧の自動閉じの切替（`tako edit auto-close on|off`・設定画面）。開いている編集バッファへの
     /// 反映と settings.json への永続化は実装側の責務
     fn set_editor_auto_close(&mut self, _enabled: bool) -> Result<(), String> {
-        Err("括弧の自動閉じの設定は未対応".into())
+        Err(crate::HostRefusal::DefaultAutoClose.into())
     }
     /// tako mod（FR-2.42 / #1879）の状態。GUI のメモリだけに置く（永続化しない）。
     /// `None` = mod を扱わない（2 つ目のインスタンス・テストのホスト）
@@ -1568,7 +1568,7 @@ pub trait SystemHost {
     }
     /// 設定 `claude_mod` の切替（`tako mod on|off`）。settings.json への永続化は実装側の責務
     fn set_claude_mod_enabled(&mut self, _enabled: bool) -> Result<(), String> {
-        Err("この tako は mod を扱わない".into())
+        Err(crate::HostRefusal::DefaultNoMod.into())
     }
     /// 定型の UI 設定 ui.json の置き場（#1960）。既定は `<data_dir>/claude-mod/ui.json`
     /// （CLI のローカル処理と同じ場所）。テストのホストは自分の一時ファイルを返す
