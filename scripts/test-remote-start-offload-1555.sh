@@ -186,21 +186,30 @@ mcp_call() {
 }
 
 # 区間の間 `tako list`（IPC）を打ち続け、1 回ごとの往復の ms を $2 へ 1 行ずつ書く。
+# 繋がらなかった往復（GUI が居ない等）は速く返るので速さに数えず、$2.fail へ数を書く。
 # $1 = 区間を表す pid（終わるまで続ける）。少なくとも 3 回は打つ
 probe_ipc_while() {
-  local busy="$1" out="$2" n=0 t0 t1
+  local busy="$1" out="$2" n=0 failed=0 t0 t1
   : > "$out"
   while kill -0 "$busy" 2>/dev/null || [ "$n" -lt 3 ]; do
     t0=$(now_ms)
-    "$CLI" list >/dev/null 2>&1
-    t1=$(now_ms)
-    echo $((t1 - t0)) >> "$out"
+    if "$CLI" list >/dev/null 2>&1; then
+      t1=$(now_ms)
+      echo $((t1 - t0)) >> "$out"
+    else
+      failed=$((failed + 1))
+    fi
     n=$((n + 1))
     [ "$n" -ge 200 ] && break
     sleep 0.2
   done
+  echo "$failed" > "$out.fail"
 }
-max_of() { sort -n "$1" | tail -1 | tr -dc '0-9'; }
+# 往復の最長（ms）。1 回も通らなければ大きな値（= 「待たされない」を満たさない）
+max_of() {
+  if [ -s "$1" ]; then sort -n "$1" | tail -1 | tr -dc '0-9'; else echo 999999; fi
+}
+fails_of() { tr -dc '0-9' < "$1.fail"; }
 # perf.log の「メインスレッド専有: <タグ> が N ms」の行数（$1 = タグの正規表現）
 perf_hits() {
   grep -cE "メインスレッド専有: $1 が [0-9]+ms" "$PERF" 2>/dev/null | tr -dc '0-9'
@@ -247,6 +256,7 @@ check_eq "応答に url がある" "true" "$(jq -r '(.url // "") | startswith("h
 check_eq "応答に serve_binary がある（#432）" "true" "$(jq -r '(.serve_binary // "") != ""' "$TMP/1-start.txt" 2>/dev/null)"
 check_ge "start は注入した待ちの分かかる（区間を作れている）" "$SLOW_MS" "$(cat "$TMP/1-start-ms.txt")"
 check_lt "start の間の tako list の最長の往復（ms）" "$QUICK_MS" "$(max_of "$TMP/1-ipc.txt")"
+check_eq "start の間の tako list は 1 回も失敗しない" 0 "$(fails_of "$TMP/1-ipc.txt")"
 check_eq "perf.log に dispatch:RemoteStart の専有が出ない" 0 "$(perf_hits 'dispatch:RemoteStart')"
 check_eq "perf.log に 1000ms 以上の専有が出ない" 0 "$(perf_long | grep -c . | tr -dc '0-9')"
 check_eq "daemon は 1 本" 1 "$(count_daemons)"
@@ -293,6 +303,10 @@ if wait_status '.starting.state == "starting"' 40 "$TMP/3-window.json"; then
   pass "自動復帰が起こしている途中（印が starting）を捉えた"
 else
   fail "自動復帰が起こしている途中を捉えられなかった"
+  # 切り分け用: GUI が生きているか・自動復帰が何を残したか
+  if kill -0 "$APP_PID" 2>/dev/null; then echo "    GUI（pid ${APP_PID}）は生きている"; else echo "    GUI（pid ${APP_PID}）は居ない"; fi
+  grep -h "リモート自動復帰\|セカンダリ\|secondary" "$TMP/data/persist.log" 2>/dev/null | tail -5 | sed 's/^/    persist.log: /'
+  tail -15 "$TMP/app3.log" 2>/dev/null | sed 's/^/    app3.log: /'
 fi
 # 自動復帰の起動が終わるまで IPC を打ち続ける（終わりは印が消えて running になったこと）
 (
@@ -308,6 +322,7 @@ echo "  （自動復帰の間の tako list: $(LC_ALL=C tr '\n' ' ' < "$TMP/3-ipc
 "$CLI" remote status >"$TMP/3-after.json" 2>/dev/null
 check_eq "自動復帰が起こした" "true/started" "$(field "$TMP/3-after.json" .running)/$(field "$TMP/3-after.json" .last_autostart.result)"
 check_lt "自動復帰の間の tako list の最長の往復（ms）" "$QUICK_MS" "$(max_of "$TMP/3-ipc.txt")"
+check_eq "自動復帰の間の tako list は 1 回も失敗しない" 0 "$(fails_of "$TMP/3-ipc.txt")"
 check_eq "自動復帰の間の perf.log に 1000ms 以上の専有が出ない" 0 "$(perf_long | grep -c . | tr -dc '0-9')"
 perf_long | sed 's/^/    /' | head -5
 check_eq "daemon は 1 本" 1 "$(count_daemons)"
@@ -326,6 +341,7 @@ jq -r '.content[0].text // ""' "$TMP/4-start.json" > "$TMP/4-start.txt"
 jq -r 'keys | join(",")' "$TMP/4-start.txt" > "$TMP/4-keys.txt" 2>/dev/null
 check_eq "A/B: 応答の欄は ① と同じ" "$(cat "$TMP/1-keys.txt")" "$(cat "$TMP/4-keys.txt")"
 check_ge "A/B: start の間の tako list は起動の終わりまで待たされる（ms）" "$((SLOW_MS / 2))" "$(max_of "$TMP/4-ipc.txt")"
+check_eq "A/B: start の間の tako list は 1 回も失敗しない" 0 "$(fails_of "$TMP/4-ipc.txt")"
 check_eq "A/B: perf.log に dispatch:RemoteStart の専有が出る" 1 "$(perf_hits 'dispatch:RemoteStart')"
 stop_isolated_gui "$APP_PID"
 APP_PID=""
@@ -348,6 +364,7 @@ echo 0 > "$TMP/slow"
 sleep 1
 check_eq "CLI の start は成る" 0 "$S5_RC"
 check_lt "CLI の start の間の tako list の最長の往復（ms）" "$QUICK_MS" "$(max_of "$TMP/5-ipc.txt")"
+check_eq "CLI の start の間の tako list は 1 回も失敗しない" 0 "$(fails_of "$TMP/5-ipc.txt")"
 check_eq "CLI の start は GUI の dispatch:RemoteStart を通らない" 0 "$(perf_hits 'dispatch:RemoteStart')"
 stop_isolated_gui "$APP_PID"
 APP_PID=""
