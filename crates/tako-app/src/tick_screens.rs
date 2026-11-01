@@ -538,34 +538,46 @@ mod tests {
     #[test]
     fn 背景で採った1枚は修正前の読みと同じ答えを返す() {
         use std::time::{Duration, Instant};
-        // claude の画面の形（alternate screen・太字・全角・利用制限の告知・入力欄・フッター）
-        let script = concat!(
-            "printf '\\033[?1049h\\033[1m❯ 作業を続けて\\033[0m\\n\\n",
-            "⏺ You'\\''ve hit your session limit · resets 3am (Asia/Tokyo)\\n\\n",
-            "────────\\n❯ \\n────────\\n",
-            "  [Opus 5 (1M context) · 1H] ctx 55%% · 5h 40%% · 7d 20%%'; sleep 30"
-        );
-        let (session, _rx) = TerminalSession::spawn(
+        // 子は何も出さずにすぐ終わらせ、終わりが届いてから画面を直に置く（`print_local`）。
+        // 子の出力の時機（unix の PTY と Windows の ConPTY で違う）に依らず、両 OS で同じ画面を読む
+        #[cfg(unix)]
+        let (program, args) = ("/bin/sh", vec!["-c", "exit 0"]);
+        #[cfg(windows)]
+        let (program, args) = ("cmd.exe", vec!["/c", "exit 0"]);
+        let (session, mut rx) = TerminalSession::spawn(
             60,
             12,
             tako_core::SpawnOptions {
                 command: Some(tako_core::SpawnCommand {
-                    program: "/bin/sh".to_string(),
-                    args: vec!["-c".to_string(), script.to_string()],
+                    program: program.to_string(),
+                    args: args.into_iter().map(str::to_string).collect(),
                 }),
                 ..tako_core::SpawnOptions::default()
             },
         )
         .expect("PTY を張れる");
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !session
-            .visible_lines()
-            .iter()
-            .any(|l| l.contains("ctx 55%"))
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(20));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut exited = false;
+        while !exited && Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(tako_core::SessionEvent::Term(
+                    tako_core::TermEvent::ChildExit(_) | tako_core::TermEvent::Exit,
+                )) => exited = true,
+                Ok(_) => {}
+                Err(futures::channel::mpsc::TryRecvError::Closed) => exited = true,
+                Err(futures::channel::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+            }
         }
+        assert!(exited, "子の終わりが届かない");
+        // claude の画面の形（alternate screen・太字・全角・利用制限の告知・入力欄・フッター）
+        session.print_local(concat!(
+            "\u{1b}[?1049h\u{1b}[H\u{1b}[2J\u{1b}[1m❯ 作業を続けて\u{1b}[0m\r\n\r\n",
+            "⏺ You've hit your session limit · resets 3am (Asia/Tokyo)\r\n\r\n",
+            "────────\r\n❯ \r\n────────\r\n",
+            "  [Opus 5 (1M context) · 1H] ctx 55% · 5h 40% · 7d 20%"
+        ));
         assert!(
             session
                 .visible_lines()
