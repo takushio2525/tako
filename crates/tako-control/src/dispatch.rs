@@ -45002,10 +45002,16 @@ tako | pane 2 [ compact ]       [-]
                 );
                 assert_eq!(result["cwd_source"].as_str(), Some("profile"));
                 let warnings = result["warnings"].as_array().cloned().unwrap_or_default();
+                // 文は表示言語（#2365。日英の字面は tako-core の `successor_cwd_warning_in` のテストが見る）。
+                // ここは日英で同じ部分 = 後任の cwd と、前任に合わせる最簡のコマンド（#322）で見る
+                let fix = format!(
+                    "tako orchestrator profiles set {profile} --cwd {}",
+                    prev_cwd.display()
+                );
                 assert!(
-                    warnings.iter().any(|w| w
-                        .as_str()
-                        .is_some_and(|t| t.contains("起動フォルダが前任と違います"))),
+                    warnings.iter().any(|w| w.as_str().is_some_and(|t| {
+                        t.contains(want_cwd.to_string_lossy().as_ref()) && t.ends_with(&fix)
+                    })),
                     "食い違いを黙った: {warnings:?}"
                 );
 
