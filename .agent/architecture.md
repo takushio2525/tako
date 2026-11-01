@@ -1849,6 +1849,14 @@ lid-guard.json が使う）:
   15 節（グラフ）+ 16 節（`job.run()` の形と tako-app）、A/B は `TAKO_2182_LEGACY=1`（UI スレッドで組む）、
   実経路は `scripts/test-respond-master-launch-2182.sh`（`$SHELL` を差し替えた戻らないログインシェル）と
   visual-test `tasks-launch-2182`（右パネルの「返す」の入口 `user_task_respond`）
+- **remote の daemon の起動も UI スレッドで待たない**（#1555）: `spawn_daemon` は子の起動情報を最長 30 秒待ち、
+  子は起動の途中で GUI の IPC へ probe（`AppConnection::new` → `List`）を送るので、UI スレッドの同期の dispatch
+  （MCP `tako_remote_start` の IPC・設定画面の「開始」）で待つと子の読み取りの上限 10 秒まで待ち合っていた
+  （本番の `dispatch:RemoteStart` 10.5 秒の正体）。`prepare_offload` の腕が host の仕事（`RemoteHost::remote_start_job`）を
+  `OffloadJob::RemoteStart` へ包み、`run_reply` が background から応答する。設定画面は `remote_start_off_ui` で同じ
+  準備 → background → `drive_offload` を通す。自動復帰とリモートパネルのボタンは元から `background_executor()`。
+  番犬 `issue1555_remote_start_offload_watchdog.rs`、A/B は `TAKO_1555_LEGACY=1`、実経路は
+  `scripts/test-remote-start-offload-1555.sh`（FR-6.22.5）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

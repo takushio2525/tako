@@ -6235,6 +6235,10 @@ pub enum OffloadJob {
     /// スマホの一覧（#1984）。`claude agents --json`（上限 15 秒）と器の `list-panes` を
     /// UI スレッドで待たない（workspace に触らないのでそのまま background から応答する）
     RemoteAgents,
+    /// リモートの daemon の起動（#1555。host が渡した [`crate::host::RemoteStartJob`]）。
+    /// 子の起動情報を最長 30 秒待ち、子は起動の途中で GUI の IPC へ probe を送るので、UI スレッドで
+    /// 待つと子の読み取りの上限（10 秒）まで互いに待ち合う。workspace に触らないので background から応答する
+    RemoteStart(crate::host::RemoteStartJob),
     /// 利用制限の観測の要約と使用量の内訳（`tako_sessions` の `action: "usage"`。usage 分析 S1 #2200 /
     /// S2 #2201）。`<data_dir>/usage/` のファイルは記録が続くほど育ち、答える前に索引を最大 10 秒
     /// 読み進めるので、UI スレッドで読まない（workspace に触らないのでそのまま background から応答する）
@@ -7074,6 +7078,12 @@ pub fn prepare_offload(
         Request::RemoteAgents if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::RemoteAgents))
         }
+        // #1555: daemon の起動を UI スレッドで待たない（子が起動の途中で GUI の IPC へ probe を送るので、
+        // 待つと子の読み取りの上限 10 秒まで互いに待ち合う）。仕事を渡さない host（テスト等）と
+        // A/B の `TAKO_1555_LEGACY=1` は同期の腕（`host.remote_start()`）
+        Request::RemoteStart {} if !crate::remote::start_offload_legacy() => host
+            .remote_start_job()
+            .map(|job| Ok(OffloadJob::RemoteStart(job))),
         // #2203: `show` は同じ段・期間・絞り込みで右パネルの usage ビューを開いてから、答えは同じ
         // background のジョブで返す（UI スレッドで行うのは引数の確かめと画面の段を置くことだけ）
         Request::Sessions {
@@ -7284,6 +7294,8 @@ impl OffloadJob {
             OffloadJob::RunResolve { ctx } => finish_run_resolve(&ctx),
             OffloadJob::RunConfigSketch(job) => job.run(),
             OffloadJob::RemoteAgents => remote_agents_reply(),
+            // #1555: 同期の腕（`host.remote_start().map_err(DispatchError::Operation)`）と同じ応答
+            OffloadJob::RemoteStart(job) => job().map_err(DispatchError::Operation),
             OffloadJob::UsageSummary(query) => crate::usage::usage_payload(
                 &query,
                 crate::usage::Refresh::Budget(crate::usage::MCP_REFRESH_BUDGET),
@@ -11757,6 +11769,8 @@ fn dispatch_inner(
             limit,
         }),
 
+        // #1555: IPC / 設定画面のボタンは `prepare_offload` が background へ出す（`OffloadJob::RemoteStart`）。
+        // ここへ来るのは仕事を渡さない host・`TAKO_OFFLOAD=0`・A/B の `TAKO_1555_LEGACY=1`・直呼び
         Request::RemoteStart {} => host.remote_start().map_err(DispatchError::Operation),
         Request::RemoteStop { force } => {
             if force {
@@ -28991,6 +29005,10 @@ mod tests {
         _mod_ui_dir: tako_core::test_residue::ScratchDir,
         /// #1908: ファイルツリー（GUI の `filetree` と `tree_selection` の代役）
         tree: MockTree,
+        /// #1555: `remote_start_job` が渡す仕事の答え（既定 None = 仕事を渡さない host = 同期の腕）
+        remote_start_reply: Option<Result<Value, String>>,
+        /// #1555: 同期の腕（`remote_start`）が呼ばれた回数
+        remote_start_sync_calls: usize,
     }
 
     /// #1908: ファイルツリーの代役（見えている行・選択・開閉の記録）
@@ -29104,6 +29122,8 @@ mod tests {
                 mod_ui_path: mod_ui_dir.path().join("ui.json"),
                 _mod_ui_dir: mod_ui_dir,
                 tree: MockTree::default(),
+                remote_start_reply: None,
+                remote_start_sync_calls: 0,
             }
         }
 
@@ -30195,7 +30215,18 @@ mod tests {
     }
 
     impl WebViewHost for MockHost {}
-    impl RemoteHost for MockHost {}
+    impl RemoteHost for MockHost {
+        fn remote_start(&mut self) -> Result<Value, String> {
+            self.remote_start_sync_calls += 1;
+            self.remote_start_reply
+                .clone()
+                .unwrap_or_else(|| Err(crate::HostRefusal::DefaultRemoteApi.into()))
+        }
+        fn remote_start_job(&self) -> Option<crate::host::RemoteStartJob> {
+            let reply = self.remote_start_reply.clone()?;
+            Some(Box::new(move || reply))
+        }
+    }
     impl SystemHost for MockHost {
         fn resolve_stale_pane(&self, stale: PaneId) -> Option<PaneId> {
             self.stale_pane_map.get(&stale).copied()
@@ -54821,6 +54852,79 @@ mod tests {
         // 器のペインが無ければジョブにしない（同期の腕で組む = 子プロセスを起こさない）
         host.backend_sessions.clear();
         assert!(prepare_offload(&mut host, &Request::List).is_none());
+    }
+
+    /// #1555: `RemoteStart` は host が仕事を渡せば background へ出し、応答は同期の腕と同じ。
+    /// 仕事を渡さない host は同期の腕のまま（daemon を起こさない host に起こす道を作らない）
+    #[test]
+    fn issue1555_remote_startは仕事を渡すhostだけbackgroundへ出る() {
+        let start = Request::RemoteStart {};
+
+        // 仕事を渡さない host: ジョブにしない = 同期の腕（既定の断り）
+        let mut host = MockHost::new();
+        assert!(prepare_offload(&mut host, &start).is_none());
+        let sync = dispatch(&mut host, start.clone(), PaneOrigin::Cli).unwrap_err();
+        assert!(matches!(sync, DispatchError::Operation(_)), "{sync:?}");
+        assert_eq!(host.remote_start_sync_calls, 1);
+
+        // 仕事を渡す host: ジョブになり、UI スレッドで host の同期の腕を呼ばない
+        let reply = json!({ "running": true, "url": "https://tako-1555.example.ts.net" });
+        host.remote_start_reply = Some(Ok(reply.clone()));
+        let job = match prepare_offload(&mut host, &start) {
+            Some(Ok(job @ OffloadJob::RemoteStart(_))) => job,
+            _ => panic!("RemoteStart が background のジョブにならない"),
+        };
+        assert_eq!(host.remote_start_sync_calls, 1, "準備で起動しない");
+        // background から応答する（workspace に触らない = UI スレッドへ戻さない）
+        match job.run_staged() {
+            OffloadOutcome::Reply(Ok(v)) => assert_eq!(v, reply),
+            OffloadOutcome::Reply(Err(e)) => panic!("成功の応答のはずが {e:?}"),
+            OffloadOutcome::OnUi(_) => panic!("RemoteStart の続きを UI スレッドへ戻している"),
+        }
+        // 同期の腕と同じ応答（同じ host・同じ答え）
+        assert_eq!(
+            dispatch(&mut host, start.clone(), PaneOrigin::Cli).unwrap(),
+            reply
+        );
+
+        // 断り・失敗も同期の腕と同じ形（`DispatchError::Operation` に包む）
+        let why = "リモートサーバーは既に起動中".to_string();
+        host.remote_start_reply = Some(Err(why.clone()));
+        let offloaded = match prepare_offload(&mut host, &start) {
+            Some(Ok(job)) => match job.run_staged() {
+                OffloadOutcome::Reply(Err(e)) => e,
+                _ => panic!("断りが Reply(Err) で返らない"),
+            },
+            _ => panic!("RemoteStart が background のジョブにならない"),
+        };
+        let synced = dispatch(&mut host, start, PaneOrigin::Cli).unwrap_err();
+        assert_eq!(format!("{offloaded:?}"), format!("{synced:?}"));
+        assert_eq!(
+            format!("{offloaded:?}"),
+            format!("{:?}", DispatchError::Operation(why))
+        );
+    }
+
+    /// #1555 の A/B: `TAKO_1555_LEGACY=1` は修正前と同じく同期の腕（UI スレッドで待つ）
+    #[test]
+    fn issue1555_legacyはremote_startを同期の腕で答える() {
+        if tako_core::run_alone!(issue1555_legacyはremote_startを同期の腕で答える) {
+            return;
+        }
+        let mut host = MockHost::new();
+        host.remote_start_reply = Some(Ok(json!({ "running": true })));
+        assert!(prepare_offload(&mut host, &Request::RemoteStart {}).is_some());
+        std::env::set_var(crate::remote::START_OFFLOAD_LEGACY_ENV, "1");
+        assert!(crate::remote::start_offload_legacy());
+        assert!(
+            prepare_offload(&mut host, &Request::RemoteStart {}).is_none(),
+            "A/B なのに background へ出している"
+        );
+        assert_eq!(
+            dispatch(&mut host, Request::RemoteStart {}, PaneOrigin::Cli).unwrap(),
+            json!({ "running": true })
+        );
+        assert_eq!(host.remote_start_sync_calls, 1);
     }
 
     /// #1984: UI スレッドの同期の dispatch で子プロセスを待っていた要求だけが background へ出る。

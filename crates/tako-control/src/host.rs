@@ -1413,14 +1413,27 @@ pub trait WebViewHost {
 }
 
 // ---------------------------------------------------------------------------
-// RemoteHost — リモートアクセス API（3 メソッド）
+// RemoteHost — リモートアクセス API（4 メソッド）
 // ---------------------------------------------------------------------------
+
+/// `remote_start` の本体を UI スレッドの外で走らせる 1 回きりの仕事（#1555）
+pub type RemoteStartJob = Box<dyn FnOnce() -> Result<Value, String> + Send>;
 
 pub trait RemoteHost {
     /// リモートアクセス API サーバーを起動する。成功時は状態 JSON を返す。
     /// transport は Tailscale Serve のみ。未セットアップなら不足項目を列挙して拒否する（#282）
     fn remote_start(&mut self) -> Result<Value, String> {
         Err(crate::HostRefusal::DefaultRemoteApi.into())
+    }
+    /// `remote_start` と同じ起動を background で走らせるための仕事（#1555）。
+    ///
+    /// daemon の起動は子の起動情報を最長 30 秒待ち、しかも子は起動の途中で GUI の IPC へ
+    /// 問い合わせる（`AppConnection::new` の probe）。UI スレッドで待つと互いに待ち合い、
+    /// 子の読み取りの上限（10 秒）まで GUI が止まる。IPC の受け口と設定画面のボタンは
+    /// `prepare_offload` でこれを background へ出す。`None`（既定）= 背景へ出さず同期の腕
+    /// （`remote_start`）で答える（daemon を起こさない host に起こす道を作らない）
+    fn remote_start_job(&self) -> Option<RemoteStartJob> {
+        None
     }
     /// リモートアクセス API サーバーを停止する
     fn remote_stop(&mut self) -> Result<Value, String> {

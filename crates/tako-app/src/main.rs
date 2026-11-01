@@ -28798,11 +28798,23 @@ impl PreviewHost for TakoApp {
     }
 }
 
+/// dispatch（MCP `tako_remote_start` の IPC・設定画面の「開始」）が頼んだ daemon の起動（#2533 の経路の名乗りつき）。
+/// 同期の腕（`remote_start`）と background の仕事（`remote_start_job`。#1555）の 1 実装
+fn remote_start_from_dispatch() -> Result<serde_json::Value, String> {
+    use tako_control::remote::{with_origin, RequestOrigin};
+    with_origin(RequestOrigin::Dispatch, tako_control::remote::spawn_daemon)
+}
+
 impl RemoteHost for TakoApp {
     // #2533: dispatch（MCP・CLI からの IPC・設定画面）から頼んだことを audit.log に残す
     fn remote_start(&mut self) -> Result<serde_json::Value, String> {
-        use tako_control::remote::{with_origin, RequestOrigin};
-        with_origin(RequestOrigin::Dispatch, tako_control::remote::spawn_daemon)
+        remote_start_from_dispatch()
+    }
+
+    // #1555: IPC の受け口と設定画面のボタンはこれを background で走らせる（UI スレッドで daemon を待つと、
+    // 起動の途中で GUI の IPC へ probe を送る daemon と子の読み取りの上限 10 秒まで待ち合う）
+    fn remote_start_job(&self) -> Option<tako_control::RemoteStartJob> {
+        Some(Box::new(remote_start_from_dispatch))
     }
 
     fn remote_stop(&mut self) -> Result<serde_json::Value, String> {
