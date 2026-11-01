@@ -319,13 +319,9 @@ pub fn json(topic: Option<&str>, profile_name: &str) -> Result<Value, String> {
     // #2256: 読めないプロファイルでも手順書は既定値で引ける（止めない）が、既定で組み立てたことを
     // `warnings` へ出し、個人ルール（local-rules）は「無い」ではなく「読めない」と返す。
     // 読むだけ（退避は起動の経路と `tako migrate` が持つ）
+    // 理由は表示言語（`ProfileFallback` の Display。CLI の手元の処理も表示言語を決めてから呼ぶ。#2365）
     let (profile, unreadable) = super::read_for_judgment(super::ProfileKind::Master, profile_name);
-    let warning = unreadable.map(|why| {
-        format!(
-            "{why}。手順書の値（引き継ぎの閾値など）はこのファイルではなく組み込み既定で組み立てた。\
-             個人ルールの on-demand 部（local-rules）は読めていない。直すと次の呼び出しから効く"
-        )
-    });
+    let warning = unreadable.map(|why| super::ProfileFallback::Guide(why).to_string());
     let text_of = |g: &Guide| match &warning {
         Some(w) if g.topic == LOCAL_RULES => local_rules_unreadable(w),
         _ => profile.render_prompt_placeholders(&g.body_raw(&profile)),

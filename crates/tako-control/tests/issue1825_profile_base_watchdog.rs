@@ -481,7 +481,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: ORCH,
             fn_needle: "fn read_profile_base_at(",
-            from: "serde_yaml::from_str(&text).map_err(|e| tako_core::load_issue::yaml_error_reason(&e, &text))",
+            from: "serde_yaml::from_str(&text).map_err(|e| UnreadableCause::Parse(YamlReason::of(&e, &text)))",
             to: "Ok(serde_yaml::from_str(&text).unwrap_or_default())",
             marker: "serde_yaml::from_str(&text).unwrap_or_default()",
         },

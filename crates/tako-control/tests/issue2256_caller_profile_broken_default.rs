@@ -673,6 +673,9 @@ fn issue2256_壊れたdefaultでspawn_解消_adopt_guide_自動復帰が黙ら�
     std::env::set_var("TAKO_ISOLATED", "1");
     // claude の所在確認（ログインシェル）を外す
     std::env::set_var("TAKO_983_LEGACY", "1");
+    // 応答の理由は表示言語に従う（#2365）。このテストは日本語の文の中身を見るので日本語表示で回す
+    // （静的既定は英語。英語表示は `issue2365_profile_unreadable_lang.rs` が見る）
+    tako_core::i18n::set_lang(tako_core::i18n::Lang::Ja);
     // 実行時の自動移行（#916。1 プロセス 1 回）を default の無い data dir で先に済ませる。
     // 済ませないと最初のケースだけ移行が default.yaml を読みに行き、退避・persist.log の行が
     // 「この経路が出したもの」かどうかを見分けられない

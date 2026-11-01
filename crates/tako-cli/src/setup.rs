@@ -2867,6 +2867,8 @@ fn print_next_steps(master_ready: bool, has_remaining: bool) {
         tako_control::orchestrator::ProfileKind::Master,
         tako_core::handoff::DEFAULT_PROFILE,
     );
+    // `tako setup` の要約は日本語の枠（#2365 の「setup は日本語」）なので理由も日本語で組む
+    let note = note.map(|n| n.text_in(tako_core::i18n::Lang::Ja));
     eprintln!();
     for line in profile_summary_lines(&profile, note.as_deref()) {
         eprintln!("{line}");
