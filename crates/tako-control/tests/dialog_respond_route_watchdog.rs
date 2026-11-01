@@ -56,22 +56,31 @@ fn fn_body(src: &str, name: &str) -> String {
     rest[..end].to_string()
 }
 
+/// 届き方の解決の 1 実装（#2639 で同期の腕 `dispatch_orchestrator_respond` と background へ出す準備
+/// `prepare_offload` が共有するために切り出した）
+const RESOLVER: &str = "respond_access";
+
 #[test]
 fn respondの入口はin_processを先に見る() {
     let root = workspace_root();
     let src = read(&root, "crates/tako-control/src/dispatch.rs");
     let code = read_code(&root, "crates/tako-control/src/dispatch.rs");
-    let body = fn_body(&code, "dispatch_orchestrator_respond");
+    // 入口は届き方の解決を 1 実装へ任せる（自前で器越しへ直行しない）
+    assert!(
+        fn_body(&code, "dispatch_orchestrator_respond").contains(&format!("{RESOLVER}(")),
+        "respond の入口が届き方の解決（`{RESOLVER}`）を通っていない（#1200 / #2639）"
+    );
+    let body = fn_body(&code, RESOLVER);
 
     assert!(
         body.contains("crate::reach::dialog_access("),
-        "respond の入口が `reach::dialog_access` を通っていない（#1200。\
+        "respond の届き方の解決が `reach::dialog_access` を通っていない（#1200。\
          器越しへ直行すると、入力送出を持たない器（psmux）では生きているペインに\
          対して必ず失敗する）"
     );
     // 旧実装の形（バックエンドセッション名が無ければ即エラー）へ戻っていないこと。
     // A/B の入口（`TAKO_1200_LEGACY`）の中だけは旧経路を残してある
-    let outside_ab = fn_body(&src, "dispatch_orchestrator_respond")
+    let outside_ab = fn_body(&src, RESOLVER)
         .split("TAKO_1200_LEGACY")
         .next()
         .expect("split は必ず 1 つ以上返す")
@@ -85,7 +94,7 @@ fn respondの入口はin_processを先に見る() {
     );
     // 番犬自身の検査: A/B の入口の中には今もその断りがある（綴りが変わって空振りしていない）
     assert!(
-        fn_body(&src, "dispatch_orchestrator_respond").contains("Reason::BackendSessionNotFound("),
+        fn_body(&src, RESOLVER).contains("Reason::BackendSessionNotFound("),
         "A/B の入口の断りの綴りが変わった。この番犬の照合も直すこと"
     );
 }

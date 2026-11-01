@@ -6249,6 +6249,11 @@ pub enum OffloadJob {
     /// リモートの daemon の状態（#2630。host が渡した [`crate::host::RemoteStatusJob`]）。稼働中は 2 系統の同居の
     /// 調査で tailscale の CLI を最大 3 本起こすので、UI スレッドで待たない。workspace に触らないので background から応答する
     RemoteStatus(crate::host::RemoteStatusJob),
+    /// 選択肢ダイアログへの応答（#2639）。届き方（[`crate::reach::DialogAccess`]）は UI スレッドで解決し、
+    /// 応答の手順（[`respond_via`]）は番号キー / Enter の後に 400ms ずつの固定の待ちを挟むので background で回す
+    /// （本番の `dispatch:OrchestratorRespond` 401〜414ms）。画面のグリッドは PTY の I/O スレッドが更新するので
+    /// UI スレッドの外から読み直せる。workspace に触らないので background から応答する
+    OrchestratorRespond(Box<RespondJob>),
     /// 利用制限の観測の要約と使用量の内訳（`tako_sessions` の `action: "usage"`。usage 分析 S1 #2200 /
     /// S2 #2201）。`<data_dir>/usage/` のファイルは記録が続くほど育ち、答える前に索引を最大 10 秒
     /// 読み進めるので、UI スレッドで読まない（workspace に触らないのでそのまま background から応答する）
@@ -7104,6 +7109,21 @@ pub fn prepare_offload(
         Request::RemoteStatus if !crate::remote::stop_status_offload_legacy() => host
             .remote_status_job()
             .map(|job| Ok(OffloadJob::RemoteStatus(job))),
+        // #2639: ダイアログへの応答は番号キー / Enter の後に 400ms ずつ待つので、UI スレッドでは届き方の
+        // 解決（同期の腕と同じ `respond_access`。届かない断りもここで同じ形に返る）だけを行い、応答の手順は
+        // background で回す。A/B の `TAKO_2639_LEGACY=1` は同期の腕
+        Request::OrchestratorRespond {
+            pane_id,
+            choice,
+            caller_role,
+        } if !respond_offload_legacy() => Some(respond_access(host, *pane_id).map(|access| {
+            OffloadJob::OrchestratorRespond(Box::new(RespondJob {
+                access,
+                pane_id: *pane_id,
+                choice: choice.clone(),
+                caller_role: caller_role.clone(),
+            }))
+        })),
         // #2203: `show` は同じ段・期間・絞り込みで右パネルの usage ビューを開いてから、答えは同じ
         // background のジョブで返す（UI スレッドで行うのは引数の確かめと画面の段を置くことだけ）
         Request::Sessions {
@@ -7324,6 +7344,20 @@ impl OffloadJob {
             }
             .map_err(DispatchError::Operation),
             OffloadJob::RemoteStatus(job) => Ok(job()),
+            // #2639: 同期の腕（`dispatch_orchestrator_respond`）と同じ手順・同じ応答・同じ監査記録。
+            // UI スレッドで 1 本ずつ走っていた順序を錠で保つ（同じダイアログへ重なった 2 本の応答で
+            // キーが混ざらない。後の 1 本は解消した画面を読み直して断る）
+            OffloadJob::OrchestratorRespond(job) => {
+                let _serial = RESPOND_SERIAL
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                respond_via(
+                    job.access.as_ref(),
+                    job.pane_id,
+                    job.choice.as_deref(),
+                    job.caller_role.as_deref(),
+                )
+            }
             OffloadJob::UsageSummary(query) => crate::usage::usage_payload(
                 &query,
                 crate::usage::Refresh::Budget(crate::usage::MCP_REFRESH_BUDGET),
@@ -21148,6 +21182,19 @@ fn dispatch_orchestrator_respond(
     choice: Option<&str>,
     caller_role: Option<&str>,
 ) -> Result<Value, DispatchError> {
+    // 届き方の解決は background へ出す準備（`prepare_offload`）と 1 実装（#2639）
+    let access = respond_access(host, pane_id)?;
+    respond_via(access.as_ref(), pane_id, choice, caller_role)
+}
+
+/// 応答の届き方を決める（#1200 / #2639。同期の腕と `prepare_offload` の 1 実装）。
+///
+/// UI スレッドで host を見て解決する（ペインの `TerminalSession` は host が持つ）。返す手は `Send` で、
+/// 固定の待ちを挟む応答の手順（[`respond_via`]）は background で回せる。届かないときの断りもここで決まる
+fn respond_access(
+    host: &dyn ControlHost,
+    pane_id: u64,
+) -> Result<Box<dyn crate::reach::DialogAccess + Send>, DispatchError> {
     let target = PaneId::from_raw(pane_id);
 
     // `TAKO_1200_LEGACY=1` で **#1200 前の挙動**（バックエンドセッション名を必須にして
@@ -21156,15 +21203,39 @@ fn dispatch_orchestrator_respond(
         let backend_session = host
             .backend_session(target)
             .ok_or_else(|| Reason::BackendSessionNotFound(pane_id).operation())?;
-        return respond_to_choice_dialog(&backend_session, pane_id, choice, caller_role);
+        return Ok(Box::new(detached_dialog_access(&backend_session)?));
     }
     // #1200: **in-process を先に見る**。旧実装はバックエンドセッション名を必須にして
     // detached へ直行していたので、(a) 器が入力送出を持たない環境（psmux = Windows）では
     // 生きているペインに対して必ず失敗し、(b) 器なしのペインには最初から応答できなかった
-    let access =
-        crate::reach::dialog_access(host, pane_id, host.backend_session(target).as_deref())
-            .map_err(|reason| DispatchError::Operation(reason.note()))?;
-    respond_via(access.as_ref(), pane_id, choice, caller_role)
+    crate::reach::dialog_access(host, pane_id, host.backend_session(target).as_deref())
+        .map_err(|reason| DispatchError::Operation(reason.note()))
+}
+
+/// 背景で回すダイアログへの応答（#2639。[`OffloadJob::OrchestratorRespond`] の中身）
+pub struct RespondJob {
+    /// UI スレッドで解決した届き方（[`respond_access`]）
+    access: Box<dyn crate::reach::DialogAccess + Send>,
+    pane_id: u64,
+    choice: Option<String>,
+    caller_role: Option<String>,
+}
+
+/// background の応答を 1 本ずつにする錠（#2639）。UI スレッドで同期に答えていた頃は応答が
+/// 自然に 1 本ずつ走っていた。重なると、同じダイアログへの 2 本がそれぞれ画面を読んでから番号キーを
+/// 送り、2 本目のキーが閉じた後の入力欄や次のダイアログへ抜けうる
+static RESPOND_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A/B: #2639 前へ戻す（IPC の `OrchestratorRespond` を UI スレッドで同期に答える）
+pub const RESPOND_OFFLOAD_LEGACY_ENV: &str = "TAKO_2639_LEGACY";
+
+/// `OrchestratorRespond` を background へ出さず、修正前と同じく UI スレッドで待つか（#2639 の A/B）。
+/// 要求のたびに読む（テストが `run_alone!` の子で切り替えられるよう、値を覚えない）
+pub fn respond_offload_legacy() -> bool {
+    matches!(
+        std::env::var(RESPOND_OFFLOAD_LEGACY_ENV).ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
 }
 
 /// 器越し（アウトオブプロセス）でダイアログへ応答する入口。
@@ -21184,6 +21255,14 @@ pub fn respond_to_choice_dialog(
 ) -> Result<Value, DispatchError> {
     // 器越しの経路（GUI 不在・ペイン消失）。ホストを持たない呼び出し元（#813 の
     // 自動復帰はバックグラウンドスレッドで走る）用の入口
+    let access = detached_dialog_access(backend_session)?;
+    respond_via(&access, pane_id, choice, caller_role)
+}
+
+/// 器のセッション名から器越しの届き方を作る（届かなければ断り。#1200 の A/B と器越しの入口の 1 実装）
+fn detached_dialog_access(
+    backend_session: &str,
+) -> Result<crate::reach::DetachedDialogAccess, DispatchError> {
     let (session, detached) = crate::reach::detached_session(backend_session).ok_or_else(|| {
         DispatchError::Operation(
             crate::reach::UnreachableReason::NoDetachedAccess {
@@ -21193,8 +21272,7 @@ pub fn respond_to_choice_dialog(
             .note(),
         )
     })?;
-    let access = crate::reach::DetachedDialogAccess::new(session, detached);
-    respond_via(&access, pane_id, choice, caller_role)
+    Ok(crate::reach::DetachedDialogAccess::new(session, detached))
 }
 
 /// 応答の手順そのもの（#1200 で届き方を [`crate::reach::DialogAccess`] へ出した）。
@@ -55405,6 +55483,101 @@ tako | pane 2 [ compact ]       [-]
             json!({ "running": true })
         );
         assert_eq!(host.remote_status_sync_calls.get(), 1);
+    }
+
+    /// #2639: 番号キーで閉じる承認ダイアログ（`PERMISSION_SCREEN_577`）の偽の届き方。`Send`（background で回す）
+    #[derive(Clone, Default)]
+    struct Issue2639Dialog {
+        keys: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::reach::DialogAccess for Issue2639Dialog {
+        fn capture(&self) -> Result<Vec<String>, String> {
+            // 番号キーを受けたら閉じる（claude の形）
+            let closed = !self.keys.lock().unwrap().is_empty();
+            let screen = if closed {
+                "⏺ done\n────\n❯ \n────"
+            } else {
+                PERMISSION_SCREEN_577
+            };
+            Ok(screen.lines().map(str::to_string).collect())
+        }
+        fn send_key(&self, key: &str) -> Result<(), String> {
+            self.keys.lock().unwrap().push(key.to_string());
+            Ok(())
+        }
+        fn route(&self) -> &'static str {
+            "test-2639"
+        }
+    }
+
+    /// #2639: 応答のジョブは background から同期の腕（`respond_via`）と同じ応答を返し、UI スレッドへの続きを作らない
+    #[test]
+    fn issue2639_respondのジョブはbackgroundから同期の腕と同じ応答を返す() {
+        let synced_dialog = Issue2639Dialog::default();
+        let synced = respond_via(&synced_dialog, 7, Some("1"), Some("t2639")).unwrap();
+
+        let offloaded_dialog = Issue2639Dialog::default();
+        let job = OffloadJob::OrchestratorRespond(Box::new(RespondJob {
+            access: Box::new(offloaded_dialog.clone()),
+            pane_id: 7,
+            choice: Some("1".into()),
+            caller_role: Some("t2639".into()),
+        }));
+        let offloaded = match job.run_staged() {
+            OffloadOutcome::Reply(r) => r.unwrap(),
+            OffloadOutcome::OnUi(_) => {
+                panic!("OrchestratorRespond の続きを UI スレッドへ戻している")
+            }
+        };
+        assert_eq!(offloaded, synced);
+        assert_eq!(offloaded["resolved"], json!(true), "{offloaded}");
+        assert_eq!(
+            *offloaded_dialog.keys.lock().unwrap(),
+            vec!["1".to_string()],
+            "番号キー 1 つで確定する（Enter を足さない）"
+        );
+    }
+
+    /// #2639: 届かないペインの断りは準備（UI スレッド）で同期の腕と同じ形に返る
+    #[test]
+    fn issue2639_届かないペインの断りは準備で同期の腕と同じ() {
+        let mut host = MockHost::new();
+        let respond = Request::OrchestratorRespond {
+            pane_id: 999_999,
+            choice: Some("1".into()),
+            caller_role: None,
+        };
+        let prepared = match prepare_offload(&mut host, &respond) {
+            Some(Err(e)) => e,
+            Some(Ok(_)) => panic!("届かないペインの応答をジョブにしている"),
+            None => panic!("OrchestratorRespond が準備を通っていない"),
+        };
+        let synced = dispatch(&mut host, respond, PaneOrigin::Cli).unwrap_err();
+        assert_eq!(format!("{prepared:?}"), format!("{synced:?}"));
+    }
+
+    /// #2639 の A/B: `TAKO_2639_LEGACY=1` は修正前と同じく同期の腕（UI スレッドで待つ）
+    #[test]
+    fn issue2639_legacyはrespondを同期の腕で答える() {
+        if tako_core::run_alone!(issue2639_legacyはrespondを同期の腕で答える) {
+            return;
+        }
+        let mut host = MockHost::new();
+        let respond = Request::OrchestratorRespond {
+            pane_id: 999_999,
+            choice: Some("1".into()),
+            caller_role: None,
+        };
+        std::env::remove_var(RESPOND_OFFLOAD_LEGACY_ENV);
+        assert!(prepare_offload(&mut host, &respond).is_some());
+        std::env::set_var(RESPOND_OFFLOAD_LEGACY_ENV, "1");
+        assert!(respond_offload_legacy());
+        assert!(
+            prepare_offload(&mut host, &respond).is_none(),
+            "A/B なのに background へ出している"
+        );
+        assert!(dispatch(&mut host, respond, PaneOrigin::Cli).is_err());
     }
 
     /// #1984: UI スレッドの同期の dispatch で子プロセスを待っていた要求だけが background へ出る。

@@ -1865,6 +1865,13 @@ lid-guard.json が使う）:
   リモートタブの読み直しを `refresh_remote_status`（最後に頼んだ答えだけを映す）で同じ準備 → background → `drive_offload` へ通す。
   番犬 `issue2630_remote_stop_status_offload_watchdog.rs`、A/B は `TAKO_2630_LEGACY=1`、実経路は
   `scripts/test-remote-stop-status-offload-2630.sh`（FR-6.22.7）
+- **選択肢ダイアログへの応答も UI スレッドで待たない**（#2639）: `respond_via` は番号キーの後に 400ms・Enter の後に 400ms の
+  固定の待ちを挟んで画面を読み直す（本番の `dispatch:OrchestratorRespond` 401〜414ms はこの 1 回ぶん）。届き方の解決
+  （`respond_access` = host のペインの `PaneAccess` か器越し。同期の腕と 1 実装）だけを UI スレッドで行い、`prepare_offload` が
+  `OffloadJob::OrchestratorRespond` へ包んで `run_reply` が background から応答する（画面のグリッドは PTY の I/O スレッドが更新し、
+  `PaneAccess` は `Send` = #813 の自動復帰と同じ形）。UI スレッドで 1 本ずつだった順序は錠 `RESPOND_SERIAL` で保つ。チャット表示の
+  承認カード（`chat_respond`）も同じ準備 → background → `drive_offload` を通す。番犬 `issue2639_respond_offload_watchdog.rs`、
+  A/B は `TAKO_2639_LEGACY=1`、実経路は `scripts/test-respond-offload-2639.sh`（FR-2.25.16）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

@@ -275,12 +275,15 @@ impl DialogAccess for DetachedDialogAccess {
 /// ダイアログ応答の届き方を決める（#1200）。
 ///
 /// **in-process を必ず先に見る**。`session_hint` は器のセッション名で、
-/// in-process で見つからないときだけ使う
+/// in-process で見つからないときだけ使う。
+///
+/// 返す手は `Send`（#2639）: UI スレッドで解決し、固定の待ちを挟む応答の手順は
+/// background で回す（`OffloadJob::OrchestratorRespond`）
 pub fn dialog_access(
     host: &dyn ControlHost,
     pane: u64,
     session_hint: Option<&str>,
-) -> Result<Box<dyn DialogAccess>, UnreachableReason> {
+) -> Result<Box<dyn DialogAccess + Send>, UnreachableReason> {
     if let Some(session) = host.session(PaneId::from_raw(pane)) {
         return Ok(Box::new(LiveDialogAccess::new(session.access())));
     }
