@@ -1059,12 +1059,14 @@ pub enum Reason {
         got: String,
         missing: &'static str,
     },
-    /// `<label>: 移送でエントリ数が合わない（前 <before> / 残 <kept> + 移送 <archived>）ので書き込まない`
+    /// `<label>: 移送でエントリ数が合わない（前 <before> / 残 <kept> + 移送 <archived>）ので書き込まない`。
+    /// `dropped`（アーカイブに既に在るので作業ログ側を落とす件数。#1675）は 1 以上のときだけ文に出る
     BudgetEntriesMismatch {
         label: String,
         before: usize,
         kept: usize,
         archived: usize,
+        dropped: usize,
     },
     // ---- #2365 の続き: CLI の手元の処理の断り（CLI `main.rs` が自分で組んでいた文。`error: …` に出る） ----
     /// `カレントディレクトリの取得に失敗: <error>`（`tako setup-mcp --project`）
@@ -2999,24 +3001,41 @@ impl Reason {
                     before,
                     kept,
                     archived,
+                    dropped,
                 },
                 Ja,
-            ) => format!(
-                "{label}: 移送でエントリ数が合わない（前 {before} / 残 {kept} + 移送 {archived}）\
-                 ので書き込まない"
-            ),
+            ) => {
+                // #1675: 戻ったエントリを落とす回だけ内訳に足す（それ以外は従来の文のまま）
+                let dropped = match dropped {
+                    0 => String::new(),
+                    n => format!(" + 除去 {n}。除去はアーカイブに同じ 1 行が在るものだけ"),
+                };
+                format!(
+                    "{label}: 移送でエントリ数が合わない（前 {before} / 残 {kept} + 移送 {archived}\
+                     {dropped}）ので書き込まない"
+                )
+            }
             (
                 Self::BudgetEntriesMismatch {
                     label,
                     before,
                     kept,
                     archived,
+                    dropped,
                 },
                 En,
-            ) => format!(
-                "{label}: the entry count does not add up after the move (before {before} / kept \
-                 {kept} + moved {archived}), so nothing is written"
-            ),
+            ) => {
+                let dropped = match dropped {
+                    0 => String::new(),
+                    n => format!(
+                        " + dropped {n}; an entry is dropped only when the archive has the same line"
+                    ),
+                };
+                format!(
+                    "{label}: the entry count does not add up after the move (before {before} / kept \
+                     {kept} + moved {archived}{dropped}), so nothing is written"
+                )
+            }
             // ---- #2365 の続き: CLI の手元の処理の断り ----
             (Self::CurrentDirFailed(error), Ja) => {
                 format!("カレントディレクトリの取得に失敗: {error}")

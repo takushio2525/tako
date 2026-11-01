@@ -49,8 +49,9 @@ fn アーカイブ済みのエントリが作業ログへ戻っていない() {
     assert!(
         named.is_empty(),
         "アーカイブ済みのエントリが作業ログに戻っている（rebase の auto-merge で起きる）\n{}\n\
-         直し方: git checkout origin/main -- {PROGRESS} {ARCHIVE} でこの 2 ファイルだけを\n\
-         main の状態へ戻し、自分の 1 件を書き直してから push する\n\
+         直し方: cargo run -p tako-cli -- context-budget fix が作業ログ側を落とす（#1675）。\n\
+         fix では直らないと言われた形は git checkout origin/main -- {PROGRESS} {ARCHIVE} で\n\
+         この 2 ファイルだけを main の状態へ戻し、自分の 1 件を書き直してから push する\n\
          状態の確認: cargo run -p tako-cli -- context-budget（violations に同じ違反が出る）",
         named.join("\n")
     );

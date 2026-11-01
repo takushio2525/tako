@@ -6,6 +6,11 @@
 //! `fix` では直らず、main から 2 ファイルを戻して自分の 1 件だけ書き直す）ので、
 //! master が起動時に見る 1 行で見分けられないといけない。
 //!
+//! #1675 で、アーカイブに既に在るエントリ（写しが 1 種類）は `fix` が作業ログ側を落として
+//! 直せるようになった。それは `fix` の案内へ合流し、「fix では直らない」は直らないもの
+//! （アーカイブに無い重複など）にだけ言う。ここでは直らない側を重複で、直る側を
+//! アーカイブ済みの復活で確かめる。
+//!
 //! 実際の置き場（一時ディレクトリの規約 + 作業ログ + アーカイブ）を作り、
 //! **`tako master` / `tako setup` が呼ぶ `startup_line`** と、
 //! **MCP `tako_context_budget` の応答**（`tools/call` を本物の変換に通す）の両方で、
@@ -24,9 +29,18 @@ fn entry(day: usize, issue: usize, title: &str) -> String {
     format!("## 2026-10-{day:02}（#{issue} {title}）\n- 本文\n\n")
 }
 
-/// 置き場を 1 つ作る。`normal` 件の普通のエントリと、`revived` なら
-/// アーカイブにも載っているエントリ（= rebase で戻ったもの）を末尾に足す
-fn write_repo(dir: &Path, normal: usize, revived: bool, long_context: bool) {
+/// 作業ログへ足す「戻った・重複した」エントリの形
+#[derive(Clone, Copy, PartialEq)]
+enum Revived {
+    No,
+    /// 同じエントリが 2 回（アーカイブには無い）= `fix` では直らない
+    Duplicated,
+    /// アーカイブにも載っているエントリ（= rebase で戻ったもの）= `fix` が落とせる（#1675）
+    Archived,
+}
+
+/// 置き場を 1 つ作る。`normal` 件の普通のエントリの末尾に、`revived` の形のエントリを足す
+fn write_repo(dir: &Path, normal: usize, revived: Revived, long_context: bool) {
     std::fs::create_dir_all(dir.join(".agent")).expect("置き場");
     let mut imports = String::from("- 作業ログ: @.agent/progress.md\n");
     if long_context {
@@ -45,8 +59,13 @@ fn write_repo(dir: &Path, normal: usize, revived: bool, long_context: bool) {
     for i in 1..=normal {
         log.push_str(&entry(i, 200 + i, "普通のエントリ"));
     }
-    if revived {
-        log.push_str(&entry(29, 100, "古いエントリ"));
+    match revived {
+        Revived::No => {}
+        Revived::Duplicated => {
+            log.push_str(&entry(29, 150, "重複したエントリ"));
+            log.push_str(&entry(29, 150, "重複したエントリ"));
+        }
+        Revived::Archived => log.push_str(&entry(29, 100, "古いエントリ")),
     }
     std::fs::write(dir.join(".agent/progress.md"), log).expect("progress");
     std::fs::write(
@@ -129,15 +148,17 @@ fn 起動時の1行が予算超過と作業ログの復活を言い分ける() {
     let over = base.join("over");
     let both = base.join("both");
     let not_fixable = base.join("not_fixable");
-    write_repo(&revived, 3, true, false);
+    let revived_fix = base.join("revived_fix");
+    write_repo(&revived, 3, Revived::Duplicated, false);
     // 21 件 = 件数（20）と作業日数（5）の 2 軸で超える。どちらも `fix` で直る
-    write_repo(&over, 21, false, false);
-    write_repo(&both, 21, true, false);
-    write_repo(&not_fixable, 3, true, true);
+    write_repo(&over, 21, Revived::No, false);
+    write_repo(&both, 21, Revived::Duplicated, false);
+    write_repo(&not_fixable, 3, Revived::Duplicated, true);
+    write_repo(&revived_fix, 3, Revived::Archived, false);
 
     // 予算内で復活も無ければ黙る（#322）
     let clean = base.join("clean");
-    write_repo(&clean, 3, false, false);
+    write_repo(&clean, 3, Revived::No, false);
     assert_eq!(
         tako_control::context_budget::startup_line(&clean, None),
         None
@@ -205,7 +226,33 @@ fn 起動時の1行が予算超過と作業ログの復活を言い分ける() {
     let r = mcp(&both);
     assert_eq!(r["violations"], 3, "{r:#}");
     assert_eq!(r["revived_entries"], 1, "{r:#}");
+    assert_eq!(r["revived_fixable"], 0, "{r:#}");
     assert_eq!(r["fixable"], 2, "{r:#}");
+
+    // #1675: アーカイブ済みの復活は `fix` が直す。fix の案内へ合流し「直らない」とは言わない
+    let l = line(&revived_fix);
+    assert!(
+        l.starts_with("作業ログに rebase で戻ったエントリ: 1 件（"),
+        "{l}"
+    );
+    assert!(
+        l.contains("progress.md:"),
+        "どこに戻ったかを名指ししていない: {l}"
+    );
+    assert!(
+        l.ends_with("いま直す: tako context-budget fix（自動で直せる 1 件）"),
+        "{l}"
+    );
+    assert!(!l.contains("fix では直らない"), "{l}");
+    assert!(!l.contains("予算超過"), "{l}");
+    let r = mcp(&revived_fix);
+    assert_eq!(r["revived_entries"], 1, "{r:#}");
+    assert_eq!(r["revived_fixable"], 1, "{r:#}");
+    assert_eq!(r["fixable"], 1, "{r:#}");
+    assert!(
+        r["proposals"].as_array().is_some_and(|p| p.is_empty()),
+        "fix で直るものを人の判断が要る提案に載せない: {r:#}"
+    );
 
     // ── 英語 ──
     tako_core::i18n::set_lang(Lang::En);
@@ -247,6 +294,18 @@ fn 起動時の1行が予算超過と作業ログの復活を言い分ける() {
         "{l}"
     );
     assert!(l.contains("activeContext.md: lines 92 > 80. "), "{l}");
+    assert!(!l.contains('。'), "英語の 1 行に和文の句点が混ざる: {l}");
+
+    let l = line(&revived_fix);
+    assert!(
+        l.starts_with("Work log entries revived by a rebase: 1 ("),
+        "{l}"
+    );
+    assert!(
+        l.ends_with("Fix now: tako context-budget fix (1 auto-fixable)"),
+        "{l}"
+    );
+    assert!(!l.contains("cannot repair"), "{l}");
     assert!(!l.contains('。'), "英語の 1 行に和文の句点が混ざる: {l}");
 
     std::fs::remove_dir_all(&base).ok();
