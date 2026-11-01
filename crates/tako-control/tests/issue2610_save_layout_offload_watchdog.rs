@@ -166,11 +166,12 @@ fn issue2610_layout_jsonへ直に書くのは書き手とab枝だけ() {
             if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
+            // Windows でも許可範囲（`MAIN` = `/` 区切り）と突き合わせられるよう区切りを揃える
             let rel = path
                 .strip_prefix(repo_root())
                 .unwrap()
                 .to_string_lossy()
-                .into_owned();
+                .replace('\\', "/");
             // テスト領域（番犬が綴りを並べる箇所）とコメントは数えない。小さなファイルもあるので
             // 下限は見ない（main.rs / update_window.rs は他のテストが下限つきで読む）
             let text = code_of(&std::fs::read_to_string(&path).unwrap(), &rel, false);
