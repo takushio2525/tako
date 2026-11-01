@@ -131,6 +131,21 @@ pub fn find_tailscale() -> Option<String> {
     detect_tailscale().into_runnable()
 }
 
+/// 本物の tailscale の CLI の置き場（#2619: 隔離の門が `TAKO_TAILSCALE_BIN` の値を偽物か見分けるため）。
+/// 既定の候補のうちパスのものと、素の名前の候補をこのプロセスの PATH で引いたもの（候補は起こさない）
+pub fn real_candidate_paths() -> Vec<std::path::PathBuf> {
+    TAILSCALE_CANDIDATES
+        .iter()
+        .filter_map(|c| {
+            if is_bare_name(c) {
+                tako_core::platform::exe::find_in_process_path(c).map(std::path::PathBuf::from)
+            } else {
+                Some(std::path::PathBuf::from(c))
+            }
+        })
+        .collect()
+}
+
 /// A/B: #2513 前へ戻す（素の名前の候補をこのプロセスの PATH で引かず、素の名前のまま持つ）。
 /// 立てると remote daemon が 30 秒ごとに PATH の空振りを繰り返す = Issue の症状の起点
 pub const ISSUE2513_LEGACY_ENV: &str = "TAKO_2513_LEGACY";

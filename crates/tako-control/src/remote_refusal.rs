@@ -11,6 +11,7 @@
 //! daemon を起こしている途中（#2608 の印が効いている間）の明示の start / stop の断り
 //! （`DaemonStarting` / `DaemonStartingStop`。#2613）もここに置く。`remote::spawn_daemon` /
 //! `daemon_stop` は `String` を返す従来の口のまま、この型の表示（呼び手のプロセスの表示言語）を載せる。
+//! 隔離中（`TAKO_ISOLATED`）に本物の tailscale の serve を張らなかった断り（`IsolatedServe`。#2619）も同じ形。
 //!
 //! # 口
 //!
@@ -128,6 +129,11 @@ pub enum RemoteRefusal {
         marker: crate::remote_starting::StartingMarker,
         now: u64,
     },
+
+    // ---- 隔離中の serve（#2619） ----
+    /// 隔離中（`TAKO_ISOLATED`）なので本物の tailscale の serve を張らなかった
+    /// （`tako remote start` / 起動ボタン / MCP / daemon の直起動 / UDS の setup。門は `remote_isolated_serve`）
+    IsolatedServe,
 }
 
 /// daemon が断ったときの本文の中身
@@ -348,6 +354,22 @@ impl RemoteRefusal {
                 "{}. It was not stopped, because the start in progress would launch the daemon again. \
                  Wait for it to finish, then stop it with `tako remote stop`",
                 crate::remote_starting::doing_in(marker, *now, lang)
+            ),
+            (Self::IsolatedServe, Ja) => format!(
+                "隔離中（TAKO_ISOLATED）なので、tailscale の serve を張らずに止めました。\
+                 serve はこの機械の Tailscale のノード全体の設定で、隔離の外にある本番の公開や\
+                 利用者の serve 設定を書き換えるためです。serve を張らずに試すなら TAKO_REMOTE_TEST_MODE=1、\
+                 偽の tailscale で試すなら TAKO_TAILSCALE_BIN=<偽物のパス>、本物の serve まで確かめるなら \
+                 {}=1 を付けてください",
+                crate::remote_isolated_serve::OPT_IN_ENV
+            ),
+            (Self::IsolatedServe, En) => format!(
+                "Stopped without setting up tailscale serve because this process is isolated (TAKO_ISOLATED). \
+                 serve is a machine-wide setting of this Tailscale node, outside the sandbox, so it could \
+                 overwrite the live remote access or your own serve config. To try without serve, set \
+                 TAKO_REMOTE_TEST_MODE=1; to use a fake tailscale, set TAKO_TAILSCALE_BIN=<path to the fake>; \
+                 to exercise the real serve, set {}=1",
+                crate::remote_isolated_serve::OPT_IN_ENV
             ),
         }
     }
