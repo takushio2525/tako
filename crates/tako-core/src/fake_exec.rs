@@ -414,4 +414,12 @@ mod tests {
         warm_binary(&bin);
         assert_eq!(lines(), 2, "作り直したファイルはもう 1 回起こす");
     }
+
+    /// 無い実行ファイル（cargo がまだ作っていない・パスの取り違え）は黙って進めず、パスを添えて止まる
+    #[test]
+    #[should_panic(expected = "空打ちする実行ファイルが無い")]
+    fn 無い実行ファイルの空打ちはパスを添えて止まる() {
+        let dir = crate::test_residue::ScratchDir::new("fake-exec-2228-missing");
+        warm_binary(dir.path().join("not-built"));
+    }
 }
