@@ -11,14 +11,16 @@
 //!
 //! # 何を縛るか
 //!
-//! 1. CLI と `plan` がプロファイルを**同じ 1 実装**（`master_launch::load_profile`）で読み、
+//! 1. CLI と `plan` がプロファイルを**同じ 1 実装**（`master_launch::load_profile`。CLI は表示言語を
+//!    明示する同じ本体の口 `load_profile_in` = #2365）で読み、
 //!    自前の `Profile::load` / `Profile::default()` の握りつぶしへ戻らない
 //! 2. `load_default_at` が継承元と同じ読み方（`project_profile_base_at` = 退避つき）を通り、
 //!    `Err` を握りつぶさず warning にする
 //! 3. `load_profile` が warning を persist.log へ出し、`-<key>` の「見つからない」に
 //!    #1825 の理由（`missing_project_profile_reason`）を足す
 //! 4. 理由の判定が継承元の読み取り（`check_project_profile_base`）と #1825 の理由文を通る
-//! 5. warning が画面（CLI の `警告:` 行・応答の `warnings`）と master 本人の system prompt
+//! 5. warning が画面（CLI の `警告:` 行 = 見出しは #2365 から表示言語の `ReplyNote::WarningLabel`・
+//!    応答の `warnings`）と master 本人の system prompt
 //!    （`with_startup_warning`）へ届く
 //!
 //! # #2233 で広げた範囲（同じ根の残り）
@@ -301,8 +303,22 @@ fn scan_launch(src: &str) -> Vec<Offender> {
         }
     }
 
+    // #2365: 本体は表示言語を明示する `load_profile_in`。旧い口（`plan`・後任）はそこへ委ねるだけ
     match fn_window(src, "pub fn load_profile(") {
         None => push(0, "`load_profile` が見つからない（走査が空振り）".into()),
+        Some((at, window)) => {
+            if !window_has(&window, "load_profile_in(") {
+                push(
+                    at,
+                    "`load_profile` が本体 `load_profile_in` へ委ねていない = 起動の経路ごとに \
+                     読み方が食い違う（#2227 / #2365）"
+                        .into(),
+                );
+            }
+        }
+    }
+    match fn_window(src, "pub fn load_profile_in(") {
+        None => push(0, "`load_profile_in` が見つからない（走査が空振り）".into()),
         Some((at, window)) => {
             if !window_has(&window, "load_default_at(") {
                 push(
@@ -357,6 +373,17 @@ fn scan_launch(src: &str) -> Vec<Offender> {
     // 7. `tako solo` の default も同じ形（退避つきの読み方・persist.log）
     match fn_window(src, "pub fn load_solo(") {
         None => push(0, "`load_solo` が見つからない（走査が空振り）".into()),
+        Some((at, window)) => {
+            if !window_has(&window, "load_solo_in(") {
+                push(
+                    at,
+                    "`load_solo` が本体 `load_solo_in` へ委ねていない（#2233 / #2365）".into(),
+                );
+            }
+        }
+    }
+    match fn_window(src, "pub fn load_solo_in(") {
+        None => push(0, "`load_solo_in` が見つからない（走査が空振り）".into()),
         Some((at, window)) => {
             if !window_has(&window, "load_default_at(") || !window_has(&window, "ProfileKind::Solo")
             {
@@ -593,7 +620,7 @@ fn scan_cli(src: &str) -> Vec<Offender> {
         CLI,
         src,
         "fn orchestrator_master(",
-        "master_launch::load_profile(",
+        "master_launch::load_profile_in(",
         MASTER_BADS,
         &mut out,
     );
@@ -602,12 +629,13 @@ fn scan_cli(src: &str) -> Vec<Offender> {
         CLI,
         src,
         "fn orchestrator_solo(",
-        "master_launch::load_solo(",
+        "master_launch::load_solo_in(",
         &["load_solo_profile(", "solo_default_profile()"],
         &mut out,
     );
+    // `警告:` の見出しは #2365 から表示言語の `ReplyNote::WarningLabel`
     if let Some((at, window)) = fn_window(src, "fn orchestrator_solo(") {
-        if !window_has(&window, "eprintln!(\"警告: {w}\")") {
+        if !window_has(&window, "eprintln!(\"{}: {w}\", ReplyNote::WarningLabel") {
             out.push(Offender {
                 file: CLI,
                 line: at,
@@ -630,7 +658,7 @@ fn scan_cli(src: &str) -> Vec<Offender> {
         &mut out,
     );
     if let Some((at, window)) = fn_window(src, "fn orchestrator_master(") {
-        if !window_has(&window, "eprintln!(\"警告: {w}\")") {
+        if !window_has(&window, "eprintln!(\"{}: {w}\", ReplyNote::WarningLabel") {
             out.push(Offender {
                 file: CLI,
                 line: at,
@@ -921,6 +949,7 @@ fn 走査が空振りしていない() {
     for (rel, src, needle) in [
         (LAUNCH, &s.launch, "pub fn plan("),
         (LAUNCH, &s.launch, "pub fn load_profile("),
+        (LAUNCH, &s.launch, "pub fn load_profile_in("),
         (LAUNCH, &s.launch, "pub fn load_default_at("),
         (LAUNCH, &s.launch, "pub fn to_json("),
         (ORCH, &s.orch, "pub fn missing_project_profile_reason("),
@@ -928,6 +957,7 @@ fn 走査が空振りしていない() {
         (CLI, &s.cli, "fn orchestrator_master("),
         (LAUNCH, &s.launch, "pub fn load_successor_profile("),
         (LAUNCH, &s.launch, "pub fn load_solo("),
+        (LAUNCH, &s.launch, "pub fn load_solo_in("),
         (ORCH, &s.orch, "pub fn load_for_display("),
         (ORCH, &s.orch, "fn load_for_display_at("),
         (CLI, &s.cli, "fn orchestrator_solo("),
@@ -1052,7 +1082,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: CLI,
             fn_needle: "fn orchestrator_master(",
-            from: "} = orchestrator::master_launch::load_profile(profile_name)?;",
+            from: "} = orchestrator::master_launch::load_profile_in(profile_name, lang)?;",
             to: "} = orchestrator::master_launch::LaunchProfile { profile: orchestrator::Profile::load(profile_name).unwrap_or_else(|_| orchestrator::Profile::default()), warning: None };",
             marker: "orchestrator::Profile::load(profile_name)",
         },
@@ -1060,7 +1090,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: CLI,
             fn_needle: "fn orchestrator_master(",
-            from: "eprintln!(\"警告: {w}\");",
+            from: "eprintln!(\"{}: {w}\", ReplyNote::WarningLabel.text_in(lang));",
             to: "let _ = w;",
             marker: "fn orchestrator_master(",
         },
@@ -1083,10 +1113,10 @@ fn 逆戻りを名指しできる() {
         // 注入 6: `-<key>` の「見つからない」に理由を足さない
         Injection {
             rel: LAUNCH,
-            fn_needle: "pub fn load_profile(",
+            fn_needle: "pub fn load_profile_in(",
             from: "orchestrator::missing_project_profile_reason(name)",
             to: "None::<String>",
-            marker: "pub fn load_profile(",
+            marker: "pub fn load_profile_in(",
         },
         // 注入 7: スマホの応答に warnings を載せない
         Injection {
@@ -1164,7 +1194,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: CLI,
             fn_needle: "fn orchestrator_solo(",
-            from: "} = orchestrator::master_launch::load_solo(profile_name)?;",
+            from: "} = orchestrator::master_launch::load_solo_in(profile_name, lang)?;",
             to: "} = orchestrator::master_launch::LaunchProfile { profile: orchestrator::load_solo_profile(profile_name).unwrap_or_else(|_| orchestrator::solo_default_profile()), warning: None };",
             marker: "orchestrator::load_solo_profile(profile_name)",
         },
@@ -1172,7 +1202,7 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: CLI,
             fn_needle: "fn orchestrator_solo(",
-            from: "eprintln!(\"警告: {w}\");",
+            from: "eprintln!(\"{}: {w}\", ReplyNote::WarningLabel.text_in(lang));",
             to: "let _ = w;",
             marker: "fn orchestrator_solo(",
         },
@@ -1187,10 +1217,10 @@ fn 逆戻りを名指しできる() {
         // 注入 19: solo の default の警告を persist.log へ残さない
         Injection {
             rel: LAUNCH,
-            fn_needle: "pub fn load_solo(",
+            fn_needle: "pub fn load_solo_in(",
             from: "crate::diag::persist_log(&format!(\"[solo] {name}: {w}\"));",
             to: "let _ = w;",
-            marker: "pub fn load_solo(",
+            marker: "pub fn load_solo_in(",
         },
         // 注入 20: 後任の読み込みが `load_profile` を通らない
         Injection {
