@@ -5213,11 +5213,26 @@ main で既にアーカイブ済みのエントリが `progress.md` へ黙って
 - CI の番犬 `crates/tako-control/tests/issue1645_progress_revival_watchdog.rs` が
   `file:line` で落とし、`tako context-budget` / MCP `tako_context_budget` の
   violations にも同じ違反が出る。**rebase 後の目視は補助**
-- `tako master` / `tako setup` の起動前 1 行も予算超過とは分けて
-  「作業ログに rebase で戻った・重複したエントリ: N 件（fix では直らない）」と出す（#1715）
-- 直し方は 2 ファイルの復元:
+- **アーカイブ済みのエントリが戻った形は `tako context-budget fix` が直す**（#1675）:
+  作業ログ側を落とすだけ（アーカイブの 1 行はそのまま・残すエントリの本文は 1 文字も変えない・
+  予算より先に落とすので戻ったエントリが予算の枠を食わない）。落とすのは `revivals` の
+  `fixable` な `Archived` だけ = 判定は check と同じ 1 実装。書く前に「残 + 移送 + 除去 = 前」と
+  「除去したものの 1 行がアーカイブ（か `aged_out`）に在る」をデータで確かめ、合わなければ書かない。
+  落とした件数と両側の行番号は persist.log へ（エントリの中身は載せない）。
+  2 回目の `fix` は何も変えない
+- `fix` が**触らない**もの（`fixable: false`・手で直す）: アーカイブに無い重複（本文が違いうる）と、
+  同じ見出しで本文の違うエントリが作業ログに複数あってどれが戻ったものか決まらない形。
+  直し方は 2 ファイルの復元:
   `git checkout origin/main -- .agent/progress.md .agent/progress-archive.md` で main の状態へ戻し、
-  自分の 1 件を書き直してから push する（どちらの版が正かは機械には決まらないので自動では直さない）
+  自分の 1 件を書き直してから push する
+- `tako master` / `tako setup` の起動前 1 行も予算超過とは分けて名指しする（#1715）。
+  `fix` で直る復活は「作業ログに rebase で戻ったエントリ: N 件」として `fix` の案内へ合流し、
+  直らないものだけを「作業ログに rebase で戻った・重複したエントリ: N 件（fix では直らない）」と出す（#1675）。
+  check の応答は直るものを `fixable` / `revived_fixable` に数えて `proposals` には載せず、
+  項目の violations の `next_step` に `tako context-budget fix` を返す
+- 既知の限界: 予算の移送が同じ見出しの 2 件（同じ日・同じ一言で本文が違う）を残す側と移す側へ
+  分けると、次の `fix` は残った側を「戻ったもの」と読んで落とす（アーカイブの 1 行は移した側のもの
+  と同じ文なので、表に残る形は後で移送したときと変わらない。#1645 の check も同じ形を名指ししていた）
 
 ### マーカーの例をドキュメントへ書くとき
 

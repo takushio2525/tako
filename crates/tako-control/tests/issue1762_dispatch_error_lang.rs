@@ -1476,6 +1476,7 @@ fn reason_samples() -> Vec<Reason> {
             before: 21,
             kept: 15,
             archived: 5,
+            dropped: 0,
         },
         Reason::CurrentDirFailed("Permission denied (os error 13)".into()),
         Reason::CwdNotObtained("No such file or directory (os error 2)".into()),

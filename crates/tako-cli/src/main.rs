@@ -7681,6 +7681,13 @@ fn print_context_budget_check(out: &serde_json::Value) {
                 x["limit"].as_u64().unwrap_or(0),
                 x["note"].as_str().unwrap_or("")
             );
+            // #1675: `fix` で直る復活は提案に載らないので、どこに戻ったかをここで名指しする
+            // （直らないものは提案の側が同じ名指しを出す）
+            if x["fixable"] == true {
+                if let Some(detail) = x["detail"].as_str() {
+                    println!("        {detail}");
+                }
+            }
         }
     }
     let violations = out["violations"].as_u64().unwrap_or(0);
@@ -7756,6 +7763,18 @@ fn print_context_budget_fix(out: &serde_json::Value, dry_run: bool) {
         let aged = c["archive_lines_removed_by_age"].as_u64().unwrap_or(0);
         if aged > 0 {
             println!("  保持期間を過ぎて archive から削除: {aged} 行");
+        }
+        // #1675: アーカイブに既に在るので作業ログ側を落としたエントリ（rebase で戻ったもの）。
+        // 無い回は何も出さない（それまでの表示とバイト一致）
+        let dropped = c["entries_dropped_revived"].as_u64().unwrap_or(0);
+        if dropped > 0 {
+            println!(
+                "  {}",
+                tako_control::context_budget::dropped_line_in(dropped, tako_core::i18n::lang())
+            );
+            for l in c["dropped_revived"].as_array().unwrap_or(&empty) {
+                println!("    {}", l.as_str().unwrap_or(""));
+            }
         }
         for l in c["archived_preview"].as_array().unwrap_or(&empty) {
             println!("    移送予定 {}", l.as_str().unwrap_or(""));

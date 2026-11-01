@@ -370,8 +370,22 @@ fn revival_json(it: &Item, r: &budget::Revival, archive_label: &str) -> Value {
         "note": v.note.text(),
         "note_ja": v.note.ja(),
         "note_en": v.note.en(),
+        // #1675: 直し方。`fix` で直るものは `fix` の 1 行、直らないものは手で戻す手順
+        "next_step": revival_next_step(&v),
     })
 }
+
+/// 復活・重複 1 件の `next_step`（#1675）。`fix` で直るものは最簡形のコマンドそのもの（#322）
+fn revival_next_step(v: &budget::Violation) -> String {
+    if v.fixable {
+        FIX_COMMAND.to_string()
+    } else {
+        v.note.text().to_string()
+    }
+}
+
+/// 自動で直せるものを直すコマンド（応答の `fix_command` と同じ 1 行）
+const FIX_COMMAND: &str = "tako context-budget fix";
 
 fn item_json(it: &Item, revived: &[budget::Revival], archive_label: &str) -> Value {
     let m = budget::measure(it.kind, &it.text);
@@ -472,6 +486,8 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
     let mut fixable = 0usize;
     // #1715: 復活・重複は `violations` に含めつつ別にも数える（直し方が違う）
     let mut revived_entries = 0usize;
+    // #1675: そのうち `fix` が作業ログ側を落として直せるもの（`fixable` にも数える）
+    let mut revived_fixable = 0usize;
     let mut proposals: Vec<Value> = Vec::new();
 
     let items_json: Vec<Value> = items
@@ -520,6 +536,13 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
                 violations += 1;
                 revived_entries += 1;
                 let v = r.violation();
+                if v.fixable {
+                    // #1675: `fix` が直すので提案（= 人の判断が要るもの）には載せない。
+                    // 名指しは項目の violations（`detail` = file:line）と起動前の 1 行が持つ
+                    fixable += 1;
+                    revived_fixable += 1;
+                    continue;
+                }
                 proposals.push(json!({
                     "path": format!("{}:{}", it.label, r.line),
                     "metric": v.metric.as_str(),
@@ -561,9 +584,10 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
         "violations": violations,
         "fixable": fixable,
         "revived_entries": revived_entries,
+        "revived_fixable": revived_fixable,
         "proposals": proposals,
         "budget": budget_json(),
-        "fix_command": "tako context-budget fix",
+        "fix_command": FIX_COMMAND,
         "ok": violations == 0,
     });
     // #1715: `tako master` / `tako setup` の起動前 1 行と同じものを応答にも載せる
@@ -642,6 +666,7 @@ pub fn fix(cwd: &Path, profile: Option<&str>, dry_run: bool) -> Result<Value, St
                 before: plan.entries_before,
                 kept: plan.kept.len(),
                 archived: plan.archived.len(),
+                dropped: plan.dropped.len(),
             }
             .to_string());
         }
@@ -663,13 +688,24 @@ pub fn fix(cwd: &Path, profile: Option<&str>, dry_run: bool) -> Result<Value, St
             "entries_before": plan.entries_before,
             "entries_kept": plan.kept.len(),
             "entries_archived": plan.archived.len(),
-            "entries_preserved": plan.entries_before == plan.kept.len() + plan.archived.len(),
+            "entries_preserved": plan.entries_preserved(),
             "archive_lines_removed_by_age": plan.aged_out.len(),
             "bytes_before": it.text.len(),
             "bytes_after": plan.progress_text.len(),
             "est_tokens_before": budget::estimate_tokens(&it.text),
             "est_tokens_after": budget::estimate_tokens(&plan.progress_text),
         });
+        let archive_label = display_path(&archive);
+        if !plan.dropped.is_empty() {
+            // #1675: アーカイブに既に在るので作業ログ側を落としたエントリ（rebase で戻ったもの）。
+            // 戻ったエントリが無い回は欄ごと出さない（それまでの応答とバイト一致）
+            c["entries_dropped_revived"] = json!(plan.dropped.len());
+            c["dropped_revived"] = json!(plan
+                .dropped
+                .iter()
+                .map(|r| r.locate(&it.label, &archive_label))
+                .collect::<Vec<_>>());
+        }
         if dry_run {
             // 何を移すのかを 1 行ずつ見せる（適用前に読める形）
             c["archived_preview"] = json!(plan
@@ -684,6 +720,9 @@ pub fn fix(cwd: &Path, profile: Option<&str>, dry_run: bool) -> Result<Value, St
             std::fs::write(&archive, &plan.archive_text)
                 .map_err(|e| format!("{}: {e}", display_path(&archive)))?;
             std::fs::write(&path, &plan.progress_text).map_err(|e| format!("{}: {e}", it.label))?;
+            if !plan.dropped.is_empty() {
+                crate::diag::persist_log(&dropped_log_line(&it.label, &archive_label, &plan));
+            }
         }
         changes.push(c);
     }
@@ -698,6 +737,40 @@ pub fn fix(cwd: &Path, profile: Option<&str>, dry_run: bool) -> Result<Value, St
         "violations_after": after["violations"],
         "ok": after["violations"].as_u64().unwrap_or(0) == 0,
     }))
+}
+
+/// `fix` の表示で、戻ったエントリを落とす件数の 1 行（#1675。CLI の手元の表示が使う。
+/// dry-run でも同じ行を出すので時制を持たない文にする）
+pub fn dropped_line_in(dropped: u64, lang: tako_core::i18n::Lang) -> String {
+    match lang {
+        tako_core::i18n::Lang::Ja => format!(
+            "作業ログ側を落とす（アーカイブに既に在る = rebase で戻ったエントリ）: {dropped} 件"
+        ),
+        tako_core::i18n::Lang::En => format!(
+            "Drop from the work log (already in the archive = entries revived by a rebase): {dropped}"
+        ),
+    }
+}
+
+/// 戻ったエントリを落としたことの persist.log の 1 行（#1675）。
+///
+/// **エントリの中身（見出し・本文）は載せない**: 置き場・件数・行番号だけ。
+/// 何が落ちたかは行番号から git 履歴で辿れる（作業ログはリポジトリの中のファイル）
+fn dropped_log_line(label: &str, archive_label: &str, plan: &budget::PrunePlan) -> String {
+    let join = |f: fn(&budget::Revival) -> usize| {
+        plan.dropped
+            .iter()
+            .map(|r| f(r).to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(
+        "[context-budget] fix: アーカイブ済みのエントリが作業ログに戻っていたので作業ログ側を落とした \
+         件数={} 作業ログ={label} 行={} アーカイブ={archive_label} 行={}（#1675）",
+        plan.dropped.len(),
+        join(|r| r.line),
+        join(|r| r.other_line),
+    )
 }
 
 /// `tako setup` / `tako master` が出す 1 行（#322 の最簡形）。
@@ -718,17 +791,23 @@ pub fn startup_line(cwd: &Path, profile: Option<&str>) -> Option<String> {
 /// その場合は代わりに**何が超えているか**を 1 行で名指しする。
 ///
 /// #1715: **予算超過と作業ログの復活・重複（`revived_entries`）を言い分ける**。
-/// 直し方が違う（前者は `fix` で直る / 後者は `fix` では直らず、main から 2 ファイルを
-/// 戻して自分の 1 件だけ書き直す）ので、復活は予算超過の件数に混ぜず別の文で名指しする
+/// 復活は予算超過の件数に混ぜず別の文で名指しする。
+///
+/// #1675: 復活のうち `fix` が作業ログ側を落として直せるもの（`revived_fixable`）は
+/// `fix` の案内へ合流させる。直せないもの（アーカイブに無い重複・どれが戻ったものか
+/// 決まらない形）だけを「fix では直らない」と言う（main から 2 ファイルを戻して自分の 1 件だけ書き直す）
 fn startup_line_in(r: &Value, lang: tako_core::i18n::Lang) -> Option<String> {
     let violations = r["violations"].as_u64().unwrap_or(0);
     if violations == 0 {
         return None;
     }
     let revived = r["revived_entries"].as_u64().unwrap_or(0);
+    let revived_fixable = r["revived_fixable"].as_u64().unwrap_or(0);
+    let revived_manual = revived.saturating_sub(revived_fixable);
     let over = violations.saturating_sub(revived);
     let tokens = r["totals"]["est_tokens"].as_u64().unwrap_or(0);
     let fixable = r["fixable"].as_u64().unwrap_or(0);
+    let over_fixable = fixable.saturating_sub(revived_fixable);
     let ja = lang == tako_core::i18n::Lang::Ja;
 
     let mut parts: Vec<String> = Vec::new();
@@ -740,13 +819,7 @@ fn startup_line_in(r: &Value, lang: tako_core::i18n::Lang) -> Option<String> {
         } else {
             format!("Startup load is over budget: {over} item(s) (~{tokens} tokens)")
         });
-        if fixable > 0 {
-            parts.push(if ja {
-                format!("いま直す: tako context-budget fix（自動で直せる {fixable} 件）")
-            } else {
-                format!("Fix now: tako context-budget fix ({fixable} auto-fixable)")
-            });
-        } else {
+        if over_fixable == 0 {
             parts.extend(worst_proposal(r));
             tail = Some(if ja {
                 "内訳: tako context-budget"
@@ -755,29 +828,48 @@ fn startup_line_in(r: &Value, lang: tako_core::i18n::Lang) -> Option<String> {
             });
         }
     }
-    if revived > 0 {
-        // どこに戻ったかを 1 か所名指しする（全件は `tako context-budget` が出す）
-        let first = first_revival(r).unwrap_or("?");
-        let at = match (revived > 1, ja) {
-            (false, _) => first.to_string(),
-            (true, true) => format!("{first} ほか"),
-            (true, false) => format!("{first} and more"),
-        };
+    if revived_fixable > 0 {
+        let at = revival_at(r, true, revived_fixable > 1, ja);
         parts.push(match (over > 0, ja) {
+            (false, true) => {
+                format!("作業ログに rebase で戻ったエントリ: {revived_fixable} 件（{at}）")
+            }
+            (true, true) => {
+                format!("ほかに作業ログに rebase で戻ったエントリ: {revived_fixable} 件（{at}）")
+            }
+            (false, false) => {
+                format!("Work log entries revived by a rebase: {revived_fixable} ({at})")
+            }
+            (true, false) => {
+                format!("Also, work log entries revived by a rebase: {revived_fixable} ({at})")
+            }
+        });
+    }
+    if fixable > 0 {
+        parts.push(if ja {
+            format!("いま直す: {FIX_COMMAND}（自動で直せる {fixable} 件）")
+        } else {
+            format!("Fix now: {FIX_COMMAND} ({fixable} auto-fixable)")
+        });
+    }
+    if revived_manual > 0 {
+        let at = revival_at(r, false, revived_manual > 1, ja);
+        let also = over > 0 || revived_fixable > 0;
+        parts.push(match (also, ja) {
             (false, true) => format!(
-                "作業ログに rebase で戻った・重複したエントリ: {revived} 件（{at}。fix では直らない）"
+                "作業ログに rebase で戻った・重複したエントリ: {revived_manual} 件（{at}。fix では直らない）"
             ),
             (true, true) => format!(
-                "ほかに作業ログに rebase で戻った・重複したエントリ: {revived} 件（{at}。fix では直らない）"
+                "ほかに作業ログに rebase で戻った・重複したエントリ: {revived_manual} 件（{at}。fix では直らない）"
             ),
             (false, false) => format!(
-                "Work log entries revived or duplicated by a rebase: {revived} ({at}; fix cannot repair them)"
+                "Work log entries revived or duplicated by a rebase: {revived_manual} ({at}; fix cannot repair them)"
             ),
             (true, false) => format!(
-                "Also, work log entries revived or duplicated by a rebase: {revived} ({at}; fix cannot repair them)"
+                "Also, work log entries revived or duplicated by a rebase: {revived_manual} ({at}; fix cannot repair them)"
             ),
         });
-        tail = Some(match (over > 0, ja) {
+        tail = Some(match (also, ja) {
             (false, true) => "直し方: tako context-budget",
             (true, true) => "内訳と直し方: tako context-budget",
             (false, false) => "How to fix: tako context-budget",
@@ -788,13 +880,25 @@ fn startup_line_in(r: &Value, lang: tako_core::i18n::Lang) -> Option<String> {
     Some(parts.join(if ja { "。" } else { ". " }))
 }
 
-/// 復活・重複の最初の 1 件の `file:line`（`report` の提案から）
-fn first_revival(report: &Value) -> Option<&str> {
-    report["proposals"]
-        .as_array()?
-        .iter()
-        .find(|p| p["metric"] == budget::Metric::RevivedEntries.as_str())
-        .and_then(|p| p["path"].as_str())
+/// どこに戻ったかを 1 か所名指しする（全件は `tako context-budget` が出す）
+fn revival_at(report: &Value, fixable: bool, more: bool, ja: bool) -> String {
+    let first = first_revival(report, fixable).unwrap_or_else(|| "?".to_string());
+    match (more, ja) {
+        (false, _) => first,
+        (true, true) => format!("{first} ほか"),
+        (true, false) => format!("{first} and more"),
+    }
+}
+
+/// 復活・重複の最初の 1 件の `file:line`（項目の violations から。`fix` で直るものは
+/// 提案に載らないので、提案ではなく項目の側を引く = #1675）
+fn first_revival(report: &Value, fixable: bool) -> Option<String> {
+    report["items"].as_array()?.iter().find_map(|it| {
+        let v = it["violations"].as_array()?.iter().find(|v| {
+            v["metric"] == budget::Metric::RevivedEntries.as_str() && v["fixable"] == fixable
+        })?;
+        Some(format!("{}:{}", it["path"].as_str()?, v["line"].as_u64()?))
+    })
 }
 
 /// 1 行で名指しする対象。**master 自身の system prompt を優先する**
@@ -969,17 +1073,39 @@ mod tests {
     }
 
     /// #1715 の素材: 棚卸しの応答のうち 1 行が読む欄だけを持つ形
-    fn budget_report(over: &[Value], fixable: u64, revived: &[&str]) -> Value {
+    /// `fixable` は予算超過のうち自動で直せる件数。`revived` は `fix` で直らない復活
+    /// （提案に載る）、`revived_fix` は `fix` が作業ログ側を落として直す復活（#1675。
+    /// 提案に載らず `fixable` に数える）。どちらも `file:line`
+    fn budget_report(
+        over: &[Value],
+        fixable: u64,
+        revived: &[&str],
+        revived_fix: &[&str],
+    ) -> Value {
         let mut proposals: Vec<Value> = over.to_vec();
         proposals.extend(revived.iter().map(
             |path| json!({ "path": path, "metric": "revived_entries", "actual": 1, "limit": 0 }),
         ));
+        // `report` の項目と同じ形（名指しの file:line は項目の側から引く）
+        let item = |at: &&str, fixable: bool| {
+            let (path, line) = at.rsplit_once(':').unwrap();
+            json!({ "path": path, "violations": [{
+                "metric": "revived_entries", "fixable": fixable,
+                "line": line.parse::<u64>().unwrap(),
+            }] })
+        };
+        let items: Vec<Value> = revived
+            .iter()
+            .map(|p| item(p, false))
+            .chain(revived_fix.iter().map(|p| item(p, true)))
+            .collect();
         json!({
-            "items": [],
+            "items": items,
             "totals": { "est_tokens": 1234 },
-            "violations": over.len() + fixable as usize + revived.len(),
-            "fixable": fixable,
-            "revived_entries": revived.len(),
+            "violations": over.len() + fixable as usize + revived.len() + revived_fix.len(),
+            "fixable": fixable + revived_fix.len() as u64,
+            "revived_entries": revived.len() + revived_fix.len(),
+            "revived_fixable": revived_fix.len(),
             "proposals": proposals,
         })
     }
@@ -997,7 +1123,7 @@ mod tests {
         };
 
         // 復活だけ
-        let (ja, en) = lines(&budget_report(&[], 0, &["~/r/.agent/progress.md:12"]));
+        let (ja, en) = lines(&budget_report(&[], 0, &["~/r/.agent/progress.md:12"], &[]));
         assert_eq!(
             ja,
             "作業ログに rebase で戻った・重複したエントリ: 1 件\
@@ -1010,7 +1136,7 @@ mod tests {
         );
 
         // 超過だけ（自動で直せる）: #1154 以前からの文言のまま
-        let (ja, en) = lines(&budget_report(&[], 2, &[]));
+        let (ja, en) = lines(&budget_report(&[], 2, &[], &[]));
         assert_eq!(
             ja,
             "起動時ロードが予算超過: 2 件（概算 1234 トークン）。\
@@ -1027,6 +1153,7 @@ mod tests {
             &[],
             2,
             &["~/r/.agent/progress.md:30", "~/r/.agent/progress.md:40"],
+            &[],
         ));
         assert_eq!(
             ja,
@@ -1055,6 +1182,7 @@ mod tests {
             std::slice::from_ref(&over),
             0,
             &["~/r/.agent/progress.md:12"],
+            &[],
         );
         assert_eq!(
             startup_line_in(&r, Lang::Ja).unwrap(),
@@ -1073,7 +1201,7 @@ mod tests {
         );
 
         // 超過だけ（自動で直せない）: 日本語は #1154 の文言のまま。英語は句点だけ直る
-        let r = budget_report(&[over], 0, &[]);
+        let r = budget_report(std::slice::from_ref(&over), 0, &[], &[]);
         assert_eq!(
             startup_line_in(&r, Lang::Ja).unwrap(),
             "起動時ロードが予算超過: 1 件（概算 1234 トークン）。\
@@ -1086,7 +1214,65 @@ mod tests {
         );
 
         // 違反が無ければ黙る
-        assert_eq!(startup_line_in(&budget_report(&[], 0, &[]), Lang::Ja), None);
+        assert_eq!(
+            startup_line_in(&budget_report(&[], 0, &[], &[]), Lang::Ja),
+            None
+        );
+    }
+
+    /// #1675: `fix` が作業ログ側を落として直せる復活は `fix` の案内へ合流させ、
+    /// 「fix では直らない」は直らないものにだけ言う（日英とも）
+    #[test]
+    fn fixで直る復活はfixの案内へ合流し直らないものだけを言い分ける() {
+        use tako_core::i18n::Lang;
+        // 直る復活だけ
+        let r = budget_report(&[], 0, &[], &["~/r/.agent/progress.md:5"]);
+        assert_eq!(
+            startup_line_in(&r, Lang::Ja).unwrap(),
+            "作業ログに rebase で戻ったエントリ: 1 件（~/r/.agent/progress.md:5）。\
+             いま直す: tako context-budget fix（自動で直せる 1 件）"
+        );
+        assert_eq!(
+            startup_line_in(&r, Lang::En).unwrap(),
+            "Work log entries revived by a rebase: 1 (~/r/.agent/progress.md:5). \
+             Fix now: tako context-budget fix (1 auto-fixable)"
+        );
+
+        // 自動で直せる超過 2 + 直る復活 2 + 直らない重複 1: 件数は種類ごと、fix の件数は合算
+        let r = budget_report(
+            &[],
+            2,
+            &["~/r/.agent/progress.md:20"],
+            &["~/r/.agent/progress.md:5", "~/r/.agent/progress.md:9"],
+        );
+        assert_eq!(
+            startup_line_in(&r, Lang::Ja).unwrap(),
+            "起動時ロードが予算超過: 2 件（概算 1234 トークン）。\
+             ほかに作業ログに rebase で戻ったエントリ: 2 件（~/r/.agent/progress.md:5 ほか）。\
+             いま直す: tako context-budget fix（自動で直せる 4 件）。\
+             ほかに作業ログに rebase で戻った・重複したエントリ: 1 件\
+             （~/r/.agent/progress.md:20。fix では直らない）。内訳と直し方: tako context-budget"
+        );
+        assert_eq!(
+            startup_line_in(&r, Lang::En).unwrap(),
+            "Startup load is over budget: 2 item(s) (~1234 tokens). \
+             Also, work log entries revived by a rebase: 2 (~/r/.agent/progress.md:5 and more). \
+             Fix now: tako context-budget fix (4 auto-fixable). \
+             Also, work log entries revived or duplicated by a rebase: 1 \
+             (~/r/.agent/progress.md:20; fix cannot repair them). \
+             Breakdown and how to fix: tako context-budget"
+        );
+
+        // 自動で直せない超過 + 直る復活: 超過の名指しは残し、fix は復活の件数だけを言う
+        let over = json!({ "path": "~/r/.agent/activeContext.md", "metric": "lines", "actual": 92, "limit": 80 });
+        let r = budget_report(&[over], 0, &[], &["~/r/.agent/progress.md:5"]);
+        assert_eq!(
+            startup_line_in(&r, Lang::Ja).unwrap(),
+            "起動時ロードが予算超過: 1 件（概算 1234 トークン）。\
+             ~/r/.agent/activeContext.md: lines 92 > 80。\
+             ほかに作業ログに rebase で戻ったエントリ: 1 件（~/r/.agent/progress.md:5）。\
+             いま直す: tako context-budget fix（自動で直せる 1 件）。内訳: tako context-budget"
+        );
     }
 
     /// #1539: MCP カタログは cwd にもプロファイルにも依らず必ず 1 件載る。

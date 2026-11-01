@@ -429,8 +429,15 @@ pub mod notes {
     );
 
     pub const PROGRESS_ENTRY_REVIVED: Note = Note::new(
-        "アーカイブへ移したはずのエントリが作業ログに戻っている。rebase では「移送（古いエントリを消す）」と「末尾追記」が噛み合っても git は衝突を報告せず auto-merge するので、`git checkout origin/main -- .agent/progress.md .agent/progress-archive.md` でこの 2 ファイルだけを main の状態へ戻し、自分の 1 件を書き直してから push する",
-        "An entry that was already archived is back in the work log. During a rebase git silently auto-merges a prune (which deletes old entries) against an append, so restore just these two files with `git checkout origin/main -- .agent/progress.md .agent/progress-archive.md`, then rewrite your own entry and push again",
+        "アーカイブへ移したはずのエントリが作業ログに戻っている（rebase / merge で移送の削除だけが失われた形）。`tako context-budget fix` が作業ログ側を落とす（アーカイブの 1 行はそのまま・本文は git 履歴に残る）",
+        "An entry that was already archived is back in the work log (a rebase / merge kept the entry but lost the prune's deletion). `tako context-budget fix` drops the work-log copy (the archive line stays and the full text stays in git history)",
+    );
+
+    /// 戻ったエントリと同じ見出しで本文の違うエントリが作業ログに並んでいて、
+    /// どれが戻ったものか機械には決まらない形（#1675）。`fix` は触らない
+    pub const PROGRESS_ENTRY_REVIVED_AMBIGUOUS: Note = Note::new(
+        "アーカイブへ移したはずの見出しが作業ログに戻っているが、同じ見出しで本文の違うエントリが作業ログに複数あり、どれが戻ったものか機械には決まらないので `fix` は触らない。rebase では「移送（古いエントリを消す）」と「末尾追記」が噛み合っても git は衝突を報告せず auto-merge するので、`git checkout origin/main -- .agent/progress.md .agent/progress-archive.md` でこの 2 ファイルだけを main の状態へ戻し、自分の 1 件を書き直してから push する",
+        "A heading that was already archived is back in the work log, but several work-log entries share that heading with different bodies, so the machine cannot tell which one came back and `fix` leaves them alone. During a rebase git silently auto-merges a prune (which deletes old entries) against an append, so restore just these two files with `git checkout origin/main -- .agent/progress.md .agent/progress-archive.md`, then rewrite your own entry and push again",
     );
 
     pub const PROGRESS_ENTRY_DUPLICATED: Note = Note::new(
@@ -739,6 +746,9 @@ pub struct PrunePlan {
     pub kept: Vec<LogEntry>,
     /// アーカイブへ移すエントリ（出現順）
     pub archived: Vec<LogEntry>,
+    /// アーカイブに既に在るので作業ログ側を落とすエントリ（rebase で戻ったもの。#1675）。
+    /// 1 件 = 落とすエントリ 1 件で、中身は `revivals` の `Archived` の検出そのもの
+    pub dropped: Vec<Revival>,
     /// 保持期間を過ぎてアーカイブから消す行
     pub aged_out: Vec<String>,
     /// 適用後の progress.md
@@ -752,13 +762,23 @@ pub struct PrunePlan {
 impl PrunePlan {
     /// 何も変わらないか（冪等性の判定に使う）
     pub fn is_noop(&self) -> bool {
-        self.archived.is_empty() && self.aged_out.is_empty()
+        self.archived.is_empty() && self.dropped.is_empty() && self.aged_out.is_empty()
     }
 
     /// 移送でエントリが失われていないこと。
-    /// **`fix` はこれを満たさなければ書き込まない**
+    /// **`fix` はこれを満たさなければ書き込まない**。
+    ///
+    /// 落とすエントリ（#1675）は「アーカイブに同じ 1 行が残る」ことまでデータで確かめる
+    /// （保持期間を過ぎてその行ごと消える回は、移送と同じく `aged_out` に載っていればよい）
     pub fn entries_preserved(&self) -> bool {
-        self.kept.len() + self.archived.len() == self.entries_before
+        let archive_lines: std::collections::BTreeSet<&str> =
+            self.archive_text.lines().map(str::trim_end).collect();
+        let accounted = self.dropped.iter().all(|r| {
+            let key = r.key.trim_end();
+            archive_lines.contains(key) || self.aged_out.iter().any(|l| l.trim_end() == key)
+        });
+        accounted
+            && self.kept.len() + self.archived.len() + self.dropped.len() == self.entries_before
     }
 }
 
@@ -849,6 +869,7 @@ pub fn days_to_date(days: i64) -> String {
 /// 移送計画を立てる（純粋関数。ファイルには触れない）。
 ///
 /// - `today_days`: 「今日」の 1970-01-01 からの日数（保持期間の判定に使う）
+/// - アーカイブに既に在るエントリ（rebase で戻ったもの）は**先に**作業ログ側を落とす（#1675）
 /// - 残すのは **新しい方から** 作業日 / 件数 / バイトのすべてに収まるところまで
 /// - 収まらなかったものは出現順のままアーカイブへ 1 行で積む
 pub fn plan_prune(progress: &str, archive: &str, today_days: i64) -> PrunePlan {
@@ -856,8 +877,27 @@ pub fn plan_prune(progress: &str, archive: &str, today_days: i64) -> PrunePlan {
     let log = parse_log(progress);
     let entries_before = log.entries.len();
 
+    // 0) #1675: 移送の「消す」側だけが rebase / merge で失われると、同じエントリが
+    //    作業ログとアーカイブの両方に残る。判定は check と同じ `revivals` の 1 実装で、
+    //    落とすのは `fixable` の `Archived` だけ（どれが戻ったものか決まらない形は残す）。
+    //    予算より先に落とすので、戻ったエントリが予算の枠を食って別の 1 件を押し出さない
+    let dropped: Vec<Revival> = revivals(progress, archive)
+        .into_iter()
+        .filter(|r| r.kind == RevivalKind::Archived && r.fixable)
+        .collect();
+    let mut drop_flags = vec![false; log.entries.len()];
+    for r in &dropped {
+        drop_flags[r.entry] = true;
+    }
+
     // 1) 新しい方から max_work_days ぶんの日付だけを候補にする
-    let mut days: Vec<&str> = log.entries.iter().map(|e| e.date.as_str()).collect();
+    let mut days: Vec<&str> = log
+        .entries
+        .iter()
+        .zip(&drop_flags)
+        .filter(|(_, d)| !**d)
+        .map(|(e, _)| e.date.as_str())
+        .collect();
     days.sort_unstable();
     days.dedup();
     let allowed: Vec<&str> = days
@@ -876,7 +916,7 @@ pub fn plan_prune(progress: &str, archive: &str, today_days: i64) -> PrunePlan {
     let mut keep_flags = vec![false; log.entries.len()];
     let mut kept_count = 0usize;
     for (i, e) in log.entries.iter().enumerate().rev() {
-        if !allowed.contains(&e.date.as_str()) {
+        if drop_flags[i] || !allowed.contains(&e.date.as_str()) {
             continue;
         }
         if kept_count >= max_entries {
@@ -897,6 +937,9 @@ pub fn plan_prune(progress: &str, archive: &str, today_days: i64) -> PrunePlan {
     let mut kept = Vec::new();
     let mut archived = Vec::new();
     for (i, e) in log.entries.iter().enumerate() {
+        if drop_flags[i] {
+            continue;
+        }
         if keep_flags[i] {
             kept.push(e.clone());
         } else {
@@ -948,6 +991,7 @@ pub fn plan_prune(progress: &str, archive: &str, today_days: i64) -> PrunePlan {
     PrunePlan {
         kept,
         archived,
+        dropped,
         aged_out,
         progress_text,
         archive_text,
@@ -1022,14 +1066,6 @@ impl RevivalKind {
             RevivalKind::Duplicated => Note::new("同じエントリが 2 回", "entry appears twice"),
         }
     }
-
-    /// 直し方（日英）
-    pub fn note(self) -> Note {
-        match self {
-            RevivalKind::Archived => notes::PROGRESS_ENTRY_REVIVED,
-            RevivalKind::Duplicated => notes::PROGRESS_ENTRY_DUPLICATED,
-        }
-    }
 }
 
 /// 検出 1 件。**行番号は 1 起点**なので `file:line` でそのまま名指しできる
@@ -1047,6 +1083,16 @@ pub struct Revival {
     pub other_line: usize,
     /// 突き合わせに使った 1 行（= `LogEntry::archive_line()` の出力）
     pub key: String,
+    /// `parse_log` のエントリの添字（0 起点）。`plan_prune` が落とす 1 件を指す
+    pub entry: usize,
+    /// `tako context-budget fix` が作業ログ側を落として直せるか（#1675）。
+    ///
+    /// - `Archived`: 同じ鍵のエントリが作業ログで**すべて同じ本文**のとき（= 戻ったものの写し）だけ。
+    ///   同じ見出しで本文の違うエントリが並んでいると、どれが戻ったものか機械には決まらない。
+    ///   消す側を機械が選ぶと他の 1 エントリが消える（#1246 と同じ事故）ので残す
+    /// - `Duplicated`: 同じ鍵が `fixable` な `Archived` でもあるとき（`fix` が写しごと落とすので
+    ///   重複も同時に消える）。アーカイブに無い重複は本文が違いうるので機械は選ばない
+    pub fixable: bool,
 }
 
 impl Revival {
@@ -1056,10 +1102,17 @@ impl Revival {
             metric: Metric::RevivedEntries,
             actual: 1,
             limit: 0,
-            // 自動では直せない: どちらの版が正かは移送の履歴を見ないと決まらない。
-            // 消す側を機械が選ぶと他の worker の 1 エントリが消える（#1246 と同じ事故）
-            fixable: false,
-            note: self.kind.note(),
+            fixable: self.fixable,
+            note: self.note(),
+        }
+    }
+
+    /// 直し方（日英）。`fix` で直るものは `fix` を、直らないものは手で戻す手順を返す
+    pub fn note(&self) -> Note {
+        match (self.kind, self.fixable) {
+            (_, true) => notes::PROGRESS_ENTRY_REVIVED,
+            (RevivalKind::Archived, false) => notes::PROGRESS_ENTRY_REVIVED_AMBIGUOUS,
+            (RevivalKind::Duplicated, false) => notes::PROGRESS_ENTRY_DUPLICATED,
         }
     }
 
@@ -1139,16 +1192,35 @@ fn archive_line_index(text: &str) -> std::collections::BTreeMap<&str, usize> {
 /// 逆に、戻ったあとで本文を書き換えられると鍵が変わって見えなくなる。
 /// それは「復活を直した」か「別の 1 件を書いた」かの区別が機械には付かないので、
 /// ここでは追わない（#1352 / #1228 の merge 戦略の決着が根治）
+///
+/// # `fix` が直せるもの（#1675）
+///
+/// `plan_prune` は**この関数の `fixable` な `Archived` だけ**を作業ログから落とす
+/// （判定を 2 か所に書かない）。どれを `fixable` にするかは [`Revival::fixable`] の doc
 pub fn revivals(progress: &str, archive: &str) -> Vec<Revival> {
     let log = parse_log(progress);
     let lines = heading_line_numbers(progress);
     let archived_at = archive_line_index(archive);
-    let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let keys: Vec<String> = log.entries.iter().map(LogEntry::archive_line).collect();
+    // 鍵ごとに「作業ログの写しがすべて同じ本文か」。違う本文が混ざる鍵は
+    // どれが戻ったものか決まらないので `fix` は落とさない
+    let mut bodies: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (e, key) in log.entries.iter().zip(&keys) {
+        let v = bodies.entry(key.as_str()).or_default();
+        let r = e.render();
+        if !v.contains(&r) {
+            v.push(r);
+        }
+    }
+    let droppable = |key: &str| {
+        archived_at.contains_key(key.trim_end()) && bodies.get(key).is_some_and(|v| v.len() == 1)
+    };
+    let mut seen: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     let mut out = Vec::new();
-    for (i, e) in log.entries.iter().enumerate() {
-        let key = e.archive_line();
+    for (i, (e, key)) in log.entries.iter().zip(&keys).enumerate() {
         let line = lines.get(i).copied().unwrap_or(0);
-        if let Some(&first) = seen.get(&key) {
+        if let Some(&first) = seen.get(key.as_str()) {
             out.push(Revival {
                 kind: RevivalKind::Duplicated,
                 date: e.date.clone(),
@@ -1156,9 +1228,11 @@ pub fn revivals(progress: &str, archive: &str) -> Vec<Revival> {
                 line,
                 other_line: first,
                 key: key.clone(),
+                entry: i,
+                fixable: droppable(key),
             });
         } else {
-            seen.insert(key.clone(), line);
+            seen.insert(key, line);
         }
         if let Some(&at) = archived_at.get(key.trim_end()) {
             out.push(Revival {
@@ -1167,7 +1241,9 @@ pub fn revivals(progress: &str, archive: &str) -> Vec<Revival> {
                 heading: e.heading.clone(),
                 line,
                 other_line: at,
-                key,
+                key: key.clone(),
+                entry: i,
+                fixable: droppable(key),
             });
         }
     }
@@ -1636,9 +1712,10 @@ mod tests {
         assert_eq!(hits[0].violation().metric, Metric::RevivedEntries);
         assert_eq!(hits[0].violation().limit, 0, "1 件でも違反");
         assert!(
-            !hits[0].violation().fixable,
-            "どちらの版が正かは機械には決まらない"
+            hits[0].violation().fixable,
+            "写しが 1 種類なら fix が作業ログ側を落とせる（#1675）"
         );
+        assert_eq!(hits[0].entry, 0, "落とす 1 件を添字で指す");
     }
 
     #[test]
@@ -1650,6 +1727,10 @@ mod tests {
         assert_eq!(hits[0].kind, RevivalKind::Duplicated);
         assert_eq!(hits[0].other_line, 8, "先に出た見出しの行を指す");
         assert_eq!(hits[0].line, 11);
+        assert!(
+            !hits[0].violation().fixable,
+            "アーカイブに無い重複は本文が違いうるので fix は選ばない"
+        );
     }
 
     /// (日付, Issue 番号) を鍵にすると落ちる形。**実データに在る**
@@ -1669,6 +1750,180 @@ mod tests {
         assert!(
             revivals(progress, archive).is_empty(),
             "同じ日・同じ Issue の別エントリは復活ではない"
+        );
+    }
+
+    // ─── 戻ったエントリの除去（Issue #1675） ────────────────────────────
+
+    /// 予算内の作業ログへ、アーカイブ済みのエントリが 1 件戻った形（rebase の auto-merge）
+    fn doubled_fixture() -> (String, String) {
+        let (progress, archive) = revival_fixture();
+        let moved = parse_log(&progress).entries[0].archive_line();
+        (progress, format!("{archive}{moved}\n"))
+    }
+
+    #[test]
+    fn 戻ったエントリはfixが作業ログ側を落として1回で収束する() {
+        let (progress, archive) = doubled_fixture();
+        let today = date_to_days("2026-09-24").unwrap();
+        let first = plan_prune(&progress, &archive, today);
+        assert_eq!(first.dropped.len(), 1, "戻った 1 件を落とす");
+        assert_eq!(first.dropped[0].line, 5, "落とす見出しの行（1 起点）");
+        assert!(first.archived.is_empty(), "予算内なので移送はしない");
+        assert!(!first.is_noop());
+        assert!(first.entries_preserved(), "残 1 + 除去 1 = 前 2");
+        // 削除だけ: アーカイブは 1 文字も変えず、残すエントリの本文もそのまま
+        assert_eq!(first.archive_text, archive);
+        assert_eq!(
+            first.progress_text,
+            "# Progress Log\n\n> 説明\n\n\
+             ## 2026-09-23（#1504: Windows のシェル統合を段にした）\n\
+             - 何を / どこを / 結果\n"
+        );
+        assert!(
+            revivals(&first.progress_text, &first.archive_text).is_empty(),
+            "check も同じ判定で緑になる"
+        );
+
+        // 2 回目は何も変えない（バイト一致）
+        let second = plan_prune(&first.progress_text, &first.archive_text, today);
+        assert!(second.is_noop());
+        assert_eq!(second.progress_text, first.progress_text);
+        assert_eq!(second.archive_text, first.archive_text);
+    }
+
+    #[test]
+    fn 予算超過の二重でも戻ったエントリは移送に数えずアーカイブへ積み直さない() {
+        // 6 作業日 = 1 日ぶん超過。その最も古い日が戻ったエントリ
+        let mut text = String::from("# t\n\n## 2026-08-20（#900: 戻った）\n- x\n");
+        for d in 1..=5 {
+            text.push_str(&format!("\n## 2026-09-0{d}（#90{d}: 新しい）\n- x\n"));
+        }
+        let archive = "# a\n\n- 2026-08-20 #900: 戻った\n";
+        let plan = plan_prune(&text, archive, date_to_days("2026-09-06").unwrap());
+        assert_eq!(plan.dropped.len(), 1);
+        assert!(plan.archived.is_empty(), "戻った 1 件を除けば予算内");
+        assert_eq!(plan.kept.len(), 5);
+        assert_eq!(plan.archive_text, archive, "同じ 1 行を二重に積まない");
+        assert!(plan.entries_preserved());
+    }
+
+    #[test]
+    fn 戻ったエントリが予算の枠を食って別の1件を押し出さない() {
+        // 件数の上限ちょうど + 戻った 1 件。戻ったものが最古の位置に無くても、
+        // 予算より先に落とすので正規の最古（#1）はアーカイブへ押し出されない
+        let mut text = String::from(
+            "# t\n\n## 2026-09-01（#1: 正規の最古）\n- x\n\n## 2026-09-01（#2: 戻った）\n- x\n",
+        );
+        for i in 3..=(PROGRESS_MAX_ENTRIES + 1) {
+            text.push_str(&format!("\n## 2026-09-02（#{i}: 普通）\n- x\n"));
+        }
+        let archive = "# a\n\n- 2026-09-01 #2: 戻った\n";
+        let plan = plan_prune(&text, archive, date_to_days("2026-09-06").unwrap());
+        assert_eq!(plan.dropped.len(), 1);
+        assert_eq!(plan.dropped[0].key, "- 2026-09-01 #2: 戻った");
+        assert!(plan.archived.is_empty(), "正規の 1 件を押し出していない");
+        assert_eq!(plan.kept.len(), PROGRESS_MAX_ENTRIES);
+        assert!(plan.kept[0].heading.contains("#1: 正規の最古"));
+        assert!(plan.entries_preserved());
+    }
+
+    #[test]
+    fn 同じ写しが2回戻っていても1回のfixで両方落とす() {
+        // rebase の復活 + union の両採用で、同じエントリが 2 回戻った形
+        let (progress, archive) = doubled_fixture();
+        let e = parse_log(&progress).entries[0].render();
+        let twice = format!("{progress}\n{e}");
+        let hits = revivals(&twice, &archive);
+        assert!(
+            hits.iter().all(|r| r.fixable),
+            "写しが 1 種類なので重複も含めて fix で直る: {hits:?}"
+        );
+        let today = date_to_days("2026-09-24").unwrap();
+        let first = plan_prune(&twice, &archive, today);
+        assert_eq!(first.dropped.len(), 2);
+        assert!(first.entries_preserved());
+        assert!(revivals(&first.progress_text, &first.archive_text).is_empty());
+        assert!(plan_prune(&first.progress_text, &first.archive_text, today).is_noop());
+    }
+
+    /// 誤って消す側の境界 1: 鍵は (日付, Issue 番号) ではなくアーカイブの 1 行そのもの
+    #[test]
+    fn 同じ日の同じissueでも一言が違えばfixは落とさない() {
+        let progress =
+            "# t\n\n## 2026-09-14（#1450: tasks を PWA から片付けられるようにした）\n- x\n";
+        let archive = "# a\n\n- 2026-09-14 #1450: tasks ビューを右パネルへ出した\n";
+        let plan = plan_prune(progress, archive, date_to_days("2026-09-15").unwrap());
+        assert!(plan.dropped.is_empty(), "別のエントリを落とさない");
+        assert!(plan.is_noop());
+    }
+
+    /// 誤って消す側の境界 2: 同じ見出しで本文の違うエントリが並ぶと、どれが戻ったものか決まらない
+    #[test]
+    fn 同じ見出しで本文の違うエントリが並ぶならfixはどちらも落とさない() {
+        let progress = "# t\n\n## 2026-09-14（#1450: 同じ見出し）\n- 本文 A\n\n\
+                        ## 2026-09-14（#1450: 同じ見出し）\n- 本文 B\n";
+        let archive = "# a\n\n- 2026-09-14 #1450: 同じ見出し\n";
+        let plan = plan_prune(progress, archive, date_to_days("2026-09-15").unwrap());
+        assert!(plan.dropped.is_empty(), "本文 A も B も残す");
+        assert!(plan.is_noop());
+        // check は名指しするが、fix では直らないと言う（手で戻す手順）
+        let hits = revivals(progress, archive);
+        let archived: Vec<&Revival> = hits
+            .iter()
+            .filter(|r| r.kind == RevivalKind::Archived)
+            .collect();
+        assert_eq!(archived.len(), 2, "{hits:?}");
+        assert!(hits.iter().all(|r| !r.violation().fixable), "{hits:?}");
+        assert_eq!(
+            archived[0].violation().note,
+            notes::PROGRESS_ENTRY_REVIVED_AMBIGUOUS
+        );
+    }
+
+    /// 誤って消す側の境界 3: アーカイブに無い重複は fix の対象外（本文が違いうる）
+    #[test]
+    fn アーカイブに無い重複はfixが落とさない() {
+        let (progress, archive) = revival_fixture();
+        let dup = format!("{progress}\n{}", parse_log(&progress).entries[1].render());
+        let plan = plan_prune(&dup, &archive, date_to_days("2026-09-24").unwrap());
+        assert!(plan.dropped.is_empty());
+        assert!(plan.is_noop());
+    }
+
+    #[test]
+    fn 落とすエントリの1行がアーカイブに無い計画は書き込みの検算で止まる() {
+        let (progress, archive) = doubled_fixture();
+        let today = date_to_days("2026-09-24").unwrap();
+        let mut plan = plan_prune(&progress, &archive, today);
+        assert!(plan.entries_preserved());
+        // 除去の根拠（アーカイブの 1 行）が書き込む内容から消えていたら書かない
+        plan.archive_text = archive.replace(&plan.dropped[0].key, "");
+        assert!(
+            !plan.entries_preserved(),
+            "1 行が無いのに作業ログ側だけ消さない"
+        );
+        // 件数が合わないときも書かない
+        let mut plan = plan_prune(&progress, &archive, today);
+        plan.dropped.push(plan.dropped[0].clone());
+        assert!(!plan.entries_preserved());
+    }
+
+    #[test]
+    fn 保持期間を過ぎた戻りはアーカイブの行と一緒に消える() {
+        // 戻ったエントリもアーカイブの 1 行も 90 日より古い。移送と同じく aged_out へ載る
+        let progress =
+            "# t\n\n## 2026-01-01（#5: とても古い）\n- x\n\n## 2026-09-01（#6: 最近）\n- x\n";
+        let archive = "# a\n\n- 2026-01-01 #5: とても古い\n";
+        let plan = plan_prune(progress, archive, date_to_days("2026-09-06").unwrap());
+        assert_eq!(plan.dropped.len(), 1);
+        assert_eq!(
+            plan.aged_out,
+            vec!["- 2026-01-01 #5: とても古い".to_string()]
+        );
+        assert!(
+            plan.entries_preserved(),
+            "aged_out に載っていれば失われたことにならない"
         );
     }
 
