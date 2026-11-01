@@ -47,7 +47,11 @@ const STALE: &str = "crates/tako-control/src/stale_binary.rs";
 
 /// UI スレッドで走る収集関数（`prepare_offload` から呼ばれる / 同期経路でも同じ）
 const UI_COLLECTORS: &[&str] = &[
-    "fn collect_worker_status_ctx(",
+    // #2646: `collect_worker_status_ctx` は材料の写し（UI スレッド）と、写しから文脈を組む口（同期の腕・
+    // A/B は UI スレッドで、IPC / MCP の受け口では background で走る = どちらでも子プロセスを起こさない）を
+    // 順に呼ぶだけになったので、本体の 2 つを見る
+    "fn worker_status_seed(",
+    "fn into_ctx(self)",
     "fn collect_report_ctx(",
     "fn verify_ctx_pane_identity(",
 ];
@@ -417,10 +421,11 @@ fn 走査が空振りしていない() {
         assert!(w.len() >= 5, "{head} の窓が短すぎる（{} 行）", w.len());
     }
     // 収集関数の本体を実際に見ている（器の名前を引く行が窓に入っている）
-    let (_, w) = fn_window(&dispatch, "fn collect_worker_status_ctx(").unwrap();
+    // #2646: 器の名前を引く行は材料の写し（`worker_status_seed`）へ移った
+    let (_, w) = fn_window(&dispatch, "fn worker_status_seed(").unwrap();
     assert!(
         !code_lines_with(&w, "host.backend_session(").is_empty(),
-        "collect_worker_status_ctx の窓に本体が入っていない"
+        "worker_status_seed の窓に本体が入っていない"
     );
     let (_, w) = fn_window(&dispatch, "fn collect_report_ctx(").unwrap();
     assert!(
@@ -448,15 +453,15 @@ const INJECTIONS: &[Injection] = &[
     Injection {
         name: "収集で PC リソースを走査する（#1993）",
         file: DISPATCH,
-        from: "        has_running_children: false,\n        live_tail: lines.map(tail_join),",
-        to: "        has_running_children: crate::resources::answer(None).is_ok(),\n        live_tail: lines.map(tail_join),",
+        from: "            has_running_children: false,\n            live_tail: lines.map(tail_join),",
+        to: "            has_running_children: crate::resources::answer(None).is_ok(),\n            live_tail: lines.map(tail_join),",
         expect: "resources::answer(",
     },
     Injection {
         name: "収集で子プロセスを数える（修正前の collect_worker_status_ctx）",
         file: DISPATCH,
-        from: "        has_running_children: false,\n        live_tail: lines.map(tail_join),",
-        to: "        has_running_children: crate::agents::has_running_children(\"x\"),\n        live_tail: lines.map(tail_join),",
+        from: "            has_running_children: false,\n            live_tail: lines.map(tail_join),",
+        to: "            has_running_children: crate::agents::has_running_children(\"x\"),\n            live_tail: lines.map(tail_join),",
         expect: "agents::has_running_children",
     },
     Injection {

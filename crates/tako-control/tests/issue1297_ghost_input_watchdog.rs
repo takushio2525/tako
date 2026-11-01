@@ -208,13 +208,25 @@ fn 属性はdispatchから配線されている() {
     let src = std::fs::read_to_string(crate_file("src/dispatch.rs")).expect("dispatch.rs を読める");
     let prod = production_source(&src);
 
-    // 採る側: `read_pane` の `input_status` と同じ 1 実装から採っていること
-    let collect = fn_body(prod, "fn collect_worker_status_ctx(");
+    // 採る側: `read_pane` の `input_status` と同じ 1 実装（`screen::analyze_input_line`）から採っていること。
+    // #2646 で採取は UI スレッドの外（`WorkerStatusSeed::into_ctx` → `PaneAccess::lines_and_input`）へ移った
+    let collect = fn_body(prod, "fn into_ctx(self)");
     assert!(
-        collect.contains("analyze_input"),
+        collect.contains("lines_and_input"),
         "worker_status が入力欄の属性を採っていない。判定を直しても本番では \
          1 ビットも変わらない\n{}",
-        locate(DISPATCH_PATH, &src, "fn collect_worker_status_ctx(")
+        locate(DISPATCH_PATH, &src, "fn into_ctx(self)")
+    );
+    let core = std::fs::read_to_string(crate_file("../tako-core/src/terminal.rs"))
+        .expect("tako-core の terminal.rs を読める");
+    assert!(
+        fn_body(&core, "pub fn lines_and_input(").contains("analyze_input_line"),
+        "`PaneAccess::lines_and_input` が `read_pane` と同じ判定（`analyze_input_line`）で入力欄を読んでいない\n{}",
+        locate(
+            "crates/tako-core/src/terminal.rs",
+            &core,
+            "pub fn lines_and_input("
+        )
     );
 
     // 渡す側: 覆す腕へ属性が届いていること

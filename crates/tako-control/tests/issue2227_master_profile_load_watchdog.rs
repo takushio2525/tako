@@ -745,13 +745,18 @@ fn scan_dispatch(src: &str) -> Vec<Offender> {
                      黙って組み込み既定へ落とす修正前の形（#2256）",
                 )],
             },
+            // #2646: spawn は段に分かれた（読み込みの warning を受け取るのは配置の段、出すのは記録の段）
             Rule {
-                fn_needle: "fn dispatch_orchestrator_spawn(",
+                fn_needle: "fn spawn_place(",
+                needs: &[(
+                    "warning: profile_warning",
+                    "spawn が読み込みの warning を受け取っていない（#2256）",
+                )],
+                bans: &[],
+            },
+            Rule {
+                fn_needle: "fn record(self) -> SpawnRecorded",
                 needs: &[
-                    (
-                        "warning: profile_warning",
-                        "spawn が読み込みの warning を受け取っていない（#2256）",
-                    ),
                     (
                         "if let Some(w) = profile_warning {",
                         "spawn が読み込みの warning を出していない（#2256）",
@@ -980,6 +985,8 @@ fn 走査が空振りしていない() {
             "fn resolve_caller_profile_with_role(",
         ),
         (DISPATCH, &s.dispatch, "fn dispatch_orchestrator_spawn("),
+        (DISPATCH, &s.dispatch, "fn spawn_place("),
+        (DISPATCH, &s.dispatch, "fn record(self) -> SpawnRecorded"),
         (DISPATCH, &s.dispatch, "fn dispatch_git_resolve_agent("),
         (DISPATCH, &s.dispatch, "fn dispatch_orchestrator_adopt("),
         (
@@ -1282,18 +1289,18 @@ fn 逆戻りを名指しできる() {
         // 注入 27: spawn が理由を応答へ載せない
         Injection {
             rel: DISPATCH,
-            fn_needle: "fn dispatch_orchestrator_spawn(",
+            fn_needle: "fn record(self) -> SpawnRecorded",
             from: "\"kind\": \"profile_unreadable\",",
             to: "\"kind\": \"other\",",
-            marker: "fn dispatch_orchestrator_spawn(",
+            marker: "fn record(self) -> SpawnRecorded",
         },
         // 注入 28: spawn が理由を persist.log へ残さない
         Injection {
             rel: DISPATCH,
-            fn_needle: "fn dispatch_orchestrator_spawn(",
+            fn_needle: "fn record(self) -> SpawnRecorded",
             from: "crate::diag::persist_log(&format!(\"[spawn] pane={}: {w}\", new_id.as_u64()));",
             to: "let _ = &w;",
-            marker: "fn dispatch_orchestrator_spawn(",
+            marker: "fn record(self) -> SpawnRecorded",
         },
         // 注入 29: 解消エージェントが理由を応答へ載せない
         Injection {

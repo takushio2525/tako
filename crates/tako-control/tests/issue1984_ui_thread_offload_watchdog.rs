@@ -232,6 +232,10 @@ const UI_PATHS: &[&str] = &[
     "fn resolve_handoff_target(",
     "fn dispatch_orchestrator_handoff(",
     "fn dispatch_orchestrator_spawn(",
+    // #2646: spawn は段に分かれた（配置 = UI・記録 = 同期の腕では UI・積み込み = UI）
+    "fn spawn_place(",
+    "fn record(self) -> SpawnRecorded",
+    "fn spawn_launch(",
     "fn spawn_caller_profile(",
     "fn build_session_restart_plan(",
     "fn dispatch_session_restart(",
@@ -2918,21 +2922,9 @@ fn 走査が空振りしていない() {
             "fn resolve_caller_pane(",
             "caller_pane_by_pid(",
         ),
-        (
-            &s.dispatch,
-            "fn dispatch_orchestrator_spawn(",
-            "agent_preflight(",
-        ),
-        (
-            &s.dispatch,
-            "fn dispatch_orchestrator_spawn(",
-            "caller_pane_by_pid(",
-        ),
-        (
-            &s.dispatch,
-            "fn dispatch_orchestrator_spawn(",
-            "tako_binary()",
-        ),
+        (&s.dispatch, "fn spawn_place(", "agent_preflight("),
+        (&s.dispatch, "fn spawn_place(", "caller_pane_by_pid("),
+        (&s.dispatch, "fn spawn_place(", "tako_binary()"),
         (
             &s.dispatch,
             "fn dispatch_orchestrator_handoff(",
@@ -3213,7 +3205,7 @@ fn 逆戻りを名指しできる() {
         "spawn の preflight を同期へ",
         scan_ui_paths(&d),
         DISPATCH,
-        "fn dispatch_orchestrator_spawn(",
+        "fn spawn_place(",
     );
 
     // ③ 再起動の計画の走査を修正前の同期の採取へ戻す

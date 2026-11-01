@@ -6351,6 +6351,18 @@ pub enum OffloadJob {
     /// （[`crate::welcome::probe`]）は background、段を GUI へ渡してボタンを押すのは
     /// [`OffloadContinuation::Welcome`] で UI スレッドへ戻す
     Welcome(WelcomeProbeFor),
+    /// 委任台帳の操作（#2646）。ledger.yaml の YAML の解釈・書き戻し・書き手のロック待ちを
+    /// UI スレッドで待たない。本体は同期の腕と同じ [`dispatch_orchestrator_ledger`]
+    /// （workspace に触らないのでそのまま background から応答する）
+    OrchestratorLedger(Box<LedgerParams>),
+    /// worker の状態の追跡キーの解決と画面の採取（#2646。[`WorkerStatusJob`]）。レジストリ
+    /// （workers.yaml）の読みと端末のロックを UI スレッドで待たない。worker 指定でペインがまだ
+    /// 決まっていなければ、解決の後に [`OffloadContinuation::WorkerStatusSeed`] で UI スレッドへ戻す
+    WorkerStatusQuery(Box<WorkerStatusJob>),
+    /// spawn の記録と I/O の段（#2646。[`SpawnPlaced::record`]）。配置（ペインの分割）を UI スレッドで
+    /// 済ませた後、worker の MCP の構成・事前信頼・カタログ / 台帳 / レジストリへの記録を background で行い、
+    /// 起動の積み込みは [`OffloadContinuation::SpawnLaunch`] で UI スレッドへ戻す
+    SpawnRecord(Box<SpawnPlaced>),
 }
 
 /// 何のために「次にやること」を確かめるか（#1510）
@@ -6539,6 +6551,10 @@ pub enum OffloadContinuation {
     PreviewChangelogDiff(Box<PreviewChangelogDiffLanding>),
     /// 確かめた「次にやること」を GUI へ渡す・押す（[`welcome_land`]。#1510）
     Welcome(Box<WelcomeLanding>),
+    /// worker 指定で解決したペインの材料を写す（#2646。[`worker_status_seed`]）。続きは background
+    WorkerStatusSeed(Box<WorkerQuery>),
+    /// 記録を済ませた spawn の起動を起動ゲートへ積み、応答を組む（#2646。[`spawn_launch`]）
+    SpawnLaunch(Box<SpawnRecorded>),
 }
 
 impl OffloadContinuation {
@@ -6552,10 +6568,14 @@ impl OffloadContinuation {
         match self {
             // #2052: 完了・却下は同期の腕の判定（`protocol::changes_layout`）でも偽。
             // #2014: 変更履歴もプレビューの中身だけを変える（同期の腕の判定でも偽）。#2150 の行の展開も同じ
+            // #2646: worker の状態の材料の写しは読むだけ。spawn の起動の積み込みはペインを作らない
+            // （ペインの分割と描画は配置の段 = `Probed` の着地で済んでいる）
             Self::List(_)
             | Self::UserTaskStatus(_)
             | Self::PreviewChangelog(_)
-            | Self::PreviewChangelogDiff(_) => false,
+            | Self::PreviewChangelogDiff(_)
+            | Self::WorkerStatusSeed(_)
+            | Self::SpawnLaunch(_) => false,
             // #1510: 押す（ペインを開く・master を起こす）ときだけタブが増える
             Self::Welcome(landing) => landing.probe_for == WelcomeProbeFor::Next,
             // #2086: 同期の腕と同じ判定（返答だけが真 = master を起こすとタブが増える）
@@ -6628,6 +6648,11 @@ pub fn finish_offload(
             preview_changelog_diff_land(host, *landing)
         }
         OffloadContinuation::Welcome(landing) => welcome_land(host, *landing),
+        // #2646: もう一巡を出せない直の呼び手は、写して（UI）から組む（background の続き）までを同じスレッドで順に通す
+        OffloadContinuation::WorkerStatusSeed(q) => {
+            worker_status_from_seed(worker_status_seed(host, q.pane_id), *q)
+        }
+        OffloadContinuation::SpawnLaunch(recorded) => Ok(spawn_launch(host, origin, *recorded)),
     }
 }
 
@@ -6678,6 +6703,18 @@ pub fn prepare_offload(
             tmux_session,
             worker,
         } => {
+            // #2646: 追跡キーの解決（workers.yaml の読み）と画面の採取（端末のロック）も UI スレッドで
+            // 待たない。ここではメモリだけの材料を写す（[`worker_status_prepare`]）。A/B の
+            // `TAKO_2646_LEGACY=1` と `TAKO_1968_LEGACY=1` は修正前と同じく UI スレッドで解決して採る
+            if !orchestrator_offload_legacy() && !crate::diag::issue1968_legacy() {
+                return Some(worker_status_prepare(
+                    host,
+                    *pane_id,
+                    worker.clone(),
+                    session_id.clone(),
+                    tmux_session.clone(),
+                ));
+            }
             let q = match resolve_worker_query(
                 *pane_id,
                 worker.as_deref(),
@@ -7143,6 +7180,31 @@ pub fn prepare_offload(
                 caller_role: caller_role.clone(),
             }))
         })),
+        // #2646: 委任台帳（ledger.yaml。本番 590 KB・1830 件）の YAML の解釈・書き戻し（世代バックアップ込み）・
+        // 書き手のロック待ちを UI スレッドで待たない（本番の `dispatch:OrchestratorLedger` 平均 54ms・最大 661ms。
+        // 段 1 の同じ大きさの合成で list / stats 14ms・record 27ms）。workspace に触らないので background から
+        // 応答する。A/B の `TAKO_2646_LEGACY=1` は同期の腕
+        Request::OrchestratorLedger {
+            action,
+            id,
+            outcome,
+            rounds,
+            note,
+            project,
+            task_type,
+            limit,
+        } if !orchestrator_offload_legacy() => {
+            Some(Ok(OffloadJob::OrchestratorLedger(Box::new(LedgerParams {
+                action: action.clone(),
+                id: id.clone(),
+                outcome: outcome.clone(),
+                rounds: *rounds,
+                note: note.clone(),
+                project: project.clone(),
+                task_type: task_type.clone(),
+                limit: *limit,
+            }))))
+        }
         // #2203: `show` は同じ段・期間・絞り込みで右パネルの usage ビューを開いてから、答えは同じ
         // background のジョブで返す（UI スレッドで行うのは引数の確かめと画面の段を置くことだけ）
         Request::Sessions {
@@ -7207,6 +7269,12 @@ impl OffloadJob {
     /// [`OffloadOutcome::OnUi`] を返す（受け口は UI スレッドで [`finish_offload`] を呼ぶ）
     pub fn run_staged(self) -> OffloadOutcome {
         match self {
+            // #2646: worker 指定でペインがまだ決まっていなければ、解決の後に UI スレッドで材料を写す
+            OffloadJob::WorkerStatusQuery(job) => job.run(),
+            // #2646: 記録を済ませてから、起動の積み込みを UI スレッドへ戻す（記録より前に起動を積まない）
+            OffloadJob::SpawnRecord(placed) => {
+                OffloadOutcome::OnUi(OffloadContinuation::SpawnLaunch(Box::new(placed.record())))
+            }
             OffloadJob::LspGoto(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspGoto(Box::new(job.run())))
             }
@@ -7328,6 +7396,9 @@ impl OffloadJob {
             } => {
                 crate::agents::with_shared_scan(|| finish_orchestrator_report(ctx, lines, messages))
             }
+            // #2646: 同期の腕（`Request::OrchestratorLedger`）と同じ本体・同じ応答・同じ断り。台帳の書き込みは
+            // ファイルのロック（`Ledger::mutate_typed`）で 1 本ずつになる
+            OffloadJob::OrchestratorLedger(params) => dispatch_orchestrator_ledger(*params),
             OffloadJob::Workers {
                 live_panes,
                 limit_resume_panes,
@@ -7494,6 +7565,13 @@ impl OffloadJob {
             OffloadJob::Welcome(_) => Err(DispatchError::Operation(
                 "初回起動の導線の確かめは run_staged で走らせる（段を GUI へ渡すのに UI スレッドの続きが要る）"
                     .into(),
+            )),
+            OffloadJob::WorkerStatusQuery(_) => Err(DispatchError::Operation(
+                "worker の状態は run_staged で走らせる（worker 指定はペインの材料を写すのに UI スレッドの続きが要る）"
+                    .into(),
+            )),
+            OffloadJob::SpawnRecord(_) => Err(DispatchError::Operation(
+                "spawn の記録は run_staged で走らせる（起動を積むのに UI スレッドの続きが要る）".into(),
             )),
         }
     }
@@ -8080,11 +8158,7 @@ pub fn land_offload(
             let needs = with_ui_probes(&probed.probes, || probe_needs(host, &probed.request))
                 .unwrap_or_default();
             if needs.is_empty() {
-                return OffloadLanding::Done(finish_offload(
-                    host,
-                    OffloadContinuation::Probed(probed),
-                    origin,
-                ));
+                return land_probed(host, probed, origin);
             }
             let ProbedRequest {
                 request,
@@ -8128,8 +8202,50 @@ pub fn land_offload(
                 },
             ))))
         }
+        // 先取りの巡の上限に達した要求も、答えが揃った要求と同じ着地を通す（#2646 の spawn の段分け）
+        OffloadContinuation::Probed(probed) => land_probed(host, probed, origin),
+        // #2646: worker 指定で解決したペインの材料をここ（UI）で写し、画面の採取と状態の組み立ては background へ。
+        // host は変えていない（読むだけ）ので後処理の要らない一巡にする
+        OffloadContinuation::WorkerStatusSeed(q) => {
+            let seed = worker_status_seed(host, q.pane_id);
+            OffloadLanding::Again(Box::new(OffloadJob::WorkerStatusQuery(Box::new(
+                WorkerStatusJob {
+                    query: WorkerStatusTarget::Resolved(*q),
+                    seed: Some(Box::new(seed)),
+                },
+            ))))
+        }
         other => OffloadLanding::Done(finish_offload(host, other, origin)),
     }
+}
+
+/// 先取りの答えが揃った要求の着地（#1984 / #2646）。
+///
+/// spawn（A/B の `TAKO_2646_LEGACY=1` を除く）は配置の段（[`spawn_place`]）だけをここ（UI）で行い、
+/// 記録と I/O の段を background へ出す（[`OffloadLanding::Settled`] = 受け口がペインの PTY を立てて
+/// 描いてから出す）。他の要求は従来どおり先取りの答えの内側で dispatch する
+fn land_probed(
+    host: &mut dyn ControlHost,
+    probed: Box<ProbedRequest>,
+    origin: PaneOrigin,
+) -> OffloadLanding {
+    if !orchestrator_offload_legacy() {
+        if let Some(params) = spawn_params_of(&probed.request) {
+            // UI スレッドに残る配置の段も同じタグで測る（修正前は spawn 全体がこのタグだった）
+            let _span = crate::diag::perf_span("dispatch:OrchestratorSpawn");
+            return match with_ui_probes(&probed.probes, || spawn_place(host, origin, params)) {
+                Ok(placed) => {
+                    OffloadLanding::Settled(Box::new(OffloadJob::SpawnRecord(Box::new(placed))))
+                }
+                Err(e) => OffloadLanding::Done(Err(e)),
+            };
+        }
+    }
+    OffloadLanding::Done(finish_offload(
+        host,
+        OffloadContinuation::Probed(probed),
+        origin,
+    ))
 }
 
 /// 変更履歴の準備（UI スレッド。#2014）。写すのはプレビューのパス（キャッシュ済みの値）だけで、
@@ -8269,10 +8385,43 @@ fn remote_agents_reply() -> Result<Value, DispatchError> {
 }
 
 /// worker_status / report のクエリ正規化結果（#390）
-struct WorkerQuery {
+pub struct WorkerQuery {
     pane_id: u64,
     session_id: Option<String>,
     tmux_session: Option<String>,
+}
+
+/// A/B: #2646 前へ戻す（orchestrator 系の dispatch = spawn の記録と I/O・台帳・worker の状態の
+/// 追跡キーの解決と画面の採取を UI スレッドで同期に済ませる）
+pub const ORCHESTRATOR_OFFLOAD_LEGACY_ENV: &str = "TAKO_2646_LEGACY";
+
+/// orchestrator 系の dispatch を background へ出さず、修正前と同じく UI スレッドで待つか（#2646 の A/B。
+/// **門はここ 1 か所**）。要求のたびに読む（テストが `run_alone!` の子で切り替えられるよう、値を覚えない）
+pub fn orchestrator_offload_legacy() -> bool {
+    matches!(
+        std::env::var(ORCHESTRATOR_OFFLOAD_LEGACY_ENV)
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// **#2646 の検出力の注入**（`TAKO_2646_INJECT_IO_MS=<ms>`）: orchestrator 系のファイルの読み書きの段
+/// （台帳の操作・worker レジストリでの追跡キーの解決・spawn の記録）を 1 回ずつこの ms だけ遅らせる。
+/// 負荷は作らず、遅い読み書き（大きな台帳・書き手のロック待ち）の区間だけを伸ばす。実経路テスト
+/// `scripts/test-orchestrator-offload-2646.sh` が「その間に別の IPC が待たされない」を測るのに使う。
+/// 製品の既定は 0（何もしない）
+fn inject_orchestrator_io_delay() {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("TAKO_2646_INJECT_IO_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    });
+    if ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
 }
 
 /// worker_status / report の対象解決（#390）。
@@ -8288,6 +8437,7 @@ fn resolve_worker_query(
 ) -> Result<WorkerQuery, DispatchError> {
     use crate::orchestrator::registry::WorkerRegistry;
     if let Some(worker_id) = worker {
+        inject_orchestrator_io_delay();
         let reg = WorkerRegistry::load_typed()
             .map_err(|e| Reason::WorkerRegistryUnreadable(e.to_string()).operation())?;
         let (_, entry) = reg
@@ -8304,6 +8454,7 @@ fn resolve_worker_query(
     };
     // pane_id 指定: 欠けている追跡キーだけをレジストリで補完（明示指定は常に優先）
     if session_id.is_none() || tmux_session.is_none() {
+        inject_orchestrator_io_delay();
         if let Ok(reg) = WorkerRegistry::load() {
             if let Some((_, entry)) = reg.find_active_by_pane(pane_id) {
                 return Ok(WorkerQuery {
@@ -11701,39 +11852,11 @@ fn dispatch_inner(
             content.as_deref(),
         ),
 
-        Request::OrchestratorSpawn {
-            project,
-            prompt,
-            label,
-            model,
-            effort,
-            pane,
-            tab,
-            caller_role,
-            agent,
-            caller_pid,
-            task_type,
-            account,
-            limit_resume,
-        } => dispatch_orchestrator_spawn(
-            host,
-            origin,
-            SpawnParams {
-                project: &project,
-                prompt: &prompt,
-                label: label.as_deref(),
-                model: model.as_deref(),
-                effort: effort.as_deref(),
-                pane,
-                tab,
-                caller_role: caller_role.as_deref(),
-                agent: agent.as_deref(),
-                caller_pid,
-                task_type: task_type.as_deref(),
-                account: account.as_deref(),
-                limit_resume,
-            },
-        ),
+        // 引数の写しは #2646 の着地（[`land_probed`]）と 1 実装（[`spawn_params_of`]）
+        Request::OrchestratorSpawn { .. } => match spawn_params_of(&request) {
+            Some(params) => dispatch_orchestrator_spawn(host, origin, params),
+            None => Err(Reason::EitherOf("pane", "tab").operation()),
+        },
 
         // 通常は UI 層（tako-app の IPC ループ）が snapshot / compute を二段で実行して
         // ここへ来ない（#181: compute の claude CLI 起動が UI を専有するため background 化）。
@@ -19348,11 +19471,118 @@ fn launch_agent_gated(
     }
 }
 
+/// spawn の引数（#2646。同期の腕と着地 [`land_probed`] の 1 実装）。spawn の要求でなければ None
+fn spawn_params_of(request: &Request) -> Option<SpawnParams<'_>> {
+    let Request::OrchestratorSpawn {
+        project,
+        prompt,
+        label,
+        model,
+        effort,
+        pane,
+        tab,
+        caller_role,
+        agent,
+        caller_pid,
+        task_type,
+        account,
+        limit_resume,
+    } = request
+    else {
+        return None;
+    };
+    Some(SpawnParams {
+        project,
+        prompt,
+        label: label.as_deref(),
+        model: model.as_deref(),
+        effort: effort.as_deref(),
+        pane: *pane,
+        tab: *tab,
+        caller_role: caller_role.as_deref(),
+        agent: agent.as_deref(),
+        caller_pid: *caller_pid,
+        task_type: task_type.as_deref(),
+        account: account.as_deref(),
+        limit_resume: *limit_resume,
+    })
+}
+
+/// worker の spawn（#2646 で 3 段に分けた。段の中身と順は IPC / MCP の受け口でも同じ）。
+///
+/// 1. 配置（[`spawn_place`]。UI スレッド）: 引数とプロファイルの検証・分割元の解決・配置・ペインの分割・
+///    セッションの予約・タイトル / role / 自動復帰・フォントの当て直し・器の名前の予約
+/// 2. 記録と I/O（[`SpawnPlaced::record`]。UI スレッドに縛られない）: worker の MCP の構成・起動コマンド・
+///    事前信頼（`.claude.json`）・Bypass の事前承認・セッションカタログ / 委任台帳 / worker レジストリへの記録
+/// 3. 起動の積み込み（[`spawn_launch`]。UI スレッド）: 起動ゲートへ起動コマンドと依頼文を預ける / 積む
+///
+/// 同期の腕（この関数）はその場で順に通す。IPC / MCP の受け口は 1 の後に 2 を background へ出す
+/// （[`land_probed`] → [`OffloadLanding::Settled`]。本番の `dispatch:OrchestratorSpawn` が毎回 67〜73ms
+/// だったのは 2 の YAML の解釈と書き戻し = 段 1 の同じ大きさの合成で 52ms のうち 50ms）。
+/// **起動を積むのは記録の後**なので、送達フローが依頼文の到達を worker レジストリへ書く（#790）とき、
+/// そのペインのエントリは必ず在る。事前信頼も起動より前に済む
 fn dispatch_orchestrator_spawn(
     host: &mut dyn ControlHost,
     origin: PaneOrigin,
     params: SpawnParams,
 ) -> Result<Value, DispatchError> {
+    let placed = spawn_place(host, origin, params)?;
+    let recorded = placed.record();
+    Ok(spawn_launch(host, origin, recorded))
+}
+
+/// spawn の配置の段の結果（#2646）。記録と I/O の段（[`SpawnPlaced::record`]）へ運ぶ材料
+pub struct SpawnPlaced {
+    project: String,
+    prompt: String,
+    label: Option<String>,
+    task_type: Option<String>,
+    cwd: String,
+    /// このプロジェクトの worker へ持ち込む user scope の MCP サーバー名（#2412。projects.yaml から）
+    mcp_keep: Vec<String>,
+    worker_agent: crate::orchestrator::agent::WorkerAgent,
+    /// #983: tako がどの実行ファイルを起動するか（先取りの答え。#1984）
+    agent_cli_path: Option<String>,
+    profile_env: crate::orchestrator::EnvPlan,
+    launch: crate::orchestrator::ResolvedWorkerLaunch,
+    remote_control: crate::claude_remote::RemoteControlDecision,
+    account_name: Option<String>,
+    /// #2256: 呼び出し元 master のプロファイルを読めなかった理由
+    profile_warning: Option<String>,
+    /// #2470: 読んだプロファイルの名前（レジストリへ記録する）
+    caller_profile: String,
+    window_title: String,
+    role_value: String,
+    pane_role: String,
+    /// tako の実行ファイル（先取りの答え。#1984 の先取りは UI スレッドの内側でだけ引ける）
+    tako_bin: String,
+    new_id: PaneId,
+    tab_id: TabId,
+    target: PaneId,
+    placement_kind: &'static str,
+    placement_reason: Option<String>,
+    placement_cols: Option<u16>,
+    placement_min: u16,
+    font_fits: Vec<crate::worker_font::AppliedFit>,
+    limit_resume_applied: bool,
+    /// 自動復帰を ON にした発生源（ON のときだけ。監査行は記録の段で出す = 修正前と同じ順）
+    limit_resume_source: Option<&'static str>,
+    tmux_session: Option<String>,
+}
+
+/// spawn の記録の段の結果（#2646）。起動の積み込み（[`spawn_launch`]）へ運ぶ
+pub struct SpawnRecorded {
+    /// 応答（`launch_gate` は積み込みで埋める）
+    reply: Value,
+    launch: crate::launch_gate::LaunchRequest,
+}
+
+/// spawn の配置の段（#2646。UI スレッド）。ペインを作るまでの検証・配置・分割と、host に触る後始末
+fn spawn_place(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    params: SpawnParams,
+) -> Result<SpawnPlaced, DispatchError> {
     let SpawnParams {
         project,
         prompt,
@@ -19364,7 +19594,7 @@ fn dispatch_orchestrator_spawn(
         caller_role,
         agent,
         caller_pid,
-        task_type: _task_type,
+        task_type,
         account,
         limit_resume,
     } = params;
@@ -19385,7 +19615,7 @@ fn dispatch_orchestrator_spawn(
     // 検証はペイン分割の**前**に行う（不正 agent でペインだけ生える事故を防ぐ）
     // #2256: 呼び出し元 master のプロファイルを読めなくても止めずに組み込み既定で立てるが、
     // 理由（projects の制限・アカウント・worker のモデルが効かない）を応答の warnings と
-    // persist.log へ出す（記録は立てた後 = 下の launch_warnings で 1 回だけ）
+    // persist.log へ出す（記録は立てた後 = 記録の段の launch_warnings で 1 回だけ）
     let (
         role_suffix,
         orchestrator::master_launch::LaunchProfile {
@@ -19519,126 +19749,13 @@ fn dispatch_orchestrator_spawn(
         Some(l) => format!("worker:{project}:{l}"),
         None => format!("worker:{project}"),
     };
-    // MCP の一時注入（#986）。codex だけが `-c` で受け取る（他系統は 1 バイトも変わらない）。
-    // master と同じ 1 実装（`agent::codex_mcp_args`）なので、worker だけ古い形になることが無い
+    // MCP の一時注入（#986）に埋める tako の実行ファイル。先取りの答えは UI スレッドの内側でだけ引けるので
+    // ここで引いて記録の段へ渡す（#1984）
     let tako_bin = tako_binary();
-    // #2412: user scope の MCP を持ち込まない（既定は tako の MCP だけ。足すのはプロジェクトの
-    // mcp_servers）。読む user scope は起動する claude の config dir を含む（#558 と同じ解決）。
-    // codex は env 計画の CODEX_HOME の config.toml を読み、`-c` で止める（#2418）
-    let worker_mcp = crate::worker_mcp::prepare(
-        worker_agent,
-        std::path::Path::new(&cwd),
-        &profile_env,
-        &crate::worker_mcp::keep_for_project(&config, project),
-        &launch.extra_args,
-    )
-    .materialized();
-    let worker_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
-        agent: worker_agent,
-        role: &role_value,
-        model: launch.model.as_deref(),
-        effort: launch.effort.as_deref(),
-        skip_permissions: launch.skip_permissions,
-        allow_sandbox_bypass: launch.allow_sandbox_bypass,
-        // Remote Control（#1068）: opt-in かつ適格なときだけ付く。
-        // 不適格なら flag は None になり、理由は `remote_control` に残る
-        remote_control: remote_control.enabled(),
-        extra_args: &launch.extra_args,
-        tako_bin: Some(&tako_bin),
-        mcp_settings: worker_mcp.settings_file.as_deref(),
-        mcp_codex_off: &worker_mcp.codex_off,
-        env: &profile_env,
-        // 新しい会話（再開は resume_launch::worker_resume_launch が同じ関数へ会話 ID を渡す = #2473）
-        resume: None,
-    });
-
-    // 事前信頼: 未信頼フォルダでエージェント CLI を起動すると信頼ダイアログが出て、
-    // 送信したプロンプトがダイアログへの応答として消費される（Issue #32 問題 1）。
-    // 起動前に各 CLI の設定ファイル（claude: <config dir>/.claude.json /
-    // codex: ~/.codex/config.toml / agy: ~/.gemini/antigravity-cli/settings.json）へ
-    // 信頼済みを書き込んでダイアログ自体を出さない。claude の書き先は起動する
-    // config dir 配下でなければ効かない（#558。アカウント指定で変わる）。
-    // 失敗しても PromptFlow のダイアログ検出 → 承諾がフォールバックするため継続する
-    let claude_config_dir = profile_env.claude_config_dir();
-    // #983 の変更 3: 事前信頼の書き込み失敗を**黙って握りつぶさない**。
-    // 致命ではない（tako がダイアログを検出して承諾する）が、そのぶん最初の指示が
-    // 届くまで遅くなる。理由と次の一手を応答の warnings へ載せる
-    let mut launch_warnings: Vec<Value> = Vec::new();
-    if let Some(w) = profile_warning {
-        crate::diag::persist_log(&format!("[spawn] pane={}: {w}", new_id.as_u64()));
-        launch_warnings.push(json!({
-            "kind": "profile_unreadable",
-            "agent": worker_agent.as_str(),
-            "message": w,
-        }));
-    }
-    // #2412: 絞り込みが効かない / 名前が見つからないことは黙らせない（spawn は止めない）
-    for w in &worker_mcp.warnings {
-        crate::diag::persist_log(&format!(
-            "[spawn] pane={} worker の MCP: {w}",
-            new_id.as_u64()
-        ));
-        launch_warnings.push(json!({
-            "kind": "worker_mcp",
-            "agent": worker_agent.as_str(),
-            "message": w,
-        }));
-    }
-    let pre_trusted =
-        orchestrator::agent::ensure_trusted_in(worker_agent, claude_config_dir.as_deref(), &cwd)
-            .unwrap_or_else(|e| {
-                launch_warnings.push(launch_warning(
-                    worker_agent,
-                    crate::orchestrator::agent_cli::AgentCliProblem::TrustWriteFailed,
-                    &e,
-                ));
-                false
-            });
-
-    // Bypass Permissions 事前承認（#407）: skip_permissions=true の claude worker は
-    // --dangerously-skip-permissions で起動する。初回は確認ダイアログが出て既定選択
-    // 「No, exit」で即終了するため、起動前に config dir 配下の .claude.json へ
-    // 承認済みを書き込む。フォールバック: deliver_via_tmux の bypass ダイアログ検出 → 承諾
-    if launch.skip_permissions && worker_agent == orchestrator::agent::WorkerAgent::Claude {
-        let _ = crate::claude_tui::ensure_bypass_accepted_in(claude_config_dir.as_deref()).map_err(
-            |e| {
-                eprintln!("warning: Bypass 事前承認の書き込みに失敗（ダイアログ検出で継続）: {e}");
-            },
-        );
-    }
-
     let pane_role = match label {
         Some(l) => format!("orchestrator-worker:{project}:{l}"),
         None => format!("orchestrator-worker:{project}"),
     };
-    // attach_session は非同期（pending_attach）なのでセッションはまだ存在しない。
-    // かつ、起動した直後の PTY へ書いたバイトは器（psmux）に落とされる（#640 実測:
-    // PTY 起動から 0〜500ms の書き込みは全損、1500〜3000ms は途中欠落）。
-    // 「シェルの準備待ち → エコー確認 → 分離 Enter → 実行確認」を回す送達確認フローで送る。
-    //
-    // プロンプトは claude TUI の起動完了を画面内容で確認してから送達確認つきで送る。
-    // ステートマシン駆動: alt_screen 遷移 → 信頼ダイアログ承諾 → ❯ 表示待ち →
-    // bracketed paste → 分離 Enter → 入力欄の空検証 + Enter 再送（Issue #32）。
-    // マルチラインは bracketed paste でそのまま渡るため改行の平坦化はしない
-    //
-    // #2413: メモリが逼迫しているあいだ（メモリ圧 warn / critical・swap・空きの予約割れ）は起動を待たせる。
-    // ペイン・レジストリ・台帳は今作り、起動コマンドと依頼文は起動待ちへ預けてすぐ答える
-    // （MCP の呼び出しを固めない）。圧が戻ると GUI の tick が同じ 2 つのフローを積む
-    let launch_gate = launch_agent_gated(
-        host,
-        origin,
-        crate::launch_gate::LaunchRequest {
-            pane: new_id.as_u64(),
-            kind: crate::launch_gate::LaunchKind::Spawn,
-            agent: worker_agent.as_str().to_string(),
-            label: window_title.clone(),
-            role: Some(pane_role.clone()),
-            action: crate::launch_gate::LaunchAction::Command {
-                command: worker_cmd.clone(),
-                prompt: Some(crate::launch_gate::FirstPrompt::Spawn(prompt.to_string())),
-            },
-        },
-    );
 
     // タイトルと role 設定
     // #1945: 一括ボタンの全体の既定（spawn 引数・プロファイルが何も言わないときの最後の段）
@@ -19652,26 +19769,22 @@ fn dispatch_orchestrator_spawn(
         .expect("直前に split で追加済み");
     pane_obj.set_title(Some(window_title.clone()));
     pane_obj.set_spawned_by(Some(target));
-    pane_obj.set_role(Some(pane_role));
+    pane_obj.set_role(Some(pane_role.clone()));
     // 利用上限後の自動復帰（FR-2.27 / #813）の既定を worker ペインへ適用する（#822）。
     // 解決順は spawn 引数 → プロファイル → 全体の既定（#1945）。ON のときだけ監査行を残す
-    // （既定 OFF の spawn で persist.log を埋めない）
+    // （既定 OFF の spawn で persist.log を埋めない。行は記録の段 = 修正前と同じ順で出す）
     let limit_resume_applied =
         orchestrator::resolve_worker_limit_resume_in(&profile, limit_resume, all_default);
     pane_obj.set_limit_autoresume(limit_resume_applied);
-    if limit_resume_applied {
-        let source = if limit_resume.is_some() {
+    let limit_resume_source = limit_resume_applied.then(|| {
+        if limit_resume.is_some() {
             "spawn"
         } else if profile.limit_resume.is_some() {
             "profile"
         } else {
             "all"
-        };
-        crate::diag::persist_log(&format!(
-            "[limit-autoresume] pane={} enabled=true 発生源 spawn:{source}",
-            new_id.as_u64()
-        ));
-    }
+        }
+    });
 
     // #1439: worker 領域のフォントを当て直す（**新しいペインだけでなく領域まるごと**。
     // grid は 1 体足すと既存の列も細くなるので、新しいペインだけ縮めても
@@ -19693,178 +19806,391 @@ fn dispatch_orchestrator_spawn(
         .reserve_backend_session(new_id)
         .or_else(|| host.backend_session(new_id));
 
-    // セッションカタログへ spawn 記録を残す（Issue #112 A）。session_id は claude 起動後に
-    // GUI の定期スキャンが検出して昇格する。失敗してもカタログの都合で spawn は止めない。
-    //
-    // #728: 器が無い構成（Windows で psmux 未導入 / tmux 不在の macOS）では
-    // `tmux_session` が None になる。以前はこのブロックごと飛ばしていたので、
-    // spawn 時のメタ（プロンプト・Issue 番号・model）が永久に記録されず、
-    // カタログが「発見性」という存在意義を果たせなかった。キーはペイン ID へ倒す
-    //
-    // #2199: Issue 番号はラベル → プロンプトの書いた順で 1 回だけ拾い、カタログ・台帳・
-    // レジストリへ同じ値を渡す（先頭 = 主の Issue。台帳の `issue` はその 1 件）
-    let spawn_issues = crate::sessions::spawn_issues(label, prompt);
-    {
-        let record = crate::sessions::PendingSpawn {
-            tmux_session: tmux_session.clone(),
-            kind: "worker".into(),
-            label: label.map(str::to_string),
-            project: Some(project.to_string()),
-            agent: Some(worker_agent.as_str().to_string()),
-            model: launch.model.clone(),
-            effort: launch.effort.clone(),
-            issues: spawn_issues.clone(),
-            prompt_head: Some(crate::sessions::prompt_head(prompt, 200)),
-            cwd: Some(cwd.clone()),
-            tab: Some(tab_id.as_u64()),
-            pane: Some(new_id.as_u64()),
-            recorded_at: crate::sessions::now_iso(),
-        };
-        if let Err(e) = crate::sessions::record_spawn(record) {
-            eprintln!("warning: セッションカタログへの spawn 記録に失敗: {e}");
+    Ok(SpawnPlaced {
+        project: project.to_string(),
+        prompt: prompt.to_string(),
+        label: label.map(str::to_string),
+        task_type: task_type.map(str::to_string),
+        mcp_keep: crate::worker_mcp::keep_for_project(&config, project),
+        cwd,
+        worker_agent,
+        agent_cli_path,
+        profile_env,
+        launch,
+        remote_control,
+        account_name: account_name.map(str::to_string),
+        profile_warning,
+        caller_profile,
+        window_title,
+        role_value,
+        pane_role,
+        tako_bin,
+        new_id,
+        tab_id,
+        target,
+        placement_kind,
+        placement_reason,
+        placement_cols,
+        placement_min,
+        font_fits,
+        limit_resume_applied,
+        limit_resume_source,
+        tmux_session,
+    })
+}
+
+impl SpawnPlaced {
+    /// spawn の記録と I/O の段（#2646。UI スレッドに縛られない）。workspace にも host にも触らない。
+    ///
+    /// どれも spawn を止めない（失敗は応答の warnings / stderr へ出す = 修正前と同じ）ので、この段は断らない
+    fn record(self) -> SpawnRecorded {
+        use crate::orchestrator;
+        let SpawnPlaced {
+            project,
+            prompt,
+            label,
+            task_type,
+            cwd,
+            mcp_keep,
+            worker_agent,
+            agent_cli_path,
+            profile_env,
+            launch,
+            remote_control,
+            account_name,
+            profile_warning,
+            caller_profile,
+            window_title,
+            role_value,
+            pane_role,
+            tako_bin,
+            new_id,
+            tab_id,
+            target,
+            placement_kind,
+            placement_reason,
+            placement_cols,
+            placement_min,
+            font_fits,
+            limit_resume_applied,
+            limit_resume_source,
+            tmux_session,
+        } = self;
+        let label = label.as_deref();
+        let new_fit = font_fits.iter().find(|f| f.pane == new_id).copied();
+        inject_orchestrator_io_delay();
+
+        // MCP の一時注入（#986）。codex だけが `-c` で受け取る（他系統は 1 バイトも変わらない）。
+        // master と同じ 1 実装（`agent::codex_mcp_args`）なので、worker だけ古い形になることが無い
+        // #2412: user scope の MCP を持ち込まない（既定は tako の MCP だけ。足すのはプロジェクトの
+        // mcp_servers）。読む user scope は起動する claude の config dir を含む（#558 と同じ解決）。
+        // codex は env 計画の CODEX_HOME の config.toml を読み、`-c` で止める（#2418）
+        let worker_mcp = crate::worker_mcp::prepare(
+            worker_agent,
+            std::path::Path::new(&cwd),
+            &profile_env,
+            &mcp_keep,
+            &launch.extra_args,
+        )
+        .materialized();
+        let worker_cmd =
+            orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
+                agent: worker_agent,
+                role: &role_value,
+                model: launch.model.as_deref(),
+                effort: launch.effort.as_deref(),
+                skip_permissions: launch.skip_permissions,
+                allow_sandbox_bypass: launch.allow_sandbox_bypass,
+                // Remote Control（#1068）: opt-in かつ適格なときだけ付く。
+                // 不適格なら flag は None になり、理由は `remote_control` に残る
+                remote_control: remote_control.enabled(),
+                extra_args: &launch.extra_args,
+                tako_bin: Some(&tako_bin),
+                mcp_settings: worker_mcp.settings_file.as_deref(),
+                mcp_codex_off: &worker_mcp.codex_off,
+                env: &profile_env,
+                // 新しい会話（再開は resume_launch::worker_resume_launch が同じ関数へ会話 ID を渡す = #2473）
+                resume: None,
+            });
+
+        // 事前信頼: 未信頼フォルダでエージェント CLI を起動すると信頼ダイアログが出て、
+        // 送信したプロンプトがダイアログへの応答として消費される（Issue #32 問題 1）。
+        // 起動前に各 CLI の設定ファイル（claude: <config dir>/.claude.json /
+        // codex: ~/.codex/config.toml / agy: ~/.gemini/antigravity-cli/settings.json）へ
+        // 信頼済みを書き込んでダイアログ自体を出さない。claude の書き先は起動する
+        // config dir 配下でなければ効かない（#558。アカウント指定で変わる）。
+        // 失敗しても PromptFlow のダイアログ検出 → 承諾がフォールバックするため継続する。
+        // **起動を積むのはこの段の後**（[`spawn_launch`]）なので、書き込みは起動より前に済む
+        let claude_config_dir = profile_env.claude_config_dir();
+        // #983 の変更 3: 事前信頼の書き込み失敗を**黙って握りつぶさない**。
+        // 致命ではない（tako がダイアログを検出して承諾する）が、そのぶん最初の指示が
+        // 届くまで遅くなる。理由と次の一手を応答の warnings へ載せる
+        let mut launch_warnings: Vec<Value> = Vec::new();
+        if let Some(w) = profile_warning {
+            crate::diag::persist_log(&format!("[spawn] pane={}: {w}", new_id.as_u64()));
+            launch_warnings.push(json!({
+                "kind": "profile_unreadable",
+                "agent": worker_agent.as_str(),
+                "message": w,
+            }));
         }
-    }
+        // #2412: 絞り込みが効かない / 名前が見つからないことは黙らせない（spawn は止めない）
+        for w in &worker_mcp.warnings {
+            crate::diag::persist_log(&format!(
+                "[spawn] pane={} worker の MCP: {w}",
+                new_id.as_u64()
+            ));
+            launch_warnings.push(json!({
+                "kind": "worker_mcp",
+                "agent": worker_agent.as_str(),
+                "message": w,
+            }));
+        }
+        let pre_trusted = orchestrator::agent::ensure_trusted_in(
+            worker_agent,
+            claude_config_dir.as_deref(),
+            &cwd,
+        )
+        .unwrap_or_else(|e| {
+            launch_warnings.push(launch_warning(
+                worker_agent,
+                crate::orchestrator::agent_cli::AgentCliProblem::TrustWriteFailed,
+                &e,
+            ));
+            false
+        });
 
-    // 委任台帳への自動記録（Issue #292 層1）。失敗しても spawn は止めない
-    let issue_str = spawn_issues.first().map(|n| format!("#{n}"));
-    let ledger_id = crate::orchestrator::ledger::record_spawn(
-        project,
-        label,
-        issue_str.as_deref(),
-        _task_type,
-        launch.model.as_deref().unwrap_or("(default)"),
-        launch.effort.as_deref(),
-        Some(worker_agent.as_str()),
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("warning: 委任台帳への記録に失敗: {e}");
-        String::new()
-    });
+        // Bypass Permissions 事前承認（#407）: skip_permissions=true の claude worker は
+        // --dangerously-skip-permissions で起動する。初回は確認ダイアログが出て既定選択
+        // 「No, exit」で即終了するため、起動前に config dir 配下の .claude.json へ
+        // 承認済みを書き込む。フォールバック: deliver_via_tmux の bypass ダイアログ検出 → 承諾
+        if launch.skip_permissions && worker_agent == orchestrator::agent::WorkerAgent::Claude {
+            let _ = crate::claude_tui::ensure_bypass_accepted_in(claude_config_dir.as_deref())
+                .map_err(|e| {
+                    eprintln!(
+                        "warning: Bypass 事前承認の書き込みに失敗（ダイアログ検出で継続）: {e}"
+                    );
+                });
+        }
 
-    // worker レジストリへ登録（Issue #390）。ペイン消失・tako 再起動後も
-    // watch / status / report が追跡を継続するための永続キー。失敗しても spawn は止めない
-    let worker_id =
-        crate::orchestrator::registry::record_spawn(crate::orchestrator::registry::RegisterSpawn {
-            label: label.map(str::to_string),
-            project: project.to_string(),
-            agent: worker_agent.as_str().to_string(),
-            model: launch.model.clone(),
-            effort: launch.effort.clone(),
-            pane: new_id.as_u64(),
-            tab: Some(tab_id.as_u64()),
-            tmux_session: tmux_session.clone(),
-            issues: spawn_issues,
-            ledger_id: Some(ledger_id.clone()).filter(|s| !s.is_empty()),
-            cwd: Some(cwd.clone()),
-            prompt_head: Some(crate::sessions::prompt_head(prompt, 200)),
-            profile: Some(caller_profile),
-        })
+        // 利用上限後の自動復帰を ON にした監査行（#822。発生源は配置の段で決めた）
+        if let Some(source) = limit_resume_source {
+            crate::diag::persist_log(&format!(
+                "[limit-autoresume] pane={} enabled=true 発生源 spawn:{source}",
+                new_id.as_u64()
+            ));
+        }
+
+        // セッションカタログへ spawn 記録を残す（Issue #112 A）。session_id は claude 起動後に
+        // GUI の定期スキャンが検出して昇格する。失敗してもカタログの都合で spawn は止めない。
+        //
+        // #728: 器が無い構成（Windows で psmux 未導入 / tmux 不在の macOS）では
+        // `tmux_session` が None になる。以前はこのブロックごと飛ばしていたので、
+        // spawn 時のメタ（プロンプト・Issue 番号・model）が永久に記録されず、
+        // カタログが「発見性」という存在意義を果たせなかった。キーはペイン ID へ倒す
+        //
+        // #2199: Issue 番号はラベル → プロンプトの書いた順で 1 回だけ拾い、カタログ・台帳・
+        // レジストリへ同じ値を渡す（先頭 = 主の Issue。台帳の `issue` はその 1 件）
+        let spawn_issues = crate::sessions::spawn_issues(label, &prompt);
+        {
+            let record = crate::sessions::PendingSpawn {
+                tmux_session: tmux_session.clone(),
+                kind: "worker".into(),
+                label: label.map(str::to_string),
+                project: Some(project.clone()),
+                agent: Some(worker_agent.as_str().to_string()),
+                model: launch.model.clone(),
+                effort: launch.effort.clone(),
+                issues: spawn_issues.clone(),
+                prompt_head: Some(crate::sessions::prompt_head(&prompt, 200)),
+                cwd: Some(cwd.clone()),
+                tab: Some(tab_id.as_u64()),
+                pane: Some(new_id.as_u64()),
+                recorded_at: crate::sessions::now_iso(),
+            };
+            if let Err(e) = crate::sessions::record_spawn(record) {
+                eprintln!("warning: セッションカタログへの spawn 記録に失敗: {e}");
+            }
+        }
+
+        // 委任台帳への自動記録（Issue #292 層1）。失敗しても spawn は止めない
+        let issue_str = spawn_issues.first().map(|n| format!("#{n}"));
+        let ledger_id = crate::orchestrator::ledger::record_spawn(
+            &project,
+            label,
+            issue_str.as_deref(),
+            task_type.as_deref(),
+            launch.model.as_deref().unwrap_or("(default)"),
+            launch.effort.as_deref(),
+            Some(worker_agent.as_str()),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("warning: 委任台帳への記録に失敗: {e}");
+            String::new()
+        });
+
+        // worker レジストリへ登録（Issue #390）。ペイン消失・tako 再起動後も
+        // watch / status / report が追跡を継続するための永続キー。失敗しても spawn は止めない。
+        // **起動を積む前に**登録する（送達フローが依頼文の到達をこのエントリへ書く = #790）
+        let worker_id = crate::orchestrator::registry::record_spawn(
+            crate::orchestrator::registry::RegisterSpawn {
+                label: label.map(str::to_string),
+                project: project.clone(),
+                agent: worker_agent.as_str().to_string(),
+                model: launch.model.clone(),
+                effort: launch.effort.clone(),
+                pane: new_id.as_u64(),
+                tab: Some(tab_id.as_u64()),
+                tmux_session: tmux_session.clone(),
+                issues: spawn_issues,
+                ledger_id: Some(ledger_id.clone()).filter(|s| !s.is_empty()),
+                cwd: Some(cwd.clone()),
+                prompt_head: Some(crate::sessions::prompt_head(&prompt, 200)),
+                profile: Some(caller_profile),
+            },
+        )
         .unwrap_or_else(|e| {
             eprintln!("warning: worker レジストリへの登録に失敗: {e}");
             String::new()
         });
 
-    // #368: spawn 完了 → claude session スキャンを即時トリガー
-    crate::request_claude_scan();
+        // #368: spawn 完了 → claude session スキャンを即時トリガー
+        crate::request_claude_scan();
 
-    // #1068: opt-in しているのに Remote Control が有効にならなかったときは理由を残す。
-    // ここで黙ると「スマホの一覧に出ない」の原因が辿れなくなる
-    if let Some(blocked) = &remote_control.blocked {
-        let message = ReplyNote::SpawnRemoteControlBlocked {
-            detail: blocked.detail().to_string(),
-            reason: blocked.reason(),
-            next_step: blocked.next_step(),
+        // #1068: opt-in しているのに Remote Control が有効にならなかったときは理由を残す。
+        // ここで黙ると「スマホの一覧に出ない」の原因が辿れなくなる
+        if let Some(blocked) = &remote_control.blocked {
+            let message = ReplyNote::SpawnRemoteControlBlocked {
+                detail: blocked.detail().to_string(),
+                reason: blocked.reason(),
+                next_step: blocked.next_step(),
+            }
+            .to_string();
+            eprintln!("warning: {message}");
+            launch_warnings.push(json!({
+                "kind": format!("remote_control_{}", blocked.kind()),
+                "agent": worker_agent.as_str(),
+                "message": message,
+                "detail": blocked.detail(),
+                "next_step": blocked.next_step().text(),
+            }));
         }
-        .to_string();
-        eprintln!("warning: {message}");
-        launch_warnings.push(json!({
-            "kind": format!("remote_control_{}", blocked.kind()),
+
+        // Part 4: env のキー一覧（値はマスク。Issue #500）
+        let env_keys: Vec<&str> = profile_env.export_keys();
+        // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスを応答に含める。
+        // inherit のアカウントでは設定しない = null + env_unset に現れる（#512）
+        let config_dir_value = profile_env.export_value(orchestrator::CLAUDE_CONFIG_DIR_ENV);
+
+        let reply = json!({
+            "pane_id": new_id.as_u64(),
+            "spawned_by": target.as_u64(),
+            // #1132: どのタブへ出したか（同じタブへ置けなかったときは master のタブと違う）
+            "tab": tab_id.as_u64(),
+            "placement": placement_kind,
+            "placement_reason": placement_reason,
+            // worker ペインの桁数（#1439 の当て直し後の実測。測れなければ既定フォントでの
+            // 見積もり）と、保証した下限（0 = 保証しない）
+            "pane_cols": placement_cols,
+            "min_worker_cols": placement_min,
+            // #1439: 適用したフォント倍率と絶対サイズ（null = 既定のまま = 縮めていない）
+            "font_scale": new_fit
+                .filter(|f| f.fit.scale < 1.0)
+                .map(|f| (f64::from(f.fit.scale) * 1000.0).round() / 1000.0),
+            "font_size": new_fit
+                .filter(|f| f.fit.scale < 1.0)
+                .and_then(|f| f.font_size)
+                .map(|s| (f64::from(s) * 100.0).round() / 100.0),
+            // 床まで縮めても下限に届かなかった（ウィンドウが狭い / worker が多すぎる）
+            "cols_short": new_fit.map(|f| f.fit.cols_short),
+            // 同じ当て直しで**既存の** worker も動く（grid は 1 体足すと列が細くなる）
+            "font_refit": font_fits
+                .iter()
+                .filter(|f| f.pane != new_id)
+                .map(|f| json!({
+                    "pane": f.pane.as_u64(),
+                    "font_scale": (f64::from(f.fit.scale) * 1000.0).round() / 1000.0,
+                    "cols": f.fit.cols,
+                    "cols_short": f.fit.cols_short,
+                }))
+                .collect::<Vec<_>>(),
+            "title": window_title,
+            "cwd": cwd,
             "agent": worker_agent.as_str(),
-            "message": message,
-            "detail": blocked.detail(),
-            "next_step": blocked.next_step().text(),
-        }));
+            // #983: tako がどの実行ファイルを起動したか（無ければ preflight で落ちている）
+            "agent_path": agent_cli_path,
+            // #2412: 持ち込んだ / 止めた MCP（mode = tako_only / keep_all / legacy / not_supported 等）
+            "mcp": worker_mcp.to_json(),
+            "model": launch.model,
+            // #1013: どの段が model を決めたか（explicit / account / agent_config /
+            // profile_policy / cli_default）。null の model が「CLI 既定に委ねた」のか
+            // 「設定を読み落とした」のかを master が区別できるようにする
+            "model_source": launch.model_source.as_str(),
+            "effort": launch.effort,
+            "effort_source": launch.effort_source.as_str(),
+            "command": worker_cmd,
+            // 旧フィールド名の互換（#120 以前のクライアント / ドキュメント向け）
+            "claude_command": worker_cmd,
+            "prompt": prompt,
+            "pre_trusted": pre_trusted,
+            "tmux_session": tmux_session,
+            "ledger_id": ledger_id,
+            "worker_id": Some(worker_id).filter(|s| !s.is_empty()),
+            "env_keys": env_keys,
+            // #512: 明示 unset する変数（inherit アカウントの CLAUDE_CONFIG_DIR 等）
+            "env_unset": profile_env.unsets,
+            "config_dir": config_dir_value,
+            "account": account_name,
+            // #822: この worker に適用された利用上限後の自動復帰（FR-2.27）。
+            // true なら `tako limit-resume --pane <id>` で切らない限り自動復帰の対象
+            "limit_resume": limit_resume_applied,
+            // #1068: この worker の会話が Claude 公式の Remote Control へ繋がるか。
+            // opt-in していても環境が不適格ならここは false（理由は warnings に入る）
+            "remote_control": remote_control.enabled(),
+            // #983: spawn は成立したが完全ではなかったもの（分類 + 理由 + 次の一手）。
+            // 空配列 = 何も問題が無かった
+            "warnings": launch_warnings,
+            // #2413: 起動待ち。`state` が `waiting` ならメモリの逼迫で agent をまだ起こしていない
+            // （`reason` / `position` / `waiting`。圧が戻ると起きる。急ぐなら `start_now` のコマンド）。
+            // `starting` = 起こした。null = 起動待ちを持たない tako（隔離 / A/B）。
+            // 値は起動の積み込み（[`spawn_launch`]）が埋める
+            "launch_gate": Value::Null,
+        });
+        SpawnRecorded {
+            reply,
+            // attach_session は非同期（pending_attach）で、起動した直後の PTY へ書いたバイトは器（psmux）に
+            // 落とされる（#640 実測: PTY 起動から 0〜500ms の書き込みは全損、1500〜3000ms は途中欠落）。
+            // 「シェルの準備待ち → エコー確認 → 分離 Enter → 実行確認」を回す送達確認フローで送る。
+            //
+            // プロンプトは claude TUI の起動完了を画面内容で確認してから送達確認つきで送る。
+            // ステートマシン駆動: alt_screen 遷移 → 信頼ダイアログ承諾 → ❯ 表示待ち →
+            // bracketed paste → 分離 Enter → 入力欄の空検証 + Enter 再送（Issue #32）。
+            // マルチラインは bracketed paste でそのまま渡るため改行の平坦化はしない
+            //
+            // #2413: メモリが逼迫しているあいだ（メモリ圧 warn / critical・swap・空きの予約割れ）は起動を待たせる。
+            // ペイン・レジストリ・台帳は今作り、起動コマンドと依頼文は起動待ちへ預けてすぐ答える
+            // （MCP の呼び出しを固めない）。圧が戻ると GUI の tick が同じ 2 つのフローを積む
+            launch: crate::launch_gate::LaunchRequest {
+                pane: new_id.as_u64(),
+                kind: crate::launch_gate::LaunchKind::Spawn,
+                agent: worker_agent.as_str().to_string(),
+                label: window_title,
+                role: Some(pane_role),
+                action: crate::launch_gate::LaunchAction::Command {
+                    command: worker_cmd,
+                    prompt: Some(crate::launch_gate::FirstPrompt::Spawn(prompt)),
+                },
+            },
+        }
     }
+}
 
-    // Part 4: env のキー一覧（値はマスク。Issue #500）
-    let env_keys: Vec<&str> = profile_env.export_keys();
-    // CLAUDE_CONFIG_DIR が設定されている場合、config dir パスを応答に含める。
-    // inherit のアカウントでは設定しない = null + env_unset に現れる（#512）
-    let config_dir_value = profile_env.export_value(orchestrator::CLAUDE_CONFIG_DIR_ENV);
-
-    Ok(json!({
-        "pane_id": new_id.as_u64(),
-        "spawned_by": target.as_u64(),
-        // #1132: どのタブへ出したか（同じタブへ置けなかったときは master のタブと違う）
-        "tab": tab_id.as_u64(),
-        "placement": placement_kind,
-        "placement_reason": placement_reason,
-        // worker ペインの桁数（#1439 の当て直し後の実測。測れなければ既定フォントでの
-        // 見積もり）と、保証した下限（0 = 保証しない）
-        "pane_cols": placement_cols,
-        "min_worker_cols": placement_min,
-        // #1439: 適用したフォント倍率と絶対サイズ（null = 既定のまま = 縮めていない）
-        "font_scale": new_fit
-            .filter(|f| f.fit.scale < 1.0)
-            .map(|f| (f64::from(f.fit.scale) * 1000.0).round() / 1000.0),
-        "font_size": new_fit
-            .filter(|f| f.fit.scale < 1.0)
-            .and_then(|f| f.font_size)
-            .map(|s| (f64::from(s) * 100.0).round() / 100.0),
-        // 床まで縮めても下限に届かなかった（ウィンドウが狭い / worker が多すぎる）
-        "cols_short": new_fit.map(|f| f.fit.cols_short),
-        // 同じ当て直しで**既存の** worker も動く（grid は 1 体足すと列が細くなる）
-        "font_refit": font_fits
-            .iter()
-            .filter(|f| f.pane != new_id)
-            .map(|f| json!({
-                "pane": f.pane.as_u64(),
-                "font_scale": (f64::from(f.fit.scale) * 1000.0).round() / 1000.0,
-                "cols": f.fit.cols,
-                "cols_short": f.fit.cols_short,
-            }))
-            .collect::<Vec<_>>(),
-        "title": window_title,
-        "cwd": cwd,
-        "agent": worker_agent.as_str(),
-        // #983: tako がどの実行ファイルを起動したか（無ければ preflight で落ちている）
-        "agent_path": agent_cli_path,
-        // #2412: 持ち込んだ / 止めた MCP（mode = tako_only / keep_all / legacy / not_supported 等）
-        "mcp": worker_mcp.to_json(),
-        "model": launch.model,
-        // #1013: どの段が model を決めたか（explicit / account / agent_config /
-        // profile_policy / cli_default）。null の model が「CLI 既定に委ねた」のか
-        // 「設定を読み落とした」のかを master が区別できるようにする
-        "model_source": launch.model_source.as_str(),
-        "effort": launch.effort,
-        "effort_source": launch.effort_source.as_str(),
-        "command": worker_cmd,
-        // 旧フィールド名の互換（#120 以前のクライアント / ドキュメント向け）
-        "claude_command": worker_cmd,
-        "prompt": prompt,
-        "pre_trusted": pre_trusted,
-        "tmux_session": tmux_session,
-        "ledger_id": ledger_id,
-        "worker_id": Some(worker_id).filter(|s| !s.is_empty()),
-        "env_keys": env_keys,
-        // #512: 明示 unset する変数（inherit アカウントの CLAUDE_CONFIG_DIR 等）
-        "env_unset": profile_env.unsets,
-        "config_dir": config_dir_value,
-        "account": account_name,
-        // #822: この worker に適用された利用上限後の自動復帰（FR-2.27）。
-        // true なら `tako limit-resume --pane <id>` で切らない限り自動復帰の対象
-        "limit_resume": limit_resume_applied,
-        // #1068: この worker の会話が Claude 公式の Remote Control へ繋がるか。
-        // opt-in していても環境が不適格ならここは false（理由は warnings に入る）
-        "remote_control": remote_control.enabled(),
-        // #983: spawn は成立したが完全ではなかったもの（分類 + 理由 + 次の一手）。
-        // 空配列 = 何も問題が無かった
-        "warnings": launch_warnings,
-        // #2413: 起動待ち。`state` が `waiting` ならメモリの逼迫で agent をまだ起こしていない
-        // （`reason` / `position` / `waiting`。圧が戻ると起きる。急ぐなら `start_now` のコマンド）。
-        // `starting` = 起こした。null = 起動待ちを持たない tako（隔離 / A/B）
-        "launch_gate": launch_gate,
-    }))
+/// spawn の起動の積み込み（#2646。UI スレッド）。記録を済ませた worker の起動コマンドと依頼文を
+/// 起動ゲートへ預ける / 積み（[`launch_agent_gated`]）、応答の `launch_gate` を埋める
+fn spawn_launch(host: &mut dyn ControlHost, origin: PaneOrigin, recorded: SpawnRecorded) -> Value {
+    let SpawnRecorded { mut reply, launch } = recorded;
+    reply["launch_gate"] = launch_agent_gated(host, origin, launch).unwrap_or(Value::Null);
+    reply
 }
 
 /// 起動時の非致命な失敗を「分類 + 理由 + 次の一手 + 生の詳細」で返す（#983 の変更 3）。
@@ -19922,7 +20248,30 @@ fn tail_join(mut lines: Vec<String>) -> String {
     lines.join("\n")
 }
 
+/// UI スレッドで写した材料から状態照会の文脈を組む（同期の腕・A/B の腕は写してその場で組む = 1 実装）
 fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStatusCtx {
+    worker_status_seed(host, pane_id).into_ctx()
+}
+
+/// worker の状態の照会で UI スレッドが写す材料（#2646）。**メモリだけを読む**: 画面は `Send` な手
+/// （[`tako_core::PaneAccess`]）を写すだけで、端末のロックを取って採るのは [`WorkerStatusSeed::into_ctx`]
+/// （IPC / MCP の受け口では background）。本番の `offload_prepare:OrchestratorWorkerStatus` は p50 33ms で、
+/// 段 1 の隔離 GUI（レジストリの読み 0.3〜4ms・画面の採取 0.1ms）では再現しなかった = 残りは動いている
+/// agent の出力を PTY のスレッドが解釈している間の端末のロック待ちと見て、画面の採取ごと外す
+pub struct WorkerStatusSeed {
+    pane_id: u64,
+    pane_exists: bool,
+    backend_session: Option<String>,
+    /// ペインの画面を読む手（ペインが GUI に無ければ None）
+    screen: Option<tako_core::PaneAccess>,
+    /// 利用上限後の自動復帰の状態（#813）
+    limit_resume: Value,
+    /// tako mod の報告（#1880）
+    mod_state: crate::claude_mod::ModSnapshot,
+}
+
+/// ペインの材料を写す（#2646。UI スレッド）
+fn worker_status_seed(host: &dyn ControlHost, pane_id: u64) -> WorkerStatusSeed {
     // ペインの存在確認（ツリー上 + shelved の両方を走査）
     let target = PaneId::from_raw(pane_id);
     let in_tree = host.workspace().tabs().iter().any(|tab| {
@@ -19931,32 +20280,131 @@ fn collect_worker_status_ctx(host: &dyn ControlHost, pane_id: u64) -> WorkerStat
             .iter()
             .any(|p| p.id().as_u64() == pane_id)
     });
-    // 画面と入力欄の属性は**同じセッション・同じ呼び出し**から採る
-    // （別々に引き直すと、別フレームの画面と属性を突き合わせることになる）
-    let session = host.session(target);
-    let lines = session.map(|session| session.visible_lines());
-    let full_screen = lines.as_ref().map(|l| l.join("\n"));
-    // #1297: 入力欄の「文字があるか」ではなく「**人が打った**文字があるか」を
-    // 決めるための属性。claude は空欄へ AI のゴースト提案を dim で描くので、
-    // 文字列だけだと下書きと見分けられず #1273 の腕が死ぬ。
-    // 取り口は `read_pane` の `input_status` と同じ 1 実装（`analyze_input`）
-    let input_style = session
-        .and_then(|session| session.analyze_input())
-        .map(|status| status.style);
-    let backend_session = host.backend_session(target);
-    WorkerStatusCtx {
+    WorkerStatusSeed {
         pane_id,
         pane_exists: in_tree || host.workspace().is_shelved(target),
-        backend_session,
-        // 子プロセスの有無は `tmux list-panes` + `ps` の 2 プロセスを起こすので、ここ
-        // （UI スレッド）では数えない。後段の [`probe_running_children`] が background で埋める（#1968）
-        has_running_children: false,
-        live_tail: lines.map(tail_join),
-        full_screen,
-        input_style,
+        backend_session: host.backend_session(target),
+        screen: host.session(target).map(|session| session.access()),
         limit_resume: limit_resume_entry(host, target),
         mod_state: crate::claude_mod::ModSnapshot::capture(host, target),
     }
+}
+
+impl WorkerStatusSeed {
+    /// 画面を採って状態照会の文脈を組む（UI スレッドに縛られない）
+    fn into_ctx(self) -> WorkerStatusCtx {
+        // 画面と入力欄の属性は**同じ 1 枚**から採る
+        // （別々に引き直すと、別フレームの画面と属性を突き合わせることになる）。
+        // #1297: 入力欄の「文字があるか」ではなく「**人が打った**文字があるか」を
+        // 決めるための属性。claude は空欄へ AI のゴースト提案を dim で描くので、
+        // 文字列だけだと下書きと見分けられず #1273 の腕が死ぬ。
+        // 取り口は `read_pane` の `input_status` と同じ 1 実装（`analyze_input_line`）
+        let (lines, input_style) = match &self.screen {
+            Some(access) => {
+                let (lines, input) = access.lines_and_input();
+                (Some(lines), input.map(|status| status.style))
+            }
+            None => (None, None),
+        };
+        let full_screen = lines.as_ref().map(|l| l.join("\n"));
+        WorkerStatusCtx {
+            pane_id: self.pane_id,
+            pane_exists: self.pane_exists,
+            backend_session: self.backend_session,
+            // 子プロセスの有無は `tmux list-panes` + `ps` の 2 プロセスを起こすので、ここでは
+            // 数えない。後段の [`probe_running_children`] が background で埋める（#1968）
+            has_running_children: false,
+            live_tail: lines.map(tail_join),
+            full_screen,
+            input_style,
+            limit_resume: self.limit_resume,
+            mod_state: self.mod_state,
+        }
+    }
+}
+
+/// worker の状態の照会の準備（#2646。UI スレッド）。ペインが分かっていれば材料を写し、
+/// 追跡キーの解決（[`resolve_worker_query`] = workers.yaml の読み）と画面の採取は background へ回す。
+/// worker 指定はペインがレジストリから決まるので、解決の後にもう一度 UI スレッドで写す
+fn worker_status_prepare(
+    host: &dyn ControlHost,
+    pane_id: Option<u64>,
+    worker: Option<String>,
+    session_id: Option<String>,
+    tmux_session: Option<String>,
+) -> Result<OffloadJob, DispatchError> {
+    // 解決と同じ断り（worker が無ければ pane_id が要る）を、同じ時点（準備）で返す
+    if worker.is_none() && pane_id.is_none() {
+        return Err(Reason::EitherOf("pane_id", "worker").invalid());
+    }
+    // worker 指定は引数の pane_id を使わない（解決と同じ）
+    let seed = match (&worker, pane_id) {
+        (None, Some(pane)) => Some(Box::new(worker_status_seed(host, pane))),
+        _ => None,
+    };
+    Ok(OffloadJob::WorkerStatusQuery(Box::new(WorkerStatusJob {
+        query: WorkerStatusTarget::Pending {
+            pane_id,
+            worker,
+            session_id,
+            tmux_session,
+        },
+        seed,
+    })))
+}
+
+/// worker の状態の照会の background の段（#2646。[`OffloadJob::WorkerStatusQuery`]）
+pub struct WorkerStatusJob {
+    query: WorkerStatusTarget,
+    /// 写したペインの材料（ペインが分かっていたとき）。無ければ解決の後に UI スレッドで写す
+    seed: Option<Box<WorkerStatusSeed>>,
+}
+
+/// 照会の対象（#2646）
+enum WorkerStatusTarget {
+    /// 解決前の引数（同期の腕の [`resolve_worker_query`] へそのまま渡す）
+    Pending {
+        pane_id: Option<u64>,
+        worker: Option<String>,
+        session_id: Option<String>,
+        tmux_session: Option<String>,
+    },
+    /// 解決済み（worker 指定で材料を写した後）
+    Resolved(WorkerQuery),
+}
+
+impl WorkerStatusJob {
+    fn run(self) -> OffloadOutcome {
+        let q = match self.query {
+            WorkerStatusTarget::Pending {
+                pane_id,
+                worker,
+                session_id,
+                tmux_session,
+            } => match resolve_worker_query(pane_id, worker.as_deref(), session_id, tmux_session) {
+                Ok(q) => q,
+                Err(e) => return OffloadOutcome::Reply(Err(e)),
+            },
+            WorkerStatusTarget::Resolved(q) => q,
+        };
+        match self.seed {
+            Some(seed) => OffloadOutcome::Reply(worker_status_from_seed(*seed, q)),
+            None => OffloadOutcome::OnUi(OffloadContinuation::WorkerStatusSeed(Box::new(q))),
+        }
+    }
+}
+
+/// 写した材料と解決した追跡キーから状態を組む（#2646。同期の腕と同じ同一性の検証 → 子プロセスの有無 →
+/// [`finish_worker_status`]）
+fn worker_status_from_seed(seed: WorkerStatusSeed, q: WorkerQuery) -> Result<Value, DispatchError> {
+    let ctx = verify_ctx_pane_identity(seed.into_ctx(), q.tmux_session.as_deref());
+    OffloadJob::WorkerStatus {
+        ctx,
+        session_id: q.session_id,
+        tmux_session: q.tmux_session,
+        children_probed: false,
+    }
+    .run_reply()
 }
 
 /// 器の配下に実行中の子プロセスがあるかを埋める（#224）。**UI スレッドで呼ばない**（#1968）。
@@ -28072,7 +28520,8 @@ fn dispatch_task_resume(
     Ok(result)
 }
 
-struct LedgerParams {
+/// 委任台帳の操作の引数（同期の腕と #2646 の background のジョブ [`OffloadJob::OrchestratorLedger`] が同じ形で渡す）
+pub struct LedgerParams {
     action: String,
     id: Option<String>,
     outcome: Option<String>,
@@ -28159,6 +28608,7 @@ fn dispatch_orchestrator_ledger(p: LedgerParams) -> Result<Value, DispatchError>
         limit,
     } = p;
     use crate::orchestrator::ledger;
+    inject_orchestrator_io_delay();
     match action.as_str() {
         "list" => {
             let ledger = ledger::Ledger::load_typed().map_err(ConfigError::operation)?;
