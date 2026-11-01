@@ -20,14 +20,26 @@
 //!    [`TTL_SECS`] を過ぎた印は効かない（status は #2455 の `pidless_listener` と stop の案内へ戻る）
 //! 3. **status へ載せる形**（[`status_field`] / [`detail`]）。読む側（CLI・MCP）は再計算しない
 //!
+//! 印が効いている間に**明示の start / stop が来たら断る**（#2613。断りの文は
+//! `RemoteRefusal::DaemonStarting` / `DaemonStartingStop`、誰が何をしている途中かの 1 文は [`doing_in`]）。
+//! 区間内の start は、入れ替えの途中の旧版を自分も「入れ替える相手」と読んで止めに行き、子を起こして
+//! daemon を 2 本にする（PID ファイルに載らない孤児が残る）か、印を上書きして抜けるときに消す
+//! （status が stop の案内へ戻る）。区間内の stop は、止めても進行中の起動が新版を起こし直すか、
+//! PID ファイルも管理トークンも無いので止められない（どちらも段 1 で実測）。
+//!
 //! 短命な稼働状態なので #916 の移行台帳には載せない（`LastAutostart` / `ServeHealth` と同じ。
 //! 次の起動で必ず書き直され、読めなければ「印が無い」として扱えばよいだけ）。
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tako_core::i18n::Lang;
 
 /// A/B: #2608 前へ戻す（status が印を見ない = 起こしている途中も `pidless_listener` と stop の案内）
 pub const LEGACY_ENV: &str = "TAKO_2608_LEGACY";
+
+/// A/B: #2613 前へ戻す（印が効いていても明示の start / stop が断らない = 2 本目の daemon を起こしうる）。
+/// status の A/B（[`LEGACY_ENV`]）とは分ける（片方だけを戻して比べられるように）
+pub const START_LEGACY_ENV: &str = "TAKO_2613_LEGACY";
 
 /// 印が効く上限（秒）。`spawn_daemon` が抜けるまでの最長より長くとる:
 /// 旧版の停止（管理 API 3 秒 + 終了待ち 5 秒 + 撃って 5 秒）+ 起動情報の待ち 30 秒 + 子の終了待ち 2 秒
@@ -42,6 +54,11 @@ pub const STATE_REPLACING: &str = "replacing";
 /// #2608 前の status へ戻すか
 pub fn legacy_mode() -> bool {
     std::env::var(LEGACY_ENV).is_ok_and(|v| v == "1" || v == "true" || v == "on")
+}
+
+/// #2613 前の明示の start / stop へ戻すか
+pub fn start_legacy_mode() -> bool {
+    std::env::var(START_LEGACY_ENV).is_ok_and(|v| v == "1" || v == "true" || v == "on")
 }
 
 /// 「daemon を起こしている途中」の印（`<state_dir>/tako-remote.starting`）
@@ -95,27 +112,47 @@ pub fn is_active(
     now.saturating_sub(marker.at) <= TTL_SECS && marker.at.saturating_sub(now) <= TTL_SECS
 }
 
-/// 頼んだ経路を人が読む名前へ（既知の値だけ。#2533 の経路の語彙）
-fn via_label(via: &str) -> &'static str {
-    match via {
-        "autostart" => "GUI 起動時の自動復帰",
-        "cli" => "`tako remote start`",
-        "dispatch" => "MCP / GUI からの起動の要求",
-        "panel" => "リモートカードの起動ボタン",
-        _ => "起動の要求",
+/// 頼んだ経路を人が読む名前へ（既知の値だけ。#2533 の経路の語彙）。
+/// (経路, 言語) の網羅 match で、英語は文の途中に置く形（小文字で始める）
+fn via_label_in(via: &str, lang: Lang) -> &'static str {
+    match (via, lang) {
+        ("autostart", Lang::Ja) => "GUI 起動時の自動復帰",
+        ("autostart", Lang::En) => "the GUI's automatic restore at launch",
+        ("cli", _) => "`tako remote start`",
+        ("dispatch", Lang::Ja) => "MCP / GUI からの起動の要求",
+        ("dispatch", Lang::En) => "a start request from MCP / the GUI",
+        ("panel", Lang::Ja) => "リモートカードの起動ボタン",
+        ("panel", Lang::En) => "the start button of the remote card",
+        (_, Lang::Ja) => "起動の要求",
+        (_, Lang::En) => "a start request",
+    }
+}
+
+/// 誰が何をしている途中かの 1 文（句点なし。status の [`detail`] と #2613 の断りが共有する）。
+/// 日本語は #2608 の `detail` の前半とバイト一致
+pub fn doing_in(marker: &StartingMarker, now: u64, lang: Lang) -> String {
+    let elapsed = now.saturating_sub(marker.at);
+    let who = via_label_in(&marker.via, lang);
+    match (marker.previous_pid, lang) {
+        (Some(pid), Lang::Ja) => format!(
+            "{who}がリモート daemon を新版へ入れ替えている途中です（旧版の PID {pid}・開始から {elapsed} 秒）"
+        ),
+        (Some(pid), Lang::En) => format!(
+            "The remote daemon is being replaced with the new version by {who} \
+             (old PID {pid}, started {elapsed} s ago)"
+        ),
+        (None, Lang::Ja) => {
+            format!("{who}がリモート daemon を起動している途中です（開始から {elapsed} 秒）")
+        }
+        (None, Lang::En) => {
+            format!("The remote daemon is being started by {who} (started {elapsed} s ago)")
+        }
     }
 }
 
 /// 人が読む 1 行（`warnings` と CLI の stderr に出す）。**stop を案内しない**のが要点
 pub fn detail(marker: &StartingMarker, now: u64) -> String {
-    let elapsed = now.saturating_sub(marker.at);
-    let who = via_label(&marker.via);
-    let doing = match marker.previous_pid {
-        Some(pid) => format!(
-            "{who}がリモート daemon を新版へ入れ替えている途中です（旧版の PID {pid}・開始から {elapsed} 秒）"
-        ),
-        None => format!("{who}がリモート daemon を起動している途中です（開始から {elapsed} 秒）"),
-    };
+    let doing = doing_in(marker, now, Lang::Ja);
     format!(
         "{doing}。新しい daemon は待ち受けを開いてから PID ファイルを書くまで数十秒かかることがあり、\
          その間は `running: false` に見えます。止めたり起動し直したりせず、しばらく待ってから \
@@ -222,8 +259,31 @@ mod tests {
             ("unspecified", "起動の要求"),
             ("<script>", "起動の要求"),
         ] {
-            assert_eq!(via_label(via), want);
+            assert_eq!(via_label_in(via, Lang::Ja), want);
         }
+        for (via, want) in [
+            ("autostart", "the GUI's automatic restore at launch"),
+            ("cli", "`tako remote start`"),
+            ("dispatch", "a start request from MCP / the GUI"),
+            ("panel", "the start button of the remote card"),
+            ("<script>", "a start request"),
+        ] {
+            assert_eq!(via_label_in(via, Lang::En), want);
+        }
+    }
+
+    #[test]
+    fn 途中の1文は日英を持ち英語に日本語が混ざらない() {
+        for m in [marker(1000, Some(77)), marker(1000, None)] {
+            let ja = doing_in(&m, 1004, Lang::Ja);
+            let en = doing_in(&m, 1004, Lang::En);
+            assert!(detail(&m, 1004).starts_with(&format!("{ja}。")), "{ja}");
+            assert!(en.is_ascii(), "{en}");
+            assert!(en.contains("4 s ago"), "{en}");
+            assert!(en.contains("the GUI's automatic restore at launch"), "{en}");
+        }
+        assert!(doing_in(&marker(1000, Some(77)), 1000, Lang::En).contains("old PID 77"));
+        assert!(doing_in(&marker(1000, None), 1000, Lang::En).contains("being started"));
     }
 
     #[test]

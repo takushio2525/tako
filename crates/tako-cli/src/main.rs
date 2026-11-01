@@ -6258,6 +6258,8 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
 /// ペアリング承認ダイアログが表示される）
 fn remote_start() -> Result<(), String> {
     use tako_control::remote::{with_origin, RequestOrigin};
+    // 起動の途中の断り（`RemoteRefusal::DaemonStarting`。#2613）は表示言語で文にするので、呼ぶ前に決める
+    init_local_lang();
     // #2533: audit.log に「CLI から頼んだ」と残す
     let result = with_origin(RequestOrigin::Cli, tako_control::remote::spawn_daemon)?;
     println!("{}", pretty_json(&result));
@@ -6303,6 +6305,8 @@ fn remote_start() -> Result<(), String> {
 /// `tako remote stop` — デーモンを PID ファイルから kill する
 fn remote_stop(force: bool) -> Result<(), String> {
     use tako_control::remote::{with_origin, RequestOrigin};
+    // 起動の途中の断り（`RemoteRefusal::DaemonStartingStop`。#2613）は表示言語で文にするので、呼ぶ前に決める
+    init_local_lang();
     // #2533: audit.log に「CLI から頼んだ」と残す
     let result = if force {
         with_origin(RequestOrigin::Cli, tako_control::remote::daemon_force_stop)?

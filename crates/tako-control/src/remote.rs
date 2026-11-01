@@ -417,11 +417,8 @@ impl Drop for StartingGuard {
 
 /// いま効いている「起こしている途中」の印（#2608）。判定は `remote_starting::is_active` の
 /// 1 実装で、ここは材料（書き手の生死・起動時刻・今の時刻）を集めるだけ。
-/// A/B（`TAKO_2608_LEGACY=1`）では見ない = #2608 前の status
-fn start_in_progress() -> Option<crate::remote_starting::StartingMarker> {
-    if crate::remote_starting::legacy_mode() {
-        return None;
-    }
+/// A/B は読む側が持つ（status = [`start_in_progress`]・明示の start / stop = [`start_blocks_request`]）
+fn active_start_marker() -> Option<crate::remote_starting::StartingMarker> {
     let marker = read_starting_marker()?;
     let alive = is_process_alive(marker.pid);
     let started = if alive {
@@ -430,6 +427,38 @@ fn start_in_progress() -> Option<crate::remote_starting::StartingMarker> {
         None
     };
     crate::remote_starting::is_active(&marker, now_epoch_secs(), alive, started).then_some(marker)
+}
+
+/// status が読む「起こしている途中」（#2608）。A/B（`TAKO_2608_LEGACY=1`）では見ない = #2608 前の status
+fn start_in_progress() -> Option<crate::remote_starting::StartingMarker> {
+    if crate::remote_starting::legacy_mode() {
+        return None;
+    }
+    active_start_marker()
+}
+
+/// 明示の start / stop を断る理由になる「起こしている途中」（#2613）。
+/// A/B（`TAKO_2613_LEGACY=1`）では見ない = 印が効いていても起こしに行く / 止めに行く
+fn start_blocks_request() -> Option<crate::remote_starting::StartingMarker> {
+    if crate::remote_starting::start_legacy_mode() {
+        return None;
+    }
+    active_start_marker()
+}
+
+/// 起こしている途中で断ったことを audit.log へ残す（#2613。頼んだ側の記録 `daemon_*_requested` の続き）
+fn audit_refused_while_starting(event: &str, marker: &crate::remote_starting::StartingMarker) {
+    audit_serve(
+        event,
+        json!({
+            "reason": "starting",
+            "state": marker.state(),
+            "since": marker.at,
+            "starter_pid": marker.pid,
+            "starter_via": marker.via,
+            "previous_pid": marker.previous_pid,
+        }),
+    );
 }
 
 /// serve の増減を audit.log へ残す（#1049: 「何が消したか」を後から追えるように）。
@@ -3281,13 +3310,34 @@ fn parse_etime(s: &str) -> Option<u64> {
 pub fn daemon_stop() -> Result<Value, String> {
     // #2533: 誰が・どの経路で止めたかを、止める前に残す
     audit_daemon_request("daemon_stop_requested", "stop", recorded_daemon_pid());
+    refuse_stop_while_starting()?;
     forget_if_stopped(daemon_stop_impl(false))
 }
 
 /// `--force` 付き停止。SIGTERM を試みた後 SIGKILL を送る
 pub fn daemon_force_stop() -> Result<Value, String> {
     audit_daemon_request("daemon_stop_requested", "force_stop", recorded_daemon_pid());
+    refuse_stop_while_starting()?;
     forget_if_stopped(daemon_stop_impl(true))
+}
+
+/// 別の起動が daemon を起こしている途中（#2608 の印が効いている）なら止めずに断る（#2613）。
+///
+/// 区間内の stop は止まっていることを作れない（段 1 で実測）: 入れ替えの途中なら旧版は止まって
+/// 「停止しました」と返るが、進行中の起動がそのまま新版を起こし `desired` も戻す。起動の途中なら
+/// PID ファイルも管理トークンも無いので、何も止められずに `kill` / 記録の `rm` を案内する。
+/// `--force` も同じ（止めても戻るので逃げ道にならない）。**断るのは明示の stop の入口だけ**で、
+/// 入れ替えの旧版の停止（`stop_stale_generation` → `daemon_stop_impl`）は通る。
+/// 断るときは `forget_if_stopped` を通さない（`desired` を消さない = 起動の結果を待つ）
+fn refuse_stop_while_starting() -> Result<(), String> {
+    match start_blocks_request() {
+        Some(marker) => {
+            audit_refused_while_starting("daemon_stop_refused", &marker);
+            let now = now_epoch_secs();
+            Err(crate::RemoteRefusal::DaemonStartingStop { marker, now }.to_string())
+        }
+        None => Ok(()),
+    }
 }
 
 /// 停止のあと daemon が居なければ「起動していた」の記録を消す（#1485）。
@@ -3819,6 +3869,17 @@ pub fn spawn_daemon() -> Result<Value, String> {
     // #2533: 誰が・どの経路で起こしたかを残す（初回の起動では置き場がまだ無いので作っておく）
     let _ = ensure_state_dir();
     audit_daemon_request("daemon_start_requested", "start", None);
+    // #2613: 別の起動が daemon を起こしている途中（#2608 の印が効いている）なら、2 本目を起こさずに断る。
+    // 見るのは状態を読むより前: 区間内の start は、入れ替えの途中の旧版を自分も「入れ替える相手」と
+    // 読んで止めに行き子を起こす（daemon が 2 本になり、PID ファイルに載らない 1 本が残る）か、
+    // 起動の途中の新版の待ち受けを見て断る前に印を上書きし、抜けるときに消す（#2608 の status が
+    // stop の案内へ戻る）。稼働中の serve バイナリの食い違いで stop を勧める断りより前でもある。
+    // 確かめてから印を置くまで（状態の読み取りの間）に割り込んだ起動までは防がない
+    if let Some(marker) = start_blocks_request() {
+        audit_refused_while_starting("daemon_start_refused", &marker);
+        let now = now_epoch_secs();
+        return Err(crate::RemoteRefusal::DaemonStarting { marker, now }.to_string());
+    }
     // 既に起動中か確認
     let status = daemon_status();
     let mut renewing: Option<u32> = None;
