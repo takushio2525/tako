@@ -253,7 +253,7 @@ fn scan(d: &str) -> Vec<String> {
         let line = line_at(d, start);
         let gate = body.find("orchestrator_offload_legacy()");
         let place = body.find("spawn_place(");
-        if !gate.zip(place).is_some_and(|(g, p)| g < p) {
+        if gate.zip(place).is_none_or(|(g, p)| g >= p) {
             out.push(format!(
                 "{DISPATCH}:{line} `land_probed` が門（`orchestrator_offload_legacy()`）の内側で配置の段（`spawn_place(`）を\
                  通していない。spawn の記録と I/O を UI スレッドで待つ（#2646）"
