@@ -20,35 +20,6 @@
 
 ---
 
-## 2026-10-31（#2365 の続き: `tako config` の断り 33 種を `ShareRefusal` / `GitError`（その場で型を返す）へ、CLI の手元 3 か所（watch --worker・lsp options --set・remote agents）を型の口へ。応答の push_error / files[].error も表示言語）
-- 実経路 23 ケースで英語の日本語入り 23 → 0・CLI 27 / 28 → 0 / 28（日本語 28 / 28 sha256 一致）・隔離 GUI の MCP 19 / 19 → 0 / 19・注入 6 か所を名指し + E0004・カタログ +0 B。PR #2589
-
-## 2026-10-31（#2583: setup の PATH の案内の残り = SHELL 未設定の問い合わせを setup の既定 zsh へ揃える（`exe::fallback_login_shell`・child_cmd も 1 実装）・handoff の PATH の段と check-health の `tako_cli_link` は未知のシェルで bootstrap path を示さない（A/B `TAKO_2583_LEGACY=1`））
-- 砂場の CLI と隔離 GUI で修正前は path が残る / 誘導 1 → 修正後は auth・login へ進む / 誘導 0・既知のシェル 12 種はバイト一致・注入 7 通りで file:line を名指し・カタログ +0 B。PR #2590
-- 23:36 に `3f031cc` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）
-
-## 2026-10-31（#2588: 隔離 GUI の後片付けで `stop_isolated_gui` が GUI の pid だけを待って返し、SIGHUP を受けたペイン（SSH ペインの統合の無い zsh）の履歴保存と直後の `rm -rf "$TMP"` が競って rc=1 → GUI を落とす前にペインのプロセス（別の端末を持つ子孫）を控え、終わるまで待つ・居座りは TERM → KILL・番犬 `issue2588_stop_waits_pane_exit`）
-- 本物の 1449 で修正前 + 注入 rc=1 → 修正後 + 同じ注入 rc=0・注入なし 5 / 5 rc=0（PASS 38 / FAIL 0・残骸 0）・逆戻りを番犬が file:line で名指し・カタログ +0 B。PR #2591
-
-## 2026-10-31（#2577: tcsh / csh のログインシェルへ `-l -c` を渡さず、argv[0] を `-<名>` にした `-c 'exec /bin/sh -c $argv[1]:q'` の形で起こす。表 `exe::login_invocation` の 1 実装へ寄せ、`ChildCmd::command` が argv[0] を当てる。A/B `TAKO_2577_LEGACY=1`）
-- 砂場の check-health で tcsh / csh / 別名は修正前 claude 未検出・git 不明 → 修正後どちらも検出。zsh / bash / sh / fish / 空はバイト一致・番犬 `issue2577_csh_login_shell_watchdog`・カタログ +0 B。PR #2593
-
-## 2026-10-31（#2365 の続き: GUI 側 = git パネルの 13 呼び出しを型の口へ・動画 `VideoRefusal`・Web ビューの親 `HostRefusal::WebViewParentDetached`・ファイルのクリップボード `ClipboardWriteError`・`.app` の差し替え `BundleError` / `SwapCause`・プレビューのリンク / アプリを選んで開く / 再起動は os_integration の型の口）
-- 隔離 GUI の CLI / MCP で英語表示の日本語入り 8 / 8 → 0 / 8・日本語は sha256 一致・GUI 無しの実経路 4 / 4 → 0・注入 6 通りを名指し + E0004・カタログ +0 B。PR #2596
-
-## 2026-11-01（#2594: SSH ペインが ssh の失敗・切断後に戻るローカルのシェルに統合が載らなかった → 戻る直前に素のペインと同じ統合（`shell_integration::relaunch`）を当て直す。A/B `TAKO_2594_LEGACY=1`）
-- 隔離 GUI の A/B で戻りのシェルが `unknown → failed`・cwd 追従・HISTFILE が素のペインと同じ（器あり・切断・bash も）・番犬が呼び手を file:line で名指し・カタログ +0 B。PR #2599
-- 02:53 に `3638362` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）。本番 GUI の SSH ペインの戻りのシェルが state=failed / cwd 追従 = 素のペインと一致した本番確認で #2594 を閉じた
-
-## 2026-11-01（#2592: `SHELL` の名前が sh のとき setup が `~/.bash_profile` へ書き、`sh -l` は `~/.profile` だけを読むので段が path に残っていた → `ShellKind::Sh`（`~/.profile`）・undo は移す前の `.bash_profile` のブロックも外す・A/B `TAKO_2592_LEGACY=1`）
-- 砂場の CLI で修正前は verified=false・next_step=path、修正後は verified=true・auth。既知のシェル 8 種は 15 ファイルずつバイト一致。注入 2 通りを番犬が file:line で名指し。カタログ +0 B。PR #2600
-
-## 2026-11-01（#2598: `wait_isolated_gui` の素の `tako list` が呼び手の env（本番の `TAKO_SOCKET` / 既定の置き場）で本番 GUI へ届き、隔離 GUI が立つ前に返っていた → ヘルパの CLI を `iso_cli`（本番の env を落とし GUI と同じ発見の置き場）へ・置き場が空ならログの隣に決めて GUI にも渡す・番犬が `scripts/lib/*.sh` を「その行で隔離」の規則で読む（A/B `TAKO_2598_LEGACY=1`））
-- 本番役の隔離 GUI + 中継で修正前は 7 通り中 6 通りで本番役へ届く（1 回の待ちで 1 件・launch を通さない待ちは 30 件）→ 修正後 0 件・代表 2 本の rc と PASS / FAIL は一致・カタログ +0 B。PR #2601
-
-## 2026-11-01（#2602: bash のログインは `.bash_profile` → `.bash_login` → `.profile` の最初の 1 つだけを読むのに、setup が `.profile` / `.bash_login` だけの人に `.bash_profile` を作り、undo 後も 0 バイトで残して覆い隠していた → 書き先を `bash -l` が読む 1 つに（`ShellKind::login_profile_in`）・undo で 0 バイトになったファイルは消す・A/B `TAKO_2602_LEGACY=1`）
-- 本物の `bash -l` で修正前は `.profile` の変数が unset → 修正後は読む。9 シェル × 5 通りの 45 ケースのうち変わったのは理由つきの 26（bash の書き先 2・作ったファイルの削除 24）で、残り 19 はバイト一致。注入 2 通りを番犬が file:line で名指し。カタログ +0 B。PR #2605
-
 ## 2026-11-01（#2365 の続き: dispatch の注記 32 種と fda の description を新しい `ReplyNote` へ、CLI の手元の断り 17 種を `Reason`・突然死からの復旧 3 種を `SessionRefusal` へ、同じ出力の行 17 種も `ReplyNote` へ）
 - CLI 23 ケースで英語の日本語入り 23 → 0（日本語 20 / 23 sha256 一致・残り 3 は移行の知らせの言語の修正）・隔離 GUI 13 / 13 → 0 / 13（日本語 13 / 13 一致）・注入で名指し + E0004・カタログ +0 B。PR #2606
 
@@ -74,3 +45,31 @@
 ## 2026-11-01（#2365 の続き: `tako master` / `tako solo` の起動の流れを表示言語へ。言語を移行より前に決め（日本語表示に英語の移行の知らせが混ざっていた）、断りは `Reason` 3 種と型の口、行は `ReplyNote` 26 種。host.rs の既定 26 種を `HostRefusal::Default*` へ・mcp_host が表示言語と切り替えに従う）
 - GUI 無しの CLI 19/23 → 0/23（日本語 14/23 一致・残り 9 は移行の知らせの修正）・隔離 GUI 10/10 → 0/10（日本語 10/10 一致）・mcp_host 12/12 → 0/12・注入 6 か所を名指し + E0004・カタログ +0 B。PR #2617
 - 11:29 に `00a3b4b` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）。再起動直後の入れ替えの区間に打った remote start / stop が両方断られ、daemon は 1 本のまま新版へ移った本番確認で #2613 を閉じた
+
+## 2026-11-01（#1623: setup --check / check-health のプロファイルの行が登録済みの名前を 1 行に全部並べていた（84 個で 449 字）→ 件数・先頭 3 個（default → 名前順）・他 N 個の 1 行、全件は `--json` の `items[].names`（A/B `TAKO_1623_LEGACY=1`））
+- 実経路 0 / 1 / 3 / 4 / 84 個 × 日英で OK 63 / NG 0・旧形は #1623 前とバイト一致・プロファイル以外の行もバイト一致・注入で番犬が file:line を名指し・カタログ +0 B。PR #2621
+
+## 2026-11-01（#2619: 隔離中（`TAKO_ISOLATED`）の remote start（CLI / MCP / daemon の直起動 / UDS の setup）が既定ノードへ serve を張っていた → 門 `remote_isolated_serve::check` で断る（検証モード・偽 tailscale・`TAKO_REMOTE_ISOLATED_SERVE=1` は通す・A/B `TAKO_2619_LEGACY=1`））
+- 段 1 は 3 経路とも GUI 版ノードへ `serve_set`（daemon 1 本・本番 standalone は不変）→ 修正後は断り・daemon 0 本・両ノード不変、opt-in / A/B は従来どおり。番犬が注入 7 通りを file:line で名指し・カタログ +0 B。PR #2622
+
+## 2026-11-01（#2618: ペインログの追記・ローテーション・全体上限の削除を Mutex を握ったまま呼び手のスレッドで行い、直接ペインの取り込み・閉じたときのフラッシュ・Mutex を待つ口がメインスレッドを止めていた → 専用の書き手スレッド 1 本（積んだ順の FIFO）へ積み、Mutex の内側はメモリだけ・終了は書き終わりを待つ・A/B `TAKO_2618_LEGACY=1`）
+- 注入 5 秒で取り込み 4,825ms → 15ms / 閉じる IPC 15,031ms → 20ms / `logs status` 9,960ms → 30〜167ms・中身は修正前と一致・詰まった終了で 350 行 + マーカーを確認・番犬が逆戻り 4 種を file:line で名指し・カタログ +0 B。PR #2623
+
+## 2026-11-01（#1556: セルフテストをリポジトリ外の cwd から起動すると項目 14 が cwd で `cargo build -p tako-cli` を回して `could not find Cargo.toml` で落ちていた → 根を実行ファイルの位置 → 実行時の `CARGO_MANIFEST_DIR` → cwd の順に辿ってそこで回し、見つからなければ日英の案内で止まる（A/B `TAKO_1556_LEGACY=1`・注入 `TAKO_1556_INJECT=noroot`））
+- 隔離 GUI で同じ外の cwd から修正前は `could not find Cargo.toml` → 項目 14 で FAILED（9 秒）→ 修正後は根で回して項目 17 まで進む・注入で日英の案内・A/B は旧挙動・番犬が注入 5 通りを file:line で名指し・カタログ +0 B。PR #2626
+
+## 2026-11-01（#1555 の残り: MCP `tako_remote_start` と設定画面の「開始」が daemon の起動を UI スレッドで待ち、起動途中の daemon が GUI の IPC へ送る probe と読み取りの上限 10 秒まで待ち合っていた（本番 10.5 秒の正体）→ `prepare_offload` の `OffloadJob::RemoteStart` で background から応答・A/B `TAKO_1555_LEGACY=1`）
+- 隔離 GUI で start の間の `tako list` 17,947ms → 504ms・`dispatch:RemoteStart` 専有 18,141ms → 0 件・応答は一致・番犬が注入 6 通りを名指し・カタログ +0 B。PR #2628
+
+## 2026-11-01（#2627: 隔離 GUI のペインの zsh が利用者の rc を読み、GUI の終了でペインへ重ねて届く SIGHUP が rc の `pyenv rehash` の EXIT の trap を断って shim のロックを残していた（後片付けの TERM / KILL ではない）→ `launch_isolated_gui` が既定でペインの zsh を砂場の ZDOTDIR へ向ける・opt-in は `TAKO_ISO_USER_RC=1` + `# tako:user-rc-ok <理由>`・A/B `TAKO_2627_LEGACY=1`）
+- PR #2631
+
+## 2026-11-01（#2625: 器のペインを閉じるたびに器の tmux サーバー全体が約 600ms 止まっていた（tty の最後の close がサーバーの中で読まれない出力を抱えて待つ。tako のメインスレッドは止まっていない）→ 器のペインの端末は閉じるときに PTY のスレッドが attach クライアントへ SIGHUP を送り、子の側が全部閉じるまで親側を読み捨ててから閉じる・A/B `TAKO_2625_LEGACY=1`）
+- 閉じた後の外からの `tmux ls` 593〜607ms → 6〜10ms・器が消えるまで 633〜654ms → 24〜50ms・fd / 子 / ゾンビ・終了と復元・直接ペインは同じ・番犬 4 件・カタログ +0 B。PR #2629
+- 18:45 に `70faa47` を install・GUI 再起動（画面ロック中・remote daemon は replaced-generation）。本番の `tmux -L tako ls` が閉じた後 598ms → 49ms の本番確認で #2625 を閉じた
+
+## 2026-11-01（#2624: 段 1 で setup（CLI / MCP）は serve 以外に tailscale を書き換えないと確認（up / login / set / funnel なし）→ 門の外の 3 経路（stop の後始末・対話 setup の brew 導入・QR のビューア）と Windows の本物の置き場を #2619 の門 `allows_op` へ通す（A/B `TAKO_2624_LEGACY=1`・③ の自動復帰は画面ロック中に確かめられず見送り））
+- 偽の tailscale / brew / open の記録で修正前 6 / 1 / 1 回 → 修正後 0 / 0 / 0 回、opt-in・A/B・本番の経路は従来どおり、両ノードの serve status は前後一致・番犬が注入 9 通りを file:line で名指し・カタログ +0 B。PR #2632
+
+## 2026-11-01（#1721: 狭いペインで claude が背景作業の申告を折り返し、mod なしの worker が `busy / agents-auto / idle_override_blocked: null` のままだった → 折り返しをつないで読み、入力欄の直前の申告に限る・読めず状態行が切れていれば `status_line_truncated`・A/B `TAKO_1721_LEGACY=1`）
+- 実 GUI の 36 / 24 桁で修正前 busy → 修正後 idle（生成中は busy のまま）・mod の経路は修正前から idle・番犬が注入 4 通りを file:line で名指し・カタログ +0 B。PR #2635
