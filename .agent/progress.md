@@ -20,28 +20,6 @@
 
 ---
 
-## 2026-11-01（#2365 の続き: dispatch の注記 32 種と fda の description を新しい `ReplyNote` へ、CLI の手元の断り 17 種を `Reason`・突然死からの復旧 3 種を `SessionRefusal` へ、同じ出力の行 17 種も `ReplyNote` へ）
-- CLI 23 ケースで英語の日本語入り 23 → 0（日本語 20 / 23 sha256 一致・残り 3 は移行の知らせの言語の修正）・隔離 GUI 13 / 13 → 0 / 13（日本語 13 / 13 一致）・注入で名指し + E0004・カタログ +0 B。PR #2606
-
-## 2026-11-01（#2597: tcsh / csh の利用者の明示コマンドのペインが `-l` で消える / 器経由は `Unmatched '''.` で止まる → ログインの層は表の csh 系の行を `exec -a` の段越しに・器の 1 行は csh の引用（A/B `TAKO_2597_LEGACY=1`））
-- 隔離 GUI で修正前 9 本とも不成立（器なしの tcsh / csh 6 本 = `Unknown option`・器ありの tcsh 3 本 = `Unmatched`） → 修正後 tcsh / csh × 器なし / 器ありの 12 本が起きる・csh 系でない 6 種の argv は修正前と一致・カタログ +0 B。PR #2607
-
-## 2026-11-01（#2603: 名前が dash / ksh のシェルは種別の分からないシェルの断りで手作業だった → 本物の dash と ksh93u+ が `-l -c`・argv[0]・対話ログインで `.profile` を読むと確かめて `ShellKind::Sh` へ寄せる（`SH_PROFILE_SHELLS`）・確かめていない mksh ほかは寄せない・A/B `TAKO_2603_LEGACY=1`）
-- 砂場の CLI で修正前は断り（rc=1）・段は path → 修正後は `.profile` に書いて auth へ進み、本物の `dash -l` / `ksh -l` から claude を引ける。既知のシェル 8 種 × 3 通りの 24 ケースはバイト一致。注入 2 通りを番犬が file:line で名指し。カタログ +0 B。PR #2609
-
-## 2026-11-01（#2608: GUI の自動復帰が daemon を入れ替える途中の remote status が、新版の待ち受けを PID ファイルの無い待ち受け（#2455）と読んで `tako remote stop` を案内していた → `spawn_daemon` が抜けるまで `tako-remote.starting` を置き、status は `starting`（replacing / starting）を返して stop を案内しない（書き手の死・pid の再利用・90 秒で失効・A/B `TAKO_2608_LEGACY=1`））
-- 隔離 GUI の実経路で修正前 FAIL 6（区間の 35 読みが全部 stop の案内）→ 修正後 PASS 27・MCP も同じ・注入で番犬が file:line を名指し・カタログ +0 B。PR #2611
-
-## 2026-11-01（#2365 の続き: check-health 一式と `tako setup --check` を表示言語へ。文は新しい `HealthText`（147 種）、共有の文は各モジュールの `_in(lang)`。`setup --check` は「setup は日本語」の枠から外した）
-- 英語表示の日本語入り: CLI 経路 12/12 → 0/12・隔離 GUI の CLI / MCP 3/3 → 0/3（問題 0 件でも同じ）。日本語は全件一致（意図した差は旧文の空白 1 か所）。注入 7 通りを名指し / E0004・カタログ +0 B。PR #2612
-- 09:09 に `31b5683` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）。再起動直後 90 秒の status 180 回で stop の案内 0（区間は starting.state=replacing）の本番確認で #2608 を閉じた
-
-## 2026-11-01（#2610: save_layout が layout.json の書き出しとペインログの Mutex 待ちでメインスレッドを止めていた（本番最大 99 秒）→ 専用の書き手スレッド 1 本（最新 1 件の合流・tmp + rename）+ `try_lock`、終了と起動し直しの前は書き終わりを待つ・A/B `TAKO_2610_LEGACY=1`）
-- 注入 5 秒で IPC 5,023ms → 18ms / ペインログ 4,840ms → 22ms・SIGKILL / 終了 / 順序 / 書けない dir を実経路で確認・番犬が逆戻り 4 種を file:line で名指し・カタログ +0 B。PR #2614
-
-## 2026-11-01（#2613: 起動・入れ替えの途中（#2608 の印が効いている間）の `tako remote start` が旧版を止めて daemon を 2 本にしていた / 印を消していた → `spawn_daemon` が状態を読む前に印を見て `RemoteRefusal::DaemonStarting` で断る・stop / `--force` も止めても戻るので `DaemonStartingStop` で断る（A/B `TAKO_2613_LEGACY=1`））
-- 実経路で修正前 FAIL 28（daemon 2 本・区間の残り 26 回が stop の案内）→ 修正後 PASS 59 / 0・番犬が注入 7 通りを file:line で名指し・カタログ +0 B。PR #2616
-
 ## 2026-11-01（#2365 の続き: `tako master` / `tako solo` の起動の流れを表示言語へ。言語を移行より前に決め（日本語表示に英語の移行の知らせが混ざっていた）、断りは `Reason` 3 種と型の口、行は `ReplyNote` 26 種。host.rs の既定 26 種を `HostRefusal::Default*` へ・mcp_host が表示言語と切り替えに従う）
 - GUI 無しの CLI 19/23 → 0/23（日本語 14/23 一致・残り 9 は移行の知らせの修正）・隔離 GUI 10/10 → 0/10（日本語 10/10 一致）・mcp_host 12/12 → 0/12・注入 6 か所を名指し + E0004・カタログ +0 B。PR #2617
 - 11:29 に `00a3b4b` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）。再起動直後の入れ替えの区間に打った remote start / stop が両方断られ、daemon は 1 本のまま新版へ移った本番確認で #2613 を閉じた
@@ -73,3 +51,24 @@
 
 ## 2026-11-01（#1721: 狭いペインで claude が背景作業の申告を折り返し、mod なしの worker が `busy / agents-auto / idle_override_blocked: null` のままだった → 折り返しをつないで読み、入力欄の直前の申告に限る・読めず状態行が切れていれば `status_line_truncated`・A/B `TAKO_1721_LEGACY=1`）
 - 実 GUI の 36 / 24 桁で修正前 busy → 修正後 idle（生成中は busy のまま）・mod の経路は修正前から idle・番犬が注入 4 通りを file:line で名指し・カタログ +0 B。PR #2635
+
+## 2026-11-01（#2634: 器なしの `tako tmux open` のペインを閉じるたびに利用者の tmux サーバーが約 600ms 止まっていた → #2625 の印を器なしのビューにも立てる（`tmux_backend::hang_up_view_client_on_close`・A/B `TAKO_2634_LEGACY=1`）。GUI の終了は OS が親側を先に閉じるので止まらず変えない）
+- 隔離 GUI で修正前 592〜606ms → 修正後 6ms（5/5）・legacy 592〜607ms・終了は器 3 枚で 6〜9ms・器は残り再起動で戻る・番犬が注入 6 通りを file:line で名指し・カタログ +0 B。PR #2636
+
+## 2026-11-01（#2630: MCP `tako_remote_stop` / `tako_remote_status` と設定画面の停止・リモートタブの読み直しを `prepare_offload` → `OffloadJob::RemoteStop` / `RemoteStatus` で background へ（#1555 と同じ形・A/B `TAKO_2630_LEGACY=1`））
+- 注入 3 秒で `tako list` の待ち 2.7 / 5.6 / 5.6 秒 → 17 / 17 / 22ms・perf.log の専有 0・応答は A/B と一致・カタログ +0 B。PR #2637
+
+## 2026-11-01（#2633 (c): ログインシェルの問い合わせの打ち切りがグループへいきなり SIGKILL を送り、rc の `pyenv rehash` のロックを残していた → グループへ SIGTERM 1 回 → 猶予 1 秒 → 残りへ SIGKILL（刈り取り係・頭は判定まで刈らない）。A/B `TAKO_2633_LEGACY=1`・番犬 `issue2633_probe_group_term_watchdog`）
+- 実経路で修正前 5/5 → 修正後 0/5、連鎖（後続の問い合わせの打ち切り）11/11 → 5/11。呼び手が返る時刻は同じ・カタログ +0 B。(a) は直さない（master が [提案] Issue へ）。PR #2642
+
+## 2026-11-01（#1675: `tako context-budget fix` がアーカイブ済みのまま作業ログへ戻ったエントリを、#1645 の `revivals` の判定を共有して予算計算の前に落とし 1 回で収束するようにした。同じ見出しで本文の違うものは触らない・check は直るものを `fixable` / `revived_fixable` へ数えて `next_step` に fix）
+- 修正前は予算内の二重で fix が「変更なし」のまま → 修正後 1 回目で 4→3 件・2 回目はバイト一致・二重でない 3 素材は修正前と出力・書き込みが一致（check --json に欄 1 つ）・カタログ +0 B。PR #2641
+
+## 2026-11-01（#2639: `tako_orchestrator_respond` の 400ms の正体は `respond_via` の固定の sleep → 届き方の解決（`respond_access`）だけ UI スレッドで行い `OffloadJob::OrchestratorRespond` で background から応答（錠で 1 本ずつ・チャット表示の承認カードも同じ口・A/B `TAKO_2639_LEGACY=1`））
+- 模擬 TUI で応答の間の `tako list` 308〜326 / 696〜766ms → 最長 17 / 20ms・perf.log の専有 0・応答と監査記録は A/B と一致・カタログ +0 B。PR #2643
+
+## 2026-11-02（#2644: issue2576 の番犬が全体並列の負荷で落ちる間欠 → 作りたての偽シェルの初回 exec（macOS の検査・手元 130〜390ms）が確かめの上限 5 秒の内側で払われていた。偽シェルを作ったその場で 1 回起こして終わるまで待ってから測る（上限は延ばさない））
+- 初回 exec を 6 秒にする注入で修正前は Issue と同じ `nu / Ja` の不明を含む FAILED → 修正後 8 / 8・同型の候補 4 本は同じ注入で全部 ok・カタログ +0 B。PR #2648
+
+## 2026-11-02（#2365 の続き: 読めないプロファイルの理由（#2256 の系統）を表示言語へ。芯 `UnreadableProfile`・知らせ `ProfileFallback` 5 種・`ConfigError` 3 種、利用者へ返す口は表示言語・persist.log は日本語。check-health の profiles 行も型の口へ）
+- 実経路（CLI + mcp_host の MCP）で英語表示の日本語入り 32/64 → 4/64（残りは projects add の枠）・日本語 56/64 sha256 一致（残り 8 は時刻と置き場だけ）・persist.log 一致・注入で名指し + E0004・カタログ +0 B。PR #2645
