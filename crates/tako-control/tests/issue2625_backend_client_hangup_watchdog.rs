@@ -39,11 +39,20 @@ fn repo_root() -> PathBuf {
 #[path = "common/production_range.rs"]
 mod production_range;
 
-/// 本番コードだけの眺め（テスト領域とコメントを同じバイト数の空白へ潰す）
+/// 本番コードだけの眺め（テスト領域とコメントを同じバイト数の空白へ潰す）。下限つき = 黙って縮んだら落ちる
 fn read(rel: &str) -> String {
+    // tmux_backend.rs はテストが本番より厚い（本番の割合は 2 割台）ので下限を下げて読む
+    // （`production_range::MIN_COVERAGE` の注記と同じ扱い）
+    let floor = if rel == TMUX_BACKEND {
+        0.20
+    } else {
+        production_range::MIN_COVERAGE
+    };
     let src = std::fs::read_to_string(repo_root().join(rel))
         .unwrap_or_else(|e| panic!("{rel} を読めない: {e}"));
-    production_range::code_view::without_comments(&production_range::production(&src, rel))
+    production_range::code_view::without_comments(&production_range::production_with_floor(
+        &src, rel, floor,
+    ))
 }
 
 /// バイト位置の行番号（1 始まり）

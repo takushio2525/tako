@@ -796,8 +796,8 @@ impl TerminalSession {
         self.hang_up_on_close = Some(crate::pty_loop::HANG_UP_DRAIN_MAX);
     }
 
-    /// [`Self::hang_up_client_on_close`] の待つ上限を指定する版（テスト用）
-    #[cfg(test)]
+    /// [`Self::hang_up_client_on_close`] の待つ上限を指定する版（テスト用。unix のテストだけが使う）
+    #[cfg(all(test, unix))]
     pub(crate) fn hang_up_client_on_close_within(&mut self, limit: std::time::Duration) {
         self.hang_up_on_close = Some(limit);
     }
@@ -4541,31 +4541,26 @@ mod tests {
         assert!(done(), "{what} にならなかった");
     }
 
-    /// プロセスのコマンド名（`ps -o comm=`）。居なければ（回収済み）None
+    /// pid がまだ回収されていないか（生きている・ゾンビ）。回収済みなら kill(2) が ESRCH を返す。
+    /// 子を回収するのは PTY のスレッド（`Pty` の drop）だけなので、偽になったら回収済み
     #[cfg(unix)]
-    fn proc_comm(pid: u32) -> Option<String> {
-        let out = std::process::Command::new("ps")
-            .args(["-o", "comm=", "-p", &pid.to_string()])
-            .output()
-            .ok()?;
-        let comm = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (!comm.is_empty()).then_some(comm)
+    fn not_reaped(pid: u32) -> bool {
+        // SAFETY: kill(2) へシグナル 0（存在の確認だけ）を渡す
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 
     /// 失敗で抜けたとき、止まったままの子を残さない（書き込みで止まった子は PTY のスレッドの
-    /// wait を塞ぐ）。回収を見届けたら外す。撃つのはまだ sh として居る pid だけ
+    /// wait を塞ぐ）。回収を見届けたら外す（外した後は撃たない = pid の再利用に当たらない）
     #[cfg(unix)]
     struct ReapGuard(Option<u32>);
 
     #[cfg(unix)]
     impl Drop for ReapGuard {
         fn drop(&mut self) {
-            if let Some(pid) = self.0 {
-                if proc_comm(pid).is_some_and(|c| c.ends_with("sh")) {
-                    // SAFETY: kill(2) へ値を渡すだけ。まだ回収されていない子の pid（コマンド名で確かめた）
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
+            if let Some(pid) = self.0.filter(|pid| not_reaped(*pid)) {
+                // SAFETY: kill(2) へ値を渡すだけ。まだ回収されていない子の pid
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
                 }
             }
         }
@@ -4618,7 +4613,7 @@ mod tests {
         wait_until("PTY のスレッドが終わる", || {
             rx_closed(&mut rx, &mut seen)
         });
-        wait_until("子の回収", || proc_comm(child).is_none());
+        wait_until("子の回収", || !not_reaped(child));
         guard.0 = None;
         assert!(
             !seen.iter().any(is_exit_event),
@@ -4643,7 +4638,7 @@ mod tests {
         wait_until("PTY のスレッドが終わる", || {
             rx_closed(&mut rx, &mut seen)
         });
-        wait_until("子の回収", || proc_comm(child).is_none());
+        wait_until("子の回収", || !not_reaped(child));
         guard.0 = None;
         assert!(marker.exists(), "子へ SIGHUP が届いている");
     }
@@ -4663,7 +4658,7 @@ mod tests {
         wait_until("PTY のスレッドが終わる", || {
             rx_closed(&mut rx, &mut seen)
         });
-        wait_until("子の回収", || proc_comm(child).is_none());
+        wait_until("子の回収", || !not_reaped(child));
         guard.0 = None;
         assert!(marker.exists(), "子へ SIGHUP が届いている");
     }
