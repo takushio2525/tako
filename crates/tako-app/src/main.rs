@@ -10894,8 +10894,14 @@ impl TakoApp {
             };
         // #2625: 器（tmux）のペインは、閉じるときに attach クライアントを先に帰してから PTY を
         // 閉じる（tty の最後の close を器のサーバーの中で起こさない = サーバー全体を止めない）。
-        // 閉じる経路（× / ⌘W / CLI / MCP / タブ・窓ごと）はすべて端末の drop を通るのでここで決める
-        if backend_session.is_some() && tako_core::tmux_backend::hang_up_client_on_close() {
+        // 閉じる経路（× / ⌘W / CLI / MCP / タブ・窓ごと）はすべて端末の drop を通るのでここで決める。
+        // #2634: 器なしの `tako tmux open` のペインも PTY 直下の子が（利用者の）tmux サーバーの
+        // attach クライアントなので同じ順で閉じる（`track_tmux_view` は spawn より先に呼ばれる）
+        if (backend_session.is_some() && tako_core::tmux_backend::hang_up_client_on_close())
+            || (backend_session.is_none()
+                && self.tmux_view_panes.contains_key(&pane_id)
+                && tako_core::tmux_backend::hang_up_view_client_on_close())
+        {
             session.hang_up_client_on_close();
         }
         // #2367: 器の tmux サーバーの fd の上限を persist.log へ（サーバーが変わったときだけ 1 行。

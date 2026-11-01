@@ -5018,11 +5018,24 @@ tako のメインスレッドは止まっていない（同じ区間の `tako sc
   読んだバイトは捨て、UI へイベントを送らない（漏れても #1857 の serial の照合と「端末の無いペイン」で捨てられる）。
   上限（`pty_loop::HANG_UP_DRAIN_MAX` = 2 秒）を過ぎたら従来どおり閉じる。実測では SIGHUP から
   子の側が閉じるまで 10〜25ms、閉じた器が `tmux ls` から消えるまで 25〜60ms（修正前は 630〜700ms）
-- 直接ペイン（器なし）・Windows（psmux = ConPTY には tty の close が無い）は従来どおり `Msg::Shutdown`
+- 直接ペイン（器なし。器なしの `tako tmux open` のペインは下の #2634）・Windows（psmux = ConPTY には tty の close が無い）は
+  従来どおり `Msg::Shutdown`
 - A/B は `TAKO_2625_LEGACY=1`（ゲートは `tmux_backend::issue2625_legacy()` の 1 か所）。番犬は
   `crates/tako-control/tests/issue2625_backend_client_hangup_watchdog.rs`、閉じた後の出力を読み切ることは
   `tako_core::terminal` の単体テスト、実経路（止まり・fd・子プロセス・ゾンビ・終了と復元・直接ペイン・A/B）は
   `bash scripts/test-backend-close-2625.sh`
+- **器なしの `tako tmux open` のペインも同じ順で閉じる**（#2634）: persist OFF のビューペインは PTY 直下の子が
+  **利用者の** tmux サーバーの attach クライアント（ログインシェルの `-c` が exec する）なので、印が無いと閉じるたびに
+  利用者の tmux サーバー全体が約 600ms 止まった（実測 592〜606ms・5/5 回）。`spawn_session` の同じ `if` に
+  「`backend_session.is_none()` かつ `tmux_view_panes` に載っている」枝を足し、判断は
+  `tmux_backend::hang_up_view_client_on_close()`（unix・`TAKO_2634_LEGACY=1` でない。器の種類は見ない =
+  ビューは常に `tmux` を起こす）の 1 か所。**dispatch の `TmuxOpen` はビューの登録（`track_tmux_view`）を端末を
+  起こす依頼（`attach_session`）より先に置く**（`spawn_session` はその登録を見て印を立てる）。器に包まれた
+  ビュー（persist ON）は外側が器のクライアントなので上の器の枝が立てる（修正前から 6〜7ms）。
+  GUI の終了（SIGTERM / ⌘Q）は端末を drop せず OS が PTY の親側を閉じる = tty が切れてから
+  サーバーが閉じるので止まらない（器 3 枚で外からの `tmux ls` 7〜9ms）。終了の経路は変えない。
+  番犬は `crates/tako-control/tests/issue2634_tmux_open_hangup_watchdog.rs`、実経路（tmux open の close の器なし /
+  器あり・終了と起動し直し・A/B）は `bash scripts/test-tmux-open-quit-2634.sh`
 
 ## 機械全体の設定を倒す記録には「所有者」を書く（Issue #1373 / #449）
 
