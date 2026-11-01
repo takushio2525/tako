@@ -55544,7 +55544,7 @@ tako | pane 2 [ compact ]       [-]
     fn issue2639_届かないペインの断りは準備で同期の腕と同じ() {
         let mut host = MockHost::new();
         let respond = Request::OrchestratorRespond {
-            pane_id: 999_999,
+            pane_id: tako_core::unused_id::pane().as_u64(),
             choice: Some("1".into()),
             caller_role: None,
         };
@@ -55565,7 +55565,7 @@ tako | pane 2 [ compact ]       [-]
         }
         let mut host = MockHost::new();
         let respond = Request::OrchestratorRespond {
-            pane_id: 999_999,
+            pane_id: tako_core::unused_id::pane().as_u64(),
             choice: Some("1".into()),
             caller_role: None,
         };
