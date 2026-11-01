@@ -149,6 +149,8 @@ pub struct Item {
     pub lines: Vec<String>,
     /// この項目から積まれる残り作業（#1501）
     pub remaining: Vec<Remaining>,
+    /// `--json` だけに載せる項目固有の欄（#1623。行へ畳んだものの全件など）。人へ出す行には出ない
+    pub fields: serde_json::Map<String, Value>,
 }
 
 impl Item {
@@ -166,6 +168,7 @@ impl Item {
             lines: vec![format!("  {} {summary}", status.tag(lang))],
             summary,
             remaining: Vec::new(),
+            fields: serde_json::Map::new(),
         }
     }
 
@@ -183,6 +186,7 @@ impl Item {
             summary: summary.into(),
             lines: text.lines().map(str::to_string).collect(),
             remaining: Vec::new(),
+            fields: serde_json::Map::new(),
         }
     }
 
@@ -204,19 +208,32 @@ impl Item {
         self
     }
 
+    /// `--json` だけに載せる欄を足す（#1623）。共通の欄（`key` / `status` / `summary` / `lines` /
+    /// `remaining`）と同じ名前は上書きしない
+    fn field(mut self, name: &str, value: Value) -> Self {
+        self.fields.insert(name.to_string(), value);
+        self
+    }
+
     pub fn to_json(&self) -> Value {
         self.to_json_in(Lang::Ja)
     }
 
     /// 項目の JSON（残り作業の見出しは表示言語。#2365）
     pub fn to_json_in(&self, lang: Lang) -> Value {
-        json!({
+        let mut value = json!({
             "key": self.key,
             "status": self.status.as_str(),
             "summary": self.summary,
             "lines": self.lines,
             "remaining": self.remaining.iter().map(|r| remaining_json(r, lang)).collect::<Vec<_>>(),
-        })
+        });
+        if let Value::Object(map) = &mut value {
+            for (name, field) in &self.fields {
+                map.entry(name.clone()).or_insert_with(|| field.clone());
+            }
+        }
+        value
     }
 }
 
@@ -1495,31 +1512,88 @@ pub fn config_share_lines_in(
 
 // --- プロファイル -----------------------------------------------------------
 
+/// 1 行に名前で並べるプロファイルの数（#1623）。残りは「他 N 個」へ畳み、全件は `--json` の `names` に置く
+const PROFILES_SHOWN: usize = 3;
+
+/// A/B（#1623）: `TAKO_1623_LEGACY=1` で登録済みの名前を 1 行に全部並べる（`names` も載せない）
+fn issue1623_legacy() -> bool {
+    matches!(
+        std::env::var("TAKO_1623_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 fn profiles_item(lang: Lang) -> Item {
-    match crate::orchestrator::list_profiles() {
-        Ok(profiles) if !profiles.is_empty() => Item::new(
-            "profiles",
-            Status::Ok,
-            HealthText::ProfilesCount {
-                count: profiles.len(),
-                names: profiles.join(", "),
-            }
-            .text_in(lang),
-            lang,
-        ),
-        Ok(_) => Item::new(
-            "profiles",
+    profiles_item_from(
+        crate::orchestrator::list_profiles(),
+        lang,
+        issue1623_legacy(),
+    )
+}
+
+/// プロファイルの項目を一覧の結果から組む（#1623）。
+///
+/// #1623 前は登録済みの名前を `, ` で 1 行に全部並べていた（84 個の砂場で 1 行 449 字。
+/// `check-health --json` の `lines` にも同じ 1 行が載る）。いまは件数・先頭
+/// [`PROFILES_SHOWN`] 個・「他 N 個」の 1 行にし、全件は `names`（名前順）へ置く
+fn profiles_item_from(listed: Result<Vec<String>, String>, lang: Lang, legacy: bool) -> Item {
+    const KEY: &str = "profiles";
+    let names = match listed {
+        Ok(names) => names,
+        Err(e) => {
+            return Item::new(
+                KEY,
+                Status::Info,
+                HealthText::ProfilesFailed(e).text_in(lang),
+                lang,
+            )
+        }
+    };
+    if names.is_empty() {
+        let item = Item::new(
+            KEY,
             Status::Info,
             HealthText::ProfilesNone.text_in(lang),
             lang,
-        ),
-        Err(e) => Item::new(
-            "profiles",
-            Status::Info,
-            HealthText::ProfilesFailed(e).text_in(lang),
-            lang,
-        ),
+        );
+        return if legacy {
+            item
+        } else {
+            item.field("names", json!(names))
+        };
     }
+    if legacy {
+        let count = HealthText::ProfilesCount {
+            count: names.len(),
+            shown: names.join(", "),
+            rest: 0,
+        };
+        return Item::new(KEY, Status::Ok, count.text_in(lang), lang);
+    }
+    let (shown, rest) = profiles_shown(&names);
+    let count = HealthText::ProfilesCount {
+        count: names.len(),
+        shown: shown.join(" / "),
+        rest,
+    };
+    Item::new(KEY, Status::Ok, count.text_in(lang), lang).field("names", json!(names))
+}
+
+/// 1 行に並べる先頭と、並べなかった残りの個数（#1623）。
+///
+/// `default`（引数なしの `tako master` が使う = #322 の最簡形で案内する名前）を先頭に、残りは
+/// 名前順（`list_profiles` の並び）。いま動いている master の有無では並びを変えない
+/// （観測者で文面を変えない = #1505。GUI の外から叩いた check-health とも同じ 1 行になる）
+fn profiles_shown(names: &[String]) -> (Vec<&str>, usize) {
+    let default = tako_core::handoff::DEFAULT_PROFILE;
+    let names_iter = || names.iter().map(String::as_str);
+    let shown: Vec<&str> = names_iter()
+        .filter(|name| *name == default)
+        .chain(names_iter().filter(|name| *name != default))
+        .take(PROFILES_SHOWN)
+        .collect();
+    let rest = names.len() - shown.len();
+    (shown, rest)
 }
 
 // --- リモート公開（#1049 / #1485） ------------------------------------------
@@ -2355,5 +2429,132 @@ mod tests {
         }
         // 空でも here は走る
         assert_eq!(overlap(PROBE_CONCURRENCY, Vec::new(), || 7), 7);
+    }
+
+    /// `list_profiles` と同じ並び（名前順）の一覧
+    fn profile_names(list: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = list.iter().map(|name| name.to_string()).collect();
+        names.sort();
+        names
+    }
+
+    /// 本番と同じ形の 84 個（#1623 の実測の件数。`default` は名前順で 2 番目）
+    fn many_profiles() -> Vec<String> {
+        let mut names: Vec<String> = ["codex", "default", "takodev"]
+            .iter()
+            .map(|name| name.to_string())
+            .chain((1..=81).map(|i| format!("p{i:02}")))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// #1623 の番犬: プロファイルの項目は「件数・先頭 3 個（`default` が先頭）・他 N 個」の 1 行で、
+    /// 全件は `--json` の `names`（名前順）に載る。0 / 1 / 先頭ちょうど / 1 個はみ出す / 84 個を
+    /// 日英で固定する。#1623 前（1 行に全部並べる）へ戻ると組み立ての行を名指しして落ちる
+    #[test]
+    fn プロファイルの項目は先頭3個と他n個の1行で全件はnamesに載る() {
+        let at = source_line("fn profiles_item_from(");
+        let cases: Vec<(Vec<String>, &str, &str)> = vec![
+            (
+                Vec::new(),
+                "  [情報] プロファイル: 未作成（tako master で自動生成されます）",
+                "  [info] profiles: none yet (tako master creates one automatically)",
+            ),
+            (
+                profile_names(&["work"]),
+                "  [OK] プロファイル: 1 個（work）",
+                "  [OK] profiles: 1 (work)",
+            ),
+            (
+                profile_names(&["work", "codex", "default"]),
+                "  [OK] プロファイル: 3 個（default / codex / work）",
+                "  [OK] profiles: 3 (default / codex / work)",
+            ),
+            (
+                profile_names(&["d", "c", "b", "a"]),
+                "  [OK] プロファイル: 4 個（a / b / c …他 1 個）",
+                "  [OK] profiles: 4 (a / b / c … 1 more)",
+            ),
+            (
+                many_profiles(),
+                "  [OK] プロファイル: 84 個（default / codex / p01 …他 81 個）",
+                "  [OK] profiles: 84 (default / codex / p01 … 81 more)",
+            ),
+        ];
+        for (names, ja, en) in cases {
+            for (lang, want) in [(Lang::Ja, ja), (Lang::En, en)] {
+                let item = profiles_item_from(Ok(names.clone()), lang, false);
+                assert_eq!(
+                    item.lines,
+                    vec![want.to_string()],
+                    "{at}: {} 個のプロファイルの行が #1623 の形（件数・先頭 {PROFILES_SHOWN} 個・他 N 個）でない（{lang:?}）",
+                    names.len()
+                );
+                let value = item.to_json_in(lang);
+                assert_eq!(
+                    value["names"],
+                    json!(names),
+                    "{at}: `--json` の `names` が全件（名前順）でない（{} 個・{lang:?}）",
+                    names.len()
+                );
+                assert_eq!(value["lines"], json!([want]));
+            }
+        }
+    }
+
+    /// #1623 の A/B: 旧形は 1 行に全部並べ、`names` を載せない（#1623 前とバイト一致）
+    #[test]
+    fn プロファイルの項目の旧形は1行に全部並べる() {
+        let names = many_profiles();
+        let item = profiles_item_from(Ok(names.clone()), Lang::Ja, true);
+        assert_eq!(
+            item.lines,
+            vec![format!(
+                "  [OK] プロファイル: 84 個（{}）",
+                names.join(", ")
+            )]
+        );
+        assert!(item.to_json_in(Lang::Ja).get("names").is_none());
+        let none = profiles_item_from(Ok(Vec::new()), Lang::En, true);
+        assert!(none.to_json_in(Lang::En).get("names").is_none());
+    }
+
+    /// #1623: 一覧を読めないときは理由を出し、`names` は載せない（空の一覧と言い分ける）
+    #[test]
+    fn プロファイルを読めないときはnamesを載せない() {
+        let item = profiles_item_from(Err("io".into()), Lang::En, false);
+        assert_eq!(item.status, Status::Info);
+        assert_eq!(item.lines, vec!["  [info] profiles: check failed (io)"]);
+        assert!(item.to_json_in(Lang::En).get("names").is_none());
+    }
+
+    /// #1623: 項目固有の欄は共通の欄を上書きしない
+    #[test]
+    fn 項目固有の欄は共通の欄を上書きしない() {
+        let item = Item::new("k", Status::Ok, "s", Lang::Ja)
+            .field("key", json!("other"))
+            .field("extra", json!([1, 2]));
+        let value = item.to_json();
+        assert_eq!(value["key"], "k");
+        assert_eq!(value["extra"], json!([1, 2]));
+    }
+
+    /// #1623: 本番の入口が A/B のゲートから旧形かどうかを決める（決め打ちの値を渡すと、上の番犬は
+    /// 緑のまま本番だけ旧形へ戻る）
+    #[test]
+    fn プロファイルの項目の本番の入口はゲートから旧形を決める() {
+        let src = include_str!("diagnostics.rs");
+        let head = "fn profiles_item(lang: Lang) -> Item {";
+        let start = src.find(head).expect("profiles_item の頭");
+        let end = start + src[start..].find("\n}\n").expect("profiles_item の終わり");
+        let body: String = src[start..end].split_whitespace().collect();
+        assert!(
+            body.contains(
+                "profiles_item_from(crate::orchestrator::list_profiles(),lang,issue1623_legacy()"
+            ),
+            "{}（fn profiles_item）が `issue1623_legacy()` で旧形を決めていない（#1623）",
+            source_line(head)
+        );
     }
 }

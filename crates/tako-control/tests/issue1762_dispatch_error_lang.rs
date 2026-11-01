@@ -17031,7 +17031,7 @@ fn health_text_table() -> Vec<(HealthText, String)> {
         (H::ShareFresh(s("tako config init")), s("  [情報] 設定共有: 未配線（複数デバイスで同じ AI 設定を使うなら `tako config init`）")),
         (H::ShareFreshWhat, s("         claude のグローバル指示と tako の宣言的設定を git 1 本で共有します")),
         (H::ShareFreshSafe, s("         秘匿情報とこのマシン固有の状態は共有対象から構造的に外れます")),
-        (H::ProfilesCount { count: 2, names: s("default, work") }, s("プロファイル: 2 個（default, work）")),
+        (H::ProfilesCount { count: 2, shown: s("default, work"), rest: 0 }, s("プロファイル: 2 個（default, work）")),
         (H::ProfilesNone, s("プロファイル: 未作成（tako master で自動生成されます）")),
         (H::ProfilesFailed(s("io")), s("プロファイル: 確認失敗 (io)")),
         (H::RemoteStoppedUnexpectedly, s("リモート公開: 前回は公開していましたが、いまは止まっています")),
