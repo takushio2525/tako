@@ -1857,6 +1857,14 @@ lid-guard.json が使う）:
   準備 → background → `drive_offload` を通す。自動復帰とリモートパネルのボタンは元から `background_executor()`。
   番犬 `issue1555_remote_start_offload_watchdog.rs`、A/B は `TAKO_1555_LEGACY=1`、実経路は
   `scripts/test-remote-start-offload-1555.sh`（FR-6.22.5）
+- **remote の daemon の停止と状態も UI スレッドで待たない**（#2630）: `daemon_stop` は daemon が畳み終わる（serve の解除を
+  含む）のを最長数秒待って状態を読み直し、`daemon_status` は稼働中に 2 系統の同居の調査で tailscale の CLI を最大 3 本起こす
+  （本番の `dispatch:RemoteStop` 247〜349ms）。`prepare_offload` の腕が host の仕事（`RemoteHost::remote_stop_job` /
+  `remote_status_job`）を `OffloadJob::RemoteStop` / `OffloadJob::RemoteStatus` へ包み、`run_reply` が background から
+  応答する（`force` の停止は同期の腕と同じく host を通らない `daemon_force_stop`）。設定画面は「停止」を `remote_stop_off_ui`、
+  リモートタブの読み直しを `refresh_remote_status`（最後に頼んだ答えだけを映す）で同じ準備 → background → `drive_offload` へ通す。
+  番犬 `issue2630_remote_stop_status_offload_watchdog.rs`、A/B は `TAKO_2630_LEGACY=1`、実経路は
+  `scripts/test-remote-stop-status-offload-2630.sh`（FR-6.22.7）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

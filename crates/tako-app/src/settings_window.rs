@@ -146,6 +146,23 @@ struct ImeState {
 /// PWA のペアリング画面・`tako remote devices role` とも同じ語を使う（#1452）
 const ROLE_CHOICES: &[&str] = &["observe", "interact", "manage", "admin"];
 
+/// リモートタブで background に待っている daemon の操作（#1555 / #2630）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteDaemonOp {
+    Start,
+    Stop,
+}
+
+impl RemoteDaemonOp {
+    /// 成ったときのメッセージ（同期の腕の `run_with_message` と同じ文）
+    fn done_message(self) -> &'static str {
+        match self {
+            Self::Start => txt::msg_remote_started(),
+            Self::Stop => txt::msg_remote_stopped(),
+        }
+    }
+}
+
 /// タブ表示に必要な read-only 状態のキャッシュ。
 /// render 毎に子プロセス・dispatch を叩かないよう、タブ切替と更新ボタンでのみ取得する
 #[derive(Default)]
@@ -203,8 +220,13 @@ pub struct SettingsWindow {
     edit_bounds: Option<Bounds<Pixels>>,
     /// 操作結果のメッセージ（本文, エラーか）
     message: Option<(String, bool)>,
-    /// リモートの「開始」を background で待っている間（#1555。押し直しを無視し、ボタンを「起動中…」にする）
-    remote_starting: bool,
+    /// リモートの「開始」（#1555）/「停止」（#2630）を background で待っている間。押し直しを無視し、
+    /// ボタンを「起動中…」/「停止中…」にする
+    remote_busy: Option<RemoteDaemonOp>,
+    /// リモートタブの状態の読み直しの番号（#2630）。background の答えは最後に頼んだものだけを映す
+    remote_status_seq: u64,
+    /// その読み直しを background で待っている間（#2630。初めて開いたときは「読み込み中…」を出す）
+    remote_status_pending: bool,
     status: StatusCache,
     /// Code Runner 新規追加行の確定前バッファ
     runner_new_ext: String,
@@ -254,7 +276,9 @@ impl SettingsWindow {
             ime: None,
             edit_bounds: None,
             message: None,
-            remote_starting: false,
+            remote_busy: None,
+            remote_status_seq: 0,
+            remote_status_pending: false,
             status: StatusCache::default(),
             runner_new_ext: String::new(),
             runner_new_cmd: String::new(),
@@ -322,7 +346,7 @@ impl SettingsWindow {
     /// 送る daemon と子の読み取りの上限 10 秒まで待ち合い、その間 GUI が止まる）。
     /// background へ出さない形（A/B の `TAKO_1555_LEGACY=1` 等）は従来どおり同期で dispatch する
     fn remote_start_off_ui(&mut self, cx: &mut Context<Self>) {
-        if self.remote_starting {
+        if self.remote_busy.is_some() {
             return;
         }
         let Some(app) = self.tako_app.upgrade() else {
@@ -343,7 +367,48 @@ impl SettingsWindow {
             }
             Some(Ok(job)) => job,
         };
-        self.remote_starting = true;
+        self.run_remote_daemon_job(RemoteDaemonOp::Start, job, cx);
+    }
+
+    /// リモートの「停止」（#2630）。IPC の受け口と同じ `prepare_offload` → background → 着地を通し、
+    /// daemon が畳み終わる（serve の解除を含む）のと止まった後の状態の読み直しを UI スレッドで待たない
+    /// （本番の `dispatch:RemoteStop` 247〜349ms の間 GUI が止まっていた）。
+    /// background へ出さない形（A/B の `TAKO_2630_LEGACY=1` 等）は従来どおり同期で dispatch する
+    fn remote_stop_off_ui(&mut self, cx: &mut Context<Self>) {
+        if self.remote_busy.is_some() {
+            return;
+        }
+        let Some(app) = self.tako_app.upgrade() else {
+            self.message = Some((txt::error_app_gone().to_string(), true));
+            return;
+        };
+        let request = Request::RemoteStop { force: false };
+        let prepared = app.update(cx, |app, _| tako_control::prepare_offload(app, &request));
+        let job = match prepared {
+            None => {
+                self.run_with_message(request, txt::msg_remote_stopped().to_string(), cx);
+                self.refresh_tab_status(cx);
+                return;
+            }
+            Some(Err(e)) => {
+                self.message = Some((e.to_string(), true));
+                return;
+            }
+            Some(Ok(job)) => job,
+        };
+        self.run_remote_daemon_job(RemoteDaemonOp::Stop, job, cx);
+    }
+
+    /// 準備できた daemon の開始 / 停止を background で走らせ、終わったらこの画面へ着地させる
+    /// （#1555 / #2630。IPC の受け口と同じ `run_staged` → `drive_offload`）。待つ間はボタンを
+    /// 「起動中…」/「停止中…」にして押し直しを無視し、着地で結果のメッセージと状態の読み直しを出す
+    fn run_remote_daemon_job(
+        &mut self,
+        op: RemoteDaemonOp,
+        job: tako_control::OffloadJob,
+        cx: &mut Context<Self>,
+    ) {
+        self.remote_busy = Some(op);
         self.message = None;
         cx.notify();
         let weak_app = self.tako_app.clone();
@@ -355,13 +420,62 @@ impl SettingsWindow {
             let origin = tako_core::pane::PaneOrigin::User;
             let result = crate::drive_offload(weak_app, outcome, origin, cx).await;
             let _ = this.update(cx, |this: &mut Self, cx| {
-                this.remote_starting = false;
+                this.remote_busy = None;
                 this.settings = settings::load();
                 this.message = Some(match result {
-                    Ok(_) => (txt::msg_remote_started().to_string(), false),
+                    Ok(_) => (op.done_message().to_string(), false),
                     Err(e) => (e.to_string(), true),
                 });
                 this.refresh_tab_status(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// リモートタブの daemon の状態を読み直す（#2630）。稼働中の状態は 2 系統の同居の調査で tailscale の
+    /// CLI を最大 3 本起こすので、IPC の受け口と同じ `prepare_offload` → background → 着地を通し、
+    /// UI スレッドで待たない（タブを開くたび・「更新」・開始 / 停止の後に GUI が止まっていた）。
+    /// 読み終わるまでは前の値を出したまま（初めて開いたときは「読み込み中…」）。読み直しが重なったら
+    /// 最後に頼んだものだけを映す（先に頼んだ古い答えで上書きしない）。
+    /// background へ出さない形（A/B の `TAKO_2630_LEGACY=1` 等）は従来どおり同期で照会する
+    fn refresh_remote_status(&mut self, cx: &mut Context<Self>) {
+        let Some(app) = self.tako_app.upgrade() else {
+            self.status.remote = None;
+            return;
+        };
+        let request = Request::RemoteStatus;
+        let prepared = app.update(cx, |app, _| tako_control::prepare_offload(app, &request));
+        self.remote_status_seq += 1;
+        let job = match prepared {
+            None => {
+                self.remote_status_pending = false;
+                self.status.remote = self.query(request, cx);
+                return;
+            }
+            Some(Err(_)) => {
+                self.remote_status_pending = false;
+                self.status.remote = None;
+                return;
+            }
+            Some(Ok(job)) => job,
+        };
+        let seq = self.remote_status_seq;
+        self.remote_status_pending = true;
+        let weak_app = self.tako_app.clone();
+        let staged = cx
+            .background_executor()
+            .spawn(async move { job.run_staged() });
+        cx.spawn(async move |this, cx| {
+            let outcome = staged.await;
+            let origin = tako_core::pane::PaneOrigin::User;
+            let result = crate::drive_offload(weak_app, outcome, origin, cx).await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                if this.remote_status_seq != seq {
+                    return;
+                }
+                this.remote_status_pending = false;
+                this.status.remote = result.ok();
                 cx.notify();
             });
         })
@@ -437,7 +551,8 @@ impl SettingsWindow {
                 );
             }
             SettingsTab::Remote => {
-                self.status.remote = self.query(Request::RemoteStatus, cx);
+                // #2630: tailscale の CLI を起こすので background で読む（着地で映す）
+                self.refresh_remote_status(cx);
                 self.status.remote_devices = self.query(
                     Request::RemoteDevices {
                         action: "list".into(),
@@ -2970,6 +3085,8 @@ impl SettingsWindow {
     fn render_remote_tab(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
         let status = self.status.remote.clone();
+        // #2630: 状態は background で読む。初めの答えが着くまでは「読み込み中…」
+        let loading = status.is_none() && self.remote_status_pending;
         // #976: ペインの ssh 検知による自動追加（リモートデーモンとは別の機能）
         let ssh_auto_folders = self.settings.ssh_auto_folders;
         let running = status
@@ -3053,38 +3170,41 @@ impl SettingsWindow {
                                     to_hsla(theme.text_faint)
                                 })
                                 .text_size(px(12.))
-                                .child(if running {
+                                .child(if loading {
+                                    txt::msg_loading()
+                                } else if running {
                                     txt::remote_status_running()
                                 } else {
                                     txt::remote_status_stopped()
                                 }),
                         )
-                        .child(if running {
-                            self.button(
-                                "remote-stop",
-                                txt::remote_stop(),
-                                BtnKind::Danger,
-                                cx.listener(|this, _, _, cx| {
-                                    this.run_with_message(
-                                        Request::RemoteStop { force: false },
-                                        txt::msg_remote_stopped().to_string(),
-                                        cx,
-                                    );
-                                    this.refresh_tab_status(cx);
-                                }),
-                            )
-                        } else {
-                            // #1555: 起動は background で待つ（押し直しは無視し、待つ間は「起動中…」）
-                            self.button(
-                                "remote-start",
-                                if self.remote_starting {
-                                    crate::ui_text::remote::start_button_busy()
-                                } else {
-                                    txt::remote_start()
-                                },
-                                BtnKind::Primary,
-                                cx.listener(|this, _, _, cx| this.remote_start_off_ui(cx)),
-                            )
+                        // #2630: 初めの読み直しが着くまでは開始 / 停止を出さない（止まっていると読み違えて押させない）
+                        .when(!loading, |d| {
+                            d.child(if running {
+                                // #2630: 停止も background で待つ（押し直しは無視し、待つ間は「停止中…」）
+                                self.button(
+                                    "remote-stop",
+                                    if self.remote_busy == Some(RemoteDaemonOp::Stop) {
+                                        crate::ui_text::remote::stop_button_busy()
+                                    } else {
+                                        txt::remote_stop()
+                                    },
+                                    BtnKind::Danger,
+                                    cx.listener(|this, _, _, cx| this.remote_stop_off_ui(cx)),
+                                )
+                            } else {
+                                // #1555: 起動は background で待つ（押し直しは無視し、待つ間は「起動中…」）
+                                self.button(
+                                    "remote-start",
+                                    if self.remote_busy == Some(RemoteDaemonOp::Start) {
+                                        crate::ui_text::remote::start_button_busy()
+                                    } else {
+                                        txt::remote_start()
+                                    },
+                                    BtnKind::Primary,
+                                    cx.listener(|this, _, _, cx| this.remote_start_off_ui(cx)),
+                                )
+                            })
                         }),
                 ),
             )

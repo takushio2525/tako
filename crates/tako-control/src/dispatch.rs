@@ -6239,6 +6239,16 @@ pub enum OffloadJob {
     /// 子の起動情報を最長 30 秒待ち、子は起動の途中で GUI の IPC へ probe を送るので、UI スレッドで
     /// 待つと子の読み取りの上限（10 秒）まで互いに待ち合う。workspace に触らないので background から応答する
     RemoteStart(crate::host::RemoteStartJob),
+    /// リモートの daemon の停止（#2630。`force` でなければ host が渡した [`crate::host::RemoteStopJob`]）。
+    /// daemon が畳み終わる（serve の解除を含む）のを最長数秒待ち、止まった後に状態を読み直すので、
+    /// UI スレッドで待たない（本番の `dispatch:RemoteStop` 247〜349ms）。workspace に触らないので background から応答する
+    RemoteStop {
+        force: bool,
+        job: crate::host::RemoteStopJob,
+    },
+    /// リモートの daemon の状態（#2630。host が渡した [`crate::host::RemoteStatusJob`]）。稼働中は 2 系統の同居の
+    /// 調査で tailscale の CLI を最大 3 本起こすので、UI スレッドで待たない。workspace に触らないので background から応答する
+    RemoteStatus(crate::host::RemoteStatusJob),
     /// 利用制限の観測の要約と使用量の内訳（`tako_sessions` の `action: "usage"`。usage 分析 S1 #2200 /
     /// S2 #2201）。`<data_dir>/usage/` のファイルは記録が続くほど育ち、答える前に索引を最大 10 秒
     /// 読み進めるので、UI スレッドで読まない（workspace に触らないのでそのまま background から応答する）
@@ -7084,6 +7094,16 @@ pub fn prepare_offload(
         Request::RemoteStart {} if !crate::remote::start_offload_legacy() => host
             .remote_start_job()
             .map(|job| Ok(OffloadJob::RemoteStart(job))),
+        // #2630: daemon の停止（畳み終わりの待ち + 止まった後の状態の読み直し）と状態（tailscale の CLI を
+        // 最大 3 本）を UI スレッドで待たない。`force` の停止は同期の腕と同じく host を通らずに止める
+        // （仕事を渡す host = GUI のときだけ background へ出す）。仕事を渡さない host と A/B の
+        // `TAKO_2630_LEGACY=1` は同期の腕
+        Request::RemoteStop { force } if !crate::remote::stop_status_offload_legacy() => host
+            .remote_stop_job()
+            .map(|job| Ok(OffloadJob::RemoteStop { force: *force, job })),
+        Request::RemoteStatus if !crate::remote::stop_status_offload_legacy() => host
+            .remote_status_job()
+            .map(|job| Ok(OffloadJob::RemoteStatus(job))),
         // #2203: `show` は同じ段・期間・絞り込みで右パネルの usage ビューを開いてから、答えは同じ
         // background のジョブで返す（UI スレッドで行うのは引数の確かめと画面の段を置くことだけ）
         Request::Sessions {
@@ -7296,6 +7316,14 @@ impl OffloadJob {
             OffloadJob::RemoteAgents => remote_agents_reply(),
             // #1555: 同期の腕（`host.remote_start().map_err(DispatchError::Operation)`）と同じ応答
             OffloadJob::RemoteStart(job) => job().map_err(DispatchError::Operation),
+            // #2630: 同期の腕（`Request::RemoteStop` / `Request::RemoteStatus`）と同じ応答
+            OffloadJob::RemoteStop { force, job } => if force {
+                crate::remote::daemon_force_stop()
+            } else {
+                job()
+            }
+            .map_err(DispatchError::Operation),
+            OffloadJob::RemoteStatus(job) => Ok(job()),
             OffloadJob::UsageSummary(query) => crate::usage::usage_payload(
                 &query,
                 crate::usage::Refresh::Budget(crate::usage::MCP_REFRESH_BUDGET),
@@ -11772,6 +11800,9 @@ fn dispatch_inner(
         // #1555: IPC / 設定画面のボタンは `prepare_offload` が background へ出す（`OffloadJob::RemoteStart`）。
         // ここへ来るのは仕事を渡さない host・`TAKO_OFFLOAD=0`・A/B の `TAKO_1555_LEGACY=1`・直呼び
         Request::RemoteStart {} => host.remote_start().map_err(DispatchError::Operation),
+        // #2630: IPC / 設定画面は `prepare_offload` が background へ出す（`OffloadJob::RemoteStop` /
+        // `OffloadJob::RemoteStatus`）。ここへ来るのは仕事を渡さない host・`TAKO_OFFLOAD=0`・
+        // A/B の `TAKO_2630_LEGACY=1`・直呼び
         Request::RemoteStop { force } => {
             if force {
                 crate::remote::daemon_force_stop().map_err(DispatchError::Operation)
@@ -29012,6 +29043,14 @@ mod tests {
         remote_start_reply: Option<Result<Value, String>>,
         /// #1555: 同期の腕（`remote_start`）が呼ばれた回数
         remote_start_sync_calls: usize,
+        /// #2630: `remote_stop_job` が渡す仕事の答え（既定 None = 仕事を渡さない host = 同期の腕）
+        remote_stop_reply: Option<Result<Value, String>>,
+        /// #2630: 同期の腕（`remote_stop`）が呼ばれた回数
+        remote_stop_sync_calls: usize,
+        /// #2630: `remote_status_job` が渡す仕事の答え（既定 None = 仕事を渡さない host = 同期の腕）
+        remote_status_reply: Option<Value>,
+        /// #2630: 同期の腕（`remote_status`）が呼ばれた回数
+        remote_status_sync_calls: std::cell::Cell<usize>,
     }
 
     /// #1908: ファイルツリーの代役（見えている行・選択・開閉の記録）
@@ -29127,6 +29166,10 @@ mod tests {
                 tree: MockTree::default(),
                 remote_start_reply: None,
                 remote_start_sync_calls: 0,
+                remote_stop_reply: None,
+                remote_stop_sync_calls: 0,
+                remote_status_reply: None,
+                remote_status_sync_calls: std::cell::Cell::new(0),
             }
         }
 
@@ -30227,6 +30270,27 @@ mod tests {
         }
         fn remote_start_job(&self) -> Option<crate::host::RemoteStartJob> {
             let reply = self.remote_start_reply.clone()?;
+            Some(Box::new(move || reply))
+        }
+        fn remote_stop(&mut self) -> Result<Value, String> {
+            self.remote_stop_sync_calls += 1;
+            self.remote_stop_reply
+                .clone()
+                .unwrap_or_else(|| Err(crate::HostRefusal::DefaultRemoteApiNotRunning.into()))
+        }
+        fn remote_stop_job(&self) -> Option<crate::host::RemoteStopJob> {
+            let reply = self.remote_stop_reply.clone()?;
+            Some(Box::new(move || reply))
+        }
+        fn remote_status(&self) -> Value {
+            self.remote_status_sync_calls
+                .set(self.remote_status_sync_calls.get() + 1);
+            self.remote_status_reply
+                .clone()
+                .unwrap_or_else(|| json!({ "running": false }))
+        }
+        fn remote_status_job(&self) -> Option<crate::host::RemoteStatusJob> {
+            let reply = self.remote_status_reply.clone()?;
             Some(Box::new(move || reply))
         }
     }
@@ -55168,6 +55232,179 @@ tako | pane 2 [ compact ]       [-]
             json!({ "running": true })
         );
         assert_eq!(host.remote_start_sync_calls, 1);
+    }
+
+    /// background のジョブを走らせ、応答（`Reply`）を取り出す。UI スレッドへの続きを作ったら落とす（#2630）
+    fn issue2630_reply_of(job: OffloadJob, what: &str) -> Result<Value, DispatchError> {
+        match job.run_staged() {
+            OffloadOutcome::Reply(r) => r,
+            OffloadOutcome::OnUi(_) => panic!("{what} の続きを UI スレッドへ戻している"),
+        }
+    }
+
+    /// #2630: `RemoteStop` / `RemoteStatus` は host が仕事を渡せば background へ出し、応答は同期の腕と同じ。
+    /// 仕事を渡さない host は同期の腕のまま
+    #[test]
+    fn issue2630_remote_stopとstatusは仕事を渡すhostだけbackgroundへ出る() {
+        let stop = Request::RemoteStop { force: false };
+        let force = Request::RemoteStop { force: true };
+        let status = Request::RemoteStatus;
+
+        // 仕事を渡さない host: ジョブにしない = 同期の腕
+        let mut host = MockHost::new();
+        assert!(prepare_offload(&mut host, &stop).is_none());
+        assert!(prepare_offload(&mut host, &force).is_none());
+        assert!(prepare_offload(&mut host, &status).is_none());
+        let sync = dispatch(&mut host, stop.clone(), PaneOrigin::Cli).unwrap_err();
+        assert!(matches!(sync, DispatchError::Operation(_)), "{sync:?}");
+        assert_eq!(host.remote_stop_sync_calls, 1);
+        assert_eq!(
+            dispatch(&mut host, status.clone(), PaneOrigin::Cli).unwrap(),
+            json!({ "running": false })
+        );
+        assert_eq!(host.remote_status_sync_calls.get(), 1);
+
+        // 仕事を渡す host: ジョブになり、UI スレッドで host の同期の腕を呼ばない
+        let stopped = json!({ "stopped": true, "via": "shutdown" });
+        host.remote_stop_reply = Some(Ok(stopped.clone()));
+        let job = match prepare_offload(&mut host, &stop) {
+            Some(Ok(job @ OffloadJob::RemoteStop { force: false, .. })) => job,
+            _ => panic!("RemoteStop が background のジョブにならない"),
+        };
+        assert_eq!(host.remote_stop_sync_calls, 1, "準備で止めない");
+        assert_eq!(issue2630_reply_of(job, "RemoteStop").unwrap(), stopped);
+        assert_eq!(
+            dispatch(&mut host, stop.clone(), PaneOrigin::Cli).unwrap(),
+            stopped
+        );
+
+        // 断り・失敗も同期の腕と同じ形（`DispatchError::Operation` に包む）
+        let why = "リモートサーバーが起動していない（PID ファイルが無い）".to_string();
+        host.remote_stop_reply = Some(Err(why.clone()));
+        let offloaded = match prepare_offload(&mut host, &stop) {
+            Some(Ok(job)) => issue2630_reply_of(job, "RemoteStop").unwrap_err(),
+            _ => panic!("RemoteStop が background のジョブにならない"),
+        };
+        let synced = dispatch(&mut host, stop, PaneOrigin::Cli).unwrap_err();
+        assert_eq!(format!("{offloaded:?}"), format!("{synced:?}"));
+        assert_eq!(
+            format!("{offloaded:?}"),
+            format!("{:?}", DispatchError::Operation(why))
+        );
+
+        // `force` もジョブになる（中身は同期の腕と同じく host を通らない停止。答えの一致は
+        // 本物の state に触るので `issue2630_forceの停止は…` の子で見る）
+        match prepare_offload(&mut host, &force) {
+            Some(Ok(OffloadJob::RemoteStop { force: true, .. })) => {}
+            _ => panic!("RemoteStop（force）が background のジョブにならない"),
+        }
+
+        // 状態
+        let running =
+            json!({ "running": true, "pid": 4242, "url": "https://tako-2630.example.ts.net" });
+        host.remote_status_reply = Some(running.clone());
+        let job = match prepare_offload(&mut host, &status) {
+            Some(Ok(job @ OffloadJob::RemoteStatus(_))) => job,
+            _ => panic!("RemoteStatus が background のジョブにならない"),
+        };
+        assert_eq!(host.remote_status_sync_calls.get(), 1, "準備で読まない");
+        assert_eq!(issue2630_reply_of(job, "RemoteStatus").unwrap(), running);
+        assert_eq!(
+            dispatch(&mut host, status, PaneOrigin::Cli).unwrap(),
+            running
+        );
+    }
+
+    /// #2630: `force` の停止は background でも同期の腕と同じく host を通らずに止め、同じ答えを返す
+    /// （止まっている daemon への `--force` の断り。state は使い捨ての置き場）
+    #[test]
+    fn issue2630_forceの停止はbackgroundでも同期の腕と同じ答え() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2630_forceの停止はbackgroundでも同期の腕と同じ答え)
+        {
+            return;
+        }
+        let scratch = tako_core::test_residue::ScratchDir::new("tako-2630-force");
+        let state = scratch.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(scratch.path().join("data")).unwrap();
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", &state);
+        std::env::set_var("TAKO_DATA_DIR", scratch.path().join("data"));
+        std::env::set_var("TAKO_ISOLATED", "1");
+        std::env::set_var(
+            "TAKO_TAILSCALE_BIN",
+            scratch.path().join("no-such-tailscale"),
+        );
+        std::env::remove_var("TAKO_REMOTE_ENDPOINT");
+        std::env::remove_var(crate::remote::STOP_STATUS_OFFLOAD_LEGACY_ENV);
+        assert!(
+            crate::remote::state_dir().starts_with(scratch.path()),
+            "state が使い捨ての置き場を向いていない"
+        );
+
+        let mut host = MockHost::new();
+        // host の停止が呼ばれたら分かる答え（force は通らないはず）
+        host.remote_stop_reply = Some(Ok(json!({ "stopped": true, "via": "host" })));
+        let force = Request::RemoteStop { force: true };
+        let offloaded = match prepare_offload(&mut host, &force) {
+            Some(Ok(job)) => issue2630_reply_of(job, "RemoteStop（force）"),
+            _ => panic!("RemoteStop（force）が background のジョブにならない"),
+        };
+        std::env::set_var(crate::remote::STOP_STATUS_OFFLOAD_LEGACY_ENV, "1");
+        assert!(prepare_offload(&mut host, &force).is_none());
+        let synced = dispatch(&mut host, force, PaneOrigin::Cli);
+        assert!(
+            offloaded.is_err(),
+            "止まっている daemon への --force は断る: {offloaded:?}"
+        );
+        assert_eq!(format!("{offloaded:?}"), format!("{synced:?}"));
+        assert_eq!(
+            host.remote_stop_sync_calls, 0,
+            "force が host の停止を通った"
+        );
+    }
+
+    /// #2630 の A/B: `TAKO_2630_LEGACY=1` は修正前と同じく同期の腕（UI スレッドで待つ）。
+    /// `RemoteStart` の A/B（`TAKO_1555_LEGACY`）とは別の門
+    #[test]
+    fn issue2630_legacyはremote_stopとstatusを同期の腕で答える() {
+        if tako_core::run_alone!(issue2630_legacyはremote_stopとstatusを同期の腕で答える)
+        {
+            return;
+        }
+        let stop = Request::RemoteStop { force: false };
+        let mut host = MockHost::new();
+        host.remote_stop_reply = Some(Ok(json!({ "stopped": true })));
+        host.remote_status_reply = Some(json!({ "running": true }));
+        host.remote_start_reply = Some(Ok(json!({ "running": true })));
+        std::env::remove_var(crate::remote::START_OFFLOAD_LEGACY_ENV);
+        assert!(prepare_offload(&mut host, &stop).is_some());
+        assert!(prepare_offload(&mut host, &Request::RemoteStatus).is_some());
+        std::env::set_var(crate::remote::STOP_STATUS_OFFLOAD_LEGACY_ENV, "1");
+        assert!(crate::remote::stop_status_offload_legacy());
+        assert!(
+            prepare_offload(&mut host, &stop).is_none(),
+            "A/B なのに RemoteStop を background へ出している"
+        );
+        assert!(prepare_offload(&mut host, &Request::RemoteStop { force: true }).is_none());
+        assert!(
+            prepare_offload(&mut host, &Request::RemoteStatus).is_none(),
+            "A/B なのに RemoteStatus を background へ出している"
+        );
+        assert!(
+            prepare_offload(&mut host, &Request::RemoteStart {}).is_some(),
+            "#2630 の A/B が RemoteStart（#1555）まで戻している"
+        );
+        assert_eq!(
+            dispatch(&mut host, stop, PaneOrigin::Cli).unwrap(),
+            json!({ "stopped": true })
+        );
+        assert_eq!(host.remote_stop_sync_calls, 1);
+        assert_eq!(
+            dispatch(&mut host, Request::RemoteStatus, PaneOrigin::Cli).unwrap(),
+            json!({ "running": true })
+        );
+        assert_eq!(host.remote_status_sync_calls.get(), 1);
     }
 
     /// #1984: UI スレッドの同期の dispatch で子プロセスを待っていた要求だけが background へ出る。

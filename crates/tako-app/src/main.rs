@@ -28830,13 +28830,31 @@ impl RemoteHost for TakoApp {
     }
 
     fn remote_stop(&mut self) -> Result<serde_json::Value, String> {
-        use tako_control::remote::{with_origin, RequestOrigin};
-        with_origin(RequestOrigin::Dispatch, tako_control::remote::daemon_stop)
+        remote_stop_from_dispatch()
+    }
+
+    // #2630: IPC の受け口と設定画面の「停止」はこれを background で走らせる（daemon が畳み終わるのを
+    // UI スレッドで待たない。本番の dispatch:RemoteStop 247〜349ms）
+    fn remote_stop_job(&self) -> Option<tako_control::RemoteStopJob> {
+        Some(Box::new(remote_stop_from_dispatch))
     }
 
     fn remote_status(&self) -> serde_json::Value {
         tako_control::remote::daemon_status()
     }
+
+    // #2630: IPC の受け口と設定画面のリモートタブの読み直しはこれを background で走らせる
+    // （稼働中の状態は tailscale の CLI を最大 3 本起こす）
+    fn remote_status_job(&self) -> Option<tako_control::RemoteStatusJob> {
+        Some(Box::new(tako_control::remote::daemon_status))
+    }
+}
+
+/// dispatch（MCP `tako_remote_stop` の IPC・設定画面の「停止」）が頼んだ daemon の停止（#2533 の経路の名乗りつき）。
+/// 同期の腕（`remote_stop`）と background の仕事（`remote_stop_job`。#2630）の 1 実装
+fn remote_stop_from_dispatch() -> Result<serde_json::Value, String> {
+    use tako_control::remote::{with_origin, RequestOrigin};
+    with_origin(RequestOrigin::Dispatch, tako_control::remote::daemon_stop)
 }
 
 impl WebViewHost for TakoApp {
