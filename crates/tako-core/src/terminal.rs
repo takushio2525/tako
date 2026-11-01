@@ -4586,10 +4586,15 @@ mod tests {
         )
     }
 
-    /// HUP の後に tty のバッファを超える量（256 KiB）を書く
+    /// HUP の後に tty とパイプのバッファを超える量（64 KiB）を書く（読まれなければ `tr` が tty への
+    /// 書き込みで止まり、パイプラインが終わらない）
     #[cfg(unix)]
-    const FLOOD_AFTER_HUP: &str =
-        "dd if=/dev/zero bs=1024 count=256 2>/dev/null | tr \"\\000\" x; ";
+    const FLOOD_AFTER_HUP: &str = "dd if=/dev/zero bs=1024 count=64 2>/dev/null | tr \"\\000\" x; ";
+
+    /// 読み切りの上限をテストでは十分長くする（混んだ CI で上限に当たって読むのをやめると、
+    /// 書き込みで止まった子を `Pty` の drop が待ち続ける = 確かめたいことが時間の話に化ける）
+    #[cfg(unix)]
+    const TEST_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
 
     #[cfg(unix)]
     #[test]
@@ -4597,7 +4602,7 @@ mod tests {
         let dir = crate::test_residue::ScratchDir::new("tako-2625-drain");
         let marker = dir.path().join("hup");
         let (mut session, mut rx) = spawn_hup_child(&marker, FLOOD_AFTER_HUP);
-        session.hang_up_client_on_close();
+        session.hang_up_client_on_close_within(TEST_DRAIN_LIMIT);
         let child = session.child_pid().expect("子の pid");
         let mut guard = ReapGuard(Some(child));
         let mut seen = Vec::new();
@@ -4605,7 +4610,7 @@ mod tests {
         seen.clear();
 
         drop(session);
-        // 閉じる知らせで子へ SIGHUP が届き、子が書いた 256 KiB を親側が読み切るので子は印まで進む
+        // 閉じる知らせで子へ SIGHUP が届き、子が書いた 64 KiB を親側が読み切るので子は印まで進む
         wait_until(
             "子が HUP の後の出力を書き切って印を書く",
             || marker.exists(),

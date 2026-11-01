@@ -562,22 +562,21 @@ where
         let started = Instant::now();
         let mut buf = [0u8; 4096];
         loop {
+            // 上限は毎回見る（相手が書き続けても抜ける）
+            if started.elapsed() >= limit {
+                tracing::warn!(
+                    "PTY の子の側が {}ms で閉じなかったので待たずに閉じる（#2625）",
+                    limit.as_millis()
+                );
+                return;
+            }
             match self.pty.reader().read(&mut buf) {
                 // 子の側が全部閉じた（macOS）
                 Ok(0) => return,
                 Ok(_) => {}
                 Err(err) => match err.kind() {
                     ErrorKind::Interrupted => {}
-                    ErrorKind::WouldBlock => {
-                        if started.elapsed() >= limit {
-                            tracing::warn!(
-                                "PTY の子の側が {}ms で閉じなかったので待たずに閉じる（#2625）",
-                                limit.as_millis()
-                            );
-                            return;
-                        }
-                        std::thread::sleep(HANG_UP_DRAIN_POLL);
-                    }
+                    ErrorKind::WouldBlock => std::thread::sleep(HANG_UP_DRAIN_POLL),
                     // 子の側が全部閉じた（Linux の EIO）か、もう読めない
                     _ => return,
                 },
