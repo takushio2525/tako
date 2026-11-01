@@ -388,3 +388,13 @@ held launches under `launches`. If the work is urgent, launch it now with
 `tako queue start <pane>` (MCP `tako_queue` with `action: "start"`, `id` = pane).
 Running workers are never stopped. After a reboot, saved sessions come back one at
 a time, masters first.
+
+<!-- #1721: 狭いペインでは claude が背景作業の申告を折り返すので、tako がつないで読む。 -->
+<!-- 旧い 2 行（"On very narrow panes the status line is truncated, …"）は意図して消し、 -->
+<!-- system_prompt_before_1154.md からも同じ PR で外した。monitoring の #1273 の段落へ足した本文 -->
+blocking *on* the background work — stays `busy`. On narrow panes claude wraps
+that line mid-declaration; tako joins the wrapped rows (Issue #1721), but only
+when it is the last message above the input box (an older turn's line above a new
+request or spinner does not count). When the declaration cannot be read and the
+status line is cut by the pane width, the worker stays `busy` and
+`idle_override_blocked` says `status_line_truncated` — widen the pane or read it.
