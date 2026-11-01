@@ -8,6 +8,10 @@
 //! (バリアント, 言語) の網羅 match の 1 か所に置く（形は [`crate::SessionRefusal`] と同じ）。
 //! 日本語は #2365 より前の固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。
 //!
+//! daemon を起こしている途中（#2608 の印が効いている間）の明示の start / stop の断り
+//! （`DaemonStarting` / `DaemonStartingStop`。#2613）もここに置く。`remote::spawn_daemon` /
+//! `daemon_stop` は `String` を返す従来の口のまま、この型の表示（呼び手のプロセスの表示言語）を載せる。
+//!
 //! # 口
 //!
 //! dispatch と CLI だけが呼ぶ口（`remote::devices_*` / `admin_request` / `scrollback*` /
@@ -112,6 +116,18 @@ pub enum RemoteRefusal {
     VariantSave(String),
     /// MagicDNS 名を取れない
     MagicDnsMissing,
+
+    // ---- daemon を起こしている途中（#2608 の印が効いている。#2613） ----
+    /// 起こしている途中なので、2 本目の daemon を起こさなかった（`tako remote start` / 起動ボタン / MCP）
+    DaemonStarting {
+        marker: crate::remote_starting::StartingMarker,
+        now: u64,
+    },
+    /// 起こしている途中なので止めなかった（止めても進行中の起動が新版を起こし直す / 止める手掛かりが無い）
+    DaemonStartingStop {
+        marker: crate::remote_starting::StartingMarker,
+        now: u64,
+    },
 }
 
 /// daemon が断ったときの本文の中身
@@ -312,6 +328,27 @@ impl RemoteRefusal {
             }
             (Self::MagicDnsMissing, Ja) => "MagicDNS 名を取得できません".to_string(),
             (Self::MagicDnsMissing, En) => "cannot get the MagicDNS name".to_string(),
+            // stop を案内しない（#2608 の status と同じ。止めると立ち上がりかけの新版を止めさせる）
+            (Self::DaemonStarting { marker, now }, Ja) => format!(
+                "{}。2 本目の daemon を起こさないよう、この起動は行いませんでした。\
+                 終わるまで待ってから `tako remote status` を読み直してください",
+                crate::remote_starting::doing_in(marker, *now, lang)
+            ),
+            (Self::DaemonStarting { marker, now }, En) => format!(
+                "{}. This start was not carried out so as not to launch a second daemon. \
+                 Wait for it to finish, then check `tako remote status` again",
+                crate::remote_starting::doing_in(marker, *now, lang)
+            ),
+            (Self::DaemonStartingStop { marker, now }, Ja) => format!(
+                "{}。いま止めても進行中の起動が daemon を起こし直すため、止めていません。\
+                 終わるまで待ってから `tako remote stop` で止めてください",
+                crate::remote_starting::doing_in(marker, *now, lang)
+            ),
+            (Self::DaemonStartingStop { marker, now }, En) => format!(
+                "{}. It was not stopped, because the start in progress would launch the daemon again. \
+                 Wait for it to finish, then stop it with `tako remote stop`",
+                crate::remote_starting::doing_in(marker, *now, lang)
+            ),
         }
     }
 

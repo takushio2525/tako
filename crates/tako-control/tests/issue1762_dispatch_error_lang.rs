@@ -12799,6 +12799,7 @@ fn cli_の台帳の手元の処理は日本語の口を呼ばない() {
 // `RemoteRefusal`） ----
 
 use tako_control::remote_refusal::{DaemonMessage, ScrollbackCause};
+use tako_control::remote_starting::StartingMarker;
 use tako_control::RemoteRefusal;
 
 const REMOTE_REFUSAL_SRC: &str = include_str!("../src/remote_refusal.rs");
@@ -12856,9 +12857,21 @@ fn remote_refusal_index(r: &RemoteRefusal) -> usize {
         RemoteRefusal::VariantStateDirCreate(_) => 28,
         RemoteRefusal::VariantSave(_) => 29,
         RemoteRefusal::MagicDnsMissing => 30,
+        RemoteRefusal::DaemonStarting { .. } => 31,
+        RemoteRefusal::DaemonStartingStop { .. } => 32,
     }
 }
-const REMOTE_REFUSAL_VARIANTS: usize = 31;
+const REMOTE_REFUSAL_VARIANTS: usize = 33;
+
+/// 起こしている途中の印の見本（#2613 の断りの表に使う）
+fn starting_marker(via: &str, previous_pid: Option<u32>) -> StartingMarker {
+    StartingMarker {
+        at: 1000,
+        pid: 4242,
+        via: via.into(),
+        previous_pid,
+    }
+}
 
 /// `DaemonMessage` / `ScrollbackCause` の通し番号（網羅 match）
 fn daemon_message_index(m: &DaemonMessage) -> usize {
@@ -13033,6 +13046,27 @@ fn remote_refusal_table() -> Vec<(RemoteRefusal, String)> {
         (
             RemoteRefusal::MagicDnsMissing,
             "MagicDNS 名を取得できません".into(),
+        ),
+        // #2613 で足した断り（#2365 より前の文は無いので、日本語の見本を固定する）
+        (
+            RemoteRefusal::DaemonStarting {
+                marker: starting_marker("autostart", Some(77)),
+                now: 1007,
+            },
+            "GUI 起動時の自動復帰がリモート daemon を新版へ入れ替えている途中です（旧版の PID 77・開始から 7 秒）。\
+             2 本目の daemon を起こさないよう、この起動は行いませんでした。\
+             終わるまで待ってから `tako remote status` を読み直してください"
+                .into(),
+        ),
+        (
+            RemoteRefusal::DaemonStartingStop {
+                marker: starting_marker("cli", None),
+                now: 1003,
+            },
+            "`tako remote start`がリモート daemon を起動している途中です（開始から 3 秒）。\
+             いま止めても進行中の起動が daemon を起こし直すため、止めていません。\
+             終わるまで待ってから `tako remote stop` で止めてください"
+                .into(),
         ),
     ]
 }
