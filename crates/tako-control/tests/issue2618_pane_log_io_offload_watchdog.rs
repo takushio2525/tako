@@ -267,13 +267,16 @@ fn issue2618_終了はペインログの書き手を待ってから後片付け�
 #[test]
 fn issue2618_全体上限の受け口はmutexを放してから待つ() {
     let src = read(MAIN);
-    for at in all_at(&src, ".enforce_total_cap()") {
-        panic!(
-            "{MAIN}:{} が同期の全体上限（`.enforce_total_cap()`）を呼んでいる（Mutex を握ったまま削除の I/O をする = #2618）。\
-             `queue_total_cap()` を積み、Mutex を放してから `.recv()` で待つ",
-            line_at(&src, at)
-        );
-    }
+    let sync_cap: Vec<String> = all_at(&src, ".enforce_total_cap()")
+        .into_iter()
+        .map(|at| format!("{MAIN}:{}", line_at(&src, at)))
+        .collect();
+    assert!(
+        sync_cap.is_empty(),
+        "同期の全体上限（`.enforce_total_cap()`）を呼んでいる（Mutex を握ったまま削除の I/O をする = #2618）。\
+         `queue_total_cap()` を積み、Mutex を放してから `.recv()` で待つ:\n{}",
+        sync_cap.join("\n")
+    );
     let queued = all_at(&src, ".queue_total_cap()");
     assert!(
         !queued.is_empty(),
