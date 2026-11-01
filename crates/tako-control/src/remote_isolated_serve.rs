@@ -253,7 +253,8 @@ mod tests {
     #[test]
     fn 隔離中の操作ごとの通す理由() {
         // (理由の名前, 入れ方, [Serve, ServeCleanup, Install, OpenViewer] で通すか)
-        let table: [(&str, fn(&mut Inputs), [bool; 4]); 6] = [
+        type Row = (&'static str, fn(&mut Inputs), [bool; 4]);
+        let table: [Row; 6] = [
             ("理由なし", |_| {}, [false, false, false, false]),
             (
                 "検証モード",

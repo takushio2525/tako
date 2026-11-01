@@ -837,7 +837,8 @@ fn 実際の機械全体の門はenvで答えを変える() {
     let fake = fake.to_str().expect("utf-8");
     let iso = ("TAKO_ISOLATED", "1");
     // (env, [後始末, 導入, ビューア])
-    let table: Vec<(Vec<(&str, &str)>, [bool; 3])> = vec![
+    type Env<'a> = Vec<(&'a str, &'a str)>;
+    let table: Vec<(Env, [bool; 3])> = vec![
         (vec![], [true, true, true]),
         (vec![("TAKO_ISOLATED", "0")], [true, true, true]),
         (vec![iso], [false, false, false]),
