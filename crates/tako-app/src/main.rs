@@ -33750,6 +33750,8 @@ mod self_test {
     mod palette_alias_2340;
     #[cfg(feature = "visual-test")]
     use palette_alias_2340::palette_alias_visual;
+    /// #1556: ソースツリーの根と、項目 14 が `cargo build -p tako-cli` を回す dir（cwd に依らない）
+    mod repo_root_1556;
 
     /// セルフテスト開始時刻（環境 1 行の `elapsed` 用。#796）
     static STARTED_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -33783,19 +33785,12 @@ mod self_test {
     ///
     /// `env!("CARGO_MANIFEST_DIR")` はビルド機の絶対パスが文字列のまま release バイナリへ
     /// 入り（`--remap-path-prefix` も届かない）、配布物にホームパスを残すので使わない。
-    /// 実行中のバイナリ（`target/…/tako-app`・`dist/tako.app/…`）とカレントディレクトリから
-    /// 上へ辿り、`crates/tako-app/Cargo.toml` のある dir を返す。リポジトリの外（配布物を
-    /// そのまま走らせた）なら `None`
+    /// 実行中のバイナリ（`target/…/tako-app`・`dist/tako.app/…`）・`cargo run` が渡す実行時の
+    /// `CARGO_MANIFEST_DIR`・カレントディレクトリの順に上へ辿り、`crates/tako-app/Cargo.toml` の
+    /// ある dir を返す（1 実装は `repo_root_1556`。項目 14 の cargo もここで決めた根で回す = #1556）。
+    /// リポジトリの外（配布物をそのまま走らせた）なら `None`
     fn source_tree_root() -> Option<std::path::PathBuf> {
-        [std::env::current_exe().ok(), std::env::current_dir().ok()]
-            .into_iter()
-            .flatten()
-            .find_map(|start| {
-                start
-                    .ancestors()
-                    .find(|d| d.join("crates/tako-app/Cargo.toml").is_file())
-                    .map(std::path::Path::to_path_buf)
-            })
+        repo_root_1556::source_tree_root()
     }
 
     #[cfg(test)]
@@ -65378,13 +65373,27 @@ mod self_test {
             // ここからはペイン内のシェルから実際に `tako` CLI を叩いて検証する。
             // 出力マーカーは `$((40+2))` で組み立て、入力エコー行との誤一致を防ぐ
 
-            // 14. CLI バイナリの準備（target/debug/tako。常にビルドして鮮度を保証）
+            // 14. CLI バイナリの準備（target/debug/tako。常にビルドして鮮度を保証）。
+            //     cargo はリポジトリの根で回す（cwd に依らない。根が無ければ案内で止まる = #1556）
             let (cli_path, cli) = {
-                let built = std::process::Command::new("cargo")
-                    .args(["build", "-p", "tako-cli", "--quiet"])
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
+                let mut build = std::process::Command::new("cargo");
+                build.args(["build", "-p", "tako-cli", "--quiet"]);
+                match repo_root_1556::cli_build_dir() {
+                    repo_root_1556::CliBuildDir::Root { root, from } => {
+                        println!(
+                            "TAKO_SELF_TEST_1556: cargo build -p tako-cli dir={} from={}",
+                            root.display(),
+                            from.label()
+                        );
+                        build.current_dir(root);
+                    }
+                    // TAKO_1556_LEGACY=1: 修正前と同じくカレントディレクトリのまま回す（A/B）
+                    repo_root_1556::CliBuildDir::LegacyCwd => {
+                        println!("TAKO_SELF_TEST_1556: cargo build -p tako-cli dir=cwd legacy=1");
+                    }
+                    repo_root_1556::CliBuildDir::Missing(why) => fail(&why.to_string()),
+                }
+                let built = build.status().map(|s| s.success()).unwrap_or(false);
                 // Windows では `tako.exe`。`EXE_SUFFIX` は std の定数なので cfg を書かない
                 let path = std::env::current_exe()
                     .ok()
