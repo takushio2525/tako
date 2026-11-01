@@ -262,6 +262,33 @@ pub fn hang_up_client_on_close() -> bool {
     cfg!(unix) && crate::backend::choice() == crate::backend::Choice::Tmux && !issue2625_legacy()
 }
 
+/// #2634 の A/B（`TAKO_2634_LEGACY=1`）。同一バイナリのまま、器なしの `tako tmux open` のペインを
+/// 修正前の閉じ方（読むのをやめる → SIGHUP → 子を wait → PTY の親側を閉じる）へ戻す。**ゲートはこの 1 か所**
+pub fn issue2634_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2634_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// 器なしの `tako tmux open` のペイン（#1185 / #1190）の端末を、閉じるときに attach クライアントを
+/// 先に帰す順にするか（#2634。[`hang_up_client_on_close`] と同じ形を利用者の tmux サーバーへ広げる）。
+///
+/// 器なし（persist OFF）のビューペインの PTY 直下の子は**利用者の** tmux サーバーの attach
+/// クライアント（ログインシェルの `-c` が exec する）で、その tty は利用者のサーバーも開いている。
+/// 従来の閉じ方では tty の最後の close が利用者のサーバーの中で起き、閉じるたびに利用者の
+/// tmux サーバー全体が約 600ms 止まった（macOS で実測 592〜606ms）。器に包まれたビュー
+/// （persist ON）は PTY 直下が器のクライアントなので [`hang_up_client_on_close`] の側で立つ。
+///
+/// 器の種類は問わない（ビューは常に `tmux` を起こす）。偽: unix 以外（`tako tmux open` は
+/// attach 前提 = psmux は非対応 #519・ConPTY には tty の close が無い）・A/B
+pub fn hang_up_view_client_on_close() -> bool {
+    cfg!(unix) && !issue2634_legacy()
+}
+
 /// 自ら閉じたペインの最後の出力の置き場（[`PANE_DIED_DIR`]）。データディレクトリが無ければ None
 pub fn pane_died_dir() -> Option<PathBuf> {
     data_dir().map(|dir| dir.join(PANE_DIED_DIR))
