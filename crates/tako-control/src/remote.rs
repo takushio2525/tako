@@ -3376,6 +3376,16 @@ fn forget_if_stopped(result: Result<Value, String>) -> Result<Value, String> {
 /// SIGKILL などで daemon 自身のクリーンアップが走らなかったケースの回収。
 /// 自 socket + 旧 TCP 残骸の両方を回収する（ユーザー設定は不可侵）
 fn cleanup_serve_leftover() {
+    // #2624: 隔離中は、この env が serve を張れたとき（偽の tailscale・opt-in・A/B）だけ本物の
+    // tailscale へ話す。それ以外の砂場の stop は機械全体の serve を読みも外しもしない
+    // （張れない env の daemon は serve を持たない。張った daemon は自分の終了で外す）
+    if !crate::remote_isolated_serve::allowed(crate::remote_isolated_serve::Op::ServeCleanup) {
+        audit_serve(
+            "isolated_serve_cleanup_skipped",
+            serde_json::json!({ "cause": "stop_cleanup" }),
+        );
+        return;
+    }
     let Some(cli) = crate::tailscale::find_tailscale() else {
         return;
     };

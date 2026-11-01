@@ -11,7 +11,8 @@
 //! daemon を起こしている途中（#2608 の印が効いている間）の明示の start / stop の断り
 //! （`DaemonStarting` / `DaemonStartingStop`。#2613）もここに置く。`remote::spawn_daemon` /
 //! `daemon_stop` は `String` を返す従来の口のまま、この型の表示（呼び手のプロセスの表示言語）を載せる。
-//! 隔離中（`TAKO_ISOLATED`）に本物の tailscale の serve を張らなかった断り（`IsolatedServe`。#2619）も同じ形。
+//! 隔離中（`TAKO_ISOLATED`）に本物の tailscale の serve を張らなかった断り（`IsolatedServe`。#2619）と、
+//! 対話の setup が Tailscale を導入しなかった断り（`IsolatedInstall`。#2624）も同じ形。
 //!
 //! # 口
 //!
@@ -134,6 +135,9 @@ pub enum RemoteRefusal {
     /// 隔離中（`TAKO_ISOLATED`）なので本物の tailscale の serve を張らなかった
     /// （`tako remote start` / 起動ボタン / MCP / daemon の直起動 / UDS の setup。門は `remote_isolated_serve`）
     IsolatedServe,
+    /// 隔離中なので、対話の `tako remote setup` が未導入の Tailscale を導入しなかった（#2624。
+    /// 導入器はこの機械全体へ入れる。通すのは `TAKO_REMOTE_ISOLATED_SERVE=1` だけ）
+    IsolatedInstall,
 }
 
 /// daemon が断ったときの本文の中身
@@ -369,6 +373,18 @@ impl RemoteRefusal {
                  overwrite the live remote access or your own serve config. To try without serve, set \
                  TAKO_REMOTE_TEST_MODE=1; to use a fake tailscale, set TAKO_TAILSCALE_BIN=<path to the fake>; \
                  to exercise the real serve, set {}=1",
+                crate::remote_isolated_serve::OPT_IN_ENV
+            ),
+            (Self::IsolatedInstall, Ja) => format!(
+                "隔離中（TAKO_ISOLATED）なので、Tailscale を導入せずに止めました。導入はこの機械全体への\
+                 インストールで、隔離の外にあるためです（偽の TAKO_TAILSCALE_BIN では導入器は偽物になりません）。\
+                 導入まで確かめるなら {}=1 を付けてください",
+                crate::remote_isolated_serve::OPT_IN_ENV
+            ),
+            (Self::IsolatedInstall, En) => format!(
+                "Stopped without installing Tailscale because this process is isolated (TAKO_ISOLATED). \
+                 Installing is machine-wide and outside the sandbox (a fake TAKO_TAILSCALE_BIN does not make \
+                 the installer fake). To exercise the install, set {}=1",
                 crate::remote_isolated_serve::OPT_IN_ENV
             ),
         }
