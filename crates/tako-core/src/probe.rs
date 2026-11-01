@@ -89,6 +89,18 @@
 //! kill しても残るので、ログインシェルは**自分のプロセスグループ**で起こし、打ち切ったら
 //! グループごと畳む（[`group_output_with_timeout`]）。A/B は `issue1532_legacy`
 //! （`TAKO_1532_LEGACY=1`）の 1 か所
+//!
+//! ## グループの畳み方は TERM → 猶予 → KILL（Issue #2633）
+//!
+//! 畳むときにいきなり SIGKILL を送ると、rc の途中の処理は後片付けを走らせられない。実測では
+//! `.zprofile` の `pyenv rehash` がロック（`<pyenv root>/shims/.pyenv-shim`）を持つ間に打ち切ると、
+//! EXIT の trap が走らずにロックが残り、以後のログインシェルの rehash が残ったロックを待つ
+//! （pyenv の待ちは 60 秒・ここの上限は 5 秒なので、tako の問い合わせが自分でロックを片付けることは
+//! 無く、残っている間の問い合わせは全部打ち切りになる）。いまはグループへ **SIGTERM を 1 回だけ**送って
+//! 呼び手へはその場で返し（上限の契約は変えない）、刈り取り係（[`reap_group_in_background`]）が
+//! 猶予（[`GROUP_TERM_GRACE`]）の間グループを見張って、残っていれば SIGKILL で畳む。頭（直接の子）は
+//! 判定が済むまで刈り取らないので、グループの番号は別のグループへ使い回されない。
+//! A/B は [`issue2633_legacy`]（`TAKO_2633_LEGACY=1` = 猶予を置かずにグループごと SIGKILL）の 1 か所
 
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -181,6 +193,12 @@ const POLL_FIRST: Duration = Duration::from_millis(1);
 /// 上限まで伸びる（実測: 並列 `cargo test --workspace` の負荷下で予算 30 秒の
 /// 単体テストが 30 秒掛かった回がある）。パイプ容量は 64 KiB なので 2 秒あれば桁で足りる
 const READ_GRACE: Duration = Duration::from_secs(2);
+
+/// 打ち切ったグループへ SIGTERM を送ってから、SIGKILL で畳むまでの猶予（#2633）。
+///
+/// rc の後片付け（EXIT の trap の `rm` 1 回）に要るのはミリ秒の桁。待つのは呼び手ではなく
+/// 刈り取り係なので、ここを伸ばしても呼び手の待ちは伸びない（伸びるのは刈り取り係の寿命だけ）
+pub const GROUP_TERM_GRACE: Duration = Duration::from_secs(1);
 
 /// 待ちの結末。
 ///
@@ -591,6 +609,19 @@ pub fn issue1532_legacy() -> bool {
     })
 }
 
+/// #2633 の A/B（`TAKO_2633_LEGACY=1`）。打ち切ったグループ（[`group_output_with_timeout`] の子）を
+/// 修正前の形 = 猶予を置かずにグループごと SIGKILL で畳む（rc の EXIT の trap は走らない）。
+/// **ゲートはこの 1 か所**
+pub fn issue2633_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2633_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// コマンドを起こして、上限つきで待つ。
 ///
 /// **`Command` の組み立てごとここが持つ**（呼び手に `Command::new` を書かせない）。
@@ -665,10 +696,11 @@ pub fn command_output_with_timeout(
 ///
 /// ログインシェル（`$SHELL -l -c …`）のための口。rc が起こした孫（`sleep` / 入力を待つ `read` /
 /// パスフレーズを聞く `ssh-add`）は直接の子を kill しても残り、パイプの書き手として居座る。
-/// 打ち切ったら**グループごと** SIGKILL を送るので、孫も残らない。
+/// 打ち切ったら**グループへ** SIGTERM を 1 回送り、猶予（[`GROUP_TERM_GRACE`]）の後も残るものは
+/// SIGKILL で畳むので、孫も残らない。rc の途中の処理の後片付け（EXIT の trap）は走れる（#2633）。
 ///
 /// グループを分けるので、rc が端末（`/dev/tty`）を読もうとするとバックグラウンドの読み取りとして
-/// 止められる（SIGTTIN）。利用者の打鍵を横取りせず、止まったまま上限で畳まれる。
+/// 止められる（SIGTTIN）。利用者の打鍵を横取りせず、止まったまま上限で打ち切られ、猶予の後に畳まれる。
 /// 普通に終わったときは何も畳まない（rc が意図して残す常駐 = `ssh-agent` 等は従来どおり残る）。
 /// Windows はグループを分けない（ログインシェルを起こさない）= [`command_output_with_timeout`] と同じ
 pub fn group_output_with_timeout(command: &mut Command, label: &str, budget: Duration) -> Outcome {
@@ -693,23 +725,39 @@ pub fn group_output_with_timeout(command: &mut Command, label: &str, budget: Dur
 }
 
 /// 打ち切りの kill。子が**自分のプロセスグループを率いている**（[`group_output_with_timeout`] で
-/// 起こした）ならグループごと SIGKILL を送る（rc が起こした孫も残さない = #1532）。
-/// それ以外の子（親のグループに居る）は直接の子だけ（孫は残る = モジュール冒頭の「分かっている限界」）。
-/// Windows の孫は呼び手（[`wait_with_timeout`]）が先に入れ物（`kill_scope`）ごと止める（#2462）。
+/// 起こした）ならグループへ **SIGTERM を 1 回だけ**送って `true` を返す（#2633）。直接の子にも
+/// SIGKILL は送らない = rc の途中の処理（`pyenv rehash` のロック）が EXIT の trap で後片付けを終えられる。
+/// 残ったもの（TERM を無視する・止まっている）は呼び手が [`reap_group_in_background`] へ渡し、
+/// [`GROUP_TERM_GRACE`] の後に SIGKILL で畳む（rc が起こした孫も残さない = #1532）。
+/// A/B（[`issue2633_legacy`]）は修正前の形 = 猶予を置かずにグループごと SIGKILL。
+/// それ以外の子（親のグループに居る）は直接の子だけを kill して `false`（孫は残る = モジュール冒頭の
+/// 「分かっている限界」）。Windows の孫は呼び手（[`wait_with_timeout`]）が先に入れ物（`kill_scope`）ごと
+/// 止める（#2462）。
 ///
 /// グループへ送るのは子がまだ刈り取られていないとき（`try_wait` が `None` を返した直後）だけなので、
 /// 番号が別のグループへ使い回されていることは無い
-fn kill_on_timeout(child: &mut Child) {
+fn kill_on_timeout(child: &mut Child) -> bool {
     #[cfg(unix)]
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: プロセスの属性を読み、負の pid（= グループ宛て）へシグナルを送るだけでメモリには触れない
-        unsafe {
-            if libc::getpgid(pid) == pid {
-                libc::kill(-pid, libc::SIGKILL);
+        // SAFETY: プロセスの属性を読むだけでメモリには触れない
+        let leads_group = unsafe { libc::getpgid(pid) == pid };
+        if leads_group {
+            if issue2633_legacy() {
+                // SAFETY: 負の pid（= グループ宛て）へシグナルを送るだけでメモリには触れない
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            } else {
+                // SAFETY: 同上
+                unsafe {
+                    libc::kill(-pid, libc::SIGTERM);
+                }
+                return true;
             }
         }
     }
     let _ = child.kill();
+    false
 }
 
 /// 起こし済みの子を上限つきで待つ（**待ちの 1 実装**）。
@@ -755,11 +803,16 @@ pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Out
                 if start.elapsed() >= budget {
                     // #2462: 子孫は入れ物ごと（コンソールは止め GUI のアプリは残す）。直下の子は次の kill
                     descendants.stop();
-                    kill_on_timeout(&mut child);
+                    let group = kill_on_timeout(&mut child);
                     // 刈り取り（`wait`）は**ここで待たない**（#1979）。カーネルの中で止まった
                     // 子は SIGKILL を受けても出てくるまで終わらず、ここで `wait` すると
-                    // 上限そのものが意味を失う。刈り取り係へ渡して呼び手には今すぐ返す
-                    reap_in_background(child);
+                    // 上限そのものが意味を失う。刈り取り係へ渡して呼び手には今すぐ返す。
+                    // TERM を送ったグループの猶予と SIGKILL も刈り取り係が持つ（#2633）
+                    if group {
+                        reap_group_in_background(child);
+                    } else {
+                        reap_in_background(child);
+                    }
                     return Outcome::TimedOut {
                         label: label.to_string(),
                         waited: budget,
@@ -823,6 +876,54 @@ fn reap_in_background(mut child: Child) {
     // スレッドを作れない（資源切れ）ときは刈り取りを諦める。ここで同期に待つと
     // 上限の意味が消えるので、ゾンビ 1 つを残すほうを選ぶ
     drop(spawned);
+}
+
+/// 打ち切りで SIGTERM を送ったグループ（[`kill_on_timeout`] が `true` を返した子）を刈り取る（#2633）。
+///
+/// 呼び手へはもう返してある（ここは別スレッド = 上限の契約にも #1979 の「刈り取りを待たない」にも
+/// 触れない）。グループに生きたプロセスが居なくなるか [`GROUP_TERM_GRACE`] を過ぎるまで見張り、
+/// 過ぎてもまだ居れば SIGKILL で畳んでから頭（直接の子）を刈り取る。TERM を無視する・止まった
+/// （SIGTTIN）メンバーもここで消える。
+///
+/// **頭は判定が済むまで刈り取らない**: 刈り取ると頭の番号（= グループの番号）が空き、後から生まれた
+/// 別のグループへ SIGKILL を送りうる。生き死には `kill(-pgid, 0)` で見る（生きたメンバーが居る間だけ
+/// 0。macOS は刈り取り前の頭だけが残ると EPERM、刈り取った後は ESRCH を返す = どちらも「居ない」）
+#[cfg(unix)]
+fn reap_group_in_background(mut child: Child) {
+    let pgid = libc::pid_t::try_from(child.id()).ok();
+    let spawned = std::thread::Builder::new()
+        .name("tako-probe-reap".into())
+        .spawn(move || {
+            if let Some(pgid) = pgid {
+                let start = Instant::now();
+                // SAFETY: グループ宛てに 0 番（居るかどうかの確かめ）を送るだけでメモリには触れない
+                while unsafe { libc::kill(-pgid, 0) } == 0 {
+                    if start.elapsed() >= GROUP_TERM_GRACE {
+                        // SAFETY: 頭はまだ刈り取っていない = グループの番号は使い回されていない
+                        unsafe {
+                            libc::kill(-pgid, libc::SIGKILL);
+                        }
+                        break;
+                    }
+                    std::thread::sleep(POLL);
+                }
+            }
+            let _ = child.wait();
+        });
+    // スレッドを作れない（資源切れ）ときは猶予を諦めてその場で畳む。子は刈り取られずにゾンビとして
+    // 残る（= 番号は使い回されない。[`reap_in_background`] と同じくゾンビ 1 つを残すほうを選ぶ）
+    if let (Err(_), Some(pgid)) = (spawned, pgid) {
+        // SAFETY: 負の pid（= グループ宛て）へシグナルを送るだけでメモリには触れない
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
+/// unix 以外はグループを分けない（[`kill_on_timeout`] が `true` を返さない）ので、ここへは来ない
+#[cfg(not(unix))]
+fn reap_group_in_background(child: Child) {
+    reap_in_background(child);
 }
 
 /// パイプを吸い出す係。**join しない**のが要点（孫が書き手として残っていると

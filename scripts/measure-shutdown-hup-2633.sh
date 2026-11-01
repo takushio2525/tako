@@ -8,8 +8,10 @@
 #   (b) 器（tmux）のペインの rc の初期化中に GUI を終了する（ソケットは明示 = GUI の終了で器を落とさない
 #       製品の既定と同じ。使い捨ての器は GUI の pid から作った名前のときだけ落とされる）
 #   (c) ログインシェルへの問い合わせ（`probe::group_output_with_timeout`。`zsh -l -c` を自分のグループで起こし、
-#       上限（既定 5 秒）で `kill(-pgid, SIGKILL)`）が rc の初期化中に打ち切られる。入口は製品の CLI の
-#       `tako check-health`（CLI が自分で診断する経路 = exe::find がログインシェルへ聞く）
+#       上限（既定 5 秒）で打ち切る）が rc の初期化中に打ち切られる。入口は製品の CLI の
+#       `tako check-health`（CLI が自分で診断する経路 = exe::find がログインシェルへ聞く）。
+#       #2633 の修正後はグループへ SIGTERM 1 回 → 猶予 1 秒 → 残りへ SIGKILL。修正前の形（即 SIGKILL）は
+#       `TAKO_2633_LEGACY=1 ONLY=c bash scripts/measure-shutdown-hup-2633.sh`
 #
 # 砂場: HOME は `mktemp -d` の中（利用者のホームの外 = isolated-gui.sh はペインの zsh を砂場の ZDOTDIR へ
 # 向けず、呼び手の HOME の rc をそのまま読む = 製品のペインと同じ読み方）。本物の ~/.pyenv と利用者の rc は
@@ -505,7 +507,9 @@ if want c; then
     mkdir -p "$run/data" "$run/disc"
     rm -f "${LOCK_C:?}" "${PR_C:?}/rehash.log" "${PR_C:?}/watch.log" "${H_C:?}/rc-read.log"
     t0=$(now_ms)
+    # A/B（#2633 の修正前 = グループへの即 SIGKILL）は TAKO_2633_LEGACY=1 を export して回す（env -i の中へ通す）
     env -i HOME="$H_C" PATH="$BASE_PATH" SHELL=/bin/zsh TERM=dumb USER="$(id -un)" LOGNAME="$(id -un)" TAKO_LANG=ja \
+      ${TAKO_2633_LEGACY:+TAKO_2633_LEGACY="$TAKO_2633_LEGACY"} \
       TAKO_ISOLATED=1 TAKO_DATA_DIR="$run/data" TAKO_DISCOVERY_DIR="$run/disc" \
       FAKE_REHASH_SECS="$HOLD_PROBE" FAKE_WATCH_LOG="$PR_C/watch.log" FAKE_WATCH_MODE=outside \
       "$TAKO_BIN" check-health --json > "$run/health.json" 2> "$run/health.err"
