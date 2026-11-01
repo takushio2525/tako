@@ -17,10 +17,14 @@ pub mod wait;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use tako_core::load_issue::YamlReason;
 use tako_core::platform::support::{Note, Platform};
 
 pub use agent::WorkerAgent;
-pub use config_error::{ConfigError, ConfigFile};
+pub use config_error::{
+    CallerLaunch, ConfigError, ConfigFile, ProfileFallback, Quarantine, UnreadableCause,
+    UnreadableProfile,
+};
 
 /// agent CLI の実在検査と分類済みの失敗（#983）
 pub mod agent_cli;
@@ -362,10 +366,12 @@ pub fn master_pane_limit_resume_decision(role: &str) -> (Option<bool>, Option<St
     if master_limit_resume_legacy() {
         return (None, None);
     }
+    // 出し先は persist.log だけ（日本語の診断ログ）なので日本語で組む
     let note = why.map(|w| {
         format!(
-            "{w}。このペインの利用上限後の自動復帰（limit_resume）はプロファイルではなく\
-             全体の既定で決めた。直すと次に role を貼るとき（起動・引き継ぎ・再起動）から効く"
+            "{}。このペインの利用上限後の自動復帰（limit_resume）はプロファイルではなく\
+             全体の既定で決めた。直すと次に role を貼るとき（起動・引き継ぎ・再起動）から効く",
+            w.text_in(tako_core::i18n::Lang::Ja)
         )
     });
     (profile.limit_resume, note)
@@ -3179,7 +3185,7 @@ pub fn legacy_silent_profile_base() -> bool {
 }
 
 /// プロジェクト専用プロファイルの自動生成の結果
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProfileGen {
     /// 新しく作った
     Created(PathBuf),
@@ -3192,8 +3198,10 @@ pub enum ProfileGen {
     /// 組み込み既定で作ると個人ルール（`prompt_blocks`）・モデルの抜けたプロファイルが残り、
     /// 生成は既存に触らない（冪等）ので **default.yaml を直しても二度と追いつかない**（実測）。
     /// 作らずにおけば、直した後の `tako migrate run` / GUI 起動の差分検出が正しく継承して作る。
-    /// [`Skipped`](Self::Skipped) と違い、理由は黙らせない（応答の `warnings` と persist.log）
-    NotInherited { reason: String },
+    /// [`Skipped`](Self::Skipped) と違い、理由は黙らせない（応答の `warnings` と persist.log）。
+    /// 理由は型（[`ConfigError::ProjectProfileNotInherited`]）で持ち、応答は表示言語・
+    /// persist.log は日本語で組む（#2365）
+    NotInherited { reason: ConfigError },
 }
 
 impl ProfileGen {
@@ -3218,16 +3226,19 @@ impl ProfileGen {
         }
     }
 
-    /// 作らなかった理由（作った / 既にあるなら `None`）
-    pub fn skip_reason(&self) -> Option<&str> {
+    /// 作らなかった理由（作った / 既にあるなら `None`）。`NotInherited` は `lang` で組む
+    /// （`Skipped` の理由は日本語のまま = 読み取りの理由ではない。Issue #2365 の表）
+    pub fn skip_reason_in(&self, lang: tako_core::i18n::Lang) -> Option<String> {
         match self {
-            Self::Skipped { reason } | Self::NotInherited { reason } => Some(reason),
+            Self::Skipped { reason } => Some(reason.clone()),
+            Self::NotInherited { reason } => Some(reason.text_in(lang)),
             Self::Created(_) | Self::Exists(_) => None,
         }
     }
 
-    /// 利用者に必ず見せる理由（応答の `warnings` と persist.log へ出す。#1825）
-    pub fn warning(&self) -> Option<&str> {
+    /// 利用者に必ず見せる理由（応答の `warnings` と persist.log へ出す。#1825）。
+    /// 応答は表示言語（`to_string()` / `operation()`）、persist.log は `text_in(Lang::Ja)` で組む
+    pub fn warning(&self) -> Option<&ConfigError> {
         match self {
             Self::NotInherited { reason } => Some(reason),
             _ => None,
@@ -3244,12 +3255,12 @@ impl ProfileGen {
 /// **読めないときは `Err`**（#1825）。以前は組み込み既定へ黙って落としていたので、
 /// 壊れた default.yaml のまま `projects add` すると個人ルールとモデルが抜けた
 /// プロファイルが「default から継承」と表示されて作られていた（実測）
-pub fn project_profile_base() -> Result<Profile, String> {
+pub fn project_profile_base() -> Result<Profile, ConfigError> {
     if legacy_silent_profile_base() {
         return Ok(legacy_project_profile_base());
     }
-    let path = ProfileKind::Master.path(tako_core::handoff::DEFAULT_PROFILE)?;
-    project_profile_base_at(&path)
+    let path = ProfileKind::Master.path_typed(tako_core::handoff::DEFAULT_PROFILE)?;
+    project_profile_base_at(&path).map_err(ConfigError::ProfileUnreadable)
 }
 
 /// #1825 の A/B の旧挙動（読めなければ黙って組み込み既定・退避もしない）
@@ -3258,7 +3269,7 @@ fn legacy_project_profile_base() -> Profile {
 }
 
 /// [`project_profile_base`] の本体（パス指定。テストは一時 dir で回す）
-pub fn project_profile_base_at(path: &Path) -> Result<Profile, String> {
+pub fn project_profile_base_at(path: &Path) -> Result<Profile, UnreadableProfile> {
     profile_base_at(ProfileKind::Master, path)
 }
 
@@ -3266,16 +3277,30 @@ pub fn project_profile_base_at(path: &Path) -> Result<Profile, String> {
 /// 継承元（#1825）・master の起動（#2227）・`tako solo` の起動（#2233）が同じ 1 実装を通る。
 ///
 /// 無い = 種別の組み込み既定・空 = 設定なし・読めない = `Err`。読めない中身は理由を返す前に
-/// `<name>.unreadable[.<n>].bak` へ退避する（#916 / #1819 の共通口）。default.yaml そのものには触らない
-pub fn profile_base_at(kind: ProfileKind, path: &Path) -> Result<Profile, String> {
-    read_profile_base_at(kind, path).map_err(|why| {
+/// `<name>.unreadable[.<n>].bak` へ退避する（#916 / #1819 の共通口）。default.yaml そのものには触らない。
+/// 理由は型（[`UnreadableProfile`]。退避の結果つき）で返す = 呼び手が表示言語 / 日本語で組む（#2365）
+pub fn profile_base_at(kind: ProfileKind, path: &Path) -> Result<Profile, UnreadableProfile> {
+    read_profile_base_at(kind, path).map_err(|cause| {
         let kept =
             match tako_core::migration::quarantine_unreadable(path, &tako_core::migration::FsIo) {
-                Some(q) => format!("中身は {} に退避した", q.path.display()),
-                None => "退避はできなかったが default.yaml そのものには触っていない".to_string(),
+                Some(q) => Quarantine::Moved(q.path.display().to_string()),
+                None => Quarantine::Failed,
             };
-        format!("{} を読めない（{why}）。{kept}", path.display())
+        UnreadableProfile {
+            path: path.display().to_string(),
+            cause,
+            quarantine: Some(kept),
+        }
     })
+}
+
+/// 読むだけの経路の理由（退避の文を足さない = 表示・判定・予告。#2365）
+fn unreadable_at(path: &Path, cause: UnreadableCause) -> UnreadableProfile {
+    UnreadableProfile {
+        path: path.display().to_string(),
+        cause,
+        quarantine: None,
+    }
 }
 
 /// 継承元を**読むだけ**で判定する（書かない）。退避つきの [`profile_base_at`]・
@@ -3284,27 +3309,28 @@ pub fn profile_base_at(kind: ProfileKind, path: &Path) -> Result<Profile, String
 ///
 /// 「読める」の基準は移行の `validate_profile` と同じ（`Profile` として解釈できるか）なので、
 /// 空のファイルは「設定なし」として読める（移行機構の判定と食い違わない）
-fn read_profile_base_at(kind: ProfileKind, path: &Path) -> Result<Profile, String> {
+fn read_profile_base_at(kind: ProfileKind, path: &Path) -> Result<Profile, UnreadableCause> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         // 無い = 継ぐべき個人設定がそもそも無い
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(kind.default_profile());
         }
-        Err(e) => return Err(format!("読み取りに失敗: {e}")),
+        Err(e) => return Err(UnreadableCause::Read(e.to_string())),
     };
-    serde_yaml::from_str(&text).map_err(|e| tako_core::load_issue::yaml_error_reason(&e, &text))
+    serde_yaml::from_str(&text).map_err(|e| UnreadableCause::Parse(YamlReason::of(&e, &text)))
 }
 
-/// 継承元が読めるかだけを見る（書かない・退避しない）。`tako migrate status` 用
-pub fn check_project_profile_base() -> Result<(), String> {
+/// 継承元が読めるかだけを見る（書かない・退避しない）。`tako migrate status` の予告と
+/// `tako master -<key>` の「見つからない」の理由（[`missing_project_profile_reason`]）が使う
+pub fn check_project_profile_base() -> Result<(), ConfigError> {
     if legacy_silent_profile_base() {
         return Ok(());
     }
-    let path = ProfileKind::Master.path(tako_core::handoff::DEFAULT_PROFILE)?;
+    let path = ProfileKind::Master.path_typed(tako_core::handoff::DEFAULT_PROFILE)?;
     read_profile_base_at(ProfileKind::Master, &path)
         .map(|_| ())
-        .map_err(|why| format!("{} を読めない（{why}）", path.display()))
+        .map_err(|cause| ConfigError::ProfileUnreadable(unreadable_at(&path, cause)))
 }
 
 /// #2233 の A/B。`TAKO_2233_LEGACY=1` で修正前（引き継ぎの後任・`tako solo`・表示だけの経路が
@@ -3329,16 +3355,15 @@ pub fn legacy_silent_default_2256() -> bool {
 ///
 /// 返すプロファイルは修正前（`Profile::load(..).unwrap_or_default()` 等）と同じ値なので、
 /// `TAKO_2256_LEGACY=1` は理由だけを落とす（= 修正前の黙った既定落としの再現）
-pub fn read_for_judgment(kind: ProfileKind, name: &str) -> (Profile, Option<String>) {
-    let Ok(path) = kind.path(name) else {
+pub fn read_for_judgment(kind: ProfileKind, name: &str) -> (Profile, Option<UnreadableProfile>) {
+    let Ok(path) = kind.path_typed(name) else {
         return (kind.default_profile(), None);
     };
     match read_profile_base_at(kind, &path) {
         Ok(profile) => (profile, None),
-        Err(why) => (
+        Err(cause) => (
             kind.default_profile(),
-            (!legacy_silent_default_2256())
-                .then(|| format!("{} を読めない（{why}）", path.display())),
+            (!legacy_silent_default_2256()).then(|| unreadable_at(&path, cause)),
         ),
     }
 }
@@ -3350,37 +3375,32 @@ pub fn read_for_judgment(kind: ProfileKind, name: &str) -> (Profile, Option<Stri
 /// ための理由を返す（応答の `warnings`・画面の行へ出す）。読むだけで退避しない（表示のたびに
 /// 書き込まない。退避は起動の経路と `tako migrate` が持つ）。無い（ゼロコンフィグの初回）・
 /// 読める・名前が不正 = `None`
-pub fn load_for_display(kind: ProfileKind, name: &str) -> (Profile, Option<String>) {
-    match kind.path(name) {
+pub fn load_for_display(kind: ProfileKind, name: &str) -> (Profile, Option<ProfileFallback>) {
+    match kind.path_typed(name) {
         Ok(path) => load_for_display_at(kind, &path),
         Err(_) => (kind.default_profile(), None),
     }
 }
 
-/// [`load_for_display`] の本体（パス指定。テストは一時 dir で回す）
-fn load_for_display_at(kind: ProfileKind, path: &Path) -> (Profile, Option<String>) {
+/// [`load_for_display`] の本体（パス指定。テストは一時 dir で回す）。理由は型で返す
+/// （応答の `warnings` は表示言語、`tako setup` の日本語の要約は日本語で組む。#2365）
+fn load_for_display_at(kind: ProfileKind, path: &Path) -> (Profile, Option<ProfileFallback>) {
     match read_profile_base_at(kind, path) {
         Ok(profile) => (profile, None),
-        Err(why) => (
+        Err(cause) => (
             kind.default_profile(),
-            (!legacy_silent_default_rest()).then(|| {
-                format!(
-                    "{} を読めない（{why}）。表示している値はこのファイルではなく組み込み既定。\
-                     直すと次の呼び出しから効く",
-                    path.display()
-                )
-            }),
+            (!legacy_silent_default_rest())
+                .then(|| ProfileFallback::Display(unreadable_at(path, cause))),
         ),
     }
 }
 
-/// 継承元を読めずに作らなかったときの理由文（直し方まで言う）
-fn not_inherited_reason(key: &str, why: &str) -> String {
-    format!(
-        "{why}。default を継承できないので専用プロファイル '{key}' は作らなかった\
-         （組み込み既定で作ると個人ルール・モデルが抜けたまま残る）。\
-         default.yaml を直すと tako migrate run（GUI の次の起動でも自動）で作られる"
-    )
+/// 継承元を読めずに作らなかったときの理由（直し方まで言う。文は `ConfigError` の 1 か所）
+fn not_inherited_reason(key: &str, why: ConfigError) -> ConfigError {
+    ConfigError::ProjectProfileNotInherited {
+        key: key.to_string(),
+        why: Box::new(why),
+    }
 }
 
 /// `tako master -<key>` の専用プロファイルが無い理由が #1825（継承元の default.yaml を
@@ -3388,7 +3408,7 @@ fn not_inherited_reason(key: &str, why: &str) -> String {
 ///
 /// 登録済みのキーで・ファイルが無く・継承元を読めないときだけ `Some`。それ以外
 /// （未登録の名前・継承元は読める）は呼び出し元の「見つからない」をそのまま出す
-pub fn missing_project_profile_reason(key: &str) -> Option<String> {
+pub fn missing_project_profile_reason(key: &str) -> Option<ConfigError> {
     let path = ProfileKind::Master.path(key).ok()?;
     let registered = ProjectsConfig::load()
         .map(|c| c.projects.contains_key(key))
@@ -3406,13 +3426,13 @@ fn missing_project_profile_reason_from(
     key: &str,
     exists: bool,
     registered: bool,
-    base: Result<(), String>,
-) -> Option<String> {
+    base: Result<(), ConfigError>,
+) -> Option<ConfigError> {
     if exists || !registered {
         return None;
     }
     let why = base.err()?;
-    Some(not_inherited_reason(key, &why))
+    Some(not_inherited_reason(key, why))
 }
 
 /// projects.yaml に登録されている cwd（生値。`~` は展開しない）
@@ -3461,7 +3481,7 @@ pub fn ensure_project_profile(key: &str) -> ProfileGen {
         Ok(profile) => profile,
         Err(why) => {
             return ProfileGen::NotInherited {
-                reason: not_inherited_reason(key, &why),
+                reason: not_inherited_reason(key, why),
             }
         }
     };
@@ -4806,7 +4826,9 @@ mod tests {
             &b"model: m\nprompt_blocks:\n  append: [PERSONAL]\n"[..],
         ] {
             let (_dir, path) = t1825_base(body);
-            let err = project_profile_base_at(&path).expect_err("黙って既定へ落としている");
+            let err = project_profile_base_at(&path)
+                .expect_err("黙って既定へ落としている")
+                .text_in(tako_core::i18n::Lang::Ja);
             let kept = tako_core::migration::quarantine_path(&path);
             assert!(
                 err.contains(&kept.display().to_string()),
@@ -4823,7 +4845,9 @@ mod tests {
                 "default.yaml を書き換えている"
             );
             // 同じ中身で 2 回目に読んでも写しは増えない（#1819 の共通口の約束）
-            let again = project_profile_base_at(&path).expect_err("2 回目も Err");
+            let again = project_profile_base_at(&path)
+                .expect_err("2 回目も Err")
+                .text_in(tako_core::i18n::Lang::Ja);
             assert!(again.contains(&kept.display().to_string()));
             assert!(!tako_core::migration::quarantine_slot_path(&path, 2).exists());
         }
@@ -4857,7 +4881,9 @@ mod tests {
     fn issue1825_utf8でない継承元も既定へ落とさない() {
         let body = b"model: m\n\xff\xfe\x00broken\n";
         let (_dir, path) = t1825_base(body);
-        let err = project_profile_base_at(&path).expect_err("黙って既定へ落としている");
+        let err = project_profile_base_at(&path)
+            .expect_err("黙って既定へ落としている")
+            .text_in(tako_core::i18n::Lang::Ja);
         assert!(err.contains("退避はできなかった"), "{err}");
         assert_eq!(std::fs::read(&path).expect("元が残る"), body);
     }
@@ -4880,7 +4906,9 @@ mod tests {
         ] {
             let (_dir, path) = t1825_base(body);
             let (profile, note) = load_for_display_at(ProfileKind::Master, &path);
-            let note = note.expect("既定値で答えていることを黙っている");
+            let note = note
+                .expect("既定値で答えていることを黙っている")
+                .text_in(tako_core::i18n::Lang::Ja);
             assert!(
                 note.contains(&path.display().to_string()) && note.contains("組み込み既定"),
                 "どのファイルか・何で答えたかが無い: {note}"
@@ -4911,28 +4939,42 @@ mod tests {
 
     #[test]
     fn issue1825_継承できない理由は黙らせない() {
-        let gen = ProfileGen::NotInherited { reason: "r".into() };
+        use tako_core::i18n::Lang;
+        let reason = not_inherited_reason("k", ConfigError::HomeUnresolved);
+        let gen = ProfileGen::NotInherited {
+            reason: reason.clone(),
+        };
         assert_eq!(gen.kind(), "skipped", "応答の語彙は増やさない");
-        assert_eq!(gen.warning(), Some("r"));
-        assert_eq!(gen.skip_reason(), Some("r"));
+        assert_eq!(gen.warning(), Some(&reason));
+        assert_eq!(gen.skip_reason_in(Lang::Ja), Some(reason.text_in(Lang::Ja)));
+        assert_eq!(gen.skip_reason_in(Lang::En), Some(reason.text_in(Lang::En)));
         assert_eq!(gen.path(), None);
         let skipped = ProfileGen::Skipped { reason: "s".into() };
         assert_eq!(skipped.warning(), None, "従来の見送りは警告にしない");
-        assert_eq!(skipped.skip_reason(), Some("s"));
-        let reason = not_inherited_reason("k", "x を読めない");
-        assert!(
-            reason.contains("tako migrate run") && reason.contains("'k'"),
-            "直し方が無い: {reason}"
-        );
+        assert_eq!(skipped.skip_reason_in(Lang::En), Some("s".to_string()));
+        for lang in [Lang::Ja, Lang::En] {
+            let text = reason.text_in(lang);
+            assert!(
+                text.contains("tako migrate run") && text.contains("'k'"),
+                "直し方が無い: {text}"
+            );
+        }
     }
 
     /// #2227: `tako master -<key>` の「見つからない」に足すのは、登録済み・未生成・
     /// 継承元が読めない、の 3 つが揃ったときだけ（他は従来の文のまま）
     #[test]
     fn issue2227_専用プロファイルが無い理由は継承元が読めないときだけ足す() {
-        let broken = || Err::<(), String>("d.yaml を読めない（x）".into());
+        let broken = || {
+            Err::<(), ConfigError>(ConfigError::ProfileUnreadable(UnreadableProfile {
+                path: "d.yaml".into(),
+                cause: UnreadableCause::Read("x".into()),
+                quarantine: None,
+            }))
+        };
         let reason = missing_project_profile_reason_from("k", false, true, broken())
-            .expect("登録済み・未生成・継承元が読めない = 理由を足す");
+            .expect("登録済み・未生成・継承元が読めない = 理由を足す")
+            .text_in(tako_core::i18n::Lang::Ja);
         assert!(
             reason.contains("d.yaml を読めない")
                 && reason.contains("tako migrate run")

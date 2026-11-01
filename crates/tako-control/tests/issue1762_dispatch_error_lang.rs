@@ -7094,7 +7094,10 @@ fn dispatch_の個別の断りの値で分かれる腕の境界() {
 // (1) 全バリアントの日英と旧文のバイト一致、(2) 口の本体に日本語の固定文を書き足していないこと、
 // (3) dispatch の対象の関数が日本語の口を呼んで断りに載せていないことを `file:line` で名指す
 
-use tako_control::orchestrator::{ConfigError, ConfigFile, ProfileKind, WorkerAgent};
+use tako_control::orchestrator::{
+    CallerLaunch, ConfigError, ConfigFile, ProfileFallback, ProfileKind, Quarantine,
+    UnreadableCause, UnreadableProfile, WorkerAgent,
+};
 
 const ORCH_MOD_SRC: &str = include_str!("../src/orchestrator/mod.rs");
 const ORCH_MOD_PATH: &str = "crates/tako-control/src/orchestrator/mod.rs";
@@ -7147,9 +7150,13 @@ fn config_error_index(e: &ConfigError) -> usize {
         ConfigError::LedgerOutcomeInvalid(_) => 33,
         ConfigError::HandoffKeyUnusable(_) => 34,
         ConfigError::HandoffDirCreate { .. } => 35,
+        // #2365 の続き: 読めないプロファイルの理由（#2256 の系統）
+        ConfigError::ProfileUnreadable(_) => 36,
+        ConfigError::ProjectProfileNotInherited { .. } => 37,
+        ConfigError::ProjectProfileMissing { .. } => 38,
     }
 }
-const CONFIG_ERROR_VARIANTS: usize = 36;
+const CONFIG_ERROR_VARIANTS: usize = 39;
 
 /// 見本と #2365 より前の固定文（`orchestrator` の口が書いていた文を見本の値で展開）
 fn config_error_table() -> Vec<(ConfigError, &'static str)> {
@@ -7394,7 +7401,75 @@ fn config_error_table() -> Vec<(ConfigError, &'static str)> {
             ConfigError::CtxThresholdOutOfRange(10),
             "ctx_threshold は 50〜60 の範囲で指定する: 10",
         ),
+        // #2365 の続き: 読めないプロファイルの理由（`orchestrator/mod.rs` の `profile_base_at` /
+        // `check_project_profile_base` / `not_inherited_reason` と `master_launch::load_profile_in` が
+        // 書いていた文。原因 2 種 × 退避の 3 通り）
+        (
+            ConfigError::ProfileUnreadable(unreadable(
+                UnreadableCause::Parse(yaml.clone()),
+                Some(Quarantine::Moved("/x/default.yaml.unreadable.bak".into())),
+            )),
+            "/x/default.yaml を読めない（YAML の構文が壊れている（1 行 11 列））。\
+             中身は /x/default.yaml.unreadable.bak に退避した",
+        ),
+        (
+            ConfigError::ProfileUnreadable(unreadable(
+                UnreadableCause::Read("stream did not contain valid UTF-8".into()),
+                Some(Quarantine::Failed),
+            )),
+            "/x/default.yaml を読めない（読み取りに失敗: stream did not contain valid UTF-8）。\
+             退避はできなかったが default.yaml そのものには触っていない",
+        ),
+        (
+            ConfigError::ProfileUnreadable(unreadable(
+                UnreadableCause::Read("Permission denied (os error 13)".into()),
+                None,
+            )),
+            "/x/default.yaml を読めない（読み取りに失敗: Permission denied (os error 13)）",
+        ),
+        (
+            not_inherited(),
+            "/x/default.yaml を読めない（読み取りに失敗: Permission denied (os error 13)）。\
+             default を継承できないので専用プロファイル 'k' は作らなかった\
+             （組み込み既定で作ると個人ルール・モデルが抜けたまま残る）。\
+             default.yaml を直すと tako migrate run（GUI の次の起動でも自動）で作られる",
+        ),
+        (
+            ConfigError::ProjectProfileMissing {
+                not_found: Box::new(ConfigError::ProfileNotFound {
+                    kind: None,
+                    name: "k".into(),
+                    path: "/x/k.yaml".into(),
+                }),
+                why: Box::new(not_inherited()),
+            },
+            "プロファイル 'k' が見つからない: /x/k.yaml。\
+             /x/default.yaml を読めない（読み取りに失敗: Permission denied (os error 13)）。\
+             default を継承できないので専用プロファイル 'k' は作らなかった\
+             （組み込み既定で作ると個人ルール・モデルが抜けたまま残る）。\
+             default.yaml を直すと tako migrate run（GUI の次の起動でも自動）で作られる",
+        ),
     ]
+}
+
+/// 読めないプロファイルの理由の見本（`/x/default.yaml`）
+fn unreadable(cause: UnreadableCause, quarantine: Option<Quarantine>) -> UnreadableProfile {
+    UnreadableProfile {
+        path: "/x/default.yaml".into(),
+        cause,
+        quarantine,
+    }
+}
+
+/// #1825 の「作らなかった」の見本（読むだけの経路の理由 = 退避の文なし）
+fn not_inherited() -> ConfigError {
+    ConfigError::ProjectProfileNotInherited {
+        key: "k".into(),
+        why: Box::new(ConfigError::ProfileUnreadable(unreadable(
+            UnreadableCause::Read("Permission denied (os error 13)".into()),
+            None,
+        ))),
+    }
 }
 
 #[test]
@@ -7691,6 +7766,75 @@ const CONFIG_REFUSAL_SCOPES: &[(&str, &str, Span)] = &[
         ORCH_MOD_SRC,
         Span::Item("pub fn ensure_defaults_typed() ->"),
     ),
+    // #2365 の続き: 読めないプロファイルの理由（#2256 の系統）を組む口。文は `ConfigError` /
+    // `UnreadableProfile` / `ProfileFallback` の 1 か所にだけ置く
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn project_profile_base() ->"),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn profile_base_at("),
+    ),
+    (ORCH_MOD_PATH, ORCH_MOD_SRC, Span::Item("fn unreadable_at(")),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("fn read_profile_base_at("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn check_project_profile_base("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn read_for_judgment("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("fn load_for_display_at("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("fn not_inherited_reason("),
+    ),
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("fn missing_project_profile_reason_from("),
+    ),
+    (
+        MASTER_LAUNCH_PATH,
+        MASTER_LAUNCH_SRC,
+        Span::Item("pub fn load_profile_in("),
+    ),
+    (
+        MASTER_LAUNCH_PATH,
+        MASTER_LAUNCH_SRC,
+        Span::Item("pub fn load_solo_in("),
+    ),
+    (
+        MASTER_LAUNCH_PATH,
+        MASTER_LAUNCH_SRC,
+        Span::Item("pub fn load_caller_profile("),
+    ),
+    (
+        MASTER_LAUNCH_PATH,
+        MASTER_LAUNCH_SRC,
+        Span::Item("pub fn load_default_at("),
+    ),
+    (GUIDE_PATH, GUIDE_SRC, Span::Item("pub fn json(")),
+    (
+        DIAGNOSTICS_PATH,
+        DIAGNOSTICS_SRC,
+        Span::Item("fn profiles_item(lang: Lang)"),
+    ),
     (
         ORCH_AGENT_PATH,
         ORCH_AGENT_SRC,
@@ -7861,6 +8005,358 @@ fn dispatch_の設定の断りの番犬の境界() {
         .map(|(l, _, _)| l)
         .collect();
     assert_eq!(found, vec![3, 9], "日本語の口の 2 か所だけを名指す");
+}
+
+// ---- #2365 の続き: 読めないプロファイルの理由（#2256 の系統） ----
+//
+// 起動・継承元・表示・判定の経路がプロファイルを読めないときの理由は persist.log（日本語の診断ログ）と
+// 共有する日本語の `String` だったので、英語表示でも `warnings`・断り・CLI の警告の行・check-health の
+// 括弧の中だけ日本語のまま混ざった。いまは型（`UnreadableProfile` / `ProfileFallback` と `ConfigError` の
+// 3 種）で持ち、利用者へ返す口は表示言語、persist.log と別スライスの経路（スマホの「+ master」・
+// 引き継ぎの後任・`tako setup` の日本語の要約・移行の記録）は `text_in(Lang::Ja)` で組む。ここでは
+// (1) 全バリアントの日英と旧文のバイト一致（`ConfigError` の分は上の表）、
+// (2) 口の本体に日本語の固定文を書き足していないこと（上の CONFIG_REFUSAL_SCOPES）、
+// (3) 利用者へ返す口で日本語に固定して組むのは persist.log の行だけであること、
+// を `file:line` で名指す
+
+const MASTER_LAUNCH_SRC: &str = include_str!("../src/orchestrator/master_launch.rs");
+const MASTER_LAUNCH_PATH: &str = "crates/tako-control/src/orchestrator/master_launch.rs";
+// `GUIDE_SRC` / `DIAGNOSTICS_SRC` はこのファイルの後ろの節で定義済み（同じファイルを指す）
+
+/// `ProfileFallback` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
+fn profile_fallback_index(f: &ProfileFallback) -> usize {
+    match f {
+        ProfileFallback::DefaultLaunch { .. } => 0,
+        ProfileFallback::CallerLaunch { .. } => 1,
+        ProfileFallback::Adopt { .. } => 2,
+        ProfileFallback::Guide(_) => 3,
+        ProfileFallback::Display(_) => 4,
+    }
+}
+const PROFILE_FALLBACK_VARIANTS: usize = 5;
+
+/// 見本と #2365 より前の固定文（`master_launch.rs` / `dispatch.rs` / `guide.rs` / `orchestrator/mod.rs` が
+/// 書いていた文を見本の値で展開）
+fn profile_fallback_table() -> Vec<(ProfileFallback, &'static str)> {
+    let moved = || {
+        unreadable(
+            UnreadableCause::Parse(YamlReason::Located {
+                kind: YamlProblem::Syntax,
+                at: Some((5, 1)),
+            }),
+            Some(Quarantine::Moved("/x/default.yaml.unreadable.bak".into())),
+        )
+    };
+    let read_only = || {
+        unreadable(
+            UnreadableCause::Read("Permission denied (os error 13)".into()),
+            None,
+        )
+    };
+    vec![
+        (
+            ProfileFallback::DefaultLaunch {
+                why: moved(),
+                kind: ProfileKind::Master,
+            },
+            "/x/default.yaml を読めない（YAML の構文が壊れている（5 行 1 列））。\
+             中身は /x/default.yaml.unreadable.bak に退避した。\
+             default.yaml の個人ルール（prompt_blocks）・モデルなどの設定を使わず、\
+             組み込み既定で master を立てる。default.yaml を直すと次の起動から効く",
+        ),
+        (
+            ProfileFallback::DefaultLaunch {
+                why: moved(),
+                kind: ProfileKind::Solo,
+            },
+            "/x/default.yaml を読めない（YAML の構文が壊れている（5 行 1 列））。\
+             中身は /x/default.yaml.unreadable.bak に退避した。\
+             default.yaml の個人ルール（prompt_blocks）・モデルなどの設定を使わず、\
+             組み込み既定で solo を立てる。default.yaml を直すと次の起動から効く",
+        ),
+        (
+            ProfileFallback::CallerLaunch {
+                why: moved(),
+                name: "default".into(),
+                launching: CallerLaunch::Worker,
+            },
+            "/x/default.yaml を読めない（YAML の構文が壊れている（5 行 1 列））。\
+             中身は /x/default.yaml.unreadable.bak に退避した。\
+             呼び出し元 master のプロファイル 'default' の設定（worker のモデル・effort・\
+             agent・アカウント・env・projects の制限）を使わず、組み込み既定で worker を\
+             立てる。直すと次から効く",
+        ),
+        (
+            ProfileFallback::CallerLaunch {
+                why: moved(),
+                name: "default".into(),
+                launching: CallerLaunch::ConflictResolver,
+            },
+            "/x/default.yaml を読めない（YAML の構文が壊れている（5 行 1 列））。\
+             中身は /x/default.yaml.unreadable.bak に退避した。\
+             呼び出し元 master のプロファイル 'default' の設定（worker のモデル・effort・\
+             agent・アカウント・env・projects の制限）を使わず、組み込み既定で \
+             コンフリクト解消エージェント を立てる。直すと次から効く",
+        ),
+        (
+            ProfileFallback::Adopt {
+                why: read_only(),
+                launched_as: "default".into(),
+            },
+            "/x/default.yaml を読めない（読み取りに失敗: Permission denied (os error 13)）。\
+             起動時のプロファイル 'default' の代わりに組み込み既定と比べて採用を判断した\
+             （system prompt・master の系統の食い違いの判断が実際と違いうる）。直すと次の採用から効く",
+        ),
+        (
+            ProfileFallback::Guide(read_only()),
+            "/x/default.yaml を読めない（読み取りに失敗: Permission denied (os error 13)）。\
+             手順書の値（引き継ぎの閾値など）はこのファイルではなく組み込み既定で組み立てた。\
+             個人ルールの on-demand 部（local-rules）は読めていない。直すと次の呼び出しから効く",
+        ),
+        (
+            ProfileFallback::Display(read_only()),
+            "/x/default.yaml を読めない（読み取りに失敗: Permission denied (os error 13)）。\
+             表示している値はこのファイルではなく組み込み既定。直すと次の呼び出しから効く",
+        ),
+    ]
+}
+
+#[test]
+fn 読めないプロファイルの知らせは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let table = profile_fallback_table();
+    let samples: Vec<ProfileFallback> = table.iter().map(|(f, _)| f.clone()).collect();
+    covers_every(
+        &samples,
+        profile_fallback_index,
+        PROFILE_FALLBACK_VARIANTS,
+        "ProfileFallback",
+    );
+    let mut failures = Vec::new();
+    for (f, old) in &table {
+        let (ja, en) = (f.text_in(Lang::Ja), f.text_in(Lang::En));
+        let debug = format!("{f:?}");
+        let at = |lang| {
+            where_written(
+                CONFIG_ERROR_SRC,
+                CONFIG_ERROR_PATH,
+                "impl ProfileFallback {",
+                &debug,
+                lang,
+            )
+        };
+        if ja != *old {
+            failures.push(format!(
+                "{f:?}: 日本語が #2365 より前と違う（{}）\n  want: {old}\n  got:  {ja}",
+                at(Lang::Ja)
+            ));
+        }
+        if let Some(c) = has_japanese(&en) {
+            failures.push(format!(
+                "{f:?}: 英語に日本語（{c}）が混ざる（{}）: {en}",
+                at(Lang::En)
+            ));
+        }
+        if ja == en {
+            failures.push(format!(
+                "{f:?}: 日英が同じ文（英語の書き忘れ。{}）: {en}",
+                at(Lang::En)
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 利用者へ返す口（応答の `warnings`・断り・CLI の警告の行・本人の system prompt・check-health）。
+/// この中で日本語に固定して組んでよいのは persist.log の行だけ（`Lang::Ja` / `into_ja()` の行の
+/// 3 行上から 1 行下までに `persist_log(` がある = 折り返した persist.log の文か、その直前で組む
+/// `let ja = …`）
+const PROFILE_REASON_USER_SCOPES: &[(&str, &str, &str)] = &[
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "pub fn dispatch_orchestrator_projects(",
+    ),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "fn dispatch_orchestrator_adopt(",
+    ),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "fn dispatch_orchestrator_self(",
+    ),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "fn dispatch_git_resolve_agent(",
+    ),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "fn dispatch_orchestrator_spawn(",
+    ),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "fn dispatch_orchestrator_supervisor(",
+    ),
+    (
+        MASTER_LAUNCH_PATH,
+        MASTER_LAUNCH_SRC,
+        "pub fn load_profile_in(",
+    ),
+    (
+        MASTER_LAUNCH_PATH,
+        MASTER_LAUNCH_SRC,
+        "pub fn load_solo_in(",
+    ),
+    (
+        MASTER_LAUNCH_PATH,
+        MASTER_LAUNCH_SRC,
+        "pub fn load_caller_profile(",
+    ),
+    (GUIDE_PATH, GUIDE_SRC, "pub fn json("),
+    (
+        DIAGNOSTICS_PATH,
+        DIAGNOSTICS_SRC,
+        "fn profiles_item(lang: Lang)",
+    ),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, "fn orchestrator_master("),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, "fn orchestrator_solo("),
+    (CLI_MAIN_PATH, CLI_MAIN_SRC, "fn orchestrator_guide_local("),
+];
+
+/// 範囲の中で、persist.log の行の外で日本語に固定して組んでいる行
+fn ja_fixed_outside_log(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for (i, (line, code)) in lines.iter().enumerate() {
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        if !(code.contains("Lang::Ja") || code.contains("into_ja()")) {
+            continue;
+        }
+        let logged = lines[i.saturating_sub(3)..(i + 2).min(lines.len())]
+            .iter()
+            .any(|(_, l)| l.contains("persist_log("));
+        if !logged {
+            out.push((*line, code.trim().to_string()));
+        }
+    }
+    out
+}
+
+fn scan_profile_reason_user_scopes(sources: &[(&str, &str, &str)]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (path, src, head) in sources {
+        let Some(lines) = front_scope_lines(src, Some(head)) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする。\
+                 PROFILE_REASON_USER_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, code) in ja_fixed_outside_log(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 利用者へ返す口（`{head}`）が読めないプロファイルの理由を日本語に固定して組んでいる \
+                 = 英語表示でも理由だけ日本語で混ざる（表示言語の `to_string()` / `text_in(lang)` で組む。\
+                 日本語で組むのは persist.log の行だけ）: {code}"
+            ));
+        }
+    }
+    failures
+}
+
+#[test]
+fn 読めないプロファイルの理由を利用者へ返す口は日本語に固定しない() {
+    report_all(scan_profile_reason_user_scopes(PROFILE_REASON_USER_SCOPES));
+}
+
+/// 番犬自身の検査（本物のソースへ注入）: 応答・CLI の行・本文へ日本語に固定した理由を戻すと
+/// その行を名指し、persist.log の行は見逃す。口の本体へ旧い日本語の固定文を戻すと上の走査が名指す
+#[test]
+fn 読めないプロファイルの理由の番犬は注入を名指す() {
+    // (注入先のファイル, 範囲の頭, 注入元, 注入後)
+    let injections: [(&str, &str, &str, &str, &str); 4] = [
+        (
+            DISPATCH_PATH,
+            DISPATCH_SRC,
+            "fn dispatch_orchestrator_spawn(",
+            "\"message\": w.to_string(),",
+            "\"message\": w.text_in(Lang::Ja),",
+        ),
+        (
+            DISPATCH_PATH,
+            DISPATCH_SRC,
+            "fn dispatch_orchestrator_supervisor(",
+            "v[\"warnings\"] = json!([note.to_string()]);",
+            "v[\"warnings\"] = json!([note.text_in(Lang::Ja)]);",
+        ),
+        (
+            GUIDE_PATH,
+            GUIDE_SRC,
+            "pub fn json(",
+            "super::ProfileFallback::Guide(why).to_string()",
+            "super::ProfileFallback::Guide(why).text_in(tako_core::i18n::Lang::Ja)",
+        ),
+        (
+            CLI_MAIN_PATH,
+            CLI_MAIN_SRC,
+            "fn orchestrator_master(",
+            "let load_warning = load_warning.map(|w| w.text_in(lang));",
+            "let load_warning = load_warning.map(|w| w.text_in(Lang::Ja));",
+        ),
+    ];
+    for (path, src, head, from, to) in injections {
+        // 範囲の頭より後ろの最初の 1 か所へ注入する（CLI の `tako master` / `tako solo` は同じ行を持つ）
+        let start = src
+            .find(head)
+            .unwrap_or_else(|| panic!("{path}: 範囲の頭が無い: {head}"));
+        let at = start
+            + src[start..]
+                .find(from)
+                .unwrap_or_else(|| panic!("{path}: 範囲の中に注入元が無い: {from}"));
+        let injected = format!("{}{to}{}", &src[..at], &src[at + from.len()..]);
+        let want = injected[..at].lines().count().max(1);
+        let found = scan_profile_reason_user_scopes(&[(path, injected.as_str(), head)]);
+        assert_eq!(
+            found.len(),
+            1,
+            "{path}: 注入（{to}）を 1 件だけ名指すはず: {found:?}"
+        );
+        assert!(
+            found[0].starts_with(&format!("{path}:{want}:")),
+            "{path}: 名指した行が違う（want {want}）: {}",
+            found[0]
+        );
+    }
+
+    // 口の本体へ旧い日本語の固定文を戻す（#2256 の read_for_judgment の形）
+    let from = "(!legacy_silent_default_2256()).then(|| unreadable_at(&path, cause)),";
+    assert_eq!(
+        ORCH_MOD_SRC.matches(from).count(),
+        1,
+        "注入元が 1 か所でない"
+    );
+    let injected = ORCH_MOD_SRC.replacen(
+        from,
+        "(!legacy_silent_default_2256()).then(|| format!(\"{} を読めない（{cause:?}）\", path.display())),",
+        1,
+    );
+    let lines =
+        client_store_lines(&injected, &Span::Item("pub fn read_for_judgment(")).expect("範囲");
+    let found = front_japanese(&lines);
+    let want = injected
+        .lines()
+        .position(|l| l.contains("を読めない（{cause:?}）"))
+        .map(|i| i + 1)
+        .expect("注入した行");
+    assert_eq!(
+        found.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+        vec![want],
+        "{ORCH_MOD_PATH}: 口の本体の日本語の固定文を名指していない: {found:?}"
+    );
 }
 
 // ---- #2365 の続き: GUI 側の口（ControlHost の実装）が組む断り（`HostRefusal`） ----

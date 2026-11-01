@@ -203,7 +203,8 @@ const FUNNELS: &[(&str, &str, &str)] = &[
     (
         "crates/tako-control/src/orchestrator/mod.rs",
         "fn read_profile_base_at(",
-        "load_issue::yaml_error_reason(",
+        // 理由は型（表示言語で組む。persist.log は日本語。#2365）。中身は種類と位置だけ = 同じ口
+        "YamlReason::of(",
     ),
 ];
 
@@ -589,8 +590,8 @@ fn 本物の口へ植えた回帰を名指せる() {
         ),
         (
             "crates/tako-control/src/orchestrator/mod.rs",
-            "serde_yaml::from_str(&text).map_err(|e| tako_core::load_issue::yaml_error_reason(&e, &text))",
-            "serde_yaml::from_str(&text).map_err(|e| e.to_string())",
+            "serde_yaml::from_str(&text).map_err(|e| UnreadableCause::Parse(YamlReason::of(&e, &text)))",
+            "serde_yaml::from_str(&text).map_err(|e| UnreadableCause::Read(e.to_string()))",
             "e.to_string()",
         ),
         // rustfmt が折った位置引数（`"…{}",\n e\n)`）も拾う（#2365 で projects.yaml・ledger.yaml・workers.yaml の

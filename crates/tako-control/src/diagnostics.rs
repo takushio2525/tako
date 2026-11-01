@@ -1524,8 +1524,10 @@ fn issue1623_legacy() -> bool {
 }
 
 fn profiles_item(lang: Lang) -> Item {
+    // 一覧の失敗の理由は型の口で受け、行と同じ表示言語で組む（#2365。日本語固定の
+    // `list_profiles()` だと英語表示でも括弧の中だけ日本語のまま混ざった）
     profiles_item_from(
-        crate::orchestrator::list_profiles(),
+        crate::orchestrator::list_profiles_of_typed(crate::orchestrator::ProfileKind::Master),
         lang,
         issue1623_legacy(),
     )
@@ -1536,7 +1538,11 @@ fn profiles_item(lang: Lang) -> Item {
 /// #1623 前は登録済みの名前を `, ` で 1 行に全部並べていた（84 個の砂場で 1 行 449 字。
 /// `check-health --json` の `lines` にも同じ 1 行が載る）。いまは件数・先頭
 /// [`PROFILES_SHOWN`] 個・「他 N 個」の 1 行にし、全件は `names`（名前順）へ置く
-fn profiles_item_from(listed: Result<Vec<String>, String>, lang: Lang, legacy: bool) -> Item {
+fn profiles_item_from(
+    listed: Result<Vec<String>, crate::orchestrator::ConfigError>,
+    lang: Lang,
+    legacy: bool,
+) -> Item {
     const KEY: &str = "profiles";
     let names = match listed {
         Ok(names) => names,
@@ -1544,7 +1550,7 @@ fn profiles_item_from(listed: Result<Vec<String>, String>, lang: Lang, legacy: b
             return Item::new(
                 KEY,
                 Status::Info,
-                HealthText::ProfilesFailed(e).text_in(lang),
+                HealthText::ProfilesFailed(e.text_in(lang)).text_in(lang),
                 lang,
             )
         }
@@ -2523,10 +2529,20 @@ mod tests {
     /// #1623: 一覧を読めないときは理由を出し、`names` は載せない（空の一覧と言い分ける）
     #[test]
     fn プロファイルを読めないときはnamesを載せない() {
-        let item = profiles_item_from(Err("io".into()), Lang::En, false);
+        let denied = || crate::orchestrator::ConfigError::ListProfiles("io".into());
+        let item = profiles_item_from(Err(denied()), Lang::En, false);
         assert_eq!(item.status, Status::Info);
-        assert_eq!(item.lines, vec!["  [info] profiles: check failed (io)"]);
+        // 括弧の中の理由も行と同じ表示言語（#2365）
+        assert_eq!(
+            item.lines,
+            vec!["  [info] profiles: check failed (failed to read the profiles directory: io)"]
+        );
         assert!(item.to_json_in(Lang::En).get("names").is_none());
+        let ja = profiles_item_from(Err(denied()), Lang::Ja, false);
+        assert_eq!(
+            ja.lines,
+            vec!["  [情報] プロファイル: 確認失敗 (プロファイルディレクトリの読み取りに失敗: io)"]
+        );
     }
 
     /// #1623: 項目固有の欄は共通の欄を上書きしない
@@ -2551,7 +2567,7 @@ mod tests {
         let body: String = src[start..end].split_whitespace().collect();
         assert!(
             body.contains(
-                "profiles_item_from(crate::orchestrator::list_profiles(),lang,issue1623_legacy()"
+                "profiles_item_from(crate::orchestrator::list_profiles_of_typed(crate::orchestrator::ProfileKind::Master),lang,issue1623_legacy()"
             ),
             "{}（fn profiles_item）が `issue1623_legacy()` で旧形を決めていない（#1623）",
             source_line(head)

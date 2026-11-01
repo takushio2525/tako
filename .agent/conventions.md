@@ -313,7 +313,7 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   （`orchestrator projects` / `profiles` / `accounts`・adopt・引き継ぎ・spawn・コンフリクト解消）だけが
   型の口（`*_typed`）を呼び、`ConfigError::operation` / `invalid` で載せる（一覧の壊れたエントリの `error` も
   同じ言語）。「見つからない」系の英語は ` not found` を含む。setup 系（`setup models` / `setup_mcp` の
-  エージェント名）・`ProfileGen` の理由・応答の注記（読めないプロファイルの warnings）は対象外。番犬は同じ
+  エージェント名）は対象外（`ProfileGen` の理由と読めないプロファイルの warnings は下の #2256 の系統の節）。番犬は同じ
   `issue1762_dispatch_error_lang.rs` の末尾の節（`ConfigError` の表・型の口の本体の日本語の固定文
   `CONFIG_REFUSAL_SCOPES`・対象の dispatch の関数が日本語の口を呼んで断りに載せていないか
   `CONFIG_DISPATCH_SCOPES`）、実経路は `tests/issue2365_orchestrator_config_lang.rs`（unix。置き場を一時の場所へ
@@ -473,7 +473,7 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   出ないので対象外。非同期 run の照会・回収の「run_id が見つからない」・dispatch の「非同期 run の開始は受け口が処理
   する」・手順書の「未知の topic」は `Reason` の 3 種（`wait.rs` / `guide.rs` は `String` の口のまま文を表示言語で
   引く = 呼び手は dispatch と、表示言語を設定から読んでから呼ぶ CLI の手元の処理だけ）。手順書の `warnings`
-  （読めないプロファイルを既定で組んだ注記）は `Ok` の値なので対象外。tako-core の設定値の範囲（`preview_cache_bytes` /
+  （読めないプロファイルを既定で組んだ注記）は下の #2256 の系統の節（`ProfileFallback::Guide`）。tako-core の設定値の範囲（`preview_cache_bytes` /
   `scrollback::validate_lines` / `redraw_limit::validate_fps`）は `setting_range::RangeRefusal`、paste-guard の
   許可リストと規則（`Policy::allow_text` / `unallow` / `set_rule`）は `paste_guard::PolicyRefusal`（`TaskRefusal` と
   同じく `Result<_, String>` のまま `Display` が表示言語。呼び手は dispatch と、文を捨てて既定へ倒す GUI の起動時の
@@ -544,8 +544,8 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   cwd が取れない 2 種・標準入力）を `Reason` の 17 種へ、突然死からの復旧の断り（`resume_launch::registry_resume_launch`
   は呼び手が CLI だけなので**その場で型を返す**）を `SessionRefusal` の 3 種へ寄せた。CLI は `cli_lang()`
   （= `front_err` と同じ解決。グローバルに触らない）で文を引き、型の口の `Display` を使う枝（resume・fda の `to_json`）
-  だけ先に `init_local_lang()`。中身に他モジュールの文を載せる注記（読めないプロファイルの理由 = #2256 の系統・
-  `profile_warnings`・`window_warning`・`launch.warnings` の中身）は対象外。番犬は同じ `issue1762_dispatch_error_lang.rs`
+  だけ先に `init_local_lang()`。中身に他モジュールの文を載せる注記（`profile_warnings`・`window_warning`・
+  `launch.warnings` の中身）は対象外（読めないプロファイルの理由 = #2256 の系統は下の節）。番犬は同じ `issue1762_dispatch_error_lang.rs`
   の末尾の節（`ReplyNote` の表・`DISPATCH_NOTE_SCOPES` / `DISPATCH_NOTE_OLD_JA`・CLI の `CLI_NOTE_SCOPES` と
   **断りの括弧の中（`Err` / `ok_or` / `ok_or_else` / `map_err`）と `error:` の行の日本語**を main.rs 全体で見る走査。
   まだ移していない関数は `CLI_REFUSAL_DEFERRED` に理由つきで並べ、移し終えたら外さないと落ちる）、実経路は
@@ -564,7 +564,8 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `i18n::lang()` を読んで引き回す（GUI はそのまま、GUI を通さない CLI = 届かないときの check-health と
   `setup --check` は先に `init_local_lang()`）。中身が外から来る文（remote daemon が自己検査で書いた理由・
   起動時に記録した窓の置き先の理由・Windows の文字コード固定を諦めた理由・OS / tmux のエラー文・型の口の無い
-  `pending_changes` / `current_revision` / `agents_sync::status` / `list_profiles` の失敗）はそのまま載せる。
+  `pending_changes` / `current_revision` / `agents_sync::status` の失敗）はそのまま載せる。プロファイルの
+  一覧の失敗は型の口（`list_profiles_of_typed` + `ConfigError::text_in`）で行と同じ言語に組む（#2256 の系統の節）。
   番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（`HealthText` の表・`diagnostics.rs` の本体 /
   dispatch の `DISPATCH_HEALTH_SCOPES` / CLI / `run_check` の日本語の固定文と文字リテラル・日本語の口
   `HEALTH_JA_CALLS` の呼び出し）
@@ -576,12 +577,32 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   （`*_typed` + `ConfigError::text_in`・足した口は `validate_projects_typed` / `load_solo_profile_typed` /
   `master_launch::{load_profile_in, load_solo_in}` / `one_m_model_warning_in`）、行は `ReplyNote`、既定の断りは
   `HostRefusal::Default*`。旧い口（スマホの「+ master」= `master_launch::plan`・引き継ぎの後任・
-  `profile_warnings`）は日本語のまま。読めないプロファイルの理由（#2256 の系統）は persist.log と共有なので
-  中身ごと日本語のまま載せる。mcp_host は起動時に設定から表示言語を決め、`tako lang` の切り替えもその場で
+  `profile_warnings`）は日本語のまま。読めないプロファイルの理由（#2256 の系統）は次の節。mcp_host は起動時に設定から表示言語を決め、`tako lang` の切り替えもその場で
   反映する（GUI と同じ）。番犬は同じ `issue1762_dispatch_error_lang.rs`（`CLI_NOTE_SCOPES` と
   `HOST_IMPL_SCOPES` に起動の流れの関数・host.rs の trait を足した）、実経路は
   `crates/tako-cli/tests/issue2365_master_solo_lang.rs`（GUI 無しの CLI を日英で叩く。A/B は
   `TAKO_2365_MASTER_BIN`）
+- #2365 の続きで、**読めないプロファイルの理由（#2256 の系統）**を表示言語へ移した。以前は persist.log
+  （日本語の診断ログ）と共有する日本語の `String` だったので、英語表示でも応答の `warnings`・断り・CLI の
+  警告の行・check-health の `profiles: check failed (…)` の括弧の中だけ日本語のまま混ざった。いまは型で持つ:
+  理由の芯は `orchestrator::UnreadableProfile`（パス・原因 `UnreadableCause` = 読めない / YAML を解釈できない・
+  退避の結果 `Quarantine`）、止めずに組み込み既定で進む経路の知らせは `ProfileFallback`
+  （`DefaultLaunch` = `tako master` / `tako solo`・`CallerLaunch` = spawn / コンフリクト解消・`Adopt`・`Guide`・
+  `Display` = `orchestrator self` / `supervisor status`）、#1825 の「作らなかった」は
+  `ConfigError::ProjectProfileNotInherited`（`ProfileGen::NotInherited` の理由・adopt の断り）、
+  `tako master -<key>` の「見つからない」+ 理由は `ConfigError::ProjectProfileMissing`（どれも
+  `config_error.rs` の網羅 match）。**利用者へ返す口は表示言語**（dispatch は `to_string()` = `i18n::lang()`、
+  CLI は `text_in(lang)`。`tako master` / `tako solo` は本人の system prompt の Detail も同じ言語）、**persist.log は
+  `text_in(Lang::Ja)`**（`[spawn]` / `[git-resolve]` は直前の `let ja = …` で組んで 1 行の形を保つ）。日本語のまま
+  なのは別スライスの経路（スマホの「+ master」= `master_launch::plan`・引き継ぎの後任 = `SuccessorProfile`）と
+  日本語の枠（`tako setup` の要約・移行の記録 `FileOutcome::Failed`・自動復帰の `[limit-autoresume]` の行）。
+  CLI の guide / `projects add` の警告の行の見出しは `ReplyNote::WarningLabel`（`projects add` の他の行は
+  日本語のまま = 各コマンドの人向けの表示の残り）。番犬は同じ `issue1762_dispatch_error_lang.rs`（`ConfigError` の
+  表へ 3 種・`ProfileFallback` の表・読み込み口の本体の日本語の固定文 = `CONFIG_REFUSAL_SCOPES` に足した範囲・
+  **利用者へ返す口で日本語に固定して組むのは persist.log の行だけ** = `PROFILE_REASON_USER_SCOPES`、本物の
+  ソースへの注入で `file:line` を名指す）、実経路は `tests/issue2365_profile_unreadable_lang.rs`（unix。GUI 無しの
+  ホストへ spawn / 解消 / adopt / guide / self / supervisor / projects add / check-health を日英で）と
+  `crates/tako-cli/tests/issue2365_profile_unreadable_cli_lang.rs`（GUI 無しの CLI を日英で）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
