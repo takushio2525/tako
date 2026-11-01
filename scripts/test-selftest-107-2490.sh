@@ -46,7 +46,7 @@ bad()  { FAIL=$((FAIL + 1)); echo "  [NG] $1"; }
 check() { if [ "$1" = "1" ]; then pass "$2"; else bad "$2"; fi; }
 
 isolated_gui_bins || exit 1
-# 項目 14 がカレントディレクトリで `cargo build -p tako-cli` を回す = リポジトリの根から起こす
+# 起動の cwd はリポジトリの根に揃える（項目 14 の `cargo build -p tako-cli` は #1556 から根を実行ファイルの位置で辿るので、cwd は前提ではない）
 cd "$REPO_ROOT" || exit 1
 
 # ペインの中から走らせても本番へ届かないように、継承した接続情報を落とす。
