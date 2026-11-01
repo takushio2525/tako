@@ -35,6 +35,7 @@
 #        前面のグループには届かない（リーダーにだけ届く。mode 2）。だから (a) の「from zsh」2 回は
 #        「zsh がジョブへ中継した 1 回 + zsh の終了でカーネルが送った 1 回」と読む
 # 対照: HOLD_GUI=0（rehash が終わった後に GUI を終了）・HOLD_PROBE=0（rehash が上限より早く終わる）
+# 連鎖: HOLD_ONCE=1 ONLY=c（眠るのは最初にロックを取った rehash だけ。残ったロックで後続の問い合わせが打ち切られるかを見る）
 #
 # 使い方: bash scripts/measure-shutdown-hup-2633.sh   （ONLY=a|b|a32|c|pty で 1 つだけ・RUNS=N で回数・KEEP_TMP=1 で一時 dir を残す）
 set -uo pipefail
@@ -235,7 +236,10 @@ if [ -z "${acquired}" ]; then
   exit 1
 fi
 echo "locked pid=$$" >> "$LOG"
-sleep "${FAKE_REHASH_SECS:-0}"
+# FAKE_REHASH_ONCE: 眠るのは最初にロックを取った 1 本だけ（後続は本物と同じくすぐ終わる = 残ったロックの連鎖を見る）
+if [ -z "${FAKE_REHASH_ONCE:-}" ] || ( set -o noclobber; : > "$PYENV_ROOT/held-once" ) 2>/dev/null; then
+  sleep "${FAKE_REHASH_SECS:-0}"
+fi
 echo "done pid=$$" >> "$LOG"
 '
 
@@ -505,11 +509,12 @@ if want c; then
   for n in $(seq 1 "$RUNS"); do
     run="$TMP/c-$n"
     mkdir -p "$run/data" "$run/disc"
-    rm -f "${LOCK_C:?}" "${PR_C:?}/rehash.log" "${PR_C:?}/watch.log" "${H_C:?}/rc-read.log"
+    rm -f "${LOCK_C:?}" "${PR_C:?}/rehash.log" "${PR_C:?}/watch.log" "${H_C:?}/rc-read.log" "${PR_C:?}/held-once"
     t0=$(now_ms)
-    # A/B（#2633 の修正前 = グループへの即 SIGKILL）は TAKO_2633_LEGACY=1 を export して回す（env -i の中へ通す）
+    # A/B（#2633 の修正前 = グループへの即 SIGKILL）は TAKO_2633_LEGACY=1 を export して回す（env -i の中へ通す）。
+    # HOLD_ONCE=1 は眠る rehash を最初の 1 本だけにする（残ったロックが後続の問い合わせを打ち切らせる連鎖を見る）
     env -i HOME="$H_C" PATH="$BASE_PATH" SHELL=/bin/zsh TERM=dumb USER="$(id -un)" LOGNAME="$(id -un)" TAKO_LANG=ja \
-      ${TAKO_2633_LEGACY:+TAKO_2633_LEGACY="$TAKO_2633_LEGACY"} \
+      ${TAKO_2633_LEGACY:+TAKO_2633_LEGACY="$TAKO_2633_LEGACY"} ${HOLD_ONCE:+FAKE_REHASH_ONCE=1} \
       TAKO_ISOLATED=1 TAKO_DATA_DIR="$run/data" TAKO_DISCOVERY_DIR="$run/disc" \
       FAKE_REHASH_SECS="$HOLD_PROBE" FAKE_WATCH_LOG="$PR_C/watch.log" FAKE_WATCH_MODE=outside \
       "$TAKO_BIN" check-health --json > "$run/health.json" 2> "$run/health.err"
