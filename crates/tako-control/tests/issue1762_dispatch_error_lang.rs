@@ -7889,6 +7889,9 @@ const CONFIG_DISPATCH_SCOPES: &[&str] = &[
     "fn dispatch_orchestrator_handoff(",
     "fn dispatch_git_resolve_agent(",
     "fn dispatch_orchestrator_spawn(",
+    // #2646: spawn は段に分かれた（設定の読み = 配置の段・応答と persist.log = 記録の段）
+    "fn spawn_place(",
+    "fn record(self) -> SpawnRecorded",
     // #2365 の続き: 委任台帳・引き継ぎファイルの書き込み・supervisor の set_mode
     "fn dispatch_orchestrator_ledger(",
     "pub fn dispatch_orchestrator_handoff_files(",
@@ -8196,6 +8199,12 @@ const PROFILE_REASON_USER_SCOPES: &[(&str, &str, &str)] = &[
         DISPATCH_SRC,
         "fn dispatch_orchestrator_spawn(",
     ),
+    // #2646: spawn の応答の `warnings` と persist.log の行は記録の段が組む
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "fn record(self) -> SpawnRecorded",
+    ),
     (
         DISPATCH_PATH,
         DISPATCH_SRC,
@@ -8282,7 +8291,7 @@ fn 読めないプロファイルの理由の番犬は注入を名指す() {
         (
             DISPATCH_PATH,
             DISPATCH_SRC,
-            "fn dispatch_orchestrator_spawn(",
+            "fn record(self) -> SpawnRecorded",
             "\"message\": w.to_string(),",
             "\"message\": w.text_in(Lang::Ja),",
         ),

@@ -92,8 +92,9 @@ const ROUTES: &[Route] = &[
     },
     Route {
         file: DISPATCH,
-        name: "worker_status（UI スレッドの写し）",
-        open: "fn collect_worker_status_ctx(",
+        name:
+            "worker_status（UI スレッドの写し。#2646 で材料の写し `worker_status_seed` へ移った）",
+        open: "fn worker_status_seed(",
         close: "}",
         lookup: &["ModSnapshot::capture("],
         resolve: &["ModSnapshot::capture("],

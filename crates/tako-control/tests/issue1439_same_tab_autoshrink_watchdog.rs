@@ -173,11 +173,23 @@ fn scan_dispatch(src: &str) -> Vec<Offender> {
         }
     }
 
-    // 3. spawn 応答に縮小の結果が載る
-    match fn_window(&src, "fn dispatch_orchestrator_spawn(") {
+    // 3. spawn 応答に縮小の結果が載る（#2646 で spawn は段に分かれた: 応答は記録の段
+    //    `SpawnPlaced::record` が組み、フォントの当て直しは配置の段 `spawn_place` が行う）
+    match fn_window(&src, "fn spawn_place(") {
+        None => push(0, "`spawn_place` が見つからない（走査が空振り）".into()),
+        Some((at, window)) => {
+            if code_line_with(&window, "worker_font::refit_worker_area(").is_none() {
+                push(
+                    at,
+                    "spawn 後に worker 領域のフォントを当て直していない（#1439）".into(),
+                );
+            }
+        }
+    }
+    match fn_window(&src, "fn record(self) -> SpawnRecorded") {
         None => push(
             0,
-            "`dispatch_orchestrator_spawn` が見つからない（走査が空振り）".into(),
+            "spawn の記録の段（`SpawnPlaced::record`）が見つからない（走査が空振り）".into(),
         ),
         Some((at, window)) => {
             for (key, why) in [
@@ -202,12 +214,6 @@ fn scan_dispatch(src: &str) -> Vec<Offender> {
                             .into(),
                     );
                 }
-            }
-            if code_line_with(&window, "worker_font::refit_worker_area(").is_none() {
-                push(
-                    at,
-                    "spawn 後に worker 領域のフォントを当て直していない（#1439）".into(),
-                );
             }
         }
     }
@@ -494,6 +500,8 @@ fn 走査が空振りしていない() {
             vec![
                 "fn plan_worker_placement(",
                 "fn dispatch_orchestrator_spawn(",
+                "fn spawn_place(",
+                "fn record(self) -> SpawnRecorded",
                 "Request::Close {",
                 "use crate::worker_font::PlacementArm;",
             ],

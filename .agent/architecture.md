@@ -1872,6 +1872,17 @@ lid-guard.json が使う）:
   `PaneAccess` は `Send` = #813 の自動復帰と同じ形）。UI スレッドで 1 本ずつだった順序は錠 `RESPOND_SERIAL` で保つ。チャット表示の
   承認カード（`chat_respond`）も同じ準備 → background → `drive_offload` を通す。番犬 `issue2639_respond_offload_watchdog.rs`、
   A/B は `TAKO_2639_LEGACY=1`、実経路は `scripts/test-respond-offload-2639.sh`（FR-2.25.16）
+- **spawn の記録・台帳・状態照会の読み書きも UI スレッドで待たない**（#2646）: 段 1 の内訳は spawn 52ms のうち 50ms が
+  配置の後の記録と I/O（台帳 27ms・レジストリ 10ms・カタログ 5ms・MCP の構成 6ms・事前信頼 3ms）、台帳の list / stats / record が
+  14 / 14 / 27ms（YAML の解釈と書き戻し）。台帳は `prepare_offload` → `OffloadJob::OrchestratorLedger`（同期の腕と同じ
+  `dispatch_orchestrator_ledger`）。状態照会は UI でメモリだけの材料を写し（`worker_status_seed`。画面は `Send` な `PaneAccess`
+  を写すだけ）、追跡キーの解決（`resolve_worker_query` = workers.yaml の読み）と画面の採取（`PaneAccess::lines_and_input`）を
+  `WorkerStatusJob` が background で行う（worker 指定は解決の後に `OffloadContinuation::WorkerStatusSeed` → `OffloadLanding::Again`
+  で写す一巡を挟む）。spawn は `spawn_place`（UI）→ `SpawnPlaced::record`（background）→ `spawn_launch`（UI）の 3 段で、
+  先取りの着地 `land_probed` が `OffloadLanding::Settled` で記録の段を出す（受け口が PTY を立てて描いてから）。**起動を積むのは
+  記録の後**（送達フローが到達を書くレジストリのエントリが先に在る = #790・事前信頼も起動より前）。同期の腕も同じ 3 段を同じ順に
+  通す。番犬 `issue2646_orchestrator_offload_watchdog.rs`、A/B は `TAKO_2646_LEGACY=1`、注入は `TAKO_2646_INJECT_IO_MS`、実経路は
+  `scripts/test-orchestrator-offload-2646.sh`（FR-2.26.8）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

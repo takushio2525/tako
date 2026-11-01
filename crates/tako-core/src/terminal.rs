@@ -2491,6 +2491,20 @@ impl PaneAccess {
             .collect()
     }
 
+    /// 可視画面の行と入力欄の状態を**同じ 1 枚**から採る（#2646。worker の状態の照会が UI スレッドの外で読む）。
+    /// 行は [`Self::visible_lines`]、入力欄は [`TerminalSession::analyze_input`] と同じ材料
+    /// （`TerminalSession` の画面との違いはサブライン表示の追加行だけで、どちらも読まない）
+    pub fn lines_and_input(&self) -> (Vec<String>, Option<screen::InputStatus>) {
+        let scr = screen::snapshot_opts(&self.term.lock(), &Theme::default(), true, 0.0);
+        let input = screen::analyze_input_line(&scr);
+        let lines = scr
+            .lines
+            .into_iter()
+            .map(|l| l.text.trim_end().to_string())
+            .collect();
+        (lines, input)
+    }
+
     /// PTY へバイト列を書く。**スクロール位置は触らない**
     /// （`TerminalSession::write` は最下部へ戻すが、ここは「いま画面に見えている
     /// ダイアログへ 1 キー送る」用途なので、読んだ画面と送る先をずらさない）
