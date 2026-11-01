@@ -95,6 +95,11 @@ fn read(dir: &Path, rel: &str) -> String {
     std::fs::read_to_string(dir.join(rel)).expect(rel)
 }
 
+/// 名指しの文のパスの区切りを `/` へ揃える（Windows はアーカイブの置き場を `\` で表示する）
+fn slash(s: &str) -> String {
+    s.replace('\\', "/")
+}
+
 fn persist_log(data: &Path) -> String {
     std::fs::read_to_string(data.join("persist.log")).unwrap_or_default()
 }
@@ -175,7 +180,7 @@ fn 二重の状態へfixを2回当てると1回目で収束し2回目は何も�
     assert_eq!(v["kind"], "archived_entry_revived");
     assert_eq!(v["fixable"], true);
     assert_eq!(v["next_step"], "tako context-budget fix", "{v:#}");
-    let detail = v["detail"].as_str().unwrap();
+    let detail = slash(v["detail"].as_str().unwrap());
     assert!(
         detail.contains(".agent/progress.md:5 ") && detail.contains(".agent/progress-archive.md:4"),
         "両側を file:line で名指しする: {detail}"
@@ -212,7 +217,7 @@ fn 二重の状態へfixを2回当てると1回目で収束し2回目は何も�
     assert!(
         c["dropped_revived"][0]
             .as_str()
-            .is_some_and(|l| l.contains(".agent/progress.md:5 ")),
+            .is_some_and(|l| slash(l).contains(".agent/progress.md:5 ")),
         "{c:#}"
     );
     assert_eq!(read(&repo, ".agent/progress.md"), CONVERGED_PROGRESS);
