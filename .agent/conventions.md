@@ -568,6 +568,20 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（`HealthText` の表・`diagnostics.rs` の本体 /
   dispatch の `DISPATCH_HEALTH_SCOPES` / CLI / `run_check` の日本語の固定文と文字リテラル・日本語の口
   `HEALTH_JA_CALLS` の呼び出し）
+- #2365 の続きで、**`tako master` / `tako solo` の起動の流れ**（CLI `main.rs` の断り・案内の行・起動先の
+  解決の `[情報]`）と **ControlHost の口の既定の実装**（`host.rs`。GUI の居ないホスト = `examples/mcp_host` だけに
+  届く）を表示言語へ移した。起動の流れは**最初に** `init_local_lang()` で言語を決める（以前は移行より後・
+  cwd 移動の後に決めていたので、日本語表示でも移行の知らせだけ英語で混ざり、断りは日本語で固定されていた）。
+  断りは `Reason`（`LaunchSetupFailed` / `ProfileCwdUnreachable` / `TabNewNoPane`）と型の口
+  （`*_typed` + `ConfigError::text_in`・足した口は `validate_projects_typed` / `load_solo_profile_typed` /
+  `master_launch::{load_profile_in, load_solo_in}` / `one_m_model_warning_in`）、行は `ReplyNote`、既定の断りは
+  `HostRefusal::Default*`。旧い口（スマホの「+ master」= `master_launch::plan`・引き継ぎの後任・
+  `profile_warnings`）は日本語のまま。読めないプロファイルの理由（#2256 の系統）は persist.log と共有なので
+  中身ごと日本語のまま載せる。mcp_host は起動時に設定から表示言語を決め、`tako lang` の切り替えもその場で
+  反映する（GUI と同じ）。番犬は同じ `issue1762_dispatch_error_lang.rs`（`CLI_NOTE_SCOPES` と
+  `HOST_IMPL_SCOPES` に起動の流れの関数・host.rs の trait を足した）、実経路は
+  `crates/tako-cli/tests/issue2365_master_solo_lang.rs`（GUI 無しの CLI を日英で叩く。A/B は
+  `TAKO_2365_MASTER_BIN`）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

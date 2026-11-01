@@ -889,9 +889,12 @@ fn reason_index(r: &Reason) -> usize {
         Reason::RunNoPaneId(_) => 330,
         Reason::RunExitedWithCode(_) => 331,
         Reason::RunWaitTimedOut { .. } => 332,
+        Reason::LaunchSetupFailed(_) => 333,
+        Reason::ProfileCwdUnreachable { .. } => 334,
+        Reason::TabNewNoPane => 335,
     }
 }
-const REASON_VARIANTS: usize = 333;
+const REASON_VARIANTS: usize = 336;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1498,6 +1501,12 @@ fn reason_samples() -> Vec<Reason> {
             secs: 600,
             env: "TAKO_RUN_WAIT_TIMEOUT_SECS",
         },
+        Reason::LaunchSetupFailed("Not a directory (os error 20)".into()),
+        Reason::ProfileCwdUnreachable {
+            cwd: "/tmp/p".into(),
+            error: "Permission denied (os error 13)".into(),
+        },
+        Reason::TabNewNoPane,
     ]
 }
 
@@ -1896,6 +1905,9 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "コマンドが exit code 3 で終了",
     "まだ実行中です（pane 7。600 秒待って打ち切りました。実行は止めていません）。\
      続きは `tako run-interactive-status 7`。上限は TAKO_RUN_WAIT_TIMEOUT_SECS で変えられます",
+    "セットアップに失敗: Not a directory (os error 20)",
+    "プロファイルの cwd に移動できない: /tmp/p (Permission denied (os error 13))",
+    "タブ作成の応答に pane が含まれない",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
@@ -7927,9 +7939,34 @@ fn host_refusal_index(r: &HostRefusal) -> usize {
         HostRefusal::UrlHasControlChar(_) => 56,
         HostRefusal::WebViewParentDetached => 57,
         HostRefusal::VideoOpen(_) => 58,
+        HostRefusal::DefaultNoClick => 59,
+        HostRefusal::DefaultNoFileTree => 60,
+        HostRefusal::DefaultReattachNeedsGui => 61,
+        HostRefusal::DefaultChatCopy => 62,
+        HostRefusal::DefaultWelcomeNeedsGui => 63,
+        HostRefusal::DefaultZoom => 64,
+        HostRefusal::DefaultLineJump => 65,
+        HostRefusal::DefaultGotoDefinition => 66,
+        HostRefusal::DefaultFormat => 67,
+        HostRefusal::DefaultOutline => 68,
+        HostRefusal::DefaultPdfLink => 69,
+        HostRefusal::DefaultMarkdownLink => 70,
+        HostRefusal::DefaultCodeBlockCopy => 71,
+        HostRefusal::DefaultPreviewEdit => 72,
+        HostRefusal::DefaultChangelog => 73,
+        HostRefusal::DefaultNoOsClipboard => 74,
+        HostRefusal::DefaultVideo => 75,
+        HostRefusal::DefaultWebView => 76,
+        HostRefusal::DefaultRemoteApi => 77,
+        HostRefusal::DefaultRemoteApiNotRunning => 78,
+        HostRefusal::DefaultUpdate => 79,
+        HostRefusal::DefaultRepair => 80,
+        HostRefusal::DefaultFormatOnSave => 81,
+        HostRefusal::DefaultAutoClose => 82,
+        HostRefusal::DefaultNoMod => 83,
     }
 }
-const HOST_REFUSAL_VARIANTS: usize = 59;
+const HOST_REFUSAL_VARIANTS: usize = 84;
 
 /// (断り, #2365 より前に GUI が組んでいた日本語の固定文)。中身で腕を分けるもの
 /// （`LinkIndexOutOfRange` の total・`WebViewNotFound` の案内）は両方を載せる
@@ -8140,6 +8177,32 @@ fn host_refusal_table() -> Vec<(HostRefusal, String)> {
             H::VideoOpen(tako_control::VideoRefusal::LoadFailed),
             "動画の読み込みに失敗した".into(),
         ),
+        // 口の既定の実装（`host.rs`。届くのは GUI の居ないホスト = `examples/mcp_host` だけ）
+        (H::DefaultNoClick, "このホストはクリックを渡せない".into()),
+        (H::DefaultNoFileTree, "このホストはファイルツリーを持たない".into()),
+        (H::DefaultReattachNeedsGui, "tako アプリ（GUI）が居ないので再 attach できない".into()),
+        (H::DefaultChatCopy, "チャットビューのコピーは未対応".into()),
+        (H::DefaultWelcomeNeedsGui, "ボタンを押す GUI が居ない".into()),
+        (H::DefaultZoom, "PDF・画像プレビューのズームは未対応".into()),
+        (H::DefaultLineJump, "行ジャンプは未対応".into()),
+        (H::DefaultGotoDefinition, "定義ジャンプは未対応".into()),
+        (H::DefaultFormat, "整形は未対応".into()),
+        (H::DefaultOutline, "アウトラインナビゲーションは未対応".into()),
+        (H::DefaultPdfLink, "PDF リンクフォローは未対応".into()),
+        (H::DefaultMarkdownLink, "Markdown リンクフォローは未対応".into()),
+        (H::DefaultCodeBlockCopy, "コードブロックのコピーは未対応".into()),
+        (H::DefaultPreviewEdit, "プレビュー編集は未対応".into()),
+        (H::DefaultChangelog, "チェンジログビューは未対応".into()),
+        (H::DefaultNoOsClipboard, "このホストは OS のクリップボードを使わない".into()),
+        (H::DefaultVideo, "動画再生は未対応".into()),
+        (H::DefaultWebView, "Web ビューはこの環境では使えない".into()),
+        (H::DefaultRemoteApi, "リモートアクセス API はこの環境では使えない".into()),
+        (H::DefaultRemoteApiNotRunning, "リモートアクセス API サーバーが起動していない".into()),
+        (H::DefaultUpdate, "この環境では更新を実行できない".into()),
+        (H::DefaultRepair, "この環境では修復を実行できない".into()),
+        (H::DefaultFormatOnSave, "保存時整形の設定は未対応".into()),
+        (H::DefaultAutoClose, "括弧の自動閉じの設定は未対応".into()),
+        (H::DefaultNoMod, "この tako は mod を扱わない".into()),
     ]
 }
 
@@ -8359,6 +8422,14 @@ const HOST_IMPL_SCOPES: &[(&str, &str)] = &[
     ("crates/tako-app/src/webview.rs", "    pub fn eval("),
     ("crates/tako-app/src/webview.rs", "    pub fn retry("),
     ("crates/tako-app/src/webview.rs", "pub fn validate_url("),
+    // #2365 の続き: 口の既定の実装（`host.rs`。GUI の居ないホスト = `examples/mcp_host` に届く）
+    ("crates/tako-control/src/host.rs", "pub trait SessionHost {"),
+    ("crates/tako-control/src/host.rs", "pub trait TmuxHost {"),
+    ("crates/tako-control/src/host.rs", "pub trait UiStateHost {"),
+    ("crates/tako-control/src/host.rs", "pub trait PreviewHost {"),
+    ("crates/tako-control/src/host.rs", "pub trait WebViewHost {"),
+    ("crates/tako-control/src/host.rs", "pub trait RemoteHost {"),
+    ("crates/tako-control/src/host.rs", "pub trait SystemHost {"),
 ];
 
 /// 断りではない日本語の呼び出し（診断の出力 = persist.log / stderr は日本語のまま。内部の印も）
@@ -15737,9 +15808,36 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::FdaNotApplicable => 49,
         ReplyNote::FdaGrantedDescription => 50,
         ReplyNote::FdaNotGrantedDescription => 51,
+        ReplyNote::McpPathMissing(_) => 52,
+        ReplyNote::OneMModelWarning { .. } => 53,
+        ReplyNote::MasterLaunched(_) => 54,
+        ReplyNote::SoloLaunched(_) => 55,
+        ReplyNote::LaunchTabNamed { .. } => 56,
+        ReplyNote::LaunchNewTab(_) => 57,
+        ReplyNote::LaunchInline(_) => 58,
+        ReplyNote::LaunchProfile { .. } => 59,
+        ReplyNote::LimitResumeOn => 60,
+        ReplyNote::WorkerPolicyInherit { .. } => 61,
+        ReplyNote::WorkerPolicyInheritNonClaude { .. } => 62,
+        ReplyNote::WorkerPolicyFixed { .. } => 63,
+        ReplyNote::WorkerPolicyDelegate => 64,
+        ReplyNote::ProjectsRestriction(_) => 65,
+        ReplyNote::TreeFoldersAdded(_) => 66,
+        ReplyNote::SoloMode => 67,
+        ReplyNote::MasterAccount { .. } => 68,
+        ReplyNote::MasterAccountDefault(_) => 69,
+        ReplyNote::RemoteControlEnableHint(_) => 70,
+        ReplyNote::SandboxBypassHint(_) => 71,
+        ReplyNote::StalePaneIdRemapped { .. } => 72,
+        ReplyNote::PaneIdMismatch { .. } => 73,
+        ReplyNote::UnsetPaneIdHint => 74,
+        ReplyNote::CallerPaneUnknownStale(_) => 75,
+        ReplyNote::CallerPaneUnknownUnset => 76,
+        ReplyNote::LaunchingInNewTab => 77,
+        ReplyNote::SshDetectionNoGui => 78,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 52;
+const REPLY_NOTE_VARIANTS: usize = 79;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -16028,6 +16126,147 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             "フルディスクアクセスが未付与です。フォルダアクセス時に許可ダイアログが表示されることがあります"
                 .into(),
         ),
+        // ---- `tako master` / `tako solo` の起動の流れ（CLI `main.rs` の 2 行の出力は改行で 1 つに） ----
+        (
+            ReplyNote::McpPathMissing("/x/tako".into()),
+            "[警告] MCP 登録パスが消失しています: /x/tako\n        \
+             tako MCP なしで起動します。tako setup-mcp で修復してください。"
+                .into(),
+        ),
+        (
+            ReplyNote::OneMModelWarning {
+                source: "master".into(),
+                model: "claude-opus-4-6[1m]".into(),
+            },
+            "[警告] master のモデル 'claude-opus-4-6[1m]' は 1M コンテキスト版のため、Pro プランでは起動できない可能性があります（Max / API プラン向け）。\n  \
+             起動に失敗する場合は `tako orchestrator profiles set <プロファイル名> --clear-model` で解除してください"
+                .into(),
+        ),
+        (
+            ReplyNote::MasterLaunched("<loc>".into()),
+            "master を起動しました: <loc>".into(),
+        ),
+        (
+            ReplyNote::SoloLaunched("<loc>".into()),
+            "solo を起動しました: <loc>".into(),
+        ),
+        (
+            ReplyNote::LaunchTabNamed {
+                title: "p2365".into(),
+                pane: 7,
+            },
+            "タブ 'p2365'（ペイン 7）".into(),
+        ),
+        (ReplyNote::LaunchNewTab(7), "新しいタブ（ペイン 7）".into()),
+        (ReplyNote::LaunchInline(7), "ペイン 7（インライン）".into()),
+        (
+            ReplyNote::LaunchProfile {
+                profile: "d".into(),
+                agent: "claude".into(),
+                model: "(claude CLI default)".into(),
+                effort: "high".into(),
+            },
+            "プロファイル: d（エージェント: claude、モデル: (claude CLI default)、effort: high）".into(),
+        ),
+        (
+            ReplyNote::LimitResumeOn,
+            "リミット後の自動復帰: 有効（プロファイル既定。#1140）".into(),
+        ),
+        (
+            ReplyNote::WorkerPolicyInherit {
+                model: "m".into(),
+                effort: "high".into(),
+            },
+            "worker モデルポリシー: inherit（master と同じ m / high）".into(),
+        ),
+        (
+            ReplyNote::WorkerPolicyInheritNonClaude {
+                agent: "codex".into(),
+                model: "m".into(),
+                effort: "max".into(),
+            },
+            "worker モデルポリシー: inherit（master は codex のため claude worker へは非継承: m / max）"
+                .into(),
+        ),
+        (
+            ReplyNote::WorkerPolicyFixed {
+                model: "m".into(),
+                effort: "max".into(),
+            },
+            "worker モデルポリシー: fixed（m / max）".into(),
+        ),
+        (
+            ReplyNote::WorkerPolicyDelegate,
+            "worker モデルポリシー: delegate（master が判断）".into(),
+        ),
+        (
+            ReplyNote::ProjectsRestriction("a, b".into()),
+            "projects 制限: a, b".into(),
+        ),
+        (
+            ReplyNote::TreeFoldersAdded("proj".into()),
+            "ファイルツリーに追加: proj".into(),
+        ),
+        (
+            ReplyNote::SoloMode,
+            "モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）".into(),
+        ),
+        (
+            ReplyNote::MasterAccount {
+                name: "acct".into(),
+                config_dir: "/tmp/c".into(),
+            },
+            "アカウント: acct（config dir: /tmp/c）".into(),
+        ),
+        (
+            ReplyNote::MasterAccountDefault("acct".into()),
+            "アカウント: acct（既定の資格情報 / CLAUDE_CONFIG_DIR 未設定）".into(),
+        ),
+        (
+            ReplyNote::RemoteControlEnableHint(
+                "tako orchestrator profiles set d --remote-control true".into(),
+            ),
+            "  有効にする場合: tako orchestrator profiles set d --remote-control true".into(),
+        ),
+        (
+            ReplyNote::SandboxBypassHint(
+                "tako orchestrator profiles set d --bypass-sandbox true".into(),
+            ),
+            "  外す場合: tako orchestrator profiles set d --bypass-sandbox true".into(),
+        ),
+        (
+            ReplyNote::StalePaneIdRemapped { old: 5, pane: 7 },
+            "[情報] TAKO_PANE_ID=5 は旧世代のペイン ID です（アプリ再起動をまたいだ値）\n  \
+             現世代のペイン 7 へ読み替えて起動します"
+                .into(),
+        ),
+        (
+            ReplyNote::PaneIdMismatch { old: 5, pane: 7 },
+            "[情報] TAKO_PANE_ID=5 は呼び出し元ペインと一致しません（シェルが古い値を持っています）\n  \
+             実際の呼び出し元ペイン 7 で起動します"
+                .into(),
+        ),
+        (
+            ReplyNote::UnsetPaneIdHint,
+            "  このシェルを使い続けるなら: unset TAKO_PANE_ID".into(),
+        ),
+        (
+            ReplyNote::CallerPaneUnknownStale(5),
+            "[情報] 呼び出し元ペインを特定できません（TAKO_PANE_ID=5 は現在の tako に無い古い値）".into(),
+        ),
+        (
+            ReplyNote::CallerPaneUnknownUnset,
+            "[情報] 呼び出し元ペインを特定できません（TAKO_PANE_ID 未設定）".into(),
+        ),
+        (
+            ReplyNote::LaunchingInNewTab,
+            "  新しいタブを作ってそこで起動します".into(),
+        ),
+        // ---- GUI の居ないホスト（host.rs の既定）の応答の値 ----
+        (
+            ReplyNote::SshDetectionNoGui,
+            "GUI が接続していないので検知状態を読めない".into(),
+        ),
     ]
 }
 
@@ -16245,23 +16484,22 @@ const CLI_NOTE_SCOPES: &[&str] = &[
     "fn pipe_line(",
     "fn local_gui_report(",
     "fn alive_unreachable_next(",
+    // #2365: `tako master` / `tako solo` の起動の流れ（断りは `Reason`・型の口、行は `ReplyNote`）
+    "fn check_mcp_health_warning(",
+    "fn print_master_env(",
+    "fn print_remote_control_state(",
+    "fn print_sandbox_state(",
+    "fn orchestrator_master(",
+    "fn orchestrator_solo(",
+    "fn launch_profile_line(",
+    "fn launch_location(",
+    "fn resolve_launch_target(",
+    "fn new_tab_target(",
 ];
 
 /// CLI `main.rs` でまだ断りに日本語の固定文を持つ関数（頭, 理由）。**断りを移し終えたら外す**
 /// （下の番犬が「古い」と落とす = 表が縮む方向にしか動かない）。Issue #2365 の段 1 の表と同じ切り分け
 const CLI_REFUSAL_DEFERRED: &[(&str, &str)] = &[
-    (
-        "fn orchestrator_master(",
-        "master / solo の起動の流れ（中の型の口と案内の行と 1 本で移す）",
-    ),
-    (
-        "fn orchestrator_solo(",
-        "master / solo の起動の流れ（中の型の口と案内の行と 1 本で移す）",
-    ),
-    (
-        "fn new_tab_target(",
-        "master / solo の起動の流れ（中の型の口と案内の行と 1 本で移す）",
-    ),
     (
         "fn recover_local(",
         "recover 一式（中身の LayoutError と一覧・復元の結果と 1 本で移す）",

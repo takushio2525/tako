@@ -5086,7 +5086,7 @@ fn print_setup_mcp_report(resp: &serde_json::Value) {
 }
 
 /// MCP 登録パスの存在を確認し、不在なら警告を出す（master/solo 起動前のガード）
-fn check_mcp_health_warning() {
+fn check_mcp_health_warning(lang: tako_core::i18n::Lang) {
     let home = match tako_core::paths::home_dir() {
         Some(h) => h,
         None => return,
@@ -5110,8 +5110,10 @@ fn check_mcp_health_warning() {
         None => return,
     };
     if !std::path::Path::new(cmd).is_file() {
-        eprintln!("[警告] MCP 登録パスが消失しています: {cmd}");
-        eprintln!("        tako MCP なしで起動します。tako setup-mcp で修復してください。");
+        eprintln!(
+            "{}",
+            ReplyNote::McpPathMissing(cmd.to_string()).text_in(lang)
+        );
         eprintln!();
     }
 }
@@ -5119,31 +5121,38 @@ fn check_mcp_health_warning() {
 /// master / solo 起動時の env とアカウントの可視化（Issue #500 / #547）。
 /// 値はマスクし、キー名と解決後の config dir だけを出す。
 /// アカウント解決の失敗は build_master_cmd が起動前に Err にするので、ここは表示だけ
-fn print_master_env(profile: &tako_control::orchestrator::Profile, profile_name: &str) {
+fn print_master_env(
+    profile: &tako_control::orchestrator::Profile,
+    profile_name: &str,
+    lang: tako_core::i18n::Lang,
+) {
     use tako_control::orchestrator;
     if !profile.env.is_empty() {
         let keys: Vec<&str> = profile.env.keys().map(|k| k.as_str()).collect();
         eprintln!("env: {}", keys.join(", "));
     }
-    match profile.resolve_master_account() {
+    match profile.resolve_master_account_typed() {
         // #547: master_account があればそちらが CLAUDE_CONFIG_DIR の正
-        Ok(Some(account)) => match account.config_dir.path() {
-            Some(dir) => eprintln!("アカウント: {}（config dir: {dir}）", account.name),
-            None => eprintln!(
-                "アカウント: {}（既定の資格情報 / CLAUDE_CONFIG_DIR 未設定）",
-                account.name
-            ),
-        },
+        Ok(Some(account)) => {
+            let line = match account.config_dir.path() {
+                Some(dir) => ReplyNote::MasterAccount {
+                    name: account.name.clone(),
+                    config_dir: dir.to_string(),
+                },
+                None => ReplyNote::MasterAccountDefault(account.name.clone()),
+            };
+            eprintln!("{}", line.text_in(lang));
+        }
         // アカウント未指定: プロファイル env の config dir を従来どおり出す
         Ok(None) => {
             if let Some(config_dir) = profile.env.get("CLAUDE_CONFIG_DIR") {
                 eprintln!("config dir: {}", orchestrator::expand_tilde(config_dir));
             }
         }
-        Err(e) => eprintln!("warning: {e}"),
+        Err(e) => eprintln!("warning: {}", e.text_in(lang)),
     }
-    print_sandbox_state(profile, profile_name);
-    print_remote_control_state(profile, profile_name);
+    print_sandbox_state(profile, profile_name, lang);
+    print_remote_control_state(profile, profile_name, lang);
 }
 
 /// Remote Control の状態を 1 行で出す（Issue #1068。#981 の
@@ -5152,7 +5161,11 @@ fn print_master_env(profile: &tako_control::orchestrator::Profile, profile_name:
 /// 無効のときに黙っていると「スマホから見えない」の切り分けができない。
 /// 逆に opt-in しているのに環境が不適格なときは、**なぜ付かなかったか**を出す
 /// （フラグを付けないことで claude の即死は避けているが、理由が要る）
-fn print_remote_control_state(profile: &tako_control::orchestrator::Profile, profile_name: &str) {
+fn print_remote_control_state(
+    profile: &tako_control::orchestrator::Profile,
+    profile_name: &str,
+    lang: tako_core::i18n::Lang,
+) {
     use tako_control::{claude_remote, orchestrator};
     // claude 以外には相当する仕組みが無い（マトリクスの宣言が正）。
     // opt-in していない限り黙る = codex master の画面に無関係な行を増やさない
@@ -5170,17 +5183,20 @@ fn print_remote_control_state(profile: &tako_control::orchestrator::Profile, pro
     };
     eprintln!("{}", claude_remote::status_line(&decision));
     if decision.flag.is_none() && decision.blocked.is_none() && is_claude {
-        eprintln!(
-            "  有効にする場合: {}",
-            claude_remote::enable_hint_command(profile_name)
-        );
+        let hint =
+            ReplyNote::RemoteControlEnableHint(claude_remote::enable_hint_command(profile_name));
+        eprintln!("{}", hint.text_in(lang));
     }
 }
 
 /// codex 系 master / solo のサンドボックス状態を 1 行で出す（Issue #981）。
 /// **外れているときも外れていないときも出す**（承認プロンプトで止まったとき、
 /// 画面に理由が残っていなければ「黙って動かない」に見えるため）
-fn print_sandbox_state(profile: &tako_control::orchestrator::Profile, profile_name: &str) {
+fn print_sandbox_state(
+    profile: &tako_control::orchestrator::Profile,
+    profile_name: &str,
+    lang: tako_core::i18n::Lang,
+) {
     use tako_control::orchestrator;
     // codex 以外はサンドボックスの概念が無い（claude / agy にこのフラグは存在しない）
     if !matches!(
@@ -5190,12 +5206,14 @@ fn print_sandbox_state(profile: &tako_control::orchestrator::Profile, profile_na
         return;
     }
     let enabled = profile.bypass_sandbox || orchestrator::legacy_unconditional_bypass();
-    eprintln!("{}", orchestrator::sandbox_bypass_line(enabled).text());
+    eprintln!(
+        "{}",
+        orchestrator::sandbox_bypass_line(enabled).text_in(lang)
+    );
     if !enabled {
-        eprintln!(
-            "  外す場合: {}",
-            orchestrator::sandbox_bypass_hint_command(profile_name)
-        );
+        let hint =
+            ReplyNote::SandboxBypassHint(orchestrator::sandbox_bypass_hint_command(profile_name));
+        eprintln!("{}", hint.text_in(lang));
     }
 }
 
@@ -5304,13 +5322,20 @@ fn run_launch_line(command: &str) -> Result<(), String> {
 fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     use tako_control::orchestrator;
 
-    orchestrator::ensure_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
+    // 起動の流れの断り・行・型の口の文と、移行の知らせ・`Note` 由来の文言（サンドボックス状態 #981 /
+    // CLI 不在の案内 #983）を表示言語で組む。**移行より前に**決める（#2365。以前は cwd 移動の後に
+    // 決めていたので、移行の知らせと断りが設定と無関係に英語 / 日本語で固定されていた）
+    init_local_lang();
+    let lang = tako_core::i18n::lang();
 
-    check_mcp_health_warning();
+    orchestrator::ensure_defaults_typed()
+        .map_err(|e| Reason::LaunchSetupFailed(e.text_in(lang)).text_in(lang))?;
+
+    check_mcp_health_warning(lang);
 
     // 旧形式の設定ファイルを master 起動のたびに検知して直す（#916）
     if let Some(notice) = tako_control::migrations::ensure_migrated() {
-        eprintln!("[情報] {notice}");
+        eprintln!("{} {notice}", ReplyNote::InfoLabel.text_in(lang));
         eprintln!();
     }
 
@@ -5320,9 +5345,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             // 切り出し安全: 直前の starts_with('-') で先頭 1 バイトは ASCII の `-`
             let name = &s[1..];
             if name.is_empty() {
-                return Err(front_err(tako_control::Reason::EmptyProfileName(
-                    "tako master -2",
-                )));
+                return Err(Reason::EmptyProfileName("tako master -2").text_in(lang));
             }
             (name, Some(name))
         }
@@ -5334,41 +5357,45 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     let orchestrator::master_launch::LaunchProfile {
         profile,
         warning: load_warning,
-    } = orchestrator::master_launch::load_profile(profile_name)?;
+    } = orchestrator::master_launch::load_profile_in(profile_name, lang)?;
     if let Some(w) = &load_warning {
-        eprintln!("警告: {w}");
+        eprintln!("{}: {w}", ReplyNote::WarningLabel.text_in(lang));
     }
 
     // env 検証（内部変数の上書き拒否。Issue #500）
-    profile.validate_env()?;
+    profile.validate_env_typed().map_err(|e| e.text_in(lang))?;
 
     // Part 5: cwd 解決（存在しなければ診断つきエラー）
-    let resolved_cwd = profile.resolve_cwd()?;
+    let resolved_cwd = profile.resolve_cwd_typed().map_err(|e| e.text_in(lang))?;
 
     // Part 7: projects の key が projects.yaml に存在するか検証（起動時エラー）
-    profile.validate_projects()?;
+    profile
+        .validate_projects_typed()
+        .map_err(|e| e.text_in(lang))?;
 
     // Part 5: cwd が指定されていれば、そのディレクトリへ移動
     if let Some(ref cwd) = resolved_cwd {
-        std::env::set_current_dir(cwd)
-            .map_err(|e| format!("プロファイルの cwd に移動できない: {} ({e})", cwd.display()))?;
+        std::env::set_current_dir(cwd).map_err(|e| {
+            Reason::ProfileCwdUnreachable {
+                cwd: cwd.display().to_string(),
+                error: e.to_string(),
+            }
+            .text_in(lang)
+        })?;
     }
 
-    // #983: この経路は表示言語を初期化していなかったため、`Note` 由来の文言
-    // （サンドボックス状態 #981 / CLI 不在の案内）が設定と無関係に英語で出ていた。
-    // 既に他のサブコマンドが使っている 1 行と同じ形で揃える（既定は En の静的値）
-    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
-
-    let master_agent = profile.resolve_master_agent()?;
+    let master_agent = profile
+        .resolve_master_agent_typed()
+        .map_err(|e| e.text_in(lang))?;
     // #983: CLI が無ければタブを作る前に理由 + 次の一手で落ちる
     // （組み立てたコマンドをそのまま流すと、新しいタブに command not found が出るだけ）
-    orchestrator::agent_cli::preflight(master_agent).map_err(|e| e.message())?;
+    orchestrator::agent_cli::preflight(master_agent).map_err(|e| e.message_in(lang))?;
 
     if profile.master_agent_is_claude() {
         if let Some(warning) = profile
             .model
             .as_deref()
-            .and_then(|m| orchestrator::one_m_model_warning(m, "master"))
+            .and_then(|m| orchestrator::one_m_model_warning_in(m, "master", lang))
         {
             eprintln!("{warning}");
         }
@@ -5376,7 +5403,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     if let Some(warning) = profile
         .resolve_worker_model()
         .filter(|m| Some(*m) != profile.model.as_deref())
-        .and_then(|m| orchestrator::one_m_model_warning(m, "worker"))
+        .and_then(|m| orchestrator::one_m_model_warning_in(m, "worker", lang))
     {
         eprintln!("{warning}");
     }
@@ -5394,10 +5421,10 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         profile.build_system_prompt(profile_name),
         load_warning.as_deref(),
     );
-    let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
+    let dir = orchestrator::config_dir().ok_or_else(|| Reason::HomeDirUnknown.text_in(lang))?;
     let prompt_path = dir.join(format!("_system_prompt_{profile_name}.md"));
     std::fs::write(&prompt_path, &prompt_content)
-        .map_err(|e| format!("system prompt の書き出しに失敗: {e}"))?;
+        .map_err(|e| Reason::SystemPromptWriteFailed(e.to_string()).text_in(lang))?;
 
     // #2120: タブ名は管轄プロジェクトの名前を**自動名で**付ける（汎用 master は触らない）。
     // 役割名（`master` / `master-<名前>`）を手動名で付けると、master 自身の
@@ -5414,7 +5441,9 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     };
 
     let tako_bin = tako_control::dispatch::resolve_tako_binary();
-    let master_cmd = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)?;
+    let master_cmd =
+        orchestrator::build_master_cmd_typed(&role_env, &profile, &prompt_path, &tako_bin)
+            .map_err(|e| e.text_in(lang))?;
 
     // インライン起動（既定）: 現在のペインでコマンドを実行（新タブを作らない。#264）
     // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）: 新タブ起動
@@ -5423,6 +5452,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         None,
         use_tab,
         &master_cmd_hint(profile_name),
+        lang,
     )?;
     let pane_id = target.pane;
 
@@ -5441,42 +5471,41 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         paste_guard: None,
     })?;
 
-    eprintln!("master を起動しました: {}", launch_location(&target));
+    let launched = ReplyNote::MasterLaunched(launch_location(&target, lang));
+    eprintln!("{}", launched.text_in(lang));
     eprintln!(
-        "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
-        master_agent.as_str(),
-        profile.master_model_label(),
-        profile.effort
+        "{}",
+        launch_profile_line(&profile, profile_name, master_agent, lang)
     );
     // #1140: 本人のペインへ配った利用上限後の自動復帰。適用は role を貼る
     // dispatch 側（`Request::Title`）が行うので、ここは何が起きたかを言うだけ
     if orchestrator::resolve_master_limit_resume(&profile) {
-        eprintln!("リミット後の自動復帰: 有効（プロファイル既定。#1140）");
+        eprintln!("{}", ReplyNote::LimitResumeOn.text_in(lang));
     }
-    let policy_desc = match profile.worker_model_policy {
-        orchestrator::WorkerModelPolicy::Inherit if profile.master_agent_is_claude() => format!(
-            "inherit（master と同じ {} / {}）",
-            profile.model_label(),
-            profile.effort
-        ),
-        orchestrator::WorkerModelPolicy::Inherit => format!(
-            "inherit（master は {} のため claude worker へは非継承: {} / {}）",
-            master_agent.as_str(),
-            profile.worker_model_label(),
-            profile.resolve_worker_effort()
-        ),
-        orchestrator::WorkerModelPolicy::Fixed => format!(
-            "fixed（{} / {}）",
-            profile.worker_model_label(),
-            profile.resolve_worker_effort()
-        ),
-        orchestrator::WorkerModelPolicy::Delegate => "delegate（master が判断）".into(),
+    let policy_line = match profile.worker_model_policy {
+        orchestrator::WorkerModelPolicy::Inherit if profile.master_agent_is_claude() => {
+            ReplyNote::WorkerPolicyInherit {
+                model: profile.model_label().to_string(),
+                effort: profile.effort.clone(),
+            }
+        }
+        orchestrator::WorkerModelPolicy::Inherit => ReplyNote::WorkerPolicyInheritNonClaude {
+            agent: master_agent.as_str().to_string(),
+            model: profile.worker_model_label().to_string(),
+            effort: profile.resolve_worker_effort().to_string(),
+        },
+        orchestrator::WorkerModelPolicy::Fixed => ReplyNote::WorkerPolicyFixed {
+            model: profile.worker_model_label().to_string(),
+            effort: profile.resolve_worker_effort().to_string(),
+        },
+        orchestrator::WorkerModelPolicy::Delegate => ReplyNote::WorkerPolicyDelegate,
     };
-    eprintln!("worker モデルポリシー: {policy_desc}");
+    eprintln!("{}", policy_line.text_in(lang));
     // Part 4: env の可視化（キー名のみ。Issue #500 / #547）
-    print_master_env(&profile, profile_name);
+    print_master_env(&profile, profile_name, lang);
     if let Some(ref projects) = profile.projects {
-        eprintln!("projects 制限: {}", projects.join(", "));
+        let line = ReplyNote::ProjectsRestriction(projects.join(", "));
+        eprintln!("{}", line.text_in(lang));
     }
     // Part 5: cwd 表示
     if let Some(ref cwd) = resolved_cwd {
@@ -5517,22 +5546,36 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         });
     }
     if !tree_folders.is_empty() {
-        eprintln!(
-            "ファイルツリーに追加: {}",
-            tree_folders
-                .iter()
-                .map(|p| {
-                    std::path::Path::new(p)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| p.clone())
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        let names = tree_folders
+            .iter()
+            .map(|p| {
+                std::path::Path::new(p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.clone())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("{}", ReplyNote::TreeFoldersAdded(names).text_in(lang));
     }
 
     Ok(())
+}
+
+/// 起動した master / solo の `プロファイル: …（エージェント・モデル・effort）` の行（#2365）
+fn launch_profile_line(
+    profile: &tako_control::orchestrator::Profile,
+    profile_name: &str,
+    agent: tako_control::orchestrator::WorkerAgent,
+    lang: tako_core::i18n::Lang,
+) -> String {
+    ReplyNote::LaunchProfile {
+        profile: profile_name.to_string(),
+        agent: agent.as_str().to_string(),
+        model: profile.master_model_label(),
+        effort: profile.effort.clone(),
+    }
+    .text_in(lang)
 }
 
 /// `tako solo [-profile]` — solo system prompt 付きで claude / codex を起動する。
@@ -5540,9 +5583,14 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
 fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     use tako_control::orchestrator;
 
-    orchestrator::ensure_solo_defaults().map_err(|e| format!("セットアップに失敗: {e}"))?;
+    // 起動の流れの断り・行・型の口の文と `Note` 由来の文言を表示言語で組む（master と同じ。#2365）
+    init_local_lang();
+    let lang = tako_core::i18n::lang();
 
-    check_mcp_health_warning();
+    orchestrator::ensure_solo_defaults_typed()
+        .map_err(|e| Reason::LaunchSetupFailed(e.text_in(lang)).text_in(lang))?;
+
+    check_mcp_health_warning(lang);
 
     let (profile_name, suffix) = match arg {
         None => ("default", None),
@@ -5550,9 +5598,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
             // 切り出し安全: 直前の starts_with('-') で先頭 1 バイトは ASCII の `-`
             let name = &s[1..];
             if name.is_empty() {
-                return Err(front_err(tako_control::Reason::EmptyProfileName(
-                    "tako solo -fast",
-                )));
+                return Err(Reason::EmptyProfileName("tako solo -fast").text_in(lang));
             }
             (name, Some(name))
         }
@@ -5564,32 +5610,37 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     let orchestrator::master_launch::LaunchProfile {
         profile,
         warning: load_warning,
-    } = orchestrator::master_launch::load_solo(profile_name)?;
+    } = orchestrator::master_launch::load_solo_in(profile_name, lang)?;
     if let Some(w) = &load_warning {
-        eprintln!("警告: {w}");
+        eprintln!("{}: {w}", ReplyNote::WarningLabel.text_in(lang));
     }
 
     // env 検証（内部変数の上書き拒否。Issue #500）
-    profile.validate_env()?;
+    profile.validate_env_typed().map_err(|e| e.text_in(lang))?;
 
     // Part 5: cwd 解決
-    let resolved_cwd = profile.resolve_cwd()?;
+    let resolved_cwd = profile.resolve_cwd_typed().map_err(|e| e.text_in(lang))?;
     if let Some(ref cwd) = resolved_cwd {
-        std::env::set_current_dir(cwd)
-            .map_err(|e| format!("プロファイルの cwd に移動できない: {} ({e})", cwd.display()))?;
+        std::env::set_current_dir(cwd).map_err(|e| {
+            Reason::ProfileCwdUnreachable {
+                cwd: cwd.display().to_string(),
+                error: e.to_string(),
+            }
+            .text_in(lang)
+        })?;
     }
 
-    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
-
-    let solo_agent = profile.resolve_master_agent()?;
+    let solo_agent = profile
+        .resolve_master_agent_typed()
+        .map_err(|e| e.text_in(lang))?;
     // #983: master と同じ理由で、起動前に CLI の実在を確かめる
-    orchestrator::agent_cli::preflight(solo_agent).map_err(|e| e.message())?;
+    orchestrator::agent_cli::preflight(solo_agent).map_err(|e| e.message_in(lang))?;
 
     if profile.master_agent_is_claude() {
         if let Some(warning) = profile
             .model
             .as_deref()
-            .and_then(|m| orchestrator::one_m_model_warning(m, "solo"))
+            .and_then(|m| orchestrator::one_m_model_warning_in(m, "solo", lang))
         {
             eprintln!("{warning}");
         }
@@ -5600,10 +5651,10 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         profile.build_solo_system_prompt(profile_name),
         load_warning.as_deref(),
     );
-    let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
+    let dir = orchestrator::config_dir().ok_or_else(|| Reason::HomeDirUnknown.text_in(lang))?;
     let prompt_path = dir.join(format!("_solo_system_prompt_{profile_name}.md"));
     std::fs::write(&prompt_path, &prompt_content)
-        .map_err(|e| format!("system prompt の書き出しに失敗: {e}"))?;
+        .map_err(|e| Reason::SystemPromptWriteFailed(e.to_string()).text_in(lang))?;
 
     // #2127: タブ名は solo が作業するフォルダ（Part 5 の cwd 移動の後）のリポジトリ名を
     // **自動名で**付ける（HOME で立てたら触らない）。役割名（`solo` / `solo-<名前>`）を
@@ -5622,7 +5673,8 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
     };
 
     let tako_bin = tako_control::dispatch::resolve_tako_binary();
-    let solo_cmd = orchestrator::build_master_cmd(&role, &profile, &prompt_path, &tako_bin)?;
+    let solo_cmd = orchestrator::build_master_cmd_typed(&role, &profile, &prompt_path, &tako_bin)
+        .map_err(|e| e.text_in(lang))?;
 
     // --tab 指定時 / 呼び出し元ペインが解決できないとき（#567）は新タブ起動
     let target = resolve_launch_target(
@@ -5630,6 +5682,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         new_tab_cwd,
         use_tab,
         &solo_cmd_hint(profile_name),
+        lang,
     )?;
     let pane_id = target.pane;
 
@@ -5648,20 +5701,19 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         paste_guard: None,
     })?;
 
-    eprintln!("solo を起動しました: {}", launch_location(&target));
+    let launched = ReplyNote::SoloLaunched(launch_location(&target, lang));
+    eprintln!("{}", launched.text_in(lang));
     eprintln!(
-        "プロファイル: {profile_name}（エージェント: {}、モデル: {}、effort: {}）",
-        solo_agent.as_str(),
-        profile.master_model_label(),
-        profile.effort
+        "{}",
+        launch_profile_line(&profile, profile_name, solo_agent, lang)
     );
-    eprintln!("モード: solo（オーケストレーション無し・1 対 1 対話・worker spawn 禁止）");
+    eprintln!("{}", ReplyNote::SoloMode.text_in(lang));
     // #1140: solo は worker を spawn しないので、この設定が効く先は本人のペインだけ
     if orchestrator::resolve_master_limit_resume(&profile) {
-        eprintln!("リミット後の自動復帰: 有効（プロファイル既定。#1140）");
+        eprintln!("{}", ReplyNote::LimitResumeOn.text_in(lang));
     }
     // Part 4: env の可視化（キー名のみ。Issue #500 / #547）
-    print_master_env(&profile, profile_name);
+    print_master_env(&profile, profile_name, lang);
     eprintln!("system prompt: {}", prompt_path.display());
     Ok(())
 }
@@ -9607,12 +9659,16 @@ struct LaunchTarget {
 }
 
 /// 起動場所の表示文言（Issue #567。フォールバックで新タブになった場合もタブ表記になる）
-fn launch_location(target: &LaunchTarget) -> String {
-    match (target.new_tab, target.tab_title.as_deref()) {
-        (true, Some(title)) => format!("タブ '{title}'（ペイン {}）", target.pane),
-        (true, None) => format!("新しいタブ（ペイン {}）", target.pane),
-        (false, _) => format!("ペイン {}（インライン）", target.pane),
-    }
+fn launch_location(target: &LaunchTarget, lang: tako_core::i18n::Lang) -> String {
+    let note = match (target.new_tab, target.tab_title.as_deref()) {
+        (true, Some(title)) => ReplyNote::LaunchTabNamed {
+            title: title.to_string(),
+            pane: target.pane,
+        },
+        (true, None) => ReplyNote::LaunchNewTab(target.pane),
+        (false, _) => ReplyNote::LaunchInline(target.pane),
+    };
+    note.text_in(lang)
 }
 
 /// 案内文に出す最簡形のコマンド（#322。既定プロファイルなら引数を付けない）
@@ -9639,7 +9695,8 @@ fn profile_cmd_hint(base: &str, profile_name: &str) -> String {
 /// 2. 解決できなければ「呼び出し元不明」として新規タブを作る
 ///
 /// アプリへ届かないときだけエラーで止め、復旧手順を添える。
-/// `cmd_hint` は案内文に出す最簡形のコマンド（例: `tako master -fable`。#322）
+/// `cmd_hint` は案内文に出す最簡形のコマンド（例: `tako master -fable`。#322）。
+/// 案内の行・断りは `lang`（呼び手が決めた表示言語。#2365）で組む
 ///
 /// タブ名は `naming` のとおりに付ける（`None` = 触らない）。master は管轄プロジェクトの
 /// 自動名（#2120）、solo は作業フォルダのリポジトリの自動名（#2127）。
@@ -9650,10 +9707,11 @@ fn resolve_launch_target(
     new_tab_cwd: Option<&std::path::Path>,
     use_tab: bool,
     cmd_hint: &str,
+    lang: tako_core::i18n::Lang,
 ) -> Result<LaunchTarget, String> {
     let requested = caller_pane();
     if use_tab {
-        return new_tab_target(naming, new_tab_cwd, cmd_hint, requested);
+        return new_tab_target(naming, new_tab_cwd, cmd_hint, requested, lang);
     }
     let resolved = resolve_caller_pane_via_app(requested)
         .map_err(|e| launch_failure_message(&e, cmd_hint, requested))?;
@@ -9661,18 +9719,13 @@ fn resolve_launch_target(
         Some(caller) => {
             let pane = caller.pane;
             if let Some(old) = requested.filter(|old| *old != pane) {
-                if caller.method.as_deref() == Some("stale") {
-                    eprintln!(
-                        "[情報] TAKO_PANE_ID={old} は旧世代のペイン ID です（アプリ再起動をまたいだ値）"
-                    );
-                    eprintln!("  現世代のペイン {pane} へ読み替えて起動します");
+                let info = if caller.method.as_deref() == Some("stale") {
+                    ReplyNote::StalePaneIdRemapped { old, pane }
                 } else {
-                    eprintln!(
-                        "[情報] TAKO_PANE_ID={old} は呼び出し元ペインと一致しません（シェルが古い値を持っています）"
-                    );
-                    eprintln!("  実際の呼び出し元ペイン {pane} で起動します");
-                }
-                eprintln!("  このシェルを使い続けるなら: unset TAKO_PANE_ID");
+                    ReplyNote::PaneIdMismatch { old, pane }
+                };
+                eprintln!("{}", info.text_in(lang));
+                eprintln!("{}", ReplyNote::UnsetPaneIdHint.text_in(lang));
             }
             let tab_title = naming.and_then(|n| rename_launch_tab(n, None, Some(pane)));
             Ok(LaunchTarget {
@@ -9682,19 +9735,16 @@ fn resolve_launch_target(
             })
         }
         None => {
-            match requested {
-                Some(old) => eprintln!(
-                    "[情報] 呼び出し元ペインを特定できません（TAKO_PANE_ID={old} は現在の tako に無い古い値）"
-                ),
-                None => {
-                    eprintln!("[情報] 呼び出し元ペインを特定できません（TAKO_PANE_ID 未設定）")
-                }
-            }
-            eprintln!("  新しいタブを作ってそこで起動します");
+            let info = match requested {
+                Some(old) => ReplyNote::CallerPaneUnknownStale(old),
+                None => ReplyNote::CallerPaneUnknownUnset,
+            };
+            eprintln!("{}", info.text_in(lang));
+            eprintln!("{}", ReplyNote::LaunchingInNewTab.text_in(lang));
             if requested.is_some() {
-                eprintln!("  このシェルを使い続けるなら: unset TAKO_PANE_ID");
+                eprintln!("{}", ReplyNote::UnsetPaneIdHint.text_in(lang));
             }
-            new_tab_target(naming, new_tab_cwd, cmd_hint, requested)
+            new_tab_target(naming, new_tab_cwd, cmd_hint, requested, lang)
         }
     }
 }
@@ -9705,6 +9755,7 @@ fn new_tab_target(
     cwd: Option<&std::path::Path>,
     cmd_hint: &str,
     requested: Option<u64>,
+    lang: tako_core::i18n::Lang,
 ) -> Result<LaunchTarget, String> {
     // 明示タイトル付きの作成は手動名になるので、渡すのは手動名（#2120 / #2127 前の A/B）の
     // ときだけ。自動名は作ってから `source: auto` で付ける
@@ -9717,7 +9768,7 @@ fn new_tab_target(
     .map_err(|e| launch_failure_message(&e, cmd_hint, requested))?;
     let pane = tab_result["pane"]
         .as_u64()
-        .ok_or("タブ作成の応答に pane が含まれない")?;
+        .ok_or_else(|| Reason::TabNewNoPane.text_in(lang))?;
     let tab_title = match naming {
         Some(n) if !n.is_manual() => tab_result["tab"]
             .as_u64()
@@ -16880,20 +16931,41 @@ mod tests {
             new_tab: false,
             tab_title: Some("tako".into()),
         };
-        assert_eq!(launch_location(&inline), "ペイン 780（インライン）");
+        assert_eq!(
+            launch_location(&inline, tako_core::i18n::Lang::Ja),
+            "ペイン 780（インライン）"
+        );
+        assert_eq!(
+            launch_location(&inline, tako_core::i18n::Lang::En),
+            "pane 780 (inline)"
+        );
         let fallback = LaunchTarget {
             pane: 900,
             new_tab: true,
             tab_title: Some("tako".into()),
         };
-        assert_eq!(launch_location(&fallback), "タブ 'tako'（ペイン 900）");
+        assert_eq!(
+            launch_location(&fallback, tako_core::i18n::Lang::Ja),
+            "タブ 'tako'（ペイン 900）"
+        );
+        assert_eq!(
+            launch_location(&fallback, tako_core::i18n::Lang::En),
+            "tab 'tako' (pane 900)"
+        );
         // #2120: 汎用 master はタブ名に触らないので、名前の無い表記になる
         let generic = LaunchTarget {
             pane: 901,
             new_tab: true,
             tab_title: None,
         };
-        assert_eq!(launch_location(&generic), "新しいタブ（ペイン 901）");
+        assert_eq!(
+            launch_location(&generic, tako_core::i18n::Lang::Ja),
+            "新しいタブ（ペイン 901）"
+        );
+        assert_eq!(
+            launch_location(&generic, tako_core::i18n::Lang::En),
+            "a new tab (pane 901)"
+        );
     }
 
     /// 復旧案内は最簡形で出す（既定プロファイルに余計な引数を付けない。#322）

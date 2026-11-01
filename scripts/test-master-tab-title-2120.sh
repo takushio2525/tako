@@ -22,6 +22,9 @@
 # 使い方: bash scripts/test-master-tab-title-2120.sh
 #   OUT_DIR=<dir> を渡すと画像をそこへ残す（既定は一時 dir = 終了時に消える）
 set -euo pipefail
+# `tako master` / `tako solo` の起動の行は表示言語に従う（#2365）。判定は日本語の字面（「ペイン N」ほか）
+# なので、OS の言語に依らず日本語表示へ固定する（settings.json の language が system のときだけ効く）
+export TAKO_LANG=ja
 
 # 本番 GUI を指す env を最初に落とす（tako のペインの中から走らせると継承される）
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_ORCHESTRATOR_ROLE TAKO_TAB_ID

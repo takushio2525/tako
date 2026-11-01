@@ -54,6 +54,8 @@
 
 use std::path::{Path, PathBuf};
 
+use tako_core::i18n::Lang;
+
 use crate::orchestrator::{self, Profile};
 
 /// master を立てるための組み立て結果。**ペインを作る前に全部揃う**
@@ -222,11 +224,20 @@ pub fn legacy_profile_load() -> bool {
 /// - `-<key>` が無く、そのキーが登録済みで継承元の default.yaml を読めない
 ///   （#1825 で作っていない）ときは、「見つからない」に理由と直し方を足して止める
 pub fn load_profile(name: &str) -> Result<LaunchProfile, String> {
+    load_profile_in(name, Lang::Ja)
+}
+
+/// [`load_profile`] の断りを表示言語で組む口（CLI の `tako master`。#2365）。
+///
+/// 「見つからない」に #1825 の理由（[`orchestrator::missing_project_profile_reason`]。persist.log と
+/// 共有する日本語の文）を足す形は、枠だけ訳すと 1 つの断りに日英が混ざるので日本語のまま返す
+/// （読めないプロファイルの理由 = #2256 の系統と一緒に移す。Issue #2365 の表）
+pub fn load_profile_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> {
     if legacy_profile_load() {
-        let profile = match Profile::load(name) {
+        let profile = match Profile::load_typed(name) {
             Ok(p) => p,
             Err(_) if name == tako_core::handoff::DEFAULT_PROFILE => Profile::default(),
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.text_in(lang)),
         };
         return Ok(LaunchProfile {
             profile,
@@ -236,25 +247,27 @@ pub fn load_profile(name: &str) -> Result<LaunchProfile, String> {
     if name == tako_core::handoff::DEFAULT_PROFILE {
         let loaded = load_default_at(
             orchestrator::ProfileKind::Master,
-            &orchestrator::ProfileKind::Master.path(name)?,
+            &orchestrator::ProfileKind::Master
+                .path_typed(name)
+                .map_err(|e| e.text_in(lang))?,
         );
         if let Some(w) = &loaded.warning {
             crate::diag::persist_log(&format!("[master] {name}: {w}"));
         }
         return Ok(loaded);
     }
-    match Profile::load(name) {
+    match Profile::load_typed(name) {
         Ok(profile) => Ok(LaunchProfile {
             profile,
             warning: None,
         }),
         Err(e) => match orchestrator::missing_project_profile_reason(name) {
             Some(why) => {
-                let msg = format!("{e}。{why}");
+                let msg = format!("{}。{why}", e.into_ja());
                 crate::diag::persist_log(&format!("[master] {name}: {msg}"));
                 Err(msg)
             }
-            None => Err(e),
+            None => Err(e.text_in(lang)),
         },
     }
 }
@@ -343,13 +356,18 @@ pub fn load_caller_profile(name: &str, launching: &str) -> LaunchProfile {
 /// default.yaml には触らない）、persist.log へ 1 行残す。無いだけなら黙る。
 /// `-<名前>` が読めなければ従来どおり止める。`TAKO_2233_LEGACY=1` で修正前（黙って既定）へ戻す
 pub fn load_solo(name: &str) -> Result<LaunchProfile, String> {
+    load_solo_in(name, Lang::Ja)
+}
+
+/// [`load_solo`] の断りを表示言語で組む口（CLI の `tako solo`。#2365）
+pub fn load_solo_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> {
     if orchestrator::legacy_silent_default_rest() {
-        let profile = match orchestrator::load_solo_profile(name) {
+        let profile = match orchestrator::load_solo_profile_typed(name) {
             Ok(p) => p,
             Err(_) if name == tako_core::handoff::DEFAULT_PROFILE => {
                 orchestrator::solo_default_profile()
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.text_in(lang)),
         };
         return Ok(LaunchProfile {
             profile,
@@ -359,17 +377,21 @@ pub fn load_solo(name: &str) -> Result<LaunchProfile, String> {
     if name == tako_core::handoff::DEFAULT_PROFILE {
         let loaded = load_default_at(
             orchestrator::ProfileKind::Solo,
-            &orchestrator::ProfileKind::Solo.path(name)?,
+            &orchestrator::ProfileKind::Solo
+                .path_typed(name)
+                .map_err(|e| e.text_in(lang))?,
         );
         if let Some(w) = &loaded.warning {
             crate::diag::persist_log(&format!("[solo] {name}: {w}"));
         }
         return Ok(loaded);
     }
-    orchestrator::load_solo_profile(name).map(|profile| LaunchProfile {
-        profile,
-        warning: None,
-    })
+    orchestrator::load_solo_profile_typed(name)
+        .map(|profile| LaunchProfile {
+            profile,
+            warning: None,
+        })
+        .map_err(|e| e.text_in(lang))
 }
 
 /// [`load_profile`] / [`load_solo`] の `default` の本体（パス指定。テストは一時 dir で回す）。

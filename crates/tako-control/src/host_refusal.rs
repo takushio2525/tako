@@ -4,6 +4,7 @@
 //! 以前は GUI（tako-app の `impl *Host for TakoApp`）がその文を日本語で固定していたので、英語表示でも
 //! CLI / MCP の応答の理由だけ日本語で返った。ここに日英の対を 1 か所に置き、GUI は
 //! `HostRefusal::…` を返す（`String` への変換 = `Display` は組んだその場の表示言語）。
+//! 口の既定の実装（`host.rs` の `Default*`。GUI の居ないホスト = `examples/mcp_host` だけに届く）も同じ。
 //!
 //! 形は [`crate::Reason`]（dispatch が組む理由の文）と同じ: (バリアント, 言語) の網羅 match なので、
 //! バリアントを足すと日英の両方を書くまでコンパイルが通らない。日本語は #2365 より前の固定文と
@@ -154,6 +155,58 @@ pub enum HostRefusal {
     NothingToCopy,
     /// `ファイルツリーが閉じている`
     FileTreeClosed,
+
+    // ---- 口の既定の実装（`host.rs`。GUI の居ないホスト = `examples/mcp_host` だけに届く） ----
+    /// `このホストはクリックを渡せない`
+    DefaultNoClick,
+    /// `このホストはファイルツリーを持たない`
+    DefaultNoFileTree,
+    /// `tako アプリ（GUI）が居ないので再 attach できない`
+    DefaultReattachNeedsGui,
+    /// `チャットビューのコピーは未対応`
+    DefaultChatCopy,
+    /// `ボタンを押す GUI が居ない`
+    DefaultWelcomeNeedsGui,
+    /// `PDF・画像プレビューのズームは未対応`
+    DefaultZoom,
+    /// `行ジャンプは未対応`
+    DefaultLineJump,
+    /// `定義ジャンプは未対応`
+    DefaultGotoDefinition,
+    /// `整形は未対応`（整形の結果を当てる口も同じ文）
+    DefaultFormat,
+    /// `アウトラインナビゲーションは未対応`
+    DefaultOutline,
+    /// `PDF リンクフォローは未対応`
+    DefaultPdfLink,
+    /// `Markdown リンクフォローは未対応`
+    DefaultMarkdownLink,
+    /// `コードブロックのコピーは未対応`
+    DefaultCodeBlockCopy,
+    /// `プレビュー編集は未対応`
+    DefaultPreviewEdit,
+    /// `チェンジログビューは未対応`
+    DefaultChangelog,
+    /// `このホストは OS のクリップボードを使わない`
+    DefaultNoOsClipboard,
+    /// `動画再生は未対応`
+    DefaultVideo,
+    /// `Web ビューはこの環境では使えない`
+    DefaultWebView,
+    /// `リモートアクセス API はこの環境では使えない`
+    DefaultRemoteApi,
+    /// `リモートアクセス API サーバーが起動していない`
+    DefaultRemoteApiNotRunning,
+    /// `この環境では更新を実行できない`
+    DefaultUpdate,
+    /// `この環境では修復を実行できない`
+    DefaultRepair,
+    /// `保存時整形の設定は未対応`
+    DefaultFormatOnSave,
+    /// `括弧の自動閉じの設定は未対応`
+    DefaultAutoClose,
+    /// `この tako は mod を扱わない`
+    DefaultNoMod,
 }
 
 impl HostRefusal {
@@ -393,6 +446,69 @@ impl HostRefusal {
             (Self::NothingToCopy, En) => "nothing to copy".into(),
             (Self::FileTreeClosed, Ja) => "ファイルツリーが閉じている".into(),
             (Self::FileTreeClosed, En) => "the file tree is closed".into(),
+
+            (Self::DefaultNoClick, Ja) => "このホストはクリックを渡せない".into(),
+            (Self::DefaultNoClick, En) => "this host cannot pass clicks".into(),
+            (Self::DefaultNoFileTree, Ja) => "このホストはファイルツリーを持たない".into(),
+            (Self::DefaultNoFileTree, En) => "this host has no file tree".into(),
+            (Self::DefaultReattachNeedsGui, Ja) => {
+                "tako アプリ（GUI）が居ないので再 attach できない".into()
+            }
+            (Self::DefaultReattachNeedsGui, En) => {
+                "cannot reattach because the tako app (GUI) is not running".into()
+            }
+            (Self::DefaultChatCopy, Ja) => "チャットビューのコピーは未対応".into(),
+            (Self::DefaultChatCopy, En) => "copying from the chat view is not supported".into(),
+            (Self::DefaultWelcomeNeedsGui, Ja) => "ボタンを押す GUI が居ない".into(),
+            (Self::DefaultWelcomeNeedsGui, En) => "no GUI is running to press the button".into(),
+            (Self::DefaultZoom, Ja) => "PDF・画像プレビューのズームは未対応".into(),
+            (Self::DefaultZoom, En) => "zooming PDF and image previews is not supported".into(),
+            (Self::DefaultLineJump, Ja) => "行ジャンプは未対応".into(),
+            (Self::DefaultLineJump, En) => "jumping to a line is not supported".into(),
+            (Self::DefaultGotoDefinition, Ja) => "定義ジャンプは未対応".into(),
+            (Self::DefaultGotoDefinition, En) => "jumping to a definition is not supported".into(),
+            (Self::DefaultFormat, Ja) => "整形は未対応".into(),
+            (Self::DefaultFormat, En) => "formatting is not supported".into(),
+            (Self::DefaultOutline, Ja) => "アウトラインナビゲーションは未対応".into(),
+            (Self::DefaultOutline, En) => "outline navigation is not supported".into(),
+            (Self::DefaultPdfLink, Ja) => "PDF リンクフォローは未対応".into(),
+            (Self::DefaultPdfLink, En) => "following PDF links is not supported".into(),
+            (Self::DefaultMarkdownLink, Ja) => "Markdown リンクフォローは未対応".into(),
+            (Self::DefaultMarkdownLink, En) => "following Markdown links is not supported".into(),
+            (Self::DefaultCodeBlockCopy, Ja) => "コードブロックのコピーは未対応".into(),
+            (Self::DefaultCodeBlockCopy, En) => "copying code blocks is not supported".into(),
+            (Self::DefaultPreviewEdit, Ja) => "プレビュー編集は未対応".into(),
+            (Self::DefaultPreviewEdit, En) => "editing previews is not supported".into(),
+            (Self::DefaultChangelog, Ja) => "チェンジログビューは未対応".into(),
+            (Self::DefaultChangelog, En) => "the changelog view is not supported".into(),
+            (Self::DefaultNoOsClipboard, Ja) => "このホストは OS のクリップボードを使わない".into(),
+            (Self::DefaultNoOsClipboard, En) => "this host does not use the OS clipboard".into(),
+            (Self::DefaultVideo, Ja) => "動画再生は未対応".into(),
+            (Self::DefaultVideo, En) => "video playback is not supported".into(),
+            (Self::DefaultWebView, Ja) => "Web ビューはこの環境では使えない".into(),
+            (Self::DefaultWebView, En) => "the web view is not available in this environment".into(),
+            (Self::DefaultRemoteApi, Ja) => "リモートアクセス API はこの環境では使えない".into(),
+            (Self::DefaultRemoteApi, En) => {
+                "the remote access API is not available in this environment".into()
+            }
+            (Self::DefaultRemoteApiNotRunning, Ja) => {
+                "リモートアクセス API サーバーが起動していない".into()
+            }
+            (Self::DefaultRemoteApiNotRunning, En) => {
+                "the remote access API server is not running".into()
+            }
+            (Self::DefaultUpdate, Ja) => "この環境では更新を実行できない".into(),
+            (Self::DefaultUpdate, En) => "updates cannot run in this environment".into(),
+            (Self::DefaultRepair, Ja) => "この環境では修復を実行できない".into(),
+            (Self::DefaultRepair, En) => "repair cannot run in this environment".into(),
+            (Self::DefaultFormatOnSave, Ja) => "保存時整形の設定は未対応".into(),
+            (Self::DefaultFormatOnSave, En) => "the format-on-save setting is not supported".into(),
+            (Self::DefaultAutoClose, Ja) => "括弧の自動閉じの設定は未対応".into(),
+            (Self::DefaultAutoClose, En) => {
+                "the bracket auto-close setting is not supported".into()
+            }
+            (Self::DefaultNoMod, Ja) => "この tako は mod を扱わない".into(),
+            (Self::DefaultNoMod, En) => "this tako does not handle mods".into(),
         }
     }
 }
