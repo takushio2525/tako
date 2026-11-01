@@ -10,6 +10,10 @@
 #     （未導入の偽装 = そのパスに実体が無い状態）
 #   - スタブの tailscale は `status --json` に **NeedsLogin** を返すので、
 #     ウィザードは [2/5]「未ログイン」で止まる（serve には進まない）
+#   - #2624 以後、隔離中（`TAKO_ISOLATED=1`）の導入は opt-in（`TAKO_REMOTE_ISOLATED_SERVE=1`）が
+#     無ければ導入器を起こさず断る（偽の `TAKO_TAILSCALE_BIN` では導入器は偽物にならない）。
+#     ここは brew もスタブなので導入まで確かめるため opt-in を付けて起こし、⑪ で付けない形の断りを見る
+#     （`ISO_OPT_IN=0` で外す）
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -84,6 +88,7 @@ setup_pty(){   # setup_pty <出力先> <answers...> -- <tako の引数...>
   # （macOS 同梱の bash 3.2 は `set -u` 下で空配列の `"${arr[@]}"` を未定義扱いにする）
   local answers=() ; while [ "${1:-}" != "--" ]; do answers+=(--answer "$1"); shift; done; shift
   env -i HOME="$SANDBOX/home" TAKO_DATA_DIR="$SANDBOX/d" TAKO_ISOLATED=1 \
+      TAKO_REMOTE_ISOLATED_SERVE="${ISO_OPT_IN-1}" \
       SHELL="$BIN/isosh" TAKO_TAILSCALE_BIN="$BIN/tailscale" TAKO_TAILSCALE_SOCKET= \
       TAKO_SOCKET="$SANDBOX/none.sock" TAKO_TMUX_SOCKET="$SANDBOX/t.sock" \
       PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb LANG=ja_JP.UTF-8 \
@@ -93,6 +98,7 @@ setup_pty(){   # setup_pty <出力先> <answers...> -- <tako の引数...>
 setup_pipe(){  # setup_pipe <出力先> -- <tako の引数...>
   local out="$1"; shift; shift
   env -i HOME="$SANDBOX/home" TAKO_DATA_DIR="$SANDBOX/d" TAKO_ISOLATED=1 \
+      TAKO_REMOTE_ISOLATED_SERVE="${ISO_OPT_IN-1}" \
       SHELL="$BIN/isosh" TAKO_TAILSCALE_BIN="$BIN/tailscale" TAKO_TAILSCALE_SOCKET= \
       TAKO_SOCKET="$SANDBOX/none.sock" TAKO_TMUX_SOCKET="$SANDBOX/t.sock" \
       PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=dumb LANG=ja_JP.UTF-8 \
@@ -188,6 +194,14 @@ RC=$(setup_pipe "$SANDBOX/10.log" -- remote setup --answers '{}')
 contains "不足として報告する" '"status": "missing"' "$SANDBOX/10.log"
 absent   "導入は走らない"     "==> Fetching tailscale" "$SANDBOX/10.log"
 if [ -e "$BIN/tailscale" ]; then ng "非対話経路が tailscale を入れた"; else ok "非対話経路は何も入れない"; fi
+
+echo "== 11) 隔離中は opt-in が無ければ導入器を起こさず断る（#2624）=="
+mkstubs ok
+RC=$(ISO_OPT_IN=0 setup_pipe "$SANDBOX/11.log" -- remote setup --yes)
+contains "断りを言う" "隔離中（TAKO_ISOLATED）なので、Tailscale を導入せずに止めました" "$SANDBOX/11.log"
+absent   "導入器は起きない" "==> Fetching tailscale" "$SANDBOX/11.log"
+if [ -e "$BIN/tailscale" ]; then ng "opt-in なしで tailscale を入れた"; else ok "何も入れない"; fi
+check "終了コード 1" "$RC" "1"
 
 echo
 echo "PASS=$PASS FAIL=$FAIL"

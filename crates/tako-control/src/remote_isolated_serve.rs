@@ -23,6 +23,21 @@
 //! 回らない（env は起動時のまま）。番犬は `tests/issue2619_isolated_remote_serve_watchdog.rs`。
 //!
 //! A/B は `TAKO_2619_LEGACY=1`（[`LEGACY_ENV`]。隔離中でも従来どおり既定の tailscale へ張る）。
+//!
+//! # serve の外の、機械全体へ触る操作（#2624）
+//!
+//! 同じ門（[`allows_op`] の 1 実装）が serve 以外の 3 つも見る。通す理由は操作ごとに違う:
+//!
+//! - [`Op::ServeCleanup`] — `tako remote stop` の後始末（`remote::cleanup_serve_leftover`）が本物の
+//!   tailscale の serve を読み、自分の待ち受けと一致すれば外す。通すのは**この env が serve を張れた**とき
+//!   （偽の tailscale・opt-in・#2619 の A/B）だけ。検証モードは serve を張らないので外す
+//! - [`Op::Install`] — 対話の `tako remote setup` が未導入の Tailscale を導入器（brew）で入れる。
+//!   導入はこの機械全体へのインストールで、**偽の tailscale では偽物にならない**（「未導入を装う」偽の
+//!   `TAKO_TAILSCALE_BIN` で門を通すと本物の brew が走る）ので、通すのは opt-in だけ
+//! - [`Op::OpenViewer`] — 対話の setup が QR を既定のビューアで開く（隔離中でも利用者の画面に窓が出る）。
+//!   通すのは opt-in だけ
+//!
+//! 3 つの A/B は `TAKO_2624_LEGACY=1`（[`LEGACY_2624_ENV`]。#2624 前 = 隔離中でも従来どおり触る）。
 
 use std::path::{Path, PathBuf};
 
@@ -32,7 +47,11 @@ pub const OPT_IN_ENV: &str = "TAKO_REMOTE_ISOLATED_SERVE";
 /// A/B: #2619 前へ戻す（隔離中でも既定の tailscale へ serve を張る）
 pub const LEGACY_ENV: &str = "TAKO_2619_LEGACY";
 
-/// 門の入力（env から読んだもの。判定は [`allows`] が持つ）
+/// A/B: #2624 前へ戻す（隔離中でも stop の後始末が本物の tailscale を読み・外し、対話の setup が
+/// Tailscale を導入し、QR を既定のビューアで開く）
+pub const LEGACY_2624_ENV: &str = "TAKO_2624_LEGACY";
+
+/// 門の入力（env から読んだもの。判定は [`allows_op`] が持つ）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Inputs {
     /// `TAKO_ISOLATED` が真
@@ -45,11 +64,40 @@ pub struct Inputs {
     pub opt_in: bool,
     /// [`LEGACY_ENV`] が真
     pub legacy: bool,
+    /// [`LEGACY_2624_ENV`] が真
+    pub legacy_2624: bool,
+}
+
+/// 隔離中に門を通す操作（#2624。通す理由は操作ごとに違う = モジュールの doc）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    /// serve を張る（#2619）
+    Serve,
+    /// stop の後始末で serve を読み・自分の待ち受けなら外す
+    ServeCleanup,
+    /// Tailscale を導入器（brew）で入れる
+    Install,
+    /// QR を既定のビューアで開く
+    OpenViewer,
 }
 
 /// serve へ書いてよいか（純関数）。隔離でなければ常に真 = 本番の経路は変えない
 pub fn allows(i: Inputs) -> bool {
-    !i.isolated || i.test_mode || i.fake_tailscale || i.opt_in || i.legacy
+    allows_op(Op::Serve, i)
+}
+
+/// その操作をしてよいか（純関数。**判定はこの 1 実装**）。隔離でなければ常に真 = 本番の経路は変えない
+pub fn allows_op(op: Op, i: Inputs) -> bool {
+    if !i.isolated {
+        return true;
+    }
+    match op {
+        Op::Serve => i.test_mode || i.fake_tailscale || i.opt_in || i.legacy,
+        // 後始末は「この env が serve を張れた」ときだけ（検証モードは張らない）
+        Op::ServeCleanup => i.legacy_2624 || i.fake_tailscale || i.opt_in || i.legacy,
+        // 導入と画面は tailscale を偽物にしても偽物にならない
+        Op::Install | Op::OpenViewer => i.legacy_2624 || i.opt_in,
+    }
 }
 
 /// `TAKO_TAILSCALE_BIN` の値が本物以外（検証用の偽物）を指しているか（純関数）。
@@ -99,6 +147,7 @@ pub fn current_inputs() -> Inputs {
             fake_tailscale: false,
             opt_in: false,
             legacy: false,
+            legacy_2624: false,
         };
     }
     let real: Vec<PathBuf> = crate::tailscale::real_candidate_paths()
@@ -115,6 +164,7 @@ pub fn current_inputs() -> Inputs {
         ),
         opt_in: truthy(OPT_IN_ENV),
         legacy: truthy(LEGACY_ENV),
+        legacy_2624: truthy(LEGACY_2624_ENV),
     }
 }
 
@@ -124,6 +174,20 @@ pub fn check() -> Result<(), crate::RemoteRefusal> {
         Ok(())
     } else {
         Err(crate::RemoteRefusal::IsolatedServe)
+    }
+}
+
+/// serve 以外の操作の門（#2624）。断りを返さない操作（後始末・ビューア）は呼び手が黙って見送る
+pub fn allowed(op: Op) -> bool {
+    allows_op(op, current_inputs())
+}
+
+/// 対話の setup が Tailscale を導入する前に通す門（#2624）。隔離中で opt-in が無ければ日英の断り
+pub fn check_install() -> Result<(), crate::RemoteRefusal> {
+    if allowed(Op::Install) {
+        Ok(())
+    } else {
+        Err(crate::RemoteRefusal::IsolatedInstall)
     }
 }
 
@@ -138,25 +202,32 @@ mod tests {
             fake_tailscale: false,
             opt_in: false,
             legacy: false,
+            legacy_2624: false,
         }
     }
 
-    /// 本番（隔離でない）の経路は、ほかの入力がどうであれ常に通す = 挙動を変えない
+    const OPS: [Op; 4] = [Op::Serve, Op::ServeCleanup, Op::Install, Op::OpenViewer];
+
+    /// 本番（隔離でない）の経路は、操作とほかの入力がどうであれ常に通す = 挙動を変えない
     #[test]
     fn 隔離でなければ常に通す() {
-        for bits in 0u8..16 {
+        for bits in 0u8..32 {
             let i = Inputs {
                 isolated: false,
                 test_mode: bits & 1 != 0,
                 fake_tailscale: bits & 2 != 0,
                 opt_in: bits & 4 != 0,
                 legacy: bits & 8 != 0,
+                legacy_2624: bits & 16 != 0,
             };
             assert!(allows(i), "{i:?}");
+            for op in OPS {
+                assert!(allows_op(op, i), "{op:?} {i:?}");
+            }
         }
     }
 
-    /// 隔離中は理由が 1 つも無ければ断り、どれか 1 つで通す
+    /// 隔離中は理由が 1 つも無ければ断り、どれか 1 つで通す（serve = #2619 のまま）
     #[test]
     fn 隔離中は理由が無ければ断る() {
         assert!(!allows(inputs(true)));
@@ -170,6 +241,49 @@ mod tests {
             let mut i = inputs(true);
             set(&mut i);
             assert!(allows(i), "{n}: {i:?}");
+        }
+        // #2624 の A/B は serve の門を開けない（#2619 の判定は変えない）
+        let mut i = inputs(true);
+        i.legacy_2624 = true;
+        assert!(!allows(i));
+    }
+
+    /// 隔離中に操作ごとに通す理由の表（#2624）。
+    /// 後始末は「serve を張れた env」だけ・導入と画面は tailscale の偽物では開かない
+    #[test]
+    fn 隔離中の操作ごとの通す理由() {
+        // (理由の名前, 入れ方, [Serve, ServeCleanup, Install, OpenViewer] で通すか)
+        type Row = (&'static str, fn(&mut Inputs), [bool; 4]);
+        let table: [Row; 6] = [
+            ("理由なし", |_| {}, [false, false, false, false]),
+            (
+                "検証モード",
+                |i| i.test_mode = true,
+                [true, false, false, false],
+            ),
+            (
+                "偽の tailscale",
+                |i| i.fake_tailscale = true,
+                [true, true, false, false],
+            ),
+            ("opt-in", |i| i.opt_in = true, [true, true, true, true]),
+            (
+                "#2619 の A/B",
+                |i| i.legacy = true,
+                [true, true, false, false],
+            ),
+            (
+                "#2624 の A/B",
+                |i| i.legacy_2624 = true,
+                [false, true, true, true],
+            ),
+        ];
+        for (name, set, want) in table {
+            let mut i = inputs(true);
+            set(&mut i);
+            for (op, want) in OPS.into_iter().zip(want) {
+                assert_eq!(allows_op(op, i), want, "{name}: {op:?}");
+            }
         }
     }
 
