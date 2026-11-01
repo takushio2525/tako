@@ -23,10 +23,11 @@
 //! リポジトリ・同期対象に置かないこと。`TAKO_PANE_LOG_DIR` で隔離検証用に上書き可能。
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+use crate::pane_log_writer::{PaneLogWriter, WriteOp};
 
 /// 1 tick で取り込む最大行数（洪水時の上限。超過分は省略マーカーを残す）
 pub const CAPTURE_CHUNK: usize = 400;
@@ -196,7 +197,12 @@ struct PaneState {
 }
 
 /// ペインログの管理体。GUI プロセスが 1 つ保持し、UI / background の両スレッドから
-/// Mutex 越しに使う（クリティカルセクションは小さな追記のみ）
+/// Mutex 越しに使う。
+///
+/// **クリティカルセクションはメモリの操作だけ**（#2618）: ファイルへの操作（追記・ローテーション・
+/// 全体上限の削除）は [`PaneLogWriter`] の列へ積むだけで、I/O は書き手のスレッドが行う。
+/// 以前は Mutex を握ったまま呼び手のスレッドで書いていたので、ディスクが詰まるとメインスレッドの
+/// 取り込み・閉じたときのフラッシュと、Mutex を待つ口がその長さだけ GUI を止めた
 #[derive(Debug)]
 pub struct PaneLogManager {
     dir: PathBuf,
@@ -206,6 +212,31 @@ pub struct PaneLogManager {
     /// 走るので、閉じた後に届いた観測が状態を作り直し、新しいログファイルへ同じ行を
     /// 書き始めないようにする（ペイン ID はプロセスの中で使い回されない）
     closed: HashSet<u64>,
+    /// ファイルへの操作を実行する書き手（#2618。[`Self::new`] は積んだ場で同期で書く）
+    writer: PaneLogWriter,
+    /// 書き手の列が [`BACKLOG_DEFER_OVER`] を超えていたので見送った取り込みの数（#2618）
+    deferred: u64,
+}
+
+/// 書き手の列に残る追記がこれを超えている間は、取り込み（[`PaneLogManager::apply`]）を見送る（#2618）。
+///
+/// ディスクが詰まり続けると列がメモリに溜まり続けるので上限を置く。見送った取り込みは基準を進めない
+/// （直接ペインは Term の履歴・器のペインは tmux の履歴にまだ行がある）ので、次の取り込みが読み直す。
+/// 読める量の上限（[`CAPTURE_CHUNK`] 等）を超えたぶんは省略マーカーになる = 修正前に I/O で
+/// 取り込みが止まっていた間と同じ。閉じたときのフラッシュは見送らない（最後の行とマーカーを残す）
+pub const BACKLOG_DEFER_OVER: u64 = 16 * 1024 * 1024;
+
+/// #2618 の A/B（`TAKO_2618_LEGACY=1`）。同一バイナリのまま修正前の形へ戻す: ペインログの
+/// ファイルへの操作をマネージャーの Mutex を握ったまま呼び手のスレッド（メインスレッドを含む）で行う。
+/// **ゲートはこの 1 か所**（tako-app もここを読む）
+pub fn issue2618_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2618_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
 }
 
 /// ペイン 1 回分の走査結果（呼び出し側が Term / tmux から観測して詰める）
@@ -237,13 +268,33 @@ pub enum ChunkKind {
 }
 
 impl PaneLogManager {
+    /// 積んだ場で同期で書くマネージャー（単体テスト・A/B の既定）。GUI は [`Self::with_writer`] で
+    /// 背景の書き手へ差し替える
     pub fn new(dir: PathBuf, config: PaneLogConfig) -> Self {
         Self {
             dir,
             config,
             states: HashMap::new(),
             closed: HashSet::new(),
+            writer: PaneLogWriter::inline(),
+            deferred: 0,
         }
+    }
+
+    /// ファイルへの操作を `writer` で行う（#2618。GUI は背景の書き手 [`PaneLogWriter::spawn`]）
+    pub fn with_writer(mut self, writer: PaneLogWriter) -> Self {
+        self.writer = writer;
+        self
+    }
+
+    /// 書き手の持ち手（終了の前に [`PaneLogWriter::flush`] で書き終わりを待つ。Mutex の外で待つこと）
+    pub fn writer(&self) -> PaneLogWriter {
+        self.writer.clone()
+    }
+
+    /// 書き手の列が溜まっていたので見送った取り込みの数（#2618）
+    pub fn deferred(&self) -> u64 {
+        self.deferred
     }
 
     pub fn config(&self) -> PaneLogConfig {
@@ -261,7 +312,7 @@ impl PaneLogManager {
     /// 復元ペインの履歴基準値をシードする（layout.json の `logged_history`。
     /// tako 停止中に積もった履歴を次回 tick で差分として取り込むため）
     pub fn seed_history(&mut self, pane: u64, meta: &PaneLogMeta, logged_history: usize) {
-        self.ensure_state(pane, meta).last_history = logged_history;
+        ensure_state(&mut self.states, &self.dir, pane, meta).last_history = logged_history;
     }
 
     /// 現在の履歴基準値（layout.json への保存用）。状態が無いペインは None
@@ -292,8 +343,15 @@ impl PaneLogManager {
             return;
         }
         let enabled = self.config.enabled;
+        // #2618: 書き手の列が溜まり過ぎている（ディスクが詰まり続けている）間は見送る。基準を進めないので
+        // 次の取り込みが同じ増分を読み直す（OFF の間は書かないので見送らない）
+        if enabled && self.writer.backlog_bytes() > BACKLOG_DEFER_OVER {
+            self.deferred += 1;
+            return;
+        }
         let max_bytes = self.config.max_bytes_per_pane;
-        let state = self.ensure_state(pane, meta);
+        let writer = &self.writer;
+        let state = ensure_state(&mut self.states, &self.dir, pane, meta);
 
         // alt screen（TUI）区間のマーカー
         if obs.alt_screen != state.alt_screen {
@@ -304,7 +362,7 @@ impl PaneLogManager {
                 } else {
                     format!("--- [TUI 終了 {}] ---", now_utc())
                 };
-                append_lines_to(state, std::slice::from_ref(&marker), max_bytes);
+                append_lines_to(state, std::slice::from_ref(&marker), max_bytes, writer);
             }
         }
 
@@ -322,9 +380,9 @@ impl PaneLogManager {
                 if enabled {
                     if delta > lines.len() {
                         let marker = format!("--- [省略: {} 行] ---", delta - lines.len());
-                        append_lines_to(state, std::slice::from_ref(&marker), max_bytes);
+                        append_lines_to(state, std::slice::from_ref(&marker), max_bytes, writer);
                     }
-                    append_lines_to(state, &lines, max_bytes);
+                    append_lines_to(state, &lines, max_bytes, writer);
                 }
                 update_tail(&mut state.tail, &lines);
                 state.last_history = obs.history;
@@ -333,7 +391,7 @@ impl PaneLogManager {
                 let new_lines = split_new_suffix(&state.tail, &captured);
                 if !new_lines.is_empty() {
                     if enabled {
-                        append_lines_to(state, new_lines, max_bytes);
+                        append_lines_to(state, new_lines, max_bytes, writer);
                     }
                     let owned: Vec<String> = new_lines.to_vec();
                     update_tail(&mut state.tail, &owned);
@@ -362,7 +420,8 @@ impl PaneLogManager {
         let reason = origin.marker_with_caller(caller);
         let enabled = self.config.enabled;
         let max_bytes = self.config.max_bytes_per_pane;
-        let state = self.ensure_state(pane, meta);
+        let writer = &self.writer;
+        let state = ensure_state(&mut self.states, &self.dir, pane, meta);
         if enabled {
             let mut lines: Vec<&str> = visible.iter().map(String::as_str).collect();
             while lines.last().is_some_and(|l| l.trim().is_empty()) {
@@ -370,13 +429,13 @@ impl PaneLogManager {
             }
             let owned: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
             if !owned.is_empty() {
-                append_lines_to(state, &owned, max_bytes);
+                append_lines_to(state, &owned, max_bytes, writer);
             }
             let marker = format!(
                 "{CLOSE_MARKER_PREFIX}{reason} {}{CLOSE_MARKER_SUFFIX}",
                 now_utc()
             );
-            append_lines_to(state, std::slice::from_ref(&marker), max_bytes);
+            append_lines_to(state, std::slice::from_ref(&marker), max_bytes, writer);
         }
         self.states.remove(&pane);
     }
@@ -404,26 +463,42 @@ impl PaneLogManager {
         self.states.get(&pane).map(|s| s.path.clone())
     }
 
-    /// ディレクトリ全体の上限を強制する。現在開いているファイルは削除対象から除外し、
-    /// それ以外を古い順（更新時刻）に削除する。削除したファイル数を返す
-    pub fn enforce_total_cap(&self) -> usize {
-        let open: Vec<PathBuf> = self.open_paths();
-        enforce_total_cap_at(&self.dir, self.config.max_total_bytes, &open)
+    /// ディレクトリ全体の上限の強制を書き手の列へ積む。現在開いているファイルは削除対象から除外し、
+    /// それ以外を古い順（更新時刻）に削除する。削除したファイル数は返り値の受け口へ届く。
+    ///
+    /// #2618: 削除（ディレクトリの走査・stat・remove）は書き手が行う。**受け口はマネージャーの
+    /// Mutex を放してから待つ**（握ったまま待つと、その間ほかの呼び手を止める）。列に並ぶので、
+    /// 先に積んだ追記（閉じたペインの最後の行とマーカー）を書き終えてから消す
+    pub fn queue_total_cap(&self) -> std::sync::mpsc::Receiver<usize> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.writer.submit(WriteOp::EnforceCap {
+            dir: self.dir.clone(),
+            max_total_bytes: self.config.max_total_bytes,
+            exclude: self.open_paths(),
+            reply,
+        });
+        rx
     }
+}
 
-    fn ensure_state(&mut self, pane: u64, meta: &PaneLogMeta) -> &mut PaneState {
-        self.states.entry(pane).or_insert_with(|| {
-            let name = file_name(&now_utc_compact(), meta.tab, pane, meta.label.as_deref());
-            PaneState {
-                path: self.dir.join(name),
-                bytes: 0,
-                tail: Vec::new(),
-                last_history: 0,
-                last_bytes: 0,
-                alt_screen: false,
-            }
-        })
-    }
+/// ペインの保存状態を引く（無ければ作る）。フィールドごとに借りる（書き手と同時に借りるため）
+fn ensure_state<'a>(
+    states: &'a mut HashMap<u64, PaneState>,
+    dir: &Path,
+    pane: u64,
+    meta: &PaneLogMeta,
+) -> &'a mut PaneState {
+    states.entry(pane).or_insert_with(|| {
+        let name = file_name(&now_utc_compact(), meta.tab, pane, meta.label.as_deref());
+        PaneState {
+            path: dir.join(name),
+            bytes: 0,
+            tail: Vec::new(),
+            last_history: 0,
+            last_bytes: 0,
+            alt_screen: false,
+        }
+    })
 }
 
 /// ペインログの定期走査の周期（tako-app の 2 秒ポーリング）。[`capture_budget`] の単位
@@ -740,46 +815,50 @@ fn slice_counted(anchor: &[String], mut hist: Vec<String>, take: usize) -> (Vec<
     (hist.split_off(start), 0)
 }
 
-/// 行群をファイルへ追記する（ヘッダ・ローテーション込み。失敗は握りつぶす =
-/// ログ機能の失敗で本体を巻き込まない）
-fn append_lines_to(state: &mut PaneState, lines: &[String], max_bytes: u64) {
+/// 行群をファイルへ追記する（ヘッダ・ローテーション込み。失敗は書き手が握りつぶす =
+/// ログ機能の失敗で本体を巻き込まない）。
+///
+/// #2618: ファイルへの操作（ローテーションの退避・追記）は書き手の列へ積むだけで、ここでは I/O しない
+/// （呼び手はマネージャーの Mutex の内側 = 列の順が状態を進めた順）。ヘッダの要否はファイルの有無で
+/// 書き手が書く時点に決める（同期で書いていたときと同じ）。サイズは積んだ時点で数える概算
+/// （ファイルを新しく始める回はヘッダの分も足す）
+fn append_lines_to(
+    state: &mut PaneState,
+    lines: &[String],
+    max_bytes: u64,
+    writer: &PaneLogWriter,
+) {
     if lines.is_empty() {
         return;
     }
     // ローテーション: 上限超過なら現ファイルを `.1` へ退避して新しく始める
     if state.bytes > max_bytes {
-        rotate(&state.path);
+        writer.submit(WriteOp::Rotate(state.path.clone()));
         state.bytes = 0;
     }
-    let Some(dir) = state.path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let existed = state.path.is_file();
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&state.path)
-    else {
-        return;
-    };
-    let mut buf = String::new();
-    if !existed {
-        buf.push_str(&format!("# tako pane log — 開始 {}\n", now_utc()));
-    }
+    let mut body = String::new();
     for line in lines {
-        buf.push_str(line.trim_end());
-        buf.push('\n');
+        body.push_str(line.trim_end());
+        body.push('\n');
     }
-    if f.write_all(buf.as_bytes()).is_ok() {
-        state.bytes += buf.len() as u64;
+    if state.bytes == 0 {
+        state.bytes += file_header().len() as u64;
     }
+    state.bytes += body.len() as u64;
+    writer.submit(WriteOp::Append {
+        path: state.path.clone(),
+        body,
+    });
 }
 
-/// `path` を `.1` へ退避する（既存 `.1` は上書き = 世代 1 つ）
-fn rotate(path: &Path) {
+/// ログファイルの先頭の 1 行（ファイルを新しく始めるときに書き手が付ける）
+pub(crate) fn file_header() -> String {
+    format!("# tako pane log — 開始 {}\n", now_utc())
+}
+
+/// `path` を `.1` へ退避する（既存 `.1` は上書き = 世代 1 つ）。
+/// 呼ぶのは書き手だけ（#2618。[`crate::pane_log_writer`]）
+pub(crate) fn rotate(path: &Path) {
     for generation in (1..=KEEP_GENERATIONS).rev() {
         let to = rotated_path(path, generation);
         let from = if generation == 1 {

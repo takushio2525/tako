@@ -4941,6 +4941,46 @@ OS で分岐すると「macOS だけ通る道」が増えて、この等価性�
   Mutex を待つ）。番犬は `crates/tako-control/tests/issue2610_save_layout_offload_watchdog.rs`
   （上の約束の逆戻りを file:line で名指す）、書き手の順序・合流・失敗・panic は
   `layout_writer` の単体テスト
+- ペインログの Mutex を握ったまま I/O する形は #2618 で無くした（下の節）。`try_lock` は
+  その後も残す（Mutex の内側はメモリの操作だけになったので、握られている時間は短い）
+
+## ペインログのファイルへの操作は Mutex の内側・メインスレッドで行わない（Issue #2618）
+
+ペインログのマネージャー（`tako_core::pane_log::PaneLogManager`）は GUI の 1 つの Mutex 越しに、
+メインスレッド（直接ペインの取り込み = `collect_pane_log_work`・閉じたときのフラッシュ =
+`write_pane_log_close`・`tako logs status` ほか）と背景（器のペインの取り込み・器を kill する
+直前のフラッシュ・全体上限の強制）の両方から使われる。以前は追記・ローテーション・全体上限の削除を
+**Mutex を握ったまま呼び手のスレッドで**行っていたので、ディスクが詰まると:
+メインスレッドの取り込み・閉じたときのフラッシュがその長さだけ GUI を止め（隔離 GUI で追記に
+5 秒の遅れを注入すると `periodic_prep:pane_log が 5002ms`・閉じる IPC が 15,031ms）、背景が
+握っている間は Mutex を取る口が待った（同じ注入で `dispatch:Logs が 9939ms`）。
+
+- **マネージャーの Mutex の内側はメモリの操作だけ**。ファイルへの操作（追記・ローテーションの退避・
+  全体上限の削除）は `WriteOp` にして `PaneLogWriter::submit` で書き手の列へ積む
+  （`tako_core::pane_log_writer`）。`impl PaneLogManager` と `append_lines_to` の中で
+  `std::fs` / `rotate` / `enforce_total_cap_at` を呼ばない
+- **書き手のスレッドは 1 本で、積まれた順に実行する**。積むのは常にマネージャーの Mutex の内側
+  なので、列の順 = 状態を進めた順 = ファイルの中身の並びは同期で書いていたときと同じ
+  （ヘッダの要否はファイルの有無で書く時点に決める・ローテーションの退避も同じ列）。
+  #2610 の layout.json の書き手（最新 1 件の合流）とは違い、追記なので**合流しない**
+- **全体上限の強制は `queue_total_cap()` で積み、受け口はマネージャーの Mutex を放してから
+  `.recv()` で待つ**（同期の `enforce_total_cap()` は無くした）。列に並ぶので、先に積んだ
+  閉じたペインの最後の行とマーカーを書き終えてから消す（消した後で作り直さない）
+- **終了（`on_app_quit`）は `flush_pane_log_writer(why)` で書き終わりを待つ**。直接ペインの
+  クローズフラッシュを積んだ後・`flush_layout_writer` と同じ深さ（`quitting` でも待つ）・
+  `cleanup_process_scoped` より前。待つ長さは修正前の同期の追記と同じで、1 秒を超えたら
+  persist.log へ「ペインログの書き出しを Nms 待った」。`SIGTERM` の猶予（FR-5.17・5 秒）を
+  超える詰まりでは修正前と同じく書き切れない
+- 列に残る追記が `BACKLOG_DEFER_OVER`（16 MiB）を超えている間は取り込み（`apply`）を見送り、
+  基準を進めない（次の取り込みが読み直す。読める量の上限を超えたぶんは省略マーカー =
+  修正前に I/O で取り込みが止まっていた間と同じ）。閉じたときのフラッシュは見送らない
+- 1 件が 1 秒を超えたら perf.log へ「ペインログの追記（背景）が Nms（メインスレッドは待っていない）」
+  （パス・中身は出さない）。1 件の中の panic で書き手を止めない
+- A/B は `TAKO_2618_LEGACY=1`（積んだ場で同期で書く = Mutex の内側・呼び手のスレッドで I/O。
+  ゲートは `pane_log::issue2618_legacy()` の 1 か所）。単体テストの既定（`PaneLogManager::new`）も
+  同期の書き手。番犬は `crates/tako-control/tests/issue2618_pane_log_io_offload_watchdog.rs`
+  （上の約束の逆戻りを file:line で名指す）、順序・待たないこと・flush・見送り・panic・全体上限の
+  順序は `pane_log_writer` の単体テスト
 
 ## 機械全体の設定を倒す記録には「所有者」を書く（Issue #1373 / #449）
 
