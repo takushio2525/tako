@@ -345,13 +345,13 @@ fn check_healthのtako_cliリンクの案内は足すしかないとき同じ断
     // 修正前（#1502 からの文）とバイト一致
     let before = "tako CLI のリンク（~/.local/bin/tako）の指す先が消えている。tako.app を移動・削除した場合は \
                   tako setup bootstrap path で張り直すこと（#1502）";
-    let got = setup_bootstrap::tako_cli_link_issue(link, false);
+    let got = setup_bootstrap::tako_cli_link_issue(link, false, tako_core::i18n::Lang::Ja);
     if got != before {
         failures.push(format!(
             "{at}: 足すしかないのでないときの文が修正前と違う: {got}\n  修正前: {before}"
         ));
     }
-    let by_hand = setup_bootstrap::tako_cli_link_issue(link, true);
+    let by_hand = setup_bootstrap::tako_cli_link_issue(link, true, tako_core::i18n::Lang::Ja);
     if by_hand.contains(LOOP_COMMAND) {
         failures.push(format!(
             "{at}: 足すしかない（種別の分からないシェルで置き場所が PATH に無い）のに \

@@ -1,6 +1,9 @@
 #!/bin/sh
 # Issue #262: setup UX A〜E をスクラッチ HOME / PATH で実測する。
 set -eu
+# check-health / `tako setup --check` は表示言語に従う（#2365）。判定は日本語の字面なので、OS の言語に
+# 依らず日本語表示へ固定する（settings.json の language が system のときだけ効く）
+export TAKO_LANG=ja
 
 # 本番 tako のペインから回しても CLI が本番の GUI へ繋がないよう、本番が配る env を落とす（#1970）
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID

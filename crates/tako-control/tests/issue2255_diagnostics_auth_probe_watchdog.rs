@@ -264,8 +264,8 @@ fn 修正前の形を名指しできる() {
     // ② 診断の関数へ上限なしの口を直書きする
     let d = inject(
         &diagnostics,
-        "fn agents_sync_item() -> Item {\n",
-        "fn agents_sync_item() -> Item {\n    let _ = crate::agent_probe::run(&mut std::process::Command::new(\"claude\"));\n",
+        "fn agents_sync_item(lang: Lang) -> Item {\n",
+        "fn agents_sync_item(lang: Lang) -> Item {\n    let _ = crate::agent_probe::run(&mut std::process::Command::new(\"claude\"));\n",
         "②",
     );
     let line = d

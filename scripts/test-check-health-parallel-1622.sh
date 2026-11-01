@@ -21,6 +21,9 @@
 # CI には登録しない（数十秒掛かる）。CI 側の担保は単体テストの番犬
 # （`crates/tako-control/src/diagnostics.rs` の `外部の問い合わせは導入状況と重ねて走り答えは逐次と同じ`）。
 set -uo pipefail
+# check-health / `tako setup --check` は表示言語に従う（#2365）。判定は日本語の字面なので、OS の言語に
+# 依らず日本語表示へ固定する（settings.json の language が system のときだけ効く）
+export TAKO_LANG=ja
 
 # **本番 GUI を指す env を最初に落とす**（#1449 / #1450 で本番にペインが漏れた実例が 2 件）
 unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAKO_MCP_URL \

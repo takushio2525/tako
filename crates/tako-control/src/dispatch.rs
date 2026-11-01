@@ -10,6 +10,7 @@
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use tako_core::i18n::Lang;
 use tako_core::jump_history::{JumpHistory, JumpLocation, Liveness};
 use tako_core::text_edit::{SearchOptions, TextPosition};
 use tako_core::{
@@ -18,6 +19,7 @@ use tako_core::{
     Workspace,
 };
 
+use crate::health_text::{ContainerLimitNote, HealthText};
 use crate::orchestrator::ConfigError;
 use crate::os_refusal::OsRefusal;
 use crate::protocol::{error_code, Direction, FileOpKind, PreviewModeWire, Request};
@@ -22311,8 +22313,8 @@ fn collect_check_health_ctx(host: &dyn ControlHost) -> CheckHealthCtx {
             .map(|pane| pane.id().as_u64())
             .collect(),
         claude_mod: (!tako_core::claude_mod::no_report_legacy()).then(|| {
-            // 枠が日本語の check-health は理由の文も日本語で組む（1 つの出力に日英を混ぜない。#2365）
-            crate::claude_mod::status_ctx(host, tako_core::i18n::Lang::Ja)
+            // check-health の枠と同じ表示言語で理由の文も組む（1 つの出力に日英を混ぜない。#2365）
+            crate::claude_mod::status_ctx(host, tako_core::i18n::lang())
                 .map(Box::new)
                 .map_err(|e| e.to_string())
         }),
@@ -22328,6 +22330,8 @@ fn check_health(host: &dyn ControlHost) -> Value {
 fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     let app_version = env!("CARGO_PKG_VERSION").to_string();
     let mut issues: Vec<Value> = Vec::new();
+    // #2365: 申告と節の文は表示言語で組む（診断の項目も同じ言語 = `diagnostics::collect` が同じ値を読む）
+    let lang = tako_core::i18n::lang();
     // #1505: 診断項目の正本。`tako setup --check` と**同じ 1 実装**から組む
     // （片方にだけ項目が足される形をここで断つ）
     let diagnostics = crate::diagnostics::collect();
@@ -22350,16 +22354,12 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     let injected_cli_dir = tako_core::shell_integration::cli_dir();
     // #1502: 外部ターミナル向けの設置（FR-2.14.5）の実測。判定の正本は
     // `setup_bootstrap::tako_cli_path_json`（`tako setup --check` も同じ材料を読む）
-    let tako_cli_path = crate::setup_bootstrap::tako_cli_path_json();
+    let tako_cli_path = crate::setup_bootstrap::tako_cli_path_json_in(lang);
     if let Some(notice) = &cli_in_path_unconfirmed {
         issues.push(json!({
             "level": "warning",
             "check": "cli_in_path",
-            "message": format!(
-                "tako CLI が PATH に在るかを確かめられない（ログインシェルが {} 秒で応答しない）。\
-                 .zprofile などのログインシェルの設定が入力を待っていないか確かめること（#1533）",
-                notice.waited_secs
-            ),
+            "message": HealthText::CliPathUnconfirmed(notice.waited_secs).text_in(lang),
         }));
     } else if !cli_in_path {
         // 注入が効いていれば tako の中では打てる = 致命ではない（level を下げても対処法は示し続ける）。
@@ -22368,6 +22368,7 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         let (level, message) = crate::setup_bootstrap::tako_cli_in_path_issue(
             injected_cli_dir.as_deref(),
             crate::setup_bootstrap::tako_cli_dir_by_hand(&tako_cli_path),
+            lang,
         );
         issues.push(json!({
             "level": level,
@@ -22388,6 +22389,7 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
             "message": crate::setup_bootstrap::tako_cli_link_issue(
                 tako_cli_path["link_display"].as_str().unwrap_or("?"),
                 by_hand,
+                lang,
             ),
         }));
     }
@@ -22426,21 +22428,21 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         issues.push(json!({
             "level": "warning",
             "check": "version_match",
-            "message": format!(
-                "CLI バージョンを確かめられない（`{}` が {} 秒で応答しない）",
-                notice.label, notice.waited_secs
-            ),
+            "message": HealthText::VersionUnconfirmed {
+                label: notice.label.clone(),
+                secs: notice.waited_secs,
+            }
+            .text_in(lang),
         }));
     } else if cli_in_path && !version_match {
         issues.push(json!({
             "level": "warning",
             "check": "version_match",
-            "message": format!(
-                "CLI バージョン ({}) とアプリバージョン ({}) が不一致。\
-                 build-app.sh --install で最新の CLI をインストールすること",
-                cli_version.as_deref().unwrap_or("不明"),
-                app_version,
-            ),
+            "message": HealthText::VersionMismatch {
+                cli: cli_version.clone(),
+                app: app_version.clone(),
+            }
+            .text_in(lang),
         }));
     }
 
@@ -22455,9 +22457,7 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         issues.push(json!({
             "level": "warning",
             "check": "tmux",
-            "message": "tmux がインストールされていない。タブ構成の保存・復元は機能するが、\
-                実行中プロセス・画面内容の復元（完全復元）は使えない。\
-                brew install tmux でインストール可能",
+            "message": HealthText::TmuxMissing.text_in(lang),
         }));
     }
 
@@ -22468,8 +22468,7 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         issues.push(json!({
             "level": "info",
             "check": "persist",
-            "message": "セッション永続化が無効。tako persist on で有効にすると、\
-                tako 再起動時にプロセスと画面内容が復元される",
+            "message": HealthText::PersistOff.text_in(lang),
         }));
     }
 
@@ -22486,7 +22485,7 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         issues.push(json!({
             "level": "error",
             "check": "dpi_awareness",
-            "message": note.text(),
+            "message": note.text_in(lang),
         }));
     }
 
@@ -22497,7 +22496,10 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     // 狙ったのに外したときだけ申告する（当たっているときは黙る = 通常起動と同じ）。
     // 文と重さの正は `Placement::health_issue`（#1160。GUI を立てずに検証できる形へ
     // 寄せてある = ここで組み立てると自己テストが通らないと固定できない）
-    if let Some(issue) = display_placement.as_ref().and_then(|p| p.health_issue()) {
+    if let Some(issue) = display_placement
+        .as_ref()
+        .and_then(|p| p.health_issue_in(lang))
+    {
         issues.push(issue);
     }
 
@@ -22505,13 +22507,13 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     // 見た目は普通に動くので、**機械で読める形**で申告する。記録は
     // `IpcServer::start_with` が起動時に 1 回置く（GUI 以外のホストでは None）
     let ipc = tako_core::ipc_socket::status();
-    if let Some(issue) = ipc.as_ref().and_then(ipc_health_issue) {
+    if let Some(issue) = ipc.as_ref().and_then(|s| ipc_health_issue(s, lang)) {
         issues.push(issue);
     }
     // #2002: 立った後にパスから切り離されたまま（奪われている・張り直せない）
     if let Some(issue) = tako_core::ipc_socket::watch()
         .as_ref()
-        .and_then(ipc_watch_issue)
+        .and_then(|w| ipc_watch_issue(w, lang))
     {
         issues.push(issue);
     }
@@ -22520,7 +22522,7 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     // HTTP の MCP と GUI 自身の診断。戻った後は `ipc.pipe` の記録で読む
     if let Some(issue) = tako_core::ipc_socket::pipe()
         .as_ref()
-        .and_then(ipc_pipe_issue)
+        .and_then(|p| ipc_pipe_issue(p, lang))
     {
         issues.push(issue);
     }
@@ -22528,7 +22530,7 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     // try_clone が EMFILE）ので CLI / MCP は届かない（= この診断も届かない）。届くうちに申告する
     let fd_startup = tako_core::platform::fd_limit::startup_report();
     let fd_usage = tako_core::platform::fd_limit::usage();
-    issues.extend(fd_limit_issues(fd_startup, fd_usage));
+    issues.extend(fd_limit_issues(fd_startup, fd_usage, lang));
     // #2367: 器の tmux サーバーの fd の使用数と上限。上限に届くと器に新しいペインを作れず、
     // 器への問い合わせ（画面の読み取り・生死の確認）もすべて返らなくなる。macOS の tmux の器だけ
     // （psmux は上限の仕組みが無い・器なしは null）。問い合わせは 1〜2 回（サーバーは起こさない）。
@@ -22547,12 +22549,13 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
             probe,
             fd_startup,
             fd_container_legacy,
+            lang,
         ));
     }
 
     // ペインの文字コード固定（#2092。Windows だけ記録を持つ）。諦めたペインは
     // UTF-8 のバイト列で書く子の出力が化けるので、ペインを名指しで申告する
-    issues.extend(encoding_pin_issues(&ctx.encoding_pins));
+    issues.extend(encoding_pin_issues(&ctx.encoding_pins, lang));
     let encoding_pin = encoding_pin_section(
         &ctx.encoding_pins,
         tako_core::platform::console::read_pane_code_pages,
@@ -22561,13 +22564,14 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     let terminal_queries = terminal_queries_section(
         &tako_core::terminal_query::report(),
         &ctx.color_scheme_panes,
+        lang,
     );
 
     // #2431: WebView2 ランタイムの版（Windows の Web ビューに要る）とユーザーデータの置き場。
     // 判定は `platform::webview2` の 1 実装（診断項目 `webview2` と同じ材料。レジストリを読むだけ）。
     // 入っていない・古いときだけ申告する。macOS は対象外（節は `applicable: false`）
     let webview2_runtime = tako_core::platform::webview2::runtime();
-    if let Some(message) = webview2_runtime.next_step_in(tako_core::i18n::Lang::Ja) {
+    if let Some(message) = webview2_runtime.next_step_in(lang) {
         issues.push(json!({
             "level": "warning",
             "check": "webview2",
@@ -22592,7 +22596,7 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
     issues.extend(
         claude_mod
             .as_ref()
-            .map(crate::claude_mod::health_issues)
+            .map(|section| crate::claude_mod::health_issues_in(section, lang))
             .unwrap_or_default(),
     );
 
@@ -22601,6 +22605,7 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         tako_core::platform::fd_limit::APPLICABLE,
         fd_startup,
         fd_usage,
+        lang,
     );
     if tako_core::platform::fd_limit::APPLICABLE {
         fd_limit_section["container"] =
@@ -22657,7 +22662,7 @@ fn finish_check_health(ctx: &CheckHealthCtx) -> Value {
         ),
         // #1441: IPC の受け口の実測。`bound=false` なら CLI / MCP は届かない
         // （`kind=shortened` は深い data dir を短いパスへ逃がした正常な状態）
-        "ipc": ipc.as_ref().map(ipc_describe),
+        "ipc": ipc.as_ref().map(|s| ipc_describe(s, lang)),
         // #2359: fd の使用数（`open`）と上限（`soft` / `hard`）・起動時の引き上げ（`startup`）。
         // `near_exhaustion=true` なら上限の `warn_percent` % 以上を使っている。Windows は
         // `applicable=false`（小さい既定の上限が無い）。
@@ -22713,8 +22718,9 @@ fn webview2_describe(
 }
 
 /// `check_health` の `ipc` 節（#1441）。GUI を立てずに検査できるよう
-/// **記録から組み立てるだけ**にしてある（#1160 の `Placement::describe` と同じ作法）
-fn ipc_describe(status: &tako_core::ipc_socket::IpcStatus) -> Value {
+/// **記録から組み立てるだけ**にしてある（#1160 の `Placement::describe` と同じ作法）。
+/// 理由の文（`reason_text`）は表示言語（#2365）
+fn ipc_describe(status: &tako_core::ipc_socket::IpcStatus, lang: Lang) -> Value {
     json!({
         "bound": status.bound,
         "endpoint": status.endpoint,
@@ -22724,28 +22730,28 @@ fn ipc_describe(status: &tako_core::ipc_socket::IpcStatus) -> Value {
         "well_known_bytes": status.well_known_bytes,
         "error": status.error,
         // #2002: 受け口の見張り（null = 見張っていない = windows / A/B）
-        "watch": tako_core::ipc_socket::watch().as_ref().map(|w| ipc_watch_describe(w, unix_ms_now())),
+        "watch": tako_core::ipc_socket::watch().as_ref().map(|w| ipc_watch_describe(w, unix_ms_now(), lang)),
         // #2361: 名前付きパイプの待ち受けの作り直し（null = windows 以外 / A/B）
         "pipe": tako_core::ipc_socket::pipe().as_ref().map(|p| ipc_pipe_describe(p, unix_ms_now())),
         // #2360: 起動時に固定パスで見た先客（null = 確かめていない・ファイルが無かった）
-        "fixed_path": tako_core::ipc_socket::fixed_path().map(ipc_fixed_path_describe),
+        "fixed_path": tako_core::ipc_socket::fixed_path().map(|o| ipc_fixed_path_describe(o, lang)),
     })
 }
 
 /// `ipc.fixed_path` 節（#2360）。`state` は `live` / `busy`（奪わずに一時パスで立てた）か
 /// `dead`（残骸を消して固定パスで立てた）、`pid` は `busy` の持ち主
-fn ipc_fixed_path_describe(occupant: tako_core::ipc_socket::Occupant) -> Value {
+fn ipc_fixed_path_describe(occupant: tako_core::ipc_socket::Occupant, lang: Lang) -> Value {
     json!({
         "state": occupant.as_str(),
         "held": occupant.holds(),
         "pid": occupant.pid(),
-        "reason_text": occupant.reason(),
+        "reason_text": occupant.reason_in(lang),
     })
 }
 
 /// `ipc.watch` 節（#2002）。`state` はいまの判定（`ok` / `foreign_live` / `not_socket` /
 /// 張り直しに失敗したままなら `missing` / `replaced_dead`）、`last_rebind` は最後に張り直した記録
-fn ipc_watch_describe(watch: &tako_core::ipc_socket::IpcWatch, now_ms: u64) -> Value {
+fn ipc_watch_describe(watch: &tako_core::ipc_socket::IpcWatch, now_ms: u64, lang: Lang) -> Value {
     json!({
         "interval_ms": watch.interval_ms,
         "checks": watch.checks,
@@ -22754,7 +22760,7 @@ fn ipc_watch_describe(watch: &tako_core::ipc_socket::IpcWatch, now_ms: u64) -> V
         "healthy": watch.healthy(),
         "last_rebind": watch.last_rebind.as_ref().map(|r| json!({
             "reason": r.reason.as_str(),
-            "reason_text": r.reason.reason(),
+            "reason_text": r.reason.reason_in(lang),
             "at_unix_ms": r.at_unix_ms,
             "secs_ago": now_ms.saturating_sub(r.at_unix_ms) / 1000,
         })),
@@ -22787,17 +22793,16 @@ fn ipc_pipe_describe(pipe: &tako_core::ipc_socket::PipeInstances, now_ms: u64) -
 }
 
 /// 名前付きパイプの待ち受けを作れないままのときの申告（#2361）。作れていれば黙る
-fn ipc_pipe_issue(pipe: &tako_core::ipc_socket::PipeInstances) -> Option<Value> {
+fn ipc_pipe_issue(pipe: &tako_core::ipc_socket::PipeInstances, lang: Lang) -> Option<Value> {
     if pipe.healthy() {
         return None;
     }
-    let message = format!(
-        "IPC の名前付きパイプの待ち受けを作れていない（tako CLI / MCP の stdio は届かない）: {}・\
-         {} 回続けて失敗。間を置いて（最長 {} 秒ごとに）作り直している。戻らなければ tako を再起動する（#2361）",
-        pipe.error.as_deref().unwrap_or("理由不明"),
-        pipe.streak,
-        pipe.retry_max_ms / 1000,
-    );
+    let message = HealthText::PipeDown {
+        error: pipe.error.clone(),
+        streak: u64::from(pipe.streak),
+        max_secs: pipe.retry_max_ms / 1000,
+    }
+    .text_in(lang);
     Some(json!({
         "level": "warning",
         "check": "ipc",
@@ -22814,24 +22819,24 @@ fn unix_ms_now() -> u64 {
 
 /// 見張りが「パスが自分の受け口を指していない」と見たままのときの申告（#2002）。
 /// 張り直せた・正常なら黙る
-fn ipc_watch_issue(watch: &tako_core::ipc_socket::IpcWatch) -> Option<Value> {
+fn ipc_watch_issue(watch: &tako_core::ipc_socket::IpcWatch, lang: Lang) -> Option<Value> {
     if watch.healthy() {
         return None;
     }
-    let reason = watch.last.map(|c| c.reason()).unwrap_or("理由不明");
+    let reason = watch.last.map_or_else(
+        || HealthText::UnknownReason.text_in(lang),
+        |c| c.reason_in(lang).to_string(),
+    );
+    let secs = watch.interval_ms / 1000;
     let message = match &watch.error {
-        Some(error) => format!(
-            "IPC の受け口がソケットのパスから切り離されている（tako CLI / MCP の stdio は届かない）: \
-             {reason}・張り直せない（{error}）。{} 秒ごとにやり直す。戻らなければ tako を再起動する（#2002）",
-            watch.interval_ms / 1000,
-        ),
-        None => format!(
-            "IPC の受け口がソケットのパスから切り離されている（tako CLI / MCP の stdio は届かない）: \
-             {reason}。同じデータディレクトリで別の tako が動いていないか確かめる。\
-             そのファイルが消えれば {} 秒以内に張り直す（#2002）",
-            watch.interval_ms / 1000,
-        ),
-    };
+        Some(error) => HealthText::IpcDetachedStuck {
+            reason,
+            error: error.clone(),
+            secs,
+        },
+        None => HealthText::IpcDetached { reason, secs },
+    }
+    .text_in(lang);
     Some(json!({
         "level": "warning",
         "check": "ipc",
@@ -22845,12 +22850,13 @@ fn fd_limit_describe(
     applicable: bool,
     startup: Option<&tako_core::platform::fd_limit::Report>,
     usage: Option<tako_core::platform::fd_limit::Usage>,
+    lang: Lang,
 ) -> Value {
     use tako_core::platform::fd_limit::{FDS_PER_PANE, NOT_APPLICABLE_REASON, WARN_PERCENT};
     if !applicable {
         return json!({
             "applicable": false,
-            "reason": NOT_APPLICABLE_REASON,
+            "reason": NOT_APPLICABLE_REASON.text_in(lang),
         });
     }
     json!({
@@ -22881,6 +22887,7 @@ fn fd_limit_describe(
 fn fd_limit_issues(
     startup: Option<&tako_core::platform::fd_limit::Report>,
     usage: Option<tako_core::platform::fd_limit::Usage>,
+    lang: Lang,
 ) -> Vec<Value> {
     use tako_core::platform::fd_limit::{Outcome, FDS_PER_PANE};
     let mut out = Vec::new();
@@ -22888,40 +22895,29 @@ fn fd_limit_issues(
         out.push(json!({
             "level": "warning",
             "check": "fd_limit",
-            "message": format!(
-                "起動時にファイル記述子（fd）の上限を引き上げられなかった（{}）。soft {} のまま動いているので、\
-                 ペインが増えると tako CLI / MCP が届かなくなる。tako を再起動しても直らなければ \
-                 launchctl limit maxfiles で上限を確かめる（#2359）",
-                report.error.as_deref().unwrap_or("理由不明"),
-                report.soft.map_or_else(|| "?".to_string(), |s| s.to_string()),
-            ),
+            "message": HealthText::FdRaiseFailed {
+                error: report.error.clone(),
+                soft: report.soft,
+            }
+            .text_in(lang),
         }));
     }
     if let Some(u) = usage.filter(|u| u.near_exhaustion()) {
-        let mut message = format!(
-            "ファイル記述子（fd）の使用が上限に近い: {} / {} 本（{}%・残り {} 本）。上限に達すると \
-             tako CLI / MCP が届かなくなり（繋がっても GUI がすぐ閉じる）、新しいペインも開けない。\
-             使っていないペイン・タブを閉じること（1 ペインで約 {FDS_PER_PANE} 本）",
-            u.open,
-            u.soft,
-            u.percent(),
-            u.remaining(),
-        );
-        if let Some(report) =
-            startup.filter(|r| !matches!(r.outcome, Outcome::Raised | Outcome::AlreadyEnough))
-        {
-            message.push_str(&format!(
-                "。起動時に上限を引き上げていない（{}）",
-                report.outcome.as_str()
-            ));
-        }
-        message.push_str(
-            "。ペインの数に比べて多すぎるなら漏れの疑いがあるので persist.log を添えて報告する（#2359）",
-        );
+        let not_raised = startup
+            .filter(|r| !matches!(r.outcome, Outcome::Raised | Outcome::AlreadyEnough))
+            .map(|r| r.outcome.as_str().to_string());
         out.push(json!({
             "level": "warning",
             "check": "fd_limit",
-            "message": message,
+            "message": HealthText::FdNearExhaustion {
+                open: u.open,
+                soft: u.soft,
+                percent: u.percent(),
+                remaining: u.remaining(),
+                per_pane: FDS_PER_PANE,
+                not_raised,
+            }
+            .text_in(lang),
         }));
     }
     out
@@ -23006,16 +23002,17 @@ fn fd_limit_container_issues(
     probe: &tako_core::tmux_backend::ServerNofile,
     startup: Option<&tako_core::platform::fd_limit::Report>,
     legacy: bool,
+    lang: Lang,
 ) -> Vec<Value> {
     use tako_core::platform::fd_limit::{
-        classify_container, ContainerLimit, CONTAINER_FDS_PER_PANE, CONTAINER_LEGACY_ENV,
+        classify_container, ContainerLimit, CONTAINER_FDS_PER_PANE,
     };
     use tako_core::tmux_backend::{server_pane_capacity, ServerNofile};
-    let issue = |message: String| {
+    let issue = |text: HealthText| {
         json!({
             "level": "warning",
             "check": "fd_limit",
-            "message": message,
+            "message": text.text_in(lang),
         })
     };
     match probe {
@@ -23024,57 +23021,33 @@ fn fd_limit_container_issues(
             let Some(u) = fd_container_usage(limits).filter(|u| u.near_exhaustion()) else {
                 return Vec::new();
             };
-            let mut message = format!(
-                "器の tmux サーバー（pid {}）のファイル記述子（fd）の使用が上限に近い: {} / {} 本\
-                 （{}%・残り {} 本）。上限に達すると器に新しいペインを作れず（create window failed: \
-                 fork failed: Too many open files）、器への問い合わせ（画面の読み取り・生死の確認）も\
-                 すべて返らなくなる。使っていないペインを閉じること（器の 1 ペインで約 \
-                 {CONTAINER_FDS_PER_PANE} 本）",
-                limits.pid,
-                u.open,
-                u.soft,
-                u.percent(),
-                u.remaining(),
-            );
-            match classify_container(u.soft, startup, legacy) {
-                ContainerLimit::Raised => {}
-                ContainerLimit::Predates => message.push_str(&format!(
-                    "。このサーバーは fd の上限の引き上げより前に起きたので起動時の {} のまま\
-                     （約 {} ペインで詰まる）。上がるのは次にサーバーが起きたとき（器のセッションが\
-                     すべて終わった後。tako を再起動しても器は残るので上がらない）",
-                    u.soft,
-                    server_pane_capacity(u.soft),
-                )),
-                ContainerLimit::Legacy => message.push_str(&format!(
-                    "。{CONTAINER_LEGACY_ENV} のため引き上げた値を渡していない"
-                )),
-                ContainerLimit::LaunchValue => message.push_str(&format!(
-                    "。tako 自身が起動時に上限を引き上げていない（{}）ので器も起動時の値のまま",
-                    startup.map_or("記録なし", |r| r.outcome.as_str()),
-                )),
-            }
-            message.push_str("（#2367）");
-            vec![issue(message)]
+            let limit = match classify_container(u.soft, startup, legacy) {
+                ContainerLimit::Raised => ContainerLimitNote::Raised,
+                ContainerLimit::Predates => ContainerLimitNote::Predates {
+                    soft: u.soft,
+                    capacity: server_pane_capacity(u.soft),
+                },
+                ContainerLimit::Legacy => ContainerLimitNote::Legacy,
+                ContainerLimit::LaunchValue => {
+                    ContainerLimitNote::LaunchValue(startup.map(|r| r.outcome.as_str().to_string()))
+                }
+            };
+            vec![issue(HealthText::FdContainerNear {
+                pid: limits.pid,
+                open: u.open,
+                soft: u.soft,
+                percent: u.percent(),
+                remaining: u.remaining(),
+                per_pane: CONTAINER_FDS_PER_PANE,
+                limit,
+            })]
         }
         ServerNofile::Unreachable { reason, last } => {
-            let mut message = format!(
-                "器の tmux サーバーに問い合わせが届かない（{reason}）。fd の上限に届いたサーバーは\
-                 生きたまま、すべての問い合わせをこう返す（tmux 3.6b）"
-            );
-            if let Some(l) = last {
-                let num = |v: Option<u64>| v.map_or_else(|| "?".to_string(), |n| n.to_string());
-                message.push_str(&format!(
-                    "。前に読めたサーバー（pid {}）は soft {}・いまの使用数は {} 本",
-                    l.pid,
-                    num(l.soft),
-                    num(l.open),
-                ));
-            }
-            message.push_str(&format!(
-                "。上限に届いているなら、使っていないペインを閉じると戻る（器の 1 ペインで約 \
-                 {CONTAINER_FDS_PER_PANE} 本）（#2367）"
-            ));
-            vec![issue(message)]
+            vec![issue(HealthText::FdContainerUnreachable {
+                reason: reason.clone(),
+                last: last.as_ref().map(|l| (l.pid, l.soft, l.open)),
+                per_pane: CONTAINER_FDS_PER_PANE,
+            })]
         }
     }
 }
@@ -23143,10 +23116,11 @@ fn encoding_pin_section(
 
 /// `check_health` の `terminal_queries` 節（#2350）。答え方の表と回数は
 /// `tako_core::terminal_query::report` の写し（判定はここに持たない）。`summary` は
-/// CLI の人が読む出力がそのまま出す 1 行
+/// CLI の人が読む出力がそのまま出す 1 行（理由と要約は表示言語 = #2365）
 fn terminal_queries_section(
     report: &tako_core::terminal_query::Report,
     color_scheme_panes: &[u64],
+    lang: Lang,
 ) -> Value {
     use tako_core::terminal_query::Responder;
     let kinds: Vec<Value> = report
@@ -23160,7 +23134,7 @@ fn terminal_queries_section(
                 "answers": answers,
                 "by": k.responder.as_str(),
                 "from": if answers { k.kind.source() } else { None },
-                "reason": k.kind.decline_reason(report.legacy).map(|t| t.text().to_string()),
+                "reason": k.kind.decline_reason(report.legacy).map(|t| t.text_in(lang).to_string()),
                 "answered": k.answered,
                 "declined": k.declined,
             })
@@ -23172,22 +23146,26 @@ fn terminal_queries_section(
         "declined_color": report.declined_color,
         "scheme_notices": report.scheme_notices,
         "color_scheme_panes": color_scheme_panes,
-        "summary": report.summary().text(),
+        "summary": report.summary().text_in(lang),
     })
 }
 
-/// 固定を諦めたペインごとに 1 件の申告（#2092）。直し方は最簡のコマンド（#322）
-fn encoding_pin_issues(pins: &[(u64, tako_core::encoding_pin::PinReport)]) -> Vec<Value> {
+/// 固定を諦めたペインごとに 1 件の申告（#2092）。直し方は最簡のコマンド（#322）。
+/// 対象ごとの理由は固定を試みたときに記録した文（OS の答え）をそのまま載せる
+fn encoding_pin_issues(
+    pins: &[(u64, tako_core::encoding_pin::PinReport)],
+    lang: Lang,
+) -> Vec<Value> {
     pins.iter()
         .filter_map(|(pane, report)| {
             let reasons: Vec<String> = report
                 .gave_up()
                 .map(|t| {
-                    format!(
-                        "{}: {}",
-                        t.target.as_str(),
-                        t.state.reason().unwrap_or("理由不明")
-                    )
+                    let reason = t
+                        .state
+                        .reason()
+                        .map_or_else(|| HealthText::UnknownReason.text_in(lang), str::to_string);
+                    format!("{}: {reason}", t.target.as_str())
                 })
                 .collect();
             (!reasons.is_empty()).then(|| {
@@ -23195,12 +23173,11 @@ fn encoding_pin_issues(pins: &[(u64, tako_core::encoding_pin::PinReport)]) -> Ve
                     "level": "warning",
                     "check": "encoding_pin",
                     "pane": pane,
-                    "message": format!(
-                        "ペイン {pane} の文字コードを UTF-8 に固定できなかった（{}）。\
-                         このペインで UTF-8 のバイト列を書く子（type・CRT の printf 等）の出力は化ける。\
-                         そのペインで chcp 65001 を実行すると直る（#2092）",
-                        reasons.join(" / ")
-                    ),
+                    "message": HealthText::EncodingPinGaveUp {
+                        pane: *pane,
+                        reasons: reasons.join(" / "),
+                    }
+                    .text_in(lang),
                 })
             })
         })
@@ -23209,21 +23186,19 @@ fn encoding_pin_issues(pins: &[(u64, tako_core::encoding_pin::PinReport)]) -> Ve
 
 /// 受け口が立たなかったときだけ申告する（立っているときは黙る = 通常起動と同じ）。
 /// 上限超過（#1441 の症状）は原因と次の一手が違うので文言を分ける
-fn ipc_health_issue(status: &tako_core::ipc_socket::IpcStatus) -> Option<Value> {
+fn ipc_health_issue(status: &tako_core::ipc_socket::IpcStatus, lang: Lang) -> Option<Value> {
     if status.bound {
         return None;
     }
     let message = if status.too_long() {
-        format!(
-            "IPC の受け口が立っていない（tako CLI / MCP は届かない）: データディレクトリが深く、             ソケットパスが {} バイトで上限 {} バイトを超えている。             もっと浅い TAKO_DATA_DIR で起動し直すこと",
-            status.path_bytes, status.limit,
-        )
+        HealthText::IpcNotBoundTooLong {
+            bytes: status.path_bytes,
+            limit: status.limit,
+        }
     } else {
-        format!(
-            "IPC の受け口が立っていない（tako CLI / MCP は届かない）: {}",
-            status.error.as_deref().unwrap_or("理由不明"),
-        )
-    };
+        HealthText::IpcNotBound(status.error.clone())
+    }
+    .text_in(lang);
     Some(json!({
         "level": "error",
         "check": "ipc",
@@ -58549,7 +58524,7 @@ mod tests {
         assert_eq!(section["panes"][1]["hold"]["held_bytes"], 9);
         assert_eq!(section["hold_limit_ms"]["direct"], 500);
 
-        let issues = encoding_pin_issues(&pins);
+        let issues = encoding_pin_issues(&pins, Lang::Ja);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert_eq!(issues[0]["pane"], 7);
         assert_eq!(issues[0]["check"], "encoding_pin");
@@ -58565,7 +58540,7 @@ mod tests {
         let empty = encoding_pin_section(&[], read);
         assert_eq!(empty["needed"], cfg!(windows));
         assert_eq!(empty["panes"], json!([]));
-        assert!(encoding_pin_issues(&[]).is_empty());
+        assert!(encoding_pin_issues(&[], Lang::Ja).is_empty());
     }
 
     /// #2350: `terminal_queries` 節は答え方の表（種類ごとの答える / 答えない・誰が・出どころ・
@@ -58597,7 +58572,7 @@ mod tests {
                 .clone()
         };
 
-        let section = terminal_queries_section(&report(false), &[4]);
+        let section = terminal_queries_section(&report(false), &[4], Lang::Ja);
         assert_eq!(section["legacy"], false);
         assert_eq!(
             section["kinds"].as_array().unwrap().len(),
@@ -58627,7 +58602,7 @@ mod tests {
             .is_some_and(|s| s.contains("OSC 52")));
 
         // A/B（#2350 前）: tako が答えていた種類は答えない・出どころも出さない
-        let legacy = terminal_queries_section(&report(true), &[]);
+        let legacy = terminal_queries_section(&report(true), &[], Lang::Ja);
         assert_eq!(legacy["legacy"], true);
         let bg = row(&legacy, "osc11");
         assert_eq!(
@@ -58661,20 +58636,23 @@ mod issue2002_tests {
             at_unix_ms: 1_000_000,
             reason: ListenerCheck::ReplacedDead,
         });
-        let v = ipc_watch_describe(&watch, 1_007_500);
+        let v = ipc_watch_describe(&watch, 1_007_500, Lang::Ja);
         assert_eq!(v["state"], json!("ok"));
         assert_eq!(v["healthy"], json!(true));
         assert_eq!(v["rebinds"], json!(1));
         assert_eq!(v["last_rebind"]["reason"], json!("replaced_dead"));
         assert_eq!(v["last_rebind"]["secs_ago"], json!(7));
-        assert!(ipc_watch_issue(&watch).is_none(), "戻ったら申告しない");
+        assert!(
+            ipc_watch_issue(&watch, Lang::Ja).is_none(),
+            "戻ったら申告しない"
+        );
     }
 
     #[test]
     fn 奪われたまま_張り直せないままなら申告する() {
         let mut foreign = IpcWatch::new(10_000);
         foreign.last = Some(ListenerCheck::ForeignLive);
-        let issue = ipc_watch_issue(&foreign).expect("奪われたままは申告する");
+        let issue = ipc_watch_issue(&foreign, Lang::Ja).expect("奪われたままは申告する");
         assert_eq!(issue["check"], json!("ipc"));
         assert_eq!(issue["level"], json!("warning"));
         let message = issue["message"].as_str().unwrap();
@@ -58683,7 +58661,8 @@ mod issue2002_tests {
         let mut failed = IpcWatch::new(10_000);
         failed.last = Some(ListenerCheck::Missing);
         failed.error = Some("ソケットの置き場のディレクトリが無い".into());
-        let message = ipc_watch_issue(&failed).expect("張り直せないままは申告する")["message"]
+        let message = ipc_watch_issue(&failed, Lang::Ja).expect("張り直せないままは申告する")
+            ["message"]
             .as_str()
             .unwrap()
             .to_string();
@@ -58704,7 +58683,10 @@ mod issue2361_tests {
     #[test]
     fn 作れないままなら申告し戻れば黙って記録を出す() {
         let mut pipe = PipeInstances::new(PipeRetryPolicy::DEFAULT);
-        assert!(ipc_pipe_issue(&pipe).is_none(), "何も起きていなければ黙る");
+        assert!(
+            ipc_pipe_issue(&pipe, Lang::Ja).is_none(),
+            "何も起きていなければ黙る"
+        );
         let v = ipc_pipe_describe(&pipe, 0);
         assert_eq!(v["listening"], json!(true));
         assert_eq!(v["failures"], json!(0));
@@ -58720,7 +58702,7 @@ mod issue2361_tests {
         assert_eq!(v["retry_ms"], json!(200));
         assert_eq!(v["down_secs"], json!(4));
         assert_eq!(v["error"], json!(error));
-        let issue = ipc_pipe_issue(&pipe).expect("作れないままは申告する");
+        let issue = ipc_pipe_issue(&pipe, Lang::Ja).expect("作れないままは申告する");
         assert_eq!(issue["check"], json!("ipc"));
         assert_eq!(issue["level"], json!("warning"));
         let message = issue["message"].as_str().unwrap();
@@ -58729,7 +58711,10 @@ mod issue2361_tests {
         assert!(message.contains("最長 5 秒ごと"), "{message}");
 
         pipe.on_created(1_005_000);
-        assert!(ipc_pipe_issue(&pipe).is_none(), "戻ったら申告しない");
+        assert!(
+            ipc_pipe_issue(&pipe, Lang::Ja).is_none(),
+            "戻ったら申告しない"
+        );
         let v = ipc_pipe_describe(&pipe, 1_012_000);
         assert_eq!(v["listening"], json!(true));
         assert_eq!(
@@ -58773,7 +58758,7 @@ mod issue2359_tests {
     #[test]
     fn 節は使用数と上限と起動時の引き上げを出す() {
         let report = raised();
-        let section = fd_limit_describe(true, Some(&report), Some(usage(121, OPEN_MAX)));
+        let section = fd_limit_describe(true, Some(&report), Some(usage(121, OPEN_MAX)), Lang::Ja);
         assert_eq!(section["applicable"], true);
         assert_eq!(section["open"], 121);
         assert_eq!(section["soft"], OPEN_MAX);
@@ -58788,12 +58773,12 @@ mod issue2359_tests {
         assert_eq!(section["startup"]["soft_at_launch"], 256);
         assert_eq!(section["startup"]["children_soft"], 256);
         assert_eq!(section["startup"]["target"], OPEN_MAX);
-        assert!(fd_limit_issues(Some(&report), Some(usage(121, OPEN_MAX))).is_empty());
+        assert!(fd_limit_issues(Some(&report), Some(usage(121, OPEN_MAX)), Lang::Ja).is_empty());
     }
 
     #[test]
     fn 上限の無いosは理由だけを出す() {
-        let section = fd_limit_describe(false, None, None);
+        let section = fd_limit_describe(false, None, None, Lang::Ja);
         assert_eq!(section["applicable"], false);
         assert!(section["reason"].as_str().unwrap().contains("2^24"));
         assert_eq!(section.get("open"), None);
@@ -58809,7 +58794,7 @@ mod issue2359_tests {
             Some(138_240),
         );
         assert_eq!(capped.outcome, Outcome::HardCapped);
-        let issues = fd_limit_issues(Some(&capped), Some(usage(170, 200)));
+        let issues = fd_limit_issues(Some(&capped), Some(usage(170, 200)), Lang::Ja);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert_eq!(issues[0]["level"], "warning");
         assert_eq!(issues[0]["check"], "fd_limit");
@@ -58824,13 +58809,13 @@ mod issue2359_tests {
             assert!(message.contains(want), "{want} が無い: {message}");
         }
         // 境目: 79% は黙る・80% から申告する
-        assert!(fd_limit_issues(Some(&capped), Some(usage(159, 200))).is_empty());
+        assert!(fd_limit_issues(Some(&capped), Some(usage(159, 200)), Lang::Ja).is_empty());
         assert_eq!(
-            fd_limit_issues(Some(&capped), Some(usage(160, 200))).len(),
+            fd_limit_issues(Some(&capped), Some(usage(160, 200)), Lang::Ja).len(),
             1
         );
         // 引き上げた後に近づいたなら「引き上げていない」は付けない
-        let issues = fd_limit_issues(Some(&raised()), Some(usage(9000, OPEN_MAX)));
+        let issues = fd_limit_issues(Some(&raised()), Some(usage(9000, OPEN_MAX)), Lang::Ja);
         let message = issues[0]["message"].as_str().unwrap();
         assert!(!message.contains("引き上げていない"), "{message}");
     }
@@ -58843,7 +58828,7 @@ mod issue2359_tests {
             |_| Err(std::io::Error::from_raw_os_error(22)),
             Some(138_240),
         );
-        let issues = fd_limit_issues(Some(&failed), Some(usage(30, 256)));
+        let issues = fd_limit_issues(Some(&failed), Some(usage(30, 256)), Lang::Ja);
         assert_eq!(issues.len(), 1, "{issues:?}");
         let message = issues[0]["message"].as_str().unwrap();
         assert!(
@@ -58853,7 +58838,7 @@ mod issue2359_tests {
         assert!(message.contains("soft 256 のまま"), "{message}");
         assert!(message.contains("launchctl limit maxfiles"), "{message}");
         // 使用数を読めない・記録が無い（GUI 以外のホスト）なら申告しない
-        assert!(fd_limit_issues(None, None).is_empty());
+        assert!(fd_limit_issues(None, None, Lang::Ja).is_empty());
     }
 }
 
@@ -58907,21 +58892,28 @@ mod issue2367_tests {
         assert_eq!(c["pane_capacity"], 3411);
         assert_eq!(c["fds_per_pane"], 3);
         assert_eq!(c["warn_percent"], 80);
-        assert!(fd_limit_container_issues(&running(90, OPEN_MAX), Some(&report), false).is_empty());
+        assert!(
+            fd_limit_container_issues(&running(90, OPEN_MAX), Some(&report), false, Lang::Ja)
+                .is_empty()
+        );
         let off =
             fd_limit_container_describe("tako", &ServerNofile::NotRunning, Some(&report), false);
         assert_eq!(off["state"], "not_running");
         assert_eq!(off["limit"], Value::Null);
-        assert!(
-            fd_limit_container_issues(&ServerNofile::NotRunning, Some(&report), false).is_empty()
-        );
+        assert!(fd_limit_container_issues(
+            &ServerNofile::NotRunning,
+            Some(&report),
+            false,
+            Lang::Ja
+        )
+        .is_empty());
     }
 
     #[test]
     fn 器のサーバーの枯渇が近いと決まり方ごとの次の一手つきで申告する() {
         let report = raised();
         // 引き上げより前に起きたサーバー（soft 256）で 210 本（82%）
-        let issues = fd_limit_container_issues(&running(210, 256), Some(&report), false);
+        let issues = fd_limit_container_issues(&running(210, 256), Some(&report), false, Lang::Ja);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert_eq!(issues[0]["level"], "warning");
         assert_eq!(issues[0]["check"], "fd_limit");
@@ -58938,12 +58930,15 @@ mod issue2367_tests {
             assert!(message.contains(want), "{want} が無い: {message}");
         }
         // 境目: 79% は黙る・80% から申告する
-        assert!(fd_limit_container_issues(&running(204, 256), Some(&report), false).is_empty());
+        assert!(
+            fd_limit_container_issues(&running(204, 256), Some(&report), false, Lang::Ja)
+                .is_empty()
+        );
         assert_eq!(
-            fd_limit_container_issues(&running(205, 256), Some(&report), false).len(),
+            fd_limit_container_issues(&running(205, 256), Some(&report), false, Lang::Ja).len(),
             1
         );
-        let legacy = fd_limit_container_issues(&running(210, 256), Some(&report), true);
+        let legacy = fd_limit_container_issues(&running(210, 256), Some(&report), true, Lang::Ja);
         assert!(legacy[0]["message"]
             .as_str()
             .unwrap()
@@ -58954,7 +58949,7 @@ mod issue2367_tests {
             |_| panic!("書かない"),
             Some(138_240),
         );
-        let launch = fd_limit_container_issues(&running(210, 256), Some(&capped), false);
+        let launch = fd_limit_container_issues(&running(210, 256), Some(&capped), false, Lang::Ja);
         assert!(
             launch[0]["message"]
                 .as_str()
@@ -58963,7 +58958,8 @@ mod issue2367_tests {
             "{launch:?}"
         );
         // 引き上げた値で近づいたなら決まり方の注記は付けない
-        let raised_near = fd_limit_container_issues(&running(9000, OPEN_MAX), Some(&report), false);
+        let raised_near =
+            fd_limit_container_issues(&running(9000, OPEN_MAX), Some(&report), false, Lang::Ja);
         let message = raised_near[0]["message"].as_str().unwrap();
         assert!(!message.contains("起動時の"), "{message}");
     }
@@ -58988,7 +58984,7 @@ mod issue2367_tests {
         assert_eq!(c["open"], 256);
         assert_eq!(c["near_exhaustion"], true);
         assert_eq!(c["limit"], "predates");
-        let issues = fd_limit_container_issues(&probe, Some(&report), false);
+        let issues = fd_limit_container_issues(&probe, Some(&report), false, Lang::Ja);
         assert_eq!(issues.len(), 1, "{issues:?}");
         let message = issues[0]["message"].as_str().unwrap();
         for want in [
@@ -59005,7 +59001,8 @@ mod issue2367_tests {
         let c = fd_limit_container_describe("tako", &bare, Some(&report), false);
         assert_eq!(c["last_known"], false);
         assert_eq!(c["open"], Value::Null);
-        let message = fd_limit_container_issues(&bare, Some(&report), false)[0]["message"]
+        let message = fd_limit_container_issues(&bare, Some(&report), false, Lang::Ja)[0]
+            ["message"]
             .as_str()
             .unwrap()
             .to_string();

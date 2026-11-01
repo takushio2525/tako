@@ -35,7 +35,7 @@ use tako_cli::mcp_bridge;
 use tako_control::claude_mod::text::ModText;
 use tako_control::orchestrator::wait;
 use tako_control::protocol::{Axis, Direction, Request};
-use tako_control::{Reason, ReplyNote};
+use tako_control::{HealthText, Reason, ReplyNote};
 
 // 呼び出し元ペイン（`TAKO_PANE_ID`。FR-2.1.1）。テストのビルドだけは env を読まない差し替えへ
 // 向ける（#1716。手元のシェルが継承した env でテストが通り CI で落ちる「偽の緑」を作らない）
@@ -6848,7 +6848,7 @@ fn mod_install_local(args: &ModArgs) -> Result<(), String> {
 }
 
 /// 設定 dir ごとの skills/tako の行（`tako mod` と `tako mod install|uninstall` と `tako check-health` で
-/// 共通。組み立ては tako-control の 1 本）。`lang` は行の枠の言語（check-health は日本語。#2365）
+/// 共通。組み立ては tako-control の 1 本）。`lang` は行の枠の言語（どれも表示言語。#2365）
 fn print_mod_skills(skills: &Value, lang: tako_core::i18n::Lang) {
     for line in tako_control::claude_mod::text::skills_lines(skills, lang) {
         println!("{line}");
@@ -7714,27 +7714,33 @@ fn print_context_budget_fix(out: &serde_json::Value, dry_run: bool) {
 /// アプリへ届けば dispatch の結果をそのまま出す（`ipc` 節つき）。**届かないときこそ
 /// 答えが要る**ので、IPC の受け口だけをローカルで診断して出す。#1441 の症状
 /// （深い `TAKO_DATA_DIR` でソケットが `sun_path` の上限を超え、警告 1 行で縮退する）は
-/// アプリ側の記録も discovery も残らないので、ここが唯一の機械的な手がかりになる
+/// アプリ側の記録も discovery も残らないので、ここが唯一の機械的な手がかりになる。
+///
+/// 表示言語は設定に従う（#2365）。届いたときの行は GUI が同じ設定から組み、CLI が並べる行は
+/// [`cli_lang`]、届かないときの手元の診断は表示言語を決めてから組む
 fn check_health_cli(json: bool) -> Result<(), String> {
+    let lang = cli_lang();
     match send_request(Request::CheckHealth) {
         Ok(result) => {
             if json {
                 println!("{}", pretty_json(&result));
             } else {
-                print_check_health(&result);
+                print_check_health(&result, lang);
             }
             Ok(())
         }
         Err(reason) => {
-            let local = local_ipc_report();
+            let local = local_ipc_report(lang);
             // #1505: 届かなくても**環境診断は答えられる**（項目の正本は tako-control 側で、
-            // GUI を要らない）。ここで黙ると「tako が起動していないと何も分からない」に戻る
+            // GUI を要らない）。ここで黙ると「tako が起動していないと何も分からない」に戻る。
+            // 正本は表示言語のグローバルを読むので、組む前に決める（#2365）
+            init_local_lang();
             let diagnostics = tako_control::diagnostics::collect();
             // #1891: tako mod の項目は GUI のメモリにしか無いので、理由つきの不明（A/B では載せない）
             let claude_mod = (!tako_core::claude_mod::no_report_legacy()).then(|| {
-                tako_control::claude_mod::health_unavailable(&format!(
-                    "tako アプリへ届かない（{reason}）"
-                ))
+                tako_control::claude_mod::health_unavailable(
+                    &HealthText::AppUnreachable(reason.clone()).text_in(lang),
+                )
             });
             if json {
                 println!(
@@ -7748,16 +7754,19 @@ fn check_health_cli(json: bool) -> Result<(), String> {
                     }))
                 );
             } else {
-                println!("接続: 届かない（{reason}）");
-                print_ipc_section(&local);
+                println!(
+                    "{}",
+                    HealthText::ConnectionUnreachable(reason).text_in(lang)
+                );
+                print_ipc_section(&local, lang);
                 for line in diagnostics.lines() {
                     println!("{line}");
                 }
                 if let Some(section) = &claude_mod {
-                    print_check_health_mod(section);
+                    print_check_health_mod(section, lang);
                 }
             }
-            Err("tako アプリへ届かない（上の ipc 節が受け口の実測）".into())
+            Err(HealthText::AppUnreachableRefusal.text_in(lang))
         }
     }
 }
@@ -8391,44 +8400,51 @@ fn print_launches_section(l: &Value) {
 }
 
 /// `ipc.pipe` の 1 行（#2361。節が無ければ `None` = windows 以外・旧版の応答）
-fn pipe_line(pipe: &Value) -> Option<String> {
+fn pipe_line(pipe: &Value, lang: tako_core::i18n::Lang) -> Option<String> {
     if !pipe.is_object() {
         return None;
     }
     let max_secs = pipe["retry_max_ms"].as_u64().unwrap_or(0) / 1000;
     if pipe["listening"].as_bool() == Some(false) {
-        return Some(format!(
-            "  パイプの待ち受け: 作れていない（{} 回続けて失敗・{}）。{} ms 後に作り直す（最長 {max_secs} 秒ごと）。\
-             この間は tako CLI / MCP の stdio が届かない（#2361）",
-            pipe["streak"].as_u64().unwrap_or(0),
-            pipe["error"].as_str().unwrap_or("理由不明"),
-            pipe["retry_ms"].as_u64().unwrap_or(0),
-        ));
+        return Some(
+            HealthText::PipeDownLine {
+                streak: pipe["streak"].as_u64().unwrap_or(0),
+                error: pipe["error"].as_str().map(str::to_string),
+                retry_ms: pipe["retry_ms"].as_u64().unwrap_or(0),
+                max_secs,
+            }
+            .text_in(lang),
+        );
     }
     let outages = pipe["outages"].as_u64().unwrap_or(0);
     if outages == 0 {
-        return Some(format!(
-            "  パイプの待ち受け: 正常（作れなければ最長 {max_secs} 秒ごとに作り直す）"
-        ));
+        return Some(HealthText::PipeOk(max_secs).text_in(lang));
     }
-    let mut line = format!(
-        "  パイプの待ち受け: 正常・これまでに途切れ {outages} 回（作れなかった {} 回）",
-        pipe["failures"].as_u64().unwrap_or(0),
-    );
+    let mut line = HealthText::PipeOkWithOutages {
+        outages,
+        failures: pipe["failures"].as_u64().unwrap_or(0),
+    }
+    .text_in(lang);
     if let Some(last) = pipe["last_recovery"].as_object() {
-        line.push_str(&format!(
-            "（最後: {} 秒前に {} 回続けて作れなかった後に戻った・{}）",
-            last.get("secs_ago").and_then(Value::as_u64).unwrap_or(0),
-            last.get("failures").and_then(Value::as_u64).unwrap_or(0),
-            last.get("error").and_then(Value::as_str).unwrap_or("?"),
-        ));
+        line.push_str(
+            &HealthText::PipeLastRecovery {
+                secs_ago: last.get("secs_ago").and_then(Value::as_u64).unwrap_or(0),
+                failures: last.get("failures").and_then(Value::as_u64).unwrap_or(0),
+                error: last
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string(),
+            }
+            .text_in(lang),
+        );
     }
     Some(line)
 }
 
 /// 繋ぐ側からの受け口の診断（#1441）。置き場の決め方は
 /// `tako_core::ipc_socket` の 1 実装を通す（bind 側と同じ規則で引く）
-fn local_ipc_report() -> Value {
+fn local_ipc_report(lang: tako_core::i18n::Lang) -> Value {
     let Some(data_dir) = tako_core::paths::data_dir() else {
         return serde_json::json!({ "resolved": false });
     };
@@ -8453,13 +8469,13 @@ fn local_ipc_report() -> Value {
         "pointer": tako_core::ipc_socket::read_pointer(&data_dir)
             .map(|p| p.display().to_string()),
         // #2002: 届かないのは GUI が居ないからか、居るのに受け口が応答しないからか
-        "gui": (!tako_core::ipc_socket::legacy_2002()).then(local_gui_report).flatten(),
+        "gui": (!tako_core::ipc_socket::legacy_2002()).then(|| local_gui_report(lang)).flatten(),
     })
 }
 
 /// 接続情報ファイルの GUI が生きているか・その受け口へ繋がるか（#2002）。
 /// 接続情報ファイルが無ければ `None`（GUI を起動したことが無い・片付けられた）
-fn local_gui_report() -> Option<Value> {
+fn local_gui_report(lang: tako_core::i18n::Lang) -> Option<Value> {
     let info = tako_control::discovery::read()?;
     let alive = if cfg!(target_os = "macos") {
         tako_core::ports::is_live_tako_app(info.pid)
@@ -8473,8 +8489,8 @@ fn local_gui_report() -> Option<Value> {
         (true, _) => "alive_unreachable",
     };
     let next = match state {
-        "not_running" => Some("tako を起動する".to_string()),
-        "alive_unreachable" => Some(alive_unreachable_next(cfg!(windows))),
+        "not_running" => Some(HealthText::StartTako.text_in(lang)),
+        "alive_unreachable" => Some(alive_unreachable_next(cfg!(windows), lang)),
         _ => None,
     };
     Some(serde_json::json!({
@@ -8490,20 +8506,13 @@ fn local_gui_report() -> Option<Value> {
 
 /// GUI は動いているのに受け口が応答しないときの次の一手（#2002 / #2361）。
 /// 立て直し方が OS で違う（unix = パスの見張りと張り直し・windows = パイプの待ち受けの作り直し）
-fn alive_unreachable_next(windows: bool) -> String {
-    if windows {
-        format!(
-            "tako はパイプの待ち受けを作れなければ最長 {} 秒ごとに作り直す。少し待って tako check-health をもう一度。\
-             戻らなければ tako を再起動する（#2361）",
-            tako_core::ipc_socket::PIPE_RETRY_MAX_MS / 1000
-        )
+fn alive_unreachable_next(windows: bool, lang: tako_core::i18n::Lang) -> String {
+    let secs = if windows {
+        tako_core::ipc_socket::PIPE_RETRY_MAX_MS / 1000
     } else {
-        format!(
-            "tako は受け口を {} 秒ごとに確かめて張り直す。少し待って tako check-health をもう一度。\
-             戻らなければ tako を再起動する（#2002）",
-            tako_core::ipc_socket::WATCH_INTERVAL_MS_DEFAULT / 1000
-        )
-    }
+        tako_core::ipc_socket::WATCH_INTERVAL_MS_DEFAULT / 1000
+    };
+    HealthText::AliveUnreachableNext { windows, secs }.text_in(lang)
 }
 
 /// 受け口へ 1 本繋いでみる（認証はしない）。`ok` / `refused`（ファイルはあるが誰も受けない）/
@@ -8533,28 +8542,34 @@ fn probe_socket(socket: &str) -> (&'static str, Option<String>) {
     }
 }
 
-/// 人が読む要約（`--json` 無しのとき）
-fn print_check_health(result: &Value) {
+/// 人が読む要約（`--json` 無しのとき）。表示言語は CLI の設定（#2365）。
+/// 診断と tako mod の行は GUI が同じ設定の言語で組んだものをそのまま出す
+fn print_check_health(result: &Value, lang: tako_core::i18n::Lang) {
     println!(
-        "健全性: {}",
-        if result["healthy"].as_bool() == Some(true) {
-            "問題なし"
-        } else {
-            "指摘あり"
-        }
+        "{}",
+        HealthText::Healthy(result["healthy"].as_bool() == Some(true)).text_in(lang)
     );
     println!(
-        "バージョン: app={} cli={}",
-        result["app_version"].as_str().unwrap_or("?"),
-        result["cli_version"].as_str().unwrap_or("不明"),
+        "{}",
+        HealthText::Versions {
+            app: result["app_version"].as_str().unwrap_or("?").to_string(),
+            cli: result["cli_version"].as_str().map(str::to_string),
+        }
+        .text_in(lang)
     );
     if let Some(ipc) = result.get("ipc").filter(|v| !v.is_null()) {
-        print_ipc_section(ipc);
+        print_ipc_section(ipc, lang);
     }
-    if let Some(line) = result.get("fd_limit").and_then(fd_limit_line) {
+    if let Some(line) = result
+        .get("fd_limit")
+        .and_then(|fd| fd_limit_line(fd, lang))
+    {
         println!("{line}");
     }
-    if let Some(line) = result.get("fd_limit").and_then(fd_container_line) {
+    if let Some(line) = result
+        .get("fd_limit")
+        .and_then(|fd| fd_container_line(fd, lang))
+    {
         println!("{line}");
     }
     // #2350: 端末の問い合わせ（GUI が組んだ 1 行をそのまま出す）
@@ -8574,7 +8589,7 @@ fn print_check_health(result: &Value) {
     }
     // #1891: tako mod の項目（`tako mod` と同じ関数で同じ字面。A/B では節が無い）
     if let Some(section) = result.get("claude_mod").filter(|v| v.is_object()) {
-        print_check_health_mod(section);
+        print_check_health_mod(section, lang);
     }
     for issue in result["issues"].as_array().into_iter().flatten() {
         println!(
@@ -8587,10 +8602,9 @@ fn print_check_health(result: &Value) {
 }
 
 /// `tako check-health` の tako mod の項目（#1891）。行はすべて `tako mod` が出す行と同じ字面
-/// （1 行目・設定 dir ごとの skills/tako・報告が届いていないペインの理由）。check-health の枠は
-/// 日本語なので、`tako mod` の日本語表示と同じ字面で引く（節の理由の文も GUI が日本語で組む。#2365）
-fn print_check_health_mod(section: &Value) {
-    let lang = tako_core::i18n::Lang::Ja;
+/// （1 行目・設定 dir ごとの skills/tako・報告が届いていないペインの理由）。check-health の枠と
+/// 同じ表示言語で引く（節の理由の文も GUI が同じ言語で組む。#2365）
+fn print_check_health_mod(section: &Value, lang: tako_core::i18n::Lang) {
     println!(
         "{}",
         tako_control::claude_mod::text::injection_line(section, lang)
@@ -8608,7 +8622,7 @@ fn print_check_health_mod(section: &Value) {
 
 /// `check-health` の fd の 1 行（#2359）。使用数 / 上限と起動時の引き上げ。
 /// 上限の無い OS（`applicable=false`）・節の無い旧版の応答は None（何も出さない）
-fn fd_limit_line(fd: &Value) -> Option<String> {
+fn fd_limit_line(fd: &Value, lang: tako_core::i18n::Lang) -> Option<String> {
     if fd["applicable"].as_bool() != Some(true) {
         return None;
     }
@@ -8616,88 +8630,70 @@ fn fd_limit_line(fd: &Value) -> Option<String> {
         v.as_u64()
             .map_or_else(|| "?".to_string(), |n| n.to_string())
     };
-    let mut line = format!(
-        "fd: {} / {} 本（{}%）",
-        num(&fd["open"]),
-        num(&fd["soft"]),
-        num(&fd["percent"]),
-    );
+    let mut line = HealthText::FdUsage {
+        open: num(&fd["open"]),
+        soft: num(&fd["soft"]),
+        percent: num(&fd["percent"]),
+    }
+    .text_in(lang);
     let startup = &fd["startup"];
     let launch = num(&startup["soft_at_launch"]);
     let note = match startup["outcome"].as_str() {
-        Some("raised") => Some(format!(
-            "起動時 {launch} → {} に引き上げ（ペインのシェルには {launch}）",
-            num(&fd["soft"])
+        Some("raised") => Some(HealthText::FdRaised {
+            launch,
+            soft: num(&fd["soft"]),
+        }),
+        Some("already_enough") => Some(HealthText::FdAlreadyEnough(launch)),
+        Some("hard_capped") => Some(HealthText::FdHardCapped(num(&fd["hard"]))),
+        Some("failed") => Some(HealthText::FdFailed(
+            startup["error"].as_str().map(str::to_string),
         )),
-        Some("already_enough") => Some(format!("起動時から {launch}（引き上げは不要）")),
-        Some("hard_capped") => Some(format!(
-            "hard が {} で引き上げられない（起動時のまま）",
-            num(&fd["hard"])
-        )),
-        Some("failed") => Some(format!(
-            "引き上げに失敗（{}）",
-            startup["error"].as_str().unwrap_or("理由不明")
-        )),
-        Some("legacy") => Some(format!(
-            "引き上げない（{}）",
-            tako_core::platform::fd_limit::LEGACY_ENV
-        )),
+        Some("legacy") => Some(HealthText::FdLegacy),
         _ => None,
     };
     if let Some(note) = note {
-        line.push('・');
-        line.push_str(&note);
+        line.push_str(&HealthText::NoteSeparator.text_in(lang));
+        line.push_str(&note.text_in(lang));
     }
     Some(line)
 }
 
 /// `check-health` の器の tmux サーバーの 1 行（#2367）。使用数 / 上限と上限がどう決まったか。
 /// 器が tmux でない（`container=null`）・節の無い旧版の応答は None（何も出さない）
-fn fd_container_line(fd: &Value) -> Option<String> {
+fn fd_container_line(fd: &Value, lang: tako_core::i18n::Lang) -> Option<String> {
     let c = fd.get("container").filter(|c| c.is_object())?;
     let num = |v: &Value| {
         v.as_u64()
             .map_or_else(|| "?".to_string(), |n| n.to_string())
     };
-    let head = "器の tmux サーバー: ";
     let mut line = match c["state"].as_str() {
-        Some("not_running") => return Some(format!("{head}起きていない")),
-        Some("unreachable") => format!(
-            "{head}問い合わせが届かない（{}）",
-            c["reason"].as_str().unwrap_or("理由不明")
-        ),
-        _ => format!(
-            "{head}{} / {} 本（{}%）",
-            num(&c["open"]),
-            num(&c["soft"]),
-            num(&c["percent"]),
-        ),
-    };
+        Some("not_running") => return Some(HealthText::ContainerNotRunning.text_in(lang)),
+        Some("unreachable") => {
+            HealthText::ContainerUnreachable(c["reason"].as_str().map(str::to_string))
+        }
+        _ => HealthText::ContainerUsage {
+            open: num(&c["open"]),
+            soft: num(&c["soft"]),
+            percent: num(&c["percent"]),
+        },
+    }
+    .text_in(lang);
     let note = match c["limit"].as_str() {
-        Some("raised") => Some(format!(
-            "引き上げた値を受け継いだ（器のペインのシェルには {}）",
-            num(&c["children_soft"])
-        )),
-        Some("predates") => Some(format!(
-            "引き上げより前に起きたので起動時のまま（約 {} ペインで詰まる。次にサーバーが起きたとき上がる）",
-            num(&c["pane_capacity"])
-        )),
-        Some("legacy") => Some(format!(
-            "引き上げない（{}）",
-            tako_core::platform::fd_limit::CONTAINER_LEGACY_ENV
-        )),
-        Some("launch_value") => Some("tako が引き上げていないので起動時のまま".to_string()),
+        Some("raised") => Some(HealthText::ContainerRaised(num(&c["children_soft"]))),
+        Some("predates") => Some(HealthText::ContainerPredates(num(&c["pane_capacity"]))),
+        Some("legacy") => Some(HealthText::ContainerLegacy),
+        Some("launch_value") => Some(HealthText::ContainerLaunchValue),
         _ => None,
     };
     if let Some(note) = note {
-        line.push('・');
-        line.push_str(&note);
+        line.push_str(&HealthText::NoteSeparator.text_in(lang));
+        line.push_str(&note.text_in(lang));
     }
     Some(line)
 }
 
 /// IPC の受け口 1 行（アプリ経由・ローカル診断のどちらも同じ形で出す）
-fn print_ipc_section(ipc: &Value) {
+fn print_ipc_section(ipc: &Value, lang: tako_core::i18n::Lang) {
     println!(
         "IPC: bound={} kind={} path_bytes={} limit={} well_known_bytes={}",
         ipc["bound"].as_bool().unwrap_or(false) || ipc["connect_ok"].as_bool().unwrap_or(false),
@@ -8707,83 +8703,92 @@ fn print_ipc_section(ipc: &Value) {
         ipc["well_known_bytes"].as_u64().unwrap_or(0),
     );
     if let Some(endpoint) = ipc["endpoint"].as_str().or(ipc["socket"].as_str()) {
-        println!("  受け口: {endpoint}");
+        println!(
+            "{}",
+            HealthText::IpcEndpoint(endpoint.to_string()).text_in(lang)
+        );
     }
     if let Some(error) = ipc["error"].as_str() {
-        println!("  理由: {error}");
+        println!(
+            "{}",
+            HealthText::IpcErrorLine(error.to_string()).text_in(lang)
+        );
     }
-    for line in ipc_recovery_lines(ipc) {
+    for line in ipc_recovery_lines(ipc, lang) {
         println!("{line}");
     }
 }
 
 /// `ipc` 節の #2002 の行（GUI 側の見張り・届かないときの GUI の生死と次の一手）。
 /// 行を組むだけにしてある（単体テストが字面を固定する）
-fn ipc_recovery_lines(ipc: &Value) -> Vec<String> {
+fn ipc_recovery_lines(ipc: &Value, lang: tako_core::i18n::Lang) -> Vec<String> {
     let mut lines = Vec::new();
     // GUI 側の見張り（届いたときだけある）
     let watch = &ipc["watch"];
     if watch.is_object() {
-        let mut line = format!(
-            "  見張り: {} 秒ごと・確認 {} 回・張り直し {} 回",
-            watch["interval_ms"].as_u64().unwrap_or(0) / 1000,
-            watch["checks"].as_u64().unwrap_or(0),
-            watch["rebinds"].as_u64().unwrap_or(0),
-        );
+        let mut line = HealthText::WatchCounts {
+            secs: watch["interval_ms"].as_u64().unwrap_or(0) / 1000,
+            checks: watch["checks"].as_u64().unwrap_or(0),
+            rebinds: watch["rebinds"].as_u64().unwrap_or(0),
+        }
+        .text_in(lang);
         if let Some(last) = watch["last_rebind"].as_object() {
-            line.push_str(&format!(
-                "（最後: {} 秒前・{}）",
-                last.get("secs_ago").and_then(Value::as_u64).unwrap_or(0),
-                last.get("reason_text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("?"),
-            ));
+            line.push_str(
+                &HealthText::WatchLastRebind {
+                    secs_ago: last.get("secs_ago").and_then(Value::as_u64).unwrap_or(0),
+                    reason: last
+                        .get("reason_text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                        .to_string(),
+                }
+                .text_in(lang),
+            );
         }
         lines.push(line);
         if let Some(error) = watch["error"].as_str() {
-            lines.push(format!("  張り直せない理由: {error}"));
+            lines.push(HealthText::WatchRebindError(error.to_string()).text_in(lang));
         }
     }
     // #2361: Windows の名前付きパイプの待ち受け（作れない間は間を置いて作り直す）
-    if let Some(line) = pipe_line(&ipc["pipe"]) {
+    if let Some(line) = pipe_line(&ipc["pipe"], lang) {
         lines.push(line);
     }
     // #2360: 起動時に固定パスで見た先客（奪わずに一時パスで立てた・残骸を作り直した）
     let fixed = &ipc["fixed_path"];
     if fixed.is_object() {
-        let reason = fixed["reason_text"].as_str().unwrap_or("?");
-        lines.push(if fixed["held"].as_bool().unwrap_or(false) {
-            format!(
-                "  固定パス: 生きた受け口が居たので奪わずに一時パスで立てた（{reason}）。\
-                 同じデータディレクトリの別の tako が動いている = このウィンドウはセカンダリ（#2360）"
-            )
-        } else {
-            format!("  固定パス: 起動時に残骸を消して張り直した（{reason}）（#2360）")
-        });
+        let reason = fixed["reason_text"].as_str().unwrap_or("?").to_string();
+        lines.push(
+            if fixed["held"].as_bool().unwrap_or(false) {
+                HealthText::FixedPathHeld(reason)
+            } else {
+                HealthText::FixedPathReclaimed(reason)
+            }
+            .text_in(lang),
+        );
     }
     // 届かないときの GUI の生死（届かない原因と次の一手を分ける）
     let gui = &ipc["gui"];
     if gui.is_object() {
         let pid = gui["pid"].as_u64().unwrap_or(0);
-        match gui["state"].as_str() {
-            Some("alive_unreachable") => lines.push(format!(
-                "  GUI: 動いている（pid {pid}）のに受け口が応答しない（{}）",
-                match gui["connect"].as_str() {
-                    Some("refused") => "ソケットファイルはあるが誰も受けていない",
-                    Some("missing") => "ソケットファイルが無い",
-                    _ => gui["connect_error"].as_str().unwrap_or("繋がらない"),
-                }
-            )),
-            Some("not_running") => lines.push(format!(
-                "  GUI: 動いていない（接続情報の pid {pid} は居ない）"
-            )),
-            Some("reachable") => lines.push(format!(
-                "  GUI: 動いている（pid {pid}）・受け口にも繋がる（届かない理由は「接続:」の行）"
-            )),
-            _ => {}
-        }
+        let state_line = match gui["state"].as_str() {
+            Some("alive_unreachable") => Some(HealthText::GuiAliveUnreachable {
+                pid,
+                why: match gui["connect"].as_str() {
+                    Some("refused") => HealthText::SocketRefused.text_in(lang),
+                    Some("missing") => HealthText::SocketMissing.text_in(lang),
+                    _ => gui["connect_error"]
+                        .as_str()
+                        .map_or_else(|| HealthText::NotConnected.text_in(lang), str::to_string),
+                },
+            }),
+            Some("not_running") => Some(HealthText::GuiNotRunning(pid)),
+            Some("reachable") => Some(HealthText::GuiReachable(pid)),
+            _ => None,
+        };
+        lines.extend(state_line.map(|text| text.text_in(lang)));
         if let Some(next) = gui["next"].as_str() {
-            lines.push(format!("  次の一手: {next}"));
+            lines.push(HealthText::NextStep(next.to_string()).text_in(lang));
         }
     }
     lines
@@ -14311,7 +14316,7 @@ mod tests {
                 "next": "tako は受け口を 10 秒ごとに確かめて張り直す。少し待って tako check-health をもう一度。戻らなければ tako を再起動する（#2002）",
             }
         });
-        let lines = ipc_recovery_lines(&ipc);
+        let lines = ipc_recovery_lines(&ipc, tako_core::i18n::Lang::Ja);
         assert_eq!(
             lines,
             [
@@ -14324,14 +14329,18 @@ mod tests {
             "gui": { "pid": 42, "alive": false, "connect": "refused", "state": "not_running", "next": "tako を起動する" }
         });
         assert_eq!(
-            ipc_recovery_lines(&down),
+            ipc_recovery_lines(&down, tako_core::i18n::Lang::Ja),
             [
                 "  GUI: 動いていない（接続情報の pid 42 は居ない）",
                 "  次の一手: tako を起動する",
             ]
         );
         // A/B（`gui` 節が無い = 修正前）では何も足さない
-        assert!(ipc_recovery_lines(&serde_json::json!({ "gui": null })).is_empty());
+        assert!(ipc_recovery_lines(
+            &serde_json::json!({ "gui": null }),
+            tako_core::i18n::Lang::Ja
+        )
+        .is_empty());
     }
 
     /// #2359: fd の 1 行は使用数 / 上限と起動時の引き上げを出す。上限の無い OS・旧版は出さない
@@ -14348,36 +14357,55 @@ mod tests {
             })
         };
         assert_eq!(
-            fd_limit_line(&section("raised", 121, 10240, Value::Null)).as_deref(),
+            fd_limit_line(
+                &section("raised", 121, 10240, Value::Null),
+                tako_core::i18n::Lang::Ja
+            )
+            .as_deref(),
             Some(
                 "fd: 121 / 10240 本（1%）・起動時 256 → 10240 に引き上げ（ペインのシェルには 256）"
             )
         );
         assert_eq!(
-            fd_limit_line(&section("hard_capped", 170, 200, serde_json::json!(200))).as_deref(),
+            fd_limit_line(
+                &section("hard_capped", 170, 200, serde_json::json!(200)),
+                tako_core::i18n::Lang::Ja
+            )
+            .as_deref(),
             Some("fd: 170 / 200 本（85%）・hard が 200 で引き上げられない（起動時のまま）")
         );
         assert_eq!(
-            fd_limit_line(&section("failed", 121, 256, Value::Null)).as_deref(),
+            fd_limit_line(&section("failed", 121, 256, Value::Null), tako_core::i18n::Lang::Ja).as_deref(),
             Some("fd: 121 / 256 本（47%）・引き上げに失敗（setrlimit(10240): Invalid argument (os error 22)）")
         );
         assert_eq!(
-            fd_limit_line(&section("legacy", 121, 256, Value::Null)).as_deref(),
+            fd_limit_line(
+                &section("legacy", 121, 256, Value::Null),
+                tako_core::i18n::Lang::Ja
+            )
+            .as_deref(),
             Some("fd: 121 / 256 本（47%）・引き上げない（TAKO_2359_LEGACY）")
         );
         // GUI 以外のホスト（起動時の記録が無い）は使用数だけ
         let mut bare = section("raised", 11, 10240, Value::Null);
         bare["startup"] = Value::Null;
         assert_eq!(
-            fd_limit_line(&bare).as_deref(),
+            fd_limit_line(&bare, tako_core::i18n::Lang::Ja).as_deref(),
             Some("fd: 11 / 10240 本（0%）")
         );
         assert_eq!(
-            fd_limit_line(&serde_json::json!({ "applicable": false, "reason": "x" })),
+            fd_limit_line(
+                &serde_json::json!({ "applicable": false, "reason": "x" }),
+                tako_core::i18n::Lang::Ja
+            ),
             None,
             "Windows は出さない"
         );
-        assert_eq!(fd_limit_line(&Value::Null), None, "節の無い旧版の応答");
+        assert_eq!(
+            fd_limit_line(&Value::Null, tako_core::i18n::Lang::Ja),
+            None,
+            "節の無い旧版の応答"
+        );
     }
 
     /// #2367: 器の tmux サーバーの 1 行は使用数 / 上限と決まり方を出す。器が tmux でない・旧版は出さない
@@ -14398,40 +14426,50 @@ mod tests {
             })
         };
         assert_eq!(
-            fd_container_line(&section("raised", 90, 10240)).as_deref(),
+            fd_container_line(&section("raised", 90, 10240), tako_core::i18n::Lang::Ja).as_deref(),
             Some("器の tmux サーバー: 90 / 10240 本（0%）・引き上げた値を受け継いだ（器のペインのシェルには 256）")
         );
         assert_eq!(
-            fd_container_line(&section("predates", 210, 256)).as_deref(),
+            fd_container_line(&section("predates", 210, 256), tako_core::i18n::Lang::Ja).as_deref(),
             Some("器の tmux サーバー: 210 / 256 本（82%）・引き上げより前に起きたので起動時のまま（約 83 ペインで詰まる。次にサーバーが起きたとき上がる）")
         );
         assert_eq!(
-            fd_container_line(&section("legacy", 90, 256)).as_deref(),
+            fd_container_line(&section("legacy", 90, 256), tako_core::i18n::Lang::Ja).as_deref(),
             Some("器の tmux サーバー: 90 / 256 本（35%）・引き上げない（TAKO_2367_LEGACY）")
         );
         assert_eq!(
-            fd_container_line(&section("launch_value", 90, 256)).as_deref(),
+            fd_container_line(&section("launch_value", 90, 256), tako_core::i18n::Lang::Ja)
+                .as_deref(),
             Some("器の tmux サーバー: 90 / 256 本（35%）・tako が引き上げていないので起動時のまま")
         );
         assert_eq!(
-            fd_container_line(&serde_json::json!({ "container": { "state": "not_running" } }))
-                .as_deref(),
+            fd_container_line(
+                &serde_json::json!({ "container": { "state": "not_running" } }),
+                tako_core::i18n::Lang::Ja
+            )
+            .as_deref(),
             Some("器の tmux サーバー: 起きていない")
         );
         assert_eq!(
             fd_container_line(&serde_json::json!({ "container": {
                 "state": "unreachable", "reason": "server exited unexpectedly", "limit": "predates", "pane_capacity": 83,
-            } }))
+            } }), tako_core::i18n::Lang::Ja)
             .as_deref(),
             Some("器の tmux サーバー: 問い合わせが届かない（server exited unexpectedly）・引き上げより前に起きたので起動時のまま（約 83 ペインで詰まる。次にサーバーが起きたとき上がる）")
         );
         assert_eq!(
-            fd_container_line(&serde_json::json!({ "applicable": true, "container": null })),
+            fd_container_line(
+                &serde_json::json!({ "applicable": true, "container": null }),
+                tako_core::i18n::Lang::Ja
+            ),
             None,
             "器が tmux でない"
         );
         assert_eq!(
-            fd_container_line(&serde_json::json!({ "applicable": true })),
+            fd_container_line(
+                &serde_json::json!({ "applicable": true }),
+                tako_core::i18n::Lang::Ja
+            ),
             None,
             "節の無い旧版の応答"
         );
@@ -14450,7 +14488,7 @@ mod tests {
             }
         });
         assert_eq!(
-            ipc_recovery_lines(&ipc),
+            ipc_recovery_lines(&ipc, tako_core::i18n::Lang::Ja),
             ["  見張り: 10 秒ごと・確認 7 回・張り直し 1 回（最後: 3 秒前・ソケットファイルが消えていた）"]
         );
     }
@@ -14462,18 +14500,22 @@ mod tests {
             "fixed_path": { "state": "busy", "held": true, "pid": 42, "reason_text": "繋がらないが、接続情報の持ち主（pid 42）が生きている" }
         });
         assert_eq!(
-            ipc_recovery_lines(&held),
+            ipc_recovery_lines(&held, tako_core::i18n::Lang::Ja),
             ["  固定パス: 生きた受け口が居たので奪わずに一時パスで立てた（繋がらないが、接続情報の持ち主（pid 42）が生きている）。同じデータディレクトリの別の tako が動いている = このウィンドウはセカンダリ（#2360）"]
         );
         let dead = serde_json::json!({
             "fixed_path": { "state": "dead", "held": false, "pid": null, "reason_text": "4 回繋いでも繋がらず、生きた持ち主の記録も無い（残骸）" }
         });
         assert_eq!(
-            ipc_recovery_lines(&dead),
+            ipc_recovery_lines(&dead, tako_core::i18n::Lang::Ja),
             ["  固定パス: 起動時に残骸を消して張り直した（4 回繋いでも繋がらず、生きた持ち主の記録も無い（残骸））（#2360）"]
         );
         // 節が無い（確かめていない・旧版の応答）なら何も足さない
-        assert!(ipc_recovery_lines(&serde_json::json!({ "fixed_path": null })).is_empty());
+        assert!(ipc_recovery_lines(
+            &serde_json::json!({ "fixed_path": null }),
+            tako_core::i18n::Lang::Ja
+        )
+        .is_empty());
     }
 
     /// #2361: Windows の名前付きパイプの待ち受けを 1 行で出す（作れていない・正常・途切れの後に戻った）
@@ -14483,14 +14525,14 @@ mod tests {
             "pipe": { "listening": false, "streak": 3, "error": "Insufficient system resources exist (os error 1450)", "retry_ms": 400, "retry_max_ms": 5000 }
         });
         assert_eq!(
-            ipc_recovery_lines(&down),
+            ipc_recovery_lines(&down, tako_core::i18n::Lang::Ja),
             ["  パイプの待ち受け: 作れていない（3 回続けて失敗・Insufficient system resources exist (os error 1450)）。400 ms 後に作り直す（最長 5 秒ごと）。この間は tako CLI / MCP の stdio が届かない（#2361）"]
         );
         let quiet = serde_json::json!({
             "pipe": { "listening": true, "outages": 0, "failures": 0, "retry_max_ms": 5000, "last_recovery": null }
         });
         assert_eq!(
-            ipc_recovery_lines(&quiet),
+            ipc_recovery_lines(&quiet, tako_core::i18n::Lang::Ja),
             ["  パイプの待ち受け: 正常（作れなければ最長 5 秒ごとに作り直す）"]
         );
         let recovered = serde_json::json!({
@@ -14500,22 +14542,26 @@ mod tests {
             }
         });
         assert_eq!(
-            ipc_recovery_lines(&recovered),
+            ipc_recovery_lines(&recovered, tako_core::i18n::Lang::Ja),
             ["  パイプの待ち受け: 正常・これまでに途切れ 2 回（作れなかった 7 回）（最後: 12 秒前に 5 回続けて作れなかった後に戻った・os error 1450）"]
         );
         // 節が無い（windows 以外・旧版の応答）なら何も足さない
-        assert!(ipc_recovery_lines(&serde_json::json!({ "pipe": null })).is_empty());
+        assert!(ipc_recovery_lines(
+            &serde_json::json!({ "pipe": null }),
+            tako_core::i18n::Lang::Ja
+        )
+        .is_empty());
     }
 
     /// #2361: アプリへ届かないときの次の一手は OS の立て直し方に合わせる（unix の文は #2002 のまま）
     #[test]
     fn issue2361_届かないときの次の一手はosの立て直し方に合わせる() {
         assert_eq!(
-            alive_unreachable_next(false),
+            alive_unreachable_next(false, tako_core::i18n::Lang::Ja),
             "tako は受け口を 10 秒ごとに確かめて張り直す。少し待って tako check-health をもう一度。戻らなければ tako を再起動する（#2002）"
         );
         assert_eq!(
-            alive_unreachable_next(true),
+            alive_unreachable_next(true, tako_core::i18n::Lang::Ja),
             "tako はパイプの待ち受けを作れなければ最長 5 秒ごとに作り直す。少し待って tako check-health をもう一度。戻らなければ tako を再起動する（#2361）"
         );
     }

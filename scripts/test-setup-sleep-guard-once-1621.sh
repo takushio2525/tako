@@ -10,6 +10,9 @@
 # `tako sleep-guard set`）・LaunchAgent には触れない（`env -i` で環境ごと差し替え、claude /
 # brew / tmux はスタブ。答えはスリープ防止の値を settings.json へ書くだけで pmset は叩かない）。
 set -uo pipefail
+# check-health / `tako setup --check` は表示言語に従う（#2365）。判定は日本語の字面なので、OS の言語に
+# 依らず日本語表示へ固定する（settings.json の language が system のときだけ効く）
+export TAKO_LANG=ja
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAKO="${TAKO_BIN:-$ROOT/target/debug/tako}"

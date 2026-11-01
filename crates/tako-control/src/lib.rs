@@ -61,6 +61,7 @@ pub mod discovery;
 pub mod dispatch;
 pub mod fda;
 pub mod handoff_guard;
+pub mod health_text;
 pub mod host;
 /// GUI 側の口（ControlHost の実装）が自分で組む断りの日英の対（#2365）
 pub mod host_refusal;
@@ -152,6 +153,7 @@ pub use dispatch::{
     DispatchError, LspFormatLanding, LspGotoLanding, NoTargetPaneAt, OffloadContinuation,
     OffloadJob, OffloadLanding, OffloadOutcome, PinnedView, Reason, TmuxContext,
 };
+pub use health_text::{ContainerLimitNote, HealthText};
 pub use host::{
     cleanup_tmux_servers_default, ChangelogDiffTarget, OrphanCleanupPlan, PreviewConflict,
     PreviewFormatSource, PreviewGotoSource, PreviewHost, PreviewLineTarget, RemoteHost,

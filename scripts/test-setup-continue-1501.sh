@@ -14,6 +14,9 @@
 # 「MCP 登録が実際に載ったか」を隔離 HOME の .claude.json で確かめられる
 # （未認証の実 claude 2.1.258 でも `mcp add --scope user` が通ることは実測済み）。
 set -uo pipefail
+# check-health / `tako setup --check` は表示言語に従う（#2365）。判定は日本語の字面なので、OS の言語に
+# 依らず日本語表示へ固定する（settings.json の language が system のときだけ効く）
+export TAKO_LANG=ja
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAKO="${TAKO_BIN:-$ROOT/target/debug/tako}"

@@ -219,7 +219,7 @@ fn checkhealthにipc節がある() {
         "check_health が IPC の記録を読んでいない（#1441）"
     );
     assert!(
-        src.contains("\"ipc\": ipc.as_ref().map(ipc_describe)"),
+        src.contains("\"ipc\": ipc.as_ref().map(|s| ipc_describe(s, lang))"),
         "check_health の応答に `ipc` 節が無い（#1441）"
     );
     assert!(

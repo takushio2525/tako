@@ -1072,8 +1072,14 @@ pub fn health_unavailable(message: &str) -> Value {
 /// 注入しない理由のうち、利用者の選択ではなく直す手がある（= check-health の指摘に出す）もの
 const HEALTH_FIXABLE_OFF: &[&str] = &["not_installed", "no_cli", "claude_too_old"];
 
-/// `claude_mod` 節から check-health の `issues` を組む（#1891。節の値を読むだけ）
+/// `claude_mod` 節から check-health の `issues` を組む（#1891。節の値を読むだけ。日本語）
 pub fn health_issues(section: &Value) -> Vec<Value> {
+    health_issues_in(section, Lang::Ja)
+}
+
+/// [`health_issues`] を表示言語で（#2365）。ペインごとの理由の行は節を組んだときの言語のまま
+/// （check-health は節も同じ表示言語で組む = `dispatch::collect_check_health_ctx`）
+pub fn health_issues_in(section: &Value, lang: Lang) -> Vec<Value> {
     let mut issues = Vec::new();
     if section["available"] != json!(true) {
         return issues;
@@ -1083,7 +1089,7 @@ pub fn health_issues(section: &Value) -> Vec<Value> {
         issues.push(json!({
             "level": "info",
             "check": "claude_mod",
-            "message": text::injection_line(section, Lang::Ja),
+            "message": text::injection_line(section, lang),
         }));
     }
     let lines: Vec<String> = section["panes"]
@@ -1098,11 +1104,11 @@ pub fn health_issues(section: &Value) -> Vec<Value> {
         issues.push(json!({
             "level": "info",
             "check": "claude_mod_no_report",
-            "message": format!(
-                "claude が動いているのに mod の報告が無いペインが {} 個（{}）。詳しくは tako mod",
-                lines.len(),
-                lines.join(" / ")
-            ),
+            "message": crate::HealthText::ModNoReport {
+                count: lines.len(),
+                lines: lines.join(" / "),
+            }
+            .text_in(lang),
         }));
     }
     issues

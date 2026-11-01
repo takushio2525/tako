@@ -262,8 +262,11 @@ fn check_healthのcli_in_pathは足すしかないなら置き場所で閉じる
     let injected = Path::new("/Applications/tako.app/Contents/MacOS");
     let mut failures = Vec::new();
     for (inj, want_level) in [(Some(injected), "info"), (None, "error")] {
-        let (level, message) =
-            setup_bootstrap::tako_cli_in_path_issue(inj, Some("$HOME/.local/bin".to_string()));
+        let (level, message) = setup_bootstrap::tako_cli_in_path_issue(
+            inj,
+            Some("$HOME/.local/bin".to_string()),
+            tako_core::i18n::Lang::Ja,
+        );
         if level != want_level
             || message.contains(LOOP_COMMAND)
             || !message.contains("$HOME/.local/bin をそのシェルの書き方で PATH へ足してください")
@@ -295,7 +298,7 @@ fn check_healthのcli_in_pathは足すしかないなら置き場所で閉じる
         ),
     ];
     for (inj, want_level, want) in before {
-        let got = setup_bootstrap::tako_cli_in_path_issue(inj, None);
+        let got = setup_bootstrap::tako_cli_in_path_issue(inj, None, tako_core::i18n::Lang::Ja);
         if got != (want_level, want.clone()) {
             failures.push(format!(
                 "{at}: 足すしかないのでないときの文が修正前と違う: {got:?}\n  修正前: ({want_level}) {want}"

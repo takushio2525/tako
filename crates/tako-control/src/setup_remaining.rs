@@ -32,6 +32,7 @@
 //!
 //! A/B は `TAKO_1501_LEGACY=1`（[`legacy_stop`] が #1501 前の exit 1 へ戻す）。
 
+use tako_core::i18n::Lang;
 use tako_core::platform::agent_install::AgentKind;
 
 use crate::setup_bootstrap::{self, Step};
@@ -66,26 +67,52 @@ pub enum RemainingKind {
 impl RemainingKind {
     /// 一覧に出す 1 行の見出し（**何が残っているか**）
     pub fn title(&self) -> String {
-        match self {
-            Self::AgentInstall(agent) => format!("{} の導入", agent.product()),
+        self.title_in(Lang::Ja)
+    }
+
+    /// [`Self::title`] を表示言語で（`tako setup --check` / check-health の残り作業。#2365。
+    /// `tako setup` の本体の末尾は日本語の口のまま）
+    pub fn title_in(&self, lang: Lang) -> String {
+        match (self, lang) {
+            (Self::AgentInstall(agent), Lang::Ja) => format!("{} の導入", agent.product()),
+            (Self::AgentInstall(agent), Lang::En) => format!("install {}", agent.product()),
             // 見出しは同じ（違うのは「次の 1 行」が無いことと理由の行 = #2564）
-            Self::AgentPath(agent) | Self::AgentPathByHand(agent) => {
+            (Self::AgentPath(agent) | Self::AgentPathByHand(agent), Lang::Ja) => {
                 format!(
                     "{} コマンドをどのターミナルからも使えるようにする",
                     agent.as_str()
                 )
             }
-            Self::AgentLogin(agent) => {
+            (Self::AgentPath(agent) | Self::AgentPathByHand(agent), Lang::En) => format!(
+                "make the {} command available from any terminal",
+                agent.as_str()
+            ),
+            (Self::AgentLogin(agent), Lang::Ja) => {
                 format!("{}へのログイン", setup_bootstrap::account_label(*agent))
             }
-            Self::AgentMissing => {
+            (Self::AgentLogin(agent), Lang::En) => format!(
+                "sign in to your {}",
+                setup_bootstrap::account_label_in(*agent, lang)
+            ),
+            (Self::AgentMissing, Lang::Ja) => {
                 "エージェント CLI（claude / codex / agy のいずれか）の導入".to_string()
             }
-            Self::AgentStatusUnknown => "エージェント CLI の導入状況の確認".to_string(),
-            Self::Mcp { agent } => format!("{agent} への tako MCP 登録"),
-            Self::Dep { bin } => format!("{bin} の導入"),
-            Self::ShellIntegration => {
+            (Self::AgentMissing, Lang::En) => {
+                "install an agent CLI (one of claude / codex / agy)".to_string()
+            }
+            (Self::AgentStatusUnknown, Lang::Ja) => "エージェント CLI の導入状況の確認".to_string(),
+            (Self::AgentStatusUnknown, Lang::En) => {
+                "check the setup state of the agent CLIs".to_string()
+            }
+            (Self::Mcp { agent }, Lang::Ja) => format!("{agent} への tako MCP 登録"),
+            (Self::Mcp { agent }, Lang::En) => format!("register the tako MCP with {agent}"),
+            (Self::Dep { bin }, Lang::Ja) => format!("{bin} の導入"),
+            (Self::Dep { bin }, Lang::En) => format!("install {bin}"),
+            (Self::ShellIntegration, Lang::Ja) => {
                 "シェル統合の配置（ペインの cwd 追従とコマンド実行状態）".to_string()
+            }
+            (Self::ShellIntegration, Lang::En) => {
+                "place the shell integration (pane cwd tracking and command state)".to_string()
             }
         }
     }
@@ -120,22 +147,36 @@ impl RemainingKind {
 
     /// 既定の理由・注意（段が固有の理由を持たないときに出す）
     pub fn default_detail(&self) -> Vec<String> {
-        match self {
-            Self::AgentLogin(_) => {
-                vec!["ブラウザでの操作が要るため tako は代行しません".to_string()]
+        self.default_detail_in(Lang::Ja)
+    }
+
+    /// [`Self::default_detail`] を表示言語で（#2365）
+    pub fn default_detail_in(&self, lang: Lang) -> Vec<String> {
+        let line = match (self, lang) {
+            (Self::AgentLogin(_), Lang::Ja) => "ブラウザでの操作が要るため tako は代行しません",
+            (Self::AgentLogin(_), Lang::En) => {
+                "tako does not do this for you because it needs the browser"
             }
-            Self::AgentMissing => {
-                vec!["どれか 1 つ入れてログインすれば master / worker が動きます".to_string()]
+            (Self::AgentMissing, Lang::Ja) => {
+                "どれか 1 つ入れてログインすれば master / worker が動きます"
             }
-            Self::Mcp { .. } => {
-                vec!["登録が無いと AI から tako の画面を操作できません".to_string()]
+            (Self::AgentMissing, Lang::En) => {
+                "install any one of them and sign in, and master / worker will work"
             }
-            Self::ShellIntegration => vec![
+            (Self::Mcp { .. }, Lang::Ja) => "登録が無いと AI から tako の画面を操作できません",
+            (Self::Mcp { .. }, Lang::En) => {
+                "without it, AI cannot operate the tako screen"
+            }
+            (Self::ShellIntegration, Lang::Ja) => {
                 "無くても tako は動きますが、ペインの cwd 追従・コマンド実行状態・入力予測が働きません"
-                    .to_string(),
-            ],
-            _ => Vec::new(),
-        }
+            }
+            (Self::ShellIntegration, Lang::En) => {
+                "tako works without it, but pane cwd tracking, command state, and input \
+                 suggestions do not"
+            }
+            _ => return Vec::new(),
+        };
+        vec![line.to_string()]
     }
 
     /// ゼロスタート導入の段（[`Step`]）から残り作業へ（**この写しが 1 実装**）。
@@ -190,7 +231,12 @@ pub struct Remaining {
 impl Remaining {
     /// 既定の理由で 1 件作る
     pub fn new(kind: RemainingKind) -> Self {
-        let detail = kind.default_detail();
+        Self::new_in(kind, Lang::Ja)
+    }
+
+    /// 既定の理由を表示言語で持つ 1 件（`--check` / check-health の診断。#2365）
+    pub fn new_in(kind: RemainingKind, lang: Lang) -> Self {
+        let detail = kind.default_detail_in(lang);
         Self { kind, detail }
     }
 
@@ -217,7 +263,12 @@ impl Remaining {
     /// 新しいタブなら引けるなら、新しいタブを開く 1 行を足す（`tako setup` の末尾と `--check` が
     /// 同じ 1 行を出すよう、添える判断はここ 1 か所）
     pub fn noting_state(self, state: &setup_bootstrap::BootstrapState) -> Self {
-        self.noting(setup_bootstrap::new_tab_note(state))
+        self.noting_state_in(state, Lang::Ja)
+    }
+
+    /// [`Self::noting_state`] を表示言語で（#2365）
+    pub fn noting_state_in(self, state: &setup_bootstrap::BootstrapState, lang: Lang) -> Self {
+        self.noting(setup_bootstrap::new_tab_note_in(state, lang))
     }
 
     /// [`Self::noting_state`] の本体（添える 1 行を引数で受ける**純粋関数**）
@@ -260,15 +311,24 @@ pub fn summarize(items: Vec<Remaining>) -> Vec<Remaining> {
 /// `tako setup` の末尾と `tako setup --check` の末尾が同じものを出す
 /// （CLI / MCP の 1:1 = 開発不変条件）。空なら 1 行も出さない
 pub fn render(items: &[Remaining]) -> Vec<String> {
+    render_in(items, Lang::Ja)
+}
+
+/// [`render`] を表示言語で（`tako setup --check` の末尾。#2365。`tako setup` の本体は日本語の口のまま）
+pub fn render_in(items: &[Remaining], lang: Lang) -> Vec<String> {
     if items.is_empty() {
         return Vec::new();
     }
+    let count = items.len();
     let mut out = vec![
         String::new(),
-        format!("残り {} 件（ここから先は人の操作が必要です）:", items.len()),
+        match lang {
+            Lang::Ja => format!("残り {} 件（ここから先は人の操作が必要です）:", count),
+            Lang::En => format!("{count} left (these need you from here on):"),
+        },
     ];
     for (index, item) in items.iter().enumerate() {
-        out.push(format!("  {}. {}", index + 1, item.kind.title()));
+        out.push(format!("  {}. {}", index + 1, item.kind.title_in(lang)));
         if let Some(command) = item.kind.command() {
             out.push(format!("     {command}"));
         }
@@ -276,9 +336,14 @@ pub fn render(items: &[Remaining]) -> Vec<String> {
             out.push(format!("     {line}"));
         }
     }
-    out.push(
-        "済んだら tako setup をもう一度実行してください（残りはここから再開します）".to_string(),
-    );
+    out.push(match lang {
+        Lang::Ja => {
+            "済んだら tako setup をもう一度実行してください（残りはここから再開します）".to_string()
+        }
+        Lang::En => {
+            "When done, run tako setup again (it resumes from the remaining items)".to_string()
+        }
+    });
     out
 }
 

@@ -56,9 +56,11 @@
 
 use serde_json::{json, Value};
 
+use tako_core::i18n::Lang;
 use tako_core::platform::agent_install::AgentKind;
 
 use crate::setup_remaining::{Remaining, RemainingKind};
+use crate::HealthText;
 
 /// 診断 1 件の重さ。表示のラベル（`[OK]` 等）と機械可読の語彙を 1 対 1 で持つ
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,16 +80,40 @@ pub enum Status {
 }
 
 impl Status {
-    /// 行頭の `[...]` に入れる語
+    const ALL: [Status; 6] = [
+        Self::Ok,
+        Self::Info,
+        Self::Optional,
+        Self::Detected,
+        Self::Missing,
+        Self::Warn,
+    ];
+
+    /// 行頭の `[...]` に入れる語（日本語）
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Ok => "OK",
-            Self::Info => "情報",
-            Self::Optional => "任意",
-            Self::Detected => "検出",
-            Self::Missing => "不足",
-            Self::Warn => "警告",
+        self.label_in(Lang::Ja)
+    }
+
+    /// 行頭の `[...]` に入れる語を表示言語で（#2365。英語は `tako setup` の段の `[warning]` と揃える）
+    pub fn label_in(self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (Self::Ok, _) => "OK",
+            (Self::Info, Lang::Ja) => "情報",
+            (Self::Info, Lang::En) => "info",
+            (Self::Optional, Lang::Ja) => "任意",
+            (Self::Optional, Lang::En) => "optional",
+            (Self::Detected, Lang::Ja) => "検出",
+            (Self::Detected, Lang::En) => "detected",
+            (Self::Missing, Lang::Ja) => "不足",
+            (Self::Missing, Lang::En) => "missing",
+            (Self::Warn, Lang::Ja) => "警告",
+            (Self::Warn, Lang::En) => "warning",
         }
+    }
+
+    /// `[ラベル]`（表示言語）
+    fn tag(self, lang: Lang) -> String {
+        format!("[{}]", self.label_in(lang))
     }
 
     /// 機械可読の語彙（`--json` / MCP がこちらを読む）
@@ -126,13 +152,18 @@ pub struct Item {
 }
 
 impl Item {
-    /// `  [ラベル] 要約` の 1 行だけを持つ項目
-    pub fn new(key: impl Into<String>, status: Status, summary: impl Into<String>) -> Self {
+    /// `  [ラベル] 要約` の 1 行だけを持つ項目（ラベルは表示言語 = #2365）
+    pub fn new(
+        key: impl Into<String>,
+        status: Status,
+        summary: impl Into<String>,
+        lang: Lang,
+    ) -> Self {
         let summary = summary.into();
         Self {
             key: key.into(),
             status,
-            lines: vec![format!("  [{}] {summary}", status.label())],
+            lines: vec![format!("  {} {summary}", status.tag(lang))],
             summary,
             remaining: Vec::new(),
         }
@@ -161,6 +192,12 @@ impl Item {
         self
     }
 
+    /// 改行で区切った複数の続きの行を足す
+    fn lines_of(mut self, text: &str) -> Self {
+        self.lines.extend(text.lines().map(str::to_string));
+        self
+    }
+
     /// 残り作業を足す
     pub fn remaining(mut self, remaining: Remaining) -> Self {
         self.remaining.push(remaining);
@@ -168,20 +205,25 @@ impl Item {
     }
 
     pub fn to_json(&self) -> Value {
+        self.to_json_in(Lang::Ja)
+    }
+
+    /// 項目の JSON（残り作業の見出しは表示言語。#2365）
+    pub fn to_json_in(&self, lang: Lang) -> Value {
         json!({
             "key": self.key,
             "status": self.status.as_str(),
             "summary": self.summary,
             "lines": self.lines,
-            "remaining": self.remaining.iter().map(remaining_json).collect::<Vec<_>>(),
+            "remaining": self.remaining.iter().map(|r| remaining_json(r, lang)).collect::<Vec<_>>(),
         })
     }
 }
 
 /// 残り作業 1 件を JSON へ（`--check` の末尾と同じ材料を機械可読にする）
-fn remaining_json(item: &Remaining) -> Value {
+fn remaining_json(item: &Remaining, lang: Lang) -> Value {
     json!({
-        "title": item.kind.title(),
+        "title": item.kind.title_in(lang),
         "command": item.kind.command(),
         "detail": item.detail,
     })
@@ -194,6 +236,8 @@ pub struct Report {
     /// 上限で打ち切った問い合わせ（#1503）。**確認できなかったことを黙らせない**。
     /// 人へは `agent_probe` が stderr へ出し、ここは AI / 機械が読む写し
     pub probe_timeouts: Vec<tako_core::probe::TimeoutNotice>,
+    /// 項目の文を組んだ表示言語（#2365。残り作業の見出しも同じ言語で出す）
+    pub lang: Lang,
 }
 
 impl Report {
@@ -225,13 +269,14 @@ impl Report {
 
     /// `check_health` の `diagnostics` 節
     pub fn to_json(&self) -> Value {
+        let lang = self.lang;
         let remaining = self.remaining();
         json!({
-            "items": self.items.iter().map(Item::to_json).collect::<Vec<_>>(),
+            "items": self.items.iter().map(|item| item.to_json_in(lang)).collect::<Vec<_>>(),
             "keys": self.keys(),
             "remaining": crate::setup_remaining::summarize(remaining)
                 .iter()
-                .map(remaining_json)
+                .map(|r| remaining_json(r, lang))
                 .collect::<Vec<_>>(),
             // #1503: 上限で打ち切った問い合わせ（`dispatch::SetupRun` の
             // `probe_timeouts` と同じ形）。空なら全部を確認できたということ
@@ -245,6 +290,9 @@ impl Report {
 
 /// 環境診断の全項目（**この 1 実装が正本**）。
 ///
+/// 文は呼んだ時点の表示言語（`tako_core::i18n::lang()`）で組む（#2365）。GUI（dispatch）はそのまま、
+/// GUI を通さない CLI（届かないときの check-health・`tako setup --check`）は呼ぶ前に表示言語を決める。
+///
 /// 重い（エージェント CLI へ問い合わせる）ので、UI スレッドから呼ばないこと。
 /// 外部プロセスを起こす問い合わせは重ねて走らせる（#1622。[`collect_with`]）。
 ///
@@ -253,6 +301,7 @@ impl Report {
 /// ここから先を辿れなくなり、問い合わせの先で上限なしの口を呼んでも見逃す
 #[allow(clippy::redundant_closure)]
 pub fn collect() -> Report {
+    let lang = tako_core::i18n::lang();
     // #2255: 認証の問い合わせは上限つきで、系統を並べて聞く（返らない CLI 1 つで診断ごと
     // 固まらないため）。A/B の旧経路は setup と同じ上限なしの 1 系統ずつ
     let bootstrap = || {
@@ -267,11 +316,11 @@ pub fn collect() -> Report {
         claude_mcp: &|| crate::agent_mcp::claude_health_now(),
         codex_mcp: &|| crate::agent_mcp::state(crate::orchestrator::agent::WorkerAgent::Codex),
         agy_mcp: &|| crate::agent_mcp::state(crate::orchestrator::agent::WorkerAgent::Agy),
-        deps: &|| dep_items(),
-        config_share: &|| config_share_item(),
-        tako_cli_path: &|| tako_cli_path_item(),
+        deps: &|| dep_items(lang),
+        config_share: &|| config_share_item(lang),
+        tako_cli_path: &|| tako_cli_path_item(lang),
     };
-    collect_with(&probes, probe_concurrency(issue1622_legacy()))
+    collect_with(&probes, probe_concurrency(issue1622_legacy()), lang)
 }
 
 // --- 外部の問い合わせを重ねる（#1622） ----------------------------------------
@@ -349,7 +398,7 @@ fn issue1622_legacy() -> bool {
 /// 繋ぐので一番長い = 実測 5.7 秒）。MCP の問い合わせは導入状況を待たずに始めるが、項目は今まで
 /// 通り「導入済みの系統だけ」出す（[`mcp_items`] の判定。未導入の系統の答えは捨てる）。
 /// 答えは種類ごとの置き場へ入るので、終わった順は項目の並びに響かない
-fn collect_with(probes: &Probes<'_>, concurrency: usize) -> Report {
+fn collect_with(probes: &Probes<'_>, concurrency: usize, lang: Lang) -> Report {
     let claude_mcp = Slot::new();
     let codex_mcp = Slot::new();
     let agy_mcp = Slot::new();
@@ -373,7 +422,7 @@ fn collect_with(probes: &Probes<'_>, concurrency: usize) -> Report {
         config_share: config_share.take(),
         tako_cli_path: tako_cli_path.take(),
     };
-    assemble(bootstrap, answers)
+    assemble(bootstrap, answers, lang)
 }
 
 /// 背景で走らせる問い合わせ 1 本（答えは自分の [`Slot`] へ置く）
@@ -431,7 +480,7 @@ impl<T> Slot<T> {
 }
 
 /// 採った答えから項目を組む（**問い合わせを 1 つも起こさない**。並びと判定は #1622 の前と同じ）
-fn assemble(bootstrap: BootstrapList, answers: Answers) -> Report {
+fn assemble(bootstrap: BootstrapList, answers: Answers, lang: Lang) -> Report {
     let mut items = Vec::new();
     let mut probe_timeouts = Vec::new();
     probe_timeouts.extend(
@@ -452,33 +501,38 @@ fn assemble(bootstrap: BootstrapList, answers: Answers) -> Report {
             }
         }
     }
-    items.extend(agent_cli_items(&bootstrap));
+    items.extend(agent_cli_items(&bootstrap, lang));
     items.push(answers.tako_cli_path);
-    items.push(shell_integration_item());
-    items.push(agents_detected_item(&bootstrap));
+    items.push(shell_integration_item(lang));
+    items.push(agents_detected_item(&bootstrap, lang));
     items.extend(answers.deps);
-    items.extend(fda_item());
-    items.extend(webview2_item(&tako_core::platform::webview2::runtime()));
+    items.extend(fda_item(lang));
+    items.extend(webview2_item(
+        &tako_core::platform::webview2::runtime(),
+        lang,
+    ));
     let (mcp, mcp_timeouts) = mcp_items(
         &bootstrap,
         answers.claude_mcp,
         &answers.codex_mcp,
         &answers.agy_mcp,
+        lang,
     );
     items.extend(mcp);
     probe_timeouts.extend(mcp_timeouts);
-    items.extend(agent_role_items(&bootstrap));
-    items.extend(setup_items());
-    items.extend(instruction_items(&bootstrap));
-    items.push(agents_sync_item());
-    items.extend(sleep_guard_items());
+    items.extend(agent_role_items(&bootstrap, lang));
+    items.extend(setup_items(lang));
+    items.extend(instruction_items(&bootstrap, lang));
+    items.push(agents_sync_item(lang));
+    items.extend(sleep_guard_items(lang));
     items.push(answers.config_share);
-    items.push(profiles_item());
-    items.push(remote_item());
-    items.push(ipc_item());
+    items.push(profiles_item(lang));
+    items.push(remote_item(lang));
+    items.push(ipc_item(lang));
     Report {
         items,
         probe_timeouts,
+        lang,
     }
 }
 
@@ -491,41 +545,41 @@ type BootstrapStates = [(
 
 /// 認証を確かめられなかった（問い合わせを上限で打ち切った）系統の 1 句（#2255）。
 /// 未認証と言うと「ログインし直す」へ人を送ってしまうので、**不明**と言い分ける
-fn auth_unknown(state: &crate::setup_bootstrap::BootstrapState) -> Option<String> {
-    state
-        .auth_timeout
-        .as_ref()
-        .map(|notice| format!("認証: 不明（{} 秒で応答なし）", notice.waited_secs))
+fn auth_unknown(state: &crate::setup_bootstrap::BootstrapState, lang: Lang) -> Option<String> {
+    state.auth_timeout.as_ref().map(|notice| {
+        HealthText::AuthUnknown {
+            secs: notice.waited_secs,
+        }
+        .text_in(lang)
+    })
 }
 
 /// 認証が不明なせいで段が「ログイン」に見えているか（段の判定は認証済みかどうかしか見ない）
-fn auth_step_unknown(state: &crate::setup_bootstrap::BootstrapState) -> Option<String> {
+fn auth_step_unknown(state: &crate::setup_bootstrap::BootstrapState, lang: Lang) -> Option<String> {
     (state.step == crate::setup_bootstrap::Step::Auth)
-        .then(|| auth_unknown(state))
+        .then(|| auth_unknown(state, lang))
         .flatten()
 }
 
 /// 段が「確かめられなかった」せいで決まっているときの 1 句。認証（#2255）に加えて、
 /// ログインシェルの打ち切り（実行ファイルの検出 = #1533・PATH の読み取り = #1532）で
 /// 「未導入」「PATH に無い」に見えている段も**不明**と言い分ける（導入や PATH の設定へ人を送らない）
-fn step_unknown(state: &crate::setup_bootstrap::BootstrapState) -> Option<String> {
+fn step_unknown(state: &crate::setup_bootstrap::BootstrapState, lang: Lang) -> Option<String> {
     use crate::setup_bootstrap::Step;
     if let Some(notice) = state.step_unconfirmed() {
-        let what = if state.step == Step::Install {
-            "導入"
-        } else {
-            "PATH"
-        };
-        return Some(format!(
-            "{what}: 不明（ログインシェルが {} 秒で応答なし）",
-            notice.waited_secs
-        ));
+        return Some(
+            HealthText::StepUnknown {
+                install: state.step == Step::Install,
+                secs: notice.waited_secs,
+            }
+            .text_in(lang),
+        );
     }
-    auth_step_unknown(state)
+    auth_step_unknown(state, lang)
 }
 
 /// 導入・PATH・ログインの段（`tako setup bootstrap status-all` と同じ材料）
-fn agent_cli_items(states: &BootstrapStates) -> Vec<Item> {
+fn agent_cli_items(states: &BootstrapStates, lang: Lang) -> Vec<Item> {
     use crate::setup_bootstrap::Step;
 
     let ready: Vec<&str> = states
@@ -538,8 +592,14 @@ fn agent_cli_items(states: &BootstrapStates) -> Vec<Item> {
     let unknown: Vec<String> = states
         .iter()
         .filter_map(|(agent, state)| {
-            let text = step_unknown(state.as_ref().ok()?)?;
-            Some(format!("{} の{text}", agent.as_str()))
+            let text = step_unknown(state.as_ref().ok()?, lang)?;
+            Some(
+                HealthText::AgentUnknown {
+                    agent: agent.as_str().to_string(),
+                    text,
+                }
+                .text_in(lang),
+            )
         })
         .collect();
     // **1 つでも ready なら tako は使える**ので、そこを最初に言う
@@ -547,76 +607,67 @@ fn agent_cli_items(states: &BootstrapStates) -> Vec<Item> {
         Item::new(
             "agent_cli",
             Status::Warn,
-            format!(
-                "エージェント CLI の導入: 使える系統を確かめられません（{}）",
-                unknown.join(" / ")
-            ),
+            HealthText::AgentCliUnconfirmed(unknown.join(" / ")).text_in(lang),
+            lang,
         )
     } else if ready.is_empty() {
         Item::new(
             "agent_cli",
             Status::Missing,
-            "エージェント CLI の導入: 使える系統がありません",
+            HealthText::AgentCliNone.text_in(lang),
+            lang,
         )
-        .line("         tako setup を実行すると、ここから最後まで案内します")
+        .line(HealthText::AgentCliNoneHint.text_in(lang))
     } else {
         Item::new(
             "agent_cli",
             Status::Ok,
-            format!(
-                "エージェント CLI の導入: 使える系統 {}（導入 / PATH / ログイン）",
-                ready.join(" / ")
-            ),
+            HealthText::AgentCliReady(ready.join(" / ")).text_in(lang),
+            lang,
         )
     };
     // 1 つも使える系統が無いときだけ、**一番短い道**を残り作業にする
     if ready.is_empty() && unknown.is_empty() {
-        if let Some(remaining) = shortest_bootstrap_remaining(states) {
+        if let Some(remaining) = shortest_bootstrap_remaining(states, lang) {
             head = head.remaining(remaining);
         }
     }
 
+    // 系統ごとの行は字下げを深くして親の項目の下に並べる
+    let sub_item = |key: String, status: Status, summary: String| {
+        let line = format!("         {} {summary}", status.tag(lang));
+        Item::from_text(key, status, summary, &line)
+    };
     let mut items = vec![head];
     for (agent, state) in states {
         let key = format!("agent_cli.{}", agent.as_str());
+        let name = agent.as_str().to_string();
         items.push(match state {
-            Ok(state) if state.step == Step::Ready => Item::from_text(
-                key,
-                Status::Ok,
-                format!("{}: 完了", agent.as_str()),
-                &format!("         [OK] {}: 完了", agent.as_str()),
-            ),
-            Ok(state) => match step_unknown(state) {
+            Ok(state) if state.step == Step::Ready => {
+                sub_item(key, Status::Ok, HealthText::AgentDone(name).text_in(lang))
+            }
+            Ok(state) => match step_unknown(state, lang) {
                 // 確かめられなかった（#2255 / #1532 / #1533）。「ログイン未完了」「未導入」と言うと
                 // 人をログインや導入へ送ってしまう
-                Some(text) => Item::from_text(
-                    key,
-                    Status::Warn,
-                    format!("{}: {text}", agent.as_str()),
-                    &format!("         [警告] {}: {text}", agent.as_str()),
-                ),
-                None => Item::from_text(
+                Some(text) => sub_item(key, Status::Warn, format!("{name}: {text}")),
+                None => sub_item(
                     key,
                     Status::Missing,
                     format!(
-                        "{}: {} ({})",
-                        agent.as_str(),
-                        state.step_description(),
-                        state.step.as_str()
-                    ),
-                    &format!(
-                        "         [不足] {}: {} ({})",
-                        agent.as_str(),
-                        state.step_description(),
+                        "{name}: {} ({})",
+                        state.step_description_in(lang),
                         state.step.as_str()
                     ),
                 ),
             },
-            Err(e) => Item::from_text(
+            Err(e) => sub_item(
                 key,
                 Status::Warn,
-                format!("{}: 確認できません（{e}）", agent.as_str()),
-                &format!("         [警告] {}: 確認できません（{e}）", agent.as_str()),
+                HealthText::AgentStatusUnreadable {
+                    agent: name,
+                    error: e.clone(),
+                }
+                .text_in(lang),
             ),
         });
     }
@@ -627,7 +678,7 @@ fn agent_cli_items(states: &BootstrapStates) -> Vec<Item> {
 ///
 /// どの系統を仕上げるかの判断は `setup_bootstrap::choose_target` の 1 実装
 /// （`tako setup` の bootstrap 段が実際に面倒を見る系統と同じもの）
-fn shortest_bootstrap_remaining(states: &BootstrapStates) -> Option<Remaining> {
+fn shortest_bootstrap_remaining(states: &BootstrapStates, lang: Lang) -> Option<Remaining> {
     if states.is_empty() {
         return None;
     }
@@ -645,20 +696,16 @@ fn shortest_bootstrap_remaining(states: &BootstrapStates) -> Option<Remaining> {
             crate::setup_bootstrap::path_by_hand(state),
         )
         .map(|kind| match kind {
+            // 診断は check-health と `--check` が同じ文を出す正本（#1505）。どちらも表示言語で組む（#2365）
             RemainingKind::AgentPathByHand(agent) => {
-                // 診断は check-health と `--check` が同じ文を出す正本（#1505）。2 つは表示言語の
-                // 決め方が違う（`tako setup` は settings.json・check-health は解決しない）ので、
-                // ほかの項目（`summary_in(Lang::Ja)`）と同じく言語を固定して組む
                 match crate::setup_bootstrap::path_by_hand_refusal() {
-                    Some(refusal) => {
-                        Remaining::path_by_hand(agent, &refusal, tako_core::i18n::Lang::Ja)
-                    }
-                    None => Remaining::new(kind),
+                    Some(refusal) => Remaining::path_by_hand(agent, &refusal, lang),
+                    None => Remaining::new_in(kind, lang),
                 }
             }
-            kind => Remaining::new(kind),
+            kind => Remaining::new_in(kind, lang),
         })
-        .map(|item| item.noting_state(state)),
+        .map(|item| item.noting_state_in(state, lang)),
         Some(Err(e)) => Some(Remaining::with_detail(
             RemainingKind::AgentStatusUnknown,
             vec![e.clone()],
@@ -668,7 +715,7 @@ fn shortest_bootstrap_remaining(states: &BootstrapStates) -> Option<Remaining> {
 }
 
 /// 検出できた CLI の一覧（パス / 認証 / プラン）。判定は `status_all` の 1 実装から引く
-fn agents_detected_item(states: &BootstrapStates) -> Item {
+fn agents_detected_item(states: &BootstrapStates, lang: Lang) -> Item {
     let detected: Vec<(AgentKind, &crate::setup_bootstrap::BootstrapState)> = states
         .iter()
         .filter_map(|(agent, state)| state.as_ref().ok().map(|s| (*agent, s)))
@@ -686,6 +733,7 @@ fn agents_detected_item(states: &BootstrapStates) -> Item {
                 .then_some((*agent, notice.waited_secs))
         })
         .collect();
+    let heading = HealthText::AgentsHeading.text_in(lang);
     if detected.is_empty() && !unconfirmed.is_empty() {
         let names: Vec<&str> = unconfirmed.iter().map(|(a, _)| a.as_str()).collect();
         let secs = unconfirmed
@@ -693,36 +741,45 @@ fn agents_detected_item(states: &BootstrapStates) -> Item {
             .map(|(_, s)| *s)
             .max()
             .unwrap_or_default();
-        let text = format!(
-            "{} を確かめられません（ログインシェルが {secs} 秒で応答なし）",
-            names.join(" / ")
-        );
+        let text = HealthText::AgentsUnconfirmed {
+            names: names.join(" / "),
+            secs,
+        }
+        .text_in(lang);
         return Item::from_text(
             "agents_detected",
             Status::Warn,
             text.clone(),
-            &format!("  エージェント CLI:\n    [警告] {text}"),
+            &format!("{heading}\n    {} {text}", Status::Warn.tag(lang)),
         )
-        .line("      .zprofile などのログインシェルの設定が入力を待っていないか確かめてください");
+        .line(format!(
+            "      {}",
+            HealthText::LoginShellWaitHint.text_in(lang)
+        ));
     }
     if detected.is_empty() {
+        let text = HealthText::AgentsNoneFound.text_in(lang);
         let mut item = Item::from_text(
             "agents_detected",
             Status::Missing,
-            "claude / codex / agy のいずれも見つかりません",
-            "  エージェント CLI:\n    [不足] claude / codex / agy のいずれも見つかりません",
+            text.clone(),
+            &format!("{heading}\n    {} {text}", Status::Missing.tag(lang)),
         );
         for agent in crate::setup_bootstrap::bootstrap_agents() {
-            item = item.line(format!("      {}: {}", agent.as_str(), install_hint(agent)));
+            item = item.line(format!(
+                "      {}: {}",
+                agent.as_str(),
+                install_hint(agent, lang)
+            ));
         }
-        return item.remaining(Remaining::new(RemainingKind::AgentMissing));
+        return item.remaining(Remaining::new_in(RemainingKind::AgentMissing, lang));
     }
     let names: Vec<&str> = detected.iter().map(|(agent, _)| agent.as_str()).collect();
     let mut item = Item::from_text(
         "agents_detected",
         Status::Detected,
-        format!("検出: {}", names.join(" / ")),
-        "  エージェント CLI:",
+        HealthText::AgentsDetected(names.join(" / ")).text_in(lang),
+        &heading,
     );
     for (agent, state) in detected {
         let path = state
@@ -731,41 +788,55 @@ fn agents_detected_item(states: &BootstrapStates) -> Item {
             .map(tako_core::paths::shorten_home)
             .unwrap_or_default();
         // 認証を確かめられなかったら、プランも同じ問い合わせから読むので並べない（#2255）
-        let auth = auth_unknown(state).unwrap_or_else(|| {
+        let auth = auth_unknown(state, lang).unwrap_or_else(|| {
             let auth = if state.authenticated {
-                "認証済み"
+                HealthText::SignedIn
             } else {
-                "未認証"
-            };
-            let plan = state.account_plan.as_deref().unwrap_or("プラン不明");
+                HealthText::SignedOut
+            }
+            .text_in(lang);
+            let plan = state
+                .account_plan
+                .clone()
+                .unwrap_or_else(|| HealthText::PlanUnknown.text_in(lang));
             format!("{auth} / {plan}")
         });
-        item = item.line(format!("    [検出] {}: {path}（{auth}）", agent.as_str()));
+        item = item.line(
+            HealthText::AgentDetectedLine {
+                agent: agent.as_str().to_string(),
+                path,
+                auth,
+            }
+            .text_in(lang),
+        );
     }
     for (agent, secs) in unconfirmed {
-        item = item.line(format!(
-            "    [警告] {}: 確かめられません（ログインシェルが {secs} 秒で応答なし）",
-            agent.as_str()
-        ));
+        item = item.line(
+            HealthText::AgentUnconfirmedLine {
+                agent: agent.as_str().to_string(),
+                secs,
+            }
+            .text_in(lang),
+        );
     }
     item
 }
 
 /// 導入の案内 1 行（正本は境界 B17 = `platform::agent_install`。#989 / #322）
-fn install_hint(agent: AgentKind) -> String {
+fn install_hint(agent: AgentKind, lang: Lang) -> String {
     let guidance = crate::orchestrator::agent_cli::guidance(agent.into());
     match (guidance.command, guidance.docs_url) {
         (Some(cmd), _) => cmd.to_string(),
         (None, Some(url)) => url.to_string(),
         (None, None) => guidance
             .manual
-            .map(|m| m.text().to_string())
+            .map(|m| m.text_in(lang).to_string())
             .unwrap_or_default(),
     }
 }
 
 /// master を任せられるか / worker 専用かの申告（#989）
-fn agent_role_items(states: &BootstrapStates) -> Vec<Item> {
+fn agent_role_items(states: &BootstrapStates, lang: Lang) -> Vec<Item> {
     let installed = |kind: AgentKind| {
         states.iter().any(|(agent, state)| {
             *agent == kind && state.as_ref().is_ok_and(|s| s.binary.is_some())
@@ -776,14 +847,16 @@ fn agent_role_items(states: &BootstrapStates) -> Vec<Item> {
         items.push(Item::new(
             "agent_role.codex",
             Status::Ok,
-            "Codex: master 起動時にも一時注入",
+            HealthText::RoleCodex.text_in(lang),
+            lang,
         ));
     }
     if installed(AgentKind::Agy) {
         items.push(Item::new(
             "agent_role.agy",
             Status::Info,
-            "agy: worker 専用（master は非対応）",
+            HealthText::RoleAgy.text_in(lang),
+            lang,
         ));
     }
     items
@@ -791,14 +864,14 @@ fn agent_role_items(states: &BootstrapStates) -> Vec<Item> {
 
 // --- tako CLI の PATH（#1502）/ シェル統合（#1504） -------------------------
 
-fn tako_cli_path_item() -> Item {
-    let text = crate::setup_bootstrap::tako_cli_path_check_line();
+fn tako_cli_path_item(lang: Lang) -> Item {
+    let text = crate::setup_bootstrap::tako_cli_path_check_line(lang);
     let status = status_from_line(&text);
     Item::from_text("tako_cli_path", status, summary_of(&text), &text)
 }
 
-fn shell_integration_item() -> Item {
-    let text = crate::shell_integration::check_line();
+fn shell_integration_item(lang: Lang) -> Item {
+    let text = crate::shell_integration::check_line(lang);
     let status = status_from_line(&text);
     let mut item = Item::from_text("shell_integration", status, summary_of(&text), &text);
     if let Some(remaining) = crate::shell_integration::check_remaining() {
@@ -807,19 +880,15 @@ fn shell_integration_item() -> Item {
     item
 }
 
-/// 他所が組んだ 1 行目の `[ラベル]` から重さを読む（文面の正本を 2 つにしないため）
+/// 他所が組んだ 1 行目の `[ラベル]` から重さを読む（文面の正本を 2 つにしないため）。
+/// ラベルは日英のどちらでも読む（行は表示言語で組まれる = #2365）
 fn status_from_line(text: &str) -> Status {
     let head = text.lines().next().unwrap_or_default();
-    for status in [
-        Status::Ok,
-        Status::Info,
-        Status::Optional,
-        Status::Detected,
-        Status::Missing,
-        Status::Warn,
-    ] {
-        if head.contains(&format!("[{}]", status.label())) {
-            return status;
+    for status in Status::ALL {
+        for lang in [Lang::Ja, Lang::En] {
+            if head.contains(&status.tag(lang)) {
+                return status;
+            }
         }
     }
     // `[設置]` `[legacy]` 等（段が実行された形）は「整っている」側へ倒す
@@ -840,7 +909,7 @@ fn summary_of(text: &str) -> String {
 /// 依存ツール 1 件ごとの状態。**案内の文面は `setup_deps` の 1 実装が持つ**ので、
 /// 読み取り専用の文脈（`CheckOnly`）でそこを呼んで出力を受け取る
 /// （呼び手が案内を組み直すと `tako setup` と `--check` で文面が割れる = #1509）
-fn dep_items() -> Vec<Item> {
+fn dep_items(lang: Lang) -> Vec<Item> {
     crate::setup_deps::status()
         .into_iter()
         .map(|state| {
@@ -848,36 +917,47 @@ fn dep_items() -> Vec<Item> {
             let key = format!("dep.{}", dep.bin);
             // 在るが動かない（tailscale の `--version` が固まる / 非 0。#1816）= 壊れている。
             // 任意依存なので残り作業には数えない（`tako setup` の依存段と同じ文面・同じ扱い）
-            if let Some(text) = state.unrunnable_text() {
-                return Item::new(key, Status::Warn, text)
-                    .line(format!("      {}", crate::tailscale::UNRUNNABLE_HINT));
+            if let Some(text) = state.unrunnable_text_in(lang) {
+                return Item::new(key, Status::Warn, text, lang).line(format!(
+                    "      {}",
+                    crate::tailscale::unrunnable_hint_in(lang)
+                ));
             }
             if let Some(path) = &state.found {
-                return Item::new(key, Status::Ok, format!("{}: {path}", dep.bin));
+                return Item::new(key, Status::Ok, format!("{}: {path}", dep.bin), lang);
             }
             // 検出を上限で打ち切った（#1533）。「見つかりません」とも導入の案内とも言わない
-            if let Some(text) = state.unconfirmed_text() {
-                return Item::new(key, Status::Warn, text).line(
-                    "      .zprofile などのログインシェルの設定が入力を待っていないか確かめてください",
-                );
+            if let Some(text) = state.unconfirmed_text_in(lang) {
+                return Item::new(key, Status::Warn, text, lang).line(format!(
+                    "      {}",
+                    HealthText::LoginShellWaitHint.text_in(lang)
+                ));
             }
-            let (mark, kind) = if dep.required {
-                (Status::Missing, "必須")
+            let mark = if dep.required {
+                Status::Missing
             } else {
-                (Status::Optional, "任意")
+                Status::Optional
             };
-            let mut item = Item::new(key, mark, format!("{}: 見つかりません（{kind}）", dep.bin))
-                .line(format!("      用途: {}", dep.purpose));
-            if !dep.required {
-                item = item.line("      無くても tako 自体は動きますが、上記の機能が使えません");
+            let summary = HealthText::DepNotFound {
+                bin: dep.bin.to_string(),
+                required: dep.required,
             }
-            for line in dep_guide_lines(&state) {
+            .text_in(lang);
+            let mut item = Item::new(key, mark, summary, lang)
+                .line(HealthText::DepPurpose(dep.purpose.text_in(lang).to_string()).text_in(lang));
+            if !dep.required {
+                item = item.line(HealthText::DepOptionalNote.text_in(lang));
+            }
+            for line in dep_guide_lines(&state, lang) {
                 item = item.line(line);
             }
             if dep.required {
-                item = item.remaining(Remaining::new(RemainingKind::Dep {
-                    bin: dep.bin.to_string(),
-                }));
+                item = item.remaining(Remaining::new_in(
+                    RemainingKind::Dep {
+                        bin: dep.bin.to_string(),
+                    },
+                    lang,
+                ));
             }
             item
         })
@@ -885,7 +965,7 @@ fn dep_items() -> Vec<Item> {
 }
 
 /// 読み取りだけの文脈で `setup_deps` が出す案内行（**導入は 1 つも起こさない**）
-fn dep_guide_lines(state: &crate::setup_deps::DepStatus) -> Vec<String> {
+fn dep_guide_lines(state: &crate::setup_deps::DepStatus, lang: Lang) -> Vec<String> {
     let ctx = crate::setup_deps::DepOfferContext {
         // `--check` は読み取り専用（`offer_for` が `CheckOnly` へ倒す唯一の条件）
         stage_installs: false,
@@ -903,6 +983,7 @@ fn dep_guide_lines(state: &crate::setup_deps::DepStatus) -> Vec<String> {
             writer: &mut buffer,
             reader: &mut reader,
             indent: "      ",
+            lang,
         },
     );
     debug_assert!(
@@ -918,28 +999,26 @@ fn dep_guide_lines(state: &crate::setup_deps::DepStatus) -> Vec<String> {
 // --- フルディスクアクセス（macOS） ------------------------------------------
 
 #[cfg(target_os = "macos")]
-fn fda_item() -> Vec<Item> {
+fn fda_item(lang: Lang) -> Vec<Item> {
     if crate::fda::is_granted() {
         return vec![Item::new(
             "fda",
             Status::Ok,
-            "フルディスクアクセス: 付与済み（許可ダイアログは表示されません）",
+            HealthText::FdaGranted.text_in(lang),
+            lang,
         )];
     }
     vec![Item::new(
         "fda",
         Status::Optional,
-        "フルディスクアクセス: 未付与（推奨）",
+        HealthText::FdaNotGranted.text_in(lang),
+        lang,
     )
-    .line("      macOS が「tako.app から、ほかのアプリからのデータへのアクセス権を")
-    .line("      求められています」と頻繁に表示する原因です。フルディスクアクセスを")
-    .line("      付与すると、このダイアログが出なくなります。")
-    .line("      設定方法: システム設定 → プライバシーとセキュリティ → フルディスクアクセス → tako を追加")
-    .line("      付与方法: tako fda open でシステム設定を開き、tako を追加してください")]
+    .lines_of(&HealthText::FdaNotGrantedDetail.text_in(lang))]
 }
 
 #[cfg(not(target_os = "macos"))]
-fn fda_item() -> Vec<Item> {
+fn fda_item(_lang: Lang) -> Vec<Item> {
     Vec::new()
 }
 
@@ -947,16 +1026,15 @@ fn fda_item() -> Vec<Item> {
 
 /// WebView2 ランタイムの版（Windows だけ。macOS は対象外 = 項目を出さない）。
 /// 判定と文言は `platform::webview2` の 1 実装（check-health の `webview2` 節と同じ材料）
-fn webview2_item(runtime: &tako_core::platform::webview2::Runtime) -> Option<Item> {
-    use tako_core::i18n::Lang;
-    let summary = runtime.summary_in(Lang::Ja)?;
+fn webview2_item(runtime: &tako_core::platform::webview2::Runtime, lang: Lang) -> Option<Item> {
+    let summary = runtime.summary_in(lang)?;
     let status = match runtime.state() {
         "missing" => Status::Missing,
         "outdated" => Status::Warn,
         _ => Status::Ok,
     };
-    let item = Item::new("webview2", status, summary);
-    Some(match runtime.next_step_in(Lang::Ja) {
+    let item = Item::new("webview2", status, summary, lang);
+    Some(match runtime.next_step_in(lang) {
         Some(step) => item.line(format!("      {step}")),
         None => item,
     })
@@ -972,6 +1050,7 @@ fn mcp_items(
     claude: ClaudeMcp,
     codex: &crate::agent_mcp::McpState,
     agy: &crate::agent_mcp::McpState,
+    lang: Lang,
 ) -> (Vec<Item>, Vec<tako_core::probe::TimeoutNotice>) {
     use crate::agent_mcp::McpState;
     use crate::orchestrator::agent::WorkerAgent;
@@ -981,6 +1060,7 @@ fn mcp_items(
             *agent == kind && state.as_ref().is_ok_and(|s| s.binary.is_some())
         })
     };
+    let text = |t: HealthText| t.text_in(lang);
     let mut items = Vec::new();
     let mut timeouts = Vec::new();
     // claude だけ登録の読み方が違う（`dispatch::setup_mcp` が書き手なので
@@ -989,44 +1069,56 @@ fn mcp_items(
         // 打ち切りの知らせも受け取る（#1503。確認できなかったことを黙らせない）
         let (registered, healthy, notice) = claude;
         let key = "mcp.claude";
+        let name = || "Claude".to_string();
         // 問い合わせ（実行ファイルの検出 = #1533 / `claude mcp list` = #1503）を打ち切って
         // 登録を読めなかった。未登録ではなく確かめられなかったので、登録し直しへ人を送らない
         let unconfirmed = notice.clone().filter(|_| !registered);
         timeouts.extend(notice);
         let item = if registered && healthy {
-            Item::new(key, Status::Ok, "Claude MCP: tako が登録済み")
+            Item::new(
+                key,
+                Status::Ok,
+                text(HealthText::McpRegistered(name())),
+                lang,
+            )
         } else if registered {
             let mut item = Item::new(
                 key,
                 Status::Warn,
-                "Claude MCP: 登録済みだがパスが消失しています",
+                text(HealthText::McpPathGone(name())),
+                lang,
             );
             if let Some(cmd) = crate::agent_mcp::claude_registered_command() {
-                item = item.line(format!("         登録パス: {cmd}"));
+                item = item.line(text(HealthText::McpRegisteredPath(cmd)));
             }
-            item.line("         tako setup または tako setup-mcp で修復できます")
+            item.line(text(HealthText::McpRepairHint))
         } else if let Some(n) = &unconfirmed {
             Item::new(
                 key,
                 Status::Warn,
-                format!(
-                    "Claude MCP: 登録状態を確認できません（{} が {} 秒で応答なし）",
-                    n.label, n.waited_secs
-                ),
+                text(HealthText::McpClaudeUnconfirmed {
+                    label: n.label.clone(),
+                    secs: n.waited_secs,
+                }),
+                lang,
             )
         } else {
             Item::new(
                 key,
                 Status::Missing,
-                "Claude MCP: tako が未登録（tako setup-mcp で登録できます）",
+                text(HealthText::McpNotRegistered(name())),
+                lang,
             )
         };
         items.push(if (registered && healthy) || unconfirmed.is_some() {
             item
         } else {
-            item.remaining(Remaining::new(RemainingKind::Mcp {
-                agent: "claude".to_string(),
-            }))
+            item.remaining(Remaining::new_in(
+                RemainingKind::Mcp {
+                    agent: "claude".to_string(),
+                },
+                lang,
+            ))
         });
     }
     for (kind, agent, state) in [
@@ -1039,41 +1131,51 @@ fn mcp_items(
         let name = agent.as_str();
         let key = format!("mcp.{name}");
         let mut item = match state {
-            McpState::Ready { .. } => {
-                Item::new(key, Status::Ok, format!("{name} MCP: tako が登録済み"))
-            }
+            McpState::Ready { .. } => Item::new(
+                key,
+                Status::Ok,
+                text(HealthText::McpRegistered(name.to_string())),
+                lang,
+            ),
             McpState::Dead { command } => Item::new(
                 key,
                 Status::Warn,
-                format!("{name} MCP: 登録済みだがパスが消失しています"),
+                text(HealthText::McpPathGone(name.to_string())),
+                lang,
             )
-            .line(format!("         登録パス: {command}"))
-            .line("         tako setup または tako setup-mcp で修復できます"),
+            .line(text(HealthText::McpRegisteredPath(command.clone())))
+            .line(text(HealthText::McpRepairHint)),
             // 登録行はあるのに env の転送が無い = ツールが 0 個になる（#979 の実測）。
             // 「未登録」と混ぜると原因を追えないので別の文言にする
             McpState::EnvMissing { .. } => Item::new(
                 key,
                 Status::Warn,
-                format!("{name} MCP: 登録済みだが tako と通信する env の転送設定がありません"),
+                text(HealthText::McpEnvMissing(name.to_string())),
+                lang,
             )
-            .line("         そのままだとツールが 0 個になります")
-            .line(format!("         tako setup-mcp --agent {name} で入れ直せます")),
+            .line(text(HealthText::McpNoTools))
+            .line(text(HealthText::McpReinstall(name.to_string()))),
             McpState::NotRegistered => Item::new(
                 key,
                 Status::Missing,
-                format!("{name} MCP: tako が未登録（tako setup-mcp で登録できます）"),
+                text(HealthText::McpNotRegistered(name.to_string())),
+                lang,
             ),
             // CLI は検出できているので Unknown は「一覧を読めなかった」だけ
             McpState::Unknown => Item::new(
                 key,
                 Status::Warn,
-                format!("{name} MCP: 登録状態を確認できません（{name} mcp list を手で確認してください）"),
+                text(HealthText::McpUnknown(name.to_string())),
+                lang,
             ),
         };
         if state.describe_gap().is_some() {
-            item = item.remaining(Remaining::new(RemainingKind::Mcp {
-                agent: name.to_string(),
-            }));
+            item = item.remaining(Remaining::new_in(
+                RemainingKind::Mcp {
+                    agent: name.to_string(),
+                },
+                lang,
+            ));
         }
         items.push(item);
     }
@@ -1082,51 +1184,58 @@ fn mcp_items(
 
 // --- セットアップ本体と追従（#94） ------------------------------------------
 
-fn setup_items() -> Vec<Item> {
+fn setup_items(lang: Lang) -> Vec<Item> {
+    let text = |t: HealthText| t.text_in(lang);
     let Ok(config_path) = crate::setup::config_yaml_path() else {
         return vec![
-            Item::new(
-                "setup",
-                Status::Info,
-                "config.yaml: 置き場を特定できません（HOME が未設定）",
-            ),
-            update_item_unapplied(),
+            Item::new("setup", Status::Info, text(HealthText::ConfigNoHome), lang),
+            update_item_unapplied(lang),
         ];
     };
     if !config_path.is_file() {
         return vec![
-            Item::new("setup", Status::Info, "config.yaml: 未作成"),
-            update_item_unapplied(),
+            Item::new(
+                "setup",
+                Status::Info,
+                text(HealthText::ConfigNotCreated),
+                lang,
+            ),
+            update_item_unapplied(lang),
         ];
     }
-    let config = match crate::setup::load_config() {
+    // 読めない理由も表示言語で（型の口 = `SetupRefusal`。日本語は従来の `load_config` と同じ文）
+    let config = match crate::setup::load_config_typed() {
         Ok(config) => config,
         Err(e) => {
             return vec![
                 Item::new(
                     "setup",
                     Status::Warn,
-                    format!("config.yaml: 読めません（{e}）"),
+                    text(HealthText::ConfigUnreadable(e.text_in(lang))),
+                    lang,
                 ),
-                update_item_unapplied(),
+                update_item_unapplied(lang),
             ]
         }
     };
     if !config.setup.completed {
         return vec![
-            Item::new("setup", Status::Info, "セットアップ: 未完了"),
+            Item::new(
+                "setup",
+                Status::Info,
+                text(HealthText::SetupIncomplete),
+                lang,
+            ),
             // **項目を落とさない**（#1505）: 「いま何リビジョンか」は未実施でも答えられる。
             // ここで消すと状態によって項目の集合が変わり、機械照合が成り立たない
-            update_item_unapplied(),
+            update_item_unapplied(lang),
         ];
     }
     let mut items = vec![Item::new(
         "setup",
         Status::Ok,
-        format!(
-            "セットアップ: 完了済み ({})",
-            config.setup.completed_at.as_deref().unwrap_or("日時不明")
-        ),
+        text(HealthText::SetupDone(config.setup.completed_at.clone())),
+        lang,
     )];
     // アップデート追従状況（Issue #94）
     items.push(
@@ -1134,23 +1243,20 @@ fn setup_items() -> Vec<Item> {
             Ok(pending) if pending.is_empty() => Item::new(
                 "update",
                 Status::Ok,
-                format!(
-                    "アップデート追従: 最新（rev {}）",
-                    config.setup.applied_revision
-                ),
+                text(HealthText::UpdateLatest(config.setup.applied_revision)),
+                lang,
             ),
             Ok(pending) => Item::new(
                 "update",
                 Status::Info,
-                format!(
-                    "アップデート追従: 未適用の setup 変更が {} 件（tako setup --changes で詳細）",
-                    pending.len()
-                ),
+                text(HealthText::UpdatePending(pending.len())),
+                lang,
             ),
             Err(e) => Item::new(
                 "update",
                 Status::Warn,
-                format!("アップデート追従: 確認できません（{e}）"),
+                text(HealthText::UpdateUnknown(e)),
+                lang,
             ),
         },
     );
@@ -1158,7 +1264,8 @@ fn setup_items() -> Vec<Item> {
         items.push(Item::new(
             "setup.agent",
             Status::Ok,
-            format!("既定エージェント: {agent}"),
+            text(HealthText::DefaultAgent(agent.to_string())),
+            lang,
         ));
     }
     if !config.setup.provider_plans.is_empty() {
@@ -1172,31 +1279,34 @@ fn setup_items() -> Vec<Item> {
         items.push(Item::new(
             "setup.plans",
             Status::Ok,
-            format!("申告・検出プラン: {plans}"),
+            text(HealthText::Plans(plans)),
+            lang,
         ));
     }
     items
 }
 
 /// まだ setup を通していないときの追従行（**項目は落とさない**）
-fn update_item_unapplied() -> Item {
+fn update_item_unapplied(lang: Lang) -> Item {
     match crate::setup::current_revision() {
         Ok(current) => Item::new(
             "update",
             Status::Info,
-            format!("アップデート追従: 未適用（現在の setup リビジョンは {current}）"),
+            HealthText::UpdateUnapplied(current).text_in(lang),
+            lang,
         ),
         Err(e) => Item::new(
             "update",
             Status::Warn,
-            format!("アップデート追従: 確認できません（{e}）"),
+            HealthText::UpdateUnknown(e).text_in(lang),
+            lang,
         ),
     }
 }
 
 // --- グローバル指示ファイル -------------------------------------------------
 
-fn instruction_items(states: &BootstrapStates) -> Vec<Item> {
+fn instruction_items(states: &BootstrapStates, lang: Lang) -> Vec<Item> {
     states
         .iter()
         .filter(|(_, state)| state.as_ref().is_ok_and(|s| s.binary.is_some()))
@@ -1205,9 +1315,19 @@ fn instruction_items(states: &BootstrapStates) -> Vec<Item> {
             let display = tako_core::paths::shorten_home(&path.to_string_lossy());
             let key = format!("instructions.{}", agent.as_str());
             Some(if path.is_file() {
-                Item::new(key, Status::Ok, format!("{display}: 存在します"))
+                Item::new(
+                    key,
+                    Status::Ok,
+                    HealthText::InstructionsExist(display).text_in(lang),
+                    lang,
+                )
             } else {
-                Item::new(key, Status::Info, format!("{display}: 未作成"))
+                Item::new(
+                    key,
+                    Status::Info,
+                    HealthText::InstructionsMissing(display).text_in(lang),
+                    lang,
+                )
             })
         })
         .collect()
@@ -1235,47 +1355,33 @@ fn codex_home_dir() -> Option<std::path::PathBuf> {
 
 // --- エージェント共通ルール同期（#136） --------------------------------------
 
-fn agents_sync_item() -> Item {
+fn agents_sync_item(lang: Lang) -> Item {
     let key = "agents_sync";
+    let item = |status: Status, t: HealthText| Item::new(key, status, t.text_in(lang), lang);
     match crate::agents_sync::status() {
         Ok(status) => {
             let st = status["status"].as_str().unwrap_or("unknown");
             match st {
-                "not_configured" => {
-                    Item::new(key, Status::Info, "エージェント共通ルール同期: 未設定")
-                }
-                "up_to_date" => Item::new(key, Status::Ok, "エージェント共通ルール同期: 最新"),
-                "outdated" => Item::new(
-                    key,
-                    Status::Info,
-                    "エージェント共通ルール同期: ずれあり（tako agents sync-rules で同期）",
-                ),
+                "not_configured" => item(Status::Info, HealthText::SyncNotConfigured),
+                "up_to_date" => item(Status::Ok, HealthText::SyncUpToDate),
+                "outdated" => item(Status::Info, HealthText::SyncOutdated),
                 "source_missing" => {
                     let path = status["source_path"].as_str().unwrap_or("?");
-                    Item::new(
-                        key,
+                    item(
                         Status::Missing,
-                        format!("エージェント共通ルール同期: 正本が見つからない ({path})"),
+                        HealthText::SyncSourceMissing(path.to_string()),
                     )
                 }
-                other => Item::new(
-                    key,
-                    Status::Warn,
-                    format!("エージェント共通ルール同期: {other}"),
-                ),
+                other => item(Status::Warn, HealthText::SyncOther(other.to_string())),
             }
         }
-        Err(e) => Item::new(
-            key,
-            Status::Info,
-            format!("エージェント共通ルール同期: 確認失敗 ({e})"),
-        ),
+        Err(e) => item(Status::Info, HealthText::SyncFailed(e)),
     }
 }
 
 // --- スリープ防止（#173 / #524） --------------------------------------------
 
-fn sleep_guard_items() -> Vec<Item> {
+fn sleep_guard_items(lang: Lang) -> Vec<Item> {
     use crate::sleep_guard::{LidSleepMode, SleepGuardMode};
 
     let settings = crate::settings::load();
@@ -1285,45 +1391,40 @@ fn sleep_guard_items() -> Vec<Item> {
         SleepGuardMode::Off => Item::new(
             "sleep_guard",
             Status::Info,
-            "スリープ防止: 無効（tako sleep-guard set --mode while-agents-running で有効化）",
+            HealthText::SleepOff.text_in(lang),
+            lang,
         ),
         _ => Item::new(
             "sleep_guard",
             Status::Ok,
-            format!(
-                "スリープ防止: mode={}, power={}",
-                mode.as_str(),
-                power.as_str()
-            ),
+            HealthText::SleepOn {
+                mode: mode.as_str().to_string(),
+                power: power.as_str().to_string(),
+            }
+            .text_in(lang),
+            lang,
         ),
     }];
     // 蓋閉じ継続を持たない OS では案内しない（#524）
     if crate::sleep_guard::lid_control_supported() {
         // 未完了かどうかだけを見る。手段（macOS の sudoers）は sleep_guard の内側（#697）
         let setup_pending = crate::sleep_guard::lid_setup_pending();
-        items.push(match settings.lid_sleep_mode {
-            LidSleepMode::Off => Item::new(
-                "lid_sleep",
-                Status::Info,
-                "蓋閉じ防止: 未設定（tako sleep-guard install-lid-sleep で有効化）",
-            ),
-            LidSleepMode::WhileAgentsRunning if setup_pending => Item::new(
-                "lid_sleep",
-                Status::Missing,
-                "蓋閉じ防止: while-agents-running だが sudoers 未登録（tako sleep-guard install-lid-sleep で登録）",
-            ),
-            LidSleepMode::WhileAgentsRunning => {
-                Item::new("lid_sleep", Status::Ok, "蓋閉じ防止: while-agents-running")
+        let (status, text) = match settings.lid_sleep_mode {
+            LidSleepMode::Off => (Status::Info, HealthText::LidOff),
+            LidSleepMode::WhileAgentsRunning if setup_pending => {
+                (Status::Missing, HealthText::LidSudoersMissing)
             }
-        });
+            LidSleepMode::WhileAgentsRunning => (Status::Ok, HealthText::LidOn),
+        };
+        items.push(Item::new("lid_sleep", status, text.text_in(lang), lang));
     }
     items
 }
 
 // --- 設定共有（#513 / #793） ------------------------------------------------
 
-fn config_share_item() -> Item {
-    let lines = config_share_lines(&crate::config_share::env::detect(), false);
+fn config_share_item(lang: Lang) -> Item {
+    let lines = config_share_lines_in(&crate::config_share::env::detect(), false, lang);
     let text = lines.join("\n");
     Item::from_text(
         "config_share",
@@ -1335,64 +1436,57 @@ fn config_share_item() -> Item {
 
 /// 設定共有の状態表示（Issue #793）。setup サマリと `--check` が**同じ判定**
 /// （`config_share::env::Guidance`）から文言を作るので、片方だけ古くならない。
-/// **質問は含まない**（#262 の質問ゼロ）。`verbose` = setup サマリ向けに説明行を足す
+/// **質問は含まない**（#262 の質問ゼロ）。`verbose` = setup サマリ向けに説明行を足す。
+/// 日本語（`tako setup` の要約）。`--check` / check-health は [`config_share_lines_in`]
 pub fn config_share_lines(
     env: &crate::config_share::env::ShareEnvironment,
     verbose: bool,
 ) -> Vec<String> {
+    config_share_lines_in(env, verbose, Lang::Ja)
+}
+
+/// [`config_share_lines`] を表示言語で（#2365）
+pub fn config_share_lines_in(
+    env: &crate::config_share::env::ShareEnvironment,
+    verbose: bool,
+    lang: Lang,
+) -> Vec<String> {
     use crate::config_share::env::Guidance;
 
-    let repo = env.repo.as_deref().unwrap_or("?");
+    let text = |t: HealthText| t.text_in(lang);
+    let repo = env.repo.as_deref().unwrap_or("?").to_string();
     let next = env.next_command();
     let mut lines = Vec::new();
     match env.guidance() {
         // 配線済みなら状態を 1 行示すだけ。勧誘はしない（#793 受け入れ条件 4 = 冪等）
         Guidance::Linked => {
-            lines.push(format!("  [OK] 設定共有: 配線済み（{repo}）"));
+            lines.push(text(HealthText::ShareLinked(repo)));
             if verbose {
-                lines.push(
-                    "       差分は `tako config status`、同期は `tako config push` / `pull`".into(),
-                );
+                lines.push(text(HealthText::ShareLinkedUsage));
             }
         }
         Guidance::Broken => {
-            lines.push(format!(
-                "  [警告] 設定共有: 配線先が git リポジトリではありません（{repo}）"
-            ));
-            lines.push(format!("         `{next}` で繋ぎ直せます"));
+            lines.push(text(HealthText::ShareBroken(repo)));
+            lines.push(text(HealthText::ShareRelink(next.to_string())));
         }
         // 既に自力で共有している利用者には、まず相乗りを示す（二重管理を作らない）
         Guidance::AdoptExisting => {
-            lines.push("  [情報] 設定共有: 未配線".into());
+            lines.push(text(HealthText::ShareUnlinked));
             for found in &env.external {
-                lines.push(format!(
-                    "         {} は既に {} で管理されています{}",
-                    found.path,
-                    found.repo,
-                    if found.same_place {
-                        "（tako の置き場と一致）"
-                    } else {
-                        "（tako の置き場とは別）"
-                    }
-                ));
+                lines.push(text(HealthText::ShareManaged {
+                    path: found.path.to_string(),
+                    repo: found.repo.to_string(),
+                    same: found.same_place,
+                }));
             }
-            lines.push(format!("         同じリポジトリへ相乗りするなら `{next}`"));
-            lines.push(
-                "         別のリポジトリを作ると同じ内容が 2 箇所に並びます（二重管理）".into(),
-            );
+            lines.push(text(HealthText::ShareAdopt(next.to_string())));
+            lines.push(text(HealthText::ShareDuplicate));
         }
         Guidance::Fresh => {
-            lines.push(format!(
-                "  [情報] 設定共有: 未配線（複数デバイスで同じ AI 設定を使うなら `{next}`）"
-            ));
+            lines.push(text(HealthText::ShareFresh(next.to_string())));
             if verbose {
-                lines.push(
-                    "         claude のグローバル指示と tako の宣言的設定を git 1 本で共有します"
-                        .into(),
-                );
-                lines.push(
-                    "         秘匿情報とこのマシン固有の状態は共有対象から構造的に外れます".into(),
-                );
+                lines.push(text(HealthText::ShareFreshWhat));
+                lines.push(text(HealthText::ShareFreshSafe));
             }
         }
     }
@@ -1401,26 +1495,29 @@ pub fn config_share_lines(
 
 // --- プロファイル -----------------------------------------------------------
 
-fn profiles_item() -> Item {
+fn profiles_item(lang: Lang) -> Item {
     match crate::orchestrator::list_profiles() {
         Ok(profiles) if !profiles.is_empty() => Item::new(
             "profiles",
             Status::Ok,
-            format!(
-                "プロファイル: {} 個（{}）",
-                profiles.len(),
-                profiles.join(", ")
-            ),
+            HealthText::ProfilesCount {
+                count: profiles.len(),
+                names: profiles.join(", "),
+            }
+            .text_in(lang),
+            lang,
         ),
         Ok(_) => Item::new(
             "profiles",
             Status::Info,
-            "プロファイル: 未作成（tako master で自動生成されます）",
+            HealthText::ProfilesNone.text_in(lang),
+            lang,
         ),
         Err(e) => Item::new(
             "profiles",
             Status::Info,
-            format!("プロファイル: 確認失敗 ({e})"),
+            HealthText::ProfilesFailed(e).text_in(lang),
+            lang,
         ),
     }
 }
@@ -1429,8 +1526,9 @@ fn profiles_item() -> Item {
 
 /// スマホから使えるか。**状態ファイルを読むだけ**（`daemon_status` は死んだ
 /// プロセスの残骸を掃除する = 書き込みがあるので `--check` からは呼ばない）
-fn remote_item() -> Item {
+fn remote_item(lang: Lang) -> Item {
     let key = "remote";
+    let text = |t: HealthText| t.text_in(lang);
     let desired = crate::remote::read_desired().is_some();
     let Some(pid) = crate::remote::daemon_pid_if_alive() else {
         return if desired {
@@ -1438,15 +1536,12 @@ fn remote_item() -> Item {
             Item::new(
                 key,
                 Status::Missing,
-                "リモート公開: 前回は公開していましたが、いまは止まっています",
+                text(HealthText::RemoteStoppedUnexpectedly),
+                lang,
             )
-            .line("         tako remote start で公開し直せます")
+            .line(text(HealthText::RemoteStartHint))
         } else {
-            Item::new(
-                key,
-                Status::Info,
-                "リモート公開: 停止中（スマホから使うなら tako remote start）",
-            )
+            Item::new(key, Status::Info, text(HealthText::RemoteStopped), lang)
         };
     };
     // 動いていることと tailnet から見えることは別物（#1049）
@@ -1456,23 +1551,15 @@ fn remote_item() -> Item {
         crate::remote_autostart::now_epoch_secs(),
         crate::remote_serve::watch_interval().as_secs(),
     );
-    match crate::remote_serve::degraded_warning(&fields) {
+    match crate::remote_serve::degraded_warning_in(&fields, lang) {
         Some(warning) => {
-            let mut item = Item::new(
-                key,
-                Status::Warn,
-                "リモート公開: 稼働中ですが tailnet からは届いていません",
-            );
+            let mut item = Item::new(key, Status::Warn, text(HealthText::RemoteUnreachable), lang);
             for line in warning.lines() {
                 item = item.line(format!("         {line}"));
             }
-            item.line("         tako remote status で詳細を確認できます")
+            item.line(text(HealthText::RemoteStatusHint))
         }
-        None => Item::new(
-            key,
-            Status::Ok,
-            format!("リモート公開: 稼働中（pid {pid}）"),
-        ),
+        None => Item::new(key, Status::Ok, text(HealthText::RemoteRunning(pid)), lang),
     }
 }
 
@@ -1484,56 +1571,35 @@ fn remote_item() -> Item {
 /// （`ipc_socket::status`）、外からは繋ぎ先の実測（ソケットへ 1 回繋ぐ）を読むが、
 /// 届いているときはどちらも**同じ 1 行**になる。受け口の詳細（`kind` / バイト数 /
 /// bind エラー）は `check_health` の `ipc` 節が持つ（#1441）ので、ここでは重ねない
-fn ipc_item() -> Item {
+fn ipc_item(lang: Lang) -> Item {
     const KEY: &str = "ipc";
-    const REACHABLE: &str = "IPC の受け口: 立っています（tako CLI / MCP が届きます）";
+    let text = |t: HealthText| t.text_in(lang);
 
     // GUI の中（起動時に記録がある）
     if let Some(status) = tako_core::ipc_socket::status() {
         if status.bound {
-            return Item::new(KEY, Status::Ok, REACHABLE);
+            return Item::new(KEY, Status::Ok, text(HealthText::IpcUp), lang);
         }
-        return Item::new(
-            KEY,
-            Status::Warn,
-            "IPC の受け口: 立っていません（tako CLI / MCP は届きません）",
-        )
-        .line(format!(
-            "         理由: {}",
-            status.error.as_deref().unwrap_or("理由不明")
-        ));
+        return Item::new(KEY, Status::Warn, text(HealthText::IpcDown), lang)
+            .line(text(HealthText::IpcDownReason(status.error.clone())));
     }
     // 外から（繋ぎ先の実測）。置き場の決め方は `ipc_socket` の 1 実装を通す（#1441）
     let Some(data_dir) = tako_core::paths::data_dir() else {
-        return Item::new(
-            KEY,
-            Status::Warn,
-            "IPC の受け口: データディレクトリを特定できません",
-        );
+        return Item::new(KEY, Status::Warn, text(HealthText::IpcNoDataDir), lang);
     };
     let limit = tako_core::ipc_socket::max_path_bytes();
     let socket = tako_core::ipc_socket::resolve_with(&data_dir, &std::env::temp_dir(), limit);
     if socket.exists() && crate::discovery::socket_alive(&socket.to_string_lossy()) {
-        return Item::new(KEY, Status::Ok, REACHABLE);
+        return Item::new(KEY, Status::Ok, text(HealthText::IpcUp), lang);
     }
     // #1441 の症状（深い data dir でソケットが上限を超える）は原因が違うので名指しする
     let bytes = tako_core::ipc_socket::path_bytes(&socket);
     if bytes > limit {
-        return Item::new(
-            KEY,
-            Status::Warn,
-            "IPC の受け口: データディレクトリが深すぎます（tako CLI / MCP は届きません）",
-        )
-        .line(format!(
-            "         ソケットパスが {bytes} バイトで上限 {limit} バイトを超えています"
-        ))
-        .line("         もっと浅い TAKO_DATA_DIR で起動し直してください");
+        return Item::new(KEY, Status::Warn, text(HealthText::IpcTooDeep), lang)
+            .line(text(HealthText::IpcPathTooLong { bytes, limit }))
+            .line(text(HealthText::IpcShallowerHint));
     }
-    Item::new(
-        KEY,
-        Status::Info,
-        "IPC の受け口: 届きません（tako アプリが起動していません）",
-    )
+    Item::new(KEY, Status::Info, text(HealthText::IpcAppNotRunning), lang)
 }
 
 #[cfg(test)]
@@ -1545,16 +1611,19 @@ mod tests {
     #[test]
     fn webview2の項目は版と次の一手を出す() {
         use tako_core::platform::webview2::{Runtime, INSTALL_COMMAND, REQUIRED_VERSION};
-        assert_eq!(webview2_item(&Runtime::NotApplicable), None);
-        let fresh = webview2_item(&Runtime::Installed {
-            version: "146.0.3856.84".into(),
-        })
+        assert_eq!(webview2_item(&Runtime::NotApplicable, Lang::Ja), None);
+        let fresh = webview2_item(
+            &Runtime::Installed {
+                version: "146.0.3856.84".into(),
+            },
+            Lang::Ja,
+        )
         .unwrap();
         assert_eq!(fresh.key, "webview2");
         assert_eq!(fresh.status, Status::Ok);
         assert!(fresh.summary.contains("146.0.3856.84"));
         assert_eq!(fresh.lines.len(), 1);
-        let missing = webview2_item(&Runtime::Missing).unwrap();
+        let missing = webview2_item(&Runtime::Missing, Lang::Ja).unwrap();
         assert_eq!(missing.status, Status::Missing);
         assert!(missing.summary.contains("無い"));
         assert!(
@@ -1562,9 +1631,12 @@ mod tests {
             "{:?}",
             missing.lines
         );
-        let old = webview2_item(&Runtime::Installed {
-            version: "120.0.2210.91".into(),
-        })
+        let old = webview2_item(
+            &Runtime::Installed {
+                version: "120.0.2210.91".into(),
+            },
+            Lang::Ja,
+        )
         .unwrap();
         assert_eq!(old.status, Status::Warn);
         assert!(old.summary.contains(REQUIRED_VERSION));
@@ -1605,7 +1677,7 @@ mod tests {
 
     #[test]
     fn 項目のjsonはキーと重さと行を持つ() {
-        let item = Item::new("dep.tmux", Status::Ok, "tmux: /usr/bin/tmux")
+        let item = Item::new("dep.tmux", Status::Ok, "tmux: /usr/bin/tmux", Lang::Ja)
             .remaining(Remaining::new(RemainingKind::ShellIntegration));
         let value = item.to_json();
         assert_eq!(value["key"], "dep.tmux");
@@ -1622,9 +1694,10 @@ mod tests {
     fn レポートは行と残りを項目から組む() {
         let report = Report {
             probe_timeouts: Vec::new(),
+            lang: Lang::Ja,
             items: vec![
-                Item::new("a", Status::Ok, "あ"),
-                Item::new("b", Status::Missing, "い")
+                Item::new("a", Status::Ok, "あ", Lang::Ja),
+                Item::new("b", Status::Missing, "い", Lang::Ja)
                     .line("      続き")
                     .remaining(Remaining::new(RemainingKind::AgentMissing)),
             ],
@@ -1646,11 +1719,12 @@ mod tests {
     fn 残り作業は面倒を見る系統の段から積まれる() {
         // 読めない系統しか無いときは理由を持ち上げる（黙って消さない）
         let states = vec![(AgentKind::Claude, Err("読めません".to_string()))];
-        let remaining = shortest_bootstrap_remaining(&states).expect("残り作業が選ばれる");
+        let remaining =
+            shortest_bootstrap_remaining(&states, Lang::Ja).expect("残り作業が選ばれる");
         assert_eq!(remaining.kind, RemainingKind::AgentStatusUnknown);
         assert_eq!(remaining.detail, vec!["読めません".to_string()]);
         // 空なら 1 件も積まない
-        assert!(shortest_bootstrap_remaining(&[]).is_none());
+        assert!(shortest_bootstrap_remaining(&[], Lang::Ja).is_none());
     }
 
     /// 段と認証の結果だけを変えた導入状況（パスはホームの外の決め打ち = #927）
@@ -1710,7 +1784,7 @@ mod tests {
                 Some(10),
             )),
         )];
-        let items = agent_cli_items(&states);
+        let items = agent_cli_items(&states, Lang::Ja);
         assert_eq!(items[0].status, Status::Warn, "{:?}", items[0]);
         assert!(
             items[0]
@@ -1730,7 +1804,7 @@ mod tests {
             line_of(&items[1]),
             "         [警告] claude: 認証: 不明（10 秒で応答なし）"
         );
-        let detected = agents_detected_item(&states);
+        let detected = agents_detected_item(&states, Lang::Ja);
         assert!(
             line_of(&detected).contains(
                 "    [検出] claude: /opt/fake/bin/claude（認証: 不明（10 秒で応答なし））"
@@ -1748,17 +1822,17 @@ mod tests {
             AgentKind::Claude,
             Ok(bootstrap_state(AgentKind::Claude, Step::Ready, true, None)),
         )];
-        let items = agent_cli_items(&ready);
+        let items = agent_cli_items(&ready, Lang::Ja);
         assert_eq!(items[0].status, Status::Ok);
         assert_eq!(line_of(&items[1]), "         [OK] claude: 完了");
-        assert!(line_of(&agents_detected_item(&ready))
+        assert!(line_of(&agents_detected_item(&ready, Lang::Ja))
             .contains("    [検出] claude: /opt/fake/bin/claude（認証済み / max）"));
 
         let logged_out = vec![(
             AgentKind::Claude,
             Ok(bootstrap_state(AgentKind::Claude, Step::Auth, false, None)),
         )];
-        let items = agent_cli_items(&logged_out);
+        let items = agent_cli_items(&logged_out, Lang::Ja);
         assert_eq!(items[0].status, Status::Missing);
         assert_eq!(
             items[0].remaining.first().map(|r| r.kind.clone()),
@@ -1767,7 +1841,8 @@ mod tests {
         );
         assert_eq!(items[1].status, Status::Missing);
         assert!(line_of(&items[1]).contains("[不足] claude:"));
-        assert!(line_of(&agents_detected_item(&logged_out)).contains("（未認証 / プラン不明）"));
+        assert!(line_of(&agents_detected_item(&logged_out, Lang::Ja))
+            .contains("（未認証 / プラン不明）"));
     }
 
     /// 使える系統が 1 つでもあれば頭は OK のまま。打ち切った系統だけが警告になる。
@@ -1794,7 +1869,7 @@ mod tests {
                 Ok(bootstrap_state(AgentKind::Agy, Step::Path, false, Some(3))),
             ),
         ];
-        let items = agent_cli_items(&states);
+        let items = agent_cli_items(&states, Lang::Ja);
         assert_eq!(items[0].status, Status::Ok, "{:?}", items[0]);
         assert_eq!(items[2].status, Status::Warn);
         assert_eq!(
@@ -1807,7 +1882,7 @@ mod tests {
             "{}",
             line_of(&items[3])
         );
-        let detected = line_of(&agents_detected_item(&states));
+        let detected = line_of(&agents_detected_item(&states, Lang::Ja));
         assert!(detected.contains("codex: /opt/fake/bin/codex（認証: 不明（3 秒で応答なし））"));
         assert!(detected.contains("agy: /opt/fake/bin/agy（認証: 不明（3 秒で応答なし））"));
     }
@@ -1820,7 +1895,7 @@ mod tests {
         claude.binary = None;
         claude.locate_timeout = Some(login_shell_notice("command -v claude", 5));
         let states = vec![(AgentKind::Claude, Ok(claude))];
-        let items = agent_cli_items(&states);
+        let items = agent_cli_items(&states, Lang::Ja);
         assert_eq!(items[0].status, Status::Warn, "{:?}", items[0]);
         assert!(
             items[0]
@@ -1838,7 +1913,7 @@ mod tests {
             line_of(&items[1]),
             "         [警告] claude: 導入: 不明（ログインシェルが 5 秒で応答なし）"
         );
-        let detected = agents_detected_item(&states);
+        let detected = agents_detected_item(&states, Lang::Ja);
         assert_eq!(detected.status, Status::Warn, "{detected:?}");
         assert!(
             detected.remaining.is_empty(),
@@ -1866,7 +1941,7 @@ mod tests {
             (AgentKind::Claude, Ok(read_timeout)),
             (AgentKind::Codex, Ok(locate_timeout)),
         ];
-        let items = agent_cli_items(&states);
+        let items = agent_cli_items(&states, Lang::Ja);
         assert_eq!(items[0].status, Status::Warn, "{:?}", items[0]);
         for (i, agent) in [(1, "claude"), (2, "codex")] {
             assert_eq!(
@@ -1879,7 +1954,7 @@ mod tests {
             AgentKind::Claude,
             Ok(bootstrap_state(AgentKind::Claude, Step::Path, false, None)),
         )];
-        let items = agent_cli_items(&plain);
+        let items = agent_cli_items(&plain, Lang::Ja);
         assert_eq!(items[1].status, Status::Missing);
         assert!(line_of(&items[1]).contains("(path)"));
     }
@@ -2043,7 +2118,12 @@ mod tests {
             .into_iter()
             .map(|dep| {
                 let key = format!("dep.{}", dep.bin);
-                Item::new(key, Status::Ok, format!("{0}: /opt/fake/bin/{0}", dep.bin))
+                Item::new(
+                    key,
+                    Status::Ok,
+                    format!("{0}: /opt/fake/bin/{0}", dep.bin),
+                    Lang::Ja,
+                )
             })
             .collect()
     }
@@ -2092,6 +2172,7 @@ mod tests {
                 .cloned()
                 .collect(),
             probe_timeouts: report.probe_timeouts.clone(),
+            lang: report.lang,
         };
         (kept.to_json(), kept.lines())
     }
@@ -2130,7 +2211,7 @@ mod tests {
             config_share: &|| watch.background("config_share", fake_config_share()),
             tako_cli_path: &|| watch.background("tako_cli_path", fake_tako_cli_path()),
         };
-        let report = collect_with(&probes, probe_concurrency(false));
+        let report = collect_with(&probes, probe_concurrency(false), Lang::Ja);
         let seen = watch.lock();
 
         // 1. 重なった（直列へ戻すと、導入状況か背景の 1 組が相手の始まりを待ったまま締め切りを過ぎる）
@@ -2172,7 +2253,7 @@ mod tests {
         drop(seen);
 
         // 4. 逐次に組んだもの（問い合わせを起こさない組み立てへ同じ答えを渡す）と 1 バイトも変わらない
-        let serial = assemble(fake_bootstrap(), fake_answers());
+        let serial = assemble(fake_bootstrap(), fake_answers(), Lang::Ja);
         assert_eq!(
             comparable(&report),
             comparable(&serial),
@@ -2233,8 +2314,8 @@ mod tests {
             config_share: &|| fake_config_share(),
             tako_cli_path: &|| fake_tako_cli_path(),
         };
-        let parallel = collect_with(&probes, probe_concurrency(false));
-        let legacy = collect_with(&probes, probe_concurrency(true));
+        let parallel = collect_with(&probes, probe_concurrency(false), Lang::Ja);
+        let legacy = collect_with(&probes, probe_concurrency(true), Lang::Ja);
         assert_eq!(comparable(&parallel), comparable(&legacy));
         assert_eq!(probe_concurrency(true), 0, "A/B の旧経路は重ねない");
         assert!(probe_concurrency(false) > 1, "既定は重ねる");
@@ -2249,7 +2330,7 @@ mod tests {
         let start = src.find(head).expect("collect の頭");
         let end = start + src[start..].find("\n}\n").expect("collect の終わり");
         assert!(
-            src[start..end].contains("collect_with(&probes, probe_concurrency(issue1622_legacy()))"),
+            src[start..end].contains("collect_with(&probes, probe_concurrency(issue1622_legacy()), lang)"),
             "{}（fn collect）が `probe_concurrency(issue1622_legacy())` で同時数を決めていない（#1622）",
             source_line(head)
         );

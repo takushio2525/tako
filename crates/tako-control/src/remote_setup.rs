@@ -679,6 +679,8 @@ fn install_tailscale(auto_yes: bool, writer: &mut dyn io::Write) -> Result<Optio
             writer,
             reader: &mut reader,
             indent: "  ",
+            // `tako remote setup` の案内は日本語（#2365 の範囲外）
+            lang: tako_core::i18n::Lang::Ja,
         },
     )?;
     Ok(match outcome {

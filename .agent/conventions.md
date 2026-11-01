@@ -550,6 +550,24 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   **断りの括弧の中（`Err` / `ok_or` / `ok_or_else` / `map_err`）と `error:` の行の日本語**を main.rs 全体で見る走査。
   まだ移していない関数は `CLI_REFUSAL_DEFERRED` に理由つきで並べ、移し終えたら外さないと落ちる）、実経路は
   `crates/tako-cli/tests/issue2365_cli_local_lang.rs`（GUI 無しの CLI を日英で叩く。A/B は `TAKO_2365_CLI_BIN`）
+- #2365 の続きで、**check-health 一式**（CLI の表示・`--json`・dispatch の `issues` と節の理由・MCP
+  `tako_check_health`）と、字面を共有する**環境診断**（`diagnostics.rs` = `tako setup --check` の行と末尾の残り作業）を
+  表示言語へ移した。`--check` は「setup は日本語」の枠から外し、check-health と同じ言語で出す（setup 系の断り
+  `SetupRefusal` と揃える。`tako setup` の本体 = 段の進行と末尾の要約は日本語のまま）。文は `tako_control::HealthText`
+  （`health_text.rs`。網羅 match）、他モジュールが組む共有の文は各モジュールの `_in(lang)` の口
+  （`setup_bootstrap::{Step::describe_for_in, account_label_in, new_tab_note_in, tako_cli_path_json_in}`・
+  `tako_cli_path_check_line` / `tako_cli_in_path_issue` / `tako_cli_link_issue` / `shell_integration::check_line` は
+  言語を引数で受ける・`setup_deps` の `*_in` と `DepPromptIo::lang`・依存表の用途 / 案内は日英の `Note`・
+  `setup_remaining::{title_in, default_detail_in, Remaining::new_in, noting_state_in, render_in}`・tako-core の
+  `ListenerCheck` / `Occupant::reason_in`・`Placement::health_issue_in`・`fd_limit::NOT_APPLICABLE_REASON` は `Note`）。
+  `tako setup` の本体と persist.log は日本語の旧い口のまま。診断の正本 `diagnostics::collect` は**入口で 1 回**
+  `i18n::lang()` を読んで引き回す（GUI はそのまま、GUI を通さない CLI = 届かないときの check-health と
+  `setup --check` は先に `init_local_lang()`）。中身が外から来る文（remote daemon が自己検査で書いた理由・
+  起動時に記録した窓の置き先の理由・Windows の文字コード固定を諦めた理由・OS / tmux のエラー文・型の口の無い
+  `pending_changes` / `current_revision` / `agents_sync::status` / `list_profiles` の失敗）はそのまま載せる。
+  番犬は同じ `issue1762_dispatch_error_lang.rs` の末尾の節（`HealthText` の表・`diagnostics.rs` の本体 /
+  dispatch の `DISPATCH_HEALTH_SCOPES` / CLI / `run_check` の日本語の固定文と文字リテラル・日本語の口
+  `HEALTH_JA_CALLS` の呼び出し）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

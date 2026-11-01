@@ -15,6 +15,9 @@
 #     /Applications の既知の置き場を直接見るので、TAKO_TAILSCALE_BIN を未作成のパスへ向ける
 #     （brew スタブが入れる先 = `$BIN/tailscale`。実機の Tailscale は 1 度も試されない）
 set -uo pipefail
+# check-health / `tako setup --check` は表示言語に従う（#2365）。判定は日本語の字面なので、OS の言語に
+# 依らず日本語表示へ固定する（settings.json の language が system のときだけ効く）
+export TAKO_LANG=ja
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAKO="${TAKO_BIN:-$ROOT/target/debug/tako}"

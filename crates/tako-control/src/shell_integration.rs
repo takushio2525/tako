@@ -6,6 +6,7 @@
 //! MCP からは dispatch 経由で、まったく同じ結果になる。
 
 use serde_json::{json, Value};
+use tako_core::i18n::Lang;
 use tako_core::shell_integration as si;
 
 use crate::setup_remaining::{Remaining, RemainingKind};
@@ -84,6 +85,17 @@ pub fn legacy_no_setup_stage() -> bool {
 const LEGACY_LINE: &str =
     "  [legacy] シェル統合の配置は TAKO_1504_LEGACY=1 で無効（#1504 前の挙動）";
 
+/// [`LEGACY_LINE`] を表示言語で（`--check` の行。#2365）
+fn legacy_line_in(lang: Lang) -> &'static str {
+    match lang {
+        Lang::Ja => LEGACY_LINE,
+        Lang::En => {
+            "  [legacy] placing the shell integration is off with TAKO_1504_LEGACY=1 \
+             (the behavior before #1504)"
+        }
+    }
+}
+
 /// `tako setup` のシェル統合の段（#1504 / #2432）。
 ///
 /// ## 何をする段か
@@ -112,7 +124,7 @@ pub fn run_setup_stage() -> StageOutcome {
     }
     match si::install() {
         Ok(_) => StageOutcome {
-            lines: state_lines(&si::status(), Phase::Setup),
+            lines: state_lines(&si::status(), Phase::Setup, Lang::Ja),
             remaining: None,
         },
         Err(e) => {
@@ -125,12 +137,13 @@ pub fn run_setup_stage() -> StageOutcome {
     }
 }
 
-/// `tako setup --check` の 1 行（**読み取りだけ**。書き出しも書き込みもしない）
-pub fn check_line() -> String {
+/// `tako setup --check` の 1 行（**読み取りだけ**。書き出しも書き込みもしない）。
+/// check-health と `--check` が同じ文を表示言語で出す（#2365）
+pub fn check_line(lang: Lang) -> String {
     if legacy_no_setup_stage() {
-        return LEGACY_LINE.to_string();
+        return legacy_line_in(lang).to_string();
     }
-    check_line_for(&si::status())
+    check_line_for(&si::status(), lang)
 }
 
 /// `tako setup --check` が積む残り作業。#2432 以降は人の手で配置するものが無いので、
@@ -150,61 +163,83 @@ enum Phase {
     Check,
 }
 
-/// どう届くかの表示。**判断はここ 1 か所**（`cfg!(windows)` を散らさない）
-fn state_lines(status: &si::Status, phase: Phase) -> Vec<String> {
-    let mut lines = vec![delivery_line(status, phase)];
+/// どう届くかの表示。**判断はここ 1 か所**（`cfg!(windows)` を散らさない）。
+/// 段（`tako setup`）は日本語、点検（`--check` / check-health）は表示言語で組む（#2365）
+fn state_lines(status: &si::Status, phase: Phase, lang: Lang) -> Vec<String> {
+    let mut lines = vec![delivery_line(status, phase, lang)];
     if status.installed() {
-        lines.extend(backend_note(status));
+        lines.extend(backend_note(status, lang));
     }
-    lines.extend(legacy_note(status));
+    lines.extend(legacy_note(status, lang));
     lines
 }
 
 /// 届け方の 1 行。`si::Delivery` の 2 値で分ける
-fn delivery_line(status: &si::Status, phase: Phase) -> String {
-    match (status.delivery, phase) {
-        (si::Delivery::Automatic, Phase::Setup) => format!(
-            "  [OK] シェル統合: 環境変数の注入で有効です（{}。設定ファイルは書き換えません）",
-            si::shells()
+fn delivery_line(status: &si::Status, phase: Phase, lang: Lang) -> String {
+    use Lang::{En, Ja};
+    let shells = si::shells();
+    match (status.delivery, phase, lang) {
+        (si::Delivery::Automatic, Phase::Setup, Ja) => format!(
+            "  [OK] シェル統合: 環境変数の注入で有効です（{shells}。設定ファイルは書き換えません）"
         ),
-        (si::Delivery::Automatic, Phase::Check) => format!(
-            "  [OK] シェル統合: 環境変数の注入で有効（{}）",
-            si::shells()
+        (si::Delivery::Automatic, Phase::Setup, En) => format!(
+            "  [OK] shell integration: enabled by injecting env vars ({shells}; settings files are \
+             not modified)"
         ),
-        (si::Delivery::Launch, _) if !status.installed() => format!(
-            "  [不足] シェル統合: 既定のシェルが PowerShell でないため効きません（{} が見つかりません）",
-            si::shells()
+        (si::Delivery::Automatic, Phase::Check, Ja) => {
+            format!("  [OK] シェル統合: 環境変数の注入で有効（{shells}）")
+        }
+        (si::Delivery::Automatic, Phase::Check, En) => {
+            format!("  [OK] shell integration: enabled by injecting env vars ({shells})")
+        }
+        (si::Delivery::Launch, _, Ja) if !status.installed() => format!(
+            "  [不足] シェル統合: 既定のシェルが PowerShell でないため効きません（{shells} が見つかりません）"
         ),
-        (si::Delivery::Launch, Phase::Setup) => format!(
-            "  [OK] シェル統合: tako が開く PowerShell へ起動時に読ませます（{}。$PROFILE は書き換えません）",
-            si::shells()
+        (si::Delivery::Launch, _, En) if !status.installed() => format!(
+            "  [missing] shell integration: does not work because the default shell is not \
+             PowerShell ({shells} not found)"
         ),
-        (si::Delivery::Launch, Phase::Check) => format!(
-            "  [OK] シェル統合: tako が開く PowerShell へ起動時に読ませる（{}）",
-            si::shells()
+        (si::Delivery::Launch, Phase::Setup, Ja) => format!(
+            "  [OK] シェル統合: tako が開く PowerShell へ起動時に読ませます（{shells}。$PROFILE は書き換えません）"
+        ),
+        (si::Delivery::Launch, Phase::Setup, En) => format!(
+            "  [OK] shell integration: loaded at startup into the PowerShell tako opens ({shells}; \
+             $PROFILE is not modified)"
+        ),
+        (si::Delivery::Launch, Phase::Check, Ja) => {
+            format!("  [OK] シェル統合: tako が開く PowerShell へ起動時に読ませる（{shells}）")
+        }
+        (si::Delivery::Launch, Phase::Check, En) => format!(
+            "  [OK] shell integration: loaded at startup into the PowerShell tako opens ({shells})"
         ),
     }
 }
 
-/// 器が OSC を落として「届け方が整っていても効かない」ときだけ出す注記（#525）
-fn backend_note(status: &si::Status) -> Option<String> {
+/// 器が OSC を落として「届け方が整っていても効かない」ときだけ出す注記（#525）。
+/// 理由の文は tako-core の `shell_integration::status` が組んだもの（Windows の psmux だけ）
+fn backend_note(status: &si::Status, lang: Lang) -> Option<String> {
+    let tag = match lang {
+        Lang::Ja => "[注意]",
+        Lang::En => "[note]",
+    };
     status
         .blocked_by_backend
         .as_deref()
-        .map(|reason| format!("         [注意] {reason}"))
+        .map(|reason| format!("         {tag} {reason}"))
 }
 
 /// 以前の版が `$PROFILE` に置いたブロックが残っているときだけ出す注記（#2432）。
 /// 通常は移行が取り除くので出ない。出ているなら移行が失敗している（理由は `tako migrate`）。
 /// 直し方はブロックだけを外す `uninstall`（`tako migrate run` は利用者の判断が要る案まで当てる）
-fn legacy_note(status: &si::Status) -> Vec<String> {
+fn legacy_note(status: &si::Status, lang: Lang) -> Vec<String> {
     if status.legacy_blocks.is_empty() {
         return Vec::new();
     }
-    let mut lines = vec![
-        "         [注意] 以前の版が $PROFILE に置いた管理ブロックが残っています（取り除くには tako shell-integration uninstall）"
-            .to_string(),
-    ];
+    let head = match lang {
+        Lang::Ja => "         [注意] 以前の版が $PROFILE に置いた管理ブロックが残っています（取り除くには tako shell-integration uninstall）",
+        Lang::En => "         [note] a managed block placed in $PROFILE by an earlier version is still there (remove it with tako shell-integration uninstall)",
+    };
+    let mut lines = vec![head.to_string()];
     lines.extend(
         status
             .legacy_blocks
@@ -228,8 +263,8 @@ fn failure_lines(error: &str) -> (Vec<String>, Remaining) {
 }
 
 /// `--check` の 1 行（複数行になることもある）。**判定は段と同じ材料を読む**
-fn check_line_for(status: &si::Status) -> String {
-    state_lines(status, Phase::Check).join("\n")
+fn check_line_for(status: &si::Status, lang: Lang) -> String {
+    state_lines(status, Phase::Check, lang).join("\n")
 }
 
 /// `--check` が積む残り作業。人の手で配置するものが無い（#2432）ので積まない
@@ -276,9 +311,41 @@ mod stage_tests {
 
     const PWSH: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
 
+    /// #2365: `--check` / check-health の行は表示言語で組む。どの届け方・注記でも英語に日本語が混ざらず、
+    /// 行の数は日本語と同じ（器が OSC を落とす理由の文は tako-core が組んだものをそのまま載せる）
+    #[test]
+    fn 点検の行は表示言語で組む() {
+        let japanese = |s: &str| {
+            s.chars()
+                .find(|c| matches!(*c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF))
+        };
+        let mut with_legacy = windows_status(Some(PWSH));
+        with_legacy.legacy_blocks = vec![legacy("PowerShell")];
+        let mut blocked = unix_status();
+        blocked.blocked_by_backend = Some("psmux drops OSC".into());
+        for status in [
+            unix_status(),
+            windows_status(Some(PWSH)),
+            windows_status(None),
+            with_legacy,
+            blocked,
+        ] {
+            for phase in [Phase::Setup, Phase::Check] {
+                let ja = state_lines(&status, phase, Lang::Ja);
+                let en = state_lines(&status, phase, Lang::En);
+                assert_eq!(ja.len(), en.len(), "{ja:?} / {en:?}");
+                for line in &en {
+                    assert_eq!(japanese(line), None, "英語の行に日本語が混ざる: {line}");
+                }
+            }
+        }
+        assert_eq!(japanese(legacy_line_in(Lang::En)), None);
+        assert_eq!(legacy_line_in(Lang::Ja), LEGACY_LINE);
+    }
+
     #[test]
     fn 注入で完結する環境は1行だけ言う() {
-        let lines = state_lines(&unix_status(), Phase::Setup);
+        let lines = state_lines(&unix_status(), Phase::Setup, Lang::Ja);
         assert_eq!(lines.len(), 1, "1 行だけ: {lines:?}");
         assert!(lines[0].contains("環境変数の注入で有効"), "{lines:?}");
         assert!(
@@ -291,7 +358,7 @@ mod stage_tests {
     /// 「開き直すと有効」も要らない（書いていないし、新しいペインから効く）
     #[test]
     fn windowsは起動時に読ませて_profileを書き換えないと言う() {
-        let lines = state_lines(&windows_status(Some(PWSH)), Phase::Setup);
+        let lines = state_lines(&windows_status(Some(PWSH)), Phase::Setup, Lang::Ja);
         let text = lines.join("\n");
         assert_eq!(lines.len(), 1, "{text}");
         assert!(text.starts_with("  [OK]"), "{text}");
@@ -309,7 +376,7 @@ mod stage_tests {
     #[test]
     fn powershellが無ければ不足と言い残りには積まない() {
         let status = windows_status(None);
-        let line = check_line_for(&status);
+        let line = check_line_for(&status, Lang::Ja);
         assert!(line.starts_with("  [不足]"), "{line}");
         assert!(line.contains("PowerShell でない"), "{line}");
         assert!(check_remaining_for(&status).is_none());
@@ -320,7 +387,7 @@ mod stage_tests {
     fn 旧ブロックが残っていれば場所と直し方を出す() {
         let mut status = windows_status(Some(PWSH));
         status.legacy_blocks = vec![legacy("PowerShell"), legacy("WindowsPowerShell")];
-        let text = check_line_for(&status);
+        let text = check_line_for(&status, Lang::Ja);
         assert!(text.contains("[注意]"), "{text}");
         assert!(
             text.contains("tako shell-integration uninstall"),
@@ -334,7 +401,7 @@ mod stage_tests {
             );
         }
         // 残っていなければ注記は出ない
-        assert!(!check_line_for(&windows_status(Some(PWSH))).contains("[注意]"));
+        assert!(!check_line_for(&windows_status(Some(PWSH)), Lang::Ja).contains("[注意]"));
     }
 
     #[test]
@@ -366,24 +433,24 @@ mod stage_tests {
     #[test]
     fn checkは状況を読むだけで残りを積まない() {
         for status in [unix_status(), windows_status(Some(PWSH))] {
-            let line = check_line_for(&status);
+            let line = check_line_for(&status, Lang::Ja);
             assert!(line.contains("[OK]"), "{line}");
             assert!(check_remaining_for(&status).is_none());
         }
-        assert!(check_line_for(&windows_status(Some(PWSH))).contains("起動時に読ませる"));
+        assert!(check_line_for(&windows_status(Some(PWSH)), Lang::Ja).contains("起動時に読ませる"));
     }
 
     #[test]
     fn 器がoscを落とすなら効かないことを言う() {
         let mut status = windows_status(Some(PWSH));
         status.blocked_by_backend = Some("永続バックエンドが OSC を通さない".to_string());
-        let text = state_lines(&status, Phase::Setup).join("\n");
+        let text = state_lines(&status, Phase::Setup, Lang::Ja).join("\n");
         assert!(text.contains("[注意]"), "{text}");
         assert!(text.contains("OSC を通さない"), "{text}");
         assert!(
-            check_line_for(&status).contains("[注意]"),
+            check_line_for(&status, Lang::Ja).contains("[注意]"),
             "--check でも同じ注記が出る: {}",
-            check_line_for(&status)
+            check_line_for(&status, Lang::Ja)
         );
     }
 
