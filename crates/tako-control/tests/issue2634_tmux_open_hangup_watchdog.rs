@@ -142,11 +142,17 @@ fn issue2634_器なしのtmux_openのペインも閉じ方の印を立てて起�
 #[test]
 fn issue2634_tmux_openはビューを登録してから端末を起こす() {
     let src = read(DISPATCH);
-    let (start, end) = span_of(
-        &src,
-        "        Request::TmuxOpen {\n            socket,",
-        DISPATCH,
-    );
+    // 1 行 1 欄の形が本体の腕（#1989 の先取りの腕は `socket, session, ..` の 1 行）
+    let sig = "        Request::TmuxOpen {\n            socket,\n            session,\n";
+    let start = src.find(sig).unwrap_or_else(|| {
+        panic!("{DISPATCH} に `TmuxOpen` の腕が無い（構造が変わったらこの番犬も見直すこと）")
+    });
+    // 最初の `{` はパターンの波括弧なので、腕の本体（`=> {`）から括弧を数える
+    let arm = src[start..]
+        .find("} => {")
+        .map(|i| start + i + "} => ".len())
+        .expect("`TmuxOpen` の腕の `=> {`");
+    let end = block_end(&src, arm);
     let body = &src[start..end];
     let track = body.find("host.track_tmux_view(").unwrap_or_else(|| {
         panic!(
