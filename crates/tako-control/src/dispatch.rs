@@ -1119,6 +1119,9 @@ pub enum Reason {
         secs: u64,
         env: &'static str,
     },
+    /// 返答の配送で起票 master を起こす組み立て（`master_launch::plan`）が断った（`error` は
+    /// その断りの文 = 同じ表示言語。配送の記録の理由になる）
+    UserTaskMasterLaunchFailed(String),
 }
 
 /// ペイン ID の並び（`3, 5`）。複数ペインに当たった断りに添える
@@ -3151,6 +3154,12 @@ impl Reason {
                  keeps running). Check it with `tako run-interactive-status {pane}`. Change the \
                  limit with {env}"
             ),
+            (Self::UserTaskMasterLaunchFailed(error), Ja) => {
+                format!("master を起動できない: {error}")
+            }
+            (Self::UserTaskMasterLaunchFailed(error), En) => {
+                format!("cannot start the master: {error}")
+            }
         }
     }
 
@@ -18589,10 +18598,12 @@ fn dispatch_orchestrator_handoff(
 
     // プロファイルの読み込み（#2233: `tako master` と同じ 1 実装。読めなければ組み込み既定で
     // 立てるが黙らない = 応答の warnings・persist.log・後任の system prompt。引き継ぎは止めない）
-    let orchestrator::master_launch::SuccessorProfile {
+    let orchestrator::master_launch::LaunchProfile {
         profile,
         warning: load_warning,
     } = orchestrator::master_launch::load_successor_profile(profile_name);
+    // 理由は表示言語で（前任への応答の warnings と後任の system prompt。persist.log は日本語で書き済み。#2365）
+    let load_warning = load_warning.map(|w| w.to_string());
 
     // #915: 管轄プロジェクトの解決。明示引数 → プロファイル担当 + 稼働 worker → worker のみ
     let jurisdiction =
@@ -27370,12 +27381,13 @@ fn launch_master_for_response(
         Ok(p) => p,
         Err(e) => {
             log_user_task_delivery(&task.id, "launch_plan_failed", "operation");
+            // 組み立ての断り（`plan` = 表示言語）と同じ言語で包む（#2365）
             return delivery_record(
                 DeliveryState::Failed,
                 profile,
                 None,
                 None,
-                Some(format!("master を起動できない: {e}")),
+                Some(Reason::UserTaskMasterLaunchFailed(e).to_string()),
                 index,
             );
         }
@@ -54186,10 +54198,12 @@ tako | pane 2 [ compact ]       [-]
         assert!(host.command_flows.is_empty());
         let value = t2086_settle(&mut host, record.run_staged()).unwrap();
         assert_eq!(value["delivery"]["state"], "failed");
+        // 枠は組み立ての断りと同じ表示言語（#2365。字面は番犬の表が日英で見る）
+        let frame = Reason::UserTaskMasterLaunchFailed(String::new()).to_string();
         assert!(
             value["delivery"]["reason"]
                 .as_str()
-                .is_some_and(|r| r.contains("master を起動できない")),
+                .is_some_and(|r| r.starts_with(&frame)),
             "組み立ての失敗の理由が記録されていない: {}",
             value["delivery"]
         );
@@ -54330,9 +54344,10 @@ tako | pane 2 [ compact ]       [-]
         p.decision = Some("approve".into());
         let value = dispatch_user_task(&mut host, PaneOrigin::Cli, p).unwrap();
         assert_eq!(value["delivery"]["state"], "failed");
+        let frame = Reason::UserTaskMasterLaunchFailed(String::new()).to_string();
         assert!(value["delivery"]["reason"]
             .as_str()
-            .is_some_and(|r| r.contains("master を起動できない")));
+            .is_some_and(|r| r.starts_with(&frame)));
     }
 
     /// 展開: 在ることの確かめは background、開く・右パネルを出すのは着地（UI）。無い id は

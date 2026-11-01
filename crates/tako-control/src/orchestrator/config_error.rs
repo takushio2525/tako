@@ -553,6 +553,9 @@ pub enum ProfileFallback {
     Guide(UnreadableProfile),
     /// 表示している値は組み込み既定（`orchestrator self` / `supervisor status` ほか。#2233）
     Display(UnreadableProfile),
+    /// 引き継ぎの後任 master のプロファイル `name` を読めない（`why` = `tako master` と同じ読み込みの
+    /// 断り）ので、止めずに組み込み既定で後任を立てる（#2233。表示言語は #2365）
+    Successor { name: String, why: Box<ConfigError> },
 }
 
 impl ProfileFallback {
@@ -616,6 +619,19 @@ impl ProfileFallback {
             (Self::Display(why), En) => format!(
                 "{}. The values shown are tako's built-in defaults, not this file's. Fix it and \
                  it takes effect from the next call",
+                why.text_in(lang)
+            ),
+            (Self::Successor { name, why }, Ja) => format!(
+                "後任 master のプロファイル '{name}' を読めない（{}）。引き継ぎは止めずに、\
+                 個人ルール（prompt_blocks）・モデル・アカウントなどの設定を使わない組み込み既定で\
+                 後任を立てる。プロファイルを直すと次の起動から効く",
+                why.text_in(lang)
+            ),
+            (Self::Successor { name, why }, En) => format!(
+                "cannot read the successor master's profile '{name}' ({}). The handoff goes on: \
+                 the successor starts on tako's built-in defaults, without the personal rules \
+                 (prompt_blocks), model, account and other settings of that profile. Fix the \
+                 profile and it takes effect from the next launch",
                 why.text_in(lang)
             ),
         }

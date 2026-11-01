@@ -11,12 +11,12 @@
 //!
 //! # 何を縛るか
 //!
-//! 1. CLI と `plan` がプロファイルを**同じ 1 実装**（`master_launch::load_profile`。CLI は表示言語を
-//!    明示する同じ本体の口 `load_profile_in` = #2365）で読み、
+//! 1. CLI と `plan` がプロファイルを**同じ 1 実装**（`master_launch::load_profile_typed`。CLI と `plan` は
+//!    断りを表示言語で組む口 `load_profile_in` = #2365）で読み、
 //!    自前の `Profile::load` / `Profile::default()` の握りつぶしへ戻らない
 //! 2. `load_default_at` が継承元と同じ読み方（`project_profile_base_at` = 退避つき）を通り、
 //!    `Err` を握りつぶさず warning にする
-//! 3. `load_profile` が warning を persist.log へ出し、`-<key>` の「見つからない」に
+//! 3. `load_profile_typed` が warning を persist.log へ出し、`-<key>` の「見つからない」に
 //!    #1825 の理由（`missing_project_profile_reason`）を足す
 //! 4. 理由の判定が継承元の読み取り（`check_project_profile_base`）と #1825 の理由文を通る
 //! 5. warning が画面（CLI の `警告:` 行 = 見出しは #2365 から表示言語の `ReplyNote::WarningLabel`・
@@ -26,7 +26,7 @@
 //! # #2233 で広げた範囲（同じ根の残り）
 //!
 //! 6. 引き継ぎの後任（`dispatch_orchestrator_handoff`）が `load_successor_profile`
-//!    （= `load_profile`）で読み、警告を応答の `warnings` と後任の system prompt へ渡す
+//!    （= `load_profile_typed`）で読み、警告を応答の `warnings` と後任の system prompt へ渡す
 //! 7. `tako solo`（CLI）が `load_solo`（solo の default も `load_default_at` = 退避つき・
 //!    persist.log）で読み、`警告:` 行と solo 本人の system prompt へ渡す
 //! 8. 表示・判定だけの経路（`orchestrator self` / `supervisor status` / `tako setup` の表示）が
@@ -256,7 +256,7 @@ fn scan_launch(src: &str) -> Vec<Offender> {
         LAUNCH,
         src,
         "pub fn plan(",
-        "load_profile(",
+        "load_profile_in(",
         MASTER_BADS,
         &mut out,
     );
@@ -303,22 +303,22 @@ fn scan_launch(src: &str) -> Vec<Offender> {
         }
     }
 
-    // #2365: 本体は表示言語を明示する `load_profile_in`。旧い口（`plan`・後任）はそこへ委ねるだけ
-    match fn_window(src, "pub fn load_profile(") {
-        None => push(0, "`load_profile` が見つからない（走査が空振り）".into()),
+    // #2365: 本体は断りを型で返す `load_profile_typed`。表示言語で組む口（CLI・`plan`）はそこへ委ねるだけ
+    match fn_window(src, "pub fn load_profile_in(") {
+        None => push(0, "`load_profile_in` が見つからない（走査が空振り）".into()),
         Some((at, window)) => {
-            if !window_has(&window, "load_profile_in(") {
+            if !window_has(&window, "load_profile_typed(") {
                 push(
                     at,
-                    "`load_profile` が本体 `load_profile_in` へ委ねていない = 起動の経路ごとに \
+                    "`load_profile_in` が本体 `load_profile_typed` へ委ねていない = 起動の経路ごとに \
                      読み方が食い違う（#2227 / #2365）"
                         .into(),
                 );
             }
         }
     }
-    match fn_window(src, "pub fn load_profile_in(") {
-        None => push(0, "`load_profile_in` が見つからない（走査が空振り）".into()),
+    match fn_window(src, "pub fn load_profile_typed(") {
+        None => push(0, "`load_profile_typed` が見つからない（走査が空振り）".into()),
         Some((at, window)) => {
             if !window_has(&window, "load_default_at(") {
                 push(
@@ -343,17 +343,17 @@ fn scan_launch(src: &str) -> Vec<Offender> {
         }
     }
 
-    // 6. 引き継ぎの後任は CLI / スマホと同じ `load_profile` を通る（#2233）
+    // 6. 引き継ぎの後任は CLI / スマホと同じ `load_profile_typed` を通る（#2233）
     match fn_window(src, "pub fn load_successor_profile(") {
         None => push(
             0,
             "`load_successor_profile` が見つからない（走査が空振り）".into(),
         ),
         Some((at, window)) => {
-            if !window_has(&window, "load_profile(name)") {
+            if !window_has(&window, "load_profile_typed(name)") {
                 push(
                     at,
-                    "後任の読み込みが `load_profile` を通っていない = 後任だけ個人ルールの抜けた \
+                    "後任の読み込みが `load_profile_typed` を通っていない = 後任だけ個人ルールの抜けた \
                      master が黙って立つ（#2233）"
                         .into(),
                 );
@@ -948,8 +948,8 @@ fn 走査が空振りしていない() {
     let s = sources(&workspace_root());
     for (rel, src, needle) in [
         (LAUNCH, &s.launch, "pub fn plan("),
-        (LAUNCH, &s.launch, "pub fn load_profile("),
         (LAUNCH, &s.launch, "pub fn load_profile_in("),
+        (LAUNCH, &s.launch, "pub fn load_profile_typed("),
         (LAUNCH, &s.launch, "pub fn load_default_at("),
         (LAUNCH, &s.launch, "pub fn to_json("),
         (ORCH, &s.orch, "pub fn missing_project_profile_reason("),
@@ -1074,8 +1074,8 @@ fn 逆戻りを名指しできる() {
         Injection {
             rel: LAUNCH,
             fn_needle: "pub fn plan(",
-            from: "let LaunchProfile { profile, warning } = load_profile(profile_name)?;",
-            to: "let (profile, warning) = (Profile::load(profile_name).unwrap_or_else(|_| Profile::default()), None::<String>);",
+            from: "let LaunchProfile { profile, warning } = load_profile_in(profile_name, lang)?;",
+            to: "let (profile, warning) = (Profile::load(profile_name).unwrap_or_else(|_| Profile::default()), None::<ProfileFallback>);",
             marker: "Profile::load(profile_name)",
         },
         // 注入 2: CLI が修正前そのもの
@@ -1113,10 +1113,10 @@ fn 逆戻りを名指しできる() {
         // 注入 6: `-<key>` の「見つからない」に理由を足さない
         Injection {
             rel: LAUNCH,
-            fn_needle: "pub fn load_profile_in(",
+            fn_needle: "pub fn load_profile_typed(",
             from: "orchestrator::missing_project_profile_reason(name)",
             to: "None::<String>",
-            marker: "pub fn load_profile_in(",
+            marker: "pub fn load_profile_typed(",
         },
         // 注入 7: スマホの応答に warnings を載せない
         Injection {
@@ -1222,12 +1222,12 @@ fn 逆戻りを名指しできる() {
             to: "let _ = w;",
             marker: "pub fn load_solo_in(",
         },
-        // 注入 20: 後任の読み込みが `load_profile` を通らない
+        // 注入 20: 後任の読み込みが `load_profile_typed` を通らない
         Injection {
             rel: LAUNCH,
             fn_needle: "pub fn load_successor_profile(",
-            from: "match load_profile(name) {",
-            to: "match Ok::<LaunchProfile, String>(LaunchProfile { profile: Profile::load(name).unwrap_or_default(), warning: None }) {",
+            from: "match load_profile_typed(name) {",
+            to: "match Ok::<LaunchProfile, ConfigError>(LaunchProfile { profile: Profile::load(name).unwrap_or_default(), warning: None }) {",
             marker: "pub fn load_successor_profile(",
         },
         // 注入 23: 読めない後任のプロファイルを既定で立てるのに warning を持たない

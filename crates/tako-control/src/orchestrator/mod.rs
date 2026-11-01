@@ -2693,8 +2693,15 @@ pub fn remote_control_decision(
 pub fn master_remote_control_decision(
     profile: &Profile,
 ) -> Result<crate::claude_remote::RemoteControlDecision, String> {
-    let agent = profile.resolve_master_agent()?;
-    let plan = profile.resolved_env_plan_for_master()?;
+    master_remote_control_decision_typed(profile).map_err(ConfigError::into_ja)
+}
+
+/// [`master_remote_control_decision`] の型の口（`master_launch::plan` が表示言語で組む。#2365）
+pub fn master_remote_control_decision_typed(
+    profile: &Profile,
+) -> Result<crate::claude_remote::RemoteControlDecision, ConfigError> {
+    let agent = profile.resolve_master_agent_typed()?;
+    let plan = profile.resolved_env_plan_for_master_typed()?;
     Ok(remote_control_decision(profile, agent, &plan))
 }
 

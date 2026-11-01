@@ -211,12 +211,17 @@ impl SuccessorCwdSource {
         }
     }
 
-    /// 警告文へ埋め込む「決め手」の説明
-    fn describe(self) -> &'static str {
-        match self {
-            Self::Profile => "プロファイルの cwd",
-            Self::PreviousMaster => "前任 master の cwd",
-            Self::Home => "ホーム（プロファイルにも前任にも手がかりが無い）",
+    /// 警告文へ埋め込む「決め手」の説明（表示言語。日本語は #2365 より前の固定文とバイト一致）
+    fn describe_in(self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (Self::Profile, Lang::Ja) => "プロファイルの cwd",
+            (Self::Profile, Lang::En) => "the profile's cwd",
+            (Self::PreviousMaster, Lang::Ja) => "前任 master の cwd",
+            (Self::PreviousMaster, Lang::En) => "the predecessor master's cwd",
+            (Self::Home, Lang::Ja) => "ホーム（プロファイルにも前任にも手がかりが無い）",
+            (Self::Home, Lang::En) => {
+                "the home folder (neither the profile nor the predecessor gives a hint)"
+            }
         }
     }
 }
@@ -271,24 +276,46 @@ pub fn resolve_successor_cwd(
 /// **理由の分からない停止**になるので、食い違いは必ず言葉にする。
 /// 前任の cwd を採取できなかった場合も、ホームへ落ちたときだけは黙らない
 /// （プロファイルで明示されているならユーザーの指定どおりなので黙る）。
+///
+/// 引き継ぎの応答の `warnings` に載る利用者向けの文なので表示言語で組む（#2365）
 pub fn successor_cwd_warning(
     resolved: &SuccessorCwd,
     previous_cwd: Option<&Path>,
     profile_name: &str,
 ) -> Option<String> {
+    successor_cwd_warning_in(lang(), resolved, previous_cwd, profile_name)
+}
+
+/// 言語を明示しての [`successor_cwd_warning`]（テストは言語グローバルに触らない = #608）。
+/// 日本語は #2365 より前の固定文とバイト一致
+pub fn successor_cwd_warning_in(
+    lang: Lang,
+    resolved: &SuccessorCwd,
+    previous_cwd: Option<&Path>,
+    profile_name: &str,
+) -> Option<String> {
     let new_path = resolved.path.display();
-    match previous_cwd {
-        Some(prev) if prev == resolved.path => None,
-        Some(prev) => Some(format!(
+    match (previous_cwd, lang) {
+        (Some(prev), _) if prev == resolved.path => None,
+        (Some(prev), Lang::Ja) => Some(format!(
             "後任 master の起動フォルダが前任と違います（前任: {} / 後任: {new_path}）。決め手: {}。\n  cwd に依存する設定（PreToolUse フック・direnv・リポジトリローカルの設定）があると、後任だけ挙動が変わります。\n  前任に合わせるには: tako orchestrator profiles set {profile_name} --cwd {}",
             prev.display(),
-            resolved.source.describe(),
+            resolved.source.describe_in(lang),
             prev.display(),
         )),
-        None if resolved.source == SuccessorCwdSource::Home => Some(format!(
+        (Some(prev), Lang::En) => Some(format!(
+            "The successor master starts in a different folder from the predecessor (predecessor: {} / successor: {new_path}). Decided by: {}.\n  If anything depends on the cwd (PreToolUse hooks, direnv, repository-local settings), only the successor behaves differently.\n  To match the predecessor: tako orchestrator profiles set {profile_name} --cwd {}",
+            prev.display(),
+            resolved.source.describe_in(lang),
+            prev.display(),
+        )),
+        (None, Lang::Ja) if resolved.source == SuccessorCwdSource::Home => Some(format!(
             "前任 master の cwd を採取できなかったため、後任をホーム（{new_path}）で起動します。\n  cwd に依存する設定があると、後任だけ挙動が変わります。\n  明示するには: tako orchestrator profiles set {profile_name} --cwd <path>"
         )),
-        None => None,
+        (None, Lang::En) if resolved.source == SuccessorCwdSource::Home => Some(format!(
+            "Could not read the predecessor master's cwd, so the successor starts in the home folder ({new_path}).\n  If anything depends on the cwd, only the successor behaves differently.\n  To set it explicitly: tako orchestrator profiles set {profile_name} --cwd <path>"
+        )),
+        (None, _) => None,
     }
 }
 
@@ -2533,7 +2560,7 @@ mod tests {
             Some(cwd("/repo/b")),
             cwd("/Users/testuser"),
         );
-        let w = successor_cwd_warning(&r, Some(Path::new("/repo/b")), "takodev")
+        let w = successor_cwd_warning_in(Lang::Ja, &r, Some(Path::new("/repo/b")), "takodev")
             .expect("食い違いは黙らない");
         assert!(w.contains("/repo/b"), "前任の cwd が出ていない: {w}");
         assert!(w.contains("/repo/a"), "後任の cwd が出ていない: {w}");
@@ -2556,5 +2583,66 @@ mod tests {
         // 前任が不明でもプロファイルで明示されているならユーザーの指定どおり = 黙る
         let r = resolve_successor_cwd(Some(cwd("/repo/a")), None, cwd("/Users/testuser"));
         assert_eq!(successor_cwd_warning(&r, None, "takodev"), None);
+    }
+
+    /// #2365: 起動フォルダの警告は表示言語で組む。日本語は #2365 より前の固定文とバイト一致・
+    /// 英語に日本語が混ざらない・黙る条件は日英で同じ
+    #[test]
+    fn issue2365_起動フォルダの警告は日英の対で日本語は旧文と一致() {
+        let differs = resolve_successor_cwd(
+            Some(cwd("/repo/a")),
+            Some(cwd("/repo/b")),
+            cwd("/Users/testuser"),
+        );
+        let home = resolve_successor_cwd(None, None, cwd("/Users/testuser"));
+        let previous = resolve_successor_cwd(None, Some(cwd("/repo/b")), cwd("/Users/testuser"));
+        let cases: [(&SuccessorCwd, Option<&Path>, &str); 2] = [
+            (
+                &differs,
+                Some(Path::new("/repo/b")),
+                "後任 master の起動フォルダが前任と違います（前任: /repo/b / 後任: /repo/a）。決め手: プロファイルの cwd。\n  cwd に依存する設定（PreToolUse フック・direnv・リポジトリローカルの設定）があると、後任だけ挙動が変わります。\n  前任に合わせるには: tako orchestrator profiles set takodev --cwd /repo/b",
+            ),
+            (
+                &home,
+                None,
+                "前任 master の cwd を採取できなかったため、後任をホーム（/Users/testuser）で起動します。\n  cwd に依存する設定があると、後任だけ挙動が変わります。\n  明示するには: tako orchestrator profiles set takodev --cwd <path>",
+            ),
+        ];
+        for (resolved, prev, old) in cases {
+            let ja = successor_cwd_warning_in(Lang::Ja, resolved, prev, "takodev");
+            assert_eq!(ja.as_deref(), Some(old), "日本語が #2365 より前と違う");
+            let en = successor_cwd_warning_in(Lang::En, resolved, prev, "takodev")
+                .expect("英語でも黙らない");
+            assert!(
+                !en.chars().any(
+                    |c| matches!(c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF)
+                ),
+                "英語に日本語が混ざる: {en}"
+            );
+            // 直し方のコマンドは日英で同じ（#322 の最簡形）
+            let command = old.rsplit(": ").next().expect("直し方");
+            assert!(en.ends_with(command), "英語の直し方が違う: {en}");
+        }
+        // 決め手の説明は 3 種とも日英の対
+        for source in [
+            SuccessorCwdSource::Profile,
+            SuccessorCwdSource::PreviousMaster,
+            SuccessorCwdSource::Home,
+        ] {
+            assert_ne!(source.describe_in(Lang::Ja), source.describe_in(Lang::En));
+        }
+        // 黙る条件（前任と同じ・プロファイルの明示）は日英で同じ
+        for lang in [Lang::Ja, Lang::En] {
+            assert_eq!(
+                successor_cwd_warning_in(lang, &previous, Some(Path::new("/repo/b")), "takodev"),
+                None
+            );
+            let explicit =
+                resolve_successor_cwd(Some(cwd("/repo/a")), None, cwd("/Users/testuser"));
+            assert_eq!(
+                successor_cwd_warning_in(lang, &explicit, None, "takodev"),
+                None
+            );
+        }
     }
 }

@@ -576,8 +576,8 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   断りは `Reason`（`LaunchSetupFailed` / `ProfileCwdUnreachable` / `TabNewNoPane`）と型の口
   （`*_typed` + `ConfigError::text_in`・足した口は `validate_projects_typed` / `load_solo_profile_typed` /
   `master_launch::{load_profile_in, load_solo_in}` / `one_m_model_warning_in`）、行は `ReplyNote`、既定の断りは
-  `HostRefusal::Default*`。旧い口（スマホの「+ master」= `master_launch::plan`・引き継ぎの後任・
-  `profile_warnings`）は日本語のまま。読めないプロファイルの理由（#2256 の系統）は次の節。mcp_host は起動時に設定から表示言語を決め、`tako lang` の切り替えもその場で
+  `HostRefusal::Default*`。旧い口の `profile_warnings` は日本語のまま（スマホの「+ master」=
+  `master_launch::plan`・引き継ぎの後任はのちに移した = 下の項）。読めないプロファイルの理由（#2256 の系統）は次の節。mcp_host は起動時に設定から表示言語を決め、`tako lang` の切り替えもその場で
   反映する（GUI と同じ）。番犬は同じ `issue1762_dispatch_error_lang.rs`（`CLI_NOTE_SCOPES` と
   `HOST_IMPL_SCOPES` に起動の流れの関数・host.rs の trait を足した）、実経路は
   `crates/tako-cli/tests/issue2365_master_solo_lang.rs`（GUI 無しの CLI を日英で叩く。A/B は
@@ -594,8 +594,8 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `config_error.rs` の網羅 match）。**利用者へ返す口は表示言語**（dispatch は `to_string()` = `i18n::lang()`、
   CLI は `text_in(lang)`。`tako master` / `tako solo` は本人の system prompt の Detail も同じ言語）、**persist.log は
   `text_in(Lang::Ja)`**（`[spawn]` / `[git-resolve]` は直前の `let ja = …` で組んで 1 行の形を保つ）。日本語のまま
-  なのは別スライスの経路（スマホの「+ master」= `master_launch::plan`・引き継ぎの後任 = `SuccessorProfile`）と
-  日本語の枠（`tako setup` の要約・移行の記録 `FileOutcome::Failed`・自動復帰の `[limit-autoresume]` の行）。
+  なのは日本語の枠（`tako setup` の要約・移行の記録 `FileOutcome::Failed`・自動復帰の `[limit-autoresume]` の行）。
+  スマホの「+ master」と引き継ぎの後任は次の項。
   CLI の guide / `projects add` の警告の行の見出しは `ReplyNote::WarningLabel`（`projects add` の他の行は
   日本語のまま = 各コマンドの人向けの表示の残り）。番犬は同じ `issue1762_dispatch_error_lang.rs`（`ConfigError` の
   表へ 3 種・`ProfileFallback` の表・読み込み口の本体の日本語の固定文 = `CONFIG_REFUSAL_SCOPES` に足した範囲・
@@ -603,6 +603,25 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   ソースへの注入で `file:line` を名指す）、実経路は `tests/issue2365_profile_unreadable_lang.rs`（unix。GUI 無しの
   ホストへ spawn / 解消 / adopt / guide / self / supervisor / projects add / check-health を日英で）と
   `crates/tako-cli/tests/issue2365_profile_unreadable_cli_lang.rs`（GUI 無しの CLI を日英で）
+- #2365 の続きで、**引き継ぎの後任の起動**と**スマホの「+ master」・返答の配送の組み立て（`master_launch::plan`）**を
+  表示言語へ移した。以前はどちらも日本語の文で組んでいたので、英語表示でも前任への応答の `warnings`・後任 /
+  起こした master の system prompt の `Detail:`・`plan` の断り（daemon の `POST /api/tabs/:id/master` の `error`）・
+  返答の配送の記録の理由が日本語のまま混ざった。後任の「専用プロファイルを読めないので組み込み既定で立てる」は
+  `ProfileFallback::Successor`（中身は `tako master` と同じ読み込み `master_launch::load_profile_typed` の断り =
+  `ConfigError`）で持ち、`load_successor_profile` は `LaunchProfile` を返す（`SuccessorProfile` は外した）。
+  起動フォルダの注意は `tako_core::handoff::successor_cwd_warning_in(lang, …)`（既定の口は表示言語）。`plan` は
+  `tako master` の CLI と同じ型の口 + `text_in(lang)`（足した口は `master_remote_control_decision_typed`）と
+  `Reason`（`HomeDirUnknown` / `SystemPromptDirFailed` / `SystemPromptWriteFailed`）で組み、言語は呼んだ時点の
+  `i18n::lang()`（daemon は起動時に設定から決める = #1077・返答の配送は GUI の表示言語）。返答の配送の枠
+  「master を起動できない: …」は `Reason::UserTaskMasterLaunchFailed`（配送の記録は書いた時点の表示言語のまま残る）。
+  persist.log は日本語のまま。日本語の `load_profile`（呼び手が無くなった）は外した。残りの配送の理由
+  （宛先不明 `UNRESOLVED_ORIGIN_REASON`・起動したタブのペインを解けない・UI スレッドでは待たない）と
+  引き継ぎファイルの移行の `warnings`（`handoff_store::ensure_migrated`）は Issue #2365 の表の残り。番犬は同じ
+  `issue1762_dispatch_error_lang.rs`（`ProfileFallback` / `Reason` の表・`PROFILE_REASON_USER_SCOPES` に `plan` /
+  `load_profile_typed` / `load_successor_profile` / `dispatch_orchestrator_handoff`・`plan` の本体の日本語の口と
+  固定文と配送の枠 = `plan_と返答の配送の枠は表示言語で断る`、本物のソースへの注入で `file:line` を名指す）、
+  実経路は `tests/issue2365_successor_plan_lang.rs`（unix。GUI 無しのホストへ引き継ぎ・`plan`・返答の配送を日英で。
+  `TAKO_2365_DUMP=<path>` で全出力を書き出して修正前後を突き合わせる）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

@@ -9,7 +9,7 @@
 //! - **self / supervisor status** は既定値（閾値 60・自動通知 ON・mode auto…）を、プロファイルの
 //!   値であるかのように返した
 //!
-//! いまは後任を `master_launch::load_successor_profile`（= `tako master` と同じ `load_profile`）で
+//! いまは後任を `master_launch::load_successor_profile`（= `tako master` と同じ `load_profile_typed`）で
 //! 読み、立てるが応答の `warnings`・persist.log・後任の system prompt に理由を出して中身を退避する。
 //! 表示だけの経路は `orchestrator::load_for_display`（読むだけ）の理由を `warnings` へ出す。
 //!

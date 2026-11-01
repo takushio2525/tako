@@ -160,7 +160,10 @@ pub(super) async fn tasks_launch_visual(
     check(
         responses == 1
             && state == "failed"
-            && reason.contains("master を起動できない")
+            // 枠は組み立ての断りと同じ表示言語（#2365）
+            && reason.starts_with(
+                &tako_control::Reason::UserTaskMasterLaunchFailed(String::new()).to_string(),
+            )
             && tabs_after == tabs_before
             && comment_empty,
         &format!(
