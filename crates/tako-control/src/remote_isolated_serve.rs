@@ -74,9 +74,10 @@ pub fn overrides_to_fake(
     !real.contains(&resolved)
 }
 
-/// パスを解決する（シンボリックリンクを辿る。解決できないパス = 存在しない偽物はそのまま）
+/// パスを解決する（シンボリックリンクを辿る。解決できないパス = 存在しない偽物はそのまま）。
+/// 境界 B26（#970）の 1 実装を通す = 両辺とも Windows の verbatim prefix を落とした形で比べる
 fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    tako_core::platform::path::canonicalize_or_self(path)
 }
 
 fn truthy(name: &str) -> bool {
