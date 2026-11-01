@@ -35,7 +35,7 @@
 //!
 //! ## 読めない default.yaml でも立てるが、黙らない（#2227）
 //!
-//! プロファイルの読み込みは [`load_profile`] の 1 実装（CLI / スマホ / 返答の配送が通る）。
+//! プロファイルの読み込みは [`load_profile_typed`] の 1 実装（CLI / スマホ / 返答の配送が通る）。
 //! `default` が読めないときは**組み込み既定で立てる**（#916 の「退避して既定値で動き、
 //! 知らせる」と同じ方針。止めると YAML を直せない利用者が master を立てられず、
 //! スマホ・返答の配送からの起動も失敗する）。その代わり、個人ルール・モデルが効いていない
@@ -151,40 +151,51 @@ impl MasterLaunchPlan {
 /// projects 検証（#500 Part 7） → 系統解決 → **CLI の実在検査**（#983。
 /// ペインを作る前に落とす） → system prompt の書き出し → 起動コマンド。
 ///
-/// 表示言語は呼び出し側が初期化しておくこと（理由文が英語で凍る。#983 で踏んだ）
+/// 断り・`warnings`・本人の system prompt の Detail は**呼び出した時点の表示言語**で組む（#2365。
+/// CLI の `tako master` と同じ型の口 + `text_in(lang)`。persist.log は日本語）。表示言語は呼び出し側が
+/// 初期化しておくこと（daemon は起動時に設定から決める = #1077。理由文が英語で凍る = #983 で踏んだ）
 pub fn plan(profile_name: &str) -> Result<MasterLaunchPlan, String> {
+    let lang = tako_core::i18n::lang();
     // 読み込みは CLI と同じ 1 実装（#2227。読めない default は立てるが warning を持つ）
-    let LaunchProfile { profile, warning } = load_profile(profile_name)?;
-    // スマホの「+ master」・返答の配送の起動の流れは日本語のまま（表示言語は別スライス = Issue #2365 の表）
-    let warning = warning.map(|w| w.text_in(Lang::Ja));
+    let LaunchProfile { profile, warning } = load_profile_in(profile_name, lang)?;
+    // 応答の `warnings` と本人の system prompt の両方へ同じ言語で（persist.log は日本語で書き済み）
+    let warning = warning.map(|w| w.text_in(lang));
 
-    profile.validate_env()?;
-    let cwd = profile.resolve_cwd()?;
-    profile.validate_projects()?;
+    profile.validate_env_typed().map_err(|e| e.text_in(lang))?;
+    let cwd = profile.resolve_cwd_typed().map_err(|e| e.text_in(lang))?;
+    profile
+        .validate_projects_typed()
+        .map_err(|e| e.text_in(lang))?;
 
-    let agent = profile.resolve_master_agent()?;
+    let agent = profile
+        .resolve_master_agent_typed()
+        .map_err(|e| e.text_in(lang))?;
     // #983: 実行ファイルが無ければここで落とす（タブを作ってから
     // `command not found` を出すと、tako 側は成功と報告してしまう）
-    orchestrator::agent_cli::preflight(agent).map_err(|e| e.message())?;
+    orchestrator::agent_cli::preflight(agent).map_err(|e| e.message_in(lang))?;
 
     let prompt_content = with_startup_warning(
         profile.build_system_prompt(profile_name),
         warning.as_deref(),
     );
-    let dir = orchestrator::config_dir().ok_or("ホームディレクトリが取得できない")?;
+    let dir =
+        orchestrator::config_dir().ok_or_else(|| crate::Reason::HomeDirUnknown.text_in(lang))?;
     let prompt_path = dir.join(format!("_system_prompt_{profile_name}.md"));
     if let Some(parent) = prompt_path.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("system prompt の保存先を作れない: {e}"))?;
+            .map_err(|e| crate::Reason::SystemPromptDirFailed(e.to_string()).text_in(lang))?;
     }
     std::fs::write(&prompt_path, &prompt_content)
-        .map_err(|e| format!("system prompt の書き出しに失敗: {e}"))?;
+        .map_err(|e| crate::Reason::SystemPromptWriteFailed(e.to_string()).text_in(lang))?;
 
     let role_env = tako_core::handoff::master_role_env(profile_name);
     let pane_role = tako_core::handoff::master_pane_role(profile_name);
     let tako_bin = crate::dispatch::resolve_tako_binary();
-    let command = orchestrator::build_master_cmd(&role_env, &profile, &prompt_path, &tako_bin)?;
-    let remote_control = orchestrator::master_remote_control_decision(&profile)?;
+    let command =
+        orchestrator::build_master_cmd_typed(&role_env, &profile, &prompt_path, &tako_bin)
+            .map_err(|e| e.text_in(lang))?;
+    let remote_control = orchestrator::master_remote_control_decision_typed(&profile)
+        .map_err(|e| e.text_in(lang))?;
 
     Ok(MasterLaunchPlan {
         profile_name: profile_name.to_string(),
@@ -203,7 +214,7 @@ pub fn plan(profile_name: &str) -> Result<MasterLaunchPlan, String> {
     })
 }
 
-/// master の起動で使うプロファイル（[`load_profile`] の結果。#2227）
+/// master の起動で使うプロファイル（[`load_profile_typed`] の結果。#2227）
 #[derive(Debug, Clone)]
 pub struct LaunchProfile {
     pub profile: Profile,
@@ -213,43 +224,36 @@ pub struct LaunchProfile {
     pub warning: Option<ProfileFallback>,
 }
 
-/// 引き継ぎの後任のプロファイル（[`load_successor_profile`] の結果）。後任の起動の流れの
-/// 表示言語は別スライス（Issue #2365 の表）なので、理由は日本語の文のまま持つ
-#[derive(Debug, Clone)]
-pub struct SuccessorProfile {
-    pub profile: Profile,
-    /// 立てるが前任・後任・利用者に必ず見せる理由（`None` = 黙ってよい）
-    pub warning: Option<String>,
-}
-
 /// #2227 の A/B。`TAKO_2227_LEGACY=1` で修正前（読めない default.yaml は黙って組み込み既定・
 /// `-<key>` は直し方の無い「見つからない」）へ戻す
 pub fn legacy_profile_load() -> bool {
     std::env::var_os("TAKO_2227_LEGACY").is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// [`load_profile_typed`] の断りを `lang` で組む口（CLI の `tako master`・[`plan`]。#2365）
+pub fn load_profile_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> {
+    load_profile_typed(name).map_err(|e| e.text_in(lang))
+}
+
 /// master の起動で使うプロファイルを読む（#2227）。**CLI の `tako master` と [`plan`]
-/// （スマホの「+ master」・返答の配送）が同じ 1 実装を通る**。
+/// （スマホの「+ master」・返答の配送）と引き継ぎの後任が同じ 1 実装を通る**。
 ///
 /// - `default` が読めないときは**組み込み既定で立てる**が、理由を `warning` に載せて
 ///   persist.log へも 1 行残す（中身は `.unreadable.bak` へ退避・default.yaml には触らない）。
 ///   無いだけなら従来どおり黙って組み込み既定（ゼロコンフィグの初回）
 /// - `-<key>` が無く、そのキーが登録済みで継承元の default.yaml を読めない
 ///   （#1825 で作っていない）ときは、「見つからない」に理由と直し方を足して止める
-pub fn load_profile(name: &str) -> Result<LaunchProfile, String> {
-    load_profile_in(name, Lang::Ja)
-}
-
-/// [`load_profile`] の断りを表示言語で組む口（CLI の `tako master`。#2365）。
 ///
-/// 「見つからない」に #1825 の理由（[`orchestrator::missing_project_profile_reason`]）を足す形も
-/// 型（[`ConfigError::ProjectProfileMissing`]）で組むので、断りは表示言語・persist.log は日本語
-pub fn load_profile_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> {
+/// 断りは型で返す（#2365。CLI / [`plan`] は [`load_profile_in`] で表示言語に組み、引き継ぎの後任は
+/// 止めずに既定で立てる理由 [`ProfileFallback::Successor`] へ包む）。「見つからない」に #1825 の理由
+/// （[`orchestrator::missing_project_profile_reason`]）を足す形も型（[`ConfigError::ProjectProfileMissing`]）
+/// で組むので、断りは呼び手の言語・persist.log は日本語
+pub fn load_profile_typed(name: &str) -> Result<LaunchProfile, ConfigError> {
     if legacy_profile_load() {
         let profile = match Profile::load_typed(name) {
             Ok(p) => p,
             Err(_) if name == tako_core::handoff::DEFAULT_PROFILE => Profile::default(),
-            Err(e) => return Err(e.text_in(lang)),
+            Err(e) => return Err(e),
         };
         return Ok(LaunchProfile {
             profile,
@@ -259,9 +263,7 @@ pub fn load_profile_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> 
     if name == tako_core::handoff::DEFAULT_PROFILE {
         let loaded = load_default_at(
             orchestrator::ProfileKind::Master,
-            &orchestrator::ProfileKind::Master
-                .path_typed(name)
-                .map_err(|e| e.text_in(lang))?,
+            &orchestrator::ProfileKind::Master.path_typed(name)?,
         );
         if let Some(w) = &loaded.warning {
             crate::diag::persist_log(&format!("[master] {name}: {}", w.text_in(Lang::Ja)));
@@ -283,45 +285,43 @@ pub fn load_profile_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> 
                     "[master] {name}: {}",
                     refusal.text_in(Lang::Ja)
                 ));
-                Err(refusal.text_in(lang))
+                Err(refusal)
             }
-            None => Err(e.text_in(lang)),
+            None => Err(e),
         },
     }
 }
 
 /// 引き継ぎで立てる後任 master のプロファイルを読む（#2233）。
 ///
-/// 読み込みは CLI / スマホ / 返答の配送と同じ [`load_profile`]（読めない default は組み込み既定で
-/// 立てて警告）。`load_profile` が止める形（専用プロファイルが無い・読めない）でも、**引き継ぎは
+/// 読み込みは CLI / スマホ / 返答の配送と同じ [`load_profile_typed`]（読めない default は組み込み既定で
+/// 立てて警告）。`load_profile_typed` が止める形（専用プロファイルが無い・読めない）でも、**引き継ぎは
 /// 止めずに組み込み既定で後任を立てて警告する**: 引き継ぎは前任が ctx の上限に近いときの継続の
 /// 仕組みで、止めると人の居ない時間帯に master そのものを失いうる（`tako master -<key>` は
 /// 人が打つので止めて直させる、と役割が違う）。
 ///
 /// 以前は `Profile::load(..).unwrap_or_default()` で、後任だけ個人ルールの抜けた master が
-/// 黙って立っていた（実測）。`TAKO_2233_LEGACY=1` で修正前へ戻す
-pub fn load_successor_profile(name: &str) -> SuccessorProfile {
+/// 黙って立っていた（実測）。`TAKO_2233_LEGACY=1` で修正前へ戻す。
+///
+/// 理由は型で持つ（#2365）: 前任への応答の `warnings` と後任の system prompt は表示言語、persist.log は日本語
+pub fn load_successor_profile(name: &str) -> LaunchProfile {
     if orchestrator::legacy_silent_default_rest() {
-        return SuccessorProfile {
+        return LaunchProfile {
             profile: Profile::load(name).unwrap_or_default(),
             warning: None,
         };
     }
-    match load_profile(name) {
-        Ok(loaded) => SuccessorProfile {
-            profile: loaded.profile,
-            warning: loaded.warning.map(|w| w.text_in(Lang::Ja)),
-        },
+    match load_profile_typed(name) {
+        Ok(loaded) => loaded,
         Err(e) => {
             // 前任と後任が読む文なので、どのプロファイルか・何が抜けるかまで言う
             // （パース失敗の文にはプロファイルの名前が無い）
-            let w = format!(
-                "後任 master のプロファイル '{name}' を読めない（{e}）。引き継ぎは止めずに、\
-                 個人ルール（prompt_blocks）・モデル・アカウントなどの設定を使わない組み込み既定で\
-                 後任を立てる。プロファイルを直すと次の起動から効く"
-            );
-            crate::diag::persist_log(&format!("[master] {name}: {w}"));
-            SuccessorProfile {
+            let w = ProfileFallback::Successor {
+                name: name.to_string(),
+                why: Box::new(e),
+            };
+            crate::diag::persist_log(&format!("[master] {name}: {}", w.text_in(Lang::Ja)));
+            LaunchProfile {
                 profile: Profile::default(),
                 warning: Some(w),
             }
@@ -372,7 +372,7 @@ pub fn load_caller_profile(name: &str, launching: CallerLaunch) -> LaunchProfile
     }
 }
 
-/// `tako solo` の起動で使うプロファイルを読む（#2233）。master の [`load_profile`] と同じ形:
+/// `tako solo` の起動で使うプロファイルを読む（#2233）。master の [`load_profile_typed`] と同じ形:
 /// `default` が読めないときは solo の組み込み既定で立てるが warning を持ち（中身は退避・
 /// default.yaml には触らない）、persist.log へ 1 行残す。無いだけなら黙る。
 /// `-<名前>` が読めなければ従来どおり止める。`TAKO_2233_LEGACY=1` で修正前（黙って既定）へ戻す
@@ -415,7 +415,7 @@ pub fn load_solo_in(name: &str, lang: Lang) -> Result<LaunchProfile, String> {
         .map_err(|e| e.text_in(lang))
 }
 
-/// [`load_profile`] / [`load_solo`] の `default` の本体（パス指定。テストは一時 dir で回す）。
+/// [`load_profile_typed`] / [`load_solo`] の `default` の本体（パス指定。テストは一時 dir で回す）。
 ///
 /// 読み方は専用プロファイルの継承元と同じ 1 実装（[`orchestrator::profile_base_at`]。
 /// 無い = 種別の組み込み既定・空 = 設定なし・読めない = 退避して `Err`）。`Err` を握りつぶさず

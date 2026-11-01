@@ -892,9 +892,10 @@ fn reason_index(r: &Reason) -> usize {
         Reason::LaunchSetupFailed(_) => 333,
         Reason::ProfileCwdUnreachable { .. } => 334,
         Reason::TabNewNoPane => 335,
+        Reason::UserTaskMasterLaunchFailed(_) => 336,
     }
 }
-const REASON_VARIANTS: usize = 336;
+const REASON_VARIANTS: usize = 337;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1508,6 +1509,7 @@ fn reason_samples() -> Vec<Reason> {
             error: "Permission denied (os error 13)".into(),
         },
         Reason::TabNewNoPane,
+        Reason::UserTaskMasterLaunchFailed("the profile's cwd does not exist: /p".into()),
     ]
 }
 
@@ -1909,6 +1911,7 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "セットアップに失敗: Not a directory (os error 20)",
     "プロファイルの cwd に移動できない: /tmp/p (Permission denied (os error 13))",
     "タブ作成の応答に pane が含まれない",
+    "master を起動できない: the profile's cwd does not exist: /p",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
@@ -8015,8 +8018,9 @@ fn dispatch_の設定の断りの番犬の境界() {
 // 起動・継承元・表示・判定の経路がプロファイルを読めないときの理由は persist.log（日本語の診断ログ）と
 // 共有する日本語の `String` だったので、英語表示でも `warnings`・断り・CLI の警告の行・check-health の
 // 括弧の中だけ日本語のまま混ざった。いまは型（`UnreadableProfile` / `ProfileFallback` と `ConfigError` の
-// 3 種）で持ち、利用者へ返す口は表示言語、persist.log と別スライスの経路（スマホの「+ master」・
-// 引き継ぎの後任・`tako setup` の日本語の要約・移行の記録）は `text_in(Lang::Ja)` で組む。ここでは
+// 3 種）で持ち、利用者へ返す口は表示言語、persist.log と日本語の枠（`tako setup` の要約・移行の記録）は
+// `text_in(Lang::Ja)` で組む（スマホの「+ master」= `master_launch::plan` と引き継ぎの後任 =
+// `ProfileFallback::Successor` も #2365 の続きで表示言語へ移した = 下の節）。ここでは
 // (1) 全バリアントの日英と旧文のバイト一致（`ConfigError` の分は上の表）、
 // (2) 口の本体に日本語の固定文を書き足していないこと（上の CONFIG_REFUSAL_SCOPES）、
 // (3) 利用者へ返す口で日本語に固定して組むのは persist.log の行だけであること、
@@ -8034,9 +8038,10 @@ fn profile_fallback_index(f: &ProfileFallback) -> usize {
         ProfileFallback::Adopt { .. } => 2,
         ProfileFallback::Guide(_) => 3,
         ProfileFallback::Display(_) => 4,
+        ProfileFallback::Successor { .. } => 5,
     }
 }
-const PROFILE_FALLBACK_VARIANTS: usize = 5;
+const PROFILE_FALLBACK_VARIANTS: usize = 6;
 
 /// 見本と #2365 より前の固定文（`master_launch.rs` / `dispatch.rs` / `guide.rs` / `orchestrator/mod.rs` が
 /// 書いていた文を見本の値で展開）
@@ -8120,6 +8125,20 @@ fn profile_fallback_table() -> Vec<(ProfileFallback, &'static str)> {
             ProfileFallback::Display(read_only()),
             "/x/default.yaml を読めない（読み取りに失敗: Permission denied (os error 13)）。\
              表示している値はこのファイルではなく組み込み既定。直すと次の呼び出しから効く",
+        ),
+        // 引き継ぎの後任（#2233 の `load_successor_profile` が `format!` で組んでいた文）
+        (
+            ProfileFallback::Successor {
+                name: "p".into(),
+                why: Box::new(ConfigError::ProfileNotFound {
+                    kind: None,
+                    name: "p".into(),
+                    path: "/x/p.yaml".into(),
+                }),
+            },
+            "後任 master のプロファイル 'p' を読めない（プロファイル 'p' が見つからない: /x/p.yaml）。\
+             引き継ぎは止めずに、個人ルール（prompt_blocks）・モデル・アカウントなどの設定を使わない\
+             組み込み既定で後任を立てる。プロファイルを直すと次の起動から効く",
         ),
     ]
 }
@@ -8215,6 +8234,23 @@ const PROFILE_REASON_USER_SCOPES: &[(&str, &str, &str)] = &[
         MASTER_LAUNCH_SRC,
         "pub fn load_profile_in(",
     ),
+    // #2365 の続き: スマホの「+ master」・返答の配送（`plan`）と引き継ぎの後任
+    (
+        MASTER_LAUNCH_PATH,
+        MASTER_LAUNCH_SRC,
+        "pub fn load_profile_typed(",
+    ),
+    (MASTER_LAUNCH_PATH, MASTER_LAUNCH_SRC, "pub fn plan("),
+    (
+        MASTER_LAUNCH_PATH,
+        MASTER_LAUNCH_SRC,
+        "pub fn load_successor_profile(",
+    ),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "fn dispatch_orchestrator_handoff(",
+    ),
     (
         MASTER_LAUNCH_PATH,
         MASTER_LAUNCH_SRC,
@@ -8287,7 +8323,7 @@ fn 読めないプロファイルの理由を利用者へ返す口は日本語�
 #[test]
 fn 読めないプロファイルの理由の番犬は注入を名指す() {
     // (注入先のファイル, 範囲の頭, 注入元, 注入後)
-    let injections: [(&str, &str, &str, &str, &str); 4] = [
+    let injections: [(&str, &str, &str, &str, &str); 6] = [
         (
             DISPATCH_PATH,
             DISPATCH_SRC,
@@ -8315,6 +8351,21 @@ fn 読めないプロファイルの理由の番犬は注入を名指す() {
             "fn orchestrator_master(",
             "let load_warning = load_warning.map(|w| w.text_in(lang));",
             "let load_warning = load_warning.map(|w| w.text_in(Lang::Ja));",
+        ),
+        // #2365 の続き: 引き継ぎの後任（前任への応答・後任の system prompt）と `plan`（スマホの「+ master」）
+        (
+            DISPATCH_PATH,
+            DISPATCH_SRC,
+            "fn dispatch_orchestrator_handoff(",
+            "let load_warning = load_warning.map(|w| w.to_string());",
+            "let load_warning = load_warning.map(|w| w.text_in(Lang::Ja));",
+        ),
+        (
+            MASTER_LAUNCH_PATH,
+            MASTER_LAUNCH_SRC,
+            "pub fn plan(",
+            "let warning = warning.map(|w| w.text_in(lang));",
+            "let warning = warning.map(|w| w.text_in(Lang::Ja));",
         ),
     ];
     for (path, src, head, from, to) in injections {
@@ -8365,6 +8416,173 @@ fn 読めないプロファイルの理由の番犬は注入を名指す() {
         found.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
         vec![want],
         "{ORCH_MOD_PATH}: 口の本体の日本語の固定文を名指していない: {found:?}"
+    );
+}
+
+// ---- #2365 の続き: スマホの「+ master」・返答の配送（`master_launch::plan`）の断り ----
+//
+// `plan` は daemon の `POST /api/tabs/:id/master` と返答の配送（起票 master が居ないときの起動）が呼ぶ
+// 組み立ての 1 実装。以前は String 版の口（`into_ja`）と日本語の固定文で断りを組み、英語表示でも
+// 断りが日本語のまま返った。いまは CLI の `tako master` と同じ型の口 + `text_in(lang)`・`Reason` で組む。
+// ここでは `plan` の本体に (1) 日本語の口（`into_ja` で包む String 版）の呼び出し、(2) 日本語の固定文、
+// が無いことと、返答の配送の枠（「master を起動できない」）が `Reason` を通ることを `file:line` で名指す
+
+/// `plan` の本体が呼んではいけない日本語の口（dispatch の [`JA_CONFIG_CALLS`] に `plan` が呼ぶ口を足す）
+const PLAN_JA_CALLS: [&str; 4] = [
+    ".validate_projects()",
+    "master_remote_control_decision(",
+    ".message()",
+    "load_profile(",
+];
+
+fn scan_plan_body(src: &str) -> Vec<String> {
+    let Some(lines) = front_scope_lines(src, Some("pub fn plan(")) else {
+        return vec![format!(
+            "{MASTER_LAUNCH_PATH}: 走査の範囲 `pub fn plan(` が見つからない（改名で番犬が空振りする）"
+        )];
+    };
+    let mut failures = Vec::new();
+    for (line, call, code) in ja_config_calls(&lines) {
+        failures.push(format!(
+            "{MASTER_LAUNCH_PATH}:{line}: `plan` が日本語の口 `{call}…)` の断りを返している = スマホの \
+             「+ master」・返答の配送で英語表示でも断りが日本語（`*_typed` + `text_in(lang)` で組む）: {code}"
+        ));
+    }
+    for (i, (line, code)) in lines.iter().enumerate() {
+        if code.trim_start().starts_with("//") {
+            continue;
+        }
+        if let Some(call) = PLAN_JA_CALLS.iter().find(|c| code.contains(*c)) {
+            if !statement_discards_error(&lines, i) {
+                failures.push(format!(
+                    "{MASTER_LAUNCH_PATH}:{line}: `plan` が日本語の口 `{call}…)` を呼んでいる \
+                     （型の口 + `text_in(lang)` / `message_in(lang)` で組む）: {}",
+                    code.trim()
+                ));
+            }
+        }
+    }
+    for (line, text) in front_japanese(&lines) {
+        failures.push(format!(
+            "{MASTER_LAUNCH_PATH}:{line}: `plan` の本体に日本語の固定文がある = 英語表示にもそのまま出る \
+             （`Reason` / `ConfigError` の日英の対で組む）: {text}"
+        ));
+    }
+    failures
+}
+
+/// 返答の配送の枠（組み立ての断りを包む「master を起動できない」）が `Reason` を通っていない行
+fn scan_user_task_launch_frame(src: &str) -> Vec<String> {
+    let head = "fn launch_master_for_response(";
+    let Some(lines) = front_scope_lines(src, Some(head)) else {
+        return vec![format!(
+            "{DISPATCH_PATH}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする）"
+        )];
+    };
+    let mut failures = Vec::new();
+    if !lines
+        .iter()
+        .any(|(_, l)| l.contains("Reason::UserTaskMasterLaunchFailed("))
+    {
+        failures.push(format!(
+            "{DISPATCH_PATH}:{}: 返答の配送が組み立ての断りを `Reason::UserTaskMasterLaunchFailed` で包んでいない",
+            lines[0].0
+        ));
+    }
+    for (line, code) in &lines {
+        if !code.trim_start().starts_with("//") && code.contains("\"master を起動できない") {
+            failures.push(format!(
+                "{DISPATCH_PATH}:{line}: 返答の配送の枠を日本語に固定して組んでいる = 英語表示でも \
+                 配送の記録の理由が日本語（`Reason::UserTaskMasterLaunchFailed` で組む）: {}",
+                code.trim()
+            ));
+        }
+    }
+    failures
+}
+
+#[test]
+fn plan_と返答の配送の枠は表示言語で断る() {
+    let mut failures = scan_plan_body(MASTER_LAUNCH_SRC);
+    failures.extend(scan_user_task_launch_frame(DISPATCH_SRC));
+    report_all(failures);
+}
+
+/// 番犬自身の検査（本物のソースへ注入）: `plan` を String 版の口・日本語の固定文へ戻す / 返答の配送の
+/// 枠を `format!` の日本語へ戻すと、それぞれ注入した行を名指す
+#[test]
+fn plan_と返答の配送の枠の番犬は注入を名指す() {
+    // (注入元, 注入後, 名指す行の目印)
+    let plan_injections: [(&str, &str, &str); 4] = [
+        (
+            "profile.validate_env_typed().map_err(|e| e.text_in(lang))?;",
+            "profile.validate_env()?;",
+            "profile.validate_env()?;",
+        ),
+        (
+            ".validate_projects_typed()",
+            ".validate_projects()",
+            ".validate_projects()",
+        ),
+        (
+            "orchestrator::agent_cli::preflight(agent).map_err(|e| e.message_in(lang))?;",
+            "orchestrator::agent_cli::preflight(agent).map_err(|e| e.message())?;",
+            "e.message())?",
+        ),
+        (
+            "orchestrator::config_dir().ok_or_else(|| crate::Reason::HomeDirUnknown.text_in(lang))?;",
+            "orchestrator::config_dir().ok_or(\"ホームディレクトリが取得できない\")?;",
+            "ホームディレクトリが取得できない",
+        ),
+    ];
+    for (from, to, mark) in plan_injections {
+        assert_eq!(
+            MASTER_LAUNCH_SRC.matches(from).count(),
+            1,
+            "注入元が 1 か所でない: {from}"
+        );
+        let injected = MASTER_LAUNCH_SRC.replacen(from, to, 1);
+        let want = injected
+            .lines()
+            .position(|l| l.contains(mark))
+            .map(|i| i + 1)
+            .expect("注入した行");
+        let found = scan_plan_body(&injected);
+        assert!(
+            !found.is_empty()
+                && found
+                    .iter()
+                    .all(|f| f.starts_with(&format!("{MASTER_LAUNCH_PATH}:{want}:"))),
+            "注入（{to}）の行 {want} だけを名指すはず: {found:?}"
+        );
+    }
+    assert!(
+        scan_plan_body(MASTER_LAUNCH_SRC).is_empty(),
+        "本物のソースで名指している"
+    );
+
+    let from = "Some(Reason::UserTaskMasterLaunchFailed(e).to_string()),";
+    assert_eq!(
+        DISPATCH_SRC.matches(from).count(),
+        1,
+        "注入元が 1 か所でない"
+    );
+    let injected = DISPATCH_SRC.replacen(from, "Some(format!(\"master を起動できない: {e}\")),", 1);
+    let want = injected
+        .lines()
+        .position(|l| l.contains("Some(format!(\"master を起動できない"))
+        .map(|i| i + 1)
+        .expect("注入した行");
+    let found = scan_user_task_launch_frame(&injected);
+    assert!(
+        found
+            .iter()
+            .any(|f| f.starts_with(&format!("{DISPATCH_PATH}:{want}:"))),
+        "返答の配送の枠の注入（行 {want}）を名指していない: {found:?}"
+    );
+    assert!(
+        scan_user_task_launch_frame(DISPATCH_SRC).is_empty(),
+        "本物のソースで名指している"
     );
 }
 
