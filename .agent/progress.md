@@ -20,28 +20,6 @@
 
 ---
 
-## 2026-10-31（#2569: 台帳 / projects.yaml / accounts.yaml の `mutate` が閉包の断りでも書き戻し 0 件のファイル作成・手書きの形の書き直しをしていた → `try_mutate_typed`（Err なら書かない）へ寄せ、番犬 `issue2569_refusal_writeback` が file:line で名指す）
-- 実経路（CLI / MCP・日英）で修正前 NG 32 → 修正後 0・出力 128 ファイルがバイト一致・カタログ +0 B。PR #2572
-
-## 2026-10-31（#2365 の続き: 対応マトリクス・移行・使用量・起動時ロードの予算の断りを `Reason` の 10 種、remote 系（会話の末尾・端末・daemon の admin API・スクロールバック・セットアップ）を新しい `RemoteRefusal`（31 種）へ。daemon の本文に `kind` を添えて呼び手の言語で組み直す）
-- 実経路で英語表示の日本語入り dispatch 27 / 27・CLI 18 / 22・MCP 15 / 15 → 0・日本語は sha256 一致・注入 6 通りで名指し + E0004・カタログ +0 B。PR #2573
-
-## 2026-10-31（#2564: 未知のシェルで tako setup が同じ断りで止まる `tako setup bootstrap path` へ誘導していた → 残りは `AgentPathByHand`（次の 1 行なし・理由に足すディレクトリの全文）、tako CLI の段と `--check` は一覧で閉じる、足し終えたら断らず already_on_path）
-- 未知のシェル 12 本で誘導 0・既知のシェル 60 ファイルがバイト一致・注入 5 通りで file:line を名指し・カタログ +0 B。PR #2571
-
-## 2026-10-31（#1632: remote のトークン・QR・状態ファイルの置き場を Windows でも本人 + SYSTEM だけの DACL（継承を切る）にする。境界 B32 `platform::private_file`・A/B `TAKO_1632_LEGACY=1`・unix は同じ呼び出し）
-- CI の Windows ジョブで Win32 と icacls の読み戻し（修正後 2 者・`(I)` 無し / 旧アームは継承のまま）・番犬が no-op への戻しを file:line で名指す・カタログ +0 B。PR #2575
-
-## 2026-10-31（#2570: ペインの中から起こし直した GUI がペインの env（識別・接続・claude の印・`GIT_EDITOR=true`・重なった `XDG_DATA_DIRS`）を新しいペインと子へ素通しにしていた → `tako_core::host_env::STRIP` を main の最初で外し unix は exec し直す（A/B `TAKO_2570_LEGACY=1`））
-- 隔離 GUI の A/B でペインと子の env が Dock 起動相当と一致・`ps eww` も外れる・番犬 `issue2570_inherited_pane_env_watchdog`・カタログ +0 B。PR #2574
-- 19:03 に `3aac66e` を install・GUI 再起動（master のペインから `open -a` = この再 exec の経路・復元失敗 0）の本番確認で #2570 を閉じた
-
-## 2026-10-31（#2365 の続き: tmux のセッション操作（`TmuxRefusal` / `TmuxRunError`。口は名前のまま型を返す）・git show・edit type・LSP の初期化オプション・worker の解決とレジストリ・layout の config.yaml・remote agents の断りを表示言語へ）
-- GUI 無しの実経路で英語の日本語入り 26 / 27 → 0（残り 1 は git の stderr）・隔離 GUI の CLI / MCP 18 / 18 → 0 / 18・日本語は sha256 一致・注入 6 か所を名指し + E0004・カタログ +0 B。PR #2579
-
-## 2026-10-31（#2576: 未知のシェルで welcome の次の一手と check-health の cli_in_path が `tako setup bootstrap path` へ誘導していた → welcome は `NextStep::PathByHand`（段は path のまま command null・dirs と断りの全文）、check-health は `--check` と同じ判定 `tako_cli_dir_by_hand` + `tako_cli_in_path_issue`（日本語固定））
-- 未知のシェル 4 ケース × 5 出力で誘導 0・既知のシェルと足し終えた後の 48 ファイルがバイト一致・注入 5 通りで file:line を名指し・カタログ +0 B。PR #2580
-
 ## 2026-10-31（#2581: control.json と instances/・IPC のトークン・usage の塩・shortcuts・スマホから受け取ったファイル・ペインの最後の出力の置き場を境界 `platform::private_file` へ寄せ、Windows も本人 + SYSTEM だけの DACL に。境界は当てられない置き場で呼び手を止めず・同じ DACL は当て直さない）
 - CI の Windows で Win32 と icacls の読み戻し・隔離 GUI の A/B で unix の mode と CLI / MCP の接続が修正前と一致・番犬が境界の外の本人だけの mode を file:line で名指す・カタログ +0 B。PR #2584
 
@@ -78,3 +56,22 @@
 
 ## 2026-11-01（#2598: `wait_isolated_gui` の素の `tako list` が呼び手の env（本番の `TAKO_SOCKET` / 既定の置き場）で本番 GUI へ届き、隔離 GUI が立つ前に返っていた → ヘルパの CLI を `iso_cli`（本番の env を落とし GUI と同じ発見の置き場）へ・置き場が空ならログの隣に決めて GUI にも渡す・番犬が `scripts/lib/*.sh` を「その行で隔離」の規則で読む（A/B `TAKO_2598_LEGACY=1`））
 - 本番役の隔離 GUI + 中継で修正前は 7 通り中 6 通りで本番役へ届く（1 回の待ちで 1 件・launch を通さない待ちは 30 件）→ 修正後 0 件・代表 2 本の rc と PASS / FAIL は一致・カタログ +0 B。PR #2601
+
+## 2026-11-01（#2602: bash のログインは `.bash_profile` → `.bash_login` → `.profile` の最初の 1 つだけを読むのに、setup が `.profile` / `.bash_login` だけの人に `.bash_profile` を作り、undo 後も 0 バイトで残して覆い隠していた → 書き先を `bash -l` が読む 1 つに（`ShellKind::login_profile_in`）・undo で 0 バイトになったファイルは消す・A/B `TAKO_2602_LEGACY=1`）
+- 本物の `bash -l` で修正前は `.profile` の変数が unset → 修正後は読む。9 シェル × 5 通りの 45 ケースのうち変わったのは理由つきの 26（bash の書き先 2・作ったファイルの削除 24）で、残り 19 はバイト一致。注入 2 通りを番犬が file:line で名指し。カタログ +0 B。PR #2605
+
+## 2026-11-01（#2365 の続き: dispatch の注記 32 種と fda の description を新しい `ReplyNote` へ、CLI の手元の断り 17 種を `Reason`・突然死からの復旧 3 種を `SessionRefusal` へ、同じ出力の行 17 種も `ReplyNote` へ）
+- CLI 23 ケースで英語の日本語入り 23 → 0（日本語 20 / 23 sha256 一致・残り 3 は移行の知らせの言語の修正）・隔離 GUI 13 / 13 → 0 / 13（日本語 13 / 13 一致）・注入で名指し + E0004・カタログ +0 B。PR #2606
+
+## 2026-11-01（#2597: tcsh / csh の利用者の明示コマンドのペインが `-l` で消える / 器経由は `Unmatched '''.` で止まる → ログインの層は表の csh 系の行を `exec -a` の段越しに・器の 1 行は csh の引用（A/B `TAKO_2597_LEGACY=1`））
+- 隔離 GUI で修正前 9 本とも不成立（器なしの tcsh / csh 6 本 = `Unknown option`・器ありの tcsh 3 本 = `Unmatched`） → 修正後 tcsh / csh × 器なし / 器ありの 12 本が起きる・csh 系でない 6 種の argv は修正前と一致・カタログ +0 B。PR #2607
+
+## 2026-11-01（#2603: 名前が dash / ksh のシェルは種別の分からないシェルの断りで手作業だった → 本物の dash と ksh93u+ が `-l -c`・argv[0]・対話ログインで `.profile` を読むと確かめて `ShellKind::Sh` へ寄せる（`SH_PROFILE_SHELLS`）・確かめていない mksh ほかは寄せない・A/B `TAKO_2603_LEGACY=1`）
+- 砂場の CLI で修正前は断り（rc=1）・段は path → 修正後は `.profile` に書いて auth へ進み、本物の `dash -l` / `ksh -l` から claude を引ける。既知のシェル 8 種 × 3 通りの 24 ケースはバイト一致。注入 2 通りを番犬が file:line で名指し。カタログ +0 B。PR #2609
+
+## 2026-11-01（#2608: GUI の自動復帰が daemon を入れ替える途中の remote status が、新版の待ち受けを PID ファイルの無い待ち受け（#2455）と読んで `tako remote stop` を案内していた → `spawn_daemon` が抜けるまで `tako-remote.starting` を置き、status は `starting`（replacing / starting）を返して stop を案内しない（書き手の死・pid の再利用・90 秒で失効・A/B `TAKO_2608_LEGACY=1`））
+- 隔離 GUI の実経路で修正前 FAIL 6（区間の 35 読みが全部 stop の案内）→ 修正後 PASS 27・MCP も同じ・注入で番犬が file:line を名指し・カタログ +0 B。PR #2611
+
+## 2026-11-01（#2365 の続き: check-health 一式と `tako setup --check` を表示言語へ。文は新しい `HealthText`（147 種）、共有の文は各モジュールの `_in(lang)`。`setup --check` は「setup は日本語」の枠から外した）
+- 英語表示の日本語入り: CLI 経路 12/12 → 0/12・隔離 GUI の CLI / MCP 3/3 → 0/3（問題 0 件でも同じ）。日本語は全件一致（意図した差は旧文の空白 1 か所）。注入 7 通りを名指し / E0004・カタログ +0 B。PR #2612
+- 09:09 に `31b5683` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）。再起動直後 90 秒の status 180 回で stop の案内 0（区間は starting.state=replacing）の本番確認で #2608 を閉じた
