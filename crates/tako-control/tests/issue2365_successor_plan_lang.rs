@@ -476,10 +476,7 @@ fn run(lang: Lang, out: &mut Vec<Out>) {
     }
     // ⑥ 後任（境界・断り）: プロファイルの cwd が無い = 分割の前に断る
     {
-        let case = Case::new(Some(&format!(
-            "cwd: '{}'\n",
-            Path::new("/nonexistent-2365").display()
-        )));
+        let case = Case::new(Some("cwd: '/nonexistent-2365'\n"));
         case.memo("default");
         let mut host = Host::master();
         c.handoff(&case, &mut host, "handoff/cwd_broken", "master", "default");
