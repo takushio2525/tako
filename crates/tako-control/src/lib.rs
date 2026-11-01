@@ -160,8 +160,8 @@ pub use health_text::{ContainerLimitNote, HealthText};
 pub use host::{
     cleanup_tmux_servers_default, ChangelogDiffTarget, OrphanCleanupPlan, PreviewConflict,
     PreviewFormatSource, PreviewGotoSource, PreviewHost, PreviewLineTarget, RemoteHost,
-    RemoteStartJob, SessionHost, SystemHost, TmuxCleanupJob, TmuxHost, UiStateHost, VideoStatus,
-    WebViewHost, WorkspaceHost,
+    RemoteStartJob, RemoteStatusJob, RemoteStopJob, SessionHost, SystemHost, TmuxCleanupJob,
+    TmuxHost, UiStateHost, VideoStatus, WebViewHost, WorkspaceHost,
 };
 pub use host_refusal::{HostRefusal, VideoRefusal};
 pub use ipc::{IncomingRequest, IpcServer};

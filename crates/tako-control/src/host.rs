@@ -1413,11 +1413,17 @@ pub trait WebViewHost {
 }
 
 // ---------------------------------------------------------------------------
-// RemoteHost — リモートアクセス API（4 メソッド）
+// RemoteHost — リモートアクセス API（6 メソッド）
 // ---------------------------------------------------------------------------
 
 /// `remote_start` の本体を UI スレッドの外で走らせる 1 回きりの仕事（#1555）
 pub type RemoteStartJob = Box<dyn FnOnce() -> Result<Value, String> + Send>;
+
+/// `remote_stop` の本体を UI スレッドの外で走らせる 1 回きりの仕事（#2630）
+pub type RemoteStopJob = Box<dyn FnOnce() -> Result<Value, String> + Send>;
+
+/// `remote_status` の本体を UI スレッドの外で走らせる 1 回きりの仕事（#2630）
+pub type RemoteStatusJob = Box<dyn FnOnce() -> Value + Send>;
 
 pub trait RemoteHost {
     /// リモートアクセス API サーバーを起動する。成功時は状態 JSON を返す。
@@ -1439,9 +1445,26 @@ pub trait RemoteHost {
     fn remote_stop(&mut self) -> Result<Value, String> {
         Err(crate::HostRefusal::DefaultRemoteApiNotRunning.into())
     }
+    /// `remote_stop` と同じ停止を background で走らせるための仕事（#2630）。
+    ///
+    /// 停止は daemon が畳み終わる（serve の解除を含む）のを最長数秒待ち、止まった後に
+    /// 状態（[`Self::remote_status`] と同じ調べ）を読み直す。UI スレッドで待つとその間 GUI が
+    /// 止まる（本番の `dispatch:RemoteStop` 247〜349ms）。IPC の受け口と設定画面の「停止」は
+    /// `prepare_offload` でこれを background へ出す。`None`（既定）= 同期の腕（`remote_stop`）で答える
+    fn remote_stop_job(&self) -> Option<RemoteStopJob> {
+        None
+    }
     /// リモートアクセス API サーバーの状態を返す
     fn remote_status(&self) -> Value {
         serde_json::json!({ "running": false })
+    }
+    /// `remote_status` と同じ照会を background で走らせるための仕事（#2630）。
+    ///
+    /// daemon の稼働中の状態は 2 系統の同居の調査で tailscale の CLI を最大 3 本起こす
+    /// （1 本の上限 10 秒）。IPC の受け口と設定画面のリモートタブの読み直しは `prepare_offload` で
+    /// これを background へ出す。`None`（既定）= 同期の腕（`remote_status`）で答える
+    fn remote_status_job(&self) -> Option<RemoteStatusJob> {
+        None
     }
 }
 

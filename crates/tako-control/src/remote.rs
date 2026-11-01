@@ -540,6 +540,20 @@ pub fn start_offload_legacy() -> bool {
     )
 }
 
+/// A/B: #2630 前へ戻す（IPC と設定画面の `RemoteStop` / `RemoteStatus` を UI スレッドで同期に待つ）
+pub const STOP_STATUS_OFFLOAD_LEGACY_ENV: &str = "TAKO_2630_LEGACY";
+
+/// `RemoteStop` / `RemoteStatus` を background へ出さず、修正前と同じく UI スレッドで待つか（#2630 の A/B）。
+/// 要求のたびに読む（[`start_offload_legacy`] と同じ）
+pub fn stop_status_offload_legacy() -> bool {
+    matches!(
+        std::env::var(STOP_STATUS_OFFLOAD_LEGACY_ENV)
+            .ok()
+            .as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// いまのスレッドが名乗っている経路
 fn current_origin_str() -> &'static str {
     REQUEST_ORIGIN
