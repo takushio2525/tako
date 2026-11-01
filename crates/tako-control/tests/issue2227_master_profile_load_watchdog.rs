@@ -318,7 +318,10 @@ fn scan_launch(src: &str) -> Vec<Offender> {
         }
     }
     match fn_window(src, "pub fn load_profile_typed(") {
-        None => push(0, "`load_profile_typed` が見つからない（走査が空振り）".into()),
+        None => push(
+            0,
+            "`load_profile_typed` が見つからない（走査が空振り）".into(),
+        ),
         Some((at, window)) => {
             if !window_has(&window, "load_default_at(") {
                 push(
