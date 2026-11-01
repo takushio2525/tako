@@ -12930,9 +12930,10 @@ fn remote_refusal_index(r: &RemoteRefusal) -> usize {
         RemoteRefusal::MagicDnsMissing => 30,
         RemoteRefusal::DaemonStarting { .. } => 31,
         RemoteRefusal::DaemonStartingStop { .. } => 32,
+        RemoteRefusal::IsolatedServe => 33,
     }
 }
-const REMOTE_REFUSAL_VARIANTS: usize = 33;
+const REMOTE_REFUSAL_VARIANTS: usize = 34;
 
 /// 起こしている途中の印の見本（#2613 の断りの表に使う）
 fn starting_marker(via: &str, previous_pid: Option<u32>) -> StartingMarker {
@@ -13137,6 +13138,16 @@ fn remote_refusal_table() -> Vec<(RemoteRefusal, String)> {
             "`tako remote start`がリモート daemon を起動している途中です（開始から 3 秒）。\
              いま止めても進行中の起動が daemon を起こし直すため、止めていません。\
              終わるまで待ってから `tako remote stop` で止めてください"
+                .into(),
+        ),
+        // #2619 で足した断り（#2365 より前の文は無いので、日本語の見本を固定する）
+        (
+            RemoteRefusal::IsolatedServe,
+            "隔離中（TAKO_ISOLATED）なので、tailscale の serve を張らずに止めました。\
+             serve はこの機械の Tailscale のノード全体の設定で、隔離の外にある本番の公開や\
+             利用者の serve 設定を書き換えるためです。serve を張らずに試すなら TAKO_REMOTE_TEST_MODE=1、\
+             偽の tailscale で試すなら TAKO_TAILSCALE_BIN=<偽物のパス>、本物の serve まで確かめるなら \
+             TAKO_REMOTE_ISOLATED_SERVE=1 を付けてください"
                 .into(),
         ),
     ]

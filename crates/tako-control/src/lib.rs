@@ -93,6 +93,8 @@ pub mod remote_autostart;
 pub mod remote_cards;
 pub mod remote_files;
 pub mod remote_generation;
+/// 隔離中（`TAKO_ISOLATED`）は本物の tailscale の serve を張らない門（#2619）
+pub mod remote_isolated_serve;
 pub mod remote_launch;
 pub mod remote_preview;
 pub mod remote_refusal;

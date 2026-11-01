@@ -3295,8 +3295,12 @@ struct TakoApp {
     restore_source: Option<tako_control::layout::LayoutFile>,
     /// 器を使わずに起こすペイン（#641 の救済のシェル。`spawn_session` が 1 回だけ消費する）
     direct_spawn: std::collections::HashSet<PaneId>,
-    /// ペインの平文ログ管理（Issue #112 B）
+    /// ペインの平文ログ管理（Issue #112 B）。#2618 以後、Mutex の内側はメモリの操作だけで、
+    /// ファイルへの操作は `pane_log_writer` の列へ積む（メインスレッドで I/O を待たない）
     pane_logs: std::sync::Arc<std::sync::Mutex<tako_core::pane_log::PaneLogManager>>,
+    /// ペインログの専用の書き手（#2618）。終了の前に `flush_pane_log_writer` で書き終わりを待つ
+    /// （マネージャーの Mutex を取らずに待てるよう、持ち手をここにも持つ）
+    pane_log_writer: tako_core::pane_log_writer::PaneLogWriter,
     /// 器のペインの取り込みの間合い（#2018。どの tick で tmux を起こすかを決める）
     pane_log_pace: HashMap<PaneId, tako_core::pane_log::BackendPace>,
     /// 器の kill を待っているクローズフラッシュ（#2018。`drop_backend_session` が消費する）
@@ -5145,6 +5149,14 @@ impl TakoApp {
         let mut theme_warning_log = tako_control::settings::ThemeWarningLog::default();
         let startup_theme = load_theme_logged(&mut theme_warning_log);
 
+        // ペインログのファイルへの操作の書き手（#2618）。既定は背景のスレッド 1 本で、1 件が遅かったら
+        // perf.log へ 1 行（メインスレッドは待っていない）。A/B は積んだ場で同期で書く = 修正前
+        let pane_log_writer = if tako_core::pane_log::issue2618_legacy() {
+            tako_core::pane_log_writer::PaneLogWriter::inline()
+        } else {
+            tako_core::pane_log_writer::PaneLogWriter::spawn(tako_control::diag::perf_log)
+        };
+
         let mut app = Self {
             // ルートペイン（復元時は全ペイン）は下の spawn_session でセッションを張る
             workspace,
@@ -5562,8 +5574,10 @@ impl TakoApp {
                     tako_core::pane_log::log_dir()
                         .unwrap_or_else(|| std::env::temp_dir().join("tako-pane-logs")),
                     tako_control::settings::load().pane_log_config(),
-                ),
+                )
+                .with_writer(pane_log_writer.clone()),
             )),
+            pane_log_writer,
             pane_log_pace: HashMap::new(),
             pane_log_close_pending: HashMap::new(),
             autosave_pending: std::collections::HashSet::new(),
@@ -5764,6 +5778,9 @@ impl TakoApp {
             // 書き終えてから抜ける。quitting でも待つ（削除はその経路で来る）。下の後片付けが
             // 検証起動の置き場を消すより前に待つ（消した後で書き戻さない）
             this.flush_layout_writer("on_app_quit");
+            // #2618: ペインログの書き手へ積んだ追記（上の直接ペインのクローズフラッシュ・最後のタブの
+            // 明示クローズのフラッシュ）を書き終えてから抜ける。quitting でも待つ・後片付けより前
+            this.flush_pane_log_writer("on_app_quit");
             // #1192 / #1253: このプロセスだけが使う資源（自分の pid から作った使い捨ての
             // backend サーバーとソケットファイル・検証起動の設定置き場）を片付ける。
             // セルフテストの失敗の出口（`self_test::fail`）と同じ 1 実装（#2388）
@@ -7411,10 +7428,15 @@ impl TakoApp {
                     let mgr = pane_logs.clone();
                     cx.background_executor()
                         .spawn(async move {
+                            // #2618: 削除（走査・stat・remove）は書き手の列に並べ、受け口は
+                            // マネージャーの Mutex を放してから待つ（握ったまま待つと、その間
+                            // メインスレッドの取り込み・閉じたときのフラッシュを止める）
                             let removed = {
                                 let guard = mgr.lock().unwrap_or_else(|p| p.into_inner());
-                                guard.enforce_total_cap()
-                            };
+                                guard.queue_total_cap()
+                            }
+                            .recv()
+                            .unwrap_or(0);
                             if removed > 0 {
                                 eprintln!(
                                     "info: ペインログの全体上限で {removed} ファイルを削除した"
@@ -13266,6 +13288,19 @@ impl TakoApp {
         if waited >= Duration::from_secs(1) && !self.secondary {
             persist_diag(&format!(
                 "{why}: layout.json の書き出しを {}ms 待った（#2610）",
+                waited.as_millis()
+            ));
+        }
+    }
+
+    /// ペインログの書き手へ積んだファイルへの操作が終わるまで待つ（#2618）。終了の直前に呼ぶ
+    /// （閉じたペインの最後の行とクローズマーカーを残す）。マネージャーの Mutex は取らない。
+    /// 待つ長さは修正前の同期の追記と同じで短くはならないので、1 秒を超えたら persist.log へ残す
+    fn flush_pane_log_writer(&self, why: &str) {
+        let waited = self.pane_log_writer.flush();
+        if waited >= Duration::from_secs(1) && !self.secondary {
+            persist_diag(&format!(
+                "{why}: ペインログの書き出しを {}ms 待った（#2618）",
                 waited.as_millis()
             ));
         }
