@@ -371,15 +371,29 @@ fn 寄せ先の1実装を通る() {
             "wait_with_timeout(child, label, budget)",
         ],
     );
+    // 畳み方は #2633 で TERM → 猶予 → KILL（グループへ TERM を 1 回・残りは刈り取り係が猶予の後に
+    // SIGKILL = rc の孫も残さない。形の拘束の本体は issue2633_probe_group_term_watchdog）
     expect(
         PROBE,
         "kill_on_timeout",
         &[
             "libc::getpgid(pid) == pid",
-            "libc::kill(-pid, libc::SIGKILL)",
+            "libc::kill(-pid, libc::SIGTERM)",
         ],
     );
-    expect(PROBE, "wait_with_timeout", &["kill_on_timeout(&mut child)"]);
+    expect(
+        PROBE,
+        "reap_group_in_background",
+        &["libc::kill(-pgid, libc::SIGKILL)"],
+    );
+    expect(
+        PROBE,
+        "wait_with_timeout",
+        &[
+            "kill_on_timeout(&mut child)",
+            "reap_group_in_background(child)",
+        ],
+    );
     // check-health / setup の経路: 導入状況の検出は上限つきで 1 回だけ（PATH の判定でも使い回す）
     expect(
         SETUP_BOOTSTRAP,

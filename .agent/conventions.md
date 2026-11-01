@@ -1582,6 +1582,17 @@ codex 0.154.0 はセッションの終わりに **SIGTERM**、agy はセッシ�
   打ち切りを persist.log へ名前ごとに 1 行残す（受け口は `bin_resolve::set_notice_sink`）。番犬
   `crates/tako-control/tests/issue1533_login_shell_timeout_watchdog.rs`、実経路
   `bash scripts/test-login-shell-timeout-1532.sh`、A/B `TAKO_1532_LEGACY=1`
+- **打ち切ったログインシェルのグループは TERM → 猶予 → KILL で畳む**（#2633）。いきなりグループごと
+  SIGKILL すると rc の途中の処理が後片付けを走らせられない（`.zprofile` の `pyenv rehash` が持つ
+  `shims/.pyenv-shim` が残り、以後のログインシェルの rehash がそれを 60 秒待つ。上限 5 秒の問い合わせは
+  自分では片付けられず、残っている間の問い合わせが全部打ち切りになる = 修正前の実測で check-health の
+  後続 5 本が全部「5 秒で応答なし」）。`probe::kill_on_timeout` はグループを率いる子ならグループへ
+  **SIGTERM を 1 回だけ**送り（直接の子にも SIGKILL を送らない）、呼び手へはその場で返す。猶予
+  （`probe::GROUP_TERM_GRACE` = 1 秒）の見張りと残りへの SIGKILL は刈り取り係
+  `probe::reap_group_in_background` が持ち、**頭は判定が済むまで刈り取らない**（刈り取るとグループの番号が
+  空いて別のグループへ SIGKILL を送りうる）。生き死には `kill(-pgid, 0)`（macOS は刈り取り前の頭だけだと
+  EPERM・刈り取った後は ESRCH）。番犬 `crates/tako-control/tests/issue2633_probe_group_term_watchdog.rs`、
+  実経路 `bash scripts/measure-shutdown-hup-2633.sh`（`ONLY=c`）、A/B `TAKO_2633_LEGACY=1`
 - **ログインシェルの起こし方はシェル種別の表 `platform::exe::login_invocation` の 1 実装で決める**（#2577）。
   tcsh / csh は `-l` を唯一の引数としてしか受け付けず、`$SHELL -l -c …` が毎回 `Unknown option: '-l'` で
   落ちていた（探索・PATH の読み取り・CLI の子のすべて。修正前の砂場の check-health でログインシェルでだけ
