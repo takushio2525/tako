@@ -5,7 +5,7 @@
 //! 応答の手順（`respond_via`）は番号キーの後に 400ms・Enter の後に 400ms の固定の待ち（`std::thread::sleep`）を
 //! 挟んで画面を読み直す。UI スレッドの同期の dispatch で回すとその間 GUI が止まり、別の IPC も待たされる
 //! （本番の perf.log の `dispatch:OrchestratorRespond` 8 回すべて 401〜414ms。段 1 では隔離 GUI の模擬 TUI で
-//! 408ms / Enter の要る形は 804ms・その間の `tako list` が 315 / 703ms 待たされた）。画面のグリッドは PTY の I/O
+//! 403〜408ms / Enter の要る形は 804〜805ms・その間の `tako list` が 308〜326 / 696〜766ms 待たされた）。画面のグリッドは PTY の I/O
 //! スレッドが更新し、読み書きの手（`PaneAccess`）は `Send` なので、届き方の解決（host が要る）だけを UI スレッドで
 //! 行い、手順は background で回せる（#813 の自動復帰が既に同じ形）。いまは IPC の受け口とチャット表示の承認カードが
 //! `prepare_offload` → `OffloadJob::OrchestratorRespond` で background へ出す（#1555 / #2630 と同じ形）。
