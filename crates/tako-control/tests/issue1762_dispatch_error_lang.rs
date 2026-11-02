@@ -2354,6 +2354,7 @@ use tako_core::lsp::{
     format::ParseError as FormatParseError, rename::ParseError as RenameParseError,
 };
 use tako_core::preview_limit::Truncation;
+use tako_core::remote_open::PaneSshBlock;
 use tako_core::runner::RunnerError;
 use tako_core::terminal::SessionError;
 use tako_core::text_edit::{ChangesError, LineOpError, NotEditable, RangeEditError, TextEditError};
@@ -2425,6 +2426,8 @@ const FILE_MOVE_SRC: &str = include_str!("../../tako-core/src/file_move.rs");
 const FILE_MOVE_PATH: &str = "crates/tako-core/src/file_move.rs";
 const FILE_COPY_SRC: &str = include_str!("../../tako-core/src/file_copy.rs");
 const FILE_COPY_PATH: &str = "crates/tako-core/src/file_copy.rs";
+const REMOTE_OPEN_SRC: &str = include_str!("../../tako-core/src/remote_open.rs");
+const REMOTE_OPEN_PATH: &str = "crates/tako-core/src/remote_open.rs";
 
 // 型ごとの通し番号（網羅 match = バリアントを足すとここがコンパイルで落ち、
 // [`core_cases`] へ見本と旧文を足すまで通らない）
@@ -2569,6 +2572,62 @@ fn copy_refusal_index(r: &CopyRefusal) -> usize {
     }
 }
 const COPY_REFUSALS: usize = 16;
+
+fn ssh_block_index(b: &PaneSshBlock) -> usize {
+    match b {
+        PaneSshBlock::NoSession => 0,
+        PaneSshBlock::AltScreen => 1,
+        PaneSshBlock::Running => 2,
+        PaneSshBlock::AgentRole => 3,
+    }
+}
+const SSH_BLOCKS: usize = 4;
+
+/// 見本のペイン番号（SSH 化の断りは `pane {pane}` で始まる）
+const SSH_BLOCK_PANE: u64 = 7;
+
+/// SSH 化の断りの見本と #2365 より前の固定文（`PaneSshBlock::message` の日本語をペイン 7 で展開したもの）
+fn ssh_block_table() -> Vec<(PaneSshBlock, &'static str)> {
+    vec![
+        (
+            PaneSshBlock::NoSession,
+            "pane 7 にはターミナルセッションが無い（プレビュー等）ので SSH 化できない。\
+             target=split で新しいペインを作って接続する",
+        ),
+        (
+            PaneSshBlock::AltScreen,
+            "pane 7 は全画面 TUI を表示中（素のシェルではない）ので SSH 化できない。\
+             TUI を終了させるか、target=split で新しいペインを作って接続する",
+        ),
+        (
+            PaneSshBlock::Running,
+            "pane 7 はコマンド実行中なので SSH 化できない（入力が実行中の\
+             プロセスへ流れる）。終わるのを待つか、target=split で新しいペインを作って接続する",
+        ),
+        (
+            PaneSshBlock::AgentRole,
+            "pane 7 は AI エージェントのペインなので SSH 化できない\
+             （対話が壊れる）。target=split で新しいペインを作って接続する",
+        ),
+    ]
+}
+
+/// SSH 化の断りを [`Bilingual`] の口へ載せる（`text_in` がペイン番号を受けるので見本の番号を束ねる）。
+/// `Display` は利用者へ出す口の `message`（表示言語）
+#[derive(Debug)]
+struct SshBlockAt(PaneSshBlock);
+
+impl std::fmt::Display for SshBlockAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message(SSH_BLOCK_PANE))
+    }
+}
+
+impl Bilingual for SshBlockAt {
+    fn text(&self, lang: Lang) -> String {
+        self.0.text_in(SSH_BLOCK_PANE, lang)
+    }
+}
 
 /// 移動の断りの見本と #2365 より前の固定文（`MoveRefusal::reason` の日本語。値は ASCII）
 fn move_refusal_table() -> Vec<(MoveRefusal, &'static str)> {
@@ -2979,6 +3038,12 @@ fn core_cases() -> Vec<CoreCase> {
         let arm = variant_name(&format!("{r:?}")).to_string().leak();
         out.push(case(r, copies, arm, old));
     }
+    // #2365 の続き: 既存ペインの SSH 化の断り（`list` の `can_ssh.note`・open-in remote の target=pane の断り）
+    let ssh = (REMOTE_OPEN_SRC, REMOTE_OPEN_PATH, "impl PaneSshBlock {");
+    for (b, old) in ssh_block_table() {
+        let arm = variant_name(&format!("{b:?}")).to_string().leak();
+        out.push(case(SshBlockAt(b), ssh, arm, old));
+    }
     out
 }
 
@@ -3001,6 +3066,8 @@ fn core_のエラー型の見本は全バリアントを1つずつ持つ() {
     covers_all(&moves, move_refusal_index, MOVE_REFUSALS);
     let copies: Vec<CopyRefusal> = copy_refusal_table().into_iter().map(|(r, _)| r).collect();
     covers_all(&copies, copy_refusal_index, COPY_REFUSALS);
+    let blocks: Vec<PaneSshBlock> = ssh_block_table().into_iter().map(|(b, _)| b).collect();
+    covers_all(&blocks, ssh_block_index, SSH_BLOCKS);
     // 1 つずつ並べた型（LineOp / Session / Runner / Backend / ParseError 2 種）は
     // 見本の数を網羅 match の通し番号の数とそろえる
     let cases = core_cases();
@@ -14989,6 +15056,153 @@ fn daemonの他の受け口の番犬は本物のソースへ植えた日本語�
         if !got.is_empty() {
             failures.push(format!("{path}: 植えていないのに名指した: {got:?}"));
         }
+    }
+    report_all(failures);
+}
+
+// ─────────── SSH 化の断りの 409 の読み（#2365 の続き） ───────────
+//
+// 既存ペインの SSH 化の断り（`PaneSshBlock`）は GUI の dispatch が `Operation` に載せて返し、IPC を越えると
+// 文字列になる。remote daemon（`remote_ssh::is_refusal`）はその文を「dispatch の正常な拒否 = 409」と
+// 「経路の故障 = 502（IPC の接続を捨てる）」へ分けるので、断りの文を表示言語に従わせても読みが
+// 取り残されないこと（日英のどの文でも 409）と、読みが型の 1 実装を通ることを見る
+
+/// 読みの本体（`PaneSshBlock::says_blocked`）の行
+fn says_blocked_where() -> String {
+    match REMOTE_OPEN_SRC
+        .lines()
+        .position(|l| l.contains("pub fn says_blocked("))
+    {
+        Some(i) => format!("{REMOTE_OPEN_PATH}:{}", i + 1),
+        None => format!("{REMOTE_OPEN_PATH}（says_blocked が見つからない）"),
+    }
+}
+
+/// SSH 化の断りの日英の対を書いた行
+fn ssh_block_where(b: PaneSshBlock, lang: Lang) -> String {
+    where_arm(
+        REMOTE_OPEN_SRC,
+        REMOTE_OPEN_PATH,
+        "impl PaneSshBlock {",
+        variant_name(&format!("{b:?}")),
+        lang,
+    )
+}
+
+#[test]
+fn ssh化の断りは日英のどの文でも409と読める() {
+    let mut failures = Vec::new();
+    for (b, _) in ssh_block_table() {
+        for lang in [Lang::Ja, Lang::En] {
+            let text = b.text_in(SSH_BLOCK_PANE, lang);
+            // dispatch は `Operation` に載せて返す = IPC の向こうに届く文はその表示
+            let wire = E::Operation(text.clone()).text_in(lang);
+            if !PaneSshBlock::says_blocked(&wire) {
+                failures.push(format!(
+                    "{}: {b:?} / {lang:?} の文を SSH 化の断りと読めない = remote daemon が 409 ではなく 502 を返して \
+                     IPC の接続を捨てる（文に `{}` を入れる。読みは {}）: {text}",
+                    ssh_block_where(b, lang),
+                    PaneSshBlock::NEXT_STEP,
+                    says_blocked_where()
+                ));
+            }
+            if E::says_not_found(&wire) {
+                failures.push(format!(
+                    "{}: {b:?} / {lang:?} の文が「見つからない」の読みに当たる（404 寄せの口で別の断りに化ける）: {text}",
+                    ssh_block_where(b, lang)
+                ));
+            }
+        }
+    }
+    // 当たるのは SSH 化の断りだけ（ペイン解決の失敗・daemon 自身の注記には当たらない）
+    for lang in [Lang::Ja, Lang::En] {
+        for other in [
+            E::PaneNotFound(42).text_in(lang),
+            E::NoSession(42).text_in(lang),
+            RemoteRefusal::SshAppUnavailableNote.text_in(lang),
+            RemoteRefusal::SshCapabilityUnknownNote.text_in(lang),
+        ] {
+            if PaneSshBlock::says_blocked(&other) {
+                failures.push(format!(
+                    "{}: SSH 化の断りでない文を SSH 化の断りと読む: {other}",
+                    says_blocked_where()
+                ));
+            }
+        }
+    }
+    report_all(failures);
+}
+
+/// `remote_ssh::is_refusal` の本体の違反を `file:line` つきで並べる。
+/// SSH 化の断りは型の 1 実装（`PaneSshBlock::says_blocked`）で読み、字面（`"target=split"` / 日本語の
+/// 「SSH 化できない」）を直に書かない（断りの文を変えたときに読みだけが取り残される）
+fn is_refusal_failures(src: &str) -> Vec<String> {
+    let Some(lines) = front_scope_lines(src, Some("fn is_refusal(")) else {
+        return vec![format!(
+            "{REMOTE_SSH_PATH}: `fn is_refusal(` が見つからない（改名したなら番犬の範囲を直す）"
+        )];
+    };
+    let code = |text: &str| text.split("//").next().unwrap_or("").to_string();
+    let mut out = Vec::new();
+    if !lines
+        .iter()
+        .any(|(_, text)| code(text).contains("PaneSshBlock::says_blocked("))
+    {
+        let head = lines.first().map(|(line, _)| *line).unwrap_or(0);
+        out.push(format!(
+            "{REMOTE_SSH_PATH}:{head}: is_refusal が SSH 化の断りを `PaneSshBlock::says_blocked` で読んでいない \
+             = 断りの文と読みが別々に変わり、英語表示の断りが 409 から 502 へ逆戻りしうる"
+        ));
+    }
+    for (line, text) in &lines {
+        if code(text).contains('"') {
+            out.push(format!(
+                "{REMOTE_SSH_PATH}:{line}: is_refusal が断りの字面を直に読んでいる（読みは \
+                 `PaneSshBlock::says_blocked` / `DispatchError::says_not_found` の 1 実装へ寄せる）: {}",
+                text.trim()
+            ));
+        }
+    }
+    out
+}
+
+#[test]
+fn daemonのssh化の断りの409の読みは型の1実装を通る() {
+    report_all(is_refusal_failures(REMOTE_SSH_SRC));
+}
+
+/// 番犬自身の検査: `is_refusal` の本物のソースへ字面の読みを植え戻すと、植えた行を `file:line` で名指す
+#[test]
+fn is_refusalの番犬は本物のソースへ植えた字面の読みを名指す() {
+    let from = "tako_core::remote_open::PaneSshBlock::says_blocked(err)";
+    let mut failures = Vec::new();
+    if REMOTE_SSH_SRC.matches(from).count() != 1 {
+        failures.push(format!(
+            "{REMOTE_SSH_PATH}: 植える元 `{from}` が 1 か所ではない（{} か所。番犬の検査の前提が崩れた）",
+            REMOTE_SSH_SRC.matches(from).count()
+        ));
+    } else {
+        let at = REMOTE_SSH_SRC.find(from).unwrap_or(0);
+        let line = REMOTE_SSH_SRC[..at].matches('\n').count() + 1;
+        // #2365 より前の字面の読み・日本語だけの読み
+        for to in [
+            r#"err.contains("target=split")"#,
+            r#"err.contains("SSH 化できない")"#,
+        ] {
+            let injected = REMOTE_SSH_SRC.replacen(from, to, 1);
+            let named = format!("{REMOTE_SSH_PATH}:{line}:");
+            let got = is_refusal_failures(&injected);
+            if !got.iter().any(|f| f.starts_with(&named)) {
+                failures.push(format!(
+                    "{REMOTE_SSH_PATH}:{line}: `{to}` を植えても番犬が名指さない: {got:?}"
+                ));
+            }
+        }
+    }
+    // 植えていない本物のソースは名指さない（対照）
+    let got = is_refusal_failures(REMOTE_SSH_SRC);
+    if !got.is_empty() {
+        failures.push(format!("植えていないのに名指した: {got:?}"));
     }
     report_all(failures);
 }
