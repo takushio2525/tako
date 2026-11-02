@@ -469,13 +469,14 @@ fn all(s: &Sources) -> Vec<String> {
         "mod_ui_local が tako_control::claude_mod_ui::run を通らない",
     );
     // dispatch（MCP と GUI）: ui と帯の切替が同じ 1 実装
-    let run_window = ("pub fn run(", "}");
-    for (must, why) in [(
+    require(
+        &mut out,
+        CONTROL_MOD,
+        &s.control_mod,
+        ("pub fn run(", "}"),
         "crate::claude_mod_ui::run(&ui_path(host)?, &ui.unwrap_or_default())",
         "dispatch の action=ui が claude_mod_ui::run を通らない",
-    )] {
-        require(&mut out, CONTROL_MOD, &s.control_mod, run_window, must, why);
-    }
+    );
     // #2663: band-on / band-off の書き込みと、報告の帯のトグルの取り込み・ui.json の読みは続きの段
     // （IPC では background）。UI スレッドの段（`action_prepare` / `accept_report`）では書かない・読まない
     require(

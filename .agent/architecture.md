@@ -1899,6 +1899,18 @@ lid-guard.json が使う）:
   `PaneClick` も数えるようになった）。着地がアクティブウィンドウをまたいだら同期の腕と同じく OS ウィンドウを前面化する。
   番犬 `issue2657_close_offload_watchdog.rs`、A/B は `TAKO_2657_LEGACY=1`（門は `close_record::legacy()` の 1 か所）、注入は
   `TAKO_2657_INJECT_RECORD_MS`、実経路は `scripts/test-close-record-offload-2657.sh`（FR-2.26.9）
+- **tako mod の報告・status・on / off・帯の切り替えも UI スレッドで画面を採らない・ui.json を読み書きしない**（#2663）:
+  報告は claude のターンごとに全ペインから来る。以前は受け口が UI スレッドで帯の材料を組み、worker ごとの画面と自分の
+  画面の末尾を端末のロックを取って採り、ui.json を 2〜3 回読んでいた（段 1 の注入で 31〜77ms がロック待ちに乗った）。
+  報告は `accept_report`（UI = 受け付けと材料・`PaneAccess` の写し）→ `ReportJob::run`（background = 帯のトグルの
+  取り込みと ui.json の読み・画面の採取・帯の組み立て）→ `claude_mod::land`（UI = `cards_place` / `chat_place` の写し）の
+  3 段。並行する続きの着地の順で古い読みが残らないよう、ui.json の取り込みと読みは錠 `UI_READS` の内側で順に行って
+  通し番号を振り、着地は番号の新しい読みだけを写す（`ModHub::copy_places`）。status は `status_seed`（UI = 行の材料と
+  画面の手）→ `StatusCtx::with_screens`（背景 = 全ペインの採取。check-health も同じ）、on / off・帯は `action_prepare`（UI）→
+  `ActionJob::run`（続き）。同期の腕も同じ段を同じ順に通す。番犬 `issue2663_mod_dispatch_offload_watchdog.rs`、A/B は
+  `TAKO_2663_LEGACY=1`、注入は `TAKO_2663_INJECT_HOLD_MS`（PTY の読み手がロックを持ったまま止まる。検証プロセスだけ）、
+  実経路は `scripts/test-mod-dispatch-offload-2663.sh`（FR-2.42.56）。`tako list` 自身も UI スレッドで各ペインの
+  端末のロックを取る（スクロールの位置・alt screen の印）のは残っている
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の
