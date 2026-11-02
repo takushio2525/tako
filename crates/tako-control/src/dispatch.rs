@@ -6372,6 +6372,12 @@ pub enum OffloadJob {
     /// 済ませた後、worker の MCP の構成・事前信頼・カタログ / 台帳 / レジストリへの記録を background で行い、
     /// 起動の積み込みは [`OffloadContinuation::SpawnLaunch`] で UI スレッドへ戻す
     SpawnRecord(Box<SpawnPlaced>),
+    /// close の UI の段へ戻す一巡（#2657）。準備（`prepare_offload`）は host を変えない約束なので、
+    /// 守り・ツリーの close・セッションの破棄は着地（[`OffloadContinuation::ClosePlace`] → [`land_offload`]
+    /// の [`close_place`]）で行う。background では何も待たない
+    ClosePlace(Box<Request>),
+    /// close の記録の段（#2657。[`CloseRecord::finish`]）。worker レジストリへ closed を書き終わってから応答する
+    CloseRecord(Box<CloseRecord>),
 }
 
 /// 何のために「次にやること」を確かめるか（#1510）
@@ -6564,6 +6570,8 @@ pub enum OffloadContinuation {
     WorkerStatusSeed(Box<WorkerQuery>),
     /// 記録を済ませた spawn の起動を起動ゲートへ積み、応答を組む（#2646。[`spawn_launch`]）
     SpawnLaunch(Box<SpawnRecorded>),
+    /// close の UI の段（#2657。[`close_place`]）。続きの記録は background（[`OffloadJob::CloseRecord`]）
+    ClosePlace(Box<Request>),
 }
 
 impl OffloadContinuation {
@@ -6592,6 +6600,8 @@ impl OffloadContinuation {
             // #2182: master を起こす着地（タブが増える）
             Self::UserTaskLaunched(_) => true,
             Self::Probed(probed) => crate::protocol::changes_layout(&probed.request),
+            // #2657: close の UI の段は同期の腕と同じ判定（ペインを閉じる = 描き直す）
+            Self::ClosePlace(request) => crate::protocol::changes_layout(request),
             _ => true,
         }
     }
@@ -6662,6 +6672,10 @@ pub fn finish_offload(
             worker_status_from_seed(worker_status_seed(host, q.pane_id), *q)
         }
         OffloadContinuation::SpawnLaunch(recorded) => Ok(spawn_launch(host, origin, *recorded)),
+        // #2657: もう一巡を出せない直の呼び手は、UI の段から記録の段までを同じスレッドで順に通す
+        OffloadContinuation::ClosePlace(request) => {
+            close_place(host, *request, origin).map(CloseRecord::finish)
+        }
     }
 }
 
@@ -7253,6 +7267,16 @@ pub fn prepare_offload(
             "next" => Some(Ok(OffloadJob::Welcome(WelcomeProbeFor::Next))),
             _ => None,
         },
+        // #2657: close（`Close` / たまり場の `BackgroundKill`）は、UI の段（守り・ツリーの close・セッションの
+        // 破棄）を着地（`land_offload` → [`close_place`]）で行い、worker レジストリへの記録（workers.yaml の
+        // 読み書き + fsync + 上限なしの flock）を background の段（`OffloadJob::CloseRecord`）で書き終わってから
+        // 応答する。準備は host を変えない約束なので、ここでは要求を写して着地へ回すだけ。
+        // A/B（`TAKO_2657_LEGACY=1`）は修正前と同じ `None` = UI スレッドで記録まで同期に書く
+        Request::Close { .. } | Request::BackgroundKill { .. }
+            if !crate::close_record::legacy() =>
+        {
+            Some(Ok(OffloadJob::ClosePlace(Box::new(request.clone()))))
+        }
         // 呼び出し元の pid 祖先辿り・CLI の所在確認・再起動の計画の走査を先取りする。
         // 先取りが要らない（pid の無い self 等）ときは `None` = 同期の腕（子プロセスを起こさない）。
         // 要るものの判断（`probe_needs`）も空の答えの内側で回す（判断の途中で待たない）
@@ -7284,6 +7308,12 @@ impl OffloadJob {
             OffloadJob::SpawnRecord(placed) => {
                 OffloadOutcome::OnUi(OffloadContinuation::SpawnLaunch(Box::new(placed.record())))
             }
+            // #2657: 何も待たずに close の UI の段へ戻す（host を変えるのは着地だけ）
+            OffloadJob::ClosePlace(request) => {
+                OffloadOutcome::OnUi(OffloadContinuation::ClosePlace(request))
+            }
+            // #2657: 記録を書き終わってから応答する（close の応答の後に workers を読めば closed）
+            OffloadJob::CloseRecord(record) => OffloadOutcome::Reply(Ok(record.finish())),
             OffloadJob::LspGoto(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspGoto(Box::new(job.run())))
             }
@@ -7581,6 +7611,9 @@ impl OffloadJob {
             )),
             OffloadJob::SpawnRecord(_) => Err(DispatchError::Operation(
                 "spawn の記録は run_staged で走らせる（起動を積むのに UI スレッドの続きが要る）".into(),
+            )),
+            OffloadJob::ClosePlace(_) | OffloadJob::CloseRecord(_) => Err(DispatchError::Operation(
+                "close の段は run_staged で走らせる（ペインを閉じるのに UI スレッドの続きが要る）".into(),
             )),
         }
     }
@@ -8223,6 +8256,18 @@ pub fn land_offload(
                     seed: Some(Box::new(seed)),
                 },
             ))))
+        }
+        // #2657: close の UI の段をここ（UI）で行い、記録の段を background へ出す。host を変えた
+        // （ペインを閉じた）ので受け口に後処理（保存・強制描画）をさせてから出す = `Settled`。
+        // UI スレッドに残る段も修正前と同じタグで測る（perf.log の `dispatch:Close` を続けて比べられる）
+        OffloadContinuation::ClosePlace(request) => {
+            let _span = crate::diag::perf_span(format!("dispatch:{}", request.kind_name()));
+            match close_place(host, *request, origin) {
+                Ok(record) => {
+                    OffloadLanding::Settled(Box::new(OffloadJob::CloseRecord(Box::new(record))))
+                }
+                Err(e) => OffloadLanding::Done(Err(e)),
+            }
         }
         other => OffloadLanding::Done(finish_offload(host, other, origin)),
     }
@@ -9145,103 +9190,13 @@ fn dispatch_inner(
             Ok(json!({ "pane": new_id.as_u64() }))
         }
 
-        Request::Close {
-            pane,
-            force,
-            caller_role,
-            caller_pane,
-        } => {
-            let (tab, target) = resolve_pane(host.workspace(), pane)?;
-
-            // #2330: master のペインを閉じる close の守り（タブの最後の master・引き継ぎを
-            // 受け取った後任）。force でも断る（force は busy な worker を閉じる口で、
-            // master の消失を許す口ではない）。判断は tako_core::handoff_guard::decide
-            if let Err(refusal) = crate::handoff_guard::check_close(
-                host.workspace(),
-                tab,
-                target,
-                caller_pane,
-                caller_role.as_deref(),
-            ) {
-                crate::diag::persist_log(&format!(
-                    "close を断った（pane={} 理由={} 呼び出し元={} force={force}。#2330）",
-                    target.as_u64(),
-                    refusal.code(),
-                    caller_pane.map_or_else(|| "-".to_string(), |p| p.to_string()),
-                ));
-                return Err(DispatchError::Operation(refusal.note().text().to_string()));
-            }
-
-            // worker 保護: orchestrator-worker role のペインが busy なら拒否
-            let target_pane = host
-                .workspace()
-                .get_tab(tab)
-                .and_then(|t| t.tree().get(target));
-            let is_worker = target_pane
-                .and_then(|p| p.role())
-                .is_some_and(|r| r.starts_with("orchestrator-worker"));
-            if !force && is_worker {
-                let busy = is_worker_busy(host, target);
-                if busy {
-                    return Err(DispatchError::Operation(format!(
-                        "Worker is still active. Use force: true to close anyway. pane_id={}",
-                        target.as_u64()
-                    )));
-                }
-            }
-            // Issue #165: worker close 後のリフロー用に spawn 元を close 前に記録する
-            let reflow_anchor = if is_worker {
-                target_pane.and_then(|p| p.spawned_by())
-            } else {
-                None
-            };
-
-            let closed = tree_mut(host.workspace_mut(), tab).close(target);
-            match closed {
-                Ok(closed_pane) => {
-                    // #2133: 引き継ぎの前任 master なら、その worker の spawn 元を後任へ付け替える
-                    // （後任から spawn しても後任自身を割らない。master 以外は no-op）
-                    let _ = host.workspace_mut().hand_over_spawned(&closed_pane);
-                    // Issue #165: worker が抜けた領域を残りの worker で再配分する
-                    // （master・ユーザー由来ペインの矩形は変わらない）
-                    if let Some(anchor) = reflow_anchor {
-                        let layout = crate::setup::spawn_layout_config();
-                        if layout.policy != tako_core::SpawnLayoutPolicy::Legacy {
-                            let _ = tree_mut(host.workspace_mut(), tab)
-                                .reflow_workers(anchor, layout.algorithm);
-                        }
-                        // #1439: 幅が戻ったぶんフォントも戻す（1.0 が選ばれれば
-                        // 自動縮小が外れる）。残りが下限を割るなら縮めたまま保つ。
-                        // A/B の対照で縮めないことは `worker_font::enabled` が見る
-                        crate::worker_font::refit_worker_area(host, tab, anchor, &layout);
-                    }
-                }
-                Err(PaneTreeError::LastPane) => {
-                    // タブ最後の 1 ペイン → タブごと閉じる。最後のタブなら拒否する
-                    // （アプリ終了に等しい操作は AI / CLI からは行わせない。UI の cmd+W のみ）
-                    host.workspace_mut().close_tab(tab).map_err(op_err)?;
-                }
-                Err(e) => return Err(op_err(e)),
-            }
-            // #566: 発生源（CLI / MCP + 呼び出し元 role）をペインログへ残す。
-            // dispatch 経由の close は確認を挟まない（AI フルコントロール維持）ぶん、
-            // 「誰が閉じたか」を事後に追える形にしておく
-            host.detach_session(target, close_origin_of(origin), caller_role.as_deref());
-            // #390: worker レジストリの該当エントリを closed へ（worker でなければ no-op。
-            // PTY 死亡（Exited）はここを通らないため「pane が消えても worker は生存」の
-            // 追跡は維持される）
-            // #775: `close_reason` には発生源（CLI / MCP + 呼び出し元 role）を載せる。
-            // ペインログのクローズマーカーと同じ語彙なので、両者を突き合わせられる
-            if let Err(e) = crate::orchestrator::registry::mark_closed_by_origin(
-                target.as_u64(),
-                close_origin_of(origin),
-                caller_role.as_deref(),
-            ) {
-                eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
-            }
-            // #2330: 引き継ぎの帳面から消す（前任なら引き継ぎの完了・後任ならやり直し）
-            crate::handoff_guard::forget(target.as_u64());
-            Ok(json!({ "closed": target.as_u64() }))
+        // #2657: close は UI の段（守り・ツリーの close・セッションの破棄 = [`close_place`]）→ 記録の段
+        // （worker レジストリへ closed を書く = [`CloseRecord::finish`]）の 2 段。IPC の受け口は
+        // `prepare_offload` → `land_offload` で UI の段だけを UI スレッドで行い、記録の段は background で
+        // 書き終わってから応答する。同期の呼び手（`TAKO_OFFLOAD=0`・直の呼び手）と A/B の旧経路
+        // （`TAKO_2657_LEGACY=1`）はここで同じ 2 段を同じ順に通す
+        req @ (Request::Close { .. } | Request::BackgroundKill { .. }) => {
+            close_place(host, req, origin).map(CloseRecord::finish)
         }
 
         Request::Focus { pane, direction } => {
@@ -11333,33 +11288,6 @@ fn dispatch_inner(
                 host.set_pin_pane(target, pinned);
                 Ok(json!({ "pinned": pinned_json(host), "pane": target.as_u64() }))
             }
-        }
-
-        Request::BackgroundKill { pane } => {
-            let pane_id = PaneId::from_raw(pane);
-            if !host.workspace().is_shelved(pane_id) {
-                return Err(DispatchError::PaneNotFound(pane));
-            }
-            // #1946: 器を外す前に見る（外した後では幽霊と区別できない）
-            let vessel = background_vessel(host, pane_id);
-            let plan = tako_core::background_groups::close_plan(vessel);
-            host.workspace_mut().remove_shelved(pane_id);
-            // 幽霊は器（tmux の登録）を持たないので、ここで kill される器は無い
-            // （`Vessel::Missing` = バックエンドの登録が無い、が判定の定義）
-            host.detach_session(pane_id, close_origin_of(origin), None);
-            // #775: たまり場の kill も明示 close なのでレジストリへ記録する
-            // （GUI のたまり場カードと対の経路。UI でできることは AI からも同じに見える）。
-            // #1946: 幽霊は記録しない（本物が別の pane id で生きていることがある）
-            if plan.record_worker_close {
-                if let Err(e) = crate::orchestrator::registry::mark_closed_by_origin(
-                    pane_id.as_u64(),
-                    close_origin_of(origin),
-                    None,
-                ) {
-                    eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
-                }
-            }
-            Ok(json!({ "killed": pane, "vessel": vessel.as_str() }))
         }
 
         Request::CheckHealth => Ok(check_health(host)),
@@ -22085,6 +22013,179 @@ fn send_target_screen(
 /// worker が busy かどうかを画面出力で判定する。
 /// false negative より false positive を優先（殺すより残す方が安全）。
 /// 判定は orchestrator::wait の完了監視ヒューリスティックと共通（#83）
+/// close の記録の段へ渡すもの（#2657）。UI の段（[`close_place`]）が組んだ応答と、書く記録
+/// （幽霊の `BackgroundKill` は記録しない = `None`）
+pub struct CloseRecord {
+    reply: Value,
+    mark: Option<crate::close_record::CloseMark>,
+}
+
+impl CloseRecord {
+    /// 記録を書いてから応答を返す。background の段（[`OffloadJob::CloseRecord`]）と同期の腕の両方が
+    /// ここを通る = **書き終わる前に応答しない**（close の応答の後に workers を読めば closed）
+    pub fn finish(self) -> Value {
+        if let Some(mark) = &self.mark {
+            mark.write();
+        }
+        self.reply
+    }
+}
+
+/// close の UI の段（#2657）。`Close` と `BackgroundKill` の、worker レジストリへの記録より前の全部
+/// （守り・ツリーの close・リフロー・セッションの破棄・引き継ぎの帳面）を行い、書く記録を返す。
+/// workspace と host（端末・器）を変えるので UI スレッドで呼ぶ
+fn close_place(
+    host: &mut dyn ControlHost,
+    request: Request,
+    origin: PaneOrigin,
+) -> Result<CloseRecord, DispatchError> {
+    match request {
+        Request::Close {
+            pane,
+            force,
+            caller_role,
+            caller_pane,
+        } => close_pane_place(host, origin, pane, force, caller_role, caller_pane),
+        Request::BackgroundKill { pane } => background_kill_place(host, origin, pane),
+        other => Err(DispatchError::Operation(format!(
+            "close の段へ {} は来ない（#2657）",
+            other.kind_name()
+        ))),
+    }
+}
+
+/// ペインの close の UI の段（#2657 で `Request::Close` の腕から分けた。中身は記録を除いて修正前と同じ）
+fn close_pane_place(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    pane: Option<u64>,
+    force: bool,
+    caller_role: Option<String>,
+    caller_pane: Option<u64>,
+) -> Result<CloseRecord, DispatchError> {
+    let (tab, target) = resolve_pane(host.workspace(), pane)?;
+
+    // #2330: master のペインを閉じる close の守り（タブの最後の master・引き継ぎを
+    // 受け取った後任）。force でも断る（force は busy な worker を閉じる口で、
+    // master の消失を許す口ではない）。判断は tako_core::handoff_guard::decide
+    if let Err(refusal) = crate::handoff_guard::check_close(
+        host.workspace(),
+        tab,
+        target,
+        caller_pane,
+        caller_role.as_deref(),
+    ) {
+        crate::diag::persist_log(&format!(
+            "close を断った（pane={} 理由={} 呼び出し元={} force={force}。#2330）",
+            target.as_u64(),
+            refusal.code(),
+            caller_pane.map_or_else(|| "-".to_string(), |p| p.to_string()),
+        ));
+        return Err(DispatchError::Operation(refusal.note().text().to_string()));
+    }
+
+    // worker 保護: orchestrator-worker role のペインが busy なら拒否
+    let target_pane = host
+        .workspace()
+        .get_tab(tab)
+        .and_then(|t| t.tree().get(target));
+    let is_worker = target_pane
+        .and_then(|p| p.role())
+        .is_some_and(|r| r.starts_with("orchestrator-worker"));
+    if !force && is_worker {
+        let busy = is_worker_busy(host, target);
+        if busy {
+            return Err(DispatchError::Operation(format!(
+                "Worker is still active. Use force: true to close anyway. pane_id={}",
+                target.as_u64()
+            )));
+        }
+    }
+    // Issue #165: worker close 後のリフロー用に spawn 元を close 前に記録する
+    let reflow_anchor = if is_worker {
+        target_pane.and_then(|p| p.spawned_by())
+    } else {
+        None
+    };
+
+    let closed = tree_mut(host.workspace_mut(), tab).close(target);
+    match closed {
+        Ok(closed_pane) => {
+            // #2133: 引き継ぎの前任 master なら、その worker の spawn 元を後任へ付け替える
+            // （後任から spawn しても後任自身を割らない。master 以外は no-op）
+            let _ = host.workspace_mut().hand_over_spawned(&closed_pane);
+            // Issue #165: worker が抜けた領域を残りの worker で再配分する
+            // （master・ユーザー由来ペインの矩形は変わらない）
+            if let Some(anchor) = reflow_anchor {
+                let layout = crate::setup::spawn_layout_config();
+                if layout.policy != tako_core::SpawnLayoutPolicy::Legacy {
+                    let _ = tree_mut(host.workspace_mut(), tab)
+                        .reflow_workers(anchor, layout.algorithm);
+                }
+                // #1439: 幅が戻ったぶんフォントも戻す（1.0 が選ばれれば
+                // 自動縮小が外れる）。残りが下限を割るなら縮めたまま保つ。
+                // A/B の対照で縮めないことは `worker_font::enabled` が見る
+                crate::worker_font::refit_worker_area(host, tab, anchor, &layout);
+            }
+        }
+        Err(PaneTreeError::LastPane) => {
+            // タブ最後の 1 ペイン → タブごと閉じる。最後のタブなら拒否する
+            // （アプリ終了に等しい操作は AI / CLI からは行わせない。UI の cmd+W のみ）
+            host.workspace_mut().close_tab(tab).map_err(op_err)?;
+        }
+        Err(e) => return Err(op_err(e)),
+    }
+    // #566: 発生源（CLI / MCP + 呼び出し元 role）をペインログへ残す。
+    // dispatch 経由の close は確認を挟まない（AI フルコントロール維持）ぶん、
+    // 「誰が閉じたか」を事後に追える形にしておく
+    host.detach_session(target, close_origin_of(origin), caller_role.as_deref());
+    // #2330: 引き継ぎの帳面から消す（前任なら引き継ぎの完了・後任ならやり直し）
+    crate::handoff_guard::forget(target.as_u64());
+    // #390: worker レジストリの該当エントリを closed へ（worker でなければ書かない。
+    // PTY 死亡（Exited）はここを通らないため「pane が消えても worker は生存」の
+    // 追跡は維持される）
+    // #775: `close_reason` には発生源（CLI / MCP + 呼び出し元 role）を載せる。
+    // ペインログのクローズマーカーと同じ語彙なので、両者を突き合わせられる。
+    // #2657: 書くのは記録の段（[`CloseRecord::finish`]。IPC では background）
+    Ok(CloseRecord {
+        reply: json!({ "closed": target.as_u64() }),
+        mark: Some(crate::close_record::CloseMark::new(
+            target.as_u64(),
+            close_origin_of(origin),
+            caller_role.as_deref(),
+        )),
+    })
+}
+
+/// たまり場の kill の UI の段（#2657 で `Request::BackgroundKill` の腕から分けた。中身は記録を除いて修正前と同じ）
+fn background_kill_place(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    pane: u64,
+) -> Result<CloseRecord, DispatchError> {
+    let pane_id = PaneId::from_raw(pane);
+    if !host.workspace().is_shelved(pane_id) {
+        return Err(DispatchError::PaneNotFound(pane));
+    }
+    // #1946: 器を外す前に見る（外した後では幽霊と区別できない）
+    let vessel = background_vessel(host, pane_id);
+    let plan = tako_core::background_groups::close_plan(vessel);
+    host.workspace_mut().remove_shelved(pane_id);
+    // 幽霊は器（tmux の登録）を持たないので、ここで kill される器は無い
+    // （`Vessel::Missing` = バックエンドの登録が無い、が判定の定義）
+    host.detach_session(pane_id, close_origin_of(origin), None);
+    // #775: たまり場の kill も明示 close なのでレジストリへ記録する
+    // （GUI のたまり場カードと対の経路。UI でできることは AI からも同じに見える）。
+    // #1946: 幽霊は記録しない（本物が別の pane id で生きていることがある）。
+    // #2657: 書くのは記録の段（[`CloseRecord::finish`]。IPC では background）
+    let record = plan.record_worker_close;
+    Ok(CloseRecord {
+        reply: json!({ "killed": pane, "vessel": vessel.as_str() }),
+        mark: record
+            .then(|| crate::close_record::CloseMark::new(pane, close_origin_of(origin), None)),
+    })
+}
+
 fn is_worker_busy(host: &dyn ControlHost, target: PaneId) -> bool {
     let Some(session) = host.session(target) else {
         return true; // 画面取得不可 = busy 寄りに倒す
@@ -32313,6 +32414,275 @@ mod tests {
         let _ = WorkerRegistry::mutate_at(&path, |reg| {
             reg.workers.remove(&worker_id);
         });
+    }
+
+    /// #2657 のテスト用: 器を持つ worker のペインを立ててレジストリへ active で登録する
+    fn t2657_worker(host: &mut MockHost, label: &str) -> (u64, String) {
+        use crate::orchestrator::registry::RegisterSpawn;
+        let root = host.root_pane();
+        let pane = split(host, root);
+        host.backend_sessions
+            .insert(pane, format!("tako-t2657-{label}-{pane}"));
+        host.ws
+            .pane_anywhere_mut(PaneId::from_raw(pane))
+            .unwrap()
+            .set_role(Some(format!("orchestrator-worker:t2657:{label}")));
+        let worker_id = crate::orchestrator::registry::record_spawn(RegisterSpawn {
+            label: Some(format!("t2657-{label}")),
+            project: "t2657".into(),
+            agent: "claude".into(),
+            model: None,
+            effort: None,
+            pane,
+            tab: None,
+            tmux_session: None,
+            issues: vec![],
+            ledger_id: None,
+            cwd: None,
+            prompt_head: None,
+            profile: None,
+        })
+        .expect("レジストリへ登録できる");
+        (pane, worker_id)
+    }
+
+    /// #2657 のテスト用: レジストリでのその worker の状態（`status/close_reason`）
+    fn t2657_state(worker_id: &str) -> String {
+        let reg = crate::orchestrator::registry::WorkerRegistry::load().unwrap();
+        let (_, e) = reg.resolve(worker_id).unwrap();
+        format!(
+            "{}/{}",
+            e.status,
+            e.close_reason.clone().unwrap_or_default()
+        )
+    }
+
+    /// #2657 のテスト用: プロセス共有の一時レジストリからこの worker だけ消す
+    fn t2657_forget(worker_id: &str) {
+        use crate::orchestrator::registry::{registry_path, WorkerRegistry};
+        let path = registry_path().unwrap();
+        let _ = WorkerRegistry::mutate_at(&path, |reg| {
+            reg.workers.remove(worker_id);
+        });
+    }
+
+    /// #2657: IPC の受け口の経路（準備 → 着地 → background）で、close の UI の段は記録を書かず、
+    /// 記録の段が**書き終わってから**応答する（close の応答の後に workers を読めば closed）
+    #[test]
+    fn issue2657_closeの記録はbackgroundの段で書き終わってから応答する() {
+        let mut host = MockHost::new();
+        let (pane, worker_id) = t2657_worker(&mut host, "close");
+        let caller = "orchestrator-master:t2657";
+        let request = Request::Close {
+            pane: Some(pane),
+            force: true,
+            caller_role: Some(caller.into()),
+            caller_pane: None,
+        };
+        // 準備は host を変えない（ペインはまだ在る）
+        let job = prepare_offload(&mut host, &request)
+            .expect("close は準備で background の経路へ出る")
+            .expect("準備は断らない");
+        assert!(host.ws.pane_anywhere(PaneId::from_raw(pane)).is_some());
+        // background の一巡は何も待たずに UI の段へ戻す
+        let OffloadOutcome::OnUi(next) = job.run_staged() else {
+            panic!("close の準備の一巡は UI の段へ戻す");
+        };
+        assert!(
+            next.changes_layout(),
+            "close の着地は描き直す（同期の腕と同じ）"
+        );
+        // UI の段: ペインは閉じ、セッションは破棄し、記録はまだ書かない
+        let OffloadLanding::Settled(record) = land_offload(&mut host, next, PaneOrigin::Mcp) else {
+            panic!("close の UI の段は後処理の後に記録の段を background へ出す（Settled）");
+        };
+        assert!(host.ws.pane_anywhere(PaneId::from_raw(pane)).is_none());
+        assert!(
+            host.detached.contains(&pane),
+            "UI の段でセッションを破棄する"
+        );
+        assert_eq!(
+            t2657_state(&worker_id),
+            "active/",
+            "UI の段（UI スレッド）で workers.yaml を書いてはいけない"
+        );
+        // 記録の段: 書き終わってから応答する
+        let OffloadOutcome::Reply(reply) = record.run_staged() else {
+            panic!("close の記録の段はそのまま応答する");
+        };
+        assert_eq!(reply.unwrap()["closed"].as_u64(), Some(pane));
+        assert_eq!(
+            t2657_state(&worker_id),
+            format!(
+                "closed/{}",
+                crate::orchestrator::registry::close_reason_for(CloseOrigin::Mcp, Some(caller))
+            ),
+            "応答の時点で workers.yaml は closed（発生源つき）"
+        );
+        t2657_forget(&worker_id);
+    }
+
+    /// #2657: たまり場の kill も同じ 2 段（UI の段で外し、記録の段で書いてから応答する）。
+    /// 幽霊（器なし）は記録の段でも書かない（#1946）
+    #[test]
+    fn issue2657_たまり場のkillも記録をbackgroundの段で書く() {
+        let mut host = MockHost::new();
+        let (pane, worker_id) = t2657_worker(&mut host, "shelf");
+        let (ghost, ghost_id) = t2657_worker(&mut host, "ghost");
+        host.backend_sessions.remove(&ghost);
+        for p in [pane, ghost] {
+            dispatch(
+                &mut host,
+                Request::Background {
+                    pane: Some(p),
+                    tab: None,
+                },
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+        }
+        let land = |host: &mut MockHost, p: u64| -> Box<OffloadJob> {
+            let job = prepare_offload(host, &Request::BackgroundKill { pane: p })
+                .expect("たまり場の kill は準備で background の経路へ出る")
+                .expect("準備は断らない");
+            let OffloadOutcome::OnUi(next) = job.run_staged() else {
+                panic!("たまり場の kill の準備の一巡は UI の段へ戻す");
+            };
+            let OffloadLanding::Settled(record) = land_offload(host, next, PaneOrigin::Mcp) else {
+                panic!("たまり場の kill の UI の段は Settled");
+            };
+            record
+        };
+        let record = land(&mut host, pane);
+        assert!(!host.ws.is_shelved(PaneId::from_raw(pane)));
+        assert_eq!(t2657_state(&worker_id), "active/", "UI の段では書かない");
+        let OffloadOutcome::Reply(reply) = record.run_staged() else {
+            panic!("記録の段はそのまま応答する");
+        };
+        let reply = reply.unwrap();
+        assert_eq!(reply["killed"].as_u64(), Some(pane));
+        assert_eq!(reply["vessel"].as_str(), Some("tmux"));
+        assert_eq!(
+            t2657_state(&worker_id),
+            format!("closed/{}", CloseOrigin::Mcp.marker()),
+            "応答の時点で closed"
+        );
+        // 幽霊: 外すが、記録の段でも書かない
+        let record = land(&mut host, ghost);
+        let OffloadOutcome::Reply(reply) = record.run_staged() else {
+            panic!("記録の段はそのまま応答する");
+        };
+        assert_eq!(reply.unwrap()["vessel"].as_str(), Some("none"));
+        assert!(!host.ws.is_shelved(PaneId::from_raw(ghost)));
+        assert_eq!(
+            t2657_state(&ghost_id),
+            "active/",
+            "幽霊は記録しない（#1946）"
+        );
+        t2657_forget(&worker_id);
+        t2657_forget(&ghost_id);
+    }
+
+    /// #2657: 断り（busy な worker・在しないペイン）は UI の段で返り、ペインもレジストリも変えない
+    #[test]
+    fn issue2657_断りはuiの段で返り記録を書かない() {
+        let mut host = MockHost::new();
+        let (pane, worker_id) = t2657_worker(&mut host, "busy");
+        // MockHost は画面を持たない = busy 寄り。force なしの close は断られる
+        let land = |host: &mut MockHost, request: Request| {
+            let job = prepare_offload(host, &request)
+                .expect("close は準備で background の経路へ出る")
+                .expect("準備は断らない（断りは着地で決まる）");
+            let OffloadOutcome::OnUi(next) = job.run_staged() else {
+                panic!("close の準備の一巡は UI の段へ戻す");
+            };
+            land_offload(host, next, PaneOrigin::Cli)
+        };
+        let busy = land(
+            &mut host,
+            Request::Close {
+                pane: Some(pane),
+                force: false,
+                caller_role: None,
+                caller_pane: None,
+            },
+        );
+        let OffloadLanding::Done(Err(e)) = busy else {
+            panic!("busy な worker の close は UI の段で断る");
+        };
+        assert!(format!("{e:?}").contains("Worker is still active"), "{e:?}");
+        assert!(host.ws.pane_anywhere(PaneId::from_raw(pane)).is_some());
+        assert_eq!(t2657_state(&worker_id), "active/");
+        let missing = land(
+            &mut host,
+            Request::Close {
+                pane: Some(9_999_999),
+                force: true,
+                caller_role: None,
+                caller_pane: None,
+            },
+        );
+        assert!(
+            matches!(missing, OffloadLanding::Done(Err(_))),
+            "在しないペインの close は UI の段で断る"
+        );
+        let shelf = land(&mut host, Request::BackgroundKill { pane });
+        assert!(
+            matches!(
+                shelf,
+                OffloadLanding::Done(Err(DispatchError::PaneNotFound(_)))
+            ),
+            "退避していないペインのたまり場の kill は UI の段で断る"
+        );
+        // 直の呼び手（もう一巡を出せない）は UI の段から記録の段までを同じスレッドで順に通す
+        let reply = finish_offload(
+            &mut host,
+            OffloadContinuation::ClosePlace(Box::new(Request::Close {
+                pane: Some(pane),
+                force: true,
+                caller_role: None,
+                caller_pane: None,
+            })),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(reply["closed"].as_u64(), Some(pane));
+        assert_eq!(
+            t2657_state(&worker_id),
+            format!("closed/{}", CloseOrigin::Cli.marker())
+        );
+        t2657_forget(&worker_id);
+    }
+
+    /// A/B: `TAKO_2657_LEGACY=1` は準備で出さず（= 受け口は同期の腕で記録まで UI スレッドで書く）
+    #[test]
+    fn issue2657_legacyは準備で出さず同期の腕で書く() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2657_legacyは準備で出さず同期の腕で書く) {
+            return;
+        }
+        std::env::set_var(crate::close_record::LEGACY_ENV, "1");
+        let mut host = MockHost::new();
+        let (pane, worker_id) = t2657_worker(&mut host, "legacy");
+        let request = Request::Close {
+            pane: Some(pane),
+            force: true,
+            caller_role: None,
+            caller_pane: None,
+        };
+        assert!(
+            prepare_offload(&mut host, &request).is_none(),
+            "A/B の旧経路は準備で出さない（同期の腕）"
+        );
+        assert!(prepare_offload(&mut host, &Request::BackgroundKill { pane }).is_none());
+        let reply = dispatch(&mut host, request, PaneOrigin::Cli).unwrap();
+        assert_eq!(reply["closed"].as_u64(), Some(pane));
+        assert_eq!(
+            t2657_state(&worker_id),
+            format!("closed/{}", CloseOrigin::Cli.marker()),
+            "同期の腕は応答までに書く"
+        );
+        t2657_forget(&worker_id);
     }
 
     /// #1946: 一覧の `groups` は由来タブ → 親 master のまとまりで、各エントリに親 master が載る

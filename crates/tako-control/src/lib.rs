@@ -48,6 +48,7 @@ pub mod claude_remote;
 pub mod claude_remote_link;
 pub mod claude_session;
 pub mod claude_tui;
+pub mod close_record;
 pub mod codex_session;
 pub mod config_io;
 pub mod config_share;

@@ -251,6 +251,8 @@ impl TakoApp {
                     // 定義ジャンプの問い合わせからは来ない（#2646 の worker の状態と spawn の続き）
                     OffloadContinuation::WorkerStatusSeed(_)
                     | OffloadContinuation::SpawnLaunch(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#2657 の close の UI の段）
+                    OffloadContinuation::ClosePlace(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }

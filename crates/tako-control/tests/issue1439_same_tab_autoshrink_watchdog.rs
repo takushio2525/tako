@@ -218,11 +218,11 @@ fn scan_dispatch(src: &str) -> Vec<Offender> {
         }
     }
 
-    // 4. close 後のリフローでも当て直す
-    match fn_window(&src, "Request::Close {") {
+    // 4. close 後のリフローでも当て直す（#2657 で `Request::Close` の腕から UI の段 `close_pane_place` へ分けた）
+    match fn_window(&src, "fn close_pane_place(") {
         None => push(
             0,
-            "`Request::Close` の腕が見つからない（走査が空振り）".into(),
+            "close の UI の段（`fn close_pane_place(`）が見つからない（走査が空振り）".into(),
         ),
         Some((at, window)) => {
             let reflow = code_line_with(&window, "reflow_workers(");
@@ -502,7 +502,7 @@ fn 走査が空振りしていない() {
                 "fn dispatch_orchestrator_spawn(",
                 "fn spawn_place(",
                 "fn record(self) -> SpawnRecorded",
-                "Request::Close {",
+                "fn close_pane_place(",
                 "use crate::worker_font::PlacementArm;",
             ],
         ),
@@ -586,7 +586,7 @@ fn 逆戻りを名指しできる() {
 
     // 注入 4: close 後のリフローで当て直さない
     let stale = dispatch.replace(
-        "                        crate::worker_font::refit_worker_area(host, tab, anchor, &layout);",
+        "                crate::worker_font::refit_worker_area(host, tab, anchor, &layout);",
         "",
     );
     assert!(stale != dispatch, "注入 4 の対象が見つからない");

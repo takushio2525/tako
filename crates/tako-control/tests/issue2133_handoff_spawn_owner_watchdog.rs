@@ -141,7 +141,8 @@ fn all(dispatch: &str, app: &str, pane_tree: &str) -> Vec<String> {
     scan_close_path(
         DISPATCH,
         dispatch,
-        "Request::Close {",
+        // #2657: dispatch の Close は UI の段 `close_pane_place` に分けた（同期の腕と IPC の着地が通る）
+        "fn close_pane_place(",
         ".close(target)",
         &mut out,
     );
@@ -170,7 +171,12 @@ fn sources() -> (String, String, String) {
 fn 走査が空振りしていない() {
     let (dispatch, app, pane_tree) = sources();
     for (rel, src, needle, inner) in [
-        (DISPATCH, &dispatch, "Request::Close {", ".close(target)"),
+        (
+            DISPATCH,
+            &dispatch,
+            "fn close_pane_place(",
+            ".close(target)",
+        ),
         (APP, &app, "fn remove_pane_with(", ".close(pane_id)"),
         (
             PANE_TREE,

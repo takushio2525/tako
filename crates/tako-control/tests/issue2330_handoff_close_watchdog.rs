@@ -139,21 +139,9 @@ fn 送達の決着は引き継ぎの帳面へ受領を書く() {
 #[test]
 fn dispatchのcloseはペインを外す前に守りを通す() {
     let src = read(DISPATCH);
-    // dispatch 本体の Close の腕（`} => {` で始まる受け手）を探す
-    let lines: Vec<&str> = src.lines().collect();
-    let start = (0..lines.len())
-        .find(|&i| {
-            lines[i].trim() == "Request::Close {"
-                && lines[i + 1..(i + 7).min(lines.len())]
-                    .iter()
-                    .any(|l| l.trim() == "} => {")
-        })
-        .expect("dispatch の Request::Close の腕が見つからない");
-    // 分解パターン（`Request::Close { pane, … }`）の後ろの `} => {` から腕の本体が始まる
-    let body_start = (start..lines.len())
-        .find(|&i| lines[i].trim() == "} => {")
-        .expect("Close の腕の本体が見つからない");
-    let arm = block_at(&lines, body_start);
+    // dispatch の Close の UI の段（#2657 で `Request::Close` の腕から `close_pane_place` へ分けた。
+    // 同期の腕と IPC の着地が同じここを通る）
+    let arm = block(&src, "fn close_pane_place(", 0);
     let close_at = arm
         .iter()
         .find(|(_, l)| l.contains(".close(target)"))
