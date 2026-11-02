@@ -320,8 +320,8 @@ echo "$$" > "$FAKE_DIR/measure.pid"
 n=$(( $(cat "$FAKE_DIR/measure.count" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$FAKE_DIR/measure.count"
 same=no
-[ -n "${TAKO_BIN:-}" ] && cmp -s "$TAKO_BIN" "$FAKE_DIR/repo/target/release/tako" \
-  && cmp -s "${APP_BIN:-}" "$FAKE_DIR/repo/target/release/tako-app" && same=yes
+built="$FAKE_DIR/repo/target/release"
+[ -n "${TAKO_BIN:-}" ] && cmp -s "$TAKO_BIN" "$built/tako" && cmp -s "${APP_BIN:-}" "$built/tako-app" && same=yes
 echo "call=$n tako_bin=${TAKO_BIN:-} app_bin=${APP_BIN:-} same=$same queue_tako=${TAKO_FOOTPRINT_QUEUE_TAKO:-}" >> "$FAKE_DIR/measure-calls.log"
 [ "$n" -ge 2 ] && [ -n "${FAKE_VALUES_2:-}" ] && FAKE_VALUES="$FAKE_VALUES_2"
 case "${FAKE_MEASURE:-ok}" in
@@ -703,9 +703,11 @@ echo "D. 起動の区間に重い処理が重なった夜（#2652。偽の tako 
 # ============================================================================
 # 履歴・状態・todo を空にして基準を作り直す（リポジトリと代役は B のものを使う）
 rm -rf "${B:?}/home/.claude-orchestrator/state/tako-footprint" "${B:?}/todo.json"
-printf 'built-cli\n' > "$B/repo/target/release/tako"
-printf 'built-app\n' > "$B/repo/target/release/tako-app"
-chmod +x "$B/repo/target/release/tako" "$B/repo/target/release/tako-app"
+# 夜間のビルドが置くバイナリの代役（中身は印だけ。GUI は起こさない）
+BUILT="$B/repo/target/release"
+printf 'built-cli\n' > "$BUILT/tako"
+printf 'built-app\n' > "$BUILT/tako-app"
+chmod +x "$BUILT/tako" "$BUILT/tako-app"
 QUIET="TAKO_FOOTPRINT_WATCH_QUIET_POLL=0.1"
 calls() { cat "$B/measure-calls.log" 2>/dev/null; }
 last_col() { python3 -c 'import csv,sys; r=list(csv.DictReader(open(sys.argv[1]),delimiter="\t")); print(r[-1].get(sys.argv[2],""))' "$HIST" "$1"; }
