@@ -53,22 +53,26 @@ fn reason_phrase(reason: &WaitReason) -> String {
             format!("swap 使用 {}", gb(*used_mb)),
             format!("{} of swap in use", gb(*used_mb))
         ),
+        // 判定は「空き < 必要 + 予約」なので、見せる必要量にも予約を含める（含めないと
+        // 「空き 1.2 GB・必要 0.6 GB」のように空きが足りているのに待っているように読める）
         WaitReason::Memory {
             available_mb,
             need_mb,
+            reserve_mb,
             ..
-        } => tr!(
-            format!(
-                "空きメモリ不足（空き {}・必要 {}）",
-                gb(*available_mb),
-                gb(*need_mb)
-            ),
-            format!(
-                "Not enough free memory ({} free, {} needed)",
-                gb(*available_mb),
-                gb(*need_mb)
+        } => {
+            let needed = gb(need_mb.saturating_add(*reserve_mb));
+            tr!(
+                format!(
+                    "空きメモリ不足（空き {}・予約込みで必要 {needed}）",
+                    gb(*available_mb)
+                ),
+                format!(
+                    "Not enough free memory ({} free, {needed} needed incl. reserve)",
+                    gb(*available_mb)
+                )
             )
-        ),
+        }
         WaitReason::TargetDir => {
             tr!("復元は 1 本ずつ", "Restored agents start one at a time").to_string()
         }
@@ -197,6 +201,29 @@ mod tests {
     #[test]
     fn 日英が揃い絵文字が無い() {
         tests_support::check_ja_en(all_lines);
+    }
+
+    /// 空きメモリ不足の必要量は予約込み（判定は「空き < 必要 + 予約」。e2e で「空き 1.2 GB・必要 0.6 GB」と
+    /// 空きが足りているように読める文が出た）
+    #[test]
+    fn 空きメモリ不足の必要量は予約込み() {
+        tests_support::with_lang(tako_core::i18n::Lang::Ja, || {
+            let b = waiting(
+                Some(1),
+                Some(WaitReason::Memory {
+                    available_mb: 1229,
+                    need_mb: 640,
+                    reserve_mb: 3686,
+                    pending_mb: 0,
+                    estimate_mb: 640,
+                }),
+                None,
+            );
+            assert_eq!(
+                reason(&b),
+                "空きメモリ不足（空き 1.2 GB・予約込みで必要 4.2 GB）（戻ると自動で起動）"
+            );
+        });
     }
 
     /// 前に並んでいるだけの件は、並びを止めている理由（warn）と空きを見せる。順番は N 本中 M 番目
