@@ -662,6 +662,18 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   #2365 より前の GUI の日本語の文にも当たる）で、`remote_ssh::is_refusal` はこれを呼ぶ。番犬は同じ
   `issue1762_dispatch_error_lang.rs`（tako-core の型の表に 4 種の旧文・日英のどの文でも 409 と読めること・
   `is_refusal` が字面を直に読まないこと = 本物のソースへの注入で `file:line` を名指す）
+- 同じ続きで、**会話の再起動の断りと建て直しの失敗**（tako-core の `session_restart::RestartBlock` 12 種 +
+  系統の未対応 / エージェント不在の mode の分岐・`RelaunchFailure` 5 種）と、**リモートフォルダの自動接続の注記**
+  （`remote_open::AutoTerminalSkip` 2 種）を表示言語へ移した。出る口は `tako session-restart` / MCP
+  `tako_session_restart` の断りと下見の `modes[].message`・`last_restart.message`、`tako remote-folder open` /
+  MCP `tako_remote_folder` の応答の `terminal.note`（GUI の通知はこれを包む）。日英の対は
+  `RestartBlock::text_in(pane, mode, lang)` / `RelaunchFailure::text_in(pane, exit_code, lang)` /
+  `AutoTerminalSkip::text_in(lang)` の網羅 match、利用者へ返す口の `message` / `note` は `i18n::lang()`
+  （GUI の dispatch が組むので GUI の表示言語）。`reason` の slug は変えていない。persist.log の行は slug だけで
+  日本語のまま。建て直しの失敗のバナー（`ui_text::stale`）は前から日英。英語の「会話が見つからない」系は
+  ` not found` を含め、`DispatchError::says_not_found` の当たり方を日英でそろえた。番犬は同じ
+  `issue1762_dispatch_error_lang.rs`（tako-core の型の表に 14 + 6 + 2 行の旧文。旧文は origin/main のソースから
+  展開した値）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

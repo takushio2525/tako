@@ -2346,6 +2346,7 @@ fn 案内の3つの状態と添え方が日英を持ち日本語は旧文と一�
 // （format / rename の ParseError）。どれも `text_in` の (バリアント, 言語) の網羅 match で、
 // 落ちたら日英の対を書いたソースの行（`file:line`）を名指しする
 
+use tako_core::agent_support::Agent;
 use tako_core::backend::{BackendError, InvalidSessionReason};
 use tako_core::command_card::CommandCardError;
 use tako_core::file_copy::CopyRefusal;
@@ -2354,8 +2355,9 @@ use tako_core::lsp::{
     format::ParseError as FormatParseError, rename::ParseError as RenameParseError,
 };
 use tako_core::preview_limit::Truncation;
-use tako_core::remote_open::PaneSshBlock;
+use tako_core::remote_open::{AutoTerminalSkip, PaneSshBlock};
 use tako_core::runner::RunnerError;
+use tako_core::session_restart::{RelaunchFailure, RestartBlock, SessionRestartMode};
 use tako_core::terminal::SessionError;
 use tako_core::text_edit::{ChangesError, LineOpError, NotEditable, RangeEditError, TextEditError};
 
@@ -2428,6 +2430,8 @@ const FILE_COPY_SRC: &str = include_str!("../../tako-core/src/file_copy.rs");
 const FILE_COPY_PATH: &str = "crates/tako-core/src/file_copy.rs";
 const REMOTE_OPEN_SRC: &str = include_str!("../../tako-core/src/remote_open.rs");
 const REMOTE_OPEN_PATH: &str = "crates/tako-core/src/remote_open.rs";
+const SESSION_RESTART_SRC: &str = include_str!("../../tako-core/src/session_restart.rs");
+const SESSION_RESTART_PATH: &str = "crates/tako-core/src/session_restart.rs";
 
 // 型ごとの通し番号（網羅 match = バリアントを足すとここがコンパイルで落ち、
 // [`core_cases`] へ見本と旧文を足すまで通らない）
@@ -2626,6 +2630,137 @@ impl std::fmt::Display for SshBlockAt {
 impl Bilingual for SshBlockAt {
     fn text(&self, lang: Lang) -> String {
         self.0.text_in(SSH_BLOCK_PANE, lang)
+    }
+}
+
+fn restart_block_index(b: &RestartBlock) -> usize {
+    match b {
+        RestartBlock::NoSession => 0,
+        RestartBlock::NotAgent => 1,
+        RestartBlock::AgentUnsupported { .. } => 2,
+        RestartBlock::SessionUnresolved => 3,
+        RestartBlock::AgentProcessNotFound => 4,
+        RestartBlock::HandoffNeedsMaster => 5,
+        RestartBlock::Busy => 6,
+        RestartBlock::QueuedMessages => 7,
+        RestartBlock::UserDraft => 8,
+        RestartBlock::Dialog => 9,
+        RestartBlock::ConversationMissing => 10,
+        RestartBlock::RestartInProgress => 11,
+    }
+}
+const RESTART_BLOCKS: usize = 12;
+
+fn relaunch_index(f: &RelaunchFailure) -> usize {
+    match f {
+        RelaunchFailure::ProcessStuck => 0,
+        RelaunchFailure::CommandFlowTimeout => 1,
+        RelaunchFailure::ConversationNotFound => 2,
+        RelaunchFailure::AgentExited => 3,
+        RelaunchFailure::PaneClosed => 4,
+    }
+}
+const RELAUNCH_FAILURES: usize = 5;
+
+fn auto_skip_index(s: &AutoTerminalSkip) -> usize {
+    match s {
+        AutoTerminalSkip::Disabled => 0,
+        AutoTerminalSkip::AlreadyConnected { .. } => 1,
+    }
+}
+const AUTO_SKIPS: usize = 2;
+
+/// 見本のペイン番号（会話の再起動の断りと建て直しの失敗は `pane {pane}` を含む）
+const RESTART_PANE: u64 = 7;
+
+/// 会話の再起動の断りの見本（断り, mode, 腕の頭, #2365 より前の固定文）。
+/// 旧文は origin/main の `RestartBlock::message` の日本語をペイン 7・系統 codex で展開したもの。
+/// mode で文が変わるのは系統の未対応とエージェントが居ないときだけなので、その 2 種は両方の mode を持つ
+fn restart_block_table() -> Vec<(RestartBlock, SessionRestartMode, &'static str, &'static str)> {
+    use SessionRestartMode as M;
+    vec![
+        (RestartBlock::NoSession, M::Harness, "NoSession", "pane 7 にはターミナルセッションが無い（プレビュー等）ので再起動できない。エージェントが動いているペインを指定する"),
+        (RestartBlock::NotAgent, M::Harness, "NotAgent", "pane 7 は AI エージェントのペインではない（role が無い）のでセッション再起動の対象外。`tako list` の role で対象ペインを確認する"),
+        (RestartBlock::AgentUnsupported { agent: Agent::Codex }, M::Harness, "AgentUnsupported { agent }, M::Harness", "pane 7 の系統（codex）は tako からの resume に未対応なのでハーネス更新できない（claude のみ）。手動なら codex は `codex resume`、agy は `agy --conversation` を使う。対応状況は `tako agent-support` を参照"),
+        (RestartBlock::AgentUnsupported { agent: Agent::Codex }, M::Handoff, "AgentUnsupported { agent }, M::Handoff", "pane 7 の系統（codex）は tako からの引き継ぎ再起動に未対応（claude のみ実測済み）。対応状況は `tako agent-support` を参照"),
+        (RestartBlock::SessionUnresolved, M::Harness, "SessionUnresolved", "pane 7 の claude の会話（session_id）を解決できないのでハーネス更新できない（resume 先が分からないまま終了させると会話を失う）。`tako sessions list` で会話を確認し、必要なら `tako sessions resume <id>` を使う"),
+        (RestartBlock::AgentProcessNotFound, M::Harness, "AgentProcessNotFound, M::Harness", "pane 7 で動いているエージェント CLI のプロセスが見つからず、シェルが入力待ちとも確かめられないのでハーネス更新できない（終了させる相手が分からないまま resume の行を打つと、動いているエージェントへの指示として入力されてしまう）。すでに終了しているなら `tako sessions resume <id>` で会話を別ペインへ開く"),
+        (RestartBlock::AgentProcessNotFound, M::Handoff, "AgentProcessNotFound, M::Handoff", "pane 7 ではエージェントが動いていないので引き継ぎを書かせられない（依頼を受け取る相手が居ない）。同じ会話を戻すなら `tako session-restart --mode harness --pane 7` を使う"),
+        (RestartBlock::HandoffNeedsMaster, M::Harness, "HandoffNeedsMaster", "pane 7 は master ペインではないので引き継ぎ再起動できない（引き継ぎファイルの機構は master だけが持つ）。会話を保ったまま建て直すなら mode=harness を使う"),
+        (RestartBlock::Busy, M::Harness, "Busy", "pane 7 は生成中 / コマンド実行中なので再起動しない（途中の作業を失う）。終わってからもう一度実行する"),
+        (RestartBlock::QueuedMessages, M::Harness, "QueuedMessages", "pane 7 には未送信の指示がキューに残っているので再起動しない（その指示が失われる）。エージェントが処理し終えてからもう一度実行する"),
+        (RestartBlock::UserDraft, M::Harness, "UserDraft", "pane 7 の入力欄に下書きが残っているので再起動しない（打ちかけの指示が失われる）。送信するか消してからもう一度実行する"),
+        (RestartBlock::Dialog, M::Harness, "Dialog", "pane 7 は選択肢ダイアログを表示中なので再起動しない。`tako orchestrator respond --pane 7` で応答してからもう一度実行する"),
+        (RestartBlock::ConversationMissing, M::Harness, "ConversationMissing", "pane 7 の会話の記録（claude の transcript）が見つからないのでハーネス更新できない（終了させてから resume しても `No conversation found` で落ち、会話も画面も失う）。`tako sessions list` で再開できる会話（resumable）を確認する"),
+        (RestartBlock::RestartInProgress, M::Harness, "RestartInProgress", "pane 7 の建て直しがまだ終わっていないので重ねて再起動しない（起動し直したばかりのエージェントをまた終了させてしまう）。`tako session-restart --pane 7` の last_restart で進み具合を確かめ、終わってからもう一度実行する"),
+    ]
+}
+
+/// 建て直しの失敗の見本（失敗, 終了コード, #2365 より前の固定文。ペイン 7 で展開）
+fn relaunch_table() -> Vec<(RelaunchFailure, Option<i32>, &'static str)> {
+    vec![
+        (RelaunchFailure::ProcessStuck, Some(1), "pane 7 のエージェントが SIGKILL 後も終わらないので建て直しを中止した。ペインで直接終了させてから `tako session-restart --mode harness --pane 7` をやり直す"),
+        (RelaunchFailure::CommandFlowTimeout, Some(1), "pane 7 のシェルへ再開コマンドを送り届けられなかった（シェルが入力を受け付けない）。ペインの状態を `tako read --pane 7` で確かめ、`tako session-restart --mode harness --pane 7` をやり直す"),
+        (RelaunchFailure::ConversationNotFound, Some(1), "pane 7 で再開した claude が「会話が見つからない」で終わった（終了コード 1）。`tako sessions list` で会話の記録（resumable）を確かめ、`tako sessions resume <id>` で開き直す"),
+        (RelaunchFailure::AgentExited, Some(1), "pane 7 で再開したエージェントがすぐ終わった（終了コード 1）。`tako read --pane 7` で理由を確かめ、`tako session-restart --mode harness --pane 7` をやり直す"),
+        (RelaunchFailure::PaneClosed, Some(1), "pane 7 が建て直しの途中で閉じられた。会話は `tako sessions resume <id>` で別ペインへ開ける"),
+        (RelaunchFailure::ConversationNotFound, None, "pane 7 で再開した claude が「会話が見つからない」で終わった。`tako sessions list` で会話の記録（resumable）を確かめ、`tako sessions resume <id>` で開き直す"),
+    ]
+}
+
+/// リモートフォルダを開いたときに繋がなかった理由の見本（#2365 より前の固定文）
+fn auto_skip_table() -> Vec<(AutoTerminalSkip, &'static str)> {
+    vec![
+        (AutoTerminalSkip::Disabled, "terminal=false が指定されたのでターミナルは繋がない（繋ぐなら `tako remote-folder ssh-pane <host> <path>`）"),
+        (AutoTerminalSkip::AlreadyConnected { pane: 7 }, "pane 7 が同じホストへ繋がっているので新しいペインは作らない（別に立てるなら `tako open-in remote <host> --remote-dir <path>`）"),
+    ]
+}
+
+/// 会話の再起動の断りを [`Bilingual`] の口へ載せる。`Display` は利用者へ出す口の `message`（表示言語）
+#[derive(Debug)]
+struct RestartBlockAt(RestartBlock, SessionRestartMode);
+
+impl std::fmt::Display for RestartBlockAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message(RESTART_PANE, self.1))
+    }
+}
+
+impl Bilingual for RestartBlockAt {
+    fn text(&self, lang: Lang) -> String {
+        self.0.text_in(RESTART_PANE, self.1, lang)
+    }
+}
+
+/// 建て直しの失敗を [`Bilingual`] の口へ載せる（`last_restart.message` = `message`）
+#[derive(Debug)]
+struct RelaunchAt(RelaunchFailure, Option<i32>);
+
+impl std::fmt::Display for RelaunchAt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message(RESTART_PANE, self.1))
+    }
+}
+
+impl Bilingual for RelaunchAt {
+    fn text(&self, lang: Lang) -> String {
+        self.0.text_in(RESTART_PANE, self.1, lang)
+    }
+}
+
+/// 繋がなかった理由を [`Bilingual`] の口へ載せる（`terminal.note` = `note`）
+#[derive(Debug)]
+struct AutoSkipNote(AutoTerminalSkip);
+
+impl std::fmt::Display for AutoSkipNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.note())
+    }
+}
+
+impl Bilingual for AutoSkipNote {
+    fn text(&self, lang: Lang) -> String {
+        self.0.text_in(lang)
     }
 }
 
@@ -3044,6 +3179,30 @@ fn core_cases() -> Vec<CoreCase> {
         let arm = variant_name(&format!("{b:?}")).to_string().leak();
         out.push(case(SshBlockAt(b), ssh, arm, old));
     }
+    // #2365 の続き: 会話の再起動の断り（`tako session-restart` / MCP の断り・下見の `modes[].message`）と
+    // 建て直しの失敗（`last_restart.message`）、リモートフォルダの自動接続の注記（`terminal.note`）
+    let restart = (
+        SESSION_RESTART_SRC,
+        SESSION_RESTART_PATH,
+        "pub fn text_in(self, pane: u64, mode: SessionRestartMode",
+    );
+    for (b, mode, arm, old) in restart_block_table() {
+        out.push(case(RestartBlockAt(b, mode), restart, arm, old));
+    }
+    let relaunch = (
+        SESSION_RESTART_SRC,
+        SESSION_RESTART_PATH,
+        "pub fn text_in(self, pane: u64, exit_code: Option<i32>",
+    );
+    for (f, code, old) in relaunch_table() {
+        let arm = variant_name(&format!("{f:?}")).to_string().leak();
+        out.push(case(RelaunchAt(f, code), relaunch, arm, old));
+    }
+    let skip = (REMOTE_OPEN_SRC, REMOTE_OPEN_PATH, "impl AutoTerminalSkip {");
+    for (sk, old) in auto_skip_table() {
+        let arm = variant_name(&format!("{sk:?}")).to_string().leak();
+        out.push(case(AutoSkipNote(sk), skip, arm, old));
+    }
     out
 }
 
@@ -3068,6 +3227,21 @@ fn core_のエラー型の見本は全バリアントを1つずつ持つ() {
     covers_all(&copies, copy_refusal_index, COPY_REFUSALS);
     let blocks: Vec<PaneSshBlock> = ssh_block_table().into_iter().map(|(b, _)| b).collect();
     covers_all(&blocks, ssh_block_index, SSH_BLOCKS);
+    // 会話の再起動の断りは mode ごとの行を持つので、バリアントの網羅は Harness の行で見る
+    let restarts: Vec<RestartBlock> = restart_block_table()
+        .into_iter()
+        .filter(|(_, mode, _, _)| *mode == SessionRestartMode::Harness)
+        .map(|(b, ..)| b)
+        .collect();
+    covers_all(&restarts, restart_block_index, RESTART_BLOCKS);
+    let relaunches: Vec<RelaunchFailure> = relaunch_table()
+        .into_iter()
+        .filter(|(_, code, _)| code.is_some())
+        .map(|(f, ..)| f)
+        .collect();
+    covers_all(&relaunches, relaunch_index, RELAUNCH_FAILURES);
+    let skips: Vec<AutoTerminalSkip> = auto_skip_table().into_iter().map(|(sk, _)| sk).collect();
+    covers_all(&skips, auto_skip_index, AUTO_SKIPS);
     // 1 つずつ並べた型（LineOp / Session / Runner / Backend / ParseError 2 種）は
     // 見本の数を網羅 match の通し番号の数とそろえる
     let cases = core_cases();
