@@ -6403,10 +6403,18 @@ impl TakoApp {
                 // #786 の描画固定費を乗せない）。`request` は dispatch へ move するのでここで読む
                 let needs_frame = !TakoApp::ipc_redraw_legacy()
                     && tako_control::protocol::changes_layout(&incoming.request);
+                // #2665: 検証専用の注入（`TAKO_2665_INJECT_FILE`。env が無ければ何もしない）。
+                // `tako window list` の処理でメインスレッドを計測区間の外（前 / 後）・中で塞ぐ
+                let inject_2665 = tako_control::diag::Issue2665Inject::for_request(matches!(
+                    incoming.request,
+                    tako_control::protocol::Request::WindowList
+                ));
+                inject_2665.block_out_of_span();
                 let outcome = this.update(cx, |app: &mut TakoApp, cx| {
                     // Issue #168: dispatch + 後処理（pending 消化 + save_layout）込みの
                     // IPC 1 件あたりのメインスレッド専有を計測（dispatch 単体とネスト計測）
                     let _span = tako_control::diag::perf_span("ipc_turn");
+                    inject_2665.block_in_span();
                     let was_scroll = matches!(
                         incoming.request,
                         tako_control::protocol::Request::Scroll { .. }
@@ -6452,6 +6460,8 @@ impl TakoApp {
                     let redraw = app.after_dispatch(&mut result, needs_frame, cx);
                     (result, redraw)
                 });
+                // #2665: 検証専用の注入の 3 つ目（`ipc_turn` の区間が閉じた直後に計測区間の外で塞ぐ）
+                inject_2665.block_after_span();
                 match outcome {
                     // 接続が先に切れていても無視してよい
                     Ok((result, redraw)) => {
@@ -6783,27 +6793,17 @@ impl TakoApp {
         // timer が WinRT スレッドプール、再開がメインスレッドのキュー）。この値だけを
         // 「UI ストール」と呼ぶと、マシンが他所で飽和しているだけの状況を tako の
         // 専有と誤認する。素の OS スレッドの sleep 超過（スケジューラ遅延）と
-        // 実行中の計測区間を突き合わせて分類してから記録する
+        // 計測区間を突き合わせて分類してから記録する。
+        //
+        // #1968 / #2665: このループ自身が UI スレッドで走るので、塞いでいた区間はもう終わっている。
+        // 分類はタイマーの期限から今まで（= 遅延の間）に重なった区間の、重なった分で行う
+        // （1 周の判定の正本は `diag::stall_line`。スケジューラ遅延も毎周回そこで取り出す）
         cx.spawn(async move |this, cx| loop {
-            let t0 = std::time::Instant::now();
-            cx.background_executor().timer(Duration::from_secs(1)).await;
-            let lag = t0.elapsed().saturating_sub(Duration::from_secs(1));
-            // 毎周回 take する（記録するときだけ取ると古いピークが混ざる）
-            let sched_lag = tako_control::diag::take_scheduler_lag_peak();
-            if lag >= Duration::from_millis(500) {
-                let span = tako_control::diag::current_span_snapshot();
-                // #1968: このループ自身が UI スレッドで走るので、塞いでいた区間はもう
-                // 終わっている。遅延の窓（待った 1 秒 + 遅れ）に終わった区間で分類する
-                // （A/B の `TAKO_1968_LEGACY=1` は修正前と同じく使わない）
-                let recent = (!tako_control::diag::issue1968_legacy())
-                    .then(|| tako_control::diag::recent_spans_within(Duration::from_secs(1) + lag))
-                    .flatten();
-                tako_control::diag::perf_log(&tako_control::diag::classify_stall(
-                    lag,
-                    sched_lag,
-                    span.as_ref().map(|(tag, ms)| (tag.as_str(), *ms)),
-                    recent.as_ref(),
-                ));
+            let armed = std::time::Instant::now();
+            let period = Duration::from_secs(1);
+            cx.background_executor().timer(period).await;
+            if let Some(line) = tako_control::diag::stall_line(armed, period) {
+                tako_control::diag::perf_log(&line);
             }
             // View 破棄でループ終了（他の定期ループと同じ生存判定）
             if this.update(cx, |_, _| {}).is_err() {

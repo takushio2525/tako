@@ -1914,8 +1914,17 @@ lid-guard.json が使う）:
   UI スレッドで走るので、記録する時点で塞いでいた区間は**必ず終わっている**
   （`current_span_snapshot` は常に空）。旧実装はそのため tako 自身の専有まで
   「再開経路（タイマー / キュー）側の遅延」と分類していた。`perf_span` がトップレベル
-  （ネストの外側）の区間を短い履歴へ残し、`recent_spans_within(1 秒 + 遅れ)` の合計が
-  遅れの半分以上なら「tako の専有（最長の区間名）」と書く
+  （ネストの外側）の区間を短い履歴へ残し、遅延の間に重なった分の合計が遅れの半分以上なら
+  「tako の専有（最長の区間名）」と書く
+- **UI ストールの窓は「タイマーの期限 → 記録」= 遅延の間だけ**（#2665）: 1 周の判定の正本は
+  `diag::stall_line`（GUI の監視ループは呼ぶだけ）。`spans_overlapping_since(期限)` が期限より後ろへ
+  はみ出した分だけを数える（期限より前に終わった区間はタイマーの再開を遅らせていない）。
+  旧実装は窓を「1 秒 + 遅れ」= タイマーを掛けた時点まで遡り区間の全長を数えたので、期限より前に
+  終わった 300ms の区間を「tako の専有」と名指していた（隔離 GUI の注入で 4/4）。半分に届かないときは
+  `StallCause::Partial` = 内訳（区間・遅延の何 %）と残り（計測区間の外）を書く（騙らない・捨てない）。
+  分類は型 `StallCause`（文は網羅 match の `text_in`。perf.log は日本語）。A/B は `TAKO_2665_LEGACY=1`、
+  実経路の注入は `TAKO_2665_INJECT_FILE`（`scripts/test-stall-window-2665.sh`）、番犬は
+  `issue2665_stall_window_watchdog`
 - **プロセス走査の共有と変化検出**（#772 / #779）: `agents::ProcessSnapshot` が tmux pane PID と
   `ps` の親子関係を 1 回ずつ採取し、stale binary と sleep guard が同一 tick で共有する。
   sleep guard の 2 秒 tick は assertion の評価頻度であって、tmux / ps の採取頻度ではない。
