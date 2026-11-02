@@ -25102,7 +25102,7 @@ fn run_paste_cut(host: &mut dyn ControlHost, plan: &PastePlan) -> Result<Value, 
 
 /// ペインをそのまま SSH 化できるか（#1006 の `can_ssh_pane` を `list` に載せる。#1080）。
 ///
-/// `{ "ok": true }` か `{ "ok": false, "reason": <slug>, "note": <日本語の理由 + 次の一手> }`。
+/// `{ "ok": true }` か `{ "ok": false, "reason": <slug>, "note": <理由 + 次の一手（表示言語。#2365）> }`。
 /// リモート UI（#1080）と AI は**この 1 箇所の答え**を読むので、
 /// 「メニューに出たのに実行すると断られる」食い違いが構造的に起きない
 fn can_ssh_json(host: &dyn ControlHost, pane: &Pane) -> Value {
