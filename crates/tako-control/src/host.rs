@@ -1037,6 +1037,11 @@ pub trait PreviewHost {
     fn preview_edit_state(&self, _pane: PaneId) -> Option<(bool, bool)> {
         None
     }
+    /// 編集バッファの本文と版を `f` へ貸す（#2045。横断置換が開いているバッファを写す・戻す前に
+    /// 中身を確かめる）。編集セッションが無ければ `f` を呼ばずに `false`
+    fn read_preview_buffer(&self, _pane: PaneId, _f: &mut dyn FnMut(&str, u64)) -> bool {
+        false
+    }
     /// 本文の器から見た可視範囲と、カーソル行がそこに入っているか（#1649）。
     ///
     /// 追従スクロールは内部挙動なので新しい操作は増えないが、**効いているかを

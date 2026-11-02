@@ -846,6 +846,59 @@ pub fn search_more(n: usize) -> String {
 pub fn search_close() -> &'static str {
     tr!("この結果を閉じる", "Close these results")
 }
+// #2045: 置換
+pub fn search_replace_toggle() -> &'static str {
+    tr!("置換欄を開く / 閉じる", "Toggle replace")
+}
+pub fn search_replace_placeholder() -> &'static str {
+    tr!(
+        "置換後（正規表現なら $1 で括弧の中身）",
+        "Replace with ($1 for a group in a regular expression)"
+    )
+}
+pub fn search_replace_all() -> &'static str {
+    tr!("すべて置換", "Replace all")
+}
+pub fn search_replace_undo() -> &'static str {
+    tr!("元に戻す", "Undo replace")
+}
+pub fn search_replace_file() -> &'static str {
+    tr!("ファイルを置換", "Replace in file")
+}
+pub fn search_replace_row() -> &'static str {
+    tr!("置換", "Replace")
+}
+pub fn search_replace_done() -> &'static str {
+    tr!("置換済み", "Replaced")
+}
+/// 行に添える当てない理由の札（短く。全文は CLI / MCP の `files[].reason`）
+pub fn search_replace_skip(skip: tako_core::workspace_replace::Skip) -> &'static str {
+    use tako_core::workspace_replace::Skip;
+    match skip {
+        Skip::Stale => tr!("検索の後に変わった", "changed since search"),
+        Skip::Unsaved => tr!("未保存の編集あり", "unsaved edits"),
+        Skip::NotUtf8 => tr!("UTF-8 でない", "not UTF-8"),
+        Skip::Unreadable => tr!("読めない", "unreadable"),
+        Skip::ReadOnly => tr!("読み取り専用", "read-only"),
+        Skip::OpenInSeveral => tr!("複数のペインで編集中", "open in several panes"),
+        Skip::Unchanged => tr!("変わらない", "no change"),
+        Skip::BackupFailed => tr!("退避できない", "backup failed"),
+        Skip::WriteFailed => tr!("書けない", "write failed"),
+        Skip::AlreadyApplied => tr!("置換済み", "replaced"),
+        Skip::Edited => tr!("編集された", "edited"),
+    }
+}
+/// 当てなかったファイルの理由（欄の下に 1 つ出す）
+pub fn search_replace_skipped(path: &str, reason: &str) -> String {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    tr!(
+        format!("当てなかった: {name} — {reason}"),
+        format!("Not replaced: {name} — {reason}")
+    )
+}
 
 // --- usage ビュー（キー: panel.usage_*。#2203） ---
 
@@ -1125,6 +1178,15 @@ mod tests {
                 search_failed("x"),
                 search_more(5),
                 search_close().to_string(),
+                // #2045: 置換
+                search_replace_toggle().to_string(),
+                search_replace_placeholder().to_string(),
+                search_replace_all().to_string(),
+                search_replace_undo().to_string(),
+                search_replace_file().to_string(),
+                search_replace_row().to_string(),
+                search_replace_done().to_string(),
+                search_replace_skipped("/w/a.rs", "x"),
                 // #2203: usage ビュー
                 usage_title().to_string(),
                 usage_loading().to_string(),
@@ -1160,6 +1222,11 @@ mod tests {
                 tako_core::lsp::xref::XrefKind::ALL
                     .into_iter()
                     .flat_map(|k| [xref_action(k).to_string(), xref_kind(k).to_string()]),
+            )
+            .chain(
+                tako_core::workspace_replace::Skip::ALL
+                    .into_iter()
+                    .map(|k| search_replace_skip(k).to_string()),
             )
             .collect()
         });

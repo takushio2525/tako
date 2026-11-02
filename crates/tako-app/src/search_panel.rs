@@ -13,10 +13,19 @@
 //!
 //! 検索欄（[`SearchUi`]）だけは画面の持ち物（打ちかけの文字は AI へ見せる状態ではない）。
 //! CLI の `--show` が出した検索は欄へ写す（画面と結果の検索語を食い違わせない）。
+//!
+//! ## 置換（#2045）
+//!
+//! 検索欄の左の > で置換欄を開く。置換欄の文字列で作ったプレビュー（行ごとの「消す字 → 足す字」）は
+//! CLI `tako search --replace <置換後>`（検索語なし = 右パネルの結果へのプレビュー）と同じ要求で頼み、
+//! 置き場に置かれたものを行に並べる（打っている最中は少し待ってから頼む）。行の「置換」・ファイルの
+//! 「ファイルを置換」・見出しの「すべて置換」は同じ要求に `confirm`（CLI の `--yes`）を付けたもの、
+//! 「元に戻す」は `tako search --undo --yes`。照合・退避・書き込みは background（同じ 3 段）。
 
 use gpui::{div, prelude::*, px, svg, Context, HighlightStyle, MouseButton, MouseDownEvent};
-use gpui::{SharedString, StyledText};
+use gpui::{SharedString, StrikethroughStyle, StyledText};
 use tako_control::protocol::Request;
+use tako_core::workspace_replace::{Mark, RowPreview};
 use tako_core::workspace_search::{QueryError, Stop};
 use tako_core::PaneOrigin;
 
@@ -26,6 +35,8 @@ use super::*;
 const ROWS: usize = 500;
 /// 検索語の上限（バイト。貼り付けた巨大な文字列で欄と照合器を膨らませない）
 const QUERY_MAX_BYTES: usize = 1000;
+/// 置換欄を打ってからプレビューを頼むまで（毎打鍵でファイルを読み直さない）
+const PREVIEW_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// 検索欄の状態（結果そのものは `TakoApp::workspace_search`）
 #[derive(Debug, Default)]
@@ -39,6 +50,17 @@ pub(crate) struct SearchUi {
     synced_seq: u64,
     /// dispatch が断った理由（置き場に残らない失敗 = 範囲が無い等。次の検索で消える）
     pub(crate) notice: Option<String>,
+    /// 置換欄を開いている（#2045）
+    pub(crate) replace_open: bool,
+    pub(crate) replace_input: crate::text_field::TextField,
+    /// 打鍵を受けているのが置換欄（`focused` と組で使う。Tab で行き来する）
+    pub(crate) replace_focused: bool,
+    /// プレビューを頼んだ（結果の番号, 置換の世代, 置換欄の文字列）。同じものを 2 度頼まない
+    preview_requested: Option<(u64, u64, String)>,
+    /// プレビューを頼むのを遅らせている
+    preview_scheduled: bool,
+    /// 置き場のプレビューを置換欄へ写した回数（CLI が置いたプレビューを欄へ写す目印）
+    synced_previews: u64,
 }
 
 impl TakoApp {
@@ -67,13 +89,26 @@ impl TakoApp {
         self.search_ui.focused && self.panel_visible && self.panel_view == PanelView::Search
     }
 
-    /// 検索欄へ文字を入れる（打鍵・⌘V・IME の確定の共通経路。1 行なので制御文字は落とす）
+    /// 打鍵を受けている欄が置換欄か（#2045）
+    fn replace_field_active(&self) -> bool {
+        self.search_ui.replace_open && self.search_ui.replace_focused
+    }
+
+    /// 検索欄へ文字を入れる（打鍵・⌘V・IME の確定の共通経路。1 行なので制御文字は落とす）。
+    /// 置換欄が打鍵を受けていればそちらへ入れる（#2045。IME の宛先は同じ `WorkspaceSearch`）
     pub(crate) fn search_insert(&mut self, text: &str, cx: &mut Context<Self>) {
         let filtered: String = text.chars().filter(|c| !c.is_control()).collect();
         if !filtered.is_empty() {
-            self.search_ui
-                .input
-                .insert(&filtered, QUERY_MAX_BYTES, false);
+            if self.replace_field_active() {
+                self.search_ui
+                    .replace_input
+                    .insert(&filtered, QUERY_MAX_BYTES, false);
+                self.schedule_replace_preview(cx);
+            } else {
+                self.search_ui
+                    .input
+                    .insert(&filtered, QUERY_MAX_BYTES, false);
+            }
         }
         cx.notify();
     }
@@ -86,8 +121,20 @@ impl TakoApp {
     ) -> bool {
         let m = keystroke.modifiers;
         match keystroke.key.as_str() {
+            // 置換欄の Enter はプレビューをすぐ頼む（書き換えるのはボタンだけ）
+            "enter" if self.replace_field_active() => {
+                self.request_replace_preview(cx);
+                true
+            }
             "enter" => {
                 self.run_workspace_search(cx);
+                true
+            }
+            // 置換欄を開いていれば Tab で検索欄 ↔ 置換欄
+            "tab" if self.search_ui.replace_open && !m.platform && !m.control => {
+                self.search_ui.replace_focused = !self.search_ui.replace_focused;
+                self.discard_app_text_ime(AppTextInput::WorkspaceSearch);
+                cx.notify();
                 true
             }
             "escape" => {
@@ -111,7 +158,13 @@ impl TakoApp {
                 true
             }
             key => {
-                if self.search_ui.input.handle_edit_key(key) {
+                if self.replace_field_active() {
+                    if self.search_ui.replace_input.handle_edit_key(key) {
+                        self.schedule_replace_preview(cx);
+                        cx.notify();
+                        return true;
+                    }
+                } else if self.search_ui.input.handle_edit_key(key) {
                     cx.notify();
                     return true;
                 }
@@ -148,6 +201,9 @@ impl TakoApp {
             limit: Some(1),
             item: None,
             focus: None,
+            replacement: None,
+            file: None,
+            confirm: None,
         };
         self.dispatch_off_ui(request, PaneOrigin::User, cx, |app, result, cx| {
             // 壊れた正規表現は置き場に理由が残る（ビューが出す）。それ以外の断り（範囲が無い等）は
@@ -194,6 +250,9 @@ impl TakoApp {
             item: Some(item),
             // 手で押した = 開いた行を読みに行く（定義ジャンプの ⌘クリックと同じ）
             focus: Some(true),
+            replacement: None,
+            file: None,
+            confirm: None,
         };
         if let Err(e) = tako_control::dispatch(self, request, PaneOrigin::User) {
             self.search_ui.notice = Some(e.to_string());
@@ -215,11 +274,201 @@ impl TakoApp {
             limit: None,
             item: None,
             focus: None,
+            replacement: None,
+            file: None,
+            confirm: None,
         };
         if let Err(e) = tako_control::dispatch(self, request, PaneOrigin::User) {
             self.search_ui.notice = Some(e.to_string());
         }
         cx.notify();
+    }
+
+    /// 置換欄の開閉（検索欄の左の >。#2045）。開いたら置換欄へフォーカスしてプレビューを頼み、
+    /// 閉じたら置き場のプレビューを下ろす（行の表示を検索だけへ戻す）
+    fn toggle_replace(&mut self, cx: &mut Context<Self>) {
+        self.search_ui.replace_open = !self.search_ui.replace_open;
+        self.clear_text_input_focus();
+        if self.search_ui.replace_open {
+            self.search_ui.focused = true;
+            self.search_ui.replace_focused = true;
+            self.search_ui.replace_input.move_end();
+            self.search_ui.preview_requested = None;
+            self.request_replace_preview(cx);
+        } else {
+            self.search_ui.replace_focused = false;
+            self.workspace_search.replace_mut().clear_preview();
+        }
+        cx.notify();
+    }
+
+    /// 置換の要求（CLI `tako search --replace <置換欄> [--item N | --file F] [--yes]` と同じ形）
+    fn replace_request(&self, item: Option<usize>, file: Option<String>, confirm: bool) -> Request {
+        Request::WorkspaceSearch {
+            action: "replace".into(),
+            query: None,
+            path: None,
+            pane: Some(self.focused_pane().as_u64()),
+            regex: None,
+            case_sensitive: None,
+            show: None,
+            // 画面は置き場を読むので、応答には行を載せない
+            limit: Some(1),
+            item,
+            focus: None,
+            replacement: Some(self.search_ui.replace_input.text().to_string()),
+            file,
+            confirm: confirm.then_some(true),
+        }
+    }
+
+    /// 打っている最中は少し待ってからプレビューを頼む（待つ間の打鍵は 1 回にまとめる）
+    fn schedule_replace_preview(&mut self, cx: &mut Context<Self>) {
+        if self.search_ui.preview_scheduled {
+            return;
+        }
+        self.search_ui.preview_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PREVIEW_DELAY).await;
+            let _ = this.update(cx, |app, cx| {
+                app.search_ui.preview_scheduled = false;
+                app.request_replace_preview(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 右パネルの結果へのプレビューを頼む（同じ結果・世代・文字列ではもう頼まない）
+    fn request_replace_preview(&mut self, cx: &mut Context<Self>) {
+        if !self.search_ui.replace_open {
+            return;
+        }
+        let Some(seq) = self.workspace_search.shown().map(|s| s.seq) else {
+            return;
+        };
+        let key = (
+            seq,
+            self.workspace_search.replace().generation(),
+            self.search_ui.replace_input.text().to_string(),
+        );
+        if self.search_ui.preview_requested.as_ref() == Some(&key) {
+            return;
+        }
+        self.search_ui.preview_requested = Some(key);
+        let request = self.replace_request(None, None, false);
+        self.dispatch_off_ui(request, PaneOrigin::User, cx, |app, result, cx| {
+            // 置換の参照の誤りは置き場に理由が残る（欄の下に出る）。それ以外の断りは欄の下へ
+            if let Err(e) = result {
+                let in_store = app
+                    .workspace_search
+                    .replace()
+                    .preview()
+                    .is_some_and(|p| p.error.is_some());
+                if !in_store {
+                    app.search_ui.notice = Some(e.to_string());
+                }
+            }
+            cx.notify();
+        });
+    }
+
+    /// 当てる（行の「置換」= item・ファイルの「ファイルを置換」= file・見出しの「すべて置換」= どちらも無し）
+    fn apply_replace(&mut self, item: Option<usize>, file: Option<String>, cx: &mut Context<Self>) {
+        self.search_ui.notice = None;
+        let request = self.replace_request(item, file, true);
+        self.dispatch_off_ui(request, PaneOrigin::User, cx, |app, result, cx| {
+            match result {
+                Err(e) => app.search_ui.notice = Some(e.to_string()),
+                // 当てなかったファイルがあれば、最初の 1 つの理由を欄の下に出す（行にも理由が並ぶ）
+                Ok(out) => {
+                    app.search_ui.notice = out["files"].as_array().and_then(|files| {
+                        files.iter().find_map(|f| {
+                            let reason = f["reason"].as_str()?;
+                            (f["status"] != "unchanged" && f["status"] != "already-applied").then(
+                                || {
+                                    crate::ui_text::panel::search_replace_skipped(
+                                        f["path"].as_str().unwrap_or(""),
+                                        reason,
+                                    )
+                                },
+                            )
+                        })
+                    });
+                }
+            }
+            app.search_ui.preview_requested = None;
+            app.request_replace_preview(cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// 最後の置換を戻す（CLI `tako search --undo --yes` と同じ要求）
+    fn undo_replace(&mut self, cx: &mut Context<Self>) {
+        self.search_ui.notice = None;
+        let request = Request::WorkspaceSearch {
+            action: "undo".into(),
+            query: None,
+            path: None,
+            pane: None,
+            regex: None,
+            case_sensitive: None,
+            show: None,
+            limit: None,
+            item: None,
+            focus: None,
+            replacement: None,
+            file: None,
+            confirm: Some(true),
+        };
+        self.dispatch_off_ui(request, PaneOrigin::User, cx, |app, result, cx| {
+            match result {
+                Err(e) => app.search_ui.notice = Some(e.to_string()),
+                Ok(out) => {
+                    app.search_ui.notice = out["files"].as_array().and_then(|files| {
+                        files.iter().find_map(|f| {
+                            (f["status"] == "changed"
+                                || f["status"] == "edited"
+                                || f["status"] == "backup-missing"
+                                || f["status"] == "write-failed")
+                                .then(|| {
+                                    crate::ui_text::panel::search_replace_skipped(
+                                        f["path"].as_str().unwrap_or(""),
+                                        f["reason"].as_str().unwrap_or(""),
+                                    )
+                                })
+                        })
+                    });
+                }
+            }
+            app.search_ui.preview_requested = None;
+            app.request_replace_preview(cx);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// CLI が置いたプレビュー（`tako search --replace <置換後>`）を置換欄へ写して開く。
+    /// 打っている最中（欄にフォーカス）は書き換えない
+    fn sync_replace_input(&mut self) {
+        let placed = self.workspace_search.replace().previews_placed();
+        if placed <= self.search_ui.synced_previews {
+            return;
+        }
+        self.search_ui.synced_previews = placed;
+        let Some(preview) = self.workspace_search.replace().preview() else {
+            return;
+        };
+        if self.search_ui.focused && self.search_ui.replace_focused {
+            return;
+        }
+        if preview.replacement != self.search_ui.replace_input.text() {
+            self.search_ui
+                .replace_input
+                .set_text(preview.replacement.clone());
+            self.search_ui.replace_input.move_end();
+        }
+        self.search_ui.replace_open = true;
     }
 
     /// CLI の `--show` が出した検索を欄へ写す（画面と結果の検索語を食い違わせない）。
@@ -247,11 +496,151 @@ impl TakoApp {
         self.search_ui.case_sensitive = query.case_sensitive;
     }
 
+    /// 検索欄 / 置換欄の 1 つ（#2045 で置換欄も同じ形）。押すとその欄が打鍵を受ける。
+    /// IME の宛先はどちらも `AppTextInput::WorkspaceSearch`（下線とキャレットは打鍵を受ける欄にだけ出す）
+    fn search_field(
+        &self,
+        replace: bool,
+        active: bool,
+        theme: &tako_core::Theme,
+        probe: &dyn Fn(String) -> gpui::Canvas<()>,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let input = if replace {
+            &self.search_ui.replace_input
+        } else {
+            &self.search_ui.input
+        };
+        let (before, after) = input.split_at_caret();
+        let visible = ((self.panel_width - 130.0) / 6.5).max(6.0) as usize;
+        let empty = input.text().is_empty();
+        let id = if replace {
+            "search-replace-input"
+        } else {
+            "search-input"
+        };
+        let placeholder = if replace {
+            crate::ui_text::panel::search_replace_placeholder()
+        } else {
+            crate::ui_text::panel::search_placeholder()
+        };
+        div()
+            .id(id)
+            .relative()
+            .flex_1()
+            .min_w(px(0.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .overflow_hidden()
+            .px(px(6.0))
+            .py(px(3.0))
+            .rounded(px(4.0))
+            .cursor(gpui::CursorStyle::IBeam)
+            .border_1()
+            .border_color(hsla(if active {
+                theme.accent_border_muted
+            } else {
+                theme.border_inner
+            }))
+            .bg(rgba(theme.surface_0))
+            .text_size(px(11.5))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    // #496: 押した瞬間にルートの dismiss で自分が消えないよう伝播を止める
+                    this.clear_text_input_focus();
+                    this.search_ui.focused = true;
+                    this.search_ui.replace_focused = replace;
+                    if replace {
+                        this.search_ui.replace_input.move_end();
+                    } else {
+                        this.search_ui.input.move_end();
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .when(empty && !active, |d| {
+                d.child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .text_color(hsla(theme.text_faint))
+                        .child(placeholder),
+                )
+            })
+            .when(!empty, |d| {
+                d.child(div().flex_none().child(SharedString::from(
+                    crate::right_panel::tail_chars(before, visible),
+                )))
+            })
+            // #561: 未確定文字列は入力欄の中へ出す（変換の宛先 = AppTextInput::WorkspaceSearch）
+            .children(
+                active
+                    .then(|| self.text_input_marked(AppTextInput::WorkspaceSearch, theme))
+                    .flatten(),
+            )
+            .when(active, |d| {
+                d.child(self.text_input_caret(AppTextInput::WorkspaceSearch, theme))
+            })
+            .when(!empty, |d| {
+                d.child(
+                    div()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(SharedString::from(crate::right_panel::head_chars(
+                            after, visible,
+                        ))),
+                )
+            })
+            .child(probe(id.to_string()))
+    }
+
+    /// 置換の文字のボタン（すべて置換 / 元に戻す / ファイルを置換 / 行の置換。#2045）。
+    /// 押せないときは薄く出し、押しても何もしない（呼び手の on_click は `enabled` のときだけ効く）
+    fn search_button(
+        &self,
+        id: impl Into<SharedString>,
+        label: &'static str,
+        enabled: bool,
+        theme: &tako_core::Theme,
+        probe: &dyn Fn(String) -> gpui::Canvas<()>,
+        _cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let id: SharedString = id.into();
+        div()
+            .id(gpui::ElementId::Name(id.clone()))
+            .relative()
+            .flex_none()
+            .px(px(6.0))
+            .py(px(1.0))
+            .rounded(px(4.0))
+            .text_size(px(10.5))
+            .whitespace_nowrap()
+            .border_1()
+            .border_color(hsla(theme.border_inner))
+            .text_color(hsla(if enabled {
+                theme.foreground
+            } else {
+                theme.text_faint
+            }))
+            .when(enabled, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(hsla(theme.surface_hover)))
+            })
+            .child(label)
+            .child(probe(id.to_string()))
+    }
+
     pub(crate) fn render_search_view(
         &mut self,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         self.sync_search_input();
+        self.sync_replace_input();
         let theme = self.theme.clone();
         let probe_bounds = self.panel_click_probe_bounds.clone();
         let mono = SharedString::from(theme.font_family.clone());
@@ -287,10 +676,15 @@ impl TakoApp {
             .size_full()
         };
 
-        // --- 検索欄 + トグル ---
-        let (before, after) = self.search_ui.input.split_at_caret();
-        let visible = ((self.panel_width - 110.0) / 6.5).max(6.0) as usize;
-        let empty = self.search_ui.input.text().is_empty();
+        // --- 検索欄 + トグル（左の > で置換欄を開く。#2045） ---
+        let replace_active = focused && self.replace_field_active();
+        let query_active = focused && !self.replace_field_active();
+        // 欄は `cx` を借りるので、`cx` を掴むトグルの閉包より先に組む
+        let query_field = self.search_field(false, query_active, &theme, &probe, cx);
+        let replace_field = self
+            .search_ui
+            .replace_open
+            .then(|| self.search_field(true, replace_active, &theme, &probe, cx));
         let toggle = |id: &'static str, label: &'static str, on: bool, tip: &'static str| {
             let tip_theme = theme.clone();
             div()
@@ -327,108 +721,161 @@ impl TakoApp {
                 .child(label)
                 .child(probe(id.to_string()))
         };
-        root = root.child(
+        let expander = {
+            let tip_theme = theme.clone();
             div()
+                .id("search-replace-toggle")
+                .relative()
                 .flex_none()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(4.0))
-                .px(px(8.0))
-                .py(px(6.0))
-                .border_b_1()
-                .border_color(hsla(theme.border_inner))
+                .px(px(2.0))
+                .py(px(2.0))
+                .rounded(px(3.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(hsla(theme.surface_hover)))
+                .tooltip(move |_, cx| {
+                    cx.new(|_| {
+                        crate::tab_bar::HintTooltip::new(
+                            crate::ui_text::panel::search_replace_toggle().to_string(),
+                            tip_theme.clone(),
+                        )
+                    })
+                    .into()
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_replace(cx)))
                 .child(
-                    div()
-                        .id("search-input")
-                        .relative()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .overflow_hidden()
-                        .px(px(6.0))
-                        .py(px(3.0))
-                        .rounded(px(4.0))
-                        .cursor(gpui::CursorStyle::IBeam)
-                        .border_1()
-                        .border_color(hsla(if focused {
-                            theme.accent_border_muted
+                    svg()
+                        .path(if self.search_ui.replace_open {
+                            crate::file_icons::ui_icon::CHEVRON_DOWN
                         } else {
-                            theme.border_inner
-                        }))
-                        .bg(rgba(theme.surface_0))
-                        .text_size(px(11.5))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                                // #496: 押した瞬間にルートの dismiss で自分が消えないよう伝播を止める
-                                this.clear_text_input_focus();
-                                this.search_ui.focused = true;
-                                this.search_ui.input.move_end();
-                                cx.stop_propagation();
-                                cx.notify();
+                            crate::file_icons::ui_icon::CHEVRON_RIGHT
+                        })
+                        .w(px(10.0))
+                        .h(px(10.0))
+                        .text_color(hsla(theme.text_muted)),
+                )
+                .child(probe("search-replace-toggle".to_string()))
+        };
+        root =
+            root.child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .pl(px(4.0))
+                    .pr(px(8.0))
+                    .py(px(6.0))
+                    .when(!self.search_ui.replace_open, |d| {
+                        d.border_b_1().border_color(hsla(theme.border_inner))
+                    })
+                    .child(expander)
+                    .child(query_field)
+                    .child(
+                        toggle(
+                            "search-case",
+                            "Aa",
+                            self.search_ui.case_sensitive,
+                            crate::ui_text::panel::search_case_toggle(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_workspace_search_option(false, cx)
+                        })),
+                    )
+                    .child(
+                        toggle(
+                            "search-regex",
+                            ".*",
+                            self.search_ui.regex,
+                            crate::ui_text::panel::search_regex_toggle(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_workspace_search_option(true, cx)
+                        })),
+                    ),
+            );
+        // --- 置換欄 + すべて置換 / 元に戻す（#2045） ---
+        let preview = self
+            .workspace_search
+            .shown()
+            .and_then(|shown| {
+                self.workspace_search
+                    .replace()
+                    .preview()
+                    .filter(|p| p.seq == shown.seq)
+            })
+            .filter(|p| p.replacement == self.search_ui.replace_input.text())
+            .cloned();
+        if let Some(replace_field) = replace_field {
+            let ready = preview
+                .as_ref()
+                .is_some_and(|p| p.rows.values().any(|r| matches!(r, RowPreview::Ready(_))));
+            let busy = self.workspace_search.replace().busy().is_some();
+            let can_undo = !self.workspace_search.replace().history().is_empty();
+            root = root.child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .pl(px(20.0))
+                    .pr(px(8.0))
+                    .pb(px(6.0))
+                    .border_b_1()
+                    .border_color(hsla(theme.border_inner))
+                    .child(replace_field)
+                    .child(
+                        self.search_button(
+                            "search-replace-all",
+                            crate::ui_text::panel::search_replace_all(),
+                            ready && !busy,
+                            &theme,
+                            &probe,
+                            cx,
+                        )
+                        .when(ready && !busy, |d| {
+                            d.on_click(
+                                cx.listener(|this, _, _, cx| this.apply_replace(None, None, cx)),
+                            )
+                        }),
+                    )
+                    .when(can_undo, |d| {
+                        d.child(
+                            self.search_button(
+                                "search-replace-undo",
+                                crate::ui_text::panel::search_replace_undo(),
+                                !busy,
+                                &theme,
+                                &probe,
+                                cx,
+                            )
+                            .when(!busy, |d| {
+                                d.on_click(cx.listener(|this, _, _, cx| this.undo_replace(cx)))
                             }),
                         )
-                        .when(empty && !focused, |d| {
-                            d.child(
-                                div()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .text_color(hsla(theme.text_faint))
-                                    .child(crate::ui_text::panel::search_placeholder()),
-                            )
-                        })
-                        .when(!empty, |d| {
-                            d.child(div().flex_none().child(SharedString::from(
-                                crate::right_panel::tail_chars(before, visible),
-                            )))
-                        })
-                        // #561: 未確定文字列は入力欄の中へ出す（変換の宛先 = AppTextInput::WorkspaceSearch）
-                        .children(self.text_input_marked(AppTextInput::WorkspaceSearch, &theme))
-                        .when(focused, |d| {
-                            d.child(self.text_input_caret(AppTextInput::WorkspaceSearch, &theme))
-                        })
-                        .when(!empty, |d| {
-                            d.child(
-                                div()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .child(SharedString::from(crate::right_panel::head_chars(
-                                        after, visible,
-                                    ))),
-                            )
-                        })
-                        .child(probe("search-input".to_string())),
-                )
-                .child(
-                    toggle(
-                        "search-case",
-                        "Aa",
-                        self.search_ui.case_sensitive,
-                        crate::ui_text::panel::search_case_toggle(),
-                    )
-                    .on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.toggle_workspace_search_option(false, cx)
-                        }),
-                    ),
-                )
-                .child(
-                    toggle(
-                        "search-regex",
-                        ".*",
-                        self.search_ui.regex,
-                        crate::ui_text::panel::search_regex_toggle(),
-                    )
-                    .on_click(
-                        cx.listener(|this, _, _, cx| this.toggle_workspace_search_option(true, cx)),
-                    ),
-                ),
-        );
+                    }),
+            );
+            if let Some(error) = preview.as_ref().and_then(|p| p.error.as_ref()) {
+                root = root.child(note(error.text_in(tako_core::i18n::lang())));
+            }
+            // 結果・置換欄が変わったら（打鍵・当てた・別の検索）少し待ってからプレビューを頼む
+            let stale = self.workspace_search.shown().is_some_and(|shown| {
+                self.search_ui.preview_requested.as_ref()
+                    != Some(&(
+                        shown.seq,
+                        self.workspace_search.replace().generation(),
+                        self.search_ui.replace_input.text().to_string(),
+                    ))
+            });
+            if stale {
+                self.schedule_replace_preview(cx);
+            }
+        }
         if let Some(notice) = self.search_ui.notice.clone() {
             root = root.child(note(crate::ui_text::panel::search_failed(&notice)));
         }
@@ -562,6 +1009,27 @@ impl TakoApp {
             background_color: Some(hsla_alpha(theme.accent, 0.30)),
             ..HighlightStyle::default()
         };
+        // #2045: 置換のプレビューは消す字（取り消し線）と足す字を色で分ける
+        let deleted = HighlightStyle {
+            color: Some(hsla(theme.text_muted)),
+            background_color: Some(hsla_alpha(theme.red, 0.22)),
+            strikethrough: Some(StrikethroughStyle {
+                thickness: px(1.0),
+                color: Some(hsla(theme.red)),
+            }),
+            ..HighlightStyle::default()
+        };
+        let inserted = HighlightStyle {
+            color: Some(hsla(theme.foreground)),
+            background_color: Some(hsla_alpha(theme.green, 0.25)),
+            ..HighlightStyle::default()
+        };
+        let replace_open = self.search_ui.replace_open;
+        let busy = self.workspace_search.replace().busy().is_some();
+        let applied = self.workspace_search.replace().applied().clone();
+        let row_preview = |index: usize| -> Option<&RowPreview> {
+            preview.as_ref().filter(|_| replace_open)?.rows.get(&index)
+        };
         let mut body = div()
             .id("panel-search-scroll")
             .flex_1()
@@ -581,6 +1049,14 @@ impl TakoApp {
             if last_path != Some(hit.path.as_path()) {
                 last_path = Some(hit.path.as_path());
                 let in_file = outcome.hits.iter().filter(|h| h.path == hit.path).count();
+                // そのファイルに当てられる行があれば「ファイルを置換」（#2045）
+                let file_ready = outcome
+                    .hits
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, h)| h.path == hit.path)
+                    .any(|(i, _)| matches!(row_preview(i), Some(RowPreview::Ready(_))));
+                let file_path = hit.path.display().to_string();
                 body = body.child(
                     div()
                         .flex_shrink_0()
@@ -600,14 +1076,69 @@ impl TakoApp {
                                 .whitespace_nowrap()
                                 .child(SharedString::from(hit.rel.clone())),
                         )
-                        .child(muted(in_file.to_string())),
+                        .child(muted(in_file.to_string()))
+                        .when(file_ready, |d| {
+                            d.child(div().flex_1()).child(
+                                self.search_button(
+                                    format!("search-replace-file-{id}"),
+                                    crate::ui_text::panel::search_replace_file(),
+                                    !busy,
+                                    &theme,
+                                    &probe,
+                                    cx,
+                                )
+                                .when(!busy, |d| {
+                                    d.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.apply_replace(None, Some(file_path.clone()), cx)
+                                    }))
+                                }),
+                            )
+                        }),
                 );
             }
-            let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> =
-                char_ranges_to_bytes(&hit.excerpt, &hit.ranges)
-                    .into_iter()
-                    .map(|r| (r, highlight))
-                    .collect();
+            // 置換のプレビュー（#2045）: 当てられる行は差分の抜粋、当てない行は理由の札
+            let ready = match row_preview(index) {
+                Some(RowPreview::Ready(line)) if !applied.contains(&index) => Some(line.clone()),
+                _ => None,
+            };
+            let tag = if !replace_open {
+                None
+            } else if applied.contains(&index) {
+                Some(crate::ui_text::panel::search_replace_done().to_string())
+            } else {
+                match row_preview(index) {
+                    Some(RowPreview::Skipped(skip)) => {
+                        Some(crate::ui_text::panel::search_replace_skip(*skip).to_string())
+                    }
+                    _ => None,
+                }
+            };
+            let (text, highlights): (String, Vec<(std::ops::Range<usize>, HighlightStyle)>) =
+                match &ready {
+                    Some(line) => {
+                        let marks: Vec<(usize, usize)> =
+                            line.diff_marks.iter().map(|(s, e, _)| (*s, *e)).collect();
+                        let styles = line.diff_marks.iter().map(|(_, _, k)| match k {
+                            Mark::Deleted => deleted,
+                            Mark::Inserted => inserted,
+                        });
+                        (
+                            line.diff.clone(),
+                            char_ranges_to_bytes_kept(&line.diff, &marks)
+                                .into_iter()
+                                .zip(styles)
+                                .filter_map(|(r, style)| r.map(|r| (r, style)))
+                                .collect(),
+                        )
+                    }
+                    None => (
+                        hit.excerpt.clone(),
+                        char_ranges_to_bytes(&hit.excerpt, &hit.ranges)
+                            .into_iter()
+                            .map(|r| (r, highlight))
+                            .collect(),
+                    ),
+                };
             body = body.child(
                 div()
                     .id(("search-row", id as u64))
@@ -632,10 +1163,34 @@ impl TakoApp {
                             .whitespace_nowrap()
                             .font_family(mono.clone())
                             .child(
-                                StyledText::new(SharedString::from(hit.excerpt.clone()))
+                                StyledText::new(SharedString::from(text))
                                     .with_highlights(highlights),
                             ),
                     )
+                    .when_some(tag, |d, tag| d.child(muted(tag)))
+                    .when(ready.is_some(), |d| {
+                        d.child(
+                            self.search_button(
+                                format!("search-replace-row-{id}"),
+                                crate::ui_text::panel::search_replace_row(),
+                                !busy,
+                                &theme,
+                                &probe,
+                                cx,
+                            )
+                            // 行のクリック（開く）へ伝えない
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _: &MouseDownEvent, _, cx| cx.stop_propagation()),
+                            )
+                            .when(!busy, |d| {
+                                d.on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.apply_replace(Some(id), None, cx)
+                                }))
+                            }),
+                        )
+                    })
                     // 押す（⌘クリックも同じ）と開く。押した瞬間にルートの dismiss で
                     // 欄のフォーカスが落ちるのは構わない（開いたペインへ移る）
                     .on_click(cx.listener(move |this, _, _, cx| this.open_search_item(id, cx)))
@@ -647,6 +1202,17 @@ impl TakoApp {
         }
         root.child(body)
     }
+}
+
+/// [`char_ranges_to_bytes`] の位置を保つ版（#2045。範囲ごとに印が対になるので、落とした範囲は `None`）
+fn char_ranges_to_bytes_kept(
+    text: &str,
+    ranges: &[(usize, usize)],
+) -> Vec<Option<std::ops::Range<usize>>> {
+    ranges
+        .iter()
+        .map(|r| char_ranges_to_bytes(text, std::slice::from_ref(r)).pop())
+        .collect()
 }
 
 /// 抜粋の中の文字範囲をバイト範囲へ直す（`StyledText` の強調はバイトで受ける）。

@@ -896,9 +896,14 @@ fn reason_index(r: &Reason) -> usize {
         // #2365 の続き: adopt の判断の断り（`orchestrator::decide_adopt`）
         Reason::AdoptLaunchedDedicated { .. } => 337,
         Reason::AdoptMasterAgentMismatch { .. } => 338,
+        // #2045: 横断置換の断り
+        Reason::ReplaceNeedsReplacement => 339,
+        Reason::ReplaceItemAndFile => 340,
+        Reason::ReplaceFileNotInResults(_) => 341,
+        Reason::ReplaceBusy => 342,
     }
 }
-const REASON_VARIANTS: usize = 339;
+const REASON_VARIANTS: usize = 343;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1523,6 +1528,10 @@ fn reason_samples() -> Vec<Reason> {
             target: "tako".into(),
             target_agent: "claude".into(),
         },
+        Reason::ReplaceNeedsReplacement,
+        Reason::ReplaceItemAndFile,
+        Reason::ReplaceFileNotInResults("src/a.rs".into()),
+        Reason::ReplaceBusy,
     ]
 }
 
@@ -1933,6 +1942,11 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "master の系統が食い違う（この master は codex / 'tako' は claude）。\n\
      採用だけ通すと引き継ぎの後任が claude で立ち上がる。\n\
      揃えるには: tako orchestrator profiles set tako --master-agent codex",
+    // #2045 で足した断り（#2365 の後に生まれたので、今の日本語をそのまま固定する）
+    "replace には replacement（置換後の文字列。空文字で一致を消す）が要る",
+    "item と file は同時に指定できない（1 行か 1 ファイルのどちらか）",
+    "結果に src/a.rs の行が無い（結果の path か表示の相対パスで指定する）",
+    "前の置換を当てている途中（終わってからもう一度）",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形

@@ -3464,7 +3464,7 @@ fn normalize_line_endings(text: &str, ending: LineEnding) -> Cow<'_, str> {
 }
 
 #[cfg(unix)]
-fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
     let nonce = std::time::SystemTime::now()
@@ -3495,7 +3495,7 @@ fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // `create`: 外で消されたファイルを上書き保存で作り直す（#1659）。
     // 消えたファイルへの通常の保存は `save_inner` が書く前に断る
     let mut file = std::fs::OpenOptions::new()

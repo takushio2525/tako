@@ -234,8 +234,10 @@ impl TakoApp {
                     OffloadContinuation::List(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#1984 の先取りの続き）
                     OffloadContinuation::Probed(_) => None,
-                    // 定義ジャンプの問い合わせからは来ない（#1694 の横断検索の続き）
-                    OffloadContinuation::WorkspaceSearch(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#1694 の横断検索 / #2045 の置換の続き）
+                    OffloadContinuation::WorkspaceSearch(_)
+                    | OffloadContinuation::WorkspaceReplace(_)
+                    | OffloadContinuation::WorkspaceUndo(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#2052 の完了・却下の続き）
                     OffloadContinuation::UserTaskStatus(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#2086 のユーザータスクの続き）

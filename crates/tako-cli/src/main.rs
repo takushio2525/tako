@@ -3706,10 +3706,12 @@ struct LinksArgs {
 }
 
 /// ワークスペース横断検索の引数（Issue #1694）。
-/// 最簡形（#322）: `tako search <検索語>` でタブのファイルツリーのルートから探す
+/// 最簡形（#322）: `tako search <検索語>` でタブのファイルツリーのルートから探す。
+/// 置換（#2045）: `tako search <検索語> --replace <置換後>` でプレビュー、`--yes` で当てる
+/// （検索語を省くと右パネルの結果に当てる）。`tako search --undo --yes` で最後の置換を戻す
 #[derive(Args)]
 struct SearchArgs {
-    /// 検索語（--results / --open / --clear では要らない）
+    /// 検索語（--results / --open / --clear / --undo では要らない。--replace で省くと右パネルの結果に当てる）
     query: Option<String>,
     /// 探すフォルダ（省略時はタブのファイルツリーのルート）
     #[arg(long)]
@@ -3738,6 +3740,22 @@ struct SearchArgs {
     /// 右パネルの結果を閉じる（走っている検索も取り消す）
     #[arg(long, conflicts_with_all = ["query", "show"])]
     clear: bool,
+    /// 置換後の文字列（正規表現の検索なら $1 / ${名前} / $0 を展開。--yes が無ければプレビューだけ）
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true,
+          conflicts_with_all = ["results", "open", "clear"])]
+    replace: Option<String>,
+    /// 置換: 結果の N 番目の 1 行だけに当てる
+    #[arg(long, value_name = "N", requires = "replace", conflicts_with = "file")]
+    item: Option<usize>,
+    /// 置換: そのファイルの行だけに当てる
+    #[arg(long, value_name = "PATH", requires = "replace")]
+    file: Option<String>,
+    /// 最後に当てた置換を戻す（--yes が無ければ戻せるかだけを見る）
+    #[arg(long, conflicts_with_all = ["query", "replace", "results", "open", "clear", "show"])]
+    undo: bool,
+    /// 置換 / 取り消しを実際に当てる
+    #[arg(long)]
+    yes: bool,
     /// 対象ペイン（探す範囲のタブ・--open の起点。省略時は呼び出し元）
     #[arg(long)]
     pane: Option<u64>,
@@ -3754,6 +3772,10 @@ impl SearchArgs {
             "open"
         } else if self.clear {
             "clear"
+        } else if self.undo {
+            "undo"
+        } else if self.replace.is_some() {
+            "replace"
         } else {
             "search"
         }
@@ -10366,8 +10388,18 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 case_sensitive: args.case_sensitive.then_some(true),
                 show: args.show.then_some(true),
                 limit: args.limit,
-                item: args.open,
+                item: args.open.or(args.item),
                 focus: args.focus.then_some(true),
+                replacement: args.replace.clone(),
+                // 自分の cwd から辿れる相対パスは絶対パスへ直す（辿れなければ表示の相対パスとして渡す）
+                file: args.file.as_deref().map(|f| {
+                    if std::path::Path::new(f).exists() {
+                        absolutize(f)
+                    } else {
+                        f.to_string()
+                    }
+                }),
+                confirm: args.yes.then_some(true),
             }
         }
         Command::Links(args) => {
@@ -13207,6 +13239,8 @@ fn print_search(args: &SearchArgs, result: &Value) {
             }
             return;
         }
+        "replace" => return print_replace(result),
+        "undo" => return print_undo(result),
         _ => {}
     }
     match result["status"].as_str() {
@@ -13291,6 +13325,86 @@ fn print_search(args: &SearchArgs, result: &Value) {
         tail.push(format!("探していない: {}", skip.join("・")));
     }
     println!("{}", tail.join(" / "));
+}
+
+/// 自分の cwd からの相対パス（ターミナルのリンクとして開ける形）
+fn cwd_relative(path: &str) -> String {
+    let path = std::path::PathBuf::from(path);
+    std::env::current_dir()
+        .ok()
+        .and_then(|c| path.strip_prefix(c).ok().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// `tako search --replace` の出力（#2045）。行は `パス:行: 抜粋` と、その下に `→ 置換後`。
+/// 当てないファイルは理由つきで並べ、最後に件数と次の一手
+fn print_replace(result: &Value) {
+    let items = result["items"].as_array().cloned().unwrap_or_default();
+    for item in &items {
+        let status = item["status"].as_str().unwrap_or("");
+        println!(
+            "{}:{}: {}",
+            cwd_relative(item["path"].as_str().unwrap_or("")),
+            item["line"],
+            item["excerpt"].as_str().unwrap_or("")
+        );
+        match item["replaced"].as_str() {
+            Some(after) => println!("  → {after}"),
+            None => println!("  （{status}）"),
+        }
+    }
+    for file in result["files"].as_array().into_iter().flatten() {
+        if let Some(reason) = file["reason"].as_str() {
+            println!(
+                "当てない: {} — {reason}",
+                cwd_relative(file["path"].as_str().unwrap_or(""))
+            );
+        } else if file["via"] == "buffer" {
+            println!(
+                "編集中のペイン {} に当てる: {}",
+                file["pane"],
+                cwd_relative(file["path"].as_str().unwrap_or(""))
+            );
+        }
+    }
+    let more = result["truncated"].as_u64().unwrap_or(0);
+    if more > 0 {
+        println!("ほか {more} 行（--limit 0 で全部）");
+    }
+    if let Some(note) = result["note"].as_str() {
+        println!("{note}");
+    }
+    if let Some(next) = result["next_step"].as_str() {
+        println!("{next}");
+    }
+}
+
+/// `tako search --undo` の出力（#2045）
+fn print_undo(result: &Value) {
+    if result["status"] == "nothing" {
+        println!("{}", result["note"].as_str().unwrap_or(""));
+        return;
+    }
+    println!(
+        "置換 #{}（{} → {}）",
+        result["id"],
+        result["query"].as_str().unwrap_or(""),
+        result["replacement"].as_str().unwrap_or("")
+    );
+    for file in result["files"].as_array().into_iter().flatten() {
+        let mut line = format!(
+            "{}: {}",
+            cwd_relative(file["path"].as_str().unwrap_or("")),
+            file["reason"].as_str().unwrap_or("")
+        );
+        if let Some(backup) = file["backup"].as_str() {
+            line.push_str(&format!("（退避: {backup}）"));
+        }
+        println!("{line}");
+    }
+    if let Some(next) = result["next_step"].as_str() {
+        println!("{next}");
+    }
 }
 
 fn print_jump(sub: &JumpCommand, result: &Value) {

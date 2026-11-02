@@ -113,6 +113,9 @@ fn retained(window: WindowHandle<TakoApp>, cx: &mut AsyncApp) -> serde_json::Val
                     limit: None,
                     item: None,
                     focus: None,
+                    replacement: None,
+                    file: None,
+                    confirm: None,
                 },
                 PaneOrigin::Cli,
             )
