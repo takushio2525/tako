@@ -548,6 +548,36 @@ fn 補完_content_modified_は問い直さずエラーにもせず未完の_0_�
     assert_fixed("completion-typing-loading");
 }
 
+/// 上限（deadline）は今までどおり: 読み込み中の `-32801` の後に読み込みが上限までに済まなければ、
+/// 読み込み中に問い直しを重ねずに「起動・読み込みの上限」で返す（合図を作らない = 読み込みは終わらない）
+#[test]
+fn 読み込みが上限までに済まなければ問い直さずに上限で返す() {
+    let stage = Stage::new("deadline");
+    let manager = stage.manager(Modified::WhileLoading, None);
+    let mut link = DocLink::default();
+    manager.sync(&mut link, true, &stage.main, TEXT, 1);
+    lsp_fake_e2e::wait_loading_known(&manager);
+    let answer = manager.goto(&GotoRequest {
+        kind: GotoKind::Definition,
+        path: stage.main.clone(),
+        line: 0,
+        column: 12,
+        timeout: Duration::from_secs(2),
+        document: None,
+    });
+    assert!(
+        matches!(answer, Err(GotoError::Timeout { starting: true, .. })),
+        "読み込みの上限で返る: {answer:?}"
+    );
+    lsp_fake_e2e::stop_and_settle(&manager, &stage.log());
+    drop(link);
+    assert_eq!(
+        lsp_fake_e2e::received(&stage.log(), "textDocument/definition"),
+        1,
+        "読み込み中は問い直さない"
+    );
+}
+
 /// 表の全件が上の `#[test]` のどれかに載っている（足した件を測り忘れない）
 #[test]
 fn 表の全件を測っている() {

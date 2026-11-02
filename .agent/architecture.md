@@ -3059,7 +3059,9 @@ A/B は `TAKO_1935_LEGACY=1`（#1917 の状態 = TS / TSX だけ前置き付き�
   で今の本文の座標へ直して戻す）だけ（番犬 `issue1651_undo_delta_watchdog` / `issue1869_lsp_followup_watchdog`）
 - **補完の読み込み中の真因**（実測。rust-analyzer 1.95.0・std だけの新しいプロジェクト・250ms おきの
   問い合わせ）: 読み込みの前半（`quiescent:false` から約 0.8 秒）は補完に**即座に `null`**、後半（約 2.3 秒まで）は
-  **答えずに待たせ** `quiescent:true` の直後にまとめて答える。`didChange` を挟んでも -32801 は出ない。tako は
+  **答えずに待たせ** `quiescent:true` の直後にまとめて答える。`didChange` を挟んでも -32801 は出ない
+  （ただし読み込み直し = `switch_workspaces` の最中に受けた要求は `-32801` で返る。扱いは #2673 =
+  `.agent/plans/2026-09-lsp-s1.md` の 20-2 節）。tako は
   前半の `null` を 0 件として受け、**打鍵の要求（`superseding`）は読み込みを待たずに 0 件で返していた**
   （CLI / MCP だけが #1680 と同じく待って問い直していた）= tako 側が捨てていた
 - **直し方**: 打鍵の要求も空の答えの後に `wait_loaded` で済むのを待って問い直す。待ちは
