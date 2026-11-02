@@ -240,7 +240,8 @@ fn scan_owner(s: &Sources) -> Vec<String> {
             "cards_drawn_by_mod が見つからない（走査が空振り）",
         )),
     }
-    match window(&s.control, "fn band_view(", "}") {
+    // #2663: 帯の材料を組むのは写しの段（`band_seed`。UI スレッド）
+    match window(&s.control, "fn band_seed(", "}") {
         Some(w) => needs(
             &mut out,
             CONTROL,
@@ -251,7 +252,7 @@ fn scan_owner(s: &Sources) -> Vec<String> {
         None => out.push(report(
             CONTROL,
             1,
-            "band_view が見つからない（走査が空振り）",
+            "band_seed が見つからない（走査が空振り）",
         )),
     }
     let owners = s

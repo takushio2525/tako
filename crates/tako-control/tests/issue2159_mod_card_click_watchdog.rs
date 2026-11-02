@@ -19,7 +19,7 @@
 //! 2. `pressCard`: Run の番は CLI を叩く前に `Number.POSITIVE_INFINITY` で取り、読み（`runBusy.get`）と書きの
 //!    間に `await` を挟まない。走ったら `RUN_REPEAT_MS` まで捨て、断られたら番を外す
 //! 3. tako 側: `card_click` は `mouse_forward_status()` の `enabled` と #1961 の A/B（`legacy`）と #2159 の
-//!    A/B（`core::card_click_legacy()`）を見て、応答の `view.cards`（`band_view`）へ渡る
+//!    A/B（`core::card_click_legacy()`）を見て、応答の `view.cards`（`band_seed` = 帯の材料の写し）へ渡る
 //! 4. A/B の env（`TAKO_2159_LEGACY`）の名前を文字列で読むのは `tako_core::claude_mod` だけ
 //!
 //! # 見逃す側へ倒れないための作り
@@ -267,7 +267,8 @@ fn scan_control(s: &Sources) -> Vec<String> {
             "card_click が見つからない（走査が空振り）",
         )),
     }
-    match window(&s.control, "fn band_view(", "}") {
+    // #2663: 帯の材料を組むのは写しの段（`band_seed`。UI スレッド）
+    match window(&s.control, "fn band_seed(", "}") {
         Some(w) => needs(
             &mut out,
             CONTROL,
@@ -278,7 +279,7 @@ fn scan_control(s: &Sources) -> Vec<String> {
         None => out.push(report(
             CONTROL,
             1,
-            "band_view が見つからない（走査が空振り）",
+            "band_seed が見つからない（走査が空振り）",
         )),
     }
     for (file, src) in &s.others {
