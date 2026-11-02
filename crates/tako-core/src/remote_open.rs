@@ -384,15 +384,33 @@ impl AutoTerminalSkip {
         }
     }
 
-    /// 人が読む説明（規約どおり日本語。応答と通知に出す）
+    /// 人が読む説明（応答の `terminal.note` と GUI の通知に出す）。
+    /// 表示言語に従う（#2365。日英の正本は [`Self::text_in`]）
     pub fn note(self) -> String {
-        match self {
-            AutoTerminalSkip::Disabled => "terminal=false が指定されたのでターミナルは繋がない\
+        self.text_in(crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての説明（#2365）。日英の対はここ 1 か所に置く。
+    ///
+    /// (バリアント, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまで
+    /// コンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    /// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）
+    pub fn text_in(self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Disabled, Ja) => "terminal=false が指定されたのでターミナルは繋がない\
                  （繋ぐなら `tako remote-folder ssh-pane <host> <path>`）"
                 .to_string(),
-            AutoTerminalSkip::AlreadyConnected { pane } => format!(
+            (Self::Disabled, En) => "terminal=false was given, so no terminal is connected \
+                 (to connect one, use `tako remote-folder ssh-pane <host> <path>`)"
+                .to_string(),
+            (Self::AlreadyConnected { pane }, Ja) => format!(
                 "pane {pane} が同じホストへ繋がっているので新しいペインは作らない\
                  （別に立てるなら `tako open-in remote <host> --remote-dir <path>`）"
+            ),
+            (Self::AlreadyConnected { pane }, En) => format!(
+                "pane {pane} is already connected to the same host, so no new pane is created \
+                 (to open another one, use `tako open-in remote <host> --remote-dir <path>`)"
             ),
         }
     }
@@ -450,9 +468,13 @@ mod auto_terminal_tests {
             AutoTerminalSkip::AlreadyConnected { pane: 3 },
         ] {
             assert!(!skip.as_str().is_empty());
-            assert!(!skip.note().trim().is_empty());
-            // 次の一手（別の繋ぎ方）を必ず添える
-            assert!(skip.note().contains("tako "), "{}", skip.note());
+            // #2365: 日英どちらの表示でも同じ形
+            for lang in [crate::i18n::Lang::Ja, crate::i18n::Lang::En] {
+                let note = skip.text_in(lang);
+                assert!(!note.trim().is_empty());
+                // 次の一手（別の繋ぎ方）を必ず添える
+                assert!(note.contains("tako "), "{note}");
+            }
         }
     }
 

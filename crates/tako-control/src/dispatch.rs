@@ -52935,12 +52935,21 @@ tako | pane 2 [ compact ]       [-]
         let msg = format!("{}", result.unwrap_err());
         // #1067 で判断を session_restart へ寄せた。MockHost のペインは
         // セッションも role も持たないので、構造的な理由で断られる
-        // （旧文面は「バックエンドが無い」だった）。**理由と次の一手が入っている**ことを見る
-        assert!(
-            msg.contains("ターミナルセッションが無い")
-                || msg.contains("エージェントのペインではない"),
-            "エラーメッセージが想定と異なる: {msg}"
-        );
+        // （旧文面は「バックエンドが無い」だった）。**理由と次の一手が入っている**ことを見る。
+        // #2365: 断りの文は表示言語に従う（言語グローバルの既定は英語）ので、日英どちらかの正本の文と比べる
+        use tako_core::session_restart::{RestartBlock, SessionRestartMode};
+        let known = [RestartBlock::NoSession, RestartBlock::NotAgent]
+            .into_iter()
+            .any(|b| {
+                [SessionRestartMode::Harness, SessionRestartMode::Handoff]
+                    .into_iter()
+                    .any(|m| {
+                        [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                            .into_iter()
+                            .any(|l| msg == b.text_in(pane, m, l))
+                    })
+            });
+        assert!(known, "エラーメッセージが想定と異なる: {msg}");
         assert!(msg.contains("pane"), "対象ペインを名指しする: {msg}");
     }
 

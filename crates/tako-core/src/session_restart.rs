@@ -146,83 +146,161 @@ impl RestartBlock {
         )
     }
 
-    /// 理由 + 次の一手（dispatch / CLI / MCP / GUI のバナーにそのまま出す。規約どおり日本語）
+    /// 理由 + 次の一手（dispatch / CLI / MCP の断り・下見の `modes[].message`）。
+    /// 表示言語に従う（#2365。日英の正本は [`Self::text_in`]）
     pub fn message(self, pane: u64, mode: SessionRestartMode) -> String {
-        match self {
-            Self::NoSession => format!(
+        self.text_in(pane, mode, crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての文言（#2365）。日英の対はここ 1 か所に置く。
+    ///
+    /// (バリアント, mode, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまで
+    /// コンパイルが通らない。mode で文が変わるのは系統の未対応と、エージェントが居ないときだけ。
+    /// 日本語は #2365 より前の固定文とバイト一致
+    /// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）
+    pub fn text_in(self, pane: u64, mode: SessionRestartMode, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        use SessionRestartMode as M;
+        match (self, mode, lang) {
+            (Self::NoSession, _, Ja) => format!(
                 "pane {pane} にはターミナルセッションが無い（プレビュー等）ので再起動できない。\
                  エージェントが動いているペインを指定する"
             ),
-            Self::NotAgent => format!(
+            (Self::NoSession, _, En) => format!(
+                "pane {pane} has no terminal session (e.g. a preview), so it cannot be restarted. \
+                 Specify a pane where an agent is running"
+            ),
+            (Self::NotAgent, _, Ja) => format!(
                 "pane {pane} は AI エージェントのペインではない（role が無い）ので\
                  セッション再起動の対象外。`tako list` の role で対象ペインを確認する"
             ),
-            Self::AgentUnsupported { agent } => match mode {
-                SessionRestartMode::Harness => format!(
-                    "pane {pane} の系統（{}）は tako からの resume に未対応なので\
-                     ハーネス更新できない（claude のみ）。手動なら codex は `codex resume`、\
-                     agy は `agy --conversation` を使う。対応状況は `tako agent-support` を参照",
-                    agent.as_str()
-                ),
-                SessionRestartMode::Handoff => format!(
-                    "pane {pane} の系統（{}）は tako からの引き継ぎ再起動に未対応\
-                     （claude のみ実測済み）。対応状況は `tako agent-support` を参照",
-                    agent.as_str()
-                ),
-            },
-            Self::SessionUnresolved => format!(
+            (Self::NotAgent, _, En) => format!(
+                "pane {pane} is not an AI agent pane (it has no role), so a session restart does not \
+                 apply. Check the role in `tako list` to find the target pane"
+            ),
+            (Self::AgentUnsupported { agent }, M::Harness, Ja) => format!(
+                "pane {pane} の系統（{}）は tako からの resume に未対応なので\
+                 ハーネス更新できない（claude のみ）。手動なら codex は `codex resume`、\
+                 agy は `agy --conversation` を使う。対応状況は `tako agent-support` を参照",
+                agent.as_str()
+            ),
+            (Self::AgentUnsupported { agent }, M::Harness, En) => format!(
+                "the agent in pane {pane} ({}) cannot be resumed from tako yet, so the harness \
+                 cannot be updated (claude only). To do it by hand, use `codex resume` for codex \
+                 or `agy --conversation` for agy. See `tako agent-support` for what is supported",
+                agent.as_str()
+            ),
+            (Self::AgentUnsupported { agent }, M::Handoff, Ja) => format!(
+                "pane {pane} の系統（{}）は tako からの引き継ぎ再起動に未対応\
+                 （claude のみ実測済み）。対応状況は `tako agent-support` を参照",
+                agent.as_str()
+            ),
+            (Self::AgentUnsupported { agent }, M::Handoff, En) => format!(
+                "the agent in pane {pane} ({}) does not support a handoff restart from tako yet \
+                 (verified with claude only). See `tako agent-support` for what is supported",
+                agent.as_str()
+            ),
+            (Self::SessionUnresolved, _, Ja) => format!(
                 "pane {pane} の claude の会話（session_id）を解決できないので\
                  ハーネス更新できない（resume 先が分からないまま終了させると会話を失う）。\
                  `tako sessions list` で会話を確認し、必要なら `tako sessions resume <id>` を使う"
             ),
-            Self::AgentProcessNotFound => match mode {
-                SessionRestartMode::Harness => format!(
-                    "pane {pane} で動いているエージェント CLI のプロセスが見つからず、\
-                     シェルが入力待ちとも確かめられないのでハーネス更新できない\
-                     （終了させる相手が分からないまま resume の行を打つと、\
-                     動いているエージェントへの指示として入力されてしまう）。\
-                     すでに終了しているなら `tako sessions resume <id>` で会話を別ペインへ開く"
-                ),
-                // #1967: エージェントが居ないペインへ引き継ぎの依頼を積むと、
-                // 届け先が無いまま黙って時間切れになる（後任も立たない）
-                SessionRestartMode::Handoff => format!(
-                    "pane {pane} ではエージェントが動いていないので引き継ぎを書かせられない\
-                     （依頼を受け取る相手が居ない）。同じ会話を戻すなら \
-                     `tako session-restart --mode harness --pane {pane}` を使う"
-                ),
-            },
-            Self::HandoffNeedsMaster => format!(
+            (Self::SessionUnresolved, _, En) => format!(
+                "cannot resolve the claude conversation (session_id) of pane {pane}, so the harness \
+                 cannot be updated (quitting without knowing what to resume would lose the \
+                 conversation). Check the conversation with `tako sessions list` and use \
+                 `tako sessions resume <id>` if needed"
+            ),
+            (Self::AgentProcessNotFound, M::Harness, Ja) => format!(
+                "pane {pane} で動いているエージェント CLI のプロセスが見つからず、\
+                 シェルが入力待ちとも確かめられないのでハーネス更新できない\
+                 （終了させる相手が分からないまま resume の行を打つと、\
+                 動いているエージェントへの指示として入力されてしまう）。\
+                 すでに終了しているなら `tako sessions resume <id>` で会話を別ペインへ開く"
+            ),
+            (Self::AgentProcessNotFound, M::Harness, En) => format!(
+                "cannot find the agent CLI process running in pane {pane}, and cannot confirm that \
+                 the shell is waiting for input, so the harness cannot be updated (typing the resume \
+                 line without knowing what to quit would send it to the running agent as an \
+                 instruction). If the agent has already exited, open the conversation in another \
+                 pane with `tako sessions resume <id>`"
+            ),
+            // #1967: エージェントが居ないペインへ引き継ぎの依頼を積むと、
+            // 届け先が無いまま黙って時間切れになる（後任も立たない）
+            (Self::AgentProcessNotFound, M::Handoff, Ja) => format!(
+                "pane {pane} ではエージェントが動いていないので引き継ぎを書かせられない\
+                 （依頼を受け取る相手が居ない）。同じ会話を戻すなら \
+                 `tako session-restart --mode harness --pane {pane}` を使う"
+            ),
+            (Self::AgentProcessNotFound, M::Handoff, En) => format!(
+                "no agent is running in pane {pane}, so it cannot be asked to write a handoff \
+                 (there is no one to receive the request). To bring back the same conversation, \
+                 use `tako session-restart --mode harness --pane {pane}`"
+            ),
+            (Self::HandoffNeedsMaster, _, Ja) => format!(
                 "pane {pane} は master ペインではないので引き継ぎ再起動できない\
                  （引き継ぎファイルの機構は master だけが持つ）。\
                  会話を保ったまま建て直すなら mode=harness を使う"
             ),
-            Self::Busy => format!(
+            (Self::HandoffNeedsMaster, _, En) => format!(
+                "pane {pane} is not a master pane, so it cannot do a handoff restart (only master has \
+                 the handoff file mechanism). To rebuild while keeping the conversation, use \
+                 mode=harness"
+            ),
+            (Self::Busy, _, Ja) => format!(
                 "pane {pane} は生成中 / コマンド実行中なので再起動しない\
                  （途中の作業を失う）。終わってからもう一度実行する"
             ),
-            Self::QueuedMessages => format!(
+            (Self::Busy, _, En) => format!(
+                "pane {pane} is generating or running a command, so it will not be restarted \
+                 (the work in progress would be lost). Run it again once it finishes"
+            ),
+            (Self::QueuedMessages, _, Ja) => format!(
                 "pane {pane} には未送信の指示がキューに残っているので再起動しない\
                  （その指示が失われる）。エージェントが処理し終えてからもう一度実行する"
             ),
-            Self::UserDraft => format!(
+            (Self::QueuedMessages, _, En) => format!(
+                "pane {pane} still has unsent instructions in its queue, so it will not be restarted \
+                 (they would be lost). Run it again after the agent has processed them"
+            ),
+            (Self::UserDraft, _, Ja) => format!(
                 "pane {pane} の入力欄に下書きが残っているので再起動しない\
                  （打ちかけの指示が失われる）。送信するか消してからもう一度実行する"
             ),
-            Self::Dialog => format!(
+            (Self::UserDraft, _, En) => format!(
+                "pane {pane} has a draft in its input box, so it will not be restarted \
+                 (the half-typed instruction would be lost). Send or clear it, then run it again"
+            ),
+            (Self::Dialog, _, Ja) => format!(
                 "pane {pane} は選択肢ダイアログを表示中なので再起動しない。\
                  `tako orchestrator respond --pane {pane}` で応答してからもう一度実行する"
             ),
-            Self::ConversationMissing => format!(
+            (Self::Dialog, _, En) => format!(
+                "pane {pane} is showing a choice dialog, so it will not be restarted. \
+                 Answer it with `tako orchestrator respond --pane {pane}`, then run it again"
+            ),
+            (Self::ConversationMissing, _, Ja) => format!(
                 "pane {pane} の会話の記録（claude の transcript）が見つからないので\
                  ハーネス更新できない（終了させてから resume しても \
                  `No conversation found` で落ち、会話も画面も失う）。\
                  `tako sessions list` で再開できる会話（resumable）を確認する"
             ),
-            Self::RestartInProgress => format!(
+            (Self::ConversationMissing, _, En) => format!(
+                "the conversation record (claude transcript) of pane {pane} was not found, so the \
+                 harness cannot be updated (resuming after quitting would fail with \
+                 `No conversation found` and lose both the conversation and the screen). \
+                 Check resumable conversations with `tako sessions list`"
+            ),
+            (Self::RestartInProgress, _, Ja) => format!(
                 "pane {pane} の建て直しがまだ終わっていないので重ねて再起動しない\
                  （起動し直したばかりのエージェントをまた終了させてしまう）。\
                  `tako session-restart --pane {pane}` の last_restart で進み具合を確かめ、\
                  終わってからもう一度実行する"
+            ),
+            (Self::RestartInProgress, _, En) => format!(
+                "pane {pane} is still being rebuilt, so it will not be restarted again (that would \
+                 quit the agent that was just started). Check the progress in last_restart of \
+                 `tako session-restart --pane {pane}`, then run it again once it is done"
             ),
         }
     }
@@ -591,32 +669,71 @@ impl RelaunchFailure {
         }
     }
 
-    /// 理由 + 次の一手（dispatch の応答・CLI / MCP。規約どおり日本語）
+    /// 理由 + 次の一手（`tako session-restart` の下見の `last_restart.message`）。
+    /// 表示言語に従う（#2365。日英の正本は [`Self::text_in`]）
     pub fn message(self, pane: u64, exit_code: Option<i32>) -> String {
-        let code = exit_code.map_or_else(String::new, |c| format!("（終了コード {c}）"));
-        match self {
-            Self::ProcessStuck => format!(
+        self.text_in(pane, exit_code, crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての文言（#2365）。日英の対はここ 1 か所に置く。
+    ///
+    /// (バリアント, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまで
+    /// コンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    /// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）
+    pub fn text_in(self, pane: u64, exit_code: Option<i32>, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        let code = match (exit_code, lang) {
+            (None, _) => String::new(),
+            (Some(c), Ja) => format!("（終了コード {c}）"),
+            (Some(c), En) => format!(" (exit code {c})"),
+        };
+        match (self, lang) {
+            (Self::ProcessStuck, Ja) => format!(
                 "pane {pane} のエージェントが SIGKILL 後も終わらないので建て直しを中止した。\
                  ペインで直接終了させてから `tako session-restart --mode harness --pane {pane}` をやり直す"
             ),
-            Self::CommandFlowTimeout => format!(
+            (Self::ProcessStuck, En) => format!(
+                "the agent in pane {pane} did not exit even after SIGKILL, so the rebuild was \
+                 aborted. Quit it in the pane, then run \
+                 `tako session-restart --mode harness --pane {pane}` again"
+            ),
+            (Self::CommandFlowTimeout, Ja) => format!(
                 "pane {pane} のシェルへ再開コマンドを送り届けられなかった（シェルが入力を受け付けない）。\
                  ペインの状態を `tako read --pane {pane}` で確かめ、\
                  `tako session-restart --mode harness --pane {pane}` をやり直す"
             ),
-            Self::ConversationNotFound => format!(
+            (Self::CommandFlowTimeout, En) => format!(
+                "could not deliver the resume command to the shell in pane {pane} (the shell is not \
+                 accepting input). Check the pane with `tako read --pane {pane}`, then run \
+                 `tako session-restart --mode harness --pane {pane}` again"
+            ),
+            (Self::ConversationNotFound, Ja) => format!(
                 "pane {pane} で再開した claude が「会話が見つからない」で終わった{code}。\
                  `tako sessions list` で会話の記録（resumable）を確かめ、\
                  `tako sessions resume <id>` で開き直す"
             ),
-            Self::AgentExited => format!(
+            (Self::ConversationNotFound, En) => format!(
+                "the claude resumed in pane {pane} exited with \"conversation not found\"{code}. \
+                 Check the conversation record (resumable) with `tako sessions list`, then reopen \
+                 it with `tako sessions resume <id>`"
+            ),
+            (Self::AgentExited, Ja) => format!(
                 "pane {pane} で再開したエージェントがすぐ終わった{code}。\
                  `tako read --pane {pane}` で理由を確かめ、\
                  `tako session-restart --mode harness --pane {pane}` をやり直す"
             ),
-            Self::PaneClosed => format!(
+            (Self::AgentExited, En) => format!(
+                "the agent resumed in pane {pane} exited right away{code}. Check why with \
+                 `tako read --pane {pane}`, then run \
+                 `tako session-restart --mode harness --pane {pane}` again"
+            ),
+            (Self::PaneClosed, Ja) => format!(
                 "pane {pane} が建て直しの途中で閉じられた。\
                  会話は `tako sessions resume <id>` で別ペインへ開ける"
+            ),
+            (Self::PaneClosed, En) => format!(
+                "pane {pane} was closed during the rebuild. The conversation can be opened in \
+                 another pane with `tako sessions resume <id>`"
             ),
         }
     }
@@ -1086,14 +1203,19 @@ mod tests {
         ];
         for block in blocks {
             for mode in [SessionRestartMode::Harness, SessionRestartMode::Handoff] {
-                let msg = block.message(7, mode);
-                assert!(msg.contains("pane 7"), "対象ペインを名指しする: {msg}");
-                // 「どうすれば通るか」を必ず添える（コマンドか、待つ / 別モードの案内）
-                let has_next_step = msg.contains("tako ")
-                    || msg.contains("もう一度")
-                    || msg.contains("mode=harness")
-                    || msg.contains("指定する");
-                assert!(has_next_step, "次の一手を添える: {msg}");
+                // #2365: 日英どちらの表示でも同じ形（対象ペイン + 次の一手）
+                for lang in [crate::i18n::Lang::Ja, crate::i18n::Lang::En] {
+                    let msg = block.text_in(7, mode, lang);
+                    assert!(msg.contains("pane 7"), "対象ペインを名指しする: {msg}");
+                    // 「どうすれば通るか」を必ず添える（コマンドか、待つ / 別モードの案内）
+                    let has_next_step = msg.contains("tako ")
+                        || msg.contains("もう一度")
+                        || msg.to_lowercase().contains("run it again")
+                        || msg.contains("mode=harness")
+                        || msg.contains("指定する")
+                        || msg.contains("Specify a pane");
+                    assert!(has_next_step, "次の一手を添える: {msg}");
+                }
             }
             assert!(!block.as_str().is_empty());
         }
@@ -1376,8 +1498,11 @@ mod tests {
             can_restart(SessionRestartMode::Handoff, &shell_only),
             Err(RestartBlock::AgentProcessNotFound)
         );
-        let msg = RestartBlock::AgentProcessNotFound.message(9, SessionRestartMode::Handoff);
-        assert!(msg.contains("--mode harness"), "次の一手は harness: {msg}");
+        for lang in [crate::i18n::Lang::Ja, crate::i18n::Lang::En] {
+            let msg =
+                RestartBlock::AgentProcessNotFound.text_in(9, SessionRestartMode::Handoff, lang);
+            assert!(msg.contains("--mode harness"), "次の一手は harness: {msg}");
+        }
         // 入力待ちとも確かめられないなら従来どおり断る（打った行が誰かの入力欄へ入る）
         let unknown = RestartFacts {
             shell_idle: false,
@@ -1401,9 +1526,21 @@ mod tests {
             RelaunchFailure::AgentExited,
             RelaunchFailure::PaneClosed,
         ] {
-            let msg = f.message(4, Some(1));
-            assert!(msg.contains("pane 4"), "{msg}");
-            assert!(msg.contains("tako "), "次の一手: {msg}");
+            // #2365: 日英どちらの表示でも同じ形（対象ペイン + 次の一手 + 終了コード）
+            for lang in [crate::i18n::Lang::Ja, crate::i18n::Lang::En] {
+                let msg = f.text_in(4, Some(1), lang);
+                assert!(msg.contains("pane 4"), "{msg}");
+                assert!(msg.contains("tako "), "次の一手: {msg}");
+                let with_code = matches!(
+                    f,
+                    RelaunchFailure::ConversationNotFound | RelaunchFailure::AgentExited
+                );
+                assert_eq!(
+                    msg.contains('1'),
+                    with_code,
+                    "終了コードを添える理由だけ: {msg}"
+                );
+            }
             assert_eq!(
                 serde_json::to_value(f).unwrap(),
                 serde_json::json!(f.as_str()),
