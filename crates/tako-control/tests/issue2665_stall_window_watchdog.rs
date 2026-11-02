@@ -19,7 +19,9 @@
 //! 2. 半分に届かないときは内訳（区間・遅延の何 %）と残り（計測区間の外）を書く（騙らない・捨てない）
 //! 3. ソースの形: 既定の経路の窓は期限（`armed + period`）から・数えるのははみ出した分だけ・
 //!    修正前の窓（1 秒 + 遅延）は A/B（`TAKO_2665_LEGACY=1`）の枝の中だけ・監視スレッドが中間報告を
-//!    取り出す・GUI の注入の口（`TAKO_2665_INJECT_FILE`）が計測区間の外 / 中の正しい側にある
+//!    取り出す・GUI の注入の口（`TAKO_2665_INJECT_FILE`）が計測区間の外 / 中の正しい側にあり、
+//!    検証プロセスの門（`is_verification_process`）の内側でだけ env を読む（本番の GUI で UI スレッドを
+//!    外から止められる口を開けない）
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -331,6 +333,32 @@ fn scan_diag(src: &str) -> Vec<Offender> {
         }
     }
 
+    // 注入の口は検証プロセスの門の内側（本番の GUI は env があっても UI スレッドを止めない）
+    match fn_window(&lines, "pub fn for_request(") {
+        None => out.push(off(
+            0,
+            "注入の口 `Issue2665Inject::for_request` が見つからない（走査が空振り）",
+        )),
+        Some((at, w)) => {
+            let code_at =
+                |pred: &dyn Fn(&str) -> bool| w.iter().position(|l| !is_comment(l) && pred(l));
+            let gate = code_at(&|l| l.contains("is_verification_process()"));
+            let env = code_at(&|l| l.contains("env::var") && l.contains("INJECT_FILE"));
+            match (gate, env) {
+                (_, None) => out.push(off(
+                    at + 1,
+                    "注入の口が env（`ISSUE2665_INJECT_FILE_ENV`）を読む行が見つからない（走査が空振り）",
+                )),
+                (Some(g), Some(e)) if g < e => {}
+                (_, Some(e)) => out.push(off(
+                    at + e + 1,
+                    "注入の口（`TAKO_2665_INJECT_FILE`）が検証プロセスの門（`is_verification_process()`）を \
+                     通らずに env を読む（本番の GUI でも env だけで UI スレッドを止められる。#2665 / #2663）",
+                )),
+            }
+        }
+    }
+
     // 監視スレッドが中間報告を取り出す
     match fn_window(&lines, "pub fn spawn_stall_watchdog(") {
         None => out.push(off(
@@ -463,6 +491,13 @@ const INJECTIONS: &[Injection] = &[
         from: "            if ended <= since {\n                continue;\n            }\n",
         to: "",
         expect: "if ended <= since",
+    },
+    Injection {
+        name: "注入の口の検証プロセスの門を外す",
+        file: DIAG,
+        from: "            if !tako_core::paths::is_verification_process() {\n                return None;\n            }\n",
+        to: "",
+        expect: "is_verification_process",
     },
     Injection {
         name: "長時間専有の中間報告を出さない",

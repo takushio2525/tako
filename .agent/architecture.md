@@ -1923,7 +1923,7 @@ lid-guard.json が使う）:
   終わった 300ms の区間を「tako の専有」と名指していた（隔離 GUI の注入で 4/4）。半分に届かないときは
   `StallCause::Partial` = 内訳（区間・遅延の何 %）と残り（計測区間の外）を書く（騙らない・捨てない）。
   分類は型 `StallCause`（文は網羅 match の `text_in`。perf.log は日本語）。A/B は `TAKO_2665_LEGACY=1`、
-  実経路の注入は `TAKO_2665_INJECT_FILE`（`scripts/test-stall-window-2665.sh`）、番犬は
+  実経路の注入は `TAKO_2665_INJECT_FILE`（検証プロセスでだけ効く・`scripts/test-stall-window-2665.sh`）、番犬は
   `issue2665_stall_window_watchdog`
 - **プロセス走査の共有と変化検出**（#772 / #779）: `agents::ProcessSnapshot` が tmux pane PID と
   `ps` の親子関係を 1 回ずつ採取し、stale binary と sleep guard が同一 tick で共有する。

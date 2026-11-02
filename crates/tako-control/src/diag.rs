@@ -858,13 +858,18 @@ pub fn take_hang_report() -> Option<String> {
     }
 }
 
+/// #2665 の注入の口の env（[`Issue2665Inject`]。検証プロセスでだけ読む）
+pub const ISSUE2665_INJECT_FILE_ENV: &str = "TAKO_2665_INJECT_FILE";
+
 /// #2665 の検証専用の注入（`TAKO_2665_INJECT_FILE`）。env が指すファイルの中身
 /// （`out=<ms>` / `in=<ms>` / `after=<ms>`。空白区切りで並べてよい）に従い、`tako window list` の
 /// 処理でメインスレッドを塞ぐ: `out` は計測区間の**外**（IPC の受信ループで `ipc_turn` の前）、
 /// `in` は計測区間の**中**（`ipc_turn` の内側）、`after` は `ipc_turn` の区間が閉じた**直後**の外。
 /// 並べたものは out → in → after の順に途切れず続く（監視ループは間に割り込めない）。
-/// env が無ければ何も読まない（製品の既定は常に無効）。隔離 GUI で UI ストールの分類を
-/// 実経路で確かめるためのもの（`scripts/test-stall-window-2665.sh`）
+/// **検証プロセス（`TAKO_ISOLATED` 等。`tako_core::paths::is_verification_process`）でだけ効く**:
+/// 本番の GUI は env があっても読まない（UI スレッドを外から止められる口を本番に開けない）。
+/// env が無ければ何も読まない。隔離 GUI で UI ストールの分類を実経路で確かめるためのもの
+/// （`scripts/test-stall-window-2665.sh`）
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Issue2665Inject {
     pub out_of_span: Option<Duration>,
@@ -894,16 +899,22 @@ impl Issue2665Inject {
     }
 
     /// 注入の対象の要求（`tako window list`）なら、env が指すファイルを読んで注入を決める
+    /// （検証プロセスでなければ常に何もしない）
     pub fn for_request(target: bool) -> Self {
         static FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
         if !target {
             return Self::default();
         }
-        FILE.get_or_init(|| std::env::var_os("TAKO_2665_INJECT_FILE").map(PathBuf::from))
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|text| Self::parse(&text))
-            .unwrap_or_default()
+        FILE.get_or_init(|| {
+            if !tako_core::paths::is_verification_process() {
+                return None;
+            }
+            std::env::var_os(ISSUE2665_INJECT_FILE_ENV).map(PathBuf::from)
+        })
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|text| Self::parse(&text))
+        .unwrap_or_default()
     }
 
     /// 計測区間の外で塞ぐ（IPC の受信ループで `ipc_turn` の前に呼ぶ）
