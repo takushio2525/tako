@@ -155,6 +155,72 @@ pub fn legacy_1930() -> bool {
     )
 }
 
+/// LSP の `ContentModified`（#2673）: 処理の途中で中身が変わったので、この要求の答えは古い。
+/// rust-analyzer は読み込み直し（`switch_workspaces`）の最中に受けた要求をこれで取り消す
+/// （実測: 1.95.0・新しいプロジェクトを開いた直後。`Cargo.lock` ができたことの知らせで読み直しが重なる）
+pub const CONTENT_MODIFIED: i64 = -32801;
+
+/// 1 回の問い合わせで `-32801` の後に問い直す回数の上限（#2673。無限に繰り返さない）
+pub const MAX_CONTENT_MODIFIED_RETRIES: u32 = 3;
+
+/// エラー応答のコードが `-32801`（ContentModified）か
+pub fn is_content_modified(code: i64) -> bool {
+    code == CONTENT_MODIFIED
+}
+
+/// `TAKO_2673_LEGACY=1` で **#2673 の前の形**へ戻す（同一バイナリで A/B を取る入口）: `-32801` を
+/// ほかのエラー応答と同じ最終の失敗として返す（補完も `server-error`）
+pub fn legacy_2673() -> bool {
+    matches!(
+        std::env::var("TAKO_2673_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// `-32801` を受けた後の手（[`ContentModified::step`]）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Requery {
+    /// 読み込み中: 済むのを待ってから問い直す
+    AfterLoading,
+    /// 読み込み中でない: 待たずに問い直す
+    Now,
+    /// 問い直さない（上限）。呼び手は受けたエラーをそのまま返す
+    GiveUp,
+}
+
+/// `-32801` の後に問い直すかの判定（#2673）。定義ジャンプ・ホバー・参照・名前の変更・整形が manager の
+/// `after_content_modified` からこの 1 実装を通る（補完は問い直さない = 次の打鍵で置き換わる）。
+///
+/// 読み込み中に受けた `-32801` は読み込み直しで取り消されたもの = 済むのを待って問い直す。
+/// 読み込み中でない `-32801`（打鍵の直後など）は待たずに 1 回だけ問い直す。どちらも合わせて
+/// [`MAX_CONTENT_MODIFIED_RETRIES`] 回まで（上限の時間は呼び手の deadline が守る）
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ContentModified {
+    retries: u32,
+    retried_now: bool,
+}
+
+impl ContentModified {
+    /// `loading` = `-32801` を受けた時点でサーバが読み込み中か
+    pub fn step(&mut self, loading: bool) -> Requery {
+        if self.retries >= MAX_CONTENT_MODIFIED_RETRIES || (!loading && self.retried_now) {
+            return Requery::GiveUp;
+        }
+        self.retries += 1;
+        if loading {
+            Requery::AfterLoading
+        } else {
+            self.retried_now = true;
+            Requery::Now
+        }
+    }
+
+    /// これまでに問い直した回数
+    pub fn retries(&self) -> u32 {
+        self.retries
+    }
+}
+
 /// 候補の一覧に載せる行の抜粋の上限（文字数）
 pub const EXCERPT_CHARS: usize = 160;
 
@@ -270,6 +336,11 @@ impl GotoError {
             Self::ServerError { .. } => "server-error",
             Self::Unreadable { .. } => "unreadable",
         }
+    }
+
+    /// サーバが `-32801`（ContentModified = 変更で古くなった答え）で答えたか（#2673）
+    pub fn is_content_modified(&self) -> bool {
+        matches!(self, Self::ServerError { code, .. } if is_content_modified(*code))
     }
 
     /// 理由（日英は `text` の 1 か所）
@@ -658,5 +729,48 @@ mod tests {
             // 1 回目の問い直しの枠は使っていない
             assert_eq!(empty.decide(Loading::Settled), Loading::Retry);
         }
+    }
+
+    /// #2673: 読み込み中の `-32801` は済むのを待って問い直す。読み込みが何度やり直されても
+    /// 合わせて上限の回数で止める
+    #[test]
+    fn 読み込み中の_content_modified_は待って問い直し上限で止まる() {
+        let mut modified = ContentModified::default();
+        for n in 1..=MAX_CONTENT_MODIFIED_RETRIES {
+            assert_eq!(modified.step(true), Requery::AfterLoading, "{n} 回目");
+            assert_eq!(modified.retries(), n);
+        }
+        assert_eq!(modified.step(true), Requery::GiveUp);
+        assert_eq!(modified.step(false), Requery::GiveUp);
+        assert_eq!(modified.retries(), MAX_CONTENT_MODIFIED_RETRIES);
+    }
+
+    /// #2673: 読み込み中でない `-32801` は待たずに 1 回だけ問い直す（2 回目は受けたエラーのまま）
+    #[test]
+    fn 読み込み中でない_content_modified_はすぐ_1_回だけ問い直す() {
+        let mut modified = ContentModified::default();
+        assert_eq!(modified.step(false), Requery::Now);
+        assert_eq!(modified.step(false), Requery::GiveUp);
+        // 読み込み中に受けたものは、すぐの問い直しを使った後でも上限まで待って問い直す
+        let mut mixed = ContentModified::default();
+        assert_eq!(mixed.step(false), Requery::Now);
+        assert_eq!(mixed.step(true), Requery::AfterLoading);
+        assert_eq!(mixed.step(true), Requery::AfterLoading);
+        assert_eq!(mixed.step(true), Requery::GiveUp);
+    }
+
+    /// #2673: `-32801` だけが「変更で古くなった答え」（ほかのエラー応答は今までどおり最終の失敗）
+    #[test]
+    fn content_modified_はコードで見分ける() {
+        let error = |code| GotoError::ServerError {
+            server: "s",
+            code,
+            detail: "d".into(),
+        };
+        assert!(error(CONTENT_MODIFIED).is_content_modified());
+        assert!(!error(-32603).is_content_modified());
+        // 取り消し（-32800）は tako が取り消した要求の答え = 別の経路（`RpcError::Cancelled`）
+        assert!(!error(-32800).is_content_modified());
+        assert!(!GotoError::Closed.is_content_modified());
     }
 }

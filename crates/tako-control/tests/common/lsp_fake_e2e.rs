@@ -207,6 +207,21 @@ pub fn wait_loading_known(manager: &LspManager) {
     );
 }
 
+/// サーバが起動して握手を終え、読み込み中でもない（`loading: false`）まで待つ（#2673）。
+/// 文書を編集モードで開いてから呼ぶ（`normal` シナリオは didOpen の診断で読み込み済みになる = #1977）。
+/// 「読み込み中でないときに受けたエラー応答」の経路を見る前提の待ち
+#[track_caller]
+pub fn wait_settled(manager: &LspManager) {
+    wait_until(
+        "言語サーバの起動と読み込みの完了",
+        || {
+            let server = server(manager);
+            server["state"] == json!("running") && server["loading"] == json!(false)
+        },
+        || server(manager).to_string(),
+    );
+}
+
 /// 状態を送らないサーバ（偽サーバの `quiet-loading` = pyright 型。#1977）で、握手の直後の猶予
 /// （`STATUS_GRACE`）が明けた後の「最初の診断の前」にいることを確かめる。文書を編集モードで開いてから、
 /// 読み込みの合図（[`LoadingGate::finish`]）を作る前に呼ぶ。
