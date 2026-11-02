@@ -657,7 +657,12 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   付けないのでユーザーの profile も今までどおり読まれる。`-ExecutionPolicy Bypass` は採らない
   （ペインと子の PowerShell の Process スコープまで緩むため）。既知の制限: ペインの中で手で起こした
   入れ子の PowerShell には統合が入らない。残った `$PROFILE` のブロックは移行
-  （`SchemaId::PowerShellProfile`）が取り除く
+  （`SchemaId::PowerShellProfile`）が取り除く。
+  **読み込みは共有違反のときだけ読み直す**（#2659）: `ReadAllText` は他の書き手を許さない開き方なので、
+  別のプロセスが `tako.ps1` を書いている数ミリ秒に当たると失敗する。本文（`powershell_bootstrap`）は
+  共有違反（32 / 33）のときだけ 50ms おきに 10 回まで読み直し、それでも読めなければ統合が入らなかったことを
+  表示言語の 1 行の警告で出す（置き場が無い・スクリプトが壊れているときは今までどおり黙る）。
+  書き出し（`write_powershell_script`）は中身が同じなら書き直さない。A/B は `TAKO_2659_LEGACY=1`
 - **listen ポート検知** → 検知層は実装済み（2026-06-12、FR-2.4.2。`tako-core::ports`）
   - macOS: libproc（`proc_listpids` → `proc_bsdinfo.e_tdev` とペインの PTY スレーブ rdev の
     突き合わせで「ペイン配下」を判定 → `PROC_PIDLISTFDS` + `PROC_PIDFDSOCKETINFO` で
