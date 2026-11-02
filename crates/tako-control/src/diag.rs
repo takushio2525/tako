@@ -678,7 +678,11 @@ fn reconfig_reports_at(
         } else {
             format!("メインスレッド以外 {} 件", w.off_main)
         };
-        let synthetic = if w.synthetic { "・検証の合成" } else { "" };
+        let synthetic = if w.synthetic {
+            "・検証の合成"
+        } else {
+            ""
+        };
         out.push(match w.ended {
             Some(ended) => format!(
                 "画面構成の変更（macOS の画面再構成）: begin → end {}ms・画面 {displays}・\
