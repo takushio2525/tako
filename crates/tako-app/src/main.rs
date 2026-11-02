@@ -53753,6 +53753,13 @@ mod self_test {
         )
         .expect("goto.json");
         std::env::set_var("TAKO_LSP_FAKE_GOTO", &goto);
+        // #2537: 参照・階層と名前の変更も申告させる（偽サーバは規則を渡したときだけ申告する）。
+        // 渡さないと申告が `MenuItem::ALL` より少なく、① の「申告どおりの全項目」が落ちる
+        for env in tako_control::lsp::menu::FAKE_FULL_MENU_RULE_ENVS {
+            let rules = dir.join(format!("{env}.json"));
+            std::fs::write(&rules, "[]").expect("visual-test lsp-context-menu の規則");
+            std::env::set_var(env, &rules);
+        }
         let pane = vt1684_open(any, window, cx, anchor, &file, LABEL).await;
         let at = |cx: &mut AsyncApp, line: usize, range: std::ops::Range<usize>| {
             vt1684_point(window, cx, pane, line, range.clone()).unwrap_or_else(|| {
@@ -54108,6 +54115,9 @@ mod self_test {
         std::env::remove_var(&rs_env);
         std::env::remove_var(&py_env);
         std::env::remove_var("TAKO_LSP_FAKE_GOTO");
+        for env in tako_control::lsp::menu::FAKE_FULL_MENU_RULE_ENVS {
+            std::env::remove_var(env);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

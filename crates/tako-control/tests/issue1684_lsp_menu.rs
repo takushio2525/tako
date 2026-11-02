@@ -4,19 +4,25 @@
 //!
 //! GUI の描画・クリックは visual-test `lsp-context-menu`（`scripts/test-lsp-menu-1684.sh`）が持つ。
 //! ここは「サーバが申告したもの → 出る項目」と「メニューを開くだけでは握手以外を送らない」まで。
+//! visual-test は CI に載らないので、visual-test が偽サーバへ渡す規則の組で全項目が申告されることは
+//! ここの番犬が縛る（#2537）。
 
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tako_control::lsp::manager::DEFAULT_IDLE_GRACE;
+use tako_control::lsp::menu::FAKE_FULL_MENU_RULE_ENVS;
+use tako_control::lsp::rpc;
 use tako_control::lsp::{
     DocLink, GotoError, Launch, LspConfig, LspManager, MenuCapabilities, MenuRequest,
 };
 use tako_core::lsp::goto::SymbolKind;
-use tako_core::lsp::menu::items;
+use tako_core::lsp::menu::{items, MenuItem};
 use tako_core::lsp::servers::{self, ServerSpec};
 use tako_core::lsp::state::RestartPolicy;
 use tako_core::platform::child_cmd::ChildCmd;
@@ -176,6 +182,80 @@ fn 実プロセスの申告4通りで項目の列が固定値と一致する() {
         }))),
         ["lsp-implementation", "lsp-format"],
         "一部だけ"
+    );
+}
+
+/// 番犬（#2537）: visual-test `lsp-context-menu` が偽サーバへ渡す規則の組
+/// （[`FAKE_FULL_MENU_RULE_ENVS`]。中身は空の規則）で、識別子の上・選択の中なら
+/// [`MenuItem::ALL`] の全項目が出る。`ALL` へ項目を足して偽サーバの申告（か、ここの規則の env）を
+/// 足し忘れるとここで落ちる。visual-test は CI に載らないので、#1685 で `ALL` が 7 → 12 になってから
+/// visual-test だけが 17 日落ち続けていた。
+///
+/// visual-test と同じく**env で**渡す（`LspManager` の起こし方は引数しか運べないので偽サーバを直に起こす。
+/// 足すのは子の env だけ = テストのプロセスの env は書き換えない）
+#[test]
+fn visual_testが渡す規則の組で全項目が申告される() {
+    let scratch = Scratch::new("full-menu");
+    // 初回 exec の検査を下の上限の外で済ませる（#2228）
+    tako_core::fake_exec::warm_binary(FAKE);
+    let mut cmd = Command::new(FAKE);
+    cmd.args(["--scenario", "normal"])
+        // 申告の組を差し替える口が手元の env から漏れると、規則の組を見ないまま通る
+        .env_remove("TAKO_LSP_FAKE_PROVIDERS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for env in FAKE_FULL_MENU_RULE_ENVS {
+        cmd.env(env, scratch.write(&format!("{env}.json"), "[]"));
+    }
+    let mut child = cmd.spawn().expect("偽サーバを起こす");
+    let mut stdin = child.stdin.take().expect("偽サーバの stdin");
+    let stdout = child.stdout.take().expect("偽サーバの stdout");
+    rpc::write_message(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "processId": null, "rootUri": null, "capabilities": {} },
+        }),
+    )
+    .expect("initialize を送る");
+    // 読むのは別スレッド（答えが来なくても上限で落ちる = テストを止めない）
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        while let Ok(Some(message)) = rpc::read_message(&mut stdout) {
+            if message.get("id") == Some(&json!(1)) {
+                let _ = tx.send(message["result"]["capabilities"].clone());
+                return;
+            }
+        }
+    });
+    let capabilities = rx.recv_timeout(Duration::from_secs(30));
+    for message in [
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "shutdown" }),
+        json!({ "jsonrpc": "2.0", "method": "exit" }),
+    ] {
+        let _ = rpc::write_message(&mut stdin, &message);
+    }
+    drop(stdin);
+    let capabilities = capabilities.unwrap_or_else(|_| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("偽サーバが 30 秒以内に initialize へ答えなかった")
+    });
+    let _ = child.wait();
+    let ids: Vec<&str> = items(&capabilities, Some(SymbolKind::Identifier), true)
+        .into_iter()
+        .map(MenuItem::id)
+        .collect();
+    let all: Vec<&str> = MenuItem::ALL.into_iter().map(MenuItem::id).collect();
+    assert_eq!(
+        ids, all,
+        "visual-test が渡す規則の組（{FAKE_FULL_MENU_RULE_ENVS:?}）で偽サーバが申告しない項目がある。\
+         偽サーバに申告させる規則の env を tako_control::lsp::menu::FAKE_FULL_MENU_RULE_ENVS へ足す\
+         （申告: {capabilities}）"
     );
 }
 
