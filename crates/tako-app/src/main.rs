@@ -557,6 +557,20 @@ const PANE_TITLE_BAR: f32 = 32.0;
 /// 描画側の `.h()` と会計側がずれると座標がずれるため（#781 の根因）
 const STALE_BANNER_HEIGHT: f32 = 28.0;
 
+/// 起動待ちの帯（#2425）の高さ（px）。
+///
+/// stale バナー（[`STALE_BANNER_HEIGHT`]）と同じく**流れの中**（ヘッダとターミナル領域のあいだ）に
+/// 積むので、出ているあいだはテキスト領域が下へずれて縮む。会計（`launch_wait_band_height`）と
+/// 描画側の `.h()` はこの 1 定数を共有する（#781 と同じ理由）。3 行 × [`LAUNCH_WAIT_LINE_HEIGHT`] +
+/// 上下の余白
+const LAUNCH_WAIT_BAND_HEIGHT: f32 = 54.0;
+
+/// 起動待ちの帯の 1 行の高さ（px）。狭い worker のペインでも行ごとに読めるよう 3 行に分けてある
+const LAUNCH_WAIT_LINE_HEIGHT: f32 = 15.0;
+
+// 3 行 + 上下の余白が帯に収まる（行の高さを変えたら帯の高さも見直す。ビルド時に落ちる）
+const _: () = assert!(LAUNCH_WAIT_BAND_HEIGHT >= LAUNCH_WAIT_LINE_HEIGHT * 3.0 + 6.0);
+
 /// 下部ステータスバーの高さ（px。FR-2.16.4。Zed / VSCode 風）
 const STATUS_BAR_HEIGHT: f32 = 32.0;
 
@@ -1931,7 +1945,7 @@ fn grid_cells(area: Size<Pixels>, cell: Size<Pixels>) -> (usize, usize) {
 
 /// `TakoApp::offscreen_areas` の作り直し条件（#932）。
 /// (コンテンツ矩形, タブ数, 端末数, stale バナー数, カードの有無, 拡大率のビット列)
-type OffscreenAreaKey = (Bounds<Pixels>, usize, usize, usize, bool, u32);
+type OffscreenAreaKey = (Bounds<Pixels>, usize, usize, usize, usize, bool, u32);
 
 /// 裏タブの寸法合わせをやり直す間隔（#932 / #1426）。
 ///
@@ -3140,6 +3154,11 @@ struct TakoApp {
     >,
     /// stale claude バイナリの検知状態（Issue #498）。ペインごとに管理
     stale_binary_banners: HashMap<PaneId, StaleBinaryBanner>,
+    /// 起動待ちの帯（#2425）。500 ms tick の後に `launch_gate::wait_bands` から写す。
+    /// 描画・テキスト領域の会計・打鍵の遮断・`tako list` の `launch_wait_band` がこの表を読む
+    launch_wait_bands: HashMap<PaneId, LaunchWaitBand>,
+    /// A/B: `TAKO_2425_LEGACY=1`（帯を出さず打鍵を素通し = 修正前）。起動時に 1 回読む
+    launch_wait_legacy: bool,
     /// stale 検知の走査状態（Issue #772）。前回の指紋・対象・時刻を持ち、
     /// 変化していない tick では tmux / ps を起動しないための判断材料にする
     stale_binary_scan: tako_control::stale_binary::ScanState,
@@ -4262,6 +4281,16 @@ struct PortSuggestion {
     pane: PaneId,
     port: u16,
     process: String,
+}
+
+/// 起動待ちの帯（#2425）の 1 ペイン分。材料は `launch_gate::wait_bands` の写し
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaunchWaitBand {
+    /// 帯の材料（順番・理由・圧と空き）。起動待ちが明けて起動コマンドの送達フローがまだ
+    /// 終わっていない間は `BandState::Starting` に書き換えて残す（打鍵も止めたまま）
+    band: tako_control::launch_gate::WaitBand,
+    /// 待っている間に受け付けなかった入力の回数（打鍵・貼り付け・IME の確定）
+    ignored_inputs: u32,
 }
 
 /// stale claude バイナリの通知バナー（Issue #498）
@@ -5514,6 +5543,8 @@ impl TakoApp {
             webview_build_wake: None,
             webview_guard_marks: HashMap::new(),
             stale_binary_banners: HashMap::new(),
+            launch_wait_bands: HashMap::new(),
+            launch_wait_legacy: tako_control::launch_gate::band_legacy(),
             stale_binary_scan: tako_control::stale_binary::ScanState::default(),
             // #549: 初回起動（settings.json がまだ無い）だけウェルカムバナーを出す。
             // 起動処理は settings を読むだけで書かないため、ここでの判定は
@@ -6845,7 +6876,7 @@ impl TakoApp {
                 cx.update(|cx| cx.quit());
                 break;
             }
-            let ok = this.update(cx, |app: &mut TakoApp, _| {
+            let ok = this.update(cx, |app: &mut TakoApp, cx| {
                 // #777 の検証専用の注入: 受ける前からメインスレッドが固まっているアプリを
                 // 作る（quit を撃つ機会すら無い = まさに `pkill` したくなる状況）
                 inject_777_hang("hang-main");
@@ -6866,6 +6897,11 @@ impl TakoApp {
                 }
                 if !app.prompt_flows.is_empty() {
                     app.drive_prompt_flows();
+                }
+                // #2425: 起動待ちの帯を起動待ちの今の状態へ合わせる（起こした・送達フローが終わった件は
+                // 消える）。件が無ければロック 1 回で戻る
+                if app.refresh_launch_wait_bands() {
+                    cx.notify();
                 }
                 // #2112: 到達確認の結果を拾う（走っていなければフラグを見るだけ）。
                 // 2 秒 tick を待たずに拾うので、回線の復帰から再開までの遅れが縮む
@@ -18050,6 +18086,10 @@ impl TakoApp {
         }
         // #641: 貼り付けも入力（右クリックメニューからはキーを通らない）
         self.restore_guard.note_input();
+        // #2425: 起動待ちのペインへは貼り付けない（打鍵と同じ扱い。帯に回数を出す）
+        if self.launch_wait_holds_input(pane, cx) {
+            return;
+        }
         if self.paste_guard && !tako_core::paste_guard::legacy() && !text.is_empty() {
             use tako_core::paste_guard as pg;
             let legacy_2050 = pg::legacy_2050();
@@ -18411,9 +18451,15 @@ impl TakoApp {
             CsiUMode::ModifiedOnly
         };
         if let Some(bytes) = keystroke_to_bytes(keystroke, csi_u) {
+            let pane = self.focused_pane();
+            // #2425: 起動待ちのペインへは流さない（後から打つ起動コマンドと入力行で混ざる）。
+            // 受け付けなかったことは帯に出す。処理済みを宣言して IME への回送（insertText）も止める
+            if self.launch_wait_holds_input(pane, cx) {
+                cx.stop_propagation();
+                return;
+            }
             // tmux スクロール中（copy-mode）は iTerm2 流に最下部へ戻してから流す
             // （copy-mode にキーが飲まれて「入力が反映されない」症状の根治）
-            let pane = self.focused_pane();
             self.cancel_scroll_before_input(pane);
             // #1040: 自動再接続を待っているペインで人が打ち始めたら黙って降りる
             self.cancel_ssh_reconnect_on_input(pane);
@@ -19031,6 +19077,231 @@ impl TakoApp {
         } else {
             0.0
         }
+    }
+
+    /// テキスト領域から差し引く起動待ちの帯（#2425）の高さ（px）。
+    ///
+    /// stale バナーと同じく**流れの中**に積むので、`render()` がペイン矩形を作る前に呼ぶ。
+    /// 判定条件は描画側（`render_pane` の `when_some`）と**同じ**にすること（[`Self::launch_wait_band_of`]）
+    fn launch_wait_band_height(&self, pane_id: PaneId) -> f32 {
+        if self.launch_wait_band_of(pane_id).is_some() {
+            LAUNCH_WAIT_BAND_HEIGHT
+        } else {
+            0.0
+        }
+    }
+
+    /// 描く起動待ちの帯（#2425）。帯はターミナル表示のペインにしか描かない（プレビュー / Web ビュー /
+    /// スターター / チャットは `render_pane` の分岐で先に返る）。描画・会計・`tako list` が同じ判定を通る
+    fn launch_wait_band_of(&self, pane_id: PaneId) -> Option<&LaunchWaitBand> {
+        if !self.pane_shows_terminal(pane_id) {
+            return None;
+        }
+        self.launch_wait_bands.get(&pane_id)
+    }
+
+    /// 起動待ちの帯（#2425）を `launch_gate` の今の状態へ合わせる。変わったら真（呼び手が描き直す）。
+    ///
+    /// 500 ms tick で `launch_gate::tick` と起動コマンドの送達フローを回した**後**に呼ぶ。待ちが明けても
+    /// そのペインの送達フローが残っている間は「起動中」で残す（起動コマンドを打ち終えるまで打鍵を
+    /// 止める = 人の入力と起動コマンドが同じ入力行で混ざらない）。件が無ければロック 1 回で戻る
+    fn refresh_launch_wait_bands(&mut self) -> bool {
+        use tako_control::launch_gate::BandState;
+        if self.launch_wait_legacy {
+            return false;
+        }
+        let fresh = tako_control::launch_gate::wait_bands();
+        if fresh.is_empty() && self.launch_wait_bands.is_empty() {
+            return false;
+        }
+        let mut next: HashMap<PaneId, LaunchWaitBand> = HashMap::new();
+        for band in fresh {
+            let pane = PaneId::from_raw(band.pane);
+            if self.workspace.pane_anywhere(pane).is_none() {
+                continue;
+            }
+            let ignored_inputs = self
+                .launch_wait_bands
+                .get(&pane)
+                .map_or(0, |b| b.ignored_inputs);
+            next.insert(
+                pane,
+                LaunchWaitBand {
+                    band,
+                    ignored_inputs,
+                },
+            );
+        }
+        for (pane, old) in &self.launch_wait_bands {
+            if next.contains_key(pane)
+                || self.workspace.pane_anywhere(*pane).is_none()
+                || !self.command_flows.iter().any(|f| f.pane == *pane)
+            {
+                continue;
+            }
+            let mut kept = old.clone();
+            kept.band.state = BandState::Starting;
+            next.insert(*pane, kept);
+        }
+        if next == self.launch_wait_bands {
+            return false;
+        }
+        self.launch_wait_bands = next;
+        true
+    }
+
+    /// 人の入力（打鍵・貼り付け・IME の確定）を起動待ちのペインへ流さないか（#2425）。
+    ///
+    /// 待っている間・起動コマンドを打ち終えるまでは真を返し、受け付けなかった回数を帯へ出す
+    /// （黙って捨てない）。帯の表がまだ写っていない（受付から 500 ms 以内）ときは `launch_gate` の
+    /// 今の状態で決め、その場で写す。A/B `TAKO_2425_LEGACY=1` は常に偽（修正前 = 素通し）
+    fn launch_wait_holds_input(&mut self, pane: PaneId, cx: &mut Context<Self>) -> bool {
+        if self.launch_wait_legacy {
+            return false;
+        }
+        if !self.launch_wait_bands.contains_key(&pane) {
+            if !tako_control::launch_gate::is_waiting(pane.as_u64()) {
+                return false;
+            }
+            self.refresh_launch_wait_bands();
+        }
+        if let Some(band) = self.launch_wait_bands.get_mut(&pane) {
+            band.ignored_inputs = band.ignored_inputs.saturating_add(1);
+        }
+        cx.notify();
+        true
+    }
+
+    /// 帯の「今すぐ起こす」（#2425）。CLI `tako queue start <ペイン>` / MCP `tako_queue` の `start` と
+    /// 同じ口（`tako_control::queue::handle`）を通す = 次の 500 ms tick で起こし、persist.log に
+    /// 上書きの 1 行が残る
+    fn launch_wait_start_now(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        match tako_control::queue::handle("start", None, Some(pane.as_u64()), None) {
+            Ok(_) => {
+                self.refresh_launch_wait_bands();
+            }
+            Err(e) => {
+                // 起こした後・閉じた後に押された（帯の写しが 1 tick 遅れた）。帯は次の写しで消える
+                eprintln!("warning: 起動待ちを起こせない: {e}");
+            }
+        }
+        cx.notify();
+    }
+
+    /// 起動待ちの帯（#2425）の要素。3 行（何を待っているか + 順番 / 理由 / 打鍵の扱い）と
+    /// 「今すぐ起こす」。印は絵文字ではなく描画プリミティブ（待ち = 縦棒 2 本・起動中 = 丸）。
+    /// 実描画の矩形は visual-test の `launch-wait-band` 節が読む（何も描かない absolute なプローブ）
+    fn render_launch_wait_band(
+        &self,
+        pane_id: PaneId,
+        band: LaunchWaitBand,
+        theme: &tako_core::Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use tako_control::launch_gate::BandState;
+        use tako_core::resources::Pressure;
+        let waiting = matches!(band.band.state, BandState::Waiting { .. });
+        let tint = match band.band.state {
+            BandState::Waiting {
+                pressure: Some(Pressure::Critical),
+                ..
+            } => theme.red,
+            BandState::Waiting { .. } => theme.yellow,
+            BandState::Starting => theme.accent,
+        };
+        let [title, reason, note] =
+            crate::ui_text::launch_wait::lines(&band.band, band.ignored_inputs);
+        let line = |text: String| {
+            div()
+                .h(px(LAUNCH_WAIT_LINE_HEIGHT))
+                .line_height(px(LAUNCH_WAIT_LINE_HEIGHT))
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(SharedString::from(text))
+        };
+        let icon = if waiting {
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(2.0))
+                .child(div().w(px(2.5)).h(px(9.0)).rounded(px(1.0)).bg(hsla(tint)))
+                .child(div().w(px(2.5)).h(px(9.0)).rounded(px(1.0)).bg(hsla(tint)))
+        } else {
+            div().w(px(7.0)).h(px(7.0)).rounded_full().bg(hsla(tint))
+        };
+        let probes = self.panel_click_probe_bounds.clone();
+        div()
+            .id(("launch-wait-band", pane_id.as_u64()))
+            .flex_none()
+            .w_full()
+            // 高さは会計側（`launch_wait_band_height`）と同じ定数から取る（#781 と同じ理由）
+            .h(px(LAUNCH_WAIT_BAND_HEIGHT))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .relative()
+            .bg(rgba_alpha(tint, 0.12))
+            .border_b_1()
+            .border_color(hsla_alpha(tint, 0.25))
+            .text_size(px(11.0))
+            .text_color(hsla(theme.foreground))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(10.0))
+                    .flex()
+                    .justify_center()
+                    .child(icon),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex()
+                    .flex_col()
+                    .child(line(title).font_weight(FontWeight::SEMIBOLD))
+                    .child(line(reason))
+                    .child(line(note).text_color(hsla(if band.ignored_inputs > 0 {
+                        tint
+                    } else {
+                        theme.text_muted
+                    }))),
+            )
+            .when(waiting, |d| {
+                let probes = probes.clone();
+                d.child(
+                    div()
+                        .id(("launch-wait-start", pane_id.as_u64()))
+                        .flex_none()
+                        .relative()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(4.0))
+                        .bg(rgba(theme.chip_surface))
+                        .text_size(px(10.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(hsla(theme.accent))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgba_alpha(theme.accent, 0.18)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.launch_wait_start_now(pane_id, cx);
+                        }))
+                        .child(SharedString::from(
+                            crate::ui_text::launch_wait::start_now_button(),
+                        ))
+                        .child(crate::tab_shape::probe_canvas(
+                            probes,
+                            format!("launch-wait-start-{}", pane_id.as_u64()),
+                        )),
+                )
+            })
+            .child(crate::tab_shape::probe_canvas(
+                probes,
+                format!("launch-wait-band-{}", pane_id.as_u64()),
+            ))
     }
 
     /// `pane_text_areas` の算術と実描画のテキスト領域のずれ（#781。診断・機械検証用）。
@@ -22192,6 +22463,7 @@ impl TakoApp {
             self.workspace.tabs().len(),
             self.terminals.len(),
             self.stale_binary_banners.len(),
+            self.launch_wait_bands.len(),
             !self.command_cards.is_empty(),
             scale_factor.to_bits(),
         )
@@ -22267,7 +22539,9 @@ impl TakoApp {
         scale_factor: f32,
         default_cell: Size<Pixels>,
     ) -> Bounds<Pixels> {
-        let stacked_top = PANE_TITLE_BAR + self.stale_banner_height(pane_id);
+        let stacked_top = PANE_TITLE_BAR
+            + self.stale_banner_height(pane_id)
+            + self.launch_wait_band_height(pane_id);
         let full = pane_text_area_rect(content, r, stacked_top, 0.0, scale_factor);
         let cell_h = self
             .cell_size_for_pane(pane_id)
@@ -25931,6 +26205,11 @@ impl TakoApp {
                     )
                 },
             )
+            // 起動待ちの帯（#2425）: 待っている理由・順番・「今すぐ起こす」。stale バナーと同じく
+            // 流れの中に積む（高さは会計側 `launch_wait_band_height` と同じ定数）
+            .when_some(self.launch_wait_band_of(pane_id).cloned(), |d, band| {
+                d.child(self.render_launch_wait_band(pane_id, band, &theme, cx))
+            })
             .child(
                 // テキスト領域: 端末グリッドは専用 element（#787）が 1 要素で描く。
                 // サブラインスクロール（#159）の fract 行ぶんのずらしは element の内側で
@@ -27615,6 +27894,28 @@ impl UiStateHost for TakoApp {
             "session": name,
             "backend_reattach": self.backend_reattach_json(pane),
         }))
+    }
+
+    /// #2425: 描いている起動待ちの帯（描画と同じ判定 `launch_wait_band_of`・同じ文 `launch_wait::lines`）
+    fn launch_wait_band(&self, pane: PaneId) -> Option<serde_json::Value> {
+        use tako_control::launch_gate::BandState;
+        let band = self.launch_wait_band_of(pane)?;
+        let mut v = band.band.to_json();
+        v["lines"] = serde_json::json!(crate::ui_text::launch_wait::lines(
+            &band.band,
+            band.ignored_inputs
+        ));
+        // ボタンは待っている間だけ（起動中は押す意味が無い）
+        v["button"] = match band.band.state {
+            BandState::Waiting { .. } => {
+                serde_json::json!(crate::ui_text::launch_wait::start_now_button())
+            }
+            BandState::Starting => serde_json::Value::Null,
+        };
+        v["ignored_inputs"] = serde_json::json!(band.ignored_inputs);
+        v["input_held"] = serde_json::json!(true);
+        v["height"] = serde_json::json!(LAUNCH_WAIT_BAND_HEIGHT);
+        Some(v)
     }
 
     fn ssh_connect_state(&self, pane: PaneId) -> Option<serde_json::Value> {
@@ -29778,6 +30079,11 @@ impl EntityInputHandler for TakoApp {
             .map(|ime| ime.pane)
             .filter(|pane| self.ime_pane_alive(*pane))
             .unwrap_or_else(|| self.focused_pane());
+        // #2425: 起動待ちのペインへは確定文字列を流さない（打鍵と同じ扱い。帯に回数を出す）
+        if !text.is_empty() && self.launch_wait_holds_input(pane, cx) {
+            window.invalidate_character_coordinates();
+            return;
+        }
         self.cancel_scroll_before_input(pane);
         if let Some(session) = self.terminals.get(&pane) {
             session.clear_selection();
@@ -49579,6 +49885,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2425: 起動待ちの帯（理由・順番・今すぐ起こす）・待っている間の打鍵の扱い・起きたら消える
+                "launch-wait-band" => {
+                    launch_wait_band_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #1579: 絵文字ではないグリフ（× / ●）を置き換えた印が
                 // 実ピクセルで描かれているか
                 "glyph-icon" => {
@@ -64661,6 +64973,502 @@ mod self_test {
             cx.notify();
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 起動待ちの帯（#2425）が**実ピクセルで描かれ**、待っている間の入力をペインへ流さず、帯のボタンで
+    /// 起き、起きたら消えるか。
+    ///
+    /// 起動待ちは注入（`TAKO_2413_INJECT` のファイル。この節が critical / normal を書く）で与え、待たせる
+    /// 起動は `launch_gate::request`（spawn と同じ口）へ「印を echo する起動コマンド」を預ける
+    /// （本物の agent は起こさない）。確かめること:
+    /// ① 待っている 2 枚に帯（順番 1/2・2/2・理由・ボタン）が描かれ、`tako list` の `launch_wait_band` に同じ中身
+    /// ② 打鍵・貼り付け・IME の確定がペインへ届かず、受け付けなかった回数が帯に出る
+    /// ③ 帯の「今すぐ起こす」を実マウスで押すと起動コマンドが 1 回だけ（人の入力と混ざらずに）打たれ、
+    ///    帯が消え、以後の打鍵は届く
+    /// ④ 待っているペインを閉じると起こさない ⑤ normal へ戻すと残りが自然に起き、帯が消える。
+    /// A/B `TAKO_2425_LEGACY=1` は帯が無く、打鍵がシェルへ届いて起動コマンドと同じ行に混ざる。
+    /// 単独実行は `TAKO_VISUAL_ONLY=launch-wait-band`（`scripts/test-launch-wait-band-2425.sh`）
+    #[cfg(feature = "visual-test")]
+    async fn launch_wait_band_visual(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+    ) {
+        use tako_control::launch_gate as gate;
+        use tako_control::protocol::Request as Req;
+        let wait =
+            |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        let legacy = gate::band_legacy();
+        let Some(inject) = std::env::var_os(gate::ENV_INJECT).map(std::path::PathBuf::from) else {
+            println!("TAKO_VISUAL_2425: SKIPPED（注入 TAKO_2413_INJECT が無い = 起動待ちが有効にならない）");
+            return;
+        };
+        if gate::mode() != Some(gate::Mode::Injected) {
+            println!(
+                "TAKO_VISUAL_2425: SKIPPED（起動待ちの形が注入でない: {:?}）",
+                gate::mode()
+            );
+            return;
+        }
+        // 書きかけを読ませない（一時ファイルへ書いて rename）。critical の空きは帯の文に出る値、
+        // normal の空きは予約（`resources` の既定）と見込みを足しても余る値（空きが少ないままだと
+        // 圧が normal でも「空きメモリ不足」で待ち続ける）
+        let write_inject = |pressure: &str| {
+            let available_mb = if pressure == "normal" { 20480 } else { 1229 };
+            let tmp = inject.with_extension("tmp");
+            let _ = std::fs::write(
+                &tmp,
+                format!(
+                    r#"{{"total_mb":36864,"available_mb":{available_mb},"pressure":"{pressure}","swap_used_mb":0,"startup_secs":2}}"#
+                ),
+            );
+            let _ = std::fs::rename(&tmp, &inject);
+        };
+        write_inject("critical");
+        // 注入は 1 秒ごとに読み直される（`INJECT_RECHECK`）
+        wait(cx, 1300).await;
+        let dump = std::env::var("TAKO_VISUAL_DUMP_DIR").ok();
+        let save = |frame: &image::RgbaImage, name: &str| {
+            if let Some(dir) = dump.as_deref() {
+                let _ = frame.save(std::path::Path::new(dir).join(name));
+            }
+        };
+        let marker = |p: PaneId| format!("TAKO2425-LAUNCHED-{}", p.as_u64());
+        let screen = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp, p: PaneId| -> Vec<String> {
+            window
+                .update(cx, |app, _, _| {
+                    app.terminals
+                        .get(&p)
+                        .map(|s| s.visible_lines())
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+        // 起動コマンドの出力の行（印だけの行）の数 = 起動コマンドが実行された回数
+        let ran = |lines: &[String], p: PaneId| {
+            let m = marker(p);
+            lines.iter().filter(|l| l.trim() == m).count()
+        };
+        let band_json = |list: &serde_json::Value, p: PaneId| -> serde_json::Value {
+            list["tabs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|t| t["panes"].as_array().into_iter().flatten())
+                .find(|x| x["id"].as_u64() == Some(p.as_u64()))
+                .map(|x| x["launch_wait_band"].clone())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        let list = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp| -> serde_json::Value {
+            window
+                .update(cx, |app, _, _| {
+                    tako_control::dispatch(app, Req::List, PaneOrigin::Cli).unwrap_or_default()
+                })
+                .unwrap_or_default()
+        };
+        let type_keys = |any: AnyWindowHandle, cx: &mut AsyncApp, text: &str| {
+            let text = text.to_string();
+            let _ = any.update(cx, |_, win, cx| {
+                for ch in text.chars() {
+                    win.dispatch_keystroke(
+                        Keystroke {
+                            modifiers: Modifiers::default(),
+                            key: ch.to_string(),
+                            key_char: Some(ch.to_string()),
+                        },
+                        cx,
+                    );
+                }
+            });
+        };
+        let focus = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp, p: PaneId| {
+            let _ = window.update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::Focus {
+                        pane: Some(p.as_u64()),
+                        direction: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+            });
+        };
+        let ignored = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp, p: PaneId| {
+            window
+                .update(cx, |app, _, _| {
+                    app.launch_wait_bands.get(&p).map(|b| b.ignored_inputs)
+                })
+                .ok()
+                .flatten()
+        };
+        let has_band = |window: WindowHandle<TakoApp>, cx: &mut AsyncApp, p: PaneId| {
+            window
+                .update(cx, |app, _, _| app.launch_wait_bands.contains_key(&p))
+                .unwrap_or(false)
+        };
+
+        // --- 準備: 右に 2 枚・その下に 1 枚（閉じる用）を分けて、シェルが立つのを待つ ---
+        let panes = window
+            .update(cx, |app, _, cx| {
+                app.drawer_visible = false;
+                app.panel_visible = false;
+                let mut base = app.focused_pane();
+                let mut out = Vec::new();
+                for dir in [
+                    tako_control::protocol::Direction::Right,
+                    tako_control::protocol::Direction::Down,
+                    tako_control::protocol::Direction::Down,
+                ] {
+                    let pane = tako_control::dispatch(
+                        app,
+                        Req::Split {
+                            pane: Some(base.as_u64()),
+                            tab: None,
+                            direction: Some(dir),
+                            ratio: None,
+                            command: None,
+                            cwd: None,
+                            focus: Some(false),
+                        },
+                        PaneOrigin::User,
+                    )
+                    .ok()
+                    .and_then(|v| v["pane"].as_u64())
+                    .map(PaneId::from_raw);
+                    let _ = app.attach_pending_sessions(cx);
+                    if let Some(p) = pane {
+                        base = p;
+                    }
+                    out.push(pane);
+                }
+                app.panel_click_probe_bounds.borrow_mut().clear();
+                cx.notify();
+                out
+            })
+            .unwrap_or_default();
+        let (Some(a), Some(b), Some(c)) = (
+            panes.first().copied().flatten(),
+            panes.get(1).copied().flatten(),
+            panes.get(2).copied().flatten(),
+        ) else {
+            println!("TAKO_VISUAL_2425: SKIPPED（ペインを分けられない: {panes:?}）");
+            return;
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            let ready = [a, b, c]
+                .iter()
+                .all(|p| screen(window, cx, *p).iter().any(|l| !l.trim().is_empty()));
+            if ready {
+                break;
+            }
+            wait(cx, 200).await;
+        }
+        wait(cx, 800).await;
+
+        // --- ① 待たせる（spawn と同じ口）→ 帯と `tako list` ---
+        let decided = window
+            .update(cx, |_, _, _| {
+                [a, b, c].map(|p| {
+                    matches!(
+                        gate::request(gate::LaunchRequest {
+                            pane: p.as_u64(),
+                            kind: gate::LaunchKind::Spawn,
+                            agent: "claude".into(),
+                            label: format!("2425-{}", p.as_u64()),
+                            role: None,
+                            action: gate::LaunchAction::Command {
+                                command: format!("echo {}", marker(p)),
+                                prompt: None,
+                            },
+                        }),
+                        gate::Decision::Wait(_)
+                    )
+                })
+            })
+            .unwrap_or([false; 3]);
+        check(
+            decided == [true; 3],
+            &format!("visual-test launch-wait-band: critical の注入で 3 本とも待ちにならない ({decided:?})"),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while std::time::Instant::now() < deadline {
+            if legacy || [a, b, c].iter().all(|p| has_band(window, cx, *p)) {
+                break;
+            }
+            wait(cx, 100).await;
+        }
+        wait(cx, 600).await;
+        let l1 = list(window, cx);
+        let (ja, jb) = (band_json(&l1, a), band_json(&l1, b));
+        println!("TAKO_VISUAL_2425: legacy={legacy} band_a={ja}");
+        println!("TAKO_VISUAL_2425: band_b={jb}");
+        let Some((frame, scale)) = capture_frame(any, cx) else {
+            println!("TAKO_VISUAL_2425: SKIPPED（フレームを読めない）");
+            return;
+        };
+        save(&frame, "launch-wait-band-1-waiting.png");
+        let (red, band_rect, button_rect) = window
+            .update(cx, |app, _, _| {
+                let probes = app.panel_click_probe_bounds.borrow();
+                (
+                    app.theme.red,
+                    probes
+                        .get(&format!("launch-wait-band-{}", a.as_u64()))
+                        .copied(),
+                    probes
+                        .get(&format!("launch-wait-start-{}", a.as_u64()))
+                        .copied(),
+                )
+            })
+            .unwrap_or((tako_core::Rgb { r: 0, g: 0, b: 0 }, None, None));
+        // 帯の矩形の中の「critical の色（赤）」の画素（印の縦棒は不透明の原色で描く）
+        let red_px = band_rect.map_or(0, |r| {
+            let x0 = ((f32::from(r.origin.x) * scale) as u32).min(frame.width().saturating_sub(1));
+            let y0 = ((f32::from(r.origin.y) * scale) as u32).min(frame.height().saturating_sub(1));
+            let w = ((f32::from(r.size.width) * scale) as u32)
+                .max(1)
+                .min(frame.width() - x0);
+            let h = ((f32::from(r.size.height) * scale) as u32)
+                .max(1)
+                .min(frame.height() - y0);
+            let mut n = 0usize;
+            for y in y0..y0 + h {
+                for x in x0..x0 + w {
+                    let p = frame.get_pixel(x, y).0;
+                    let d = (p[0] as i32 - red.r as i32).abs()
+                        + (p[1] as i32 - red.g as i32).abs()
+                        + (p[2] as i32 - red.b as i32).abs();
+                    if d <= 60 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        });
+        println!(
+            "TAKO_VISUAL_2425: band_rect={:?} button_rect={:?} red_px={red_px}",
+            band_rect.map(|r| (
+                f32::from(r.origin.x) as i32,
+                f32::from(r.origin.y) as i32,
+                f32::from(r.size.width) as i32,
+                f32::from(r.size.height) as i32
+            )),
+            button_rect.map(|r| (
+                f32::from(r.origin.x) as i32,
+                f32::from(r.origin.y) as i32,
+                f32::from(r.size.width) as i32,
+                f32::from(r.size.height) as i32
+            )),
+        );
+        if legacy {
+            check(
+                ja.is_null() && jb.is_null() && band_rect.is_none(),
+                "visual-test launch-wait-band(legacy): 帯が出ている",
+            );
+        } else {
+            let field = |v: &serde_json::Value, k: &str| v[k].to_string();
+            check(
+                ja["state"] == "waiting"
+                    && ja["position"] == 1
+                    && jb["position"] == 2
+                    && ja["waiting"] == 3
+                    && ja["code"] == "pressure_critical"
+                    && ja["pressure"] == "critical"
+                    && ja["available_mb"] == 1229
+                    && ja["button"].is_string()
+                    && ja["lines"].as_array().map(Vec::len) == Some(3)
+                    && ja["start_now"] == format!("tako queue start {}", a.as_u64()),
+                &format!(
+                    "visual-test launch-wait-band: `tako list` の launch_wait_band が期待と違う \
+                     (state={} position={}/{} code={} button={})",
+                    field(&ja, "state"),
+                    field(&ja, "position"),
+                    field(&jb, "position"),
+                    field(&ja, "code"),
+                    field(&ja, "button")
+                ),
+            );
+            check(
+                band_rect.is_some() && button_rect.is_some() && red_px >= 8,
+                &format!(
+                    "visual-test launch-wait-band: 帯が実ピクセルで描かれていない \
+                     (band={} button={} red_px={red_px})",
+                    band_rect.is_some(),
+                    button_rect.is_some()
+                ),
+            );
+        }
+
+        // --- ② 待っている間の入力（打鍵 3・貼り付け 1・IME の確定 1）---
+        focus(window, cx, a);
+        wait(cx, 200).await;
+        type_keys(any, cx, "xyz");
+        let _ = window.update(cx, |app, window, cx| {
+            app.paste_to_terminal(a, "PASTE2425".into(), cx);
+            app.replace_text_in_range(None, "\u{3042}", window, cx);
+        });
+        wait(cx, 800).await;
+        let typed = screen(window, cx, a).join("\n");
+        let reached =
+            typed.contains("xyz") || typed.contains("PASTE2425") || typed.contains('\u{3042}');
+        let held = ignored(window, cx, a);
+        println!("TAKO_VISUAL_2425: typed_reached_shell={reached} ignored_inputs={held:?}");
+        if let Some((frame, _)) = capture_frame(any, cx) {
+            save(&frame, "launch-wait-band-2-typed.png");
+        }
+        if legacy {
+            check(
+                reached,
+                "visual-test launch-wait-band(legacy): 待っている間の打鍵がシェルへ届いていない",
+            );
+        } else {
+            check(
+                !reached && held == Some(5),
+                &format!(
+                    "visual-test launch-wait-band: 待っている間の入力がペインへ届いた / 回数が帯に出ない \
+                     (reached={reached} ignored={held:?})"
+                ),
+            );
+        }
+
+        // --- ③ 「今すぐ起こす」（legacy はボタンが無いので CLI と同じ口で起こす）---
+        if let (false, Some(r)) = (legacy, button_rect) {
+            click_at(
+                any,
+                cx,
+                point(
+                    r.origin.x + r.size.width / 2.0,
+                    r.origin.y + r.size.height / 2.0,
+                ),
+            );
+        } else {
+            let _ = tako_control::queue::handle("start", None, Some(a.as_u64()), None);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            let lines = screen(window, cx, a);
+            let done = ran(&lines, a) > 0 || lines.iter().any(|l| l.contains("not found"));
+            if done && (legacy || !has_band(window, cx, a)) {
+                break;
+            }
+            wait(cx, 200).await;
+        }
+        wait(cx, 800).await;
+        let lines_a = screen(window, cx, a);
+        let ran_a = ran(&lines_a, a);
+        let cmd_line = lines_a
+            .iter()
+            .find(|l| l.contains(&format!("echo {}", marker(a))))
+            .cloned()
+            .unwrap_or_default();
+        let mixed_a = cmd_line.contains("xyz") || cmd_line.contains("PASTE2425");
+        let l2 = list(window, cx);
+        let (ja2, jb2) = (band_json(&l2, a), band_json(&l2, b));
+        println!(
+            "TAKO_VISUAL_2425: started_a ran={ran_a} mixed={mixed_a} command_line={:?} band_a={ja2} band_b_position={}",
+            cmd_line.trim(),
+            jb2["position"]
+        );
+        if legacy {
+            check(mixed_a, "visual-test launch-wait-band(legacy): 待っている間の入力と起動コマンドが混ざらなかった（A/B の前提が崩れた）");
+        } else {
+            check(
+                ran_a == 1 && !mixed_a && ja2.is_null() && jb2["position"] == 1 && jb2["waiting"] == 2,
+                &format!(
+                    "visual-test launch-wait-band: ボタンで起動コマンドが 1 回だけ混ざらずに打たれ帯が消える、にならない \
+                     (ran={ran_a} mixed={mixed_a} band_a={ja2} b.position={})",
+                    jb2["position"]
+                ),
+            );
+            // 起きた後の打鍵は届く
+            focus(window, cx, a);
+            wait(cx, 200).await;
+            type_keys(any, cx, "okz");
+            wait(cx, 600).await;
+            let after = screen(window, cx, a).join("\n");
+            check(
+                after.contains("okz"),
+                "visual-test launch-wait-band: 起きた後の打鍵がペインへ届かない",
+            );
+        }
+        if let Some((frame, _)) = capture_frame(any, cx) {
+            save(&frame, "launch-wait-band-3-started.png");
+        }
+
+        // --- ④ 待っているペインを閉じると起こさない ---
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                Req::Close {
+                    pane: Some(c.as_u64()),
+                    force: true,
+                    caller_role: None,
+                    caller_pane: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        wait(cx, 1200).await;
+        let closed_gone = gate::view(c.as_u64()).is_none() && !has_band(window, cx, c);
+        println!("TAKO_VISUAL_2425: closed_pane_gate_gone={closed_gone}");
+        check(
+            closed_gone,
+            "visual-test launch-wait-band: 閉じたペインの起動待ちが残っている",
+        );
+
+        // --- ⑤ 待っている間に B へ打鍵 → normal へ戻すと自然に起き、帯が消える ---
+        focus(window, cx, b);
+        wait(cx, 200).await;
+        type_keys(any, cx, "qq");
+        wait(cx, 300).await;
+        write_inject("normal");
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            let lines = screen(window, cx, b);
+            let done = ran(&lines, b) > 0 || lines.iter().any(|l| l.contains("not found"));
+            if done && (legacy || !has_band(window, cx, b)) {
+                break;
+            }
+            wait(cx, 200).await;
+        }
+        wait(cx, 800).await;
+        let lines_b = screen(window, cx, b);
+        let ran_b = ran(&lines_b, b);
+        let cmd_b = lines_b
+            .iter()
+            .find(|l| l.contains(&format!("echo {}", marker(b))))
+            .cloned()
+            .unwrap_or_default();
+        let mixed_b = cmd_b.contains("qq");
+        let jb3 = band_json(&list(window, cx), b);
+        println!(
+            "TAKO_VISUAL_2425: woken_b ran={ran_b} mixed={mixed_b} command_line={:?} band_b={jb3}",
+            cmd_b.trim()
+        );
+        if let Some((frame, _)) = capture_frame(any, cx) {
+            save(&frame, "launch-wait-band-4-woken.png");
+        }
+        if !legacy {
+            check(
+                ran_b == 1 && !mixed_b && jb3.is_null(),
+                &format!(
+                    "visual-test launch-wait-band: normal で自然に起きて帯が消える、にならない \
+                     (ran={ran_b} mixed={mixed_b} band_b={jb3})"
+                ),
+            );
+        }
+        println!(
+            "TAKO_VISUAL_2425: all_ok legacy={legacy} ran_a={ran_a} ran_b={ran_b} mixed_a={mixed_a} mixed_b={mixed_b}"
+        );
+        let _ = window.update(cx, |app, _, cx| {
+            for pane in [a, b] {
+                app.close_pane_button(pane, CloseOrigin::Internal, cx);
+            }
+            cx.notify();
+        });
     }
 
     /// グリフから描画プリミティブへ替えた印が**実ピクセルで描かれている**か（#1579）。
@@ -99267,13 +100075,14 @@ mod offscreen_sync_tests {
     use std::time::Duration;
     use tako_core::PaneId;
 
-    /// (コンテンツ矩形, タブ数, 端末数, バナー数, カードの有無, 拡大率) + #1426 の追加分
+    /// (コンテンツ矩形, タブ数, 端末数, バナー数, 起動待ちの帯の数 #2425, カードの有無, 拡大率) + #1426 の追加分
     fn key() -> OffscreenSyncKey {
         (
             (
                 Bounds::new(point(px(240.0), px(76.0)), size(px(1200.0), px(800.0))),
                 7,
                 22,
+                0,
                 0,
                 false,
                 2.0f32.to_bits(),
@@ -104235,6 +105044,36 @@ mod pane_text_area_tests {
         assert_eq!(flat.matches(&formula).count(), 1);
     }
 
+    /// #2425: 起動待ちの帯も stale バナーと同じく、描画の高さ指定と会計が同じ定数を共有し、
+    /// 描画と会計が同じ判定（`launch_wait_band_of`）を通る
+    #[test]
+    fn issue2425_起動待ちの帯の高さ指定と会計が同じ定数を共有している() {
+        let source = include_str!("main.rs");
+        let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        let band_element = flat
+            .split(&format!("(\"{}\", pane_id.as_u64())", "launch-wait-band"))
+            .nth(1)
+            .map(|rest| rest.split(".flex_row()").next().unwrap_or(""))
+            .expect("起動待ちの帯の要素が見つからない");
+        let shared = format!(".h(px({}))", "LAUNCH_WAIT_BAND_HEIGHT");
+        assert!(
+            band_element.contains(&shared),
+            "帯の高さが定数経由でない（会計側とずれる）: {band_element}"
+        );
+        assert_eq!(flat.matches(&shared).count(), 1, "帯の高さ指定が複数ある");
+        let accounted = format!("+ self.{}(pane_id)", "launch_wait_band_height");
+        assert!(
+            flat.contains(&accounted),
+            "テキスト領域の矩形計算が起動待ちの帯を会計していない"
+        );
+        // 描画（`render_pane` の when_some）・会計・`tako list` が同じ判定を通る
+        let judged = format!("self.{}(pane_id)", "launch_wait_band_of");
+        assert!(
+            flat.matches(&judged).count() >= 2,
+            "描画と会計が同じ判定を通っていない"
+        );
+    }
+
     /// #1132: 幅比 → 桁数の見積もりが**実描画の式**（`pane_text_area_rect` +
     /// `grid_cells`）と一致することを固定する。
     ///
@@ -104316,19 +105155,20 @@ mod pane_text_area_tests {
                     .map(|_| rest)
             })
             .collect();
-        // 期待する 10 個:
+        // 期待する 11 個:
         //   when(legacy_812) = 旧挙動のときだけ枠線色を付ける（#812。色だけなので
         //     高さを食わない。枠**幅**は `.border(px(PANE_BORDER))` が常に持つので
         //     `stacked_top` の会計は腕によらず不変）
         //   when(is_failed) / when(focused) = 影と枠の見た目だけ（高さを食わない）
         //   child(ヘッダの場所を空けるスペーサー #803) = PANE_TITLE_BAR
         //   when_some(stale バナー) = STALE_BANNER_HEIGHT
+        //   when_some(起動待ちの帯 #2425) = LAUNCH_WAIT_BAND_HEIGHT
         //   child(ターミナル領域) = flex_1
         //   children(カード帯) = card_band_height
         //   children(スクロールバー) / children(提案チップ) / when(workers メニュー) = absolute
         assert_eq!(
             children.len(),
-            10,
+            11,
             "ペインの直接の子が変わっている: {children:#?}\n\
              流れの中（absolute でない）に足したなら `stacked_top` / `band` の会計を\
              見直すこと（#781）"

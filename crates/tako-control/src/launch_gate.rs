@@ -23,6 +23,9 @@
 //! - 明示の上書きは [`start_now`]（`tako queue start <ペイン>` / MCP `tako_queue` の `start`）
 //! - 本番の GUI（とセカンダリ）で有効。隔離 / セルフテストは注入 [`ENV_INJECT`] があるときだけ
 //!   （逼迫は注入で再現する = 負荷を生成しない）。A/B [`ENV_LEGACY`] は修正前（待たずに起こす）
+//! - GUI の帯（#2425）の材料は [`wait_bands`]（型のまま渡し、文にするのは GUI の表示言語）。帯は
+//!   待っている理由・順番・「今すぐ起こす」を出し、待っている間の打鍵をペインへ流さない。
+//!   A/B [`ENV_BAND_LEGACY`] は帯なし・打鍵は素通し（起動待ちそのものは変えない）
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -45,6 +48,9 @@ pub const ENV_LEGACY: &str = "TAKO_2413_LEGACY";
 /// 隔離 / セルフテストの GUI だけが読む注入（機の値・立ち上がりの長さ。JSON ファイル）。
 /// ファイルは tick のたびに（変わっていれば）読み直すので、待っている間に normal ↔ critical を往復できる
 pub const ENV_INJECT: &str = "TAKO_2413_INJECT";
+/// A/B: `TAKO_2425_LEGACY=1` で帯（#2425）を出さず、待っている間の打鍵もペインへ流す（修正前）。
+/// GUI のプロセスの env で効く。起動待ちそのもの（[`ENV_LEGACY`]）とは独立
+pub const ENV_BAND_LEGACY: &str = "TAKO_2425_LEGACY";
 
 /// 起こしてから「立ち上がり中」とみなす長さ（秒）。この間はまだ使っていない見込みを空きから引き、
 /// 復元の列を塞ぐ（= 復元の時差）。本物の claude（stdio の MCP サーバー 7 本が子として起きる構成）は
@@ -285,6 +291,8 @@ struct Gate {
     usage_at: Option<Instant>,
     /// 直近の判断（待ちそれぞれの理由と並び）
     last: Admission,
+    /// 直近の判断に使った機の値（帯 #2425 の圧と空き）
+    last_machine: Option<MachineView>,
     /// 機の値を固定する（**単体テストだけ**。本番は常に `None`）
     fixed_machine: Option<Option<MachineView>>,
     /// 立ち上がりの長さを固定する（**単体テストだけ**）
@@ -547,6 +555,17 @@ fn decide(g: &mut Gate, now: Instant) {
         }
     }
     g.last = admission;
+    g.last_machine = machine;
+}
+
+/// 待っている件の並び（受付番号 = ペイン。判断の並びのうち、まだ待っている件だけ）
+fn waiting_order(g: &Gate) -> Vec<u64> {
+    g.last
+        .order
+        .iter()
+        .copied()
+        .filter(|p| g.entries.get(p).is_some_and(|x| x.phase == Phase::Waiting))
+        .collect()
 }
 
 /// 待っている件の (理由のコード, 理由の文)。並びが止まって調べなかった件は止めている理由を添える
@@ -583,13 +602,7 @@ fn view_of(g: &Gate, pane: u64, now: Instant) -> Option<Value> {
     let mut v = base;
     match e.phase {
         Phase::Waiting => {
-            let order: Vec<u64> = g
-                .last
-                .order
-                .iter()
-                .copied()
-                .filter(|p| g.entries.get(p).is_some_and(|x| x.phase == Phase::Waiting))
-                .collect();
+            let order = waiting_order(g);
             let position = order.iter().position(|p| *p == pane).map(|i| i + 1);
             let (code, text) = reason_of(&g.last, pane);
             v["state"] = json!("waiting");
@@ -900,6 +913,126 @@ pub fn is_waiting(pane: u64) -> bool {
         .is_some_and(|e| matches!(e.phase, Phase::Waiting | Phase::Due))
 }
 
+/// A/B の env（GUI の起動時に 1 回読む。帯 #2425 を出さず打鍵を素通しにする）
+pub fn band_legacy() -> bool {
+    std::env::var_os(ENV_BAND_LEGACY).is_some_and(|v| v == "1")
+}
+
+/// 起動待ちの帯（#2425）の材料。**型のまま**渡し、文にするのは GUI（表示言語に従う）。
+/// GUI が描く帯と `tako list` の `launch_wait_band` は同じ材料から組む
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitBand {
+    pub pane: u64,
+    pub kind: LaunchKind,
+    pub agent: String,
+    pub state: BandState,
+}
+
+/// 帯の段
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BandState {
+    /// 待っている
+    Waiting {
+        /// 並びの何番目か（1 始まり。最初の判断の前 = 起動時の復元を預けた直後は `None`）
+        position: Option<usize>,
+        /// 待っている本数
+        waiting: usize,
+        /// 自分の待つ理由（最初の判断の前は `None`）
+        reason: Option<WaitReason>,
+        /// 前に並んでいて待つ（[`WaitReason::Ahead`]）とき、並びを止めている理由
+        holding: Option<WaitReason>,
+        /// 判断に使ったメモリ圧（機の値が無い = Windows・取れていない は `None`）
+        pressure: Option<Pressure>,
+        /// 判断に使った空きメモリ（MiB）
+        available_mb: Option<u64>,
+    },
+    /// 起こすと決めた（上書き・圧が戻った）。次の tick で起動コマンドを打つ
+    Starting,
+}
+
+impl WaitBand {
+    /// 帯の理由として見せる 1 つ（前に並んでいるだけなら、並びを止めている理由）
+    pub fn shown_reason(&self) -> Option<&WaitReason> {
+        match &self.state {
+            BandState::Waiting {
+                reason: Some(WaitReason::Ahead),
+                holding: Some(hold),
+                ..
+            } => Some(hold),
+            BandState::Waiting { reason, .. } => reason.as_ref(),
+            BandState::Starting => None,
+        }
+    }
+
+    /// `tako list` の `launch_wait_band` の型の部分（文は GUI が足す）
+    pub fn to_json(&self) -> Value {
+        let mut v = json!({
+            "kind": self.kind.as_str(),
+            "agent": self.agent,
+            "start_now": start_now_command(self.pane),
+        });
+        match &self.state {
+            BandState::Waiting {
+                position,
+                waiting,
+                pressure,
+                available_mb,
+                ..
+            } => {
+                v["state"] = json!("waiting");
+                v["position"] = json!(position);
+                v["waiting"] = json!(waiting);
+                v["code"] = json!(self.shown_reason().map(WaitReason::code));
+                v["pressure"] = json!(pressure.map(Pressure::as_str));
+                v["available_mb"] = json!(available_mb);
+            }
+            BandState::Starting => v["state"] = json!("starting"),
+        }
+        v
+    }
+}
+
+/// 帯を出すペインの材料（待っている件と、起こすと決めてまだ起動コマンドを打っていない件）。
+/// UI スレッドの 500 ms tick の後に読む（ロック 1 回・件が無ければすぐ空で返る）
+pub fn wait_bands() -> Vec<WaitBand> {
+    let g = lock();
+    if g.entries.is_empty() {
+        return Vec::new();
+    }
+    let order = waiting_order(&g);
+    let machine = g.last_machine;
+    g.entries
+        .iter()
+        .filter_map(|(pane, e)| {
+            let state = match e.phase {
+                Phase::Waiting => {
+                    let reason = g.last.reason_of(*pane).cloned();
+                    let holding = match reason {
+                        Some(WaitReason::Ahead) => g.last.holding_of(*pane).cloned(),
+                        _ => None,
+                    };
+                    BandState::Waiting {
+                        position: order.iter().position(|p| p == pane).map(|i| i + 1),
+                        waiting: order.len(),
+                        reason,
+                        holding,
+                        pressure: machine.and_then(|m| m.pressure),
+                        available_mb: machine.and_then(|m| m.available_mb),
+                    }
+                }
+                Phase::Due => BandState::Starting,
+                Phase::Starting(_) => return None,
+            };
+            Some(WaitBand {
+                pane: *pane,
+                kind: e.kind,
+                agent: e.agent.clone(),
+                state,
+            })
+        })
+        .collect()
+}
+
 /// 待っている起動の 1 行（人が読む。CLI の `orchestrator run` / `tako queue` が出す）。待っていなければ `None`
 pub fn wait_line(view: &Value) -> Option<String> {
     if view["state"] != "waiting" {
@@ -1047,6 +1180,100 @@ mod tests {
         let s = status_section();
         assert_eq!(s["waiting"].as_array().map(Vec::len), Some(3));
         assert_eq!(s["waiting"][0]["pane"], 10);
+    }
+
+    /// #2425: 帯の材料は順番・理由・判断に使った圧と空きを持つ。前に並んでいる件は並びを止めている理由を
+    /// 見せる。上書きで起こすと決めた件は「起動中」になり、起動コマンドを打った（立ち上がり中）件は外れる
+    #[test]
+    fn issue2425_帯の材料は順番と理由と圧と空きを持つ() {
+        enable_for_test(machine(Pressure::Critical), Duration::from_secs(60));
+        assert!(wait_bands().is_empty(), "待ちが無ければ空");
+        waiting(request(req(40, LaunchKind::Spawn, None)));
+        waiting(request(req(41, LaunchKind::Spawn, None)));
+        let bands = wait_bands();
+        let band = |p: u64| bands.iter().find(|b| b.pane == p).cloned().unwrap();
+        assert_eq!(bands.len(), 2);
+        let BandState::Waiting {
+            position,
+            waiting: n,
+            pressure,
+            available_mb,
+            ..
+        } = band(40).state
+        else {
+            panic!("待っている");
+        };
+        assert_eq!(
+            (position, n, pressure, available_mb),
+            (Some(1), 2, Some(Pressure::Critical), Some(20 * GIB))
+        );
+        // 2 本目は前に並んでいても、見せる理由は並びを止めている critical
+        for p in [40, 41] {
+            assert_eq!(
+                band(p).shown_reason(),
+                Some(&WaitReason::PressureCritical),
+                "pane {p}"
+            );
+        }
+        let j = band(41).to_json();
+        assert_eq!(
+            (
+                j["state"].as_str(),
+                j["position"].as_u64(),
+                j["waiting"].as_u64(),
+                j["code"].as_str(),
+                j["pressure"].as_str(),
+                j["start_now"].as_str()
+            ),
+            (
+                Some("waiting"),
+                Some(2),
+                Some(2),
+                Some("pressure_critical"),
+                Some("critical"),
+                Some("tako queue start 41")
+            )
+        );
+        assert_eq!(j["available_mb"], 20 * GIB);
+        // 上書き: 起こすと決めた件は起動中・残りの順番が繰り上がる
+        start_now(40).expect("待っている件");
+        let bands = wait_bands();
+        let band = |p: u64| bands.iter().find(|b| b.pane == p).cloned().unwrap();
+        assert_eq!(band(40).state, BandState::Starting);
+        assert_eq!(band(40).to_json()["state"], "starting");
+        assert!(matches!(
+            band(41).state,
+            BandState::Waiting {
+                position: Some(1),
+                waiting: 1,
+                ..
+            }
+        ));
+        // 起動コマンドを打った（立ち上がり中）件は帯から外れる
+        lock().entries.get_mut(&40).unwrap().phase = Phase::Starting(Instant::now());
+        assert_eq!(
+            wait_bands().iter().map(|b| b.pane).collect::<Vec<_>>(),
+            vec![41]
+        );
+    }
+
+    /// #2425: 起動時の復元を預けた直後（最初の判断の前）は順番も理由もまだ無い = 帯は「順番を決めている」
+    #[test]
+    fn issue2425_最初の判断の前の帯は順番と理由が無い() {
+        enable_for_test(machine(Pressure::Warn), Duration::from_secs(60));
+        assert!(hold(req(50, LaunchKind::Restore, None)).is_none());
+        let bands = wait_bands();
+        assert_eq!(bands.len(), 1);
+        assert!(matches!(
+            bands[0].state,
+            BandState::Waiting {
+                position: None,
+                reason: None,
+                ..
+            }
+        ));
+        assert_eq!(bands[0].shown_reason(), None);
+        assert!(bands[0].to_json()["code"].is_null());
     }
 
     #[test]

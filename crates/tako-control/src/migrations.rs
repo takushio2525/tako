@@ -25,9 +25,11 @@
 
 use std::path::{Path, PathBuf};
 
+use tako_core::i18n::Lang;
+use tako_core::load_issue::{JsonReason, YamlReason};
 use tako_core::migration::{
-    self, FileOutcome, FileReport, MigrationIo, MigrationReport, Proposal, SchemaId, SchemaSpec,
-    Step,
+    self, FileOutcome, FileReport, MigrationIo, MigrationReport, OutcomeReason, Proposal, SchemaId,
+    SchemaSpec, Step,
 };
 use tako_core::platform::support::Note;
 
@@ -46,98 +48,102 @@ pub enum Mode {
 // 退避されて `tako migrate status` の警告行になる。理由は**中身を含めない**（#2230。
 // `移行できず:` の行として persist.log へもそのまま載る。serde の素の文言は型が違うと値を引用する）
 
-fn json_ok<T: serde::de::DeserializeOwned>(text: &str) -> Result<(), String> {
-    serde_json::from_str::<T>(text)
-        .map(|_| ())
-        .map_err(|e| tako_core::load_issue::json_error_reason(&e))
+// 理由は日英の対（`tako migrate status` の `reason` は表示言語・persist.log は日本語 = #2365）。
+// 中身は `JsonReason` / `YamlReason`（種類と位置だけ。`TAKO_2230_LEGACY=1` は serde の素の文言 = 日英同じ）
+fn json_ok<T: serde::de::DeserializeOwned>(text: &str) -> Result<(), OutcomeReason> {
+    serde_json::from_str::<T>(text).map(|_| ()).map_err(|e| {
+        let reason = JsonReason::of(&e);
+        OutcomeReason::of(|lang| reason.text_in(lang))
+    })
 }
 
-fn yaml_ok<T: serde::de::DeserializeOwned>(text: &str) -> Result<(), String> {
-    serde_yaml::from_str::<T>(text)
-        .map(|_| ())
-        .map_err(|e| tako_core::load_issue::yaml_error_reason(&e, text))
+fn yaml_ok<T: serde::de::DeserializeOwned>(text: &str) -> Result<(), OutcomeReason> {
+    serde_yaml::from_str::<T>(text).map(|_| ()).map_err(|e| {
+        let reason = YamlReason::of(&e, text);
+        OutcomeReason::of(|lang| reason.text_in(lang))
+    })
 }
 
-fn validate_settings(text: &str) -> Result<(), String> {
+fn validate_settings(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<crate::settings::Settings>(text)
 }
 
-fn validate_layout(text: &str) -> Result<(), String> {
+fn validate_layout(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<crate::layout::LayoutFile>(text)
 }
 
-fn validate_recent(text: &str) -> Result<(), String> {
+fn validate_recent(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<tako_core::recent::RecentList>(text)
 }
 
-fn validate_config_share(text: &str) -> Result<(), String> {
+fn validate_config_share(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<crate::config_share::ShareState>(text)
 }
 
-fn validate_remote_devices(text: &str) -> Result<(), String> {
+fn validate_remote_devices(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<crate::remote_auth::DevicesFile>(text)
 }
 
 /// リモート閲覧のショートカット（#1451）。**秘匿情報ではない**（行き先の宣言だけで、
 /// 読める範囲は role と認可が毎リクエスト決める）ので、読めない内容は退避して残す
-fn validate_remote_shortcuts(text: &str) -> Result<(), String> {
+fn validate_remote_shortcuts(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<tako_core::remote_shortcuts::ShortcutsFile>(text)
 }
 
 /// Code Runner の実行設定（#1731）。利用者が選んだ実行環境・プロファイル
-fn validate_run_configs(text: &str) -> Result<(), String> {
+fn validate_run_configs(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<crate::run_configs::RunConfigsFile>(text)
 }
 
 /// 蓋閉じ継続の残留記録（#697 / #1373）。中身は Windows 専用だが、
 /// **読めない記録を「記録なし」へ丸めない**のは両 OS 共通の要件なので検査も共通
-fn validate_lid_guard(text: &str) -> Result<(), String> {
+fn validate_lid_guard(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<crate::platform::lid::SavedLidState>(text)
 }
 
-fn validate_discovery_instance(text: &str) -> Result<(), String> {
+fn validate_discovery_instance(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<crate::discovery::ControlInfo>(text)
 }
 
-fn validate_sessions(text: &str) -> Result<(), String> {
+fn validate_sessions(text: &str) -> Result<(), OutcomeReason> {
     yaml_ok::<crate::sessions::SessionCatalog>(text)
 }
 
-fn validate_workers(text: &str) -> Result<(), String> {
+fn validate_workers(text: &str) -> Result<(), OutcomeReason> {
     yaml_ok::<crate::orchestrator::registry::WorkerRegistry>(text)
 }
 
-fn validate_task_checkpoints(text: &str) -> Result<(), String> {
+fn validate_task_checkpoints(text: &str) -> Result<(), OutcomeReason> {
     yaml_ok::<crate::task_checkpoints::TaskCheckpointStore>(text)
 }
 
-fn validate_acceptance_gates(text: &str) -> Result<(), String> {
+fn validate_acceptance_gates(text: &str) -> Result<(), OutcomeReason> {
     yaml_ok::<crate::acceptance_gates::AcceptanceGateStore>(text)
 }
 
-fn validate_orchestrator_config(text: &str) -> Result<(), String> {
+fn validate_orchestrator_config(text: &str) -> Result<(), OutcomeReason> {
     yaml_ok::<crate::setup::SetupConfig>(text)
 }
 
-fn validate_projects(text: &str) -> Result<(), String> {
+fn validate_projects(text: &str) -> Result<(), OutcomeReason> {
     yaml_ok::<crate::orchestrator::ProjectsConfig>(text)
 }
 
-fn validate_accounts(text: &str) -> Result<(), String> {
+fn validate_accounts(text: &str) -> Result<(), OutcomeReason> {
     yaml_ok::<crate::orchestrator::AccountsConfig>(text)
 }
 
-fn validate_profile(text: &str) -> Result<(), String> {
+fn validate_profile(text: &str) -> Result<(), OutcomeReason> {
     yaml_ok::<crate::orchestrator::Profile>(text)
 }
 
-fn validate_ledger(text: &str) -> Result<(), String> {
+fn validate_ledger(text: &str) -> Result<(), OutcomeReason> {
     yaml_ok::<crate::orchestrator::ledger::Ledger>(text)
 }
 
 /// ユーザー向けタスク（#1450）。**読めない = 承認待ちが画面から消える**ので、
 /// 黙って既定値（0 件）へ落とさずここで Err にして退避へ回す
-fn validate_user_tasks(text: &str) -> Result<(), String> {
+fn validate_user_tasks(text: &str) -> Result<(), OutcomeReason> {
     yaml_ok::<tako_core::user_task::TaskStore>(text)
 }
 
@@ -209,12 +215,74 @@ fn has_top_level_key(text: &str, key: &str) -> bool {
 /// プロファイルの現在の世代
 const PROFILE_VERSION: u32 = 3;
 
+/// tako-control が組む移行の記録の理由（#2365）。
+///
+/// (バリアント, 言語) の網羅 match で、日本語は #2365 より前の固定文とバイト一致。記録へは
+/// [`Self::reason`]（日英の対）で載せる = `tako migrate status` / MCP の `reason` は表示言語、
+/// persist.log と `tako setup` の行は日本語
+#[derive(Debug, Clone, PartialEq)]
+pub enum MigrateReason {
+    /// 手順の途中でプロファイルを読めなかった（中身を含めない。#2230）
+    ProfileUnreadable(YamlReason),
+    /// 手順の途中で projects.yaml を読めなかった（#2412）
+    ProjectsUnreadable(YamlReason),
+    /// 手順の結果を YAML へ書き戻せない（`error` は serde_yaml の文）
+    YamlRebuild(String),
+    /// 追記の区切りを上げる案（#1981）が区切りの行以外まで変える書き換えになった
+    MarkerMoveTouchesOtherLines,
+    /// 登録済みプロジェクトのプロファイルを作らない予告（#1825。default を継承できない）
+    ProfileBaseUnreadable(crate::orchestrator::ConfigError),
+}
+
+impl MigrateReason {
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::ProfileUnreadable(reason), Ja) => {
+                format!("プロファイルとして読めない: {}", reason.text_in(lang))
+            }
+            (Self::ProfileUnreadable(reason), En) => {
+                format!("cannot read it as a profile: {}", reason.text_in(lang))
+            }
+            (Self::ProjectsUnreadable(reason), Ja) => {
+                format!("projects.yaml として読めない: {}", reason.text_in(lang))
+            }
+            (Self::ProjectsUnreadable(reason), En) => {
+                format!("cannot read it as projects.yaml: {}", reason.text_in(lang))
+            }
+            (Self::YamlRebuild(error), Ja) => format!("YAML の再構成に失敗: {error}"),
+            (Self::YamlRebuild(error), En) => format!("failed to rebuild the YAML: {error}"),
+            (Self::MarkerMoveTouchesOtherLines, Ja) => {
+                "区切りの行以外が変わる書き換えになったので書かない（#1981）".into()
+            }
+            (Self::MarkerMoveTouchesOtherLines, En) => {
+                "not written because the rewrite would change lines other than the marker (#1981)"
+                    .into()
+            }
+            (Self::ProfileBaseUnreadable(why), Ja) => {
+                format!("{}。default を継承できないので作らない", why.text_in(lang))
+            }
+            (Self::ProfileBaseUnreadable(why), En) => format!(
+                "{}. Not created because the default profile cannot be inherited",
+                why.text_in(lang)
+            ),
+        }
+    }
+
+    /// 移行の記録の理由（日英の対）
+    pub fn reason(&self) -> OutcomeReason {
+        OutcomeReason::of(|lang| self.text_in(lang))
+    }
+}
+
 /// 手順の途中でプロファイルを読めなかった理由（中身を含めない。#2230）
-fn profile_unreadable(e: &serde_yaml::Error, text: &str) -> String {
-    format!(
-        "プロファイルとして読めない: {}",
-        tako_core::load_issue::yaml_error_reason(e, text)
-    )
+fn profile_unreadable(e: &serde_yaml::Error, text: &str) -> OutcomeReason {
+    MigrateReason::ProfileUnreadable(YamlReason::of(e, text)).reason()
+}
+
+/// 手順の結果を YAML へ書き戻せない理由
+fn yaml_rebuild_failed(e: serde_yaml::Error) -> OutcomeReason {
+    MigrateReason::YamlRebuild(e.to_string()).reason()
 }
 
 const PROFILE_V1_TO_V2: Note = Note::new(
@@ -224,7 +292,7 @@ const PROFILE_V1_TO_V2: Note = Note::new(
 
 /// #27 の移行を機構へ載せたもの。**行単位で `model:` だけを外す**ので、
 /// コメントも他の設定もそのまま残る（読めなくなる書式だけ serde 経由で作り直す）
-fn strip_legacy_default_model(text: &str) -> Result<Option<String>, String> {
+fn strip_legacy_default_model(text: &str) -> Result<Option<String>, OutcomeReason> {
     let profile: crate::orchestrator::Profile =
         serde_yaml::from_str(text).map_err(|e| profile_unreadable(&e, text))?;
     if profile.model.as_deref() != Some(crate::orchestrator::LEGACY_DEFAULT_MODEL) {
@@ -252,7 +320,7 @@ fn strip_legacy_default_model(text: &str) -> Result<Option<String>, String> {
     rebuilt.model = None;
     serde_yaml::to_string(&rebuilt)
         .map(Some)
-        .map_err(|e| format!("YAML の再構成に失敗: {e}"))
+        .map_err(yaml_rebuild_failed)
 }
 
 const PROFILE_V2_TO_V3: Note = Note::new(
@@ -265,7 +333,7 @@ const PROFILE_V2_TO_V3: Note = Note::new(
 /// 既定を安全側（バイパスしない）へ変えると、今まで動いていた codex master /
 /// codex worker が承認プロンプトで止まる。**既存ユーザーの体験は変えない**ため、
 /// この項目が無いファイル（= 変更前に作られたファイル）には従来と同じ挙動になる値を書く
-fn pin_sandbox_bypass(text: &str) -> Result<Option<String>, String> {
+fn pin_sandbox_bypass(text: &str) -> Result<Option<String>, OutcomeReason> {
     if has_top_level_key(text, "bypass_sandbox") {
         // 既に明示されている = 二度目。冪等（何もしない）
         return Ok(None);
@@ -287,7 +355,7 @@ fn pin_sandbox_bypass(text: &str) -> Result<Option<String>, String> {
         rebuilt.bypass_sandbox = true;
         return serde_yaml::to_string(&rebuilt)
             .map(Some)
-            .map_err(|e| format!("YAML の再構成に失敗: {e}"));
+            .map_err(yaml_rebuild_failed);
     }
     Ok(Some(out))
 }
@@ -304,10 +372,10 @@ const PROJECTS_V1_TO_V2: Note = Note::new(
 ///
 /// 読む会話は `worker_mcp::evidence_config_dirs`（テストのプロセスでは読まない）。
 /// 冪等: 2 回目は `version: 2` を見て何もしない（`detect` も同じ値を読む）
-fn adopt_worker_mcp_usage(text: &str) -> Result<Option<String>, String> {
+fn adopt_worker_mcp_usage(text: &str) -> Result<Option<String>, OutcomeReason> {
     // 下見（dry run）と本番の移行が同じ本文で手順を 2 回呼ぶ。会話の走査（数 GB）は
     // 重いので、同じ本文への答えはプロセスの中で 1 回だけ作る
-    type Answer = Result<Option<String>, String>;
+    type Answer = Result<Option<String>, OutcomeReason>;
     static MEMO: std::sync::Mutex<Option<(String, Answer)>> = std::sync::Mutex::new(None);
     let mut memo = MEMO.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((seen, answer)) = memo.as_ref() {
@@ -324,14 +392,9 @@ fn adopt_worker_mcp_usage(text: &str) -> Result<Option<String>, String> {
 pub fn adopt_worker_mcp_usage_in(
     text: &str,
     config_dirs: &[PathBuf],
-) -> Result<Option<String>, String> {
-    let mut config: crate::orchestrator::ProjectsConfig =
-        serde_yaml::from_str(text).map_err(|e| {
-            format!(
-                "projects.yaml として読めない: {}",
-                tako_core::load_issue::yaml_error_reason(&e, text)
-            )
-        })?;
+) -> Result<Option<String>, OutcomeReason> {
+    let mut config: crate::orchestrator::ProjectsConfig = serde_yaml::from_str(text)
+        .map_err(|e| MigrateReason::ProjectsUnreadable(YamlReason::of(&e, text)).reason())?;
     if config.version >= crate::orchestrator::PROJECTS_VERSION {
         return Ok(None);
     }
@@ -342,7 +405,7 @@ pub fn adopt_worker_mcp_usage_in(
     config.version = crate::orchestrator::PROJECTS_VERSION;
     serde_yaml::to_string(&config)
         .map(Some)
-        .map_err(|e| format!("YAML の再構成に失敗: {e}"))
+        .map_err(yaml_rebuild_failed)
 }
 
 const PROJECTS_STEPS: &[Step] = &[Step {
@@ -386,7 +449,7 @@ const PROMPT_APPEND_V1_TO_V2: Note = Note::new(
 /// **挿入するのはマーカー行 1 本だけ**（[`tako_core::prompt_append::insert_marker`]）。
 /// 見出しが無い / 先頭の節だけで予算を超えるものは切らずに `Ok(None)` を返す
 /// （機械的に切ると規則の意味が壊れるので、`tako context-budget` の提案へ回す）
-fn split_oversized_append(text: &str) -> Result<Option<String>, String> {
+fn split_oversized_append(text: &str) -> Result<Option<String>, OutcomeReason> {
     // **手順そのものが世代を見る**（`detect` を通さずに呼ばれても小さいファイルや
     // 区切り済みのファイルを触らない = `Step::apply` の「Ok(None) = 既に新形式」契約）
     if detect_prompt_append(text) == PROMPT_APPEND_VERSION {
@@ -520,7 +583,7 @@ fn append_marker_move(file: FileReport, proposals: Proposals) -> FileReport {
     if prompt_append::strip_marker(&moved) != prompt_append::strip_marker(&text) {
         return FileReport {
             outcome: FileOutcome::Failed {
-                reason: "区切りの行以外が変わる書き換えになったので書かない（#1981）".into(),
+                reason: MigrateReason::MarkerMoveTouchesOtherLines.reason(),
             },
             ..file
         };
@@ -906,7 +969,9 @@ impl MigrationIo for ConfigIo {
     }
 
     fn write(&self, path: &Path, text: &str) -> std::io::Result<()> {
-        crate::config_io::atomic_write(path, text).map_err(std::io::Error::other)
+        // 書き手の断りは日英の対で tako-core へ渡す（記録の理由が表示言語で載る。#2365）
+        crate::config_io::atomic_write_typed(path, text)
+            .map_err(|e| OutcomeReason::of(|lang| e.text_in(lang)).into_io_error())
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -1044,13 +1109,9 @@ fn project_profile_reports(mode: Mode) -> Vec<FileReport> {
                     Ok(()) => FileOutcome::Created {
                         reason: PROFILE_AUTO_CREATED,
                     },
-                    // 移行の記録の理由は日本語（persist.log と同じ枠。`tako migrate` の理由の
-                    // 日英は移行機構のスライス = Issue #2365 の表）
+                    // 移行の記録の理由は日英の対（`tako migrate status` は表示言語・persist.log は日本語。#2365）
                     Err(why) => FileOutcome::Failed {
-                        reason: format!(
-                            "{}。default を継承できないので作らない",
-                            why.text_in(tako_core::i18n::Lang::Ja)
-                        ),
+                        reason: MigrateReason::ProfileBaseUnreadable(why.clone()).reason(),
                     },
                 };
                 Some(FileReport {
@@ -1074,19 +1135,19 @@ fn project_profile_reports(mode: Mode) -> Vec<FileReport> {
             // 既にある = 揃っている（記録に出さない。毎回 N 行増えるのを避ける）
             orchestrator::ProfileGen::Exists(_) => None,
             // 継承元を読めない（#1825）も同じく「中止」として記録へ残す（persist.log と通知）。
-            // 移行の記録の理由は日本語（`tako migrate` の理由の日英は移行機構のスライス = #2365 の表）
+            // 移行の記録の理由は日英の対（`tako migrate status` は表示言語・persist.log は日本語。#2365）
             orchestrator::ProfileGen::Skipped { reason } => Some(FileReport {
                 id: SchemaId::Profiles,
                 path: PathBuf::from(format!("{key}.yaml")),
                 outcome: FileOutcome::Failed {
-                    reason: reason.text_in(tako_core::i18n::Lang::Ja),
+                    reason: OutcomeReason::of(|lang| reason.text_in(lang)),
                 },
             }),
             orchestrator::ProfileGen::NotInherited { reason } => Some(FileReport {
                 id: SchemaId::Profiles,
                 path: PathBuf::from(format!("{key}.yaml")),
                 outcome: FileOutcome::Failed {
-                    reason: reason.text_in(tako_core::i18n::Lang::Ja),
+                    reason: OutcomeReason::of(|lang| reason.text_in(lang)),
                 },
             }),
         })
@@ -1153,21 +1214,21 @@ fn handoff_reports(mode: Mode) -> Vec<FileReport> {
     for (profile, path, old) in before {
         let now = std::fs::read_to_string(&path).ok();
         let outcome = outcomes.iter().find(|o| o.profile == profile);
-        // 移行の記録は日本語の枠（`FileOutcome::Failed`）なので理由も日本語で組む（#2365）
-        let warnings: Vec<String> = outcome
-            .map(|o| {
-                o.warnings
-                    .iter()
-                    .map(|w| w.text_in(tako_core::i18n::Lang::Ja))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // 移行の記録の理由は日英の対（`tako migrate status` は表示言語・persist.log は日本語。#2365）
+        let warnings: &[crate::ReplyNote] =
+            outcome.map(|o| o.warnings.as_slice()).unwrap_or_default();
         if !warnings.is_empty() {
             reports.push(FileReport {
                 id: SchemaId::Handoff,
                 path,
                 outcome: FileOutcome::Failed {
-                    reason: warnings.join(" / "),
+                    reason: OutcomeReason::of(|lang| {
+                        warnings
+                            .iter()
+                            .map(|w| w.text_in(lang))
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    }),
                 },
             });
             continue;
@@ -1208,7 +1269,7 @@ fn setup_reports(mode: Mode) -> Vec<FileReport> {
     // ディレクトリのような失敗も、見るだけの `status` の段で人へ出る）
     match crate::setup::relocate_setup_dir(&from, &to, mode == Mode::Apply) {
         Ok(done) => vec![setup_migrated(&done.to, done.backup)],
-        Err(reason) => vec![setup_failed(&to, reason)],
+        Err(e) => vec![setup_failed(&to, OutcomeReason::of(|lang| e.text_in(lang)))],
     }
 }
 
@@ -1228,7 +1289,7 @@ fn setup_migrated(to: &Path, backup: PathBuf) -> FileReport {
 }
 
 /// 移設に失敗したときの記録。**旧い場所はそのまま残る**ので次回また試される
-fn setup_failed(to: &Path, reason: String) -> FileReport {
+fn setup_failed(to: &Path, reason: OutcomeReason) -> FileReport {
     FileReport {
         id: SchemaId::Setup,
         path: to.to_path_buf(),
@@ -1272,13 +1333,18 @@ fn powershell_profile_reports_for(
             let outcome = if mode == Mode::Check {
                 migrated
             } else {
-                match tako_core::shell_integration::strip_legacy_block(&block.path, Some(&backup)) {
+                match tako_core::shell_integration::strip_legacy_block_typed(
+                    &block.path,
+                    Some(&backup),
+                ) {
                     Ok(tako_core::shell_integration::ChangeKind::Absent) => {
                         // 見てから書き換えるまでの間に別の発火点が済ませた
                         FileOutcome::UpToDate { version: 2 }
                     }
                     Ok(_) => migrated,
-                    Err(reason) => FileOutcome::Failed { reason },
+                    Err(e) => FileOutcome::Failed {
+                        reason: OutcomeReason::of(|lang| e.text_in(lang)),
+                    },
                 }
             };
             FileReport {
@@ -1344,8 +1410,8 @@ fn webview2_reports_for(legacy: Vec<PathBuf>, to: &Path, mode: Mode) -> Vec<File
                     backup,
                     applied: vec![WEBVIEW2_DATA_SET_ASIDE],
                 },
-                Err(reason) => FileOutcome::Failed {
-                    reason: reason.to_string(),
+                Err(e) => FileOutcome::Failed {
+                    reason: OutcomeReason::of(|lang| e.text_in(lang)),
                 },
             };
             FileReport {
@@ -1499,17 +1565,21 @@ pub fn setup_lines() -> Vec<String> {
                 }
                 lines.push(format!("旧内容の退避先: {}", backup.display()));
             }
+            // 枠が日本語の固定文なので、理由も日本語のまま載せる（#2365 より前とバイト一致。
+            // `tako setup` の行の日英は Issue #2365 の表の残り）
             FileOutcome::Unreadable {
                 quarantine, reason, ..
             } => lines.push(match quarantine {
                 Some(dest) => format!(
-                    "{} は読めなかったので {} へ退避しました（{reason}）",
+                    "{} は読めなかったので {} へ退避しました（{}）",
                     file.path.display(),
-                    dest.display()
+                    dest.display(),
+                    reason.ja()
                 ),
                 None => format!(
-                    "{} は読めないので既定値で動きます（{reason}）",
-                    file.path.display()
+                    "{} は読めないので既定値で動きます（{}）",
+                    file.path.display(),
+                    reason.ja()
                 ),
             }),
             FileOutcome::Created { reason } => lines.push(format!(
@@ -1518,7 +1588,7 @@ pub fn setup_lines() -> Vec<String> {
                 reason.text()
             )),
             FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
-                lines.push(format!("{}: {reason}", file.path.display()))
+                lines.push(format!("{}: {}", file.path.display(), reason.ja()))
             }
             // 案（#1981）は自動の発火点では出ない・書かない
             FileOutcome::Absent | FileOutcome::UpToDate { .. } | FileOutcome::Proposed { .. } => {}
@@ -1641,7 +1711,8 @@ fn file_json(file: &FileReport, did_apply: bool) -> serde_json::Value {
             if *evicted {
                 map.insert("quarantine_evicted".into(), true.into());
             }
-            map.insert("reason".into(), reason.clone().into());
+            // 理由は表示言語（persist.log の行は日本語 = `record`。#2365）
+            map.insert("reason".into(), reason.text().into());
         }
         FileOutcome::Proposed { proposal } => {
             map.insert("proposal".into(), proposal.text().into());
@@ -1655,7 +1726,7 @@ fn file_json(file: &FileReport, did_apply: bool) -> serde_json::Value {
             }
         }
         FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
-            map.insert("reason".into(), reason.clone().into());
+            map.insert("reason".into(), reason.text().into());
         }
         FileOutcome::Absent => {}
     }
@@ -1687,14 +1758,15 @@ fn record(report: &MigrationReport, origin: &str) {
             } => crate::diag::persist_log(&unreadable_line(
                 file.id,
                 &file.path,
-                reason,
+                // 診断ログは日本語（#2365 より前とバイト一致）
+                reason.ja(),
                 quarantine.as_deref(),
                 *evicted,
                 "退避しない種別",
                 origin,
             )),
             FileOutcome::Refused { reason } | FileOutcome::Failed { reason } => {
-                crate::diag::persist_log(&aborted_line(file.id, &file.path, reason, origin))
+                crate::diag::persist_log(&aborted_line(file.id, &file.path, reason.ja(), origin))
             }
             // 案（#1981）は自動の発火点では出ない・書かない
             FileOutcome::Absent | FileOutcome::UpToDate { .. } | FileOutcome::Proposed { .. } => {}
@@ -1770,7 +1842,11 @@ mod tests {
     fn 登録簿の手順は目標まで繋がる() {
         for spec in SPECS {
             migration::plan(1, spec.target_version, spec.steps).unwrap_or_else(|e| {
-                panic!("{} の手順が繋がらない: {}", spec.id.as_str(), e.message())
+                panic!(
+                    "{} の手順が繋がらない: {}",
+                    spec.id.as_str(),
+                    e.text_in(Lang::Ja)
+                )
             });
         }
     }
@@ -2140,7 +2216,7 @@ mod tests {
         assert_eq!(done["steps"][0], SETUP_V1_TO_V2.text());
 
         // 失敗は「人が気にするべき状態」として出す（黙って成功にしない）
-        let failed = setup_failed(&to, "退避に失敗".into());
+        let failed = setup_failed(&to, OutcomeReason::new("退避に失敗", "archive failed"));
         assert!(failed.outcome.needs_attention());
         assert_eq!(file_json(&failed, true)["state"], "failed");
     }
@@ -2361,7 +2437,7 @@ mod tests {
         let done = webview2_reports_for(vec![from.clone()], &to, Mode::Apply);
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
-            matches!(&done[0].outcome, FileOutcome::Failed { reason } if reason.contains("WebView2")),
+            matches!(&done[0].outcome, FileOutcome::Failed { reason } if reason.ja().contains("WebView2") && reason.en().contains("WebView2")),
             "{done:?}"
         );
         assert!(done[0].outcome.needs_attention());

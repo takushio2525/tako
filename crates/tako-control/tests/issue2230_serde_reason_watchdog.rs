@@ -185,15 +185,16 @@ const ALLOWED: &[Allow] = &[
 
 /// persist.log へ流れる主な口と、そこで呼ぶべき関数（関数ごと差し替える回帰を止める）
 const FUNNELS: &[(&str, &str, &str)] = &[
+    // 移行の記録の理由は日英の対（#2365。中身は種類と位置だけ = 同じ口の型）
     (
         "crates/tako-control/src/migrations.rs",
         "fn json_ok<",
-        "load_issue::json_error_reason(",
+        "JsonReason::of(",
     ),
     (
         "crates/tako-control/src/migrations.rs",
         "fn yaml_ok<",
-        "load_issue::yaml_error_reason(",
+        "YamlReason::of(",
     ),
     (
         "crates/tako-control/src/settings.rs",
@@ -570,16 +571,17 @@ fn 本物の口へ植えた回帰を名指せる() {
     let base = sources();
     // (注入先, 注入元, 注入後, 注入後のうち違反として名指されるべき所)
     for (file, from, to, marker) in [
+        // 移行の検査の口（#2365 で理由が日英の対 = `JsonReason::of` / `YamlReason::of` になった）
         (
             "crates/tako-control/src/migrations.rs",
-            ".map_err(|e| tako_core::load_issue::json_error_reason(&e))",
-            ".map_err(|e| e.to_string())",
+            "let reason = JsonReason::of(&e);",
+            "let reason = e.to_string();",
             "e.to_string()",
         ),
         (
             "crates/tako-control/src/migrations.rs",
-            ".map_err(|e| tako_core::load_issue::yaml_error_reason(&e, text))",
-            ".map_err(|e| format!(\"{e:?}\"))",
+            "let reason = YamlReason::of(&e, text);",
+            "let reason = format!(\"{e:?}\");",
             "{e:?}",
         ),
         (
@@ -595,11 +597,12 @@ fn 本物の口へ植えた回帰を名指せる() {
             "e.to_string()",
         ),
         // rustfmt が折った位置引数（`"…{}",\n e\n)`）も拾う（#2365 で projects.yaml・ledger.yaml・workers.yaml の
-        // 口が型の断りへ移ったので、同じ形の残る設定の移行（projects.yaml の読み直し）の口へ植える）
+        // 口と移行の記録の理由（projects.yaml の読み直し）が型の断りへ移ったので、同じ形の残る
+        // `.claude.json` の承認の印の口へ植える）
         (
-            "crates/tako-control/src/migrations.rs",
-            "\"projects.yaml として読めない: {}\",\n                tako_core::load_issue::yaml_error_reason(&e, text)",
-            "\"projects.yaml として読めない: {}\",\n                e",
+            "crates/tako-control/src/claude_tui.rs",
+            "path.display(),\n                tako_core::load_issue::json_error_reason(&e)\n            )",
+            "path.display(),\n                e\n            )",
             "\n                e",
         ),
     ] {

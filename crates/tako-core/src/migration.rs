@@ -42,6 +42,7 @@
 //! **[`SchemaSpec::detect`] は「そのファイルが今どの世代か」を内容から答える**関数で、
 //! 版数フィールドを持つ形式ならそれを読み、持たない形式なら構造の特徴で見分ける。
 
+use crate::i18n::Lang;
 use crate::platform::support::Note;
 use std::path::{Path, PathBuf};
 
@@ -222,8 +223,8 @@ pub struct Step {
     pub to: u32,
     /// 何をするか（日英。CLI / MCP / ログが同じ文言を使う）
     pub describe: Note,
-    /// 変換本体。`Ok(None)` = 変えるものが無かった（既に新形式）
-    pub apply: fn(&str) -> Result<Option<String>, String>,
+    /// 変換本体。`Ok(None)` = 変えるものが無かった（既に新形式）。失敗の理由は日英の対（#2365）
+    pub apply: fn(&str) -> Result<Option<String>, OutcomeReason>,
     /// **一度だけ**当てる手順か。
     ///
     /// 既定は false = 内容が旧形式なら何度でも直す（構造の移行はこれでよい）。
@@ -235,8 +236,8 @@ pub struct Step {
     pub once: bool,
 }
 
-/// 「今の形式として読めるか」を確かめる関数の型
-pub type Validator = fn(&str) -> Result<(), String>;
+/// 「今の形式として読めるか」を確かめる関数の型（読めない理由は日英の対。#2365）
+pub type Validator = fn(&str) -> Result<(), OutcomeReason>;
 
 /// ファイル種別ごとの登録内容
 #[derive(Debug, Clone, Copy)]
@@ -330,22 +331,172 @@ pub enum PlanError {
 }
 
 impl PlanError {
-    pub fn message(&self) -> String {
-        match self {
-            Self::FromFuture { current, target } => format!(
+    /// 表示言語を明示しての文言（#2365）。(バリアント, 言語) の網羅 match で、日本語は
+    /// #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::FromFuture { current, target }, Ja) => format!(
                 "ファイルの形式（v{current}）が この tako が知る形式（v{target}）より新しい。tako を更新してください"
             ),
-            Self::MissingStep { from, target } => {
+            (Self::FromFuture { current, target }, En) => format!(
+                "the file format (v{current}) is newer than the format this tako knows (v{target}). \
+                 Update tako"
+            ),
+            (Self::MissingStep { from, target }, Ja) => {
                 format!("v{from} から v{target} へ進む移行手順が登録されていない")
             }
-            Self::NotAdvancing { from, to } => {
+            (Self::MissingStep { from, target }, En) => {
+                format!("no migration step is registered to go from v{from} to v{target}")
+            }
+            (Self::NotAdvancing { from, to }, Ja) => {
                 format!("移行手順の版数が進んでいない（v{from} -> v{to}）")
             }
-            Self::Overshoot { reached, target } => {
+            (Self::NotAdvancing { from, to }, En) => {
+                format!("a migration step does not advance the version (v{from} -> v{to})")
+            }
+            (Self::Overshoot { reached, target }, Ja) => {
                 format!("移行手順が v{reached} で止まり目標 v{target} に届かない")
             }
-            Self::Cycle => "移行手順が循環している".to_string(),
+            (Self::Overshoot { reached, target }, En) => format!(
+                "the migration steps stop at v{reached} and do not reach the target v{target}"
+            ),
+            (Self::Cycle, Ja) => "移行手順が循環している".to_string(),
+            (Self::Cycle, En) => "the migration steps form a cycle".to_string(),
         }
+    }
+}
+
+/// 移行の記録の理由（[`FileOutcome::Unreadable`] / [`FileOutcome::Refused`] /
+/// [`FileOutcome::Failed`]。#2365）。
+///
+/// 理由は tako-core（読み書き = [`FileFailure`]・登録の壊れ方 = [`PlanError`]）と tako-control
+/// （各ファイルの検査・手順・置き場の移設・#1453 / #915 の記録）の両方が作るので、作る側が
+/// 型の `text_in` で**日英の両方を組んで**持たせる（[`Proposal`] と同じ）。`tako migrate status` /
+/// MCP `tako_migrate` の `reason` は表示言語（[`Self::text`]）、persist.log と `tako setup` の行は
+/// 日本語（[`Self::ja`]。#2365 より前とバイト一致）。`Display` は持たせない（どちらの言語で
+/// 載せるかを呼び手が選ぶ）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutcomeReason {
+    ja: String,
+    en: String,
+}
+
+impl OutcomeReason {
+    pub fn new(ja: impl Into<String>, en: impl Into<String>) -> Self {
+        Self {
+            ja: ja.into(),
+            en: en.into(),
+        }
+    }
+
+    /// 型の文から日英を組む（`text_in` を両方の言語で引く）
+    pub fn of(text_in: impl Fn(Lang) -> String) -> Self {
+        Self::new(text_in(Lang::Ja), text_in(Lang::En))
+    }
+
+    /// 日英で同じ文（外から来た文 = OS のエラー文・`TAKO_2230_LEGACY=1` の serde の素の文言）
+    pub fn verbatim(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            ja: text.clone(),
+            en: text,
+        }
+    }
+
+    /// 日本語（persist.log・`tako setup` の行）
+    pub fn ja(&self) -> &str {
+        &self.ja
+    }
+
+    pub fn en(&self) -> &str {
+        &self.en
+    }
+
+    pub fn text_in(&self, lang: Lang) -> &str {
+        match lang {
+            Lang::Ja => &self.ja,
+            Lang::En => &self.en,
+        }
+    }
+
+    /// 現在の表示言語での文（`tako migrate status` / MCP の `reason`）
+    pub fn text(&self) -> &str {
+        self.text_in(crate::i18n::lang())
+    }
+
+    /// [`MigrationIo::write`] の実装が型の断りを tako-core へ渡す口（`io::Error` に載せる。
+    /// `io::Error` としての文は日本語 = 従来の書き手の文と同じ）
+    pub fn into_io_error(self) -> std::io::Error {
+        std::io::Error::other(IoReason(self))
+    }
+
+    /// `io::Error` から理由を取り出す（[`Self::into_io_error`] で載せた日英の対。載っていなければ
+    /// OS の文をそのまま = 日英同じ）
+    pub fn from_io(e: &std::io::Error) -> Self {
+        e.get_ref()
+            .and_then(|inner| inner.downcast_ref::<IoReason>())
+            .map(|r| r.0.clone())
+            .unwrap_or_else(|| Self::verbatim(e.to_string()))
+    }
+}
+
+/// [`OutcomeReason`] を `io::Error` に載せる包み（`Display` は日本語）
+#[derive(Debug)]
+struct IoReason(OutcomeReason);
+
+impl std::fmt::Display for IoReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.ja())
+    }
+}
+
+impl std::error::Error for IoReason {}
+
+/// 読み書きの失敗（[`migrate_file`] と [`write_with_backup`] が組む理由。#2365）。
+/// `cause` は OS の文か、書き手（tako-control の `config_io`）が載せた日英の対
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileFailure {
+    /// 読み取りに失敗
+    Read(OutcomeReason),
+    /// 先に取る旧内容の退避に失敗したので書かない（`backup` は退避先）
+    BackupFailed {
+        backup: String,
+        cause: OutcomeReason,
+    },
+    /// 書き込みに失敗（旧内容は `backup` に残る）
+    WriteFailed {
+        backup: String,
+        cause: OutcomeReason,
+    },
+}
+
+impl FileFailure {
+    /// (バリアント, 言語) の網羅 match。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Read(cause), Ja) => format!("読み取りに失敗: {}", cause.ja()),
+            (Self::Read(cause), En) => format!("failed to read: {}", cause.en()),
+            (Self::BackupFailed { backup, cause }, Ja) => {
+                format!("退避に失敗したので移行しない ({backup}): {}", cause.ja())
+            }
+            (Self::BackupFailed { backup, cause }, En) => format!(
+                "not migrated because the old contents could not be backed up ({backup}): {}",
+                cause.en()
+            ),
+            (Self::WriteFailed { backup, cause }, Ja) => {
+                format!("書き込みに失敗: {}（旧内容は {backup} に残る）", cause.ja())
+            }
+            (Self::WriteFailed { backup, cause }, En) => format!(
+                "failed to write: {} (the old contents are kept in {backup})",
+                cause.en()
+            ),
+        }
+    }
+
+    pub fn reason(&self) -> OutcomeReason {
+        OutcomeReason::of(|lang| self.text_in(lang))
     }
 }
 
@@ -377,16 +528,16 @@ pub enum FileOutcome {
     /// `evicted` は退避が上限に達していたので最も古い 1 本を押し出したか（#1819）
     Unreadable {
         quarantine: Option<PathBuf>,
-        reason: String,
+        reason: OutcomeReason,
         evicted: bool,
     },
     /// 自動では当てない書き換えの**案**（#1981）。`tako migrate status` にだけ出し、
     /// 明示の `tako migrate run` で当てる（発火点 = setup / 起動時の報告には載らない）
     Proposed { proposal: Proposal },
     /// 登録の壊れ方が判明したので触らなかった
-    Refused { reason: String },
+    Refused { reason: OutcomeReason },
     /// 移行しようとして失敗した（元のファイルは無傷）
-    Failed { reason: String },
+    Failed { reason: OutcomeReason },
 }
 
 impl FileOutcome {
@@ -686,17 +837,31 @@ pub fn migrate_text_with(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MigrateTextError {
     Plan(PlanError),
-    Step { from: u32, to: u32, reason: String },
+    Step {
+        from: u32,
+        to: u32,
+        reason: OutcomeReason,
+    },
 }
 
 impl MigrateTextError {
-    pub fn message(&self) -> String {
-        match self {
-            Self::Plan(e) => e.message(),
-            Self::Step { from, to, reason } => {
-                format!("v{from} -> v{to} の移行に失敗: {reason}")
+    /// (バリアント, 言語) の網羅 match。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Plan(e), _) => e.text_in(lang),
+            (Self::Step { from, to, reason }, Ja) => {
+                format!("v{from} -> v{to} の移行に失敗: {}", reason.ja())
+            }
+            (Self::Step { from, to, reason }, En) => {
+                format!("migrating v{from} -> v{to} failed: {}", reason.en())
             }
         }
+    }
+
+    /// 移行の記録の理由（日英の対）
+    pub fn reason(&self) -> OutcomeReason {
+        OutcomeReason::of(|lang| self.text_in(lang))
     }
 
     /// 登録の壊れ方（= 触らずに拒否すべき）か、変換の失敗か
@@ -767,7 +932,7 @@ fn migrate_file_outcome(spec: &SchemaSpec, path: &Path, io: &dyn MigrationIo) ->
         Ok(None) => return FileOutcome::Absent,
         Err(e) => {
             return FileOutcome::Failed {
-                reason: format!("読み取りに失敗: {e}"),
+                reason: FileFailure::Read(OutcomeReason::from_io(&e)).reason(),
             }
         }
     };
@@ -804,16 +969,8 @@ fn migrate_file_outcome(spec: &SchemaSpec, path: &Path, io: &dyn MigrationIo) ->
                 version: (spec.detect)(&text),
             }
         }
-        Err(e) if e.is_plan_error() => {
-            return FileOutcome::Refused {
-                reason: e.message(),
-            }
-        }
-        Err(e) => {
-            return FileOutcome::Failed {
-                reason: e.message(),
-            }
-        }
+        Err(e) if e.is_plan_error() => return FileOutcome::Refused { reason: e.reason() },
+        Err(e) => return FileOutcome::Failed { reason: e.reason() },
     };
     let (body, from, applied) = migrated;
     match write_with_backup(path, &text, &body, from, io) {
@@ -837,22 +994,24 @@ pub fn write_with_backup(
     new: &str,
     from: u32,
     io: &dyn MigrationIo,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, OutcomeReason> {
     let backup = backup_path(path, from);
     // 退避が取れないなら書かない（旧内容を失う経路を作らない）
     if !io.exists(&backup) {
         if let Err(e) = io.write(&backup, old) {
-            return Err(format!(
-                "退避に失敗したので移行しない ({}): {e}",
-                backup.display()
-            ));
+            return Err(FileFailure::BackupFailed {
+                backup: backup.display().to_string(),
+                cause: OutcomeReason::from_io(&e),
+            }
+            .reason());
         }
     }
     if let Err(e) = io.write(path, new) {
-        return Err(format!(
-            "書き込みに失敗: {e}（旧内容は {} に残る）",
-            backup.display()
-        ));
+        return Err(FileFailure::WriteFailed {
+            backup: backup.display().to_string(),
+            cause: OutcomeReason::from_io(&e),
+        }
+        .reason());
     }
     Ok(backup)
 }
@@ -998,22 +1157,22 @@ mod tests {
         1
     }
 
-    fn add_a(text: &str) -> Result<Option<String>, String> {
+    fn add_a(text: &str) -> Result<Option<String>, OutcomeReason> {
         if text.contains('a') {
             return Ok(None);
         }
         Ok(Some(format!("{text}a")))
     }
 
-    fn add_b(text: &str) -> Result<Option<String>, String> {
+    fn add_b(text: &str) -> Result<Option<String>, OutcomeReason> {
         if text.contains('b') {
             return Ok(None);
         }
         Ok(Some(format!("{text}b")))
     }
 
-    fn fail(_: &str) -> Result<Option<String>, String> {
-        Err("こわれた".into())
+    fn fail(_: &str) -> Result<Option<String>, OutcomeReason> {
+        Err(OutcomeReason::new("こわれた", "broken"))
     }
 
     const STEPS: &[Step] = &[
@@ -1162,7 +1321,13 @@ mod tests {
         };
         let err = migrate_text(&spec, "x").expect_err("失敗する");
         assert!(!err.is_plan_error());
-        assert!(err.message().contains("こわれた"), "{}", err.message());
+        assert!(
+            err.text_in(Lang::Ja).contains("こわれた"),
+            "{}",
+            err.text_in(Lang::Ja)
+        );
+        // 手順の理由は枠と同じ言語で載る（#2365）
+        assert_eq!(err.text_in(Lang::En), "migrating v1 -> v2 failed: broken");
     }
 
     #[test]
@@ -1211,7 +1376,7 @@ mod tests {
             path: PathBuf::from("/tmp/recent.json"),
             outcome: FileOutcome::Unreadable {
                 quarantine: Some(PathBuf::from("/tmp/recent.json.unreadable.bak")),
-                reason: "壊れている".into(),
+                reason: OutcomeReason::verbatim("壊れている"),
                 evicted: false,
             },
         });
@@ -1669,8 +1834,11 @@ mod tests {
 
     #[test]
     fn 読めない内容は移行せず退避して申告する() {
-        fn reject(_: &str) -> Result<(), String> {
-            Err("JSON として読めない".into())
+        fn reject(_: &str) -> Result<(), OutcomeReason> {
+            Err(OutcomeReason::new(
+                "JSON として読めない",
+                "not readable as JSON",
+            ))
         }
         const SPEC: SchemaSpec = SchemaSpec {
             id: SchemaId::Settings,
@@ -1689,7 +1857,7 @@ mod tests {
             FileOutcome::Unreadable {
                 quarantine, reason, ..
             } => {
-                assert!(reason.contains("JSON"), "{reason}");
+                assert!(reason.ja().contains("JSON"), "{reason:?}");
                 let quarantine = quarantine.as_ref().expect("退避される種別");
                 assert_eq!(
                     std::fs::read_to_string(quarantine).expect("読める"),

@@ -2562,13 +2562,16 @@ pub fn detect_version(text: &str) -> u32 {
 }
 
 /// 今の形として読めるか（移行の `validate`）。新しい形は通す（移行の計画が「目標超過」で断る）。
-/// 理由は日本語で返す（移行の申告 = `tako migrate` と persist.log の文はほかの種別も日本語。#2365）
-pub fn validate_text(text: &str) -> Result<(), String> {
+/// 理由は日英の対で返す（`tako migrate status` の `reason` は表示言語・persist.log は日本語。#2365）
+pub fn validate_text(text: &str) -> Result<(), crate::migration::OutcomeReason> {
     let parsed = parse_lenient(text);
     if parsed.is_future() || parsed.problems.is_empty() {
         Ok(())
     } else {
-        Err(join_problems(&parsed.problems, crate::i18n::Lang::Ja))
+        // 移行の記録の理由は日英の対（`tako migrate status` は表示言語・persist.log は日本語。#2365）
+        Err(crate::migration::OutcomeReason::of(|lang| {
+            join_problems(&parsed.problems, lang)
+        }))
     }
 }
 
