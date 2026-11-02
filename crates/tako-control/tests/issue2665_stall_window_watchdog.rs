@@ -149,6 +149,7 @@ fn 期限より前に終わった区間は旧の窓では専有_新しい窓で�
         Duration::ZERO,
         None,
         DelaySpans::summarize(spans, deadline),
+        None,
     );
     assert!(!new.names_tako(), "{new:?}");
     assert!(new.text_in(Lang::Ja).contains("計測区間の外"));
@@ -179,6 +180,7 @@ fn 半分に届かなければ内訳と残りを書く() {
         Duration::ZERO,
         None,
         DelaySpans::summarize(spans, deadline),
+        None,
     );
     let ja = c.text_in(Lang::Ja);
     assert!(

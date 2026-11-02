@@ -6409,6 +6409,13 @@ impl TakoApp {
                     incoming.request,
                     tako_control::protocol::Request::WindowList
                 ));
+                // #2666: 検証専用の注入（`TAKO_2666_INJECT_FILE`）。画面構成の変更の通知を本物の
+                // コールバックの関数で合成し、その前後でメインスレッドを塞ぐ（蓋の開閉は検証で起こせない）
+                tako_control::diag::Issue2666Inject::for_request(matches!(
+                    incoming.request,
+                    tako_control::protocol::Request::WindowList
+                ))
+                .run(crate::platform::display_reconfig::synthesize);
                 inject_2665.block_out_of_span();
                 let outcome = this.update(cx, |app: &mut TakoApp, cx| {
                     // Issue #168: dispatch + 後処理（pending 消化 + save_layout）込みの
@@ -6798,6 +6805,10 @@ impl TakoApp {
         // #1968 / #2665: このループ自身が UI スレッドで走るので、塞いでいた区間はもう終わっている。
         // 分類はタイマーの期限から今まで（= 遅延の間）に重なった区間の、重なった分で行う
         // （1 周の判定の正本は `diag::stall_line`。スケジューラ遅延も毎周回そこで取り出す）
+        //
+        // #2666: 遅延の間に画面構成の変更（蓋の開閉・画面スリープでの macOS の画面再構成）が重なったら
+        // 分類が名指せるよう、OS の通知の時刻を diag へ渡す（登録はプロセスで 1 回・メインスレッドで）
+        crate::platform::display_reconfig::watch();
         cx.spawn(async move |this, cx| loop {
             let armed = std::time::Instant::now();
             let period = Duration::from_secs(1);
