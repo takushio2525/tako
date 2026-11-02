@@ -557,6 +557,14 @@ pub trait UiStateHost {
         None
     }
 
+    /// ペインに出ている起動待ちの帯（#2425）。帯が無ければ None。
+    ///
+    /// **GUI が描いている帯そのもの**（文は表示言語・受け付けなかった打鍵の数つき）を `list` に載せる。
+    /// 型の部分は `launch_gate::WaitBand::to_json` の 1 実装。既定は GUI が居ない host = 帯を描かない
+    fn launch_wait_band(&self, _pane: PaneId) -> Option<Value> {
+        None
+    }
+
     /// tmux の attach クライアントが外から終わったペインの再 attach の状態（#1857）。
     /// 一度も起きていないペインは None。`list` / `read` に載せる（GUI はヘッダに同じ状態を出す）。
     /// 形は `tako_core::backend_reattach::ReattachState::to_json` の 1 実装

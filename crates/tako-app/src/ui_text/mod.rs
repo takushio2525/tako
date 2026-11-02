@@ -30,6 +30,7 @@ pub mod command_card;
 pub mod common;
 pub mod dialog;
 pub mod drawer;
+pub mod launch_wait;
 pub mod menu;
 pub mod palette;
 pub mod pane_menu;
