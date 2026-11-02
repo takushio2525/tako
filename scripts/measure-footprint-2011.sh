@@ -14,6 +14,10 @@
 #     `tmux list-panes` / `capture-pane` はここに出る = #2018）
 #   - 描画回数（`tako redraw-limit`）: ペイン本体の描画 `body_renders` と出力起因の再描画の要求 `flushes`
 #   - 起動時間（起こしてから `tako list` が通るまで）・常駐スレッド数・子プロセス数
+#   - 起動の区間の混み具合（#2652）: 起こす直前と `tako list` が通った直後に本番の順番待ち
+#     （`tako queue --json`）を読み、実行中の本数と load1 の大きい方を `startup_busy` / `startup_load1` へ。
+#     重い処理（他の worker の cargo build / clippy）と重なった起動は 2 秒が 10 秒にもなる（11/02 の夜）ので、
+#     夜間の見張りはこの列で測り直す・比べないを決める。読めなければ「-」（記録なし）
 #
 # どのシナリオも「① 放置」と「② 出力中（表に 1 枚足し、1 行 10ms で出し続ける）」の 2 区間を測る。
 # **描画資源（IOSurface・… (graphics)）は描いている最中しか計上されない**（放置 40 秒ほどで外れる）ので、
@@ -31,6 +35,8 @@
 # 使い方: bash scripts/measure-footprint-2011.sh [シナリオ（既定 std）] [放置の秒（既定 60）]
 #   TAKO_FOOTPRINT_ENV="TAKO_2009_LEGACY=1"  起こす GUI へ足す env（A/B 用。空白区切り）
 #   TAKO_FOOTPRINT_OUT=<file>                結果の TSV を追記する先（既定は表示だけ）
+#   TAKO_FOOTPRINT_QUEUE_TAKO=<tako>         混み具合を読む tako（既定 /Applications/tako.app の tako → PATH の tako。
+#                                            テストは偽の tako を差し込む。#2652）
 #   TAKO_FOOTPRINT_STUB_CLAUDE=1             GUI の PATH の先頭へ「即座に [] を返す claude」を置く（#2018）。
 #                                            隔離 HOME には claude の台帳が無く #2017 の絞り込みが効かないので、
 #                                            器に子が居ると 30 秒ごとに `claude agents --json`（Node）が起き、
@@ -57,6 +63,18 @@ BOUNDS="${TAKO_FOOTPRINT_BOUNDS:-0,0,1600,1000}"
 TMP="$(mktemp -d /tmp/tako-fp-XXXXXX)"
 SOCK_NAME="tako-fp-$$"
 CAFF_PID=""
+# 起動の区間の混み具合を読む tako（#2652）。**測る側の CLI（$TAKO_BIN）は使わない**: 時計の前に起こすと
+# 建てたての実行ファイルの初回 exec の検査（CLI で約 0.5 秒）が時計の外へ出て、起動時間が基準と揃わない
+REAL_HOME="$HOME"
+QUEUE_TAKO="${TAKO_FOOTPRINT_QUEUE_TAKO:-}"
+if [ -z "$QUEUE_TAKO" ]; then
+  if [ -x /Applications/tako.app/Contents/MacOS/tako ]; then
+    QUEUE_TAKO=/Applications/tako.app/Contents/MacOS/tako
+  else
+    QUEUE_TAKO="$(command -v tako 2>/dev/null || true)"
+  fi
+fi
+FPW_PY="$REPO_ROOT/scripts/lib/footprint-watch.py"
 
 cleanup() {
   [ -n "$CAFF_PID" ] && kill "$CAFF_PID" 2>/dev/null
@@ -136,6 +154,23 @@ if ctypes.CDLL("/usr/lib/libSystem.B.dylib").proc_pidinfo(int(sys.argv[1]), 3, c
 print(b.sec * 1000 + b.usec // 1000)
 PY
 ru() { python3 "$TMP/ru.py" "$1"; }
+# 本番の順番待ちの混み具合を「実行中の本数 load1」で返す（#2652。読めなければ「- -」）。
+# 調停役は本番 GUI の中に 1 つなので、隔離の置き場・接続の env を落として HOME を本物へ戻して読む
+queue_busy() {
+  local out=""
+  if [ -n "$QUEUE_TAKO" ] && [ -x "$QUEUE_TAKO" ] && [ -f "$FPW_PY" ]; then
+    # tako:prod-ok 本番の順番待ちの混み具合を読むだけ（#2652。何も並べない・書かない）
+    out="$(env -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID -u TAKO_TAB_ID -u TAKO_MCP_URL -u TAKO_ORCHESTRATOR_ROLE -u TAKO_DATA_DIR -u TAKO_DISCOVERY_DIR -u TAKO_ORCHESTRATOR_DIR -u TAKO_ISOLATED -u TAKO_TMUX_SOCKET HOME="$REAL_HOME" "$QUEUE_TAKO" queue --json 2>/dev/null | python3 "$FPW_PY" queue-busy 2>/dev/null)"
+  fi
+  echo "${out:-- -}"
+}
+# 2 回の読みの大きい方（本数・load1 ごと。片方しか読めなければその値・両方読めなければ -）
+busy_merge() {
+  printf '%s\n%s\n' "$1" "$2" | awk '
+    $1 != "-" { if (!hb || $1 + 0 > b) b = $1 + 0; hb = 1 }
+    $2 != "-" { if (!hl || $2 + 0 > l) l = $2 + 0; hl = 1 }
+    END { printf "%s %s\n", (hb ? b : "-"), (hl ? sprintf("%.2f", l) : "-") }'
+}
 renders() { # body_renders と flushes（focused + unfocused）
   "$TAKO_BIN" redraw-limit 2>/dev/null | python3 -c '
 import json, sys
@@ -267,7 +302,7 @@ if [ "$STUB_CLAUDE" = 1 ]; then
   ENV_LABEL="$ENV_LABEL stub-claude"
 fi
 
-HEADER="scenario	mode	panes	front	back_tab	bg	previews	startup_ms	footprint_mb	malloc_mb	gfx_mb	other_mb	tmux_mb	threads	children	cpu_pct	child_cpu_pct	energy_mw	wakeups_s	body_renders_s	flushes_s	busy_footprint_mb	busy_malloc_mb	busy_gfx_mb	busy_cpu_pct	busy_child_cpu_pct	busy_energy_mw	busy_body_renders_s	busy_flushes_s	filled	drawn	lid	locked	env"
+HEADER="scenario	mode	panes	front	back_tab	bg	previews	startup_ms	footprint_mb	malloc_mb	gfx_mb	other_mb	tmux_mb	threads	children	cpu_pct	child_cpu_pct	energy_mw	wakeups_s	body_renders_s	flushes_s	busy_footprint_mb	busy_malloc_mb	busy_gfx_mb	busy_cpu_pct	busy_child_cpu_pct	busy_energy_mw	busy_body_renders_s	busy_flushes_s	filled	drawn	lid	locked	env	startup_busy	startup_load1"
 echo "$HEADER" > "$TMP/result.tsv"
 
 # 1 本ぶん: 起こす → 並べる → 放置して測る → 落とす
@@ -281,7 +316,9 @@ run_one() {
   mkdir -p "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR" "$TAKO_ORCHESTRATOR_DIR"
   tmux_socket_kill "$SOCK_NAME"
 
-  local t0 t1
+  local t0 t1 qb0 qb1 busy load
+  # 起動の区間の混み具合（#2652）: 起こす直前に 1 回（GUI の誕生 = 時計の始まりより前）
+  qb0="$(queue_busy)"
   # shellcheck disable=SC2086
   launch_isolated_gui "$TMP/app.log" TAKO_PERSIST=$persist $EXTRA_ENV ${STUB_PATH:+"PATH=$STUB_PATH"} || exit $?
   # 起動時間は「プロセスが生まれた時刻 → `tako list` が通った時刻」（仮想ディスプレイの用意の時間を含めない）
@@ -300,8 +337,12 @@ run_one() {
   [ -n "$TAKO_SOCKET" ] && [ -n "$TAKO_TOKEN" ] || { echo "隔離先の socket / token が空なので止める"; exit 1; }
   wait_isolated_gui "$TMP/app.log" 600 || exit 1
   t1="$(now_ms)"
+  # …と `tako list` が通った直後に 1 回（時計の外）。大きい方を行に残す
+  qb1="$(queue_busy)"
+  read -r busy load <<<"$(busy_merge "$qb0" "$qb1")"
   # 窓をどの面へ置いたか（persist.log の解決行）。夜間の見張り（#2023）が「tako-vd の上だけ」の証拠に残す
   echo "  窓: $(grep -m1 'ディスプレイ指定' "$TAKO_DATA_DIR/persist.log" 2>/dev/null | sed 's/^.*ディスプレイ指定/ディスプレイ指定/' || echo '解決行なし')"
+  echo "  起動の混み具合: 順番待ちの実行 ${busy} 本・load1 ${load}（起こす直前 ${qb0% *} 本・通った直後 ${qb1% *} 本）"
   # 隔離 GUI でも自動命名は claude を呼ぶので切る（memory: isolated-gui-autorename-calls-claude）
   "$TAKO_BIN" autorename off >/dev/null 2>&1 || true
 
@@ -371,11 +412,11 @@ run_one() {
   kill "$CAFF_PID" 2>/dev/null; CAFF_PID=""
 
   python3 - "$spec" "$mode" "$n" "$front" "$back_tab" "$bg" "$previews" "$((t1 - t0))" "$fp_idle" "$threads" "$children" \
-    "$r0" "$r1" "$b0" "$b1" "$fp_busy" "$q0" "$q1" "$s0" "$s1" "$IDLE" "$filled/$n" "$(lid_state)" "$(lock_state)" "$ENV_LABEL" \
+    "$r0" "$r1" "$b0" "$b1" "$fp_busy" "$q0" "$q1" "$s0" "$s1" "$IDLE" "$filled/$n" "$(lid_state)" "$(lock_state)" "$ENV_LABEL" "$busy" "$load" \
     >> "$TMP/result.tsv" <<'PY'
 import sys
 (spec, mode, n, front, back, bg, prev, startup, fp_idle, threads, children,
- r0, r1, b0, b1, fp_busy, q0, q1, s0, s1, secs, filled, lid, locked, env) = sys.argv[1:]
+ r0, r1, b0, b1, fp_busy, q0, q1, s0, s1, secs, filled, lid, locked, env, busy, load) = sys.argv[1:]
 secs = float(secs)
 def f(s): return [float(x) for x in s.split()]
 def rates(a, b, c, d):
@@ -391,7 +432,7 @@ drawn = "あり" if k["body"] > 0 else "なし"
 print("\t".join([spec, mode, n, front, back, bg, prev, startup] + fp_idle.split() + [threads, children,
       "%.2f" % i["cpu"], "%.2f" % i["child"], "%.1f" % i["energy"], "%.1f" % i["wake"], "%.2f" % i["body"], "%.2f" % i["flush"],
       bt, bm, bg_, "%.2f" % k["cpu"], "%.2f" % k["child"], "%.1f" % k["energy"], "%.1f" % k["body"], "%.1f" % k["flush"],
-      filled, drawn, lid, locked, env]))
+      filled, drawn, lid, locked, env, busy, load]))
 PY
   stop_isolated_gui "$ISOLATED_GUI_PID"; ISOLATED_GUI_PID=""
   tmux_socket_kill "$SOCK_NAME"

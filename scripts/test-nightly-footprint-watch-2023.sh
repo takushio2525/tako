@@ -15,8 +15,12 @@
 #   C. 夜間リリースのフック: 見張りは後始末とロックの解放の後・リリースの後に回り、
 #      見張りの結果（失敗・未実測・遅い）で夜間リリースの終了コードが変わらない /
 #      dry-run・多重起動・TAKO_NIGHTLY_FOOTPRINT=0 では回らない
+#   D. 起動の区間に重い処理が重なった夜（#2652。偽の `tako queue --json` を差し込む）: 空くのを待って
+#      新しく複製したバイナリで 1 回だけ測り直す / 測り直しても重なれば・空かなければ起動時間を比べず
+#      基準にも入れない / 重なった夜は後の夜の起動時間の基準を汚さない / A/B `TAKO_2652_LEGACY=1`
 #
-# ここが落ちるということは、夜の見張りが「鳴らない」「毎晩積む」「リリースを壊す」のどれかへ戻ったという意味。
+# ここが落ちるということは、夜の見張りが「鳴らない」「毎晩積む」「リリースを壊す」「重なった夜に鳴る」の
+# どれかへ戻ったという意味。
 # launchd と同じ /bin/bash（3.2）で走らせる。
 set -uo pipefail
 
@@ -226,6 +230,71 @@ judge_kv "$H" "$A/none" "$A/o11b"
 assert_eq "次の main の夜の基準は main の 3 回だけ" "3" "$(kv_of "$A/o11b" baseline_n)"
 assert_eq "前に測れたコミットにブランチを数えない" "k3" "$(kv_of "$A/o11b" prev_sha)"
 
+echo "A12: queue-busy は順番待ちの実行中の本数と load1 を読む（GUI に届かない応答は本数を -・自分の受付は数えない）"
+j='{"machine":{"load":[6.884,4.6,3.4]},"queue":{"running":[{"id":11,"label":"cargo clippy"},{"id":12,"label":"cargo test"}]}}'
+assert_eq "実行 2 本・load1" "2 6.88" "$(printf '%s' "$j" | python3 "$PY" queue-busy)"
+assert_eq "実行 0 本" "0 3.00" "$(printf '%s' '{"machine":{"load":[3,2,1]},"queue":{"running":[]}}' | python3 "$PY" queue-busy)"
+assert_eq "GUI に届かない応答（queue なし）は本数を -" "- 1.50" "$(printf '%s' '{"gui":false,"machine":{"load":[1.5,1,1]}}' | python3 "$PY" queue-busy)"
+assert_eq "JSON でなければ - -" "- -" "$(printf 'oops' | python3 "$PY" queue-busy)"
+mine="{\"machine\":{\"load\":[2,2,2]},\"queue\":{\"running\":[{\"id\":$$,\"label\":\"bash scripts/measure-footprint-2011.sh\"},{\"id\":12,\"label\":\"cargo build\"}]}}"
+assert_eq "自分の祖先の受付（tako queue bash … で測るとき）は数えない" "1 2.00" "$(printf '%s' "$mine" | python3 "$PY" queue-busy)"
+
+echo "A13: 起動の区間に重なった夜（startup_busy ≥ 1）は起動時間を比べず、起動時間の基準にも入れない"
+H="$A/h13.tsv"
+add_row "$H" "2026-10-10 05:30" m1 ok startup_busy=0 startup_load1=3.00
+add_row "$H" "2026-10-11 05:30" m2 ok
+add_row "$H" "2026-10-12 05:30" m3 ok startup_busy=0
+add_row "$H" "2026-10-13 05:30" m4 ok startup_ms=10896 startup_busy=2 startup_load1=12.50
+judge_kv "$H" "$A/none" "$A/o13"
+assert_eq "11/02 の形（起動 10.9 秒・重なり 2 本）は clean" "clean" "$(kv_of "$A/o13" verdict)"
+assert_contains "起動時間は比べないと出る" "$(cat "$A/o13/lines")" "起動時間: 10896 ms（起動の区間に重い処理が重なった夜なので比べない・順番待ちの実行 2 本・load1 12.50）"
+TAKO_2652_LEGACY=1 judge_kv "$H" "$A/none" "$A/o13l"
+assert_eq "A/B TAKO_2652_LEGACY=1 は前の判定（起動時間の悪化）" "startup_ms" "$(kv_of "$A/o13l" metrics)"
+add_row "$H" "2026-10-14 05:30" m5 ok startup_ms=9000 startup_busy=1
+add_row "$H" "2026-10-15 05:30" m6 ok startup_ms=9000 startup_busy=1
+add_row "$H" "2026-10-16 05:30" m7 ok startup_ms=1950 startup_busy=0
+judge_kv "$H" "$A/none" "$A/o13b"
+# 重なった 3 晩を外した基準は 900 ms（上限 1900）。外さなければ直近 5 回の中央値 9000 ms で鳴らない
+assert_eq "重なった夜を外した基準で後の夜を比べる（+1 秒を超えたら鳴る）" "startup_ms" "$(kv_of "$A/o13b" metrics)"
+assert_contains "基準は重ならなかった夜の 900 ms" "$(cat "$A/o13b/lines")" "起動時間: 1950 ms（基準 900・上限 1900） 悪化"
+TAKO_2652_LEGACY=1 judge_kv "$H" "$A/none" "$A/o13c"
+assert_eq "A/B は重なった夜も基準に混ぜる（中央値 9000 ms で鳴らない）" "clean" "$(kv_of "$A/o13c" verdict)"
+assert_eq "ほかの項目の基準は重なった夜も含む（直近 5 回）" "5" "$(kv_of "$A/o13b" baseline_n)"
+
+echo "A14: 列を足す前の行（startup_busy が無い）は「記録なし」= 重なっていない夜として読む"
+H="$A/h14.tsv"
+ncols="$(printf '%s\n' "$HEADER" | tr '\t' '\n' | grep -c .)"
+row="$TMP_ROOT/row-old.tsv"
+for i in 1 2 3; do
+  fake_row | cut -f1-$((ncols - 2)) > "$row"
+  python3 "$PY" record --history "$H" --date "2026-10-1$i 05:30" --sha q$i --status ok --elapsed 160 --row "$row"
+done
+assert_not_contains "旧い行だけの履歴に startup_busy の列は無い" "$(head -1 "$H")" "startup_busy"
+add_row "$H" "2026-10-14 05:30" q4 ok startup_ms=1950 startup_busy=0
+assert_eq "旧い行の新しい列は -（記録なし）" "-" "$(sed -n 2p "$H" | awk -F'\t' '{print $NF}')"
+judge_kv "$H" "$A/none" "$A/o14"
+assert_eq "旧い行は起動時間の基準に入る（基準 900 ms で +1 秒超えを拾う）" "startup_ms" "$(kv_of "$A/o14" metrics)"
+
+echo "A15: 計測スクリプトは起こす直前と tako list が通った直後に本番の順番待ちを読む（測る側の CLI では読まない）"
+MF="$REPO_ROOT/scripts/measure-footprint-2011.sh"
+MF_REL="scripts/measure-footprint-2011.sh"
+line_of() { grep -nF -- "$1" "$MF" | head -1 | cut -d: -f1; }
+ro_from="$(line_of 'run_one() {')"
+ro_to="$(awk -v s="$ro_from" 'NR > s && /^}/ { print NR; exit }' "$MF")"
+in_run_one() { [ -n "$1" ] && [ "$1" -gt "$ro_from" ] && [ "$1" -lt "$ro_to" ]; }
+l_q0="$(line_of 'qb0="$(queue_busy)"')"
+l_launch="$(line_of 'launch_isolated_gui "$TMP/app.log"')"
+l_t1="$(line_of 't1="$(now_ms)"')"
+l_q1="$(line_of 'qb1="$(queue_busy)"')"
+if in_run_one "$l_q0" && in_run_one "$l_launch" && [ "$l_q0" -lt "$l_launch" ]; then ok "起こす直前に読む（${MF_REL}:${l_q0}）"
+else ng "起こす直前（${MF_REL}:${l_launch:-?} の launch_isolated_gui より前）に qb0=\"\$(queue_busy)\" が無い（${MF_REL}:${l_q0:-なし}）"; fi
+if in_run_one "$l_q1" && [ "$l_q1" -gt "$l_t1" ] && [ "$((l_q1 - l_t1))" -le 2 ]; then ok "tako list が通った直後（時計の外）に読む（${MF_REL}:${l_q1}）"
+else ng "t1 の直後（${MF_REL}:${l_t1:-?}）に qb1=\"\$(queue_busy)\" が無い（${MF_REL}:${l_q1:-なし}）"; fi
+qb_body="$(sed -n '/^queue_busy() {/,/^}/p' "$MF")"
+assert_not_contains "混み具合は測る側の CLI で読まない（時計の前に建てたての初回 exec を済ませない）" "$qb_body" 'TAKO_BIN'
+assert_contains "本物の HOME へ戻して本番の順番待ちを読む" "$qb_body" 'HOME="$REAL_HOME"'
+assert_contains "見出しの末尾に startup_busy / startup_load1" "$HEADER" "$(printf 'env\tstartup_busy\tstartup_load1')"
+
 # ============================================================================
 echo
 echo "B. 見張りの通し（計測・tako・cargo は代役）"
@@ -247,6 +316,14 @@ cat > "$B/measure.sh" <<'SH'
 echo "$$" > "$FAKE_DIR/measure.pid"
 { echo "args=$*"; echo "no_queue=${TAKO_NO_QUEUE:-}"; echo "stub=${TAKO_FOOTPRINT_STUB_CLAUDE:-}"
   echo "tako_bin=${TAKO_BIN:-}"; echo "socket=${TAKO_SOCKET:-}"; } > "$FAKE_DIR/measure.env"
+# 1 晩の何回目の計測か（#2652 の測り直し）と、渡されたバイナリ（建てたてと同じ中身の別ファイルか）
+n=$(( $(cat "$FAKE_DIR/measure.count" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$FAKE_DIR/measure.count"
+same=no
+[ -n "${TAKO_BIN:-}" ] && cmp -s "$TAKO_BIN" "$FAKE_DIR/repo/target/release/tako" \
+  && cmp -s "${APP_BIN:-}" "$FAKE_DIR/repo/target/release/tako-app" && same=yes
+echo "call=$n tako_bin=${TAKO_BIN:-} app_bin=${APP_BIN:-} same=$same queue_tako=${TAKO_FOOTPRINT_QUEUE_TAKO:-}" >> "$FAKE_DIR/measure-calls.log"
+[ "$n" -ge 2 ] && [ -n "${FAKE_VALUES_2:-}" ] && FAKE_VALUES="$FAKE_VALUES_2"
 case "${FAKE_MEASURE:-ok}" in
   nodisplay) echo "未実測: tako-vd を用意できないので検証用 GUI を開かない（テストの注入）" >&2; exit 4 ;;
   hang) trap 'echo term > "$FAKE_DIR/measure.term"; exit 130' TERM; while :; do sleep 0.2; done ;;
@@ -278,6 +355,20 @@ if args[:1] == ["queue"]:
     # 順番待ちを知っている tako のふり（`queue --help` に --max-wait・`queue <コマンド>` は記録して走らせる）
     if args[1:] == ["--help"]:
         print("Usage: tako queue [--max-wait <時間>] <コマンド>")
+        sys.exit(0)
+    if args[1:] == ["--json"]:
+        # 順番待ちの状況（#2652）: queue-seq の先頭の本数を返して 1 つ進める（最後の 1 つは残す）。down = GUI に届かない
+        seq_f = os.path.join(os.environ["FAKE_DIR"], "queue-seq")
+        seq = open(seq_f).read().split() if os.path.exists(seq_f) else []
+        n = seq[0] if seq else "0"
+        if len(seq) > 1:
+            open(seq_f, "w").write(" ".join(seq[1:]))
+        if n == "down":
+            print(json.dumps({"gui": False, "machine": {"load": [1.0, 1.0, 1.0]}}))
+        else:
+            print(json.dumps({"gui": True, "machine": {"load": [7.5, 5.0, 4.0]},
+                              "queue": {"running": [{"id": 900000 + i, "label": "cargo clippy --workspace"}
+                                                    for i in range(int(n))]}}))
         sys.exit(0)
     os.execvp(args[1], args[1:])
 data = json.load(open(store)) if os.path.exists(store) else {"tasks": []}
@@ -329,6 +420,7 @@ new_commit() {
 WATCH_RC=0
 night() {
   WATCH_RC=0
+  rm -f "${B:?}/measure.count"
   env -i HOME="$B/home" PATH="$B/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" \
     FAKE_DIR="$B" FAKE_LOG="$B/calls.log" TAKO_NO_QUEUE=1 \
     TAKO_FOOTPRINT_WATCH_MEASURE="$B/measure.sh" TAKO_FOOTPRINT_WATCH_TAKO="$B/tako" \
@@ -604,6 +696,79 @@ rm -f "${D:?}/repo/scripts/nightly-footprint-watch.sh"
 run_nightly_c "$D"
 assert_eq "夜間の終了コード 0" "0" "$NIGHT_RC"
 assert_contains "飛ばすと言う" "$(cat "$D/out.txt")" "見張りを飛ばす"
+
+# ============================================================================
+echo
+echo "D. 起動の区間に重い処理が重なった夜（#2652。偽の tako queue --json を差し込む）"
+# ============================================================================
+# 履歴・状態・todo を空にして基準を作り直す（リポジトリと代役は B のものを使う）
+rm -rf "${B:?}/home/.claude-orchestrator/state/tako-footprint" "${B:?}/todo.json"
+printf 'built-cli\n' > "$B/repo/target/release/tako"
+printf 'built-app\n' > "$B/repo/target/release/tako-app"
+chmod +x "$B/repo/target/release/tako" "$B/repo/target/release/tako-app"
+QUIET="TAKO_FOOTPRINT_WATCH_QUIET_POLL=0.1"
+calls() { cat "$B/measure-calls.log" 2>/dev/null; }
+last_col() { python3 -c 'import csv,sys; r=list(csv.DictReader(open(sys.argv[1]),delimiter="\t")); print(r[-1].get(sys.argv[2],""))' "$HIST" "$1"; }
+for k in 1 2 3; do new_commit "d$k"; night; done
+assert_contains "基準 3 晩（起動 900 ms・重なりの記録なし）を作った（判定は 4 晩目から）" "$(cat "$B/out.txt")" "基準づくり中（同じ条件で描画ありの行 2/3 回）"
+
+echo "D1: 1 回目の起動に 2 本が重なり、空くのを待って測り直す → 2 回目の行を残し、鳴らない"
+: > "$B/measure-calls.log"; : > "$B/tako.log"; echo "1 1 0" > "$B/queue-seq"
+new_commit d4; night "$QUIET" FAKE_VALUES="startup_ms=10896 startup_busy=2 startup_load1=12.50" FAKE_VALUES_2="startup_ms=950 startup_busy=0 startup_load1=4.00"
+assert_eq "終了コード 0" "0" "$WATCH_RC"
+assert_contains "重なりを言って測り直す" "$(cat "$B/out.txt")" "起動の区間に順番待ちの実行 2 本が重なった（load1 12.50・起動 10896 ms）。空くのを待って 1 回だけ測り直す"
+assert_eq "計測は 2 回" "2" "$(calls | grep -c '^call=')"
+assert_contains "1 回目はバイナリを渡さない（夜間のビルドのもの）" "$(calls | sed -n 1p)" "call=1 tako_bin= app_bin= same=no"
+c2="$(calls | sed -n 2p)"
+assert_contains "2 回目は建てたてと同じ中身の別ファイル（初回 exec の検査を含めて揃える）" "$c2" "same=yes"
+assert_not_contains "2 回目のバイナリは target/release のものではない" "$c2" "/target/release/"
+assert_contains "混み具合は起票に使う tako で読ませる" "$c2" "queue_tako=$B/tako"
+assert_eq "空くまで順番待ちを 3 回読んだ（1 → 1 → 0）" "3" "$(grep -c '^queue --json' "$B/tako.log")"
+assert_eq "履歴は 1 晩 1 行" "4" "$(rows_of)"
+assert_eq "残したのは 2 回目の起動" "950" "$(last_col startup_ms)"
+assert_eq "2 回目の重なりは 0 本" "0" "$(last_col startup_busy)"
+assert_contains "備考に 1 回目を残す" "$(last_col reason)" "測り直し（1 回目は起動 10896 ms・順番待ちの実行 2 本が重なった）"
+assert_contains "測り直しの起動を言う" "$(cat "$B/out.txt")" "起動 10896 → 950 ms"
+assert_contains "鳴らない" "$(cat "$B/out.txt")" "回帰なし"
+assert_eq "todo は 0 件" "0" "$(todo_count)"
+env -i HOME="$B/home" PATH="/usr/bin:/bin:/opt/homebrew/bin" /bin/bash "$B/repo/scripts/nightly-footprint-watch.sh" --status > "$B/status.txt" 2>&1
+assert_contains "--status の備考に測り直し" "$(cat "$B/status.txt")" "測り直し（1 回目は起動 10896 ms"
+
+echo "D2: 測り直しも重なった → その行の起動時間は比べない（10 秒でも鳴らない）"
+: > "$B/measure-calls.log"; echo "0" > "$B/queue-seq"
+new_commit d5; night "$QUIET" FAKE_VALUES="startup_ms=9000 startup_busy=1" FAKE_VALUES_2="startup_ms=9500 startup_busy=1 startup_load1=11.00"
+assert_eq "終了コード 0" "0" "$WATCH_RC"
+assert_eq "計測は 2 回（測り直しは 1 回だけ）" "2" "$(calls | grep -c '^call=')"
+assert_contains "測り直しも重なったと言う" "$(cat "$B/out.txt")" "測り直しも起動の区間に順番待ちの実行 1 本が重なった"
+assert_contains "起動時間は比べない" "$(cat "$B/out.txt")" "起動時間: 9500 ms（起動の区間に重い処理が重なった夜なので比べない・順番待ちの実行 1 本・load1 11.00）"
+assert_eq "todo は 0 件" "0" "$(todo_count)"
+
+echo "D3: 待っても順番待ちが空かない → 測り直さず 1 回目の行を残す（起動時間は比べない）"
+: > "$B/measure-calls.log"; echo "3" > "$B/queue-seq"
+new_commit d6; night "$QUIET" TAKO_FOOTPRINT_WATCH_QUIET_WAIT=1 FAKE_VALUES="startup_ms=9000 startup_busy=2"
+assert_eq "終了コード 0" "0" "$WATCH_RC"
+assert_eq "計測は 1 回" "1" "$(calls | grep -c '^call=')"
+assert_contains "空かないと言う" "$(cat "$B/out.txt")" "1 秒待っても順番待ちが空かない（実行 3 本）。測り直さず 1 回目の行を残す"
+assert_contains "備考に残す" "$(last_col reason)" "順番待ちが 1 秒空かず測り直さない"
+assert_eq "todo は 0 件" "0" "$(todo_count)"
+
+echo "D4: GUI に届かず順番待ちを読めない → 待たずに測り直す"
+: > "$B/measure-calls.log"; echo "down" > "$B/queue-seq"
+new_commit d7; night "$QUIET" FAKE_VALUES="startup_ms=9000 startup_busy=1" FAKE_VALUES_2="startup_ms=900"
+assert_eq "計測は 2 回" "2" "$(calls | grep -c '^call=')"
+assert_eq "残したのは 2 回目" "900" "$(last_col startup_ms)"
+
+echo "D5: 重なった夜（D2・D3）は後の夜の起動時間の基準を汚さない → +1 秒を超えた夜は鳴る"
+new_commit d8; night "$QUIET" FAKE_VALUES="startup_ms=1950 startup_busy=0"
+assert_contains "起動時間の基準は重ならなかった夜の 900 ms" "$(cat "$B/out.txt")" "起動時間: 1950 ms（基準 900・上限 1900） 悪化"
+assert_contains "載せた" "$(cat "$B/out.txt")" "tako todo へ載せた（u-1）"
+
+echo "D6: A/B TAKO_2652_LEGACY=1 → 重なっていても測り直さず、起動時間を比べる"
+: > "$B/measure-calls.log"; echo "0" > "$B/queue-seq"
+new_commit d9; night "$QUIET" TAKO_2652_LEGACY=1 FAKE_VALUES="startup_ms=9000 startup_busy=2"
+assert_eq "計測は 1 回" "1" "$(calls | grep -c '^call=')"
+assert_not_contains "測り直すと言わない" "$(cat "$B/out.txt")" "測り直す"
+assert_contains "起動時間を基準と比べる" "$(cat "$B/out.txt")" "起動時間: 9000 ms（基準"
 
 echo
 echo "結果: PASS ${PASS} / FAIL ${FAIL}"

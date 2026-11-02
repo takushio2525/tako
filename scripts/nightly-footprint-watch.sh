@@ -27,6 +27,14 @@
 # **同じ悪化を重ねて積まない**: 前の夜から続く悪化の項目を状態ファイルに持ち、新しい項目が
 #   悪化したときだけ起票する（未完了の 1 件が残っていればそれを書き換える）。回帰なしの夜が
 #   来たら状態を消す（todo は人が片付ける）。
+# **起動の区間に重い処理が重なった夜**（#2652）: 計測は順番待ちの外で走るので、ビルドが枠を返した
+#   その秒に他の worker の clippy 等が走り出して起動の区間に重なる（11/02 は起動 2.4 → 10.9 秒。
+#   回帰前のコミットでも重ねると 10.6 秒 = 計測の外れ値）。計測の行の `startup_busy`（起こす直前と
+#   `tako list` が通った直後の順番待ちの実行中の本数）が 1 以上なら、順番待ちが空くまで待って
+#   （上限 20 分）**1 回だけ**測り直す。測り直しのバイナリは新しいファイルへ複製して渡す（同じファイルの
+#   2 回目の exec は初回の検査が済んでいて起動が約 1.4 秒短く出る = 建てたての夜の基準と揃わない）。
+#   それでも重なった・空かなかった・測り直せなかった夜は、その行の起動時間を比べず基準にも入れない
+#   （判定は footprint-watch.py の CONTENDED_KEYS）。A/B は `TAKO_2652_LEGACY=1`（測り直さず重なりを見ない）
 #
 # 置き場（data dir ではなく開発側。`cargo clean` で消えないよう target/ の外 = 夜間の予約・mod の
 #   検査の記録と同じ所）: ~/.claude-orchestrator/state/tako-footprint/
@@ -42,6 +50,8 @@
 #   TAKO_FOOTPRINT_WATCH_SCALE         閾値の倍率（既定 1。0.5 = 閾値を半分に下げる注入）
 #   TAKO_FOOTPRINT_WATCH_MIN           判定に要る基準の回数（既定 3）/ TAKO_FOOTPRINT_WATCH_WINDOW 基準の回数（既定 5）
 #   TAKO_FOOTPRINT_WATCH_TIMEOUT       計測の上限（秒。既定 900）
+#   TAKO_FOOTPRINT_WATCH_QUIET_WAIT    起動に重なりがあったとき、順番待ちが空くのを待つ上限（秒。既定 1200 = #2652）
+#   TAKO_FOOTPRINT_WATCH_QUIET_POLL    その待ちで順番待ちを読む間隔（秒。既定 10）
 #   TAKO_FOOTPRINT_WATCH_BUILD_TIMEOUT ビルドの上限（順番待ちを含む。秒。既定 3600）
 #   TAKO_FOOTPRINT_WATCH_DIR           履歴・状態の置き場
 #   TAKO_FOOTPRINT_WATCH_TAKO          起票に使う tako（既定 /Applications/tako.app の tako → PATH の tako）
@@ -60,6 +70,8 @@ HISTORY="$DIR/history.tsv"
 STATE="$DIR/state"
 LOCK_DIR="$HOME/.claude-orchestrator/locks/tako-footprint-watch.lock"
 MEASURE_TIMEOUT="${TAKO_FOOTPRINT_WATCH_TIMEOUT:-900}"
+QUIET_WAIT="${TAKO_FOOTPRINT_WATCH_QUIET_WAIT:-1200}"
+QUIET_POLL="${TAKO_FOOTPRINT_WATCH_QUIET_POLL:-10}"
 BUILD_TIMEOUT="${TAKO_FOOTPRINT_WATCH_BUILD_TIMEOUT:-3600}"
 SCALE="${TAKO_FOOTPRINT_WATCH_SCALE:-1}"
 MIN_N="${TAKO_FOOTPRINT_WATCH_MIN:-3}"
@@ -249,22 +261,54 @@ say "ビルド: ${build_s} 秒"
 # - TAKO_NO_QUEUE: ビルドは上で済んでいる（中の cargo は確かめるだけ）ので、もう一度並ばない
 # - TAKO_FOOTPRINT_STUB_CLAUDE: 隔離 HOME では `claude agents --json` の絞り込みが効かず、子の CPU が
 #   claude CLI の版で揺れる（#2018）。夜ごとの比較を tako の変化だけにする
-# - 呼び出し元の tako の接続情報・バイナリの指定は渡さない（隔離 GUI だけを相手にする）
-t0=$(date +%s)
-rc=0
-run_limited "$MEASURE_TIMEOUT" "$WORK/measure.log" \
-  env -u TAKO_BIN -u APP_BIN -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID \
-  TAKO_NO_QUEUE=1 TAKO_FOOTPRINT_STUB_CLAUDE=1 TAKO_FOOTPRINT_OUT="$WORK/row.tsv" \
-  /bin/bash "$MEASURE" std \
-  || rc=$?
-measure_s=$(( $(date +%s) - t0 ))
-mask < "$WORK/measure.log" > "$DIR/last-run.log" 2>/dev/null || true
-# 夜間のログへは要点だけ（全文は last-run.log）
-grep -E '^  persist|^  direct|窓:|未実測|ERROR|接続できない' "$WORK/measure.log" 2>/dev/null | mask | sed 's/^ *//; s/^/  /'
+# - 呼び出し元の tako の接続情報・バイナリの指定は渡さない（隔離 GUI だけを相手にする）。
+#   起動の区間の混み具合（#2652）は起票に使う tako と同じ 1 本で読ませる
+# measure_once <名前> [計測へ足す env …] → 結果は MRC（終了コード）・MEASURE_S（秒）・
+#   $WORK/measure-<名前>.log・$WORK/row-<名前>.tsv
+measure_once() {
+  local tag="$1" t0
+  shift
+  t0=$(date +%s)
+  MRC=0
+  run_limited "$MEASURE_TIMEOUT" "$WORK/measure-$tag.log" \
+    env -u TAKO_BIN -u APP_BIN -u TAKO_SOCKET -u TAKO_TOKEN -u TAKO_PANE_ID \
+    TAKO_NO_QUEUE=1 TAKO_FOOTPRINT_STUB_CLAUDE=1 TAKO_FOOTPRINT_OUT="$WORK/row-$tag.tsv" \
+    ${TAKO_CLI:+"TAKO_FOOTPRINT_QUEUE_TAKO=$TAKO_CLI"} "$@" \
+    /bin/bash "$MEASURE" std \
+    || MRC=$?
+  MEASURE_S=$(( $(date +%s) - t0 ))
+  mask < "$WORK/measure-$tag.log" > "$DIR/last-run.log" 2>/dev/null || true
+  # 夜間のログへは要点だけ（全文は last-run.log）
+  grep -E '^  persist|^  direct|窓:|起動の混み具合:|未実測|ERROR|接続できない' "$WORK/measure-$tag.log" 2>/dev/null | mask | sed 's/^ *//; s/^/  /'
+}
+# 計測が結果の行を出したか
+has_row() { grep -qv '^scenario' "$1" 2>/dev/null; }
+# 本番の順番待ちの実行中の本数（読めなければ -）
+queue_running() {
+  local out=""
+  [ -n "$TAKO_CLI" ] && out="$("$TAKO_CLI" queue --json 2>/dev/null | python3 "$PY" queue-busy 2>/dev/null)"
+  echo "${out%% *}" | sed 's/^$/-/'
+}
+# 順番待ちの実行が 0 本になるまで待つ（上限 QUIET_WAIT 秒）。読めない（GUI が居ない等）なら待たずに進む。
+# 空かなければ 1（最後に読んだ本数は QUIET_LAST）
+wait_quiet() {
+  local deadline=$(( $(date +%s) + QUIET_WAIT ))
+  QUIET_LAST="-"
+  while :; do
+    QUIET_LAST="$(queue_running)"
+    case "$QUIET_LAST" in -|0) return 0 ;; esac
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep "$QUIET_POLL"
+  done
+}
+
+measure_once 1
+rc=$MRC
+measure_s=$MEASURE_S
 
 if [ "$rc" -eq 4 ]; then
   # 原因は「未実測: … を開かない（<原因>。状態は …）」の括弧の中（形が違えば行ごと）
-  line="$(grep -m1 '^未実測: ' "$WORK/measure.log" 2>/dev/null || true)"
+  line="$(grep -m1 '^未実測: ' "$WORK/measure-1.log" 2>/dev/null || true)"
   reason="$(printf '%s' "$line" | sed -n 's/^未実測: .*を開かない（\(.*\)。状態は.*$/\1/p')"
   [ -n "$reason" ] || reason="${line#未実測: }"
   reason="$(printf '%s' "$reason" | cut -c1-120)"
@@ -275,13 +319,46 @@ elif [ "$rc" -eq 124 ]; then
   say "未実測: 計測が上限 ${MEASURE_TIMEOUT} 秒に届いたので止めた"
   record unmeasured "計測の時間切れ（${MEASURE_TIMEOUT} 秒）" "$measure_s"
   exit 3
-elif [ "$rc" -ne 0 ] || ! grep -qv '^scenario' "$WORK/row.tsv" 2>/dev/null; then
+elif [ "$rc" -ne 0 ] || ! has_row "$WORK/row-1.tsv"; then
   say "ERROR: 計測が終了コード ${rc} で終わった（結果の行なし・${measure_s} 秒。全文は $(echo "$DIR/last-run.log" | mask)）"
   record failed "計測が終了コード ${rc} で終わった" "$measure_s"
   exit 1
 fi
 say "計測: ${measure_s} 秒"
-record ok "-" "$measure_s" "$WORK/row.tsv" || { say "ERROR: 履歴へ書けない"; exit 1; }
+ROW="$WORK/row-1.tsv"
+NOTE="-"
+
+# --- 起動の区間に重い処理が重なった夜は 1 回だけ測り直す（#2652）-------------------------
+read -r busy load first_ms <<<"$(python3 "$PY" row-busy --row "$ROW")"
+case "$busy" in ''|-|0|*[!0-9]*) busy=0 ;; esac
+if [ "$busy" -gt 0 ] && [ "${TAKO_2652_LEGACY:-}" != 1 ]; then
+  say "起動の区間に順番待ちの実行 ${busy} 本が重なった（load1 ${load}・起動 ${first_ms} ms）。空くのを待って 1 回だけ測り直す（上限 ${QUIET_WAIT} 秒）"
+  fresh="$WORK/fresh-bin"
+  src="$WT/target/release"
+  if ! wait_quiet; then
+    say "${QUIET_WAIT} 秒待っても順番待ちが空かない（実行 ${QUIET_LAST} 本）。測り直さず 1 回目の行を残す（起動時間は比べない）"
+    NOTE="起動に重なり ${busy} 本。順番待ちが ${QUIET_WAIT} 秒空かず測り直さない"
+  elif ! { [ -x "$src/tako" ] && [ -x "$src/tako-app" ] && mkdir -p "$fresh" \
+      && command cp -f "$src/tako" "$src/tako-app" "$fresh/"; }; then
+    say "測り直しのバイナリを用意できない（$(echo "$src" | mask)）。1 回目の行を残す（起動時間は比べない）"
+    NOTE="起動に重なり ${busy} 本。バイナリを用意できず測り直さない"
+  else
+    # 新しいファイルへ複製したバイナリ = 初回 exec の検査を含めて建てたての夜と同じ条件で測る
+    measure_once 2 TAKO_BIN="$fresh/tako" APP_BIN="$fresh/tako-app"
+    if [ "$MRC" -eq 0 ] && has_row "$WORK/row-2.tsv"; then
+      ROW="$WORK/row-2.tsv"
+      measure_s=$MEASURE_S
+      NOTE="測り直し（1 回目は起動 ${first_ms} ms・順番待ちの実行 ${busy} 本が重なった）"
+      read -r busy2 _ second_ms <<<"$(python3 "$PY" row-busy --row "$ROW")"
+      say "測り直し: ${MEASURE_S} 秒（起動 ${first_ms} → ${second_ms} ms）"
+      case "$busy2" in ''|-|0|*[!0-9]*) ;; *) say "測り直しも起動の区間に順番待ちの実行 ${busy2} 本が重なった（起動時間は比べない）" ;; esac
+    else
+      say "測り直しが終了コード ${MRC} で終わった（${MEASURE_S} 秒）。1 回目の行を残す（起動時間は比べない）"
+      NOTE="起動に重なり ${busy} 本。測り直しが終了コード ${MRC} で終わった"
+    fi
+  fi
+fi
+record ok "$NOTE" "$measure_s" "$ROW" || { say "ERROR: 履歴へ書けない"; exit 1; }
 
 # --- 判定 -----------------------------------------------------------------------------
 python3 "$PY" judge --history "$HISTORY" --state "$STATE" --out-dir "$WORK/judge" \

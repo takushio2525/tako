@@ -10,6 +10,8 @@
   measured   そのコミットを「描画ありで」測り済みなら終了コード 0
   find-open  `tako todo list --json`（stdin）から、この見張りが載せた未完了の 1 件の id を出す
   status     直近の結果・基準・載せた悪化を人が読む形で出す（読むだけ）
+  queue-busy `tako queue --json`（stdin）から「順番待ちの実行中の本数 load1」を出す（#2652。読めなければ -）
+  row-busy   計測の行の「起動の区間に重なった本数 load1 起動時間」を出す（#2652。見張りが測り直すかを決める）
 
 閾値は設計書 `.agent/plans/2026-10-lightweight.md` §7.1 の 2 回のぶれから決めた（METRICS の注記）。
 """
@@ -58,11 +60,16 @@ METRICS = [
     ("busy_child_cpu_pct", "出力中の子プロセスの CPU", "%", "abs_rel", (1.0, 0.50), False),
     # スレッドのぶれは ±2 本。std は器 30 で 48〜49 本（1 枚 1 本 + 常駐 16〜18 本 = §3.5）
     ("threads", "スレッド", "本", "abs", 5, False),
-    # 起動時間はその日の最初の起動かで 0.5〜2.6 秒と大きく動く（§3.5 / L16）ので、+1 秒かつ +50%
+    # 起動時間はその日の最初の起動かで 0.5〜2.6 秒と大きく動く（§3.5 / L16）ので、+1 秒かつ +50%。
+    # 起動の区間に重い処理が重なった夜は比べず基準にも入れない（CONTENDED_KEYS = #2652）
     ("startup_ms", "起動時間", "ms", "abs_rel", (1000, 0.50), False),
     ("busy_body_renders_s", "出力中の描画回数", "回/秒", "cap", REDRAW_CAP, True),
 ]
 METRIC_KEYS = [m[0] for m in METRICS]
+# 起動の区間（起こす直前 → `tako list` が通った直後）に順番待ちの実行が重なると大きく揺れる項目（#2652）。
+# 11/02 の夜は夜間のビルドが枠を返した同じ秒に他の worker の clippy が走り出し、起動 2.4 → 10.9 秒と出た
+# （回帰前のコミットでも重ねると 10.6 秒 = 計測の外れ値）。重なった夜は比べず、この項目の基準にも入れない
+CONTENDED_KEYS = ("startup_ms",)
 
 
 def num(v):
@@ -150,6 +157,27 @@ def cond_key(row):
     return tuple(row.get(k, "-") for k in CONDITION)
 
 
+def startup_busy(row):
+    """起動の区間に重なった順番待ちの実行の本数（#2652）。記録の無い行（列を足す前の行・
+    順番待ちを読めなかった夜）は None = 重なりの記録なし（重なっていないとして扱う）"""
+    v = num(row.get("startup_busy"))
+    return None if v is None else int(v)
+
+
+def contended(row):
+    """起動の区間に重い処理が重なった行か（#2652）。その行の CONTENDED_KEYS は比べず、基準にも入れない。
+    A/B は `TAKO_2652_LEGACY=1`（重なりを見ない前の判定）"""
+    if os.environ.get("TAKO_2652_LEGACY") == "1":
+        return False
+    b = startup_busy(row)
+    return b is not None and b > 0
+
+
+def busy_note(row):
+    """重なりの中身（「順番待ちの実行 N 本・load1 L」）"""
+    return "順番待ちの実行 %s 本・load1 %s" % (startup_busy(row), row.get("startup_load1") or "-")
+
+
 # --- record ------------------------------------------------------------------
 def cmd_record(a):
     fields, rows = read_tsv(a.history)
@@ -187,10 +215,13 @@ def judge(rows, state, window, min_n, scale):
     _, stub = env_parts(cur)
     # 基準は origin/main の行と、今回と同じ ref の行（ブランチの行は main の基準を汚さない）
     refs = (MAIN_REF, ref_of(cur))
-    base = [r for r in rows[:-1]
-            if r.get("status") == "ok" and cond_key(r) == cond_key(cur) and filled_complete(r)
-            and env_parts(r) == ("-", stub) and ref_of(r) in refs
-            and (r.get("drawn") == "あり") == drawn][-window:]
+    eligible = [r for r in rows[:-1]
+                if r.get("status") == "ok" and cond_key(r) == cond_key(cur) and filled_complete(r)
+                and env_parts(r) == ("-", stub) and ref_of(r) in refs
+                and (r.get("drawn") == "あり") == drawn]
+    base = eligible[-window:]
+    # 重なりで揺れる項目の基準は、重ならなかった直近 N 回（重なった夜が窓の枠を食わない = #2652）
+    calm_base = [r for r in eligible if not contended(r)][-window:]
     res["baseline"] = base
     for key, label, unit, kind, th, needs_draw in METRICS:
         v = num(cur.get(key))
@@ -199,6 +230,10 @@ def judge(rows, state, window, min_n, scale):
         if needs_draw and not drawn:
             res["lines"].append("%s: %s（描画なしの夜なので比べない）" % (label, vu(v, unit)))
             continue
+        if key in CONTENDED_KEYS and contended(cur):
+            res["lines"].append("%s: %s（起動の区間に重い処理が重なった夜なので比べない・%s）" % (
+                label, vu(v, unit), busy_note(cur)))
+            continue
         if kind == "cap":
             bad = v > th
             res["lines"].append("%s: %s（上限 %s）%s" % (label, vu(v, unit), fmt(th, unit), " 悪化" if bad else ""))
@@ -206,7 +241,8 @@ def judge(rows, state, window, min_n, scale):
                 res["flagged"].append({"key": key, "label": label, "unit": unit, "cur": v, "base": None,
                                        "limit": th, "short": "%s %s（上限 %s）" % (label, vu(v, unit), fmt(th, unit))})
             continue
-        vals = [x for x in (num(r.get(key)) for r in base) if x is not None]
+        vals = [x for x in (num(r.get(key)) for r in (calm_base if key in CONTENDED_KEYS else base))
+                if x is not None]
         if len(vals) < min_n:
             res["lines"].append("%s: %s（基準づくり中 %d/%d 回）" % (label, vu(v, unit), len(vals), min_n))
             continue
@@ -269,6 +305,10 @@ def body_md(res, new, prev_open):
         "- 計測: %s・v%s（`%s`）・描画%s・起動 %s ms" % (cur.get("date", "-"), cur.get("version", "-"), sha[:12],
                                                 cur.get("drawn", "-"), cur.get("startup_ms", "-")),
     ]
+    if contended(cur):
+        lines.append("- 起動の区間に重い処理が重なった（%s）。起動時間は比べず、基準にも入れない（#2652）" % busy_note(cur))
+    if (cur.get("reason") or "-") != "-":
+        lines.append("- 備考: %s" % cur.get("reason"))
     if extra != "-":
         # 手で A/B を回したとき（TAKO_FOOTPRINT_ENV）。この行は基準には入らない
         lines.append("- 足した env: `%s`（この行は基準に入らない）" % extra)
@@ -382,8 +422,10 @@ def cmd_status(a):
         st = {"ok": "ok", "unmeasured": "未実測", "failed": "失敗"}.get(r.get("status", "-"), r.get("status", "-"))
         # 理由・足した env・ref は表の外（行末）に出す（列をはみ出させない）
         notes = []
-        if r.get("status") != "ok":
+        if r.get("status") != "ok" or (r.get("reason") or "-") != "-":
             notes.append(r.get("reason") or "-")
+        if contended(r):
+            notes.append("起動に重なり %d 本" % startup_busy(r))
         extra, _ = env_parts(r)
         if r.get("status") == "ok" and extra != "-":
             notes.append("env " + extra)
@@ -402,6 +444,52 @@ def cmd_status(a):
             state.get("open_metrics"), state.get("todo") or "未起票", state.get("since") or "-"))
     else:
         print("載せた悪化: なし")
+    return 0
+
+
+def ancestors():
+    """このプロセスの祖先の pid。測る側が順番待ちの中で走っているとき（`tako queue bash …`）、
+    自分の受付（`queue.running[].id` = 包みの `tako queue` の pid）を重なりに数えないため"""
+    import subprocess
+    out, pid = set(), os.getppid()
+    for _ in range(64):
+        if pid <= 1 or pid in out:
+            break
+        out.add(pid)
+        try:
+            r = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+            pid = int(r.stdout.strip() or 0)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            break
+    return out
+
+
+def cmd_queue_busy(a):
+    """`tako queue --json`（stdin）→「実行中の本数 load1」（#2652）。GUI に届かないときの応答は機の状態
+    だけで `queue` を持たない = 本数は「-」。JSON でなければ「- -」"""
+    import json
+    try:
+        d = json.load(sys.stdin)
+    except ValueError:
+        print("- -")
+        return 0
+    load = (d.get("machine") or {}).get("load") if isinstance(d, dict) else None
+    load1 = num(load[0]) if isinstance(load, list) and load else None
+    q = d.get("queue") if isinstance(d, dict) else None
+    running = q.get("running") if isinstance(q, dict) else None
+    n = None
+    if isinstance(running, list):
+        mine = ancestors()
+        n = sum(1 for r in running if not (isinstance(r, dict) and r.get("id") in mine))
+    print("%s %s" % ("-" if n is None else n, "-" if load1 is None else "%.2f" % load1))
+    return 0
+
+
+def cmd_row_busy(a):
+    """計測の行（最後の行）→「起動の区間に重なった本数 load1 起動時間」（#2652。無い欄は -）"""
+    _, rows = read_tsv(a.row)
+    r = rows[-1] if rows else {}
+    print(" ".join((r.get(k) or "-") for k in ("startup_busy", "startup_load1", "startup_ms")))
     return 0
 
 
@@ -435,9 +523,13 @@ def main():
     m.add_argument("--sha", required=True)
     f = sub.add_parser("find-open")
     f.add_argument("--prefer", default="")
+    sub.add_parser("queue-busy")
+    rb = sub.add_parser("row-busy")
+    rb.add_argument("--row", required=True)
     a = p.parse_args()
     fn = {"record": cmd_record, "judge": cmd_judge, "measured": cmd_measured,
-          "find-open": cmd_find_open, "status": cmd_status}.get(a.cmd)
+          "find-open": cmd_find_open, "status": cmd_status,
+          "queue-busy": cmd_queue_busy, "row-busy": cmd_row_busy}.get(a.cmd)
     if fn is None:
         p.print_help(sys.stderr)
         return 2
