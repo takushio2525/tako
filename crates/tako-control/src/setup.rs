@@ -566,11 +566,73 @@ pub fn setup_relocation_target() -> Option<(PathBuf, PathBuf)> {
     from.is_dir().then_some((from, to))
 }
 
+/// setup の生成物の置き場の移設（#1019）の断り（#2365）。
+///
+/// `tako migrate status` / MCP の `reason` は表示言語、persist.log と `tako setup` の行は日本語で載る
+/// （移行の記録の理由 = `tako_core::migration::OutcomeReason`）。`error` は OS のエラー文、
+/// パスは表記のまま埋める
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupRelocateError {
+    /// 旧 setup ディレクトリを退避先へ rename できない
+    Archive {
+        from: String,
+        to: String,
+        error: String,
+    },
+    /// ディレクトリを読めない
+    ReadDir { path: String, error: String },
+    /// ディレクトリの走査の途中で失敗した
+    Walk { path: String, error: String },
+    /// 項目の種別を読めない
+    FileType { path: String, error: String },
+    /// 移設先のディレクトリを作れない
+    CreateDir { path: String, error: String },
+    /// 旧い場所のファイルを移設先へ写せない
+    Copy {
+        from: String,
+        to: String,
+        error: String,
+    },
+}
+
+impl SetupRelocateError {
+    /// (バリアント, 言語) の網羅 match。日本語は #2365 より前の固定文とバイト一致
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Archive { from, to, error }, Ja) => {
+                format!("旧 setup ディレクトリの退避に失敗（{from} -> {to}）: {error}")
+            }
+            (Self::Archive { from, to, error }, En) => {
+                format!("failed to archive the old setup folder ({from} -> {to}): {error}")
+            }
+            (Self::ReadDir { path, error }, Ja) => format!("{path} を読めない: {error}"),
+            (Self::ReadDir { path, error }, En) => format!("cannot read {path}: {error}"),
+            (Self::Walk { path, error }, Ja) => format!("{path} の走査に失敗: {error}"),
+            (Self::Walk { path, error }, En) => format!("failed to walk {path}: {error}"),
+            (Self::FileType { path, error }, Ja) => format!("{path} の種別を読めない: {error}"),
+            (Self::FileType { path, error }, En) => {
+                format!("cannot read the file type of {path}: {error}")
+            }
+            (Self::CreateDir { path, error }, Ja) => format!("{path} を作れない: {error}"),
+            (Self::CreateDir { path, error }, En) => format!("cannot create {path}: {error}"),
+            (Self::Copy { from, to, error }, Ja) => format!("{from} を {to} へ写せない: {error}"),
+            (Self::Copy { from, to, error }, En) => {
+                format!("cannot copy {from} to {to}: {error}")
+            }
+        }
+    }
+}
+
 /// 旧い場所を新しい場所へ移す。`apply = false` なら**1 バイトも書かず**同じ内訳を返す
 /// （`status` の予告と `run` の報告が食い違わないよう、走査も失敗の出方も 1 実装にする）。
 ///
 /// 旧ディレクトリは**消さずに** `setup.pre-v1.bak` へ退避する
-pub fn relocate_setup_dir(from: &Path, to: &Path, apply: bool) -> Result<SetupRelocation, String> {
+pub fn relocate_setup_dir(
+    from: &Path,
+    to: &Path,
+    apply: bool,
+) -> Result<SetupRelocation, SetupRelocateError> {
     let backup = free_backup_path(from);
     let mut copied = Vec::new();
     let mut kept = Vec::new();
@@ -578,12 +640,10 @@ pub fn relocate_setup_dir(from: &Path, to: &Path, apply: bool) -> Result<SetupRe
     if apply {
         // **写してから退避する**。退避（rename）が済んだ時点で旧い場所は消えるので、
         // 次回は `setup_relocation_target` が None を返す = 冪等
-        std::fs::rename(from, &backup).map_err(|e| {
-            format!(
-                "旧 setup ディレクトリの退避に失敗（{} -> {}）: {e}",
-                from.display(),
-                backup.display()
-            )
+        std::fs::rename(from, &backup).map_err(|e| SetupRelocateError::Archive {
+            from: from.display().to_string(),
+            to: backup.display().to_string(),
+            error: e.to_string(),
         })?;
     }
     copied.sort();
@@ -608,20 +668,27 @@ fn walk(
     depth: usize,
     copied: &mut Vec<String>,
     kept: &mut Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), SetupRelocateError> {
     // setup ディレクトリは 2 段（`templates/`）しか無い。循環したリンクを
     // 掴んでも無限に潜らないための保険
     if depth > 8 {
         return Ok(());
     }
-    let reader =
-        std::fs::read_dir(dir).map_err(|e| format!("{} を読めない: {e}", dir.display()))?;
+    let at = |path: &Path, e: std::io::Error| (path.display().to_string(), e.to_string());
+    let reader = std::fs::read_dir(dir).map_err(|e| {
+        let (path, error) = at(dir, e);
+        SetupRelocateError::ReadDir { path, error }
+    })?;
     for entry in reader {
-        let entry = entry.map_err(|e| format!("{} の走査に失敗: {e}", dir.display()))?;
+        let entry = entry.map_err(|e| {
+            let (path, error) = at(dir, e);
+            SetupRelocateError::Walk { path, error }
+        })?;
         let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|e| format!("{} の種別を読めない: {e}", path.display()))?;
+        let file_type = entry.file_type().map_err(|e| {
+            let (path, error) = at(&path, e);
+            SetupRelocateError::FileType { path, error }
+        })?;
         if file_type.is_dir() {
             walk(root, &path, to_root, apply, depth + 1, copied, kept)?;
             continue;
@@ -637,11 +704,16 @@ fn walk(
         }
         if apply {
             if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("{} を作れない: {e}", parent.display()))?;
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    let (path, error) = at(parent, e);
+                    SetupRelocateError::CreateDir { path, error }
+                })?;
             }
-            std::fs::copy(&path, &dest)
-                .map_err(|e| format!("{} を {} へ写せない: {e}", path.display(), dest.display()))?;
+            std::fs::copy(&path, &dest).map_err(|e| SetupRelocateError::Copy {
+                from: path.display().to_string(),
+                to: dest.display().to_string(),
+                error: e.to_string(),
+            })?;
         }
         copied.push(label);
     }

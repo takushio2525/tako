@@ -1136,6 +1136,15 @@ pub enum Reason {
     /// 返答の配送で起票 master を起こす組み立て（`master_launch::plan`）が断った（`error` は
     /// その断りの文 = 同じ表示言語。配送の記録の理由になる）
     UserTaskMasterLaunchFailed(String),
+    /// 返答の配送で起票元の master プロファイルを解決できない（#1466。配送の記録の理由で、
+    /// 正本は `user_tasks::UNRESOLVED_ORIGIN_REASON`）
+    UserTaskOriginUnresolved,
+    /// 返答の配送で、もう一巡を出せない UI スレッドの呼び手が起動の組み立てを待たずに断った（#2182）
+    UserTaskLaunchPlanDeferred,
+    /// 返答の配送で、組み立てた起動が着地へ届かなかった（#2182。来ないはずの経路を無言にしない）
+    UserTaskLaunchPlanLost,
+    /// 返答の配送で起こしたタブのペインを解決できない
+    UserTaskLaunchPaneMissing,
 }
 
 /// ペイン ID の並び（`3, 5`）。複数ペインに当たった断りに添える
@@ -3224,6 +3233,38 @@ impl Reason {
             }
             (Self::UserTaskMasterLaunchFailed(error), En) => {
                 format!("cannot start the master: {error}")
+            }
+            (Self::UserTaskOriginUnresolved, Ja) => {
+                "宛先不明: 起票元の master プロファイルを解決できない\
+                 （呼び出し元の role も spawn 元の master も残っていない）"
+                    .into()
+            }
+            (Self::UserTaskOriginUnresolved, En) => {
+                "no destination: cannot resolve the master profile that filed the task \
+                 (neither the caller's role nor the master that spawned it remains)"
+                    .into()
+            }
+            (Self::UserTaskLaunchPlanDeferred, Ja) => {
+                "master の起動の組み立て（CLI の所在確認）を UI スレッドでは待たない\
+                 （もう一度返答すると組み立て直す）"
+                    .into()
+            }
+            (Self::UserTaskLaunchPlanDeferred, En) => {
+                "the UI thread does not wait for building the master launch (checking where the \
+                 CLI is); respond again to build it again"
+                    .into()
+            }
+            (Self::UserTaskLaunchPlanLost, Ja) => {
+                "master の起動の組み立てが着地へ届かなかった".into()
+            }
+            (Self::UserTaskLaunchPlanLost, En) => {
+                "the master launch that was built did not reach the landing step".into()
+            }
+            (Self::UserTaskLaunchPaneMissing, Ja) => {
+                "起動したタブのペインを解決できない".into()
+            }
+            (Self::UserTaskLaunchPaneMissing, En) => {
+                "cannot resolve the pane of the tab that was started".into()
             }
         }
     }
@@ -26937,11 +26978,8 @@ impl UserTaskLaunchJob {
             &self.profile,
             None,
             None,
-            Some(
-                "master の起動の組み立て（CLI の所在確認）を UI スレッドでは待たない\
-                 （もう一度返答すると組み立て直す）"
-                    .into(),
-            ),
+            // 書いた時点の表示言語で記録する（#2365。`UserTaskMasterLaunchFailed` と同じ）
+            Some(Reason::UserTaskLaunchPlanDeferred.to_string()),
             self.stored.index,
         );
         self.stored.delivered(delivery)
@@ -26975,7 +27013,7 @@ pub fn user_task_launch_land(
                 &profile,
                 None,
                 None,
-                Some("master の起動の組み立てが着地へ届かなかった".into()),
+                Some(Reason::UserTaskLaunchPlanLost.to_string()),
                 stored.index,
             )
         }
@@ -28126,7 +28164,7 @@ fn launch_master_for_response(
             profile,
             None,
             tab,
-            Some("起動したタブのペインを解決できない".into()),
+            Some(Reason::UserTaskLaunchPaneMissing.to_string()),
             index,
         );
     };
@@ -55417,9 +55455,12 @@ tako | pane 2 [ compact ]       [-]
         assert_eq!(host.ws.tabs().len(), tabs, "直の呼び手が master を起こした");
         assert_eq!(value["responses"][0]["comment"], "直の呼び手");
         assert_eq!(value["delivery"]["state"], "failed");
-        assert!(value["delivery"]["reason"]
-            .as_str()
-            .is_some_and(|r| r.contains("UI スレッドでは待たない")));
+        // 理由は書いた時点の表示言語（#2365）。テストの並びで言語のグローバルが動くので日英のどちらかで見る
+        assert!(value["delivery"]["reason"].as_str().is_some_and(|r| {
+            [Lang::Ja, Lang::En]
+                .iter()
+                .any(|&lang| r == Reason::UserTaskLaunchPlanDeferred.text_in(lang))
+        }));
         let (next_ticket, serving) = respond_turn_state();
         assert_eq!(next_ticket, serving, "札が手放されていない");
     }
@@ -55682,11 +55723,13 @@ tako | pane 2 [ compact ]       [-]
                 "role={role:?} の返答が誰かへ配送されている"
             );
             assert_eq!(delivery.profile, None, "role={role:?}");
+            // 理由は書いた時点の表示言語（#2365）。テストの並びで言語のグローバルが動くので日英のどちらかで見る
             assert!(
-                delivery
-                    .reason
-                    .as_deref()
-                    .is_some_and(|r| r.contains("宛先不明")),
+                delivery.reason.as_deref().is_some_and(|r| {
+                    [Lang::Ja, Lang::En]
+                        .iter()
+                        .any(|&lang| r == crate::user_tasks::UNRESOLVED_ORIGIN_REASON.text_in(lang))
+                }),
                 "role={role:?} の失敗理由が読めない: {:?}",
                 delivery.reason
             );
