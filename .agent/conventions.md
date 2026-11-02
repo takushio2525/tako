@@ -2951,6 +2951,25 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   - **スリープ防止（#173）のアサーションを握っている間は間引かれない**（#1926 で実測。隔離 GUI でも
     `tako sleep-guard set --mode on` で優先度 28 のまま）。性能を比べる腕ではスリープ防止の状態を揃える
 
+### 非同期の GUI 操作の結果は状態で待ってから確かめる（Issue #2684）
+
+本体が `dispatch_off_ui` を通る GUI のメソッド（kill の確認・履歴の開閉・タスクの完了 等）は、結果が
+background を一往復した後の着地で決まる。**呼んだのと同じ `window.update` の中では結果を確かめない**。
+#2657 が `pane_kill_confirmed` をこの形へ寄せた後も、項目 56 は同じ update の中で「一時ペインが消えた」を
+見ていたので必ず落ち、セルフテストが成功の出口へ届かなくなっていた（#2684。製品の結果は変わっていない =
+着地は 12〜24ms 後）。
+
+- update では同期で決まる部分（確認の畳み = `take` 等）だけを判定し、結果は `wait_for_app_state`
+  （上限は `state_wait_budget`）で待ってから `check` する。検出力は「待つ相手が来ない」注入で示す
+  （項目 56 は `TAKO_2684_INJECT=noclose` = 確認を畳むだけで close を撃たない → 上限まで待って FAILED）
+- 番犬 `selftest_offui_wait_watchdog` が、本体に `self.dispatch_off_ui(` を持つ fn の名前を tako-app の src
+  から自動で集め、セルフテストでそれを呼んだ行から次の `check(` までに状態待ち（名前が `wait_` で始まる
+  呼び出しか `settle` / `settle_…`。固定待ちの `wait(` は数えない）が無ければ file:line で名指す。同期で
+  決まるものしか見ない呼び出しだけ、その行か直前のコメント行に `// tako:offui-sync-ok <理由>` を書く
+- **製品の側を非同期へ寄せる PR は、セルフテストの呼び手も直す**（セルフテストは CI で走らない。番犬は
+  `dispatch_off_ui` へ寄せた時点で呼び手を名指すが、`prepare_offload` の側で同期の腕が非同期へ変わる形は
+  呼び手の字面が変わらないので拾えない）
+
 ### 節が作る一時ファイルは `remove_on_fail` で登録する（Issue #2051）
 
 `fail()` は即 `exit(1)` するので、節の末尾の `remove_dir_all` は**落ちた経路では走らない**
