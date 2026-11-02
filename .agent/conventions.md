@@ -713,6 +713,23 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `resend_command` の鍵が無い）。番犬は同じ `issue1762_dispatch_error_lang.rs`（`ReplyNote` の表に旧文・
   `NOTE_ITEM_SCOPES` と dispatch の `handoffs` の関数・応答の文にする口で `text_in(Lang::Ja)` に固定するのを名指す
   `NOTE_LANG_FIXED_SCOPES`）
+- 同じ続きで、**返答の配送の理由**と**移行の記録の理由**も表示言語へ移した。配送の理由（宛先不明・UI スレッドでは
+  組み立てを待たない・組み立てが着地へ届かない・起こしたタブのペインを解けない）は `Reason::UserTask*` の 4 種で、
+  配送の記録（`user-tasks.yaml` の `delivery.reason`）へは**書いた時点の表示言語**で残る（`tako todo respond` /
+  MCP `tako_todo` / PWA の `POST /api/tasks/<id>/respond` と一覧・右パネル・`tako todo show` の `配送:` 行が同じ文を
+  読む。記録の形は変えていない = 移行は要らない）。正本の名前 `user_tasks::UNRESOLVED_ORIGIN_REASON` は残し、
+  中身を `Reason::UserTaskOriginUnresolved` にした（#1466 の番犬が名前を見る）。移行の記録の
+  `FileOutcome::{Unreadable, Refused, Failed}` の理由は `String` から日英の対 `tako_core::migration::OutcomeReason`
+  へ替え、`Validator` / `Step::apply` の失敗も同じ型にした。組む側は型の `text_in` で日英の両方を持たせる:
+  tako-core は `PlanError` / `MigrateTextError` / `FileFailure`（読み取り・退避・書き込みの失敗）、tako-control は
+  `migrations::MigrateReason`（手順の途中で読めない・YAML の再構成・#1981 の区切り・#1825 の作らなかった理由）と
+  `setup::SetupRelocateError`（#1019 の置き場の移設）、中身が前から日英の型のもの（`JsonReason` / `YamlReason` /
+  `ConfigError` / `ReplyNote` / `SiError` / `RelocateError` / mod の `UiProblem`）はその `text_in`。書き手
+  （`config_io::atomic_write_typed` の `WriteError`）の断りは `OutcomeReason::into_io_error` で `io::Error` に載せて
+  tako-core の退避・書き込みの理由まで日英の対のまま届く。**`tako migrate status` / MCP `tako_migrate` の `reason` は
+  表示言語（`.text()`）、persist.log（`移行できず:` / `移行を中止:`）と `tako setup` の行（枠が日本語）は `.ja()`** で
+  修正前とバイト一致。番犬は同じ `issue1762_dispatch_error_lang.rs`（`Reason` の表に 4 種・移行の記録の型 5 つの
+  旧文の表・`MIGRATION_REASON_SCOPES` と `file_json` の `reason` の走査・`USER_TASK_DELIVERY_SCOPES`）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

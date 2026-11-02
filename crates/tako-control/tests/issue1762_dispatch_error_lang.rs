@@ -896,9 +896,14 @@ fn reason_index(r: &Reason) -> usize {
         // #2365 の続き: adopt の判断の断り（`orchestrator::decide_adopt`）
         Reason::AdoptLaunchedDedicated { .. } => 337,
         Reason::AdoptMasterAgentMismatch { .. } => 338,
+        // #2365 の続き: 返答の配送の理由（配送の記録へ書いた時点の表示言語で残る）
+        Reason::UserTaskOriginUnresolved => 339,
+        Reason::UserTaskLaunchPlanDeferred => 340,
+        Reason::UserTaskLaunchPlanLost => 341,
+        Reason::UserTaskLaunchPaneMissing => 342,
     }
 }
-const REASON_VARIANTS: usize = 339;
+const REASON_VARIANTS: usize = 343;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1523,6 +1528,10 @@ fn reason_samples() -> Vec<Reason> {
             target: "tako".into(),
             target_agent: "claude".into(),
         },
+        Reason::UserTaskOriginUnresolved,
+        Reason::UserTaskLaunchPlanDeferred,
+        Reason::UserTaskLaunchPlanLost,
+        Reason::UserTaskLaunchPaneMissing,
     ]
 }
 
@@ -1933,6 +1942,11 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "master の系統が食い違う（この master は codex / 'tako' は claude）。\n\
      採用だけ通すと引き継ぎの後任が claude で立ち上がる。\n\
      揃えるには: tako orchestrator profiles set tako --master-agent codex",
+    // 返答の配送の理由（`user_tasks::UNRESOLVED_ORIGIN_REASON` と dispatch の 3 か所が書いていた文。#2365 の続き）
+    "宛先不明: 起票元の master プロファイルを解決できない（呼び出し元の role も spawn 元の master も残っていない）",
+    "master の起動の組み立て（CLI の所在確認）を UI スレッドでは待たない（もう一度返答すると組み立て直す）",
+    "master の起動の組み立てが着地へ届かなかった",
+    "起動したタブのペインを解決できない",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
@@ -6186,7 +6200,7 @@ const CLIENT_STORE_SCOPES: &[(&str, &str, Span)] = &[
     ),
     // チェックポイント（ファイル全体）
     (CHECKPOINTS_PATH, CHECKPOINTS_SRC, Span::Whole),
-    // ユーザータスク（配送の理由 `UNRESOLVED_ORIGIN_REASON` と返答の本文は外す）
+    // ユーザータスク（返答の本文は外す。配送の理由は `Reason::UserTask*` = `USER_TASK_DELIVERY_SCOPES` が見る）
     (
         USER_TASKS_PATH,
         USER_TASKS_SRC,
@@ -20680,6 +20694,663 @@ fn 事前信頼の理由の口へ日本語の固定文を戻すと名指す() {
             found.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
             vec![want],
             "{path}: 注入（{to}）を {path}:{want} として 1 件だけ名指すはず: {found:?}"
+        );
+    }
+}
+
+// ---- #2365 の続き: 移行の記録の理由（`tako migrate status` / MCP `tako_migrate` の `reason`） ----
+//
+// `FileOutcome::{Unreadable, Refused, Failed}` の理由は日英の対（`tako_core::migration::OutcomeReason`）で、
+// 組む側は型の `text_in` で日英の両方を持たせる。ここでは (1) 組む型（tako-core の `PlanError` /
+// `MigrateTextError` / `FileFailure`・tako-control の `MigrateReason` / `setup::SetupRelocateError`）の
+// 全バリアントの日英と、#2365 より前の固定文とのバイト一致（腕の行を名指す）、(2) 組む口に日本語の
+// 固定文が無いこと、(3) 応答の JSON の `reason` が表示言語の文（`.text()`）で、persist.log だけが
+// 日本語（`.ja()`）であることを見る
+
+use tako_control::migrations::MigrateReason;
+use tako_control::setup::SetupRelocateError;
+use tako_core::migration::{FileFailure, MigrateTextError, OutcomeReason, PlanError};
+
+// `MIGRATIONS_SRC` / `SETUP_SRC` は上の節（#2365 の setup 系・移行の断り）と共有する
+const CORE_MIGRATION_SRC: &str = include_str!("../../tako-core/src/migration.rs");
+const CORE_MIGRATION_PATH: &str = "crates/tako-core/src/migration.rs";
+
+fn plan_error_index(e: &PlanError) -> usize {
+    match e {
+        PlanError::FromFuture { .. } => 0,
+        PlanError::MissingStep { .. } => 1,
+        PlanError::NotAdvancing { .. } => 2,
+        PlanError::Overshoot { .. } => 3,
+        PlanError::Cycle => 4,
+    }
+}
+const PLAN_ERRORS: usize = 5;
+
+fn file_failure_index(e: &FileFailure) -> usize {
+    match e {
+        FileFailure::Read(_) => 0,
+        FileFailure::BackupFailed { .. } => 1,
+        FileFailure::WriteFailed { .. } => 2,
+    }
+}
+const FILE_FAILURES: usize = 3;
+
+fn migrate_reason_index(r: &MigrateReason) -> usize {
+    match r {
+        MigrateReason::ProfileUnreadable(_) => 0,
+        MigrateReason::ProjectsUnreadable(_) => 1,
+        MigrateReason::YamlRebuild(_) => 2,
+        MigrateReason::MarkerMoveTouchesOtherLines => 3,
+        MigrateReason::ProfileBaseUnreadable(_) => 4,
+    }
+}
+const MIGRATE_REASONS: usize = 5;
+
+fn setup_relocate_index(e: &SetupRelocateError) -> usize {
+    match e {
+        SetupRelocateError::Archive { .. } => 0,
+        SetupRelocateError::ReadDir { .. } => 1,
+        SetupRelocateError::Walk { .. } => 2,
+        SetupRelocateError::FileType { .. } => 3,
+        SetupRelocateError::CreateDir { .. } => 4,
+        SetupRelocateError::Copy { .. } => 5,
+    }
+}
+const SETUP_RELOCATE_ERRORS: usize = 6;
+
+/// 見本の YAML の読めない理由（中身は #2230 の「種類と位置」。#2365 より前から日英の対）
+fn sample_yaml_reason() -> YamlReason {
+    YamlReason::Located {
+        kind: YamlProblem::Syntax,
+        at: Some((3, 5)),
+    }
+}
+
+/// 見本と #2365 より前の固定文（`migration.rs` の `PlanError::message` が組んでいた文を見本の値で展開）
+fn plan_error_table() -> Vec<(PlanError, &'static str)> {
+    vec![
+        (
+            PlanError::FromFuture {
+                current: 9,
+                target: 3,
+            },
+            "ファイルの形式（v9）が この tako が知る形式（v3）より新しい。tako を更新してください",
+        ),
+        (
+            PlanError::MissingStep { from: 1, target: 3 },
+            "v1 から v3 へ進む移行手順が登録されていない",
+        ),
+        (
+            PlanError::NotAdvancing { from: 2, to: 2 },
+            "移行手順の版数が進んでいない（v2 -> v2）",
+        ),
+        (
+            PlanError::Overshoot {
+                reached: 4,
+                target: 3,
+            },
+            "移行手順が v4 で止まり目標 v3 に届かない",
+        ),
+        (PlanError::Cycle, "移行手順が循環している"),
+    ]
+}
+
+/// `migrate_file_outcome` / `write_with_backup` が `format!` で組んでいた文（見本の値で展開）
+fn file_failure_table() -> Vec<(FileFailure, &'static str)> {
+    vec![
+        (
+            FileFailure::Read(OutcomeReason::verbatim("Permission denied (os error 13)")),
+            "読み取りに失敗: Permission denied (os error 13)",
+        ),
+        (
+            FileFailure::BackupFailed {
+                backup: "/tmp/a.json.pre-v1.bak".into(),
+                cause: OutcomeReason::verbatim("Read-only file system (os error 30)"),
+            },
+            "退避に失敗したので移行しない (/tmp/a.json.pre-v1.bak): Read-only file system (os error 30)",
+        ),
+        (
+            FileFailure::WriteFailed {
+                backup: "/tmp/a.json.pre-v1.bak".into(),
+                cause: OutcomeReason::verbatim("No space left on device (os error 28)"),
+            },
+            "書き込みに失敗: No space left on device (os error 28)（旧内容は /tmp/a.json.pre-v1.bak に残る）",
+        ),
+    ]
+}
+
+/// `migrations.rs` の手順・#1981・#1825 が組んでいた文（見本の値で展開。中身の `YamlReason` /
+/// `ConfigError` は #2365 より前から日英の対なので、日本語の中身はその `text_in(Lang::Ja)`）
+fn migrate_reason_table() -> Vec<(MigrateReason, String)> {
+    let yaml = sample_yaml_reason().text_in(Lang::Ja);
+    let why = ConfigError::Read {
+        file: ConfigFile::Projects,
+        error: "Permission denied (os error 13)".into(),
+    };
+    vec![
+        (
+            MigrateReason::ProfileUnreadable(sample_yaml_reason()),
+            format!("プロファイルとして読めない: {yaml}"),
+        ),
+        (
+            MigrateReason::ProjectsUnreadable(sample_yaml_reason()),
+            format!("projects.yaml として読めない: {yaml}"),
+        ),
+        (
+            MigrateReason::YamlRebuild("unexpected end of input".into()),
+            "YAML の再構成に失敗: unexpected end of input".into(),
+        ),
+        (
+            MigrateReason::MarkerMoveTouchesOtherLines,
+            "区切りの行以外が変わる書き換えになったので書かない（#1981）".into(),
+        ),
+        (
+            MigrateReason::ProfileBaseUnreadable(why.clone()),
+            format!(
+                "{}。default を継承できないので作らない",
+                why.text_in(Lang::Ja)
+            ),
+        ),
+    ]
+}
+
+/// `setup::relocate_setup_dir` / `walk` が `format!` で組んでいた文（見本の値で展開）
+fn setup_relocate_table() -> Vec<(SetupRelocateError, &'static str)> {
+    let e = || "Permission denied (os error 13)".to_string();
+    vec![
+        (
+            SetupRelocateError::Archive {
+                from: "/h/.tako-setup".into(),
+                to: "/h/.tako-setup.pre-v1.bak".into(),
+                error: e(),
+            },
+            "旧 setup ディレクトリの退避に失敗（/h/.tako-setup -> /h/.tako-setup.pre-v1.bak）: Permission denied (os error 13)",
+        ),
+        (
+            SetupRelocateError::ReadDir {
+                path: "/h/s".into(),
+                error: e(),
+            },
+            "/h/s を読めない: Permission denied (os error 13)",
+        ),
+        (
+            SetupRelocateError::Walk {
+                path: "/h/s".into(),
+                error: e(),
+            },
+            "/h/s の走査に失敗: Permission denied (os error 13)",
+        ),
+        (
+            SetupRelocateError::FileType {
+                path: "/h/s/a".into(),
+                error: e(),
+            },
+            "/h/s/a の種別を読めない: Permission denied (os error 13)",
+        ),
+        (
+            SetupRelocateError::CreateDir {
+                path: "/d/setup".into(),
+                error: e(),
+            },
+            "/d/setup を作れない: Permission denied (os error 13)",
+        ),
+        (
+            SetupRelocateError::Copy {
+                from: "/h/s/a".into(),
+                to: "/d/setup/a".into(),
+                error: e(),
+            },
+            "/h/s/a を /d/setup/a へ写せない: Permission denied (os error 13)",
+        ),
+    ]
+}
+
+/// 日本語は旧文とバイト一致・英語は日本語を含まない・英語は日本語と違う・`OutcomeReason` の対が同じ文
+fn check_outcome_texts(
+    failures: &mut Vec<String>,
+    at: impl Fn(Lang) -> String,
+    debug: &str,
+    ja: String,
+    en: String,
+    old: &str,
+    pair: OutcomeReason,
+) {
+    if ja != old {
+        failures.push(format!(
+            "{}: {debug} の日本語が #2365 より前と違う\n  want: {old}\n  got:  {ja}",
+            at(Lang::Ja)
+        ));
+    }
+    if let Some(c) = has_japanese(&en) {
+        failures.push(format!(
+            "{}: {debug} の英語に日本語（{c}）が混ざる: {en}",
+            at(Lang::En)
+        ));
+    }
+    if en.trim().is_empty() || ja == en {
+        failures.push(format!(
+            "{}: {debug} の英語が空か日本語と同じ文（英語の書き忘れ）: {en}",
+            at(Lang::En)
+        ));
+    }
+    if pair.ja() != ja || pair.en() != en {
+        failures.push(format!(
+            "{debug}: 記録の理由（OutcomeReason）が型の文と違う: {pair:?}"
+        ));
+    }
+}
+
+#[test]
+fn 移行の記録の理由は全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let mut failures = Vec::new();
+
+    let plan = plan_error_table();
+    let samples: Vec<PlanError> = plan.iter().map(|(e, _)| e.clone()).collect();
+    covers_every(&samples, plan_error_index, PLAN_ERRORS, "PlanError");
+    for (e, old) in &plan {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                CORE_MIGRATION_SRC,
+                CORE_MIGRATION_PATH,
+                "impl PlanError {",
+                &debug,
+                lang,
+            )
+        };
+        let reason = MigrateTextError::Plan(e.clone()).reason();
+        check_outcome_texts(
+            &mut failures,
+            at,
+            &debug,
+            e.text_in(Lang::Ja),
+            e.text_in(Lang::En),
+            old,
+            reason,
+        );
+    }
+
+    // 手順の失敗（中身の理由は手順が日英の対で渡す）
+    let step = MigrateTextError::Step {
+        from: 1,
+        to: 2,
+        reason: OutcomeReason::new("こわれた", "broken"),
+    };
+    let at = |lang| {
+        where_written(
+            CORE_MIGRATION_SRC,
+            CORE_MIGRATION_PATH,
+            "impl MigrateTextError {",
+            "Step",
+            lang,
+        )
+    };
+    check_outcome_texts(
+        &mut failures,
+        at,
+        "MigrateTextError::Step",
+        step.text_in(Lang::Ja),
+        step.text_in(Lang::En),
+        "v1 -> v2 の移行に失敗: こわれた",
+        step.reason(),
+    );
+
+    let files = file_failure_table();
+    let samples: Vec<FileFailure> = files.iter().map(|(e, _)| e.clone()).collect();
+    covers_every(&samples, file_failure_index, FILE_FAILURES, "FileFailure");
+    for (e, old) in &files {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                CORE_MIGRATION_SRC,
+                CORE_MIGRATION_PATH,
+                "impl FileFailure {",
+                &debug,
+                lang,
+            )
+        };
+        check_outcome_texts(
+            &mut failures,
+            at,
+            &debug,
+            e.text_in(Lang::Ja),
+            e.text_in(Lang::En),
+            old,
+            e.reason(),
+        );
+    }
+
+    let migrate = migrate_reason_table();
+    let samples: Vec<MigrateReason> = migrate.iter().map(|(e, _)| e.clone()).collect();
+    covers_every(
+        &samples,
+        migrate_reason_index,
+        MIGRATE_REASONS,
+        "MigrateReason",
+    );
+    for (e, old) in &migrate {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                MIGRATIONS_SRC,
+                MIGRATIONS_PATH,
+                "impl MigrateReason {",
+                &debug,
+                lang,
+            )
+        };
+        check_outcome_texts(
+            &mut failures,
+            at,
+            &debug,
+            e.text_in(Lang::Ja),
+            e.text_in(Lang::En),
+            old,
+            e.reason(),
+        );
+    }
+
+    let setup = setup_relocate_table();
+    let samples: Vec<SetupRelocateError> = setup.iter().map(|(e, _)| e.clone()).collect();
+    covers_every(
+        &samples,
+        setup_relocate_index,
+        SETUP_RELOCATE_ERRORS,
+        "SetupRelocateError",
+    );
+    for (e, old) in &setup {
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                SETUP_SRC,
+                SETUP_PATH,
+                "impl SetupRelocateError {",
+                &debug,
+                lang,
+            )
+        };
+        let ja = e.text_in(Lang::Ja);
+        let en = e.text_in(Lang::En);
+        let pair = OutcomeReason::of(|lang| e.text_in(lang));
+        check_outcome_texts(&mut failures, at, &debug, ja, en, old, pair);
+    }
+    report_all(failures);
+}
+
+/// 記録の理由の対の口: 型の文から組んだ対は言語ごとに引ける・外から来た文（OS のエラー文）は
+/// 日英同じ・`io::Error` に載せた対は書き込みの失敗の理由まで同じ対のまま届く
+#[test]
+fn 移行の記録の理由の対は言語ごとに引けて書き手の断りの対も届く() {
+    let pair = OutcomeReason::new("日本語", "english");
+    assert_eq!(pair.text_in(Lang::Ja), "日本語");
+    assert_eq!(pair.text_in(Lang::En), "english");
+    let raw = OutcomeReason::verbatim("Permission denied (os error 13)");
+    assert_eq!(raw.ja(), raw.en());
+    // 書き手（`config_io`）が載せた対は `io::Error` を通っても対のまま（文は日本語 = 従来の文）
+    let io = OutcomeReason::new("書けない", "cannot write").into_io_error();
+    assert_eq!(io.to_string(), "書けない");
+    let back = OutcomeReason::from_io(&io);
+    assert_eq!(back, OutcomeReason::new("書けない", "cannot write"));
+    // 載っていない io::Error は OS の文をそのまま（日英同じ）
+    let plain = std::io::Error::other("os says no");
+    assert_eq!(
+        OutcomeReason::from_io(&plain),
+        OutcomeReason::verbatim("os says no")
+    );
+}
+
+/// 移行の記録の理由を組む口（path, ソース, 頭）。日本語の固定文を書かず、型の `text_in` から組む。
+/// persist.log の行（`persist_log(`）は日本語のまま残すので外して読む
+const MIGRATION_REASON_SCOPES: &[(&str, &str, &str)] = &[
+    (
+        CORE_MIGRATION_PATH,
+        CORE_MIGRATION_SRC,
+        "fn migrate_file_outcome(",
+    ),
+    (
+        CORE_MIGRATION_PATH,
+        CORE_MIGRATION_SRC,
+        "pub fn write_with_backup(",
+    ),
+    (MIGRATIONS_PATH, MIGRATIONS_SRC, "fn json_ok<"),
+    (MIGRATIONS_PATH, MIGRATIONS_SRC, "fn yaml_ok<"),
+    (MIGRATIONS_PATH, MIGRATIONS_SRC, "fn profile_unreadable("),
+    (MIGRATIONS_PATH, MIGRATIONS_SRC, "fn yaml_rebuild_failed("),
+    (
+        MIGRATIONS_PATH,
+        MIGRATIONS_SRC,
+        "fn strip_legacy_default_model(",
+    ),
+    (MIGRATIONS_PATH, MIGRATIONS_SRC, "fn pin_sandbox_bypass("),
+    (
+        MIGRATIONS_PATH,
+        MIGRATIONS_SRC,
+        "pub fn adopt_worker_mcp_usage_in(",
+    ),
+    (MIGRATIONS_PATH, MIGRATIONS_SRC, "fn append_marker_move("),
+    (
+        MIGRATIONS_PATH,
+        MIGRATIONS_SRC,
+        "fn project_profile_reports(",
+    ),
+    (MIGRATIONS_PATH, MIGRATIONS_SRC, "fn handoff_reports("),
+    (MIGRATIONS_PATH, MIGRATIONS_SRC, "fn setup_reports("),
+    (
+        MIGRATIONS_PATH,
+        MIGRATIONS_SRC,
+        "fn powershell_profile_reports_for(",
+    ),
+    (MIGRATIONS_PATH, MIGRATIONS_SRC, "fn webview2_reports_for("),
+    (
+        MIGRATIONS_PATH,
+        MIGRATIONS_SRC,
+        "impl MigrationIo for ConfigIo {",
+    ),
+    (MIGRATIONS_PATH, MIGRATIONS_SRC, "fn file_json("),
+    (SETUP_PATH, SETUP_SRC, "pub fn relocate_setup_dir("),
+    (SETUP_PATH, SETUP_SRC, "fn walk("),
+];
+
+/// 範囲の中で、日本語の固定文の行と、言語を日本語に固定して組む行（persist.log の行は外す）
+fn scan_migration_reason(sources: &[(&str, &str, &str)]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (path, src, head) in sources {
+        let Some(lines) = front_scope_lines(src, Some(head)) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする。MIGRATION_REASON_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in japanese_outside(&lines, &DISPATCH_NOTE_INTERNAL) {
+            failures.push(format!(
+                "{path}:{line}: 移行の記録の理由を組む口（`{head}`）に日本語の固定文がある = 英語表示の \
+                 `tako migrate status` にもそのまま出る（型の text_in から OutcomeReason を組む）: {text}"
+            ));
+        }
+        for (line, code) in ja_fixed_outside_log(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 移行の記録の理由を日本語に固定して組んでいる = 英語表示でも理由だけ日本語 \
+                 （`OutcomeReason::of(|lang| …text_in(lang))` で日英の両方を持たせる）: {code}"
+            ));
+        }
+    }
+    failures
+}
+
+/// 応答の JSON（`file_json`）の `reason` は表示言語の文。日本語（`.ja()`）で載せてよいのは
+/// `reason_ja` の鍵だけ（`Created` の日英の鍵）
+fn scan_file_json_reason(src: &str) -> Vec<String> {
+    let head = "fn file_json(";
+    let Some(lines) = front_scope_lines(src, Some(head)) else {
+        return vec![format!(
+            "{MIGRATIONS_PATH}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする）"
+        )];
+    };
+    let mut failures = Vec::new();
+    for (line, code) in &lines {
+        if code.trim_start().starts_with("//") || !code.contains("\"reason\".into()") {
+            continue;
+        }
+        if !code.contains(".text()") {
+            failures.push(format!(
+                "{MIGRATIONS_PATH}:{line}: 応答の `reason` を表示言語の文（`.text()`）で載せていない = \
+                 英語表示の `tako migrate status` に日本語の理由が出る: {}",
+                code.trim()
+            ));
+        }
+    }
+    failures
+}
+
+#[test]
+fn 移行の記録の理由を組む口に日本語の固定文が無く応答は表示言語で載せる() {
+    let mut failures = scan_migration_reason(MIGRATION_REASON_SCOPES);
+    failures.extend(scan_file_json_reason(MIGRATIONS_SRC));
+    report_all(failures);
+}
+
+/// 番犬自身の検査（本物のソースへ注入）: 組む口へ日本語の固定文を戻す・言語を日本語に固定する・
+/// 応答の `reason` を日本語で載せると、その行を `file:line` で名指す
+#[test]
+fn 移行の記録の理由の口へ日本語を戻すと名指す() {
+    let injections: [(&str, &str, &str, &str, &str); 4] = [
+        (
+            CORE_MIGRATION_PATH,
+            CORE_MIGRATION_SRC,
+            "fn migrate_file_outcome(",
+            "reason: FileFailure::Read(OutcomeReason::from_io(&e)).reason(),",
+            "reason: OutcomeReason::verbatim(format!(\"読み取りに失敗: {e}\")),",
+        ),
+        (
+            MIGRATIONS_PATH,
+            MIGRATIONS_SRC,
+            "fn project_profile_reports(",
+            "reason: OutcomeReason::of(|lang| reason.text_in(lang)),",
+            "reason: OutcomeReason::verbatim(reason.text_in(tako_core::i18n::Lang::Ja)),",
+        ),
+        (
+            SETUP_PATH,
+            SETUP_SRC,
+            "fn walk(",
+            "SetupRelocateError::ReadDir { path, error }",
+            "SetupRelocateError::ReadDir { path: format!(\"{path} を読めない\"), error }",
+        ),
+        (
+            MIGRATIONS_PATH,
+            MIGRATIONS_SRC,
+            "fn file_json(",
+            "map.insert(\"reason\".into(), reason.text().into());\n        }\n        FileOutcome::Absent",
+            "map.insert(\"reason\".into(), reason.ja().into());\n        }\n        FileOutcome::Absent",
+        ),
+    ];
+    for (path, src, head, from, to) in injections {
+        let start = src
+            .find(head)
+            .unwrap_or_else(|| panic!("{path}: 範囲の頭が無い: {head}"));
+        let at = start
+            + src[start..]
+                .find(from)
+                .unwrap_or_else(|| panic!("{path}: 範囲の中に注入元が無い: {from}"));
+        let injected = format!("{}{to}{}", &src[..at], &src[at + from.len()..]);
+        let want = injected[..at].lines().count().max(1);
+        let mut found = scan_migration_reason(&[(path, injected.as_str(), head)]);
+        if head == "fn file_json(" {
+            found = scan_file_json_reason(&injected);
+        }
+        assert!(
+            !found.is_empty()
+                && found
+                    .iter()
+                    .all(|f| f.starts_with(&format!("{path}:{want}: "))),
+            "{path}: 注入（{to}）を {path}:{want} として名指すはず: {found:?}"
+        );
+    }
+}
+
+/// 返答の配送の理由（`Reason::UserTask*`。#2365 の続き）を組む口。配送の記録は書いた時点の
+/// 表示言語で残るので、日本語の固定文を書かない（persist.log の `log_user_task_delivery` は slug だけ）
+const USER_TASK_DELIVERY_SCOPES: &[(&str, &str, &str)] = &[
+    (DISPATCH_PATH, DISPATCH_SRC, "    fn refused_on_ui(self)"),
+    (DISPATCH_PATH, DISPATCH_SRC, "pub fn user_task_launch_land("),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "fn deliver_user_task_response(",
+    ),
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "fn launch_master_for_response(",
+    ),
+    (
+        USER_TASKS_PATH,
+        USER_TASKS_SRC,
+        "pub fn unresolved_delivery(",
+    ),
+];
+
+fn scan_user_task_delivery(sources: &[(&str, &str, &str)]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (path, src, head) in sources {
+        let Some(lines) = front_scope_lines(src, Some(head)) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする。USER_TASK_DELIVERY_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in japanese_outside(&lines, &DISPATCH_NOTE_INTERNAL) {
+            failures.push(format!(
+                "{path}:{line}: 返答の配送の理由を組む口（`{head}`）に日本語の固定文がある = 英語表示でも \
+                 配送の記録の理由が日本語（`Reason::UserTask*` で組む）: {text}"
+            ));
+        }
+    }
+    failures
+}
+
+#[test]
+fn 返答の配送の理由を組む口に日本語の固定文が無い() {
+    report_all(scan_user_task_delivery(USER_TASK_DELIVERY_SCOPES));
+}
+
+/// 番犬自身の検査（本物のソースへ注入）: 配送の理由を日本語の固定文へ戻すと名指す
+#[test]
+fn 返答の配送の理由へ日本語の固定文を戻すと名指す() {
+    let injections: [(&str, &str, &str, &str, &str); 2] = [
+        (
+            DISPATCH_PATH,
+            DISPATCH_SRC,
+            "fn launch_master_for_response(",
+            "Some(Reason::UserTaskLaunchPaneMissing.to_string()),",
+            "Some(\"起動したタブのペインを解決できない\".into()),",
+        ),
+        (
+            DISPATCH_PATH,
+            DISPATCH_SRC,
+            "    fn refused_on_ui(self)",
+            "Some(Reason::UserTaskLaunchPlanDeferred.to_string()),",
+            "Some(\"master の起動の組み立てを UI スレッドでは待たない\".into()),",
+        ),
+    ];
+    for (path, src, head, from, to) in injections {
+        let start = src
+            .find(head)
+            .unwrap_or_else(|| panic!("{path}: 範囲の頭が無い: {head}"));
+        let at = start
+            + src[start..]
+                .find(from)
+                .unwrap_or_else(|| panic!("{path}: 範囲の中に注入元が無い: {from}"));
+        let injected = format!("{}{to}{}", &src[..at], &src[at + from.len()..]);
+        let want = injected[..at].lines().count().max(1);
+        let found = scan_user_task_delivery(&[(path, injected.as_str(), head)]);
+        assert_eq!(
+            found.len(),
+            1,
+            "{path}: 注入（{to}）を 1 件だけ名指すはず: {found:?}"
+        );
+        assert!(
+            found[0].starts_with(&format!("{path}:{want}: ")),
+            "{path}: 注入（{to}）を {path}:{want} として名指すはず: {found:?}"
         );
     }
 }
