@@ -105,18 +105,19 @@ pub fn reason(band: &WaitBand) -> String {
     text
 }
 
-/// 3 行目: 待っている間の打鍵の扱い（受け付けなかった入力があれば回数）
+/// 3 行目: 待っている間の打鍵の扱い（受け付けなかった入力があれば回数）。1 行目が「起動待ち」と
+/// 言っているので短く（狭い worker のペインでも回数まで読める長さ）
 pub fn input_note(ignored: u32) -> String {
     if ignored == 0 {
         tr!(
-            "起動待ちのため、入力は起動してから受け付けます",
-            "Input is accepted once the agent has started"
+            "入力は起動してから受け付けます",
+            "Input is accepted after the agent starts"
         )
         .to_string()
     } else {
         tr!(
-            format!("起動待ちのため、入力は起動してから受け付けます（受け付けなかった入力 {ignored} 回）"),
-            format!("Input is accepted once the agent has started ({ignored} inputs ignored)")
+            format!("入力は起動してから受け付けます · 受け付けなかった入力 {ignored} 回"),
+            format!("Input is accepted after the agent starts · {ignored} ignored")
         )
     }
 }
@@ -211,7 +212,7 @@ mod tests {
         let [t, r, n] = lines(&b, 0);
         assert_eq!(t, "claude の起動待ち · 3 本中 2 番目");
         assert_eq!(r, "メモリ圧 warn · 空き 1.2 GB（戻ると自動で起動）");
-        assert_eq!(n, "起動待ちのため、入力は起動してから受け付けます");
+        assert_eq!(n, "入力は起動してから受け付けます");
         assert!(input_note(4).contains("4 回"));
         tako_core::i18n::set_lang(tako_core::i18n::Lang::En);
         let [t, r, n] = lines(&b, 2);
@@ -220,6 +221,6 @@ mod tests {
             r,
             "Memory pressure warn · 1.2 GB free (starts when memory recovers)"
         );
-        assert!(n.contains("2 inputs ignored"), "{n}");
+        assert!(n.ends_with("2 ignored"), "{n}");
     }
 }

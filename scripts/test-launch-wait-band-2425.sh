@@ -165,10 +165,14 @@ YAML
     --description "#2425 の検証（自動削除される）" >/dev/null 2>&1
 }
 
-# 注入: inject <pressure>（書きかけを読ませない = 一時ファイルへ書いて rename）
+# 注入: inject <pressure>（書きかけを読ませない = 一時ファイルへ書いて rename）。逼迫中の空きは帯の文に出る
+# 値、normal の空きは予約と見込みを足しても余る値（空きが少ないままだと圧が normal でも
+# 「空きメモリ不足」で待ち続ける）
 inject() {
-  printf '{"total_mb":36864,"available_mb":1229,"pressure":"%s","swap_used_mb":0,"startup_secs":2}\n' \
-    "$1" > "$INJECT.tmp"
+  local avail=1229
+  [ "$1" = normal ] && avail=20480
+  printf '{"total_mb":36864,"available_mb":%s,"pressure":"%s","swap_used_mb":0,"startup_secs":2}\n' \
+    "$avail" "$1" > "$INJECT.tmp"
   command mv -f "$INJECT.tmp" "$INJECT"
 }
 

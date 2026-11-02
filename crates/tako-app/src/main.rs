@@ -64982,13 +64982,16 @@ mod self_test {
             );
             return;
         }
-        // 書きかけを読ませない（一時ファイルへ書いて rename）。空きは帯の文に出る値
+        // 書きかけを読ませない（一時ファイルへ書いて rename）。critical の空きは帯の文に出る値、
+        // normal の空きは予約（`resources` の既定）と見込みを足しても余る値（空きが少ないままだと
+        // 圧が normal でも「空きメモリ不足」で待ち続ける）
         let write_inject = |pressure: &str| {
+            let available_mb = if pressure == "normal" { 20480 } else { 1229 };
             let tmp = inject.with_extension("tmp");
             let _ = std::fs::write(
                 &tmp,
                 format!(
-                    r#"{{"total_mb":36864,"available_mb":1229,"pressure":"{pressure}","swap_used_mb":0,"startup_secs":2}}"#
+                    r#"{{"total_mb":36864,"available_mb":{available_mb},"pressure":"{pressure}","swap_used_mb":0,"startup_secs":2}}"#
                 ),
             );
             let _ = std::fs::rename(&tmp, &inject);
