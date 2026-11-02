@@ -7637,7 +7637,14 @@ mod tests {
         let (status, body) = input_reply(&json!({ "sent": false, "paste_guard": guard }));
         assert_eq!(status, 409);
         assert_eq!(body["paste_guard"]["findings"][0]["masked"], "ghp_…qrst");
-        assert!(body["error"].as_str().unwrap().contains("送っていない"));
+        // 文は daemon の表示言語（#2365）。日英どちらの正本の文でも当たる
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| error == crate::RemoteRefusal::InputSecretSuspected.text_in(lang)),
+            "{error}"
+        );
         let warned = json!({ "queued": true, "paste_guard": { "verdict": "warn" } });
         let (status, body) = input_reply(&warned);
         assert_eq!((status, body["ok"].clone()), (200, json!(true)));
@@ -7846,16 +7853,6 @@ mod tests {
         assert!(tcp.contains("tako remote start"), "{tcp}");
     }
 
-    /// #841: **偽の `X-Forwarded-For` を付けたローカルプロセスは認証を通れない**。
-    ///
-    /// 修正前は、ループバック TCP へ繋げる誰でも「ペアリング済み端末の tailnet IP を
-    /// XFF に入れる」だけで層①を通り、role 次第で実質シェルアクセスになった。
-    /// この 1 本が **A/B を同居**させる:
-    ///
-    /// - 既定（検証あり）= 403 + 理由コード
-    /// - `TAKO_841_LEGACY=1`（検証なし）= 200 / 層②も通過 = **修正前の再現**
-    /// - `TAKO_REMOTE_TRUSTED_PEER_NAMES` で接続元を信頼名にする = 200
-    ///   （正規の tailscaled 経由の代理。実 tailscaled は root で動くのでテストから起こせない）
     /// スマホの close が「最後のタブの最後のペイン」を断られたら、GUI の表示言語に依らず 409 へ寄る
     /// （#2365 の続き。英語表示の GUI の文は `LastPane` も「最後」も含まず、502 で IPC を捨てていた）
     #[test]
@@ -7875,6 +7872,16 @@ mod tests {
         assert!(!says_last_pane("tab 3 not found"));
     }
 
+    /// #841: **偽の `X-Forwarded-For` を付けたローカルプロセスは認証を通れない**。
+    ///
+    /// 修正前は、ループバック TCP へ繋げる誰でも「ペアリング済み端末の tailnet IP を
+    /// XFF に入れる」だけで層①を通り、role 次第で実質シェルアクセスになった。
+    /// この 1 本が **A/B を同居**させる:
+    ///
+    /// - 既定（検証あり）= 403 + 理由コード
+    /// - `TAKO_841_LEGACY=1`（検証なし）= 200 / 層②も通過 = **修正前の再現**
+    /// - `TAKO_REMOTE_TRUSTED_PEER_NAMES` で接続元を信頼名にする = 200
+    ///   （正規の tailscaled 経由の代理。実 tailscaled は root で動くのでテストから起こせない）
     #[test]
     fn 偽のxffを付けたローカルプロセスは接続元検証で拒否される() {
         // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
@@ -8164,8 +8171,15 @@ mod tests {
         // ① observe の実行は層②で 403（受け口へ届かない）
         let (status, body) = run("100.64.0.21");
         assert_eq!(status, 403, "observe の端末が実行できてしまう: {body}");
+        // 文は daemon の表示言語（#2365）。日英どちらの正本の文でも、足りない role を名指す
+        let too_low = crate::RemoteRefusal::RoleTooLow {
+            required: DeviceRole::Interact,
+            current: DeviceRole::Observe,
+        };
         assert!(
-            body.contains("interact 以上"),
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| body.contains(&too_low.text_in(lang))),
             "足りない role を名指す: {body}"
         );
         // ② observe でも一覧は認可を通る（app が居ないので 503 = 認可は通った）

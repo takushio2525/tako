@@ -562,9 +562,7 @@ impl RemoteRefusal {
                 None => "tako app が稼働していない".to_string(),
             },
             (Self::AppNotRunning(via), En) => match via.what_in(lang) {
-                Some(what) => {
-                    format!("the tako app is not running ({what} only works through the app)")
-                }
+                Some(what) => format!("the tako app is not running (the app is required for {what})"),
                 None => "the tako app is not running".to_string(),
             },
             (Self::TabNotFound(id), Ja) => format!("タブ {id} が見つからない"),
