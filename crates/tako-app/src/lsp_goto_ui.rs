@@ -253,6 +253,8 @@ impl TakoApp {
                     | OffloadContinuation::SpawnLaunch(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#2657 の close の UI の段）
                     OffloadContinuation::ClosePlace(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#2663 の tako mod の着地）
+                    OffloadContinuation::Mod(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }

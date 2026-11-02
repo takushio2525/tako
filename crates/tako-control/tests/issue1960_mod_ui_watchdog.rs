@@ -470,31 +470,35 @@ fn all(s: &Sources) -> Vec<String> {
     );
     // dispatch（MCP と GUI）: ui と帯の切替が同じ 1 実装
     let run_window = ("pub fn run(", "}");
-    for (must, why) in [
-        (
-            "crate::claude_mod_ui::run(&ui_path(host)?, &ui.unwrap_or_default())",
-            "dispatch の action=ui が claude_mod_ui::run を通らない",
-        ),
-        (
-            "crate::claude_mod_ui::run(&ui_path(host)?, &request)",
-            "band-on / band-off が ui.json を通らない（帯のトグルの正本は ui.json = メモリの中継へ戻さない）",
-        ),
-    ] {
+    for (must, why) in [(
+        "crate::claude_mod_ui::run(&ui_path(host)?, &ui.unwrap_or_default())",
+        "dispatch の action=ui が claude_mod_ui::run を通らない",
+    )] {
         require(&mut out, CONTROL_MOD, &s.control_mod, run_window, must, why);
     }
+    // #2663: band-on / band-off の書き込みと、報告の帯のトグルの取り込み・ui.json の読みは続きの段
+    // （IPC では background）。UI スレッドの段（`action_prepare` / `accept_report`）では書かない・読まない
     require(
         &mut out,
         CONTROL_MOD,
         &s.control_mod,
-        ("fn band_view(", "}"),
-        "crate::claude_mod_ui::view(",
+        ("impl ActionJob {", "}"),
+        "crate::claude_mod_ui::run(path, &request)",
+        "band-on / band-off が ui.json を通らない（帯のトグルの正本は ui.json = メモリの中継へ戻さない）",
+    );
+    require(
+        &mut out,
+        CONTROL_MOD,
+        &s.control_mod,
+        ("impl ReportJob {", "}"),
+        "crate::claude_mod_ui::view",
         "報告の応答の tako.view.ui が検証済みの ui.json から来ていない",
     );
     require(
         &mut out,
         CONTROL_MOD,
         &s.control_mod,
-        ("fn accept_report(", "}"),
+        ("impl ReportJob {", "}"),
         "crate::claude_mod_ui::import_band(",
         "mod の中で切り替えた帯のトグルを ui.json へ取り込んでいない",
     );
@@ -597,7 +601,8 @@ fn 走査が空振りしていない() {
     for (src, needle) in [
         (&s.cli_main, "fn mod_ui_local("),
         (&s.control_mod, "pub fn run("),
-        (&s.control_mod, "fn band_view("),
+        (&s.control_mod, "impl ReportJob {"),
+        (&s.control_mod, "impl ActionJob {"),
         (&s.control_mod, "fn accept_report("),
         (&s.mcp_request, "\"tako_mod\" => {"),
         (&s.cli_setup, "fn review_mod_ui("),
@@ -632,8 +637,8 @@ fn 逆戻りを名指しできる() {
     // 1. 帯の切替をメモリの中継へ戻す
     let found = mutate(&|s| {
         s.control_mod = s.control_mod.replacen(
-            "crate::claude_mod_ui::run(&ui_path(host)?, &request)",
-            "host.claude_mod_mut().unwrap().request_band(&request)",
+            "crate::claude_mod_ui::run(path, &request)",
+            "request_band(path, &request)",
             1,
         );
     });
@@ -671,7 +676,7 @@ fn 逆戻りを名指しできる() {
     // 5. 応答の ui を既定値の直書きへ
     let found = mutate(&|s| {
         s.control_mod = s.control_mod.replacen(
-            ".map(|p| crate::claude_mod_ui::view(&p))",
+            ".map(crate::claude_mod_ui::view)",
             ".map(|_| Default::default())",
             1,
         );
@@ -708,7 +713,7 @@ fn 逆戻りを名指しできる() {
     let found = mutate(&|s| {
         s.control_mod =
             s.control_mod
-                .replacen("crate::claude_mod_ui::import_band(&path, band);", "", 1);
+                .replacen("crate::claude_mod_ui::import_band(path, band);", "", 1);
     });
     assert_named(&found, CONTROL_MOD, "取り込んでいない");
     // 10. setup の口が自前で書く

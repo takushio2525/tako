@@ -116,6 +116,10 @@ pub const CHAT_LEGACY_ENV: &str = "TAKO_1964_LEGACY";
 /// ペインの外の claude の報告をペインへ記録しない前（#2559）へ戻す A/B の入口。自動命名の `claude -p` へ
 /// GUI の env をそのまま渡し（[`helper_env`] を当てない）、報告の送り主の居場所（[`report_origin`]）を見ない
 pub const HELPER_LEGACY_ENV: &str = "TAKO_2559_LEGACY";
+/// `tako mod` の IPC（報告・status・on / off・帯の切り替え）の画面の採取と ui.json の読み書きを
+/// UI スレッドで行っていた前（#2663）へ戻す A/B の入口。報告と on / off・帯は同期の dispatch、
+/// status は準備の段（UI スレッド）で全ペインの画面を採る
+pub const OFFLOAD_LEGACY_ENV: &str = "TAKO_2663_LEGACY";
 /// GUI がペインの外で起こす claude（自動命名の `claude -p`）へ渡さない env（#2559。[`helper_env`]）。
 ///
 /// ペインの識別・mod の起床条件（`register.ts` の `wake` が見る `TAKO_PANE_ID` と [`CLI_ENV`]）・
@@ -593,6 +597,11 @@ pub fn no_report_legacy() -> bool {
 /// #2559 の A/B（[`HELPER_LEGACY_ENV`]）が立っているか
 pub fn helper_legacy() -> bool {
     std::env::var_os(HELPER_LEGACY_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// #2663 の A/B（[`OFFLOAD_LEGACY_ENV`]）が立っているか
+pub fn offload_legacy() -> bool {
+    std::env::var_os(OFFLOAD_LEGACY_ENV).is_some_and(|v| !v.is_empty())
 }
 
 /// GUI がペインの外で起こす claude（自動命名の `claude -p`）の env の差分（#2559）。`None` は外す。
@@ -1568,6 +1577,8 @@ pub struct ModHub {
     pub cards_place: crate::claude_mod_ui::Place,
     /// ui.json の `chat.place`（S7-6 #1964。[`Self::cards_place`] と同じく報告のたびに写す）
     pub chat_place: crate::claude_mod_ui::Place,
+    /// 最後に写した置き場の読みの通し番号（#2663。[`Self::copy_places`]）
+    pub places_seq: u64,
     /// 利用制限の観測と会話 → ログインの対応の材料（usage 分析 S1 #2200）。報告を受けるたびに
     /// 同じペインの前の報告と比べ、値が変わった枠・初めての会話だけを積む（heartbeat では積まない）。
     /// GUI の定期処理が汲み出し、鍵の解決と `<data_dir>/usage/` への追記は背景で行う
@@ -1645,6 +1656,26 @@ impl ModHub {
         entry.count += 1;
         entry.last = now;
         Accepted::Foreign
+    }
+
+    /// 報告の続き（背景の段）が読んだ ui.json の置き場（`cards.place` / `chat.place`）を写す（#2663）。
+    ///
+    /// `seq` は背景の段が ui.json を読んだ順の通し番号。ペインの違う報告の続きは並行して走り、着地の順が
+    /// 読んだ順と入れ替わりうるので、**より後で読んだ値だけ**を残す（古い読みで新しい値を上書きしない =
+    /// 最後に残る値は UI スレッドで順に読んでいた修正前と同じ）。写したら真
+    pub fn copy_places(
+        &mut self,
+        seq: u64,
+        cards: crate::claude_mod_ui::Place,
+        chat: crate::claude_mod_ui::Place,
+    ) -> bool {
+        if seq <= self.places_seq {
+            return false;
+        }
+        self.places_seq = seq;
+        self.cards_place = cards;
+        self.chat_place = chat;
+        true
     }
 
     /// 報告を受け取る。`ended` ならそのペインの報告を捨てる

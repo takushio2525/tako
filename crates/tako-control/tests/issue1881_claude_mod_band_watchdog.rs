@@ -27,7 +27,7 @@
 //! 6. A/B（`TAKO_1877_S3_LEGACY`）と検証用の閾値（`TAKO_1881_BAND_THRESHOLD`）の env の名前を
 //!    文字列で読むのは `tako_core::claude_mod` の 1 か所だけ。応答の組み立て（`snapshot`）は
 //!    `legacy` のとき `view` を載せない
-//! 7. worker の数え方は 1 実装: 帯（`claude_mod::band_view`）と右パネル orch が
+//! 7. worker の数え方は 1 実装: 帯（`claude_mod::band_seed`。#2663 で UI スレッドの写しの段）と右パネル orch が
 //!    `Workspace::workers_of(` を通し、orch に inline の規則（`master_count`）を戻さない
 //!
 //! # 見逃す側へ倒れないための作り
@@ -460,7 +460,8 @@ fn scan_env(s: &Sources) -> Vec<String> {
     }
     match window(&s.control, "pub(crate) fn snapshot(", "}") {
         Some(w) => {
-            if !(w.1.contains("!legacy") && w.1.contains("band_view(")) {
+            // #2663: 帯の材料は写し（`band_seed`）→ 仕上げ（`Snapshot::finish`）の 2 段。載せるかは写しで決まる
+            if !(w.1.contains("!legacy") && w.1.contains("band_seed(")) {
                 out.push(report(
                     CONTROL,
                     w.0,
@@ -490,7 +491,7 @@ fn scan_env(s: &Sources) -> Vec<String> {
 /// 7. worker の数え方は 1 実装
 fn scan_workers(control: &str, right_panel: &str) -> Vec<String> {
     let mut out = Vec::new();
-    match window(control, "fn band_view(", "}") {
+    match window(control, "fn band_seed(", "}") {
         Some(w) if w.1.contains(".workers_of(") => {}
         Some(w) => out.push(report(
             CONTROL,
@@ -500,7 +501,7 @@ fn scan_workers(control: &str, right_panel: &str) -> Vec<String> {
         None => out.push(report(
             CONTROL,
             1,
-            "band_view が見つからない（走査が空振り）",
+            "band_seed が見つからない（走査が空振り）",
         )),
     }
     match window(right_panel, "fn render_orch_view(", "    }") {
@@ -561,7 +562,7 @@ fn 走査が空振りしていない() {
         (&s.register, "async function wake("),
         (&s.register, "async function syncStore("),
         (&s.control, "pub(crate) fn snapshot("),
-        (&s.control, "fn band_view("),
+        (&s.control, "fn band_seed("),
         (&s.right_panel, "fn render_orch_view("),
     ] {
         assert!(src.contains(needle), "{needle} が見つからない");
@@ -714,8 +715,8 @@ fn 逆戻りを名指しできる() {
     assert_named(&found, CONTROL, "TAKO_1877_S3_LEGACY");
     let found = mutate(&|s| {
         s.control = s.control.replacen(
-            "if accepted == Accepted::Stored && !legacy {",
-            "if accepted == Accepted::Stored {",
+            "(accepted == Accepted::Stored && !legacy)",
+            "(accepted == Accepted::Stored)",
             1,
         );
     });
