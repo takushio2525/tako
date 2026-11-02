@@ -902,6 +902,14 @@ pub enum Reason {
         item: usize,
         total: usize,
     },
+    /// `replace には replacement（置換後の文字列）が要る`（#2045）
+    ReplaceNeedsReplacement,
+    /// `item と file は同時に指定できない`（#2045）
+    ReplaceItemAndFile,
+    /// `結果に <file> の行が無い`（#2045）
+    ReplaceFileNotInResults(String),
+    /// `前の置換を当てている途中`（#2045。同じファイルを 2 つの回が取り合わない）
+    ReplaceBusy,
     // ---- #2365 の続き: 変更履歴（プレビューの changelog）の断り ----
     /// `変更履歴を取っている間にプレビューのファイルが変わった（履歴を置かない）`
     ChangelogFileChanged,
@@ -1136,6 +1144,15 @@ pub enum Reason {
     /// 返答の配送で起票 master を起こす組み立て（`master_launch::plan`）が断った（`error` は
     /// その断りの文 = 同じ表示言語。配送の記録の理由になる）
     UserTaskMasterLaunchFailed(String),
+    /// 返答の配送で起票元の master プロファイルを解決できない（#1466。配送の記録の理由で、
+    /// 正本は `user_tasks::UNRESOLVED_ORIGIN_REASON`）
+    UserTaskOriginUnresolved,
+    /// 返答の配送で、もう一巡を出せない UI スレッドの呼び手が起動の組み立てを待たずに断った（#2182）
+    UserTaskLaunchPlanDeferred,
+    /// 返答の配送で、組み立てた起動が着地へ届かなかった（#2182。来ないはずの経路を無言にしない）
+    UserTaskLaunchPlanLost,
+    /// 返答の配送で起こしたタブのペインを解決できない
+    UserTaskLaunchPaneMissing,
 }
 
 /// ペイン ID の並び（`3, 5`）。複数ペインに当たった断りに添える
@@ -2730,6 +2747,32 @@ impl Reason {
             (Self::ItemOutsideResults { item, total }, En) => {
                 format!("item {item} is outside the results ({total} items)")
             }
+            (Self::ReplaceNeedsReplacement, Ja) => {
+                "replace には replacement（置換後の文字列。空文字で一致を消す）が要る".to_string()
+            }
+            (Self::ReplaceNeedsReplacement, En) => {
+                "replace needs replacement (the new text; an empty string deletes the matches)"
+                    .to_string()
+            }
+            (Self::ReplaceItemAndFile, Ja) => {
+                "item と file は同時に指定できない（1 行か 1 ファイルのどちらか）".to_string()
+            }
+            (Self::ReplaceItemAndFile, En) => {
+                "item and file cannot be given together (one line or one file)".to_string()
+            }
+            (Self::ReplaceFileNotInResults(file), Ja) => {
+                format!("結果に {file} の行が無い（結果の path か表示の相対パスで指定する）")
+            }
+            (Self::ReplaceFileNotInResults(file), En) => format!(
+                "the results have no line in {file} (give the result path or its relative path)"
+            ),
+            (Self::ReplaceBusy, Ja) => {
+                "前の置換を当てている途中（終わってからもう一度）".to_string()
+            }
+            (Self::ReplaceBusy, En) => {
+                "a previous replacement is still being applied (try again when it finishes)"
+                    .to_string()
+            }
             (Self::ChangelogFileChanged, Ja) => {
                 "変更履歴を取っている間にプレビューのファイルが変わった（履歴を置かない）".to_string()
             }
@@ -3224,6 +3267,38 @@ impl Reason {
             }
             (Self::UserTaskMasterLaunchFailed(error), En) => {
                 format!("cannot start the master: {error}")
+            }
+            (Self::UserTaskOriginUnresolved, Ja) => {
+                "宛先不明: 起票元の master プロファイルを解決できない\
+                 （呼び出し元の role も spawn 元の master も残っていない）"
+                    .into()
+            }
+            (Self::UserTaskOriginUnresolved, En) => {
+                "no destination: cannot resolve the master profile that filed the task \
+                 (neither the caller's role nor the master that spawned it remains)"
+                    .into()
+            }
+            (Self::UserTaskLaunchPlanDeferred, Ja) => {
+                "master の起動の組み立て（CLI の所在確認）を UI スレッドでは待たない\
+                 （もう一度返答すると組み立て直す）"
+                    .into()
+            }
+            (Self::UserTaskLaunchPlanDeferred, En) => {
+                "the UI thread does not wait for building the master launch (checking where the \
+                 CLI is); respond again to build it again"
+                    .into()
+            }
+            (Self::UserTaskLaunchPlanLost, Ja) => {
+                "master の起動の組み立てが着地へ届かなかった".into()
+            }
+            (Self::UserTaskLaunchPlanLost, En) => {
+                "the master launch that was built did not reach the landing step".into()
+            }
+            (Self::UserTaskLaunchPaneMissing, Ja) => {
+                "起動したタブのペインを解決できない".into()
+            }
+            (Self::UserTaskLaunchPaneMissing, En) => {
+                "cannot resolve the pane of the tab that was started".into()
             }
         }
     }
@@ -4544,6 +4619,476 @@ fn workspace_search_open(
         "landing": plan.slug(),
         "open": opened,
     }))
+}
+
+// --- 横断置換（#2045）--------------------------------------------------------
+
+/// 開いている編集バッファの写し（#2045。UI スレッド）。`names` があればそのファイル名のペインだけ
+/// （右パネルの結果に当てるとき = 当てるファイルが分かっている）。実体のパスでの突き合わせは background
+fn workspace_replace_buffers(
+    host: &dyn ControlHost,
+    names: Option<&HashSet<std::ffi::OsString>>,
+) -> Vec<crate::workspace_replace::BufferSnap> {
+    let mut out = Vec::new();
+    for id in host.workspace().all_panes().into_iter().map(|p| p.id()) {
+        let Some((path, _)) = host.preview_state(id) else {
+            continue;
+        };
+        if let Some(names) = names {
+            if !Path::new(&path)
+                .file_name()
+                .is_some_and(|n| names.contains(n))
+            {
+                continue;
+            }
+        }
+        let dirty = host.preview_edit_state(id).is_some_and(|(_, dirty)| dirty);
+        let mut copied = None;
+        host.read_preview_buffer(id, &mut |text, version| {
+            copied = Some((text.to_string(), version));
+        });
+        if let Some((text, version)) = copied {
+            out.push(crate::workspace_replace::BufferSnap {
+                pane: id,
+                path: path.clone(),
+                text,
+                version,
+                dirty,
+            });
+        }
+    }
+    out
+}
+
+/// 横断置換の準備（UI スレッド。#2045）。範囲の行を決め、開いている編集バッファを写し、当てるなら
+/// 置き場に「当てている最中」を立てて記録の番号を取る。**ファイルは読まない**（照合・退避・書き込みは
+/// background の [`crate::workspace_replace::ReplaceJob::run`]）
+#[allow(clippy::too_many_arguments)]
+fn workspace_replace_prepare(
+    host: &mut dyn ControlHost,
+    query: Option<&str>,
+    replacement: Option<&str>,
+    path: Option<&str>,
+    pane: Option<u64>,
+    regex: Option<bool>,
+    case_sensitive: Option<bool>,
+    show: Option<bool>,
+    limit: Option<usize>,
+    item: Option<usize>,
+    file: Option<&str>,
+    confirm: bool,
+) -> Result<crate::workspace_replace::ReplaceJob, DispatchError> {
+    use crate::workspace_replace::{ReplaceJob, Scope, Source};
+    use tako_core::workspace_search::{Options, Query};
+    let replacement = replacement.ok_or_else(|| Reason::ReplaceNeedsReplacement.invalid())?;
+    let scope = match (item, file) {
+        (Some(_), Some(_)) => return Err(Reason::ReplaceItemAndFile.invalid()),
+        (Some(n), None) => Scope::Item(n),
+        (None, Some(f)) => Scope::File(f.to_string()),
+        (None, None) => Scope::All,
+    };
+    let root = if confirm {
+        Some(
+            tako_core::paths::data_dir()
+                .ok_or_else(|| Reason::DataDirUnresolved.operation())?
+                .join(tako_core::workspace_replace::BACKUP_DIR),
+        )
+    } else {
+        None
+    };
+    let (source, names) = if let Some(text) = query {
+        let query = Query {
+            text: text.to_string(),
+            regex: regex.unwrap_or(false),
+            case_sensitive: case_sensitive.unwrap_or(false),
+        };
+        let roots = workspace_search_roots(host, path, pane)?;
+        let options = Options::new(roots);
+        let busy = host
+            .workspace_search()
+            .ok_or_else(workspace_search_unavailable)?
+            .replace()
+            .busy();
+        if confirm && busy.is_some() {
+            return Err(Reason::ReplaceBusy.operation());
+        }
+        let (show, cancel) = if show == Some(true) {
+            let store = host
+                .workspace_search_mut()
+                .ok_or_else(workspace_search_unavailable)?;
+            let (seq, cancel) = store.begin(query.clone(), options.roots.clone());
+            host.set_panel(
+                Some(true),
+                None,
+                Some(crate::protocol::PanelViewWire::Search),
+            );
+            (Some(seq), cancel)
+        } else {
+            (None, Default::default())
+        };
+        (
+            Source::Fresh {
+                query,
+                options,
+                cancel,
+                show,
+            },
+            None,
+        )
+    } else {
+        let store = host
+            .workspace_search()
+            .ok_or_else(workspace_search_unavailable)?;
+        let shown = store
+            .shown()
+            .ok_or_else(|| Reason::NoShownSearchResults.invalid())?;
+        let total = shown.outcome.hits.len();
+        if let Scope::Item(n) = scope {
+            if n == 0 || n > total {
+                return Err(Reason::ItemOutsideResults { item: n, total }.invalid());
+            }
+        }
+        let state = store.replace();
+        if confirm && state.busy().is_some() {
+            return Err(Reason::ReplaceBusy.operation());
+        }
+        let mut hits = Vec::new();
+        let mut already = Vec::new();
+        for (index, hit) in shown.outcome.hits.iter().enumerate() {
+            if !scope.takes_hit(index, hit) {
+                continue;
+            }
+            if state.is_applied(shown.seq, index) {
+                already.push((index, hit.clone()));
+            } else {
+                hits.push((index, hit.clone()));
+            }
+        }
+        if let (Scope::File(f), true) = (&scope, hits.is_empty() && already.is_empty()) {
+            return Err(Reason::ReplaceFileNotInResults(f.clone()).invalid());
+        }
+        let mut expect = std::collections::HashMap::new();
+        let mut names = HashSet::new();
+        for (_, hit) in &hits {
+            if let Some(stamp) = shown.outcome.stamps.get(&hit.path) {
+                expect.insert(
+                    hit.path.clone(),
+                    state.expected(shown.seq, &hit.path, *stamp),
+                );
+            }
+            if let Some(name) = hit.path.file_name() {
+                names.insert(name.to_os_string());
+            }
+        }
+        let source = Source::Shown {
+            seq: shown.seq,
+            query: shown.query.clone(),
+            roots: shown.roots.clone(),
+            hits,
+            already,
+            expect,
+            stopped: shown.outcome.stopped,
+            total,
+        };
+        host.set_panel(
+            Some(true),
+            None,
+            Some(crate::protocol::PanelViewWire::Search),
+        );
+        (source, Some(names))
+    };
+    let buffers = workspace_replace_buffers(host, names.as_ref());
+    let store = host
+        .workspace_search_mut()
+        .ok_or_else(workspace_search_unavailable)?;
+    let generation = store.replace().generation();
+    // 当てる回だけ「最中」を立てる（ここより後は断らない = 立てたまま返らない）
+    let (record, evicted) = match root {
+        Some(root) => {
+            let id = store
+                .replace_mut()
+                .begin()
+                .map_err(|_| Reason::ReplaceBusy.operation())?;
+            (
+                Some((id, tako_core::workspace_replace::next_backup_dir(&root))),
+                store.replace_mut().take_evicted(),
+            )
+        }
+        None => (None, Vec::new()),
+    };
+    Ok(ReplaceJob {
+        source,
+        replacement: replacement.to_string(),
+        scope,
+        confirm,
+        buffers,
+        record,
+        evicted,
+        limit,
+        generation,
+    })
+}
+
+/// 横断置換の着地（UI スレッド。#2045）。出す検索の答えを置き場へ置き、開いている編集バッファへ
+/// 当て（`apply_preview_changes` = undo 1 回で戻る）、当てたファイルを取り消しの履歴へ積む。
+/// 右パネルの結果へのプレビューは置き場にも置く（GUI の行に並ぶ）
+pub fn workspace_replace_land(
+    host: &mut dyn ControlHost,
+    landing: crate::workspace_replace::ReplaceLanding,
+) -> Result<Value, DispatchError> {
+    use crate::workspace_replace::FileStatus;
+    use tako_core::workspace_replace::{Preview, Skip};
+    let crate::workspace_replace::ReplaceLanding {
+        mut meta,
+        fresh,
+        result,
+    } = landing;
+    // 出す検索の答えを置く（置いたら世代が進むので、プレビューはその世代で置く）
+    if let (Some(seq), Some(fresh)) = (meta.seq, fresh) {
+        if let Some(store) = host.workspace_search_mut() {
+            let placed = match fresh {
+                Ok(outcome) => store.finish(seq, outcome),
+                Err(e) => store.fail(seq, e),
+            };
+            if placed {
+                meta.generation = store.replace().generation();
+            } else {
+                meta.seq = None;
+            }
+        }
+    }
+    let end_busy = |host: &mut dyn ControlHost, meta: &crate::workspace_replace::ReplaceMeta| {
+        if let (Some((id, _)), Some(store)) = (&meta.record, host.workspace_search_mut()) {
+            store.replace_mut().end(*id);
+        }
+    };
+    let mut body = match result {
+        Ok(body) => body,
+        Err(failure) => {
+            end_busy(host, &meta);
+            // 右パネルの結果へのプレビューなら、置換欄の下に出す理由を置き場に残す
+            if let (crate::workspace_replace::ReplaceFailure::Template(error), Some(seq), false) =
+                (&failure, meta.seq, meta.confirm)
+            {
+                workspace_replace_preview_failed(
+                    host,
+                    seq,
+                    meta.generation,
+                    &meta.replacement,
+                    error.clone(),
+                );
+            }
+            return Err(DispatchError::InvalidParams(
+                failure.text_in(tako_core::i18n::lang()),
+            ));
+        }
+    };
+    for file in &mut body.files {
+        let FileStatus::Buffer {
+            pane,
+            pane_path,
+            version,
+            changes,
+            real,
+            before,
+            after,
+            backup,
+        } = &file.status
+        else {
+            continue;
+        };
+        file.status = match host.apply_preview_changes(*pane, changes.clone(), *version) {
+            Ok(applied) if applied.changes > 0 => FileStatus::BufferApplied {
+                pane: *pane,
+                pane_path: pane_path.clone(),
+                version: host
+                    .preview_document(*pane)
+                    .and_then(|d| d["version"].as_u64())
+                    .unwrap_or(version + 1),
+                real: real.clone(),
+                before: *before,
+                after: *after,
+                backup: backup.clone(),
+            },
+            Ok(_) => FileStatus::Skipped(Skip::Unchanged),
+            // 写してからここまでの間にペインで打たれた（版が進んだ）
+            Err(_) => FileStatus::Skipped(Skip::Edited),
+        };
+    }
+    let mut out = crate::workspace_replace::replace_json(&meta, &body);
+    if let Some(store) = host.workspace_search_mut() {
+        if let Some((id, dir)) = &meta.record {
+            if let Some(record) = body.record(
+                *id,
+                meta.seq,
+                &meta.query.text,
+                &meta.replacement,
+                dir.clone(),
+            ) {
+                store.replace_mut().push(record);
+                out["undo"] = json!({ "id": id });
+            }
+            store.replace_mut().end(*id);
+        } else if let Some(seq) = meta.seq {
+            store.replace_mut().set_preview(Preview {
+                seq,
+                generation: meta.generation,
+                replacement: meta.replacement.clone(),
+                rows: body.rows(),
+                error: None,
+            });
+        }
+        out["history"] = json!(store.replace().history().len());
+    }
+    Ok(out)
+}
+
+/// 右パネルの結果へのプレビューが組めなかった（置換の参照の誤り）ことを置き場に残す（#2045。
+/// GUI の置換欄の下に理由を出す）
+fn workspace_replace_preview_failed(
+    host: &mut dyn ControlHost,
+    seq: u64,
+    generation: u64,
+    replacement: &str,
+    error: tako_core::workspace_replace::TemplateError,
+) {
+    if let Some(store) = host.workspace_search_mut() {
+        store
+            .replace_mut()
+            .set_preview(tako_core::workspace_replace::Preview {
+                seq,
+                generation,
+                replacement: replacement.to_string(),
+                rows: Default::default(),
+                error: Some(error),
+            });
+    }
+}
+
+/// 取り消しの準備（UI スレッド。#2045）。最後に当てた 1 回の各ファイルの戻し方を決める:
+/// バッファへ当てたファイルは、そのペインが同じファイルを同じ版のまま開いていれば undo 1 回
+/// （着地）、ペインが無ければディスクを退避から戻す（background）、ペインで編集が進んでいれば戻さない。
+/// 戻す置換が無ければ `None`（同期の腕が「無い」と答える）
+fn workspace_undo_prepare(
+    host: &mut dyn ControlHost,
+    confirm: bool,
+) -> Result<Option<crate::workspace_replace::UndoJob>, DispatchError> {
+    use crate::workspace_replace::{UndoJob, UndoTarget};
+    use tako_core::workspace_replace::{Restore, Stamp};
+    let store = host
+        .workspace_search()
+        .ok_or_else(workspace_search_unavailable)?;
+    let Some(record) = store.replace().last().cloned() else {
+        return Ok(None);
+    };
+    if confirm && store.replace().busy().is_some() {
+        return Err(Reason::ReplaceBusy.operation());
+    }
+    let remaining = store.replace().history().len();
+    let mut targets = Vec::new();
+    for file in &record.files {
+        let target = match &file.buffer {
+            None => UndoTarget::Disk,
+            Some(buffer) => {
+                let (pane, version) = (PaneId::from_raw(buffer.pane), buffer.version);
+                // 当てたときにそのペインが開いていたパスと突き合わせる（UI スレッドで実体を引き直さない）
+                let same_file = host
+                    .preview_state(pane)
+                    .is_some_and(|(path, _)| path == buffer.path);
+                let mut seen = None;
+                if same_file {
+                    host.read_preview_buffer(pane, &mut |text, current| {
+                        seen = Some((Stamp::of(text.as_bytes()), current));
+                    });
+                }
+                match seen {
+                    // ペインを閉じた / 別のファイルを開いた = ディスクを退避から戻す
+                    None => UndoTarget::Disk,
+                    Some((_, current)) if current == version => {
+                        UndoTarget::Buffer { pane, version }
+                    }
+                    Some((stamp, _)) if stamp == file.before => {
+                        UndoTarget::Decided(Restore::AlreadyRestored)
+                    }
+                    Some(_) => UndoTarget::Decided(Restore::Edited),
+                }
+            }
+        };
+        targets.push(target);
+    }
+    let store = host
+        .workspace_search_mut()
+        .ok_or_else(workspace_search_unavailable)?;
+    let busy = if confirm {
+        Some(
+            store
+                .replace_mut()
+                .begin()
+                .map_err(|_| Reason::ReplaceBusy.operation())?,
+        )
+    } else {
+        None
+    };
+    Ok(Some(UndoJob {
+        record,
+        targets,
+        confirm,
+        remaining,
+        busy,
+        evicted: store.replace_mut().take_evicted(),
+    }))
+}
+
+/// 取り消しの着地（UI スレッド。#2045）。バッファの undo 1 回を当て、戻し終えたファイルを履歴から下ろす
+pub fn workspace_undo_land(
+    host: &mut dyn ControlHost,
+    landing: crate::workspace_replace::UndoLanding,
+) -> Result<Value, DispatchError> {
+    use crate::workspace_replace::UndoTarget;
+    use tako_core::workspace_replace::Restore;
+    let mut outcomes = Vec::new();
+    for target in &landing.targets {
+        let outcome = match target {
+            UndoTarget::Decided(outcome) => *outcome,
+            // background を通るのはディスクだけ（着地の前に Decided へ変わる）
+            UndoTarget::Disk => Restore::BackupMissing,
+            UndoTarget::Buffer { pane, version } => {
+                let current = host
+                    .preview_document(*pane)
+                    .and_then(|d| d["version"].as_u64());
+                if current != Some(*version) {
+                    Restore::Edited
+                } else if !landing.confirm {
+                    Restore::Restorable
+                } else {
+                    match host.preview_undo(*pane) {
+                        Ok(true) => Restore::Restored,
+                        _ => Restore::Edited,
+                    }
+                }
+            }
+        };
+        outcomes.push(outcome);
+    }
+    let mut remaining = landing.remaining;
+    if let Some(store) = host.workspace_search_mut() {
+        if landing.confirm {
+            let settled: Vec<usize> = outcomes
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.settled())
+                .map(|(i, _)| i)
+                .collect();
+            store.replace_mut().settle_last(landing.record.id, &settled);
+            remaining = store.replace().history().len();
+        }
+        if let Some(busy) = landing.busy {
+            store.replace_mut().end(busy);
+        }
+    }
+    Ok(crate::workspace_replace::undo_json(
+        &landing, &outcomes, remaining,
+    ))
 }
 
 /// 整形（FR-3.33 / #1683）の問い合わせ。UI スレッドで [`lsp_format_prepare`] が作り、
@@ -6401,6 +6946,13 @@ pub enum OffloadJob {
     /// 出す検索の登録だけを行い、走査と照合は background。出す検索の答えを置き場へ置くのは
     /// [`OffloadContinuation::WorkspaceSearch`] で UI スレッドへ戻す
     WorkspaceSearch(Box<crate::workspace_search::WorkspaceSearchJob>),
+    /// ワークスペース横断置換（#2045。プレビューも同じ）。UI スレッドでは範囲の行と開いている
+    /// 編集バッファの写しを採るだけで、照合・退避・書き込みは background。バッファへ当てて
+    /// 取り消しの履歴へ積むのは [`OffloadContinuation::WorkspaceReplace`] で UI スレッドへ戻す
+    WorkspaceReplace(Box<crate::workspace_replace::ReplaceJob>),
+    /// 横断置換の取り消し（#2045）。ディスクの書き戻しは background、バッファの undo と履歴の
+    /// 片付けは [`OffloadContinuation::WorkspaceUndo`] で UI スレッドへ戻す
+    WorkspaceUndo(Box<crate::workspace_replace::UndoJob>),
     /// ユーザータスクの一覧（CLI / MCP / PWA の 5 秒ごと。#2052）。UI スレッドでは送達フローの
     /// 観測と画面の展開状態の写しだけを行い、配送の書き戻しと置き場の読みは background
     /// （workspace に触らないのでそのまま background から応答する）
@@ -6626,6 +7178,10 @@ pub enum OffloadContinuation {
     Probed(Box<ProbedRequest>),
     /// 右パネルへ出す横断検索の答えを置き場へ置く（[`workspace_search_land`]。#1694）
     WorkspaceSearch(Box<crate::workspace_search::WorkspaceSearchLanding>),
+    /// 横断置換の答えを置き場とバッファへ反映する（[`workspace_replace_land`]。#2045）
+    WorkspaceReplace(Box<crate::workspace_replace::ReplaceLanding>),
+    /// 取り消しのバッファの undo と履歴の片付け（[`workspace_undo_land`]。#2045）
+    WorkspaceUndo(Box<crate::workspace_replace::UndoLanding>),
     /// ユーザータスクの完了・却下の後始末（開いていた行を畳む。[`user_task_status_finish`]。#2052）
     UserTaskStatus(Box<UserTaskStatusLanding>),
     /// ユーザータスクの host に触る後始末（起票の通知・返答の配送・展開。[`user_task_land`]。#2086）
@@ -6728,6 +7284,8 @@ pub fn finish_offload(
             with_ui_probes(&probes, || dispatch(host, request, origin))
         }
         OffloadContinuation::WorkspaceSearch(landing) => workspace_search_land(host, *landing),
+        OffloadContinuation::WorkspaceReplace(landing) => workspace_replace_land(host, *landing),
+        OffloadContinuation::WorkspaceUndo(landing) => workspace_undo_land(host, *landing),
         OffloadContinuation::UserTaskStatus(landing) => Ok(user_task_status_finish(host, *landing)),
         OffloadContinuation::UserTaskStored(landing) => user_task_land(host, *landing),
         // #2182: もう一巡を出せない直の呼び手は、起こして（UI）から記録まで（④）を同じスレッドで順に通す
@@ -7020,6 +7578,47 @@ pub fn prepare_offload(
             )
             .map(|job| OffloadJob::WorkspaceSearch(Box::new(job))),
         ),
+        // #2045: 置換の照合・退避・書き込みも UI スレッドで走らせない。ここでは範囲の行と開いている
+        // 編集バッファの写しと「当てている最中」の印だけ
+        Request::WorkspaceSearch {
+            action,
+            query,
+            path,
+            pane,
+            regex,
+            case_sensitive,
+            show,
+            limit,
+            item,
+            replacement,
+            file,
+            confirm,
+            ..
+        } if action == "replace" => Some(
+            workspace_replace_prepare(
+                host,
+                query.as_deref(),
+                replacement.as_deref(),
+                path.as_deref(),
+                *pane,
+                *regex,
+                *case_sensitive,
+                *show,
+                *limit,
+                *item,
+                file.as_deref(),
+                *confirm == Some(true),
+            )
+            .map(|job| OffloadJob::WorkspaceReplace(Box::new(job))),
+        ),
+        // 戻す置換が無ければ同期の腕が「無い」と答える（何も読まない）
+        Request::WorkspaceSearch {
+            action, confirm, ..
+        } if action == "undo" => match workspace_undo_prepare(host, *confirm == Some(true)) {
+            Ok(Some(job)) => Some(Ok(OffloadJob::WorkspaceUndo(Box::new(job)))),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        },
         // #1678: manager を持たない host は同期実行へ落として「使えない」を返す
         Request::LspServer { action, name, set } => host.lsp().map(|manager| {
             Ok(OffloadJob::Lsp {
@@ -7465,6 +8064,13 @@ impl OffloadJob {
                     OffloadOutcome::Reply(landing.reply())
                 }
             }
+            // #2045: バッファへ当てる・履歴へ積む・プレビューを置くのは UI スレッド
+            OffloadJob::WorkspaceReplace(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::WorkspaceReplace(Box::new(job.run())))
+            }
+            OffloadJob::WorkspaceUndo(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::WorkspaceUndo(Box::new(job.run())))
+            }
             OffloadJob::Probe(job) => {
                 let ProbeJob {
                     request,
@@ -7663,6 +8269,12 @@ impl OffloadJob {
             OffloadJob::WorkspaceSearch(_) => Err(DispatchError::Operation(
                 "横断検索は run_staged で走らせる（出す検索は置き場へ置く続きが要る）".into(),
             )),
+            OffloadJob::WorkspaceReplace(_) | OffloadJob::WorkspaceUndo(_) => {
+                Err(DispatchError::Operation(
+                    "横断置換は run_staged で走らせる（バッファと履歴に UI スレッドの続きが要る）"
+                        .into(),
+                ))
+            }
             OffloadJob::LspFormat(_) => Err(DispatchError::Operation(
                 "整形は run_staged で走らせる（当てるのに UI スレッドの続きが要る）".into(),
             )),
@@ -11473,6 +12085,9 @@ fn dispatch_inner(
             limit,
             item,
             focus,
+            replacement,
+            file,
+            confirm,
         } => match action.as_str() {
             "search" => {
                 let job = workspace_search_prepare(
@@ -11493,6 +12108,28 @@ fn dispatch_inner(
                 limit,
             )),
             "open" => workspace_search_open(host, origin, item, pane, focus),
+            // #2045: 通常は prepare_offload が background へ出す。ここは同じ 3 段を直列に通る
+            "replace" => {
+                let job = workspace_replace_prepare(
+                    host,
+                    query.as_deref(),
+                    replacement.as_deref(),
+                    path.as_deref(),
+                    pane,
+                    regex,
+                    case_sensitive,
+                    show,
+                    limit,
+                    item,
+                    file.as_deref(),
+                    confirm == Some(true),
+                )?;
+                workspace_replace_land(host, job.run())
+            }
+            "undo" => match workspace_undo_prepare(host, confirm == Some(true))? {
+                Some(job) => workspace_undo_land(host, job.run()),
+                None => Ok(crate::workspace_replace::undo_nothing_json()),
+            },
             "clear" => {
                 let store = host
                     .workspace_search_mut()
@@ -26940,11 +27577,8 @@ impl UserTaskLaunchJob {
             &self.profile,
             None,
             None,
-            Some(
-                "master の起動の組み立て（CLI の所在確認）を UI スレッドでは待たない\
-                 （もう一度返答すると組み立て直す）"
-                    .into(),
-            ),
+            // 書いた時点の表示言語で記録する（#2365。`UserTaskMasterLaunchFailed` と同じ）
+            Some(Reason::UserTaskLaunchPlanDeferred.to_string()),
             self.stored.index,
         );
         self.stored.delivered(delivery)
@@ -26978,7 +27612,7 @@ pub fn user_task_launch_land(
                 &profile,
                 None,
                 None,
-                Some("master の起動の組み立てが着地へ届かなかった".into()),
+                Some(Reason::UserTaskLaunchPlanLost.to_string()),
                 stored.index,
             )
         }
@@ -28129,7 +28763,7 @@ fn launch_master_for_response(
             profile,
             None,
             tab,
-            Some("起動したタブのペインを解決できない".into()),
+            Some(Reason::UserTaskLaunchPaneMissing.to_string()),
             index,
         );
     };
@@ -30738,6 +31372,16 @@ mod tests {
                     .unwrap_or((false, false)),
             )
         }
+        /// #2045: 本物の `TextBuffer` の本文と版を貸す（GUI と同じ）
+        fn read_preview_buffer(&self, pane: PaneId, f: &mut dyn FnMut(&str, u64)) -> bool {
+            match self.preview_edits.get(&pane.as_u64()) {
+                Some((_, _, buffer)) => {
+                    f(buffer.text(), buffer.version());
+                    true
+                }
+                None => false,
+            }
+        }
         /// #1649: 器の寸法を持たないモックでも「応答へ載るか」は測れるので、
         /// 編集セッションがあるときだけ固定の形を返す（値の正しさは
         /// `tako_core::editor_scroll` の単体テストと visual-test 節が見る）
@@ -30937,7 +31581,9 @@ mod tests {
                 .preview_edits
                 .get_mut(&pane.as_u64())
                 .ok_or_else(|| "編集セッションがない".to_string())?;
-            Ok(state.2.undo())
+            let undone = state.2.undo();
+            state.1 = state.2.dirty();
+            Ok(undone)
         }
         fn preview_redo(&mut self, pane: PaneId) -> Result<bool, String> {
             let state = self
@@ -35512,6 +36158,9 @@ mod tests {
         show: Option<bool>,
         limit: Option<usize>,
         item: Option<usize>,
+        replacement: Option<String>,
+        file: Option<String>,
+        confirm: Option<bool>,
     }
 
     impl Ws {
@@ -35527,6 +36176,9 @@ mod tests {
                 limit: self.limit,
                 item: self.item,
                 focus: None,
+                replacement: self.replacement,
+                file: self.file,
+                confirm: self.confirm,
             }
         }
     }
@@ -55420,9 +56072,12 @@ tako | pane 2 [ compact ]       [-]
         assert_eq!(host.ws.tabs().len(), tabs, "直の呼び手が master を起こした");
         assert_eq!(value["responses"][0]["comment"], "直の呼び手");
         assert_eq!(value["delivery"]["state"], "failed");
-        assert!(value["delivery"]["reason"]
-            .as_str()
-            .is_some_and(|r| r.contains("UI スレッドでは待たない")));
+        // 理由は書いた時点の表示言語（#2365）。テストの並びで言語のグローバルが動くので日英のどちらかで見る
+        assert!(value["delivery"]["reason"].as_str().is_some_and(|r| {
+            [Lang::Ja, Lang::En]
+                .iter()
+                .any(|&lang| r == Reason::UserTaskLaunchPlanDeferred.text_in(lang))
+        }));
         let (next_ticket, serving) = respond_turn_state();
         assert_eq!(next_ticket, serving, "札が手放されていない");
     }
@@ -55685,11 +56340,13 @@ tako | pane 2 [ compact ]       [-]
                 "role={role:?} の返答が誰かへ配送されている"
             );
             assert_eq!(delivery.profile, None, "role={role:?}");
+            // 理由は書いた時点の表示言語（#2365）。テストの並びで言語のグローバルが動くので日英のどちらかで見る
             assert!(
-                delivery
-                    .reason
-                    .as_deref()
-                    .is_some_and(|r| r.contains("宛先不明")),
+                delivery.reason.as_deref().is_some_and(|r| {
+                    [Lang::Ja, Lang::En]
+                        .iter()
+                        .any(|&lang| r == crate::user_tasks::UNRESOLVED_ORIGIN_REASON.text_in(lang))
+                }),
                 "role={role:?} の失敗理由が読めない: {:?}",
                 delivery.reason
             );
@@ -57901,6 +58558,419 @@ tako | pane 2 [ compact ]       [-]
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #2045: 横断置換 -------------------------------------------------------------
+
+    /// 置換を試すツリー（使い捨て。スコープで消える）
+    fn replace_tree(tag: &str) -> tako_core::test_residue::ScratchDir {
+        let dir = tako_core::test_residue::ScratchDir::new(tag);
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn main() {\n    let needle = 1;\n    drop(needle);\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.txt"), "needle\r\nneedle\r\n").unwrap();
+        std::fs::write(dir.join("c.txt"), "needle\n").unwrap();
+        dir
+    }
+
+    fn read_in(dir: &Path, name: &str) -> String {
+        std::fs::read_to_string(dir.join(name)).unwrap()
+    }
+
+    /// 右パネルへ出す検索（`tako search needle --show --path <dir>`）
+    fn show_needle(host: &mut MockHost, dir: &Path) -> Value {
+        offloaded(
+            host,
+            Ws {
+                action: "search",
+                query: Some("needle".into()),
+                path: Some(dir.display().to_string()),
+                show: Some(true),
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap()
+    }
+
+    /// 右パネルの結果への置換（`tako search --replace <r> [--item N | --file F] [--yes]`）
+    fn replace_shown(
+        host: &mut MockHost,
+        replacement: &str,
+        item: Option<usize>,
+        file: Option<String>,
+        confirm: bool,
+    ) -> Result<Value, DispatchError> {
+        offloaded(
+            host,
+            Ws {
+                action: "replace",
+                replacement: Some(replacement.into()),
+                item,
+                file,
+                confirm: confirm.then_some(true),
+                limit: Some(0),
+                ..Default::default()
+            }
+            .req(),
+        )
+    }
+
+    fn undo(host: &mut MockHost, confirm: bool) -> Value {
+        offloaded(
+            host,
+            Ws {
+                action: "undo",
+                confirm: confirm.then_some(true),
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap()
+    }
+
+    fn file_status(out: &Value, name: &str) -> String {
+        out["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"].as_str().unwrap().ends_with(name))
+            .map(|f| f["status"].as_str().unwrap().to_string())
+            .unwrap_or_else(|| panic!("{name} が files に無い: {out}"))
+    }
+
+    const A_RS_2045: &str = "fn main() {\n    let needle = 1;\n    drop(needle);\n}\n";
+
+    /// 受け入れ条件 4・5 の土台: プレビュー（書かない）→ 1 行 → ファイル単位 → 全部 → 戻すを
+    /// IPC と同じ 3 段で通す。戻すのは最後の 1 回ずつ（後に当てたものから）
+    #[test]
+    fn issue2045_横断置換はプレビューして1行とファイルと全部を当てて1回ずつ戻す() {
+        let dir = replace_tree("2045-flow");
+        let mut host = MockHost::new();
+        assert_eq!(show_needle(&mut host, &dir)["total"], json!(5));
+
+        // プレビュー: 何も書かない・右パネルの行に並ぶ・`results` から読める
+        let preview = replace_shown(&mut host, "pin", None, None, false).unwrap();
+        assert_eq!(preview["status"], json!("preview"), "{preview}");
+        assert_eq!(
+            preview["will_replace"],
+            json!({ "files": 3, "lines": 5, "occurrences": 5 })
+        );
+        assert_eq!(preview["items"][0]["replaced"], json!("let pin = 1;"));
+        assert_eq!(read_in(&dir, "a.rs"), A_RS_2045, "プレビューは書かない");
+        let results = offloaded(
+            &mut host,
+            Ws {
+                action: "results",
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap();
+        assert_eq!(results["replace"]["replacement"], json!("pin"));
+        assert_eq!(results["items"][1]["replaced"], json!("drop(pin);"));
+
+        // 1 行（item 1 = a.rs の 2 行目）だけ
+        let one = replace_shown(&mut host, "pin", Some(1), None, true).unwrap();
+        assert_eq!(one["status"], json!("replaced"), "{one}");
+        assert_eq!(one["undo"]["id"], json!(1));
+        assert_eq!(
+            read_in(&dir, "a.rs"),
+            "fn main() {\n    let pin = 1;\n    drop(needle);\n}\n"
+        );
+        // 当て済みの行は 2 回当てない
+        let again = replace_shown(&mut host, "pin", Some(1), None, true).unwrap();
+        assert_eq!(again["status"], json!("not-applied"));
+        assert_eq!(again["items"][0]["status"], json!("already-applied"));
+
+        // ファイル単位（b.txt。CRLF は残る）
+        let file = replace_shown(
+            &mut host,
+            "pin",
+            None,
+            Some(dir.join("b.txt").display().to_string()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(file["status"], json!("replaced"), "{file}");
+        assert_eq!(read_in(&dir, "b.txt"), "pin\r\npin\r\n");
+
+        // 全部: 残り（a.rs の 3 行目と c.txt）だけを当てる（a.rs は 1 行目を当てた後の中身が期待）
+        let all = replace_shown(&mut host, "pin", None, None, true).unwrap();
+        assert_eq!(all["status"], json!("replaced"), "{all}");
+        assert_eq!(
+            all["replaced"],
+            json!({ "files": 2, "lines": 2, "occurrences": 2 })
+        );
+        assert_eq!(
+            read_in(&dir, "a.rs"),
+            "fn main() {\n    let pin = 1;\n    drop(pin);\n}\n"
+        );
+        assert_eq!(read_in(&dir, "c.txt"), "pin\n");
+
+        // 戻す: プレビューは書かない → 最後の「全部」だけを戻す → ファイル単位 → 1 行
+        let peek = undo(&mut host, false);
+        assert_eq!(peek["status"], json!("preview"));
+        assert_eq!(file_status(&peek, "c.txt"), "restorable");
+        assert_eq!(read_in(&dir, "c.txt"), "pin\n");
+        let back = undo(&mut host, true);
+        assert_eq!(back["status"], json!("restored"), "{back}");
+        assert_eq!(back["remaining"], json!(2));
+        assert_eq!(
+            read_in(&dir, "a.rs"),
+            "fn main() {\n    let pin = 1;\n    drop(needle);\n}\n"
+        );
+        assert_eq!(read_in(&dir, "c.txt"), "needle\n");
+        assert_eq!(read_in(&dir, "b.txt"), "pin\r\npin\r\n");
+        let back = undo(&mut host, true);
+        assert_eq!(back["status"], json!("restored"), "{back}");
+        assert_eq!(read_in(&dir, "b.txt"), "needle\r\nneedle\r\n");
+        let back = undo(&mut host, true);
+        assert_eq!(back["status"], json!("restored"), "{back}");
+        assert_eq!(read_in(&dir, "a.rs"), A_RS_2045);
+        assert_eq!(undo(&mut host, true)["status"], json!("nothing"));
+        // 戻した行はもう一度当てられる
+        let redo = replace_shown(&mut host, "pin", Some(1), None, true).unwrap();
+        assert_eq!(redo["status"], json!("replaced"));
+    }
+
+    /// 受け入れ条件 3 の土台: 検索の後に外で書き換わったファイルは当てずに理由を返し、中身を触らない
+    #[test]
+    fn issue2045_検索の後に外で変わったファイルは当てずに理由を返す() {
+        let dir = replace_tree("2045-stale");
+        let mut host = MockHost::new();
+        show_needle(&mut host, &dir);
+        std::fs::write(dir.join("c.txt"), "needle\nmine\n").unwrap();
+        let out = replace_shown(&mut host, "pin", None, None, true).unwrap();
+        assert_eq!(out["status"], json!("partial"), "{out}");
+        assert_eq!(file_status(&out, "c.txt"), "stale");
+        let reason = out["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["status"] == "stale")
+            .unwrap()["reason"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!reason.is_empty());
+        assert_eq!(
+            read_in(&dir, "c.txt"),
+            "needle\nmine\n",
+            "外の変更を上書きしない"
+        );
+        assert_eq!(read_in(&dir, "b.txt"), "pin\r\npin\r\n");
+        // 戻すのは当てたファイルだけ
+        let back = undo(&mut host, true);
+        assert_eq!(back["files"].as_array().unwrap().len(), 2);
+        assert_eq!(read_in(&dir, "c.txt"), "needle\nmine\n");
+        assert_eq!(read_in(&dir, "a.rs"), A_RS_2045);
+    }
+
+    /// 受け入れ条件 2: 開いている編集バッファは編集バッファへ当たり（保存しない・undo 1 回で戻る）、
+    /// 保存していない編集のあるバッファは上書きしない（バッファもディスクも 1 バイトも変えない）
+    #[test]
+    fn issue2045_開いているバッファはundo1回で戻り未保存のバッファは上書きしない() {
+        let dir = replace_tree("2045-buffer");
+        let mut host = MockHost::new();
+        host.preview_real_files = true;
+        let pane = host.root_pane();
+        let a = dir.join("a.rs");
+        host.previews
+            .insert(pane, (a.display().to_string(), PreviewModeWire::Code));
+        host.set_preview_editing(PaneId::from_raw(pane), true)
+            .unwrap();
+        show_needle(&mut host, &dir);
+
+        let out = replace_shown(&mut host, "pin", None, None, true).unwrap();
+        assert_eq!(out["status"], json!("replaced"), "{out}");
+        let a_row = out["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"].as_str().unwrap().ends_with("a.rs"))
+            .unwrap()
+            .clone();
+        assert_eq!(a_row["via"], json!("buffer"));
+        assert_eq!(a_row["pane"], json!(pane));
+        let replaced = "fn main() {\n    let pin = 1;\n    drop(pin);\n}\n";
+        assert_eq!(buffer_text(&host, pane), replaced);
+        assert_eq!(
+            read_in(&dir, "a.rs"),
+            A_RS_2045,
+            "バッファへ当てたファイルは保存しない"
+        );
+        assert_eq!(
+            read_in(&dir, "c.txt"),
+            "pin\n",
+            "開いていないファイルは書く"
+        );
+        // ペインの undo 1 回で置換の前へ戻る
+        dispatch(
+            &mut host,
+            Request::PreviewUndo { pane: Some(pane) },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        assert_eq!(buffer_text(&host, pane), A_RS_2045);
+        // ペインで戻した後の取り消しは、バッファを「既に戻っている」と読み、ディスクだけを戻す
+        let back = undo(&mut host, true);
+        assert_eq!(file_status(&back, "a.rs"), "already-restored");
+        assert_eq!(file_status(&back, "c.txt"), "restored");
+
+        // 保存していない編集のあるバッファ: 当てずに理由を返し、バッファもディスクも変えない
+        show_needle(&mut host, &dir);
+        let edited = format!("{A_RS_2045}// mine\n");
+        dispatch(
+            &mut host,
+            Request::PreviewApply {
+                pane: Some(pane),
+                text: edited.clone(),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let out = replace_shown(&mut host, "pin", None, None, true).unwrap();
+        assert_eq!(file_status(&out, "a.rs"), "unsaved", "{out}");
+        assert_eq!(buffer_text(&host, pane), edited);
+        assert_eq!(read_in(&dir, "a.rs"), A_RS_2045);
+        assert_eq!(read_in(&dir, "b.txt"), "pin\r\npin\r\n");
+    }
+
+    /// 取り消しの `undo` はバッファへ当てたファイルをペインの undo 1 回で戻す（版がそのままなら）
+    #[test]
+    fn issue2045_取り消しはバッファをペインのundoで戻す() {
+        let dir = replace_tree("2045-buffer-undo");
+        let mut host = MockHost::new();
+        host.preview_real_files = true;
+        let pane = host.root_pane();
+        host.previews.insert(
+            pane,
+            (
+                dir.join("a.rs").display().to_string(),
+                PreviewModeWire::Code,
+            ),
+        );
+        host.set_preview_editing(PaneId::from_raw(pane), true)
+            .unwrap();
+        show_needle(&mut host, &dir);
+        replace_shown(&mut host, "pin", None, None, true).unwrap();
+        let back = undo(&mut host, true);
+        assert_eq!(back["status"], json!("restored"), "{back}");
+        assert_eq!(file_status(&back, "a.rs"), "restored");
+        assert_eq!(buffer_text(&host, pane), A_RS_2045);
+        assert_eq!(read_in(&dir, "b.txt"), "needle\r\nneedle\r\n");
+    }
+
+    /// CLI の 1 回で済む形（`tako search needle --replace pin --yes`）: 探してから全部に当て、
+    /// 右パネルの結果は上書きしない。取り消しは同じ履歴から
+    #[test]
+    fn issue2045_検索語つきの置換は探してから当て右パネルを上書きしない() {
+        let dir = replace_tree("2045-fresh");
+        let mut host = MockHost::new();
+        let req = |confirm: bool| {
+            Ws {
+                action: "replace",
+                query: Some("needle".into()),
+                path: Some(dir.display().to_string()),
+                replacement: Some("pin".into()),
+                confirm: confirm.then_some(true),
+                ..Default::default()
+            }
+            .req()
+        };
+        let preview = offloaded(&mut host, req(false)).unwrap();
+        assert_eq!(preview["status"], json!("preview"));
+        assert_eq!(read_in(&dir, "c.txt"), "needle\n");
+        let out = offloaded(&mut host, req(true)).unwrap();
+        assert_eq!(out["status"], json!("replaced"), "{out}");
+        assert_eq!(read_in(&dir, "c.txt"), "pin\n");
+        assert!(
+            host.workspace_search.shown().is_none(),
+            "出さない検索は置き場に置かない"
+        );
+        assert_eq!(undo(&mut host, true)["status"], json!("restored"));
+        assert_eq!(read_in(&dir, "c.txt"), "needle\n");
+    }
+
+    /// 境界: 一致 0 件・置換後が元と同じ・不正な正規表現・無いグループ・1 ファイルに大量一致
+    #[test]
+    fn issue2045_境界は理由つきで当てない() {
+        let dir = replace_tree("2045-edges");
+        let mut host = MockHost::new();
+        let fresh = |query: &str, regex: bool, replacement: &str, confirm: bool| {
+            Ws {
+                action: "replace",
+                query: Some(query.into()),
+                path: Some(dir.display().to_string()),
+                regex: regex.then_some(true),
+                replacement: Some(replacement.into()),
+                confirm: confirm.then_some(true),
+                ..Default::default()
+            }
+            .req()
+        };
+        // 一致 0 件
+        let none = offloaded(&mut host, fresh("absent", false, "x", true)).unwrap();
+        assert_eq!(none["status"], json!("not-applied"));
+        assert_eq!(none["targets"], json!(0));
+        // 置換後が元と同じ（書かない・履歴に積まない）
+        let same = offloaded(&mut host, fresh("(needle)", true, "$1", true)).unwrap();
+        assert_eq!(same["status"], json!("not-applied"), "{same}");
+        assert_eq!(file_status(&same, "c.txt"), "unchanged");
+        assert!(host.workspace_search.replace().history().is_empty());
+        // 不正な正規表現・無いグループは断る（何も書かない）
+        let bad = offloaded(&mut host, fresh("(", true, "x", true)).unwrap_err();
+        assert!(matches!(bad, DispatchError::InvalidParams(_)), "{bad:?}");
+        let group = offloaded(&mut host, fresh("(needle)", true, "$2", true)).unwrap_err();
+        assert!(group.to_string().contains("$2"), "{group}");
+        // 置換後の文字列が無い・item と file を同時に
+        let missing = offloaded(
+            &mut host,
+            Ws {
+                action: "replace",
+                query: Some("needle".into()),
+                path: Some(dir.display().to_string()),
+                ..Default::default()
+            }
+            .req(),
+        )
+        .unwrap_err();
+        assert!(matches!(missing, DispatchError::InvalidParams(_)));
+        assert_eq!(read_in(&dir, "c.txt"), "needle\n");
+        // 当てている最中は次を受けない（印が解けずに残らないことも見る）
+        assert!(host.workspace_search.replace().busy().is_none());
+        // 1 ファイルに大量一致（1 行に 3 つ × 3000 行）
+        let many: String = (0..3000)
+            .map(|i| format!("{i} needle needle needle\n"))
+            .collect();
+        std::fs::write(dir.join("many.txt"), &many).unwrap();
+        let mut options_dir = Ws {
+            action: "replace",
+            query: Some("needle".into()),
+            path: Some(dir.display().to_string()),
+            replacement: Some("pin".into()),
+            confirm: Some(true),
+            ..Default::default()
+        };
+        options_dir.limit = Some(1);
+        let out = offloaded(&mut host, options_dir.req()).unwrap();
+        // 保持の上限（2000 行）で打ち切った検索は一覧に出た行だけを当てる
+        assert_eq!(out["stopped"], json!("limit"), "{out}");
+        let text = read_in(&dir, "many.txt");
+        let replaced_lines = text.lines().filter(|l| l.contains("pin")).count();
+        let rest = text.lines().filter(|l| l.contains("needle")).count();
+        assert_eq!(replaced_lines + rest, 3000);
+        assert!(
+            replaced_lines > 0 && rest > 0,
+            "上限の外の行は残る: {replaced_lines} / {rest}"
+        );
+        assert!(text
+            .lines()
+            .filter(|l| l.contains("pin"))
+            .all(|l| l.ends_with("pin pin pin")));
     }
 
     // --- #1683: 整形 -----------------------------------------------------------------

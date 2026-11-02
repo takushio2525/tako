@@ -98,6 +98,10 @@ impl Env {
             .env("TAKO_ISOLATED", "1")
             .env("TAKO_DATA_DIR", self.dir.path())
             .env("TAKO_983_LEGACY", "1")
+            // 移行の記録の理由は表示言語で返る（#2365）。settings.json が無い・壊れている場面は OS の
+            // ロケールへ落ちるので、応答の理由を日本語の字面で見るこの番犬は表示言語を日本語に固定する
+            // （CI の英語のランナーでも同じ条件。英語の文は issue1762_dispatch_error_lang の表が見る）
+            .env("TAKO_LANG", "ja")
             .stdin(Stdio::null());
         if legacy {
             cmd.env("TAKO_2230_LEGACY", "1");

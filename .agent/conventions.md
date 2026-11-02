@@ -713,6 +713,23 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `resend_command` の鍵が無い）。番犬は同じ `issue1762_dispatch_error_lang.rs`（`ReplyNote` の表に旧文・
   `NOTE_ITEM_SCOPES` と dispatch の `handoffs` の関数・応答の文にする口で `text_in(Lang::Ja)` に固定するのを名指す
   `NOTE_LANG_FIXED_SCOPES`）
+- 同じ続きで、**返答の配送の理由**と**移行の記録の理由**も表示言語へ移した。配送の理由（宛先不明・UI スレッドでは
+  組み立てを待たない・組み立てが着地へ届かない・起こしたタブのペインを解けない）は `Reason::UserTask*` の 4 種で、
+  配送の記録（`user-tasks.yaml` の `delivery.reason`）へは**書いた時点の表示言語**で残る（`tako todo respond` /
+  MCP `tako_todo` / PWA の `POST /api/tasks/<id>/respond` と一覧・右パネル・`tako todo show` の `配送:` 行が同じ文を
+  読む。記録の形は変えていない = 移行は要らない）。正本の名前 `user_tasks::UNRESOLVED_ORIGIN_REASON` は残し、
+  中身を `Reason::UserTaskOriginUnresolved` にした（#1466 の番犬が名前を見る）。移行の記録の
+  `FileOutcome::{Unreadable, Refused, Failed}` の理由は `String` から日英の対 `tako_core::migration::OutcomeReason`
+  へ替え、`Validator` / `Step::apply` の失敗も同じ型にした。組む側は型の `text_in` で日英の両方を持たせる:
+  tako-core は `PlanError` / `MigrateTextError` / `FileFailure`（読み取り・退避・書き込みの失敗）、tako-control は
+  `migrations::MigrateReason`（手順の途中で読めない・YAML の再構成・#1981 の区切り・#1825 の作らなかった理由）と
+  `setup::SetupRelocateError`（#1019 の置き場の移設）、中身が前から日英の型のもの（`JsonReason` / `YamlReason` /
+  `ConfigError` / `ReplyNote` / `SiError` / `RelocateError` / mod の `UiProblem`）はその `text_in`。書き手
+  （`config_io::atomic_write_typed` の `WriteError`）の断りは `OutcomeReason::into_io_error` で `io::Error` に載せて
+  tako-core の退避・書き込みの理由まで日英の対のまま届く。**`tako migrate status` / MCP `tako_migrate` の `reason` は
+  表示言語（`.text()`）、persist.log（`移行できず:` / `移行を中止:`）と `tako setup` の行（枠が日本語）は `.ja()`** で
+  修正前とバイト一致。番犬は同じ `issue1762_dispatch_error_lang.rs`（`Reason` の表に 4 種・移行の記録の型 5 つの
+  旧文の表・`MIGRATION_REASON_SCOPES` と `file_json` の `reason` の走査・`USER_TASK_DELIVERY_SCOPES`）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
@@ -2933,6 +2950,25 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     `forget` / static / フィールドに持つ形は番犬 `issue1926_app_nap_watchdog` が落とす）
   - **スリープ防止（#173）のアサーションを握っている間は間引かれない**（#1926 で実測。隔離 GUI でも
     `tako sleep-guard set --mode on` で優先度 28 のまま）。性能を比べる腕ではスリープ防止の状態を揃える
+
+### 非同期の GUI 操作の結果は状態で待ってから確かめる（Issue #2684）
+
+本体が `dispatch_off_ui` を通る GUI のメソッド（kill の確認・履歴の開閉・タスクの完了 等）は、結果が
+background を一往復した後の着地で決まる。**呼んだのと同じ `window.update` の中では結果を確かめない**。
+#2657 が `pane_kill_confirmed` をこの形へ寄せた後も、項目 56 は同じ update の中で「一時ペインが消えた」を
+見ていたので必ず落ち、セルフテストが成功の出口へ届かなくなっていた（#2684。製品の結果は変わっていない =
+着地は 12〜24ms 後）。
+
+- update では同期で決まる部分（確認の畳み = `take` 等）だけを判定し、結果は `wait_for_app_state`
+  （上限は `state_wait_budget`）で待ってから `check` する。検出力は「待つ相手が来ない」注入で示す
+  （項目 56 は `TAKO_2684_INJECT=noclose` = 確認を畳むだけで close を撃たない → 上限まで待って FAILED）
+- 番犬 `selftest_offui_wait_watchdog` が、本体に `self.dispatch_off_ui(` を持つ fn の名前を tako-app の src
+  から自動で集め、セルフテストでそれを呼んだ行から次の `check(` までに状態待ち（名前が `wait_` で始まる
+  呼び出しか `settle` / `settle_…`。固定待ちの `wait(` は数えない）が無ければ file:line で名指す。同期で
+  決まるものしか見ない呼び出しだけ、その行か直前のコメント行に `// tako:offui-sync-ok <理由>` を書く
+- **製品の側を非同期へ寄せる PR は、セルフテストの呼び手も直す**（セルフテストは CI で走らない。番犬は
+  `dispatch_off_ui` へ寄せた時点で呼び手を名指すが、`prepare_offload` の側で同期の腕が非同期へ変わる形は
+  呼び手の字面が変わらないので拾えない）
 
 ### 節が作る一時ファイルは `remove_on_fail` で登録する（Issue #2051）
 

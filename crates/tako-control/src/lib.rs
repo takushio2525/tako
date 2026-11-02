@@ -149,6 +149,7 @@ pub mod welcome;
 pub mod worker_font;
 /// worker へ持ち込む MCP サーバーを絞る（#2412。既定は tako の MCP だけ）
 pub mod worker_mcp;
+pub mod workspace_replace;
 pub mod workspace_search;
 
 pub use dispatch::{

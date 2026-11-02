@@ -408,7 +408,8 @@ const OLD_JA: [(&str, &str); 68] = [
     ("setup_bootstrap_action", "無効なパラメータ: 不明な action: \"bogus\"（status / status-all / install / path / undo-path / handoff のいずれか）"),
     ("fda_action", "無効なパラメータ: 不明な action: \"bogus\"（status / open のいずれか）"),
     ("update_action", "無効なパラメータ: 不明な action: \"bogus\"（status / check / apply / apply-zip / repair / open / card / card-dismiss / card-show のいずれか）"),
-    ("workspace_search_action", "無効なパラメータ: 不明な action: \"bogus\"（search / results / open / clear のいずれか）"),
+    // #2045 で action に replace / undo が増えた（候補の並びは `workspace_search::ACTIONS` から組む）
+    ("workspace_search_action", "無効なパラメータ: 不明な action: \"bogus\"（search / results / open / clear / replace / undo のいずれか）"),
     ("user_task_action", "無効なパラメータ: 不明な action: \"bogus\"（add / list / show / update / done / dismiss / respond / expand / collapse のいずれか）"),
     ("show_command_action", "無効なパラメータ: 不明な action: \"bogus\"（show / list / copy / run / dismiss のいずれか）"),
     ("remote_folder_action", "無効なパラメータ: 不明な action: \"bogus\"（open / close / list / ls / open-file / ssh-pane / pending / push / auto のいずれか）"),

@@ -525,6 +525,10 @@ pub(super) fn build_request(
             limit: u64_arg(args, "limit")?.map(|n| n as usize),
             item: u64_arg(args, "item")?.map(|n| n as usize),
             focus: bool_arg(args, "focus")?,
+            // #2045: 置換（action=replace / undo）。confirm が無ければプレビューだけ
+            replacement: str_arg(args, "replacement")?,
+            file: str_arg(args, "file")?,
+            confirm: bool_arg(args, "confirm")?,
         },
         "tako_preview_replace" => Request::PreviewReplace {
             pane: Some(target_pane(args, caller)?),

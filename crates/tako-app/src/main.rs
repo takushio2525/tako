@@ -28869,6 +28869,17 @@ impl PreviewHost for TakoApp {
         )
     }
 
+    /// #2045: 横断置換が開いている編集バッファを写す・戻す前に確かめる（画面の本文 = バッファ）
+    fn read_preview_buffer(&self, pane: PaneId, f: &mut dyn FnMut(&str, u64)) -> bool {
+        match self.preview_edits.get(&pane) {
+            Some(edit) => {
+                f(edit.buffer.text(), edit.buffer.version());
+                true
+            }
+            None => false,
+        }
+    }
+
     fn preview_viewport(&self, pane: PaneId) -> Option<serde_json::Value> {
         self.preview_viewport_json(pane)
     }
@@ -34174,6 +34185,11 @@ mod self_test {
     mod workspace_search_1694;
     #[cfg(feature = "visual-test")]
     use workspace_search_1694::workspace_search_visual;
+    /// #2045: 置換欄 → プレビュー → 行の置換 → すべて置換 → 元に戻す（visual-test `workspace-replace-2045`）
+    #[cfg(feature = "visual-test")]
+    mod workspace_replace_2045;
+    #[cfg(feature = "visual-test")]
+    use workspace_replace_2045::workspace_replace_visual;
     /// #1691: 対応する括弧の強調が実ピクセルで出て、対が無いと出ない（visual-test `bracket-match`）
     #[cfg(feature = "visual-test")]
     mod bracket_match_1691;
@@ -40577,6 +40593,17 @@ mod self_test {
     /// - `nomenu` = 657 の `MenuInvoke` を送らずに成功を騙る（#657）
     fn inject_1153() -> String {
         std::env::var("TAKO_1153_INJECT").unwrap_or_default()
+    }
+
+    /// **#2684 の検出力の注入口**（項目 56）。`noclose` = kill の確認を畳むだけで close を撃たない。
+    /// 一時ペインが閉じるのを状態で待つ形が本物の回帰（閉じない）を隠さないことの実測に使う
+    /// （上限まで待ってから「kill 確認フローで一時ペインが閉じる」で FAILED になるのが正しい）。
+    /// 検証プロセスの門の内側でだけ読む
+    fn inject_2684() -> String {
+        if !tako_core::paths::is_verification_process() {
+            return String::new();
+        }
+        std::env::var("TAKO_2684_INJECT").unwrap_or_default()
     }
 
     /// **#2477 の注入口**（項目 93 (e) = 694(e)）。`transient` で「子の走査が 1 瞬間だけ居た子を
@@ -50182,6 +50209,12 @@ mod self_test {
                     workspace_search_visual(any, window, cx).await;
                     visual_exit(0);
                 }
+                // #2045: 置換欄 → プレビュー → 行の置換 → すべて置換 → 元に戻す
+                "workspace-replace-2045" => {
+                    workspace_replace_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #2046: 鍵らしき文字を貼ると確認が出て、やめると PTY へ 1 バイトも届かないか
                 "paste-guard" => {
                     paste_guard_visual(any, window, cx).await;
@@ -50239,7 +50272,7 @@ mod self_test {
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
                          syntax-alias / extra-syntax / net-resume / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
-                         workspace-search-1694 / paste-guard / bracket-match / enter-1759 / \
+                         workspace-search-1694 / workspace-replace-2045 / paste-guard / bracket-match / enter-1759 / \
                          changelog-offload / changelog-expand / tasks-launch-2182 / palette-alias / preview-reveal-2247）"
                     );
                     // 窓とペインはもう開いている = 成功の出口と同じ後片付けを通す（#2491）
@@ -69064,6 +69097,7 @@ mod self_test {
                     let shown = app.panel_visible && app.panel_view == PanelView::Fleet;
                     // 確認フロー: 存在しないセッションの kill は無害に失敗し pending が畳まれる
                     app.tmux_pending_kill = Some(("tako-no-such-session".into(), None, None));
+                    // tako:offui-sync-ok 見るのは同期で畳まれる確認（`take`）だけで、kill の結果は見ない（#2684）
                     app.tmux_kill_confirmed(cx);
                     let pending_cleared = app.tmux_pending_kill.is_none();
                     let closed = tako_control::dispatch(
@@ -69351,8 +69385,13 @@ mod self_test {
 
             // 56. 統合 tmux ビューのタブ枠データ（FR-2.16.6〜2.16.7。旧集約センター FR-2.10 を
             //     統合）。全タブの全ペインがタブ枠に載り、枠内は注目度順。ジャンプで該当ペインへ
-            //     フォーカス（パネルは開いたまま）。ペイン kill の確認フローも畳める
-            let groups_ok = window
+            //     フォーカス（パネルは開いたまま）。ペイン kill の確認フローも畳める。
+            //     #2684: kill 確認の close は #2657 以後 `dispatch_off_ui` = background を一往復した
+            //     後の着地で閉じる（実測 12〜24ms 後）。同じ update の中で「消えた」を確かめると
+            //     必ず落ちるので、update では同期で決まる部分（一覧・並び・ジャンプ・パネル・確認が
+            //     畳まれた）だけを判定し、一時ペインが閉じるのは状態で待ってから確かめる
+            let inject_2684 = inject_2684();
+            let (groups_ok, temp_id) = window
                 .update(cx, |app, _, cx| {
                     let opened = tako_control::dispatch(
                         app,
@@ -69434,19 +69473,56 @@ mod self_test {
                         .find(|p| p.as_u64() == temp)
                         .expect("生やしたペインは存在する");
                     app.pending_pane_kill = Some(temp_id);
-                    app.pane_kill_confirmed(cx);
-                    let killed = app.pending_pane_kill.is_none()
-                        && !app
-                            .workspace
-                            .tabs()
-                            .iter()
-                            .flat_map(|t| t.tree().panes())
-                            .any(|p| p.id() == temp_id);
+                    if inject_2684 == "noclose" {
+                        // 検出力の注入: 確認を畳むだけで close を撃たない（上限まで待って FAILED が正しい）
+                        app.pending_pane_kill = None;
+                    } else {
+                        app.pane_kill_confirmed(cx);
+                    }
+                    // 確認の畳み（`take`）は同期で決まる
+                    let confirm_cleared = app.pending_pane_kill.is_none();
                     app.panel_visible = false;
-                    opened_ok && tabs_match && all_listed && sorted && jumped && still_open && killed
+                    (
+                        opened_ok
+                            && tabs_match
+                            && all_listed
+                            && sorted
+                            && jumped
+                            && still_open
+                            && confirm_cleared,
+                        temp_id,
+                    )
                 })
-                .unwrap_or(false);
-            check(groups_ok, "fleet ビューのタブ枠一覧・ジャンプ・kill 確認フロー");
+                .unwrap_or_else(|_| fail("56: fleet ビューの状態取得"));
+            let started_2684 = std::time::Instant::now();
+            let budget_2684 = state_wait_budget(Duration::from_secs(5), machine_busy());
+            let temp_closed = wait_for_app_state(
+                window,
+                cx,
+                "56: kill 確認で一時ペインが閉じる",
+                budget_2684,
+                move |app| {
+                    !app.workspace
+                        .tabs()
+                        .iter()
+                        .flat_map(|t| t.tree().panes())
+                        .any(|p| p.id() == temp_id)
+                },
+            )
+            .await;
+            println!(
+                "TAKO_SELF_TEST_2684: closed={temp_closed} waited={:.2}s budget={:.1}s \
+                 inject={inject_2684:?} legacy2657={} {}",
+                started_2684.elapsed().as_secs_f32(),
+                budget_2684.as_secs_f32(),
+                tako_control::close_record::legacy(),
+                env_line()
+            );
+            check(
+                groups_ok,
+                "56: fleet ビューのタブ枠一覧・ジャンプ・kill の確認が畳まれる",
+            );
+            check(temp_closed, "56: kill 確認フローで一時ペインが閉じる (#2684)");
 
             // 57. ファイルツリー（FR-3.1 / FR-3.7）。cmd+B で開閉し、表示中は
             //     タブ内ペインの cwd（無ければ $HOME）がワークスペースフォルダとして並ぶ
@@ -108134,6 +108210,276 @@ mod selftest_wait_watchdog {
         let good = "            check(\n                \
                     wait_for_focused_text(window, cx, \"X\", Duration::from_secs(15)).await,\n";
         assert!(fixed_wait_then_positive_contains(good).is_empty());
+    }
+}
+
+/// **セルフテストは非同期の GUI 操作の結果を、呼んだのと同じ update の中で確かめない**（#2684）。
+///
+/// 本体に `self.dispatch_off_ui(` を持つ GUI のメソッド（kill の確認・履歴の開閉・タスクの完了 等）は、
+/// 結果が background を一往復した後の着地で決まる。#2657 が `pane_kill_confirmed` をこの形へ寄せた後も、
+/// 項目 56 は呼んだ update の中で「一時ペインが消えた」を確かめていたので必ず落ち、セルフテストが
+/// 成功の出口へ届かなくなった（#2684。セルフテストは CI で走らないので PR の時点で気づけなかった）。
+///
+/// 検査: そのメソッドの名前を tako-app の src から**自動で集め**（今後 `dispatch_off_ui` へ寄せた
+/// メソッドも自動で対象に入る）、セルフテスト（main.rs の `mod self_test` と `src/self_test/*.rs`）で
+/// それを呼んだ行から次の `check(` までに状態待ちが無ければ file:line で名指す。状態待ちは名前の
+/// 規約で見る = 名前が `wait_` で始まる呼び出しか `settle` / `settle_…` の呼び出し（固定待ちの
+/// `wait(` / `sleep(` は数えない）。次の `check(` より先に別の fn の頭が来たら判定しない。
+/// 同期で決まるもの（確認の畳み = `take` 等）しか見ない呼び出しは、その行か直前のコメント行に
+/// `// tako:offui-sync-ok <理由>` を書いて外す（理由の無い印では外さない）。
+///
+/// 限界（行の近傍の推定）:
+/// - 見るのは「呼んだ行から次の `check(` まで」の字面だけ。間に状態待ちがあれば、同じ update の中で
+///   先に読んだ値を後の check に渡していても見逃す
+/// - `tako_control::dispatch` を update の中で直接呼ぶ形や、`prepare_offload` の側で同期の腕が
+///   非同期へ変わる形（呼び手の字面は変わらない）は拾わない
+/// - 名前が `wait_` / `settle` で始まる固定待ちを足すと、状態待ちと読み違える
+#[cfg(test)]
+mod selftest_offui_wait_watchdog {
+    use super::selftest_launch_withdraw_watchdog::self_test_region;
+    use tako_core::source_scan::fn_head_name;
+
+    /// 非同期の GUI 操作の印と逃げ道の印（`concat!` で分割して書く = 番犬自身のソース行が対象に入らない）
+    const OFF_UI: &str = concat!("self.dispatch", "_off_ui(");
+    const ALLOW_MARKER: &str = concat!("tako:offui", "-sync-ok");
+
+    fn code(line: &str) -> bool {
+        !line.trim_start().starts_with("//")
+    }
+
+    /// 本体に [`OFF_UI`] を持つ fn の名前（重複なし・出現順）
+    fn off_ui_methods(sources: &[(String, String)]) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for (_, src) in sources {
+            let mut current: Option<&str> = None;
+            for line in src.lines() {
+                if let Some(name) = fn_head_name(line) {
+                    current = Some(name);
+                }
+                if !(code(line) && line.contains(OFF_UI)) {
+                    continue;
+                }
+                if let Some(name) = current.filter(|n| !names.iter().any(|m| m == n)) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    /// 状態待ちの呼び出しを含む行か（名前が `wait_` で始まる / `settle` / `settle_…`）
+    fn has_state_wait(line: &str) -> bool {
+        if !code(line) || fn_head_name(line).is_some() {
+            return false;
+        }
+        let mut rest = line;
+        while let Some(open) = rest.find('(') {
+            let head = &rest[..open];
+            let start = head
+                .char_indices()
+                .rev()
+                .find(|&(_, c)| !(c.is_alphanumeric() || c == '_'))
+                .map_or(0, |(at, c)| at + c.len_utf8());
+            let name = &head[start..];
+            if name.starts_with("wait_") || name == "settle" || name.starts_with("settle_") {
+                return true;
+            }
+            rest = &rest[open + 1..];
+        }
+        false
+    }
+
+    /// その行か直前のコメント行に理由つきの印があるか
+    fn allowed(lines: &[(usize, &str)], at: usize) -> bool {
+        let marked = |line: &str| {
+            line.find(ALLOW_MARKER)
+                .is_some_and(|p| !line[p + ALLOW_MARKER.len()..].trim().is_empty())
+        };
+        marked(lines[at].1)
+            || lines[..at]
+                .iter()
+                .rev()
+                .take_while(|(_, l)| !code(l))
+                .any(|(_, l)| marked(l))
+    }
+
+    /// 違反（`file:line: メソッド名`）
+    fn violations(names: &[String], file: &str, lines: &[(usize, &str)]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, &(number, line)) in lines.iter().enumerate() {
+            if !code(line) || fn_head_name(line).is_some() {
+                continue;
+            }
+            let Some(name) = names.iter().find(|n| line.contains(&format!(".{n}("))) else {
+                continue;
+            };
+            if allowed(lines, i) {
+                continue;
+            }
+            let mut waited = false;
+            for &(_, next) in &lines[i + 1..] {
+                if !code(next) {
+                    continue;
+                }
+                if fn_head_name(next).is_some() {
+                    break;
+                }
+                if next.trim_start().starts_with("check(") {
+                    if !waited {
+                        out.push(format!("{file}:{number}: {name}"));
+                    }
+                    break;
+                }
+                waited |= has_state_wait(next);
+            }
+        }
+        out
+    }
+
+    /// 集めた名前と違反。セルフテストとして見るのは main.rs の `mod self_test` と `self_test/*.rs`
+    fn scan(sources: &[(String, String)]) -> (Vec<String>, Vec<String>) {
+        let names = off_ui_methods(sources);
+        let mut hits = Vec::new();
+        for (file, src) in sources {
+            let lines: Vec<(usize, &str)> = if file == "main.rs" {
+                self_test_region(src)
+            } else if file.starts_with("self_test/") {
+                src.lines().enumerate().map(|(i, l)| (i + 1, l)).collect()
+            } else {
+                continue;
+            };
+            hits.extend(violations(
+                &names,
+                &format!("crates/tako-app/src/{file}"),
+                &lines,
+            ));
+        }
+        (names, hits)
+    }
+
+    /// tako-app の src の .rs（src からの相対パスと本文。main.rs は `include_str!` の版）
+    fn app_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = vec![("main.rs".to_string(), include_str!("main.rs").to_string())];
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let mut paths: Vec<_> = std::fs::read_dir(&dir)
+                .expect("src を読めない")
+                .flatten()
+                .map(|e| e.path())
+                .collect();
+            paths.sort();
+            for path in paths {
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rel != "main.rs" {
+                    out.push((rel, std::fs::read_to_string(&path).unwrap_or_default()));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn セルフテストは非同期のgui操作の結果を状態で待ってから確かめる() {
+        let (names, hits) = scan(&app_sources());
+        // 名前を集められない（= 番犬が何も見ていない）形で通らない
+        for must in ["pane_kill_confirmed", "tmux_kill_confirmed"] {
+            assert!(
+                names.iter().any(|n| n == must),
+                "`{must}` を非同期の GUI 操作として集められない（集めた名前: {names:?}）"
+            );
+        }
+        assert!(
+            hits.is_empty(),
+            "{hits:?} は本体が `dispatch_off_ui` を通る（結果は background を一往復した後の着地で決まる）\
+             GUI の操作を呼んだ後、次の `check(` までに状態待ちが無い。同じ update の中で結果を確かめると\
+             必ず落ちる（#2684）。`wait_for_app_state` 等で状態を待ってから確かめるか、同期で決まるもの\
+             しか見ないならその行か直前のコメント行に `// tako:offui-sync-ok <理由>` を書く"
+        );
+    }
+
+    /// 検出力の担保: 修正前の項目 56 の形を名指し、状態待ち・理由つきの印は許す
+    #[test]
+    fn 番犬は修正前の項目56の形を名指し状態待ちと理由つきの印は許す() {
+        let product = format!(
+            "impl TakoApp {{\n    fn pane_kill_confirmed(&mut self, cx: &mut Context<Self>) {{\n        \
+             {OFF_UI}\n    }}\n    fn jump_to_pane(&mut self) {{}}\n}}\n"
+        );
+        // 修正前の項目 56（呼んだ update の中で消えたことを確かめ、そのまま check）。`{wait}` に差し込む
+        let item = |call: &str, wait: &str| {
+            [
+                "mod self_test {",
+                "    async fn run(cx: &mut AsyncApp) {",
+                "        let groups_ok = window",
+                "            .update(cx, |app, _, cx| {",
+                "                app.pending_pane_kill = Some(temp_id);",
+                call,
+                "                app.pending_pane_kill.is_none() && !app.has(temp_id)",
+                "            })",
+                "            .unwrap_or(false);",
+                wait,
+                "        check(groups_ok, \"56\");",
+                "    }",
+                "}",
+            ]
+            .join("\n")
+        };
+        let call = "                app.pane_kill_confirmed(cx);";
+        let hits = |main: String| {
+            scan(&[
+                ("product.rs".to_string(), product.clone()),
+                ("main.rs".to_string(), main),
+            ])
+            .1
+        };
+        assert_eq!(
+            scan(&[("product.rs".to_string(), product.clone())]).0,
+            vec!["pane_kill_confirmed".to_string()],
+            "本体に dispatch_off_ui を持つ fn だけを集める"
+        );
+        assert_eq!(
+            hits(item(call, "")),
+            vec!["crates/tako-app/src/main.rs:6: pane_kill_confirmed".to_string()]
+        );
+        // 固定待ちは状態待ちに数えない
+        assert_eq!(hits(item(call, "        wait(cx, 500).await;")).len(), 1);
+        // 状態待ちを挟めば通る（`wait_` で始まる名前・`settle_…`）
+        let waited =
+            "        let closed = wait_for_app_state(window, cx, \"56\", budget, f).await;";
+        assert!(hits(item(call, waited)).is_empty());
+        assert!(hits(item(call, "        settle_user_tasks(window, cx).await;")).is_empty());
+        // 理由つきの印（直前のコメント行・同じ行）は外す。理由の無い印では外さない
+        let marked = format!("                // {ALLOW_MARKER} 確認の畳みだけを見る\n{call}");
+        assert!(hits(item(&marked, "")).is_empty());
+        assert!(hits(item(&format!("{call} // {ALLOW_MARKER} 畳みだけ"), "")).is_empty());
+        let bare = format!("                // {ALLOW_MARKER}\n{call}");
+        assert_eq!(hits(item(&bare, "")).len(), 1);
+        // 非同期でない操作は見ない
+        assert!(hits(item("                app.jump_to_pane(target, cx);", "")).is_empty());
+        // 次の check より先に別の fn の頭が来たら判定しない
+        assert!(hits(item(call, "    }\n    async fn next(cx: &mut AsyncApp) {")).is_empty());
+        // self_test/*.rs はファイル全体をセルフテストとして見る
+        let section =
+            format!("async fn section(cx: &mut AsyncApp) {{\n{call}\n    check(ok, \"x\");\n}}\n");
+        assert_eq!(
+            scan(&[
+                ("product.rs".to_string(), product.clone()),
+                ("self_test/x_1.rs".to_string(), section),
+            ])
+            .1,
+            vec!["crates/tako-app/src/self_test/x_1.rs:2: pane_kill_confirmed".to_string()]
+        );
     }
 }
 

@@ -670,6 +670,9 @@ mod tests {
                 limit: None,
                 item: None,
                 focus: None,
+                replacement: None,
+                file: None,
+                confirm: None,
             }]
         );
         let (_, requests) = run(
@@ -696,6 +699,9 @@ mod tests {
                 limit: Some(0),
                 item: None,
                 focus: None,
+                replacement: None,
+                file: None,
+                confirm: None,
             }]
         );
         let (_, requests) = run(
@@ -719,6 +725,9 @@ mod tests {
                 limit: None,
                 item: Some(3),
                 focus: Some(true),
+                replacement: None,
+                file: None,
+                confirm: None,
             }]
         );
     }

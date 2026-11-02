@@ -16,8 +16,8 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tako_core::workspace_search::{self, Matcher, Options, Outcome, Query, QueryError};
 
-/// CLI / MCP が共有する action の綴り（既定は `search`）
-pub const ACTIONS: [&str; 4] = ["search", "results", "open", "clear"];
+/// CLI / MCP が共有する action の綴り（既定は `search`。`replace` / `undo` は #2045 の置換）
+pub const ACTIONS: [&str; 6] = ["search", "results", "open", "clear", "replace", "undo"];
 /// 応答に載せる行の既定（`limit` 省略時。0 = 保持しているぶん全部）
 pub const DEFAULT_LIMIT: usize = 100;
 
@@ -139,5 +139,39 @@ pub fn store_json(store: &workspace_search::SearchStore, limit: Option<usize>) -
     };
     out["running"] = running.unwrap_or(Value::Null);
     out["retained"] = json!(store.retained());
+    // #2045: 置換の状態（GUI の行に並んでいるプレビュー・当て済みの行・取り消しの履歴）
+    let replace = store.replace();
+    let preview = store
+        .shown()
+        .and_then(|shown| replace.preview().filter(|p| p.seq == shown.seq));
+    if let Some(items) = out["items"].as_array_mut() {
+        for item in items {
+            let Some(index) = item["id"].as_u64().map(|id| id as usize - 1) else {
+                continue;
+            };
+            if replace.applied().contains(&index) {
+                item["replace_status"] = json!("replaced");
+            } else if let Some(row) = preview.and_then(|p| p.rows.get(&index)) {
+                match row {
+                    tako_core::workspace_replace::RowPreview::Ready(line) => {
+                        item["replace_status"] = json!("preview");
+                        item["replaced"] = json!(line.after);
+                    }
+                    tako_core::workspace_replace::RowPreview::Skipped(skip) => {
+                        item["replace_status"] = json!(skip.slug());
+                    }
+                }
+            }
+        }
+    }
+    out["replace"] = json!({
+        "replacement": preview.map(|p| p.replacement.clone()),
+        "error": preview
+            .and_then(|p| p.error.as_ref())
+            .map(|e| e.text_in(tako_core::i18n::lang())),
+        "applied": replace.applied().len(),
+        "busy": replace.busy().is_some(),
+        "history": crate::workspace_replace::history_json(replace),
+    });
     out
 }

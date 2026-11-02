@@ -1708,7 +1708,7 @@
     "name": "tako_preview_search"
   },
   {
-    "description": "ワークスペース横断検索（右パネル search ビュー）。action=search（既定）は query をタブのファイルツリーのルート（path で別のフォルダ）から行ごとに探し、items[]（id・path・line・column・excerpt）を返す。.gitignore 対象・バイナリ・.git の中は探さない。regex で正規表現・case_sensitive で大文字小文字を区別（どちらも既定 false）。上限で止めたら stopped（limit / time / cancelled）。show で右パネルにも出し、results で読み直す・open で item 番目を開く・clear で閉じる。",
+    "description": "ワークスペース横断検索（右パネル search ビュー）。action=search（既定）は query をタブのファイルツリーのルート（path で別のフォルダ）から行ごとに探し、items[]（id・path・line・column・excerpt）を返す。.gitignore 対象・バイナリ・.git の中は探さない。regex で正規表現・case_sensitive で大文字小文字を区別（どちらも既定 false）。上限で止めたら stopped（limit / time / cancelled）。show で右パネルにも出し、results で読み直す・open で item 番目を開く・clear で閉じる。replace は replacement で置換（query 無しは右パネルの結果・item / file で範囲）、undo は直前の置換を戻す（confirm 無しはプレビュー）。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -1718,19 +1718,29 @@
             "search",
             "results",
             "open",
-            "clear"
+            "clear",
+            "replace",
+            "undo"
           ],
           "type": "string"
         },
         "case_sensitive": {
           "type": "boolean"
         },
+        "confirm": {
+          "description": "replace / undo: 当てる（既定 false）",
+          "type": "boolean"
+        },
+        "file": {
+          "description": "replace: そのファイルの行だけ",
+          "type": "string"
+        },
         "focus": {
           "description": "open: 着地したペインへフォーカスを移す",
           "type": "boolean"
         },
         "item": {
-          "description": "open: items[] の id",
+          "description": "open / replace: items[] の id",
           "minimum": 1,
           "type": "integer"
         },
@@ -1754,6 +1764,10 @@
         },
         "regex": {
           "type": "boolean"
+        },
+        "replacement": {
+          "description": "replace: 置換後（正規表現は $1 等）",
+          "type": "string"
         },
         "show": {
           "description": "search: 右パネルにも出す",

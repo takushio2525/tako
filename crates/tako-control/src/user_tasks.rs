@@ -371,9 +371,10 @@ impl OriginSource {
 ///
 /// **`default` へ落とさない**のが要点（#1466）。落とすと「たまたま生きている
 /// default プロファイルの master」= 別プロジェクトの会話へ返答が入り、
-/// 受け取った側にも起票した側にも何が起きたか分からない
-pub const UNRESOLVED_ORIGIN_REASON: &str =
-    "宛先不明: 起票元の master プロファイルを解決できない（呼び出し元の role も spawn 元の master も残っていない）";
+/// 受け取った側にも起票した側にも何が起きたか分からない。
+///
+/// 文は日英の対（`crate::Reason` の網羅 match）で、記録へは書いた時点の表示言語で載る（#2365）
+pub const UNRESOLVED_ORIGIN_REASON: crate::Reason = crate::Reason::UserTaskOriginUnresolved;
 
 /// #1466 の A/B。`TAKO_1466_LEGACY=1` で「master を名乗る呼び出しだけ解けて、
 /// 残りは `default` へ落ちる」修正前の挙動を同一バイナリのまま再現する
@@ -913,7 +914,19 @@ mod tests {
         assert_eq!(d.pane, None, "宛先不明なのにペインを選んでいる");
         assert_eq!(d.response_index, Some(2));
         let reason = d.reason.expect("理由が無い");
-        assert!(reason.contains("宛先不明"), "{reason}");
+        // 理由は書いた時点の表示言語（#2365）。テストの並びで言語のグローバルが動くので日英のどちらかで見る
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .iter()
+                .any(|&lang| reason == UNRESOLVED_ORIGIN_REASON.text_in(lang)),
+            "{reason}"
+        );
+        assert!(
+            UNRESOLVED_ORIGIN_REASON
+                .text_in(tako_core::i18n::Lang::Ja)
+                .contains("宛先不明"),
+            "日本語は #1466 の文のまま"
+        );
     }
 
     /// #1466: 解決順は「呼び出し元の名乗り → ペインの role → spawn 元 → 管轄」
