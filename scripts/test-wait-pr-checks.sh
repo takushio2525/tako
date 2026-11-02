@@ -18,6 +18,18 @@
 #   9. gh の一時的な接続エラーはやり直し、届かないままなら到達性の 5 で終わる（赤の 1 と分ける。#1704）
 # 併せて期待名の導出（pull_request で起動する job のみ / name 無しは job id）と、
 # merge-pr.sh が「揃っていないときに merge を呼ばない」ことも見る。
+#
+# 失敗時の手掛かり（#2690）: assert が落ちたら、直前の腕でまだ出していない実行（wait-pr-checks.sh /
+# merge-pr.sh の 1 回）の出力と終了コード、偽 gh の 1 回ごとの呼ばれ方（時刻・終了コード・引数）、
+# 偽 gh の応答ファイルの一覧をログへ出す（CI のログだけで「その腕のどこで何が起きたか」を追えるように）。
+# CI の macOS の runner の `bash` は macOS 同梱の 3.2（Homebrew の bash が無い）なので、手元の再現は
+# PATH の先頭の `bash` を /bin/bash にして回す。
+#
+# 使い方: bash scripts/test-wait-pr-checks.sh
+#   TAKO_2690_INJECT=<merge-rc|classify> を付けると、Test 39 の t39merge の腕の 1 回だけ、CI で出た
+#   「5 のはずが 1・到達性の名指しが無い」と同じ 2 件の FAIL を起こす（手掛かりが出ることの確認用）:
+#     merge-rc = 偽 gh が merge.rc を読めず、gh pr merge が 0 で終わったことになる
+#     classify = merge-pr.sh の接続エラーの判定（grep）が 1 回だけ一致しない
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$PWD"
@@ -37,6 +49,7 @@ ok() {
 ng() {
   echo "  FAIL: $1 ($2)"
   FAIL=$((FAIL + 1))
+  dump_case
 }
 assert_eq() { if [[ "$2" == "$3" ]]; then ok "$1"; else ng "$1" "期待 '$3' / 実際 '$2'"; fi; }
 assert_has() { if grep -qF -- "$2" <<<"$3"; then ok "$1"; else ng "$1" "出力に無い: $2"; fi; }
@@ -54,6 +67,8 @@ cat > "${TMP}/bin/gh" <<'GH_EOF'
 set -uo pipefail
 M="${TAKO_GH_MOCK_DIR}"
 echo "$*" >> "${M}/calls.log"
+# 1 回ごとの呼ばれ方（時刻・終了コード・引数）を残す。落ちた腕の手掛かりに出す（#2690）
+trap 'rc=$?; echo "$(date +%H:%M:%S) rc=${rc} gh $*" >> "${M}/trace.log"' EXIT
 
 # -q / --jq が付いていればその式を適用して返す（本物と同じ見え方にする）
 emit() {
@@ -247,13 +262,70 @@ new_case() {
   export TAKO_GH_MOCK_DIR="${CASE_DIR}/mock"
 }
 
-run_wait() { (cd "${CASE_DIR}/repo" && bash "${WAIT_SH}" "$@" 2>&1); }
-run_merge() { (cd "${CASE_DIR}/repo" && bash "${MERGE_SH}" "$@" 2>&1); }
+# ---------------------------------------------------------------- 落ちた腕の手掛かり（#2690）
+# 腕の実行は $( ) の中で走り、親の変数を書けないので、出力・終了コード・コマンドを <腕>/runs/ へ
+# 連番のファイルで残す（実行は 1 本ずつ順に走るので連番の読み書きは競合しない）。偽 gh の呼ばれ方
+# （mock/trace.log）には実行の区切りを書き込む。assert が落ちたら dump_case が、直前の腕でまだ
+# 出していない実行をまとめて出す（同じ実行を 2 度出さない。通った assert では何も出さない）
+DUMPED_CASE=""
+DUMPED_RUNS=0
+
+# record_run <コマンド...>: コマンドを走らせて出力をそのまま返し、写しと終了コードを残す
+# （tee で写すのは、腕の標準出力をこれまでどおりパイプのままにして、検査する条件を変えないため）
+record_run() {
+  local runs="${CASE_DIR}/runs" n rc
+  mkdir -p "${runs}"
+  n=$(($(cat "${runs}/seq" 2>/dev/null || echo 0) + 1))
+  echo "${n}" > "${runs}/seq"
+  printf '%s\n%s\n' "$*" "$(date +%H:%M:%S)" > "${runs}/${n}.meta"
+  echo "== 実行 ${n}" >> "${CASE_DIR}/mock/trace.log"
+  "$@" 2>&1 | tee "${runs}/${n}.out"
+  rc=${PIPESTATUS[0]}
+  printf '%s %s\n' "${rc}" "$(date +%H:%M:%S)" > "${runs}/${n}.rc"
+  return "${rc}"
+}
+
+# 一時 dir とリポジトリの実パスは伏せる（ログを読みやすく。実ユーザー名を出さない）
+mask_paths() { LC_ALL=C sed -e "s#/private${TMP}#<tmp>#g" -e "s#${TMP}#<tmp>#g" -e "s#${REPO_ROOT}#<repo>#g"; }
+
+dump_case() {
+  local runs n last rc_line
+  [[ -n "${CASE_DIR:-}" && -d "${CASE_DIR}/runs" ]] || return 0
+  runs="${CASE_DIR}/runs"
+  if [[ "${DUMPED_CASE}" != "${CASE_DIR}" ]]; then
+    DUMPED_CASE="${CASE_DIR}"
+    DUMPED_RUNS=0
+  fi
+  last="$(cat "${runs}/seq" 2>/dev/null || echo 0)"
+  if [[ ${last} -le ${DUMPED_RUNS} ]]; then
+    echo "    （この腕の手掛かりは上に出した）"
+    return 0
+  fi
+  echo "    ==== 手掛かり（#2690）: 腕 ${CASE_DIR##*/} の実行 $((DUMPED_RUNS + 1))〜${last} ===="
+  n=$((DUMPED_RUNS + 1))
+  while [[ ${n} -le ${last} ]]; do
+    # .rc は「終了コード 終了時刻」。無い = 実行が終わる前に記録が途切れた
+    rc_line="$(cat "${runs}/${n}.rc" 2>/dev/null || echo '? ?')"
+    echo "    ---- 実行 ${n}: $(sed -n 1p "${runs}/${n}.meta" | mask_paths)"
+    echo "         $(sed -n 2p "${runs}/${n}.meta") 開始 → ${rc_line#* } 終了 / 終了コード ${rc_line%% *}"
+    sed -e 's/^/    | /' "${runs}/${n}.out" | mask_paths
+    n=$((n + 1))
+  done
+  echo "    ---- 偽 gh の呼ばれ方（mock/trace.log = 時刻 終了コード 引数。「== 実行 N」は実行の区切り）"
+  awk -v from="== 実行 $((DUMPED_RUNS + 1))" 'p || $0 == from { p = 1; print "    | " $0 }' \
+    "${CASE_DIR}/mock/trace.log" | mask_paths
+  echo "    ---- 偽 gh の応答ファイル: $(ls "${CASE_DIR}/mock" | tr '\n' ' ')"
+  echo "    ==== 手掛かりここまで ===="
+  DUMPED_RUNS="${last}"
+}
+
+run_wait() { (cd "${CASE_DIR}/repo" && record_run bash "${WAIT_SH}" "$@"); }
+run_merge() { (cd "${CASE_DIR}/repo" && record_run bash "${MERGE_SH}" "$@"); }
 # 専用 worktree から実行する形（#1430）。第 1 引数が作業ディレクトリ
 run_merge_at() {
   local dir="$1"
   shift
-  (cd "${dir}" && bash "${MERGE_SH}" "$@" 2>&1)
+  (cd "${dir}" && record_run bash "${MERGE_SH}" "$@")
 }
 # 実 git のコミット・ブランチ・作業ツリーを用意する（#1430 のローカル後始末は本当に git を触るので
 # スタブではなく実物で見る）。$1 = head ブランチ名 / $2 = "worktree" なら別の作業ツリーが握る
@@ -1169,7 +1241,20 @@ green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
 echo 1 > "${TAKO_GH_MOCK_DIR}/merge.rc"
 printf 'error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com\n' \
   > "${TAKO_GH_MOCK_DIR}/merge.err"
-out="$(run_merge 1669 --timeout 20 --interval 1)"
+# 注入（#2690。手掛かりが出ることの確認用）: CI で出た 2 件の FAIL をこの腕の 1 回だけ起こす
+t39_path="${PATH}"
+case "${TAKO_2690_INJECT:-}" in
+  merge-rc) chmod 000 "${TAKO_GH_MOCK_DIR}/merge.rc" ;;
+  classify)
+    # 接続エラーの判定の grep（引数に判定の式が入る）だけを 1 回落とし、他の grep は本物へ渡す
+    mkdir -p "${CASE_DIR}/inject"
+    printf '#!/bin/sh\ncase "$*" in *"error connecting to|"*)\n  [ -f "%s/used" ] || { : > "%s/used"; exit 1; } ;;\nesac\nexec "%s" "$@"\n' \
+      "${CASE_DIR}/inject" "${CASE_DIR}/inject" "$(command -v grep)" > "${CASE_DIR}/inject/grep"
+    chmod +x "${CASE_DIR}/inject/grep"
+    t39_path="${CASE_DIR}/inject:${PATH}"
+    ;;
+esac
+out="$(PATH="${t39_path}" run_merge 1669 --timeout 20 --interval 1)"
 assert_eq "gh pr merge が届かず merge されていなければ 5" "$?" "5"
 assert_has "merge しない理由に到達性を名指しする" "merge しない: gh pr merge が GitHub API に届かなかった" "${out}"
 
