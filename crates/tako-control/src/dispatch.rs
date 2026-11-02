@@ -18092,7 +18092,8 @@ fn dispatch_orchestrator_self(
     warnings.extend(
         memo_content
             .as_deref()
-            .and_then(|m| tako_core::handoff::profile_memo_warning(profile_name, m)),
+            .and_then(|m| orchestrator::handoff_store::memo_warning(profile_name, m))
+            .map(String::from),
     );
     // #1021 の自己検証: 画面と transcript がずれていたら窓の宣言が実態と食い違っている
     warnings.extend(crate::claude_ctx::window_warning(&ctx).map(String::from));
@@ -18517,7 +18518,7 @@ pub fn dispatch_orchestrator_handoff_files(
                     let mut v = describe(&path);
                     v["profile"] = json!(name);
                     let body = std::fs::read_to_string(&path).unwrap_or_default();
-                    v["warning"] = json!(ho::profile_memo_warning(&name, &body));
+                    v["warning"] = json!(store::memo_warning(&name, &body).map(String::from));
                     v
                 })
                 .collect();
@@ -18556,7 +18557,10 @@ pub fn dispatch_orchestrator_handoff_files(
                     "format": doc.as_ref().map(|d| d.format().as_str()),
                     "sections": doc.as_ref().map(|d| d.section_labels()),
                     "content": body,
-                    "warning": body.as_deref().and_then(|b| ho::profile_memo_warning(name, b)),
+                    "warning": body
+                        .as_deref()
+                        .and_then(|b| store::memo_warning(name, b))
+                        .map(String::from),
                 }))
             }
             _ => Err(Reason::ActionExactlyOneOf {
@@ -18597,7 +18601,7 @@ pub fn dispatch_orchestrator_handoff_files(
                         "profile": name,
                         "path": path.display().to_string(),
                         "bytes": text.len(),
-                        "warning": ho::profile_memo_warning(name, &text),
+                        "warning": store::memo_warning(name, &text).map(String::from),
                     }))
                 }
                 _ => Err(Reason::ActionExactlyOneOf {
@@ -18614,7 +18618,10 @@ pub fn dispatch_orchestrator_handoff_files(
                 Some(name) => vec![store::ensure_migrated(name)],
                 None => store::migrate_all(),
             };
-            let summaries: Vec<String> = outcomes.iter().filter_map(|o| o.summary()).collect();
+            let summaries: Vec<String> = outcomes
+                .iter()
+                .filter_map(|o| o.summary().map(String::from))
+                .collect();
             Ok(json!({
                 "migrations": outcomes,
                 "summaries": summaries,
@@ -18975,7 +18982,7 @@ fn dispatch_orchestrator_handoff(
     let handoff_path = orchestrator::handoff_path(profile_name);
     let mut warnings: Vec<String> = migration.warnings.iter().map(ToString::to_string).collect();
     warnings.extend(load_warning);
-    warnings.extend(bundle.memo_warning.clone());
+    warnings.extend(bundle.memo_warning.clone().map(String::from));
     // #1055: 起動フォルダの食い違いは黙らない（後任だけツールが全部拒否される、のような
     // 理由の分からない停止を作らないため）
     warnings.extend(cwd_warning);

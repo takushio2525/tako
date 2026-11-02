@@ -22,8 +22,12 @@
 //! orchestrator の応答の `warnings` に並ぶ別モジュールの注記のうち、引き継ぎファイルの自動移行
 //! （`handoff_store::ensure_migrated` の `MigrationOutcome::warnings`。応答の JSON へは表示言語の文で
 //! 書き出し、`tako migrate` の記録は日本語）とモデルの食い違い（`registry::model_warning` /
-//! `ModelObservation::warning`。旧 `tako_core::model_check::mismatch_warning`）も同じ形で持つ
+//! `ModelObservation::warning`。旧 `tako_core::model_check::mismatch_warning`）も同じ形で持つ。
+//! 引き継ぎの応答のほかの文（移行の 1 行サマリ `MigrationOutcome::summary`・運用メモの肥大
+//! `handoff_store::memo_warning`。旧 `tako_core::handoff::profile_memo_warning`）と `workers` 一覧の
+//! `resend_command`（`registry::resend_command`。プレースホルダだけ表示言語）も組む側は型を返す
 
+use tako_core::handoff::{HANDOFF_PROJECTS_DIR, PROFILE_MEMO_SOFT_LIMIT_LINES};
 use tako_core::i18n::Lang;
 use tako_core::platform::support::Note;
 
@@ -336,6 +340,22 @@ pub enum ReplyNote {
         actual: String,
         account: Option<String>,
     },
+
+    // ---- 引き継ぎの応答のほかの文・`workers` 一覧の再送コマンド ----
+    /// 引き継ぎファイルの移行の 1 行サマリ（`MigrationOutcome::summary`。`handoffs migrate` の
+    /// `summaries`）。`moved` は移した先のプロジェクトキー（空 = 移動なし）、`archived_to` は原本の退避先
+    HandoffMigrated {
+        profile: String,
+        moved: Vec<String>,
+        kept_lines: usize,
+        archived_to: Option<String>,
+    },
+    /// プロファイル運用メモの肥大（#915 要件 3。旧 `tako_core::handoff::profile_memo_warning`）。
+    /// `lines` は今の行数（目安は `PROFILE_MEMO_SOFT_LIMIT_LINES`）
+    ProfileMemoOversized { profile: String, lines: usize },
+    /// `workers` 一覧の `resend_command`（未達 worker へ同じ依頼文を送り直すテンプレート）。
+    /// コピーして打つコマンドなので、表示言語に従うのはプレースホルダだけ（本体と引用は同じ）
+    ResendCommand { pane: u64 },
 }
 
 impl ReplyNote {
@@ -1333,6 +1353,61 @@ impl ReplyNote {
                 }
                 .text_in(lang)
             ),
+            (
+                Self::HandoffMigrated {
+                    profile,
+                    moved,
+                    kept_lines,
+                    archived_to,
+                },
+                Ja,
+            ) => format!(
+                "handoff/{profile}.md をプロジェクト単位へ自動移行しました（#915）: {} / \
+                 共通置き場に {kept_lines} 行を残し、移行前のファイルは {} へ退避",
+                if moved.is_empty() {
+                    "移動なし".to_string()
+                } else {
+                    moved.join(", ")
+                },
+                archived_to.as_deref().unwrap_or("(退避なし)")
+            ),
+            (
+                Self::HandoffMigrated {
+                    profile,
+                    moved,
+                    kept_lines,
+                    archived_to,
+                },
+                En,
+            ) => format!(
+                "migrated handoff/{profile}.md to per-project files (#915): {} / kept \
+                 {kept_lines} lines in the shared memo and archived the original to {}",
+                if moved.is_empty() {
+                    "nothing moved".to_string()
+                } else {
+                    moved.join(", ")
+                },
+                archived_to.as_deref().unwrap_or("(not archived)")
+            ),
+            // 英語は旧 `tako_core::handoff::profile_memo_warning_in` の英語の腕とバイト一致
+            (Self::ProfileMemoOversized { profile, lines }, Ja) => format!(
+                "プロファイル運用メモ handoff/{profile}.md が {lines} 行あります\
+                 （目安 {PROFILE_MEMO_SOFT_LIMIT_LINES} 行）。\
+                 プロジェクト固有の内容は handoff/{HANDOFF_PROJECTS_DIR}/<project-key>.md へ\
+                 移してください（そこは管轄する master だけへ渡ります）"
+            ),
+            (Self::ProfileMemoOversized { profile, lines }, En) => format!(
+                "The profile operating memo handoff/{profile}.md is {lines} lines \
+                 (target {PROFILE_MEMO_SOFT_LIMIT_LINES}). Move project-specific content into \
+                 handoff/{HANDOFF_PROJECTS_DIR}/<project-key>.md, which only reaches the master \
+                 that owns that project"
+            ),
+            (Self::ResendCommand { pane }, Ja) => {
+                format!("tako send --pane {pane} '<同じ依頼文>'")
+            }
+            (Self::ResendCommand { pane }, En) => {
+                format!("tako send --pane {pane} '<same prompt>'")
+            }
         }
     }
 }

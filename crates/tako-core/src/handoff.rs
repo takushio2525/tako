@@ -1143,31 +1143,13 @@ pub fn profile_memo_template(profile: &str) -> String {
     profile_memo_template_in(lang(), profile)
 }
 
-/// 運用メモが膨らみすぎていないか。超えていたら警告文（表示言語）を返す
-pub fn profile_memo_warning_in(lang: Lang, profile: &str, content: &str) -> Option<String> {
+/// 運用メモが膨らみすぎていないか。超えていたら今の行数を返す（目安は
+/// [`PROFILE_MEMO_SOFT_LIMIT_LINES`]）。
+///
+/// 警告の文は応答を組む側（tako-control の `ReplyNote::ProfileMemoOversized`）が表示言語で組む（#2365）
+pub fn profile_memo_oversized(content: &str) -> Option<usize> {
     let lines = content.lines().count();
-    if lines <= PROFILE_MEMO_SOFT_LIMIT_LINES {
-        return None;
-    }
-    Some(match lang {
-        Lang::Ja => format!(
-            "プロファイル運用メモ handoff/{profile}.md が {lines} 行あります\
-             （目安 {PROFILE_MEMO_SOFT_LIMIT_LINES} 行）。\
-             プロジェクト固有の内容は handoff/{HANDOFF_PROJECTS_DIR}/<project-key>.md へ\
-             移してください（そこは管轄する master だけへ渡ります）"
-        ),
-        Lang::En => format!(
-            "The profile operating memo handoff/{profile}.md is {lines} lines \
-             (target {PROFILE_MEMO_SOFT_LIMIT_LINES}). Move project-specific content into \
-             handoff/{HANDOFF_PROJECTS_DIR}/<project-key>.md, which only reaches the master \
-             that owns that project"
-        ),
-    })
-}
-
-/// 運用メモの警告（表示言語版）
-pub fn profile_memo_warning(profile: &str, content: &str) -> Option<String> {
-    profile_memo_warning_in(lang(), profile, content)
+    (lines > PROFILE_MEMO_SOFT_LIMIT_LINES).then_some(lines)
 }
 
 /// 閾値超過で master へ送るナッジ文面（Issue #749 要件 2）。
@@ -2445,12 +2427,18 @@ mod tests {
     #[test]
     fn 運用メモが膨らんだら警告する() {
         let small = "x\n".repeat(PROFILE_MEMO_SOFT_LIMIT_LINES);
-        assert!(profile_memo_warning_in(Lang::Ja, "p", &small).is_none());
+        assert_eq!(
+            profile_memo_oversized(&small),
+            None,
+            "目安ちょうどは出さない"
+        );
+        assert_eq!(profile_memo_oversized(""), None);
         let big = "x\n".repeat(PROFILE_MEMO_SOFT_LIMIT_LINES + 1);
-        let w = profile_memo_warning_in(Lang::Ja, "p", &big).expect("警告が出る");
-        assert!(w.contains("handoff/p.md"), "{w}");
-        assert!(w.contains(HANDOFF_PROJECTS_DIR), "{w}");
-        assert!(profile_memo_warning_in(Lang::En, "p", &big).is_some());
+        assert_eq!(
+            profile_memo_oversized(&big),
+            Some(PROFILE_MEMO_SOFT_LIMIT_LINES + 1),
+            "超えたら今の行数を返す"
+        );
     }
 
     #[test]

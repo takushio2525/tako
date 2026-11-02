@@ -18075,9 +18075,13 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::HandoffMigrationMemoKept => 100,
         ReplyNote::ModelMismatch { .. } => 101,
         ReplyNote::WorkerModelMismatch { .. } => 102,
+        // #2365 の続き: 引き継ぎの応答のほかの文（移行の 1 行サマリ・運用メモの肥大）と workers の再送コマンド
+        ReplyNote::HandoffMigrated { .. } => 103,
+        ReplyNote::ProfileMemoOversized { .. } => 104,
+        ReplyNote::ResendCommand { .. } => 105,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 103;
+const REPLY_NOTE_VARIANTS: usize = 106;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -18718,7 +18722,82 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
              ledger は実際のモデルで集計する）"
                 .into(),
         ),
+        // ---- 引き継ぎの応答のほかの文と workers の再送コマンド（#2365 の続き。
+        // `MigrationOutcome::summary`・`tako_core::handoff::profile_memo_warning`・`registry::resend_command`
+        // が組んでいた文）
+        (
+            ReplyNote::HandoffMigrated {
+                profile: "p".into(),
+                moved: vec!["alpha".into(), "beta".into()],
+                kept_lines: 3,
+                archived_to: Some("/tmp/h/archive/p-1.md".into()),
+            },
+            "handoff/p.md をプロジェクト単位へ自動移行しました（#915）: alpha, beta / \
+             共通置き場に 3 行を残し、移行前のファイルは /tmp/h/archive/p-1.md へ退避"
+                .into(),
+        ),
+        // 移した先が無い・退避先が無いときの埋め字
+        (
+            ReplyNote::HandoffMigrated {
+                profile: "p".into(),
+                moved: Vec::new(),
+                kept_lines: 0,
+                archived_to: None,
+            },
+            "handoff/p.md をプロジェクト単位へ自動移行しました（#915）: 移動なし / \
+             共通置き場に 0 行を残し、移行前のファイルは (退避なし) へ退避"
+                .into(),
+        ),
+        (
+            ReplyNote::ProfileMemoOversized {
+                profile: "p".into(),
+                lines: 81,
+            },
+            "プロファイル運用メモ handoff/p.md が 81 行あります（目安 80 行）。\
+             プロジェクト固有の内容は handoff/projects/<project-key>.md へ移してください\
+             （そこは管轄する master だけへ渡ります）"
+                .into(),
+        ),
+        (
+            ReplyNote::ResendCommand { pane: 41 },
+            "tako send --pane 41 '<同じ依頼文>'".into(),
+        ),
     ]
+}
+
+/// #2365 の続き: `resend_command` はコピーして打つコマンドなので、日英で違うのはプレースホルダだけ
+/// （本体・引用・ペイン番号は同じ）。運用メモの肥大の英語は、前から表示言語で組んでいた旧
+/// `tako_core::handoff::profile_memo_warning_in` の英語の腕とバイト一致（英語表示の出力も変えない）
+#[test]
+fn 再送コマンドは日英でプレースホルダだけが違い肥大の英語は旧文と一致() {
+    for pane in [0u64, 41, u64::MAX] {
+        let n = ReplyNote::ResendCommand { pane };
+        let (ja, en) = (n.text_in(Lang::Ja), n.text_in(Lang::En));
+        assert_eq!(
+            ja,
+            format!("tako send --pane {pane} '<同じ依頼文>'"),
+            "{}",
+            reply_note_where(&n, Lang::Ja)
+        );
+        assert_eq!(
+            en,
+            ja.replace("<同じ依頼文>", "<same prompt>"),
+            "{}: プレースホルダ以外が日本語と違う",
+            reply_note_where(&n, Lang::En)
+        );
+    }
+    let n = ReplyNote::ProfileMemoOversized {
+        profile: "p".into(),
+        lines: 81,
+    };
+    assert_eq!(
+        n.text_in(Lang::En),
+        "The profile operating memo handoff/p.md is 81 lines (target 80). Move project-specific \
+         content into handoff/projects/<project-key>.md, which only reaches the master that owns \
+         that project",
+        "{}",
+        reply_note_where(&n, Lang::En)
+    );
 }
 
 /// `ReplyNote` の日英の対を書いた行
@@ -18812,6 +18891,8 @@ const DISPATCH_NOTE_SCOPES: &[&str] = &[
     "fn finish_stale_status(",
     "fn dispatch_tree_selection(",
     "fn run_setup_cli_within(",
+    // #2365 の続き: 引き継ぎファイルの管理（`handoffs` の list / show / write / migrate）
+    "fn dispatch_orchestrator_handoff_files(",
 ];
 
 /// 走査の中で見ない呼び出し（診断の出力・内部の印）
@@ -18854,6 +18935,11 @@ const DISPATCH_NOTE_OLD_JA: &[(&str, &str)] = &[
     ("stale 検知対象外", "StaleNoBackend"),
     ("last_restart に出る", "SessionRestartHarness"),
     ("handoff_delivery に出る", "SessionRestartHandoff"),
+    // #2365 の続き: 引き継ぎの応答のほかの文と workers の再送コマンド（旧文は dispatch の外が組んでいた。
+    // self / handoff の応答を組む関数へ直書きで戻すのを止める）
+    ("をプロジェクト単位へ自動移行しました", "HandoffMigrated"),
+    ("行あります", "ProfileMemoOversized"),
+    ("<同じ依頼文>", "ResendCommand"),
 ];
 
 /// dispatch の外で応答の値の注記を組む口（path, ソース, 頭）。中身を全部 `ReplyNote` へ移したもの
@@ -18900,17 +18986,42 @@ const NOTE_ITEM_SCOPES: &[(&str, &str, &str)] = &[
     (REGISTRY_PATH, REGISTRY_SRC, "pub fn model_warning("),
     (REGISTRY_PATH, REGISTRY_SRC, "impl ModelObservation {"),
     (REGISTRY_PATH, REGISTRY_SRC, "pub fn list_payload("),
+    // #2365 の続き: 引き継ぎの応答のほかの文（移行の 1 行サマリ・運用メモの肥大）と workers の再送コマンド
+    (
+        HANDOFF_STORE_PATH,
+        HANDOFF_STORE_SRC,
+        "impl MigrationOutcome {",
+    ),
+    (
+        HANDOFF_STORE_PATH,
+        HANDOFF_STORE_SRC,
+        "pub fn memo_warning(",
+    ),
+    (
+        HANDOFF_STORE_PATH,
+        HANDOFF_STORE_SRC,
+        "pub fn collect_bundle(",
+    ),
+    (
+        CORE_HANDOFF_PATH,
+        CORE_HANDOFF_SRC,
+        "pub fn profile_memo_oversized(",
+    ),
+    (REGISTRY_PATH, REGISTRY_SRC, "pub fn resend_command("),
 ];
 
 const CLAUDE_CTX_SRC: &str = include_str!("../src/claude_ctx.rs");
 const CLAUDE_CTX_PATH: &str = "crates/tako-control/src/claude_ctx.rs";
+/// 運用メモの肥大の判定（文は `ReplyNote::ProfileMemoOversized` へ移した = 判定だけが残る）
+const CORE_HANDOFF_SRC: &str = include_str!("../../tako-core/src/handoff.rs");
+const CORE_HANDOFF_PATH: &str = "crates/tako-core/src/handoff.rs";
 
 /// 番犬自身の検査（本物のソースへ注入）: 他モジュールが組む注記の口へ日本語の固定文を戻すと、
 /// その行を `file:line` で名指す（#2365 の続き。注入しない元のソースは上の走査が 0 件で通る）
 #[test]
 fn 他モジュールが組む注記の口へ日本語の固定文を戻すと名指す() {
     // (path, ソース, 範囲の頭, 注入元, 注入後)
-    let injections: [(&str, &str, &str, &str, &str); 9] = [
+    let injections: [(&str, &str, &str, &str, &str); 13] = [
         (
             ORCH_MOD_PATH,
             ORCH_MOD_SRC,
@@ -18974,6 +19085,35 @@ fn 他モジュールが組む注記の口へ日本語の固定文を戻すと�
             "pub fn list_payload(",
             "worker_id: id.clone(),",
             "worker_id: format!(\"{id}（pane）\"),",
+        ),
+        // #2365 の続き: 移行の 1 行サマリ・運用メモの肥大・再送コマンド
+        (
+            HANDOFF_STORE_PATH,
+            HANDOFF_STORE_SRC,
+            "impl MigrationOutcome {",
+            "kept_lines: self.kept_lines,",
+            "kept_lines: self.kept_lines, note: format!(\"共通置き場に {} 行を残し\", self.kept_lines),",
+        ),
+        (
+            HANDOFF_STORE_PATH,
+            HANDOFF_STORE_SRC,
+            "pub fn memo_warning(",
+            "profile: profile.to_string(),",
+            "profile: format!(\"プロファイル運用メモ {profile}\"),",
+        ),
+        (
+            CORE_HANDOFF_PATH,
+            CORE_HANDOFF_SRC,
+            "pub fn profile_memo_oversized(",
+            "(lines > PROFILE_MEMO_SOFT_LIMIT_LINES).then_some(lines)",
+            "(lines > PROFILE_MEMO_SOFT_LIMIT_LINES).then(|| format!(\"{lines} 行あります\"))",
+        ),
+        (
+            REGISTRY_PATH,
+            REGISTRY_SRC,
+            "pub fn resend_command(",
+            "Some(crate::ReplyNote::ResendCommand { pane: entry.pane })",
+            "Some(format!(\"tako send --pane {} '<同じ依頼文>'\", entry.pane))",
         ),
     ];
     for (path, src, head, from, to) in injections {
@@ -19041,6 +19181,110 @@ fn 注記を移したdispatchの関数に日本語の固定文が無く旧文も
         }
     }
     report_all(failures);
+}
+
+/// 型で返す注記を応答の文にする口（path, ソース, 頭）。ここで `text_in(Lang::Ja)` に固定すると
+/// 表示言語を無視して日本語の文が応答へ載る（persist.log / stderr の行は日本語のままでよいので外す）。
+/// `self` と引き継ぎ（`dispatch_orchestrator_self` / `dispatch_orchestrator_handoff`）は
+/// `PROFILE_REASON_USER_SCOPES` が同じ走査で見る
+const NOTE_LANG_FIXED_SCOPES: &[(&str, &str, &str)] = &[
+    (
+        DISPATCH_PATH,
+        DISPATCH_SRC,
+        "pub fn dispatch_orchestrator_handoff_files(",
+    ),
+    (
+        HANDOFF_STORE_PATH,
+        HANDOFF_STORE_SRC,
+        "impl MigrationOutcome {",
+    ),
+    (
+        HANDOFF_STORE_PATH,
+        HANDOFF_STORE_SRC,
+        "pub fn memo_warning(",
+    ),
+    (
+        HANDOFF_STORE_PATH,
+        HANDOFF_STORE_SRC,
+        "pub fn collect_bundle(",
+    ),
+    (REGISTRY_PATH, REGISTRY_SRC, "pub fn resend_command("),
+    (REGISTRY_PATH, REGISTRY_SRC, "pub fn list_payload("),
+];
+
+fn scan_note_lang_fixed(sources: &[(&str, &str, &str)]) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (path, src, head) in sources {
+        let Some(lines) = front_scope_lines(src, Some(head)) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする。NOTE_LANG_FIXED_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, code) in ja_fixed_outside_log(&lines) {
+            failures.push(format!(
+                "{path}:{line}: 注記を応答の文にする口（`{head}`）が日本語に固定して組んでいる = \
+                 英語表示でも日本語の文が載る（表示言語の `String::from` / `to_string()` で組む。\
+                 日本語で組むのは persist.log の行と stderr の診断だけ）: {code}"
+            ));
+        }
+    }
+    failures
+}
+
+/// #2365 の続き: 移行の 1 行サマリ・運用メモの肥大・再送コマンドを応答の文にする口は表示言語で組む
+#[test]
+fn 移行のサマリと肥大と再送コマンドを応答の文にする口は表示言語で組む() {
+    report_all(scan_note_lang_fixed(NOTE_LANG_FIXED_SCOPES));
+}
+
+/// 番犬自身の検査（本物のソースへ注入）: 言語を無視して日本語に固定すると、その行を `file:line` で名指す
+#[test]
+fn 移行のサマリと再送コマンドの口で言語を無視すると名指す() {
+    let injections: [(&str, &str, &str, &str, &str); 3] = [
+        (
+            REGISTRY_PATH,
+            REGISTRY_SRC,
+            "pub fn list_payload(",
+            "resend_command(e).map(String::from)",
+            "resend_command(e).map(|n| n.text_in(tako_core::i18n::Lang::Ja))",
+        ),
+        (
+            DISPATCH_PATH,
+            DISPATCH_SRC,
+            "pub fn dispatch_orchestrator_handoff_files(",
+            ".filter_map(|o| o.summary().map(String::from))",
+            ".filter_map(|o| o.summary().map(|n| n.text_in(Lang::Ja)))",
+        ),
+        (
+            HANDOFF_STORE_PATH,
+            HANDOFF_STORE_SRC,
+            "pub fn collect_bundle(",
+            "memo_warning: memo.as_deref().and_then(|m| memo_warning(profile, m)),",
+            "memo_warning: memo.as_deref().and_then(|m| memo_warning(profile, m)).map(|n| n.text_in(Lang::Ja)),",
+        ),
+    ];
+    for (path, src, head, from, to) in injections {
+        let start = src
+            .find(head)
+            .unwrap_or_else(|| panic!("{path}: 範囲の頭が無い: {head}"));
+        let at = start
+            + src[start..]
+                .find(from)
+                .unwrap_or_else(|| panic!("{path}: 範囲の中に注入元が無い: {from}"));
+        let injected = format!("{}{to}{}", &src[..at], &src[at + from.len()..]);
+        let want = injected[..at].lines().count().max(1);
+        let found = scan_note_lang_fixed(&[(path, injected.as_str(), head)]);
+        assert_eq!(
+            found.len(),
+            1,
+            "{path}: 注入（{to}）を 1 件だけ名指すはず: {found:?}"
+        );
+        assert!(
+            found[0].starts_with(&format!("{path}:{want}: ")),
+            "{path}: 注入（{to}）を {path}:{want} として名指すはず: {found:?}"
+        );
+    }
 }
 
 /// CLI `main.rs` の関数のうち、断りと同じ出力に並ぶ行まで全部 `Reason` / `ReplyNote` へ移したもの（頭）
