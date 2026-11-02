@@ -254,8 +254,8 @@ fn visual_testが渡す規則の組で全項目が申告される() {
     assert_eq!(
         ids, all,
         "visual-test が渡す規則の組（{FAKE_FULL_MENU_RULE_ENVS:?}）で偽サーバが申告しない項目がある。\
-         偽サーバに申告させる規則の env を tako_control::lsp::menu::FAKE_FULL_MENU_RULE_ENVS へ足す\
-         （申告: {capabilities}）"
+         偽サーバ（tako-lsp-fake）にその能力を申告させ、規則を渡したときだけ申告する形なら\
+         その env を tako_control::lsp::menu::FAKE_FULL_MENU_RULE_ENVS へ足す（申告: {capabilities}）"
     );
 }
 
