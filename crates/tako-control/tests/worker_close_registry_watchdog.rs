@@ -72,29 +72,44 @@ fn gui_の明示close経路はworkerレジストリの記録フックを通る()
 /// `Request::Close` は #390 から記録していたが、**`Request::BackgroundKill`
 /// （たまり場 kill の CLI / MCP 側）は記録していなかった**。GUI と AI で
 /// `workers.yaml` の見え方が変わる = 開発不変条件「UI でできることは AI からも
-/// 同じに見える」から外れる
+/// 同じに見える」から外れる。
+///
+/// #2657 以後、両者の UI の段（`close_pane_place` / `background_kill_place`）は記録（`CloseMark::new(`）を
+/// 返し、書くのは記録の段（`CloseRecord::finish` → `CloseMark::write` → `mark_closed_by_origin`）
 #[test]
 fn dispatchのclose系はworkerレジストリの記録フックを通る() {
     let root = workspace_root();
     let src = read(&root, "crates/tako-control/src/dispatch.rs");
-    for (arm, what) in [
-        ("Request::Close {", "ペイン / タブの close"),
-        ("Request::BackgroundKill {", "たまり場の kill"),
+    for (sig, what) in [
+        ("fn close_pane_place(", "ペイン / タブの close"),
+        ("fn background_kill_place(", "たまり場の kill"),
     ] {
         let start = src
-            .find(arm)
-            .unwrap_or_else(|| panic!("{arm} が見つからない"));
+            .find(sig)
+            .unwrap_or_else(|| panic!("{sig} が見つからない"));
         let rest = &src[start..];
-        // 次の match アーム（同じインデントの `Request::`）までを本体とする
-        let end = rest[1..]
-            .find("\n        Request::")
-            .map(|at| at + 1)
-            .unwrap_or(rest.len());
+        // トップレベルの関数の終わり（行頭の `}`）までを本体とする
+        let end = rest.find("\n}\n").map(|at| at + 1).unwrap_or(rest.len());
         assert!(
-            rest[..end].contains("mark_closed_by_origin("),
-            "{what}（{arm}）が mark_closed_by_origin を呼んでいない（#775）"
+            rest[..end].contains("CloseMark::new("),
+            "{what}（{sig}）が worker レジストリへの記録（CloseMark）を返していない（#775 / #2657）"
         );
     }
+    // 書くのは記録の段の 1 実装（同期の腕・background の段が同じ `CloseRecord::finish` を通る）
+    let finish = src
+        .find("pub fn finish(self) -> Value {")
+        .expect("CloseRecord::finish が見つからない");
+    let rest = &src[finish..];
+    let end = rest.find("\n    }\n").unwrap_or(rest.len());
+    assert!(
+        rest[..end].contains(".write()"),
+        "CloseRecord::finish が記録を書いていない（#775 / #2657）"
+    );
+    let record = read(&root, "crates/tako-control/src/close_record.rs");
+    assert!(
+        record.contains("mark_closed_by_origin("),
+        "close_record（CloseMark::write）が mark_closed_by_origin を呼んでいない（#775 / #2657）"
+    );
 }
 
 /// たまり場カードの kill は後始末を並べ直さず集約関数へ任せる。

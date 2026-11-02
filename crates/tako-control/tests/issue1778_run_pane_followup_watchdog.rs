@@ -275,7 +275,8 @@ fn splitの失敗時の保持は側路で運ぶ() {
         DISPATCH,
         &src,
         "        Request::Split {",
-        "        Request::Close {",
+        // #2657: Split の次の腕は close の 2 段（`close_place` → `CloseRecord::finish`）
+        "        req @ (Request::Close { .. }",
     );
     let bad = split_violations(DISPATCH, &arm, at);
     assert!(

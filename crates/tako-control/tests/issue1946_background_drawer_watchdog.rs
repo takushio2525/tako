@@ -75,26 +75,10 @@ fn fn_body<'a>(file: &str, source: &'a str, head: &str) -> Vec<(usize, &'a str)>
     numbered[start..end].to_vec()
 }
 
-/// `Request::BackgroundKill` の腕（次の `Request::` の腕の手前まで）
+/// `Request::BackgroundKill` の UI の段（#2657 で dispatch の腕から `background_kill_place` へ分けた。
+/// 同期の腕と IPC の着地が同じここを通る）
 fn kill_arm(source: &str) -> Vec<(usize, &str)> {
-    let numbered: Vec<(usize, &str)> = source
-        .lines()
-        .enumerate()
-        .map(|(i, l)| (i + 1, l))
-        .collect();
-    let start = numbered
-        .iter()
-        .position(|(_, l)| {
-            l.trim_start()
-                .starts_with("Request::BackgroundKill { pane } =>")
-        })
-        .unwrap_or_else(|| panic!("{DISPATCH} に BackgroundKill の腕が無い"));
-    let end = numbered[start + 1..]
-        .iter()
-        .position(|(_, l)| l.trim_start().starts_with("Request::"))
-        .map(|i| i + start + 1)
-        .expect("BackgroundKill の次の腕");
-    numbered[start..end].to_vec()
+    fn_body(DISPATCH, source, "fn background_kill_place(")
 }
 
 fn find<'a>(body: &[(usize, &'a str)], needle: &str) -> Option<(usize, &'a str)> {
@@ -334,7 +318,11 @@ fn 修正を外すと名指しできる() {
     // 3'. dispatch のレジストリ記録の守りを外す
     inject(
         &|s| {
-            replace_once(&mut s.dispatch, "if plan.record_worker_close {", "{");
+            replace_once(
+                &mut s.dispatch,
+                "let record = plan.record_worker_close;",
+                "let record = true;",
+            );
         },
         "dispatch の BackgroundKill が閉じ方の判断を通っていない",
     );
