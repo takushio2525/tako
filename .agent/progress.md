@@ -20,28 +20,6 @@
 
 ---
 
-## 2026-11-01（#2365 の続き: `tako master` / `tako solo` の起動の流れを表示言語へ。言語を移行より前に決め（日本語表示に英語の移行の知らせが混ざっていた）、断りは `Reason` 3 種と型の口、行は `ReplyNote` 26 種。host.rs の既定 26 種を `HostRefusal::Default*` へ・mcp_host が表示言語と切り替えに従う）
-- GUI 無しの CLI 19/23 → 0/23（日本語 14/23 一致・残り 9 は移行の知らせの修正）・隔離 GUI 10/10 → 0/10（日本語 10/10 一致）・mcp_host 12/12 → 0/12・注入 6 か所を名指し + E0004・カタログ +0 B。PR #2617
-- 11:29 に `00a3b4b` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）。再起動直後の入れ替えの区間に打った remote start / stop が両方断られ、daemon は 1 本のまま新版へ移った本番確認で #2613 を閉じた
-
-## 2026-11-01（#1623: setup --check / check-health のプロファイルの行が登録済みの名前を 1 行に全部並べていた（84 個で 449 字）→ 件数・先頭 3 個（default → 名前順）・他 N 個の 1 行、全件は `--json` の `items[].names`（A/B `TAKO_1623_LEGACY=1`））
-- 実経路 0 / 1 / 3 / 4 / 84 個 × 日英で OK 63 / NG 0・旧形は #1623 前とバイト一致・プロファイル以外の行もバイト一致・注入で番犬が file:line を名指し・カタログ +0 B。PR #2621
-
-## 2026-11-01（#2619: 隔離中（`TAKO_ISOLATED`）の remote start（CLI / MCP / daemon の直起動 / UDS の setup）が既定ノードへ serve を張っていた → 門 `remote_isolated_serve::check` で断る（検証モード・偽 tailscale・`TAKO_REMOTE_ISOLATED_SERVE=1` は通す・A/B `TAKO_2619_LEGACY=1`））
-- 段 1 は 3 経路とも GUI 版ノードへ `serve_set`（daemon 1 本・本番 standalone は不変）→ 修正後は断り・daemon 0 本・両ノード不変、opt-in / A/B は従来どおり。番犬が注入 7 通りを file:line で名指し・カタログ +0 B。PR #2622
-
-## 2026-11-01（#2618: ペインログの追記・ローテーション・全体上限の削除を Mutex を握ったまま呼び手のスレッドで行い、直接ペインの取り込み・閉じたときのフラッシュ・Mutex を待つ口がメインスレッドを止めていた → 専用の書き手スレッド 1 本（積んだ順の FIFO）へ積み、Mutex の内側はメモリだけ・終了は書き終わりを待つ・A/B `TAKO_2618_LEGACY=1`）
-- 注入 5 秒で取り込み 4,825ms → 15ms / 閉じる IPC 15,031ms → 20ms / `logs status` 9,960ms → 30〜167ms・中身は修正前と一致・詰まった終了で 350 行 + マーカーを確認・番犬が逆戻り 4 種を file:line で名指し・カタログ +0 B。PR #2623
-
-## 2026-11-01（#1556: セルフテストをリポジトリ外の cwd から起動すると項目 14 が cwd で `cargo build -p tako-cli` を回して `could not find Cargo.toml` で落ちていた → 根を実行ファイルの位置 → 実行時の `CARGO_MANIFEST_DIR` → cwd の順に辿ってそこで回し、見つからなければ日英の案内で止まる（A/B `TAKO_1556_LEGACY=1`・注入 `TAKO_1556_INJECT=noroot`））
-- 隔離 GUI で同じ外の cwd から修正前は `could not find Cargo.toml` → 項目 14 で FAILED（9 秒）→ 修正後は根で回して項目 17 まで進む・注入で日英の案内・A/B は旧挙動・番犬が注入 5 通りを file:line で名指し・カタログ +0 B。PR #2626
-
-## 2026-11-01（#1555 の残り: MCP `tako_remote_start` と設定画面の「開始」が daemon の起動を UI スレッドで待ち、起動途中の daemon が GUI の IPC へ送る probe と読み取りの上限 10 秒まで待ち合っていた（本番 10.5 秒の正体）→ `prepare_offload` の `OffloadJob::RemoteStart` で background から応答・A/B `TAKO_1555_LEGACY=1`）
-- 隔離 GUI で start の間の `tako list` 17,947ms → 504ms・`dispatch:RemoteStart` 専有 18,141ms → 0 件・応答は一致・番犬が注入 6 通りを名指し・カタログ +0 B。PR #2628
-
-## 2026-11-01（#2627: 隔離 GUI のペインの zsh が利用者の rc を読み、GUI の終了でペインへ重ねて届く SIGHUP が rc の `pyenv rehash` の EXIT の trap を断って shim のロックを残していた（後片付けの TERM / KILL ではない）→ `launch_isolated_gui` が既定でペインの zsh を砂場の ZDOTDIR へ向ける・opt-in は `TAKO_ISO_USER_RC=1` + `# tako:user-rc-ok <理由>`・A/B `TAKO_2627_LEGACY=1`）
-- PR #2631
-
 ## 2026-11-01（#2625: 器のペインを閉じるたびに器の tmux サーバー全体が約 600ms 止まっていた（tty の最後の close がサーバーの中で読まれない出力を抱えて待つ。tako のメインスレッドは止まっていない）→ 器のペインの端末は閉じるときに PTY のスレッドが attach クライアントへ SIGHUP を送り、子の側が全部閉じるまで親側を読み捨ててから閉じる・A/B `TAKO_2625_LEGACY=1`）
 - 閉じた後の外からの `tmux ls` 593〜607ms → 6〜10ms・器が消えるまで 633〜654ms → 24〜50ms・fd / 子 / ゾンビ・終了と復元・直接ペインは同じ・番犬 4 件・カタログ +0 B。PR #2629
 - 18:45 に `70faa47` を install・GUI 再起動（画面ロック中・remote daemon は replaced-generation）。本番の `tmux -L tako ls` が閉じた後 598ms → 49ms の本番確認で #2625 を閉じた
@@ -72,3 +50,26 @@
 
 ## 2026-11-02（#2365 の続き: 読めないプロファイルの理由（#2256 の系統）を表示言語へ。芯 `UnreadableProfile`・知らせ `ProfileFallback` 5 種・`ConfigError` 3 種、利用者へ返す口は表示言語・persist.log は日本語。check-health の profiles 行も型の口へ）
 - 実経路（CLI + mcp_host の MCP）で英語表示の日本語入り 32/64 → 4/64（残りは projects add の枠）・日本語 56/64 sha256 一致（残り 8 は時刻と置き場だけ）・persist.log 一致・注入で名指し + E0004・カタログ +0 B。PR #2645
+
+## 2026-11-02（#2228 の 3.: cargo が作る偽 LSP サーバ・debug の tako の初回 exec の検査（大きさに比例・361ms / 1,763ms）が LSP の e2e の 10 秒の窓と issue2367 の窓を食っていた → `fake_exec::warm_binary` で時計の前に空打ち・テスト専用の実行ファイルは `enter_test_binary`・A/B `TAKO_2228_LEGACY=1`）
+- 注入 12 秒で修正前 FAILED 13 本 → 修正後 24 本 ok・issue2367 も FAILED → ok・番犬が逆戻り 2 種を file:line で名指し・カタログ +0 B。Issue の 1・2（tako-vd が要る）は残す。PR #2650
+
+## 2026-11-02（#2646: orchestrator 系の dispatch（spawn の記録・台帳・状態照会の準備）が UI スレッドで YAML の読み書きと画面の採取を待っていた → 台帳は OffloadJob・状態照会は写し（UI）と解決 + 採取（background）・spawn は配置 / 記録 / 積み込みの 3 段（積むのは記録の後）。A/B `TAKO_2646_LEGACY=1`）
+- 段 1: spawn 52ms のうち 50ms が配置の後の記録と I/O・台帳 14 / 27ms が YAML。修正後は注入 1.5 秒の間も `tako list` 15〜35ms・専有 0 件（A/B 1.4〜1.8 秒）・応答と記録は一致・カタログ +0 B。PR #2649
+
+## 2026-11-02（#2365 の続き: 引き継ぎの後任の起動とスマホの「+ master」（`master_launch::plan`）を表示言語へ。後任の理由は `ProfileFallback::Successor`・起動フォルダの注意は `successor_cwd_warning_in`・`plan` は型の口 + `text_in(lang)`・返答の配送の枠は `Reason::UserTaskMasterLaunchFailed`。persist.log は日本語）
+- GUI 無しのホストで英語表示の日本語入り 18/24 → 0/24・日本語 24/24 一致・persist.log 14/14 一致、実 daemon の HTTP で 6/6 → 0/6・日本語 6/6 一致・注入で名指し + E0004・カタログ +0 B。PR #2653
+- 09:36 に `6613e2e` を install・GUI 再起動。本番の perf.log で spawn / 台帳 / 状態照会の専有が install 後 0 件の本番確認で #2646 を閉じた
+
+## 2026-11-02（#2647: 2 秒 tick の 5 段（metrics / queued / handoff / limit / net）が UI スレッドでペインごとに端末をロックして画面を組み解析していた（24 本で p50 15.6ms・ロック 152 回 / tick）→ UI は `PaneAccess` を集めるだけ・背景で 1 ペイン 1 ロック + 解析 + 閾値の設定の読み直し、判定は同じ関数で UI（A/B `TAKO_2647_LEGACY=1`））
+- 24 本で p50 209µs・UI のロック 0。注入 30ms で `tako list` p95 1,567 → 22ms。修正前と修正後で 4 事象の回数・文面・時機（差 ≤0.5s）が一致。番犬 `issue2647_periodic_prep_offload_watchdog`・カタログ +0 B。PR #2654
+
+## 2026-11-02（#2365 の続き: remote daemon の HTTP API の本文の `error`（PWA と管理 API）を表示言語へ。handler 群と認証の層・本文の JSON・tmux / IPC の往復・アップロード・WebSocket の固定文を `RemoteRefusal` の 50 種 + `AppVia` + `PeerReject::describe_in` へ。英語表示の GUI で最後のペインの close が 502 で IPC を捨てていたのを `says_last_pane` で 409 に）
+- 実 daemon への HTTP 51 ケースで英語表示の日本語入り 49 → 0・日本語 51/51 一致・ステータスの差は close の英語表示 502 → 409 だけ・注入 8 通りで名指し + E0004・カタログ +0 B。PR #2655
+- 10:40 に `62dd0c8` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）。11:03 に #2618 を閉じた（ペインログ側の専有は 11/01 18:45 の install 以後 0 件・残る `dispatch:Close` の専有の真因は worker レジストリへの close の記録 → #2657）
+
+## 2026-11-02（#2365 の続き: remote daemon の他の受け口 4 つ（`remote_files` / `remote_tasks` / `remote_cards` / `remote_ssh`）の本文の `error` と注記（`can_ssh.note` / `poll`）を表示言語へ。`RemoteRefusal` に 35 種 + `AppVia` 2 種、前から日英の対を持っていた `Denial` / `ShortcutError` は `FileDenied` / `ShortcutRejected` が引き、本文の形は `kind_body` の 1 実装）
+- 実 daemon への HTTP 56 ケース（GUI 無し 42 + 隔離 GUI 14）で英語表示の日本語入り 53 → 0・日本語 56/56 一致・ステータスの差 0・注入 9 通りで名指し + E0004・カタログ +0 B。PR #2658
+
+## 2026-11-02（#2652: 夜間の footprint の 11/02 の起動 10.9 秒は 29 コミットの回帰ではなく計測の外れ値 → 起動の区間の混み具合を `startup_busy` / `startup_load1` に記録し、重なった夜は空くのを待って複製したバイナリで 1 回だけ測り直し、なお重なれば起動時間を比べず基準から外す・A/B `TAKO_2652_LEGACY=1`）
+- PR #2656
