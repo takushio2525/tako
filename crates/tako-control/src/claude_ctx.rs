@@ -112,8 +112,9 @@ pub fn merge_response_fields(target: &mut Value, r: &CtxResolution) {
 
 /// 窓の宣言が実態とずれていたら警告文を返す（`warnings` へ載せる。#1021 の自己検証）。
 ///
-/// 上流が文脈窓の決め方を変えたら差として現れるので、静かに嘘をつくのではなく気づける
-pub fn window_warning(r: &CtxResolution) -> Option<String> {
+/// 上流が文脈窓の決め方を変えたら差として現れるので、静かに嘘をつくのではなく気づける。
+/// 警告は型（[`crate::ReplyNote`]）で返す = 呼び手が表示言語で組む（#2365）
+pub fn window_warning(r: &CtxResolution) -> Option<crate::ReplyNote> {
     if !r.window_looks_wrong() {
         return None;
     }
@@ -121,19 +122,13 @@ pub fn window_warning(r: &CtxResolution) -> Option<String> {
     if r.source == CtxSource::Mod {
         // #1880: mod と画面（statusLine の出力）は同じ claude の答えなので、ずれるのは
         // どちらかが古いとき（statusLine の更新待ち・mod の flush 待ち）か、画面の読み違い
-        return Some(format!(
-            "ctx% の画面と mod の報告が {delta} ポイントずれています\
-             （mod の値 {}% を採用。statusLine の更新待ちなら次のターンで揃います。\
-             揃わなければ画面の読み取りか mod の報告を疑う）",
-            r.percent?
-        ));
+        return Some(crate::ReplyNote::CtxModDrift {
+            delta,
+            percent: r.percent?,
+        });
     }
     let window = r.window?;
-    Some(format!(
-        "ctx% の画面と transcript が {delta} ポイントずれています\
-         （transcript 側で使った文脈窓 {window}。上流が窓の決め方を変えた合図。\
-         画面の値を採用しています）"
-    ))
+    Some(crate::ReplyNote::CtxTranscriptDrift { delta, window })
 }
 
 #[cfg(test)]
@@ -267,7 +262,9 @@ mod tests {
             model: None,
         });
         let r = resolve(None, Some(&screen), &fresh);
-        let w = window_warning(&r).expect("±1 を超えたら警告");
+        let w = window_warning(&r)
+            .expect("±1 を超えたら警告")
+            .text_in(tako_core::i18n::Lang::Ja);
         assert!(w.contains("mod の値 6%"), "{w}");
         let screen_ok = ScreenCtx {
             percent: Some(7),
@@ -288,7 +285,9 @@ mod tests {
             model: Some("claude-opus-5".into()),
         };
         let r = tako_core::ctx_usage::resolve(Some(&screen), Some(&t));
-        let w = window_warning(&r).expect("ずれていれば警告が出る");
+        let w = window_warning(&r)
+            .expect("ずれていれば警告が出る")
+            .text_in(tako_core::i18n::Lang::Ja);
         assert!(w.contains("1000000"), "{w}");
         assert!(w.contains("画面の値を採用"), "{w}");
         // 一致しているときは警告しない

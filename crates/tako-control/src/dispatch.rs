@@ -706,6 +706,20 @@ pub enum Reason {
         profiles: Vec<String>,
         projects: Vec<String>,
     },
+    /// 専用プロファイル `launched_as`（管轄 `projects` = `, ` 区切り）で起動した master は `target` へ
+    /// 採用で移らない（`orchestrator::decide_adopt`。3 行・直し方は handoff）
+    AdoptLaunchedDedicated {
+        launched_as: String,
+        projects: String,
+        target: String,
+    },
+    /// master の系統が食い違う（この master は `current` / `target` は `target_agent`）ので採用しない
+    /// （`orchestrator::decide_adopt`。3 行・揃える 1 コマンドつき）
+    AdoptMasterAgentMismatch {
+        current: String,
+        target: String,
+        target_agent: String,
+    },
     /// `name（複製先）を指定する`（`profiles copy`）
     CopyNameMissing,
     /// `from（複製元）を指定する`（`profiles copy`）
@@ -2301,6 +2315,57 @@ impl Reason {
                     list(projects)
                 )
             }
+            (
+                Self::AdoptLaunchedDedicated {
+                    launched_as,
+                    projects,
+                    target,
+                },
+                Ja,
+            ) => format!(
+                "この master は専用プロファイル '{launched_as}'（管轄: {projects}）で起動している。\n\
+                 会話の途中で system prompt は差し替えられないので、tako 側だけ \
+                 '{target}' へ移すと prompt と状態が食い違う。\n\
+                 移るには: tako orchestrator handoff（'{target}' で後任を立て直す）"
+            ),
+            (
+                Self::AdoptLaunchedDedicated {
+                    launched_as,
+                    projects,
+                    target,
+                },
+                En,
+            ) => format!(
+                "this master was started with the dedicated profile '{launched_as}' (projects: \
+                 {projects}).\nIts system prompt cannot be replaced mid-conversation, so moving \
+                 only tako's side to '{target}' would leave the prompt and the state out of step.\n\
+                 To move: tako orchestrator handoff (starts a successor with '{target}')"
+            ),
+            (
+                Self::AdoptMasterAgentMismatch {
+                    current,
+                    target,
+                    target_agent,
+                },
+                Ja,
+            ) => format!(
+                "master の系統が食い違う（この master は {current} / '{target}' は {target_agent}）。\n\
+                 採用だけ通すと引き継ぎの後任が {target_agent} で立ち上がる。\n\
+                 揃えるには: tako orchestrator profiles set {target} --master-agent {current}"
+            ),
+            (
+                Self::AdoptMasterAgentMismatch {
+                    current,
+                    target,
+                    target_agent,
+                },
+                En,
+            ) => format!(
+                "the master agent does not match (this master is {current} / '{target}' is \
+                 {target_agent}).\nAdopting it anyway would start the handoff successor as \
+                 {target_agent}.\nTo align them: tako orchestrator profiles set {target} \
+                 --master-agent {current}"
+            ),
             (Self::CopyNameMissing, Ja) => "name（複製先）を指定する".to_string(),
             (Self::CopyNameMissing, En) => {
                 "name (the profile to create) is required".to_string()
@@ -15604,7 +15669,7 @@ fn dispatch_sessions_resume(
         // #1967: どの組み立てで起動コマンドを作ったか（ペインの再起動と同じ語彙）
         "recipe": launch.recipe.as_str(),
         "profile": launch.profile,
-        "warnings": launch.warnings,
+        "warnings": launch.warnings.iter().map(ToString::to_string).collect::<Vec<_>>(),
         // #2413: 起動待ち（spawn の応答と同じ形）
         "launch_gate": launch_gate,
     }))
@@ -15787,7 +15852,8 @@ pub fn dispatch_orchestrator_projects_mcp(
         &keep,
         &[],
     );
-    let mut warnings = plan.warnings.clone();
+    // 警告は表示言語（#2365。文は `ReplyNote` の 1 か所）
+    let mut warnings: Vec<String> = plan.warnings.iter().map(ToString::to_string).collect();
     // #2418: codex の worker の構成も同じ mcp_servers で決まる。claude は知っている config dir の和を
     // 読む（知らない名前を止めても害が無い）が、codex は worker が読む config.toml **1 本**で決まる
     // （知らない名前を止めると起動しない）ので、CODEX_HOME を spawn と同じくプロファイルの env から引く
@@ -15941,16 +16007,19 @@ fn dispatch_orchestrator_adopt(
         }
         .to_string()
     });
-    let mut warnings = match decision {
+    // 断りと警告は表示言語（#2365。文は `Reason` / `ReplyNote` の 1 か所）
+    let mut warnings: Vec<String> = match decision {
         // 断る理由も組み込み既定と比べた結果でありうるので、読めない理由を添える
         orchestrator::AdoptDecision::Refused { reason } => {
             return Err(DispatchError::Operation(match &launched_note {
                 Some(note) => format!("{reason}\n{note}"),
-                None => reason,
+                None => reason.to_string(),
             }))
         }
         orchestrator::AdoptDecision::Unchanged => Vec::new(),
-        orchestrator::AdoptDecision::Adopt { warnings } => warnings,
+        orchestrator::AdoptDecision::Adopt { warnings } => {
+            warnings.into_iter().map(String::from).collect()
+        }
     };
     warnings.extend(launched_note);
 
@@ -16153,7 +16222,10 @@ fn profile_to_json(
     });
     // 参照整合性の警告（未登録 project / アカウント / [1m] モデル）は list / show /
     // set のすべてに載せる。GUI は保存前の確認に、CLI / MCP は起動前の気づきに使う（#721）
-    let warnings = orchestrator::profile_warnings(profile);
+    let warnings: Vec<String> = orchestrator::profile_warnings(profile)
+        .into_iter()
+        .map(String::from)
+        .collect();
     if !warnings.is_empty() {
         v["warnings"] = json!(warnings);
     }
@@ -17969,7 +18041,7 @@ fn dispatch_orchestrator_self(
             .and_then(|m| tako_core::handoff::profile_memo_warning(profile_name, m)),
     );
     // #1021 の自己検証: 画面と transcript がずれていたら窓の宣言が実態と食い違っている
-    warnings.extend(crate::claude_ctx::window_warning(&ctx));
+    warnings.extend(crate::claude_ctx::window_warning(&ctx).map(String::from));
     // #1516: 名指しされたペインが master / solo でなければ、profile が既定へ落ちたことを
     // 黙らせない（pane_id は名指しどおり返るので、読み手が取り違えないよう理由を出す。#1466）
     if named && profile_source == tako_core::handoff::ProfileSource::Default {
@@ -18988,7 +19060,11 @@ fn dispatch_git_resolve_agent(
     )
     .materialized();
     for w in &worker_mcp.warnings {
-        crate::diag::persist_log(&format!("[git resolve] pane={}: {w}", new_id.as_u64()));
+        crate::diag::persist_log(&format!(
+            "[git resolve] pane={}: {}",
+            new_id.as_u64(),
+            w.text_in(Lang::Ja)
+        ));
     }
     let agent_cmd = orchestrator::agent::build_worker_cmd(&orchestrator::agent::WorkerLaunch {
         agent: worker_agent,
@@ -19881,15 +19957,17 @@ impl SpawnPlaced {
             }));
         }
         // #2412: 絞り込みが効かない / 名前が見つからないことは黙らせない（spawn は止めない）
+        // persist.log は日本語・応答の `message` は表示言語（#2365）
         for w in &worker_mcp.warnings {
             crate::diag::persist_log(&format!(
-                "[spawn] pane={} worker の MCP: {w}",
-                new_id.as_u64()
+                "[spawn] pane={} worker の MCP: {}",
+                new_id.as_u64(),
+                w.text_in(Lang::Ja)
             ));
             launch_warnings.push(json!({
                 "kind": "worker_mcp",
                 "agent": worker_agent.as_str(),
-                "message": w,
+                "message": w.to_string(),
             }));
         }
         let pre_trusted = orchestrator::agent::ensure_trusted_in(
@@ -21250,7 +21328,11 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
             );
         }
     }
-    warnings.extend(ctx.as_ref().and_then(crate::claude_ctx::window_warning));
+    warnings.extend(
+        ctx.as_ref()
+            .and_then(crate::claude_ctx::window_warning)
+            .map(String::from),
+    );
     // #1638: 宣言と違うモデルで動いている（アカウントの entitlement・モデルの廃止）
     warnings.extend(registry_model.as_ref().and_then(|m| m.warning.clone()));
 
@@ -29135,7 +29217,11 @@ fn dispatch_session_restart(
         // worker_profile / catalog）と、使ったプロファイル・黙って寄せない食い違い
         "recipe": plan.launch.as_ref().map(|l| l.recipe.as_str()),
         "profile": plan.launch.as_ref().and_then(|l| l.profile.clone()).or(plan.profile.clone()),
-        "warnings": plan.launch.as_ref().map(|l| l.warnings.clone()).unwrap_or_default(),
+        "warnings": plan
+            .launch
+            .as_ref()
+            .map(|l| l.warnings.iter().map(ToString::to_string).collect::<Vec<_>>())
+            .unwrap_or_default(),
         "resume_error": plan.resume_error,
         "agent_pid": plan.agent_pid,
         "shell_idle": plan.facts.shell_idle,
@@ -29245,7 +29331,10 @@ fn dispatch_session_restart(
                 )
             ));
             for w in &launch.warnings {
-                crate::diag::persist_log(&format!("セッション再起動: 注意 pane={pane_raw} {w}"));
+                crate::diag::persist_log(&format!(
+                    "セッション再起動: 注意 pane={pane_raw} {}",
+                    w.text_in(Lang::Ja)
+                ));
             }
             resp["applied"] = json!(true);
             resp["mode"] = json!(mode.as_str());

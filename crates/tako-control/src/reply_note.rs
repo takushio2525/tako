@@ -12,12 +12,19 @@
 //! 日本語は #2365 より前の固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が旧文の表と
 //! 突き合わせる）。
 //!
-//! 中身に他モジュールの文を載せる注記（読めないプロファイルの理由 = #2256 の系統・`profile_warnings`・
-//! `window_warning` ほか）は、枠だけ移すと 1 つの注記に日英が混ざるので、中身と一緒に移すまでここへ
-//! 載せない（Issue #2365 の表）
+//! 中身に他モジュールの文を載せる注記は、枠だけ移すと 1 つの注記に日英が混ざるので、中身と一緒に移す
+//! （Issue #2365 の表）。プロファイルの参照（`orchestrator::profile_warnings`）・採用の警告
+//! （`decide_adopt`）・ctx の窓（`claude_ctx::window_warning`）・会話の再開の食い違い（`resume_launch` の
+//! `warnings`）・worker の MCP（`worker_mcp` の `warnings`）は、組む側が文字列ではなくここのバリアントを
+//! 返し、中身（`ConfigError` / `SessionRefusal`）も同じ言語で組む。persist.log へ載せる呼び手は
+//! `text_in(Lang::Ja)`、応答・CLI の行は表示言語で組む
 
 use tako_core::i18n::Lang;
 use tako_core::platform::support::Note;
+
+use crate::orchestrator::{ConfigError, ProfileKind};
+use crate::worker_mcp::CodexConfigError;
+use crate::SessionRefusal;
 
 /// 応答の値・CLI の行に載せる注記の文（#2365）。値（ペイン番号・パス・桁数・env 名）は表記のまま埋める
 #[derive(Debug, Clone, PartialEq)]
@@ -256,6 +263,48 @@ pub enum ReplyNote {
     // ---- GUI の居ないホスト（`host.rs` の既定 = `examples/mcp_host`）の応答の値 ----
     /// ssh の自動検知の `reason`（GUI が居ないので読めない）
     SshDetectionNoGui,
+
+    // ---- 他モジュールが組む注記（応答の `warnings`。#2365） ----
+    /// プロファイルの projects に projects.yaml に未登録のキー `<key>` がある（`profile_warnings`。2 行）
+    ProfileProjectUnregistered(String),
+    /// プロファイルの `<label>`（master_account / worker_account）のアカウント `<name>` が
+    /// accounts.yaml に無い（`profile_warnings`。2 行）
+    ProfileAccountUnregistered { label: String, name: String },
+    /// 採用先 `<target>` が管轄を持たない汎用プロファイル（`decide_adopt`）
+    AdoptGenericTarget(String),
+    /// 採用先 `<target>` の system prompt が起動時の `<launched_as>` と違う（`decide_adopt`）
+    AdoptPromptDiffers { target: String, launched_as: String },
+    /// ctx% の画面と mod の報告が `<delta>` ポイントずれている（mod の値 `<percent>`% を採用。
+    /// `claude_ctx::window_warning`）
+    CtxModDrift { delta: i32, percent: u32 },
+    /// ctx% の画面と transcript が `<delta>` ポイントずれている（transcript 側の文脈窓 `<window>`。
+    /// `claude_ctx::window_warning`）
+    CtxTranscriptDrift { delta: i32, window: u64 },
+    /// 会話の再開: `<kind>` プロファイル `<name>` が無いので既定プロファイルで組んだ（`resume_launch`）
+    ResumeProfileMissing { kind: ProfileKind, name: String },
+    /// 会話の再開: worker のアカウント `<name>` を引けないのでプロファイルの env だけで組んだ
+    /// （`why` は同じ言語で組む `ConfigError`）
+    ResumeWorkerAccountUnresolved { name: String, why: ConfigError },
+    /// 会話の再開: プロファイルの設定 dir `<path>` に会話の記録が無いので、記録のある方で組んだ
+    ResumeConfigDirPinned(String),
+    /// 会話の再開: プロファイルの CODEX_HOME `<current>` に会話の記録が無いので `<home>` で組んだ
+    ResumeCodexHomePinned { current: String, home: String },
+    /// worker の MCP: user scope の MCP を止める設定ファイルを書けなかった（`why` は同じ言語で組む）
+    McpSettingsUnwritable(SessionRefusal),
+    /// worker の MCP: 止める設定ファイルの置き場（データディレクトリ）が決まらない
+    McpSettingsNoDataDir,
+    /// worker の MCP: プロジェクトの mcp_servers の `<name>` が user scope にも .mcp.json にも無い
+    McpKeepMissing(String),
+    /// worker の MCP: プロファイルの worker_agents.claude.args に --settings がある
+    McpSettingsOverridden,
+    /// worker の MCP（codex）: CODEX_HOME を決められない
+    McpCodexHomeUnresolved,
+    /// worker の MCP（codex）: codex の設定を読めない（中身は置き場とエラー文）
+    McpCodexConfigUnreadable(CodexConfigError),
+    /// worker の MCP（codex）: mcp_servers の `<name>` が config.toml にも .codex/config.toml にも無い
+    McpCodexKeepMissing(String),
+    /// worker の MCP（codex）: `-c` で表せない名前 `<name>` は止めずに持ち込む
+    McpCodexNameInexpressible(String),
 }
 
 impl ReplyNote {
@@ -967,6 +1016,193 @@ impl ReplyNote {
             (Self::SshDetectionNoGui, En) => {
                 "cannot read the detection state because no GUI is connected".into()
             }
+
+            (Self::ProfileProjectUnregistered(key), Ja) => format!(
+                "プロジェクト '{key}' は projects.yaml に登録されていません（この状態では起動時にエラーになります）。\n  `tako orchestrator projects add {key} <パス>` で登録してください"
+            ),
+            (Self::ProfileProjectUnregistered(key), En) => format!(
+                "project '{key}' is not registered in projects.yaml (launching in this state \
+                 fails).\n  Register it with `tako orchestrator projects add {key} <path>`"
+            ),
+            (Self::ProfileAccountUnregistered { label, name }, Ja) => format!(
+                "{label} のアカウント '{name}' は accounts.yaml に登録されていません（この状態では起動時にエラーになります）。\n  `tako orchestrator accounts add {name} --inherit` で登録してください"
+            ),
+            (Self::ProfileAccountUnregistered { label, name }, En) => format!(
+                "the account '{name}' set in {label} is not registered in accounts.yaml \
+                 (launching in this state fails).\n  Register it with \
+                 `tako orchestrator accounts add {name} --inherit`"
+            ),
+            (Self::AdoptGenericTarget(target), Ja) => format!(
+                "'{target}' は管轄プロジェクトを持たない汎用プロファイル（projects 未指定）。\
+                 引き継ぎの宛先は変わるが管轄は決まらない"
+            ),
+            (Self::AdoptGenericTarget(target), En) => format!(
+                "'{target}' is a generic profile with no projects of its own (projects is not \
+                 set). The handoff destination changes, but no projects are assigned"
+            ),
+            (
+                Self::AdoptPromptDiffers {
+                    target,
+                    launched_as,
+                },
+                Ja,
+            ) => format!(
+                "'{target}' は起動時の '{launched_as}' と違う system prompt を持っている\
+                 （個別の prompt_blocks / system_prompt）。走っている会話の prompt は\
+                 差し替えられないので、prompt ごと '{target}' にしたいときは \
+                 tako orchestrator handoff で立て直す"
+            ),
+            (
+                Self::AdoptPromptDiffers {
+                    target,
+                    launched_as,
+                },
+                En,
+            ) => format!(
+                "'{target}' has a different system prompt from the launch profile \
+                 '{launched_as}' (its own prompt_blocks / system_prompt). The prompt of a running \
+                 conversation cannot be replaced, so to switch the prompt to '{target}' as well, \
+                 restart with tako orchestrator handoff"
+            ),
+            (Self::CtxModDrift { delta, percent }, Ja) => format!(
+                "ctx% の画面と mod の報告が {delta} ポイントずれています\
+                 （mod の値 {percent}% を採用。statusLine の更新待ちなら次のターンで揃います。\
+                 揃わなければ画面の読み取りか mod の報告を疑う）"
+            ),
+            (Self::CtxModDrift { delta, percent }, En) => format!(
+                "the ctx% on screen and the one reported by mod differ by {delta} points (using \
+                 mod's {percent}%. If the statusLine has not refreshed yet, they match from the \
+                 next turn; if they still differ, suspect the screen reading or the mod report)"
+            ),
+            (Self::CtxTranscriptDrift { delta, window }, Ja) => format!(
+                "ctx% の画面と transcript が {delta} ポイントずれています\
+                 （transcript 側で使った文脈窓 {window}。上流が窓の決め方を変えた合図。\
+                 画面の値を採用しています）"
+            ),
+            (Self::CtxTranscriptDrift { delta, window }, En) => format!(
+                "the ctx% on screen and the transcript differ by {delta} points (the transcript \
+                 used a context window of {window}, a sign that upstream changed how the window \
+                 is chosen; using the on-screen value)"
+            ),
+            (Self::ResumeProfileMissing { kind, name }, Ja) => format!(
+                "{} プロファイル '{name}' が見つからないので既定プロファイルの設定で再開した\
+                 （`{} {name}` のようにラベルだけで起動した master と同じ組み立て）",
+                kind.as_str(),
+                kind.launch_bin()
+            ),
+            (Self::ResumeProfileMissing { kind, name }, En) => format!(
+                "{} profile '{name}' was not found, so the conversation was resumed with the \
+                 default profile's settings (the same setup as a master started with just a \
+                 label, like `{} {name}`)",
+                kind.as_str(),
+                kind.launch_bin()
+            ),
+            (Self::ResumeWorkerAccountUnresolved { name, why }, Ja) => format!(
+                "worker のアカウント '{name}' を引けないので、プロファイルの env だけで再開した: {}",
+                why.text_in(lang)
+            ),
+            (Self::ResumeWorkerAccountUnresolved { name, why }, En) => format!(
+                "cannot resolve the worker's account '{name}', so the conversation was resumed \
+                 with only the profile's env: {}",
+                why.text_in(lang)
+            ),
+            (Self::ResumeConfigDirPinned(path), Ja) => format!(
+                "プロファイルの設定 dir（{path}）に会話の記録が無いので、記録のある設定 dir で再開した"
+            ),
+            (Self::ResumeConfigDirPinned(path), En) => format!(
+                "the profile's config dir ({path}) has no record of the conversation, so it was \
+                 resumed in the config dir that has it"
+            ),
+            (Self::ResumeCodexHomePinned { current, home }, Ja) => format!(
+                "プロファイルの CODEX_HOME（{current}）に会話の記録が無いので、記録のある置き場（{home}）で再開した"
+            ),
+            (Self::ResumeCodexHomePinned { current, home }, En) => format!(
+                "the profile's CODEX_HOME ({current}) has no record of the conversation, so it \
+                 was resumed in the location that has it ({home})"
+            ),
+            (Self::McpSettingsUnwritable(why), Ja) => format!(
+                "user scope の MCP を止める設定ファイルを書けなかったので、今回は全部持ち込んで起動する: {}",
+                why.text_in(lang)
+            ),
+            (Self::McpSettingsUnwritable(why), En) => format!(
+                "could not write the settings file that turns off user-scope MCP servers, so this \
+                 launch brings them all in: {}",
+                why.text_in(lang)
+            ),
+            (Self::McpSettingsNoDataDir, Ja) => {
+                "user scope の MCP を止める設定ファイルの置き場が無いので、今回は全部持ち込んで起動する: データディレクトリを特定できない"
+                    .into()
+            }
+            (Self::McpSettingsNoDataDir, En) => {
+                "there is no place for the settings file that turns off user-scope MCP servers, \
+                 so this launch brings them all in: cannot determine the data directory"
+                    .into()
+            }
+            (Self::McpKeepMissing(name), Ja) => format!(
+                "プロジェクトの mcp_servers の '{name}' は user scope にもプロジェクトの .mcp.json にも見つからない（今は何も足されない）"
+            ),
+            (Self::McpKeepMissing(name), En) => format!(
+                "'{name}' in the project's mcp_servers was not found in the user scope or in the \
+                 project's .mcp.json (nothing is added for now)"
+            ),
+            (Self::McpSettingsOverridden, Ja) => {
+                "プロファイルの worker_agents.claude.args に --settings があるため、user scope の MCP を止める設定が効かない（claude は後ろの --settings だけを読む）"
+                    .into()
+            }
+            (Self::McpSettingsOverridden, En) => {
+                "the profile's worker_agents.claude.args has --settings, so the setting that \
+                 turns off user-scope MCP servers has no effect (claude reads only the last \
+                 --settings)"
+                    .into()
+            }
+            (Self::McpCodexHomeUnresolved, Ja) => {
+                "codex の設定の置き場（CODEX_HOME）を決められないので、今回は user 設定の MCP を全部持ち込んで起動する"
+                    .into()
+            }
+            (Self::McpCodexHomeUnresolved, En) => {
+                "cannot determine where codex's settings are (CODEX_HOME), so this launch brings \
+                 in all MCP servers from the user settings"
+                    .into()
+            }
+            (Self::McpCodexConfigUnreadable(e), Ja) => {
+                let why = match e {
+                    CodexConfigError::Read { path, error } => format!("{path} を読めない: {error}"),
+                    CodexConfigError::Toml { path, error } => {
+                        format!("{path} を TOML として読めない: {error}")
+                    }
+                };
+                format!(
+                    "codex の設定を読めないので、今回は user 設定の MCP に何も足さずに起動する: {why}"
+                )
+            }
+            (Self::McpCodexConfigUnreadable(e), En) => {
+                let why = match e {
+                    CodexConfigError::Read { path, error } => {
+                        format!("cannot read {path}: {error}")
+                    }
+                    CodexConfigError::Toml { path, error } => {
+                        format!("{path} is not valid TOML: {error}")
+                    }
+                };
+                format!(
+                    "cannot read codex's settings, so this launch leaves the MCP servers of the \
+                     user settings as they are: {why}"
+                )
+            }
+            (Self::McpCodexKeepMissing(name), Ja) => format!(
+                "プロジェクトの mcp_servers の '{name}' は codex の config.toml にもプロジェクトの .codex/config.toml にも見つからない（今は何も足されない）"
+            ),
+            (Self::McpCodexKeepMissing(name), En) => format!(
+                "'{name}' in the project's mcp_servers was not found in codex's config.toml or \
+                 in the project's .codex/config.toml (nothing is added for now)"
+            ),
+            (Self::McpCodexNameInexpressible(name), Ja) => format!(
+                "codex の -c は名前の '.' や空白などを表せないので、'{name}' は止めずに持ち込む"
+            ),
+            (Self::McpCodexNameInexpressible(name), En) => format!(
+                "codex's -c cannot express names with '.', spaces and the like, so '{name}' is \
+                 brought in without being turned off"
+            ),
         }
     }
 }

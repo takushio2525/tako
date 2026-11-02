@@ -5263,7 +5263,11 @@ fn orchestrator_resume(worker_id: &str) -> Result<(), String> {
         let launch = tako_control::resume_launch::registry_resume_launch(entry)
             .map_err(|e| e.text_in(lang))?;
         for w in &launch.warnings {
-            eprintln!("{}: {w}", ReplyNote::WarningLabel.text_in(lang));
+            eprintln!(
+                "{}: {}",
+                ReplyNote::WarningLabel.text_in(lang),
+                w.text_in(lang)
+            );
         }
         // MCP の絞り込みの設定ファイルを書く（spawn と同じ。下見では書かない作法）
         launch.materialize_typed().map_err(|e| e.text_in(lang))?;

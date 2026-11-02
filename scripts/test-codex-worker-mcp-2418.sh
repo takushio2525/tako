@@ -202,6 +202,8 @@ setup_sandbox() {
   export TAKO_TMUX_SOCKET="$sock"
   export TAKO_ISOLATED=1
   mkdir -p "$TAKO_DATA_DIR" "$TAKO_DISCOVERY_DIR" "$TAKO_ORCHESTRATOR_DIR/profiles"
+  # 下の検査は日本語の警告の文を見る（#2365 以後は表示言語に従う）ので、OS の言語に依らず日本語に固定する
+  printf '{"language":"ja"}\n' >"$TAKO_DATA_DIR/settings.json"
   # worker の codex を一時の CODEX_HOME へ向ける（tako が読む user 設定もここ = env 計画の export）
   cat >"$TAKO_ORCHESTRATOR_DIR/profiles/default.yaml" <<YAML
 env:

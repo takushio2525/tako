@@ -67,6 +67,7 @@ use serde_json::{json, Value};
 
 use crate::orchestrator::agent::WorkerAgent;
 use crate::orchestrator::{EnvPlan, ProjectsConfig};
+use crate::ReplyNote;
 
 /// `mcp_servers` に書くと user scope を**全部持ち込む**（絞らない）印
 pub const KEEP_ALL: &str = "*";
@@ -322,13 +323,13 @@ pub fn settings_json(denied: &[String]) -> String {
 
 /// 絞り込みの設定ファイルの置き場と中身（**書かない**）。名前は中身のハッシュ
 /// （同じ構成は同じファイル = worker の本数ぶん増えない）
-pub fn settings_file_for(denied: &[String]) -> Result<(PathBuf, String), String> {
+pub fn settings_file_for(denied: &[String]) -> Result<(PathBuf, String), ReplyNote> {
     use sha2::Digest;
     let body = settings_json(denied);
     let digest = sha2::Sha256::digest(body.as_bytes());
     let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
     let dir = tako_core::paths::data_dir()
-        .ok_or("データディレクトリを特定できない")?
+        .ok_or(ReplyNote::McpSettingsNoDataDir)?
         .join(SETTINGS_DIR);
     Ok((dir.join(format!("deny-{hex}.json")), body))
 }
@@ -387,8 +388,8 @@ pub struct WorkerMcp {
     pub codex_off: Vec<CodexOff>,
     /// 読んだ codex の user 設定（応答の `config_file`。codex だけ）
     pub config_file: Option<String>,
-    /// 応答の warnings と persist.log へ出す文
-    pub warnings: Vec<String>,
+    /// 応答の warnings と persist.log へ出す知らせ（型。応答は表示言語・persist.log は日本語で組む = #2365）
+    pub warnings: Vec<ReplyNote>,
 }
 
 /// codex の worker で止める 1 つの server（#2418）
@@ -435,13 +436,11 @@ impl WorkerMcp {
     /// spawn 用: 書いてから使う。書けなければ**絞り込みをやめて全部持ち込む**
     /// （起動は止めない。理由は warnings へ）
     pub fn materialized(mut self) -> Self {
-        if let Err(e) = self.materialize() {
+        if let Err(e) = self.materialize_typed() {
             self.mode = "unrestricted";
             self.settings_file = None;
             self.settings_body = None;
-            self.warnings.push(format!(
-                "user scope の MCP を止める設定ファイルを書けなかったので、今回は全部持ち込んで起動する: {e}"
-            ));
+            self.warnings.push(ReplyNote::McpSettingsUnwritable(e));
         }
         self
     }
@@ -517,10 +516,7 @@ pub fn prepare(
                 Some(home) => prepare_codex_from(cwd, &home.join("config.toml"), keep),
                 None => WorkerMcp {
                     mode: "unrestricted",
-                    warnings: vec![
-                        "codex の設定の置き場（CODEX_HOME）を決められないので、今回は user 設定の MCP を全部持ち込んで起動する"
-                            .to_string(),
-                    ],
+                    warnings: vec![ReplyNote::McpCodexHomeUnresolved],
                     ..Default::default()
                 },
             }
@@ -553,9 +549,7 @@ pub fn prepare_from(
         ..Default::default()
     };
     for name in &out.plan.missing {
-        out.warnings.push(format!(
-            "プロジェクトの mcp_servers の '{name}' は user scope にもプロジェクトの .mcp.json にも見つからない（今は何も足されない）"
-        ));
+        out.warnings.push(ReplyNote::McpKeepMissing(name.clone()));
     }
     if out.plan.denied.is_empty() {
         return out;
@@ -565,10 +559,7 @@ pub fn prepare_from(
         .any(|a| a == "--settings" || a.starts_with("--settings="))
     {
         out.mode = "overridden";
-        out.warnings.push(
-            "プロファイルの worker_agents.claude.args に --settings があるため、user scope の MCP を止める設定が効かない（claude は後ろの --settings だけを読む）"
-                .to_string(),
-        );
+        out.warnings.push(ReplyNote::McpSettingsOverridden);
         return out;
     }
     match settings_file_for(&out.plan.denied) {
@@ -576,11 +567,9 @@ pub fn prepare_from(
             out.settings_file = Some(path.display().to_string());
             out.settings_body = Some(body);
         }
-        Err(e) => {
+        Err(note) => {
             out.mode = "unrestricted";
-            out.warnings.push(format!(
-                "user scope の MCP を止める設定ファイルの置き場が無いので、今回は全部持ち込んで起動する: {e}"
-            ));
+            out.warnings.push(note);
         }
     }
     out
@@ -604,16 +593,33 @@ pub fn codex_home_for(env: &EnvPlan) -> Option<PathBuf> {
     crate::codex_session::codex_home()
 }
 
+/// codex の設定（TOML）を読めない理由（#2365。文は `ReplyNote::McpCodexConfigUnreadable` が
+/// 表示言語 / 日本語で組む。`error` は OS / toml のエラー文 = 言語に依らずそのまま載せる）
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodexConfigError {
+    /// 読み取りに失敗
+    Read { path: String, error: String },
+    /// TOML として解釈できない
+    Toml { path: String, error: String },
+}
+
 /// codex の設定（TOML）の `mcp_servers`（名前 → 定義を JSON にしたもの）。
 /// ファイルが無ければ空。読めない・TOML として壊れていれば Err
-pub fn codex_servers(path: &Path) -> Result<BTreeMap<String, Value>, String> {
+pub fn codex_servers(path: &Path) -> Result<BTreeMap<String, Value>, CodexConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(format!("{} を読めない: {e}", path.display())),
+        Err(e) => {
+            return Err(CodexConfigError::Read {
+                path: path.display().to_string(),
+                error: e.to_string(),
+            })
+        }
     };
-    let root: Value = toml::from_str(&text)
-        .map_err(|e| format!("{} を TOML として読めない: {e}", path.display()))?;
+    let root: Value = toml::from_str(&text).map_err(|e| CodexConfigError::Toml {
+        path: path.display().to_string(),
+        error: e.to_string(),
+    })?;
     Ok(root
         .get("mcp_servers")
         .and_then(Value::as_object)
@@ -680,31 +686,23 @@ pub fn prepare_codex_from(cwd: &Path, user_config: &Path, keep: &[String]) -> Wo
             return WorkerMcp {
                 mode: "unrestricted",
                 config_file,
-                warnings: vec![format!(
-                    "codex の設定を読めないので、今回は user 設定の MCP に何も足さずに起動する: {e}"
-                )],
+                warnings: vec![ReplyNote::McpCodexConfigUnreadable(e)],
                 ..Default::default()
             }
         }
     };
     let declared = codex_project_declared(cwd, user_config);
     let mut plan = plan(&user, &declared, keep);
-    let mut warnings: Vec<String> = plan
+    let mut warnings: Vec<ReplyNote> = plan
         .missing
         .iter()
-        .map(|name| {
-            format!(
-                "プロジェクトの mcp_servers の '{name}' は codex の config.toml にもプロジェクトの .codex/config.toml にも見つからない（今は何も足されない）"
-            )
-        })
+        .map(|name| ReplyNote::McpCodexKeepMissing(name.clone()))
         .collect();
     let (ok, odd): (Vec<String>, Vec<String>) = std::mem::take(&mut plan.denied)
         .into_iter()
         .partition(|n| codex_name_expressible(n));
     for name in odd {
-        warnings.push(format!(
-            "codex の -c は名前の '.' や空白などを表せないので、'{name}' は止めずに持ち込む"
-        ));
+        warnings.push(ReplyNote::McpCodexNameInexpressible(name));
     }
     plan.denied = ok;
     let codex_off = plan
@@ -1052,11 +1050,16 @@ mod tests {
                 "利用者の --settings を消して上書きしない"
             );
             assert!(
-                mcp.warnings.iter().any(|w| w.contains("--settings")),
+                mcp.warnings.iter().any(|w| ja(w).contains("--settings")),
                 "{:?}",
                 mcp.warnings
             );
         }
+    }
+
+    /// 警告の日本語の文（#2365 より前の文で中身を確かめる。表示言語のグローバルには触らない）
+    fn ja(w: &ReplyNote) -> String {
+        w.text_in(tako_core::i18n::Lang::Ja)
     }
 
     #[test]
@@ -1065,7 +1068,7 @@ mod tests {
         let files = [claude_json(&t, &["github"])];
         let mcp = prepare_from(&t, &files, &["coplay-mcp".into()], &[]);
         assert_eq!(mcp.plan.missing, ["coplay-mcp"]);
-        assert!(mcp.warnings.iter().any(|w| w.contains("coplay-mcp")));
+        assert!(mcp.warnings.iter().any(|w| ja(w).contains("coplay-mcp")));
         assert_eq!(mcp.plan.denied, ["github"]);
     }
 
@@ -1226,7 +1229,7 @@ trust_level = "trusted"
         assert_eq!(broken.mode, "unrestricted");
         assert!(broken.codex_off.is_empty());
         assert!(
-            broken.warnings.iter().any(|w| w.contains("TOML")),
+            broken.warnings.iter().any(|w| ja(w).contains("TOML")),
             "{:?}",
             broken.warnings
         );
@@ -1243,7 +1246,7 @@ trust_level = "trusted"
         // `codex mcp add` が許す `:` `@` `/` と Unicode の英数字は通る（実測）
         assert_eq!(mcp.plan.denied, ["@scope/x:1", "名前"]);
         for n in ["my.server", "a b"] {
-            assert!(mcp.warnings.iter().any(|w| w.contains(n)), "{n}");
+            assert!(mcp.warnings.iter().any(|w| ja(w).contains(n)), "{n}");
         }
     }
 
@@ -1253,7 +1256,7 @@ trust_level = "trusted"
         let cfg = codex_toml(&t, CODEX_USER);
         let mcp = prepare_codex_from(&t, &cfg, &["coplay-mcp".into()]);
         assert_eq!(mcp.plan.missing, ["coplay-mcp"]);
-        assert!(mcp.warnings.iter().any(|w| w.contains("coplay-mcp")));
+        assert!(mcp.warnings.iter().any(|w| ja(w).contains("coplay-mcp")));
         let all = prepare_codex_from(&t, &cfg, &["*".into()]);
         assert_eq!(all.mode, "keep_all");
         assert!(all.codex_off.is_empty());

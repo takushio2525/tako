@@ -1517,7 +1517,10 @@ fn restore_worker_command(
         return None;
     }
     for w in &launch.warnings {
-        crate::diag::persist_log(&format!("[restore] pane={pane} worker: {w}"));
+        crate::diag::persist_log(&format!(
+            "[restore] pane={pane} worker: {}",
+            w.text_in(tako_core::i18n::Lang::Ja)
+        ));
     }
     Some(launch.command)
 }
@@ -1541,10 +1544,11 @@ fn restore_worker_mcp_args(input: &RestoreInput<'_>) -> Option<String> {
     let mcp = mcp.materialized();
     for w in &mcp.warnings {
         crate::diag::persist_log(&format!(
-            "[restore] pane={} worker の MCP: {w}",
+            "[restore] pane={} worker の MCP: {}",
             input
                 .pane
-                .map_or_else(|| "-".to_string(), |p| p.to_string())
+                .map_or_else(|| "-".to_string(), |p| p.to_string()),
+            w.text_in(tako_core::i18n::Lang::Ja)
         ));
     }
     Some(resume_mcp_args(
