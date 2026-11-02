@@ -247,6 +247,19 @@ pub fn issue2665_legacy() -> bool {
     })
 }
 
+/// #2666 の A/B 用の逃げ道（`TAKO_2666_LEGACY=1`）。同一バイナリのまま修正前（#2665 の分類）へ戻す:
+/// 画面構成の変更の通知を登録しない・届いた通知（検証の合成を含む）を記録しない・UI ストールの分類に
+/// 画面構成の変更を使わない（記録が無いので perf.log の再構成の行も出ない）
+pub fn issue2666_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2666_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// 直近に終わったメインスレッドの**トップレベル**計測区間（UI ストールの分類用。#1968）。
 ///
 /// UI ストールは 1 秒タイマーの再開遅延で測るが、その監視ループ自身が UI スレッドで走るので、
@@ -376,6 +389,320 @@ pub fn spans_overlapping_since(since: Instant) -> Option<DelaySpans> {
         q.iter().map(|s| (s.tag.as_ref(), s.ended, s.took_ms)),
         since,
     )
+}
+
+// ===== 画面構成の変更（macOS の画面再構成。#2666） =====
+//
+// 蓋の開閉・画面スリープで内蔵ディスプレイが画面構成から出入りする瞬間に、UI が 0.5〜1.8 秒止まる。
+// その塞がりは tako の計測区間の外（AppKit / GPUI の画面の当て直し・Metal の提示）なので、
+// #2665 の分類では「計測区間の外か再開経路側の遅延」としか書けなかった（本番 29 件中 18 件）。
+// OS の通知（`CGDisplayRegisterReconfigurationCallback` の begin / end。登録は tako-app の
+// `platform::display_reconfig`）の時刻だけをここへ記録し、遅延の間に重なったら分類が名指す。
+//
+// 本番の統合ログ（11/01 15:03・tako-app）の実測: 再構成の通知（kCGSDisplayWillReconfigure →
+// DidReconfigure2 → ReconfigureHappened）はどれもプロセスで最も若い TID（= メインスレッド）で処理され、
+// DidReconfigure2（end のコールバックの時点）の約 130ms 後から 1.4 秒、そのスレッドの記録が途切れていた。
+// 塞がりは end の**後**に来るので、窓は end から [`RECONFIG_AFTER_GRACE`] まで延ばす。
+
+/// 再構成の通知の段（begin = 変更の前・end = 変更の後。画面ごとに 1 回ずつ来る）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconfigPhase {
+    Begin,
+    End,
+}
+
+/// 再構成の通知 1 件（コールバックが受けた値そのまま）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconfigEvent {
+    pub phase: ReconfigPhase,
+    /// 通知の対象の画面（macOS の `CGDirectDisplayID`）
+    pub display: u32,
+    /// 変更の内容（macOS の `CGDisplayChangeSummaryFlags`）
+    pub flags: u32,
+    /// コールバックがメインスレッドで呼ばれたか（本番で確かめるため perf.log の行に書く）
+    pub main_thread: bool,
+    /// 検証の合成（[`Issue2666Inject`]）か。perf.log の行と分類の文に「検証の合成」と書く
+    pub synthetic: bool,
+}
+
+/// end の後、その後始末（AppKit / GPUI の画面の当て直し・全面の描き直し）として窓に含める長さ。
+/// 本番の実測では end の約 130ms 後から 1.4 秒塞がっていた（期限は塞がりの頭から最大 1 秒後ろへ来る）
+pub const RECONFIG_AFTER_GRACE: Duration = Duration::from_secs(2);
+/// begin だけで end が来ない再構成を開いたままと見なす上限（end を取りこぼしても、以後のストールを
+/// いつまでも画面構成の変更と名指さない）
+pub const RECONFIG_OPEN_MAX: Duration = Duration::from_secs(10);
+/// 最後の end からこれだけ次の通知が無ければ、その再構成は終わった（perf.log へ 1 行書く）。
+/// 画面ごとの end は同じ瞬間に続けて来る
+const RECONFIG_SETTLE: Duration = Duration::from_millis(300);
+/// 履歴の上限（古いものから捨てる。窓は数秒なので数件あれば足りる）
+const RECONFIG_CAP: usize = 16;
+/// 1 回の再構成で覚える画面の数の上限
+const RECONFIG_DISPLAYS_CAP: usize = 8;
+
+/// 1 回の再構成（最初の begin から最後の end まで）
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReconfigWindow {
+    begun: Instant,
+    ended: Option<Instant>,
+    begins: u32,
+    ends: u32,
+    /// 通知の来た画面（重複なし・先頭 [`RECONFIG_DISPLAYS_CAP`] 枚まで）
+    displays: Vec<u32>,
+    /// end の通知の変更の内容の和
+    end_flags: u32,
+    /// メインスレッド以外で来た通知の数
+    off_main: u32,
+    synthetic: bool,
+    /// perf.log へ書いたか
+    reported: bool,
+}
+
+static RECONFIG: Mutex<std::collections::VecDeque<ReconfigWindow>> =
+    Mutex::new(std::collections::VecDeque::new());
+
+/// 通知 1 件を履歴へ畳む（純粋関数。時刻は呼び手が渡す）。
+///
+/// - begin: 開いている窓（end が未着で [`RECONFIG_OPEN_MAX`] 以内）があればその窓に数え、
+///   無ければ新しい窓を始める
+/// - end: 直前の窓が開いているか、end から [`RECONFIG_SETTLE`] 以内ならその窓を延ばす。
+///   どちらでもなければ（登録より前に始まった再構成など）end の時刻で窓を作る
+fn apply_reconfig(
+    q: &mut std::collections::VecDeque<ReconfigWindow>,
+    ev: &ReconfigEvent,
+    now: Instant,
+) {
+    let off_main = u32::from(!ev.main_thread);
+    let fresh = |begun: Instant| ReconfigWindow {
+        begun,
+        ended: None,
+        begins: 0,
+        ends: 0,
+        displays: Vec::new(),
+        end_flags: 0,
+        off_main: 0,
+        synthetic: false,
+        reported: false,
+    };
+    let joins = q.back().is_some_and(|w| match (ev.phase, w.ended) {
+        (ReconfigPhase::Begin, None) | (ReconfigPhase::End, None) => {
+            now.saturating_duration_since(w.begun) <= RECONFIG_OPEN_MAX
+        }
+        (ReconfigPhase::End, Some(ended)) => {
+            now.saturating_duration_since(ended) <= RECONFIG_SETTLE
+        }
+        (ReconfigPhase::Begin, Some(_)) => false,
+    });
+    if !joins {
+        if q.len() >= RECONFIG_CAP {
+            q.pop_front();
+        }
+        q.push_back(fresh(now));
+    }
+    let Some(w) = q.back_mut() else {
+        return;
+    };
+    w.off_main += off_main;
+    w.synthetic |= ev.synthetic;
+    if !w.displays.contains(&ev.display) && w.displays.len() < RECONFIG_DISPLAYS_CAP {
+        w.displays.push(ev.display);
+    }
+    match ev.phase {
+        ReconfigPhase::Begin => w.begins += 1,
+        ReconfigPhase::End => {
+            w.ends += 1;
+            w.end_flags |= ev.flags;
+            w.ended = Some(now);
+        }
+    }
+}
+
+/// 画面構成の変更の通知を記録する（コールバックから呼ぶ。時刻を取って畳むだけ = I/O しない）。
+/// A/B（`TAKO_2666_LEGACY=1`）は何もしない
+pub fn record_display_reconfig(ev: ReconfigEvent) {
+    if issue2666_legacy() {
+        return;
+    }
+    let now = Instant::now();
+    let mut q = RECONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    apply_reconfig(&mut q, &ev, now);
+}
+
+/// 遅延の間に重なった画面構成の変更の要約（#2666）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconfigOverlap {
+    /// begin → end（ms）。end が未着なら begin から記録まで
+    pub took_ms: u64,
+    /// end から記録まで（ms）。end が未着なら `None`
+    pub since_end_ms: Option<u64>,
+    /// 遅延の間に重なった再構成の数（`took_ms` / `since_end_ms` は最後に始まったもの）
+    pub count: usize,
+    /// 検証の合成を含む
+    pub synthetic: bool,
+}
+
+impl ReconfigOverlap {
+    /// 再構成（begin・end・合成か）のうち、窓（begin → end + [`RECONFIG_AFTER_GRACE`]。end が未着なら
+    /// 記録まで・ただし begin から [`RECONFIG_OPEN_MAX`] まで）が `since`（タイマーの期限）から `now`
+    /// （記録）までに重なったものを要約する（無ければ `None`）。時刻は呼び手が渡す純粋関数
+    pub fn summarize(
+        windows: impl IntoIterator<Item = (Instant, Option<Instant>, bool)>,
+        since: Instant,
+        now: Instant,
+    ) -> Option<Self> {
+        let mut out: Option<Self> = None;
+        let mut latest: Option<Instant> = None;
+        for (begun, ended, synthetic) in windows {
+            let reach = match ended {
+                Some(e) => e + RECONFIG_AFTER_GRACE,
+                None => (begun + RECONFIG_OPEN_MAX).min(now),
+            };
+            if begun > now || reach <= since {
+                continue;
+            }
+            let r = out.get_or_insert(Self {
+                took_ms: 0,
+                since_end_ms: None,
+                count: 0,
+                synthetic: false,
+            });
+            r.count += 1;
+            r.synthetic |= synthetic;
+            if latest.is_none_or(|l| begun >= l) {
+                latest = Some(begun);
+                let end = ended.unwrap_or(now);
+                r.took_ms = end.saturating_duration_since(begun).as_millis() as u64;
+                r.since_end_ms = ended.map(|e| now.saturating_duration_since(e).as_millis() as u64);
+            }
+        }
+        out
+    }
+
+    /// 分類の文に挟む中身（言語ごと）
+    fn detail_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        let mut s = match (self.since_end_ms, lang) {
+            (Some(after), Ja) => {
+                format!("begin → end {}ms・end から記録まで {after}ms", self.took_ms)
+            }
+            (Some(after), En) => format!(
+                "begin → end {}ms, {after}ms from end to the record",
+                self.took_ms
+            ),
+            (None, Ja) => format!("begin から記録まで {}ms・end は未着", self.took_ms),
+            (None, En) => format!("{}ms from begin to the record, no end yet", self.took_ms),
+        };
+        if self.count > 1 {
+            s.push_str(&match lang {
+                Ja => format!("（遅延の間に {} 回）", self.count),
+                En => format!(" ({} of them during the delay)", self.count),
+            });
+        }
+        if self.synthetic {
+            s.push_str(match lang {
+                Ja => "・検証の合成",
+                En => ", synthesized for verification",
+            });
+        }
+        s
+    }
+}
+
+/// `since`（タイマーの期限）から今までに重なった画面構成の変更（#2666）
+pub fn reconfig_overlapping_since(since: Instant) -> Option<ReconfigOverlap> {
+    let q = RECONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    ReconfigOverlap::summarize(
+        q.iter().map(|w| (w.begun, w.ended, w.synthetic)),
+        since,
+        Instant::now(),
+    )
+}
+
+/// macOS の `CGDisplayChangeSummaryFlags` の名前（perf.log の行に書く。他の OS は通知を記録しない）
+const RECONFIG_FLAG_NAMES: &[(u32, &str)] = &[
+    (1 << 1, "moved"),
+    (1 << 2, "set_main"),
+    (1 << 3, "set_mode"),
+    (1 << 4, "add"),
+    (1 << 5, "remove"),
+    (1 << 8, "enabled"),
+    (1 << 9, "disabled"),
+    (1 << 10, "mirror"),
+    (1 << 11, "unmirror"),
+    (1 << 12, "desktop_shape"),
+];
+
+/// 変更の内容の和を名前の並びにする（知らない桁は 16 進で残す・何も無ければ「なし」）
+fn reconfig_flags_text(flags: u32) -> String {
+    let mut names: Vec<String> = Vec::new();
+    let mut rest = flags & !1;
+    for &(bit, name) in RECONFIG_FLAG_NAMES {
+        if rest & bit != 0 {
+            names.push(name.to_string());
+            rest &= !bit;
+        }
+    }
+    if rest != 0 {
+        names.push(format!("0x{rest:x}"));
+    }
+    if names.is_empty() {
+        "なし".to_string()
+    } else {
+        names.join(",")
+    }
+}
+
+/// 終わった再構成（または end が来ないまま [`RECONFIG_OPEN_MAX`] を過ぎたもの）を perf.log の行に
+/// して取り出す（1 回の再構成につき 1 回。純粋関数）
+fn reconfig_reports_at(
+    q: &mut std::collections::VecDeque<ReconfigWindow>,
+    now: Instant,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in q.iter_mut().filter(|w| !w.reported) {
+        let ready = match w.ended {
+            Some(ended) => now.saturating_duration_since(ended) >= RECONFIG_SETTLE,
+            None => now.saturating_duration_since(w.begun) >= RECONFIG_OPEN_MAX,
+        };
+        if !ready {
+            continue;
+        }
+        w.reported = true;
+        let displays = w
+            .displays
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let thread = if w.off_main == 0 {
+            "メインスレッド".to_string()
+        } else {
+            format!("メインスレッド以外 {} 件", w.off_main)
+        };
+        let synthetic = if w.synthetic { "・検証の合成" } else { "" };
+        out.push(match w.ended {
+            Some(ended) => format!(
+                "画面構成の変更（macOS の画面再構成）: begin → end {}ms・画面 {displays}・\
+                 通知 begin {} 件 / end {} 件・変更 {}・コールバックは{thread}{synthetic}。#2666",
+                ended.saturating_duration_since(w.begun).as_millis(),
+                w.begins,
+                w.ends,
+                reconfig_flags_text(w.end_flags),
+            ),
+            None => format!(
+                "画面構成の変更（macOS の画面再構成）: begin から {}s 経っても end が来ない・\
+                 画面 {displays}・通知 begin {} 件・コールバックは{thread}{synthetic}。#2666",
+                RECONFIG_OPEN_MAX.as_secs(),
+                w.begins,
+            ),
+        });
+    }
+    out
+}
+
+/// 監視スレッドが 50ms ごとに呼ぶ（ロック中に I/O しない: 行だけ組んで返す。普段は空）
+pub fn take_reconfig_reports() -> Vec<String> {
+    let mut q = RECONFIG.lock().unwrap_or_else(|e| e.into_inner());
+    reconfig_reports_at(&mut q, Instant::now())
 }
 
 /// メインスレッドの ThreadId（`mark_main_thread` で登録）。
@@ -627,14 +954,15 @@ const SCHED_OVERLOAD_OVER: Duration = Duration::from_millis(500);
 /// UI ストールとして記録する再開遅延の下限（#113）
 pub const STALL_REPORT_OVER: Duration = Duration::from_millis(500);
 
-/// UI ストール監視ループの 1 周の判定（#113 / #643 / #1968 / #2665）。記録すべきなら perf.log の
+/// UI ストール監視ループの 1 周の判定（#113 / #643 / #1968 / #2665 / #2666）。記録すべきなら perf.log の
 /// 1 行（日本語）を返す。
 ///
 /// - `armed`: 監視ループがタイマーを掛けた時刻
 /// - `period`: タイマーの長さ（期限 = `armed + period`）
 ///
 /// 監視ループ自身が UI スレッドで走るので、記録する時点で塞いでいた区間は終わっている（#1968）。
-/// 分類に使うのは**期限から今まで**（= 遅延の間）に重なった区間の、重なった分だけ（#2665）。
+/// 分類に使うのは**期限から今まで**（= 遅延の間）に重なった区間の、重なった分だけ（#2665）と、
+/// 同じ遅延の間に重なった画面構成の変更（#2666）。
 /// スケジューラ遅延のピークは毎周回取り出す（記録するときだけ取ると古いピークが混ざる）
 pub fn stall_line(armed: Instant, period: Duration) -> Option<String> {
     let lag = armed.elapsed().saturating_sub(period);
@@ -655,19 +983,53 @@ pub fn stall_line(armed: Instant, period: Duration) -> Option<String> {
     let delay = (!issue1968_legacy())
         .then(|| spans_overlapping_since(armed + period))
         .flatten();
-    Some(StallCause::classify(lag, sched_lag, span, delay).text_in(tako_core::i18n::Lang::Ja))
+    // #2666 の A/B（`TAKO_2666_LEGACY=1`）は画面構成の変更を見ない（= #2665 の分類）
+    let reconfig = (!issue2666_legacy())
+        .then(|| reconfig_overlapping_since(armed + period))
+        .flatten();
+    Some(
+        StallCause::classify(lag, sched_lag, span, delay, reconfig)
+            .text_in(tako_core::i18n::Lang::Ja),
+    )
 }
 
-/// UI ストールの原因の分類（#643 / #1968 / #2665）。実測値だけから決め、根拠の無い断定はしない
-/// （原因を騙ると次の調査が丸ごと無駄になる）。文は [`StallCause::text_in`]（perf.log は日本語）
+/// UI ストールの原因の分類（#643 / #1968 / #2665 / #2666）。実測値だけから決め、根拠の無い断定はしない
+/// （原因を騙ると次の調査が丸ごと無駄になる）。文は [`StallCause::text_in`]（perf.log は日本語）。
+///
+/// **名指す順（#2666 で決めた優先の決まり）**: 過負荷（素の OS スレッドまで遅れた）> 継続中の計測区間 >
+/// 遅延の半分以上を説明する計測区間（tako の専有）> 画面構成の変更 > 内訳 / 計測区間の外。
+/// 計測区間は「tako のどのコードがメインスレッドを持っていたか」の直接の実測なので、画面構成の変更より
+/// 先に名指す。ただし画面構成の変更が遅延に重なっていれば、上の 3 つでも**併記する**（変更が塞がりの
+/// 引き金のことがある = 描き直しの `render` など。片方を捨てると次の調査が因果を辿れない）。
+/// 計測区間が半分に届かないときは、残りを画面構成の変更の処理中と名指し、区間の内訳も書く
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StallCause {
     /// 素の OS スレッドの sleep まで遅れた = マシン全体の過負荷（tako の専有ではない）
-    Overload { lag: Duration, sched_lag: Duration },
+    Overload {
+        lag: Duration,
+        sched_lag: Duration,
+        reconfig: Option<ReconfigOverlap>,
+    },
     /// 記録の時点でメインスレッドの計測区間が走っていた = tako の専有
-    Running { lag: Duration, tag: String, ms: u64 },
+    Running {
+        lag: Duration,
+        tag: String,
+        ms: u64,
+        reconfig: Option<ReconfigOverlap>,
+    },
     /// 遅延の間に重なった計測区間が遅延の半分以上を説明する = tako の専有
-    Owned { lag: Duration, spans: DelaySpans },
+    Owned {
+        lag: Duration,
+        spans: DelaySpans,
+        reconfig: Option<ReconfigOverlap>,
+    },
+    /// 遅延の間に画面構成の変更（macOS の画面再構成）が重なり、計測区間は半分に届かない
+    /// = 画面構成の変更の処理中（OS / GPUI 側）。区間があれば内訳も書く（#2666）
+    DisplayReconfig {
+        lag: Duration,
+        reconfig: ReconfigOverlap,
+        spans: Option<DelaySpans>,
+    },
     /// 遅延の間に計測区間はあるが半分に届かない。内訳を書き、残りは計測区間の外とする
     /// （騙らない・捨てない。#2665）
     Partial { lag: Duration, spans: DelaySpans },
@@ -676,50 +1038,86 @@ pub enum StallCause {
 }
 
 impl StallCause {
-    /// 実測値から分類する。
+    /// 実測値から分類する（名指す順は [`StallCause`] の説明）。
     ///
     /// - `lag`: foreground executor の再開遅延
     /// - `sched_lag`: 素の OS スレッドの sleep 超過（[`take_scheduler_lag_peak`]）
     /// - `span`: 記録時点でメインスレッドが走らせていた計測区間
     /// - `delay`: 遅延の間に重なった区間（[`spans_overlapping_since`]）
+    /// - `reconfig`: 遅延の間に重なった画面構成の変更（[`reconfig_overlapping_since`]）
     pub fn classify(
         lag: Duration,
         sched_lag: Duration,
         span: Option<(&str, u64)>,
         delay: Option<DelaySpans>,
+        reconfig: Option<ReconfigOverlap>,
     ) -> Self {
         if sched_lag >= SCHED_OVERLOAD_OVER {
-            return Self::Overload { lag, sched_lag };
+            return Self::Overload {
+                lag,
+                sched_lag,
+                reconfig,
+            };
         }
         if let Some((tag, ms)) = span {
             return Self::Running {
                 lag,
                 tag: tag.to_string(),
                 ms,
+                reconfig,
             };
         }
-        match delay {
-            Some(spans) if spans.overlap_ms.saturating_mul(2) >= lag.as_millis() as u64 => {
-                Self::Owned { lag, spans }
+        match (delay, reconfig) {
+            (Some(spans), reconfig)
+                if spans.overlap_ms.saturating_mul(2) >= lag.as_millis() as u64 =>
+            {
+                Self::Owned {
+                    lag,
+                    spans,
+                    reconfig,
+                }
             }
-            Some(spans) => Self::Partial { lag, spans },
-            None => Self::Unmeasured { lag },
+            (spans, Some(reconfig)) => Self::DisplayReconfig {
+                lag,
+                reconfig,
+                spans,
+            },
+            (Some(spans), None) => Self::Partial { lag, spans },
+            (None, None) => Self::Unmeasured { lag },
         }
     }
 
-    /// tako の専有と名指すか（過負荷・計測区間の外・内訳だけのときは偽）
+    /// tako の専有と名指すか（過負荷・画面構成の変更・計測区間の外・内訳だけのときは偽）
     pub fn names_tako(&self) -> bool {
         matches!(self, Self::Running { .. } | Self::Owned { .. })
     }
 
+    /// 画面構成の変更を原因として名指すか（併記だけのときは偽。#2666）
+    pub fn names_reconfig(&self) -> bool {
+        matches!(self, Self::DisplayReconfig { .. })
+    }
+
+    /// 遅延に重なった画面構成の変更（名指し・併記のどちらでも。#2666）
+    pub fn reconfig(&self) -> Option<&ReconfigOverlap> {
+        match self {
+            Self::Overload { reconfig, .. }
+            | Self::Running { reconfig, .. }
+            | Self::Owned { reconfig, .. } => reconfig.as_ref(),
+            Self::DisplayReconfig { reconfig, .. } => Some(reconfig),
+            Self::Partial { .. } | Self::Unmeasured { .. } => None,
+        }
+    }
+
     /// 表示言語を明示しての 1 行。(バリアント, 言語) の網羅 match なので、バリアントを足すと
-    /// 日英の両方を書くまでコンパイルが通らない。日本語の過負荷・継続中は #2665 より前とバイト一致
+    /// 日英の両方を書くまでコンパイルが通らない。日本語の過負荷・継続中は #2665 より前と、
+    /// 画面構成の変更が重ならない行は #2666 より前とバイト一致
     pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
         use tako_core::i18n::Lang::{En, Ja};
         let lag = match self {
             Self::Overload { lag, .. }
             | Self::Running { lag, .. }
             | Self::Owned { lag, .. }
+            | Self::DisplayReconfig { lag, .. }
             | Self::Partial { lag, .. }
             | Self::Unmeasured { lag } => *lag,
         };
@@ -734,38 +1132,102 @@ impl StallCause {
             ),
         };
         let lag_ms = (lag.as_millis() as u64).max(1);
-        match (self, lang) {
+        let body = match (self, lang) {
             (Self::Overload { sched_lag, .. }, Ja) => format!(
-                "{head}（素の OS スレッドの sleep も {:.2}s 超過 = マシン全体の過負荷。\
-                 tako のメインスレッド専有ではない）",
+                "素の OS スレッドの sleep も {:.2}s 超過 = マシン全体の過負荷。\
+                 tako のメインスレッド専有ではない",
                 sched_lag.as_secs_f64()
             ),
             (Self::Overload { sched_lag, .. }, En) => format!(
-                "{head} (a plain OS thread's sleep also overran by {:.2}s = the whole machine \
-                 is overloaded, not tako holding the main thread)",
+                "a plain OS thread's sleep also overran by {:.2}s = the whole machine \
+                 is overloaded, not tako holding the main thread",
                 sched_lag.as_secs_f64()
             ),
-            (Self::Running { tag, ms, .. }, Ja) => format!(
-                "{head}（OS スレッドは正常。メインスレッドで {tag} が {ms}ms 継続中 = tako の専有）"
-            ),
+            (Self::Running { tag, ms, .. }, Ja) => {
+                format!("OS スレッドは正常。メインスレッドで {tag} が {ms}ms 継続中 = tako の専有")
+            }
             (Self::Running { tag, ms, .. }, En) => format!(
-                "{head} (OS threads are fine; {tag} has been running on the main thread for \
-                 {ms}ms = held by tako)"
+                "OS threads are fine; {tag} has been running on the main thread for \
+                 {ms}ms = held by tako"
             ),
             (Self::Owned { spans: s, .. }, Ja) => format!(
-                "{head}（OS スレッドは正常。遅延の間にメインスレッドの計測区間が計 {}ms・{} 件\
-                 （最長 {}: 全長 {}ms のうち遅延の間 {}ms）= tako の専有。#1968 / #2665）",
+                "OS スレッドは正常。遅延の間にメインスレッドの計測区間が計 {}ms・{} 件\
+                 （最長 {}: 全長 {}ms のうち遅延の間 {}ms）= tako の専有。#1968 / #2665",
                 s.overlap_ms, s.count, s.longest_tag, s.longest_took_ms, s.longest_overlap_ms
             ),
             (Self::Owned { spans: s, .. }, En) => format!(
-                "{head} (OS threads are fine; measured main-thread spans during the delay total \
-                 {}ms over {} (longest: {}, {}ms of its {}ms) = held by tako. #1968 / #2665)",
+                "OS threads are fine; measured main-thread spans during the delay total \
+                 {}ms over {} (longest: {}, {}ms of its {}ms) = held by tako. #1968 / #2665",
                 s.overlap_ms, s.count, s.longest_tag, s.longest_overlap_ms, s.longest_took_ms
             ),
+            (
+                Self::DisplayReconfig {
+                    reconfig: r,
+                    spans: None,
+                    ..
+                },
+                Ja,
+            ) => format!(
+                "OS スレッドは正常・遅延の間に計測区間なし = 画面構成の変更の処理中（OS / GPUI 側）: \
+                 {}。#2666",
+                r.detail_in(Ja)
+            ),
+            (
+                Self::DisplayReconfig {
+                    reconfig: r,
+                    spans: None,
+                    ..
+                },
+                En,
+            ) => format!(
+                "OS threads are fine; no measured span during the delay = processing a display \
+                 configuration change (OS / GPUI side): {}. #2666",
+                r.detail_in(En)
+            ),
+            (
+                Self::DisplayReconfig {
+                    reconfig: r,
+                    spans: Some(s),
+                    ..
+                },
+                Ja,
+            ) => format!(
+                "OS スレッドは正常。遅延の間の計測区間は計 {}ms・{} 件 = 遅延の {}%\
+                 （最長 {}: 全長 {}ms のうち遅延の間 {}ms）。残り {}ms は画面構成の変更の処理中\
+                 （OS / GPUI 側）: {}。#2666",
+                s.overlap_ms,
+                s.count,
+                s.overlap_ms * 100 / lag_ms,
+                s.longest_tag,
+                s.longest_took_ms,
+                s.longest_overlap_ms,
+                lag_ms.saturating_sub(s.overlap_ms),
+                r.detail_in(Ja)
+            ),
+            (
+                Self::DisplayReconfig {
+                    reconfig: r,
+                    spans: Some(s),
+                    ..
+                },
+                En,
+            ) => format!(
+                "OS threads are fine; measured spans during the delay total {}ms over {} \
+                 = {}% of the delay (longest: {}, {}ms of its {}ms); the remaining {}ms is \
+                 processing a display configuration change (OS / GPUI side): {}. #2666",
+                s.overlap_ms,
+                s.count,
+                s.overlap_ms * 100 / lag_ms,
+                s.longest_tag,
+                s.longest_overlap_ms,
+                s.longest_took_ms,
+                lag_ms.saturating_sub(s.overlap_ms),
+                r.detail_in(En)
+            ),
             (Self::Partial { spans: s, .. }, Ja) => format!(
-                "{head}（OS スレッドは正常。遅延の間の計測区間は計 {}ms・{} 件 = 遅延の {}%\
+                "OS スレッドは正常。遅延の間の計測区間は計 {}ms・{} 件 = 遅延の {}%\
                  （最長 {}: 全長 {}ms のうち遅延の間 {}ms）。残り {}ms は計測区間の外か\
-                 再開経路（タイマー / キュー）側の遅延。#643 / #2665）",
+                 再開経路（タイマー / キュー）側の遅延。#643 / #2665",
                 s.overlap_ms,
                 s.count,
                 s.overlap_ms * 100 / lag_ms,
@@ -775,9 +1237,9 @@ impl StallCause {
                 lag_ms.saturating_sub(s.overlap_ms)
             ),
             (Self::Partial { spans: s, .. }, En) => format!(
-                "{head} (OS threads are fine; measured spans during the delay total {}ms over {} \
+                "OS threads are fine; measured spans during the delay total {}ms over {} \
                  = {}% of the delay (longest: {}, {}ms of its {}ms); the remaining {}ms is \
-                 outside measured spans or in the resume path (timer / queue). #643 / #2665)",
+                 outside measured spans or in the resume path (timer / queue). #643 / #2665",
                 s.overlap_ms,
                 s.count,
                 s.overlap_ms * 100 / lag_ms,
@@ -786,13 +1248,32 @@ impl StallCause {
                 s.longest_took_ms,
                 lag_ms.saturating_sub(s.overlap_ms)
             ),
-            (Self::Unmeasured { .. }, Ja) => format!(
-                "{head}（OS スレッドは正常・遅延の間に計測区間なし = \
-                 計測区間の外か再開経路（タイマー / キュー）側の遅延。#643 / #2665）"
+            (Self::Unmeasured { .. }, Ja) => "OS スレッドは正常・遅延の間に計測区間なし = \
+                 計測区間の外か再開経路（タイマー / キュー）側の遅延。#643 / #2665"
+                .to_string(),
+            (Self::Unmeasured { .. }, En) => {
+                "OS threads are fine; no measured span during the delay = outside \
+                 measured spans or in the resume path (timer / queue). #643 / #2665"
+                    .to_string()
+            }
+        };
+        // #2666: 計測区間で名指した行にも、重なった画面構成の変更を併記する（名指しの腕は本文に書いた）
+        let also = match self {
+            Self::Overload { reconfig, .. }
+            | Self::Running { reconfig, .. }
+            | Self::Owned { reconfig, .. } => reconfig.as_ref(),
+            Self::DisplayReconfig { .. } | Self::Partial { .. } | Self::Unmeasured { .. } => None,
+        };
+        match (also, lang) {
+            (None, Ja) => format!("{head}（{body}）"),
+            (None, En) => format!("{head} ({body})"),
+            (Some(r), Ja) => format!(
+                "{head}（{body}。画面構成の変更とも重なる: {}。#2666）",
+                r.detail_in(Ja)
             ),
-            (Self::Unmeasured { .. }, En) => format!(
-                "{head} (OS threads are fine; no measured span during the delay = outside \
-                 measured spans or in the resume path (timer / queue). #643 / #2665)"
+            (Some(r), En) => format!(
+                "{head} ({body}; also overlaps a display configuration change: {}. #2666)",
+                r.detail_in(En)
             ),
         }
     }
@@ -939,6 +1420,106 @@ impl Issue2665Inject {
     }
 }
 
+/// #2666 の注入の口の env（[`Issue2666Inject`]。検証プロセスでだけ読む）
+pub const ISSUE2666_INJECT_FILE_ENV: &str = "TAKO_2666_INJECT_FILE";
+
+/// [`Issue2666Inject`] の 1 手
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Issue2666Step {
+    /// 画面ごとに begin の通知を合成する
+    Begin,
+    /// 画面ごとに end の通知を合成する
+    End,
+    /// 計測区間の外でメインスレッドを塞ぐ
+    Sleep(Duration),
+    /// 計測区間（`t2666_inject`）の中でメインスレッドを塞ぐ
+    Span(Duration),
+}
+
+/// #2666 の検証専用の注入（`TAKO_2666_INJECT_FILE`）。蓋の開閉は検証で起こせず、tako-vd も触らないので、
+/// 画面構成の変更は**通知の合成**で再現する。env が指すファイルの中身（空白区切りの手の並び:
+/// `begin` / `end` / `sleep=<ms>` / `span=<ms>` / `displays=<n>`（合成する画面の数・既定 2））を、
+/// `tako window list` の処理でメインスレッド上に書いた順に行う（例 `begin sleep=1800 end`）。
+/// begin / end は呼び手が渡す合成の口（tako-app の `platform::display_reconfig::synthesize` = 本物の
+/// コールバックの関数を呼ぶ）を通る。
+/// **検証プロセス（`TAKO_ISOLATED` 等。`tako_core::paths::is_verification_process`）でだけ効く**:
+/// 本番の GUI は env があっても読まない（UI スレッドを外から止められる口を本番に開けない。#2665 と同じ）。
+/// env が無ければ何も読まない（`scripts/test-display-reconfig-2666.sh`）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Issue2666Inject {
+    pub steps: Vec<Issue2666Step>,
+    pub displays: u32,
+}
+
+impl Default for Issue2666Inject {
+    fn default() -> Self {
+        Self {
+            steps: Vec::new(),
+            displays: 2,
+        }
+    }
+}
+
+impl Issue2666Inject {
+    /// ファイルの中身を読む（読めない語は無視する）
+    pub fn parse(text: &str) -> Self {
+        let mut out = Self::default();
+        for word in text.split_whitespace() {
+            let ms = |v: &str| v.parse::<u64>().ok().map(Duration::from_millis);
+            match word.split_once('=') {
+                None if word == "begin" => out.steps.push(Issue2666Step::Begin),
+                None if word == "end" => out.steps.push(Issue2666Step::End),
+                Some(("sleep", v)) => out.steps.extend(ms(v).map(Issue2666Step::Sleep)),
+                Some(("span", v)) => out.steps.extend(ms(v).map(Issue2666Step::Span)),
+                Some(("displays", v)) => {
+                    if let Ok(n) = v.parse::<u32>() {
+                        out.displays = n.clamp(1, 16);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// 注入の対象の要求（`tako window list`）なら、env が指すファイルを読んで注入を決める
+    /// （検証プロセスでなければ常に何もしない）
+    pub fn for_request(target: bool) -> Self {
+        static FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
+        if !target {
+            return Self::default();
+        }
+        FILE.get_or_init(|| {
+            tako_core::paths::is_verification_process()
+                .then(|| std::env::var_os(ISSUE2666_INJECT_FILE_ENV).map(PathBuf::from))
+                .flatten()
+        })
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|text| Self::parse(&text))
+        .unwrap_or_default()
+    }
+
+    /// 手を順に行う（`synthesize(段, 画面)` が通知の合成。IPC の受信ループで `ipc_turn` の前に呼ぶ）
+    pub fn run(&self, synthesize: impl Fn(ReconfigPhase, u32)) {
+        for step in &self.steps {
+            match *step {
+                Issue2666Step::Begin => {
+                    (1..=self.displays).for_each(|d| synthesize(ReconfigPhase::Begin, d));
+                }
+                Issue2666Step::End => {
+                    (1..=self.displays).for_each(|d| synthesize(ReconfigPhase::End, d));
+                }
+                Issue2666Step::Sleep(d) => std::thread::sleep(d),
+                Issue2666Step::Span(d) => {
+                    let _span = perf_span("t2666_inject");
+                    std::thread::sleep(d);
+                }
+            }
+        }
+    }
+}
+
 /// メインスレッド・ウォッチドッグを起動する（多重呼び出しは無視）。
 /// 50ms ごとに現在区間を確認し、ハング級（2 秒超え継続）を drop を待たず記録する。
 /// 同時に自分自身の sleep 超過を [`record_scheduler_lag`] へ積む（#643）。
@@ -959,6 +1540,10 @@ pub fn spawn_stall_watchdog() {
                 record_scheduler_lag(tick.elapsed().saturating_sub(Duration::from_millis(50)));
                 if let Some(msg) = take_hang_report() {
                     perf_log(&msg);
+                }
+                // #2666: 終わった画面構成の変更を 1 回につき 1 行（コールバックの側では I/O しない）
+                for line in take_reconfig_reports() {
+                    perf_log(&line);
                 }
                 if perf_verbose() && last_stats.elapsed() >= Duration::from_secs(10) {
                     last_stats = Instant::now();
@@ -1205,6 +1790,7 @@ mod tests {
             Duration::from_millis(10),
             None,
             DelaySpans::summarize(spans_at(deadline, &[("ipc_turn", 1000, 1500)]), deadline),
+            None,
         );
         assert!(owned.names_tako(), "{owned:?}");
         let ja = owned.text_in(tako_core::i18n::Lang::Ja);
@@ -1217,6 +1803,7 @@ mod tests {
             Duration::from_millis(10),
             None,
             DelaySpans::summarize(spans_at(deadline, &[("ipc_turn", 1300, 400)]), deadline),
+            None,
         );
         assert!(!partial.names_tako(), "{partial:?}");
         let ja = partial.text_in(tako_core::i18n::Lang::Ja);
@@ -1231,6 +1818,7 @@ mod tests {
         let none = StallCause::classify(
             Duration::from_millis(600),
             Duration::from_millis(10),
+            None,
             None,
             None,
         );
@@ -1253,7 +1841,8 @@ mod tests {
             (Duration::from_millis(10), Some(("dispatch:Mod", 812))),
         ] {
             assert_eq!(
-                StallCause::classify(lag, sched, span, None).text_in(tako_core::i18n::Lang::Ja),
+                StallCause::classify(lag, sched, span, None, None)
+                    .text_in(tako_core::i18n::Lang::Ja),
                 classify_stall(lag, sched, span, None)
             );
         }
@@ -1265,16 +1854,46 @@ mod tests {
         let d = || DelaySpans::summarize(spans_at(deadline, &[("render", 500, 900)]), deadline);
         let lag = Duration::from_millis(2000);
         let causes = [
-            StallCause::classify(lag, SCHED_OVERLOAD_OVER, None, None),
-            StallCause::classify(lag, Duration::ZERO, Some(("render", 700)), None),
-            StallCause::classify(Duration::from_millis(800), Duration::ZERO, None, d()),
-            StallCause::classify(lag, Duration::ZERO, None, d()),
-            StallCause::classify(lag, Duration::ZERO, None, None),
+            StallCause::classify(lag, SCHED_OVERLOAD_OVER, None, None, None),
+            StallCause::classify(lag, Duration::ZERO, Some(("render", 700)), None, None),
+            StallCause::classify(Duration::from_millis(800), Duration::ZERO, None, d(), None),
+            StallCause::classify(lag, Duration::ZERO, None, d(), None),
+            StallCause::classify(lag, Duration::ZERO, None, None, None),
+            StallCause::classify(
+                lag,
+                Duration::ZERO,
+                None,
+                None,
+                Some(overlap(71, Some(1545))),
+            ),
         ];
         let kinds: Vec<_> = causes.iter().map(std::mem::discriminant).collect();
         for (i, k) in kinds.iter().enumerate() {
-            assert!(!kinds[..i].contains(k), "5 種を 1 つずつ: {causes:?}");
+            assert!(!kinds[..i].contains(k), "6 種を 1 つずつ: {causes:?}");
         }
+        // 併記・内訳つき・end 未着・回数・合成の文も同じ頭と英語だけの英文を持つ
+        let mut causes = causes.to_vec();
+        let mut many = overlap(900, None);
+        many.count = 2;
+        many.synthetic = true;
+        causes.extend([
+            StallCause::classify(lag, SCHED_OVERLOAD_OVER, None, None, Some(many.clone())),
+            StallCause::classify(
+                lag,
+                Duration::ZERO,
+                Some(("render", 700)),
+                None,
+                Some(many.clone()),
+            ),
+            StallCause::classify(
+                Duration::from_millis(800),
+                Duration::ZERO,
+                None,
+                d(),
+                Some(many.clone()),
+            ),
+            StallCause::classify(lag, Duration::ZERO, None, d(), Some(many)),
+        ]);
         for c in &causes {
             let ja = c.text_in(tako_core::i18n::Lang::Ja);
             let en = c.text_in(tako_core::i18n::Lang::En);
@@ -1291,6 +1910,309 @@ mod tests {
                 "{en}"
             );
         }
+    }
+
+    // --- #2666: 画面構成の変更 ---
+
+    /// 要約を直に組む（begin → end `took` ms・end から記録まで `since_end` ms・1 回・合成でない）
+    fn overlap(took: u64, since_end: Option<u64>) -> ReconfigOverlap {
+        ReconfigOverlap {
+            took_ms: took,
+            since_end_ms: since_end,
+            count: 1,
+            synthetic: false,
+        }
+    }
+
+    fn ev(phase: ReconfigPhase, display: u32, flags: u32) -> ReconfigEvent {
+        ReconfigEvent {
+            phase,
+            display,
+            flags,
+            main_thread: true,
+            synthetic: false,
+        }
+    }
+
+    #[test]
+    fn 画面ごとの_begin_と_end_は_1_回の再構成に畳む() {
+        let t = Instant::now();
+        let ms = |n: u64| t + Duration::from_millis(n);
+        let mut q = std::collections::VecDeque::new();
+        // 本番の並び: begin が画面ぶん続き、71ms 後に end が画面ぶん続く
+        apply_reconfig(&mut q, &ev(ReconfigPhase::Begin, 1, 1), ms(0));
+        apply_reconfig(&mut q, &ev(ReconfigPhase::Begin, 6, 1), ms(0));
+        apply_reconfig(&mut q, &ev(ReconfigPhase::End, 1, 1 << 9), ms(71));
+        apply_reconfig(&mut q, &ev(ReconfigPhase::End, 6, 1 << 2), ms(72));
+        assert_eq!(q.len(), 1, "{q:?}");
+        let w = &q[0];
+        assert_eq!((w.begins, w.ends), (2, 2));
+        assert_eq!((w.begun, w.ended), (ms(0), Some(ms(72))));
+        assert_eq!(w.end_flags, (1 << 9) | (1 << 2));
+
+        // end の後の begin は次の再構成
+        apply_reconfig(&mut q, &ev(ReconfigPhase::Begin, 1, 1), ms(100));
+        assert_eq!(q.len(), 2);
+        // end が settle を過ぎてから来たら、登録より前に始まった再構成として end の時刻で窓を作る
+        apply_reconfig(&mut q, &ev(ReconfigPhase::End, 1, 0), ms(150));
+        apply_reconfig(&mut q, &ev(ReconfigPhase::End, 1, 0), ms(150 + 301));
+        assert_eq!(q.len(), 3);
+        assert_eq!((q[2].begun, q[2].begins), (ms(451), 0));
+        // 開いたまま OPEN_MAX を過ぎた begin には数えない
+        apply_reconfig(&mut q, &ev(ReconfigPhase::Begin, 1, 1), ms(1_000));
+        apply_reconfig(&mut q, &ev(ReconfigPhase::Begin, 1, 1), ms(1_000 + 10_001));
+        assert_eq!(q.len(), 5);
+        // メインスレッド以外・合成は窓に残る
+        let mut off = ev(ReconfigPhase::End, 2, 0);
+        off.main_thread = false;
+        off.synthetic = true;
+        apply_reconfig(&mut q, &off, ms(11_002));
+        assert_eq!((q[4].off_main, q[4].synthetic), (1, true));
+        // 上限で古いものから捨てる
+        for i in 0..40u64 {
+            apply_reconfig(
+                &mut q,
+                &ev(ReconfigPhase::Begin, 1, 1),
+                ms(20_000 + i * 1_000),
+            );
+            apply_reconfig(
+                &mut q,
+                &ev(ReconfigPhase::End, 1, 0),
+                ms(20_000 + i * 1_000 + 10),
+            );
+        }
+        assert_eq!(q.len(), RECONFIG_CAP);
+    }
+
+    #[test]
+    fn 遅延の窓に重なる再構成だけを数え_end_の後は猶予まで延ばす() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let at = |ms: i64| {
+            if ms >= 0 {
+                deadline + Duration::from_millis(ms as u64)
+            } else {
+                deadline - Duration::from_millis(ms.unsigned_abs())
+            }
+        };
+        let now = at(1_000);
+        let sum = |w: &[(i64, Option<i64>)]| {
+            ReconfigOverlap::summarize(
+                w.iter().map(|&(b, e)| (at(b), e.map(at), false)),
+                deadline,
+                now,
+            )
+        };
+        // begin → end が遅延の中（合成の begin → 塞ぐ → end）
+        assert_eq!(sum(&[(100, Some(900))]), Some(overlap(800, Some(100))));
+        // end が期限より前でも猶予（2 秒）の内なら数える（本番: end の後に 1.4 秒塞がった）
+        assert_eq!(sum(&[(-600, Some(-500))]), Some(overlap(100, Some(1_500))));
+        // 猶予の外（end + 2 秒 <= 期限）は数えない
+        assert_eq!(sum(&[(-2_100, Some(-2_000))]), None);
+        assert!(sum(&[(-2_100, Some(-1_999))]).is_some(), "境界の内側");
+        // end が未着: 記録まで処理中（ただし begin から OPEN_MAX まで）
+        assert_eq!(sum(&[(-300, None)]), Some(overlap(1_300, None)));
+        assert_eq!(sum(&[(-10_000, None)]), None, "OPEN_MAX ちょうどで閉じる");
+        assert!(sum(&[(-9_999, None)]).is_some());
+        // 複数なら回数と最後に始まったもの
+        let two = sum(&[(-700, Some(-600)), (200, Some(300))]).expect("2 回");
+        assert_eq!(
+            (two.count, two.took_ms, two.since_end_ms),
+            (2, 100, Some(700))
+        );
+        // 記録より後の begin は数えない（純粋関数の境界）
+        assert_eq!(sum(&[(1_001, Some(1_002))]), None);
+    }
+
+    #[test]
+    fn 再構成は終わってから_1_回だけ_perf_log_の行になる() {
+        let t = Instant::now();
+        let ms = |n: u64| t + Duration::from_millis(n);
+        let mut q = std::collections::VecDeque::new();
+        apply_reconfig(&mut q, &ev(ReconfigPhase::Begin, 1, 1), ms(0));
+        apply_reconfig(&mut q, &ev(ReconfigPhase::Begin, 6, 1), ms(0));
+        apply_reconfig(
+            &mut q,
+            &ev(ReconfigPhase::End, 1, (1 << 9) | (1 << 5)),
+            ms(71),
+        );
+        assert!(reconfig_reports_at(&mut q, ms(71)).is_empty(), "end の途中");
+        assert!(
+            reconfig_reports_at(&mut q, ms(71 + 299)).is_empty(),
+            "settle の内"
+        );
+        let lines = reconfig_reports_at(&mut q, ms(71 + 300));
+        assert_eq!(
+            lines,
+            vec![
+                "画面構成の変更（macOS の画面再構成）: begin → end 71ms・画面 1,6・通知 begin 2 件 / end 1 件・\
+                 変更 remove,disabled・コールバックはメインスレッド。#2666"
+                    .to_string()
+            ]
+        );
+        assert!(
+            reconfig_reports_at(&mut q, ms(5_000)).is_empty(),
+            "1 回だけ"
+        );
+
+        // end が来ないまま OPEN_MAX を過ぎたら 1 回（メインスレッド以外・合成も書く）
+        let mut off = ev(ReconfigPhase::Begin, 1, 1);
+        off.main_thread = false;
+        off.synthetic = true;
+        apply_reconfig(&mut q, &off, ms(6_000));
+        assert!(reconfig_reports_at(&mut q, ms(6_000 + 9_999)).is_empty());
+        let lines = reconfig_reports_at(&mut q, ms(16_000));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("begin から 10s 経っても end が来ない"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].contains("コールバックはメインスレッド以外 1 件・検証の合成"),
+            "{lines:?}"
+        );
+        assert!(reconfig_reports_at(&mut q, ms(30_000)).is_empty());
+    }
+
+    #[test]
+    fn 変更の内容は名前で書き_知らない桁は_16_進で残す() {
+        assert_eq!(reconfig_flags_text(0), "なし");
+        assert_eq!(reconfig_flags_text(1), "なし", "begin の桁は書かない");
+        assert_eq!(reconfig_flags_text((1 << 4) | (1 << 8)), "add,enabled");
+        assert_eq!(
+            reconfig_flags_text((1 << 12) | (1 << 20)),
+            "desktop_shape,0x100000"
+        );
+    }
+
+    #[test]
+    fn 優先の決まり_計測区間で名指し再構成は併記_届かなければ再構成を名指す() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let lag = Duration::from_millis(1600);
+        let r = || Some(overlap(71, Some(1545)));
+        let ja = |c: &StallCause| c.text_in(tako_core::i18n::Lang::Ja);
+
+        // 過負荷・継続中・専有は計測を名指したまま、再構成を併記する
+        let over = StallCause::classify(lag, SCHED_OVERLOAD_OVER, None, None, r());
+        let run = StallCause::classify(lag, Duration::ZERO, Some(("render", 900)), None, r());
+        let owned = StallCause::classify(
+            lag,
+            Duration::ZERO,
+            None,
+            DelaySpans::summarize(spans_at(deadline, &[("render", 1600, 1700)]), deadline),
+            r(),
+        );
+        for (c, says) in [
+            (&over, "マシン全体の過負荷"),
+            (&run, "render が 900ms 継続中 = tako の専有"),
+            (&owned, "= tako の専有。#1968 / #2665"),
+        ] {
+            let text = ja(c);
+            assert!(!c.names_reconfig(), "{c:?}");
+            assert_eq!(c.reconfig(), r().as_ref());
+            assert!(text.contains(says), "{text}");
+            assert!(
+                text.ends_with(
+                    "。画面構成の変更とも重なる: begin → end 71ms・end から記録まで 1545ms。#2666）"
+                ),
+                "併記: {text}"
+            );
+        }
+        assert!(run.names_tako() && owned.names_tako() && !over.names_tako());
+
+        // 計測区間が半分に届かない: 残りを画面構成の変更の処理中と名指し、内訳も書く
+        let partial = StallCause::classify(
+            lag,
+            Duration::ZERO,
+            None,
+            DelaySpans::summarize(spans_at(deadline, &[("render", 1600, 400)]), deadline),
+            r(),
+        );
+        assert!(
+            partial.names_reconfig() && !partial.names_tako(),
+            "{partial:?}"
+        );
+        let text = ja(&partial);
+        assert!(text.contains("計 400ms・1 件 = 遅延の 25%"), "{text}");
+        assert!(
+            text.contains("残り 1200ms は画面構成の変更の処理中（OS / GPUI 側）: begin → end 71ms"),
+            "{text}"
+        );
+        assert!(!text.contains("tako の専有"), "{text}");
+
+        // 計測区間なし: 画面構成の変更の処理中
+        let none = StallCause::classify(lag, Duration::ZERO, None, None, r());
+        assert_eq!(
+            ja(&none),
+            "UI ストール: foreground executor の再開が 1.60s 遅延（OS スレッドは正常・遅延の間に計測区間なし = \
+             画面構成の変更の処理中（OS / GPUI 側）: begin → end 71ms・end から記録まで 1545ms。#2666）"
+        );
+        assert_eq!(
+            none.text_in(tako_core::i18n::Lang::En),
+            "UI stall: the foreground executor resumed 1.60s late (OS threads are fine; no measured \
+             span during the delay = processing a display configuration change (OS / GPUI side): \
+             begin → end 71ms, 1545ms from end to the record. #2666)"
+        );
+
+        // 再構成が無ければ #2665 の分類のまま（併記もしない）
+        for (c, kind) in [
+            (
+                StallCause::classify(lag, Duration::ZERO, None, None, None),
+                "外",
+            ),
+            (
+                StallCause::classify(
+                    lag,
+                    Duration::ZERO,
+                    None,
+                    DelaySpans::summarize(spans_at(deadline, &[("render", 1600, 400)]), deadline),
+                    None,
+                ),
+                "内訳",
+            ),
+        ] {
+            assert!(
+                !c.names_reconfig() && c.reconfig().is_none(),
+                "{kind}: {c:?}"
+            );
+            assert!(!ja(&c).contains("画面構成"), "{kind}: {}", ja(&c));
+        }
+    }
+
+    #[test]
+    fn 再構成の注入は手を書いた順に読む() {
+        assert_eq!(Issue2666Inject::parse(""), Issue2666Inject::default());
+        assert_eq!(Issue2666Inject::default().displays, 2);
+        let inj = Issue2666Inject::parse("begin sleep=1800 span=400 end displays=3 x=1 sleep=? \n");
+        assert_eq!(
+            inj,
+            Issue2666Inject {
+                steps: vec![
+                    Issue2666Step::Begin,
+                    Issue2666Step::Sleep(Duration::from_millis(1800)),
+                    Issue2666Step::Span(Duration::from_millis(400)),
+                    Issue2666Step::End,
+                ],
+                displays: 3,
+            }
+        );
+        // 合成は画面ごと・書いた順
+        let seen = std::cell::RefCell::new(Vec::new());
+        Issue2666Inject::parse("begin sleep=1 end displays=2")
+            .run(|phase, d| seen.borrow_mut().push((phase, d)));
+        assert_eq!(
+            seen.into_inner(),
+            vec![
+                (ReconfigPhase::Begin, 1),
+                (ReconfigPhase::Begin, 2),
+                (ReconfigPhase::End, 1),
+                (ReconfigPhase::End, 2),
+            ]
+        );
+        // 対象外の要求はファイルを読まない
+        assert_eq!(
+            Issue2666Inject::for_request(false),
+            Issue2666Inject::default()
+        );
     }
 
     #[test]

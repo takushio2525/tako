@@ -1937,6 +1937,19 @@ lid-guard.json が使う）:
   分類は型 `StallCause`（文は網羅 match の `text_in`。perf.log は日本語）。A/B は `TAKO_2665_LEGACY=1`、
   実経路の注入は `TAKO_2665_INJECT_FILE`（検証プロセスでだけ効く・`scripts/test-stall-window-2665.sh`）、番犬は
   `issue2665_stall_window_watchdog`
+- **画面構成の変更（蓋の開閉・画面スリープでの macOS の画面再構成）を名指す**（#2666・境界 B33
+  `tako-app::platform::display_reconfig`。診断専用）: GUI が起動時に 1 回 `CGDisplayRegisterReconfigurationCallback`
+  を登録し、コールバックは begin / end の時刻を `diag::record_display_reconfig` へ畳むだけ（I/O しない）。
+  `diag::stall_line` は遅延の間（期限 → 記録）に窓「begin → end + `RECONFIG_AFTER_GRACE`（2 秒）」が重なれば
+  `StallCause::DisplayReconfig` =「画面構成の変更の処理中（OS / GPUI 側）」と名指す。猶予は本番の統合ログの実測
+  （tako-app のメインスレッドが end のコールバックの時点の約 130ms 後から 1.4 秒塞がっていた）による。
+  **名指す順**: 過負荷 > 継続中の区間 > 専有（区間が遅延の半分以上）> 画面構成の変更 > 内訳 / 計測区間の外。
+  上の 3 つでも再構成が重なれば「画面構成の変更とも重なる」と併記し、区間が半分に届かなければ内訳を書いて
+  残りを画面構成の変更と名指す。終わった再構成は監視スレッドが perf.log へ 1 回 1 行
+  （begin → end・通知の数・変更の内容・コールバックがメインスレッドか）。end が来ないまま 10 秒で閉じる。
+  macOS 以外は何もしない。A/B は `TAKO_2666_LEGACY=1`（登録しない・記録しない = #2665 の分類）、実経路は通知の合成
+  `TAKO_2666_INJECT_FILE`（検証プロセスでだけ効く・本物のコールバックの関数を通る・
+  `scripts/test-display-reconfig-2666.sh`）、番犬は `issue2666_display_reconfig_stall_watchdog`
 - **プロセス走査の共有と変化検出**（#772 / #779）: `agents::ProcessSnapshot` が tmux pane PID と
   `ps` の親子関係を 1 回ずつ採取し、stale binary と sleep guard が同一 tick で共有する。
   sleep guard の 2 秒 tick は assertion の評価頻度であって、tmux / ps の採取頻度ではない。
