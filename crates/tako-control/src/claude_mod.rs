@@ -25,7 +25,7 @@ use tako_core::claude_mod::{
 };
 use tako_core::claude_mod_ui::Vocab;
 use tako_core::i18n::Lang;
-use tako_core::PaneId;
+use tako_core::{PaneAccess, PaneId};
 
 use crate::dispatch::DispatchError;
 use crate::host::ControlHost;
@@ -279,32 +279,17 @@ pub fn run(
             .map_err(DispatchError::InvalidParams)
         }
         "status" => status(host),
-        "on" | "off" => {
-            let enabled = action == Some("on");
-            host.set_claude_mod_enabled(enabled)
-                .map_err(DispatchError::Operation)?;
-            let mut out = status(host)?;
-            out["applies_to"] = json!(ModText::AppliesToOnOff.text_in(tako_core::i18n::lang()));
-            Ok(out)
-        }
-        "band-on" | "band-off" => {
-            hub(host)?;
-            // #1960: 正本は ui.json の band.hidden（`tako mod ui set band.hidden` と同じ 1 実装）
-            let request = tako_core::claude_mod_ui::UiRequest {
-                op: Some("set".into()),
-                key: Some("band.hidden".into()),
-                value: Some(json!(action == Some("band-off"))),
-                ..Default::default()
-            };
-            crate::claude_mod_ui::run(&ui_path(host)?, &request).map_err(ui_error)?;
-            let mut out = status(host)?;
-            out["applies_to"] = json!(ModText::AppliesToBand.text_in(tako_core::i18n::lang()));
-            Ok(out)
-        }
+        // #2663: UI スレッドの段（設定の切り替え・行の材料の写し）→ 続き（帯の ui.json の書き込みと
+        // status の仕上げ）を同じスレッドで順に通す。IPC は `prepare_offload` が続きを background へ出す
+        on_off @ ("on" | "off" | "band-on" | "band-off") => action_prepare(host, on_off)?.run(),
         "ui" => {
             crate::claude_mod_ui::run(&ui_path(host)?, &ui.unwrap_or_default()).map_err(ui_error)
         }
-        "report" => accept_report(host, report, pane, ancestry.as_deref()),
+        // #2663: 受け付け（UI）→ 応答の組み立て（[`ReportJob::run`]）→ 置き場の写し（[`land`]）を
+        // 同じスレッドで順に通す。IPC は `prepare_offload` が組み立てを background へ出す
+        "report" => accept_report(host, report, pane, ancestry.as_deref())
+            .map(ReportJob::run)
+            .and_then(|landing| land(host, landing)),
         other => Err(DispatchError::InvalidParams(
             ModText::UnknownAction {
                 action: other.into(),
@@ -342,13 +327,17 @@ fn reason_json(reason: &OffReason, lang: Lang) -> Value {
     json!({ "code": reason.code(), "message": reason.describe_in(lang) })
 }
 
-/// 報告を受け取り、tako 側のスナップショットを返す（設計書 §2.3。S3 から mod が使う）
-fn accept_report(
+/// 報告の UI スレッドの段（設計書 §2.3。#2663）。報告を読み、送り主のペインを決めて hub へ受け付け、
+/// 応答の材料のうちメモリにあるもの（タイトル・worker の報告と制限・カード・cwd）と画面の手
+/// （`PaneAccess`）を写すまで。**端末のロックもファイルも触らない**: 帯のトグルの ui.json への取り込みと
+/// 読み・画面の採取・帯の組み立ては [`ReportJob::run`]（IPC では background）、`cards_place` /
+/// `chat_place` の写しは着地（[`land`]。UI スレッド）
+pub fn accept_report(
     host: &mut dyn ControlHost,
     report: Option<Value>,
     pane: Option<u64>,
     ancestry: Option<&[u32]>,
-) -> Result<Value, DispatchError> {
+) -> Result<ReportJob, DispatchError> {
     let value = report.ok_or_else(|| {
         DispatchError::InvalidParams("report には報告の JSON が要る（stdin で渡す）".into())
     })?;
@@ -356,48 +345,129 @@ fn accept_report(
     let pane_id = resolve_reporting_pane(host, pane)?;
     // #2559: GUI がペインの外で起こした claude（自動命名の `claude -p` 等）の報告は、受け継いだ
     // `TAKO_PANE_ID` のペインのものとして記録しない。帯のトグルの取り込みより前に見る
-    // （補助の報告で ui.json も動かさない）。`ended` でそのペインの主の報告を消させない
+    // （補助の報告で ui.json も動かさない = `ui: None`）。`ended` でそのペインの主の報告を消させない
     if let core::ReportOrigin::HostHelper { .. } = report_origin_of(host, ancestry) {
         let hub = host
             .claude_mod_mut()
             .ok_or_else(|| DispatchError::Operation("この tako は mod の報告を受けない".into()))?;
         let accepted = hub.reject_foreign(pane_id.as_u64(), Instant::now());
-        return Ok(json!({
-            "accepted": accepted.as_str(),
-            "pane": pane_id.as_u64(),
-            "fresh_for_ms": core::FRESH_FOR.as_millis() as u64,
-            "tako": snapshot(host, pane_id, accepted, core::s3_legacy()),
-        }));
+        return Ok(ReportJob {
+            accepted,
+            pane: pane_id.as_u64(),
+            snapshot: snapshot(host, pane_id, accepted, core::s3_legacy()),
+            ui: None,
+        });
     }
-    // #1960: 帯のトグルの正本は ui.json。mod の中で切り替えた（`$.store` の時刻が新しい）なら取り込む
-    if let (Some(band), Some(path), false) = (
-        parsed.band.as_ref(),
-        host.claude_mod_ui_path(),
-        core::s3_legacy(),
-    ) {
-        crate::claude_mod_ui::import_band(&path, band);
-    }
-    // #1963: GPUI のカード帯の判断（描画のたびに引く）が ui.json を読まずに済むよう、
-    // cards.place は報告を受けるたびにここで写す。#1964: chat.place も同じ（GUI モードの表示の判断）
-    let (cards_place, chat_place) = host
-        .claude_mod_ui_path()
-        .map(|p| {
-            let ui = crate::claude_mod_ui::view(&p);
-            (ui.cards.place, ui.chat.place)
-        })
-        .unwrap_or_default();
+    // #1960: 帯のトグルの正本は ui.json。mod の中で切り替えた（`$.store` の時刻が新しい）なら続きの段で取り込む
+    let import = parsed.band.clone().filter(|_| !core::s3_legacy());
+    let path = host.claude_mod_ui_path();
     let hub = host
         .claude_mod_mut()
         .ok_or_else(|| DispatchError::Operation("この tako は mod の報告を受けない".into()))?;
-    hub.cards_place = cards_place;
-    hub.chat_place = chat_place;
     let accepted = hub.accept(pane_id.as_u64(), parsed, Instant::now());
-    Ok(json!({
-        "accepted": accepted.as_str(),
-        "pane": pane_id.as_u64(),
-        "fresh_for_ms": core::FRESH_FOR.as_millis() as u64,
-        "tako": snapshot(host, pane_id, accepted, core::s3_legacy()),
-    }))
+    Ok(ReportJob {
+        accepted,
+        pane: pane_id.as_u64(),
+        snapshot: snapshot(host, pane_id, accepted, core::s3_legacy()),
+        ui: Some(ReportUi { path, import }),
+    })
+}
+
+/// 報告の続き（#2663。[`accept_report`] の後）。IPC では background で走らせ、着地（[`land`]）で
+/// `cards_place` / `chat_place` を hub へ写してから応答する
+pub struct ReportJob {
+    accepted: Accepted,
+    pane: u64,
+    snapshot: Snapshot,
+    /// ui.json の置き場と取り込む帯。GUI がペインの外で起こした claude の報告（#2559）は None = ui.json に触らない
+    ui: Option<ReportUi>,
+}
+
+struct ReportUi {
+    path: Option<std::path::PathBuf>,
+    /// 報告の帯の状態（取り込むのは `toggled_at` が ui.json より新しいときだけ = [`crate::claude_mod_ui::import_band`]）
+    import: Option<core::ModBand>,
+}
+
+impl ReportJob {
+    /// 帯のトグルを ui.json へ取り込み、ui.json を 1 回読んで（置き場の写しと帯の材料の両方に使う）、画面を採って
+    /// 応答を組む（#2663。IPC では background）。**hub に触らない**（置き場の写しは着地）
+    pub fn run(self) -> Landing {
+        let ReportJob {
+            accepted,
+            pane,
+            snapshot,
+            ui,
+        } = self;
+        let (places, config) = match ui {
+            Some(ReportUi { path, import }) => {
+                // 取り込みと読みは錠の内側で順に行う（番号の順 = 読んだ順。並行する続きの着地の順に依らない）
+                let mut reads = UI_READS.lock().unwrap_or_else(|e| e.into_inner());
+                if let (Some(band), Some(path)) = (import.as_ref(), path.as_deref()) {
+                    crate::claude_mod_ui::import_band(path, band);
+                }
+                // #1963: GPUI のカード帯の判断（描画のたびに引く）が ui.json を読まずに済むよう、
+                // cards.place は報告を受けるたびに写す。#1964: chat.place も同じ（GUI モードの表示の判断）。
+                // 帯の材料（`tako.view.ui`）も同じ 1 回の読みの検証済みの値
+                let config = path
+                    .as_deref()
+                    .map(crate::claude_mod_ui::view)
+                    .unwrap_or_default();
+                *reads += 1;
+                (
+                    Some((*reads, config.cards.place, config.chat.place)),
+                    config,
+                )
+            }
+            None => (None, Default::default()),
+        };
+        Landing {
+            places,
+            reply: Ok(json!({
+                "accepted": accepted.as_str(),
+                "pane": pane,
+                "fresh_for_ms": core::FRESH_FOR.as_millis() as u64,
+                "tako": snapshot.finish(config),
+            })),
+        }
+    }
+}
+
+/// 報告の続きが ui.json を取り込み・読んだ順の通し番号（#2663）。取り込みと読みはこの錠の内側で順に行うので
+/// 番号の順 = 読んだ順で、着地は新しい読みだけを hub へ写す（[`core::ModHub::copy_places`]）。
+/// 取るのは続きの段（IPC では background）だけ = **UI スレッドの段（準備・着地）は取らない**
+static UI_READS: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+/// `tako mod` の続きの結果（#2663）。`places` は hub へ写す `cards_place` / `chat_place` と読みの通し番号
+/// （報告だけ）
+pub struct Landing {
+    places: Option<(
+        u64,
+        tako_core::claude_mod_ui::Place,
+        tako_core::claude_mod_ui::Place,
+    )>,
+    reply: Result<Value, DispatchError>,
+}
+
+impl Landing {
+    /// hub へ写すものの無い続き（on / off・帯の切り替え）
+    pub fn reply(reply: Result<Value, DispatchError>) -> Self {
+        Self {
+            places: None,
+            reply,
+        }
+    }
+}
+
+/// 着地（#2663。UI スレッド）: 報告で読んだ ui.json の置き場を hub へ写して応答する
+pub fn land(host: &mut dyn ControlHost, landing: Landing) -> Result<Value, DispatchError> {
+    if let Some((seq, cards, chat)) = landing.places {
+        let hub = host
+            .claude_mod_mut()
+            .ok_or_else(|| DispatchError::Operation("この tako は mod の報告を受けない".into()))?;
+        hub.copy_places(seq, cards, chat);
+    }
+    landing.reply
 }
 
 /// 報告の送り主の居場所（#2559。判断は [`core::report_origin`]）。祖先を送らない CLI・A/B
@@ -421,7 +491,7 @@ fn report_origin_of(host: &dyn ControlHost, ancestry: Option<&[u32]>) -> core::R
     core::report_origin(chain, std::process::id(), Some(&children))
 }
 
-/// 報告の応答に載せる tako 側のスナップショット（設計書 §2.3）。
+/// 報告の応答に載せる tako 側のスナップショット（設計書 §2.3）の材料のうち UI スレッドで写すもの（#2663）。
 ///
 /// S3（#1881）から帯・サイドバーの材料（`view`）も載せる。終わったセッションには描く先が
 /// 無いので載せない。A/B（`legacy` = `TAKO_1877_S3_LEGACY`）でも載せない = mod は何も描かない
@@ -430,7 +500,7 @@ pub(crate) fn snapshot(
     pane_id: PaneId,
     accepted: Accepted,
     legacy: bool,
-) -> Value {
+) -> Snapshot {
     let enabled = host.claude_mod().is_some_and(|h| h.enabled);
     let ws = host.workspace();
     let tab = ws.find_tab_of_pane(pane_id).and_then(|t| ws.get_tab(t));
@@ -438,69 +508,111 @@ pub(crate) fn snapshot(
         .and_then(|t| t.tree().get(pane_id))
         .and_then(|p| p.title())
         .map(str::to_string);
-    let mut out = json!({
+    let base = json!({
         "pane_title": pane_title,
         "tab_title": tab.map(|t| t.title().to_string()),
         "mod_enabled": enabled,
     });
-    if accepted == Accepted::Stored && !legacy {
-        out["view"] =
-            serde_json::to_value(band_view(host, pane_id, Instant::now())).unwrap_or(Value::Null);
-    }
-    out
+    let band =
+        (accepted == Accepted::Stored && !legacy).then(|| band_seed(host, pane_id, Instant::now()));
+    Snapshot { base, band }
 }
 
-/// 帯・サイドバーの材料（S3 #1881。判断は `tako_core::claude_mod::band_view`）。
+/// [`snapshot`] の写し（#2663）。画面の採取と帯の組み立ては [`Snapshot::finish`]
+pub(crate) struct Snapshot {
+    base: Value,
+    band: Option<BandSeed>,
+}
+
+impl Snapshot {
+    /// 帯の材料を仕上げて載せる（#2663。IPC では background）。`ui` は検証済みの ui.json
+    pub(crate) fn finish(self, ui: tako_core::claude_mod_ui::UiConfig) -> Value {
+        let mut out = self.base;
+        if let Some(band) = self.band {
+            out["view"] = serde_json::to_value(band.band_view(ui)).unwrap_or(Value::Null);
+        }
+        out
+    }
+}
+
+/// 帯・サイドバーの材料のうち UI スレッドで写すもの（S3 #1881 / #2663。判断は `tako_core::claude_mod::band_view`）。
 ///
-/// worker は右パネル orch と同じ規則（`Workspace::workers_of`）で引き、1 本ずつ mod の報告・
-/// 画面・コマンド状態の手掛かりを集める（報告は最大 1 秒に 1 回なので、画面の判定もその頻度）
-fn band_view(host: &dyn ControlHost, pane: PaneId, now: Instant) -> core::BandView {
+/// worker は右パネル orch と同じ規則（`Workspace::workers_of`）で引き、1 本ずつ mod の報告・コマンド状態と
+/// 画面の手を写す（報告は最大 1 秒に 1 回なので、画面の判定もその頻度）。**端末のロックもファイルも触らない**:
+/// 画面の採取と ui.json の値は [`BandSeed::band_view`]
+fn band_seed(host: &dyn ControlHost, pane: PaneId, now: Instant) -> BandSeed {
     let ws = host.workspace();
     let tab = ws.find_tab_of_pane(pane).and_then(|t| ws.get_tab(t));
     let workers = ws
         .workers_of(pane)
         .into_iter()
-        .map(|p| worker_facts(host, p, now))
+        .map(|p| worker_seed(host, p, now))
         .collect();
     let looked_up = lookup_pane(host, pane, now).ok();
     let session = host.session(pane);
-    core::band_view(core::BandInput {
-        pane: pane.as_u64(),
-        pane_title: tab
-            .and_then(|t| t.tree().get(pane))
-            .and_then(|p| p.title())
-            .map(str::to_string),
-        tab_title: tab.map(|t| t.title().to_string()),
-        lang: tako_core::i18n::lang().as_str(),
+    BandSeed {
+        input: core::BandInput {
+            pane: pane.as_u64(),
+            pane_title: tab
+                .and_then(|t| t.tree().get(pane))
+                .and_then(|p| p.title())
+                .map(str::to_string),
+            tab_title: tab.map(|t| t.title().to_string()),
+            lang: tako_core::i18n::lang().as_str(),
+            // 画面で決まる値（worker の画面の手掛かり・ui.json・画面の末尾の数値）は続きの段で埋める
+            workers: Vec::new(),
+            ctx: looked_up.and_then(|s| s.report.context.clone()),
+            rate_limits: account_rate_limits(host, pane, now),
+            thresholds: core::band_thresholds(),
+            ui: Default::default(),
+            // #1962: バーを描かせるか（利用者の statusLine の有無 × 画面の末尾の数値）とボタンの引数の材料
+            status_line: looked_up.and_then(|s| s.report.status_line),
+            screen_shows_usage: false,
+            cwd: session
+                .and_then(|s| s.cwd())
+                .map(|p| p.display().to_string()),
+            s7_legacy: core::s7_legacy(),
+            // #1963: このペインのコマンドカード（mod が会話の行と帯に描く。正本は tako の store）
+            cards: host
+                .command_cards()
+                .map(|c| c.list(Some(pane)).into_iter().cloned().collect())
+                .unwrap_or_default(),
+            cards_legacy: core::cards_legacy(),
+            // #2159: 会話の行のカードにクリックで押す「実行 / コピー」を置いてよいか
+            card_click: card_click(host),
+            // #1964: チャット風の描画の組は表示モードで変わる（ターミナル表示の既定はコードのコピーだけ）
+            ui_mode_gui: host.ui_mode().is_gui(),
+            chat_legacy: core::chat_legacy(),
+        },
+        screen: session.map(tako_core::TerminalSession::access),
         workers,
-        ctx: looked_up.and_then(|s| s.report.context.clone()),
-        rate_limits: account_rate_limits(host, pane, now),
-        thresholds: core::band_thresholds(),
-        // #1960: 検証済みの ui.json（読めない部分は既定。帯のトグルの中継もここから作る）
-        ui: host
-            .claude_mod_ui_path()
-            .map(|p| crate::claude_mod_ui::view(&p))
-            .unwrap_or_default(),
-        // #1962: バーを描かせるか（利用者の statusLine の有無 × 画面の末尾の数値）とボタンの引数の材料
-        status_line: looked_up.and_then(|s| s.report.status_line),
-        screen_shows_usage: session
-            .is_some_and(|s| core::screen_shows_usage(&s.tail_lines(core::USAGE_SCAN_LINES))),
-        cwd: session
-            .and_then(|s| s.cwd())
-            .map(|p| p.display().to_string()),
-        s7_legacy: core::s7_legacy(),
-        // #1963: このペインのコマンドカード（mod が会話の行と帯に描く。正本は tako の store）
-        cards: host
-            .command_cards()
-            .map(|c| c.list(Some(pane)).into_iter().cloned().collect())
-            .unwrap_or_default(),
-        cards_legacy: core::cards_legacy(),
-        // #2159: 会話の行のカードにクリックで押す「実行 / コピー」を置いてよいか
-        card_click: card_click(host),
-        // #1964: チャット風の描画の組は表示モードで変わる（ターミナル表示の既定はコードのコピーだけ）
-        ui_mode_gui: host.ui_mode().is_gui(),
-        chat_legacy: core::chat_legacy(),
-    })
+    }
+}
+
+/// [`band_seed`] の写し（#2663）
+struct BandSeed {
+    /// 画面で決まる値（`workers` / `ui` / `screen_shows_usage`）を除いて組み終えたもの
+    input: core::BandInput,
+    /// このペインの画面の手（端末の無いペインは None）
+    screen: Option<PaneAccess>,
+    workers: Vec<WorkerSeed>,
+}
+
+impl BandSeed {
+    /// 画面を採って帯の材料を組む（#2663。端末のロックを取るのはここ = IPC では background）。
+    /// `ui` は検証済みの ui.json（#1960。読めない部分は既定。帯のトグルの中継もここから作る）
+    fn band_view(self, ui: tako_core::claude_mod_ui::UiConfig) -> core::BandView {
+        let BandSeed {
+            mut input,
+            screen,
+            workers,
+        } = self;
+        input.ui = ui;
+        input.screen_shows_usage =
+            screen.is_some_and(|s| core::screen_shows_usage(&s.tail_lines(core::USAGE_SCAN_LINES)));
+        input.workers = workers.into_iter().map(WorkerSeed::facts).collect();
+        core::band_view(input)
+    }
 }
 
 /// tako がペインの TUI へ左クリックを渡すか（#2159。応答の `view.cards.click` と `tako mod` の `cards.click`）。
@@ -589,9 +701,9 @@ pub fn status_bar_owner(
     core::claude_bar_owner(report, core::s7_legacy())
 }
 
-/// worker 1 本の手掛かり（判断は `tako_core::claude_mod::classify_worker`）
-fn worker_facts(host: &dyn ControlHost, pane: &tako_core::Pane, now: Instant) -> core::WorkerFacts {
-    use crate::claude_tui::DialogKind;
+/// worker 1 本の手掛かりのうち UI スレッドで写すもの（判断は `tako_core::claude_mod::classify_worker`。#2663）。
+/// 画面の手掛かり（ダイアログ・生成中）は [`WorkerSeed::facts`] が採る
+fn worker_seed(host: &dyn ControlHost, pane: &tako_core::Pane, now: Instant) -> WorkerSeed {
     let id = pane.id();
     let mod_turn = lookup_pane(host, id, now).ok().map(|s| s.report.turn);
     let limited = mod_turn.is_some()
@@ -599,29 +711,53 @@ fn worker_facts(host: &dyn ControlHost, pane: &tako_core::Pane, now: Instant) ->
             .iter()
             .any(|l| l.percent_used >= 100.0);
     let session = host.session(id);
-    let lines = session.map(|s| s.visible_lines()).unwrap_or_default();
-    let dialog = crate::claude_tui::detect_choice_dialog(&lines);
-    core::WorkerFacts {
-        pane: id.as_u64(),
-        name: pane
-            .title()
-            .or_else(|| pane.role())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("pane {}", id.as_u64())),
-        mod_turn,
-        limited,
-        dialog_on_screen: dialog
-            .as_ref()
-            .is_some_and(|d| !d.kind.auto_accepted() && d.kind != DialogKind::UsageLimit),
-        permission_on_screen: dialog
-            .as_ref()
-            .is_some_and(|d| d.kind == DialogKind::Permission),
-        limit_dialog_on_screen: dialog
-            .as_ref()
-            .is_some_and(|d| d.kind == DialogKind::UsageLimit),
-        screen_busy: !lines.is_empty()
-            && crate::orchestrator::wait::screen_looks_busy(&lines.join("\n")),
-        command: session.map(|s| s.command_state()).unwrap_or_default(),
+    WorkerSeed {
+        facts: core::WorkerFacts {
+            pane: id.as_u64(),
+            name: pane
+                .title()
+                .or_else(|| pane.role())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("pane {}", id.as_u64())),
+            mod_turn,
+            limited,
+            dialog_on_screen: false,
+            permission_on_screen: false,
+            limit_dialog_on_screen: false,
+            screen_busy: false,
+            command: session.map(|s| s.command_state()).unwrap_or_default(),
+        },
+        screen: session.map(tako_core::TerminalSession::access),
+    }
+}
+
+/// [`worker_seed`] の写し（#2663）
+struct WorkerSeed {
+    /// 画面の手掛かりを除いて組み終えたもの
+    facts: core::WorkerFacts,
+    screen: Option<PaneAccess>,
+}
+
+impl WorkerSeed {
+    /// 画面を採って手掛かりを埋める（#2663。端末のロックを取るのはここ = IPC では background）
+    fn facts(self) -> core::WorkerFacts {
+        use crate::claude_tui::DialogKind;
+        let lines = self.screen.map(|s| s.visible_lines()).unwrap_or_default();
+        let dialog = crate::claude_tui::detect_choice_dialog(&lines);
+        core::WorkerFacts {
+            dialog_on_screen: dialog
+                .as_ref()
+                .is_some_and(|d| !d.kind.auto_accepted() && d.kind != DialogKind::UsageLimit),
+            permission_on_screen: dialog
+                .as_ref()
+                .is_some_and(|d| d.kind == DialogKind::Permission),
+            limit_dialog_on_screen: dialog
+                .as_ref()
+                .is_some_and(|d| d.kind == DialogKind::UsageLimit),
+            screen_busy: !lines.is_empty()
+                && crate::orchestrator::wait::screen_looks_busy(&lines.join("\n")),
+            ..self.facts
+        }
     }
 }
 
@@ -648,25 +784,26 @@ fn resolve_reporting_pane(
     }
 }
 
-/// ペイン 1 行の状態（理由の `message` は `lang` で引く。#2365）
-fn pane_row(
-    hub: &ModHub,
-    pane: PaneId,
-    title: Option<&str>,
-    claude_on_screen: bool,
-    now: Instant,
-    lang: Lang,
-) -> Value {
+/// ペイン 1 行の材料（理由の `message` は `lang` で引く。#2365）。
+///
+/// #2663: 行は hub だけで決まる。画面（claude が居るか）で決まるのは「報告が無く、注入した記録だけがある」
+/// ペインの状態 1 つだけなので、UI スレッドではここまで写し、画面の採取は背景の段（[`StatusCtx::with_screens`]）
+/// が行う（[`RowFacts::row`]）
+fn pane_row(hub: &ModHub, pane: PaneId, title: Option<&str>, now: Instant, lang: Lang) -> RowFacts {
     let raw = pane.as_u64();
     let injection = hub.injections.get(&raw);
     let stored = hub.reports.get(&raw);
     let dormant = hub.dormant.get(&raw);
-    let (state, reason) = match (stored, injection) {
+    let state = match (stored, injection) {
         // #1959: 利用者が Claude Code 側で止めた（mod の最後の報告）。休眠した mod はもう
         // 報告しないので鮮度に依らず出す
-        _ if dormant.is_some() => ("user_disabled", reason_json(&OffReason::UserDisabled, lang)),
-        (Some(s), _) if core::is_fresh(s.received, now) => ("reporting", Value::Null),
-        (Some(s), _) => (
+        _ if dormant.is_some() => {
+            RowState::Decided("user_disabled", reason_json(&OffReason::UserDisabled, lang))
+        }
+        (Some(s), _) if core::is_fresh(s.received, now) => {
+            RowState::Decided("reporting", Value::Null)
+        }
+        (Some(s), _) => RowState::Decided(
             "stale",
             json!({
                 "code": "mod_stale",
@@ -678,44 +815,87 @@ fn pane_row(
             }),
         ),
         (None, Some(inj)) => match &inj.off {
-            Some(off) => ("not_injected", reason_json(off, lang)),
+            Some(off) => RowState::Decided("not_injected", reason_json(off, lang)),
             // #1891: 理由はここでは材料なし（候補を並べた文）。背景の段（[`finish_status`]）が
             // ペインの claude を調べられたら 1 つに決めて差し替える
-            None if claude_on_screen => (
-                NO_REPORT,
-                no_report_reason(core::classify_no_report(None), lang),
-            ),
-            None => ("waiting", Value::Null),
+            None => RowState::ByScreen,
         },
-        (None, None) => ("unknown", Value::Null),
+        (None, None) => RowState::Decided("unknown", Value::Null),
     };
-    let mut row = json!({
-        "pane": raw,
-        "title": title,
-        "state": state,
-        "injected": injection.map(|i| i.off.is_none()),
-        "claude_on_screen": claude_on_screen,
-    });
-    if !reason.is_null() {
-        row["reason"] = reason;
-    }
+    let mut tail = Vec::new();
     // #2559: ペインの外の claude の報告を捨てた回数（自動命名の `claude -p` が受け継いだペインの識別で送った等）
     if let Some(foreign) = hub.foreign.get(&raw) {
-        row["foreign_reports"] = json!({
-            "count": foreign.count,
-            "last_age_ms": now.saturating_duration_since(foreign.last).as_millis() as u64,
-        });
+        tail.push((
+            "foreign_reports",
+            json!({
+                "count": foreign.count,
+                "last_age_ms": now.saturating_duration_since(foreign.last).as_millis() as u64,
+            }),
+        ));
     }
     if let Some(s) = stored {
-        row["report"] = report_json(s, now);
+        tail.push(("report", report_json(s, now)));
         // #1962: 帯を描けているか（新鮮で renders を送ってくる mod だけ）
         if core::is_fresh(s.received, now) {
             if let Some(band) = band_state_json(&s.report, lang) {
-                row["band"] = band;
+                tail.push(("band", band));
             }
         }
     }
-    row
+    RowFacts {
+        raw,
+        title: title.map(str::to_string),
+        state,
+        injected: injection.map(|i| i.off.is_none()),
+        tail,
+    }
+}
+
+/// ペイン 1 行の材料（#2663。[`pane_row`]）
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RowFacts {
+    raw: u64,
+    title: Option<String>,
+    state: RowState,
+    injected: Option<bool>,
+    /// 行の末尾に並べるもの（修正前と同じ順の キー と 値）
+    tail: Vec<(&'static str, Value)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowState {
+    /// 報告・休眠・注入の記録で決まった状態と理由（理由の無い状態は Null）
+    Decided(&'static str, Value),
+    /// 報告が無く、注入した（理由の無い）記録だけがある: 画面に claude が居れば `no_report`、居なければ `waiting`
+    ByScreen,
+}
+
+impl RowFacts {
+    /// 画面の判定（`claude_on_screen`）を受けて行を組む
+    fn row(&self, claude_on_screen: bool, lang: Lang) -> Value {
+        let (state, reason) = match &self.state {
+            RowState::Decided(state, reason) => (*state, reason.clone()),
+            RowState::ByScreen if claude_on_screen => (
+                NO_REPORT,
+                no_report_reason(core::classify_no_report(None), lang),
+            ),
+            RowState::ByScreen => ("waiting", Value::Null),
+        };
+        let mut row = json!({
+            "pane": self.raw,
+            "title": self.title,
+            "state": state,
+            "injected": self.injected,
+            "claude_on_screen": claude_on_screen,
+        });
+        if !reason.is_null() {
+            row["reason"] = reason;
+        }
+        for (key, value) in &self.tail {
+            row[*key] = value.clone();
+        }
+        row
+    }
 }
 
 /// 帯の状態（#1962。`drawn` / `not_drawn` / `hidden_by_other_mod`）。renders を送らない mod
@@ -791,56 +971,118 @@ pub struct StatusCtx {
     over_limit: usize,
     /// 理由・状態の文の言語（`tako mod` は表示言語・`tako check-health` は日本語。#2365）
     lang: Lang,
+    /// ペインの行の材料（#2663）。画面を採る前は Some で、[`StatusCtx::with_screens`] が行・要約・
+    /// 調べるペインへ組んで None にする
+    rows: Option<Vec<RowSeed>>,
+}
+
+/// ペイン 1 行の材料と画面の手（#2663。[`status_ctx`] が UI スレッドで写す）
+#[derive(Debug, Clone)]
+struct RowSeed {
+    facts: RowFacts,
+    /// #1964: GUI モードでこのペインのチャットを誰が出すか（報告のあるペインだけ）
+    chat: Option<Value>,
+    /// 画面の手（端末の無いペイン = プレビュー・Web ビューは None）
+    screen: Option<PaneAccess>,
+    /// 報告の無い claude を調べるときの材料（#1891）
+    probe: crate::agent_resume::PaneProbe,
+}
+
+/// 画面の手（`PaneAccess`）は比べない（同じ端末かどうかは材料の一致で足りる。`CheckHealthCtx` の比較用）
+impl PartialEq for RowSeed {
+    fn eq(&self, other: &Self) -> bool {
+        self.facts == other.facts
+            && self.chat == other.chat
+            && self.probe == other.probe
+            && self.screen.is_some() == other.screen.is_some()
+    }
+}
+
+impl Eq for RowSeed {}
+
+impl StatusCtx {
+    /// ペインの画面を採って行・要約・調べるペインを組む（#2663）。**端末のロックを取るのはここ**
+    /// = IPC では背景の段（[`finish_status_in_background`] / [`ActionJob::run`]）。A/B の `TAKO_2663_LEGACY` は
+    /// 修正前と同じく準備の段（[`status_ctx`]）で済ませる。済んでいれば何もしない
+    fn with_screens(mut self) -> Self {
+        let Some(rows) = self.rows.take() else {
+            return self;
+        };
+        let legacy = core::no_report_legacy();
+        let mut panes = Vec::with_capacity(rows.len());
+        for seed in rows {
+            let on_screen = seed.screen.is_some_and(|s| {
+                !matches!(
+                    crate::claude_tui::detect(&s.visible_lines()),
+                    crate::claude_tui::ClaudeScreen::Unknown
+                )
+            });
+            let mut row = seed.facts.row(on_screen, self.lang);
+            // #1964: GUI モードでこのペインのチャットを誰が出すか（mod が描いている組は report.renders.chat）
+            if let Some(chat) = seed.chat {
+                row["chat"] = chat;
+            }
+            // #1891: 報告の無い claude は背景の段で調べる（上限まで。A/B は調べない）
+            if row["state"] == NO_REPORT && !legacy {
+                if self.probes.len() < core::NO_REPORT_PROBE_LIMIT {
+                    self.probes.push(seed.probe);
+                } else {
+                    self.over_limit += 1;
+                }
+            }
+            panes.push(row);
+        }
+        let count = |state: &str| panes.iter().filter(|p| p["state"] == state).count();
+        self.out["summary"] = json!({
+            "reporting": count("reporting"),
+            "stale": count("stale"),
+            "no_report": count(NO_REPORT),
+            "not_injected": count("not_injected"),
+            "user_disabled": count("user_disabled"),
+        });
+        self.out["panes"] = Value::Array(panes);
+        self
+    }
 }
 
 /// `tako mod`（status）の UI スレッドの段（#1891。**子プロセスもファイルも触らない** = ui.json・skills の
 /// 読みと報告の無い claude の調べは背景の段）。`lang` は応答の文の言語（#2365。`tako mod` は表示言語、
 /// 枠が日本語の `tako check-health` は日本語を渡す = 1 つの出力に日英を混ぜない）
 pub fn status_ctx(host: &dyn ControlHost, lang: Lang) -> Result<StatusCtx, DispatchError> {
+    let ctx = status_seed(host, lang)?;
+    // #2663 の A/B: 修正前と同じく準備の段（UI スレッド）で全ペインの画面を採る
+    Ok(if core::offload_legacy() {
+        ctx.with_screens()
+    } else {
+        ctx
+    })
+}
+
+/// [`status_ctx`] の写し（#2663）。**端末のロックもファイルも子プロセスも触らない** = 行の材料と画面の手まで
+fn status_seed(host: &dyn ControlHost, lang: Lang) -> Result<StatusCtx, DispatchError> {
     let hub = hub(host)?;
     let now = Instant::now();
     let injection = hub.decide(core::ab_off());
-    let legacy = core::no_report_legacy();
-    let mut panes = Vec::new();
-    let mut probes = Vec::new();
-    let mut over_limit = 0;
+    let mut rows = Vec::new();
     for tab in host.workspace().tabs() {
         for pane in tab.tree().panes() {
             let id = pane.id();
-            let on_screen = host.session(id).is_some_and(|s| {
-                !matches!(
-                    crate::claude_tui::detect(&s.visible_lines()),
-                    crate::claude_tui::ClaudeScreen::Unknown
-                )
+            let session = host.session(id);
+            rows.push(RowSeed {
+                facts: pane_row(hub, id, pane.title(), now, lang),
+                chat: hub
+                    .reports
+                    .contains_key(&id.as_u64())
+                    .then(|| chat_owner_json(host, id, now)),
+                screen: session.map(tako_core::TerminalSession::access),
+                probe: crate::agent_resume::PaneProbe {
+                    pane: id.as_u64(),
+                    backend: host.backend_session(id),
+                    pty_pid: session.and_then(|s| s.child_pid()),
+                },
             });
-            let mut row = pane_row(hub, id, pane.title(), on_screen, now, lang);
-            // #1964: GUI モードでこのペインのチャットを誰が出すか（mod が描いている組は report.renders.chat）
-            if hub.reports.contains_key(&id.as_u64()) {
-                row["chat"] = chat_owner_json(host, id, now);
-            }
-            // #1891: 報告の無い claude は背景の段で調べる（上限まで。A/B は調べない）
-            if row["state"] == NO_REPORT && !legacy {
-                if probes.len() < core::NO_REPORT_PROBE_LIMIT {
-                    probes.push(crate::agent_resume::PaneProbe {
-                        pane: id.as_u64(),
-                        backend: host.backend_session(id),
-                        pty_pid: host.session(id).and_then(|s| s.child_pid()),
-                    });
-                } else {
-                    over_limit += 1;
-                }
-            }
-            panes.push(row);
         }
     }
-    let count = |state: &str| panes.iter().filter(|p| p["state"] == state).count();
-    let summary = json!({
-        "reporting": count("reporting"),
-        "stale": count("stale"),
-        "no_report": count(NO_REPORT),
-        "not_injected": count("not_injected"),
-        "user_disabled": count("user_disabled"),
-    });
     let out = json!({
         "enabled": hub.enabled,
         "injecting": injection.is_on(),
@@ -887,14 +1129,15 @@ pub fn status_ctx(host: &dyn ControlHost, lang: Lang) -> Result<StatusCtx, Dispa
         "min_claude_version": core::MIN_CLAUDE_VERSION,
         "mod_version": env!("CARGO_PKG_VERSION"),
         "fresh_for_ms": core::FRESH_FOR.as_millis() as u64,
-        "summary": summary,
+        // 行と要約は画面の採取の後（[`StatusCtx::with_screens`]。キーの並びはここで決まる）
+        "summary": Value::Null,
         // #1960: 定型の UI 設定（詳細と変更は `tako mod ui`。読むのは背景の段 = finish_status）
         "ui": Value::Null,
         // S7-1（#1959）: 設定 dir ごとの skills/tako（読むのは背景の段 = finish_status）
         "skills": Value::Null,
         // #1891: 報告の無い claude を調べたか（finish_status が埋める）
         "no_report_probe": Value::Null,
-        "panes": panes,
+        "panes": Value::Null,
     });
     Ok(StatusCtx {
         out,
@@ -903,9 +1146,10 @@ pub fn status_ctx(host: &dyn ControlHost, lang: Lang) -> Result<StatusCtx, Dispa
         claude_version: hub.claude_version.clone(),
         enabled: hub.enabled,
         plugin_dir: hub.plugin_dir.clone(),
-        probes,
-        over_limit,
+        probes: Vec::new(),
+        over_limit: 0,
         lang,
+        rows: Some(rows),
     })
 }
 
@@ -999,6 +1243,8 @@ fn finish_status(ctx: StatusCtx, evidence: Option<&HashMap<u64, core::NoReportEv
 /// 背景の段（[`StatusCtx`] の続き）。報告の無い claude を調べてから仕上げる。**UI スレッドで呼ばない**
 /// （`OffloadJob::ModStatus` と `tako check-health` の背景の段が呼ぶ）
 pub fn finish_status_in_background(ctx: StatusCtx) -> Value {
+    // #2663: 画面の採取（端末のロック）もここ（背景の段）。調べるペインは採取の後で決まる
+    let ctx = ctx.with_screens();
     let evidence = probe_no_report(&ctx);
     finish_status(ctx, evidence.as_ref())
 }
@@ -1007,9 +1253,67 @@ pub fn finish_status_in_background(ctx: StatusCtx) -> Value {
 /// 実プロセスは調べない（UI スレッドで走りうるので）= 報告の無いペインの理由は候補を並べた文
 fn status(host: &dyn ControlHost) -> Result<Value, DispatchError> {
     Ok(finish_status(
-        status_ctx(host, tako_core::i18n::lang())?,
+        status_ctx(host, tako_core::i18n::lang())?.with_screens(),
         None,
     ))
+}
+
+/// `tako mod on|off|band-on|band-off` の UI スレッドの段（#2663）。設定の切り替え（on / off）は host を
+/// 変えるのでここで行い、応答の status は行の材料まで写す。帯の ui.json の書き込みと status の仕上げ
+/// （画面の採取・ui.json と skills の読み）は [`ActionJob::run`]（IPC では background）
+pub fn action_prepare(
+    host: &mut dyn ControlHost,
+    action: &str,
+) -> Result<ActionJob, DispatchError> {
+    let lang = tako_core::i18n::lang();
+    match action {
+        "on" | "off" => {
+            host.set_claude_mod_enabled(action == "on")
+                .map_err(DispatchError::Operation)?;
+            Ok(ActionJob {
+                status: status_ctx(host, lang)?,
+                band_hidden: None,
+                applies_to: ModText::AppliesToOnOff,
+            })
+        }
+        _ => {
+            hub(host)?;
+            let path = ui_path(host)?;
+            Ok(ActionJob {
+                status: status_ctx(host, lang)?,
+                band_hidden: Some((path, action == "band-off")),
+                applies_to: ModText::AppliesToBand,
+            })
+        }
+    }
+}
+
+/// `tako mod on|off|band-*` の続き（#2663。[`action_prepare`] の後。IPC では background）
+pub struct ActionJob {
+    status: StatusCtx,
+    /// 帯の切り替え: ui.json の置き場と書く `band.hidden`
+    band_hidden: Option<(std::path::PathBuf, bool)>,
+    applies_to: ModText,
+}
+
+impl ActionJob {
+    /// 帯なら ui.json を書いてから、status を仕上げて応答する（同期の腕と同じく実プロセスは調べない）
+    pub fn run(self) -> Result<Value, DispatchError> {
+        if let Some((path, hidden)) = &self.band_hidden {
+            // #1960: 正本は ui.json の band.hidden（`tako mod ui set band.hidden` と同じ 1 実装）
+            let request = tako_core::claude_mod_ui::UiRequest {
+                op: Some("set".into()),
+                key: Some("band.hidden".into()),
+                value: Some(json!(hidden)),
+                ..Default::default()
+            };
+            crate::claude_mod_ui::run(path, &request).map_err(ui_error)?;
+        }
+        let lang = self.status.lang;
+        let mut out = finish_status(self.status.with_screens(), None);
+        out["applies_to"] = json!(self.applies_to.text_in(lang));
+        Ok(out)
+    }
 }
 
 // --- `tako check-health` の mod の項目（#1891） -------------------------------------
@@ -1755,12 +2059,12 @@ mod tests {
         hub.accept(1, report("busy"), now);
         hub.accept(4, report("idle"), now - Duration::from_secs(60));
 
-        let row = pane_row(&hub, PaneId::from_raw(1), None, true, now, Lang::Ja);
+        let row = pane_row(&hub, PaneId::from_raw(1), None, now, Lang::Ja).row(true, Lang::Ja);
         assert_eq!(row["state"], "reporting");
         assert_eq!(row["report"]["turn"], "busy");
         assert_eq!(row["report"]["context"]["percent"], 10);
 
-        let row = pane_row(&hub, PaneId::from_raw(2), None, true, now, Lang::Ja);
+        let row = pane_row(&hub, PaneId::from_raw(2), None, now, Lang::Ja).row(true, Lang::Ja);
         assert_eq!(row["state"], "no_report");
         assert_eq!(row["reason"]["code"], "mod_absent");
         // #1891: 行を組む段（UI スレッド）では材料が無い = 候補を並べた文
@@ -1769,21 +2073,21 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("--safe-mode"));
-        let row = pane_row(&hub, PaneId::from_raw(2), None, false, now, Lang::Ja);
+        let row = pane_row(&hub, PaneId::from_raw(2), None, now, Lang::Ja).row(false, Lang::Ja);
         assert_eq!(
             row["state"], "waiting",
             "claude が居ないペインは理由を出さない"
         );
 
-        let row = pane_row(&hub, PaneId::from_raw(3), None, true, now, Lang::Ja);
+        let row = pane_row(&hub, PaneId::from_raw(3), None, now, Lang::Ja).row(true, Lang::Ja);
         assert_eq!(row["state"], "not_injected");
         assert_eq!(row["reason"]["code"], "disabled");
 
-        let row = pane_row(&hub, PaneId::from_raw(4), None, true, now, Lang::Ja);
+        let row = pane_row(&hub, PaneId::from_raw(4), None, now, Lang::Ja).row(true, Lang::Ja);
         assert_eq!(row["state"], "stale");
         assert_eq!(row["reason"]["code"], "mod_stale");
 
-        let row = pane_row(&hub, PaneId::from_raw(9), None, false, now, Lang::Ja);
+        let row = pane_row(&hub, PaneId::from_raw(9), None, now, Lang::Ja).row(false, Lang::Ja);
         assert_eq!(row["state"], "unknown");
     }
 
@@ -1792,7 +2096,7 @@ mod tests {
     /// 4 ペイン（1 = --safe-mode / 2 = 注入前の claude / 3 = tako mod off / 4 = 報告あり）の材料
     fn status_ctx_1891(hub: &ModHub, now: Instant) -> StatusCtx {
         let rows: Vec<Value> = (1..=4)
-            .map(|p| pane_row(hub, PaneId::from_raw(p), None, true, now, Lang::Ja))
+            .map(|p| pane_row(hub, PaneId::from_raw(p), None, now, Lang::Ja).row(true, Lang::Ja))
             .collect();
         StatusCtx {
             ui_path: None,
@@ -1815,6 +2119,7 @@ mod tests {
             probes: Vec::new(),
             over_limit: 0,
             lang: Lang::Ja,
+            rows: None,
         }
     }
 

@@ -220,7 +220,8 @@ fn scan_owner(s: &Sources) -> Vec<String> {
         ),
         None => out.push(report(CONTROL, 1, "chat_owner が見つからない（走査が空振り）")),
     }
-    match window(&s.control, "fn band_view(", "}") {
+    // #2663: 帯の材料を組むのは写しの段（`band_seed`。UI スレッド）
+    match window(&s.control, "fn band_seed(", "}") {
         Some(w) => needs(
             &mut out,
             CONTROL,
@@ -228,11 +229,12 @@ fn scan_owner(s: &Sources) -> Vec<String> {
             &["ui_mode_gui: host.ui_mode().is_gui()", "chat_legacy: core::chat_legacy()"],
             "応答の view.chat は表示モードと A/B から組む（ターミナル表示の利用者に吹き出しを出さない）",
         ),
-        None => out.push(report(CONTROL, 1, "band_view が見つからない（走査が空振り）")),
+        None => out.push(report(CONTROL, 1, "band_seed が見つからない（走査が空振り）")),
     }
     if !s
         .control
-        .contains("row[\"chat\"] = chat_owner_json(host, id, now);")
+        // #2663: 行の材料（`status_seed`）で写し、画面の採取の後に行へ載せる
+        .contains(".then(|| chat_owner_json(host, id, now))")
     {
         out.push(report(
             CONTROL,
@@ -603,8 +605,8 @@ fn 逆戻りを名指しできる() {
     let found = mutate(&|s| {
         replace_once(
             &mut s.control,
-            "        ui_mode_gui: host.ui_mode().is_gui(),\n        chat_legacy",
-            "        ui_mode_gui: true,\n        chat_legacy",
+            "            ui_mode_gui: host.ui_mode().is_gui(),\n            chat_legacy",
+            "            ui_mode_gui: true,\n            chat_legacy",
         );
     });
     assert_named(&found, CONTROL, "ui_mode_gui: host.ui_mode().is_gui()");

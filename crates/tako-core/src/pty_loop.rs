@@ -65,6 +65,26 @@ const READ_BUFFER_SIZE: usize = 0x10_0000;
 /// 1 回のロック中に処理する最大バイト数（upstream の `MAX_LOCKED_READ`）
 const MAX_LOCKED_READ: usize = u16::MAX as usize;
 
+/// 検証用の注入（#2663）: 読み手がロックを取って受け取った分を parse したあと、ロックを持ったまま
+/// この ms だけ止まる（CPU の混雑で読み手が待たされた形）。UI スレッドの外で画面を採る経路が
+/// 待ちを吸うかを実経路で確かめるためのもの。**検証プロセス（`TAKO_ISOLATED` 等）でだけ効く**
+pub const INJECT_HOLD_ENV: &str = "TAKO_2663_INJECT_HOLD_MS";
+
+/// [`INJECT_HOLD_ENV`] の値（検証プロセスでなければ常に None）
+fn inject_hold() -> Option<Duration> {
+    static HOLD: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *HOLD.get_or_init(|| {
+        if !crate::paths::is_verification_process() {
+            return None;
+        }
+        std::env::var(INJECT_HOLD_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+    })
+}
+
 /// 子の終了を観測してから PTY を読み切るときの「静かになった」判定（#1628）。
 /// この窓のあいだ 1 バイトも来なければ、もう来ないとみなす
 const EXIT_DRAIN_QUIET: Duration = Duration::from_millis(50);
@@ -481,6 +501,9 @@ where
 
             // 受け取ったバイト列をパースする
             state.parser.advance(&mut **terminal, &buf[..unprocessed]);
+            if let Some(hold) = inject_hold() {
+                std::thread::sleep(hold);
+            }
 
             processed += unprocessed;
             unprocessed = 0;

@@ -451,23 +451,24 @@ fn scan_status_bar(s: &Sources) -> Vec<String> {
             "status_bar_owner が見つからない（走査が空振り）",
         )),
     }
-    match window(&s.control, "fn band_view(", "}") {
-        Some(w) => {
-            for need in ["s7_legacy: core::s7_legacy()", "core::screen_shows_usage("] {
-                if !w.1.contains(need) {
-                    out.push(report(
-                        CONTROL,
-                        w.0,
-                        &format!("band_view に `{need}` が無い（A/B と画面の読み取りをバーの判断へ渡す）"),
-                    ));
-                }
-            }
+    // #2663: 帯の材料は写し（`band_seed` = UI スレッド。A/B を渡す）→ 仕上げ（`impl BandSeed` = 画面の読み取り）の 2 段
+    for (open, need) in [
+        ("fn band_seed(", "s7_legacy: core::s7_legacy()"),
+        ("impl BandSeed {", "core::screen_shows_usage("),
+    ] {
+        match window(&s.control, open, "}") {
+            Some(w) if !w.1.contains(need) => out.push(report(
+                CONTROL,
+                w.0,
+                &format!("帯の材料（`{open}`）に `{need}` が無い（A/B と画面の読み取りをバーの判断へ渡す）"),
+            )),
+            Some(_) => {}
+            None => out.push(report(
+                CONTROL,
+                1,
+                &format!("`{open}` が見つからない（走査が空振り）"),
+            )),
         }
-        None => out.push(report(
-            CONTROL,
-            1,
-            "band_view が見つからない（走査が空振り）",
-        )),
     }
     for (file, src) in &s.others {
         for (i, line) in src.lines().enumerate() {

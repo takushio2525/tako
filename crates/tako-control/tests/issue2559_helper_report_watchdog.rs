@@ -15,8 +15,9 @@
 //!    `spawn_claude` はその起動形を使い、ほかに `Command::new` を置かない
 //! 2. mod の起床条件（`register.ts` の `wake` が `$.env.get` で読む env）がすべて `HELPER_DROP_ENV` にある
 //!    （mod が新しい env で起きるようになったら、補助の子からも外す）
-//! 3. 受ける側: `accept_report` が送り主の居場所（`report_origin_of`）を、帯のトグルの取り込み
-//!    （`import_band`）と記録（`.accept(`）より前に見る
+//! 3. 受ける側: `accept_report` が送り主の居場所（`report_origin_of`）を、取り込む帯の決定
+//!    （`parsed.band`）と記録（`.accept(`）より前に見て、補助の報告には ui.json に触らない続き
+//!    （`ui: None`）を返す（#2663 で帯のトグルの取り込みは続きの段 `ReportJob::run` へ移った）
 //! 4. CLI の `tako mod report` が自分の祖先（`report_ancestry()`）を添える
 //!
 //! # 見逃す側へ倒れないための作り
@@ -239,10 +240,22 @@ fn scan_accept(src: &str) -> Vec<Offender> {
         return out;
     };
     let origin = code_pos(&window, "report_origin_of(host, ancestry)");
-    let band = code_pos(&window, "import_band(");
+    // #2663: 取り込み（`import_band`）は続きの段。受け口で決めるのは取り込む帯（`parsed.band`）だけ
+    let band = code_pos(&window, "parsed.band");
     let store = code_pos(&window, ".accept(pane_id");
     match (origin, band, store) {
-        (Some(o), Some(b), Some(s)) if o < b && o < s => {}
+        (Some(o), Some(b), Some(s)) if o < b && o < s => {
+            // 補助の報告の早期の戻り（居場所の判定から記録までの間）は ui.json に触らない続きを返す
+            let early: Vec<&str> = window.lines().skip(o).take(s - o).collect();
+            if !early.iter().any(|l| l.contains("ui: None")) {
+                out.push(Offender {
+                    file: CONTROL_MOD,
+                    line: at + o,
+                    why: "補助の報告の続きが ui.json に触りうる（帯の取り込み・置き場の読みを止めていない = `ui: None` が無い。#2559 / #2663）"
+                        .into(),
+                });
+            }
+        }
         (None, _, _) => out.push(Offender {
             file: CONTROL_MOD,
             line: at,

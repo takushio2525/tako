@@ -6207,6 +6207,13 @@ pub enum OffloadJob {
     ModStatus {
         ctx: Box<crate::claude_mod::StatusCtx>,
     },
+    /// mod の報告の続き（#2663）。受け付けと材料の写しは準備の段（UI スレッド）で済み、ここで帯のトグルの
+    /// ui.json への取り込みと読み・画面の採取・帯の組み立てを行う。`cards_place` / `chat_place` の写しは
+    /// 着地（[`OffloadContinuation::Mod`]）
+    ModReport(Box<crate::claude_mod::ReportJob>),
+    /// `tako mod on|off|band-*` の続き（#2663）。設定の切り替えは準備の段で済み、ここで帯の ui.json の
+    /// 書き込みと status の仕上げ（画面の採取・ui.json と skills の読み）を行う
+    ModAction(Box<crate::claude_mod::ActionJob>),
     /// ファイルツリーの git ステータス（#1009）。
     /// ルートの解決は UI スレッドで済ませ、`git` の実行だけをここへ出す
     TreeGitStatus {
@@ -6572,6 +6579,8 @@ pub enum OffloadContinuation {
     SpawnLaunch(Box<SpawnRecorded>),
     /// close の UI の段（#2657。[`close_place`]）。続きの記録は background（[`OffloadJob::CloseRecord`]）
     ClosePlace(Box<Request>),
+    /// `tako mod` の着地（#2663。[`crate::claude_mod::land`]）。報告で読んだ ui.json の置き場を hub へ写して応答する
+    Mod(Box<crate::claude_mod::Landing>),
 }
 
 impl OffloadContinuation {
@@ -6593,6 +6602,8 @@ impl OffloadContinuation {
             | Self::PreviewChangelogDiff(_)
             | Self::WorkerStatusSeed(_)
             | Self::SpawnLaunch(_) => false,
+            // #2663: 同期の腕の判定（`protocol::changes_layout` の `Request::Mod`）と同じ = 幾何に触らない
+            Self::Mod(_) => false,
             // #1510: 押す（ペインを開く・master を起こす）ときだけタブが増える
             Self::Welcome(landing) => landing.probe_for == WelcomeProbeFor::Next,
             // #2086: 同期の腕と同じ判定（返答だけが真 = master を起こすとタブが増える）
@@ -6676,6 +6687,7 @@ pub fn finish_offload(
         OffloadContinuation::ClosePlace(request) => {
             close_place(host, *request, origin).map(CloseRecord::finish)
         }
+        OffloadContinuation::Mod(landing) => crate::claude_mod::land(host, *landing),
     }
 }
 
@@ -6796,6 +6808,31 @@ pub fn prepare_offload(
             Some(
                 crate::claude_mod::status_ctx(host, tako_core::i18n::lang())
                     .map(|ctx| OffloadJob::ModStatus { ctx: Box::new(ctx) }),
+            )
+        }
+        // #2663: mod の報告（claude のターンごとに全ペインから来る）と on / off・帯の切り替えも、UI スレッドで
+        // 画面を採らない・ui.json を読み書きしない。ここ（UI）では受け付け・設定の切り替え・材料の写しまでを行い、
+        // 続きは background、`cards_place` / `chat_place` の写しは着地。A/B の `TAKO_2663_LEGACY=1` は
+        // 修正前と同じく `None` = 同期の腕
+        Request::Mod {
+            action: Some(action),
+            report,
+            pane,
+            ancestry,
+            ..
+        } if action == "report" && !tako_core::claude_mod::offload_legacy() => Some(
+            crate::claude_mod::accept_report(host, report.clone(), *pane, ancestry.as_deref())
+                .map(|job| OffloadJob::ModReport(Box::new(job))),
+        ),
+        Request::Mod {
+            action: Some(action),
+            ..
+        } if matches!(action.as_str(), "on" | "off" | "band-on" | "band-off")
+            && !tako_core::claude_mod::offload_legacy() =>
+        {
+            Some(
+                crate::claude_mod::action_prepare(host, action)
+                    .map(|job| OffloadJob::ModAction(Box::new(job))),
             )
         }
         // #1979: `tako list` の器の採り直し（`tmux list-windows -a`）を UI スレッドで待たない。
@@ -7314,6 +7351,14 @@ impl OffloadJob {
             }
             // #2657: 記録を書き終わってから応答する（close の応答の後に workers を読めば closed）
             OffloadJob::CloseRecord(record) => OffloadOutcome::Reply(Ok(record.finish())),
+            // #2663: 組み立ては background、置き場の写しは UI スレッドへ戻す（hub は UI スレッドのもの）
+            OffloadJob::ModReport(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::Mod(Box::new(job.run())))
+            }
+            // #2663: 設定を変えた着地で描き直す（同期の腕の後処理と同じ）ので UI スレッドへ戻す
+            OffloadJob::ModAction(job) => OffloadOutcome::OnUi(OffloadContinuation::Mod(Box::new(
+                crate::claude_mod::Landing::reply(job.run()),
+            ))),
             OffloadJob::LspGoto(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspGoto(Box::new(job.run())))
             }
@@ -7614,6 +7659,10 @@ impl OffloadJob {
             )),
             OffloadJob::ClosePlace(_) | OffloadJob::CloseRecord(_) => Err(DispatchError::Operation(
                 "close の段は run_staged で走らせる（ペインを閉じるのに UI スレッドの続きが要る）".into(),
+            )),
+            OffloadJob::ModReport(_) | OffloadJob::ModAction(_) => Err(DispatchError::Operation(
+                "tako mod の続きは run_staged で走らせる（置き場の写しと描き直しに UI スレッドの続きが要る）"
+                    .into(),
             )),
         }
     }
@@ -8268,6 +8317,11 @@ pub fn land_offload(
                 }
                 Err(e) => OffloadLanding::Done(Err(e)),
             }
+        }
+        // #2663: 置き場の写しだけ（UI）。修正前と同じタグで測る（perf.log の `dispatch:Mod` を続けて比べられる）
+        OffloadContinuation::Mod(landing) => {
+            let _span = crate::diag::perf_span("dispatch:Mod");
+            OffloadLanding::Done(crate::claude_mod::land(host, *landing))
         }
         other => OffloadLanding::Done(finish_offload(host, other, origin)),
     }
@@ -58257,23 +58311,280 @@ tako | pane 2 [ compact ]       [-]
     fn issue1881_ab_と終わったセッションには帯の材料を載せない() {
         let host = MockHost::new();
         let pane = PaneId::from_raw(host.root_pane());
-        let on = crate::claude_mod::snapshot(
-            &host,
-            pane,
-            tako_core::claude_mod::Accepted::Stored,
-            false,
-        );
+        // #2663: 写し（UI スレッドの段）→ 仕上げ（背景の段）を順に通す
+        let snapshot = |accepted, legacy| {
+            crate::claude_mod::snapshot(&host, pane, accepted, legacy).finish(Default::default())
+        };
+        let on = snapshot(tako_core::claude_mod::Accepted::Stored, false);
         assert!(on["view"].is_object(), "{on}");
-        let legacy =
-            crate::claude_mod::snapshot(&host, pane, tako_core::claude_mod::Accepted::Stored, true);
+        let legacy = snapshot(tako_core::claude_mod::Accepted::Stored, true);
         assert!(legacy.get("view").is_none(), "{legacy}");
         assert_eq!(
             legacy["mod_enabled"], on["mod_enabled"],
             "S1 の中身はそのまま"
         );
-        let ended =
-            crate::claude_mod::snapshot(&host, pane, tako_core::claude_mod::Accepted::Ended, false);
+        let ended = snapshot(tako_core::claude_mod::Accepted::Ended, false);
         assert!(ended.get("view").is_none());
+    }
+
+    /// #2663: IPC の受け口と同じ 3 段（準備 = UI スレッド → 続き = background → 着地 = UI スレッド）を順に通す
+    fn issue2663_staged(host: &mut MockHost, request: Request) -> Result<Value, DispatchError> {
+        let job = match prepare_offload(host, &request) {
+            Some(Ok(job)) => job,
+            Some(Err(e)) => return Err(e),
+            None => panic!("#2663: {} が段分けされていない", request.kind_name()),
+        };
+        match job.run_staged() {
+            OffloadOutcome::Reply(result) => result,
+            OffloadOutcome::OnUi(next) => match land_offload(host, next, PaneOrigin::Cli) {
+                OffloadLanding::Done(result) => result,
+                _ => panic!("#2663: tako mod の着地はもう一巡しない"),
+            },
+        }
+    }
+
+    /// 時刻・置き場・ペイン ID（プロセス全体の通し番号）で揺れる値を揃える（同じ手順を 2 つのホストで流して比べるため）
+    fn issue2663_normalize(value: &mut Value, ids: &[(u64, &str)]) {
+        let label = |id: u64| ids.iter().find(|(i, _)| *i == id).map(|(_, l)| *l);
+        match value {
+            Value::Object(map) => {
+                for key in ["age_ms", "last_age_ms", "path"] {
+                    map.shift_remove(key);
+                }
+                for (key, v) in map.iter_mut() {
+                    match v.as_u64() {
+                        Some(id) if key == "pane" && label(id).is_some() => *v = json!(label(id)),
+                        // 帯の切り替えが書く壁時計の時刻（epoch ms）
+                        Some(ms) if ms > 1_000_000_000_000 => *v = json!("epoch_ms"),
+                        _ => issue2663_normalize(v, ids),
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|v| issue2663_normalize(v, ids)),
+            // 名前の無い worker の表示名（`pane N`）。断りの文の中の番号には当てない
+            Value::String(text) => {
+                if let Some((_, l)) = ids.iter().find(|(id, _)| *text == format!("pane {id}")) {
+                    *text = format!("pane {l}");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 同じ手順（worker の報告・置き場の変更・帯のトグルの取り込みつきの master の報告・ended・status・
+    /// 帯の切り替え・on / off・断り）を流し、応答・hub・ui.json を返す
+    fn issue2663_script(staged: bool) -> (Vec<Value>, Value, Vec<Value>) {
+        let mut host = MockHost::new();
+        let (_tab, master) = layout_with_workers(&mut host, 2);
+        let master = master.as_u64();
+        let mut workers: Vec<u64> = host
+            .ws
+            .workers_of(PaneId::from_raw(master))
+            .iter()
+            .map(|p| p.id().as_u64())
+            .collect();
+        workers.sort_unstable();
+        let ids = [(master, "M"), (workers[0], "W0"), (workers[1], "W1")];
+        let run = |host: &mut MockHost, request: Request| {
+            let result = if staged {
+                issue2663_staged(host, request)
+            } else {
+                dispatch(host, request, PaneOrigin::Cli)
+            };
+            let mut out = result.unwrap_or_else(|e| json!({ "error": e.to_string() }));
+            issue2663_normalize(&mut out, &ids);
+            out
+        };
+        let mut outs = vec![run(
+            &mut host,
+            mod_request(
+                "report",
+                Some(mod_report_body("permission")),
+                Some(workers[1]),
+            ),
+        )];
+        // ui.json の置き場の変更（同期の口のまま）→ 報告で hub へ写る
+        dispatch(
+            &mut host,
+            mod_ui_request(json!({"op": "set", "key": "cards.place", "value": "tako"})),
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let mut body = mod_report_body("busy");
+        body["band"] = json!({"hidden": true, "shown": false, "toggled_at": 7});
+        outs.push(run(
+            &mut host,
+            mod_request("report", Some(body), Some(master)),
+        ));
+        let read_ui = |host: &MockHost| {
+            let mut ui: Value = std::fs::read_to_string(&host.mod_ui_path)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or(Value::Null);
+            issue2663_normalize(&mut ui, &ids);
+            ui
+        };
+        let mut uis = vec![read_ui(&host)];
+        let mut ended = mod_report_body("idle");
+        ended["ended"] = json!(true);
+        outs.push(run(
+            &mut host,
+            mod_request("report", Some(ended), Some(workers[0])),
+        ));
+        outs.push(run(&mut host, mod_request("status", None, None)));
+        outs.push(run(&mut host, mod_request("band-on", None, None)));
+        outs.push(run(&mut host, mod_request("off", None, None)));
+        outs.push(run(&mut host, mod_request("on", None, None)));
+        // 断り（居ないペイン・報告の本文なし）
+        outs.push(run(
+            &mut host,
+            mod_request("report", Some(mod_report_body("idle")), Some(999_999)),
+        ));
+        outs.push(run(&mut host, mod_request("report", None, Some(master))));
+        let hub = &host.claude_mod;
+        let mut reports: Vec<Value> = hub
+            .reports
+            .iter()
+            .map(|(pane, stored)| {
+                json!({
+                    "pane": pane,
+                    "count": stored.count,
+                    "report": serde_json::to_value(&stored.report).unwrap(),
+                })
+            })
+            .collect();
+        reports.sort_by_key(|r| r["pane"].as_u64());
+        reports
+            .iter_mut()
+            .for_each(|r| issue2663_normalize(r, &ids));
+        let hub = json!({
+            "enabled": hub.enabled,
+            "reports": reports,
+            "cards_place": tako_core::claude_mod_ui::Vocab::as_str(hub.cards_place),
+            "chat_place": tako_core::claude_mod_ui::Vocab::as_str(hub.chat_place),
+            "dormant": hub.dormant.len(),
+            "foreign": hub.foreign.len(),
+            "reported_config_dirs": hub.reported_config_dirs,
+        });
+        uis.push(read_ui(&host));
+        (outs, hub, uis)
+    }
+
+    /// #2663: 報告・status・on / off・帯の切り替えを 3 段へ分けても、応答（帯の `view` を含む）・hub の状態・
+    /// ui.json は同期の腕（A/B の `TAKO_2663_LEGACY=1` と同じ道）と一致する
+    #[test]
+    fn issue2663_段分けしても応答とhubとuijsonが同期の腕と一致する() {
+        let (sync_outs, sync_hub, sync_ui) = issue2663_script(false);
+        let (staged_outs, staged_hub, staged_ui) = issue2663_script(true);
+        for (i, (a, b)) in sync_outs.iter().zip(&staged_outs).enumerate() {
+            assert_eq!(a, b, "手順 {i} の応答が食い違う");
+        }
+        assert_eq!(sync_outs.len(), staged_outs.len());
+        assert_eq!(sync_hub, staged_hub, "hub の状態が食い違う");
+        assert_eq!(sync_ui, staged_ui, "ui.json が食い違う");
+        // 中身が空のまま一致していない（帯の材料・置き場の写し・帯の取り込み・断りが実際に起きている）
+        assert!(
+            staged_outs[1]["tako"]["view"]["worker_count"] == 2,
+            "{}",
+            staged_outs[1]
+        );
+        assert_eq!(staged_hub["cards_place"], "tako", "{staged_hub}");
+        assert_eq!(staged_ui[0]["band"]["toggled_at"], 7, "{:?}", staged_ui);
+        assert_eq!(staged_ui[0]["band"]["hidden"], true, "{:?}", staged_ui);
+        assert_eq!(
+            staged_ui[1]["band"]["hidden"], false,
+            "band-on の書き込み: {:?}",
+            staged_ui
+        );
+        assert!(staged_outs[7]["error"].is_string(), "{}", staged_outs[7]);
+        assert!(staged_outs[8]["error"].is_string(), "{}", staged_outs[8]);
+    }
+
+    /// #2663: ペインの違う報告の続きは並行して走り、着地の順が読んだ順と入れ替わりうる。最後に hub に
+    /// 残る置き場は**後で読んだ** ui.json の値（UI スレッドで順に読んでいた修正前と同じ）
+    #[test]
+    fn issue2663_着地の順が入れ替わっても最後に残る置き場は後の読み() {
+        let mut host = MockHost::new();
+        let (_tab, master) = layout_with_workers(&mut host, 1);
+        let worker = host.ws.workers_of(master)[0].id().as_u64();
+        let continuation = |host: &mut MockHost, pane: u64| {
+            let request = mod_request("report", Some(mod_report_body("idle")), Some(pane));
+            match prepare_offload(host, &request) {
+                Some(Ok(job)) => match job.run_staged() {
+                    OffloadOutcome::OnUi(next) => next,
+                    OffloadOutcome::Reply(r) => panic!("着地へ戻らない: {r:?}"),
+                },
+                _ => panic!("段分けされていない"),
+            }
+        };
+        // 1 本目の続きは既定（auto）を読み、利用者が置き場を変えた後で 2 本目の続きが読む
+        let first = continuation(&mut host, master.as_u64());
+        for key in ["cards.place", "chat.place"] {
+            dispatch(
+                &mut host,
+                mod_ui_request(json!({"op": "set", "key": key, "value": "tako"})),
+                PaneOrigin::Cli,
+            )
+            .unwrap();
+        }
+        let second = continuation(&mut host, worker);
+        // background の終わりの順が入れ替わった = 2 本目 → 1 本目の順に着地する
+        for next in [second, first] {
+            match land_offload(&mut host, next, PaneOrigin::Cli) {
+                OffloadLanding::Done(result) => assert!(result.is_ok(), "{result:?}"),
+                _ => panic!("tako mod の着地はもう一巡しない"),
+            }
+        }
+        use tako_core::claude_mod_ui::Place;
+        assert_eq!(
+            host.claude_mod.cards_place,
+            Place::Tako,
+            "古い読みで上書きした"
+        );
+        assert_eq!(
+            host.claude_mod.chat_place,
+            Place::Tako,
+            "古い読みで上書きした"
+        );
+    }
+
+    /// #2663: 帯のトグルの取り込みは続きの段（並行しうる）。どの順・並行で走っても ui.json に残るのは
+    /// いちばん新しい `toggled_at` の値（`import_band` の時刻の比較 = 修正前と同じ最終値）
+    #[test]
+    fn issue2663_帯のトグルの取り込みが並行しても新しい時刻の値が残る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        // 時刻 10..=17 の報告を受け付けて、続きを古い順の逆・並行で走らせる（いちばん新しい 17 は隠さない）
+        let mut jobs: Vec<OffloadJob> = (10..=17u64)
+            .map(|at| {
+                let mut body = mod_report_body("idle");
+                body["band"] = json!({"hidden": at != 17, "shown": at == 17, "toggled_at": at});
+                match prepare_offload(&mut host, &mod_request("report", Some(body), Some(pane))) {
+                    Some(Ok(job)) => job,
+                    _ => panic!("段分けされていない"),
+                }
+            })
+            .collect();
+        jobs.reverse();
+        let landed: Vec<OffloadOutcome> = std::thread::scope(|scope| {
+            let handles: Vec<_> = jobs
+                .into_iter()
+                .map(|job| scope.spawn(move || job.run_staged()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for outcome in landed {
+            match outcome {
+                OffloadOutcome::OnUi(next) => {
+                    let _ = land_offload(&mut host, next, PaneOrigin::Cli);
+                }
+                OffloadOutcome::Reply(r) => panic!("着地へ戻らない: {r:?}"),
+            }
+        }
+        let ui: Value =
+            serde_json::from_str(&std::fs::read_to_string(&host.mod_ui_path).unwrap()).unwrap();
+        assert_eq!(ui["band"]["toggled_at"], 17, "{ui}");
+        assert_eq!(ui["band"]["hidden"], false, "{ui}");
     }
 
     fn mod_ui_request(ui: Value) -> Request {

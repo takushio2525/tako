@@ -277,6 +277,11 @@ D は双方向にできず掃除の責務が増えるので採らない。
 - **当面（S1〜S5）**: `tako mod report` の応答に tako 側のスナップショット（このペインの名前・
   タブ・worker の要約・tako 側の設定）を載せて返す。mod は報告のたびに最新を受け取る。
   アイドル中も 15 秒の heartbeat で更新される
+- **#2663**: 報告は claude のターンごとに全ペインから来るので、応答の組み立ては GUI のメインスレッドで
+  端末のロックも ui.json も待たない。UI スレッドの段（`accept_report`）は受け付けと材料・画面の手
+  （`PaneAccess`）の写しまで、帯のトグルの取り込みと ui.json の読み・画面の採取・帯の組み立ては続きの段
+  （`ReportJob::run` = IPC では background）、`cards_place` / `chat_place` の hub への写しは着地（読んだ順の
+  通し番号が新しいときだけ = `ModHub::copy_places`）。応答の中身は修正前と同じ（FR-2.42.56）
 - **常時 push が要る機能**（チャット入力を `$.prompt.submit` で送る・権限ダイアログへ
   mod 経由で答える・tako から `/compact` を頼む 等）は S6 で別設計にする。候補は
   `$.process.spawn([tako, "mod", "watch"])` の長命な子 + 長ポーリングの dispatch。
@@ -637,7 +642,8 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
   （#1892。前回合格した claude の版と比べて「Claude Code の更新で壊れた」かを出し分ける）
   - **#1891 で着地**（S1 では `tako mod` だけだった）: `check-health` の `claude_mod` 節は `tako mod --json` と
     同じキー・同じ値で、判定は `tako mod`（status）の 2 段（UI スレッドの `status_ctx` → 背景の
-    `finish_status_in_background`）から写すだけ（FR-2.42.54）。報告の無いペインの理由は候補の羅列をやめ、
+    `finish_status_in_background`）から写すだけ（FR-2.42.54）。#2663 から全ペインの画面の採取も背景の段
+    （`StatusCtx::with_screens`）で、UI スレッドの段は行の材料と画面の手を写すだけ。報告の無いペインの理由は候補の羅列をやめ、
     背景の段がペインの claude のコマンド行と起動時の env を調べて 1 つに決める（`reason.cause` =
     `safe_mode` / `bare` / `before_injection` / `not_loaded` / `undetermined`。上限 8 ペイン・macOS だけ）。
     10/9 の実測（GUI 再起動直後の既存ペインがすべて 5 択）は env に印が無いので `before_injection` になる。
