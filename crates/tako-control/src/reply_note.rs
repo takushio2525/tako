@@ -1567,11 +1567,15 @@ impl ReplyNote {
                     title,
                 },
                 En,
-            // 「約」の代わりの `~` は数字に付けて右へ寄せる（列の幅は英語の行どうしで揃う）
-            ) => format!(
-                "{topic:<16} {bytes:>6} bytes / {:>6} tok  {title}",
-                format!("~{est_tokens}")
-            ),
+            ) => {
+                // 「約」の代わりの概数の印は数字に付けて右へ寄せる（列の幅は英語の行どうしで揃う）。
+                // ホームの短縮（`paths::shorten_home`）とは別物なので印は定数で持つ
+                const APPROX: char = '~';
+                format!(
+                    "{topic:<16} {bytes:>6} bytes / {:>6} tok  {title}",
+                    format!("{APPROX}{est_tokens}")
+                )
+            }
             (Self::SessionResumed { pane, head, cwd }, Ja) => {
                 format!("復元しました: ペイン {pane}（session {head}…, cwd {cwd}）")
             }
