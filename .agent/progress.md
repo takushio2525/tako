@@ -20,40 +20,6 @@
 
 ---
 
-## 2026-11-01（#2625: 器のペインを閉じるたびに器の tmux サーバー全体が約 600ms 止まっていた（tty の最後の close がサーバーの中で読まれない出力を抱えて待つ。tako のメインスレッドは止まっていない）→ 器のペインの端末は閉じるときに PTY のスレッドが attach クライアントへ SIGHUP を送り、子の側が全部閉じるまで親側を読み捨ててから閉じる・A/B `TAKO_2625_LEGACY=1`）
-- 閉じた後の外からの `tmux ls` 593〜607ms → 6〜10ms・器が消えるまで 633〜654ms → 24〜50ms・fd / 子 / ゾンビ・終了と復元・直接ペインは同じ・番犬 4 件・カタログ +0 B。PR #2629
-- 18:45 に `70faa47` を install・GUI 再起動（画面ロック中・remote daemon は replaced-generation）。本番の `tmux -L tako ls` が閉じた後 598ms → 49ms の本番確認で #2625 を閉じた
-
-## 2026-11-01（#2624: 段 1 で setup（CLI / MCP）は serve 以外に tailscale を書き換えないと確認（up / login / set / funnel なし）→ 門の外の 3 経路（stop の後始末・対話 setup の brew 導入・QR のビューア）と Windows の本物の置き場を #2619 の門 `allows_op` へ通す（A/B `TAKO_2624_LEGACY=1`・③ の自動復帰は画面ロック中に確かめられず見送り））
-- 偽の tailscale / brew / open の記録で修正前 6 / 1 / 1 回 → 修正後 0 / 0 / 0 回、opt-in・A/B・本番の経路は従来どおり、両ノードの serve status は前後一致・番犬が注入 9 通りを file:line で名指し・カタログ +0 B。PR #2632
-
-## 2026-11-01（#1721: 狭いペインで claude が背景作業の申告を折り返し、mod なしの worker が `busy / agents-auto / idle_override_blocked: null` のままだった → 折り返しをつないで読み、入力欄の直前の申告に限る・読めず状態行が切れていれば `status_line_truncated`・A/B `TAKO_1721_LEGACY=1`）
-- 実 GUI の 36 / 24 桁で修正前 busy → 修正後 idle（生成中は busy のまま）・mod の経路は修正前から idle・番犬が注入 4 通りを file:line で名指し・カタログ +0 B。PR #2635
-
-## 2026-11-01（#2634: 器なしの `tako tmux open` のペインを閉じるたびに利用者の tmux サーバーが約 600ms 止まっていた → #2625 の印を器なしのビューにも立てる（`tmux_backend::hang_up_view_client_on_close`・A/B `TAKO_2634_LEGACY=1`）。GUI の終了は OS が親側を先に閉じるので止まらず変えない）
-- 隔離 GUI で修正前 592〜606ms → 修正後 6ms（5/5）・legacy 592〜607ms・終了は器 3 枚で 6〜9ms・器は残り再起動で戻る・番犬が注入 6 通りを file:line で名指し・カタログ +0 B。PR #2636
-
-## 2026-11-01（#2630: MCP `tako_remote_stop` / `tako_remote_status` と設定画面の停止・リモートタブの読み直しを `prepare_offload` → `OffloadJob::RemoteStop` / `RemoteStatus` で background へ（#1555 と同じ形・A/B `TAKO_2630_LEGACY=1`））
-- 注入 3 秒で `tako list` の待ち 2.7 / 5.6 / 5.6 秒 → 17 / 17 / 22ms・perf.log の専有 0・応答は A/B と一致・カタログ +0 B。PR #2637
-
-## 2026-11-01（#2633 (c): ログインシェルの問い合わせの打ち切りがグループへいきなり SIGKILL を送り、rc の `pyenv rehash` のロックを残していた → グループへ SIGTERM 1 回 → 猶予 1 秒 → 残りへ SIGKILL（刈り取り係・頭は判定まで刈らない）。A/B `TAKO_2633_LEGACY=1`・番犬 `issue2633_probe_group_term_watchdog`）
-- 実経路で修正前 5/5 → 修正後 0/5、連鎖（後続の問い合わせの打ち切り）11/11 → 5/11。呼び手が返る時刻は同じ・カタログ +0 B。(a) は直さない（master が [提案] Issue へ）。PR #2642
-
-## 2026-11-01（#1675: `tako context-budget fix` がアーカイブ済みのまま作業ログへ戻ったエントリを、#1645 の `revivals` の判定を共有して予算計算の前に落とし 1 回で収束するようにした。同じ見出しで本文の違うものは触らない・check は直るものを `fixable` / `revived_fixable` へ数えて `next_step` に fix）
-- 修正前は予算内の二重で fix が「変更なし」のまま → 修正後 1 回目で 4→3 件・2 回目はバイト一致・二重でない 3 素材は修正前と出力・書き込みが一致（check --json に欄 1 つ）・カタログ +0 B。PR #2641
-
-## 2026-11-01（#2639: `tako_orchestrator_respond` の 400ms の正体は `respond_via` の固定の sleep → 届き方の解決（`respond_access`）だけ UI スレッドで行い `OffloadJob::OrchestratorRespond` で background から応答（錠で 1 本ずつ・チャット表示の承認カードも同じ口・A/B `TAKO_2639_LEGACY=1`））
-- 模擬 TUI で応答の間の `tako list` 308〜326 / 696〜766ms → 最長 17 / 20ms・perf.log の専有 0・応答と監査記録は A/B と一致・カタログ +0 B。PR #2643
-
-## 2026-11-02（#2644: issue2576 の番犬が全体並列の負荷で落ちる間欠 → 作りたての偽シェルの初回 exec（macOS の検査・手元 130〜390ms）が確かめの上限 5 秒の内側で払われていた。偽シェルを作ったその場で 1 回起こして終わるまで待ってから測る（上限は延ばさない））
-- 初回 exec を 6 秒にする注入で修正前は Issue と同じ `nu / Ja` の不明を含む FAILED → 修正後 8 / 8・同型の候補 4 本は同じ注入で全部 ok・カタログ +0 B。PR #2648
-
-## 2026-11-02（#2365 の続き: 読めないプロファイルの理由（#2256 の系統）を表示言語へ。芯 `UnreadableProfile`・知らせ `ProfileFallback` 5 種・`ConfigError` 3 種、利用者へ返す口は表示言語・persist.log は日本語。check-health の profiles 行も型の口へ）
-- 実経路（CLI + mcp_host の MCP）で英語表示の日本語入り 32/64 → 4/64（残りは projects add の枠）・日本語 56/64 sha256 一致（残り 8 は時刻と置き場だけ）・persist.log 一致・注入で名指し + E0004・カタログ +0 B。PR #2645
-
-## 2026-11-02（#2228 の 3.: cargo が作る偽 LSP サーバ・debug の tako の初回 exec の検査（大きさに比例・361ms / 1,763ms）が LSP の e2e の 10 秒の窓と issue2367 の窓を食っていた → `fake_exec::warm_binary` で時計の前に空打ち・テスト専用の実行ファイルは `enter_test_binary`・A/B `TAKO_2228_LEGACY=1`）
-- 注入 12 秒で修正前 FAILED 13 本 → 修正後 24 本 ok・issue2367 も FAILED → ok・番犬が逆戻り 2 種を file:line で名指し・カタログ +0 B。Issue の 1・2（tako-vd が要る）は残す。PR #2650
-
 ## 2026-11-02（#2646: orchestrator 系の dispatch（spawn の記録・台帳・状態照会の準備）が UI スレッドで YAML の読み書きと画面の採取を待っていた → 台帳は OffloadJob・状態照会は写し（UI）と解決 + 採取（background）・spawn は配置 / 記録 / 積み込みの 3 段（積むのは記録の後）。A/B `TAKO_2646_LEGACY=1`）
 - 段 1: spawn 52ms のうち 50ms が配置の後の記録と I/O・台帳 14 / 27ms が YAML。修正後は注入 1.5 秒の間も `tako list` 15〜35ms・専有 0 件（A/B 1.4〜1.8 秒）・応答と記録は一致・カタログ +0 B。PR #2649
 
@@ -73,3 +39,36 @@
 
 ## 2026-11-02（#2652: 夜間の footprint の 11/02 の起動 10.9 秒は 29 コミットの回帰ではなく計測の外れ値 → 起動の区間の混み具合を `startup_busy` / `startup_load1` に記録し、重なった夜は空くのを待って複製したバイナリで 1 回だけ測り直し、なお重なれば起動時間を比べず基準から外す・A/B `TAKO_2652_LEGACY=1`）
 - PR #2656
+
+## 2026-11-02（#2657: `dispatch:Close` が worker レジストリへの close の記録（YAML + fsync + 上限なしの flock）をメインスレッドで書いていた → UI の段 `close_place` と記録の段 `CloseRecord` に分け、IPC は background で書き終わってから応答・GUI の close は背景のスレッド・「セッション kill」の行は kill のスレッド・A/B `TAKO_2657_LEGACY=1`）
+- 注入 1.5 秒で close の間の `tako list` 1516〜1540ms → 20〜29ms・`dispatch:Close` の専有 5 → 0 件・ロック 1.5 秒の間も 20〜25ms・応答と記録は A/B と一致（85/85）・カタログ +0 B。PR #2660
+- 14:02 に install。以後の本番 perf.log の `専有: dispatch:Close` を数えて閉じる（#2657 は開けてある）
+
+## 2026-11-02（#2365 の続き: 既存ペインの SSH 化の断り `PaneSshBlock` を表示言語へ（`text_in` の網羅 match・`message` は GUI の表示言語）。`list` / MCP / `/api/v2/panes` の `can_ssh.note` と open-in remote / `tako_open_remote` / PWA の 409 の本文。daemon の 409 の読みは `PaneSshBlock::says_blocked`（目印 `target=split`）の 1 実装へ）
+- 隔離 GUI + 隔離 daemon の 29 ケースで英語表示の日本語入り 26 → 0・日本語は出力全体がバイト一致・ステータスの差 0（版ずれ 2 通りも 409）・注入 5 通りで名指し + E0004・カタログ +0 B。PR #2661
+
+## 2026-11-02（#2365 の続き: 会話の再起動の断り `RestartBlock`（12 種 + mode の分岐）・建て直しの失敗 `RelaunchFailure`（5 種）・リモートフォルダの自動接続の注記 `AutoTerminalSkip`（2 種）を表示言語へ。`text_in` の網羅 match・`message` / `note` は GUI の表示言語・「見つからない」は英語にも ` not found`）
+- 隔離 GUI の 89 ケース（偽 claude で建て直しの失敗・偽 ssh / sftp で remote-folder まで）で英語表示の日本語入り 89 → 0・日本語は出力全体がバイト一致・終了コード / isError / reason の差 0・注入で名指し + E0004 × 3・カタログ +0 B。PR #2667
+
+## 2026-11-02（#2663: tako mod の報告・status・on / off・帯の切り替えを 準備（UI）→ 続き（background = 画面の採取・ui.json）→ 着地（UI = 置き場の写し・番号の守り）へ分けた。A/B `TAKO_2663_LEGACY=1`）
+- 注入 50ms で perf.log の `dispatch:Mod` / `offload_prepare:Mod` の専有 修正前 9〜12 件 → 0 件・`tako lang` の最長 54〜133 → 14〜22ms・応答 / hub / ui.json は A/B と一致・カタログ +0 B。PR #2668
+- 17:46 に install。以後の本番 perf.log の `専有: dispatch:Mod` / `offload_prepare:Mod` を数えて閉じる（#2663 は開けてある）
+
+## 2026-11-02（#2365 の続き: orchestrator の設定の理由（作らなかった理由 `ProfileGen::Skipped` = `ConfigError` 2 種・adopt の断り `Reason` 2 種）と他モジュールが組む注記（adopt の警告・`profile_warnings`・`window_warning`・会話の再開と worker の MCP の `warnings` = `ReplyNote` 18 種）を型で返して表示言語へ。persist.log と移行の記録は日本語）
+- GUI 無しのホスト + CLI の 27 ケース（spawn / adopt / projects add / profiles / projects mcp / orchestrator resume / sessions resume）で英語表示の日本語入り 27 → 0・日本語は全出力と persist.log がバイト一致・終了コード / isError の差 0・注入で名指し + E0004 × 3・カタログ +0 B。PR #2670
+
+## 2026-11-02（#2665: UI ストールの分類の窓を「期限 → 記録」へ。期限より前に終わった区間を専有と名指さない・半分未満は内訳と残り・型 `StallCause` + 日英 `text_in`・A/B `TAKO_2665_LEGACY=1`・注入 `TAKO_2665_INJECT_FILE`・番犬 `issue2665_stall_window_watchdog`）
+- 隔離 GUI で ① 中 300 → 外 900 の記録 27 件で専有 0（A/B 32 件で 10）・② 1500ms 6/6 専有・③ 3000ms 中間報告 5/5・④ 内訳 10/10（A/B は外だけ 10/10）・カタログ +0 B。PR #2669
+
+## 2026-11-02（#2659: Windows の CI の `shell_integration_powershell` の間欠は同じプロセスのテストが 1 つの `tako.ps1` を書き直す共有違反（PSReadline は主因でない）→ テストごとの置き場・製品は共有違反だけ 0.5 秒まで読み直し読めなければ警告・同じ中身は書き直さない（A/B `TAKO_2659_LEGACY=1`））
+- Windows の CI で `shell_integration_powershell` 22 passed（注入 4 本が実シェルで通る）・修正前の 2 ファイルへ戻すと番犬 `issue2659_pwsh_script_share_watchdog` 5/5 FAILED・カタログ +0 B。PR #2671
+
+## 2026-11-02（#2666 段 1: 画面構成の変更（macOS の画面再構成）の begin / end を境界 B33 `platform::display_reconfig` で記録し、UI ストールの分類が遅延の間に窓「begin → end + 2 秒」が重なれば「画面構成の変更の処理中（OS / GPUI 側）」と名指す・計測区間の専有でも併記・A/B `TAKO_2666_LEGACY=1`）
+- 隔離 GUI の通知の合成で 24/24（A/B は「計測区間の外」）・番犬 `issue2666_display_reconfig_stall_watchdog`・カタログ +0 B。本番未確認（install 後に perf.log の再構成の行で）。PR #2672
+
+## 2026-11-02（#2365 の続き: orchestrator の応答の warnings の残り 3 つ = 引き継ぎの自動移行（`ReplyNote` 4 種 + 退避の `ConfigError` 3 種）・モデルの食い違い（`ReplyNote` 2 種。tako-core の日本語の口は外した）・spawn の事前信頼の失敗の `detail`（新しい `TrustWriteError` 12 種）を型で返して表示言語へ。persist.log・`tako migrate` の記録・stderr の診断は日本語）
+- GUI 無しのホスト + CLI の 17 ケースで英語表示の日本語入り 17 → 0・日本語は全出力と persist.log がバイト一致・終了コード / isError の差 0・注入で名指し + E0004 × 3・カタログ +0 B。PR #2674
+
+## 2026-11-02（#2537: test-lsp-menu-1684.sh の ① が 12 のうち 6 で落ちていた = #1685 / #1686 で `MenuItem::ALL` が増えたのに visual-test が偽サーバへ参照・階層・名前の変更の規則を渡していなかった（製品の出し分けは仕様どおり）→ 規則の env の組 `FAKE_FULL_MENU_RULE_ENVS` を節で渡し、`ALL` と偽サーバの申告のずれを CI の番犬で縛る）
+- tako-vd でスクリプト 3 回とも PASS 25 / FAIL 0（修正前の ① は 4/4 NG）・注入 2 種で番犬が落ちる・カタログ +0 B。実の rust-analyzer の節 ④ は #2673 へ切り出した。PR #2675
+- 23:31 に `b305af4` を install・GUI 再起動（画面ロック中・復元失敗 0・remote daemon は replaced-generation）
