@@ -250,13 +250,15 @@ impl Denial {
         }
     }
 
-    /// エラー応答の本体。`error` は既存 API と同じキー名（PWA が拾う）
+    /// エラー応答の本体。`error` は既存 API と同じキー名（PWA が拾う）で daemon の表示言語
+    /// （#2365 の続き。以前は常に日本語）、`error_en` は英語
     pub fn to_json(self) -> Value {
-        json!({
-            "error": self.message_ja(),
-            "error_en": self.message_en(),
-            "kind": self.kind(),
-        })
+        crate::RemoteRefusal::FileDenied(self).kind_body(self.kind())
+    }
+
+    /// [`Self::to_json`] の表示言語を明示する形
+    pub fn to_json_in(self, lang: tako_core::i18n::Lang) -> Value {
+        crate::RemoteRefusal::FileDenied(self).kind_body_in(lang, self.kind())
     }
 }
 
@@ -1192,8 +1194,10 @@ pub struct WriteFailure {
     /// 機械可読な種別。**呼び出し側の固定文字列だけ**（監査の種別と同じ規約で、
     /// パスやファイル名が種別として応答へ混ざる形を型で禁じる）
     pub kind: &'static str,
-    pub ja: String,
-    pub en: String,
+    /// 理由（文は `RemoteRefusal` の日英の対）。本文の `error` は daemon の表示言語・`error_en` は英語で
+    /// 組み、中の詳細（app / リモート側の文・固定の理由）は作った時点の表示言語の文のまま両方へ入る
+    /// （日本語表示は修正前とバイト一致。#2365 の続き。以前は日英の文を持ち `error` は常に日本語）
+    pub reason: crate::RemoteRefusal,
     /// 応答へ足す追加フィールド（`pending` など）。
     /// `Option` にしてあるのは **`Result` の Err 側を小さく保つため**
     /// （`Result<Value, WriteFailure>` を返す関数が多く、大きいと clippy が咎める）
@@ -1201,84 +1205,54 @@ pub struct WriteFailure {
 }
 
 impl WriteFailure {
-    fn new(status: u16, kind: &'static str, ja: impl Into<String>, en: impl Into<String>) -> Self {
+    fn new(status: u16, kind: &'static str, reason: crate::RemoteRefusal) -> Self {
         Self {
             status,
             kind,
-            ja: ja.into(),
-            en: en.into(),
+            reason,
             extra: None,
         }
     }
 
     /// 読んだ時点から中身が変わっている。**上書きしない**
     pub fn conflict(detail: &str) -> Self {
-        let mut ja = "このファイルは他で変更されています。読み直してから編集をやり直してください"
-            .to_string();
-        let mut en = "This file changed elsewhere; reload it and redo your edit".to_string();
-        if !detail.is_empty() {
-            ja.push_str(&format!("（{detail}）"));
-            en.push_str(&format!(" ({detail})"));
-        }
-        Self::new(409, "conflict", ja, en)
+        Self::new(
+            409,
+            "conflict",
+            crate::RemoteRefusal::FileConflict(detail.to_string()),
+        )
     }
 
     /// Mac 側に未保存の編集がある。**踏み潰さない**
     pub fn busy_editing() -> Self {
-        Self::new(
-            409,
-            "busy_editing",
-            "Mac 側にこのファイルの未保存の編集があります。先に Mac で保存するか編集を取り消してください",
-            "The Mac has unsaved edits to this file; save or discard them there first",
-        )
+        Self::new(409, "busy_editing", crate::RemoteRefusal::FileBusyEditing)
     }
 
     /// テキストとして編集できない（バイナリ・画像・PDF・動画）
     pub fn not_text() -> Self {
-        Self::new(
-            400,
-            "not_text",
-            "この形式はスマホから編集できません（テキストファイルだけが編集できます）",
-            "This format cannot be edited from the phone (text files only)",
-        )
+        Self::new(400, "not_text", crate::RemoteRefusal::FileNotText)
     }
 
     /// リモート側が読み取り専用（#966 の `read_only`）
     pub fn read_only() -> Self {
-        Self::new(
-            403,
-            "read_only",
-            "書き込みが許可されていないファイルです",
-            "This file is not writable",
-        )
+        Self::new(403, "read_only", crate::RemoteRefusal::FileReadOnly)
     }
 
     /// 検証子が付いていない = 競合を判定できないので書かない
     pub fn missing_etag() -> Self {
-        Self::new(
-            400,
-            "missing_etag",
-            "検証子（etag）が要ります。ファイルを読み直してから保存してください",
-            "An etag is required; reload the file before saving",
-        )
+        Self::new(400, "missing_etag", crate::RemoteRefusal::FileEtagMissing)
     }
 
     pub fn bad_body(detail: &str) -> Self {
         Self::new(
             400,
             "bad_body",
-            format!("リクエストの本文が読めません（{detail}）"),
-            format!("Could not read the request body ({detail})"),
+            crate::RemoteRefusal::FileBodyUnreadable(detail.to_string()),
         )
     }
 
     pub fn too_large(limit: u64) -> Self {
-        Self::new(
-            413,
-            "too_large",
-            format!("{limit} バイトを超える内容は保存できません"),
-            format!("Cannot save more than {limit} bytes"),
-        )
+        Self::new(413, "too_large", crate::RemoteRefusal::FileTooLarge(limit))
     }
 
     /// tako app 側が断った（プレビューにできない・編集を開始できない等）。
@@ -1287,8 +1261,7 @@ impl WriteFailure {
         Self::new(
             409,
             "app_rejected",
-            format!("Mac 側で保存できませんでした（{detail}）"),
-            format!("The Mac could not save it ({detail})"),
+            crate::RemoteRefusal::FileAppRejected(detail.to_string()),
         )
     }
 
@@ -1296,8 +1269,7 @@ impl WriteFailure {
         Self::new(
             503,
             "app_unreachable",
-            format!("tako app に問い合わせできません: {detail}"),
-            format!("Could not reach the tako app: {detail}"),
+            crate::RemoteRefusal::FileAppUnreachable(detail.to_string()),
         )
     }
 
@@ -1306,10 +1278,7 @@ impl WriteFailure {
         let mut f = Self::new(
             502,
             "remote_pending",
-            format!(
-                "リモートへ送れませんでした。内容は退避したので、つながったら送り直せます（{detail}）"
-            ),
-            format!("Could not reach the host; the content is stashed and can be pushed again once connected ({detail})"),
+            crate::RemoteRefusal::FileRemotePending(detail.to_string()),
         );
         f.extra = Some(Box::new(
             json!({ "pending": true, "remote_kind": remote_kind }),
@@ -1317,12 +1286,14 @@ impl WriteFailure {
         f
     }
 
+    /// 応答の本文（`error` は daemon の表示言語）
     pub fn to_json(&self) -> Value {
-        let mut out = json!({
-            "error": self.ja,
-            "error_en": self.en,
-            "kind": self.kind,
-        });
+        self.to_json_in(tako_core::i18n::lang())
+    }
+
+    /// [`Self::to_json`] の表示言語を明示する形
+    pub fn to_json_in(&self, lang: tako_core::i18n::Lang) -> Value {
+        let mut out = self.reason.kind_body_in(lang, self.kind);
         if let Some(extra) = self.extra.as_deref().and_then(Value::as_object) {
             for (k, v) in extra {
                 out[k] = v.clone();
@@ -1337,8 +1308,7 @@ impl From<Denial> for WriteFailure {
         Self {
             status: d.status(),
             kind: d.kind(),
-            ja: d.message_ja().to_string(),
-            en: d.message_en().to_string(),
+            reason: crate::RemoteRefusal::FileDenied(d),
             extra: None,
         }
     }
@@ -1602,9 +1572,9 @@ fn ensure_local_preview(deps: &FilesDeps, abs: &str) -> Result<PreviewTarget, Wr
                 column: None,
             })
             .map_err(|e| WriteFailure::app(&e))?;
-            let pane = opened["pane"]
-                .as_u64()
-                .ok_or_else(|| WriteFailure::app("プレビューペインを用意できなかった"))?;
+            let pane = opened["pane"].as_u64().ok_or_else(|| {
+                WriteFailure::app(&crate::RemoteRefusal::PreviewPaneUnavailable.to_string())
+            })?;
             (
                 pane,
                 opened["mode"].as_str().unwrap_or_default().to_string(),
@@ -1721,7 +1691,7 @@ fn write_local(
                     .map(|t| content_etag(t.as_bytes()) != etag)
                     .unwrap_or(false) =>
             {
-                WriteFailure::conflict("保存の直前に変わりました")
+                WriteFailure::conflict(&crate::RemoteRefusal::ChangedBeforeSave.to_string())
             }
             _ => failure,
         }),
@@ -1790,12 +1760,12 @@ fn write_ssh(
     if opened["read_only"].as_bool().unwrap_or(false) {
         return Err(WriteFailure::read_only());
     }
-    let pane = opened["pane"]
-        .as_u64()
-        .ok_or_else(|| WriteFailure::app("プレビューペインを用意できなかった"))?;
-    let cached = opened["cached_path"]
-        .as_str()
-        .ok_or_else(|| WriteFailure::app("取得したファイルの置き場が分からない"))?;
+    let pane = opened["pane"].as_u64().ok_or_else(|| {
+        WriteFailure::app(&crate::RemoteRefusal::PreviewPaneUnavailable.to_string())
+    })?;
+    let cached = opened["cached_path"].as_str().ok_or_else(|| {
+        WriteFailure::app(&crate::RemoteRefusal::FetchedFileLocationUnknown.to_string())
+    })?;
     let current = read_cached_text(std::path::Path::new(cached))?;
     if content_etag(current.as_bytes()) != etag {
         return Err(WriteFailure::conflict(""));
@@ -2037,17 +2007,13 @@ pub fn handle_files_request(
             request,
             deps,
             405,
-            &json!({
-                "error": "このメソッドには対応していない",
-                "error_en": "Method not allowed",
-                "kind": "method_not_allowed",
-            }),
+            &crate::RemoteRefusal::MethodNotAllowed.kind_body("method_not_allowed"),
         ),
         _ => respond_json(
             request,
             deps,
             404,
-            &json!({ "error": "API エンドポイントが見つからない" }),
+            &json!({ "error": crate::RemoteRefusal::ApiEndpointNotFound.to_string() }),
         ),
     }
 }
@@ -2147,11 +2113,7 @@ fn read_shortcuts(deps: &FilesDeps) -> (u16, Value) {
 fn shortcut_failure(e: ShortcutError) -> (u16, Value) {
     (
         e.status(),
-        json!({
-            "error": e.message_ja(),
-            "error_en": e.message_en(),
-            "kind": e.kind(),
-        }),
+        crate::RemoteRefusal::ShortcutRejected(e).kind_body(e.kind()),
     )
 }
 
@@ -2174,7 +2136,7 @@ fn add_shortcut(deps: &FilesDeps, body: &Value) -> (u16, Value) {
         return (
             500,
             json!({
-                "error": format!("ショートカットを保存できなかった: {e}"),
+                "error": crate::RemoteRefusal::ShortcutSave(e.to_string()).to_string(),
                 "error_en": "Could not save the shortcut",
                 "kind": "save_failed",
             }),
@@ -2198,7 +2160,7 @@ fn remove_shortcut(deps: &FilesDeps, id: Option<&str>) -> (u16, Value) {
         return (
             500,
             json!({
-                "error": format!("ショートカットを保存できなかった: {e}"),
+                "error": crate::RemoteRefusal::ShortcutSave(e.to_string()).to_string(),
                 "error_en": "Could not save the shortcut",
                 "kind": "save_failed",
             }),
@@ -2341,7 +2303,7 @@ fn write_file_content(
         return (Denial::UnknownRoot.status(), Denial::UnknownRoot.to_json());
     };
     let Some(text) = body["text"].as_str() else {
-        let f = WriteFailure::bad_body("text が要ります");
+        let f = WriteFailure::bad_body(&crate::RemoteRefusal::FileTextRequired.to_string());
         return (f.status, f.to_json());
     };
     // 検証子が無ければ**書かない**（競合を判定できないまま上書きしない）
@@ -2404,7 +2366,7 @@ fn push_pending(deps: &FilesDeps, root: Option<&str>, rel: &str, body: &Value) -
             }
         }
         Some(_) => {
-            let f = WriteFailure::bad_body("SSH 先のフォルダを指定してください");
+            let f = WriteFailure::bad_body(&crate::RemoteRefusal::SshFolderRequired.to_string());
             return (f.status, f.to_json());
         }
         None => None,
@@ -2498,9 +2460,9 @@ fn ssh_list_directory(deps: &FilesDeps, target: &SshResolved) -> Result<Value, W
 /// （「読み直してやり直す」の導線がそのまま効く）
 fn ssh_content_payload(deps: &FilesDeps, target: &SshResolved) -> Result<Value, WriteFailure> {
     let opened = open_ssh_preview(deps, target)?;
-    let cached = opened["cached_path"]
-        .as_str()
-        .ok_or_else(|| WriteFailure::app("取得したファイルの置き場が分からない"))?;
+    let cached = opened["cached_path"].as_str().ok_or_else(|| {
+        WriteFailure::app(&crate::RemoteRefusal::FetchedFileLocationUnknown.to_string())
+    })?;
     let size = opened["size"].as_u64();
     let pane = opened["pane"].as_u64();
     // 種別は**ペインから**引く（`opened["mode"]` は `ls -la` の権限欄なので使えない）
@@ -2605,9 +2567,9 @@ fn prepare_ssh_download(
     target: &SshResolved,
 ) -> Result<(std::fs::File, String, u64), WriteFailure> {
     let opened = open_ssh_preview(deps, target)?;
-    let cached = opened["cached_path"]
-        .as_str()
-        .ok_or_else(|| WriteFailure::app("取得したファイルの置き場が分からない"))?;
+    let cached = opened["cached_path"].as_str().ok_or_else(|| {
+        WriteFailure::app(&crate::RemoteRefusal::FetchedFileLocationUnknown.to_string())
+    })?;
     let file = std::fs::File::open(cached).map_err(|e| WriteFailure::app(&format!("{e}")))?;
     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
     Ok((file, tako_core::remote_fs::base_name(&target.path), size))
@@ -2715,11 +2677,12 @@ pub(crate) fn read_json_body(request: &mut tiny_http::Request) -> Result<Value, 
         .as_reader()
         .take(MAX_BODY_BYTES)
         .read_to_string(&mut body)
-        .map_err(|_| "リクエストボディの読み取りに失敗".to_string())?;
+        .map_err(|_| crate::RemoteRefusal::BodyUnreadable.to_string())?;
     if body.trim().is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str(&body).map_err(|e| format!("JSON パースエラー: {e}"))
+    serde_json::from_str(&body)
+        .map_err(|e| crate::RemoteRefusal::BodyJsonInvalid(e.to_string()).to_string())
 }
 
 /// 書き込みのボディ上限。
@@ -3651,7 +3614,8 @@ mod tests {
         ];
         for (f, status, kind) in cases {
             assert_eq!(f.status, status, "{kind}");
-            let body = f.to_json();
+            // `error` は daemon の表示言語（#2365 の続き）、`error_en` は常に英語
+            let body = f.to_json_in(tako_core::i18n::Lang::Ja);
             assert_eq!(body["kind"].as_str(), Some(kind));
             let ja = body["error"].as_str().unwrap_or_default();
             let en = body["error_en"].as_str().unwrap_or_default();
@@ -3661,6 +3625,10 @@ mod tests {
                 "{kind} の日本語が英語のまま: {ja}"
             );
             assert!(en.is_ascii(), "{kind} の英語に日本語が混ざる: {en}");
+            let en_body = f.to_json_in(tako_core::i18n::Lang::En);
+            assert_eq!(en_body["error"].as_str(), Some(en), "{kind} の英語表示");
+            assert_eq!(en_body["error_en"].as_str(), Some(en), "{kind}");
+            assert_eq!(en_body["kind"].as_str(), Some(kind), "{kind}");
         }
         // 退避されたことは機械可読に載る（PWA が「送り直す」を出す材料）
         let pending = WriteFailure::remote_pending("unreachable", "x").to_json();

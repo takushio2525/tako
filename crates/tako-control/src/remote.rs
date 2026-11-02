@@ -6397,13 +6397,7 @@ fn handle_ssh_open(
     };
     let open = match crate::remote_ssh::parse_open_request(&parsed, path_pane) {
         Ok(v) => v,
-        Err(e) => {
-            return respond(
-                request,
-                e.status,
-                Some(json!({ "error": e.message }).to_string()),
-            );
-        }
+        Err(e) => return refuse(request, e.status, e.reason),
     };
     // 監査には**何をどこへ開こうとしたか**を残す。ホスト名は接続先そのものなので
     // 記録する（ペインの中身・送信テキストとは別種の情報）
