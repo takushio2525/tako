@@ -2763,29 +2763,25 @@ pub fn sandbox_bypass_hint_command(profile_name: &str) -> String {
     format!("tako orchestrator profiles set {profile_name} --bypass-sandbox true")
 }
 
-/// 1M コンテキスト版モデル（`[1m]` サフィックス）への警告文を生成する。
+/// 1M コンテキスト版モデル（`[1m]` サフィックス）への警告（型）。
 /// プロファイルへの明示 opt-in は尊重して起動は継続するため、警告のみ（Issue #27）。
-/// 日本語の口（`profile_warnings` = 応答の `warnings`）。表示言語で組むのは [`one_m_model_warning_in`]
-pub fn one_m_model_warning(model: &str, source: &str) -> Option<String> {
-    one_m_model_warning_in(model, source, tako_core::i18n::Lang::Ja)
+/// `profile_warnings`（応答の `warnings`）が使い、呼び手が表示言語で組む（#2365）
+pub fn one_m_model_note(model: &str, source: &str) -> Option<crate::ReplyNote> {
+    model
+        .contains("[1m]")
+        .then(|| crate::ReplyNote::OneMModelWarning {
+            source: source.to_string(),
+            model: model.to_string(),
+        })
 }
 
-/// [`one_m_model_warning`] の表示言語を明示する口（`tako master` / `tako solo` の起動の流れ。#2365）
+/// [`one_m_model_note`] を表示言語を明示して組む口（`tako master` / `tako solo` の起動の流れ。#2365）
 pub fn one_m_model_warning_in(
     model: &str,
     source: &str,
     lang: tako_core::i18n::Lang,
 ) -> Option<String> {
-    if !model.contains("[1m]") {
-        return None;
-    }
-    Some(
-        crate::ReplyNote::OneMModelWarning {
-            source: source.to_string(),
-            model: model.to_string(),
-        }
-        .text_in(lang),
-    )
+    one_m_model_note(model, source).map(|n| n.text_in(lang))
 }
 
 // --- system prompt の組み立て（Issue #1154）---
@@ -3198,8 +3194,9 @@ pub enum ProfileGen {
     Created(PathBuf),
     /// 既にあったので**触っていない**（冪等の正常系）
     Exists(PathBuf),
-    /// 作らなかった（理由つき。プロジェクト追加そのものは失敗させない）
-    Skipped { reason: String },
+    /// 作らなかった（理由つき。プロジェクト追加そのものは失敗させない）。
+    /// 理由は型で持ち、応答の `profile_note` は表示言語・`tako migrate` の記録は日本語で組む（#2365）
+    Skipped { reason: ConfigError },
     /// 継承元の `profiles/default.yaml` を読めないので作らなかった（#1825）。
     ///
     /// 組み込み既定で作ると個人ルール（`prompt_blocks`）・モデルの抜けたプロファイルが残り、
@@ -3233,12 +3230,10 @@ impl ProfileGen {
         }
     }
 
-    /// 作らなかった理由（作った / 既にあるなら `None`）。`NotInherited` は `lang` で組む
-    /// （`Skipped` の理由は日本語のまま = 読み取りの理由ではない。Issue #2365 の表）
+    /// 作らなかった理由（作った / 既にあるなら `None`）。どちらも `lang` で組む（#2365）
     pub fn skip_reason_in(&self, lang: tako_core::i18n::Lang) -> Option<String> {
         match self {
-            Self::Skipped { reason } => Some(reason.clone()),
-            Self::NotInherited { reason } => Some(reason.text_in(lang)),
+            Self::Skipped { reason } | Self::NotInherited { reason } => Some(reason.text_in(lang)),
             Self::Created(_) | Self::Exists(_) => None,
         }
     }
@@ -3462,26 +3457,27 @@ fn project_entry_cwd(key: &str) -> Option<String> {
 /// 残りは [`project_profile_base`] の値をそのまま使う。
 /// 生成できない理由（プロファイル名に使えないキー・書き込み失敗）は
 /// `Skipped` に載せて返し、**呼び出し元の操作そのものは失敗させない**。
-/// 継承元を読めないときは作らずに `NotInherited` を返す（#1825）
+/// 継承元を読めないときは作らずに `NotInherited` を返す（#1825）。
+/// 理由は型（[`ConfigError`]）で返す = 呼び手が表示言語 / 日本語で組む（#2365）
 pub fn ensure_project_profile(key: &str) -> ProfileGen {
     if legacy_auto_profile() {
         return ProfileGen::Skipped {
-            reason: "TAKO_1453_LEGACY=1 のため自動生成しない".into(),
+            reason: ConfigError::AutoProfileLegacy,
         };
     }
-    if let Err(e) = validate_profile_name(key) {
+    if let Err(e) = validate_profile_name_typed(key) {
         return ProfileGen::Skipped {
-            reason: format!("プロジェクトキーをプロファイル名にできない: {e}"),
+            reason: ConfigError::ProjectKeyNotProfileName(Box::new(e)),
         };
     }
-    let path = match ProfileKind::Master.path(key) {
+    let path = match ProfileKind::Master.path_typed(key) {
         Ok(p) => p,
         Err(e) => return ProfileGen::Skipped { reason: e },
     };
     if path.is_file() {
         return ProfileGen::Exists(path);
     }
-    if let Err(e) = ProfileKind::Master.ensure_defaults() {
+    if let Err(e) = ProfileKind::Master.ensure_defaults_typed() {
         return ProfileGen::Skipped { reason: e };
     }
     let mut profile = match project_profile_base() {
@@ -3500,9 +3496,7 @@ pub fn ensure_project_profile(key: &str) -> ProfileGen {
         Ok(()) => ProfileGen::Created(path),
         // 並行生成で先を越された = 望みの状態になっている（冪等）
         Err(CreateError::Exists) => ProfileGen::Exists(path),
-        Err(CreateError::Failed(reason)) => ProfileGen::Skipped {
-            reason: reason.into_ja(),
-        },
+        Err(CreateError::Failed(reason)) => ProfileGen::Skipped { reason },
     }
 }
 
@@ -3522,15 +3516,16 @@ pub fn ensure_project_profiles() -> Vec<(String, ProfileGen)> {
         .collect()
 }
 
-/// 採用（adopt）の判定結果。**拒否の理由をここ 1 箇所に閉じる**
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 採用（adopt）の判定結果。**拒否の理由をここ 1 箇所に閉じる**。
+/// 理由と警告は型で持ち、応答は表示言語で組む（#2365。文は [`crate::Reason`] / [`crate::ReplyNote`]）
+#[derive(Debug, Clone, PartialEq)]
 pub enum AdoptDecision {
     /// 採用してよい（`warnings` は採用を妨げないが黙らせないもの）
-    Adopt { warnings: Vec<String> },
+    Adopt { warnings: Vec<crate::ReplyNote> },
     /// 既に同じプロファイル（冪等。role ラベルは貼り直す）
     Unchanged,
     /// 採用できない（理由 + 直し方）
-    Refused { reason: String },
+    Refused { reason: crate::Reason },
 }
 
 /// このプロファイルが**汎用の入口**か（管轄プロジェクトを持たない）。
@@ -3629,17 +3624,15 @@ pub fn decide_adopt(
     }
     if !is_generic_profile(launched) {
         return AdoptDecision::Refused {
-            reason: format!(
-                "この master は専用プロファイル '{launched_as}'（管轄: {}）で起動している。\n\
-                 会話の途中で system prompt は差し替えられないので、tako 側だけ \
-                 '{target_name}' へ移すと prompt と状態が食い違う。\n\
-                 移るには: tako orchestrator handoff（'{target_name}' で後任を立て直す）",
-                launched
+            reason: crate::Reason::AdoptLaunchedDedicated {
+                launched_as: launched_as.to_string(),
+                projects: launched
                     .projects
                     .as_ref()
                     .map(|p| p.join(", "))
-                    .unwrap_or_default()
-            ),
+                    .unwrap_or_default(),
+                target: target_name.to_string(),
+            },
         };
     }
     let launched_agent = launched.resolve_master_agent();
@@ -3647,23 +3640,18 @@ pub fn decide_adopt(
     if let (Ok(cur), Ok(tgt)) = (launched_agent, target_agent) {
         if cur != tgt {
             return AdoptDecision::Refused {
-                reason: format!(
-                    "master の系統が食い違う（この master は {} / '{target_name}' は {}）。\n\
-                     採用だけ通すと引き継ぎの後任が {} で立ち上がる。\n\
-                     揃えるには: tako orchestrator profiles set {target_name} --master-agent {}",
-                    cur.as_str(),
-                    tgt.as_str(),
-                    tgt.as_str(),
-                    cur.as_str()
-                ),
+                reason: crate::Reason::AdoptMasterAgentMismatch {
+                    current: cur.as_str().to_string(),
+                    target: target_name.to_string(),
+                    target_agent: tgt.as_str().to_string(),
+                },
             };
         }
     }
     let mut warnings = Vec::new();
     if is_generic_profile(target) && target_name != tako_core::handoff::DEFAULT_PROFILE {
-        warnings.push(format!(
-            "'{target_name}' は管轄プロジェクトを持たない汎用プロファイル（projects 未指定）。\
-             引き継ぎの宛先は変わるが管轄は決まらない"
+        warnings.push(crate::ReplyNote::AdoptGenericTarget(
+            target_name.to_string(),
         ));
     }
     // 会話の途中で system prompt は差し替えられない（#1453 の前提）。ユーザーが対象
@@ -3676,12 +3664,10 @@ pub fn decide_adopt(
     // 「誰も読まない警告」になる。見たいのは `system_prompt` / `prompt_blocks` /
     // 閾値・命名規約といった**利用者が書いた違い**だけ
     if prompt_fingerprint(launched, launched_as) != prompt_fingerprint(target, launched_as) {
-        warnings.push(format!(
-            "'{target_name}' は起動時の '{launched_as}' と違う system prompt を持っている\
-             （個別の prompt_blocks / system_prompt）。走っている会話の prompt は\
-             差し替えられないので、prompt ごと '{target_name}' にしたいときは \
-             tako orchestrator handoff で立て直す"
-        ));
+        warnings.push(crate::ReplyNote::AdoptPromptDiffers {
+            target: target_name.to_string(),
+            launched_as: launched_as.to_string(),
+        });
     }
     AdoptDecision::Adopt { warnings }
 }
@@ -3691,8 +3677,9 @@ pub fn decide_adopt(
 /// 登録される場合があり、`[1m]` モデルは明示 opt-in を尊重する（#27）。
 ///
 /// projects.yaml / accounts.yaml は**参照があるときだけ**読む（list は全プロファイル
-/// 分呼ばれるので、無条件に読むとプロファイル数ぶんのファイル読み込みが増える）
-pub fn profile_warnings(profile: &Profile) -> Vec<String> {
+/// 分呼ばれるので、無条件に読むとプロファイル数ぶんのファイル読み込みが増える）。
+/// 警告は型（[`crate::ReplyNote`]）で返す = 呼び手が表示言語で組む（#2365）
+pub fn profile_warnings(profile: &Profile) -> Vec<crate::ReplyNote> {
     let mut warnings = Vec::new();
 
     // [1m] モデル（Max / API プラン限定）。inherit で master と同一なら master 分のみ。
@@ -3701,14 +3688,14 @@ pub fn profile_warnings(profile: &Profile) -> Vec<String> {
         .model
         .as_deref()
         .filter(|_| profile.master_agent_is_claude())
-        .and_then(|m| one_m_model_warning(m, "master"))
+        .and_then(|m| one_m_model_note(m, "master"))
     {
         warnings.push(w);
     }
     if let Some(w) = profile
         .resolve_worker_model()
         .filter(|m| Some(*m) != profile.model.as_deref())
-        .and_then(|m| one_m_model_warning(m, "worker"))
+        .and_then(|m| one_m_model_note(m, "worker"))
     {
         warnings.push(w);
     }
@@ -3720,9 +3707,7 @@ pub fn profile_warnings(profile: &Profile) -> Vec<String> {
             .unwrap_or_default();
         for key in keys {
             if !known.iter().any(|k| k == key) {
-                warnings.push(format!(
-                    "プロジェクト '{key}' は projects.yaml に登録されていません（この状態では起動時にエラーになります）。\n  `tako orchestrator projects add {key} <パス>` で登録してください"
-                ));
+                warnings.push(crate::ReplyNote::ProfileProjectUnregistered(key.clone()));
             }
         }
     }
@@ -3741,9 +3726,10 @@ pub fn profile_warnings(profile: &Profile) -> Vec<String> {
             .unwrap_or_default();
         for (label, name) in referenced {
             if !known.iter().any(|n| n == name) {
-                warnings.push(format!(
-                    "{label} のアカウント '{name}' は accounts.yaml に登録されていません（この状態では起動時にエラーになります）。\n  `tako orchestrator accounts add {name} --inherit` で登録してください"
-                ));
+                warnings.push(crate::ReplyNote::ProfileAccountUnregistered {
+                    label: label.to_string(),
+                    name: name.to_string(),
+                });
             }
         }
     }
@@ -4761,8 +4747,10 @@ mod tests {
         let gen = ensure_project_profile("a/b");
         match gen {
             ProfileGen::Skipped { reason } => assert!(
-                reason.contains("プロファイル名"),
-                "理由が説明になっていない: {reason}"
+                reason
+                    .text_in(tako_core::i18n::Lang::Ja)
+                    .contains("プロファイル名"),
+                "理由が説明になっていない: {reason:?}"
             ),
             other => panic!("不正なキーで生成した: {other:?}"),
         }
@@ -4956,9 +4944,14 @@ mod tests {
         assert_eq!(gen.skip_reason_in(Lang::Ja), Some(reason.text_in(Lang::Ja)));
         assert_eq!(gen.skip_reason_in(Lang::En), Some(reason.text_in(Lang::En)));
         assert_eq!(gen.path(), None);
-        let skipped = ProfileGen::Skipped { reason: "s".into() };
+        let skipped = ProfileGen::Skipped {
+            reason: ConfigError::AutoProfileLegacy,
+        };
         assert_eq!(skipped.warning(), None, "従来の見送りは警告にしない");
-        assert_eq!(skipped.skip_reason_in(Lang::En), Some("s".to_string()));
+        assert_eq!(
+            skipped.skip_reason_in(Lang::En),
+            Some(ConfigError::AutoProfileLegacy.text_in(Lang::En))
+        );
         for lang in [Lang::Ja, Lang::En] {
             let text = reason.text_in(lang);
             assert!(
@@ -5076,6 +5069,7 @@ mod tests {
         // **専用プロファイルで起動した** master は拒否し、立て直す手を案内する
         match decide_adopt(running("takodev", "takodev", &target), "campus", &other) {
             AdoptDecision::Refused { reason } => {
+                let reason = reason.text_in(tako_core::i18n::Lang::Ja);
                 assert!(reason.contains("handoff"), "直し方が無い: {reason}");
                 assert!(
                     reason.contains("takodev"),
@@ -5092,8 +5086,10 @@ mod tests {
         };
         match decide_adopt(running("codex", "codex", &codex_master), "tako", &target) {
             AdoptDecision::Refused { reason } => assert!(
-                reason.contains("--master-agent codex"),
-                "揃えるコマンドが無い: {reason}"
+                reason
+                    .text_in(tako_core::i18n::Lang::Ja)
+                    .contains("--master-agent codex"),
+                "揃えるコマンドが無い: {reason:?}"
             ),
             other => panic!("系統違いを通した: {other:?}"),
         }
@@ -5130,7 +5126,9 @@ mod tests {
             panic!("採用が通らない");
         };
         assert!(
-            !warnings.iter().any(|w| w.contains("system prompt")),
+            !warnings
+                .iter()
+                .any(|w| matches!(w, crate::ReplyNote::AdoptPromptDiffers { .. })),
             "同じ prompt なのに警告が出ている: {warnings:?}"
         );
 
@@ -5148,7 +5146,9 @@ mod tests {
             panic!("採用が通らない");
         };
         assert!(
-            warnings.iter().any(|w| w.contains("system prompt")),
+            warnings.iter().any(|w| w
+                .text_in(tako_core::i18n::Lang::Ja)
+                .contains("system prompt")),
             "prompt が違うのに黙っている: {warnings:?}"
         );
     }
@@ -7018,9 +7018,9 @@ worker_agents:
 
     #[test]
     fn one_m_warning_only_for_1m_models() {
-        assert!(one_m_model_warning("claude-opus-4-6[1m]", "master").is_some());
-        assert!(one_m_model_warning("claude-opus-4-6", "master").is_none());
-        assert!(one_m_model_warning("claude-sonnet-5", "worker").is_none());
+        assert!(one_m_model_note("claude-opus-4-6[1m]", "master").is_some());
+        assert!(one_m_model_note("claude-opus-4-6", "master").is_none());
+        assert!(one_m_model_note("claude-sonnet-5", "worker").is_none());
     }
 
     // #27 の移行の振る舞い（コメント保持 / 明示モデル尊重 / #67 の再設定尊重 /
@@ -8463,7 +8463,7 @@ worker_agents:
         };
         let w = profile_warnings(&one_m);
         assert_eq!(w.len(), 1, "inherit で同一モデルなら master 分のみ: {w:?}");
-        assert!(w[0].contains("master"));
+        assert!(w[0].text_in(tako_core::i18n::Lang::Ja).contains("master"));
 
         let both = Profile {
             model: Some("claude-opus-4-6".into()),
@@ -8473,6 +8473,6 @@ worker_agents:
         };
         let w = profile_warnings(&both);
         assert_eq!(w.len(), 1, "worker 側だけ [1m]: {w:?}");
-        assert!(w[0].contains("worker"));
+        assert!(w[0].text_in(tako_core::i18n::Lang::Ja).contains("worker"));
     }
 }

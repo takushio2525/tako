@@ -893,9 +893,12 @@ fn reason_index(r: &Reason) -> usize {
         Reason::ProfileCwdUnreachable { .. } => 334,
         Reason::TabNewNoPane => 335,
         Reason::UserTaskMasterLaunchFailed(_) => 336,
+        // #2365 の続き: adopt の判断の断り（`orchestrator::decide_adopt`）
+        Reason::AdoptLaunchedDedicated { .. } => 337,
+        Reason::AdoptMasterAgentMismatch { .. } => 338,
     }
 }
-const REASON_VARIANTS: usize = 337;
+const REASON_VARIANTS: usize = 339;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1510,6 +1513,16 @@ fn reason_samples() -> Vec<Reason> {
         },
         Reason::TabNewNoPane,
         Reason::UserTaskMasterLaunchFailed("the profile's cwd does not exist: /p".into()),
+        Reason::AdoptLaunchedDedicated {
+            launched_as: "takodev".into(),
+            projects: "tako, sub".into(),
+            target: "campus".into(),
+        },
+        Reason::AdoptMasterAgentMismatch {
+            current: "codex".into(),
+            target: "tako".into(),
+            target_agent: "claude".into(),
+        },
     ]
 }
 
@@ -1912,6 +1925,14 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "プロファイルの cwd に移動できない: /tmp/p (Permission denied (os error 13))",
     "タブ作成の応答に pane が含まれない",
     "master を起動できない: the profile's cwd does not exist: /p",
+    // `orchestrator::decide_adopt` が `format!` で組んでいた断り（#2365 の続き）
+    "この master は専用プロファイル 'takodev'（管轄: tako, sub）で起動している。\n\
+     会話の途中で system prompt は差し替えられないので、tako 側だけ \
+     'campus' へ移すと prompt と状態が食い違う。\n\
+     移るには: tako orchestrator handoff（'campus' で後任を立て直す）",
+    "master の系統が食い違う（この master は codex / 'tako' は claude）。\n\
+     採用だけ通すと引き継ぎの後任が claude で立ち上がる。\n\
+     揃えるには: tako orchestrator profiles set tako --master-agent codex",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
@@ -7398,9 +7419,12 @@ fn config_error_index(e: &ConfigError) -> usize {
         ConfigError::ProfileUnreadable(_) => 36,
         ConfigError::ProjectProfileNotInherited { .. } => 37,
         ConfigError::ProjectProfileMissing { .. } => 38,
+        // #2365 の続き: 専用プロファイルを作らなかった理由（`ProfileGen::Skipped`）
+        ConfigError::AutoProfileLegacy => 39,
+        ConfigError::ProjectKeyNotProfileName(_) => 40,
     }
 }
-const CONFIG_ERROR_VARIANTS: usize = 39;
+const CONFIG_ERROR_VARIANTS: usize = 41;
 
 /// 見本と #2365 より前の固定文（`orchestrator` の口が書いていた文を見本の値で展開）
 fn config_error_table() -> Vec<(ConfigError, &'static str)> {
@@ -7692,6 +7716,16 @@ fn config_error_table() -> Vec<(ConfigError, &'static str)> {
              default を継承できないので専用プロファイル 'k' は作らなかった\
              （組み込み既定で作ると個人ルール・モデルが抜けたまま残る）。\
              default.yaml を直すと tako migrate run（GUI の次の起動でも自動）で作られる",
+        ),
+        // `ensure_project_profile` が `format!` / 固定文で組んでいた `Skipped` の理由（#2365 の続き）
+        (
+            ConfigError::AutoProfileLegacy,
+            "TAKO_1453_LEGACY=1 のため自動生成しない",
+        ),
+        (
+            ConfigError::ProjectKeyNotProfileName(Box::new(ConfigError::ProfileNameBadChar('@'))),
+            "プロジェクトキーをプロファイル名にできない: \
+             プロファイル名に使えない文字が含まれる: '@'（英数字と - _ . のみ）",
         ),
     ]
 }
@@ -8052,6 +8086,12 @@ const CONFIG_REFUSAL_SCOPES: &[(&str, &str, Span)] = &[
         ORCH_MOD_PATH,
         ORCH_MOD_SRC,
         Span::Item("fn missing_project_profile_reason_from("),
+    ),
+    // #2365 の続き: 専用プロファイルを作らなかった理由（`ProfileGen::Skipped`）を組む口
+    (
+        ORCH_MOD_PATH,
+        ORCH_MOD_SRC,
+        Span::Item("pub fn ensure_project_profile("),
     ),
     (
         MASTER_LAUNCH_PATH,
@@ -17900,6 +17940,8 @@ fn gui側の呼び手の番犬の境界() {
 const REPLY_NOTE_SRC: &str = include_str!("../src/reply_note.rs");
 const REPLY_NOTE_PATH: &str = "crates/tako-control/src/reply_note.rs";
 
+use tako_control::worker_mcp::CodexConfigError;
+
 /// `ReplyNote` の通し番号（網羅 match）
 fn reply_note_index(n: &ReplyNote) -> usize {
     match n {
@@ -17982,9 +18024,28 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::CallerPaneUnknownUnset => 76,
         ReplyNote::LaunchingInNewTab => 77,
         ReplyNote::SshDetectionNoGui => 78,
+        // #2365 の続き: 他モジュールが組む注記（profile_warnings / adopt / ctx の窓 / 会話の再開 / worker の MCP）
+        ReplyNote::ProfileProjectUnregistered(_) => 79,
+        ReplyNote::ProfileAccountUnregistered { .. } => 80,
+        ReplyNote::AdoptGenericTarget(_) => 81,
+        ReplyNote::AdoptPromptDiffers { .. } => 82,
+        ReplyNote::CtxModDrift { .. } => 83,
+        ReplyNote::CtxTranscriptDrift { .. } => 84,
+        ReplyNote::ResumeProfileMissing { .. } => 85,
+        ReplyNote::ResumeWorkerAccountUnresolved { .. } => 86,
+        ReplyNote::ResumeConfigDirPinned(_) => 87,
+        ReplyNote::ResumeCodexHomePinned { .. } => 88,
+        ReplyNote::McpSettingsUnwritable(_) => 89,
+        ReplyNote::McpSettingsNoDataDir => 90,
+        ReplyNote::McpKeepMissing(_) => 91,
+        ReplyNote::McpSettingsOverridden => 92,
+        ReplyNote::McpCodexHomeUnresolved => 93,
+        ReplyNote::McpCodexConfigUnreadable(_) => 94,
+        ReplyNote::McpCodexKeepMissing(_) => 95,
+        ReplyNote::McpCodexNameInexpressible(_) => 96,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 79;
+const REPLY_NOTE_VARIANTS: usize = 97;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -18414,6 +18475,160 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             ReplyNote::SshDetectionNoGui,
             "GUI が接続していないので検知状態を読めない".into(),
         ),
+        // ---- 他モジュールが組む注記（#2365 の続き。`orchestrator::profile_warnings` / `decide_adopt`・
+        // `claude_ctx::window_warning`・`resume_launch`・`worker_mcp` が `format!` で組んでいた文） ----
+        (
+            ReplyNote::ProfileProjectUnregistered("ghost".into()),
+            "プロジェクト 'ghost' は projects.yaml に登録されていません（この状態では起動時にエラーになります）。\n  \
+             `tako orchestrator projects add ghost <パス>` で登録してください"
+                .into(),
+        ),
+        (
+            ReplyNote::ProfileAccountUnregistered {
+                label: "worker_account".into(),
+                name: "acct".into(),
+            },
+            "worker_account のアカウント 'acct' は accounts.yaml に登録されていません（この状態では起動時にエラーになります）。\n  \
+             `tako orchestrator accounts add acct --inherit` で登録してください"
+                .into(),
+        ),
+        (
+            ReplyNote::AdoptGenericTarget("g".into()),
+            "'g' は管轄プロジェクトを持たない汎用プロファイル（projects 未指定）。\
+             引き継ぎの宛先は変わるが管轄は決まらない"
+                .into(),
+        ),
+        (
+            ReplyNote::AdoptPromptDiffers {
+                target: "tako".into(),
+                launched_as: "default".into(),
+            },
+            "'tako' は起動時の 'default' と違う system prompt を持っている\
+             （個別の prompt_blocks / system_prompt）。走っている会話の prompt は\
+             差し替えられないので、prompt ごと 'tako' にしたいときは \
+             tako orchestrator handoff で立て直す"
+                .into(),
+        ),
+        (
+            ReplyNote::CtxModDrift {
+                delta: 6,
+                percent: 6,
+            },
+            "ctx% の画面と mod の報告が 6 ポイントずれています\
+             （mod の値 6% を採用。statusLine の更新待ちなら次のターンで揃います。\
+             揃わなければ画面の読み取りか mod の報告を疑う）"
+                .into(),
+        ),
+        (
+            ReplyNote::CtxTranscriptDrift {
+                delta: -26,
+                window: 1_000_000,
+            },
+            "ctx% の画面と transcript が -26 ポイントずれています\
+             （transcript 側で使った文脈窓 1000000。上流が窓の決め方を変えた合図。\
+             画面の値を採用しています）"
+                .into(),
+        ),
+        (
+            ReplyNote::ResumeProfileMissing {
+                kind: ProfileKind::Master,
+                name: "ghost".into(),
+            },
+            "master プロファイル 'ghost' が見つからないので既定プロファイルの設定で再開した\
+             （`tako master ghost` のようにラベルだけで起動した master と同じ組み立て）"
+                .into(),
+        ),
+        (
+            ReplyNote::ResumeProfileMissing {
+                kind: ProfileKind::Solo,
+                name: "ghost".into(),
+            },
+            "solo プロファイル 'ghost' が見つからないので既定プロファイルの設定で再開した\
+             （`tako solo ghost` のようにラベルだけで起動した master と同じ組み立て）"
+                .into(),
+        ),
+        (
+            ReplyNote::ResumeWorkerAccountUnresolved {
+                name: "acct".into(),
+                why: ConfigError::AccountNotFound("acct".into()),
+            },
+            "worker のアカウント 'acct' を引けないので、プロファイルの env だけで再開した: \
+             アカウント 'acct' が accounts.yaml に見つからない"
+                .into(),
+        ),
+        (
+            ReplyNote::ResumeConfigDirPinned("/tmp/c".into()),
+            "プロファイルの設定 dir（/tmp/c）に会話の記録が無いので、記録のある設定 dir で再開した".into(),
+        ),
+        (
+            ReplyNote::ResumeCodexHomePinned {
+                current: "/tmp/a".into(),
+                home: "/tmp/b".into(),
+            },
+            "プロファイルの CODEX_HOME（/tmp/a）に会話の記録が無いので、記録のある置き場（/tmp/b）で再開した"
+                .into(),
+        ),
+        (
+            ReplyNote::McpSettingsUnwritable(SessionRefusal::McpSettingsDir {
+                dir: "/tmp/d".into(),
+                error: "Permission denied (os error 13)".into(),
+            }),
+            "user scope の MCP を止める設定ファイルを書けなかったので、今回は全部持ち込んで起動する: \
+             /tmp/d を作れない: Permission denied (os error 13)"
+                .into(),
+        ),
+        (
+            ReplyNote::McpSettingsNoDataDir,
+            "user scope の MCP を止める設定ファイルの置き場が無いので、今回は全部持ち込んで起動する: \
+             データディレクトリを特定できない"
+                .into(),
+        ),
+        (
+            ReplyNote::McpKeepMissing("coplay-mcp".into()),
+            "プロジェクトの mcp_servers の 'coplay-mcp' は user scope にもプロジェクトの .mcp.json にも\
+             見つからない（今は何も足されない）"
+                .into(),
+        ),
+        (
+            ReplyNote::McpSettingsOverridden,
+            "プロファイルの worker_agents.claude.args に --settings があるため、\
+             user scope の MCP を止める設定が効かない（claude は後ろの --settings だけを読む）"
+                .into(),
+        ),
+        (
+            ReplyNote::McpCodexHomeUnresolved,
+            "codex の設定の置き場（CODEX_HOME）を決められないので、\
+             今回は user 設定の MCP を全部持ち込んで起動する"
+                .into(),
+        ),
+        (
+            ReplyNote::McpCodexConfigUnreadable(CodexConfigError::Read {
+                path: "/tmp/c/config.toml".into(),
+                error: "Permission denied (os error 13)".into(),
+            }),
+            "codex の設定を読めないので、今回は user 設定の MCP に何も足さずに起動する: \
+             /tmp/c/config.toml を読めない: Permission denied (os error 13)"
+                .into(),
+        ),
+        (
+            ReplyNote::McpCodexConfigUnreadable(CodexConfigError::Toml {
+                path: "/tmp/c/config.toml".into(),
+                error: "TOML parse error at line 1, column 15".into(),
+            }),
+            "codex の設定を読めないので、今回は user 設定の MCP に何も足さずに起動する: \
+             /tmp/c/config.toml を TOML として読めない: TOML parse error at line 1, column 15"
+                .into(),
+        ),
+        (
+            ReplyNote::McpCodexKeepMissing("coplay-mcp".into()),
+            "プロジェクトの mcp_servers の 'coplay-mcp' は codex の config.toml にも\
+             プロジェクトの .codex/config.toml にも見つからない（今は何も足されない）"
+                .into(),
+        ),
+        (
+            ReplyNote::McpCodexNameInexpressible("my.server".into()),
+            "codex の -c は名前の '.' や空白などを表せないので、'my.server' は止めずに持ち込む".into(),
+        ),
     ]
 }
 
@@ -18553,11 +18768,106 @@ const DISPATCH_NOTE_OLD_JA: &[(&str, &str)] = &[
 ];
 
 /// dispatch の外で応答の値の注記を組む口（path, ソース, 頭）。中身を全部 `ReplyNote` へ移したもの
-const NOTE_ITEM_SCOPES: &[(&str, &str, &str)] = &[(
-    "crates/tako-control/src/fda.rs",
-    include_str!("../src/fda.rs"),
-    "impl FdaStatus {",
-)];
+const NOTE_ITEM_SCOPES: &[(&str, &str, &str)] = &[
+    (
+        "crates/tako-control/src/fda.rs",
+        include_str!("../src/fda.rs"),
+        "impl FdaStatus {",
+    ),
+    // #2365 の続き: 他モジュールが組む注記（プロファイルの参照・採用の判断・ctx の窓・会話の再開・worker の MCP）
+    (ORCH_MOD_PATH, ORCH_MOD_SRC, "pub fn profile_warnings("),
+    (ORCH_MOD_PATH, ORCH_MOD_SRC, "pub fn one_m_model_note("),
+    (ORCH_MOD_PATH, ORCH_MOD_SRC, "pub fn decide_adopt("),
+    (CLAUDE_CTX_PATH, CLAUDE_CTX_SRC, "pub fn window_warning("),
+    (
+        RESUME_LAUNCH_PATH,
+        RESUME_LAUNCH_SRC,
+        "pub fn registry_resume_launch_in(",
+    ),
+    (
+        RESUME_LAUNCH_PATH,
+        RESUME_LAUNCH_SRC,
+        "fn load_profile_for_resume(",
+    ),
+    (RESUME_LAUNCH_PATH, RESUME_LAUNCH_SRC, "fn worker_env_plan("),
+    (RESUME_LAUNCH_PATH, RESUME_LAUNCH_SRC, "fn pin_config_dir("),
+    (RESUME_LAUNCH_PATH, RESUME_LAUNCH_SRC, "fn pin_codex_home("),
+    (WORKER_MCP_PATH, WORKER_MCP_SRC, "pub fn settings_file_for("),
+    (WORKER_MCP_PATH, WORKER_MCP_SRC, "    pub fn materialized("),
+    (WORKER_MCP_PATH, WORKER_MCP_SRC, "pub fn prepare("),
+    (WORKER_MCP_PATH, WORKER_MCP_SRC, "pub fn prepare_from("),
+    (WORKER_MCP_PATH, WORKER_MCP_SRC, "pub fn codex_servers("),
+    (
+        WORKER_MCP_PATH,
+        WORKER_MCP_SRC,
+        "pub fn prepare_codex_from(",
+    ),
+];
+
+const CLAUDE_CTX_SRC: &str = include_str!("../src/claude_ctx.rs");
+const CLAUDE_CTX_PATH: &str = "crates/tako-control/src/claude_ctx.rs";
+
+/// 番犬自身の検査（本物のソースへ注入）: 他モジュールが組む注記の口へ日本語の固定文を戻すと、
+/// その行を `file:line` で名指す（#2365 の続き。注入しない元のソースは上の走査が 0 件で通る）
+#[test]
+fn 他モジュールが組む注記の口へ日本語の固定文を戻すと名指す() {
+    // (path, ソース, 範囲の頭, 注入元, 注入後)
+    let injections: [(&str, &str, &str, &str, &str); 5] = [
+        (
+            ORCH_MOD_PATH,
+            ORCH_MOD_SRC,
+            "pub fn profile_warnings(",
+            "warnings.push(crate::ReplyNote::ProfileProjectUnregistered(key.clone()));",
+            "warnings.push(format!(\"プロジェクト '{key}' は projects.yaml に登録されていません\"));",
+        ),
+        (
+            ORCH_MOD_PATH,
+            ORCH_MOD_SRC,
+            "pub fn decide_adopt(",
+            "warnings.push(crate::ReplyNote::AdoptGenericTarget(",
+            "warnings.push(crate::ReplyNote::AdoptGenericTarget(format!(\"は汎用プロファイル: \") + &",
+        ),
+        (
+            CLAUDE_CTX_PATH,
+            CLAUDE_CTX_SRC,
+            "pub fn window_warning(",
+            "Some(crate::ReplyNote::CtxTranscriptDrift { delta, window })",
+            "Some(format!(\"ctx% の画面と transcript が {delta} ポイントずれています\"))",
+        ),
+        (
+            RESUME_LAUNCH_PATH,
+            RESUME_LAUNCH_SRC,
+            "fn pin_config_dir(",
+            "current.display().to_string(),",
+            "format!(\"プロファイルの設定 dir（{}）に会話の記録が無い\", current.display()),",
+        ),
+        (
+            WORKER_MCP_PATH,
+            WORKER_MCP_SRC,
+            "pub fn prepare_codex_from(",
+            "warnings.push(ReplyNote::McpCodexNameInexpressible(name));",
+            "warnings.push(format!(\"codex の -c は名前を表せないので '{name}' は止めずに持ち込む\"));",
+        ),
+    ];
+    for (path, src, head, from, to) in injections {
+        let start = src
+            .find(head)
+            .unwrap_or_else(|| panic!("{path}: 範囲の頭が無い: {head}"));
+        let at = start
+            + src[start..]
+                .find(from)
+                .unwrap_or_else(|| panic!("{path}: 範囲の中に注入元が無い: {from}"));
+        let injected = format!("{}{to}{}", &src[..at], &src[at + from.len()..]);
+        let want = injected[..at].lines().count().max(1);
+        let lines = item_lines(&injected, head).expect("範囲");
+        let found = japanese_outside(&lines, &DISPATCH_NOTE_INTERNAL);
+        assert_eq!(
+            found.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            vec![want],
+            "{path}: 注入（{to}）を {path}:{want} として 1 件だけ名指すはず: {found:?}"
+        );
+    }
+}
 
 #[test]
 fn 注記を移したdispatchの関数に日本語の固定文が無く旧文も戻っていない() {

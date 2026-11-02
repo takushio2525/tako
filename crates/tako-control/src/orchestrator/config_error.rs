@@ -23,7 +23,10 @@
 //! 知らせは [`ProfileFallback`]、#1825 の「作らなかった」は [`ConfigError::ProjectProfileNotInherited`]
 //! で持つ。利用者へ返す口（応答の `warnings`・断り・CLI の警告の行・check-health）は表示言語、
 //! persist.log（日本語の診断ログ）は `text_in(Lang::Ja)` で同じ型から組む。以前は persist.log と
-//! 共有する日本語の `String` だったので、英語表示でも理由だけ日本語のまま混ざった
+//! 共有する日本語の `String` だったので、英語表示でも理由だけ日本語のまま混ざった。
+//! 専用プロファイルを作らなかった理由（`ProfileGen::Skipped` = `projects add` の `profile_note`）も
+//! 同じ型で持つ（[`ConfigError::AutoProfileLegacy`] / [`ConfigError::ProjectKeyNotProfileName`] と
+//! 置き場・書き込みの断り。`tako migrate` の記録は日本語の枠なので `text_in(Lang::Ja)`）
 
 use tako_core::i18n::Lang;
 use tako_core::load_issue::YamlReason;
@@ -140,6 +143,12 @@ pub enum ConfigError {
         not_found: Box<ConfigError>,
         why: Box<ConfigError>,
     },
+    /// #1453 の A/B（`TAKO_1453_LEGACY=1`）なので専用プロファイルを自動生成しない
+    /// （`ProfileGen::Skipped` の理由 = `projects add` の `profile_note`）
+    AutoProfileLegacy,
+    /// プロジェクトキーをプロファイル名にできない（`ProfileGen::Skipped` の理由。
+    /// 中身は名前の検証の断り = [`Self::ProfileNameBadChar`] ほか）
+    ProjectKeyNotProfileName(Box<ConfigError>),
 }
 
 impl ConfigError {
@@ -401,6 +410,18 @@ impl ConfigError {
             (Self::ProjectProfileMissing { not_found, why }, En) => {
                 format!("{}; {}", not_found.text_in(lang), why.text_in(lang))
             }
+            (Self::AutoProfileLegacy, Ja) => "TAKO_1453_LEGACY=1 のため自動生成しない".to_string(),
+            (Self::AutoProfileLegacy, En) => {
+                "not generated automatically because TAKO_1453_LEGACY=1 is set".to_string()
+            }
+            (Self::ProjectKeyNotProfileName(why), Ja) => format!(
+                "プロジェクトキーをプロファイル名にできない: {}",
+                why.text_in(lang)
+            ),
+            (Self::ProjectKeyNotProfileName(why), En) => format!(
+                "the project key cannot be used as a profile name: {}",
+                why.text_in(lang)
+            ),
         }
     }
 

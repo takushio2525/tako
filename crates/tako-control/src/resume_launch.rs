@@ -159,8 +159,9 @@ pub struct ResumeLaunch {
     pub recipe: ResumeRecipe,
     /// 使ったプロファイル名（master / solo / worker のときだけ）
     pub profile: Option<String>,
-    /// 黙って寄せない食い違い（プロファイルが無い・アカウントと記録の所在が違う 等）
-    pub warnings: Vec<String>,
+    /// 黙って寄せない食い違い（プロファイルが無い・アカウントと記録の所在が違う 等）。
+    /// 型で持ち、応答・CLI の行は表示言語・persist.log は日本語で組む（#2365）
+    pub warnings: Vec<crate::ReplyNote>,
     /// 起動の直前に書き出す system prompt（パスと本文）。**下見では書かない**ので
     /// 実行する呼び出し側が [`ResumeLaunch::materialize`] を呼ぶ
     prompt_file: Option<(PathBuf, String)>,
@@ -464,7 +465,7 @@ pub fn registry_resume_launch_in(
     if entry.profile.is_none() {
         launch
             .warnings
-            .insert(0, crate::ReplyNote::ResumeNoProfileRecord.to_string());
+            .insert(0, crate::ReplyNote::ResumeNoProfileRecord);
     }
     Ok(launch)
 }
@@ -627,16 +628,19 @@ fn resume_worker_launch(
 /// spawn と同じ env 計画（プロファイルの env + worker のアカウント = `resolved_env_plan_with_account`）。
 /// spawn 時の `--account` は記録に無いのでプロファイルの `worker_account`（無ければ `master_account`）で引く。
 /// アカウントが引けなくても再開は止めない（プロファイルの env だけで組み、理由を warnings へ）
-fn worker_env_plan(profile: &Profile, warnings: &mut Vec<String>) -> EnvPlan {
+fn worker_env_plan(profile: &Profile, warnings: &mut Vec<crate::ReplyNote>) -> EnvPlan {
     let Some(name) = profile.resolve_worker_account_name(None) else {
         return profile.resolved_env_plan();
     };
-    match orchestrator::AccountsConfig::load().and_then(|accounts| accounts.resolve(name)) {
+    match orchestrator::AccountsConfig::load_typed()
+        .and_then(|accounts| accounts.resolve_typed(name))
+    {
         Ok(account) => profile.resolved_env_plan_with_account(Some(&account)),
-        Err(e) => {
-            warnings.push(format!(
-                "worker のアカウント '{name}' を引けないので、プロファイルの env だけで再開した: {e}"
-            ));
+        Err(why) => {
+            warnings.push(crate::ReplyNote::ResumeWorkerAccountUnresolved {
+                name: name.to_string(),
+                why,
+            });
             profile.resolved_env_plan()
         }
     }
@@ -652,7 +656,7 @@ const DEFAULT_PROFILE: &str = "default";
 fn load_profile_for_resume(
     kind: ProfileKind,
     name: &str,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<crate::ReplyNote>,
 ) -> Result<(Profile, String), SessionRefusal> {
     let exists = kind.path(name).map(|p| p.is_file()).unwrap_or(false);
     if exists {
@@ -661,12 +665,10 @@ fn load_profile_for_resume(
             .map_err(SessionRefusal::from);
     }
     if name != DEFAULT_PROFILE {
-        warnings.push(format!(
-            "{} プロファイル '{name}' が見つからないので既定プロファイルの設定で再開した\
-             （`{} {name}` のようにラベルだけで起動した master と同じ組み立て）",
-            kind.as_str(),
-            kind.launch_bin()
-        ));
+        warnings.push(crate::ReplyNote::ResumeProfileMissing {
+            kind,
+            name: name.to_string(),
+        });
     }
     // 既定プロファイルが未作成なら組み込み既定（`tako master` / `tako solo` と同じ緩和）
     let profile = orchestrator::load_profile_of(kind, DEFAULT_PROFILE)
@@ -678,7 +680,11 @@ fn load_profile_for_resume(
 ///
 /// プロファイルのアカウントが同じ場所を指していれば計画には触らない（`tako master` と
 /// 1 バイトも変わらない）。指していなければ寄せて warnings に出す
-fn pin_config_dir(plan: &mut EnvPlan, location: &TranscriptLocation, warnings: &mut Vec<String>) {
+fn pin_config_dir(
+    plan: &mut EnvPlan,
+    location: &TranscriptLocation,
+    warnings: &mut Vec<crate::ReplyNote>,
+) {
     let key = orchestrator::CLAUDE_CONFIG_DIR_ENV;
     let wanted = location.config_dir.clone();
     let current = plan.claude_config_dir().map(PathBuf::from);
@@ -686,9 +692,8 @@ fn pin_config_dir(plan: &mut EnvPlan, location: &TranscriptLocation, warnings: &
         return;
     }
     if let Some(current) = current {
-        warnings.push(format!(
-            "プロファイルの設定 dir（{}）に会話の記録が無いので、記録のある設定 dir で再開した",
-            current.display()
+        warnings.push(crate::ReplyNote::ResumeConfigDirPinned(
+            current.display().to_string(),
         ));
     }
     plan.exports.retain(|(k, _)| k != key);
@@ -704,7 +709,7 @@ fn pin_config_dir(plan: &mut EnvPlan, location: &TranscriptLocation, warnings: &
 /// env 計画の `CODEX_HOME` を **rollout を見つけた置き場**へ寄せる（#2473。claude の [`pin_config_dir`] と
 /// 同じ考え方）。計画が `CODEX_HOME` を決めていなければ触らない（spawn も決めていない = 同じ env を継ぐ）。
 /// 決めていて食い違うときだけ寄せて warnings に出す（記録の無い置き場で `codex resume` すると会話が無い）
-fn pin_codex_home(plan: &mut EnvPlan, home: &Path, warnings: &mut Vec<String>) {
+fn pin_codex_home(plan: &mut EnvPlan, home: &Path, warnings: &mut Vec<crate::ReplyNote>) {
     const KEY: &str = "CODEX_HOME";
     let Some(current) = plan.export_value(KEY).map(PathBuf::from) else {
         return;
@@ -712,11 +717,10 @@ fn pin_codex_home(plan: &mut EnvPlan, home: &Path, warnings: &mut Vec<String>) {
     if current == home {
         return;
     }
-    warnings.push(format!(
-        "プロファイルの CODEX_HOME（{}）に会話の記録が無いので、記録のある置き場（{}）で再開した",
-        current.display(),
-        home.display()
-    ));
+    warnings.push(crate::ReplyNote::ResumeCodexHomePinned {
+        current: current.display().to_string(),
+        home: home.display().to_string(),
+    });
     for (k, v) in plan.exports.iter_mut() {
         if k == KEY {
             *v = home.display().to_string();
@@ -1546,12 +1550,10 @@ mod tests {
         let got = registry_resume_launch_in(&entry, Some(&loc), "/opt/tako", ShellDialect::Posix)
             .unwrap();
         assert_eq!(got.profile.as_deref(), Some("default"));
-        // 警告は組んだ時点の表示言語（#2365。表示言語はプロセス全体の状態なので日英のどちらかで見る）
-        let note = crate::ReplyNote::ResumeNoProfileRecord;
-        assert!(
-            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
-                .iter()
-                .any(|&lang| got.warnings[0] == note.text_in(lang)),
+        // 警告は型で持つ（#2365。表示言語は呼び手が決める）
+        assert_eq!(
+            got.warnings.first(),
+            Some(&crate::ReplyNote::ResumeNoProfileRecord),
             "{:?}",
             got.warnings
         );
