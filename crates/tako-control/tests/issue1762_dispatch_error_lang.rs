@@ -18107,9 +18107,35 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::HandoffMigrated { .. } => 103,
         ReplyNote::ProfileMemoOversized { .. } => 104,
         ReplyNote::ResendCommand { .. } => 105,
+        // #2365 の続き: CLI の人向けの表示（projects / guide の一覧 / sessions resume / todo show）
+        ReplyNote::ProjectsNone => 106,
+        ReplyNote::ProjectsAddHint => 107,
+        ReplyNote::ProjectWorkerMcp(_) => 108,
+        ReplyNote::ProjectAdded { .. } => 109,
+        ReplyNote::ProjectProfileCreated(_) => 110,
+        ReplyNote::ProjectProfileSkipped(_) => 111,
+        ReplyNote::ProjectProfileNoteMissing => 112,
+        ReplyNote::ProjectRemoved(_) => 113,
+        ReplyNote::ProjectMcpNone => 114,
+        ReplyNote::ProjectMcpAdded(_) => 115,
+        ReplyNote::ProjectMcpRemoved(_) => 116,
+        ReplyNote::ProjectMcpConfigured { .. } => 117,
+        ReplyNote::ProjectMcpKept(_) => 118,
+        ReplyNote::ProjectMcpDenied(_) => 119,
+        ReplyNote::ProjectMcpShadowed(_) => 120,
+        ReplyNote::ProjectMcpCodexDenied(_) => 121,
+        ReplyNote::ProjectMcpCodexShadowed(_) => 122,
+        ReplyNote::GuideCount(_) => 123,
+        ReplyNote::GuideRow { .. } => 124,
+        ReplyNote::SessionResumed { .. } => 125,
+        ReplyNote::TodoAttachment { .. } => 126,
+        ReplyNote::TodoCopyText { .. } => 127,
+        ReplyNote::TodoLink(_) => 128,
+        ReplyNote::TodoResponse { .. } => 129,
+        ReplyNote::TodoDelivery { .. } => 130,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 106;
+const REPLY_NOTE_VARIANTS: usize = 131;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -18790,6 +18816,148 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             ReplyNote::ResendCommand { pane: 41 },
             "tako send --pane 41 '<同じ依頼文>'".into(),
         ),
+        // ---- #2365 の続き: CLI の人向けの表示（旧文は origin/main の `main.rs` の `println!` /
+        // `eprintln!` を見本の値で展開し、呼び手に残した字下げ・桁揃えの空白を外したもの） ----
+        (
+            ReplyNote::ProjectsNone,
+            "登録済みプロジェクトはありません。".into(),
+        ),
+        (
+            ReplyNote::ProjectsAddHint,
+            "追加: tako orchestrator projects add --key <名前> --cwd <パス>".into(),
+        ),
+        (
+            ReplyNote::ProjectWorkerMcp("foo, nosuch".into()),
+            "worker の MCP: tako + foo, nosuch".into(),
+        ),
+        (
+            ReplyNote::ProjectAdded {
+                key: "alpha".into(),
+                cwd: "/w/alpha".into(),
+            },
+            "追加しました: alpha → /w/alpha".into(),
+        ),
+        (
+            ReplyNote::ProjectProfileCreated("/o/profiles/alpha.yaml".into()),
+            "専用プロファイルを作りました: /o/profiles/alpha.yaml（default から継承）".into(),
+        ),
+        (
+            ReplyNote::ProjectProfileSkipped("the reason".into()),
+            "専用プロファイルは作りませんでした: the reason".into(),
+        ),
+        (ReplyNote::ProjectProfileNoteMissing, "理由不明".into()),
+        (ReplyNote::ProjectRemoved("beta".into()), "削除しました: beta".into()),
+        (ReplyNote::ProjectMcpNone, "（なし）".into()),
+        (ReplyNote::ProjectMcpAdded("foo".into()), "足しました: foo".into()),
+        (
+            ReplyNote::ProjectMcpRemoved("foo, nosuch".into()),
+            "外しました: foo, nosuch".into(),
+        ),
+        (
+            ReplyNote::ProjectMcpConfigured {
+                key: "alpha".into(),
+                list: "foo".into(),
+            },
+            "alpha の worker へ持ち込む user scope の MCP: foo".into(),
+        ),
+        (
+            ReplyNote::ProjectMcpKept("foo".into()),
+            "今 spawn すると持ち込む: tako + foo".into(),
+        ),
+        (
+            ReplyNote::ProjectMcpDenied("zed".into()),
+            "止める（user scope）: zed".into(),
+        ),
+        (
+            ReplyNote::ProjectMcpShadowed("bar".into()),
+            "プロジェクトの .mcp.json と同名なので止めない: bar".into(),
+        ),
+        (
+            ReplyNote::ProjectMcpCodexDenied("baz".into()),
+            "codex の worker で止める（config.toml）: baz".into(),
+        ),
+        (
+            ReplyNote::ProjectMcpCodexShadowed("qux".into()),
+            "codex: プロジェクトの .codex/config.toml と同名なので止めない: qux".into(),
+        ),
+        (ReplyNote::GuideCount(16), "引ける手順書: 16 件".into()),
+        (
+            ReplyNote::GuideRow {
+                topic: "context-budget".into(),
+                bytes: 1050,
+                est_tokens: 807,
+                title: "Startup Load Budget".into(),
+            },
+            "context-budget     1050 bytes / 約   807 tok  Startup Load Budget".into(),
+        ),
+        // 列の幅を超える値（16 文字を超える topic・6 桁を超える bytes）は詰めずにそのまま
+        (
+            ReplyNote::GuideRow {
+                topic: "a-very-long-topic-name".into(),
+                bytes: 1_234_567,
+                est_tokens: 123_456,
+                title: "T".into(),
+            },
+            "a-very-long-topic-name 1234567 bytes / 約 123456 tok  T".into(),
+        ),
+        (
+            ReplyNote::SessionResumed {
+                pane: 2,
+                head: "0123abcd".into(),
+                cwd: "/w/alpha".into(),
+            },
+            "復元しました: ペイン 2（session 0123abcd…, cwd /w/alpha）".into(),
+        ),
+        (
+            ReplyNote::TodoAttachment {
+                path: "/w/a.txt".into(),
+                exists: true,
+            },
+            "添付: /w/a.txt".into(),
+        ),
+        (
+            ReplyNote::TodoAttachment {
+                path: "/nonexistent/x.png".into(),
+                exists: false,
+            },
+            "添付: /nonexistent/x.png（見つからない）".into(),
+        ),
+        (
+            ReplyNote::TodoCopyText {
+                label: "msg".into(),
+                head: "hello world".into(),
+            },
+            "コピー用[msg]: hello world".into(),
+        ),
+        (
+            ReplyNote::TodoLink("https://example.com/pr/1".into()),
+            "リンク: https://example.com/pr/1".into(),
+        ),
+        (
+            ReplyNote::TodoResponse {
+                stamp: "11:02".into(),
+                via: "pc".into(),
+                decision: "needs_change".into(),
+                first_line: "line1".into(),
+            },
+            "返答 11:02 [pc] needs_change: line1".into(),
+        ),
+        (
+            ReplyNote::TodoDelivery {
+                state: "failed".into(),
+                reason: Some("no destination".into()),
+                pane: "-".into(),
+            },
+            "配送: failed（no destination） pane:-".into(),
+        ),
+        (
+            ReplyNote::TodoDelivery {
+                state: "delivered".into(),
+                reason: None,
+                pane: "7".into(),
+            },
+            "配送: delivered pane:7".into(),
+        ),
     ]
 }
 
@@ -19351,6 +19519,13 @@ const CLI_NOTE_SCOPES: &[&str] = &[
     "fn launch_location(",
     "fn resolve_launch_target(",
     "fn new_tab_target(",
+    // #2365: 人向けの表示の枠（projects / guide の一覧 / sessions resume / todo show。行は `ReplyNote`）
+    "fn orchestrator_projects_cli(",
+    "fn print_project_mcp(",
+    "fn orchestrator_guide_local(",
+    "fn print_sessions_resume(",
+    "fn print_todo_detail(",
+    "fn todo_response_text(",
 ];
 
 /// CLI `main.rs` でまだ断りに日本語の固定文を持つ関数（頭, 理由）。**断りを移し終えたら外す**

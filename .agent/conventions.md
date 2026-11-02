@@ -730,6 +730,17 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   表示言語（`.text()`）、persist.log（`移行できず:` / `移行を中止:`）と `tako setup` の行（枠が日本語）は `.ja()`** で
   修正前とバイト一致。番犬は同じ `issue1762_dispatch_error_lang.rs`（`Reason` の表に 4 種・移行の記録の型 5 つの
   旧文の表・`MIGRATION_REASON_SCOPES` と `file_json` の `reason` の走査・`USER_TASK_DELIVERY_SCOPES`）
+- 同じ続きで、**CLI の人向けの表示（JSON でない出力の枠・見出し・ラベル）のうち orchestrator・会話・todo の系統**も
+  表示言語へ移した: `tako orchestrator projects` の list / add / remove / mcp・`tako orchestrator guide` の一覧
+  （件数の見出しと「約 N tok」の行）・`tako sessions resume` の「復元しました」の行・`tako todo show`（add / update /
+  done / dismiss / respond も同じ表示）の添付・コピー用・リンク・返答・配送の行。文は `ReplyNote` の 25 種
+  （`Project*` / `GuideCount` / `GuideRow` / `SessionResumed` / `Todo*`）で、CLI は `cli_lang()` で組む。**字下げ・
+  桁揃えの空白は呼び手**（`main.rs`）が付け、guide の行の桁揃えだけは型の中（英語は `~N` を 6 桁で右寄せ = 英語の
+  行どうしで列が揃う）。`--json` の出力・応答の値・終了コードは変えていない。番犬は同じ
+  `issue1762_dispatch_error_lang.rs`（`ReplyNote` の旧文の表に 28 行・`CLI_NOTE_SCOPES` に 6 つの関数）と、実経路の
+  `crates/tako-cli/tests/issue2365_cli_human_lang.rs`（unix。ビルドした `tako` を日英で叩き、todo / sessions は決まった
+  応答を返す偽の GUI を立てる。英語表示に日本語が無いこと・日本語表示が #2365 より前とバイト一致・`--json` が日英で
+  同じこと。A/B は `TAKO_2365_HUMAN_BIN`）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
