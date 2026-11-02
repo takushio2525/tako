@@ -10,6 +10,7 @@
 //!   GUI のクリックも CLI / MCP も**同じ要求**になる（UI 限定の操作を作らない = 開発不変条件）
 //! - [`NOT_IN_MENU`] — メニューに載せない言語機能の action と理由（番犬が
 //!   「項目の action + これ = `dispatch::LSP_FEATURE_ACTIONS`」を縛る。片方だけの action を落とす）
+//! - [`FAKE_FULL_MENU_RULE_ENVS`] — 偽の言語サーバに全項目の能力を申告させる規則の env（検証用。#2537）
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -46,6 +47,16 @@ pub enum MenuCapabilities {
     /// 使えないと分かっている（受け持つサーバが無い・未導入・止めた・諦めた・LSP を止めている）
     Failed(GotoError),
 }
+
+/// 偽の言語サーバ（`tako-lsp-fake`）に [`MenuItem::ALL`] の全項目の能力を申告させる規則の env（#2537）。
+///
+/// 偽サーバは定義ジャンプ・ホバー・整形の能力を既定で申告し、参照・階層（#1685）と名前の変更（#1686）は
+/// 規則のファイルを**渡したときだけ**申告する。中身は空の規則 `[]` でよい（申告は規則の有無だけで決まる）。
+/// visual-test `lsp-context-menu` は「申告どおりの全項目が描かれる」を見るので、この組を渡さないと
+/// 項目が足りずに落ちる（#1685 で `ALL` が 7 → 12 になってから visual-test だけが落ちていた）。
+/// 偽サーバが規則を渡したときだけ申告する項目を `ALL` へ足したら、その規則の env をここへ足す
+/// （CI の番犬 `tests/issue1684_lsp_menu.rs` が、この組で全項目が出ることを実プロセスで縛る）
+pub const FAKE_FULL_MENU_RULE_ENVS: [&str; 2] = ["TAKO_LSP_FAKE_XREF", "TAKO_LSP_FAKE_RENAME"];
 
 /// 項目 → `tako_lsp` の action（CLI は `tako lsp <action>`）
 pub fn action_of(item: MenuItem) -> &'static str {
