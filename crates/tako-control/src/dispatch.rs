@@ -38902,12 +38902,87 @@ mod tests {
         }
     }
 
+    /// A/B（#2676）: 修正前の材料（このリポジトリの実ファイル = 相対表記が「いま」で動く）へ戻す
+    const LEGACY_2676_ENV: &str = "TAKO_2676_LEGACY";
+
+    /// 固定の時計（#2676）の author / committer の起点。tako-core の `file_history` の A/B（#2164）と
+    /// 同じ値（2026-11 の実測: author「25 years ago」/ committer「16 years ago」）
+    const FIXED_AUTHOR_EPOCH_2676: i64 = 1_000_000_000;
+    const FIXED_COMMITTER_EPOCH_2676: i64 = 1_300_000_000;
+
+    /// #2676 の材料: 過去の固定時刻のコミットを 3 つ持つ使い捨てのリポジトリ（置き場ごと `Drop` で
+    /// 消える）と、その中の履歴のあるファイル。git の無い環境では `None`
+    fn fixed_clock_changelog_file() -> Option<(tako_core::test_residue::ScratchDir, PathBuf)> {
+        let scratch = tako_core::test_residue::ScratchDir::new("dispatch-2676-changelog");
+        let dir = scratch.path().to_path_buf();
+        // `minutes` が `Some` なら author / committer の日時を起点から 1 分ずつ進めた過去の時刻にする
+        let git = |args: &[&str], minutes: Option<i64>| {
+            let mut cmd = std::process::Command::new(tako_core::git::git_bin());
+            tako_core::platform::process::no_console_window(&mut cmd)
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_TERMINAL_PROMPT", "0");
+            if let Some(minutes) = minutes {
+                cmd.env(
+                    "GIT_AUTHOR_DATE",
+                    format!("@{} +0000", FIXED_AUTHOR_EPOCH_2676 + minutes * 60),
+                )
+                .env(
+                    "GIT_COMMITTER_DATE",
+                    format!("@{} +0000", FIXED_COMMITTER_EPOCH_2676 + minutes * 60),
+                );
+            }
+            cmd.output().is_ok_and(|o| o.status.success())
+        };
+        if !git(&["init", "-q", "-b", "main"], None) {
+            return None;
+        }
+        for args in [
+            ["config", "user.email", "test@example.invalid"],
+            ["config", "user.name", "testuser"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            assert!(git(&args, None), "git {args:?} が通る");
+        }
+        let file = dir.join("notes.txt");
+        for (minutes, body) in (0i64..).zip(["one\n", "two\n", "three\n"]) {
+            std::fs::write(&file, body).expect("書ける");
+            assert!(git(&["add", "notes.txt"], None), "git add が通る");
+            let message = format!("c{minutes}");
+            assert!(
+                git(&["commit", "-q", "-m", &message], Some(minutes)),
+                "git commit が通る"
+            );
+        }
+        Some((scratch, file))
+    }
+
     /// #2014: 開く切替は background のジョブになり、UI スレッドの準備は状態に触らない。
-    /// 着地（UI スレッド）が置いた履歴と応答は同期の腕（テスト・直呼び・A/B）と同じ
+    /// 着地（UI スレッド）が置いた履歴と応答は同期の腕（テスト・直呼び・A/B）と同じ。
+    ///
+    /// 材料は過去の固定時刻のコミットだけを持つ使い捨てのリポジトリ（#2676）。置いた履歴の各コミットは
+    /// git が「いま」から数える相対表記（`date_relative` = `%cr`）を持つので、このリポジトリの実ファイル
+    /// （修正前の材料）では 2 つの腕の `git log` が分の境目をまたぐと「33 minutes ago」と
+    /// 「32 minutes ago」で食い違って落ちていた（PR #2674 の Windows の CI）。固定時刻なら相対表記は
+    /// 「N years ago」で 2 回の取得の間に変わらない。比較から `date_relative` を外さないのは、2 つの腕が
+    /// 相対表記を同じに作ることも「同じ応答」の一部だから（#2164 と同じ直し方）
     #[test]
     fn preview_changelogの開く切替はbackgroundのジョブで同期の腕と同じ応答になる() {
-        let Some(file) = changelog_repo_file() else {
-            return; // git の無い環境
+        let legacy = matches!(
+            std::env::var(LEGACY_2676_ENV).ok().as_deref(),
+            Some("1" | "true" | "on")
+        );
+        // 置き場（`ScratchDir`）はテストの終わりまで持つ
+        let (_scratch, file) = if legacy {
+            let Some(file) = changelog_repo_file() else {
+                return; // git の無い環境
+            };
+            (None, file)
+        } else {
+            let Some((scratch, file)) = fixed_clock_changelog_file() else {
+                return; // git の無い環境
+            };
+            (Some(scratch), file)
         };
         let mut host = MockHost::new();
         let root = host.root_pane();
@@ -38961,6 +39036,12 @@ mod tests {
         assert!(
             staged["commits"].as_u64().is_some_and(|n| n >= 1),
             "{staged}"
+        );
+        // 下の比較は相対表記も含めて見る（空どうしの一致で素通りしない = #2676）
+        assert!(
+            placed.commits.iter().all(|c| !c.date_relative.is_empty()),
+            "{:?}",
+            placed.commits
         );
         let sync = dispatch(&mut host, changelog_on(root), PaneOrigin::Cli).expect("同期の腕");
         assert_eq!(staged, sync);
