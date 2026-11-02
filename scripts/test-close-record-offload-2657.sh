@@ -172,6 +172,10 @@ spawn_worker() {
   done
   echo "$p"
 }
+# そのペインが `tako list` に居るか（true / false。jq が最後まで読む = pipefail の下でも途中で抜けない）
+pane_listed() {
+  "$CLI" list | jq -r --argjson p "$1" '[.tabs[].panes[].id] | index($p) != null'
+}
 # 応答の直後に読んだ workers --all でのそのペインの状態（`status/close_reason`）
 registry_state() {
   "$CLI" orchestrator workers --all 2>/dev/null \
@@ -222,8 +226,7 @@ YAML
     echo "$state" >> "$TMP/$r-order.txt"
     { cat "$D/close-$i.json.rc"; cat "$D/close-$i.json" "$D/close-$i.json.err"; } > "$D/close-$i.norm"
     check_eq "[$r] ① close $i は成功する（終了コード 0）" 0 "$(cat "$D/close-$i.json.rc")"
-    check_eq "[$r] ① close $i でペインが消えた" 1 \
-      "$("$CLI" list | jq --argjson p "$p" '[.tabs[].panes[].id] | index($p) == null' | grep -q true && echo 1)"
+    check_eq "[$r] ① close $i でペインが消えた" false "$(pane_listed "$p")"
     check_eq "[$r] ④ close $i の応答の直後に workers は closed（発生源つき）" \
       "closed/close:dispatch(cli, caller=$MASTER_ROLE)" "$state"
   done
@@ -273,8 +276,7 @@ YAML
     check_eq "[$r] ⑤ busy な worker の force なしの close は断る" 1 \
       "$(grep -q "Worker is still active" "$D/edge-busy.txt" && echo 1)"
     check_eq "[$r] ⑤ 断った close はレジストリを変えない" "active/" "$(registry_state "$p")"
-    check_eq "[$r] ⑤ 断った close はペインを閉じない" 1 \
-      "$("$CLI" list | jq --argjson p "$p" '[.tabs[].panes[].id] | index($p) != null' | grep -q true && echo 1)"
+    check_eq "[$r] ⑤ 断った close はペインを閉じない" true "$(pane_listed "$p")"
   else
     fail "[$r] ⑤ busy 用の worker を spawn できない"
   fi

@@ -152,46 +152,60 @@ fn inject_record_delay() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
+    /// 札の数はプロセスで 1 つなので、札を数えるテストは 1 本ずつ走らせる
+    /// （製品の経路で札を出すのは GUI の close だけ = このクレートのテストでは他に出ない）
+    static TICKETS: Mutex<()> = Mutex::new(());
+
+    /// 測るのは時間ではなく機構の観測値（返ったときに札が残っているか・書き終わりの印が立っているか）
     #[test]
     fn flushは背景の記録が書き終わるまで待つ() {
-        // 札を 1 枚持ったまま別スレッドで 80ms 後に返す。flush はそれまで返らない
+        let _alone = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
         let ticket = Pending::enter();
-        let t0 = Instant::now();
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(80));
-            drop(ticket);
+        let wrote = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let wrote = Arc::clone(&wrote);
+            move || {
+                std::thread::sleep(Duration::from_millis(80));
+                wrote.store(true, Ordering::SeqCst);
+                drop(ticket);
+            }
         });
-        let waited = flush(Duration::from_secs(5));
-        handle.join().unwrap();
+        // 上限は書き終わりより桁で長く取る（上限で抜けたら下の印が立っておらず落ちる）
+        flush(Duration::from_secs(60));
         assert!(
-            waited >= Duration::from_millis(60) && t0.elapsed() < Duration::from_secs(5),
-            "flush が書き終わりを待っていない: {waited:?}"
+            wrote.load(Ordering::SeqCst),
+            "flush が書き終わりより先に返った"
         );
+        assert_eq!(pending(), 0, "書き終わった札が残っている");
+        handle.join().unwrap();
     }
 
     #[test]
     fn flushは上限で打ち切る() {
+        let _alone = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+        // 返さない札を持ったまま待つ。返ってきた = 上限で打ち切った（札はまだ残っている）
         let ticket = Pending::enter();
-        let waited = flush(Duration::from_millis(50));
-        drop(ticket);
-        assert!(
-            waited >= Duration::from_millis(50) && waited < Duration::from_secs(2),
-            "上限で打ち切っていない: {waited:?}"
+        flush(Duration::from_millis(50));
+        assert_eq!(
+            pending(),
+            1,
+            "札を持ったまま flush が返った = 上限で打ち切った"
         );
+        drop(ticket);
+        assert_eq!(pending(), 0);
     }
 
     #[test]
     fn 札はpanicでも返る() {
+        let _alone = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
         let handle = std::thread::spawn(|| {
             let _ticket = Pending::enter();
             panic!("記録の途中の panic");
         });
         assert!(handle.join().is_err());
-        // 札が返っていなければ上限（2 秒）まで待つ。他のテストの札（最長 80ms）は数えてよい
-        assert!(
-            flush(Duration::from_secs(2)) < Duration::from_secs(1),
-            "panic したスレッドの札が返っていない"
-        );
+        assert_eq!(pending(), 0, "panic したスレッドの札が返っていない");
     }
 }

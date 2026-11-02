@@ -32616,7 +32616,7 @@ mod tests {
         let missing = land(
             &mut host,
             Request::Close {
-                pane: Some(9_999_999),
+                pane: Some(tako_core::unused_id::pane().as_u64()),
                 force: true,
                 caller_role: None,
                 caller_pane: None,
