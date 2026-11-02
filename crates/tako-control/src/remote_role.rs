@@ -442,10 +442,8 @@ pub fn decide(change: RoleChange, caller: CallerCheck) -> GrantDecision {
             CallerCheck::Gui | CallerCheck::Unavailable => GrantDecision::Allow,
             CallerCheck::NotGui => GrantDecision::Deny {
                 code: DENY_UPGRADE_REQUIRES_GUI,
-                message: "権限を上げる操作は tako の画面（設定 → リモート、または承認\
-                          ダイアログ）からのみ行えます。CLI / MCP / スマホからは\
-                          降格と削除だけができます"
-                    .to_string(),
+                // 文は `RemoteRefusal` の正本 1 か所（daemon の表示言語。#2365 の続き）
+                message: crate::RemoteRefusal::UpgradeRequiresGui.to_string(),
             },
         },
     }

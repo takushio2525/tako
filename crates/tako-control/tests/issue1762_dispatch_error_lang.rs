@@ -13593,7 +13593,9 @@ fn cli_の台帳の手元の処理は日本語の口を呼ばない() {
 // remote 系（会話の末尾・端末の登録・daemon の admin API・スクロールバック・リモートのセットアップ =
 // `RemoteRefusal`） ----
 
-use tako_control::remote_refusal::{DaemonMessage, ScrollbackCause};
+use tako_control::platform::local_endpoint::PeerReject;
+use tako_control::remote_auth::DeviceRole;
+use tako_control::remote_refusal::{AppVia, DaemonMessage, ScrollbackCause};
 use tako_control::remote_starting::StartingMarker;
 use tako_control::RemoteRefusal;
 
@@ -13656,9 +13658,83 @@ fn remote_refusal_index(r: &RemoteRefusal) -> usize {
         RemoteRefusal::DaemonStartingStop { .. } => 32,
         RemoteRefusal::IsolatedServe => 33,
         RemoteRefusal::IsolatedInstall => 34,
+        RemoteRefusal::AdminTokenRequired => 35,
+        RemoteRefusal::DeviceIdRequired => 36,
+        RemoteRefusal::AdminEndpointNotFound => 37,
+        RemoteRefusal::ApiEndpointNotFound => 38,
+        RemoteRefusal::PaneIdInvalid => 39,
+        RemoteRefusal::SessionIdMalformed => 40,
+        RemoteRefusal::TabIdInvalid => 41,
+        RemoteRefusal::SshPaneIdNotNumeric => 42,
+        RemoteRefusal::RespondPaneIdNotNumeric => 43,
+        RemoteRefusal::ChoiceRequired => 44,
+        RemoteRefusal::ResizeSizeRequired => 45,
+        RemoteRefusal::Internal => 46,
+        RemoteRefusal::AppNotRunning(_) => 47,
+        RemoteRefusal::TabNotFound(_) => 48,
+        RemoteRefusal::PaneNotFound(_) => 49,
+        RemoteRefusal::InputSecretSuspected => 50,
+        RemoteRefusal::BodyUnreadable => 51,
+        RemoteRefusal::BodyJsonInvalid(_) => 52,
+        RemoteRefusal::OriginNotAllowed(_) => 53,
+        RemoteRefusal::PeerUnverified(_) => 54,
+        RemoteRefusal::ServeOnly => 55,
+        RemoteRefusal::ForwardedForEmpty => 56,
+        RemoteRefusal::ForwardedHostMissing => 57,
+        RemoteRefusal::ForwardedHostMismatch(_) => 58,
+        RemoteRefusal::PeerNotInTailnet(_) => 59,
+        RemoteRefusal::WhoisFailed(_) => 60,
+        RemoteRefusal::DeviceNotPaired => 61,
+        RemoteRefusal::RoleTooLow { .. } => 62,
+        RemoteRefusal::PairingRequestNotPending(_) => 63,
+        RemoteRefusal::WsProtocolRequired => 64,
+        RemoteRefusal::WsPaneQueryRequired => 65,
+        RemoteRefusal::WsKeyMissing => 66,
+        RemoteRefusal::UploadTooLarge(_) => 67,
+        RemoteRefusal::UploadNotMultipart => 68,
+        RemoteRefusal::UploadNoFile => 69,
+        RemoteRefusal::UploadPaneRequired => 70,
+        RemoteRefusal::UploadDataUnreadable => 71,
+        RemoteRefusal::UploadFileNameInvalid => 72,
+        RemoteRefusal::UploadPaneCwdUnknown => 73,
+        RemoteRefusal::UploadDirCreate(_) => 74,
+        RemoteRefusal::UploadDirSymlink => 75,
+        RemoteRefusal::UploadTargetSymlink => 76,
+        RemoteRefusal::UploadPathResolve(_) => 77,
+        RemoteRefusal::UploadWrite(_) => 78,
+        RemoteRefusal::UploadTraversal => 79,
+        RemoteRefusal::TmuxSpawn(_) => 80,
+        RemoteRefusal::TmuxDrainThread { .. } => 81,
+        RemoteRefusal::TmuxTimeout { .. } => 82,
+        RemoteRefusal::TmuxWait(_) => 83,
+        RemoteRefusal::TmuxCaptureFailed(_) => 84,
     }
 }
-const REMOTE_REFUSAL_VARIANTS: usize = 35;
+const REMOTE_REFUSAL_VARIANTS: usize = 85;
+
+/// `AppVia` / `PeerReject` の通し番号（網羅 match = 足すとここがコンパイルで落ちる）
+fn app_via_index(v: &AppVia) -> usize {
+    match v {
+        AppVia::Plain => 0,
+        AppVia::Input => 1,
+        AppVia::Respond => 2,
+        AppVia::Close => 3,
+        AppVia::TabNew => 4,
+        AppVia::MasterLaunch => 5,
+        AppVia::Tasks => 6,
+        AppVia::Cards => 7,
+    }
+}
+fn peer_reject_index(r: &PeerReject) -> usize {
+    match r {
+        PeerReject::NoPeerAddr => 0,
+        PeerReject::NotLoopback => 1,
+        PeerReject::Unresolved => 2,
+        PeerReject::OwnerUntrusted => 3,
+        PeerReject::ImageUnknown => 4,
+        PeerReject::NotTailscaleDaemon => 5,
+    }
+}
 
 /// 起こしている途中の印の見本（#2613 の断りの表に使う）
 fn starting_marker(via: &str, previous_pid: Option<u32>) -> StartingMarker {
@@ -13883,6 +13959,247 @@ fn remote_refusal_table() -> Vec<(RemoteRefusal, String)> {
              導入まで確かめるなら TAKO_REMOTE_ISOLATED_SERVE=1 を付けてください"
                 .into(),
         ),
+        // ---- daemon の HTTP API（#2365 の続き。旧文は remote.rs の handler 群・remote_auth.rs の identify /
+        // approve / deny・local_endpoint.rs の PeerReject::describe が書いていた文） ----
+        (
+            RemoteRefusal::AdminTokenRequired,
+            "管理 API はローカルの管理トークンが必要".into(),
+        ),
+        (RemoteRefusal::DeviceIdRequired, "device_id が必要".into()),
+        (
+            RemoteRefusal::AdminEndpointNotFound,
+            "管理 API エンドポイントが見つからない".into(),
+        ),
+        (
+            RemoteRefusal::ApiEndpointNotFound,
+            "API エンドポイントが見つからない".into(),
+        ),
+        (RemoteRefusal::PaneIdInvalid, "無効なペイン ID".into()),
+        (RemoteRefusal::SessionIdMalformed, "無効なセッション ID".into()),
+        (RemoteRefusal::TabIdInvalid, "無効なタブ ID".into()),
+        (
+            RemoteRefusal::SshPaneIdNotNumeric,
+            "SSH の対象は数値ペイン ID のみ（一覧の id を渡す）".into(),
+        ),
+        (
+            RemoteRefusal::RespondPaneIdNotNumeric,
+            "respond は数値ペイン ID のみ（app 稼働時の一覧から取得してください）".into(),
+        ),
+        (
+            RemoteRefusal::ChoiceRequired,
+            "choice が必要（番号または yes/no）".into(),
+        ),
+        (
+            RemoteRefusal::ResizeSizeRequired,
+            "cols と rows（正の整数）か reset=true を指定する".into(),
+        ),
+        (RemoteRefusal::Internal, "内部エラー".into()),
+        (
+            RemoteRefusal::AppNotRunning(AppVia::Plain),
+            "tako app が稼働していない".into(),
+        ),
+        (
+            RemoteRefusal::AppNotRunning(AppVia::Input),
+            "tako app が稼働していない（リモートからの入力は app 経由のみ）".into(),
+        ),
+        (
+            RemoteRefusal::AppNotRunning(AppVia::Respond),
+            "tako app が稼働していない（リモートからの承認応答は app 経由のみ）".into(),
+        ),
+        (
+            RemoteRefusal::AppNotRunning(AppVia::Close),
+            "tako app が稼働していない（リモートからの close は app 経由のみ）".into(),
+        ),
+        (
+            RemoteRefusal::AppNotRunning(AppVia::TabNew),
+            "tako app が稼働していない（リモートからのタブ作成は app 経由のみ）".into(),
+        ),
+        (
+            RemoteRefusal::AppNotRunning(AppVia::MasterLaunch),
+            "tako app が稼働していない（リモートからの master 起動は app 経由のみ）".into(),
+        ),
+        (
+            RemoteRefusal::AppNotRunning(AppVia::Tasks),
+            "tako app が稼働していない（タスクの操作は app 経由のみ）".into(),
+        ),
+        (
+            RemoteRefusal::AppNotRunning(AppVia::Cards),
+            "tako app が稼働していない（コマンドカードの操作は app 経由のみ）".into(),
+        ),
+        (RemoteRefusal::TabNotFound(7), "タブ 7 が見つからない".into()),
+        (
+            RemoteRefusal::PaneNotFound("=tako-x:0.0".into()),
+            "ペイン '=tako-x:0.0' が見つからない".into(),
+        ),
+        (
+            RemoteRefusal::InputSecretSuspected,
+            "鍵らしき文字が入っている（送っていない）".into(),
+        ),
+        (
+            RemoteRefusal::BodyUnreadable,
+            "リクエストボディの読み取りに失敗".into(),
+        ),
+        (
+            RemoteRefusal::BodyJsonInvalid("expected value at line 1 column 1".into()),
+            "JSON パースエラー: expected value at line 1 column 1".into(),
+        ),
+        (
+            RemoteRefusal::OriginNotAllowed("https://evil.example".into()),
+            "Origin 'https://evil.example' は許可されていない".into(),
+        ),
+        (
+            RemoteRefusal::PeerUnverified(PeerReject::NoPeerAddr),
+            "serve 経由を名乗る接続の接続元を検証できない: 接続元アドレスを取得できない".into(),
+        ),
+        (
+            RemoteRefusal::PeerUnverified(PeerReject::NotLoopback),
+            "serve 経由を名乗る接続の接続元を検証できない: 接続元がループバックではない".into(),
+        ),
+        (
+            RemoteRefusal::PeerUnverified(PeerReject::Unresolved),
+            "serve 経由を名乗る接続の接続元を検証できない: 接続元プロセスを特定できない".into(),
+        ),
+        (
+            RemoteRefusal::PeerUnverified(PeerReject::OwnerUntrusted),
+            "serve 経由を名乗る接続の接続元を検証できない: 接続元プロセスの所有ユーザーが一致しない"
+                .into(),
+        ),
+        (
+            RemoteRefusal::PeerUnverified(PeerReject::ImageUnknown),
+            "serve 経由を名乗る接続の接続元を検証できない: 接続元プロセスの実行ファイルを読めない"
+                .into(),
+        ),
+        (
+            RemoteRefusal::PeerUnverified(PeerReject::NotTailscaleDaemon),
+            "serve 経由を名乗る接続の接続元を検証できない: 接続元プロセスが tailscale デーモンではない"
+                .into(),
+        ),
+        (
+            RemoteRefusal::ServeOnly,
+            "tailscale serve 経由のアクセスのみ受け付ける".into(),
+        ),
+        (RemoteRefusal::ForwardedForEmpty, "X-Forwarded-For が空".into()),
+        (
+            RemoteRefusal::ForwardedHostMissing,
+            "X-Forwarded-For はあるが X-Forwarded-Host が欠落（serve 経由でない可能性）".into(),
+        ),
+        (
+            RemoteRefusal::ForwardedHostMismatch("evil.tail0000.ts.net".into()),
+            "X-Forwarded-Host が期待値と不一致（受信: evil.tail0000.ts.net）".into(),
+        ),
+        (
+            RemoteRefusal::PeerNotInTailnet("100.64.0.9".into()),
+            "接続元 100.64.0.9 は tailnet 上のノードではない（whois: peer not found）".into(),
+        ),
+        (
+            RemoteRefusal::WhoisFailed("exit status 1".into()),
+            "接続元の identity 検証に失敗: exit status 1".into(),
+        ),
+        (
+            RemoteRefusal::DeviceNotPaired,
+            "この端末はペアリングされていない。PWA のペアリング画面から要求してください".into(),
+        ),
+        (
+            RemoteRefusal::RoleTooLow {
+                required: DeviceRole::Manage,
+                current: DeviceRole::Observe,
+            },
+            "この操作には manage 以上の role が必要（現在: observe）。\
+             role の変更はペアリング画面から要求できます"
+                .into(),
+        ),
+        (
+            RemoteRefusal::PairingRequestNotPending("dev-1".into()),
+            "保留中のペアリング要求が無い: dev-1".into(),
+        ),
+        (
+            RemoteRefusal::WsProtocolRequired,
+            "Sec-WebSocket-Protocol に 'tako-remote' が必要".into(),
+        ),
+        (RemoteRefusal::WsPaneQueryRequired, "pane クエリが必要".into()),
+        (
+            RemoteRefusal::WsKeyMissing,
+            "Sec-WebSocket-Key ヘッダが無い".into(),
+        ),
+        (
+            RemoteRefusal::UploadTooLarge(20),
+            "ファイルサイズが上限 (20MB) を超えています".into(),
+        ),
+        (
+            RemoteRefusal::UploadNotMultipart,
+            "multipart/form-data が必要です".into(),
+        ),
+        (RemoteRefusal::UploadNoFile, "ファイルが含まれていません".into()),
+        (
+            RemoteRefusal::UploadPaneRequired,
+            "pane パラメータが必要です".into(),
+        ),
+        (
+            RemoteRefusal::UploadDataUnreadable,
+            "ファイルデータの読み取りに失敗".into(),
+        ),
+        (RemoteRefusal::UploadFileNameInvalid, "不正なファイル名です".into()),
+        (
+            RemoteRefusal::UploadPaneCwdUnknown,
+            "対象ペインの作業ディレクトリが取得できません".into(),
+        ),
+        (
+            RemoteRefusal::UploadDirCreate(EACCES.into()),
+            format!("アップロードディレクトリの作成に失敗: {EACCES}"),
+        ),
+        (
+            RemoteRefusal::UploadDirSymlink,
+            "アップロード先がシンボリックリンクのため拒否しました".into(),
+        ),
+        (
+            RemoteRefusal::UploadTargetSymlink,
+            "既存のシンボリックリンクへの上書きは拒否しました".into(),
+        ),
+        (
+            RemoteRefusal::UploadPathResolve(EACCES.into()),
+            format!("パス解決に失敗: {EACCES}"),
+        ),
+        (
+            RemoteRefusal::UploadWrite(EACCES.into()),
+            format!("ファイル書き込みに失敗: {EACCES}"),
+        ),
+        (
+            RemoteRefusal::UploadTraversal,
+            "パス traversal が検出されました".into(),
+        ),
+        (
+            RemoteRefusal::TmuxSpawn("No such file or directory (os error 2)".into()),
+            "tmux コマンドの起動に失敗: No such file or directory (os error 2)".into(),
+        ),
+        (
+            RemoteRefusal::TmuxDrainThread {
+                stream: "stdout",
+                error: "Resource temporarily unavailable (os error 35)".into(),
+            },
+            "stdout drain スレッドの起動に失敗: Resource temporarily unavailable (os error 35)".into(),
+        ),
+        (
+            RemoteRefusal::TmuxDrainThread {
+                stream: "stderr",
+                error: "Resource temporarily unavailable (os error 35)".into(),
+            },
+            "stderr drain スレッドの起動に失敗: Resource temporarily unavailable (os error 35)".into(),
+        ),
+        (
+            RemoteRefusal::TmuxTimeout {
+                command: "capture-pane".into(),
+                secs: 5,
+            },
+            "tmux capture-pane がタイムアウト（5秒）".into(),
+        ),
+        (
+            RemoteRefusal::TmuxWait("Interrupted system call (os error 4)".into()),
+            "プロセスの待機に失敗: Interrupted system call (os error 4)".into(),
+        ),
+        (
+            RemoteRefusal::TmuxCaptureFailed("can't find pane: %9\n".into()),
+            "tmux capture-pane がエラー: can't find pane: %9\n".into(),
+        ),
     ]
 }
 
@@ -13944,6 +14261,17 @@ fn remote系の断りは全バリアントが日英を持ち日本語は2365よ�
     }
     covers_every(&messages, daemon_message_index, 3, "DaemonMessage");
     covers_every(&causes, scrollback_cause_index, 2, "ScrollbackCause");
+    let mut vias = Vec::new();
+    let mut rejects = Vec::new();
+    for (r, _) in &table {
+        match r {
+            RemoteRefusal::AppNotRunning(via) => vias.push(*via),
+            RemoteRefusal::PeerUnverified(reject) => rejects.push(*reject),
+            _ => {}
+        }
+    }
+    covers_every(&vias, app_via_index, 8, "AppVia");
+    covers_every(&rejects, peer_reject_index, 6, "PeerReject");
 
     let mut failures = Vec::new();
     for (r, old) in table.iter().chain(&wrapped) {
@@ -13977,7 +14305,8 @@ fn remote系の断りは全バリアントが日英を持ち日本語は2365よ�
 }
 
 /// daemon の admin API の本文（`admin_body`）を頼んだ側（`from_admin_body`）が読み直すと、同じ断りに戻る。
-/// `error` は修正前と同じ日本語（PWA・旧版の頼み手が読む）、`kind` の無い本文は `error` をそのまま載せる
+/// `error` は daemon の表示言語（日本語表示は修正前と同じ文。#2365 の続き）、`kind` の無い本文は
+/// `error` をそのまま載せる
 #[test]
 fn daemonの断りの本文はkindで呼び手の言語に組み直せる() {
     let mut failures = Vec::new();
@@ -13986,8 +14315,12 @@ fn daemonの断りの本文はkindで呼び手の言語に組み直せる() {
         RemoteRefusal::UpgradeRequiresGui,
     ] {
         let body = r.admin_body();
-        if body["error"].as_str() != Some(r.text_in(Lang::Ja).as_str()) {
-            failures.push(format!("{r:?}: 本文の error が日本語の旧文と違う: {body}"));
+        // 表示言語はテストの外（並列のテスト）が決めるので、日英どちらかの文であることを見る
+        let error = body["error"].as_str().unwrap_or_default();
+        if error != r.text_in(Lang::Ja) && error != r.text_in(Lang::En) {
+            failures.push(format!(
+                "{r:?}: 本文の error が日英どちらの文でもない: {body}"
+            ));
         }
         match RemoteRefusal::from_admin_body(&body) {
             DaemonMessage::Refusal(back) if *back == r => {}
@@ -14008,6 +14341,196 @@ fn daemonの断りの本文はkindで呼び手の言語に組み直せる() {
     let partial = serde_json::json!({ "error": "x", "kind": "device_not_registered" });
     if RemoteRefusal::from_admin_body(&partial) != DaemonMessage::Text("x".into()) {
         failures.push(format!("device_id の無い本文 {partial} を組み直している"));
+    }
+    report_all(failures);
+}
+
+const REMOTE_ROLE_SRC: &str = include_str!("../src/remote_role.rs");
+const REMOTE_ROLE_PATH: &str = "crates/tako-control/src/remote_role.rs";
+
+/// daemon の HTTP API（PWA・管理 API）が本文の `error` へ載せる断りを組む範囲（#2365 の続き）。
+/// handler 群と、そこへ断りの文を渡す remote.rs / remote_auth.rs / remote_role.rs の口。
+/// 範囲の外: `remote_files` / `remote_tasks` / `remote_cards` / `remote_ssh` の受け口（Issue #2365 の残り）
+const REMOTE_HTTP_SCOPES: &[(&str, &str, &str)] = &[
+    (REMOTE_PATH, REMOTE_SRC, "fn refuse("),
+    (REMOTE_PATH, REMOTE_SRC, "fn forwarded_identity("),
+    (REMOTE_PATH, REMOTE_SRC, "fn authorize_device("),
+    (REMOTE_PATH, REMOTE_SRC, "fn identify_tailnet("),
+    (REMOTE_PATH, REMOTE_SRC, "fn tmux_output_with_timeout("),
+    (REMOTE_PATH, REMOTE_SRC, "fn tmux_capture_pane("),
+    (REMOTE_PATH, REMOTE_SRC, "fn check_request_origin("),
+    (REMOTE_PATH, REMOTE_SRC, "fn read_json_body("),
+    (REMOTE_PATH, REMOTE_SRC, "fn app_request("),
+    (REMOTE_PATH, REMOTE_SRC, "fn input_reply("),
+    (REMOTE_PATH, REMOTE_SRC, "fn dispatch_send("),
+    (REMOTE_PATH, REMOTE_SRC, "fn dispatch_respond("),
+    (REMOTE_PATH, REMOTE_SRC, "fn dispatch_close("),
+    (REMOTE_PATH, REMOTE_SRC, "fn handle_request_v2("),
+    (REMOTE_PATH, REMOTE_SRC, "fn handle_admin_api("),
+    (REMOTE_PATH, REMOTE_SRC, "fn handle_ssh_open("),
+    (REMOTE_PATH, REMOTE_SRC, "fn handle_api_v2_routes("),
+    (REMOTE_PATH, REMOTE_SRC, "fn handle_master_profiles("),
+    (REMOTE_PATH, REMOTE_SRC, "fn handle_tab_new("),
+    (REMOTE_PATH, REMOTE_SRC, "fn handle_tab_master("),
+    (REMOTE_PATH, REMOTE_SRC, "fn app_dispatch("),
+    (REMOTE_PATH, REMOTE_SRC, "fn handle_upload("),
+    (REMOTE_PATH, REMOTE_SRC, "fn parse_multipart("),
+    (REMOTE_PATH, REMOTE_SRC, "fn handle_ws_v2("),
+    (REMOTE_AUTH_PATH, REMOTE_AUTH_SRC, "pub fn identify("),
+    (
+        REMOTE_AUTH_PATH,
+        REMOTE_AUTH_SRC,
+        "    pub fn approve_typed(",
+    ),
+    (REMOTE_AUTH_PATH, REMOTE_AUTH_SRC, "    pub fn deny_typed("),
+    (REMOTE_ROLE_PATH, REMOTE_ROLE_SRC, "pub fn decide("),
+];
+
+/// HTTP の本文ではない出力（persist.log の行・デスクトップ通知・届かない印）。この中の日本語は見ない
+const REMOTE_HTTP_INTERNAL: &[&str] = &[
+    "unreachable!(",
+    ".expect(",
+    "persist_log(",
+    "notify_desktop(",
+];
+
+/// handler 群が呼んではならない日本語の口（`String` を返す従来の口。断りが日本語で固定される）
+const JA_HTTP_CALLS: [&str; 5] = [
+    ".approve(",
+    ".deny(",
+    ".revoke(",
+    "read_messages(",
+    "list_agents_with_panes(",
+];
+
+/// 1 つの範囲の違反（日本語の固定文と日本語の口の呼び出し）を `file:line` つきで並べる
+fn remote_http_failures(path: &str, src: &str, head: &str) -> Vec<String> {
+    let Some(lines) = run_value_lines(src, head) else {
+        return vec![format!(
+            "{path}: 走査の範囲 `{}` が見つからない（改名で番犬が空振りする。REMOTE_HTTP_SCOPES を直す）",
+            head.trim()
+        )];
+    };
+    let mut out = Vec::new();
+    for (line, text) in japanese_outside(&lines, REMOTE_HTTP_INTERNAL) {
+        out.push(format!(
+            "{path}:{line}: daemon の HTTP の本文に日本語の固定文がある = 英語表示の daemon でもそのまま \
+             PWA / 管理 API へ出る（RemoteRefusal へバリアントを足し、日英の対を text_in に書く）: {text}"
+        ));
+    }
+    for (line, code) in &lines {
+        let code_part = code.split("//").next().unwrap_or("");
+        for call in JA_HTTP_CALLS {
+            if code_part.contains(call) {
+                out.push(format!(
+                    "{path}:{line}: daemon の HTTP の口が日本語の口 `{call}…` を呼んでいる = 英語表示の daemon でも \
+                     断りが日本語で返る（`*_typed` を呼ぶ）: {}",
+                    code.trim()
+                ));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn daemonのhttpの断りに日本語の固定文が無く日本語の口を呼ばない() {
+    let mut failures = Vec::new();
+    for (path, src, head) in REMOTE_HTTP_SCOPES {
+        failures.extend(remote_http_failures(path, src, head));
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 本物のソースへ素の文・日本語の口を植え戻すと、植えた行を `file:line` で名指す
+#[test]
+fn daemonのhttpの番犬は本物のソースへ植えた日本語の断りを名指す() {
+    let cases: &[(&str, &str, &str, &str, &str)] = &[
+        (
+            REMOTE_PATH,
+            REMOTE_SRC,
+            "fn handle_tab_master(",
+            "return refuse(request, 400, crate::RemoteRefusal::TabIdInvalid);",
+            r#"return respond(request, 400, Some(json!({ "error": "無効なタブ ID" }).to_string()));"#,
+        ),
+        (
+            REMOTE_PATH,
+            REMOTE_SRC,
+            "fn handle_api_v2_routes(",
+            "_ => refuse(request, 404, crate::RemoteRefusal::ApiEndpointNotFound),",
+            r#"_ => respond(request, 404, Some(json!({ "error": "API エンドポイントが見つからない" }).to_string())),"#,
+        ),
+        (
+            REMOTE_PATH,
+            REMOTE_SRC,
+            "fn app_dispatch(",
+            ".ok_or_else(|| (503u16, crate::RemoteRefusal::AppNotRunning(via).to_string()))?;",
+            r#".ok_or_else(|| (503u16, format!("tako app が稼働していない（{via:?}は app 経由のみ）")))?;"#,
+        ),
+        (
+            REMOTE_PATH,
+            REMOTE_SRC,
+            "fn read_json_body(",
+            ".map_err(|_| crate::RemoteRefusal::BodyUnreadable.to_string())?;",
+            r#".map_err(|_| "リクエストボディの読み取りに失敗".to_string())?;"#,
+        ),
+        (
+            REMOTE_PATH,
+            REMOTE_SRC,
+            "fn handle_admin_api(",
+            ".approve_typed(device_id, role);",
+            ".approve(device_id, role);",
+        ),
+        (
+            REMOTE_PATH,
+            REMOTE_SRC,
+            "fn handle_api_v2_routes(",
+            "crate::transcript::read_messages_typed(",
+            "crate::transcript::read_messages(",
+        ),
+        (
+            REMOTE_AUTH_PATH,
+            REMOTE_AUTH_SRC,
+            "pub fn identify(",
+            "return Err(RemoteRefusal::ForwardedForEmpty);",
+            r#"return Err("X-Forwarded-For が空".into());"#,
+        ),
+        (
+            REMOTE_ROLE_PATH,
+            REMOTE_ROLE_SRC,
+            "pub fn decide(",
+            "message: crate::RemoteRefusal::UpgradeRequiresGui.to_string(),",
+            r#"message: "権限を上げる操作は tako の画面からのみ".to_string(),"#,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (path, src, head, from, to) in cases {
+        if src.matches(from).count() != 1 {
+            failures.push(format!(
+                "{path}: 植える元 `{from}` が 1 か所ではない（{} か所。番犬の検査の前提が崩れた）",
+                src.matches(from).count()
+            ));
+            continue;
+        }
+        let at = src.find(from).unwrap_or(0);
+        let line = src[..at].matches('\n').count() + 1;
+        let injected = src.replacen(from, to, 1);
+        let named = format!("{path}:{line}:");
+        let got = remote_http_failures(path, &injected, head);
+        if !got.iter().any(|f| f.starts_with(&named)) {
+            failures.push(format!(
+                "{path}:{line}: `{to}` を植えても番犬が名指さない（{head}）: {got:?}"
+            ));
+        }
+    }
+    // 植えていない本物のソースは名指さない（上の検査が空振りでないことの対照）
+    for (path, src, head) in REMOTE_HTTP_SCOPES {
+        let got = remote_http_failures(path, src, head);
+        if !got.is_empty() {
+            failures.push(format!(
+                "{path}: 植えていないのに名指した（{head}）: {got:?}"
+            ));
+        }
     }
     report_all(failures);
 }

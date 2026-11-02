@@ -17,16 +17,21 @@
 //! # 口
 //!
 //! dispatch と CLI だけが呼ぶ口（`remote::devices_*` / `admin_request` / `scrollback*` /
-//! `remote_setup::run_noninteractive`）はこの型を返す。daemon の中や対話のウィザードも使う口
+//! `remote_setup::run_noninteractive`）はこの型を返す。対話のウィザードや起動時の断りも使う口
 //! （`transcript::read_messages` / `DeviceRegistry::open` / `revoke` / `set_role` /
 //! `remote_setup::decide_variant` / `tailscale::save_variant`）は `String` を返す従来の形を残し、文は
-//! **日本語のまま**（daemon が PWA へ返す本文・起動時の断り・日本語の対話）。dispatch と CLI は型の口
-//! （`*_typed`）を通す。
+//! **日本語のまま**（起動時の断り・日本語の対話）。dispatch と CLI は型の口（`*_typed`）を通す。
 //!
-//! daemon の admin API の断り（端末が登録されていない・昇格は画面からだけ）は、本文の `error`（日本語）に
-//! 加えて `kind` を返し、頼んだ側（[`crate::remote::admin_request`]）が `kind` から呼び手の表示言語で
-//! 組み直す（daemon の表示言語は起動した時点のまま）。`kind` の無い本文（旧版の daemon・それ以外の断り）は
-//! `error` を手を加えずに載せる。
+//! daemon の HTTP API（PWA と管理 API）が返す本文の `error` も、この型を daemon の表示言語で文にして
+//! 載せる（#2365 の続き。以前は handler 群が日本語の固定文を直に書いていた）。daemon の表示言語は
+//! 起動した時点で設定から決まり（#1077）、`tako lang` を切り替えても起こし直すまで前の言語のまま。
+//! PWA は `error` を表示に使うだけで、分岐はステータスコードと `kind` / `paste_guard` で行う
+//! （日本語の字面に依らない）。daemon の中で型の口（`*_typed`）を呼び、`to_string()` で文にする。
+//!
+//! daemon の admin API の断り（端末が登録されていない・昇格は画面からだけ）は、本文の `error` に加えて
+//! `kind` を返し、頼んだ側（[`crate::remote::admin_request`]）が `kind` から呼び手の表示言語で
+//! 組み直す（daemon と呼び手の表示言語が違ってもそろう）。`kind` の無い本文（旧版の daemon・それ以外の
+//! 断り）は `error` を手を加えずに載せる。
 //!
 //! OS / serde / tmux のエラー文は言語に依らずそのまま載せる。「見つからない」系は英語にも ` not found` を
 //! 含め、[`crate::DispatchError::says_not_found`] の当たり方を日英でそろえる。
@@ -138,6 +143,132 @@ pub enum RemoteRefusal {
     /// 隔離中なので、対話の `tako remote setup` が未導入の Tailscale を導入しなかった（#2624。
     /// 導入器はこの機械全体へ入れる。通すのは `TAKO_REMOTE_ISOLATED_SERVE=1` だけ）
     IsolatedInstall,
+
+    // ---- daemon の HTTP API（PWA・管理 API が受け取る本文の `error`。#2365 の続き） ----
+    /// 管理 API へ管理トークン無しで来た
+    AdminTokenRequired,
+    /// 本文に `device_id` が無い
+    DeviceIdRequired,
+    /// 管理 API に無い経路
+    AdminEndpointNotFound,
+    /// API に無い経路
+    ApiEndpointNotFound,
+    /// パスからペイン ID を取り出せない
+    PaneIdInvalid,
+    /// パスからセッション ID を取り出せない
+    SessionIdMalformed,
+    /// パスからタブ ID を取り出せない
+    TabIdInvalid,
+    /// SSH の対象が数値のペイン ID でない
+    SshPaneIdNotNumeric,
+    /// respond の対象が数値のペイン ID でない
+    RespondPaneIdNotNumeric,
+    /// respond の本文に `choice` が無い
+    ChoiceRequired,
+    /// resize の大きさの指定が無い（app 不在の tmux 直の経路）
+    ResizeSizeRequired,
+    /// 内部のロックが毒（他のスレッドが握ったまま panic した）
+    Internal,
+    /// tako app が動いていないので、app 経由の操作を断った
+    AppNotRunning(AppVia),
+    /// タブが一覧に無い（日本語は tako-core の `WorkspaceError::TabNotFound` と同じ文）
+    TabNotFound(u64),
+    /// ペインを解決できない（中身は渡されたペインの指定の表記）
+    PaneNotFound(String),
+    /// 鍵らしき文字が入っていたので送らなかった（#2050）
+    InputSecretSuspected,
+    /// 本文を読めない
+    BodyUnreadable,
+    /// 本文を JSON として読めない（serde のエラー文）
+    BodyJsonInvalid(String),
+    /// Origin が daemon の URL と違う（中身はヘッダの値）
+    OriginNotAllowed(String),
+    /// serve 経由を名乗る接続の接続元を確かめられない（#841）
+    PeerUnverified(crate::platform::local_endpoint::PeerReject),
+    /// serve 経由でない（`X-Forwarded-For` の無い）アクセス
+    ServeOnly,
+    /// `X-Forwarded-For` が空
+    ForwardedForEmpty,
+    /// `X-Forwarded-For` はあるが `X-Forwarded-Host` が無い
+    ForwardedHostMissing,
+    /// `X-Forwarded-Host` が自ノードの名前と違う（中身は受け取った値）
+    ForwardedHostMismatch(String),
+    /// 接続元が tailnet のノードではない（中身は接続元の IP）
+    PeerNotInTailnet(String),
+    /// 接続元の identity を確かめられない（中身は whois のエラー文）
+    WhoisFailed(String),
+    /// ペアリングされていない端末
+    DeviceNotPaired,
+    /// 端末の role が足りない
+    RoleTooLow {
+        required: crate::remote_auth::DeviceRole,
+        current: crate::remote_auth::DeviceRole,
+    },
+    /// 承認 / 拒否の対象の保留中の要求が無い（中身は端末の ID）
+    PairingRequestNotPending(String),
+    /// WebSocket の要求に tako のサブプロトコルが無い
+    WsProtocolRequired,
+    /// WebSocket の要求に `pane` のクエリが無い
+    WsPaneQueryRequired,
+    /// WebSocket の要求に `Sec-WebSocket-Key` が無い
+    WsKeyMissing,
+    /// アップロードが上限を超えた（中身は上限の MB）
+    UploadTooLarge(u64),
+    /// アップロードが multipart/form-data でない
+    UploadNotMultipart,
+    /// multipart にファイルが無い
+    UploadNoFile,
+    /// multipart に `pane` が無い
+    UploadPaneRequired,
+    /// multipart のファイルの中身を取り出せない
+    UploadDataUnreadable,
+    /// ファイル名がパスを含む・空
+    UploadFileNameInvalid,
+    /// 対象ペインの作業ディレクトリを引けない
+    UploadPaneCwdUnknown,
+    /// 置き場（`.tako-remote-uploads/`）を作れない（OS のエラー文）
+    UploadDirCreate(String),
+    /// 置き場がシンボリックリンク
+    UploadDirSymlink,
+    /// 書き先が既存のシンボリックリンク
+    UploadTargetSymlink,
+    /// 置き場のパスを解決できない（OS のエラー文）
+    UploadPathResolve(String),
+    /// ファイルを書けない（OS のエラー文）
+    UploadWrite(String),
+    /// 書いた先が置き場の外だった
+    UploadTraversal,
+    /// tmux を起こせない（OS のエラー文）
+    TmuxSpawn(String),
+    /// tmux の出力を読むスレッドを起こせない（`stream` は `stdout` / `stderr`）
+    TmuxDrainThread { stream: &'static str, error: String },
+    /// tmux が時間内に終わらない（`command` は tmux のサブコマンド）
+    TmuxTimeout { command: String, secs: u64 },
+    /// tmux の終わりを待てない（OS のエラー文）
+    TmuxWait(String),
+    /// tmux capture-pane が失敗した（tmux 自身の出力は手を加えずに載る）
+    TmuxCaptureFailed(String),
+}
+
+/// tako app 経由でしか行えない daemon の操作（[`RemoteRefusal::AppNotRunning`] の括弧の中身）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppVia {
+    /// 括弧を付けない「tako app が稼働していない」
+    Plain,
+    /// スマホからの入力（`POST /api/panes/:id/input`）
+    Input,
+    /// 承認ダイアログへの応答（`POST /api/panes/:id/respond`）
+    Respond,
+    /// ペインを閉じる（`POST /api/panes/:id/close`）
+    Close,
+    /// タブを作る（`POST /api/tabs`）
+    TabNew,
+    /// master を起こす（`POST /api/tabs/:id/master`）
+    MasterLaunch,
+    /// 人がやることの操作（`/api/tasks…`）
+    Tasks,
+    /// コマンドカードの操作（`/api/cards…`）
+    Cards,
 }
 
 /// daemon が断ったときの本文の中身
@@ -387,6 +518,211 @@ impl RemoteRefusal {
                  the installer fake). To exercise the install, set {}=1",
                 crate::remote_isolated_serve::OPT_IN_ENV
             ),
+            (Self::AdminTokenRequired, Ja) => "管理 API はローカルの管理トークンが必要".to_string(),
+            (Self::AdminTokenRequired, En) => {
+                "the admin API needs the local admin token".to_string()
+            }
+            (Self::DeviceIdRequired, Ja) => "device_id が必要".to_string(),
+            (Self::DeviceIdRequired, En) => "device_id is required".to_string(),
+            (Self::AdminEndpointNotFound, Ja) => "管理 API エンドポイントが見つからない".to_string(),
+            (Self::AdminEndpointNotFound, En) => "admin API endpoint not found".to_string(),
+            (Self::ApiEndpointNotFound, Ja) => "API エンドポイントが見つからない".to_string(),
+            (Self::ApiEndpointNotFound, En) => "API endpoint not found".to_string(),
+            (Self::PaneIdInvalid, Ja) => "無効なペイン ID".to_string(),
+            (Self::PaneIdInvalid, En) => "invalid pane ID".to_string(),
+            (Self::SessionIdMalformed, Ja) => "無効なセッション ID".to_string(),
+            (Self::SessionIdMalformed, En) => "invalid session ID".to_string(),
+            (Self::TabIdInvalid, Ja) => "無効なタブ ID".to_string(),
+            (Self::TabIdInvalid, En) => "invalid tab ID".to_string(),
+            (Self::SshPaneIdNotNumeric, Ja) => {
+                "SSH の対象は数値ペイン ID のみ（一覧の id を渡す）".to_string()
+            }
+            (Self::SshPaneIdNotNumeric, En) => {
+                "the SSH target must be a numeric pane ID (pass an id from the list)".to_string()
+            }
+            (Self::RespondPaneIdNotNumeric, Ja) => {
+                "respond は数値ペイン ID のみ（app 稼働時の一覧から取得してください）".to_string()
+            }
+            (Self::RespondPaneIdNotNumeric, En) => {
+                "respond takes a numeric pane ID only (take one from the list while the app is running)"
+                    .to_string()
+            }
+            (Self::ChoiceRequired, Ja) => "choice が必要（番号または yes/no）".to_string(),
+            (Self::ChoiceRequired, En) => "choice is required (a number or yes/no)".to_string(),
+            (Self::ResizeSizeRequired, Ja) => {
+                "cols と rows（正の整数）か reset=true を指定する".to_string()
+            }
+            (Self::ResizeSizeRequired, En) => {
+                "specify cols and rows (positive integers) or reset=true".to_string()
+            }
+            (Self::Internal, Ja) => "内部エラー".to_string(),
+            (Self::Internal, En) => "internal error".to_string(),
+            (Self::AppNotRunning(via), Ja) => match via.what_in(lang) {
+                Some(what) => format!("tako app が稼働していない（{what}は app 経由のみ）"),
+                None => "tako app が稼働していない".to_string(),
+            },
+            (Self::AppNotRunning(via), En) => match via.what_in(lang) {
+                Some(what) => format!("the tako app is not running (the app is required for {what})"),
+                None => "the tako app is not running".to_string(),
+            },
+            (Self::TabNotFound(id), Ja) => format!("タブ {id} が見つからない"),
+            (Self::TabNotFound(id), En) => format!("tab {id} not found"),
+            (Self::PaneNotFound(pane), Ja) => format!("ペイン '{pane}' が見つからない"),
+            (Self::PaneNotFound(pane), En) => format!("pane '{pane}' not found"),
+            (Self::InputSecretSuspected, Ja) => {
+                "鍵らしき文字が入っている（送っていない）".to_string()
+            }
+            (Self::InputSecretSuspected, En) => {
+                "the text looks like it contains a secret (not sent)".to_string()
+            }
+            (Self::BodyUnreadable, Ja) => "リクエストボディの読み取りに失敗".to_string(),
+            (Self::BodyUnreadable, En) => "failed to read the request body".to_string(),
+            (Self::BodyJsonInvalid(error), Ja) => format!("JSON パースエラー: {error}"),
+            (Self::BodyJsonInvalid(error), En) => format!("JSON parse error: {error}"),
+            (Self::OriginNotAllowed(origin), Ja) => format!("Origin '{origin}' は許可されていない"),
+            (Self::OriginNotAllowed(origin), En) => format!("Origin '{origin}' is not allowed"),
+            (Self::PeerUnverified(reject), Ja) => format!(
+                "serve 経由を名乗る接続の接続元を検証できない: {}",
+                reject.describe_in(lang)
+            ),
+            (Self::PeerUnverified(reject), En) => format!(
+                "cannot verify the peer of a connection that claims to come through serve: {}",
+                reject.describe_in(lang)
+            ),
+            (Self::ServeOnly, Ja) => "tailscale serve 経由のアクセスのみ受け付ける".to_string(),
+            (Self::ServeOnly, En) => "only access through tailscale serve is accepted".to_string(),
+            (Self::ForwardedForEmpty, Ja) => "X-Forwarded-For が空".to_string(),
+            (Self::ForwardedForEmpty, En) => "X-Forwarded-For is empty".to_string(),
+            (Self::ForwardedHostMissing, Ja) => {
+                "X-Forwarded-For はあるが X-Forwarded-Host が欠落（serve 経由でない可能性）"
+                    .to_string()
+            }
+            (Self::ForwardedHostMissing, En) => {
+                "X-Forwarded-For is present but X-Forwarded-Host is missing (possibly not through serve)"
+                    .to_string()
+            }
+            (Self::ForwardedHostMismatch(host), Ja) => {
+                format!("X-Forwarded-Host が期待値と不一致（受信: {host}）")
+            }
+            (Self::ForwardedHostMismatch(host), En) => {
+                format!("X-Forwarded-Host does not match the expected value (received: {host})")
+            }
+            // 日本語も英語も whois の言い方（`peer not found`）をそのまま括弧に残す
+            (Self::PeerNotInTailnet(ip), Ja) => {
+                format!("接続元 {ip} は tailnet 上のノードではない（whois: peer not found）")
+            }
+            (Self::PeerNotInTailnet(ip), En) => {
+                format!("the peer {ip} is not a node on the tailnet (whois: peer not found)")
+            }
+            (Self::WhoisFailed(error), Ja) => format!("接続元の identity 検証に失敗: {error}"),
+            (Self::WhoisFailed(error), En) => {
+                format!("failed to verify the identity of the peer: {error}")
+            }
+            (Self::DeviceNotPaired, Ja) => {
+                "この端末はペアリングされていない。PWA のペアリング画面から要求してください"
+                    .to_string()
+            }
+            (Self::DeviceNotPaired, En) => {
+                "this device is not paired. Request pairing from the pairing screen of the PWA"
+                    .to_string()
+            }
+            (Self::RoleTooLow { required, current }, Ja) => format!(
+                "この操作には {} 以上の role が必要（現在: {}）。\
+                 role の変更はペアリング画面から要求できます",
+                required.as_str(),
+                current.as_str()
+            ),
+            (Self::RoleTooLow { required, current }, En) => format!(
+                "this operation needs the {} role or higher (current: {}). \
+                 You can request a role change from the pairing screen",
+                required.as_str(),
+                current.as_str()
+            ),
+            // 日本語が「見つからない」と言わないので、英語も ` not found` を含めない
+            (Self::PairingRequestNotPending(id), Ja) => {
+                format!("保留中のペアリング要求が無い: {id}")
+            }
+            (Self::PairingRequestNotPending(id), En) => {
+                format!("there is no pending pairing request: {id}")
+            }
+            (Self::WsProtocolRequired, Ja) => format!(
+                "Sec-WebSocket-Protocol に '{}' が必要",
+                crate::remote::WS_PROTOCOL
+            ),
+            (Self::WsProtocolRequired, En) => format!(
+                "Sec-WebSocket-Protocol must include '{}'",
+                crate::remote::WS_PROTOCOL
+            ),
+            (Self::WsPaneQueryRequired, Ja) => "pane クエリが必要".to_string(),
+            (Self::WsPaneQueryRequired, En) => "the pane query is required".to_string(),
+            (Self::WsKeyMissing, Ja) => "Sec-WebSocket-Key ヘッダが無い".to_string(),
+            (Self::WsKeyMissing, En) => "the Sec-WebSocket-Key header is missing".to_string(),
+            (Self::UploadTooLarge(mb), Ja) => {
+                format!("ファイルサイズが上限 ({mb}MB) を超えています")
+            }
+            (Self::UploadTooLarge(mb), En) => format!("the file exceeds the size limit ({mb}MB)"),
+            (Self::UploadNotMultipart, Ja) => "multipart/form-data が必要です".to_string(),
+            (Self::UploadNotMultipart, En) => "multipart/form-data is required".to_string(),
+            (Self::UploadNoFile, Ja) => "ファイルが含まれていません".to_string(),
+            (Self::UploadNoFile, En) => "the request contains no file".to_string(),
+            (Self::UploadPaneRequired, Ja) => "pane パラメータが必要です".to_string(),
+            (Self::UploadPaneRequired, En) => "the pane parameter is required".to_string(),
+            (Self::UploadDataUnreadable, Ja) => "ファイルデータの読み取りに失敗".to_string(),
+            (Self::UploadDataUnreadable, En) => "failed to read the file data".to_string(),
+            (Self::UploadFileNameInvalid, Ja) => "不正なファイル名です".to_string(),
+            (Self::UploadFileNameInvalid, En) => "invalid file name".to_string(),
+            (Self::UploadPaneCwdUnknown, Ja) => {
+                "対象ペインの作業ディレクトリが取得できません".to_string()
+            }
+            (Self::UploadPaneCwdUnknown, En) => {
+                "cannot get the working directory of the target pane".to_string()
+            }
+            (Self::UploadDirCreate(error), Ja) => {
+                format!("アップロードディレクトリの作成に失敗: {error}")
+            }
+            (Self::UploadDirCreate(error), En) => {
+                format!("failed to create the upload directory: {error}")
+            }
+            (Self::UploadDirSymlink, Ja) => {
+                "アップロード先がシンボリックリンクのため拒否しました".to_string()
+            }
+            (Self::UploadDirSymlink, En) => {
+                "refused because the upload directory is a symbolic link".to_string()
+            }
+            (Self::UploadTargetSymlink, Ja) => {
+                "既存のシンボリックリンクへの上書きは拒否しました".to_string()
+            }
+            (Self::UploadTargetSymlink, En) => {
+                "refused to overwrite an existing symbolic link".to_string()
+            }
+            (Self::UploadPathResolve(error), Ja) => format!("パス解決に失敗: {error}"),
+            (Self::UploadPathResolve(error), En) => format!("failed to resolve the path: {error}"),
+            (Self::UploadWrite(error), Ja) => format!("ファイル書き込みに失敗: {error}"),
+            (Self::UploadWrite(error), En) => format!("failed to write the file: {error}"),
+            (Self::UploadTraversal, Ja) => "パス traversal が検出されました".to_string(),
+            (Self::UploadTraversal, En) => "path traversal detected".to_string(),
+            (Self::TmuxSpawn(error), Ja) => format!("tmux コマンドの起動に失敗: {error}"),
+            (Self::TmuxSpawn(error), En) => format!("failed to start the tmux command: {error}"),
+            (Self::TmuxDrainThread { stream, error }, Ja) => {
+                format!("{stream} drain スレッドの起動に失敗: {error}")
+            }
+            (Self::TmuxDrainThread { stream, error }, En) => {
+                format!("failed to start the {stream} drain thread: {error}")
+            }
+            (Self::TmuxTimeout { command, secs }, Ja) => {
+                format!("tmux {command} がタイムアウト（{secs}秒）")
+            }
+            (Self::TmuxTimeout { command, secs }, En) => {
+                format!("tmux {command} timed out ({secs}s)")
+            }
+            (Self::TmuxWait(error), Ja) => format!("プロセスの待機に失敗: {error}"),
+            (Self::TmuxWait(error), En) => format!("failed to wait for the process: {error}"),
+            (Self::TmuxCaptureFailed(stderr), Ja) => {
+                format!("tmux capture-pane がエラー: {stderr}")
+            }
+            (Self::TmuxCaptureFailed(stderr), En) => {
+                format!("tmux capture-pane failed: {stderr}")
+            }
         }
     }
 
@@ -414,11 +750,12 @@ impl RemoteRefusal {
         }
     }
 
-    /// daemon の admin API が断るときの本文。`error` は従来どおり日本語（daemon の文 = 修正前と
-    /// バイト一致。PWA・旧版の頼み手が読む）で、頼んだ側が組み直せる断りは `kind`（と端末の
-    /// `device_id`）も添える（[`Self::from_admin_body`] が読み、呼び手の表示言語で組み直す）
+    /// daemon の admin API が断るときの本文。`error` は daemon の表示言語（起動した時点で決まる。
+    /// 日本語表示は修正前とバイト一致。旧版の頼み手はこれをそのまま出す）で、頼んだ側が組み直せる
+    /// 断りは `kind`（と端末の `device_id`）も添える（[`Self::from_admin_body`] が読み、呼び手の
+    /// 表示言語で組み直す）
     pub fn admin_body(&self) -> serde_json::Value {
-        let mut body = serde_json::json!({ "error": self.text_in(Lang::Ja) });
+        let mut body = serde_json::json!({ "error": self.to_string() });
         if let Some(kind) = self.admin_kind() {
             body["kind"] = serde_json::json!(kind);
         }
@@ -456,6 +793,31 @@ impl DaemonMessage {
             (Self::Text(text), _) => text.clone(),
             (Self::Missing, Lang::Ja) => "不明なエラー".to_string(),
             (Self::Missing, Lang::En) => "unknown error".to_string(),
+        }
+    }
+}
+
+impl AppVia {
+    /// 「…は app 経由のみ」の操作の名前（[`Self::Plain`] は括弧を付けないので `None`）。
+    /// 日本語は #2365 より前の固定文とバイト一致（close だけ英単語の後ろに空白が入っていた）
+    pub fn what_in(self, lang: Lang) -> Option<&'static str> {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Plain, _) => None,
+            (Self::Input, Ja) => Some("リモートからの入力"),
+            (Self::Input, En) => Some("remote input"),
+            (Self::Respond, Ja) => Some("リモートからの承認応答"),
+            (Self::Respond, En) => Some("answering dialogs remotely"),
+            (Self::Close, Ja) => Some("リモートからの close "),
+            (Self::Close, En) => Some("closing panes remotely"),
+            (Self::TabNew, Ja) => Some("リモートからのタブ作成"),
+            (Self::TabNew, En) => Some("creating tabs remotely"),
+            (Self::MasterLaunch, Ja) => Some("リモートからの master 起動"),
+            (Self::MasterLaunch, En) => Some("launching a master remotely"),
+            (Self::Tasks, Ja) => Some("タスクの操作"),
+            (Self::Tasks, En) => Some("task operations"),
+            (Self::Cards, Ja) => Some("コマンドカードの操作"),
+            (Self::Cards, En) => Some("command card operations"),
         }
     }
 }

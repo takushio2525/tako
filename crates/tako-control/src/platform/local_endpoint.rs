@@ -236,15 +236,23 @@ impl PeerReject {
         }
     }
 
-    /// 人間向けの 1 行説明（応答本文にも使う。接続元の詳細は明かさない）
-    pub fn describe(&self) -> &'static str {
-        match self {
-            Self::NoPeerAddr => "接続元アドレスを取得できない",
-            Self::NotLoopback => "接続元がループバックではない",
-            Self::Unresolved => "接続元プロセスを特定できない",
-            Self::OwnerUntrusted => "接続元プロセスの所有ユーザーが一致しない",
-            Self::ImageUnknown => "接続元プロセスの実行ファイルを読めない",
-            Self::NotTailscaleDaemon => "接続元プロセスが tailscale デーモンではない",
+    /// 人間向けの 1 行説明（応答本文に使う。接続元の詳細は明かさない）。daemon の表示言語で引く
+    /// （#2365 の続き。日本語は以前の固定文とバイト一致）
+    pub fn describe_in(&self, lang: tako_core::i18n::Lang) -> &'static str {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NoPeerAddr, Ja) => "接続元アドレスを取得できない",
+            (Self::NoPeerAddr, En) => "cannot get the peer address",
+            (Self::NotLoopback, Ja) => "接続元がループバックではない",
+            (Self::NotLoopback, En) => "the peer is not on the loopback",
+            (Self::Unresolved, Ja) => "接続元プロセスを特定できない",
+            (Self::Unresolved, En) => "cannot identify the peer process",
+            (Self::OwnerUntrusted, Ja) => "接続元プロセスの所有ユーザーが一致しない",
+            (Self::OwnerUntrusted, En) => "the owner of the peer process does not match",
+            (Self::ImageUnknown, Ja) => "接続元プロセスの実行ファイルを読めない",
+            (Self::ImageUnknown, En) => "cannot read the executable of the peer process",
+            (Self::NotTailscaleDaemon, Ja) => "接続元プロセスが tailscale デーモンではない",
+            (Self::NotTailscaleDaemon, En) => "the peer process is not the tailscale daemon",
         }
     }
 }
@@ -711,10 +719,13 @@ mod tests {
         ] {
             assert!(!r.code().is_empty());
             assert!(r.code().is_ascii(), "コードはログ・JSON 用の ascii");
-            assert!(!r.describe().is_empty());
-            // 接続元のパス・IP・pid は説明に載せない（診断ログへ漏らさない）
-            assert!(!r.describe().contains('/'));
-            assert!(!r.describe().contains("127."));
+            for lang in [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En] {
+                let text = r.describe_in(lang);
+                assert!(!text.is_empty());
+                // 接続元のパス・IP・pid は説明に載せない（診断ログへ漏らさない）
+                assert!(!text.contains('/'));
+                assert!(!text.contains("127."));
+            }
         }
         assert_eq!(
             PeerReject::NotTailscaleDaemon.code(),

@@ -490,10 +490,10 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   降格・daemon の admin API・スクロールバック・リモートのセットアップ）は新しい `tako_control::RemoteRefusal`
   （31 種 + 包みの `DaemonMessage` / `ScrollbackCause`）。dispatch と CLI だけが呼ぶ口（`remote::devices_*` /
   `admin_request` / `scrollback` / `scrollback_session` / `parse_scrollback_target` / `remote_setup::run_noninteractive`）は
-  この型を返し、daemon・対話のウィザードも使う口（`transcript::read_messages` / `DeviceRegistry::open` / `revoke` /
+  この型を返し、起動時の断り・対話のウィザードも使う口（`transcript::read_messages` / `DeviceRegistry::open` / `revoke` /
   `set_role` / `remote_setup::decide_variant` / `tailscale::save_variant`）は**日本語の `String` の口を残して**
-  型の口 `*_typed` を足した（daemon が PWA へ返す本文・起動時の断り・日本語の対話のウィザード）。daemon の admin API は
-  断りの本文に従来の日本語の `error` と並べて `kind`（`device_not_registered` + `device_id` / 既存の
+  型の口 `*_typed` を足した（起動時の断り・日本語の対話のウィザード。daemon の HTTP の本文は下の項で型の口へ移した）。
+  daemon の admin API は断りの本文の `error` と並べて `kind`（`device_not_registered` + `device_id` / 既存の
   `upgrade_requires_gui`）を返し、頼んだ側が `RemoteRefusal::from_admin_body` で**呼び手の表示言語で組み直す**
   （daemon の表示言語は起動した時点のまま。`kind` の無い本文 = 旧版の daemon・その他の断りは `error` をそのまま）。
   GUI の設定 → リモートの断り（`admin_request` を直に呼ぶ）も画面の表示言語になる。CLI の `tako remote messages /
@@ -622,6 +622,24 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   固定文と配送の枠 = `plan_と返答の配送の枠は表示言語で断る`、本物のソースへの注入で `file:line` を名指す）、
   実経路は `tests/issue2365_successor_plan_lang.rs`（unix。GUI 無しのホストへ引き継ぎ・`plan`・返答の配送を日英で。
   `TAKO_2365_DUMP=<path>` で全出力を書き出して修正前後を突き合わせる）
+- #2365 の続きで、**remote daemon の HTTP API の本文の `error`**（PWA と管理 API。`remote.rs` の handler 群と、
+  そこへ文を渡す認証の層・本文の JSON・tmux の往復・IPC の往復・アップロード・WebSocket）を表示言語へ移した。
+  以前は handler 群が日本語の固定文を直に書いていたので、英語表示の daemon でも「無効なタブ ID」「タブ N が
+  見つからない」「この操作には … 以上の role が必要」などが日本語のまま PWA へ出た。文は `RemoteRefusal` の
+  50 種（+ 「…は app 経由のみ」の操作名 `AppVia`・接続元の検証の理由 `PeerReject::describe_in`）に置き、handler は
+  `refuse(request, status, RemoteRefusal::…)`（本文は `{"error": …}` の 1 実装）か、`String` を返す補助の中で
+  `.to_string()` する。言語は daemon の表示言語（起動時に設定から決まる = #1077。`tako lang` を切り替えても
+  daemon を起こし直すまで前の言語）。admin API の `admin_body` の `error` も同じ言語（`kind` からの組み直しは
+  従来どおり呼び手の言語）。日本語表示の本文とステータスコードは修正前とバイト一致。PWA は `error` を表示に
+  使うだけで、分岐はステータスコードと `kind` / `paste_guard`（日本語の字面に依らない）。足した型の口は
+  `DeviceRegistry::approve_typed` / `deny_typed`、`remote_auth::identify` は `RemoteRefusal` を返す。
+  **英語表示の GUI で最後のタブの最後のペインを PWA から閉じると 502 で IPC を捨てていた**（`dispatch_close` が
+  `LastPane` / 「最後」の部分一致で 409 を判定していた）ので、`says_last_pane`（`WorkspaceError::LastTab` の日英の
+  正本の文を読む）で日本語表示と同じ 409 にそろえた。`remote_files` / `remote_tasks` / `remote_cards` /
+  `remote_ssh` の受け口の断り・デスクトップ通知・whois の解釈の失敗の中身は Issue #2365 の表の残り。番犬は同じ
+  `issue1762_dispatch_error_lang.rs`（`RemoteRefusal` の表に旧文 + `AppVia` / `PeerReject` の網羅・
+  `REMOTE_HTTP_SCOPES` の 28 範囲の日本語の固定文と日本語の口 `JA_HTTP_CALLS`・本物のソースへの注入 8 通りで
+  `file:line` を名指す）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

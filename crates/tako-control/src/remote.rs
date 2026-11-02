@@ -1103,10 +1103,7 @@ fn forwarded_identity(
         ctx.record_peer_reject(reject);
         return Err((
             403,
-            format!(
-                "serve 経由を名乗る接続の接続元を検証できない: {}",
-                reject.describe()
-            ),
+            crate::RemoteRefusal::PeerUnverified(reject).to_string(),
         ));
     }
     Ok((forwarded, header_value(request, "x-forwarded-host")))
@@ -1139,25 +1136,21 @@ fn authorize_device(
                 }
                 Some(device) => AuthDecision::Rejected(
                     403,
-                    format!(
-                        "この操作には {} 以上の role が必要（現在: {}）。\
-                         role の変更はペアリング画面から要求できます",
-                        required.as_str(),
-                        device.role.as_str()
-                    ),
+                    crate::RemoteRefusal::RoleTooLow {
+                        required,
+                        current: device.role,
+                    }
+                    .to_string(),
                 ),
-                None => AuthDecision::Rejected(
-                    403,
-                    "この端末はペアリングされていない。PWA のペアリング画面から要求してください"
-                        .to_string(),
-                ),
+                None => {
+                    AuthDecision::Rejected(403, crate::RemoteRefusal::DeviceNotPaired.to_string())
+                }
             }
         }
-        Ok(Identity::Local) => AuthDecision::Rejected(
-            401,
-            "tailscale serve 経由のアクセスのみ受け付ける".to_string(),
-        ),
-        Err(e) => AuthDecision::Rejected(401, e),
+        Ok(Identity::Local) => {
+            AuthDecision::Rejected(401, crate::RemoteRefusal::ServeOnly.to_string())
+        }
+        Err(e) => AuthDecision::Rejected(401, e.to_string()),
     }
 }
 
@@ -1176,11 +1169,8 @@ fn identify_tailnet(
         &ctx.expected_host,
     ) {
         Ok(Identity::Tailnet(who)) => Ok(who),
-        Ok(Identity::Local) => Err((
-            401,
-            "tailscale serve 経由のアクセスのみ受け付ける".to_string(),
-        )),
-        Err(e) => Err((401, e)),
+        Ok(Identity::Local) => Err((401, crate::RemoteRefusal::ServeOnly.to_string())),
+        Err(e) => Err((401, e.to_string())),
     }
 }
 
@@ -4533,7 +4523,7 @@ fn tmux_output_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("tmux コマンドの起動に失敗: {e}"))?;
+        .map_err(|e| crate::RemoteRefusal::TmuxSpawn(e.to_string()).to_string())?;
 
     // stdout/stderr を別スレッドで同時に drain する（H-5 pipe deadlock 対策）。
     // 子プロセスが pipe buffer いっぱいまで書いて write 待ちになっても、
@@ -4552,7 +4542,13 @@ fn tmux_output_with_timeout(
             }
             buf
         })
-        .map_err(|e| format!("stdout drain スレッドの起動に失敗: {e}"))?;
+        .map_err(|e| {
+            crate::RemoteRefusal::TmuxDrainThread {
+                stream: "stdout",
+                error: e.to_string(),
+            }
+            .to_string()
+        })?;
 
     let stderr_handle = std::thread::Builder::new()
         .name("tmux-stderr-drain".into())
@@ -4565,7 +4561,13 @@ fn tmux_output_with_timeout(
             }
             buf
         })
-        .map_err(|e| format!("stderr drain スレッドの起動に失敗: {e}"))?;
+        .map_err(|e| {
+            crate::RemoteRefusal::TmuxDrainThread {
+                stream: "stderr",
+                error: e.to_string(),
+            }
+            .to_string()
+        })?;
 
     // タイムアウト付きで子プロセスの終了を待つ
     let start = std::time::Instant::now();
@@ -4576,17 +4578,17 @@ fn tmux_output_with_timeout(
                 if start.elapsed() > TMUX_TIMEOUT {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!(
-                        "tmux {} がタイムアウト（{}秒）",
-                        args.first().unwrap_or(&""),
-                        TMUX_TIMEOUT.as_secs()
-                    ));
+                    return Err(crate::RemoteRefusal::TmuxTimeout {
+                        command: args.first().unwrap_or(&"").to_string(),
+                        secs: TMUX_TIMEOUT.as_secs(),
+                    }
+                    .to_string());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(e) => {
                 let _ = child.kill();
-                return Err(format!("プロセスの待機に失敗: {e}"));
+                return Err(crate::RemoteRefusal::TmuxWait(e.to_string()).to_string());
             }
         }
     };
@@ -4728,10 +4730,10 @@ fn tmux_capture_pane(
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let output = tmux_output_with_timeout(tmux_socket, &arg_refs)?;
     if !output.status.success() {
-        return Err(format!(
-            "tmux capture-pane がエラー: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        return Err(crate::RemoteRefusal::TmuxCaptureFailed(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+        .to_string());
     }
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -4864,7 +4866,7 @@ fn check_request_origin(ctx: &DaemonCtx, request: &tiny_http::Request) -> Result
         let allowed = ctx.base_url.trim_end_matches('/');
         let given = origin.trim_end_matches('/');
         if !given.eq_ignore_ascii_case(allowed) {
-            return Err(format!("Origin '{origin}' は許可されていない"));
+            return Err(crate::RemoteRefusal::OriginNotAllowed(origin).to_string());
         }
     }
     Ok(())
@@ -4872,6 +4874,16 @@ fn check_request_origin(ctx: &DaemonCtx, request: &tiny_http::Request) -> Result
 
 fn respond(request: tiny_http::Request, status: u16, body: Option<String>) {
     respond_inner(request, status, body, false);
+}
+
+/// 断りを `{"error": …}` の本文で返す（#2365 の続き）。文は daemon の表示言語（起動時に設定から
+/// 決まる = #1077）。handler 群は日本語の固定文を直に書かず、ここへ [`crate::RemoteRefusal`] を渡す
+fn refuse(request: tiny_http::Request, status: u16, refusal: crate::RemoteRefusal) {
+    respond(
+        request,
+        status,
+        Some(json!({ "error": refusal.to_string() }).to_string()),
+    );
 }
 
 /// M-4: 機密データを含む応答。Cache-Control: no-store, private を付与する
@@ -4971,11 +4983,12 @@ fn read_json_body(request: &mut tiny_http::Request) -> Result<Value, String> {
         .as_reader()
         .take(MAX_BODY_BYTES)
         .read_to_string(&mut body)
-        .map_err(|_| "リクエストボディの読み取りに失敗".to_string())?;
+        .map_err(|_| crate::RemoteRefusal::BodyUnreadable.to_string())?;
     if body.trim().is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str(&body).map_err(|e| format!("JSON パースエラー: {e}"))
+    serde_json::from_str(&body)
+        .map_err(|e| crate::RemoteRefusal::BodyJsonInvalid(e.to_string()).to_string())
 }
 
 // --- WebSocket（画面プッシュ専用チャンネル） ---
@@ -5003,7 +5016,7 @@ fn read_json_body(request: &mut tiny_http::Request) -> Result<Value, String> {
 /// WS サブプロトコル名。ブラウザの WebSocket API は任意ヘッダを付けられないため、
 /// クライアントは `new WebSocket(url, ["tako-remote", "token.<TOKEN>"])` の
 /// サブプロトコル列でトークンを渡す（Sec-WebSocket-Protocol ヘッダに乗る）
-const WS_PROTOCOL: &str = "tako-remote";
+pub(crate) const WS_PROTOCOL: &str = "tako-remote";
 /// 画面差分のポーリング間隔
 const WS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 /// 無変化時のキープアライブ送信間隔（プロキシの idle 切断対策）
@@ -5178,7 +5191,9 @@ fn app_request(
     req: crate::protocol::Request,
 ) -> Result<Value, String> {
     with_app_ipc(app_conn, |conn| {
-        let client = conn.get().ok_or("tako app が稼働していない".to_string())?;
+        let client = conn.get().ok_or_else(|| {
+            crate::RemoteRefusal::AppNotRunning(crate::remote_refusal::AppVia::Plain).to_string()
+        })?;
         match client.request_checked(req) {
             Ok(v) => Ok(v),
             // app が答えた = 接続は健全。理由だけ返す
@@ -5189,7 +5204,7 @@ fn app_request(
             }
         }
     })
-    .map_err(|_| "内部エラー".to_string())?
+    .map_err(|_| crate::RemoteRefusal::Internal.to_string())?
 }
 
 /// IPC 経由でペイン一覧を取得し、マッピングを更新する。
@@ -5459,7 +5474,7 @@ fn input_reply(reply: &Value) -> (u16, Value) {
         return (
             409,
             json!({
-                "error": "鍵らしき文字が入っている（送っていない）",
+                "error": crate::RemoteRefusal::InputSecretSuspected.to_string(),
                 "paste_guard": reply["paste_guard"],
             }),
         );
@@ -5508,11 +5523,13 @@ fn dispatch_send(
 
     let mut conn = app_conn
         .write()
-        .map_err(|_| (500u16, "内部エラー".to_string()))?;
-    let client = conn.get().ok_or((
-        503u16,
-        "tako app が稼働していない（リモートからの入力は app 経由のみ）".to_string(),
-    ))?;
+        .map_err(|_| (500u16, crate::RemoteRefusal::Internal.to_string()))?;
+    let client = conn.get().ok_or_else(|| {
+        (
+            503u16,
+            crate::RemoteRefusal::AppNotRunning(crate::remote_refusal::AppVia::Input).to_string(),
+        )
+    })?;
     match client.request(request) {
         Ok(v) => Ok(v),
         Err(e) => {
@@ -5538,11 +5555,13 @@ fn dispatch_respond(
     };
     let mut conn = app_conn
         .write()
-        .map_err(|_| (500u16, "内部エラー".to_string()))?;
-    let client = conn.get().ok_or((
-        503u16,
-        "tako app が稼働していない（リモートからの承認応答は app 経由のみ）".to_string(),
-    ))?;
+        .map_err(|_| (500u16, crate::RemoteRefusal::Internal.to_string()))?;
+    let client = conn.get().ok_or_else(|| {
+        (
+            503u16,
+            crate::RemoteRefusal::AppNotRunning(crate::remote_refusal::AppVia::Respond).to_string(),
+        )
+    })?;
     match client.request(request) {
         Ok(v) => Ok(v),
         Err(e) => {
@@ -5568,11 +5587,14 @@ fn dispatch_close(
     let list = {
         let mut conn = app_conn
             .write()
-            .map_err(|_| (500u16, "内部エラー".to_string()))?;
-        let client = conn.get().ok_or((
-            503u16,
-            "tako app が稼働していない（リモートからの close は app 経由のみ）".to_string(),
-        ))?;
+            .map_err(|_| (500u16, crate::RemoteRefusal::Internal.to_string()))?;
+        let client = conn.get().ok_or_else(|| {
+            (
+                503u16,
+                crate::RemoteRefusal::AppNotRunning(crate::remote_refusal::AppVia::Close)
+                    .to_string(),
+            )
+        })?;
         match client.request(crate::protocol::Request::List) {
             Ok(v) => v,
             Err(e) => {
@@ -5596,16 +5618,22 @@ fn dispatch_close(
 
     let pane_id = find_pane_id_for_tmux_target(&list, session_name);
     let Some(pid) = pane_id else {
-        return Err((404, format!("ペイン '{tmux_target}' が見つからない")));
+        return Err((
+            404,
+            crate::RemoteRefusal::PaneNotFound(tmux_target.to_string()).to_string(),
+        ));
     };
 
     // Close を実行する
     let mut conn = app_conn
         .write()
-        .map_err(|_| (500u16, "内部エラー".to_string()))?;
-    let client = conn
-        .get()
-        .ok_or((503u16, "tako app が稼働していない".to_string()))?;
+        .map_err(|_| (500u16, crate::RemoteRefusal::Internal.to_string()))?;
+    let client = conn.get().ok_or_else(|| {
+        (
+            503u16,
+            crate::RemoteRefusal::AppNotRunning(crate::remote_refusal::AppVia::Plain).to_string(),
+        )
+    })?;
     let result = client.request(crate::protocol::Request::Close {
         pane: Some(pid),
         force: false,
@@ -5615,7 +5643,9 @@ fn dispatch_close(
     match result {
         Ok(v) => Ok(v),
         Err(e) => {
-            if e.contains("LastPane") || e.contains("最後") {
+            // 最後のタブの最後のペイン（GUI が閉じない = 409）。理由の文は GUI の表示言語で
+            // 日英どちらにもなる（#2365）ので、読み方は 1 実装を通す
+            if says_last_pane(&e) {
                 Err((409, e))
             } else {
                 conn.invalidate();
@@ -5623,6 +5653,20 @@ fn dispatch_close(
             }
         }
     }
+}
+
+/// close の断りが「最後のタブの最後のペインは閉じない」を言っているか（スマホの close を 409 へ寄せる）。
+///
+/// GUI の文は表示言語に従う（`WorkspaceError::LastTab` = #2358）ので、日英の正本の文をどちらも読む。
+/// 以前の判定（`LastPane` / 「最後」の部分一致）も残す（旧版の GUI。英語表示では当たらず、
+/// 502 で IPC の接続まで捨てていた = #2365 の続き）
+fn says_last_pane(message: &str) -> bool {
+    use tako_core::i18n::Lang;
+    message.contains("LastPane")
+        || message.contains("最後")
+        || [Lang::Ja, Lang::En].into_iter().any(|lang| {
+            message.contains(&tako_core::workspace::WorkspaceError::LastTab.text_in(lang))
+        })
 }
 
 /// List 応答からセッション名にマッチする PaneId を探す
@@ -5695,11 +5739,7 @@ fn handle_request_v2(
     // --- 管理 API（ローカル直結 + 管理トークン。GUI 承認ダイアログ / CLI / MCP 用）---
     if path.starts_with("/api/admin/") {
         if !check_admin(ctx, &request) {
-            return respond(
-                request,
-                401,
-                Some(json!({ "error": "管理 API はローカルの管理トークンが必要" }).to_string()),
-            );
+            return refuse(request, 401, crate::RemoteRefusal::AdminTokenRequired);
         }
         return handle_admin_api(request, &method, &path, ctx, app_conn, broadcasters);
     }
@@ -5803,13 +5843,10 @@ fn handle_request_v2(
         let reason = parsed["reason"].as_str().unwrap_or("").to_string();
         let role_str = parsed["role"].as_str().unwrap_or("observe");
         let Some(role) = DeviceRole::parse(role_str) else {
-            return respond(
+            return refuse(
                 request,
                 400,
-                Some(
-                    json!({ "error": format!("不正な role: {role_str}（observe / interact / manage / admin）") })
-                        .to_string(),
-                ),
+                crate::RemoteRefusal::RoleInvalid(role_str.to_string()),
             );
         };
         // レジストリのロックは**要求を作るところまで**で外す。起票は daemon → app の
@@ -5876,13 +5913,9 @@ fn handle_request_v2(
             }
         };
         let Some(target_id) = parsed["device_id"].as_str() else {
-            return respond(
-                request,
-                400,
-                Some(json!({ "error": "device_id が必要" }).to_string()),
-            );
+            return refuse(request, 400, crate::RemoteRefusal::DeviceIdRequired);
         };
-        let result = ctx.registry.lock().unwrap().revoke(target_id);
+        let result = ctx.registry.lock().unwrap().revoke_typed(target_id);
         return match result {
             Ok(revoked) => {
                 disconnect_device_ws(broadcasters, target_id);
@@ -5892,7 +5925,7 @@ fn handle_request_v2(
                     Some(json!({ "revoked": true, "device": device_json(&revoked) }).to_string()),
                 )
             }
-            Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+            Err(e) => refuse(request, 404, e),
         };
     }
 
@@ -6080,11 +6113,7 @@ fn handle_admin_api(
                 }
             };
             let Some(device_id) = parsed["device_id"].as_str() else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "device_id が必要" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::DeviceIdRequired);
             };
             let role = parsed["role"].as_str().and_then(DeviceRole::parse);
             // #1452: 承認は role を**上げうる**経路なので、上げる向きのときだけ
@@ -6113,7 +6142,7 @@ fn handle_admin_api(
                     Some(json!({ "error": message, "kind": code }).to_string()),
                 );
             }
-            let result = ctx.registry.lock().unwrap().approve(device_id, role);
+            let result = ctx.registry.lock().unwrap().approve_typed(device_id, role);
             match result {
                 Ok(device) => {
                     if let Some((change, caller, _)) = &decision {
@@ -6135,7 +6164,7 @@ fn handle_admin_api(
                         ),
                     )
                 }
-                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+                Err(e) => respond(request, 404, Some(e.admin_body().to_string())),
             }
         }
         // ペアリング / 昇格の拒否（GUI 限定経路）
@@ -6147,19 +6176,15 @@ fn handle_admin_api(
                 }
             };
             let Some(device_id) = parsed["device_id"].as_str() else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "device_id が必要" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::DeviceIdRequired);
             };
-            let result = ctx.registry.lock().unwrap().deny(device_id);
+            let result = ctx.registry.lock().unwrap().deny_typed(device_id);
             match result {
                 Ok(()) => {
                     let _ = crate::remote_role::resolve_upgrade_task(app_conn, device_id, false);
                     respond(request, 200, Some(json!({ "denied": true }).to_string()))
                 }
-                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+                Err(e) => respond(request, 404, Some(e.admin_body().to_string())),
             }
         }
         // role の直接変更（#1452）。**降格は誰でも / 昇格は tako-app からだけ**。
@@ -6172,21 +6197,14 @@ fn handle_admin_api(
                 }
             };
             let Some(device_id) = parsed["device_id"].as_str() else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "device_id が必要" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::DeviceIdRequired);
             };
             let role_str = parsed["role"].as_str().unwrap_or("");
             let Some(next) = DeviceRole::parse(role_str) else {
-                return respond(
+                return refuse(
                     request,
                     400,
-                    Some(
-                        json!({ "error": format!("不正な role: {role_str}（observe / interact / manage / admin）") })
-                            .to_string(),
-                    ),
+                    crate::RemoteRefusal::RoleInvalid(role_str.to_string()),
                 );
             };
             let (change, caller, verdict) = {
@@ -6255,11 +6273,7 @@ fn handle_admin_api(
                 }
             };
             let Some(device_id) = parsed["device_id"].as_str() else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "device_id が必要" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::DeviceIdRequired);
             };
             let result = ctx.registry.lock().unwrap().revoke_typed(device_id);
             match result {
@@ -6303,11 +6317,7 @@ fn handle_admin_api(
                 Some(json!({ "shutting_down": true, "pid": std::process::id() }).to_string()),
             )
         }
-        _ => respond(
-            request,
-            404,
-            Some(json!({ "error": "管理 API エンドポイントが見つからない" }).to_string()),
-        ),
+        _ => refuse(request, 404, crate::RemoteRefusal::AdminEndpointNotFound),
     }
 }
 
@@ -6446,65 +6456,50 @@ fn handle_api_v2_routes(
         }
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/ssh") => {
             let Some(pane_param) = extract_pane_target(p) else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::PaneIdInvalid);
             };
             let Ok(pane_id) = pane_param.parse::<u64>() else {
-                return respond(
-                    request,
-                    400,
-                    Some(
-                        json!({ "error": "SSH の対象は数値ペイン ID のみ（一覧の id を渡す）" })
-                            .to_string(),
-                    ),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::SshPaneIdNotNumeric);
             };
             handle_ssh_open(request, Some(pane_id), ctx, device, app_conn)
         }
         (tiny_http::Method::Get, "/api/agents") => {
-            match crate::agents::list_agents_with_panes(Some(tmux_socket)) {
+            match crate::agents::list_agents_with_panes_typed(Some(tmux_socket)) {
                 Ok(mut result) => {
                     // #1069: 公式リンク（claude.ai/code）。dispatch の RemoteAgents
                     // （CLI / MCP）と**同じ 1 実装**を通す
                     crate::claude_remote_link::attach_to_agents(&mut result);
                     respond_sensitive(request, 200, Some(result.to_string()))
                 }
-                Err(e) => respond(request, 502, Some(json!({ "error": e }).to_string())),
+                Err(e) => respond(
+                    request,
+                    502,
+                    Some(json!({ "error": e.to_string() }).to_string()),
+                ),
             }
         }
         (tiny_http::Method::Get, p)
             if p.starts_with("/api/sessions/") && p.ends_with("/messages") =>
         {
             let Some(session_id) = extract_session_id(p) else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "無効なセッション ID" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::SessionIdMalformed);
             };
             let tail = query_param(url_full, "tail")
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(30);
-            match crate::transcript::read_messages(&session_id, tail) {
+            match crate::transcript::read_messages_typed(&session_id, tail) {
                 // #715: システム通知は PWA が描き分けられないので配る手前で落とす
                 Ok(result) => respond_sensitive(
                     request,
                     200,
                     Some(crate::transcript::without_system_notices(result).to_string()),
                 ),
-                Err(e) => respond(request, 404, Some(json!({ "error": e }).to_string())),
+                Err(e) => refuse(request, 404, e),
             }
         }
         (tiny_http::Method::Get, p) if p.starts_with("/api/panes/") && p.ends_with("/screen") => {
             let Some(pane_param) = extract_pane_target(p) else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::PaneIdInvalid);
             };
             let target =
                 resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
@@ -6527,11 +6522,7 @@ fn handle_api_v2_routes(
             if p.starts_with("/api/panes/") && p.ends_with("/scrollback") =>
         {
             let Some(pane_param) = extract_pane_target(p) else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::PaneIdInvalid);
             };
             let target =
                 resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
@@ -6553,11 +6544,7 @@ fn handle_api_v2_routes(
         // --- 書き込み系: dispatch 経由（H-7）---
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/input") => {
             let Some(pane_param) = extract_pane_target(p) else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::PaneIdInvalid);
             };
             let parsed = match read_json_body(&mut request) {
                 Ok(v) => v,
@@ -6623,21 +6610,10 @@ fn handle_api_v2_routes(
         // 再検証してから番号キー + Enter を送る（OrchestratorRespond と同一経路 = 監査つき）
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/respond") => {
             let Some(pane_param) = extract_pane_target(p) else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::PaneIdInvalid);
             };
             let Ok(pane_id) = pane_param.parse::<u64>() else {
-                return respond(
-                    request,
-                    400,
-                    Some(
-                        json!({ "error": "respond は数値ペイン ID のみ（app 稼働時の一覧から取得してください）" })
-                            .to_string(),
-                    ),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::RespondPaneIdNotNumeric);
             };
             let parsed = match read_json_body(&mut request) {
                 Ok(v) => v,
@@ -6649,11 +6625,7 @@ fn handle_api_v2_routes(
                 Value::String(s) if !s.is_empty() => s.clone(),
                 Value::Number(n) => n.to_string(),
                 _ => {
-                    return respond(
-                        request,
-                        400,
-                        Some(json!({ "error": "choice が必要（番号または yes/no）" }).to_string()),
-                    );
+                    return refuse(request, 400, crate::RemoteRefusal::ChoiceRequired);
                 }
             };
             ctx.registry.lock().unwrap().audit(
@@ -6671,11 +6643,7 @@ fn handle_api_v2_routes(
         }
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/close") => {
             let Some(pane_param) = extract_pane_target(p) else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::PaneIdInvalid);
             };
             let target =
                 resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
@@ -6694,11 +6662,7 @@ fn handle_api_v2_routes(
         }
         (tiny_http::Method::Post, p) if p.starts_with("/api/panes/") && p.ends_with("/resize") => {
             let Some(pane_param) = extract_pane_target(p) else {
-                return respond(
-                    request,
-                    400,
-                    Some(json!({ "error": "無効なペイン ID" }).to_string()),
-                );
+                return refuse(request, 400, crate::RemoteRefusal::PaneIdInvalid);
             };
             let target =
                 resolve_pane_param(&pane_param, app_conn, pane_mapping).unwrap_or(pane_param);
@@ -6741,11 +6705,7 @@ fn handle_api_v2_routes(
             let result = match result {
                 Ok(v) => v,
                 Err(_) => {
-                    return respond(
-                        request,
-                        500,
-                        Some(json!({ "error": "内部エラー" }).to_string()),
-                    );
+                    return refuse(request, 500, crate::RemoteRefusal::Internal);
                 }
             };
             match result {
@@ -6764,13 +6724,10 @@ fn handle_api_v2_routes(
                                 tmux_resize_window(tmux_socket, &window_target, c, r)
                             }
                             _ => {
-                                return respond(
+                                return refuse(
                                     request,
                                     400,
-                                    Some(
-                                        json!({ "error": "cols と rows（正の整数）か reset=true を指定する" })
-                                            .to_string(),
-                                    ),
+                                    crate::RemoteRefusal::ResizeSizeRequired,
                                 );
                             }
                         }
@@ -6801,7 +6758,7 @@ fn handle_api_v2_routes(
             let deps = crate::remote_tasks::TasksDeps {
                 // **status つきで受ける**（`app_dispatch` が「app の拒否 = 400」と
                 // 「届かない = 503」を分ける 1 実装。タスク側で分類し直さない）
-                send: &|req| app_dispatch(app_conn, req, "タスクの操作"),
+                send: &|req| app_dispatch(app_conn, req, crate::remote_refusal::AppVia::Tasks),
                 audit: &|event, extra| {
                     ctx.registry
                         .lock()
@@ -6819,7 +6776,7 @@ fn handle_api_v2_routes(
         // = PC のカードのボタン・CLI・MCP と同じ dispatch を通る（実行ロジックを新設しない）
         (_, p) if crate::remote_cards::owns_path(p) => {
             let deps = crate::remote_cards::CardsDeps {
-                send: &|req| app_dispatch(app_conn, req, "コマンドカードの操作"),
+                send: &|req| app_dispatch(app_conn, req, crate::remote_refusal::AppVia::Cards),
                 audit: &|event, extra| {
                     ctx.registry
                         .lock()
@@ -6855,11 +6812,7 @@ fn handle_api_v2_routes(
             };
             crate::remote_files::handle_files_request(request, p, url_full, &deps)
         }
-        _ => respond(
-            request,
-            404,
-            Some(json!({ "error": "API エンドポイントが見つからない" }).to_string()),
-        ),
+        _ => refuse(request, 404, crate::RemoteRefusal::ApiEndpointNotFound),
     }
 }
 
@@ -6925,7 +6878,7 @@ fn handle_tab_new(
         focus: Some(true),
         cwd,
     };
-    match app_dispatch(app_conn, req, "リモートからのタブ作成") {
+    match app_dispatch(app_conn, req, crate::remote_refusal::AppVia::TabNew) {
         Ok(v) => respond(request, 200, Some(v.to_string())),
         Err((status, e)) => respond(request, status, Some(json!({ "error": e }).to_string())),
     }
@@ -6947,11 +6900,7 @@ fn handle_tab_master(
     path: &str,
 ) {
     let Some(tab_id) = extract_tab_id(path) else {
-        return respond(
-            request,
-            400,
-            Some(json!({ "error": "無効なタブ ID" }).to_string()),
-        );
+        return refuse(request, 400, crate::RemoteRefusal::TabIdInvalid);
     };
     let parsed = match read_json_body(&mut request) {
         Ok(v) => v,
@@ -6973,7 +6922,7 @@ fn handle_tab_master(
     let list = match app_dispatch(
         app_conn,
         crate::protocol::Request::List,
-        "リモートからの master 起動",
+        crate::remote_refusal::AppVia::MasterLaunch,
     ) {
         Ok(v) => v,
         Err((status, e)) => {
@@ -6981,11 +6930,7 @@ fn handle_tab_master(
         }
     };
     let Some(pane_id) = focused_pane_of_tab(&list, tab_id) else {
-        return respond(
-            request,
-            404,
-            Some(json!({ "error": format!("タブ {tab_id} が見つからない") }).to_string()),
-        );
+        return refuse(request, 404, crate::RemoteRefusal::TabNotFound(tab_id));
     };
 
     ctx.registry.lock().unwrap().audit(
@@ -7003,7 +6948,7 @@ fn handle_tab_master(
             title: None,
             role: Some(plan.pane_role.clone()),
         },
-        "リモートからの master 起動",
+        crate::remote_refusal::AppVia::MasterLaunch,
     ) {
         return respond(request, status, Some(json!({ "error": e }).to_string()));
     }
@@ -7019,7 +6964,7 @@ fn handle_tab_master(
                 title: naming.title.clone(),
                 source: naming.source.clone(),
             },
-            "リモートからの master 起動",
+            crate::remote_refusal::AppVia::MasterLaunch,
         ) {
             if let Some(title) = v["title"].as_str() {
                 tab_title = Some(title.to_string());
@@ -7037,7 +6982,7 @@ fn handle_tab_master(
             await_prompt: false,
             paste_guard: None,
         },
-        "リモートからの master 起動",
+        crate::remote_refusal::AppVia::MasterLaunch,
     ) {
         return respond(request, status, Some(json!({ "error": e }).to_string()));
     }
@@ -7078,22 +7023,21 @@ fn focused_pane_of_tab(list: &Value, tab_id: u64) -> Option<u64> {
 /// IPC 経由で任意の dispatch を呼ぶ（#1078）。
 ///
 /// 失敗の対応は 3 通り: app 不在 = 503 / **app が拒否 = 400（接続は捨てない）** /
-/// 通信失敗 = 502 + 接続を捨てる。`what` は 503 のエラー文に混ぜる用途。
+/// 通信失敗 = 502 + 接続を捨てる。`via` は 503 の断りの括弧に入る操作の名前（表示言語で引く）。
 /// 既存の `dispatch_input` / `dispatch_respond` / `dispatch_close` は
 /// 拒否と通信失敗をまとめて 502 にするが（#425 が「ダイアログ不在」だけ 409 へ分けた形）、
 /// ここは新規経路なので最初から分けている
 fn app_dispatch(
     app_conn: &Arc<RwLock<AppConnection>>,
     request: crate::protocol::Request,
-    what: &str,
+    via: crate::remote_refusal::AppVia,
 ) -> Result<Value, (u16, String)> {
     let mut conn = app_conn
         .write()
-        .map_err(|_| (500u16, "内部エラー".to_string()))?;
-    let client = conn.get().ok_or((
-        503u16,
-        format!("tako app が稼働していない（{what}は app 経由のみ）"),
-    ))?;
+        .map_err(|_| (500u16, crate::RemoteRefusal::Internal.to_string()))?;
+    let client = conn
+        .get()
+        .ok_or_else(|| (503u16, crate::RemoteRefusal::AppNotRunning(via).to_string()))?;
     match client.request_checked(request) {
         Ok(v) => Ok(v),
         // app が拒否した = 頼み方が悪い（存在しないフォルダ等）。
@@ -7134,10 +7078,10 @@ fn handle_upload(
         .and_then(|h| h.value.as_str().parse::<u64>().ok())
         .unwrap_or(0);
     if content_length > MAX_UPLOAD_SIZE {
-        return respond(
+        return refuse(
             request,
             413,
-            Some(json!({ "error": format!("ファイルサイズが上限 ({}MB) を超えています", MAX_UPLOAD_SIZE / (1024 * 1024)) }).to_string()),
+            crate::RemoteRefusal::UploadTooLarge(MAX_UPLOAD_SIZE / (1024 * 1024)),
         );
     }
 
@@ -7150,11 +7094,7 @@ fn handle_upload(
         .unwrap_or_default();
     let boundary = extract_multipart_boundary(&content_type);
     let Some(boundary) = boundary else {
-        return respond(
-            request,
-            400,
-            Some(json!({ "error": "multipart/form-data が必要です" }).to_string()),
-        );
+        return refuse(request, 400, crate::RemoteRefusal::UploadNotMultipart);
     };
 
     // ボディを全て読む（サイズ上限を超えたら中断）
@@ -7168,10 +7108,10 @@ fn handle_upload(
             Ok(n) => {
                 body.extend_from_slice(&buf[..n]);
                 if body.len() as u64 > MAX_UPLOAD_SIZE {
-                    return respond(
+                    return refuse(
                         request,
                         413,
-                        Some(json!({ "error": format!("ファイルサイズが上限 ({}MB) を超えています", MAX_UPLOAD_SIZE / (1024 * 1024)) }).to_string()),
+                        crate::RemoteRefusal::UploadTooLarge(MAX_UPLOAD_SIZE / (1024 * 1024)),
                     );
                 }
             }
@@ -7193,11 +7133,7 @@ fn handle_upload(
         || file_name.contains("..")
         || file_name.is_empty()
     {
-        return respond(
-            request,
-            400,
-            Some(json!({ "error": "不正なファイル名です" }).to_string()),
-        );
+        return refuse(request, 400, crate::RemoteRefusal::UploadFileNameInvalid);
     }
 
     // cwd を取得（pane_mapping の pane_info から）
@@ -7212,23 +7148,16 @@ fn handle_upload(
     };
 
     let Some(cwd) = cwd else {
-        return respond(
-            request,
-            404,
-            Some(json!({ "error": "対象ペインの作業ディレクトリが取得できません" }).to_string()),
-        );
+        return refuse(request, 404, crate::RemoteRefusal::UploadPaneCwdUnknown);
     };
 
     // 保存先ディレクトリの作成
     let upload_dir = std::path::Path::new(&cwd).join(UPLOAD_DIR);
     if let Err(e) = std::fs::create_dir_all(&upload_dir) {
-        return respond(
+        return refuse(
             request,
             500,
-            Some(
-                json!({ "error": format!("アップロードディレクトリの作成に失敗: {e}") })
-                    .to_string(),
-            ),
+            crate::RemoteRefusal::UploadDirCreate(e.to_string()),
         );
     }
 
@@ -7238,14 +7167,7 @@ fn handle_upload(
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
     {
-        return respond(
-            request,
-            400,
-            Some(
-                json!({ "error": "アップロード先がシンボリックリンクのため拒否しました" })
-                    .to_string(),
-            ),
-        );
+        return refuse(request, 400, crate::RemoteRefusal::UploadDirSymlink);
     }
 
     // パスの最終検証（canonicalize で traversal を防止）
@@ -7256,32 +7178,26 @@ fn handle_upload(
         .symlink_metadata()
         .is_ok_and(|m| m.file_type().is_symlink())
     {
-        return respond(
-            request,
-            400,
-            Some(
-                json!({ "error": "既存のシンボリックリンクへの上書きは拒否しました" }).to_string(),
-            ),
-        );
+        return refuse(request, 400, crate::RemoteRefusal::UploadTargetSymlink);
     }
 
     let canonical_dir = match upload_dir.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            return respond(
+            return refuse(
                 request,
                 500,
-                Some(json!({ "error": format!("パス解決に失敗: {e}") }).to_string()),
+                crate::RemoteRefusal::UploadPathResolve(e.to_string()),
             );
         }
     };
 
     // ファイル書き込み（所有者のみ読み書き可。#287 P2-1 / #2581）
     if let Err(e) = save_received_file(&target_path, &file_data) {
-        return respond(
+        return refuse(
             request,
             500,
-            Some(json!({ "error": format!("ファイル書き込みに失敗: {e}") }).to_string()),
+            crate::RemoteRefusal::UploadWrite(e.to_string()),
         );
     }
 
@@ -7289,11 +7205,7 @@ fn handle_upload(
     if let Ok(canonical_target) = target_path.canonicalize() {
         if !canonical_target.starts_with(&canonical_dir) {
             let _ = std::fs::remove_file(&target_path);
-            return respond(
-                request,
-                400,
-                Some(json!({ "error": "パス traversal が検出されました" }).to_string()),
-            );
+            return refuse(request, 400, crate::RemoteRefusal::UploadTraversal);
         }
     }
 
@@ -7399,12 +7311,12 @@ fn parse_multipart(body: &[u8], boundary: &str) -> Result<(String, Vec<u8>, Stri
     }
 
     if file_name.is_empty() {
-        return Err("ファイルが含まれていません".to_string());
+        return Err(crate::RemoteRefusal::UploadNoFile.to_string());
     }
     if pane_id.is_empty() {
-        return Err("pane パラメータが必要です".to_string());
+        return Err(crate::RemoteRefusal::UploadPaneRequired.to_string());
     }
-    let data = file_data.ok_or_else(|| "ファイルデータの読み取りに失敗".to_string())?;
+    let data = file_data.ok_or_else(|| crate::RemoteRefusal::UploadDataUnreadable.to_string())?;
     Ok((file_name, data, pane_id))
 }
 
@@ -7435,14 +7347,7 @@ fn handle_ws_v2(
         .split(',')
         .any(|p| p.trim().eq_ignore_ascii_case(WS_PROTOCOL))
     {
-        return respond(
-            request,
-            400,
-            Some(
-                json!({ "error": format!("Sec-WebSocket-Protocol に '{WS_PROTOCOL}' が必要") })
-                    .to_string(),
-            ),
-        );
+        return refuse(request, 400, crate::RemoteRefusal::WsProtocolRequired);
     }
 
     let url_full = request.url().to_string();
@@ -7454,27 +7359,15 @@ fn handle_ws_v2(
         }
     };
     let Some(pane_param) = query_param(&url_full, "pane") else {
-        return respond(
-            request,
-            400,
-            Some(json!({ "error": "pane クエリが必要" }).to_string()),
-        );
+        return refuse(request, 400, crate::RemoteRefusal::WsPaneQueryRequired);
     };
     // 数値 PaneId → tmux ターゲットの解決（#423/#426: v2 API が返す数値 ID 対応）
     let pane = resolve_pane_param(&pane_param, app_conn, pane_mapping);
     let Some(ref pane) = pane else {
-        return respond(
-            request,
-            404,
-            Some(json!({ "error": format!("ペイン '{pane_param}' が見つからない") }).to_string()),
-        );
+        return refuse(request, 404, crate::RemoteRefusal::PaneNotFound(pane_param));
     };
     let Some(ws_key) = header_value(&request, "sec-websocket-key") else {
-        return respond(
-            request,
-            400,
-            Some(json!({ "error": "Sec-WebSocket-Key ヘッダが無い" }).to_string()),
-        );
+        return refuse(request, 400, crate::RemoteRefusal::WsKeyMissing);
     };
 
     // 101 Switching Protocols
@@ -7744,7 +7637,14 @@ mod tests {
         let (status, body) = input_reply(&json!({ "sent": false, "paste_guard": guard }));
         assert_eq!(status, 409);
         assert_eq!(body["paste_guard"]["findings"][0]["masked"], "ghp_…qrst");
-        assert!(body["error"].as_str().unwrap().contains("送っていない"));
+        // 文は daemon の表示言語（#2365）。日英どちらの正本の文でも当たる
+        let error = body["error"].as_str().unwrap();
+        assert!(
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| error == crate::RemoteRefusal::InputSecretSuspected.text_in(lang)),
+            "{error}"
+        );
         let warned = json!({ "queued": true, "paste_guard": { "verdict": "warn" } });
         let (status, body) = input_reply(&warned);
         assert_eq!((status, body["ok"].clone()), (200, json!(true)));
@@ -7953,6 +7853,25 @@ mod tests {
         assert!(tcp.contains("tako remote start"), "{tcp}");
     }
 
+    /// スマホの close が「最後のタブの最後のペイン」を断られたら、GUI の表示言語に依らず 409 へ寄る
+    /// （#2365 の続き。英語表示の GUI の文は `LastPane` も「最後」も含まず、502 で IPC を捨てていた）
+    #[test]
+    fn closeの最後のペインの断りは日英どちらの文でも当たる() {
+        use tako_core::i18n::Lang;
+        use tako_core::workspace::WorkspaceError;
+        for lang in [Lang::Ja, Lang::En] {
+            let text = WorkspaceError::LastTab.text_in(lang);
+            assert!(says_last_pane(&text), "{lang:?}: {text}");
+            // dispatch の断りの枠に包まれても当たる
+            assert!(says_last_pane(&format!("operation failed: {text}")));
+        }
+        // 旧版の GUI の言い方も読む
+        assert!(says_last_pane("LastPane"));
+        // ほかの断りは当たらない（502 のまま = 接続を捨てる側）
+        assert!(!says_last_pane("pane 3 not found"));
+        assert!(!says_last_pane("tab 3 not found"));
+    }
+
     /// #841: **偽の `X-Forwarded-For` を付けたローカルプロセスは認証を通れない**。
     ///
     /// 修正前は、ループバック TCP へ繋げる誰でも「ペアリング済み端末の tailnet IP を
@@ -8056,8 +7975,12 @@ mod tests {
         // ① 修正後: 接続元がこのテストプロセス（= tailscaled ではない）なので 403
         let (status, body) = call(&forged("/api/me"));
         assert_eq!(status, 403, "偽の XFF は層①へ届く前に落ちる: {body}");
+        // 理由の文は daemon の表示言語（#2365）。日英どちらの文でも当たる
         assert!(
-            body.contains("接続元プロセスが tailscale デーモンではない"),
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| body
+                    .contains(local_endpoint::PeerReject::NotTailscaleDaemon.describe_in(lang))),
             "拒否理由が返る: {body}"
         );
         // ② 層②（role 認可）が要る経路も同じ入口で落ちる。
@@ -8248,8 +8171,15 @@ mod tests {
         // ① observe の実行は層②で 403（受け口へ届かない）
         let (status, body) = run("100.64.0.21");
         assert_eq!(status, 403, "observe の端末が実行できてしまう: {body}");
+        // 文は daemon の表示言語（#2365）。日英どちらの正本の文でも、足りない role を名指す
+        let too_low = crate::RemoteRefusal::RoleTooLow {
+            required: DeviceRole::Interact,
+            current: DeviceRole::Observe,
+        };
         assert!(
-            body.contains("interact 以上"),
+            [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En]
+                .into_iter()
+                .any(|lang| body.contains(&too_low.text_in(lang))),
             "足りない role を名指す: {body}"
         );
         // ② observe でも一覧は認可を通る（app が居ないので 503 = 認可は通った）
