@@ -35,10 +35,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tako_control::host::SessionHost;
-use tako_control::net_stop::{NetScreen, NetStop};
+use tako_control::net_stop::{self, NetScreen, NetStop};
 use tako_core::net_resume::{self, ConnErrorKind, Hold, ProbeTarget, ResumeInput};
 use tako_core::PaneId;
 
+use crate::tick_screens::{TickScreens, TickSource};
 use crate::TakoApp;
 
 /// 1 ペインの停止（1 エピソード = 接続エラーで止まってから、その停止が画面から消えるまで）
@@ -79,8 +80,9 @@ enum Offscreen {
     Read { print: u64, screen: NetScreen },
 }
 
-/// 画面を読んだ結果
-enum NetRead {
+/// 画面を読んだ結果（#2647: 2 秒 tick では背景のスレッドが `TakoApp::read_net_screen` で解いて持ち帰る）
+#[derive(Debug, Clone)]
+pub(crate) enum NetRead {
     Screen(NetScreen),
     /// 見えている行だけでは判定できない（締めの行より上が画面の外）。値は形の印（#2181）
     Offscreen(u64),
@@ -149,8 +151,10 @@ impl NetResumeState {
 }
 
 impl TakoApp {
-    /// 2 秒 tick から呼ぶ。止まったペインを拾い直し、送ってよい停止があれば到達確認を始める
-    pub(crate) fn drive_net_autoresume(&mut self) {
+    /// 2 秒 tick から呼ぶ。止まったペインを拾い直し、送ってよい停止があれば到達確認を始める。
+    /// 画面は `screens` から読む（#2647: 定期更新は背景で採った 1 枚を渡す = UI スレッドで
+    /// 端末のロックを取らない）
+    pub(crate) fn drive_net_autoresume(&mut self, screens: &TickScreens) {
         if !self.net_resume.enabled {
             if !self.net_resume.trackers.is_empty() {
                 self.net_resume.trackers.clear();
@@ -160,18 +164,7 @@ impl TakoApp {
             return;
         }
         let now = tako_core::limit_resume::now_unix();
-        let targets: Vec<(PaneId, bool)> = self
-            .workspace
-            .all_panes()
-            .into_iter()
-            .filter(|p| {
-                tako_core::limit_resume_all::is_agent_pane(
-                    p,
-                    self.limit_resume_agent_detected(p.id()),
-                )
-            })
-            .map(|p| (p.id(), self.workspace.background_pane(p.id()).is_some()))
-            .collect();
+        let targets = self.net_resume_targets();
         // 閉じた・エージェントでなくなったペインの追跡は捨てる（ペイン ID の再利用で取り違えない）
         self.net_resume
             .trackers
@@ -192,12 +185,16 @@ impl TakoApp {
         // 画面の外を読みに行っているペイン（答えが来るまで追跡を動かさない = #2181）
         let mut reading = 0usize;
         for (pane, shelved) in targets {
-            let screen = match self.read_net_screen(pane) {
+            let read = match screens.source(&self.terminals, pane) {
+                Some(src) => src.net_read(),
+                None => NetRead::Screen(NetScreen::Clear),
+            };
+            let screen = match read {
                 NetRead::Screen(s) => {
                     self.net_resume.offscreen.remove(&pane);
                     s
                 }
-                NetRead::Offscreen(print) => match self.offscreen_screen(pane, print) {
+                NetRead::Offscreen(print) => match self.offscreen_screen(pane, print, screens) {
                     Some(s) => s,
                     None => {
                         reading += 1;
@@ -270,7 +267,7 @@ impl TakoApp {
             };
             tracker.message = stop.message;
             tracker.dialog = dialog;
-            match self.net_resume_decide(pane, now) {
+            match self.net_resume_decide(pane, now, screens) {
                 Ok(()) => {
                     if let Some(t) = self.net_resume.trackers.get_mut(&pane) {
                         t.hold = None;
@@ -290,17 +287,33 @@ impl TakoApp {
         self.maybe_start_net_probe(ready);
     }
 
-    /// 画面を読んで判定する（ペインの画面が無ければ Clear）。見えている行だけでは判定できない
-    /// 形（締めの行より上が画面の外）なら `Offscreen` を返す（#2181）
-    fn read_net_screen(&self, pane: PaneId) -> NetRead {
-        use tako_control::net_stop;
-        let Some(session) = self.terminals.get(&pane) else {
-            return NetRead::Screen(NetScreen::Clear);
-        };
+    /// ネット復帰の対象（退避中を含むエージェントのペインと、退避中か）。2 秒 tick の段と、
+    /// 背景で画面を採る計画（#2647 の `tick_screens::plan`）が同じ 1 実装を引く
+    pub(crate) fn net_resume_targets(&self) -> Vec<(PaneId, bool)> {
+        if !self.net_resume.enabled {
+            return Vec::new();
+        }
+        self.workspace
+            .all_panes()
+            .into_iter()
+            .filter(|p| {
+                tako_core::limit_resume_all::is_agent_pane(
+                    p,
+                    self.limit_resume_agent_detected(p.id()),
+                )
+            })
+            .map(|p| (p.id(), self.workspace.background_pane(p.id()).is_some()))
+            .collect()
+    }
+
+    /// 画面を読んで判定する。見えている行だけでは判定できない形（締めの行より上が画面の外）なら
+    /// `Offscreen` を返す（#2181）。**判定の 1 実装**: 2 秒 tick は背景のスレッドが背景で採った
+    /// 1 枚へ（`TickSource::net_read` の既定の実装）、送る直前の確かめはその場の端末へ通す（#2647）
+    pub(crate) fn read_net_screen(src: &(impl TickSource + ?Sized)) -> NetRead {
         // 普段は画面末尾だけ。入力欄の上に会話の項目が見えないときだけ全体を読む
-        let tail = session.tail_lines(tako_core::terminal::AGENT_TUI_TAIL_LINES);
+        let tail = src.tail_lines(tako_core::terminal::AGENT_TUI_TAIL_LINES);
         let full = net_stop::needs_full_screen(&tail);
-        let lines = if full { session.visible_lines() } else { tail };
+        let lines = if full { src.visible_lines() } else { tail };
         let screen = net_stop::detect(&lines);
         if screen != NetScreen::Clear {
             return NetRead::Screen(screen);
@@ -313,7 +326,7 @@ impl TakoApp {
             return NetRead::Offscreen(print);
         }
         // 末尾の窓の外でも画面の中なら、画面全体で足りる（背の高いペイン）
-        let lines = session.visible_lines();
+        let lines = src.visible_lines();
         match net_stop::detect(&lines) {
             NetScreen::Clear => match net_stop::offscreen_print(&lines) {
                 Some(print) => NetRead::Offscreen(print),
@@ -326,7 +339,12 @@ impl TakoApp {
     /// 画面の外を足した判定（#2181）。覚えた答えが同じ形の印なら使う。無ければ読みに行く:
     /// 器の無い直接のペインはメモリの履歴をその場で、器のペインは背景のスレッドで
     /// （その間は None = 判定を保留する）
-    fn offscreen_screen(&mut self, pane: PaneId, print: u64) -> Option<NetScreen> {
+    fn offscreen_screen(
+        &mut self,
+        pane: PaneId,
+        print: u64,
+        screens: &TickScreens,
+    ) -> Option<NetScreen> {
         use tako_control::net_stop;
         match self.net_resume.offscreen.get(&pane) {
             Some(Offscreen::Read { print: p, screen }) if *p == print => {
@@ -341,9 +359,8 @@ impl TakoApp {
             return Some(NetScreen::Clear);
         }
         let Some(session) = self.backend_sessions.get(&pane).cloned() else {
-            let lines = self
-                .terminals
-                .get(&pane)?
+            let lines = screens
+                .source(&self.terminals, pane)?
                 .lines_with_history(net_stop::OFFSCREEN_LINES);
             let screen = net_stop::detect_offscreen(&lines, print);
             self.net_resume.offscreen.insert(
@@ -416,7 +433,11 @@ impl TakoApp {
     /// 画面を読んで停止を切り出す。(停止, ダイアログ中か)。止まっていなければ None。
     /// 締めの行より上が画面の外なら、同じ形の印で覚えた答えだけを使う（ここでは読みに行かない）
     fn observe_net_stop(&self, pane: PaneId) -> Option<(NetStop, bool)> {
-        let screen = match self.read_net_screen(pane) {
+        let read = match self.terminals.get(&pane) {
+            Some(session) => TickSource::net_read(session),
+            None => NetRead::Screen(NetScreen::Clear),
+        };
+        let screen = match read {
             NetRead::Screen(s) => s,
             NetRead::Offscreen(print) => match self.net_resume.offscreen.get(&pane) {
                 Some(Offscreen::Read { print: p, screen }) if *p == print => screen.clone(),
@@ -446,8 +467,9 @@ impl TakoApp {
                 })
     }
 
-    /// 送ってよいかを判断する（材料はその場で取る = 送る直前にも同じ判断を通す）
-    fn net_resume_decide(&self, pane: PaneId, now: i64) -> Result<(), Hold> {
+    /// 送ってよいかを判断する（材料はその場で取る = 送る直前にも同じ判断を通す）。
+    /// 入力欄は `screens` から読む（2 秒 tick は背景で採った 1 枚・送る直前はその場の画面）
+    fn net_resume_decide(&self, pane: PaneId, now: i64, screens: &TickScreens) -> Result<(), Hold> {
         let Some(t) = self.net_resume.trackers.get(&pane) else {
             return Err(Hold::AlreadyResumed);
         };
@@ -455,9 +477,8 @@ impl TakoApp {
         // 止まったペインに限って行う（2 秒 tick の全ペインでは組まない）
         let user_draft = !t.dialog
             && t.sent_at.is_none()
-            && self
-                .terminals
-                .get(&pane)
+            && screens
+                .source(&self.terminals, pane)
                 .and_then(|s| s.analyze_input())
                 .is_some_and(|s| s.style.is_user_draft());
         net_resume::decide(&ResumeInput {
@@ -619,7 +640,7 @@ impl TakoApp {
                 self.net_resume.trackers.remove(&pane);
                 continue;
             }
-            match self.net_resume_decide(pane, now) {
+            match self.net_resume_decide(pane, now, &TickScreens::Live) {
                 Ok(()) => {
                     self.queue_prompt_flow(pane, net_resume::nudge_prompt());
                     if let Some(t) = self.net_resume.trackers.get_mut(&pane) {

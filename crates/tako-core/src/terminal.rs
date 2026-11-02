@@ -1191,9 +1191,13 @@ impl TerminalSession {
     /// PTY の出力が入りうる）。上へスクロールしていれば、その表示位置の直上を読む。
     /// 各行は [`Self::visible_lines`] と 1 バイトも変わらない（[`Self::compose_grid_row`] の 1 実装）
     pub fn lines_with_history(&self, history: usize) -> Vec<String> {
+        Self::lines_with_history_of(&self.term.lock(), history)
+    }
+
+    /// [`Self::lines_with_history`] の本体（[`PaneAccess`] と共有する 1 実装。#2647）
+    fn lines_with_history_of(term: &Term<EventProxy>, history: usize) -> Vec<String> {
         use alacritty_terminal::index::Line;
 
-        let term = self.term.lock();
         let rows = term.screen_lines() as i32;
         let grid = term.grid();
         let cols = grid.columns();
@@ -1523,9 +1527,13 @@ impl TerminalSession {
     /// （`n >= rows` なら全体。テスト `tail_lines_は_visible_lines_の末尾と一致する`）。
     /// 色・選択・カーソルはテキストを変えないので、装飾を解決せずに済む
     pub fn tail_lines(&self, n: usize) -> Vec<String> {
+        Self::tail_lines_of(&self.term.lock(), n)
+    }
+
+    /// [`Self::tail_lines`] の本体（[`PaneAccess`] と共有する 1 実装。#2647）
+    fn tail_lines_of(term: &Term<EventProxy>, n: usize) -> Vec<String> {
         use alacritty_terminal::index::Line;
 
-        let term = self.term.lock();
         let rows = term.screen_lines();
         let take = n.min(rows);
         if take == 0 {
@@ -2503,6 +2511,39 @@ impl PaneAccess {
             .map(|l| l.text.trim_end().to_string())
             .collect();
         (lines, input)
+    }
+
+    /// alternate screen（全画面 TUI）中か（[`TerminalSession::is_alt_screen`] と同じ材料。#2647）
+    pub fn is_alt_screen(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// 表示行の末尾 `n` 行の平文（[`TerminalSession::tail_lines`] と同じ 1 実装。#2647）
+    pub fn tail_lines(&self, n: usize) -> Vec<String> {
+        TerminalSession::tail_lines_of(&self.term.lock(), n)
+    }
+
+    /// alternate screen の印と**可視行のすべて**の平文を、**1 回のロック**で採る（#2647）。
+    ///
+    /// 2 秒 tick の判定（エージェントのメトリクス・キュー滞留・利用制限・接続エラーの停止）が
+    /// 背景のスレッドで読む 1 枚。行は [`TerminalSession::tail_lines`] に画面の行数以上を渡したものと
+    /// 同じ = [`TerminalSession::visible_lines`] と 1 バイトも変わらない（装飾を解決しないので
+    /// `Screen` を組むより軽く、ロックを握る時間も短い）
+    pub fn alt_and_lines(&self) -> (bool, Vec<String>) {
+        let term = self.term.lock();
+        let alt = term.mode().contains(TermMode::ALT_SCREEN);
+        (alt, TerminalSession::tail_lines_of(&term, usize::MAX))
+    }
+
+    /// 入力欄の状態（[`TerminalSession::analyze_input`] と同じ材料。#2647）
+    pub fn analyze_input(&self) -> Option<screen::InputStatus> {
+        let scr = screen::snapshot_opts(&self.term.lock(), &Theme::default(), true, 0.0);
+        screen::analyze_input_line(&scr)
+    }
+
+    /// 表示中の画面の直上の履歴 + 画面（[`TerminalSession::lines_with_history`] と同じ 1 実装。#2647）
+    pub fn lines_with_history(&self, history: usize) -> Vec<String> {
+        TerminalSession::lines_with_history_of(&self.term.lock(), history)
     }
 
     /// PTY へバイト列を書く。**スクロール位置は触らない**

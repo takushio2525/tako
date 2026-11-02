@@ -403,7 +403,7 @@ fn scan_contract(register: &str, types: &str, core: &str) -> Vec<String> {
 /// 5. tako 側の区画を止める判断は 1 本
 fn scan_status_bar(s: &Sources) -> Vec<String> {
     let mut out = Vec::new();
-    match window(&s.main, "    fn refresh_agent_metrics(&mut self) {", "    }") {
+    match window(&s.main, "    fn refresh_agent_metrics(&mut self, screens: &tick_screens::TickScreens) {", "    }") {
         Some(w) if w.1.contains("tako_control::claude_mod::status_bar_owner(") => {}
         Some(w) => out.push(report(
             MAIN,
@@ -522,7 +522,7 @@ fn 走査が空振りしていない() {
     assert_eq!(press.len(), 3, "{press:?}");
     let (_, w) = window(
         &s.main,
-        "    fn refresh_agent_metrics(&mut self) {",
+        "    fn refresh_agent_metrics(&mut self, screens: &tick_screens::TickScreens) {",
         "    }",
     )
     .unwrap();

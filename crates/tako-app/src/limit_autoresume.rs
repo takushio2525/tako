@@ -26,6 +26,7 @@ use tako_core::limit_resume::{
 };
 use tako_core::PaneId;
 
+use crate::tick_screens::{TickScreens, TickSource};
 use crate::TakoApp;
 
 /// codex の構造化レート制限を読み直す間隔（#985）。
@@ -128,13 +129,12 @@ pub(crate) struct LimitResumeJob {
 const AUDIT_ACTION: &str = "limit_autoresume";
 
 impl TakoApp {
-    /// 自動復帰の駆動（2 秒 tick から呼ぶ）。
-    /// 戻り値はバックグラウンドで実行すべきダイアログ応答ジョブ
-    pub(crate) fn drive_limit_autoresume(&mut self) -> Vec<LimitResumeJob> {
-        // 有効なペインの収集。既定 OFF なので通常運転ではここで終わる（NFR-8）。
-        // #1945: 退避中のペインも対象（一括で ON にした退避中の master が上限で止まったら
-        // 戻す。端末を持たない退避中 = 再起動後まだ表へ出していないペインは下で飛ばす）
-        let targets: Vec<PaneId> = if tako_core::limit_resume_all::legacy() {
+    /// 自動復帰の対象（有効なペイン）。2 秒 tick の段と、背景で画面を採る計画
+    /// （#2647 の `tick_screens::plan`）が同じ 1 実装を引く。
+    /// #1945: 退避中のペインも対象（一括で ON にした退避中の master が上限で止まったら
+    /// 戻す。端末を持たない退避中 = 再起動後まだ表へ出していないペインは段の中で飛ばす）
+    pub(crate) fn limit_resume_targets(&self) -> Vec<PaneId> {
+        if tako_core::limit_resume_all::legacy() {
             self.workspace
                 .tabs()
                 .iter()
@@ -149,7 +149,16 @@ impl TakoApp {
                 .filter(|p| p.limit_autoresume())
                 .map(|p| p.id())
                 .collect()
-        };
+        }
+    }
+
+    /// 自動復帰の駆動（2 秒 tick から呼ぶ）。
+    /// 戻り値はバックグラウンドで実行すべきダイアログ応答ジョブ。
+    /// 画面は `screens` から読む（#2647: 定期更新は背景で採った 1 枚を渡す = 画面の組み立てと
+    /// 上限の判定を UI スレッドで行わない。定期更新の外は `TickScreens::Live` = その場で読む）
+    pub(crate) fn drive_limit_autoresume(&mut self, screens: &TickScreens) -> Vec<LimitResumeJob> {
+        // 有効なペインの収集。既定 OFF なので通常運転ではここで終わる（NFR-8）
+        let targets = self.limit_resume_targets();
         if targets.is_empty() {
             if !self.limit_resume.is_empty() {
                 self.limit_resume.clear();
@@ -170,11 +179,14 @@ impl TakoApp {
         let mod_legacy = tako_core::claude_mod::s2_legacy();
         let mut jobs = Vec::new();
         for pane in targets {
-            let Some(session) = self.terminals.get(&pane) else {
+            let Some(session) = screens.source(&self.terminals, pane) else {
                 continue;
             };
-            let lines = session.visible_lines();
-            let fingerprint = tako_control::limit_stop::screen_fingerprint(&lines);
+            let crate::tick_screens::LimitRead {
+                lines,
+                fingerprint,
+                classified,
+            } = session.limit_read();
             // #985: codex は rollout の `rate_limits.resets_at`（epoch）で解除時刻が
             // **書式にもタイムゾーンにも依存せず**分かる。画面の文言パースより確かなので
             // 読めていればそちらを採る。**停止の根拠は画面のまま**（#813 の安全条件）。
@@ -201,8 +213,9 @@ impl TakoApp {
                     .and_then(|p| p.limit_seen())
                     .cloned()
             };
-            let observed = tako_control::limit_stop::observe_limit_stop(
+            let observed = tako_control::limit_stop::observe_classified(
                 &lines,
+                classified,
                 seen.as_ref(),
                 now,
                 tz,

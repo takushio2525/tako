@@ -68,7 +68,7 @@ pub(super) async fn mod_bar_visual(
                 let root = app.workspace.active_tab().tree().focused();
                 app.limit_service = tako_core::LimitService::Claude;
                 app.claude_mod.accept(root.as_u64(), report, received);
-                app.refresh_agent_metrics();
+                app.refresh_agent_metrics(&crate::tick_screens::TickScreens::Live);
                 cx.notify();
                 (
                     app.claude_bar_owner.as_str(),

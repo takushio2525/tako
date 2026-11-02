@@ -76,6 +76,7 @@ mod tab_shape;
 mod tasks_panel;
 mod terminal_grid;
 mod text_field;
+mod tick_screens;
 mod ui_text;
 mod update_checker;
 mod update_window;
@@ -624,6 +625,10 @@ const QUEUE_STRANDED_TICKS: u8 = 3;
 
 /// #572: 1 ペインあたりの救出試行の上限（滞留が解けないときに叩き続けない）
 const QUEUE_RECOVERY_MAX: u8 = 5;
+
+/// master の引き継ぎの閾値の設定（profiles/*.yaml + config.yaml）の控えの寿命（Issue #749）。
+/// 設定の変更は次の TTL 切れで反映される。#2647 以後、2 秒 tick は切れかけの控えを背景で読み直す
+const HANDOFF_POLICY_TTL: Duration = Duration::from_secs(30);
 
 // --- セルフテスト項目 111（#985 / #1048）の番兵 ------------------------------
 
@@ -6874,6 +6879,25 @@ impl TakoApp {
                 {
                     break;
                 }
+                // ⓪ #2647: 判定（メトリクス・キュー滞留・引き継ぎ・自動復帰・ネット復帰）が読む画面を
+                // 背景で採る。UI スレッドはペインへの手を集めるだけ（端末のロックも解析も設定の
+                // 読み直しも背景）。A/B（TAKO_2647_LEGACY=1）では採らず、各段がその場で読む
+                let plan = this.update(cx, |app: &mut TakoApp, _| {
+                    let _s = tako_control::diag::perf_span("periodic_prep:tick_screens");
+                    tick_screens::plan(app)
+                });
+                let Ok(plan) = plan else {
+                    break;
+                };
+                let mut screens = match plan {
+                    Some(plan) => {
+                        cx.background_executor()
+                            .spawn(async move { tick_screens::read(plan) })
+                            .await
+                    }
+                    None => tick_screens::TickScreens::Live,
+                };
+                let policies = screens.take_policies();
                 // ① main thread: tmux コンテキスト + filetree 対象 + view 監視対象 + git を収集（高速）
                 let t0 = std::time::Instant::now();
                 let prep = this.update(cx, |app: &mut TakoApp, wcx| {
@@ -6897,7 +6921,7 @@ impl TakoApp {
                     }
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:agent_metrics");
-                        app.refresh_agent_metrics();
+                        app.refresh_agent_metrics(&screens);
                     }
                     {
                         // #1993: PC リソースの採取へペインの一覧を渡す（写すだけ。採取は背景）
@@ -6913,14 +6937,15 @@ impl TakoApp {
                         // #572: busy 中に人間が打った指示が claude のキューに滞留したまま
                         // 止まっていないかを見張り、見つけたら送り出す
                         let _s = tako_control::diag::perf_span("periodic_prep:queued_recovery");
-                        app.drive_queued_message_recovery();
+                        app.drive_queued_message_recovery(&screens);
                     }
                     // #749: master の ctx% が閾値を超えていたら引き継ぎを促す。
                     // #1021: 画面が ctx% を出していない master は transcript で補う
                     // （読むのは background。間隔も空ける）
                     let transcript_ctx_scan = {
                         let _s = tako_control::diag::perf_span("periodic_prep:handoff_nudge");
-                        let targets = app.drive_handoff_nudge();
+                        app.absorb_handoff_policies(policies);
+                        let targets = app.drive_handoff_nudge(&screens);
                         let due = app
                             .transcript_ctx_scan
                             .due(targets.len(), std::time::Instant::now());
@@ -6930,13 +6955,13 @@ impl TakoApp {
                     // （有効なペインが無ければ即 return するので通常運転のコストはゼロ）
                     let limit_resume_jobs = {
                         let _s = tako_control::diag::perf_span("periodic_prep:limit_autoresume");
-                        app.drive_limit_autoresume()
+                        app.drive_limit_autoresume(&screens)
                     };
                     // #2112: 接続エラーで止まったエージェントを拾い、送ってよい停止があるときだけ
                     // 到達確認を 1 本だけ背景で起こす（設定 OFF なら即 return。結果は 500ms ループ）
                     {
                         let _s = tako_control::diag::perf_span("periodic_prep:net_autoresume");
-                        app.drive_net_autoresume();
+                        app.drive_net_autoresume(&screens);
                     }
                     // #2009: 見えていないプレビューを猶予つきで手放し、実効上限を見えている量へ
                     // 合わせる。手放したら描き直して GPUI の asset / atlas からの解放を流す
@@ -10457,8 +10482,11 @@ impl TakoApp {
     /// idle + キュー滞留が `QUEUE_STRANDED_TICKS` 回続いたら Enter 単独送達フローを積む
     /// （フロー側が `Up` → `Enter` でキューから取り出して送る）。ペインごとに
     /// `QUEUE_RECOVERY_MAX` 回で打ち切り、状態が解消したらカウンタを戻す
-    fn drive_queued_message_recovery(&mut self) {
-        use tako_control::claude_tui;
+    ///
+    /// 画面は `screens` から読む（#2647: 定期更新は背景で採った 1 枚を渡す = UI スレッドで
+    /// 端末のロックを取らない）
+    fn drive_queued_message_recovery(&mut self, screens: &tick_screens::TickScreens) {
+        use tick_screens::TickSource;
         let legacy_c3 = queued_recovery_legacy();
         let panes: Vec<PaneId> = self
             .workspace
@@ -10468,7 +10496,7 @@ impl TakoApp {
             .map(|p| p.id())
             .collect();
         for pane in panes {
-            let Some(session) = self.terminals.get(&pane) else {
+            let Some(session) = screens.source(&self.terminals, pane) else {
                 self.queued_recovery.remove(&pane);
                 continue;
             };
@@ -10481,13 +10509,9 @@ impl TakoApp {
             // ヒントが出ているペインに限って全画面を採る（フルが本当に要るのは
             // `state.observe` の before / after 比較だけ）。`AGENT_TUI_TAIL_LINES`
             // より上にある入力欄は claude の TUI では起こらない（フッターが最下部）ので、
-            // ヒントの有無の判定はこの窓で全画面と一致する
-            let hint_lines = if legacy_c3 {
-                session.visible_lines()
-            } else {
-                session.tail_lines(tako_core::terminal::AGENT_TUI_TAIL_LINES)
-            };
-            if !claude_tui::queued_messages_pending(&hint_lines) {
+            // ヒントの有無の判定はこの窓で全画面と一致する（判定の 1 実装は
+            // `TickSource::queued_hint_pending`。C3 の A/B では全画面で判定する）
+            if !session.queued_hint_pending(legacy_c3) {
                 self.queued_recovery.remove(&pane);
                 continue;
             }
@@ -10498,11 +10522,8 @@ impl TakoApp {
             }
             // ここまで来たペイン（= ヒントが出ている）だけフル画面を採る。
             // `screen_settled` は画面全体の前後比較なので窓では代用できない
-            let lines = if legacy_c3 {
-                hint_lines
-            } else {
-                session.visible_lines()
-            };
+            // （C3 の A/B でも判定に使ったのと同じ全画面）
+            let lines = session.visible_lines();
             let state = self.queued_recovery.entry(pane).or_default();
             match state.observe(lines) {
                 QueuedRecoveryAction::Wait => continue,
@@ -19145,8 +19166,12 @@ impl TakoApp {
         })
     }
 
-    fn refresh_agent_metrics(&mut self) {
+    /// 全ペインの画面から Claude / Codex のメトリクス（ctx% / 使用量）を集めてステータスバーへ写す。
+    /// 画面は `screens` から読む（#2647: 定期更新は背景で採った 1 枚を渡す = UI スレッドで
+    /// 端末のロックを取らない。定期更新の外から呼ぶ経路は `TickScreens::Live` = その場で読む）
+    fn refresh_agent_metrics(&mut self, screens: &tick_screens::TickScreens) {
         use tako_core::MetricsSource;
+        use tick_screens::TickSource;
         let mut best_claude: Option<AgentMetrics> = None;
         let mut best_codex: Option<AgentMetrics> = None;
         // フォーカスペインを優先し、なければ他のペインから取得
@@ -19166,7 +19191,7 @@ impl TakoApp {
         // 性質）= ここで落ちるのは器なしの素のシェルだけで、取りこぼしは増えない
         let gate_alt_screen = !tako_core::terminal::c2_legacy();
         for pid in &pane_ids {
-            if let Some(session) = self.terminals.get(pid) {
+            if let Some(session) = screens.source(&self.terminals, *pid) {
                 if gate_alt_screen && !session.is_alt_screen() {
                     continue;
                 }
@@ -19237,10 +19262,9 @@ impl TakoApp {
     /// profiles/*.yaml + config.yaml の読み取りは 30 秒 TTL でキャッシュし、
     /// 2 秒 tick 毎のファイル I/O を避ける（設定変更は次の TTL 切れで反映される）
     fn handoff_policy_for(&mut self, profile: &str) -> (u32, bool) {
-        const TTL: Duration = Duration::from_secs(30);
         let now = std::time::Instant::now();
         if let Some((at, threshold, auto)) = self.handoff_policy_cache.get(profile) {
-            if now.duration_since(*at) < TTL {
+            if now.duration_since(*at) < HANDOFF_POLICY_TTL {
                 return (*threshold, *auto);
             }
         }
@@ -19248,6 +19272,29 @@ impl TakoApp {
         self.handoff_policy_cache
             .insert(profile.to_string(), (now, resolved.value, auto));
         (resolved.value, auto)
+    }
+
+    /// 引き継ぎの閾値の設定の控えが、`now` から `margin` のうちに TTL 切れになるか（#2647。
+    /// 背景で前倒しに読み直す候補 = `tick_screens::plan`）
+    fn handoff_policy_expiring(
+        &self,
+        profile: &str,
+        now: std::time::Instant,
+        margin: Duration,
+    ) -> bool {
+        self.handoff_policy_cache
+            .get(profile)
+            .is_none_or(|(at, _, _)| now.duration_since(*at) + margin >= HANDOFF_POLICY_TTL)
+    }
+
+    /// 背景で読み直した引き継ぎの閾値の設定を控えへ入れる（#2647。メモリの操作だけ）。
+    /// 読み直した時刻ではなく**入れた時刻**で控える = 同じ tick の段は必ず控えを使う
+    fn absorb_handoff_policies(&mut self, policies: Vec<(String, (u32, bool))>) {
+        let now = std::time::Instant::now();
+        for (profile, (threshold, auto)) in policies {
+            self.handoff_policy_cache
+                .insert(profile, (now, threshold, auto));
+        }
     }
 
     /// master の自動ハンドオフ通知（Issue #749）。
@@ -19258,8 +19305,12 @@ impl TakoApp {
     ///
     /// 戻り値は **#1021 の transcript 補完が要る master ペイン**（画面が ctx% を
     /// 出していないもの）。呼び出し側が background の走査対象へ回す
-    fn drive_handoff_nudge(&mut self) -> Vec<PaneId> {
+    ///
+    /// 画面は `screens` から読む（#2647: 定期更新は背景で採った 1 枚を渡す。閾値の設定の
+    /// 読み直しも背景で済ませて控えに入っている）
+    fn drive_handoff_nudge(&mut self, screens: &tick_screens::TickScreens) -> Vec<PaneId> {
         use tako_core::handoff;
+        use tick_screens::TickSource;
 
         // 対象 master ペインの収集（role が orchestrator-master のもの）。
         // handoff 済み判定は「このペインを spawned_by に持つ master ペインがある」で導く
@@ -19300,9 +19351,8 @@ impl TakoApp {
                 now,
                 tako_core::claude_mod::s2_legacy(),
             ));
-            let screen = self
-                .terminals
-                .get(&pane_id)
+            let screen = screens
+                .source(&self.terminals, pane_id)
                 .and_then(|s| s.agent_metrics())
                 .map(|m| tako_core::ctx_usage::ScreenCtx {
                     percent: m.ctx_percent,
@@ -27140,7 +27190,7 @@ impl UiStateHost for TakoApp {
     }
 
     fn refresh_limits(&mut self) -> serde_json::Value {
-        self.refresh_agent_metrics();
+        self.refresh_agent_metrics(&tick_screens::TickScreens::Live);
         let m = |metrics: &AgentMetrics, l1: &str, l2: &str| {
             serde_json::json!({
                 l1: metrics.limit_5h,
@@ -84479,7 +84529,7 @@ mod self_test {
                                 .insert(master_pane, HandoffNudgeTracker::new(old));
                             app.handoff_policy_cache.clear();
                             app.prompt_flows.clear();
-                            app.drive_handoff_nudge();
+                            app.drive_handoff_nudge(&tick_screens::TickScreens::Live);
                             app.prompt_flows
                                 .iter()
                                 .filter(|f| f.pane == master_pane)
@@ -84510,7 +84560,7 @@ mod self_test {
                 let again = window
                     .update(cx, |app, _, _| {
                         app.prompt_flows.clear();
-                        app.drive_handoff_nudge();
+                        app.drive_handoff_nudge(&tick_screens::TickScreens::Live);
                         app.prompt_flows
                             .iter()
                             .filter(|f| f.pane == master_pane)
@@ -86951,7 +87001,7 @@ mod self_test {
                         window
                             .update(cx, |app, _, _| {
                                 app.prompt_flows.clear();
-                                let _jobs = app.drive_limit_autoresume();
+                                let _jobs = app.drive_limit_autoresume(&tick_screens::TickScreens::Live);
                                 let sent: Vec<String> = app
                                     .prompt_flows
                                     .iter()
@@ -87069,7 +87119,7 @@ mod self_test {
                             t.last_attempt = None;
                         }
                         app.prompt_flows.clear();
-                        let _ = app.drive_limit_autoresume();
+                        let _ = app.drive_limit_autoresume(&tick_screens::TickScreens::Live);
                         app.prompt_flows
                             .iter()
                             .filter(|f| f.pane == idle_pane)
@@ -87109,7 +87159,7 @@ mod self_test {
                 let dialog_act = window
                     .update(cx, |app, _, _| {
                         app.prompt_flows.clear();
-                        let jobs = app.drive_limit_autoresume();
+                        let jobs = app.drive_limit_autoresume(&tick_screens::TickScreens::Live);
                         let job_for = jobs.iter().filter(|j| j.pane == dialog_pane).count();
                         let sent = app
                             .prompt_flows
@@ -87293,7 +87343,7 @@ mod self_test {
                             .get(&session_pane)
                             .and_then(|s| s.agent_metrics())
                             .and_then(|m| m.limit_5h);
-                        app.refresh_agent_metrics();
+                        app.refresh_agent_metrics(&tick_screens::TickScreens::Live);
                         (pane_level, app.agent_metrics.limit_5h)
                     })
                     .unwrap_or((None, None));
@@ -87682,7 +87732,7 @@ mod self_test {
                             .get(&wrapped_pane)
                             .and_then(|s| s.agent_metrics())
                             .and_then(|m| m.limit_5h);
-                        app.refresh_agent_metrics();
+                        app.refresh_agent_metrics(&tick_screens::TickScreens::Live);
                         (pane_level, app.agent_metrics.limit_5h)
                     })
                     .unwrap_or((None, None));
@@ -87848,7 +87898,7 @@ mod self_test {
                 // 「注入で動いていないこと」を見る
                 let claude_before = window
                     .update(cx, |app, _, _| {
-                        app.refresh_agent_metrics();
+                        app.refresh_agent_metrics(&tick_screens::TickScreens::Live);
                         app.agent_metrics.limit_5h
                     })
                     .unwrap_or(None);
@@ -87878,7 +87928,7 @@ mod self_test {
                                 reached: None,
                             },
                         );
-                        app.refresh_agent_metrics();
+                        app.refresh_agent_metrics(&tick_screens::TickScreens::Live);
                         (
                             app.codex_metrics.limit_5h,
                             app.codex_metrics.limit_week,
