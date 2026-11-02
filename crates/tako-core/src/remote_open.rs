@@ -82,7 +82,7 @@ pub enum PaneSshBlock {
 impl PaneSshBlock {
     /// ワイヤ表記（応答 JSON の `reason`。#1080 でリモート UI が読む）。
     ///
-    /// **文言ではなく slug で分岐させる**ため。`message` は人が読む日本語で、
+    /// **文言ではなく slug で分岐させる**ため。`message` は人が読む文（表示言語）で、
     /// 表示の都合で変わりうる。リモート UI は「このペインを SSH 化できるか」を
     /// 判定するのに `ok` を、理由の出し分けにこの slug を使う
     pub fn as_str(self) -> &'static str {
@@ -94,26 +94,70 @@ impl PaneSshBlock {
         }
     }
 
-    /// 理由 + 次の一手（dispatch / CLI / MCP のエラー文。規約どおり日本語）
+    /// 理由 + 次の一手（dispatch / CLI / MCP のエラー文・`list` の `can_ssh.note`）。
+    /// 表示言語に従う（#2365。日英の正本は [`Self::text_in`]）
     pub fn message(self, pane: u64) -> String {
-        match self {
-            PaneSshBlock::NoSession => format!(
+        self.text_in(pane, crate::i18n::lang())
+    }
+
+    /// 表示言語を明示しての文言（#2365）。日英の対はここ 1 か所に置く。
+    ///
+    /// (バリアント, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまで
+    /// コンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    /// （`tako-control/tests/issue1762_dispatch_error_lang.rs` が旧文の表と突き合わせる）。
+    /// どの文にも次の一手 [`Self::NEXT_STEP`] を入れる（remote daemon の 409 の読み
+    /// [`Self::says_blocked`] の目印でもある）
+    pub fn text_in(self, pane: u64, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NoSession, Ja) => format!(
                 "pane {pane} にはターミナルセッションが無い（プレビュー等）ので SSH 化できない。\
                  target=split で新しいペインを作って接続する"
             ),
-            PaneSshBlock::AltScreen => format!(
+            (Self::NoSession, En) => format!(
+                "pane {pane} has no terminal session (e.g. a preview), so it cannot be turned into SSH. \
+                 Use target=split to connect in a new pane"
+            ),
+            (Self::AltScreen, Ja) => format!(
                 "pane {pane} は全画面 TUI を表示中（素のシェルではない）ので SSH 化できない。\
                  TUI を終了させるか、target=split で新しいペインを作って接続する"
             ),
-            PaneSshBlock::Running => format!(
+            (Self::AltScreen, En) => format!(
+                "pane {pane} is showing a full-screen TUI (not a plain shell), so it cannot be turned \
+                 into SSH. Quit the TUI, or use target=split to connect in a new pane"
+            ),
+            (Self::Running, Ja) => format!(
                 "pane {pane} はコマンド実行中なので SSH 化できない（入力が実行中の\
                  プロセスへ流れる）。終わるのを待つか、target=split で新しいペインを作って接続する"
             ),
-            PaneSshBlock::AgentRole => format!(
+            (Self::Running, En) => format!(
+                "pane {pane} is running a command, so it cannot be turned into SSH (the input would go \
+                 to the running process). Wait for it to finish, or use target=split to connect in a \
+                 new pane"
+            ),
+            (Self::AgentRole, Ja) => format!(
                 "pane {pane} は AI エージェントのペインなので SSH 化できない\
                  （対話が壊れる）。target=split で新しいペインを作って接続する"
             ),
+            (Self::AgentRole, En) => format!(
+                "pane {pane} is an AI agent pane, so it cannot be turned into SSH \
+                 (it would break the conversation). Use target=split to connect in a new pane"
+            ),
         }
+    }
+
+    /// どの断りの文にも入る次の一手（新しいペインで開く引数の綴り。言語に依らない）
+    pub const NEXT_STEP: &'static str = "target=split";
+
+    /// 断りの文が「このペインは SSH 化できない」か（#2365）。
+    ///
+    /// dispatch の断りは IPC を越えると文字列になる（`RpcError` は code と message だけ）ので、
+    /// remote daemon はこれで「SSH 化できないので断った（409）」と「経路の故障（502）」を分ける。
+    /// 目印は日英どちらの文にも入る引数の綴り [`Self::NEXT_STEP`] なので、daemon と表示言語の
+    /// 違う GUI（daemon は起動時に決まる = #1077、GUI は `tako lang` でその場で切り替わる）の文にも、
+    /// #2365 より前の GUI の日本語の文にも当たる
+    pub fn says_blocked(message: &str) -> bool {
+        message.contains(Self::NEXT_STEP)
     }
 }
 
@@ -266,13 +310,23 @@ mod tests {
             PaneSshBlock::Running,
             PaneSshBlock::AgentRole,
         ] {
-            let msg = block.message(7);
-            assert!(msg.contains("pane 7"), "対象ペインを名指しする: {msg}");
-            assert!(
-                msg.contains("target=split"),
-                "回避策（新ペインで開く）を必ず添える: {msg}"
-            );
+            // #2365: 日英どちらの表示でも同じ形（対象ペイン + 新ペインで開く回避策）
+            for lang in [crate::i18n::Lang::Ja, crate::i18n::Lang::En] {
+                let msg = block.text_in(7, lang);
+                assert!(msg.contains("pane 7"), "対象ペインを名指しする: {msg}");
+                assert!(
+                    msg.contains("target=split"),
+                    "回避策（新ペインで開く）を必ず添える: {msg}"
+                );
+                assert!(
+                    PaneSshBlock::says_blocked(&msg),
+                    "SSH 化できない断りとして読める: {msg}"
+                );
+            }
         }
+        // 当たるのは SSH 化の断りだけ（ペインが無い・経路の故障は別の読み）
+        assert!(!PaneSshBlock::says_blocked("pane 42 not found"));
+        assert!(!PaneSshBlock::says_blocked("接続が切断された"));
     }
 }
 

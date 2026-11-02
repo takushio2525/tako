@@ -652,6 +652,16 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `error` / `note` / `poll` を表示に使うだけで、分岐は `kind` / ステータス / `can_ssh.ok`（字面に依らない）。番犬は
   同じファイルの `REMOTE_RECEIVER_FILES`（4 つの受け口の**ファイル全体**を見る。外すのは `Denial::message_ja` の
   範囲だけ。日本語の口に `.message_ja(` を足した）と、本物のソースへの注入 9 通りで `file:line` を名指す
+- 同じ続きで、**既存ペインの SSH 化の断り**（tako-core の `PaneSshBlock`。`tako list` / MCP `tako_list_panes` /
+  `/api/v2/panes` の `can_ssh.note` と、`tako open-in remote --target pane` / MCP `tako_open_remote` / PWA の
+  SSH 接続の断り）を表示言語へ移した。日英の対は `PaneSshBlock::text_in(pane, lang)` の網羅 match、利用者へ
+  返す口の `message(pane)` は `i18n::lang()`（GUI の dispatch が組むので GUI の表示言語）。`reason` の slug は
+  変えていない。remote daemon は dispatch の断りを文字列でしか受け取れない（`RpcError` は code と message
+  だけ）ので、SSH 化の断りを 409（正常な拒否）と読むのは型の 1 実装 `PaneSshBlock::says_blocked`（日英
+  どちらの文にも入る次の一手 `PaneSshBlock::NEXT_STEP` = `target=split` を目印にする。表示言語の違う GUI・
+  #2365 より前の GUI の日本語の文にも当たる）で、`remote_ssh::is_refusal` はこれを呼ぶ。番犬は同じ
+  `issue1762_dispatch_error_lang.rs`（tako-core の型の表に 4 種の旧文・日英のどの文でも 409 と読めること・
+  `is_refusal` が字面を直に読まないこと = 本物のソースへの注入で `file:line` を名指す）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

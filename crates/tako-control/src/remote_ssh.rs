@@ -306,11 +306,13 @@ fn request_via_app(
 
 /// dispatch の拒否（呼び出し側の指定が通らない）か、経路の故障かを見分ける。
 ///
-/// 判定材料は `PaneSshBlock::message` が必ず添える次の一手（`target=split`）と、
-/// ペイン解決の失敗。文言に依存するのでゆるく見て、外れたら 502 側（安全側 =
-/// 接続を張り直す）へ倒れる。ペイン解決の失敗は表示言語で日英どちらにもなる（#1762）
+/// 判定材料は SSH 化の断り（読みは `PaneSshBlock::says_blocked` の 1 実装。#2365）と、
+/// ペイン解決の失敗。IPC の向こうでは文言しか残らないのでゆるく見て、外れたら 502 側
+/// （安全側 = 接続を張り直す）へ倒れる。どちらの断りも GUI の表示言語で日英どちらにもなる
+/// （#1762 / #2365）
 fn is_refusal(err: &str) -> bool {
-    err.contains("target=split") || crate::dispatch::DispatchError::says_not_found(err)
+    tako_core::remote_open::PaneSshBlock::says_blocked(err)
+        || crate::dispatch::DispatchError::says_not_found(err)
 }
 
 #[cfg(test)]
@@ -553,6 +555,20 @@ mod tests {
         for lang in [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En] {
             let err = crate::dispatch::DispatchError::PaneNotFound(42).text_in(lang);
             assert!(is_refusal(&err), "{err}");
+        }
+        // #2365: SSH 化の断りも日英どちらの文でも拒否（409）として読む。dispatch は
+        // `Operation` に載せて返すので、IPC の向こうに届く文はその表示
+        for block in [
+            tako_core::remote_open::PaneSshBlock::NoSession,
+            tako_core::remote_open::PaneSshBlock::AltScreen,
+            tako_core::remote_open::PaneSshBlock::Running,
+            tako_core::remote_open::PaneSshBlock::AgentRole,
+        ] {
+            for lang in [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En] {
+                let err =
+                    crate::dispatch::DispatchError::Operation(block.text_in(7, lang)).text_in(lang);
+                assert!(is_refusal(&err), "{block:?} / {lang:?}: {err}");
+            }
         }
     }
 }
