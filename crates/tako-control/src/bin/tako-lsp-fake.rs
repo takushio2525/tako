@@ -181,6 +181,16 @@
 //!   まだ tako に届いていない形。CI の遅い機で `issue1678_lsp_e2e.rs` のアイドルの検査が受信数
 //!   1 → 2 で落ちた順序を、どの機でも起こす）
 //!
+//! ## 変更で古くなった答え（#2673）
+//!
+//! `--content-modified <loading|N>`（`TAKO_LSP_FAKE_CONTENT_MODIFIED`）を渡すと、言語機能の要求
+//! （定義ジャンプ・参照と階層・名前の変更・整形・補完・ホバー）へ答えの代わりに `-32801`
+//! （`ContentModified`・`"content modified"`）で答える。規則・シナリオより先に効く:
+//!
+//! - `loading` = `loading` の読み込み中に受けた要求すべて（rust-analyzer 1.95.0 が読み込み直し
+//!   （`switch_workspaces`）の最中に受けた要求を取り消す形の実測。済んだ後は規則どおり答える）
+//! - `N`（数）= 読み込みと無関係に、最初の N 本（読み込み中でない `-32801` = 打鍵の直後などの形）
+//!
 //! `TAKO_LSP_FAKE_ARGV_LOG=<ファイル>`（#1951）: 起動のたびに自分の起動引数（0 番 = 実行ファイルを含む）を
 //! 1 行 1 JSON の配列で追記する。知らない引数は読み飛ばすので、検出表の行が組んだ引数（`-cli <パス>` 等）を
 //! そのまま受けて、何が並んだかを e2e が読める（env だけで指定する = 起動引数を汚さない）
@@ -302,6 +312,15 @@ const XREF_METHODS: [&str; 7] = [
 
 /// 名前の変更の method（#1686）
 const RENAME_METHODS: [&str; 2] = ["textDocument/prepareRename", "textDocument/rename"];
+
+/// `--content-modified` が `-32801` で答える言語機能の要求か（#2673。冒頭の説明）
+fn answers_language_feature(method: &str) -> bool {
+    GOTO_METHODS.contains(&method)
+        || XREF_METHODS.contains(&method)
+        || RENAME_METHODS.contains(&method)
+        || FORMAT_METHODS.contains(&method)
+        || matches!(method, "textDocument/completion" | "textDocument/hover")
+}
 
 /// 名前の変更の既定の答え（#1686。冒頭の説明）。`texts` は本文の模型（とディスクの模型）
 fn rename_answer(
@@ -1028,6 +1047,17 @@ fn main() {
     let settle_on_empty = arg_or_env(&args, "--settle-on-empty", "TAKO_LSP_FAKE_SETTLE_ON_EMPTY");
     let settle_before = settle_on_empty.as_deref() == Some("before");
     let settle_after = settle_on_empty.as_deref() == Some("after");
+    // #2673: 言語機能の要求へ `-32801` で答える（冒頭の説明。`loading` か最初の N 本）
+    let content_modified = arg_or_env(
+        &args,
+        "--content-modified",
+        "TAKO_LSP_FAKE_CONTENT_MODIFIED",
+    );
+    let mut content_modified_left: u64 = content_modified
+        .as_deref()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let content_modified_while_loading = content_modified.as_deref() == Some("loading");
     std::thread::sleep(delay_of("--start-delay-ms", "TAKO_LSP_FAKE_START_DELAY_MS"));
     // #1684: 申告する能力の組をそのまま差し替える（シナリオの能力は捨てる）
     let providers: Option<serde_json::Map<String, serde_json::Value>> =
@@ -1141,6 +1171,26 @@ fn main() {
                 }
             }
             continue;
+        }
+        // #2673: 言語機能の要求へ `-32801` で答える（規則・シナリオより先に効く）
+        if let Some(id) = id.as_ref().filter(|_| answers_language_feature(method)) {
+            let loading = !loaded.load(std::sync::atomic::Ordering::SeqCst);
+            let modified = if content_modified_while_loading {
+                loading
+            } else if content_modified_left > 0 {
+                content_modified_left -= 1;
+                true
+            } else {
+                false
+            };
+            if modified {
+                out.send(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32801, "message": "content modified" },
+                }));
+                continue;
+            }
         }
         match (method, id) {
             ("initialize", Some(id)) => {

@@ -844,7 +844,10 @@ fn scan_fake_answers(view: &str) -> Vec<String> {
 
 /// 空の答えの判定（#1930 の 6）: `wait_loaded` は `wait_after_empty` の中だけ、`wait_after_empty`
 /// は定義ジャンプ・補完・ホバーの 3 つから、3 つとも送る直前に `empty.sent(` で記録する。
-/// `EmptyAnswer::decide` は A/B（`legacy_1930`）と 1 回だけの印を見る
+/// `EmptyAnswer::decide` は A/B（`legacy_1930`）と 1 回だけの印を見る。
+/// `wait_loaded` のもう 1 つの呼び手は `-32801`（ContentModified）の後の待ち `after_content_modified`
+/// （#2673。空の答えではなくエラー応答の後 = 古い空の判定は要らない。呼び手の検査は
+/// `issue2673_content_modified_watchdog`）
 fn scan_empty_answer(manager_src: &str, goto_src: &str) -> Vec<String> {
     let view = code_view::without_comments_checked(manager_src, MANAGER);
     let lines: Vec<&str> = view.lines().collect();
@@ -854,7 +857,12 @@ fn scan_empty_answer(manager_src: &str, goto_src: &str) -> Vec<String> {
             .and_then(|(head, _)| fn_head_name(lines[head]).map(str::to_string))
     };
     for (i, line) in lines.iter().enumerate() {
-        if line.contains("self.wait_loaded(") && name_at(i).as_deref() != Some("wait_after_empty") {
+        if line.contains("self.wait_loaded(")
+            && !matches!(
+                name_at(i).as_deref(),
+                Some("wait_after_empty" | "after_content_modified")
+            )
+        {
             out.push(report(
                 MANAGER,
                 i + 1,

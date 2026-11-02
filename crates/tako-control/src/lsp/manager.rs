@@ -3478,9 +3478,34 @@ impl Shared {
             position::lsp_position_of_line_col(&doc.text, request.line, request.column)
         };
         let mut empty = super::goto::EmptyAnswer::default();
+        let mut modified = super::goto::ContentModified::default();
         loop {
             empty.sent(self.sent_while_loading(&key));
-            let answer = self.xref_once(&process, &uri, spec, request, at, deadline)?;
+            let answer = match self.xref_once(&process, &uri, spec, request, at, deadline) {
+                Ok(answer) => answer,
+                // #2673: 変更で古くなった答え（prepare・展開のどこで受けても）は済むのを待って問い直す
+                Err(error) if error.is_content_modified() => {
+                    match self.after_content_modified(
+                        &key,
+                        request.kind.method(),
+                        deadline,
+                        &|| false,
+                        &mut modified,
+                    ) {
+                        super::goto::Loading::Retry => continue,
+                        super::goto::Loading::Settled => return Err(error),
+                        super::goto::Loading::TimedOut => {
+                            return Err(GotoError::Timeout {
+                                server: spec.id,
+                                secs: request.timeout.as_secs(),
+                                starting: true,
+                            })
+                        }
+                        super::goto::Loading::Abandoned => return Err(GotoError::Closed),
+                    }
+                }
+                Err(error) => return Err(error),
+            };
             if !answer.is_empty() {
                 return Ok(answer);
             }
@@ -3580,21 +3605,47 @@ impl Shared {
         let spec = resolved.spec;
         let uri = tako_core::file_uri::from_path(&request.path);
         let _transient = self.open_for_request(&request.path, &uri, spec, None)?;
-        let (process, capabilities, _) =
+        let (process, capabilities, key) =
             self.wait_ready(&uri, spec, request.timeout, deadline, &|| false)?;
         if !core::server_supports(&capabilities, request.kind) {
             return Err(GotoError::Unsupported { server: spec.id });
         }
-        let remaining = deadline
-            .saturating_duration_since(Instant::now())
-            .max(Duration::from_millis(1));
-        let answer = process
-            .request(
+        let mut modified = super::goto::ContentModified::default();
+        let answer = loop {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            let error = match process.request(
                 request.kind.method(),
                 json!({ "item": request.item }),
                 remaining,
-            )
-            .map_err(|e| rpc_failure(spec, request.timeout, e))?;
+            ) {
+                Ok(answer) => break answer,
+                Err(e) => rpc_failure(spec, request.timeout, e),
+            };
+            // #2673: 変更で古くなった答えは済むのを待って問い直す（参照・階層の 1 段目と同じ判定）
+            if error.is_content_modified() {
+                match self.after_content_modified(
+                    &key,
+                    request.kind.method(),
+                    deadline,
+                    &|| false,
+                    &mut modified,
+                ) {
+                    super::goto::Loading::Retry => continue,
+                    super::goto::Loading::Settled => {}
+                    super::goto::Loading::TimedOut => {
+                        return Err(GotoError::Timeout {
+                            server: spec.id,
+                            secs: request.timeout.as_secs(),
+                            starting: true,
+                        })
+                    }
+                    super::goto::Loading::Abandoned => return Err(GotoError::Closed),
+                }
+            }
+            return Err(error);
+        };
         let mut source = PlaceSource {
             shared: self,
             texts: std::collections::HashMap::new(),
@@ -3634,9 +3685,34 @@ impl Shared {
             position::lsp_position_of_line_col(&doc.text, request.line, request.column)
         };
         let mut empty = super::goto::EmptyAnswer::default();
+        let mut modified = super::goto::ContentModified::default();
         loop {
             empty.sent(self.sent_while_loading(&key));
-            let targets = self.goto_once(&process, &uri, spec, request, at, deadline)?;
+            let targets = match self.goto_once(&process, &uri, spec, request, at, deadline) {
+                Ok(targets) => targets,
+                // #2673: 変更で古くなった答え（読み込み直しの最中の取り消し）は済むのを待って問い直す
+                Err(error) if error.is_content_modified() => {
+                    match self.after_content_modified(
+                        &key,
+                        request.kind.method(),
+                        deadline,
+                        &|| false,
+                        &mut modified,
+                    ) {
+                        super::goto::Loading::Retry => continue,
+                        super::goto::Loading::Settled => return Err(error),
+                        super::goto::Loading::TimedOut => {
+                            return Err(GotoError::Timeout {
+                                server: spec.id,
+                                secs: request.timeout.as_secs(),
+                                starting: true,
+                            })
+                        }
+                        super::goto::Loading::Abandoned => return Err(GotoError::Closed),
+                    }
+                }
+                Err(error) => return Err(error),
+            };
             if !targets.is_empty() {
                 return Ok(GotoAnswer {
                     server: spec.id,
@@ -3755,6 +3831,44 @@ impl Shared {
         empty: &mut super::goto::EmptyAnswer,
     ) -> super::goto::Loading {
         empty.decide(self.wait_loaded(key, deadline, abandoned))
+    }
+
+    /// `-32801`（ContentModified = 変更で古くなった答え）を受けた後: 問い直すかを決め、要るなら
+    /// 読み込みが済むのを待つ（#2673。定義ジャンプ・参照・ホバー・名前の変更・整形が呼ぶ 1 実装。
+    /// 補完は呼ばない = 問い直さずに 0 件で返す）。判定は [`super::goto::ContentModified`]、
+    /// 待ち方は [`Self::wait_loaded`]（#1930 の空の答えと同じ待ち）。
+    ///
+    /// 返り値: `Retry` = 問い直す / `Settled` = 問い直さない（上限・A/B の旧腕
+    /// `TAKO_2673_LEGACY=1`）= 呼び手は受けたエラーをそのまま返す / `TimedOut` / `Abandoned`
+    fn after_content_modified(
+        &self,
+        key: &ServerKey,
+        method: &str,
+        deadline: Instant,
+        abandoned: &dyn Fn() -> bool,
+        modified: &mut super::goto::ContentModified,
+    ) -> super::goto::Loading {
+        use super::goto::{Loading, Requery};
+        if super::goto::legacy_2673() {
+            return Loading::Settled;
+        }
+        let loading = self.loading_now(key);
+        let step = modified.step(loading);
+        crate::diag::perf_log(&format!(
+            "lsp content modified: server={} method={method} loading={loading} next={step:?} retries={}",
+            key.id,
+            modified.retries()
+        ));
+        match step {
+            Requery::GiveUp => Loading::Settled,
+            Requery::Now if Instant::now() >= deadline => Loading::TimedOut,
+            Requery::Now => Loading::Retry,
+            // 見た時点で済んでいた（`Settled`）も、待って済んだ（`Retry`）も問い直す
+            Requery::AfterLoading => match self.wait_loaded(key, deadline, abandoned) {
+                Loading::Settled | Loading::Retry => Loading::Retry,
+                other => other,
+            },
+        }
     }
 
     /// 要求を送る直前: その答えが空なら 1 回だけ問い直す対象か（[`slot_sent_while_loading`]。**待たない**）
@@ -3915,7 +4029,7 @@ impl Shared {
         let _transient = self
             .open_for_request(&request.path, &uri, spec, Some(&request.text))
             .map_err(FormatError::Lsp)?;
-        let (process, capabilities, _) = self
+        let (process, capabilities, key) = self
             .wait_ready(&uri, spec, request.timeout, deadline, &|| false)
             .map_err(FormatError::Lsp)?;
         let ranged = request.range.is_some();
@@ -3930,26 +4044,52 @@ impl Shared {
         self.align_shadow(&uri, &request.text, spec)
             .map_err(FormatError::Lsp)?;
         let params = fmt::params(&uri, &request.text, request.options, request.range.clone());
-        let remaining = deadline
-            .saturating_duration_since(Instant::now())
-            .max(Duration::from_millis(1));
-        let answer = match process.request(fmt::method(ranged), params, remaining) {
-            Ok(answer) => answer,
-            Err(super::server::RpcError::Timeout(_)) => {
-                return Err(FormatError::Lsp(GotoError::Timeout {
-                    server: spec.id,
-                    secs: request.timeout.as_secs(),
-                    starting: false,
-                }))
-            }
-            Err(super::server::RpcError::Server(e)) => {
-                return Err(FormatError::Lsp(GotoError::ServerError {
+        let mut modified = super::goto::ContentModified::default();
+        let answer = loop {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1));
+            let error = match process.request(fmt::method(ranged), params.clone(), remaining) {
+                Ok(answer) => break answer,
+                Err(super::server::RpcError::Timeout(_)) => {
+                    return Err(FormatError::Lsp(GotoError::Timeout {
+                        server: spec.id,
+                        secs: request.timeout.as_secs(),
+                        starting: false,
+                    }))
+                }
+                Err(super::server::RpcError::Server(e)) => GotoError::ServerError {
                     server: spec.id,
                     code: e.code,
                     detail: e.message,
-                }))
+                },
+                Err(_) => return Err(FormatError::Lsp(GotoError::Crashed { server: spec.id })),
+            };
+            // #2673: 変更で古くなった答えは済むのを待って問い直す（問い直した答えを当てる。待つあいだに
+            // 写しが変わっていれば下の `Stale` で断る = 古い本文への答えは当てない）
+            if error.is_content_modified() {
+                match self.after_content_modified(
+                    &key,
+                    fmt::method(ranged),
+                    deadline,
+                    &|| false,
+                    &mut modified,
+                ) {
+                    super::goto::Loading::Retry => continue,
+                    super::goto::Loading::Settled => {}
+                    super::goto::Loading::TimedOut => {
+                        return Err(FormatError::Lsp(GotoError::Timeout {
+                            server: spec.id,
+                            secs: request.timeout.as_secs(),
+                            starting: true,
+                        }))
+                    }
+                    super::goto::Loading::Abandoned => {
+                        return Err(FormatError::Lsp(GotoError::Closed))
+                    }
+                }
             }
-            Err(_) => return Err(FormatError::Lsp(GotoError::Crashed { server: spec.id })),
+            return Err(FormatError::Lsp(error));
         };
         // 待つあいだに写しが変わった（打鍵・別のペイン）= 答えの座標は今の本文に合わない
         if self.shadow_text(&uri).as_deref() != Some(request.text.as_str()) {
@@ -4063,6 +4203,28 @@ impl Shared {
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(1))
         };
+        // #2673: 変更で古くなった答え（-32801）は済むのを待って問い直す。prepare と本体の 2 か所が
+        // 同じ回数の枠を使う。`Ok(())` = 問い直す / `Err` = その失敗で返す（上限なら受けたエラー）。
+        // A/B の旧腕（`TAKO_2673_LEGACY=1`）は呼ばない = prepare は断り・本体は `Refused` のまま
+        let mut modified = super::goto::ContentModified::default();
+        let mut requery = |method: &str, code: i64, detail: String| -> Result<(), RenameError> {
+            match self.after_content_modified(&key, method, deadline, &|| false, &mut modified) {
+                super::goto::Loading::Retry => Ok(()),
+                super::goto::Loading::Settled => Err(RenameError::Lsp(GotoError::ServerError {
+                    server: spec.id,
+                    code,
+                    detail,
+                })),
+                super::goto::Loading::TimedOut => Err(RenameError::Lsp(GotoError::Timeout {
+                    server: spec.id,
+                    secs: request.timeout.as_secs(),
+                    starting: true,
+                })),
+                super::goto::Loading::Abandoned => Err(RenameError::Lsp(GotoError::Closed)),
+            }
+        };
+        let content_modified =
+            |code: i64| super::goto::is_content_modified(code) && !super::goto::legacy_2673();
         let mut placeholder = None;
         if core::supports_prepare(&capabilities) {
             let mut empty = super::goto::EmptyAnswer::default();
@@ -4083,6 +4245,10 @@ impl Shared {
                         }
                         core::Prepared::Rejected => None,
                     },
+                    Err(RpcError::Server(e)) if content_modified(e.code) => {
+                        requery(core::PREPARE_METHOD, e.code, e.message)?;
+                        continue;
+                    }
                     // 断りはエラーでも来る（rust-analyzer は「No references found at position」）
                     Err(RpcError::Server(e)) => Some(e.message),
                     Err(e) => return Err(RenameError::Lsp(rpc_failure(spec, request.timeout, e))),
@@ -4111,15 +4277,21 @@ impl Shared {
         }
         let mut params = at;
         params["newName"] = json!(request.new_name);
-        let answer = match process.request(core::METHOD, params, remaining()) {
-            Ok(answer) => answer,
-            Err(RpcError::Server(e)) => {
-                return Err(RenameError::Refused {
-                    server: spec.id,
-                    detail: e.message,
-                })
+        // 問い直した答えを当てる（待つあいだに写しが変わっていれば下の `Stale` で断る = 古い答えは当てない）
+        let answer = loop {
+            match process.request(core::METHOD, params.clone(), remaining()) {
+                Ok(answer) => break answer,
+                Err(RpcError::Server(e)) if content_modified(e.code) => {
+                    requery(core::METHOD, e.code, e.message)?;
+                }
+                Err(RpcError::Server(e)) => {
+                    return Err(RenameError::Refused {
+                        server: spec.id,
+                        detail: e.message,
+                    })
+                }
+                Err(e) => return Err(RenameError::Lsp(rpc_failure(spec, request.timeout, e))),
             }
-            Err(e) => return Err(RenameError::Lsp(rpc_failure(spec, request.timeout, e))),
         };
         // 待つあいだに写しが変わった（打鍵・別のペイン）= 答えの座標は今の本文に合わない
         if self.shadow_text(&uri).as_deref() != Some(base.as_str()) {
@@ -4337,6 +4509,8 @@ impl Shared {
             let remaining = deadline
                 .saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(1));
+            // #2673: 変更で古くなった答え（-32801）は問い直さずに捨てた
+            let mut discarded = false;
             let answer = match self.request_in_lane(
                 lane,
                 &process,
@@ -4353,6 +4527,19 @@ impl Shared {
                         secs: request.timeout.as_secs(),
                     })
                 }
+                // #2673: 変更で古くなった答えは問い直さず、未完の 0 件として返す（エラーにしない。
+                // 次の打鍵の要求で置き換わる。`isIncomplete` = 打ち足したら問い直す印）。
+                // A/B の旧腕（`TAKO_2673_LEGACY=1`）は今までどおり `server-error`
+                Err(RpcError::Server(e))
+                    if super::goto::is_content_modified(e.code) && !super::goto::legacy_2673() =>
+                {
+                    crate::diag::perf_log(&format!(
+                        "lsp content modified: server={} method=textDocument/completion next=discard",
+                        key.id
+                    ));
+                    discarded = true;
+                    json!({ "isIncomplete": true, "items": [] })
+                }
                 Err(e) => return Err(rpc_failure(spec, request.timeout, e).into()),
             };
             let parsed = comp::parse_response(&answer);
@@ -4361,7 +4548,7 @@ impl Shared {
             // （#1869。待たずに 0 件で返すと GUI は一覧を出さず、済んでも問い直さなかった）。待つあいだに
             // 次の打鍵・一覧を閉じる・文書を閉じるで抜ける（古いスレッドを上限まで残さない）。
             // A/B（`TAKO_1869_LEGACY=1`）は #1869 前 = 打鍵の要求は待たない
-            let wait = !request.superseding || !super::completion::legacy_1869();
+            let wait = (!request.superseding || !super::completion::legacy_1869()) && !discarded;
             if parsed.items.is_empty() && wait {
                 match self.wait_after_empty(&key, deadline, &abandoned, &mut empty) {
                     super::goto::Loading::Retry => {
@@ -4536,6 +4723,7 @@ impl Shared {
         let shared_at_start = others_hold();
         let abandoned = || superseded() || (shared_at_start && !others_hold());
         let mut empty = super::goto::EmptyAnswer::default();
+        let mut modified = super::goto::ContentModified::default();
         loop {
             // 問い合わせる位置は**サーバが見ている本文**（送った写し）で LSP の座標へ直す（#1769）
             let at = {
@@ -4568,7 +4756,36 @@ impl Shared {
                             secs: request.timeout.as_secs(),
                         })
                     }
-                    Err(e) => return Err(rpc_failure(spec, request.timeout, e).into()),
+                    Err(e) => {
+                        let error = rpc_failure(spec, request.timeout, e);
+                        // #2673: 変更で古くなった答えは済むのを待って問い直す（待つあいだに次のマウスの
+                        // 要求・カードを閉じる・文書を閉じるで抜ける = 空の答えの待ちと同じ）
+                        if error.is_content_modified() {
+                            match self.after_content_modified(
+                                &key,
+                                "textDocument/hover",
+                                deadline,
+                                &abandoned,
+                                &mut modified,
+                            ) {
+                                super::goto::Loading::Retry => continue,
+                                super::goto::Loading::Settled => {}
+                                super::goto::Loading::TimedOut => {
+                                    return Err(HoverError::Loading {
+                                        server: spec.id,
+                                        secs: request.timeout.as_secs(),
+                                    })
+                                }
+                                super::goto::Loading::Abandoned if superseded() => {
+                                    return Err(HoverError::Superseded)
+                                }
+                                super::goto::Loading::Abandoned => {
+                                    return Err(GotoError::Closed.into())
+                                }
+                            }
+                        }
+                        return Err(error.into());
+                    }
                 };
             let content = hv::parse_response(&answer);
             // 空の答え: 読み込み中のサーバ（rust-analyzer は読み込みの前半に即座に null で答える）なら、

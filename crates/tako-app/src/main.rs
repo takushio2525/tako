@@ -54201,33 +54201,39 @@ mod self_test {
         });
         let pressed = std::time::Instant::now();
         vt1860_click(any, window, cx, def, MouseButton::Left);
+        // #2673: ヘッダの一時表示（`GOTO_STATUS_FEEDBACK` = 4 秒で消える）と通知は、待つあいだに
+        // 見えた最後のものを押してからの秒数つきで残す（待ち終わってから読むと消えた後 =
+        // 「答えが来なかった」と読み違える。#2673 の段 1 は `status=None` で真因を外した）
+        let seen_status: std::cell::RefCell<Option<(String, bool, f32)>> = Default::default();
+        let seen_notice: std::cell::RefCell<Option<(String, f32)>> = Default::default();
         let landed = vt1860_wait(any, window, cx, Duration::from_secs(90), &|cx| {
             window
                 .update(cx, |app, _, _| {
+                    let at = pressed.elapsed().as_secs_f32();
+                    if let Some((_, message, is_error, _)) = &app.lsp_goto.status {
+                        *seen_status.borrow_mut() = Some((message.clone(), *is_error, at));
+                    }
+                    if let Some(notice) = app.remote_notice.as_ref().filter(|n| n.at >= pressed) {
+                        *seen_notice.borrow_mut() = Some((notice.text.clone(), at));
+                    }
                     app.lsp_goto.pending.is_none()
                         && app.jump_history.current().and_then(|j| j.line) == Some(6)
                 })
                 .unwrap_or(false)
         })
         .await;
-        let (current, status) = window
-            .update(cx, |app, _, _| {
-                (
-                    app.jump_history.current().cloned(),
-                    app.lsp_goto
-                        .status
-                        .as_ref()
-                        .map(|(_, m, e, _)| (m.clone(), *e)),
-                )
-            })
-            .unwrap_or((None, None));
+        let current = window
+            .update(cx, |app, _, _| app.jump_history.current().cloned())
+            .ok()
+            .flatten();
+        let (status, notice) = (seen_status.into_inner(), seen_notice.into_inner());
         println!(
-            "TAKO_VISUAL_PIXEL: {LABEL} landed={landed} in {:.1}s jump={current:?} status={status:?}",
+            "TAKO_VISUAL_PIXEL: {LABEL} landed={landed} in {:.1}s jump={current:?} last_status={status:?} last_notice={notice:?}",
             pressed.elapsed().as_secs_f32()
         );
         check(
             landed,
-            &format!("visual-test lsp-context-menu-real: 「定義へ移動」で fn helper の行へ着地する（{current:?} {status:?}）"),
+            &format!("visual-test lsp-context-menu-real: 「定義へ移動」で fn helper の行へ着地する（{current:?} 最後に見えた表示 {status:?} 通知 {notice:?}）"),
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
