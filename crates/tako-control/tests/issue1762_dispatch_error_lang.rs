@@ -7422,9 +7422,13 @@ fn config_error_index(e: &ConfigError) -> usize {
         // #2365 の続き: 専用プロファイルを作らなかった理由（`ProfileGen::Skipped`）
         ConfigError::AutoProfileLegacy => 39,
         ConfigError::ProjectKeyNotProfileName(_) => 40,
+        // #2365 の続き: 引き継ぎファイルの移行で原本を退避できない理由（`handoff_store::archive_original`）
+        ConfigError::HandoffArchiveDirCreate { .. } => 41,
+        ConfigError::HandoffArchiveWrite(_) => 42,
+        ConfigError::HandoffArchiveFull => 43,
     }
 }
-const CONFIG_ERROR_VARIANTS: usize = 41;
+const CONFIG_ERROR_VARIANTS: usize = 44;
 
 /// 見本と #2365 より前の固定文（`orchestrator` の口が書いていた文を見本の値で展開）
 fn config_error_table() -> Vec<(ConfigError, &'static str)> {
@@ -7727,6 +7731,19 @@ fn config_error_table() -> Vec<(ConfigError, &'static str)> {
             "プロジェクトキーをプロファイル名にできない: \
              プロファイル名に使えない文字が含まれる: '@'（英数字と - _ . のみ）",
         ),
+        // `handoff_store::archive_original` が `format!` / 固定文で組んでいた退避の断り（#2365 の続き）
+        (
+            ConfigError::HandoffArchiveDirCreate {
+                dir: "/tmp/tako-x/handoff/archive".into(),
+                error: "Permission denied (os error 13)".into(),
+            },
+            "退避先を作れない: /tmp/tako-x/handoff/archive (Permission denied (os error 13))",
+        ),
+        (
+            ConfigError::HandoffArchiveWrite("No space left on device (os error 28)".into()),
+            "退避に失敗: No space left on device (os error 28)",
+        ),
+        (ConfigError::HandoffArchiveFull, "退避先の連番が埋まっている"),
     ]
 }
 
@@ -7952,6 +7969,12 @@ const CONFIG_REFUSAL_SCOPES: &[(&str, &str, Span)] = &[
         HANDOFF_STORE_PATH,
         HANDOFF_STORE_SRC,
         Span::Item("fn write_file_typed("),
+    ),
+    // 引き継ぎファイルの移行で原本を退避する口（#2365 の続き）
+    (
+        HANDOFF_STORE_PATH,
+        HANDOFF_STORE_SRC,
+        Span::Item("fn archive_original("),
     ),
     (
         ORCH_MOD_PATH,
@@ -8553,7 +8576,9 @@ const PROFILE_REASON_USER_SCOPES: &[(&str, &str, &str)] = &[
     (CLI_MAIN_PATH, CLI_MAIN_SRC, "fn orchestrator_guide_local("),
 ];
 
-/// 範囲の中で、persist.log の行の外で日本語に固定して組んでいる行
+/// 範囲の中で、persist.log の行・stderr の診断（`eprintln!`）の外で日本語に固定して組んでいる行
+/// （診断ログは日本語のまま = `.agent/conventions.md`。#2365 の続きで引き継ぎの事前信頼の失敗の
+/// stderr の行が型から `text_in(Lang::Ja)` で組むようになったので `eprintln!` も外す）
 fn ja_fixed_outside_log(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     for (i, (line, code)) in lines.iter().enumerate() {
@@ -8565,7 +8590,7 @@ fn ja_fixed_outside_log(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
         }
         let logged = lines[i.saturating_sub(3)..(i + 2).min(lines.len())]
             .iter()
-            .any(|(_, l)| l.contains("persist_log("));
+            .any(|(_, l)| l.contains("persist_log(") || l.contains("eprintln!("));
         if !logged {
             out.push((*line, code.trim().to_string()));
         }
@@ -8587,7 +8612,7 @@ fn scan_profile_reason_user_scopes(sources: &[(&str, &str, &str)]) -> Vec<String
             failures.push(format!(
                 "{path}:{line}: 利用者へ返す口（`{head}`）が読めないプロファイルの理由を日本語に固定して組んでいる \
                  = 英語表示でも理由だけ日本語で混ざる（表示言語の `to_string()` / `text_in(lang)` で組む。\
-                 日本語で組むのは persist.log の行だけ）: {code}"
+                 日本語で組むのは persist.log の行と stderr の診断だけ）: {code}"
             ));
         }
     }
@@ -18043,9 +18068,16 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::McpCodexConfigUnreadable(_) => 94,
         ReplyNote::McpCodexKeepMissing(_) => 95,
         ReplyNote::McpCodexNameInexpressible(_) => 96,
+        // #2365 の続き: orchestrator の応答の warnings に並ぶ別モジュールの注記（引き継ぎの移行・モデルの食い違い）
+        ReplyNote::HandoffMigrationDeferred(_) => 97,
+        ReplyNote::HandoffMigrationWriteFailed(_) => 98,
+        ReplyNote::HandoffMigrationArchiveFailed(_) => 99,
+        ReplyNote::HandoffMigrationMemoKept => 100,
+        ReplyNote::ModelMismatch { .. } => 101,
+        ReplyNote::WorkerModelMismatch { .. } => 102,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 97;
+const REPLY_NOTE_VARIANTS: usize = 103;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -18629,6 +18661,63 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             ReplyNote::McpCodexNameInexpressible("my.server".into()),
             "codex の -c は名前の '.' や空白などを表せないので、'my.server' は止めずに持ち込む".into(),
         ),
+        // ---- orchestrator の応答の warnings に並ぶ別モジュールの注記（#2365 の続き。
+        // `handoff_store::ensure_migrated` と `tako_core::model_check::mismatch_warning` が組んでいた文）
+        (
+            ReplyNote::HandoffMigrationDeferred(ConfigError::Read {
+                file: ConfigFile::Projects,
+                error: "Permission denied (os error 13)".into(),
+            }),
+            "projects.yaml が読めないため移行を見送った: \
+             projects.yaml の読み取りに失敗: Permission denied (os error 13)"
+                .into(),
+        ),
+        (
+            ReplyNote::HandoffMigrationWriteFailed(ConfigError::HandoffKeyUnusable("a/b".into())),
+            "プロジェクトキーがファイル名として使えない: a/b".into(),
+        ),
+        (
+            ReplyNote::HandoffMigrationArchiveFailed(ConfigError::HandoffArchiveFull),
+            "移行前のファイルを退避できないため中止した: 退避先の連番が埋まっている".into(),
+        ),
+        (
+            ReplyNote::HandoffMigrationMemoKept,
+            "移せないプロジェクトがあったため運用メモの書き換えを中止した（原本は退避済み）".into(),
+        ),
+        (
+            ReplyNote::ModelMismatch {
+                declared: "claude-opus-5-5".into(),
+                actual: "claude-opus-5".into(),
+                account: Some("univ".into()),
+            },
+            "モデルの食い違い: 宣言 claude-opus-5-5 → 実際 claude-opus-5（アカウント univ の \
+             entitlement かモデルの廃止で claude が別のモデルへ解決した。ledger は実際のモデルで集計する）"
+                .into(),
+        ),
+        // アカウントを引けなければ名指ししない
+        (
+            ReplyNote::ModelMismatch {
+                declared: "claude-opus-5-5".into(),
+                actual: "claude-opus-5".into(),
+                account: None,
+            },
+            "モデルの食い違い: 宣言 claude-opus-5-5 → 実際 claude-opus-5（entitlement \
+             かモデルの廃止で claude が別のモデルへ解決した。ledger は実際のモデルで集計する）"
+                .into(),
+        ),
+        (
+            ReplyNote::WorkerModelMismatch {
+                worker_id: "w1".into(),
+                pane: 12,
+                declared: "claude-opus-5-5".into(),
+                actual: "claude-opus-5".into(),
+                account: Some("univ".into()),
+            },
+            "worker w1（pane 12）: モデルの食い違い: 宣言 claude-opus-5-5 → 実際 claude-opus-5\
+             （アカウント univ の entitlement かモデルの廃止で claude が別のモデルへ解決した。\
+             ledger は実際のモデルで集計する）"
+                .into(),
+        ),
     ]
 }
 
@@ -18802,6 +18891,15 @@ const NOTE_ITEM_SCOPES: &[(&str, &str, &str)] = &[
         WORKER_MCP_SRC,
         "pub fn prepare_codex_from(",
     ),
+    // #2365 の続き: orchestrator の応答の warnings に並ぶ別モジュールの注記（引き継ぎの移行・モデルの食い違い）
+    (
+        HANDOFF_STORE_PATH,
+        HANDOFF_STORE_SRC,
+        "pub fn ensure_migrated(",
+    ),
+    (REGISTRY_PATH, REGISTRY_SRC, "pub fn model_warning("),
+    (REGISTRY_PATH, REGISTRY_SRC, "impl ModelObservation {"),
+    (REGISTRY_PATH, REGISTRY_SRC, "pub fn list_payload("),
 ];
 
 const CLAUDE_CTX_SRC: &str = include_str!("../src/claude_ctx.rs");
@@ -18812,7 +18910,7 @@ const CLAUDE_CTX_PATH: &str = "crates/tako-control/src/claude_ctx.rs";
 #[test]
 fn 他モジュールが組む注記の口へ日本語の固定文を戻すと名指す() {
     // (path, ソース, 範囲の頭, 注入元, 注入後)
-    let injections: [(&str, &str, &str, &str, &str); 5] = [
+    let injections: [(&str, &str, &str, &str, &str); 9] = [
         (
             ORCH_MOD_PATH,
             ORCH_MOD_SRC,
@@ -18847,6 +18945,35 @@ fn 他モジュールが組む注記の口へ日本語の固定文を戻すと�
             "pub fn prepare_codex_from(",
             "warnings.push(ReplyNote::McpCodexNameInexpressible(name));",
             "warnings.push(format!(\"codex の -c は名前を表せないので '{name}' は止めずに持ち込む\"));",
+        ),
+        // #2365 の続き: 引き継ぎの移行・モデルの食い違い
+        (
+            HANDOFF_STORE_PATH,
+            HANDOFF_STORE_SRC,
+            "pub fn ensure_migrated(",
+            ".push(crate::ReplyNote::HandoffMigrationMemoKept);",
+            ".push(\"移せないプロジェクトがあったため運用メモの書き換えを中止した\".into());",
+        ),
+        (
+            HANDOFF_STORE_PATH,
+            HANDOFF_STORE_SRC,
+            "pub fn ensure_migrated(",
+            ".push(crate::ReplyNote::HandoffMigrationDeferred(e));",
+            ".push(format!(\"projects.yaml が読めないため移行を見送った: {e}\"));",
+        ),
+        (
+            REGISTRY_PATH,
+            REGISTRY_SRC,
+            "pub fn model_warning(",
+            "declared: entry.model.clone()?,",
+            "declared: format!(\"宣言 {}\", entry.model.clone()?),",
+        ),
+        (
+            REGISTRY_PATH,
+            REGISTRY_SRC,
+            "pub fn list_payload(",
+            "worker_id: id.clone(),",
+            "worker_id: format!(\"{id}（pane）\"),",
         ),
     ];
     for (path, src, head, from, to) in injections {
@@ -20064,4 +20191,251 @@ fn 診断と共有する他モジュールの文は表示言語で組む() {
         na.text_in(Lang::En),
     );
     report_all(f);
+}
+
+// ---- 事前信頼を書き込めなかった理由（`orchestrator::agent::TrustWriteError`。#2365 の続き） ----
+//
+// spawn の応答の `warnings[]`（`kind: trust_write_failed`）の `message` は前から表示言語だったが、`detail`
+// は `ensure_trusted_in`（claude / codex / agy の書き手）が組んだ日本語の `String` のままだった。
+// (1) 全バリアントの日英と旧文のバイト一致、(2) 書き手と応答を組む口の本体に日本語の固定文を
+// 書き足していないこと（stderr の診断 `eprintln!` は日本語のまま = 外す）を `file:line` で名指す
+
+use tako_control::orchestrator::agent::TrustWriteError;
+
+const CLAUDE_TUI_SRC: &str = include_str!("../src/claude_tui.rs");
+const CLAUDE_TUI_PATH: &str = "crates/tako-control/src/claude_tui.rs";
+
+/// `TrustWriteError` の通し番号（網羅 match = バリアントを足すとここがコンパイルで落ちる）
+fn trust_write_index(e: &TrustWriteError) -> usize {
+    match e {
+        TrustWriteError::ClaudeConfigPathUnknown => 0,
+        TrustWriteError::HomeUnresolved => 1,
+        TrustWriteError::Read { .. } => 2,
+        TrustWriteError::Parse { .. } => 3,
+        TrustWriteError::TopLevelNotObject { .. } => 4,
+        TrustWriteError::FieldNotObject { .. } => 5,
+        TrustWriteError::FieldNotArray { .. } => 6,
+        TrustWriteError::DirCreate(_) => 7,
+        TrustWriteError::DirCreateAt { .. } => 8,
+        TrustWriteError::Serialize(_) => 9,
+        TrustWriteError::Write { .. } => 10,
+        TrustWriteError::Replace { .. } => 11,
+    }
+}
+const TRUST_WRITE_VARIANTS: usize = 12;
+
+/// 見本と #2365 より前の固定文（`claude_tui` / `orchestrator::agent` の書き手が `format!` で組んでいた文）
+fn trust_write_table() -> Vec<(TrustWriteError, &'static str)> {
+    let denied = || "Permission denied (os error 13)".to_string();
+    vec![
+        (
+            TrustWriteError::ClaudeConfigPathUnknown,
+            "claude の設定ファイル（.claude.json）の場所を特定できない",
+        ),
+        (
+            TrustWriteError::HomeUnresolved,
+            "ホームディレクトリを特定できない",
+        ),
+        (
+            TrustWriteError::Read {
+                path: "/tmp/tako-x/.codex/config.toml".into(),
+                error: denied(),
+            },
+            "/tmp/tako-x/.codex/config.toml を読めない: Permission denied (os error 13)",
+        ),
+        (
+            TrustWriteError::Parse {
+                path: "/tmp/tako-x/.claude.json".into(),
+                reason: JsonReason::Located {
+                    kind: JsonProblem::Syntax,
+                    line: 1,
+                    column: 2,
+                },
+            },
+            "/tmp/tako-x/.claude.json を解釈できない: JSON の構文が壊れている（1 行 2 列）",
+        ),
+        (
+            TrustWriteError::TopLevelNotObject {
+                path: "/tmp/tako-x/.claude.json".into(),
+            },
+            "/tmp/tako-x/.claude.json のトップレベルがオブジェクトでない",
+        ),
+        (
+            TrustWriteError::FieldNotObject {
+                path: "/tmp/tako-x/.claude.json".into(),
+                field: "projects".into(),
+            },
+            "/tmp/tako-x/.claude.json の projects がオブジェクトでない",
+        ),
+        (
+            TrustWriteError::FieldNotObject {
+                path: "/tmp/tako-x/.claude.json".into(),
+                field: "projects./work/proj".into(),
+            },
+            "/tmp/tako-x/.claude.json の projects./work/proj がオブジェクトでない",
+        ),
+        (
+            TrustWriteError::FieldNotArray {
+                path: "/tmp/tako-x/settings.json".into(),
+                field: "trustedWorkspaces".into(),
+            },
+            "/tmp/tako-x/settings.json の trustedWorkspaces が配列でない",
+        ),
+        (
+            TrustWriteError::DirCreate(denied()),
+            "ディレクトリの作成に失敗: Permission denied (os error 13)",
+        ),
+        (
+            TrustWriteError::DirCreateAt {
+                dir: "/tmp/tako-x/cfg".into(),
+                error: denied(),
+            },
+            "/tmp/tako-x/cfg のディレクトリを作れない: Permission denied (os error 13)",
+        ),
+        (
+            TrustWriteError::Serialize("key must be a string".into()),
+            "設定を直列化できない: key must be a string",
+        ),
+        (
+            TrustWriteError::Write {
+                path: "/tmp/tako-x/.claude.json.tako-tmp".into(),
+                error: denied(),
+            },
+            "/tmp/tako-x/.claude.json.tako-tmp を書けない: Permission denied (os error 13)",
+        ),
+        (
+            TrustWriteError::Replace {
+                path: "/tmp/tako-x/.claude.json".into(),
+                error: denied(),
+            },
+            "/tmp/tako-x/.claude.json を置換できない: Permission denied (os error 13)",
+        ),
+    ]
+}
+
+#[test]
+fn 事前信頼の理由は全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致() {
+    let table = trust_write_table();
+    let samples: Vec<TrustWriteError> = table.iter().map(|(e, _)| e.clone()).collect();
+    covers_every(
+        &samples,
+        trust_write_index,
+        TRUST_WRITE_VARIANTS,
+        "TrustWriteError",
+    );
+    let mut failures = Vec::new();
+    for (e, old) in &table {
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        let debug = format!("{e:?}");
+        let at = |lang| {
+            where_written(
+                ORCH_AGENT_SRC,
+                ORCH_AGENT_PATH,
+                "impl TrustWriteError {",
+                &debug,
+                lang,
+            )
+        };
+        if ja != *old {
+            failures.push(format!(
+                "{e:?}: 日本語が #2365 より前と違う（{}）\n  want: {old}\n  got:  {ja}",
+                at(Lang::Ja)
+            ));
+        }
+        if let Some(c) = has_japanese(&en) {
+            failures.push(format!(
+                "{e:?}: 英語に日本語（{c}）が混ざる（{}）: {en}",
+                at(Lang::En)
+            ));
+        }
+        if ja == en {
+            failures.push(format!("{e:?}: 英語が日本語と同じ文（{}）", at(Lang::En)));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// 事前信頼の理由を組む口（path, ソース, 頭）。中身を全部 `TrustWriteError` へ移したもの
+const TRUST_WRITE_SCOPES: &[(&str, &str, &str)] = &[
+    (ORCH_AGENT_PATH, ORCH_AGENT_SRC, "fn ensure_codex_trusted("),
+    (
+        ORCH_AGENT_PATH,
+        ORCH_AGENT_SRC,
+        "fn ensure_codex_trusted_at(",
+    ),
+    (ORCH_AGENT_PATH, ORCH_AGENT_SRC, "fn ensure_agy_trusted("),
+    (ORCH_AGENT_PATH, ORCH_AGENT_SRC, "fn ensure_agy_trusted_at("),
+    (CLAUDE_TUI_PATH, CLAUDE_TUI_SRC, "pub fn ensure_trusted_in("),
+    (CLAUDE_TUI_PATH, CLAUDE_TUI_SRC, "fn ensure_trusted_at("),
+    (CLAUDE_TUI_PATH, CLAUDE_TUI_SRC, "fn write_claude_json("),
+    // spawn の応答の `detail` を組む口（stderr の診断 `eprintln!` は日本語のまま = 走査で外す）
+    (DISPATCH_PATH, DISPATCH_SRC, "fn launch_warning("),
+];
+
+#[test]
+fn 事前信頼の理由を組む口に日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, src, head) in TRUST_WRITE_SCOPES {
+        let Some(lines) = item_lines(src, head) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{head}` が見つからない（改名で番犬が空振りする。TRUST_WRITE_SCOPES を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in japanese_outside(&lines, &DISPATCH_NOTE_INTERNAL) {
+            failures.push(format!(
+                "{path}:{line}: 事前信頼の理由を TrustWriteError へ移した口（`{head}`）に日本語の固定文がある = \
+                 英語表示の spawn の応答の detail にもそのまま出る（TrustWriteError へバリアントを足す）: {text}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// 番犬自身の検査（本物のソースへ注入）: 事前信頼の書き手と応答を組む口へ日本語の固定文を戻すと、
+/// その行を `file:line` で名指す（注入しない元のソースは上の走査が 0 件で通る）
+#[test]
+fn 事前信頼の理由の口へ日本語の固定文を戻すと名指す() {
+    // (path, ソース, 範囲の頭, 注入元, 注入後)
+    let injections: [(&str, &str, &str, &str, &str); 3] = [
+        (
+            ORCH_AGENT_PATH,
+            ORCH_AGENT_SRC,
+            "fn ensure_codex_trusted_at(",
+            ".map_err(|e| TrustWriteError::DirCreate(e.to_string()))?;",
+            ".map_err(|e| format!(\"ディレクトリの作成に失敗: {e}\"))?;",
+        ),
+        (
+            CLAUDE_TUI_PATH,
+            CLAUDE_TUI_SRC,
+            "fn write_claude_json(",
+            ".map_err(|e| TrustWriteError::Serialize(e.to_string()))?;",
+            ".map_err(|e| format!(\"設定を直列化できない: {e}\"))?;",
+        ),
+        (
+            DISPATCH_PATH,
+            DISPATCH_SRC,
+            "fn launch_warning(",
+            "\"detail\": detail.to_string(),",
+            "\"detail\": format!(\"{}（詳細）\", detail),",
+        ),
+    ];
+    for (path, src, head, from, to) in injections {
+        let start = src
+            .find(head)
+            .unwrap_or_else(|| panic!("{path}: 範囲の頭が無い: {head}"));
+        let at = start
+            + src[start..]
+                .find(from)
+                .unwrap_or_else(|| panic!("{path}: 範囲の中に注入元が無い: {from}"));
+        let injected = format!("{}{to}{}", &src[..at], &src[at + from.len()..]);
+        let want = injected[..at].lines().count().max(1);
+        let lines = item_lines(&injected, head).expect("範囲");
+        let found = japanese_outside(&lines, &DISPATCH_NOTE_INTERNAL);
+        assert_eq!(
+            found.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            vec![want],
+            "{path}: 注入（{to}）を {path}:{want} として 1 件だけ名指すはず: {found:?}"
+        );
+    }
 }

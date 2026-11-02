@@ -26,7 +26,9 @@
 //! 共有する日本語の `String` だったので、英語表示でも理由だけ日本語のまま混ざった。
 //! 専用プロファイルを作らなかった理由（`ProfileGen::Skipped` = `projects add` の `profile_note`）も
 //! 同じ型で持つ（[`ConfigError::AutoProfileLegacy`] / [`ConfigError::ProjectKeyNotProfileName`] と
-//! 置き場・書き込みの断り。`tako migrate` の記録は日本語の枠なので `text_in(Lang::Ja)`）
+//! 置き場・書き込みの断り。`tako migrate` の記録は日本語の枠なので `text_in(Lang::Ja)`）。
+//! 引き継ぎファイルの自動移行で原本を退避できない理由（`handoff_store::archive_original`）も同じ型
+//! （[`ConfigError::HandoffArchiveDirCreate`] ほか 3 種）
 
 use tako_core::i18n::Lang;
 use tako_core::load_issue::YamlReason;
@@ -149,6 +151,12 @@ pub enum ConfigError {
     /// プロジェクトキーをプロファイル名にできない（`ProfileGen::Skipped` の理由。
     /// 中身は名前の検証の断り = [`Self::ProfileNameBadChar`] ほか）
     ProjectKeyNotProfileName(Box<ConfigError>),
+    /// 引き継ぎの移行で原本の退避先（`handoff/archive/`）を作れない（`dir` は作ろうとしたパス。#915 の移行）
+    HandoffArchiveDirCreate { dir: String, error: String },
+    /// 引き継ぎの移行で原本を退避先へ書けない
+    HandoffArchiveWrite(String),
+    /// 引き継ぎの移行で原本の退避先の連番（1〜999）が埋まっている
+    HandoffArchiveFull,
 }
 
 impl ConfigError {
@@ -422,6 +430,20 @@ impl ConfigError {
                 "the project key cannot be used as a profile name: {}",
                 why.text_in(lang)
             ),
+            (Self::HandoffArchiveDirCreate { dir, error }, Ja) => {
+                format!("退避先を作れない: {dir} ({error})")
+            }
+            (Self::HandoffArchiveDirCreate { dir, error }, En) => {
+                format!("cannot create the archive folder: {dir} ({error})")
+            }
+            (Self::HandoffArchiveWrite(error), Ja) => format!("退避に失敗: {error}"),
+            (Self::HandoffArchiveWrite(error), En) => {
+                format!("failed to write the archived copy: {error}")
+            }
+            (Self::HandoffArchiveFull, Ja) => "退避先の連番が埋まっている".to_string(),
+            (Self::HandoffArchiveFull, En) => {
+                "the archive numbering is full (1 to 999 are taken)".to_string()
+            }
         }
     }
 

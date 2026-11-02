@@ -17,7 +17,12 @@
 //! （`decide_adopt`）・ctx の窓（`claude_ctx::window_warning`）・会話の再開の食い違い（`resume_launch` の
 //! `warnings`）・worker の MCP（`worker_mcp` の `warnings`）は、組む側が文字列ではなくここのバリアントを
 //! 返し、中身（`ConfigError` / `SessionRefusal`）も同じ言語で組む。persist.log へ載せる呼び手は
-//! `text_in(Lang::Ja)`、応答・CLI の行は表示言語で組む
+//! `text_in(Lang::Ja)`、応答・CLI の行は表示言語で組む。
+//!
+//! orchestrator の応答の `warnings` に並ぶ別モジュールの注記のうち、引き継ぎファイルの自動移行
+//! （`handoff_store::ensure_migrated` の `MigrationOutcome::warnings`。応答の JSON へは表示言語の文で
+//! 書き出し、`tako migrate` の記録は日本語）とモデルの食い違い（`registry::model_warning` /
+//! `ModelObservation::warning`。旧 `tako_core::model_check::mismatch_warning`）も同じ形で持つ
 
 use tako_core::i18n::Lang;
 use tako_core::platform::support::Note;
@@ -305,6 +310,32 @@ pub enum ReplyNote {
     McpCodexKeepMissing(String),
     /// worker の MCP（codex）: `-c` で表せない名前 `<name>` は止めずに持ち込む
     McpCodexNameInexpressible(String),
+
+    // ---- orchestrator の応答の warnings に並ぶ別モジュールの注記 ----
+    /// 引き継ぎファイルの移行: projects.yaml が読めないので見送った（`handoff_store::ensure_migrated`）
+    HandoffMigrationDeferred(ConfigError),
+    /// 引き継ぎファイルの移行: 書き込みの断り（中身の文だけ。枠は付けない）
+    HandoffMigrationWriteFailed(ConfigError),
+    /// 引き継ぎファイルの移行: 原本を退避できないので中止した
+    HandoffMigrationArchiveFailed(ConfigError),
+    /// 引き継ぎファイルの移行: 移せないプロジェクトがあったので運用メモを書き換えなかった
+    HandoffMigrationMemoKept,
+    /// 宣言と実際のモデルの食い違い（#1638。`worker_status` の warnings と persist.log）。
+    /// `account` は transcript が属したアカウント名（引けなければ `None` = 名指ししない）。
+    /// 名前・モデル名だけを載せる（ホームパス・会話の中身は載せない）
+    ModelMismatch {
+        declared: String,
+        actual: String,
+        account: Option<String>,
+    },
+    /// `workers` 一覧の食い違いの行（worker と pane を前に置いた [`Self::ModelMismatch`]）
+    WorkerModelMismatch {
+        worker_id: String,
+        pane: u64,
+        declared: String,
+        actual: String,
+        account: Option<String>,
+    },
 }
 
 impl ReplyNote {
@@ -1202,6 +1233,105 @@ impl ReplyNote {
             (Self::McpCodexNameInexpressible(name), En) => format!(
                 "codex's -c cannot express names with '.', spaces and the like, so '{name}' is \
                  brought in without being turned off"
+            ),
+
+            (Self::HandoffMigrationDeferred(e), Ja) => format!(
+                "projects.yaml が読めないため移行を見送った: {}",
+                e.text_in(lang)
+            ),
+            (Self::HandoffMigrationDeferred(e), En) => format!(
+                "the handoff migration was postponed because projects.yaml cannot be read: {}",
+                e.text_in(lang)
+            ),
+            (Self::HandoffMigrationWriteFailed(e), _) => e.text_in(lang),
+            (Self::HandoffMigrationArchiveFailed(e), Ja) => format!(
+                "移行前のファイルを退避できないため中止した: {}",
+                e.text_in(lang)
+            ),
+            (Self::HandoffMigrationArchiveFailed(e), En) => format!(
+                "the handoff migration was stopped because the original file could not be \
+                 archived: {}",
+                e.text_in(lang)
+            ),
+            (Self::HandoffMigrationMemoKept, Ja) => {
+                "移せないプロジェクトがあったため運用メモの書き換えを中止した（原本は退避済み）"
+                    .into()
+            }
+            (Self::HandoffMigrationMemoKept, En) => {
+                "the profile memo was left as it was because some projects could not be moved \
+                 (the original is archived)"
+                    .into()
+            }
+            (
+                Self::ModelMismatch {
+                    declared,
+                    actual,
+                    account,
+                },
+                Ja,
+            ) => {
+                let whose = account
+                    .as_deref()
+                    .map(|name| format!("アカウント {name} の "))
+                    .unwrap_or_default();
+                format!(
+                    "モデルの食い違い: 宣言 {declared} → 実際 {actual}（{whose}entitlement かモデルの廃止で \
+                     claude が別のモデルへ解決した。ledger は実際のモデルで集計する）"
+                )
+            }
+            (
+                Self::ModelMismatch {
+                    declared,
+                    actual,
+                    account,
+                },
+                En,
+            ) => {
+                let whose = account
+                    .as_deref()
+                    .map(|name| format!("the entitlement of the account {name}"))
+                    .unwrap_or_else(|| "the account's entitlement".to_string());
+                format!(
+                    "model mismatch: declared {declared} → actual {actual} (claude resolved to a \
+                     different model because of {whose} or a model retirement; the ledger counts \
+                     the actual model)"
+                )
+            }
+            (
+                Self::WorkerModelMismatch {
+                    worker_id,
+                    pane,
+                    declared,
+                    actual,
+                    account,
+                },
+                Ja,
+            ) => format!(
+                "worker {worker_id}（pane {pane}）: {}",
+                Self::ModelMismatch {
+                    declared: declared.clone(),
+                    actual: actual.clone(),
+                    account: account.clone(),
+                }
+                .text_in(lang)
+            ),
+            (
+                Self::WorkerModelMismatch {
+                    worker_id,
+                    pane,
+                    declared,
+                    actual,
+                    account,
+                },
+                En,
+            ) => format!(
+                "worker {worker_id} (pane {pane}): {}",
+                Self::ModelMismatch {
+                    declared: declared.clone(),
+                    actual: actual.clone(),
+                    account: account.clone(),
+                }
+                .text_in(lang)
             ),
         }
     }

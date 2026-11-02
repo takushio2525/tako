@@ -80,20 +80,8 @@ pub fn is_real_model(model: &str) -> bool {
     !m.is_empty() && !m.starts_with('<')
 }
 
-/// 食い違いの 1 行（`warnings` と persist.log に同じ文を出す）。
-///
-/// `account` は transcript が属したアカウント名（accounts.yaml の逆引き）。引けなければ `None` で、
-/// そのときは名指ししない（推測で別のアカウントを指さない）。
-/// 名前・モデル名だけを載せる（ホームパス・会話の中身は載せない）
-pub fn mismatch_warning(declared: &str, actual: &str, account: Option<&str>) -> String {
-    let whose = account
-        .map(|name| format!("アカウント {name} の "))
-        .unwrap_or_default();
-    format!(
-        "モデルの食い違い: 宣言 {declared} → 実際 {actual}（{whose}entitlement かモデルの廃止で \
-         claude が別のモデルへ解決した。ledger は実際のモデルで集計する）"
-    )
-}
+// 食い違いの 1 行の文は `tako_control::ReplyNote::ModelMismatch`（#2365）。応答の `warnings` は
+// 表示言語、persist.log は日本語で同じ型から組む（以前はここが日本語の `String` を返していた）
 
 #[cfg(test)]
 mod tests {
@@ -179,19 +167,5 @@ mod tests {
         assert!(!is_real_model("<synthetic>"));
         assert!(!is_real_model(""));
         assert!(is_real_model("claude-opus-5"));
-    }
-
-    #[test]
-    fn 食い違いの行はアカウント名とモデル名だけを載せる() {
-        let line = mismatch_warning("claude-opus-5-5", "claude-opus-5", Some("univ"));
-        assert!(
-            line.contains("宣言 claude-opus-5-5 → 実際 claude-opus-5"),
-            "{line}"
-        );
-        assert!(line.contains("アカウント univ の entitlement"), "{line}");
-        // アカウントを引けなければ名指ししない
-        let line = mismatch_warning("claude-opus-5-5", "claude-opus-5", None);
-        assert!(!line.contains("アカウント"), "{line}");
-        assert!(line.contains("（entitlement"), "{line}");
     }
 }

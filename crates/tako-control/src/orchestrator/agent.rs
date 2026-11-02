@@ -12,6 +12,8 @@ use std::path::Path;
 use serde_json::json;
 
 use tako_core::agent_support;
+use tako_core::i18n::Lang;
+use tako_core::load_issue::JsonReason;
 
 use super::{EnvPlan, EMPTY_ENV_PLAN};
 
@@ -461,10 +463,105 @@ pub(crate) fn sh_quote(s: &str) -> String {
 
 // --- 事前信頼（spawn 前にダイアログ自体を出さない。Issue #32 の各 CLI 対応） ---
 
+/// 事前信頼（作業フォルダを信頼済みとして各 CLI の設定ファイルへ書く）を書き込めなかった理由（#2365）。
+///
+/// spawn の応答の `warnings[].detail`（`kind: trust_write_failed`）へは表示言語で、stderr の診断は
+/// 日本語で同じ型から組む。以前は日本語の `String` だったので、英語表示でも `detail` だけ日本語で返った。
+/// (バリアント, 言語) の網羅 match なので、バリアントを足すと日英の両方を書くまでコンパイルが通らない。
+/// 日本語は #2365 より前の固定文とバイト一致。中身のエラー文（`error`）は OS / serde の文のまま
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustWriteError {
+    /// claude の設定ファイル（.claude.json）の置き場を 1 つも決められない
+    ClaudeConfigPathUnknown,
+    /// ホームディレクトリを特定できない（codex / agy の置き場）
+    HomeUnresolved,
+    /// 設定ファイル `path` を読めない
+    Read { path: String, error: String },
+    /// 設定ファイル `path` を JSON として解釈できない（種類と位置だけ = 中身を引用しない。#2230）
+    Parse { path: String, reason: JsonReason },
+    /// `path` のトップレベルがオブジェクトでない
+    TopLevelNotObject { path: String },
+    /// `path` の `field`（`projects` / `projects.<cwd>`）がオブジェクトでない
+    FieldNotObject { path: String, field: String },
+    /// `path` の `field`（`trustedWorkspaces`）が配列でない
+    FieldNotArray { path: String, field: String },
+    /// 置き場のディレクトリを作れない（codex / agy。旧文どおり場所は書かない）
+    DirCreate(String),
+    /// 置き場のディレクトリ `dir` を作れない（claude）
+    DirCreateAt { dir: String, error: String },
+    /// 設定を直列化できない
+    Serialize(String),
+    /// 一時ファイル `path` を書けない
+    Write { path: String, error: String },
+    /// 一時ファイルで `path` を置き換えられない
+    Replace { path: String, error: String },
+}
+
+impl TrustWriteError {
+    /// 表示言語を明示しての文言（#2365）
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::ClaudeConfigPathUnknown, Ja) => {
+                "claude の設定ファイル（.claude.json）の場所を特定できない".to_string()
+            }
+            (Self::ClaudeConfigPathUnknown, En) => {
+                "cannot determine where claude's settings file (.claude.json) is".to_string()
+            }
+            (Self::HomeUnresolved, Ja) => "ホームディレクトリを特定できない".to_string(),
+            (Self::HomeUnresolved, En) => "cannot determine the home directory".to_string(),
+            (Self::Read { path, error }, Ja) => format!("{path} を読めない: {error}"),
+            (Self::Read { path, error }, En) => format!("cannot read {path}: {error}"),
+            (Self::Parse { path, reason }, Ja) => {
+                format!("{path} を解釈できない: {}", reason.text_in(lang))
+            }
+            (Self::Parse { path, reason }, En) => {
+                format!("cannot parse {path}: {}", reason.text_in(lang))
+            }
+            (Self::TopLevelNotObject { path }, Ja) => {
+                format!("{path} のトップレベルがオブジェクトでない")
+            }
+            (Self::TopLevelNotObject { path }, En) => {
+                format!("the top level of {path} is not an object")
+            }
+            (Self::FieldNotObject { path, field }, Ja) => {
+                format!("{path} の {field} がオブジェクトでない")
+            }
+            (Self::FieldNotObject { path, field }, En) => {
+                format!("{field} in {path} is not an object")
+            }
+            (Self::FieldNotArray { path, field }, Ja) => format!("{path} の {field} が配列でない"),
+            (Self::FieldNotArray { path, field }, En) => {
+                format!("{field} in {path} is not an array")
+            }
+            (Self::DirCreate(error), Ja) => format!("ディレクトリの作成に失敗: {error}"),
+            (Self::DirCreate(error), En) => format!("failed to create the folder: {error}"),
+            (Self::DirCreateAt { dir, error }, Ja) => {
+                format!("{dir} のディレクトリを作れない: {error}")
+            }
+            (Self::DirCreateAt { dir, error }, En) => {
+                format!("cannot create the folder {dir}: {error}")
+            }
+            (Self::Serialize(error), Ja) => format!("設定を直列化できない: {error}"),
+            (Self::Serialize(error), En) => format!("cannot serialize the settings: {error}"),
+            (Self::Write { path, error }, Ja) => format!("{path} を書けない: {error}"),
+            (Self::Write { path, error }, En) => format!("cannot write {path}: {error}"),
+            (Self::Replace { path, error }, Ja) => format!("{path} を置換できない: {error}"),
+            (Self::Replace { path, error }, En) => format!("cannot replace {path}: {error}"),
+        }
+    }
+}
+
+impl std::fmt::Display for TrustWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
 /// エージェント種別に応じた事前信頼を書き込む。
 /// いずれも best-effort: 失敗しても PromptFlow のダイアログ検出 → 承諾が
 /// フォールバックするため、呼び出し側は警告ログのみで継続する
-pub fn ensure_trusted(agent: WorkerAgent, cwd: &str) -> Result<bool, String> {
+pub fn ensure_trusted(agent: WorkerAgent, cwd: &str) -> Result<bool, TrustWriteError> {
     ensure_trusted_in(agent, None, cwd)
 }
 
@@ -476,7 +573,7 @@ pub fn ensure_trusted_in(
     agent: WorkerAgent,
     claude_config_dir: Option<&str>,
     cwd: &str,
-) -> Result<bool, String> {
+) -> Result<bool, TrustWriteError> {
     match agent {
         WorkerAgent::Claude => crate::claude_tui::ensure_trusted_in(claude_config_dir, cwd),
         WorkerAgent::Codex => ensure_codex_trusted(cwd),
@@ -485,17 +582,21 @@ pub fn ensure_trusted_in(
 }
 
 /// codex: `~/.codex/config.toml` に `[projects."<cwd>"] trust_level = "trusted"` を追記する
-fn ensure_codex_trusted(cwd: &str) -> Result<bool, String> {
-    let home =
-        crate::orchestrator::agent_config_home().ok_or("ホームディレクトリを特定できない")?;
+fn ensure_codex_trusted(cwd: &str) -> Result<bool, TrustWriteError> {
+    let home = crate::orchestrator::agent_config_home().ok_or(TrustWriteError::HomeUnresolved)?;
     ensure_codex_trusted_at(&home.join(".codex/config.toml"), cwd)
 }
 
-fn ensure_codex_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
+fn ensure_codex_trusted_at(path: &Path, cwd: &str) -> Result<bool, TrustWriteError> {
     let content = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(format!("{} を読めない: {e}", path.display())),
+        Err(e) => {
+            return Err(TrustWriteError::Read {
+                path: path.display().to_string(),
+                error: e.to_string(),
+            })
+        }
     };
     let header = format!("[projects.{}]", toml_quote(cwd));
     // セクションが既に存在すれば触らない（trusted ならスキップ、ユーザーが明示的に
@@ -504,7 +605,7 @@ fn ensure_codex_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
         return Ok(true);
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| TrustWriteError::DirCreate(e.to_string()))?;
     }
     let mut updated = content;
     if !updated.is_empty() && !updated.ends_with('\n') {
@@ -513,8 +614,14 @@ fn ensure_codex_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
     updated.push_str(&format!("\n{header}\ntrust_level = \"trusted\"\n"));
     // codex 本体も読み書きするファイルのため、一時ファイル + rename で原子的に置き換える
     let tmp = path.with_extension("toml.tako-tmp");
-    std::fs::write(&tmp, &updated).map_err(|e| format!("{} を書けない: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{} を置換できない: {e}", path.display()))?;
+    std::fs::write(&tmp, &updated).map_err(|e| TrustWriteError::Write {
+        path: tmp.display().to_string(),
+        error: e.to_string(),
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| TrustWriteError::Replace {
+        path: path.display().to_string(),
+        error: e.to_string(),
+    })?;
     Ok(true)
 }
 
@@ -524,46 +631,57 @@ pub(crate) fn toml_quote(s: &str) -> String {
 }
 
 /// agy: `~/.gemini/antigravity-cli/settings.json` の `trustedWorkspaces` 配列に cwd を追加する
-fn ensure_agy_trusted(cwd: &str) -> Result<bool, String> {
-    let home =
-        crate::orchestrator::agent_config_home().ok_or("ホームディレクトリを特定できない")?;
+fn ensure_agy_trusted(cwd: &str) -> Result<bool, TrustWriteError> {
+    let home = crate::orchestrator::agent_config_home().ok_or(TrustWriteError::HomeUnresolved)?;
     ensure_agy_trusted_at(&home.join(".gemini/antigravity-cli/settings.json"), cwd)
 }
 
-fn ensure_agy_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
+fn ensure_agy_trusted_at(path: &Path, cwd: &str) -> Result<bool, TrustWriteError> {
+    let shown = || path.display().to_string();
     let mut root: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| {
-            format!(
-                "{} を解釈できない: {}",
-                path.display(),
-                tako_core::load_issue::json_error_reason(&e)
-            )
+        Ok(s) => serde_json::from_str(&s).map_err(|e| TrustWriteError::Parse {
+            path: shown(),
+            reason: JsonReason::of(&e),
         })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
-        Err(e) => return Err(format!("{} を読めない: {e}", path.display())),
+        Err(e) => {
+            return Err(TrustWriteError::Read {
+                path: shown(),
+                error: e.to_string(),
+            })
+        }
     };
     let obj = root
         .as_object_mut()
-        .ok_or_else(|| format!("{} のトップレベルがオブジェクトでない", path.display()))?;
+        .ok_or_else(|| TrustWriteError::TopLevelNotObject { path: shown() })?;
     let list = obj
         .entry("trustedWorkspaces")
         .or_insert_with(|| json!([]))
         .as_array_mut()
-        .ok_or_else(|| format!("{} の trustedWorkspaces が配列でない", path.display()))?;
+        .ok_or_else(|| TrustWriteError::FieldNotArray {
+            path: shown(),
+            field: "trustedWorkspaces".to_string(),
+        })?;
     if list.iter().any(|v| v.as_str() == Some(cwd)) {
         return Ok(true); // 既に信頼済み（書き込み不要）
     }
     list.push(json!(cwd));
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("ディレクトリの作成に失敗: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| TrustWriteError::DirCreate(e.to_string()))?;
     }
     // agy 本体も読み書きするファイルのため、一時ファイル + rename で原子的に置き換える
     let tmp = path.with_extension("json.tako-tmp");
-    let serialized =
-        serde_json::to_string_pretty(&root).map_err(|e| format!("設定を直列化できない: {e}"))?;
-    std::fs::write(&tmp, serialized).map_err(|e| format!("{} を書けない: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{} を置換できない: {e}", path.display()))?;
+    let serialized = serde_json::to_string_pretty(&root)
+        .map_err(|e| TrustWriteError::Serialize(e.to_string()))?;
+    std::fs::write(&tmp, serialized).map_err(|e| TrustWriteError::Write {
+        path: tmp.display().to_string(),
+        error: e.to_string(),
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| TrustWriteError::Replace {
+        path: shown(),
+        error: e.to_string(),
+    })?;
     Ok(true)
 }
 
@@ -1006,7 +1124,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         let raw = result.expect_err("書き込めないディレクトリでは失敗する");
-        assert!(!raw.is_empty(), "生の詳細が残ること");
+        assert!(!raw.text_in(Lang::Ja).is_empty(), "生の詳細が残ること");
 
         // 呼び出し側（spawn）はこれを分類済みの警告へ変換する
         let msg = AgentCliError {

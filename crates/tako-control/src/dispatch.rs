@@ -18087,7 +18087,7 @@ fn dispatch_orchestrator_self(
         "handoff_migration": migration,
     });
     // 運用メモが膨らんでいたら肥大の再発なので警告する（#915 要件 3）
-    let mut warnings: Vec<String> = migration.warnings.clone();
+    let mut warnings: Vec<String> = migration.warnings.iter().map(ToString::to_string).collect();
     warnings.extend(profile_note.map(|note| note.to_string()));
     warnings.extend(
         memo_content
@@ -18923,7 +18923,10 @@ fn dispatch_orchestrator_handoff(
         &cwd.to_string_lossy(),
     )
     .unwrap_or_else(|e| {
-        eprintln!("warning: handoff 事前信頼失敗（ダイアログ検出で継続）: {e}");
+        eprintln!(
+            "warning: handoff 事前信頼失敗（ダイアログ検出で継続）: {}",
+            e.text_in(Lang::Ja)
+        );
         false
     });
 
@@ -18970,7 +18973,7 @@ fn dispatch_orchestrator_handoff(
     let limit_resume_applied = pane_obj.limit_autoresume();
 
     let handoff_path = orchestrator::handoff_path(profile_name);
-    let mut warnings: Vec<String> = migration.warnings.clone();
+    let mut warnings: Vec<String> = migration.warnings.iter().map(ToString::to_string).collect();
     warnings.extend(load_warning);
     warnings.extend(bundle.memo_warning.clone());
     // #1055: 起動フォルダの食い違いは黙らない（後任だけツールが全部拒否される、のような
@@ -20276,16 +20279,17 @@ fn spawn_launch(host: &mut dyn ControlHost, origin: PaneOrigin, recorded: SpawnR
 fn launch_warning(
     agent: crate::orchestrator::agent::WorkerAgent,
     problem: crate::orchestrator::agent_cli::AgentCliProblem,
-    detail: &str,
+    detail: &crate::orchestrator::agent::TrustWriteError,
 ) -> Value {
     let err = crate::orchestrator::agent_cli::AgentCliError { agent, problem };
     let message = err.message();
-    eprintln!("warning: {message}（{detail}）");
+    // stderr の診断の詳細は日本語のまま、応答の `detail` は `message` と同じ表示言語（#2365）
+    eprintln!("warning: {message}（{}）", detail.text_in(Lang::Ja));
     json!({
         "kind": problem.kind(),
         "agent": agent.as_str(),
         "message": message,
-        "detail": detail,
+        "detail": detail.to_string(),
     })
 }
 
@@ -20968,7 +20972,8 @@ fn finish_worker_status(
         }
         RegistryModel {
             check: orchestrator::registry::model_check(&entry).as_str(),
-            warning: orchestrator::registry::model_warning(&entry),
+            // 表示言語で組む（#2365。persist.log は観測の記録の側で日本語）
+            warning: orchestrator::registry::model_warning(&entry).map(String::from),
             declared: entry.model,
             actual: entry.model_actual,
         }
@@ -52875,14 +52880,19 @@ tako | pane 2 [ compact ]       [-]
                 .unwrap()
                 .iter()
                 .filter_map(|w| w.as_str())
-                .filter(|w| w.contains("モデルの食い違い"))
+                // 応答の行は表示言語（#2365。テストの既定は英語）なので、言語に依らない
+                // 「宣言 → 実際」のモデル名の並びで拾う（日本語の文は番犬の表が旧文と突き合わせる）
+                .filter(|w| w.contains("claude-opus-5-5 → "))
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         };
         let lines = warned(&v);
         assert_eq!(lines.len(), 1, "{v}");
         assert!(
-            lines[0].contains("宣言 claude-opus-5-5 → 実際 claude-opus-5"),
+            lines[0]
+                .split("claude-opus-5-5 → ")
+                .nth(1)
+                .is_some_and(|actual| actual.contains("claude-opus-5")),
             "{lines:?}"
         );
         // 一致: warnings は出ない
@@ -52931,6 +52941,22 @@ tako | pane 2 [ compact ]       [-]
         );
         assert_eq!(item(&ids[1])["model_check"], "match");
         assert_eq!(item(&ids[2])["model_check"], "pending");
+        // 応答の行は表示言語（#2365。テストの既定は英語）なので、前置き（`worker <id>（pane <n>）`）は
+        // 型から組んだ文の頭（最初の `: ` の手前）と比べる
+        let head = |id: &str, pane: u64| {
+            crate::ReplyNote::WorkerModelMismatch {
+                worker_id: id.to_string(),
+                pane,
+                declared: String::new(),
+                actual: String::new(),
+                account: None,
+            }
+            .to_string()
+            .split(": ")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+        };
         let mine: Vec<&str> = v["warnings"]
             .as_array()
             .unwrap()
@@ -52938,11 +52964,12 @@ tako | pane 2 [ compact ]       [-]
             .filter_map(|w| w.as_str())
             .filter(|w| {
                 ids.iter()
-                    .any(|id| w.starts_with(&format!("worker {id}（")))
+                    .zip(panes.iter())
+                    .any(|(id, pane)| w.starts_with(&head(id, *pane)))
             })
             .collect();
         assert_eq!(mine.len(), 1, "食い違いの 1 件だけ: {mine:?}");
-        assert!(mine[0].starts_with(&format!("worker {}（pane {}）", ids[0], panes[0])));
+        assert!(mine[0].starts_with(&head(&ids[0], panes[0])));
 
         // worker_status を worker ID で引く（ペインが無い・mod の報告も無い = 記録した値を返す）
         let v = dispatch(

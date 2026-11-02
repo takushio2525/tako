@@ -802,16 +802,18 @@ pub fn model_check(entry: &WorkerEntry) -> tako_core::model_check::ModelCheck {
     tako_core::model_check::check(entry.model.as_deref(), entry.model_actual.as_deref())
 }
 
-/// 食い違いの 1 行（一致・未確定・比べられないなら None）
-pub fn model_warning(entry: &WorkerEntry) -> Option<String> {
+/// 食い違いの 1 行（一致・未確定・比べられないなら None）。
+///
+/// 応答の warnings は表示言語（`to_string()`）、persist.log は `text_in(Lang::Ja)` で組む（#2365）
+pub fn model_warning(entry: &WorkerEntry) -> Option<crate::ReplyNote> {
     if model_check(entry) != tako_core::model_check::ModelCheck::Mismatch {
         return None;
     }
-    Some(tako_core::model_check::mismatch_warning(
-        entry.model.as_deref()?,
-        entry.model_actual.as_deref()?,
-        entry.model_actual_account.as_deref(),
-    ))
+    Some(crate::ReplyNote::ModelMismatch {
+        declared: entry.model.clone()?,
+        actual: entry.model_actual.clone()?,
+        account: entry.model_actual_account.clone(),
+    })
 }
 
 /// 実際のモデルを 1 件確定した結果（#1638）
@@ -830,14 +832,14 @@ impl ModelObservation {
         tako_core::model_check::check(self.declared.as_deref(), Some(&self.actual))
     }
 
-    /// 食い違いなら warnings / persist.log に出す 1 行
-    pub fn warning(&self) -> Option<String> {
+    /// 食い違いなら warnings / persist.log に出す 1 行（persist.log は `text_in(Lang::Ja)`）
+    pub fn warning(&self) -> Option<crate::ReplyNote> {
         (self.check() == tako_core::model_check::ModelCheck::Mismatch).then(|| {
-            tako_core::model_check::mismatch_warning(
-                self.declared.as_deref().unwrap_or_default(),
-                &self.actual,
-                self.account.as_deref(),
-            )
+            crate::ReplyNote::ModelMismatch {
+                declared: self.declared.clone().unwrap_or_default(),
+                actual: self.actual.clone(),
+                account: self.account.clone(),
+            }
         })
     }
 }
@@ -916,10 +918,13 @@ fn record_model_actual_at(
 /// 確定した観測を外へ流す: 食い違いなら persist.log へ 1 行、委任台帳へ実際のモデルを書く。
 /// 1 件につき 1 回だけ通る（記録は未確定のエントリにしか書かない）
 fn publish_observation(obs: &ModelObservation) {
-    if let Some(line) = obs.warning() {
+    if let Some(note) = obs.warning() {
+        // persist.log は日本語（診断ログ。#2365）
         crate::diag::persist_log(&format!(
-            "[orchestrator] worker={} pane={} {line}",
-            obs.worker_id, obs.pane
+            "[orchestrator] worker={} pane={} {}",
+            obs.worker_id,
+            obs.pane,
+            note.text_in(tako_core::i18n::Lang::Ja)
         ));
     }
     if let Some(id) = obs.ledger_id.as_deref() {
@@ -1493,8 +1498,23 @@ pub fn list_payload(
     for (id, e) in entries {
         let (pane_alive, tmux_alive) = liveness(e, live_backends, live_panes);
         let delivery = prompt_delivery_assessment(e, now_epoch);
-        if let Some(line) = model_warning(e) {
-            warnings.push(format!("worker {id}（pane {}）: {line}", e.pane));
+        if let Some(crate::ReplyNote::ModelMismatch {
+            declared,
+            actual,
+            account,
+        }) = model_warning(e)
+        {
+            // 表示言語で組む（#2365）
+            warnings.push(
+                crate::ReplyNote::WorkerModelMismatch {
+                    worker_id: id.clone(),
+                    pane: e.pane,
+                    declared,
+                    actual,
+                    account,
+                }
+                .to_string(),
+            );
         }
         items.push(json!({
             "worker_id": id,
@@ -3141,7 +3161,11 @@ mod tests {
         assert_eq!(found.len(), 2, "応答のある 2 件だけ確定する: {found:?}");
         let a = found.iter().find(|o| o.worker_id == "1").unwrap();
         assert_eq!(a.check(), tako_core::model_check::ModelCheck::Mismatch);
-        assert!(a.warning().unwrap().contains("アカウント univ の"));
+        assert!(a
+            .warning()
+            .unwrap()
+            .text_in(tako_core::i18n::Lang::Ja)
+            .contains("アカウント univ の"));
 
         let reg = WorkerRegistry::load_from(&path).unwrap();
         assert_eq!(
@@ -3185,12 +3209,22 @@ mod tests {
         let warnings = v["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 1, "食い違いの 1 件だけ: {warnings:?}");
         let line = warnings[0].as_str().unwrap();
-        assert!(line.starts_with("worker 1（pane "), "{line}");
+        // 応答の行は表示言語（テストの既定は英語）。日本語の文は型から引く（#2365）
+        let note = crate::ReplyNote::WorkerModelMismatch {
+            worker_id: "1".into(),
+            pane: reg.workers["1"].pane,
+            declared: "claude-opus-5-5".into(),
+            actual: "claude-opus-5".into(),
+            account: Some("univ".into()),
+        };
+        assert_eq!(line, note.to_string());
+        let ja = note.text_in(tako_core::i18n::Lang::Ja);
+        assert!(ja.starts_with("worker 1（pane "), "{ja}");
         assert!(
-            line.contains(
+            ja.contains(
                 "宣言 claude-opus-5-5 → 実際 claude-opus-5（アカウント univ の entitlement"
             ),
-            "{line}"
+            "{ja}"
         );
 
         // 確定したものは二度と探さない（transcript に触らない）。未確定の 1 件だけをまた探す
