@@ -23,9 +23,10 @@
 //! 3. 子プロセスの有無は後段（`probe_running_children`）が埋め、background と同期の
 //!    **両経路**がそれを通る（落とすと busy / stalled の判定が静かに壊れる）
 //! 4. tako-app の IPC ループが `prepare_offload` を計測区間で包む（再発したら perf.log に出る）
-//! 5. UI ストールの記録が「直前に終わった区間」（`recent_spans_within`）を分類へ渡す
+//! 5. UI ストールの記録が「直前に終わった区間」を分類へ渡す 1 実装（`diag::stall_line`）を通る
 //!    （監視ループ自身が UI スレッドで走るので、記録の時点で塞いでいた区間は必ず終わっている。
-//!    渡さないと tako の専有が「再開経路の遅延」と誤分類される = 本番で 38 分に 331 件）
+//!    渡さないと tako の専有が「再開経路の遅延」と誤分類される = 本番で 38 分に 331 件）。
+//!    #2665 以後、区間の窓（遅延の間）と分類の中身は `issue2665_stall_window_watchdog` が縛る
 //! 6. stale binary 検知の保険の探索（`which_claude` = ログインシェルの `command -v claude`）が
 //!    結果の覚え（`memoized_find`）を通る（PATH の痩せた `.app` では 2 秒ごとの指紋取りの
 //!    たびにシェルが起動していた = 本番で 20 秒に約 6 本）
@@ -300,35 +301,37 @@ fn scan_main(src: &str) -> Vec<Offender> {
     out
 }
 
-/// 5. UI ストールの記録が直前の区間の履歴を渡しているか
+/// 5. UI ストールの記録が直前の区間の履歴を通す 1 実装（`diag::stall_line`。#1968 / #2665）を通るか
 fn scan_stall_classify(src: &str) -> Vec<Offender> {
     let lines: Vec<&str> = src.lines().collect();
-    let Some(call) = lines
+    // 分類を直に組む形は名指す（区間の履歴を渡さない修正前の形へ戻りうる）
+    let direct: Vec<Offender> = lines
         .iter()
-        .position(|l| !is_comment(l) && l.contains("diag::classify_stall("))
-    else {
-        return vec![Offender {
+        .enumerate()
+        .filter(|(_, l)| !is_comment(l) && l.contains("diag::classify_stall("))
+        .map(|(i, _)| Offender {
             file: MAIN,
-            line: 0,
-            why: "UI ストールの記録（`diag::classify_stall(`）が見つからない（走査が空振り）"
-                .into(),
-        }];
-    };
-    let from = call.saturating_sub(12);
-    let to = (call + 8).min(lines.len());
-    let passes = lines[from..to]
+            line: i + 1,
+            why:
+                "UI ストールの分類を `diag::classify_stall` で直に組んでいる（直前に終わった区間を \
+                  通す 1 実装 `diag::stall_line` を通らない = 塞いでいた区間が「再開経路の遅延」と \
+                  誤分類されうる。#1968 / #2665）"
+                    .into(),
+        })
+        .collect();
+    if !direct.is_empty() {
+        return direct;
+    }
+    if lines
         .iter()
-        .any(|l| !is_comment(l) && l.contains("recent_spans_within("));
-    if passes {
+        .any(|l| !is_comment(l) && l.contains("diag::stall_line("))
+    {
         Vec::new()
     } else {
         vec![Offender {
             file: MAIN,
-            line: call + 1,
-            why: "UI ストールの分類へ直前に終わった区間（`recent_spans_within`）を渡していない \
-                  （記録の時点で塞いでいた区間は終わっているので、tako の専有が \
-                  「再開経路の遅延」と誤分類される = #1968）"
-                .into(),
+            line: 0,
+            why: "UI ストールの記録（`diag::stall_line(`）が見つからない（走査が空振り）".into(),
         }]
     }
 }
@@ -502,9 +505,9 @@ const INJECTIONS: &[Injection] = &[
     Injection {
         name: "UI ストールの分類へ直前の区間を渡さない",
         file: MAIN,
-        from: "tako_control::diag::recent_spans_within(Duration::from_secs(1) + lag)",
-        to: "None::<tako_control::diag::RecentSpans>",
-        expect: "recent_spans_within",
+        from: "tako_control::diag::stall_line(armed, period)",
+        to: "Some(tako_control::diag::classify_stall(\n                Duration::ZERO,\n                Duration::ZERO,\n                None,\n                None,\n            ))",
+        expect: "stall_line",
     },
     Injection {
         name: "IPC ループの準備を測らない",

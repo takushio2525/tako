@@ -234,6 +234,19 @@ pub fn issue1968_legacy() -> bool {
     })
 }
 
+/// #2665 の A/B 用の逃げ道（`TAKO_2665_LEGACY=1`）。同一バイナリのまま修正前の UI ストールの分類へ戻す:
+/// 窓を「1 秒 + 遅延」（タイマーを掛けた時点まで遡る）で取り、区間の全長を数え、半分に届かなければ
+/// 内訳を書かずに「計測区間の外」とする（文も修正前の [`classify_stall`] のまま）
+pub fn issue2665_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2665_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
 /// 直近に終わったメインスレッドの**トップレベル**計測区間（UI ストールの分類用。#1968）。
 ///
 /// UI ストールは 1 秒タイマーの再開遅延で測るが、その監視ループ自身が UI スレッドで走るので、
@@ -297,6 +310,72 @@ pub fn recent_spans_within(window: Duration) -> Option<RecentSpans> {
         }
     }
     out
+}
+
+/// 遅延の間（タイマーの期限 → 記録）に重なったトップレベル区間の要約（#2665）。
+///
+/// 数えるのは**期限より後ろへはみ出した分**だけ。期限より前に終わった区間はタイマーの再開を
+/// 遅らせていない（その間メインスレッドは空いていた）ので数えない。旧実装は窓を
+/// 「1 秒 + 遅延」= タイマーを掛けた時点まで遡り、期限より前に終わった区間まで丸ごと数えて
+/// 「tako の専有」と名指していた（隔離 GUI の注入で 4/4）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelaySpans {
+    /// 遅延の間に重なった分が最も長い区間
+    pub longest_tag: String,
+    /// その区間の全長（ms。区間自身の「メインスレッド専有」の行と突き合わせられる）
+    pub longest_took_ms: u64,
+    /// その区間のうち遅延の間に重なった分（ms）
+    pub longest_overlap_ms: u64,
+    /// 遅延の間に重なった分の合計（ms。トップレベルの区間どうしは重ならないので遅延を超えない）
+    pub overlap_ms: u64,
+    pub count: usize,
+}
+
+impl DelaySpans {
+    /// 終わった区間（タグ・終わった時刻・全長 ms）のうち `since` より後ろに重なった分を要約する
+    /// （無ければ `None`）。時刻は呼び手が渡す純粋関数
+    pub fn summarize<'a>(
+        spans: impl IntoIterator<Item = (&'a str, Instant, u64)>,
+        since: Instant,
+    ) -> Option<Self> {
+        let mut out: Option<Self> = None;
+        for (tag, ended, took_ms) in spans {
+            if ended <= since {
+                continue;
+            }
+            let started = ended
+                .checked_sub(Duration::from_millis(took_ms))
+                .unwrap_or(since);
+            let overlap_ms = ended.duration_since(started.max(since)).as_millis() as u64;
+            if overlap_ms == 0 {
+                continue;
+            }
+            let r = out.get_or_insert_with(|| Self {
+                longest_tag: tag.to_string(),
+                longest_took_ms: took_ms,
+                longest_overlap_ms: 0,
+                overlap_ms: 0,
+                count: 0,
+            });
+            r.overlap_ms += overlap_ms;
+            r.count += 1;
+            if overlap_ms > r.longest_overlap_ms {
+                r.longest_overlap_ms = overlap_ms;
+                r.longest_took_ms = took_ms;
+                r.longest_tag = tag.to_string();
+            }
+        }
+        out
+    }
+}
+
+/// `since`（タイマーの期限）から今までに重なったメインスレッドのトップレベル区間（#2665）
+pub fn spans_overlapping_since(since: Instant) -> Option<DelaySpans> {
+    let q = RECENT_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    DelaySpans::summarize(
+        q.iter().map(|s| (s.tag.as_ref(), s.ended, s.took_ms)),
+        since,
+    )
 }
 
 /// メインスレッドの ThreadId（`mark_main_thread` で登録）。
@@ -545,14 +624,186 @@ pub fn current_span_snapshot() -> Option<(String, u64)> {
 /// tako 側の事情では起こせない（= CPU が他所で飽和している証拠）
 const SCHED_OVERLOAD_OVER: Duration = Duration::from_millis(500);
 
-/// UI ストールの原因を、実測値だけから分類して 1 行にする（#643）。
+/// UI ストールとして記録する再開遅延の下限（#113）
+pub const STALL_REPORT_OVER: Duration = Duration::from_millis(500);
+
+/// UI ストール監視ループの 1 周の判定（#113 / #643 / #1968 / #2665）。記録すべきなら perf.log の
+/// 1 行（日本語）を返す。
+///
+/// - `armed`: 監視ループがタイマーを掛けた時刻
+/// - `period`: タイマーの長さ（期限 = `armed + period`）
+///
+/// 監視ループ自身が UI スレッドで走るので、記録する時点で塞いでいた区間は終わっている（#1968）。
+/// 分類に使うのは**期限から今まで**（= 遅延の間）に重なった区間の、重なった分だけ（#2665）。
+/// スケジューラ遅延のピークは毎周回取り出す（記録するときだけ取ると古いピークが混ざる）
+pub fn stall_line(armed: Instant, period: Duration) -> Option<String> {
+    let lag = armed.elapsed().saturating_sub(period);
+    let sched_lag = take_scheduler_lag_peak();
+    if lag < STALL_REPORT_OVER {
+        return None;
+    }
+    let running = current_span_snapshot();
+    let span = running.as_ref().map(|(tag, ms)| (tag.as_str(), *ms));
+    if issue2665_legacy() {
+        // A/B: 修正前の窓（1 秒 + 遅延 = タイマーを掛けた時点まで遡る）・区間の全長・修正前の文
+        let recent = (!issue1968_legacy())
+            .then(|| recent_spans_within(period + lag))
+            .flatten();
+        return Some(classify_stall(lag, sched_lag, span, recent.as_ref()));
+    }
+    // #1968 の A/B（`TAKO_1968_LEGACY=1`）は修正前と同じく終わった区間を使わない
+    let delay = (!issue1968_legacy())
+        .then(|| spans_overlapping_since(armed + period))
+        .flatten();
+    Some(StallCause::classify(lag, sched_lag, span, delay).text_in(tako_core::i18n::Lang::Ja))
+}
+
+/// UI ストールの原因の分類（#643 / #1968 / #2665）。実測値だけから決め、根拠の無い断定はしない
+/// （原因を騙ると次の調査が丸ごと無駄になる）。文は [`StallCause::text_in`]（perf.log は日本語）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StallCause {
+    /// 素の OS スレッドの sleep まで遅れた = マシン全体の過負荷（tako の専有ではない）
+    Overload { lag: Duration, sched_lag: Duration },
+    /// 記録の時点でメインスレッドの計測区間が走っていた = tako の専有
+    Running { lag: Duration, tag: String, ms: u64 },
+    /// 遅延の間に重なった計測区間が遅延の半分以上を説明する = tako の専有
+    Owned { lag: Duration, spans: DelaySpans },
+    /// 遅延の間に計測区間はあるが半分に届かない。内訳を書き、残りは計測区間の外とする
+    /// （騙らない・捨てない。#2665）
+    Partial { lag: Duration, spans: DelaySpans },
+    /// 遅延の間に計測区間が無い = 計測区間の外か再開経路（タイマー / キュー）側の遅延
+    Unmeasured { lag: Duration },
+}
+
+impl StallCause {
+    /// 実測値から分類する。
+    ///
+    /// - `lag`: foreground executor の再開遅延
+    /// - `sched_lag`: 素の OS スレッドの sleep 超過（[`take_scheduler_lag_peak`]）
+    /// - `span`: 記録時点でメインスレッドが走らせていた計測区間
+    /// - `delay`: 遅延の間に重なった区間（[`spans_overlapping_since`]）
+    pub fn classify(
+        lag: Duration,
+        sched_lag: Duration,
+        span: Option<(&str, u64)>,
+        delay: Option<DelaySpans>,
+    ) -> Self {
+        if sched_lag >= SCHED_OVERLOAD_OVER {
+            return Self::Overload { lag, sched_lag };
+        }
+        if let Some((tag, ms)) = span {
+            return Self::Running {
+                lag,
+                tag: tag.to_string(),
+                ms,
+            };
+        }
+        match delay {
+            Some(spans) if spans.overlap_ms.saturating_mul(2) >= lag.as_millis() as u64 => {
+                Self::Owned { lag, spans }
+            }
+            Some(spans) => Self::Partial { lag, spans },
+            None => Self::Unmeasured { lag },
+        }
+    }
+
+    /// tako の専有と名指すか（過負荷・計測区間の外・内訳だけのときは偽）
+    pub fn names_tako(&self) -> bool {
+        matches!(self, Self::Running { .. } | Self::Owned { .. })
+    }
+
+    /// 表示言語を明示しての 1 行。(バリアント, 言語) の網羅 match なので、バリアントを足すと
+    /// 日英の両方を書くまでコンパイルが通らない。日本語の過負荷・継続中は #2665 より前とバイト一致
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        let lag = match self {
+            Self::Overload { lag, .. }
+            | Self::Running { lag, .. }
+            | Self::Owned { lag, .. }
+            | Self::Partial { lag, .. }
+            | Self::Unmeasured { lag } => *lag,
+        };
+        let head = match lang {
+            Ja => format!(
+                "UI ストール: foreground executor の再開が {:.2}s 遅延",
+                lag.as_secs_f64()
+            ),
+            En => format!(
+                "UI stall: the foreground executor resumed {:.2}s late",
+                lag.as_secs_f64()
+            ),
+        };
+        let lag_ms = (lag.as_millis() as u64).max(1);
+        match (self, lang) {
+            (Self::Overload { sched_lag, .. }, Ja) => format!(
+                "{head}（素の OS スレッドの sleep も {:.2}s 超過 = マシン全体の過負荷。\
+                 tako のメインスレッド専有ではない）",
+                sched_lag.as_secs_f64()
+            ),
+            (Self::Overload { sched_lag, .. }, En) => format!(
+                "{head} (a plain OS thread's sleep also overran by {:.2}s = the whole machine \
+                 is overloaded, not tako holding the main thread)",
+                sched_lag.as_secs_f64()
+            ),
+            (Self::Running { tag, ms, .. }, Ja) => format!(
+                "{head}（OS スレッドは正常。メインスレッドで {tag} が {ms}ms 継続中 = tako の専有）"
+            ),
+            (Self::Running { tag, ms, .. }, En) => format!(
+                "{head} (OS threads are fine; {tag} has been running on the main thread for \
+                 {ms}ms = held by tako)"
+            ),
+            (Self::Owned { spans: s, .. }, Ja) => format!(
+                "{head}（OS スレッドは正常。遅延の間にメインスレッドの計測区間が計 {}ms・{} 件\
+                 （最長 {}: 全長 {}ms のうち遅延の間 {}ms）= tako の専有。#1968 / #2665）",
+                s.overlap_ms, s.count, s.longest_tag, s.longest_took_ms, s.longest_overlap_ms
+            ),
+            (Self::Owned { spans: s, .. }, En) => format!(
+                "{head} (OS threads are fine; measured main-thread spans during the delay total \
+                 {}ms over {} (longest: {}, {}ms of its {}ms) = held by tako. #1968 / #2665)",
+                s.overlap_ms, s.count, s.longest_tag, s.longest_overlap_ms, s.longest_took_ms
+            ),
+            (Self::Partial { spans: s, .. }, Ja) => format!(
+                "{head}（OS スレッドは正常。遅延の間の計測区間は計 {}ms・{} 件 = 遅延の {}%\
+                 （最長 {}: 全長 {}ms のうち遅延の間 {}ms）。残り {}ms は計測区間の外か\
+                 再開経路（タイマー / キュー）側の遅延。#643 / #2665）",
+                s.overlap_ms,
+                s.count,
+                s.overlap_ms * 100 / lag_ms,
+                s.longest_tag,
+                s.longest_took_ms,
+                s.longest_overlap_ms,
+                lag_ms.saturating_sub(s.overlap_ms)
+            ),
+            (Self::Partial { spans: s, .. }, En) => format!(
+                "{head} (OS threads are fine; measured spans during the delay total {}ms over {} \
+                 = {}% of the delay (longest: {}, {}ms of its {}ms); the remaining {}ms is \
+                 outside measured spans or in the resume path (timer / queue). #643 / #2665)",
+                s.overlap_ms,
+                s.count,
+                s.overlap_ms * 100 / lag_ms,
+                s.longest_tag,
+                s.longest_overlap_ms,
+                s.longest_took_ms,
+                lag_ms.saturating_sub(s.overlap_ms)
+            ),
+            (Self::Unmeasured { .. }, Ja) => format!(
+                "{head}（OS スレッドは正常・遅延の間に計測区間なし = \
+                 計測区間の外か再開経路（タイマー / キュー）側の遅延。#643 / #2665）"
+            ),
+            (Self::Unmeasured { .. }, En) => format!(
+                "{head} (OS threads are fine; no measured span during the delay = outside \
+                 measured spans or in the resume path (timer / queue). #643 / #2665)"
+            ),
+        }
+    }
+}
+
+/// 修正前（#2665 の A/B `TAKO_2665_LEGACY=1`）の UI ストールの分類（#643 / #1968）。
+/// `recent` は「1 秒 + 遅延」の窓に**終わった**区間の全長の要約（期限より前に終わった区間も数える）。
 ///
 /// - `ui_lag`: foreground executor の再開遅延
 /// - `sched_lag`: 素の OS スレッドの sleep 超過（[`take_scheduler_lag_peak`]）
 /// - `span`: 記録時点でメインスレッドが走らせていた計測区間
-///
-/// 断定するのは根拠がある場合だけで、それ以外は「どこが遅れたか分からない」と
-/// 分かるように書く（原因を騙ると次の調査が丸ごと無駄になる）
 pub fn classify_stall(
     ui_lag: Duration,
     sched_lag: Duration,
@@ -590,6 +841,104 @@ pub fn classify_stall(
     )
 }
 
+/// ハング級（[`HANG_REPORT_AFTER`] を超えて継続中）の区間の中間報告を、区間ごとに 1 回だけ取り出す。
+/// 監視スレッドが 50ms ごとに呼ぶ（ロック中に I/O しない: 文だけ組んで返す）
+pub fn take_hang_report() -> Option<String> {
+    let mut w = watch_lock();
+    match w.current.as_mut() {
+        Some(cur) if !cur.hang_reported && cur.started.elapsed() >= HANG_REPORT_AFTER => {
+            cur.hang_reported = true;
+            Some(format!(
+                "メインスレッド長時間専有（継続中）: {} が {}ms 経過",
+                cur.tag,
+                cur.started.elapsed().as_millis()
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// #2665 の注入の口の env（[`Issue2665Inject`]。検証プロセスでだけ読む）
+pub const ISSUE2665_INJECT_FILE_ENV: &str = "TAKO_2665_INJECT_FILE";
+
+/// #2665 の検証専用の注入（`TAKO_2665_INJECT_FILE`）。env が指すファイルの中身
+/// （`out=<ms>` / `in=<ms>` / `after=<ms>`。空白区切りで並べてよい）に従い、`tako window list` の
+/// 処理でメインスレッドを塞ぐ: `out` は計測区間の**外**（IPC の受信ループで `ipc_turn` の前）、
+/// `in` は計測区間の**中**（`ipc_turn` の内側）、`after` は `ipc_turn` の区間が閉じた**直後**の外。
+/// 並べたものは out → in → after の順に途切れず続く（監視ループは間に割り込めない）。
+/// **検証プロセス（`TAKO_ISOLATED` 等。`tako_core::paths::is_verification_process`）でだけ効く**:
+/// 本番の GUI は env があっても読まない（UI スレッドを外から止められる口を本番に開けない）。
+/// env が無ければ何も読まない。隔離 GUI で UI ストールの分類を実経路で確かめるためのもの
+/// （`scripts/test-stall-window-2665.sh`）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Issue2665Inject {
+    pub out_of_span: Option<Duration>,
+    pub in_span: Option<Duration>,
+    pub after_span: Option<Duration>,
+}
+
+impl Issue2665Inject {
+    /// ファイルの中身を読む（読めない語は無視する）
+    pub fn parse(text: &str) -> Self {
+        let mut out = Self::default();
+        for word in text.split_whitespace() {
+            let Some((key, ms)) = word.split_once('=') else {
+                continue;
+            };
+            let Ok(ms) = ms.parse::<u64>() else {
+                continue;
+            };
+            match key {
+                "out" => out.out_of_span = Some(Duration::from_millis(ms)),
+                "in" => out.in_span = Some(Duration::from_millis(ms)),
+                "after" => out.after_span = Some(Duration::from_millis(ms)),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// 注入の対象の要求（`tako window list`）なら、env が指すファイルを読んで注入を決める
+    /// （検証プロセスでなければ常に何もしない）
+    pub fn for_request(target: bool) -> Self {
+        static FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
+        if !target {
+            return Self::default();
+        }
+        FILE.get_or_init(|| {
+            if !tako_core::paths::is_verification_process() {
+                return None;
+            }
+            std::env::var_os(ISSUE2665_INJECT_FILE_ENV).map(PathBuf::from)
+        })
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|text| Self::parse(&text))
+        .unwrap_or_default()
+    }
+
+    /// 計測区間の外で塞ぐ（IPC の受信ループで `ipc_turn` の前に呼ぶ）
+    pub fn block_out_of_span(&self) {
+        if let Some(d) = self.out_of_span {
+            std::thread::sleep(d);
+        }
+    }
+
+    /// 計測区間の中で塞ぐ（`ipc_turn` の区間の内側で呼ぶ）
+    pub fn block_in_span(&self) {
+        if let Some(d) = self.in_span {
+            std::thread::sleep(d);
+        }
+    }
+
+    /// 計測区間の直後に外で塞ぐ（`ipc_turn` の区間が閉じた直後に呼ぶ）
+    pub fn block_after_span(&self) {
+        if let Some(d) = self.after_span {
+            std::thread::sleep(d);
+        }
+    }
+}
+
 /// メインスレッド・ウォッチドッグを起動する（多重呼び出しは無視）。
 /// 50ms ごとに現在区間を確認し、ハング級（2 秒超え継続）を drop を待たず記録する。
 /// 同時に自分自身の sleep 超過を [`record_scheduler_lag`] へ積む（#643）。
@@ -608,24 +957,7 @@ pub fn spawn_stall_watchdog() {
                 std::thread::sleep(Duration::from_millis(50));
                 // #643: 自分の遅れ = マシン全体の混み具合。tako 側の専有では伸びない
                 record_scheduler_lag(tick.elapsed().saturating_sub(Duration::from_millis(50)));
-                // ハング級の中間報告（ロック中に I/O しない: メッセージだけ組んで出る）
-                let hang_msg = {
-                    let mut w = watch_lock();
-                    match w.current.as_mut() {
-                        Some(cur)
-                            if !cur.hang_reported && cur.started.elapsed() >= HANG_REPORT_AFTER =>
-                        {
-                            cur.hang_reported = true;
-                            Some(format!(
-                                "メインスレッド長時間専有（継続中）: {} が {}ms 経過",
-                                cur.tag,
-                                cur.started.elapsed().as_millis()
-                            ))
-                        }
-                        _ => None,
-                    }
-                };
-                if let Some(msg) = hang_msg {
+                if let Some(msg) = take_hang_report() {
                     perf_log(&msg);
                 }
                 if perf_verbose() && last_stats.elapsed() >= Duration::from_secs(10) {
@@ -820,6 +1152,171 @@ mod tests {
         let exactly = classify_stall(ui, SCHED_OVERLOAD_OVER, None, None);
         assert!(!just_under.contains("マシン全体の過負荷"), "{just_under}");
         assert!(exactly.contains("マシン全体の過負荷"), "{exactly}");
+    }
+
+    // --- #2665: 遅延の間に重なった分だけで分類する ---
+
+    /// (タグ, 終わった時刻 = 期限からのずれ ms, 全長 ms) を期限 `deadline` の前後に並べる
+    fn spans_at(
+        deadline: Instant,
+        spans: &[(&'static str, i64, u64)],
+    ) -> Vec<(&'static str, Instant, u64)> {
+        spans
+            .iter()
+            .map(|&(tag, end_ms, took)| {
+                let ended = if end_ms >= 0 {
+                    deadline + Duration::from_millis(end_ms as u64)
+                } else {
+                    deadline - Duration::from_millis(end_ms.unsigned_abs())
+                };
+                (tag, ended, took)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn 期限より前に終わった区間は遅延の間に数えない() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // 期限の 400ms 前に終わった 300ms の区間（#2665 の注入「中 300ms → 外 900ms」の形）
+        let s = spans_at(deadline, &[("ipc_turn", -400, 300)]);
+        assert_eq!(DelaySpans::summarize(s, deadline), None);
+    }
+
+    #[test]
+    fn 期限をまたぐ区間ははみ出した分だけ数える() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let s = spans_at(
+            deadline,
+            &[("ipc_turn", 1000, 1500), ("periodic_prep", 1300, 200)],
+        );
+        let d = DelaySpans::summarize(s, deadline).expect("重なりがある");
+        assert_eq!(d.longest_tag, "ipc_turn");
+        assert_eq!(d.longest_took_ms, 1500);
+        assert_eq!(d.longest_overlap_ms, 1000);
+        assert_eq!(d.overlap_ms, 1200);
+        assert_eq!(d.count, 2);
+    }
+
+    #[test]
+    fn 遅延の半分以上を説明すれば専有_届かなければ内訳と残りを書く() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let owned = StallCause::classify(
+            Duration::from_millis(1000),
+            Duration::from_millis(10),
+            None,
+            DelaySpans::summarize(spans_at(deadline, &[("ipc_turn", 1000, 1500)]), deadline),
+        );
+        assert!(owned.names_tako(), "{owned:?}");
+        let ja = owned.text_in(tako_core::i18n::Lang::Ja);
+        assert!(ja.contains("tako の専有"), "{ja}");
+        assert!(ja.contains("全長 1500ms のうち遅延の間 1000ms"), "{ja}");
+
+        // 外 1200ms（期限は 300ms の位置）の直後に中 400ms = 遅延 1.3 秒のうち 400ms だけ測れている
+        let partial = StallCause::classify(
+            Duration::from_millis(1300),
+            Duration::from_millis(10),
+            None,
+            DelaySpans::summarize(spans_at(deadline, &[("ipc_turn", 1300, 400)]), deadline),
+        );
+        assert!(!partial.names_tako(), "{partial:?}");
+        let ja = partial.text_in(tako_core::i18n::Lang::Ja);
+        assert!(!ja.contains("tako の専有"), "騙らない: {ja}");
+        assert!(ja.contains("遅延の 30%"), "{ja}");
+        assert!(ja.contains("残り 900ms は計測区間の外"), "捨てない: {ja}");
+        let en = partial.text_in(tako_core::i18n::Lang::En);
+        assert!(en.contains("30% of the delay"), "{en}");
+        assert!(en.contains("remaining 900ms"), "{en}");
+        assert!(!en.contains("held by tako"), "{en}");
+
+        let none = StallCause::classify(
+            Duration::from_millis(600),
+            Duration::from_millis(10),
+            None,
+            None,
+        );
+        assert_eq!(
+            none,
+            StallCause::Unmeasured {
+                lag: Duration::from_millis(600)
+            }
+        );
+        assert!(none
+            .text_in(tako_core::i18n::Lang::Ja)
+            .contains("遅延の間に計測区間なし = 計測区間の外"));
+    }
+
+    #[test]
+    fn 過負荷と継続中の日本語は修正前とバイト一致() {
+        let lag = Duration::from_millis(1234);
+        for (sched, span) in [
+            (SCHED_OVERLOAD_OVER, None),
+            (Duration::from_millis(10), Some(("dispatch:Mod", 812))),
+        ] {
+            assert_eq!(
+                StallCause::classify(lag, sched, span, None).text_in(tako_core::i18n::Lang::Ja),
+                classify_stall(lag, sched, span, None)
+            );
+        }
+    }
+
+    #[test]
+    fn 分類の文は日英どちらも頭と数値を持つ() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let d = || DelaySpans::summarize(spans_at(deadline, &[("render", 500, 900)]), deadline);
+        let lag = Duration::from_millis(2000);
+        let causes = [
+            StallCause::classify(lag, SCHED_OVERLOAD_OVER, None, None),
+            StallCause::classify(lag, Duration::ZERO, Some(("render", 700)), None),
+            StallCause::classify(Duration::from_millis(800), Duration::ZERO, None, d()),
+            StallCause::classify(lag, Duration::ZERO, None, d()),
+            StallCause::classify(lag, Duration::ZERO, None, None),
+        ];
+        let kinds: Vec<_> = causes.iter().map(std::mem::discriminant).collect();
+        for (i, k) in kinds.iter().enumerate() {
+            assert!(!kinds[..i].contains(k), "5 種を 1 つずつ: {causes:?}");
+        }
+        for c in &causes {
+            let ja = c.text_in(tako_core::i18n::Lang::Ja);
+            let en = c.text_in(tako_core::i18n::Lang::En);
+            assert!(
+                ja.starts_with("UI ストール: foreground executor の再開が"),
+                "{ja}"
+            );
+            assert!(
+                en.starts_with("UI stall: the foreground executor resumed"),
+                "{en}"
+            );
+            assert!(
+                !en.chars().any(|ch| ('\u{3040}'..='\u{30ff}').contains(&ch)),
+                "{en}"
+            );
+        }
+    }
+
+    #[test]
+    fn 注入のファイルは外と中の_ms_を読む() {
+        assert_eq!(Issue2665Inject::parse(""), Issue2665Inject::default());
+        assert_eq!(
+            Issue2665Inject::parse("out=1200 in=400\n"),
+            Issue2665Inject {
+                out_of_span: Some(Duration::from_millis(1200)),
+                in_span: Some(Duration::from_millis(400)),
+                after_span: None,
+            }
+        );
+        assert_eq!(
+            Issue2665Inject::parse("in=300 junk out=x after=900"),
+            Issue2665Inject {
+                out_of_span: None,
+                in_span: Some(Duration::from_millis(300)),
+                after_span: Some(Duration::from_millis(900)),
+            }
+        );
+        // 対象外の要求はファイルを読まない
+        assert_eq!(
+            Issue2665Inject::for_request(false),
+            Issue2665Inject::default()
+        );
     }
 
     #[test]
