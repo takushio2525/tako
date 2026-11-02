@@ -6029,6 +6029,8 @@ fn orchestrator_run(
 /// `tako orchestrator projects` — CLI 版プロジェクト管理
 fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
     init_local_lang();
+    // 人向けの行は表示言語（#2365。文は `ReplyNote` の 1 か所）
+    let lang = cli_lang();
     match sub {
         // list も読み取りだが MCP と同じ 1 本を通す。#1544 まで CLI 側だけ
         // 設定ファイルの直読みが残っていた。出力は一致していたが、**同じ関数に
@@ -6040,8 +6042,8 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
                     .map_err(local_dispatch_err)?;
             let projects = res["projects"].as_array().cloned().unwrap_or_default();
             if projects.is_empty() {
-                eprintln!("登録済みプロジェクトはありません。");
-                eprintln!("追加: tako orchestrator projects add --key <名前> --cwd <パス>");
+                eprintln!("{}", ReplyNote::ProjectsNone.text_in(lang));
+                eprintln!("{}", ReplyNote::ProjectsAddHint.text_in(lang));
             } else {
                 for p in &projects {
                     println!(
@@ -6056,7 +6058,8 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
                         .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
                         .unwrap_or_default();
                     if !mcp.is_empty() {
-                        println!("{:<16} worker の MCP: tako + {}", "", mcp.join(", "));
+                        let line = ReplyNote::ProjectWorkerMcp(mcp.join(", "));
+                        println!("{:<16} {}", "", line.text_in(lang));
                     }
                 }
             }
@@ -6076,27 +6079,34 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
                 description.clone(),
             )
             .map_err(local_dispatch_err)?;
-            eprintln!("追加しました: {key} → {cwd}");
+            let added = ReplyNote::ProjectAdded {
+                key: key.clone(),
+                cwd: cwd.clone(),
+            };
+            eprintln!("{}", added.text_in(lang));
             // #1825: 黙らせてはいけない理由（default を継承できなかった等）。
             // 同じ文が profile_note にも載るので、そちらは重ねて出さない
             let warnings: Vec<&str> = res["warnings"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|w| w.as_str()).collect())
                 .unwrap_or_default();
-            let note = res["profile_note"].as_str().unwrap_or("理由不明");
+            let note = res["profile_note"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| ReplyNote::ProjectProfileNoteMissing.text_in(lang));
             // 専用プロファイルの生成結果も見せる（黙って作らない / 黙って作らないでもない）
             match res["profile_generation"].as_str() {
-                Some("created") => eprintln!(
-                    "専用プロファイルを作りました: {}（default から継承）",
-                    res["profile_path"].as_str().unwrap_or("")
-                ),
-                Some("skipped") if !warnings.contains(&note) => {
-                    eprintln!("専用プロファイルは作りませんでした: {note}")
+                Some("created") => {
+                    let path = res["profile_path"].as_str().unwrap_or("").to_string();
+                    eprintln!("{}", ReplyNote::ProjectProfileCreated(path).text_in(lang))
+                }
+                Some("skipped") if !warnings.contains(&note.as_str()) => {
+                    eprintln!("{}", ReplyNote::ProjectProfileSkipped(note).text_in(lang))
                 }
                 _ => {}
             }
             for w in &warnings {
-                eprintln!("{}: {w}", ReplyNote::WarningLabel.text_in(cli_lang()));
+                eprintln!("{}: {w}", ReplyNote::WarningLabel.text_in(lang));
             }
             Ok(())
         }
@@ -6108,7 +6118,7 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
                 None,
             )
             .map_err(local_dispatch_err)?;
-            eprintln!("削除しました: {key}");
+            eprintln!("{}", ReplyNote::ProjectRemoved(key.clone()).text_in(lang));
             Ok(())
         }
         // #2412: MCP と同じ 1 本（dispatch_orchestrator_projects_mcp）を通す
@@ -6124,61 +6134,72 @@ fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
                 servers.clone(),
             )
             .map_err(local_dispatch_err)?;
-            print_project_mcp(key, &res);
+            print_project_mcp(key, &res, lang);
             Ok(())
         }
     }
 }
 
-/// `tako orchestrator projects mcp` の表示（設定・今 spawn したときの構成・警告）
-fn print_project_mcp(key: &str, res: &serde_json::Value) {
+/// `tako orchestrator projects mcp` の表示（設定・今 spawn したときの構成・警告）。
+/// 行は表示言語（#2365。文は `ReplyNote` の 1 か所・字下げはここ）
+fn print_project_mcp(key: &str, res: &serde_json::Value, lang: tako_core::i18n::Lang) {
     let list = |v: &serde_json::Value| -> String {
         let names: Vec<&str> = v
             .as_array()
             .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
             .unwrap_or_default();
         if names.is_empty() {
-            "（なし）".to_string()
+            ReplyNote::ProjectMcpNone.text_in(lang)
         } else {
             names.join(", ")
         }
     };
     if let Some(added) = res.get("added") {
-        eprintln!("足しました: {}", list(added));
+        eprintln!("{}", ReplyNote::ProjectMcpAdded(list(added)).text_in(lang));
     }
     if let Some(removed) = res.get("removed") {
-        eprintln!("外しました: {}", list(removed));
+        eprintln!(
+            "{}",
+            ReplyNote::ProjectMcpRemoved(list(removed)).text_in(lang)
+        );
     }
     let plan = &res["plan"];
+    let configured = ReplyNote::ProjectMcpConfigured {
+        key: key.to_string(),
+        list: list(&res["mcp_servers"]),
+    };
+    println!("{}", configured.text_in(lang));
     println!(
-        "{key} の worker へ持ち込む user scope の MCP: {}",
-        list(&res["mcp_servers"])
+        "  {}",
+        ReplyNote::ProjectMcpKept(list(&plan["kept"])).text_in(lang)
     );
-    println!("  今 spawn すると持ち込む: tako + {}", list(&plan["kept"]));
-    println!("  止める（user scope）: {}", list(&plan["denied"]));
+    println!(
+        "  {}",
+        ReplyNote::ProjectMcpDenied(list(&plan["denied"])).text_in(lang)
+    );
     if plan["shadowed"].as_array().is_some_and(|a| !a.is_empty()) {
         println!(
-            "  プロジェクトの .mcp.json と同名なので止めない: {}",
-            list(&plan["shadowed"])
+            "  {}",
+            ReplyNote::ProjectMcpShadowed(list(&plan["shadowed"])).text_in(lang)
         );
     }
     // #2418: codex の worker（codex の設定がある機だけ応答に載る）
     let codex = &res["codex_plan"];
     if codex.is_object() {
         println!(
-            "  codex の worker で止める（config.toml）: {}",
-            list(&codex["denied"])
+            "  {}",
+            ReplyNote::ProjectMcpCodexDenied(list(&codex["denied"])).text_in(lang)
         );
         if codex["shadowed"].as_array().is_some_and(|a| !a.is_empty()) {
             println!(
-                "  codex: プロジェクトの .codex/config.toml と同名なので止めない: {}",
-                list(&codex["shadowed"])
+                "  {}",
+                ReplyNote::ProjectMcpCodexShadowed(list(&codex["shadowed"])).text_in(lang)
             );
         }
     }
     for w in res["warnings"].as_array().into_iter().flatten() {
         if let Some(w) = w.as_str() {
-            eprintln!("警告: {w}");
+            eprintln!("{}: {w}", ReplyNote::WarningLabel.text_in(lang));
         }
     }
 }
@@ -7516,17 +7537,20 @@ fn orchestrator_guide_local(
     match out["text"].as_str() {
         // 全文はそのまま出す（移動前のブロックと diff が取れる形にしておく）
         Some(text) => print!("{text}"),
+        // 一覧の枠は表示言語（#2365。文は `ReplyNote` の 1 か所。topic の title は英語の固定、hint は前から表示言語）
         None => {
+            let lang = cli_lang();
             let empty = vec![];
-            println!("引ける手順書: {} 件", out["count"].as_u64().unwrap_or(0));
+            let count = ReplyNote::GuideCount(out["count"].as_u64().unwrap_or(0));
+            println!("{}", count.text_in(lang));
             for g in out["topics"].as_array().unwrap_or(&empty) {
-                println!(
-                    "  {:<16} {:>6} bytes / 約 {:>5} tok  {}",
-                    g["topic"].as_str().unwrap_or("?"),
-                    g["bytes"].as_u64().unwrap_or(0),
-                    g["est_tokens"].as_u64().unwrap_or(0),
-                    g["title"].as_str().unwrap_or("")
-                );
+                let row = ReplyNote::GuideRow {
+                    topic: g["topic"].as_str().unwrap_or("?").to_string(),
+                    bytes: g["bytes"].as_u64().unwrap_or(0),
+                    est_tokens: g["est_tokens"].as_u64().unwrap_or(0),
+                    title: g["title"].as_str().unwrap_or("").to_string(),
+                };
+                println!("  {}", row.text_in(lang));
             }
             if let Some(hint) = out["hint"].as_str() {
                 println!("\n{hint}");
@@ -12832,6 +12856,21 @@ fn cli_lang() -> tako_core::i18n::Lang {
     tako_control::settings::peek_lang_setting().resolve()
 }
 
+/// `tako sessions resume` の表示: 復元した 1 行（stderr・表示言語。#2365）+ 応答の JSON（stdout）
+fn print_sessions_resume(result: &Value) {
+    if let (Some(pane), Some(sid)) = (result["pane"].as_u64(), result["session_id"].as_str()) {
+        // session_id は型の上で ASCII の保証が無いので文字単位で先頭を取る（#1746）
+        let head: String = sid.chars().take(8).collect();
+        let line = ReplyNote::SessionResumed {
+            pane,
+            head,
+            cwd: result["cwd"].as_str().unwrap_or("-").to_string(),
+        };
+        eprintln!("{}", line.text_in(cli_lang()));
+    }
+    println!("{result}");
+}
+
 /// `tako sessions list` の人間向け表示（1 セッション 1 行 + pending 節）
 fn print_sessions_list(result: &Value) {
     let sessions = result["sessions"].as_array().cloned().unwrap_or_default();
@@ -12948,6 +12987,8 @@ fn print_todo_expanded(result: &Value) {
 }
 
 fn print_todo_detail(result: &Value) {
+    // 枠（添付・コピー用・リンク・返答・配送）は表示言語（#2365。文は `ReplyNote` の 1 か所・字下げはここ）
+    let lang = cli_lang();
     println!(
         "{} [{}/{}] {}",
         result["id"].as_str().unwrap_or("-"),
@@ -12959,60 +13000,65 @@ fn print_todo_detail(result: &Value) {
         println!("{body}");
     }
     for a in result["attachments"].as_array().unwrap_or(&Vec::new()) {
-        let mark = if a["exists"].as_bool() == Some(true) {
-            ""
-        } else {
-            "（見つからない）"
+        let line = ReplyNote::TodoAttachment {
+            path: a["path"].as_str().unwrap_or("-").to_string(),
+            exists: a["exists"].as_bool() == Some(true),
         };
-        println!("  添付: {}{mark}", a["path"].as_str().unwrap_or("-"));
+        println!("  {}", line.text_in(lang));
     }
     for c in result["copy_texts"].as_array().unwrap_or(&Vec::new()) {
-        let label = c["label"].as_str().unwrap_or("");
-        let head: String = c["text"].as_str().unwrap_or("").chars().take(40).collect();
-        println!("  コピー用[{label}]: {head}");
+        let line = ReplyNote::TodoCopyText {
+            label: c["label"].as_str().unwrap_or("").to_string(),
+            head: c["text"].as_str().unwrap_or("").chars().take(40).collect(),
+        };
+        println!("  {}", line.text_in(lang));
     }
     for l in result["links"].as_array().unwrap_or(&Vec::new()) {
-        println!("  リンク: {}", l.as_str().unwrap_or("-"));
+        let line = ReplyNote::TodoLink(l.as_str().unwrap_or("-").to_string());
+        println!("  {}", line.text_in(lang));
     }
     // #2016: やりとりは古い順（積んだ順）に、時刻つきで出す。時刻の表記は右パネルと同じ
     // 1 実装（`user_task::response_stamp`）。複数行の本文は 2 行目以降を字下げして続ける
     let now = tako_core::user_task::unix_now();
     let offset = tako_core::platform::clock::local_utc_offset();
     for r in result["responses"].as_array().unwrap_or(&Vec::new()) {
-        print!("{}", todo_response_text(r, now, offset));
+        print!("{}", todo_response_text(r, now, offset, lang));
     }
     if let Some(d) = result["delivery"].as_object() {
-        let reason = d
-            .get("reason")
-            .and_then(Value::as_str)
-            .map(|r| format!("（{r}）"))
-            .unwrap_or_default();
-        println!(
-            "  配送: {}{reason} pane:{}",
-            d.get("state").and_then(Value::as_str).unwrap_or("-"),
-            d.get("pane")
+        let line = ReplyNote::TodoDelivery {
+            state: d
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+                .to_string(),
+            reason: d.get("reason").and_then(Value::as_str).map(str::to_string),
+            pane: d
+                .get("pane")
                 .and_then(Value::as_u64)
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "-".into()),
-        );
+        };
+        println!("  {}", line.text_in(lang));
     }
 }
 
 /// やりとり 1 件の行（`tako todo show` の既定出力。#2016。機械検証できるよう印字と分けてある）。
-/// `  返答 11:02 [pc] needs_change: 本文` の形で、本文の 2 行目以降は字下げして続ける
-fn todo_response_text(r: &Value, now: i64, utc_offset: i32) -> String {
+/// `  返答 11:02 [pc] needs_change: 本文` の形で、本文の 2 行目以降は字下げして続ける。
+/// 枠（`返答`）は `lang`（#2365）
+fn todo_response_text(r: &Value, now: i64, utc_offset: i32, lang: tako_core::i18n::Lang) -> String {
     let stamp = r["at"]
         .as_i64()
         .map(|at| tako_core::user_task::response_stamp(at, now, utc_offset))
         .unwrap_or_else(|| "-".to_string());
     let comment = r["comment"].as_str().unwrap_or("");
     let mut lines = comment.lines();
-    let mut out = format!(
-        "  返答 {stamp} [{}] {}: {}\n",
-        r["via"].as_str().unwrap_or("-"),
-        r["decision"].as_str().unwrap_or("-"),
-        lines.next().unwrap_or(""),
-    );
+    let first = ReplyNote::TodoResponse {
+        stamp,
+        via: r["via"].as_str().unwrap_or("-").to_string(),
+        decision: r["decision"].as_str().unwrap_or("-").to_string(),
+        first_line: lines.next().unwrap_or("").to_string(),
+    };
+    let mut out = format!("  {}\n", first.text_in(lang));
     for rest in lines {
         out.push_str(&format!("      {rest}\n"));
     }
@@ -14257,19 +14303,7 @@ fn print_result(command: &Command, result: &Value) {
                 }
             }
         }
-        Command::Sessions(SessionsCommand::Resume { .. }) => {
-            if let (Some(pane), Some(sid)) =
-                (result["pane"].as_u64(), result["session_id"].as_str())
-            {
-                // session_id は型の上で ASCII の保証が無いので文字単位で先頭を取る（#1746）
-                let head: String = sid.chars().take(8).collect();
-                eprintln!(
-                    "復元しました: ペイン {pane}（session {head}…, cwd {}）",
-                    result["cwd"].as_str().unwrap_or("-"),
-                );
-            }
-            println!("{result}");
-        }
+        Command::Sessions(SessionsCommand::Resume { .. }) => print_sessions_resume(result),
         Command::Logs(LogsCommand::Show { .. }) => {
             if let Some(content) = result["content"].as_str() {
                 println!("{content}");
@@ -17166,6 +17200,7 @@ mod tests {
     /// #2016: `tako todo show` のやりとりは時刻つきで、複数行の本文は字下げして続く
     #[test]
     fn todo_showのやりとりは時刻つきで複数行を字下げする() {
+        use tako_core::i18n::Lang;
         // 2026-10-13 02:02:00 UTC
         let at = 1_791_856_920;
         let r = serde_json::json!({
@@ -17173,20 +17208,25 @@ mod tests {
             "comment": "サムネを大きく\n文字も太く",
         });
         assert_eq!(
-            todo_response_text(&r, at + 60, 9 * 3_600),
+            todo_response_text(&r, at + 60, 9 * 3_600, Lang::Ja),
             "  返答 11:02 [pc] needs_change: サムネを大きく\n      文字も太く\n"
+        );
+        // #2365: 英語表示は枠だけ英語（本文・時刻・via・判断・続きの字下げは同じ）
+        assert_eq!(
+            todo_response_text(&r, at + 60, 9 * 3_600, Lang::En),
+            "  Reply 11:02 [pc] needs_change: サムネを大きく\n      文字も太く\n"
         );
         // 本文が空でも 1 行出る（判断だけの返答）
         let bare =
             serde_json::json!({"decision": "approve", "via": "pwa", "at": at, "comment": ""});
         assert_eq!(
-            todo_response_text(&bare, at + 86_400, 0),
+            todo_response_text(&bare, at + 86_400, 0, Lang::Ja),
             "  返答 10/13 02:02 [pwa] approve: \n"
         );
         // `at` が読めない応答でも落ちない
         let broken = serde_json::json!({"decision": "answered"});
         assert_eq!(
-            todo_response_text(&broken, at, 0),
+            todo_response_text(&broken, at, 0, Lang::Ja),
             "  返答 - [-] answered: \n"
         );
     }

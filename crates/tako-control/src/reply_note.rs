@@ -25,7 +25,12 @@
 //! `ModelObservation::warning`。旧 `tako_core::model_check::mismatch_warning`）も同じ形で持つ。
 //! 引き継ぎの応答のほかの文（移行の 1 行サマリ `MigrationOutcome::summary`・運用メモの肥大
 //! `handoff_store::memo_warning`。旧 `tako_core::handoff::profile_memo_warning`）と `workers` 一覧の
-//! `resend_command`（`registry::resend_command`。プレースホルダだけ表示言語）も組む側は型を返す
+//! `resend_command`（`registry::resend_command`。プレースホルダだけ表示言語）も組む側は型を返す。
+//!
+//! CLI の人向けの表示（JSON でない出力の枠・見出し・ラベル）のうち、`tako orchestrator projects`
+//! （list / add / remove / mcp）・`tako orchestrator guide` の一覧・`tako sessions resume` の復元の行・
+//! `tako todo show` ほか 1 件の詳細の枠もここが持つ。字下げ・桁揃えの空白は CLI が付け、`--json` の
+//! 出力と応答の値は変えない
 
 use tako_core::handoff::{HANDOFF_PROJECTS_DIR, PROFILE_MEMO_SOFT_LIMIT_LINES};
 use tako_core::i18n::Lang;
@@ -356,6 +361,77 @@ pub enum ReplyNote {
     /// `workers` 一覧の `resend_command`（未達 worker へ同じ依頼文を送り直すテンプレート）。
     /// コピーして打つコマンドなので、表示言語に従うのはプレースホルダだけ（本体と引用は同じ）
     ResendCommand { pane: u64 },
+
+    // ---- CLI の人向けの表示: orchestrator projects / guide の一覧 / sessions resume / todo show ----
+    // 字下げの空白は呼び手（CLI `main.rs`）が付ける。値（キー・パス・名前・件数）は表記のまま
+    /// `tako orchestrator projects list`: 登録が無い
+    ProjectsNone,
+    /// `tako orchestrator projects list`: 登録が無いときの次の一手（コマンドはプレースホルダだけ表示言語）
+    ProjectsAddHint,
+    /// `tako orchestrator projects list`: worker へ持ち込む MCP の行（`list` は `, ` で連ねた名前）
+    ProjectWorkerMcp(String),
+    /// `tako orchestrator projects add`: 追加した
+    ProjectAdded { key: String, cwd: String },
+    /// `tako orchestrator projects add`: 専用プロファイルを作った（`path` はプロファイルのパス）
+    ProjectProfileCreated(String),
+    /// `tako orchestrator projects add`: 専用プロファイルを作らなかった（`note` は応答の理由の文）
+    ProjectProfileSkipped(String),
+    /// `tako orchestrator projects add`: 理由の文が応答に無いときの埋め草
+    ProjectProfileNoteMissing,
+    /// `tako orchestrator projects remove`: 削除した
+    ProjectRemoved(String),
+    /// `tako orchestrator projects mcp`: 名前の並びが空
+    ProjectMcpNone,
+    /// `tako orchestrator projects mcp add`: 足した（`list` は名前の並び）
+    ProjectMcpAdded(String),
+    /// `tako orchestrator projects mcp remove`: 外した（`list` は名前の並び）
+    ProjectMcpRemoved(String),
+    /// `tako orchestrator projects mcp`: 設定の見出し（`list` は名前の並び）
+    ProjectMcpConfigured { key: String, list: String },
+    /// `tako orchestrator projects mcp`: 今 spawn すると持ち込む
+    ProjectMcpKept(String),
+    /// `tako orchestrator projects mcp`: 止める（user scope）
+    ProjectMcpDenied(String),
+    /// `tako orchestrator projects mcp`: プロジェクトの .mcp.json と同名なので止めない
+    ProjectMcpShadowed(String),
+    /// `tako orchestrator projects mcp`: codex の worker で止める（config.toml）
+    ProjectMcpCodexDenied(String),
+    /// `tako orchestrator projects mcp`: codex のプロジェクトの .codex/config.toml と同名なので止めない
+    ProjectMcpCodexShadowed(String),
+    /// `tako orchestrator guide`（topic 無し）: 件数の見出し
+    GuideCount(u64),
+    /// `tako orchestrator guide`（topic 無し）: 1 topic の行（桁揃えはこの中。字下げは呼び手）
+    GuideRow {
+        topic: String,
+        bytes: u64,
+        est_tokens: u64,
+        title: String,
+    },
+    /// `tako sessions resume`: 復元した（`head` は会話 ID の先頭）
+    SessionResumed {
+        pane: u64,
+        head: String,
+        cwd: String,
+    },
+    /// `tako todo show`: 添付の行（`exists` が偽なら見つからない印を付ける）
+    TodoAttachment { path: String, exists: bool },
+    /// `tako todo show`: コピー用テキストの行（`head` は本文の先頭）
+    TodoCopyText { label: String, head: String },
+    /// `tako todo show`: 関連 URL の行
+    TodoLink(String),
+    /// `tako todo show`: やりとり 1 件の 1 行目（`first_line` は本文の 1 行目）
+    TodoResponse {
+        stamp: String,
+        via: String,
+        decision: String,
+        first_line: String,
+    },
+    /// `tako todo show`: 配送の行（`reason` は応答の `delivery.reason`）
+    TodoDelivery {
+        state: String,
+        reason: Option<String>,
+        pane: String,
+    },
 }
 
 impl ReplyNote {
@@ -1408,6 +1484,158 @@ impl ReplyNote {
             (Self::ResendCommand { pane }, En) => {
                 format!("tako send --pane {pane} '<same prompt>'")
             }
+            (Self::ProjectsNone, Ja) => "登録済みプロジェクトはありません。".into(),
+            (Self::ProjectsNone, En) => "No projects are registered.".into(),
+            (Self::ProjectsAddHint, Ja) => {
+                "追加: tako orchestrator projects add --key <名前> --cwd <パス>".into()
+            }
+            (Self::ProjectsAddHint, En) => {
+                "Add one: tako orchestrator projects add --key <name> --cwd <path>".into()
+            }
+            (Self::ProjectWorkerMcp(list), Ja) => format!("worker の MCP: tako + {list}"),
+            (Self::ProjectWorkerMcp(list), En) => format!("worker MCP: tako + {list}"),
+            (Self::ProjectAdded { key, cwd }, Ja) => format!("追加しました: {key} → {cwd}"),
+            (Self::ProjectAdded { key, cwd }, En) => format!("Added: {key} → {cwd}"),
+            (Self::ProjectProfileCreated(path), Ja) => {
+                format!("専用プロファイルを作りました: {path}（default から継承）")
+            }
+            (Self::ProjectProfileCreated(path), En) => {
+                format!("Created a dedicated profile: {path} (inherits from default)")
+            }
+            (Self::ProjectProfileSkipped(note), Ja) => {
+                format!("専用プロファイルは作りませんでした: {note}")
+            }
+            (Self::ProjectProfileSkipped(note), En) => {
+                format!("Did not create a dedicated profile: {note}")
+            }
+            (Self::ProjectProfileNoteMissing, Ja) => "理由不明".into(),
+            (Self::ProjectProfileNoteMissing, En) => "unknown reason".into(),
+            (Self::ProjectRemoved(key), Ja) => format!("削除しました: {key}"),
+            (Self::ProjectRemoved(key), En) => format!("Removed: {key}"),
+            (Self::ProjectMcpNone, Ja) => "（なし）".into(),
+            (Self::ProjectMcpNone, En) => "(none)".into(),
+            (Self::ProjectMcpAdded(list), Ja) => format!("足しました: {list}"),
+            (Self::ProjectMcpAdded(list), En) => format!("Added: {list}"),
+            (Self::ProjectMcpRemoved(list), Ja) => format!("外しました: {list}"),
+            (Self::ProjectMcpRemoved(list), En) => format!("Removed: {list}"),
+            (Self::ProjectMcpConfigured { key, list }, Ja) => {
+                format!("{key} の worker へ持ち込む user scope の MCP: {list}")
+            }
+            (Self::ProjectMcpConfigured { key, list }, En) => {
+                format!("User-scope MCP servers carried into {key}'s workers: {list}")
+            }
+            (Self::ProjectMcpKept(list), Ja) => format!("今 spawn すると持ち込む: tako + {list}"),
+            (Self::ProjectMcpKept(list), En) => {
+                format!("Carried in if spawned now: tako + {list}")
+            }
+            (Self::ProjectMcpDenied(list), Ja) => format!("止める（user scope）: {list}"),
+            (Self::ProjectMcpDenied(list), En) => format!("Blocked (user scope): {list}"),
+            (Self::ProjectMcpShadowed(list), Ja) => {
+                format!("プロジェクトの .mcp.json と同名なので止めない: {list}")
+            }
+            (Self::ProjectMcpShadowed(list), En) => {
+                format!("Not blocked (same name as in the project's .mcp.json): {list}")
+            }
+            (Self::ProjectMcpCodexDenied(list), Ja) => {
+                format!("codex の worker で止める（config.toml）: {list}")
+            }
+            (Self::ProjectMcpCodexDenied(list), En) => {
+                format!("Blocked in codex workers (config.toml): {list}")
+            }
+            (Self::ProjectMcpCodexShadowed(list), Ja) => {
+                format!("codex: プロジェクトの .codex/config.toml と同名なので止めない: {list}")
+            }
+            (Self::ProjectMcpCodexShadowed(list), En) => format!(
+                "codex: not blocked (same name as in the project's .codex/config.toml): {list}"
+            ),
+            (Self::GuideCount(n), Ja) => format!("引ける手順書: {n} 件"),
+            (Self::GuideCount(n), En) => format!("Available guides: {n}"),
+            (
+                Self::GuideRow {
+                    topic,
+                    bytes,
+                    est_tokens,
+                    title,
+                },
+                Ja,
+            ) => format!("{topic:<16} {bytes:>6} bytes / 約 {est_tokens:>5} tok  {title}"),
+            (
+                Self::GuideRow {
+                    topic,
+                    bytes,
+                    est_tokens,
+                    title,
+                },
+                En,
+            // 「約」の代わりの `~` は数字に付けて右へ寄せる（列の幅は英語の行どうしで揃う）
+            ) => format!(
+                "{topic:<16} {bytes:>6} bytes / {:>6} tok  {title}",
+                format!("~{est_tokens}")
+            ),
+            (Self::SessionResumed { pane, head, cwd }, Ja) => {
+                format!("復元しました: ペイン {pane}（session {head}…, cwd {cwd}）")
+            }
+            (Self::SessionResumed { pane, head, cwd }, En) => {
+                format!("Resumed: pane {pane} (session {head}…, cwd {cwd})")
+            }
+            (Self::TodoAttachment { path, exists }, Ja) => format!(
+                "添付: {path}{}",
+                if *exists { "" } else { "（見つからない）" }
+            ),
+            (Self::TodoAttachment { path, exists }, En) => format!(
+                "Attachment: {path}{}",
+                if *exists { "" } else { " (not found)" }
+            ),
+            (Self::TodoCopyText { label, head }, Ja) => format!("コピー用[{label}]: {head}"),
+            (Self::TodoCopyText { label, head }, En) => format!("Copy text[{label}]: {head}"),
+            (Self::TodoLink(url), Ja) => format!("リンク: {url}"),
+            (Self::TodoLink(url), En) => format!("Link: {url}"),
+            (
+                Self::TodoResponse {
+                    stamp,
+                    via,
+                    decision,
+                    first_line,
+                },
+                Ja,
+            ) => format!("返答 {stamp} [{via}] {decision}: {first_line}"),
+            (
+                Self::TodoResponse {
+                    stamp,
+                    via,
+                    decision,
+                    first_line,
+                },
+                En,
+            ) => format!("Reply {stamp} [{via}] {decision}: {first_line}"),
+            (
+                Self::TodoDelivery {
+                    state,
+                    reason,
+                    pane,
+                },
+                Ja,
+            ) => format!(
+                "配送: {state}{} pane:{pane}",
+                reason
+                    .as_deref()
+                    .map(|r| format!("（{r}）"))
+                    .unwrap_or_default()
+            ),
+            (
+                Self::TodoDelivery {
+                    state,
+                    reason,
+                    pane,
+                },
+                En,
+            ) => format!(
+                "Delivery: {state}{} pane:{pane}",
+                reason
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default()
+            ),
         }
     }
 }
