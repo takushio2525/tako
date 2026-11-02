@@ -702,6 +702,17 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   （`FileOutcome::Failed`）・stderr の診断（`launch_warning` / 引き継ぎの事前信頼の失敗）は `text_in(Lang::Ja)`** で
   修正前とバイト一致。番犬は同じ `issue1762_dispatch_error_lang.rs`（`ConfigError` / `ReplyNote` の表と
   `TrustWriteError` の節。読めないプロファイルの理由の番犬 `ja_fixed_outside_log` は `eprintln!` の行も診断として外す）
+- 同じ続きで、**引き継ぎの応答のほかの文と `workers` 一覧の `resend_command`** も型で返す。移行の 1 行サマリ
+  （`MigrationOutcome::summary` = `handoffs migrate` の `summaries`）は `ReplyNote::HandoffMigrated`、運用メモの肥大
+  （`handoffs` の list / show / write の `warning`・`orchestrator self` と引き継ぎの `warnings`）は
+  `ReplyNote::ProfileMemoOversized`（組む口は `handoff_store::memo_warning`。tako-core には判定
+  `handoff::profile_memo_oversized` だけを残し、文の `profile_memo_warning(_in)` は外した。この文は前から表示言語で
+  組んでいたので出力は日英とも変わらない）、未達 worker への再送コマンドは `ReplyNote::ResendCommand`
+  （`registry::resend_command`）。**再送コマンドはコピーして打つので表示言語に従うのはプレースホルダだけ**
+  （日本語 `<同じ依頼文>` / 英語 `<same prompt>`。本体・引用・ペイン番号は同じ。`worker_status` には前から
+  `resend_command` の鍵が無い）。番犬は同じ `issue1762_dispatch_error_lang.rs`（`ReplyNote` の表に旧文・
+  `NOTE_ITEM_SCOPES` と dispatch の `handoffs` の関数・応答の文にする口で `text_in(Lang::Ja)` に固定するのを名指す
+  `NOTE_LANG_FIXED_SCOPES`）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

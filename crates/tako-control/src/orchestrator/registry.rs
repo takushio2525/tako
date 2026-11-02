@@ -1088,12 +1088,14 @@ fn record_prompt_delivery_at(
 
 /// 未達 worker へプロンプトを送り直すコマンド（Issue #530 / #390 の再送導線）。
 /// prompt 本文は tako 側に残っていないため（規約により保存しない）、master が
-/// 同じ依頼文を渡し直す前提のテンプレートを返す
-pub fn resend_command(entry: &WorkerEntry) -> Option<String> {
+/// 同じ依頼文を渡し直す前提のテンプレートを返す。
+///
+/// 型で返し、載せる側が表示言語の文にする（プレースホルダだけ表示言語。#2365）
+pub fn resend_command(entry: &WorkerEntry) -> Option<crate::ReplyNote> {
     if !entry.is_active() {
         return None;
     }
-    Some(format!("tako send --pane {} '<同じ依頼文>'", entry.pane))
+    Some(crate::ReplyNote::ResendCommand { pane: entry.pane })
 }
 
 /// 突然死からの復旧コマンド（#390: SIGSEGV 等の突然死からの復旧提示）。claude の worker で
@@ -1564,10 +1566,11 @@ pub fn list_payload(
             "limit_resume": pane_alive.then(|| limit_resume_panes.contains(&e.pane)),
             // 未達 worker にだけ再送コマンドを出す（#530 の受け入れ条件 3）。
             // #1940: 起動に失敗した worker へ依頼文を再送しても届かない（エージェントが
-            // 居ない）ので出さない。次の一手は起動のやり直し
+            // 居ない）ので出さない。次の一手は起動のやり直し。
+            // 表示言語で組む（プレースホルダだけ。#2365）
             "resend_command": match delivery {
                 PromptDelivery::OverdueSuspect if e.launch_failed_at.is_none() => {
-                    resend_command(e)
+                    resend_command(e).map(String::from)
                 }
                 _ => None,
             },
@@ -2281,9 +2284,12 @@ mod tests {
             prompt_delivery_assessment(failed, now_epoch),
             PromptDelivery::OverdueSuspect
         );
+        // 文はプレースホルダだけ表示言語（日本語は #2365 より前と同じ。英語は番犬の表が見る）
+        let resend = resend_command(failed).expect("未達には出す");
+        assert_eq!(resend, crate::ReplyNote::ResendCommand { pane: 41 });
         assert_eq!(
-            resend_command(failed).as_deref(),
-            Some("tako send --pane 41 '<同じ依頼文>'")
+            resend.text_in(tako_core::i18n::Lang::Ja),
+            "tako send --pane 41 '<同じ依頼文>'"
         );
         let _ = std::fs::remove_file(&path);
     }

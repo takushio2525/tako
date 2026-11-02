@@ -172,24 +172,30 @@ fn notes_as_text<S: serde::Serializer>(
 }
 
 impl MigrationOutcome {
-    /// 人が読む 1 行サマリ（CLI / 起動ログ / master への一言）
-    pub fn summary(&self) -> Option<String> {
+    /// 人が読む 1 行サマリ（`handoffs migrate` の `summaries`）。
+    ///
+    /// 型で返し、文は載せる側が組んだその場の表示言語で組む（#2365）
+    pub fn summary(&self) -> Option<crate::ReplyNote> {
         if !self.migrated {
             return None;
         }
-        let keys: Vec<&str> = self.moved.iter().map(|(k, _)| k.as_str()).collect();
-        Some(format!(
-            "handoff/{}.md をプロジェクト単位へ自動移行しました（#915）: {} / 共通置き場に {} 行を残し、移行前のファイルは {} へ退避",
-            self.profile,
-            if keys.is_empty() {
-                "移動なし".to_string()
-            } else {
-                keys.join(", ")
-            },
-            self.kept_lines,
-            self.archived_to.as_deref().unwrap_or("(退避なし)")
-        ))
+        Some(crate::ReplyNote::HandoffMigrated {
+            profile: self.profile.clone(),
+            moved: self.moved.iter().map(|(k, _)| k.clone()).collect(),
+            kept_lines: self.kept_lines,
+            archived_to: self.archived_to.clone(),
+        })
     }
+}
+
+/// 運用メモが膨らみすぎていれば肥大の注記（#915 要件 3: 肥大の再発防止）。
+///
+/// 判定は tako-core の [`ho::profile_memo_oversized`]、文は載せる側が表示言語で組む（#2365）
+pub fn memo_warning(profile: &str, content: &str) -> Option<crate::ReplyNote> {
+    ho::profile_memo_oversized(content).map(|lines| crate::ReplyNote::ProfileMemoOversized {
+        profile: profile.to_string(),
+        lines,
+    })
 }
 
 /// そのプロファイルの引き継ぎを新形式へ移す（**冪等**）。
@@ -352,8 +358,8 @@ pub struct HandoffBundle {
     pub missing_projects: Vec<String>,
     pub catalog: Vec<(String, String)>,
     pub jurisdiction: ho::Jurisdiction,
-    /// 運用メモが膨らみすぎているときの警告（#915 要件 3: 肥大の再発防止）
-    pub memo_warning: Option<String>,
+    /// 運用メモが膨らみすぎているときの警告（#915 要件 3: 肥大の再発防止。[`memo_warning`]）
+    pub memo_warning: Option<crate::ReplyNote>,
 }
 
 impl HandoffBundle {
@@ -386,9 +392,7 @@ pub fn collect_bundle(profile: &str, jurisdiction: ho::Jurisdiction) -> HandoffB
     let memo = super::read_handoff(profile);
     let mut bundle = HandoffBundle {
         profile: profile.to_string(),
-        memo_warning: memo
-            .as_deref()
-            .and_then(|m| ho::profile_memo_warning(profile, m)),
+        memo_warning: memo.as_deref().and_then(|m| memo_warning(profile, m)),
         profile_memo: memo,
         jurisdiction,
         ..Default::default()
