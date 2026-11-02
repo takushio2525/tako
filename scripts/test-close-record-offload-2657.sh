@@ -55,12 +55,14 @@ APP_PID=""
 SOCKETS=""
 
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+. "$REPO_ROOT/scripts/lib/tmux-socket.sh"
 isolated_gui_bins || exit 1
 
 cleanup() {
   if [ -n "$APP_PID" ]; then stop_isolated_gui "$APP_PID"; fi
   local s
-  for s in $SOCKETS; do tmux -L "$s" kill-server >/dev/null 2>&1; done
+  # 器はソケットファイルまで消す（#2399）
+  for s in $SOCKETS; do tmux_socket_kill "$s"; done
   if [ -n "${KEEP:-}" ]; then echo "置き場を残した: $TMP"; else rm -rf "${TMP:?}"; fi
 }
 trap cleanup EXIT
@@ -153,8 +155,10 @@ measure() {
   echo $((t1 - t0)) > "$TMP/$name-ms.txt"
   echo "    （${name}: close の応答 $(cat "$TMP/$name-ms.txt")ms・その間の tako list: $(LC_ALL=C tr '\n' ' ' < "$TMP/$name-ipc.txt")ms）"
 }
+# CLI の close は成功しても何も出さない（応答の JSON は MCP の口で見る）。終了コードを $1.rc へ
 close_cli() {
   TAKO_ORCHESTRATOR_ROLE="$MASTER_ROLE" "$CLI" close --pane "$2" --force >"$1" 2>"$1.err"
+  echo $? > "$1.rc"
 }
 spawn_worker() {
   local out="$1" label="$2" p i screen
@@ -216,8 +220,10 @@ YAML
     measure "$r-close-$i" close_cli "$D/close-$i.json" "$p"
     state=$(registry_state "$p")
     echo "$state" >> "$TMP/$r-order.txt"
-    jq -S -c 'del(.closed)' "$D/close-$i.json" > "$D/close-$i.norm" 2>/dev/null
-    check_eq "[$r] ① close $i の応答はそのペイン" "$p" "$(jq -r '.closed' "$D/close-$i.json" 2>/dev/null)"
+    { cat "$D/close-$i.json.rc"; cat "$D/close-$i.json" "$D/close-$i.json.err"; } > "$D/close-$i.norm"
+    check_eq "[$r] ① close $i は成功する（終了コード 0）" 0 "$(cat "$D/close-$i.json.rc")"
+    check_eq "[$r] ① close $i でペインが消えた" 1 \
+      "$("$CLI" list | jq --argjson p "$p" '[.tabs[].panes[].id] | index($p) == null' | grep -q true && echo 1)"
     check_eq "[$r] ④ close $i の応答の直後に workers は closed（発生源つき）" \
       "closed/close:dispatch(cli, caller=$MASTER_ROLE)" "$state"
   done
@@ -232,6 +238,7 @@ YAML
     sleep 1
     mcp_call tako_close_pane "{\"pane\":$p,\"force\":true}" "$D/mcp-close.json"
     mcp_text "$D/mcp-close.json" | jq -S -c 'del(.closed)' > "$D/mcp-close.norm" 2>/dev/null
+    check_eq "[$r] ③ MCP の close の応答はそのペイン" "$p" "$(mcp_text "$D/mcp-close.json" | jq -r '.closed')"
     check_eq "[$r] ③ MCP の close の応答の直後に workers は closed" \
       "closed/close:dispatch(mcp, caller=$MASTER_ROLE)" "$(registry_state "$p")"
   else
@@ -244,9 +251,11 @@ YAML
     check_eq "[$r] ③ たまり場へ退避しただけでは active" "active/" "$(registry_state "$p")"
     mcp_call tako_background_kill "{\"pane\":$p}" "$D/shelf-kill.json"
     mcp_text "$D/shelf-kill.json" | jq -S -c 'del(.killed)' > "$D/shelf-kill.norm" 2>/dev/null
-    check_eq "[$r] ③ たまり場の kill の応答（器あり）" tmux "$(mcp_text "$D/shelf-kill.json" | jq -r '.vessel')"
+    check_eq "[$r] ③ たまり場の kill の応答（器あり）" "$p/tmux" \
+      "$(mcp_text "$D/shelf-kill.json" | jq -r '"\(.killed)/\(.vessel)"')"
+    # たまり場の kill は呼び出し元の role を載せない（#775 からの形。修正前と同じ）
     check_eq "[$r] ③ たまり場の kill の応答の直後に workers は closed" \
-      "closed/close:dispatch(mcp, caller=$MASTER_ROLE)" "$(registry_state "$p")"
+      "closed/close:dispatch(mcp)" "$(registry_state "$p")"
   else
     fail "[$r] ③ たまり場用の worker を spawn できない"
   fi
