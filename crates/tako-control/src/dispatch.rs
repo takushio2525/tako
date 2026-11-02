@@ -4845,6 +4845,7 @@ pub fn workspace_replace_land(
     for file in &mut body.files {
         let FileStatus::Buffer {
             pane,
+            pane_path,
             version,
             changes,
             real,
@@ -4858,6 +4859,7 @@ pub fn workspace_replace_land(
         file.status = match host.apply_preview_changes(*pane, changes.clone(), *version) {
             Ok(applied) if applied.changes > 0 => FileStatus::BufferApplied {
                 pane: *pane,
+                pane_path: pane_path.clone(),
                 version: host
                     .preview_document(*pane)
                     .and_then(|d| d["version"].as_u64())
@@ -4944,13 +4946,14 @@ fn workspace_undo_prepare(
     let remaining = store.replace().history().len();
     let mut targets = Vec::new();
     for file in &record.files {
-        let target = match file.buffer {
+        let target = match &file.buffer {
             None => UndoTarget::Disk,
-            Some((pane, version)) => {
-                let pane = PaneId::from_raw(pane);
-                let same_file = host.preview_state(pane).is_some_and(|(path, _)| {
-                    tako_core::platform::path::canonicalize_or_self(Path::new(&path)) == file.real
-                });
+            Some(buffer) => {
+                let (pane, version) = (PaneId::from_raw(buffer.pane), buffer.version);
+                // 当てたときにそのペインが開いていたパスと突き合わせる（UI スレッドで実体を引き直さない）
+                let same_file = host
+                    .preview_state(pane)
+                    .is_some_and(|(path, _)| path == buffer.path);
                 let mut seen = None;
                 if same_file {
                     host.read_preview_buffer(pane, &mut |text, current| {

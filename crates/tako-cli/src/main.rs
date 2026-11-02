@@ -14505,6 +14505,117 @@ mod tests {
         Cli::command().debug_assert();
     }
 
+    /// #2045: `--replace` は action=replace（検索語つき = 探してから / 省くと右パネルの結果へ）、
+    /// `--item` / `--file` は範囲、`--yes` だけが confirm を送る。`--undo` は action=undo。
+    /// 組み合わせられない指定はパースで断る
+    #[test]
+    fn issue2045_置換と取り消しの引数はそのまま渡り既定はプレビュー() {
+        let request = |args: &[&str]| build_request(&parse(args)).unwrap();
+        let Request::WorkspaceSearch {
+            action,
+            query,
+            replacement,
+            confirm,
+            item,
+            file,
+            regex,
+            ..
+        } = request(&[
+            "tako",
+            "search",
+            "old",
+            "--replace",
+            "new",
+            "--regex",
+            "--pane",
+            "5",
+        ])
+        else {
+            panic!("横断検索の要求になる");
+        };
+        assert_eq!(
+            (action.as_str(), query.as_deref(), replacement.as_deref()),
+            ("replace", Some("old"), Some("new"))
+        );
+        assert_eq!((confirm, item, file, regex), (None, None, None, Some(true)));
+        // 先頭が - の置換後・空の置換後（一致を消す）も値として読む
+        let Request::WorkspaceSearch { replacement, .. } =
+            request(&["tako", "search", "a", "--replace", "-x", "--pane", "5"])
+        else {
+            panic!("横断検索の要求になる");
+        };
+        assert_eq!(replacement.as_deref(), Some("-x"));
+        let Request::WorkspaceSearch {
+            action,
+            query,
+            replacement,
+            confirm,
+            item,
+            ..
+        } = request(&[
+            "tako",
+            "search",
+            "--replace",
+            "",
+            "--item",
+            "3",
+            "--yes",
+            "--pane",
+            "5",
+        ])
+        else {
+            panic!("横断検索の要求になる");
+        };
+        assert_eq!(
+            (
+                action.as_str(),
+                query,
+                replacement.as_deref(),
+                confirm,
+                item
+            ),
+            ("replace", None, Some(""), Some(true), Some(3))
+        );
+        // 辿れないパスは表示の相対パスとしてそのまま渡す
+        let Request::WorkspaceSearch { file, .. } = request(&[
+            "tako",
+            "search",
+            "--replace",
+            "x",
+            "--file",
+            "no/such/dir/a.rs",
+            "--pane",
+            "5",
+        ]) else {
+            panic!("横断検索の要求になる");
+        };
+        assert_eq!(file.as_deref(), Some("no/such/dir/a.rs"));
+        let Request::WorkspaceSearch {
+            action, confirm, ..
+        } = request(&["tako", "search", "--undo", "--yes", "--pane", "5"])
+        else {
+            panic!("横断検索の要求になる");
+        };
+        assert_eq!((action.as_str(), confirm), ("undo", Some(true)));
+        for bad in [
+            &["tako", "search", "--item", "3"][..],
+            &[
+                "tako",
+                "search",
+                "--replace",
+                "x",
+                "--item",
+                "1",
+                "--file",
+                "a.rs",
+            ],
+            &["tako", "search", "--undo", "--replace", "x"],
+            &["tako", "search", "--replace", "x", "--open", "1"],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
+    }
+
     /// #2002: 届かないとき、GUI が生きているのに受け口が応答しないなら、そう言って次の一手を出す
     #[test]
     fn issue2002_生きたguiの受け口が応答しないと区別して次の一手を出す() {

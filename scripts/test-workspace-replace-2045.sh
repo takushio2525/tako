@@ -152,7 +152,7 @@ printf 'fn main() {\n    let old_2045 = 1;\n    drop(old_2045);\n}\n// edited ou
 cp "$T/src/a.rs" "$TMP/a.outside"
 tk search --replace new_2045 --yes --json --limit 0 > "$TMP/apply.json" 2>&1
 A_REASON="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(f.get("reason","") for f in d["files"] if f["path"].endswith("a.rs")))' "$TMP/apply.json" 2>/dev/null)"
-echo "    当てる: status=$(jget status < "$TMP/apply.json") replaced=$(jget replaced < "$TMP/apply.json") a.rs=$(fstatus a.rs < "$TMP/apply.json")（$A_REASON）"
+echo "    当てる: status=$(jget status < "$TMP/apply.json") replaced=$(jget replaced < "$TMP/apply.json") a.rs=$(fstatus a.rs < "$TMP/apply.json")（${A_REASON}）"
 check "$([ "$(fstatus a.rs < "$TMP/apply.json")" = stale ] && [ -n "$A_REASON" ] && cmp -s "$T/src/a.rs" "$TMP/a.outside" && echo 1)" \
   "検索の後に外で書き換わったファイルは当てずに理由を返し、中身を触らない"
 check "$([ "$(jget status < "$TMP/apply.json")" = partial ] && echo 1)" "ほかのファイルは当たる（status=partial）"
@@ -196,7 +196,7 @@ mcp tako_search "{\"action\":\"replace\",\"query\":\"old_2045\",\"path\":\"$M\",
 mcp tako_search '{"action":"undo"}' > "$TMP/m-undo-peek.json" 2>&1
 MCP_AFTER="$(cat "$M/src/a.rs" "$M/src/crlf.txt" | shasum | cut -c1-12)"
 mcp tako_search '{"action":"undo","confirm":true}' > "$TMP/m-undo.json" 2>&1
-echo "    当てた後の中身: CLI $CLI_AFTER / MCP $MCP_AFTER（a.rs: $(grep -c n_old_2045 "$TMP/cli/src/a.rs" 2>/dev/null) 行は戻した後なので 0）"
+echo "    当てた後の中身: CLI $CLI_AFTER / MCP ${MCP_AFTER}（a.rs: $(grep -c n_old_2045 "$TMP/cli/src/a.rs" 2>/dev/null) 行は戻した後なので 0）"
 check "$([ "$(norm "$C" < "$TMP/c-apply.json")" = "$(norm "$M" < "$TMP/m-apply.json")" ] && [ "$(jget status < "$TMP/c-apply.json")" = partial ] && [ "$CLI_AFTER" = "$MCP_AFTER" ] && echo 1)" \
   "当てる: CLI と MCP の応答と書き換えた後の中身が一致（status=$(jget status < "$TMP/c-apply.json")）"
 check "$([ "$(norm "$C" < "$TMP/c-undo-peek.json")" = "$(norm "$M" < "$TMP/m-undo-peek.json")" ] && [ "$(norm "$C" < "$TMP/c-undo.json")" = "$(norm "$M" < "$TMP/m-undo.json")" ] && echo 1)" \
@@ -212,7 +212,7 @@ check "$([ "$(jget status < "$TMP/e-none.json")" = not-applied ] && [ "$(jget ta
 tk search '(old_2045)' --regex --path "$E" --replace '$1' --yes --json > "$TMP/e-same.json" 2>&1
 check "$([ "$(fstatus a.rs < "$TMP/e-same.json")" = unchanged ] && diff -r "$E" "$TMP/tree.orig" >/dev/null && echo 1)" "置換後が元と同じ: unchanged・何も書かない"
 if tk search '(old' --regex --path "$E" --replace x --yes > "$TMP/e-regex.txt" 2>&1; then RC=0; else RC=$?; fi
-check "$([ "$RC" -ne 0 ] && grep -q '正規表現として読めない' "$TMP/e-regex.txt" && echo 1)" "不正な正規表現: 理由つきで失敗（rc=$RC）"
+check "$([ "$RC" -ne 0 ] && grep -q '正規表現として読めない' "$TMP/e-regex.txt" && echo 1)" "不正な正規表現: 理由つきで失敗（rc=${RC}）"
 if tk search '(old)_2045' --regex --path "$E" --replace '$2' --yes > "$TMP/e-group.txt" 2>&1; then RC=0; else RC=$?; fi
 check "$([ "$RC" -ne 0 ] && grep -q '\$2' "$TMP/e-group.txt" && diff -r "$E" "$TMP/tree.orig" >/dev/null && echo 1)" "無いグループ（\$2）: 理由つきで失敗し何も書かない（$(head -1 "$TMP/e-group.txt")）"
 perl -e 'print "$_ old_2045 old_2045 old_2045\n" for 1..1500' > "$E/src/many.txt"

@@ -38,6 +38,9 @@ pub const BACKUP_DIR: &str = "search-replace";
 pub const HISTORY_CAP: usize = 20;
 /// 前のプロセスが残した退避を残す期間（履歴はメモリなので tako からは戻せない。手で拾える期間）
 pub const BACKUP_KEEP: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// 「当てている最中」の印をあきらめるまで（background の回が着地せずに終わっても、次の置換を
+/// 永久に断り続けない。2000 行・8 MB のファイルでも数十秒で終わる量の 10 倍以上）
+pub const BUSY_EXPIRE: Duration = Duration::from_secs(10 * 60);
 
 // --- 指紋 -------------------------------------------------------------------
 
@@ -447,7 +450,7 @@ pub fn check_disk(
     template: &Template,
     lines: &BTreeSet<usize>,
 ) -> Result<(PathBuf, Vec<u8>, FilePlan), Skip> {
-    let real = std::fs::canonicalize(path).map_err(|_| Skip::Unreadable)?;
+    let real = crate::platform::path::canonicalize(path).map_err(|_| Skip::Unreadable)?;
     let bytes = std::fs::read(&real).map_err(|_| Skip::Unreadable)?;
     if Stamp::of(&bytes) != expect {
         return Err(Skip::Stale);
@@ -517,7 +520,14 @@ pub fn write_disk(
     let text = std::str::from_utf8(before).map_err(|_| Skip::NotUtf8)?;
     let after = plan.apply(text);
     write_backup(backup, before)?;
-    crate::text_edit::write_file(real, after.as_bytes()).map_err(|_| Skip::WriteFailed)?;
+    if crate::text_edit::write_file(real, after.as_bytes()).is_err() {
+        // 一時ファイル + rename の口（unix）は失敗しても元の中身のまま。その場で書く口（Windows）が
+        // 途中まで書いていたら、元の中身で書き戻す
+        if std::fs::read(real).map_or(true, |now| now != before) {
+            let _ = crate::text_edit::write_file(real, before);
+        }
+        return Err(Skip::WriteFailed);
+    }
     Ok(Stamp::of(after.as_bytes()))
 }
 
@@ -660,8 +670,17 @@ pub struct RecordFile {
     pub after: Stamp,
     /// 置換前の中身の退避（バッファへ当てたファイルも退避する = ペインを閉じた後でも戻せる）
     pub backup: PathBuf,
-    /// バッファへ当てたなら（ペイン, 当てた直後の版）
-    pub buffer: Option<(u64, u64)>,
+    /// バッファへ当てたなら、そのペインと当てた直後の版
+    pub buffer: Option<BufferRef>,
+}
+
+/// バッファへ当てた先（取り消しで「同じペインが同じファイルを同じ版のまま開いているか」を見る材料）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferRef {
+    pub pane: u64,
+    pub version: u64,
+    /// そのペインが開いていたパス（ペインの表示のまま。UI スレッドで実体を引き直さずに突き合わせる）
+    pub path: String,
 }
 
 /// 当てた 1 回ぶんの記録
@@ -713,8 +732,9 @@ pub struct ReplaceState {
     session: Session,
     history: Vec<Record>,
     next_id: u64,
-    /// 当てている / 戻している最中の 1 回（その間は次を受けない = 同じファイルを取り合わない）
-    busy: Option<u64>,
+    /// 当てている / 戻している最中の 1 回と立てた時刻（その間は次を受けない = 同じファイルを
+    /// 取り合わない。[`BUSY_EXPIRE`] を過ぎた印は見ない）
+    busy: Option<(u64, std::time::Instant)>,
     /// 置いたプレビューの数（GUI が「外から置かれた」プレビューを置換欄へ写す目印）
     previews_placed: u64,
     /// 戻し終えて履歴から下ろした記録の退避の置き場（次の background の回で消す）
@@ -760,23 +780,26 @@ impl ReplaceState {
 
     /// 当て始める（最中なら断る = `Err(最中の番号)`）。返すのは記録の番号
     pub fn begin(&mut self) -> Result<u64, u64> {
-        if let Some(busy) = self.busy {
+        if let Some(busy) = self.busy() {
             return Err(busy);
         }
         self.next_id += 1;
-        self.busy = Some(self.next_id);
+        self.busy = Some((self.next_id, std::time::Instant::now()));
         Ok(self.next_id)
     }
 
     /// 当て終えた / 戻し終えた（`id` が最中の番号なら最中を解く）
     pub fn end(&mut self, id: u64) {
-        if self.busy == Some(id) {
+        if self.busy.is_some_and(|(busy, _)| busy == id) {
             self.busy = None;
         }
     }
 
+    /// 最中の番号（[`BUSY_EXPIRE`] を過ぎた印は無いものとして扱う）
     pub fn busy(&self) -> Option<u64> {
         self.busy
+            .filter(|(_, since)| since.elapsed() < BUSY_EXPIRE)
+            .map(|(id, _)| id)
     }
 
     /// 上限まで履歴を下ろし、下ろしたぶん（と戻し終えた記録）の退避の置き場を返す

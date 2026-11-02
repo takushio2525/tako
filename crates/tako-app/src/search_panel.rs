@@ -459,15 +459,16 @@ impl TakoApp {
         let Some(preview) = self.workspace_search.replace().preview() else {
             return;
         };
-        if self.search_ui.focused && self.search_ui.replace_focused {
+        // 欄と同じ文字列 = この画面が頼んだプレビュー（閉じた後に着いても開き直さない）
+        if (self.search_ui.focused && self.search_ui.replace_focused)
+            || preview.replacement == self.search_ui.replace_input.text()
+        {
             return;
         }
-        if preview.replacement != self.search_ui.replace_input.text() {
-            self.search_ui
-                .replace_input
-                .set_text(preview.replacement.clone());
-            self.search_ui.replace_input.move_end();
-        }
+        self.search_ui
+            .replace_input
+            .set_text(preview.replacement.clone());
+        self.search_ui.replace_input.move_end();
         self.search_ui.replace_open = true;
     }
 

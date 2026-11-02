@@ -717,7 +717,27 @@ tako search --clear                       # 右パネルの結果を閉じる
 - `--show` を付けない検索は結果を返すだけで、画面の検索結果を上書きしません
 - 表示する行は既定で 100 まで（`--limit 0` で全部）。`--json` で応答をそのまま出します
 
-MCP では `tako_search`（`action` = `search` / `results` / `open` / `clear`）が同じ操作です。
+#### 置換
+
+見つけた行をまとめて書き換えます。**既定は書き換えずにプレビュー**（どのファイルの何行目がどう変わるか）だけを出し、`--yes` を付けたときだけ当てます。GUI では search ビューの検索欄の左の **>** で置換欄を開くと、結果の行に「消す字 → 足す字」が並び、行の「置換」・ファイルの「ファイルを置換」・「すべて置換」・「元に戻す」で同じことができます。
+
+```bash
+tako search old_name --replace new_name          # プレビュー（何も書き換えない）
+tako search old_name --replace new_name --yes    # 当てる
+tako search '(\w+)\.unwrap\(\)' --regex --replace '$1.expect("msg")' --yes   # 正規表現の括弧は $1
+tako search --replace new_name --item 3 --yes    # 右パネルの結果の 3 番目の行だけ（検索語を省くと右パネルの結果へ）
+tako search --replace new_name --file src/a.rs --yes   # 右パネルの結果のうち、そのファイルの行だけ
+tako search --undo                               # 直前の置換を戻せるかを見る
+tako search --undo --yes                         # 戻す
+```
+
+- 書き換えるのは**一覧に出た行**の一致だけです（2000 行で打ち切った検索の外は触りません）。改行コード（CRLF）・BOM はそのまま残ります
+- 正規表現の置換後では `$1`〜`$99` / `${名前}` / `$0`（一致全体）/ `$$`（`$` そのもの）が使えます。`$1a` は `$1` の後ろに `a` です
+- **検索の後にファイルが変わっていたら、そのファイルは当てずに理由を出します**（検索し直してください）。UTF-8 でないファイル・読み取り専用のファイルも当てません
+- tako で開いて編集しているファイルは、そのペインの編集に当てます（保存はしません。そのペインの undo（⌘Z、Windows は Ctrl+Z）1 回でも戻ります）。保存していない編集があるファイルは上書きせずに飛ばします
+- 開いていないファイルは、書く前に置換前の中身を tako のデータフォルダ（`search-replace/`）へ退避します。`--undo --yes` は直前の 1 回ずつ戻し、その後に変わったファイルは上書きせずに退避の場所を出します。取り消しの履歴は tako を終了すると消えます（退避は 7 日残ります）
+
+MCP では `tako_search`（`action` = `search` / `results` / `open` / `clear` / `replace` / `undo`。置換は `replacement` / `item` / `file`、当てる・戻すのは `confirm: true`）が同じ操作です。
 
 ### プレビューの操作
 

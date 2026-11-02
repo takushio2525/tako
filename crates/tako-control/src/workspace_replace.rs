@@ -124,6 +124,8 @@ pub enum FileStatus {
     /// バッファへ当てる（UI スレッドの着地で `apply_preview_changes`）
     Buffer {
         pane: PaneId,
+        /// そのペインが開いているパス（ペインの表示のまま）
+        pane_path: String,
         version: u64,
         changes: Vec<TextChange>,
         real: PathBuf,
@@ -134,6 +136,7 @@ pub enum FileStatus {
     /// バッファへ当てた（着地の後）
     BufferApplied {
         pane: PaneId,
+        pane_path: String,
         version: u64,
         real: PathBuf,
         before: Stamp,
@@ -287,12 +290,14 @@ impl ReplaceJob {
                         };
                     }
                     Ok((outcome, matcher)) => {
+                        // 取り消された検索（次の検索に追い越された）の途中までの行には当てない
+                        let cancelled = outcome.stopped == Some(Stop::Cancelled);
                         let hits: Vec<(usize, Hit)> = outcome
                             .hits
                             .iter()
                             .cloned()
                             .enumerate()
-                            .filter(|(i, h)| scope.takes_hit(*i, h))
+                            .filter(|(i, h)| !cancelled && scope.takes_hit(*i, h))
                             .collect();
                         let expect: HashMap<PathBuf, Stamp> = outcome
                             .stamps
@@ -478,6 +483,7 @@ fn one_file(
             (
                 FileStatus::Buffer {
                     pane: snap.pane,
+                    pane_path: snap.path.clone(),
                     version: snap.version,
                     changes: plan.changes.clone(),
                     real,
@@ -510,8 +516,10 @@ fn one_file(
                     Some(plan),
                 ),
                 Err(skip) => {
-                    // 書けなかったなら退避は要らない（中身は元のまま）
-                    let _ = std::fs::remove_file(&backup);
+                    // 元の中身のままだと確かめられたときだけ退避を消す（確かめられなければ手で拾えるよう残す）
+                    if std::fs::read(&real).is_ok_and(|now| now == bytes) {
+                        let _ = std::fs::remove_file(&backup);
+                    }
                     (FileStatus::Skipped(skip), None)
                 }
             }
@@ -560,6 +568,7 @@ impl ReplaceBody {
                 }),
                 FileStatus::BufferApplied {
                     pane,
+                    pane_path,
                     version,
                     real,
                     before,
@@ -572,7 +581,11 @@ impl ReplaceBody {
                     before: *before,
                     after: *after,
                     backup: backup.clone(),
-                    buffer: Some((pane.as_u64(), *version)),
+                    buffer: Some(replace::BufferRef {
+                        pane: pane.as_u64(),
+                        version: *version,
+                        path: pane_path.clone(),
+                    }),
                 }),
                 _ => None,
             })
@@ -906,8 +919,8 @@ pub fn undo_json(landing: &UndoLanding, outcomes: &[Restore], remaining: usize) 
                 "via": if file.buffer.is_some() { "buffer" } else { "disk" },
                 "reason": outcome.text_in(lang),
             });
-            if let Some((pane, _)) = file.buffer {
-                out["pane"] = json!(pane);
+            if let Some(buffer) = &file.buffer {
+                out["pane"] = json!(buffer.pane);
             }
             if !outcome.settled() {
                 out["backup"] = json!(file.backup.display().to_string());
