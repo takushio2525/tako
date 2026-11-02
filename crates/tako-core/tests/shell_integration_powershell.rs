@@ -47,13 +47,36 @@ fn detach_own_console() {
     });
 }
 
-/// 統合スクリプトを一時ディレクトリへ書き出す。**リポジトリの正本をそのまま使う**
-/// （テスト用に書き直すと、本番と違うものを検証してしまう）
-fn write_script() -> PathBuf {
-    write_script_in(&std::env::temp_dir().join(format!("tako-si-test-{}", std::process::id())))
+/// テストごとの統合スクリプト（#2659）。**置き場はテストごとに 1 つ**で、スコープを抜けると消える。
+///
+/// 以前は同じプロセスの全テストが `%TEMP%\tako-si-test-<pid>\tako.ps1` を共有して書き直していた。
+/// あるテストのペインの PowerShell が読む瞬間に別のテストが同じファイルへ書くと、Windows では
+/// 読み手（`ReadAllText`）か書き手（`std::fs::write`）の片方が共有違反（OS エラー 32）で落ちる
+/// （CI の 11/01 は書き手が `write_script_in` で panic し、11/02 は読み手が黙って統合なしになり
+/// `wait_ready` の 30 秒待ちが切れた）。製品は 1 プロセスで 1 回書いてから読ませるので、
+/// テストも「自分のファイルを書いてから自分のペインに読ませる」形に揃える
+struct Script {
+    _dir: tako_core::test_residue::ScratchDir,
+    path: PathBuf,
 }
 
-/// 置き場を選んで書き出す（#2432 の「空白入りの置き場」の検査用）
+impl std::ops::Deref for Script {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// 統合スクリプトをテストごとの置き場へ書き出す。**リポジトリの正本をそのまま使う**
+/// （テスト用に書き直すと、本番と違うものを検証してしまう）
+fn write_script() -> Script {
+    let dir = tako_core::test_residue::ScratchDir::new("i2659-si");
+    let path = write_script_in(dir.path());
+    Script { _dir: dir, path }
+}
+
+/// 置き場を選んで書き出す（#2432 の「空白入りの置き場」の検査用。置き場は呼び手が
+/// `ScratchDir` で作る = 他のテストと共有しない。#2659）
 fn write_script_in(dir: &Path) -> PathBuf {
     const SCRIPT: &str = include_str!("../shell-integration/tako.ps1");
     std::fs::create_dir_all(dir).expect("一時ディレクトリを作れること");
@@ -919,6 +942,257 @@ fn 置き場が無ければ黙って素のシェルになる() {
         !screen.contains("tako.ps1") && !screen.contains("__takoShellIntegrationScript"),
         "起動コマンドがエラーとして画面に出ている\n{screen}"
     );
+    // 置き場が無いのは「読めなかった」ではない（#2659 の警告は出さない）
+    assert!(!warned(&screen), "置き場が無いだけで警告を出した\n{screen}");
+}
+
+// --- #2659: 統合スクリプトの共有違反（テストの置き場・製品の読み直し・PSReadLine 抜き）-----------
+
+/// 統合が入らなかったときの警告（製品の [`tako_core::shell_integration::powershell_bootstrap`]）が
+/// 画面に出ているか。表示言語はテストプロセスの既定（英語）だが、どちらでも拾う
+fn warned(screen: &str) -> bool {
+    screen.contains("could not load the shell integration")
+        || screen.contains("シェル統合を読み込めませんでした")
+}
+
+/// ファイルを**他の誰にも開かせない**形で開いて握る（共有違反の注入）。
+/// 書き手の `std::fs::write` も読み手の `ReadAllText` も、握っている間は OS エラー 32 で失敗する
+fn hold_exclusive(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .expect("排他で開けること")
+}
+
+/// 製品の起動形の本文の前に「これから読む」印を置いて起こす（#2659 の注入）。
+///
+/// 印のファイルは本文の 1 文目で書かれ、次の文が統合スクリプトの `Test-Path` → `ReadAllText`。
+/// 印が現れたときにロックを握っていれば、1 回目の読み込みは必ず共有違反になる
+/// （PowerShell の起動にかかる時間がばらついても、ロックを放す時刻を印から数えるので揺れない）
+fn product_with_marker(program: &str, script: &Path, marker: &Path) -> Pane {
+    let marker = marker.display().to_string().replace('\'', "''");
+    let body = format!(
+        "[System.IO.File]::WriteAllText('{marker}', 'x'); {}",
+        tako_core::shell_integration::powershell_bootstrap(script)
+    );
+    Pane::spawn(
+        SpawnCommand {
+            program: program.to_string(),
+            args: vec![
+                "-NoExit".into(),
+                "-EncodedCommand".into(),
+                tako_core::platform::shell::encode_powershell_command(&body),
+            ],
+        },
+        std::env::temp_dir(),
+        &[RESTRICTED],
+    )
+}
+
+/// 注入でロックを握る長さ。製品の読み直しの上限（回数 × 間隔 = 0.5 秒）より短く、
+/// 間隔（50ms）の数倍 = 何度か読み直してから読める長さ
+const HOLD: Duration = Duration::from_millis(250);
+
+#[test]
+fn 注入の長さは製品の読み直しの上限に収まる() {
+    let budget = tako_core::shell_integration::POWERSHELL_SCRIPT_READ_RETRY_INTERVAL
+        * tako_core::shell_integration::POWERSHELL_SCRIPT_READ_RETRIES;
+    assert!(
+        HOLD * 3 / 2 < budget,
+        "ロックを握る長さ {HOLD:?} が読み直しの上限 {budget:?} に余裕を持って収まっていない"
+    );
+    assert!(
+        HOLD > tako_core::shell_integration::POWERSHELL_SCRIPT_READ_RETRY_INTERVAL * 2,
+        "ロックが短すぎて読み直しを通らない"
+    );
+}
+
+/// **#2659 の A**: テストごとの置き場は、他のテストのスクリプトが排他で握られていても書ける。
+/// 検出力として、握られた同じパスへ書けば共有違反（OS エラー 32）で落ちる = 修正前に全テストが
+/// 同じパスへ書いていた形（11/01 の CI で `write_script_in` が panic したのと同じ失敗）
+#[test]
+fn issue2659_テストごとの置き場は他のテストの排他に触れない() {
+    let mine = write_script();
+    let held = hold_exclusive(&mine);
+    let err = std::fs::write(&*mine, b"x")
+        .expect_err("排他で握ったファイルへ書けてしまう（注入が効いていない）");
+    assert_eq!(err.raw_os_error(), Some(32), "共有違反ではない: {err:?}");
+    // 別のテストの書き出し（修正後の形）は自分の置き場へ書くので、握られていても通る
+    let other = write_script();
+    assert_ne!(&*mine, &*other, "置き場がテストごとに分かれていない");
+    assert!(other.is_file(), "{:?}", &*other);
+    drop(held);
+}
+
+/// [`issue2659_ロックが外れれば読み直して統合が入る`] の本体（PowerShell 7 / 5.1 で同じ形）
+fn read_after_release(program: &str) {
+    detach_own_console();
+    let dir = tako_core::test_residue::ScratchDir::new("i2659-hold");
+    let script = write_script_in(dir.path());
+    let marker = dir.path().join("reading");
+    let held = hold_exclusive(&script);
+    let mut pane = product_with_marker(program, &script, &marker);
+    assert!(
+        pane.wait(Duration::from_secs(30), |_| marker.exists()),
+        "本文の 1 文目が走らない\n{}",
+        pane.screen()
+    );
+    // 1 回目の読み込みは握っている間に起きる。読み直しの途中で放す
+    std::thread::sleep(HOLD);
+    drop(held);
+    pane.wait_ready();
+    pane.send_line("cmd.exe /c exit 4");
+    assert!(
+        pane.wait_state(CommandState::Failed(4), Duration::from_secs(20)),
+        "読み直した統合で終了コードが報告されない（state={:?}）\n{}",
+        pane.session.command_state(),
+        pane.screen()
+    );
+    assert!(
+        !warned(&pane.screen()),
+        "読めたのに警告を出した\n{}",
+        pane.screen()
+    );
+}
+
+/// **#2659 の B（修正後）**: 読み込みの瞬間に別の誰かがスクリプトを握っていても、放されれば
+/// 読み直して統合が入る（ロックは 1 回目の読み込みの前に握り、[`HOLD`] の後に放す）
+#[test]
+fn issue2659_ロックが外れれば読み直して統合が入る() {
+    let programs: Vec<String> = pwsh7().into_iter().chain(windows_powershell()).collect();
+    if programs.is_empty() {
+        eprintln!("skip: PowerShell が無い");
+        return;
+    }
+    for program in programs {
+        read_after_release(&program);
+    }
+}
+
+/// **#2659 の B の A/B**: `TAKO_2659_LEGACY=1`（修正前の本文 = 1 回だけ読んで黙る）は、同じ注入で
+/// 統合が入らず、理由も出ない（11/02 の CI の画面と同じ = state Unknown のままプロンプトだけが出る）
+#[test]
+fn issue2659_legacyでは一度の失敗で統合が入らない() {
+    let Some(program) = pwsh7().or_else(windows_powershell) else {
+        eprintln!("skip: PowerShell が無い");
+        return;
+    };
+    if tako_core::run_alone!(issue2659_legacyでは一度の失敗で統合が入らない) {
+        return;
+    }
+    // 子の中だけ（他のテストは居ない。#2400）
+    unsafe { std::env::set_var("TAKO_2659_LEGACY", "1") };
+    detach_own_console();
+    let dir = tako_core::test_residue::ScratchDir::new("i2659-legacy");
+    let script = write_script_in(dir.path());
+    let marker = dir.path().join("reading");
+    let held = hold_exclusive(&script);
+    let mut pane = product_with_marker(&program, &script, &marker);
+    assert!(
+        pane.wait(Duration::from_secs(30), |_| marker.exists()),
+        "本文の 1 文目が走らない\n{}",
+        pane.screen()
+    );
+    std::thread::sleep(HOLD);
+    drop(held);
+    let prompted = pane.wait(Duration::from_secs(30), |s| {
+        s.visible_lines().iter().any(|l| l.contains("PS "))
+    });
+    pane.send_line("cmd.exe /c exit 4");
+    let reported = pane.wait_state(CommandState::Failed(4), Duration::from_secs(10));
+    let screen = pane.screen();
+    assert!(prompted, "プロンプトが出ない\n{screen}");
+    assert!(
+        !reported,
+        "修正前の本文なのに統合が入った（注入が 1 回目の読み込みに当たっていない）\n{screen}"
+    );
+    assert_eq!(
+        pane.session.command_state(),
+        CommandState::Unknown,
+        "{screen}"
+    );
+    assert!(!warned(&screen), "修正前の本文が警告を出した\n{screen}");
+}
+
+/// **#2659 の B（読めないまま）**: 読み直しの上限まで握られたままなら統合は入らず、そのことが
+/// 1 行の警告で画面に出る（修正前は黙って入らなかった）。シェルとしてはそのまま使える
+#[test]
+fn issue2659_読めないままなら統合が入らなかったと画面に出る() {
+    let Some(program) = pwsh7().or_else(windows_powershell) else {
+        eprintln!("skip: PowerShell が無い");
+        return;
+    };
+    detach_own_console();
+    let dir = tako_core::test_residue::ScratchDir::new("i2659-busy");
+    let script = write_script_in(dir.path());
+    let marker = dir.path().join("reading");
+    let held = hold_exclusive(&script);
+    let mut pane = product_with_marker(&program, &script, &marker);
+    let shown = pane.wait(Duration::from_secs(30), |s| {
+        warned(&s.visible_lines().join("\n"))
+    });
+    pane.send_line("Write-Output ('ALIVE=' + (1 + 1))");
+    let alive = pane.wait(Duration::from_secs(20), |s| {
+        s.visible_lines().iter().any(|l| l.contains("ALIVE=2"))
+    });
+    let screen = pane.screen();
+    drop(held);
+    assert!(shown, "読めなかったのに警告が出ない\n{screen}");
+    assert!(alive, "シェルとして使えない\n{screen}");
+    assert_eq!(
+        pane.session.command_state(),
+        CommandState::Unknown,
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("__takoShellIntegration"),
+        "一時変数の名前が画面に漏れている\n{screen}"
+    );
+}
+
+/// PSReadLine が読めなかったペイン（11/02 の CI の画面の `Cannot load PSReadline module.`）でも、
+/// 製品の起動形の統合は状態を報告する。PSReadLine を本文の前で外して、統合の
+/// PSReadLine 抜きの経路（`tako.ps1` の `PreCommandLookupAction`）を決定的に通す
+fn without_psreadline(program: &str) {
+    detach_own_console();
+    let script = write_script();
+    let body = format!(
+        "Remove-Module PSReadLine -Force -ErrorAction SilentlyContinue; {}",
+        tako_core::shell_integration::powershell_bootstrap(&script)
+    );
+    let pane = Pane::spawn(
+        SpawnCommand {
+            program: program.to_string(),
+            args: vec![
+                "-NoExit".into(),
+                "-EncodedCommand".into(),
+                tako_core::platform::shell::encode_powershell_command(&body),
+            ],
+        },
+        std::env::temp_dir(),
+        &[RESTRICTED],
+    );
+    run_state_transitions(pane);
+}
+
+#[test]
+fn psreadlineが無くてもpwsh7のペインで状態が報告される() {
+    let Some(program) = pwsh7() else {
+        eprintln!("skip: PowerShell 7 が無い");
+        return;
+    };
+    without_psreadline(&program);
+}
+
+#[test]
+fn psreadlineが無くてもwindowspowershell51のペインで状態が報告される() {
+    let Some(program) = windows_powershell() else {
+        eprintln!("skip: Windows PowerShell 5.1 が無い");
+        return;
+    };
+    without_psreadline(&program);
 }
 
 fn psmux_bin() -> Option<String> {

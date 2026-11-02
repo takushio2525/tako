@@ -2489,6 +2489,12 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
 - **PTY 起動の失敗理由を捨てない**。セルフテストの `spawn_session` の `Err` を捨てると
   「起動できなかった」が「画面に出ない」として現れ、原因が fixture 側にあるように見える
   （#903 が長引いた理由の 1 つ）。`spawn_error` を診断行に出す
+- **実シェルに読ませるファイル（統合スクリプト等）はテストごとの置き場へ書く**（#2659）。
+  同じテストプロセスの並列のテストが 1 つのファイル（`%TEMP%\tako-si-test-<pid>\tako.ps1`）を書き直すと、
+  Windows では読み手か書き手の片方が共有違反（OS エラー 32）で落ちる（CI で 306 回に 2 回。
+  書き手の panic と、読み手が黙って統合なしになり 30 秒待ちが切れる回の両方が出た）。
+  置き場は `ScratchDir::new` で作り、自分のファイルを書いてから自分のペインに読ませる。
+  番犬 `issue2659_pwsh_script_share_watchdog`
 - **シェル統合を要る項目は「配置されているか」でゲートしない**。#2432 より前の Windows の
   `shell_integration::status().installed()` は「`$PROFILE` のブロックが *いまの
   data dir の* `tako.ps1` を指しているか」で決まっていたので、**`TAKO_ISOLATED=1` が

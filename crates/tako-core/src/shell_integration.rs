@@ -428,15 +428,37 @@ fn write_scripts() -> std::io::Result<Vec<(String, String)>> {
 
 /// PowerShell 用スクリプトの書き出し。**BOM 付き UTF-8** で置く
 /// （Windows PowerShell 5.1 は BOM 無しの `.ps1` を ANSI コードページとして読むため、
-/// BOM が無いと日本語環境ではスクリプトが化ける）
+/// BOM が無いと日本語環境ではスクリプトが化ける）。
+///
+/// **中身が同じなら書き直さない**（#2659）。Windows はファイルを書いている間、ペインの PowerShell の
+/// 読み込み（[`powershell_bootstrap`] の `ReadAllText`）が共有違反で失敗し、逆に読んでいる間は
+/// こちらの書き込みが共有違反で失敗する。書き出しはプロセスごとに 1 回（[`env`]）だが、別のプロセス
+/// （`tako shell-integration install` ほか）が開いたばかりのペインと重なりうる。
+/// 中身が変わるのは版が変わったときだけなので、ふだんはファイルを開きもしない
 fn write_powershell_script(root: &Path) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(root)?;
     let path = root.join("tako.ps1");
     let mut bytes = Vec::with_capacity(POWERSHELL_SCRIPT.len() + 3);
     bytes.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
     bytes.extend_from_slice(POWERSHELL_SCRIPT.as_bytes());
+    if !issue2659_legacy() && std::fs::read(&path).is_ok_and(|current| current == bytes) {
+        return Ok(path);
+    }
     std::fs::write(&path, bytes)?;
     Ok(path)
+}
+
+/// #2659 の A/B（`TAKO_2659_LEGACY=1`）。PowerShell の統合スクリプトを修正前の形で扱う:
+/// 書き出しは中身が同じでも毎回書き直し、ペインの読み込み（[`powershell_bootstrap`]）は
+/// 1 回だけ試して失敗を黙って捨てる。**ゲートはこの 1 か所**
+fn issue2659_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2659_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
 }
 
 // --- 届け方（B13）。unix は env 注入、Windows はペインの PowerShell の起動引数 ---
@@ -865,8 +887,11 @@ impl std::error::Error for SiError {}
 ///   npm が起こすもの）まで Bypass になる
 /// - **`-EncodedCommand`**: パスに空白・単引用符・非 ASCII があっても、ConPTY の argv・器
 ///   （psmux）の単語分割・PowerShell の 3 層で引用符が崩れない（#875 の実行ペインと同じ手）
-/// - 読めない・壊れているときは**黙って素のシェルになる**（ペインに赤いエラーを出さない。
-///   効いているかは `tako shell-integration` の status とセルフテスト 41 で見える）
+/// - 置き場が無い・スクリプトが壊れているときは**黙って素のシェルになる**（ペインに赤いエラーを
+///   出さない。効いているかは `tako shell-integration` の status とセルフテスト 41 で見える）
+/// - ファイルは在るのに読めないときは、共有違反（別のプロセスが書いている最中）だけ短く読み直し、
+///   それでも読めなければ**統合が入らなかったことを 1 行の警告で出す**（#2659。状態ドットと
+///   cwd 追従が理由の出ないまま消えないように）
 pub fn powershell_pane_command(program: &str, script: &Path) -> crate::terminal::SpawnCommand {
     crate::terminal::SpawnCommand {
         program: program.to_string(),
@@ -884,15 +909,72 @@ pub fn powershell_pane_args(script: &Path) -> Vec<String> {
     ]
 }
 
+/// 統合スクリプトの読み込みが共有違反で失敗したときに読み直す回数（#2659）
+pub const POWERSHELL_SCRIPT_READ_RETRIES: u32 = 10;
+
+/// 読み直しの間隔（#2659）。上限は [`POWERSHELL_SCRIPT_READ_RETRIES`] × これ = 0.5 秒で、
+/// 待つのは共有違反のときだけ（ふだんの起動は 1 回で読めるので 1 ミリ秒も延びない）
+pub const POWERSHELL_SCRIPT_READ_RETRY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(50);
+
 /// [`powershell_pane_command`] が渡すコマンド本文。パスは ASCII だけの式で埋める
-/// （[`powershell_ascii_literal`]。非 ASCII のパスは `[char]0xNNNN` へ逃がす）
-fn powershell_bootstrap(script: &Path) -> String {
+/// （[`powershell_ascii_literal`]。非 ASCII のパスは `[char]0xNNNN` へ逃がす）。
+///
+/// 読み込みは**共有違反（`ERROR_SHARING_VIOLATION` = 32 / `ERROR_LOCK_VIOLATION` = 33）のときだけ**
+/// [`POWERSHELL_SCRIPT_READ_RETRY_INTERVAL`] おきに [`POWERSHELL_SCRIPT_READ_RETRIES`] 回まで
+/// 読み直す（#2659）。`ReadAllText` は他の書き手を許さない開き方なので、別のプロセスが同じファイルを
+/// 書いている数ミリ秒に当たると失敗する（CI では同じファイルへ書く並列のテストがこれを踏み、
+/// 統合が黙って入らずに 30 秒待ちが切れた）。読み直しても読めなければ、統合が入らなかったことを
+/// 表示言語で 1 行の警告に出す（ファイルが無いときは今までどおり黙る）。
+///
+/// テストはここに前置きを足して起こす（読み込みの瞬間にロックを当てる注入）ので公開している
+pub fn powershell_bootstrap(script: &Path) -> String {
+    powershell_bootstrap_in(script, crate::i18n::lang())
+}
+
+/// [`powershell_bootstrap`] の言語を引数で受ける版（警告の文言だけが言語で変わる）
+fn powershell_bootstrap_in(script: &Path, lang: crate::i18n::Lang) -> String {
     let path = powershell_ascii_literal(&script.display().to_string());
+    if issue2659_legacy() {
+        return format!(
+            "$__takoShellIntegrationScript = {path}; \
+             if (Test-Path -LiteralPath $__takoShellIntegrationScript) {{ \
+             try {{ . ([scriptblock]::Create([System.IO.File]::ReadAllText($__takoShellIntegrationScript))) }} catch {{ }} }}; \
+             Remove-Variable -Name __takoShellIntegrationScript -ErrorAction SilentlyContinue"
+        );
+    }
+    let warning = powershell_ascii_literal(
+        crate::i18n::Text::new(
+            "tako: シェル統合を読み込めませんでした（統合スクリプトを読めません）。\
+             このペインの実行状態と作業フォルダは tako へ伝わりません。ペインを開き直すと読み直します",
+            "tako: could not load the shell integration (its script could not be read). \
+             This pane will not report its command state or working directory to tako; \
+             reopen the pane to try again",
+        )
+        .text_in(lang),
+    );
+    let retries = POWERSHELL_SCRIPT_READ_RETRIES;
+    let interval = POWERSHELL_SCRIPT_READ_RETRY_INTERVAL.as_millis();
+    // `$_.Exception` は .NET のメソッドの例外を包んだ MethodInvocationException なので中身を見る。
+    // HResult の下位 16 ビットが Win32 のエラー番号（0x80070020 → 32）
     format!(
         "$__takoShellIntegrationScript = {path}; \
          if (Test-Path -LiteralPath $__takoShellIntegrationScript) {{ \
-         try {{ . ([scriptblock]::Create([System.IO.File]::ReadAllText($__takoShellIntegrationScript))) }} catch {{ }} }}; \
-         Remove-Variable -Name __takoShellIntegrationScript -ErrorAction SilentlyContinue"
+         $__takoShellIntegrationText = $null; $__takoShellIntegrationTry = 0; \
+         while ($true) {{ \
+         try {{ $__takoShellIntegrationText = [System.IO.File]::ReadAllText($__takoShellIntegrationScript); break }} \
+         catch {{ \
+         $__takoShellIntegrationErr = $_.Exception; \
+         if ($__takoShellIntegrationErr.InnerException) {{ $__takoShellIntegrationErr = $__takoShellIntegrationErr.InnerException }}; \
+         if (-not ($__takoShellIntegrationErr -is [System.IO.IOException]) -or \
+         (@(32, 33) -notcontains ($__takoShellIntegrationErr.HResult -band 0xFFFF)) -or \
+         ($__takoShellIntegrationTry -ge {retries})) {{ break }}; \
+         $__takoShellIntegrationTry++; [System.Threading.Thread]::Sleep({interval}) }} }}; \
+         if ($null -ne $__takoShellIntegrationText) {{ \
+         try {{ . ([scriptblock]::Create($__takoShellIntegrationText)) }} catch {{ }} }} \
+         else {{ Write-Warning ({warning}) }} }}; \
+         Remove-Variable -Name __takoShellIntegrationScript, __takoShellIntegrationText, \
+         __takoShellIntegrationTry, __takoShellIntegrationErr -ErrorAction SilentlyContinue"
     )
 }
 
@@ -2029,6 +2111,213 @@ mod powershell_tests {
         assert!(
             POWERSHELL_SCRIPT.contains(r"'\\?\UNC\'") && POWERSHELL_SCRIPT.contains(r"'\\?\'"),
             "__takoStripVerbatim が verbatim / verbatim UNC の両方を見ていない（#970）"
+        );
+    }
+
+    // --- #2659: 統合スクリプトの読み込み（読み直しと警告）と書き出し（同じなら書かない）---------
+
+    fn bootstrap_en(script: &str) -> String {
+        powershell_bootstrap_in(Path::new(script), crate::i18n::Lang::En)
+    }
+
+    /// #2659: 読み込みは共有違反（32 / 33）のときだけ上限つきで読み直し、読めなければ警告を出す。
+    /// 置き場が無いときは今までどおり黙る（警告も `Test-Path` の内側）・壊れたスクリプトも黙る
+    #[test]
+    fn issue2659_読み込みは共有違反だけ読み直し読めなければ警告を出す() {
+        let body = bootstrap_en("C:\\tako\\shell-integration\\tako.ps1");
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` が無い:\n{body}"))
+        };
+        let guard = at("if (Test-Path -LiteralPath $__takoShellIntegrationScript) {");
+        let loop_at = at("while ($true) {");
+        let read = at("[System.IO.File]::ReadAllText($__takoShellIntegrationScript); break");
+        let warn = at("else { Write-Warning (");
+        let remove = at("Remove-Variable -Name __takoShellIntegrationScript");
+        assert!(
+            guard < loop_at && loop_at < read && read < warn && warn < remove,
+            "置き場の確認 → 読み直しの輪 → 警告 → 後片付けの順でない:\n{body}"
+        );
+        // 読み直すのは共有違反だけ・回数と間隔は定数のとおり
+        at("@(32, 33) -notcontains ($__takoShellIntegrationErr.HResult -band 0xFFFF)");
+        at(&format!(
+            "($__takoShellIntegrationTry -ge {POWERSHELL_SCRIPT_READ_RETRIES})"
+        ));
+        at(&format!(
+            "[System.Threading.Thread]::Sleep({})",
+            POWERSHELL_SCRIPT_READ_RETRY_INTERVAL.as_millis()
+        ));
+        assert!(
+            POWERSHELL_SCRIPT_READ_RETRY_INTERVAL * POWERSHELL_SCRIPT_READ_RETRIES
+                <= std::time::Duration::from_secs(1),
+            "読み直しの上限が長い（ペインの起動を待たせる）"
+        );
+        // 壊れたスクリプトは今までどおり黙る（dot-source の catch）
+        at(". ([scriptblock]::Create($__takoShellIntegrationText)) } catch { }");
+        at("could not load the shell integration");
+        // 一時変数はすべて片付ける
+        let tail = &body[remove..];
+        for var in [
+            "__takoShellIntegrationScript",
+            "__takoShellIntegrationText",
+            "__takoShellIntegrationTry",
+            "__takoShellIntegrationErr",
+        ] {
+            assert!(tail.contains(var), "{var} を片付けていない:\n{tail}");
+        }
+        assert!(body.is_ascii(), "{body}");
+    }
+
+    /// #2659: 警告は表示言語に従い、日本語も ASCII だけの式で埋める（5.1 の読み違いを避ける）
+    #[test]
+    fn issue2659_警告は表示言語に従う() {
+        let script = Path::new("C:\\tako\\tako.ps1");
+        let ja = powershell_bootstrap_in(script, crate::i18n::Lang::Ja);
+        let en = powershell_bootstrap_in(script, crate::i18n::Lang::En);
+        assert!(en.contains("could not load the shell integration"), "{en}");
+        assert!(!ja.contains("could not load"), "{ja}");
+        assert!(
+            ja.contains(&powershell_ascii_literal(
+                "シェル統合を読み込めませんでした"
+            )),
+            "{ja}"
+        );
+        assert!(ja.is_ascii(), "{ja}");
+    }
+
+    /// #2659 の A/B: `TAKO_2659_LEGACY=1` は修正前の本文（1 回だけ読んで失敗を黙って捨てる）
+    #[test]
+    fn issue2659_legacyでは1回だけ読んで黙る() {
+        if crate::run_alone!(issue2659_legacyでは1回だけ読んで黙る) {
+            return;
+        }
+        // 子の中だけ（他のテストは居ない。#2400）
+        unsafe { std::env::set_var("TAKO_2659_LEGACY", "1") };
+        let body = bootstrap_en("C:\\tako\\tako.ps1");
+        assert!(
+            body.contains(
+                "try { . ([scriptblock]::Create([System.IO.File]::ReadAllText($__takoShellIntegrationScript))) } catch { } }"
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("while ($true)"), "{body}");
+        assert!(!body.contains("Write-Warning"), "{body}");
+    }
+
+    /// 読み取り専用にする（戻すときは false）。書けてしまう環境（root 等）なら false を返す
+    fn make_readonly(path: &Path, readonly: bool) -> bool {
+        let mut perms = std::fs::metadata(path).expect("属性を読める").permissions();
+        perms.set_readonly(readonly);
+        std::fs::set_permissions(path, perms).expect("属性を変えられる");
+        !readonly || std::fs::OpenOptions::new().write(true).open(path).is_err()
+    }
+
+    /// #2659: 中身が同じならスクリプトを開きもしない（読み取り専用にしても Ok = 書こうとしていない）。
+    /// 中身が違えば書き直す
+    #[test]
+    fn issue2659_中身が同じならスクリプトを書き直さない() {
+        let dir = ScratchDir::new("i2659-write-same");
+        let path = write_powershell_script(dir.path()).expect("1 回目は書ける");
+        let first = std::fs::read(&path).expect("書いた中身を読める");
+        if !make_readonly(&path, true) {
+            make_readonly(&path, false);
+            eprintln!(
+                "skip: 読み取り専用でも書ける環境（root 等）では書き直しの有無を見分けられない"
+            );
+            return;
+        }
+        let again = write_powershell_script(dir.path());
+        make_readonly(&path, false);
+        assert!(again.is_ok(), "中身が同じなのに書き直そうとした: {again:?}");
+        std::fs::write(&path, b"# older version\n").expect("古い中身を置ける");
+        write_powershell_script(dir.path()).expect("中身が違えば書き直す");
+        assert_eq!(std::fs::read(&path).expect("読める"), first);
+    }
+
+    /// #2659 の A/B: `TAKO_2659_LEGACY=1` は中身が同じでも毎回書き直す（= 読み取り専用で失敗する）
+    #[test]
+    fn issue2659_legacyでは中身が同じでも書き直す() {
+        if crate::run_alone!(issue2659_legacyでは中身が同じでも書き直す) {
+            return;
+        }
+        // 子の中だけ（他のテストは居ない。#2400）
+        unsafe { std::env::set_var("TAKO_2659_LEGACY", "1") };
+        let dir = ScratchDir::new("i2659-write-legacy");
+        let path = write_powershell_script(dir.path()).expect("1 回目は書ける");
+        if !make_readonly(&path, true) {
+            make_readonly(&path, false);
+            eprintln!(
+                "skip: 読み取り専用でも書ける環境（root 等）では書き直しの有無を見分けられない"
+            );
+            return;
+        }
+        let again = write_powershell_script(dir.path());
+        make_readonly(&path, false);
+        assert!(again.is_err(), "legacy なのに書き直していない: {again:?}");
+    }
+
+    /// #2659: 本文を**実物の PowerShell** で走らせる（手元に `pwsh` があるときだけ。macOS / Windows の
+    /// CI のランナーには入っている）。読めれば読み込み・置き場が無ければ黙る・在るのに読めなければ
+    /// 警告、の 3 通り。共有違反での読み直しは Windows でしか起きないので
+    /// `tests/shell_integration_powershell.rs` の注入（ロックを握ってから放す）が見る
+    #[test]
+    fn issue2659_本文を実物のpowershellで走らせると読めないときだけ警告が出る() {
+        let dir = ScratchDir::new("i2659-pwsh");
+        let run = |script: &Path| -> Option<String> {
+            let encoded = crate::platform::shell::encode_powershell_command(&bootstrap_en(
+                &script.display().to_string(),
+            ));
+            match crate::probe::output_with_timeout(
+                "pwsh",
+                &[
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-EncodedCommand",
+                    &encoded,
+                ],
+                std::time::Duration::from_secs(60),
+            ) {
+                crate::probe::Outcome::Done { stdout, stderr, .. } => Some(format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                )),
+                _ => None,
+            }
+        };
+        let ok = dir.path().join("ok.ps1");
+        std::fs::write(&ok, "Write-Output ('TAKO2659-' + 'LOADED')\n").expect("置ける");
+        let Some(loaded) = run(&ok) else {
+            eprintln!("skip: pwsh が無い");
+            return;
+        };
+        assert!(
+            loaded.contains("TAKO2659-LOADED"),
+            "読めるのに読み込まない:\n{loaded}"
+        );
+        assert!(
+            !loaded.contains("could not load"),
+            "読めたのに警告を出した:\n{loaded}"
+        );
+
+        let missing = run(&dir.path().join("gone").join("tako.ps1")).expect("pwsh は在る");
+        assert!(
+            !missing.contains("could not load") && !missing.contains("__tako"),
+            "置き場が無いのに何か出した:\n{missing}"
+        );
+
+        // 在るのに読めない = ディレクトリ（`Test-Path` は真・`ReadAllText` は共有違反でない失敗）
+        let unreadable = dir.path().join("dir.ps1");
+        std::fs::create_dir_all(&unreadable).expect("作れる");
+        let warned = run(&unreadable).expect("pwsh は在る");
+        assert!(
+            warned.contains("could not load the shell integration"),
+            "読めなかったのに警告が出ない:\n{warned}"
+        );
+        assert!(
+            !warned.contains("__tako"),
+            "一時変数の名前が漏れている:\n{warned}"
         );
     }
 }
