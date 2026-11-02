@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use crate::orchestrator::agent::TrustWriteError;
+
 // --- 画面状態の検出（純関数） ---
 
 // --- 選択肢ダイアログ検知（#319 permission → #748 で一般化） ---
@@ -802,9 +804,9 @@ fn resolve_config_json_paths(
     paths
 }
 
-/// 書き込み対象が 1 つも解決できないときのエラー文言
+/// 書き込み対象が 1 つも解決できないときのエラー文言（Bypass の事前承認は stderr だけなので日本語）
 fn no_config_path_err() -> String {
-    "claude の設定ファイル（.claude.json）の場所を特定できない".to_string()
+    TrustWriteError::ClaudeConfigPathUnknown.text_in(tako_core::i18n::Lang::Ja)
 }
 
 // --- 事前信頼（Issue #32 問題 1） ---
@@ -815,17 +817,17 @@ fn no_config_path_err() -> String {
 /// 実行中の別 claude が設定ファイルを書き戻すレースで負ける可能性があるため
 /// best-effort とし、失敗しても呼び出し側はダイアログ検出 → 承諾のフォールバックで継続する。
 /// 戻り値: 新たに書き込んだ / 既に信頼済みなら Ok(true)
-pub fn ensure_trusted(cwd: &str) -> Result<bool, String> {
+pub fn ensure_trusted(cwd: &str) -> Result<bool, TrustWriteError> {
     ensure_trusted_in(None, cwd)
 }
 
 /// config ディレクトリを明示する版（Issue #558）。アカウント指定で
 /// `CLAUDE_CONFIG_DIR` を注入して spawn する場合、信頼はその config dir 配下の
 /// `.claude.json` に書かないと効かない
-pub fn ensure_trusted_in(config_dir: Option<&str>, cwd: &str) -> Result<bool, String> {
+pub fn ensure_trusted_in(config_dir: Option<&str>, cwd: &str) -> Result<bool, TrustWriteError> {
     let paths = config_json_paths(config_dir);
     if paths.is_empty() {
-        return Err(no_config_path_err());
+        return Err(TrustWriteError::ClaudeConfigPathUnknown);
     }
     let mut ok = false;
     let mut last_err = None;
@@ -840,7 +842,7 @@ pub fn ensure_trusted_in(config_dir: Option<&str>, cwd: &str) -> Result<bool, St
     if ok {
         Ok(true)
     } else {
-        Err(last_err.unwrap_or_else(no_config_path_err))
+        Err(last_err.unwrap_or(TrustWriteError::ClaudeConfigPathUnknown))
     }
 }
 
@@ -901,35 +903,44 @@ fn ensure_bypass_accepted_at(path: &Path) -> Result<bool, String> {
     }
     obj.insert("bypassPermissionsModeAccepted".into(), json!(true));
 
-    write_claude_json(path, &root)?;
+    write_claude_json(path, &root).map_err(|e| e.text_in(tako_core::i18n::Lang::Ja))?;
     Ok(true)
 }
 
-fn ensure_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
+fn ensure_trusted_at(path: &Path, cwd: &str) -> Result<bool, TrustWriteError> {
+    let shown = || path.display().to_string();
     let mut root: serde_json::Value = match std::fs::read_to_string(path) {
-        Ok(s) => serde_json::from_str(&s).map_err(|e| {
-            format!(
-                "{} を解釈できない: {}",
-                path.display(),
-                tako_core::load_issue::json_error_reason(&e)
-            )
+        Ok(s) => serde_json::from_str(&s).map_err(|e| TrustWriteError::Parse {
+            path: shown(),
+            reason: tako_core::load_issue::JsonReason::of(&e),
         })?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({}),
-        Err(e) => return Err(format!("{} を読めない: {e}", path.display())),
+        Err(e) => {
+            return Err(TrustWriteError::Read {
+                path: shown(),
+                error: e.to_string(),
+            })
+        }
     };
     let obj = root
         .as_object_mut()
-        .ok_or_else(|| format!("{} のトップレベルがオブジェクトでない", path.display()))?;
+        .ok_or_else(|| TrustWriteError::TopLevelNotObject { path: shown() })?;
     let projects = obj
         .entry("projects")
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .ok_or_else(|| format!("{} の projects がオブジェクトでない", path.display()))?;
+        .ok_or_else(|| TrustWriteError::FieldNotObject {
+            path: shown(),
+            field: "projects".to_string(),
+        })?;
     let entry = projects
         .entry(cwd.to_string())
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .ok_or_else(|| format!("{} の projects.{cwd} がオブジェクトでない", path.display()))?;
+        .ok_or_else(|| TrustWriteError::FieldNotObject {
+            path: shown(),
+            field: format!("projects.{cwd}"),
+        })?;
     if entry
         .get("hasTrustDialogAccepted")
         .and_then(|v| v.as_bool())
@@ -950,16 +961,24 @@ fn ensure_trusted_at(path: &Path, cwd: &str) -> Result<bool, String> {
 /// （claude を一度も起動していない / config dir を明示した初回）では**無い**。
 /// 作らないと rename が NotFound で落ち、事前信頼が黙って効かない
 /// （#944 の検証で判明。codex / agy の `ensure_*_trusted_at` は元から作っていた）
-fn write_claude_json(path: &Path, root: &serde_json::Value) -> Result<(), String> {
+fn write_claude_json(path: &Path, root: &serde_json::Value) -> Result<(), TrustWriteError> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("{} のディレクトリを作れない: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| TrustWriteError::DirCreateAt {
+            dir: parent.display().to_string(),
+            error: e.to_string(),
+        })?;
     }
     let tmp = path.with_extension("json.tako-tmp");
-    let serialized =
-        serde_json::to_string_pretty(root).map_err(|e| format!("設定を直列化できない: {e}"))?;
-    std::fs::write(&tmp, serialized).map_err(|e| format!("{} を書けない: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{} を置換できない: {e}", path.display()))
+    let serialized = serde_json::to_string_pretty(root)
+        .map_err(|e| TrustWriteError::Serialize(e.to_string()))?;
+    std::fs::write(&tmp, serialized).map_err(|e| TrustWriteError::Write {
+        path: tmp.display().to_string(),
+        error: e.to_string(),
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| TrustWriteError::Replace {
+        path: path.display().to_string(),
+        error: e.to_string(),
+    })
 }
 
 // --- tmux 経由の送達確認つき配送 ---

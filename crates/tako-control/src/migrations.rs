@@ -1153,7 +1153,15 @@ fn handoff_reports(mode: Mode) -> Vec<FileReport> {
     for (profile, path, old) in before {
         let now = std::fs::read_to_string(&path).ok();
         let outcome = outcomes.iter().find(|o| o.profile == profile);
-        let warnings = outcome.map(|o| o.warnings.clone()).unwrap_or_default();
+        // 移行の記録は日本語の枠（`FileOutcome::Failed`）なので理由も日本語で組む（#2365）
+        let warnings: Vec<String> = outcome
+            .map(|o| {
+                o.warnings
+                    .iter()
+                    .map(|w| w.text_in(tako_core::i18n::Lang::Ja))
+                    .collect()
+            })
+            .unwrap_or_default();
         if !warnings.is_empty() {
             reports.push(FileReport {
                 id: SchemaId::Handoff,

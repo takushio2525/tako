@@ -142,7 +142,7 @@ fn write_file_typed(path: &Path, content: &str) -> Result<(), ConfigError> {
 // --- 自動移行 ---------------------------------------------------------------
 
 /// 1 プロファイルぶんの移行結果（可視化・応答 JSON 用）
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct MigrationOutcome {
     /// 対象プロファイル
     pub profile: String,
@@ -154,8 +154,21 @@ pub struct MigrationOutcome {
     pub kept_lines: usize,
     /// 移行前のファイルの退避先
     pub archived_to: Option<String>,
-    /// 移行で起きた問題（キーが不正・書き込み失敗など。移行自体は続ける）
-    pub warnings: Vec<String>,
+    /// 移行で起きた問題（キーが不正・書き込み失敗など。移行自体は続ける）。
+    ///
+    /// 型で持ち、応答の JSON（`handoff_migration.warnings`・`handoffs migrate` の `migrations`）へは
+    /// 組んだその場の表示言語の文で載せる。`tako migrate` の記録（`FileOutcome::Failed`）は
+    /// 日本語の枠なので `text_in(Lang::Ja)`（#2365）
+    #[serde(serialize_with = "notes_as_text")]
+    pub warnings: Vec<crate::ReplyNote>,
+}
+
+/// [`MigrationOutcome::warnings`] を表示言語の文の配列として書き出す（JSON の形は従来どおり文字列の配列）
+fn notes_as_text<S: serde::Serializer>(
+    notes: &[crate::ReplyNote],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(notes.iter().map(ToString::to_string))
 }
 
 impl MigrationOutcome {
@@ -203,11 +216,11 @@ pub fn ensure_migrated(profile: &str) -> MigrationOutcome {
     if stamped && !ho::needs_migration_scan(&content) {
         return out;
     }
-    let all_keys: Vec<String> = match ProjectsConfig::load() {
+    let all_keys: Vec<String> = match ProjectsConfig::load_typed() {
         Ok(c) => c.projects.keys().cloned().collect(),
         Err(e) => {
             out.warnings
-                .push(format!("projects.yaml が読めないため移行を見送った: {e}"));
+                .push(crate::ReplyNote::HandoffMigrationDeferred(e));
             return out;
         }
     };
@@ -221,8 +234,9 @@ pub fn ensure_migrated(profile: &str) -> MigrationOutcome {
         // （次からは安い前判定で抜けられる。内容は 1 バイトも変えない）
         if !stamped {
             let stamped_body = format!("{}\n{content}", ho::HANDOFF_FORMAT_MARKER);
-            if let Err(e) = write_profile_memo(profile, &stamped_body) {
-                out.warnings.push(e);
+            if let Err(e) = write_profile_memo_typed(profile, &stamped_body) {
+                out.warnings
+                    .push(crate::ReplyNote::HandoffMigrationWriteFailed(e));
             }
         }
         return out;
@@ -234,7 +248,7 @@ pub fn ensure_migrated(profile: &str) -> MigrationOutcome {
         Err(e) => {
             // 退避できないなら移行しない（原本を失うリスクを取らない）
             out.warnings
-                .push(format!("移行前のファイルを退避できないため中止した: {e}"));
+                .push(crate::ReplyNote::HandoffMigrationArchiveFailed(e));
             return out;
         }
     }
@@ -256,11 +270,12 @@ pub fn ensure_migrated(profile: &str) -> MigrationOutcome {
                 body.trim()
             ),
         };
-        match write_project_handoff(&key, &merged) {
+        match write_project_handoff_typed(&key, &merged) {
             Ok(path) => out.moved.push((key, path.display().to_string())),
             Err(e) => {
                 write_failed = true;
-                out.warnings.push(e);
+                out.warnings
+                    .push(crate::ReplyNote::HandoffMigrationWriteFailed(e));
             }
         }
     }
@@ -268,10 +283,8 @@ pub fn ensure_migrated(profile: &str) -> MigrationOutcome {
         // 1 つでも移せなかったら**運用メモは書き換えない**。書き換えると、移せなかった
         // 断片が現用のファイルから消えて退避先にしか無くなる（原本は残っているので
         // 復元はできるが、気づかないまま欠けた状態で動くほうが危ない）
-        out.warnings.push(
-            "移せないプロジェクトがあったため運用メモの書き換えを中止した（原本は退避済み）"
-                .to_string(),
-        );
+        out.warnings
+            .push(crate::ReplyNote::HandoffMigrationMemoKept);
         return out;
     }
 
@@ -287,8 +300,9 @@ pub fn ensure_migrated(profile: &str) -> MigrationOutcome {
         )
     };
     out.kept_lines = residue.lines().filter(|l| !l.trim().is_empty()).count();
-    if let Err(e) = write_profile_memo(profile, &memo) {
-        out.warnings.push(e);
+    if let Err(e) = write_profile_memo_typed(profile, &memo) {
+        out.warnings
+            .push(crate::ReplyNote::HandoffMigrationWriteFailed(e));
     }
     out.migrated = !out.moved.is_empty();
     out
@@ -308,19 +322,22 @@ fn migrated_note(profile: &str) -> String {
 }
 
 /// 移行前の原本を `handoff/archive/` へ退避する。既存を上書きしない
-fn archive_original(profile: &str, content: &str) -> Result<PathBuf, String> {
-    let dir = archive_dir().ok_or("ホームディレクトリが取得できない")?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("退避先を作れない: {} ({e})", dir.display()))?;
+fn archive_original(profile: &str, content: &str) -> Result<PathBuf, ConfigError> {
+    let dir = archive_dir().ok_or(ConfigError::HomeUnresolved)?;
+    std::fs::create_dir_all(&dir).map_err(|e| ConfigError::HandoffArchiveDirCreate {
+        dir: dir.display().to_string(),
+        error: e.to_string(),
+    })?;
     for n in 1..=999u32 {
         let path = dir.join(format!("{profile}-pre915-{n}.md"));
         if path.exists() {
             continue;
         }
-        std::fs::write(&path, content).map_err(|e| format!("退避に失敗: {e}"))?;
+        std::fs::write(&path, content)
+            .map_err(|e| ConfigError::HandoffArchiveWrite(e.to_string()))?;
         return Ok(path);
     }
-    Err("退避先の連番が埋まっている".into())
+    Err(ConfigError::HandoffArchiveFull)
 }
 
 // --- 後任へ渡す一式の組み立て -----------------------------------------------

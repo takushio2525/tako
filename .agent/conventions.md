@@ -689,6 +689,19 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `profile_generation` ほか）は変えていない。番犬は同じ `issue1762_dispatch_error_lang.rs`（`Reason` / `ConfigError` /
   `ReplyNote` の表に旧文・注記を組む口の本体を `NOTE_ITEM_SCOPES` / `CONFIG_REFUSAL_SCOPES` に足し、本物の
   ソースへの注入で `file:line` を名指す）
+- 同じ続きで、**orchestrator の応答の `warnings` に並ぶ別モジュールの注記の残り 3 つ**も型で返す。引き継ぎファイルの
+  自動移行（`handoff_store::ensure_migrated` の `MigrationOutcome::warnings`）は `ReplyNote` の 4 種
+  （`HandoffMigrationDeferred` / `WriteFailed` / `ArchiveFailed` / `MemoKept`。原本を退避できない理由は
+  `ConfigError::{HandoffArchiveDirCreate, HandoffArchiveWrite, HandoffArchiveFull}`）で持ち、応答の JSON
+  （`handoff_migration` / `handoffs migrate` の `migrations`）へは `serialize_with` で表示言語の文の配列として書き出す
+  （形は文字列の配列のまま）。モデルの食い違い（#1638）は `ReplyNote::{ModelMismatch, WorkerModelMismatch}`
+  （`registry::model_warning` / `ModelObservation::warning`。tako-core の `model_check::mismatch_warning` は外した）。
+  spawn の事前信頼の書き込み失敗の `detail` は `orchestrator::agent::TrustWriteError`（12 種。claude / codex / agy の
+  書き手 = `claude_tui::ensure_trusted_in` / `ensure_trusted_at` / `write_claude_json` と `ensure_codex_trusted*` /
+  `ensure_agy_trusted*`）で、`message` と同じ表示言語。**persist.log（実際のモデルの観測の行）・`tako migrate` の記録
+  （`FileOutcome::Failed`）・stderr の診断（`launch_warning` / 引き継ぎの事前信頼の失敗）は `text_in(Lang::Ja)`** で
+  修正前とバイト一致。番犬は同じ `issue1762_dispatch_error_lang.rs`（`ConfigError` / `ReplyNote` の表と
+  `TrustWriteError` の節。読めないプロファイルの理由の番犬 `ja_fixed_outside_log` は `eprintln!` の行も診断として外す）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
