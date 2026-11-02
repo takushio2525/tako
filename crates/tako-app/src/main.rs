@@ -50212,8 +50212,7 @@ mod self_test {
                 // #2045: 置換欄 → プレビュー → 行の置換 → すべて置換 → 元に戻す
                 "workspace-replace-2045" => {
                     workspace_replace_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2046: 鍵らしき文字を貼ると確認が出て、やめると PTY へ 1 バイトも届かないか
                 "paste-guard" => {
