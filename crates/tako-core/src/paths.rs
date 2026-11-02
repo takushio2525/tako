@@ -198,22 +198,45 @@ pub fn is_verification_process() -> bool {
 /// **データディレクトリの下には置かない**: `TAKO_SELF_TEST=1` だけの起動
 /// （AGENTS.md の実 claude e2e）は data dir が本番のままなので、そこへ置くと
 /// 「本番の置き場へ書かない」という前提が崩れる
+///
+/// **読む口 = パスを決めるだけで作らない**（#2685）。読むだけの呼び手（`tako usage` の
+/// 設定 dir の列挙・資格情報の参照など）が引くたびに作っていたので、CLI が 1 回動くごとに
+/// その pid の空の dir が残った（CLI 自身しか使わない pid つきの置き場なので、GUI の側では
+/// 片付けられない）。無ければ「まだ何も書いていない = 空」として扱えばよい。
+/// 置き場を先に作っておく必要がある書き手は [`ensure_verification_agent_home`] を通す
+/// （書く瞬間に親 dir を自分で作る書き手 = 事前信頼・mod の install は、どちらでもよい）
 pub fn verification_agent_home() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!("tako-agent-config-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
         // **テストプロセスのときだけ**終了時に自分の dir を消す（#1312）。
         // #1296 がここを自動掃除の対象から外したのは、これを作るのが
         // テストバイナリだけでなく製品バイナリの検証起動（`TAKO_ISOLATED` /
         // `TAKO_SELF_TEST`）でもあるため。`is_test_process` で絞れば
-        // 製品の挙動は 1 ビットも変わらず、`cargo test` の残骸だけが消える
+        // 製品の挙動は 1 ビットも変わらず、`cargo test` の残骸だけが消える。
+        // 作る前に武装しておく（#2685）: 書き手が親 dir ごと作る経路
+        // （`create_dir_all(<ホーム>/.codex)` 等）でも後始末が付く。無い dir の削除は黙って済む
         if is_test_process() {
             crate::test_residue::arm_self_cleanup(&dir);
         }
         dir
     })
     .clone()
+}
+
+/// 作る口: [`verification_agent_home`] を**在る状態にして**返す（#2685）。
+///
+/// 置き場が先に在ることに頼る書き手だけが通す。いまはシェルの履歴の書き先
+/// （[`verification_histfile_env`]）だけで、シェルは `HISTFILE` の親 dir を作らない。
+/// 作るのは 1 プロセス 1 回（修正前の `OnceLock` と同じ）: 終了の後始末
+/// （`tako-app` の `cleanup_process_scoped`）が消した後に作り直さない
+pub fn ensure_verification_agent_home() -> PathBuf {
+    static CREATED: std::sync::Once = std::sync::Once::new();
+    let dir = verification_agent_home();
+    CREATED.call_once(|| {
+        let _ = std::fs::create_dir_all(&dir);
+    });
+    dir
 }
 
 /// 検証プロセスの `HISTFILE` を tako 側から指す環境変数（#1253）。
@@ -241,7 +264,8 @@ pub fn verification_histfile_env() -> Vec<(String, String)> {
     if !is_verification_process() {
         return Vec::new();
     }
-    let path = verification_agent_home()
+    // シェルは履歴の親 dir を作らないので、ここは作る口（#2685）
+    let path = ensure_verification_agent_home()
         .join("shell_history")
         .display()
         .to_string();

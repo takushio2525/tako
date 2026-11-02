@@ -2156,4 +2156,66 @@ mod tests {
         assert!(notes.contains("codex は rollout の token_count"), "{notes}");
         assert!(notes.contains("プランが週の枠だけ"), "{notes}");
     }
+
+    /// #2685: 読むだけの経路（CLI の `tako usage` / `--by issue` と同じ `usage_payload`・設定 dir の解決）は
+    /// 検証用の設定置き場 `tako-agent-config-<pid>` を作らない。書き手（シェル履歴・事前信頼）は作り、
+    /// 中身が在れば読む。置き場は pid ごとなので、他のテストが居ない子（新しい pid）で見る
+    #[test]
+    fn issue2685_読むだけの経路は検証用の設定置き場を作らない() {
+        if tako_core::run_alone!(issue2685_読むだけの経路は検証用の設定置き場を作らない)
+        {
+            return;
+        }
+        use crate::orchestrator::agent::{ensure_trusted, WorkerAgent};
+        let home = tako_core::paths::verification_agent_home();
+        assert!(!home.exists(), "子の起動の時点で在る: {}", home.display());
+        let usage = |by: Option<&str>| {
+            let query = crate::usage::UsageQuery {
+                by: by.map(String::from),
+                ..Default::default()
+            };
+            crate::usage::usage_payload(&query, crate::usage::Refresh::Full).unwrap()
+        };
+        // 無ければ空として答える（CLI の 2 形）
+        for by in [None, Some("issue")] {
+            let p = usage(by);
+            assert_eq!(p["index"]["update"]["files"], 0, "{by:?}: {p}");
+        }
+        // 同じ置き場を引く読むだけの呼び手を一通り
+        let _ = roots();
+        let _ = codex_homes();
+        let _ = crate::orchestrator::agent_config_home();
+        let _ = crate::claude_tui::config_json_paths(None);
+        let _ = crate::claude_mod_install::default_config_dir();
+        let _ = crate::worker_mcp::codex_home_for(&crate::orchestrator::EMPTY_ENV_PLAN);
+        assert!(
+            !home.exists(),
+            "読むだけの経路が置き場を作った: {}",
+            home.display()
+        );
+
+        // 書き手は作る: シェル履歴（親 dir を作らないシェルのための作る口）
+        let hist = tako_core::paths::verification_histfile_env();
+        assert_eq!(hist.len(), 2, "{hist:?}");
+        assert!(home.is_dir(), "シェル履歴の書き先が作られない");
+        std::fs::remove_dir_all(&home).unwrap();
+        // 事前信頼（spawn の前）: codex / claude とも、書く瞬間に置き場ごと作る
+        ensure_trusted(WorkerAgent::Codex, ALPHA).unwrap();
+        assert!(home.join(".codex/config.toml").is_file());
+        std::fs::remove_dir_all(&home).unwrap();
+        ensure_trusted(WorkerAgent::Claude, ALPHA).unwrap();
+        assert!(home.join(".claude/.claude.json").is_file());
+
+        // 中身が在れば読む（既定の設定 dir = 置き場の `.claude`）
+        let s1 = home.join(".claude/projects/-home-testuser-dev-alpha/s1.jsonl");
+        std::fs::create_dir_all(s1.parent().unwrap()).unwrap();
+        write(
+            &s1,
+            &[assistant("msg_a", "s1", &T1, OPUS, [2, 5, 0, 0, 0], ALPHA)],
+            "",
+        );
+        let p = usage(Some("issue"));
+        assert_eq!(p["index"]["update"]["files"], 1, "{p}");
+        assert_eq!(p["index"]["update"]["responses"], 1, "{p}");
+    }
 }

@@ -406,6 +406,12 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 ///
 /// [`home_dir`] 自体は倒さない: 表示・比較（`is_claude_default_config_dir` 等）は
 /// 本物のホームで判定する必要があり、まとめて倒すと**別のテストが壊れる**
+///
+/// **読む口 = 置き場を作らない**（#2685）。検証プロセスの置き場が無ければ「まだ何も書いていない
+/// = 空」として読めばよい（`tako usage` の CLI が読むだけで空の pid の dir を残していた）。
+/// 書き手は書く瞬間に親 dir を自分で作る（事前信頼の `create_dir_all(parent)` /
+/// `write_claude_json`・mod の install）。先に在ることに頼る書き手は
+/// `tako_core::paths::ensure_verification_agent_home` を通す
 pub(crate) fn agent_config_home() -> Option<PathBuf> {
     if tako_core::paths::is_verification_process() {
         return Some(tako_core::paths::verification_agent_home());
