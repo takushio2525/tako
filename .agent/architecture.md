@@ -1883,6 +1883,22 @@ lid-guard.json が使う）:
   記録の後**（送達フローが到達を書くレジストリのエントリが先に在る = #790・事前信頼も起動より前）。同期の腕も同じ 3 段を同じ順に
   通す。番犬 `issue2646_orchestrator_offload_watchdog.rs`、A/B は `TAKO_2646_LEGACY=1`、注入は `TAKO_2646_INJECT_IO_MS`、実経路は
   `scripts/test-orchestrator-offload-2646.sh`（FR-2.26.8）
+- **ペインの close の worker レジストリへの記録も UI スレッドで書かない**（#2657）: 明示 close の記録
+  （`mark_closed_by_origin`）は workers.yaml を読んで YAML を解釈し、上限の無い flock を取り、書き出して世代バックアップを回し
+  `sync_all`（macOS は F_FULLFSYNC）まで行う。#2618 の段 1 の実測では器の worker の close の専有の 9 割以上がこれで、裾は
+  解釈 87.6ms・読み 30.5ms・fsync 21.3ms・別プロセスのロック 400ms で `dispatch:Close` 350ms。close（`Close` / たまり場の
+  `BackgroundKill`）は UI の段（`close_place` = 守り・ツリーの close・リフロー・`detach_session`・引き継ぎの帳面。書く記録
+  `CloseMark` を返すだけ）と記録の段（`CloseRecord::finish` = `CloseMark::write`）に分け、IPC の受け口は `prepare_offload` →
+  `OffloadJob::ClosePlace`（何も待たずに着地へ）→ `land_offload` の UI の段 → `OffloadLanding::Settled` → background の
+  `OffloadJob::CloseRecord` で**書き終わってから応答する**（close の応答の後に `workers` を読めば closed の順序は修正前と同じ）。
+  UI スレッドに残る段も `dispatch:Close` のタグで測る。同期の呼び手（`TAKO_OFFLOAD=0`・直の呼び手）は同じ 2 段を同じ順に通す。
+  GUI の × / ⌘W / タブ close / たまり場カード（`mark_worker_closed`）は `CloseMark::spawn`（背景のスレッド）で書き、
+  `on_app_quit` の `flush_close_records`（上限 5 秒）が書き終わりを待つ。persist.log の「セッション kill」の行は kill の
+  スレッドの先頭で書く（kill より前の順は保つ）。#641 の「入力」の記録（`counts_as_input`）は IPC の受信ループの準備より前の
+  1 か所へ移した（準備 → 着地へ移った close が数え漏れない。同じく準備を通る `OrchestratorRespond` / `TmuxKill` / 器のペインの
+  `PaneClick` も数えるようになった）。着地がアクティブウィンドウをまたいだら同期の腕と同じく OS ウィンドウを前面化する。
+  番犬 `issue2657_close_offload_watchdog.rs`、A/B は `TAKO_2657_LEGACY=1`（門は `close_record::legacy()` の 1 か所）、注入は
+  `TAKO_2657_INJECT_RECORD_MS`、実経路は `scripts/test-close-record-offload-2657.sh`（FR-2.26.9）
 - **照会 1 回の中では `ps` / `tmux list-panes -a` を 1 回だけ起こす**（#1968）: 状態照会は
   `has_running_children` と claude / codex / agy の会話 ID 解決が**それぞれ** `ps` と
   `tmux list-panes -a` を起こしていた（報告 1 回で `ps` 3 本）。`agents::with_shared_scan` の

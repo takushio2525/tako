@@ -5789,6 +5789,9 @@ impl TakoApp {
             // #2618: ペインログの書き手へ積んだ追記（上の直接ペインのクローズフラッシュ・最後のタブの
             // 明示クローズのフラッシュ）を書き終えてから抜ける。quitting でも待つ・後片付けより前
             this.flush_pane_log_writer("on_app_quit");
+            // #2657: 背景へ投げた worker レジストリへの close の記録（GUI の × / ⌘W / タブ close）を
+            // 書き終えてから抜ける（最後に閉じた worker を active で残さない）。後片付けより前
+            this.flush_close_records("on_app_quit");
             // #1192 / #1253: このプロセスだけが使う資源（自分の pid から作った使い捨ての
             // backend サーバーとソケットファイル・検証起動の設定置き場）を片付ける。
             // セルフテストの失敗の出口（`self_test::fail`）と同じ 1 実装（#2388）
@@ -6321,6 +6324,12 @@ impl TakoApp {
                     Some("0" | "false" | "off")
                 );
                 let offload = this.update(cx, |app: &mut TakoApp, cx| {
+                    // #641: ペインへの送信・クリック・close は「入力」（以後の全滅は普通の終了として扱う）。
+                    // #2657: 同期の dispatch と background へ出す要求のどちらへ分かれても 1 回だけ数える
+                    // （close が準備 → 着地の経路へ移って数え漏れないよう、分かれる前に置く）
+                    if tako_control::restore_guard::counts_as_input(&incoming.request) {
+                        app.restore_guard.note_input();
+                    }
                     if offload_enabled {
                         // #1968: 準備（UI スレッド部）も測る。ここが子プロセスを待っていても
                         // 計測区間の外だったので perf.log に出ず、UI ストールが「再開経路側の
@@ -6420,10 +6429,7 @@ impl TakoApp {
                             ..
                         }
                     );
-                    // #641: ペインへの送信・クリックは「入力」（以後の全滅は普通の終了として扱う）
-                    if tako_control::restore_guard::counts_as_input(&incoming.request) {
-                        app.restore_guard.note_input();
-                    }
+                    // #641 の「入力」の記録は分かれる前（上の準備の段）で済ませてある（#2657）
                     let mut result = tako_control::dispatch(app, incoming.request, incoming.origin);
                     if limit_resume_changed && app.refresh_limit_resume_summary() {
                         cx.notify();
@@ -8205,7 +8211,14 @@ impl TakoApp {
     ) -> OffloadLanded {
         let _span = tako_control::diag::perf_span("ipc_turn");
         let needs_frame = next.changes_layout() && !Self::ipc_redraw_legacy();
-        match tako_control::land_offload(self, next, origin) {
+        let prev_window = self.workspace.active_window_id();
+        let landed = tako_control::land_offload(self, next, origin);
+        // #2657: 着地がアクティブウィンドウをまたいだら（close でウィンドウの最後のタブを閉じた等）
+        // OS ウィンドウも前面化する（受信ループの同期の腕と同じ。#339）
+        if self.workspace.active_window_id() != prev_window {
+            self.focus_active_viewport(cx);
+        }
+        match landed {
             tako_control::OffloadLanding::Again(job) => OffloadLanded::Again(job, None, Vec::new()),
             // #2086: 着地で host を変えた（返答を運んだ = master を起こしたかもしれない）。
             // 受信ループの同期の腕と同じ後処理をここで済ませてから、続きを background へ出す
@@ -10573,13 +10586,13 @@ impl TakoApp {
     }
 
     /// 統合 tmux ビューのペイン行ゴミ箱の確認済み kill（FR-2.16.7）。
-    /// CLI / MCP と同じコマンド層（dispatch の Close）を通す
+    /// CLI / MCP と同じコマンド層（dispatch の Close）を通す。#2657: IPC の受け口と同じ
+    /// 準備 → 着地 → background を通し、worker レジストリへの記録を UI スレッドで書かない
     fn pane_kill_confirmed(&mut self, cx: &mut Context<Self>) {
         let Some(pane) = self.pending_pane_kill.take() else {
             return;
         };
-        let result = tako_control::dispatch(
-            self,
+        self.dispatch_off_ui(
             tako_control::protocol::Request::Close {
                 pane: Some(pane.as_u64()),
                 force: true,
@@ -10587,11 +10600,14 @@ impl TakoApp {
                 caller_pane: None,
             },
             PaneOrigin::User,
+            cx,
+            |_, result, cx| {
+                if let Err(e) = result {
+                    eprintln!("warning: ペインを kill できない: {e}");
+                }
+                cx.notify();
+            },
         );
-        if let Err(e) = result {
-            eprintln!("warning: ペインを kill できない: {e}");
-        }
-        cx.notify();
     }
 
     /// 確認済みの kill を実行する（kill ボタン → 確認 → ここ）
@@ -12119,16 +12135,28 @@ impl TakoApp {
         // 最後の増分を取り込んでから書く（器が消えた後では履歴を読めない）
         let pending_log = self.pane_log_close_pending.remove(&pane_id);
         if let Some(name) = self.backend_sessions.remove(&pane_id) {
-            if !self.secondary {
-                persist_diag(&format!(
+            // #2657: persist.log への追記（ファイル I/O。注入なしで 1 回 62ms を観測）は kill のスレッドの
+            // 先頭で書く（kill より前に書く順は保つ）。A/B の旧経路はここ（UI スレッド）で書く
+            let kill_line = (!self.secondary).then(|| {
+                format!(
                     "セッション kill: pane={} session={name}（発生源 {}）",
                     pane_id.as_u64(),
                     origin.marker_with_caller(caller)
-                ));
-            }
+                )
+            });
+            let kill_line = match kill_line {
+                Some(line) if tako_control::close_record::legacy() => {
+                    persist_diag(&line);
+                    None
+                }
+                other => other,
+            };
             let socket = tako_core::tmux_backend::socket_name();
             let logs = self.pane_logs.clone();
             std::thread::spawn(move || {
+                if let Some(line) = kill_line {
+                    persist_diag(&line);
+                }
                 if let Some(close) = pending_log {
                     finish_backend_pane_log_close(&logs, &socket, pane_id, close);
                 }
@@ -12473,16 +12501,33 @@ impl TakoApp {
     /// #775: `close_reason` には発生源（`close:gui` / `close:gui-tab` / `close:kbd`）を
     /// 載せる。綴りは `registry::close_reason_for` の 1 実装が持つので、GUI と
     /// CLI / MCP で語彙がずれない
+    ///
+    /// #2657: 書く（workers.yaml の読み書き + fsync + 上限なしの flock）のは背景のスレッド
+    /// （`CloseMark::spawn`。応答を待つ相手はいない）。終了の直前は `on_app_quit` の
+    /// `flush_close_records` が書き終わりを待つ。A/B の旧経路（`TAKO_2657_LEGACY=1`）はここで書く
     fn mark_worker_closed(&self, pane_id: PaneId, reason: CloseReason) {
         if !reason.is_explicit() || self.secondary {
             return;
         }
-        if let Err(e) = tako_control::orchestrator::registry::mark_closed_by_origin(
-            pane_id.as_u64(),
-            reason.origin(),
-            None,
-        ) {
-            eprintln!("warning: worker レジストリの close 記録に失敗: {e}");
+        let mark =
+            tako_control::close_record::CloseMark::new(pane_id.as_u64(), reason.origin(), None);
+        if tako_control::close_record::legacy() {
+            mark.write();
+        } else {
+            mark.spawn();
+        }
+    }
+
+    /// 背景へ投げた close の記録（#2657）が書き終わるまで待つ。終了の直前に呼ぶ（最後に閉じた worker を
+    /// active のまま残さない）。上限は 5 秒（ロックを握ったまま返らない別プロセスで終了を止めない）。
+    /// 1 秒を超えたら persist.log へ残す
+    fn flush_close_records(&self, why: &str) {
+        let waited = tako_control::close_record::flush(Duration::from_secs(5));
+        if waited >= Duration::from_secs(1) && !self.secondary {
+            persist_diag(&format!(
+                "{why}: worker レジストリへの close の記録を {}ms 待った（#2657）",
+                waited.as_millis()
+            ));
         }
     }
 
