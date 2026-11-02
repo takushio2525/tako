@@ -25469,6 +25469,9 @@ fn list_json(host: &dyn ControlHost) -> Value {
                         "run": run_pane_json(p),
                         // SSH の接続待ち / 失敗（#1010。null = どちらでもない）
                         "ssh_connect": host.ssh_connect_state(p.id()),
+                        // 起動待ち（#2413）の帯（#2425。null = 帯が出ていない）。GUI が描いている
+                        // 文・順番・理由・受け付けなかった打鍵の数
+                        "launch_wait_band": host.launch_wait_band(p.id()),
                         // このペインをそのまま SSH にできるか（#1006 の判定。#1080）。
                         // **判定材料を集めるのはここ 1 箇所**にする: 器つきペインの
                         // 外側 alt screen を渡してはいけない（#694 / #1006 の罠）といった
