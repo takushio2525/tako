@@ -1216,7 +1216,12 @@ pub enum Request {
     /// `show` で右パネルの search ビューにも出す（出した結果だけが `results` / `open` の対象。
     /// 出さない検索は応答を返すだけで画面の結果を上書きしない）。`limit` は応答に載せる行の数
     /// （既定 100・0 = 全部。保持の上限は `tako_core::workspace_search::MAX_RESULTS`）。
-    /// `focus` は `open` で着地したペインへフォーカスを移すか
+    /// `focus` は `open` で着地したペインへフォーカスを移すか。
+    ///
+    /// 置換（#2045）: `replace`（`replacement` で置き換える。`query` があれば探してから、無ければ
+    /// 右パネルの結果に当てる。範囲は `item` 番目の 1 行 / `file` の行 / 省略で全部）と
+    /// `undo`（最後に当てた 1 回を戻す）。どちらも `confirm` が無ければ書き換えずにプレビューだけ返す
+    /// （`tako lsp rename` と同じ約束）。右パネルの結果へのプレビューは置き場にも置く（GUI の行に並ぶ）
     WorkspaceSearch {
         action: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1237,6 +1242,15 @@ pub enum Request {
         item: Option<usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         focus: Option<bool>,
+        /// replace: 置換後の文字列（#2045。空文字 = 一致を消す）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement: Option<String>,
+        /// replace: そのファイルの行だけに当てる（結果の `path` か表示の相対パス）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        /// replace / undo: 当てる・戻す（無ければプレビューだけ。CLI の `--yes`）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirm: Option<bool>,
     },
     /// 自動保存設定の取得・変更（#195）。enabled 省略時は状態取得のみ
     PreviewAutosave {
@@ -2893,7 +2907,13 @@ pub fn changes_layout(request: &Request) -> bool {
         Request::TreeSelection { key, .. } => key.is_some(),
         // ワークスペース横断検索（#1694）。`show` は右パネルを出し（ペインの面積が変わる）、
         // `open` は別のファイルなら新しいペインを生やす。出さない検索・読むだけは偽
-        Request::WorkspaceSearch { action, show, .. } => action == "open" || *show == Some(true),
+        // #2045: 右パネルの結果への置換（プレビューを含む）も search ビューを開く
+        Request::WorkspaceSearch {
+            action,
+            show,
+            query,
+            ..
+        } => action == "open" || *show == Some(true) || (action == "replace" && query.is_none()),
         // --- ペインの木・寸法そのもの ---
         Request::Split { .. }
         | Request::Close { .. }

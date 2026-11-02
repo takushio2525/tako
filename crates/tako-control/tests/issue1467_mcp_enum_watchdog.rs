@@ -151,7 +151,7 @@ fn registry() -> Vec<Source> {
             binding: Binding::Consumed,
             values: owned(&Placement::NAMES),
         },
-        // #1694: ワークスペース横断検索の action（search / results / open / clear）
+        // #1694: ワークスペース横断検索の action（search / results / open / clear。#2045 で replace / undo）
         Source {
             tool: "tako_search",
             prop: "action",

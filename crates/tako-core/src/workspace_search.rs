@@ -10,7 +10,8 @@
 //! - [`search`] — 走査と照合の本体（**UI スレッドで呼ばない**。呼び手は dispatch の
 //!   `prepare_offload` → background → `finish_offload` の 3 段）
 //! - [`SearchStore`] — 右パネルの search ビューに出している結果の正本（GUI の行のクリックも
-//!   CLI / MCP の `open` / `results` / `clear` も同じ 1 つを読み書きする = 設計原則 5）
+//!   CLI / MCP の `open` / `results` / `clear` も同じ 1 つを読み書きする = 設計原則 5）。
+//!   置換（#2045）の当て済みの行・取り消しの履歴も同じ置き場が持つ（[`crate::workspace_replace`]）
 //!
 //! ## 決めごと（受け入れ条件で固定するもの）
 //!
@@ -29,7 +30,10 @@
 //!   並びは（ルートの順, パス, 行）で、走査の並列度に依らない
 //! - 上限: 保持は [`MAX_RESULTS`] 行・抜粋は [`MAX_EXCERPT_CHARS`] 字・所要は
 //!   [`DEFAULT_TIME_LIMIT`]。上限で止めたら `stopped` に理由が載る（黙って欠けない）
+//! - 一致したファイルは探した時点の中身の指紋（[`Outcome::stamps`]）を残す。置換（#2045）は
+//!   これと違うファイル（検索の後に外で変わった）へ当てない
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -141,6 +145,11 @@ impl Matcher {
     fn may_match(&self, text: &str) -> bool {
         self.whole.as_ref().is_none_or(|w| w.is_match(text))
     }
+
+    /// 1 行に当てる正規表現（置換 #2045 がキャプチャを取る。検索と同じ照合器を使い回す）
+    pub(crate) fn line_regex(&self) -> &regex::Regex {
+        &self.line
+    }
 }
 
 /// `regex` の説明は複数行（パターンと ^ の位置の図）なので最後の 1 行（理由）だけにする
@@ -217,6 +226,8 @@ pub struct Outcome {
     /// 途中で止めた理由（`None` = 最後まで探した）。止めたときの件数は止めるまでに数えたぶん
     pub stopped: Option<Stop>,
     pub elapsed: Duration,
+    /// 一致したファイルの、探した時点の中身の指紋（置換 #2045 が「検索の後に変わったか」を見る）
+    pub stamps: BTreeMap<PathBuf, crate::workspace_replace::Stamp>,
 }
 
 /// 走査の条件
@@ -275,6 +286,7 @@ struct FileHits {
     path: PathBuf,
     hits: Vec<Hit>,
     occurrences: usize,
+    stamp: crate::workspace_replace::Stamp,
 }
 
 /// 走査を共有する数え上げ
@@ -416,6 +428,7 @@ pub fn search(matcher: &Matcher, options: &Options, cancel: &AtomicBool) -> Outc
     files.sort_by(|a, b| (a.root, &a.path).cmp(&(b.root, &b.path)));
     let files_matched = files.len();
     let occurrences = files.iter().map(|f| f.occurrences).sum();
+    let stamps = files.iter().map(|f| (f.path.clone(), f.stamp)).collect();
     let mut hits: Vec<Hit> = files.into_iter().flat_map(|f| f.hits).collect();
     hits.truncate(options.max_results);
     Outcome {
@@ -430,6 +443,7 @@ pub fn search(matcher: &Matcher, options: &Options, cancel: &AtomicBool) -> Outc
         },
         stopped,
         elapsed: started.elapsed(),
+        stamps,
     }
 }
 
@@ -523,6 +537,8 @@ fn search_file(
         path: path.to_path_buf(),
         hits,
         occurrences,
+        // 指紋は一致したファイルだけ（BOM を外す前の全バイト = 置換が読み直す中身と同じ単位）
+        stamp: crate::workspace_replace::Stamp::of(&bytes),
     }))
 }
 
@@ -530,6 +546,17 @@ fn search_file(
 /// [`EXCERPT_LEAD_CHARS`] 字前から切る（切った側に `…`）。一致の範囲は抜粋の中の文字単位へ直し、
 /// 抜粋の外に出たものは落とす / はみ出たものは端で切る
 pub fn excerpt(line: &str, byte_ranges: &[(usize, usize)]) -> (String, Vec<(usize, usize)>) {
+    let marked: Vec<(usize, usize, ())> = byte_ranges.iter().map(|&(s, e)| (s, e, ())).collect();
+    let (text, ranges) = excerpt_marked(line, &marked);
+    (text, ranges.into_iter().map(|(s, e, ())| (s, e)).collect())
+}
+
+/// [`excerpt`] の印つき版（置換のプレビュー #2045 が「消す字」と「足す字」を分けて強調する）。
+/// 切り出しの規則は [`excerpt`] と同じ 1 実装で、窓の位置は最初の範囲で決める
+pub fn excerpt_marked<K: Copy>(
+    line: &str,
+    byte_ranges: &[(usize, usize, K)],
+) -> (String, Vec<(usize, usize, K)>) {
     let lead_bytes = line.len() - line.trim_start().len();
     // 切り出し安全: lead_bytes は trim_start が残した後ろ側の始まり = 文字境界
     let body = &line[lead_bytes..];
@@ -541,9 +568,9 @@ pub fn excerpt(line: &str, byte_ranges: &[(usize, usize)]) -> (String, Vec<(usiz
             .count()
     };
     let total = body.chars().count();
-    let mut ranges: Vec<(usize, usize)> = byte_ranges
+    let mut ranges: Vec<(usize, usize, K)> = byte_ranges
         .iter()
-        .map(|&(s, e)| (to_char(s), to_char(e)))
+        .map(|&(s, e, k)| (to_char(s), to_char(e), k))
         .collect();
     if total <= MAX_EXCERPT_CHARS {
         return (body.to_string(), ranges);
@@ -564,8 +591,14 @@ pub fn excerpt(line: &str, byte_ranges: &[(usize, usize)]) -> (String, Vec<(usiz
     }
     ranges = ranges
         .into_iter()
-        .filter(|&(s, e)| e > start && s < end)
-        .map(|(s, e)| (s.max(start) - start + prefix, e.min(end) - start + prefix))
+        .filter(|&(s, e, _)| e > start && s < end)
+        .map(|(s, e, k)| {
+            (
+                s.max(start) - start + prefix,
+                e.min(end) - start + prefix,
+                k,
+            )
+        })
         .collect();
     (out, ranges)
 }
@@ -597,6 +630,9 @@ pub struct SearchStore {
     shown: Option<Shown>,
     /// 出す側の検索が照合器を組めなかった理由（壊れた正規表現。次の検索 / 閉じるで消える）
     error: Option<(Query, QueryError)>,
+    /// 置換（#2045）の当て済みの行・プレビュー・取り消しの履歴。当て済みとプレビューは出している
+    /// 結果に付き、次の結果 / 閉じるで手放す。取り消しの履歴は残す（結果を閉じても戻せる）
+    replace: crate::workspace_replace::ReplaceState,
 }
 
 impl SearchStore {
@@ -628,6 +664,7 @@ impl SearchStore {
                     roots: running.roots,
                     outcome,
                 });
+                self.replace.reset_session(seq);
                 true
             }
             _ => false,
@@ -641,6 +678,7 @@ impl SearchStore {
                 let running = self.running.take().expect("直前に確かめた");
                 self.shown = None;
                 self.error = Some((running.query, error));
+                self.replace.reset_session(0);
                 true
             }
             _ => false,
@@ -655,7 +693,17 @@ impl SearchStore {
         }
         self.shown = None;
         self.error = None;
+        self.replace.reset_session(0);
         had
+    }
+
+    /// 置換の状態（#2045）
+    pub fn replace(&self) -> &crate::workspace_replace::ReplaceState {
+        &self.replace
+    }
+
+    pub fn replace_mut(&mut self) -> &mut crate::workspace_replace::ReplaceState {
+        &mut self.replace
     }
 
     /// 照合器を組めなかった検索（検索語と理由）

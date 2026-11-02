@@ -138,6 +138,7 @@ pub mod usage;
 pub mod user_task;
 pub mod wait_budget;
 pub mod workspace;
+pub mod workspace_replace;
 pub mod workspace_search;
 
 pub use byte_lru::ByteLru;

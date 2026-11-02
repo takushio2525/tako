@@ -84,7 +84,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | `tako_preview_undo` / `tako_preview_redo` | 編集バッファの undo / redo（ディスクへ書くのは `tako_preview_save`） |
 | `tako_preview_search` / `tako_preview_replace` | テキストの検索 / 置換（**既定は大文字小文字を区別する**。`case_sensitive: false` で区別しない・`whole_word: true` で単語単位。検索で `query` を省略したときは今の条件を引き継ぐ。`visible: true / false` で画面の検索欄を開閉し、閉じると閲覧中の Markdown は描画へ戻る） |
 | `tako_preview_autosave` | 編集の自動保存設定 |
-| `tako_search` | ワークスペース横断検索（GUI の ⇧⌘F。`action` = search（既定）でタブのファイルツリーのルート（`path` で別のフォルダ）から行ごとに探す。`regex` / `case_sensitive`（どちらも既定 false）。.gitignore 対象・バイナリ・.git の中は探さない。`show` で右パネルにも出し、results で読み直す・open で `item` 番目を開く・clear で閉じる） |
+| `tako_search` | ワークスペース横断検索（GUI の ⇧⌘F。`action` = search（既定）でタブのファイルツリーのルート（`path` で別のフォルダ）から行ごとに探す。`regex` / `case_sensitive`（どちらも既定 false）。.gitignore 対象・バイナリ・.git の中は探さない。`show` で右パネルにも出し、results で読み直す・open で `item` 番目を開く・clear で閉じる。replace は `replacement` で置換（`query` を省くと右パネルの結果へ・`item` / `file` で範囲）、undo は直前の置換を戻す。どちらも `confirm: true` が無ければプレビューだけ） |
 
 ### 動画
 

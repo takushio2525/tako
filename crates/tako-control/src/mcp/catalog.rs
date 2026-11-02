@@ -1195,7 +1195,9 @@ pub fn tools() -> Vec<Value> {
                 ファイルツリーのルート（path で別のフォルダ）から行ごとに探し、items[]（id・path・line・column・excerpt）を\
                 返す。.gitignore 対象・バイナリ・.git の中は探さない。regex で正規表現・case_sensitive で大文字小文字を区別\
                 （どちらも既定 false）。上限で止めたら stopped（limit / time / cancelled）。show で右パネルにも出し、\
-                results で読み直す・open で item 番目を開く・clear で閉じる。",
+                results で読み直す・open で item 番目を開く・clear で閉じる。replace は replacement で置換\
+                （query 無しは右パネルの結果・item / file で範囲）、undo は直前の置換を戻す（confirm 無しは\
+                プレビュー）。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1207,8 +1209,11 @@ pub fn tools() -> Vec<Value> {
                     "case_sensitive": { "type": "boolean" },
                     "show": { "type": "boolean", "description": "search: 右パネルにも出す" },
                     "limit": { "type": "integer", "minimum": 0, "description": "載せる行（既定 100。0 で全部）" },
-                    "item": { "type": "integer", "minimum": 1, "description": "open: items[] の id" },
+                    "item": { "type": "integer", "minimum": 1, "description": "open / replace: items[] の id" },
                     "focus": { "type": "boolean", "description": "open: 着地したペインへフォーカスを移す" },
+                    "replacement": { "type": "string", "description": "replace: 置換後（正規表現は $1 等）" },
+                    "file": { "type": "string", "description": "replace: そのファイルの行だけ" },
+                    "confirm": { "type": "boolean", "description": "replace / undo: 当てる（既定 false）" },
                 },
                 "additionalProperties": false,
             },

@@ -28868,6 +28868,17 @@ impl PreviewHost for TakoApp {
         )
     }
 
+    /// #2045: 横断置換が開いている編集バッファを写す・戻す前に確かめる（画面の本文 = バッファ）
+    fn read_preview_buffer(&self, pane: PaneId, f: &mut dyn FnMut(&str, u64)) -> bool {
+        match self.preview_edits.get(&pane) {
+            Some(edit) => {
+                f(edit.buffer.text(), edit.buffer.version());
+                true
+            }
+            None => false,
+        }
+    }
+
     fn preview_viewport(&self, pane: PaneId) -> Option<serde_json::Value> {
         self.preview_viewport_json(pane)
     }
@@ -34173,6 +34184,11 @@ mod self_test {
     mod workspace_search_1694;
     #[cfg(feature = "visual-test")]
     use workspace_search_1694::workspace_search_visual;
+    /// #2045: 置換欄 → プレビュー → 行の置換 → すべて置換 → 元に戻す（visual-test `workspace-replace-2045`）
+    #[cfg(feature = "visual-test")]
+    mod workspace_replace_2045;
+    #[cfg(feature = "visual-test")]
+    use workspace_replace_2045::workspace_replace_visual;
     /// #1691: 対応する括弧の強調が実ピクセルで出て、対が無いと出ない（visual-test `bracket-match`）
     #[cfg(feature = "visual-test")]
     mod bracket_match_1691;
@@ -50254,6 +50270,12 @@ mod self_test {
                     println!("TAKO_VISUAL_TEST_OK");
                     std::process::exit(0);
                 }
+                // #2045: 置換欄 → プレビュー → 行の置換 → すべて置換 → 元に戻す
+                "workspace-replace-2045" => {
+                    workspace_replace_visual(any, window, cx).await;
+                    println!("TAKO_VISUAL_TEST_OK");
+                    std::process::exit(0);
+                }
                 // #2046: 鍵らしき文字を貼ると確認が出て、やめると PTY へ 1 バイトも届かないか
                 "paste-guard" => {
                     paste_guard_visual(any, window, cx).await;
@@ -50319,7 +50341,7 @@ mod self_test {
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
                          syntax-alias / extra-syntax / net-resume / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
-                         workspace-search-1694 / paste-guard / bracket-match / enter-1759 / \
+                         workspace-search-1694 / workspace-replace-2045 / paste-guard / bracket-match / enter-1759 / \
                          changelog-offload / changelog-expand / tasks-launch-2182 / palette-alias / preview-reveal-2247）"
                     );
                     std::process::exit(1);

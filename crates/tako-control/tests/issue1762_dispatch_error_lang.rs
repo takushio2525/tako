@@ -901,9 +901,14 @@ fn reason_index(r: &Reason) -> usize {
         Reason::UserTaskLaunchPlanDeferred => 340,
         Reason::UserTaskLaunchPlanLost => 341,
         Reason::UserTaskLaunchPaneMissing => 342,
+        // #2045: 横断置換の断り
+        Reason::ReplaceNeedsReplacement => 343,
+        Reason::ReplaceItemAndFile => 344,
+        Reason::ReplaceFileNotInResults(_) => 345,
+        Reason::ReplaceBusy => 346,
     }
 }
-const REASON_VARIANTS: usize = 343;
+const REASON_VARIANTS: usize = 347;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1532,6 +1537,10 @@ fn reason_samples() -> Vec<Reason> {
         Reason::UserTaskLaunchPlanDeferred,
         Reason::UserTaskLaunchPlanLost,
         Reason::UserTaskLaunchPaneMissing,
+        Reason::ReplaceNeedsReplacement,
+        Reason::ReplaceItemAndFile,
+        Reason::ReplaceFileNotInResults("src/a.rs".into()),
+        Reason::ReplaceBusy,
     ]
 }
 
@@ -1947,6 +1956,11 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "master の起動の組み立て（CLI の所在確認）を UI スレッドでは待たない（もう一度返答すると組み立て直す）",
     "master の起動の組み立てが着地へ届かなかった",
     "起動したタブのペインを解決できない",
+    // #2045 で足した断り（#2365 の後に生まれたので、今の日本語をそのまま固定する）
+    "replace には replacement（置換後の文字列。空文字で一致を消す）が要る",
+    "item と file は同時に指定できない（1 行か 1 ファイルのどちらか）",
+    "結果に src/a.rs の行が無い（結果の path か表示の相対パスで指定する）",
+    "前の置換を当てている途中（終わってからもう一度）",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
