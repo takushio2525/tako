@@ -207,14 +207,13 @@ pub fn handle_cards_request(
         let (status, body) = if known_path {
             (
                 405,
-                json!({
-                    "error": "このメソッドには対応していない",
-                    "error_en": "Method not allowed",
-                    "kind": "method_not_allowed",
-                }),
+                crate::RemoteRefusal::MethodNotAllowed.kind_body("method_not_allowed"),
             )
         } else {
-            (404, json!({ "error": "API エンドポイントが見つからない" }))
+            (
+                404,
+                json!({ "error": crate::RemoteRefusal::ApiEndpointNotFound.to_string() }),
+            )
         };
         return respond_json(request, deps, status, &body);
     };
@@ -235,11 +234,11 @@ pub fn handle_cards_request(
             deps,
             403,
             &json!({
-                "error": format!(
-                    "この操作には {} 以上の role が必要（現在: {}）",
-                    route.role.as_str(),
-                    deps.role.as_str()
-                ),
+                "error": crate::RemoteRefusal::RouteRoleTooLow {
+                    required: route.role,
+                    current: deps.role,
+                }
+                .to_string(),
                 "kind": "forbidden",
             }),
         );
@@ -315,7 +314,7 @@ fn dispatch_route(
                     return (
                         400,
                         json!({
-                            "error": "pane（数値のペイン ID）が必要",
+                            "error": crate::RemoteRefusal::CardPaneRequired.to_string(),
                             "kind": "bad_request",
                         }),
                     )
@@ -326,7 +325,10 @@ fn dispatch_route(
             let Some(id) = card_id_of(path) else {
                 return (
                     404,
-                    json!({ "error": "カード id が読み取れない", "kind": "not_found" }),
+                    json!({
+                        "error": crate::RemoteRefusal::CardIdUnreadable.to_string(),
+                        "kind": "not_found",
+                    }),
                 );
             };
             card = Some(id);
@@ -335,7 +337,10 @@ fn dispatch_route(
                 Err(()) => {
                     return (
                         400,
-                        json!({ "error": "index は 1 始まりの整数", "kind": "bad_request" }),
+                        json!({
+                            "error": crate::RemoteRefusal::CardIndexInvalid.to_string(),
+                            "kind": "bad_request",
+                        }),
                     )
                 }
             }

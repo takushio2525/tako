@@ -389,11 +389,7 @@ pub fn handle_tasks_request(
             request,
             deps,
             404,
-            &json!({
-                "error": "この版にはタスクの画面が無い",
-                "error_en": "Tasks are not available in this build",
-                "kind": "not_found",
-            }),
+            &crate::RemoteRefusal::TasksUnavailable.kind_body("not_found"),
         );
     }
     let method = request.method().as_str().to_string();
@@ -403,14 +399,13 @@ pub fn handle_tasks_request(
         let (status, body) = if known_path {
             (
                 405,
-                json!({
-                    "error": "このメソッドには対応していない",
-                    "error_en": "Method not allowed",
-                    "kind": "method_not_allowed",
-                }),
+                crate::RemoteRefusal::MethodNotAllowed.kind_body("method_not_allowed"),
             )
         } else {
-            (404, json!({ "error": "API エンドポイントが見つからない" }))
+            (
+                404,
+                json!({ "error": crate::RemoteRefusal::ApiEndpointNotFound.to_string() }),
+            )
         };
         return respond_json(request, deps, status, &body);
     };
@@ -493,7 +488,10 @@ fn dispatch_route(
         }
         TaskPurpose::Respond => {
             let Some(task) = task_id_of(path, "respond") else {
-                return (404, json!({ "error": "タスク id が読み取れない" }));
+                return (
+                    404,
+                    json!({ "error": crate::RemoteRefusal::TaskIdUnreadable.to_string() }),
+                );
             };
             *id = Some(task);
             *decision = body["decision"].as_str().map(str::to_string);
@@ -501,7 +499,10 @@ fn dispatch_route(
         }
         TaskPurpose::Done | TaskPurpose::Dismiss => {
             let Some(task) = task_id_of(path, route.purpose.as_str()) else {
-                return (404, json!({ "error": "タスク id が読み取れない" }));
+                return (
+                    404,
+                    json!({ "error": crate::RemoteRefusal::TaskIdUnreadable.to_string() }),
+                );
             };
             *id = Some(task);
         }

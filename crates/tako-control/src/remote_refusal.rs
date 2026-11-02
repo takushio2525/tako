@@ -27,6 +27,12 @@
 //! 起動した時点で設定から決まり（#1077）、`tako lang` を切り替えても起こし直すまで前の言語のまま。
 //! PWA は `error` を表示に使うだけで、分岐はステータスコードと `kind` / `paste_guard` で行う
 //! （日本語の字面に依らない）。daemon の中で型の口（`*_typed`）を呼び、`to_string()` で文にする。
+//! 他の受け口（`remote_files` / `remote_tasks` / `remote_cards` / `remote_ssh`）の断りと、本文に載る注記
+//! （`can_ssh.note` / `poll`）も同じ形。日英の対を前から持っていたファイル API の `Denial` と tako-core の
+//! `ShortcutError` は、その対をそのまま [`RemoteRefusal::FileDenied`] / [`RemoteRefusal::ShortcutRejected`] が
+//! 引く。本文の `error_en`（ファイル API・人がやること・コマンドカードの 405 ほか）は従来どおり英語の文で、
+//! 中に入る理由（app / リモート側の文・固定の理由）は `error` と同じ表示言語の文のまま入る
+//! （日本語表示は本文全体が修正前とバイト一致）。
 //!
 //! daemon の admin API の断り（端末が登録されていない・昇格は画面からだけ）は、本文の `error` に加えて
 //! `kind` を返し、頼んだ側（[`crate::remote::admin_request`]）が `kind` から呼び手の表示言語で
@@ -248,6 +254,82 @@ pub enum RemoteRefusal {
     TmuxWait(String),
     /// tmux capture-pane が失敗した（tmux 自身の出力は手を加えずに載る）
     TmuxCaptureFailed(String),
+
+    // ---- daemon の HTTP API の他の受け口（remote_files / remote_tasks / remote_cards / remote_ssh。
+    // #2365 の続き。以前は各受け口が日本語の固定文を直に書いていた） ----
+    /// 受け持つパスだがメソッドが違う（405。英語は本文の `error_en` と同じ文）
+    MethodNotAllowed,
+    /// 表の role に届かない要求を受け口で断った（コマンドカードの二重の門。#1724）
+    RouteRoleTooLow {
+        required: crate::remote_auth::DeviceRole,
+        current: crate::remote_auth::DeviceRole,
+    },
+    /// ファイルの読み出しを断った（日英は `remote_files::Denial` の対 = #435）
+    FileDenied(crate::remote_files::Denial),
+    /// 読んだ時点から中身が変わっていた（中身は理由。空なら括弧を付けない）
+    FileConflict(String),
+    /// Mac 側に未保存の編集がある
+    FileBusyEditing,
+    /// テキストとして編集できない（バイナリ・画像・PDF・動画）
+    FileNotText,
+    /// リモート側が読み取り専用
+    FileReadOnly,
+    /// 検証子（etag）が付いていない
+    FileEtagMissing,
+    /// 書き込みの本文が読めない（中身は理由）
+    FileBodyUnreadable(String),
+    /// 上限を超える内容（中身は上限のバイト数）
+    FileTooLarge(u64),
+    /// tako app 側が断った（中身は app の理由。daemon で言い換えない）
+    FileAppRejected(String),
+    /// tako app へ問い合わせできない（中身は理由）
+    FileAppUnreachable(String),
+    /// リモートへ押し出せず退避した（中身はリモート側の理由）
+    FileRemotePending(String),
+    /// プレビューペインを用意できなかった（[`Self::FileAppRejected`] の理由）
+    PreviewPaneUnavailable,
+    /// 取得したファイルの置き場が分からない（[`Self::FileAppRejected`] の理由）
+    FetchedFileLocationUnknown,
+    /// 適用してから書くまでの窓で中身が変わった（[`Self::FileConflict`] の理由）
+    ChangedBeforeSave,
+    /// 保存の本文に `text` が無い（[`Self::FileBodyUnreadable`] の理由）
+    FileTextRequired,
+    /// 送り直しの対象が SSH 先のフォルダでない（[`Self::FileBodyUnreadable`] の理由）
+    SshFolderRequired,
+    /// ショートカットの操作を断った（日英は tako-core の `ShortcutError` の対）
+    ShortcutRejected(tako_core::remote_shortcuts::ShortcutError),
+    /// ショートカットを保存できなかった（中身は OS のエラー文）
+    ShortcutSave(String),
+    /// 人がやることの A/B の legacy 腕（`TAKO_1450B3_LEGACY=1` = スマホからは見えない）
+    TasksUnavailable,
+    /// パスからタスク id を取り出せない
+    TaskIdUnreadable,
+    /// コマンドカードの一覧に数値の `pane` が無い
+    CardPaneRequired,
+    /// パスからカード id を取り出せない
+    CardIdUnreadable,
+    /// コマンドカードの `index` が 1 始まりの整数でない
+    CardIndexInvalid,
+    /// SSH の要求に `host` が無い
+    SshHostRequired,
+    /// SSH の `host` に許可していない文字がある
+    SshHostInvalid,
+    /// SSH の `target` が開き先の語彙に無い
+    SshTargetInvalid,
+    /// SSH の `target` が文字列でない
+    SshTargetNotString,
+    /// SSH の `pane` が数値でない
+    SshPaneNotNumeric,
+    /// `target=pane` なのに対象ペインが無い
+    SshPaneRequired,
+    /// `remote_dir` に二重引用符がある
+    SshRemoteDirQuote,
+    /// app 不在のペインの `can_ssh.note`（押せない理由を先に出す）
+    SshAppUnavailableNote,
+    /// SSH 化できるかの判定が取れないペインの `can_ssh.note`
+    SshCapabilityUnknownNote,
+    /// SSH の接続を始めた応答の `poll`（次にどこを見ればよいか）
+    SshPollNote,
 }
 
 /// tako app 経由でしか行えない daemon の操作（[`RemoteRefusal::AppNotRunning`] の括弧の中身）
@@ -269,6 +351,10 @@ pub enum AppVia {
     Tasks,
     /// コマンドカードの操作（`/api/cards…`）
     Cards,
+    /// SSH ホストの一覧（`GET /api/ssh-hosts`）
+    SshHosts,
+    /// SSH の接続（`POST /api/ssh` / `POST /api/panes/:id/ssh`）
+    SshOpen,
 }
 
 /// daemon が断ったときの本文の中身
@@ -723,6 +809,187 @@ impl RemoteRefusal {
             (Self::TmuxCaptureFailed(stderr), En) => {
                 format!("tmux capture-pane failed: {stderr}")
             }
+            (Self::MethodNotAllowed, Ja) => "このメソッドには対応していない".to_string(),
+            (Self::MethodNotAllowed, En) => "Method not allowed".to_string(),
+            (Self::RouteRoleTooLow { required, current }, Ja) => format!(
+                "この操作には {} 以上の role が必要（現在: {}）",
+                required.as_str(),
+                current.as_str()
+            ),
+            (Self::RouteRoleTooLow { required, current }, En) => format!(
+                "this operation needs the {} role or higher (current: {})",
+                required.as_str(),
+                current.as_str()
+            ),
+            (Self::FileDenied(denial), Ja) => denial.message_ja().to_string(),
+            (Self::FileDenied(denial), En) => denial.message_en().to_string(),
+            // 英語は本文の `error_en`（#1084）と同じ文。理由は手を加えずに括弧へ入れる
+            (Self::FileConflict(detail), Ja) => {
+                let mut text =
+                    "このファイルは他で変更されています。読み直してから編集をやり直してください"
+                        .to_string();
+                if !detail.is_empty() {
+                    text.push_str(&format!("（{detail}）"));
+                }
+                text
+            }
+            (Self::FileConflict(detail), En) => {
+                let mut text = "This file changed elsewhere; reload it and redo your edit".to_string();
+                if !detail.is_empty() {
+                    text.push_str(&format!(" ({detail})"));
+                }
+                text
+            }
+            (Self::FileBusyEditing, Ja) => {
+                "Mac 側にこのファイルの未保存の編集があります。先に Mac で保存するか編集を取り消してください"
+                    .to_string()
+            }
+            (Self::FileBusyEditing, En) => {
+                "The Mac has unsaved edits to this file; save or discard them there first".to_string()
+            }
+            (Self::FileNotText, Ja) => {
+                "この形式はスマホから編集できません（テキストファイルだけが編集できます）".to_string()
+            }
+            (Self::FileNotText, En) => {
+                "This format cannot be edited from the phone (text files only)".to_string()
+            }
+            (Self::FileReadOnly, Ja) => "書き込みが許可されていないファイルです".to_string(),
+            (Self::FileReadOnly, En) => "This file is not writable".to_string(),
+            (Self::FileEtagMissing, Ja) => {
+                "検証子（etag）が要ります。ファイルを読み直してから保存してください".to_string()
+            }
+            (Self::FileEtagMissing, En) => {
+                "An etag is required; reload the file before saving".to_string()
+            }
+            (Self::FileBodyUnreadable(detail), Ja) => {
+                format!("リクエストの本文が読めません（{detail}）")
+            }
+            (Self::FileBodyUnreadable(detail), En) => {
+                format!("Could not read the request body ({detail})")
+            }
+            (Self::FileTooLarge(limit), Ja) => format!("{limit} バイトを超える内容は保存できません"),
+            (Self::FileTooLarge(limit), En) => format!("Cannot save more than {limit} bytes"),
+            (Self::FileAppRejected(detail), Ja) => {
+                format!("Mac 側で保存できませんでした（{detail}）")
+            }
+            (Self::FileAppRejected(detail), En) => format!("The Mac could not save it ({detail})"),
+            (Self::FileAppUnreachable(detail), Ja) => {
+                format!("tako app に問い合わせできません: {detail}")
+            }
+            (Self::FileAppUnreachable(detail), En) => {
+                format!("Could not reach the tako app: {detail}")
+            }
+            (Self::FileRemotePending(detail), Ja) => format!(
+                "リモートへ送れませんでした。内容は退避したので、つながったら送り直せます（{detail}）"
+            ),
+            (Self::FileRemotePending(detail), En) => format!(
+                "Could not reach the host; the content is stashed and can be pushed again once \
+                 connected ({detail})"
+            ),
+            (Self::PreviewPaneUnavailable, Ja) => "プレビューペインを用意できなかった".to_string(),
+            (Self::PreviewPaneUnavailable, En) => "could not prepare a preview pane".to_string(),
+            (Self::FetchedFileLocationUnknown, Ja) => {
+                "取得したファイルの置き場が分からない".to_string()
+            }
+            (Self::FetchedFileLocationUnknown, En) => {
+                "the location of the fetched file is unknown".to_string()
+            }
+            (Self::ChangedBeforeSave, Ja) => "保存の直前に変わりました".to_string(),
+            (Self::ChangedBeforeSave, En) => "it changed just before saving".to_string(),
+            (Self::FileTextRequired, Ja) => "text が要ります".to_string(),
+            (Self::FileTextRequired, En) => "text is required".to_string(),
+            (Self::SshFolderRequired, Ja) => "SSH 先のフォルダを指定してください".to_string(),
+            (Self::SshFolderRequired, En) => "specify a folder on an SSH host".to_string(),
+            (Self::ShortcutRejected(e), Ja) => e.message_ja(),
+            (Self::ShortcutRejected(e), En) => e.message_en(),
+            (Self::ShortcutSave(error), Ja) => format!("ショートカットを保存できなかった: {error}"),
+            (Self::ShortcutSave(error), En) => format!("Could not save the shortcut: {error}"),
+            // 英語は本文の `error_en` と同じ文
+            (Self::TasksUnavailable, Ja) => "この版にはタスクの画面が無い".to_string(),
+            (Self::TasksUnavailable, En) => "Tasks are not available in this build".to_string(),
+            (Self::TaskIdUnreadable, Ja) => "タスク id が読み取れない".to_string(),
+            (Self::TaskIdUnreadable, En) => "cannot read the task id".to_string(),
+            (Self::CardPaneRequired, Ja) => "pane（数値のペイン ID）が必要".to_string(),
+            (Self::CardPaneRequired, En) => "pane (a numeric pane ID) is required".to_string(),
+            (Self::CardIdUnreadable, Ja) => "カード id が読み取れない".to_string(),
+            (Self::CardIdUnreadable, En) => "cannot read the card id".to_string(),
+            (Self::CardIndexInvalid, Ja) => "index は 1 始まりの整数".to_string(),
+            (Self::CardIndexInvalid, En) => {
+                "index must be an integer starting at 1".to_string()
+            }
+            (Self::SshHostRequired, Ja) => {
+                "host が必要（`GET /api/ssh-hosts` の name を渡す）".to_string()
+            }
+            (Self::SshHostRequired, En) => {
+                "host is required (pass a name from `GET /api/ssh-hosts`)".to_string()
+            }
+            (Self::SshHostInvalid, Ja) => {
+                "host に使えない文字が入っている（英数と . - _ : @ [ ] % + のみ。\
+                 ~/.ssh/config の Host 名を渡す）"
+                    .to_string()
+            }
+            (Self::SshHostInvalid, En) => {
+                "host contains characters that cannot be used (letters, digits and \
+                 . - _ : @ [ ] % + only; pass a Host name from ~/.ssh/config)"
+                    .to_string()
+            }
+            (Self::SshTargetInvalid, Ja) => format!(
+                "target が不正（{}）",
+                tako_core::remote_open::RemoteOpenTarget::values_hint()
+            ),
+            (Self::SshTargetInvalid, En) => format!(
+                "invalid target ({})",
+                tako_core::remote_open::RemoteOpenTarget::values_hint()
+            ),
+            (Self::SshTargetNotString, Ja) => format!(
+                "target は文字列（{}）",
+                tako_core::remote_open::RemoteOpenTarget::values_hint()
+            ),
+            (Self::SshTargetNotString, En) => format!(
+                "target must be a string ({})",
+                tako_core::remote_open::RemoteOpenTarget::values_hint()
+            ),
+            (Self::SshPaneNotNumeric, Ja) => {
+                "pane は数値ペイン ID（一覧の id を渡す）".to_string()
+            }
+            (Self::SshPaneNotNumeric, En) => {
+                "pane must be a numeric pane ID (pass an id from the list)".to_string()
+            }
+            (Self::SshPaneRequired, Ja) => {
+                "target=pane は対象ペインが必要（`POST /api/panes/<id>/ssh` を使うか pane を渡す）"
+                    .to_string()
+            }
+            (Self::SshPaneRequired, En) => {
+                "target=pane needs a target pane (use `POST /api/panes/<id>/ssh` or pass pane)"
+                    .to_string()
+            }
+            (Self::SshRemoteDirQuote, Ja) => "remote_dir に二重引用符は使えない".to_string(),
+            (Self::SshRemoteDirQuote, En) => "remote_dir cannot contain double quotes".to_string(),
+            (Self::SshAppUnavailableNote, Ja) => {
+                "tako app が稼働していないので SSH 接続を開けない（Mac で tako を起動する）"
+                    .to_string()
+            }
+            (Self::SshAppUnavailableNote, En) => {
+                "cannot open an SSH connection because the tako app is not running \
+                 (start tako on the Mac)"
+                    .to_string()
+            }
+            (Self::SshCapabilityUnknownNote, Ja) => {
+                "このペインを SSH 化できるか判定できない（Mac 側の tako が古い可能性がある）"
+                    .to_string()
+            }
+            (Self::SshCapabilityUnknownNote, En) => {
+                "cannot tell whether this pane can be turned into SSH \
+                 (tako on the Mac may be outdated)"
+                    .to_string()
+            }
+            (Self::SshPollNote, Ja) => {
+                "/api/v2/panes の ssh_connect で接続の進み方と失敗の理由が読める".to_string()
+            }
+            (Self::SshPollNote, En) => {
+                "ssh_connect in /api/v2/panes shows how the connection is going and why it failed"
+                    .to_string()
+            }
         }
     }
 
@@ -763,6 +1030,21 @@ impl RemoteRefusal {
             body["device_id"] = serde_json::json!(id);
         }
         body
+    }
+
+    /// ファイル API・人がやること・コマンドカードの断りの本文（`error` = 表示言語・`error_en` = 英語・
+    /// `kind`。PWA は `kind` で出し分け `error` を表示する）。キーの並びは #2365 より前と同じ
+    pub fn kind_body(&self, kind: &str) -> serde_json::Value {
+        self.kind_body_in(tako_core::i18n::lang(), kind)
+    }
+
+    /// [`Self::kind_body`] の表示言語を明示する形（日本語は #2365 より前の本文とバイト一致）
+    pub fn kind_body_in(&self, lang: Lang, kind: &str) -> serde_json::Value {
+        serde_json::json!({
+            "error": self.text_in(lang),
+            "error_en": self.text_in(Lang::En),
+            "kind": kind,
+        })
     }
 
     /// daemon の admin API の断りの本文を読む（[`Self::admin_kind`] の逆。`kind` が無い・知らない
@@ -818,6 +1100,10 @@ impl AppVia {
             (Self::Tasks, En) => Some("task operations"),
             (Self::Cards, Ja) => Some("コマンドカードの操作"),
             (Self::Cards, En) => Some("command card operations"),
+            (Self::SshHosts, Ja) => Some("SSH ホスト一覧"),
+            (Self::SshHosts, En) => Some("listing SSH hosts"),
+            (Self::SshOpen, Ja) => Some("リモートからの SSH 接続"),
+            (Self::SshOpen, En) => Some("opening SSH connections remotely"),
         }
     }
 }

@@ -635,11 +635,23 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `DeviceRegistry::approve_typed` / `deny_typed`、`remote_auth::identify` は `RemoteRefusal` を返す。
   **英語表示の GUI で最後のタブの最後のペインを PWA から閉じると 502 で IPC を捨てていた**（`dispatch_close` が
   `LastPane` / 「最後」の部分一致で 409 を判定していた）ので、`says_last_pane`（`WorkspaceError::LastTab` の日英の
-  正本の文を読む）で日本語表示と同じ 409 にそろえた。`remote_files` / `remote_tasks` / `remote_cards` /
-  `remote_ssh` の受け口の断り・デスクトップ通知・whois の解釈の失敗の中身は Issue #2365 の表の残り。番犬は同じ
-  `issue1762_dispatch_error_lang.rs`（`RemoteRefusal` の表に旧文 + `AppVia` / `PeerReject` の網羅・
-  `REMOTE_HTTP_SCOPES` の 28 範囲の日本語の固定文と日本語の口 `JA_HTTP_CALLS`・本物のソースへの注入 8 通りで
+  正本の文を読む）で日本語表示と同じ 409 にそろえた。デスクトップ通知・whois の解釈の失敗の中身は Issue #2365 の
+  表の残り。番犬は同じ `issue1762_dispatch_error_lang.rs`（`RemoteRefusal` の表に旧文 + `AppVia` / `PeerReject` の
+  網羅・`REMOTE_HTTP_SCOPES` の 28 範囲の日本語の固定文と日本語の口 `JA_HTTP_CALLS`・本物のソースへの注入 8 通りで
   `file:line` を名指す）
+- 同じ続きで、daemon の HTTP API の**他の受け口**（`remote_files` = ファイルの閲覧・保存・ショートカット /
+  `remote_tasks` / `remote_cards` / `remote_ssh` = SSH の要求の検査・app 不在）の本文の `error` と、本文に載る注記
+  （`/api/v2/panes` の `can_ssh.note`・SSH の接続を始めた応答の `poll`）も daemon の表示言語へ移した（`RemoteRefusal`
+  に 35 種 + `AppVia::{SshHosts, SshOpen}`）。ファイル API の `Denial`（#435）と tako-core の `ShortcutError` は
+  前から日英の対を持っていたのに本文の `error` が常に日本語の片側だったので、対をそのまま
+  `RemoteRefusal::FileDenied` / `ShortcutRejected` が引く。書き込みの失敗 `WriteFailure` は日英の文の代わりに
+  `reason: RemoteRefusal` を持ち、`SshRequestError` も `message` の代わりに `reason` を持つ。本文の形
+  （`error` / `error_en` / `kind` の並び）は `RemoteRefusal::kind_body` の 1 実装で、`error_en` は従来どおり英語。
+  中に入る詳細（app / リモート側の文・固定の理由）は作った時点の表示言語の文のまま `error` と `error_en` の両方へ
+  入る（日本語表示は本文全体が修正前とバイト一致）。`kind` とステータスコードは変えていない。PWA はこれらの
+  `error` / `note` / `poll` を表示に使うだけで、分岐は `kind` / ステータス / `can_ssh.ok`（字面に依らない）。番犬は
+  同じファイルの `REMOTE_RECEIVER_FILES`（4 つの受け口の**ファイル全体**を見る。外すのは `Denial::message_ja` の
+  範囲だけ。日本語の口に `.message_ja(` を足した）と、本物のソースへの注入 9 通りで `file:line` を名指す
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は

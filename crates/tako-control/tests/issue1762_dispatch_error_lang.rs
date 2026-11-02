@@ -13595,6 +13595,7 @@ fn cli_の台帳の手元の処理は日本語の口を呼ばない() {
 
 use tako_control::platform::local_endpoint::PeerReject;
 use tako_control::remote_auth::DeviceRole;
+use tako_control::remote_files::Denial;
 use tako_control::remote_refusal::{AppVia, DaemonMessage, ScrollbackCause};
 use tako_control::remote_starting::StartingMarker;
 use tako_control::RemoteRefusal;
@@ -13708,9 +13709,44 @@ fn remote_refusal_index(r: &RemoteRefusal) -> usize {
         RemoteRefusal::TmuxTimeout { .. } => 82,
         RemoteRefusal::TmuxWait(_) => 83,
         RemoteRefusal::TmuxCaptureFailed(_) => 84,
+        RemoteRefusal::MethodNotAllowed => 85,
+        RemoteRefusal::RouteRoleTooLow { .. } => 86,
+        RemoteRefusal::FileDenied(_) => 87,
+        RemoteRefusal::FileConflict(_) => 88,
+        RemoteRefusal::FileBusyEditing => 89,
+        RemoteRefusal::FileNotText => 90,
+        RemoteRefusal::FileReadOnly => 91,
+        RemoteRefusal::FileEtagMissing => 92,
+        RemoteRefusal::FileBodyUnreadable(_) => 93,
+        RemoteRefusal::FileTooLarge(_) => 94,
+        RemoteRefusal::FileAppRejected(_) => 95,
+        RemoteRefusal::FileAppUnreachable(_) => 96,
+        RemoteRefusal::FileRemotePending(_) => 97,
+        RemoteRefusal::PreviewPaneUnavailable => 98,
+        RemoteRefusal::FetchedFileLocationUnknown => 99,
+        RemoteRefusal::ChangedBeforeSave => 100,
+        RemoteRefusal::FileTextRequired => 101,
+        RemoteRefusal::SshFolderRequired => 102,
+        RemoteRefusal::ShortcutRejected(_) => 103,
+        RemoteRefusal::ShortcutSave(_) => 104,
+        RemoteRefusal::TasksUnavailable => 105,
+        RemoteRefusal::TaskIdUnreadable => 106,
+        RemoteRefusal::CardPaneRequired => 107,
+        RemoteRefusal::CardIdUnreadable => 108,
+        RemoteRefusal::CardIndexInvalid => 109,
+        RemoteRefusal::SshHostRequired => 110,
+        RemoteRefusal::SshHostInvalid => 111,
+        RemoteRefusal::SshTargetInvalid => 112,
+        RemoteRefusal::SshTargetNotString => 113,
+        RemoteRefusal::SshPaneNotNumeric => 114,
+        RemoteRefusal::SshPaneRequired => 115,
+        RemoteRefusal::SshRemoteDirQuote => 116,
+        RemoteRefusal::SshAppUnavailableNote => 117,
+        RemoteRefusal::SshCapabilityUnknownNote => 118,
+        RemoteRefusal::SshPollNote => 119,
     }
 }
-const REMOTE_REFUSAL_VARIANTS: usize = 85;
+const REMOTE_REFUSAL_VARIANTS: usize = 120;
 
 /// `AppVia` / `PeerReject` の通し番号（網羅 match = 足すとここがコンパイルで落ちる）
 fn app_via_index(v: &AppVia) -> usize {
@@ -13723,6 +13759,33 @@ fn app_via_index(v: &AppVia) -> usize {
         AppVia::MasterLaunch => 5,
         AppVia::Tasks => 6,
         AppVia::Cards => 7,
+        AppVia::SshHosts => 8,
+        AppVia::SshOpen => 9,
+    }
+}
+/// ファイル API の `Denial` / tako-core の `ShortcutError` の通し番号（`FileDenied` / `ShortcutRejected` が
+/// 包む日英の対。網羅 match = 足すとここがコンパイルで落ちる）
+fn denial_index(d: &Denial) -> usize {
+    match d {
+        Denial::UnknownRoot => 0,
+        Denial::AbsolutePath => 1,
+        Denial::Traversal => 2,
+        Denial::EscapesRoot => 3,
+        Denial::NotFound => 4,
+        Denial::NotADirectory => 5,
+        Denial::NotAFile => 6,
+        Denial::TooLarge => 7,
+        Denial::Unreadable => 8,
+    }
+}
+fn shortcut_error_index(e: &ShortcutError) -> usize {
+    match e {
+        ShortcutError::NotAbsolute => 0,
+        ShortcutError::NotFound => 1,
+        ShortcutError::NotADirectory => 2,
+        ShortcutError::TooMany => 3,
+        ShortcutError::UnknownShortcut => 4,
+        ShortcutError::Builtin => 5,
     }
 }
 fn peer_reject_index(r: &PeerReject) -> usize {
@@ -13768,7 +13831,7 @@ const TMUX_NO_SERVER: &str = "no server running on /private/tmp/tmux-501/tako-x"
 /// `remote_setup.rs` / `tailscale.rs` / dispatch / CLI が書いていた文）。中身の文（OS・serde・tmux）は ASCII
 fn remote_refusal_table() -> Vec<(RemoteRefusal, String)> {
     let note = tako_control::reach::no_detached_capture_note();
-    vec![
+    let mut rows = vec![
         (
             RemoteRefusal::SessionIdInvalid,
             "session_id の形式が不正（英数とハイフンのみ）".into(),
@@ -14200,7 +14263,229 @@ fn remote_refusal_table() -> Vec<(RemoteRefusal, String)> {
             RemoteRefusal::TmuxCaptureFailed("can't find pane: %9\n".into()),
             "tmux capture-pane がエラー: can't find pane: %9\n".into(),
         ),
-    ]
+    ];
+    rows.extend(remote_receiver_table());
+    rows
+}
+
+/// daemon の HTTP API の他の受け口（`remote_files` / `remote_tasks` / `remote_cards` / `remote_ssh`）の見本と、
+/// #2365 より前に各受け口が書いていた固定文（ファイル API の `Denial` と `ShortcutError` は前から持っていた
+/// 日本語の対）。中身の文（app / OS の理由）は ASCII
+fn remote_receiver_table() -> Vec<(RemoteRefusal, String)> {
+    let mut rows: Vec<(RemoteRefusal, String)> = vec![
+        (
+            RemoteRefusal::AppNotRunning(AppVia::SshHosts),
+            "tako app が稼働していない（SSH ホスト一覧は app 経由のみ）".into(),
+        ),
+        (
+            RemoteRefusal::AppNotRunning(AppVia::SshOpen),
+            "tako app が稼働していない（リモートからの SSH 接続は app 経由のみ）".into(),
+        ),
+        (
+            RemoteRefusal::MethodNotAllowed,
+            "このメソッドには対応していない".into(),
+        ),
+        (
+            RemoteRefusal::RouteRoleTooLow {
+                required: DeviceRole::Interact,
+                current: DeviceRole::Observe,
+            },
+            "この操作には interact 以上の role が必要（現在: observe）".into(),
+        ),
+        (
+            RemoteRefusal::FileConflict(String::new()),
+            "このファイルは他で変更されています。読み直してから編集をやり直してください".into(),
+        ),
+        (
+            RemoteRefusal::FileConflict("remote changed".into()),
+            "このファイルは他で変更されています。読み直してから編集をやり直してください\
+             （remote changed）"
+                .into(),
+        ),
+        (
+            RemoteRefusal::FileBusyEditing,
+            "Mac 側にこのファイルの未保存の編集があります。先に Mac で保存するか編集を取り消してください"
+                .into(),
+        ),
+        (
+            RemoteRefusal::FileNotText,
+            "この形式はスマホから編集できません（テキストファイルだけが編集できます）".into(),
+        ),
+        (
+            RemoteRefusal::FileReadOnly,
+            "書き込みが許可されていないファイルです".into(),
+        ),
+        (
+            RemoteRefusal::FileEtagMissing,
+            "検証子（etag）が要ります。ファイルを読み直してから保存してください".into(),
+        ),
+        (
+            RemoteRefusal::FileBodyUnreadable("EOF while parsing".into()),
+            "リクエストの本文が読めません（EOF while parsing）".into(),
+        ),
+        (
+            RemoteRefusal::FileTooLarge(524288),
+            "524288 バイトを超える内容は保存できません".into(),
+        ),
+        (
+            RemoteRefusal::FileAppRejected("no preview".into()),
+            "Mac 側で保存できませんでした（no preview）".into(),
+        ),
+        (
+            RemoteRefusal::FileAppUnreachable("broken pipe".into()),
+            "tako app に問い合わせできません: broken pipe".into(),
+        ),
+        (
+            RemoteRefusal::FileRemotePending("no route to host".into()),
+            "リモートへ送れませんでした。内容は退避したので、つながったら送り直せます（no route to host）"
+                .into(),
+        ),
+        (
+            RemoteRefusal::PreviewPaneUnavailable,
+            "プレビューペインを用意できなかった".into(),
+        ),
+        (
+            RemoteRefusal::FetchedFileLocationUnknown,
+            "取得したファイルの置き場が分からない".into(),
+        ),
+        (
+            RemoteRefusal::ChangedBeforeSave,
+            "保存の直前に変わりました".into(),
+        ),
+        (RemoteRefusal::FileTextRequired, "text が要ります".into()),
+        (
+            RemoteRefusal::SshFolderRequired,
+            "SSH 先のフォルダを指定してください".into(),
+        ),
+        (
+            RemoteRefusal::ShortcutSave(EACCES.into()),
+            format!("ショートカットを保存できなかった: {EACCES}"),
+        ),
+        (
+            RemoteRefusal::TasksUnavailable,
+            "この版にはタスクの画面が無い".into(),
+        ),
+        (
+            RemoteRefusal::TaskIdUnreadable,
+            "タスク id が読み取れない".into(),
+        ),
+        (
+            RemoteRefusal::CardPaneRequired,
+            "pane（数値のペイン ID）が必要".into(),
+        ),
+        (
+            RemoteRefusal::CardIdUnreadable,
+            "カード id が読み取れない".into(),
+        ),
+        (
+            RemoteRefusal::CardIndexInvalid,
+            "index は 1 始まりの整数".into(),
+        ),
+        (
+            RemoteRefusal::SshHostRequired,
+            "host が必要（`GET /api/ssh-hosts` の name を渡す）".into(),
+        ),
+        (
+            RemoteRefusal::SshHostInvalid,
+            "host に使えない文字が入っている（英数と . - _ : @ [ ] % + のみ。\
+             ~/.ssh/config の Host 名を渡す）"
+                .into(),
+        ),
+        (
+            RemoteRefusal::SshTargetInvalid,
+            "target が不正（split | tab | pane）".into(),
+        ),
+        (
+            RemoteRefusal::SshTargetNotString,
+            "target は文字列（split | tab | pane）".into(),
+        ),
+        (
+            RemoteRefusal::SshPaneNotNumeric,
+            "pane は数値ペイン ID（一覧の id を渡す）".into(),
+        ),
+        (
+            RemoteRefusal::SshPaneRequired,
+            "target=pane は対象ペインが必要（`POST /api/panes/<id>/ssh` を使うか pane を渡す）".into(),
+        ),
+        (
+            RemoteRefusal::SshRemoteDirQuote,
+            "remote_dir に二重引用符は使えない".into(),
+        ),
+        (
+            RemoteRefusal::SshAppUnavailableNote,
+            "tako app が稼働していないので SSH 接続を開けない（Mac で tako を起動する）".into(),
+        ),
+        (
+            RemoteRefusal::SshCapabilityUnknownNote,
+            "このペインを SSH 化できるか判定できない（Mac 側の tako が古い可能性がある）".into(),
+        ),
+        (
+            RemoteRefusal::SshPollNote,
+            "/api/v2/panes の ssh_connect で接続の進み方と失敗の理由が読める".into(),
+        ),
+    ];
+    // ファイル API の読み出しの断り（#435 から日英の対を持つ。日本語は `message_ja` の旧文）
+    for (d, old) in [
+        (
+            Denial::UnknownRoot,
+            "このフォルダは tako のファイルツリーに出ていません。Mac 側でフォルダを開いてください",
+        ),
+        (
+            Denial::AbsolutePath,
+            "絶対パスは指定できません。ツリーのルートからの相対パスで指定してください",
+        ),
+        (
+            Denial::Traversal,
+            "上位フォルダへの参照（..）は指定できません",
+        ),
+        (
+            Denial::EscapesRoot,
+            "ツリーに出ているフォルダの外は参照できません",
+        ),
+        (Denial::NotFound, "見つかりません"),
+        (Denial::NotADirectory, "フォルダではありません"),
+        (Denial::NotAFile, "ファイルではありません"),
+        (
+            Denial::TooLarge,
+            "大きすぎるため表示できません。ダウンロードしてください",
+        ),
+        (
+            Denial::Unreadable,
+            "読み取れませんでした（権限を確認してください）",
+        ),
+    ] {
+        rows.push((RemoteRefusal::FileDenied(d), old.into()));
+    }
+    // ショートカットの断り（tako-core の日英の対。日本語は `message_ja` の旧文）
+    for (e, old) in [
+        (
+            ShortcutError::NotAbsolute,
+            "絶対パスで指定してください".to_string(),
+        ),
+        (
+            ShortcutError::NotFound,
+            "そのフォルダが見つかりません".to_string(),
+        ),
+        (
+            ShortcutError::NotADirectory,
+            "フォルダではありません".to_string(),
+        ),
+        (
+            ShortcutError::TooMany,
+            "ショートカットは 64 件までです".to_string(),
+        ),
+        (
+            ShortcutError::UnknownShortcut,
+            "そのショートカットは登録されていません".to_string(),
+        ),
+        (
+            ShortcutError::Builtin,
+            "既定のショートカットは削除できません".to_string(),
+        ),
+    ] {
+        rows.push((RemoteRefusal::ShortcutRejected(e), old));
+    }
+    rows
 }
 
 /// 包みの組み合わせ（daemon の本文の 3 形・スクロールバックの理由の 2 形）と #2365 より前の文
@@ -14263,15 +14548,21 @@ fn remote系の断りは全バリアントが日英を持ち日本語は2365よ�
     covers_every(&causes, scrollback_cause_index, 2, "ScrollbackCause");
     let mut vias = Vec::new();
     let mut rejects = Vec::new();
+    let mut denials = Vec::new();
+    let mut shortcut_errors = Vec::new();
     for (r, _) in &table {
         match r {
             RemoteRefusal::AppNotRunning(via) => vias.push(*via),
             RemoteRefusal::PeerUnverified(reject) => rejects.push(*reject),
+            RemoteRefusal::FileDenied(d) => denials.push(*d),
+            RemoteRefusal::ShortcutRejected(e) => shortcut_errors.push(*e),
             _ => {}
         }
     }
-    covers_every(&vias, app_via_index, 8, "AppVia");
+    covers_every(&vias, app_via_index, 10, "AppVia");
     covers_every(&rejects, peer_reject_index, 6, "PeerReject");
+    covers_every(&denials, denial_index, 9, "Denial");
+    covers_every(&shortcut_errors, shortcut_error_index, 6, "ShortcutError");
 
     let mut failures = Vec::new();
     for (r, old) in table.iter().chain(&wrapped) {
@@ -14350,7 +14641,8 @@ const REMOTE_ROLE_PATH: &str = "crates/tako-control/src/remote_role.rs";
 
 /// daemon の HTTP API（PWA・管理 API）が本文の `error` へ載せる断りを組む範囲（#2365 の続き）。
 /// handler 群と、そこへ断りの文を渡す remote.rs / remote_auth.rs / remote_role.rs の口。
-/// 範囲の外: `remote_files` / `remote_tasks` / `remote_cards` / `remote_ssh` の受け口（Issue #2365 の残り）
+/// 他の受け口（`remote_files` / `remote_tasks` / `remote_cards` / `remote_ssh`）はファイルの全体を
+/// [`REMOTE_RECEIVER_FILES`] で見る
 const REMOTE_HTTP_SCOPES: &[(&str, &str, &str)] = &[
     (REMOTE_PATH, REMOTE_SRC, "fn refuse("),
     (REMOTE_PATH, REMOTE_SRC, "fn forwarded_identity("),
@@ -14394,13 +14686,16 @@ const REMOTE_HTTP_INTERNAL: &[&str] = &[
     "notify_desktop(",
 ];
 
-/// handler 群が呼んではならない日本語の口（`String` を返す従来の口。断りが日本語で固定される）
-const JA_HTTP_CALLS: [&str; 5] = [
+/// handler 群が呼んではならない日本語の口（`String` を返す従来の口。断りが日本語で固定される）。
+/// `.message_ja(` はファイル API の `Denial` / tako-core の `ShortcutError` の日本語の片側
+/// （受け口は `RemoteRefusal::FileDenied` / `ShortcutRejected` を通して表示言語で組む）
+const JA_HTTP_CALLS: [&str; 6] = [
     ".approve(",
     ".deny(",
     ".revoke(",
     "read_messages(",
     "list_agents_with_panes(",
+    ".message_ja(",
 ];
 
 /// 1 つの範囲の違反（日本語の固定文と日本語の口の呼び出し）を `file:line` つきで並べる
@@ -14411,14 +14706,19 @@ fn remote_http_failures(path: &str, src: &str, head: &str) -> Vec<String> {
             head.trim()
         )];
     };
+    remote_http_line_failures(path, &lines)
+}
+
+/// [`remote_http_failures`] の本体（行番号つきの行を受ける）
+fn remote_http_line_failures(path: &str, lines: &[(usize, &str)]) -> Vec<String> {
     let mut out = Vec::new();
-    for (line, text) in japanese_outside(&lines, REMOTE_HTTP_INTERNAL) {
+    for (line, text) in japanese_outside(lines, REMOTE_HTTP_INTERNAL) {
         out.push(format!(
             "{path}:{line}: daemon の HTTP の本文に日本語の固定文がある = 英語表示の daemon でもそのまま \
              PWA / 管理 API へ出る（RemoteRefusal へバリアントを足し、日英の対を text_in に書く）: {text}"
         ));
     }
-    for (line, code) in &lines {
+    for (line, code) in lines {
         let code_part = code.split("//").next().unwrap_or("");
         for call in JA_HTTP_CALLS {
             if code_part.contains(call) {
@@ -14530,6 +14830,164 @@ fn daemonのhttpの番犬は本物のソースへ植えた日本語の断りを�
             failures.push(format!(
                 "{path}: 植えていないのに名指した（{head}）: {got:?}"
             ));
+        }
+    }
+    report_all(failures);
+}
+
+const REMOTE_FILES_SRC: &str = include_str!("../src/remote_files.rs");
+const REMOTE_FILES_PATH: &str = "crates/tako-control/src/remote_files.rs";
+const REMOTE_TASKS_SRC: &str = include_str!("../src/remote_tasks.rs");
+const REMOTE_TASKS_PATH: &str = "crates/tako-control/src/remote_tasks.rs";
+const REMOTE_CARDS_SRC: &str = include_str!("../src/remote_cards.rs");
+const REMOTE_CARDS_PATH: &str = "crates/tako-control/src/remote_cards.rs";
+const REMOTE_SSH_SRC: &str = include_str!("../src/remote_ssh.rs");
+const REMOTE_SSH_PATH: &str = "crates/tako-control/src/remote_ssh.rs";
+
+/// daemon の HTTP API の他の受け口（#2365 の続き）。単体テストの mod より前の**ファイル全体**を見る
+/// （受け口を足しても範囲の登録を忘れて素通りしない）。`except` は HTTP の本文ではない日本語を持つ範囲
+/// （ファイル API の `Denial` の日本語の対 = #435。`RemoteRefusal::FileDenied` がこれを引く）
+const REMOTE_RECEIVER_FILES: &[(&str, &str, &[&str])] = &[
+    (
+        REMOTE_FILES_PATH,
+        REMOTE_FILES_SRC,
+        &["    pub fn message_ja(self)"],
+    ),
+    (REMOTE_TASKS_PATH, REMOTE_TASKS_SRC, &[]),
+    (REMOTE_CARDS_PATH, REMOTE_CARDS_SRC, &[]),
+    (REMOTE_SSH_PATH, REMOTE_SSH_SRC, &[]),
+];
+
+/// 1 つの受け口のファイルの違反を `file:line` つきで並べる
+fn remote_receiver_failures(path: &str, src: &str, except: &[&str]) -> Vec<String> {
+    let all = front_scope_lines(src, None).unwrap_or_default();
+    let mut skip = std::collections::BTreeSet::new();
+    for head in except {
+        let Some(lines) = front_scope_lines(src, Some(head)) else {
+            return vec![format!(
+                "{path}: 外す範囲 `{}` が見つからない（改名で番犬が広く外す / 空振りする。\
+                 REMOTE_RECEIVER_FILES を直す）",
+                head.trim()
+            )];
+        };
+        skip.extend(lines.iter().map(|(line, _)| *line));
+    }
+    let lines: Vec<(usize, &str)> = all
+        .into_iter()
+        .filter(|(line, _)| !skip.contains(line))
+        .collect();
+    remote_http_line_failures(path, &lines)
+}
+
+#[test]
+fn daemonの他の受け口の断りと注記に日本語の固定文が無く日本語の口を呼ばない() {
+    let mut failures = Vec::new();
+    for (path, src, except) in REMOTE_RECEIVER_FILES {
+        failures.extend(remote_receiver_failures(path, src, except));
+    }
+    report_all(failures);
+}
+
+/// 番犬自身の検査: 4 つの受け口の本物のソースへ素の文・日本語の口を植え戻すと、植えた行を `file:line` で
+/// 名指す。植えていない本物のソースは名指さない（対照）
+#[test]
+fn daemonの他の受け口の番犬は本物のソースへ植えた日本語の断りを名指す() {
+    let cases: &[(&str, &str, &[&str], &str, &str)] = &[
+        (
+            REMOTE_FILES_PATH,
+            REMOTE_FILES_SRC,
+            &["    pub fn message_ja(self)"],
+            r#"&crate::RemoteRefusal::MethodNotAllowed.kind_body("method_not_allowed"),"#,
+            r#"&json!({ "error": "このメソッドには対応していない", "kind": "method_not_allowed" }),"#,
+        ),
+        (
+            REMOTE_FILES_PATH,
+            REMOTE_FILES_SRC,
+            &["    pub fn message_ja(self)"],
+            "WriteFailure::conflict(&crate::RemoteRefusal::ChangedBeforeSave.to_string())",
+            r#"WriteFailure::conflict("保存の直前に変わりました")"#,
+        ),
+        (
+            REMOTE_FILES_PATH,
+            REMOTE_FILES_SRC,
+            &["    pub fn message_ja(self)"],
+            "crate::RemoteRefusal::ShortcutRejected(e).kind_body(e.kind()),",
+            r#"json!({ "error": e.message_ja(), "kind": e.kind() }),"#,
+        ),
+        (
+            REMOTE_FILES_PATH,
+            REMOTE_FILES_SRC,
+            &["    pub fn message_ja(self)"],
+            ".map_err(|_| crate::RemoteRefusal::BodyUnreadable.to_string())?;",
+            r#".map_err(|_| "リクエストボディの読み取りに失敗".to_string())?;"#,
+        ),
+        (
+            REMOTE_TASKS_PATH,
+            REMOTE_TASKS_SRC,
+            &[],
+            "&crate::RemoteRefusal::TasksUnavailable.kind_body(\"not_found\"),",
+            r#"&json!({ "error": "この版にはタスクの画面が無い", "kind": "not_found" }),"#,
+        ),
+        (
+            REMOTE_CARDS_PATH,
+            REMOTE_CARDS_SRC,
+            &[],
+            "\"error\": crate::RemoteRefusal::CardIndexInvalid.to_string(),",
+            r#""error": "index は 1 始まりの整数","#,
+        ),
+        (
+            REMOTE_SSH_PATH,
+            REMOTE_SSH_SRC,
+            &[],
+            "return Err(SshRequestError::bad(crate::RemoteRefusal::SshHostRequired));",
+            r#"return Err(SshRequestError::bad("host が必要"));"#,
+        ),
+        (
+            REMOTE_SSH_PATH,
+            REMOTE_SSH_SRC,
+            &[],
+            "\"note\": crate::RemoteRefusal::SshCapabilityUnknownNote.to_string(),",
+            r#""note": "このペインを SSH 化できるか判定できない","#,
+        ),
+        (
+            REMOTE_SSH_PATH,
+            REMOTE_SSH_SRC,
+            &[],
+            ".map_err(|_| (500u16, crate::RemoteRefusal::Internal.to_string()))?",
+            r#".map_err(|_| (500u16, "内部エラー".to_string()))?"#,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (path, src, except, from, to) in cases {
+        if src.matches(from).count() != 1 {
+            failures.push(format!(
+                "{path}: 植える元 `{from}` が 1 か所ではない（{} か所。番犬の検査の前提が崩れた）",
+                src.matches(from).count()
+            ));
+            continue;
+        }
+        let at = src.find(from).unwrap_or(0);
+        let line = src[..at].matches('\n').count() + 1;
+        let injected = src.replacen(from, to, 1);
+        let named = format!("{path}:{line}:");
+        let got = remote_receiver_failures(path, &injected, except);
+        if !got.iter().any(|f| f.starts_with(&named)) {
+            failures.push(format!(
+                "{path}:{line}: `{to}` を植えても番犬が名指さない: {got:?}"
+            ));
+        }
+    }
+    // 外す範囲を消すと `Denial` の日本語の対まで名指す（外す範囲が効いていることの対照）
+    let got = remote_receiver_failures(REMOTE_FILES_PATH, REMOTE_FILES_SRC, &[]);
+    if got.is_empty() {
+        failures.push(
+            "外す範囲を消しても `Denial::message_ja` の日本語を名指さない（走査が空振り）".into(),
+        );
+    }
+    for (path, src, except) in REMOTE_RECEIVER_FILES {
+        let got = remote_receiver_failures(path, src, except);
+        if !got.is_empty() {
+            failures.push(format!("{path}: 植えていないのに名指した: {got:?}"));
         }
     }
     report_all(failures);

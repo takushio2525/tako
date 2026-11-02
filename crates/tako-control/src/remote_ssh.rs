@@ -34,18 +34,19 @@ pub struct SshOpenRequest {
     pub remote_dir: Option<String>,
 }
 
-/// 要求を組み立てられなかった理由（HTTP ステータス + 日本語の理由 + 次の一手）
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 要求を組み立てられなかった理由（HTTP ステータス + 理由と次の一手）。文は `RemoteRefusal` の
+/// 日英の対で、本文の `error` は daemon の表示言語（#2365 の続き。以前は日本語の固定文）
+#[derive(Debug, Clone, PartialEq)]
 pub struct SshRequestError {
     pub status: u16,
-    pub message: String,
+    pub reason: crate::RemoteRefusal,
 }
 
 impl SshRequestError {
-    fn bad(message: impl Into<String>) -> Self {
+    fn bad(reason: crate::RemoteRefusal) -> Self {
         Self {
             status: 400,
-            message: message.into(),
+            reason,
         }
     }
 }
@@ -89,15 +90,10 @@ pub fn parse_open_request(
 ) -> Result<SshOpenRequest, SshRequestError> {
     let host = body["host"].as_str().unwrap_or("").trim().to_string();
     if host.is_empty() {
-        return Err(SshRequestError::bad(
-            "host が必要（`GET /api/ssh-hosts` の name を渡す）",
-        ));
+        return Err(SshRequestError::bad(crate::RemoteRefusal::SshHostRequired));
     }
     if !host_is_acceptable(&host) {
-        return Err(SshRequestError::bad(
-            "host に使えない文字が入っている（英数と . - _ : @ [ ] % + のみ。\
-             ~/.ssh/config の Host 名を渡す）",
-        ));
+        return Err(SshRequestError::bad(crate::RemoteRefusal::SshHostInvalid));
     }
 
     let target = match body.get("target") {
@@ -110,37 +106,30 @@ pub fn parse_open_request(
                 RemoteOpenTarget::default()
             }
         }
-        Some(Value::String(s)) => RemoteOpenTarget::parse(s).ok_or_else(|| {
-            SshRequestError::bad(format!(
-                "target が不正（{}）",
-                RemoteOpenTarget::values_hint()
-            ))
-        })?,
+        Some(Value::String(s)) => RemoteOpenTarget::parse(s)
+            .ok_or_else(|| SshRequestError::bad(crate::RemoteRefusal::SshTargetInvalid))?,
         Some(_) => {
-            return Err(SshRequestError::bad(format!(
-                "target は文字列（{}）",
-                RemoteOpenTarget::values_hint()
-            )))
+            return Err(SshRequestError::bad(
+                crate::RemoteRefusal::SshTargetNotString,
+            ))
         }
     };
 
     // 対象ペインはパス優先（`POST /api/panes/:id/ssh` の :id が正）。
     // ボディ側の pane はペイン非指定ルート（`POST /api/ssh`）でだけ効く
-    let pane =
-        match path_pane {
-            Some(p) => Some(p),
-            None => match body.get("pane") {
-                None | Some(Value::Null) => None,
-                Some(v) => Some(v.as_u64().ok_or_else(|| {
-                    SshRequestError::bad("pane は数値ペイン ID（一覧の id を渡す）")
-                })?),
-            },
-        };
+    let pane = match path_pane {
+        Some(p) => Some(p),
+        None => match body.get("pane") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .ok_or_else(|| SshRequestError::bad(crate::RemoteRefusal::SshPaneNotNumeric))?,
+            ),
+        },
+    };
 
     if target == RemoteOpenTarget::Pane && pane.is_none() {
-        return Err(SshRequestError::bad(
-            "target=pane は対象ペインが必要（`POST /api/panes/<id>/ssh` を使うか pane を渡す）",
-        ));
+        return Err(SshRequestError::bad(crate::RemoteRefusal::SshPaneRequired));
     }
 
     let remote_dir = body["remote_dir"]
@@ -150,7 +139,9 @@ pub fn parse_open_request(
         .map(str::to_string);
     if remote_dir.as_deref().is_some_and(|d| d.contains('"')) {
         // 接続後の `cd "<path>"` は両方言で通る形（#919）なので二重引用符だけ弾く
-        return Err(SshRequestError::bad("remote_dir に二重引用符は使えない"));
+        return Err(SshRequestError::bad(
+            crate::RemoteRefusal::SshRemoteDirQuote,
+        ));
     }
 
     Ok(SshOpenRequest {
@@ -235,7 +226,7 @@ pub fn attach_app_unavailable(result: &mut Value) {
         pane["can_ssh"] = json!({
             "ok": false,
             "reason": "app_unavailable",
-            "note": "tako app が稼働していないので SSH 接続を開けない（Mac で tako を起動する）",
+            "note": crate::RemoteRefusal::SshAppUnavailableNote.to_string(),
         });
     }
 }
@@ -244,7 +235,7 @@ fn unknown_can_ssh() -> Value {
     json!({
         "ok": false,
         "reason": "unknown",
-        "note": "このペインを SSH 化できるか判定できない（Mac 側の tako が古い可能性がある）",
+        "note": crate::RemoteRefusal::SshCapabilityUnknownNote.to_string(),
     })
 }
 
@@ -259,7 +250,7 @@ pub(crate) fn list_hosts(
     request_via_app(
         app_conn,
         crate::protocol::Request::SshHosts,
-        "tako app が稼働していない（SSH ホスト一覧は app 経由のみ）",
+        crate::remote_refusal::AppVia::SshHosts,
     )
 }
 
@@ -271,29 +262,32 @@ pub(crate) fn open_remote(
     let mut out = request_via_app(
         app_conn,
         to_open_remote(req),
-        "tako app が稼働していない（リモートからの SSH 接続は app 経由のみ）",
+        crate::remote_refusal::AppVia::SshOpen,
     )?;
     // 応答に「次に何を見ればいいか」を添える。接続の成否はこの時点では**まだ分からない**
     // （#919 / #1040: 失敗しても ssh_connect に理由が残り、ペインは消えない）
     if let Some(obj) = out.as_object_mut() {
         obj.insert(
             "poll".into(),
-            json!("/api/v2/panes の ssh_connect で接続の進み方と失敗の理由が読める"),
+            json!(crate::RemoteRefusal::SshPollNote.to_string()),
         );
     }
     Ok(out)
 }
 
-/// dispatch を IPC で呼ぶ共通経路。app 不在は 503、失敗は 502（接続は破棄して張り直す）
+/// dispatch を IPC で呼ぶ共通経路。app 不在は 503（断りの括弧の中身は `via`）、失敗は 502
+/// （接続は破棄して張り直す）
 fn request_via_app(
     app_conn: &std::sync::Arc<std::sync::RwLock<crate::remote::AppConnection>>,
     request: crate::protocol::Request,
-    unavailable: &str,
+    via: crate::remote_refusal::AppVia,
 ) -> Result<Value, (u16, String)> {
     // #1403: daemon → app の往復は `remote::with_app_ipc` の 1 実装を通す
     // （HTTP 受信が複数ワーカーになったので、ここで同時に 2 本走らせない）
     crate::remote::with_app_ipc(app_conn, |conn| {
-        let client = conn.get().ok_or((503u16, unavailable.to_string()))?;
+        let client = conn
+            .get()
+            .ok_or_else(|| (503u16, crate::RemoteRefusal::AppNotRunning(via).to_string()))?;
         match client.request(request) {
             Ok(v) => Ok(v),
             Err(e) => {
@@ -307,7 +301,7 @@ fn request_via_app(
             }
         }
     })
-    .map_err(|_| (500u16, "内部エラー".to_string()))?
+    .map_err(|_| (500u16, crate::RemoteRefusal::Internal.to_string()))?
 }
 
 /// dispatch の拒否（呼び出し側の指定が通らない）か、経路の故障かを見分ける。
@@ -382,11 +376,14 @@ mod tests {
             let err =
                 parse_open_request(&body, path_pane).expect_err(&format!("{body} は断るべき"));
             assert_eq!(err.status, 400, "{body}");
+            // 日本語は #2365 より前の文のまま、英語は日本語を含まない（本文は daemon の表示言語）
+            let ja = err.reason.text_in(tako_core::i18n::Lang::Ja);
             assert!(
-                err.message.contains(needle),
-                "理由に {needle} が出ていない: {} ({body})",
-                err.message
+                ja.contains(needle),
+                "理由に {needle} が出ていない: {ja} ({body})"
             );
+            let en = err.reason.text_in(tako_core::i18n::Lang::En);
+            assert!(en.is_ascii(), "英語の理由に日本語が混ざる: {en} ({body})");
         }
     }
 
@@ -423,7 +420,7 @@ mod tests {
         // 落とした結果が安全な 1 語なら通す（間に挟まった空白は上のテストで弾く）
         for raw in [" win", "win\n", "\twin \r\n"] {
             let req = parse_open_request(&json!({ "host": raw }), None)
-                .unwrap_or_else(|e| panic!("{raw:?} は受けるべき: {}", e.message));
+                .unwrap_or_else(|e| panic!("{raw:?} は受けるべき: {}", e.reason));
             assert_eq!(req.host, "win", "{raw:?}");
         }
     }

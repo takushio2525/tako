@@ -143,8 +143,8 @@ const ALLOWED: &[Allow] = &[
     },
     Allow {
         file: "crates/tako-control/src/remote_files.rs",
-        needle: "JSON パースエラー",
-        why: "リモートの HTTP 要求の本文",
+        needle: "RemoteRefusal::BodyJsonInvalid(",
+        why: "リモートの HTTP 要求の本文（#2365 で文を RemoteRefusal へ移した）",
     },
     Allow {
         file: "crates/tako-control/src/acceptance_gates.rs",
