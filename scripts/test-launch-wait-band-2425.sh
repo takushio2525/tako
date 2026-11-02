@@ -238,11 +238,12 @@ run_section() {
   new_round "visual-$arm"
   inject critical
   mkdir -p "$DUMP_ROOT/$arm"
+  # 面を用意できなければ 4（#1744）= 呼び手が未実測と書く
+  local rc=0
   launch_isolated_gui "$R/app.log" "SHELL=/bin/zsh" "ZDOTDIR=$ZDOTDIR" \
     "PATH=$R/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" "TAKO_2413_INJECT=$INJECT" \
     TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY=launch-wait-band "TAKO_VISUAL_DUMP_DIR=$DUMP_ROOT/$arm" \
-    ${1+"$@"}
-  local rc=$?
+    ${1+"$@"} || rc=$?
   if [ "$rc" -ne 0 ]; then
     return "$rc"
   fi
@@ -294,10 +295,11 @@ part_visual() {
 start_gui() {
   local name="$1"
   shift
+  # 面を用意できなければ 4（#1744）= 呼び手が未実測と書く
+  local rc=0
   launch_isolated_gui "$R/app-${name}.log" "TAKO_PERSIST=1" "SHELL=/bin/zsh" "ZDOTDIR=$ZDOTDIR" \
     "PATH=$R/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin" "TAKO_2413_INJECT=$INJECT" \
-    ${1+"$@"}
-  local rc=$?
+    ${1+"$@"} || rc=$?
   if [ "$rc" -ne 0 ]; then
     return "$rc"
   fi
