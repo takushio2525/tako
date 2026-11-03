@@ -693,7 +693,10 @@ fn queue_run_cases() -> Vec<Case> {
         run(
             "r_cancel_running",
             &["queue", "sleep", "30"],
-            Arbiter::Script(vec![granted(2), json!({"state": "running", "cancel": true})]),
+            Arbiter::Script(vec![
+                granted(2),
+                json!({"state": "running", "cancel": true}),
+            ]),
         ),
     ]
 }
