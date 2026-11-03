@@ -149,7 +149,7 @@ sleep 0.3
 wait_until 5 waiting_is 3
 got="$(waiting_summary)"
 want="$P_MASTER:high:role $P_WORKER:normal:role $P_OUT:low:role"
-[ "$got" = "$want" ] && pass "master → worker → ペインの外の順（$got）" || fail "並び $got（期待 $want）"
+[ "$got" = "$want" ] && pass "master → worker → ペインの外の順（${got}）" || fail "並び ${got}（期待 ${want}）"
 # 人が直接（役割の無いペインで stdin が端末）は top。端末は script(1) の疑似端末で与える
 script -q /dev/null env TAKO_PANE_ID=903 TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" queue sleep 1 >/dev/null 2>&1 &
 P_HUMAN=$!
@@ -159,8 +159,8 @@ human_line="$(status_json | py 'import json,sys
 w=json.load(sys.stdin)["queue"]["waiting"][0]
 print(w["priority"], w["priority_from"], w["label"])')"
 case "$human_line" in
-  "top role sleep 1") pass "人が端末から打った処理は top で先頭（$human_line）" ;;
-  *) fail "先頭が $human_line（期待 top role sleep 1）" ;;
+  "top role sleep 1") pass "人が端末から打った処理は top で先頭（${human_line}）" ;;
+  *) fail "先頭が ${human_line}（期待 top role sleep 1）" ;;
 esac
 
 echo "== ② CLI と MCP の優先度変更が同じ結果 =="
@@ -181,13 +181,14 @@ esac
   pass "default で既定（low = ペインの外）へ戻る" || fail "default の後: $back"
 cli_fields="$(py 'import json,sys; v=json.loads(sys.argv[1]); print(v["priority"], v["priority_from"], v["changed"])' "$cli_out" 2>/dev/null)"
 mcp_fields="$(py 'import json,sys; v=json.loads(sys.argv[1]); print(v["priority"], v["priority_from"], v["changed"])' "$mcp_out" 2>/dev/null)"
-[ -n "$cli_fields" ] && [ "$cli_fields" = "$mcp_fields" ] && pass "応答の段・出どころ・changed が一致（$cli_fields）" || fail "CLI 応答 [$cli_fields] / MCP 応答 [$mcp_fields]（$mcp_out）"
+[ -n "$cli_fields" ] && [ "$cli_fields" = "$mcp_fields" ] && pass "応答の段・出どころ・changed が一致（${cli_fields}）" || fail "CLI 応答 [${cli_fields}] / MCP 応答 [${mcp_fields}]（${mcp_out}）"
 # 人の読む表示に出どころが出る
-q 2>/dev/null | grep -q "top（処理に付けた段）" && pass "tako queue の待ちの行に段の出どころ" || fail "待ちの行に出どころが無い"
+human_status="$(q 2>/dev/null)"
+[[ "$human_status" == *"top（処理に付けた段）"* ]] && pass "tako queue の待ちの行に段の出どころ" || fail "待ちの行に出どころが無い"
 
 echo "== ③ 境界 =="
 out="$(q priority "$P_OUT" urgent 2>&1)"; rc=$?
-[ "$rc" -ne 0 ] && grep -q "urgent" <<<"$out" && pass "読めない段は断る（rc=$rc）" || fail "読めない段: rc=$rc $out"
+[ "$rc" -ne 0 ] && grep -q "urgent" <<<"$out" && pass "読めない段は断る（rc=${rc}）" || fail "読めない段: rc=$rc $out"
 out="$(q priority 4242424 high 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] && grep -q "4242424" <<<"$out" && pass "居ない受付番号は断る" || fail "居ない受付番号: rc=$rc $out"
 out="$(q priority 1 high --pane 5 2>&1)"; rc=$?
@@ -232,9 +233,10 @@ print(next(("%s/%s %s" % (x["progress"]["done"], x["progress"]["total"], x["eta"
   sleep 0.5
 done
 wait "$B1"; rc1=$?
-[ "$rc1" -eq 0 ] && pass "1 回目のビルドは成功" || fail "1 回目 rc=$rc1（$(tail -3 "$TMP/b1.err")）"
-[ -n "$saw_progress" ] && pass "status の running[].progress に N/M（$saw_progress）" || fail "N/M が status に出なかった"
-if tr '\r' '\n' < "$TMP/b1.err" | grep -q "Building \["; then
+[ "$rc1" -eq 0 ] && pass "1 回目のビルドは成功" || fail "1 回目 rc=${rc1}（$(tail -3 "$TMP/b1.err")）"
+[ -n "$saw_progress" ] && pass "status の running[].progress に N/M（${saw_progress}）" || fail "N/M が status に出なかった"
+b1_lines="$(tr '\r' '\n' < "$TMP/b1.err")"
+if [[ "$b1_lines" == *"Building ["* ]]; then
   fail "AI に返る stderr に進みの行が混ざった"
 else
   pass "stderr に進みの行が無い"
@@ -243,7 +245,7 @@ grep -q "Compiling sleep_a" "$TMP/b1.err" && grep -q "Finished" "$TMP/b1.err" &&
 grep -q $'\r' "$TMP/b1.err" && fail "stderr に \\r が残った" || pass "進みの行の \\r も残らない"
 
 echo "== ⑤ 同じコマンドの 2 回目から終わりの見込み =="
-[ -s "$HIST" ] && pass "1 回目の記録が残った" || fail "記録が無い（$HIST）"
+[ -s "$HIST" ] && pass "1 回目の記録が残った" || fail "記録が無い（${HIST}）"
 if [ -s "$HIST" ]; then
   py 'import json,sys
 rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
@@ -277,7 +279,8 @@ case "$human2" in *"あと約"*"前回"*) pass "人の読む行に「あと約 N
 
 echo "== ⑥ 端末の cargo は横取りしない =="
 (cd "$WS" && SLEEP_SALT=3 SLEEP_MS=1000 script -q "$TMP/tty.typescript" env TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" queue cargo build >/dev/null 2>&1)
-if tr '\r' '\n' < "$TMP/tty.typescript" | grep -q "Building"; then
+tty_lines="$(tr '\r' '\n' < "$TMP/tty.typescript")"
+if [[ "$tty_lines" == *"Building"* ]]; then
   pass "端末では cargo 自身の進みがそのまま見える"
 else
   fail "端末の出力に cargo の進みが無い（横取りした？）"
@@ -309,7 +312,7 @@ for l in open(sys.argv[1]):
 print(n)' "$HIST")"
 [ "$bad" = "0" ] && pass "history.jsonl は読める行だけ" || fail "読めない行が $bad 行残った"
 mig="$(TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" migrate status --schema queue_history 2>&1)"
-echo "$mig" | grep -q "queue_history" && pass "tako migrate status に queue_history が載る" || fail "migrate status: $mig"
+[[ "$mig" == *"queue_history"* ]] && pass "tako migrate status に queue_history が載る" || fail "migrate status: $mig"
 
 stop_arbiter
 echo

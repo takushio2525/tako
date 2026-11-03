@@ -1151,7 +1151,9 @@ fn cancel(id: u64) -> Result<Value, DispatchError> {
     not_arbiter(&a)?;
     prune(&mut a, Instant::now());
     let Some(job) = a.jobs.get_mut(&id) else {
-        return Err(Reason::QueueJobUnknown(id).invalid());
+        return Err(DispatchError::InvalidParams(format!(
+            "受付番号 {id} は順番待ちに居ない（`tako queue` で一覧）"
+        )));
     };
     job.cancel = true;
     Ok(json!({
@@ -1902,6 +1904,7 @@ mod tests {
 
     const MIN_MS: u64 = 60 * 1000;
 
+    /// 受付の時刻は今の時刻 + `at` ミリ秒（小さい値をそのまま使うと 1970 年からの待ち = 全件が high へ上がる）
     fn hinted(
         pid: u32,
         at: u64,
@@ -1910,6 +1913,7 @@ mod tests {
         tty: bool,
     ) -> JobWire {
         JobWire {
+            enqueued_at_ms: unix_ms() + at,
             pane,
             hint: Some(q::PriorityHint {
                 set: None,
@@ -2075,19 +2079,18 @@ mod tests {
         let wall = unix_ms();
         // A = ペインの外（low）を 31 分前に受付 → high / B = worker（normal）を 1 分前 → normal のまま /
         // C = 端末から（top）を今
-        poll(&hinted(pids[1], wall - 31 * MIN_MS, None, None, false), now).unwrap();
+        let at = |w: JobWire, ms: u64| JobWire {
+            enqueued_at_ms: ms,
+            ..w
+        };
+        let worker = hinted(pids[2], 0, Some(13), Some(CallerRole::Worker), false);
         poll(
-            &hinted(
-                pids[2],
-                wall - MIN_MS,
-                Some(13),
-                Some(CallerRole::Worker),
-                false,
-            ),
+            &at(hinted(pids[1], 0, None, None, false), wall - 31 * MIN_MS),
             now,
         )
         .unwrap();
-        poll(&hinted(pids[3], wall, Some(13), None, true), now).unwrap();
+        poll(&at(worker, wall - MIN_MS), now).unwrap();
+        poll(&at(hinted(pids[3], 0, Some(13), None, true), wall), now).unwrap();
         assert_eq!(waiting_ids(), vec![id(3), id(1), id(2)]);
         let a = waiting_of(id(1));
         assert_eq!(
@@ -2164,7 +2167,7 @@ mod tests {
         // S2 の wrapper: 手がかりを送らず、既定の normal（master のペインでも high にしない = S2 と同じ並び）
         let old = JobWire {
             pane: Some(10),
-            ..wire(pids[1], 2)
+            ..wire(pids[1], unix_ms())
         };
         let r = poll(&old, now).unwrap();
         assert_eq!(

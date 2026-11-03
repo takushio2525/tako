@@ -221,19 +221,21 @@ fn 生のargvとパスの載った行は欄を名指して書かない() {
 
 // ===== 配線（ソースを読む）=====
 
-/// `head` で始まる関数の本体（次の `fn ` の行まで）の (開始行, 行)
-fn fn_window<'a>(src: &'a str, head: &str) -> Option<(usize, Vec<&'a str>)> {
+/// 名前が `name` の関数の本体（次のトップレベルの関数の頭まで）の (開始行, 行)。関数の頭は
+/// `tako_core::source_scan::fn_head_name` で読む（`pub(crate) fn` / `async fn` も頭と見なす = #1496）
+fn fn_window<'a>(src: &'a str, name: &str) -> Option<(usize, Vec<&'a str>)> {
+    use tako_core::source_scan::fn_head_name;
     let lines: Vec<&str> = src.lines().collect();
-    let start = lines
-        .iter()
-        .position(|l| l.trim_start().starts_with(head))?;
+    let start = lines.iter().position(|l| fn_head_name(l) == Some(name))?;
     let end = lines
         .iter()
         .enumerate()
         .skip(start + 1)
         .find(|(_, l)| {
-            let t = l.trim_start();
-            (t.starts_with("fn ") || t.starts_with("pub fn ")) && !l.starts_with("        ")
+            !l.starts_with(' ')
+                && (fn_head_name(l).is_some()
+                    || l.starts_with("#[cfg(test)]")
+                    || l.starts_with("mod "))
         })
         .map_or(lines.len(), |(i, _)| i);
     Some((start + 1, lines[start..end].to_vec()))
@@ -247,7 +249,7 @@ fn code(line: &str) -> &str {
 fn scan(queue: &str, history: &str, wrapper: &str) -> Vec<String> {
     let mut out = Vec::new();
     // 2: 待ちの並びの入力はエイジングの後の段
-    match fn_window(queue, "fn waiting_jobs(") {
+    match fn_window(queue, "waiting_jobs") {
         None => out.push(format!(
             "{QUEUE}:0 `waiting_jobs` が見つからない（走査が空振り）"
         )),
@@ -266,7 +268,7 @@ fn scan(queue: &str, history: &str, wrapper: &str) -> Vec<String> {
         }
     }
     // 4: 書く口は検査してから書く
-    match fn_window(history, "pub fn append(") {
+    match fn_window(history, "append") {
         None => out.push(format!(
             "{HISTORY}:0 `append` が見つからない（走査が空振り）"
         )),

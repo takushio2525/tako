@@ -41165,9 +41165,10 @@ mod tests {
         .unwrap();
         assert!(!saved.contains("queue_priority"), "{saved}");
         // 境界: 居ないペイン・読めない段・受付番号とペインの両方
+        let missing = tako_core::unused_id::pane().as_u64();
         assert!(matches!(
-            dispatch(&mut host, req("high", Some(987_654), None), PaneOrigin::Cli),
-            Err(DispatchError::PaneNotFound(987_654))
+            dispatch(&mut host, req("high", Some(missing), None), PaneOrigin::Cli),
+            Err(DispatchError::PaneNotFound(id)) if id == missing
         ));
         let e = dispatch(&mut host, req("urgent", Some(pane), None), PaneOrigin::Cli).unwrap_err();
         assert!(e.to_string().contains("urgent"), "{e}");
