@@ -2390,7 +2390,15 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     **積んだだけの仕事は走っていない**: 読み込みと塗りの待ち行列（`pending_preview_loads` /
     `pending_highlights` 等）は描画では流れない（#826）ので、流し忘れは `Settled` で即座に落ちる。
     相手が別プロセスで「走っている」を言えないとき（偽サーバの診断）は `Landed` / `Running`
-    だけを返す（= 状態待ち + 伸びる上限）
+    だけを返す（= 状態待ち + 伸びる上限）。節が dispatch を直に呼んで開いた読み込みは、呼び手が
+    開いた直後に `drain_pending_preview_loads` を流す（IPC の `after_dispatch` の代わり。UI の経路の
+    後の待ちでは流さない = 製品の流し忘れを試験が隠さない）。`probe` は読むだけなので、製品の処理を
+    試験の手で回さない（動画の末尾判定は製品と同じ ticker `ensure_video_ticker` に回させる）
+  - **画面の静止を撮り直して待つなら `wait_for_quiet_frame` の 1 実装**（#1902 の 2 回目）: 毎周期
+    1 フレーム描いて撮り、**前の周期の絵と同じ**で `ready` が真なら `QuietFrame::Quiet`。動いている
+    相手（シェルのプロンプトの再描画・画像のデコード・フォントの組み直し）は「走っている」を
+    言えないので、上限は `state_wait_budget` の保険（上限まで動けば `Moving`・撮れなければ
+    `NoCapture`）。A/B・注入・診断行は `wait_for_background_state` と同じ口（静止 = `outcome=Landed`）
   - A/B は `TAKO_1902_LEGACY=<項目>`（旧の回数の窓 = 予算の値 `text_wait_budget(回数, 間隔, 素の上限)`
     で残す）、注入は `TAKO_1902_INJECT=late|never[:<項目>…]`（**観測だけ**を遅らせる）、診断行は
     `TAKO_SELF_TEST_1902`（`item=` / `outcome=` / `waited=` / `budget=` / `polls=` / `legacy=` /
@@ -2403,8 +2411,8 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     （`wait(cx, ` / `.timer(` / `sleep(cx, ` / `thread::sleep(`）と**抜け**（`break` / `return`）を
     両方持つものを `ファイル:行（キー）` で名指しする。キーは「ファイル名: ループの後の最初の
     `check(` / `fail(` のラベル」（無ければ「ファイル名: fn <囲む関数>」）。#1902 の時点の残りは
-    既知リスト `KNOWN_COUNT_WINDOWS`（キーと分類 = PTY / 別プロセス / UI / 画面の静止 / 計測 /
-    background の未移送）で段階導入する（減る方向にしか動かさない）。#1162 / #1153 / #1165 /
+    既知リスト `KNOWN_COUNT_WINDOWS`（キーと分類 = PTY / 別プロセス / UI / 計測。background と
+    画面の静止は 2 回目の移送で 0 件）で段階導入する（減る方向にしか動かさない）。#1162 / #1153 / #1165 /
     #1180 / #771 の needle 別の番犬はそれぞれの寄せ先を案内するために残す（形の番犬が上位）
   - **上限が固定値の状態待ち**（`wait_for_preview_state(…, Duration::from_secs(3), …)`）は
     回数の窓ではないのでこの番犬には当たらない = 下の #1837 の番犬の担当（形が違うので並べる）
