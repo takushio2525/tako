@@ -37,7 +37,7 @@ FAKE_EXEC_WARM_ARG=tako-fake-exec-warm
 
 # スタブの 2 行目に空打ちの行（と注入の行）を差し込む（既にあれば何もしない）
 _fake_exec_insert() {
-  local f="$1" first second ms tmp
+  local f="$1" first warm_line ms tmp
   if [ ! -f "$f" ]; then
     echo "fake_exec_warm: スタブが無い: $f" >&2
     return 1
@@ -47,10 +47,12 @@ _fake_exec_insert() {
     '#!'*) ;;
     *) echo "fake_exec_warm: 1 行目が shebang でない: $f" >&2; return 1 ;;
   esac
-  second="$(sed -n 2,3p "$f")"
-  case "$second" in
-    *"$FAKE_EXEC_WARM_ARG"*) return 0 ;;
-  esac
+  # 空打ちの行が 2 行目（注入の行があれば 3 行目）に既にあれば差し込まない（冪等）。**行そのもの**で
+  # 見る: 空打ちの引数の字面だけで見ると、引数を値に持つ行（書き出し口に焼き込んだ
+  # `FAKE_EXEC_WARM_ARG=…`）を空打ちの行と取り違え、空打ちが本文を走らせる（#2228 で踏んだ）
+  warm_line="$(printf '[ "${1:-}" = %s ] && exit 0' "$FAKE_EXEC_WARM_ARG")"
+  case "$(sed -n 2p "$f")" in "$warm_line") return 0 ;; esac
+  case "$(sed -n 3p "$f")" in "$warm_line") return 0 ;; esac
   tmp="$f.fake-exec.$$"
   {
     printf '%s\n' "$first"
@@ -60,7 +62,7 @@ _fake_exec_insert() {
       *) printf 'if [ ! -e "$0.first-exec" ]; then : > "$0.first-exec"; /bin/sleep %d.%03d; fi\n' \
            "$((ms / 1000))" "$((ms % 1000))" ;;
     esac
-    printf '[ "${1:-}" = %s ] && exit 0\n' "$FAKE_EXEC_WARM_ARG"
+    printf '%s\n' "$warm_line"
     tail -n +2 "$f"
   } > "$tmp" || return 1
   command mv -f "$tmp" "$f"

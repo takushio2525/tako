@@ -5581,3 +5581,66 @@ fn 番犬は素のchmodの増加をfile_lineで名指しする() {
     assert_eq!(got.len(), 1, "{got:?}");
     assert!(got[0].starts_with(&format!("{rel}:{want}: ")), "{got:?}");
 }
+
+/// 空打ちの補助（`scripts/lib/fake-exec.sh`）を実際の bash で走らせ、差し込んだ後のスタブを返す
+#[cfg(unix)]
+fn run_fake_exec_warm(stub_body: &str, env: &[(&str, &str)], times: usize) -> (String, bool) {
+    let scratch = tako_core::test_residue::ScratchDir::new("t2228-fake-exec-sh");
+    let stub = scratch.path().join("stub");
+    std::fs::write(&stub, stub_body).expect("スタブを書ける");
+    let calls = vec!["fake_exec_warm \"$2\""; times].join(" && ");
+    let mut cmd = std::process::Command::new("/bin/bash");
+    cmd.arg("-c")
+        .arg(format!(". \"$1\" && {calls}"))
+        .arg("_")
+        .arg(repo_root().join(FAKE_EXEC_LIB))
+        .arg(&stub)
+        .env_remove("TAKO_2222_LEGACY")
+        .env_remove("TAKO_2222_INJECT_FIRST_EXEC_MS");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("bash を起こせる");
+    assert!(out.status.success(), "{out:?}");
+    let text = std::fs::read_to_string(&stub).expect("スタブを読める");
+    (text, scratch.path().join("body-ran").exists())
+}
+
+/// 空打ちの補助は「空打ちの行そのもの」があるときだけ差し込みを飛ばす（#2228）。空打ちの引数の字面を
+/// 2〜3 行目に含むだけの書き出し口（`FAKE_EXEC_WARM_ARG='…'` を焼き込んだ write-ts）を、空打ちの行が
+/// あると取り違えて差し込まず、空打ちが本文を走らせて作業ディレクトリへスタブを書いていた
+#[cfg(unix)]
+#[test]
+fn 空打ちの補助は空打ちの字面を含む行を空打ちの行と取り違えない() {
+    const WARM_LINE: &str = "[ \"${1:-}\" = tako-fake-exec-warm ] && exit 0";
+    let body = "#!/bin/bash\nSANDBOX='x'\nFAKE_EXEC_WARM_ARG='tako-fake-exec-warm'\n\
+                : > \"$(dirname \"$0\")/body-ran\"\n";
+    // 2 回掛けても空打ちの行は 1 行だけ・空打ちは本文を走らせない
+    let (text, ran) = run_fake_exec_warm(body, &[], 2);
+    assert!(!ran, "空打ちが本文を走らせた:\n{text}");
+    assert_eq!(text.lines().nth(1), Some(WARM_LINE), "{text}");
+    assert_eq!(
+        text.lines().filter(|l| *l == WARM_LINE).count(),
+        1,
+        "{text}"
+    );
+    // 注入の行があれば空打ちの行は 3 行目（2 回掛けても増えない）
+    let (text, ran) = run_fake_exec_warm(body, &[("TAKO_2222_INJECT_FIRST_EXEC_MS", "1")], 2);
+    assert!(!ran, "{text}");
+    assert!(
+        text.lines()
+            .nth(1)
+            .is_some_and(|l| l.contains(".first-exec")),
+        "{text}"
+    );
+    assert_eq!(text.lines().nth(2), Some(WARM_LINE), "{text}");
+    assert_eq!(
+        text.lines().filter(|l| *l == WARM_LINE).count(),
+        1,
+        "{text}"
+    );
+    // 修正前の形（A/B）: 差し込むが起こさない
+    let (text, ran) = run_fake_exec_warm(body, &[("TAKO_2222_LEGACY", "1")], 1);
+    assert!(!ran, "{text}");
+    assert_eq!(text.lines().nth(1), Some(WARM_LINE), "{text}");
+}
