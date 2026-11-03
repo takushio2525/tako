@@ -3023,12 +3023,19 @@ background を一往復した後の着地で決まる。**呼んだのと同じ 
   を `fail` の外で出して exit しない。後片付けの要らない出口（窓を開く前に終わる等）だけ、その行か
   直前 6 行に `// tako:exit-cleanup-ok <理由>` を書く（番犬 `selftest_exit_cleanup_watchdog`）
 - `fail()` は FAILED の行の**後**に上限 5 秒で片付けるので、片付けが固まっても落ちた理由と終了コード 1 は
-  変わらない。片付けた物は `TAKO_APP_SELF_TEST_EXIT_CLEANUP: backend=… agent_home=… left=…` の行で読む。
+  変わらない。片付けた物は `TAKO_APP_SELF_TEST_EXIT_CLEANUP: backend=… agent_home=… ipc_socket=… scoped=… left=…` の行で読む。
   A/B は `TAKO_2388_LEGACY=1`、実経路は `bash scripts/test-selftest-failed-cleanup-2388.sh`
 - visual-test の出口（成功の `TAKO_VISUAL_TEST_OK` と知らない節の名前の `exit(1)`）も `exit` で終わるので、
   `self_test::visual_exit` を通す（#2491・FR-4.8.27）。節の腕で成功の行を出して直に exit しない
   （`run_visual` の中の直の exit と `visual_exit` の外の成功の行は番犬が名指しする）。成功の行は片付けの
   **後**に出る。A/B は `TAKO_2491_LEGACY=1`、実経路は `bash scripts/test-visual-exit-cleanup-2491.sh`
+- 検証起動の GUI が env へ自分で決めた置き場（`tako-iso-…-<pid>` / `tako-st-…-<pid>`）は `set_var` で直に当てず
+  `tako_core::scoped_dirs::adopt` で当てる（無いときだけ当てて覚える = 片付けが覚えた物だけを付属ファイルごと消す。#2686・
+  FR-4.8.28）。**明示 = 残す・暗黙 = 片付ける**: 利用者が渡した置き場は当ても覚えもしない・`cleanup_process_scoped` の中で
+  data dir やペインログの置き場を直に消さない。消した後の書き込みで置き場を生き返らせないよう、親 dir を作る書き手は
+  `scoped_dirs::is_retired` を見て捨てる（いまは診断ログの `append_log` とセッションカタログの `flush_last_seen`）。
+  本番の GUI では覚えも消しもしない（門は `paths::is_verification_process()`）。A/B は `TAKO_2686_LEGACY=1`、番犬は
+  `issue2686_scoped_dirs_watchdog`、実経路は `bash scripts/test-isolated-scoped-dirs-2686.sh`
 
 ## TUI の画面マーカーは「幅で切られる」前提で選ぶ（Issue #1015）
 

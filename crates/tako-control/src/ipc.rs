@@ -227,6 +227,8 @@ impl Drop for IpcServer {
         }
         #[cfg(unix)]
         {
+            // 終了の後片付けの名簿から外す（#2686。drop で消すので片付けが二度触らない）
+            unix_imp::forget_scoped(&self.file_id);
             // 消すのは自分の受け口のファイルだけ（別の受け口に奪われていたパスを
             // 終了のついでに消すと、今度は相手の受け口がパスから切り離される）
             if !owns {
@@ -238,6 +240,26 @@ impl Drop for IpcServer {
                 let _ = std::fs::remove_file(pointer);
             }
         }
+    }
+}
+
+/// 検証プロセスの本体の受け口のうち、このプロセスだけが使うソケットファイル（pid 入りの一時パス
+/// `tako-<pid>-<連番>.sock`、と GUI が自分で決めた data dir から逃がした短縮パス）を消し、消したパスを返す（#2686）。
+///
+/// 消すのはふつう drop の役目だが、GUI はどの出口でも drop を通らずに終わる（セルフテストの FAILED は
+/// `std::process::exit`、成功と SIGTERM は `on_app_quit` が最後まで通っても GPUI が TakoApp を drop せずに
+/// プロセスを終える = #2686 で実測）。呼ぶのは tako-app の終了の後片付け `cleanup_process_scoped` の 1 実装。
+/// 消すのは自分の受け口の実体のときだけ（パスを奪われていたら相手のもの）。**本番の GUI では何もしない**
+/// （本番の `<data_dir>/tako.sock` は次の起動の bind が残骸を片付ける作りのまま）。Windows は名前付きパイプで
+/// ファイルが無いので常に空
+pub fn remove_scoped_socket_files() -> Vec<String> {
+    #[cfg(unix)]
+    {
+        unix_imp::remove_scoped()
+    }
+    #[cfg(windows)]
+    {
+        Vec::new()
     }
 }
 
@@ -783,8 +805,11 @@ mod unix_imp {
                 };
                 // #2002: 本体の受け口だけが記録と persist.log へ出す（単体テストは出さない）
                 let watch = WatchConfig::from_env(plan.kind, !cfg!(test));
+                let kind = plan.kind;
                 let mut server = serve(listener, tx, token, plan.path, pointer, watch)?;
                 server.fixed_path_holder = probe.map(|p| p.occupant).filter(|o| o.holds());
+                // #2686: このプロセスだけのソケットファイルなら、drop を通らない出口の後片付けへ名簿で渡す
+                remember_scoped(kind, &server);
                 Ok(server)
             }
             Err(e) => {
@@ -917,6 +942,89 @@ mod unix_imp {
             return true;
         };
         socket_id(Path::new(path)) == Some(ours)
+    }
+
+    /// 終了の後片付けが消す、このプロセスだけの本体の受け口（#2686）
+    struct ScopedSocket {
+        endpoint: String,
+        pointer: Option<PathBuf>,
+        file_id: SharedFileId,
+    }
+
+    static SCOPED: Mutex<Vec<ScopedSocket>> = Mutex::new(Vec::new());
+
+    /// 本体の受け口のソケットファイルが、このプロセスだけのものか（**純関数**。#2686）: pid 入りの一時パス
+    /// （`tako-<pid>-<連番>.sock`）か、GUI が自分で決めた置き場（`adopted`）の中に参照を置いた短縮パス
+    /// （data dir が深いので逃がしたもの）。固定パス（`<data_dir>/tako.sock`）は data dir と一緒に片付く
+    /// （明示した data dir の中のものは残す）ので数えない
+    pub(super) fn is_scoped_socket(
+        kind: SocketPathKind,
+        endpoint: &Path,
+        pointer: Option<&Path>,
+        pid: u32,
+        adopted: impl Fn(&Path) -> bool,
+    ) -> bool {
+        match kind {
+            SocketPathKind::Temp => endpoint
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix(&format!("tako-{pid}-")))
+                .and_then(|rest| rest.strip_suffix(".sock"))
+                .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit())),
+            SocketPathKind::Shortened => pointer.is_some_and(adopted),
+            _ => false,
+        }
+    }
+
+    /// 本体の受け口を名簿へ載せる（検証プロセスで、このプロセスだけのソケットファイルのときだけ）
+    pub(super) fn remember_scoped(kind: SocketPathKind, server: &IpcServer) {
+        if !tako_core::paths::is_verification_process() || tako_core::scoped_dirs::legacy() {
+            return;
+        }
+        if !is_scoped_socket(
+            kind,
+            Path::new(&server.endpoint),
+            server.pointer.as_deref(),
+            std::process::id(),
+            tako_core::scoped_dirs::is_adopted,
+        ) {
+            return;
+        }
+        if let Ok(mut scoped) = SCOPED.lock() {
+            scoped.push(ScopedSocket {
+                endpoint: server.endpoint.clone(),
+                pointer: server.pointer.clone(),
+                file_id: Arc::clone(&server.file_id),
+            });
+        }
+    }
+
+    /// drop した受け口を名簿から外す
+    pub(super) fn forget_scoped(file_id: &SharedFileId) {
+        if let Ok(mut scoped) = SCOPED.lock() {
+            scoped.retain(|s| !Arc::ptr_eq(&s.file_id, file_id));
+        }
+    }
+
+    /// 名簿の受け口のソケットファイル（と参照）を消し、消したパスを返す。自分の実体でなければ触らない
+    pub(super) fn remove_scoped() -> Vec<String> {
+        let taken = match SCOPED.lock() {
+            Ok(mut scoped) => std::mem::take(&mut *scoped),
+            Err(_) => return Vec::new(),
+        };
+        let mut removed = Vec::new();
+        for socket in taken {
+            if !owns_path(&socket.endpoint, &socket.file_id) {
+                continue;
+            }
+            if std::fs::remove_file(&socket.endpoint).is_ok() {
+                removed.push(socket.endpoint);
+            }
+            if let Some(pointer) = &socket.pointer {
+                let _ = std::fs::remove_file(pointer);
+            }
+        }
+        removed
     }
 
     /// 受け口が読める（接続が来た）か、時間切れまで待つ。`None` は待ち続ける
@@ -1361,6 +1469,79 @@ mod tests {
     use crate::protocol::{error_code, RequestEnvelope, ResponseEnvelope};
 
     const TEST_TOKEN: &str = "test-token";
+
+    /// #2686: 終了の後片付けが消すのは、このプロセスだけのソケットファイル（pid 入りの一時パス・
+    /// GUI が自分で決めた data dir から逃がした短縮パス）だけ
+    #[test]
+    fn issue2686_片付けるソケットは自分の_pid_の一時パスと自分の置き場の短縮パスだけ() {
+        use std::path::Path;
+        use tako_core::ipc_socket::SocketPathKind as K;
+        let scoped = |kind, endpoint: &str, pointer: Option<&str>| {
+            unix_imp::is_scoped_socket(
+                kind,
+                Path::new(endpoint),
+                pointer.map(Path::new),
+                42,
+                |p: &Path| p.starts_with("/t/tako-iso-data-42"),
+            )
+        };
+        assert!(scoped(K::Temp, "/t/tako-42-0.sock", None));
+        assert!(scoped(K::Temp, "/t/tako-42-17.sock", None));
+        // 別の pid・連番でない・明示パス（順番待ちの隔離の受け口 = 名前が違う）
+        assert!(!scoped(K::Temp, "/t/tako-43-0.sock", None));
+        assert!(!scoped(K::Temp, "/t/tako-421-0.sock", None));
+        assert!(!scoped(K::Temp, "/t/tako-42-.sock", None));
+        assert!(!scoped(K::Temp, "/t/tako-42-x.sock", None));
+        assert!(!scoped(K::Temp, "/t/queue.sock", None));
+        // 短縮パスは参照が自分の置き場の中のときだけ（明示した data dir のものは残す）
+        assert!(scoped(
+            K::Shortened,
+            "/t/tako-0123456789abcdef.sock",
+            Some("/t/tako-iso-data-42/tako.sock.path")
+        ));
+        assert!(!scoped(
+            K::Shortened,
+            "/t/tako-0123456789abcdef.sock",
+            Some("/home/u/data/tako.sock.path")
+        ));
+        assert!(!scoped(K::Shortened, "/t/tako-0123456789abcdef.sock", None));
+        // 固定パスは data dir と一緒に片付く（明示した data dir の中なら残す）ので数えない
+        assert!(!scoped(K::WellKnown, "/t/tako-iso-data-42/tako.sock", None));
+    }
+
+    /// #2686: drop を通らない出口でも、名簿から pid 入りのソケットファイルを消せる。drop した受け口は
+    /// 名簿から外れる（片付けが二度触らない）。名簿はプロセスで 1 つなので、並走する他のテストの受け口を
+    /// 消さないよう子の中で
+    #[test]
+    fn issue2686_drop_を通らない出口でも名簿からソケットファイルを消す() {
+        if tako_core::run_alone!(issue2686_drop_を通らない出口でも名簿からソケットファイルを消す)
+        {
+            return;
+        }
+        std::env::remove_var("TAKO_2686_LEGACY");
+        let (tx, _rx) = unbounded::<IncomingRequest>();
+        let kept = IpcServer::start(tx.clone(), TEST_TOKEN.into()).expect("1 本目を張れる");
+        let dropped = IpcServer::start(tx, TEST_TOKEN.into()).expect("2 本目を張れる");
+        let kept_path = kept.endpoint().to_string();
+        let dropped_path = dropped.endpoint().to_string();
+        drop(dropped);
+        assert!(
+            !std::path::Path::new(&dropped_path).exists(),
+            "drop は従来どおり消す"
+        );
+        assert!(std::path::Path::new(&kept_path).exists());
+        assert_eq!(remove_scoped_socket_files(), vec![kept_path.clone()]);
+        assert!(
+            !std::path::Path::new(&kept_path).exists(),
+            "drop を通らなくても消える"
+        );
+        assert!(
+            remove_scoped_socket_files().is_empty(),
+            "2 度目は何もしない"
+        );
+        // 後から drop しても壊れない（パスはもう自分の実体ではないので触らない）
+        drop(kept);
+    }
 
     /// サーバー + ダミーディスパッチャ（list に固定値を返す）を立てて 1 往復する
     fn roundtrip(token_for_client: Option<String>) -> ResponseEnvelope {
