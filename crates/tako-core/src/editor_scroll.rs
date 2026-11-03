@@ -265,6 +265,40 @@ mod tests {
         }
     }
 
+    /// 先頭から ↓ で 1 行ずつ進んだとき、器は「可視 − 詰めた余白」の行で動き始め、以降は
+    /// 下の余白が詰めた余白のまま（#2714）。visual-test の追従の判定（#1741 / #1772）が引く
+    /// 設計値そのもの。狭い器（可視 7 行以下）で余白を固定の 3 行と見ると設計と食い違う
+    #[test]
+    fn 先頭から下へ進むと詰めた余白の行で動き始める() {
+        for visible in 1..=12 {
+            let margin = effective_margin(visible, FOLLOW_MARGIN);
+            let mut v = view(0, visible, 500);
+            let mut start = None;
+            for cursor in 1..visible + 8 {
+                v = after(v, cursor);
+                assert!(
+                    v.contains(cursor),
+                    "視野 {visible} 行で {cursor} 行目が見えない"
+                );
+                if start.is_none() && v.first_visible > 0 {
+                    start = Some(cursor);
+                }
+                if start.is_some() {
+                    assert_eq!(
+                        v.last_visible() - cursor,
+                        margin,
+                        "視野 {visible} 行・{cursor} 行目で下の余白が詰めた余白でない"
+                    );
+                }
+            }
+            assert_eq!(
+                start,
+                Some(visible - margin),
+                "視野 {visible} 行で動き始めた行が「可視 − 詰めた余白 {margin}」でない"
+            );
+        }
+    }
+
     /// エッジ: 行数が減った直後、器が末尾より先を指している
     #[test]
     fn 器が末尾より先を指していたら詰める() {

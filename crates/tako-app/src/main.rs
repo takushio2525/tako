@@ -59253,6 +59253,66 @@ mod self_test {
         println!("TAKO_VISUAL_PIXEL: large-file-decor {label} ok");
     }
 
+    /// **#2714 の A/B**（visual-test の節 viewport-lines / editor-font の追従の判定）。
+    /// `TAKO_2714_LEGACY=1` = 修正前の設計値（固定の `FOLLOW_MARGIN` で引く）と、viewport-lines の
+    /// fixture の拡張子（`.rs`）へ戻す
+    #[cfg(feature = "visual-test")]
+    fn legacy_2714() -> bool {
+        std::env::var("TAKO_2714_LEGACY").as_deref() == Ok("1")
+    }
+
+    /// **#2714 の注入口**（viewport-lines。検証プロセスの門の内側でだけ読む）。
+    ///
+    /// - `rs` = fixture を `.rs` にする（言語サーバを呼ぶ）。`TAKO_LSP_AUTOSTART=1` と
+    ///   `TAKO_LSP_BIN_RUST_ANALYZER=<存在しないパス>` を並べると、未導入の帯が最初から器の高さを取り、
+    ///   既定の窓（960×600）の文字の最大で可視 2 行の器になる（修正前の判定は引き算が溢れて panic
+    ///   した器）
+    /// - `shrink` = 下端の追従の途中で編集ペインの下を分割して器の高さを取る。全節実行で
+    ///   未導入の帯が節の途中に割り込んだ形を、言語サーバ抜きで作る（修正後は「前提が崩れた」と
+    ///   名指して落ちるのが正しい）
+    #[cfg(feature = "visual-test")]
+    fn inject_2714() -> String {
+        if !tako_core::paths::is_verification_process() {
+            return String::new();
+        }
+        std::env::var("TAKO_2714_INJECT").unwrap_or_default()
+    }
+
+    /// viewport-lines の fixture の拡張子（#2714）。**言語サーバの受け持たない拡張子**にする。
+    /// 全節実行は偽の言語サーバの節のために `TAKO_LSP_AUTOSTART=1` を付けるので、`.rs` だと
+    /// 前の節で始まった rust-analyzer の解決（隔離 HOME では動かない）が節の途中に着地し、
+    /// 未導入の帯が器の高さを 129px 取って、可視行数から出した設計値が途中で崩れた。
+    /// 開くモードは Code のまま（行の組み方・追従は拡張子に依らない）
+    #[cfg(feature = "visual-test")]
+    const VLINES_FIXTURE_EXT: &str = "txt";
+
+    /// 先頭から ↓ で 1 行ずつ進んだとき、器が動き始めるカーソル行と、以降の下の余白（行）。
+    /// viewport-lines（#1741）と editor-font（#1772）の判定の設計値はこの 1 実装から引く。
+    ///
+    /// 製品は狭い器で余白を `effective_margin` まで詰める（上下 m 行 + カーソル行の 2m + 1 行が
+    /// 収まる m。#1649）ので、動き始める行は「可視 − m」、余白は m 行。固定の `FOLLOW_MARGIN` で
+    /// 引くと可視 7 行以下で製品の設計と食い違い、3 行未満では引き算が溢れて debug で panic し、
+    /// 全節実行が後ろの節へ届かなかった（#2714）。旧の設計値（`TAKO_2714_LEGACY=1`）で引けない
+    /// 器は `Err`（理由の文）で返す
+    #[cfg(feature = "visual-test")]
+    fn follow_design(visible: usize) -> Result<(usize, usize), String> {
+        use tako_core::editor_scroll::{effective_margin, FOLLOW_MARGIN};
+        let margin = if legacy_2714() {
+            FOLLOW_MARGIN
+        } else {
+            effective_margin(visible, FOLLOW_MARGIN)
+        };
+        visible
+            .checked_sub(margin)
+            .map(|start| (start, margin))
+            .ok_or_else(|| {
+                format!(
+                    "可視 {visible} 行から余白 {margin} 行を引けない（#2714 の旧の設計値。修正前は \
+                     debug で引き算が溢れて panic し、全節実行が後ろの節へ届かなかった）"
+                )
+            })
+    }
+
     /// #1741: 可視行数（追従スクロールの余白とページ移動の歩幅）が**実際に描いた行の
     /// 矩形**と合っているか。
     ///
@@ -59265,6 +59325,9 @@ mod self_test {
     /// 相: (1) 寸法 (2) 下端の追従 (3) 上端の追従 (4) Page Down / Up (5) 文字サイズ
     /// （⌘+ と全体の文字サイズの最大・最小） (6) 1 行 / 視野より短い / 折り返しのある行。
     /// 判定は溜めて節の最後にまとめて落とす（修正前のビルドで全相のずれを 1 回で並べるため）。
+    /// 動き始める行と余白の設計値は [`follow_design`]（狭い器では余白が詰まる。#2714）。
+    /// 追従を見る相は、器の高さが基準の段から動いていないこと（前提）を先に確かめ、動いていれば
+    /// 「前提が崩れた」と名指して設計の判定を省く（#2714）。
     /// 単独実行は `TAKO_VISUAL_ONLY=viewport-lines`
     #[cfg(feature = "visual-test")]
     async fn viewport_lines_visual(
@@ -59393,25 +59456,36 @@ mod self_test {
         remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test viewport-lines 一時ディレクトリ");
-        let write = |name: &str, body: String| -> std::path::PathBuf {
-            let path = dir.join(name);
+        // fixture は言語サーバを呼ばない拡張子（#2714。旧 / 注入 `rs` は `.rs`）
+        let inject = inject_2714();
+        let ext = if legacy_2714() || inject == "rs" {
+            "rs"
+        } else {
+            VLINES_FIXTURE_EXT
+        };
+        println!(
+            "TAKO_VISUAL_PIXEL: viewport-lines arm legacy={} inject={inject:?} fixture_ext={ext}",
+            legacy_2714()
+        );
+        let write = |stem: &str, body: String| -> std::path::PathBuf {
+            let path = dir.join(format!("{stem}.{ext}"));
             std::fs::write(&path, body).expect("visual-test viewport-lines fixture");
             path
         };
         let long = write(
-            "long.rs",
+            "long",
             (0..400)
                 .map(|i| format!("    let row_{i:03} = {i};\n"))
                 .collect(),
         );
-        let one = write("one.rs", "fn main() {}".to_string());
+        let one = write("one", "fn main() {}".to_string());
         let short = write(
-            "short.rs",
+            "short",
             (0..5).map(|i| format!("let s{i} = {i};\n")).collect(),
         );
         // 5 行に 1 行、器の幅で折り返す長い行を混ぜる（その行だけ 2 行ぶん以上の高さになる）
         let wrapped = write(
-            "wrapped.rs",
+            "wrapped",
             (0..200)
                 .map(|i| {
                     if i % 5 == 2 {
@@ -59422,6 +59496,20 @@ mod self_test {
                 })
                 .collect(),
         );
+        if ext == VLINES_FIXTURE_EXT {
+            // 問う口は製品と同じ `LspManager::resolve`（#2113）
+            let claimed = window
+                .update(cx, |app, _, _| {
+                    [&long, &one, &short, &wrapped]
+                        .iter()
+                        .any(|path| app.lsp.resolve(path).is_some())
+                })
+                .unwrap_or(true);
+            check(
+                !claimed,
+                "visual-test viewport-lines: fixture を受け持つ言語サーバが無い (#2714)",
+            );
+        }
 
         let rows = |cx: &mut AsyncApp, pane: PaneId| -> Rows {
             notify_and_draw(any, window, cx);
@@ -59485,14 +59573,15 @@ mod self_test {
         let report = |label: &str, key: &str, r: &Rows| {
             println!(
                 "TAKO_VISUAL_PIXEL: viewport-lines {label} key={key} cursor={} visible={}..={} \
-                 count={} follow_lines={} below={:?} above={:?}",
+                 count={} follow_lines={} below={:?} above={:?} view_h={:.1}",
                 r.cursor,
                 r.first,
                 r.last,
                 r.count,
                 r.follow_lines,
                 r.below(),
-                r.above()
+                r.above(),
+                r.view_h
             );
         };
         // 先頭から ↓ を押し続けた各段の観測（下端の追従）
@@ -59506,11 +59595,76 @@ mod self_test {
             }
             seen
         };
-        // 下端の追従の判定。設計: カーソルの下に FOLLOW_MARGIN 行が見えなくなる段
-        // （= 先頭から数えて可視行数 − 余白の行）で器が動き始め、以降は下の余白が
-        // ちょうど FOLLOW_MARGIN 行のまま。どの段でもカーソル行ははみ出さずに見えている
-        fn judge_down(failures: &mut Vec<String>, label: &str, visible: usize, seen: &[Rows]) {
-            let want = visible - FOLLOW_MARGIN;
+        // 器の高さを途中で変える（#2714 の注入 `shrink` だけが使う）。編集ペインの下へターミナルを
+        // 分割して器の高さを取る = 全節実行で未導入の帯が節の途中に器の高さを取った形と同じ。
+        // フォーカスは編集ペインのまま（打鍵は編集ペインへ届く）。返り値は分割したペイン
+        let split_below = |cx: &mut AsyncApp, pane: PaneId| -> Option<PaneId> {
+            let below = window
+                .update(cx, |app, _, cx| {
+                    let split = tako_control::dispatch(
+                        app,
+                        Req::Split {
+                            pane: Some(pane.as_u64()),
+                            tab: None,
+                            direction: Some(tako_control::protocol::Direction::Down),
+                            ratio: Some(0.4),
+                            command: None,
+                            cwd: None,
+                            focus: Some(false),
+                        },
+                        PaneOrigin::Cli,
+                    );
+                    cx.notify();
+                    split
+                        .ok()
+                        .and_then(|v| v["pane"].as_u64())
+                        .map(PaneId::from_raw)
+                })
+                .ok()
+                .flatten();
+            println!("TAKO_VISUAL_PIXEL: viewport-lines inject shrink split={below:?}");
+            below
+        };
+        // 器の高さが基準の段（設計値を出した段）から動いていないか（#2714）。全節実行では前の節で
+        // 始まった言語サーバの解決が節の途中に着地し、未導入の帯が器の高さを取ったことがある。
+        // 動いていれば「前提が崩れた」と名指して false（追従の設計の NG と取り違えない）。
+        // 旧の判定（`TAKO_2714_LEGACY=1`）は見ない
+        fn steady(failures: &mut Vec<String>, label: &str, base: &Rows, seen: &[Rows]) -> bool {
+            if legacy_2714() {
+                return true;
+            }
+            let moved: Vec<(usize, f32)> = seen
+                .iter()
+                .filter(|r| (r.view_h - base.view_h).abs() > 0.5)
+                .map(|r| (r.cursor, r.view_h))
+                .collect();
+            expect(
+                failures,
+                moved.is_empty(),
+                format!(
+                    "{label}: 前提が崩れた = 途中で器の高さが {:.1}px から変わった \
+                     ((カーソル行, 高さ) = {moved:?})。可視行数から出した設計値は当てにならないので判定を省いた",
+                    base.view_h
+                ),
+            );
+            moved.is_empty()
+        }
+        // 下端の追従の判定。設計（`follow_design`）: カーソルの下に余白 m 行が見えなくなる段
+        // （= 先頭から数えて可視行数 − m の行）で器が動き始め、以降は下の余白がちょうど m 行のまま
+        // （m は狭い器で詰まる = #2714）。どの段でもカーソル行ははみ出さずに見えている。
+        // 可視行数は基準の段（`base`）の実矩形の数
+        fn judge_down(failures: &mut Vec<String>, label: &str, base: &Rows, seen: &[Rows]) {
+            let visible = base.count;
+            if !steady(failures, label, base, seen) {
+                return;
+            }
+            let (want, margin) = match follow_design(visible) {
+                Ok(design) => design,
+                Err(why) => {
+                    expect(failures, false, format!("{label}: {why}"));
+                    return;
+                }
+            };
             let hidden: Vec<usize> = seen
                 .iter()
                 .filter(|r| !r.cursor_visible)
@@ -59523,7 +59677,7 @@ mod self_test {
                 .map(Rows::below)
                 .collect();
             println!(
-                "TAKO_VISUAL_PIXEL: viewport-lines {label} judge visible={visible} \
+                "TAKO_VISUAL_PIXEL: viewport-lines {label} judge visible={visible} margin={margin} \
                  scroll_start={start:?} want_start={want} hidden={hidden:?} margins={margins:?}"
             );
             expect(
@@ -59534,21 +59688,43 @@ mod self_test {
             expect(
                 failures,
                 start == Some(want),
-                format!("{label}: 器が動き始めた行 {start:?} が設計（可視 {visible} 行 − 余白 = {want}）と違う"),
+                format!(
+                    "{label}: 器が動き始めた行 {start:?} が設計（可視 {visible} 行 − 余白 {margin} \
+                     = {want}）と違う"
+                ),
             );
-            let exact = !margins.is_empty() && margins.iter().all(|m| *m == Some(FOLLOW_MARGIN));
+            let exact = !margins.is_empty() && margins.iter().all(|m| *m == Some(margin));
             expect(
                 failures,
                 exact,
-                format!(
-                    "{label}: 動き始めてからの下の余白が {FOLLOW_MARGIN} 行でない ({margins:?})"
-                ),
+                format!("{label}: 動き始めてからの下の余白が {margin} 行でない ({margins:?})"),
             );
         }
         let mut failures: Vec<String> = Vec::new();
 
         // (1) 寸法: 先頭を見ている状態で、実装の可視行数と実矩形の行数を並べる
         let pane = open_edit(any, window, cx, &long).await;
+        if ext == "rs" {
+            // 言語サーバを呼ぶ fixture（旧 / 注入 `rs`）は、解決が着地して帯の有無が決まってから
+            // 測る（#2714。測った後に帯が出ると基準の段の寸法が崩れる）
+            use tako_core::lsp::state::ServerState;
+            let settled = wait_for_app_state(
+                window,
+                cx,
+                "visual-test viewport-lines: 言語サーバの状態が落ち着く",
+                Duration::from_secs(20),
+                move |app| {
+                    app.lsp_document_server(pane).is_none_or(|s| {
+                        !matches!(
+                            s.state,
+                            ServerState::NotStarted | ServerState::Starting | ServerState::Fetching
+                        )
+                    })
+                },
+            )
+            .await;
+            println!("TAKO_VISUAL_PIXEL: viewport-lines arm lsp_settled={settled}");
+        }
         place(cx, pane, 0);
         let top = rows(cx, pane);
         println!(
@@ -59570,9 +59746,26 @@ mod self_test {
             ),
         );
 
-        // (2) 下端の追従
-        let down = walk(cx, pane, "bottom-edge", "down", capacity + 6);
-        judge_down(&mut failures, "bottom-edge", capacity, &down);
+        // (2) 下端の追従。#2714 の注入 `shrink` は途中で器の高さを取り（帯の割り込みと同じ形）、
+        // 相の後で戻す（名指されるのは下端の「前提が崩れた」だけにする）
+        let steps = capacity + 6;
+        let down = if inject == "shrink" {
+            let half = steps / 2;
+            let mut seen = walk(cx, pane, "bottom-edge", "down", half);
+            let below = split_below(cx, pane);
+            check(
+                below.is_some(),
+                "visual-test viewport-lines: 注入 shrink で編集ペインの下を分割できる (#2714)",
+            );
+            seen.extend(walk(cx, pane, "bottom-edge", "down", steps - half));
+            if let Some(below) = below {
+                close(window, cx, below);
+            }
+            seen
+        } else {
+            walk(cx, pane, "bottom-edge", "down", steps)
+        };
+        judge_down(&mut failures, "bottom-edge", &top, &down);
 
         // (3) 上端の追従: そこから ↑ を押し続ける。器が上へ動き始めてからは、
         // 文書頭に着くまで上の余白がちょうど FOLLOW_MARGIN 行
@@ -59593,16 +59786,19 @@ mod self_test {
             "TAKO_VISUAL_PIXEL: viewport-lines top-edge judge hidden={hidden_up:?} \
              margins={moved_up:?}"
         );
-        expect(
-            &mut failures,
-            hidden_up.is_empty(),
-            format!("上端: ↑ の途中でカーソル行が器の外へ出た (行 {hidden_up:?})"),
-        );
-        expect(
-            &mut failures,
-            !moved_up.is_empty() && moved_up.iter().all(|m| *m == Some(FOLLOW_MARGIN)),
-            format!("上端: 動き始めてからの上の余白が {FOLLOW_MARGIN} 行でない ({moved_up:?})"),
-        );
+        // 上端の余白は固定の FOLLOW_MARGIN で見てよい（寸法の前提で可視 2m + 1 = 7 行より大きい）
+        if steady(&mut failures, "top-edge", &top, &up) {
+            expect(
+                &mut failures,
+                hidden_up.is_empty(),
+                format!("上端: ↑ の途中でカーソル行が器の外へ出た (行 {hidden_up:?})"),
+            );
+            expect(
+                &mut failures,
+                !moved_up.is_empty() && moved_up.iter().all(|m| *m == Some(FOLLOW_MARGIN)),
+                format!("上端: 動き始めてからの上の余白が {FOLLOW_MARGIN} 行でない ({moved_up:?})"),
+            );
+        }
 
         // (4) Page Down / Up: 歩幅は「見えている行数 − 1」、着地のあとも余白つきで見える。
         // 2 回目の Page Down では前の画面の最下段が新しい画面の最上段に残る
@@ -59618,37 +59814,39 @@ mod self_test {
         let p3 = rows(cx, pane);
         report("page-up", "pageup", &p3);
         let step = p1.cursor;
-        expect(
-            &mut failures,
-            step + 1 == capacity,
-            format!("Page Down: 歩幅 {step} が「実矩形の可視 {capacity} 行 − 1」と違う"),
-        );
-        expect(
-            &mut failures,
-            p1.below() == Some(FOLLOW_MARGIN) && p2.below() == Some(FOLLOW_MARGIN),
-            format!(
-                "Page Down: 着地のあとの下の余白が {FOLLOW_MARGIN} 行でない ({:?} / {:?})",
-                p1.below(),
-                p2.below()
-            ),
-        );
-        expect(
-            &mut failures,
-            p2.cursor == step * 2 && p2.first == p1.last,
-            format!(
-                "Page Down: 2 回目で前の画面の最下段 {} が最上段に残らない (first={} cursor={})",
-                p1.last, p2.first, p2.cursor
-            ),
-        );
-        expect(
-            &mut failures,
-            p3.cursor == step && p3.above() == Some(FOLLOW_MARGIN),
-            format!(
-                "Page Up: 着地 {} / 上の余白 {:?} が設計（{step} / {FOLLOW_MARGIN}）と違う",
-                p3.cursor,
-                p3.above()
-            ),
-        );
+        if steady(&mut failures, "Page Down", &top, &[p1, p2, p3]) {
+            expect(
+                &mut failures,
+                step + 1 == capacity,
+                format!("Page Down: 歩幅 {step} が「実矩形の可視 {capacity} 行 − 1」と違う"),
+            );
+            expect(
+                &mut failures,
+                p1.below() == Some(FOLLOW_MARGIN) && p2.below() == Some(FOLLOW_MARGIN),
+                format!(
+                    "Page Down: 着地のあとの下の余白が {FOLLOW_MARGIN} 行でない ({:?} / {:?})",
+                    p1.below(),
+                    p2.below()
+                ),
+            );
+            expect(
+                &mut failures,
+                p2.cursor == step * 2 && p2.first == p1.last,
+                format!(
+                    "Page Down: 2 回目で前の画面の最下段 {} が最上段に残らない (first={} cursor={})",
+                    p1.last, p2.first, p2.cursor
+                ),
+            );
+            expect(
+                &mut failures,
+                p3.cursor == step && p3.above() == Some(FOLLOW_MARGIN),
+                format!(
+                    "Page Up: 着地 {} / 上の余白 {:?} が設計（{step} / {FOLLOW_MARGIN}）と違う",
+                    p3.cursor,
+                    p3.above()
+                ),
+            );
+        }
 
         // (5a) ⌘+（ペインの文字サイズ）。コードプレビューの行の高さが変わるかも観測する
         place(cx, pane, 0);
@@ -59711,7 +59909,7 @@ mod self_test {
                 ),
             );
             let seen = walk(cx, pane, label, "down", r.count + 4);
-            judge_down(&mut failures, label, r.count, &seen);
+            judge_down(&mut failures, label, &r, &seen);
         }
         let _ = window.update(cx, |app, _, cx| {
             app.theme.font_size = font_before;
@@ -60149,7 +60347,8 @@ mod self_test {
         };
 
         // 先頭から ↓ を押し続け、カーソル行が器の外へ出ず、器が「可視行数 − 余白」の行で
-        // 動き始めて以降は下の余白がちょうど FOLLOW_MARGIN 行かを見る（#1741 と同じ設計）
+        // 動き始めて以降は下の余白がちょうど余白の行数かを見る（#1741 と同じ設計値 `follow_design`。
+        // 余白は狭い器で詰まる = #2714）
         let walk_down = |cx: &mut AsyncApp,
                          failures: &mut Vec<String>,
                          pane: PaneId,
@@ -60173,9 +60372,15 @@ mod self_test {
                 .skip_while(|p| p.first == 0)
                 .map(Probe::below)
                 .collect();
-            let want = visible.saturating_sub(FOLLOW_MARGIN);
+            let (want, margin) = match follow_design(visible) {
+                Ok(design) => design,
+                Err(why) => {
+                    expect(failures, false, format!("{label}: {why}"));
+                    return;
+                }
+            };
             println!(
-                "TAKO_VISUAL_PIXEL: editor-font {label} walk visible={visible} \
+                "TAKO_VISUAL_PIXEL: editor-font {label} walk visible={visible} margin={margin} \
                  scroll_start={start:?} want_start={want} hidden={hidden:?} margins={margins:?}"
             );
             expect(
@@ -60186,14 +60391,15 @@ mod self_test {
             expect(
                 failures,
                 start == Some(want),
-                format!("{label}: 器が動き始めた行 {start:?} が設計（可視 {visible} 行 − 余白 = {want}）と違う"),
+                format!(
+                    "{label}: 器が動き始めた行 {start:?} が設計（可視 {visible} 行 − 余白 {margin} \
+                     = {want}）と違う"
+                ),
             );
             expect(
                 failures,
-                !margins.is_empty() && margins.iter().all(|m| *m == Some(FOLLOW_MARGIN)),
-                format!(
-                    "{label}: 動き始めてからの下の余白が {FOLLOW_MARGIN} 行でない ({margins:?})"
-                ),
+                !margins.is_empty() && margins.iter().all(|m| *m == Some(margin)),
+                format!("{label}: 動き始めてからの下の余白が {margin} 行でない ({margins:?})"),
             );
         };
 
