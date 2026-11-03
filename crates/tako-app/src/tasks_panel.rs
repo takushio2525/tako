@@ -584,6 +584,18 @@ pub(crate) struct ListPoll {
     pub pending: bool,
 }
 
+impl ListPoll {
+    /// 検証が画面の値（`snapshot` の件数など）を手で置いている間、background の一覧の着地を
+    /// 捨てさせる（#2711。visual-test 項目 152 のバッジ）。着地の「古い結果で上書きしない」規則
+    /// （`seq <= applied`）をそのまま使う = 反映済みの番号を上限まで進めるだけで、2 秒 tick は
+    /// 撃ち続け、着いた結果は全部「古い」として捨てられる。戻すのは
+    /// [`TakoApp::refresh_user_tasks`]（`applied` を頼んだ番号へ戻し、本物の一覧を読み直す）
+    #[cfg(feature = "visual-test")]
+    pub(crate) fn hold_landings(&mut self) {
+        self.applied = u64::MAX;
+    }
+}
+
 impl std::fmt::Debug for ListPoll {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ListPoll")
@@ -691,6 +703,7 @@ impl TakoApp {
                 let poll = &mut app.user_tasks.list_poll;
                 poll.inflight = poll.inflight.saturating_sub(1);
                 // 後から頼んだ引き直しが先に着いていたら、古い結果で上書きしない
+                // （visual-test が件数を手で置いている間もここで捨てる = `ListPoll::hold_landings`）
                 if seq <= poll.applied {
                     return;
                 }
