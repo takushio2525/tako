@@ -1222,6 +1222,13 @@ pub fn error_json(kind: WorkerErrorKind, detail: &str, account: Option<&Value>) 
     v
 }
 
+/// `tako orchestrator watch` の `WORKER_DIALOG` で、今選ばれている選択肢の行の末尾に付ける印。
+///
+/// **master が読む印なので表示言語で変えない**（#2365）: master の guide（`guides/monitoring.md`）が
+/// この綴りを字面で引いて「今の選択」を見分ける。英語表示の watch でも日本語のまま出し、綴りを
+/// 変えるときは guide も一緒に直す（`issue1762_dispatch_error_lang` が guide との一致を見る）
+pub const CHOICE_HIGHLIGHT_MARK: &str = "← 現在の選択";
+
 /// 対象アカウントを 1 行へ添える表記（#757）。
 ///
 /// `account=<名前 | -> config_dir=<パス>` の形。名前は accounts.yaml に登録が

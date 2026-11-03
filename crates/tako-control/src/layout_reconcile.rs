@@ -75,12 +75,26 @@ pub enum Untrusted {
 }
 
 impl Untrusted {
-    /// 診断・CLI 出力用の日本語ラベル
+    /// 診断（persist.log）用の日本語ラベル
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::NoAnswer => "tmux に問い合わせられない（サーバー未起動・ソケットが無い等）",
-            Self::NoLayoutSession => {
+        self.label_in(tako_core::i18n::Lang::Ja)
+    }
+
+    /// 表示言語を明示してのラベル（#2365。`tako recover --apply` の出力は表示言語）。
+    /// (バリアント, 言語) の網羅 match
+    pub const fn label_in(self, lang: tako_core::i18n::Lang) -> &'static str {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NoAnswer, Ja) => "tmux に問い合わせられない（サーバー未起動・ソケットが無い等）",
+            (Self::NoAnswer, En) => {
+                "tmux cannot be asked (the server is not running, the socket is missing, etc.)"
+            }
+            (Self::NoLayoutSession, Ja) => {
                 "tmux の一覧に layout の器が 1 つも無い（layout を書いたのと別のサーバーかもしれない）"
+            }
+            (Self::NoLayoutSession, En) => {
+                "the tmux list has none of the layout's sessions (it may be a different server \
+                 from the one the layout was written with)"
             }
         }
     }
@@ -233,11 +247,22 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
-    /// CLI 出力・診断用の日本語ラベル
+    /// 診断（persist.log）用の日本語ラベル
     pub const fn label(self) -> &'static str {
-        match self {
-            Self::AllDead => "master / worker のペインで、tmux セッションがすべて終わっている",
-            Self::AlreadyInBackup => "どのペインもバックアップの側にある",
+        self.label_in(tako_core::i18n::Lang::Ja)
+    }
+
+    /// 表示言語を明示してのラベル（#2365。`tako recover --apply` の出力は表示言語）。
+    /// (バリアント, 言語) の網羅 match
+    pub const fn label_in(self, lang: tako_core::i18n::Lang) -> &'static str {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::AllDead, Ja) => {
+                "master / worker のペインで、tmux セッションがすべて終わっている"
+            }
+            (Self::AllDead, En) => "master / worker panes whose tmux sessions have all ended",
+            (Self::AlreadyInBackup, Ja) => "どのペインもバックアップの側にある",
+            (Self::AlreadyInBackup, En) => "every pane is already in the backup",
         }
     }
 }

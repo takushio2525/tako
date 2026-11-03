@@ -912,9 +912,20 @@ fn reason_index(r: &Reason) -> usize {
         Reason::QueuePriorityTargetMissing => 349,
         Reason::QueuePriorityTargetBoth => 350,
         Reason::QueueJobUnknown(_) => 351,
+        // #2365 の続き: CLI の sleep-guard / recover の手元の断り
+        Reason::SleepGuardUnknownValue { .. } => 352,
+        Reason::SleepGuardUnknownLidPower(_) => 353,
+        Reason::RecoverDataDirUnresolved => 354,
+        Reason::RecoverGenerationUnknown(_) => 355,
+        Reason::RecoverTakoRunning { .. } => 356,
+        Reason::RecoverOtherTakoRunning => 357,
+        Reason::RecoverBackupUnreadable { .. } => 358,
+        Reason::RecoverStashFailed(_) => 359,
+        Reason::RecoverWriteFailed(_) => 360,
+        Reason::RecoverCopyFailed(_) => 361,
     }
 }
-const REASON_VARIANTS: usize = 352;
+const REASON_VARIANTS: usize = 362;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1552,6 +1563,26 @@ fn reason_samples() -> Vec<Reason> {
         Reason::QueuePriorityTargetMissing,
         Reason::QueuePriorityTargetBoth,
         Reason::QueueJobUnknown(4242),
+        Reason::SleepGuardUnknownValue {
+            flag: "mode",
+            got: "bogus".into(),
+            allowed: "off / on / while-agents-running",
+        },
+        Reason::SleepGuardUnknownLidPower("bogus".into()),
+        Reason::RecoverDataDirUnresolved,
+        Reason::RecoverGenerationUnknown("9".into()),
+        Reason::RecoverTakoRunning {
+            pid: 4242,
+            quit_key: "Cmd+Q".into(),
+        },
+        Reason::RecoverOtherTakoRunning,
+        Reason::RecoverBackupUnreadable {
+            path: "/tmp/d/layout.json.bak.1".into(),
+            error: "No such file or directory (os error 2)".into(),
+        },
+        Reason::RecoverStashFailed("Permission denied (os error 13)".into()),
+        Reason::RecoverWriteFailed("Permission denied (os error 13)".into()),
+        Reason::RecoverCopyFailed("Permission denied (os error 13)".into()),
     ]
 }
 
@@ -1978,6 +2009,19 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "priority には受付番号（id）かペイン（pane）のどちらかが要る",
     "受付番号（id）とペイン（pane）はどちらか一方だけ",
     "受付番号 4242 は順番待ちに居ない（`tako queue` で一覧）",
+    // #2365 の続き: CLI `main.rs` の sleep-guard / recover が `Err(format!(…))` で組んでいた断り
+    "不明な mode: \"bogus\"（off / on / while-agents-running のいずれか）",
+    "不明な lid-power-condition: \"bogus\"（ac-only = AC 電源に接続しているときだけ / \
+     always = バッテリー駆動でも）",
+    "データディレクトリを解決できない（HOME 未設定等）",
+    "世代は 1〜3・good・rescued のどれかで指定してください（指定: 9）",
+    "tako（pid 4242）が稼働中です。終了（Cmd+Q）してから実行してください（--force で強制実行）",
+    "tako が稼働中です（定期保存が復元結果を上書きします）。終了してから実行するか、\
+     別のデータディレクトリの tako だと確かなら --force を付けてください",
+    "バックアップ /tmp/d/layout.json.bak.1 を読めない: No such file or directory (os error 2)",
+    "現在の layout.json の退避に失敗: Permission denied (os error 13)",
+    "復元の書き込みに失敗: Permission denied (os error 13)",
+    "復元コピーに失敗: Permission denied (os error 13)",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
@@ -10230,6 +10274,22 @@ const SESSION_OS_REFUSAL_SCOPES: &[(&str, &str, Span)] = &[
         SLEEP_GUARD_SRC,
         Span::Item("pub fn remove_sudoers_typed("),
     ),
+    // #2365 の続き: 結果を型で返す口（`LidControlDone`。CLI の行が表示言語で組む）
+    (
+        SLEEP_GUARD_PATH,
+        SLEEP_GUARD_SRC,
+        Span::Item("pub fn prepare_lid_control_done("),
+    ),
+    (
+        SLEEP_GUARD_PATH,
+        SLEEP_GUARD_SRC,
+        Span::Item("pub fn teardown_lid_control_done("),
+    ),
+    (
+        SLEEP_GUARD_PATH,
+        SLEEP_GUARD_SRC,
+        Span::Item("pub fn remove_sudoers_done("),
+    ),
     (
         SLEEP_GUARD_PATH,
         SLEEP_GUARD_SRC,
@@ -18163,9 +18223,62 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::SessionLinkAccount(_) => 141,
         ReplyNote::SessionLinkNone(_) => 142,
         ReplyNote::SessionLinkEnableHint => 143,
+        // #2365 の続き: sleep-guard・recover・orchestrator watch の人向けの行
+        ReplyNote::SleepGuardSource { .. } => 144,
+        ReplyNote::SleepGuardIdleSleep(_) => 145,
+        ReplyNote::SleepGuardMode(_) => 146,
+        ReplyNote::SleepGuardPower(_) => 147,
+        ReplyNote::SleepGuardAcPower(_) => 148,
+        ReplyNote::SleepGuardLid(_) => 149,
+        ReplyNote::SleepGuardLidUnknown => 150,
+        ReplyNote::SleepGuardLidModeSudoers { .. } => 151,
+        ReplyNote::SleepGuardLidMode(_) => 152,
+        ReplyNote::SleepGuardLidUnsupported => 153,
+        ReplyNote::SleepGuardLidApplied(_) => 154,
+        ReplyNote::SleepGuardLidPower(_) => 155,
+        ReplyNote::SleepGuardBattery { .. } => 156,
+        ReplyNote::SleepGuardBatteryUnknown => 157,
+        ReplyNote::SleepGuardLidSkip(_) => 158,
+        ReplyNote::SleepGuardDisplayOff => 159,
+        ReplyNote::SleepGuardSettingsChanged { .. } => 160,
+        ReplyNote::LidSudoersSetupStart => 161,
+        ReplyNote::LidSudoersSetupContent => 162,
+        ReplyNote::LidSudoersPasswordPrompt => 163,
+        ReplyNote::LidEnableStart => 164,
+        ReplyNote::LidSleepModeSet(_) => 165,
+        ReplyNote::LidRemoveHint => 166,
+        ReplyNote::RecoverMissing => 167,
+        ReplyNote::RecoverAge(_) => 168,
+        ReplyNote::RecoverAgeUnknown => 169,
+        ReplyNote::RecoverLayoutSummary { .. } => 170,
+        ReplyNote::RecoverLayoutUnreadable { .. } => 171,
+        ReplyNote::RecoverWipeoutLabel => 172,
+        ReplyNote::RecoverWipeouts { .. } => 173,
+        ReplyNote::RecoverHowTo { .. } => 174,
+        ReplyNote::RecoverRestartNote => 175,
+        ReplyNote::RecoverTmuxNote => 176,
+        ReplyNote::RecoverGoodNote => 177,
+        ReplyNote::RecoverRescuedNote => 178,
+        ReplyNote::RecoverCurrentUnreadable(_) => 179,
+        ReplyNote::RecoverStashed(_) => 180,
+        ReplyNote::RecoverRestored { .. } => 181,
+        ReplyNote::RecoverLaunchNote => 182,
+        ReplyNote::RecoverMergedHeader(_) => 183,
+        ReplyNote::RecoverMergedTab { .. } => 184,
+        ReplyNote::RecoverSkippedHeader(_) => 185,
+        ReplyNote::RecoverSkippedTab { .. } => 186,
+        ReplyNote::RecoverUntrustedMerged(_) => 187,
+        ReplyNote::RecoverMergedTotal { .. } => 188,
+        ReplyNote::WatchLabelTruncated => 189,
+        ReplyNote::WatchNoteUnnumbered => 190,
+        ReplyNote::WatchNoteCursorOffscreen => 191,
+        ReplyNote::WatchNoteLabelsTruncated => 192,
+        ReplyNote::WatchChoicePlaceholder => 193,
+        ReplyNote::WatchAgentDeadDetail => 194,
+        ReplyNote::WatchResumeUnbuildable => 195,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 144;
+const REPLY_NOTE_VARIANTS: usize = 196;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -19026,6 +19139,289 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             "有効にする場合: tako orchestrator profiles set <名前> --remote-control true → 起動し直す"
                 .into(),
         ),
+        // #2365 の続き: sleep-guard の行（字下げは呼び手）
+        (
+            ReplyNote::SleepGuardSource { from_app: true },
+            "取得元: tako アプリ（IPC）".into(),
+        ),
+        (
+            ReplyNote::SleepGuardSource { from_app: false },
+            "取得元: この CLI プロセス（tako アプリは未起動）".into(),
+        ),
+        (
+            ReplyNote::SleepGuardIdleSleep(true),
+            "idle-sleep: アサーション保持中".into(),
+        ),
+        (
+            ReplyNote::SleepGuardIdleSleep(false),
+            "idle-sleep: アサーション未保持".into(),
+        ),
+        (
+            ReplyNote::SleepGuardMode("while-agents-running".into()),
+            "モード: while-agents-running".into(),
+        ),
+        (
+            ReplyNote::SleepGuardPower("ac-only".into()),
+            "電源条件: ac-only".into(),
+        ),
+        (ReplyNote::SleepGuardAcPower(true), "AC 電源: 接続中".into()),
+        (ReplyNote::SleepGuardAcPower(false), "AC 電源: 未接続".into()),
+        (ReplyNote::SleepGuardLid(true), "蓋: 閉".into()),
+        (ReplyNote::SleepGuardLid(false), "蓋: 開".into()),
+        (
+            ReplyNote::SleepGuardLidUnknown,
+            "蓋: 不明（この OS では開閉を検知できません）".into(),
+        ),
+        (
+            ReplyNote::SleepGuardLidModeSudoers {
+                mode: "off".into(),
+                installed: true,
+            },
+            "蓋閉じ防止: off (sudoers: 登録済み)".into(),
+        ),
+        (
+            ReplyNote::SleepGuardLidModeSudoers {
+                mode: "off".into(),
+                installed: false,
+            },
+            "蓋閉じ防止: off (sudoers: 未登録)".into(),
+        ),
+        (
+            ReplyNote::SleepGuardLidMode("while-agents-running".into()),
+            "蓋閉じ防止: while-agents-running".into(),
+        ),
+        (
+            ReplyNote::SleepGuardLidUnsupported,
+            "蓋閉じ防止: この OS では対応していません".into(),
+        ),
+        (ReplyNote::SleepGuardLidApplied(true), "蓋閉じ継続の適用: 有効".into()),
+        (ReplyNote::SleepGuardLidApplied(false), "蓋閉じ継続の適用: 無効".into()),
+        (
+            ReplyNote::SleepGuardLidPower("always".into()),
+            "蓋閉じ継続の電源条件: always".into(),
+        ),
+        (
+            ReplyNote::SleepGuardBattery {
+                percent: 57,
+                floor: 20,
+            },
+            "バッテリー残量: 57%（下限 20%）".into(),
+        ),
+        (
+            ReplyNote::SleepGuardBatteryUnknown,
+            "バッテリー残量: 不明（この機械では取得できません）".into(),
+        ),
+        (
+            ReplyNote::SleepGuardLidSkip("no-agents".into()),
+            "蓋閉じ継続が効かない理由: no-agents".into(),
+        ),
+        (
+            ReplyNote::SleepGuardDisplayOff,
+            "ディスプレイ: 消灯済み（蓋閉じ中）".into(),
+        ),
+        (
+            ReplyNote::SleepGuardSettingsChanged {
+                mode: "on".into(),
+                power: "always".into(),
+                lid_sleep: "off".into(),
+                lid_power: "ac-only".into(),
+                floor: 20,
+            },
+            "設定を変更しました: mode=on, power=always, lid-sleep=off, lid-power=ac-only, \
+             lid-battery-floor=20%"
+                .into(),
+        ),
+        (
+            ReplyNote::LidSudoersSetupStart,
+            "蓋閉じ防止の sudoers 登録を行います...".into(),
+        ),
+        (
+            ReplyNote::LidSudoersSetupContent,
+            "登録内容: pmset -a disablesleep 0/1 のみ NOPASSWD".into(),
+        ),
+        (
+            ReplyNote::LidSudoersPasswordPrompt,
+            "管理者パスワードの入力ダイアログが表示されます。".into(),
+        ),
+        (ReplyNote::LidEnableStart, "蓋閉じ防止を有効にします...".into()),
+        (
+            ReplyNote::LidSleepModeSet("while-agents-running".into()),
+            "lid-sleep-mode を while-agents-running に設定しました。".into(),
+        ),
+        (
+            ReplyNote::LidSleepModeSet("off".into()),
+            "lid-sleep-mode を off に設定しました。".into(),
+        ),
+        (
+            ReplyNote::LidRemoveHint,
+            "解除: tako sleep-guard remove-lid-sleep".into(),
+        ),
+        // #2365 の続き: recover の一覧・案内・復元と合流の結果（字下げ・桁揃えは呼び手）
+        (ReplyNote::RecoverMissing, "（無し）".into()),
+        (ReplyNote::RecoverAge(0), "0 秒前".into()),
+        (ReplyNote::RecoverAge(59), "59 秒前".into()),
+        (ReplyNote::RecoverAge(60), "1 分前".into()),
+        (ReplyNote::RecoverAge(3599), "59 分前".into()),
+        (ReplyNote::RecoverAge(3600), "1 時間前".into()),
+        (ReplyNote::RecoverAge(86399), "23 時間前".into()),
+        (ReplyNote::RecoverAge(86400), "1 日前".into()),
+        (ReplyNote::RecoverAge(864000), "10 日前".into()),
+        (ReplyNote::RecoverAgeUnknown, "更新時刻不明".into()),
+        (
+            ReplyNote::RecoverLayoutSummary {
+                tabs: 3,
+                panes: 7,
+                age: "5 s ago".into(),
+            },
+            "3 タブ / 7 ペイン（5 s ago 更新）".into(),
+        ),
+        (
+            ReplyNote::RecoverLayoutUnreadable {
+                error: "bad".into(),
+                age: "5 s ago".into(),
+            },
+            "読めない: bad（5 s ago 更新）".into(),
+        ),
+        (ReplyNote::RecoverWipeoutLabel, "復元の直後の全滅".into()),
+        (
+            ReplyNote::RecoverWipeouts {
+                count: 1,
+                skip_after: 2,
+            },
+            "連続 1 回（2 回続くと次の起動は復元を見送る）".into(),
+        ),
+        (
+            ReplyNote::RecoverHowTo {
+                quit_key: "Cmd+Q".into(),
+            },
+            "復元するには: tako を終了（Cmd+Q）してから `tako recover --apply <世代>` →".into(),
+        ),
+        (
+            ReplyNote::RecoverRestartNote,
+            "tako を再起動すると復元されたレイアウトで立ち上がります。".into(),
+        ),
+        (
+            ReplyNote::RecoverTmuxNote,
+            "実体の tmux セッションが生きていれば、実行中プロセスごと画面に戻ります。".into(),
+        ),
+        (
+            ReplyNote::RecoverGoodNote,
+            "（good = 最後に復元へ成功した良品。`tako recover --apply good` で戻せます）".into(),
+        ),
+        (
+            ReplyNote::RecoverRescuedNote,
+            "（rescued = 復元の直後に全ペインが終わったので退避した構成。\
+             `tako recover --apply rescued` で戻せます）"
+                .into(),
+        ),
+        (
+            ReplyNote::RecoverCurrentUnreadable("bad".into()),
+            "現在の layout.json を読めないので、バックアップより後のタブは合流しない: bad".into(),
+        ),
+        (
+            ReplyNote::RecoverStashed("/tmp/d/layout.json.pre-recover".into()),
+            "現在の layout.json → /tmp/d/layout.json.pre-recover へ退避".into(),
+        ),
+        (
+            ReplyNote::RecoverRestored {
+                name: "layout.json.bak.1".into(),
+                tabs: 2,
+                panes: 5,
+            },
+            "layout.json.bak.1（2 タブ / 5 ペイン）→ layout.json へ復元しました。".into(),
+        ),
+        (
+            ReplyNote::RecoverLaunchNote,
+            "tako を起動すると、このレイアウトで復元されます。".into(),
+        ),
+        (
+            ReplyNote::RecoverMergedHeader(2),
+            "バックアップより後に作られたタブを 2 枚合流しました:".into(),
+        ),
+        (
+            ReplyNote::RecoverMergedTab {
+                id: 9,
+                title: "work".into(),
+                panes: 3,
+                alive: 3,
+                dead: 0,
+                duplicates: 0,
+            },
+            "タブ 9「work」: 3 ペイン（tmux セッションあり 3）".into(),
+        ),
+        (
+            ReplyNote::RecoverMergedTab {
+                id: 9,
+                title: "work".into(),
+                panes: 4,
+                alive: 1,
+                dead: 2,
+                duplicates: 1,
+            },
+            "タブ 9「work」: 4 ペイン（tmux セッションあり 1・終わっている 2\
+             （master / worker のペインは起動時に外し、ほかは開き直す）・\
+             バックアップ側にあるペイン 1 を除いた）"
+                .into(),
+        ),
+        (
+            ReplyNote::RecoverSkippedHeader(1),
+            "合流しなかったタブ 1 枚:".into(),
+        ),
+        (
+            ReplyNote::RecoverSkippedTab {
+                id: 4,
+                title: "old".into(),
+                reason: SkipReason::AllDead,
+            },
+            "タブ 4「old」: master / worker のペインで、tmux セッションがすべて終わっている".into(),
+        ),
+        (
+            ReplyNote::RecoverSkippedTab {
+                id: 4,
+                title: "old".into(),
+                reason: SkipReason::AlreadyInBackup,
+            },
+            "タブ 4「old」: どのペインもバックアップの側にある".into(),
+        ),
+        (
+            ReplyNote::RecoverUntrustedMerged(Untrusted::NoAnswer),
+            "（tmux に問い合わせられない（サーバー未起動・ソケットが無い等）ので、\
+             tmux セッションの生死は確かめずに合流しました）"
+                .into(),
+        ),
+        (
+            ReplyNote::RecoverUntrustedMerged(Untrusted::NoLayoutSession),
+            "（tmux の一覧に layout の器が 1 つも無い（layout を書いたのと別のサーバーかもしれない）\
+             ので、tmux セッションの生死は確かめずに合流しました）"
+                .into(),
+        ),
+        (
+            ReplyNote::RecoverMergedTotal { tabs: 4, panes: 9 },
+            "合流後: 4 タブ / 9 ペイン".into(),
+        ),
+        // #2365 の続き: orchestrator watch の説明文（ラベル・`WORKER_*`・現在の選択の印は呼び手のまま）
+        (ReplyNote::WatchLabelTruncated, "[切り詰め]".into()),
+        (
+            ReplyNote::WatchNoteUnnumbered,
+            "番号キーは無反応なダイアログ（tako が矢印移動で応答する）".into(),
+        ),
+        (
+            ReplyNote::WatchNoteCursorOffscreen,
+            "ダイアログがペインより高く選択カーソルが画面外（番号で応答する）".into(),
+        ),
+        (
+            ReplyNote::WatchNoteLabelsTruncated,
+            "ラベルが切り詰められている（respond はラベルではなく番号で）".into(),
+        ),
+        (ReplyNote::WatchChoicePlaceholder, "<番号|ラベル>".into()),
+        (
+            ReplyNote::WatchAgentDeadDetail,
+            "エージェント CLI プロセスが終了している（SIGSEGV 等の突然死の疑い）".into(),
+        ),
+        (
+            ReplyNote::WatchResumeUnbuildable,
+            "(session ID 未記録のため resume コマンドを組み立てられない)".into(),
+        ),
     ]
 }
 
@@ -19599,23 +19995,20 @@ const CLI_NOTE_SCOPES: &[&str] = &[
     "fn print_todo_expanded(",
     "fn print_sessions_list(",
     "fn print_sessions_link(",
+    // #2365: sleep-guard 一式・recover 一式（断りも `Reason` へ）・orchestrator watch の説明文
+    "fn sleep_guard_status_state(",
+    "fn sleep_guard_local(",
+    "fn recover_local(",
+    "fn pad_cols(",
+    "fn recover_list(",
+    "fn recover_apply(",
+    "fn print_recover_merge(",
+    "fn orchestrator_watch(",
 ];
 
 /// CLI `main.rs` でまだ断りに日本語の固定文を持つ関数（頭, 理由）。**断りを移し終えたら外す**
 /// （下の番犬が「古い」と落とす = 表が縮む方向にしか動かない）。Issue #2365 の段 1 の表と同じ切り分け
 const CLI_REFUSAL_DEFERRED: &[(&str, &str)] = &[
-    (
-        "fn recover_local(",
-        "recover 一式（中身の LayoutError と一覧・復元の結果と 1 本で移す）",
-    ),
-    (
-        "fn recover_apply(",
-        "recover 一式（中身の LayoutError と一覧・復元の結果と 1 本で移す）",
-    ),
-    (
-        "fn sleep_guard_local(",
-        "sleep-guard 一式（状態の表示と 1 本で移す）",
-    ),
     (
         "fn lsp_server_local(",
         "届かない内部の断り（呼び手が LspServer の要求だけを渡す）",
@@ -19828,6 +20221,279 @@ fn cli_の手元の断りの番犬の境界() {
     assert_eq!(found, vec![1, 5, 7, 12], "植えた 4 か所だけを名指す");
     assert_eq!(strip_line_comment("a // b"), "a ");
     assert_eq!(strip_line_comment("\"x // y\" // z"), "\"x // y\" ");
+}
+
+// ---- #2365 の続き: sleep-guard / recover の行の中身の型と、watch の現在の選択の印 ----
+//
+// CLI の sleep-guard / recover の行（`ReplyNote`）に載る中身 = レイアウトの読めない理由
+// （`LayoutError`）・合流しなかった理由（`SkipReason`）・生死を確かめなかった理由（`Untrusted`）・
+// 蓋閉じ継続の効かない理由（`LidSkipReason`）・蓋閉じ防止の登録 / 解除の結果（`LidControlDone`）は
+// 各型の `text_in` / `label_in` / `describe_in` が日英を持つ。日本語は #2365 より前の文
+// （persist.log・`tako persist` の診断・応答の `text` / `result` は今も日本語の口でこの文）とバイト一致
+
+use tako_control::layout::LayoutError;
+use tako_control::layout_reconcile::{SkipReason, Untrusted};
+use tako_control::sleep_guard::{LidControlDone, LidSkipReason, ThermalState};
+
+const LAYOUT_RECONCILE_SRC: &str = include_str!("../src/layout_reconcile.rs");
+const LAYOUT_RECONCILE_PATH: &str = "crates/tako-control/src/layout_reconcile.rs";
+const MONITORING_GUIDE: &str = include_str!("../src/orchestrator/guides/monitoring.md");
+
+fn layout_error_index(e: &LayoutError) -> usize {
+    match e {
+        LayoutError::NotFound => 0,
+        LayoutError::Io(_) => 1,
+        LayoutError::Parse(_) => 2,
+        LayoutError::Version(_) => 3,
+        LayoutError::Empty => 4,
+        LayoutError::DuplicateId => 5,
+        LayoutError::InvalidAxis => 6,
+        LayoutError::Workspace => 7,
+    }
+}
+
+fn lid_skip_index(r: &LidSkipReason) -> usize {
+    match r {
+        LidSkipReason::ModeOff => 0,
+        LidSkipReason::SetupRequired => 1,
+        LidSkipReason::NoAgents => 2,
+        LidSkipReason::NoAcPower => 3,
+        LidSkipReason::BatteryFloor { .. } => 4,
+        LidSkipReason::BatteryUnknown => 5,
+        LidSkipReason::Thermal(_) => 6,
+    }
+}
+
+fn lid_done_index(d: &LidControlDone) -> usize {
+    match d {
+        LidControlDone::SudoersInstalled(_) => 0,
+        LidControlDone::SudoersRemoved(_) => 1,
+        LidControlDone::SudoersAbsent => 2,
+        LidControlDone::NoSetupNeeded => 3,
+        LidControlDone::PowerPlanRestored => 4,
+        LidControlDone::NotEnabled => 5,
+    }
+}
+
+/// [`bilingual_at`] の日本語の側に、#2365 より前の文とのバイト一致を足す
+fn bilingual_old(src: &str, path: &str, from: &str, debug: &str, ja: &str, en: &str, old: &str) {
+    assert_eq!(
+        ja,
+        old,
+        "{}: {debug} の日本語が #2365 より前と違う",
+        where_written(src, path, from, debug, Lang::Ja)
+    );
+    bilingual_at(src, path, from, debug, ja, en);
+}
+
+#[test]
+fn recoverとsleep_guardの行の中身の型は日英を持ち日本語は2365より前と一致() {
+    // レイアウトの読めない理由（`Display` = persist.log・`tako persist` の診断の文も同じ）
+    let layout = [
+        (
+            LayoutError::NotFound,
+            "レイアウトファイルが無い（初回起動または明示クローズ・OFF 切替後）",
+        ),
+        (
+            LayoutError::Io("Permission denied (os error 13)".into()),
+            "レイアウトファイルを読めない: Permission denied (os error 13)",
+        ),
+        (
+            LayoutError::Parse(tako_core::load_issue::JsonReason::Located {
+                kind: tako_core::load_issue::JsonProblem::Eof,
+                line: 1,
+                column: 1,
+            }),
+            "レイアウトファイルを解釈できない（破損）: JSON が途中で切れている（1 行 1 列）",
+        ),
+        (
+            LayoutError::Version(9),
+            "フォーマットバージョン不一致（ファイル=9, 対応=1）",
+        ),
+        (LayoutError::Empty, "タブが空"),
+        (
+            LayoutError::DuplicateId,
+            "ペイン / タブ ID が重複している（破損・継ぎ接ぎされたファイル）",
+        ),
+        (LayoutError::InvalidAxis, "分割軸が不正"),
+        (LayoutError::Workspace, "ワークスペースを再構成できない"),
+    ];
+    let samples: Vec<&LayoutError> = layout.iter().map(|(e, _)| e).collect();
+    covers_every(&samples, |e| layout_error_index(e), 8, "LayoutError");
+    for (e, old) in &layout {
+        let debug = format!("{e:?}");
+        let (ja, en) = (e.text_in(Lang::Ja), e.text_in(Lang::En));
+        bilingual_old(
+            LAYOUT_FILE_SRC,
+            LAYOUT_FILE_PATH,
+            "impl LayoutError {",
+            &debug,
+            &ja,
+            &en,
+            old,
+        );
+        assert_eq!(
+            e.to_string(),
+            *old,
+            "{debug}: Display（診断の文）が変わった"
+        );
+    }
+    // 合流しなかった理由・生死を確かめなかった理由（`label` = persist.log の行の文も同じ）
+    for (r, old) in [
+        (
+            SkipReason::AllDead,
+            "master / worker のペインで、tmux セッションがすべて終わっている",
+        ),
+        (
+            SkipReason::AlreadyInBackup,
+            "どのペインもバックアップの側にある",
+        ),
+    ] {
+        let debug = format!("{r:?}");
+        let (ja, en) = (r.label_in(Lang::Ja), r.label_in(Lang::En));
+        bilingual_old(
+            LAYOUT_RECONCILE_SRC,
+            LAYOUT_RECONCILE_PATH,
+            "impl SkipReason {",
+            &debug,
+            ja,
+            en,
+            old,
+        );
+        assert_eq!(r.label(), old, "{debug}: persist.log の文が変わった");
+    }
+    for (u, old) in [
+        (
+            Untrusted::NoAnswer,
+            "tmux に問い合わせられない（サーバー未起動・ソケットが無い等）",
+        ),
+        (
+            Untrusted::NoLayoutSession,
+            "tmux の一覧に layout の器が 1 つも無い（layout を書いたのと別のサーバーかもしれない）",
+        ),
+    ] {
+        let debug = format!("{u:?}");
+        let (ja, en) = (u.label_in(Lang::Ja), u.label_in(Lang::En));
+        bilingual_old(
+            LAYOUT_RECONCILE_SRC,
+            LAYOUT_RECONCILE_PATH,
+            "impl Untrusted {",
+            &debug,
+            ja,
+            en,
+            old,
+        );
+        assert_eq!(u.label(), old, "{debug}: persist.log の文が変わった");
+    }
+    // 蓋閉じ継続の効かない理由（`describe` = 応答の `text` も同じ日本語）
+    let skip = [
+        (LidSkipReason::ModeOff, "未設定"),
+        (
+            LidSkipReason::SetupRequired,
+            "sudoers 未登録（tako setup --lid-sleep で登録）",
+        ),
+        (LidSkipReason::NoAgents, "エージェント待機中のため無効"),
+        (
+            LidSkipReason::NoAcPower,
+            "AC 未接続のため無効（tako sleep-guard set --lid-power-condition always でバッテリーでも継続）",
+        ),
+        (
+            LidSkipReason::BatteryFloor {
+                percent: 15,
+                floor: 20,
+            },
+            "バッテリー残量 15% が下限 20% 以下のため解除",
+        ),
+        (
+            LidSkipReason::BatteryUnknown,
+            "バッテリー残量を取得できないため解除（安全弁）",
+        ),
+        (
+            LidSkipReason::Thermal(ThermalState::Serious),
+            "本体が高温（serious）のため解除",
+        ),
+    ];
+    let samples: Vec<&LidSkipReason> = skip.iter().map(|(r, _)| r).collect();
+    covers_every(&samples, |r| lid_skip_index(r), 7, "LidSkipReason");
+    for (r, old) in &skip {
+        let debug = format!("{r:?}");
+        let (ja, en) = (r.describe_in(Lang::Ja), r.describe_in(Lang::En));
+        bilingual_old(
+            SLEEP_GUARD_SRC,
+            SLEEP_GUARD_PATH,
+            "pub fn describe_in(",
+            &debug,
+            &ja,
+            &en,
+            old,
+        );
+        assert_eq!(r.describe(), *old, "{debug}: 応答の text が変わった");
+    }
+    // 蓋閉じ防止の登録 / 解除の結果（`into_ja` = 応答の `result` も同じ日本語。macOS の登録・削除は
+    // osascript の出力をそのまま出す = 見本は管理者権限のスクリプトが echo する行）
+    let done = [
+        (
+            LidControlDone::SudoersInstalled("OK: sudoers 登録完了".into()),
+            "OK: sudoers 登録完了",
+        ),
+        (
+            LidControlDone::SudoersRemoved("OK: sudoers 削除完了・disablesleep 解除".into()),
+            "OK: sudoers 削除完了・disablesleep 解除",
+        ),
+        (
+            LidControlDone::SudoersAbsent,
+            "sudoers は未登録です（削除不要）",
+        ),
+        (
+            LidControlDone::NoSetupNeeded,
+            "この OS では追加の権限も登録も不要です（電源プランの設定で実現します）",
+        ),
+        (
+            LidControlDone::PowerPlanRestored,
+            "蓋閉じ継続を解除し、電源プランの設定を元へ戻しました",
+        ),
+        (
+            LidControlDone::NotEnabled,
+            "蓋閉じ継続は有効化されていません（解除不要）",
+        ),
+    ];
+    let samples: Vec<&LidControlDone> = done.iter().map(|(d, _)| d).collect();
+    covers_every(&samples, |d| lid_done_index(d), 6, "LidControlDone");
+    for (d, old) in &done {
+        let debug = format!("{d:?}");
+        let (ja, en) = (d.text_in(Lang::Ja), d.text_in(Lang::En));
+        bilingual_old(
+            SLEEP_GUARD_SRC,
+            SLEEP_GUARD_PATH,
+            "impl LidControlDone {",
+            &debug,
+            &ja,
+            &en,
+            old,
+        );
+        assert_eq!(
+            d.clone().into_ja(),
+            *old,
+            "{debug}: 応答の result が変わった"
+        );
+    }
+}
+
+/// `tako orchestrator watch` の現在の選択の印は master が読む印なので両言語で同じ綴り。
+/// guide の monitoring が字面で引く綴りと一致し、CLI は定数から引く（日本語の固定文で書き戻すと
+/// `CLI_NOTE_SCOPES` の番犬が名指す）
+#[test]
+fn watchの現在の選択の印はguideが引く綴りと同じ() {
+    let mark = tako_control::orchestrator::wait::CHOICE_HIGHLIGHT_MARK;
+    assert!(
+        MONITORING_GUIDE.contains(&format!("`{mark}`")),
+        "crates/tako-control/src/orchestrator/guides/monitoring.md: watch の印 `{mark}` を引いていない \
+         （綴りを変えたなら guide も直す）"
+    );
+    assert!(
+        CLI_MAIN_SRC.contains("wait::CHOICE_HIGHLIGHT_MARK"),
+        "{CLI_MAIN_PATH}: watch の現在の選択の印を定数から引いていない"
+    );
 }
 
 // ---- #2365 の続き: check-health 一式（`HealthText`）と、`tako setup --check` と共有する診断 ----

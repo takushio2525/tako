@@ -1117,6 +1117,36 @@ pub enum Reason {
     TabNewNoPane,
     /// `tako orchestrator watch` の対象（ペイン ID / `--worker`）が無い
     WatchTargetMissing,
+    /// `tako sleep-guard set` の値が読めない（`flag` はオプション名・`allowed` は受け付ける値）
+    SleepGuardUnknownValue {
+        flag: &'static str,
+        got: String,
+        allowed: &'static str,
+    },
+    /// `tako sleep-guard set --lid-power-condition` の値が読めない（受け付ける値と意味を添える）
+    SleepGuardUnknownLidPower(String),
+    /// `tako recover` でデータディレクトリを解決できない（文の違う [`Self::DataDirUnresolved`] とは別）
+    RecoverDataDirUnresolved,
+    /// `tako recover --apply` の世代が読めない（受け取った値）
+    RecoverGenerationUnknown(String),
+    /// `tako recover --apply` で control.json の tako が稼働中（`quit_key` は終了の打鍵の表記）
+    RecoverTakoRunning {
+        pid: u32,
+        quit_key: String,
+    },
+    /// `tako recover --apply` でプロセス走査が別の tako の稼働を見つけた
+    RecoverOtherTakoRunning,
+    /// `tako recover --apply` でバックアップを読めない（`error` は同じ言語の `LayoutError` の文）
+    RecoverBackupUnreadable {
+        path: String,
+        error: String,
+    },
+    /// `tako recover --apply` で現在の layout.json を退避できない（`error` は OS のエラー文）
+    RecoverStashFailed(String),
+    /// `tako recover --apply` で合流した構成を書けない（同上）
+    RecoverWriteFailed(String),
+    /// `tako recover --apply` でバックアップを layout.json へ写せない（同上）
+    RecoverCopyFailed(String),
     /// `tako usage --show` で GUI が動いていない
     UsageShowNeedsGui,
     /// `tako queue` の優先度が読めない（`got` は受け取った値）
@@ -3213,6 +3243,73 @@ impl Reason {
                 "pass a pane ID or --worker (tako orchestrator watch <PANE_ID> / --worker <ID>)"
                     .into()
             }
+            (
+                Self::SleepGuardUnknownValue {
+                    flag,
+                    got,
+                    allowed,
+                },
+                Ja,
+            ) => format!("不明な {flag}: {got:?}（{allowed} のいずれか）"),
+            (
+                Self::SleepGuardUnknownValue {
+                    flag,
+                    got,
+                    allowed,
+                },
+                En,
+            ) => format!("unknown {flag}: {got:?} (one of {allowed})"),
+            (Self::SleepGuardUnknownLidPower(got), Ja) => format!(
+                "不明な lid-power-condition: {got:?}（{}）",
+                crate::sleep_guard::PowerCondition::values_hint_in(Ja)
+            ),
+            (Self::SleepGuardUnknownLidPower(got), En) => format!(
+                "unknown lid-power-condition: {got:?} ({})",
+                crate::sleep_guard::PowerCondition::values_hint_in(En)
+            ),
+            (Self::RecoverDataDirUnresolved, Ja) => {
+                "データディレクトリを解決できない（HOME 未設定等）".into()
+            }
+            (Self::RecoverDataDirUnresolved, En) => {
+                "cannot resolve the data directory (HOME is not set, etc.)".into()
+            }
+            (Self::RecoverGenerationUnknown(got), Ja) => {
+                format!("世代は 1〜3・good・rescued のどれかで指定してください（指定: {got}）")
+            }
+            (Self::RecoverGenerationUnknown(got), En) => {
+                format!("pass the generation as 1-3, good or rescued (given: {got})")
+            }
+            (Self::RecoverTakoRunning { pid, quit_key }, Ja) => format!(
+                "tako（pid {pid}）が稼働中です。終了（{quit_key}）してから実行してください（--force で強制実行）"
+            ),
+            (Self::RecoverTakoRunning { pid, quit_key }, En) => format!(
+                "tako (pid {pid}) is running. Quit it ({quit_key}) and run this again \
+                 (--force runs it anyway)"
+            ),
+            (Self::RecoverOtherTakoRunning, Ja) => {
+                "tako が稼働中です（定期保存が復元結果を上書きします）。終了してから実行するか、\
+                 別のデータディレクトリの tako だと確かなら --force を付けてください"
+                    .into()
+            }
+            (Self::RecoverOtherTakoRunning, En) => {
+                "tako is running (its periodic save would overwrite the restored layout). Quit it \
+                 and run this again, or add --force if you are sure it uses another data directory"
+                    .into()
+            }
+            (Self::RecoverBackupUnreadable { path, error }, Ja) => {
+                format!("バックアップ {path} を読めない: {error}")
+            }
+            (Self::RecoverBackupUnreadable { path, error }, En) => {
+                format!("cannot read the backup {path}: {error}")
+            }
+            (Self::RecoverStashFailed(e), Ja) => format!("現在の layout.json の退避に失敗: {e}"),
+            (Self::RecoverStashFailed(e), En) => {
+                format!("failed to set aside the current layout.json: {e}")
+            }
+            (Self::RecoverWriteFailed(e), Ja) => format!("復元の書き込みに失敗: {e}"),
+            (Self::RecoverWriteFailed(e), En) => format!("failed to write the restored layout: {e}"),
+            (Self::RecoverCopyFailed(e), Ja) => format!("復元コピーに失敗: {e}"),
+            (Self::RecoverCopyFailed(e), En) => format!("failed to copy the backup: {e}"),
             (Self::UsageShowNeedsGui, Ja) => {
                 "tako が動いていないので右パネルには出せない（--show を外すとこのまま読める）".into()
             }
