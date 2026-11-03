@@ -34072,6 +34072,13 @@ mod self_test {
     mod usage_panel_2203;
     #[cfg(feature = "visual-test")]
     use usage_panel_2203::usage_panel_2203_visual;
+    /// #1995: 右パネルの resources ビューとステータスバーの区画（区画から開く・行でフォーカス・
+    /// 段のチップ・取り消しの確かめ・CLI / MCP と同じ答え・未対応と critical の色）
+    /// （visual-test `resources-panel-1995`）
+    #[cfg(feature = "visual-test")]
+    mod resources_panel_1995;
+    #[cfg(feature = "visual-test")]
+    use resources_panel_1995::resources_panel_1995_visual;
     /// #1952: ドロップダウンの基板とポートの欄（実の arduino-cli で sketch.yaml・言語サーバの起き直し）
     /// （visual-test `run-board-1952`）
     #[cfg(feature = "visual-test")]
@@ -50133,6 +50140,11 @@ mod self_test {
                 // #2203: 右パネルの usage ビュー（素材は scripts/test-usage-panel-2203.sh）
                 "usage-panel-2203" => {
                     usage_panel_2203_visual(any, window, cx).await;
+                    visual_exit(0);
+                }
+                // #1995: 右パネルの resources ビュー（素材は scripts/test-resources-panel-1995.sh）
+                "resources-panel-1995" => {
+                    resources_panel_1995_visual(any, window, cx).await;
                     visual_exit(0);
                 }
                 // #1733: 実行ボタン横のドロップダウン（実マウスで開く・候補を選ぶ・欄で直す・出典タグ）
