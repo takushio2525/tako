@@ -143,6 +143,23 @@ export function createClient() {
     runCommandCard(cardId, index) {
       return request('POST', `/api/cards/${encodeURIComponent(cardId)}/run`, { index });
     },
+    // --- PC の負荷と順番待ち（#1999。経路は `remote_resources::RESOURCE_ROUTES` が正）---
+    // 機の状態・実行中・待ち（`tako queue --json` の machine / queue の節と同じ答え）。observe で読める
+    resources() {
+      return request('GET', '/api/resources');
+    },
+    // 受付番号の処理の段（`tako queue priority <id> <段>`。manage 以上）
+    setJobPriority(id, priority) {
+      return request('POST', `/api/resources/jobs/${encodeURIComponent(id)}/priority`, { priority });
+    },
+    // ペインから出る処理の段の既定（`tako queue priority --pane N <段>`。manage 以上）
+    setPanePriority(pane, priority) {
+      return request('POST', `/api/resources/panes/${encodeURIComponent(pane)}/priority`, { priority });
+    },
+    // 取り消し（`tako queue cancel <id>`。manage 以上）。走っている処理は wrapper が止める
+    cancelJob(id) {
+      return request('POST', `/api/resources/jobs/${encodeURIComponent(id)}/cancel`);
+    },
     // リサイズ要求は存在しない: リモート表示は PC 側のペインサイズに一切影響しない（#63）
     wsUrl(paneId) {
       const proto = base.startsWith('https') ? 'wss' : 'ws';

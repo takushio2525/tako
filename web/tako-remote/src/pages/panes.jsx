@@ -14,6 +14,7 @@ import { AgentIcon } from '../components/agent-icon';
 import { RemoteLinkRow, AccountChip } from '../components/remote-link';
 import { LaunchSheet, legacy1449 } from '../components/launch-sheet';
 import { useOpenTaskCount, legacy1450b3 } from './tasks';
+import { MachineCard, useResources, MACHINE_CARD_POLL_MS } from './resources';
 
 const PREVIEW_LINES = 8;
 const PULL_THRESHOLD = 80;
@@ -266,6 +267,15 @@ export function PanesPage({ me }) {
   const [launcher, setLauncher] = useState(false);
   // #1450 B3: 未完了のユーザータスク件数（ポーリングの止め方は tasks.jsx の 1 実装）
   const openTasks = useOpenTaskCount(!legacy1450b3());
+  // #1999: 機の状態のカード（読めない古い daemon では出さない = 押せない入口を並べない）
+  const resources = useResources(MACHINE_CARD_POLL_MS);
+  const machineCard = resources.data && (
+    <MachineCard
+      data={resources.data}
+      compact
+      onOpen={() => { window.location.hash = '#/resources'; }}
+    />
+  );
   const timerRef = useRef(null);
   const touchStartRef = useRef({ y: 0, scrollTop: 0 });
   const listRef = useRef(null);
@@ -418,6 +428,11 @@ export function PanesPage({ me }) {
 
       {pulling && <div class="pull-indicator"><div class="spinner" /></div>}
 
+      {/* 一覧があるときはカードも一覧と一緒にスクロールする（下の card-list の先頭） */}
+      {(loading || error || groups.length === 0) && machineCard && (
+        <div class="machine-card-wrap">{machineCard}</div>
+      )}
+
       {loading ? (
         <div class="card-list" style="padding-top: 14px;">
           <SkeletonCard /><SkeletonCard /><SkeletonCard />
@@ -449,6 +464,7 @@ export function PanesPage({ me }) {
           onTouchEnd={onTouchEnd}
           style={pullY > 0 ? `transform: translateY(${pullY}px)` : ''}
         >
+          {machineCard}
           {groups.map(group => (
             <div class="tab-group" key={group.key}>
               <div class="tab-group-header">

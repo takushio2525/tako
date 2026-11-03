@@ -4,6 +4,7 @@ import { PanesPage } from './pages/panes';
 import { TerminalPage } from './pages/terminal';
 import { FilesPage } from './pages/files';
 import { TasksPage } from './pages/tasks';
+import { ResourcesPage } from './pages/resources';
 import { createClient } from './api';
 import { cleanupLegacyStore } from './store';
 
@@ -138,6 +139,9 @@ export function App() {
         onMeRefresh={refreshMe}
       />
     );
+  } else if (segments[0] === 'resources') {
+    // #1999: PC の負荷と順番待ち（優先度の変更と取り消しは manage 以上）
+    page = <ResourcesPage me={me} onMeRefresh={refreshMe} />;
   } else if (segments[0] === 'files') {
     // #1079: ファイルビュー（root / path はクエリで持つ）
     page = (

@@ -310,6 +310,12 @@ pub enum RemoteRefusal {
     CardIdUnreadable,
     /// コマンドカードの `index` が 1 始まりの整数でない
     CardIndexInvalid,
+    /// パスから順番待ちの受付番号を取り出せない（#1999）
+    ResourceJobIdUnreadable,
+    /// パスからペイン ID を取り出せない（順番待ちのペインの既定。#1999）
+    ResourcePaneIdUnreadable,
+    /// 優先度の変更の本文に `priority`（段の名前）が無い（#1999）
+    ResourcePriorityRequired,
     /// SSH の要求に `host` が無い
     SshHostRequired,
     /// SSH の `host` に許可していない文字がある
@@ -351,6 +357,8 @@ pub enum AppVia {
     Tasks,
     /// コマンドカードの操作（`/api/cards…`）
     Cards,
+    /// PC の負荷と順番待ちの操作（`/api/resources…`。#1999）
+    Resources,
     /// SSH ホストの一覧（`GET /api/ssh-hosts`）
     SshHosts,
     /// SSH の接続（`POST /api/ssh` / `POST /api/panes/:id/ssh`）
@@ -917,6 +925,16 @@ impl RemoteRefusal {
             (Self::CardIndexInvalid, En) => {
                 "index must be an integer starting at 1".to_string()
             }
+            (Self::ResourceJobIdUnreadable, Ja) => "受付番号が読み取れない".to_string(),
+            (Self::ResourceJobIdUnreadable, En) => "cannot read the job number".to_string(),
+            (Self::ResourcePaneIdUnreadable, Ja) => "ペイン ID が読み取れない".to_string(),
+            (Self::ResourcePaneIdUnreadable, En) => "cannot read the pane ID".to_string(),
+            (Self::ResourcePriorityRequired, Ja) => {
+                "priority（top / high / normal / low / default）が必要".to_string()
+            }
+            (Self::ResourcePriorityRequired, En) => {
+                "priority (top / high / normal / low / default) is required".to_string()
+            }
             (Self::SshHostRequired, Ja) => {
                 "host が必要（`GET /api/ssh-hosts` の name を渡す）".to_string()
             }
@@ -1100,6 +1118,8 @@ impl AppVia {
             (Self::Tasks, En) => Some("task operations"),
             (Self::Cards, Ja) => Some("コマンドカードの操作"),
             (Self::Cards, En) => Some("command card operations"),
+            (Self::Resources, Ja) => Some("順番待ちの操作"),
+            (Self::Resources, En) => Some("queue operations"),
             (Self::SshHosts, Ja) => Some("SSH ホスト一覧"),
             (Self::SshHosts, En) => Some("listing SSH hosts"),
             (Self::SshOpen, Ja) => Some("リモートからの SSH 接続"),

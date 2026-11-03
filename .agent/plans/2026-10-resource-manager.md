@@ -478,6 +478,26 @@ S2 の「先頭が入れなければ後ろも待つ」は、先頭が**同じ ta
 | 区画の配置と色 | ctx メーターの左。バー 48px + 使用率。色は normal = accent / warn = 黄 / critical = 赤（文字も warn 以上は同じ色）。件数は実行中・待ちが 1 件以上のときだけ「実行 N · 待ち M」 | §7 の表のとおり。普段の画面に増える幅を小さくする |
 | Windows | 機の値が無ければビューの ① と ④ に「未対応」、区画は「メモリ 未対応」。順番待ちの ② ③ は出す（調停役は OS に依らない） | §10。値を作らない（過大にも過小にも申告しない） |
 
+### 7.2 S7（#1999）の実装で決めたこと
+
+§7 の表の「スマホ（PWA）」の行をそのまま入れたうえで、実装の途中で決めた差分と細部（正は FR-2.43.17 とコード）:
+
+| 項目 | 決めたこと | 理由 |
+|---|---|---|
+| 受け口 | daemon に宣言表 `remote_resources::RESOURCE_ROUTES` の 4 本（`GET /api/resources`・`POST /api/resources/jobs/<id>/priority`・`POST /api/resources/panes/<pane>/priority`・`POST /api/resources/jobs/<id>/cancel`）。中身は `Request::Queue` の `status` / `priority` / `cancel` を `app_dispatch` で素通し | GUI のチップと同じく 2 つの口（受付番号・ペイン）をそのまま並べる。`ipc::submit` の振り分け（受付番号 = 手前の `queue::answer`、ペイン = UI の dispatch）も IPC と同じになる |
+| role | 読むのは Observe（全役割）、変更は Manage（`/api/panes/*/close` と同じ強さ）。表に無い `/api/resources…` は床の Manage・受け口の中でも二重の門 | 取り消しは他人のビルドを止める = 打鍵（Interact）より強い。#1405 の「未知の経路が弱い role へこぼれる」を #1724 と同じ形で塞ぐ |
+| 返す節 | status の `machine` / `queue`（と `gui`・`machine_unavailable`）だけを**手を加えずに**返す。`panes` / `heavy` / `external` / `scan`（走査の内訳）・`launches`・`jobserver`（fifo のパス）は配らない | 画面に出さないものを端末へ配らない。抜くのは節単位なので、受付番号・並び・段は CLI と 1 バイトも変わらない（実経路のスクリプトが突き合わせる） |
+| 載せない操作 | `limits`（上限の書き換え）・`start`（agent の起動待ちを起こす）・wrapper 専用の `enqueue` / `poll` / `started` / `done` は表に載せない（manage でも 404） | Issue の範囲は「優先度の変更と取り消し」。上限は機全体の政策で、スマホから変える要求が無い |
+| GUI 不在 | 読む経路だけ CLI と同じく daemon が `resources::machine_only` で機の状態を採り、`gui: false` + 注記（`ReplyNote::QueueOfflineNote` = daemon の表示言語）で返す。変更は 503 `app_unreachable` | daemon は GUI と別プロセスで、GUI が落ちても `/api/me` は答える。機のカードが消えるより「順番待ちは無効」と言う方が状況が分かる |
+| 失敗の分類 | 押す前に終わった処理（`Reason::QueueJobUnknown` と `queue::cancel` の断り）は 404 `gone`。読みは `Reason::says_queue_job_unknown` の 1 実装（日英） | 受付番号は wrapper の pid = 使い回されうる。画面は「もう順番待ちに居ない」と言って読み直す |
+| 段の検査 | daemon は形（文字列か）だけ見て、段の読み（`urgent` 等の断り）は調停役の 1 実装に任せる | CLI の `queue_priority_request` と同じ分担。段の名前を 2 か所で持たない |
+| 文言 | 画面の語は PC の resources ビュー（`ui_text::resources`）と同じ（段の名前・「この処理」「ペイン N の既定」・取り消しの確かめ・段の出どころ）。見込み・待つ理由・開始の見込みは調停役の日本語の 1 文（`eta.text` / `text` / `start_text`）をそのまま出す | PWA は日本語だけ（i18n が無い）。数字の丸めを PWA で組み直さない |
+| ポーリング | `#/resources` は 3 秒（ペイン一覧と同じ）、`#/` のカードは 5 秒（タスクのバッジと同じ）。タスクの `usePolling`（画面を離れたら止まる・裏では撃たない）に周期の引数を足して使う | タイマーの実装を 2 つ作らない（#1450 B3 の番犬が縛る）。status を読む間は PC の走査が 2 秒ごとになる（§2.2 の「見ている間」）が、スマホが見ている間だけ |
+| 入口 | `#/` のペイン一覧の先頭に機のカード（一覧と一緒にスクロールする）。押すと `#/resources`。古い daemon（`/api/resources` が 404）ではカードを出さない | 押しても何も出ない入口を並べない |
+| 権限が足りない端末 | 段のチップと取り消しを出さず、#1452 の `PermissionRequest`（manage を要求）を出す | 「権限が足りません」で行き止まりにしない（tasks / files と同じ） |
+| テーマ | PWA は暗色のテーマしか持たない（`main.css` に `prefers-color-scheme` の分岐が無い）ので、新しい画面も既存のトークンだけで描き暗色にそろえた | ライトテーマは PWA 全体の話で、この画面だけ明るくすると他の画面と食い違う。トークンだけで書いたので、PWA にライトテーマが入れば一緒に切り替わる |
+| MCP | 新しいツールは足さない（カタログ +0 B） | スマホの経路は既存の `tako_queue` と同じ `Request::Queue`。AI は今まで通り MCP / CLI から同じ操作ができる |
+
 ## 8. CLI / MCP（論点 7）
 
 ### 8.1 CLI
