@@ -177,6 +177,7 @@ tako/
 | **その 1 件を右パネルで開いて見せる（#1479）** | `tako todo expand <id>` |
 | **人がやることを画面で見る・返答する（右パネル。#1450 B2）** | `tako panel --show --view tasks` |
 | **人がやることをスマホから片付ける（PWA。#1450 B3）** | `#/tasks` |
+| **スマホから PC の負荷と順番待ち（段・取り消しは manage 以上。#1999）** | `#/resources` |
 | 受け入れゲート（#244 / #935） | `tako task gate set <task_id> --command "cmd" [--pr-merged N] [--custom "desc"]` |
 | git ブランチ操作（#496） | `tako git checkout <branch>` |
 | コンフリクト解消エージェント（#496） | `tako git resolve [--agent claude\|codex\|agy] [--tab N]` |

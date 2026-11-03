@@ -14160,9 +14160,12 @@ fn remote_refusal_index(r: &RemoteRefusal) -> usize {
         RemoteRefusal::SshAppUnavailableNote => 117,
         RemoteRefusal::SshCapabilityUnknownNote => 118,
         RemoteRefusal::SshPollNote => 119,
+        RemoteRefusal::ResourceJobIdUnreadable => 120,
+        RemoteRefusal::ResourcePaneIdUnreadable => 121,
+        RemoteRefusal::ResourcePriorityRequired => 122,
     }
 }
-const REMOTE_REFUSAL_VARIANTS: usize = 120;
+const REMOTE_REFUSAL_VARIANTS: usize = 123;
 
 /// `AppVia` / `PeerReject` の通し番号（網羅 match = 足すとここがコンパイルで落ちる）
 fn app_via_index(v: &AppVia) -> usize {
@@ -14177,6 +14180,7 @@ fn app_via_index(v: &AppVia) -> usize {
         AppVia::Cards => 7,
         AppVia::SshHosts => 8,
         AppVia::SshOpen => 9,
+        AppVia::Resources => 10,
     }
 }
 /// ファイル API の `Denial` / tako-core の `ShortcutError` の通し番号（`FileDenied` / `ShortcutRejected` が
@@ -14505,6 +14509,10 @@ fn remote_refusal_table() -> Vec<(RemoteRefusal, String)> {
             RemoteRefusal::AppNotRunning(AppVia::Cards),
             "tako app が稼働していない（コマンドカードの操作は app 経由のみ）".into(),
         ),
+        (
+            RemoteRefusal::AppNotRunning(AppVia::Resources),
+            "tako app が稼働していない（順番待ちの操作は app 経由のみ）".into(),
+        ),
         (RemoteRefusal::TabNotFound(7), "タブ 7 が見つからない".into()),
         (
             RemoteRefusal::PaneNotFound("=tako-x:0.0".into()),
@@ -14798,6 +14806,18 @@ fn remote_receiver_table() -> Vec<(RemoteRefusal, String)> {
             "index は 1 始まりの整数".into(),
         ),
         (
+            RemoteRefusal::ResourceJobIdUnreadable,
+            "受付番号が読み取れない".into(),
+        ),
+        (
+            RemoteRefusal::ResourcePaneIdUnreadable,
+            "ペイン ID が読み取れない".into(),
+        ),
+        (
+            RemoteRefusal::ResourcePriorityRequired,
+            "priority（top / high / normal / low / default）が必要".into(),
+        ),
+        (
             RemoteRefusal::SshHostRequired,
             "host が必要（`GET /api/ssh-hosts` の name を渡す）".into(),
         ),
@@ -14975,7 +14995,7 @@ fn remote系の断りは全バリアントが日英を持ち日本語は2365よ�
             _ => {}
         }
     }
-    covers_every(&vias, app_via_index, 10, "AppVia");
+    covers_every(&vias, app_via_index, 11, "AppVia");
     covers_every(&rejects, peer_reject_index, 6, "PeerReject");
     covers_every(&denials, denial_index, 9, "Denial");
     covers_every(&shortcut_errors, shortcut_error_index, 6, "ShortcutError");

@@ -99,6 +99,8 @@ pub mod remote_isolated_serve;
 pub mod remote_launch;
 pub mod remote_preview;
 pub mod remote_refusal;
+/// スマホから PC の負荷と順番待ちを見る・変える経路の宣言表と受け口（#1999）
+pub mod remote_resources;
 pub mod remote_role;
 pub mod remote_serve;
 pub mod remote_setup;

@@ -120,10 +120,10 @@ export function formatSize(bytes) {
 // --- ポーリング（止め方の 1 実装）---
 
 /**
- * `TASKS_POLL_MS` ごとに `fn` を呼ぶ。**画面を離れたら止まり、裏へ回っているあいだは撃たない**。
- * この 1 本を画面とバッジの両方が使う（タイマー実装を 2 つ作らない）
+ * `intervalMs`（既定 `TASKS_POLL_MS`）ごとに `fn` を呼ぶ。**画面を離れたら止まり、裏へ回っているあいだは撃たない**。
+ * この 1 本を画面とバッジの両方が使う（タイマー実装を 2 つ作らない）。PC の負荷（#1999）も周期だけ変えて使う
  */
-export function usePolling(fn, deps = []) {
+export function usePolling(fn, deps = [], intervalMs = TASKS_POLL_MS) {
   const saved = useRef(fn);
   saved.current = fn;
   useEffect(() => {
@@ -135,7 +135,7 @@ export function usePolling(fn, deps = []) {
       saved.current();
     };
     tick();
-    const timer = setInterval(tick, TASKS_POLL_MS);
+    const timer = setInterval(tick, intervalMs);
     const onVisibility = () => tick();
     document.addEventListener('visibilitychange', onVisibility);
     return () => {
@@ -261,7 +261,7 @@ function ShareIcon() {
   );
 }
 
-function BackIcon() {
+export function BackIcon() {
   return (
     <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
       <path d="M15 5l-7 7 7 7" />

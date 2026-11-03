@@ -3501,6 +3501,15 @@ impl Reason {
         message.contains("表示中のコマンドカードが無い")
             || message.contains("no command card is shown on this pane")
     }
+
+    /// 応答の文が「受付番号が順番待ちに居ない」（[`Self::QueueJobUnknown`] と `queue::cancel` の断り）を
+    /// 言っているか（#1999）。
+    ///
+    /// リモートの HTTP 層は押す前に終わった・取り消された処理への操作を 404 へ寄せる。日英どちらの形も
+    /// この 1 か所で読む（`queue::cancel` の日本語の固定文も同じ字面）
+    pub fn says_queue_job_unknown(message: &str) -> bool {
+        message.contains("は順番待ちに居ない") || message.contains("is not in the queue")
+    }
 }
 
 /// 拡張子からプレビュー種別（ワイヤ表現）を決める。
