@@ -722,7 +722,10 @@ impl TakoApp {
             seg = seg.child(
                 div()
                     .text_color(hsla(theme.text_muted))
-                    .child(SharedString::from(text::bar_counts(bar.running, bar.waiting))),
+                    .child(SharedString::from(text::bar_counts(
+                        bar.running,
+                        bar.waiting,
+                    ))),
             );
         }
         Some(seg.child(crate::tab_shape::probe_canvas(
@@ -903,13 +906,9 @@ impl TakoApp {
                                         .flex_row()
                                         .gap(px(6.0))
                                         .child(text::memory_label())
-                                        .child(
-                                            div()
-                                                .font_family(theme.font_family.clone())
-                                                .child(SharedString::from(text::memory_used(
-                                                    used, total,
-                                                ))),
-                                        ),
+                                        .child(div().font_family(theme.font_family.clone()).child(
+                                            SharedString::from(text::memory_used(used, total)),
+                                        )),
                                 )
                                 .child(
                                     div()
@@ -1171,7 +1170,6 @@ impl TakoApp {
                     } else {
                         None
                     },
-                    job.ran_s.unwrap_or(0),
                 ));
             }
             if job.stalled {
@@ -1183,7 +1181,8 @@ impl TakoApp {
                 details.push(text::start_eta(s));
             }
         }
-        if let Some(from) = text::priority_from(job.priority_from.as_deref(), job.aged, job.base_priority)
+        if let Some(from) =
+            text::priority_from(job.priority_from.as_deref(), job.aged, job.base_priority)
         {
             details.push(from);
         }
@@ -1245,12 +1244,7 @@ impl TakoApp {
                             .rounded(px(2.0))
                             .bg(rgba(theme.surface_highlight))
                             .overflow_hidden()
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(relative(frac))
-                                    .bg(hsla(theme.accent)),
-                            ),
+                            .child(div().h_full().w(relative(frac)).bg(hsla(theme.accent))),
                     )
                     .child(
                         div()
@@ -1264,7 +1258,8 @@ impl TakoApp {
         }
         row = row.child(line(details.join(" · "), theme.text_muted));
         if !running {
-            if let Some(reason) = text::wait_reason(job.reason.as_deref(), job.reason_text.as_deref())
+            if let Some(reason) =
+                text::wait_reason(job.reason.as_deref(), job.reason_text.as_deref())
             {
                 row = row.child(line(reason, theme.text_faint));
             }
@@ -1490,12 +1485,7 @@ impl TakoApp {
                     .rounded(px(2.0))
                     .bg(rgba(theme.surface_highlight))
                     .overflow_hidden()
-                    .child(
-                        div()
-                            .h_full()
-                            .w(relative(frac))
-                            .bg(hsla(theme.teal)),
-                    ),
+                    .child(div().h_full().w(relative(frac)).bg(hsla(theme.teal))),
             )
             .child(
                 div()
@@ -1614,7 +1604,11 @@ mod tests {
         assert_eq!(w.reason.as_deref(), Some("max_jobs"));
         assert_eq!(s.panes.len(), 2);
         assert_eq!(s.panes_total, 5);
-        assert_eq!(s.panes[0].other_mb(), 500, "3400 − agent 2100 − 重い処理 800");
+        assert_eq!(
+            s.panes[0].other_mb(),
+            500,
+            "3400 − agent 2100 − 重い処理 800"
+        );
         assert!(s.panes[1].shelved);
         assert_eq!(s.external, Some((8200, 412, 1)));
         assert_eq!(s.scan, Some((1320, 1200)));

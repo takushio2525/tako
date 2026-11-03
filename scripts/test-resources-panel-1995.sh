@@ -98,7 +98,7 @@ else
   if [ "$rc" -eq 4 ]; then
     UNMEASURED="${UNMEASURED} 隔離 GUI（tako-vd を用意できない）"
   else
-    fail "隔離 GUI を起こせない（$rc）"
+    fail "隔離 GUI を起こせない（${rc}）"
   fi
 fi
 
@@ -109,8 +109,8 @@ if [ -f "$PERF" ]; then
   STALLS="$(grep -c "メインスレッド専有" "$PERF" || true)"
   echo "    perf.log の行 $(wc -l < "$PERF" | tr -d ' ')・メインスレッド専有 ${STALLS}・うち resources の区間 ${HITS}"
   # 参考: 専有の上位のタグ（起動・debug ビルドの描画など resources 以外も含む）
-  grep "メインスレッド専有" "$PERF" | sed -E 's/.*専有: ([^ ]+) が.*/\1/' | sort | uniq -c | sort -rn | head -5 | sed 's/^/      /'
-  grep -E "periodic_prep:resources|dispatch:Queue|offload_prepare:Queue" "$PERF" | mask | sed 's/^/    /' | head -5
+  grep "メインスレッド専有" "$PERF" | sed -E 's/.*専有: ([^ ]+) が.*/\1/' | sort | uniq -c | sort -rn | sed -n '1,5p' | sed 's/^/      /'
+  grep -E "periodic_prep:resources|dispatch:Queue|offload_prepare:Queue" "$PERF" | mask | sed 's/^/    /' | sed -n '1,5p'
   if [ "${HITS:-0}" = "0" ]; then
     pass "resources の区間（periodic_prep:resources / dispatch:Queue / offload_prepare:Queue）は 32 ms を超えていない"
   else
@@ -124,7 +124,8 @@ echo "== 3. 画像の個人情報（ユーザー名・ホームパス）=="
 if command -v tesseract >/dev/null 2>&1 && ls "$DUMP_DIR"/*.png >/dev/null 2>&1; then
   leak=0
   for f in "$DUMP_DIR"/*.png; do
-    if tesseract "$f" - 2>/dev/null | grep -qiE "${MASK_USER}|/Users/"; then
+    ocr="$(tesseract "$f" - 2>/dev/null)"
+    if grep -qiE "${MASK_USER}|/Users/" <<<"$ocr"; then
       leak=1
       echo "    写り込み: $(basename "$f")"
     fi
@@ -139,4 +140,5 @@ if [ -n "${KEEP:-}" ] || [ -n "${RES1995_DUMP_DIR:-}" ]; then
   echo "画像: $DUMP_DIR" | mask
 fi
 echo "PASS=$PASS FAIL=$FAIL${UNMEASURED:+ 未実測:$UNMEASURED}"
-[ "$FAIL" -eq 0 ]
+[ "$FAIL" -eq 0 ] || exit 1
+tako_exit 0

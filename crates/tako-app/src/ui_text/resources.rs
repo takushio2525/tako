@@ -186,13 +186,13 @@ pub fn running_detail(cpu: Option<f64>, memory_mb: Option<u64>, ran_s: Option<u6
     }
     parts.join(" · ")
 }
-/// 終わりの見込み（status の `eta` の欄から。`eta::Eta::text` と同じ 4 通り）
+/// 終わりの見込み（status の `eta` の欄から。`eta::Eta::text` と同じ 4 通り。経過は同じ行の
+/// [`running_detail`] が出すので、ここでは繰り返さない）
 pub fn eta(
     state: &str,
     remaining_s: Option<u64>,
     previous_s: Option<u64>,
     from_progress: Option<(u32, u32)>,
-    ran_s: u64,
 ) -> String {
     match (state, remaining_s) {
         ("remaining", Some(rem)) => match (from_progress, previous_s) {
@@ -212,20 +212,11 @@ pub fn eta(
         ("overrun", _) => {
             let prev = previous_s.map(approx).unwrap_or_else(|| "-".into());
             tr!(
-                format!(
-                    "前回より長くかかっている（経過 {}・前回 {prev}）",
-                    approx(ran_s)
-                ),
-                format!(
-                    "taking longer than last time ({} elapsed, last {prev})",
-                    approx(ran_s)
-                )
+                format!("前回より長くかかっている（前回 {prev}）"),
+                format!("taking longer than last time (last {prev})")
             )
         }
-        _ => tr!(
-            format!("経過 {}（見込みなし）", approx(ran_s)),
-            format!("{} elapsed (no estimate)", approx(ran_s))
-        ),
+        _ => tr!("見込みなし".to_string(), "no estimate".to_string()),
     }
 }
 pub fn stalled() -> &'static str {
@@ -386,7 +377,10 @@ pub fn focus_tip() -> &'static str {
 // ===== ④ 常駐の内訳 =====
 
 pub fn section_resident() -> &'static str {
-    tr!("常駐の内訳（メモリの多いペイン）", "Resident memory by pane")
+    tr!(
+        "常駐の内訳（メモリの多いペイン）",
+        "Resident memory by pane"
+    )
 }
 pub fn scan_unsupported() -> &'static str {
     tr!(
@@ -522,11 +516,11 @@ mod tests {
                 owner(None, None, None, None),
                 shelved().to_string(),
                 running_detail(Some(120.0), Some(1300), Some(200)),
-                eta("remaining", Some(180), Some(420), None, 60),
-                eta("remaining", Some(180), None, Some((34, 120)), 60),
-                eta("remaining", Some(180), None, None, 60),
-                eta("overrun", None, Some(420), None, 540),
-                eta("unknown", None, None, None, 240),
+                eta("remaining", Some(180), Some(420), None),
+                eta("remaining", Some(180), None, Some((34, 120))),
+                eta("remaining", Some(180), None, None),
+                eta("overrun", None, Some(420), None),
+                eta("unknown", None, None, None),
                 stalled().to_string(),
                 cancelling().to_string(),
                 position(2),
@@ -582,6 +576,27 @@ mod tests {
         }
         assert_eq!(start_eta(0), tako_core::queue::eta::start_text(0));
         assert_eq!(start_eta(240), tako_core::queue::eta::start_text(240));
+    }
+
+    /// 実行中の行は「数値（経過つき）· 見込み」を 1 行に並べるので、見込みの文で経過を繰り返さない
+    /// （隔離 GUI の 1 回目で「経過 7 秒 · 経過 7 秒（見込みなし）」と二重に出た）
+    #[test]
+    fn 経過は見込みの文で繰り返さない() {
+        let _g = tests_support::lang_guard();
+        for (lang, word) in [
+            (tako_core::i18n::Lang::Ja, "経過"),
+            (tako_core::i18n::Lang::En, "elapsed"),
+        ] {
+            tako_core::i18n::set_lang(lang);
+            for state in ["unknown", "overrun", "remaining"] {
+                let line = [
+                    running_detail(Some(0.0), Some(7), Some(420)),
+                    eta(state, Some(60), Some(300), None),
+                ]
+                .join(" · ");
+                assert_eq!(line.matches(word).count(), 1, "{lang:?} {state}: {line}");
+            }
+        }
     }
 
     /// 誰の欄は同じ語を重ねない（タブ名とペイン名が同じとき）・空の欄は飛ばす

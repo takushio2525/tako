@@ -278,7 +278,9 @@ async fn mcp_call(cx: &mut AsyncApp, cli: &str, tool: &str, args: Value, step: &
         let text = msg["result"]["content"][0]["text"].as_str().unwrap_or("");
         return serde_json::from_str(text).unwrap_or_else(|_| json!({ "text": text }));
     }
-    fail(&format!("visual-test {LABEL} {step}: MCP {tool} の応答が無い"))
+    fail(&format!(
+        "visual-test {LABEL} {step}: MCP {tool} の応答が無い"
+    ))
 }
 
 /// 画面の行（受付番号・並び・段・誰）が CLI `tako queue --json` の答えと同じか
@@ -312,18 +314,19 @@ async fn same_as_cli(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, cli: &str
             })
             .collect()
     };
-    let screen = |jobs: &[crate::resources_panel::JobView]| -> Vec<(u64, String, String, Option<String>)> {
-        jobs.iter()
-            .map(|j| {
-                (
-                    j.id,
-                    j.priority.map(Priority::as_str).unwrap_or("").to_string(),
-                    j.priority_from.clone().unwrap_or_default(),
-                    j.tab.clone(),
-                )
-            })
-            .collect()
-    };
+    let screen =
+        |jobs: &[crate::resources_panel::JobView]| -> Vec<(u64, String, String, Option<String>)> {
+            jobs.iter()
+                .map(|j| {
+                    (
+                        j.id,
+                        j.priority.map(Priority::as_str).unwrap_or("").to_string(),
+                        j.priority_from.clone().unwrap_or_default(),
+                        j.tab.clone(),
+                    )
+                })
+                .collect()
+        };
     let (cli_run, cli_wait) = (rows("running"), rows("waiting"));
     let (gui_run, gui_wait) = (screen(&s.queue.running), screen(&s.queue.waiting));
     println!("TAKO_RES_1995_CLI\t{step}\trunning={cli_run:?}\twaiting={cli_wait:?}");
@@ -386,11 +389,8 @@ fn pin(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, status: Value) {
 
 /// 区画の塗りの中央の画素（RGB）
 fn fill_pixel(any: AnyWindowHandle, window: WindowHandle<TakoApp>, cx: &mut AsyncApp) -> [u8; 3] {
-    let bounds = drawn(any, window, cx, "statusbar-resources-fill").unwrap_or_else(|| {
-        fail(&format!(
-            "visual-test {LABEL} ⑨: 区画の塗りの矩形が無い"
-        ))
-    });
+    let bounds = drawn(any, window, cx, "statusbar-resources-fill")
+        .unwrap_or_else(|| fail(&format!("visual-test {LABEL} ⑨: 区画の塗りの矩形が無い")));
     let Some((frame, scale)) = capture_frame(any, cx) else {
         fail(&format!("visual-test {LABEL} ⑨: フレームを採れない"));
     };
@@ -466,12 +466,18 @@ pub(super) async fn resources_panel_1995_visual(
                 PaneOrigin::Cli,
             );
             let _ = app.after_dispatch(&mut r, false, cx);
-            r.ok().and_then(|v| v["pane"].as_u64()).map(PaneId::from_raw)
+            r.ok()
+                .and_then(|v| v["pane"].as_u64())
+                .map(PaneId::from_raw)
         })
         .ok()
         .flatten()
         .unwrap_or_else(|| fail(&format!("visual-test {LABEL}: 分割できない")));
-    println!("TAKO_RES_1995_PANES\tp1={}\tp2={}", p1.as_u64(), p2.as_u64());
+    println!(
+        "TAKO_RES_1995_PANES\tp1={}\tp2={}",
+        p1.as_u64(),
+        p2.as_u64()
+    );
     // 区画の右に並ぶ ctx / tmux の分も入る幅
     let _ = window.update(cx, |app, _, cx| {
         app.panel_width = 440.0;
@@ -571,14 +577,23 @@ pub(super) async fn resources_panel_1995_visual(
     let focused = window
         .update(cx, |app, _, _| app.focused_pane())
         .unwrap_or(p1);
-    println!("TAKO_RES_1995_FOCUS\tclicked=B\tfocused={}", focused.as_u64());
+    println!(
+        "TAKO_RES_1995_FOCUS\tclicked=B\tfocused={}",
+        focused.as_u64()
+    );
     check(
         focused == p2,
         &format!("visual-test {LABEL} ③: 待ちの行を押すとそのペイン（B = ペイン 2）へ移る"),
     );
 
     // ④ 段のチップ（GUI）→ C を high（この処理）→ 先頭へ
-    click(any, window, cx, &format!("resources-prio-{id_c}"), "④ チップ");
+    click(
+        any,
+        window,
+        cx,
+        &format!("resources-prio-{id_c}"),
+        "④ チップ",
+    );
     check(
         window
             .update(cx, |app, _, _| app.resources.priority_open == Some(id_c))
@@ -616,7 +631,13 @@ pub(super) async fn resources_panel_1995_visual(
     .await;
     same_as_cli(window, cx, &cli, "④ MCP の low").await;
     // B のチップ → 「ペイン 2 の既定」の low（GUI = UI の dispatch がペインの模型へ）
-    click(any, window, cx, &format!("resources-prio-{id_b}"), "④ B のチップ");
+    click(
+        any,
+        window,
+        cx,
+        &format!("resources-prio-{id_b}"),
+        "④ B のチップ",
+    );
     click(
         any,
         window,
@@ -655,13 +676,11 @@ pub(super) async fn resources_panel_1995_visual(
     );
     // CLI でペインの既定を戻す → 画面も戻る
     let p2s = p2.as_u64().to_string();
-    let (code, out) = run_cli(
-        cx,
-        &cli,
-        &["queue", "priority", "--pane", &p2s, "default"],
-    )
-    .await;
-    println!("TAKO_RES_1995_CLI_PANE_DEFAULT\tcode={code}\t{}", out.trim());
+    let (code, out) = run_cli(cx, &cli, &["queue", "priority", "--pane", &p2s, "default"]).await;
+    println!(
+        "TAKO_RES_1995_CLI_PANE_DEFAULT\tcode={code}\t{}",
+        out.trim()
+    );
     check(
         code == 0,
         &format!("visual-test {LABEL} ④: CLI `tako queue priority --pane N default` が通る"),
@@ -737,12 +756,21 @@ pub(super) async fn resources_panel_1995_visual(
         .filter_map(Value::as_u64)
         .collect();
     check(
-        ids(&m, "waiting").iter().all(|id| [id_b, id_c].contains(id)) && gui_wait.len() == 2,
+        ids(&m, "waiting")
+            .iter()
+            .all(|id| [id_b, id_c].contains(id))
+            && gui_wait.len() == 2,
         &format!("visual-test {LABEL} ⑤: 応答の resources が画面の行と同じ受付番号"),
     );
 
     // ⑥ C の取り消し: 確かめの枠 → やめる（残る）→ 取り消す（125 で終わる）
-    click(any, window, cx, &format!("resources-cancel-{id_c}"), "⑥ 取り消し");
+    click(
+        any,
+        window,
+        cx,
+        &format!("resources-cancel-{id_c}"),
+        "⑥ 取り消し",
+    );
     check(
         window
             .update(cx, |app, _, _| app.resources.confirm_cancel == Some(id_c))
@@ -750,7 +778,13 @@ pub(super) async fn resources_panel_1995_visual(
         &format!("visual-test {LABEL} ⑥: 取り消しを押すと確かめの枠が開く（まだ取り消さない）"),
     );
     dump(any, window, cx, "confirm");
-    click(any, window, cx, &format!("resources-cancel-no-{id_c}"), "⑥ やめる");
+    click(
+        any,
+        window,
+        cx,
+        &format!("resources-cancel-no-{id_c}"),
+        "⑥ やめる",
+    );
     check(
         window
             .update(cx, |app, _, _| app.resources.confirm_cancel.is_none())
@@ -764,8 +798,20 @@ pub(super) async fn resources_panel_1995_visual(
             .unwrap_or(false),
         &format!("visual-test {LABEL} ⑥: やめたら C は待ちに残る"),
     );
-    click(any, window, cx, &format!("resources-cancel-{id_c}"), "⑥ 取り消し 2");
-    click(any, window, cx, &format!("resources-cancel-yes-{id_c}"), "⑥ 取り消す");
+    click(
+        any,
+        window,
+        cx,
+        &format!("resources-cancel-{id_c}"),
+        "⑥ 取り消し 2",
+    );
+    click(
+        any,
+        window,
+        cx,
+        &format!("resources-cancel-yes-{id_c}"),
+        "⑥ 取り消す",
+    );
     let code_c = wait_exit(cx, &mut children[2], "⑥ C").await;
     println!("TAKO_RES_1995_CANCEL\tC\texit={code_c}");
     check(
@@ -785,7 +831,13 @@ pub(super) async fn resources_panel_1995_visual(
 
     // ⑧ 走っている A を GUI で取り消す → B が走る → CLI で B を取り消す → 空
     click(any, window, cx, &format!("resources-cancel-{id_a}"), "⑧ A");
-    click(any, window, cx, &format!("resources-cancel-yes-{id_a}"), "⑧ A 取り消す");
+    click(
+        any,
+        window,
+        cx,
+        &format!("resources-cancel-yes-{id_a}"),
+        "⑧ A 取り消す",
+    );
     let code_a = wait_exit(cx, &mut children[0], "⑧ A").await;
     println!("TAKO_RES_1995_CANCEL\tA\texit={code_a}");
     check(

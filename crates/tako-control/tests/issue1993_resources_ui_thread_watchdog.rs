@@ -554,7 +554,8 @@ fn scan_panel(src: &str, main: &str) -> Vec<Offender> {
         out.push(Offender {
             file: PANEL,
             line: 0,
-            why: "`read_cached_snapshot` を誰も呼んでいない（ステータスバーの区画が更新されない）".into(),
+            why: "`read_cached_snapshot` を誰も呼んでいない（ステータスバーの区画が更新されない）"
+                .into(),
         });
     }
     for i in calls {

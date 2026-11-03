@@ -471,7 +471,7 @@ S2 の「先頭が入れなければ後ろも待つ」は、先頭が**同じ ta
 | 操作の口 | 行 = dispatch の `Focus`（`tako focus`）、取り消し = `Request::Queue { action: "cancel", id }`、優先度 = `Request::Queue { action: "priority", id \| pane }`。どれも `dispatch_off_ui` を通るので、受付番号の操作は background の `queue::answer`、ペインの既定（`queue::needs_ui`）は UI スレッドの dispatch（`queue_pane_priority`）が受ける = **IPC と同じ振り分け** | 3 経路（CLI / MCP / GUI）が同じ関数に着く。GUI だけの分岐を持たない |
 | 取り消しの確かめ | 行の中に確かめの枠（「取り消す」「やめる」）を開く。ダイアログは出さない。確かめ中の行が答えから消えたら畳む | 受付番号 = wrapper の pid で使い回されうる。確かめの間に終わった処理の番号を別の処理に当てない |
 | 優先度のチップ | 行の段のチップを押すと行の中に「この処理」と「ペイン N の既定」の 2 列（top / high / normal / low / default）を開く。選んでいる段は処理に付けた段 / ペインの既定（無ければ default） | #1996 の 2 つの口（受付番号・ペイン）をそのまま並べる。走っている処理の段を変えたときは「走っている処理は止めない」を添える |
-| 見込みの文 | status の `eta` の欄（`state` / `remaining_s` / `previous_s` / `from`）と `start_s` から表示言語で組む（日本語は `eta::Eta::text` / `start_text` と同じ文。単体テストで一致を縛る） | `eta.text` は日本語の 1 文だけなので、英語表示では欄から組む |
+| 見込みの文 | status の `eta` の欄（`state` / `remaining_s` / `previous_s` / `from`）と `start_s` から表示言語で組む（残りと開始の見込みは `eta::Eta::text` / `start_text` と同じ言い方・丸め。数値の区切りは単体テストで CLI との一致を縛る）。経過は同じ行の数値に出すので、見込みの文では繰り返さない（「見込みなし」「前回より長くかかっている（前回 N 分）」） | `eta.text` は日本語の 1 文だけなので、英語表示では欄から組む。隔離 GUI の 1 回目で「経過 7 秒 · 経過 7 秒（見込みなし）」と二重に出た |
 | 待つ理由 | 日本語は調停役の 1 文（`text` = CLI と同じ。数値の内訳つき）、英語は理由の種類（`reason`）からの短い文 | 理由の型は tako-core にあり、日本語の文は CLI と同じ 1 実装 |
 | タブ | 条件つき（このビューを選んでいるか、このセッションで開いたとき）。最小幅 264 → **288px**（9 本 + 3 桁のバッジがアイコンだけの段で 270.5px） | 常設 4 本の画面を変えない（#1694 / #2203 と同じ） |
 | 入口 | ステータスバーの区画・表示メニューの「パネル」の「resources ビュー」（`ShowResourcesPanel`）・パレット `panel-resources`・`tako panel --view resources`（MCP `tako_panel` の `view`）。応答の `resources` に描いている行の受付番号・確かめ中の取り消し・開いている段 | #2341 の「ビューはメニューとパレットの両方」。応答で AI が画面の状態を読める |
