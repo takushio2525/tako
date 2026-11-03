@@ -1912,6 +1912,9 @@ tako check-health --json     # 生の JSON（`diagnostics` に項目・状態・
 
 tako queue                   # PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理がどのペインで動いているか
                              # （順番待ちの実行中・待ち・上限・待ちごとの理由も。メモリの逼迫で起動を待っている agent も）
+                             # 同じ数値は画面の右パネルの resources ビュー（ステータスバーのメモリの区画を押す /
+                             # tako panel --view resources）にも出る。行を押すとそのペインへ移り、段のチップと取り消しは
+                             # 下の priority / cancel と同じ操作（取り消しは確かめてから）
 tako queue --json            # 生の JSON（tako が起動していなければ機の状態だけを返す）
 tako queue cargo build       # 重い処理を順番待ちで走らせる（同時数・空きメモリ・メモリ圧で割り当て。
                              # 終了コードはコマンドのまま。tako が起動していなければ待たずに走る）
