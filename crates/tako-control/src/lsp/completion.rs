@@ -406,7 +406,10 @@ mod tests {
             let note = error.limit_note(true);
             assert_eq!(note.is_some(), limited, "{error:?}");
             if let Some(note) = note {
-                assert!(!note.contains('{'), "{error:?} の 1 行に差し込み漏れ: {note}");
+                assert!(
+                    !note.contains('{'),
+                    "{error:?} の 1 行に差し込み漏れ: {note}"
+                );
                 assert!(!note.contains('\n'), "{error:?} は 1 行: {note}");
             }
         }

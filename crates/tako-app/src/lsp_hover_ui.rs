@@ -1032,7 +1032,11 @@ impl TakoApp {
             (card.generation, Arc::clone(&card.blocks), card.truncated);
         // 切ったカードの脚注に出す全文の取り方（#1899。位置はカードの語の頭 = CLI の綴り）
         let full_command = (!tako_control::lsp::completion::legacy_1899()).then(|| {
-            tako_control::lsp::hover::full_command(card.pane.as_u64(), card.line + 1, card.range.start)
+            tako_control::lsp::hover::full_command(
+                card.pane.as_u64(),
+                card.line + 1,
+                card.range.start,
+            )
         });
         let layout = self
             .preview_text_layouts

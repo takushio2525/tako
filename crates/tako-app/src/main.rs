@@ -54297,7 +54297,10 @@ mod self_test {
     #[cfg(feature = "visual-test")]
     struct VtMenu {
         /// 最後の試行で右クリックした直後（待つ前）のメニュー（開かなければ `None`）
-        first: Option<(Option<crate::lsp_menu_ui::LspMenuSection>, Vec<&'static str>)>,
+        first: Option<(
+            Option<crate::lsp_menu_ui::LspMenuSection>,
+            Vec<&'static str>,
+        )>,
         /// 最後に開いたメニューの言語サーバの節と、描いた項目（待ちの後。開けていなければ空）
         section: Option<crate::lsp_menu_ui::LspMenuSection>,
         drawn: Vec<&'static str>,
@@ -54383,7 +54386,9 @@ mod self_test {
             attempt += 1;
             let Some(settled) = vt1684_menu(any, window, cx) else {
                 // 待つあいだに閉じた = 割り込み
-                println!("TAKO_VISUAL_PIXEL: vt1899-menu interfered=closed attempt={attempt} at={at:?}");
+                println!(
+                    "TAKO_VISUAL_PIXEL: vt1899-menu interfered=closed attempt={attempt} at={at:?}"
+                );
                 if out.interfered >= VT_MENU_MAX_INTERFERED {
                     out.exhausted = true;
                     return out;
@@ -54917,7 +54922,9 @@ mod self_test {
         opened.check_not_exhausted("lsp-context-menu ⑧");
         let first = opened.first.clone();
         let settled = opened.section != Some(LspMenuSection::Pending);
-        let menu = first.as_ref().map(|_| (opened.section.clone(), opened.drawn.clone()));
+        let menu = first
+            .as_ref()
+            .map(|_| (opened.section.clone(), opened.drawn.clone()));
         println!(
             "TAKO_VISUAL_PIXEL: {LABEL} ⑧ not-installed first={first:?} settled={settled} menu={menu:?} interfered={}",
             opened.interfered

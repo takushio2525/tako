@@ -307,7 +307,9 @@ pub(super) async fn completion_loading_limit_visual(
     );
     check(
         settled,
-        &format!("visual-test {LABEL} ②: 上限まで待つと「読み込み中」が次の状態へ移る（素材の前提）"),
+        &format!(
+            "visual-test {LABEL} ②: 上限まで待つと「読み込み中」が次の状態へ移る（素材の前提）"
+        ),
     );
     check(
         note == Some(Some(want.clone())) && drawn && !popup,
@@ -359,7 +361,9 @@ pub(super) async fn completion_loading_limit_visual(
     println!("TAKO_VISUAL_PIXEL: {LABEL} ④ loading_again={again} limited_again={limited_again}");
     check(
         again && limited_again,
-        &format!("visual-test {LABEL} ④: 打ち直すと「読み込み中」へ戻り、また上限で理由の 1 行が出る"),
+        &format!(
+            "visual-test {LABEL} ④: 打ち直すと「読み込み中」へ戻り、また上限で理由の 1 行が出る"
+        ),
     );
     completion_type(any, cx, ' ');
 
@@ -396,6 +400,14 @@ fn word_corner(
         })
         .ok()
         .flatten()
+}
+
+/// 1 行が語の真下にあるか: 上端が語の行の下端で、語の頭が 1 行の横幅の中（右端で見切れるなら
+/// 左へずらす = カードと同じ `hover_card_placement`。#1681 の四隅の単体と同じ言い方）
+fn under_word(bounds: Bounds<Pixels>, (left, bottom): (f32, f32)) -> bool {
+    (f32::from(bounds.top()) - bottom).abs() < 1.0
+        && f32::from(bounds.left()) <= left + 0.5
+        && left <= f32::from(bounds.right())
 }
 
 /// ホバーの「読み込み中」の 1 行の今の状態（描いていれば（きっかけ, 矩形））
@@ -477,11 +489,12 @@ pub(super) async fn hover_key_loading_visual(
     );
     let (bounds, (word_left, word_bottom)) = match (note, corner) {
         (Some((_, bounds)), Some(corner)) => (bounds, corner),
-        _ => fail(&format!("visual-test {LABEL} ①: 1 行の矩形か語の位置が無い")),
+        _ => fail(&format!(
+            "visual-test {LABEL} ①: 1 行の矩形か語の位置が無い"
+        )),
     };
     check(
-        (f32::from(bounds.top()) - word_bottom).abs() < 1.0
-            && (f32::from(bounds.left()) - word_left).abs() < 1.0,
+        under_word(bounds, (word_left, word_bottom)),
         &format!(
             "visual-test {LABEL} ①: 1 行は語の頭の真下に置く（矩形 {bounds:?} / 語の左下 ({word_left}, {word_bottom})）"
         ),
@@ -517,7 +530,9 @@ pub(super) async fn hover_key_loading_visual(
     println!("TAKO_VISUAL_PIXEL: {LABEL} ② card={carded} note_after={after:?} header={header:?}");
     check(
         carded && after.is_none(),
-        &format!("visual-test {LABEL} ②: 読み込みが済むとカードへ差し替わり、1 行は消える ({after:?})"),
+        &format!(
+            "visual-test {LABEL} ②: 読み込みが済むとカードへ差し替わり、1 行は消える ({after:?})"
+        ),
     );
     vt1860_press(any, window, cx, "escape");
 
@@ -538,9 +553,7 @@ pub(super) async fn hover_key_loading_visual(
         Some(Duration::from_secs(20)),
         Some(hover_id),
         Duration::from_secs(3),
-        &|cx| {
-            hover_note(window, cx).is_some_and(|(origin, _)| origin == HoverOrigin::Explicit)
-        },
+        &|cx| hover_note(window, cx).is_some_and(|(origin, _)| origin == HoverOrigin::Explicit),
         &|cx| {
             let _ = window.update(cx, |app, _, cx| {
                 app.close_lsp_hover();
@@ -563,15 +576,12 @@ pub(super) async fn hover_key_loading_visual(
         picked.drawn.contains(&hover_id),
         &format!("visual-test {LABEL} ③: 識別子の右クリックに「ホバー情報を表示」が出る（素材の前提） ({:?})", picked.drawn),
     );
-    let under_word = match (note, corner) {
-        (Some((_, bounds)), Some((left, bottom))) => {
-            (f32::from(bounds.top()) - bottom).abs() < 1.0
-                && (f32::from(bounds.left()) - left).abs() < 1.0
-        }
+    let below = match (note, corner) {
+        (Some((_, bounds)), Some(corner)) => under_word(bounds, corner),
         _ => false,
     };
     check(
-        picked.done && under_word,
+        picked.done && below,
         &format!(
             "visual-test {LABEL} ③: 右クリックの「ホバー情報を表示」で頼んでも、読み込み中は語の真下に 1 行が出る (#1899) ({note:?} / {corner:?})"
         ),
@@ -590,7 +600,9 @@ pub(super) async fn hover_key_loading_visual(
     println!("TAKO_VISUAL_PIXEL: {LABEL} ③ card={carded} note_after={after:?}");
     check(
         carded && after.is_none(),
-        &format!("visual-test {LABEL} ③: 読み込みが済むとカードへ差し替わり、1 行は消える ({after:?})"),
+        &format!(
+            "visual-test {LABEL} ③: 読み込みが済むとカードへ差し替わり、1 行は消える ({after:?})"
+        ),
     );
     vt1860_press(any, window, cx, "escape");
 
@@ -667,8 +679,8 @@ pub(super) async fn hover_footer_1899_visual(
             )
         })
         .unwrap_or_default();
-    let want = range_start
-        .map(|start| tako_control::lsp::hover::full_command(pane.as_u64(), 2, start));
+    let want =
+        range_start.map(|start| tako_control::lsp::hover::full_command(pane.as_u64(), 2, start));
     println!(
         "TAKO_VISUAL_PIXEL: {LABEL} card={carded} truncated={truncated:?} total_chars={total_chars} footer={footer:?} want={want:?}"
     );
@@ -686,7 +698,9 @@ pub(super) async fn hover_footer_1899_visual(
         footer.as_deref().is_some_and(|c| {
             c.starts_with("tako lsp hover ") && c.ends_with(" --full") && c.contains("--line 2 ")
         }),
-        &format!("visual-test {LABEL}: 脚注のコマンドは CLI の綴り（行 1 始まり・--full）({footer:?})"),
+        &format!(
+            "visual-test {LABEL}: 脚注のコマンドは CLI の綴り（行 1 始まり・--full）({footer:?})"
+        ),
     );
     dump_both_themes(any, window, cx, "hover-footer-1899");
     vt1860_press(any, window, cx, "escape");
