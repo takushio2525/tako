@@ -443,6 +443,12 @@ pub fn flush_last_seen() -> Result<(), String> {
     let now = unix_now();
     let mut first_err = None;
     for (path, throttle) in throttles.iter_mut() {
+        // #2686: 検証起動の GUI が終了の後片付けで消したカタログは作り直さない（溜めた時刻は捨てる）。
+        // この書き出しは `on_app_quit` が背景で走らせ、後片付けと並んで終わるのを待たれる唯一の書き手。
+        // 本番の GUI では常に偽
+        if tako_core::scoped_dirs::is_retired(path) {
+            continue;
+        }
         if let Err(e) = flush_last_seen_at(path, now, throttle) {
             first_err.get_or_insert(e);
         }

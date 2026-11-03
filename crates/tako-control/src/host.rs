@@ -414,6 +414,11 @@ pub trait UiStateHost {
     fn usage_view_state(&self) -> Option<serde_json::Value> {
         None
     }
+    /// resources ビューが描いている答え（#1995。`tako panel` の応答の `resources`。画面の無い host・
+    /// まだ開いていなければ `None`）。行の受付番号・確かめ中の取り消し・開いている優先度の段を返す
+    fn resources_view_state(&self) -> Option<serde_json::Value> {
+        None
+    }
     /// ワークスペース横断検索の結果の置き場（#1694。右パネルの search ビューもこれを読む）。
     /// 持たない実装（セカンダリ等）は `None` で、`tako search --show` / `--results` / `--open` /
     /// `--clear` は「使えない」と答える（出さない検索は置き場が無くても答える）

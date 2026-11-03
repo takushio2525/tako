@@ -45,6 +45,11 @@ pub fn cmd_label(id: &str) -> &'static str {
             "usage パネルを開く（利用制限の使い道）",
             "Open usage panel (usage limits breakdown)"
         ),
+        // #1995: PC の負荷（ステータスバーのメモリの区画と同じ画面）
+        "panel-resources" => tr!(
+            "resources パネルを開く（PC の負荷）",
+            "Open resources panel (PC load)"
+        ),
         "split-right" => tr!("ペインを右に分割", "Split pane right"),
         "split-down" => tr!("ペインを下に分割", "Split pane down"),
         // #552: いまのタブ名を固定して自動リネームの上書きを止める
@@ -125,6 +130,7 @@ mod tests {
                 cmd_label("panel-git").to_string(),
                 cmd_label("panel-tasks").to_string(),
                 cmd_label("panel-usage").to_string(),
+                cmd_label("panel-resources").to_string(),
                 cmd_label("split-right").to_string(),
                 cmd_label("split-down").to_string(),
                 cmd_label("pin-tab-title").to_string(),

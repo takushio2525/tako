@@ -69,6 +69,8 @@ actions!(
         // #2341: 表示メニューの「パネル」の tasks / usage（パレットにだけあった）
         ShowTasksPanel,
         ShowUsagePanel,
+        // #1995: 表示メニューの「パネル」の resources（ステータスバーのメモリの区画と同じ画面）
+        ShowResourcesPanel,
         OpenDocumentation,
         ReportIssue,
         // #1677: ジャンプ履歴の戻る / 進む（割当と理由は `jump_bindings`）
