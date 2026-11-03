@@ -253,7 +253,7 @@ impl Job {
             None
         };
         if suspended {
-            if let Err(reason) = imp::resume(pid) {
+            if let Err(reason) = imp::resume(&child) {
                 // Job の drop が中身（この子だけ）を止める。Job が無い回も子は止めて刈り取る
                 drop(job);
                 let _ = child.kill();
@@ -702,7 +702,7 @@ mod imp {
     /// unix では一時停止で起こさない（`spawn_contained` は Job を作らない OS で素の `spawn` を返す）
     pub(super) fn suspend_on_spawn(_cmd: &mut std::process::Command, _console: super::Console) {}
 
-    pub(super) fn resume(_pid: u32) -> Result<(), String> {
+    pub(super) fn resume(_child: &std::process::Child) -> Result<(), String> {
         Ok(())
     }
 }
@@ -962,36 +962,10 @@ mod imp {
     /// winbase.h の `CREATE_SUSPENDED` / `CREATE_NO_WINDOW`（後者は `platform::process` と同じ値）
     const CREATE_SUSPENDED: u32 = 0x0000_0004;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    /// winnt.h の `THREAD_SUSPEND_RESUME` / tlhelp32.h の `TH32CS_SNAPTHREAD`
-    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
-    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
-    /// `INVALID_HANDLE_VALUE`（`CreateToolhelp32Snapshot` の失敗。`procinfo` と同じ書き方）
-    fn invalid_handle() -> Handle {
-        -1isize as Handle
-    }
-    /// `ResumeThread` の失敗（`(DWORD)-1`）
-    const RESUME_FAILED: u32 = u32::MAX;
 
-    /// `THREADENTRY32`（tlhelp32.h）
-    #[repr(C)]
-    #[derive(Default)]
-    struct ThreadEntry32 {
-        size: u32,
-        usage: u32,
-        thread_id: u32,
-        owner_process_id: u32,
-        base_priority: i32,
-        delta_priority: i32,
-        flags: u32,
-    }
-
-    #[link(name = "kernel32")]
+    #[link(name = "ntdll")]
     extern "system" {
-        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
-        fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
-        fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
-        fn OpenThread(access: u32, inherit_handle: i32, thread_id: u32) -> Handle;
-        fn ResumeThread(thread: Handle) -> u32;
+        fn NtResumeProcess(process: Handle) -> i32;
     }
 
     /// 一時停止で起こす作成フラグを付ける（std の `creation_flags` は上書きなので、コンソールの扱いも
@@ -1005,55 +979,22 @@ mod imp {
         cmd.creation_flags(CREATE_SUSPENDED | window);
     }
 
-    /// 一時停止で起こした `pid` の子を動かす。std の `Child` は主スレッドのハンドルを持たない
-    /// （`CreateProcessW` の直後に閉じる）ので、スレッドの一覧（Toolhelp32）からその子のスレッドを
-    /// 見つけて `ResumeThread` する。起こしたばかりの子のスレッドは主スレッド 1 本だけ。
-    /// 1 本も動かせなければ Err（呼び手が子を止める）
-    pub(super) fn resume(pid: u32) -> Result<(), String> {
-        // SAFETY: 戻りは失敗の値を検査し、この関数の中で 1 回だけ閉じる
-        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-        if snapshot.is_null() || snapshot == invalid_handle() {
-            return Err(format!("CreateToolhelp32Snapshot: {}", last_error()));
-        }
-        // 閉じるだけの包み（`Process` の drop は CloseHandle。スナップショット・スレッドにも使える）
-        let snapshot = Process(snapshot);
-        let mut entry = ThreadEntry32 {
-            size: std::mem::size_of::<ThreadEntry32>() as u32,
-            ..ThreadEntry32::default()
-        };
-        let mut resumed = 0usize;
-        let mut failures = Vec::new();
-        // SAFETY: snapshot は有効なハンドル、entry は size を入れた THREADENTRY32 で呼び出しの間生きている
-        let mut more = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
-        while more {
-            if entry.owner_process_id == pid {
-                // SAFETY: 戻りは null を検査し、drop で 1 回だけ閉じる
-                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.thread_id) };
-                if thread.is_null() {
-                    failures.push(format!("OpenThread({}): {}", entry.thread_id, last_error()));
-                } else {
-                    let thread = Process(thread);
-                    // SAFETY: 開いた有効なスレッドのハンドル
-                    if unsafe { ResumeThread(thread.0) } == RESUME_FAILED {
-                        failures.push(format!(
-                            "ResumeThread({}): {}",
-                            entry.thread_id,
-                            last_error()
-                        ));
-                    } else {
-                        resumed += 1;
-                    }
-                }
-            }
-            // SAFETY: 同上
-            more = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
-        }
-        if resumed == 0 {
-            return Err(if failures.is_empty() {
-                format!("pid {pid} のスレッドが一覧に無い")
-            } else {
-                failures.join(" / ")
-            });
+    /// 一時停止で起こした子を動かす。std の `Child` は主スレッドのハンドルを持たない
+    /// （`CreateProcessW` の直後に閉じる）ので、プロセスのハンドル（`CreateProcessW` の戻り = 全権）へ
+    /// `NtResumeProcess`（全スレッドの一時停止を 1 つ戻す）を撃つ。起こしたばかりの子のスレッドは
+    /// 主スレッド 1 本だけ。
+    ///
+    /// 手段は Windows CI の実測で選んだ（各 20 回）: `NtResumeProcess` は p50 14µs / 最大 47µs。
+    /// スレッドの一覧（Toolhelp32）から主スレッドを探して `ResumeThread` する形は、一覧が系全体の
+    /// スレッド（CI で約 1,200 本）を毎回写すので p50 6.3ms / 最大 7.0ms = 起動のたびに 6ms 上乗せ。
+    /// `PROC_THREAD_ATTRIBUTE_JOB_LIST` は std の口（`raw_attribute`）が unstable で使えない。
+    /// 動かせなければ Err（呼び手が子を止める）
+    pub(super) fn resume(child: &std::process::Child) -> Result<(), String> {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: child が生きている間有効なプロセスのハンドル（閉じるのは std）
+        let status = unsafe { NtResumeProcess(child.as_raw_handle()) };
+        if status < 0 {
+            return Err(format!("NtResumeProcess: NTSTATUS 0x{:08X}", status as u32));
         }
         Ok(())
     }

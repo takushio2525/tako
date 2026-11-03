@@ -40,6 +40,8 @@
 //!   `TAKO_2697_LEGACY=1`（起こしてから入れる）では 1 回目の心拍で掴んだ孫が残る = 番犬に検出力がある
 //! - ppid だけで探すと、親の pid が再利用された古い ping（孤児）を掴みうるので、[`ping_child_of`] は
 //!   親より後に生まれたものだけを子と読む
+//! - 一時停止の口で 20 回起こし、毎回入れ物に入って動き終わる（動かせずに止まったまま残る子が無い）。
+//!   起動 1 回の上乗せを `TAKO2697_SPAWN_COST` に出す
 //!
 //! 落ちたときは [`diagnose`] が孫と子の生成時刻・入れ物へ入れ終えた時刻・ping の一覧から、どちらの形かを名指す。
 
@@ -810,189 +812,90 @@ fn issue2462_先に死んだエージェントの孫も止めシェルは撃た�
     );
 }
 
-// ---- #2697 段 2 の実測（一時。再開の手段を選んだら外す） ----
+// ---- #2697: 一時停止の口の繰り返し ----
 
-mod resume_measure {
-    use super::*;
-    use std::os::windows::process::CommandExt;
-    use std::process::{Child, Command, Stdio};
+/// 一時停止の口の繰り返しの回数
+const SPAWN_ROUNDS: usize = 20;
+/// 1 回の子（`cmd /C exit 0`）が終わるまでの上限（動かせずに止まったままなら落とす）
+const SPAWN_EXIT_LIMIT: Duration = Duration::from_secs(30);
 
-    const CREATE_SUSPENDED: u32 = 0x0000_0004;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
-    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
-    const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
-    const N: usize = 20;
+/// すぐ終わる子
+fn quick_cmd() -> std::process::Command {
+    let mut command = std::process::Command::new("cmd");
+    command
+        .args(["/C", "exit 0"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+}
 
-    #[repr(C)]
-    #[derive(Default)]
-    struct ThreadEntry32 {
-        size: u32,
-        usage: u32,
-        thread_id: u32,
-        owner_process_id: u32,
-        base_priority: i32,
-        delta_priority: i32,
-        flags: u32,
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
-        fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
-        fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
-        fn OpenThread(access: u32, inherit_handle: i32, thread_id: u32) -> Handle;
-        fn ResumeThread(thread: Handle) -> u32;
-    }
-
-    #[link(name = "ntdll")]
-    extern "system" {
-        fn NtResumeProcess(process: Handle) -> i32;
-    }
-
-    /// スレッドの一覧から `pid` のスレッドを動かす。戻りは (動かした数, 一覧のスレッドの数)
-    fn resume_threads(pid: u32) -> (usize, usize) {
-        let (mut resumed, mut seen) = (0, 0);
-        // SAFETY: 実測用。戻りを検査し、開いたハンドルは閉じる
-        unsafe {
-            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-            if snapshot.is_null() || snapshot == -1isize as Handle {
-                return (0, 0);
-            }
-            let mut entry = ThreadEntry32 {
-                size: std::mem::size_of::<ThreadEntry32>() as u32,
-                ..ThreadEntry32::default()
-            };
-            let mut more = Thread32First(snapshot, &mut entry) != 0;
-            while more {
-                seen += 1;
-                if entry.owner_process_id == pid {
-                    let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.thread_id);
-                    if !thread.is_null() {
-                        if ResumeThread(thread) != u32::MAX {
-                            resumed += 1;
-                        }
-                        CloseHandle(thread);
-                    }
-                }
-                more = Thread32Next(snapshot, &mut entry) != 0;
-            }
-            CloseHandle(snapshot);
+/// 子が上限までに終わった終了状態（終わらなければ止めて `None`）
+fn exit_within(
+    child: &mut std::process::Child,
+    limit: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
         }
-        (resumed, seen)
-    }
-
-    /// `NtResumeProcess` で動かす。成功（NTSTATUS >= 0）なら true
-    fn resume_nt(pid: u32) -> bool {
-        // SAFETY: 実測用。戻りを検査し、開いたハンドルは閉じる
-        unsafe {
-            let process = OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid);
-            if process.is_null() {
-                return false;
-            }
-            let status = NtResumeProcess(process);
-            CloseHandle(process);
-            status >= 0
-        }
-    }
-
-    fn quick_cmd() -> Command {
-        let mut command = Command::new("cmd");
-        command
-            .args(["/C", "exit 0"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        command
-    }
-
-    fn spawn_suspended() -> Child {
-        quick_cmd()
-            .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW)
-            .spawn()
-            .expect("一時停止で起こせる")
-    }
-
-    /// 動かせた子が終わるのを待つ（動かせなかった子は止める）。終わったら true
-    fn finish(mut child: Child, resumed: bool) -> bool {
-        if !resumed {
+        if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return false;
+            return None;
         }
-        child.wait().is_ok_and(|status| status.success())
+        std::thread::sleep(Duration::from_millis(TICK_MS));
     }
+}
 
-    fn summary(label: &str, mut micros: Vec<u128>, ok: usize, extra: &str) -> String {
-        micros.sort_unstable();
-        let p50 = micros.get(micros.len() / 2).copied().unwrap_or(0);
-        let max = micros.last().copied().unwrap_or(0);
-        format!("TAKO2697_RESUME method={label} n={N} ok={ok} p50_us={p50} max_us={max} {extra}")
-    }
+/// 並びの p50 と最大
+fn p50_max(mut micros: Vec<u128>) -> (u128, u128) {
+    micros.sort_unstable();
+    (
+        micros.get(micros.len() / 2).copied().unwrap_or(0),
+        micros.last().copied().unwrap_or(0),
+    )
+}
 
-    #[test]
-    fn issue2697_再開の手段の実測() {
-        // スレッドの列挙 + ResumeThread
-        let (mut micros, mut ok, mut seen_max) = (Vec::new(), 0, 0);
-        for _ in 0..N {
-            let child = spawn_suspended();
-            let start = Instant::now();
-            let (resumed, seen) = resume_threads(child.id());
-            micros.push(start.elapsed().as_micros());
-            seen_max = seen_max.max(seen);
-            if finish(child, resumed == 1) {
-                ok += 1;
-            }
-        }
-        println!(
-            "{}",
-            summary(
-                "threads",
-                micros,
-                ok,
-                &format!("threads_in_snapshot={seen_max}")
-            )
+/// 一時停止の口（`Job::spawn_contained`）で起こした子が毎回 Job に入り、動き出して終わる（動かせずに
+/// 止まったまま残る子が無い）。起動 1 回の上乗せを修正前の形（起こしてから入れる）と並べてログへ出す
+/// （再開の手段 = `NtResumeProcess` を選んだ根拠の実測は `platform::job` の `resume` の doc）
+#[test]
+fn issue2697_一時停止の口で起こした子が毎回入れ物に入って動き終わる() {
+    use std::os::windows::process::CommandExt;
+    /// winbase.h の `CREATE_NO_WINDOW`（製品の口の `Console::NoWindow` と同じ作成フラグで比べる）
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut product = Vec::new();
+    for round in 0..SPAWN_ROUNDS {
+        let start = Instant::now();
+        let (mut child, job) =
+            job::Job::spawn_contained(&mut quick_cmd(), job::Console::NoWindow, |_| true)
+                .expect("一時停止の口で起こせる");
+        product.push(start.elapsed().as_micros());
+        assert!(job.is_some(), "{round} 回目: Job に入っていない");
+        let status = exit_within(&mut child, SPAWN_EXIT_LIMIT);
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "{round} 回目: 一時停止の口で起こした子が {SPAWN_EXIT_LIMIT:?} で動き終わらない（{status:?}）"
         );
-        assert_eq!(ok, N, "スレッドの列挙で動かせない子があった");
-        // NtResumeProcess
-        let (mut micros, mut ok) = (Vec::new(), 0);
-        for _ in 0..N {
-            let child = spawn_suspended();
-            let start = Instant::now();
-            let resumed = resume_nt(child.id());
-            micros.push(start.elapsed().as_micros());
-            if finish(child, resumed) {
-                ok += 1;
-            }
-        }
-        println!("{}", summary("nt", micros, ok, ""));
-        // 製品の口の全体（一時停止で起こす → 入れる → 動かす）と、修正前の形（起こす → 入れる）
-        let (mut micros, mut ok) = (Vec::new(), 0);
-        for _ in 0..N {
-            let start = Instant::now();
-            let (child, job) =
-                job::Job::spawn_contained(&mut quick_cmd(), job::Console::NoWindow, |_| true)
-                    .expect("製品の口で起こせる");
-            micros.push(start.elapsed().as_micros());
-            if job.is_some() && finish(child, true) {
-                ok += 1;
-            }
-        }
-        println!("{}", summary("product_spawn_contained", micros, ok, ""));
-        assert_eq!(ok, N, "製品の口で起こした子が Job に入って終わらない");
-        let (mut micros, mut ok) = (Vec::new(), 0);
-        for _ in 0..N {
-            let start = Instant::now();
-            let child = quick_cmd()
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn()
-                .expect("起こせる");
-            let job = job::Job::contain(child.id());
-            micros.push(start.elapsed().as_micros());
-            if job.is_some() && finish(child, true) {
-                ok += 1;
-            }
-        }
-        println!("{}", summary("legacy_spawn_then_contain", micros, ok, ""));
     }
+    let mut legacy = Vec::new();
+    for _ in 0..SPAWN_ROUNDS {
+        let start = Instant::now();
+        let mut child = quick_cmd()
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .expect("起こせる");
+        let job = job::Job::contain(child.id());
+        legacy.push(start.elapsed().as_micros());
+        let _ = exit_within(&mut child, SPAWN_EXIT_LIMIT);
+        drop(job);
+    }
+    let (product_p50, product_max) = p50_max(product);
+    let (legacy_p50, legacy_max) = p50_max(legacy);
+    println!(
+        "TAKO2697_SPAWN_COST n={SPAWN_ROUNDS} suspended_p50_us={product_p50} suspended_max_us={product_max} \
+         legacy_p50_us={legacy_p50} legacy_max_us={legacy_max}"
+    );
 }

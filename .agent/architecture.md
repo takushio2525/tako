@@ -1478,7 +1478,8 @@ Job を 1 つ作って入れる（以後その子が起こすものは Job を�
   CI の間欠）。`PROC_THREAD_ATTRIBUTE_JOB_LIST` は渡せない（std の `CommandExt::raw_attribute` は 1.95 で
   unstable）ので、**std の `Command` で起こす子は `Job::spawn_contained` / `KillScope::spawn` の 1 実装**で
   `CREATE_SUSPENDED` で起こし、Job へ入れてから主スレッドを動かす（std の `Child` は主スレッドのハンドルを
-  持たないので、Toolhelp32 のスレッドの一覧から `ResumeThread`。動かせない子は止めて刈り取りエラーを返す）。
+  持たないので、プロセスのハンドルへ `NtResumeProcess`。Windows CI の実測で p50 14µs、Toolhelp32 のスレッドの
+  一覧から `ResumeThread` する形は系全体のスレッドを写すので p50 6.3ms。動かせない子は止めて刈り取りエラーを返す）。
   `creation_flags` は上書きなので、呼び手はコンソールの扱い（`Console::Inherit` / `NoWindow`）を明示する。
   寄せた呼び手は `tako queue` の子・probe の待つ子（`probe::spawn_for_wait`）・AI 命名・言語サーバ・`tako setup`。
   ペインの ConPTY は alacritty_terminal が `CreateProcessW` を呼び作成フラグが固定なので、起こした直後に
@@ -1520,7 +1521,8 @@ GUI 役はテスト専用の `tako-gui-sleeper`。普通の終了の経路 = 関
 （`tako queue` の取り消しの孫・再起動でエージェントの孫は止まりシェルは残る・先に死んだエージェント）・
 tako-app の `autorename::tests::issue2462`（`.cmd` の偽 claude の孫）。どれも `TAKO_2454_LEGACY=1` の旧アームで孫が残る。
 #2697 は同じ 2 ファイルの `issue2697_*`（入れる前に待たせる注入を当てても queue の取り消し・probe の打ち切りで
-孫まで止まる。`TAKO_2697_LEGACY=1` の旧アームでは 1 回目の心拍で掴んだ孫が残る）。
+孫まで止まる。`TAKO_2697_LEGACY=1` の旧アームでは 1 回目の心拍で掴んだ孫が残る。一時停止の口で 20 回起こして
+毎回 Job に入り動き終わる = 動かせずに止まったまま残る子が無い。起動 1 回の上乗せを `TAKO2697_SPAWN_COST` に出す）。
 
 **縮退の宣言は system prompt へも流れる**（#516。正本は `tako-core::platform::support`）。
 ただし prompt へ載せるのは「この環境は何か」と「縮退が N 件あること・その引き方」だけで、
