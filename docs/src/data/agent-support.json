@@ -1127,6 +1127,32 @@
       }
     },
     {
+      "key": "worker_heavy_queue_wait",
+      "summary_ja": "重い処理の順番待ち（`tako queue`。ビルド・テスト・隔離 GUI）を、エージェントのシェルの時間切れで切られずに待てる（背景実行で待つ）",
+      "evidence": "measured",
+      "evidence_detail": "#1997: claude（Claude Code）の Bash ツールは既定 2 分・最大 10 分で切れるが、背景実行 （run_in_background）なら時間切れが無く、終わると通知で戻る。この PR の検証で `tako queue cargo …` を背景実行で通し、順番待ちと 10 分を超える実行を切られずに終えた。順番待ちそのもの（`tako queue` の CLI と env）は worker_cli_control と同じく agent に依らない。codex / agy のシェルの時間切れの長さと背景実行の有無は実物で調べていない",
+      "agents": {
+        "claude": {
+          "status": "supported"
+        },
+        "codex": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 975
+        },
+        "agy": {
+          "status": "pending",
+          "note_ja": "この系統に同等の手段があるかを実物で調べていない（無いと確定したわけではない）",
+          "issue": 975
+        },
+        "local": {
+          "status": "pending",
+          "note_ja": "ローカル LLM の系統がまだ成立していない（リポジトリに Ollama への参照が 1 件も無い）",
+          "issue": 991
+        }
+      }
+    },
+    {
       "key": "worker_idle_with_background",
       "summary_ja": "背景作業（背景シェル・Monitor 等）が残っていても、ターンが終わって入力待ちになったことを検知する（#1273）",
       "evidence": "measured",
