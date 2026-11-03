@@ -21,7 +21,8 @@
 //!    （ペインへ配る名前を増やしたら、ペインの中から起こした GUI からも外す）
 //! 3. 検証の隔離 GUI が落とす名前（`isolated-gui.sh` の `ISOLATED_GUI_DROP_ENV`。#2570 より前の
 //!    バイナリのために残す）がすべて `STRIP` にある（スクリプトと GUI の判断を揃える）
-//! 4. 外しすぎ: GUI の `main` が隔離のために立てる名前（`set_var`）は `STRIP` に無い
+//! 4. 外しすぎ: GUI の `main` が隔離のために立てる名前（`set_var` と、置き場を当てる口
+//!    `tako_core::scoped_dirs::adopt` = #2686）は `STRIP` に無い
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -315,8 +316,10 @@ fn scan_script(script: &str) -> Vec<Offender> {
         .collect()
 }
 
-/// 4. 外しすぎ: `main` が隔離のために立てる名前は `STRIP` に無い
+/// 4. 外しすぎ: `main` が隔離のために立てる名前は `STRIP` に無い。立てる口は `set_var` と、
+/// 検証起動の置き場を当てて覚える `scoped_dirs::adopt`（#2686。名前は同じく最初の引数）
 fn scan_isolation(main: &str) -> Vec<Offender> {
+    const SETTERS: [&str; 2] = ["std::env::set_var(", "tako_core::scoped_dirs::adopt("];
     let mut out = Vec::new();
     let Some((at, window)) = fn_window(main, "fn main() {") else {
         return vec![missing(MAIN, "fn main() {")];
@@ -325,12 +328,15 @@ fn scan_isolation(main: &str) -> Vec<Offender> {
     let lines: Vec<&str> = window.lines().collect();
     let mut seen = 0;
     for (i, l) in lines.iter().enumerate() {
-        if l.trim_start().starts_with("//") || !l.contains("std::env::set_var(") {
+        let Some(setter) = SETTERS.iter().find(|s| l.contains(*s)) else {
+            continue;
+        };
+        if l.trim_start().starts_with("//") {
             continue;
         }
         // 名前は同じ行か次の行の最初の引数
         let arg = l
-            .split("std::env::set_var(")
+            .split(setter)
             .nth(1)
             .map(str::trim)
             .filter(|a| !a.is_empty())
@@ -500,11 +506,12 @@ fn 修正前の形へ戻すと名指しする() {
     );
 
     // 注入 5: 外しすぎ（隔離の置き場を STRIP の名前で立てる = 例として TAKO_PANE_ID）
+    let anchor = "        tako_core::scoped_dirs::adopt(\"TAKO_DATA_DIR\",";
     let mut s = sources(&workspace_root());
     s.main = inject(
         &s.main,
-        "        if std::env::var_os(\"TAKO_PANE_LOG_DIR\").is_none() {",
-        "        std::env::set_var(\"TAKO_PANE_ID\", \"0\");\n        if std::env::var_os(\"TAKO_PANE_LOG_DIR\").is_none() {",
+        anchor,
+        &format!("        std::env::set_var(\"TAKO_PANE_ID\", \"0\");\n{anchor}"),
         "外しすぎ",
     );
     assert_named(
@@ -514,6 +521,24 @@ fn 修正前の形へ戻すと名指しする() {
             first_line(&s.main, "std::env::set_var(\"TAKO_PANE_ID\"")
         ),
         "外しすぎ",
+    );
+    // 注入 5b: 置き場を当てる口（#2686）でも同じ（STRIP の名前を当てて覚える）
+    let mut s = sources(&workspace_root());
+    s.main = inject(
+        &s.main,
+        anchor,
+        &format!(
+            "        tako_core::scoped_dirs::adopt(\"TAKO_PANE_ID\", tmp.join(\"x\"));\n{anchor}"
+        ),
+        "外しすぎ（当てる口）",
+    );
+    assert_named(
+        &all(&s),
+        &format!(
+            "{MAIN}:{}",
+            first_line(&s.main, "tako_core::scoped_dirs::adopt(\"TAKO_PANE_ID\"")
+        ),
+        "外しすぎ（当てる口）",
     );
 
     // 注入 6: persist.log の 1 行を隔離の置き場より前に書く
