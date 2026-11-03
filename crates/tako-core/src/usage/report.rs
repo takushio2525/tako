@@ -716,27 +716,42 @@ fn group_key(by: By, row: &BucketRow, keys: Option<&SessionKeys>, utc_offset: i3
     }
 }
 
-/// 表示名
+/// 表示名（日本語の口 = 応答の `groups[].name`。表示言語で組むのは [`group_name_in`]）
 pub fn group_name(by: By, key: &GroupKey) -> String {
+    group_name_in(by, key, crate::i18n::Lang::Ja)
+}
+
+/// 表示名を表示言語で（#2365。`tako usage` の英語表示は応答の `key` からこれで組み直す）。
+/// 言い換える名前（未分類・プロファイル・Issue なし・合計・不明・種別なし・手動）だけが言語で変わる
+pub fn group_name_in(by: By, key: &GroupKey, lang: crate::i18n::Lang) -> String {
+    use crate::i18n::Lang::{En, Ja};
+    let word = |ja: &'static str, en: &'static str| match lang {
+        Ja => ja,
+        En => en,
+    };
     let project = || match (&key.project, &key.profile) {
         (Some(p), _) => p.clone(),
-        (None, Some(p)) => format!("プロファイル: {p}"),
-        (None, None) => "未分類".to_string(),
+        (None, Some(p)) => format!("{}: {p}", word("プロファイル", "profile")),
+        (None, None) => word("未分類", "unclassified").to_string(),
     };
     let issue = || {
         key.issue
             .map(|n| format!("#{n}"))
-            .unwrap_or_else(|| "Issue なし".to_string())
+            .unwrap_or_else(|| word("Issue なし", "no issue").to_string())
     };
+    let manual = || word("手動", "manual").to_string();
     match by {
-        By::Login => "合計".to_string(),
-        By::Account => key.account.clone().unwrap_or_else(|| "不明".to_string()),
+        By::Login => word("合計", "total").to_string(),
+        By::Account => key
+            .account
+            .clone()
+            .unwrap_or_else(|| word("不明", "unknown").to_string()),
         By::Project => project(),
         By::Issue => format!("{} {}", project(), issue()),
         By::TaskType => key
             .task_type
             .clone()
-            .unwrap_or_else(|| "種別なし".to_string()),
+            .unwrap_or_else(|| word("種別なし", "no task type").to_string()),
         By::Session => {
             let sid: String = key
                 .session
@@ -745,7 +760,7 @@ pub fn group_name(by: By, key: &GroupKey) -> String {
                 .chars()
                 .take(8)
                 .collect();
-            let role = key.role.as_deref().unwrap_or("手動");
+            let role = key.role.clone().unwrap_or_else(manual);
             match &key.label {
                 Some(label) => format!("{sid} {role} {} {label}", project()),
                 None => format!("{sid} {role} {}", project()),
@@ -753,7 +768,7 @@ pub fn group_name(by: By, key: &GroupKey) -> String {
         }
         By::Model => key.model.clone().unwrap_or_else(|| "-".to_string()),
         By::Day => key.day.clone().unwrap_or_default(),
-        By::Role => key.role.clone().unwrap_or_else(|| "手動".to_string()),
+        By::Role => key.role.clone().unwrap_or_else(manual),
     }
 }
 

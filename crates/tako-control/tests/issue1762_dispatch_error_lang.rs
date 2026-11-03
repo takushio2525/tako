@@ -923,9 +923,11 @@ fn reason_index(r: &Reason) -> usize {
         Reason::RecoverStashFailed(_) => 359,
         Reason::RecoverWriteFailed(_) => 360,
         Reason::RecoverCopyFailed(_) => 361,
+        // #2365 の続き: CLI の `tako queue` の cancel / priority / start が調停役に届かない
+        Reason::QueueArbiterOffline => 362,
     }
 }
-const REASON_VARIANTS: usize = 362;
+const REASON_VARIANTS: usize = 363;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1583,6 +1585,7 @@ fn reason_samples() -> Vec<Reason> {
         Reason::RecoverStashFailed("Permission denied (os error 13)".into()),
         Reason::RecoverWriteFailed("Permission denied (os error 13)".into()),
         Reason::RecoverCopyFailed("Permission denied (os error 13)".into()),
+        Reason::QueueArbiterOffline,
     ]
 }
 
@@ -2022,6 +2025,8 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "現在の layout.json の退避に失敗: Permission denied (os error 13)",
     "復元の書き込みに失敗: Permission denied (os error 13)",
     "復元コピーに失敗: Permission denied (os error 13)",
+    // #2365 の続き: CLI `main.rs` の `QUEUE_OFFLINE_NOTE`（cancel / priority / start の断りに使っていた）
+    "順番待ちは無効（tako が起動していない）",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形
@@ -18276,9 +18281,83 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::WatchChoicePlaceholder => 193,
         ReplyNote::WatchAgentDeadDetail => 194,
         ReplyNote::WatchResumeUnbuildable => 195,
+        // #2365 の続き: CLI の `tako queue`（状況・cancel / start / priority / limits）と `tako usage` の
+        // 人向けの表示。調停役が組む文は日本語なら応答の文そのまま（`QueueWaitReason` / `QueueEta` ほか）
+        ReplyNote::QueueOfflineNote => 196,
+        ReplyNote::QueueUnresponsiveNote(_) => 197,
+        ReplyNote::QueueCancelled { .. } => 198,
+        ReplyNote::QueueAgentAlreadyStarted(_) => 199,
+        ReplyNote::QueueAgentStartNow { .. } => 200,
+        ReplyNote::QueueLimits(_) => 201,
+        ReplyNote::QueuePriorityFrom { .. } => 202,
+        ReplyNote::QueuePanePriorityChanged { .. } => 203,
+        ReplyNote::QueueJobPriorityChanged { .. } => 204,
+        ReplyNote::QueuePriorityRunningNote(_) => 205,
+        ReplyNote::QueueNotArbiter(_) => 206,
+        ReplyNote::QueueSectionHead { .. } => 207,
+        ReplyNote::QueuePane(_) => 208,
+        ReplyNote::QueueMemoryPeak { .. } => 209,
+        ReplyNote::QueuePending { .. } => 210,
+        ReplyNote::QueueRunningFlags { .. } => 211,
+        ReplyNote::QueueRunningRow(_) => 212,
+        ReplyNote::QueueWaitingRow(_) => 213,
+        ReplyNote::QueueHeadReason(_) => 214,
+        ReplyNote::QueueRecent { .. } => 215,
+        ReplyNote::QueueGaveUp { .. } => 216,
+        ReplyNote::QueueGaveUpWhy(_) => 217,
+        ReplyNote::QueueBehindHead(_) => 218,
+        ReplyNote::QueueHolder(_) => 219,
+        ReplyNote::QueueOwnerExternal(_) => 220,
+        ReplyNote::QueueMachineUnavailable(_) => 221,
+        ReplyNote::QueueMemoryLine(_) => 222,
+        ReplyNote::QueueCpuLine { .. } => 223,
+        ReplyNote::QueueHeavyNone => 224,
+        ReplyNote::QueueHeavyHeader(_) => 225,
+        ReplyNote::QueuePanesHeader => 226,
+        ReplyNote::QueuePaneRow { .. } => 227,
+        ReplyNote::QueueExternalLine { .. } => 228,
+        ReplyNote::QueueScanLine { .. } => 229,
+        ReplyNote::QueueLaunchesHead { .. } => 230,
+        ReplyNote::QueueLaunchWaitingRow(_) => 231,
+        ReplyNote::QueueLaunchStartingRow { .. } => 232,
+        ReplyNote::QueueJobserverActive { .. } => 233,
+        ReplyNote::QueueJobserverRecount { .. } => 234,
+        ReplyNote::QueueJobserverFollower(_) => 235,
+        ReplyNote::QueueJobserverOff { .. } => 236,
+        ReplyNote::QueueWaitReason { .. } => 237,
+        ReplyNote::QueueEta { .. } => 238,
+        ReplyNote::QueueStartEta { .. } => 239,
+        ReplyNote::UsageIndexBuilt { .. } => 240,
+        ReplyNote::UsageHeader => 241,
+        ReplyNote::UsageNotRecording(_) => 242,
+        ReplyNote::UsageNoObservations => 243,
+        ReplyNote::UsageLoginLine { .. } => 244,
+        ReplyNote::UsageWindowRest { .. } => 245,
+        ReplyNote::UsageAmount { .. } => 246,
+        ReplyNote::UsageShareHeadNote { .. } => 247,
+        ReplyNote::UsageMoreGroups(_) => 248,
+        ReplyNote::UsageNoUsageInPeriod => 249,
+        ReplyNote::UsageOutsideLabel => 250,
+        ReplyNote::UsageEstimatedLabel => 251,
+        ReplyNote::UsageShareUnavailable(_) => 252,
+        ReplyNote::UsageShareLine(_) => 253,
+        ReplyNote::UsageRecorded { .. } => 254,
+        ReplyNote::UsageUnreadableLines(_) => 255,
+        ReplyNote::UsageBy(_) => 256,
+        ReplyNote::UsageNoteLabel => 257,
+        ReplyNote::UsageNotePrice(_) => 258,
+        ReplyNote::UsageNoteUnpriced(_) => 259,
+        ReplyNote::UsageNoteShareScope { .. } => 260,
+        ReplyNote::UsageNoteOutside => 261,
+        ReplyNote::UsageNoteMissing(_) => 262,
+        ReplyNote::UsageNoteCodexMissing(_) => 263,
+        ReplyNote::UsageNoteCodex => 264,
+        ReplyNote::UsageNoteUnestimated => 265,
+        ReplyNote::UsageNoteIndexLocked => 266,
+        ReplyNote::UsageNoteIndexPending { .. } => 267,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 196;
+const REPLY_NOTE_VARIANTS: usize = 268;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -19422,6 +19501,810 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             ReplyNote::WatchResumeUnbuildable,
             "(session ID 未記録のため resume コマンドを組み立てられない)".into(),
         ),
+        // #2365 の続き: CLI `main.rs` の `tako queue`（`QUEUE_OFFLINE_NOTE` / `queue_unresponsive_note` /
+        // `queue_cli` / `print_queue_*` / `queue_priority_text` / `queue_owner_text` / `print_jobserver_section` /
+        // `print_launches_section`）・`queue_wrapper::gave_up_lines` / `human_secs`、`tako usage`（`usage_local` /
+        // `usage_amount` / `usage_share_footer` / `usage_text`）と `usage::payload_in` の注記・案内の文。
+        // 部品（`mem` / `eta` ほか）は呼び手が同じ言語で組んで渡すので、見本は ASCII（英語の検査に掛からない）
+        (
+            ReplyNote::QueueOfflineNote,
+            "順番待ちは無効（tako が起動していない）".into(),
+        ),
+        (
+            ReplyNote::QueueUnresponsiveNote(15),
+            "順番待ちの状況は読めない（tako が 15 秒応答しない = GUI が固まっている可能性。\
+             tako queue <コマンド> は待たずに走る）"
+                .into(),
+        ),
+        (
+            ReplyNote::QueueCancelled {
+                id: "4243".into(),
+                label: "cargo test".into(),
+                waiting: true,
+            },
+            "取り消した: 4243 cargo test — 待ちから外した（その tako queue は 125 で終わる）".into(),
+        ),
+        (
+            ReplyNote::QueueCancelled {
+                id: "4242".into(),
+                label: "cargo build".into(),
+                waiting: false,
+            },
+            "取り消した: 4242 cargo build — 子を止める（SIGTERM → 10 秒で SIGKILL）".into(),
+        ),
+        (
+            ReplyNote::QueueAgentAlreadyStarted("5".into()),
+            "ペイン 5 の agent はもう起こしている".into(),
+        ),
+        (
+            ReplyNote::QueueAgentStartNow {
+                pane: "5".into(),
+                waited_s: 75,
+                reason: Some("why".into()),
+            },
+            "ペイン 5 の agent を今すぐ起こす（待ち 1 分 15 秒・待っていた理由: why）".into(),
+        ),
+        (
+            ReplyNote::QueueAgentStartNow {
+                pane: "5".into(),
+                waited_s: 5,
+                reason: None,
+            },
+            "ペイン 5 の agent を今すぐ起こす（待ち 5 秒）".into(),
+        ),
+        (
+            ReplyNote::QueueLimits(Box::new(tako_control::reply_note::QueueLimitsFields {
+                max_jobs: "3".into(),
+                reserve_gb: "3.6".into(),
+                swap_guard_gb: "4".into(),
+                max_wait_min: "120".into(),
+                jobserver: "on".into(),
+                configured: None,
+            })),
+            "同時 3 件・予約 3.6 GB・swap の警戒線 4 GB・待ちの上限 120 分・cargo の札 on（すべて機に合わせた既定）"
+                .into(),
+        ),
+        (
+            ReplyNote::QueueLimits(Box::new(tako_control::reply_note::QueueLimitsFields {
+                max_jobs: "2".into(),
+                reserve_gb: "3.6".into(),
+                swap_guard_gb: "4".into(),
+                max_wait_min: "120".into(),
+                jobserver: "-".into(),
+                configured: Some("max_jobs=2".into()),
+            })),
+            "同時 2 件・予約 3.6 GB・swap の警戒線 4 GB・待ちの上限 120 分・cargo の札 -（設定: max_jobs=2）"
+                .into(),
+        ),
+        (
+            ReplyNote::QueuePriorityFrom {
+                priority: "high".into(),
+                from: "pane".into(),
+                aged_from: None,
+            },
+            "high（ペインの既定）".into(),
+        ),
+        (
+            ReplyNote::QueuePriorityFrom {
+                priority: "high".into(),
+                from: "job".into(),
+                aged_from: Some("normal".into()),
+            },
+            "high（処理に付けた段 normal から待ちで上がった）".into(),
+        ),
+        (
+            ReplyNote::QueuePriorityFrom {
+                priority: "low".into(),
+                from: "role".into(),
+                aged_from: None,
+            },
+            "low（役割の既定）".into(),
+        ),
+        (
+            ReplyNote::QueuePanePriorityChanged {
+                pane: 3,
+                priority: "low".into(),
+                jobs: 2,
+            },
+            "ペイン 3 から出る処理の優先度の既定を low にした（順番待ちの中のそのペインの処理 2 件）".into(),
+        ),
+        (
+            ReplyNote::QueueJobPriorityChanged {
+                id: "4243".into(),
+                label: "cargo test".into(),
+                priority: "top".into(),
+                position: Some(1),
+            },
+            "優先度: 4243 cargo test → top・待ち 1 番目".into(),
+        ),
+        (
+            ReplyNote::QueueJobPriorityChanged {
+                id: "4242".into(),
+                label: "cargo build".into(),
+                priority: "low".into(),
+                position: None,
+            },
+            "優先度: 4242 cargo build → low".into(),
+        ),
+        (
+            ReplyNote::QueuePriorityRunningNote(
+                "走っている処理は止めない（優先度は待ちの並びにだけ効く）".into(),
+            ),
+            "走っている処理は止めない（優先度は待ちの並びにだけ効く）".into(),
+        ),
+        (
+            ReplyNote::QueueNotArbiter(Some(tako_control::queue::NOT_ARBITER.into())),
+            "順番待ち: この tako は順番待ちの調停役ではない".into(),
+        ),
+        (
+            ReplyNote::QueueNotArbiter(None),
+            "順番待ち: この tako は調停役ではない".into(),
+        ),
+        (
+            ReplyNote::QueueSectionHead {
+                running: 1,
+                max_jobs: "3".into(),
+                waiting: 2,
+                reserve_gb: "3.6".into(),
+                unmanaged: None,
+            },
+            "順番待ち: 実行 1 / 上限 3・待ち 2（予約 3.6 GB）".into(),
+        ),
+        (
+            ReplyNote::QueueSectionHead {
+                running: 1,
+                max_jobs: "3".into(),
+                waiting: 2,
+                reserve_gb: "3.6".into(),
+                unmanaged: Some("1".into()),
+            },
+            "順番待ち: 実行 1 / 上限 3・待ち 2（予約 3.6 GB）・順番待ちを通っていない重い処理 1".into(),
+        ),
+        (ReplyNote::QueuePane("3".into()), "ペイン 3".into()),
+        (
+            ReplyNote::QueueMemoryPeak {
+                used: "1.2 GB".into(),
+                peak: "2.0 GB".into(),
+            },
+            "1.2 GB（最大 2.0 GB）".into(),
+        ),
+        (
+            ReplyNote::QueuePending {
+                pending: "1.5 GB".into(),
+                estimate: "3.5 GB".into(),
+            },
+            "まだ使っていない見込み 1.5 GB（見込み 3.5 GB）".into(),
+        ),
+        (
+            ReplyNote::QueueRunningFlags {
+                stalled: true,
+                cancelling: true,
+            },
+            "停滞（枠を返した）・取り消し中".into(),
+        ),
+        (
+            ReplyNote::QueueRunningFlags {
+                stalled: false,
+                cancelling: true,
+            },
+            "取り消し中".into(),
+        ),
+        (
+            ReplyNote::QueueRunningRow(Box::new(tako_control::reply_note::QueueRunningRowFields {
+                id: "4242".into(),
+                label: "cargo build".into(),
+                pane: Some("3".into()),
+                ran_s: 65,
+                progress: "  12/345".into(),
+                mem: Some("1.2 GB".into()),
+                pending: Some("pend".into()),
+                share: "4".into(),
+                flags: Some("flag".into()),
+                eta: Some("eta".into()),
+            })),
+            "実行  4242  cargo build  ペイン 3  1 分 5 秒  12/345  1.2 GB  pend  取り分 4  [flag]  — eta"
+                .into(),
+        ),
+        (
+            ReplyNote::QueueRunningRow(Box::new(tako_control::reply_note::QueueRunningRowFields {
+                id: "4242".into(),
+                label: "cargo build".into(),
+                pane: None,
+                ran_s: 5,
+                progress: String::new(),
+                mem: None,
+                pending: None,
+                share: "4".into(),
+                flags: None,
+                eta: None,
+            })),
+            "実行  4242  cargo build  5 秒  取り分 4".into(),
+        ),
+        (
+            ReplyNote::QueueWaitingRow(Box::new(tako_control::reply_note::QueueWaitingRowFields {
+                position: "1".into(),
+                id: "4243".into(),
+                label: "cargo test".into(),
+                pane: Some("3".into()),
+                priority: "normal".into(),
+                waited_s: 3,
+                start: Some("start".into()),
+                reason: Some("why".into()),
+            })),
+            "待ち 1  4243  cargo test  ペイン 3  normal  待ち 3 秒・start  — why".into(),
+        ),
+        (
+            ReplyNote::QueueWaitingRow(Box::new(tako_control::reply_note::QueueWaitingRowFields {
+                position: "2".into(),
+                id: "4244".into(),
+                label: "cargo clippy".into(),
+                pane: None,
+                priority: "low".into(),
+                waited_s: 3700,
+                start: None,
+                reason: None,
+            })),
+            "待ち 2  4244  cargo clippy  low  待ち 1 時間 1 分".into(),
+        ),
+        (
+            ReplyNote::QueueHeadReason("why".into()),
+            "先頭が待つ理由: why".into(),
+        ),
+        (
+            ReplyNote::QueueRecent {
+                id: "4240".into(),
+                label: "cargo build".into(),
+                exit: Some("0".into()),
+                ran_s: 125,
+                peak: Some("2.0 GB".into()),
+            },
+            "直近: 4240  cargo build  終了 0（2 分 5 秒・最大 2.0 GB）".into(),
+        ),
+        (
+            ReplyNote::QueueRecent {
+                id: "4240".into(),
+                label: "cargo build".into(),
+                exit: None,
+                ran_s: 125,
+                peak: None,
+            },
+            "直近: 4240  cargo build  wrapper が消えた（2 分 5 秒）".into(),
+        ),
+        (
+            ReplyNote::QueueGaveUp {
+                id: "4239".into(),
+                label: "cargo test".into(),
+                waited_s: 7200,
+                reason: Some("why".into()),
+            },
+            "直近の諦め: 4239  cargo test  待ち 2 時間 0 分  — why".into(),
+        ),
+        (
+            ReplyNote::QueueGaveUpWhy("why".into()),
+            "待っていた理由: why".into(),
+        ),
+        (
+            ReplyNote::QueueBehindHead("why".into()),
+            "前に並んでいる処理の後（先頭: why）".into(),
+        ),
+        (
+            ReplyNote::QueueHolder(Box::new(tako_control::reply_note::QueueHolderFields {
+                id: "4240".into(),
+                label: "cargo build".into(),
+                used: Some("1.2 GB".into()),
+                peak: Some("2.0 GB".into()),
+                pending: Some("1.5 GB".into()),
+                estimate: Some("3.5 GB".into()),
+                estimate_from: Some("history".into()),
+                peak_passed: true,
+                stalled: true,
+            })),
+            "押さえていた処理: 4240 cargo build（使用 1.2 GB・最大 2.0 GB・まだ使っていない見込み 1.5 GB・\
+             見込み 3.5 GB（過去の記録）・ピーク後・停滞）"
+                .into(),
+        ),
+        (
+            ReplyNote::QueueHolder(Box::new(tako_control::reply_note::QueueHolderFields {
+                id: "4241".into(),
+                label: "cargo test".into(),
+                used: None,
+                peak: None,
+                pending: None,
+                estimate: Some("2.0 GB".into()),
+                estimate_from: Some("shape".into()),
+                peak_passed: false,
+                stalled: false,
+            })),
+            "押さえていた処理: 4241 cargo test（使用 未計測・見込み 2.0 GB（同じ形の記録））".into(),
+        ),
+        (
+            ReplyNote::QueueHolder(Box::new(tako_control::reply_note::QueueHolderFields {
+                id: "4241".into(),
+                label: "cargo test".into(),
+                used: Some("512 MB".into()),
+                peak: None,
+                pending: None,
+                estimate: Some("2.0 GB".into()),
+                estimate_from: None,
+                peak_passed: false,
+                stalled: false,
+            })),
+            "押さえていた処理: 4241 cargo test（使用 512 MB・見込み 2.0 GB（区分の既定））".into(),
+        ),
+        (ReplyNote::QueueOwnerExternal(None), "tako の外".into()),
+        (
+            ReplyNote::QueueOwnerExternal(Some("Terminal".into())),
+            "tako の外（Terminal）".into(),
+        ),
+        (
+            ReplyNote::QueueMachineUnavailable(Some(
+                "この OS ではまだ採れない（Windows は #2000 で対応）".into(),
+            )),
+            "機の状態: この OS ではまだ採れない（Windows は #2000 で対応）".into(),
+        ),
+        (
+            ReplyNote::QueueMachineUnavailable(None),
+            "機の状態: 採れない".into(),
+        ),
+        (
+            ReplyNote::QueueMemoryLine(Box::new(tako_control::reply_note::QueueMemoryLineFields {
+                used: "20.1 GB".into(),
+                total: "36.0 GB".into(),
+                app: "10.0 GB".into(),
+                wired: "3.0 GB".into(),
+                compressed: "2.0 GB".into(),
+                available: "15.9 GB".into(),
+                swap: Some(("1.0 GB".into(), "2.0 GB".into())),
+                pressure: Some("normal".into()),
+            })),
+            "メモリ 20.1 GB / 36.0 GB（app 10.0 GB・wired 3.0 GB・圧縮 2.0 GB・空き 15.9 GB）  \
+             swap 1.0 GB / 2.0 GB  メモリ圧 normal"
+                .into(),
+        ),
+        (
+            ReplyNote::QueueMemoryLine(Box::new(tako_control::reply_note::QueueMemoryLineFields {
+                used: "20.1 GB".into(),
+                total: "36.0 GB".into(),
+                app: "10.0 GB".into(),
+                wired: "3.0 GB".into(),
+                compressed: "2.0 GB".into(),
+                available: "15.9 GB".into(),
+                swap: None,
+                pressure: None,
+            })),
+            "メモリ 20.1 GB / 36.0 GB（app 10.0 GB・wired 3.0 GB・圧縮 2.0 GB・空き 15.9 GB）".into(),
+        ),
+        (
+            ReplyNote::QueueCpuLine {
+                cpu: "35%".into(),
+                cores: 18,
+                load: Some("3.1 / 2.5 / 2.0".into()),
+            },
+            "CPU 35%（18 コア）  load 3.1 / 2.5 / 2.0".into(),
+        ),
+        (
+            ReplyNote::QueueCpuLine {
+                cpu: "?".into(),
+                cores: 0,
+                load: None,
+            },
+            "CPU ?（0 コア）".into(),
+        ),
+        (ReplyNote::QueueHeavyNone, "重い処理: なし".into()),
+        (ReplyNote::QueueHeavyHeader(2), "重い処理 2 件:".into()),
+        (
+            ReplyNote::QueuePanesHeader,
+            "ペインの上位（メモリの多い順）:".into(),
+        ),
+        (
+            ReplyNote::QueuePaneRow {
+                memory: "2.0 GB".into(),
+                agent_mb: "1.0 GB".into(),
+                heavy_mb: "512 MB".into(),
+                owner: "owner".into(),
+                agent: Some("claude".into()),
+            },
+            "2.0 GB（agent 1.0 GB・重い処理 512 MB）  owner  claude".into(),
+        ),
+        (
+            ReplyNote::QueueExternalLine {
+                memory: "3.0 GB".into(),
+                processes: 12,
+                heavy: 1,
+            },
+            "tako の外: 3.0 GB・12 本（重い処理 1 件）".into(),
+        ),
+        (
+            ReplyNote::QueueScanLine {
+                processes: 400,
+                readable: 390,
+                age_ms: 1500,
+            },
+            "走査: 400 本（読めた 390）・1.5 秒前".into(),
+        ),
+        (
+            ReplyNote::QueueLaunchesHead {
+                waiting: 1,
+                starting: 1,
+            },
+            "agent の起動待ち: 待ち 1・立ち上がり中 1（逼迫が解けると起きる。今すぐ起こすには \
+             tako queue start <ペイン>）"
+                .into(),
+        ),
+        (
+            ReplyNote::QueueLaunchWaitingRow(Box::new(tako_control::reply_note::QueueLaunchWaitingRowFields {
+                position: "1".into(),
+                pane: "5".into(),
+                kind: "worker".into(),
+                label: "w".into(),
+                priority: "normal".into(),
+                waited_s: 30,
+                reason: "why".into(),
+            })),
+            "待ち 1  ペイン 5  worker  w  normal  待ち 30 秒  — why".into(),
+        ),
+        (
+            ReplyNote::QueueLaunchStartingRow {
+                pane: "6".into(),
+                kind: "master".into(),
+                label: "m".into(),
+                since_s: 4,
+                memory: Some("300 MB".into()),
+            },
+            "立ち上がり中  ペイン 6  master  m  4秒  300 MB".into(),
+        ),
+        (
+            ReplyNote::QueueJobserverActive {
+                free: "10".into(),
+                tokens: "18".into(),
+                holders: Some(3),
+            },
+            "cargo の札: 空き 10 / 18（札を持ちうる cargo 系 3 本）".into(),
+        ),
+        (
+            ReplyNote::QueueJobserverRecount {
+                free_before: "16".into(),
+                added: true,
+                count: 2,
+                over: false,
+            },
+            "直近の数え直し: 空き 16 → +2（誰も持っていないのに足りない分を足した）".into(),
+        ),
+        (
+            ReplyNote::QueueJobserverRecount {
+                free_before: "16".into(),
+                added: false,
+                count: 1,
+                over: true,
+            },
+            "直近の数え直し: 空き 16 → -1（多すぎた分を抜いた）".into(),
+        ),
+        (
+            ReplyNote::QueueJobserverFollower("18".into()),
+            "cargo の札: 先行の tako の札を使う（総数 18）".into(),
+        ),
+        (
+            ReplyNote::QueueJobserverOff {
+                code: Some("setting".into()),
+                ja: "設定 resources.jobserver が off（`tako queue limits --jobserver on` で戻す）".into(),
+            },
+            "cargo の札: 配っていない — 設定 resources.jobserver が off（`tako queue limits --jobserver on` で戻す）"
+                .into(),
+        ),
+        (
+            ReplyNote::QueueWaitReason {
+                code: Some("memory".into()),
+                ja: "空きメモリ不足（空き 1.0 GB・必要 3.5 GB・予約 3.6 GB）".into(),
+            },
+            "空きメモリ不足（空き 1.0 GB・必要 3.5 GB・予約 3.6 GB）".into(),
+        ),
+        (
+            ReplyNote::QueueEta {
+                ja: "あと約 9 分（前回 10 分）".into(),
+                state: "remaining".into(),
+                remaining_s: Some(540),
+                previous_s: Some(600),
+                from_progress: false,
+                progress: None,
+                ran_s: 60,
+            },
+            "あと約 9 分（前回 10 分）".into(),
+        ),
+        (
+            ReplyNote::QueueEta {
+                ja: "あと約 4 分（進み 120/345 からの見込み）".into(),
+                state: "remaining".into(),
+                remaining_s: Some(240),
+                previous_s: None,
+                from_progress: true,
+                progress: Some((120, 345)),
+                ran_s: 130,
+            },
+            "あと約 4 分（進み 120/345 からの見込み）".into(),
+        ),
+        (
+            ReplyNote::QueueEta {
+                ja: "前回より長くかかっている（経過 12 分・前回 10 分）".into(),
+                state: "overrun".into(),
+                remaining_s: None,
+                previous_s: Some(600),
+                from_progress: false,
+                progress: None,
+                ran_s: 720,
+            },
+            "前回より長くかかっている（経過 12 分・前回 10 分）".into(),
+        ),
+        (
+            ReplyNote::QueueEta {
+                ja: "経過 45 秒（見込みなし）".into(),
+                state: "unknown".into(),
+                remaining_s: None,
+                previous_s: None,
+                from_progress: false,
+                progress: None,
+                ran_s: 45,
+            },
+            "経過 45 秒（見込みなし）".into(),
+        ),
+        (
+            ReplyNote::QueueStartEta {
+                ja: "開始まで約 19 分".into(),
+                start_s: 1140,
+            },
+            "開始まで約 19 分".into(),
+        ),
+        (
+            ReplyNote::QueueStartEta {
+                ja: "空き次第すぐ開始の見込み".into(),
+                start_s: 0,
+            },
+            "空き次第すぐ開始の見込み".into(),
+        ),
+        (
+            ReplyNote::UsageIndexBuilt {
+                files: 120,
+                mb: 300,
+                elapsed_ms: 4200,
+            },
+            "使用量の索引を作った（会話記録 120 本・300 MB を 4.2 秒。次からは追記された分だけを読む）".into(),
+        ),
+        (
+            ReplyNote::UsageHeader,
+            "利用制限の観測（tako mod の報告と codex の rollout。% か解除時刻が変わったときだけ記録）と使用量の内訳"
+                .into(),
+        ),
+        (
+            ReplyNote::UsageNotRecording(Some("TAKO_2192_S1_LEGACY".into())),
+            "記録していない（TAKO_2192_S1_LEGACY が立っている）".into(),
+        ),
+        (
+            ReplyNote::UsageNotRecording(None),
+            "記録していない（A/B の env が立っている）".into(),
+        ),
+        (
+            ReplyNote::UsageNoObservations,
+            "まだ観測が無い。tako mod の効いた claude のペインが利用制限を報告すると記録が始まる\
+             （mod の状態は tako mod）"
+                .into(),
+        ),
+        (
+            ReplyNote::UsageLoginLine {
+                label: "A".into(),
+                codex: false,
+                login: "0123456789ab".into(),
+                config_dir: false,
+                observations: 3,
+                sessions: Some(2),
+            },
+            "ログイン A（鍵 0123456789ab）  観測 3 点・会話 2 本".into(),
+        ),
+        (
+            ReplyNote::UsageLoginLine {
+                label: "B".into(),
+                codex: true,
+                login: "ba9876543210".into(),
+                config_dir: true,
+                observations: 0,
+                sessions: None,
+            },
+            "ログイン B（codex・鍵 ba9876543210 = 資格情報を読めず設定 dir で束ねた）  観測 0 点".into(),
+        ),
+        (
+            ReplyNote::UsageWindowRest {
+                resets: "12:02".into(),
+                expired: false,
+                observed: "11:12".into(),
+                observations: 2,
+            },
+            "解除 12:02  最新の観測 11:12（2 点）".into(),
+        ),
+        (
+            ReplyNote::UsageWindowRest {
+                resets: "11:01".into(),
+                expired: true,
+                observed: "11:02".into(),
+                observations: 1,
+            },
+            "解除 11:01（過ぎた = 今の窓の値ではない）  最新の観測 11:02（1 点）".into(),
+        ),
+        (
+            ReplyNote::UsageAmount {
+                usd: "$12.35".into(),
+                tokens: "1.23".into(),
+                output: "4.6".into(),
+                responses: 10,
+                sessions: 2,
+                unpriced: Some("5".into()),
+            },
+            "API 換算 $12.35・トークン 1.23（出力 4.6）・応答 10・会話 2・単価不明 5".into(),
+        ),
+        (
+            ReplyNote::UsageAmount {
+                usd: "$0.00".into(),
+                tokens: "0".into(),
+                output: "0".into(),
+                responses: 0,
+                sessions: 0,
+                unpriced: None,
+            },
+            "API 換算 $0.00・トークン 0（出力 0）・応答 0・会話 0".into(),
+        ),
+        (
+            ReplyNote::UsageShareHeadNote { period: false },
+            "（% は今の窓のうち各段が使った分・+ は推定）".into(),
+        ),
+        (
+            ReplyNote::UsageShareHeadNote { period: true },
+            "（% は期間に重なる窓の延べ・+ は推定）".into(),
+        ),
+        (
+            ReplyNote::UsageMoreGroups(3),
+            "ほか 3 件（--limit で増やせる）".into(),
+        ),
+        (
+            ReplyNote::UsageNoUsageInPeriod,
+            "この期間の使用量は無い".into(),
+        ),
+        (
+            ReplyNote::UsageOutsideLabel,
+            "tako の外（区間にローカルの使用量が無いのに増えた分）".into(),
+        ),
+        (
+            ReplyNote::UsageEstimatedLabel,
+            "推定の合計（観測の区間の外 = 最後の観測より後・観測の無い窓）".into(),
+        ),
+        (
+            ReplyNote::UsageShareUnavailable("5h".into()),
+            "5h の按分: このログインの観測が無いので % を出していない".into(),
+        ),
+        (
+            ReplyNote::UsageShareLine(Box::new(tako_control::reply_note::UsageShareLineFields {
+                label: "7d".into(),
+                head: tako_control::UsageShareHead::Latest(12.0),
+                allocated: 12.0,
+                outside: 0.0,
+                estimated: None,
+                per_usd: None,
+                per_tokens: Some("16.7".into()),
+                intervals: 3,
+                quartiles: None,
+                unestimated_usd: None,
+            })),
+            "7d の按分: 今の窓 12.0% = 段 12.0 + tako の外 0.0・1% あたり トークン 16.7（区間 3 本）".into(),
+        ),
+        (
+            ReplyNote::UsageShareLine(Box::new(tako_control::reply_note::UsageShareLineFields {
+                label: "5h".into(),
+                head: tako_control::UsageShareHead::Period(30.0),
+                allocated: 25.0,
+                outside: 5.0,
+                estimated: Some(0.4),
+                per_usd: Some(1.5),
+                per_tokens: None,
+                intervals: 4,
+                quartiles: Some((1.2, 1.8)),
+                unestimated_usd: Some(0.75),
+            })),
+            "5h の按分: 期間の延べ 30.0% = 段 25.0 + tako の外 5.0・推定 +0.4・1% あたり API 換算 $1.50\
+             （区間 4 本・直近の窓の四分位 $1.20〜$1.80）・% へ直せない API 換算 $0.75"
+                .into(),
+        ),
+        (
+            ReplyNote::UsageShareLine(Box::new(tako_control::reply_note::UsageShareLineFields {
+                label: "7d".into(),
+                head: tako_control::UsageShareHead::NoWindow,
+                allocated: 0.0,
+                outside: 0.0,
+                estimated: None,
+                per_usd: Some(2.0),
+                per_tokens: None,
+                intervals: 1,
+                quartiles: None,
+                unestimated_usd: None,
+            })),
+            "7d の按分: 観測した今の窓が無い = 段 0.0 + tako の外 0.0・1% あたり API 換算 $2.00（区間 1 本）".into(),
+        ),
+        (
+            ReplyNote::UsageRecorded {
+                observations: 3,
+                from: "11:02".into(),
+                to: "11:12".into(),
+            },
+            "記録 3 点（11:02 〜 11:12）".into(),
+        ),
+        (
+            ReplyNote::UsageUnreadableLines(2),
+            "読めない行 2 行を飛ばした（書きかけ・壊れた行）".into(),
+        ),
+        (
+            ReplyNote::UsageBy("issue".into()),
+            "段: issue（既定は project）".into(),
+        ),
+        (ReplyNote::UsageNoteLabel, "注".into()),
+        (
+            ReplyNote::UsageNotePrice("2026-10-15".into()),
+            "api_usd は API 換算（モデル別の単価 × 5 成分。単価表 2026-10-15）で、サブスクリプションの請求額ではない"
+                .into(),
+        ),
+        (
+            ReplyNote::UsageNoteUnpriced("gpt-x / o9".into()),
+            "単価表に無いモデル（gpt-x / o9）は API 換算に含めず unpriced_tokens に数えた".into(),
+        ),
+        (
+            ReplyNote::UsageNoteShareScope { period: false },
+            "limit_share は観測した % の増分を、観測点の間の区間の使用量（API 換算）の比で段へ配った値。\
+             範囲は枠（5h / 7d）ごとの今の窓の、期間に重なる分。今の窓を丸ごと見るときは段の合計 + tako の外 = 最新の観測"
+                .into(),
+        ),
+        (
+            ReplyNote::UsageNoteShareScope { period: true },
+            "limit_share は観測した % の増分を、観測点の間の区間の使用量（API 換算）の比で段へ配った値。\
+             範囲は期間に重なるすべての窓の延べ（窓をまたぐと 100% を超えうる）"
+                .into(),
+        ),
+        (
+            ReplyNote::UsageNoteOutside,
+            "outside（tako の外）は区間にローカルの使用量が無いのに % が増えた分（claude.ai・別の PC など）。\
+             estimated（推定）は観測の区間の外（最後の観測より後・観測の無い窓）の使用量を、直近 7 日の区間の \
+             1% あたりの API 換算の中央値で割った値"
+                .into(),
+        ),
+        (
+            ReplyNote::UsageNoteMissing(vec![
+                ("A".into(), "5h".into()),
+                ("B".into(), "5h / 7d".into()),
+            ]),
+            "観測の無いログインと枠は % を出していない: ログイン A（5h）・ログイン B（5h / 7d）。\
+             tako mod の効いた claude のペインが利用制限を報告すると記録が始まる"
+                .into(),
+        ),
+        (
+            ReplyNote::UsageNoteCodexMissing(vec![("C".into(), "5h".into())]),
+            "codex のログインで rollout の rate_limits にその枠が出ていないものは % を出していない: \
+             ログイン C（5h）（プランが週の枠だけ等）"
+                .into(),
+        ),
+        (
+            ReplyNote::UsageNoteCodex,
+            "codex は rollout の token_count の累積の差分を使用量に、rate_limits を観測にして過去の分まで配る。\
+             codex のモデルは単価表に無いので API 換算は出ず、% は生トークンの比で配る。rollout はどのログインで\
+             使ったかを持たないので、過去の分も今の auth.json のログインへ寄せる"
+                .into(),
+        ),
+        (
+            ReplyNote::UsageNoteUnestimated,
+            "unestimated_usd / unestimated_tokens は観測の区間の外の使用量のうち、係数が無く % へ直せなかった分"
+                .into(),
+        ),
+        (
+            ReplyNote::UsageNoteIndexLocked,
+            "ほかの更新（CLI / GUI の背景）が索引を読み進めている最中なので、今ある索引で答えた".into(),
+        ),
+        (
+            ReplyNote::UsageNoteIndexPending { files: 12, mb: 340 },
+            "索引はまだ読み途中（残り 12 本・340 MB）。GUI が背景で続ける（CLI は tako usage で追いつく）"
+                .into(),
+        ),
     ]
 }
 
@@ -20004,6 +20887,25 @@ const CLI_NOTE_SCOPES: &[&str] = &[
     "fn recover_apply(",
     "fn print_recover_merge(",
     "fn orchestrator_watch(",
+    // #2365: `tako queue`（状況・cancel / start / priority / limits）と `tako usage` の人向けの表示
+    // （調停役が組む文は日本語なら応答の文そのまま、英語は応答の構造の欄から）
+    "fn queue_wait_reason(",
+    "fn queue_eta(",
+    "fn queue_cli(",
+    "fn queue_status_cli(",
+    "fn print_queue_limits(",
+    "fn queue_priority_text(",
+    "fn print_queue_priority(",
+    "fn print_queue_section(",
+    "fn queue_owner_text(",
+    "fn print_queue_status(",
+    "fn print_jobserver_section(",
+    "fn print_launches_section(",
+    "fn usage_local(",
+    "fn usage_group_name(",
+    "fn usage_amount(",
+    "fn usage_share_footer(",
+    "fn usage_text(",
 ];
 
 /// CLI `main.rs` でまだ断りに日本語の固定文を持つ関数（頭, 理由）。**断りを移し終えたら外す**
@@ -20494,6 +21396,380 @@ fn watchの現在の選択の印はguideが引く綴りと同じ() {
         CLI_MAIN_SRC.contains("wait::CHOICE_HIGHLIGHT_MARK"),
         "{CLI_MAIN_PATH}: watch の現在の選択の印を定数から引いていない"
     );
+}
+
+// ---- #2365 の続き: `tako queue` と `tako usage` の行の中身 ----
+//
+// 調停役（GUI）が組む文（待つ理由・見込み・札を配らない理由・`note`）は応答の値のまま変えない。日本語の
+// 表示はその文をそのまま、英語は同じ応答の構造の欄（`reason` / `code` / `eta` / `start_s`）から組む。
+// ここでは (1) 中身の口（`human_secs_in` / `gave_up_lines_in` / `usage_notes`）の日本語が #2365 より前の
+// 文と一致し英語に日本語が混ざらない (2) 理由の種類を足したら英語の書き忘れで落ちる (3) 調停役の `note` の
+// 字面が英語の腕の前提と同じ、を見る
+
+use serde_json::{json, Value};
+
+const QUEUE_WRAPPER_SRC: &str = include_str!("../src/queue_wrapper.rs");
+const QUEUE_WRAPPER_PATH: &str = "crates/tako-control/src/queue_wrapper.rs";
+const QUEUE_SRC: &str = include_str!("../src/queue.rs");
+const QUEUE_PATH: &str = "crates/tako-control/src/queue.rs";
+const JOBSERVER_SRC: &str = include_str!("../src/jobserver.rs");
+const JOBSERVER_PATH: &str = "crates/tako-control/src/jobserver.rs";
+
+#[test]
+fn queueの時間と諦めの説明の日本語は2365より前と一致し英語に日本語が無い() {
+    use tako_control::queue_wrapper::{gave_up_lines, gave_up_lines_in, human_secs, human_secs_in};
+    for (secs, old) in [
+        (0, "0 秒"),
+        (59, "59 秒"),
+        (60, "1 分 0 秒"),
+        (3599, "59 分 59 秒"),
+        (3600, "1 時間 0 分"),
+        (7325, "2 時間 2 分"),
+    ] {
+        assert_eq!(
+            human_secs_in(secs, Lang::Ja),
+            old,
+            "{QUEUE_WRAPPER_PATH}: {secs} 秒"
+        );
+        assert_eq!(
+            human_secs(secs),
+            old,
+            "{QUEUE_WRAPPER_PATH}: 日本語の口 {secs} 秒"
+        );
+        let en = human_secs_in(secs, Lang::En);
+        assert!(
+            has_japanese(&en).is_none(),
+            "{QUEUE_WRAPPER_PATH}: 英語 {en}"
+        );
+    }
+    let holders = json!([
+        {"id": 4240, "label": "cargo build", "memory_mb": 1229, "peak_mb": 2048, "pending_mb": 1536,
+         "estimate_mb": 3584, "estimate_from": "history", "peak_passed": true, "stalled": true},
+        {"id": 4241, "label": "cargo test", "pending_mb": 0, "estimate_mb": 2048, "estimate_from": "shape"},
+    ]);
+    // 自分の理由で待っていた（`reason` ≠ ahead）/ 前に並ぶ処理の後（先頭の理由）/ 理由を返さない旧い調停役
+    let cases = [
+        (
+            json!({"reason": "memory", "text": "空きメモリ不足（空き 1.0 GB）", "holders": holders}),
+            vec![
+                "待っていた理由: 空きメモリ不足（空き 1.0 GB）",
+                "押さえていた処理: 4240 cargo build（使用 1.2 GB・最大 2.0 GB・まだ使っていない見込み 1.5 GB・\
+                 見込み 3.5 GB（過去の記録）・ピーク後・停滞）",
+                "押さえていた処理: 4241 cargo test（使用 未計測・見込み 2.0 GB（同じ形の記録））",
+            ],
+        ),
+        (
+            json!({"reason": "ahead", "head_reason": "max_jobs", "head_text": "同時数の上限（実行 3 / 上限 3）"}),
+            vec!["待っていた理由: 前に並んでいる処理の後（先頭: 同時数の上限（実行 3 / 上限 3））"],
+        ),
+        (json!({"holders": []}), vec![]),
+    ];
+    for (resp, old) in cases {
+        assert_eq!(
+            gave_up_lines_in(&resp, Lang::Ja),
+            old,
+            "{QUEUE_WRAPPER_PATH}: {resp}"
+        );
+        assert_eq!(
+            gave_up_lines(&resp),
+            old,
+            "{QUEUE_WRAPPER_PATH}: 日本語の口 {resp}"
+        );
+        let en = gave_up_lines_in(&resp, Lang::En);
+        assert_eq!(
+            en.len(),
+            old.len(),
+            "{QUEUE_WRAPPER_PATH}: 英語の行数 {en:?}"
+        );
+        for line in en {
+            assert!(
+                has_japanese(&line).is_none(),
+                "{QUEUE_WRAPPER_PATH}: 英語 {line}"
+            );
+        }
+    }
+}
+
+/// 待つ理由の種類（`WaitReason` の全種と起動待ちの「判断待ち」）と札を配らない理由（`jobserver::Off`）は、
+/// 英語で種類ごとの文を持つ（足した種類を英語で書き忘れると、種類の名前がそのまま出る = ここで落ちる）
+#[test]
+fn queueの理由の種類はどれも英語の文を持つ() {
+    use tako_core::queue::WaitReason;
+    let reasons = [
+        WaitReason::Regather,
+        WaitReason::TargetDir,
+        WaitReason::PressureCritical,
+        WaitReason::PressureWarn,
+        WaitReason::Swap { used_mb: 4096 },
+        WaitReason::MaxJobs {
+            running: 3,
+            unmanaged: 1,
+            max: 3,
+        },
+        WaitReason::Memory {
+            available_mb: 1024,
+            need_mb: 3584,
+            reserve_mb: 3686,
+            pending_mb: 0,
+            estimate_mb: 3584,
+        },
+        WaitReason::Ahead,
+        WaitReason::OvertakeLimit { max: 3 },
+    ];
+    // 種類を足したら E0004 = この表に見本を足す
+    for r in &reasons {
+        match r {
+            WaitReason::Regather
+            | WaitReason::TargetDir
+            | WaitReason::PressureCritical
+            | WaitReason::PressureWarn
+            | WaitReason::Swap { .. }
+            | WaitReason::MaxJobs { .. }
+            | WaitReason::Memory { .. }
+            | WaitReason::Ahead
+            | WaitReason::OvertakeLimit { .. } => {}
+        }
+    }
+    let mut codes: Vec<(String, String)> = reasons
+        .iter()
+        .map(|r| (r.code().to_string(), r.text()))
+        .collect();
+    codes.push(("pending".into(), "判断待ち".into()));
+    use tako_control::jobserver::Off;
+    let offs = [
+        Off::Setting,
+        Off::Legacy,
+        Off::Unsupported,
+        Off::NoPlace,
+        Off::Error("No such file or directory (os error 2)".into()),
+    ];
+    for o in &offs {
+        match o {
+            Off::Setting | Off::Legacy | Off::Unsupported | Off::NoPlace | Off::Error(_) => {}
+        }
+    }
+    let mut failures = Vec::new();
+    for (code, ja) in &codes {
+        let n = ReplyNote::QueueWaitReason {
+            code: Some(code.clone()),
+            ja: ja.clone(),
+        };
+        let en = n.text_in(Lang::En);
+        if en == *code || has_japanese(&en).is_some() {
+            failures.push(format!(
+                "{}: 待つ理由 `{code}` の英語が無い（種類の名前のまま / 日本語）: {en}",
+                reply_note_where(&n, Lang::En)
+            ));
+        }
+        if n.text_in(Lang::Ja) != *ja {
+            failures.push(format!("待つ理由 `{code}` の日本語が調停役の文と違う"));
+        }
+    }
+    for o in &offs {
+        let n = ReplyNote::QueueJobserverOff {
+            code: Some(o.code().into()),
+            ja: o.text(),
+        };
+        let en = n.text_in(Lang::En);
+        if en.ends_with(&format!("— {}", o.code())) || has_japanese(&en).is_some() {
+            failures.push(format!(
+                "{}: 札を配らない理由 `{}` の英語が無い: {en}",
+                reply_note_where(&n, Lang::En),
+                o.code()
+            ));
+        }
+        if n.text_in(Lang::Ja) != format!("cargo の札: 配っていない — {}", o.text()) {
+            failures.push(format!(
+                "札を配らない理由 `{}` の日本語が調停役の文と違う",
+                o.code()
+            ));
+        }
+    }
+    // `Off` の外で組む節（番人が居ない `not_started` ほか）も、`jobserver.rs` が書く `"code": "…"` は全部
+    // 英語の文を持つ（足した種類の書き忘れをここで落とす）
+    let literal_codes: Vec<&str> = JOBSERVER_SRC
+        .split("\"code\": \"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert!(
+        literal_codes.contains(&"not_started"),
+        "{JOBSERVER_PATH}: 番人が居ない節の `code` を拾えない（字面が変わったならここを直す）"
+    );
+    for code in literal_codes {
+        let n = ReplyNote::QueueJobserverOff {
+            code: Some(code.into()),
+            ja: "-".into(),
+        };
+        let en = n.text_in(Lang::En);
+        if en.ends_with(&format!("— {code}")) || has_japanese(&en).is_some() {
+            failures.push(format!(
+                "{}: 札を配らない理由 `{code}`（{JOBSERVER_PATH}）の英語が無い: {en}",
+                reply_note_where(&n, Lang::En)
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// `tako queue` の「直近の諦め」の下の行と `tako usage` の注記を組む口は、文を型（`ReplyNote`）から引く
+/// （日本語の固定文を書き戻すと英語表示にもそのまま出る = 行を名指して落とす）
+#[test]
+fn queueとusageの中身の口に日本語の固定文が無い() {
+    let mut failures = Vec::new();
+    for (path, src, head) in [
+        (
+            QUEUE_WRAPPER_PATH,
+            QUEUE_WRAPPER_SRC,
+            "pub fn gave_up_lines_in(",
+        ),
+        (USAGE_PATH, USAGE_SRC, "pub fn usage_notes("),
+    ] {
+        let Some(lines) = front_scope_lines(src, Some(head)) else {
+            failures.push(format!(
+                "{path}: 走査の範囲 `{head}` が見つからない（関数の改名で番犬が空振りする。この表を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in front_japanese(&lines) {
+            failures.push(format!(
+                "{path}:{line}: `{head}` に日本語の固定文がある = 英語表示にもそのまま出る \
+                 （文は tako_control::ReplyNote へ）: {text}"
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// 調停役が `priority` の応答に載せる `note` は 1 種類だけ（英語はその意味を固定文で言う）。調停役の文を
+/// 変えたら英語の腕（`ReplyNote::QueuePriorityRunningNote`）も直す
+#[test]
+fn queueの優先度の注記は調停役の文と同じ前提() {
+    let note = "走っている処理は止めない（優先度は待ちの並びにだけ効く）";
+    assert_eq!(
+        QUEUE_SRC.matches("v[\"note\"] = json!(").count(),
+        1,
+        "{QUEUE_PATH}: priority の応答の `note` が 1 種類でなくなった（英語の腕を見直す）"
+    );
+    assert!(
+        QUEUE_SRC.contains(&format!("v[\"note\"] = json!(\"{note}\")")),
+        "{QUEUE_PATH}: priority の応答の `note` の文が変わった（`QueuePriorityRunningNote` の英語を直す）"
+    );
+    let n = ReplyNote::QueuePriorityRunningNote(note.into());
+    assert_eq!(n.text_in(Lang::Ja), note);
+    assert!(has_japanese(&n.text_in(Lang::En)).is_none());
+}
+
+/// `tako usage` の注記（応答の `notes`）は組み上がった応答から組む 1 実装。日本語は #2365 より前に
+/// `usage::payload_in` が直書きしていた文と並びが同じで、英語に日本語が混ざらない
+#[test]
+fn usageの注記は応答から組み日本語は2365より前と一致() {
+    use tako_control::usage::usage_notes;
+    let share = |kind: &str, available: bool, scope: &str| json!({"kind": kind, "available": available, "scope": scope, "unestimated_usd": 0.5});
+    let usage =
+        |shares: Vec<Value>| json!({"range": {}, "total": {}, "groups": [], "limit_share": shares});
+    // ログインの鍵の順（内訳の並び）は応答の並び（最初に見えた順）と違う
+    let payload = json!({
+        "index": {"enabled": true, "update": {"caught_up": false, "pending_files": 12, "pending_bytes": 340u64 * 1024 * 1024}},
+        "price_table_as_of": "2026-10-15",
+        "unpriced_models": ["gpt-x", "o9"],
+        "logins": [
+            {"label": "A", "login": "ffff", "agent": "claude",
+             "usage": usage(vec![share("seven_day", true, "period"), share("five_hour", false, "period")])},
+            {"label": "B", "login": "aaaa", "agent": "claude",
+             "usage": usage(vec![share("five_hour", false, "period"), share("seven_day", false, "period")])},
+            {"label": "C", "login": "cccc", "agent": "codex",
+             "usage": usage(vec![share("five_hour", false, "period")])},
+            {"label": "D", "login": "dddd", "agent": "claude"},
+        ],
+    });
+    let old = [
+        "api_usd は API 換算（モデル別の単価 × 5 成分。単価表 2026-10-15）で、サブスクリプションの請求額ではない",
+        "単価表に無いモデル（gpt-x / o9）は API 換算に含めず unpriced_tokens に数えた",
+        "limit_share は観測した % の増分を、観測点の間の区間の使用量（API 換算）の比で段へ配った値。\
+         範囲は期間に重なるすべての窓の延べ（窓をまたぐと 100% を超えうる）",
+        "outside（tako の外）は区間にローカルの使用量が無いのに % が増えた分（claude.ai・別の PC など）。\
+         estimated（推定）は観測の区間の外（最後の観測より後・観測の無い窓）の使用量を、直近 7 日の区間の \
+         1% あたりの API 換算の中央値で割った値",
+        "観測の無いログインと枠は % を出していない: ログイン B（5h / 7d）・ログイン A（5h）。\
+         tako mod の効いた claude のペインが利用制限を報告すると記録が始まる",
+        "codex のログインで rollout の rate_limits にその枠が出ていないものは % を出していない: \
+         ログイン C（5h）（プランが週の枠だけ等）",
+        "codex は rollout の token_count の累積の差分を使用量に、rate_limits を観測にして過去の分まで配る。\
+         codex のモデルは単価表に無いので API 換算は出ず、% は生トークンの比で配る。rollout はどのログインで\
+         使ったかを持たないので、過去の分も今の auth.json のログインへ寄せる",
+        "unestimated_usd / unestimated_tokens は観測の区間の外の使用量のうち、係数が無く % へ直せなかった分",
+        "索引はまだ読み途中（残り 12 本・340 MB）。GUI が背景で続ける（CLI は tako usage で追いつく）",
+    ];
+    let notes = usage_notes(&payload);
+    let ja: Vec<String> = notes.iter().map(|n| n.text_in(Lang::Ja)).collect();
+    assert_eq!(ja, old, "{USAGE_PATH}: usage_notes の日本語・並び");
+    for n in &notes {
+        let en = n.text_in(Lang::En);
+        assert!(
+            has_japanese(&en).is_none(),
+            "{}: {en}",
+            reply_note_where(n, Lang::En)
+        );
+    }
+    // 今の窓だけ・ほかの更新が読み進めている最中・単価表に無いモデルが無い
+    let mut current = payload.clone();
+    current["unpriced_models"] = json!([]);
+    current["logins"] = json!([{"label": "A", "login": "a", "agent": "claude",
+        "usage": usage(vec![json!({"kind": "seven_day", "available": true, "scope": "current_window"})])}]);
+    current["index"]["update"] = json!({"stopped": "locked", "caught_up": false});
+    let ja: Vec<String> = usage_notes(&current)
+        .iter()
+        .map(|n| n.text_in(Lang::Ja))
+        .collect();
+    assert_eq!(
+        ja,
+        [
+            old[0].to_string(),
+            "limit_share は観測した % の増分を、観測点の間の区間の使用量（API 換算）の比で段へ配った値。\
+             範囲は枠（5h / 7d）ごとの今の窓の、期間に重なる分。今の窓を丸ごと見るときは段の合計 + tako の外 = 最新の観測"
+                .to_string(),
+            old[3].to_string(),
+            "ほかの更新（CLI / GUI の背景）が索引を読み進めている最中なので、今ある索引で答えた".to_string(),
+        ],
+        "{USAGE_PATH}: 今の窓・読み進めの最中"
+    );
+    // 索引を切っている（A/B）応答には注記が無い
+    assert!(usage_notes(&json!({"index": {"enabled": false}})).is_empty());
+}
+
+/// `tako usage` の段の名前の言い換え（応答の `groups[].name` = 日本語の口）は日英を持ち、日本語は
+/// #2365 より前の `report::group_name` の文と一致する（英語表示は応答の `key` から組み直す）
+#[test]
+fn usageの段の名前の言い換えは日英を持ち日本語は2365より前と一致() {
+    use tako_core::usage::report::{group_name, group_name_in, By, GroupKey};
+    let empty = GroupKey::default();
+    let profile = GroupKey {
+        profile: Some("ops".into()),
+        ..GroupKey::default()
+    };
+    let session = GroupKey {
+        session: Some("0123456789abcdef".into()),
+        label: Some("fix".into()),
+        ..GroupKey::default()
+    };
+    let cases = [
+        (By::Login, &empty, "合計"),
+        (By::Account, &empty, "不明"),
+        (By::Project, &empty, "未分類"),
+        (By::Project, &profile, "プロファイル: ops"),
+        (By::Issue, &empty, "未分類 Issue なし"),
+        (By::TaskType, &empty, "種別なし"),
+        (By::Session, &session, "01234567 手動 未分類 fix"),
+        (By::Role, &empty, "手動"),
+        (By::Model, &empty, "-"),
+    ];
+    for (by, key, old) in cases {
+        assert_eq!(group_name_in(by, key, Lang::Ja), old, "{by:?}");
+        assert_eq!(group_name(by, key), old, "{by:?}: 日本語の口");
+        let en = group_name_in(by, key, Lang::En);
+        assert!(has_japanese(&en).is_none(), "{by:?}: 英語 {en}");
+    }
 }
 
 // ---- #2365 の続き: check-health 一式（`HealthText`）と、`tako setup --check` と共有する診断 ----

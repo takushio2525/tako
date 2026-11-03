@@ -171,7 +171,7 @@ pub use ipc::{IncomingRequest, IpcServer};
 pub use mcp::McpServer;
 pub use os_refusal::OsRefusal;
 pub use remote_refusal::RemoteRefusal;
-pub use reply_note::ReplyNote;
+pub use reply_note::{ReplyNote, UsageShareHead};
 pub use session_refusal::SessionRefusal;
 pub use setup_refusal::SetupRefusal;
 
