@@ -1739,6 +1739,21 @@ impl TakoApp {
                                     .child("WORK"),
                             )
                         })
+                        // worker の常駐メモリ（子孫込み。#1997。`tako orchestrator workers` の
+                        // `resident.memory_mb` と同じ走査の値を 2 秒 tick で写したもの）
+                        .when_some(row.resident_mb, |d, mb| {
+                            d.child(
+                                div()
+                                    .id(("tmux-pane-resident", pane.as_u64()))
+                                    .flex_none()
+                                    .text_size(px(10.0))
+                                    .font_family(theme.font_family.clone())
+                                    .text_color(hsla(theme.text_tertiary))
+                                    .child(SharedString::from(
+                                        crate::ui_text::resources::worker_resident(mb),
+                                    )),
+                            )
+                        })
                         // バックグラウンド行にピン留めボタン（FR-2.16.15。ピン中は常時表示、
                         // 未ピンは行ホバー時のみ）。前面行はプレビュー対象外なので出さない
                         .when(!is_active, |d| {

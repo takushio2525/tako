@@ -339,6 +339,8 @@ pub mod keys {
     pub const WORKER_DELIVERY_PEER: &str = "worker_delivery_peer";
     /// 時間では解けない利用阻害（座席種別・管理者による無効化・組織ポリシー等）の検知
     pub const WORKER_ENTITLEMENT_DETECT: &str = "worker_entitlement_detect";
+    /// 重い処理の順番待ち（`tako queue`）を、シェルの時間切れで切られずに待てるか（#1997）
+    pub const WORKER_HEAVY_QUEUE_WAIT: &str = "worker_heavy_queue_wait";
     /// 背景作業（Bash の背景シェル・Monitor 等）が残っていても、
     /// ターンが終わって入力待ちになったことを検知できるか（#1273）
     pub const WORKER_IDLE_WITH_BACKGROUND: &str = "worker_idle_with_background";
@@ -1625,6 +1627,24 @@ pub const MATRIX: &[AgentFeature] = &[
              `issue1107_codexの上限系は従来どおり時間で解ける扱い` が固定している。\
              **残高を 0 にして実際に踏ませる再現はしていない**（課金・管理者権限が要る）。\
              ローカル LLM にはベンダーの座席・クレジット・組織ポリシーが無い",
+        ),
+    },
+    AgentFeature {
+        key: keys::WORKER_HEAVY_QUEUE_WAIT,
+        summary: Note::new(
+            "重い処理の順番待ち（`tako queue`。ビルド・テスト・隔離 GUI）を、エージェントのシェルの時間切れで切られずに待てる（背景実行で待つ）",
+            "Can wait its turn in the heavy-job queue (`tako queue` for builds, tests and isolated GUIs) without the agent's shell tool timing it out (waits in background execution)",
+        ),
+        claude: S::Supported,
+        codex: pending(notes::NOT_INVESTIGATED, 975),
+        agy: pending(notes::NOT_INVESTIGATED, 975),
+        local: local_pending_first_class(),
+        evidence: AgentEvidence::Measured(
+            "#1997: claude（Claude Code）の Bash ツールは既定 2 分・最大 10 分で切れるが、背景実行 \
+             （run_in_background）なら時間切れが無く、終わると通知で戻る。この PR の検証で \
+             `tako queue cargo …` を背景実行で通し、順番待ちと 10 分を超える実行を切られずに終えた。\
+             順番待ちそのもの（`tako queue` の CLI と env）は worker_cli_control と同じく agent に依らない。\
+             codex / agy のシェルの時間切れの長さと背景実行の有無は実物で調べていない",
         ),
     },
     AgentFeature {

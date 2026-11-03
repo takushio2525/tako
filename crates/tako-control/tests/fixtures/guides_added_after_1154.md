@@ -398,3 +398,33 @@ when it is the last message above the input box (an older turn's line above a ne
 request or spinner does not count). When the declaration cannot be read and the
 status line is cut by the pane width, the worker stays `busy` and
 `idle_override_blocked` says `status_line_truncated` — widen the pane or read it.
+
+<!-- #1997: spawn / run の応答の machine / advice（助言と見える化だけ）。spawning の手順へ足した本文と、 -->
+<!-- worker-prompt の Constraints の雛形へ足した 1 項（tako queue と背景実行）をそのまま貼る。 -->
+### Machine headroom (`machine` / `advice`)
+
+Every spawn / run response also carries `machine` and `advice` — a read-out, never
+a gate. `machine` has the memory tako's launch gate judged on (`pressure`,
+`available_mb`, `total_mb`, `swap_used_mb`), the live agents and their resident
+memory (`agents.count` / `agents.memory_mb`, agent + MCP children, from the last
+process scan `agents.age_s` seconds old), the heavy-job queue (`queue.running` /
+`queue.waiting`, null when this tako is not the arbiter) and the launch gate
+(`launches.waiting` / `launches.starting`). `advice` is empty when there is room.
+Otherwise each entry has a `code`, the wait `reason` and a `text` to act on:
+
+- `next_launch_waits` — this worker launched, but one more spawn now would be held
+  by the launch gate. Spawn non-urgent work after a running worker finishes.
+- `heavy_queue_waits` — a build or test queued now would wait (`reason`:
+  `max_jobs`, `memory`, `pressure_warn` …). The worker's builds and tests will
+  wait their turn in `tako queue`; expect them to take longer, and prefer fewer
+  parallel workers that build.
+
+The thresholds are the same ones the launch gate and `tako queue` use — `advice`
+only asks them "what if one more?". Per-worker resident memory (descendants
+included) is in `tako_orchestrator_workers` (`resident.memory_mb` / `agent_mb` /
+`heavy_mb`) and on the fleet view's worker rows.
+
+- Run builds, test suites and GUI / browser checks through `tako queue <command>`
+  (or the repo's own entry points that already do) so they wait their turn for
+  memory. A queued command can wait a long time: run it with background execution
+  instead of a blocking shell call that times out.

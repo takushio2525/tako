@@ -35,7 +35,7 @@ use tako_cli::mcp_bridge;
 use tako_control::claude_mod::text::ModText;
 use tako_control::orchestrator::wait;
 use tako_control::protocol::{Axis, Direction, Request};
-use tako_control::{HealthText, Reason, ReplyNote};
+use tako_control::{HealthText, Reason, ReplyNote, UsageShareHead};
 
 // 呼び出し元ペイン（`TAKO_PANE_ID`。FR-2.1.1）。テストのビルドだけは env を読まない差し替えへ
 // 向ける（#1716。手元のシェルが継承した env でテストが通り CI で落ちる「偽の緑」を作らない）
@@ -7090,14 +7090,16 @@ fn usage_local(args: &UsageArgs) -> Result<(), String> {
         init_local_lang();
         tako_control::usage::usage_payload(&query, tako_control::usage::Refresh::Full)?
     };
+    // 人向けの行は表示言語（#2365。`--json` と応答の値は変えない）
+    let lang = cli_lang();
     let update = &payload["index"]["update"];
     if update["bytes_read"].as_u64().unwrap_or(0) >= 256 * 1024 * 1024 {
-        eprintln!(
-            "使用量の索引を作った（会話記録 {} 本・{} MB を {:.1} 秒。次からは追記された分だけを読む）",
-            update["read_files"].as_u64().unwrap_or(0),
-            update["bytes_read"].as_u64().unwrap_or(0) / (1024 * 1024),
-            update["elapsed_ms"].as_u64().unwrap_or(0) as f64 / 1000.0,
-        );
+        let built = ReplyNote::UsageIndexBuilt {
+            files: update["read_files"].as_u64().unwrap_or(0),
+            mb: update["bytes_read"].as_u64().unwrap_or(0) / (1024 * 1024),
+            elapsed_ms: update["elapsed_ms"].as_u64().unwrap_or(0),
+        };
+        eprintln!("{}", built.text_in(lang));
     }
     if args.json {
         println!("{}", pretty_json(&payload));
@@ -7105,34 +7107,57 @@ fn usage_local(args: &UsageArgs) -> Result<(), String> {
     }
     let now = tako_core::user_task::unix_now();
     let offset = tako_core::platform::clock::local_utc_offset();
-    print!("{}", usage_text(&payload, now, offset));
+    print!("{}", usage_text(&payload, now, offset, lang));
     Ok(())
 }
 
-/// トークン数の表記（万・億。右パネルの usage ビューと同じ 1 実装 = #2203）
-fn usage_tokens(n: u64) -> String {
-    tako_core::usage::display::tokens(n)
+/// トークン数の表記（日本語は万・億。右パネルの usage ビューと同じ 1 実装 = #2203。英語は K / M / B = #2365）
+fn usage_tokens(n: u64, lang: tako_core::i18n::Lang) -> String {
+    tako_core::usage::display::tokens_in(n, lang)
+}
+
+/// 段の名前（#2365）。日本語は応答の `name` をそのまま、英語は応答の `key` と段の切り方から言い換えの
+/// 名前（未分類・Issue なし ほか）を組み直す（`usage::report::group_name_in` = 作る側と同じ 1 実装）
+fn usage_group_name(g: &Value, by: &str, lang: tako_core::i18n::Lang) -> String {
+    use tako_core::usage::report;
+    let name = g["name"].as_str().unwrap_or("-");
+    if lang == tako_core::i18n::Lang::Ja {
+        return name.to_string();
+    }
+    match (
+        report::By::parse(by),
+        serde_json::from_value::<report::GroupKey>(g["key"].clone()),
+    ) {
+        (Some(by), Ok(key)) => report::group_name_in(by, &key, lang),
+        _ => name.to_string(),
+    }
 }
 
 /// 量の 1 行（API 換算・トークン・応答・会話）
-fn usage_amount(t: &Value) -> String {
-    let mut out = format!(
-        "API 換算 {}・トークン {}（出力 {}）・応答 {}・会話 {}",
-        tako_core::usage::display::api_usd(t["api_usd"].as_f64().unwrap_or(0.0)),
-        usage_tokens(t["total_tokens"].as_u64().unwrap_or(0)),
-        usage_tokens(t["tokens"]["output"].as_u64().unwrap_or(0)),
-        t["responses"].as_u64().unwrap_or(0),
-        t["sessions"].as_u64().unwrap_or(0),
-    );
-    if let Some(n) = t["unpriced_tokens"].as_u64().filter(|n| *n > 0) {
-        out.push_str(&format!("・単価不明 {}", usage_tokens(n)));
+fn usage_amount(t: &Value, lang: tako_core::i18n::Lang) -> String {
+    ReplyNote::UsageAmount {
+        usd: tako_core::usage::display::api_usd(t["api_usd"].as_f64().unwrap_or(0.0)),
+        tokens: usage_tokens(t["total_tokens"].as_u64().unwrap_or(0), lang),
+        output: usage_tokens(t["tokens"]["output"].as_u64().unwrap_or(0), lang),
+        responses: t["responses"].as_u64().unwrap_or(0),
+        sessions: t["sessions"].as_u64().unwrap_or(0),
+        unpriced: t["unpriced_tokens"]
+            .as_u64()
+            .filter(|n| *n > 0)
+            .map(|n| usage_tokens(n, lang)),
     }
-    out
+    .text_in(lang)
 }
 
-/// 期間の表記（右パネルの usage ビューと同じ 1 実装 = #2203）
-fn usage_range(window: &str, r: &Value, now: i64, utc_offset: i32) -> String {
-    tako_core::usage::display::range_label(window, r, now, utc_offset)
+/// 期間の表記（右パネルの usage ビューと同じ 1 実装 = #2203。表示言語 = #2365）
+fn usage_range(
+    window: &str,
+    r: &Value,
+    now: i64,
+    utc_offset: i32,
+    lang: tako_core::i18n::Lang,
+) -> String {
+    tako_core::usage::display::range_label_in(window, r, now, utc_offset, lang)
 }
 
 /// 利用制限の % の列に出す枠（主の枠 = `--window 5h` なら 5h、それ以外は 7d を左に）
@@ -7181,8 +7206,9 @@ fn usage_share_cells(kinds: &[Value], share: &Value) -> String {
         .join("  ")
 }
 
-/// 段の後ろの行: tako の外・推定の合計と、枠ごとの按分の要約（観測 = 段 + tako の外・係数とその幅）
-fn usage_share_footer(kinds: &[Value]) -> String {
+/// 段の後ろの行: tako の外・推定の合計と、枠ごとの按分の要約（観測 = 段 + tako の外・係数とその幅）。
+/// 文は表示言語（#2365。字下げと % の列の桁揃えはここ）
+fn usage_share_footer(kinds: &[Value], lang: tako_core::i18n::Lang) -> String {
     let mut out = String::new();
     let f = |k: &Value, key: &str| k[key].as_f64().unwrap_or(0.0);
     let available = |k: &Value| k["available"] == Value::Bool(true);
@@ -7193,10 +7219,7 @@ fn usage_share_footer(kinds: &[Value]) -> String {
             .collect();
         format!("      {}  {label}\n", cells.join("  "))
     };
-    out.push_str(&row(
-        "tako の外（区間にローカルの使用量が無いのに増えた分）",
-        "outside",
-    ));
+    out.push_str(&row(&ReplyNote::UsageOutsideLabel.text_in(lang), "outside"));
     if kinds.iter().any(|k| f(k, "estimated") >= 0.05) {
         let cells: Vec<String> = kinds
             .iter()
@@ -7209,71 +7232,69 @@ fn usage_share_footer(kinds: &[Value]) -> String {
             })
             .collect();
         out.push_str(&format!(
-            "      {}  推定の合計（観測の区間の外 = 最後の観測より後・観測の無い窓）\n",
-            cells.join("  ")
+            "      {}  {}\n",
+            cells.join("  "),
+            ReplyNote::UsageEstimatedLabel.text_in(lang)
         ));
     }
     for k in kinds {
-        let label = usage_kind_label(k);
+        let label = usage_kind_label(k).to_string();
         if !available(k) {
             out.push_str(&format!(
-                "    {label} の按分: このログインの観測が無いので % を出していない\n"
+                "    {}\n",
+                ReplyNote::UsageShareUnavailable(label).text_in(lang)
             ));
             continue;
         }
         let head = match (k["scope"].as_str(), k["latest_percent"].as_f64()) {
-            (Some("period"), _) => format!("期間の延べ {:.1}%", f(k, "observed")),
-            (_, Some(latest)) => format!("今の窓 {latest:.1}%"),
-            _ => "観測した今の窓が無い".to_string(),
+            (Some("period"), _) => UsageShareHead::Period(f(k, "observed")),
+            (_, Some(latest)) => UsageShareHead::Latest(latest),
+            _ => UsageShareHead::NoWindow,
         };
-        let mut line = format!(
-            "    {label} の按分: {head} = 段 {:.1} + tako の外 {:.1}",
-            f(k, "allocated"),
-            f(k, "outside")
-        );
-        if f(k, "estimated") >= 0.05 {
-            line.push_str(&format!("・推定 +{:.1}", f(k, "estimated")));
-        }
-        if let Some(per) = k["coefficient"]["usd_per_percent"].as_f64() {
-            line.push_str(&format!(
-                "・1% あたり API 換算 ${per:.2}（区間 {} 本",
-                k["coefficient"]["intervals"].as_u64().unwrap_or(0)
-            ));
-            let fit = k["windows"]
-                .as_array()
-                .and_then(|w| w.last())
-                .map(|w| &w["usd_per_percent"]);
-            match fit.filter(|v| v.is_object()) {
-                Some(v) => line.push_str(&format!(
-                    "・直近の窓の四分位 ${:.2}〜${:.2}）",
+        let per_usd = k["coefficient"]["usd_per_percent"].as_f64();
+        let quartiles = k["windows"]
+            .as_array()
+            .and_then(|w| w.last())
+            .map(|w| &w["usd_per_percent"])
+            .filter(|v| v.is_object())
+            .map(|v| {
+                (
                     v["p25"].as_f64().unwrap_or(0.0),
-                    v["p75"].as_f64().unwrap_or(0.0)
-                )),
-                None => line.push('）'),
-            }
-        }
+                    v["p75"].as_f64().unwrap_or(0.0),
+                )
+            });
         // codex など単価表に無いモデルだけのログインは 1% あたりの生トークン（S5 #2204）
-        if k["coefficient"]["usd_per_percent"].is_null() {
-            if let Some(per) = k["coefficient"]["tokens_per_percent"].as_f64() {
-                line.push_str(&format!(
-                    "・1% あたり トークン {}（区間 {} 本）",
-                    usage_tokens(per.max(0.0) as u64),
-                    k["coefficient"]["intervals"].as_u64().unwrap_or(0)
-                ));
-            }
-        }
-        if let Some(usd) = k["unestimated_usd"].as_f64().filter(|v| *v > 0.0) {
-            line.push_str(&format!("・% へ直せない API 換算 ${usd:.2}"));
-        }
-        out.push_str(&line);
-        out.push('\n');
+        let per_tokens = if k["coefficient"]["usd_per_percent"].is_null() {
+            k["coefficient"]["tokens_per_percent"]
+                .as_f64()
+                .map(|per| usage_tokens(per.max(0.0) as u64, lang))
+        } else {
+            None
+        };
+        let line =
+            ReplyNote::UsageShareLine(Box::new(tako_control::reply_note::UsageShareLineFields {
+                label,
+                head,
+                allocated: f(k, "allocated"),
+                outside: f(k, "outside"),
+                estimated: Some(f(k, "estimated")).filter(|e| *e >= 0.05),
+                per_usd,
+                per_tokens,
+                intervals: k["coefficient"]["intervals"].as_u64().unwrap_or(0),
+                quartiles,
+                unestimated_usd: k["unestimated_usd"].as_f64().filter(|v| *v > 0.0),
+            }));
+        out.push_str(&format!("    {}\n", line.text_in(lang)));
     }
     out
 }
 
 /// `tako usage` の既定出力（機械検証できるよう印字と分けてある）。時刻の表記は
-/// `tako todo show` と同じ 1 実装（`user_task::response_stamp`）
-fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
+/// `tako todo show` と同じ 1 実装（`user_task::response_stamp`）。枠の文は表示言語（#2365）。
+/// 応答の注記（`notes`）と案内（`hint`）は、日本語なら応答の文をそのまま、英語なら応答から
+/// 同じ型を組み直す（`usage::usage_notes` = 作る側と同じ 1 実装）
+fn usage_text(p: &Value, now: i64, utc_offset: i32, lang: tako_core::i18n::Lang) -> String {
+    use tako_core::i18n::Lang;
     let stamp_ms = |ms: &Value| {
         ms.as_u64()
             .map(|ms| tako_core::user_task::response_stamp((ms / 1000) as i64, now, utc_offset))
@@ -7287,18 +7308,23 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
             format!("{f:.1}%")
         }
     };
-    let mut out = String::from(
-        "利用制限の観測（tako mod の報告と codex の rollout。% か解除時刻が変わったときだけ記録）と使用量の内訳\n",
-    );
+    let hint = || match lang {
+        Lang::Ja => p["hint"].as_str().map(str::to_string),
+        Lang::En => p["hint"]
+            .is_string()
+            .then(|| ReplyNote::UsageNoObservations.text_in(lang)),
+    };
+    let mut out = format!("{}\n", ReplyNote::UsageHeader.text_in(lang));
     if p["recording"] == Value::Bool(false) {
+        let env = p["legacy_env"].as_str().map(str::to_string);
         out.push_str(&format!(
-            "  記録していない（{} が立っている）\n",
-            p["legacy_env"].as_str().unwrap_or("A/B の env")
+            "  {}\n",
+            ReplyNote::UsageNotRecording(env).text_in(lang)
         ));
     }
     let logins = p["logins"].as_array().cloned().unwrap_or_default();
     if logins.is_empty() {
-        if let Some(hint) = p["hint"].as_str() {
+        if let Some(hint) = hint() {
             out.push_str(&format!("  {hint}\n"));
         }
         return out;
@@ -7306,71 +7332,58 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
     let window = p["window"].as_str().unwrap_or("7d");
     let by = p["by"].as_str().unwrap_or("project");
     for l in &logins {
-        let from = match l["key_from"].as_str() {
-            Some("config_dir") => " = 資格情報を読めず設定 dir で束ねた",
-            _ => "",
+        let line = ReplyNote::UsageLoginLine {
+            label: l["label"].as_str().unwrap_or("-").to_string(),
+            // S5 #2204: codex のログインは系統を添える（claude は既定なので書かない）
+            codex: l["agent"].as_str() == Some("codex"),
+            login: l["login"].as_str().unwrap_or("-").to_string(),
+            config_dir: l["key_from"].as_str() == Some("config_dir"),
+            observations: l["observations"].as_u64().unwrap_or(0),
+            // 内訳があるときの会話数は内訳の行に出す（ここの会話は mod の報告で対応づけた数で、意味が違う）
+            sessions: (!l["usage"].is_object()).then(|| l["sessions"].as_u64().unwrap_or(0)),
         };
-        // 内訳があるときの会話数は内訳の行に出す（ここの会話は mod の報告で対応づけた数で、意味が違う）
-        let sessions = if l["usage"].is_object() {
-            String::new()
-        } else {
-            format!("・会話 {} 本", l["sessions"].as_u64().unwrap_or(0))
-        };
-        // S5 #2204: codex のログインは系統を添える（claude は既定なので書かない）
-        let agent = match l["agent"].as_str() {
-            Some("codex") => "codex・",
-            _ => "",
-        };
-        out.push_str(&format!(
-            "  ログイン {}（{agent}鍵 {}{from}）  観測 {} 点{sessions}\n",
-            l["label"].as_str().unwrap_or("-"),
-            l["login"].as_str().unwrap_or("-"),
-            l["observations"].as_u64().unwrap_or(0),
-        ));
+        out.push_str(&format!("  {}\n", line.text_in(lang)));
         for w in l["windows"].as_array().cloned().unwrap_or_default() {
             let kind = match w["kind"].as_str() {
                 Some("five_hour") => "5h".to_string(),
                 Some("seven_day") => "7d".to_string(),
                 other => other.unwrap_or("-").to_string(),
             };
-            let resets = w["resets_at"]
-                .as_i64()
-                .map(|r| tako_core::user_task::response_stamp(r, now, utc_offset))
-                .unwrap_or_else(|| "-".into());
-            let expired = if w["expired"] == Value::Bool(true) {
-                "（過ぎた = 今の窓の値ではない）"
-            } else {
-                ""
+            let rest = ReplyNote::UsageWindowRest {
+                resets: w["resets_at"]
+                    .as_i64()
+                    .map(|r| tako_core::user_task::response_stamp(r, now, utc_offset))
+                    .unwrap_or_else(|| "-".into()),
+                expired: w["expired"] == Value::Bool(true),
+                observed: stamp_ms(&w["observed_at"]),
+                observations: w["observations"].as_u64().unwrap_or(0),
             };
             out.push_str(&format!(
-                "    {kind:<3} {:>5}  解除 {resets}{expired}  最新の観測 {}（{} 点）\n",
+                "    {kind:<3} {:>5}  {}\n",
                 pct(&w["used_percent"]),
-                stamp_ms(&w["observed_at"]),
-                w["observations"].as_u64().unwrap_or(0),
+                rest.text_in(lang)
             ));
         }
         let usage = &l["usage"];
         if usage.is_object() {
             out.push_str(&format!(
                 "    {}  {}\n",
-                usage_range(window, &usage["range"], now, utc_offset),
-                usage_amount(&usage["total"])
+                usage_range(window, &usage["range"], now, utc_offset, lang),
+                usage_amount(&usage["total"], lang)
             ));
             // #2202: 利用制限の % の列（観測のある枠だけ。主の枠を左に）
             let kinds = usage_share_kinds(&usage["limit_share"], window);
             let shares = kinds.iter().any(|k| k["available"] == Value::Bool(true));
             if shares {
-                let scope = match kinds.iter().find_map(|k| k["scope"].as_str()) {
-                    Some("period") => "期間に重なる窓の延べ",
-                    _ => "今の窓のうち各段が使った分",
-                };
+                let period = kinds.iter().find_map(|k| k["scope"].as_str()) == Some("period");
                 let heads: Vec<String> = kinds
                     .iter()
                     .map(|k| format!("{:>6}{:6}", usage_kind_label(k), ""))
                     .collect();
                 out.push_str(&format!(
-                    "      {}（% は{scope}・+ は推定）\n",
-                    heads.join("  ")
+                    "      {}{}\n",
+                    heads.join("  "),
+                    ReplyNote::UsageShareHeadNote { period }.text_in(lang)
                 ));
             }
             for g in usage["groups"].as_array().cloned().unwrap_or_default() {
@@ -7381,42 +7394,64 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
                 };
                 out.push_str(&format!(
                     "      {cells}{}  {}\n",
-                    g["name"].as_str().unwrap_or("-"),
-                    usage_amount(&g)
+                    usage_group_name(&g, by, lang),
+                    usage_amount(&g, lang)
                 ));
             }
             if let Some(n) = usage["more_groups"].as_u64() {
-                out.push_str(&format!("      ほか {n} 件（--limit で増やせる）\n"));
+                out.push_str(&format!(
+                    "      {}\n",
+                    ReplyNote::UsageMoreGroups(n).text_in(lang)
+                ));
             }
             if shares {
-                out.push_str(&usage_share_footer(&kinds));
+                out.push_str(&usage_share_footer(&kinds, lang));
             }
         } else if p["index"]["enabled"] == Value::Bool(true) {
-            out.push_str("    この期間の使用量は無い\n");
+            out.push_str(&format!(
+                "    {}\n",
+                ReplyNote::UsageNoUsageInPeriod.text_in(lang)
+            ));
         }
     }
     let observations = p["observations"].as_u64().unwrap_or(0);
     if observations > 0 {
-        out.push_str(&format!(
-            "  記録 {observations} 点（{} 〜 {}）\n",
-            stamp_ms(&p["first_observed_at"]),
-            stamp_ms(&p["last_observed_at"]),
-        ));
-    } else if let Some(hint) = p["hint"].as_str() {
+        let recorded = ReplyNote::UsageRecorded {
+            observations,
+            from: stamp_ms(&p["first_observed_at"]),
+            to: stamp_ms(&p["last_observed_at"]),
+        };
+        out.push_str(&format!("  {}\n", recorded.text_in(lang)));
+    } else if let Some(hint) = hint() {
         out.push_str(&format!("  {hint}\n"));
     }
     if let Some(n) = p["unreadable_lines"].as_u64() {
         out.push_str(&format!(
-            "  読めない行 {n} 行を飛ばした（書きかけ・壊れた行）\n"
+            "  {}\n",
+            ReplyNote::UsageUnreadableLines(n).text_in(lang)
         ));
     }
     if p["index"]["enabled"] == Value::Bool(true) && by != "project" {
-        out.push_str(&format!("  段: {by}（既定は project）\n"));
+        out.push_str(&format!(
+            "  {}\n",
+            ReplyNote::UsageBy(by.to_string()).text_in(lang)
+        ));
     }
-    for note in p["notes"].as_array().cloned().unwrap_or_default() {
-        if let Some(note) = note.as_str() {
-            out.push_str(&format!("  注: {note}\n"));
-        }
+    let notes: Vec<String> = match lang {
+        Lang::Ja => p["notes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect(),
+        Lang::En => tako_control::usage::usage_notes(p)
+            .iter()
+            .map(|n| n.text_in(lang))
+            .collect(),
+    };
+    let label = ReplyNote::UsageNoteLabel.text_in(lang);
+    for note in notes {
+        out.push_str(&format!("  {label}: {note}\n"));
     }
     out
 }
@@ -7911,16 +7946,27 @@ fn check_health_cli(json: bool) -> Result<(), String> {
     }
 }
 
-/// GUI に届かないときに添える 1 行（#1993。順番待ち #1994 は GUI の中の調停役が持つ）
-const QUEUE_OFFLINE_NOTE: &str = "順番待ちは無効（tako が起動していない）";
+/// 調停役（GUI）が組む待つ理由（日本語は調停役の 1 文、英語は理由の種類 `code` から。#2365）
+fn queue_wait_reason(code: &Value, ja: &str) -> ReplyNote {
+    ReplyNote::QueueWaitReason {
+        code: code.as_str().map(str::to_string),
+        ja: ja.to_string(),
+    }
+}
 
-/// GUI が繋がったまま応答しないときに添える 1 行（#2123）
-fn queue_unresponsive_note(limit: std::time::Duration) -> String {
-    format!(
-        "順番待ちの状況は読めない（tako が {} 秒応答しない = GUI が固まっている可能性。\
-         tako queue <コマンド> は待たずに走る）",
-        limit.as_secs()
-    )
+/// 実行中の 1 件の終わりの見込み（日本語は調停役の文 `eta.text`、英語は `eta` の欄と行の経過から。#2365）
+fn queue_eta(eta: &Value, ja: &str, ran_s: u64) -> ReplyNote {
+    ReplyNote::QueueEta {
+        ja: ja.to_string(),
+        state: eta["state"].as_str().unwrap_or("unknown").to_string(),
+        remaining_s: eta["remaining_s"].as_u64(),
+        previous_s: eta["previous_s"].as_u64(),
+        from_progress: eta["from"] == "progress",
+        progress: eta["progress"]["total"]
+            .as_u64()
+            .map(|total| (eta["progress"]["done"].as_u64().unwrap_or(0), total)),
+        ran_s,
+    }
 }
 
 /// 機全体の CPU% を出すために、GUI が居ないとき 2 回採る間隔
@@ -8028,37 +8074,33 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
                 priority: None,
             };
             let result = queue_send(request).map_err(|e| match e {
-                SendError::Unreachable(_) => QUEUE_OFFLINE_NOTE.to_string(),
+                SendError::Unreachable(_) => front_err(Reason::QueueArbiterOffline),
                 SendError::Timeout(limit) => tako_control::protocol::reply_timeout_message(limit),
                 SendError::Rejected(m) => m,
             })?;
             if *json {
                 println!("{}", pretty_json(&result));
             } else {
-                let what = if result["phase"] == "waiting" {
-                    "待ちから外した（その tako queue は 125 で終わる）"
-                } else {
-                    "子を止める（SIGTERM → 10 秒で SIGKILL）"
+                let cancelled = ReplyNote::QueueCancelled {
+                    id: result["id"].to_string(),
+                    label: result["label"].as_str().unwrap_or("").to_string(),
+                    waiting: result["phase"] == "waiting",
                 };
-                println!(
-                    "取り消した: {} {} — {what}",
-                    result["id"],
-                    result["label"].as_str().unwrap_or("")
-                );
+                println!("{}", cancelled.text_in(cli_lang()));
             }
             Ok(())
         }
         Some(QueueCommand::Priority { values, pane, json }) => {
             let request = queue_priority_request(values, *pane)?;
             let result = queue_send(request).map_err(|e| match e {
-                SendError::Unreachable(_) => QUEUE_OFFLINE_NOTE.to_string(),
+                SendError::Unreachable(_) => front_err(Reason::QueueArbiterOffline),
                 SendError::Timeout(limit) => tako_control::protocol::reply_timeout_message(limit),
                 SendError::Rejected(m) => m,
             })?;
             if *json {
                 println!("{}", pretty_json(&result));
             } else {
-                print_queue_priority(&result);
+                print_queue_priority(&result, cli_lang());
             }
             Ok(())
         }
@@ -8072,26 +8114,26 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
                 priority: None,
             };
             let result = queue_send(request).map_err(|e| match e {
-                SendError::Unreachable(_) => QUEUE_OFFLINE_NOTE.to_string(),
+                SendError::Unreachable(_) => front_err(Reason::QueueArbiterOffline),
                 SendError::Timeout(limit) => tako_control::protocol::reply_timeout_message(limit),
                 SendError::Rejected(m) => m,
             })?;
+            let lang = cli_lang();
             if *json {
                 println!("{}", pretty_json(&result));
             } else if result["state"] == "already_started" {
-                println!("ペイン {} の agent はもう起こしている", result["pane"]);
+                let started = ReplyNote::QueueAgentAlreadyStarted(result["pane"].to_string());
+                println!("{}", started.text_in(lang));
             } else {
-                println!(
-                    "ペイン {} の agent を今すぐ起こす（待ち {}{}）",
-                    result["pane"],
-                    tako_control::queue_wrapper::human_secs(
-                        result["waited_s"].as_u64().unwrap_or(0)
-                    ),
-                    result["was"]["reason"]
-                        .as_str()
-                        .map(|r| format!("・待っていた理由: {r}"))
-                        .unwrap_or_default()
-                );
+                let reason = result["was"]["reason"]
+                    .as_str()
+                    .map(|r| queue_wait_reason(&result["was"]["code"], r).text_in(lang));
+                let start = ReplyNote::QueueAgentStartNow {
+                    pane: result["pane"].to_string(),
+                    waited_s: result["waited_s"].as_u64().unwrap_or(0),
+                    reason,
+                };
+                println!("{}", start.text_in(lang));
             }
             Ok(())
         }
@@ -8131,7 +8173,7 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
             if *json {
                 println!("{}", pretty_json(&result));
             } else {
-                print_queue_limits(&result);
+                print_queue_limits(&result, cli_lang());
             }
             Ok(())
         }
@@ -8173,39 +8215,46 @@ fn queue_priority_request(values: &[String], pane: Option<u64>) -> Result<Reques
     })
 }
 
-/// `tako queue`（状況）: PC リソースと順番待ち（#1993 / #1994）。届かなければ機の状態だけをこのプロセスで採る
+/// `tako queue`（状況）: PC リソースと順番待ち（#1993 / #1994）。届かなければ機の状態だけをこのプロセスで採る。
+/// 届かない・応答しないときの 1 行は `--json` の `note` では日本語のまま、人向けの表示は表示言語（#2365）
 fn queue_status_cli(json: bool) -> Result<(), String> {
     use tako_control::queue_wrapper::SendError;
+    use tako_core::i18n::Lang;
+    let mut note = None;
     let result = match queue_send(queue_request("status")) {
         Ok(result) => result,
         Err(SendError::Rejected(message)) => return Err(message),
         Err(SendError::Unreachable(reason)) => {
+            let offline = ReplyNote::QueueOfflineNote;
             let mut local = tako_control::resources::machine_only(QUEUE_OFFLINE_CPU_WINDOW);
             local["gui"] = serde_json::json!(false);
-            local["note"] = serde_json::json!(QUEUE_OFFLINE_NOTE);
+            local["note"] = serde_json::json!(offline.text_in(Lang::Ja));
             local["reason"] = serde_json::json!(reason);
+            note = Some(offline);
             local
         }
         // #2123: 繋がったまま応答しない GUI。機の状態はこのプロセスで採って返す
         Err(SendError::Timeout(limit)) => {
+            let unresponsive = ReplyNote::QueueUnresponsiveNote(limit.as_secs());
             let mut local = tako_control::resources::machine_only(QUEUE_OFFLINE_CPU_WINDOW);
             local["gui"] = serde_json::json!(false);
-            local["note"] = serde_json::json!(queue_unresponsive_note(limit));
+            local["note"] = serde_json::json!(unresponsive.text_in(Lang::Ja));
             local["reason"] =
                 serde_json::json!(tako_control::protocol::reply_timeout_message(limit));
+            note = Some(unresponsive);
             local
         }
     };
     if json {
         println!("{}", pretty_json(&result));
     } else {
-        print_queue_status(&result);
+        print_queue_status(&result, note.as_ref(), cli_lang());
     }
     Ok(())
 }
 
 /// 上限の 1 行
-fn print_queue_limits(v: &Value) {
+fn print_queue_limits(v: &Value, lang: tako_core::i18n::Lang) {
     let configured = &v["configured"];
     let set: Vec<String> = [
         "max_jobs",
@@ -8218,229 +8267,208 @@ fn print_queue_limits(v: &Value) {
     .filter(|k| !configured[**k].is_null())
     .map(|k| format!("{k}={}", configured[*k]))
     .collect();
-    println!(
-        "同時 {} 件・予約 {} GB・swap の警戒線 {} GB・待ちの上限 {} 分・cargo の札 {}（{}）",
-        v["max_jobs"],
-        v["reserve_gb"],
-        v["swap_guard_gb"],
-        v["max_wait_min"],
+    let limits = ReplyNote::QueueLimits(Box::new(tako_control::reply_note::QueueLimitsFields {
+        max_jobs: v["max_jobs"].to_string(),
+        reserve_gb: v["reserve_gb"].to_string(),
+        swap_guard_gb: v["swap_guard_gb"].to_string(),
+        max_wait_min: v["max_wait_min"].to_string(),
         // 旧い GUI は欄を返さない（そのときは何も言わない）
-        match v["jobserver"].as_bool() {
+        jobserver: match v["jobserver"].as_bool() {
             Some(true) => "on",
             Some(false) => "off",
             None => "-",
-        },
-        if set.is_empty() {
-            "すべて機に合わせた既定".to_string()
-        } else {
-            format!("設定: {}", set.join(" "))
         }
-    );
+        .to_string(),
+        configured: (!set.is_empty()).then(|| set.join(" ")),
+    }));
+    println!("{}", limits.text_in(lang));
 }
 
-/// 優先度の段の表示（#1996）: 「high（ペインの既定）」/「high（normal から待ちで上がった）」
-fn queue_priority_text(v: &Value) -> String {
+/// 優先度の段の表示（#1996）: 「high（ペインの既定）」/「high（ペインの既定 normal から待ちで上がった）」
+fn queue_priority_text(v: &Value, lang: tako_core::i18n::Lang) -> String {
     let p = v["priority"].as_str().unwrap_or("normal");
-    let from = match v["priority_from"].as_str() {
-        Some("job") => "処理に付けた段",
-        Some("pane") => "ペインの既定",
-        Some("role") => "役割の既定",
-        _ => return p.to_string(),
+    let Some(from) = v["priority_from"]
+        .as_str()
+        .filter(|f| matches!(*f, "job" | "pane" | "role"))
+    else {
+        return p.to_string();
     };
-    if v["aged"] == true {
-        format!(
-            "{p}（{from} {} から待ちで上がった）",
-            v["base_priority"].as_str().unwrap_or("?")
-        )
-    } else {
-        format!("{p}（{from}）")
+    ReplyNote::QueuePriorityFrom {
+        priority: p.to_string(),
+        from: from.to_string(),
+        aged_from: (v["aged"] == true)
+            .then(|| v["base_priority"].as_str().unwrap_or("?").to_string()),
     }
+    .text_in(lang)
 }
 
 /// `tako queue priority` の結果（#1996）
-fn print_queue_priority(v: &Value) {
+fn print_queue_priority(v: &Value, lang: tako_core::i18n::Lang) {
     if let Some(pane) = v["pane"].as_u64() {
         let jobs = v["jobs"].as_array().cloned().unwrap_or_default();
-        println!(
-            "ペイン {pane} から出る処理の優先度の既定を {} にした（順番待ちの中のそのペインの処理 {} 件）",
-            v["priority"].as_str().unwrap_or("?"),
-            jobs.len()
-        );
+        let changed = ReplyNote::QueuePanePriorityChanged {
+            pane,
+            priority: v["priority"].as_str().unwrap_or("?").to_string(),
+            jobs: jobs.len(),
+        };
+        println!("{}", changed.text_in(lang));
         for j in &jobs {
             println!(
                 "  {}  {}  {}  {}",
                 j["id"],
                 j["label"].as_str().unwrap_or("?"),
                 j["phase"].as_str().unwrap_or("?"),
-                queue_priority_text(j)
+                queue_priority_text(j, lang)
             );
         }
         return;
     }
-    println!(
-        "優先度: {} {} → {}{}",
-        v["id"],
-        v["label"].as_str().unwrap_or(""),
-        queue_priority_text(v),
-        v["position"]
-            .as_u64()
-            .map(|p| format!("・待ち {p} 番目"))
-            .unwrap_or_default()
-    );
+    let changed = ReplyNote::QueueJobPriorityChanged {
+        id: v["id"].to_string(),
+        label: v["label"].as_str().unwrap_or("").to_string(),
+        priority: queue_priority_text(v, lang),
+        position: v["position"].as_u64(),
+    };
+    println!("{}", changed.text_in(lang));
     if let Some(note) = v["note"].as_str() {
-        println!("  {note}");
+        let note = ReplyNote::QueuePriorityRunningNote(note.to_string());
+        println!("  {}", note.text_in(lang));
     }
 }
 
 /// 順番待ちの節の表示（#1994）
-fn print_queue_section(q: &Value) {
+fn print_queue_section(q: &Value, lang: tako_core::i18n::Lang) {
     if q.is_null() {
         return;
     }
     if q["arbiter"] != true {
-        println!(
-            "順番待ち: {}",
-            q["reason"].as_str().unwrap_or("この tako は調停役ではない")
-        );
+        let reason = q["reason"].as_str().map(str::to_string);
+        println!("{}", ReplyNote::QueueNotArbiter(reason).text_in(lang));
         return;
     }
     let running = q["running"].as_array().cloned().unwrap_or_default();
     let waiting = q["waiting"].as_array().cloned().unwrap_or_default();
     let limits = &q["limits"];
-    let mut head = format!(
-        "順番待ち: 実行 {} / 上限 {}・待ち {}（予約 {} GB）",
-        running.len(),
-        limits["max_jobs"],
-        waiting.len(),
-        limits["reserve_gb"]
-    );
-    if q["unmanaged"].as_u64().unwrap_or(0) > 0 {
-        head.push_str(&format!(
-            "・順番待ちを通っていない重い処理 {}",
-            q["unmanaged"]
-        ));
-    }
-    println!("{head}");
-    let pane = |r: &Value| {
-        r["pane"]
-            .as_u64()
-            .map(|p| format!("  ペイン {p}"))
-            .unwrap_or_default()
+    let head = ReplyNote::QueueSectionHead {
+        running: running.len(),
+        max_jobs: limits["max_jobs"].to_string(),
+        waiting: waiting.len(),
+        reserve_gb: limits["reserve_gb"].to_string(),
+        unmanaged: (q["unmanaged"].as_u64().unwrap_or(0) > 0).then(|| q["unmanaged"].to_string()),
     };
+    println!("{}", head.text_in(lang));
     for r in &running {
         let mem = match (r["memory_mb"].as_u64(), r["peak_mb"].as_u64()) {
-            (Some(m), Some(p)) => format!("  {}（最大 {}）", human_mb(m), human_mb(p)),
-            (Some(m), None) => format!("  {}", human_mb(m)),
-            _ => String::new(),
+            (Some(m), Some(p)) => Some(
+                ReplyNote::QueueMemoryPeak {
+                    used: human_mb(m),
+                    peak: human_mb(p),
+                }
+                .text_in(lang),
+            ),
+            (Some(m), None) => Some(human_mb(m)),
+            _ => None,
         };
         // 後ろの空きメモリの判定で押さえている分（ピーク前の「まだ使っていない見込み」。#2254）
-        let pending = r["pending_mb"]
-            .as_u64()
-            .filter(|p| *p > 0)
-            .map(|p| {
-                format!(
-                    "  まだ使っていない見込み {}（見込み {}）",
-                    human_mb(p),
-                    human_mb(r["estimate_mb"].as_u64().unwrap_or(0))
-                )
-            })
-            .unwrap_or_default();
-        let mut flags = Vec::new();
-        if r["stalled"] == true {
-            flags.push("停滞（枠を返した）");
-        }
-        if r["cancel"] == true {
-            flags.push("取り消し中");
-        }
+        let pending = r["pending_mb"].as_u64().filter(|p| *p > 0).map(|p| {
+            ReplyNote::QueuePending {
+                pending: human_mb(p),
+                estimate: human_mb(r["estimate_mb"].as_u64().unwrap_or(0)),
+            }
+            .text_in(lang)
+        });
+        let (stalled, cancelling) = (r["stalled"] == true, r["cancel"] == true);
+        let flags = (stalled || cancelling).then(|| {
+            ReplyNote::QueueRunningFlags {
+                stalled,
+                cancelling,
+            }
+            .text_in(lang)
+        });
         // 進みと終わりの見込み（#1996。旧い GUI は返さない）
         let progress = r["progress"]["total"]
             .as_u64()
             .map(|m| format!("  {}/{m}", r["progress"]["done"].as_u64().unwrap_or(0)))
             .unwrap_or_default();
+        let ran_s = r["ran_s"].as_u64().unwrap_or(0);
         let eta = r["eta"]["text"]
             .as_str()
-            .map(|t| format!("  — {t}"))
-            .unwrap_or_default();
-        println!(
-            "  実行  {}  {}{}  {}{}{}{}  取り分 {}{}{}",
-            r["id"],
-            r["label"].as_str().unwrap_or("?"),
-            pane(r),
-            tako_control::queue_wrapper::human_secs(r["ran_s"].as_u64().unwrap_or(0)),
-            progress,
-            mem,
-            pending,
-            r["share"],
-            if flags.is_empty() {
-                String::new()
-            } else {
-                format!("  [{}]", flags.join("・"))
-            },
-            eta
-        );
+            .map(|t| queue_eta(&r["eta"], t, ran_s).text_in(lang));
+        let row =
+            ReplyNote::QueueRunningRow(Box::new(tako_control::reply_note::QueueRunningRowFields {
+                id: r["id"].to_string(),
+                label: r["label"].as_str().unwrap_or("?").to_string(),
+                pane: r["pane"].as_u64().map(|p| p.to_string()),
+                ran_s,
+                progress,
+                mem,
+                pending,
+                share: r["share"].to_string(),
+                flags,
+                eta,
+            }));
+        println!("  {}", row.text_in(lang));
     }
     for w in &waiting {
-        println!(
-            "  待ち {}  {}  {}{}  {}  待ち {}{}{}",
-            w["position"],
-            w["id"],
-            w["label"].as_str().unwrap_or("?"),
-            pane(w),
-            queue_priority_text(w),
-            tako_control::queue_wrapper::human_secs(w["waited_s"].as_u64().unwrap_or(0)),
-            // 開始の見込み（#1996。前に並ぶ全件と実行中の全件に見込みがあるときだけ）
-            w["start_text"]
-                .as_str()
-                .map(|t| format!("・{t}"))
-                .unwrap_or_default(),
-            // 待ちごとの理由（#2243。target dir 待ちの先頭は追い越せるので、先頭の理由だけでは
-            // 後ろが何を待っているか分からない）
-            w["text"]
-                .as_str()
-                .map(|t| format!("  — {t}"))
-                .unwrap_or_default()
-        );
+        let row =
+            ReplyNote::QueueWaitingRow(Box::new(tako_control::reply_note::QueueWaitingRowFields {
+                position: w["position"].to_string(),
+                id: w["id"].to_string(),
+                label: w["label"].as_str().unwrap_or("?").to_string(),
+                pane: w["pane"].as_u64().map(|p| p.to_string()),
+                priority: queue_priority_text(w, lang),
+                waited_s: w["waited_s"].as_u64().unwrap_or(0),
+                // 開始の見込み（#1996。前に並ぶ全件と実行中の全件に見込みがあるときだけ）
+                start: w["start_text"].as_str().map(|t| {
+                    ReplyNote::QueueStartEta {
+                        ja: t.to_string(),
+                        start_s: w["start_s"].as_u64().unwrap_or(0),
+                    }
+                    .text_in(lang)
+                }),
+                // 待ちごとの理由（#2243。target dir 待ちの先頭は追い越せるので、先頭の理由だけでは
+                // 後ろが何を待っているか分からない）
+                reason: w["text"]
+                    .as_str()
+                    .map(|t| queue_wait_reason(&w["reason"], t).text_in(lang)),
+            }));
+        println!("  {}", row.text_in(lang));
     }
     // 待ちごとの理由を返さない旧い GUI のときだけ、先頭の理由を 1 行で
     let per_job = waiting.iter().any(|w| w["text"].is_string());
     if let Some(text) = q["blocked"]["text"].as_str().filter(|_| !per_job) {
-        println!("  先頭が待つ理由: {text}");
+        let reason = queue_wait_reason(&q["blocked"]["reason"], text).text_in(lang);
+        println!("  {}", ReplyNote::QueueHeadReason(reason).text_in(lang));
     }
     let recent = q["recent"].as_array().cloned().unwrap_or_default();
     // 直近に終わった件（諦めた待ちは下の「直近の諦め」で出す）
     if let Some(r) = recent.iter().find(|r| r["gave_up"] != true) {
-        let end = if r["lost"] == true {
-            "wrapper が消えた".to_string()
-        } else {
-            format!("終了 {}", r["exit_code"])
+        let row = ReplyNote::QueueRecent {
+            id: r["id"].to_string(),
+            label: r["label"].as_str().unwrap_or("?").to_string(),
+            exit: (r["lost"] != true).then(|| r["exit_code"].to_string()),
+            ran_s: r["ran_s"].as_u64().unwrap_or(0),
+            peak: r["peak_mb"].as_u64().map(human_mb),
         };
-        println!(
-            "  直近: {}  {}  {}（{}{}）",
-            r["id"],
-            r["label"].as_str().unwrap_or("?"),
-            end,
-            tako_control::queue_wrapper::human_secs(r["ran_s"].as_u64().unwrap_or(0)),
-            r["peak_mb"]
-                .as_u64()
-                .map(|p| format!("・最大 {}", human_mb(p)))
-                .unwrap_or_default()
-        );
+        println!("  {}", row.text_in(lang));
     }
     // 待ちの上限で諦めた直近の件と、そのとき押さえていた処理（#2254）
     if let Some(r) = recent.iter().find(|r| r["gave_up"] == true) {
-        println!(
-            "  直近の諦め: {}  {}  待ち {}{}",
-            r["id"],
-            r["label"].as_str().unwrap_or("?"),
-            tako_control::queue_wrapper::human_secs(r["waited_s"].as_u64().unwrap_or(0)),
-            r["text"]
+        let row = ReplyNote::QueueGaveUp {
+            id: r["id"].to_string(),
+            label: r["label"].as_str().unwrap_or("?").to_string(),
+            waited_s: r["waited_s"].as_u64().unwrap_or(0),
+            reason: r["text"]
                 .as_str()
-                .map(|t| format!("  — {t}"))
-                .unwrap_or_default()
+                .map(|t| queue_wait_reason(&r["reason"], t).text_in(lang)),
+        };
+        println!("  {}", row.text_in(lang));
+        let lines = tako_control::queue_wrapper::gave_up_lines_in(
+            &serde_json::json!({
+                "holders": r["holders"],
+            }),
+            lang,
         );
-        let lines = tako_control::queue_wrapper::gave_up_lines(&serde_json::json!({
-            "holders": r["holders"],
-        }));
         for line in lines {
             println!("    {line}");
         }
@@ -8451,15 +8479,13 @@ fn print_queue_section(q: &Value) {
 use tako_control::queue_wrapper::human_mb;
 
 /// 誰の処理か（ペインなら番号・タブ・役割、外なら起点のアプリ）
-fn queue_owner_text(v: &Value) -> String {
+fn queue_owner_text(v: &Value, lang: tako_core::i18n::Lang) -> String {
     if let Some(origin) = v["external"].as_str() {
-        return if origin.is_empty() {
-            "tako の外".to_string()
-        } else {
-            format!("tako の外（{origin}）")
-        };
+        let origin = Some(origin).filter(|o| !o.is_empty()).map(str::to_string);
+        return ReplyNote::QueueOwnerExternal(origin).text_in(lang);
     }
-    let mut parts = vec![format!("ペイン {}", v["pane"].as_u64().unwrap_or(0))];
+    let pane = v["pane"].as_u64().unwrap_or(0).to_string();
+    let mut parts = vec![ReplyNote::QueuePane(pane).text_in(lang)];
     for key in ["tab", "role"] {
         if let Some(t) = v[key].as_str().filter(|t| !t.is_empty()) {
             parts.push(t.to_string());
@@ -8468,66 +8494,67 @@ fn queue_owner_text(v: &Value) -> String {
     parts.join(" · ")
 }
 
-/// `tako queue` の人間向け表示
-fn print_queue_status(v: &Value) {
-    if let Some(note) = v["note"].as_str() {
-        println!("{note}");
+/// `tako queue` の人間向け表示（`note` = このプロセスが添える 1 行。無ければ応答の `note`）
+fn print_queue_status(v: &Value, note: Option<&ReplyNote>, lang: tako_core::i18n::Lang) {
+    match note {
+        Some(note) => println!("{}", note.text_in(lang)),
+        None => {
+            if let Some(note) = v["note"].as_str() {
+                println!("{note}");
+            }
+        }
     }
     let m = &v["machine"];
     if m.is_null() {
+        let reason = v["machine_unavailable"].as_str().map(str::to_string);
         println!(
-            "機の状態: {}",
-            v["machine_unavailable"].as_str().unwrap_or("採れない")
+            "{}",
+            ReplyNote::QueueMachineUnavailable(reason).text_in(lang)
         );
     } else {
         let mem = &m["memory_mb"];
         let n = |key: &str| mem[key].as_u64().unwrap_or(0);
-        let mut line = format!(
-            "メモリ {} / {}（app {}・wired {}・圧縮 {}・空き {}）",
-            human_mb(n("used")),
-            human_mb(n("total")),
-            human_mb(n("app")),
-            human_mb(n("wired")),
-            human_mb(n("compressed")),
-            human_mb(n("available")),
-        );
-        if let Some(swap) = m["swap_mb"].as_object() {
-            line.push_str(&format!(
-                "  swap {} / {}",
-                human_mb(swap["used"].as_u64().unwrap_or(0)),
-                human_mb(swap["total"].as_u64().unwrap_or(0))
-            ));
-        }
-        if let Some(p) = m["pressure"].as_str() {
-            line.push_str(&format!("  メモリ圧 {p}"));
-        }
-        println!("{line}");
-        let mut cpu = format!(
-            "CPU {}",
-            m["cpu_percent"]
+        let memory =
+            ReplyNote::QueueMemoryLine(Box::new(tako_control::reply_note::QueueMemoryLineFields {
+                used: human_mb(n("used")),
+                total: human_mb(n("total")),
+                app: human_mb(n("app")),
+                wired: human_mb(n("wired")),
+                compressed: human_mb(n("compressed")),
+                available: human_mb(n("available")),
+                swap: m["swap_mb"].as_object().map(|swap| {
+                    (
+                        human_mb(swap["used"].as_u64().unwrap_or(0)),
+                        human_mb(swap["total"].as_u64().unwrap_or(0)),
+                    )
+                }),
+                pressure: m["pressure"].as_str().map(str::to_string),
+            }));
+        println!("{}", memory.text_in(lang));
+        let cpu = ReplyNote::QueueCpuLine {
+            cpu: m["cpu_percent"]
                 .as_f64()
                 .map(|c| format!("{c:.0}%"))
-                .unwrap_or_else(|| "?".into())
-        );
-        cpu.push_str(&format!("（{} コア）", m["cpus"].as_u64().unwrap_or(0)));
-        if let Some(load) = m["load"].as_array() {
-            let l: Vec<String> = load
-                .iter()
-                .filter_map(|x| x.as_f64())
-                .map(|x| format!("{x:.1}"))
-                .collect();
-            cpu.push_str(&format!("  load {}", l.join(" / ")));
-        }
-        println!("{cpu}");
+                .unwrap_or_else(|| "?".into()),
+            cores: m["cpus"].as_u64().unwrap_or(0),
+            load: m["load"].as_array().map(|load| {
+                load.iter()
+                    .filter_map(|x| x.as_f64())
+                    .map(|x| format!("{x:.1}"))
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            }),
+        };
+        println!("{}", cpu.text_in(lang));
     }
     if v["gui"] == false {
         return;
     }
     let heavy = v["heavy"].as_array().cloned().unwrap_or_default();
     if heavy.is_empty() {
-        println!("重い処理: なし");
+        println!("{}", ReplyNote::QueueHeavyNone.text_in(lang));
     } else {
-        println!("重い処理 {} 件:", heavy.len());
+        println!("{}", ReplyNote::QueueHeavyHeader(heavy.len()).text_in(lang));
         for job in &heavy {
             println!(
                 "  {}  {}  {}  {}",
@@ -8537,127 +8564,122 @@ fn print_queue_status(v: &Value) {
                     .as_f64()
                     .map(|c| format!("{c:.0}%"))
                     .unwrap_or_else(|| "-".into()),
-                queue_owner_text(job)
+                queue_owner_text(job, lang)
             );
         }
     }
     let panes = v["panes"].as_array().cloned().unwrap_or_default();
     if !panes.is_empty() {
-        println!("ペインの上位（メモリの多い順）:");
+        println!("{}", ReplyNote::QueuePanesHeader.text_in(lang));
         for p in &panes {
-            let agent = p["agent"]
-                .as_str()
-                .map(|a| format!("  {a}"))
-                .unwrap_or_default();
-            println!(
-                "  {}（agent {}・重い処理 {}）  {}{}",
-                human_mb(p["memory_mb"].as_u64().unwrap_or(0)),
-                human_mb(p["agent_mb"].as_u64().unwrap_or(0)),
-                human_mb(p["heavy_mb"].as_u64().unwrap_or(0)),
-                queue_owner_text(p),
-                agent
-            );
+            let row = ReplyNote::QueuePaneRow {
+                memory: human_mb(p["memory_mb"].as_u64().unwrap_or(0)),
+                agent_mb: human_mb(p["agent_mb"].as_u64().unwrap_or(0)),
+                heavy_mb: human_mb(p["heavy_mb"].as_u64().unwrap_or(0)),
+                owner: queue_owner_text(p, lang),
+                agent: p["agent"].as_str().map(str::to_string),
+            };
+            println!("  {}", row.text_in(lang));
         }
     }
     let ext = &v["external"];
     if ext.is_object() {
-        println!(
-            "tako の外: {}・{} 本（重い処理 {} 件）",
-            human_mb(ext["memory_mb"].as_u64().unwrap_or(0)),
-            ext["processes"].as_u64().unwrap_or(0),
-            ext["heavy"].as_u64().unwrap_or(0)
-        );
+        let external = ReplyNote::QueueExternalLine {
+            memory: human_mb(ext["memory_mb"].as_u64().unwrap_or(0)),
+            processes: ext["processes"].as_u64().unwrap_or(0),
+            heavy: ext["heavy"].as_u64().unwrap_or(0),
+        };
+        println!("{}", external.text_in(lang));
     }
     let scan = &v["scan"];
     if scan.is_object() {
-        println!(
-            "走査: {} 本（読めた {}）・{:.1} 秒前",
-            scan["processes"].as_u64().unwrap_or(0),
-            scan["readable"].as_u64().unwrap_or(0),
-            scan["age_ms"].as_u64().unwrap_or(0) as f64 / 1000.0
-        );
+        let scan = ReplyNote::QueueScanLine {
+            processes: scan["processes"].as_u64().unwrap_or(0),
+            readable: scan["readable"].as_u64().unwrap_or(0),
+            age_ms: scan["age_ms"].as_u64().unwrap_or(0),
+        };
+        println!("{}", scan.text_in(lang));
     }
-    print_queue_section(&v["queue"]);
-    print_launches_section(&v["launches"]);
-    print_jobserver_section(&v["jobserver"]);
+    print_queue_section(&v["queue"], lang);
+    print_launches_section(&v["launches"], lang);
+    print_jobserver_section(&v["jobserver"], lang);
 }
 
 /// cargo の札の節の表示（#1998）。旧い GUI（節が無い）では何も出さない
-fn print_jobserver_section(j: &Value) {
+fn print_jobserver_section(j: &Value, lang: tako_core::i18n::Lang) {
     if !j.is_object() {
         return;
     }
     match j["state"].as_str() {
         Some("active") => {
-            let mut line = format!(
-                "cargo の札: 空き {} / {}",
-                j["free"].as_u64().map_or("?".into(), |f| f.to_string()),
-                j["tokens"]
-            );
-            if let Some(h) = j["holders"].as_u64() {
-                line.push_str(&format!("（札を持ちうる cargo 系 {h} 本）"));
-            }
-            println!("{line}");
+            let active = ReplyNote::QueueJobserverActive {
+                free: j["free"].as_u64().map_or("?".into(), |f| f.to_string()),
+                tokens: j["tokens"].to_string(),
+                holders: j["holders"].as_u64(),
+            };
+            println!("{}", active.text_in(lang));
             if let Some(r) = j["last_recount"].as_object() {
                 let added = r["added"].as_u64().unwrap_or(0);
                 let removed = r["removed"].as_u64().unwrap_or(0);
-                println!(
-                    "  直近の数え直し: 空き {} → {}{}（{}）",
-                    r["free_before"],
-                    if added > 0 { "+" } else { "-" },
-                    added.max(removed),
-                    if r["why"] == "over" {
-                        "多すぎた分を抜いた"
-                    } else {
-                        "誰も持っていないのに足りない分を足した"
-                    }
-                );
+                let recount = ReplyNote::QueueJobserverRecount {
+                    free_before: r["free_before"].to_string(),
+                    added: added > 0,
+                    count: added.max(removed),
+                    over: r["why"] == "over",
+                };
+                println!("  {}", recount.text_in(lang));
             }
         }
-        Some("follower") => println!("cargo の札: 先行の tako の札を使う（総数 {}）", j["tokens"]),
-        _ => println!(
-            "cargo の札: 配っていない — {}",
-            j["reason"].as_str().unwrap_or("?")
-        ),
+        Some("follower") => {
+            let follower = ReplyNote::QueueJobserverFollower(j["tokens"].to_string());
+            println!("{}", follower.text_in(lang));
+        }
+        _ => {
+            let off = ReplyNote::QueueJobserverOff {
+                code: j["code"].as_str().map(str::to_string),
+                ja: j["reason"].as_str().unwrap_or("?").to_string(),
+            };
+            println!("{}", off.text_in(lang));
+        }
     }
 }
 
 /// agent の起動待ちの節の表示（#2413）。待ちも立ち上がり中も無ければ何も出さない
-fn print_launches_section(l: &Value) {
+fn print_launches_section(l: &Value, lang: tako_core::i18n::Lang) {
     let waiting = l["waiting"].as_array().cloned().unwrap_or_default();
     let starting = l["starting"].as_array().cloned().unwrap_or_default();
     if waiting.is_empty() && starting.is_empty() {
         return;
     }
-    println!(
-        "agent の起動待ち: 待ち {}・立ち上がり中 {}（逼迫が解けると起きる。今すぐ起こすには tako queue start <ペイン>）",
-        waiting.len(),
-        starting.len()
-    );
+    let head = ReplyNote::QueueLaunchesHead {
+        waiting: waiting.len(),
+        starting: starting.len(),
+    };
+    println!("{}", head.text_in(lang));
     for w in &waiting {
-        println!(
-            "  待ち {}  ペイン {}  {}  {}  {}  待ち {}  — {}",
-            w["position"],
-            w["pane"],
-            w["kind"].as_str().unwrap_or("?"),
-            w["label"].as_str().unwrap_or(""),
-            w["priority"].as_str().unwrap_or("normal"),
-            tako_control::queue_wrapper::human_secs(w["waited_s"].as_u64().unwrap_or(0)),
-            w["reason"].as_str().unwrap_or("?")
-        );
+        let row = ReplyNote::QueueLaunchWaitingRow(Box::new(
+            tako_control::reply_note::QueueLaunchWaitingRowFields {
+                position: w["position"].to_string(),
+                pane: w["pane"].to_string(),
+                kind: w["kind"].as_str().unwrap_or("?").to_string(),
+                label: w["label"].as_str().unwrap_or("").to_string(),
+                priority: w["priority"].as_str().unwrap_or("normal").to_string(),
+                waited_s: w["waited_s"].as_u64().unwrap_or(0),
+                reason: queue_wait_reason(&w["code"], w["reason"].as_str().unwrap_or("?"))
+                    .text_in(lang),
+            },
+        ));
+        println!("  {}", row.text_in(lang));
     }
     for r in &starting {
-        println!(
-            "  立ち上がり中  ペイン {}  {}  {}  {}秒{}",
-            r["pane"],
-            r["kind"].as_str().unwrap_or("?"),
-            r["label"].as_str().unwrap_or(""),
-            r["since_s"].as_u64().unwrap_or(0),
-            r["memory_mb"]
-                .as_u64()
-                .map(|m| format!("  {}", human_mb(m)))
-                .unwrap_or_default()
-        );
+        let row = ReplyNote::QueueLaunchStartingRow {
+            pane: r["pane"].to_string(),
+            kind: r["kind"].as_str().unwrap_or("?").to_string(),
+            label: r["label"].as_str().unwrap_or("").to_string(),
+            since_s: r["since_s"].as_u64().unwrap_or(0),
+            memory: r["memory_mb"].as_u64().map(human_mb),
+        };
+        println!("  {}", row.text_in(lang));
     }
 }
 
@@ -17709,7 +17731,7 @@ mod tests {
                 "observations": 0, "sessions": 1, "windows": [],
             }],
         });
-        let text = usage_text(&payload, at + 600, 9 * 3_600);
+        let text = usage_text(&payload, at + 600, 9 * 3_600, tako_core::i18n::Lang::Ja);
         assert!(
             text.contains("  ログイン A（鍵 0123456789ab）  観測 3 点・会話 2 本\n"),
             "{text}"
@@ -17749,7 +17771,7 @@ mod tests {
             "groups": [group],
             "more_groups": 3,
         });
-        let text = usage_text(&with_usage, at + 600, 9 * 3_600);
+        let text = usage_text(&with_usage, at + 600, 9 * 3_600, tako_core::i18n::Lang::Ja);
         assert!(
             text.contains(
                 "    今の 7d の窓（10:02 〜・解除 11:12）  API 換算 $12.35・トークン 1.23 億（出力 4.6 万）・応答 10・会話 2・単価不明 5\n"
@@ -17776,7 +17798,7 @@ mod tests {
             "recording": false, "legacy_env": "TAKO_2192_S1_LEGACY",
             "observations": 0, "logins": [], "hint": "まだ観測が無い",
         });
-        let text = usage_text(&empty, at, 0);
+        let text = usage_text(&empty, at, 0, tako_core::i18n::Lang::Ja);
         assert!(
             text.contains("記録していない（TAKO_2192_S1_LEGACY が立っている）"),
             "{text}"
@@ -17816,7 +17838,7 @@ mod tests {
                 },
             }],
         });
-        let text = usage_text(&payload, at, 9 * 3_600);
+        let text = usage_text(&payload, at, 9 * 3_600, tako_core::i18n::Lang::Ja);
         assert!(
             text.contains("  ログイン C（codex・鍵 c0dexc0dex12）  観測 2 点\n"),
             "{text}"

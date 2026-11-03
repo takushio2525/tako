@@ -36,12 +36,19 @@
 //! （世代の一覧・復元の案内・復元と合流の結果）・`tako orchestrator watch` の説明文も同じ。watch の
 //! `WORKER_*` と `detail:` / `action:` ほかのラベルと、guide の monitoring が字面で引く現在の選択の印
 //! （`orchestrator::wait::CHOICE_HIGHLIGHT_MARK`）は master が読む印なので両言語で同じ
+//!
+//! `tako queue`（状況・cancel / start / priority / limits）と `tako usage` の人向けの表示もここが持つ。調停役（GUI）が
+//! 組む文（待つ理由・見込み・札を配らない理由・`note`）は応答の値のまま変えず、日本語の表示はその文をそのまま、
+//! 英語の表示は同じ応答の構造の欄（`reason` / `code` / `eta` / `start_s`）から組む（`QueueWaitReason` ほかは日本語の
+//! 文を持って渡される）。usage の注記（応答の `notes`）と案内（`hint`）は作る側（`usage::payload_in`）もここの
+//! 日本語を載せ、英語の表示は応答から組み直す（`usage::usage_notes`）
 
 use tako_core::handoff::{HANDOFF_PROJECTS_DIR, PROFILE_MEMO_SOFT_LIMIT_LINES};
 use tako_core::i18n::Lang;
 use tako_core::platform::support::Note;
 
 use crate::orchestrator::{ConfigError, ProfileKind};
+use crate::queue_wrapper::human_secs_in;
 use crate::worker_mcp::CodexConfigError;
 use crate::SessionRefusal;
 
@@ -600,6 +607,261 @@ pub enum ReplyNote {
     WatchAgentDeadDetail,
     /// `tako orchestrator watch`: session ID が無く resume のコマンドを組めない（`resume: ` の後ろ）
     WatchResumeUnbuildable,
+    // ---- CLI の人向けの表示: tako queue（状況・cancel / start / priority / limits）----
+    // 調停役（GUI）が組む文（待つ理由・見込み・札を配らない理由）は応答の値のまま変えず、日本語は
+    // その文をそのまま、英語は同じ応答の構造の欄（`reason` / `code` / `eta` / `start_s`）から組む
+    /// `tako queue`: GUI に届かないときの 1 行（`--json` の `note` は日本語のまま）
+    QueueOfflineNote,
+    /// `tako queue`: GUI が繋がったまま応答しないときの 1 行（秒。`--json` の `note` は日本語のまま）
+    QueueUnresponsiveNote(u64),
+    /// `tako queue cancel`: 取り消した処理（`waiting` = 待ちから外した。偽 = 走っている子を止める）
+    QueueCancelled {
+        id: String,
+        label: String,
+        waiting: bool,
+    },
+    /// `tako queue start`: そのペインの agent はもう起こしている
+    QueueAgentAlreadyStarted(String),
+    /// `tako queue start`: 今すぐ起こす（`reason` = 待っていた理由。同じ言語で組んだ文）
+    QueueAgentStartNow {
+        pane: String,
+        waited_s: u64,
+        reason: Option<String>,
+    },
+    /// `tako queue limits`: 上限の 1 行（`configured` = 設定した項目。`None` は全部が機に合わせた既定）
+    QueueLimits(Box<QueueLimitsFields>),
+    /// 優先度の段の出どころ（`from` = job / pane / role。`aged_from` = 待ちで上がる前の段）
+    QueuePriorityFrom {
+        priority: String,
+        from: String,
+        aged_from: Option<String>,
+    },
+    /// `tako queue priority --pane`: ペインから出る処理の段の既定を変えた
+    QueuePanePriorityChanged {
+        pane: u64,
+        priority: String,
+        jobs: usize,
+    },
+    /// `tako queue priority`: 処理の段を変えた（`priority` は段の表示。待ちの順位があれば添える）
+    QueueJobPriorityChanged {
+        id: String,
+        label: String,
+        priority: String,
+        position: Option<u64>,
+    },
+    /// `tako queue priority`: 走っている処理の段を変えたときの注記（日本語は調停役の `note`）
+    QueuePriorityRunningNote(String),
+    /// `tako queue`: この tako は調停役でない（日本語は応答の `reason`）
+    QueueNotArbiter(Option<String>),
+    /// `tako queue`: 順番待ちの節の見出し（`unmanaged` = 順番待ちを通っていない重い処理の件数）
+    QueueSectionHead {
+        running: usize,
+        max_jobs: String,
+        waiting: usize,
+        reserve_gb: String,
+        unmanaged: Option<String>,
+    },
+    /// ペインの番号（誰の処理か・起動待ちの行）
+    QueuePane(String),
+    /// 実行中の処理のメモリと最大
+    QueueMemoryPeak { used: String, peak: String },
+    /// 実行中の処理がまだ使っていない見込み（後ろの空きメモリの判定で押さえている分）
+    QueuePending { pending: String, estimate: String },
+    /// 実行中の処理の印（停滞・取り消し中。どちらかが立つときだけ）
+    QueueRunningFlags { stalled: bool, cancelling: bool },
+    /// `tako queue`: 実行中の 1 行（字下げは呼び手。`mem` / `pending` / `flags` / `eta` は同じ言語で組んだ部品）
+    QueueRunningRow(Box<QueueRunningRowFields>),
+    /// `tako queue`: 待ちの 1 行（字下げは呼び手。`start` / `reason` は同じ言語で組んだ部品）
+    QueueWaitingRow(Box<QueueWaitingRowFields>),
+    /// `tako queue`: 先頭が待つ理由（待ちごとの理由を返さない旧い GUI のとき。字下げは呼び手）
+    QueueHeadReason(String),
+    /// `tako queue`: 直近に終わった処理（`exit` = 終了コード。`None` は wrapper が消えた）
+    QueueRecent {
+        id: String,
+        label: String,
+        exit: Option<String>,
+        ran_s: u64,
+        peak: Option<String>,
+    },
+    /// `tako queue`: 直近に待ちの上限で諦めた処理（`reason` は同じ言語で組んだ待つ理由）
+    QueueGaveUp {
+        id: String,
+        label: String,
+        waited_s: u64,
+        reason: Option<String>,
+    },
+    /// 諦めたときの説明: 待っていた理由（同じ言語で組んだ文）
+    QueueGaveUpWhy(String),
+    /// 諦めたときの説明: 前に並んでいる処理の後（先頭の待つ理由）
+    QueueBehindHead(String),
+    /// 諦めたときの説明: 枠とメモリを押さえていた処理 1 件（`estimate_from` = history / shape / 区分の既定）
+    QueueHolder(Box<QueueHolderFields>),
+    /// 誰の処理か: tako の外（起点のアプリが分かれば添える）
+    QueueOwnerExternal(Option<String>),
+    /// `tako queue`: 機の状態を採れない（日本語は応答の `machine_unavailable`）
+    QueueMachineUnavailable(Option<String>),
+    /// `tako queue`: メモリの 1 行
+    QueueMemoryLine(Box<QueueMemoryLineFields>),
+    /// `tako queue`: CPU の 1 行（`load` = 1 / 5 / 15 分の load average を `/` で並べたもの）
+    QueueCpuLine {
+        cpu: String,
+        cores: u64,
+        load: Option<String>,
+    },
+    /// `tako queue`: 重い処理が無い
+    QueueHeavyNone,
+    /// `tako queue`: 重い処理の件数（見出し）
+    QueueHeavyHeader(usize),
+    /// `tako queue`: ペインの上位（見出し）
+    QueuePanesHeader,
+    /// `tako queue`: ペインの上位の 1 行（字下げは呼び手。`owner` は同じ言語で組んだ「誰」）
+    QueuePaneRow {
+        memory: String,
+        agent_mb: String,
+        heavy_mb: String,
+        owner: String,
+        agent: Option<String>,
+    },
+    /// `tako queue`: tako の外のまとめ
+    QueueExternalLine {
+        memory: String,
+        processes: u64,
+        heavy: u64,
+    },
+    /// `tako queue`: 走査の 1 行
+    QueueScanLine {
+        processes: u64,
+        readable: u64,
+        age_ms: u64,
+    },
+    /// `tako queue`: agent の起動待ちの節の見出し
+    QueueLaunchesHead { waiting: usize, starting: usize },
+    /// `tako queue`: agent の起動待ちの 1 行（字下げは呼び手。`reason` は同じ言語で組んだ待つ理由）
+    QueueLaunchWaitingRow(Box<QueueLaunchWaitingRowFields>),
+    /// `tako queue`: agent の立ち上がり中の 1 行（字下げは呼び手）
+    QueueLaunchStartingRow {
+        pane: String,
+        kind: String,
+        label: String,
+        since_s: u64,
+        memory: Option<String>,
+    },
+    /// `tako queue`: cargo の札を配っている（`holders` = 札を持ちうる cargo 系の本数）
+    QueueJobserverActive {
+        free: String,
+        tokens: String,
+        holders: Option<u64>,
+    },
+    /// `tako queue`: cargo の札の直近の数え直し（字下げは呼び手。`over` = 多すぎた分を抜いた）
+    QueueJobserverRecount {
+        free_before: String,
+        added: bool,
+        count: u64,
+        over: bool,
+    },
+    /// `tako queue`: 先行の tako の札を使う（総数）
+    QueueJobserverFollower(String),
+    /// `tako queue`: 札を配っていない（日本語は応答の `reason`、英語は `code` から）
+    QueueJobserverOff { code: Option<String>, ja: String },
+    /// 待つ理由（日本語は調停役の 1 文 = 数値の内訳つき、英語は理由の種類 `code` から短く）
+    QueueWaitReason { code: Option<String>, ja: String },
+    /// 終わりの見込み（日本語は調停役の 1 文、英語は status の `eta` の欄と行の経過 `ran_s` から）
+    QueueEta {
+        ja: String,
+        state: String,
+        remaining_s: Option<u64>,
+        previous_s: Option<u64>,
+        from_progress: bool,
+        progress: Option<(u64, u64)>,
+        ran_s: u64,
+    },
+    /// 待ちの開始の見込み（日本語は調停役の 1 文、英語は `start_s` から）
+    QueueStartEta { ja: String, start_s: u64 },
+
+    // ---- CLI の人向けの表示: tako usage（注記 `notes` と `hint` は応答の値 = 日本語、組む型はここ）----
+    /// `tako usage`: 使用量の索引を作った（stderr。会話記録の本数・MB・経過ミリ秒）
+    UsageIndexBuilt {
+        files: u64,
+        mb: u64,
+        elapsed_ms: u64,
+    },
+    /// `tako usage`: 見出し
+    UsageHeader,
+    /// `tako usage`: 記録していない（A/B の env の名前。応答に無ければ `None`）
+    UsageNotRecording(Option<String>),
+    /// `tako usage`: まだ観測が無い（応答の `hint` = 日本語。作る側もこの文を載せる）
+    UsageNoObservations,
+    /// `tako usage`: ログインの 1 行（字下げは呼び手。`sessions` は内訳の無いときだけ）
+    UsageLoginLine {
+        label: String,
+        codex: bool,
+        login: String,
+        config_dir: bool,
+        observations: u64,
+        sessions: Option<u64>,
+    },
+    /// `tako usage`: 枠の 1 行の後ろ（枠の名前と % の桁揃えは呼び手）
+    UsageWindowRest {
+        resets: String,
+        expired: bool,
+        observed: String,
+        observations: u64,
+    },
+    /// `tako usage`: 量の 1 行（API 換算・トークン・応答・会話。数は同じ言語で組んだもの）
+    UsageAmount {
+        usd: String,
+        tokens: String,
+        output: String,
+        responses: u64,
+        sessions: u64,
+        unpriced: Option<String>,
+    },
+    /// `tako usage`: % の列の見出しの後ろ（`period` = 期間に重なる窓の延べ）
+    UsageShareHeadNote { period: bool },
+    /// `tako usage`: 段のほかの件数
+    UsageMoreGroups(u64),
+    /// `tako usage`: この期間の使用量は無い
+    UsageNoUsageInPeriod,
+    /// `tako usage`: % の列の「tako の外」の行のラベル
+    UsageOutsideLabel,
+    /// `tako usage`: % の列の「推定の合計」の行のラベル
+    UsageEstimatedLabel,
+    /// `tako usage`: その枠はこのログインの観測が無い（枠の名前）
+    UsageShareUnavailable(String),
+    /// `tako usage`: 枠ごとの按分の要約（字下げは呼び手）
+    UsageShareLine(Box<UsageShareLineFields>),
+    /// `tako usage`: 記録の点数と最初 / 最後の時刻
+    UsageRecorded {
+        observations: u64,
+        from: String,
+        to: String,
+    },
+    /// `tako usage`: 読めない行を飛ばした
+    UsageUnreadableLines(u64),
+    /// `tako usage`: 段（既定でないとき）
+    UsageBy(String),
+    /// `tako usage`: 注記の行のラベル
+    UsageNoteLabel,
+    /// 使用量の注記: API 換算の単価表の日付
+    UsageNotePrice(String),
+    /// 使用量の注記: 単価表に無いモデル（` / ` で並べたもの）
+    UsageNoteUnpriced(String),
+    /// 使用量の注記: limit_share の読み方（`period` = 期間に重なる窓の延べ）
+    UsageNoteShareScope { period: bool },
+    /// 使用量の注記: outside / estimated の読み方
+    UsageNoteOutside,
+    /// 使用量の注記: 観測の無い claude のログインと枠（ラベル・枠の名前を ` / ` で並べたもの）
+    UsageNoteMissing(Vec<(String, String)>),
+    /// 使用量の注記: rate_limits に枠の出ない codex のログインと枠（同上）
+    UsageNoteCodexMissing(Vec<(String, String)>),
+    /// 使用量の注記: codex の配り方
+    UsageNoteCodex,
+    /// 使用量の注記: % へ直せなかった分
+    UsageNoteUnestimated,
+    /// 使用量の注記: ほかの更新が索引を読み進めている最中
+    UsageNoteIndexLocked,
+    /// 使用量の注記: 索引はまだ読み途中（残りの本数・MB）
+    UsageNoteIndexPending { files: u64, mb: u64 },
 }
 
 impl ReplyNote {
@@ -2197,7 +2459,1272 @@ impl ReplyNote {
             (Self::WatchResumeUnbuildable, En) => {
                 "(no session ID recorded, so the resume command cannot be built)".into()
             }
+            (Self::QueueOfflineNote, Ja) => "順番待ちは無効（tako が起動していない）".into(),
+            (Self::QueueOfflineNote, En) => "the queue is off (tako is not running)".into(),
+            (Self::QueueUnresponsiveNote(secs), Ja) => format!(
+                "順番待ちの状況は読めない（tako が {secs} 秒応答しない = GUI が固まっている可能性。\
+                 tako queue <コマンド> は待たずに走る）"
+            ),
+            (Self::QueueUnresponsiveNote(secs), En) => format!(
+                "cannot read the queue status (tako has not answered for {secs} s; the GUI may be \
+                 frozen. tako queue <command> runs without waiting)"
+            ),
+            (Self::QueueCancelled { id, label, waiting }, Ja) => {
+                let what = if *waiting {
+                    "待ちから外した（その tako queue は 125 で終わる）"
+                } else {
+                    "子を止める（SIGTERM → 10 秒で SIGKILL）"
+                };
+                format!("取り消した: {id} {label} — {what}")
+            }
+            (Self::QueueCancelled { id, label, waiting }, En) => {
+                let what = if *waiting {
+                    "removed from the queue (that tako queue exits with 125)"
+                } else {
+                    "stopping the child (SIGTERM, then SIGKILL after 10 s)"
+                };
+                format!("cancelled: {id} {label} — {what}")
+            }
+            (Self::QueueAgentAlreadyStarted(pane), Ja) => {
+                format!("ペイン {pane} の agent はもう起こしている")
+            }
+            (Self::QueueAgentAlreadyStarted(pane), En) => {
+                format!("the agent in pane {pane} is already started")
+            }
+            (
+                Self::QueueAgentStartNow {
+                    pane,
+                    waited_s,
+                    reason,
+                },
+                Ja,
+            ) => format!(
+                "ペイン {pane} の agent を今すぐ起こす（待ち {}{}）",
+                human_secs_in(*waited_s, Ja),
+                reason
+                    .as_ref()
+                    .map(|r| format!("・待っていた理由: {r}"))
+                    .unwrap_or_default()
+            ),
+            (
+                Self::QueueAgentStartNow {
+                    pane,
+                    waited_s,
+                    reason,
+                },
+                En,
+            ) => format!(
+                "starting the agent in pane {pane} now (waited {}{})",
+                human_secs_in(*waited_s, En),
+                reason
+                    .as_ref()
+                    .map(|r| format!("; it was waiting for: {r}"))
+                    .unwrap_or_default()
+            ),
+            (Self::QueueLimits(f), Ja) => {
+                let QueueLimitsFields { max_jobs, reserve_gb, swap_guard_gb, max_wait_min, jobserver, configured } = f.as_ref();
+                format!(
+                "同時 {max_jobs} 件・予約 {reserve_gb} GB・swap の警戒線 {swap_guard_gb} GB・\
+                 待ちの上限 {max_wait_min} 分・cargo の札 {jobserver}（{}）",
+                configured
+                    .as_ref()
+                    .map_or_else(|| "すべて機に合わせた既定".to_string(), |c| format!("設定: {c}"))
+            )
+            }
+            (Self::QueueLimits(f), En) => {
+                let QueueLimitsFields { max_jobs, reserve_gb, swap_guard_gb, max_wait_min, jobserver, configured } = f.as_ref();
+                format!(
+                "concurrent {max_jobs} job(s), reserve {reserve_gb} GB, swap guard {swap_guard_gb} GB, \
+                 max wait {max_wait_min} min, cargo tokens {jobserver} ({})",
+                configured.as_ref().map_or_else(
+                    || "all defaults for this machine".to_string(),
+                    |c| format!("configured: {c}")
+                )
+            )
+            }
+            (
+                Self::QueuePriorityFrom {
+                    priority,
+                    from,
+                    aged_from,
+                },
+                Ja,
+            ) => {
+                let from = match from.as_str() {
+                    "job" => "処理に付けた段",
+                    "pane" => "ペインの既定",
+                    _ => "役割の既定",
+                };
+                match aged_from {
+                    Some(base) => format!("{priority}（{from} {base} から待ちで上がった）"),
+                    None => format!("{priority}（{from}）"),
+                }
+            }
+            (
+                Self::QueuePriorityFrom {
+                    priority,
+                    from,
+                    aged_from,
+                },
+                En,
+            ) => {
+                let from = match from.as_str() {
+                    "job" => "set on the job",
+                    "pane" => "the pane's default",
+                    _ => "the role's default",
+                };
+                match aged_from {
+                    Some(base) => format!("{priority} (raised by waiting from {base}, {from})"),
+                    None => format!("{priority} ({from})"),
+                }
+            }
+            (
+                Self::QueuePanePriorityChanged {
+                    pane,
+                    priority,
+                    jobs,
+                },
+                Ja,
+            ) => format!(
+                "ペイン {pane} から出る処理の優先度の既定を {priority} にした\
+                 （順番待ちの中のそのペインの処理 {jobs} 件）"
+            ),
+            (
+                Self::QueuePanePriorityChanged {
+                    pane,
+                    priority,
+                    jobs,
+                },
+                En,
+            ) => format!(
+                "set the default priority of jobs from pane {pane} to {priority} \
+                 ({jobs} job(s) from that pane in the queue)"
+            ),
+            (
+                Self::QueueJobPriorityChanged {
+                    id,
+                    label,
+                    priority,
+                    position,
+                },
+                Ja,
+            ) => format!(
+                "優先度: {id} {label} → {priority}{}",
+                position
+                    .map(|p| format!("・待ち {p} 番目"))
+                    .unwrap_or_default()
+            ),
+            (
+                Self::QueueJobPriorityChanged {
+                    id,
+                    label,
+                    priority,
+                    position,
+                },
+                En,
+            ) => format!(
+                "priority: {id} {label} → {priority}{}",
+                position
+                    .map(|p| format!(", #{p} in the queue"))
+                    .unwrap_or_default()
+            ),
+            (Self::QueuePriorityRunningNote(ja), Ja) => ja.clone(),
+            (Self::QueuePriorityRunningNote(_), En) => {
+                "running jobs are not stopped (priority only affects the waiting order)".into()
+            }
+            (Self::QueueNotArbiter(reason), Ja) => format!(
+                "順番待ち: {}",
+                reason.as_deref().unwrap_or("この tako は調停役ではない")
+            ),
+            (Self::QueueNotArbiter(_), En) => "queue: this tako is not the queue arbiter".into(),
+            (
+                Self::QueueSectionHead {
+                    running,
+                    max_jobs,
+                    waiting,
+                    reserve_gb,
+                    unmanaged,
+                },
+                Ja,
+            ) => format!(
+                "順番待ち: 実行 {running} / 上限 {max_jobs}・待ち {waiting}（予約 {reserve_gb} GB）{}",
+                unmanaged
+                    .as_ref()
+                    .map(|n| format!("・順番待ちを通っていない重い処理 {n}"))
+                    .unwrap_or_default()
+            ),
+            (
+                Self::QueueSectionHead {
+                    running,
+                    max_jobs,
+                    waiting,
+                    reserve_gb,
+                    unmanaged,
+                },
+                En,
+            ) => format!(
+                "queue: running {running} / limit {max_jobs}, waiting {waiting} (reserve {reserve_gb} GB){}",
+                unmanaged
+                    .as_ref()
+                    .map(|n| format!(", heavy jobs outside the queue {n}"))
+                    .unwrap_or_default()
+            ),
+            (Self::QueuePane(pane), Ja) => format!("ペイン {pane}"),
+            (Self::QueuePane(pane), En) => format!("pane {pane}"),
+            (Self::QueueMemoryPeak { used, peak }, Ja) => format!("{used}（最大 {peak}）"),
+            (Self::QueueMemoryPeak { used, peak }, En) => format!("{used} (peak {peak})"),
+            (Self::QueuePending { pending, estimate }, Ja) => {
+                format!("まだ使っていない見込み {pending}（見込み {estimate}）")
+            }
+            (Self::QueuePending { pending, estimate }, En) => {
+                format!("not yet used {pending} (estimate {estimate})")
+            }
+            (
+                Self::QueueRunningFlags {
+                    stalled,
+                    cancelling,
+                },
+                Ja,
+            ) => {
+                let mut flags = Vec::new();
+                if *stalled {
+                    flags.push("停滞（枠を返した）");
+                }
+                if *cancelling {
+                    flags.push("取り消し中");
+                }
+                flags.join("・")
+            }
+            (
+                Self::QueueRunningFlags {
+                    stalled,
+                    cancelling,
+                },
+                En,
+            ) => {
+                let mut flags = Vec::new();
+                if *stalled {
+                    flags.push("stalled (slot released)");
+                }
+                if *cancelling {
+                    flags.push("cancelling");
+                }
+                flags.join(", ")
+            }
+            (Self::QueueRunningRow(f), lang) => {
+                let QueueRunningRowFields { id, label, pane, ran_s, progress, mem, pending, share, flags, eta } = f.as_ref();
+                let (run, pane_word, share_word) = match lang {
+                    Ja => ("実行", "ペイン", "取り分"),
+                    En => ("running", "pane", "share"),
+                };
+                format!(
+                    "{run}  {id}  {label}{}  {}{progress}{}{}  {share_word} {share}{}{}",
+                    pane.as_ref()
+                        .map(|p| format!("  {pane_word} {p}"))
+                        .unwrap_or_default(),
+                    human_secs_in(*ran_s, lang),
+                    mem.as_ref().map(|m| format!("  {m}")).unwrap_or_default(),
+                    pending
+                        .as_ref()
+                        .map(|p| format!("  {p}"))
+                        .unwrap_or_default(),
+                    flags
+                        .as_ref()
+                        .map(|f| format!("  [{f}]"))
+                        .unwrap_or_default(),
+                    eta.as_ref().map(|e| format!("  — {e}")).unwrap_or_default(),
+                )
+            }
+            (Self::QueueWaitingRow(f), lang) => {
+                let QueueWaitingRowFields { position, id, label, pane, priority, waited_s, start, reason } = f.as_ref();
+                let (wait, pane_word, waited, sep) = match lang {
+                    Ja => ("待ち", "ペイン", "待ち", "・"),
+                    En => ("waiting", "pane", "waited", ", "),
+                };
+                format!(
+                    "{wait} {position}  {id}  {label}{}  {priority}  {waited} {}{}{}",
+                    pane.as_ref()
+                        .map(|p| format!("  {pane_word} {p}"))
+                        .unwrap_or_default(),
+                    human_secs_in(*waited_s, lang),
+                    start
+                        .as_ref()
+                        .map(|t| format!("{sep}{t}"))
+                        .unwrap_or_default(),
+                    reason
+                        .as_ref()
+                        .map(|t| format!("  — {t}"))
+                        .unwrap_or_default(),
+                )
+            }
+            (Self::QueueHeadReason(text), Ja) => format!("先頭が待つ理由: {text}"),
+            (Self::QueueHeadReason(text), En) => format!("the head of the queue waits for: {text}"),
+            (
+                Self::QueueRecent {
+                    id,
+                    label,
+                    exit,
+                    ran_s,
+                    peak,
+                },
+                Ja,
+            ) => format!(
+                "直近: {id}  {label}  {}（{}{}）",
+                exit.as_ref()
+                    .map_or_else(|| "wrapper が消えた".to_string(), |c| format!("終了 {c}")),
+                human_secs_in(*ran_s, Ja),
+                peak.as_ref()
+                    .map(|p| format!("・最大 {p}"))
+                    .unwrap_or_default()
+            ),
+            (
+                Self::QueueRecent {
+                    id,
+                    label,
+                    exit,
+                    ran_s,
+                    peak,
+                },
+                En,
+            ) => format!(
+                "latest: {id}  {label}  {} ({}{})",
+                exit.as_ref()
+                    .map_or_else(|| "the wrapper is gone".to_string(), |c| format!("exit {c}")),
+                human_secs_in(*ran_s, En),
+                peak.as_ref()
+                    .map(|p| format!(", peak {p}"))
+                    .unwrap_or_default()
+            ),
+            (
+                Self::QueueGaveUp {
+                    id,
+                    label,
+                    waited_s,
+                    reason,
+                },
+                lang,
+            ) => {
+                let (head, waited) = match lang {
+                    Ja => ("直近の諦め", "待ち"),
+                    En => ("latest give-up", "waited"),
+                };
+                format!(
+                    "{head}: {id}  {label}  {waited} {}{}",
+                    human_secs_in(*waited_s, lang),
+                    reason
+                        .as_ref()
+                        .map(|t| format!("  — {t}"))
+                        .unwrap_or_default()
+                )
+            }
+            (Self::QueueGaveUpWhy(why), Ja) => format!("待っていた理由: {why}"),
+            (Self::QueueGaveUpWhy(why), En) => format!("it was waiting for: {why}"),
+            (Self::QueueBehindHead(text), Ja) => format!("前に並んでいる処理の後（先頭: {text}）"),
+            (Self::QueueBehindHead(text), En) => {
+                format!("behind jobs queued earlier (the head: {text})")
+            }
+            (Self::QueueHolder(f), Ja) => {
+                let QueueHolderFields { id, label, used, peak, pending, estimate, estimate_from, peak_passed, stalled } = f.as_ref();
+                let mut parts = vec![match used {
+                    Some(m) => format!("使用 {m}"),
+                    None => "使用 未計測".to_string(),
+                }];
+                if let Some(p) = peak {
+                    parts.push(format!("最大 {p}"));
+                }
+                if let Some(p) = pending {
+                    parts.push(format!("まだ使っていない見込み {p}"));
+                }
+                if let Some(e) = estimate {
+                    let from = match estimate_from.as_deref() {
+                        Some("history") => "過去の記録",
+                        Some("shape") => "同じ形の記録",
+                        _ => "区分の既定",
+                    };
+                    parts.push(format!("見込み {e}（{from}）"));
+                }
+                if *peak_passed {
+                    parts.push("ピーク後".into());
+                }
+                if *stalled {
+                    parts.push("停滞".into());
+                }
+                format!("押さえていた処理: {id} {label}（{}）", parts.join("・"))
+            }
+            (Self::QueueHolder(f), En) => {
+                let QueueHolderFields { id, label, used, peak, pending, estimate, estimate_from, peak_passed, stalled } = f.as_ref();
+                let mut parts = vec![match used {
+                    Some(m) => format!("used {m}"),
+                    None => "used: not measured".to_string(),
+                }];
+                if let Some(p) = peak {
+                    parts.push(format!("peak {p}"));
+                }
+                if let Some(p) = pending {
+                    parts.push(format!("not yet used {p}"));
+                }
+                if let Some(e) = estimate {
+                    let from = match estimate_from.as_deref() {
+                        Some("history") => "past runs",
+                        Some("shape") => "runs of the same shape",
+                        _ => "the kind's default",
+                    };
+                    parts.push(format!("estimate {e} ({from})"));
+                }
+                if *peak_passed {
+                    parts.push("past its peak".into());
+                }
+                if *stalled {
+                    parts.push("stalled".into());
+                }
+                format!("holding a slot: {id} {label} ({})", parts.join(", "))
+            }
+            (Self::QueueOwnerExternal(origin), Ja) => match origin {
+                Some(o) => format!("tako の外（{o}）"),
+                None => "tako の外".into(),
+            },
+            (Self::QueueOwnerExternal(origin), En) => match origin {
+                Some(o) => format!("outside tako ({o})"),
+                None => "outside tako".into(),
+            },
+            (Self::QueueMachineUnavailable(reason), Ja) => {
+                format!("機の状態: {}", reason.as_deref().unwrap_or("採れない"))
+            }
+            (Self::QueueMachineUnavailable(reason), En) => match reason {
+                Some(_) => "machine: not available on this OS yet (Windows: #2000)".into(),
+                None => "machine: unavailable".into(),
+            },
+            (Self::QueueMemoryLine(f), Ja) => {
+                let QueueMemoryLineFields { used, total, app, wired, compressed, available, swap, pressure } = f.as_ref();
+                format!(
+                "メモリ {used} / {total}（app {app}・wired {wired}・圧縮 {compressed}・空き {available}）{}{}",
+                swap.as_ref()
+                    .map(|(u, t)| format!("  swap {u} / {t}"))
+                    .unwrap_or_default(),
+                pressure
+                    .as_ref()
+                    .map(|p| format!("  メモリ圧 {p}"))
+                    .unwrap_or_default()
+            )
+            }
+            (Self::QueueMemoryLine(f), En) => {
+                let QueueMemoryLineFields { used, total, app, wired, compressed, available, swap, pressure } = f.as_ref();
+                format!(
+                "memory {used} / {total} (app {app}, wired {wired}, compressed {compressed}, \
+                 available {available}){}{}",
+                swap.as_ref()
+                    .map(|(u, t)| format!("  swap {u} / {t}"))
+                    .unwrap_or_default(),
+                pressure
+                    .as_ref()
+                    .map(|p| format!("  memory pressure {p}"))
+                    .unwrap_or_default()
+            )
+            }
+            (Self::QueueCpuLine { cpu, cores, load }, Ja) => format!(
+                "CPU {cpu}（{cores} コア）{}",
+                load.as_ref()
+                    .map(|l| format!("  load {l}"))
+                    .unwrap_or_default()
+            ),
+            (Self::QueueCpuLine { cpu, cores, load }, En) => format!(
+                "CPU {cpu} ({cores} cores){}",
+                load.as_ref()
+                    .map(|l| format!("  load {l}"))
+                    .unwrap_or_default()
+            ),
+            (Self::QueueHeavyNone, Ja) => "重い処理: なし".into(),
+            (Self::QueueHeavyNone, En) => "heavy jobs: none".into(),
+            (Self::QueueHeavyHeader(n), Ja) => format!("重い処理 {n} 件:"),
+            (Self::QueueHeavyHeader(n), En) => format!("heavy jobs ({n}):"),
+            (Self::QueuePanesHeader, Ja) => "ペインの上位（メモリの多い順）:".into(),
+            (Self::QueuePanesHeader, En) => "top panes (by memory):".into(),
+            (
+                Self::QueuePaneRow {
+                    memory,
+                    agent_mb,
+                    heavy_mb,
+                    owner,
+                    agent,
+                },
+                Ja,
+            ) => format!(
+                "{memory}（agent {agent_mb}・重い処理 {heavy_mb}）  {owner}{}",
+                agent.as_ref().map(|a| format!("  {a}")).unwrap_or_default()
+            ),
+            (
+                Self::QueuePaneRow {
+                    memory,
+                    agent_mb,
+                    heavy_mb,
+                    owner,
+                    agent,
+                },
+                En,
+            ) => format!(
+                "{memory} (agent {agent_mb}, heavy jobs {heavy_mb})  {owner}{}",
+                agent.as_ref().map(|a| format!("  {a}")).unwrap_or_default()
+            ),
+            (
+                Self::QueueExternalLine {
+                    memory,
+                    processes,
+                    heavy,
+                },
+                Ja,
+            ) => format!("tako の外: {memory}・{processes} 本（重い処理 {heavy} 件）"),
+            (
+                Self::QueueExternalLine {
+                    memory,
+                    processes,
+                    heavy,
+                },
+                En,
+            ) => format!("outside tako: {memory}, {processes} process(es) ({heavy} heavy job(s))"),
+            (
+                Self::QueueScanLine {
+                    processes,
+                    readable,
+                    age_ms,
+                },
+                Ja,
+            ) => format!(
+                "走査: {processes} 本（読めた {readable}）・{:.1} 秒前",
+                *age_ms as f64 / 1000.0
+            ),
+            (
+                Self::QueueScanLine {
+                    processes,
+                    readable,
+                    age_ms,
+                },
+                En,
+            ) => format!(
+                "scan: {processes} process(es) ({readable} readable), {:.1} s ago",
+                *age_ms as f64 / 1000.0
+            ),
+            (Self::QueueLaunchesHead { waiting, starting }, Ja) => format!(
+                "agent の起動待ち: 待ち {waiting}・立ち上がり中 {starting}\
+                 （逼迫が解けると起きる。今すぐ起こすには tako queue start <ペイン>）"
+            ),
+            (Self::QueueLaunchesHead { waiting, starting }, En) => format!(
+                "agent launches: waiting {waiting}, starting {starting} (they start when memory \
+                 pressure eases; to start one now: tako queue start <pane>)"
+            ),
+            (Self::QueueLaunchWaitingRow(f), lang) => {
+                let QueueLaunchWaitingRowFields { position, pane, kind, label, priority, waited_s, reason } = f.as_ref();
+                let (wait, pane_word, waited) = match lang {
+                    Ja => ("待ち", "ペイン", "待ち"),
+                    En => ("waiting", "pane", "waited"),
+                };
+                format!(
+                    "{wait} {position}  {pane_word} {pane}  {kind}  {label}  {priority}  {waited} {}  — {reason}",
+                    human_secs_in(*waited_s, lang)
+                )
+            }
+            (
+                Self::QueueLaunchStartingRow {
+                    pane,
+                    kind,
+                    label,
+                    since_s,
+                    memory,
+                },
+                lang,
+            ) => {
+                let (starting, pane_word, secs) = match lang {
+                    Ja => ("立ち上がり中", "ペイン", "秒"),
+                    En => ("starting", "pane", "s"),
+                };
+                format!(
+                    "{starting}  {pane_word} {pane}  {kind}  {label}  {since_s}{secs}{}",
+                    memory
+                        .as_ref()
+                        .map(|m| format!("  {m}"))
+                        .unwrap_or_default()
+                )
+            }
+            (
+                Self::QueueJobserverActive {
+                    free,
+                    tokens,
+                    holders,
+                },
+                Ja,
+            ) => format!(
+                "cargo の札: 空き {free} / {tokens}{}",
+                holders
+                    .map(|h| format!("（札を持ちうる cargo 系 {h} 本）"))
+                    .unwrap_or_default()
+            ),
+            (
+                Self::QueueJobserverActive {
+                    free,
+                    tokens,
+                    holders,
+                },
+                En,
+            ) => format!(
+                "cargo tokens: free {free} / {tokens}{}",
+                holders
+                    .map(|h| format!(" ({h} cargo-like process(es) may hold tokens)"))
+                    .unwrap_or_default()
+            ),
+            (
+                Self::QueueJobserverRecount {
+                    free_before,
+                    added,
+                    count,
+                    over,
+                },
+                Ja,
+            ) => format!(
+                "直近の数え直し: 空き {free_before} → {}{count}（{}）",
+                if *added { "+" } else { "-" },
+                if *over {
+                    "多すぎた分を抜いた"
+                } else {
+                    "誰も持っていないのに足りない分を足した"
+                }
+            ),
+            (
+                Self::QueueJobserverRecount {
+                    free_before,
+                    added,
+                    count,
+                    over,
+                },
+                En,
+            ) => format!(
+                "latest recount: free {free_before} → {}{count} ({})",
+                if *added { "+" } else { "-" },
+                if *over {
+                    "removed the excess"
+                } else {
+                    "added the missing ones that nobody held"
+                }
+            ),
+            (Self::QueueJobserverFollower(tokens), Ja) => {
+                format!("cargo の札: 先行の tako の札を使う（総数 {tokens}）")
+            }
+            (Self::QueueJobserverFollower(tokens), En) => {
+                format!("cargo tokens: using the tokens of the tako that started first (total {tokens})")
+            }
+            (Self::QueueJobserverOff { ja, .. }, Ja) => format!("cargo の札: 配っていない — {ja}"),
+            (Self::QueueJobserverOff { code, .. }, En) => format!(
+                "cargo tokens: not handed out — {}",
+                jobserver_off_en(code.as_deref())
+            ),
+            (Self::QueueWaitReason { ja, .. }, Ja) => ja.clone(),
+            (Self::QueueWaitReason { code, .. }, En) => wait_reason_en(code.as_deref()),
+            (Self::QueueEta { ja, .. }, Ja) => ja.clone(),
+            (
+                Self::QueueEta {
+                    state,
+                    remaining_s,
+                    previous_s,
+                    from_progress,
+                    progress,
+                    ran_s,
+                    ..
+                },
+                En,
+            ) => match (state.as_str(), remaining_s) {
+                ("remaining", Some(rem)) if *from_progress => {
+                    let (done, total) = progress.unwrap_or_default();
+                    format!(
+                        "about {} left (estimated from progress {done}/{total})",
+                        approx_en(*rem)
+                    )
+                }
+                ("remaining", Some(rem)) => match previous_s {
+                    Some(prev) => format!(
+                        "about {} left (last time {})",
+                        approx_en(*rem),
+                        approx_en(*prev)
+                    ),
+                    None => format!("about {} left", approx_en(*rem)),
+                },
+                ("overrun", _) => format!(
+                    "taking longer than last time (elapsed {}, last time {})",
+                    approx_en(*ran_s),
+                    approx_en(previous_s.unwrap_or(0))
+                ),
+                _ => format!("elapsed {} (no estimate)", approx_en(*ran_s)),
+            },
+            (Self::QueueStartEta { ja, .. }, Ja) => ja.clone(),
+            (Self::QueueStartEta { start_s, .. }, En) => {
+                if *start_s == 0 {
+                    "starts as soon as a slot frees".into()
+                } else {
+                    format!("starts in about {}", approx_en(*start_s))
+                }
+            }
+
+            (
+                Self::UsageIndexBuilt {
+                    files,
+                    mb,
+                    elapsed_ms,
+                },
+                Ja,
+            ) => format!(
+                "使用量の索引を作った（会話記録 {files} 本・{mb} MB を {:.1} 秒。次からは追記された分だけを読む）",
+                *elapsed_ms as f64 / 1000.0
+            ),
+            (
+                Self::UsageIndexBuilt {
+                    files,
+                    mb,
+                    elapsed_ms,
+                },
+                En,
+            ) => format!(
+                "built the usage index ({files} transcript(s), {mb} MB in {:.1} s; from now on only \
+                 the appended parts are read)",
+                *elapsed_ms as f64 / 1000.0
+            ),
+            (Self::UsageHeader, Ja) => "利用制限の観測（tako mod の報告と codex の rollout。\
+                 % か解除時刻が変わったときだけ記録）と使用量の内訳"
+                .into(),
+            (Self::UsageHeader, En) => "usage-limit observations (tako mod reports and codex \
+                 rollouts; recorded only when the % or the reset time changes) and the usage \
+                 breakdown"
+                .into(),
+            (Self::UsageNotRecording(env), Ja) => format!(
+                "記録していない（{} が立っている）",
+                env.as_deref().unwrap_or("A/B の env")
+            ),
+            (Self::UsageNotRecording(env), En) => format!(
+                "not recording ({} is set)",
+                env.as_deref().unwrap_or("the A/B env")
+            ),
+            (Self::UsageNoObservations, Ja) => {
+                "まだ観測が無い。tako mod の効いた claude のペインが利用制限を報告すると記録が始まる\
+                 （mod の状態は tako mod）"
+                    .into()
+            }
+            (Self::UsageNoObservations, En) => "no observations yet. Recording starts when a \
+                 claude pane with tako mod reports its usage limits (see the mod with tako mod)"
+                .into(),
+            (
+                Self::UsageLoginLine {
+                    label,
+                    codex,
+                    login,
+                    config_dir,
+                    observations,
+                    sessions,
+                },
+                Ja,
+            ) => format!(
+                "ログイン {label}（{}鍵 {login}{}）  観測 {observations} 点{}",
+                if *codex { "codex・" } else { "" },
+                if *config_dir {
+                    " = 資格情報を読めず設定 dir で束ねた"
+                } else {
+                    ""
+                },
+                sessions
+                    .map(|n| format!("・会話 {n} 本"))
+                    .unwrap_or_default()
+            ),
+            (
+                Self::UsageLoginLine {
+                    label,
+                    codex,
+                    login,
+                    config_dir,
+                    observations,
+                    sessions,
+                },
+                En,
+            ) => format!(
+                "login {label} ({}key {login}{})  {observations} observation(s){}",
+                if *codex { "codex, " } else { "" },
+                if *config_dir {
+                    " = grouped by the config dir because the credentials were unreadable"
+                } else {
+                    ""
+                },
+                sessions
+                    .map(|n| format!(", {n} session(s)"))
+                    .unwrap_or_default()
+            ),
+            (
+                Self::UsageWindowRest {
+                    resets,
+                    expired,
+                    observed,
+                    observations,
+                },
+                Ja,
+            ) => format!(
+                "解除 {resets}{}  最新の観測 {observed}（{observations} 点）",
+                if *expired {
+                    "（過ぎた = 今の窓の値ではない）"
+                } else {
+                    ""
+                }
+            ),
+            (
+                Self::UsageWindowRest {
+                    resets,
+                    expired,
+                    observed,
+                    observations,
+                },
+                En,
+            ) => format!(
+                "resets {resets}{}  latest observation {observed} ({observations} point(s))",
+                if *expired {
+                    " (passed; not the current window's value)"
+                } else {
+                    ""
+                }
+            ),
+            (
+                Self::UsageAmount {
+                    usd,
+                    tokens,
+                    output,
+                    responses,
+                    sessions,
+                    unpriced,
+                },
+                Ja,
+            ) => format!(
+                "API 換算 {usd}・トークン {tokens}（出力 {output}）・応答 {responses}・会話 {sessions}{}",
+                unpriced
+                    .as_ref()
+                    .map(|n| format!("・単価不明 {n}"))
+                    .unwrap_or_default()
+            ),
+            (
+                Self::UsageAmount {
+                    usd,
+                    tokens,
+                    output,
+                    responses,
+                    sessions,
+                    unpriced,
+                },
+                En,
+            ) => format!(
+                "API equiv. {usd}, tokens {tokens} (output {output}), responses {responses}, \
+                 sessions {sessions}{}",
+                unpriced
+                    .as_ref()
+                    .map(|n| format!(", unpriced {n}"))
+                    .unwrap_or_default()
+            ),
+            (Self::UsageShareHeadNote { period }, Ja) => format!(
+                "（% は{}・+ は推定）",
+                if *period {
+                    "期間に重なる窓の延べ"
+                } else {
+                    "今の窓のうち各段が使った分"
+                }
+            ),
+            (Self::UsageShareHeadNote { period }, En) => format!(
+                " (% = {}; + = estimated)",
+                if *period {
+                    "the sum over the windows overlapping the period"
+                } else {
+                    "each group's share of the current window"
+                }
+            ),
+            (Self::UsageMoreGroups(n), Ja) => format!("ほか {n} 件（--limit で増やせる）"),
+            (Self::UsageMoreGroups(n), En) => format!("{n} more (raise it with --limit)"),
+            (Self::UsageNoUsageInPeriod, Ja) => "この期間の使用量は無い".into(),
+            (Self::UsageNoUsageInPeriod, En) => "no usage in this period".into(),
+            (Self::UsageOutsideLabel, Ja) => {
+                "tako の外（区間にローカルの使用量が無いのに増えた分）".into()
+            }
+            (Self::UsageOutsideLabel, En) => {
+                "outside tako (increase with no local usage in the interval)".into()
+            }
+            (Self::UsageEstimatedLabel, Ja) => {
+                "推定の合計（観測の区間の外 = 最後の観測より後・観測の無い窓）".into()
+            }
+            (Self::UsageEstimatedLabel, En) => "estimated total (outside the observed intervals = \
+                 after the last observation, or windows with no observation)"
+                .into(),
+            (Self::UsageShareUnavailable(label), Ja) => {
+                format!("{label} の按分: このログインの観測が無いので % を出していない")
+            }
+            (Self::UsageShareUnavailable(label), En) => {
+                format!("{label} split: no % because this login has no observations")
+            }
+            (Self::UsageShareLine(f), Ja) => {
+                let UsageShareLineFields { label, head, allocated, outside, estimated, per_usd, per_tokens, intervals, quartiles, unestimated_usd } = f.as_ref();
+                let head = match head {
+                    UsageShareHead::Period(v) => format!("期間の延べ {v:.1}%"),
+                    UsageShareHead::Latest(v) => format!("今の窓 {v:.1}%"),
+                    UsageShareHead::NoWindow => "観測した今の窓が無い".to_string(),
+                };
+                let mut line =
+                    format!("{label} の按分: {head} = 段 {allocated:.1} + tako の外 {outside:.1}");
+                if let Some(e) = estimated {
+                    line.push_str(&format!("・推定 +{e:.1}"));
+                }
+                if let Some(per) = per_usd {
+                    line.push_str(&format!("・1% あたり API 換算 ${per:.2}（区間 {intervals} 本"));
+                    match quartiles {
+                        Some((p25, p75)) => {
+                            line.push_str(&format!("・直近の窓の四分位 ${p25:.2}〜${p75:.2}）"))
+                        }
+                        None => line.push('）'),
+                    }
+                }
+                if let Some(tokens) = per_tokens {
+                    line.push_str(&format!("・1% あたり トークン {tokens}（区間 {intervals} 本）"));
+                }
+                if let Some(usd) = unestimated_usd {
+                    line.push_str(&format!("・% へ直せない API 換算 ${usd:.2}"));
+                }
+                line
+            }
+            (Self::UsageShareLine(f), En) => {
+                let UsageShareLineFields { label, head, allocated, outside, estimated, per_usd, per_tokens, intervals, quartiles, unestimated_usd } = f.as_ref();
+                let head = match head {
+                    UsageShareHead::Period(v) => format!("sum over the period {v:.1}%"),
+                    UsageShareHead::Latest(v) => format!("current window {v:.1}%"),
+                    UsageShareHead::NoWindow => "no observed current window".to_string(),
+                };
+                let mut line = format!(
+                    "{label} split: {head} = groups {allocated:.1} + outside tako {outside:.1}"
+                );
+                if let Some(e) = estimated {
+                    line.push_str(&format!(", estimated +{e:.1}"));
+                }
+                if let Some(per) = per_usd {
+                    line.push_str(&format!(
+                        ", API equiv. per 1% ${per:.2} ({intervals} interval(s)"
+                    ));
+                    match quartiles {
+                        Some((p25, p75)) => line.push_str(&format!(
+                            "; latest window quartiles ${p25:.2}-${p75:.2})"
+                        )),
+                        None => line.push(')'),
+                    }
+                }
+                if let Some(tokens) = per_tokens {
+                    line.push_str(&format!(
+                        ", tokens per 1% {tokens} ({intervals} interval(s))"
+                    ));
+                }
+                if let Some(usd) = unestimated_usd {
+                    line.push_str(&format!(", API equiv. not convertible to % ${usd:.2}"));
+                }
+                line
+            }
+            (
+                Self::UsageRecorded {
+                    observations,
+                    from,
+                    to,
+                },
+                Ja,
+            ) => format!("記録 {observations} 点（{from} 〜 {to}）"),
+            (
+                Self::UsageRecorded {
+                    observations,
+                    from,
+                    to,
+                },
+                En,
+            ) => format!("{observations} observation(s) recorded ({from} - {to})"),
+            (Self::UsageUnreadableLines(n), Ja) => {
+                format!("読めない行 {n} 行を飛ばした（書きかけ・壊れた行）")
+            }
+            (Self::UsageUnreadableLines(n), En) => {
+                format!("skipped {n} unreadable line(s) (partly written or broken)")
+            }
+            (Self::UsageBy(by), Ja) => format!("段: {by}（既定は project）"),
+            (Self::UsageBy(by), En) => format!("grouped by: {by} (default: project)"),
+            (Self::UsageNoteLabel, Ja) => "注".into(),
+            (Self::UsageNoteLabel, En) => "note".into(),
+            (Self::UsageNotePrice(as_of), Ja) => format!(
+                "api_usd は API 換算（モデル別の単価 × 5 成分。単価表 {as_of}）で、サブスクリプションの請求額ではない"
+            ),
+            (Self::UsageNotePrice(as_of), En) => format!(
+                "api_usd is the API-equivalent cost (per-model prices × 5 components; price table \
+                 {as_of}), not the subscription bill"
+            ),
+            (Self::UsageNoteUnpriced(models), Ja) => format!(
+                "単価表に無いモデル（{models}）は API 換算に含めず unpriced_tokens に数えた"
+            ),
+            (Self::UsageNoteUnpriced(models), En) => format!(
+                "models missing from the price table ({models}) are left out of the API \
+                 equivalent and counted in unpriced_tokens"
+            ),
+            (Self::UsageNoteShareScope { period }, Ja) => {
+                let scope = if *period {
+                    "期間に重なるすべての窓の延べ（窓をまたぐと 100% を超えうる）"
+                } else {
+                    "枠（5h / 7d）ごとの今の窓の、期間に重なる分。今の窓を丸ごと見るときは段の合計 + tako の外 = 最新の観測"
+                };
+                format!(
+                    "limit_share は観測した % の増分を、観測点の間の区間の使用量（API 換算）の比で段へ配った値。範囲は{scope}"
+                )
+            }
+            (Self::UsageNoteShareScope { period }, En) => {
+                let scope = if *period {
+                    "the sum over every window overlapping the period (can exceed 100% across \
+                     windows)"
+                } else {
+                    "the part of each limit's (5h / 7d) current window that overlaps the period; \
+                     for a whole current window, the groups' total + outside tako = the latest \
+                     observation"
+                };
+                format!(
+                    "limit_share splits each observed % increase among the groups by their usage \
+                     (API equivalent) in the interval between observations. Scope: {scope}"
+                )
+            }
+            (Self::UsageNoteOutside, Ja) => {
+                "outside（tako の外）は区間にローカルの使用量が無いのに % が増えた分（claude.ai・別の PC など）。\
+                 estimated（推定）は観測の区間の外（最後の観測より後・観測の無い窓）の使用量を、直近 7 日の区間の \
+                 1% あたりの API 換算の中央値で割った値"
+                    .into()
+            }
+            (Self::UsageNoteOutside, En) => {
+                "outside (outside tako) is the % increase in intervals with no local usage \
+                 (claude.ai, another PC, etc.). estimated is the usage outside the observed \
+                 intervals (after the last observation, or windows with no observation) divided by \
+                 the median API equivalent per 1% over the intervals of the last 7 days"
+                    .into()
+            }
+            (Self::UsageNoteMissing(logins), Ja) => format!(
+                "観測の無いログインと枠は % を出していない: {}。tako mod の効いた claude のペインが利用制限を報告すると記録が始まる",
+                logins
+                    .iter()
+                    .map(|(label, kinds)| format!("ログイン {label}（{kinds}）"))
+                    .collect::<Vec<_>>()
+                    .join("・")
+            ),
+            (Self::UsageNoteMissing(logins), En) => format!(
+                "no % for logins and limits without observations: {}. Recording starts when a \
+                 claude pane with tako mod reports its usage limits",
+                logins
+                    .iter()
+                    .map(|(label, kinds)| format!("login {label} ({kinds})"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            (Self::UsageNoteCodexMissing(logins), Ja) => format!(
+                "codex のログインで rollout の rate_limits にその枠が出ていないものは % を出していない: {}（プランが週の枠だけ等）",
+                logins
+                    .iter()
+                    .map(|(label, kinds)| format!("ログイン {label}（{kinds}）"))
+                    .collect::<Vec<_>>()
+                    .join("・")
+            ),
+            (Self::UsageNoteCodexMissing(logins), En) => format!(
+                "no % for codex logins whose rollout rate_limits do not show that limit: {} \
+                 (e.g. a plan with only a weekly limit)",
+                logins
+                    .iter()
+                    .map(|(label, kinds)| format!("login {label} ({kinds})"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+            (Self::UsageNoteCodex, Ja) => {
+                "codex は rollout の token_count の累積の差分を使用量に、rate_limits を観測にして過去の分まで配る。\
+                 codex のモデルは単価表に無いので API 換算は出ず、% は生トークンの比で配る。rollout はどのログインで\
+                 使ったかを持たないので、過去の分も今の auth.json のログインへ寄せる"
+                    .into()
+            }
+            (Self::UsageNoteCodex, En) => {
+                "for codex, usage is the difference of the cumulative token_count in rollouts and \
+                 the rate_limits are the observations, split back over past usage too. codex \
+                 models are not in the price table, so there is no API equivalent and the % is \
+                 split by raw tokens. Rollouts do not record which login was used, so past usage \
+                 is also attributed to the current auth.json login"
+                    .into()
+            }
+            (Self::UsageNoteUnestimated, Ja) => {
+                "unestimated_usd / unestimated_tokens は観測の区間の外の使用量のうち、係数が無く % へ直せなかった分"
+                    .into()
+            }
+            (Self::UsageNoteUnestimated, En) => "unestimated_usd / unestimated_tokens are the \
+                 usage outside the observed intervals that could not be converted to % because \
+                 there is no coefficient"
+                .into(),
+            (Self::UsageNoteIndexLocked, Ja) => {
+                "ほかの更新（CLI / GUI の背景）が索引を読み進めている最中なので、今ある索引で答えた".into()
+            }
+            (Self::UsageNoteIndexLocked, En) => "another update (the CLI or the GUI's background) \
+                 is reading the index forward, so this answer uses the index as it is"
+                .into(),
+            (Self::UsageNoteIndexPending { files, mb }, Ja) => format!(
+                "索引はまだ読み途中（残り {files} 本・{mb} MB）。GUI が背景で続ける（CLI は tako usage で追いつく）"
+            ),
+            (Self::UsageNoteIndexPending { files, mb }, En) => format!(
+                "the index is still being read ({files} file(s), {mb} MB left). The GUI continues \
+                 in the background (the CLI catches up with tako usage)"
+            ),
         }
+    }
+}
+
+/// [`ReplyNote::QueueLimits`] の中身（大きいので箱に入れる = `ReplyNote` を小さく保つ。#2365）
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueLimitsFields {
+    pub max_jobs: String,
+    pub reserve_gb: String,
+    pub swap_guard_gb: String,
+    pub max_wait_min: String,
+    pub jobserver: String,
+    pub configured: Option<String>,
+}
+
+/// [`ReplyNote::QueueRunningRow`] の中身（大きいので箱に入れる = `ReplyNote` を小さく保つ。#2365）
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueRunningRowFields {
+    pub id: String,
+    pub label: String,
+    pub pane: Option<String>,
+    pub ran_s: u64,
+    pub progress: String,
+    pub mem: Option<String>,
+    pub pending: Option<String>,
+    pub share: String,
+    pub flags: Option<String>,
+    pub eta: Option<String>,
+}
+
+/// [`ReplyNote::QueueWaitingRow`] の中身（大きいので箱に入れる = `ReplyNote` を小さく保つ。#2365）
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueWaitingRowFields {
+    pub position: String,
+    pub id: String,
+    pub label: String,
+    pub pane: Option<String>,
+    pub priority: String,
+    pub waited_s: u64,
+    pub start: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// [`ReplyNote::QueueHolder`] の中身（大きいので箱に入れる = `ReplyNote` を小さく保つ。#2365）
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueHolderFields {
+    pub id: String,
+    pub label: String,
+    pub used: Option<String>,
+    pub peak: Option<String>,
+    pub pending: Option<String>,
+    pub estimate: Option<String>,
+    pub estimate_from: Option<String>,
+    pub peak_passed: bool,
+    pub stalled: bool,
+}
+
+/// [`ReplyNote::QueueMemoryLine`] の中身（大きいので箱に入れる = `ReplyNote` を小さく保つ。#2365）
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueMemoryLineFields {
+    pub used: String,
+    pub total: String,
+    pub app: String,
+    pub wired: String,
+    pub compressed: String,
+    pub available: String,
+    pub swap: Option<(String, String)>,
+    pub pressure: Option<String>,
+}
+
+/// [`ReplyNote::QueueLaunchWaitingRow`] の中身（大きいので箱に入れる = `ReplyNote` を小さく保つ。#2365）
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueLaunchWaitingRowFields {
+    pub position: String,
+    pub pane: String,
+    pub kind: String,
+    pub label: String,
+    pub priority: String,
+    pub waited_s: u64,
+    pub reason: String,
+}
+
+/// [`ReplyNote::UsageShareLine`] の中身（大きいので箱に入れる = `ReplyNote` を小さく保つ。#2365）
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageShareLineFields {
+    pub label: String,
+    pub head: UsageShareHead,
+    pub allocated: f64,
+    pub outside: f64,
+    pub estimated: Option<f64>,
+    /// 1% あたりの API 換算
+    pub per_usd: Option<f64>,
+    /// 1% あたりの生トークン（同じ言語で組んだ数。単価の無いログインだけ）
+    pub per_tokens: Option<String>,
+    /// 係数の区間の本数（`per_usd` / `per_tokens` に添える）
+    pub intervals: u64,
+    /// 直近の窓の 1% あたりの API 換算の四分位（`per_usd` に添える）
+    pub quartiles: Option<(f64, f64)>,
+    pub unestimated_usd: Option<f64>,
+}
+
+/// `tako usage` の枠ごとの按分の要約の先頭（期間の延べ / 今の窓 / 観測した今の窓が無い。#2365）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UsageShareHead {
+    Period(f64),
+    Latest(f64),
+    NoWindow,
+}
+
+/// 見込みのおおよその長さの英語（`tako_core::queue::eta::approx` と同じ丸め: 1 分未満は秒、以上は分へ丸める。
+/// 右パネルの resources ビューと同じ書き方）
+fn approx_en(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{} min", (secs + 30) / 60)
+    }
+}
+
+/// 待つ理由の英語（理由の種類 `WaitReason::code` から短く。日本語は調停役の 1 文 = 数値の内訳つきで、
+/// 英語は応答に数値の欄が無いので種類だけを言う。起動待ちの「判断待ち」= `pending` もここ）
+fn wait_reason_en(code: Option<&str>) -> String {
+    match code {
+        Some("regather") => "the queue just restarted (re-registering the running jobs)".into(),
+        Some("target_dir") => "a job using the same target dir is running".into(),
+        Some("pressure_critical") => "memory pressure critical (new jobs are held)".into(),
+        Some("pressure_warn") => {
+            "memory pressure warn (one at a time after the running jobs finish)".into()
+        }
+        Some("swap") => "swap in use (one at a time after the running jobs finish)".into(),
+        Some("max_jobs") => "the concurrent job limit is reached".into(),
+        Some("memory") => "not enough free memory".into(),
+        Some("ahead") => "behind jobs queued earlier".into(),
+        Some("overtake_limit") => "a job waiting for its target dir hit the overtake limit \
+             (the jobs behind it wait too)"
+            .into(),
+        Some("pending") => "not decided yet".into(),
+        Some(other) => other.to_string(),
+        None => "?".into(),
+    }
+}
+
+/// cargo の札を配らない理由の英語（`jobserver::Off::code` から）
+fn jobserver_off_en(code: Option<&str>) -> String {
+    match code {
+        Some("setting") => "the setting resources.jobserver is off (turn it back on with \
+             `tako queue limits --jobserver on`)"
+            .into(),
+        Some("legacy") => format!("{}=1 (A/B)", tako_core::jobserver::AB_OFF_ENV),
+        Some("unsupported") => "this OS cannot hold them yet (Windows: #2000)".into(),
+        Some("no_place") => "no place for the fifo (the data dir is unknown, or every \
+             candidate path contains a space)"
+            .into(),
+        Some("error") => "the fifo cannot be used".into(),
+        // 番人が居ない（`jobserver::status_section` の節。GUI でない調停役・起動の途中）
+        Some("not_started") => {
+            "this tako does not hand out tokens (not the GUI, or still starting)".into()
+        }
+        Some(other) => other.to_string(),
+        None => "?".into(),
     }
 }
 

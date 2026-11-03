@@ -27,6 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tako_core::i18n::Lang;
 use tako_core::usage::{
     self as core, LimitObservation, LimitTracker, LoginKey, PendingUsage, SessionLogin,
 };
@@ -36,6 +37,8 @@ pub mod index;
 use index::{Indexer, UpdateOptions, UpdateOutcome};
 use tako_core::usage::report::{self, By, IssueFilter, ProjectFilter, Window};
 use tako_core::usage::KeyFrom;
+
+use crate::ReplyNote;
 
 /// 観測の履歴
 pub const LIMITS_FILE: &str = "limits.jsonl";
@@ -591,96 +594,108 @@ fn login_agents(
     out
 }
 
-/// 区間按分（S3）の読み方の注記
-fn share_notes(
-    b: &report::Breakdown,
-    summary: &core::Summary,
-    agents: &BTreeMap<String, &'static str>,
-    notes: &mut Vec<String>,
-) {
-    let kinds = || b.logins.iter().flat_map(|l| l.limit_share.iter());
-    if kinds().any(|k| k.available) {
-        let scope = if kinds().any(|k| k.scope == report::ShareScope::Period) {
-            "期間に重なるすべての窓の延べ（窓をまたぐと 100% を超えうる）"
-        } else {
-            "枠（5h / 7d）ごとの今の窓の、期間に重なる分。今の窓を丸ごと見るときは段の合計 + tako の外 = 最新の観測"
-        };
-        notes.push(format!(
-            "limit_share は観測した % の増分を、観測点の間の区間の使用量（API 換算）の比で段へ配った値。範囲は{scope}"
-        ));
-        notes.push(
-            "outside（tako の外）は区間にローカルの使用量が無いのに % が増えた分（claude.ai・別の PC など）。\
-             estimated（推定）は観測の区間の外（最後の観測より後・観測の無い窓）の使用量を、直近 7 日の区間の \
-             1% あたりの API 換算の中央値で割った値"
-                .to_string(),
-        );
+/// 応答の注記（`notes`）の型（#2365）。組み上がった応答（[`payload_in`] の答え。`--show` なら GUI の答え）
+/// だけから組むので、作る側（応答へ日本語で載せる）と `tako usage` の人向けの表示（表示言語）が同じ
+/// 1 実装を通る。並び: API 換算の単価表 → 単価表に無いモデル → 区間按分（S3）の読み方 → 観測の無い
+/// ログインと枠（claude / codex。ログインの鍵の順 = 内訳の並び）→ codex の配り方 → % へ直せない分 →
+/// 索引の読み進め。索引を切っている（A/B）応答には注記が無い
+pub fn usage_notes(payload: &Value) -> Vec<ReplyNote> {
+    let mut notes = Vec::new();
+    if payload["index"]["enabled"] != Value::Bool(true) {
+        return notes;
     }
-    let is_codex = |login: &str| agents.get(login) == Some(&"codex");
-    let missing: Vec<String> = b
-        .logins
-        .iter()
-        .filter(|l| !is_codex(&l.login) && l.limit_share.iter().any(|k| !k.available))
-        .map(|l| {
-            let kinds: Vec<&str> = l
-                .limit_share
-                .iter()
-                .filter(|k| !k.available)
-                .map(|k| if k.kind == "five_hour" { "5h" } else { "7d" })
-                .collect();
-            let label = summary
-                .logins
-                .iter()
-                .find(|s| s.login == l.login)
-                .map_or(l.login.as_str(), |s| s.label.as_str());
-            format!("ログイン {label}（{}）", kinds.join(" / "))
-        })
+    notes.push(ReplyNote::UsageNotePrice(
+        payload["price_table_as_of"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    ));
+    let unpriced: Vec<&str> = payload["unpriced_models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
         .collect();
-    if !missing.is_empty() {
-        notes.push(format!(
-            "観測の無いログインと枠は % を出していない: {}。tako mod の効いた claude のペインが利用制限を報告すると記録が始まる",
-            missing.join("・")
-        ));
+    if !unpriced.is_empty() {
+        notes.push(ReplyNote::UsageNoteUnpriced(unpriced.join(" / ")));
     }
-    // codex（S5）: 観測は rollout の rate_limits。枠の無いプラン（週の枠だけ）がある
-    let codex_missing: Vec<String> = b
-        .logins
-        .iter()
-        .filter(|l| is_codex(&l.login) && l.limit_share.iter().any(|k| !k.available))
-        .map(|l| {
-            let kinds: Vec<&str> = l
-                .limit_share
-                .iter()
-                .filter(|k| !k.available)
-                .map(|k| if k.kind == "five_hour" { "5h" } else { "7d" })
-                .collect();
-            let label = summary
-                .logins
-                .iter()
-                .find(|s| s.login == l.login)
-                .map_or(l.login.as_str(), |s| s.label.as_str());
-            format!("ログイン {label}（{}）", kinds.join(" / "))
-        })
+    // 内訳のあるログイン（内訳の並び = ログインの鍵の順）
+    let mut logins: Vec<&Value> = payload["logins"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|l| l["usage"].is_object())
         .collect();
+    logins.sort_by(|a, b| {
+        a["login"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["login"].as_str().unwrap_or_default())
+    });
+    let shares = |l: &Value| -> Vec<Value> {
+        l["usage"]["limit_share"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let kinds: Vec<Value> = logins.iter().flat_map(|l| shares(l)).collect();
+    let available = |k: &Value| k["available"] == Value::Bool(true);
+    if kinds.iter().any(available) {
+        notes.push(ReplyNote::UsageNoteShareScope {
+            period: kinds.iter().any(|k| k["scope"] == "period"),
+        });
+        notes.push(ReplyNote::UsageNoteOutside);
+    }
+    let is_codex = |l: &Value| l["agent"] == "codex";
+    let missing = |codex: bool| -> Vec<(String, String)> {
+        logins
+            .iter()
+            .filter(|l| is_codex(l) == codex)
+            .filter_map(|l| {
+                let kinds: Vec<&str> = shares(l)
+                    .iter()
+                    .filter(|k| !available(k))
+                    .map(|k| if k["kind"] == "five_hour" { "5h" } else { "7d" })
+                    .collect();
+                (!kinds.is_empty()).then(|| {
+                    let label = l["label"]
+                        .as_str()
+                        .or_else(|| l["login"].as_str())
+                        .unwrap_or_default();
+                    (label.to_string(), kinds.join(" / "))
+                })
+            })
+            .collect()
+    };
+    let claude_missing = missing(false);
+    if !claude_missing.is_empty() {
+        notes.push(ReplyNote::UsageNoteMissing(claude_missing));
+    }
+    let codex_missing = missing(true);
     if !codex_missing.is_empty() {
-        notes.push(format!(
-            "codex のログインで rollout の rate_limits にその枠が出ていないものは % を出していない: {}（プランが週の枠だけ等）",
-            codex_missing.join("・")
-        ));
+        notes.push(ReplyNote::UsageNoteCodexMissing(codex_missing));
     }
-    if b.logins.iter().any(|l| is_codex(&l.login)) {
-        notes.push(
-            "codex は rollout の token_count の累積の差分を使用量に、rate_limits を観測にして過去の分まで配る。\
-             codex のモデルは単価表に無いので API 換算は出ず、% は生トークンの比で配る。rollout はどのログインで\
-             使ったかを持たないので、過去の分も今の auth.json のログインへ寄せる"
-                .to_string(),
-        );
+    if logins.iter().any(|l| is_codex(l)) {
+        notes.push(ReplyNote::UsageNoteCodex);
     }
-    if kinds().any(|k| k.unestimated_usd > 0.0 || k.unestimated_tokens > 0) {
-        notes.push(
-            "unestimated_usd / unestimated_tokens は観測の区間の外の使用量のうち、係数が無く % へ直せなかった分"
-                .to_string(),
-        );
+    if kinds.iter().any(|k| {
+        k["unestimated_usd"].as_f64().unwrap_or(0.0) > 0.0
+            || k["unestimated_tokens"].as_u64().unwrap_or(0) > 0
+    }) {
+        notes.push(ReplyNote::UsageNoteUnestimated);
     }
+    let update = &payload["index"]["update"];
+    if update.is_object() {
+        if update["stopped"] == "locked" {
+            notes.push(ReplyNote::UsageNoteIndexLocked);
+        } else if update["caught_up"] == Value::Bool(false) {
+            notes.push(ReplyNote::UsageNoteIndexPending {
+                files: update["pending_files"].as_u64().unwrap_or(0),
+                mb: update["pending_bytes"].as_u64().unwrap_or(0) / (1024 * 1024),
+            });
+        }
+    }
+    notes
 }
 
 /// [`usage_payload`] の本体（置き場・読み進めた結果・現在時刻・ローカル時刻のずれを引数で受ける = テスト用）
@@ -788,7 +803,6 @@ pub fn payload_in(
     if bad_limits + bad_sessions + bad_index > 0 {
         out["unreadable_lines"] = json!(bad_limits + bad_sessions + bad_index);
     }
-    let mut notes: Vec<String> = Vec::new();
     match &breakdown {
         Some(b) => {
             out["by"] = json!(b.by);
@@ -812,40 +826,17 @@ pub fn payload_in(
             if b.unkeyed_tokens > 0 {
                 out["unkeyed_tokens"] = json!(b.unkeyed_tokens);
             }
-            notes.push(format!(
-                "api_usd は API 換算（モデル別の単価 × 5 成分。単価表 {}）で、サブスクリプションの請求額ではない",
-                b.price_table_as_of
-            ));
-            if !b.unpriced_models.is_empty() {
-                notes.push(format!(
-                    "単価表に無いモデル（{}）は API 換算に含めず unpriced_tokens に数えた",
-                    b.unpriced_models.join(" / ")
-                ));
-            }
             out["scope"] = json!(
                 "ログインごとの観測の要約（最新の % と点数）と、期間の中の使用量の内訳（トークン 5 成分・\
                  API 換算・応答数・会話数）と、利用制限の 5h / 7d の % を観測の増分の区間按分で段へ配った値\
                  （limit_share）"
             );
-            share_notes(b, &summary, &agents, &mut notes);
             let mut index = json!({
                 "enabled": true,
                 "sessions": keyed_sessions,
             });
             if let Some(o) = outcome {
                 index["update"] = json!(o);
-                if o.stopped == Some("locked") {
-                    notes.push(
-                        "ほかの更新（CLI / GUI の背景）が索引を読み進めている最中なので、今ある索引で答えた"
-                            .to_string(),
-                    );
-                } else if !o.caught_up {
-                    notes.push(format!(
-                        "索引はまだ読み途中（残り {} 本・{} MB）。GUI が背景で続ける（CLI は tako usage で追いつく）",
-                        o.pending_files,
-                        o.pending_bytes / (1024 * 1024)
-                    ));
-                }
             }
             out["index"] = index;
         }
@@ -860,11 +851,13 @@ pub fn payload_in(
         }
     }
     if summary.observations == 0 {
-        out["hint"] = json!(
-            "まだ観測が無い。tako mod の効いた claude のペインが利用制限を報告すると記録が始まる\
-             （mod の状態は tako mod）"
-        );
+        out["hint"] = json!(ReplyNote::UsageNoObservations.text_in(Lang::Ja));
     }
+    // 注記は組み上がった応答から組む（`tako usage` の人向けの表示が表示言語で同じ注記を組み直す 1 実装 = #2365）
+    let notes: Vec<String> = usage_notes(&out)
+        .iter()
+        .map(|n| n.text_in(Lang::Ja))
+        .collect();
     out["notes"] = json!(notes);
     round_usd_in(&mut out);
     out

@@ -50,10 +50,12 @@ use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use tako_core::i18n::Lang;
 use tako_core::queue::{self as q, CallerRole, JobKind, JobWire, Priority, PriorityHint};
 
 use crate::protocol::Request;
 use crate::queue::{unix_ms, ENV_JOB};
+use crate::ReplyNote;
 
 /// #1996 の A/B: `TAKO_1996_LEGACY=1` で cargo の stderr を受けず `CARGO_TERM_PROGRESS_WHEN` も足さない
 /// （従来の素通し = 進みは読まない）。wrapper（`tako queue <コマンド>`）のプロセスの env で効く
@@ -185,64 +187,80 @@ pub fn human_mb(mb: u64) -> String {
 }
 
 /// 待ちの上限で諦めたときの説明（純関数。#2254）: 待っていた理由と、枠とメモリを押さえていた処理
-/// （最後の poll の `holders`。旧い調停役は返さない = 理由だけ）
+/// （最後の poll の `holders`。旧い調停役は返さない = 理由だけ）。日本語の口（`tako queue <コマンド>` が
+/// 諦めたときの行）。表示言語で組むのは [`gave_up_lines_in`]
 pub fn gave_up_lines(resp: &Value) -> Vec<String> {
+    gave_up_lines_in(resp, Lang::Ja)
+}
+
+/// [`gave_up_lines`] を表示言語で（#2365。`tako queue` の状況の「直近の諦め」の下の行）。待つ理由は
+/// 日本語なら調停役の 1 文、英語なら理由の種類（`reason` / `head_reason`）から組む
+pub fn gave_up_lines_in(resp: &Value, lang: Lang) -> Vec<String> {
     let mut out = Vec::new();
     let behind = resp["reason"].as_str().is_none_or(|r| r == "ahead");
     let why = if behind {
-        resp["head_text"]
-            .as_str()
-            .map(|t| format!("前に並んでいる処理の後（先頭: {t}）"))
+        resp["head_text"].as_str().map(|t| {
+            let head = ReplyNote::QueueWaitReason {
+                code: resp["head_reason"].as_str().map(str::to_string),
+                ja: t.to_string(),
+            };
+            ReplyNote::QueueBehindHead(head.text_in(lang)).text_in(lang)
+        })
     } else {
-        resp["text"].as_str().map(str::to_string)
+        resp["text"].as_str().map(|t| {
+            ReplyNote::QueueWaitReason {
+                code: resp["reason"].as_str().map(str::to_string),
+                ja: t.to_string(),
+            }
+            .text_in(lang)
+        })
     };
     if let Some(why) = why {
-        out.push(format!("待っていた理由: {why}"));
+        out.push(ReplyNote::QueueGaveUpWhy(why).text_in(lang));
     }
     for h in resp["holders"].as_array().into_iter().flatten() {
-        let mut parts = vec![match h["memory_mb"].as_u64() {
-            Some(m) => format!("使用 {}", human_mb(m)),
-            None => "使用 未計測".to_string(),
-        }];
-        if let Some(p) = h["peak_mb"].as_u64() {
-            parts.push(format!("最大 {}", human_mb(p)));
-        }
-        let pending = h["pending_mb"].as_u64().unwrap_or(0);
-        if pending > 0 {
-            parts.push(format!("まだ使っていない見込み {}", human_mb(pending)));
-        }
-        if let Some(e) = h["estimate_mb"].as_u64() {
-            let from = match h["estimate_from"].as_str() {
-                Some("history") => "過去の記録",
-                Some("shape") => "同じ形の記録",
-                _ => "区分の既定",
-            };
-            parts.push(format!("見込み {}（{from}）", human_mb(e)));
-        }
-        if h["peak_passed"] == true {
-            parts.push("ピーク後".into());
-        }
-        if h["stalled"] == true {
-            parts.push("停滞".into());
-        }
-        out.push(format!(
-            "押さえていた処理: {} {}（{}）",
-            h["id"],
-            h["label"].as_str().unwrap_or("?"),
-            parts.join("・")
-        ));
+        let holder = ReplyNote::QueueHolder(Box::new(crate::reply_note::QueueHolderFields {
+            id: h["id"].to_string(),
+            label: h["label"].as_str().unwrap_or("?").to_string(),
+            used: h["memory_mb"].as_u64().map(human_mb),
+            peak: h["peak_mb"].as_u64().map(human_mb),
+            pending: h["pending_mb"].as_u64().filter(|p| *p > 0).map(human_mb),
+            estimate: h["estimate_mb"].as_u64().map(human_mb),
+            estimate_from: h["estimate_from"].as_str().map(str::to_string),
+            peak_passed: h["peak_passed"] == true,
+            stalled: h["stalled"] == true,
+        }));
+        out.push(holder.text_in(lang));
     }
     out
 }
 
-/// 秒 → 「1 分 12 秒」
+/// 秒 → 「1 分 12 秒」（日本語の口。表示言語で組むのは [`human_secs_in`]）
 pub fn human_secs(secs: u64) -> String {
-    if secs >= 3600 {
-        format!("{} 時間 {} 分", secs / 3600, (secs % 3600) / 60)
-    } else if secs >= 60 {
-        format!("{} 分 {} 秒", secs / 60, secs % 60)
-    } else {
-        format!("{secs} 秒")
+    human_secs_in(secs, Lang::Ja)
+}
+
+/// 秒 → 「1 分 12 秒」/ `1m 12s`（#2365。英語は右パネルの resources ビューと同じ区切り）
+pub fn human_secs_in(secs: u64, lang: Lang) -> String {
+    match lang {
+        Lang::Ja => {
+            if secs >= 3600 {
+                format!("{} 時間 {} 分", secs / 3600, (secs % 3600) / 60)
+            } else if secs >= 60 {
+                format!("{} 分 {} 秒", secs / 60, secs % 60)
+            } else {
+                format!("{secs} 秒")
+            }
+        }
+        Lang::En => {
+            if secs >= 3600 {
+                format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+            } else if secs >= 60 {
+                format!("{}m {}s", secs / 60, secs % 60)
+            } else {
+                format!("{secs}s")
+            }
+        }
     }
 }
 

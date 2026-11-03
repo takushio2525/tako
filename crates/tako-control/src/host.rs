@@ -419,6 +419,11 @@ pub trait UiStateHost {
     fn resources_view_state(&self) -> Option<serde_json::Value> {
         None
     }
+    /// fleet ビューの worker の行が描いている常駐メモリ（#1997。`tako panel` の応答の `fleet`。画面の無い
+    /// host は `None`）。値は `workers` の応答の `resident.memory_mb` と同じ走査の覚えの写し
+    fn fleet_view_state(&self) -> Option<serde_json::Value> {
+        None
+    }
     /// ワークスペース横断検索の結果の置き場（#1694。右パネルの search ビューもこれを読む）。
     /// 持たない実装（セカンダリ等）は `None` で、`tako search --show` / `--results` / `--open` /
     /// `--clear` は「使えない」と答える（出さない検索は置き場が無くても答える）
