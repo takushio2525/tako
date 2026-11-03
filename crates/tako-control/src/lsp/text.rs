@@ -579,6 +579,19 @@ pub const COMPLETION_LOADING_NOTE: Note = Note::new(
     "Language server is loading; candidates appear when ready",
 );
 
+/// GUI: 「読み込み中」のまま待ちの上限に当たった（黙って消さずに出す 1 行。#1899）。`{secs}`
+pub const COMPLETION_LOADING_LIMIT_NOTE: Note = Note::new(
+    "{secs} 秒待っても読み込み中です。済んだら打ち直してください",
+    "Still loading after {secs}s; type again when ready",
+);
+
+/// GUI: 「読み込み中」を出していた要求が上限まで答えられなかった（起動が済まない・答えが来ない。#1899）。
+/// `{secs}`
+pub const COMPLETION_TIMEOUT_LIMIT_NOTE: Note = Note::new(
+    "{secs} 秒待っても言語サーバが答えません（tako lsp status）",
+    "No answer from the server after {secs}s (tako lsp status)",
+);
+
 // --- ホバー（#1681）-------------------------------------------------------------
 // 失敗の多く（未導入・未応答・落ちた…）は定義ジャンプと同じ言語サーバの状態なので、上の
 // GOTO_* の文をそのまま使う（読み込み中は補完の COMPLETION_LOADING_* = #1893）。ホバーに固有なのは

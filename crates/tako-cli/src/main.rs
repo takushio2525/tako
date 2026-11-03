@@ -16298,6 +16298,19 @@ mod tests {
             "--limit", "9"
         ])
         .is_err());
+        // #1899: GUI のカードの脚注に出す全文の取り方は、そのまま打てば全文の要求になる
+        let footer = tako_control::lsp::hover::full_command(7, 3, 4);
+        assert_eq!(
+            build_request(&parse(&footer.split(' ').collect::<Vec<_>>())).unwrap(),
+            Request::LspHover {
+                pane: Some(7),
+                line: 3,
+                column: 4,
+                show: None,
+                limit: Some(0),
+            },
+            "{footer}"
+        );
         // #1685: 参照・階層は位置つきの要求（MCP `tako_lsp` の同名の action と同じ要求になる）
         for (sub, action) in [
             ("references", "references"),

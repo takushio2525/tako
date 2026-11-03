@@ -34093,6 +34093,13 @@ mod self_test {
     mod hover_1893;
     #[cfg(feature = "visual-test")]
     use hover_1893::{hover_1893_visual, hover_loading_real_visual, hover_loading_visual};
+    /// #1899: 補完の読み込みの上限の 1 行・キーのホバーの読み込み中を語の真下・カードの脚注
+    #[cfg(feature = "visual-test")]
+    mod lsp_loading_1899;
+    #[cfg(feature = "visual-test")]
+    use lsp_loading_1899::{
+        completion_loading_limit_visual, hover_footer_1899_visual, hover_key_loading_visual,
+    };
     /// #1685: 参照検索の結果の行の ⌘クリックで新しいペイン・閉じたら保持 0（visual-test `xref-1685`）
     #[cfg(feature = "visual-test")]
     mod xref_1685;
@@ -50418,6 +50425,21 @@ mod self_test {
                     hover_loading_real_visual(any, window, cx).await;
                     visual_exit(0);
                 }
+                // #1899: 補完の「読み込み中」が上限に当たると黙って消えずに理由の 1 行（偽サーバ）
+                "completion-loading-limit" => {
+                    completion_loading_limit_visual(any, window, cx).await;
+                    visual_exit(0);
+                }
+                // #1899: 読み込み中にキーで頼んだホバーも語の真下に「読み込み中」（偽サーバ）
+                "hover-key-loading" => {
+                    hover_key_loading_visual(any, window, cx).await;
+                    visual_exit(0);
+                }
+                // #1899: 切ったカードの脚注に人向けの全文の取り方（偽サーバ）
+                "hover-footer-1899" => {
+                    hover_footer_1899_visual(any, window, cx).await;
+                    visual_exit(0);
+                }
                 // #1680: ⌘ホバー中の識別子の下線が実ピクセルで描かれ、⌘ を離すと消えるか
                 "goto-hover" => {
                     goto_hover_visual(any, window, cx).await;
@@ -54323,6 +54345,154 @@ mod self_test {
         let _ = window.update(cx, |app, _, _| app.pane_context_menu = None);
     }
 
+    /// #1899 の道具: 割り込みでやり直す回数の上限（#1681 / #1893 の `interfered` と同じ 3 回）
+    #[cfg(feature = "visual-test")]
+    const VT_MENU_MAX_INTERFERED: usize = 3;
+
+    /// #1899 の道具: 割り込みの注入口（`TAKO_VISUAL_1899_INTERFERE=<回数>`）。[`vt1899_menu`] の
+    /// 呼び出しごとに、最初の N 回の試行で**待ちの後に**メニューを閉じる（共有の tako-vd で別の検証窓が
+    /// 前面を取ってメニューが閉じたのと同じ観測）。上限以下なら `interfered=N` で緑、上限を超えれば
+    /// 割り込みとして名指しの FAILED（実装の不具合の FAILED と文が違う）= 数える仕組みの検出力の証拠
+    #[cfg(feature = "visual-test")]
+    fn vt1899_injected_interference() -> usize {
+        std::env::var("TAKO_VISUAL_1899_INTERFERE")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// #1899 の道具: [`vt1899_menu`] の結果
+    #[cfg(feature = "visual-test")]
+    struct VtMenu {
+        /// 最後の試行で右クリックした直後（待つ前）のメニュー（開かなければ `None`）
+        first: Option<(
+            Option<crate::lsp_menu_ui::LspMenuSection>,
+            Vec<&'static str>,
+        )>,
+        /// 最後に開いたメニューの言語サーバの節と、描いた項目（待ちの後。開けていなければ空）
+        section: Option<crate::lsp_menu_ui::LspMenuSection>,
+        drawn: Vec<&'static str>,
+        /// 押した後に `done` が立ったか（`item` を渡さなければ押さない = `false`）
+        done: bool,
+        /// 割り込みでやり直した回数
+        interfered: usize,
+        /// 割り込みが上限を超えて続いた（実装ではなく共有の tako-vd の割り込みで止めた）
+        exhausted: bool,
+    }
+
+    #[cfg(feature = "visual-test")]
+    impl VtMenu {
+        /// 割り込みが上限まで続いたら名指しで落とす（実装の不具合の FAILED と区別する文）。
+        /// 続いていなければ何もしない（呼び手がいつもの check で判定する）
+        fn check_not_exhausted(&self, label: &str) {
+            check(
+                !self.exhausted,
+                &format!(
+                    "visual-test {label}: 右クリックメニューへの割り込みが {VT_MENU_MAX_INTERFERED} 回を超えて続いた（interfered={}。実装ではなく共有の tako-vd で別の窓に前面を取られた・実機のマウスが動いた）",
+                    self.interfered
+                ),
+            );
+        }
+    }
+
+    /// #1899 の道具: 右クリックでメニューを開き（`settle` があれば言語サーバの節が決まるまで状態で待つ）、
+    /// `item` があればその項目を実マウスで押して `done` が立つまで（`wait` まで）待つ。
+    ///
+    /// **割り込みのときだけやり直す**（#1681 / #1893 の `interfered=` を右クリックメニューの節へ 1 本で
+    /// 広げたもの）: 待ちの後にメニューが閉じていた（共有の tako-vd で別の検証窓が前面を取った）か、
+    /// 押した後に `done` が立たず窓のマウス位置が押した位置からずれていた（実機のマウスの移動が
+    /// 割り込んだ。蓋閉じの機では tako-vd が主画面）とき。閉じていたら押さずに開き直す（押下が本文へ
+    /// 落ちて選択やカーソルを動かさない）。やり直す前に `reset` を呼ぶ（出たカードを閉じる等）。
+    ///
+    /// 右クリックの直後（待つ前）に開いていないのは割り込みではない（合成の押下と読み取りのあいだに
+    /// イベントループは回らない）= 実装の不具合としてやり直さずに返す。押した位置のままで `done` が
+    /// 立たないのも同じ
+    #[cfg(feature = "visual-test")]
+    #[allow(clippy::too_many_arguments)]
+    async fn vt1899_menu(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        at: Point<Pixels>,
+        settle: Option<Duration>,
+        item: Option<&str>,
+        wait: Duration,
+        done: &dyn Fn(&mut AsyncApp) -> bool,
+        reset: &dyn Fn(&mut AsyncApp),
+    ) -> VtMenu {
+        let inject = vt1899_injected_interference();
+        let mut out = VtMenu {
+            first: None,
+            section: None,
+            drawn: Vec::new(),
+            done: false,
+            interfered: 0,
+            exhausted: false,
+        };
+        let mut attempt = 0usize;
+        loop {
+            if attempt > 0 {
+                reset(cx);
+                vt1684_close(any, window, cx);
+            }
+            vt1860_click(any, window, cx, at, MouseButton::Right);
+            out.first = vt1684_menu(any, window, cx);
+            let Some(opened) = out.first.clone() else {
+                // 開かない = 実装の不具合（割り込みではない）
+                return out;
+            };
+            (out.section, out.drawn) = opened;
+            if let Some(limit) = settle {
+                vt1684_settled(any, window, cx, limit).await;
+            }
+            if attempt < inject {
+                let _ = window.update(cx, |app, _, cx| {
+                    app.pane_context_menu = None;
+                    cx.notify();
+                });
+            }
+            attempt += 1;
+            let Some(settled) = vt1684_menu(any, window, cx) else {
+                // 待つあいだに閉じた = 割り込み
+                println!(
+                    "TAKO_VISUAL_PIXEL: vt1899-menu interfered=closed attempt={attempt} at={at:?}"
+                );
+                if out.interfered >= VT_MENU_MAX_INTERFERED {
+                    out.exhausted = true;
+                    return out;
+                }
+                out.interfered += 1;
+                continue;
+            };
+            (out.section, out.drawn) = settled;
+            let Some(id) = item else {
+                return out;
+            };
+            let Some(point) = vt1684_item_point(window, cx, id) else {
+                // 項目が無い = 呼び手が `drawn` で名指しする
+                return out;
+            };
+            vt1860_click(any, window, cx, point, MouseButton::Left);
+            out.done = vt1860_wait(any, window, cx, wait, done).await;
+            if out.done {
+                return out;
+            }
+            let moved = window
+                .update(cx, |_, win, _| win.mouse_position() != point)
+                .unwrap_or(false);
+            if !moved {
+                // 押した位置のままで立たない = 実装の不具合
+                return out;
+            }
+            println!("TAKO_VISUAL_PIXEL: vt1899-menu interfered=mouse attempt={attempt} item={id}");
+            if out.interfered >= VT_MENU_MAX_INTERFERED {
+                out.exhausted = true;
+                return out;
+            }
+            out.interfered += 1;
+        }
+    }
+
     /// #1684 の道具: 実ファイルを開いて（閲覧のまま = 編集モードに入らない）行が描かれるまで待つ
     #[cfg(feature = "visual-test")]
     async fn vt1684_open(
@@ -54464,10 +54634,28 @@ mod self_test {
         let goto_ids: Vec<&str> = MenuItem::ALL[..5].iter().map(|i| i.id()).collect();
 
         // ① 閲覧中の識別子（`helper` = 16..22）を右クリック → すぐ開き、握手を待つ 1 行 → 項目へ
+        //    待つあいだに共有の tako-vd で別の窓に前面を取られてメニューが閉じたら開き直す（#1899 =
+        //    `interfered=` に数える。右クリックの直後に開かないのは実装の不具合として落とす）
         let helper = at(cx, 1, 16..22);
-        vt1860_click(any, window, cx, helper, MouseButton::Right);
-        let first = vt1684_menu(any, window, cx);
-        println!("TAKO_VISUAL_PIXEL: {LABEL} ① first={first:?}");
+        let started = std::time::Instant::now();
+        let opened = vt1899_menu(
+            any,
+            window,
+            cx,
+            helper,
+            Some(Duration::from_secs(20)),
+            None,
+            Duration::ZERO,
+            &|_| true,
+            &|_| {},
+        )
+        .await;
+        let first = opened.first.clone();
+        println!(
+            "TAKO_VISUAL_PIXEL: {LABEL} ① first={first:?} interfered={}",
+            opened.interfered
+        );
+        opened.check_not_exhausted("lsp-context-menu ①");
         check(
             first.is_some(),
             "visual-test lsp-context-menu ①: 識別子の右クリックでメニューが開く",
@@ -54482,12 +54670,11 @@ mod self_test {
                 || first_drawn.first() == Some(&"note-lsp-pending"),
             "visual-test lsp-context-menu ①: 握手を待つあいだは押せない 1 行を先頭に描く",
         );
-        let started = std::time::Instant::now();
+        let (section, drawn) = (opened.section.clone(), opened.drawn.clone());
         check(
-            vt1684_settled(any, window, cx, Duration::from_secs(20)).await,
+            section != Some(LspMenuSection::Pending),
             "visual-test lsp-context-menu ①: 握手が済むと 1 行が項目へ差し替わる",
         );
-        let (section, drawn) = vt1684_menu(any, window, cx).unwrap_or_default();
         println!(
             "TAKO_VISUAL_PIXEL: {LABEL} ① settled in {:.2}s section={section:?} drawn={drawn:?}",
             started.elapsed().as_secs_f32()
@@ -54787,11 +54974,29 @@ mod self_test {
         let py_pane = vt1684_open(any, window, cx, pane, &py, LABEL).await;
         let run = vt1684_point(window, cx, py_pane, 0, 4..7)
             .unwrap_or_else(|| fail("visual-test lsp-context-menu ⑧: run の位置を採れない"));
-        vt1860_click(any, window, cx, run, MouseButton::Right);
-        let first = vt1684_menu(any, window, cx);
-        let settled = vt1684_settled(any, window, cx, Duration::from_secs(20)).await;
-        let menu = vt1684_menu(any, window, cx);
-        println!("TAKO_VISUAL_PIXEL: {LABEL} ⑧ not-installed first={first:?} settled={settled} menu={menu:?}");
+        // 待つあいだの割り込み（前面を取られて閉じた）は開き直して数える（#1899）
+        let opened = vt1899_menu(
+            any,
+            window,
+            cx,
+            run,
+            Some(Duration::from_secs(20)),
+            None,
+            Duration::ZERO,
+            &|_| true,
+            &|_| {},
+        )
+        .await;
+        opened.check_not_exhausted("lsp-context-menu ⑧");
+        let first = opened.first.clone();
+        let settled = opened.section != Some(LspMenuSection::Pending);
+        let menu = first
+            .as_ref()
+            .map(|_| (opened.section.clone(), opened.drawn.clone()));
+        println!(
+            "TAKO_VISUAL_PIXEL: {LABEL} ⑧ not-installed first={first:?} settled={settled} menu={menu:?} interfered={}",
+            opened.interfered
+        );
         check(
             settled && menu.as_ref().is_some_and(|(s, d)| s.is_none() && d.first() == Some(&"copy-path")),
             "visual-test lsp-context-menu ⑧: 未導入なら言語サーバの項目を出さず従来のメニューになる",
@@ -54854,12 +55059,26 @@ mod self_test {
         let helper = vt1684_point(window, cx, pane, 1, 12..18)
             .unwrap_or_else(|| fail("visual-test lsp-context-menu-real: helper の位置を採れない"));
         let started = std::time::Instant::now();
-        vt1860_click(any, window, cx, helper, MouseButton::Right);
-        let settled = vt1684_settled(any, window, cx, Duration::from_secs(90)).await;
-        let (section, drawn) = vt1684_menu(any, window, cx).unwrap_or_default();
+        // 握手を待つ 90 秒のあいだの割り込み（前面を取られて閉じた）は開き直して数える（#1899）
+        let opened = vt1899_menu(
+            any,
+            window,
+            cx,
+            helper,
+            Some(Duration::from_secs(90)),
+            None,
+            Duration::ZERO,
+            &|_| true,
+            &|_| {},
+        )
+        .await;
+        opened.check_not_exhausted(LABEL);
+        let settled = opened.section != Some(crate::lsp_menu_ui::LspMenuSection::Pending);
+        let (section, drawn) = (opened.section.clone(), opened.drawn.clone());
         println!(
-            "TAKO_VISUAL_PIXEL: {LABEL} settled={settled} in {:.1}s section={section:?} drawn={drawn:?}",
-            started.elapsed().as_secs_f32()
+            "TAKO_VISUAL_PIXEL: {LABEL} settled={settled} in {:.1}s section={section:?} drawn={drawn:?} interfered={}",
+            started.elapsed().as_secs_f32(),
+            opened.interfered
         );
         if let (Ok(dump), Some((frame, _))) = (
             std::env::var("TAKO_VISUAL_DUMP_DIR"),
