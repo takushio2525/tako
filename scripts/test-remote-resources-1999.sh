@@ -202,7 +202,7 @@ case "$PANE" in
 esac
 pass "隔離 tako-app が起動して CLI から見える（pid ${APP_PID}・ペイン ${PANE}）"
 for _ in $(seq 1 100); do
-  if q --json 2>/dev/null | grep -q '"arbiter": true'; then break; fi
+  st="$(q --json 2>/dev/null)" && [[ "$st" == *'"arbiter": true'* ]] && break
   sleep 0.1
 done
 check_contains "隔離 GUI が明示の調停役になっている" "$(q --json 2>/dev/null | tr -d '\n ')" '"role":"explicit"'
@@ -284,7 +284,7 @@ echo "=== 準備: 本物の wrapper を 3 本並べる（同時数 1 = 1 本が�
 TAKO_PANE_ID="$PANE" TAKO_TOKEN="$ISO_TOKEN" TAKO_QUEUE_SOCKET="$QSOCK" "$TAKO_BIN" queue --label res1999-a sleep 600 </dev/null >/dev/null 2>>"$TMP/wrapper.err" &
 JOB_A=$!
 for _ in $(seq 1 100); do
-  q --json 2>/dev/null | grep -q '"phase": "running"' && break
+  st="$(q --json 2>/dev/null)" && [[ "$st" == *'"phase": "running"'* ]] && break
   sleep 0.1
 done
 TAKO_PANE_ID="$PANE" TAKO_TOKEN="$ISO_TOKEN" TAKO_QUEUE_SOCKET="$QSOCK" "$TAKO_BIN" queue --label res1999-b sleep 600 </dev/null >/dev/null 2>>"$TMP/wrapper.err" &
@@ -417,7 +417,7 @@ pw_rc=0
 q --json > "$TMP/cli-5b.json" 2>&1
 grep -E "passed|failed|skipped|Error" "$PW_LOG" | mask | sed 's/^/    /' | sed -n '1,8p'
 check_eq "Playwright（chromium）の live spec が通る" "0" "$pw_rc"
-pick() { grep -o "TAKO_1999_ROWS $1 .*" "$PW_LOG" | head -1 | sed "s/^TAKO_1999_ROWS $1 //"; }
+pick() { grep -o "TAKO_1999_ROWS $1 .*" "$PW_LOG" | sed -n "1s/^TAKO_1999_ROWS $1 //p"; }
 pick before > "$TMP/pwa-before.json"
 pick after > "$TMP/pwa-after.json"
 pwa_digest() { python3 -c 'import json,sys
@@ -492,7 +492,8 @@ check_eq "GUI 不在の変更は 503" "503" "$CODE"
 check_eq "理由の種別は app_unreachable" "app_unreachable" "$(jqf kind)"
 
 echo "== 画像の個人情報（ユーザー名・ホームパス）=="
-if command -v tesseract >/dev/null 2>&1 && find "$DUMP_DIR" -name '*.png' | grep -q .; then
+PNGS="$(find "$DUMP_DIR" -name '*.png' 2>/dev/null)"
+if command -v tesseract >/dev/null 2>&1 && [ -n "$PNGS" ]; then
   leak=0
   while IFS= read -r f; do
     ocr="$(tesseract "$f" - 2>/dev/null)"
@@ -500,7 +501,7 @@ if command -v tesseract >/dev/null 2>&1 && find "$DUMP_DIR" -name '*.png' | grep
       leak=1
       echo "    写り込み: $(basename "$f")"
     fi
-  done < <(find "$DUMP_DIR" -name '*.png')
+  done <<<"$PNGS"
   [ "$leak" = 0 ] && pass "画像の文字（OCR）にユーザー名・ホームパスが無い" || fail "画像にユーザー名かホームパスが写っている"
 else
   echo "    （tesseract が無い・画像が無い = 目視で確かめる）"
