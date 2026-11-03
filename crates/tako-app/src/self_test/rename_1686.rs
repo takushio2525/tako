@@ -113,13 +113,31 @@ async fn open_rename(
     use tako_core::lsp::menu::MenuItem;
     let at = vt1684_point(window, cx, pane, line, column..column + word.len())
         .unwrap_or_else(|| fail(&format!("visual-test {label} ①: {word} の位置")));
-    vt1860_click(any, window, cx, at, MouseButton::Right);
+    // 節が決まるのを待つあいだの割り込み（共有の tako-vd で前面を取られて閉じた）は開き直して
+    // `interfered=` に数える（#1899。右クリックの直後に開かないのは実装の不具合として落とす）
+    let opened = vt1899_menu(
+        any,
+        window,
+        cx,
+        at,
+        Some(Duration::from_secs(90)),
+        None,
+        Duration::ZERO,
+        &|_| true,
+        &|_| {},
+    )
+    .await;
+    opened.check_not_exhausted(&format!("{label} ①"));
     check(
-        vt1684_settled(any, window, cx, Duration::from_secs(90)).await,
+        opened.first.is_some()
+            && opened.section != Some(crate::lsp_menu_ui::LspMenuSection::Pending),
         &format!("visual-test {label} ①: メニューの言語サーバの節が決まる"),
     );
-    let (_, drawn) = vt1684_menu(any, window, cx).unwrap_or_default();
-    println!("TAKO_VISUAL_PIXEL: {label} ① menu={drawn:?}");
+    let drawn = opened.drawn.clone();
+    println!(
+        "TAKO_VISUAL_PIXEL: {label} ① menu={drawn:?} interfered={}",
+        opened.interfered
+    );
     dump(any, window, cx, &format!("{shot}-menu.png"));
     let rename_id = MenuItem::Rename.id();
     check(

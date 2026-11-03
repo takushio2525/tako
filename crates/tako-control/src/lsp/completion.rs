@@ -72,6 +72,17 @@ pub fn legacy_1869() -> bool {
     )
 }
 
+/// `TAKO_1899_LEGACY=1` で **#1899 前の挙動**へ戻す（同一バイナリで A/B を取る入口）: GUI の補完の
+/// 「読み込み中」は待ちの上限に当たると黙って消える（理由の 1 行を出さない）・キー / メニューで頼んだ
+/// ホバーの読み込み中は語の真下に出さない（ヘッダだけ）・カードの脚注に全文の取り方を出さない。
+/// 整形の当て方も #1899 前へ戻る（`tako_core::text_edit::line_split` が同じ名前を読む）
+pub fn legacy_1899() -> bool {
+    matches!(
+        std::env::var("TAKO_1899_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// `TAKO_1909_LEGACY=1` で **#1909 前の形**へ戻す（同一バイナリで A/B を取る入口）: GUI は打鍵の
 /// 補完と説明の補いの取り消しの番号を UI スレッドで取らず、背景が問い合わせの頭で取る
 /// （一覧を閉じた・語の外へ出た取り消しを追い越して、読み込みが済むまで待ち続ける）
@@ -175,6 +186,22 @@ impl CompletionError {
                 &[("server", server), ("secs", &secs.to_string())],
             ),
         }
+    }
+
+    /// GUI の「読み込み中」の代わりに出す 1 行（#1899）。待ちの上限に当たった答えだけ `Some`:
+    /// 上限まで読み込み中だった（[`Self::Loading`]）はいつも、上限まで答えが来なかった
+    /// （`Timeout` = 起動が済まない・答えが来ない）は「読み込み中」を出していた（`shown_loading`）
+    /// ときだけ。ほかの失敗（未導入・落ちた・置き換わった…）は今までどおり一覧を出さないだけ
+    /// （打鍵のたびに通知しない。理由は `tako lsp completion` / `tako lsp status` が返す）
+    pub fn limit_note(&self, shown_loading: bool) -> Option<String> {
+        let (note, secs) = match self {
+            Self::Loading { secs, .. } => (text::COMPLETION_LOADING_LIMIT_NOTE, *secs),
+            Self::Query(GotoError::Timeout { secs, .. }) if shown_loading => {
+                (text::COMPLETION_TIMEOUT_LIMIT_NOTE, *secs)
+            }
+            _ => return None,
+        };
+        Some(text::fill(note, &[("secs", &secs.to_string())]))
     }
 
     pub fn next_step(&self) -> String {
@@ -334,6 +361,55 @@ mod tests {
             unsupported.reason(),
             text::fill(text::COMPLETION_UNSUPPORTED_REASON, &[("server", "srv")])
         );
+    }
+
+    /// #1899: 上限の 1 行が出るのは待ちの上限に当たった答えだけ（読み込み中はいつも・未応答は
+    /// 「読み込み中」を出していたときだけ）。ほかの失敗は出さない（打鍵のたびに通知しない）
+    #[test]
+    fn 上限の_1_行は待ちの上限に当たった答えだけに出る_1899() {
+        let loading = CompletionError::Loading {
+            server: "s",
+            secs: 30,
+        };
+        let timeout = CompletionError::from(GotoError::Timeout {
+            server: "s",
+            secs: 7,
+            starting: true,
+        });
+        for shown in [false, true] {
+            assert_eq!(
+                loading.limit_note(shown),
+                Some(text::fill(
+                    text::COMPLETION_LOADING_LIMIT_NOTE,
+                    &[("secs", "30")]
+                )),
+                "読み込み中の上限は「読み込み中」を出していなくても出す (shown={shown})"
+            );
+        }
+        assert_eq!(
+            timeout.limit_note(true),
+            Some(text::fill(
+                text::COMPLETION_TIMEOUT_LIMIT_NOTE,
+                &[("secs", "7")]
+            ))
+        );
+        assert_eq!(
+            timeout.limit_note(false),
+            None,
+            "「読み込み中」を出していない未応答は今までどおり黙る"
+        );
+        for error in all_errors() {
+            let limited = matches!(
+                error,
+                CompletionError::Loading { .. } | CompletionError::Query(GotoError::Timeout { .. })
+            );
+            let note = error.limit_note(true);
+            assert_eq!(note.is_some(), limited, "{error:?}");
+            if let Some(note) = note {
+                assert!(!note.contains('{'), "{error:?} の 1 行に差し込み漏れ: {note}");
+                assert!(!note.contains('\n'), "{error:?} は 1 行: {note}");
+            }
+        }
     }
 
     #[test]
