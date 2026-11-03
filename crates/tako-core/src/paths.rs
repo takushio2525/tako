@@ -95,6 +95,10 @@ pub(crate) fn is_path_separator(c: char) -> bool {
 /// 「メインスレッド専有」が 643 行）。判定は [`is_test_process`] を参照。
 /// 明示の `TAKO_DATA_DIR` は**テストでも優先**する（隔離セルフテスト・
 /// 既存テストの置き場指定を壊さないため）
+///
+/// **`TAKO_ISOLATED=1` で `TAKO_DATA_DIR` が無ければ既定（本番）の置き場を返さない**（#2694。
+/// 判定は [`data_dir_refusal`] の 1 実装）。#2531 が断るのは GUI への接続（発見ファイルの読み）だけで、
+/// CLI の中で完結する処理（`tako usage` ほか）は隔離の印のまま本番の data dir を読み書きしていた
 pub fn data_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("TAKO_DATA_DIR") {
         if !dir.is_empty() {
@@ -104,12 +108,101 @@ pub fn data_dir() -> Option<PathBuf> {
     if is_test_process() && !issue944_legacy() {
         return Some(test_data_dir());
     }
+    if data_dir_refusal().is_some() {
+        return None;
+    }
     default_data_dir()
+}
+
+/// `TAKO_ISOLATED=1` なのに `TAKO_DATA_DIR` を指定していないので、既定（本番）の data dir を
+/// 使わなかった（#2694）。
+///
+/// #2531 の `tako_control::discovery::IsolatedWithoutDir`（GUI への接続の断り）と対の、
+/// 手元の処理の断り。文の形もそろえてある
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IsolatedWithoutDataDir;
+
+impl IsolatedWithoutDataDir {
+    /// 表示言語を明示しての文言
+    pub fn text_in(self, lang: crate::i18n::Lang) -> &'static str {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self, Ja) => {
+                "TAKO_ISOLATED=1 なので既定（本番）のデータディレクトリは使わない（本番の設定・記録を\
+                 読み書きしない）。隔離したまま手元で処理するには TAKO_DATA_DIR を指定してください"
+            }
+            (Self, En) => {
+                "TAKO_ISOLATED=1 is set, so the default (production) data directory is not used \
+                 (production settings and records are never read or written). To run this locally \
+                 while isolated, set TAKO_DATA_DIR"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for IsolatedWithoutDataDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.text_in(crate::i18n::lang()))
+    }
+}
+
+impl std::error::Error for IsolatedWithoutDataDir {}
+
+/// 既定（本番）の data dir を使わない組み合わせか（#2694。純関数 = テストが env を書き換えない）。
+/// 隔離の印の読み方は tako-app の一括隔離（#177）・#2531 と同じ `1` / `true` / `on`、
+/// `TAKO_DATA_DIR` の空の値は未設定と同じ（[`data_dir`] と同じ読み方）。
+/// `TAKO_DISCOVERY_DIR` は数えない（発見の置き場は data dir の在りかを言わない）
+pub fn refuses_default_data_dir(
+    isolated: Option<&str>,
+    data_dir: Option<&std::ffi::OsStr>,
+) -> bool {
+    crate::tmux_cleanup::is_isolated_value(isolated)
+        && data_dir.is_none_or(std::ffi::OsStr::is_empty)
+}
+
+/// このプロセスで既定（本番）の data dir を使わないなら、その理由（#2694）。
+///
+/// [`data_dir`] / [`local_data_dir`] が None を返す条件の正本。CLI の手元の処理の入口と
+/// [`NoDataDir`] の文がこれを引く。テストプロセスは先に隔離先へ倒れる（#944）ので対象外。
+/// 例外は順番待ちの CLI（[`allow_machine_wide_data_dir`]）。A/B は `TAKO_2694_LEGACY=1`
+pub fn data_dir_refusal() -> Option<IsolatedWithoutDataDir> {
+    if issue2694_legacy() || MACHINE_WIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    if is_test_process() && !issue944_legacy() {
+        return None;
+    }
+    refuses_default_data_dir(
+        std::env::var("TAKO_ISOLATED").ok().as_deref(),
+        std::env::var_os("TAKO_DATA_DIR").as_deref(),
+    )
+    .then_some(IsolatedWithoutDataDir)
+}
+
+/// [`allow_machine_wide_data_dir`] が立てる印（プロセスに 1 つ）
+static MACHINE_WIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 順番待ち（#1994）の CLI だけが呼ぶ例外の口（#2694）: 隔離の印があっても既定の data dir を使う。
+///
+/// 調停役はマシン全体で 1 つ（本番の GUI の中）で、隔離した検証のビルドもそこへ並ぶのが仕様
+/// （#2531 の `discovery::read_candidates_machine_wide` と同じ扱い）。GUI が居ないときの枠の上限の
+/// 書き込み（`tako queue limits`）と表示言語は、その調停役と同じ本番の設定を見る。
+/// 呼び手は CLI の順番待ちの入口だけ（番犬 `issue2694_isolated_data_dir_watchdog` が固定する）
+pub fn allow_machine_wide_data_dir() {
+    MACHINE_WIDE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A/B 用の逃げ道（`TAKO_2694_LEGACY=1`）。修正前 = 隔離の印でも既定（本番）の data dir を使う
+pub fn issue2694_legacy() -> bool {
+    std::env::var_os("TAKO_2694_LEGACY").is_some_and(|v| v == "1")
 }
 
 /// [`data_dir`] が決まらない（HOME が無い）ときの断り（#2365）。置き場を data dir の下に持つ
 /// 機能（mod の展開・mod の UI 設定・usage）が同じ文を引く。日本語は #2365 より前の固定文とバイト一致
-/// （`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）
+/// （`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。
+///
+/// **隔離の印で既定の置き場を使わなかったときは、その断り（[`IsolatedWithoutDataDir`]）の文になる**
+/// （#2694）。理由は [`data_dir`] が None を返したのと同じ判定（[`data_dir_refusal`]）で読み直す
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NoDataDir;
 
@@ -117,6 +210,9 @@ impl NoDataDir {
     /// 表示言語を明示しての文言（#2365）
     pub fn text_in(self, lang: crate::i18n::Lang) -> &'static str {
         use crate::i18n::Lang::{En, Ja};
+        if let Some(refusal) = data_dir_refusal() {
+            return refusal.text_in(lang);
+        }
         match (self, lang) {
             (Self, Ja) => "データディレクトリが決まらない（HOME が無い）",
             (Self, En) => "cannot determine the data directory (HOME is not set)",
@@ -510,12 +606,16 @@ pub fn default_data_dir_under_home(home: &Path) -> PathBuf {
 /// LocalApplicationData の下）。
 ///
 /// `TAKO_DATA_DIR`（隔離）とテストプロセス（#944）は [`data_dir`] と同じ置き場へ倒す
-/// = 隔離した検証が本番の `%LOCALAPPDATA%` に書かない。Windows 以外も [`data_dir`] と同じ
+/// = 隔離した検証が本番の `%LOCALAPPDATA%` に書かない。Windows 以外も [`data_dir`] と同じ。
+/// `TAKO_ISOLATED=1` で `TAKO_DATA_DIR` が無ければ [`data_dir`] と同じく既定の置き場を返さない（#2694）
 pub fn local_data_dir() -> Option<PathBuf> {
     if std::env::var_os("TAKO_DATA_DIR").is_some_and(|d| !d.is_empty())
         || (is_test_process() && !issue944_legacy())
     {
         return data_dir();
+    }
+    if data_dir_refusal().is_some() {
+        return None;
     }
     default_local_data_dir()
 }
@@ -884,5 +984,62 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod issue2694_tests {
+    use super::*;
+    use crate::i18n::Lang;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn 隔離の印でtako_data_dirが無いときだけ既定のdata_dirを使わない() {
+        let set = Some(OsStr::new("/tmp/tk2694"));
+        let empty = Some(OsStr::new(""));
+        // (TAKO_ISOLATED, TAKO_DATA_DIR, 既定の置き場を使わないか)
+        let cases = [
+            (Some("1"), None, true),
+            (Some("true"), None, true),
+            (Some("on"), None, true),
+            (Some("1"), empty, true),
+            (Some("1"), set, false),
+            (Some("0"), None, false),
+            (Some(""), None, false),
+            (Some("yes"), None, false),
+            (None, None, false),
+            (None, set, false),
+        ];
+        for (isolated, data, want) in cases {
+            assert_eq!(
+                refuses_default_data_dir(isolated, data),
+                want,
+                "TAKO_ISOLATED={isolated:?} TAKO_DATA_DIR={data:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 断りは日英で英語に日本語が混ざらない() {
+        let ja = IsolatedWithoutDataDir.text_in(Lang::Ja);
+        let en = IsolatedWithoutDataDir.text_in(Lang::En);
+        for text in [ja, en] {
+            for name in ["TAKO_ISOLATED=1", "TAKO_DATA_DIR"] {
+                assert!(text.contains(name), "何を指定すれば動くかが無い: {text}");
+            }
+        }
+        assert!(en.is_ascii(), "英語表示に日本語が混ざる: {en}");
+    }
+
+    #[test]
+    fn テストプロセスでは門が効かず_データの置き場は隔離先のまま() {
+        // テストプロセスは #944 で先に隔離先へ倒れる = 隔離の印の有無に関係なく本番へは届かない。
+        // 門（data_dir_refusal）は製品のプロセスだけで効く
+        assert!(data_dir_refusal().is_none());
+        assert!(data_dir().is_some());
+        assert_eq!(
+            NoDataDir.text_in(Lang::Ja),
+            "データディレクトリが決まらない（HOME が無い）"
+        );
     }
 }

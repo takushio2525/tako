@@ -4732,7 +4732,7 @@ fn cli_main() -> ExitCode {
             // #1068: 応答に理由文（`Note`）が載るのでここで表示言語を決める。
             // profiles はローカル処理（dispatch を直呼び）なので、GUI 側の初期化に
             // 相乗りできない = 呼ぶ側が明示しないと静的既定の英語で凍る
-            tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+            init_local_lang();
             orchestrator_profiles_cli(sub)
         }
         Command::Orchestrator(OrchestratorCommand::SelfInfo { pane }) => {
@@ -4764,50 +4764,7 @@ fn cli_main() -> ExitCode {
             .map(|result| println!("{}", pretty_json(&result)))
         }
         Command::Orchestrator(OrchestratorCommand::Handoffs(ref sub)) => {
-            // 引き継ぎファイルはローカルのファイル操作なので IPC 不要。
-            // MCP `tako_orchestrator_handoffs` と同一関数を共用する（二重実装を作らない）
-            let (action, project, profile, content) = match sub {
-                HandoffsCommand::List => ("list", None, None, None),
-                HandoffsCommand::Show { project, profile } => {
-                    ("show", project.clone(), profile.clone(), None)
-                }
-                HandoffsCommand::Write {
-                    project,
-                    profile,
-                    content,
-                } => {
-                    let body = match content {
-                        Some(c) => c.clone(),
-                        None => {
-                            let mut buf = String::new();
-                            match std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
-                                Ok(_) => buf,
-                                Err(e) => {
-                                    let lang = cli_lang();
-                                    eprintln!(
-                                        "{}: {}",
-                                        ReplyNote::ErrorLabel.text_in(lang),
-                                        Reason::StdinReadFailed(e.to_string()).text_in(lang)
-                                    );
-                                    return ExitCode::FAILURE;
-                                }
-                            }
-                        }
-                    };
-                    ("write", project.clone(), profile.clone(), Some(body))
-                }
-                HandoffsCommand::Migrate { profile } => ("migrate", None, profile.clone(), None),
-            };
-            // 手元で dispatch を直呼びする。理由の文（#2365）を前置きと同じ表示言語で組む
-            init_local_lang();
-            tako_control::dispatch::dispatch_orchestrator_handoff_files(
-                action,
-                project.as_deref(),
-                profile.as_deref(),
-                content.as_deref(),
-            )
-            .map_err(local_dispatch_err)
-            .map(|result| println!("{}", pretty_json(&result)))
+            return orchestrator_handoffs_local(sub);
         }
         Command::Orchestrator(OrchestratorCommand::Layout {
             ref policy,
@@ -5255,6 +5212,7 @@ fn print_sandbox_state(
 /// 作らず**このプロセスを起動コマンドに置き換える**（ペイン番号・レジストリの追跡がそのまま続く）。
 /// A/B は `TAKO_2470_LEGACY=1`（修正前の案内 `cd <cwd> && claude … --resume <id>` をそのまま走らせる）
 fn orchestrator_resume(worker_id: &str) -> Result<(), String> {
+    local_data_gate()?;
     use tako_control::orchestrator::registry;
 
     // 断り・案内・型の口の文（移行の知らせ・レジストリ・会話の再開）を表示言語で組む（#2365）
@@ -5351,6 +5309,7 @@ fn run_launch_line(command: &str) -> Result<(), String> {
 }
 
 fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
+    local_data_gate()?;
     use tako_control::orchestrator;
 
     // 起動の流れの断り・行・型の口の文と、移行の知らせ・`Note` 由来の文言（サンドボックス状態 #981 /
@@ -5614,6 +5573,7 @@ fn launch_profile_line(
 /// `tako solo [-profile]` — solo system prompt 付きで claude / codex を起動する。
 /// 既定はインライン（現在のペインで起動）、--tab で新タブ起動（#264）。
 fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
+    local_data_gate()?;
     use tako_control::orchestrator;
 
     // 起動の流れの断り・行・型の口の文と `Note` 由来の文言を表示言語で組む（master と同じ。#2365）
@@ -5766,6 +5726,7 @@ fn orchestrator_watch(
     tmux_session: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<(), String> {
+    local_data_gate()?;
     use tako_control::orchestrator::registry::WorkerRegistry;
     let mut session_id = session_id.map(str::to_string);
     let mut tmux_session = tmux_session.map(str::to_string);
@@ -6010,6 +5971,7 @@ fn orchestrator_run(
     task_type: Option<&str>,
     account: Option<&str>,
 ) -> Result<(), String> {
+    local_data_gate()?;
     let pane_resolved = if pane.is_some() {
         pane
     } else if tab.is_some() {
@@ -6050,6 +6012,7 @@ fn orchestrator_run(
 
 /// `tako orchestrator projects` — CLI 版プロジェクト管理
 fn orchestrator_projects_cli(sub: &ProjectsCommand) -> Result<(), String> {
+    local_data_gate()?;
     init_local_lang();
     // 人向けの行は表示言語（#2365。文は `ReplyNote` の 1 か所）
     let lang = cli_lang();
@@ -6229,6 +6192,7 @@ fn print_project_mcp(key: &str, res: &serde_json::Value, lang: tako_core::i18n::
 /// `tako orchestrator profiles` — CLI 版プロファイル管理。
 /// dispatch と同じ実装（ファイル直読み）を呼ぶため、tako アプリの起動は不要
 fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
+    local_data_gate()?;
     use tako_control::dispatch::{dispatch_orchestrator_profiles, ProfilesParams};
 
     let params = match sub {
@@ -6365,6 +6329,7 @@ fn orchestrator_profiles_cli(sub: &ProfilesCommand) -> Result<(), String> {
 /// QR は恒久固定 URL のみ（#283: secret を含まない。初回接続時に Mac 側で
 /// ペアリング承認ダイアログが表示される）
 fn remote_start() -> Result<(), String> {
+    local_data_gate()?;
     use tako_control::remote::{with_origin, RequestOrigin};
     // 起動の途中の断り（`RemoteRefusal::DaemonStarting`。#2613）は表示言語で文にするので、呼ぶ前に決める
     init_local_lang();
@@ -6429,6 +6394,7 @@ fn remote_stop(force: bool) -> Result<(), String> {
 /// `tako remote status` — デーモンの状態を表示する。
 /// 応答にトークンは含まれない（#283 で長寿命 bearer token を全廃）
 fn remote_status() -> Result<(), String> {
+    local_data_gate()?;
     let status = tako_control::remote::daemon_status();
     // 自動復帰の失敗も JSON に埋もれさせない（#1485: 「起動していたのに戻っていない」を
     // 一目で分かる形に）。**判断は再計算せず状態を読むだけ**（#372 / #1473 と同じ）
@@ -6475,6 +6441,7 @@ fn remote_status() -> Result<(), String> {
 /// `.agent/requirements.md` FR-6.5 / FR-6.21）。`role` に強いものを渡すと断られるので、
 /// 「上げられない」ことを CLI からそのまま観測できる
 fn remote_devices(command: RemoteDevicesCommand) -> Result<(), String> {
+    local_data_gate()?;
     // 断り（`RemoteRefusal`）は表示言語で文にするので、呼ぶ前に設定から決める（#2365）
     init_local_lang();
     let result = match command {
@@ -6496,6 +6463,7 @@ fn remote_devices(command: RemoteDevicesCommand) -> Result<(), String> {
 /// **サブコマンド省略で一覧**（`tako remote shortcuts list` と打たせない = #322 の最簡形）。
 /// 正本は `tako_core::remote_shortcuts` で、PWA・MCP と同じ 1 実装を通る
 fn remote_shortcuts(command: Option<RemoteShortcutsCommand>) -> Result<(), String> {
+    local_data_gate()?;
     let (action, path, name) = match command {
         None | Some(RemoteShortcutsCommand::List) => ("list", None, None),
         Some(RemoteShortcutsCommand::Add { path, name }) => ("add", Some(path), name),
@@ -6517,6 +6485,7 @@ fn remote_setup_cli(
     answers_json: Option<&str>,
     tailscale: Option<&str>,
 ) -> Result<(), String> {
+    local_data_gate()?;
     if let Some(json_str) = answers_json {
         // 非対話の経路の断り（`RemoteRefusal`）は表示言語で文にするので、呼ぶ前に設定から決める（#2365。
         // 対話のウィザードは日本語の表示のまま）
@@ -6543,11 +6512,13 @@ fn remote_setup_cli(
 
 /// `tako remote serve` — HTTP サーバーをフォアグラウンドで起動する（内部用）
 fn remote_serve() -> Result<(), String> {
+    local_data_gate()?;
     tako_control::remote::run_daemon().map_err(|e| e.to_string())
 }
 
 /// `tako remote agents` — claude agents --json + tmux ペイン対応付けを表示する
 fn remote_agents() -> Result<(), String> {
+    local_data_gate()?;
     // 断り（`AgentScanError`）は表示言語で文にするので、呼ぶ前に設定から決める（#2365。
     // 日本語の口 `list_agents_with_panes` は daemon と監視の記録用）
     init_local_lang();
@@ -6562,6 +6533,7 @@ fn remote_agents() -> Result<(), String> {
 
 /// `tako remote messages` — transcript の末尾を正規化 JSON で表示する
 fn remote_messages(session_id: &str, tail: usize) -> Result<(), String> {
+    local_data_gate()?;
     // 断りは表示言語で文にする（#2365。日本語の口 `read_messages` は daemon が PWA へ返す本文用）
     init_local_lang();
     let result = tako_control::transcript::read_messages_typed(session_id, tail)
@@ -6572,6 +6544,7 @@ fn remote_messages(session_id: &str, tail: usize) -> Result<(), String> {
 
 /// `tako remote scrollback` — ペインのスクロールバック履歴をプレーンテキストで表示する
 fn remote_scrollback(pane_id: &str, lines: u32) -> Result<(), String> {
+    local_data_gate()?;
     // 断り（`RemoteRefusal`）は表示言語で文にするので、呼ぶ前に設定から決める（#2365）
     init_local_lang();
     let result = tako_control::remote::scrollback(pane_id, lines).map_err(|e| e.to_string())?;
@@ -6582,6 +6555,7 @@ fn remote_scrollback(pane_id: &str, lines: u32) -> Result<(), String> {
 }
 
 fn telemetry_local(sub: &TelemetryCommand) -> Result<(), String> {
+    local_data_gate()?;
     let mut settings = tako_control::settings::load();
     // 状態の行と保存の断りは表示言語（#2365）
     let lang = cli_lang();
@@ -6664,8 +6638,9 @@ fn fda_local(sub: &FdaCommand) -> Result<(), String> {
 /// `tako config`（Issue #513）。GUI が動いていなくても使えるローカル処理。
 /// 実体は dispatch と共通なので、MCP `tako_config_share` と結果が食い違わない
 fn config_share_local(args: &ConfigArgs) -> Result<(), String> {
+    local_data_gate()?;
     // CLI 単独で走るのでここでも表示言語を解決する（platform_local と同じ理由。#435）
-    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    init_local_lang();
     let (action, target, path, remote, message, no_push) = match &args.command {
         None | Some(ConfigCommand::Status) => ("status", None, None, None, None, false),
         Some(ConfigCommand::List) => ("list", None, None, None, None, false),
@@ -6912,6 +6887,7 @@ fn print_list_section(title: &str, value: &serde_json::Value) {
 /// このシェルの `CLAUDE_CONFIG_DIR`。mod の報告で見えた dir は GUI しか知らないので、GUI が
 /// 動いていれば起動時の差分検出がそこへ置く（MCP `tako_mod` は GUI の材料ごと見る）
 fn mod_install_local(args: &ModArgs) -> Result<(), String> {
+    local_data_gate()?;
     let action = args.action.as_deref().unwrap_or("install");
     // 位置引数は #1960 で `rest`（band の on / off・ui の操作）、ui の button add は
     // --label / --hotkey / --id になった。install / uninstall はどれも取らない
@@ -6972,6 +6948,7 @@ fn print_mod_skills(skills: &Value, lang: tako_core::i18n::Lang) {
 /// 応答の組み立ては `tako_control::platform::report` を通す。MCP `tako_platform` と
 /// **同じ 1 本**なので、CLI と AI で見える内容が食い違わない
 fn shell_integration_local(args: &ShellIntegrationArgs) -> Result<(), String> {
+    local_data_gate()?;
     let out = tako_control::shell_integration::run(args.action.as_deref())?;
     if args.json {
         println!("{}", pretty_json(&out));
@@ -7032,6 +7009,7 @@ fn shell_integration_local(args: &ShellIntegrationArgs) -> Result<(), String> {
 
 /// `tako migrate`（Issue #916）。GUI 無しで動くローカル処理
 fn migrate_local(args: &MigrateArgs) -> Result<(), String> {
+    local_data_gate()?;
     // CLI 単独で走るので表示言語を settings.json から解決する（platform と同じ。#435）。
     // ファイルに触らない読みにする: 見るだけの status が読めない settings.json を退避へ移すと、
     // 報告に出るはずの settings.json が「不在」になる（#2238）
@@ -7046,6 +7024,7 @@ fn migrate_local(args: &MigrateArgs) -> Result<(), String> {
 /// 同じ `tako_control::usage::usage_payload` を通る（観測は GUI が `<data_dir>/usage/` へ書き、
 /// 使用量の索引は GUI の背景とこのコマンドが同じ関数で読み進める）
 fn usage_local(args: &UsageArgs) -> Result<(), String> {
+    local_data_gate()?;
     let query = tako_control::usage::UsageQuery {
         by: args.by.clone(),
         window: args.window.clone(),
@@ -7424,7 +7403,7 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32) -> String {
 fn agent_support_local(args: &AgentSupportArgs) -> Result<(), String> {
     // 表示言語のグローバルは既定が英語。CLI 単独で走るここでも settings.json から
     // 解決しないと、日本語設定なのに英語で出てしまう（#435。platform_local と同じ）
-    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    init_local_lang();
     let report =
         tako_control::agent_support::report(args.agent.as_deref(), args.status.as_deref())?;
     if args.json {
@@ -7536,7 +7515,7 @@ fn orchestrator_guide_local(
     profile: Option<&str>,
     as_json: bool,
 ) -> Result<(), String> {
-    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    init_local_lang();
     let profile_name = profile.map(str::to_string).unwrap_or_else(|| {
         std::env::var("TAKO_ORCHESTRATOR_ROLE")
             .ok()
@@ -7689,7 +7668,8 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn context_budget_local(args: &ContextBudgetArgs) -> Result<(), String> {
-    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    local_data_gate()?;
+    init_local_lang();
     let cwd = match args.cwd {
         Some(ref c) => std::path::PathBuf::from(tako_control::orchestrator::expand_tilde(c)),
         None => {
@@ -7957,6 +7937,8 @@ fn queue_request(action: &str) -> Request {
 /// `tako queue <コマンド>`: 順番待ちで走らせる（#1994）。終了コードは子と同じ
 fn queue_run_cli(args: &QueueArgs) -> ExitCode {
     use tako_control::queue_wrapper as w;
+    // 調停役はマシン全体で 1 つ = 隔離した検証のビルドも本番の順番待ちと設定を見る（#2531 / #2694）
+    tako_core::paths::allow_machine_wide_data_dir();
     let Some(QueueCommand::Run(argv)) = &args.command else {
         return ExitCode::FAILURE;
     };
@@ -8003,6 +7985,8 @@ fn queue_run_cli(args: &QueueArgs) -> ExitCode {
 /// `tako queue`（状況）/ `cancel` / `limits` / `serve`（#1993 / #1994）
 fn queue_cli(args: &QueueArgs) -> Result<(), String> {
     use tako_control::queue_wrapper::SendError;
+    // 調停役はマシン全体で 1 つ。GUI が居ないときの枠の上限も本番の設定へ書く（#2531 / #2694）
+    tako_core::paths::allow_machine_wide_data_dir();
     match &args.command {
         None => queue_status_cli(args.json),
         Some(QueueCommand::Cancel { id, json }) => {
@@ -8931,7 +8915,7 @@ fn ipc_recovery_lines(ipc: &Value, lang: tako_core::i18n::Lang) -> Vec<String> {
 fn platform_local(args: &PlatformArgs) -> Result<(), String> {
     // 表示言語のグローバルは既定が英語。GUI は起動時に settings.json から解決するので、
     // CLI 単独で走るここでも同じ解決をしないと日本語設定なのに英語で出てしまう（#435）
-    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    init_local_lang();
     let report = tako_control::platform::report(
         args.platform.as_deref(),
         args.status.as_deref(),
@@ -9006,6 +8990,7 @@ fn platform_local(args: &PlatformArgs) -> Result<(), String> {
 /// GUI 死亡・縮退 layout 保存後の復旧手段なので、GUI 内蔵の MCP からは提供できない
 /// （GUI が生きていれば復旧は不要。開発不変条件の例外は requirements.md FR-5 参照）
 fn recover_local(args: &RecoverArgs) -> Result<(), String> {
+    local_data_gate()?;
     let path = tako_control::layout::layout_path()
         .ok_or_else(|| "データディレクトリを解決できない（HOME 未設定等）".to_string())?;
     match args.apply.as_deref() {
@@ -9256,6 +9241,7 @@ fn sleep_guard_status_state() -> (tako_control::sleep_guard::SleepGuardState, &'
 }
 
 fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
+    local_data_gate()?;
     match sub {
         SleepGuardCommand::Status => {
             let (state, source) = sleep_guard_status_state();
@@ -9441,6 +9427,7 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
 }
 
 fn agents_local(sub: &AgentsCommand) -> Result<(), String> {
+    local_data_gate()?;
     match sub {
         AgentsCommand::SyncRules {
             source,
@@ -9602,7 +9589,8 @@ fn read_mod_report() -> Result<Value, String> {
 /// `tako_control::claude_mod_ui` の 1 実装（MCP `tako_mod` の action=ui と同じ応答）。
 /// 断ったら理由と使える値を出して終了コード 1（ui.json は書いていない）
 fn mod_ui_local(args: &ModArgs) -> Result<(), String> {
-    tako_core::i18n::set_lang(tako_control::settings::load().lang_setting().resolve());
+    local_data_gate()?;
+    init_local_lang();
     // 断りの文はどれも表示言語に従う（#2365。上で決めた言語）
     let request = tako_control::claude_mod_ui::cli_request(
         &args.rest,
@@ -12388,6 +12376,7 @@ fn run_config_env(
 
 /// 委任台帳のローカル処理（YAML I/O のみ。IPC 不要。#292）
 fn ledger_cli(sub: &LedgerCommand) -> Result<(), String> {
+    local_data_gate()?;
     use tako_control::orchestrator::ledger;
     // 台帳の断り（`ConfigError`）を出口の枠（`error:`）と同じ表示言語で組む（#2365。`gate_cli` と同じ）
     init_local_lang();
@@ -12633,6 +12622,7 @@ fn run_list(command: &Command) -> Result<(), String> {
 
 /// gate 操作のローカル処理（YAML I/O + コマンド実行。IPC 不要。#244）
 fn gate_cli(sub: &GateCommand) -> Result<(), String> {
+    local_data_gate()?;
     // 置き場の断り（`acceptance_gates` が組む `Reason`）の表示言語を設定から決める（#2365）
     init_local_lang();
     match sub {
@@ -12886,6 +12876,81 @@ fn front_err(reason: tako_control::Reason) -> String {
 /// 表示言語のグローバルには触らない（呼ぶたびに settings.json を読む = 手元の処理の 1 回分）
 fn cli_lang() -> tako_core::i18n::Lang {
     tako_control::settings::peek_lang_setting().resolve()
+}
+
+/// `tako orchestrator handoffs`（引き継ぎファイルの管理。手元の処理）。stdin の読みの失敗は
+/// 前からの書式（`<エラーの見出し>: <理由>`）で出すので、終了コードまでここで決める
+fn orchestrator_handoffs_local(sub: &HandoffsCommand) -> ExitCode {
+    // 引き継ぎファイルは data dir の下（#2694: 隔離の印で TAKO_DATA_DIR が無ければ断る）
+    if let Err(message) = local_data_gate() {
+        eprintln!("error: {message}");
+        return ExitCode::FAILURE;
+    }
+    // 引き継ぎファイルはローカルのファイル操作なので IPC 不要。
+    // MCP `tako_orchestrator_handoffs` と同一関数を共用する（二重実装を作らない）
+    let (action, project, profile, content) = match sub {
+        HandoffsCommand::List => ("list", None, None, None),
+        HandoffsCommand::Show { project, profile } => {
+            ("show", project.clone(), profile.clone(), None)
+        }
+        HandoffsCommand::Write {
+            project,
+            profile,
+            content,
+        } => {
+            let body = match content {
+                Some(c) => c.clone(),
+                None => {
+                    let mut buf = String::new();
+                    match std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+                        Ok(_) => buf,
+                        Err(e) => {
+                            let lang = cli_lang();
+                            eprintln!(
+                                "{}: {}",
+                                ReplyNote::ErrorLabel.text_in(lang),
+                                Reason::StdinReadFailed(e.to_string()).text_in(lang)
+                            );
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            };
+            ("write", project.clone(), profile.clone(), Some(body))
+        }
+        HandoffsCommand::Migrate { profile } => ("migrate", None, profile.clone(), None),
+    };
+    // 手元で dispatch を直呼びする。理由の文（#2365）を前置きと同じ表示言語で組む
+    init_local_lang();
+    match tako_control::dispatch::dispatch_orchestrator_handoff_files(
+        action,
+        project.as_deref(),
+        profile.as_deref(),
+        content.as_deref(),
+    ) {
+        Ok(result) => {
+            println!("{}", pretty_json(&result));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {}", local_dispatch_err(e));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// 手元で data dir を読み書きするサブコマンドの入口の門（#2694）。
+///
+/// `TAKO_ISOLATED=1` で `TAKO_DATA_DIR` が無ければ、置き場の解決（`tako_core::paths::data_dir`）は
+/// 既定（本番）の置き場を返さない。手元の処理がそのまま進むと、断りの文も終了コードも無いまま黙って
+/// 何もしない（または「HOME が無い」と出る）ので、入口で同じ判定（`data_dir_refusal`）を引いて断る。
+/// 文は #2531 の GUI への接続の断りと対（`IsolatedWithoutDataDir`）。どのハンドラが呼ぶかは番犬
+/// `issue2694_isolated_data_dir_watchdog` が呼び出しを辿って固定する
+fn local_data_gate() -> Result<(), String> {
+    match tako_core::paths::data_dir_refusal() {
+        Some(refusal) => Err(refusal.text_in(cli_lang()).to_string()),
+        None => Ok(()),
+    }
 }
 
 /// `tako sessions resume` の表示: 復元した 1 行（stderr・表示言語。#2365）+ 応答の JSON（stdout）

@@ -53,6 +53,8 @@ struct Scratch {
     dir: PathBuf,
     accepted: Arc<AtomicUsize>,
     socket: PathBuf,
+    /// [`Self::set_lang`] が決めた表示言語（`run` が `TAKO_LANG` で渡す）
+    lang: std::sync::Mutex<Option<String>>,
 }
 
 impl Scratch {
@@ -97,6 +99,7 @@ impl Scratch {
             dir,
             accepted,
             socket,
+            lang: std::sync::Mutex::new(None),
         };
         // 一時 HOME の既定の置き場（= 本番の置き場の役）と、明示する側の置き場の両方に同じ接続情報
         scratch.write_control(&scratch.default_place());
@@ -125,13 +128,16 @@ impl Scratch {
         std::fs::write(dir.join("control.json"), info.to_string()).expect("control.json を書ける");
     }
 
-    /// 表示言語を決める（CLI は既定の置き場の settings.json を読む）
+    /// 表示言語を決める。#2694 以後、隔離の印で `TAKO_DATA_DIR` が無い CLI は既定の置き場の settings.json も
+    /// 読まない（本番の data dir を使わない）ので、system の検出を上書きする `TAKO_LANG` でも渡す
+    /// （settings.json は印の無い CLI のために残す）
     fn set_lang(&self, lang: &str) {
         std::fs::write(
             self.default_place().join("settings.json"),
             format!("{{\"language\":\"{lang}\"}}"),
         )
         .expect("settings.json を書ける");
+        *self.lang.lock().unwrap() = Some(lang.to_string());
     }
 
     /// `TAKO_*` と既定の置き場を動かす env を全部外し、HOME を一時の側へ向けた `tako <args>`
@@ -155,6 +161,9 @@ impl Scratch {
             .env_remove("LC_ALL")
             .env_remove("LC_MESSAGES")
             .env("HOME", self.home());
+        if let Some(lang) = self.lang.lock().unwrap().as_deref() {
+            command.env("TAKO_LANG", lang);
+        }
         for (key, value) in envs {
             command.env(key, value);
         }
@@ -318,11 +327,16 @@ fn 順番待ちは隔離の印があっても既定の置き場の調停役へ�
 
 #[test]
 fn legacy_腕は既定の置き場へ繋がる() {
-    // A/B の腕が生きている = 修正前の挙動を同じバイナリで再現できる（受け入れの A/B と同じ口）
+    // A/B の腕が生きている = 修正前の挙動を同じバイナリで再現できる（受け入れの A/B と同じ口）。
+    // 発見の既定の置き場は data dir から組むので、#2694 以後は data dir の門の A/B も立てて修正前へ戻す
     let scratch = Scratch::new("e");
     let (output, connected) = scratch.run(
         &["list"],
-        &[("TAKO_ISOLATED", "1"), ("TAKO_2531_LEGACY", "1")],
+        &[
+            ("TAKO_ISOLATED", "1"),
+            ("TAKO_2531_LEGACY", "1"),
+            ("TAKO_2694_LEGACY", "1"),
+        ],
     );
     assert!(
         output.status.success() && connected == 1,
