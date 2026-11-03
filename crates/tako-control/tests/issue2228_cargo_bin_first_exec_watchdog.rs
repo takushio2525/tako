@@ -20,7 +20,8 @@
 //! - [`gui_のセルフテストは偽の実行ファイルを空打ちの口で書く`] — GUI のセルフテスト（main.rs の
 //!   `mod self_test` と `crates/tako-app/src/self_test/`）は、節が使うスタブに実行権を直に付けない
 //!   （`from_mode(0o755)` ほか）。書く口は `write_fake_exec`（中は `fake_exec::write_script` = 空打ちつき）。
-//!   #601 の段と `run-dropdown-1733` の偽の python が 20 秒の窓の中で初めて exec されていた（#2228 の 2）
+//!   #601 の段のユーザーの `tako` が 20 秒の窓の中で初めて exec されていた（#2228 の 2。
+//!   `run-dropdown-1733` の偽の python は今は時計の中で exec されないが、同じ口へ寄せた）
 //!
 //! テストのスクリプト（`scripts/**/test-*.sh`）の同じ形（素の `chmod +x` のスタブ）は、シェルの
 //! 字句解析を持つ `shell_scripts.rs` の `テストのスタブは素のchmodではなく空打ちの補助で実行権を付ける`

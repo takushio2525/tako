@@ -1,22 +1,22 @@
 #!/bin/sh
+if [ ! -e "$0.first-exec" ]; then : > "$0.first-exec"; /bin/sleep 11.000; fi
 [ "${1:-}" = tako-fake-exec-warm ] && exit 0
 MODE=''
-VERSION='1.80.0'
-HANG='/var/folders/jt/h8b6j7gs57d1yns23ccvmm6w0000gn/T//tako-1797-v98SGk/hang'
+HANG='/var/folders/jt/h8b6j7gs57d1yns23ccvmm6w0000gn/T//tako-1507-oBVkBX/hang'
 case "$MODE" in hang-version) exec "$HANG";; esac
-for a in "$@"; do
-  if [ "$a" = "--version" ]; then
-    [ "$MODE" = "broken" ] && { echo "broken" >&2; exit 1; }
-    echo "$VERSION"; exit 0
-  fi
-done
+for a in "$@"; do [ "$a" = "--version" ] && { echo "1.80.0"; exit 0; }; done
 case "$MODE" in hang-status) exec "$HANG";; esac
-# 孫を残して親だけ終わる（孫は stdout / stderr を握ったまま = `read_to_end` が EOF を見ない）
-[ "$MODE" = "orphan" ] && "$HANG" &
-if [ "$1" = "serve" ]; then echo '{}'; exit 0; fi
+if [ "$1" = "serve" ]; then
+  if [ "$MODE" = "published" ]; then
+    echo '{"TCP":{"443":{"HTTPS":true}},"Web":{"mac.tail1234.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:18080"}}}}}'
+  else
+    echo '{}'
+  fi
+  exit 0
+fi
 case "$MODE" in
   needslogin) echo '{"BackendState":"NeedsLogin"}';;
-  nodaemon)   echo "failed to connect to local Tailscale service" >&2; exit 1;;
-  *) echo "{\"BackendState\":\"Running\",\"Version\":\"$VERSION\",\"CertDomains\":[\"mac.tail1234.ts.net\"],\"Self\":{\"DNSName\":\"mac.tail1234.ts.net.\"}}";;
+  stopped)    echo '{"BackendState":"Stopped"}';;
+  *) echo '{"BackendState":"Running","Version":"1.80.0","CertDomains":["mac.tail1234.ts.net"],"Self":{"DNSName":"mac.tail1234.ts.net."}}';;
 esac
 exit 0

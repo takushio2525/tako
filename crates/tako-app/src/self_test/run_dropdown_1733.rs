@@ -45,7 +45,9 @@ fn dump(any: AnyWindowHandle, window: WindowHandle<TakoApp>, cx: &mut AsyncApp, 
 }
 
 /// 偽の venv（`pyvenv.cfg` の版 + 実行できる `bin/python`）。中身は走った印を出すだけ。
-/// `bin/python` は書いた時点で空打ちする（#2228。一覧の 20 秒の窓の中で初めて exec しない）。
+/// `bin/python` は節のスタブを書く口 `write_fake_exec`（空打ちつき）で書く（#2228）。今の節は一覧の
+/// 版を `pyvenv.cfg` から読み、`Run` はペインを起こすだけなので時計の中では exec しない（11/04 の注入で
+/// 実測）が、時計の中で出力を待つ段を足しても初回の検査を払わない形にそろえておく。
 /// python を書けなければ `false`
 async fn fake_venv(cx: &mut AsyncApp, dir: &std::path::Path, version: &str) -> bool {
     let bin = dir.join("bin");
