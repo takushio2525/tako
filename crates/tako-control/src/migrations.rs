@@ -68,6 +68,18 @@ fn validate_settings(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<crate::settings::Settings>(text)
 }
 
+/// 順番待ちの過去の記録（JSONL。#1996）: 全行が 1 行の記録として読めるか。読めない行の番号だけを返す
+/// （中身は引用しない）
+fn validate_queue_history(text: &str) -> Result<(), OutcomeReason> {
+    match crate::queue_history::first_bad_line(text) {
+        None => Ok(()),
+        Some(line) => Err(OutcomeReason::of(move |lang| match lang {
+            Lang::Ja => format!("{line} 行目が記録の 1 行として読めない"),
+            Lang::En => format!("line {line} cannot be read as a record"),
+        })),
+    }
+}
+
 fn validate_layout(text: &str) -> Result<(), OutcomeReason> {
     json_ok::<crate::layout::LayoutFile>(text)
 }
@@ -806,6 +818,11 @@ pub const SPECS: &[SchemaSpec] = &[
     // Step では表せない。手順は `platform::webview2::relocate`、ここは**発火と可視化だけ**を
     // 引き受ける（[`webview2_reports`]）。中身は WebView2 のプロファイルなので形式の検査は持たない
     pristine(SchemaId::WebView2Data, None),
+    // #1996: 順番待ちの過去の記録（#2254 の最大メモリ + #1996 の所要時間・ユニット数）。追記だけの JSONL で
+    // 版数の欄は持たない（v1 固定）。欄を足すときは serde の default で旧い行を読めるので Step は要らない
+    // （意味を変えるときだけ target_version を上げて Step を足す）。読めない行のあるファイルは退避し、
+    // 調停役が起動の読み込みで読める行だけに直す（`queue_history::load_and_repair`）
+    pristine(SchemaId::QueueHistory, Some(validate_queue_history)),
 ];
 
 /// 種別から登録を引く
@@ -867,6 +884,16 @@ pub fn targets(id: SchemaId) -> Vec<PathBuf> {
         SchemaId::PowerShellProfile => Vec::new(),
         // #2431: WebView2 のユーザーデータ（フォルダ）。走査ではなく専用実装へ委譲する（[`webview2_reports`]）
         SchemaId::WebView2Data => Vec::new(),
+        // #1996: 新しい方と回した古い方（無いものは返さない）
+        SchemaId::QueueHistory => crate::queue_history::dir()
+            .map(|d| {
+                [crate::queue_history::FILE, crate::queue_history::OLD_FILE]
+                    .iter()
+                    .map(|n| d.join(n))
+                    .filter(|p| p.is_file())
+                    .collect()
+            })
+            .unwrap_or_default(),
         // #1959: data dir の外（設定 dir ごと）。置く先の解決は claude_mod_install の 1 実装
         SchemaId::ClaudeModMark => crate::claude_mod_install::collect_targets(
             &crate::claude_mod_install::target_inputs(&[]),

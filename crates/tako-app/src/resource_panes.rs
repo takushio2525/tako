@@ -44,6 +44,7 @@ impl TakoApp {
                 shelved,
                 child_pid,
                 backend_session,
+                queue_priority: pane.and_then(|p| p.queue_priority()),
             });
         }
         let own_socket = self.ipc.as_ref().map(|ipc| ipc.endpoint().to_string());

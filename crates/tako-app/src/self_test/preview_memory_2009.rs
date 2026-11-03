@@ -141,29 +141,27 @@ fn area_of(app: &TakoApp, pane: PaneId) -> Option<Bounds<Pixels>> {
 
 /// 開いたプレビューを描き切るまで回す（画像のデコードは GPUI の背景で進む）。
 /// `filled` の矩形がどれも空白でなく、2 枚続けて同じ絵になったら描き切ったと見る
-/// （空白どうしも「同じ絵」なので、デコード待ちの間に止まらないよう矩形も見る）
+/// （空白どうしも「同じ絵」なので、デコード待ちの間に止まらないよう矩形も見る）。
+/// 静止しないまま上限に来たら、その時点の絵で後段の比較に任せる（#1902 で回数の窓
+/// 150 回 × 100ms から静止待ちの 1 実装へ）
 async fn settle(
     any: AnyWindowHandle,
     window: WindowHandle<TakoApp>,
     cx: &mut AsyncApp,
     filled: &[Bounds<Pixels>],
 ) -> Option<(image::RgbaImage, f32)> {
-    let mut last: Option<image::RgbaImage> = None;
-    for _ in 0..150 {
-        notify_and_draw(any, window, cx);
-        cx.background_executor()
-            .timer(Duration::from_millis(100))
-            .await;
-        let (frame, scale) = capture_frame(any, cx)?;
-        let ready = filled
+    let budget = text_wait_budget(150, 100, 30);
+    let quiet = wait_for_quiet_frame(any, window, cx, "preview-settle", budget, |frame, scale| {
+        filled
             .iter()
-            .all(|rect| distinct_colors(&frame, *rect, scale) > 2);
-        if ready && last.as_ref() == Some(&frame) {
-            return Some((frame, scale));
-        }
-        last = Some(frame);
+            .all(|rect| distinct_colors(frame, *rect, scale) > 2)
+    })
+    .await;
+    match quiet {
+        QuietFrame::Quiet(frame, scale) => Some((frame, scale)),
+        QuietFrame::Moving => capture_frame(any, cx),
+        QuietFrame::NoCapture => None,
     }
-    capture_frame(any, cx)
 }
 
 /// `rect` に絵が出るまで描いて待つ（出るまでの時間。出なければ None）

@@ -32,6 +32,14 @@
 //!   調停役はそれで見込みメモリを引く（#2254）
 //! - 実行中の取り消しは子とその子孫へ SIGTERM → 10 秒で SIGKILL（Windows は子を起こした直後に入れた
 //!   Job Object ごと止める = コンソールのプロセスは止め GUI のアプリは残す。#2462。境界 B30）
+//! - 受付で優先度の手がかり（#1996。`PriorityHint` = 付けた段・stdin が端末か・env の役割）を送り、
+//!   応答の `job_priority`（受付番号での変更）を覚えて次の poll から送る（調停役を立て直しても戻らない）
+//! - **cargo の進み**（#1996）: 自分の stderr が端末でなく、子が cargo の build / test 系で、利用者が
+//!   `CARGO_TERM_PROGRESS_WHEN` を決めていないときだけ、`CARGO_TERM_PROGRESS_WHEN=always`（と幅 80）を足して
+//!   子の stderr を受け、`Building [...] N/M` の行を外して（`eta::ProgressFilter`）残りをそのまま自分の
+//!   stderr へ流す。読んだ `N/M` は心拍と done に載せる（終わりの見込み・過去の記録のユニット数）。
+//!   端末のときは横取りしない（cargo 自身のバーを人がそのまま見る）。A/B は wrapper のプロセスの env
+//!   `TAKO_1996_LEGACY=1`（stderr を受けず進みの env も足さない = 従来の素通し）
 //!
 //! 送受信（IPC の 1 往復）は呼び手（tako-cli の transport）が閉包で渡す。ここは状態の進め方と
 //! OS 依存（シグナル・子の木）だけを持つ。
@@ -42,10 +50,18 @@ use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tako_core::queue::{self as q, JobKind, JobWire, Priority};
+use tako_core::queue::{self as q, CallerRole, JobKind, JobWire, Priority, PriorityHint};
 
 use crate::protocol::Request;
 use crate::queue::{unix_ms, ENV_JOB};
+
+/// #1996 の A/B: `TAKO_1996_LEGACY=1` で cargo の stderr を受けず `CARGO_TERM_PROGRESS_WHEN` も足さない
+/// （従来の素通し = 進みは読まない）。wrapper（`tako queue <コマンド>`）のプロセスの env で効く
+pub const ENV_LEGACY_1996: &str = "TAKO_1996_LEGACY";
+
+fn legacy_1996() -> bool {
+    std::env::var_os(ENV_LEGACY_1996).is_some_and(|v| v == "1")
+}
 
 /// 待ちの間の poll の間隔
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -74,7 +90,8 @@ pub enum SendError {
 /// wrapper の指定（普段は何も付けない = #322）
 #[derive(Debug, Clone, Default)]
 pub struct Options {
-    pub priority: Priority,
+    /// 処理に付ける段（`--priority` / env `TAKO_QUEUE_PRIORITY`）。`None` = 既定（ペイン > 役割。#1996）
+    pub priority: Option<Priority>,
     /// 待ちの上限（未指定なら調停役が返す設定値。既定 30 分）
     pub max_wait: Option<Duration>,
     /// 表示名（未指定ならコマンド行を短くしたもの）
@@ -136,7 +153,12 @@ pub fn waiting_line(resp: &Value, waited: Duration) -> String {
     if n("unmanaged") > 0 {
         head.push_str(&format!("・tako の外 {}", n("unmanaged")));
     }
-    head.push_str(&format!("・{}）", human_secs(waited.as_secs())));
+    head.push_str(&format!("・{}", human_secs(waited.as_secs())));
+    // 開始の見込み（#1996。前に並ぶ全件と実行中の全件に見込みがあるときだけ調停役が返す）
+    if let Some(start) = resp["start_text"].as_str() {
+        head.push_str(&format!("・{start}"));
+    }
+    head.push('）');
     // 前の処理の後ろで待っている（並びが止まっている）ときだけ「前に N 件」。target dir 待ちの先頭を
     // 追い越せる件（#2243）は 2 番目以降でも自分の理由（枠・メモリ…）で待っているので、それを出す。
     // 旧い調停役は 2 番目以降を常に ahead で返す
@@ -270,7 +292,8 @@ pub fn build_wire(argv: &[String], opts: &Options, cwd: &Path) -> JobWire {
             .clone()
             .unwrap_or_else(|| tako_core::resources::short_label(&argv.join(" "), 80)),
         kind,
-        priority: opts.priority,
+        // 旧い調停役（手がかりを読まない = S2）はこれで並べる
+        priority: opts.priority.unwrap_or_default(),
         target_dir,
         pane: std::env::var("TAKO_PANE_ID")
             .ok()
@@ -278,7 +301,46 @@ pub fn build_wire(argv: &[String], opts: &Options, cwd: &Path) -> JobWire {
         child_pid: None,
         started_at_ms: None,
         exit_code: None,
+        hint: Some(PriorityHint {
+            set: opts.priority,
+            tty: std::io::stdin().is_terminal(),
+            role: std::env::var("TAKO_ORCHESTRATOR_ROLE")
+                .ok()
+                .as_deref()
+                .and_then(CallerRole::from_env_role),
+        }),
+        progress: None,
     }
+}
+
+/// 応答の `job_priority`（受付番号での変更。#1996）を覚える。旧い調停役は欄を返さない = そのまま
+pub fn adopt_job_priority(wire: &mut JobWire, resp: &Value) {
+    let Some(v) = resp.get("job_priority") else {
+        return;
+    };
+    let set = v.as_str().and_then(Priority::parse);
+    if let Some(hint) = wire.hint.as_mut() {
+        hint.set = set;
+    }
+}
+
+/// cargo の進みを読むか（#1996。純関数）: 自分の stderr が端末でない・子が cargo の build / test 系・
+/// 利用者が `CARGO_TERM_PROGRESS_WHEN` を決めていない
+pub fn reads_cargo_progress(
+    argv: &[String],
+    stderr_tty: bool,
+    already_set: &dyn Fn(&str) -> bool,
+) -> bool {
+    !stderr_tty && q::cargo_progress_target(argv) && !already_set("CARGO_TERM_PROGRESS_WHEN")
+}
+
+/// 進みを読む子へ足す env（純関数）。幅は利用者が決めていなければ 80
+pub fn progress_env(already_set: &dyn Fn(&str) -> bool) -> Vec<(&'static str, &'static str)> {
+    let mut v = vec![("CARGO_TERM_PROGRESS_WHEN", "always")];
+    if !already_set("CARGO_TERM_PROGRESS_WIDTH") {
+        v.push(("CARGO_TERM_PROGRESS_WIDTH", "80"));
+    }
+    v
 }
 
 fn request(action: &str, job: &JobWire) -> Request {
@@ -287,6 +349,8 @@ fn request(action: &str, job: &JobWire) -> Request {
         job: Some(job.clone()),
         id: None,
         limits: None,
+        pane: None,
+        priority: None,
     }
 }
 
@@ -480,6 +544,7 @@ fn run_with(
     // ---- 待つ ----
     let wait_start = Instant::now();
     let mut display = Display::new();
+    adopt_job_priority(&mut wire, &first);
     let mut resp = first;
     let mut lost_since: Option<Instant> = None;
     let mut attempts = 0u32;
@@ -533,6 +598,7 @@ fn run_with(
         let polled_at = Instant::now();
         match send(request("poll", &wire)) {
             Ok(v) => {
+                adopt_job_priority(&mut wire, &v);
                 resp = v;
                 lost_since = None;
                 attempts = 0;
@@ -577,6 +643,13 @@ fn run_with(
     let mut cmd = program.command();
     cmd.env(ENV_JOB, wire.id.to_string());
     cmd.envs(share_env(share, already_set));
+    // #1996: 端末でない stderr の cargo は進みを強制して読む（その行は素通しから外す）。A/B は素通し
+    let stderr_tty = std::io::stderr().is_terminal();
+    let read_progress = !legacy_1996() && reads_cargo_progress(argv, stderr_tty, already_set);
+    if read_progress {
+        cmd.envs(progress_env(already_set));
+        cmd.stderr(std::process::Stdio::piped());
+    }
     // #2462 / #2697: 取り消しを子孫まで届かせる入れ物（Windows だけ。一時停止で起こし、入れてから動かす
     // = 子が孫を起こす前に入る。子はこの端末のコンソールを受け継ぐ）。子が普通に終わったら drop が
     // 何も止めずに手放す
@@ -594,6 +667,8 @@ fn run_with(
             return q::EXIT_SPAWN_FAILED;
         }
     };
+    // #1996: 進みを読むなら子の stderr を受ける背景スレッド
+    let tap = child.stderr.take().map(progress_tap::start);
     wire.child_pid = Some(child.id());
     wire.started_at_ms = Some(unix_ms());
     let mut cancel_at: Option<Instant> = None;
@@ -609,12 +684,16 @@ fn run_with(
             signals::forward(child.id(), sig);
         }
         if Instant::now() >= next_beat {
+            if let Some(t) = &tap {
+                wire.progress = t.latest().or(wire.progress);
+            }
             // 届かなくても子は止めない（繋がったら子の pid で登録し直る）
             let beat = send(request("started", &wire));
             // 次の心拍は往復が終わってから数える（応答しない調停役で 1 往復が上限まで
             // かかっても、次の心拍までの間は子の終わりとシグナルを見られる。#2123）
             next_beat = Instant::now() + HEARTBEAT_INTERVAL;
             if let Ok(v) = beat {
+                adopt_job_priority(&mut wire, &v);
                 if v["cancel"] == true && cancel_at.is_none() {
                     note("取り消されたので子を止める（SIGTERM → 10 秒で SIGKILL）");
                     tree::terminate(&mut child, &mut descendants, false);
@@ -630,9 +709,87 @@ fn run_with(
         }
         std::thread::sleep(CHILD_TICK);
     };
+    // 子の stderr を読み切ってから（最後の N/M と途中の行を落とさない）。子孫が stderr を持ったまま
+    // 残っても待ち続けない（[`progress_tap::DRAIN_GRACE`]）
+    if let Some(t) = tap {
+        wire.progress = t.finish(progress_tap::DRAIN_GRACE).or(wire.progress);
+    }
     wire.exit_code = Some(code);
     let _ = send(request("done", &wire));
     code
+}
+
+/// 子の stderr を受けて cargo の進みの行を外し、残りを自分の stderr へ流す背景スレッド（#1996）
+mod progress_tap {
+    use std::io::{Read, Write};
+    use std::process::ChildStderr;
+    use std::sync::mpsc::{self, Receiver};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tako_core::queue::eta::ProgressFilter;
+    use tako_core::queue::Progress;
+
+    /// 子が終わってから stderr を読み切るのを待つ上限（子孫が stderr を持ったまま残る場合）
+    pub const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+    pub struct Tap {
+        latest: Arc<Mutex<Option<Progress>>>,
+        done: Receiver<()>,
+    }
+
+    pub fn start(mut stderr: ChildStderr) -> Tap {
+        let latest = Arc::new(Mutex::new(None));
+        let (tx, done) = mpsc::channel();
+        let shared = Arc::clone(&latest);
+        let spawned = std::thread::Builder::new()
+            .name("tako-queue-progress".into())
+            .spawn(move || {
+                let mut filter = ProgressFilter::new();
+                let mut buf = [0u8; 8192];
+                let mut out = std::io::stderr();
+                loop {
+                    match stderr.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let pass = filter.feed(&buf[..n]);
+                            if !pass.is_empty() {
+                                let _ = out.write_all(&pass);
+                                let _ = out.flush();
+                            }
+                            if filter.last.is_some() {
+                                *shared.lock().unwrap_or_else(|p| p.into_inner()) = filter.last;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+                let rest = filter.finish();
+                if !rest.is_empty() {
+                    let _ = out.write_all(&rest);
+                    let _ = out.flush();
+                }
+                let _ = tx.send(());
+            });
+        if let Err(e) = spawned {
+            // 読み手を立てられない（スレッドが足りない）: 子の stderr は誰も読まない = 詰まらないよう落とす
+            eprintln!("tako queue: 進みの読み手を立てられない（{e}）");
+        }
+        Tap { latest, done }
+    }
+
+    impl Tap {
+        pub fn latest(&self) -> Option<Progress> {
+            *self.latest.lock().unwrap_or_else(|p| p.into_inner())
+        }
+
+        /// 読み切るまで（上限 `grace`）待って最後の進みを返す
+        pub fn finish(self, grace: Duration) -> Option<Progress> {
+            let _ = self.done.recv_timeout(grace);
+            self.latest()
+        }
+    }
 }
 
 /// 待ちから外れる（届かなくても構わない。調停役は pid の生存でも外す）
@@ -822,12 +979,17 @@ mod tests {
             &argv,
             &Options {
                 label: Some("名前".into()),
-                priority: Priority::Low,
+                priority: Some(Priority::Low),
                 ..Options::default()
             },
             Path::new("/"),
         );
         assert_eq!((w.label.as_str(), w.priority), ("名前", Priority::Low));
+        assert_eq!(
+            w.hint.map(|h| h.set),
+            Some(Some(Priority::Low)),
+            "付けた段は手がかりにも載る（#1996）"
+        );
         // --target-dir は cwd の workspace より強い
         let argv: Vec<String> = ["cargo", "build", "--target-dir", "/x/dist-target"]
             .iter()
