@@ -24,6 +24,10 @@
 //! 7. agent の起動待ち（`launch_gate.rs`。#2413）の UI スレッドから届く口（dispatch の spawn と起動時の
 //!    復元が呼ぶ `request` / `hold`、500 ms の tick が呼ぶ `tick` と、そこから呼ぶ判断・取り込み）は採らない。
 //!    GUI の 500 ms tick が `launch_gate::tick` を呼んでいる（待たせた起動を起こす口が配線されている）
+//! 8. GUI の resources ビューとステータスバーの区画（`resources_panel.rs`。#1995）は走査の口を呼ばない。
+//!    覚えの読み（`read_cached_snapshot` = 調停役の錠・設定の mtime・札の数え）は background の
+//!    `spawn` の中からだけ呼び、見ている間の読みは CLI と同じ `Request::Queue` を `dispatch_off_ui` で
+//!    投げる（`queue::answer` は background の `OffloadJob::Queue`）。2 秒 tick は計測区間つきで呼ぶ
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -42,6 +46,7 @@ const IPC: &str = "crates/tako-control/src/ipc.rs";
 const RESOURCES: &str = "crates/tako-control/src/resources.rs";
 const QUEUE: &str = "crates/tako-control/src/queue.rs";
 const LAUNCH_GATE: &str = "crates/tako-control/src/launch_gate.rs";
+const PANEL: &str = "crates/tako-app/src/resources_panel.rs";
 
 /// UI スレッドで呼んではいけない口（右は名指しの理由）
 const SCANS: &[(&str, &str)] = &[
@@ -160,6 +165,7 @@ struct Sources {
     resources: String,
     queue: String,
     launch_gate: String,
+    panel: String,
 }
 
 impl Sources {
@@ -173,6 +179,7 @@ impl Sources {
             resources: read(&root, RESOURCES),
             queue: read(&root, QUEUE),
             launch_gate: read(&root, LAUNCH_GATE),
+            panel: read(&root, PANEL),
         }
     }
 
@@ -184,6 +191,7 @@ impl Sources {
         out.extend(scan_resources(&self.resources));
         out.extend(scan_queue(&self.queue));
         out.extend(scan_launch_gate(&self.launch_gate, &self.main));
+        out.extend(scan_panel(&self.panel, &self.main));
         out
     }
 }
@@ -502,6 +510,115 @@ fn scan_launch_gate(src: &str, main: &str) -> Vec<Offender> {
     out
 }
 
+/// 8. GUI の resources ビューは描くだけ（#1995）
+fn scan_panel(src: &str, main: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    let all: Vec<String> = src.lines().map(str::to_string).collect();
+    scans_in(
+        PANEL,
+        1,
+        &all,
+        "resources ビュー（`resources_panel.rs`）",
+        &mut out,
+    );
+    // 覚えの読みは `read_cached_snapshot` の中だけ
+    let reader = fn_window(src, "pub(crate) fn read_cached_snapshot(");
+    let reader_range = reader
+        .as_ref()
+        .map(|(at, w)| (*at, *at + w.len()))
+        .unwrap_or((0, 0));
+    if reader.is_none() {
+        out.push(Offender {
+            file: PANEL,
+            line: 0,
+            why: "`read_cached_snapshot` が見つからない（走査が空振り）".into(),
+        });
+    }
+    for i in code_lines_with(&all, "cached_status(") {
+        let line = i + 1;
+        if line < reader_range.0 || line >= reader_range.1 {
+            out.push(Offender {
+                file: PANEL,
+                line,
+                why: "覚えの読み（`cached_status`）を `read_cached_snapshot` の外で呼んでいる                       （UI スレッドで調停役の錠・設定の mtime・札の数えを待つことになる）"
+                    .into(),
+            });
+        }
+    }
+    // `read_cached_snapshot(` の呼び出しは background の spawn の中（直前 3 行に spawn がある）
+    let calls: Vec<usize> = code_lines_with(&all, "read_cached_snapshot(")
+        .into_iter()
+        .filter(|i| !all[*i].contains("fn read_cached_snapshot("))
+        .collect();
+    if calls.is_empty() {
+        out.push(Offender {
+            file: PANEL,
+            line: 0,
+            why: "`read_cached_snapshot` を誰も呼んでいない（ステータスバーの区画が更新されない）"
+                .into(),
+        });
+    }
+    for i in calls {
+        let from = i.saturating_sub(3);
+        if !all[from..i]
+            .iter()
+            .any(|l| l.contains("background_executor().spawn("))
+        {
+            out.push(Offender {
+                file: PANEL,
+                line: i + 1,
+                why: "`read_cached_snapshot` を background の spawn の外で呼んでいる（UI スレッドで覚えを読む）"
+                    .into(),
+            });
+        }
+    }
+    // 見ている間の読みは CLI と同じ要求を dispatch_off_ui で
+    match fn_window(src, "pub(crate) fn spawn_resources_fetch(") {
+        None => out.push(Offender {
+            file: PANEL,
+            line: 0,
+            why: "`spawn_resources_fetch` が見つからない（走査が空振り）".into(),
+        }),
+        Some((at, window)) => {
+            if code_lines_with(&window, ".dispatch_off_ui(").is_empty() {
+                out.push(Offender {
+                    file: PANEL,
+                    line: at,
+                    why: "見ている間の読みが `dispatch_off_ui` を通っていない（`queue::answer` の走査が                           UI スレッドの同期の dispatch に乗るか、CLI と別の経路になる）"
+                        .into(),
+                });
+            }
+        }
+    }
+    // 2 秒 tick が計測区間つきで呼ぶ
+    let lines: Vec<&str> = main.lines().collect();
+    match lines
+        .iter()
+        .position(|l| !is_comment(l) && l.contains("app.tick_resources("))
+    {
+        None => out.push(Offender {
+            file: MAIN,
+            line: 0,
+            why: "2 秒 tick が `app.tick_resources` を呼んでいない（ステータスバーの区画が更新されない）"
+                .into(),
+        }),
+        Some(i) => {
+            let from = i.saturating_sub(4);
+            if !lines[from..i]
+                .iter()
+                .any(|l| l.contains("perf_span(\"periodic_prep:resources\")"))
+            {
+                out.push(Offender {
+                    file: MAIN,
+                    line: i + 1,
+                    why: "`tick_resources` が計測区間（`periodic_prep:resources`）で包まれていない".into(),
+                });
+            }
+        }
+    }
+    out
+}
+
 #[test]
 fn ui_スレッドはpcリソースを採らない() {
     let s = Sources::load();
@@ -714,5 +831,45 @@ fn 逆戻りを名指しできる() {
             .any(|o| o.file == MAIN && o.why.contains("launch_gate::tick(app)")),
         "注入「⑩」を名指しできない: {:?}",
         offenders.iter().map(Offender::report).collect::<Vec<_>>()
+    );
+
+    // ⑪ resources ビューの描画が覚えを UI スレッドで直に読む（#1995）
+    let v = inject(
+        &s.panel,
+        "        let Some(snap) = self.resources.snapshot.clone() else {",
+        "        let _ = tako_control::queue::with_section(tako_control::resources::cached_status());\n        let Some(snap) = self.resources.snapshot.clone() else {",
+        "⑪",
+    );
+    expect_named(
+        "resources ビューが UI スレッドで覚えを読む",
+        scan_panel(&v, &s.main),
+        PANEL,
+        "read_cached_snapshot` の外",
+    );
+    // ⑫ ステータスバーの覚えの読みを background の spawn の外へ出す
+    let v = inject(
+        &s.panel,
+        "        let task = cx.background_executor().spawn(async move {\n            let _s = tako_control::diag::perf_span(\"resources_bar_read\");\n            read_cached_snapshot()\n        });",
+        "        let snapshot_now = read_cached_snapshot();\n        let task = cx.background_executor().spawn(async move { snapshot_now });",
+        "⑫",
+    );
+    expect_named(
+        "覚えの読みを UI スレッドで",
+        scan_panel(&v, &s.main),
+        PANEL,
+        "spawn の外",
+    );
+    // ⑬ 見ている間の読みで走査の口を直に呼ぶ
+    let v = inject(
+        &s.panel,
+        "        let request = queue_request(\"status\", None, None, None);",
+        "        let _ = tako_control::queue::answer(&queue_request(\"status\", None, None, None));\n        let request = queue_request(\"status\", None, None, None);",
+        "⑬",
+    );
+    expect_named(
+        "resources ビューが走査の口を呼ぶ",
+        scan_panel(&v, &s.main),
+        PANEL,
+        "queue::answer(",
     );
 }

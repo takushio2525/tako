@@ -35,8 +35,9 @@ pub enum LayoutError {
     NotFound,
     #[error("レイアウトファイルを読めない: {0}")]
     Io(String),
-    #[error("レイアウトファイルを解釈できない（破損）: {0}")]
-    Parse(String),
+    /// 中身は種類と位置だけ（ファイルの値を引用しない = #1824 / #2230）。`Display` は日本語（persist.log）
+    #[error("レイアウトファイルを解釈できない（破損）: {}", .0.text_in(tako_core::i18n::Lang::Ja))]
+    Parse(tako_core::load_issue::JsonReason),
     #[error("フォーマットバージョン不一致（ファイル={0}, 対応={LAYOUT_VERSION}）")]
     Version(u32),
     #[error("タブが空")]
@@ -47,6 +48,56 @@ pub enum LayoutError {
     InvalidAxis,
     #[error("ワークスペースを再構成できない")]
     Workspace,
+}
+
+impl LayoutError {
+    /// 表示言語を明示しての文言（#2365。`tako recover` の一覧・復元の行が枠と同じ言語で載せる）。
+    ///
+    /// (バリアント, 言語) の網羅 match。日本語は `Display`（persist.log・`tako persist` の診断が
+    /// 使う #2365 より前の文）とバイト一致。中身（OS / serde のエラー文）は言語に依らずそのまま
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::NotFound, Ja) => {
+                "レイアウトファイルが無い（初回起動または明示クローズ・OFF 切替後）".into()
+            }
+            (Self::NotFound, En) => {
+                "no layout file (first launch, or after an explicit close / turning it OFF)".into()
+            }
+            (Self::Io(e), Ja) => format!("レイアウトファイルを読めない: {e}"),
+            (Self::Io(e), En) => format!("cannot read the layout file: {e}"),
+            (Self::Parse(e), Ja) => {
+                format!(
+                    "レイアウトファイルを解釈できない（破損）: {}",
+                    e.text_in(Ja)
+                )
+            }
+            (Self::Parse(e), En) => {
+                format!(
+                    "cannot interpret the layout file (corrupted): {}",
+                    e.text_in(En)
+                )
+            }
+            (Self::Version(v), Ja) => {
+                format!("フォーマットバージョン不一致（ファイル={v}, 対応={LAYOUT_VERSION}）")
+            }
+            (Self::Version(v), En) => {
+                format!("format version mismatch (file={v}, supported={LAYOUT_VERSION})")
+            }
+            (Self::Empty, Ja) => "タブが空".into(),
+            (Self::Empty, En) => "no tabs".into(),
+            (Self::DuplicateId, Ja) => {
+                "ペイン / タブ ID が重複している（破損・継ぎ接ぎされたファイル）".into()
+            }
+            (Self::DuplicateId, En) => {
+                "duplicate pane / tab IDs (a corrupted or stitched-together file)".into()
+            }
+            (Self::InvalidAxis, Ja) => "分割軸が不正".into(),
+            (Self::InvalidAxis, En) => "invalid split axis".into(),
+            (Self::Workspace, Ja) => "ワークスペースを再構成できない".into(),
+            (Self::Workspace, En) => "cannot rebuild the workspace".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1472,9 +1523,10 @@ pub fn load_file(path: &Path) -> Result<LayoutFile, LayoutError> {
         }
     })?;
     // 理由は種類と位置だけ（serde の素の文言は読んだ値 = タブ名やパスを含み、復元失敗の行は
-    // persist.log とテレメトリへ出る。#1824）
+    // persist.log とテレメトリへ出る。#1824）。型で持つのは `tako recover` の行が表示言語で組むため
+    // （#2365。persist.log の `Display` は #2365 より前の `json_reason` と同じ日本語）
     serde_json::from_str(&json)
-        .map_err(|e| LayoutError::Parse(tako_core::load_issue::json_reason(&e)))
+        .map_err(|e| LayoutError::Parse(tako_core::load_issue::JsonReason::located(&e)))
 }
 
 /// 書き出し（tmp + rename。settings と同方式）。
@@ -3212,7 +3264,7 @@ mod tests {
     /// 復元失敗の 1 行は退避先のファイル名だけを載せる（テレメトリへホームのパスを出さない）
     #[test]
     fn 復元失敗の行はファイル名だけを載せる() {
-        let e = LayoutError::Parse("EOF".into());
+        let e = LayoutError::Parse(tako_core::load_issue::JsonReason::Raw("EOF".into()));
         let stashed = Stashed {
             path: PathBuf::from("/private/tmp/x/layout.json.unreadable.2.bak"),
             evicted: false,

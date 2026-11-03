@@ -750,6 +750,23 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   実経路の `crates/tako-cli/tests/issue2365_cli_todo_sessions_lang.rs`（偽の GUI の応答で URL の有無・空・pending まで
   通す。A/B は同じ `TAKO_2365_HUMAN_BIN`）。`sessions link --json` の `remote_link.enable_command` のプレースホルダ
   （`<名前>`）は応答の値なので、まだ日本語のまま
+- 続けて **`tako sleep-guard`・`tako recover` 一式・`tako orchestrator watch` の説明文**も移した。sleep-guard は状態の行・
+  設定の変更の行・蓋閉じ防止の登録 / 解除の行と `set` の断り、recover は世代の一覧（「（無し）」・経過・「読めない:」・
+  復元の直後の全滅の行 = ラベルを 20 桁へ揃えるのは呼び手の `pad_cols`）・復元の案内・復元と合流の結果と断り。文は
+  `ReplyNote` の 52 種（`SleepGuard*` / `Lid*` / `Recover*` / `Watch*`）と `Reason` の 10 種（`SleepGuardUnknown*` /
+  `Recover*`）で、行に載る中身は各型が日英を持つ: `LayoutError::text_in`（`Parse` の中身は `JsonReason` = 種類と位置）・
+  `SkipReason` / `Untrusted::label_in`・`LidSkipReason::describe_in`・登録 / 解除の結果 `sleep_guard::LidControlDone`
+  （`*_done` の口が返す。macOS は osascript の出力を持ち、日本語の表示はそれをそのまま出す）。persist.log の行
+  （`MergeReport::log_line`・`LayoutError` の `Display`）・`status` の JSON の `description` / `lid_skip_reason.text`・
+  dispatch の応答の `result`（`LidControlDone::into_ja`）は #2365 より前の日本語のまま。**watch の `WORKER_*` と
+  `detail:` / `action:` / `respond:` / `resume:` / `note:` ほかのラベルは master が読む印なので両言語で同じ**で、現在の
+  選択の印 `← 現在の選択` も guide の monitoring が字面で引くので日本語のまま（正本 `orchestrator::wait::
+  CHOICE_HIGHLIGHT_MARK`。guide との一致は番犬が見る）。表示言語に従うのは切り詰めの印・`note:` の説明・`respond:` の
+  プレースホルダ・`WORKER_DEAD` の説明だけ。番犬は `issue1762_dispatch_error_lang.rs`（旧文の表に `ReplyNote` 69 行・
+  `Reason` 10 行・中身の型 25 行・`CLI_NOTE_SCOPES` に 8 つの関数・`CLI_REFUSAL_DEFERRED` から sleep-guard / recover の
+  3 つを外した）と、実経路の `crates/tako-cli/tests/issue2365_cli_sleep_recover_watch_lang.rs`（unix。偽の GUI で
+  sleep-guard の状態と watch のダイアログ / 突然死、偽の osascript で登録 / 解除、一時の data dir の世代で recover を
+  日英で叩く。A/B は同じ `TAKO_2365_HUMAN_BIN`）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
@@ -3041,12 +3058,19 @@ background を一往復した後の着地で決まる。**呼んだのと同じ 
   を `fail` の外で出して exit しない。後片付けの要らない出口（窓を開く前に終わる等）だけ、その行か
   直前 6 行に `// tako:exit-cleanup-ok <理由>` を書く（番犬 `selftest_exit_cleanup_watchdog`）
 - `fail()` は FAILED の行の**後**に上限 5 秒で片付けるので、片付けが固まっても落ちた理由と終了コード 1 は
-  変わらない。片付けた物は `TAKO_APP_SELF_TEST_EXIT_CLEANUP: backend=… agent_home=… left=…` の行で読む。
+  変わらない。片付けた物は `TAKO_APP_SELF_TEST_EXIT_CLEANUP: backend=… agent_home=… ipc_socket=… scoped=… left=…` の行で読む。
   A/B は `TAKO_2388_LEGACY=1`、実経路は `bash scripts/test-selftest-failed-cleanup-2388.sh`
 - visual-test の出口（成功の `TAKO_VISUAL_TEST_OK` と知らない節の名前の `exit(1)`）も `exit` で終わるので、
   `self_test::visual_exit` を通す（#2491・FR-4.8.27）。節の腕で成功の行を出して直に exit しない
   （`run_visual` の中の直の exit と `visual_exit` の外の成功の行は番犬が名指しする）。成功の行は片付けの
   **後**に出る。A/B は `TAKO_2491_LEGACY=1`、実経路は `bash scripts/test-visual-exit-cleanup-2491.sh`
+- 検証起動の GUI が env へ自分で決めた置き場（`tako-iso-…-<pid>` / `tako-st-…-<pid>`）は `set_var` で直に当てず
+  `tako_core::scoped_dirs::adopt` で当てる（無いときだけ当てて覚える = 片付けが覚えた物だけを付属ファイルごと消す。#2686・
+  FR-4.8.28）。**明示 = 残す・暗黙 = 片付ける**: 利用者が渡した置き場は当ても覚えもしない・`cleanup_process_scoped` の中で
+  data dir やペインログの置き場を直に消さない。消した後の書き込みで置き場を生き返らせないよう、親 dir を作る書き手は
+  `scoped_dirs::is_retired` を見て捨てる（いまは診断ログの `append_log` とセッションカタログの `flush_last_seen`）。
+  本番の GUI では覚えも消しもしない（門は `paths::is_verification_process()`）。A/B は `TAKO_2686_LEGACY=1`、番犬は
+  `issue2686_scoped_dirs_watchdog`、実経路は `bash scripts/test-isolated-scoped-dirs-2686.sh`
 
 ## TUI の画面マーカーは「幅で切られる」前提で選ぶ（Issue #1015）
 

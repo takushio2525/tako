@@ -32,7 +32,10 @@
 //! `tako todo show` ほか 1 件の詳細の枠もここが持つ。字下げ・桁揃えの空白は CLI が付け、`--json` の
 //! 出力と応答の値は変えない。続けて `tako todo list` / `expand` / `collapse`・`tako sessions list` /
 //! `link` の枠（空のときの文・期限 / 返答のラベル・件数・表示の有無・resume の案内・公式リンクの行）も
-//! 同じ形で持つ
+//! 同じ形で持つ。`tako sleep-guard`（状態の行・設定の変更・蓋閉じ防止の登録 / 解除）・`tako recover`
+//! （世代の一覧・復元の案内・復元と合流の結果）・`tako orchestrator watch` の説明文も同じ。watch の
+//! `WORKER_*` と `detail:` / `action:` ほかのラベルと、guide の monitoring が字面で引く現在の選択の印
+//! （`orchestrator::wait::CHOICE_HIGHLIGHT_MARK`）は master が読む印なので両言語で同じ
 
 use tako_core::handoff::{HANDOFF_PROJECTS_DIR, PROFILE_MEMO_SOFT_LIMIT_LINES};
 use tako_core::i18n::Lang;
@@ -462,6 +465,141 @@ pub enum ReplyNote {
     SessionLinkNone(String),
     /// `tako sessions link`: 公式リンクの入れ方（コマンドはプレースホルダだけ表示言語）
     SessionLinkEnableHint,
+
+    // ---- CLI の人向けの表示: sleep-guard（状態の行・設定の変更・蓋閉じ防止の登録 / 解除）----
+    /// `tako sleep-guard status`: 状態の取得元（`from_app` = 動いている tako アプリから IPC で取った）
+    SleepGuardSource { from_app: bool },
+    /// `tako sleep-guard status`: アイドルスリープ防止のアサーションを持っているか
+    SleepGuardIdleSleep(bool),
+    /// `tako sleep-guard status`: モード（値は設定の表記のまま）
+    SleepGuardMode(String),
+    /// `tako sleep-guard status`: 電源条件（同上）
+    SleepGuardPower(String),
+    /// `tako sleep-guard status`: AC 電源につながっているか
+    SleepGuardAcPower(bool),
+    /// `tako sleep-guard status`: 蓋が閉じているか
+    SleepGuardLid(bool),
+    /// `tako sleep-guard status`: 蓋の開閉をこの OS では検知できない
+    SleepGuardLidUnknown,
+    /// `tako sleep-guard status`: 蓋閉じ防止のモードと sudoers の登録（macOS）
+    SleepGuardLidModeSudoers { mode: String, installed: bool },
+    /// `tako sleep-guard status`: 蓋閉じ防止のモード（sudoers の要らない OS）
+    SleepGuardLidMode(String),
+    /// `tako sleep-guard status`: 蓋閉じ防止にこの OS は対応していない
+    SleepGuardLidUnsupported,
+    /// `tako sleep-guard status`: 蓋閉じ継続を今あてているか
+    SleepGuardLidApplied(bool),
+    /// `tako sleep-guard status`: 蓋閉じ継続の電源条件（値は設定の表記のまま）
+    SleepGuardLidPower(String),
+    /// `tako sleep-guard status`: バッテリー残量と下限（%）
+    SleepGuardBattery { percent: u8, floor: u8 },
+    /// `tako sleep-guard status`: バッテリー残量をこの機械では取れない
+    SleepGuardBatteryUnknown,
+    /// `tako sleep-guard status`: 蓋閉じ継続が効かない理由（中身は同じ言語の `LidSkipReason`）
+    SleepGuardLidSkip(String),
+    /// `tako sleep-guard status`: 蓋閉じ中にディスプレイを消した
+    SleepGuardDisplayOff,
+    /// `tako sleep-guard set`: 変えた後の設定（値は設定の表記のまま）
+    SleepGuardSettingsChanged {
+        mode: String,
+        power: String,
+        lid_sleep: String,
+        lid_power: String,
+        floor: u8,
+    },
+    /// `tako sleep-guard install-lid-sleep`: sudoers 登録の前置き（macOS）
+    LidSudoersSetupStart,
+    /// `tako sleep-guard install-lid-sleep`: 登録する中身
+    LidSudoersSetupContent,
+    /// `tako sleep-guard install-lid-sleep`: 管理者パスワードの入力ダイアログが出る
+    LidSudoersPasswordPrompt,
+    /// `tako sleep-guard install-lid-sleep`: 有効にする前置き（登録が済んでいる・要らない OS）
+    LidEnableStart,
+    /// `tako sleep-guard install-lid-sleep` / `remove-lid-sleep`: lid-sleep-mode を設定した（値は表記のまま）
+    LidSleepModeSet(String),
+    /// `tako sleep-guard install-lid-sleep`: 解除のコマンド
+    LidRemoveHint,
+
+    // ---- CLI の人向けの表示: recover（世代の一覧・復元の案内・復元と合流の結果）----
+    /// `tako recover`: 世代のファイルが無い
+    RecoverMissing,
+    /// `tako recover`: 更新からの経過（秒。分・時間・日へ丸める）
+    RecoverAge(u64),
+    /// `tako recover`: 更新時刻を取れない
+    RecoverAgeUnknown,
+    /// `tako recover`: 世代の中身（`age` は同じ言語の経過）
+    RecoverLayoutSummary {
+        tabs: usize,
+        panes: usize,
+        age: String,
+    },
+    /// `tako recover`: 世代を読めない（`error` は同じ言語の `LayoutError`、`age` は同じ言語の経過）
+    RecoverLayoutUnreadable { error: String, age: String },
+    /// `tako recover`: 復元の直後の全滅の記録のラベル（桁揃えの空白は呼び手）
+    RecoverWipeoutLabel,
+    /// `tako recover`: 復元の直後の全滅の回数（`skip_after` 回続くと次の起動は復元を見送る）
+    RecoverWipeouts { count: u32, skip_after: u32 },
+    /// `tako recover`: 復元の手順（`quit_key` は終了の打鍵の表記）
+    RecoverHowTo { quit_key: String },
+    /// `tako recover`: 再起動すると復元したレイアウトで立ち上がる
+    RecoverRestartNote,
+    /// `tako recover`: tmux セッションが生きていれば実行中のプロセスごと戻る
+    RecoverTmuxNote,
+    /// `tako recover`: good の世代の説明
+    RecoverGoodNote,
+    /// `tako recover`: rescued の世代の説明
+    RecoverRescuedNote,
+    /// `tako recover --apply`: 現在の layout.json を読めないので合流しない（`error` は同じ言語の `LayoutError`）
+    RecoverCurrentUnreadable(String),
+    /// `tako recover --apply`: 現在の layout.json を退避した先
+    RecoverStashed(String),
+    /// `tako recover --apply`: 復元した世代（`name` はファイル名）
+    RecoverRestored {
+        name: String,
+        tabs: usize,
+        panes: usize,
+    },
+    /// `tako recover --apply`: 起動するとこのレイアウトで復元される
+    RecoverLaunchNote,
+    /// `tako recover --apply`: バックアップより後のタブを合流した枚数（見出し）
+    RecoverMergedHeader(usize),
+    /// `tako recover --apply`: 合流したタブ 1 枚（タブ名は出力にだけ出す。字下げは呼び手）
+    RecoverMergedTab {
+        id: u64,
+        title: String,
+        panes: usize,
+        alive: usize,
+        dead: usize,
+        duplicates: usize,
+    },
+    /// `tako recover --apply`: 合流しなかったタブの枚数（見出し）
+    RecoverSkippedHeader(usize),
+    /// `tako recover --apply`: 合流しなかったタブ 1 枚（字下げは呼び手）
+    RecoverSkippedTab {
+        id: u64,
+        title: String,
+        reason: crate::layout_reconcile::SkipReason,
+    },
+    /// `tako recover --apply`: tmux セッションの生死を確かめずに合流した理由
+    RecoverUntrustedMerged(crate::layout_reconcile::Untrusted),
+    /// `tako recover --apply`: 合流した後のタブ数・ペイン数
+    RecoverMergedTotal { tabs: usize, panes: usize },
+
+    // ---- CLI の人向けの表示: orchestrator watch の説明文（`WORKER_*` と `detail:` ほかのラベルは変えない）----
+    /// `tako orchestrator watch`: 画面で切り詰められた選択肢のラベルの印（前の空白は呼び手）
+    WatchLabelTruncated,
+    /// `tako orchestrator watch`: 番号キーの効かないダイアログ（`note: ` の後ろ）
+    WatchNoteUnnumbered,
+    /// `tako orchestrator watch`: 選択カーソルが画面外（同上）
+    WatchNoteCursorOffscreen,
+    /// `tako orchestrator watch`: ラベルが切り詰められている（同上）
+    WatchNoteLabelsTruncated,
+    /// `tako orchestrator watch`: `respond:` のコマンドの選択肢のプレースホルダ
+    WatchChoicePlaceholder,
+    /// `tako orchestrator watch`: エージェント CLI のプロセスが終わっている（`WORKER_DEAD` の `detail: ` の後ろ）
+    WatchAgentDeadDetail,
+    /// `tako orchestrator watch`: session ID が無く resume のコマンドを組めない（`resume: ` の後ろ）
+    WatchResumeUnbuildable,
 }
 
 impl ReplyNote {
@@ -1718,6 +1856,346 @@ impl ReplyNote {
             (Self::SessionLinkEnableHint, En) => {
                 "to turn it on: tako orchestrator profiles set <name> --remote-control true → restart"
                     .into()
+            }
+            (Self::SleepGuardSource { from_app }, Ja) => if *from_app {
+                "取得元: tako アプリ（IPC）"
+            } else {
+                "取得元: この CLI プロセス（tako アプリは未起動）"
+            }
+            .into(),
+            (Self::SleepGuardSource { from_app }, En) => if *from_app {
+                "source: the tako app (IPC)"
+            } else {
+                "source: this CLI process (the tako app is not running)"
+            }
+            .into(),
+            (Self::SleepGuardIdleSleep(held), Ja) => if *held {
+                "idle-sleep: アサーション保持中"
+            } else {
+                "idle-sleep: アサーション未保持"
+            }
+            .into(),
+            (Self::SleepGuardIdleSleep(held), En) => if *held {
+                "idle-sleep: assertion held"
+            } else {
+                "idle-sleep: assertion not held"
+            }
+            .into(),
+            (Self::SleepGuardMode(mode), Ja) => format!("モード: {mode}"),
+            (Self::SleepGuardMode(mode), En) => format!("mode: {mode}"),
+            (Self::SleepGuardPower(power), Ja) => format!("電源条件: {power}"),
+            (Self::SleepGuardPower(power), En) => format!("power condition: {power}"),
+            (Self::SleepGuardAcPower(on), Ja) => {
+                format!("AC 電源: {}", if *on { "接続中" } else { "未接続" })
+            }
+            (Self::SleepGuardAcPower(on), En) => {
+                format!("AC power: {}", if *on { "connected" } else { "not connected" })
+            }
+            (Self::SleepGuardLid(closed), Ja) => format!("蓋: {}", if *closed { "閉" } else { "開" }),
+            (Self::SleepGuardLid(closed), En) => {
+                format!("lid: {}", if *closed { "closed" } else { "open" })
+            }
+            (Self::SleepGuardLidUnknown, Ja) => "蓋: 不明（この OS では開閉を検知できません）".into(),
+            (Self::SleepGuardLidUnknown, En) => {
+                "lid: unknown (this OS cannot detect it opening or closing)".into()
+            }
+            (Self::SleepGuardLidModeSudoers { mode, installed }, Ja) => format!(
+                "蓋閉じ防止: {mode} (sudoers: {})",
+                if *installed { "登録済み" } else { "未登録" }
+            ),
+            (Self::SleepGuardLidModeSudoers { mode, installed }, En) => format!(
+                "lid-close prevention: {mode} (sudoers: {})",
+                if *installed {
+                    "registered"
+                } else {
+                    "not registered"
+                }
+            ),
+            (Self::SleepGuardLidMode(mode), Ja) => format!("蓋閉じ防止: {mode}"),
+            (Self::SleepGuardLidMode(mode), En) => format!("lid-close prevention: {mode}"),
+            (Self::SleepGuardLidUnsupported, Ja) => "蓋閉じ防止: この OS では対応していません".into(),
+            (Self::SleepGuardLidUnsupported, En) => {
+                "lid-close prevention: not supported on this OS".into()
+            }
+            (Self::SleepGuardLidApplied(on), Ja) => {
+                format!("蓋閉じ継続の適用: {}", if *on { "有効" } else { "無効" })
+            }
+            (Self::SleepGuardLidApplied(on), En) => format!(
+                "staying awake with the lid closed: {}",
+                if *on { "applied" } else { "not applied" }
+            ),
+            (Self::SleepGuardLidPower(power), Ja) => format!("蓋閉じ継続の電源条件: {power}"),
+            (Self::SleepGuardLidPower(power), En) => format!("lid-closed power condition: {power}"),
+            (Self::SleepGuardBattery { percent, floor }, Ja) => {
+                format!("バッテリー残量: {percent}%（下限 {floor}%）")
+            }
+            (Self::SleepGuardBattery { percent, floor }, En) => {
+                format!("battery: {percent}% (floor {floor}%)")
+            }
+            (Self::SleepGuardBatteryUnknown, Ja) => {
+                "バッテリー残量: 不明（この機械では取得できません）".into()
+            }
+            (Self::SleepGuardBatteryUnknown, En) => {
+                "battery: unknown (not available on this machine)".into()
+            }
+            (Self::SleepGuardLidSkip(reason), Ja) => format!("蓋閉じ継続が効かない理由: {reason}"),
+            (Self::SleepGuardLidSkip(reason), En) => {
+                format!("why staying awake with the lid closed is not applied: {reason}")
+            }
+            (Self::SleepGuardDisplayOff, Ja) => "ディスプレイ: 消灯済み（蓋閉じ中）".into(),
+            (Self::SleepGuardDisplayOff, En) => "display: turned off (lid closed)".into(),
+            (
+                Self::SleepGuardSettingsChanged {
+                    mode,
+                    power,
+                    lid_sleep,
+                    lid_power,
+                    floor,
+                },
+                Ja,
+            ) => format!(
+                "設定を変更しました: mode={mode}, power={power}, lid-sleep={lid_sleep}, \
+                 lid-power={lid_power}, lid-battery-floor={floor}%"
+            ),
+            (
+                Self::SleepGuardSettingsChanged {
+                    mode,
+                    power,
+                    lid_sleep,
+                    lid_power,
+                    floor,
+                },
+                En,
+            ) => format!(
+                "settings changed: mode={mode}, power={power}, lid-sleep={lid_sleep}, \
+                 lid-power={lid_power}, lid-battery-floor={floor}%"
+            ),
+            (Self::LidSudoersSetupStart, Ja) => "蓋閉じ防止の sudoers 登録を行います...".into(),
+            (Self::LidSudoersSetupStart, En) => {
+                "Registering lid-close prevention in sudoers...".into()
+            }
+            (Self::LidSudoersSetupContent, Ja) => {
+                "登録内容: pmset -a disablesleep 0/1 のみ NOPASSWD".into()
+            }
+            (Self::LidSudoersSetupContent, En) => {
+                "entry: NOPASSWD for pmset -a disablesleep 0/1 only".into()
+            }
+            (Self::LidSudoersPasswordPrompt, Ja) => {
+                "管理者パスワードの入力ダイアログが表示されます。".into()
+            }
+            (Self::LidSudoersPasswordPrompt, En) => {
+                "An administrator password dialog will appear.".into()
+            }
+            (Self::LidEnableStart, Ja) => "蓋閉じ防止を有効にします...".into(),
+            (Self::LidEnableStart, En) => "Turning on lid-close prevention...".into(),
+            (Self::LidSleepModeSet(mode), Ja) => format!("lid-sleep-mode を {mode} に設定しました。"),
+            (Self::LidSleepModeSet(mode), En) => format!("set lid-sleep-mode to {mode}."),
+            (Self::LidRemoveHint, Ja) => "解除: tako sleep-guard remove-lid-sleep".into(),
+            (Self::LidRemoveHint, En) => {
+                "to turn it off: tako sleep-guard remove-lid-sleep".into()
+            }
+            (Self::RecoverMissing, Ja) => "（無し）".into(),
+            (Self::RecoverMissing, En) => "(none)".into(),
+            (Self::RecoverAge(secs), Ja) => match *secs {
+                s if s < 60 => format!("{s} 秒前"),
+                s if s < 3600 => format!("{} 分前", s / 60),
+                s if s < 86400 => format!("{} 時間前", s / 3600),
+                s => format!("{} 日前", s / 86400),
+            },
+            (Self::RecoverAge(secs), En) => match *secs {
+                s if s < 60 => format!("{s} s ago"),
+                s if s < 3600 => format!("{} min ago", s / 60),
+                s if s < 86400 => format!("{} h ago", s / 3600),
+                s => format!("{} d ago", s / 86400),
+            },
+            (Self::RecoverAgeUnknown, Ja) => "更新時刻不明".into(),
+            (Self::RecoverAgeUnknown, En) => "update time unknown".into(),
+            (Self::RecoverLayoutSummary { tabs, panes, age }, Ja) => {
+                format!("{tabs} タブ / {panes} ペイン（{age} 更新）")
+            }
+            (Self::RecoverLayoutSummary { tabs, panes, age }, En) => {
+                format!("{tabs} tab(s) / {panes} pane(s) (updated {age})")
+            }
+            (Self::RecoverLayoutUnreadable { error, age }, Ja) => {
+                format!("読めない: {error}（{age} 更新）")
+            }
+            (Self::RecoverLayoutUnreadable { error, age }, En) => {
+                format!("unreadable: {error} (updated {age})")
+            }
+            (Self::RecoverWipeoutLabel, Ja) => "復元の直後の全滅".into(),
+            (Self::RecoverWipeoutLabel, En) => "post-restore wipeout".into(),
+            (Self::RecoverWipeouts { count, skip_after }, Ja) => {
+                format!("連続 {count} 回（{skip_after} 回続くと次の起動は復元を見送る）")
+            }
+            (Self::RecoverWipeouts { count, skip_after }, En) => format!(
+                "{count} in a row (after {skip_after} in a row the next launch skips restoring)"
+            ),
+            (Self::RecoverHowTo { quit_key }, Ja) => format!(
+                "復元するには: tako を終了（{quit_key}）してから `tako recover --apply <世代>` →"
+            ),
+            (Self::RecoverHowTo { quit_key }, En) => format!(
+                "To restore: quit tako ({quit_key}), run `tako recover --apply <generation>` →"
+            ),
+            (Self::RecoverRestartNote, Ja) => {
+                "tako を再起動すると復元されたレイアウトで立ち上がります。".into()
+            }
+            (Self::RecoverRestartNote, En) => {
+                "then restart tako and it comes up with the restored layout.".into()
+            }
+            (Self::RecoverTmuxNote, Ja) => {
+                "実体の tmux セッションが生きていれば、実行中プロセスごと画面に戻ります。".into()
+            }
+            (Self::RecoverTmuxNote, En) => {
+                "If the underlying tmux sessions are alive, they come back with their running \
+                 processes."
+                    .into()
+            }
+            (Self::RecoverGoodNote, Ja) => {
+                "（good = 最後に復元へ成功した良品。`tako recover --apply good` で戻せます）".into()
+            }
+            (Self::RecoverGoodNote, En) => {
+                "(good = the last layout that restored successfully. `tako recover --apply good` \
+                 brings it back)"
+                    .into()
+            }
+            (Self::RecoverRescuedNote, Ja) => {
+                "（rescued = 復元の直後に全ペインが終わったので退避した構成。\
+                 `tako recover --apply rescued` で戻せます）"
+                    .into()
+            }
+            (Self::RecoverRescuedNote, En) => {
+                "(rescued = the layout set aside because every pane ended right after a restore. \
+                 `tako recover --apply rescued` brings it back)"
+                    .into()
+            }
+            (Self::RecoverCurrentUnreadable(error), Ja) => format!(
+                "現在の layout.json を読めないので、バックアップより後のタブは合流しない: {error}"
+            ),
+            (Self::RecoverCurrentUnreadable(error), En) => format!(
+                "cannot read the current layout.json, so tabs created after the backup are not \
+                 merged: {error}"
+            ),
+            (Self::RecoverStashed(path), Ja) => format!("現在の layout.json → {path} へ退避"),
+            (Self::RecoverStashed(path), En) => {
+                format!("set aside the current layout.json → {path}")
+            }
+            (Self::RecoverRestored { name, tabs, panes }, Ja) => {
+                format!("{name}（{tabs} タブ / {panes} ペイン）→ layout.json へ復元しました。")
+            }
+            (Self::RecoverRestored { name, tabs, panes }, En) => {
+                format!("restored {name} ({tabs} tab(s) / {panes} pane(s)) → layout.json.")
+            }
+            (Self::RecoverLaunchNote, Ja) => "tako を起動すると、このレイアウトで復元されます。".into(),
+            (Self::RecoverLaunchNote, En) => "Launch tako and it comes up with this layout.".into(),
+            (Self::RecoverMergedHeader(n), Ja) => {
+                format!("バックアップより後に作られたタブを {n} 枚合流しました:")
+            }
+            (Self::RecoverMergedHeader(n), En) => {
+                format!("merged {n} tab(s) created after the backup:")
+            }
+            (
+                Self::RecoverMergedTab {
+                    id,
+                    title,
+                    panes,
+                    alive,
+                    dead,
+                    duplicates,
+                },
+                Ja,
+            ) => {
+                let mut notes = vec![format!("tmux セッションあり {alive}")];
+                if *dead > 0 {
+                    notes.push(format!(
+                        "終わっている {dead}（master / worker のペインは起動時に外し、ほかは開き直す）"
+                    ));
+                }
+                if *duplicates > 0 {
+                    notes.push(format!("バックアップ側にあるペイン {duplicates} を除いた"));
+                }
+                format!("タブ {id}「{title}」: {panes} ペイン（{}）", notes.join("・"))
+            }
+            (
+                Self::RecoverMergedTab {
+                    id,
+                    title,
+                    panes,
+                    alive,
+                    dead,
+                    duplicates,
+                },
+                En,
+            ) => {
+                let mut notes = vec![format!("tmux sessions alive {alive}")];
+                if *dead > 0 {
+                    notes.push(format!(
+                        "ended {dead} (master / worker panes are dropped at launch, the others \
+                         reopen)"
+                    ));
+                }
+                if *duplicates > 0 {
+                    notes.push(format!("left out {duplicates} pane(s) already in the backup"));
+                }
+                format!("tab {id} \"{title}\": {panes} pane(s) ({})", notes.join("; "))
+            }
+            (Self::RecoverSkippedHeader(n), Ja) => format!("合流しなかったタブ {n} 枚:"),
+            (Self::RecoverSkippedHeader(n), En) => format!("{n} tab(s) not merged:"),
+            (Self::RecoverSkippedTab { id, title, reason }, Ja) => {
+                format!("タブ {id}「{title}」: {}", reason.label_in(Ja))
+            }
+            (Self::RecoverSkippedTab { id, title, reason }, En) => {
+                format!("tab {id} \"{title}\": {}", reason.label_in(En))
+            }
+            (Self::RecoverUntrustedMerged(untrusted), Ja) => format!(
+                "（{}ので、tmux セッションの生死は確かめずに合流しました）",
+                untrusted.label_in(Ja)
+            ),
+            (Self::RecoverUntrustedMerged(untrusted), En) => format!(
+                "(merged without checking whether the tmux sessions are alive: {})",
+                untrusted.label_in(En)
+            ),
+            (Self::RecoverMergedTotal { tabs, panes }, Ja) => {
+                format!("合流後: {tabs} タブ / {panes} ペイン")
+            }
+            (Self::RecoverMergedTotal { tabs, panes }, En) => {
+                format!("after merging: {tabs} tab(s) / {panes} pane(s)")
+            }
+            (Self::WatchLabelTruncated, Ja) => "[切り詰め]".into(),
+            (Self::WatchLabelTruncated, En) => "[truncated]".into(),
+            (Self::WatchNoteUnnumbered, Ja) => {
+                "番号キーは無反応なダイアログ（tako が矢印移動で応答する）".into()
+            }
+            (Self::WatchNoteUnnumbered, En) => {
+                "a dialog that ignores number keys (tako answers by moving with the arrow keys)"
+                    .into()
+            }
+            (Self::WatchNoteCursorOffscreen, Ja) => {
+                "ダイアログがペインより高く選択カーソルが画面外（番号で応答する）".into()
+            }
+            (Self::WatchNoteCursorOffscreen, En) => {
+                "the dialog is taller than the pane and the selection cursor is off screen \
+                 (answer by number)"
+                    .into()
+            }
+            (Self::WatchNoteLabelsTruncated, Ja) => {
+                "ラベルが切り詰められている（respond はラベルではなく番号で）".into()
+            }
+            (Self::WatchNoteLabelsTruncated, En) => {
+                "labels are truncated (respond by number, not by label)".into()
+            }
+            (Self::WatchChoicePlaceholder, Ja) => "<番号|ラベル>".into(),
+            (Self::WatchChoicePlaceholder, En) => "<number|label>".into(),
+            (Self::WatchAgentDeadDetail, Ja) => {
+                "エージェント CLI プロセスが終了している（SIGSEGV 等の突然死の疑い）".into()
+            }
+            (Self::WatchAgentDeadDetail, En) => {
+                "the agent CLI process has exited (suspected sudden death such as SIGSEGV)".into()
+            }
+            (Self::WatchResumeUnbuildable, Ja) => {
+                "(session ID 未記録のため resume コマンドを組み立てられない)".into()
+            }
+            (Self::WatchResumeUnbuildable, En) => {
+                "(no session ID recorded, so the resume command cannot be built)".into()
             }
         }
     }

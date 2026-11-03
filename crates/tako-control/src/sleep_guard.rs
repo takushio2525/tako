@@ -280,27 +280,53 @@ impl LidSkipReason {
         )
     }
 
-    /// 人が読む理由（`status` の description と CLI が使う。UI の日英は
+    /// 人が読む理由（`status` の description・応答の `text` が使う日本語。UI の日英は
     /// `tako-app::ui_text::sleep_guard` が同じ分類から作る）
     pub fn describe(self) -> String {
-        match self {
-            Self::ModeOff => "未設定".to_string(),
-            Self::SetupRequired => {
+        self.describe_in(tako_core::i18n::Lang::Ja)
+    }
+
+    /// [`Self::describe`] を表示言語を明示して引く（#2365。`tako sleep-guard status` の行）。
+    /// (変種, 言語) の網羅 match
+    pub fn describe_in(self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::ModeOff, Ja) => "未設定".to_string(),
+            (Self::ModeOff, En) => "not set".to_string(),
+            (Self::SetupRequired, Ja) => {
                 "sudoers 未登録（tako setup --lid-sleep で登録）".to_string()
             }
-            Self::NoAgents => "エージェント待機中のため無効".to_string(),
-            Self::NoAcPower => {
+            (Self::SetupRequired, En) => {
+                "sudoers is not registered (register with tako setup --lid-sleep)".to_string()
+            }
+            (Self::NoAgents, Ja) => "エージェント待機中のため無効".to_string(),
+            (Self::NoAgents, En) => "off because the agents are idle".to_string(),
+            (Self::NoAcPower, Ja) => {
                 "AC 未接続のため無効（tako sleep-guard set --lid-power-condition always でバッテリーでも継続）"
                     .to_string()
             }
-            Self::BatteryFloor { percent, floor } => {
+            (Self::NoAcPower, En) => {
+                "off because AC power is not connected (tako sleep-guard set \
+                 --lid-power-condition always keeps it on battery too)"
+                    .to_string()
+            }
+            (Self::BatteryFloor { percent, floor }, Ja) => {
                 format!("バッテリー残量 {percent}% が下限 {floor}% 以下のため解除")
             }
-            Self::BatteryUnknown => {
+            (Self::BatteryFloor { percent, floor }, En) => {
+                format!("released because the battery at {percent}% is at or below the {floor}% floor")
+            }
+            (Self::BatteryUnknown, Ja) => {
                 "バッテリー残量を取得できないため解除（安全弁）".to_string()
             }
-            Self::Thermal(state) => {
+            (Self::BatteryUnknown, En) => {
+                "released because the battery level is unavailable (safety valve)".to_string()
+            }
+            (Self::Thermal(state), Ja) => {
                 format!("本体が高温（{}）のため解除", state.as_str())
+            }
+            (Self::Thermal(state), En) => {
+                format!("released because the machine is hot ({})", state.as_str())
             }
         }
     }
@@ -979,17 +1005,23 @@ pub fn prepare_lid_control() -> Result<String, String> {
 }
 
 /// [`prepare_lid_control`] の型の口（#2365）。`Ok` の文（手段の説明）は日本語のまま
+/// （dispatch の応答の `result`。表示言語の行は [`prepare_lid_control_done`]）
 pub fn prepare_lid_control_typed() -> Result<String, OsRefusal> {
+    prepare_lid_control_done().map(LidControlDone::into_ja)
+}
+
+/// [`prepare_lid_control`] の結果を型で返す口（#2365。`tako sleep-guard install-lid-sleep` の行）
+pub fn prepare_lid_control_done() -> Result<LidControlDone, OsRefusal> {
     if !lid_control_supported() {
         return Err(OsRefusal::LidUnsupported);
     }
     #[cfg(target_os = "macos")]
     {
-        install_sudoers_typed()
+        install_sudoers_typed().map(LidControlDone::SudoersInstalled)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Ok("この OS では追加の権限も登録も不要です（電源プランの設定で実現します）".to_string())
+        Ok(LidControlDone::NoSetupNeeded)
     }
 }
 
@@ -1000,11 +1032,17 @@ pub fn teardown_lid_control() -> Result<String, String> {
 }
 
 /// [`teardown_lid_control`] の型の口（#2365。枠と中身 = `platform::lid` の断りを同じ言語で組む）。
-/// `Ok` の文（解除の結果の説明）は日本語のまま
+/// `Ok` の文（解除の結果の説明）は日本語のまま（dispatch の応答の `result`。表示言語の行は
+/// [`teardown_lid_control_done`]）
 pub fn teardown_lid_control_typed() -> Result<String, OsRefusal> {
+    teardown_lid_control_done().map(LidControlDone::into_ja)
+}
+
+/// [`teardown_lid_control`] の結果を型で返す口（#2365。`tako sleep-guard remove-lid-sleep` の行）
+pub fn teardown_lid_control_done() -> Result<LidControlDone, OsRefusal> {
     #[cfg(target_os = "macos")]
     {
-        remove_sudoers_typed()
+        remove_sudoers_done()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1012,12 +1050,77 @@ pub fn teardown_lid_control_typed() -> Result<String, OsRefusal> {
         crate::platform::lid::set_stay_awake_typed(false, false)
             .map(|changed| {
                 if changed {
-                    "蓋閉じ継続を解除し、電源プランの設定を元へ戻しました".to_string()
+                    LidControlDone::PowerPlanRestored
                 } else {
-                    "蓋閉じ継続は有効化されていません（解除不要）".to_string()
+                    LidControlDone::NotEnabled
                 }
             })
             .map_err(OsRefusal::LidTeardownFailed)
+    }
+}
+
+/// 蓋閉じ継続の用意・後始末の結果（#2365）。
+///
+/// CLI の行は表示言語（[`Self::text_in`]）、dispatch の応答の `result` は #2365 より前と同じ日本語
+/// （[`Self::into_ja`]。応答の値は変えない）。macOS の登録・削除は osascript の出力をそのまま持ち、
+/// 日本語の表示はそれを出す（#2365 より前と同じ）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LidControlDone {
+    /// macOS: sudoers へ登録した（中身は osascript の出力）
+    SudoersInstalled(String),
+    /// macOS: sudoers から外し `disablesleep` を戻した（中身は osascript の出力）
+    SudoersRemoved(String),
+    /// macOS: sudoers が未登録だった（外すものが無い）
+    SudoersAbsent,
+    /// macOS 以外: 追加の権限も登録も要らない
+    NoSetupNeeded,
+    /// macOS 以外: 解除して電源プランを元へ戻した
+    PowerPlanRestored,
+    /// macOS 以外: 有効化されていなかった（解除不要）
+    NotEnabled,
+}
+
+impl LidControlDone {
+    /// 表示言語を明示しての文言。(変種, 言語) の網羅 match
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::SudoersInstalled(out), Ja) => out.clone(),
+            (Self::SudoersInstalled(_), En) => {
+                "registered in sudoers (NOPASSWD for pmset -a disablesleep 0/1 only)".to_string()
+            }
+            (Self::SudoersRemoved(out), Ja) => out.clone(),
+            (Self::SudoersRemoved(_), En) => {
+                "removed from sudoers and turned disablesleep back off".to_string()
+            }
+            (Self::SudoersAbsent, Ja) => "sudoers は未登録です（削除不要）".to_string(),
+            (Self::SudoersAbsent, En) => {
+                "sudoers is not registered (nothing to remove)".to_string()
+            }
+            (Self::NoSetupNeeded, Ja) => {
+                "この OS では追加の権限も登録も不要です（電源プランの設定で実現します）".to_string()
+            }
+            (Self::NoSetupNeeded, En) => {
+                "this OS needs no extra permission or registration (the power plan settings do it)"
+                    .to_string()
+            }
+            (Self::PowerPlanRestored, Ja) => {
+                "蓋閉じ継続を解除し、電源プランの設定を元へ戻しました".to_string()
+            }
+            (Self::PowerPlanRestored, En) => {
+                "stopped staying awake with the lid closed and restored the power plan settings"
+                    .to_string()
+            }
+            (Self::NotEnabled, Ja) => "蓋閉じ継続は有効化されていません（解除不要）".to_string(),
+            (Self::NotEnabled, En) => {
+                "staying awake with the lid closed is not turned on (nothing to undo)".to_string()
+            }
+        }
+    }
+
+    /// 応答の `result` の文（#2365 より前と同じ日本語）
+    pub fn into_ja(self) -> String {
+        self.text_in(tako_core::i18n::Lang::Ja)
     }
 }
 
@@ -1081,8 +1184,13 @@ pub fn remove_sudoers() -> Result<String, String> {
 
 /// [`remove_sudoers`] の型の口（#2365）。`Ok` の文は日本語のまま
 pub fn remove_sudoers_typed() -> Result<String, OsRefusal> {
+    remove_sudoers_done().map(LidControlDone::into_ja)
+}
+
+/// [`remove_sudoers`] の結果を型で返す口（#2365。`Ok` の中身は osascript の出力か未登録）
+pub fn remove_sudoers_done() -> Result<LidControlDone, OsRefusal> {
     if !is_sudoers_installed() {
-        return Ok("sudoers は未登録です（削除不要）".to_string());
+        return Ok(LidControlDone::SudoersAbsent);
     }
 
     let script = format!(
@@ -1103,7 +1211,7 @@ echo 'OK: sudoers 削除完了・disablesleep 解除'
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     if output.status.success() {
-        Ok(stdout)
+        Ok(LidControlDone::SudoersRemoved(stdout))
     } else if stderr.contains("User canceled") || stderr.contains("(-128)") {
         Err(OsRefusal::UserCanceled)
     } else {

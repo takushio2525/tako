@@ -5817,6 +5817,9 @@ fn orchestrator_watch(
         }
     };
 
+    // `WORKER_*` と `detail:` / `action:` ほかのラベル・現在の選択の印は master が読む印なので
+    // 両言語で同じ。表示言語に従うのは人向けの説明文だけ（#2365）
+    let lang = cli_lang();
     match outcome {
         wait::WatchOutcome::Idle {
             ctx_percent: Some(pct),
@@ -5900,22 +5903,22 @@ fn orchestrator_watch(
                         .unwrap_or((i + 1) as u64);
                     let label = opt.get("label").and_then(|v| v.as_str()).unwrap_or("");
                     let mark = if opt.get("highlighted").and_then(|v| v.as_bool()) == Some(true) {
-                        " ← 現在の選択"
+                        format!(" {}", wait::CHOICE_HIGHLIGHT_MARK)
                     } else {
-                        ""
+                        String::new()
                     };
                     // #1143: ラベルが画面上で打ち切られている（元の文字列は残っていない）
                     let cut = if opt.get("label_truncated").and_then(|v| v.as_bool()) == Some(true)
                     {
-                        " [切り詰め]"
+                        format!(" {}", ReplyNote::WatchLabelTruncated.text_in(lang))
                     } else {
-                        ""
+                        String::new()
                     };
                     println!("  {number}. {label}{cut}{mark}");
                 }
             }
             if choice_dialog.get("numbered").and_then(|v| v.as_bool()) == Some(false) {
-                println!("  note: 番号キーは無反応なダイアログ（tako が矢印移動で応答する）");
+                println!("  note: {}", ReplyNote::WatchNoteUnnumbered.text_in(lang));
             }
             // #1143: 狭いペインではカーソルもラベルの全文も画面に残らない
             if choice_dialog
@@ -5924,7 +5927,8 @@ fn orchestrator_watch(
                 == Some(false)
             {
                 println!(
-                    "  note: ダイアログがペインより高く選択カーソルが画面外（番号で応答する）"
+                    "  note: {}",
+                    ReplyNote::WatchNoteCursorOffscreen.text_in(lang)
                 );
             }
             if choice_dialog
@@ -5932,7 +5936,10 @@ fn orchestrator_watch(
                 .and_then(|v| v.as_bool())
                 == Some(true)
             {
-                println!("  note: ラベルが切り詰められている（respond はラベルではなく番号で）");
+                println!(
+                    "  note: {}",
+                    ReplyNote::WatchNoteLabelsTruncated.text_in(lang)
+                );
             }
             println!(
                 "  action: {}",
@@ -5941,18 +5948,25 @@ fn orchestrator_watch(
                     .and_then(|v| v.as_str())
                     .unwrap_or("respond")
             );
-            println!("  respond: tako orchestrator respond --pane {pane} --choice <番号|ラベル>");
+            println!(
+                "  respond: tako orchestrator respond --pane {pane} --choice {}",
+                ReplyNote::WatchChoicePlaceholder.text_in(lang)
+            );
             print_events(&mut exec);
         }
         wait::WatchOutcome::AgentDead { resume_command } => {
             println!("WORKER_DEAD: tako:{pane}");
             println!(
-                "  detail: エージェント CLI プロセスが終了している（SIGSEGV 等の突然死の疑い）"
+                "  detail: {}",
+                ReplyNote::WatchAgentDeadDetail.text_in(lang)
             );
             if let Some(cmd) = resume_command {
                 println!("  resume: {cmd}");
             } else {
-                println!("  resume: (session ID 未記録のため resume コマンドを組み立てられない)");
+                println!(
+                    "  resume: {}",
+                    ReplyNote::WatchResumeUnbuildable.text_in(lang)
+                );
             }
             println!("  action: resume_session");
         }
@@ -9118,50 +9132,55 @@ fn platform_local(args: &PlatformArgs) -> Result<(), String> {
 
 /// レイアウト世代バックアップからの復旧（#177。ローカル処理・IPC 不要）。
 /// GUI 死亡・縮退 layout 保存後の復旧手段なので、GUI 内蔵の MCP からは提供できない
-/// （GUI が生きていれば復旧は不要。開発不変条件の例外は requirements.md FR-5 参照）
+/// （GUI が生きていれば復旧は不要。開発不変条件の例外は requirements.md FR-5 参照）。
+/// 一覧・案内・復元の結果の行と断りは表示言語（#2365）。persist.log の行は日本語のまま
 fn recover_local(args: &RecoverArgs) -> Result<(), String> {
     local_data_gate()?;
     let path = tako_control::layout::layout_path()
-        .ok_or_else(|| "データディレクトリを解決できない（HOME 未設定等）".to_string())?;
+        .ok_or_else(|| front_err(Reason::RecoverDataDirUnresolved))?;
     match args.apply.as_deref() {
         None => recover_list(&path),
         Some(generation) => recover_apply(&path, generation, args.force),
     }
 }
 
+/// 表示幅（全角 = 2 桁）で `cols` 桁まで右を空白で埋める（`tako recover` の一覧のラベルの桁揃え）
+fn pad_cols(label: &str, cols: usize) -> String {
+    let width: usize = label
+        .chars()
+        .map(|c| if c.is_ascii() { 1 } else { 2 })
+        .sum();
+    format!("{label}{}", " ".repeat(cols.saturating_sub(width)))
+}
+
 /// layout.json とバックアップ世代の一覧（タブ数 / ペイン数 / 更新時刻）を表示する
 fn recover_list(path: &std::path::Path) -> Result<(), String> {
-    fn describe(path: &std::path::Path) -> String {
+    let lang = cli_lang();
+    let describe = |path: &std::path::Path| -> String {
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
-            Err(_) => return "（無し）".into(),
+            Err(_) => return ReplyNote::RecoverMissing.text_in(lang),
         };
         let age = meta
             .modified()
             .ok()
             .and_then(|t| t.elapsed().ok())
-            .map(|d| {
-                let secs = d.as_secs();
-                if secs < 60 {
-                    format!("{secs} 秒前")
-                } else if secs < 3600 {
-                    format!("{} 分前", secs / 60)
-                } else if secs < 86400 {
-                    format!("{} 時間前", secs / 3600)
-                } else {
-                    format!("{} 日前", secs / 86400)
-                }
-            })
-            .unwrap_or_else(|| "更新時刻不明".into());
+            .map(|d| ReplyNote::RecoverAge(d.as_secs()))
+            .unwrap_or(ReplyNote::RecoverAgeUnknown)
+            .text_in(lang);
         match tako_control::layout::load_file(path) {
-            Ok(layout) => format!(
-                "{} タブ / {} ペイン（{age} 更新）",
-                layout.tabs.len(),
-                layout.pane_count()
-            ),
-            Err(e) => format!("読めない: {e}（{age} 更新）"),
+            Ok(layout) => ReplyNote::RecoverLayoutSummary {
+                tabs: layout.tabs.len(),
+                panes: layout.pane_count(),
+                age,
+            },
+            Err(e) => ReplyNote::RecoverLayoutUnreadable {
+                error: e.text_in(lang),
+                age,
+            },
         }
-    }
+        .text_in(lang)
+    };
     println!("layout.json         : {}", describe(path));
     for generation in 1..=3u32 {
         let bak = tako_control::config_io::backup_path(path, generation);
@@ -9174,24 +9193,25 @@ fn recover_list(path: &std::path::Path) -> Result<(), String> {
     let rescued = path.with_extension(tako_control::restore_guard::RESCUED_EXT);
     println!("layout.json.rescued : {}", describe(&rescued));
     if let Some(record) = tako_control::restore_guard::load() {
-        println!(
-            "復元の直後の全滅    : 連続 {} 回（{} 回続くと次の起動は復元を見送る）",
-            record.count,
-            tako_control::restore_guard::SKIP_AFTER
-        );
+        // ラベルは上の行（`layout.json.rescued `）と同じ 20 桁へ揃える
+        let label = ReplyNote::RecoverWipeoutLabel.text_in(lang);
+        let count = ReplyNote::RecoverWipeouts {
+            count: record.count,
+            skip_after: tako_control::restore_guard::SKIP_AFTER,
+        };
+        println!("{}: {}", pad_cols(&label, 20), count.text_in(lang));
     }
     eprintln!();
     // 打鍵の表記は正本から引く（Windows は Ctrl+Shift+Q。#1203）
     let quit_key =
         tako_core::platform::keys::quit(tako_core::platform::support::Platform::current());
-    eprintln!("復元するには: tako を終了（{quit_key}）してから `tako recover --apply <世代>` →");
-    eprintln!("tako を再起動すると復元されたレイアウトで立ち上がります。");
-    eprintln!("実体の tmux セッションが生きていれば、実行中プロセスごと画面に戻ります。");
-    eprintln!("（good = 最後に復元へ成功した良品。`tako recover --apply good` で戻せます）");
+    let quit_key = quit_key.to_string();
+    eprintln!("{}", ReplyNote::RecoverHowTo { quit_key }.text_in(lang));
+    eprintln!("{}", ReplyNote::RecoverRestartNote.text_in(lang));
+    eprintln!("{}", ReplyNote::RecoverTmuxNote.text_in(lang));
+    eprintln!("{}", ReplyNote::RecoverGoodNote.text_in(lang));
     if rescued.is_file() {
-        eprintln!(
-            "（rescued = 復元の直後に全ペインが終わったので退避した構成。`tako recover --apply rescued` で戻せます）"
-        );
+        eprintln!("{}", ReplyNote::RecoverRescuedNote.text_in(lang));
     }
     Ok(())
 }
@@ -9199,15 +9219,16 @@ fn recover_list(path: &std::path::Path) -> Result<(), String> {
 /// バックアップ世代（1〜3 / good / rescued）を layout.json へ復元する
 /// （現行は layout.json.pre-recover へ退避）
 fn recover_apply(path: &std::path::Path, generation: &str, force: bool) -> Result<(), String> {
+    let lang = cli_lang();
     let bak = match generation {
         "1" | "2" | "3" => tako_control::config_io::backup_path(path, generation.parse().unwrap()),
         "good" => path.with_extension("json.good"),
         // #641: 復元の直後の全滅で救済・見送りしたときの退避
         "rescued" => path.with_extension(tako_control::restore_guard::RESCUED_EXT),
         other => {
-            return Err(format!(
-                "世代は 1〜3・good・rescued のどれかで指定してください（指定: {other}）"
-            ))
+            return Err(front_err(Reason::RecoverGenerationUnknown(
+                other.to_string(),
+            )))
         }
     };
     // 稼働中の tako があると、復元した layout.json を定期保存が即上書きしてしまう。
@@ -9217,20 +9238,21 @@ fn recover_apply(path: &std::path::Path, generation: &str, force: bool) -> Resul
         if let Some(pid) = tako_control::discovery::live_primary_pid() {
             let quit_key =
                 tako_core::platform::keys::quit(tako_core::platform::support::Platform::current());
-            return Err(format!(
-                "tako（pid {pid}）が稼働中です。終了（{quit_key}）してから実行してください（--force で強制実行）"
-            ));
+            return Err(front_err(Reason::RecoverTakoRunning {
+                pid,
+                quit_key: quit_key.to_string(),
+            }));
         }
         if tako_core::ports::other_tako_running() {
-            return Err(
-                "tako が稼働中です（定期保存が復元結果を上書きします）。終了してから実行するか、\
-                 別のデータディレクトリの tako だと確かなら --force を付けてください"
-                    .to_string(),
-            );
+            return Err(front_err(Reason::RecoverOtherTakoRunning));
         }
     }
-    let layout = tako_control::layout::load_file(&bak)
-        .map_err(|e| format!("バックアップ {} を読めない: {e}", bak.display()))?;
+    let layout = tako_control::layout::load_file(&bak).map_err(|e| {
+        front_err(Reason::RecoverBackupUnreadable {
+            path: bak.display().to_string(),
+            error: e.text_in(lang),
+        })
+    })?;
     // #1858: 世代をそのまま写すと、バックアップより後に作られたタブ（復旧をしている
     // master 自身のタブを含む）が消える。現在の layout.json にあって世代に無いタブを、
     // 起動時に刈り込まれるだけのタブ（器の消えた master / worker のペインしか無い）以外は
@@ -9246,43 +9268,46 @@ fn recover_apply(path: &std::path::Path, generation: &str, force: bool) -> Resul
                 tako_core::tmux::live_session_names(Some(&tako_core::tmux_backend::socket_name())),
             )),
             Err(e) => {
-                eprintln!(
-                    "現在の layout.json を読めないので、バックアップより後のタブは合流しない: {e}"
-                );
+                let note = ReplyNote::RecoverCurrentUnreadable(e.text_in(lang));
+                eprintln!("{}", note.text_in(lang));
                 None
             }
         }
     };
     if path.is_file() {
         let stash = path.with_extension("json.pre-recover");
-        std::fs::copy(path, &stash).map_err(|e| format!("現在の layout.json の退避に失敗: {e}"))?;
-        eprintln!("現在の layout.json → {} へ退避", stash.display());
+        std::fs::copy(path, &stash)
+            .map_err(|e| front_err(Reason::RecoverStashFailed(e.to_string())))?;
+        let note = ReplyNote::RecoverStashed(stash.display().to_string());
+        eprintln!("{}", note.text_in(lang));
     }
     match &merge {
         // 合流があるときだけ書き直す（無ければ世代とバイト一致のコピーのまま）
         Some((merged, report)) if !report.merged.is_empty() => {
             tako_control::layout::write_file(path, merged)
-                .map_err(|e| format!("復元の書き込みに失敗: {e}"))?
+                .map_err(|e| front_err(Reason::RecoverWriteFailed(e.to_string())))?
         }
         _ => {
-            std::fs::copy(&bak, path).map_err(|e| format!("復元コピーに失敗: {e}"))?;
+            std::fs::copy(&bak, path)
+                .map_err(|e| front_err(Reason::RecoverCopyFailed(e.to_string())))?;
         }
     }
-    eprintln!(
-        "{}（{} タブ / {} ペイン）→ layout.json へ復元しました。",
-        bak.file_name()
+    let restored = ReplyNote::RecoverRestored {
+        name: bak
+            .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| bak.display().to_string()),
-        layout.tabs.len(),
-        layout.pane_count()
-    );
+        tabs: layout.tabs.len(),
+        panes: layout.pane_count(),
+    };
+    eprintln!("{}", restored.text_in(lang));
     if let Some((merged, report)) = &merge {
-        print_recover_merge(merged, report);
+        print_recover_merge(merged, report, lang);
         if let Some(line) = report.log_line(generation) {
             tako_control::diag::persist_log(&line);
         }
     }
-    eprintln!("tako を起動すると、このレイアウトで復元されます。");
+    eprintln!("{}", ReplyNote::RecoverLaunchNote.text_in(lang));
     Ok(())
 }
 
@@ -9290,55 +9315,47 @@ fn recover_apply(path: &std::path::Path, generation: &str, force: bool) -> Resul
 fn print_recover_merge(
     merged: &tako_control::layout::LayoutFile,
     report: &tako_control::layout_reconcile::MergeReport,
+    lang: tako_core::i18n::Lang,
 ) {
     if !report.merged.is_empty() {
-        eprintln!(
-            "バックアップより後に作られたタブを {} 枚合流しました:",
-            report.merged.len()
-        );
+        let header = ReplyNote::RecoverMergedHeader(report.merged.len());
+        eprintln!("{}", header.text_in(lang));
         for t in &report.merged {
-            let mut notes = vec![format!("tmux セッションあり {}", t.alive)];
-            if t.dead > 0 {
-                notes.push(format!(
-                    "終わっている {}（master / worker のペインは起動時に外し、ほかは開き直す）",
-                    t.dead
-                ));
-            }
-            if t.duplicates > 0 {
-                notes.push(format!(
-                    "バックアップ側にあるペイン {} を除いた",
-                    t.duplicates
-                ));
-            }
-            eprintln!(
-                "  タブ {}「{}」: {} ペイン（{}）",
-                t.id,
-                t.title,
-                t.panes,
-                notes.join("・")
-            );
+            let tab = ReplyNote::RecoverMergedTab {
+                id: t.id,
+                title: t.title.clone(),
+                panes: t.panes,
+                alive: t.alive,
+                dead: t.dead,
+                duplicates: t.duplicates,
+            };
+            eprintln!("  {}", tab.text_in(lang));
         }
     }
     if !report.skipped.is_empty() {
-        eprintln!("合流しなかったタブ {} 枚:", report.skipped.len());
+        let header = ReplyNote::RecoverSkippedHeader(report.skipped.len());
+        eprintln!("{}", header.text_in(lang));
         for t in &report.skipped {
-            eprintln!("  タブ {}「{}」: {}", t.id, t.title, t.reason.label());
+            let tab = ReplyNote::RecoverSkippedTab {
+                id: t.id,
+                title: t.title.clone(),
+                reason: t.reason,
+            };
+            eprintln!("  {}", tab.text_in(lang));
         }
     }
     if let Some(untrusted) = report.untrusted {
         if !report.merged.is_empty() {
-            eprintln!(
-                "（{}ので、tmux セッションの生死は確かめずに合流しました）",
-                untrusted.label()
-            );
+            let note = ReplyNote::RecoverUntrustedMerged(untrusted);
+            eprintln!("{}", note.text_in(lang));
         }
     }
     if !report.merged.is_empty() {
-        eprintln!(
-            "合流後: {} タブ / {} ペイン",
-            merged.tabs.len(),
-            merged.pane_count()
-        );
+        let total = ReplyNote::RecoverMergedTotal {
+            tabs: merged.tabs.len(),
+            panes: merged.pane_count(),
+        };
+        eprintln!("{}", total.text_in(lang));
     }
 }
 
@@ -9348,8 +9365,9 @@ fn print_recover_merge(
 /// どちらもプロセスローカルな static）ので、この CLI プロセスで計算すると
 /// アプリが保持していても常に「未保持 / busy 0」になる。アプリが起動していれば
 /// IPC（= MCP の `tako_sleep_guard` と同じ dispatch）で取りに行き、
-/// 未起動ならこのプロセスで計算する。返り値の第 2 要素は取得元の表示用ラベル
-fn sleep_guard_status_state() -> (tako_control::sleep_guard::SleepGuardState, &'static str) {
+/// 未起動ならこのプロセスで計算する。返り値の第 2 要素は取得元（真 = アプリから IPC で取った。
+/// 表示は `ReplyNote::SleepGuardSource` が表示言語で組む。#2365）
+fn sleep_guard_status_state() -> (tako_control::sleep_guard::SleepGuardState, bool) {
     let from_app = send_request(Request::SleepGuard {
         action: Some("status".to_string()),
         mode: None,
@@ -9361,94 +9379,78 @@ fn sleep_guard_status_state() -> (tako_control::sleep_guard::SleepGuardState, &'
     .ok()
     .and_then(|value| tako_control::sleep_guard::SleepGuardState::from_json(&value));
     if let Some(state) = from_app {
-        return (state, "tako アプリ（IPC）");
+        return (state, true);
     }
     let settings = tako_control::settings::load();
     (
         tako_control::sleep_guard::status(settings.sleep_guard_config()),
-        "この CLI プロセス（tako アプリは未起動）",
+        false,
     )
 }
 
+/// `tako sleep-guard` の手元の処理。人向けの行（stderr）と断りは表示言語（#2365）、状態の JSON（stdout）は不変
 fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
+    use tako_control::sleep_guard as sg;
     local_data_gate()?;
+    let lang = cli_lang();
+    let line = |note: ReplyNote| eprintln!("  {}", note.text_in(lang));
     match sub {
         SleepGuardCommand::Status => {
-            let (state, source) = sleep_guard_status_state();
-            eprintln!("  取得元: {source}");
-            if state.assertion_held {
-                eprintln!("  idle-sleep: アサーション保持中");
-            } else {
-                eprintln!("  idle-sleep: アサーション未保持");
-            }
-            eprintln!("  モード: {}", state.mode.as_str());
-            eprintln!("  電源条件: {}", state.power_condition.as_str());
-            eprintln!(
-                "  AC 電源: {}",
-                if state.on_ac_power {
-                    "接続中"
-                } else {
-                    "未接続"
-                }
-            );
+            let (state, from_app) = sleep_guard_status_state();
+            line(ReplyNote::SleepGuardSource { from_app });
+            line(ReplyNote::SleepGuardIdleSleep(state.assertion_held));
+            line(ReplyNote::SleepGuardMode(state.mode.as_str().to_string()));
+            line(ReplyNote::SleepGuardPower(
+                state.power_condition.as_str().to_string(),
+            ));
+            line(ReplyNote::SleepGuardAcPower(state.on_ac_power));
             // 蓋の開閉は macOS でしか観測できない。取れない OS で「開」と言い切ると
             // 嘘になるので不明と出す（#697）
-            if tako_control::sleep_guard::lid_state_detectable() {
-                eprintln!("  蓋: {}", if state.lid_closed { "閉" } else { "開" });
+            if sg::lid_state_detectable() {
+                line(ReplyNote::SleepGuardLid(state.lid_closed));
             } else {
-                eprintln!("  蓋: 不明（この OS では開閉を検知できません）");
+                line(ReplyNote::SleepGuardLidUnknown);
             }
             // sudoers は macOS 固有の手段。要らない OS では出さない（#697）
-            if tako_control::sleep_guard::lid_requires_privileged_setup() {
-                eprintln!(
-                    "  蓋閉じ防止: {} (sudoers: {})",
-                    state.lid_sleep_mode.as_str(),
-                    if state.sudoers_installed {
-                        "登録済み"
-                    } else {
-                        "未登録"
-                    }
-                );
-            } else if tako_control::sleep_guard::lid_control_supported() {
-                eprintln!("  蓋閉じ防止: {}", state.lid_sleep_mode.as_str());
+            if sg::lid_requires_privileged_setup() {
+                line(ReplyNote::SleepGuardLidModeSudoers {
+                    mode: state.lid_sleep_mode.as_str().to_string(),
+                    installed: state.sudoers_installed,
+                });
+            } else if sg::lid_control_supported() {
+                line(ReplyNote::SleepGuardLidMode(
+                    state.lid_sleep_mode.as_str().to_string(),
+                ));
             } else {
-                eprintln!("  蓋閉じ防止: この OS では対応していません");
+                line(ReplyNote::SleepGuardLidUnsupported);
             }
-            eprintln!(
-                "  蓋閉じ継続の適用: {}",
-                if state.lid_sleep_disabled {
-                    "有効"
-                } else {
-                    "無効"
-                }
-            );
+            line(ReplyNote::SleepGuardLidApplied(state.lid_sleep_disabled));
             // #1473: 蓋閉じ継続の電源条件と、効いていないなら**その理由**
-            if tako_control::sleep_guard::lid_control_supported() {
-                eprintln!(
-                    "  蓋閉じ継続の電源条件: {}",
-                    state.lid_power_condition.as_str()
-                );
+            if sg::lid_control_supported() {
+                line(ReplyNote::SleepGuardLidPower(
+                    state.lid_power_condition.as_str().to_string(),
+                ));
                 match state.battery_percent {
-                    Some(percent) => eprintln!(
-                        "  バッテリー残量: {percent}%（下限 {}%）",
-                        state.lid_battery_floor
-                    ),
-                    None => eprintln!("  バッテリー残量: 不明（この機械では取得できません）"),
+                    Some(percent) => line(ReplyNote::SleepGuardBattery {
+                        percent,
+                        floor: state.lid_battery_floor,
+                    }),
+                    None => line(ReplyNote::SleepGuardBatteryUnknown),
                 }
                 if !state.lid_sleep_disabled {
                     if let Some(reason) = state.lid_skip_reason {
-                        eprintln!("  蓋閉じ継続が効かない理由: {}", reason.describe());
+                        line(ReplyNote::SleepGuardLidSkip(reason.describe_in(lang)));
                     }
                 }
             }
             // thermal は macOS でしか取れない。取れない OS で常に nominal と出しても情報がない
-            if tako_control::sleep_guard::lid_requires_privileged_setup()
-                || state.thermal_state != tako_control::sleep_guard::ThermalState::Nominal
+            if sg::lid_requires_privileged_setup()
+                || state.thermal_state != sg::ThermalState::Nominal
             {
                 eprintln!("  thermal: {}", state.thermal_state.as_str());
             }
             if state.display_sleep_forced {
-                eprintln!("  ディスプレイ: 消灯済み（蓋閉じ中）");
+                line(ReplyNote::SleepGuardDisplayOff);
             }
             println!(
                 "{}",
@@ -9463,60 +9465,45 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
             lid_power_condition,
             lid_battery_floor,
         } => {
+            let unknown = |flag: &'static str, got: &str, allowed: &'static str| {
+                front_err(Reason::SleepGuardUnknownValue {
+                    flag,
+                    got: got.to_string(),
+                    allowed,
+                })
+            };
             let mut settings = tako_control::settings::load();
             if let Some(m) = mode {
-                settings.sleep_guard_mode =
-                    tako_control::sleep_guard::SleepGuardMode::from_str_opt(m).ok_or_else(
-                        || {
-                            format!(
-                                "不明な mode: {m:?}（off / on / while-agents-running のいずれか）"
-                            )
-                        },
-                    )?;
+                settings.sleep_guard_mode = sg::SleepGuardMode::from_str_opt(m)
+                    .ok_or_else(|| unknown("mode", m, "off / on / while-agents-running"))?;
             }
             if let Some(pc) = power_condition {
-                settings.sleep_guard_power =
-                    tako_control::sleep_guard::PowerCondition::from_str_opt(pc).ok_or_else(
-                        || format!("不明な power: {pc:?}（ac-only / always のいずれか）"),
-                    )?;
+                settings.sleep_guard_power = sg::PowerCondition::from_str_opt(pc)
+                    .ok_or_else(|| unknown("power", pc, "ac-only / always"))?;
             }
             if let Some(lsm) = lid_sleep_mode {
-                settings.lid_sleep_mode = tako_control::sleep_guard::LidSleepMode::from_str_opt(
-                    lsm,
-                )
-                .ok_or_else(|| {
-                    format!(
-                        "不明な lid-sleep-mode: {lsm:?}（off / while-agents-running のいずれか）"
-                    )
-                })?;
+                settings.lid_sleep_mode = sg::LidSleepMode::from_str_opt(lsm)
+                    .ok_or_else(|| unknown("lid-sleep-mode", lsm, "off / while-agents-running"))?;
             }
             // #1473: 蓋閉じ継続の電源条件と残量下限（アイドルスリープ側とは別の軸）
             if let Some(pc) = lid_power_condition {
-                settings.lid_sleep_power = tako_control::sleep_guard::PowerCondition::from_str_opt(
-                    pc,
-                )
-                .ok_or_else(|| {
-                    format!(
-                        "不明な lid-power-condition: {pc:?}（{}）",
-                        tako_control::sleep_guard::PowerCondition::values_hint()
-                    )
-                })?;
+                settings.lid_sleep_power = sg::PowerCondition::from_str_opt(pc)
+                    .ok_or_else(|| front_err(Reason::SleepGuardUnknownLidPower(pc.to_string())))?;
             }
             if let Some(floor) = lid_battery_floor {
                 settings.lid_battery_floor =
-                    tako_control::sleep_guard::parse_battery_floor(*floor)?;
+                    sg::parse_battery_floor_typed(*floor).map_err(|e| e.text_in(lang))?;
             }
             tako_control::settings::save(&settings)
-                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
-            eprintln!(
-                "  設定を変更しました: mode={}, power={}, lid-sleep={}, lid-power={}, lid-battery-floor={}%",
-                settings.sleep_guard_mode.as_str(),
-                settings.sleep_guard_power.as_str(),
-                settings.lid_sleep_mode.as_str(),
-                settings.lid_sleep_power.as_str(),
-                settings.lid_battery_floor,
-            );
-            let state = tako_control::sleep_guard::status(settings.sleep_guard_config());
+                .map_err(|e| front_err(Reason::settings_save_failed(&e)))?;
+            line(ReplyNote::SleepGuardSettingsChanged {
+                mode: settings.sleep_guard_mode.as_str().to_string(),
+                power: settings.sleep_guard_power.as_str().to_string(),
+                lid_sleep: settings.lid_sleep_mode.as_str().to_string(),
+                lid_power: settings.lid_sleep_power.as_str().to_string(),
+                floor: settings.lid_battery_floor,
+            });
+            let state = sg::status(settings.sleep_guard_config());
             println!(
                 "{}",
                 serde_json::to_string_pretty(&state.to_json()).unwrap()
@@ -9526,31 +9513,35 @@ fn sleep_guard_local(sub: &SleepGuardCommand) -> Result<(), String> {
         SleepGuardCommand::InstallLidSleep => {
             // 案内は「この OS で何が起きるか」で出し分ける。
             // 分岐は sleep_guard 側に閉じているのでここは単一経路（#697）
-            if tako_control::sleep_guard::lid_setup_pending() {
-                eprintln!("蓋閉じ防止の sudoers 登録を行います...");
-                eprintln!("  登録内容: pmset -a disablesleep 0/1 のみ NOPASSWD");
-                eprintln!("  管理者パスワードの入力ダイアログが表示されます。");
+            if sg::lid_setup_pending() {
+                eprintln!("{}", ReplyNote::LidSudoersSetupStart.text_in(lang));
+                line(ReplyNote::LidSudoersSetupContent);
+                line(ReplyNote::LidSudoersPasswordPrompt);
             } else {
-                eprintln!("蓋閉じ防止を有効にします...");
+                eprintln!("{}", ReplyNote::LidEnableStart.text_in(lang));
             }
-            let result = tako_control::sleep_guard::prepare_lid_control()?;
-            eprintln!("  {result}");
+            let done = sg::prepare_lid_control_done().map_err(|e| e.text_in(lang))?;
+            eprintln!("  {}", done.text_in(lang));
             let mut settings = tako_control::settings::load();
-            settings.lid_sleep_mode = tako_control::sleep_guard::LidSleepMode::WhileAgentsRunning;
+            settings.lid_sleep_mode = sg::LidSleepMode::WhileAgentsRunning;
             tako_control::settings::save(&settings)
-                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
-            eprintln!("  lid-sleep-mode を while-agents-running に設定しました。");
-            eprintln!("  解除: tako sleep-guard remove-lid-sleep");
+                .map_err(|e| front_err(Reason::settings_save_failed(&e)))?;
+            line(ReplyNote::LidSleepModeSet(
+                settings.lid_sleep_mode.as_str().to_string(),
+            ));
+            line(ReplyNote::LidRemoveHint);
             Ok(())
         }
         SleepGuardCommand::RemoveLidSleep => {
-            let result = tako_control::sleep_guard::teardown_lid_control()?;
-            eprintln!("  {result}");
+            let done = sg::teardown_lid_control_done().map_err(|e| e.text_in(lang))?;
+            eprintln!("  {}", done.text_in(lang));
             let mut settings = tako_control::settings::load();
-            settings.lid_sleep_mode = tako_control::sleep_guard::LidSleepMode::Off;
+            settings.lid_sleep_mode = sg::LidSleepMode::Off;
             tako_control::settings::save(&settings)
-                .map_err(|e| format!("設定の保存に失敗: {e}"))?;
-            eprintln!("  lid-sleep-mode を off に設定しました。");
+                .map_err(|e| front_err(Reason::settings_save_failed(&e)))?;
+            line(ReplyNote::LidSleepModeSet(
+                settings.lid_sleep_mode.as_str().to_string(),
+            ));
             Ok(())
         }
     }
