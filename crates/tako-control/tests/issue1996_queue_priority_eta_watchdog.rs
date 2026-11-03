@@ -6,7 +6,8 @@
 //! 2. エイジングは待ち 15 分ごとに 1 段・`high` まで・同じ段の中の受付の順を崩さない（`priority::aged`）。
 //!    調停役は待ちの並びの入力（`WaitingJob.priority`）にエイジングの後の段を渡している
 //! 3. cargo の進みの行は素通しから外れ、それ以外の出力は 1 バイトも変わらない（`eta::ProgressFilter`）。
-//!    wrapper は端末の stderr・利用者が決めた `CARGO_TERM_PROGRESS_WHEN`・cargo でない子では横取りしない
+//!    wrapper は端末の stderr・利用者が決めた `CARGO_TERM_PROGRESS_WHEN`・cargo でない子では横取りせず、
+//!    A/B の門（`TAKO_1996_LEGACY=1` = 従来の素通し）を通してから判断する
 //! 4. 過去の記録（`<data_dir>/resources/history.jsonl`）に生の argv・パスが載らない: 書く口
 //!    （`queue_history::append`）が行を検査（`row_leak`）してから書き、外れた行は欄を名指して断る
 //!
@@ -287,18 +288,34 @@ fn scan(queue: &str, history: &str, wrapper: &str) -> Vec<String> {
             }
         }
     }
-    // 3: wrapper は自分の stderr が端末かを見てから進みを読む
-    let wired = wrapper
-        .lines()
-        .enumerate()
-        .find(|(_, l)| code(l).contains("reads_cargo_progress(argv"));
-    match wired {
-        Some((_, l)) if code(l).contains("stderr().is_terminal()") => {}
-        Some((i, _)) => out.push(format!(
-            "{WRAPPER}:{} 進みを読むかの判断に自分の stderr が端末かを渡していない（端末で横取りする）",
-            i + 1
+    // 3: wrapper は自分の stderr が端末かを見てから進みを読み、A/B の門（`TAKO_1996_LEGACY=1`）を通す
+    let lines: Vec<&str> = wrapper.lines().collect();
+    match lines
+        .iter()
+        .position(|l| code(l).contains("reads_cargo_progress(argv"))
+    {
+        None => out.push(format!(
+            "{WRAPPER}:0 `run_with` が進みを読むかを判断していない（走査が空振り）"
         )),
-        None => out.push(format!("{WRAPPER}:0 `run_with` が進みを読むかを判断していない（走査が空振り）")),
+        Some(i) => {
+            let call = code(lines[i]);
+            if !call.contains("!legacy_1996()") {
+                out.push(format!(
+                    "{WRAPPER}:{} 進みを読むかの判断が A/B の門（`!legacy_1996()`）を通っていない（TAKO_1996_LEGACY=1 で素通しへ戻らない）",
+                    i + 1
+                ));
+            }
+            let tty_bound = lines[..i].iter().rev().take(3).any(|l| {
+                let c = code(l);
+                c.contains("let stderr_tty") && c.contains("stderr().is_terminal()")
+            });
+            if !call.contains("stderr_tty") || !tty_bound {
+                out.push(format!(
+                    "{WRAPPER}:{} 進みを読むかの判断に自分の stderr が端末かを渡していない（端末で横取りする）",
+                    i + 1
+                ));
+            }
+        }
     }
     out
 }
@@ -344,8 +361,8 @@ fn 逆戻りを名指しできる() {
     );
     // 3: 端末かを見ない
     let w2 = wrapper.replacen(
-        "std::io::stderr().is_terminal(), already_set",
-        "false, already_set",
+        "let stderr_tty = std::io::stderr().is_terminal();",
+        "let stderr_tty = false;",
         1,
     );
     assert_ne!(w2, wrapper, "注入が当たらない（ソースの形が変わった）");
@@ -354,6 +371,20 @@ fn 逆戻りを名指しできる() {
         found
             .iter()
             .any(|f| f.starts_with(&format!("{WRAPPER}:")) && f.contains("端末")),
+        "{found:?}"
+    );
+    // 3': A/B の門を外す（TAKO_1996_LEGACY=1 でも横取りする）
+    let w3 = wrapper.replacen(
+        "!legacy_1996() && reads_cargo_progress(",
+        "reads_cargo_progress(",
+        1,
+    );
+    assert_ne!(w3, wrapper, "注入が当たらない（ソースの形が変わった）");
+    let found = scan(&queue, &history, &w3);
+    assert!(
+        found
+            .iter()
+            .any(|f| f.starts_with(&format!("{WRAPPER}:")) && f.contains("TAKO_1996_LEGACY")),
         "{found:?}"
     );
     // 名指しは行番号つき（0 = 空振りではない）

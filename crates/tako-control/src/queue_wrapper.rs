@@ -38,7 +38,8 @@
 //!   `CARGO_TERM_PROGRESS_WHEN` を決めていないときだけ、`CARGO_TERM_PROGRESS_WHEN=always`（と幅 80）を足して
 //!   子の stderr を受け、`Building [...] N/M` の行を外して（`eta::ProgressFilter`）残りをそのまま自分の
 //!   stderr へ流す。読んだ `N/M` は心拍と done に載せる（終わりの見込み・過去の記録のユニット数）。
-//!   端末のときは横取りしない（cargo 自身のバーを人がそのまま見る）
+//!   端末のときは横取りしない（cargo 自身のバーを人がそのまま見る）。A/B は wrapper のプロセスの env
+//!   `TAKO_1996_LEGACY=1`（stderr を受けず進みの env も足さない = 従来の素通し）
 //!
 //! 送受信（IPC の 1 往復）は呼び手（tako-cli の transport）が閉包で渡す。ここは状態の進め方と
 //! OS 依存（シグナル・子の木）だけを持つ。
@@ -53,6 +54,14 @@ use tako_core::queue::{self as q, CallerRole, JobKind, JobWire, Priority, Priori
 
 use crate::protocol::Request;
 use crate::queue::{unix_ms, ENV_JOB};
+
+/// #1996 の A/B: `TAKO_1996_LEGACY=1` で cargo の stderr を受けず `CARGO_TERM_PROGRESS_WHEN` も足さない
+/// （従来の素通し = 進みは読まない）。wrapper（`tako queue <コマンド>`）のプロセスの env で効く
+pub const ENV_LEGACY_1996: &str = "TAKO_1996_LEGACY";
+
+fn legacy_1996() -> bool {
+    std::env::var_os(ENV_LEGACY_1996).is_some_and(|v| v == "1")
+}
 
 /// 待ちの間の poll の間隔
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -634,8 +643,9 @@ fn run_with(
     let mut cmd = program.command();
     cmd.env(ENV_JOB, wire.id.to_string());
     cmd.envs(share_env(share, already_set));
-    // #1996: 端末でない stderr の cargo は進みを強制して読む（その行は素通しから外す）
-    let read_progress = reads_cargo_progress(argv, std::io::stderr().is_terminal(), already_set);
+    // #1996: 端末でない stderr の cargo は進みを強制して読む（その行は素通しから外す）。A/B は素通し
+    let stderr_tty = std::io::stderr().is_terminal();
+    let read_progress = !legacy_1996() && reads_cargo_progress(argv, stderr_tty, already_set);
     if read_progress {
         cmd.envs(progress_env(already_set));
         cmd.stderr(std::process::Stdio::piped());

@@ -14,6 +14,7 @@
 #   ⑤ 同じコマンドの 2 回目から終わりの見込みが出る（過去の記録の所要時間）・記録に生の argv とパスが無い
 #   ⑥ 端末の cargo は横取りしない（進みの行は cargo 自身が端末へ出す）
 #   ⑦ 過去の記録が 512 KB を超えたら回す・読めない行は .unreadable.bak へ退避してから直る
+#   ⑧ A/B: TAKO_1996_LEGACY=1 では stderr を受けず進みの env も足さない（従来の素通し・progress は null）
 #
 # 落とすのは自分で起こした pid とソケットだけ（名前一致で殺さない）。
 # 使い方: bash scripts/test-queue-priority-eta-1996.sh
@@ -214,13 +215,17 @@ for c in a b c; do
 fn main() {
     let ms: u64 = std::env::var("SLEEP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
     std::thread::sleep(std::time::Duration::from_millis(ms));
+    // 受け取った CARGO_TERM_PROGRESS_WHEN を記録する（wrapper が足したか = ⑧ の A/B）
+    if let Ok(probe) = std::env::var("PROGRESS_PROBE") {
+        let _ = std::fs::write(probe, std::env::var("CARGO_TERM_PROGRESS_WHEN").unwrap_or_default());
+    }
     println!("cargo:rerun-if-env-changed=SLEEP_SALT");
 }
 RS
   echo 'pub fn f() -> u32 { 1 }' > "$WS/$c/src/lib.rs"
 done
 # 1 回目（記録が無い）。stderr はファイル = 端末でない（AI の Bash ツールと同じ）
-(cd "$WS" && SLEEP_SALT=1 TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" queue cargo build >"$TMP/b1.out" 2>"$TMP/b1.err") &
+(cd "$WS" && SLEEP_SALT=1 PROGRESS_PROBE="$TMP/probe1" TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" queue cargo build >"$TMP/b1.out" 2>"$TMP/b1.err") &
 B1=$!
 BG_PIDS="$BG_PIDS $B1"
 saw_progress=""
@@ -243,6 +248,7 @@ else
 fi
 grep -q "Compiling sleep_a" "$TMP/b1.err" && grep -q "Finished" "$TMP/b1.err" && pass "普通の行（Compiling / Finished）は素通し" || fail "普通の行が欠けた: $(head -c 300 "$TMP/b1.err")"
 grep -q $'\r' "$TMP/b1.err" && fail "stderr に \\r が残った" || pass "進みの行の \\r も残らない"
+[ "$(cat "$TMP/probe1" 2>/dev/null)" = "always" ] && pass "子の cargo へ CARGO_TERM_PROGRESS_WHEN=always を足した" || fail "子が受け取った値: $(cat "$TMP/probe1" 2>/dev/null)"
 
 echo "== ⑤ 同じコマンドの 2 回目から終わりの見込み =="
 [ -s "$HIST" ] && pass "1 回目の記録が残った" || fail "記録が無い（${HIST}）"
@@ -321,6 +327,27 @@ print(n)' "$HIST")"
 [ "$bad" = "0" ] && pass "history.jsonl は読める行だけ" || fail "読めない行が $bad 行残った"
 mig="$(TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" migrate status --schema queue_history 2>&1)"
 [[ "$mig" == *"queue_history"* ]] && pass "tako migrate status に queue_history が載る" || fail "migrate status: $mig"
+
+echo "== ⑧ A/B: TAKO_1996_LEGACY=1 は従来の素通し =="
+(cd "$WS" && SLEEP_SALT=5 PROGRESS_PROBE="$TMP/probe8" TAKO_1996_LEGACY=1 TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" queue cargo build >"$TMP/b8.out" 2>"$TMP/b8.err") &
+B8=$!
+BG_PIDS="$BG_PIDS $B8"
+legacy_progress=""
+legacy_seen_running=""
+for i in $(seq 1 60); do
+  p="$(status_json | py 'import json,sys
+r=json.load(sys.stdin)["queue"]["running"]
+print(" ".join("running:%s" % json.dumps(x.get("progress")) for x in r))' 2>/dev/null)"
+  case "$p" in running:*) legacy_seen_running=1 ;; esac
+  case "$p" in *running:\{*) legacy_progress="$p" ;; esac
+  kill -0 "$B8" 2>/dev/null || break
+  sleep 0.3
+done
+wait "$B8"; rc8=$?
+[ "$rc8" -eq 0 ] && pass "LEGACY でもビルドは成功" || fail "LEGACY rc=${rc8}"
+[ -n "$legacy_seen_running" ] && [ -z "$legacy_progress" ] && pass "LEGACY では running[].progress が null のまま" || fail "LEGACY で progress: ${legacy_progress:-（実行中を観測できず）}"
+[ -z "$(cat "$TMP/probe8" 2>/dev/null)" ] && pass "LEGACY では CARGO_TERM_PROGRESS_WHEN を足さない" || fail "LEGACY で子が受け取った値: $(cat "$TMP/probe8")"
+grep -q "Finished" "$TMP/b8.err" && pass "LEGACY の stderr は cargo のまま（Finished まで）" || fail "LEGACY の stderr: $(head -c 300 "$TMP/b8.err")"
 
 stop_arbiter
 echo
