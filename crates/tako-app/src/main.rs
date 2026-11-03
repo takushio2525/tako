@@ -65832,7 +65832,7 @@ mod self_test {
                 let cwd_ok = wait_for_pty_state(
                     window496,
                     cx,
-                    "selftest-109-cwd",
+                    "conflict-cwd",
                     text_wait_budget(20, 300, 30),
                     |app, _| {
                         app.focused_session()
@@ -83907,13 +83907,20 @@ mod self_test {
                 );
 
                 // シェルのプロンプトを待ってから押す（スターターが出ている状態が起点。#1902。旧 40 回
-                // × 100ms。揃わなくても先へ進む = 押下の `armed` を含む後の検査が判定する）
+                // × 100ms。揃わなくても先へ進む = 押下の `armed` を含む後の検査が判定する）。
+                // 器つき（`tmux_backed`）のペインは押す前も「準備中」で覆われてスターターにならない
+                // （実測 `sequence=[Preparing]`）ので、プロンプトが画面に出たことでも揃ったと読む
                 let _ = wait_for_pty_state(
                     window,
                     cx,
                     "selftest-720-armed",
                     text_wait_budget(40, 100, 30),
-                    |app, _| app.pane_display_for(master_pane) == PaneDisplay::Starter,
+                    |app, _| {
+                        app.pane_display_for(master_pane) == PaneDisplay::Starter
+                            || app.terminals.get(&master_pane).is_some_and(|s| {
+                                s.visible_lines().iter().any(|l| !l.trim().is_empty())
+                            })
+                    },
                 )
                 .await;
                 let armed = window
@@ -86694,13 +86701,20 @@ mod self_test {
                     );
                     fail("#772: 検証用 tmux セッションを作れない");
                 }
-                // 偽 claude がシェルの子として見えるまで状態で待つ（#1902。旧 80 回 × 150ms = 12 秒）
+                // 偽 claude がシェルの子として見えるまで状態で待つ（#1902。旧 80 回 × 150ms = 12 秒）。
+                // 偽 claude は一過性なので、掴んだら覚えておく（注入で観測を遅らせても取りこぼさない）
+                let mut seen_claude = false;
                 let claude_up = wait_for_pty_state(
                     window,
                     cx,
                     "selftest-103-claude",
                     text_wait_budget(80, 150, 30),
-                    |_, _| tako_control::stale_binary::find_claude_pid_for_backend(&session).is_some(),
+                    |_, _| {
+                        seen_claude |=
+                            tako_control::stale_binary::find_claude_pid_for_backend(&session)
+                                .is_some();
+                        seen_claude
+                    },
                 )
                 .await;
                 check(claude_up, "103: 検証用の偽 claude がペイン内で見える (#772)");

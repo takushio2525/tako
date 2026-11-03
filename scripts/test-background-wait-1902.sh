@@ -20,7 +20,7 @@
 #   ② 観測の遅れ（TAKO_1902_INJECT=late。旧の窓 + 5 秒）でも同じ節が緑・診断行の waited が遅れ以上
 #   ③ A/B: ② を 1 項目に絞り + TAKO_1902_LEGACY=<項目>（旧の回数の窓）→ 結果を判定に使う待ちは
 #      その項目の検査が名指しで FAILED（= 修正前の予算は同じ遅れで落ちる）。揃わなければ SKIP する
-#      節（screen-lines の fixture・セルフテスト 109 / 104）は名指しの SKIPPED（= 検証が抜け落ちる）。注入は**観測だけ**を
+#      節（screen-lines の fixture・conflict-card の 109）は名指しの SKIPPED（= 検証が抜け落ちる）。注入は**観測だけ**を
 #      遅らせる（相手は前へ進む）ので、結果を判定に使わない待ち（診断の到着・preview-memory の
 #      描き切り・ime-preedit の mid・塗り直し）は旧の窓でも後段の検査が通る = 表に載せない
 #   ④ 塗りそのものの遅れ（製品側の TAKO_1890_INJECT=slow:<SLOW_MS>。旧の窓 80 回 × 50ms より長い）:
@@ -28,8 +28,12 @@
 #   ⑤ 塗りを捨てる注入（TAKO_1890_INJECT=drop）→ 上限まで待たずに outcome=Settled で FAILED
 #   ⑥ 検出力: TAKO_1902_INJECT=never:preview-maps は新の腕でも上限まで待って「平文 paint」で FAILED
 #   ⑦ セルフテスト（TAKO_SELF_TEST=1。全項目を回すので長い = 既定の STAGES に入れない）: 素の状態と、
-#      PDF の幾何・150% の再ラスタ・動画の末尾停止の 3 つと PTY の 22 の待ちへ観測の遅れを入れた状態で
-#      緑・どれも Landed（SELFTEST_ARMS="plain late" で腕を選ぶ。この環境で走らない項目は [--] で出す）。HOME は差し替えない（項目 1c「初期 cwd は
+#      PDF の幾何・150% の再ラスタ・動画の末尾停止の 3 つと PTY の 21 の待ちへ観測の遅れを入れた状態で
+#      緑・どれも Landed（SELFTEST_ARMS="plain late" で腕を選ぶ。この環境で走らない項目は [--] で出す）。
+#      103 の偽 claude（`tako mcp serve` のコピー）は隔離の環境で十数秒のうちに終わるので、観測を
+#      17 秒遅らせると後段の stale バナーの検査が相手を失う = 遅れの腕では注入しない（旧の窓の A/B は
+#      103 の検査そのもので落ちるので ⑧ で取れる）。104 は素の回でも新ペインが描かれず（drawn=0）
+#      後段を SKIP する環境があるので ⑧ の表に載せないHOME は差し替えない（項目 1c「初期 cwd は
 #      ホーム」と項目 14 の cargo が本物の HOME を要る。置き場は回ごとの TMPDIR の下）
 #   ⑧ ⑦ の A/B: 1 項目ずつ旧の窓 + 遅れ → その項目の検査が名指しで FAILED / SKIPPED（STAGES=8 で選ぶ。
 #      SELFTEST_LEGACY で項目を絞れる）。結果を判定に使わない待ち（selftest-osc-done・702-idle・
@@ -45,6 +49,7 @@
 #
 # 使い方: TAKO_ISO_PROFILE=debug|release bash scripts/test-background-wait-1902.sh
 #   STAGES="1 2 3 4 5 6"（既定。⑦ ⑧ のセルフテストは STAGES="7 8"、⑨ の全節実行は STAGES=9 で足す）で段を選ぶ。
+#   KEEP_LOG_DIR=<dir> を付けると回ごとの GUI のログをそこへ写す（一時 dir は終わりに消えるので）。
 #   SECTIONS で ①〜③ の節を絞る。SLOW_MS（既定 12000）= ④ の塗りの遅れ
 set -uo pipefail
 
@@ -54,9 +59,9 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SLOW_MS="${SLOW_MS:-12000}"
 STAGES="${STAGES:-1 2 3 4 5 6}"
-# ①〜③ で回す節。8 節は 2 回目の移送（background の残りと画面の静止）、後ろの 2 節は 3 回目（PTY。
+# ①〜③ で回す節。8 節は 2 回目の移送（background の残りと画面の静止）、後ろの 3 節は 3 回目（PTY。
 # screen-lines も PTY の待ち screen-seed を持つ）
-SECTIONS="${SECTIONS:-ino-highlight tasks-tick task-attachment tasks-input preview-code external-change md-edit-resume md-find-restore syntax-alias screen-lines ime-preedit preview-memory terminal-grid tree-move}"
+SECTIONS="${SECTIONS:-ino-highlight tasks-tick task-attachment tasks-input preview-code external-change md-edit-resume md-find-restore syntax-alias screen-lines ime-preedit preview-memory terminal-grid tree-move conflict-card}"
 PASS=0
 FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
@@ -70,6 +75,11 @@ cleanup() {
   rm -rf "${TMP:?}"
 }
 trap cleanup EXIT
+# 回のログを残す（KEEP_LOG_DIR が空なら何もしない）
+keep_log() { # ログ
+  [ -n "${KEEP_LOG_DIR:-}" ] || return 0
+  mkdir -p "$KEEP_LOG_DIR" && command cp -f "$1" "$KEEP_LOG_DIR/"
+}
 
 # shellcheck source=lib/isolated-gui.sh
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
@@ -93,6 +103,9 @@ esac
 section_env() { # 節 → その節にだけ付ける env（空可）
   case "$1" in
     preview-code | all) echo "TAKO_LSP_AUTOSTART=1" ;;
+    # ツリーの行が窓に収まる寸法と器なし（専用の scripts/test-tree-move-1834.sh と同じ前提。既定の
+    # 寸法では「日本 語」の行・リモートの行が窓の外になり ⑧ / ⑩ が落ちる）
+    tree-move) echo "TAKO_WINDOW_BOUNDS=0,0,1400,900 TAKO_PERSIST=0" ;;
   esac
 }
 
@@ -135,6 +148,7 @@ run_section() { # ログ 節（all = 全節実行）追加の env…
     sleep 0.1
   done
   stop_isolated_gui "$pid"
+  keep_log "$log"
   grep -E "TAKO_SELF_TEST_1902|TAKO_SELF_TEST_STATE_TIMEOUT|TAKO_APP_SELF_TEST_FAILED" "$log" \
     | cut -c1-200 | sed 's/^/    /'
   grep -q "TAKO_VISUAL_TEST_OK" "$log"
@@ -176,6 +190,7 @@ items_of() {
     preview-memory) echo "preview-settle" ;;
     terminal-grid) echo "grid-fixture" ;;
     tree-move) echo "tree-move-drop" ;;
+    conflict-card) echo "conflict-cwd" ;;
   esac
 }
 
@@ -263,6 +278,7 @@ ime-preedit|ime-quiet|画面が静止しない
 screen-lines|screen-seed|SKIP:fixture が画面に出ない
 terminal-grid|grid-fixture|fixture 12 行が画面に出る (#787)
 tree-move|tree-move-drop|ターミナルの中央へ落とすとパスが入る
+conflict-card|conflict-cwd|SKIP:109（ペインの cwd が使い捨てリポへ移らない）
 EOF
 fi
 
@@ -333,6 +349,7 @@ run_selftest() { # ログ 追加の env…
     sleep 0.1
   done
   stop_isolated_gui "$pid"
+  keep_log "$log"
   # セルフテストのログは多バイトの途中で切れた行を含みうるので、バイトで切る（cut が止まらない）
   grep -E "TAKO_SELF_TEST_1902: item=selftest-|TAKO_SELF_TEST_STATE_TIMEOUT|TAKO_APP_SELF_TEST_FAILED|TAKO_APP_SELF_TEST_OK" "$log" \
     | LC_ALL=C cut -c1-200 | sed 's/^/    /'
@@ -340,7 +357,7 @@ run_selftest() { # ログ 追加の env…
 }
 SELFTEST_ITEMS="selftest-pdf-geometry selftest-pdf-zoom selftest-video-end"
 # 3 回目の移送（PTY）の待ち。セルフテストの並びの順
-SELFTEST_PTY_ITEMS="selftest-109-cwd selftest-ansi-red selftest-fd selftest-osc-running selftest-osc-done \
+SELFTEST_PTY_ITEMS="selftest-ansi-red selftest-fd selftest-osc-running selftest-osc-done \
 selftest-osc-failed selftest-wide-click selftest-multiroot selftest-issue64 selftest-link-screen \
 selftest-close-markers selftest-close-registry selftest-starter-ran selftest-702-idle \
 selftest-720-starter selftest-720-armed selftest-739-delivered selftest-103-claude selftest-104-tab \
@@ -355,7 +372,8 @@ if has_stage 7; then
     log="$TMP/selftest-$ARM.log"
     if [ "$ARM" = late ]; then
       echo "⑦ セルフテスト: 3 つの待ちへ観測の遅れを入れても緑（${PROFILE}）"
-      run_selftest "$log" TAKO_1902_INJECT="late:$(echo $SELFTEST_ITEMS $SELFTEST_PTY_ITEMS | tr ' ' ',')"
+      run_selftest "$log" TAKO_1902_INJECT="late:$(echo $SELFTEST_ITEMS $SELFTEST_PTY_ITEMS | tr ' ' '\n' \
+        | grep -vxF selftest-103-claude | tr '\n' ',')"
     else
       echo "⑦ セルフテスト: 素の状態で緑（${PROFILE}）"
       run_selftest "$log"
@@ -370,7 +388,13 @@ if has_stage 7; then
         echo "  [--] $I はこの回で走らなかった（この環境で SKIP される項目か、手前で落ちた）"
         continue
       fi
-      if [ "$ARM" = late ]; then
+      # 104 は新ペインが描かれない環境では揃わず、後段のマーカー検査を SKIP する（修正前と同じ分岐）
+      if [ "$I" = selftest-104-tab ] && ! all_landed "$log" "$I" \
+        && grep -q "TAKO_SELF_TEST_SKIPPED: 104 のマーカー検査" "$log"; then
+        echo "  [--] $I は揃わず後段を SKIP した（この環境では新ペインが描かれない = 修正前と同じ分岐）"
+        continue
+      fi
+      if [ "$ARM" = late ] && [ "$I" != selftest-103-claude ]; then
         if all_landed "$log" "$I" && waited_at_least "$log" "$I" 5; then
           pass "$I は遅れ以上待って揃った（waited=$(diag_field "$log" "$I" waited) inject=$(diag_field "$log" "$I" inject)）"
         else
@@ -398,7 +422,6 @@ if has_stage 8; then
 selftest-pdf-geometry|PDFKit アウトライン一覧と 2 ページ目ジャンプ
 selftest-pdf-zoom|PDF 150% の再ラスタライズ後も文字座標が画像へ追従する
 selftest-video-end|末尾で自動停止し、再生ボタンで先頭から再開する
-selftest-109-cwd|SKIP:109（ペインの cwd が使い捨てリポへ移らない）
 selftest-ansi-red|ANSI 赤の解決
 selftest-fd|split/close で fd が漏れない
 selftest-osc-running|実行中コマンドが running
@@ -413,7 +436,6 @@ selftest-starter-ran|スターターが組む行は実シェルで実際に実�
 selftest-720-starter|新規ペインは準備中 → スターターで、生ターミナルを一度も見せない (#720)
 selftest-739-delivered|▾ から選んだプロファイルで `tako master -<name>` が届き、選択後は閉じる (#739)
 selftest-103-claude|103: 検証用の偽 claude がペイン内で見える (#772)
-selftest-104-tab|SKIP:104 のマーカー検査
 selftest-105-alt|105: worker が busy な全画面状態になる (#778)
 selftest-813-screen|#813: idle 型 fixture が画面に出ない
 EOF
