@@ -59414,10 +59414,16 @@ mod self_test {
                 .collect(),
         );
         if ext == VLINES_FIXTURE_EXT {
+            // 問う口は製品と同じ `LspManager::resolve`（#2113）
+            let claimed = window
+                .update(cx, |app, _, _| {
+                    [&long, &one, &short, &wrapped]
+                        .iter()
+                        .any(|path| app.lsp.resolve(path).is_some())
+                })
+                .unwrap_or(true);
             check(
-                [&long, &one, &short, &wrapped]
-                    .iter()
-                    .all(|path| tako_core::lsp::servers::resolve(path).is_none()),
+                !claimed,
                 "visual-test viewport-lines: fixture を受け持つ言語サーバが無い (#2714)",
             );
         }

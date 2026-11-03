@@ -138,9 +138,11 @@ green() {
 
 # 落ちる腕: 緑にならず、FAILED の行に $2（名指しの文）が入っている
 named_fail() {
+  local failed
+  failed=$(grep "TAKO_APP_SELF_TEST_FAILED" "$LOG")
   if grep -q "TAKO_VISUAL_TEST_OK" "$LOG"; then
     fail "$1: 緑になった（落ちるはずの腕。検出力が無い）"
-  elif grep "TAKO_APP_SELF_TEST_FAILED" "$LOG" | grep -q -- "$2"; then
+  elif [[ "$failed" == *"$2"* ]]; then
     pass "$1: 名指しで落ちる（$2）"
   else
     fail "$1: 名指しの文「$2」が FAILED の行に無い"
