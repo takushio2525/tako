@@ -1253,6 +1253,7 @@ tako panel --view diagnostics    # diagnostics = 言語サーバの診断（LSP 
 tako panel --view references     # references = 参照・呼び出し階層・型階層の結果（ふだんは結果があるときだけタブが出る）
 tako panel --view search         # search = ワークスペース横断検索（⇧⌘F と同じ。ふだんは結果があるときだけタブが出る）
 tako panel --view usage          # usage = 利用制限の使い道（ステータスバーの 5h / 7d と同じ。ふだんは開いたときだけタブが出る）
+tako panel --view resources      # resources = PC の負荷（tako queue と同じ数値。ステータスバーのメモリの区画と同じ。ふだんは開いたときだけタブが出る）
 tako panel --hide
 tako panel --filetree on         # 左のファイルツリー
 tako panel --width 360
@@ -1911,6 +1912,9 @@ tako check-health --json     # 生の JSON（`diagnostics` に項目・状態・
 
 tako queue                   # PC のメモリ（使用・圧縮・空き）・swap・メモリ圧・CPU% と、重い処理がどのペインで動いているか
                              # （順番待ちの実行中・待ち・上限・待ちごとの理由も。メモリの逼迫で起動を待っている agent も）
+                             # 同じ数値は画面の右パネルの resources ビュー（ステータスバーのメモリの区画を押す /
+                             # tako panel --view resources）にも出る。行を押すとそのペインへ移り、段のチップと取り消しは
+                             # 下の priority / cancel と同じ操作（取り消しは確かめてから）
 tako queue --json            # 生の JSON（tako が起動していなければ機の状態だけを返す）
 tako queue cargo build       # 重い処理を順番待ちで走らせる（同時数・空きメモリ・メモリ圧で割り当て。
                              # 終了コードはコマンドのまま。tako が起動していなければ待たずに走る）

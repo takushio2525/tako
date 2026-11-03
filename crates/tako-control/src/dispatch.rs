@@ -7046,6 +7046,10 @@ pub enum OffloadJob {
         query: crate::usage::UsageQuery,
         shown: bool,
     },
+    /// 順番待ちの状況・取り消し・受付番号の優先度（#1995）。GUI の resources ビューが `dispatch_off_ui` で
+    /// 投げた要求を、IPC / MCP と同じ口（`queue::answer` = `ipc::submit` が手前で答える関数）で答える。
+    /// status は覚えが古ければ走査する（1 回 wall 11〜24 ms）ので UI スレッドで答えない
+    Queue(Box<Request>),
     /// tmux 一覧（#1984）。UI スレッドでは tako のペインとの対応表だけを写し、
     /// `tmux list-sessions` ほか（ソケットごとに数本）は background で起こす
     TmuxList {
@@ -8084,6 +8088,12 @@ pub fn prepare_offload(
         Request::Sessions { action, .. } if action == "usage" => {
             Some(Ok(OffloadJob::UsageSummary(usage_query(request))))
         }
+        // #1995: GUI の resources ビューの順番待ちの要求（状況・取り消し・受付番号の優先度）は、CLI / MCP と
+        // 同じ口（`queue::answer`）を background で通す。IPC / MCP の要求は `ipc::submit` が手前で答えるので
+        // ここへは来ない。ペインの優先度の既定（`queue::needs_ui`）はペインの模型を書くので UI の dispatch へ
+        queued @ Request::Queue { .. } if !crate::queue::needs_ui(queued) => {
+            Some(Ok(OffloadJob::Queue(Box::new(queued.clone()))))
+        }
         Request::TmuxList { socket } if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::TmuxList {
                 ctx: collect_tmux_context(host),
@@ -8346,6 +8356,8 @@ impl OffloadJob {
                 crate::usage::Refresh::Budget(crate::usage::MCP_REFRESH_BUDGET),
             )
             .map_err(DispatchError::Operation),
+            // #1995: `ipc::submit` が手前で答えるのと同じ関数（接続のスレッドの代わりに background）
+            OffloadJob::Queue(request) => crate::queue::answer(&request),
             OffloadJob::UsageShow { query, shown } => crate::usage::usage_payload(
                 &query,
                 crate::usage::Refresh::Budget(crate::usage::MCP_REFRESH_BUDGET),
@@ -11085,6 +11097,8 @@ fn dispatch_inner(
                 "show_hidden": host.filetree_show_hidden(),
                 // #2203: usage ビューで開いている段（画面の無い host・まだ開いていなければ null）
                 "usage": host.usage_view_state(),
+                // #1995: resources ビューが描いている答え（画面の無い host・まだ開いていなければ null）
+                "resources": host.resources_view_state(),
             }))
         }
 

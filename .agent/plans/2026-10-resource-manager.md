@@ -460,6 +460,24 @@ S2 の「先頭が入れなければ後ろも待つ」は、先頭が**同じ ta
 - UI は**スナップショットを読むだけ**（§2.2）。行を押したら該当ペインへフォーカス（dispatch の `Focus`）
 - `tako check-health` には足さない（環境の健全性 = IPC の受け口・PATH・tmux の診断で、時々刻々の負荷とは別の軸）
 
+### 7.1 S3（#1995）の実装で決めたこと
+
+上の表のとおりに入れたうえで、実装の途中で決めた差分と細部（正は FR-2.43.15 とコード）:
+
+| 項目 | 決めたこと | 理由 |
+|---|---|---|
+| 読みの経路 | **見ている間**（2 秒ごと）は CLI と同じ `Request::Queue { action: "status" }` を `dispatch_off_ui` で投げる（`prepare_offload` → background の `OffloadJob::Queue` → `queue::answer` = `ipc::submit` が手前で答えるのと同じ関数）。**見ていない間**（ステータスバーの区画）は background で覚えだけ（`with_section(cached_status())` = dispatch の同期の腕と同じ）を読み、区画の値が変わったときだけ描き直す | 見ていない間も status を投げると `WANTED_FOR` で走査が 2 秒ごとに保たれ、「誰も見ていなければ 30 秒」（§2.2・S1 の実測）が崩れる。覚えの読みも調停役の錠・設定の mtime・札の数えがあるので UI スレッドで読まない（番犬 `issue1993_resources_ui_thread_watchdog` の 8 番） |
+| 誰の欄 | status の `queue.running[]` / `waiting[]` に `tab` / `title` / `role` / `pane_priority` を足した（`resources::pane_owner_fields`。ペインの外の処理は足さない） | 画面だけがペインの模型を引くと CLI / MCP と答えがずれる。錠の順は調停役 → ペインの一覧（`Job::base_priority` と同じ向き） |
+| 操作の口 | 行 = dispatch の `Focus`（`tako focus`）、取り消し = `Request::Queue { action: "cancel", id }`、優先度 = `Request::Queue { action: "priority", id \| pane }`。どれも `dispatch_off_ui` を通るので、受付番号の操作は background の `queue::answer`、ペインの既定（`queue::needs_ui`）は UI スレッドの dispatch（`queue_pane_priority`）が受ける = **IPC と同じ振り分け** | 3 経路（CLI / MCP / GUI）が同じ関数に着く。GUI だけの分岐を持たない |
+| 取り消しの確かめ | 行の中に確かめの枠（「取り消す」「やめる」）を開く。ダイアログは出さない。確かめ中の行が答えから消えたら畳む | 受付番号 = wrapper の pid で使い回されうる。確かめの間に終わった処理の番号を別の処理に当てない |
+| 優先度のチップ | 行の段のチップを押すと行の中に「この処理」と「ペイン N の既定」の 2 列（top / high / normal / low / default）を開く。選んでいる段は処理に付けた段 / ペインの既定（無ければ default） | #1996 の 2 つの口（受付番号・ペイン）をそのまま並べる。走っている処理の段を変えたときは「走っている処理は止めない」を添える |
+| 見込みの文 | status の `eta` の欄（`state` / `remaining_s` / `previous_s` / `from`）と `start_s` から表示言語で組む（残りと開始の見込みは `eta::Eta::text` / `start_text` と同じ言い方・丸め。数値の区切りは単体テストで CLI との一致を縛る）。経過は同じ行の数値に出すので、見込みの文では繰り返さない（「見込みなし」「前回より長くかかっている（前回 N 分）」） | `eta.text` は日本語の 1 文だけなので、英語表示では欄から組む。隔離 GUI の 1 回目で「経過 7 秒 · 経過 7 秒（見込みなし）」と二重に出た |
+| 待つ理由 | 日本語は調停役の 1 文（`text` = CLI と同じ。数値の内訳つき）、英語は理由の種類（`reason`）からの短い文 | 理由の型は tako-core にあり、日本語の文は CLI と同じ 1 実装 |
+| タブ | 条件つき（このビューを選んでいるか、このセッションで開いたとき）。最小幅 264 → **288px**（9 本 + 3 桁のバッジがアイコンだけの段で 270.5px） | 常設 4 本の画面を変えない（#1694 / #2203 と同じ） |
+| 入口 | ステータスバーの区画・表示メニューの「パネル」の「resources ビュー」（`ShowResourcesPanel`）・パレット `panel-resources`・`tako panel --view resources`（MCP `tako_panel` の `view`）。応答の `resources` に描いている行の受付番号・確かめ中の取り消し・開いている段 | #2341 の「ビューはメニューとパレットの両方」。応答で AI が画面の状態を読める |
+| 区画の配置と色 | ctx メーターの左。バー 48px + 使用率。色は normal = accent / warn = 黄 / critical = 赤（文字も warn 以上は同じ色）。件数は実行中・待ちが 1 件以上のときだけ「実行 N · 待ち M」 | §7 の表のとおり。普段の画面に増える幅を小さくする |
+| Windows | 機の値が無ければビューの ① と ④ に「未対応」、区画は「メモリ 未対応」。順番待ちの ② ③ は出す（調停役は OS に依らない） | §10。値を作らない（過大にも過小にも申告しない） |
+
 ## 8. CLI / MCP（論点 7）
 
 ### 8.1 CLI
@@ -652,7 +670,7 @@ MCP の子が起きない構成:                          1.1s 2 本 353 MB → 
 |---|---|---|---|---|
 | S1 | #1993 | 計測の土台（B29・背景の採取・分類・帰属）と読み取り口（`tako queue` の状況 / MCP `tako_queue` の `status`） | なし | M |
 | S2 | #1994 | 順番待ち本体（`tako queue <cmd>`・調停役・割り当ての条件・再起動をまたぐ・fail-open・取り分）+ この repo の入口の採用（✅ 実装の差分は §4.7） | S1 | L |
-| S3 | #1995 | 右パネルの `resources` ビューとステータスバーの 1 区画 | S1（待ち行列の欄は S2） | M |
+| S3 | #1995 | 右パネルの `resources` ビューとステータスバーの 1 区画（✅ #1996 の GUI のチップも。実装の差分は §7.1） | S1（待ち行列の欄は S2） | M |
 | S4 | #1996 | 優先度（4 段・変更・エイジング）と終わりの見込み（`N/M`・過去の所要時間）（✅ dispatch + CLI / MCP まで。GUI のチップは S3。実装の差分は §4.10） | S2 | M |
 | S5 | #1997 | AI の運用（spawn の `machine` / `advice`・guide・fleet の列・agent 能力マトリクスの 1 行・一括復帰の実測） | S2 | M |
 | S6 | #1998 | cargo の全体並列の上限（共有 jobserver の注入と札の数え直し）（✅ 実装の差分は §9.7） | S1 | M |

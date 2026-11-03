@@ -214,6 +214,22 @@ pub fn pane_queue_info(pane: u64) -> Option<(Option<String>, Option<tako_core::q
         .map(|e| (e.role.clone(), e.queue_priority))
 }
 
+/// ペインの「誰」の欄（タブ・ペイン名・役割・優先度の既定。#1995）。順番待ちの status が実行中と待ちの
+/// 行へ足す（resources ビュー・`tako queue --json` が同じ答えを読む）。**採らない**（一覧の覚えを読むだけ）。
+/// 一覧に無いペイン（GUI 無しの調停役・別の tako の番号）は空の object
+pub fn pane_owner_fields(pane: u64) -> Value {
+    let p = lock(published());
+    match p.panes.iter().find(|e| e.pane == pane) {
+        Some(e) => json!({
+            "tab": e.tab_title,
+            "title": e.title,
+            "role": e.role,
+            "pane_priority": e.queue_priority.map(tako_core::queue::Priority::as_str),
+        }),
+        None => json!({}),
+    }
+}
+
 /// ペインの優先度の既定を一覧の覚えへすぐ写す（#1996。dispatch がペインに付けた直後。
 /// 次の 2 秒 tick の受け渡しを待たずに待ちの並びへ効かせる。一覧に無ければ何もしない）
 pub fn set_pane_queue_priority(pane: u64, priority: Option<tako_core::queue::Priority>) {

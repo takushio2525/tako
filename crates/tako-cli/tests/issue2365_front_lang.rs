@@ -338,7 +338,7 @@ fn cases() -> Vec<Case> {
             "tako_panel",
             r#"{"view":"bogus"}"#,
             "view が不正: bogus（fleet | orch | git | tasks | diagnostics | references | search | \
-             usage。tmux は fleet の旧称）",
+             usage | resources。tmux は fleet の旧称）",
         ),
         mcp(
             "queue_limits",
