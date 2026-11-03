@@ -50,7 +50,11 @@ trap cleanup EXIT
 
 # 返らない子。**自分の argv に $SANDBOX を持ったまま**眠る（`exec sleep` にすると argv が
 # `sleep N` へ化けて「打ち切った子が残っていないか」の検査が空振りする = #1503 と同じ作法）
-printf '#!/bin/sh\nwhile :; do /bin/sleep 1; done\n' > "$SANDBOX/hang"; chmod +x "$SANDBOX/hang"
+# スタブは作った時点で空打ちし、macOS の初回 exec の検査を tako の上限（tailscale 10 秒ほか）の外で
+# 済ませる（#2222 / #2228。作り直すたび = 新しいファイルなので、書くたびに掛ける）
+# shellcheck source=lib/fake-exec.sh
+. "$ROOT/scripts/lib/fake-exec.sh"
+printf '#!/bin/sh\nwhile :; do /bin/sleep 1; done\n' > "$SANDBOX/hang"; fake_exec_warm "$SANDBOX/hang"
 
 # --- スタブ ------------------------------------------------------------------
 # tailscale スタブ。$1 = 置き場 / $2 = 振る舞い
@@ -81,7 +85,7 @@ esac
 exit 0
 EOF
   } > "$dest"
-  chmod +x "$dest"
+  fake_exec_warm "$dest"
 }
 
 # mkenv <tailscale の振る舞い: none|needslogin|…> <brew: installs|noop|none>
@@ -110,16 +114,21 @@ EOF
     none) : ;;                                                                  # brew 自体が無い
   esac
   [ "$1" = "none" ] || write_tailscale "$BIN/tailscale" "$1"
-  chmod +x "$BIN"/* 2>/dev/null
+  fake_exec_warm "$BIN"/*
 }
 # brew スタブから呼ぶための書き出し口（関数は子プロセスから呼べないので実体を作る）
+# brew スタブは tako の `env -i` の下で呼ぶので、空打ちの補助と A/B・注入の値も焼き込む（#2228。
+# brew が入れた tailscale も、入れた時点で空打ちしてから tako の再検出（上限 10 秒）に読ませる）
 {
   echo '#!/bin/bash'
   echo "SANDBOX='$SANDBOX'"
-  declare -f write_tailscale
+  echo "FAKE_EXEC_WARM_ARG='$FAKE_EXEC_WARM_ARG'"
+  echo "TAKO_2222_LEGACY='${TAKO_2222_LEGACY:-}'"
+  echo "TAKO_2222_INJECT_FIRST_EXEC_MS='${TAKO_2222_INJECT_FIRST_EXEC_MS:-}'"
+  declare -f _fake_exec_insert fake_exec_warm write_tailscale
   echo 'write_tailscale "$1" "$2"'
 } > "$SANDBOX/write-ts"
-chmod +x "$SANDBOX/write-ts"
+fake_exec_warm "$SANDBOX/write-ts"
 
 # 隔離した tako setup を**外側の締め切りつき**で走らせる（締め切りで殺されたら「固まった」）。
 # 結果はグローバルへ置く（`$( )` の副シェルだと所要も締め切りの成否も捨てられる）

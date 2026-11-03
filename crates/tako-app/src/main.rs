@@ -37399,6 +37399,29 @@ mod self_test {
         }
     }
 
+    /// 節が使う偽の実行ファイル（スタブ）を書き、実行権を付けて 1 回空打ちする（#2222 / #2228）。
+    ///
+    /// macOS は新しいファイルの初回の exec に検査を挟み、検査はシステム全体で 1 本ずつ進む（他のビルドと
+    /// 重なると数秒）。作りたてのスタブを節の時計（`wait_for_focused_text` の 20 秒ほか）の内側で初めて
+    /// 起こすと、その検査を時計の中で払う。書く口は `tako_core::fake_exec::write_script` の 1 実装で、
+    /// 空打ちは background で待つ（UI スレッドを止めない）。A/B（`TAKO_2222_LEGACY=1`）と注入
+    /// （`TAKO_2222_INJECT_FIRST_EXEC_MS`）もそちらの規則のまま。書けなければ `false`（呼び手が check で名指す）。
+    /// 節の中で実行権を直に付ける形は番犬 `issue2228_cargo_bin_first_exec_watchdog` が file:line で名指す
+    pub(crate) async fn write_fake_exec(
+        cx: &mut AsyncApp,
+        path: &std::path::Path,
+        text: &str,
+    ) -> bool {
+        let path = path.to_path_buf();
+        let text = text.to_string();
+        cx.background_executor()
+            .spawn(async move {
+                std::panic::catch_unwind(|| tako_core::fake_exec::write_script(&path, &text))
+                    .is_ok()
+            })
+            .await
+    }
+
     /// #2704 の A/B（`TAKO_2704_LEGACY=1`）: 節の一時 dir を修正前の固定名（`tako-osc-e2e`・`tako-st915-<a|b|x>`）で
     /// 作り、`remove_on_fail` の登録を終了の後片付けへ載せない（= 成功・SIGTERM の出口で残る修正前の形）
     fn legacy_2704() -> bool {
@@ -69160,15 +69183,13 @@ mod self_test {
                     "PROMPT=\"ST601${TAKO601_PHASE}> \"\n",
                 )
                 .expect(".zshrc を置ける");
-                // ユーザーが自分で PATH に置いた tako（別実体）を模す
+                // ユーザーが自分で PATH に置いた tako（別実体）を模す。B の 20 秒の窓の中で初めて
+                // exec しないよう、書いた時点で空打ちする（#2228）
                 let user_cli = iso.join("bin/tako");
-                std::fs::write(&user_cli, "#!/bin/sh\necho TAKO601-user\n").expect("置ける");
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    std::fs::set_permissions(&user_cli, std::fs::Permissions::from_mode(0o755))
-                        .expect("実行権を付けられる");
-                }
+                check(
+                    write_fake_exec(cx, &user_cli, "#!/bin/sh\necho TAKO601-user\n").await,
+                    "ユーザーの tako を模すスタブを書ける",
+                );
                 let rc_before = std::fs::read(&zshrc).expect("読める");
 
                 // A. PATH に tako が無い（zip 配布相当）→ 同梱 CLI が引ける

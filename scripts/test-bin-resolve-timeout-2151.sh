@@ -59,6 +59,8 @@ trap cleanup EXIT
 
 # shellcheck source=lib/queue.sh
 . "$REPO_ROOT/scripts/lib/queue.sh"
+# shellcheck source=lib/fake-exec.sh
+. "$REPO_ROOT/scripts/lib/fake-exec.sh"
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
   (cd "$REPO_ROOT" && run_heavy cargo build -q -p tako-cli) || exit 1
 fi
@@ -81,7 +83,7 @@ for where in pathbin shellbin; do
 echo "$where \$*" >> "$LOG"
 exec "$REAL_GIT" "\$@"
 EOF
-  chmod +x "$TMP/$where/git"
+  fake_exec_warm "$TMP/$where/git"
 done
 # `--version` だけ戻らない git（PATH の段が固まるラッパー）。眠る本人の pid を残す
 cat > "$TMP/hangbin/git" <<EOF
@@ -93,7 +95,7 @@ fi
 echo "hangbin \$*" >> "$LOG"
 exec "$REAL_GIT" "\$@"
 EOF
-chmod +x "$TMP/hangbin/git"
+fake_exec_warm "$TMP/hangbin/git"
 # 戻らないログインシェル（呼ばれたことと眠る本人の pid を残す）
 cat > "$TMP/hang-shell" <<EOF
 #!/bin/sh
@@ -107,7 +109,10 @@ cat > "$TMP/answer-shell" <<EOF
 echo "answer \$*" >> "$CALLS"
 echo "$TMP/shellbin/git"
 EOF
-chmod +x "$TMP/hang-shell" "$TMP/answer-shell"
+# 作りたてのスタブは初回の起動だけ遅い（macOS の初回 exec の検査。実測: 1 回目 1.15 秒 → 2 回目から
+# 0.06 秒）。答えるログインシェルと PATH の git は上限（2 / 5 秒）の中で答えさせるので、作った時点で
+# 空打ちして検査を腕の外で済ませる（#2222 / #2228。空打ちは本文を走らせない = 記録も残らない）
+fake_exec_warm "$TMP/hang-shell" "$TMP/answer-shell"
 
 now() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
 count() { if [ -f "$1" ]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
@@ -149,13 +154,6 @@ returned_near() {
 # 空打ち: ビルドし直した CLI の初回の起動（ページイン等）を測りに混ぜない（混雑した機では
 # 初回だけ数分かかった実例がある。解決そのものは persist.log の時刻で 2 秒だった）
 env -i HOME="$TMP/home" PATH="$TMP/empty" "$TAKO_BIN" --version >/dev/null 2>&1
-# 作ったばかりのスタブも初回の起動だけ遅い（実測: 1 回目 1.15 秒 → 2 回目から 0.06 秒）。
-# 先に走る修正後の腕だけがそれを被らないよう、1 回ずつ起こしておく（記録は腕ごとに消える）
-for stub in "$TMP/pathbin/git" "$TMP/shellbin/git" "$TMP/hangbin/git" "$TMP/answer-shell"; do
-  "$stub" rev-parse --git-dir >/dev/null 2>&1
-done
-# 戻らないシェルは 1 秒で切る（`exec` で眠る本人に alarm が残る = 孫を残さない）
-{ ( /usr/bin/perl -e 'alarm 1; exec @ARGV' "$TMP/hang-shell" ) >/dev/null 2>&1; } 2>/dev/null
 echo "    load: $(sysctl -n vm.loadavg 2>/dev/null)"
 
 echo "== H1: 戻らないログインシェル（PATH に git 無し・既知の場所は注入で飛ばす）"

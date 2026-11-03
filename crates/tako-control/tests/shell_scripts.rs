@@ -5237,3 +5237,410 @@ fn 番犬は器を落としてソケットファイルを残す形をfile_line�
     .1
     .is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// #2228: テストのスタブに素の chmod で実行権を付けない（空打ちの補助 `fake_exec_warm` を通す）
+// ---------------------------------------------------------------------------
+
+/// 空打ちの補助の 1 実装（中で `chmod +x` を使う = 数えない）
+const FAKE_EXEC_LIB: &str = "scripts/lib/fake-exec.sh";
+/// 監査済みの例外宣言 `# tako:chmod-ok <理由>`（その行か直前の行。理由の無い宣言は無効）
+const CHMOD_OK_MARKER: &str = "tako:chmod-ok";
+
+/// 素の chmod で実行権を付ける箇所の、#2228 の時点の数（テストのスクリプトごと）。
+///
+/// **増やさない**（減らすのは自由。0 になったら行ごと消す）。新しいスクリプト・既存のスクリプトに
+/// 足すスタブは `fake_exec_warm`（`scripts/lib/fake-exec.sh`）で書く。ここに載っているのは
+/// #2222 / #2228 の棚卸しで「上限の無い待ち・打ち切りだけを見る・ディレクトリの権限の戻し」と
+/// 仕分けたものを含む既存分で、1 本ずつ直す義務は無い（`.agent/conventions.md` の #2222 の節）
+const RAW_CHMOD_EXEC_FROZEN: &[(&str, usize)] = &[
+    ("scripts/test-agent-scan-mod-2017.sh", 3),
+    ("scripts/test-background-drawer-1946.sh", 1),
+    ("scripts/test-bundle-install.sh", 1),
+    ("scripts/test-bundle-privacy-1848.sh", 2),
+    ("scripts/test-changelog-expand-2150.sh", 1),
+    ("scripts/test-changelog-offload-2014.sh", 1),
+    ("scripts/test-check-health-mod-1891.sh", 1),
+    ("scripts/test-check-health-parallel-1622.sh", 2),
+    ("scripts/test-ci-change-scope-2084.sh", 2),
+    ("scripts/test-close-record-offload-2657.sh", 1),
+    ("scripts/test-external-change-1833.sh", 1),
+    ("scripts/test-first-run-1510.sh", 3),
+    ("scripts/test-gen-docs-bin-1548.sh", 1),
+    ("scripts/test-ipc-timeout-2123.sh", 1),
+    ("scripts/test-isolated-gui-defaults-1970.sh", 1),
+    ("scripts/test-isolated-gui-user-rc-2627.sh", 1),
+    ("scripts/test-launch-gate-2413.sh", 1),
+    ("scripts/test-launch-services.sh", 1),
+    ("scripts/test-launch-wait-band-2425.sh", 1),
+    ("scripts/test-ledger-primary-issue-2199.sh", 1),
+    ("scripts/test-limit-resume-restart-1710.sh", 1),
+    ("scripts/test-lsp-fetch-1944.sh", 2),
+    ("scripts/test-lsp-followup-1769.sh", 1),
+    ("scripts/test-lsp-servers-1956.sh", 1),
+    ("scripts/test-master-tab-title-2120.sh", 2),
+    ("scripts/test-measure-vd-sleep-2313.sh", 1),
+    ("scripts/test-mod-band-buttons-1962.sh", 1),
+    ("scripts/test-mod-card-click-2159.sh", 2),
+    ("scripts/test-mod-chat-1964.sh", 2),
+    ("scripts/test-mod-command-cards-1963.sh", 2),
+    ("scripts/test-mod-skills-1959.sh", 4),
+    ("scripts/test-mod-ui-1960.sh", 1),
+    ("scripts/test-nightly-follow-main-2264.sh", 3),
+    ("scripts/test-nightly-footprint-watch-2023.sh", 9),
+    ("scripts/test-nightly-mod-check-1892.sh", 7),
+    ("scripts/test-nightly-queue-path-2119.sh", 2),
+    ("scripts/test-nightly-reserve.sh", 3),
+    ("scripts/test-nightly-restore-main-2262.sh", 4),
+    ("scripts/test-nightly-role-2252.sh", 3),
+    ("scripts/test-nofile-limit-2359.sh", 1),
+    ("scripts/test-orchestrator-offload-2646.sh", 1),
+    ("scripts/test-orchestrator-run-stdio-1745.sh", 1),
+    ("scripts/test-paste-guard-2050.sh", 1),
+    ("scripts/test-preview-reveal-2247.sh", 1),
+    ("scripts/test-queue-1992.sh", 2),
+    ("scripts/test-queue-head-of-line-2243.sh", 1),
+    ("scripts/test-queue-reservation-2254.sh", 1),
+    ("scripts/test-release-promote-1853.sh", 4),
+    ("scripts/test-release-retry.sh", 8),
+    ("scripts/test-remote-attachment-preview-1472.sh", 2),
+    ("scripts/test-remote-autostart-1485.sh", 4),
+    ("scripts/test-remote-command-card-1724.sh", 1),
+    ("scripts/test-remote-daemon-generation-2518.sh", 1),
+    ("scripts/test-remote-fs-1451.sh", 2),
+    ("scripts/test-remote-launch-1449.sh", 2),
+    ("scripts/test-remote-master-launch.sh", 2),
+    ("scripts/test-remote-resources-1999.sh", 1),
+    ("scripts/test-remote-role-1452.sh", 1),
+    ("scripts/test-remote-setup-deps-1509.sh", 1),
+    ("scripts/test-remote-start-offload-1555.sh", 1),
+    ("scripts/test-remote-start-while-starting-2613.sh", 1),
+    ("scripts/test-remote-status-starting-2608.sh", 1),
+    ("scripts/test-remote-stop-status-offload-2630.sh", 1),
+    ("scripts/test-remote-tasks-1450b3.sh", 2),
+    ("scripts/test-respond-offload-2639.sh", 1),
+    ("scripts/test-resume-launch-args-2473.sh", 2),
+    ("scripts/test-resume-worker-mcp-2447.sh", 1),
+    ("scripts/test-run-board-1952.sh", 1),
+    ("scripts/test-runner-runtime-1735.sh", 2),
+    ("scripts/test-serve-watch.sh", 1),
+    ("scripts/test-session-scan-mod-2041.sh", 1),
+    ("scripts/test-sessions-write-2020.sh", 1),
+    ("scripts/test-setup-check-profiles-1623.sh", 3),
+    ("scripts/test-setup-check-single-source-1505.sh", 1),
+    ("scripts/test-setup-continue-1501.sh", 5),
+    ("scripts/test-setup-deps-prompt-1499.sh", 1),
+    ("scripts/test-setup-mod-first-run-2292.sh", 1),
+    ("scripts/test-setup-probe-timeout-1503.sh", 3),
+    ("scripts/test-setup-shell-integration-1504.sh", 1),
+    ("scripts/test-setup-sleep-guard-once-1621.sh", 1),
+    ("scripts/test-solo-tab-title-2127.sh", 2),
+    ("scripts/test-spawn-advice-1997.sh", 2),
+    ("scripts/test-spawn-launch-1940.sh", 1),
+    ("scripts/test-spawn-master-region-2133.sh", 1),
+    ("scripts/test-support-snapshot-merge-2104.sh", 1),
+    ("scripts/test-tailscale-detect-1816.sh", 3),
+    ("scripts/test-tako-cli-path-1502.sh", 2),
+    ("scripts/test-third-party-licenses-1851.sh", 1),
+    ("scripts/test-tmux-server-nofile-2367.sh", 1),
+    ("scripts/test-tree-clipboard-1860.sh", 4),
+    ("scripts/test-tree-keyboard-copy-1895.sh", 3),
+    ("scripts/test-tree-keys-1908.sh", 1),
+    ("scripts/test-tree-multiselect-1867.sh", 3),
+    ("scripts/test-ui-thread-offload-1984.sh", 2),
+    ("scripts/test-ui-thread-offload-1989.sh", 3),
+    ("scripts/test-ui-thread-offload-1991.sh", 2),
+    ("scripts/test-ui-thread-wait-1979.sh", 2),
+    ("scripts/test-user-task-delivery.sh", 1),
+    ("scripts/test-user-task-offload-2086.sh", 1),
+    ("scripts/test-user-task-origin-1466.sh", 1),
+    ("scripts/test-wait-pr-checks.sh", 2),
+    ("scripts/test-worker-min-width.sh", 1),
+    ("scripts/test-workspace-search-1694.sh", 1),
+];
+
+/// chmod のモードの語が実行権を足すか（`+x` / `u+rwx` / `a=rx` / `755` / `0700`）。
+/// `X`（ディレクトリと既に実行できる物だけ）・`-x`・変数を含む語は数えない
+fn chmod_mode_grants_exec(mode: &str) -> bool {
+    if mode.is_empty() || mode.contains('$') {
+        return false;
+    }
+    if mode.chars().all(|c| c.is_ascii_digit()) {
+        return u32::from_str_radix(mode, 8).is_ok_and(|m| m & 0o111 != 0);
+    }
+    mode.split(',').any(|clause| {
+        let mut op = None;
+        for ch in clause.chars() {
+            match ch {
+                '+' | '-' | '=' => op = Some(ch),
+                'x' if matches!(op, Some('+' | '=')) => return true,
+                _ => {}
+            }
+        }
+        false
+    })
+}
+
+/// 実行権を足す chmod の単純コマンドの行（行継続は取り除いて読む。行は原文の行）
+fn chmod_exec_lines(src: &str) -> Vec<usize> {
+    const OPTIONS: &str = "RfhvHLP";
+    let chars: Vec<char> = src.chars().collect();
+    let line_of = |pos: usize| {
+        chars[..pos.min(chars.len())]
+            .iter()
+            .filter(|&&c| c == '\n')
+            .count()
+            + 1
+    };
+    let (text, origin) = join_continuations32(src);
+    let mut lx = WordLexer::new(&text);
+    lx.list(false);
+    let mut out = Vec::new();
+    for cmd in &lx.commands {
+        let Some((k, "chmod")) = stage_command_name(&cmd.words) else {
+            continue;
+        };
+        let mode = cmd
+            .words
+            .iter()
+            .zip(&cmd.redirects)
+            .skip(k + 1)
+            .filter(|(_, redirect)| !**redirect)
+            .map(|(w, _)| shell_unquote(w))
+            .find(|w| {
+                !(w == "--"
+                    || w.strip_prefix('-').is_some_and(|flags| {
+                        !flags.is_empty() && flags.chars().all(|c| OPTIONS.contains(c))
+                    }))
+            });
+        if mode.is_some_and(|m| chmod_mode_grants_exec(&m)) {
+            let line = line_of(origin.get(cmd.start).copied().unwrap_or(chars.len()));
+            if !out.contains(&line) {
+                out.push(line);
+            }
+        }
+    }
+    out
+}
+
+/// 例外宣言（[`CHMOD_OK_MARKER`]）で外したものを除いた、素の chmod で実行権を足す行
+fn raw_chmod_exec_lines(src: &str) -> Vec<usize> {
+    let lines: Vec<&str> = src.lines().collect();
+    let has = |l: &str| {
+        l.split(CHMOD_OK_MARKER)
+            .nth(1)
+            .is_some_and(|reason| !reason.trim().is_empty())
+    };
+    let at = |n: usize| n.checked_sub(1).and_then(|i| lines.get(i)).copied();
+    chmod_exec_lines(src)
+        .into_iter()
+        .filter(|&n| !(at(n).is_some_and(has) || at(n.wrapping_sub(1)).is_some_and(has)))
+        .collect()
+}
+
+/// 1 ファイルぶんの違反（凍結した数を超えたら、素の chmod の行をすべて file:line で並べる）
+fn raw_chmod_violations(rel: &str, src: &str, frozen: usize) -> Vec<String> {
+    let found = raw_chmod_exec_lines(src);
+    if found.len() <= frozen {
+        return Vec::new();
+    }
+    let lines: Vec<&str> = src.lines().collect();
+    found
+        .iter()
+        .map(|&n| {
+            format!(
+                "{rel}:{n}: 素の chmod で実行権を付けている（{frozen} → {} 箇所）: {}",
+                found.len(),
+                lines.get(n - 1).map_or("", |l| l.trim())
+            )
+        })
+        .collect()
+}
+
+/// 走査の対象（テストのスクリプト = ファイル名が `test-` で始まる `.sh`）を (相対パス, 中身) で
+fn test_shell_scripts() -> Vec<(String, String)> {
+    let root = repo_root();
+    shell_scripts()
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("test-"))
+        })
+        .map(|p| {
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(&p).expect("読める .sh");
+            (rel, src)
+        })
+        .collect()
+}
+
+#[test]
+fn テストのスタブは素のchmodではなく空打ちの補助で実行権を付ける() {
+    let frozen = |rel: &str| {
+        RAW_CHMOD_EXEC_FROZEN
+            .iter()
+            .find(|(f, _)| *f == rel)
+            .map_or(0, |(_, n)| *n)
+    };
+    let mut violations = Vec::new();
+    for (rel, src) in test_shell_scripts() {
+        violations.extend(raw_chmod_violations(&rel, &src, frozen(&rel)));
+    }
+    assert!(
+        violations.is_empty(),
+        "テストのスクリプトが作ったスタブに素の chmod で実行権を付けている（#2222 / #2228）。\n\
+         macOS は新しいファイルの初回の exec に検査を挟み（他のビルドと重なると数秒）、作りたてのスタブを\n\
+         製品の短い上限（probe の 2〜15 秒・GUI の待ち）の中で初めて起こすと偽の赤になる。\n\
+         `. \"$REPO_ROOT/scripts/lib/fake-exec.sh\"` を読み、`chmod +x <スタブ>` の代わりに\n\
+         `fake_exec_warm <スタブ>...` で実行権を付けて空打ちする（コピーも新しいファイル = 置くたびに掛ける）。\n\
+         スタブでない物（ディレクトリの権限の戻し等）は、その行か直前の行に `# {CHMOD_OK_MARKER} <理由>` で外せる\n\
+         （.agent/conventions.md の #2222 の節。既存分は RAW_CHMOD_EXEC_FROZEN で数を凍結してある）:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn 凍結表は実在するテストのスクリプトだけを載せる() {
+    let scripts: Vec<String> = test_shell_scripts()
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .collect();
+    for (rel, n) in RAW_CHMOD_EXEC_FROZEN {
+        assert!(
+            scripts.iter().any(|s| s == rel),
+            "RAW_CHMOD_EXEC_FROZEN の {rel} はテストのスクリプトに無い（消した / 改名したなら表の行も消す）"
+        );
+        assert!(*n > 0, "{rel}: 0 箇所の行は表から消す");
+    }
+    // 走査が空振りしていない（#2228 の時点で test-*.sh は 250 本超）
+    assert!(
+        scripts.len() >= 200,
+        "テストのスクリプトが {} 本しか採れない",
+        scripts.len()
+    );
+    // 空打ちの補助そのものは test- で始まらない = 走査の対象外
+    assert!(!scripts.iter().any(|s| s == FAKE_EXEC_LIB));
+}
+
+#[test]
+fn 番犬は素のchmodの増加をfile_lineで名指しする() {
+    // モードの読み
+    for m in [
+        "+x", "u+x", "a+rx", "u+rwx", "ug=rwx", "u-w,u+x", "755", "0755", "700", "751", "1",
+    ] {
+        assert!(chmod_mode_grants_exec(m), "{m}");
+    }
+    for m in [
+        "-x", "644", "000", "u+rw", "u+rwX", "a-x", "600", "$MODE", "",
+    ] {
+        assert!(!chmod_mode_grants_exec(m), "{m}");
+    }
+    let lines = |body: &str| raw_chmod_exec_lines(body);
+    assert_eq!(
+        lines("printf '#!/bin/sh\\n' > \"$B/x\"; chmod +x \"$B/x\"\n"),
+        vec![1]
+    );
+    assert_eq!(lines("echo a\nchmod -R 755 \"$d\" && echo b\n"), vec![2]);
+    assert_eq!(lines("command chmod u+x \"$f\"\n"), vec![1]);
+    assert_eq!(lines("chmod -- +x \"$f\"\n"), vec![1]);
+    assert_eq!(lines("chmod \\\n  +x \"$f\"\n"), vec![1]);
+    // 実行権を足さない・chmod でない・文字列の中は数えない
+    assert!(lines("chmod -x \"$f\"\nchmod 644 \"$f\"\nchmod -R u+rwX \"$d\"\n").is_empty());
+    assert!(lines("echo 'chmod +x x'\n# chmod +x x\n").is_empty());
+    assert!(lines("cat <<'EOF'\nchmod +x x\nEOF\n").is_empty());
+    // 例外宣言は理由つきのときだけ効く（その行か直前の行）
+    assert!(lines("chmod 755 \"$d\" # tako:chmod-ok ディレクトリの権限の戻し\n").is_empty());
+    assert!(lines("# tako:chmod-ok ディレクトリの権限の戻し\nchmod 755 \"$d\"\n").is_empty());
+    assert_eq!(lines("# tako:chmod-ok\nchmod 755 \"$d\"\n"), vec![2]);
+
+    // 凍結した数までは通し、超えたら行を並べる
+    let two = "chmod +x a\nchmod +x b\n";
+    assert!(raw_chmod_violations("scripts/test-x.sh", two, 2).is_empty());
+    let got = raw_chmod_violations("scripts/test-x.sh", two, 1);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(got[0].starts_with("scripts/test-x.sh:1: "), "{got:?}");
+    assert!(got[1].starts_with("scripts/test-x.sh:2: "), "{got:?}");
+
+    // 現行ソースから作り直した逆戻り: #2228 で空打ちへ寄せた 1730 のスタブを素の chmod へ戻すと名指す
+    let rel = "scripts/test-runner-runtime-1730.sh";
+    let src = std::fs::read_to_string(repo_root().join(rel)).expect("読める");
+    assert!(raw_chmod_violations(rel, &src, 0).is_empty(), "現行は通る");
+    let warm = "fake_exec_warm \"$STUBS/pipenv\"";
+    assert!(
+        src.contains(warm),
+        "注入が空振りしている（空打ちの行が見つからない）"
+    );
+    let reverted = src.replacen(warm, "chmod +x \"$STUBS/pipenv\"", 1);
+    let want = src.lines().position(|l| l.contains(warm)).unwrap() + 1;
+    let got = raw_chmod_violations(rel, &reverted, 0);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].starts_with(&format!("{rel}:{want}: ")), "{got:?}");
+}
+
+/// 空打ちの補助（`scripts/lib/fake-exec.sh`）を実際の bash で走らせ、差し込んだ後のスタブを返す
+#[cfg(unix)]
+fn run_fake_exec_warm(stub_body: &str, env: &[(&str, &str)], times: usize) -> (String, bool) {
+    let scratch = tako_core::test_residue::ScratchDir::new("t2228-fake-exec-sh");
+    let stub = scratch.path().join("stub");
+    std::fs::write(&stub, stub_body).expect("スタブを書ける");
+    let calls = vec!["fake_exec_warm \"$2\""; times].join(" && ");
+    let mut cmd = std::process::Command::new("/bin/bash");
+    cmd.arg("-c")
+        .arg(format!(". \"$1\" && {calls}"))
+        .arg("_")
+        .arg(repo_root().join(FAKE_EXEC_LIB))
+        .arg(&stub)
+        .env_remove("TAKO_2222_LEGACY")
+        .env_remove("TAKO_2222_INJECT_FIRST_EXEC_MS");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("bash を起こせる");
+    assert!(out.status.success(), "{out:?}");
+    let text = std::fs::read_to_string(&stub).expect("スタブを読める");
+    (text, scratch.path().join("body-ran").exists())
+}
+
+/// 空打ちの補助は「空打ちの行そのもの」があるときだけ差し込みを飛ばす（#2228）。空打ちの引数の字面を
+/// 2〜3 行目に含むだけの書き出し口（`FAKE_EXEC_WARM_ARG='…'` を焼き込んだ write-ts）を、空打ちの行が
+/// あると取り違えて差し込まず、空打ちが本文を走らせて作業ディレクトリへスタブを書いていた
+#[cfg(unix)]
+#[test]
+fn 空打ちの補助は空打ちの字面を含む行を空打ちの行と取り違えない() {
+    const WARM_LINE: &str = "[ \"${1:-}\" = tako-fake-exec-warm ] && exit 0";
+    let body = "#!/bin/bash\nSANDBOX='x'\nFAKE_EXEC_WARM_ARG='tako-fake-exec-warm'\n\
+                : > \"$(dirname \"$0\")/body-ran\"\n";
+    // 2 回掛けても空打ちの行は 1 行だけ・空打ちは本文を走らせない
+    let (text, ran) = run_fake_exec_warm(body, &[], 2);
+    assert!(!ran, "空打ちが本文を走らせた:\n{text}");
+    assert_eq!(text.lines().nth(1), Some(WARM_LINE), "{text}");
+    assert_eq!(
+        text.lines().filter(|l| *l == WARM_LINE).count(),
+        1,
+        "{text}"
+    );
+    // 注入の行があれば空打ちの行は 3 行目（2 回掛けても増えない）
+    let (text, ran) = run_fake_exec_warm(body, &[("TAKO_2222_INJECT_FIRST_EXEC_MS", "1")], 2);
+    assert!(!ran, "{text}");
+    assert!(
+        text.lines()
+            .nth(1)
+            .is_some_and(|l| l.contains(".first-exec")),
+        "{text}"
+    );
+    assert_eq!(text.lines().nth(2), Some(WARM_LINE), "{text}");
+    assert_eq!(
+        text.lines().filter(|l| *l == WARM_LINE).count(),
+        1,
+        "{text}"
+    );
+    // 修正前の形（A/B）: 差し込むが起こさない
+    let (text, ran) = run_fake_exec_warm(body, &[("TAKO_2222_LEGACY", "1")], 1);
+    assert!(!ran, "{text}");
+    assert_eq!(text.lines().nth(1), Some(WARM_LINE), "{text}");
+}

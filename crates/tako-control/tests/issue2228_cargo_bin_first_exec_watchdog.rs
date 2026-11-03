@@ -17,8 +17,18 @@
 //!   ファイルは `fake_exec::warm_binary(` を呼ぶ（ファイル単位。どの関数で呼ぶかまでは見ない）
 //! - [`実物の偽サーバは空打ちで本文を走らせず注入の印を書く`] — 上の 2 つの配線を実プロセスで見る
 //!
+//! - [`gui_のセルフテストは偽の実行ファイルを空打ちの口で書く`] — GUI のセルフテスト（main.rs の
+//!   `mod self_test` と `crates/tako-app/src/self_test/`）は、節が使うスタブに実行権を直に付けない
+//!   （`from_mode(0o755)` ほか）。書く口は `write_fake_exec`（中は `fake_exec::write_script` = 空打ちつき）。
+//!   #601 の段のユーザーの `tako` が 20 秒の窓の中で初めて exec されていた（#2228 の 2。
+//!   `run-dropdown-1733` の偽の python は今は時計の中で exec されないが、同じ口へ寄せた）
+//!
+//! テストのスクリプト（`scripts/**/test-*.sh`）の同じ形（素の `chmod +x` のスタブ）は、シェルの
+//! 字句解析を持つ `shell_scripts.rs` の `テストのスタブは素のchmodではなく空打ちの補助で実行権を付ける`
+//! が縛る（既存分は数を凍結・増やすと file:line で名指す。#2228 の 1）。
+//!
 //! 既知の穴: 空打ちを呼ぶ位置（時計より前か）と、写し（`fs::copy(FAKE, …)`）を起こす前の掛け直しは
-//! 見ない。どちらも規約で縛る。
+//! 見ない。どちらも規約で縛る。セルフテストでスタブを写す（`fs::copy`）形も見ない（今は無い）。
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -53,6 +63,19 @@ const WARM_CALL: &str = "fake_exec::warm_binary(";
 const ENTER_STMT: &str = "tako_core::fake_exec::enter_test_binary();";
 /// この番犬自身（偽サーバを名指すが、時計を持たない実プロセスの確かめだけ）
 const SELF_FILE: &str = "issue2228_cargo_bin_first_exec_watchdog.rs";
+
+/// GUI のセルフテストの本体が居るファイル（`mod self_test {` から行頭の `}` まで）
+const APP_MAIN: &str = "crates/tako-app/src/main.rs";
+/// GUI のセルフテストの節のファイルの置き場
+const SELF_TEST_DIR: &str = "crates/tako-app/src/self_test";
+/// 節のスタブを書く口（`mod self_test` の中の 1 実装）
+const SELF_TEST_WRITER: &str = "write_fake_exec(";
+/// その口の中身（空打ちつきで書く 1 実装）
+const SELF_TEST_WRITER_BODY: &str = "tako_core::fake_exec::write_script(";
+/// 実行権を付けるモードの指定（この後ろの 8 進数を読む）
+const EXEC_MODE_CALLS: &[&str] = &["from_mode(0o", "set_mode(0o", ".mode(0o"];
+/// 監査済みの例外宣言 `// tako:fake-exec-ok <理由>`（その行か直前の行。理由の無い宣言は無効）
+const EXEC_MODE_OK: &str = "tako:fake-exec-ok";
 
 fn read(rel: &str) -> String {
     std::fs::read_to_string(workspace_root().join(rel))
@@ -117,6 +140,164 @@ fn fake_main_violation(rel: &str, src: &str) -> Option<String> {
         return None;
     }
     Some(format!("{rel}:{}", src[..first].matches('\n').count() + 1))
+}
+
+/// GUI のセルフテストの本体（main.rs の `mod self_test {` の次の行から、行頭の `}` の前まで）の
+/// 0 始まりの行の範囲
+fn self_test_range(src: &str) -> std::ops::Range<usize> {
+    let lines: Vec<&str> = src.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| *l == "mod self_test {")
+        .unwrap_or_else(|| {
+            panic!("{APP_MAIN} に `mod self_test {{` が無い（走査が空振りしている）")
+        })
+        + 1;
+    let end = start
+        + lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .unwrap_or_else(|| panic!("{APP_MAIN} の `mod self_test` の閉じ括弧が無い"));
+    start..end
+}
+
+/// GUI のセルフテストの節のファイル（`self_test/` の下の Rust）を `(相対パス, 中身)` で
+fn self_test_sources() -> Vec<(String, String)> {
+    let root = workspace_root();
+    let mut out = Vec::new();
+    let mut dirs = vec![root.join(SELF_TEST_DIR)];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{dir:?} が読める: {e}"))
+        {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((rel, std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// コードの 1 行に、実行権（どれかの x）を付けるモードの指定があるか
+fn grants_exec_mode(code_line: &str) -> bool {
+    EXEC_MODE_CALLS.iter().any(|call| {
+        code_line.match_indices(call).any(|(at, _)| {
+            let digits: String = code_line[at + call.len()..]
+                .chars()
+                .take_while(|c| c.is_digit(8) || *c == '_')
+                .filter(|c| *c != '_')
+                .collect();
+            u32::from_str_radix(&digits, 8).is_ok_and(|mode| mode & 0o111 != 0)
+        })
+    })
+}
+
+/// `range`（0 始まりの行）の中で、スタブに実行権を直に付けている行を `rel:行` で返す。
+/// 呼び出しはコードだけで見る（コメントと文字列は潰す）。例外宣言は原文で見る
+fn self_test_exec_mode_violations(
+    rel: &str,
+    src: &str,
+    range: std::ops::Range<usize>,
+) -> Vec<String> {
+    let code = code_view(src);
+    let original: Vec<&str> = src.lines().collect();
+    let declared = |i: usize| {
+        original.get(i).is_some_and(|l| {
+            l.split(EXEC_MODE_OK)
+                .nth(1)
+                .is_some_and(|reason| !reason.trim().is_empty())
+        })
+    };
+    code.lines()
+        .enumerate()
+        .filter(|(i, line)| {
+            range.contains(i)
+                && grants_exec_mode(line)
+                && !(declared(*i) || i.checked_sub(1).is_some_and(declared))
+        })
+        .map(|(i, _)| format!("{rel}:{}", i + 1))
+        .collect()
+}
+
+/// GUI のセルフテスト全体（main.rs の `mod self_test` + `self_test/`）の違反
+fn all_self_test_violations() -> Vec<String> {
+    let main = read(APP_MAIN);
+    let mut out = self_test_exec_mode_violations(APP_MAIN, &main, self_test_range(&main));
+    for (rel, src) in self_test_sources() {
+        let lines = src.lines().count();
+        out.extend(self_test_exec_mode_violations(&rel, &src, 0..lines));
+    }
+    out
+}
+
+#[test]
+fn gui_のセルフテストは偽の実行ファイルを空打ちの口で書く() {
+    let violations = all_self_test_violations();
+    assert!(
+        violations.is_empty(),
+        "GUI のセルフテストが節のスタブに実行権を直に付けている（#2228）。作りたてのスタブを節の時計\
+         （`wait_for_focused_text` の 20 秒・一覧の待ちほか）の中で初めて exec すると、macOS の初回 exec の\
+         検査を時計の中で払う。`write_fake_exec(cx, &path, text).await`（中は `fake_exec::write_script` =\
+         書いて実行権を付けて空打ち）で書く。スタブでない物（ディレクトリの権限ほか）は、その行か直前の行に\
+         `// {EXEC_MODE_OK} <理由>` で外せる:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn セルフテストの空打ちの口は_fake_exec_を通す() {
+    let main = read(APP_MAIN);
+    let range = self_test_range(&main);
+    let code = code_view(&main);
+    let lines: Vec<&str> = code.lines().collect();
+    let head = (range.start..range.end)
+        .find(|&i| lines[i].contains("async fn write_fake_exec("))
+        .unwrap_or_else(|| panic!("{APP_MAIN} の `mod self_test` に `write_fake_exec` が無い"));
+    // 口の本体（次の空行まで）が 1 実装を呼ぶ
+    let body: String = lines[head..]
+        .iter()
+        .take_while(|l| !l.trim().is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        body.contains(SELF_TEST_WRITER_BODY),
+        "`write_fake_exec` が `{SELF_TEST_WRITER_BODY}` を通していない（空打ちが抜ける）:\n{body}"
+    );
+    // #2228 で寄せた 2 か所が口を使い続けている
+    let at_601 = (range.start..range.end)
+        .any(|i| lines[i].contains(SELF_TEST_WRITER) && lines[i].contains("&user_cli"));
+    assert!(
+        at_601,
+        "{APP_MAIN} の #601 の段が `{SELF_TEST_WRITER}` でユーザーの tako を書いていない"
+    );
+    let dropdown = self_test_sources()
+        .into_iter()
+        .find(|(rel, _)| rel.ends_with("run_dropdown_1733.rs"))
+        .expect("run_dropdown_1733.rs が採れる");
+    assert!(
+        code_view(&dropdown.1).contains(SELF_TEST_WRITER),
+        "{} の偽の python が `{SELF_TEST_WRITER}` を通していない",
+        dropdown.0
+    );
+    // 走査が空振りしていない（11/04 時点で本体 6 万行超・節のファイル 30 本超）
+    assert!(
+        range.len() > 30_000,
+        "mod self_test が {} 行しか採れない",
+        range.len()
+    );
+    assert!(
+        self_test_sources().len() >= 10,
+        "self_test/ の節のファイルが少なすぎる"
+    );
 }
 
 #[test]
@@ -258,4 +439,78 @@ fn 逆戻りを名指しできる() {
         1,
     );
     assert!(fake_main_violation(FAKE_SRC, &moved).is_some());
+
+    // D. #601 の段: 空打ちの口の後ろに、実行権を直に付ける修正前の行を戻す
+    let main = read(APP_MAIN);
+    let range = self_test_range(&main);
+    assert!(self_test_exec_mode_violations(APP_MAIN, &main, range.clone()).is_empty());
+    let anchor = main
+        .lines()
+        .position(|l| l.contains(SELF_TEST_WRITER) && l.contains("&user_cli"))
+        .expect("#601 の段の空打ちの行");
+    let legacy = "                    std::fs::set_permissions(&user_cli, std::fs::Permissions::from_mode(0o755))";
+    let reverted: String = main
+        .lines()
+        .enumerate()
+        .flat_map(|(i, l)| {
+            let mut v = vec![format!("{l}\n")];
+            if i == anchor {
+                v.push(format!("{legacy}\n"));
+            }
+            v
+        })
+        .collect();
+    let named = self_test_exec_mode_violations(APP_MAIN, &reverted, self_test_range(&reverted));
+    assert_eq!(named, vec![format!("{APP_MAIN}:{}", anchor + 2)]);
+    // 理由つきの例外宣言なら外せる・理由が無ければ外せない
+    let declared = reverted.replacen(
+        legacy,
+        &format!("{legacy} // {EXEC_MODE_OK} ディレクトリの権限の戻し"),
+        1,
+    );
+    assert!(
+        self_test_exec_mode_violations(APP_MAIN, &declared, self_test_range(&declared)).is_empty()
+    );
+    let bare = reverted.replacen(legacy, &format!("{legacy} // {EXEC_MODE_OK}"), 1);
+    assert_eq!(
+        self_test_exec_mode_violations(APP_MAIN, &bare, self_test_range(&bare)).len(),
+        1
+    );
+    // `mod self_test` の外（製品のコード）は見ない
+    let outside = format!("{legacy}\n{main}");
+    assert!(
+        self_test_exec_mode_violations(APP_MAIN, &outside, self_test_range(&outside)).is_empty()
+    );
+
+    // E. run-dropdown-1733 の偽の python: 修正前の `set_permissions(… from_mode(0o755))` を戻す
+    let (rel, src) = self_test_sources()
+        .into_iter()
+        .find(|(rel, _)| rel.ends_with("run_dropdown_1733.rs"))
+        .unwrap();
+    let lines = src.lines().count();
+    assert!(self_test_exec_mode_violations(&rel, &src, 0..lines).is_empty());
+    let reverted = format!(
+        "{src}fn legacy(python: &std::path::Path) {{\n    use std::os::unix::fs::PermissionsExt;\n    \
+         let _ = std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755));\n}}\n"
+    );
+    assert_eq!(
+        self_test_exec_mode_violations(&rel, &reverted, 0..reverted.lines().count()),
+        vec![format!("{rel}:{}", lines + 3)]
+    );
+    // 実行権の無いモード（0o644 / 0o600）とコメント・文字列の中は数えない
+    for body in [
+        "let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));",
+        "let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));",
+        "// std::fs::Permissions::from_mode(0o755)",
+        "let s = \"from_mode(0o755)\";",
+    ] {
+        assert!(
+            self_test_exec_mode_violations("x.rs", body, 0..1).is_empty(),
+            "{body}"
+        );
+    }
+    assert_eq!(
+        self_test_exec_mode_violations("x.rs", "opts.mode(0o7_00);", 0..1),
+        vec!["x.rs:1".to_string()]
+    );
 }
