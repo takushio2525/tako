@@ -63,6 +63,29 @@ held launches under `launches`. If the work is urgent, launch it now with
 Running workers are never stopped. After a reboot, saved sessions come back one at
 a time, masters first.
 
+### Machine headroom (`machine` / `advice`)
+
+Every spawn / run response also carries `machine` and `advice` — a read-out, never
+a gate. `machine` has the memory tako's launch gate judged on (`pressure`,
+`available_mb`, `total_mb`, `swap_used_mb`), the live agents and their resident
+memory (`agents.count` / `agents.memory_mb`, agent + MCP children, from the last
+process scan `agents.age_s` seconds old), the heavy-job queue (`queue.running` /
+`queue.waiting`, null when this tako is not the arbiter) and the launch gate
+(`launches.waiting` / `launches.starting`). `advice` is empty when there is room.
+Otherwise each entry has a `code`, the wait `reason` and a `text` to act on:
+
+- `next_launch_waits` — this worker launched, but one more spawn now would be held
+  by the launch gate. Spawn non-urgent work after a running worker finishes.
+- `heavy_queue_waits` — a build or test queued now would wait (`reason`:
+  `max_jobs`, `memory`, `pressure_warn` …). The worker's builds and tests will
+  wait their turn in `tako queue`; expect them to take longer, and prefer fewer
+  parallel workers that build.
+
+The thresholds are the same ones the launch gate and `tako queue` use — `advice`
+only asks them "what if one more?". Per-worker resident memory (descendants
+included) is in `tako_orchestrator_workers` (`resident.memory_mb` / `agent_mb` /
+`heavy_mb`) and on the fleet view's worker rows.
+
 Always pass a `label` (2-4 words naming the deliverable) — without it the pane
 title is just the project name and the user cannot tell workers apart. Check the
 returned `agent` / `model` / `effort` fields and correct course if they are not

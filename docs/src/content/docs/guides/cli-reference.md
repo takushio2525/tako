@@ -1706,6 +1706,8 @@ tako orchestrator run-result <run_id>
 | `--auto-close <true\|false>` | 完了後にペインを自動で閉じるか（既定 true） |
 | `--output-lines <N>` | 回収する出力の末尾行数（既定 200） |
 
+spawn / run の応答には、そのときの機の余裕も入ります（spawn を止めることはありません）。`machine` はメモリ圧・空き・swap・生きている agent の本数と常駐の合計・ビルドの順番待ちと起動待ちの件数、`advice` は余裕が少ないときの助言です（空なら余裕があります）。`next_launch_waits` は「もう 1 本起こすと起動待ちになる」、`heavy_queue_waits` は「いまビルドを順番待ちへ入れると待つ」で、判断は起動待ちと `tako queue` と同じ基準です。`tako orchestrator run` は助言があれば 1 行ずつ表示します。
+
 ### tako orchestrator status / watch / report
 
 worker の状態確認・完了待ち・報告取得です。
@@ -1742,6 +1744,7 @@ tako orchestrator profiles set default --auto-handoff false
 
 ```bash
 tako orchestrator workers          # spawn 済み worker の一覧（ペインの生死と無関係）
+                                   # 生きている worker には常駐メモリ（resident.memory_mb = 子孫込み）。fleet ビューの行と同じ値
 tako orchestrator workers --all
 tako orchestrator respond --pane 5 # 権限確認ダイアログへ応答（不在時はエラー）
 tako orchestrator self             # master/solo が自分の pane・tab・コンテキスト残量と引き継ぎ閾値を知る

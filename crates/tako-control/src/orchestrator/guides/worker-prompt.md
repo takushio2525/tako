@@ -23,6 +23,10 @@ Write the prompt in the user's working language.
   CONTRIBUTING) and follow its conventions.
 - Do the work directly in this session. Do not launch sub-agents, agent teams,
   or background orchestration — progress must stay visible in this pane.
+- Run builds, test suites and GUI / browser checks through `tako queue <command>`
+  (or the repo's own entry points that already do) so they wait their turn for
+  memory. A queued command can wait a long time: run it with background execution
+  instead of a blocking shell call that times out.
 - <tech restrictions, requirement documents, parallel-worker warnings, or none>
 
 ## Acceptance criteria

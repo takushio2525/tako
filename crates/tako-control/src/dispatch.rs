@@ -9556,13 +9556,16 @@ fn finish_workers_list(
         registry::WorkerRegistry::load_typed()
     }
     .map_err(|e| Reason::WorkerRegistryUnreadable(e.to_string()).operation())?;
-    Ok(registry::list_payload(
+    let mut payload = registry::list_payload(
         &reg,
         &live_backends,
         live_panes,
         limit_resume_panes,
         include_closed,
-    ))
+    );
+    // #1997: worker ごとの常駐メモリ（子孫込み）。fleet ビューの worker の行と同じ走査の覚えを読むだけ
+    registry::attach_resident(&mut payload, crate::resources::pane_resident(None));
+    Ok(payload)
 }
 
 /// git 系の要求の UI スレッド必須部分: ペインの cwd 解決（キャッシュ済み値の読み取り）。
@@ -11099,6 +11102,8 @@ fn dispatch_inner(
                 "usage": host.usage_view_state(),
                 // #1995: resources ビューが描いている答え（画面の無い host・まだ開いていなければ null）
                 "resources": host.resources_view_state(),
+                // #1997: fleet ビューの worker の行の常駐メモリ（画面の無い host は null）
+                "fleet": host.fleet_view_state(),
             }))
         }
 
@@ -21044,6 +21049,11 @@ impl SpawnPlaced {
             // `starting` = 起こした。null = 起動待ちを持たない tako（隔離 / A/B）。
             // 値は起動の積み込み（[`spawn_launch`]）が埋める
             "launch_gate": Value::Null,
+            // #1997: 機の余裕（メモリ圧・空き・swap・生きている agent の本数と常駐・順番待ちと起動待ちの件数）と、
+            // 待つほどではないが余裕が少ないときの助言（`code` / `reason` / `text`。空配列 = 余裕がある）。
+            // 閾値は起動待ちと順番待ちの同じ `admit`。値は起動の積み込み（[`spawn_launch`]）が埋める
+            "machine": Value::Null,
+            "advice": [],
         });
         SpawnRecorded {
             reply,
@@ -21078,7 +21088,14 @@ impl SpawnPlaced {
 /// 起動ゲートへ預ける / 積み（[`launch_agent_gated`]）、応答の `launch_gate` を埋める
 fn spawn_launch(host: &mut dyn ControlHost, origin: PaneOrigin, recorded: SpawnRecorded) -> Value {
     let SpawnRecorded { mut reply, launch } = recorded;
+    let agent = launch.agent.clone();
     reply["launch_gate"] = launch_agent_gated(host, origin, launch).unwrap_or(Value::Null);
+    // #1997: 起動待ちの判断の直後の機の余裕（この 1 本を立ち上がり中に数えた後）。覚えを読むだけ
+    let waiting = reply["launch_gate"]["state"] == "waiting";
+    let (machine, advice) =
+        crate::spawn_advice::for_spawn(&agent, waiting, tako_core::i18n::lang());
+    reply["machine"] = machine;
+    reply["advice"] = advice;
     reply
 }
 
