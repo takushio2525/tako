@@ -30,7 +30,9 @@
 //! CLI の人向けの表示（JSON でない出力の枠・見出し・ラベル）のうち、`tako orchestrator projects`
 //! （list / add / remove / mcp）・`tako orchestrator guide` の一覧・`tako sessions resume` の復元の行・
 //! `tako todo show` ほか 1 件の詳細の枠もここが持つ。字下げ・桁揃えの空白は CLI が付け、`--json` の
-//! 出力と応答の値は変えない
+//! 出力と応答の値は変えない。続けて `tako todo list` / `expand` / `collapse`・`tako sessions list` /
+//! `link` の枠（空のときの文・期限 / 返答のラベル・件数・表示の有無・resume の案内・公式リンクの行）も
+//! 同じ形で持つ
 
 use tako_core::handoff::{HANDOFF_PROJECTS_DIR, PROFILE_MEMO_SOFT_LIMIT_LINES};
 use tako_core::i18n::Lang;
@@ -432,6 +434,34 @@ pub enum ReplyNote {
         reason: Option<String>,
         pane: String,
     },
+
+    // ---- CLI の人向けの表示: todo list / expand / collapse・sessions list / link ----
+    /// `tako todo list`: 1 件も無い
+    TodosNone,
+    /// `tako todo list`: 期限のラベル（値は応答の `due` の表記のまま）
+    TodoDue(String),
+    /// `tako todo list`: 返答の件数のラベル
+    TodoReplies(usize),
+    /// `tako todo list`: 末尾の未完了の件数（画面のバッジと同じ数字）
+    TodoOpenCount(u64),
+    /// `tako todo expand` / `collapse`: 開いている 1 件が無い（`expanded: ` の後ろ）
+    TodoExpandedNone,
+    /// `tako todo expand` / `collapse`: 右パネルが出ているか（`panel: ` の後ろ）
+    TodoPanelVisible(bool),
+    /// `tako sessions list`: カタログが空
+    SessionsNone,
+    /// `tako sessions list`: resume できない行の後ろに付ける印（前の空白も含む）
+    SessionNotResumable,
+    /// `tako sessions list`: session 未検出の spawn 記録の見出し
+    SessionsPendingHeader,
+    /// `tako sessions list`: 末尾の次の一手（コマンドはそのまま。`<id>` は両言語で同じ）
+    SessionsListHint,
+    /// `tako sessions link`: 公式リンクを開けるアカウント
+    SessionLinkAccount(String),
+    /// `tako sessions link`: 公式リンクが無い（`state` は応答の `remote_link.state`）
+    SessionLinkNone(String),
+    /// `tako sessions link`: 公式リンクの入れ方（コマンドはプレースホルダだけ表示言語）
+    SessionLinkEnableHint,
 }
 
 impl ReplyNote {
@@ -1640,6 +1670,55 @@ impl ReplyNote {
                     .map(|r| format!(" ({r})"))
                     .unwrap_or_default()
             ),
+            (Self::TodosNone, Ja) => "ユーザータスクが無い".into(),
+            (Self::TodosNone, En) => "No user tasks".into(),
+            (Self::TodoDue(due), Ja) => format!("期限:{due}"),
+            (Self::TodoDue(due), En) => format!("due:{due}"),
+            (Self::TodoReplies(n), Ja) => format!("返答:{n}"),
+            (Self::TodoReplies(n), En) => format!("replies:{n}"),
+            (Self::TodoOpenCount(n), Ja) => format!("未完了 {n} 件"),
+            (Self::TodoOpenCount(n), En) => format!("Open: {n}"),
+            (Self::TodoExpandedNone, Ja) => "(なし)".into(),
+            (Self::TodoExpandedNone, En) => "(none)".into(),
+            (Self::TodoPanelVisible(shown), Ja) => if *shown { "表示" } else { "非表示" }.into(),
+            (Self::TodoPanelVisible(shown), En) => if *shown { "shown" } else { "hidden" }.into(),
+            (Self::SessionsNone, Ja) => {
+                "カタログにセッションが無い（claude ペインの検出後に記録される）".into()
+            }
+            (Self::SessionsNone, En) => {
+                "No sessions in the catalog (recorded once a claude pane is detected)".into()
+            }
+            (Self::SessionNotResumable, Ja) => "（resume 不可）".into(),
+            (Self::SessionNotResumable, En) => " (not resumable)".into(),
+            (Self::SessionsPendingHeader, Ja) => {
+                "--- session 未検出の spawn 記録（codex / agy・起動直後の claude）---".into()
+            }
+            (Self::SessionsPendingHeader, En) => {
+                "--- spawn records with no session detected yet (codex / agy, or claude just launched) ---"
+                    .into()
+            }
+            (Self::SessionsListHint, Ja) => {
+                "(resume: tako sessions resume <id> / 詳細: tako sessions show <id>)".into()
+            }
+            (Self::SessionsListHint, En) => {
+                "(resume: tako sessions resume <id> / details: tako sessions show <id>)".into()
+            }
+            (Self::SessionLinkAccount(account), Ja) => {
+                format!("アカウント: {account}（このアカウントでログインした端末からだけ開けます）")
+            }
+            (Self::SessionLinkAccount(account), En) => {
+                format!("Account: {account} (opens only on devices signed in to this account)")
+            }
+            (Self::SessionLinkNone(state), Ja) => format!("公式リンクはありません（state: {state}）"),
+            (Self::SessionLinkNone(state), En) => format!("No official link (state: {state})"),
+            (Self::SessionLinkEnableHint, Ja) => {
+                "有効にする場合: tako orchestrator profiles set <名前> --remote-control true → 起動し直す"
+                    .into()
+            }
+            (Self::SessionLinkEnableHint, En) => {
+                "to turn it on: tako orchestrator profiles set <name> --remote-control true → restart"
+                    .into()
+            }
         }
     }
 }

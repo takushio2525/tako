@@ -741,6 +741,15 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `crates/tako-cli/tests/issue2365_cli_human_lang.rs`（unix。ビルドした `tako` を日英で叩き、todo / sessions は決まった
   応答を返す偽の GUI を立てる。英語表示に日本語が無いこと・日本語表示が #2365 より前とバイト一致・`--json` が日英で
   同じこと。A/B は `TAKO_2365_HUMAN_BIN`）
+- 続けて **`tako todo list` / `expand` / `collapse` と `tako sessions list` / `link` の枠**も移した（空のときの文・
+  `期限:` / `返答:` のラベル・「未完了 N 件」・「(なし)」・「表示」/「非表示」・「（resume 不可）」・pending の見出し・
+  末尾の resume の案内・`アカウント:`・「公式リンクはありません」と入れ方の案内）。文は `ReplyNote` の 13 種
+  （`Todos*` / `TodoDue` ほか・`Sessions*` / `SessionLink*`）で、`sessions link` の表示は `print_sessions_link` へ
+  切り出した。`expanded:` / `panel:` / `view:` のラベルとコマンドの本体は両言語で同じ（値と案内のプレースホルダだけ
+  表示言語）。番犬は `issue1762_dispatch_error_lang.rs`（旧文の表に 15 行・`CLI_NOTE_SCOPES` に 4 つの関数）と、
+  実経路の `crates/tako-cli/tests/issue2365_cli_todo_sessions_lang.rs`（偽の GUI の応答で URL の有無・空・pending まで
+  通す。A/B は同じ `TAKO_2365_HUMAN_BIN`）。`sessions link --json` の `remote_link.enable_command` のプレースホルダ
+  （`<名前>`）は応答の値なので、まだ日本語のまま
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
