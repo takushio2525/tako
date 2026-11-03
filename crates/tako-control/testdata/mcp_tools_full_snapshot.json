@@ -832,7 +832,7 @@
     "name": "tako_auto_rename"
   },
   {
-    "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。view=fleet はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰（master + worker のツリー）、view=git は git（差分・ステージ・コミット・ブランチ）、view=tasks は人がやること（承認待ち・レビュー・投稿）の一覧と返答、view=diagnostics は言語サーバの診断（エラー・警告）の一覧、view=references は参照・呼び出し階層・型階層の結果（一覧 / ツリー）、view=search はワークスペース横断検索の検索欄と結果の一覧、view=usage は利用制限の使い道（プロジェクト → Issue → 会話）。状況を見せたいとき表示し、邪魔なら隠す。",
+    "description": "右サイドバー情報パネルの表示・非表示・幅・ビュー切替と、左サイドバーのファイルツリーの表示・非表示を操作する（全省略で現在状態の取得）。view=fleet はタブごとの全ペイン一覧 + 管理外 / kill 漏れ tmux セッションの統合ビュー、view=orch はオーケストレーター俯瞰（master + worker のツリー）、view=git は git（差分・ステージ・コミット・ブランチ）、view=tasks は人がやること（承認待ち・レビュー・投稿）の一覧と返答、view=diagnostics は言語サーバの診断（エラー・警告）の一覧、view=references は参照・呼び出し階層・型階層の結果（一覧 / ツリー）、view=search はワークスペース横断検索の検索欄と結果の一覧、view=usage は利用制限の使い道（プロジェクト → Issue → 会話）、view=resources は PC の負荷（機・順番待ちの実行中と待ち・常駐の内訳）。状況を見せたいとき表示し、邪魔なら隠す。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -850,7 +850,7 @@
           "type": "number"
         },
         "view": {
-          "description": "表示するビュー（GUI のタブ名と同じ。fleet | orch | git | tasks | diagnostics | references | search | usage。tmux は fleet の旧称）",
+          "description": "表示するビュー（GUI のタブ名と同じ。fleet | orch | git | tasks | diagnostics | references | search | usage | resources。tmux は fleet の旧称）",
           "enum": [
             "fleet",
             "orch",
@@ -860,6 +860,7 @@
             "references",
             "search",
             "usage",
+            "resources",
             "tmux"
           ],
           "type": "string"
