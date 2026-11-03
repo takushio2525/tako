@@ -175,6 +175,8 @@ fn queue_socket() -> String {
 fn spawn_wrapper(cli: &str, pane: Option<PaneId>, secs: u32) -> Child {
     let (_, token) = control();
     let mut c = Command::new(cli);
+    // 製品の起動と同じくコンソール窓を出さない（#628。visual-test は macOS だけで回るが規約に合わせる）
+    tako_core::platform::process::no_console_window(&mut c);
     c.args(["queue", "sleep", &secs.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -206,7 +208,9 @@ async fn run_cli(cx: &mut AsyncApp, cli: &str, args: &[&str]) -> (i32, String) {
     let queue = queue_socket();
     cx.background_executor()
         .spawn(async move {
-            let out = Command::new(&cli)
+            let mut c = Command::new(&cli);
+            tako_core::platform::process::no_console_window(&mut c);
+            let out = c
                 .args(&args)
                 .stdin(Stdio::null())
                 .env("TAKO_QUEUE_SOCKET", queue)
@@ -233,10 +237,12 @@ async fn cli_json(cx: &mut AsyncApp, cli: &str, args: &[&str], step: &str) -> Va
             args.join(" ")
         ));
     }
-    serde_json::from_str(&out).unwrap_or_else(|e| {
+    // 誤りの文言は出さない（値を引用しうる = #2230）。出力の先頭を名指しの材料にする
+    serde_json::from_str(&out).unwrap_or_else(|_| {
         fail(&format!(
-            "visual-test {LABEL} {step}: `tako {}` の JSON が読めない: {e}",
-            args.join(" ")
+            "visual-test {LABEL} {step}: `tako {}` の出力が JSON でない（先頭: {}）",
+            args.join(" "),
+            out.chars().take(120).collect::<String>()
         ))
     })
 }

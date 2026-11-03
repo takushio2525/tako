@@ -1675,8 +1675,8 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "text は command=type と組で渡す",
     "op が不正: bogus",
     "path（または paths）を指定する",
-    "view が不正: bogus（fleet | orch | git | tasks | diagnostics | references | search | usage。\
-     tmux は fleet の旧称）",
+    "view が不正: bogus（fleet | orch | git | tasks | diagnostics | references | search | usage | \
+     resources。tmux は fleet の旧称）",
     "limits を解釈できない: invalid type: string \"x\", expected struct QueueLimits",
     "name を指定する（プロファイル名 / プロジェクトキー）",
     "action を指定する（check / run）",
