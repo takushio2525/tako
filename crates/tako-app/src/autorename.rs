@@ -517,23 +517,27 @@ fn spawn_claude(bin: &Path, prompt: &str, strict: bool, timeout: Duration) -> Cl
 
     let started = Instant::now();
     let mut command = claude_command(bin, strict);
-    let mut child = match command
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
+        .stderr(Stdio::null());
+    // #2462: 打ち切りの kill を孫まで届かせる入れ物（Windows だけ。境界 B30）。npm の `claude.cmd` は
+    // cmd.exe → node.exe の 2 段で、`--strict-mcp-config` を外した再試行は MCP サーバも子に持つので、
+    // 直下の子の kill だけでは cmd.exe しか止まらない。#2697: 一時停止で起こし、入れてから動かす
+    // （起こしてから入れると、入れ終える前に cmd.exe が起こした node.exe が外に残る）。コンソールは
+    // `claude_command` と同じく出さない。普通に終わったら drop が何も止めずに手放す
+    let spawned = tako_core::platform::job::KillScope::spawn(
+        &mut command,
+        tako_core::platform::job::Console::NoWindow,
+        |_| true,
+    );
+    let (mut child, mut descendants) = match spawned {
+        Ok(spawned) => spawned,
         Err(e) => {
             diag(format_args!("claude の起動に失敗: {e}"));
             return ClaudeRun::Failed;
         }
     };
-    // #2462: 打ち切りの kill を孫まで届かせる入れ物（Windows だけ。境界 B30）。npm の `claude.cmd` は
-    // cmd.exe → node.exe の 2 段で、`--strict-mcp-config` を外した再試行は MCP サーバも子に持つので、
-    // 直下の子の kill だけでは cmd.exe しか止まらない。プロンプトを書く前（= 子が孫を起こす前）に入れる。
-    // 普通に終わったら drop が何も止めずに手放す
-    let mut descendants = tako_core::platform::job::KillScope::contain(child.id());
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(prompt.as_bytes());
         // drop で stdin が閉じ、-p は EOF までをプロンプトとして読む

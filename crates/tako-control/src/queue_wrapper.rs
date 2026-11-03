@@ -650,8 +650,16 @@ fn run_with(
         cmd.envs(progress_env(already_set));
         cmd.stderr(std::process::Stdio::piped());
     }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
+    // #2462 / #2697: 取り消しを子孫まで届かせる入れ物（Windows だけ。一時停止で起こし、入れてから動かす
+    // = 子が孫を起こす前に入る。子はこの端末のコンソールを受け継ぐ）。子が普通に終わったら drop が
+    // 何も止めずに手放す
+    let spawned = tako_core::platform::job::KillScope::spawn(
+        &mut cmd,
+        tako_core::platform::job::Console::Inherit,
+        |_| true,
+    );
+    let (mut child, mut descendants) = match spawned {
+        Ok(spawned) => spawned,
         Err(e) => {
             note(&format!("{} を起動できない: {e}", argv[0]));
             wire.exit_code = Some(q::EXIT_SPAWN_FAILED);
@@ -659,9 +667,6 @@ fn run_with(
             return q::EXIT_SPAWN_FAILED;
         }
     };
-    // #2462: 取り消しを子孫まで届かせる入れ物（Windows だけ。起こした直後 = 子が孫を起こす前に入れる）。
-    // 子が普通に終わったら drop が何も止めずに手放す
-    let mut descendants = tako_core::platform::job::KillScope::contain(child.id());
     // #1996: 進みを読むなら子の stderr を受ける背景スレッド
     let tap = child.stderr.take().map(progress_tap::start);
     wire.child_pid = Some(child.id());

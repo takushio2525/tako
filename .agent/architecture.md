@@ -1440,7 +1440,8 @@ Windows の `TerminateProcess` は子孫を道連れにしない。ConPTY を閉
 止まるが、`CREATE_NO_WINDOW` で起きた子（stdio をパイプにした MCP サーバなど）はコンソールに
 繋がっていないので残り、npm の `.cmd` の言語サーバは `Child::kill` で cmd.exe だけが止まって node.exe が
 残った（FR-2.33.9 の「1 日 46 本」）。いまは子 1 つ（ペインの PTY 直下の子 / 言語サーバ 1 つ）ごとに
-Job を 1 つ作り、起こした直後に入れる（以後その子が起こすものは Job を受け継ぐ）。
+Job を 1 つ作って入れる（以後その子が起こすものは Job を受け継ぐ）。std の `Command` で起こす子は一時停止で
+起こして動く前に入れる（#2697。下の「起動直後の窓」）。
 
 - **寿命の決まり**（正本は `platform::job` の冒頭の表）:
 
@@ -1471,10 +1472,20 @@ Job を 1 つ作り、起こした直後に入れる（以後その子が起こ�
 - **`JOB_OBJECT_LIMIT_BREAKAWAY_OK` を付ける**: `CREATE_BREAKAWAY_FROM_JOB` で明示的に外へ出る子（親の
   寿命から切り離すと宣言した常駐 = unix の `setsid` に当たる）は出られる。付けないとその子の
   `CreateProcess` が ERROR_ACCESS_DENIED で失敗する。`SILENT_BREAKAWAY_OK` は付けない（回収にならない）
-- **起動直後の窓**: `PROC_THREAD_ATTRIBUTE_JOB_LIST` は渡せない（ConPTY は alacritty_terminal が属性
-  リストを中で 1 枠だけ作って `CreateProcessW` を呼ぶ・std の `CommandExt::raw_attribute` は 1.95 で
-  unstable）ので、起こした直後に `AssignProcessToJobObject` する。窓はシェル / cmd.exe が子を起こすまでの
-  時間より十分短く、Windows CI の実プロセスのテストは孫が Job に入っていることを確かめてから閉じる
+- **起動直後の窓（#2697）**: 動いている子を入れても、入れ終える前にその子が起こした孫は Job の外に生まれる。
+  cmd.exe は起きてから 10〜15ms ほどで子を起こす（Windows CI の実測で入れ終えた +11 / +14ms 後）ので、
+  起こした直後に呼び手のスレッドがそのくらい止まるだけで取り消しの後に孫が残った（`tako queue` の取り消しの
+  CI の間欠）。`PROC_THREAD_ATTRIBUTE_JOB_LIST` は渡せない（std の `CommandExt::raw_attribute` は 1.95 で
+  unstable）ので、**std の `Command` で起こす子は `Job::spawn_contained` / `KillScope::spawn` の 1 実装**で
+  `CREATE_SUSPENDED` で起こし、Job へ入れてから主スレッドを動かす（std の `Child` は主スレッドのハンドルを
+  持たないので、プロセスのハンドルへ `NtResumeProcess`。Windows CI の実測で p50 14µs、Toolhelp32 のスレッドの
+  一覧から `ResumeThread` する形は系全体のスレッドを写すので p50 6.3ms。動かせない子は止めて刈り取りエラーを返す）。
+  `creation_flags` は上書きなので、呼び手はコンソールの扱い（`Console::Inherit` / `NoWindow`）を明示する。
+  寄せた呼び手は `tako queue` の子・probe の待つ子（`probe::spawn_for_wait`）・AI 命名・言語サーバ・`tako setup`。
+  ペインの ConPTY は alacritty_terminal が `CreateProcessW` を呼び作成フラグが固定なので、起こした直後に
+  `AssignProcessToJobObject` する（窓は残る。シェルは起動に数百 ms かかり、子を起こすのは rc か入力の後）。
+  起こし済みの子を入れる口（`Job::contain` / `KillScope::contain`）を足すと番犬
+  `crates/tako-control/tests/issue2697_spawn_window_watchdog.rs` が `file:line` で落とす
 - **器（psmux）のクライアントは入れない**: 器のサーバーはクライアントの子として起きる（`new-session -A`）
   ので、入れると GUI の終了で器ごと消える。判定は `tmux_backend::is_container_client`（PTY 直下に起こすのが
   器の実行ファイルか。名前は `backend::is_plumbing_process` の正本）。`wrap_options` / `reattach_options` /
@@ -1482,11 +1493,12 @@ Job を 1 つ作り、起こした直後に入れる（以後その子が起こ�
 - **入れられないとき**（作成・割り当ての失敗）は `None` で従来の止め方（直下の子だけ）へ落ちる。panic しない
 - **打ち切り・取り消しの子（#2462）**: probe の待ちの 1 実装（`probe::wait_with_timeout` = `output_with_timeout` /
   `command_output_with_timeout` / `claude agents --json` の走査 / `tako setup` の子が通る）・`tako queue` の子
-  （`queue_wrapper`）・AI 命名の `claude -p`（`autorename::spawn_claude`）は、起こした直後に `KillScope` へ入れ、
-  止めると決めたときだけ `stop`（ペインを閉じるのと同じ振り分け）。**drop では止めない**（`KILL_ON_JOB_CLOSE` を
+  （`queue_wrapper`）・AI 命名の `claude -p`（`autorename::spawn_claude`）は、一時停止で起こして `KillScope` へ
+  入れてから動かし（`KillScope::spawn`。#2697）、止めると決めたときだけ `stop`（ペインを閉じるのと同じ振り分け）。**drop では止めない**（`KILL_ON_JOB_CLOSE` を
   外してから閉じる = 普通に終わった子が残した常駐は #2462 の前と unix と同じく残る）。probe は器の CLI
-  （実行ファイル名が `backend::is_plumbing_process`。1 回の問い合わせが器のサーバーを起こすことがある）と
-  入れる前に終わった子を入れない（`probe::kill_scope`）
+  （実行ファイル名が `backend::is_plumbing_process`。1 回の問い合わせが器のサーバーを起こすことがある）を
+  入れない（一時停止の間に `probe::admits` で見る。呼び手が自分で起こした子を待つ `wait_with_timeout(Child)` は
+  起こした後に `probe::kill_scope` で入れ、入れる前に終わった子も入れない）
 - **エージェントの再起動（#2462）**: ペインの Job はシェルごと入っているので Job ごとは止められない。
   `tako_control::platform::process::terminate_with_descendants` が終了要求の後、ペインの Job の中の pid を
   列挙して親を Job の中でたどり（純関数 `descendants_in`。止めた後のエージェントも親の pid でたどれる・
@@ -1496,7 +1508,10 @@ Job を 1 つ作り、起こした直後に入れる（以後その子が起こ�
   子を起こさない）。`claude agents --json` の走査は probe の待ちを通るので上の打ち切りで回収される
 
 A/B は `TAKO_2454_LEGACY=1`（Job を作らない）と `TAKO_2454_KILL_GUI=1`（ペインを閉じるときも GUI ごと全部止める）、
-注入は `TAKO_2454_INJECT=assign_fail`（テストプロセスだけ）。実プロセスのテストは
+注入は `TAKO_2454_INJECT=assign_fail`（テストプロセスだけ）。#2697 の A/B は `TAKO_2697_LEGACY=1`（std の `Command` の
+子も動かしてから入れる = 窓あり）、注入は `TAKO_2697_INJECT_CONTAIN_DELAY_MS=<ms>`（検証プロセスだけ。起こした子を
+入れる前に待つ = 起動直後の窓を広げる。一時停止の経路では孫は外に生まれない）、診断は `TAKO_2697_DIAG=1`
+（`KillScope::stop` が止める直前の中身を stderr へ 1 行）。実プロセスのテストは
 `crates/tako-core/tests/issue2454_pane_job_windows.rs`（ペインのコンソールの孫）・
 `crates/tako-control/tests/issue2454_pane_gui_windows.rs`（同じペインの GUI の孫は残りコンソールの孫は止まる。
 GUI 役はテスト専用の `tako-gui-sleeper`。普通の終了の経路 = 関数を呼んでから drop せずに終わる子と、
@@ -1505,6 +1520,9 @@ GUI 役はテスト専用の `tako-gui-sleeper`。普通の終了の経路 = 関
 孫・普通に終わった子の常駐は残る・割り当ての失敗）・`crates/tako-control/tests/issue2462_kill_paths_windows.rs`
 （`tako queue` の取り消しの孫・再起動でエージェントの孫は止まりシェルは残る・先に死んだエージェント）・
 tako-app の `autorename::tests::issue2462`（`.cmd` の偽 claude の孫）。どれも `TAKO_2454_LEGACY=1` の旧アームで孫が残る。
+#2697 は同じ 2 ファイルの `issue2697_*`（入れる前に待たせる注入を当てても queue の取り消し・probe の打ち切りで
+孫まで止まる。`TAKO_2697_LEGACY=1` の旧アームでは 1 回目の心拍で掴んだ孫が残る。一時停止の口で 20 回起こして
+毎回 Job に入り動き終わる = 動かせずに止まったまま残る子が無い。起動 1 回の上乗せを `TAKO2697_SPAWN_COST` に出す）。
 
 **縮退の宣言は system prompt へも流れる**（#516。正本は `tako-core::platform::support`）。
 ただし prompt へ載せるのは「この環境は何か」と「縮退が N 件あること・その引き方」だけで、
