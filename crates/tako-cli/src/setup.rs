@@ -3231,6 +3231,7 @@ fn mark_setup_complete(
 /// 日本語でも `--check` は check-health と同じ言語で出す）。診断の正本は表示言語のグローバルを読むので、
 /// 組む前に決める
 pub fn run_check() -> Result<(), String> {
+    crate::local_data_gate()?;
     crate::init_local_lang();
     let lang = tako_core::i18n::lang();
     eprintln!(
@@ -3252,6 +3253,7 @@ pub fn run_check() -> Result<(), String> {
 
 /// `tako setup --reset` — config.yaml の setup.completed を false にリセット
 pub fn run_reset() -> Result<(), String> {
+    crate::local_data_gate()?;
     // ロック付き read-modify-write（#169: 他フィールドの並行更新を巻き戻さない）
     tako_control::setup::mutate_config(|config| {
         config.setup.completed = false;
@@ -3264,6 +3266,7 @@ pub fn run_reset() -> Result<(), String> {
 /// `tako setup --changes` — アップデート追従状況の表示（Issue #94）。
 /// MCP `tako_setup_changes` と同じ照会（`--json` で同一ペイロードを出力）
 pub fn run_changes(json: bool) -> Result<(), String> {
+    crate::local_data_gate()?;
     if json {
         let status = tako_control::setup::changes_status()?;
         println!(
@@ -3337,6 +3340,7 @@ fn run_data_migration_stage() {
 }
 
 pub fn run_setup(assume_yes: bool, review: bool, answers: &SetupAnswers) -> Result<(), String> {
+    crate::local_data_gate()?;
     eprintln!("tako セットアップ");
     eprintln!("═════════════════");
     eprintln!();

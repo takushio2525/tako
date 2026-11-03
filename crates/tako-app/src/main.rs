@@ -40606,6 +40606,121 @@ mod self_test {
         std::env::var("TAKO_2684_INJECT").unwrap_or_default()
     }
 
+    /// **#2689 の A/B**（項目 41c-2 の ① ③ ④）。`TAKO_2689_LEGACY=1` = 修正前の「Tab → 固定 800ms →
+    /// Enter → Tab の前から画面に出ている文字列で判定」へ戻す
+    fn legacy_2689() -> bool {
+        std::env::var("TAKO_2689_LEGACY").as_deref() == Ok("1")
+    }
+
+    /// **#2689 の注入口**（項目 41c-2 の ① ③ ④。検証プロセスの門の内側でだけ読む）。
+    ///
+    /// - `late` = Tab / Enter を [`INJECT_2689_LATE`] 遅れて届ける。シェルの処理が遅れた回（load 16 で
+    ///   1 回落ちた）を負荷なしで作る = 修正前の ① ③ は処理前の画面で判定して FAILED、修正後は
+    ///   echo の出力の行を待って通る
+    /// - `notab` = Tab を押さずに Enter だけ押す（確定しない）。修正後の ① は出力の行が違うので FAILED が正しい。
+    ///   `notab4` は ④ だけ = 修正前の ④ は Tab の前から出ているゴーストの文字列で通る（偽 PASS）、
+    ///   修正後の ④ は FAILED が正しい
+    fn inject_2689() -> String {
+        if !tako_core::paths::is_verification_process() {
+            return String::new();
+        }
+        std::env::var("TAKO_2689_INJECT").unwrap_or_default()
+    }
+
+    /// `TAKO_2689_INJECT=late` で Tab / Enter を遅らせる長さ（修正前の固定待ち 800ms を十分に超える）
+    const INJECT_2689_LATE: Duration = Duration::from_secs(3);
+
+    /// 41c の Tab / Enter を順に押す（#2689 の注入: `late` = まとめて遅れて届ける・`notab` / `notab<site>` =
+    /// Tab を押さない。`site` は ① ③ ④ の番号）
+    fn press_41c(any: AnyWindowHandle, cx: &mut AsyncApp, site: u8, keys: &[&'static str]) {
+        let inject = inject_2689();
+        let notab = inject == "notab" || inject == format!("notab{site}");
+        let keys: Vec<&'static str> = keys
+            .iter()
+            .copied()
+            .filter(|key| !(notab && *key == "tab"))
+            .collect();
+        if inject == "late" {
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(INJECT_2689_LATE).await;
+                for key in keys {
+                    press(any, cx, key);
+                }
+            })
+            .detach();
+        } else {
+            for key in keys {
+                press(any, cx, key);
+            }
+        }
+    }
+
+    /// 41c の「ゴーストに Tab → Enter」の 1 実装（#2689）。
+    ///
+    /// 修正前は Tab の後に**固定で 800ms 待ってから** Enter を押し、結果を「`TAKO600-ghost-ok` が画面に
+    /// 出た」で確かめていた。ところがゴーストは同じ文字列を **Tab の前から**画面に出しているので、その
+    /// アンカーは Tab / Enter の処理を待たずに成立する。シェルの処理が 800ms に間に合わない回は処理前の
+    /// 画面（案内つき）で判定して落ち（load 16 で 1 回）、Tab が確定しなくても通る偽 PASS の余地もあった。
+    ///
+    /// いまは Tab と Enter を続けて押し（PTY は打鍵の順を保つので間の待ちは要らない）、**実行の後に
+    /// しか出ない echo の出力の行**（行全体が `outputs` のどれかと一致）が出るのを状態で待つ。返すのは
+    /// 一致した出力の行（上限まで出なければ `None`）と、そのときの表示行（案内の混入などを呼び手が見る）。
+    /// `outputs` には期待の行と、外れたときの行（確定しなかった等）を並べる = 外れも上限を待たずに読める
+    async fn tab_enter_41c(
+        any: AnyWindowHandle,
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        site: u8,
+        label: &str,
+        outputs: &[&str],
+    ) -> (Option<String>, Vec<String>) {
+        let started = std::time::Instant::now();
+        press_41c(any, cx, site, &["tab", "enter"]);
+        let wanted: Vec<String> = outputs.iter().map(|o| o.to_string()).collect();
+        let output_of = move |lines: &[String]| {
+            lines
+                .iter()
+                .map(|l| l.trim())
+                .find(|l| wanted.iter().any(|w| w == l))
+                .map(str::to_string)
+        };
+        let budget = state_wait_budget(Duration::from_secs(15), machine_busy());
+        let probe = output_of.clone();
+        wait_for_app_state(window, cx, label, budget, move |app| {
+            app.focused_session()
+                .is_some_and(|s| probe(&s.visible_lines()).is_some())
+        })
+        .await;
+        let lines = window
+            .update(cx, |app, _, _| {
+                app.focused_session()
+                    .map(|s| s.visible_lines())
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let output = output_of(&lines);
+        // 読めなかったときは画面の末尾（空行を除く 6 行）を添える = 何が出ていたかで切り分ける
+        let tail: Vec<&str> = if output.is_none() {
+            let shown: Vec<&str> = lines
+                .iter()
+                .map(|l| l.trim_end())
+                .filter(|l| !l.is_empty())
+                .collect();
+            shown[shown.len().saturating_sub(6)..].to_vec()
+        } else {
+            Vec::new()
+        };
+        println!(
+            "TAKO_SELF_TEST_2689: label={label:?} output={output:?} waited={:.2}s budget={:.1}s \
+             inject={:?} screen_tail={tail:?} {}",
+            started.elapsed().as_secs_f32(),
+            budget.as_secs_f32(),
+            inject_2689(),
+            env_line()
+        );
+        (output, lines)
+    }
+
     /// **#2477 の注入口**（項目 93 (e) = 694(e)）。`transient` で「子の走査が 1 瞬間だけ居た子を
     /// 拾い、その子が指紋を動かさずに消える」順序を固定する（[`inject_transient_child_2477`]）。
     /// 負荷は作らない（子は印のファイルを 0.1 秒ごとに見るだけ）
@@ -67898,22 +68013,43 @@ mod self_test {
                     wait_for_focused_text(window, cx, &hint_text, Duration::from_secs(15)).await,
                     "案内は毎行出る（#614）",
                 );
-                press(any, cx, "tab");
-                wait(cx, 800).await;
-                press(any, cx, "enter");
-                // 実行された行が出るのを待ってから「案内が混ざっていない」を見る
-                // （#796: アンカー無しの否定検査は出力前に通ってしまう）
-                check(
-                    absent_after_anchor(
+                // #2689: 実行の結果は「実行の後にしか出ない echo の出力の行」で確かめる（tab_enter_41c）。
+                // ゴーストの元は履歴の先頭 = すぐ上の右矢印で実行した `echo TAKO600-ghost-ok 41c` なので、
+                // 確定して実行した echo の出力の行はこれ（行全体で比べる = 案内が実行内容に混ざれば一致しない。
+                // 旧のアンカー `TAKO600-ghost-ok` は部分一致なので、Tab の前のゴーストでも成立していた）
+                let ghost_output = "TAKO600-ghost-ok 41c";
+                if legacy_2689() {
+                    press_41c(any, cx, 1, &["tab"]);
+                    // tako:fixed-wait-enter-ok A/B の旧経路（#2689 の修正前 = Tab の後の固定 800ms）を再現する
+                    wait(cx, 800).await;
+                    press_41c(any, cx, 1, &["enter"]);
+                    check(
+                        absent_after_anchor(
+                            window,
+                            cx,
+                            "TAKO600-ghost-ok",
+                            &hint_text,
+                            Duration::from_secs(15),
+                        )
+                        .await,
+                        "Tab で予測が確定し、案内の文字列は実行内容に混ざらない（#614）",
+                    );
+                } else {
+                    let (output, lines) = tab_enter_41c(
+                        any,
                         window,
                         cx,
-                        "TAKO600-ghost-ok",
-                        &hint_text,
-                        Duration::from_secs(15),
+                        1,
+                        "41c-2 ①: Tab → Enter の echo の出力",
+                        &[ghost_output, "TAKO600-gh"],
                     )
-                    .await,
-                    "Tab で予測が確定し、案内の文字列は実行内容に混ざらない（#614）",
-                );
+                    .await;
+                    check(
+                        output.as_deref() == Some(ghost_output)
+                            && !lines.iter().any(|l| l.contains(&hint_text)),
+                        "Tab で予測が確定し、案内の文字列は実行内容に混ざらない（#614）",
+                    );
+                }
 
                 // ② ゴーストが無いときの Tab は従来の補完のまま（非回帰）。
                 //    補完は「今いる cwd」で走るので、先に隔離 HOME へ移動しておく
@@ -67973,14 +68109,33 @@ mod self_test {
                     .await,
                     "Tab 確定 OFF では案内から Tab が消える（#614）",
                 );
-                press(any, cx, "tab");
-                wait(cx, 800).await;
-                press(any, cx, "enter");
-                wait(cx, 1200).await;
-                check(
-                    !focused_contains(window, cx, "ghost-ok"),
-                    "Tab 確定 OFF ならゴーストがあっても Tab は確定しない（#614 逃げ道）",
-                );
+                if legacy_2689() {
+                    press_41c(any, cx, 3, &["tab"]);
+                    // tako:fixed-wait-enter-ok A/B の旧経路（#2689 の修正前 = Tab の後の固定 800ms）を再現する
+                    wait(cx, 800).await;
+                    press_41c(any, cx, 3, &["enter"]);
+                    wait(cx, 1200).await;
+                    check(
+                        !focused_contains(window, cx, "ghost-ok"),
+                        "Tab 確定 OFF ならゴーストがあっても Tab は確定しない（#614 逃げ道）",
+                    );
+                } else {
+                    // #2689: 確定しなければ echo の出力は打った接頭辞のまま（`TAKO600-g`）
+                    let (output, lines) = tab_enter_41c(
+                        any,
+                        window,
+                        cx,
+                        3,
+                        "41c-2 ③: Tab 確定 OFF の Tab → Enter の echo の出力",
+                        &["TAKO600-g", ghost_output],
+                    )
+                    .await;
+                    check(
+                        output.as_deref() == Some("TAKO600-g")
+                            && !lines.iter().any(|l| l.contains("ghost-ok")),
+                        "Tab 確定 OFF ならゴーストがあっても Tab は確定しない（#614 逃げ道）",
+                    );
+                }
                 let _ = window.update(cx, |app, _, _| {
                     tako_control::dispatch(
                         app,
@@ -68030,14 +68185,37 @@ mod self_test {
                         && !focused_contains(window, cx, &hint_text_no_tab),
                     "残り回数を使い切ると案内が消える（#614 うるさくならない）",
                 );
-                press(any, cx, "tab");
-                wait(cx, 800).await;
-                press(any, cx, "enter");
-                check(
-                    wait_for_focused_text(window, cx, "TAKO600-ghost-ok", Duration::from_secs(15))
+                if legacy_2689() {
+                    press_41c(any, cx, 4, &["tab"]);
+                    // tako:fixed-wait-enter-ok A/B の旧経路（#2689 の修正前 = Tab の後の固定 800ms）を再現する
+                    wait(cx, 800).await;
+                    press_41c(any, cx, 4, &["enter"]);
+                    check(
+                        wait_for_focused_text(
+                            window,
+                            cx,
+                            "TAKO600-ghost-ok",
+                            Duration::from_secs(15),
+                        )
                         .await,
-                    "案内が消えても Tab 確定は効き続ける（#614）",
-                );
+                        "案内が消えても Tab 確定は効き続ける（#614）",
+                    );
+                } else {
+                    // #2689: 修正前の「TAKO600-ghost-ok が画面に出た」はゴーストだけで成立していた
+                    let (output, _) = tab_enter_41c(
+                        any,
+                        window,
+                        cx,
+                        4,
+                        "41c-2 ④: 案内を使い切った後の Tab → Enter の echo の出力",
+                        &[ghost_output, "TAKO600-gh"],
+                    )
+                    .await;
+                    check(
+                        output.as_deref() == Some(ghost_output),
+                        "案内が消えても Tab 確定は効き続ける（#614）",
+                    );
+                }
 
                 // エッジ 1: IME 変換中（未確定文字列）でも予測表示が壊れないこと。
                 // tako の未確定文字列はオーバーレイ描画で PTY へ流れないので、
@@ -108209,6 +108387,139 @@ mod selftest_wait_watchdog {
         let good = "            check(\n                \
                     wait_for_focused_text(window, cx, \"X\", Duration::from_secs(15)).await,\n";
         assert!(fixed_wait_then_positive_contains(good).is_empty());
+    }
+
+    /// 「入力 → **固定待ち** → Enter」の形を探す（#2689）。
+    ///
+    /// PTY は打鍵の順を保つので、Enter の前に入力の効果を時間で待つ必要は無い。それでも待っていた
+    /// 項目 41c-2 の 3 か所（Tab → 固定 800ms → Enter）は、Enter の後の判定が「Tab の前からゴーストとして
+    /// 画面に出ている文字列」をアンカーにしていて、固定待ちがそのアンカーの空振りを覆い隠していた
+    /// （シェルの処理が 800ms に間に合わない回は処理前の画面で判定して落ち、確定しなくても通る偽 PASS も
+    /// ありえた）。[`fixed_wait_then_positive_contains`] は「固定待ちの直後の check」しか見ないので、
+    /// 間に Enter が挟まり、判定が `absent_after_anchor` / 否定検査だったこの形を拾えなかった。
+    /// 正しい形は、Enter の後に「実行の後にしか出ないもの」（echo の出力の行など）を状態で待つこと。
+    /// A/B の旧経路など意図して残す形は、その行か直前のコメント行に `tako:fixed-wait-enter-ok <理由>` を書く。
+    ///
+    /// 見るのは「固定待ち（`wait(cx…` / `sleep(cx…` の 1 行）の次のコードの行が、名前が `press` で始まり
+    /// `"enter"` を押す呼び出し」だけ（`cx.background_executor().timer(…)` の複数行の待ちや、Enter を
+    /// `type_text(…, true)` で打つ形は見ない）
+    fn fixed_wait_before_enter(src: &str) -> Vec<usize> {
+        const ALLOW: &str = concat!("tako:fixed-wait", "-enter-ok");
+        let lines: Vec<&str> = src.lines().collect();
+        let code = |line: &str| {
+            let t = line.trim();
+            !t.is_empty() && !t.starts_with("//")
+        };
+        let marked = |line: &str| {
+            line.find(ALLOW)
+                .is_some_and(|p| !line[p + ALLOW.len()..].trim().is_empty())
+        };
+        let mut hits = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            // 行末のコメント（同じ行の印など）を外してから見る
+            let t = line.split("//").next().unwrap_or(line).trim();
+            let fixed = (t.starts_with(concat!("wait(", "cx"))
+                || t.starts_with(concat!("sleep(", "cx")))
+                && t.ends_with(").await;");
+            if !fixed {
+                continue;
+            }
+            let Some(next) = lines[index + 1..]
+                .iter()
+                .map(|l| l.trim())
+                .find(|l| code(l))
+            else {
+                continue;
+            };
+            if !(next.starts_with("press") && next.contains("\"enter\"")) {
+                continue;
+            }
+            let allowed = marked(line)
+                || lines[..index]
+                    .iter()
+                    .rev()
+                    .take_while(|l| l.trim_start().starts_with("//"))
+                    .any(|l| marked(l));
+            if !allowed {
+                hits.push(index + 1);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn enterの直前に入力の効果を固定時間で待っていない() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/self_test");
+        let mut sources = vec![("main.rs".to_string(), include_str!("main.rs").to_string())];
+        for entry in std::fs::read_dir(&dir).expect("src/self_test").flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|x| x == "rs") {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                sources.push((
+                    format!("self_test/{name}"),
+                    std::fs::read_to_string(&path).unwrap_or_default(),
+                ));
+            }
+        }
+        let hits: Vec<String> = sources
+            .iter()
+            .flat_map(|(file, src)| {
+                fixed_wait_before_enter(src)
+                    .into_iter()
+                    .map(move |line| format!("crates/tako-app/src/{file}:{line}"))
+            })
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "{hits:?} が「入力の効果を固定時間で待ってから Enter を押す」形。PTY は打鍵の順を保つので\
+             待ちは要らず、Enter の後の判定が Enter の前から画面にある文字列で成立する余地だけが残る（#2689）。\
+             Enter の後に「実行の後にしか出ないもの」（echo の出力の行など）を状態で待つこと。\
+             A/B の旧経路など意図して残すなら、その行か直前のコメント行に `tako:fixed-wait-enter-ok <理由>` を書く"
+        );
+    }
+
+    /// 検出力の担保: 修正前の 41c-2 の形を名指し、理由つきの印と Enter 以外は許す
+    #[test]
+    fn 番犬はenterの直前の固定待ちを見逃さず印と他の入力は許す() {
+        let wait = concat!("wait(", "cx, 800).await;");
+        let tab = "                press(any, cx, \"tab\");";
+        let enter = "                press(any, cx, \"enter\");";
+        // 修正前の 41c-2 ①（Tab → 固定 800ms → Enter）
+        let bad =
+            format!("{tab}\n                {wait}\n{enter}\n                check(ok, \"x\");");
+        assert_eq!(fixed_wait_before_enter(&bad), vec![2]);
+        // 間のコメント行は飛ばして次のコードの行を見る・名前が press で始まる別の口も同じ
+        let commented = format!(
+            "{tab}\n                {wait}\n                // 確定を待つ\n                \
+             press_41c(any, cx, 1, &[\"enter\"]);"
+        );
+        assert_eq!(fixed_wait_before_enter(&commented), vec![2]);
+        let sleep = bad.replace(concat!("wait(", "cx"), concat!("sleep(", "cx"));
+        assert_eq!(fixed_wait_before_enter(&sleep), vec![2]);
+        // 理由つきの印（直前のコメント行・同じ行）は外す。理由の無い印では外さない
+        let allow = concat!("tako:fixed-wait", "-enter-ok");
+        let marked = format!(
+            "{tab}\n                // {allow} A/B の旧経路\n                {wait}\n{enter}"
+        );
+        assert!(fixed_wait_before_enter(&marked).is_empty());
+        let same_line = format!("{tab}\n                {wait} // {allow} 旧経路\n{enter}");
+        assert!(fixed_wait_before_enter(&same_line).is_empty());
+        let same_line_bare = format!("{tab}\n                {wait} // {allow}\n{enter}");
+        assert_eq!(fixed_wait_before_enter(&same_line_bare), vec![2]);
+        let bare = format!("{tab}\n                // {allow}\n                {wait}\n{enter}");
+        assert_eq!(fixed_wait_before_enter(&bare), vec![3]);
+        // Enter 以外の入力の前の固定待ち（clear の後に打つ等）は見ない
+        let other = format!(
+            "                {wait}\n                type_text(any, cx, \"echo X\", false);"
+        );
+        assert!(fixed_wait_before_enter(&other).is_empty());
+        // 修正後の形（Tab と Enter を続けて押し、出力の行を状態で待つ）は通る
+        let fixed = "                let (output, lines) = tab_enter_41c(any, window, cx, 1, \"x\", &[\"A\"]).await;";
+        assert!(fixed_wait_before_enter(fixed).is_empty());
     }
 }
 

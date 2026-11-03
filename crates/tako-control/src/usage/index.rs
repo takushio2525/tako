@@ -2168,6 +2168,9 @@ mod tests {
         }
         use crate::orchestrator::agent::{ensure_trusted, WorkerAgent};
         let home = tako_core::paths::verification_agent_home();
+        // pid は使い回されるので、同じ pid だった前のプロセスの残骸が在りうる（その pid はいまこの子のもの =
+        // 消してよい）。見たいのは「読むだけの呼び手が作るか」なので、空の状態から始める
+        let _ = std::fs::remove_dir_all(&home);
         assert!(!home.exists(), "子の起動の時点で在る: {}", home.display());
         let usage = |by: Option<&str>| {
             let query = crate::usage::UsageQuery {
