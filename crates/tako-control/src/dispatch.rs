@@ -1171,6 +1171,8 @@ pub enum Reason {
     QueuePriorityTargetBoth,
     /// 受付番号の処理が順番待ちに居ない（`cancel` / `priority`。#1996）
     QueueJobUnknown(u64),
+    /// `tako queue cancel` / `priority` / `start`: 調停役（GUI）に届かない（#2365。旧 CLI の `QUEUE_OFFLINE_NOTE`）
+    QueueArbiterOffline,
     /// `--wait` の要求に GUI が pane ID を返さなかった（`command` は `run` / `run-interactive`）
     RunNoPaneId(&'static str),
     /// `--wait` で待ったコマンドが 0 以外で終わった
@@ -3385,6 +3387,8 @@ impl Reason {
             (Self::QueueJobUnknown(id), En) => {
                 format!("job {id} is not in the queue (`tako queue` lists them)")
             }
+            (Self::QueueArbiterOffline, Ja) => "順番待ちは無効（tako が起動していない）".into(),
+            (Self::QueueArbiterOffline, En) => "the queue is off (tako is not running)".into(),
             (Self::RunNoPaneId(command), Ja) => format!("{command} が pane ID を返さなかった"),
             (Self::RunNoPaneId(command), En) => format!("{command} did not return a pane ID"),
             (Self::RunExitedWithCode(code), Ja) => format!("コマンドが exit code {code} で終了"),

@@ -767,6 +767,25 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   3 つを外した）と、実経路の `crates/tako-cli/tests/issue2365_cli_sleep_recover_watch_lang.rs`（unix。偽の GUI で
   sleep-guard の状態と watch のダイアログ / 突然死、偽の osascript で登録 / 解除、一時の data dir の世代で recover を
   日英で叩く。A/B は同じ `TAKO_2365_HUMAN_BIN`）
+- 続けて **`tako queue`（状況・cancel / start / priority / limits）と `tako usage` の人向けの表示**も移した。文は
+  `ReplyNote` の 72 種（`Queue*` / `Usage*`）と `Reason::QueueArbiterOffline`（cancel / priority / start が調停役に
+  届かない）。**調停役（GUI）が組む文は応答の値のまま変えない**: 待つ理由（`text` / `head_text` / `blocked.text` /
+  起動待ちの `reason`）・見込み（`eta.text` / `start_text`）・札を配らない理由・priority の `note`・調停役でない理由・
+  機の状態を採れない理由は、日本語の表示では応答の文をそのまま出し、英語の表示では同じ応答の構造の欄（`reason` /
+  `code` / `eta` / `start_s`）から組む（`ReplyNote::QueueWaitReason` / `QueueEta` / `QueueStartEta` /
+  `QueueJobserverOff` ほか。待つ理由の英語は種類だけを言う = 応答に数値の欄が無い。右パネルの resources ビュー
+  （#1995）と同じ方針）。usage の注記（`notes`）は組み上がった応答から組む 1 実装 `usage::usage_notes` にし、作る側は
+  その日本語を応答へ載せ、`tako usage` の英語の表示は応答から組み直す（`--show` の GUI の答えでも同じ）。`hint` は
+  `ReplyNote::UsageNoObservations`、段の名前の言い換え（未分類・Issue なし ほか）は `report::group_name_in`
+  （日本語の口 `group_name` = 応答の `name`）。数の書き方は `usage::display::tokens_in`（英語は K / M / B）・
+  `range_label_in`、時間は `queue_wrapper::human_secs_in`、諦めた処理の説明は `gave_up_lines_in`（言語を受けない口は
+  日本語の口 = `tako queue <コマンド>` の進みの行と右パネルの usage ビューが今も呼ぶ）。`--json` の出力（GUI に届かない
+  ときの `note` を含む）は #2365 より前の日本語のまま。番犬は `issue1762_dispatch_error_lang.rs`（旧文の表に
+  `ReplyNote` 103 行・`Reason` 1 行・`CLI_NOTE_SCOPES` に 17 の関数・中身の口 `gave_up_lines_in` / `usage_notes` の
+  固定文と日本語・待つ理由と札を配らない理由の種類ごとの英語・priority の `note` の字面・注記の並び・段の名前）と、
+  実経路の `crates/tako-cli/tests/issue2365_cli_queue_usage_lang.rs`（unix。偽の調停役 `TAKO_QUEUE_SOCKET` の応答・
+  届かない口・黙る口 + `TAKO_IPC_TIMEOUT_SECS=1`、一時の設定 dir の偽の会話記録と観測で usage を日英で叩く。
+  A/B は同じ `TAKO_2365_HUMAN_BIN`、`I2365Q_DUMP=<dir>` で全ケースの出力を書き出す）
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
