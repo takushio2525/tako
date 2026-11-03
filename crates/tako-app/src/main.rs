@@ -1446,12 +1446,13 @@ fn inject_777_hang(kind: &str) {
     }
 }
 
-/// このプロセスだけが使う資源の後片付け（#1192 / #1253 / #2388）。
+/// このプロセスだけが使う資源の後片付け（#1192 / #1253 / #2388 / #2491）。
 ///
-/// **成功の出口（`on_app_quit`）とセルフテストの失敗の出口（`self_test::fail`）の 1 実装**。
-/// 失敗の出口は `exit(1)` で終わって `on_app_quit` を通らないので、以前は FAILED のたびに
-/// 器のサーバー（`tako-iso-<pid>` / `tako-st-<pid>`）とソケットファイル・検証用の設定置き場が
-/// 残っていた（#2388）。片付ける物を足すときはここへ足す = 両方の出口へ同時に効く
+/// **成功の出口（`on_app_quit`）とセルフテストの失敗の出口（`self_test::fail`）と visual-test の
+/// 出口（`self_test::visual_exit`）の 1 実装**。後ろの 2 つは `exit` で終わって `on_app_quit` を
+/// 通らないので、以前は FAILED のたびに（#2388）・visual-test が通るたびに（#2491）器のサーバー
+/// （`tako-iso-<pid>` / `tako-st-<pid>`）とソケットファイル・検証用の設定置き場が残っていた。
+/// 片付ける物を足すときはここへ足す = すべての出口へ同時に効く
 /// （配線は番犬 `selftest_exit_cleanup_watchdog` が見る）。
 ///
 /// - #1192: 自分の pid から作った使い捨てソケット（`tako-iso-<pid>` / `tako-st-<pid>`）は、
@@ -37142,6 +37143,25 @@ mod self_test {
         std::process::exit(1);
     }
 
+    /// visual-test の出口（成功 = 0・知らない節の名前 = 1。#2491）。
+    ///
+    /// visual-test は節を回し終えると `exit` で抜けるので `on_app_quit` を通らない。ここを通さないと
+    /// 成功のたびに検証用の設定置き場（`tako-agent-config-<pid>`）が、器を有効にした回
+    /// （`TAKO_PERSIST=1`）は器のサーバー（`tako-iso-<pid>`）とソケットファイルも残る（#2491 で実測）。
+    /// 片付けは失敗の出口と同じ [`run_exit_cleanup_bounded`]（上限 5 秒・片付けた物の 1 行）で、
+    /// 成功の行は片付けの**後**に出す（`on_app_quit` と同じ順。行を見て止める呼び手も片付けを待つ）。
+    /// `TAKO_2491_LEGACY=1` は修正前（片付けずに exit）= 同一バイナリでの A/B
+    #[cfg(feature = "visual-test")]
+    fn visual_exit(code: i32) -> ! {
+        if std::env::var_os("TAKO_2491_LEGACY").is_none() {
+            run_exit_cleanup_bounded(|| super::cleanup_process_scoped("visual_test::exit", false));
+        }
+        if code == 0 {
+            println!("TAKO_VISUAL_TEST_OK");
+        }
+        std::process::exit(code);
+    }
+
     /// 失敗の出口の後片付けの上限（#2388）。`on_app_quit` を見張る終了の猶予（#777 の既定 5 秒）と揃える
     const EXIT_CLEANUP_LIMIT: Duration = Duration::from_secs(5);
 
@@ -49782,549 +49802,459 @@ mod self_test {
                 "" => {}
                 "profiles" => {
                     profiles_form_visual(window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 "chat-table" => {
                     chat_table_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 "conflict-card" => {
                     conflict_card_visual(window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 "terminal-grid" => {
                     terminal_grid_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // 検査ではなく計測（#787）。ディスプレイが消えていても測れる
                 "grid-bench" => {
                     terminal_grid_bench(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // 検査ではなく計測（#821）。プレビュー開閉の live ヒープを追う
                 "preview-leak" => {
                     preview_leak_bench(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // 検査ではなく計測（#830）。チャット開閉の live ヒープを追う
                 "chat-leak" => {
                     chat_leak_bench(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 "preview-code" => {
                     preview_code_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1649: 編集カーソルが画面外へ出たままにならないか（レイアウト値で見る）
                 "cursor-follow" => {
                     cursor_follow_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #812: ペイン枠線を塗るのがルート側の 1 枚だけか
                 "pane-border" => {
                     pane_border_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #932: 静止した画面が 1 ピクセルも動かないか（ちらつきの機械検証）
                 "flicker" => {
                     flicker_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 "remote-tree" => {
                     remote_tree_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 "ime-preedit" => {
                     ime_preedit_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #947: `terminal_screen_lines` の字の大きさがペインのフォントサイズに
                 // 追従するか（ホバープレビューで測る）
                 "screen-lines" => {
                     screen_lines_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1450 B2: 右パネル tasks ビューの実ピクセル（画面収録権限に依らない）
                 "tasks-panel" => {
                     tasks_panel_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1479: 項目押下でその場に展開されるか + バッジが欠けないか
                 "tasks-accordion" => {
                     tasks_accordion_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1472: 添付の行を**実マウスで**押すとプレビューが開くか
                 "task-attachment" => {
                     task_attachment_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1945: ステータスバーの自動復帰の一括ボタンを**実マウスで**押すと、
                 // 退避中を含む全エージェントのペインが揃い、表示が 3 状態で切り替わるか
                 "limit-resume-all" => {
                     limit_resume_all_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1536: 絵文字を置き換えたアイコンが実ピクセルで描かれているか
                 "no-emoji" => {
                     no_emoji_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1657: 実行ペインのタイトルバーに実行中 / 完了 / 失敗のバッジが
                 // 実ピクセルで描かれているか（実 `Run` → GUI の終了確定経路まで通す）
                 "run-badge" => {
                     run_badge_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2425: 起動待ちの帯（理由・順番・今すぐ起こす）・待っている間の打鍵の扱い・起きたら消える
                 "launch-wait-band" => {
                     launch_wait_band_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1579: 絵文字ではないグリフ（× / ●）を置き換えた印が
                 // 実ピクセルで描かれているか
                 "glyph-icon" => {
                     glyph_icon_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1487: タブバーの ー を**実マウスで**押すとタブが 1 単位で退避するか
                 "shelve-tab" => {
                     shelve_tab_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1652: 修飾キー付きの打鍵が実 GUI の打鍵経路で編集に効くか
                 "editor-keys" => {
                     editor_keys_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1660: 大きいファイル（8 万行超）を実 GUI の打鍵経路で編集できるか。
                 // 数秒かかる計測なので全節実行の並びには入れない（単独実行だけ）
                 "large-file-edit" => {
                     large_file_edit_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1660: 10 万行 / 10 MB の末尾近くで検索の強調・⌘ホバーの下線・診断の波線が
                 // 描かれるか（LF / CRLF）。素材が大きいので全節実行の並びには入れない
                 "large-file-decor" => {
                     large_file_decor_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1677: ジャンプ履歴の戻る / 進むが実 GUI の打鍵経路で効くか
                 "jump-keys" => {
                     jump_keys_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1682: 補完の一覧（1000 件で可視ぶんだけ組む・実ピクセル・5 キー・⌘F と同時）
                 "completion" => {
                     completion_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1869: 読み込み中に打つと「読み込み中」が出て、済んだ後に一覧が出るか（偽サーバ）
                 "completion-loading" => {
                     completion_loading_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1909: 閉じた後に遅れて走り出した打鍵の要求が取り消しを追い越さないか（偽サーバ）
                 "completion-cancel" => {
                     completion_cancel_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1682: 実の rust-analyzer の候補が出て Enter で入るか（無ければ SKIPPED）
                 "completion-real" => {
                     completion_real_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1681: ホバーのカード（実ピクセル・100 回の出し入れ・下端で上へ返す・補完と同時）
                 "hover" => {
                     hover_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1681: 実の rust-analyzer の doc のカードが出るか（無ければ SKIPPED）
                 "hover-real" => {
                     hover_real_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1685: 参照検索の結果の行の ⌘クリックで新しいペインが 1 枚増え該当行が見える（偽サーバ）
                 "xref-1685" => {
                     xref_1685_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1686: 右クリックの「名前の変更…」→ 欄に実キーで打って Enter → undo 1 回で戻る（偽サーバ）
                 "rename-1686" => {
                     rename_1686_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1686: 同じ手順を実の rust-analyzer で（無ければ SKIPPED）
                 "rename-1686-real" => {
                     rename_1686_real_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2203: 右パネルの usage ビュー（素材は scripts/test-usage-panel-2203.sh）
                 "usage-panel-2203" => {
                     usage_panel_2203_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1733: 実行ボタン横のドロップダウン（実マウスで開く・候補を選ぶ・欄で直す・出典タグ）
                 "run-dropdown-1733" => {
                     run_dropdown_1733_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1952: 基板とポートの欄（実の arduino-cli。素材は scripts/test-run-board-1952.sh）
                 "run-board-1952" => {
                     run_board_1952_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1734: 実行先の行を実マウスで切り替え、実マウスの再生ボタン 2 回でペインの増え方が変わる
                 "run-target-1734" => {
                     run_target_1734_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1893: 右クリックの「ホバー情報を表示」・キー・補完中のキー・巨大な doc（偽サーバ）
                 "hover-1893" => {
                     hover_1893_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1893: 読み込み中に乗せると「読み込み中」→ 済んだらカード / 終わらなければ loading
                 "hover-loading" => {
                     hover_loading_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1893: 実の rust-analyzer を暖機せずに乗せる・キー（無ければ SKIPPED）
                 "hover-loading-real" => {
                     hover_loading_real_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1680: ⌘ホバー中の識別子の下線が実ピクセルで描かれ、⌘ を離すと消えるか
                 "goto-hover" => {
                     goto_hover_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1944: まっさらで .py を開くと取って起こし、状態が出て、押せば入るか（ミラー）
                 "lsp-fetch" => {
                     lsp_fetch_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2048: 隔離 GUI で .rs を編集しても言語サーバを起こさず、タイトルの 1 行だけか（偽サーバ）
                 "lsp-held-2048" => {
                     lsp_held_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1956: 第 2 波の言語サーバ（実物）で波線とホバーのカードが出るか（素材はスクリプト）
                 "lsp-servers" => {
                     lsp_servers_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1684: 本文の右クリックメニューに言語サーバの項目が出て、押すと動くか（偽サーバ）
                 "lsp-context-menu" => {
                     lsp_context_menu_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2247: 「Finder で表示」がどの入口からも NSWorkspace の 1 実装へ 1 回届くか（記録の口）
                 "preview-reveal-2247" => {
                     preview_reveal_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1684: 実の rust-analyzer で右クリック → 項目 → 定義へ移動（無ければ SKIPPED）
                 "lsp-context-menu-real" => {
                     lsp_context_menu_real_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1728: 実行コマンド / 検索欄を文字の途中で切って描画中に落ちないか
                 "run-command-truncate" => {
                     run_command_truncate_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1741: 可視行数（追従の余白・ページ移動の歩幅）が描いた行の実矩形と合うか
                 "viewport-lines" => {
                     viewport_lines_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1772: ⌘+ / ⌘- / ⌘0 でコードプレビュー（エディタ）と md の本文の字と行の高さが
                 // ペインの文字サイズに従うか。10 万行の素材を開くので全節実行の並びには入れない
                 "editor-font" => {
                     editor_font_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1653: 検索欄のトグルを実マウスで押すと件数が変わり、置換で型名が残るか
                 "search-case" => {
                     search_case_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1659: 外部変更の帯が出て、実マウスで差分・上書き・読み直しが効くか
                 "external-change" => {
                     external_change_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1661: Markdown を編集して抜けると描画へ戻り、目次が書き換えた見出しで
                 // 作り直されるか・編集中も目次から原文の行へ飛べるか（実マウスで押す）
                 "md-edit-resume" => {
                     md_edit_resume_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1873: 閲覧中の ⌘F 検索を閉じると描画へ戻り、目次が作られるか（実キーの経路）
                 "md-find-restore" => {
                     md_find_restore_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1834: ツリーの行を実マウスでドラッグして移せるか・断る場所で理由が出るか・
                 // 開いているペインが付け替わるか・ペインへの既存の D&D が壊れていないか
                 "tree-move" => {
                     tree_move_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 "tree-clipboard" => {
                     tree_clipboard_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1867: 複数選択・まとめた操作・⌥⌘V・コピーの進み具合と取り消し
                 "tree-multiselect" => {
                     tree_multiselect_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1895: ⇧↑ / ⇧↓・⌘⌫・1 つのファイルの途中の進み具合と取り消し・残り時間
                 "tree-keyboard-copy" => {
                     tree_keyboard_copy_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1908: ↑ / ↓ / ← / → / Enter / ⇧⌘↑ / ⇧⌘↓・残り時間の数え下ろし
                 "tree-keys" => {
                     tree_keys_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1903: ステータスバーの 5h / 7d が mod の報告の値で描かれ、古くなると戻るか
                 "mod-limits" => {
                     mod_limits_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1962: mod がバーを描いているとき、ステータスバーの claude の 5h / 7d / ctx を外すか
                 // #1961: TUI へのクリックの転送（合成のアプリ / 実物の claude）
                 "click-forward" => {
                     click_forward_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 "click-forward-claude" => {
                     click_forward_claude_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2025: 送れる履歴が無いときのオートスクロールが選択の端を (0, 0) へ寄せないか
                 "drag-autoscroll" => {
                     drag_autoscroll_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 "mod-bar" => {
                     mod_bar_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1963: mod が描いたコマンドカードは GPUI のカード帯へ出さず、viewport を縮めないか
                 "mod-card" => {
                     mod_card_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1964: GPUI のチャットと mod の描画（同じ会話）を並べて撮る・mod の描画の Copy を押せるか
                 "mod-chat" => {
                     mod_chat_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2159: mod が会話の行に描いたカードの [ run ] をクリック 1 回で実行・二重押しで 2 本走らない
                 "mod-card-click" => {
                     mod_card_click_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1949: `.ino` が C++ の構文で塗られ、構文セットが `.cpp` と同じ寿命で手放されるか
                 "ino-highlight" => {
                     ino_highlight_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1953: 既存の構文への別名で塗り、応答の `syntax` で読めるか
                 // （`TAKO_1953_LEGACY=1` で #1953 以前へ戻す A/B）
                 "syntax-alias" => {
                     syntax_alias_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1954: two-face に無い PowerShell の構文で塗り、応答の syntax で読めるか
                 "extra-syntax" => {
                     extra_syntax_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2031: tasks の 2 秒ごとの一覧更新の最中も返答欄への打鍵が止まらないか
                 // （置き場の読みは `TAKO_2031_INJECT=slow:<ミリ秒>` で遅らせて測る）
                 "tasks-tick" => {
                     tasks_tick_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2052: パレット / `tako panel` で開いた瞬間に一覧を引き直し、完了のボタンが
                 // UI スレッドで書き換えを待たないか（`TAKO_2031_INJECT=slow:<ミリ秒>` で遅らせて測る）
                 "tasks-offload" => {
                     tasks_offload_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1946: たまり場の縮小サムネイル・親 master の見出し・幽霊の後始末・間引き
                 "background-drawer" => {
                     background_drawer_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2120 / #2127: 復元したタブバーを撮り、master / solo のタブが役割名の手動名で固定されていないか
                 "master-tab-title" => {
                     master_tab_title_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1958: pane を省いた MCP の show のカードが呼び出し元の実ピクセルに描かれるか
                 "show-command-caller" => {
                     show_command_caller_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2016: 返答欄の IME（NSTextInputClient を NSView へ直接）・折り返し・上限・
                 // 送信の間と、返答の履歴が古い順で show と同じか
                 "tasks-input" => {
                     tasks_input_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2009: 見えていないプレビューを手放し、表に戻した見た目と操作が変わらないか
                 "preview-memory" => {
                     preview_memory_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1694: 横断検索の ⇧⌘F → Enter → 行の ⌘クリックで新しいペインが 1 枚増え該当行が見える
                 "workspace-search-1694" => {
                     workspace_search_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2045: 置換欄 → プレビュー → 行の置換 → すべて置換 → 元に戻す
                 "workspace-replace-2045" => {
                     workspace_replace_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2046: 鍵らしき文字を貼ると確認が出て、やめると PTY へ 1 バイトも届かないか
                 "paste-guard" => {
                     paste_guard_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2112: 設定画面「一般」のネット復帰の再開のトグルを実マウスで押し、
                 // 実行状態・settings.json・CLI / MCP の答えが揃うか
                 "net-resume" => {
                     net_resume_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1691: カーソルを括弧に置くと対の括弧が実ピクセルで強調され、対が無いと出ないか
                 "bracket-match" => {
                     bracket_match_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #1759: Enter の続き 2 つと括弧の自動閉じを実キーで 1 回ずつ打ち、前後を撮る
                 "enter-1759" => {
                     enter_1759_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2014: 「履歴」ボタンが返らない git の最中も UI スレッドを止めず、上限で理由を知らせる
                 "changelog-offload" => {
                     changelog_offload_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2150: コミット行のクリックが返らない git の最中も UI スレッドを止めず、上限で理由を知らせる
                 "changelog-expand" => {
                     changelog_expand_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2182: 右パネルの「返す」が返らないログインシェルの最中も UI スレッドを止めず、
                 // master の起動の組み立てが打ち切られたら失敗として記録する
                 "tasks-launch-2182" => {
                     tasks_launch_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 // #2340: パレットが旧表記（検索だけに効く別名）でも引け、表示はいまのラベル
                 "palette-alias" => {
                     palette_alias_visual(any, window, cx).await;
-                    println!("TAKO_VISUAL_TEST_OK");
-                    std::process::exit(0);
+                    visual_exit(0);
                 }
                 other => {
                     eprintln!(
@@ -50344,7 +50274,8 @@ mod self_test {
                          workspace-search-1694 / workspace-replace-2045 / paste-guard / bracket-match / enter-1759 / \
                          changelog-offload / changelog-expand / tasks-launch-2182 / palette-alias / preview-reveal-2247）"
                     );
-                    std::process::exit(1);
+                    // 窓とペインはもう開いている = 成功の出口と同じ後片付けを通す（#2491）
+                    visual_exit(1);
                 }
             }
 
@@ -52744,8 +52675,7 @@ mod self_test {
             if let Some(discovery) = std::env::var_os("TAKO_DISCOVERY_DIR") {
                 let _ = std::fs::remove_dir_all(discovery);
             }
-            println!("TAKO_VISUAL_TEST_OK");
-            std::process::exit(0);
+            visual_exit(0);
         })
         .detach();
     }
@@ -100967,6 +100897,9 @@ mod selftest_redraw_window_watchdog {
 ///    [`ALLOW_ABOVE`] 行に `tako:exit-cleanup-ok <理由>`）のどれか = 後片付けを通らない失敗の出口を
 ///    `fail` の外に増やさない
 /// 4. 使い捨ての判定（`owns_disposable_socket`）を呼ぶのは `cleanup_process_scoped` の中だけ
+/// 5. visual-test の出口（#2491）: `self_test::visual_exit` が `std::process::exit` より前に
+///    `cleanup_process_scoped` を呼び、visual-test の成功の行（`TAKO_VISUAL_TEST_OK`）を出すのは
+///    `visual_exit` の中だけ・`run_visual` の中で `std::process::exit` を直に呼ばない（逃げ道は 3 と同じ）
 ///
 /// テストのモジュール（`#[cfg(test)]` の直後の `mod … {`）は見ない
 #[cfg(test)]
@@ -100976,6 +100909,9 @@ mod selftest_exit_cleanup_watchdog {
     /// FAILED の行（文字列リテラルの頭として探す。`contains("TAKO_APP_SELF_TEST_FAILED")` の検査は拾わない）
     const FAILED: &str = "\"TAKO_APP_SELF_TEST_FAILED:";
     const OK_LINE: &str = "println!(\"TAKO_APP_SELF_TEST_OK\")";
+    /// visual-test の成功の行（#2491）
+    const VISUAL_OK: &str = "println!(\"TAKO_VISUAL_TEST_OK\")";
+    const EXIT: &str = "std::process::exit(";
     const QUIT_HOOK: &str = "cx.on_app_quit(";
     const DISPOSABLE: &str = "owns_disposable_socket(";
     const ALLOW_MARKER: &str = "tako:exit-cleanup-ok";
@@ -101138,6 +101074,69 @@ mod selftest_exit_cleanup_watchdog {
                 ));
             }
         }
+
+        // 5. visual-test の出口（#2491）。`visual_exit` が片付けてから exit する
+        let allowed = |i: usize| {
+            lines[i.saturating_sub(ALLOW_ABOVE)..=i]
+                .iter()
+                .any(|(_, l)| l.contains(ALLOW_MARKER))
+        };
+        let visual_exit = fn_span(&lines[self_test..], "visual_exit");
+        match visual_exit {
+            None => out.push((
+                0,
+                "`mod self_test` の `fn visual_exit` が見つからない（改名したならこの番犬も直す）"
+                    .into(),
+            )),
+            Some((head, end)) => {
+                let body: Vec<(usize, &str)> = lines
+                    .iter()
+                    .filter(|(n, _)| *n > head && *n <= end)
+                    .copied()
+                    .collect();
+                match body.iter().position(|(_, l)| code(l) && l.contains(EXIT)) {
+                    None => out.push((
+                        head,
+                        "`self_test::visual_exit` が exit しない（形が変わったならこの番犬も直す）"
+                            .into(),
+                    )),
+                    Some(exit) if !has_cleanup(&body[..exit]) => out.push((
+                        body[exit].0,
+                        "`self_test::visual_exit` が `cleanup_process_scoped` を通らずに exit する"
+                            .into(),
+                    )),
+                    Some(_) => {}
+                }
+            }
+        }
+        for (i, (n, line)) in lines.iter().enumerate() {
+            let inside = visual_exit.is_some_and(|(h, e)| *n > h && *n <= e);
+            if code(line) && line.contains(VISUAL_OK) && !inside && !allowed(i) {
+                out.push((
+                    *n,
+                    "visual-test の成功の行を `visual_exit` の外で出している\
+                     （後片付けを通らない成功の出口）"
+                        .into(),
+                ));
+            }
+        }
+        match fn_span(&lines[self_test..], "run_visual") {
+            None => out.push((
+                0,
+                "`mod self_test` の `fn run_visual` が見つからない（改名したならこの番犬も直す）"
+                    .into(),
+            )),
+            Some((head, end)) => {
+                for (i, (n, line)) in lines.iter().enumerate() {
+                    if *n > head && *n <= end && code(line) && line.contains(EXIT) && !allowed(i) {
+                        out.push((
+                            *n,
+                            "`run_visual` が `visual_exit` を通らずに exit する".into(),
+                        ));
+                    }
+                }
+            }
+        }
         out
     }
 
@@ -101153,7 +101152,8 @@ mod selftest_exit_cleanup_watchdog {
             "{}\nセルフテストの失敗の出口は exit で終わり `on_app_quit` を通らないので、\
              `cleanup_process_scoped` を呼ばないと器のサーバー（tako-iso-<pid>）・ソケットファイル・\
              検証用の設定置き場が FAILED のたびに残る（#2388）。失敗は `self_test::fail` を通し、\
-             片付ける物は `cleanup_process_scoped` へ足すこと。後片付けの要らない出口だけ、\
+             片付ける物は `cleanup_process_scoped` へ足すこと。visual-test の出口も同じく exit で\
+             終わるので `self_test::visual_exit` を通す（#2491）。後片付けの要らない出口だけ、\
              その行か直前 6 行に `// tako:exit-cleanup-ok <理由>` を書く",
             named.join("\n")
         );
@@ -101183,7 +101183,18 @@ mod selftest_exit_cleanup_watchdog {
             "        run(|| super::cleanup_process_scoped(\"self_test::fail\", false));", // 18
             "        std::process::exit(1);",                             // 19
             "    }",                                                      // 20
-            "}",                                                          // 21
+            "    fn visual_exit(code: i32) -> ! {",                       // 21
+            "        run(|| super::cleanup_process_scoped(\"visual_test::exit\", false));", // 22
+            "        println!(\"TAKO_VISUAL_TEST_OK\");",                 // 23
+            "        std::process::exit(code);",                          // 24
+            "    }",                                                      // 25
+            "    pub fn run_visual(cx: &mut App) {",                      // 26
+            "        match only {",                                       // 27
+            "            \"a\" => visual_exit(0),",                       // 28
+            "            _ => visual_exit(1),",                           // 29
+            "        }",                                                  // 30
+            "    }",                                                      // 31
+            "}",                                                          // 32
         ];
         let lines = |src: &[&str]| -> Vec<usize> {
             violations(&src.join("\n"))
@@ -101224,6 +101235,31 @@ mod selftest_exit_cleanup_watchdog {
             "        if owns_disposable_socket(pid, &socket) { kill(); }",
         );
         assert_eq!(lines(&inlined), vec![7]);
+
+        // ⑤ visual_exit から片付けを外す = exit の行を名指し（#2491）
+        let mut no_visual = good.clone();
+        no_visual.remove(21);
+        assert_eq!(lines(&no_visual), vec![23]);
+
+        // ⑥ 修正前の形（節の腕で成功の行を出して直に exit）= 成功の行と exit の行を名指し
+        let mut direct = good.clone();
+        direct.splice(
+            27..28,
+            [
+                "            \"a\" => {",
+                "                println!(\"TAKO_VISUAL_TEST_OK\");",
+                "                std::process::exit(0);",
+                "            }",
+            ],
+        );
+        assert_eq!(lines(&direct), vec![29, 30]);
+
+        // ⑦ 知らない節の名前で直に exit = その行を名指し。逃げ道があれば通す
+        let mut unknown = good.clone();
+        unknown[28] = "            _ => std::process::exit(1),";
+        assert_eq!(lines(&unknown), vec![29]);
+        unknown.insert(28, "            // tako:exit-cleanup-ok 窓を開く前に終わる");
+        assert_eq!(lines(&unknown), Vec::<usize>::new());
 
         // テストのモジュールの中（fixture や assert の文字列）は見ない
         let mut with_test = good.clone();

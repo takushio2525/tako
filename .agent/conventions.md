@@ -3007,6 +3007,10 @@ background を一往復した後の着地で決まる。**呼んだのと同じ 
 - `fail()` は FAILED の行の**後**に上限 5 秒で片付けるので、片付けが固まっても落ちた理由と終了コード 1 は
   変わらない。片付けた物は `TAKO_APP_SELF_TEST_EXIT_CLEANUP: backend=… agent_home=… left=…` の行で読む。
   A/B は `TAKO_2388_LEGACY=1`、実経路は `bash scripts/test-selftest-failed-cleanup-2388.sh`
+- visual-test の出口（成功の `TAKO_VISUAL_TEST_OK` と知らない節の名前の `exit(1)`）も `exit` で終わるので、
+  `self_test::visual_exit` を通す（#2491・FR-4.8.27）。節の腕で成功の行を出して直に exit しない
+  （`run_visual` の中の直の exit と `visual_exit` の外の成功の行は番犬が名指しする）。成功の行は片付けの
+  **後**に出る。A/B は `TAKO_2491_LEGACY=1`、実経路は `bash scripts/test-visual-exit-cleanup-2491.sh`
 
 ## TUI の画面マーカーは「幅で切られる」前提で選ぶ（Issue #1015）
 
