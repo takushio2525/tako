@@ -40945,6 +40945,42 @@ mod self_test {
     /// `TAKO_2689_INJECT=late` で Tab / Enter を遅らせる長さ（修正前の固定待ち 800ms を十分に超える）
     const INJECT_2689_LATE: Duration = Duration::from_secs(3);
 
+    /// **#2711 の A/B**（visual-test 項目 152 のバッジ・tasks-input の送信の間）。
+    /// `TAKO_2711_LEGACY=1` / `all` で両方、`152` / `tasks-input`（カンマ区切り）で片方だけ修正前へ戻す
+    /// （`check` は 1 つ目の失敗でプロセスごと止まるので、全節実行で後ろの tasks-input の旧の形を
+    /// 見るときは 152 を戻さない = #1902 の `legacy_1902` と同じ理由）。
+    ///
+    /// - `152` = 置いた件数を 2 秒 tick の一覧の着地から守らない（読む前に本物の件数へ戻りうる）
+    /// - `tasks-input` = 測る間 App Nap を止めず（`UserWork` を握らない）、基準の空押しを
+    ///   1 回目に 1 度だけ採って 5 回の送信の中央値と比べる
+    #[cfg(feature = "visual-test")]
+    fn legacy_2711(item: &str) -> bool {
+        std::env::var("TAKO_2711_LEGACY").is_ok_and(|value| {
+            value == "1" || value == "all" || value.split(',').any(|p| p.trim() == item)
+        })
+    }
+
+    /// **#2711 の注入口**（検証プロセスの門の内側でだけ読む）。
+    ///
+    /// - `land` = 項目 152 のバッジの各ケースで、件数を置いてから読むまでの間に一覧の読み直しを
+    ///   1 回撃って着地させる（2 秒 tick の着地がたまたま挟まった回を負荷なしで毎回作る）。修正後は
+    ///   着地を捨てて通り、旧の形は「置いた件数が読む前に変わった」で落ちる
+    /// - `step` = tasks-input の送信の間で、1 回目の空押しを採った後から、計る区間ごとに
+    ///   [`INJECT_2711_STEP`] 眠る（App Nap が測定の途中で始まり、以後の押下が一律に遅くなる段差）。
+    ///   旧の形（基準 1 回 vs 送信 5 回の中央値）は段差を送信の費用と読んで落ち、修正後
+    ///   （送信ごとに直前の空押しとの差を採り、その中央値）は通る
+    #[cfg(feature = "visual-test")]
+    fn inject_2711() -> String {
+        if !tako_core::paths::is_verification_process() {
+            return String::new();
+        }
+        std::env::var("TAKO_2711_INJECT").unwrap_or_default()
+    }
+
+    /// `TAKO_2711_INJECT=step` の段差の高さ（判定の閾値 8 ms を十分に超える）
+    #[cfg(feature = "visual-test")]
+    const INJECT_2711_STEP: Duration = Duration::from_millis(40);
+
     /// 41c の Tab / Enter を順に押す（#2689 の注入: `late` = まとめて遅れて届ける・`notab` / `notab<site>` =
     /// Tab を押さない。`site` は ① ③ ④ の番号）
     fn press_41c(any: AnyWindowHandle, cx: &mut AsyncApp, site: u8, keys: &[&'static str]) {
@@ -53334,7 +53370,9 @@ mod self_test {
     ///
     /// B のバッジは「欠けていない」を**幾何で**読む: タブ列の矩形の内側に
     /// バッジの矩形が丸ごと収まっているか。指紋（ハッシュ）では「切れている絵」と
-    /// 「切れていない絵」を区別できない。
+    /// 「切れていない絵」を区別できない。件数は手で置くので、置いたのと同じ update で
+    /// 一覧の着地を捨てさせ（`ListPoll::hold_landings`）、読むときに置いた値のままかも確かめる
+    /// （#2711。A/B `TAKO_2711_LEGACY=152`・着地の注入 `TAKO_2711_INJECT=land`）。
     ///
     /// 単独実行は `TAKO_VISUAL_ONLY=tasks-accordion`
     #[cfg(feature = "visual-test")]
@@ -53728,20 +53766,51 @@ mod self_test {
         // --- B: バッジがどのパネル幅でも欠けない（幾何で読む）---
         let mut badge_cases = 0usize;
         let mut badge_ok = 0usize;
+        // 置いた件数が読む前に変わったケース（#2711）
+        let mut overwritten = Vec::new();
+        let legacy2711 = legacy_2711("152");
+        let land2711 = inject_2711() == "land";
         for width in [240.0f32, 320.0, 480.0, 600.0] {
             for count in [0usize, 9, 22, 150] {
                 panel(cx, width);
                 // 件数は B1 の `open_count` がそのまま出る（画面で数えない）ので、
-                // ここでは**その値だけ**を置いて描かせる（150 件の起票は要らない）
+                // ここでは**その値だけ**を置いて描かせる（150 件の起票は要らない）。
+                // 2 秒 tick の一覧の着地（#2031）は一覧を丸ごと差し替えるので、置いたのと
+                // **同じ update で**着地を捨てさせる（間に着くと本物の件数へ戻る = #2711。
+                // 0 件のケースにバッジが出て 15/16 で落ちていた）
                 let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
                     app.user_tasks.snapshot.open_count = count;
+                    if !legacy2711 {
+                        app.user_tasks.list_poll.hold_landings();
+                    }
                     cx.notify();
                 });
+                if land2711 {
+                    // 注入: 置いてから読むまでの間に一覧の読み直しを 1 回着地させる
+                    settle_user_tasks(window, cx).await;
+                    let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+                        app.spawn_user_tasks_list(cx);
+                    });
+                    settle_user_tasks(window, cx).await;
+                }
                 redraw(cx);
                 wait(cx, 80).await;
                 let row = probe(cx, "panel-tabs-row");
                 let badge = probe(cx, "panel-tab-badge");
+                let shown = window
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.user_tasks.snapshot.open_count
+                    })
+                    .ok();
                 badge_cases += 1;
+                if shown != Some(count) {
+                    println!(
+                        "TAKO_VISUAL_2711: 幅 {width} / {count} 件: 置いた件数が読む前に \
+                         {shown:?} へ変わった（一覧の着地で上書き）"
+                    );
+                    overwritten.push(format!("{width}/{count}->{shown:?}"));
+                    continue;
+                }
                 let ok = match (row, badge, count) {
                     // 0 件はバッジを描かない
                     (Some(_), None, 0) => true,
@@ -53782,6 +53851,19 @@ mod self_test {
                 }
             }
         }
+        // 置いた件数をやめて本物の一覧へ戻す（着地を捨てさせるのもここで外れる）
+        let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
+            app.refresh_user_tasks();
+            cx.notify();
+        });
+        check(
+            overwritten.is_empty(),
+            &format!(
+                "152: バッジの検査で置いた件数が読むまで変わらない（2 秒 tick の一覧の着地で上書き\
+                 しない。#2711。{}/{badge_cases} で上書き: {overwritten:?}）",
+                overwritten.len()
+            ),
+        );
         check(
             badge_ok == badge_cases,
             &format!(
@@ -53812,6 +53894,7 @@ mod self_test {
         let _ = window.update(cx, |app: &mut TakoApp, _, cx| {
             app.user_tasks.collapse();
             app.user_tasks.kind_filter = None;
+            // tako:snapshot-write-ok 後片付け。パネルを閉じる直前に 0 へ戻すだけで、この後は読まない
             app.user_tasks.snapshot.open_count = 0;
             app.panel_visible = false;
             app.panel_view = PanelView::Fleet;
@@ -109337,6 +109420,242 @@ mod selftest_offui_wait_watchdog {
             .1,
             vec!["crates/tako-app/src/self_test/x_1.rs:2: pane_kill_confirmed".to_string()]
         );
+    }
+}
+
+/// 検証のコードが一覧の写し（`user_tasks.snapshot`）を手で置くなら、同じ update で一覧の着地を
+/// 捨てさせているかの番犬（#2711）。
+///
+/// 写しは右パネル tasks の 2 秒 tick の一覧の着地（#2031）が丸ごと差し替える。置いた値を後で読む
+/// 検査は、置いてから読むまでの間に着地が挟まると本物の値を読む（項目 152 のバッジは 0 件の
+/// ケースで本物の件数のバッジを描き、16 ケースのうち 1 つで間欠に落ちていた）。置いたのと同じ
+/// update で `list_poll.hold_landings()` を呼べば着地は「古い結果」として捨てられ、戻すのは
+/// `refresh_user_tasks`。置いた後に読まない形（後片付け）は、その行か直前のコメント行に
+/// `tako:snapshot-write-ok <理由>` を書く。
+///
+/// 拾う形: `user_tasks.snapshot` の後ろ（`.名前` と `[…]` の並びの後）が代入・複合代入・書き換えの
+/// メソッド（`push` / `clear` / …）か、`&mut …user_tasks.snapshot`。同じ update は、その行より上で
+/// 最も近い `.update(` の行から、その行と同じ字下げの `}` で始まる行まで（1 行で閉じた update はその行だけ）。
+/// 拾わない形: `user_tasks` を変数へ束縛してから書き換える（`let s = &mut app.user_tasks;` → `s.snapshot…`）
+#[cfg(test)]
+mod selftest_snapshot_hold_watchdog {
+    use super::selftest_launch_withdraw_watchdog::self_test_region;
+
+    /// 番犬自身のソース行が対象に入らないよう `concat!` で分割して書く
+    const TARGET: &str = concat!("user_tasks.", "snapshot");
+    const HOLD: &str = concat!("hold_", "landings(");
+    const ALLOW: &str = concat!("tako:snapshot", "-write-ok");
+    /// 写しの中身を書き換えるメソッド
+    const MUTATORS: &[&str] = &[
+        "push", "clear", "retain", "insert", "remove", "truncate", "extend", "iter_mut", "get_mut",
+        "sort", "sort_by", "swap", "pop", "drain",
+    ];
+
+    /// 行のコメントを外したコードの部分
+    fn code_of(line: &str) -> &str {
+        line.split("//").next().unwrap_or(line)
+    }
+
+    /// `code` に写しを書き換える式があるか
+    fn writes_snapshot(code: &str) -> bool {
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        code.match_indices(TARGET).any(|(at, _)| {
+            // `&mut app.user_tasks.snapshot`（パスの頭まで戻って `&mut` を見る）
+            let head = code[..at].trim_end_matches(|c: char| is_ident(c) || c == '.');
+            if head.trim_end().ends_with("&mut") {
+                return true;
+            }
+            let mut rest = &code[at + TARGET.len()..];
+            // `snapshot_x` のような別の名前は見ない
+            if rest.starts_with(is_ident) {
+                return false;
+            }
+            loop {
+                if let Some(tail) = rest.strip_prefix('.') {
+                    let len = tail.find(|c: char| !is_ident(c)).unwrap_or(tail.len());
+                    let (name, after) = tail.split_at(len);
+                    if after.starts_with('(') {
+                        return MUTATORS.contains(&name);
+                    }
+                    rest = after;
+                } else if rest.starts_with('[') {
+                    let Some(close) = rest.find(']') else {
+                        return false;
+                    };
+                    rest = &rest[close + 1..];
+                } else {
+                    break;
+                }
+            }
+            let rest = rest.trim_start();
+            (rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=>"))
+                || ["+=", "-=", "*=", "/=", "|=", "&="]
+                    .iter()
+                    .any(|op| rest.starts_with(op))
+        })
+    }
+
+    /// 写しを書き換える行のうち、同じ update で着地を捨てさせていない行（`lines` の行番号）
+    fn snapshot_write_without_hold(lines: &[(usize, &str)]) -> Vec<usize> {
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let marked = |line: &str| {
+            line.find(ALLOW)
+                .is_some_and(|p| !line[p + ALLOW.len()..].trim().is_empty())
+        };
+        let mut hits = Vec::new();
+        for (i, (number, line)) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !writes_snapshot(code_of(line)) {
+                continue;
+            }
+            let allowed = marked(line)
+                || lines[..i]
+                    .iter()
+                    .rev()
+                    .take_while(|(_, l)| l.trim_start().starts_with("//"))
+                    .any(|(_, l)| marked(l));
+            if allowed {
+                continue;
+            }
+            let held = lines[..=i]
+                .iter()
+                .rposition(|(_, l)| code_of(l).contains(".update("))
+                .is_some_and(|start| {
+                    let head = lines[start].1;
+                    let end = if start == i && code_of(head).trim_end().ends_with(';') {
+                        i + 1
+                    } else {
+                        lines
+                            .iter()
+                            .enumerate()
+                            .skip(i + 1)
+                            .find(|(_, (_, l))| {
+                                let t = l.trim_start();
+                                !t.is_empty() && indent(l) == indent(head) && t.starts_with('}')
+                            })
+                            .map_or(lines.len(), |(at, _)| at + 1)
+                    };
+                    lines[start..end]
+                        .iter()
+                        .any(|(_, l)| code_of(l).contains(HOLD))
+                });
+            if !held {
+                hits.push(*number);
+            }
+        }
+        hits
+    }
+
+    /// main.rs（`include_str!` の版）と `src/self_test/*.rs`
+    fn sources() -> Vec<(String, String)> {
+        let mut out = vec![("main.rs".to_string(), include_str!("main.rs").to_string())];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/self_test");
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("src/self_test")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        files.sort();
+        for path in files {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            out.push((format!("self_test/{name}"), src));
+        }
+        out
+    }
+
+    #[test]
+    fn 検証が置いた一覧の写しを着地で上書きさせない() {
+        let (mut hits, mut seen, mut writes) = (Vec::new(), 0usize, 0usize);
+        for (file, src) in sources() {
+            // main.rs は `mod self_test` の中だけ（製品の `apply_user_tasks_list` の差し替えは見ない）
+            let lines: Vec<(usize, &str)> = if file == "main.rs" {
+                self_test_region(&src)
+            } else {
+                src.lines().enumerate().map(|(i, l)| (i + 1, l)).collect()
+            };
+            seen += lines.len();
+            writes += lines
+                .iter()
+                .filter(|(_, l)| writes_snapshot(code_of(l)))
+                .count();
+            hits.extend(
+                snapshot_write_without_hold(&lines)
+                    .into_iter()
+                    .map(|n| format!("crates/tako-app/src/{file}:{n}")),
+            );
+        }
+        assert!(
+            seen > 10_000 && writes > 0,
+            "セルフテストの範囲が読めていない（{seen} 行・書き換え {writes} 行）= この番犬は何も見ていない"
+        );
+        assert!(
+            hits.is_empty(),
+            "{hits:?} が一覧の写し（user_tasks.snapshot）を手で置いているのに、同じ update で一覧の着地を\
+             捨てさせていない。2 秒 tick の着地（#2031）が置いてから読むまでの間に挟まると本物の値を読み、\
+             間欠に落ちる（#2711 = 項目 152 のバッジ）。同じ update で `list_poll.hold_landings()` を呼び、\
+             読み終えたら `refresh_user_tasks()` で戻すこと。置いた後に読まないなら、その行か直前の\
+             コメント行に `tako:snapshot-write-ok <理由>` を書く"
+        );
+    }
+
+    /// 検出力の担保: 修正前の 152 の形を名指し、同じ update の固定・読むだけ・理由つきの印は許す
+    #[test]
+    fn 番犬は着地を捨てさせない写しの書き換えを見逃さず固定と読みと印は許す() {
+        let hits = |rows: &[&str]| -> Vec<usize> {
+            let src = rows.join("\n");
+            let lines: Vec<(usize, &str)> =
+                src.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+            snapshot_write_without_hold(&lines)
+        };
+        let update = "                let _ = window.update(cx, |app: &mut TakoApp, _, cx| {";
+        let close = "                });";
+        let notify = "                    cx.notify();";
+        let set = format!("                    app.{TARGET}.open_count = count;");
+        let hold = format!("                    app.user_tasks.list_poll.{HOLD});");
+        // 修正前の 152（置くだけ）
+        assert_eq!(hits(&[update, &set, notify, close]), vec![2]);
+        // 修正後（同じ update で捨てさせる。A/B の条件の内側でもよい）
+        let guarded: [&str; 7] = [
+            update,
+            &set,
+            "                    if !legacy {",
+            &hold,
+            "                    }",
+            notify,
+            close,
+        ];
+        assert!(hits(&guarded).is_empty());
+        // 前の別の update で捨てさせても同じ update ではない
+        assert_eq!(hits(&[update, &hold, close, update, &set, close]), vec![5]);
+        // 1 行で閉じた update
+        let one = format!(
+            "                let _ = window.update(cx, |app, _, _| app.{TARGET}.open_count = 3);"
+        );
+        assert_eq!(hits(&[&one, update, &hold, close]), vec![1]);
+        // 書き換えのメソッド・添字の先・&mut も拾う
+        let push = format!("                    app.{TARGET}.tasks.push(task);");
+        assert_eq!(hits(&[update, &push, close]), vec![2]);
+        let index = format!("                    app.{TARGET}.tasks[0].title = t;");
+        assert_eq!(hits(&[update, &index, close]), vec![2]);
+        let borrow = format!("                    let s = &mut app.{TARGET};");
+        assert_eq!(hits(&[update, &borrow, close]), vec![2]);
+        // 読むだけ・比較は拾わない
+        let compare = format!("                    let same = app.{TARGET}.open_count == count;");
+        let len = format!("                    let n = app.{TARGET}.tasks.len();");
+        let iter = format!("                    app.{TARGET}.tasks.iter().any(|t| t.id == id)");
+        assert!(hits(&[update, &compare, &len, &iter, close]).is_empty());
+        // 理由つきの印（直前のコメント行・同じ行）は外す。理由の無い印では外さない
+        let allow = format!("                    // {ALLOW} 後片付け");
+        assert!(hits(&[update, &allow, &set, close]).is_empty());
+        let same_line = format!("{set} // {ALLOW} 後片付け");
+        assert!(hits(&[update, &same_line, close]).is_empty());
+        let bare = format!("                    // {ALLOW}");
+        assert_eq!(hits(&[update, &bare, &set, close]), vec![3]);
     }
 }
 

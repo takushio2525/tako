@@ -13,7 +13,10 @@
 //! 3. 上限: 行を積むと欄は [`crate::tasks_panel::COMMENT_MAX_LINES`] 行で止まり、
 //!    キャレットは欄の中に見えたままか（欄の中でスクロールする）
 //! 4. 送信の間: 「返す」を実マウスで押してから**欄が空のフレーム**を描き終えるまでの時間
-//!    （5 回の中央値）と、やりとりに載るまでの時間
+//!    （5 回の中央値）と、やりとりに載るまでの時間。送信の費用は送信ごとに直前の空押しとの差を
+//!    採ってその中央値で見て、測る間は App Nap を止める（#2711。隔離 GUI は前面に出ないので
+//!    測定の途中で間引かれていた。A/B `TAKO_2711_LEGACY=tasks-input`・段差の注入
+//!    `TAKO_2711_INJECT=step`）
 //! 5. 履歴: やりとりが古い順・経路 pc で積まれ、`show`（= `tako todo show` / MCP）と同じか
 //! 6. エッジ: 本文なしの返答 / 送信中にパネルを閉じる / 積めなかったら欄へ戻して理由を出す
 //!
@@ -667,62 +670,39 @@ pub(super) async fn tasks_input_visual(
             })
             .unwrap_or(0)
     };
-    let mut baseline_ms = f64::NAN;
+    let legacy2711 = legacy_2711("tasks-input");
+    let step2711 = inject_2711() == "step";
+    // 送信ごとの直前の空押し（旧は 1 回目に 1 度だけ）。`stepped` は注入の段差が入った後か
+    let mut idle_ms = Vec::new();
+    let mut idle_disturbed = false;
+    let mut stepped = false;
     let mut pending_shown = true;
     let mut in_handler = Vec::new();
     let mut to_empty = Vec::new();
     let mut to_listed = Vec::new();
     let mut empty_every_time = true;
-    for k in 0..5 {
-        let _ = window.update(cx, |app, _, cx| {
-            app.user_tasks.comment.clear();
-            app.user_tasks.decision = Some("answered".to_string());
-            app.task_comment_insert(&format!("{k} 回目の返答"), cx);
-        });
-        redraw(cx);
-        let Some(send) = bring_into_view(cx, "tasks-send") else {
-            fail("tasks-input: 「返す」を一覧の見える範囲へ出せない");
-        };
-        let before = responses_of(cx);
-        // 押す前に乗せて 1 フレーム描く（hit test を確定させる。click_at と同じ前段）
-        let pos = send.center();
-        let _ = any.update(cx, |_, win, cx| {
-            win.dispatch_event(
-                gpui::PlatformInput::MouseMove(MouseMoveEvent {
-                    position: pos,
-                    pressed_button: None,
-                    modifiers: Modifiers::default(),
-                }),
-                cx,
-            )
-        });
-        notify_and_draw(any, window, cx);
-        // 切り分け: 何もしない所（一覧の上端の余白）を同じ手順で押したときのハンドラ時間
-        if k == 0 {
-            let view = window
-                .update(cx, |app, _, _| app.user_tasks.scroll.bounds())
-                .unwrap_or_default();
-            let idle = point(view.right() - px(4.0), view.top() + px(2.0));
-            let t = std::time::Instant::now();
-            for input in [
-                gpui::PlatformInput::MouseDown(MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: idle,
-                    modifiers: Modifiers::default(),
-                    click_count: 1,
-                    first_mouse: false,
-                }),
-                gpui::PlatformInput::MouseUp(MouseUpEvent {
-                    button: MouseButton::Left,
-                    position: idle,
-                    modifiers: Modifiers::default(),
-                    click_count: 1,
-                }),
-            ] {
-                let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
-            }
-            baseline_ms = t.elapsed().as_secs_f64() * 1000.0;
-            say(format!("baseline idle_click_handler_ms={baseline_ms:.1}"));
+    {
+        // #2711: 測る間（この区画 = 5 回の送信）だけ App Nap を止める。利用者が「返す」を押すとき
+        // tako は前面 = 間引かれないが、隔離 GUI は前面に出ないので起動から約 30 秒で間引かれ
+        // （E コア・約 2.4 倍遅い）、全節実行では測定の途中で間引きが始まって基準と送信が別の速さで
+        // 測られていた。旧の形（A/B）は握らずに測る
+        let _app_nap = crate::platform::user_work::UserWork::begin();
+        if legacy2711 {
+            drop(_app_nap);
+        }
+        for k in 0..5 {
+            let _ = window.update(cx, |app, _, cx| {
+                app.user_tasks.comment.clear();
+                app.user_tasks.decision = Some("answered".to_string());
+                app.task_comment_insert(&format!("{k} 回目の返答"), cx);
+            });
+            redraw(cx);
+            let Some(send) = bring_into_view(cx, "tasks-send") else {
+                fail("tasks-input: 「返す」を一覧の見える範囲へ出せない");
+            };
+            let before = responses_of(cx);
+            // 押す前に乗せて 1 フレーム描く（hit test を確定させる。click_at と同じ前段）
+            let pos = send.center();
             let _ = any.update(cx, |_, win, cx| {
                 win.dispatch_event(
                     gpui::PlatformInput::MouseMove(MouseMoveEvent {
@@ -734,69 +714,148 @@ pub(super) async fn tasks_input_visual(
                 )
             });
             notify_and_draw(any, window, cx);
-        }
-        let t0 = std::time::Instant::now();
-        for input in [
-            gpui::PlatformInput::MouseDown(MouseDownEvent {
-                button: MouseButton::Left,
-                position: pos,
-                modifiers: Modifiers::default(),
-                click_count: 1,
-                first_mouse: false,
-            }),
-            gpui::PlatformInput::MouseUp(MouseUpEvent {
-                button: MouseButton::Left,
-                position: pos,
-                modifiers: Modifiers::default(),
-                click_count: 1,
-            }),
-        ] {
-            let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
-        }
-        // 押したハンドラが UI スレッドを握っていた時間（往復を待っていればここに乗る）
-        in_handler.push(t0.elapsed().as_secs_f64() * 1000.0);
-        // 修正後は返した中身が「送信中」として残る（欄を先に空にしても消えたように見せない）。
-        // 旧実装は押した中で積み終えるので、この時点でもう一覧に載っている
-        let (sending_now, listed_now) = window
-            .update(cx, |app, _, _| {
-                (
-                    app.user_tasks.sending.iter().any(|s| s.id == target),
-                    app.user_tasks
-                        .snapshot
-                        .tasks
-                        .iter()
-                        .find(|t| t.id == target)
-                        .map(|t| t.responses.len())
-                        .unwrap_or(0),
-                )
-            })
-            .unwrap_or((false, 0));
-        pending_shown &= sending_now || listed_now > before;
-        // 押した次のフレーム（欄が空なら、このフレームに空が描かれる）
-        notify_and_draw(any, window, cx);
-        let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        empty_every_time &= comment(cx).is_empty();
-        to_empty.push(frame_ms);
-        // やりとりに載るまで（積む → 運ぶ → 記録 → 読み直し）
-        let mut listed = f64::NAN;
-        for _ in 0..400 {
-            if responses_of(cx) > before {
-                listed = t0.elapsed().as_secs_f64() * 1000.0;
-                break;
+            // 切り分け: 何もしない所（一覧の上端の余白）を同じ手順で押したときのハンドラ時間。
+            // 送信ごとに直前の 1 回を採って組にする（#2711。1 回目に 1 度だけ採ると、途中で機の速さが
+            // 変わったときにその段差を送信の費用と読む）
+            if k == 0 || !legacy2711 {
+                let view = window
+                    .update(cx, |app, _, _| app.user_tasks.scroll.bounds())
+                    .unwrap_or_default();
+                let idle = point(view.right() - px(4.0), view.top() + px(2.0));
+                let state_of = |cx: &mut AsyncApp| {
+                    let open = window
+                        .update(cx, |app, _, _| app.user_tasks.expanded.clone())
+                        .ok();
+                    (open, comment(cx))
+                };
+                let before_idle = state_of(cx);
+                let t = std::time::Instant::now();
+                if stepped {
+                    std::thread::sleep(INJECT_2711_STEP);
+                }
+                for input in [
+                    gpui::PlatformInput::MouseDown(MouseDownEvent {
+                        button: MouseButton::Left,
+                        position: idle,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }),
+                    gpui::PlatformInput::MouseUp(MouseUpEvent {
+                        button: MouseButton::Left,
+                        position: idle,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                    }),
+                ] {
+                    let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
+                }
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                idle_ms.push(ms);
+                stepped = step2711;
+                say(format!("baseline k={k} idle_click_handler_ms={ms:.1}"));
+                // 空押しが何かに当たって状態を変えたら、基準として使えない（判定で名指しして落とす）
+                if state_of(cx) != before_idle {
+                    idle_disturbed = true;
+                    say(format!(
+                        "baseline k={k} が状態を変えた（前: {before_idle:?}）"
+                    ));
+                }
+                let _ = any.update(cx, |_, win, cx| {
+                    win.dispatch_event(
+                        gpui::PlatformInput::MouseMove(MouseMoveEvent {
+                            position: pos,
+                            pressed_button: None,
+                            modifiers: Modifiers::default(),
+                        }),
+                        cx,
+                    )
+                });
+                notify_and_draw(any, window, cx);
             }
-            wait(cx, 5).await;
+            let t0 = std::time::Instant::now();
+            if stepped {
+                std::thread::sleep(INJECT_2711_STEP);
+            }
+            for input in [
+                gpui::PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position: pos,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }),
+                gpui::PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position: pos,
+                    modifiers: Modifiers::default(),
+                    click_count: 1,
+                }),
+            ] {
+                let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
+            }
+            // 押したハンドラが UI スレッドを握っていた時間（往復を待っていればここに乗る）
+            in_handler.push(t0.elapsed().as_secs_f64() * 1000.0);
+            // 修正後は返した中身が「送信中」として残る（欄を先に空にしても消えたように見せない）。
+            // 旧実装は押した中で積み終えるので、この時点でもう一覧に載っている
+            let (sending_now, listed_now) = window
+                .update(cx, |app, _, _| {
+                    (
+                        app.user_tasks.sending.iter().any(|s| s.id == target),
+                        app.user_tasks
+                            .snapshot
+                            .tasks
+                            .iter()
+                            .find(|t| t.id == target)
+                            .map(|t| t.responses.len())
+                            .unwrap_or(0),
+                    )
+                })
+                .unwrap_or((false, 0));
+            pending_shown &= sending_now || listed_now > before;
+            // 押した次のフレーム（欄が空なら、このフレームに空が描かれる）
+            notify_and_draw(any, window, cx);
+            let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            empty_every_time &= comment(cx).is_empty();
+            to_empty.push(frame_ms);
+            // やりとりに載るまで（積む → 運ぶ → 記録 → 読み直し）
+            let mut listed = f64::NAN;
+            for _ in 0..400 {
+                if responses_of(cx) > before {
+                    listed = t0.elapsed().as_secs_f64() * 1000.0;
+                    break;
+                }
+                wait(cx, 5).await;
+            }
+            to_listed.push(listed);
         }
-        to_listed.push(listed);
     }
     let handler_ms = median(&mut in_handler.clone());
     let empty_ms = median(&mut to_empty.clone());
     let listed_ms = median(&mut to_listed.clone());
-    let send_cost_ms = handler_ms - baseline_ms;
+    // 送信が押下に足す時間 = 送信ごとの（送信 − 直前の空押し）の中央値（#2711）。旧は
+    // （送信 5 回の中央値 − 1 回目の空押し）
+    let (send_cost_ms, cost_basis) = if legacy2711 {
+        let baseline_ms = idle_ms.first().copied().unwrap_or(f64::NAN);
+        (
+            handler_ms - baseline_ms,
+            "送信の中央値 − 1 回目の空押し（旧 #2711）",
+        )
+    } else {
+        let mut paired: Vec<f64> = in_handler
+            .iter()
+            .zip(&idle_ms)
+            .map(|(s, i)| s - i)
+            .collect();
+        (median(&mut paired), "送信ごとに直前の空押しとの差の中央値")
+    };
     say(format!(
-        "send handler_ms={in_handler:.1?} median={handler_ms:.1} send_cost_ms={send_cost_ms:.1} \
-         pending_or_listed_at_once={pending_shown} \
+        "send handler_ms={in_handler:.1?} median={handler_ms:.1} idle_ms={idle_ms:.1?} \
+         send_cost_ms={send_cost_ms:.1} basis={cost_basis} app_nap_held={} inject_step={step2711} \
+         idle_disturbed={idle_disturbed} pending_or_listed_at_once={pending_shown} \
          click->empty_frame_ms={to_empty:.1?} median={empty_ms:.1} \
-         click->listed_ms={to_listed:.1?} median={listed_ms:.1} empty_every_time={empty_every_time}"
+         click->listed_ms={to_listed:.1?} median={listed_ms:.1} empty_every_time={empty_every_time}",
+        !legacy2711
     ));
     let _ = bring_into_view(cx, "tasks-send");
     redraw(cx);
@@ -809,6 +868,7 @@ pub(super) async fn tasks_input_visual(
     // （積む → 運ぶ → 記録 → 一覧）を握るので、その間ぶん差が開く
     let lag_ok = empty_every_time
         && pending_shown
+        && !idle_disturbed
         && send_cost_ms.is_finite()
         && send_cost_ms < 8.0
         && to_listed.iter().all(|v| v.is_finite());
@@ -1024,7 +1084,7 @@ pub(super) async fn tasks_input_visual(
             "tasks-input [{arm}]: 欄は上限の行数で止まり、キャレットは欄の中に見えたまま (#2016)"
         ),
     );
-    check(lag_ok, &format!("tasks-input [{arm}]: 押した次のフレームで欄が空になる（送信が押下に足す時間 {send_cost_ms:.1} ms / 空のフレームまで {empty_ms:.1} ms）(#2016)"));
+    check(lag_ok, &format!("tasks-input [{arm}]: 押した次のフレームで欄が空になる（送信が押下に足す時間 {send_cost_ms:.1} ms = {cost_basis}{} / 空のフレームまで {empty_ms:.1} ms）(#2016 / #2711)", if idle_disturbed { "・基準の空押しが状態を変えた" } else { "" }));
     check(
         history_ok,
         &format!("tasks-input [{arm}]: やりとりが古い順・経路 pc で積まれ show と同じ (#2016)"),
