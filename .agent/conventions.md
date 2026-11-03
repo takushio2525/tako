@@ -5099,6 +5099,14 @@ OS で分岐すると「macOS だけ通る道」が増えて、この等価性�
 
 - **`config dir` を明示する引数（#558）は隔離しない**。テストが一時ディレクトリを
   指して書き先を確かめる経路と、アカウント指定の spawn がここに乗っている
+- **置き場は読む口で作らない（#2685）**: `paths::verification_agent_home()` /
+  `orchestrator::agent_config_home()` はパスを決めるだけで、無ければ「まだ何も書いていない = 空」
+  として読む。作っていた頃は読むだけの CLI（`tako usage` の設定 dir の列挙）が動くたびに、その pid の
+  空の dir を残した（CLI 自身しか使わない pid つきの置き場なので GUI では片付けられない）。
+  書く前に置き場が要る書き手（シェル履歴 = シェルは親 dir を作らない）だけ作る口
+  `paths::ensure_verification_agent_home()` を通す。事前信頼・mod の install は書く瞬間に親 dir ごと作る。
+  番犬 `issue2685_agent_home_read_only_watchdog`（読む口から呼び出しを辿って `create_dir` / 作る口へ
+  届いたら file:line で名指す・作る口の呼び手は理由つきの許可表だけ）
 - **`HISTFILE` を渡すだけでは対話 zsh に効かない**: macOS の `/etc/zshrc` が
   `HISTFILE=${ZDOTDIR:-$HOME}/.zsh_history` を**無条件で代入**する。rc の後に必ず走る
   precmd で当て直す（`shell-integration/zshenv.zsh` の `TAKO_VERIFY_HISTFILE`）
