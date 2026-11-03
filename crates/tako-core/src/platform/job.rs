@@ -88,6 +88,15 @@ pub const ENV_KILL_GUI: &str = "TAKO_2454_KILL_GUI";
 /// 失敗させる = 割り当てに失敗した回（素の kill へ落ちる）を作る。製品のバイナリでは無視する
 pub const ENV_INJECT: &str = "TAKO_2454_INJECT";
 
+/// 注入（`TAKO_2697_INJECT_CONTAIN_DELAY_MS=<ms>`。#2697 の切り分け）。**検証プロセスでだけ**、
+/// [`KillScope::contain`] が子を入れ物へ入れる前に `<ms>` 待つ = 「起動直後の窓」（モジュール文書）を
+/// 広げ、その間に子が起こした孫を入れ物の外に生ませる。製品のバイナリでは無視する
+pub const ENV_INJECT_2697_CONTAIN_DELAY: &str = "TAKO_2697_INJECT_CONTAIN_DELAY_MS";
+
+/// 診断（`TAKO_2697_DIAG=1`。#2697 の切り分け）。**検証プロセスでだけ**、[`KillScope::stop`] が
+/// 止める直前の入れ物の中身（pid の列挙）を stderr へ 1 行出す。製品のバイナリでは無視する
+pub const ENV_DIAG_2697: &str = "TAKO_2697_DIAG";
+
 /// 実行ファイルの PE ヘッダのサブシステムの値（winnt.h の `IMAGE_SUBSYSTEM_WINDOWS_GUI`）
 pub const IMAGE_SUBSYSTEM_WINDOWS_GUI: u16 = 2;
 
@@ -104,6 +113,30 @@ fn kill_gui() -> bool {
 
 fn injected_assign_failure() -> bool {
     crate::paths::is_test_process() && std::env::var(ENV_INJECT).is_ok_and(|v| v == "assign_fail")
+}
+
+/// [`ENV_INJECT_2697_CONTAIN_DELAY`] の値の読み方（純粋関数。0・読めない値は注入なし）
+fn parse_contain_delay(value: Option<&str>) -> Option<std::time::Duration> {
+    value?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
+}
+
+/// 入れ物へ入れる前に待つ幅（[`ENV_INJECT_2697_CONTAIN_DELAY`]。検証プロセスの外では `None`）
+fn injected_contain_delay() -> Option<std::time::Duration> {
+    if !crate::paths::is_verification_process() {
+        return None;
+    }
+    parse_contain_delay(std::env::var(ENV_INJECT_2697_CONTAIN_DELAY).ok().as_deref())
+}
+
+/// [`ENV_DIAG_2697`] が効いているか（検証プロセスの外では常に false）
+fn diag_2697() -> bool {
+    crate::paths::is_verification_process()
+        && std::env::var(ENV_DIAG_2697).is_ok_and(|v| v.trim() == "1")
 }
 
 /// 子孫の入れ物。drop で中身を全部止める（ペインは [`Job::close_for_pane`] で閉じる）
@@ -338,6 +371,9 @@ pub struct KillScope {
 impl KillScope {
     /// `pid` の子を子孫ごと入れる（[`Job::contain`]。`pid` の扱いの約束も同じ）
     pub fn contain(pid: u32) -> KillScope {
+        if let Some(delay) = injected_contain_delay().filter(|_| SUPPORTED) {
+            std::thread::sleep(delay);
+        }
         KillScope {
             job: Job::contain(pid),
         }
@@ -358,9 +394,21 @@ impl KillScope {
         self.job.as_ref().and_then(|job| job.contains(pid))
     }
 
+    /// 中身の pid の列挙（テストと診断用）。空の入れ物・列挙できないときは `None`
+    pub fn members(&self) -> Option<Vec<u32>> {
+        self.job.as_ref()?.inner.as_ref()?.members().ok()
+    }
+
     /// 打ち切る・取り消す: コンソールのプロセスを止め、GUI のアプリとその子孫は残して手放す
     /// （[`Job::release_keeping_gui`]）。2 回目以降と空の入れ物は何もしない
     pub fn stop(&mut self) -> Release {
+        if diag_2697() {
+            eprintln!(
+                "[#2697 診断] 止める直前の入れ物: 入れた={} 中身={:?}",
+                self.is_contained(),
+                self.members()
+            );
+        }
         self.job
             .take()
             .map(Job::release_keeping_gui)
@@ -1093,6 +1141,24 @@ mod tests {
         assert_eq!(bad.stop(), Release::default());
         if !SUPPORTED {
             assert!(!KillScope::contain(std::process::id()).is_contained());
+        }
+        assert_eq!(empty.members(), None, "空の入れ物の中身");
+    }
+
+    /// #2697 の注入の値: 正の ms だけが効き、0・負・数でない・無いは注入なし
+    #[test]
+    fn issue2697_入れる前に待つ注入の値の読み方() {
+        use std::time::Duration;
+        assert_eq!(
+            parse_contain_delay(Some("3000")),
+            Some(Duration::from_millis(3000))
+        );
+        assert_eq!(
+            parse_contain_delay(Some(" 15 ")),
+            Some(Duration::from_millis(15))
+        );
+        for none in [Some("0"), Some("-5"), Some("abc"), Some(""), None] {
+            assert_eq!(parse_contain_delay(none), None, "{none:?}");
         }
     }
 }

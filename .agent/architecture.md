@@ -1496,7 +1496,10 @@ Job を 1 つ作り、起こした直後に入れる（以後その子が起こ�
   子を起こさない）。`claude agents --json` の走査は probe の待ちを通るので上の打ち切りで回収される
 
 A/B は `TAKO_2454_LEGACY=1`（Job を作らない）と `TAKO_2454_KILL_GUI=1`（ペインを閉じるときも GUI ごと全部止める）、
-注入は `TAKO_2454_INJECT=assign_fail`（テストプロセスだけ）。実プロセスのテストは
+注入は `TAKO_2454_INJECT=assign_fail`（テストプロセスだけ）。#2697 の切り分けの注入
+`TAKO_2697_INJECT_CONTAIN_DELAY_MS=<ms>`（検証プロセスだけ。`KillScope::contain` が入れる前に待つ = 起動直後の窓を
+広げ、その間に子が起こした孫を入れ物の外に生ませる）と診断 `TAKO_2697_DIAG=1`（`KillScope::stop` が止める直前の
+中身を stderr へ 1 行）。実プロセスのテストは
 `crates/tako-core/tests/issue2454_pane_job_windows.rs`（ペインのコンソールの孫）・
 `crates/tako-control/tests/issue2454_pane_gui_windows.rs`（同じペインの GUI の孫は残りコンソールの孫は止まる。
 GUI 役はテスト専用の `tako-gui-sleeper`。普通の終了の経路 = 関数を呼んでから drop せずに終わる子と、
