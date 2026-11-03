@@ -1732,6 +1732,46 @@ mod tests {
         ));
     }
 
+    /// #1997: spawn の応答の順番待ちの助言は、実際に同じ形の 1 件を受け付けたときの答えと一致する
+    /// （同じ `decide_inputs` の入力の `admit`）。調停役でなければ `None`
+    #[test]
+    fn issue1997_順番待ちの助言は実際の受け付けと同じ答え() {
+        let _g = serial();
+        reset_for_test(None);
+        assert_eq!(heavy_headroom(), None, "調停役でない");
+        reset_for_test(Some(Role::Production));
+        set_limits_in_memory(1);
+        let kids = alive_children(2);
+        let pid = |i: usize| kids[i].id();
+        let build = |p: u32| JobWire {
+            kind: JobKind::Build,
+            ..wire(p, 1)
+        };
+        // 空いている: 入る見込み → 実際に入る
+        let h = heavy_headroom().expect("調停役");
+        assert_eq!((h.running, h.waiting, h.next.clone()), (0, 0, None));
+        assert_eq!(
+            poll(&build(pid(0)), Instant::now()).unwrap()["state"],
+            "granted"
+        );
+        // 同時数 1 が埋まった: 待つ見込み（max_jobs）→ 実際に待つ（同じ理由）
+        let h = heavy_headroom().expect("調停役");
+        assert_eq!(h.running, 1);
+        assert_eq!(h.next.as_ref().map(WaitReason::code), Some("max_jobs"));
+        let r = poll(&build(pid(1)), Instant::now()).unwrap();
+        assert_eq!(r["state"], "waiting", "{r}");
+        assert_eq!(
+            lock().last.reason_of(u64::from(pid(1))).map(WaitReason::code),
+            Some("max_jobs")
+        );
+        let h = heavy_headroom().expect("調停役");
+        assert_eq!((h.running, h.waiting), (1, 1));
+        for mut k in kids {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+    }
+
     // ===== #2254: 実行中の予約・過去の記録・諦めた件 =====
 
     /// 36 GB の機（予約 3.6 GB・同時 3）を固定する

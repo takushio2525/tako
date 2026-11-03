@@ -12,6 +12,10 @@
 #   ⑥ A/B: `TAKO_2413_LEGACY=1`（起動待ちが無効）は同じ注入でも `launches` が null・`next_launch_waits` を出さない
 #   ⑦ fleet: visual-test `fleet-resident-1997` が worker 2 本の常駐メモリを CLI / MCP / `tako panel` / 画面で
 #      突き合わせ、画像を `$OUT/fleet-resident-1997-fleet-{dark,light}.png` へ
+#   ⑧ burst（実測。合否ではなく数を出す）: 一括復帰（#1945）は新しいプロセスを起こさず生きている agent へ
+#      続きを送るだけ（設計書 §9.6）なので、復帰の直後に来るのは**復帰した worker のビルドの同時多発**。
+#      GUI 無しの隔離の調停役（`tako queue serve` + 機の値の注入 `TAKO_QUEUE_INJECT`）へ本物の wrapper を
+#      BURST 本（既定 8 = 本番の worker の本数）同時に投げ、待ち件数と実行件数の推移・はける時間を出す
 #
 # **本番の tako / 設定には一切触らない**（data / HOME は mktemp 配下、tmux は回ごとの専用ソケット、
 # 落とすのは自分で起こした pid と自分のソケットだけ）。窓は常設の仮想ディスプレイ（tako-vd）へ出る（#1141）。
@@ -28,7 +32,10 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE TAK
 unset CLAUDE_CONFIG_DIR
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PARTS="${PARTS:-advice fleet}"
+PARTS="${PARTS:-advice fleet burst}"
+# ⑧ の同時に投げる本数と 1 件の長さ（秒）
+BURST="${BURST:-8}"
+BURST_SECS="${BURST_SECS:-15}"
 # 立ち上がりの窓（秒。注入で縮める = 本番の既定は 20 秒）。② ③ の 2 本目を 1 本目の窓の中で起こす
 STARTUP="${STARTUP:-8}"
 
@@ -346,10 +353,81 @@ part_fleet() {
   tmux_socket_kill "$SOCK"
 }
 
+# ============================== 一括復帰の直後のビルドの同時多発（実測） ==============================
+#   burst_round <名前> <空き MB> <メモリ圧> <swap MB>
+burst_round() {
+  local name="$1" avail="$2" pressure="$3" swap="$4"
+  new_round "burst-$name"
+  local qs="$R/q.sock" inj="$R/qinject.json" arb i t0 now st
+  printf '{"total_mb":36864,"available_mb":%s,"pressure":"%s","swap_used_mb":%s,"cpus":18,"unmanaged":0,"regather_secs":0}\n' \
+    "$avail" "$pressure" "$swap" > "$inj"
+  # 偽の cargo（区分は build / test のまま = 見込みは区分の既定）: 眠るだけ
+  printf '#!/bin/sh\nsleep %s\n' "$BURST_SECS" > "$R/bin/cargo"
+  chmod +x "$R/bin/cargo"
+  TAKO_ISOLATED=1 TAKO_TOKEN="t1997-$$" TAKO_QUEUE_SOCKET="$qs" TAKO_QUEUE_INJECT="$inj" \
+    "$TAKO_BIN" queue serve 2>>"$R/arb.log" &
+  arb=$!
+  for i in $(seq 1 50); do
+    TAKO_ISOLATED=1 TAKO_TOKEN="t1997-$$" TAKO_QUEUE_SOCKET="$qs" "$TAKO_BIN" queue --json > "$R/st.json" 2>/dev/null
+    [ "$(J get "$R/st.json" queue.arbiter)" = True ] || [ "$(J get "$R/st.json" queue.arbiter)" = true ] && break
+    sleep 0.1
+  done
+  local -a pids=()
+  for i in $(seq 1 "$BURST"); do
+    mkdir -p "$R/work/w$i"
+    local sub=build
+    [ $((i % 2)) = 0 ] && sub=test
+    (cd "$R/work/w$i" && PATH="$R/bin:$PATH" TAKO_ISOLATED=1 TAKO_TOKEN="t1997-$$" TAKO_QUEUE_SOCKET="$qs" \
+      "$TAKO_BIN" queue cargo "$sub" >/dev/null 2>>"$R/wrapper.err") &
+    pids+=("$!")
+  done
+  t0=$(perl -MTime::HiRes=time -e 'printf("%.1f", time)')
+  local peak_wait=0 peak_run=0 drained="" line="" prev=""
+  for i in $(seq 1 $((BURST * BURST_SECS + 60))); do
+    TAKO_ISOLATED=1 TAKO_TOKEN="t1997-$$" TAKO_QUEUE_SOCKET="$qs" "$TAKO_BIN" queue --json > "$R/st.json" 2>/dev/null
+    st="$(python3 -c 'import json,sys;q=json.load(open(sys.argv[1]))["queue"];print(len(q["running"]),len(q["waiting"]),(q.get("blocked") or {}).get("reason") or "-")' "$R/st.json" 2>/dev/null || echo "0 0 -")"
+    set -- $st
+    [ "$1" -gt "$peak_run" ] && peak_run=$1
+    [ "$2" -gt "$peak_wait" ] && peak_wait=$2
+    now=$(perl -MTime::HiRes=time -e "printf('%.0f', time - $t0)")
+    # 件数が変わったときだけ残す（推移の要約）
+    if [ "$1 $2" != "$prev" ]; then
+      line="$line t=${now}s 実行 $1・待ち $2（$3）;"
+      prev="$1 $2"
+    fi
+    if [ "$1" = 0 ] && [ "$2" = 0 ] && [ "$now" -gt 2 ]; then
+      drained="$now"
+      break
+    fi
+    sleep 1
+  done
+  for i in ${pids[@]+"${pids[@]}"}; do wait "$i" 2>/dev/null; done
+  kill "$arb" 2>/dev/null
+  wait "$arb" 2>/dev/null
+  echo "    ${name}（空き ${avail} MB・${pressure}・swap ${swap} MB・${BURST} 本 × ${BURST_SECS} 秒）: 実行の最大 ${peak_run}・待ちの最大 ${peak_wait}・はけるまで ${drained:-未完}s"
+  echo "     ${line}"
+  BURST_RESULT="$peak_run $peak_wait ${drained:-0}"
+}
+
+part_burst() {
+  echo
+  echo "=== ⑧ 一括復帰の直後のビルドの同時多発（GUI 無しの隔離の調停役・注入の機の値）==="
+  burst_round roomy 20480 normal 0
+  check "$([ "$(echo "$BURST_RESULT" | awk '{print $1}')" -le 3 ] && echo 1 || echo 0)" \
+    "⑧ 余裕のある機でも実行は同時数の上限（3）まで（$(echo "$BURST_RESULT" | awk '{print $1}')）"
+  burst_round usual 8192 normal 0
+  check "$([ "$(echo "$BURST_RESULT" | awk '{print $1}')" -le 1 ] && echo 1 || echo 0)" \
+    "⑧ 普段の運転（空き 8 GB）は空きの予約で 1 件ずつ（$(echo "$BURST_RESULT" | awk '{print $1}')）"
+  burst_round swapped 8192 normal 7577
+  check "$([ "$(echo "$BURST_RESULT" | awk '{print $1}')" -le 1 ] && echo 1 || echo 0)" \
+    "⑧ swap が警戒線を超えた機（今日の本番の値）は 1 件ずつ（$(echo "$BURST_RESULT" | awk '{print $1}')）"
+}
+
 for part in $PARTS; do
   case "$part" in
     advice) part_advice ;;
     fleet) part_fleet ;;
+    burst) part_burst ;;
     *) echo "未知の PARTS: $part"; exit 2 ;;
   esac
 done

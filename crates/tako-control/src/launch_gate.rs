@@ -1492,6 +1492,54 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// #1997: spawn の応答の「もう 1 本」の助言は、実際にもう 1 本を起動待ちへ問うた答えと同じ境界で切り替わる
+    /// （設定の既定の予約 + 立ち上がり中の見込み + 次の見込み）。起動待ちが無効なら助言を出さない
+    #[test]
+    fn issue1997_もう1本の助言は起動待ちの判断と同じ境界() {
+        let reserve = q::default_reserve_mb(Some(36 * GIB));
+        let edge = reserve + 2 * q::AGENT_ESTIMATE_MB;
+        for (available, expect_wait) in [
+            (edge, false),
+            (edge - 1, true),
+            (edge + 1, false),
+            (edge - 300, true),
+        ] {
+            enable_for_test(
+                Some(MachineView {
+                    available_mb: Some(available),
+                    ..machine(Pressure::Normal).unwrap()
+                }),
+                Duration::from_secs(60),
+            );
+            assert!(
+                matches!(request(req(1, LaunchKind::Spawn, None)), Decision::Now(_)),
+                "空き {available} MB で 1 本目が待った"
+            );
+            let h = headroom("claude");
+            assert_eq!(
+                (h.starting, h.waiting, h.reserve_mb, h.estimate_mb),
+                (1, 0, reserve, q::AGENT_ESTIMATE_MB)
+            );
+            assert_eq!(
+                h.next_launch.as_ref().map(WaitReason::code),
+                expect_wait.then_some("memory"),
+                "空き {available} MB の助言"
+            );
+            let second = request(req(2, LaunchKind::Spawn, None));
+            assert_eq!(
+                matches!(second, Decision::Wait(_)),
+                expect_wait,
+                "空き {available} MB で助言（{:?}）と 2 本目の答えが食い違う",
+                h.next_launch
+            );
+        }
+        // 有効にしていない（CLI のプロセス）・A/B は助言を出さない
+        *lock() = Gate::default();
+        assert_eq!(headroom("claude").next_launch, None);
+        enable(Mode::Off("A/B"));
+        assert_eq!(headroom("claude").next_launch, None);
+    }
+
     #[test]
     fn 役割から優先度() {
         assert_eq!(
