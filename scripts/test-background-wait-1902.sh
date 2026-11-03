@@ -11,13 +11,16 @@
 #   #1902 で待ちを 1 実装 `wait_for_background_state`（走っている間だけ待つ・戻ったのに揃わなければ
 #   その場で偽・上限は state_wait_budget）へ寄せた。2 回目に background の残り（偽サーバの診断・
 #   外部変更の競合・Markdown の目次・塗り直し・PDF の幾何と再ラスタ・動画の末尾停止）を同じ 1 実装へ、
-#   画面の静止を撮り直す 4 か所を `wait_for_quiet_frame` へ寄せた。
+#   画面の静止を撮り直す 4 か所を `wait_for_quiet_frame` へ寄せた。3 回目にシェルの出力・状態（画面の文字・
+#   OSC 133 / 7・alt screen・ペインログ・fd の回収）を待つ 25 か所を `wait_for_pty_state` へ寄せた
+#   （2 値で待ち、判定は待ちの戻り値で行う）。
 #
 # 何を確かめるか（遅れは注入で作る = CPU を焼かない）:
-#   ① 素の状態で節（既定は下の SECTIONS の 12 節）が緑・その節の待ちが Landed
+#   ① 素の状態で節（既定は下の SECTIONS の 14 節）が緑・その節の待ちが Landed
 #   ② 観測の遅れ（TAKO_1902_INJECT=late。旧の窓 + 5 秒）でも同じ節が緑・診断行の waited が遅れ以上
 #   ③ A/B: ② を 1 項目に絞り + TAKO_1902_LEGACY=<項目>（旧の回数の窓）→ 結果を判定に使う待ちは
-#      その項目の検査が名指しで FAILED（= 修正前の予算は同じ遅れで落ちる）。注入は**観測だけ**を
+#      その項目の検査が名指しで FAILED（= 修正前の予算は同じ遅れで落ちる）。揃わなければ SKIP する
+#      節（screen-lines の fixture・セルフテスト 109 / 104）は名指しの SKIPPED（= 検証が抜け落ちる）。注入は**観測だけ**を
 #      遅らせる（相手は前へ進む）ので、結果を判定に使わない待ち（診断の到着・preview-memory の
 #      描き切り・ime-preedit の mid・塗り直し）は旧の窓でも後段の検査が通る = 表に載せない
 #   ④ 塗りそのものの遅れ（製品側の TAKO_1890_INJECT=slow:<SLOW_MS>。旧の窓 80 回 × 50ms より長い）:
@@ -25,10 +28,14 @@
 #   ⑤ 塗りを捨てる注入（TAKO_1890_INJECT=drop）→ 上限まで待たずに outcome=Settled で FAILED
 #   ⑥ 検出力: TAKO_1902_INJECT=never:preview-maps は新の腕でも上限まで待って「平文 paint」で FAILED
 #   ⑦ セルフテスト（TAKO_SELF_TEST=1。全項目を回すので長い = 既定の STAGES に入れない）: 素の状態と、
-#      PDF の幾何・150% の再ラスタ・動画の末尾停止の 3 つの待ちへ観測の遅れを入れた状態で緑・3 つとも
-#      Landed（SELFTEST_ARMS="plain late" で腕を選ぶ）。HOME は差し替えない（項目 1c「初期 cwd は
+#      PDF の幾何・150% の再ラスタ・動画の末尾停止の 3 つと PTY の 22 の待ちへ観測の遅れを入れた状態で
+#      緑・どれも Landed（SELFTEST_ARMS="plain late" で腕を選ぶ。この環境で走らない項目は [--] で出す）。HOME は差し替えない（項目 1c「初期 cwd は
 #      ホーム」と項目 14 の cargo が本物の HOME を要る。置き場は回ごとの TMPDIR の下）
-#   ⑧ ⑦ の A/B: 1 項目ずつ旧の窓 + 遅れ → その項目の検査が名指しで FAILED（STAGES=8 で選ぶ）
+#   ⑧ ⑦ の A/B: 1 項目ずつ旧の窓 + 遅れ → その項目の検査が名指しで FAILED / SKIPPED（STAGES=8 で選ぶ。
+#      SELFTEST_LEGACY で項目を絞れる）。結果を判定に使わない待ち（selftest-osc-done・702-idle・
+#      720-armed・813-settle = 揃わなくても先へ進み後の検査が判定する）は表に載せない
+#   ⑨ visual-test の全節実行（TAKO_VISUAL_ONLY なし。長い = 既定の STAGES に入れない）でだけ通る
+#      スターターの「素のシェルがアイドル」（starter-idle）: 素 / 遅れで緑・旧の窓 + 遅れで名指しの FAILED
 #
 # 判定は「緑 / 名指しの FAILED」と診断行（TAKO_SELF_TEST_1902）の outcome / waited だけ。
 # 実時間は判定に使わない（waited と遅れの大小は「注入が効いた」ことの確認）。
@@ -37,7 +44,7 @@
 # だけ）。窓は常設の仮想ディスプレイ（tako-vd）へ出る（#1141 / #1490）。
 #
 # 使い方: TAKO_ISO_PROFILE=debug|release bash scripts/test-background-wait-1902.sh
-#   STAGES="1 2 3 4 5 6"（既定。⑦ ⑧ のセルフテストは STAGES="7 8" で足す）で段を選ぶ。
+#   STAGES="1 2 3 4 5 6"（既定。⑦ ⑧ のセルフテストは STAGES="7 8"、⑨ の全節実行は STAGES=9 で足す）で段を選ぶ。
 #   SECTIONS で ①〜③ の節を絞る。SLOW_MS（既定 12000）= ④ の塗りの遅れ
 set -uo pipefail
 
@@ -47,8 +54,9 @@ unset TAKO_SOCKET TAKO_TOKEN TAKO_PANE_ID TAKO_TAB_ID TAKO_ORCHESTRATOR_ROLE
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SLOW_MS="${SLOW_MS:-12000}"
 STAGES="${STAGES:-1 2 3 4 5 6}"
-# ①〜③ で回す節。後ろの 8 節は 2 回目の移送（background の残りと画面の静止）
-SECTIONS="${SECTIONS:-ino-highlight tasks-tick task-attachment tasks-input preview-code external-change md-edit-resume md-find-restore syntax-alias screen-lines ime-preedit preview-memory}"
+# ①〜③ で回す節。8 節は 2 回目の移送（background の残りと画面の静止）、後ろの 2 節は 3 回目（PTY。
+# screen-lines も PTY の待ち screen-seed を持つ）
+SECTIONS="${SECTIONS:-ino-highlight tasks-tick task-attachment tasks-input preview-code external-change md-edit-resume md-find-restore syntax-alias screen-lines ime-preedit preview-memory terminal-grid tree-move}"
 PASS=0
 FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
@@ -71,7 +79,10 @@ PROFILE="$ISOLATED_GUI_PROFILE"
 echo "プロファイル: $PROFILE"
 # preview-code の診断は本体の隣の偽の言語サーバを起こす（#1679。言語サーバの自動起動は隔離 GUI では
 # 既定で切れている = #2048 なので、その節にだけ TAKO_LSP_AUTOSTART=1 を付ける = section_env）
-case " $SECTIONS " in
+# ⑨ の全節実行も言語サーバの節（goto-hover・右クリックメニュー ほか）を通る
+NEED_FAKE_LSP="$SECTIONS"
+has_stage 9 && NEED_FAKE_LSP="$NEED_FAKE_LSP preview-code"
+case " $NEED_FAKE_LSP " in
   *" preview-code "*)
     echo "偽の言語サーバ（tako-lsp-fake）をビルドします…"
     FAKE_ARGS=(-q -p tako-control --bin tako-lsp-fake)
@@ -81,7 +92,7 @@ case " $SECTIONS " in
 esac
 section_env() { # 節 → その節にだけ付ける env（空可）
   case "$1" in
-    preview-code) echo "TAKO_LSP_AUTOSTART=1" ;;
+    preview-code | all) echo "TAKO_LSP_AUTOSTART=1" ;;
   esac
 }
 
@@ -100,8 +111,8 @@ printf "PROMPT='tako %%1~ %%%% '\nRPROMPT=''\n" > "$TMP/zdot/.zshrc"
 # 節を 1 回走らせて、終わるまで**状態で**待つ（プロセスが消えるまで。上限 900 秒 = never の上限
 # 4 倍ぶんを含む）。回ごとに data / 置き場を分ける（前の回の一覧を持ち越さない）。緑なら 0
 RUN=0
-run_section() { # ログ 節 追加の env…
-  local log="$1" section="$2" dir extra
+run_section() { # ログ 節（all = 全節実行）追加の env…
+  local log="$1" section="$2" dir extra only
   shift 2
   extra="$(section_env "$section")"
   RUN=$((RUN + 1))
@@ -111,7 +122,10 @@ run_section() { # ログ 節 追加の env…
     "$TMP"/*) : ;;
     *) echo "隔離されていないディレクトリ: ${dir}"; exit 1 ;;
   esac
-  launch_isolated_gui "$log" TAKO_VISUAL_TEST=1 TAKO_VISUAL_ONLY="$section" \
+  only="TAKO_VISUAL_ONLY=$section"
+  # 全節実行は節を絞らない（TAKO_VISUAL_ONLY を渡さない。空の値は「知らない節」で止まる）
+  [ "$section" = all ] && only="TAKO_VISUAL_TEST=1"
+  launch_isolated_gui "$log" TAKO_VISUAL_TEST=1 "$only" \
     TAKO_DATA_DIR="$dir/data" TAKO_ORCHESTRATOR_DIR="$dir/orch" \
     TAKO_USER_TASKS_FILE="$dir/orch/user-tasks.yaml" TAKO_AUTO_RENAME=0 \
     ZDOTDIR="$TMP/zdot" $extra ${1+"$@"} || exit $?
@@ -157,10 +171,35 @@ items_of() {
     external-change) echo "external-conflict" ;;
     md-edit-resume | md-find-restore) echo "md-outline" ;;
     syntax-alias) echo "syntax-repaint" ;;
-    screen-lines) echo "screen-quiet" ;;
+    screen-lines) echo "screen-quiet screen-seed" ;;
     ime-preedit) echo "ime-quiet ime-quiet-mid" ;;
     preview-memory) echo "preview-settle" ;;
+    terminal-grid) echo "grid-fixture" ;;
+    tree-move) echo "tree-move-drop" ;;
   esac
+}
+
+# 旧の窓の回の落ち方を判定する（③ ⑧ ⑨ で共用）。LABEL が `SKIP:<文>` なら名指しの SKIPPED を、
+# それ以外は名指しの FAILED を期待する。ラベルは固定文字列で突き合わせる（括弧を正規表現にしない）
+legacy_verdict() { # ログ 項目 LABEL 終了コード
+  local log="$1" item="$2" label="$3" rc="$4" want skipped failed
+  want="${label#SKIP:}"
+  # pipefail の下で `grep … | grep -q` にしない（早く抜ける読み手で前段が SIGPIPE = 偽になる）
+  skipped="$(grep -E "TAKO_(VISUAL|SELF_TEST)_SKIPPED: " "$log")"
+  failed="$(grep "TAKO_APP_SELF_TEST_FAILED: " "$log")"
+  if [ "$want" != "$label" ]; then
+    if grep -qF "$want" <<<"$skipped"; then
+      pass "$item: 旧の窓は「${want}」で SKIPPED = 検証が抜け落ちる（outcome=$(diag_field "$log" "$item" outcome) budget=$(diag_field "$log" "$item" budget) legacy=$(diag_field "$log" "$item" legacy)）"
+    else
+      fail "$item: 旧の窓で名指しの SKIPPED にならない: $(grep -oE 'TAKO_(APP_SELF_TEST_FAILED|VISUAL_SKIPPED|SELF_TEST_SKIPPED): .*' "$log" | head -1 | cut -c1-160)"
+    fi
+  elif grep -qF "$want" <<<"$failed"; then
+    pass "$item: 旧の窓は「${want}」で FAILED（outcome=$(diag_field "$log" "$item" outcome) budget=$(diag_field "$log" "$item" budget) legacy=$(diag_field "$log" "$item" legacy)）"
+  elif [ "$rc" -eq 0 ]; then
+    fail "$item: 旧の窓でも通った（遅れが窓より短い？）"
+  else
+    fail "$item: 旧の窓の落ち方が違う: $(grep -o 'TAKO_APP_SELF_TEST_FAILED: .*' "$log" | head -1 | cut -c1-160)"
+  fi
 }
 
 if has_stage 1; then
@@ -209,13 +248,8 @@ if has_stage 3; then
     [ -n "$S" ] || continue
     case " $SECTIONS " in *" $S "*) : ;; *) continue ;; esac
     log="$TMP/legacy-$S-$I.log"
-    if run_section "$log" "$S" TAKO_1902_INJECT="late:$I" TAKO_1902_LEGACY="$I"; then
-      fail "$I: 旧の窓でも通った（遅れが窓より短い？）"
-    elif grep -q "TAKO_APP_SELF_TEST_FAILED: .*$LABEL" "$log"; then
-      pass "$I: 旧の窓は「${LABEL}」で FAILED（outcome=$(diag_field "$log" "$I" outcome) budget=$(diag_field "$log" "$I" budget) legacy=$(diag_field "$log" "$I" legacy)）"
-    else
-      fail "$I: 旧の窓の落ち方が違う: $(grep -o 'TAKO_APP_SELF_TEST_FAILED: .*' "$log" | head -1 | cut -c1-160)"
-    fi
+    run_section "$log" "$S" TAKO_1902_INJECT="late:$I" TAKO_1902_LEGACY="$I"
+    legacy_verdict "$log" "$I" "$LABEL" $?
   done <<'EOF'
 ino-highlight|preview-maps|平文 paint
 ino-highlight|preview-highlight|① .ino が複数の構文色で塗られる
@@ -226,6 +260,9 @@ md-edit-resume|md-outline|描画表示で開いて目次が 3 件
 md-find-restore|md-outline|描画表示で開いて目次が 3 件
 screen-lines|screen-quiet|画面が静止しない
 ime-preedit|ime-quiet|画面が静止しない
+screen-lines|screen-seed|SKIP:fixture が画面に出ない
+terminal-grid|grid-fixture|fixture 12 行が画面に出る (#787)
+tree-move|tree-move-drop|ターミナルの中央へ落とすとパスが入る
 EOF
 fi
 
@@ -302,6 +339,12 @@ run_selftest() { # ログ 追加の env…
   grep -q "TAKO_APP_SELF_TEST_OK" "$log"
 }
 SELFTEST_ITEMS="selftest-pdf-geometry selftest-pdf-zoom selftest-video-end"
+# 3 回目の移送（PTY）の待ち。セルフテストの並びの順
+SELFTEST_PTY_ITEMS="selftest-109-cwd selftest-ansi-red selftest-fd selftest-osc-running selftest-osc-done \
+selftest-osc-failed selftest-wide-click selftest-multiroot selftest-issue64 selftest-link-screen \
+selftest-close-markers selftest-close-registry selftest-starter-ran selftest-702-idle \
+selftest-720-starter selftest-720-armed selftest-739-delivered selftest-103-claude selftest-104-tab \
+selftest-105-alt selftest-813-screen selftest-813-settle"
 
 if has_stage 7; then
   # 素の腕は「走り終えたのに揃わない」の早い打ち切り（Settled）が素の時機で誤爆しないことを、
@@ -312,7 +355,7 @@ if has_stage 7; then
     log="$TMP/selftest-$ARM.log"
     if [ "$ARM" = late ]; then
       echo "⑦ セルフテスト: 3 つの待ちへ観測の遅れを入れても緑（${PROFILE}）"
-      run_selftest "$log" TAKO_1902_INJECT="late:$(echo $SELFTEST_ITEMS | tr ' ' ',')"
+      run_selftest "$log" TAKO_1902_INJECT="late:$(echo $SELFTEST_ITEMS $SELFTEST_PTY_ITEMS | tr ' ' ',')"
     else
       echo "⑦ セルフテスト: 素の状態で緑（${PROFILE}）"
       run_selftest "$log"
@@ -322,7 +365,11 @@ if has_stage 7; then
     else
       fail "セルフテストが緑にならない（${ARM}）: $(grep -o 'TAKO_APP_SELF_TEST_FAILED: .*' "$log" | head -1 | cut -c1-160)"
     fi
-    for I in $SELFTEST_ITEMS; do
+    for I in $SELFTEST_ITEMS $SELFTEST_PTY_ITEMS; do
+      if ! grep -q "TAKO_SELF_TEST_1902: item=$I " "$log"; then
+        echo "  [--] $I はこの回で走らなかった（この環境で SKIP される項目か、手前で落ちた）"
+        continue
+      fi
       if [ "$ARM" = late ]; then
         if all_landed "$log" "$I" && waited_at_least "$log" "$I" 5; then
           pass "$I は遅れ以上待って揃った（waited=$(diag_field "$log" "$I" waited) inject=$(diag_field "$log" "$I" inject)）"
@@ -343,19 +390,67 @@ if has_stage 8; then
   echo "⑧ セルフテストの A/B: 1 項目ずつ旧の窓 + 遅れ → 名指しで FAILED（${PROFILE}）"
   while IFS='|' read -r I LABEL; do
     [ -n "$I" ] || continue
+    case " ${SELFTEST_LEGACY:-$I} " in *" $I "*) : ;; *) continue ;; esac
     log="$TMP/selftest-legacy-$I.log"
-    if run_selftest "$log" TAKO_1902_INJECT="late:$I" TAKO_1902_LEGACY="$I"; then
-      fail "$I: 旧の窓でも通った（遅れが窓より短い？）"
-    elif grep -q "TAKO_APP_SELF_TEST_FAILED: .*$LABEL" "$log"; then
-      pass "$I: 旧の窓は「${LABEL}」で FAILED（outcome=$(diag_field "$log" "$I" outcome) budget=$(diag_field "$log" "$I" budget)）"
-    else
-      fail "$I: 旧の窓の落ち方が違う: $(grep -o 'TAKO_APP_SELF_TEST_FAILED: .*' "$log" | head -1 | cut -c1-160)"
-    fi
+    run_selftest "$log" TAKO_1902_INJECT="late:$I" TAKO_1902_LEGACY="$I"
+    legacy_verdict "$log" "$I" "$LABEL" $?
   done <<'EOF'
 selftest-pdf-geometry|PDFKit アウトライン一覧と 2 ページ目ジャンプ
 selftest-pdf-zoom|PDF 150% の再ラスタライズ後も文字座標が画像へ追従する
 selftest-video-end|末尾で自動停止し、再生ボタンで先頭から再開する
+selftest-109-cwd|SKIP:109（ペインの cwd が使い捨てリポへ移らない）
+selftest-ansi-red|ANSI 赤の解決
+selftest-fd|split/close で fd が漏れない
+selftest-osc-running|実行中コマンドが running
+selftest-osc-failed|失敗コマンドで failed（プロンプト後も保持）
+selftest-wide-click|全角行のクリックが正しいセルに解決
+selftest-multiroot|タブ内全ペインの cwd がワークスペースフォルダとして並ぶ
+selftest-issue64|69b: echo の 2 行が画面に揃い #64 の検証が成り立つ
+selftest-link-screen|リンク検証テキストを実 PTY 画面へ表示
+selftest-close-markers|ペインログ: クローズマーカーに発生源（kbd / gui / dispatch）が残る（#566）
+selftest-close-registry|workers.yaml: cmd+W / ペイン × / CLI の close が発生源つきで closed になる（#775）
+selftest-starter-ran|スターターが組む行は実シェルで実際に実行される (#899)
+selftest-720-starter|新規ペインは準備中 → スターターで、生ターミナルを一度も見せない (#720)
+selftest-739-delivered|▾ から選んだプロファイルで `tako master -<name>` が届き、選択後は閉じる (#739)
+selftest-103-claude|103: 検証用の偽 claude がペイン内で見える (#772)
+selftest-104-tab|SKIP:104 のマーカー検査
+selftest-105-alt|105: worker が busy な全画面状態になる (#778)
+selftest-813-screen|#813: idle 型 fixture が画面に出ない
 EOF
+fi
+
+if has_stage 9; then
+  # スターターの「素のシェルがアイドル」（#694）は visual-test の全節実行の並びにしか無い（節の名前が無い）
+  for ARM in plain late legacy; do
+    echo
+    log="$TMP/all-$ARM.log"
+    case "$ARM" in
+      plain)
+        echo "⑨ visual-test の全節実行: 素の状態で緑・starter-idle が Landed（${PROFILE}）"
+        run_section "$log" all ;;
+      late)
+        echo "⑨ visual-test の全節実行: starter-idle へ観測の遅れを入れても緑（${PROFILE}）"
+        run_section "$log" all TAKO_1902_INJECT=late:starter-idle ;;
+      legacy)
+        echo "⑨ visual-test の全節実行: starter-idle を旧の窓 + 遅れ → 名指しで FAILED（${PROFILE}）"
+        run_section "$log" all TAKO_1902_INJECT=late:starter-idle TAKO_1902_LEGACY=starter-idle ;;
+    esac
+    rc=$?
+    if [ "$ARM" = legacy ]; then
+      legacy_verdict "$log" starter-idle "スターター: 素のシェルがアイドルになる (#694)" "$rc"
+      continue
+    fi
+    if [ "$rc" -eq 0 ]; then
+      pass "全節実行が緑（${ARM}）"
+    else
+      fail "全節実行が緑にならない（${ARM}）: $(grep -o 'TAKO_APP_SELF_TEST_FAILED: .*' "$log" | head -1 | cut -c1-160)"
+    fi
+    if all_landed "$log" starter-idle && { [ "$ARM" = plain ] || waited_at_least "$log" starter-idle 5; }; then
+      pass "starter-idle は Landed（waited=$(diag_field "$log" starter-idle waited) inject=$(diag_field "$log" starter-idle inject)）"
+    else
+      fail "starter-idle が Landed でない（outcome=$(diag_field "$log" starter-idle outcome)）"
+    fi
+  done
 fi
 
 echo

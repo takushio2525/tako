@@ -38127,6 +38127,79 @@ mod self_test {
         outcome
     }
 
+    /// **PTY（シェルの出力・状態）を状態で待つ 1 実装**（#1902。[`wait_for_background_state`] の PTY 版）。
+    ///
+    /// 旧実装は節ごとの `for _ in 0..N { M ms 待つ; 画面 / コマンド状態 / cwd を読む; 揃えば抜ける }`
+    /// = **回数の窓**で、窓の長さ（N × M）がビルドと混み具合に追従しなかった。シェルの起動・
+    /// エコー・OSC 133 / 7 の取り込み・ペインログの書き出しは「走っている」を外から言えないので
+    /// 2 値（揃った / まだ）で待ち、上限は止まったときの保険（[`state_wait_budget`]）。
+    ///
+    /// - `probe` は**毎周期**呼ぶ（判定の材料を組む・表示の推移を記録する・一過性の状態を
+    ///   掴んだら覚えておく、を中に書ける）。真を返したら揃った。`&mut TakoApp` と `Window` を
+    ///   受けるのは、ツリーの根の同期（`sync_filetree_roots`）とセル座標の解決（`cell_at`）を
+    ///   判定に含む節があるため
+    /// - 周期は `budget.legacy_poll`（旧の 1 周期）
+    /// - A/B は `TAKO_1902_LEGACY=<item>`（旧の窓）、注入は `TAKO_1902_INJECT=late|never[:<item>…]`
+    ///   （**観測だけ**を遅らせる = probe は毎周期呼ぶので、相手は前へ進み記録も続く）
+    /// - 毎回 `TAKO_SELF_TEST_1902` を 1 行（揃った = `outcome=Landed`）、上限で諦めたら
+    ///   `TAKO_SELF_TEST_STATE_TIMEOUT` を加える
+    async fn wait_for_pty_state<P>(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        item: &str,
+        budget: TextWaitBudget,
+        mut probe: P,
+    ) -> bool
+    where
+        P: FnMut(&mut TakoApp, &mut Window) -> bool,
+    {
+        let legacy = legacy_1902(item);
+        let busy = machine_busy();
+        let limit = if legacy {
+            budget.legacy_window
+        } else {
+            state_wait_budget(budget.base, busy)
+        };
+        let hold = inject_1902(item, budget.legacy_window);
+        let started = std::time::Instant::now();
+        let mut polls = 0u32;
+        let landed = loop {
+            let seen = window
+                .update(cx, |app, win, _| probe(app, win))
+                .unwrap_or(false);
+            // 注入は**観測だけ**を遅らせる（#1180 と同じ約束。相手は前へ進む）
+            if seen && hold.is_none_or(|h| started.elapsed() >= h) {
+                break true;
+            }
+            if started.elapsed() >= limit {
+                break false;
+            }
+            polls += 1;
+            cx.background_executor().timer(budget.legacy_poll).await;
+        };
+        let waited = started.elapsed().as_secs_f32();
+        let outcome = if landed {
+            BackgroundWait::Landed
+        } else {
+            BackgroundWait::Running
+        };
+        println!(
+            "TAKO_SELF_TEST_1902: item={item} outcome={outcome:?} waited={waited:.1}s \
+             budget={:.1}s polls={polls} legacy={legacy} capped={} inject={:?} {}",
+            limit.as_secs_f32(),
+            budget_capped(busy),
+            hold.map(|h| h.as_secs_f32()),
+            env_line()
+        );
+        if !landed {
+            println!(
+                "TAKO_SELF_TEST_STATE_TIMEOUT: label={item:?} waited={waited:.1}s legacy={legacy} {}",
+                env_line()
+            );
+        }
+        landed
+    }
+
     /// preview の座標キャッシュが揃ったか（[`wait_for_preview_maps`] の判定）
     fn preview_maps_ready(app: &TakoApp, pane: PaneId, pdf: bool) -> bool {
         let has_text = app
@@ -43674,37 +43747,40 @@ mod self_test {
         const MARKERS: [&str; 13] = [
             "V1", "V2", "V3", "V4", "V5", "V6", "V7", "V8", "V9", "VA", "VB", "VC", "VD",
         ];
+        // fixture の 13 行がシェルから画面へ出るのを状態で待つ（#1902。旧 13 回 × 500ms）。
+        // 判定は待ちの戻り値で行う（`rows` は毎周期写すので、注入で観測を遅らせた回も揃って見える）
         let mut rows: HashMap<String, usize> = HashMap::new();
-        for _ in 0..MARKERS.len() {
-            cx.background_executor()
-                .timer(Duration::from_millis(500))
-                .await;
-            rows = window
-                .update(cx, |app, _, _| {
-                    let pane = app.focused_pane();
-                    let Some(session) = app.terminals.get(&pane) else {
-                        return HashMap::new();
-                    };
-                    let screen = session.screen(&app.theme);
-                    MARKERS
-                        .iter()
-                        .filter_map(|marker| {
-                            let head = format!("{marker} ");
-                            screen
-                                .lines
-                                .iter()
-                                .position(|line| line.text.starts_with(&head))
-                                .map(|row| (marker.to_string(), row))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if rows.len() == MARKERS.len() {
-                break;
-            }
-        }
+        let fixture_shown = wait_for_pty_state(
+            window,
+            cx,
+            "grid-fixture",
+            text_wait_budget(13, 500, 30),
+            |app, _| {
+                let pane = app.focused_pane();
+                rows = app
+                    .terminals
+                    .get(&pane)
+                    .map(|session| {
+                        let screen = session.screen(&app.theme);
+                        MARKERS
+                            .iter()
+                            .filter_map(|marker| {
+                                let head = format!("{marker} ");
+                                screen
+                                    .lines
+                                    .iter()
+                                    .position(|line| line.text.starts_with(&head))
+                                    .map(|row| (marker.to_string(), row))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                rows.len() == MARKERS.len()
+            },
+        )
+        .await;
         check(
-            rows.len() == MARKERS.len(),
+            fixture_shown,
             "visual-test 端末グリッド: fixture 12 行が画面に出る (#787)",
         );
 
@@ -45137,28 +45213,24 @@ mod self_test {
             "clear; printf 'MMMMMM\n\nMMMMMM\n\nMMMMMM\n\nMMMMMM\n\n'",
             true,
         );
-        let mut seeded = false;
-        for _ in 0..40 {
-            wait(cx, 200).await;
-            seeded = window
-                .update(cx, |app, _, _| {
-                    app.terminals
-                        .get(&target)
-                        .map(|s| {
-                            s.screen(&app.theme)
-                                .lines
-                                .iter()
-                                .filter(|l| l.text.starts_with("MMMMMM"))
-                                .count()
-                                >= 4
-                        })
-                        .unwrap_or(false)
+        // printf の 4 行が画面へ出るのを状態で待つ（#1902。旧 40 回 × 200ms）
+        let seeded = wait_for_pty_state(
+            window,
+            cx,
+            "screen-seed",
+            text_wait_budget(40, 200, 30),
+            |app, _| {
+                app.terminals.get(&target).is_some_and(|s| {
+                    s.screen(&app.theme)
+                        .lines
+                        .iter()
+                        .filter(|l| l.text.starts_with("MMMMMM"))
+                        .count()
+                        >= 4
                 })
-                .unwrap_or(false);
-            if seeded {
-                break;
-            }
-        }
+            },
+        )
+        .await;
         if !seeded {
             println!(
                 "TAKO_VISUAL_SKIPPED: screen-lines（fixture が画面に出ない = 未描画。\
@@ -51339,24 +51411,20 @@ mod self_test {
                     .timer(Duration::from_millis(900))
                     .await;
                 // 素のシェルがアイドル（プロンプト表示）になるまで待つ = スターターの条件
-                let mut ready = false;
-                for _ in 0..40 {
-                    ready = window
-                        .update(cx, |app, _, _| {
-                            let pane = app.focused_pane();
-                            app.terminals
-                                .get(&pane)
-                                .map(|s| s.command_state() == tako_core::CommandState::Idle)
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if ready {
-                        break;
-                    }
-                    cx.background_executor()
-                        .timer(Duration::from_millis(100))
-                        .await;
-                }
+                // （#1902。旧 40 回 × 100ms）
+                let ready = wait_for_pty_state(
+                    window,
+                    cx,
+                    "starter-idle",
+                    text_wait_budget(40, 100, 30),
+                    |app, _| {
+                        let pane = app.focused_pane();
+                        app.terminals
+                            .get(&pane)
+                            .is_some_and(|s| s.command_state() == tako_core::CommandState::Idle)
+                    },
+                )
+                .await;
                 check(ready, "visual-test スターター: 素のシェルがアイドルになる (#694)");
                 let area = window
                     .update(cx, |app, _, _| {
@@ -62512,27 +62580,23 @@ mod self_test {
         match rect_of(&rows12, &at("src/d.txt")) {
             Some(d) => {
                 let _ = vt1834_drag(any, window, cx, vt1834_grab(d), area.center());
-                let mut inserted = false;
-                for _ in 0..50 {
-                    let screen = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&p0)
-                                .map(|s| {
-                                    s.visible_lines()
-                                        .iter()
-                                        .map(|l| l.trim_end())
-                                        .collect::<String>()
-                                })
-                                .unwrap_or_default()
+                // 落としたパスがシェルの入力行に出るのを状態で待つ（#1902。旧 50 回 × 100ms）
+                let inserted = wait_for_pty_state(
+                    window,
+                    cx,
+                    "tree-move-drop",
+                    text_wait_budget(50, 100, 30),
+                    |app, _| {
+                        app.terminals.get(&p0).is_some_and(|s| {
+                            s.visible_lines()
+                                .iter()
+                                .map(|l| l.trim_end())
+                                .collect::<String>()
+                                .contains("src/d.txt")
                         })
-                        .unwrap_or_default();
-                    if screen.contains("src/d.txt") {
-                        inserted = true;
-                        break;
-                    }
-                    wait(cx, 100).await;
-                }
+                    },
+                )
+                .await;
                 check(
                     inserted && at("src/d.txt").is_file(),
                     "visual-test tree-move ⑫: ターミナルの中央へ落とすとパスが入る・移さない（FR-3.13 の非回帰）",
@@ -65764,21 +65828,19 @@ mod self_test {
                 // ペインの cwd をそのリポへ移す（dispatch は**セッションの cwd** から
                 // リポジトリを解決するので、pinned フォルダだけでは届かない）
                 type_text(any496, cx, &format!("cd {}", shell_escape(&iso496)), true);
-                let mut cwd_ok = false;
-                for _ in 0..20 {
-                    wait(cx, 300).await;
-                    cwd_ok = window496
-                        .update(cx, |app, _, _| {
-                            app.focused_session()
-                                .and_then(|s| s.cwd())
-                                .map(|c| c == iso496)
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if cwd_ok {
-                        break;
-                    }
-                }
+                // シェル統合（OSC 7）が cwd を知らせるのを状態で待つ（#1902。旧 20 回 × 300ms）
+                let cwd_ok = wait_for_pty_state(
+                    window496,
+                    cx,
+                    "selftest-109-cwd",
+                    text_wait_budget(20, 300, 30),
+                    |app, _| {
+                        app.focused_session()
+                            .and_then(|s| s.cwd())
+                            .is_some_and(|c| c == iso496)
+                    },
+                )
+                .await;
                 if !cwd_ok {
                     println!(
                         "TAKO_SELF_TEST_SKIPPED: 109（ペインの cwd が使い捨てリポへ移らない）"
@@ -66390,31 +66452,27 @@ mod self_test {
                 &sh.emit_ansi_line("\u{1b}[31mTAKO-RED\u{1b}[0m"),
                 true,
             );
-            let mut red_ok = false;
-            for _ in 0..8 {
-                wait(cx, 1000).await;
-                red_ok = window
-                    .update(cx, |app, _, _| {
-                        let theme = app.theme.clone();
-                        app.focused_session()
-                            .map(|s| {
-                                let screen = s.screen(&theme);
-                                screen.lines.iter().any(|line| {
-                                    line.text.contains("TAKO-RED")
-                                        && line.runs.iter().any(|run| {
-                                            run.fg == theme.red
-                                                && line.text[run.range.clone()]
-                                                    .contains("TAKO-RED")
-                                        })
+            // 赤い行がシェルから画面へ出るのを状態で待つ（#1902。旧 8 回 × 1000ms）
+            let red_ok = wait_for_pty_state(
+                window,
+                cx,
+                "selftest-ansi-red",
+                text_wait_budget(8, 1000, 30),
+                |app, _| {
+                    let theme = app.theme.clone();
+                    app.focused_session().is_some_and(|s| {
+                        let screen = s.screen(&theme);
+                        screen.lines.iter().any(|line| {
+                            line.text.contains("TAKO-RED")
+                                && line.runs.iter().any(|run| {
+                                    run.fg == theme.red
+                                        && line.text[run.range.clone()].contains("TAKO-RED")
                                 })
-                            })
-                            .unwrap_or(false)
+                        })
                     })
-                    .unwrap_or(false);
-                if red_ok {
-                    break;
-                }
-            }
+                },
+            )
+            .await;
             check(red_ok, "ANSI 赤の解決");
 
             // 9. スクロールバック表示
@@ -67570,16 +67628,19 @@ mod self_test {
             // 遅延する。fd 数が落ち着くまでリトライして待つ（真のリークなら待っても
             // 減らないので検査の意味は変わらない）
             if fd_countable {
-                let mut fd_ok = false;
+                // PTY とシェルの後始末で fd が戻るのを状態で待つ（#1902。旧 10 回 × 800ms）
                 let mut fd_after = 0;
-                for _ in 0..10 {
-                    fd_after = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
-                    if fd_after <= fd_before + 8 {
-                        fd_ok = true;
-                        break;
-                    }
-                    wait(cx, 800).await;
-                }
+                let fd_ok = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-fd",
+                    text_wait_budget(10, 800, 30),
+                    |_, _| {
+                        fd_after = std::fs::read_dir("/dev/fd").map(|d| d.count()).unwrap_or(0);
+                        fd_after <= fd_before + 8
+                    },
+                )
+                .await;
                 check(
                     fd_ok,
                     &format!("split/close で fd が漏れない（before={fd_before}, after={fd_after}）"),
@@ -67757,53 +67818,51 @@ mod self_test {
                 // 実行中状態の検知: sleep 5 の実行ウィンドウ内で Running への遷移をポーリングで
                 // 捕まえる（高負荷時はコマンド開始自体が 1 秒超遅れるため。項目 17 と同型の対策）
                 type_text(any, cx, &sh.sleep(5), true);
-                let mut osc_running = false;
-                for _ in 0..12 {
-                    wait(cx, 300).await;
-                    osc_running = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&osc_pane)
-                                .map(|s| s.command_state() == CommandState::Running)
-                                == Some(true)
-                        })
-                        .unwrap_or(false);
-                    if osc_running {
-                        break;
-                    }
-                }
+                // Running は sleep の 5 秒だけの一過性の状態なので、掴んだら覚えておく（注入で
+                // 観測を遅らせても取りこぼさない。#1902。旧 12 回 × 300ms）
+                let mut seen_running = false;
+                let osc_running = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-osc-running",
+                    text_wait_budget(12, 300, 30),
+                    |app, _| {
+                        seen_running |= app
+                            .terminals
+                            .get(&osc_pane)
+                            .is_some_and(|s| s.command_state() == CommandState::Running);
+                        seen_running
+                    },
+                )
+                .await;
                 check(osc_running, "実行中コマンドが running");
-                // sleep 5 の完了（Running でなくなる）を待ってから失敗コマンドへ
-                for _ in 0..10 {
-                    wait(cx, 800).await;
-                    let done = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&osc_pane)
-                                .map(|s| s.command_state() != CommandState::Running)
-                                == Some(true)
-                        })
-                        .unwrap_or(false);
-                    if done {
-                        break;
-                    }
-                }
+                // sleep 5 の完了（Running でなくなる）を待ってから失敗コマンドへ（旧 10 回 × 800ms。
+                // 揃わなくても先へ進む = 後の failed の検査が判定する）
+                let _ = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-osc-done",
+                    text_wait_budget(10, 800, 30),
+                    |app, _| {
+                        app.terminals
+                            .get(&osc_pane)
+                            .is_some_and(|s| s.command_state() != CommandState::Running)
+                    },
+                )
+                .await;
                 type_text(any, cx, &sh.exit_status(1), true);
-                let mut osc_failed = false;
-                for _ in 0..8 {
-                    wait(cx, 800).await;
-                    osc_failed = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&osc_pane)
-                                .map(|s| s.command_state() == CommandState::Failed(1))
-                                == Some(true)
-                        })
-                        .unwrap_or(false);
-                    if osc_failed {
-                        break;
-                    }
-                }
+                let osc_failed = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-osc-failed",
+                    text_wait_budget(8, 800, 30),
+                    |app, _| {
+                        app.terminals
+                            .get(&osc_pane)
+                            .is_some_and(|s| s.command_state() == CommandState::Failed(1))
+                    },
+                )
+                .await;
                 check(osc_failed, "失敗コマンドで failed（プロンプト後も保持）");
                 // 開発不変条件: 検知した状態は list（CLI / MCP 共有の dispatch）からも見える
                 let list_exposes = window
@@ -69090,12 +69149,14 @@ mod self_test {
             press(any, cx, sh.clear_line_key());
             type_text(any, cx, "echo あいうえおかきくけこ", true);
             // 高負荷環境では echo の実行・画面反映が 1 秒を超えることがあるため
-            // リトライで待つ（座標解決の実バグならリトライ後も false のまま fail する）
-            let mut wide_hit = false;
-            for _ in 0..8 {
-                wait(cx, 800).await;
-                wide_hit = window
-                    .update(cx, |app, win, _| {
+            // 状態で待つ（座標解決の実バグなら上限まで false のまま fail する。#1902。旧 8 回 × 800ms）
+            let wide_hit = wait_for_pty_state(
+                window,
+                cx,
+                "selftest-wide-click",
+                text_wait_budget(8, 800, 30),
+                |app, win| {
+                    (|| -> Option<bool> {
                         let pane = app.focused_pane();
                         let (_, area) = app
                             .pane_text_areas
@@ -69119,14 +69180,11 @@ mod self_test {
                         );
                         let (col, hit_row, _) = app.cell_at(pane, pos, win)?;
                         Some(col == 4 && hit_row == row)
-                    })
-                    .ok()
-                    .flatten()
-                    .unwrap_or(false);
-                if wide_hit {
-                    break;
-                }
-            }
+                    })()
+                    .unwrap_or(false)
+                },
+            )
+            .await;
             check(wide_hit, "全角行のクリックが正しいセルに解決");
 
             // 47. ペインの × ボタン = kill（dispatch 共有経路）。split で増やして × 相当の
@@ -73048,32 +73106,28 @@ mod self_test {
                     split["pane"].as_u64().expect("pane が返る")
                 })
                 .unwrap_or(0);
-            let mut multiroot_ok = false;
-            for _ in 0..20 {
-                wait(cx, 300).await;
-                multiroot_ok = window
-                    .update(cx, |app, _, _| {
-                        app.sync_filetree_roots();
-                        let root_count = app.filetree.roots().len();
-                        // 名前決め打ち（`ends_with("tmp")`）だと Windows の `…\Local\Temp`
-                        // で外れる（`Path::ends_with` は成分の完全一致で大小も区別する）。
-                        // 実際に渡したフォルダ名で見る
-                        let has_tmp = app
-                            .filetree
-                            .roots()
-                            .iter()
-                            .any(|r| r.file_name().map(std::ffi::OsStr::to_os_string) == multiroot_leaf);
-                        let header_rows =
-                            app.filetree.rows().iter().filter(|r| r.root).count();
-                        root_count >= 2
-                            && has_tmp
-                            && header_rows == root_count
-                    })
-                    .unwrap_or(false);
-                if multiroot_ok {
-                    break;
-                }
-            }
+            // 一時ペインのシェルが起きて cwd が根に並ぶのを状態で待つ（#1902。旧 20 回 × 300ms）
+            let multiroot_ok = wait_for_pty_state(
+                window,
+                cx,
+                "selftest-multiroot",
+                text_wait_budget(20, 300, 30),
+                |app, _| {
+                    app.sync_filetree_roots();
+                    let root_count = app.filetree.roots().len();
+                    // 名前決め打ち（`ends_with("tmp")`）だと Windows の `…\Local\Temp`
+                    // で外れる（`Path::ends_with` は成分の完全一致で大小も区別する）。
+                    // 実際に渡したフォルダ名で見る
+                    let has_tmp = app
+                        .filetree
+                        .roots()
+                        .iter()
+                        .any(|r| r.file_name().map(std::ffi::OsStr::to_os_string) == multiroot_leaf);
+                    let header_rows = app.filetree.rows().iter().filter(|r| r.root).count();
+                    root_count >= 2 && has_tmp && header_rows == root_count
+                },
+            )
+            .await;
             check(
                 multiroot_ok,
                 "タブ内全ペインの cwd がワークスペースフォルダとして並ぶ",
@@ -74487,10 +74541,14 @@ mod self_test {
             // #64 の根因（グリッド幅ちょうどでの折り返し）は macOS の shaper で実測したもの。
             // 他の環境でも同じ前提が成り立つとは限らないので、そこでは診断だけ出す
             let repro_required = cfg!(target_os = "macos");
-            for _ in 0..8 {
-                wait(cx, 800).await;
-                issue64 = window
-                    .update(cx, |app, win, _| {
+            // echo の 2 行が画面へ出て組み終わるのを状態で待つ（#1902。旧 8 回 × 800ms）
+            let issue64_landed = wait_for_pty_state(
+                window,
+                cx,
+                "selftest-issue64",
+                text_wait_budget(8, 800, 30),
+                |app, win| {
+                    issue64 = (|| -> Option<(bool, bool, bool, bool)> {
                         // a. 根因の実在証明: グリッド幅ちょうどの wrap_width で ASCII を
                         //    シェイプすると折り返しが起きる（旧実装はこれが文字消失だった）
                         let ts = win.text_system().clone();
@@ -74577,14 +74635,12 @@ mod self_test {
                             // 合うかは**入っているフォント次第**
                             mark_solo && ta_solo && snap_judge,
                         ))
-                    })
-                    .ok()
-                    .flatten()
+                    })()
                     .unwrap_or((false, false, false, false));
-                if issue64.1 && issue64.2 && (!repro_required || (issue64.0 && issue64.3)) {
-                    break;
-                }
-            }
+                    issue64.1 && issue64.2 && (!repro_required || (issue64.0 && issue64.3))
+                },
+            )
+            .await;
             // (a) は「この環境でも #64 の折り返しが起こりうる」ことの確認で、
             // shaper とフォント寸法に依存する（macOS の実測で見つかった前提）。
             // 前提が成り立たない環境では**前提が無いこと**を出して先へ進む
@@ -74612,6 +74668,12 @@ mod self_test {
                     issue64.3
                 );
             }
+            // 観点ごとの判定は最後の観測の値で行う。揃わないまま上限に届いた回はどれかの観点が
+            // 偽なので上で名指しで落ちる = ここへ届くのは観測を遅らせた回（`TAKO_1902_INJECT`）だけ
+            check(
+                issue64_landed,
+                "69b: echo の 2 行が画面に揃い #64 の検証が成り立つ（#1902 の状態待ち）",
+            );
 
             // links.rs のパス検出は **POSIX 形のパス**（`/` 区切り・`/` 始まり）を
             // 前提にしている。Windows の `C:\…` / UNC / 区切り文字への対応は #522 の
@@ -74649,26 +74711,25 @@ mod self_test {
                 // cwd 追従（OSC 7）が効かない環境（器が素通ししない / 統合が未配置。#525）では
                 // ペインの cwd は起動時の値のまま。画面に出たことだけを待つ
                 let link_cwd_tracked = shell_integration.effective();
-                let mut link_screen_ready = false;
-                for _ in 0..12 {
-                    wait(cx, 300).await;
-                    link_screen_ready = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&app.focused_pane())
-                                .is_some_and(|session| {
-                                    (!link_cwd_tracked || session.cwd() == Some(link_dir.as_path()))
-                                        && session
-                                            .visible_lines()
-                                            .iter()
-                                            .any(|line| line.trim() == "LINK_SELFTEST")
-                                })
-                        })
-                        .unwrap_or(false);
-                    if link_screen_ready {
-                        break;
-                    }
-                }
+                // （#1902。旧 12 回 × 300ms）
+                let link_screen_ready = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-link-screen",
+                    text_wait_budget(12, 300, 30),
+                    |app, _| {
+                        app.terminals
+                            .get(&app.focused_pane())
+                            .is_some_and(|session| {
+                                (!link_cwd_tracked || session.cwd() == Some(link_dir.as_path()))
+                                    && session
+                                        .visible_lines()
+                                        .iter()
+                                        .any(|line| line.trim() == "LINK_SELFTEST")
+                            })
+                    },
+                )
+                .await;
                 check(link_screen_ready, "リンク検証テキストを実 PTY 画面へ表示");
 
                 let (absolute_ok, home_ok, relative_ok, cwd_ok) = window
@@ -76927,36 +76988,46 @@ mod self_test {
                 // マーカーが**出る**のを待つ（#796 の作法）。debug CLI の起動 + IPC 往復 +
                 // ログの書き出しは環境で数秒かかる（Windows 実機で 1200ms 固定では
                 // `cli=""` になった）
-                let mut markers_ok = false;
-                let mut registry_ok = false;
                 // #775: レジストリ側の期待値。**`CloseOrigin::marker` から採る**
                 // （`close_reason_for` から採ると A/B の legacy 腕で期待値も旧値へ
                 // 動いてしまい、検出力が消える）。GUI 経路は caller を載せない
                 let want775 =
                     |origin: CloseOrigin| -> String { format!("closed/{}", origin.marker()) };
-                for _ in 0..24 {
-                    wait(cx, 500).await;
-                    markers_ok = log_dir
-                        .as_ref()
-                        .map(|dir| {
+                // ペインログの書き手（#2618）のマーカーと台帳の close の記録を状態で待つ（#1902。
+                // 旧はまとめて 24 回 × 500ms。判定のラベルが別なので待ちも別にし、それぞれの判定は
+                // その待ちの戻り値で行う）
+                let markers_ok = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-close-markers",
+                    text_wait_budget(24, 500, 30),
+                    |_, _| {
+                        log_dir.as_ref().is_some_and(|dir| {
                             reason_is(&close_reason(dir, kbd_pane), CloseOrigin::Keyboard)
                                 && reason_is(&close_reason(dir, gui_pane), CloseOrigin::PaneButton)
                                 && reason_is(&close_reason(dir, cli_pane), CloseOrigin::Cli)
                         })
-                        .unwrap_or(false);
-                    // dispatch 経路は呼び出し元 role が載る（ペインログと同じ扱い）
-                    registry_ok = registry775(kbd_pane) == want775(CloseOrigin::Keyboard)
-                        && registry775(gui_pane) == want775(CloseOrigin::PaneButton)
-                        && (registry775(cli_pane) == want775(CloseOrigin::Cli)
-                            || registry775(cli_pane)
-                                == format!(
-                                    "closed/{}",
-                                    CloseOrigin::Cli.marker_with_caller(caller_role.as_deref())
-                                ));
-                    if markers_ok && registry_ok {
-                        break;
-                    }
-                }
+                    },
+                )
+                .await;
+                // dispatch 経路は呼び出し元 role が載る（ペインログと同じ扱い）
+                let registry_ok = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-close-registry",
+                    text_wait_budget(24, 500, 30),
+                    |_, _| {
+                        registry775(kbd_pane) == want775(CloseOrigin::Keyboard)
+                            && registry775(gui_pane) == want775(CloseOrigin::PaneButton)
+                            && (registry775(cli_pane) == want775(CloseOrigin::Cli)
+                                || registry775(cli_pane)
+                                    == format!(
+                                        "closed/{}",
+                                        CloseOrigin::Cli.marker_with_caller(caller_role.as_deref())
+                                    ))
+                    },
+                )
+                .await;
                 if !markers_ok {
                     if let Some(dir) = log_dir.as_ref() {
                         println!(
@@ -81426,21 +81497,20 @@ mod self_test {
                             .is_some_and(|c| c.is_ascii_digit())
                     })
                 };
-                let mut ran = false;
-                for _ in 0..120 {
-                    wait(cx, 250).await;
-                    ran = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&base)
-                                .map(|s| ran_marker(&s.visible_lines().join("\n")))
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if ran {
-                        break;
-                    }
-                }
+                // 打った行の出力（版数）が画面へ出るのを状態で待つ（#1902。旧 120 回 × 250ms =
+                // 30 秒なので、素の上限は注入の遅れ（旧の窓 + 5 秒）より広い 60 秒）
+                let ran = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-starter-ran",
+                    text_wait_budget(120, 250, 60),
+                    |app, _| {
+                        app.terminals
+                            .get(&base)
+                            .is_some_and(|s| ran_marker(&s.visible_lines().join("\n")))
+                    },
+                )
+                .await;
                 if !ran {
                     let screen = window
                         .update(cx, |app, _, _| {
@@ -82201,20 +82271,20 @@ mod self_test {
                         app.jump_to_pane(direct_pane, cx);
                     })
                     .ok();
-                // シェルが立ち上がってプロンプトを出すまで待つ（打鍵が捨てられないように）
-                for _ in 0..40 {
-                    wait(cx, 100).await;
-                    let ready = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&direct_pane)
-                                .is_some_and(|s| s.command_state() == tako_core::CommandState::Idle)
-                        })
-                        .unwrap_or(false);
-                    if ready {
-                        break;
-                    }
-                }
+                // シェルが立ち上がってプロンプトを出すまで待つ（打鍵が捨てられないように。
+                // #1902。旧 40 回 × 100ms。揃わなくても先へ進む = 後の alt screen の検査が判定する）
+                let _ = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-702-idle",
+                    text_wait_budget(40, 100, 30),
+                    |app, _| {
+                        app.terminals
+                            .get(&direct_pane)
+                            .is_some_and(|s| s.command_state() == tako_core::CommandState::Idle)
+                    },
+                )
+                .await;
                 // 打鍵ではなく PTY へ直接書く（キーの配送先ウィンドウに依存させない。
                 // スターターの master 起動と同じ経路）。cat で alt screen に留まる
                 let _ = window.update(cx, |app, _, _| {
@@ -83594,22 +83664,29 @@ mod self_test {
                 let Some(fresh) = fresh else {
                     fail("#720: 検証用ペインの作成")
                 };
-                // 生成直後から 20ms 刻みで表示を全部拾う（フレームの取りこぼしを減らす）
+                // 生成直後から 20ms 刻みで表示を全部拾い、シェルが起きてスターターに着くのを状態で
+                // 待つ（フレームの取りこぼしを減らす。#1902。旧 250 回 × 20ms）。着いたら記録を
+                // 止める（注入で観測を遅らせても、記録はスターターに着いた時点までと同じ）。
+                // 判定は待ちの戻り値で行う
                 let mut seen: Vec<PaneDisplay> = Vec::new();
-                let mut reached_starter = false;
-                for _ in 0..250 {
-                    let display = window
-                        .update(cx, |app, _, _| app.pane_display_for(fresh))
-                        .unwrap_or(PaneDisplay::Terminal);
-                    if seen.last() != Some(&display) {
-                        seen.push(display);
-                    }
-                    if display == PaneDisplay::Starter {
-                        reached_starter = true;
-                        break;
-                    }
-                    wait(cx, 20).await;
-                }
+                let mut at_starter = false;
+                let reached_starter = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-720-starter",
+                    text_wait_budget(250, 20, 30),
+                    |app, _| {
+                        if !at_starter {
+                            let display = app.pane_display_for(fresh);
+                            if seen.last() != Some(&display) {
+                                seen.push(display);
+                            }
+                            at_starter = display == PaneDisplay::Starter;
+                        }
+                        at_starter
+                    },
+                )
+                .await;
                 let no_raw_terminal = !seen.contains(&PaneDisplay::Terminal);
                 println!("97-SETTLE: sequence={seen:?} reached_starter={reached_starter}");
                 check(
@@ -83829,18 +83906,16 @@ mod self_test {
                     "role 付き（worker spawn）ペインはエージェント待ちの猶予になる (#720)",
                 );
 
-                // シェルのプロンプトを待ってから押す（スターターが出ている状態が起点）
-                for _ in 0..40 {
-                    wait(cx, 100).await;
-                    let ready = window
-                        .update(cx, |app, _, _| {
-                            app.pane_display_for(master_pane) == PaneDisplay::Starter
-                        })
-                        .unwrap_or(false);
-                    if ready {
-                        break;
-                    }
-                }
+                // シェルのプロンプトを待ってから押す（スターターが出ている状態が起点。#1902。旧 40 回
+                // × 100ms。揃わなくても先へ進む = 押下の `armed` を含む後の検査が判定する）
+                let _ = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-720-armed",
+                    text_wait_budget(40, 100, 30),
+                    |app, _| app.pane_display_for(master_pane) == PaneDisplay::Starter,
+                )
+                .await;
                 let armed = window
                     .update(cx, |app, _, cx| {
                         let done = app.starter_action(master_pane, StarterAction::Master, cx);
@@ -84791,26 +84866,26 @@ mod self_test {
                             .collect::<String>()
                     })
                     .unwrap_or_default();
-                let mut delivered = false;
-                for _ in 0..40 {
-                    wait(cx, 100).await;
-                    delivered = !master_needle.is_empty()
-                        && window
-                            .update(cx, |app, _, _| {
-                                app.terminals
-                                    .get(&starter_pane)
-                                    .map(|s| s.visible_lines().join(""))
-                                    .unwrap_or_default()
-                                    .chars()
-                                    .filter(|c| !c.is_whitespace())
-                                    .collect::<String>()
-                                    .contains(&master_needle)
-                            })
-                            .unwrap_or(false);
-                    if delivered {
-                        break;
-                    }
-                }
+                // 書き込んだ行がシェルの画面へ出るのを状態で待つ（#1902。旧 40 回 × 100ms。
+                // 期待の行を組めなければ待たずに偽）
+                let delivered = !master_needle.is_empty()
+                    && wait_for_pty_state(
+                        window,
+                        cx,
+                        "selftest-739-delivered",
+                        text_wait_budget(40, 100, 30),
+                        |app, _| {
+                            app.terminals
+                                .get(&starter_pane)
+                                .map(|s| s.visible_lines().join(""))
+                                .unwrap_or_default()
+                                .chars()
+                                .filter(|c| !c.is_whitespace())
+                                .collect::<String>()
+                                .contains(&master_needle)
+                        },
+                    )
+                    .await;
                 // (d) 選んだらドロップダウンは閉じている
                 let closed = window
                     .update(cx, |app, _, _| app.starter_profile_menu.is_none())
@@ -86619,15 +86694,15 @@ mod self_test {
                     );
                     fail("#772: 検証用 tmux セッションを作れない");
                 }
-                // 偽 claude がシェルの子として見えるまで待つ（最大 12 秒）
-                let mut claude_up = false;
-                for _ in 0..80 {
-                    if tako_control::stale_binary::find_claude_pid_for_backend(&session).is_some() {
-                        claude_up = true;
-                        break;
-                    }
-                    wait(cx, 150).await;
-                }
+                // 偽 claude がシェルの子として見えるまで状態で待つ（#1902。旧 80 回 × 150ms = 12 秒）
+                let claude_up = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-103-claude",
+                    text_wait_budget(80, 150, 30),
+                    |_, _| tako_control::stale_binary::find_claude_pid_for_backend(&session).is_some(),
+                )
+                .await;
                 check(claude_up, "103: 検証用の偽 claude がペイン内で見える (#772)");
 
                 // 検証用ペイン（role worker + バックエンドセッション登録）
@@ -86844,34 +86919,34 @@ mod self_test {
                 // close 前に構成を控える（ペイン生成は負荷で遅れるので揃うまで待つ）。
                 // シェルのプロンプトが出るまで待つのも必須: ペインログは「何も出ていない
                 // ペイン」にはファイルを作らないため、待たないとマーカー検査が空振りする
+                // （#1902。旧 30 回 × 500ms）
                 let mut panes770: Vec<PaneId> = Vec::new();
                 let mut has_preview = false;
                 let mut drawn = 0usize;
-                for _ in 0..30 {
-                    (panes770, has_preview, drawn) = window
-                        .update(cx, |app, _, _| {
-                            let panes: Vec<PaneId> = app
-                                .workspace
-                                .get_tab(TabId::from_raw(tab770))
-                                .map(|t| t.tree().panes().iter().map(|p| p.id()).collect())
-                                .unwrap_or_default();
-                            let preview = panes.iter().any(|p| app.previews.contains_key(p));
-                            let drawn = panes
-                                .iter()
-                                .filter(|p| {
-                                    app.terminals.get(p).is_some_and(|s| {
-                                        s.visible_lines().iter().any(|l| !l.trim().is_empty())
-                                    })
+                let tab_ready = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-104-tab",
+                    text_wait_budget(30, 500, 30),
+                    |app, _| {
+                        panes770 = app
+                            .workspace
+                            .get_tab(TabId::from_raw(tab770))
+                            .map(|t| t.tree().panes().iter().map(|p| p.id()).collect())
+                            .unwrap_or_default();
+                        has_preview = panes770.iter().any(|p| app.previews.contains_key(p));
+                        drawn = panes770
+                            .iter()
+                            .filter(|p| {
+                                app.terminals.get(p).is_some_and(|s| {
+                                    s.visible_lines().iter().any(|l| !l.trim().is_empty())
                                 })
-                                .count();
-                            (panes, preview, drawn)
-                        })
-                        .unwrap_or_default();
-                    if panes770.len() == 3 && has_preview && drawn == 2 {
-                        break;
-                    }
-                    wait(cx, 500).await;
-                }
+                            })
+                            .count();
+                        panes770.len() == 3 && has_preview && drawn == 2
+                    },
+                )
+                .await;
                 println!(
                     "TAKO_SELF_TEST_770_TAB: panes={} preview={has_preview} drawn={drawn}",
                     panes770.len(),
@@ -86901,7 +86976,10 @@ mod self_test {
                 // ウィンドウが他アプリに完全に隠れていると GPUI が描画を止め、新ペインの
                 // シェルが 1 行も出さない = ペインログのファイル自体が作られない。
                 // product の欠陥ではないので落とさず、飛ばしたことを明示する（76d と同じ扱い）
-                if drawn == 2 {
+                // 揃ったかは待ちの戻り値で見る（`drawn` は毎周期写すので、注入で観測を遅らせた回も
+                // 揃って見える。揃わずに上限へ届いた回は `panes770` / `has_preview` の検査が先に落ちるか
+                // `drawn` が 2 でない = 修正前と同じ分岐）
+                if tab_ready && drawn == 2 {
                     let markers: Vec<String> = tako_core::pane_log::log_dir()
                         .map(|dir| {
                             panes770
@@ -86989,20 +87067,19 @@ mod self_test {
                 let Some(busy_pane) = busy_pane else {
                     fail("105: busy worker ペインを作れない (#778)")
                 };
-                let mut alt_screen = false;
-                for _ in 0..100 {
-                    alt_screen = window
-                        .update(cx, |app, _, _| {
-                            app.terminals
-                                .get(&busy_pane)
-                                .is_some_and(|s| s.is_alt_screen())
-                        })
-                        .unwrap_or(false);
-                    if alt_screen {
-                        break;
-                    }
-                    wait(cx, 100).await;
-                }
+                // fixture が alt screen へ入るのを状態で待つ（#1902。旧 100 回 × 100ms）
+                let alt_screen = wait_for_pty_state(
+                    window,
+                    cx,
+                    "selftest-105-alt",
+                    text_wait_budget(100, 100, 30),
+                    |app, _| {
+                        app.terminals
+                            .get(&busy_pane)
+                            .is_some_and(|s| s.is_alt_screen())
+                    },
+                )
+                .await;
                 check(alt_screen, "105: worker が busy な全画面状態になる (#778)");
 
                 let worker_id = tako_control::orchestrator::registry::record_spawn(RegisterSpawn {
@@ -88125,23 +88202,20 @@ mod self_test {
                         })
                         .unwrap_or_default()
                 };
-                // 画面に文字列が出るまで待つ（固定待ちにしない。#796）
+                // 画面に文字列が出るまで状態で待つ（固定待ちにしない。#796 / #1902。旧 40 回 × 250ms）
                 let wait_screen = async |cx: &mut AsyncApp, pane: PaneId, needle: &str| -> bool {
-                    for _ in 0..40 {
-                        wait(cx, 250).await;
-                        let hit = window
-                            .update(cx, |app, _, _| {
-                                app.terminals
-                                    .get(&pane)
-                                    .map(|s| s.visible_lines().join("\n").contains(needle))
-                                    .unwrap_or(false)
-                            })
-                            .unwrap_or(false);
-                        if hit {
-                            return true;
-                        }
-                    }
-                    false
+                    wait_for_pty_state(
+                        window,
+                        cx,
+                        "selftest-813-screen",
+                        text_wait_budget(40, 250, 30),
+                        |app, _| {
+                            app.terminals
+                                .get(&pane)
+                                .is_some_and(|s| s.visible_lines().join("\n").contains(needle))
+                        },
+                    )
+                    .await
                 };
                 let set_enabled = |cx: &mut AsyncApp, pane: PaneId, on: bool| {
                     window
@@ -88213,23 +88287,26 @@ mod self_test {
                 // 画面が静止するまで待つ（fixture の出力が届き切ってから判定に入る。
                 // 静止していないと `decide` は screen_unstable で正しく待つので、
                 // ここで待たないとテスト側の都合で偽陰性になる）
+                // （#1902。旧 20 回 × 200ms。静止しなくても先へ進む = 後の判定が待ち方ごと見る）
                 let settle813 = async |cx: &mut AsyncApp, pane: PaneId| {
                     let mut last = String::new();
-                    for _ in 0..20 {
-                        let now = window
-                            .update(cx, |app, _, _| {
-                                app.terminals
-                                    .get(&pane)
-                                    .map(|s| s.visible_lines().join("\n"))
-                                    .unwrap_or_default()
-                            })
-                            .unwrap_or_default();
-                        if !now.is_empty() && now == last {
-                            return;
-                        }
-                        last = now;
-                        wait(cx, 200).await;
-                    }
+                    let _ = wait_for_pty_state(
+                        window,
+                        cx,
+                        "selftest-813-settle",
+                        text_wait_budget(20, 200, 30),
+                        |app, _| {
+                            let now = app
+                                .terminals
+                                .get(&pane)
+                                .map(|s| s.visible_lines().join("\n"))
+                                .unwrap_or_default();
+                            let quiet = !now.is_empty() && now == last;
+                            last = now;
+                            quiet
+                        },
+                    )
+                    .await;
                 };
 
                 // --- 正例 ① idle 型（ダイアログ無し。上限メッセージのまま止まっている） ---
@@ -106931,11 +107008,12 @@ mod selftest_wait_watchdog {
     }
 
     /// 回数の窓の理由の分類（#1902 の棚卸しの表と同じ言葉）。background（8 件）と画面の静止
-    /// （4 件）は 2 回目の移送で 0 件になったので分類ごと外した
-    const PTY: &str = "PTY / シェルの出力・状態";
+    /// （4 件）は 2 回目、PTY / シェルの出力・状態（26 件）は 3 回目の移送で 0 件になったので
+    /// 分類ごと外した（PTY のうち #720 の「押下から tick を跨ぐ長さだけ表示を追う」1 件は待ちでは
+    /// なく観測の窓なので計測へ移した）
     const PROC: &str = "別プロセス（言語サーバ・tmux・git・daemon・実 claude）の往復";
     const UI: &str = "UI の状態（窓・描画・クリックの着地）";
-    const MEASURE: &str = "計測の周回（所要を測る。判定は後段の検査）";
+    const MEASURE: &str = "計測・観測の周回（所要を測る・決まった長さだけ追う。判定は後段の検査）";
 
     /// **「回数の窓」の既知リスト**（#1902 で番犬を入れた時点の残り。キーと分類）。
     ///
@@ -106943,9 +107021,10 @@ mod selftest_wait_watchdog {
     /// tasks の一覧更新・送信、hover の問い合わせ、診断・サムネイル）。2 回目に background の
     /// 残り（偽サーバの診断・外部変更の競合・Markdown の目次・塗り直し・PDF の幾何と再ラスタ・
     /// 動画の末尾停止）を `wait_for_background_state` へ、画面の静止を撮り直す 4 か所を
-    /// `wait_for_quiet_frame` へ寄せた。残りは待つ相手ごとに寄せ先が違う（PTY は
-    /// `type_until_focused_text` / `wait_for_cli_state`、別プロセスは `wait_for_backend_state`）
-    /// ので、番犬を先に入れて**新規の混入を止め**、ここで段階導入にする（#1353 → #1375 の
+    /// `wait_for_quiet_frame` へ寄せた。3 回目に PTY（シェルの出力・コマンド状態・cwd・alt screen・
+    /// ペインログ・fd の回収）の 25 か所を `wait_for_pty_state` へ寄せた。残りは待つ相手ごとに
+    /// 寄せ先が違う（別プロセスは `wait_for_backend_state`・UI は `wait_for_app_state` /
+    /// `wait_for_drawn_state`）ので、番犬を先に入れて**新規の混入を止め**、ここで段階導入にする（#1353 → #1375 の
     /// `KNOWN_FIXED_CLI_WAITS`・#2013 の `KNOWN_FIXED_DISPLAY_WAITS` と同じ運用。#2013 の 3 件も
     /// ここへ移した）。
     ///
@@ -106953,12 +107032,9 @@ mod selftest_wait_watchdog {
     /// 新しく混入した形はここへ足さずに状態待ちへ移すこと
     const KNOWN_COUNT_WINDOWS: &[(&str, &str)] = &[
         ("main.rs: visual-test #738: 設定ウィンドウが開かない", UI),
-        ("main.rs: visual-test 端末グリッド: fixture 12 行が画面に出る (#787)", PTY),
         ("main.rs: visual-test 端末グリッド: 実 claude の TUI が起動する (#787)", PROC),
-        ("main.rs: visual-test screen-lines: ホバー前フレーム採取", PTY),
         ("main.rs: visual-test 診断: 右パネルの diagnostics ビューに 1 件 1 行で並ばない", UI),
         ("main.rs: fn settled_rows", MEASURE),
-        ("main.rs: visual-test スターター: 素のシェルがアイドルになる (#694)", PTY),
         ("main.rs: 151: 画像の添付行の実クリックで image プレビューが開く (#1472。{opened:?})", UI),
         ("main.rs: 151: 動画の添付行の実クリックで video プレビューが開く (#1472。{opened:?})", UI),
         ("main.rs: fn completion_wait_popup", PROC),
@@ -106970,25 +107046,13 @@ mod selftest_wait_watchdog {
         ("main.rs: visual-test hover: 2 行目の total の位置を採れない (#1681)", PROC),
         ("main.rs: visual-test tree-move ⑨: 移す前に言語サーバが文書を開く（前提。#1834）", PROC),
         ("main.rs: visual-test tree-move ⑨: 言語サーバへ旧 URI の didClose と新 URI の didOpen が届く (#1834。tail={tail:.300})", PROC),
-        ("main.rs: visual-test tree-move ⑫: ターミナルの中央へ落とすとパスが入る・移さない（FR-3.13 の非回帰）", PTY),
         ("main.rs: ⑥ 幽霊のカードの × が窓の外のまま（x={:.0} / 窓 {viewport_w:.0}） (#1946)", UI),
-        ("main.rs: 109: 使い捨てリポのコンフリクトを git パネルが認識する (#496)", PTY),
-        ("main.rs: 109: 使い捨てリポのコンフリクトを git パネルが認識する (#496) #2", PROC),
+        ("main.rs: 109: 使い捨てリポのコンフリクトを git パネルが認識する (#496)", PROC),
         ("main.rs: 109: 3 択「{agent}」の実クリックで解消エージェントのペインが立つ (#496)", UI),
-        ("main.rs: ANSI 赤の解決", PTY),
         ("main.rs: MCP theme set light（GUI 反映）", UI),
         ("main.rs: MCP theme toggle（dark へ復帰）", UI),
-        ("main.rs: split/close で fd が漏れない（before={fd_before}, after={fd_after}）", PTY),
-        ("main.rs: 実行中コマンドが running", PTY),
-        ("main.rs: 失敗コマンドで failed（プロンプト後も保持）", PTY),
-        ("main.rs: 失敗コマンドで failed（プロンプト後も保持） #2", PTY),
-        ("main.rs: 全角行のクリックが正しいセルに解決", PTY),
         ("main.rs: listen ポート検知（nc -l）", PROC),
         ("main.rs: fn run", UI),
-        ("main.rs: タブ内全ペインの cwd がワークスペースフォルダとして並ぶ", PTY),
-        ("main.rs: 半角消失の根因が実在（グリッド幅シェイプで折り返し発生）", PTY),
-        ("main.rs: リンク検証テキストを実 PTY 画面へ表示", PTY),
-        ("main.rs: ペインログ: クローズマーカーに発生源（kbd / gui / dispatch）が残る（#566）", PTY),
         ("main.rs: IME 経路: blur 後の focus 自己修復 (#332)", UI),
         ("main.rs: fn spawn_req", UI),
         ("main.rs: {label}. IME 下線: カーソル非表示ペインでもアンカーが解決する (#497)", UI),
@@ -107001,25 +107065,15 @@ mod selftest_wait_watchdog {
         ("main.rs: fn spawn_req #2", UI),
         ("main.rs: ペイン矩形の計算値が実描画のコンテナ矩形と一致する (#684)", UI),
         ("main.rs: MCP ui_mode toggle → 応答と GUI 状態が一致 (#694)", UI),
-        ("main.rs: スターターが組む行は実シェルで実際に実行される (#899)", PTY),
-        ("main.rs: fn spawn_req #3", PTY),
         ("main.rs: alt screen: tmux クライアントに騙されず、実 alt screen は据え置き (#702)", PROC),
         ("main.rs: #721: 設定ウィンドウが開かない", UI),
         ("main.rs: プロファイルタブ: モデル一覧は押して初めて取り、チップから保存できる (#1002)", PROC),
-        ("main.rs: 新規ペインは準備中 → スターターで、生ターミナルを一度も見せない (#720)", PTY),
-        ("main.rs: master 起動の過渡期は生ターミナルを見せない (#720)", PTY),
-        ("main.rs: master 起動の過渡期は生ターミナルを見せない (#720) #2", PTY),
-        ("main.rs: ▾ から選んだプロファイルで `tako master -<name>` が届き、選択後は閉じる (#739)", PTY),
+        ("main.rs: master 起動の過渡期は生ターミナルを見せない (#720)", MEASURE),
         ("main.rs: #737: 合成した入力ボックスが画面に出ない", UI),
         ("main.rs: #737({label}): 前提のチャット表示になっている", UI),
         ("main.rs: #749: 検証用ペインが消えた（器が内側コマンドの起動を拒否した疑い。#906）", PROC),
         ("main.rs: #772: 検証用 tmux セッションを作れない", PROC),
-        ("main.rs: 103: 検証用の偽 claude がペイン内で見える (#772)", PTY),
-        ("main.rs: 104: 検証用タブがターミナル 2 + プレビュー 1 で組めた (#770)", PTY),
-        ("main.rs: 105: worker が busy な全画面状態になる (#778)", PTY),
         ("main.rs: fn set_role", UI),
-        ("main.rs: fn set_role #2", PTY),
-        ("main.rs: #813: idle 型ペインの作成", PTY),
         ("main.rs: #727: 設定ウィンドウが開かない", UI),
         ("main.rs: #727: スリープ防止の状態（sleep-guard status）を取れない", PROC),
         ("main.rs: 133: 取得が終わると読み込み中が消えて理由が出る (#1010。cleared={cleared} notice={notice:?})", PROC),
@@ -107067,7 +107121,8 @@ mod selftest_wait_watchdog {
              相手が戻る前に使い切り、**その項目以降が 1 つも走らなくなる**（#1890 の \
              large-file-decor は入った時点から debug で一度も通っていなかった）。状態で待つこと: \
              background なら `wait_for_background_state`（走っている間だけ待つ）、画面の静止なら \
-             `wait_for_quiet_frame`、それ以外は `wait_for_app_state` 等 + `state_wait_budget`（#1902）"
+             `wait_for_quiet_frame`、シェルの出力・状態なら `wait_for_pty_state`、それ以外は \
+             `wait_for_app_state` 等 + `state_wait_budget`（#1902）"
         );
         let stale: Vec<&str> = KNOWN_COUNT_WINDOWS
             .iter()
@@ -107146,7 +107201,7 @@ mod selftest_wait_watchdog {
     }
 
     /// #1902 の待ちの予算（場所・旧の窓のミリ秒・新の素の上限の秒）を**ソースから**採る。
-    /// `wait_for_background_state(` / `wait_for_quiet_frame(` の呼び出しは直前 3 行
+    /// `wait_for_background_state(` / `wait_for_quiet_frame(` / `wait_for_pty_state(` の呼び出しは直前 3 行
     /// （`let budget = …`）か直後 10 行の `text_wait_budget(…)`、`wait_user_tasks_sent(…, (回数,
     /// 間隔), …)` は素の上限をヘルパーの本体の 1 か所から採る
     fn background_wait_budgets() -> Vec<(String, u64, u64)> {
@@ -107187,6 +107242,7 @@ mod selftest_wait_watchdog {
                 let at = format!("{file}:{}", index + 1);
                 if line.contains(concat!("wait_for_background", "_state("))
                     || line.contains(concat!("wait_for_quiet", "_frame("))
+                    || line.contains(concat!("wait_for_pty", "_state("))
                 {
                     let back = join(&lines[index.saturating_sub(3)..=index]);
                     let fwd = join(&lines[index..lines.len().min(index + 10)]);
@@ -107224,7 +107280,7 @@ mod selftest_wait_watchdog {
     fn 背景待ちの注入の遅れは旧の窓を超えて新の上限に収まる() {
         let budgets = background_wait_budgets();
         assert!(
-            budgets.len() >= 15,
+            budgets.len() >= 40,
             "#1902 の待ちの呼び出しを {} 件しか採れない（形を変えたならこの番犬も直す）: {budgets:?}",
             budgets.len()
         );
@@ -107343,6 +107399,12 @@ mod selftest_wait_watchdog {
             concat!("wait_for_app", "_state"),
         );
         assert!(scan(&good).is_empty());
+        // PTY の待ち（3 回目の移送）へ寄せた形も許す（probe の中で材料を組んで写す形）
+        let pty = format!(
+            "                let ready = {}(window, cx, \"starter-idle\", budget, |app, _| {{\n                    rows = read(app);\n                    rows.len() == 13\n                }}).await;\n                check(ready, \"判定表 (#694)\");",
+            concat!("wait_for_pty", "_state"),
+        );
+        assert!(scan(&pty).is_empty());
         // 範囲の外は見ない（製品コードの取り直し）
         assert!(count_windows("t.rs", &bad, 0..2).is_empty());
     }
