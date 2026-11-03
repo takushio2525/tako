@@ -262,23 +262,31 @@ fi
 B2=$!
 BG_PIDS="$BG_PIDS $B2"
 eta2=""
+human2=""
 for i in $(seq 1 60); do
   e="$(status_json | py 'import json,sys
 r=json.load(sys.stdin)["queue"]["running"]
 print(next(("%s|%s|%s" % (x["eta"]["state"], x["eta"].get("from"), x["eta"]["text"]) for x in r), ""))' 2>/dev/null)"
   case "$e" in remaining\|history\|*) eta2="$e" ;; esac
-  [ -n "$eta2" ] && break
+  if [ -n "$eta2" ]; then
+    # 人の読む表示（実行中の行）も同じ時点で
+    human_all="$(q 2>/dev/null)"
+    human2="$(printf '%s\n' "$human_all" | sed -n '/^  実行  /p')"
+    break
+  fi
   kill -0 "$B2" 2>/dev/null || break
   sleep 0.3
 done
-human2="$(q 2>/dev/null | grep "実行" | head -1)"
 wait "$B2"
 [ -n "$eta2" ] && pass "2 回目は過去の所要時間から見込み（${eta2#*|*|}）" || fail "2 回目に見込みが出ない"
 echo "    tako queue の表示: $human2"
 case "$human2" in *"あと約"*"前回"*) pass "人の読む行に「あと約 N（前回 M）」" ;; *) [ -z "$eta2" ] || fail "人の読む行に見込みが無い" ;; esac
 
 echo "== ⑥ 端末の cargo は横取りしない =="
-(cd "$WS" && SLEEP_SALT=3 SLEEP_MS=1000 script -q "$TMP/tty.typescript" env TAKO_QUEUE_SOCKET="$SOCK" "$TAKO" queue cargo build >/dev/null 2>&1)
+# script(1) の疑似端末は幅 0 で、そのままだと cargo 自身も進みを出さない（2026-11-03 実測）ので幅を与える
+(cd "$WS" && SLEEP_SALT=3 SLEEP_MS=1000 TAKO_QUEUE_SOCKET="$SOCK" TAKO_BIN="$TAKO" \
+  script -q "$TMP/tty.typescript" sh -c 'stty cols 100 rows 30; exec "$TAKO_BIN" queue cargo build' \
+  </dev/null >/dev/null 2>&1)
 tty_lines="$(tr '\r' '\n' < "$TMP/tty.typescript")"
 if [[ "$tty_lines" == *"Building"* ]]; then
   pass "端末では cargo 自身の進みがそのまま見える"
