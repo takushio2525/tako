@@ -12903,11 +12903,13 @@ fn print_sessions_resume(result: &Value) {
     println!("{result}");
 }
 
-/// `tako sessions list` の人間向け表示（1 セッション 1 行 + pending 節）
+/// `tako sessions list` の人間向け表示（1 セッション 1 行 + pending 節）。
+/// 枠（空のときの文・resume 不可の印・pending の見出し・末尾の案内）は表示言語（#2365。文は `ReplyNote`）
 fn print_sessions_list(result: &Value) {
+    let lang = cli_lang();
     let sessions = result["sessions"].as_array().cloned().unwrap_or_default();
     if sessions.is_empty() {
-        println!("カタログにセッションが無い（claude ペインの検出後に記録される）");
+        println!("{}", ReplyNote::SessionsNone.text_in(lang));
     }
     for s in &sessions {
         let issues = s["issues"]
@@ -12929,9 +12931,9 @@ fn print_sessions_list(result: &Value) {
             _ => "-".into(),
         };
         let resumable = if s["resumable"].as_bool() == Some(true) {
-            ""
+            String::new()
         } else {
-            "（resume 不可）"
+            ReplyNote::SessionNotResumable.text_in(lang)
         };
         println!(
             "{}  {}  {:6}  {}{}{}",
@@ -12945,7 +12947,7 @@ fn print_sessions_list(result: &Value) {
     }
     let pending = result["pending"].as_array().cloned().unwrap_or_default();
     if !pending.is_empty() {
-        println!("--- session 未検出の spawn 記録（codex / agy・起動直後の claude）---");
+        println!("{}", ReplyNote::SessionsPendingHeader.text_in(lang));
         for p in &pending {
             // 器がある構成はセッション名、無い構成はペイン ID がキー（#728）
             let key = p["tmux_session"]
@@ -12962,26 +12964,49 @@ fn print_sessions_list(result: &Value) {
             );
         }
     }
-    eprintln!("(resume: tako sessions resume <id> / 詳細: tako sessions show <id>)");
+    eprintln!("{}", ReplyNote::SessionsListHint.text_in(lang));
+}
+
+/// `tako sessions link` の既定出力（#1069）: 「URL 1 行」（スマホへ渡すのが用途なのでコピーしやすい形）。
+/// 繋がっていなければ理由を出す（URL を捏造しない）。添える行は表示言語（#2365。文は `ReplyNote`）
+fn print_sessions_link(result: &Value) {
+    let lang = cli_lang();
+    let link = &result["remote_link"];
+    match link["url"].as_str() {
+        Some(url) => {
+            println!("{url}");
+            if let Some(account) = link["account_label"].as_str() {
+                let line = ReplyNote::SessionLinkAccount(account.to_string());
+                eprintln!("{}", line.text_in(lang));
+            }
+        }
+        None => {
+            let state = link["state"].as_str().unwrap_or("unknown").to_string();
+            eprintln!("{}", ReplyNote::SessionLinkNone(state).text_in(lang));
+            eprintln!("  {}", ReplyNote::SessionLinkEnableHint.text_in(lang));
+        }
+    }
 }
 
 /// `tako todo list` の既定出力（#1450）。**未完了の件数を最後に出す**
-/// （画面のバッジと同じ数字を CLI でも見られるようにする）
+/// （画面のバッジと同じ数字を CLI でも見られるようにする）。
+/// 枠（空のときの文・期限 / 返答のラベル・件数）は表示言語（#2365。文は `ReplyNote`）
 fn print_todo_list(result: &Value) {
+    let lang = cli_lang();
     let tasks = result["tasks"].as_array().cloned().unwrap_or_default();
     if tasks.is_empty() {
-        println!("ユーザータスクが無い");
+        println!("{}", ReplyNote::TodosNone.text_in(lang));
     }
     for task in &tasks {
         let responses = task["responses"].as_array().map(Vec::len).unwrap_or(0);
         let reply = if responses == 0 {
             String::new()
         } else {
-            format!("  返答:{responses}")
+            format!("  {}", ReplyNote::TodoReplies(responses).text_in(lang))
         };
         let due = task["due"]
             .as_str()
-            .map(|d| format!("  期限:{d}"))
+            .map(|d| format!("  {}", ReplyNote::TodoDue(d.to_string()).text_in(lang)))
             .unwrap_or_default();
         println!(
             "{:<6}  {:10}  {:9}  {}{}{}",
@@ -12993,16 +13018,18 @@ fn print_todo_list(result: &Value) {
             reply,
         );
     }
-    println!("未完了 {} 件", result["open_count"].as_u64().unwrap_or(0));
+    let open = ReplyNote::TodoOpenCount(result["open_count"].as_u64().unwrap_or(0));
+    println!("{}", open.text_in(lang));
 }
 
-/// 1 件の詳細（`show` / `add` / `respond` の既定出力）
 /// `tako todo expand` / `collapse` の既定出力（#1479）。
-/// **画面が無い（GUI が動いていない）ときに「開いた」と言わない**
+/// **画面が無い（GUI が動いていない）ときに「開いた」と言わない**。
+/// ラベル（`expanded:` / `panel:` / `view:`）は両言語で同じ、値の「無し」と表示の有無は表示言語（#2365）
 fn print_todo_expanded(result: &Value) {
+    let lang = cli_lang();
     match result.get("expanded").and_then(Value::as_str) {
         Some(id) => println!("expanded: {id}"),
-        None => println!("expanded: (なし)"),
+        None => println!("expanded: {}", ReplyNote::TodoExpandedNone.text_in(lang)),
     }
     let visible = result
         .get("panel_visible")
@@ -13014,10 +13041,11 @@ fn print_todo_expanded(result: &Value) {
         .unwrap_or("-");
     println!(
         "panel: {} / view: {view}",
-        if visible { "表示" } else { "非表示" }
+        ReplyNote::TodoPanelVisible(visible).text_in(lang)
     );
 }
 
+/// 1 件の詳細（`show` / `add` / `respond` の既定出力）
 fn print_todo_detail(result: &Value) {
     // 枠（添付・コピー用・リンク・返答・配送）は表示言語（#2365。文は `ReplyNote` の 1 か所・字下げはここ）
     let lang = cli_lang();
@@ -14391,30 +14419,12 @@ fn print_result(command: &Command, result: &Value) {
         Command::Sessions(SessionsCommand::Show { .. }) => {
             println!("{}", pretty_json(result));
         }
-        // #1069: 既定は「URL 1 行」（スマホへ渡すのが用途なのでコピーしやすい形）。
-        // 繋がっていなければ理由を出す（URL を捏造しない）
+        // #1069: 既定は「URL 1 行」（`print_sessions_link`）
         Command::Sessions(SessionsCommand::Link { json, .. }) => {
             if *json {
                 println!("{}", pretty_json(result));
             } else {
-                let link = &result["remote_link"];
-                match link["url"].as_str() {
-                    Some(url) => {
-                        println!("{url}");
-                        if let Some(account) = link["account_label"].as_str() {
-                            eprintln!("アカウント: {account}（このアカウントでログインした端末からだけ開けます）");
-                        }
-                    }
-                    None => {
-                        eprintln!(
-                            "公式リンクはありません（state: {}）",
-                            link["state"].as_str().unwrap_or("unknown")
-                        );
-                        eprintln!(
-                            "  有効にする場合: tako orchestrator profiles set <名前> --remote-control true → 起動し直す"
-                        );
-                    }
-                }
+                print_sessions_link(result);
             }
         }
         Command::Sessions(SessionsCommand::Resume { .. }) => print_sessions_resume(result),
