@@ -3071,6 +3071,15 @@ background を一往復した後の着地で決まる。**呼んだのと同じ 
   外は `fail()` で止まる）。登録は外さない仕組みなので、guard を `let _ =` で落とす事故は起きない
 - 消えたかは `TAKO_APP_SELF_TEST_CLEANUP: registered=N removed=M left=K` の行で読む。
   A/B は `TAKO_2051_LEGACY=1`、実経路は `bash scripts/test-visual-fail-cleanup-2051.sh`
+- **名前に pid を入れる**（#2704）: `std::env::temp_dir().join(format!("tako-…-{}", std::process::id()))`。
+  固定名（修正前の `tako-osc-e2e`・`tako-st915-a`）は同じ `$TMPDIR` で並列に走る別のセルフテストと取り合い、
+  終了の後片付けが持ち主を確かめて消せない。番犬 `issue2704_selftest_fixed_tmp_watchdog` がセルフテストの
+  コードの固定名の `temp_dir().join(` を file:line で名指す（意図した固定名 = A/B の枝は、その行か直前 2 行に
+  `// tako:fixed-tmp-ok <理由>`）
+- `remove_on_fail` の登録は終了の後片付け `cleanup_process_scoped` にも載る（`tako_core::scoped_dirs::claim`。
+  名前に自分の pid が入る物だけ。#2704・FR-4.8.29）= FAILED だけでなく成功・SIGTERM・visual-test の出口でも、
+  節の末尾まで届かなかった物（後の項目へ持ち越す dir・SIGTERM で途中で終わった節の物）が残らない。
+  A/B は `TAKO_2704_LEGACY=1`、実経路は `bash scripts/test-selftest-fixed-tmp-2704.sh`
 
 ### プロセスの後片付けは成功の出口と失敗の出口で 1 実装（Issue #2388）
 
@@ -3084,7 +3093,7 @@ background を一往復した後の着地で決まる。**呼んだのと同じ 
   を `fail` の外で出して exit しない。後片付けの要らない出口（窓を開く前に終わる等）だけ、その行か
   直前 6 行に `// tako:exit-cleanup-ok <理由>` を書く（番犬 `selftest_exit_cleanup_watchdog`）
 - `fail()` は FAILED の行の**後**に上限 5 秒で片付けるので、片付けが固まっても落ちた理由と終了コード 1 は
-  変わらない。片付けた物は `TAKO_APP_SELF_TEST_EXIT_CLEANUP: backend=… agent_home=… ipc_socket=… scoped=… left=…` の行で読む。
+  変わらない。片付けた物は `TAKO_APP_SELF_TEST_EXIT_CLEANUP: backend=… agent_home=… ipc_socket=… scoped=… items=… left=…` の行で読む。
   A/B は `TAKO_2388_LEGACY=1`、実経路は `bash scripts/test-selftest-failed-cleanup-2388.sh`
 - visual-test の出口（成功の `TAKO_VISUAL_TEST_OK` と知らない節の名前の `exit(1)`）も `exit` で終わるので、
   `self_test::visual_exit` を通す（#2491・FR-4.8.27）。節の腕で成功の行を出して直に exit しない

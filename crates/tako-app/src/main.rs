@@ -1472,6 +1472,8 @@ fn inject_777_hang(kind: &str) {
 ///   （`scoped_dirs::adopt` が覚えたものだけ）・**本番の GUI では何もしない**（どちらも検証プロセスの門の内側）。
 ///   最後に消す: 上の persist.log の行・器を落としたときのシェルの書き出しは data dir の中へ書くので、その後。
 ///   消した後の書き込みは書き手が捨てる（`scoped_dirs::is_retired`）
+/// - #2704: セルフテスト / visual-test の節が作った一時の置き場（`self_test::remove_on_fail` の登録のうち名前に
+///   自分の pid が入る物）。節の末尾で消す物でも、SIGTERM で途中で終わった・成功の出口の前に置いた物は残っていた
 ///
 /// `origin` は persist.log の行の頭（どの出口から来たか）。何度呼んでも壊れない
 /// （無いサーバー・無い dir は黙って飛ばす。窓ごとの `on_app_quit` が重ねて呼ぶ）
@@ -1502,6 +1504,10 @@ fn cleanup_process_scoped(origin: &str, secondary: bool) -> ProcessScopedCleanup
     if jobserver != "none" && !secondary {
         persist_diag(&format!("{origin}: cargo の札の fifo: {jobserver}"));
     }
+    // #2704: セルフテスト / visual-test の節が作った一時の置き場（`remove_on_fail` が登録した物のうち、名前に
+    // 自分の pid が入る物）。節の末尾まで届かなかった物（SIGTERM・成功の出口の前に置いた物）。置き場の中の物も
+    // あるので、置き場より先に
+    let items = tako_core::scoped_dirs::remove_claimed();
     // #2686: 検証起動の GUI が自分で決めた物（ソケット → 置き場の順。短縮パスの参照は置き場の中）
     let sockets = tako_control::ipc::remove_scoped_socket_files();
     let scoped = tako_core::scoped_dirs::remove_adopted();
@@ -1510,6 +1516,7 @@ fn cleanup_process_scoped(origin: &str, secondary: bool) -> ProcessScopedCleanup
         agent_home,
         sockets,
         scoped,
+        items,
     }
 }
 
@@ -1523,6 +1530,8 @@ struct ProcessScopedCleanup {
     sockets: Vec<String>,
     /// 消した、GUI が env へ自分で当てた置き場（#2686。明示した置き場・本番の GUI は空）
     scoped: Vec<std::path::PathBuf>,
+    /// 消した、節が作った一時の置き場（#2704。名前に自分の pid が入る物だけ・本番の GUI は空）
+    items: Vec<std::path::PathBuf>,
 }
 
 impl ProcessScopedCleanup {
@@ -1555,14 +1564,17 @@ impl ProcessScopedCleanup {
         if !tako_core::scoped_dirs::left_adopted().is_empty() {
             left.push("scoped");
         }
+        if !tako_core::scoped_dirs::left_claimed().is_empty() {
+            left.push("items");
+        }
         left
     }
 
     /// 失敗の出口が出す 1 行の中身（`backend=<ソケット|-> agent_home=<removed|-> ipc_socket=<数>
-    /// scoped=<数> left=<none|名前,…>`）
+    /// scoped=<数> items=<数> left=<none|名前,…>`）
     fn summary(&self, left: &[&str]) -> String {
         format!(
-            "backend={} agent_home={} ipc_socket={} scoped={} left={}",
+            "backend={} agent_home={} ipc_socket={} scoped={} items={} left={}",
             self.backend.as_deref().unwrap_or("-"),
             if self.agent_home.is_some() {
                 "removed"
@@ -1571,6 +1583,7 @@ impl ProcessScopedCleanup {
             },
             self.sockets.len(),
             self.scoped.len(),
+            self.items.len(),
             if left.is_empty() {
                 "none".to_string()
             } else {
@@ -37373,12 +37386,23 @@ mod self_test {
                 path.display()
             ));
         }
+        // #2704: 終了の後片付け（`cleanup_process_scoped`）にも載せる = 成功・SIGTERM・visual-test の出口でも、
+        // 節の末尾まで届かなかった物が残らない。載るのは名前に自分の pid が入る物だけ（`scoped_dirs::claim`）
+        if !legacy_2704() {
+            tako_core::scoped_dirs::claim(&path);
+        }
         let mut list = FAIL_CLEANUP
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !list.contains(&path) {
             list.push(path);
         }
+    }
+
+    /// #2704 の A/B（`TAKO_2704_LEGACY=1`）: 節の一時 dir を修正前の固定名（`tako-osc-e2e`・`tako-st915-<a|b|x>`）で
+    /// 作り、`remove_on_fail` の登録を終了の後片付けへ載せない（= 成功・SIGTERM の出口で残る修正前の形）
+    fn legacy_2704() -> bool {
+        std::env::var_os("TAKO_2704_LEGACY").is_some_and(|v| v == "1")
     }
 
     /// `path` が `roots` のどれかより**真に下**にあり、`..` を含まないか（#2051）。
@@ -70268,10 +70292,19 @@ mod self_test {
                 //     器越しでも cwd 検知（FR-2.4.1）が生きている。
                 //     素通ししない器（psmux。#525 の実測）では届かないので対象外
                 if tako_core::backend::capabilities().osc_passthrough {
-                    let osc_e2e_dir = std::env::temp_dir()
-                        .join("tako-osc-e2e")
-                        .display()
-                        .to_string();
+                    // #2704: 名前に pid を入れる（固定名は並列の別のセルフテストと取り合い、持ち主を確かめて
+                    // 消せない）。器のシェルがこの dir へ cd したまま後の項目へ進むので、消すのは終了の後片付け
+                    // （`remove_on_fail` が載せる）
+                    let osc_e2e_dir = if legacy_2704() {
+                        // tako:fixed-tmp-ok A/B（TAKO_2704_LEGACY=1 = 修正前の固定名）
+                        std::env::temp_dir().join("tako-osc-e2e")
+                    } else {
+                        let dir = std::env::temp_dir()
+                            .join(format!("tako-osc-e2e-{}", std::process::id()));
+                        remove_on_fail(&dir);
+                        dir
+                    };
+                    let osc_e2e_dir = osc_e2e_dir.display().to_string();
                     press(any, cx, sh.clear_line_key());
                     type_text(any, cx, &sh.mkdir_and_cd(&osc_e2e_dir), true);
                     // 器のパススルー → 側路（`osc_sink`）の 2 秒 tick を跨ぐので
@@ -92044,9 +92077,20 @@ mod self_test {
                         .ok()
                         .flatten()
                 };
-                // 2 プロジェクトを登録し、片方だけをプロファイルの担当にする
+                // 2 プロジェクトを登録し、片方だけをプロファイルの担当にする。
+                // #2704: cwd の dir は名前に pid を入れ（固定名は並列の別のセルフテストと取り合う）、節の末尾で消す
+                let mut st915_dirs = Vec::new();
                 for (key, dir) in [(mine, "a"), (mine2, "b"), (other, "x")] {
-                    let cwd = std::env::temp_dir().join(format!("tako-st915-{dir}"));
+                    let cwd = if legacy_2704() {
+                        // tako:fixed-tmp-ok A/B（TAKO_2704_LEGACY=1 = 修正前の固定名）
+                        std::env::temp_dir().join(format!("tako-st915-{dir}"))
+                    } else {
+                        let cwd = std::env::temp_dir()
+                            .join(format!("tako-st915-{dir}-{}", std::process::id()));
+                        remove_on_fail(&cwd);
+                        st915_dirs.push(cwd.clone());
+                        cwd
+                    };
                     let _ = std::fs::create_dir_all(&cwd);
                     if fire(
                         Req::OrchestratorProjects {
@@ -92463,6 +92507,9 @@ mod self_test {
                 }
                 if let Some(dir) = tako_control::orchestrator::config_dir() {
                     let _ = std::fs::remove_file(dir.join(format!("_system_prompt_{probe}.md")));
+                }
+                for dir in &st915_dirs {
+                    let _ = std::fs::remove_dir_all(dir);
                 }
                 // prev は #917 の検証で閉じている（二重 close はしない）
                 for pane in successors {

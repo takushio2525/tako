@@ -20,6 +20,12 @@
 //!
 //! A/B は `TAKO_2686_LEGACY=1`（覚えない = 何も消さない = 修正前）。番犬は
 //! `crates/tako-control/tests/issue2686_scoped_dirs_watchdog.rs`。
+//!
+//! **節の一時の置き場（#2704）**: セルフテスト / visual-test の節が作る一時 dir / ファイル（env へは当てない）も
+//! [`claim`] で覚え、終了の後片付けの [`remove_claimed`] が消す。覚えるのは**名前に自分の pid が入っている物だけ**
+//! （[`names_pid`]）= 固定名（`tako-osc-e2e` など。並列の別のセルフテストと取り合う）は持ち主を確かめられないので
+//! 覚えない。節が作る場所の登録簿（tako-app の `remove_on_fail` = #2051）がここへも載せるので、FAILED の出口だけで
+//! なく成功・SIGTERM・visual-test の出口でも、節の末尾まで届かなかった物が残らない
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -38,6 +44,7 @@ pub struct Adopted {
 const OWN_PREFIXES: [&str; 2] = ["tako-iso-", "tako-st-"];
 
 static ADOPTED: Mutex<Vec<Adopted>> = Mutex::new(Vec::new());
+static CLAIMED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 static RETIRED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// A/B（`TAKO_2686_LEGACY=1`）: 覚えない = 何も消さない（修正前）
@@ -152,6 +159,73 @@ pub fn left_adopted() -> Vec<PathBuf> {
     left
 }
 
+/// 検証起動の GUI の中の節（セルフテスト / visual-test）が作る一時の置き場を、終了の後片付けへ載せる（#2704）。
+/// 覚えたら `true`。名前（最後の要素）に自分の pid が入っていない物は覚えない（[`names_pid`]。固定名は
+/// 持ち主を確かめられない = 並列の別のセルフテストの物かもしれない）。本番の GUI では何もしない。
+/// 作る前に呼んでよい（消す時点で無ければ何もしない）
+pub fn claim(path: &Path) -> bool {
+    if !active() || !names_pid(path, std::process::id()) {
+        return false;
+    }
+    let mut claimed = lock(&CLAIMED);
+    if !claimed.iter().any(|p| p == path) {
+        claimed.push(path.to_path_buf());
+    }
+    true
+}
+
+/// 覚えた節の一時の置き場の写し
+pub fn claimed() -> Vec<PathBuf> {
+    lock(&CLAIMED).clone()
+}
+
+/// 名前（最後の要素）に `pid` が数字の切れ目つきで入っているか（**純関数**。`tako-st915-a-42` /
+/// `tako-st1417-42-note.md` / `tako_st1182_42` は 42 の物・`tako-st-421` / `tako-osc-e2e` は違う）
+pub fn names_pid(path: &Path, pid: u32) -> bool {
+    let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    let pid = pid.to_string();
+    let bytes = name.as_bytes();
+    name.match_indices(&pid).any(|(at, _)| {
+        let before = at.checked_sub(1).map(|i| bytes[i]);
+        let after = bytes.get(at + pid.len()).copied();
+        !before.is_some_and(|b| b.is_ascii_digit()) && !after.is_some_and(|b| b.is_ascii_digit())
+    })
+}
+
+/// 覚えた節の一時の置き場のうち、名前が自分の pid の物を消し、消した（もう無い）物を返す（#2704）。
+/// 何度呼んでも壊れない。消した物は [`is_retired`] が真になる。検証プロセスでなければ何もしない
+pub fn remove_claimed() -> Vec<PathBuf> {
+    if !active() {
+        return Vec::new();
+    }
+    let pid = std::process::id();
+    let mut removed = Vec::new();
+    for path in claimed() {
+        if !names_pid(&path, pid) {
+            continue;
+        }
+        retire(&path);
+        remove_path(&path);
+        if std::fs::symlink_metadata(&path).is_err() {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
+/// 覚えた節の一時の置き場のうち、片付けた後もまだ在るもの（失敗の出口の申告 `left=` 用）
+pub fn left_claimed() -> Vec<PathBuf> {
+    if !active() {
+        return Vec::new();
+    }
+    claimed()
+        .into_iter()
+        .filter(|p| std::fs::symlink_metadata(p).is_ok())
+        .collect()
+}
+
 fn sidecars(path: &Path) -> Vec<PathBuf> {
     let Some(dir) = path.parent() else {
         return Vec::new();
@@ -167,7 +241,9 @@ fn sidecars(path: &Path) -> Vec<PathBuf> {
 }
 
 fn remove_path(path: &Path) {
-    let _ = if path.is_dir() {
+    // リンクは辿らずリンクそのものを消す（節が作ったリンクの先は節の物とは限らない）
+    let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    let _ = if is_dir {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
@@ -354,5 +430,79 @@ mod tests {
         assert!(remove_adopted().is_empty());
         assert!(logs.exists());
         assert!(!is_retired(&logs));
+    }
+
+    #[test]
+    fn 名前に自分の_pid_が切れ目つきで入る物だけを自分の物と読む() {
+        for name in [
+            "tako-st915-a-42",
+            "tako-osc-e2e-42",
+            "tako-st1417-42-note.md",
+            "tako_st1182_42",
+            "tako-selftest-ws-42.json",
+            "tako-st600 space-42",
+            "42",
+        ] {
+            assert!(names_pid(&Path::new("/t").join(name), 42), "{name}");
+        }
+        for name in [
+            "tako-osc-e2e",
+            "tako-st915-a",
+            "tako-st-421",
+            "tako-st-142",
+            "tako-st1425",
+            "tako-st-4242",
+        ] {
+            assert!(!names_pid(&Path::new("/t").join(name), 42), "{name}");
+        }
+        assert!(!names_pid(Path::new("/"), 42));
+    }
+
+    /// 節の一時の置き場（#2704）: 名前に自分の pid が入る物だけを覚えて消す。固定名は覚えない
+    /// （並列の別のセルフテストの物かもしれない）。リンクは辿らずリンクそのものを消す
+    #[test]
+    fn 節の一時の置き場は自分の_pid_の名前の物だけを覚えて消す() {
+        if crate::run_alone!(節の一時の置き場は自分の_pid_の名前の物だけを覚えて消す)
+        {
+            return;
+        }
+        std::env::remove_var("TAKO_2686_LEGACY");
+        let root = crate::test_residue::ScratchDir::new("scoped2704");
+        let tmp = root.path();
+        let pid = std::process::id();
+        let mine = tmp.join(format!("tako-st915-a-{pid}"));
+        let file = tmp.join(format!("tako-selftest-ws-{pid}.json"));
+        let fixed = tmp.join("tako-osc-e2e");
+        let target = tmp.join("outside");
+        let link = tmp.join(format!("tako-link-{pid}"));
+        for dir in [&mine, &fixed, &target] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("x"), "x").unwrap();
+        }
+        std::fs::write(&file, "{}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(claim(&mine));
+        assert!(claim(&file));
+        assert!(!claim(&fixed), "固定名は覚えない");
+        #[cfg(unix)]
+        assert!(claim(&link));
+        assert_eq!(left_claimed().len(), if cfg!(unix) { 3 } else { 2 });
+
+        let removed = remove_claimed();
+        assert!(
+            removed.contains(&mine) && removed.contains(&file),
+            "{removed:?}"
+        );
+        assert!(!mine.exists() && !file.exists());
+        assert!(fixed.join("x").exists(), "覚えていない固定名は残す");
+        assert!(target.join("x").exists(), "リンクの先は消さない");
+        assert!(
+            std::fs::symlink_metadata(&link).is_err(),
+            "リンクそのものは消す"
+        );
+        assert!(is_retired(&mine.join("x")));
+        assert!(left_claimed().is_empty());
+        assert_eq!(remove_claimed().len(), removed.len(), "2 度目も壊れない");
     }
 }
