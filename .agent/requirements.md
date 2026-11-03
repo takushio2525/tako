@@ -213,6 +213,13 @@ env の失敗があれば並べる。判定の正本は `tako-control::discovery
 （`tako queue`。#1994）だけで、調停役はマシン全体で 1 つなので印があっても既定の置き場の GUI へ並ぶ
 （`read_candidates_machine_wide` → CLI の `queue_send`。番犬 `crates/tako-cli/tests/issue2531_isolated_discovery.rs`）。
 A/B は `TAKO_2531_LEGACY=1`。
+**data dir の門（#2694）**: 同じ印で `TAKO_DATA_DIR` が無ければ、CLI の中で完結する処理（`tako usage` /
+`migrate` / `orchestrator handoffs` ほか）も既定（本番）の data dir を使わない。置き場の解決
+`tako_core::paths::data_dir` / `local_data_dir` が既定の置き場を返さず（判定の正本 `paths::data_dir_refusal`。
+`TAKO_DISCOVERY_DIR` は数えない）、手元のサブコマンドは入口（CLI の `local_data_gate`）で
+「TAKO_DATA_DIR を指定する」を日英で返して終了コード 1。例外は #2531 と同じく順番待ち（`tako queue`）だけ
+（`paths::allow_machine_wide_data_dir`）。隔離 GUI は自分の置き場をペインの env へ渡すので、ペインの CLI は
+断られない。番犬 `crates/tako-control/tests/issue2694_isolated_data_dir_watchdog.rs`・A/B は `TAKO_2694_LEGACY=1`。
 MCP stdio ブリッジ（`tako mcp serve`）のフォールバックは「環境変数がある = tako 内で
 起動されたブリッジ」に限る（tako 外のセッションで 0 ツールを保つ。FR-2.3.2 と整合）。
 
