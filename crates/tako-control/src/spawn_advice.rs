@@ -11,7 +11,7 @@
 //!   **同じ `admit`** に仮の 1 件を並べて問う（`tako_core::queue::headroom`）
 //!
 //! **採らない**（UI スレッドの dispatch の spawn が呼ぶ。覚えを読むだけ）。番犬は
-//! `crates/tako-control/tests/issue1993_resources_ui_thread_watchdog.rs` の 11 番
+//! `crates/tako-control/tests/issue1993_resources_ui_thread_watchdog.rs` の 9 番
 
 use serde_json::{json, Value};
 use tako_core::i18n::Lang;
