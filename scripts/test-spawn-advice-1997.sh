@@ -410,6 +410,9 @@ burst_round() {
 }
 
 part_burst() {
+  # 外側の順番待ち（このスクリプトを `tako queue` で回したとき）の受付を受け継ぐと、wrapper は入れ子と
+  # 見なして並ばずに走る（= 何も測れない）。ビルドは冒頭で済んでいるので、ここから先は外す
+  unset TAKO_QUEUE_JOB TAKO_QUEUE_PRIORITY TAKO_QUEUE_MAX_WAIT TAKO_QUEUE_SOCKET TAKO_QUEUE_INJECT
   echo
   echo "=== ⑧ 一括復帰の直後のビルドの同時多発（GUI 無しの隔離の調停役・注入の機の値）==="
   burst_round roomy 20480 normal 0
