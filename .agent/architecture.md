@@ -3342,6 +3342,23 @@ worker が並走。電力は `powermetrics` が sudo のパスワードを要す
   `issue1741_viewport_lines_watchdog`（4 規則）、実測は `scripts/test-viewport-lines-1741.sh`
   （visual-test 節 `viewport-lines`。正解は描いた行の実矩形。文字サイズ 8 / 13 / 32pt で
   実矩形 49 / 30 / 12 行と一致・器が動き始める行と下の余白 3 行が設計どおり）
+- **visual-test の追従の判定の設計値は詰めた余白から引く**（#2714）: 器が動き始めるカーソル行は
+  「可視 − m」、以降の下の余白は m 行で、m は製品と同じ `effective_margin`（既定 3 行。狭い器では
+  2m + 1 行が収まるまで詰める）。viewport-lines（#1741）と editor-font（#1772）の判定はどちらも
+  `self_test::follow_design` の 1 実装から引く。旧の判定は固定の `FOLLOW_MARGIN` で引いていたので、
+  窓を固定しない全節実行（既定の窓 960×600 = 器 450×381px）の文字の最大（1 行が折り返して可視 3 行）で
+  製品の設計どおりの動きを NG と数え、可視 3 行未満では引き算が溢れて debug で panic し、全節実行が
+  後ろの節へ届かなかった。viewport-lines の fixture は言語サーバの受け持たない `.txt`
+  （`VLINES_FIXTURE_EXT`。モードは Code のまま）: 全節実行は偽の言語サーバの節のために
+  `TAKO_LSP_AUTOSTART=1` を付けるので、`.rs` だと前の節で始まった rust-analyzer の解決（隔離 HOME では
+  動かない）が節の途中に着地し、未導入の帯が器の高さを 129px 取って、可視行数から出した設計値が
+  途中で崩れた。追従を見る相は器の高さが基準の段から動いていないこと（前提）を先に確かめ、動いていれば
+  「前提が崩れた」と名指して設計の判定を省く。A/B は `TAKO_2714_LEGACY=1`（旧の設計値と `.rs`）、
+  注入は `TAKO_2714_INJECT=rs|shrink`、番犬は `issue2714_follow_design_watchdog`（4 規則）、
+  設計そのものは `editor_scroll` の単体テスト `先頭から下へ進むと詰めた余白の行で動き始める`、実測は
+  `scripts/test-viewport-lines-1741.sh` の 6 腕（広い窓・狭い器・帯・旧 2 腕・途中で縮める）。
+  帯が後から出て器が縮んだ瞬間、下端近くのカーソルは次の打鍵まで器の外に残る（追従は編集・移動の
+  ときだけ動く = 「理由なく動かさない」設計どおり）
 - **本文の文字サイズはペイン単位**（#1772）: ⌘+ / ⌘- / ⌘0 はコード / md では `pane_font_sizes`
   （ターミナルと同じ値）を動かす。gpui の `StyledText` は字の大きさと行高を**祖先の text style** から採り、
   `with_default_highlights` へ渡す `TextStyle` のそれは使わない（#947 と同じ機序）ので、効かせる場所は
