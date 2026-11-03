@@ -94,6 +94,7 @@ pub mod runner;
 pub mod runner_config;
 pub mod runner_project;
 pub mod runtime_env;
+pub mod scoped_dirs;
 pub mod screen;
 pub mod scroll;
 pub mod scroll_mirror;

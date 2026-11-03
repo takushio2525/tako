@@ -1462,6 +1462,13 @@ fn inject_777_hang(kind: &str) {
 ///   実在する = #770）
 /// - #1253: 検証起動（隔離 / セルフテスト / visual-test）が使った使い捨ての設定置き場
 ///   （事前信頼とシェル履歴の書き先）。pid つきなのでこのプロセス専用 = 誰の邪魔にもならない
+/// - #2686: 検証起動の GUI が env へ自分で当てた置き場（`tako-iso-data-<pid>`・`tako-iso-pane-logs-<pid>`・
+///   セッションカタログ・セルフテストの workers / orchestrator ほか 10 個。付属ファイルごと）と、本体の受け口の
+///   pid 入りのソケットファイル（`tako-<pid>-0.sock`）。どれもどの出口でも残っていた（ソケットは GPUI が
+///   TakoApp を drop せずに終わるので drop の片付けが走らない）。**明示した置き場は消さない**
+///   （`scoped_dirs::adopt` が覚えたものだけ）・**本番の GUI では何もしない**（どちらも検証プロセスの門の内側）。
+///   最後に消す: 上の persist.log の行・器を落としたときのシェルの書き出しは data dir の中へ書くので、その後。
+///   消した後の書き込みは書き手が捨てる（`scoped_dirs::is_retired`）
 ///
 /// `origin` は persist.log の行の頭（どの出口から来たか）。何度呼んでも壊れない
 /// （無いサーバー・無い dir は黙って飛ばす。窓ごとの `on_app_quit` が重ねて呼ぶ）
@@ -1492,9 +1499,14 @@ fn cleanup_process_scoped(origin: &str, secondary: bool) -> ProcessScopedCleanup
     if jobserver != "none" && !secondary {
         persist_diag(&format!("{origin}: cargo の札の fifo: {jobserver}"));
     }
+    // #2686: 検証起動の GUI が自分で決めた物（ソケット → 置き場の順。短縮パスの参照は置き場の中）
+    let sockets = tako_control::ipc::remove_scoped_socket_files();
+    let scoped = tako_core::scoped_dirs::remove_adopted();
     ProcessScopedCleanup {
         backend,
         agent_home,
+        sockets,
+        scoped,
     }
 }
 
@@ -1504,6 +1516,10 @@ struct ProcessScopedCleanup {
     backend: Option<String>,
     /// 消した検証用の設定置き場。検証起動でなければ `None`
     agent_home: Option<std::path::PathBuf>,
+    /// 消した本体の受け口の pid 入りのソケットファイル（#2686。本番の GUI は空）
+    sockets: Vec<String>,
+    /// 消した、GUI が env へ自分で当てた置き場（#2686。明示した置き場・本番の GUI は空）
+    scoped: Vec<std::path::PathBuf>,
 }
 
 impl ProcessScopedCleanup {
@@ -1525,19 +1541,33 @@ impl ProcessScopedCleanup {
         if self.agent_home.as_ref().is_some_and(|dir| dir.exists()) {
             left.push("agent_home");
         }
+        // #2686: 消したはずの pid 入りのソケットファイル・自分で決めた置き場（付属ファイルを含む）
+        if self
+            .sockets
+            .iter()
+            .any(|s| std::path::Path::new(s).exists())
+        {
+            left.push("ipc_socket");
+        }
+        if !tako_core::scoped_dirs::left_adopted().is_empty() {
+            left.push("scoped");
+        }
         left
     }
 
-    /// 失敗の出口が出す 1 行の中身（`backend=<ソケット|-> agent_home=<removed|-> left=<none|名前,…>`）
+    /// 失敗の出口が出す 1 行の中身（`backend=<ソケット|-> agent_home=<removed|-> ipc_socket=<数>
+    /// scoped=<数> left=<none|名前,…>`）
     fn summary(&self, left: &[&str]) -> String {
         format!(
-            "backend={} agent_home={} left={}",
+            "backend={} agent_home={} ipc_socket={} scoped={} left={}",
             self.backend.as_deref().unwrap_or("-"),
             if self.agent_home.is_some() {
                 "removed"
             } else {
                 "-"
             },
+            self.sockets.len(),
+            self.scoped.len(),
             if left.is_empty() {
                 "none".to_string()
             } else {
@@ -33705,44 +33735,35 @@ fn main() {
                 tako_core::tmux_cleanup::isolated_socket_name(std::process::id()),
             );
         }
-        if std::env::var_os("TAKO_DISCOVERY_DIR").is_none() {
-            std::env::set_var(
-                "TAKO_DISCOVERY_DIR",
-                std::env::temp_dir().join(format!("tako-iso-discovery-{}", std::process::id())),
-            );
-        }
+        // #2686: 置き場の env は `scoped_dirs::adopt` で当てる（無いときだけ当てて覚える = 明示した値は
+        // 残し、GUI が自分で決めた置き場だけを終了の後片付け `cleanup_process_scoped` が消す）
+        let pid = std::process::id();
+        let tmp = std::env::temp_dir();
+        tako_core::scoped_dirs::adopt(
+            "TAKO_DISCOVERY_DIR",
+            tmp.join(format!("tako-iso-discovery-{pid}")),
+        );
         // データディレクトリ（layout.json / settings.json / token / persist.log）も
         // 一括隔離する（#177 の穴: TAKO_ISOLATED + TAKO_PERSIST=1 の組み合わせで
         // 本番 layout.json を復元・上書きし得た）
-        if std::env::var_os("TAKO_DATA_DIR").is_none() {
-            std::env::set_var(
-                "TAKO_DATA_DIR",
-                std::env::temp_dir().join(format!("tako-iso-data-{}", std::process::id())),
-            );
-        }
+        tako_core::scoped_dirs::adopt("TAKO_DATA_DIR", tmp.join(format!("tako-iso-data-{pid}")));
         // セッションカタログ / ペインログ（Issue #112）も本番ファイルから隔離する
-        if std::env::var_os("TAKO_SESSIONS_FILE").is_none() {
-            std::env::set_var(
-                "TAKO_SESSIONS_FILE",
-                std::env::temp_dir().join(format!("tako-iso-sessions-{}.yaml", std::process::id())),
-            );
-        }
-        if std::env::var_os("TAKO_PANE_LOG_DIR").is_none() {
-            std::env::set_var(
-                "TAKO_PANE_LOG_DIR",
-                std::env::temp_dir().join(format!("tako-iso-pane-logs-{}", std::process::id())),
-            );
-        }
+        tako_core::scoped_dirs::adopt(
+            "TAKO_SESSIONS_FILE",
+            tmp.join(format!("tako-iso-sessions-{pid}.yaml")),
+        );
+        tako_core::scoped_dirs::adopt(
+            "TAKO_PANE_LOG_DIR",
+            tmp.join(format!("tako-iso-pane-logs-{pid}")),
+        );
         // #445: remote daemon の state ファイル（pid/token/port/url）も隔離する。
         // state_dir() は TAKO_REMOTE_STATE_DIR → data_dir()/remote の順で解決するため、
         // TAKO_DATA_DIR を隔離しても TAKO_REMOTE_STATE_DIR が環境に残っていると
         // 本番 state_dir を参照し、2 秒毎の daemon_status で本番 state を消し得る
-        if std::env::var_os("TAKO_REMOTE_STATE_DIR").is_none() {
-            std::env::set_var(
-                "TAKO_REMOTE_STATE_DIR",
-                std::env::temp_dir().join(format!("tako-iso-remote-{}", std::process::id())),
-            );
-        }
+        tako_core::scoped_dirs::adopt(
+            "TAKO_REMOTE_STATE_DIR",
+            tmp.join(format!("tako-iso-remote-{pid}")),
+        );
     }
     // セルフテストの tmux バックエンド項目は、ユーザーの実バックエンド（tako サーバー）を
     // 汚さない隔離ソケットで行う（終了時に self_test 側が kill-server で片付ける）
@@ -33757,10 +33778,8 @@ fn main() {
     // セルフテストの接続情報はメインの control.json に**触らない**（2026-06-12 バグ (8):
     // 一時インスタンスの上書き → exit でメインへの CLI / MCP 接続が全断した）。
     // 専用一時ディレクトリへ隔離し、ペイン内 CLI も env 継承で同じ場所を見る
-    if std::env::var_os("TAKO_SELF_TEST").is_some()
-        && std::env::var_os("TAKO_DISCOVERY_DIR").is_none()
-    {
-        std::env::set_var(
+    if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        tako_core::scoped_dirs::adopt(
             "TAKO_DISCOVERY_DIR",
             std::env::temp_dir().join(format!("tako-st-discovery-{}", std::process::id())),
         );
@@ -33768,11 +33787,10 @@ fn main() {
     // セルフテストは本番の永続ファイルへ触らない（Issue #112 / #658）。
     // 隔離対象の一覧は self_test_isolation_defaults が正（漏れをテストで固定してある）
     if std::env::var_os("TAKO_SELF_TEST").is_some() {
+        // #2686: 無いときだけ当てて覚える（終了の後片付けが自分で決めた置き場だけを付属ファイルごと消す）
         for (key, value) in self_test_isolation_defaults(std::process::id(), &std::env::temp_dir())
         {
-            if std::env::var_os(key).is_none() {
-                std::env::set_var(key, value);
-            }
+            tako_core::scoped_dirs::adopt(key, value);
         }
     }
     // 設定・データファイルの自動マイグレーション（#916 の二段構え 2 段目 = 実行時発火）。

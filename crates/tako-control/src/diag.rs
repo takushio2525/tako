@@ -133,6 +133,11 @@ fn append_log(path: Option<PathBuf>, msg: &str) {
     let Some(dir) = path.parent() else {
         return;
     };
+    // #2686: 終了の後片付けが消した検証起動の置き場へは書かない（行は捨てる）。下の create_dir_all が
+    // 置き場を作り直すので、片付けの後の 1 行で data dir が生き返る。本番の GUI では常に偽
+    if tako_core::scoped_dirs::is_retired(&path) {
+        return;
+    }
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
