@@ -741,6 +741,15 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   `crates/tako-cli/tests/issue2365_cli_human_lang.rs`（unix。ビルドした `tako` を日英で叩き、todo / sessions は決まった
   応答を返す偽の GUI を立てる。英語表示に日本語が無いこと・日本語表示が #2365 より前とバイト一致・`--json` が日英で
   同じこと。A/B は `TAKO_2365_HUMAN_BIN`）
+- 続けて **`tako todo list` / `expand` / `collapse` と `tako sessions list` / `link` の枠**も移した（空のときの文・
+  `期限:` / `返答:` のラベル・「未完了 N 件」・「(なし)」・「表示」/「非表示」・「（resume 不可）」・pending の見出し・
+  末尾の resume の案内・`アカウント:`・「公式リンクはありません」と入れ方の案内）。文は `ReplyNote` の 13 種
+  （`Todos*` / `TodoDue` ほか・`Sessions*` / `SessionLink*`）で、`sessions link` の表示は `print_sessions_link` へ
+  切り出した。`expanded:` / `panel:` / `view:` のラベルとコマンドの本体は両言語で同じ（値と案内のプレースホルダだけ
+  表示言語）。番犬は `issue1762_dispatch_error_lang.rs`（旧文の表に 15 行・`CLI_NOTE_SCOPES` に 4 つの関数）と、
+  実経路の `crates/tako-cli/tests/issue2365_cli_todo_sessions_lang.rs`（偽の GUI の応答で URL の有無・空・pending まで
+  通す。A/B は同じ `TAKO_2365_HUMAN_BIN`）。`sessions link --json` の `remote_link.enable_command` のプレースホルダ
+  （`<名前>`）は応答の値なので、まだ日本語のまま
 - 表示言語の正は `tako_core::i18n`（グローバル）。設定値（system / ja / en）は
   settings.json の `language`。言語に依存する単体テストは相対比較
   （`結果 == カタログ関数()`）で書き、`set_lang` を触る検査は
@@ -2181,6 +2190,15 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   **ただし「画面は消えない」は通常画面の話で、alt screen の TUI では成り立たない**
   （#1175）。claude の TUI はスクロールし、長い貼り付けは `[Pasted text #N]` に畳む
   ので、一度流れた本文はビューポートから消える。次項を参照
+  - **入力予測のゴーストは確定後と同じ文字列を確定前から画面に出す**（#2689）。項目 41c-2 は
+    「Tab → 固定 800ms → Enter」の後に `TAKO600-ghost-ok` をアンカーにしていたが、それは Tab の前から
+    ゴーストとして出ているので、シェルの処理が 800ms に間に合わない回は処理前の画面（案内つき）で判定して
+    落ち（load 16 で 1 回）、Tab が効かなくても通る偽 PASS の余地もあった。Enter の結果は**実行の後に
+    しか出ないもの**（echo の出力の行 = 行全体の一致）を状態で待って確かめる（`tab_enter_41c`）
+  - **Enter の直前に入力の効果を固定時間で待たない**（#2689）。PTY は打鍵の順を保つので待ちは要らず、
+    固定待ちは上のアンカーの空振りを覆い隠すだけ。番犬 `selftest_wait_watchdog` の
+    `fixed_wait_before_enter` が「固定待ちの次のコードの行が Enter を押す `press…`」を名指す
+    （A/B の旧経路など意図して残す形は、その行か直前のコメント行に `tako:fixed-wait-enter-ok <理由>`）
 - **実 claude の「発話の内容」はビューポートから採らない**（#1175）。項目 101c は
   「引き継ぎ本文が後任へ届いた」を `visible_lines()` から探していたが、本文は
   claude の TUI では**起動直後に 1 度だけ流れる User 発話**なので、後任が数分喋れば
@@ -6043,6 +6061,9 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
   `TAKO_ISOLATED=1` が置き場を差し替えるのは GUI の起動時だけで、**CLI の置き場は変えない**
   （#2531 からは、印のある CLI / daemon が置き場を明示していなければ既定の置き場を読まずに日英の断りで
   止まる = 本番へは届かないが、隔離 GUI へも繋がらない。順番待ちだけは印があっても本番の調停役へ並ぶ）。
+  **#2694 からは手元の処理も同じ**: 印があって `TAKO_DATA_DIR` が無ければ `tako usage` / `migrate` / `setup` ほかの
+  手元のサブコマンドは日英で断る（既定の置き場が砂場の HOME でも断る = 置き場は常に明示する。
+  `verify-setup-multiagent.sh` は砂場の HOME の既定の置き場と同じパスを `TAKO_DATA_DIR` で渡す）。
   `test-serve-watch.sh` は `unset` と `TAKO_ISOLATED=1` だけで `tako remote start` を回し、QR の画像を
   本番のアクティブなタブへ開いた。検証スクリプトは tako CLI を起こす前に `TAKO_DATA_DIR` /
   `TAKO_DISCOVERY_DIR` / `HOME` のどれかを一時の側へ向ける（先頭の `export TAKO_DATA_DIR="$TMP/data"` か、
