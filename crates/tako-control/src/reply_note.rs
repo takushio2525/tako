@@ -778,6 +778,35 @@ pub enum ReplyNote {
     /// 待ちの開始の見込み（日本語は調停役の 1 文、英語は `start_s` から）
     QueueStartEta { ja: String, start_s: u64 },
 
+    // ---- CLI の人向けの表示: `tako queue <コマンド>` の進みの行（stderr。前置き `tako queue: ` は呼び手）----
+    // 待つ理由・開始の見込みは上の `QueueWaitReason` / `QueueStartEta`（調停役の文 / 応答の構造の欄）で組んで渡す
+    /// 待ちの 1 行（`start` / `why` は同じ言語で組んだ部品）
+    QueueWaitLine(Box<QueueWaitLineFields>),
+    /// 待ちの 1 行の理由: 前に並ぶ処理の後ろで待っている（`head` = 先頭の待つ理由。同じ言語で組んだ文）
+    QueueAheadOf { ahead: u64, head: Option<String> },
+    /// 待ちが明けて走り始めた（`share` = 取り分。0 は出さない）
+    QueueStarted { waited_s: u64, share: u32 },
+    /// 走らせるコマンドが無い
+    QueueNoCommand,
+    /// 子を起動できない（`error` は OS のエラー文）
+    QueueSpawnFailed { program: String, error: String },
+    /// tako が居ないので待たずに走らせる
+    QueueRunOffline,
+    /// tako が上限（秒）まで応答しないので待たずに走らせる
+    QueueRunUnresponsive(u64),
+    /// 順番待ちを受けない tako に断られたのでそのまま走らせる（中身は相手の断りの文）
+    QueueRunRejected(String),
+    /// 待っている間に取り消された
+    QueueCancelledWhileWaiting,
+    /// シグナルで待ちから外れた
+    QueueLeftOnSignal,
+    /// 待ちの上限で諦めた（`waiting` = 待ちの件数・`waited_s` = 待ちの上限）
+    QueueGaveUpAfter { waiting: u64, waited_s: u64 },
+    /// 待ちの途中で調停役を見失ったまま猶予（秒）を過ぎたので待たずに走らせる（`unresponsive` = 繋がったまま応答しない）
+    QueueRunLost { unresponsive: bool, grace_s: u64 },
+    /// 実行中に取り消されたので子を止める（中身 = SIGKILL までの猶予の秒）
+    QueueStoppingCancelled(u64),
+
     // ---- CLI の人向けの表示: tako usage（注記 `notes` と `hint` は応答の値 = 日本語、組む型はここ）----
     /// `tako usage`: 使用量の索引を作った（stderr。会話記録の本数・MB・経過ミリ秒）
     UsageIndexBuilt {
@@ -3160,6 +3189,103 @@ impl ReplyNote {
                     format!("starts in about {}", approx_en(*start_s))
                 }
             }
+            (Self::QueueWaitLine(f), lang) => {
+                let QueueWaitLineFields { position, waiting, running, max_jobs, unmanaged, waited_s, start, why } = f.as_ref();
+                let waited = human_secs_in(*waited_s, lang);
+                match lang {
+                    Ja => {
+                        let mut head = format!("待ち {position} 番目（待ち {waiting} 件・実行 {running}/{max_jobs}");
+                        if *unmanaged > 0 {
+                            head.push_str(&format!("・tako の外 {unmanaged}"));
+                        }
+                        head.push_str(&format!("・{waited}"));
+                        if let Some(start) = start {
+                            head.push_str(&format!("・{start}"));
+                        }
+                        // 全角の閉じ括弧の後ろは空けない（「…）— 理由」）
+                        format!("{head}）— {why}")
+                    }
+                    En => {
+                        let mut head = format!("#{position} in the queue ({waiting} waiting, running {running}/{max_jobs}");
+                        if *unmanaged > 0 {
+                            head.push_str(&format!(", {unmanaged} outside tako"));
+                        }
+                        head.push_str(&format!(", waited {waited}"));
+                        if let Some(start) = start {
+                            head.push_str(&format!(", {start}"));
+                        }
+                        format!("{head}) — {why}")
+                    }
+                }
+            }
+            (Self::QueueAheadOf { ahead, head: Some(head) }, Ja) => format!("前に {ahead} 件（先頭: {head}）"),
+            (Self::QueueAheadOf { ahead, head: None }, Ja) => format!("前に {ahead} 件"),
+            (Self::QueueAheadOf { ahead, head: Some(head) }, En) => {
+                format!("{ahead} job(s) ahead (the head: {head})")
+            }
+            (Self::QueueAheadOf { ahead, head: None }, En) => format!("{ahead} job(s) ahead"),
+            (Self::QueueStarted { waited_s, share }, Ja) => format!(
+                "開始（待ち {}{}）",
+                human_secs_in(*waited_s, Ja),
+                if *share > 0 { format!("・取り分 {share}") } else { String::new() }
+            ),
+            (Self::QueueStarted { waited_s, share }, En) => format!(
+                "started (waited {}{})",
+                human_secs_in(*waited_s, En),
+                if *share > 0 { format!(", share {share}") } else { String::new() }
+            ),
+            (Self::QueueNoCommand, Ja) => "走らせるコマンドが無い（例: tako queue cargo build）".into(),
+            (Self::QueueNoCommand, En) => "no command to run (e.g. tako queue cargo build)".into(),
+            (Self::QueueSpawnFailed { program, error }, Ja) => format!("{program} を起動できない: {error}"),
+            (Self::QueueSpawnFailed { program, error }, En) => format!("cannot start {program}: {error}"),
+            (Self::QueueRunOffline, Ja) => "tako が起動していないので、順番待ちせずに走らせる".into(),
+            (Self::QueueRunOffline, En) => {
+                "tako is not running, so running without waiting in the queue".into()
+            }
+            (Self::QueueRunUnresponsive(secs), Ja) => format!(
+                "tako が {secs} 秒応答しないので、順番待ちせずに走らせる（GUI が固まっている可能性）"
+            ),
+            (Self::QueueRunUnresponsive(secs), En) => format!(
+                "tako has not answered for {secs} s, so running without waiting in the queue \
+                 (the GUI may be frozen)"
+            ),
+            (Self::QueueRunRejected(detail), Ja) => {
+                format!("順番待ちを受けていない（{detail}）ので、そのまま走らせる")
+            }
+            (Self::QueueRunRejected(detail), En) => {
+                format!("this tako does not take queued jobs ({detail}), so running as is")
+            }
+            (Self::QueueCancelledWhileWaiting, Ja) => "待っている間に取り消された".into(),
+            (Self::QueueCancelledWhileWaiting, En) => "cancelled while waiting".into(),
+            (Self::QueueLeftOnSignal, Ja) => "待ちから外れた（シグナル）".into(),
+            (Self::QueueLeftOnSignal, En) => "left the queue (signal)".into(),
+            (Self::QueueGaveUpAfter { waiting, waited_s }, Ja) => format!(
+                "{waiting} 件待ちのまま {} たったので諦める。空いたらもう一度（`tako queue` で状況）",
+                human_secs_in(*waited_s, Ja)
+            ),
+            (Self::QueueGaveUpAfter { waiting, waited_s }, En) => format!(
+                "gave up after waiting {} with {waiting} job(s) in the queue. Try again when a slot \
+                 frees (`tako queue` shows the state)",
+                human_secs_in(*waited_s, En)
+            ),
+            (Self::QueueRunLost { unresponsive: true, grace_s }, Ja) => format!(
+                "順番待ちの調停役が応答しないまま {grace_s} 秒たったので、待たずに走らせる"
+            ),
+            (Self::QueueRunLost { unresponsive: false, grace_s }, Ja) => format!(
+                "順番待ちの調停役を見失ったまま {grace_s} 秒たったので、待たずに走らせる"
+            ),
+            (Self::QueueRunLost { unresponsive: true, grace_s }, En) => format!(
+                "the queue arbiter has not answered for {grace_s} s, so running without waiting"
+            ),
+            (Self::QueueRunLost { unresponsive: false, grace_s }, En) => {
+                format!("lost the queue arbiter for {grace_s} s, so running without waiting")
+            }
+            (Self::QueueStoppingCancelled(grace_s), Ja) => {
+                format!("取り消されたので子を止める（SIGTERM → {grace_s} 秒で SIGKILL）")
+            }
+            (Self::QueueStoppingCancelled(grace_s), En) => {
+                format!("cancelled, stopping the child (SIGTERM, then SIGKILL after {grace_s} s)")
+            }
 
             (
                 Self::UsageIndexBuilt {
@@ -3606,6 +3732,20 @@ pub struct QueueWaitingRowFields {
     pub waited_s: u64,
     pub start: Option<String>,
     pub reason: Option<String>,
+}
+
+/// [`ReplyNote::QueueWaitLine`] の中身（大きいので箱に入れる = `ReplyNote` を小さく保つ。#2365）
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueWaitLineFields {
+    pub position: u64,
+    pub waiting: u64,
+    pub running: u64,
+    pub max_jobs: u64,
+    /// 順番待ちを通っていない重い処理（0 は出さない）
+    pub unmanaged: u64,
+    pub waited_s: u64,
+    pub start: Option<String>,
+    pub why: String,
 }
 
 /// [`ReplyNote::QueueHolder`] の中身（大きいので箱に入れる = `ReplyNote` を小さく保つ。#2365）

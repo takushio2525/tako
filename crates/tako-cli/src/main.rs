@@ -7117,20 +7117,9 @@ fn usage_tokens(n: u64, lang: tako_core::i18n::Lang) -> String {
 }
 
 /// 段の名前（#2365）。日本語は応答の `name` をそのまま、英語は応答の `key` と段の切り方から言い換えの
-/// 名前（未分類・Issue なし ほか）を組み直す（`usage::report::group_name_in` = 作る側と同じ 1 実装）
+/// 名前（未分類・Issue なし ほか）を組み直す（右パネルの usage ビューと同じ 1 実装 = `display::group_row_name_in`）
 fn usage_group_name(g: &Value, by: &str, lang: tako_core::i18n::Lang) -> String {
-    use tako_core::usage::report;
-    let name = g["name"].as_str().unwrap_or("-");
-    if lang == tako_core::i18n::Lang::Ja {
-        return name.to_string();
-    }
-    match (
-        report::By::parse(by),
-        serde_json::from_value::<report::GroupKey>(g["key"].clone()),
-    ) {
-        (Some(by), Ok(key)) => report::group_name_in(by, &key, lang),
-        _ => name.to_string(),
-    }
+    tako_core::usage::display::group_row_name_in(g, by, lang)
 }
 
 /// 量の 1 行（API 換算・トークン・応答・会話）
@@ -7437,20 +7426,9 @@ fn usage_text(p: &Value, now: i64, utc_offset: i32, lang: tako_core::i18n::Lang)
             ReplyNote::UsageBy(by.to_string()).text_in(lang)
         ));
     }
-    let notes: Vec<String> = match lang {
-        Lang::Ja => p["notes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|n| n.as_str().map(str::to_string))
-            .collect(),
-        Lang::En => tako_control::usage::usage_notes(p)
-            .iter()
-            .map(|n| n.text_in(lang))
-            .collect(),
-    };
+    // 日本語は応答の注記のまま、英語は応答から組み直す（右パネルの usage ビューと同じ 1 実装）
     let label = ReplyNote::UsageNoteLabel.text_in(lang);
-    for note in notes {
+    for note in tako_control::usage::notes_in(p, lang) {
         out.push_str(&format!("  {label}: {note}\n"));
     }
     out
@@ -8052,6 +8030,8 @@ fn queue_run_cli(args: &QueueArgs) -> ExitCode {
         priority,
         max_wait,
         label: args.label.clone(),
+        // 進みの行（stderr の待ち・開始・諦め）も人向けの表示 = 表示言語（#2365）
+        lang: cli_lang(),
     };
     let code = w::run(argv, &opts, &mut queue_send);
     ExitCode::from(u8::try_from(code.clamp(0, 255)).unwrap_or(1))

@@ -27,7 +27,7 @@
 //! - 実行中に調停役が居なくなっても子は止めない（繋がったら子の pid で登録し直す）
 //! - 待ちの上限（既定 30 分・`--max-wait`）で 75、待ちの取り消しで 125、Ctrl+C / 親の SIGTERM で
 //!   128 + 番号（待ちから外れて終わる）。実行中のシグナルは子へ転送する。待ちの上限で諦めたときは
-//!   待っていた理由と、枠とメモリを押さえていた処理（[`gave_up_lines`]）を出す（#2254）
+//!   待っていた理由と、枠とメモリを押さえていた処理（[`gave_up_lines_in`]）を出す（#2254）
 //! - 受付で過去の記録の鍵（`HistoryKeys`。repo の根 + 正規化した argv のハッシュ）を送る。
 //!   調停役はそれで見込みメモリを引く（#2254）
 //! - 実行中の取り消しは子とその子孫へ SIGTERM → 10 秒で SIGKILL（Windows は子を起こした直後に入れた
@@ -98,6 +98,8 @@ pub struct Options {
     pub max_wait: Option<Duration>,
     /// 表示名（未指定ならコマンド行を短くしたもの）
     pub label: Option<String>,
+    /// 進みの行（stderr の待ち・開始・諦め・素通しの理由）の表示言語（#2365。CLI は `cli_lang()`）
+    pub lang: Lang,
 }
 
 /// `--max-wait` の値を読む: `90s` / `10m` / `1h` / 単位なしは分。断りは表示言語で引ける型（#2365。呼び手は CLI）
@@ -142,39 +144,52 @@ pub fn reconnect_delay(attempt: u32) -> Duration {
     Duration::from_secs(u64::from((1 + attempt / 2).min(5)))
 }
 
-/// 待ちの 1 行（純関数）
-pub fn waiting_line(resp: &Value, waited: Duration) -> String {
+/// 待ちの 1 行（純関数）。文は表示言語で組む（#2365。待つ理由・開始の見込みは日本語なら調停役の文、
+/// 英語なら同じ応答の構造の欄 `reason` / `head_reason` / `start_s` から）
+pub fn waiting_line(resp: &Value, waited: Duration, lang: Lang) -> String {
     let n = |k: &str| resp[k].as_u64().unwrap_or(0);
     let position = n("position");
-    let mut head = format!(
-        "tako queue: 待ち {position} 番目（待ち {} 件・実行 {}/{}",
-        n("waiting"),
-        n("running"),
-        n("max_jobs")
-    );
-    if n("unmanaged") > 0 {
-        head.push_str(&format!("・tako の外 {}", n("unmanaged")));
-    }
-    head.push_str(&format!("・{}", human_secs(waited.as_secs())));
     // 開始の見込み（#1996。前に並ぶ全件と実行中の全件に見込みがあるときだけ調停役が返す）
-    if let Some(start) = resp["start_text"].as_str() {
-        head.push_str(&format!("・{start}"));
-    }
-    head.push('）');
+    let start = resp["start_text"].as_str().map(|ja| {
+        ReplyNote::QueueStartEta {
+            ja: ja.to_string(),
+            start_s: n("start_s"),
+        }
+        .text_in(lang)
+    });
+    let reason = |code: &str, text: &str| {
+        resp[text].as_str().map(|ja| {
+            ReplyNote::QueueWaitReason {
+                code: resp[code].as_str().map(str::to_string),
+                ja: ja.to_string(),
+            }
+            .text_in(lang)
+        })
+    };
     // 前の処理の後ろで待っている（並びが止まっている）ときだけ「前に N 件」。target dir 待ちの先頭を
     // 追い越せる件（#2243）は 2 番目以降でも自分の理由（枠・メモリ…）で待っているので、それを出す。
     // 旧い調停役は 2 番目以降を常に ahead で返す
     let behind = resp["reason"].as_str().is_none_or(|r| r == "ahead");
     let why = if position > 1 && behind {
-        match resp["head_text"].as_str() {
-            Some(t) => format!("前に {} 件（先頭: {t}）", position - 1),
-            None => format!("前に {} 件", position - 1),
+        ReplyNote::QueueAheadOf {
+            ahead: position - 1,
+            head: reason("head_reason", "head_text"),
         }
+        .text_in(lang)
     } else {
-        resp["text"].as_str().unwrap_or("").to_string()
+        reason("reason", "text").unwrap_or_default()
     };
-    // 全角の閉じ括弧の後ろは空けない（「…）— 理由」）
-    format!("{head}— {why}")
+    let line = ReplyNote::QueueWaitLine(Box::new(crate::reply_note::QueueWaitLineFields {
+        position,
+        waiting: n("waiting"),
+        running: n("running"),
+        max_jobs: n("max_jobs"),
+        unmanaged: n("unmanaged"),
+        waited_s: waited.as_secs(),
+        start,
+        why,
+    }));
+    format!("tako queue: {}", line.text_in(lang))
 }
 
 /// MiB → 人が読む GB / MB
@@ -187,14 +202,9 @@ pub fn human_mb(mb: u64) -> String {
 }
 
 /// 待ちの上限で諦めたときの説明（純関数。#2254）: 待っていた理由と、枠とメモリを押さえていた処理
-/// （最後の poll の `holders`。旧い調停役は返さない = 理由だけ）。日本語の口（`tako queue <コマンド>` が
-/// 諦めたときの行）。表示言語で組むのは [`gave_up_lines_in`]
-pub fn gave_up_lines(resp: &Value) -> Vec<String> {
-    gave_up_lines_in(resp, Lang::Ja)
-}
-
-/// [`gave_up_lines`] を表示言語で（#2365。`tako queue` の状況の「直近の諦め」の下の行）。待つ理由は
-/// 日本語なら調停役の 1 文、英語なら理由の種類（`reason` / `head_reason`）から組む
+/// （最後の poll の `holders`。旧い調停役は返さない = 理由だけ）。表示言語で組む（#2365。`tako queue <コマンド>`
+/// が諦めたときの行と、`tako queue` の状況の「直近の諦め」の下の行）。待つ理由は日本語なら調停役の 1 文、
+/// 英語なら理由の種類（`reason` / `head_reason`）から組む
 pub fn gave_up_lines_in(resp: &Value, lang: Lang) -> Vec<String> {
     let mut out = Vec::new();
     let behind = resp["reason"].as_str().is_none_or(|r| r == "ahead");
@@ -233,11 +243,6 @@ pub fn gave_up_lines_in(resp: &Value, lang: Lang) -> Vec<String> {
         out.push(holder.text_in(lang));
     }
     out
-}
-
-/// 秒 → 「1 分 12 秒」（日本語の口。表示言語で組むのは [`human_secs_in`]）
-pub fn human_secs(secs: u64) -> String {
-    human_secs_in(secs, Lang::Ja)
 }
 
 /// 秒 → 「1 分 12 秒」/ `1m 12s`（#2365。英語は右パネルの resources ビューと同じ区切り）
@@ -375,15 +380,18 @@ fn request(action: &str, job: &JobWire) -> Request {
 /// 待ちの表示（stderr。TTY なら同じ行を書き換え、非 TTY は 60 秒ごとに 1 行）
 struct Display {
     tty: bool,
+    /// 行の表示言語（#2365）
+    lang: Lang,
     shown: bool,
     last_line: String,
     last_plain: Option<Instant>,
 }
 
 impl Display {
-    fn new() -> Self {
+    fn new(lang: Lang) -> Self {
         Self {
             tty: std::io::stderr().is_terminal(),
+            lang,
             shown: false,
             last_line: String::new(),
             last_plain: None,
@@ -391,7 +399,7 @@ impl Display {
     }
 
     fn waiting(&mut self, resp: &Value, waited: Duration) {
-        let line = waiting_line(resp, waited);
+        let line = waiting_line(resp, waited, self.lang);
         let mut err = std::io::stderr();
         if self.tty {
             if line != self.last_line {
@@ -468,11 +476,17 @@ impl<'a> Program<'a> {
 }
 
 /// 順番待ちせずに走らせる（入れ子・tako が居ない・調停役でない）
-fn run_direct(program: &Program) -> i32 {
+fn run_direct(program: &Program, lang: Lang) -> i32 {
     match program.command().spawn() {
         Ok(mut child) => wait_plain(&mut child),
         Err(e) => {
-            note(&format!("{} を起動できない: {e}", program.argv[0]));
+            note(
+                &ReplyNote::QueueSpawnFailed {
+                    program: program.argv[0].clone(),
+                    error: e.to_string(),
+                }
+                .text_in(lang),
+            );
             q::EXIT_SPAWN_FAILED
         }
     }
@@ -523,8 +537,9 @@ fn run_with(
     nested: bool,
     already_set: &dyn Fn(&str) -> bool,
 ) -> i32 {
+    let lang = opts.lang;
     if argv.is_empty() {
-        note("走らせるコマンドが無い（例: tako queue cargo build）");
+        note(&ReplyNote::QueueNoCommand.text_in(lang));
         return 2;
     }
     // 待つ前に子の場所を引いておく（待ちの間に install で自分の実行ファイルが置き換わっても、
@@ -533,7 +548,7 @@ fn run_with(
     signals::install();
     // 入れ子: 外側の枠の中で即実行
     if nested {
-        return run_direct(&program);
+        return run_direct(&program, lang);
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let mut wire = build_wire(argv, opts, &cwd);
@@ -541,27 +556,22 @@ fn run_with(
     let first = match send(request("enqueue", &wire)) {
         Ok(v) => v,
         Err(SendError::Unreachable(_)) => {
-            note("tako が起動していないので、順番待ちせずに走らせる");
-            return run_direct(&program);
+            note(&ReplyNote::QueueRunOffline.text_in(lang));
+            return run_direct(&program, lang);
         }
         Err(SendError::Timeout(limit)) => {
-            note(&format!(
-                "tako が {} 秒応答しないので、順番待ちせずに走らせる（GUI が固まっている可能性）",
-                limit.as_secs()
-            ));
-            return run_direct(&program);
+            note(&ReplyNote::QueueRunUnresponsive(limit.as_secs()).text_in(lang));
+            return run_direct(&program, lang);
         }
         Err(SendError::Rejected(m)) => {
-            note(&format!(
-                "順番待ちを受けていない（{m}）ので、そのまま走らせる"
-            ));
-            return run_direct(&program);
+            note(&ReplyNote::QueueRunRejected(m).text_in(lang));
+            return run_direct(&program, lang);
         }
     };
 
     // ---- 待つ ----
     let wait_start = Instant::now();
-    let mut display = Display::new();
+    let mut display = Display::new(lang);
     adopt_job_priority(&mut wire, &first);
     let mut resp = first;
     let mut lost_since: Option<Instant> = None;
@@ -580,7 +590,7 @@ fn run_with(
             }
             Some("cancelled") => {
                 display.finish(None);
-                note("待っている間に取り消された");
+                note(&ReplyNote::QueueCancelledWhileWaiting.text_in(lang));
                 return q::EXIT_CANCELLED;
             }
             _ => display.waiting(&resp, wait_start.elapsed()),
@@ -591,7 +601,7 @@ fn run_with(
             if let Some(sig) = signals::take().into_iter().next() {
                 display.finish(None);
                 withdraw(send, &wire);
-                note("待ちから外れた（シグナル）");
+                note(&ReplyNote::QueueLeftOnSignal.text_in(lang));
                 return 128 + sig;
             }
             std::thread::sleep(CHILD_TICK);
@@ -601,12 +611,14 @@ fn run_with(
             // 諦めたことを調停役へ知らせる（押さえていた処理を `recent` に残す。#2254）
             wire.exit_code = Some(q::EXIT_MAX_WAIT);
             withdraw(send, &wire);
-            let n = resp["waiting"].as_u64().unwrap_or(0);
-            note(&format!(
-                "{n} 件待ちのまま {} たったので諦める。空いたらもう一度（`tako queue` で状況）",
-                human_secs(max_wait.as_secs())
-            ));
-            for line in gave_up_lines(&resp) {
+            note(
+                &ReplyNote::QueueGaveUpAfter {
+                    waiting: resp["waiting"].as_u64().unwrap_or(0),
+                    waited_s: max_wait.as_secs(),
+                }
+                .text_in(lang),
+            );
+            for line in gave_up_lines_in(&resp, lang) {
                 note(&line);
             }
             return q::EXIT_MAX_WAIT;
@@ -625,36 +637,32 @@ fn run_with(
                 let since = *lost_since.get_or_insert(polled_at);
                 if since.elapsed() >= LOST_GRACE {
                     display.finish(None);
-                    note(if matches!(failure, SendError::Timeout(_)) {
-                        "順番待ちの調停役が応答しないまま 60 秒たったので、待たずに走らせる"
-                    } else {
-                        "順番待ちの調停役を見失ったまま 60 秒たったので、待たずに走らせる"
-                    });
-                    return run_direct(&program);
+                    note(
+                        &ReplyNote::QueueRunLost {
+                            unresponsive: matches!(failure, SendError::Timeout(_)),
+                            grace_s: LOST_GRACE.as_secs(),
+                        }
+                        .text_in(lang),
+                    );
+                    return run_direct(&program, lang);
                 }
                 std::thread::sleep(reconnect_delay(attempts).saturating_sub(POLL_INTERVAL));
                 attempts += 1;
             }
             Err(SendError::Rejected(m)) => {
                 display.finish(None);
-                note(&format!(
-                    "順番待ちを受けていない（{m}）ので、そのまま走らせる"
-                ));
-                return run_direct(&program);
+                note(&ReplyNote::QueueRunRejected(m).text_in(lang));
+                return run_direct(&program, lang);
             }
         }
     };
     let waited = wait_start.elapsed();
     if display.shown {
-        display.finish(Some(&format!(
-            "tako queue: 開始（待ち {}{}）",
-            human_secs(waited.as_secs()),
-            if share > 0 {
-                format!("・取り分 {share}")
-            } else {
-                String::new()
-            }
-        )));
+        let started = ReplyNote::QueueStarted {
+            waited_s: waited.as_secs(),
+            share,
+        };
+        display.finish(Some(&format!("tako queue: {}", started.text_in(lang))));
     }
 
     // ---- 走らせる ----
@@ -679,7 +687,13 @@ fn run_with(
     let (mut child, mut descendants) = match spawned {
         Ok(spawned) => spawned,
         Err(e) => {
-            note(&format!("{} を起動できない: {e}", argv[0]));
+            note(
+                &ReplyNote::QueueSpawnFailed {
+                    program: argv[0].clone(),
+                    error: e.to_string(),
+                }
+                .text_in(lang),
+            );
             wire.exit_code = Some(q::EXIT_SPAWN_FAILED);
             let _ = send(request("done", &wire));
             return q::EXIT_SPAWN_FAILED;
@@ -713,7 +727,7 @@ fn run_with(
             if let Ok(v) = beat {
                 adopt_job_priority(&mut wire, &v);
                 if v["cancel"] == true && cancel_at.is_none() {
-                    note("取り消されたので子を止める（SIGTERM → 10 秒で SIGKILL）");
+                    note(&ReplyNote::QueueStoppingCancelled(KILL_GRACE.as_secs()).text_in(lang));
                     tree::terminate(&mut child, &mut descendants, false);
                     cancel_at = Some(Instant::now());
                 }
@@ -951,14 +965,14 @@ mod tests {
             "text": "同時数の上限（実行 3 + tako の外 1 / 上限 3）",
         });
         assert_eq!(
-            waiting_line(&head, Duration::from_secs(72)),
+            waiting_line(&head, Duration::from_secs(72), Lang::Ja),
             "tako queue: 待ち 1 番目（待ち 3 件・実行 3/3・tako の外 1・1 分 12 秒）— 同時数の上限（実行 3 + tako の外 1 / 上限 3）"
         );
         let behind = json!({
             "position": 3, "waiting": 3, "running": 1, "max_jobs": 3,
             "text": "前に並んでいる処理の後", "head_text": "メモリ圧 warn（実行中が終わってから 1 件ずつ）",
         });
-        assert!(waiting_line(&behind, Duration::from_secs(5))
+        assert!(waiting_line(&behind, Duration::from_secs(5), Lang::Ja)
             .ends_with("— 前に 2 件（先頭: メモリ圧 warn（実行中が終わってから 1 件ずつ））"));
         // #2243: 先頭が target dir 待ちで、2 番目の自分は空き枠の無さで待っている → 自分の理由を出す
         // （「先頭: 同じ target dir …」と出すと、追い越せる先頭の後ろで待っているように読める）
@@ -967,7 +981,7 @@ mod tests {
             "reason": "max_jobs", "text": "同時数の上限（実行 3 / 上限 3）",
             "head_reason": "max_jobs", "head_text": "同時数の上限（実行 3 / 上限 3）",
         });
-        assert!(waiting_line(&own, Duration::from_secs(5))
+        assert!(waiting_line(&own, Duration::from_secs(5), Lang::Ja)
             .ends_with("— 同時数の上限（実行 3 / 上限 3）"));
         // 追い越しの上限に達した先頭の後ろ
         let held = json!({
@@ -975,7 +989,47 @@ mod tests {
             "reason": "ahead", "text": "前に並んでいる処理の後",
             "head_reason": "overtake_limit", "head_text": "上限",
         });
-        assert!(waiting_line(&held, Duration::from_secs(5)).ends_with("— 前に 1 件（先頭: 上限）"));
+        assert!(waiting_line(&held, Duration::from_secs(5), Lang::Ja)
+            .ends_with("— 前に 1 件（先頭: 上限）"));
+    }
+
+    /// #2365: 英語表示の待ちの 1 行は調停役の日本語の文を使わず、応答の構造の欄（`reason` /
+    /// `head_reason` / `start_s`）から組む（日本語の行と同じ欄を同じ並びで言う）
+    #[test]
+    fn 英語の待ちの1行は構造の欄から組み日本語を含まない() {
+        let head = json!({
+            "position": 1, "waiting": 3, "running": 3, "max_jobs": 3, "unmanaged": 1,
+            "reason": "max_jobs", "text": "同時数の上限（実行 3 + tako の外 1 / 上限 3）",
+            "start_s": 0, "start_text": "空き次第すぐ開始の見込み",
+        });
+        assert_eq!(
+            waiting_line(&head, Duration::from_secs(72), Lang::En),
+            "tako queue: #1 in the queue (3 waiting, running 3/3, 1 outside tako, waited 1m 12s, \
+             starts as soon as a slot frees) — the concurrent job limit is reached"
+        );
+        assert_eq!(
+            waiting_line(&head, Duration::from_secs(72), Lang::Ja),
+            "tako queue: 待ち 1 番目（待ち 3 件・実行 3/3・tako の外 1・1 分 12 秒・空き次第すぐ開始の見込み）\
+             — 同時数の上限（実行 3 + tako の外 1 / 上限 3）"
+        );
+        let held = json!({
+            "position": 3, "waiting": 3, "running": 1, "max_jobs": 3,
+            "reason": "ahead", "text": "前に並んでいる処理の後",
+            "head_reason": "memory", "head_text": "空きメモリ不足（空き 1.0 GB）",
+            "start_s": 240, "start_text": "開始まで約 4 分",
+        });
+        assert_eq!(
+            waiting_line(&held, Duration::from_secs(5), Lang::En),
+            "tako queue: #3 in the queue (3 waiting, running 1/3, waited 5s, starts in about 4 min) \
+             — 2 job(s) ahead (the head: not enough free memory)"
+        );
+        // 旧い調停役（理由の種類も先頭の理由も返さない）でも日本語は混ざらない
+        let old = json!({"position": 2, "waiting": 2, "running": 1, "max_jobs": 1, "text": "x"});
+        let line = waiting_line(&old, Duration::from_secs(0), Lang::En);
+        assert_eq!(
+            line,
+            "tako queue: #2 in the queue (2 waiting, running 1/1, waited 0s) — 1 job(s) ahead"
+        );
     }
 
     #[test]
@@ -1221,7 +1275,7 @@ mod tests {
             }],
         });
         assert_eq!(
-            gave_up_lines(&resp),
+            gave_up_lines_in(&resp, Lang::Ja),
             vec![
                 "待っていた理由: 空きメモリ不足（空き 8.0 GB・必要 13.7 GB = 実行中のまだ使っていない見込み 6.7 GB + \
                  この処理の見込み 7.0 GB・予約 3.6 GB）"
@@ -1236,9 +1290,9 @@ mod tests {
         // 並びが止まって調べなかった件は先頭の理由・旧い調停役（holders なし）は理由だけ
         let behind = json!({ "reason": "ahead", "head_text": "同時数の上限（実行 3 / 上限 3）" });
         assert_eq!(
-            gave_up_lines(&behind),
+            gave_up_lines_in(&behind, Lang::Ja),
             vec!["待っていた理由: 前に並んでいる処理の後（先頭: 同時数の上限（実行 3 / 上限 3））"]
         );
-        assert!(gave_up_lines(&json!({})).is_empty());
+        assert!(gave_up_lines_in(&json!({}), Lang::Ja).is_empty());
     }
 }

@@ -5,7 +5,9 @@
 //! ペインの上位・順番待ちの節（「実行」「待ち」「取り分」「直近」「直近の諦め」）・起動待ちと cargo の札の節・
 //! cancel / start / priority / limits の結果、usage は見出し・ログインと枠の行・量の行（万・億）・期間・
 //! % の列のラベル・按分の要約・注記が、日本語の固定文のまま出た（`main.rs` の直書き）。調停役（GUI）が組む
-//! 待つ理由・見込み・札を配らない理由と usage の注記（応答の値）もそのまま並んだ。
+//! 待つ理由・見込み・札を配らない理由と usage の注記（応答の値）もそのまま並んだ。続けて `tako queue <コマンド>`
+//! （順番待ちで走らせる）の進みの行（stderr の待ち・開始・諦め・素通しの理由・取り消し）も、修正前は
+//! `queue_wrapper` の直書きで英語表示でも日本語だった（`r_*` のケース。偽の調停役が受付 → poll の順に答える）。
 //!
 //! **ビルドした `tako` をそのまま**叩く。queue は決まった応答を返す受け口（偽の調停役。`TAKO_QUEUE_SOCKET`）を
 //! 立て、届かない（誰も居ない口）・応答しない（黙る口 + `TAKO_IPC_TIMEOUT_SECS=1`）は実際の経路で出す。
@@ -54,6 +56,10 @@ struct Out {
 enum Arbiter {
     /// 受けた要求すべてへ同じ `result` を返す
     Reply(Value),
+    /// 受けた順に `result` を返す（尽きたら最後のものを返し続ける。`tako queue <コマンド>` の受付 → poll）
+    Script(Vec<Value>),
+    /// 受けた要求すべてを断る（順番待ちを受けない tako）
+    Refuse(&'static str),
     /// 受けて読むが答えない（応答の上限で切れる）
     Silent,
     /// 誰も居ない口（届かない）
@@ -135,13 +141,16 @@ impl Sandbox {
     /// 偽の調停役の口を立てて、そのパスを返す
     fn arbiter(&self, tag: &str, arbiter: &Arbiter) -> String {
         let path = self.path().join(format!("{tag}.sock"));
-        let reply = match arbiter {
+        let (script, refuse) = match arbiter {
             Arbiter::None => return path.display().to_string(),
-            Arbiter::Reply(result) => Some(result.clone()),
-            Arbiter::Silent => None,
+            Arbiter::Reply(result) => (Some(vec![result.clone()]), None),
+            Arbiter::Script(results) => (Some(results.clone()), None),
+            Arbiter::Refuse(message) => (None, Some(*message)),
+            Arbiter::Silent => (None, None),
         };
         let listener = UnixListener::bind(&path).expect("受け口を作れる");
         std::thread::spawn(move || {
+            let mut served = 0usize;
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { return };
                 let mut line = String::new();
@@ -152,16 +161,24 @@ impl Sandbox {
                     .and_then(|v| v["id"].as_u64())
                     .unwrap_or(1);
                 let mut stream = stream;
-                match &reply {
-                    Some(result) => {
-                        let reply = ResponseEnvelope::ok(id, result.clone());
+                let reply = match (&script, refuse) {
+                    (Some(results), _) => {
+                        let result = results[served.min(results.len() - 1)].clone();
+                        served += 1;
+                        Some(ResponseEnvelope::ok(id, result))
+                    }
+                    (None, Some(message)) => Some(ResponseEnvelope::err(id, -32000, message)),
+                    // 繋いだまま答えない（CLI が応答の上限で切る）
+                    (None, None) => None,
+                };
+                match reply {
+                    Some(reply) => {
                         let _ = writeln!(
                             stream,
                             "{}",
                             serde_json::to_string(&reply).expect("応答を組める")
                         );
                     }
-                    // 繋いだまま答えない（CLI が応答の上限で切る）
                     None => std::thread::sleep(Duration::from_secs(5)),
                 }
             }
@@ -612,6 +629,78 @@ fn queue_cases() -> Vec<Case> {
     v
 }
 
+/// `tako queue <コマンド>`（順番待ちで走らせる）の進みの行（stderr）。調停役の文（待つ理由・開始の見込み）は
+/// 応答の値のまま = 日本語、英語の表示は同じ応答の構造の欄から組む。待った秒は実行のたびに揺れうるので
+/// 数字を正規化する（数字まで同じことは `queue_wrapper` の単体テストで見る）。子はすぐ終わる `true` か、
+/// 実行中の取り消しで止められる `sleep`
+fn queue_run_cases() -> Vec<Case> {
+    let run = |name, args: &[&'static str], arbiter| Case {
+        norm: Norm::Machine,
+        ..case(name, args, arbiter)
+    };
+    let max_jobs = json!({
+        "state": "waiting", "position": 1, "waiting": 1, "running": 1, "max_jobs": 1, "unmanaged": 1,
+        "reason": "max_jobs", "text": "同時数の上限（実行 1 + tako の外 1 / 上限 1）",
+        "start_s": 0, "start_text": "空き次第すぐ開始の見込み",
+    });
+    let ahead = json!({
+        "state": "waiting", "position": 2, "waiting": 2, "running": 1, "max_jobs": 1, "unmanaged": 0,
+        "reason": "ahead", "text": "前に並んでいる処理の後",
+        "head_reason": "memory", "head_text": "空きメモリ不足（空き 1.0 GB・必要 3.5 GB・予約 3.6 GB）",
+        "start_s": 240, "start_text": "開始まで約 4 分",
+    });
+    let memory = json!({
+        "state": "waiting", "position": 1, "waiting": 2, "running": 1, "max_jobs": 2, "unmanaged": 0,
+        "reason": "memory", "text": "空きメモリ不足（空き 1.0 GB・必要 3.5 GB・予約 3.6 GB）",
+        "holders": holders(),
+    });
+    let granted = |share: u64| json!({"state": "granted", "share": share});
+    let mut silent = run("r_silent", &["queue", "true"], Arbiter::Silent);
+    silent.extra = vec![("TAKO_IPC_TIMEOUT_SECS", "1")];
+    vec![
+        run(
+            "r_wait_start",
+            &["queue", "true"],
+            Arbiter::Script(vec![max_jobs, granted(4)]),
+        ),
+        run(
+            "r_ahead",
+            &["queue", "true"],
+            Arbiter::Script(vec![ahead, granted(0)]),
+        ),
+        run(
+            "r_gave_up",
+            &["queue", "--max-wait", "1s", "true"],
+            Arbiter::Reply(memory),
+        ),
+        run(
+            "r_cancelled",
+            &["queue", "true"],
+            Arbiter::Reply(json!({"state": "cancelled"})),
+        ),
+        run("r_offline", &["queue", "true"], Arbiter::None),
+        silent,
+        run(
+            "r_rejected",
+            &["queue", "true"],
+            Arbiter::Refuse("unknown queue action"),
+        ),
+        run(
+            "r_spawn_failed",
+            &["queue", "/nonexistent-2365q/cmd"],
+            Arbiter::Reply(granted(2)),
+        ),
+        run(
+            "r_cancel_running",
+            &["queue", "sleep", "30"],
+            Arbiter::Script(vec![
+                granted(2),
+                json!({"state": "running", "cancel": true}),
+            ]),
+        ),
+    ]
+}
+
 /// usage: 会話記録を置く前（観測も使用量も無い）
 fn usage_empty_cases() -> Vec<Case> {
     vec![Case {
@@ -650,7 +739,11 @@ fn usage_cases() -> Vec<Case> {
 fn run_lang(lang: &str) -> Vec<(&'static str, bool, Out)> {
     let sb = Sandbox::new(lang);
     let mut outs = Vec::new();
-    for c in queue_cases().iter().chain(usage_empty_cases().iter()) {
+    for c in queue_cases()
+        .iter()
+        .chain(queue_run_cases().iter())
+        .chain(usage_empty_cases().iter())
+    {
         outs.push((c.name, c.json, sb.run(c)));
     }
     sb.seed_usage();
@@ -847,6 +940,76 @@ cargo の札: 配っていない — 設定 resources.jobserver が off（`tako 
             r##"順番待ちの状況は読めない（tako が 9 秒応答しない = GUI が固まっている可能性。tako queue <コマンド> は待たずに走る）
 "##,
             r##""##,
+        ),
+        // `tako queue <コマンド>` の進みの行（stderr。待った秒は揺れうるので数字を正規化済み）
+        (
+            "r_wait_start",
+            0,
+            r##""##,
+            r##"tako queue: 待ち 9 番目（待ち 9 件・実行 9/9・tako の外 9・9 秒・空き次第すぐ開始の見込み）— 同時数の上限（実行 9 + tako の外 9 / 上限 9）
+tako queue: 開始（待ち 9 秒・取り分 9）
+"##,
+        ),
+        (
+            "r_ahead",
+            0,
+            r##""##,
+            r##"tako queue: 待ち 9 番目（待ち 9 件・実行 9/9・9 秒・開始まで約 9 分）— 前に 9 件（先頭: 空きメモリ不足（空き 9.9 GB・必要 9.9 GB・予約 9.9 GB））
+tako queue: 開始（待ち 9 秒）
+"##,
+        ),
+        (
+            "r_gave_up",
+            75,
+            r##""##,
+            r##"tako queue: 待ち 9 番目（待ち 9 件・実行 9/9・9 秒）— 空きメモリ不足（空き 9.9 GB・必要 9.9 GB・予約 9.9 GB）
+tako queue: 9 件待ちのまま 9 秒 たったので諦める。空いたらもう一度（`tako queue` で状況）
+tako queue: 待っていた理由: 空きメモリ不足（空き 9.9 GB・必要 9.9 GB・予約 9.9 GB）
+tako queue: 押さえていた処理: 9 cargo clippy（使用 9.9 GB・最大 9.9 GB・まだ使っていない見込み 9.9 GB・見込み 9.9 GB（過去の記録）・ピーク後・停滞）
+tako queue: 押さえていた処理: 9 cargo doc（使用 未計測・見込み 9.9 GB（同じ形の記録））
+"##,
+        ),
+        (
+            "r_cancelled",
+            125,
+            r##""##,
+            r##"tako queue: 待っている間に取り消された
+"##,
+        ),
+        (
+            "r_offline",
+            0,
+            r##""##,
+            r##"tako queue: tako が起動していないので、順番待ちせずに走らせる
+"##,
+        ),
+        (
+            "r_silent",
+            0,
+            r##""##,
+            r##"tako queue: tako が 9 秒応答しないので、順番待ちせずに走らせる（GUI が固まっている可能性）
+"##,
+        ),
+        (
+            "r_rejected",
+            0,
+            r##""##,
+            r##"tako queue: 順番待ちを受けていない（unknown queue action）ので、そのまま走らせる
+"##,
+        ),
+        (
+            "r_spawn_failed",
+            127,
+            r##""##,
+            r##"tako queue: /nonexistent-9q/cmd を起動できない: No such file or directory (os error 9)
+"##,
+        ),
+        (
+            "r_cancel_running",
+            143,
+            r##""##,
+            r##"tako queue: 取り消されたので子を止める（SIGTERM → 9 秒で SIGKILL）
+"##,
         ),
         (
             "u_empty",

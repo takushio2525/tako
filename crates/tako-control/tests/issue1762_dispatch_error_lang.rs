@@ -18375,9 +18375,23 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::UsageNoteUnestimated => 265,
         ReplyNote::UsageNoteIndexLocked => 266,
         ReplyNote::UsageNoteIndexPending { .. } => 267,
+        // #2365 の続き: `tako queue <コマンド>` の進みの行（`queue_wrapper::run` の stderr）
+        ReplyNote::QueueWaitLine(_) => 268,
+        ReplyNote::QueueAheadOf { .. } => 269,
+        ReplyNote::QueueStarted { .. } => 270,
+        ReplyNote::QueueNoCommand => 271,
+        ReplyNote::QueueSpawnFailed { .. } => 272,
+        ReplyNote::QueueRunOffline => 273,
+        ReplyNote::QueueRunUnresponsive(_) => 274,
+        ReplyNote::QueueRunRejected(_) => 275,
+        ReplyNote::QueueCancelledWhileWaiting => 276,
+        ReplyNote::QueueLeftOnSignal => 277,
+        ReplyNote::QueueGaveUpAfter { .. } => 278,
+        ReplyNote::QueueRunLost { .. } => 279,
+        ReplyNote::QueueStoppingCancelled(_) => 280,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 268;
+const REPLY_NOTE_VARIANTS: usize = 281;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -19523,7 +19537,7 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
         ),
         // #2365 の続き: CLI `main.rs` の `tako queue`（`QUEUE_OFFLINE_NOTE` / `queue_unresponsive_note` /
         // `queue_cli` / `print_queue_*` / `queue_priority_text` / `queue_owner_text` / `print_jobserver_section` /
-        // `print_launches_section`）・`queue_wrapper::gave_up_lines` / `human_secs`、`tako usage`（`usage_local` /
+        // `print_launches_section`）・`queue_wrapper::gave_up_lines_in` / `human_secs_in`、`tako usage`（`usage_local` /
         // `usage_amount` / `usage_share_footer` / `usage_text`）と `usage::payload_in` の注記・案内の文。
         // 部品（`mem` / `eta` ほか）は呼び手が同じ言語で組んで渡すので、見本は ASCII（英語の検査に掛からない）
         (
@@ -20324,6 +20338,116 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             ReplyNote::UsageNoteIndexPending { files: 12, mb: 340 },
             "索引はまだ読み途中（残り 12 本・340 MB）。GUI が背景で続ける（CLI は tako usage で追いつく）"
                 .into(),
+        ),
+        // #2365 の続き: `tako queue <コマンド>` の進みの行（`queue_wrapper::waiting_line` / `run_with` /
+        // `run_direct` が直書きしていた文。前置き `tako queue: ` は呼び手）。部品（`start` / `why` / `head`）は
+        // 呼び手が同じ言語で組んで渡すので、見本は ASCII
+        (
+            ReplyNote::QueueWaitLine(Box::new(tako_control::reply_note::QueueWaitLineFields {
+                position: 1,
+                waiting: 3,
+                running: 3,
+                max_jobs: 3,
+                unmanaged: 1,
+                waited_s: 72,
+                start: None,
+                why: "why".into(),
+            })),
+            "待ち 1 番目（待ち 3 件・実行 3/3・tako の外 1・1 分 12 秒）— why".into(),
+        ),
+        (
+            ReplyNote::QueueWaitLine(Box::new(tako_control::reply_note::QueueWaitLineFields {
+                position: 2,
+                waiting: 2,
+                running: 1,
+                max_jobs: 3,
+                unmanaged: 0,
+                waited_s: 5,
+                start: Some("start".into()),
+                why: "why".into(),
+            })),
+            "待ち 2 番目（待ち 2 件・実行 1/3・5 秒・start）— why".into(),
+        ),
+        (
+            ReplyNote::QueueAheadOf {
+                ahead: 2,
+                head: Some("head".into()),
+            },
+            "前に 2 件（先頭: head）".into(),
+        ),
+        (
+            ReplyNote::QueueAheadOf {
+                ahead: 1,
+                head: None,
+            },
+            "前に 1 件".into(),
+        ),
+        (
+            ReplyNote::QueueStarted {
+                waited_s: 72,
+                share: 6,
+            },
+            "開始（待ち 1 分 12 秒・取り分 6）".into(),
+        ),
+        (
+            ReplyNote::QueueStarted {
+                waited_s: 5,
+                share: 0,
+            },
+            "開始（待ち 5 秒）".into(),
+        ),
+        (
+            ReplyNote::QueueNoCommand,
+            "走らせるコマンドが無い（例: tako queue cargo build）".into(),
+        ),
+        (
+            ReplyNote::QueueSpawnFailed {
+                program: "nosuch".into(),
+                error: "No such file or directory (os error 2)".into(),
+            },
+            "nosuch を起動できない: No such file or directory (os error 2)".into(),
+        ),
+        (
+            ReplyNote::QueueRunOffline,
+            "tako が起動していないので、順番待ちせずに走らせる".into(),
+        ),
+        (
+            ReplyNote::QueueRunUnresponsive(30),
+            "tako が 30 秒応答しないので、順番待ちせずに走らせる（GUI が固まっている可能性）".into(),
+        ),
+        (
+            ReplyNote::QueueRunRejected("unknown action".into()),
+            "順番待ちを受けていない（unknown action）ので、そのまま走らせる".into(),
+        ),
+        (
+            ReplyNote::QueueCancelledWhileWaiting,
+            "待っている間に取り消された".into(),
+        ),
+        (ReplyNote::QueueLeftOnSignal, "待ちから外れた（シグナル）".into()),
+        (
+            ReplyNote::QueueGaveUpAfter {
+                waiting: 3,
+                waited_s: 1800,
+            },
+            "3 件待ちのまま 30 分 0 秒 たったので諦める。空いたらもう一度（`tako queue` で状況）".into(),
+        ),
+        (
+            ReplyNote::QueueRunLost {
+                unresponsive: true,
+                grace_s: 60,
+            },
+            "順番待ちの調停役が応答しないまま 60 秒たったので、待たずに走らせる".into(),
+        ),
+        (
+            ReplyNote::QueueRunLost {
+                unresponsive: false,
+                grace_s: 60,
+            },
+            "順番待ちの調停役を見失ったまま 60 秒たったので、待たずに走らせる".into(),
+        ),
+        (
+            ReplyNote::QueueStoppingCancelled(10),
+            "取り消されたので子を止める（SIGTERM → 10 秒で SIGKILL）".into(),
         ),
     ]
 }
@@ -21437,7 +21561,7 @@ const JOBSERVER_PATH: &str = "crates/tako-control/src/jobserver.rs";
 
 #[test]
 fn queueの時間と諦めの説明の日本語は2365より前と一致し英語に日本語が無い() {
-    use tako_control::queue_wrapper::{gave_up_lines, gave_up_lines_in, human_secs, human_secs_in};
+    use tako_control::queue_wrapper::{gave_up_lines_in, human_secs_in};
     for (secs, old) in [
         (0, "0 秒"),
         (59, "59 秒"),
@@ -21450,11 +21574,6 @@ fn queueの時間と諦めの説明の日本語は2365より前と一致し英�
             human_secs_in(secs, Lang::Ja),
             old,
             "{QUEUE_WRAPPER_PATH}: {secs} 秒"
-        );
-        assert_eq!(
-            human_secs(secs),
-            old,
-            "{QUEUE_WRAPPER_PATH}: 日本語の口 {secs} 秒"
         );
         let en = human_secs_in(secs, Lang::En);
         assert!(
@@ -21489,11 +21608,6 @@ fn queueの時間と諦めの説明の日本語は2365より前と一致し英�
             gave_up_lines_in(&resp, Lang::Ja),
             old,
             "{QUEUE_WRAPPER_PATH}: {resp}"
-        );
-        assert_eq!(
-            gave_up_lines(&resp),
-            old,
-            "{QUEUE_WRAPPER_PATH}: 日本語の口 {resp}"
         );
         let en = gave_up_lines_in(&resp, Lang::En);
         assert_eq!(
@@ -21643,7 +21757,16 @@ fn queueとusageの中身の口に日本語の固定文が無い() {
             QUEUE_WRAPPER_SRC,
             "pub fn gave_up_lines_in(",
         ),
+        // `tako queue <コマンド>` の進みの行（stderr の待ち・開始・諦め・素通しの理由）
+        (
+            QUEUE_WRAPPER_PATH,
+            QUEUE_WRAPPER_SRC,
+            "pub fn waiting_line(",
+        ),
+        (QUEUE_WRAPPER_PATH, QUEUE_WRAPPER_SRC, "fn run_with("),
+        (QUEUE_WRAPPER_PATH, QUEUE_WRAPPER_SRC, "fn run_direct("),
         (USAGE_PATH, USAGE_SRC, "pub fn usage_notes("),
+        (USAGE_PATH, USAGE_SRC, "pub fn notes_in("),
     ] {
         let Some(lines) = front_scope_lines(src, Some(head)) else {
             failures.push(format!(
@@ -21657,6 +21780,92 @@ fn queueとusageの中身の口に日本語の固定文が無い() {
                  （文は tako_control::ReplyNote へ）: {text}"
             ));
         }
+    }
+    report_all(failures);
+}
+
+const USAGE_PANEL_SRC: &str = include_str!("../../tako-app/src/usage_panel.rs");
+const USAGE_PANEL_PATH: &str = "crates/tako-app/src/usage_panel.rs";
+const RESOURCES_TEXT_SRC: &str = include_str!("../../tako-app/src/ui_text/resources.rs");
+const RESOURCES_TEXT_PATH: &str = "crates/tako-app/src/ui_text/resources.rs";
+
+/// `tako queue <コマンド>` の進みの行・右パネルの usage ビュー・resources ビューの待つ理由は表示言語で組む
+/// （#2365 の続き）。言語を `Lang::Ja` に固定して組む（= 旧い日本語の口の形）と英語表示でもその文だけ
+/// 日本語で出るので、行を名指して落とす。usage ビューの本体に日本語の固定文も置かない（画面の文は
+/// `ui_text` の `tr!`）。resources の待つ理由の英語は CLI と同じ `ReplyNote::QueueWaitReason` から引く
+/// （画面だけの英語の表を書き戻すと CLI と文がずれる = 字面を持つ行を名指して落とす）
+#[test]
+fn queueの進みの行とusageビューとresourcesの待つ理由は表示言語で組む() {
+    let mut failures = Vec::new();
+    let fixed_ja = |lines: &[(usize, &str)]| -> Vec<(usize, String)> {
+        lines
+            .iter()
+            .filter(|(_, raw)| {
+                let code = strip_line_comment(raw);
+                !code.trim_start().starts_with("//") && code.contains("Lang::Ja")
+            })
+            .map(|(n, raw)| (*n, raw.trim().to_string()))
+            .collect()
+    };
+    for head in [
+        "pub fn waiting_line(",
+        "fn run_with(",
+        "fn run_direct(",
+        "pub fn gave_up_lines_in(",
+    ] {
+        let Some(lines) = front_scope_lines(QUEUE_WRAPPER_SRC, Some(head)) else {
+            failures.push(format!(
+                "{QUEUE_WRAPPER_PATH}: 走査の範囲 `{head}` が見つからない（改名ならこの表を直す）"
+            ));
+            continue;
+        };
+        for (line, text) in fixed_ja(&lines) {
+            failures.push(format!(
+                "{QUEUE_WRAPPER_PATH}:{line}: `{head}` が言語を日本語に固定して組む = `tako queue <コマンド>` の\
+                 英語表示にもその文だけ日本語で出る（`opts.lang` を渡す）: {text}"
+            ));
+        }
+    }
+    let panel = front_scope_lines(USAGE_PANEL_SRC, None).expect("usage_panel.rs の本体を引ける");
+    for (line, text) in fixed_ja(&panel) {
+        failures.push(format!(
+            "{USAGE_PANEL_PATH}:{line}: usage ビューが言語を日本語に固定して組む = 英語表示でも「万」「直近 7 日」\
+             ほかが出る（`tako_core::i18n::lang()` を渡す）: {text}"
+        ));
+    }
+    for (line, text) in front_japanese(&panel) {
+        failures.push(format!(
+            "{USAGE_PANEL_PATH}:{line}: usage ビューの本体に日本語の固定文がある = 英語表示にもそのまま出る \
+             （画面の文は ui_text の tr! へ）: {text}"
+        ));
+    }
+    match front_scope_lines(RESOURCES_TEXT_SRC, Some("pub fn wait_reason(")) {
+        Some(lines) => {
+            if !lines
+                .iter()
+                .any(|(_, l)| l.contains("ReplyNote::QueueWaitReason"))
+            {
+                failures.push(format!(
+                    "{RESOURCES_TEXT_PATH}: `wait_reason` が CLI と同じ `ReplyNote::QueueWaitReason` を通らない"
+                ));
+            }
+            for (line, raw) in &lines {
+                let code = strip_line_comment(raw);
+                if code.trim_start().starts_with("//") {
+                    continue;
+                }
+                if let Some(lit) = line_literals(code).into_iter().next() {
+                    failures.push(format!(
+                        "{RESOURCES_TEXT_PATH}:{line}: `wait_reason` が自前の文（\"{lit}\"）を持つ = CLI の \
+                         `ReplyNote::QueueWaitReason` と文がずれる: {}",
+                        raw.trim()
+                    ));
+                }
+            }
+        }
+        None => failures.push(format!(
+            "{RESOURCES_TEXT_PATH}: `pub fn wait_reason(` が見つからない（改名ならこの番犬を直す）"
+        )),
     }
     report_all(failures);
 }
