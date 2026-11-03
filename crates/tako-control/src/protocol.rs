@@ -187,11 +187,13 @@ pub enum PanelViewWire {
     Search,
     /// 利用制限の使い道（#2203。ログイン → プロジェクト → Issue → 会話と掘る。数値は `tako usage` と同じ）
     Usage,
+    /// PC の負荷（#1995。機の状態・順番待ちの実行中と待ち・常駐の内訳。数値は `tako queue` と同じ）
+    Resources,
 }
 
 impl PanelViewWire {
     /// CLI / MCP が案内する正式値（GUI のタブ表示名と 1:1。#553）
-    pub const VALUES: [&'static str; 8] = [
+    pub const VALUES: [&'static str; 9] = [
         "fleet",
         "orch",
         "git",
@@ -200,6 +202,7 @@ impl PanelViewWire {
         "references",
         "search",
         "usage",
+        "resources",
     ];
     /// 後方互換のみで受理する旧称と現行値の対応（#553）
     pub const LEGACY_VALUES: [(&'static str, &'static str); 1] = [("tmux", "fleet")];
@@ -214,6 +217,7 @@ impl PanelViewWire {
             PanelViewWire::References => "references",
             PanelViewWire::Search => "search",
             PanelViewWire::Usage => "usage",
+            PanelViewWire::Resources => "resources",
         }
     }
 
@@ -228,6 +232,7 @@ impl PanelViewWire {
             "references" => Some(PanelViewWire::References),
             "search" => Some(PanelViewWire::Search),
             "usage" => Some(PanelViewWire::Usage),
+            "resources" => Some(PanelViewWire::Resources),
             _ => None,
         }
     }
@@ -249,6 +254,7 @@ impl PanelViewWire {
             PanelViewWire::References => "参照・呼び出し階層・型階層の結果（一覧 / ツリー）",
             PanelViewWire::Search => "ワークスペース横断検索の検索欄と結果の一覧",
             PanelViewWire::Usage => "利用制限の使い道（プロジェクト → Issue → 会話）",
+            PanelViewWire::Resources => "PC の負荷（機・順番待ちの実行中と待ち・常駐の内訳）",
         }
     }
 
@@ -3563,6 +3569,7 @@ mod tests {
         assert_eq!(PanelViewWire::References.as_str(), "references");
         assert_eq!(PanelViewWire::Search.as_str(), "search");
         assert_eq!(PanelViewWire::Usage.as_str(), "usage");
+        assert_eq!(PanelViewWire::Resources.as_str(), "resources");
         // 案内する正式値に旧称は混ざらない（GUI に出ない語を勧めない）
         assert_eq!(
             PanelViewWire::VALUES,
@@ -3574,7 +3581,8 @@ mod tests {
                 "diagnostics",
                 "references",
                 "search",
-                "usage"
+                "usage",
+                "resources"
             ]
         );
         assert!(!PanelViewWire::VALUES.contains(&"tmux"));
@@ -3602,6 +3610,12 @@ mod tests {
         assert_eq!(PanelViewWire::parse("search"), Some(PanelViewWire::Search));
         // #2203: 利用制限の使い道のビュー
         assert_eq!(PanelViewWire::parse("usage"), Some(PanelViewWire::Usage));
+        // #1995: PC の負荷のビュー
+        assert_eq!(
+            PanelViewWire::parse("resources"),
+            Some(PanelViewWire::Resources)
+        );
+        assert_eq!(PanelViewWire::parse("resource"), None);
         assert_eq!(PanelViewWire::parse("task"), None);
         assert_eq!(PanelViewWire::parse("fleets"), None);
         assert_eq!(PanelViewWire::parse(""), None);
@@ -3628,7 +3642,7 @@ mod tests {
         let hint = PanelViewWire::values_hint();
         assert_eq!(
             hint,
-            "fleet | orch | git | tasks | diagnostics | references | search | usage。tmux は fleet の旧称"
+            "fleet | orch | git | tasks | diagnostics | references | search | usage | resources。tmux は fleet の旧称"
         );
     }
 
@@ -3657,6 +3671,7 @@ mod tests {
                 "references",
                 "search",
                 "usage",
+                "resources",
                 "tmux"
             ]
         );

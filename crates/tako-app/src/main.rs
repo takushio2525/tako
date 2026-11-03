@@ -58,6 +58,7 @@ mod preview_watch;
 mod references_panel;
 mod remote_panel;
 mod resource_panes;
+mod resources_panel;
 mod right_panel;
 mod run_menu_ui;
 mod search_panel;
@@ -540,10 +541,10 @@ impl ScrollCtl {
 // dispatch 経路で規則を食い違わせないため、tako-app 側に定数を持たない
 
 /// 右サイドバー（情報パネル）の既定幅・最小幅（px。ドラッグで可変）。最小幅は条件つきのタブが
-/// 4 本とも出た 8 本 + 3 桁のバッジがアイコンだけの段で収まる幅（#1694 で 220 → 240、
-/// #2203 の usage タブで 240 → 264。要 246.5px + 両側の 16px）
+/// 5 本とも出た 9 本 + 3 桁のバッジがアイコンだけの段で収まる幅（#1694 で 220 → 240、
+/// #2203 の usage タブで 240 → 264、#1995 の resources タブで 264 → 288。要 270.5px + 両側の 16px）
 const PANEL_DEFAULT_WIDTH: f32 = 320.0;
-const PANEL_MIN_WIDTH: f32 = 264.0;
+const PANEL_MIN_WIDTH: f32 = 288.0;
 
 /// ペイン上部タイトルバーの高さ（px。デザインスペック: 30px）
 const PANE_TITLE_BAR: f32 = 32.0;
@@ -619,6 +620,8 @@ enum PanelView {
     Search,
     /// 利用制限の使い道（#2203）。タブはこのビューを選んでいるか、このセッションで開いたときだけ出す
     Usage,
+    /// PC の負荷（#1995）。タブはこのビューを選んでいるか、このセッションで開いたときだけ出す
+    Resources,
 }
 
 /// プレビューヘッダから開くナビゲーションドロップダウン（Issue #232）。
@@ -2806,6 +2809,8 @@ struct TakoApp {
     user_tasks: crate::tasks_panel::TasksPanel,
     /// #2203: 右パネルの usage ビュー（掘り下げの段・届いた答え。画面の一時状態）
     usage: crate::usage_panel::UsagePanel,
+    /// #1995: 右パネルの resources ビューとステータスバーの区画（届いた答え。画面の一時状態）
+    resources: crate::resources_panel::ResourcesPanel,
     /// ブランチ操作の事前提示カード（#496。承諾するまで実行しない）
     git_branch_confirm: Option<GitBranchConfirm>,
     /// 新規ブランチ名の入力欄（#496。`Some` の間はキー入力をここへ吸う）
@@ -5403,6 +5408,7 @@ impl TakoApp {
             git_commit_input_focused: false,
             user_tasks: crate::tasks_panel::TasksPanel::default(),
             usage: crate::usage_panel::UsagePanel::default(),
+            resources: crate::resources_panel::ResourcesPanel::default(),
             git_branch_confirm: None,
             git_branch_input: None,
             git_agent_menu_open: false,
@@ -7192,6 +7198,12 @@ impl TakoApp {
                     }
                     // #2203: usage ビューの読み直し（見ている間だけ。読みは background）
                     app.tick_usage_panel(wcx);
+                    {
+                        // #1995: resources ビュー（見ている間は CLI と同じ status を dispatch_off_ui）と
+                        // ステータスバーの区画（覚えだけを background で読む）。UI スレッドは投げるだけ
+                        let _s = tako_control::diag::perf_span("periodic_prep:resources");
+                        app.tick_resources(wcx);
+                    }
                     let git_selected = app.git_selected_commit.clone();
                     // サイドバー表示中はブランチ + 変更サマリの軽量 git 取得（#217）
                     let sidebar_git_cwd = if app.filetree.visible {
@@ -8162,6 +8174,8 @@ impl TakoApp {
         }
         // #2203: dispatch の内側（`tako panel --view usage` / 同期の `show`）で頼まれた usage の読み直し
         self.drain_usage_pending(cx);
+        // #1995: `tako panel --view resources` で開いた resources ビューの読み
+        self.drain_resources_pending(cx);
         // #1510: dispatch の内側（`tako welcome next|auto` / 確かめの着地）で頼まれた導線の続き
         self.drain_welcome_pending(cx);
         // セッション起動後の遅延書き込み（orchestrator spawn の claude 起動コマンド等）
@@ -14729,6 +14743,7 @@ impl TakoApp {
                 "panel-git" => self.toggle_panel_view(PanelView::Git, cx),
                 "panel-tasks" => self.toggle_panel_view(PanelView::Tasks, cx),
                 "panel-usage" => self.toggle_panel_view(PanelView::Usage, cx),
+                "panel-resources" => self.toggle_panel_view(PanelView::Resources, cx),
                 "split-right" => self.split(SplitDirection::Right, cx),
                 "split-down" => self.split(SplitDirection::Down, cx),
                 // #552 案 4: いまのタブ名を固定する（ピン印と同じ操作）
@@ -27556,6 +27571,7 @@ impl UiStateHost for TakoApp {
             PanelView::References => tako_control::protocol::PanelViewWire::References,
             PanelView::Search => tako_control::protocol::PanelViewWire::Search,
             PanelView::Usage => tako_control::protocol::PanelViewWire::Usage,
+            PanelView::Resources => tako_control::protocol::PanelViewWire::Resources,
         };
         (self.panel_visible, self.panel_width, view)
     }
@@ -27573,6 +27589,12 @@ impl UiStateHost for TakoApp {
     fn usage_view_state(&self) -> Option<serde_json::Value> {
         (self.panel_view == PanelView::Usage || !self.usage.levels.is_empty())
             .then(|| self.usage.state_json())
+    }
+
+    /// #1995: resources ビューが描いている答え（まだ開いていなければ None）
+    fn resources_view_state(&self) -> Option<serde_json::Value> {
+        self.resources_tab_visible()
+            .then(|| self.resources.state_json())
     }
 
     /// #1694: 横断検索の結果の置き場（右パネルの search ビューが読むのと同じ 1 つ）
@@ -27641,6 +27663,7 @@ impl UiStateHost for TakoApp {
                 tako_control::protocol::PanelViewWire::References => PanelView::References,
                 tako_control::protocol::PanelViewWire::Search => PanelView::Search,
                 tako_control::protocol::PanelViewWire::Usage => PanelView::Usage,
+                tako_control::protocol::PanelViewWire::Resources => PanelView::Resources,
             };
         }
         // #503: パネルが非表示になったらテキスト入力フラグをクリア
@@ -27654,6 +27677,11 @@ impl UiStateHost for TakoApp {
         // #2203: usage を開いたら読み直す（タブ・パレットと同じ。読みは `after_dispatch` が background へ）
         if self.panel_visible && self.panel_view == PanelView::Usage && view.is_some() {
             self.usage.pending = true;
+        }
+        // #1995: resources も同じ（読みは `after_dispatch` の `drain_resources_pending` が background へ）
+        if self.panel_visible && self.panel_view == PanelView::Resources && view.is_some() {
+            self.resources.opened = true;
+            self.resources.pending = true;
         }
         // #2052: tasks を開いたら一覧を引き直す（パレット・タブのクリックと同じ）。background の
         // ジョブには Context が要るので、dispatch の後処理（`after_dispatch`）が消化する
@@ -30932,6 +30960,8 @@ const PALETTE_COMMANDS: &[&str] = &[
     "panel-tasks",
     // #2203: 利用制限の使い道
     "panel-usage",
+    // #1995: PC の負荷（機・実行中・待ち・常駐）
+    "panel-resources",
     "split-right",
     "split-down",
     "pin-tab-title",
@@ -31760,6 +31790,10 @@ impl Render for TakoApp {
             }))
             .on_action(cx.listener(|this, _: &ShowUsagePanel, _, cx| {
                 this.toggle_panel_view(PanelView::Usage, cx)
+            }))
+            // #1995: パレットの panel-resources と同じ実体
+            .on_action(cx.listener(|this, _: &ShowResourcesPanel, _, cx| {
+                this.toggle_panel_view(PanelView::Resources, cx)
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 // blur（外部 a11y 等）からの自動復元（#332）: focus が無いと
@@ -32599,6 +32633,8 @@ fn view_menu() -> gpui::Menu {
             // #2341: tasks（#1450）と usage（#2203）はパレットにだけあった
             MenuItem::action(m::panel_tasks(), ShowTasksPanel),
             MenuItem::action(m::panel_usage(), ShowUsagePanel),
+            // #1995: PC の負荷（ステータスバーのメモリの区画と同じ画面）
+            MenuItem::action(m::panel_resources(), ShowResourcesPanel),
         ])),
         MenuItem::separator(),
         MenuItem::action(m::zoom_in(), ZoomIn),
@@ -104018,6 +104054,7 @@ mod app_menu_tests {
         ("panel-git", "panel-fleet と同じ"),
         ("panel-tasks", "panel-fleet と同じ"),
         ("panel-usage", "panel-fleet と同じ"),
+        ("panel-resources", "panel-fleet と同じ"),
         (
             "pin-tab-title",
             "メニューに項目が無い（タブのピン印と同じ操作）",
@@ -104133,6 +104170,11 @@ mod app_menu_tests {
                 ),
             ),
             ("usage", Item("tako::ShowUsagePanel"), Item("panel-usage")),
+            (
+                "resources",
+                Item("tako::ShowResourcesPanel"),
+                Item("panel-resources"),
+            ),
         ]
     };
 

@@ -163,6 +163,8 @@ static EMBEDDED_ASSETS: &[(&str, &[u8])] = &[
     ui_asset!("sun"),
     ui_asset!("tasks"),
     ui_asset!("trend"),
+    // #1995: 右パネル resources タブ
+    ui_asset!("gauge"),
     ui_asset!("unshelve"),
     ui_asset!("warning"),
     // GUI ライク表示モードのトグル（#694。現在モードのアイコンを出す）
@@ -235,6 +237,8 @@ pub mod ui_icon {
     /// 右パネル tasks タブ（#1450 B2。チェックリストのパス。絵文字は使わない）
     pub const TASKS: &str = "icons/ui/tasks.svg";
     pub const TREND: &str = "icons/ui/trend.svg";
+    /// 右パネル resources タブ（#1995。メーターの弧と針 = PC の負荷。絵文字は使わない）
+    pub const GAUGE: &str = "icons/ui/gauge.svg";
     pub const UNSHELVE: &str = "icons/ui/unshelve.svg";
     pub const WARNING: &str = "icons/ui/warning.svg";
     /// GUI ライク表示モード中の印（#694。吹き出し = チャット）

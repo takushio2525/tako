@@ -689,6 +689,9 @@ impl TakoApp {
                 }
                 row
             }))
+            // #1995: PC の負荷の区画（メモリの使用バー = 色はメモリ圧 + 実行中・待ちの件数。押すと resources
+            // ビュー）。描くのは背景で読んだ答えだけ（走査・子プロセス・ファイルの読みは UI スレッドでしない）
+            .children(self.render_resources_segment(&theme, cx))
             // ctx メーター（カンプ: タブ名 + 70/90% 目盛り線つきバー）。#1962: mod がバーを描いていれば出さない
             .children((!claude_yields).then(|| {
                 div()
@@ -1387,6 +1390,12 @@ impl TakoApp {
             if view == PanelView::Usage {
                 self.usage.pending = true;
                 self.drain_usage_pending(cx);
+            }
+            // #1995: resources も開いた瞬間に読む（CLI と同じ status を dispatch_off_ui。読みは background）
+            if view == PanelView::Resources {
+                self.resources.opened = true;
+                self.resources.pending = true;
+                self.drain_resources_pending(cx);
             }
             // #2052: tasks は開いた瞬間に一覧を出す（タブのクリックと同じ。2 秒ループを待たない。
             // 読みは background）。A/B の `TAKO_2052_LEGACY=1` は修正前と同じ引き直さない形

@@ -1253,6 +1253,7 @@ tako panel --view diagnostics    # diagnostics = 言語サーバの診断（LSP 
 tako panel --view references     # references = 参照・呼び出し階層・型階層の結果（ふだんは結果があるときだけタブが出る）
 tako panel --view search         # search = ワークスペース横断検索（⇧⌘F と同じ。ふだんは結果があるときだけタブが出る）
 tako panel --view usage          # usage = 利用制限の使い道（ステータスバーの 5h / 7d と同じ。ふだんは開いたときだけタブが出る）
+tako panel --view resources      # resources = PC の負荷（tako queue と同じ数値。ステータスバーのメモリの区画と同じ。ふだんは開いたときだけタブが出る）
 tako panel --hide
 tako panel --filetree on         # 左のファイルツリー
 tako panel --width 360

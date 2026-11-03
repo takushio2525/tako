@@ -929,6 +929,14 @@ pub fn pane_jobs(pane: u64) -> Vec<Value> {
         .collect()
 }
 
+/// 行の「誰」（タブ・ペイン名・役割・ペインの優先度の既定。#1995）。ペインの外の処理は何も足さない。
+/// ロックの順は調停役 → ペインの一覧（`Job::base_priority` と同じ向き）
+fn owner_fields(job: &Job) -> Value {
+    job.wire
+        .pane
+        .map_or_else(|| json!({}), crate::resources::pane_owner_fields)
+}
+
 /// 待ちの並び（受付番号）
 fn waiting_order(a: &Arbiter) -> Vec<u64> {
     q::order_waiting(&waiting_jobs(a))
@@ -1304,6 +1312,7 @@ pub fn status_section() -> Value {
                 "eta": eta_json(&j.eta(wall)),
             });
             merge(&mut v, j.priority_json(wall));
+            merge(&mut v, owner_fields(j));
             v
         })
         .collect();
@@ -1332,6 +1341,7 @@ pub fn status_section() -> Value {
                 "start_text": start.map(eta::start_text),
             });
             merge(&mut v, j.priority_json(wall));
+            merge(&mut v, owner_fields(j));
             v
         })
         .collect();
