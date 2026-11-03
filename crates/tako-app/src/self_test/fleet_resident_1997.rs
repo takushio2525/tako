@@ -128,7 +128,9 @@ async fn mcp_call(cx: &mut AsyncApp, cli: &str, tool: &str, args: Value, step: &
         let text = msg["result"]["content"][0]["text"].as_str().unwrap_or("");
         return serde_json::from_str(text).unwrap_or_else(|_| json!({ "text": text }));
     }
-    fail(&format!("visual-test {LABEL} {step}: MCP {tool} の応答が無い"))
+    fail(&format!(
+        "visual-test {LABEL} {step}: MCP {tool} の応答が無い"
+    ))
 }
 
 fn set_theme(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, mode: &str) {
@@ -269,18 +271,24 @@ pub(super) async fn fleet_resident_1997_visual(
     });
     let _ = run_cli(cx, &cli, &["queue", "--json"]).await;
     let want = workers.clone();
-    if !wait_for_app_state(window, cx, &format!("{LABEL} ② 走査に載る"), WAIT, move |app| {
-        want.iter().all(|p| {
-            let id = PaneId::from_raw(*p);
-            let role = app
-                .workspace
-                .tabs()
-                .iter()
-                .find_map(|t| t.tree().get(id))
-                .and_then(|p| p.role().map(str::to_string));
-            app.worker_resident_mb(id, role.as_deref()).is_some()
-        })
-    })
+    if !wait_for_app_state(
+        window,
+        cx,
+        &format!("{LABEL} ② 走査に載る"),
+        WAIT,
+        move |app| {
+            want.iter().all(|p| {
+                let id = PaneId::from_raw(*p);
+                let role = app
+                    .workspace
+                    .tabs()
+                    .iter()
+                    .find_map(|t| t.tree().get(id))
+                    .and_then(|p| p.role().map(str::to_string));
+                app.worker_resident_mb(id, role.as_deref()).is_some()
+            })
+        },
+    )
     .await
     {
         fail(&format!(
@@ -321,9 +329,7 @@ pub(super) async fn fleet_resident_1997_visual(
             matched = Some((a, b, c, d));
             break;
         }
-        cx.background_executor()
-            .timer(Duration::from_secs(3))
-            .await;
+        cx.background_executor().timer(Duration::from_secs(3)).await;
     }
     let Some((a, b, c, d)) = matched else {
         fail(&format!(

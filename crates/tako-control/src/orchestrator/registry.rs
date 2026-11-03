@@ -3425,7 +3425,10 @@ mod tests {
             w[0]["resident"],
             json!({ "memory_mb": 812, "agent_mb": 700, "heavy_mb": 0 })
         );
-        assert!(w[1]["resident"].is_null(), "死んだ worker に同じ番号の値を付けた");
+        assert!(
+            w[1]["resident"].is_null(),
+            "死んだ worker に同じ番号の値を付けた"
+        );
         assert!(w[2]["resident"].is_null(), "走査に無いペイン");
         assert_eq!(payload["resident_age_s"], 0);
         let mut none = json!({ "workers": [{ "pane": 5, "pane_alive": true }] });

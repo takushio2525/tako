@@ -1761,7 +1761,10 @@ mod tests {
         let r = poll(&build(pid(1)), Instant::now()).unwrap();
         assert_eq!(r["state"], "waiting", "{r}");
         assert_eq!(
-            lock().last.reason_of(u64::from(pid(1))).map(WaitReason::code),
+            lock()
+                .last
+                .reason_of(u64::from(pid(1)))
+                .map(WaitReason::code),
             Some("max_jobs")
         );
         let h = heavy_headroom().expect("調停役");

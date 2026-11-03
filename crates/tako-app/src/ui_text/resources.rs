@@ -82,7 +82,10 @@ pub fn memory_label() -> &'static str {
 }
 /// fleet ビューの worker の行の常駐メモリ（子孫込み。#1997。`workers` の応答の `resident.memory_mb`）
 pub fn worker_resident(mb: u64) -> String {
-    tr!(format!("常駐 {}", size(mb)), format!("{} resident", size(mb)))
+    tr!(
+        format!("常駐 {}", size(mb)),
+        format!("{} resident", size(mb))
+    )
 }
 pub fn memory_used(used_mb: u64, total_mb: u64) -> String {
     format!("{} / {}", size(used_mb), size(total_mb))

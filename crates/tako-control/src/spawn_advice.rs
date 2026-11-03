@@ -129,9 +129,8 @@ pub fn build(
 pub fn for_spawn(agent: &str, launch_waiting: bool, lang: Lang) -> (Value, Value) {
     let gate = launch_gate::headroom(agent);
     let heavy = crate::queue::heavy_headroom();
-    let agents = crate::resources::pane_resident(None).map(|(at, panes)| {
-        AgentsResident::from_panes(panes.values(), at.elapsed().as_secs())
-    });
+    let agents = crate::resources::pane_resident(None)
+        .map(|(at, panes)| AgentsResident::from_panes(panes.values(), at.elapsed().as_secs()));
     build(&gate, heavy.as_ref(), agents, launch_waiting, lang)
 }
 
@@ -190,7 +189,10 @@ mod tests {
         assert_eq!(m["pressure"], "normal");
         assert_eq!(m["available_mb"], 8 * 1024);
         assert_eq!(m["source"], "measured");
-        assert_eq!(m["agents"], json!({ "count": 3, "memory_mb": 1800, "age_s": 4 }));
+        assert_eq!(
+            m["agents"],
+            json!({ "count": 3, "memory_mb": 1800, "age_s": 4 })
+        );
         assert_eq!(m["queue"], json!({ "running": 1, "waiting": 0 }));
         assert_eq!(
             m["launches"],

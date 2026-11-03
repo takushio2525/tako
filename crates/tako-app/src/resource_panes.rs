@@ -54,7 +54,8 @@ impl TakoApp {
     /// 2 秒 tick（`periodic_prep`）から呼ぶ（#1997）。走査の覚えのペインごとの常駐メモリを写す
     /// （新しい走査が来たときだけ。**採らない**）。写した値が変わったら true（fleet を見ていれば描き直す）
     pub(crate) fn refresh_pane_resident(&mut self) -> bool {
-        let Some((at, panes)) = tako_control::resources::pane_resident(self.pane_resident_at) else {
+        let Some((at, panes)) = tako_control::resources::pane_resident(self.pane_resident_at)
+        else {
             return false;
         };
         self.pane_resident_at = Some(at);

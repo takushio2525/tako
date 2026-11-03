@@ -222,9 +222,9 @@ fn reason_en(reason: &WaitReason, launch: bool) -> String {
         }
         WaitReason::Ahead if launch => "behind launches already in line".into(),
         WaitReason::Ahead => "behind jobs already in line".into(),
-        WaitReason::OvertakeLimit { max } => format!(
-            "a job waiting for the same target dir reached the overtake limit ({max})"
-        ),
+        WaitReason::OvertakeLimit { max } => {
+            format!("a job waiting for the same target dir reached the overtake limit ({max})")
+        }
     }
 }
 
@@ -293,7 +293,11 @@ mod tests {
             &starting,
             AGENT_ESTIMATE_MB,
         );
-        assert_eq!(short.as_ref().map(WaitReason::code), Some("memory"), "{short:?}");
+        assert_eq!(
+            short.as_ref().map(WaitReason::code),
+            Some("memory"),
+            "{short:?}"
+        );
         for available in (edge - 3 * AGENT_ESTIMATE_MB..edge + 2 * AGENT_ESTIMATE_MB).step_by(7) {
             let m = machine(available, Pressure::Normal);
             let real = admit_launches(m, limits, &starting, &[agent_wait(8)]);
@@ -328,7 +332,10 @@ mod tests {
             Some("swap")
         );
         // 機の値が採れない（Windows は #2000 まで）: 起動待ちも時差だけなので助言も出さない
-        assert_eq!(next_launch(None, limits, &[just_started(1)], AGENT_ESTIMATE_MB), None);
+        assert_eq!(
+            next_launch(None, limits, &[just_started(1)], AGENT_ESTIMATE_MB),
+            None
+        );
     }
 
     fn heavy(id: u64) -> RunningJob {
@@ -365,7 +372,10 @@ mod tests {
         let free = machine(30 * GIB_MB, Pressure::Normal);
         // 36 GB の既定の同時数は 3。2 件なら入る・3 件なら同時数の上限
         let two = [heavy(1), heavy(2)];
-        assert_eq!(probe(&heavy_input(free, &two, &[], false), BUILD_ESTIMATE_MB), None);
+        assert_eq!(
+            probe(&heavy_input(free, &two, &[], false), BUILD_ESTIMATE_MB),
+            None
+        );
         let three = [heavy(1), heavy(2), heavy(3)];
         let full = probe(&heavy_input(free, &three, &[], false), BUILD_ESTIMATE_MB);
         assert_eq!(full.as_ref().map(WaitReason::code), Some("max_jobs"));
@@ -375,7 +385,10 @@ mod tests {
             estimate_mb: 7 * GIB_MB,
             ..agent_wait(9)
         }];
-        let behind = probe(&heavy_input(tight, &two, &waiting, false), BUILD_ESTIMATE_MB);
+        let behind = probe(
+            &heavy_input(tight, &two, &waiting, false),
+            BUILD_ESTIMATE_MB,
+        );
         assert_eq!(behind.as_ref().map(WaitReason::code), Some("memory"));
         // 立ち上げ直後は理由が Regather（一時の状態）= 助言にしない
         let regather = probe(&heavy_input(free, &[], &[], true), BUILD_ESTIMATE_MB);
@@ -394,7 +407,10 @@ mod tests {
             estimate_mb: AGENT_ESTIMATE_MB,
         };
         let a = Advice::next_launch(Some(memory.clone())).unwrap();
-        assert_eq!((a.code(), a.reason().code()), ("next_launch_waits", "memory"));
+        assert_eq!(
+            (a.code(), a.reason().code()),
+            ("next_launch_waits", "memory")
+        );
         let ja = a.text_in(Lang::Ja);
         assert!(ja.contains(&launch_reason_text(&memory)), "{ja}");
         let en = a.text_in(Lang::En);
