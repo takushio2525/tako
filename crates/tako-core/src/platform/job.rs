@@ -45,18 +45,23 @@
 //! 子孫 = 残す）。コンソールのホスト（[`is_console_host`]）は GUI と数えない。判断は [`split_for_release`] の 1 実装。止めたあと `KILL_ON_JOB_CLOSE` を外してから
 //! ハンドルを閉じる（外さないと閉じた瞬間に残したものも止まる）。
 //!
-//! ## 起動直後の窓
+//! ## 起動直後の窓（#2697）
 //!
-//! 子は動き出してから Job へ入る（`CreateProcess` の時点では入れられない）:
+//! 動いている子を Job へ入れても、入れ終える前にその子が起こした孫は Job の外に生まれる（Windows は
+//! 割り当ての前に生まれた子を Job へ入れない）。cmd.exe は起きてから 10〜15ms ほどで子を起こす
+//! （Windows CI の実測で、Job へ入れ終えた +11 / +14ms 後）ので、起こした直後に呼び手のスレッドが
+//! そのくらい止まるだけで孫が外に残った（`tako queue` の取り消しの CI の間欠 = #2697）。
 //!
+//! - **std の `Command` で起こす子**（打ち切り・取り消しの子・言語サーバ・`tako setup`）は
+//!   [`Job::spawn_contained`] / [`KillScope::spawn`] の 1 実装で起こす: `CREATE_SUSPENDED` で起こし、
+//!   Job へ入れてから主スレッドを動かす。止まっている子は孫を起こせないので窓が無い。
+//!   A/B は `TAKO_2697_LEGACY=1`（起こしてから入れる = 窓あり）
 //! - ペインの ConPTY は alacritty_terminal が `CreateProcessW` を呼び、属性リストを中で 1 枠
 //!   （疑似コンソール）だけ作るので、`PROC_THREAD_ATTRIBUTE_JOB_LIST` を足す口が無い。
-//!   作成フラグも固定で `CREATE_SUSPENDED` を渡せない
-//! - std の `Command` に属性を足す `CommandExt::raw_attribute` は unstable（toolchain 1.95 で確認）
-//!
-//! 入れるのは起こした直後（同じスレッドで次に呼ぶ）なので、窓はシェル / cmd.exe が初期化を終えて
-//! 子を起こすまでの時間より十分短い。Windows CI の実プロセスのテストは、孫が Job に入っていること
-//! （[`Job::contains`]）を確かめてから止める。
+//!   作成フラグも固定で `CREATE_SUSPENDED` を渡せないので、起こした直後に入れる（窓は残る。
+//!   シェルは起動に数百 ms かかり、子を起こすのは rc か利用者の入力の後）
+//! - std の `Command` に属性を足す `CommandExt::raw_attribute`（`JOB_LIST` の口）は unstable
+//!   （toolchain 1.95 で確認）なので一時停止で代える
 //!
 //! ## 器（psmux）は入れない
 //!
@@ -65,8 +70,8 @@
 //! 器ごと消える（再起動をまたいで残す約束が壊れる）。器のクライアントかどうかは呼び手が判断する
 //! （`TerminalSession::spawn_in` が `tmux_backend::is_container_client` で見る）。
 //!
-//! 打ち切り・取り消しの子（[`KillScope`]）も同じ理由で器の CLI は入れない（probe の
-//! `wait_with_timeout` が実行ファイル名で見る。器の 1 回の問い合わせがサーバーを起こすことがある）。
+//! 打ち切り・取り消しの子（[`KillScope`]）も同じ理由で器の CLI は入れない（probe が実行ファイル名で
+//! 見て [`KillScope::spawn`] の `admit` で断る。器の 1 回の問い合わせがサーバーを起こすことがある）。
 //!
 //! unix は何もしない（[`Job::contain`] が `None`）: ペインは PTY の HUP、言語サーバは stdin の EOF と
 //! kill に任せる（従来どおり）。A/B は `TAKO_2454_LEGACY=1`（Job を作らない = #2454 前）と
@@ -88,9 +93,14 @@ pub const ENV_KILL_GUI: &str = "TAKO_2454_KILL_GUI";
 /// 失敗させる = 割り当てに失敗した回（素の kill へ落ちる）を作る。製品のバイナリでは無視する
 pub const ENV_INJECT: &str = "TAKO_2454_INJECT";
 
-/// 注入（`TAKO_2697_INJECT_CONTAIN_DELAY_MS=<ms>`。#2697 の切り分け）。**検証プロセスでだけ**、
-/// [`KillScope::contain`] が子を入れ物へ入れる前に `<ms>` 待つ = 「起動直後の窓」（モジュール文書）を
-/// 広げ、その間に子が起こした孫を入れ物の外に生ませる。製品のバイナリでは無視する
+/// A/B の旧経路（`TAKO_2697_LEGACY=1`）。std の `Command` の子も動かしてから Job へ入れる
+/// = 「起動直後の窓」（モジュール文書）が開く #2697 の前の形
+pub const ENV_LEGACY_2697: &str = "TAKO_2697_LEGACY";
+
+/// 注入（`TAKO_2697_INJECT_CONTAIN_DELAY_MS=<ms>`。#2697）。**検証プロセスでだけ**、起こした子を
+/// Job へ入れる前に `<ms>` 待つ = 「起動直後の窓」（モジュール文書）を広げる。一時停止で起こす経路
+/// （既定）では子が止まっているので孫は Job の外に生まれず、`TAKO_2697_LEGACY=1` では外に生まれる。
+/// 製品のバイナリでは無視する
 pub const ENV_INJECT_2697_CONTAIN_DELAY: &str = "TAKO_2697_INJECT_CONTAIN_DELAY_MS";
 
 /// 診断（`TAKO_2697_DIAG=1`。#2697 の切り分け）。**検証プロセスでだけ**、[`KillScope::stop`] が
@@ -105,6 +115,22 @@ const RELEASE_ROUNDS: usize = 3;
 
 fn legacy() -> bool {
     std::env::var(ENV_LEGACY).is_ok_and(|v| v == "1")
+}
+
+fn legacy_2697() -> bool {
+    std::env::var(ENV_LEGACY_2697).is_ok_and(|v| v == "1")
+}
+
+/// 子をどのコンソールで起こすか（[`Job::spawn_contained`] が付け直す Windows の作成フラグ）。
+///
+/// std の `CommandExt::creation_flags` は上書きで読み出す口も無いので、一時停止のフラグと一緒に
+/// 付け直す。呼び手が [`crate::platform::process::no_console_window`] を通したかをここで明示する
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Console {
+    /// 親のコンソールを受け継ぐ（`tako queue` の子 = 端末へ出す）
+    Inherit,
+    /// コンソールウィンドウを出さない（`no_console_window` を通した子と同じ）
+    NoWindow,
 }
 
 fn kill_gui() -> bool {
@@ -131,6 +157,15 @@ fn injected_contain_delay() -> Option<std::time::Duration> {
         return None;
     }
     parse_contain_delay(std::env::var(ENV_INJECT_2697_CONTAIN_DELAY).ok().as_deref())
+}
+
+/// 起こした子を Job へ入れる（[`Job::spawn_contained`] と [`KillScope::contain`] の共通の段）。
+/// 注入 [`ENV_INJECT_2697_CONTAIN_DELAY`] はここで入れる前に待つ
+fn contain_spawned(pid: u32) -> Option<Job> {
+    if let Some(delay) = injected_contain_delay().filter(|_| SUPPORTED) {
+        std::thread::sleep(delay);
+    }
+    Job::contain(pid)
 }
 
 /// [`ENV_DIAG_2697`] が効いているか（検証プロセスの外では常に false）
@@ -187,6 +222,48 @@ impl Job {
                 None
             }
         }
+    }
+
+    /// 子を起こし、動き出す前に Job へ入れる（#2697。std の `Command` で起こす子はこの 1 実装を通す）。
+    ///
+    /// Windows では `CREATE_SUSPENDED` で起こし、`admit(pid)` が真なら Job へ入れてから主スレッドを動かす
+    /// = 子が起こす孫は必ず Job を受け継ぐ（「起動直後の窓」が無い）。`admit` が偽（器の CLI など入れない
+    /// 子）・入れられないときは `None` で、子はそのまま動く。動かせなかった子は止めて刈り取り、エラーを
+    /// 返す（止まったまま残さない）。`console` は呼び手の作成フラグ（[`Console`]）。
+    ///
+    /// Job を作らない（unix・`TAKO_2454_LEGACY=1`）ときは素の `spawn` で `None`（作成フラグは呼び手の
+    /// まま）。A/B `TAKO_2697_LEGACY=1` は素の `spawn` の後に入れる（窓あり = #2697 の前）
+    pub fn spawn_contained(
+        cmd: &mut std::process::Command,
+        console: Console,
+        admit: impl FnOnce(u32) -> bool,
+    ) -> std::io::Result<(std::process::Child, Option<Job>)> {
+        if !SUPPORTED || legacy() {
+            return Ok((cmd.spawn()?, None));
+        }
+        let suspended = !legacy_2697();
+        if suspended {
+            imp::suspend_on_spawn(cmd, console);
+        }
+        let mut child = cmd.spawn()?;
+        let pid = child.id();
+        let job = if admit(pid) {
+            contain_spawned(pid)
+        } else {
+            None
+        };
+        if suspended {
+            if let Err(reason) = imp::resume(pid) {
+                // Job の drop が中身（この子だけ）を止める。Job が無い回も子は止めて刈り取る
+                drop(job);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::other(format!(
+                    "一時停止で起こした子を動かせない: {reason}"
+                )));
+            }
+        }
+        Ok((child, job))
     }
 
     /// 中身を全部止める（冪等。空の Job・止め終わった Job に撃ってもよい）
@@ -369,13 +446,23 @@ pub struct KillScope {
 }
 
 impl KillScope {
-    /// `pid` の子を子孫ごと入れる（[`Job::contain`]。`pid` の扱いの約束も同じ）
+    /// 子を起こし、動き出す前に入れる（[`Job::spawn_contained`]。打ち切り・取り消しの子はこれで起こす
+    /// = 「起動直後の窓」が無い）。`admit` が偽の子は入れない（空の入れ物）
+    pub fn spawn(
+        cmd: &mut std::process::Command,
+        console: Console,
+        admit: impl FnOnce(u32) -> bool,
+    ) -> std::io::Result<(std::process::Child, KillScope)> {
+        let (child, job) = Job::spawn_contained(cmd, console, admit)?;
+        Ok((child, KillScope { job }))
+    }
+
+    /// 起こし済みの `pid` の子を子孫ごと入れる（[`Job::contain`]。`pid` の扱いの約束も同じ）。
+    /// 子は動いているので「起動直後の窓」が残る。呼び手が自分で起こした子（probe の
+    /// `wait_with_timeout` へ渡された子）のための口で、新しく起こすなら [`KillScope::spawn`]
     pub fn contain(pid: u32) -> KillScope {
-        if let Some(delay) = injected_contain_delay().filter(|_| SUPPORTED) {
-            std::thread::sleep(delay);
-        }
         KillScope {
-            job: Job::contain(pid),
+            job: contain_spawned(pid),
         }
     }
 
@@ -610,6 +697,13 @@ mod imp {
         pub(super) fn clear_kill_on_close(&self) -> Result<(), String> {
             match *self {}
         }
+    }
+
+    /// unix では一時停止で起こさない（`spawn_contained` は Job を作らない OS で素の `spawn` を返す）
+    pub(super) fn suspend_on_spawn(_cmd: &mut std::process::Command, _console: super::Console) {}
+
+    pub(super) fn resume(_pid: u32) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -863,6 +957,105 @@ mod imp {
             // SAFETY: CreateJobObjectW が返した有効なハンドルを 1 回だけ閉じる
             unsafe { CloseHandle(self.handle) };
         }
+    }
+
+    /// winbase.h の `CREATE_SUSPENDED` / `CREATE_NO_WINDOW`（後者は `platform::process` と同じ値）
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    /// winnt.h の `THREAD_SUSPEND_RESUME` / tlhelp32.h の `TH32CS_SNAPTHREAD`
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    /// `INVALID_HANDLE_VALUE`（`CreateToolhelp32Snapshot` の失敗。`procinfo` と同じ書き方）
+    fn invalid_handle() -> Handle {
+        -1isize as Handle
+    }
+    /// `ResumeThread` の失敗（`(DWORD)-1`）
+    const RESUME_FAILED: u32 = u32::MAX;
+
+    /// `THREADENTRY32`（tlhelp32.h）
+    #[repr(C)]
+    #[derive(Default)]
+    struct ThreadEntry32 {
+        size: u32,
+        usage: u32,
+        thread_id: u32,
+        owner_process_id: u32,
+        base_priority: i32,
+        delta_priority: i32,
+        flags: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
+        fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+        fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+        fn OpenThread(access: u32, inherit_handle: i32, thread_id: u32) -> Handle;
+        fn ResumeThread(thread: Handle) -> u32;
+    }
+
+    /// 一時停止で起こす作成フラグを付ける（std の `creation_flags` は上書きなので、コンソールの扱いも
+    /// 付け直す = [`super::Console`]）
+    pub(super) fn suspend_on_spawn(cmd: &mut std::process::Command, console: super::Console) {
+        use std::os::windows::process::CommandExt;
+        let window = match console {
+            super::Console::Inherit => 0,
+            super::Console::NoWindow => CREATE_NO_WINDOW,
+        };
+        cmd.creation_flags(CREATE_SUSPENDED | window);
+    }
+
+    /// 一時停止で起こした `pid` の子を動かす。std の `Child` は主スレッドのハンドルを持たない
+    /// （`CreateProcessW` の直後に閉じる）ので、スレッドの一覧（Toolhelp32）からその子のスレッドを
+    /// 見つけて `ResumeThread` する。起こしたばかりの子のスレッドは主スレッド 1 本だけ。
+    /// 1 本も動かせなければ Err（呼び手が子を止める）
+    pub(super) fn resume(pid: u32) -> Result<(), String> {
+        // SAFETY: 戻りは失敗の値を検査し、この関数の中で 1 回だけ閉じる
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot.is_null() || snapshot == invalid_handle() {
+            return Err(format!("CreateToolhelp32Snapshot: {}", last_error()));
+        }
+        // 閉じるだけの包み（`Process` の drop は CloseHandle。スナップショット・スレッドにも使える）
+        let snapshot = Process(snapshot);
+        let mut entry = ThreadEntry32 {
+            size: std::mem::size_of::<ThreadEntry32>() as u32,
+            ..ThreadEntry32::default()
+        };
+        let mut resumed = 0usize;
+        let mut failures = Vec::new();
+        // SAFETY: snapshot は有効なハンドル、entry は size を入れた THREADENTRY32 で呼び出しの間生きている
+        let mut more = unsafe { Thread32First(snapshot.0, &mut entry) } != 0;
+        while more {
+            if entry.owner_process_id == pid {
+                // SAFETY: 戻りは null を検査し、drop で 1 回だけ閉じる
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.thread_id) };
+                if thread.is_null() {
+                    failures.push(format!("OpenThread({}): {}", entry.thread_id, last_error()));
+                } else {
+                    let thread = Process(thread);
+                    // SAFETY: 開いた有効なスレッドのハンドル
+                    if unsafe { ResumeThread(thread.0) } == RESUME_FAILED {
+                        failures.push(format!(
+                            "ResumeThread({}): {}",
+                            entry.thread_id,
+                            last_error()
+                        ));
+                    } else {
+                        resumed += 1;
+                    }
+                }
+            }
+            // SAFETY: 同上
+            more = unsafe { Thread32Next(snapshot.0, &mut entry) } != 0;
+        }
+        if resumed == 0 {
+            return Err(if failures.is_empty() {
+                format!("pid {pid} のスレッドが一覧に無い")
+            } else {
+                failures.join(" / ")
+            });
+        }
+        Ok(())
     }
 }
 

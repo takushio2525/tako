@@ -9,8 +9,8 @@
 //! ## 測り方
 //!
 //! `probe::tests::hang_script` と同じ形の子（`cmd /C "echo partial& ping -n 600 127.0.0.1 > NUL"`）を
-//! 起こし、起こした直後に待ちの 1 実装へ渡す（本番の `output_with_timeout` と同じ順番 = 待ちの入口で
-//! 入れ物へ入る）。見張り役のスレッドがプロセスの一覧から cmd.exe の子の `ping` を見つけ、
+//! 本番の `output_with_timeout` と同じ口（`probe::spawn_for_wait` = 一時停止で起こし、入れ物へ入れてから
+//! 動かす。#2697）で起こし、待ちの 1 実装へ渡す。見張り役のスレッドがプロセスの一覧から cmd.exe の子の `ping` を見つけ、
 //! **ハンドルを持ったまま**見張る（止まった後に pid が別のプロセスへ再利用されて「生きている」と読むのを
 //! 防ぐ = #2284 の形）。上限（[`BUDGET`]）は見張り役が孫を見つけるまでの幅で、比較には使わない。
 //!
@@ -18,6 +18,8 @@
 //! - `TAKO_2454_LEGACY=1`（Job を作らない = #2462 の前）: cmd.exe が止まった後も孫が生きている
 //!   = この測り方に検出力がある（修正前の実装では既定のテストが落ちる）
 //! - 普通に終わった子の残り（`start /b` の常駐）は止めない（#2462 の前と unix と同じ）
+//! - 入れ物へ入れる前に待たせる注入（`TAKO_2697_INJECT_CONTAIN_DELAY_MS`。起動直後の窓を広げる）を
+//!   当てても孫まで止まる（#2697。子は一時停止の間に入る）
 //! - `TAKO_2454_INJECT=assign_fail`（入れ物へ入れる段の失敗）: 打ち切りが返り panic しない
 //!   （素の kill へ落ちる）
 //!
@@ -29,7 +31,7 @@
 #![cfg(windows)]
 
 use std::ffi::c_void;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -116,15 +118,16 @@ impl Drop for Held {
     }
 }
 
-/// `cmd /C <script>` を、本番の probe と同じ作法（コンソールを出さない・stdin を塞ぐ・出力はパイプ）で起こす
-fn spawn_cmd(script: &str) -> Child {
+/// `cmd /C <script>` を、本番の probe と同じ作法（コンソールを出さない・stdin を塞ぐ・出力はパイプ）と
+/// 同じ口（`probe::spawn_for_wait`）で起こす
+fn spawn_cmd(script: &str) -> probe::Spawned {
     let mut command = Command::new("cmd");
     tako_core::platform::process::no_console_window(&mut command)
         .args(["/C", script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.spawn().expect("cmd.exe を起こせる")
+    probe::spawn_for_wait(&mut command).expect("cmd.exe を起こせる")
 }
 
 /// 見張り役の答え: cmd.exe（終わっていれば `None`）と、その子の `ping.exe`（見つからなければ `None`）
@@ -166,7 +169,7 @@ fn watcher(limit: Duration, hold_parent: bool) -> (mpsc::Sender<u32>, mpsc::Rece
 fn time_out_hang() -> (Held, Held, String) {
     let (send_pid, answer) = watcher(BUDGET, true);
     let child = spawn_cmd(HANG);
-    let cmd_pid = child.id();
+    let cmd_pid = child.child.id();
     send_pid.send(cmd_pid).expect("見張り役へ pid を渡せる");
     let outcome = probe::wait_with_timeout(child, "cmd ping", BUDGET);
     let Outcome::TimedOut { stdout, .. } = outcome else {
@@ -233,13 +236,41 @@ fn issue2462_旧アームではprobeの打ち切りで孫が残る() {
     // 孫は `Held` の drop が止める（このテストが起こしたもの）
 }
 
+/// **#2697 の番犬**: 子を入れ物へ入れる前に 3 秒待たせる注入（起動直後の窓を広げる）を当てても、
+/// 打ち切りで孫まで止まる（子は一時停止の間に入るので、待っている間に孫は生まれない）。
+/// 修正前の形（`TAKO_2697_LEGACY=1` = 動いている子を入れる）では入れる前に孫が外に生まれて残る
+/// （A/B は `crates/tako-control/tests/issue2462_kill_paths_windows.rs` の queue の回）
+#[test]
+fn issue2697_入れ物へ入れる前に待たせてもprobeの打ち切りで孫まで止まる() {
+    if tako_core::run_alone!(issue2697_入れ物へ入れる前に待たせてもprobeの打ち切りで孫まで止まる)
+    {
+        return;
+    }
+    std::env::set_var(job::ENV_INJECT_2697_CONTAIN_DELAY, "3000"); // 子の中だけ
+    let (cmd, ping, _) = time_out_hang();
+    assert!(
+        ping.wait_gone(GONE_LIMIT),
+        "入れる前に待たせた回で、打ち切りの後も cmd.exe 経由の孫 {} が {GONE_LIMIT:?} 残った（#2697）",
+        ping.pid
+    );
+    assert!(
+        cmd.wait_gone(GONE_LIMIT),
+        "直下の cmd.exe {} が残った",
+        cmd.pid
+    );
+    println!(
+        "TAKO2697_PROBE_WINDOW_CLOSED cmd={} grandchild={} gone=true",
+        cmd.pid, ping.pid
+    );
+}
+
 /// **普通に終わった子の残りは止めない**（#2462 の前と unix と同じ。入れ物の drop は
 /// `KILL_ON_JOB_CLOSE` を外してから閉じる）。`start /b` の常駐を残して cmd.exe はすぐ終わる
 #[test]
 fn issue2462_普通に終わった子が残した常駐は止めない() {
     let (send_pid, answer) = watcher(BUDGET, false);
     let child = spawn_cmd(LEAVE_DAEMON);
-    let cmd_pid = child.id();
+    let cmd_pid = child.child.id();
     send_pid.send(cmd_pid).expect("見張り役へ pid を渡せる");
     let outcome = probe::wait_with_timeout(child, "cmd start", BUDGET);
     let Outcome::Done { status, stdout, .. } = outcome else {

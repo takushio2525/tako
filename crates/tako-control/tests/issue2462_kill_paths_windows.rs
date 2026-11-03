@@ -27,16 +27,19 @@
 //! Windows 以外ではコンパイルしない（unix の取り消しは libproc の木への SIGTERM、再起動は SIGTERM を受けた
 //! エージェントが自分の子を畳む = 振る舞いを変えない）。
 //!
-//! ## #2697 の切り分け（段 1）
+//! ## 起動直後の窓（#2697）
 //!
 //! CI のワークスペース全体の `cargo test` で queue の回が間欠に「孫が 60s 残った」で落ちた（子のテストが
 //! 60.12s / 60.16s で終わった = 通る回の 2.11s と違い、孫を**子を起こした直後の 1 回目の心拍**で掴んでいた）。
-//! 1 回目の心拍で「cmd.exe の子の ping」が一覧に居て、それが取り消しで止まらない形は 2 つある:
+//! 真因は製品の「起動直後の窓」（`tako_core::platform::job`）: 子を起こしてから入れ物へ入れ終える前に
+//! cmd.exe が ping を起こすと、ping は入れ物の外に生まれて取り消しで止まらない（通る回の実測で、ping が
+//! 生まれるのは入れ終えた +11 / +14ms 後 = 窓の余白は 12ms ほど）。修正は子を一時停止で起こし、入れて
+//! から動かす（`job::KillScope::spawn`）。
 //!
-//! - 起動直後の窓（製品）: 子を入れ物へ入れ終える前に cmd.exe が ping を起こした = ping は入れ物の外
-//!   （`tako_core::platform::job` の「起動直後の窓」）。注入 `TAKO_2697_INJECT_CONTAIN_DELAY_MS` で作る
-//! - 親の pid の再利用（テスト）: 親が先に終わった ping（孤児）の親の pid を新しい cmd.exe が取り、
-//!   ppid だけで探す [`ping_child_of`] がその孤児を掴んだ。探す親を孤児の親へ差し替えて作る
+//! - 番犬: 入れる前に待たせる注入（`TAKO_2697_INJECT_CONTAIN_DELAY_MS`）を当てても孫まで止まる。
+//!   `TAKO_2697_LEGACY=1`（起こしてから入れる）では 1 回目の心拍で掴んだ孫が残る = 番犬に検出力がある
+//! - ppid だけで探すと、親の pid が再利用された古い ping（孤児）を掴みうるので、[`ping_child_of`] は
+//!   親より後に生まれたものだけを子と読む
 //!
 //! 落ちたときは [`diagnose`] が孫と子の生成時刻・入れ物へ入れ終えた時刻・ping の一覧から、どちらの形かを名指す。
 
@@ -215,12 +218,29 @@ impl Drop for Held {
     }
 }
 
-/// `parent` の子の `ping.exe` を一覧から 1 回だけ探して開く
+/// 親より後に生まれたか（`ping_child_of` の読み方。純粋関数）。どちらかが読めなければ子と読まない
+fn born_after(child_born: Option<u64>, parent_born: Option<u64>) -> bool {
+    matches!((child_born, parent_born), (Some(child), Some(parent)) if child >= parent)
+}
+
+/// `parent` の子の `ping.exe` を一覧から 1 回だけ探して開く。Windows は親が終わっても子の親の pid を
+/// 書き換えないので、親より前に生まれたもの（親の pid を前に使っていたプロセスの子 = 孤児）は子と読まず、
+/// 止めずに閉じる（#2697。開いてから生成時刻を確かめる = 確かめた後に pid が入れ替わらない。
+/// 親は呼び手がハンドルを持っているので生成時刻を読める）
 fn ping_child_of(parent: u32) -> Option<Held> {
+    let parent_born = born_ms(parent);
     tako_core::platform::procinfo::snapshot()
         .into_iter()
-        .find(|p| p.ppid == parent && p.name.eq_ignore_ascii_case("ping.exe"))
-        .and_then(|p| Held::open(p.pid))
+        .filter(|p| p.ppid == parent && p.name.eq_ignore_ascii_case("ping.exe"))
+        .filter_map(|p| Held::open(p.pid))
+        .find_map(|held| {
+            if born_after(held.times().map(|(born, _)| born), parent_born) {
+                Some(held)
+            } else {
+                held.close_without_stopping();
+                None
+            }
+        })
 }
 
 /// `limit` まで `parent` の子の `ping.exe` を探す（状態待ち）
@@ -257,10 +277,8 @@ struct Cancelled {
     cancel_at: Instant,
 }
 
-/// `cmd /C ping` を本番の `queue_wrapper::run` で走らせ、孫を握ってから取り消す。
-///
-/// `parent_of(子の pid)` は孫を探す親（ふつうは子そのもの。#2697 の再利用の再現は孤児の親へ差し替える）
-fn run_and_cancel(parent_of: &dyn Fn(u32) -> u32) -> Cancelled {
+/// `cmd /C ping` を本番の `queue_wrapper::run` で走らせ、孫を握ってから取り消す
+fn run_and_cancel() -> Cancelled {
     let argv: Vec<String> = ["cmd", "/C", "ping -n 600 127.0.0.1 > NUL"]
         .iter()
         .map(|s| s.to_string())
@@ -284,7 +302,7 @@ fn run_and_cancel(parent_of: &dyn Fn(u32) -> u32) -> Cancelled {
                         cmd = Held::open(pid);
                     }
                     if ping.is_none() {
-                        ping = ping_child_of(parent_of(pid));
+                        ping = ping_child_of(pid);
                         if ping.is_some() {
                             found = Some((beats, wire.started_at_ms, now_ms(), Instant::now()));
                         }
@@ -413,7 +431,7 @@ fn issue2462_queueの取り消しで孫まで止まる() {
         return;
     }
     std::env::set_var(job::ENV_DIAG_2697, "1"); // 子の中だけ（他のテストは居ない）
-    let run = run_and_cancel(&|pid| pid);
+    let run = run_and_cancel();
     assert!(
         run.ping.wait_gone(GONE_LIMIT),
         "取り消しの後も cmd.exe の孫 {} が {GONE_LIMIT:?} 残った（#2462）\n{}",
@@ -446,7 +464,7 @@ fn issue2462_旧アームではqueueの取り消しで孫が残る() {
         return;
     }
     std::env::set_var(job::ENV_LEGACY, "1"); // 子の中だけ（他のテストは居ない）
-    let run = run_and_cancel(&|pid| pid);
+    let run = run_and_cancel();
     assert!(
         run.cmd.wait_gone(GONE_LIMIT),
         "旧アームでも直下の cmd.exe {} は kill で止まるはず",
@@ -466,13 +484,13 @@ fn issue2462_旧アームではqueueの取り消しで孫が残る() {
     // 孫は `Held` の drop が止める（このテストが起こしたもの）
 }
 
-/// **#2697 の再現（起動直後の窓 = 製品側の形）**: 入れ物へ入れる前に [`CONTAIN_DELAY_MS`] 待たせる注入で、
-/// cmd.exe が ping を入れ物の外に起こした回を作る。孫は 1 回目の心拍で見つかり（CI で落ちた 2 回と同じ）、
-/// 取り消しで cmd.exe は止まるが孫は残る = #2697 の失敗の形。診断はそれを「起動直後の窓」と名指す
+/// **#2697 の番犬**: 子を入れ物へ入れる前に [`CONTAIN_DELAY_MS`] 待たせる注入（起動直後の窓を広げる）を
+/// 当てても、取り消しで孫まで止まる。子は一時停止の間に入れ物へ入るので、待っている間に孫は生まれない
+/// （孫は入れ物を受け継いで生まれる）。修正前の形（`TAKO_2697_LEGACY=1`）では次のテストのとおり残る
 #[test]
-fn issue2697_入れ物へ入れる前に生まれた孫は取り消しの後も残る() {
+fn issue2697_入れ物へ入れる前に待たせても取り消しで孫まで止まる() {
     if tako_core::test_child::rerun_alone(
-        "issue2697_入れ物へ入れる前に生まれた孫は取り消しの後も残る",
+        "issue2697_入れ物へ入れる前に待たせても取り消しで孫まで止まる",
         &[tako_control::queue::ENV_JOB],
     ) {
         return;
@@ -480,7 +498,43 @@ fn issue2697_入れ物へ入れる前に生まれた孫は取り消しの後も�
     // 子の中だけ（他のテストは居ない）
     std::env::set_var(job::ENV_INJECT_2697_CONTAIN_DELAY, CONTAIN_DELAY_MS);
     std::env::set_var(job::ENV_DIAG_2697, "1");
-    let run = run_and_cancel(&|pid| pid);
+    let run = run_and_cancel();
+    assert!(
+        run.ping.wait_gone(GONE_LIMIT),
+        "入れる前に待たせた回で、取り消しの後も cmd.exe の孫 {} が {GONE_LIMIT:?} 残った（#2697）\n{}",
+        run.ping.pid,
+        diagnose(&run)
+    );
+    assert!(
+        run.cmd.wait_gone(GONE_LIMIT),
+        "取り消した cmd.exe {} が残った\n{}",
+        run.cmd.pid,
+        diagnose(&run)
+    );
+    println!(
+        "TAKO2697_WINDOW_CLOSED cmd={} grandchild={} gone=true {}",
+        run.cmd.pid,
+        run.ping.pid,
+        timing(&run)
+    );
+}
+
+/// **#2697 の A/B（修正前の形）**: `TAKO_2697_LEGACY=1`（動いている子を入れる）で同じ注入を当てると、
+/// cmd.exe が入れ物の外に ping を起こし、孫は 1 回目の心拍で見つかり、取り消しで cmd.exe は止まるが
+/// 孫は残る = CI で落ちた形（番犬に検出力がある）。診断はそれを「起動直後の窓」と名指す
+#[test]
+fn issue2697_旧アームでは入れ物へ入れる前に生まれた孫が取り消しの後も残る() {
+    if tako_core::test_child::rerun_alone(
+        "issue2697_旧アームでは入れ物へ入れる前に生まれた孫が取り消しの後も残る",
+        &[tako_control::queue::ENV_JOB],
+    ) {
+        return;
+    }
+    // 子の中だけ（他のテストは居ない）
+    std::env::set_var(job::ENV_LEGACY_2697, "1");
+    std::env::set_var(job::ENV_INJECT_2697_CONTAIN_DELAY, CONTAIN_DELAY_MS);
+    std::env::set_var(job::ENV_DIAG_2697, "1");
+    let run = run_and_cancel();
     assert!(
         run.cmd.wait_gone(GONE_LIMIT),
         "取り消した cmd.exe {} が残った\n{}",
@@ -489,7 +543,7 @@ fn issue2697_入れ物へ入れる前に生まれた孫は取り消しの後も�
     );
     assert!(
         !run.ping.wait_gone(CONFIRM_ALIVE),
-        "注入で窓を広げても孫が止まった（この形では #2697 を再現できない）\n{}",
+        "旧アームで孫が止まった（この測り方では #2697 の差が出ない）\n{}",
         diagnose(&run)
     );
     let report = diagnose(&run);
@@ -497,85 +551,36 @@ fn issue2697_入れ物へ入れる前に生まれた孫は取り消しの後も�
         run.beat == 0 && report.contains(VERDICT_WINDOW),
         "1 回目の心拍で掴み「起動直後の窓」と名指すはず\n{report}"
     );
-    println!("TAKO2697_REPRO_WINDOW {}\n{report}", timing(&run));
+    println!("TAKO2697_WINDOW_LEGACY {}\n{report}", timing(&run));
     // 孫は `Held` の drop が止める（このテストが起こしたもの）
 }
 
-/// `parent` の子の ping のうち `parent` より後に生まれたもの（= 本物の子。`parent` のハンドルを持つ間は
-/// pid が再利用されない）を開く。開いてから生成時刻を確かめ、前に生まれた別のものは止めずに閉じる
-fn own_ping_children(parent: &Held) -> Vec<Held> {
-    let Some((parent_born, _)) = parent.times() else {
-        return Vec::new();
-    };
-    tako_core::platform::procinfo::snapshot()
-        .into_iter()
-        .filter(|p| p.ppid == parent.pid && p.name.eq_ignore_ascii_case("ping.exe"))
-        .filter_map(|p| Held::open(p.pid))
-        .filter_map(|held| match held.times() {
-            Some((born, _)) if born >= parent_born => Some(held),
-            _ => {
-                held.close_without_stopping();
-                None
-            }
-        })
-        .collect()
-}
-
-/// 親が先に終わった ping（孤児）を作る。戻りは (終わった親の pid, 親の押さえ, 孤児)。
-/// 親の押さえ（看取った `Child`）を持つ間は親の pid が再利用されない
-fn spawn_orphan_ping() -> (u32, std::process::Child, Held) {
-    let mut command = std::process::Command::new("cmd");
-    command.args(["/C", "start /b ping -n 600 127.0.0.1 > NUL"]);
-    let mut parent = tako_core::platform::process::no_console_window(&mut command)
-        .spawn()
-        .expect("孤児を残す cmd.exe を起こせる");
-    let parent_pid = parent.id();
-    let orphan = wait_ping_child_of(parent_pid, START_LIMIT);
-    parent.wait().expect("孤児の親を看取れる");
-    // 次に起こす cmd.exe の生成時刻が孤児と同じ刻みに入らないよう、刻み 2 つぶん時計が進むのを待つ
-    // （時計の状態待ち。生成時刻の前後で読み違えの形を名指すため）
-    let born = orphan.times().map_or(0, |(born, _)| born);
-    while now_ms() < born + 2 * TICK_MS {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    (parent_pid, parent, orphan)
-}
-
-/// **#2697 の再現（親の pid の再利用 = テスト側の形）**: Windows は親が終わっても子の親の pid を書き換え
-/// ないので、孤児の親の pid を新しい cmd.exe が取ると、ppid だけで探す [`ping_child_of`] はその孤児を
-/// 「cmd.exe の孫」と読む。pid の再利用は起こせないので、探す親を孤児の親へ差し替えて同じ読み違いを作る。
-/// 孤児は入れ物の外なので取り消しの後も残る = #2697 の失敗の形。診断はそれを「再利用」と名指す
+/// 孫の生成時刻から残った理由を名指す判定（[`classify`]）と、子と読む条件（[`born_after`]）
 #[test]
-fn issue2697_親のpidが再利用された孤児のpingを掴むと取り消しの後も残る() {
-    if tako_core::test_child::rerun_alone(
-        "issue2697_親のpidが再利用された孤児のpingを掴むと取り消しの後も残る",
-        &[tako_control::queue::ENV_JOB],
-    ) {
-        return;
-    }
-    let (stale_parent, _parent, orphan) = spawn_orphan_ping();
-    let run = run_and_cancel(&|_| stale_parent);
-    // 本物の cmd.exe が取り消しの前に入れ物の外へ起こした ping（起動直後の窓）が居れば drop で止める
-    let _strays = own_ping_children(&run.cmd);
-    assert_eq!(run.ping.pid, orphan.pid, "孤児を掴んでいない");
-    assert!(
-        run.cmd.wait_gone(GONE_LIMIT),
-        "取り消した cmd.exe {} が残った\n{}",
-        run.cmd.pid,
-        diagnose(&run)
+fn issue2697_孫の生成時刻から残った理由を名指す() {
+    // 子より前に生まれた = 親の pid の再利用（テスト側）。入れ終えた時刻より前でも再利用が先
+    assert_eq!(classify(Some(990), Some(1000), Some(1002)), VERDICT_REUSE);
+    // 子の後・入れ終えた時刻より刻み 1 つ以上前 = 起動直後の窓（製品側）
+    assert_eq!(classify(Some(1010), Some(1000), Some(4000)), VERDICT_WINDOW);
+    assert_eq!(
+        classify(Some(1010), Some(1000), Some(1010 + TICK_MS)),
+        VERDICT_WINDOW
     );
-    assert!(
-        !run.ping.wait_gone(CONFIRM_ALIVE),
-        "入れ物の外の孤児が止まった（この形では #2697 を再現できない）\n{}",
-        diagnose(&run)
-    );
-    let report = diagnose(&run);
-    assert!(
-        run.beat == 0 && report.contains(VERDICT_REUSE),
-        "1 回目の心拍で掴み「再利用」と名指すはず\n{report}"
-    );
-    println!("TAKO2697_REPRO_REUSE {}\n{report}", timing(&run));
-    // 孤児は `Held` の drop が止める（このテストが起こしたもの）
+    // 入れ終えた後 = 入れ物に入っているはず
+    assert_eq!(classify(Some(1015), Some(1000), Some(1002)), VERDICT_AFTER);
+    // 刻みの幅の中は決めない
+    assert_eq!(classify(Some(1010), Some(1000), Some(1020)), VERDICT_EDGE);
+    assert_eq!(classify(Some(1010), Some(1000), Some(1010)), VERDICT_EDGE);
+    // 読めない
+    assert_eq!(classify(None, Some(1000), Some(1002)), VERDICT_UNKNOWN);
+    assert_eq!(classify(Some(1010), None, Some(1002)), VERDICT_UNKNOWN);
+    assert_eq!(classify(Some(1010), Some(1000), None), VERDICT_UNKNOWN);
+    // 子と読むのは親と同じ刻み以後に生まれたものだけ
+    assert!(born_after(Some(1000), Some(1000)));
+    assert!(born_after(Some(1013), Some(1000)));
+    assert!(!born_after(Some(961), Some(1000)), "親より前 = 孤児");
+    assert!(!born_after(None, Some(1000)));
+    assert!(!born_after(Some(1013), None));
 }
 
 // ---- エージェントの再起動（session-restart の harness） ----
@@ -803,4 +808,191 @@ fn issue2462_先に死んだエージェントの孫も止めシェルは撃た�
         "TAKO2462_RESTART_DEAD_AGENT agent={} grandchild={} gone=true shell_alive=true",
         pane.agent.pid, pane.grandchild.pid
     );
+}
+
+// ---- #2697 段 2 の実測（一時。再開の手段を選んだら外す） ----
+
+mod resume_measure {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Child, Command, Stdio};
+
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const THREAD_SUSPEND_RESUME: u32 = 0x0002;
+    const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+    const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+    const N: usize = 20;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ThreadEntry32 {
+        size: u32,
+        usage: u32,
+        thread_id: u32,
+        owner_process_id: u32,
+        base_priority: i32,
+        delta_priority: i32,
+        flags: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> Handle;
+        fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+        fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+        fn OpenThread(access: u32, inherit_handle: i32, thread_id: u32) -> Handle;
+        fn ResumeThread(thread: Handle) -> u32;
+    }
+
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtResumeProcess(process: Handle) -> i32;
+    }
+
+    /// スレッドの一覧から `pid` のスレッドを動かす。戻りは (動かした数, 一覧のスレッドの数)
+    fn resume_threads(pid: u32) -> (usize, usize) {
+        let (mut resumed, mut seen) = (0, 0);
+        // SAFETY: 実測用。戻りを検査し、開いたハンドルは閉じる
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snapshot.is_null() || snapshot == -1isize as Handle {
+                return (0, 0);
+            }
+            let mut entry = ThreadEntry32 {
+                size: std::mem::size_of::<ThreadEntry32>() as u32,
+                ..ThreadEntry32::default()
+            };
+            let mut more = Thread32First(snapshot, &mut entry) != 0;
+            while more {
+                seen += 1;
+                if entry.owner_process_id == pid {
+                    let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.thread_id);
+                    if !thread.is_null() {
+                        if ResumeThread(thread) != u32::MAX {
+                            resumed += 1;
+                        }
+                        CloseHandle(thread);
+                    }
+                }
+                more = Thread32Next(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+        }
+        (resumed, seen)
+    }
+
+    /// `NtResumeProcess` で動かす。成功（NTSTATUS >= 0）なら true
+    fn resume_nt(pid: u32) -> bool {
+        // SAFETY: 実測用。戻りを検査し、開いたハンドルは閉じる
+        unsafe {
+            let process = OpenProcess(PROCESS_SUSPEND_RESUME, 0, pid);
+            if process.is_null() {
+                return false;
+            }
+            let status = NtResumeProcess(process);
+            CloseHandle(process);
+            status >= 0
+        }
+    }
+
+    fn quick_cmd() -> Command {
+        let mut command = Command::new("cmd");
+        command
+            .args(["/C", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    }
+
+    fn spawn_suspended() -> Child {
+        quick_cmd()
+            .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW)
+            .spawn()
+            .expect("一時停止で起こせる")
+    }
+
+    /// 動かせた子が終わるのを待つ（動かせなかった子は止める）。終わったら true
+    fn finish(mut child: Child, resumed: bool) -> bool {
+        if !resumed {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        child.wait().is_ok_and(|status| status.success())
+    }
+
+    fn summary(label: &str, mut micros: Vec<u128>, ok: usize, extra: &str) -> String {
+        micros.sort_unstable();
+        let p50 = micros.get(micros.len() / 2).copied().unwrap_or(0);
+        let max = micros.last().copied().unwrap_or(0);
+        format!("TAKO2697_RESUME method={label} n={N} ok={ok} p50_us={p50} max_us={max} {extra}")
+    }
+
+    #[test]
+    fn issue2697_再開の手段の実測() {
+        // スレッドの列挙 + ResumeThread
+        let (mut micros, mut ok, mut seen_max) = (Vec::new(), 0, 0);
+        for _ in 0..N {
+            let child = spawn_suspended();
+            let start = Instant::now();
+            let (resumed, seen) = resume_threads(child.id());
+            micros.push(start.elapsed().as_micros());
+            seen_max = seen_max.max(seen);
+            if finish(child, resumed == 1) {
+                ok += 1;
+            }
+        }
+        println!(
+            "{}",
+            summary(
+                "threads",
+                micros,
+                ok,
+                &format!("threads_in_snapshot={seen_max}")
+            )
+        );
+        assert_eq!(ok, N, "スレッドの列挙で動かせない子があった");
+        // NtResumeProcess
+        let (mut micros, mut ok) = (Vec::new(), 0);
+        for _ in 0..N {
+            let child = spawn_suspended();
+            let start = Instant::now();
+            let resumed = resume_nt(child.id());
+            micros.push(start.elapsed().as_micros());
+            if finish(child, resumed) {
+                ok += 1;
+            }
+        }
+        println!("{}", summary("nt", micros, ok, ""));
+        // 製品の口の全体（一時停止で起こす → 入れる → 動かす）と、修正前の形（起こす → 入れる）
+        let (mut micros, mut ok) = (Vec::new(), 0);
+        for _ in 0..N {
+            let start = Instant::now();
+            let (child, job) =
+                job::Job::spawn_contained(&mut quick_cmd(), job::Console::NoWindow, |_| true)
+                    .expect("製品の口で起こせる");
+            micros.push(start.elapsed().as_micros());
+            if job.is_some() && finish(child, true) {
+                ok += 1;
+            }
+        }
+        println!("{}", summary("product_spawn_contained", micros, ok, ""));
+        assert_eq!(ok, N, "製品の口で起こした子が Job に入って終わらない");
+        let (mut micros, mut ok) = (Vec::new(), 0);
+        for _ in 0..N {
+            let start = Instant::now();
+            let child = quick_cmd()
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .expect("起こせる");
+            let job = job::Job::contain(child.id());
+            micros.push(start.elapsed().as_micros());
+            if job.is_some() && finish(child, true) {
+                ok += 1;
+            }
+        }
+        println!("{}", summary("legacy_spawn_then_contain", micros, ok, ""));
+    }
 }

@@ -655,7 +655,7 @@ pub fn output_with_timeout_in(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    match cmd.spawn() {
+    match spawn_for_wait(&mut cmd) {
         Ok(child) => wait_with_timeout(child, &name, budget),
         Err(e) => Outcome::Failed {
             label: name,
@@ -673,7 +673,7 @@ pub fn output_with_timeout_in(
 /// `Command::output()` を UI スレッドで呼ぶと、子（`ps` / `tmux`）が終わらないとき・
 /// パイプの書き手が別の長生きのプロセスへ漏れたときに**永久に返らない**
 /// （2026-10-10 の本番ハング: メインスレッドが `ps` の `output()` の `poll` で 10 分）。
-/// 名札（`label`）にパスを含めないのは [`label`] と同じ（#927）
+/// 名札（`label`）にパスを含めないのは [`label`] と同じ（#927）。起こし方は [`spawn_for_wait`]
 pub fn command_output_with_timeout(
     command: &mut Command,
     label: &str,
@@ -683,7 +683,7 @@ pub fn command_output_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    match command.spawn() {
+    match spawn_for_wait(command) {
         Ok(child) => wait_with_timeout(child, label, budget),
         Err(e) => Outcome::Failed {
             label: label.to_string(),
@@ -713,7 +713,7 @@ pub fn group_output_with_timeout(command: &mut Command, label: &str, budget: Dur
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    match command.spawn() {
+    match spawn_for_wait(command) {
         // グループごと畳むのは待ちの 1 実装の打ち切りの kill（`kill_on_timeout`）が、
         // 子がグループを率いていることを見て決める
         Ok(child) => wait_with_timeout(child, label, budget),
@@ -760,20 +760,56 @@ fn kill_on_timeout(child: &mut Child) -> bool {
     false
 }
 
-/// 起こし済みの子を上限つきで待つ（**待ちの 1 実装**）。
+/// 待つ子（起こした子と、打ち切りで子孫ごと止める入れ物）。[`spawn_for_wait`] が作るか、
+/// 起こし済みの `Child` から作る（`From<Child>` = 起こした後に入れる）
+pub struct Spawned {
+    /// 起こした子（stdin へ書く呼び手は待つ前に `take` してよい）
+    pub child: Child,
+    /// #2462: 打ち切りの kill を孫まで届かせる入れ物（Windows だけ）。普通に終わったら drop が
+    /// 何も止めずに手放す
+    descendants: crate::platform::job::KillScope,
+}
+
+/// 起こし済みの子（呼び手が自分で起こした器の CLI など）。入れ物へは起こした後に入れる
+/// （子は動いているので #2697 の「起動直後の窓」が残る。新しく待つ子を起こすなら [`spawn_for_wait`]）
+impl From<Child> for Spawned {
+    fn from(mut child: Child) -> Self {
+        let descendants = kill_scope(&mut child);
+        Spawned { child, descendants }
+    }
+}
+
+/// 待つ子を起こす（#2697）。Windows は境界 B30 の [`KillScope::spawn`] で一時停止で起こし、入れ物へ
+/// 入れてから動かす = 子が起こす孫は必ず入れ物に入る（起こしてから入れると、入れ終える前に cmd.exe が
+/// 起こした孫が外に残った）。器の CLI は入れない（[`admits`]）。
 ///
+/// 作成フラグは付け直すので、コンソールウィンドウは出さない（呼び手の雛形が `no_console_window` を
+/// 通している前提と同じ = #586）。unix は素の `spawn`
+///
+/// [`KillScope::spawn`]: crate::platform::job::KillScope::spawn
+pub fn spawn_for_wait(command: &mut Command) -> std::io::Result<Spawned> {
+    use crate::platform::job::{Console, KillScope};
+    let (child, descendants) = KillScope::spawn(command, Console::NoWindow, admits)?;
+    Ok(Spawned { child, descendants })
+}
+
+/// 起こした子を上限つきで待つ（**待ちの 1 実装**）。
+///
+/// 子は [`spawn_for_wait`] で起こした [`Spawned`]（動く前に入れ物へ入れた）か、起こし済みの `Child`
+/// （呼び手が自分で起こした器の CLI など。起こした直後にここへ来る前提で、入れ物へはここで入れる）。
 /// `stdout` / `stderr` がパイプなら吸い出す。呼び手が既に `take()` していても動く
 /// （その口は無いものとして扱う）
-pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Outcome {
+pub fn wait_with_timeout(child: impl Into<Spawned>, label: &str, budget: Duration) -> Outcome {
     // A/B は入口 1 か所。旧挙動 = 予算が尽きないので `try_wait` を回し続ける
     let budget = if legacy_unbounded() {
         Duration::MAX
     } else {
         budget
     };
-    // #2462: 打ち切りの kill を孫まで届かせる入れ物（Windows だけ）。普通に終わったら drop が
-    // 何も止めずに手放す（返り方はどれでもよい）。呼び手が起こした直後にここへ来る前提
-    let mut descendants = kill_scope(&mut child);
+    let Spawned {
+        mut child,
+        mut descendants,
+    } = child.into();
     let out = drain(child.stdout.take());
     let err = drain(child.stderr.take());
     let start = Instant::now();
@@ -845,6 +881,9 @@ pub fn wait_with_timeout(mut child: Child, label: &str, budget: Duration) -> Out
 ///   器の側へ倒す（入れ損ねても従来の止め方に戻るだけ）
 /// - **既に終わった子**（入れる前に終わった = 孫を起こす暇が無い。割り当ての失敗の警告を出さない）
 ///
+/// 起こし済みの子（[`wait_with_timeout`]）の口。[`spawn_for_wait`] は同じ判断（[`admits`]）を
+/// 一時停止の間に行う
+///
 /// [`KillScope`]: crate::platform::job::KillScope
 fn kill_scope(child: &mut Child) -> crate::platform::job::KillScope {
     use crate::platform::job::KillScope;
@@ -852,14 +891,19 @@ fn kill_scope(child: &mut Child) -> crate::platform::job::KillScope {
         return KillScope::empty();
     }
     let pid = child.id();
-    let container = crate::platform::procinfo::image_path(pid).is_none_or(|path| {
-        path.file_name()
-            .is_none_or(|name| crate::backend::is_plumbing_process(&name.to_string_lossy()))
-    });
-    if container {
+    if !admits(pid) {
         return KillScope::empty();
     }
     KillScope::contain(pid)
+}
+
+/// その子を入れ物へ入れるか（[`kill_scope`] の判断。器の CLI と、実行ファイル名を引けない子は入れない）。
+/// 一時停止で起こした子でも実行ファイル名は引ける（作成の時点で決まっている）
+fn admits(pid: u32) -> bool {
+    crate::platform::procinfo::image_path(pid).is_some_and(|path| {
+        path.file_name()
+            .is_some_and(|name| !crate::backend::is_plumbing_process(&name.to_string_lossy()))
+    })
 }
 
 /// 打ち切った子の刈り取りを別スレッドへ渡す（#1979）。

@@ -127,12 +127,16 @@ impl ServerProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn()?;
+        // #2454: 子孫ごと Job へ入れる（Windows だけ。境界 B30）。npm の `.cmd` は cmd.exe 経由で起き、
+        // `Child::kill` だけでは cmd.exe しか止まらず node.exe が残る。#2697: 一時停止で起こし、入れて
+        // から動かす（起こしてから入れると、入れ終える前に cmd.exe が起こした node.exe が外に残る）。
+        // コンソールは `plan.command()` と同じく出さない。入れられなければ None（従来の kill）
+        let (mut child, job) = tako_core::platform::job::Job::spawn_contained(
+            &mut command,
+            tako_core::platform::job::Console::NoWindow,
+            |_| true,
+        )?;
         let pid = child.id();
-        // #2454: 起こした直後に子孫ごと Job へ入れる（Windows だけ。境界 B30）。npm の `.cmd` は
-        // cmd.exe 経由で起き、`Child::kill` だけでは cmd.exe しか止まらず node.exe が残る。
-        // pid は `child` がハンドルを持つ間は再利用されない。入れられなければ None（従来の kill）
-        let job = tako_core::platform::job::Job::contain(pid);
         let stdin = child.stdin.take().expect("stdin はパイプ");
         let stdout = child.stdout.take().expect("stdout はパイプ");
         let stderr = child.stderr.take().expect("stderr はパイプ");

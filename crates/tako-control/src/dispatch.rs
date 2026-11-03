@@ -23435,23 +23435,26 @@ fn run_setup_cli_within(
 ) -> Result<Value, DispatchError> {
     use std::io::Write as _;
 
-    // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない
-    let mut child =
-        tako_core::platform::process::no_console_window(&mut std::process::Command::new(tako_bin))
-            .args(["setup", "--yes", "--answers", "-"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| SetupRefusal::SetupSpawn(e.to_string()).operation())?;
-    child
+    // #586: GUI プロセス（dispatch）から到達するのでコンソールウィンドウを出させない。
+    // #2697: 打ち切りの入れ物へは一時停止の間に入れる（probe の起こし方の 1 実装 = setup が起こす子も
+    // 入れ物に入る。起こしてから入れると、入れ終える前に起きた子が外に残る）
+    let mut command = std::process::Command::new(tako_bin);
+    tako_core::platform::process::no_console_window(&mut command)
+        .args(["setup", "--yes", "--answers", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut spawned = tako_core::probe::spawn_for_wait(&mut command)
+        .map_err(|e| SetupRefusal::SetupSpawn(e.to_string()).operation())?;
+    spawned
+        .child
         .stdin
         .take()
         .ok_or_else(|| SetupRefusal::SetupStdinUnavailable.operation())?
         .write_all(answers_json.as_bytes())
         .map_err(|e| SetupRefusal::AnswersSend(e.to_string()).operation())?;
     let (status, stdout, stderr, timed_out, waited) =
-        match tako_core::probe::wait_with_timeout(child, "tako setup", budget) {
+        match tako_core::probe::wait_with_timeout(spawned, "tako setup", budget) {
             tako_core::probe::Outcome::Done {
                 status,
                 stdout,
