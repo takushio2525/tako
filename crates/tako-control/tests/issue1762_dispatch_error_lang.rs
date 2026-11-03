@@ -18389,9 +18389,33 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::QueueGaveUpAfter { .. } => 278,
         ReplyNote::QueueRunLost { .. } => 279,
         ReplyNote::QueueStoppingCancelled(_) => 280,
+        // #2365 の続き: `tako search`（横断検索・置換・置換の取り消し）と `tako jump` の人向けの表示の枠
+        ReplyNote::SearchOpened { .. } => 281,
+        ReplyNote::SearchCleared(_) => 282,
+        ReplyNote::SearchPanelEmpty => 283,
+        ReplyNote::SearchRunning(_) => 284,
+        ReplyNote::SearchFailed(_) => 285,
+        ReplyNote::SearchNotFound(_) => 286,
+        ReplyNote::SearchFound { .. } => 287,
+        ReplyNote::SearchStoppedLimit(_) => 288,
+        ReplyNote::SearchStoppedTime(_) => 289,
+        ReplyNote::SearchCancelled => 290,
+        ReplyNote::SearchMore(_) => 291,
+        ReplyNote::SearchSkipped { .. } => 292,
+        ReplyNote::ReplaceRowStatus(_) => 293,
+        ReplyNote::ReplaceNotApplied { .. } => 294,
+        ReplyNote::ReplaceViaBuffer { .. } => 295,
+        ReplyNote::ReplaceMoreLines(_) => 296,
+        ReplyNote::UndoHeader { .. } => 297,
+        ReplyNote::UndoBackup(_) => 298,
+        ReplyNote::JumpHistoryEmpty => 299,
+        ReplyNote::JumpPaneClosed => 300,
+        ReplyNote::JumpSkippedMissing(_) => 301,
+        ReplyNote::JumpReopened => 302,
+        ReplyNote::JumpNothingToMove => 303,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 281;
+const REPLY_NOTE_VARIANTS: usize = 304;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -20449,6 +20473,134 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             ReplyNote::QueueStoppingCancelled(10),
             "取り消されたので子を止める（SIGTERM → 10 秒で SIGKILL）".into(),
         ),
+        // #2365 の続き: `tako search` / `tako jump` の枠（#2365 より前の `main.rs` の直書きを見本の値で展開した文）
+        (
+            ReplyNote::SearchOpened {
+                path: "src/a.rs".into(),
+                line: "12".into(),
+                column: "3".into(),
+                landing: "new-pane".into(),
+            },
+            "開いた: src/a.rs:12:3（new-pane）".into(),
+        ),
+        (
+            ReplyNote::SearchCleared(true),
+            "右パネルの検索結果を閉じた".into(),
+        ),
+        (
+            ReplyNote::SearchCleared(false),
+            "閉じる検索結果は無かった".into(),
+        ),
+        (
+            ReplyNote::SearchPanelEmpty,
+            "右パネルに検索結果は無い（tako search <検索語> --show で出す）".into(),
+        ),
+        (
+            ReplyNote::SearchRunning("foo".into()),
+            "検索中: foo".into(),
+        ),
+        (
+            ReplyNote::SearchFailed("bad regex".into()),
+            "検索できなかった: bad regex".into(),
+        ),
+        (
+            ReplyNote::SearchNotFound("40".into()),
+            "見つからなかった（40 ファイルを探した）".into(),
+        ),
+        (
+            ReplyNote::SearchFound {
+                total: 7,
+                files: "3".into(),
+                ms: "12".into(),
+            },
+            "7 件（3 ファイル・12 ms）".into(),
+        ),
+        (
+            ReplyNote::SearchStoppedLimit(5000),
+            "上限 5000 件で打ち切り（--path で範囲を狭めるか検索語を絞る）".into(),
+        ),
+        (
+            ReplyNote::SearchStoppedTime(10),
+            "所要の上限（10 秒）で打ち切り".into(),
+        ),
+        (
+            ReplyNote::SearchCancelled,
+            "取り消された（次の検索が始まった / 閉じられた）".into(),
+        ),
+        (
+            ReplyNote::SearchMore(93),
+            "ほか 93 件（--limit 0 で全部）".into(),
+        ),
+        (
+            ReplyNote::SearchSkipped {
+                binary: 1,
+                too_large: 0,
+                unreadable: 2,
+            },
+            "探していない: バイナリ 1・読めない 2".into(),
+        ),
+        (
+            ReplyNote::SearchSkipped {
+                binary: 0,
+                too_large: 4,
+                unreadable: 0,
+            },
+            "探していない: 大きすぎる 4".into(),
+        ),
+        (
+            ReplyNote::ReplaceRowStatus("stale".into()),
+            "（stale）".into(),
+        ),
+        (
+            ReplyNote::ReplaceNotApplied {
+                path: "b.txt".into(),
+                reason: "read-only".into(),
+            },
+            "当てない: b.txt — read-only".into(),
+        ),
+        (
+            ReplyNote::ReplaceViaBuffer {
+                pane: "5".into(),
+                path: "a.rs".into(),
+            },
+            "編集中のペイン 5 に当てる: a.rs".into(),
+        ),
+        (
+            ReplyNote::ReplaceMoreLines(3),
+            "ほか 3 行（--limit 0 で全部）".into(),
+        ),
+        (
+            ReplyNote::UndoHeader {
+                id: "2".into(),
+                query: "foo".into(),
+                replacement: "bar".into(),
+            },
+            "置換 #2（foo → bar）".into(),
+        ),
+        (
+            ReplyNote::UndoBackup("/tmp/x".into()),
+            "（退避: /tmp/x）".into(),
+        ),
+        (
+            ReplyNote::JumpHistoryEmpty,
+            "ジャンプ履歴は空（行を指定して開くと積まれる: tako open <file> --line <行>）".into(),
+        ),
+        (
+            ReplyNote::JumpPaneClosed,
+            "（ペインは閉じた。戻ると開き直す）".into(),
+        ),
+        (
+            ReplyNote::JumpSkippedMissing("a.rs:3".into()),
+            "読み飛ばした（ファイルが無い）: a.rs:3".into(),
+        ),
+        (
+            ReplyNote::JumpReopened,
+            "（閉じたペインの項目なので開き直した）".into(),
+        ),
+        (
+            ReplyNote::JumpNothingToMove,
+            "移れる履歴が無い".into(),
+        ),
     ]
 }
 
@@ -21050,6 +21202,12 @@ const CLI_NOTE_SCOPES: &[&str] = &[
     "fn usage_amount(",
     "fn usage_share_footer(",
     "fn usage_text(",
+    // #2365: `tako search`（横断検索・置換・置換の取り消し）と `tako jump` の人向けの表示の枠
+    // （行の中身は GUI が表示言語で組んだ応答の値）
+    "fn print_search(",
+    "fn print_replace(",
+    "fn print_undo(",
+    "fn print_jump(",
 ];
 
 /// CLI `main.rs` でまだ断りに日本語の固定文を持つ関数（頭, 理由）。**断りを移し終えたら外す**
@@ -21866,6 +22024,44 @@ fn queueの進みの行とusageビューとresourcesの待つ理由は表示言�
         None => failures.push(format!(
             "{RESOURCES_TEXT_PATH}: `pub fn wait_reason(` が見つからない（改名ならこの番犬を直す）"
         )),
+    }
+    report_all(failures);
+}
+
+/// #2365 の続き: `tako search`（横断検索・置換・置換の取り消し）と `tako jump` の人向けの表示の枠は表示言語
+/// （`cli_lang()`）で組み、言語を日本語に固定しない（日本語の固定文そのものは `CLI_NOTE_SCOPES` の番犬が見る）
+#[test]
+fn searchとjumpの人向けの表示は表示言語で組む() {
+    let mut failures = Vec::new();
+    for head in [
+        "fn print_search(",
+        "fn print_replace(",
+        "fn print_undo(",
+        "fn print_jump(",
+    ] {
+        let Some(lines) = front_scope_lines(CLI_MAIN_SRC, Some(head)) else {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}: 走査の範囲 `{head}` が見つからない（改名ならこの表を直す）"
+            ));
+            continue;
+        };
+        let code: Vec<(usize, &str)> = lines
+            .iter()
+            .map(|(n, raw)| (*n, strip_line_comment(raw)))
+            .filter(|(_, code)| !code.trim_start().starts_with("//"))
+            .collect();
+        if !code.iter().any(|(_, c)| c.contains("cli_lang()")) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}: `{head}` が表示言語（`cli_lang()`）を引かない = 枠の言語が設定に従わない"
+            ));
+        }
+        for (line, c) in code.iter().filter(|(_, c)| c.contains("Lang::Ja")) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}:{line}: `{head}` が言語を日本語に固定して組む = 英語表示にもその枠だけ日本語で\
+                 出る（`cli_lang()` を渡す）: {}",
+                c.trim()
+            ));
+        }
     }
     report_all(failures);
 }

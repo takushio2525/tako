@@ -13474,31 +13474,31 @@ fn delivery_line(result: &Value) -> Option<String> {
     Some(line)
 }
 
-/// `tako jump` の表示（#1677）。中身の正本は dispatch の応答で、ここは体裁だけ
 /// `tako search` の出力（#1694）。結果は grep と同じ `パス:行:桁: 抜粋`（パスは自分の cwd からの
-/// 相対 = ターミナルのリンクとして開ける）で、最後に件数と打ち切りの理由を 1 行
+/// 相対 = ターミナルのリンクとして開ける）で、最後に件数と打ち切りの理由を 1 行。
+/// 枠は表示言語（#2365。文は `ReplyNote` の 1 か所）で、行の中身（抜粋・理由・案内）は GUI が
+/// 表示言語で組んだ応答の値のまま
 fn print_search(args: &SearchArgs, result: &Value) {
     if args.json {
         println!("{}", pretty_json(result));
         return;
     }
+    let lang = cli_lang();
+    let text = |v: &Value| v.as_str().unwrap_or("").to_string();
     match args.action() {
         "open" => {
-            println!(
-                "開いた: {}:{}:{}（{}）",
-                result["path"].as_str().unwrap_or(""),
-                result["line"],
-                result["column"],
-                result["landing"].as_str().unwrap_or("")
-            );
+            let opened = ReplyNote::SearchOpened {
+                path: text(&result["path"]),
+                line: result["line"].to_string(),
+                column: result["column"].to_string(),
+                landing: text(&result["landing"]),
+            };
+            println!("{}", opened.text_in(lang));
             return;
         }
         "clear" => {
-            if result["cleared"] == Value::Bool(true) {
-                println!("右パネルの検索結果を閉じた");
-            } else {
-                println!("閉じる検索結果は無かった");
-            }
+            let cleared = ReplyNote::SearchCleared(result["cleared"] == Value::Bool(true));
+            println!("{}", cleared.text_in(lang));
             return;
         }
         "replace" => return print_replace(result),
@@ -13507,21 +13507,17 @@ fn print_search(args: &SearchArgs, result: &Value) {
     }
     match result["status"].as_str() {
         Some("empty") => {
-            println!("右パネルに検索結果は無い（tako search <検索語> --show で出す）");
+            println!("{}", ReplyNote::SearchPanelEmpty.text_in(lang));
             return;
         }
         Some("searching") => {
-            println!(
-                "検索中: {}",
-                result["running"]["query"].as_str().unwrap_or("")
-            );
+            let running = ReplyNote::SearchRunning(text(&result["running"]["query"]));
+            println!("{}", running.text_in(lang));
             return;
         }
         Some("error") => {
-            println!(
-                "検索できなかった: {}",
-                result["reason"].as_str().unwrap_or("")
-            );
+            let failed = ReplyNote::SearchFailed(text(&result["reason"]));
+            println!("{}", failed.text_in(lang));
             return;
         }
         _ => {}
@@ -13544,48 +13540,40 @@ fn print_search(args: &SearchArgs, result: &Value) {
     }
     let total = result["total"].as_u64().unwrap_or(0);
     let mut tail = vec![if total == 0 {
-        format!(
-            "見つからなかった（{} ファイルを探した）",
-            result["files_searched"]
-        )
+        ReplyNote::SearchNotFound(result["files_searched"].to_string())
     } else {
-        format!(
-            "{total} 件（{} ファイル・{} ms）",
-            result["files_matched"], result["elapsed_ms"]
-        )
+        ReplyNote::SearchFound {
+            total,
+            files: result["files_matched"].to_string(),
+            ms: result["elapsed_ms"].to_string(),
+        }
     }];
     match result["stopped"].as_str() {
-        Some("limit") => tail.push(format!(
-            "上限 {} 件で打ち切り（--path で範囲を狭めるか検索語を絞る）",
-            tako_core::workspace_search::MAX_RESULTS
+        Some("limit") => tail.push(ReplyNote::SearchStoppedLimit(
+            tako_core::workspace_search::MAX_RESULTS,
         )),
-        Some("time") => tail.push(format!(
-            "所要の上限（{} 秒）で打ち切り",
-            tako_core::workspace_search::DEFAULT_TIME_LIMIT.as_secs()
+        Some("time") => tail.push(ReplyNote::SearchStoppedTime(
+            tako_core::workspace_search::DEFAULT_TIME_LIMIT.as_secs(),
         )),
-        Some("cancelled") => tail.push("取り消された（次の検索が始まった / 閉じられた）".into()),
+        Some("cancelled") => tail.push(ReplyNote::SearchCancelled),
         _ => {}
     }
     let more = result["truncated"].as_u64().unwrap_or(0);
     if more > 0 {
-        tail.push(format!("ほか {more} 件（--limit 0 で全部）"));
+        tail.push(ReplyNote::SearchMore(more));
     }
     let skipped = &result["skipped"];
-    let skip = [
-        ("バイナリ", &skipped["binary"]),
-        ("大きすぎる", &skipped["too_large"]),
-        ("読めない", &skipped["unreadable"]),
-    ]
-    .iter()
-    .filter_map(|(label, n)| {
-        n.as_u64()
-            .filter(|n| *n > 0)
-            .map(|n| format!("{label} {n}"))
-    })
-    .collect::<Vec<_>>();
-    if !skip.is_empty() {
-        tail.push(format!("探していない: {}", skip.join("・")));
+    let count = |key: &str| skipped[key].as_u64().unwrap_or(0);
+    let (binary, too_large, unreadable) =
+        (count("binary"), count("too_large"), count("unreadable"));
+    if binary + too_large + unreadable > 0 {
+        tail.push(ReplyNote::SearchSkipped {
+            binary,
+            too_large,
+            unreadable,
+        });
     }
+    let tail: Vec<String> = tail.iter().map(|n| n.text_in(lang)).collect();
     println!("{}", tail.join(" / "));
 }
 
@@ -13599,8 +13587,9 @@ fn cwd_relative(path: &str) -> String {
 }
 
 /// `tako search --replace` の出力（#2045）。行は `パス:行: 抜粋` と、その下に `→ 置換後`。
-/// 当てないファイルは理由つきで並べ、最後に件数と次の一手
+/// 当てないファイルは理由つきで並べ、最後に件数と次の一手。枠は表示言語（#2365）
 fn print_replace(result: &Value) {
+    let lang = cli_lang();
     let items = result["items"].as_array().cloned().unwrap_or_default();
     for item in &items {
         let status = item["status"].as_str().unwrap_or("");
@@ -13612,26 +13601,31 @@ fn print_replace(result: &Value) {
         );
         match item["replaced"].as_str() {
             Some(after) => println!("  → {after}"),
-            None => println!("  （{status}）"),
+            None => println!(
+                "  {}",
+                ReplyNote::ReplaceRowStatus(status.to_string()).text_in(lang)
+            ),
         }
     }
     for file in result["files"].as_array().into_iter().flatten() {
+        let path = cwd_relative(file["path"].as_str().unwrap_or(""));
         if let Some(reason) = file["reason"].as_str() {
-            println!(
-                "当てない: {} — {reason}",
-                cwd_relative(file["path"].as_str().unwrap_or(""))
-            );
+            let skip = ReplyNote::ReplaceNotApplied {
+                path,
+                reason: reason.to_string(),
+            };
+            println!("{}", skip.text_in(lang));
         } else if file["via"] == "buffer" {
-            println!(
-                "編集中のペイン {} に当てる: {}",
-                file["pane"],
-                cwd_relative(file["path"].as_str().unwrap_or(""))
-            );
+            let buffer = ReplyNote::ReplaceViaBuffer {
+                pane: file["pane"].to_string(),
+                path,
+            };
+            println!("{}", buffer.text_in(lang));
         }
     }
     let more = result["truncated"].as_u64().unwrap_or(0);
     if more > 0 {
-        println!("ほか {more} 行（--limit 0 で全部）");
+        println!("{}", ReplyNote::ReplaceMoreLines(more).text_in(lang));
     }
     if let Some(note) = result["note"].as_str() {
         println!("{note}");
@@ -13641,18 +13635,19 @@ fn print_replace(result: &Value) {
     }
 }
 
-/// `tako search --undo` の出力（#2045）
+/// `tako search --undo` の出力（#2045）。枠は表示言語（#2365）
 fn print_undo(result: &Value) {
     if result["status"] == "nothing" {
         println!("{}", result["note"].as_str().unwrap_or(""));
         return;
     }
-    println!(
-        "置換 #{}（{} → {}）",
-        result["id"],
-        result["query"].as_str().unwrap_or(""),
-        result["replacement"].as_str().unwrap_or("")
-    );
+    let lang = cli_lang();
+    let header = ReplyNote::UndoHeader {
+        id: result["id"].to_string(),
+        query: result["query"].as_str().unwrap_or("").to_string(),
+        replacement: result["replacement"].as_str().unwrap_or("").to_string(),
+    };
+    println!("{}", header.text_in(lang));
     for file in result["files"].as_array().into_iter().flatten() {
         let mut line = format!(
             "{}: {}",
@@ -13660,7 +13655,7 @@ fn print_undo(result: &Value) {
             file["reason"].as_str().unwrap_or("")
         );
         if let Some(backup) = file["backup"].as_str() {
-            line.push_str(&format!("（退避: {backup}）"));
+            line.push_str(&ReplyNote::UndoBackup(backup.to_string()).text_in(lang));
         }
         println!("{line}");
     }
@@ -13669,7 +13664,10 @@ fn print_undo(result: &Value) {
     }
 }
 
+/// `tako jump` の表示（#1677）。中身の正本は dispatch の応答で、ここは体裁だけ。
+/// 枠は表示言語（#2365。文は `ReplyNote`）で、移れない理由は GUI が表示言語で組んだ応答の値のまま
 fn print_jump(sub: &JumpCommand, result: &Value) {
+    let lang = cli_lang();
     let place = |v: &Value| -> String {
         let path = v["path"].as_str().unwrap_or("");
         match v["line"].as_u64() {
@@ -13685,18 +13683,16 @@ fn print_jump(sub: &JumpCommand, result: &Value) {
         JumpCommand::List { json: false } => {
             let entries = result["entries"].as_array().cloned().unwrap_or_default();
             if entries.is_empty() {
-                println!(
-                    "ジャンプ履歴は空（行を指定して開くと積まれる: tako open <file> --line <行>）"
-                );
+                println!("{}", ReplyNote::JumpHistoryEmpty.text_in(lang));
                 return;
             }
             let current = result["history"]["current"].as_u64();
             for (i, entry) in entries.iter().enumerate() {
                 let mark = if current == Some(i as u64) { ">" } else { " " };
                 let closed = if entry["pane_alive"] == Value::Bool(false) {
-                    "（ペインは閉じた。戻ると開き直す）"
+                    ReplyNote::JumpPaneClosed.text_in(lang)
                 } else {
-                    ""
+                    String::new()
                 };
                 println!(
                     "{mark} {i:>3}  {}  pane {}{closed}",
@@ -13707,13 +13703,16 @@ fn print_jump(sub: &JumpCommand, result: &Value) {
         }
         JumpCommand::Back(_) | JumpCommand::Forward(_) => {
             for gone in result["dropped"].as_array().into_iter().flatten() {
-                println!("読み飛ばした（ファイルが無い）: {}", place(gone));
+                println!(
+                    "{}",
+                    ReplyNote::JumpSkippedMissing(place(gone)).text_in(lang)
+                );
             }
             if result["moved"] == Value::Bool(true) {
                 let reopened = if result["reopened"] == Value::Bool(true) {
-                    "（閉じたペインの項目なので開き直した）"
+                    ReplyNote::JumpReopened.text_in(lang)
                 } else {
-                    ""
+                    String::new()
                 };
                 println!(
                     "{}  pane {}{reopened}",
@@ -13721,10 +13720,10 @@ fn print_jump(sub: &JumpCommand, result: &Value) {
                     result["open"]["pane"]
                 );
             } else {
-                println!(
-                    "{}",
-                    result["reason"].as_str().unwrap_or("移れる履歴が無い")
-                );
+                match result["reason"].as_str() {
+                    Some(reason) => println!("{reason}"),
+                    None => println!("{}", ReplyNote::JumpNothingToMove.text_in(lang)),
+                }
             }
         }
     }
