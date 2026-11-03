@@ -18150,9 +18150,22 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::TodoLink(_) => 128,
         ReplyNote::TodoResponse { .. } => 129,
         ReplyNote::TodoDelivery { .. } => 130,
+        ReplyNote::TodosNone => 131,
+        ReplyNote::TodoDue(_) => 132,
+        ReplyNote::TodoReplies(_) => 133,
+        ReplyNote::TodoOpenCount(_) => 134,
+        ReplyNote::TodoExpandedNone => 135,
+        ReplyNote::TodoPanelVisible(_) => 136,
+        ReplyNote::SessionsNone => 137,
+        ReplyNote::SessionNotResumable => 138,
+        ReplyNote::SessionsPendingHeader => 139,
+        ReplyNote::SessionsListHint => 140,
+        ReplyNote::SessionLinkAccount(_) => 141,
+        ReplyNote::SessionLinkNone(_) => 142,
+        ReplyNote::SessionLinkEnableHint => 143,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 131;
+const REPLY_NOTE_VARIANTS: usize = 144;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -18975,6 +18988,44 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             },
             "配送: delivered pane:7".into(),
         ),
+        // #2365 の続き: todo list / expand / collapse・sessions list / link の枠（字下げは呼び手）
+        (ReplyNote::TodosNone, "ユーザータスクが無い".into()),
+        (
+            ReplyNote::TodoDue("2026-11-05".into()),
+            "期限:2026-11-05".into(),
+        ),
+        (ReplyNote::TodoReplies(3), "返答:3".into()),
+        (ReplyNote::TodoOpenCount(0), "未完了 0 件".into()),
+        (ReplyNote::TodoOpenCount(12), "未完了 12 件".into()),
+        (ReplyNote::TodoExpandedNone, "(なし)".into()),
+        (ReplyNote::TodoPanelVisible(true), "表示".into()),
+        (ReplyNote::TodoPanelVisible(false), "非表示".into()),
+        (
+            ReplyNote::SessionsNone,
+            "カタログにセッションが無い（claude ペインの検出後に記録される）".into(),
+        ),
+        (ReplyNote::SessionNotResumable, "（resume 不可）".into()),
+        (
+            ReplyNote::SessionsPendingHeader,
+            "--- session 未検出の spawn 記録（codex / agy・起動直後の claude）---".into(),
+        ),
+        (
+            ReplyNote::SessionsListHint,
+            "(resume: tako sessions resume <id> / 詳細: tako sessions show <id>)".into(),
+        ),
+        (
+            ReplyNote::SessionLinkAccount("univ".into()),
+            "アカウント: univ（このアカウントでログインした端末からだけ開けます）".into(),
+        ),
+        (
+            ReplyNote::SessionLinkNone("not_connected".into()),
+            "公式リンクはありません（state: not_connected）".into(),
+        ),
+        (
+            ReplyNote::SessionLinkEnableHint,
+            "有効にする場合: tako orchestrator profiles set <名前> --remote-control true → 起動し直す"
+                .into(),
+        ),
     ]
 }
 
@@ -19543,6 +19594,11 @@ const CLI_NOTE_SCOPES: &[&str] = &[
     "fn print_sessions_resume(",
     "fn print_todo_detail(",
     "fn todo_response_text(",
+    // #2365: 同じく todo list / expand / collapse・sessions list / link の枠
+    "fn print_todo_list(",
+    "fn print_todo_expanded(",
+    "fn print_sessions_list(",
+    "fn print_sessions_link(",
 ];
 
 /// CLI `main.rs` でまだ断りに日本語の固定文を持つ関数（頭, 理由）。**断りを移し終えたら外す**
