@@ -6053,6 +6053,9 @@ file:line を名指して落ちる（除外はヘルパ自身と `test-virtual-d
   `TAKO_ISOLATED=1` が置き場を差し替えるのは GUI の起動時だけで、**CLI の置き場は変えない**
   （#2531 からは、印のある CLI / daemon が置き場を明示していなければ既定の置き場を読まずに日英の断りで
   止まる = 本番へは届かないが、隔離 GUI へも繋がらない。順番待ちだけは印があっても本番の調停役へ並ぶ）。
+  **#2694 からは手元の処理も同じ**: 印があって `TAKO_DATA_DIR` が無ければ `tako usage` / `migrate` / `setup` ほかの
+  手元のサブコマンドは日英で断る（既定の置き場が砂場の HOME でも断る = 置き場は常に明示する。
+  `verify-setup-multiagent.sh` は砂場の HOME の既定の置き場と同じパスを `TAKO_DATA_DIR` で渡す）。
   `test-serve-watch.sh` は `unset` と `TAKO_ISOLATED=1` だけで `tako remote start` を回し、QR の画像を
   本番のアクティブなタブへ開いた。検証スクリプトは tako CLI を起こす前に `TAKO_DATA_DIR` /
   `TAKO_DISCOVERY_DIR` / `HOME` のどれかを一時の側へ向ける（先頭の `export TAKO_DATA_DIR="$TMP/data"` か、

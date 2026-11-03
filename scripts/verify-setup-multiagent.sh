@@ -150,6 +150,8 @@ prepare_home() {
     printf '%s\n' "$state" >"$home/claude-state"
 }
 
+# 隔離の印（TAKO_ISOLATED=1）の CLI が手元の data dir を使うには置き場の明示が要る（#2694）。砂場の HOME の
+# 既定の置き場と同じパスを渡す（setup の移設 #1019 は TAKO_DATA_DIR があると走らないが、ここでは見ていない）
 run_setup() {
     home=$1
     bin=$2
@@ -161,6 +163,7 @@ run_setup() {
         SHELL="$home/login-shell" \
         PATH="$bin" \
         TAKO_ISOLATED=1 \
+        TAKO_DATA_DIR="$home/Library/Application Support/tako" \
         "$TAKO_BIN" setup "$@" </dev/null >"$output" 2>&1
 }
 
@@ -175,6 +178,7 @@ run_setup_stdin() {
         SHELL="$home/login-shell" \
         PATH="$bin" \
         TAKO_ISOLATED=1 \
+        TAKO_DATA_DIR="$home/Library/Application Support/tako" \
         "$TAKO_BIN" setup --yes --answers - >"$output" 2>&1
 }
 
@@ -188,6 +192,7 @@ run_real_setup() {
         SHELL="$home/login-shell" \
         PATH="$bin" \
         TAKO_ISOLATED=1 \
+        TAKO_DATA_DIR="$home/Library/Application Support/tako" \
         TAKO_REAL_HOME="$TAKO_REAL_HOME" \
         TAKO_REAL_PATH="$TAKO_REAL_PATH" \
         TAKO_REAL_CLAUDE_BIN="$TAKO_REAL_CLAUDE_BIN" \
@@ -250,11 +255,13 @@ printf '[MEASURE] scenario=second before_keys=5+ after_keys=0 prompts=0 source=d
 
 # --check / --changes / FDA / 依存チェック / revision 追従の非退行。
 env HOME="$FIRST_HOME" USERPROFILE="$FIRST_HOME" SHELL="$FIRST_HOME/login-shell" \
-    PATH="$FIRST_BIN" TAKO_ISOLATED=1 "$TAKO_BIN" setup --check >"$TMP/check.out" 2>&1
+    PATH="$FIRST_BIN" TAKO_ISOLATED=1 TAKO_DATA_DIR="$FIRST_HOME/Library/Application Support/tako" \
+    "$TAKO_BIN" setup --check >"$TMP/check.out" 2>&1
 assert_contains "$TMP/check.out" '\[検出\] claude: .*認証済み / pro' "--check が認証・プランを表示しない"
 assert_contains "$TMP/check.out" '\[OK\] 既定エージェント: claude' "--check が既定エージェントを表示しない"
 env HOME="$FIRST_HOME" USERPROFILE="$FIRST_HOME" SHELL="$FIRST_HOME/login-shell" \
-    PATH="$FIRST_BIN" TAKO_ISOLATED=1 "$TAKO_BIN" setup --changes --json >"$TMP/changes.json" 2>&1
+    PATH="$FIRST_BIN" TAKO_ISOLATED=1 TAKO_DATA_DIR="$FIRST_HOME/Library/Application Support/tako" \
+    "$TAKO_BIN" setup --changes --json >"$TMP/changes.json" 2>&1
 assert_contains "$TMP/changes.json" '"selected_agent": "claude"' "--changes が selected_agent を返さない"
 printf '[OK] regression=check,changes,dependency,FDA,revision\n'
 
