@@ -42,6 +42,9 @@
 //! 英語の表示は同じ応答の構造の欄（`reason` / `code` / `eta` / `start_s`）から組む（`QueueWaitReason` ほかは日本語の
 //! 文を持って渡される）。usage の注記（応答の `notes`）と案内（`hint`）は作る側（`usage::payload_in`）もここの
 //! 日本語を載せ、英語の表示は応答から組み直す（`usage::usage_notes`）
+//!
+//! `tako search`（横断検索・置換・置換の取り消し）と `tako jump` の人向けの表示の枠もここが持つ。行の中身
+//! （抜粋・置換後・当てない理由・`note` / `next_step`・移れない理由）は GUI が表示言語で組んだ応答の値のまま
 
 use tako_core::handoff::{HANDOFF_PROJECTS_DIR, PROFILE_MEMO_SOFT_LIMIT_LINES};
 use tako_core::i18n::Lang;
@@ -891,6 +894,73 @@ pub enum ReplyNote {
     UsageNoteIndexLocked,
     /// 使用量の注記: 索引はまだ読み途中（残りの本数・MB）
     UsageNoteIndexPending { files: u64, mb: u64 },
+
+    // ---- CLI の人向けの表示: 横断検索 / 置換 / 置換の取り消し（`tako search`）・ジャンプ履歴（`tako jump`）----
+    // 行の中身（抜粋・置換後・当てない理由・案内・移れない理由）は GUI が表示言語で組んだ応答の値のまま。
+    // 値（パス・行・桁・件数・ペイン番号）は応答の表記のまま埋める
+    /// `tako search --open N`: 開いた場所と着地（`landing` は機械向けの綴り）
+    SearchOpened {
+        path: String,
+        line: String,
+        column: String,
+        landing: String,
+    },
+    /// `tako search --clear`: 閉じたか（`false` = 閉じる結果が無かった）
+    SearchCleared(bool),
+    /// `tako search --results`: 右パネルに結果が無い
+    SearchPanelEmpty,
+    /// `tako search --results`: 検索の最中（検索語）
+    SearchRunning(String),
+    /// `tako search --results`: 検索できなかった（理由は応答の値）
+    SearchFailed(String),
+    /// 検索の結びの行: 見つからなかった（探したファイル数）
+    SearchNotFound(String),
+    /// 検索の結びの行: 件数（ファイル数・所要 ms）
+    SearchFound {
+        total: u64,
+        files: String,
+        ms: String,
+    },
+    /// 検索の結びの行: 上限の件数で打ち切った
+    SearchStoppedLimit(usize),
+    /// 検索の結びの行: 所要の上限（秒）で打ち切った
+    SearchStoppedTime(u64),
+    /// 検索の結びの行: 取り消された
+    SearchCancelled,
+    /// 検索の結びの行: 表示を切った残りの件数
+    SearchMore(u64),
+    /// 検索の結びの行: 探していないファイルの内訳（0 の種類は出さない。呼び手はどれかが 1 以上のときだけ組む）
+    SearchSkipped {
+        binary: u64,
+        too_large: u64,
+        unreadable: u64,
+    },
+    /// `tako search --replace`: 置換後の無い行の状態（`status` は機械向けの綴り）
+    ReplaceRowStatus(String),
+    /// `tako search --replace`: 当てないファイルと理由（理由は応答の値）
+    ReplaceNotApplied { path: String, reason: String },
+    /// `tako search --replace`: 編集中のペインのバッファへ当てるファイル
+    ReplaceViaBuffer { pane: String, path: String },
+    /// `tako search --replace`: 表示を切った残りの行数
+    ReplaceMoreLines(u64),
+    /// `tako search --undo`: 取り消す置換の見出し
+    UndoHeader {
+        id: String,
+        query: String,
+        replacement: String,
+    },
+    /// `tako search --undo`: 行の後ろに付ける退避の置き場
+    UndoBackup(String),
+    /// `tako jump list`: 履歴が空
+    JumpHistoryEmpty,
+    /// `tako jump list`: 行の後ろに付ける「ペインは閉じた」
+    JumpPaneClosed,
+    /// `tako jump back / forward`: ファイルが無くて読み飛ばした項目
+    JumpSkippedMissing(String),
+    /// `tako jump back / forward`: 行の後ろに付ける「開き直した」
+    JumpReopened,
+    /// `tako jump back / forward`: 移れなかった理由が応答に無いとき（古い GUI）の代わりの文
+    JumpNothingToMove,
 }
 
 impl ReplyNote {
@@ -3691,8 +3761,153 @@ impl ReplyNote {
                 "the index is still being read ({files} file(s), {mb} MB left). The GUI continues \
                  in the background (the CLI catches up with tako usage)"
             ),
+
+            (
+                Self::SearchOpened {
+                    path,
+                    line,
+                    column,
+                    landing,
+                },
+                Ja,
+            ) => format!("開いた: {path}:{line}:{column}（{landing}）"),
+            (
+                Self::SearchOpened {
+                    path,
+                    line,
+                    column,
+                    landing,
+                },
+                En,
+            ) => format!("opened {path}:{line}:{column} ({landing})"),
+            (Self::SearchCleared(true), Ja) => "右パネルの検索結果を閉じた".into(),
+            (Self::SearchCleared(true), En) => "closed the search results in the right panel".into(),
+            (Self::SearchCleared(false), Ja) => "閉じる検索結果は無かった".into(),
+            (Self::SearchCleared(false), En) => "there were no search results to close".into(),
+            (Self::SearchPanelEmpty, Ja) => {
+                "右パネルに検索結果は無い（tako search <検索語> --show で出す）".into()
+            }
+            (Self::SearchPanelEmpty, En) => {
+                "no search results in the right panel (tako search <query> --show puts them there)"
+                    .into()
+            }
+            (Self::SearchRunning(query), Ja) => format!("検索中: {query}"),
+            (Self::SearchRunning(query), En) => format!("searching: {query}"),
+            (Self::SearchFailed(reason), Ja) => format!("検索できなかった: {reason}"),
+            (Self::SearchFailed(reason), En) => format!("could not search: {reason}"),
+            (Self::SearchNotFound(files), Ja) => format!("見つからなかった（{files} ファイルを探した）"),
+            (Self::SearchNotFound(files), En) => format!("no matches ({files} file(s) searched)"),
+            (Self::SearchFound { total, files, ms }, Ja) => {
+                format!("{total} 件（{files} ファイル・{ms} ms）")
+            }
+            (Self::SearchFound { total, files, ms }, En) => {
+                format!("{total} match(es) ({files} file(s), {ms} ms)")
+            }
+            (Self::SearchStoppedLimit(limit), Ja) => {
+                format!("上限 {limit} 件で打ち切り（--path で範囲を狭めるか検索語を絞る）")
+            }
+            (Self::SearchStoppedLimit(limit), En) => format!(
+                "stopped at the limit of {limit} matches (narrow it with --path or a more specific query)"
+            ),
+            (Self::SearchStoppedTime(secs), Ja) => format!("所要の上限（{secs} 秒）で打ち切り"),
+            (Self::SearchStoppedTime(secs), En) => format!("stopped at the time limit ({secs} s)"),
+            (Self::SearchCancelled, Ja) => "取り消された（次の検索が始まった / 閉じられた）".into(),
+            (Self::SearchCancelled, En) => {
+                "cancelled (a newer search started / the results were closed)".into()
+            }
+            (Self::SearchMore(more), Ja) => format!("ほか {more} 件（--limit 0 で全部）"),
+            (Self::SearchMore(more), En) => format!("{more} more (--limit 0 shows all)"),
+            (
+                Self::SearchSkipped {
+                    binary,
+                    too_large,
+                    unreadable,
+                },
+                Ja,
+            ) => format!(
+                "探していない: {}",
+                counted([("バイナリ", *binary), ("大きすぎる", *too_large), ("読めない", *unreadable)])
+                    .join("・")
+            ),
+            (
+                Self::SearchSkipped {
+                    binary,
+                    too_large,
+                    unreadable,
+                },
+                En,
+            ) => format!(
+                "not searched: {}",
+                counted([
+                    ("binary", *binary),
+                    ("too large", *too_large),
+                    ("unreadable", *unreadable)
+                ])
+                .join(", ")
+            ),
+            (Self::ReplaceRowStatus(status), Ja) => format!("（{status}）"),
+            (Self::ReplaceRowStatus(status), En) => format!("({status})"),
+            (Self::ReplaceNotApplied { path, reason }, Ja) => format!("当てない: {path} — {reason}"),
+            (Self::ReplaceNotApplied { path, reason }, En) => {
+                format!("not applied: {path} — {reason}")
+            }
+            (Self::ReplaceViaBuffer { pane, path }, Ja) => {
+                format!("編集中のペイン {pane} に当てる: {path}")
+            }
+            (Self::ReplaceViaBuffer { pane, path }, En) => {
+                format!("applies to the buffer of the editing pane {pane}: {path}")
+            }
+            (Self::ReplaceMoreLines(more), Ja) => format!("ほか {more} 行（--limit 0 で全部）"),
+            (Self::ReplaceMoreLines(more), En) => {
+                format!("{more} more line(s) (--limit 0 shows all)")
+            }
+            (
+                Self::UndoHeader {
+                    id,
+                    query,
+                    replacement,
+                },
+                Ja,
+            ) => format!("置換 #{id}（{query} → {replacement}）"),
+            (
+                Self::UndoHeader {
+                    id,
+                    query,
+                    replacement,
+                },
+                En,
+            ) => format!("replacement #{id} ({query} → {replacement})"),
+            (Self::UndoBackup(backup), Ja) => format!("（退避: {backup}）"),
+            (Self::UndoBackup(backup), En) => format!(" (backup: {backup})"),
+            (Self::JumpHistoryEmpty, Ja) => {
+                "ジャンプ履歴は空（行を指定して開くと積まれる: tako open <file> --line <行>）".into()
+            }
+            (Self::JumpHistoryEmpty, En) => "the jump history is empty (opening a file at a line \
+                 adds to it: tako open <file> --line <line>)"
+                .into(),
+            (Self::JumpPaneClosed, Ja) => "（ペインは閉じた。戻ると開き直す）".into(),
+            (Self::JumpPaneClosed, En) => " (the pane was closed; moving here reopens it)".into(),
+            (Self::JumpSkippedMissing(place), Ja) => {
+                format!("読み飛ばした（ファイルが無い）: {place}")
+            }
+            (Self::JumpSkippedMissing(place), En) => {
+                format!("skipped (the file no longer exists): {place}")
+            }
+            (Self::JumpReopened, Ja) => "（閉じたペインの項目なので開き直した）".into(),
+            (Self::JumpReopened, En) => " (reopened, since its pane had been closed)".into(),
+            (Self::JumpNothingToMove, Ja) => "移れる履歴が無い".into(),
+            (Self::JumpNothingToMove, En) => "no history to move to".into(),
         }
     }
+}
+
+/// `ラベル 件数` の並び（0 件のラベルは出さない）。[`ReplyNote::SearchSkipped`] の内訳
+fn counted<const N: usize>(items: [(&str, u64); N]) -> Vec<String> {
+    items
+        .iter()
+        .filter(|(_, n)| *n > 0)
+        .map(|(label, n)| format!("{label} {n}"))
+        .collect()
 }
 
 /// [`ReplyNote::QueueLimits`] の中身（大きいので箱に入れる = `ReplyNote` を小さく保つ。#2365）
