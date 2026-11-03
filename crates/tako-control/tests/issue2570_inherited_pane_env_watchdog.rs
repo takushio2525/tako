@@ -317,7 +317,7 @@ fn scan_script(script: &str) -> Vec<Offender> {
 }
 
 /// 4. 外しすぎ: `main` が隔離のために立てる名前は `STRIP` に無い。立てる口は `set_var` と、
-/// 検証起動の置き場を当てて覚える `scoped_dirs::adopt`（#2686。名前は同じく最初の引数）
+///    検証起動の置き場を当てて覚える `scoped_dirs::adopt`（#2686。名前は同じく最初の引数）
 fn scan_isolation(main: &str) -> Vec<Offender> {
     const SETTERS: [&str; 2] = ["std::env::set_var(", "tako_core::scoped_dirs::adopt("];
     let mut out = Vec::new();
