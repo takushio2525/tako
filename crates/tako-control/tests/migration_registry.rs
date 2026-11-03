@@ -90,6 +90,8 @@ fn 共有対象の設定ファイルは移行の番地にも載っている() {
         ("claude-mod/ui.json", SchemaId::ClaudeModUi),
         // #1731: Code Runner の実行設定（マシン固有のパス = Local）
         ("run-configs.json", SchemaId::RunConfigs),
+        // #1996: 順番待ちの過去の記録（`resources/history.jsonl`。カタログは dir 単位 = Local）
+        ("resources/", SchemaId::QueueHistory),
     ];
     // tako の data dir の外（Claude Code の設定 dir = カタログの `Root::Claude`）に置く番地
     const CLAUDE_MAPPING: &[(&str, SchemaId)] = &[
@@ -394,7 +396,7 @@ fn fingerprint() -> BTreeMap<String, Vec<String>> {
             // 読めない行は飛ばす）が、欄を増減・改名したら旧い行が読めるかをここで選ばせる。
             // 行に入る区分の語（enum）も載せる
             "crates/tako-core/src/queue.rs",
-            &["HistoryRow", "JobKind"],
+            &["HistoryRow", "JobKind", "Priority"],
         ),
         (
             // #724 の W4: Web ビューの生成中に落ちた印 `<data_dir>/webview-guard.json`。版数の番地は持たない

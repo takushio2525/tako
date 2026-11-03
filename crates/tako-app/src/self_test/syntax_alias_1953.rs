@@ -287,26 +287,35 @@ pub(super) async fn syntax_alias_visual(
             )
         })
         .unwrap_or_default();
-    // 塗り直しを状態で待つ（上限 10 秒）
-    let mut after_edit = None;
-    for _ in 0..100 {
-        notify_and_draw(any, window, cx);
-        window
-            .update(cx, |app, _, cx| app.drain_pending_highlights(cx))
-            .ok();
-        after_edit = window
-            .update(cx, |app, _, _| {
-                tako_control::PreviewHost::preview_syntax(app, draft_pane)
-            })
-            .ok()
-            .flatten();
-        if after_edit.as_deref() == Some("MATLAB") {
-            break;
+    // 塗り直しを状態で待つ。全文の塗り（編集セッションの seed は render の入口が流す）と
+    // プレビューの塗りが走っている間だけ待ち、走り終えたのに MATLAB でなければその場で偽
+    // （#1902。旧は 100 回 × 100ms の回数の窓）
+    window
+        .update(cx, |app, _, cx| app.drain_pending_highlights(cx))
+        .ok();
+    let budget = text_wait_budget(100, 100, 30);
+    let _ = wait_for_background_state(any, window, cx, "syntax-repaint", budget, true, |app| {
+        let matlab =
+            tako_control::PreviewHost::preview_syntax(app, draft_pane).as_deref() == Some("MATLAB");
+        let painting = app
+            .preview_edits
+            .get(&draft_pane)
+            .is_some_and(preview::EditState::highlight_pending);
+        if matlab {
+            BackgroundWait::Landed
+        } else if painting || preview_background_running(app, draft_pane) {
+            BackgroundWait::Running
+        } else {
+            BackgroundWait::Settled
         }
-        cx.background_executor()
-            .timer(Duration::from_millis(100))
-            .await;
-    }
+    })
+    .await;
+    let after_edit = window
+        .update(cx, |app, _, _| {
+            tako_control::PreviewHost::preview_syntax(app, draft_pane)
+        })
+        .ok()
+        .flatten();
     println!(
         "TAKO_VISUAL_PIXEL: {SECTION} file=draft.m before_edit={before_edit:?} editing={editing} \
          applied_syntax={applied_syntax:?} after_edit={after_edit:?}"

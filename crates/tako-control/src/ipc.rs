@@ -79,8 +79,11 @@ pub fn submit(
     // #1993 / #1994: PC リソースの状況と順番待ちは UI の受け口へ渡さずここで答える（採取は
     // 背景スレッドの覚え、古ければこの接続のスレッドで採り直す）。UI が固まっていても
     // 状況を返し、ビルドの割り当ても進む
+    // #1996: ペインの優先度の既定の変更だけはペインの模型（layout.json）を書くので UI の受け口へ渡す
     if let Request::Queue { .. } = &request {
-        return crate::queue::answer(&request).map_err(SubmitError::Rejected);
+        if !crate::queue::needs_ui(&request) {
+            return crate::queue::answer(&request).map_err(SubmitError::Rejected);
+        }
     }
     let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
     tx.unbounded_send(IncomingRequest {

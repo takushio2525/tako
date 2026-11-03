@@ -383,10 +383,34 @@ S2 の「先頭が入れなければ後ろも待つ」は、先頭が**同じ ta
 | ピークを過ぎた | ①木の最大が見込みに届いた、または ②過去の記録の山の時刻（同じコマンド / 形の記録の中の最大）+ 60 秒を過ぎ、自分の最大の更新からも 60 秒たった（`peak_passed`） | ①は本番の形（7.3 GB ≥ 7 GB）。②は今回の山が記録より小さく終わった回（差分ビルドの `cargo test --workspace`）。記録が無ければ時間では過ぎない（初回は安全側）。60 秒は 2 秒ごとの走査の取りこぼしと回ごとの山の時刻の揺れを覆う |
 | 見込み | 同じコマンドの直近 5 回の最大 → 無ければ同じ形の直近 10 回の最大（2 回以上）→ 区分の既定。128 MB 刻みへ切り上げ・下限 256 MB（`queue::estimate`） | 最大を採るのは安全側（失敗で早く終わった回が混ざっても下がらない）。形は 1 回だけだと形の中の軽い 1 本に引きずられる |
 | 鍵 | 同じコマンド = 「repo の根 + 正規化した argv（前置きの env / nice / time を飛ばし、プログラムは basename）」の FNV-1a 64bit。git の worktree（`.git` がファイルで `gitdir: <本体>/.git/worktrees/<名前>`）は**本体の根へ寄せる**。同じ形 = cargo だけ、`--test` / `--bench` / `--example` / `--bin` の値・`--target-dir` / `--manifest-path` / `--config` の値・2 語目以降の位置引数（テストの絞り込み）・`--` の後ろの位置引数を `*` にした argv の同じハッシュ。**`-p` の値は伏せない** | worker は Issue ごとに worktree を作るので、根のパスのままだと記録が引き継がれない。Issue ごとに変わる `--test <名前>` は形でまとめ、パッケージで重さが大きく違う `-p tako-app` と `-p tako-cli` は分ける。シェルスクリプト・node は中身で重さが違うので形でまとめない |
-| 記録 | `<data_dir>/resources/history.jsonl`（§6 と同じ置き場。#1996 の所要時間もここへ足す）。終わった処理 1 件 = 1 行（`at` / `key` / `shape` / `name` / `kind` / `peak_mb` / `peak_at_s` / `ran_s` / `exit_code`）。512 KB で `history.1.jsonl` へ回す。読めない行は飛ばす。共有しない（`config_share::catalog` の `resources/` = Local） | **生の argv とパスは書かない**（ハッシュと表示名 `cargo test` だけ。番犬で検査）。追記だけのファイルなので版数の番地は持たず、行の欄は `migration_registry` の指紋で固定（欄を足すなら serde の default） |
+| 記録 | `<data_dir>/resources/history.jsonl`（§6 と同じ置き場。#1996 の所要時間もここへ足す）。終わった処理 1 件 = 1 行（`at` / `key` / `shape` / `name` / `kind` / `peak_mb` / `peak_at_s` / `ran_s` / `exit_code`）。512 KB で `history.1.jsonl` へ回す。読めない行は飛ばす。共有しない（`config_share::catalog` の `resources/` = Local） | **生の argv とパスは書かない**（ハッシュと表示名 `cargo test` だけ。番犬で検査）。行の欄は `migration_registry` の指紋で固定（欄を足すなら serde の default）。#1996 で移行の番地 `queue_history`（v1・版数の欄なし）に載せた（§4.10） |
 | 諦めた件の表示 | wrapper は待ちの上限で外れるときに `done` へ 75 を載せ、最後の poll の `holders`（実行中・割り当て済みの使用・最大・まだ使っていない見込み・見込みとその出どころ・ピーク後・停滞）を stderr に出す。調停役は `recent` に `gave_up` / `reason` / `text` / `holders` を残す（CLI `tako queue` の「直近の諦め」・MCP `tako_queue`） | 「何がどれだけ押さえていたか」が分からないと、30 分の詰まりの原因を追えない（今回も #2243 の worker の実測まで分からなかった） |
 | 歯止め | §4.3 の 2・4・6（メモリ圧 warn / critical・swap・予約・空きの実測）は変えない | 安全側を崩さない。本当に空きが無いときは今まで通り待つ |
 | A/B | 調停役のプロセスの env `TAKO_2254_LEGACY=1` で修正前（区分の既定だけ・最後まで押さえる）。記録は修正前でも足す | 同じバイナリで修正前を再現（`scripts/test-queue-reservation-2254.sh`。注入 `TAKO_QUEUE_INJECT` の `jobs` で実行中の木の使用量・最大を与え、負荷は生成しない） |
+
+### 4.10 S4（#1996）の実装で決めたこと
+
+§5・§6 のとおりに入れたうえで、実装の途中で決めた差分と細部（正は FR-2.43.14 とコード）:
+
+| 項目 | 決めたこと | 理由 |
+|---|---|---|
+| 段の決め手 | 純関数 `tako_core::queue::priority::resolve`（処理 > ペイン > 役割）と `role_default`。役割は**調停役が GUI のペインの一覧の役割ラベル**（`orchestrator-master / solo / worker`）から読み、一覧に無いペイン（GUI 無しの調停役・別の tako の番号）は wrapper が env `TAKO_ORCHESTRATOR_ROLE` から読んだ役割で補う。端末かは wrapper の **stdin** | 役割はペインの側が正本（env はエージェントの起動にしか付かない）。stdin を見るのは `tako queue cargo build 2>&1 \| tee log` を人が打っても top に倒すため（stderr はパイプ） |
+| 役割の無いペインの非端末 | `normal`（§5 の表に無い行） | 背景のスクリプトや手で起こした claude の Bash は人の打鍵ではない。worker と同じ扱い |
+| 旧い wrapper | 手がかり（`JobWire.hint`）が無ければ送ってきた `priority` を処理の指定とみなす（既定の normal も） | 着地から本番の入れ替えまでの間、旧い wrapper の並びを S2 から変えない |
+| 受付番号での変更 | 調停役の `Job.priority_override` と、応答の `job_priority` を wrapper が覚えて次の poll から送る形の 2 か所。wrapper が送ってきたら調停役は持つのをやめる | 正本は wrapper のまま（§4.7）。調停役を立て直しても変更が戻らない |
+| ペインの既定の変更 | **UI スレッドの dispatch が受ける**（`ipc::submit` は `queue::needs_ui` の 1 種だけ手前で答えない）。ペインの模型に付けて layout.json に残し、調停役が読む一覧の覚え（`resources::set_pane_queue_priority`）へもすぐ写す | ペインの模型を書くのは UI スレッドだけ。受付番号の変更・status・割り当ては今まで通り手前で答える（UI が固まっても止まらない） |
+| `default` | `priority` の値に `default`（既定へ戻す）を足した | 付けた段を外す口が無いと、一度付けたペインの既定・処理の段を役割の既定へ戻せない |
+| エイジングの時計 | 調停役が `WaitingJob.priority` を作るときに `aged(段, 今 − 受付)` を当てる。`admit` / `order_waiting` は時計を持たないまま | 並びの純関数を変えずに済み、テストは受付の時刻（データ）で時計を注入できる。同じ段の中で古い方は必ず同じか多く上がるので受付の順は崩れない（単体テストで全域を確かめた） |
+| 進みを読む対象 | 自分の stderr が端末でない・子が cargo の `build / check / test / bench / clippy / doc / rustc / rustdoc`（`run` / `install` は外す）・利用者が `CARGO_TERM_PROGRESS_WHEN` を決めていない | `run` はビルドの後のプログラムの stderr まで受け続ける（対話・長生きの子を遅らせない）。`--config term.progress.when` は clippy（外部サブコマンド）へ届かない（実測）ので §6 のとおり env で渡す |
+| 進みの行の外し方 | `eta::ProgressFilter`: `\r` で終わる区切りのうち「空白・語・` [`…`] `」の形（色の制御列は外して照らす）と空白だけの消しを落とし、それ以外は 1 バイトも変えずに流す。形になりえないと分かった時点で流す（`\n` を待たない）。長さ 256 B 超は進みの行とみなさない | 2026-11-03 の実測（cargo 1.95・非 TTY + `always` + 幅 80）で進みの行は `\r` で終わり次の行が上書きする。途中の行（プロンプト等）を溜めて遅らせない |
+| 読み切りの待ち | 子が終わってから stderr を読み切るのを最大 2 秒待つ | 子孫が stderr を持ったまま残っても wrapper が終われる |
+| 戻す口（A/B） | wrapper のプロセスの env `TAKO_1996_LEGACY=1` で stderr を受けず `CARGO_TERM_PROGRESS_WHEN` も足さない（従来の素通し）。判断の呼び出しは門 `!legacy_1996() &&` を通す（番犬が外す注入を名指す） | `tako queue` を通る全ビルドの入出力を変えるので、出力の並び・子孫の stderr で困ったときに 1 つの env で戻せるように |
+| 過去の所要時間 | 同じ鍵の直近 5 回（成功した回 = 終了コード 0 を優先・無ければ問わない）の中央値と前回。**記録が 1 回あれば出す**（= 同じコマンドの 2 回目から） | §6 の「2 回以上」は今回の実行を含めた数と読んだ（受け入れ条件「同じ鍵の 2 回目から」） |
+| 開始の見込み | `eta::start_after`: 枠（同時数 − tako の外）を、枠を持つ実行中（停滞を除く）の残りと前に並ぶ件の所要時間で順に埋める。同じ target dir の実行中の残りより前には始まらない。メモリの条件は見ない（「約」） | 前に並ぶ全件・実行中の全件に見込みがあるときだけ（§6）。記録を超えた実行中（overrun）は残りが分からないので出さない |
+| 記録の欄 | `HistoryRow.units`（cargo のユニットの総数 `M`。serde の default）を足した | §6 の「`M`」。旧い行はそのまま読める |
+| 記録の移行の番地 | **`SchemaId::QueueHistory`（v1・版数の欄なし）に載せた**（§4.9・§6 の「番地は持たない」を改めた）。検査は「全行が 1 行の記録として読めるか」。調停役は起動の読み込み（`queue_history::load_and_repair`）で読めない行を見つけたら、元の中身を `history.jsonl.unreadable.bak` へ写してから読める行だけで書き直す | 追記だけのファイルは、書きかけの最終行の後ろへ追記が続くと読めない行が増えていく。退避してから直せば中身は失わず、以後は読める行だけが積もる。`tako migrate status` の健康診断にも載る |
+| 書く前の検査 | `queue_history::row_leak`: 鍵と形は 16 桁の 16 進、表示名は 2 語まで（パスの区切り・`=`・空白・制御文字なし）・64 B まで。外れた行は書かず persist.log に欄の名前だけ | 「生の argv とパスを書かない」を書く側の 1 か所でも縛る（番犬 `issue1996_queue_priority_eta_watchdog` が注入で名指す） |
+| GUI の経路 | resources ビューのチップ（S3 = #1995）は同じ dispatch（受付番号 = `queue::handle("priority")`・ペイン = dispatch の `priority` + `pane`）を呼ぶ形にする。#1996 では dispatch と CLI / MCP まで | S3 が未着手。3 経路の口は 1 実装なので、GUI は呼ぶだけになる |
 
 ## 5. 優先度（論点 4）
 
@@ -399,8 +423,8 @@ S2 の「先頭が入れなければ後ろも待つ」は、先頭が**同じ ta
 
 - **付ける場所**: 処理（`--priority` / 後からの変更）> ペイン（そのペインから出る処理の既定。layout.json の
   ペインに serde default のフィールドで持つ = 器のペインが GUI の再起動をまたいでも残る）> 役割の既定
-- **変え方**: `tako queue priority <受付番号 | --pane N> <top|high|normal|low>`・MCP `tako_queue` の `priority`・
-  resources ビューの行のチップ。master は「merge を塞いでいる worker」を上げられる
+- **変え方**: `tako queue priority <受付番号 | --pane N> <top|high|normal|low|default>`・MCP `tako_queue` の `priority`・
+  resources ビューの行のチップ（#1995）。master は「merge を塞いでいる worker」を上げられる。`default` は既定へ戻す（§4.10）
 - **エイジング**: 待ち 15 分ごとに 1 段上げる（`high` まで。`top` へは自動で上げない）= 飢餓を防ぐ
 - **横取りはしない**: 走っている処理を止めて上位を入れることはしない（§3 の G を採らない理由と同じ）。
   優先度が効くのは「次に誰を入れるか」だけ
@@ -419,8 +443,8 @@ S2 の「先頭が入れなければ後ろも待つ」は、先頭が**同じ ta
   材料が無ければ「経過 4 分（見込みなし）」
 - 待ちの見込み: 前に並ぶ全件に見込みがあるときだけ「開始まで約 N 分」、無ければ順位だけ
 - 履歴に**生の argv とパスは書かない**（ハッシュと表示名だけ）。ペインの内容も持たない。置き場と行（最大メモリ・
-  山の時刻・所要時間・終了コード）は #2254 で入った（§4.9）。追記だけの共有しない Local なので、`usage/` の行（#2200）と
-  同じく版数の番地は持たず、行の欄を `migration_registry` の指紋で固定する（#1996 で欄を足すなら serde の default）
+  山の時刻・所要時間・終了コード）は #2254 で入った（§4.9）。#1996 でユニット数 `units` を足し（serde の default）、
+  移行の番地 `queue_history`（v1）に載せた。読めない行は `.unreadable.bak` へ退避してから読める行だけに直す（§4.10）
 
 ## 7. 見せ方（論点 6）
 
@@ -629,7 +653,7 @@ MCP の子が起きない構成:                          1.1s 2 本 353 MB → 
 | S1 | #1993 | 計測の土台（B29・背景の採取・分類・帰属）と読み取り口（`tako queue` の状況 / MCP `tako_queue` の `status`） | なし | M |
 | S2 | #1994 | 順番待ち本体（`tako queue <cmd>`・調停役・割り当ての条件・再起動をまたぐ・fail-open・取り分）+ この repo の入口の採用（✅ 実装の差分は §4.7） | S1 | L |
 | S3 | #1995 | 右パネルの `resources` ビューとステータスバーの 1 区画 | S1（待ち行列の欄は S2） | M |
-| S4 | #1996 | 優先度（4 段・変更・エイジング）と終わりの見込み（`N/M`・過去の所要時間） | S2 | M |
+| S4 | #1996 | 優先度（4 段・変更・エイジング）と終わりの見込み（`N/M`・過去の所要時間）（✅ dispatch + CLI / MCP まで。GUI のチップは S3。実装の差分は §4.10） | S2 | M |
 | S5 | #1997 | AI の運用（spawn の `machine` / `advice`・guide・fleet の列・agent 能力マトリクスの 1 行・一括復帰の実測） | S2 | M |
 | S6 | #1998 | cargo の全体並列の上限（共有 jobserver の注入と札の数え直し）（✅ 実装の差分は §9.7） | S1 | M |
 | S7 | #1999 | スマホ（PWA）の状況カードと `#/resources` | S3・S4 | S〜M |

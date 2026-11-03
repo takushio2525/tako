@@ -53,6 +53,8 @@ fn queue(action: &str, job: Option<JobWire>) -> Request {
         job,
         id: None,
         limits: None,
+        pane: None,
+        priority: None,
     }
 }
 

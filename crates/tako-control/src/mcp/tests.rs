@@ -1091,6 +1091,50 @@ mod tests {
         );
     }
 
+    /// #1996: `tako_queue` の priority は受付番号かペインと段をそのまま `Request::Queue` へ写す
+    /// （呼び出し元のペインで補わない = 受付番号と排他のまま dispatch / 受け口が判断する）
+    #[test]
+    fn issue1996_queueのpriorityは受付番号かペインと段を写す() {
+        let (_, requests) = run(
+            call(
+                "tako_queue",
+                json!({ "action": "priority", "id": 4242, "priority": "high" }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Queue {
+                action: Some("priority".into()),
+                job: None,
+                id: Some(4242),
+                limits: None,
+                pane: None,
+                priority: Some("high".into()),
+            }]
+        );
+        let (_, requests) = run(
+            call(
+                "tako_queue",
+                json!({ "action": "priority", "pane": 5, "priority": "default" }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Queue {
+                action: Some("priority".into()),
+                job: None,
+                id: None,
+                limits: None,
+                pane: Some(5),
+                priority: Some("default".into()),
+            }]
+        );
+    }
+
     /// #1993 / #1994: `tako_queue` は `Request::Queue` へ写る（action 省略は status = dispatch /
     /// 受け口が既定を持つ）。cancel の id と limits の変更もそのまま渡す。wrapper 専用の job は渡せない
     #[test]
@@ -1103,6 +1147,8 @@ mod tests {
                 job: None,
                 id: None,
                 limits: None,
+                pane: None,
+                priority: None,
             }]
         );
         let (_, requests) = run(call("tako_queue", json!({ "action": "status" })), None, true);
@@ -1113,6 +1159,8 @@ mod tests {
                 job: None,
                 id: None,
                 limits: None,
+                pane: None,
+                priority: None,
             }]
         );
         let (_, requests) = run(
@@ -1127,6 +1175,8 @@ mod tests {
                 job: None,
                 id: Some(4242),
                 limits: None,
+                pane: None,
+                priority: None,
             }]
         );
         let (_, requests) = run(
@@ -1148,6 +1198,8 @@ mod tests {
                     reset: true,
                     ..Default::default()
                 }),
+                pane: None,
+                priority: None,
             }]
         );
     }

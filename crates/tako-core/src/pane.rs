@@ -112,6 +112,9 @@ pub struct Pane {
     /// リセット時刻をその時刻から解く。layout.json に保存する（告知は本文ではなく要約だけ）。
     /// 箱に入れるのは `PaneNode::Leaf` を太らせないため（clippy の large_enum_variant）
     limit_seen: Option<Box<crate::limit_resume::LimitSeen>>,
+    /// このペインから出る `tako queue` の処理の優先度の既定（#1996。`None` = 役割の既定）。
+    /// `tako queue priority --pane N <段>` で付け、layout.json に保存して GUI の再起動をまたいで残す
+    queue_priority: Option<crate::queue::Priority>,
 }
 
 impl Pane {
@@ -128,6 +131,7 @@ impl Pane {
             limit_autoresume: false,
             limit_autoresume_decided: false,
             limit_seen: None,
+            queue_priority: None,
         }
     }
 
@@ -157,6 +161,8 @@ impl Pane {
             limit_autoresume_decided: false,
             // 告知の記憶（#1710）は呼び出し側が [`Self::set_limit_seen`] で戻す
             limit_seen: None,
+            // 順番待ちの優先度の既定（#1996）は呼び出し側が [`Self::set_queue_priority`] で戻す
+            queue_priority: None,
         }
     }
 
@@ -199,6 +205,15 @@ impl Pane {
 
     pub fn role(&self) -> Option<&str> {
         self.role.as_deref()
+    }
+
+    /// `tako queue` の処理の優先度の既定（#1996。`None` = 役割の既定）
+    pub fn queue_priority(&self) -> Option<crate::queue::Priority> {
+        self.queue_priority
+    }
+
+    pub fn set_queue_priority(&mut self, priority: Option<crate::queue::Priority>) {
+        self.queue_priority = priority;
     }
 
     pub fn set_role(&mut self, role: Option<String>) {
