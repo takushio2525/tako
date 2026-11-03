@@ -520,6 +520,7 @@ fn settle(g: &mut Gate, now: Instant) -> Vec<HistoryRow> {
             peak_at_s: view.peak_seen_s,
             ran_s: view.ran_s,
             exit_code: None,
+            units: None,
         });
     }
     rows

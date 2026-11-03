@@ -4065,6 +4065,18 @@ enum QueueCommand {
         #[arg(long)]
         json: bool,
     },
+    /// 優先度を変える（#1996。`tako queue priority <受付番号> <段>` / `tako queue priority --pane N <段>` =
+    /// そのペインから出る処理の既定。段は top / high / normal / low、既定へ戻すなら default）
+    Priority {
+        /// `<受付番号> <段>`（`--pane` を付けたら `<段>` だけ）
+        #[arg(num_args = 1..=2, required = true)]
+        values: Vec<String>,
+        /// そのペインから出る処理の既定を変える（layout.json に残る）
+        #[arg(long)]
+        pane: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
     /// メモリの逼迫で起動を待っている agent を今すぐ起こす（#2413。番号は `tako queue` の起動待ちのペイン）
     Start {
         /// 起動を待っているペインの番号（spawn / run の応答の `pane_id`）
@@ -7931,6 +7943,8 @@ fn queue_request(action: &str) -> Request {
         job: None,
         id: None,
         limits: None,
+        pane: None,
+        priority: None,
     }
 }
 
@@ -7947,10 +7961,11 @@ fn queue_run_cli(args: &QueueArgs) -> ExitCode {
             .ok()
             .filter(|v| !v.is_empty())
     });
+    // 付けなければ既定（ペイン > 役割。#1996）
     let priority = match priority_text.as_deref() {
-        None => tako_core::queue::Priority::default(),
+        None => None,
         Some(p) => match tako_core::queue::Priority::parse(p) {
-            Some(p) => p,
+            Some(p) => Some(p),
             None => {
                 eprintln!(
                     "error: {}",
@@ -7995,6 +8010,8 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
                 job: None,
                 id: Some(*id),
                 limits: None,
+                pane: None,
+                priority: None,
             };
             let result = queue_send(request).map_err(|e| match e {
                 SendError::Unreachable(_) => QUEUE_OFFLINE_NOTE.to_string(),
@@ -8017,12 +8034,28 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
             }
             Ok(())
         }
+        Some(QueueCommand::Priority { values, pane, json }) => {
+            let request = queue_priority_request(values, *pane)?;
+            let result = queue_send(request).map_err(|e| match e {
+                SendError::Unreachable(_) => QUEUE_OFFLINE_NOTE.to_string(),
+                SendError::Timeout(limit) => tako_control::protocol::reply_timeout_message(limit),
+                SendError::Rejected(m) => m,
+            })?;
+            if *json {
+                println!("{}", pretty_json(&result));
+            } else {
+                print_queue_priority(&result);
+            }
+            Ok(())
+        }
         Some(QueueCommand::Start { id, json }) => {
             let request = Request::Queue {
                 action: Some("start".into()),
                 job: None,
                 id: Some(*id),
                 limits: None,
+                pane: None,
+                priority: None,
             };
             let result = queue_send(request).map_err(|e| match e {
                 SendError::Unreachable(_) => QUEUE_OFFLINE_NOTE.to_string(),
@@ -8070,6 +8103,8 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
                 job: None,
                 id: None,
                 limits: Some(patch.clone()),
+                pane: None,
+                priority: None,
             };
             // GUI が居なくても・応答しなくても設定ファイルは変えられる（調停役は次に mtime を見て読み直す）
             let result = match queue_send(request) {
@@ -8097,6 +8132,31 @@ fn queue_cli(args: &QueueArgs) -> Result<(), String> {
         }
         Some(QueueCommand::Run(_)) => unreachable!("cli_main が queue_run_cli へ回す"),
     }
+}
+
+/// `tako queue priority <受付番号> <段>` / `tako queue priority --pane N <段>` の要求（#1996。MCP `tako_queue` の
+/// `action: priority` と同じ形）。段の読みは受け口 / dispatch の 1 実装に任せる（ここは並びだけを見る）
+fn queue_priority_request(values: &[String], pane: Option<u64>) -> Result<Request, String> {
+    let (id, level) = match (pane, values) {
+        (Some(_), [level]) => (None, level.clone()),
+        (None, [id, level]) => (
+            Some(
+                id.parse::<u64>()
+                    .map_err(|_| front_err(Reason::CannotParse("id", format!("{id:?}"))))?,
+            ),
+            level.clone(),
+        ),
+        (Some(_), [_, _]) => return Err(front_err(Reason::QueuePriorityTargetBoth)),
+        _ => return Err(front_err(Reason::QueuePriorityTargetMissing)),
+    };
+    Ok(Request::Queue {
+        action: Some("priority".into()),
+        job: None,
+        id,
+        limits: None,
+        pane,
+        priority: Some(level),
+    })
 }
 
 /// `tako queue`（状況）: PC リソースと順番待ち（#1993 / #1994）。届かなければ機の状態だけをこのプロセスで採る
@@ -8164,6 +8224,60 @@ fn print_queue_limits(v: &Value) {
     );
 }
 
+/// 優先度の段の表示（#1996）: 「high（ペインの既定）」/「high（normal から待ちで上がった）」
+fn queue_priority_text(v: &Value) -> String {
+    let p = v["priority"].as_str().unwrap_or("normal");
+    let from = match v["priority_from"].as_str() {
+        Some("job") => "処理に付けた段",
+        Some("pane") => "ペインの既定",
+        Some("role") => "役割の既定",
+        _ => return p.to_string(),
+    };
+    if v["aged"] == true {
+        format!(
+            "{p}（{from} {} から待ちで上がった）",
+            v["base_priority"].as_str().unwrap_or("?")
+        )
+    } else {
+        format!("{p}（{from}）")
+    }
+}
+
+/// `tako queue priority` の結果（#1996）
+fn print_queue_priority(v: &Value) {
+    if let Some(pane) = v["pane"].as_u64() {
+        let jobs = v["jobs"].as_array().cloned().unwrap_or_default();
+        println!(
+            "ペイン {pane} から出る処理の優先度の既定を {} にした（順番待ちの中のそのペインの処理 {} 件）",
+            v["priority"].as_str().unwrap_or("?"),
+            jobs.len()
+        );
+        for j in &jobs {
+            println!(
+                "  {}  {}  {}  {}",
+                j["id"],
+                j["label"].as_str().unwrap_or("?"),
+                j["phase"].as_str().unwrap_or("?"),
+                queue_priority_text(j)
+            );
+        }
+        return;
+    }
+    println!(
+        "優先度: {} {} → {}{}",
+        v["id"],
+        v["label"].as_str().unwrap_or(""),
+        queue_priority_text(v),
+        v["position"]
+            .as_u64()
+            .map(|p| format!("・待ち {p} 番目"))
+            .unwrap_or_default()
+    );
+    if let Some(note) = v["note"].as_str() {
+        println!("  {note}");
+    }
+}
+
 /// 順番待ちの節の表示（#1994）
 fn print_queue_section(q: &Value) {
     if q.is_null() {
@@ -8224,12 +8338,22 @@ fn print_queue_section(q: &Value) {
         if r["cancel"] == true {
             flags.push("取り消し中");
         }
+        // 進みと終わりの見込み（#1996。旧い GUI は返さない）
+        let progress = r["progress"]["total"]
+            .as_u64()
+            .map(|m| format!("  {}/{m}", r["progress"]["done"].as_u64().unwrap_or(0)))
+            .unwrap_or_default();
+        let eta = r["eta"]["text"]
+            .as_str()
+            .map(|t| format!("  — {t}"))
+            .unwrap_or_default();
         println!(
-            "  実行  {}  {}{}  {}{}{}  取り分 {}{}",
+            "  実行  {}  {}{}  {}{}{}{}  取り分 {}{}{}",
             r["id"],
             r["label"].as_str().unwrap_or("?"),
             pane(r),
             tako_control::queue_wrapper::human_secs(r["ran_s"].as_u64().unwrap_or(0)),
+            progress,
             mem,
             pending,
             r["share"],
@@ -8237,18 +8361,24 @@ fn print_queue_section(q: &Value) {
                 String::new()
             } else {
                 format!("  [{}]", flags.join("・"))
-            }
+            },
+            eta
         );
     }
     for w in &waiting {
         println!(
-            "  待ち {}  {}  {}{}  {}  待ち {}{}",
+            "  待ち {}  {}  {}{}  {}  待ち {}{}{}",
             w["position"],
             w["id"],
             w["label"].as_str().unwrap_or("?"),
             pane(w),
-            w["priority"].as_str().unwrap_or("normal"),
+            queue_priority_text(w),
             tako_control::queue_wrapper::human_secs(w["waited_s"].as_u64().unwrap_or(0)),
+            // 開始の見込み（#1996。前に並ぶ全件と実行中の全件に見込みがあるときだけ）
+            w["start_text"]
+                .as_str()
+                .map(|t| format!("・{t}"))
+                .unwrap_or_default(),
             // 待ちごとの理由（#2243。target dir 待ちの先頭は追い越せるので、先頭の理由だけでは
             // 後ろが何を待っているか分からない）
             w["text"]
@@ -14599,6 +14729,39 @@ mod test_caller {
 
 #[cfg(test)]
 mod tests {
+    /// #1996: `tako queue priority` は MCP `tako_queue` の `action: priority` と同じ要求を組む
+    /// （`crates/tako-control/src/mcp/tests.rs` の `issue1996_queueのpriorityは受付番号かペインと段を写す` と同じ値）
+    #[test]
+    fn issue1996_queue_priorityはmcpと同じ要求を組む() {
+        use tako_control::protocol::Request;
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::queue_priority_request(&v(&["4242", "high"]), None).unwrap(),
+            Request::Queue {
+                action: Some("priority".into()),
+                job: None,
+                id: Some(4242),
+                limits: None,
+                pane: None,
+                priority: Some("high".into()),
+            }
+        );
+        assert_eq!(
+            super::queue_priority_request(&v(&["default"]), Some(5)).unwrap(),
+            Request::Queue {
+                action: Some("priority".into()),
+                job: None,
+                id: None,
+                limits: None,
+                pane: Some(5),
+                priority: Some("default".into()),
+            }
+        );
+        // 受付番号が数でない・段だけ（--pane なし）・--pane と受付番号の両方
+        assert!(super::queue_priority_request(&v(&["abc", "high"]), None).is_err());
+        assert!(super::queue_priority_request(&v(&["high"]), None).is_err());
+        assert!(super::queue_priority_request(&v(&["1", "high"]), Some(5)).is_err());
+    }
     use super::*;
 
     /// CLI 引数 → Request の対応（接続せずに検証できる範囲）
