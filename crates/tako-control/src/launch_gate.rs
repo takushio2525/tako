@@ -1034,6 +1034,68 @@ pub fn wait_bands() -> Vec<WaitBand> {
         .collect()
 }
 
+/// spawn の応答の `machine` / `advice`（#1997）のうち起動待ちの側
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Headroom {
+    /// このプロセスの起動待ちの形（有効にしていなければ `None`）
+    pub mode: Option<Mode>,
+    /// 判断に使う機の値（注入があれば注入）
+    pub machine: Option<MachineView>,
+    /// 機の値が注入か（隔離 / セルフテストの検証だけ）
+    pub injected: bool,
+    pub waiting: usize,
+    /// 立ち上がり中（起こすと決めた件を含む）
+    pub starting: usize,
+    /// 空きの予約（MiB。重い処理と同じ実効値）
+    pub reserve_mb: u64,
+    /// この系統の agent 1 本の見込み（MiB。過去の記録 → 既定）
+    pub estimate_mb: u64,
+    /// もう 1 本起こしたら待たせる理由（起動待ちが有効なときだけ）
+    pub next_launch: Option<WaitReason>,
+}
+
+/// spawn の応答の起動待ちの側（#1997。UI スレッドの dispatch の spawn が [`request`] の直後に呼ぶ）。
+/// **採らない**（覚えと直近の判断の材料を読むだけ。設定・注入の読み直しもしない = [`request`] が済ませた）。
+/// もう 1 本の判定は `q::headroom::next_launch` = [`decide`] と同じ `admit` の入力
+pub fn headroom(agent: &str) -> Headroom {
+    let g = lock();
+    let now = clock(&g);
+    let machine = machine(&g);
+    let injected = g.fixed_machine.is_none()
+        && g.inject
+            .as_ref()
+            .and_then(|(_, _, i)| i.machine())
+            .is_some();
+    let starting: Vec<RunningJob> = g
+        .entries
+        .iter()
+        .filter(|(_, e)| matches!(e.phase, Phase::Due | Phase::Starting(_)))
+        .map(|(p, e)| e.starting_view(*p, now))
+        .collect();
+    let waiting = g
+        .entries
+        .values()
+        .filter(|e| e.phase == Phase::Waiting)
+        .count();
+    let limits = q::effective_limits(&g.settings, machine.map(|m| m.total_mb).filter(|t| *t > 0));
+    let keys = q::agent_history_keys(agent);
+    let estimate_mb = q::estimate(JobKind::Agent, Some(&keys), &g.history).mb;
+    let next_launch = g
+        .mode
+        .filter(|m| m.active())
+        .and_then(|_| q::headroom::next_launch(machine, limits, &starting, estimate_mb));
+    Headroom {
+        mode: g.mode,
+        machine,
+        injected,
+        waiting,
+        starting: starting.len(),
+        reserve_mb: limits.reserve_mb,
+        estimate_mb,
+        next_launch,
+    }
+}
+
 /// 待っている起動の 1 行（人が読む。CLI の `orchestrator run` / `tako queue` が出す）。待っていなければ `None`
 pub fn wait_line(view: &Value) -> Option<String> {
     if view["state"] != "waiting" {

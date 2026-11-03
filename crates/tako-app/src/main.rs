@@ -2903,6 +2903,11 @@ struct TakoApp {
     /// ステータスバーの一括ボタンが描く集計（Issue #1945）。**描画のたびに数えない**:
     /// 2 秒 tick・一括 / 個別の切り替えの直後だけ数え直す（`refresh_limit_resume_summary`）
     limit_resume_summary: tako_core::limit_resume_all::BulkSummary,
+    /// fleet ビューの worker の行の常駐メモリ（Issue #1997）。採取の覚え（`resources::pane_resident`）を
+    /// 2 秒 tick で写したもの（**描画では読まない**。`workers` の応答と同じ走査の値）
+    pane_resident: HashMap<PaneId, tako_control::resources::PaneResident>,
+    /// 写した走査の時刻（新しい走査が来たときだけ写し直す）
+    pane_resident_at: Option<std::time::Instant>,
     /// ネット復帰の即時再開（Issue #2112。全体の設定 + 止まったペインの追跡 + 到達確認）
     net_resume: net_autoresume::NetResumeState,
     /// codex ペインから集約したメトリクス（#357: サービス別制限データ）
@@ -4357,6 +4362,8 @@ struct AgentEntry {
     backend: Option<String>,
     /// 補足タイトル（OSC タイトル → tako ペインタイトルの順でフォールバック）
     detail_title: String,
+    /// worker の常駐メモリ（MiB・子孫込み。#1997）。worker でないペイン・走査の前は `None`
+    resident_mb: Option<u64>,
 }
 
 /// 統合 tmux ビューのタブ 1 枠分（FR-2.16.6。タブ名ラベル付き四角枠 + 全ペイン入れ子）
@@ -5463,6 +5470,8 @@ impl TakoApp {
             limit_seen_absent: HashMap::new(),
             limit_resume_all: tako_control::settings::load().limit_resume_all,
             limit_resume_summary: Default::default(),
+            pane_resident: HashMap::new(),
+            pane_resident_at: None,
             net_resume: net_autoresume::NetResumeState::new(
                 tako_control::settings::load().network_resume,
             ),
@@ -7018,6 +7027,17 @@ impl TakoApp {
                         let _s = tako_control::diag::perf_span("periodic_prep:resource_panes");
                         app.publish_resource_panes();
                     }
+                    {
+                        // #1997: fleet ビューの worker の行の常駐メモリ（走査の覚えを写すだけ。新しい走査が
+                        // 来たときだけ）。fleet を見ていて値が変わったときだけ描き直す
+                        let _s = tako_control::diag::perf_span("periodic_prep:pane_resident");
+                        if app.refresh_pane_resident()
+                            && app.panel_visible
+                            && app.panel_view == PanelView::Fleet
+                        {
+                            wcx.notify();
+                        }
+                    }
                     // #1959: mod の報告で新しく見えた設定 dir へ skills/tako（読み書きは背景）
                     app.drive_claude_mod_skills_sync(wcx);
                     // #2200 / #2201: 報告で積んだ利用制限の観測を `<data_dir>/usage/` へ・使用量の索引を
@@ -8437,6 +8457,7 @@ impl TakoApp {
                                 .unwrap_or(CommandState::Unknown),
                             backend: self.backend_sessions.get(&p.id()).cloned(),
                             detail_title,
+                            resident_mb: self.worker_resident_mb(p.id(), p.role()),
                         }
                     })
                     .collect();
@@ -27627,6 +27648,11 @@ impl UiStateHost for TakoApp {
             .then(|| self.resources.state_json())
     }
 
+    /// #1997: fleet ビューの worker の行が描いている常駐メモリ（描画と同じ `tmux_view_groups` の行）
+    fn fleet_view_state(&self) -> Option<serde_json::Value> {
+        Some(self.fleet_state_json())
+    }
+
     /// #1694: 横断検索の結果の置き場（右パネルの search ビューが読むのと同じ 1 つ）
     fn workspace_search(&self) -> Option<&tako_core::workspace_search::SearchStore> {
         Some(&self.workspace_search)
@@ -34097,6 +34123,12 @@ mod self_test {
     mod resources_panel_1995;
     #[cfg(feature = "visual-test")]
     use resources_panel_1995::resources_panel_1995_visual;
+    /// #1997: fleet ビューの worker の行の常駐メモリ（CLI / MCP / `tako panel` / 画面の 4 経路が同じ走査の値）
+    /// （visual-test `fleet-resident-1997`）
+    #[cfg(feature = "visual-test")]
+    mod fleet_resident_1997;
+    #[cfg(feature = "visual-test")]
+    use fleet_resident_1997::fleet_resident_1997_visual;
     /// #1952: ドロップダウンの基板とポートの欄（実の arduino-cli で sketch.yaml・言語サーバの起き直し）
     /// （visual-test `run-board-1952`）
     #[cfg(feature = "visual-test")]
@@ -50277,6 +50309,11 @@ mod self_test {
                 // #1995: 右パネルの resources ビュー（素材は scripts/test-resources-panel-1995.sh）
                 "resources-panel-1995" => {
                     resources_panel_1995_visual(any, window, cx).await;
+                    visual_exit(0);
+                }
+                // #1997: fleet ビューの worker の行の常駐メモリ（素材は scripts/test-spawn-advice-1997.sh）
+                "fleet-resident-1997" => {
+                    fleet_resident_1997_visual(any, window, cx).await;
                     visual_exit(0);
                 }
                 // #1733: 実行ボタン横のドロップダウン（実マウスで開く・候補を選ぶ・欄で直す・出典タグ）

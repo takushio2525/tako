@@ -77,6 +77,7 @@ use serde::{Deserialize, Serialize};
 use crate::resources::{MachineStats, Pressure, MIB};
 
 pub mod eta;
+pub mod headroom;
 pub mod priority;
 
 pub use eta::Progress;
@@ -1350,7 +1351,18 @@ pub fn admit_launches(
     starting: &[RunningJob],
     waiting: &[WaitingJob],
 ) -> Admission {
-    admit(&AdmitInput {
+    admit(&launch_input(machine, limits, starting, waiting))
+}
+
+/// [`admit_launches`] が [`admit`] へ渡す入力（agent の方針。#2413）。spawn の応答の助言（#1997 の
+/// [`headroom::next_launch`]）も同じ入力で問うので、方針はここ 1 か所に置く
+pub fn launch_input<'a>(
+    machine: Option<MachineView>,
+    limits: Limits,
+    starting: &'a [RunningJob],
+    waiting: &'a [WaitingJob],
+) -> AdmitInput<'a> {
+    AdmitInput {
         machine,
         limits: Limits {
             max_jobs: u32::MAX,
@@ -1363,7 +1375,7 @@ pub fn admit_launches(
         overtake: true,
         release_after_peak: true,
         min_progress: false,
-    })
+    }
 }
 
 /// agent の起動が待つ理由の 1 文（#2413）。重い処理の文（[`WaitReason::text`]）は「実行中が終わってから

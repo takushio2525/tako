@@ -759,8 +759,36 @@ fn raise_peak(job: &mut Job, mb: u64, wall: u64) {
     }
 }
 
-/// 割り当てを判断して、入れた件を割り当て済みにする
-fn decide(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
+/// 割り当ての判断の材料（[`decide`] と spawn の応答の助言 = [`heavy_headroom`] が同じ 1 本を通す。#1997）
+struct DecideInputs {
+    machine: Option<MachineView>,
+    cpus: u32,
+    limits: Limits,
+    running: Vec<RunningJob>,
+    waiting: Vec<WaitingJob>,
+    regathering: bool,
+    unmanaged: u32,
+}
+
+impl DecideInputs {
+    /// [`q::admit`] の入力（重い処理の方針はここ 1 か所）
+    fn admit_input(&self) -> AdmitInput<'_> {
+        AdmitInput {
+            machine: self.machine,
+            limits: self.limits,
+            running: &self.running,
+            waiting: &self.waiting,
+            unmanaged: self.unmanaged,
+            regathering: self.regathering,
+            overtake: !legacy_2243(),
+            release_after_peak: !legacy_2254(),
+            // 重い処理は終われば空くので、外の負荷だけで永久に待たせない（agent の起動待ち = #2413 は false）
+            min_progress: true,
+        }
+    }
+}
+
+fn decide_inputs(a: &Arbiter, inj: Option<&Inject>, now: Instant) -> DecideInputs {
     let (machine_view, cpus) = machine(a, inj);
     let limits: Limits = q::effective_limits(
         &a.settings,
@@ -773,26 +801,28 @@ fn decide(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
         .filter(|j| j.holds_slot())
         .map(|j| j.running_view(wall))
         .collect();
-    let waiting = waiting_jobs(a);
     let regather = inj
         .and_then(|i| i.regather_secs)
         .map(Duration::from_secs)
         .unwrap_or(REGATHER);
-    let regathering = a
-        .enabled_at
-        .is_some_and(|at| now.duration_since(at) < regather);
-    let admission = q::admit(&AdmitInput {
+    DecideInputs {
         machine: machine_view,
+        cpus,
         limits,
-        running: &running,
-        waiting: &waiting,
+        running,
+        waiting: waiting_jobs(a),
+        regathering: a
+            .enabled_at
+            .is_some_and(|at| now.duration_since(at) < regather),
         unmanaged: a.unmanaged,
-        regathering,
-        overtake: !legacy_2243(),
-        release_after_peak: !legacy_2254(),
-        // 重い処理は終われば空くので、外の負荷だけで永久に待たせない（agent の起動待ち = #2413 は false）
-        min_progress: true,
-    });
+    }
+}
+
+/// 割り当てを判断して、入れた件を割り当て済みにする
+fn decide(a: &mut Arbiter, inj: Option<&Inject>, now: Instant) {
+    let inputs = decide_inputs(a, inj, now);
+    let (cpus, running) = (inputs.cpus, &inputs.running);
+    let admission = q::admit(&inputs.admit_input());
     let mut active = running.iter().filter(|r| !r.stalled).count();
     let granted_at = unix_ms();
     for id in &admission.grants {
@@ -1253,6 +1283,32 @@ pub fn serve_headless(socket: &str, token: String) -> std::io::Result<()> {
         )));
     }
     Ok(())
+}
+
+/// spawn の応答の `machine` / `advice`（#1997）のうち順番待ちの側
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeavyHeadroom {
+    /// 枠を持つ実行中（停滞を含む = status の `running` と同じ数え方）
+    pub running: u32,
+    pub waiting: u32,
+    /// いまビルド 1 件（区分の既定の見込み）を受け付けたら待つ理由（入るなら `None`）
+    pub next: Option<WaitReason>,
+}
+
+/// spawn の応答の順番待ちの側（#1997。UI スレッドの dispatch の spawn が呼ぶ）。調停役でなければ `None`。
+/// **採らない・書き換えない**（覚えを読むだけ。判断の材料は [`decide`] と同じ [`decide_inputs`]、
+/// 問い方は `q::headroom::probe` = 同じ `admit` の待ちの最後に仮の 1 件）
+pub fn heavy_headroom() -> Option<HeavyHeadroom> {
+    let a = lock();
+    a.role?;
+    let inj = inject(a.role);
+    let inputs = decide_inputs(&a, inj.as_ref(), Instant::now());
+    let estimate = Estimate::default_for(q::JobKind::Build).mb;
+    Some(HeavyHeadroom {
+        running: inputs.running.len() as u32,
+        waiting: inputs.waiting.len() as u32,
+        next: q::headroom::probe(&inputs.admit_input(), estimate),
+    })
 }
 
 /// status の `queue` 節（採らない）

@@ -626,6 +626,10 @@ pub fn run_worker(
     if let Some(line) = crate::launch_gate::wait_line(&spawn_result["launch_gate"]) {
         eprintln!("{line}");
     }
+    // #1997: 待つほどではないが余裕が少ない（spawn の時点の助言）
+    for line in crate::spawn_advice::advice_lines(&spawn_result["advice"]) {
+        eprintln!("{line}");
+    }
 
     // --- 2. 完了待ち ---
     let start = Instant::now();
@@ -694,6 +698,9 @@ pub fn run_worker(
         "output": output,
         "duration_seconds": start.elapsed().as_secs(),
         "closed": closed,
+        // #1997: spawn の時点の機の余裕と助言（spawn の応答の写し）
+        "machine": spawn_result.get("machine").cloned().unwrap_or(Value::Null),
+        "advice": spawn_result.get("advice").cloned().unwrap_or_else(|| json!([])),
     });
     if let WatchOutcome::Error {
         kind,
@@ -952,6 +959,9 @@ pub fn run_start(
         "tmux_session": tmux_session,
         // #2413: `state` が `waiting` なら起動待ち（圧が戻ると起きる。`run_status` で追える）
         "launch_gate": launch_gate,
+        // #1997: 機の余裕と、待つほどではないが余裕が少ないときの助言（spawn の応答の写し）
+        "machine": spawn_result.get("machine").cloned().unwrap_or(Value::Null),
+        "advice": spawn_result.get("advice").cloned().unwrap_or_else(|| json!([])),
     }))
 }
 

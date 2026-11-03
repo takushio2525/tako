@@ -127,6 +127,7 @@ pub mod shell_integration;
 pub mod shelved_restore;
 pub mod sketch_board;
 pub mod sleep_guard;
+pub mod spawn_advice;
 pub mod ssh_detect;
 pub mod stale_binary;
 pub mod tailscale;

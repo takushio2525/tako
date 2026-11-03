@@ -550,6 +550,48 @@ pub fn pane_memory(since: Option<Instant>) -> Option<(Instant, HashMap<u64, u64>
     ))
 }
 
+/// ペイン 1 つぶんの常駐メモリ（MiB。#1997）。fleet ビューの worker の行・`workers` の応答・spawn の応答の
+/// `machine.agents` が同じ走査の覚え（`Report::panes`）から読む
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneResident {
+    /// ペインの木全体（子孫込み = シェル・agent・MCP サーバー・走っているビルド）
+    pub memory_mb: u64,
+    /// そのうち agent 本体 + 補助プロセス（MCP サーバー等）
+    pub agent_mb: u64,
+    /// そのうち重い処理の木
+    pub heavy_mb: u64,
+    /// 動いている agent（claude / codex / agy …）
+    pub agent: Option<&'static str>,
+}
+
+/// ペインごとの常駐メモリの覚え（**採らない**。#1997）。走査の覚えが `since` より新しいときだけ返す。
+/// 返す時刻は走査の時刻（誰も見ていなければ走査は 30 秒ごと）
+pub fn pane_resident(since: Option<Instant>) -> Option<(Instant, HashMap<u64, PaneResident>)> {
+    let p = lock(published());
+    let snap = p.procs.as_ref()?;
+    if since.is_some_and(|s| snap.at <= s) {
+        return None;
+    }
+    Some((
+        snap.at,
+        snap.report
+            .panes
+            .iter()
+            .map(|u| {
+                (
+                    u.pane,
+                    PaneResident {
+                        memory_mb: mb(u.memory),
+                        agent_mb: mb(u.agent_memory),
+                        heavy_mb: mb(u.heavy_memory),
+                        agent: u.agent,
+                    },
+                )
+            })
+            .collect(),
+    ))
+}
+
 /// `fifo` の札を持ちうるプロセス（同じ置き場の系統の fifo を指す cargo 系）の本数（#1998）。
 ///
 /// 覚えの使い方は `tako_core::jobserver::scan_use`: 居る覚えは信じ、0 本の覚えは新しいときだけ信じる。

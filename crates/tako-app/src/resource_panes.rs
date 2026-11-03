@@ -50,4 +50,46 @@ impl TakoApp {
         let own_socket = self.ipc.as_ref().map(|ipc| ipc.endpoint().to_string());
         tako_control::resources::publish_panes(entries, own_socket);
     }
+
+    /// 2 秒 tick（`periodic_prep`）から呼ぶ（#1997）。走査の覚えのペインごとの常駐メモリを写す
+    /// （新しい走査が来たときだけ。**採らない**）。写した値が変わったら true（fleet を見ていれば描き直す）
+    pub(crate) fn refresh_pane_resident(&mut self) -> bool {
+        let Some((at, panes)) = tako_control::resources::pane_resident(self.pane_resident_at) else {
+            return false;
+        };
+        self.pane_resident_at = Some(at);
+        let next: HashMap<PaneId, tako_control::resources::PaneResident> = panes
+            .into_iter()
+            .map(|(pane, r)| (PaneId::from_raw(pane), r))
+            .collect();
+        let changed = next != self.pane_resident;
+        self.pane_resident = next;
+        changed
+    }
+
+    /// `tako panel` の応答の `fleet`（#1997）: fleet ビューの worker の行（描画と同じ `tmux_view_groups`）の
+    /// ペイン番号と常駐メモリ・fleet を見ているか・写した走査の古さ
+    pub(crate) fn fleet_state_json(&self) -> serde_json::Value {
+        let workers: Vec<serde_json::Value> = self
+            .tmux_view_groups()
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .filter_map(|r| {
+                r.resident_mb
+                    .map(|mb| serde_json::json!({ "pane": r.pane.as_u64(), "resident_mb": mb }))
+            })
+            .collect();
+        serde_json::json!({
+            "shown": self.panel_visible && self.panel_view == PanelView::Fleet,
+            "workers": workers,
+            "resident_age_s": self.pane_resident_at.map(|at| at.elapsed().as_secs()),
+        })
+    }
+
+    /// fleet ビューの worker の行に出す常駐メモリ（MiB・子孫込み。#1997）。worker でないペイン・走査に
+    /// 載っていないペインは `None`。`workers` の応答の `resident.memory_mb` と同じ走査の値
+    pub(crate) fn worker_resident_mb(&self, pane: PaneId, role: Option<&str>) -> Option<u64> {
+        role.filter(|r| r.starts_with("orchestrator-worker"))?;
+        self.pane_resident.get(&pane).map(|r| r.memory_mb)
+    }
 }

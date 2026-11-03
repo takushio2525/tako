@@ -152,6 +152,8 @@ the user cannot tell workers apart. Check the returned `agent` / `model` /
 `effort` and correct course if they are not what you intended. Non-default worker
 agents (`codex` / `agy`) only when the profile's Available Worker Agents section
 lists them or the user asks — guide `spawning` says what changes for them.
+A non-empty `advice` in the response means memory is getting tight: hold
+non-urgent spawns (guide `spawning`, "Machine headroom").
 
 <!-- block: monitoring -->
 ## Monitoring Workers (for spawn, not needed for run)

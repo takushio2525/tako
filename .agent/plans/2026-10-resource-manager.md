@@ -522,7 +522,7 @@ S2 の「先頭が入れなければ後ろも待つ」は、先頭が**同じ ta
   覚える」懸念は、**失敗にせず待ちとして返す**（spawn は成功し、応答の `launch_gate` に理由と順番。圧が戻ると tako が起こす）
   ことで小さくした。master が覚えるのは「`launch_gate.state=waiting` は待っている・急ぐなら `tako queue start <ペイン>`」の 1 つ
 - `machine` / `advice` を応答に載せる部分・fleet の常駐メモリ・guide の追記のうち、#2413 に含めなかったものは #1997 に残す
-  （#2413 の着地後に #1997 の本文を整理する）
+  （#2413 の着地後に #1997 の本文を整理した = 助言と見える化だけ。実装で決めたことは §9.8）
 
 ### 9.2 worker への指示
 
@@ -629,6 +629,20 @@ MCP の子が起きない構成:                          1.1s 2 本 353 MB → 
 | 状況 | `tako queue` / MCP `tako_queue` の status に `jobserver` 節（`state` active / follower / off・`code` / `reason`・`tokens`・`free`・`in_use`・`holders`・`last_recount`・`recreated`・`value`）。CLI は「cargo の札: 空き X / N（札を持ちうる cargo 系 K 本）」の 1 行 | resources ビュー（S3 #1995）は未着地。S3 は同じ節を読む |
 | Windows | 対象外（境界 B31 `platform::jobserver` は `Unsupported`。対応マトリクス `tako_queue` の Windows = Pending #2000 の理由文に足した） | jobserver の Windows 側は名前付きセマフォで、cargo が外から渡したものに従うかは未実測（S8） |
 | GUI が落ちた後 | 異常終了で fifo が残ると、次の GUI が立つまでの間に器のペインで始めた cargo は札 0 枚 = 暗黙の 1 枚で直列（止まりはしない）。次の GUI は同じ fifo を開き直し、その cargo が終わってから N 枚にする | 落ちた瞬間に後片付けする口が無い。直列でも進むので「永久に札待ち」にはならない |
+
+### 9.8 S5（#1997）の実装で決めたこと
+
+正は FR-2.43.16 とコード。逼迫中の起動待ちは #2413（§9.6）で、ここは**助言と見える化だけ**（spawn を止めない・待たせない）。
+
+| 項目 | 決めたこと | 理由 |
+|---|---|---|
+| 助言の判断 | 閾値を持たない純関数 `tako_core::queue::headroom::probe`: **同じ `admit` の待ちの最後に仮の 1 件**（段 normal・受付はいま）を並べ、入らなければその件を止めている理由。起動待ちの側は `admit_launches` の入力（`launch_input` へ切り出した）に「この 1 本を立ち上がり中に数えた後のもう 1 本」（見込みは同じ系統の過去の記録）、順番待ちの側は調停役の判断と同じ入力（`decide_inputs` へ切り出した）に「ビルド 1 件」（区分の既定 3.5 GB） | 受け入れ条件「政策を 2 か所に書かない」。単体テスト `issue1997_もう1本の判定は起動待ちと同じ境界` が空きのどの値でも「助言の有無」と「本物の 2 本目を起動待ちへ問うた答え」が一致することを縛る |
+| 助言の 2 種 | `next_launch_waits`（もう 1 本起こすと起動待ち）/ `heavy_queue_waits`（いまビルドを入れると待つ）。この spawn 自体が起動待ちなら前者は出さない（`launch_gate` が言い尽くしている）。調停役の立ち上げ直後（`regather` = 6 秒）は出さない（一時の状態）。起動待ちが無効（隔離で注入なし・A/B）なら前者は出さない（次の spawn は実際には待たない = 過大に言わない） | 「待つほどではないが余裕が少ない」を、待つ条件そのものの手前として言う。順番待ちの枠が埋まっている本番では後者がよく出るが、事実（この worker のビルドは待つ）なので消さない |
+| `machine` の値 | 起動待ちの判断に使う機の値（注入があれば注入 = `source: injected`）・空きの予約（`reserve_mb`）・`agents`（走査の覚えの agent の居るペインの本数と agent + MCP の常駐の合計・古さ）・`queue`（調停役の実行 / 待ちの件数）・`launches`（起動待ちの待ち / 立ち上がり中 / この系統の 1 本の見込み `estimate_mb`） | 助言と同じ材料を見せる（「なぜ助言が出た / 出ないか」を master が読める）。走査は誰も見ていなければ 30 秒ごとなので古さを添える |
+| worker ごとの常駐 | `resident.memory_mb` = **ペインの木全体（子孫込み）**、内訳 `agent_mb`（agent + MCP）/ `heavy_mb`（重い処理）。生きているペインの worker だけ（番号が別ペインへ再利用された死んだ worker に他人の値を付けない） | §7 の「その worker の常駐メモリ（子孫込み）を 1 つ」。内訳は resources ビュー ④ と同じ区分 |
+| 読みの経路 | `workers` は background の `finish_workers_list` が `resources::pane_resident` の覚えを読む。fleet ビューは 2 秒 tick で同じ覚えを写し（新しい走査が来たときだけ・計測区間 `periodic_prep:pane_resident`）、描画は写しを読むだけ。`tako panel` の応答の `fleet` に描いている値。spawn の応答は UI スレッドの `spawn_launch` が覚えと起動待ち・調停役の錠を読むだけ | 3 経路（CLI / MCP / GUI）が同じ走査の値を出す。番犬 `issue1993_resources_ui_thread_watchdog` の 9 番 |
+| 手順書 | guide `spawning` に「Machine headroom」、guide `worker-prompt` の Constraints の雛形に `tako queue` と背景実行の 1 項、base prompt の `spawning-workers` に 1 文（約 120 B） | master の system prompt の tako 部分 18.5 KB を守る（詳細は guide） |
+| MCP | 既存ツールの応答だけ（spawn / run / workers / panel）。カタログの増分 0 B | 残りは約 7 KB |
 
 ## 10. Windows と MATRIX（論点 9）
 

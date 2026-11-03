@@ -28,6 +28,9 @@
 //!    覚えの読み（`read_cached_snapshot` = 調停役の錠・設定の mtime・札の数え）は background の
 //!    `spawn` の中からだけ呼び、見ている間の読みは CLI と同じ `Request::Queue` を `dispatch_off_ui` で
 //!    投げる（`queue::answer` は background の `OffloadJob::Queue`）。2 秒 tick は計測区間つきで呼ぶ
+//! 9. spawn の応答の `machine` / `advice`（`spawn_advice.rs`。#1997）は UI スレッドの dispatch の spawn
+//!    （`spawn_launch`）が呼ぶので採らない。起動待ちの `headroom`・調停役の `heavy_headroom` /
+//!    `decide_inputs`・`resources::pane_resident`（fleet ビューの worker の行が 2 秒 tick で写す）も同じ
 //!
 //! # 見逃す側へ倒れないための作り
 //!
@@ -47,6 +50,7 @@ const RESOURCES: &str = "crates/tako-control/src/resources.rs";
 const QUEUE: &str = "crates/tako-control/src/queue.rs";
 const LAUNCH_GATE: &str = "crates/tako-control/src/launch_gate.rs";
 const PANEL: &str = "crates/tako-app/src/resources_panel.rs";
+const SPAWN_ADVICE: &str = "crates/tako-control/src/spawn_advice.rs";
 
 /// UI スレッドで呼んではいけない口（右は名指しの理由）
 const SCANS: &[(&str, &str)] = &[
@@ -166,6 +170,7 @@ struct Sources {
     queue: String,
     launch_gate: String,
     panel: String,
+    spawn_advice: String,
 }
 
 impl Sources {
@@ -180,6 +185,7 @@ impl Sources {
             queue: read(&root, QUEUE),
             launch_gate: read(&root, LAUNCH_GATE),
             panel: read(&root, PANEL),
+            spawn_advice: read(&root, SPAWN_ADVICE),
         }
     }
 
@@ -192,6 +198,7 @@ impl Sources {
         out.extend(scan_queue(&self.queue));
         out.extend(scan_launch_gate(&self.launch_gate, &self.main));
         out.extend(scan_panel(&self.panel, &self.main));
+        out.extend(scan_spawn_advice(&self.spawn_advice, &self.dispatch));
         out
     }
 }
@@ -375,7 +382,11 @@ fn scan_ipc(src: &str) -> Vec<Offender> {
 /// 5. `resources` の UI 向けの口は採らない・採取は別スレッド
 fn scan_resources(src: &str) -> Vec<Offender> {
     let mut out = Vec::new();
-    for head in ["pub fn cached_status(", "pub fn publish_panes("] {
+    for head in [
+        "pub fn cached_status(",
+        "pub fn publish_panes(",
+        "pub fn pane_resident(",
+    ] {
         match fn_window(src, head) {
             None => out.push(Offender {
                 file: RESOURCES,
@@ -433,6 +444,8 @@ const QUEUE_UI_REACHABLE: &[&str] = &[
     "fn decide(",
     "fn refresh_usage(",
     "fn machine(a: &Arbiter",
+    "pub fn heavy_headroom(",
+    "fn decide_inputs(",
 ];
 
 fn scan_queue(src: &str) -> Vec<Offender> {
@@ -471,6 +484,7 @@ const LAUNCH_GATE_UI_REACHABLE: &[&str] = &[
     "fn refresh_usage(",
     "fn refresh_inputs(",
     "fn settle(",
+    "pub fn headroom(",
 ];
 
 fn scan_launch_gate(src: &str, main: &str) -> Vec<Offender> {
@@ -614,6 +628,52 @@ fn scan_panel(src: &str, main: &str) -> Vec<Offender> {
                     why: "`tick_resources` が計測区間（`periodic_prep:resources`）で包まれていない".into(),
                 });
             }
+        }
+    }
+    out
+}
+
+/// 9. spawn の応答の `machine` / `advice` は採らない（#1997）
+fn scan_spawn_advice(src: &str, dispatch: &str) -> Vec<Offender> {
+    let mut out = Vec::new();
+    let all: Vec<String> = src.lines().map(str::to_string).collect();
+    scans_in(
+        SPAWN_ADVICE,
+        1,
+        &all,
+        "spawn の応答の助言（`spawn_advice.rs`）",
+        &mut out,
+    );
+    if fn_window(src, "pub fn for_spawn(").is_none() {
+        out.push(Offender {
+            file: SPAWN_ADVICE,
+            line: 0,
+            why: "`spawn_advice::for_spawn` が見つからない（走査が空振り）".into(),
+        });
+    }
+    match fn_window(dispatch, "fn spawn_launch(") {
+        None => out.push(Offender {
+            file: DISPATCH,
+            line: 0,
+            why: "`spawn_launch` が見つからない（走査が空振り）".into(),
+        }),
+        Some((at, window)) => {
+            if code_lines_with(&window, "spawn_advice::for_spawn(").is_empty() {
+                out.push(Offender {
+                    file: DISPATCH,
+                    line: at,
+                    why: "`spawn_launch` が `spawn_advice::for_spawn` を呼んでいない（spawn の応答に \
+                          `machine` / `advice` が出ない）"
+                        .into(),
+                });
+            }
+            scans_in(
+                DISPATCH,
+                at,
+                &window,
+                "spawn の起動の積み込み（`spawn_launch`）",
+                &mut out,
+            );
         }
     }
     out
@@ -871,5 +931,45 @@ fn 逆戻りを名指しできる() {
         scan_panel(&v, &s.main),
         PANEL,
         "queue::answer(",
+    );
+
+    // ⑭ spawn の応答の助言で走査する（#1997）
+    let a = inject(
+        &s.spawn_advice,
+        "    let gate = launch_gate::headroom(agent);",
+        "    let _ = crate::resources::answer(None);\n    let gate = launch_gate::headroom(agent);",
+        "⑭",
+    );
+    expect_named(
+        "spawn の助言で走査",
+        scan_spawn_advice(&a, &s.dispatch),
+        SPAWN_ADVICE,
+        "resources::answer(",
+    );
+    // ⑮ 起動待ちの headroom で機の値を採り直す
+    let g = inject(
+        &s.launch_gate,
+        "    let g = lock();\n    let now = clock(&g);\n    let machine = machine(&g);",
+        "    crate::resources::refresh_machine_if_stale();\n    let g = lock();\n    let now = clock(&g);\n    let machine = machine(&g);",
+        "⑮",
+    );
+    expect_named(
+        "起動待ちの headroom で採る",
+        scan_launch_gate(&g, &s.main),
+        LAUNCH_GATE,
+        "refresh_machine_if_stale(",
+    );
+    // ⑯ spawn の応答から助言を外す
+    let d = inject(
+        &s.dispatch,
+        "        crate::spawn_advice::for_spawn(&agent, waiting, tako_core::i18n::lang());",
+        "        (Value::Null, json!([]));",
+        "⑯",
+    );
+    expect_named(
+        "spawn の応答から助言を外す",
+        scan_spawn_advice(&s.spawn_advice, &d),
+        DISPATCH,
+        "for_spawn",
     );
 }

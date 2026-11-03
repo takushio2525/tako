@@ -1579,6 +1579,38 @@ pub fn list_payload(
     json!({ "workers": items, "count": items.len(), "warnings": warnings })
 }
 
+/// workers 一覧へ worker ごとの常駐メモリを足す（#1997。純関数）。`resident` は走査の覚え
+/// （`resources::pane_resident`。fleet ビューの worker の行も同じ覚えを読む）。ペインが生きていて走査に
+/// 載っている worker だけ `resident`（`memory_mb` = 子孫込み・`agent_mb` = agent + MCP・`heavy_mb` = 重い処理）、
+/// それ以外は null。一覧の `resident_age_s` は走査の古さ（覚えが無ければ null）
+pub fn attach_resident(
+    payload: &mut Value,
+    resident: Option<(
+        std::time::Instant,
+        std::collections::HashMap<u64, crate::resources::PaneResident>,
+    )>,
+) {
+    let age = resident.as_ref().map(|(at, _)| at.elapsed().as_secs());
+    if let Some(items) = payload["workers"].as_array_mut() {
+        for w in items {
+            let alive = w["pane_alive"].as_bool().unwrap_or(false);
+            let found = alive
+                .then(|| w["pane"].as_u64())
+                .flatten()
+                .and_then(|pane| resident.as_ref().and_then(|(_, m)| m.get(&pane)));
+            w["resident"] = match found {
+                Some(r) => json!({
+                    "memory_mb": r.memory_mb,
+                    "agent_mb": r.agent_mb,
+                    "heavy_mb": r.heavy_mb,
+                }),
+                None => Value::Null,
+            };
+        }
+    }
+    payload["resident_age_s"] = json!(age);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3355,5 +3387,49 @@ mod tests {
             .unwrap()
             .contains("model_actual"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1997: 常駐メモリは生きているペインの worker にだけ付く（番号が別ペインへ再利用された死んだ worker に
+    /// 他人の値を付けない）。走査の覚えが無ければ全員 null・古さも null
+    #[test]
+    fn issue1997_常駐メモリは生きているworkerにだけ付く() {
+        use crate::resources::PaneResident;
+        let mut payload = json!({ "workers": [
+            { "pane": 5, "pane_alive": true },
+            { "pane": 6, "pane_alive": false },
+            { "pane": 7, "pane_alive": true },
+        ] });
+        let map = std::collections::HashMap::from([
+            (
+                5,
+                PaneResident {
+                    memory_mb: 812,
+                    agent_mb: 700,
+                    heavy_mb: 0,
+                    agent: Some("claude"),
+                },
+            ),
+            (
+                6,
+                PaneResident {
+                    memory_mb: 99,
+                    agent_mb: 0,
+                    heavy_mb: 0,
+                    agent: None,
+                },
+            ),
+        ]);
+        attach_resident(&mut payload, Some((std::time::Instant::now(), map)));
+        let w = &payload["workers"];
+        assert_eq!(
+            w[0]["resident"],
+            json!({ "memory_mb": 812, "agent_mb": 700, "heavy_mb": 0 })
+        );
+        assert!(w[1]["resident"].is_null(), "死んだ worker に同じ番号の値を付けた");
+        assert!(w[2]["resident"].is_null(), "走査に無いペイン");
+        assert_eq!(payload["resident_age_s"], 0);
+        let mut none = json!({ "workers": [{ "pane": 5, "pane_alive": true }] });
+        attach_resident(&mut none, None);
+        assert!(none["workers"][0]["resident"].is_null() && none["resident_age_s"].is_null());
     }
 }
