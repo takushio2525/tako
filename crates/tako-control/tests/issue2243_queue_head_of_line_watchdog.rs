@@ -170,11 +170,18 @@ fn 追い越しの上限で先頭が飢えない() {
 fn 調停役は追い越しを有効にしてadmitを呼ぶ() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/queue.rs");
     let src = std::fs::read_to_string(&path).expect("調停役のソースを読める");
-    let calls = src.matches("q::admit(&AdmitInput {").count();
+    // #1997: 入力の組み立ては `DecideInputs::admit_input` の 1 か所（decide と spawn の応答の助言
+    // `heavy_headroom` が同じ入力で admit を問う = 方針を 2 か所に書かない）
     assert_eq!(
-        calls,
+        src.matches("AdmitInput {").count(),
         1,
-        "{}: admit の呼び出しは decide の 1 か所のはず",
+        "{}: admit の入力を組むのは DecideInputs::admit_input の 1 か所のはず",
+        path.display()
+    );
+    assert_eq!(
+        src.matches("q::admit(&inputs.admit_input())").count(),
+        1,
+        "{}: 割り当ての admit の呼び出しは decide の 1 か所のはず",
         path.display()
     );
     assert_eq!(
