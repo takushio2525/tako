@@ -24,6 +24,15 @@
 //! ここは**待っているあいだ一覧の代わりに 1 行の「読み込み中」を出す**だけ（打鍵の問い合わせを
 //! 出す時点で `LspManager::server_loading` を見て立て、その答えが届いたら下ろす）。キーは奪わない。
 //! A/B は `TAKO_1869_LEGACY=1`（出さない・manager も待たない = #1869 前）。
+//!
+//! ## 上限に当たったら（#1899）
+//!
+//! 待ちの上限（既定 30 秒 = `TAKO_LSP_COMPLETION_TIMEOUT_SECS`）まで読み込みが済まなかった答え
+//! （`CompletionError::Loading`）と、「読み込み中」を出していた要求の未応答（`Timeout`）は、1 行を
+//! **黙って消さずに理由の 1 行へ差し替える**（同じ置き場・同じ閉じ方。文は
+//! `CompletionError::limit_note` の 1 本）。ほかの失敗は今までどおり一覧を出さないだけ。
+//! CLI / MCP は前から `status: loading` を返すので GUI の表示だけ。A/B は `TAKO_1899_LEGACY=1`
+//! （上限で黙って消える = #1899 前）。
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -80,7 +89,8 @@ pub(crate) struct LspCompletionUi {
     pub(crate) answers: u64,
     /// 言語サーバの起動 / 読み込みを待っている印（#1869）。打鍵の問い合わせを出した時点で
     /// サーバが起動中か読み込み中なら立て、その問い合わせの答え（一覧・0 件・失敗）が届くか、
-    /// 一覧を閉じる・語の外へ出るで下ろす。**表示だけ**（5 キーは奪わない = 一覧が出ていない扱い）
+    /// 一覧を閉じる・語の外へ出るで下ろす。待ちの上限に当たった答えなら下ろさずに理由の 1 行へ
+    /// 差し替える（#1899 = [`LoadingNote::limit`]）。**表示だけ**（5 キーは奪わない = 一覧が出ていない扱い）
     pub(crate) loading: Option<LoadingNote>,
     /// 直近に描いた「読み込み中」の矩形（visual-test が差分の範囲を見る）
     pub(crate) loading_bounds: Option<Bounds<Pixels>>,
@@ -93,6 +103,8 @@ pub(crate) struct LoadingNote {
     seq: u64,
     line: usize,
     word_start: usize,
+    /// 待ちの上限に当たった理由の 1 行（#1899）。`None` は待っている最中（「読み込み中」を出す）
+    pub(crate) limit: Option<String>,
 }
 
 impl LspCompletionUi {
@@ -321,6 +333,7 @@ impl TakoApp {
             seq,
             line: at.line,
             word_start,
+            limit: None,
         });
         let request = CompletionRequest {
             path: edit.buffer.path().to_path_buf(),
@@ -365,13 +378,14 @@ impl TakoApp {
         outcome: Result<CompletionAnswer, CompletionError>,
         cx: &mut Context<Self>,
     ) {
-        // 「読み込み中」はこの問い合わせの答え（一覧・0 件・失敗のどれでも）が届いたら下ろす（#1869）
-        if self
+        // 「読み込み中」はこの問い合わせの答え（一覧・0 件・失敗のどれでも）が届いたら下ろす（#1869）。
+        // 上限に当たった答えなら下で理由の 1 行へ差し替える（#1899）
+        let shown_loading = self
             .lsp_completion
             .loading
             .as_ref()
-            .is_some_and(|note| note.seq == seq)
-        {
+            .is_some_and(|note| note.seq == seq && note.limit.is_none());
+        if shown_loading {
             self.lsp_completion.loading = None;
             self.lsp_completion.loading_bounds = None;
             cx.notify();
@@ -392,9 +406,29 @@ impl TakoApp {
             return;
         }
         // 失敗（未導入・未応答…）は一覧を出さないだけ（打鍵のたびに通知しない。理由は
-        // `tako lsp completion` / `tako lsp status` が返す）
-        let Ok(answer) = outcome else {
-            return;
+        // `tako lsp completion` / `tako lsp status` が返す）。待ちの上限に当たった答えだけは、
+        // 「読み込み中」を黙って消さずに同じ置き場へ理由の 1 行を出す（#1899。A/B の旧腕
+        // `TAKO_1899_LEGACY=1` は黙って消える）
+        let answer = match outcome {
+            Ok(answer) => answer,
+            Err(error) => {
+                let limit = (!tako_control::lsp::completion::legacy_1899())
+                    .then(|| error.limit_note(shown_loading))
+                    .flatten();
+                if let Some(limit) = limit {
+                    let (at, line) = caret(edit);
+                    let word_start = comp::word_start(line, at.col);
+                    self.lsp_completion.loading = Some(LoadingNote {
+                        pane,
+                        seq,
+                        line: at.line,
+                        word_start,
+                        limit: Some(limit),
+                    });
+                    cx.notify();
+                }
+                return;
+            }
         };
         self.lsp_completion.answers = self.lsp_completion.answers.wrapping_add(1);
         self.show_completion(pane, answer, version, cx);
@@ -834,8 +868,8 @@ impl TakoApp {
     }
 
     /// 「読み込み中」の 1 行（#1869。一覧と同じ位置 = 問い合わせた語の頭の真下、下に入らなければ上）。
-    /// 外れていれば閉じて何も描かない。**押下は下の本文へ通す**（表示だけ。押せばカーソルが動いて
-    /// 語の外へ出るので閉じる）
+    /// 待ちの上限に当たった後は同じ置き場に理由の 1 行（#1899）。外れていれば閉じて何も描かない。
+    /// **押下は下の本文へ通す**（表示だけ。押せばカーソルが動いて語の外へ出るので閉じる）
     fn render_loading_note(&mut self, window: &gpui::Window) -> Option<gpui::AnyElement> {
         if self.lsp_completion.loading.is_some() && !self.loading_note_still_valid() {
             self.close_completion();
@@ -847,6 +881,11 @@ impl TakoApp {
             .get(note.line)?
             .as_ref()?;
         let anchor = layout.position_for_index(note.word_start)?;
+        // 待っている最中は「読み込み中」、上限に当たった後は理由の 1 行（#1899）
+        let text = note.limit.clone().map_or_else(
+            || SharedString::from(tako_control::lsp::text::COMPLETION_LOADING_NOTE.text()),
+            SharedString::from,
+        );
         let line_height = layout.line_height();
         let viewport = window.viewport_size();
         let below = f32::from(anchor.y + line_height) + 2.0;
@@ -889,9 +928,7 @@ impl TakoApp {
                         .overflow_hidden()
                         .text_ellipsis()
                         .whitespace_nowrap()
-                        .child(SharedString::from(
-                            tako_control::lsp::text::COMPLETION_LOADING_NOTE.text(),
-                        )),
+                        .child(text),
                 )
                 .into_any_element(),
         )

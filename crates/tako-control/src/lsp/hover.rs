@@ -68,6 +68,13 @@ pub fn legacy_1893() -> bool {
     )
 }
 
+/// 人向けの全文の取り方（GUI のカードの脚注に出す。#1899）。カードは既定の上限で切るので、全文は
+/// CLI の `--full` で取る。`--pane` は付ける（打つのは別のペイン = 端末なので、省くと打ったペインを
+/// 指す）。位置は CLI と同じ綴り（行 1 始まり・桁 0 始まりの UTF-8 バイト）
+pub fn full_command(pane: u64, line: usize, column: usize) -> String {
+    format!("tako lsp hover --pane {pane} --line {line} --column {column} --full")
+}
+
 /// 問い合わせ 1 回ぶん（UI スレッドで作り、背景スレッドで [`super::LspManager::hover`] へ渡す）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoverRequest {

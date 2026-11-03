@@ -182,14 +182,32 @@ pub(super) async fn xref_1685_visual(
         .unwrap_or_else(|| fail(&format!("visual-test {LABEL}: 2 行目の helper の位置")));
 
     // ① 右クリック → 「参照を検索」（移動の後）→ 押すと右パネルに 2 行
+    //    節が決まるのを待つあいだの割り込み（共有の tako-vd で前面を取られて閉じた）は開き直して
+    //    `interfered=` に数える（#1899。右クリックの直後に開かないのは実装の不具合として落とす）
     let refs_id = MenuItem::Xref(XrefKind::References).id();
-    vt1860_click(any, window, cx, word, MouseButton::Right);
+    let opened = vt1899_menu(
+        any,
+        window,
+        cx,
+        word,
+        Some(Duration::from_secs(20)),
+        None,
+        Duration::ZERO,
+        &|_| true,
+        &|_| {},
+    )
+    .await;
+    opened.check_not_exhausted(&format!("{LABEL} ①"));
     check(
-        vt1684_settled(any, window, cx, Duration::from_secs(20)).await,
+        opened.first.is_some()
+            && opened.section != Some(crate::lsp_menu_ui::LspMenuSection::Pending),
         &format!("visual-test {LABEL} ①: メニューの言語サーバの節が決まる"),
     );
-    let (_, drawn) = vt1684_menu(any, window, cx).unwrap_or_default();
-    println!("TAKO_VISUAL_PIXEL: {LABEL} ① menu={drawn:?}");
+    let drawn = opened.drawn.clone();
+    println!(
+        "TAKO_VISUAL_PIXEL: {LABEL} ① menu={drawn:?} interfered={}",
+        opened.interfered
+    );
     dump(any, cx, "xref-1685-menu.png");
     let at = drawn.iter().position(|id| *id == refs_id);
     check(

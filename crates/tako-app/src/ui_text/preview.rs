@@ -624,7 +624,8 @@ pub fn hover_no_cursor() -> &'static str {
 }
 
 /// メニュー / キーで頼んだホバーの答えを待っているあいだの印（プレビューのヘッダに出す。#1893）。
-/// サーバが読み込み中なら `tako_control::lsp::text::HOVER_LOADING_NOTE` の方を出す
+/// サーバが読み込み中で語の真下に 1 行を出せない（語の行が画面の外・#1899 の旧腕）ときは
+/// `tako_control::lsp::text::HOVER_LOADING_NOTE` の方を出す
 pub fn hover_searching() -> &'static str {
     tr!("ホバー情報を問い合わせています…", "Fetching hover info…")
 }
@@ -636,6 +637,12 @@ pub fn hover_truncated(total: usize) -> String {
         format!("長いので先頭 {limit} 字まで（全 {total} 字）"),
         format!("Showing the first {limit} of {total} characters")
     )
+}
+
+/// 切ったカードの脚注の 2 行目: 人向けの全文の取り方（#1899。コマンドは
+/// `tako_control::lsp::hover::full_command` の 1 本）
+pub fn hover_full_hint() -> &'static str {
+    tr!("全文はターミナルで:", "Full text in a terminal:")
 }
 
 // --- 言語サーバの状態（#1944。キー: preview.lsp_*）。エディタのタイトルの 1 行と、未導入・失敗の帯 ---

@@ -15,8 +15,11 @@
 //!
 //! マウスの要求も manager が読み込みを待って問い直す（補完の打鍵 = #1869 と同じ待ち）。待つあいだは
 //! 語の真下に「読み込み中」の 1 行（[`LspHoverUi::loading`]）を出し、答えが届いたらカードへ差し替える。
-//! メニュー / キーの要求は定義ジャンプ・整形と同じくヘッダの「問い合わせています」（読み込み中なら
-//! その旨）を出す。カードの本文はいつも [`MAX_CHARS`] 字まで（CLI / MCP の `limit` はカードに効かない）。
+//! メニュー / キーの要求は定義ジャンプ・整形と同じくヘッダの「問い合わせています」を出し、読み込み中は
+//! マウスと同じく語の真下に「読み込み中」の 1 行を出す（#1899。語の行が画面の外ならヘッダがその旨を言う）。
+//! カードの本文はいつも [`MAX_CHARS`] 字まで（CLI / MCP の `limit` はカードに効かない）で、切ったカードの
+//! 脚注に人向けの全文の取り方（`tako lsp hover --full`。#1899）を出す。
+//! A/B は `TAKO_1899_LEGACY=1`（読み込み中はヘッダだけ・脚注に取り方を出さない = #1899 前）。
 //!
 //! ここが持つのは画面だけ: いつ問い合わせるか（識別子に乗る → デバウンス）・カードをどこに
 //! 置くか（[`hover_card_placement`]。語の行の真下、入らなければ真上。ウィンドウの端で見切れない）・
@@ -116,6 +119,14 @@ pub(crate) struct LspHoverUi {
     pub(crate) pending: Option<(PaneId, u64)>,
     /// メニュー / キーの問い合わせの番号（古い答えでヘッダの印を下ろさない）
     explicit_seq: u64,
+    /// メニュー / キーで頼んだ位置の語と、頼んだときの編集バッファの版（#1899）。`pending` と一緒に
+    /// 立てて下ろし、サーバが読み込み中のあいだ語の真下に「読み込み中」の 1 行を出す（マウスと揃える）。
+    /// 版が変わったら出さない（語の位置がずれる）
+    explicit_target: Option<(HoverTarget, Option<u64>)>,
+    /// 直近に「読み込み中」の 1 行を描いたきっかけ（visual-test がマウスとメニュー / キーを見分ける）
+    pub(crate) loading_origin: Option<HoverOrigin>,
+    /// 直近に描いたカードの脚注の全文の取り方（#1899。切っていない・旧腕なら `None`。visual-test が読む）
+    pub(crate) footer_command: Option<String>,
 }
 
 impl LspHoverUi {
@@ -123,7 +134,7 @@ impl LspHoverUi {
     #[cfg(feature = "visual-test")]
     pub(crate) fn debug_state(&self) -> String {
         format!(
-            "target={:?} seq={} card={} inflight={} shown={} last_failure={:?} last_invalid={:?} loading={:?} pending={:?}",
+            "target={:?} seq={} card={} inflight={} shown={} last_failure={:?} last_invalid={:?} loading={:?} pending={:?} explicit={:?} loading_origin={:?}",
             self.target.as_ref().map(|t| (t.line, t.range.clone())),
             self.seq,
             self.card.is_some(),
@@ -133,6 +144,10 @@ impl LspHoverUi {
             self.last_invalid,
             self.loading,
             self.pending,
+            self.explicit_target
+                .as_ref()
+                .map(|(t, _)| (t.line, t.range.clone())),
+            self.loading_origin,
         )
     }
 }
@@ -622,6 +637,7 @@ impl TakoApp {
         let ui = &mut self.lsp_hover;
         ui.card = None;
         ui.bounds = None;
+        ui.footer_command = None;
         ui.layouts.clear();
         ui.loading = None;
         ui.loading_bounds = None;
@@ -741,6 +757,8 @@ impl TakoApp {
         self.lsp_hover.explicit_seq = self.lsp_hover.explicit_seq.wrapping_add(1);
         let seq = self.lsp_hover.explicit_seq;
         self.lsp_hover.pending = Some((pane, seq));
+        // #1899: 頼んだ位置の語（読み込み中ならマウスと同じく語の真下に 1 行を出す）
+        self.lsp_hover.explicit_target = self.explicit_hover_target(pane, &request);
         let staged = cx
             .background_executor()
             .spawn(async move { job.run_staged() });
@@ -749,6 +767,7 @@ impl TakoApp {
             let _ = this.update(cx, |app, cx| {
                 if app.lsp_hover.pending.is_some_and(|(_, s)| s == seq) {
                     app.lsp_hover.pending = None;
+                    app.lsp_hover.explicit_target = None;
                 }
                 let tako_control::OffloadOutcome::OnUi(next) = outcome else {
                     return;
@@ -773,14 +792,66 @@ impl TakoApp {
         cx.notify();
     }
 
+    /// メニュー / キーの要求の位置の語（#1899。要求は CLI と同じ綴り = 行 1 始まり・桁は行内 UTF-8 バイト）。
+    /// 描いた行の本文から語を取る（識別子の上でなければ `None` = 語の真下には出さずヘッダだけ）
+    fn explicit_hover_target(
+        &self,
+        pane: PaneId,
+        request: &tako_control::protocol::Request,
+    ) -> Option<(HoverTarget, Option<u64>)> {
+        let tako_control::protocol::Request::LspHover { line, column, .. } = request else {
+            return None;
+        };
+        let line = line.checked_sub(1)?;
+        let text = self.preview_line_texts.get(&pane)?.get(line)?;
+        let symbol = tako_core::lsp::goto::symbol_at(text, *column)?;
+        Some((
+            HoverTarget {
+                pane,
+                line,
+                range: symbol.range,
+            },
+            self.hover_version(pane),
+        ))
+    }
+
+    /// メニュー / キーで頼んだ問い合わせの「読み込み中」を語の真下に出すか（#1899）。答えを待っていて、
+    /// サーバが起動中 / 読み込み中で、語の行が描かれていて、頼んだ後に本文が変わっていないときだけ。
+    /// カード・右クリックメニューが出ていれば出さない。A/B の旧腕（`TAKO_1899_LEGACY=1`）はヘッダだけ
+    fn explicit_loading_target(&self) -> Option<HoverTarget> {
+        if tako_control::lsp::completion::legacy_1899() {
+            return None;
+        }
+        let (pane, _) = self.lsp_hover.pending?;
+        let (target, version) = self.lsp_hover.explicit_target.as_ref()?;
+        if target.pane != pane
+            || self.lsp_hover.card.is_some()
+            || self.pane_context_menu.is_some()
+            || self.context_menu.is_some()
+            || self.hover_version(pane) != *version
+        {
+            return None;
+        }
+        let state = self.previews.get(&pane)?;
+        let drawn = self
+            .preview_text_layouts
+            .get(&pane)
+            .and_then(|l| l.get(target.line))
+            .is_some_and(Option::is_some);
+        (state.mode == preview::PreviewMode::Code && drawn && self.lsp.server_loading(&state.path))
+            .then(|| target.clone())
+    }
+
     /// ヘッダの「問い合わせています」（メニュー / キーで頼んだホバーの答えを待っているあいだ。#1893）。
-    /// サーバが読み込み中なら済んだら出すと言う（読み込みの待ちは manager が持つ）
+    /// サーバが読み込み中なら済んだら出すと言う（読み込みの待ちは manager が持つ）。語の真下に
+    /// 「読み込み中」の 1 行を出しているあいだ（#1899）はそちらが言うので、ヘッダは問い合わせ中の印だけ
     pub(crate) fn lsp_hover_header_status(&self, pane: PaneId) -> Option<String> {
         let (waiting, _) = self.lsp_hover.pending.filter(|(p, _)| *p == pane)?;
-        let loading = self
-            .previews
-            .get(&waiting)
-            .is_some_and(|p| self.lsp.server_loading(&p.path));
+        let loading = self.explicit_loading_target().is_none()
+            && self
+                .previews
+                .get(&waiting)
+                .is_some_and(|p| self.lsp.server_loading(&p.path));
         Some(if loading {
             tako_control::lsp::text::HOVER_LOADING_NOTE
                 .text()
@@ -801,20 +872,30 @@ impl TakoApp {
     }
 
     /// 「読み込み中」の 1 行（#1893。補完の「読み込み中」= #1869 と同じ見た目と置き場 = 語の頭の真下、
-    /// 下に入らなければ真上）。外れていれば下ろして何も描かない。**押下は下の本文へ通す**（表示だけ）
+    /// 下に入らなければ真上）。マウスの問い合わせのほか、メニュー / キーで頼んだ問い合わせも同じ 1 行
+    /// （#1899）。外れていれば下ろして何も描かない。**押下は下の本文へ通す**（表示だけ）
     fn render_lsp_hover_loading(&mut self, window: &gpui::Window) -> Option<AnyElement> {
-        let Some(target) = self.hover_loading_target().cloned() else {
-            if self.lsp_hover.loading.is_some() && self.lsp_hover.card.is_none() {
-                // 版が変わった（打った）・別の語の番号: 印だけ下ろす（待ちは語の移動 / 閉じるが捨てる）
-                self.lsp_hover.loading = None;
+        self.lsp_hover.loading_origin = None;
+        let (target, origin) = match self.hover_loading_target().cloned() {
+            Some(target) => {
+                if !self.lsp_hover_enabled_for(target.pane) {
+                    self.lsp_hover.loading_bounds = None;
+                    return None;
+                }
+                (target, HoverOrigin::Mouse)
             }
-            self.lsp_hover.loading_bounds = None;
-            return None;
+            None => {
+                if self.lsp_hover.loading.is_some() && self.lsp_hover.card.is_none() {
+                    // 版が変わった（打った）・別の語の番号: 印だけ下ろす（待ちは語の移動 / 閉じるが捨てる）
+                    self.lsp_hover.loading = None;
+                }
+                let Some(target) = self.explicit_loading_target() else {
+                    self.lsp_hover.loading_bounds = None;
+                    return None;
+                };
+                (target, HoverOrigin::Explicit)
+            }
         };
-        if !self.lsp_hover_enabled_for(target.pane) {
-            self.lsp_hover.loading_bounds = None;
-            return None;
-        }
         let layout = self
             .preview_text_layouts
             .get(&target.pane)?
@@ -836,6 +917,7 @@ impl TakoApp {
             origin: gpui::point(px(placement.left), px(placement.top)),
             size: gpui::size(px(placement.width), px(placement.height)),
         });
+        self.lsp_hover.loading_origin = Some(origin);
         let theme = &self.theme;
         Some(
             div()
@@ -948,6 +1030,14 @@ impl TakoApp {
         };
         let (generation, blocks, truncated) =
             (card.generation, Arc::clone(&card.blocks), card.truncated);
+        // 切ったカードの脚注に出す全文の取り方（#1899。位置はカードの語の頭 = CLI の綴り）
+        let full_command = (!tako_control::lsp::completion::legacy_1899()).then(|| {
+            tako_control::lsp::hover::full_command(
+                card.pane.as_u64(),
+                card.line + 1,
+                card.range.start,
+            )
+        });
         let layout = self
             .preview_text_layouts
             .get(&card.pane)?
@@ -978,6 +1068,7 @@ impl TakoApp {
             origin: gpui::point(px(placement.left), px(placement.top)),
             size: gpui::size(px(placement.width), px(placement.height)),
         });
+        self.lsp_hover.footer_command = truncated.and(full_command.clone());
         let theme = self.theme.clone();
         let mut sink = md_view::ReadOnlyMdSink::new(&theme, None);
         let body = hover_body(&theme, &blocks, &mut sink);
@@ -1019,6 +1110,23 @@ impl TakoApp {
                 .child(SharedString::from(
                     crate::ui_text::preview::hover_truncated(total),
                 ))
+                .children(full_command.clone().map(|command| {
+                    div()
+                        .id("lsp-hover-full-command")
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap(px(4.0))
+                        .child(SharedString::from(
+                            crate::ui_text::preview::hover_full_hint(),
+                        ))
+                        .child(
+                            div()
+                                .font_family(theme.font_family.clone())
+                                .text_color(hsla(theme.text_secondary))
+                                .child(SharedString::from(command)),
+                        )
+                }))
         });
         Some(
             div()
