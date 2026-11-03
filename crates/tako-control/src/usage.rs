@@ -594,6 +594,23 @@ fn login_agents(
     out
 }
 
+/// 注記の人向けの表示（#2365。`tako usage` と右パネルの usage ビューの 1 実装）: 日本語は応答の `notes`
+/// をそのまま（作る側が載せた文）、英語は組み上がった応答から [`usage_notes`] で組み直す
+pub fn notes_in(payload: &Value, lang: Lang) -> Vec<String> {
+    match lang {
+        Lang::Ja => payload["notes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect(),
+        Lang::En => usage_notes(payload)
+            .iter()
+            .map(|n| n.text_in(lang))
+            .collect(),
+    }
+}
+
 /// 応答の注記（`notes`）の型（#2365）。組み上がった応答（[`payload_in`] の答え。`--show` なら GUI の答え）
 /// だけから組むので、作る側（応答へ日本語で載せる）と `tako usage` の人向けの表示（表示言語）が同じ
 /// 1 実装を通る。並び: API 換算の単価表 → 単価表に無いモデル → 区間按分（S3）の読み方 → 観測の無い

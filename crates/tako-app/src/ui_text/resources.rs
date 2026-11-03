@@ -2,7 +2,7 @@
 //!
 //! 数値は `tako queue` / MCP `tako_queue` の status と同じ答えを、表示言語で文にする。
 //! 区切り方（GB は 1 桁・1 GB 未満は MB・時間は時間 / 分 / 秒）は CLI の
-//! `queue_wrapper::human_mb` / `human_secs` / `eta::approx` にそろえる。
+//! `queue_wrapper::human_mb` / `human_secs_in` / `eta::approx` にそろえる。
 //! 優先度の段の名前（top / high / normal / low / default）は CLI の値と同じ語を両言語で使う。
 
 use tako_core::queue::Priority;
@@ -17,7 +17,7 @@ pub fn size(mb: u64) -> String {
     }
 }
 
-/// 経過・待ちの時間（`queue_wrapper::human_secs` と同じ区切り）
+/// 経過・待ちの時間（`queue_wrapper::human_secs_in` と同じ区切り）
 pub fn secs(s: u64) -> String {
     if s >= 3600 {
         tr!(
@@ -252,26 +252,22 @@ pub fn start_eta(start_s: u64) -> String {
         )
     }
 }
-/// 待つ理由。日本語は調停役の 1 文（CLI と同じ = 数値の内訳つき）、英語は理由の種類から短く
+/// 待つ理由。日本語は調停役の 1 文（CLI と同じ = 数値の内訳つき）、英語は理由の種類から短く。
+/// 文は CLI `tako queue` と同じ 1 実装（`tako_control::ReplyNote::QueueWaitReason`。#2365）
 pub fn wait_reason(code: Option<&str>, text_ja: Option<&str>) -> Option<String> {
-    tr!(
-        text_ja.map(str::to_string),
-        code.map(|c| {
-            match c {
-                "regather" => "the queue just restarted (re-registering jobs)",
-                "target_dir" => "a job using the same target dir is running",
-                "pressure_critical" => "memory pressure critical (new jobs are held)",
-                "pressure_warn" => "memory pressure warn (one at a time)",
-                "swap" => "swap in use (one at a time)",
-                "max_jobs" => "the concurrent job limit is reached",
-                "memory" => "not enough free memory",
-                "ahead" => "behind jobs queued earlier",
-                "overtake_limit" => "a job waiting for its target dir hit the overtake limit",
-                other => other,
-            }
-            .to_string()
-        })
-    )
+    let lang = tako_core::i18n::lang();
+    // 日本語は調停役の文があるとき、英語は理由の種類があるときだけ出す（無い欄からは組まない）
+    let shown = match lang {
+        tako_core::i18n::Lang::Ja => text_ja.is_some(),
+        tako_core::i18n::Lang::En => code.is_some(),
+    };
+    shown.then(|| {
+        tako_control::ReplyNote::QueueWaitReason {
+            code: code.map(str::to_string),
+            ja: text_ja.unwrap_or_default().to_string(),
+        }
+        .text_in(lang)
+    })
 }
 
 // ===== 優先度・取り消し =====
@@ -567,7 +563,7 @@ mod tests {
         });
     }
 
-    /// 数値の区切りは CLI（`queue_wrapper::human_mb` / `human_secs` / `eta::approx`）と同じ
+    /// 数値の区切りは CLI（`queue_wrapper::human_mb` / `human_secs_in` / `eta::approx`）と同じ
     #[test]
     fn 数値の区切りはcliと同じ() {
         let _g = tests_support::lang_guard();
@@ -575,14 +571,106 @@ mod tests {
         for mb in [0, 512, 1023, 1024, 36864, 123_456] {
             assert_eq!(size(mb), tako_control::queue_wrapper::human_mb(mb), "{mb}");
         }
-        for s in [0, 59, 60, 61, 3599, 3600, 7300] {
-            assert_eq!(secs(s), tako_control::queue_wrapper::human_secs(s), "{s}");
+        for lang in [tako_core::i18n::Lang::Ja, tako_core::i18n::Lang::En] {
+            tako_core::i18n::set_lang(lang);
+            for s in [0, 59, 60, 61, 3599, 3600, 7300] {
+                assert_eq!(
+                    secs(s),
+                    tako_control::queue_wrapper::human_secs_in(s, lang),
+                    "{lang:?} {s}"
+                );
+            }
         }
+        tako_core::i18n::set_lang(tako_core::i18n::Lang::Ja);
         for s in [0, 29, 59, 60, 89, 90, 600] {
             assert_eq!(approx(s), tako_core::queue::eta::approx(s), "{s}");
         }
         assert_eq!(start_eta(0), tako_core::queue::eta::start_text(0));
         assert_eq!(start_eta(240), tako_core::queue::eta::start_text(240));
+    }
+
+    /// #2365: 待つ理由の英語は CLI `tako queue` と同じ 1 実装（`ReplyNote::QueueWaitReason`）。調停役が返す
+    /// 理由の種類（`WaitReason` の全種と起動待ちの `pending`）のどれも、画面と CLI で同じ文になり日本語を含まない。
+    /// 日本語は調停役の 1 文をそのまま出す。無い欄からは組まない（日本語は文・英語は種類が無ければ出さない）
+    #[test]
+    fn 待つ理由はcliと同じ1実装() {
+        use tako_core::i18n::Lang;
+        use tako_core::queue::WaitReason;
+        let _g = tests_support::lang_guard();
+        let reasons = [
+            WaitReason::Regather,
+            WaitReason::TargetDir,
+            WaitReason::PressureCritical,
+            WaitReason::PressureWarn,
+            WaitReason::Swap { used_mb: 4096 },
+            WaitReason::MaxJobs {
+                running: 3,
+                unmanaged: 1,
+                max: 3,
+            },
+            WaitReason::Memory {
+                available_mb: 1024,
+                need_mb: 3584,
+                reserve_mb: 3686,
+                pending_mb: 0,
+                estimate_mb: 3584,
+            },
+            WaitReason::Ahead,
+            WaitReason::OvertakeLimit { max: 3 },
+        ];
+        // 種類を足したら E0004 = 上の見本に足す
+        for r in &reasons {
+            match r {
+                WaitReason::Regather
+                | WaitReason::TargetDir
+                | WaitReason::PressureCritical
+                | WaitReason::PressureWarn
+                | WaitReason::Swap { .. }
+                | WaitReason::MaxJobs { .. }
+                | WaitReason::Memory { .. }
+                | WaitReason::Ahead
+                | WaitReason::OvertakeLimit { .. } => {}
+            }
+        }
+        let mut cases: Vec<(String, String)> = reasons
+            .iter()
+            .map(|r| (r.code().to_string(), r.text()))
+            .collect();
+        cases.push(("pending".into(), "判断待ち".into()));
+        for (code, ja) in &cases {
+            let cli = |lang| {
+                tako_control::ReplyNote::QueueWaitReason {
+                    code: Some(code.clone()),
+                    ja: ja.clone(),
+                }
+                .text_in(lang)
+            };
+            tako_core::i18n::set_lang(Lang::En);
+            let en = wait_reason(Some(code), Some(ja)).unwrap_or_default();
+            assert_eq!(en, cli(Lang::En), "待つ理由 `{code}` の英語が CLI と違う");
+            assert!(
+                !en.chars().any(|c| ('\u{3040}'..='\u{30ff}').contains(&c)
+                    || ('\u{4e00}'..='\u{9fff}').contains(&c)),
+                "待つ理由 `{code}` の英語に日本語: {en}"
+            );
+            assert_ne!(en, *code, "待つ理由 `{code}` の英語が種類の名前のまま");
+            assert_eq!(
+                wait_reason(None, Some(ja)),
+                None,
+                "英語は種類が無ければ出さない"
+            );
+            tako_core::i18n::set_lang(Lang::Ja);
+            assert_eq!(
+                wait_reason(Some(code), Some(ja)).as_deref(),
+                Some(ja.as_str())
+            );
+            assert_eq!(wait_reason(Some(code), Some(ja)), Some(cli(Lang::Ja)));
+            assert_eq!(
+                wait_reason(Some(code), None),
+                None,
+                "日本語は文が無ければ出さない"
+            );
+        }
     }
 
     /// 実行中の行は「数値（経過つき）· 見込み」を 1 行に並べるので、見込みの文で経過を繰り返さない

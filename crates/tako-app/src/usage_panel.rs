@@ -280,8 +280,9 @@ pub(crate) fn level_title(level: &UsageLevel) -> String {
     }
 }
 
-/// 段の行の名前（いまの段の絞り込みで分かる部分は省く = パンくずに出ている）
-fn row_name(level: &UsageLevel, key: &GroupKey, fallback: &str) -> String {
+/// 段の行の名前（いまの段の絞り込みで分かる部分は省く = パンくずに出ている）。`g` は応答の `groups[]` の 1 件
+/// （プロジェクト・Issue・会話以外の段は `tako usage` と同じ 1 実装 = 表示言語で言い換える。#2365）
+fn row_name(level: &UsageLevel, key: &GroupKey, g: &Value) -> String {
     let project = || project_title(&ProjectFilter::spec_of(key));
     let issue = || issue_title(&IssueFilter::spec_of(key));
     match By::parse(&level.by) {
@@ -312,7 +313,7 @@ fn row_name(level: &UsageLevel, key: &GroupKey, fallback: &str) -> String {
             }
             parts.join(" · ")
         }
-        _ => fallback.to_string(),
+        _ => display::group_row_name_in(g, &level.by, tako_core::i18n::lang()),
     }
 }
 
@@ -332,6 +333,8 @@ pub(crate) fn login_views(
     let drillable =
         By::parse(&level.by).is_some_and(|by| report::drill(by, &GroupKey::default()).is_some());
     let f = |v: &Value| v.as_f64().unwrap_or(0.0);
+    // 数の書き方と期間の文は表示言語（`tako usage` と同じ `display::*_in`。#2365）
+    let lang = tako_core::i18n::lang();
     let mut out = Vec::new();
     for l in payload["logins"].as_array().into_iter().flatten() {
         let mut title = crate::ui_text::panel::usage_login(l["label"].as_str().unwrap_or("-"));
@@ -380,16 +383,17 @@ pub(crate) fn login_views(
             if usage["range"]["basis"] == "observed" {
                 view.resets = None;
             }
-            view.range = Some(display::range_label(
+            view.range = Some(display::range_label_in(
                 window,
                 &usage["range"],
                 now,
                 utc_offset,
+                lang,
             ));
             let t = &usage["total"];
             view.total = Some(crate::ui_text::panel::usage_amount(
                 &display::api_usd(f(&t["api_usd"])),
-                &display::tokens(t["total_tokens"].as_u64().unwrap_or(0)),
+                &display::tokens_in(t["total_tokens"].as_u64().unwrap_or(0), lang),
                 t["sessions"].as_u64().unwrap_or(0),
             ));
             let kinds: Vec<&Value> = usage["limit_share"]
@@ -412,7 +416,7 @@ pub(crate) fn login_views(
                 let share = |kind: &str| &g["limit_share"][kind];
                 let main_value = f(&share(main_kind)["percent"]);
                 view.rows.push(UsageRowView {
-                    name: row_name(level, &key, g["name"].as_str().unwrap_or("-")),
+                    name: row_name(level, &key, g),
                     main: available(main_kind).then(|| display::share_percent(main_value)),
                     main_value,
                     estimated: available(main_kind)
@@ -426,7 +430,7 @@ pub(crate) fn login_views(
                         )
                     }),
                     usd: display::api_usd(f(&g["api_usd"])),
-                    tokens: display::tokens(g["total_tokens"].as_u64().unwrap_or(0)),
+                    tokens: display::tokens_in(g["total_tokens"].as_u64().unwrap_or(0), lang),
                     sessions: g["sessions"].as_u64().unwrap_or(0),
                     key,
                     drillable,
@@ -1046,13 +1050,9 @@ impl TakoApp {
                 );
             }
         }
-        // 注記（API 換算の意味・按分の読み方・索引の読み途中など。既定は畳む）
-        let notes: Vec<String> = payload["notes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|n| n.as_str().map(str::to_string))
-            .collect();
+        // 注記（API 換算の意味・按分の読み方・索引の読み途中など。既定は畳む）。日本語は応答の注記のまま、
+        // 英語は応答から組み直す（`tako usage` と同じ 1 実装。#2365）
+        let notes = tako_control::usage::notes_in(&payload, tako_core::i18n::lang());
         if !notes.is_empty() {
             let open = self.usage.notes_open;
             body = body.child(
@@ -1217,6 +1217,92 @@ mod tests {
         });
     }
 
+    /// #2365: 英語表示の行の文字（期間・量・トークン・段の名前）に日本語が混ざらない = `tako usage` の英語表示と
+    /// 同じ `display::*_in` / `group_row_name_in` を表示言語で呼ぶ。日本語表示は上の既存の文のまま
+    #[test]
+    fn 英語表示の行の文字は日本語を含まずcliと同じ() {
+        let ja = |s: &str| {
+            s.chars().any(|c| {
+                ('\u{3040}'..='\u{30ff}').contains(&c) || ('\u{4e00}'..='\u{9fff}').contains(&c)
+            })
+        };
+        crate::ui_text::tests_support::with_lang(tako_core::i18n::Lang::En, || {
+            let now = 1_792_000_000;
+            for (basis, window) in [
+                ("rolling", "7d"),
+                ("rolling", "5h"),
+                ("observed", "7d"),
+                ("calendar", "month"),
+                ("all", "all"),
+            ] {
+                let mut p = payload(
+                    window,
+                    vec![
+                        group(
+                            json!({ "project": "tako" }),
+                            "tako",
+                            30.94,
+                            1.2,
+                            20.6,
+                            12_345,
+                        ),
+                        group(
+                            json!({ "profile": "default" }),
+                            "プロファイル: default",
+                            2.0,
+                            0.0,
+                            0.0,
+                            1_234_567,
+                        ),
+                        group(json!({}), "未分類", 0.0, 0.0, 0.0, 365_000_000),
+                    ],
+                );
+                p["logins"][0]["usage"]["range"] =
+                    json!({ "basis": basis, "from": now - 3600, "resets_at": now + 3600 });
+                let v = &login_views(&p, &UsageLevel::top(), now, 0)[0];
+                let range = v.range.clone().unwrap_or_default();
+                assert!(!ja(&range), "{basis}: 期間 {range}");
+                assert_eq!(
+                    range,
+                    display::range_label_in(
+                        window,
+                        &p["logins"][0]["usage"]["range"],
+                        now,
+                        0,
+                        tako_core::i18n::Lang::En
+                    )
+                );
+                let total = v.total.clone().unwrap_or_default();
+                assert!(!ja(&total), "{basis}: 量 {total}");
+                assert!(
+                    total.contains("365.0M"),
+                    "{basis}: 量のトークンは CLI と同じ書き方 {total}"
+                );
+                let shown: Vec<(String, String)> = v
+                    .rows
+                    .iter()
+                    .map(|r| (r.name.clone(), r.tokens.clone()))
+                    .collect();
+                assert_eq!(
+                    shown,
+                    [
+                        ("tako".to_string(), "12.3K".to_string()),
+                        ("Profile: default".into(), "1.2M".into()),
+                        ("Unclassified".into(), "365.0M".into()),
+                    ],
+                    "{basis}"
+                );
+            }
+            // プロジェクト・Issue・会話以外の段（`tako usage --show --by login` ほか）も言い換える
+            let level = UsageLevel {
+                by: "login".into(),
+                ..UsageLevel::top()
+            };
+            let g = json!({ "key": {}, "name": "合計" });
+            assert_eq!(row_name(&level, &GroupKey::default(), &g), "total");
+        });
+    }
+
     /// 掘り下げ: プロジェクト → Issue → 会話。段の名前はパンくずに出ている部分を省く
     #[test]
     fn 掘り下げとパンくずと問い合わせ() {
@@ -1254,7 +1340,7 @@ mod tests {
                 ..GroupKey::default()
             };
             assert_eq!(
-                row_name(&s.current(), &key, "-"),
+                row_name(&s.current(), &key, &json!({ "name": "-" })),
                 "01234567 · worker · #2203 usage"
             );
             s.back_to(0);
