@@ -55,6 +55,8 @@ cleanup() {
 trap cleanup EXIT
 
 . "$REPO_ROOT/scripts/lib/isolated-gui.sh"
+# shellcheck source=lib/fake-exec.sh
+. "$REPO_ROOT/scripts/lib/fake-exec.sh"
 
 # ビルドは HOME を差し替える前に（後で呼ぶとツールチェーンとレジストリを一時 HOME へ取り直す）
 isolated_gui_bins visual-test || exit 1
@@ -83,7 +85,9 @@ while IFS= read -r -n1 ch; do
   fi
 done
 STUB
-chmod +x "$STUB_BIN/claude"
+# スタブは作った時点で空打ちし、macOS の初回 exec の検査を所在確認の上限（15 秒 / visual 段は 5 秒）と
+# 配送の待ちの外で済ませる（#2222 / #2228。空打ちは本文を走らせない = hang.pids も書かない）
+fake_exec_warm "$STUB_BIN/claude"
 
 # `$SHELL` のスタブ。CLI の所在確認（`-l -c 'command -v claude'`）のときだけ差し替え、
 # 残り（ペインのシェル・git / tmux の所在確認）は zsh へそのまま渡す。
@@ -101,7 +105,7 @@ case "\$*" in
 esac
 exec /bin/zsh "\$@"
 STUB
-chmod +x "$STUB_BIN/stubshell"
+fake_exec_warm "$STUB_BIN/stubshell"
 
 # PATH から claude を持つ dir を外す（本物の claude を GUI の裏でもペインでも起こさない）
 clean_path=""

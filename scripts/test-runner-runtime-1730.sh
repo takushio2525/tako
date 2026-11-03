@@ -81,11 +81,14 @@ for d in "$HOME" "$TAKO_DATA_DIR" "$TAKO_ORCHESTRATOR_DIR"; do
   esac
 done
 
-# 固まる道具のスタブ（pipenv はこの機械に無い前提の名前。直接の子を眠らせるので打ち切りで止まる）
+# 固まる道具のスタブ（pipenv はこの機械に無い前提の名前。直接の子を眠らせるので打ち切りで止まる）。
+# 作った時点で空打ちし、macOS の初回 exec の検査を Tier P の上限（3 秒）の外で済ませる（#2222 / #2228）
+# shellcheck source=lib/fake-exec.sh
+. "$REPO_ROOT/scripts/lib/fake-exec.sh"
 STUBS="$TMP/stubs"
 mkdir -p "$STUBS"
 printf '#!/bin/sh\nexec sleep 30\n' > "$STUBS/pipenv"
-chmod +x "$STUBS/pipenv"
+fake_exec_warm "$STUBS/pipenv"
 export PATH="$STUBS:$PATH"
 
 # --- 材料 ---------------------------------------------------------------------

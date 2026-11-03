@@ -20,6 +20,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAKO="${TAKO_BIN:-$ROOT/target/debug/tako}"
 PTY="$ROOT/scripts/lib/pty-answer.py"
+# shellcheck source=lib/fake-exec.sh
+. "$ROOT/scripts/lib/fake-exec.sh"
 PASS=0; FAIL=0
 
 ok()   { PASS=$((PASS+1)); echo "  PASS: $1"; }
@@ -62,7 +64,9 @@ EOF
   # 依存は揃えておく（[y/N] の導入確認を出さない = プランの問いだけを見る）
   for t in git tmux tailscale; do printf '#!/bin/sh\necho "%s (stub)"\nexit 0\n' "$t" > "$BIN/$t"; done
   printf '#!/bin/sh\nexit 0\n' > "$BIN/brew"
-  chmod +x "$BIN"/*
+  # 作った時点で空打ちし、macOS の初回 exec の検査を setup の上限（claude の問い合わせ 15 秒ほか）の
+  # 外で済ませる（#2222 / #2228。段ごとに作り直す = 新しいファイルなので、書くたびに掛ける）
+  fake_exec_warm "$BIN"/*
 }
 
 isoenv(){ # 隔離環境で残りの引数を実行する

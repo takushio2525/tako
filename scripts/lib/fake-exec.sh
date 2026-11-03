@@ -24,6 +24,12 @@
 #   （判定はテストの側の上限と状態で見る）
 # - A/B: TAKO_2222_LEGACY=1 は空打ちしない（修正前の形）。
 #   注入: TAKO_2222_INJECT_FIRST_EXEC_MS=<ms> で各スタブの初回の exec だけを遅らせる（印は `<スタブ>.first-exec`）
+# - テストのスクリプト（`test-*.sh`）でスタブに素の `chmod +x` を足すと、番犬
+#   `shell_scripts.rs` の `テストのスタブは素のchmodではなく空打ちの補助で実行権を付ける` が
+#   file:line で名指す（#2228。既存分は数を凍結。スタブでない物は `# tako:chmod-ok <理由>`）
+# - tako の `env -i` の下で別のスタブが書くスタブ（brew スタブが入れる tailscale 等）は、書き出し口へ
+#   `declare -f _fake_exec_insert fake_exec_warm` と `FAKE_EXEC_WARM_ARG`・A/B・注入の値を焼き込んで掛ける
+#   （例: `scripts/test-setup-tailscale-detect-1797.sh` の write-ts）
 #
 # bash 3.2（macOS 同梱）でも通す。`| grep -q` は pipefail の下で取りこぼす（#1933）ので case で見る。
 

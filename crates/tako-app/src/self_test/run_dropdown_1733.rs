@@ -44,24 +44,22 @@ fn dump(any: AnyWindowHandle, window: WindowHandle<TakoApp>, cx: &mut AsyncApp, 
     }
 }
 
-/// 偽の venv（`pyvenv.cfg` の版 + 実行できる `bin/python`）。中身は走った印を出すだけ
-fn fake_venv(dir: &std::path::Path, version: &str) {
+/// 偽の venv（`pyvenv.cfg` の版 + 実行できる `bin/python`）。中身は走った印を出すだけ。
+/// `bin/python` は書いた時点で空打ちする（#2228。一覧の 20 秒の窓の中で初めて exec しない）。
+/// python を書けなければ `false`
+async fn fake_venv(cx: &mut AsyncApp, dir: &std::path::Path, version: &str) -> bool {
     let bin = dir.join("bin");
     let _ = std::fs::create_dir_all(&bin);
     let _ = std::fs::write(
         dir.join("pyvenv.cfg"),
         format!("home = /usr/bin\nversion = {version}\n"),
     );
-    let python = bin.join("python");
-    let _ = std::fs::write(
-        &python,
-        format!("#!/bin/sh\necho \"fake-python-{version} $*\"\n"),
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755));
-    }
+    write_fake_exec(
+        cx,
+        &bin.join("python"),
+        &format!("#!/bin/sh\necho \"fake-python-{version} $*\"\n"),
+    )
+    .await
 }
 
 fn probe_center(
@@ -343,8 +341,12 @@ pub(super) async fn run_dropdown_1733_visual(
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
     let dir = tako_core::platform::path::canonicalize(&dir).unwrap_or(dir);
-    fake_venv(&dir.join(".venv"), "3.12.4");
-    fake_venv(&dir.join("alt"), "3.11.9");
+    let venv = fake_venv(cx, &dir.join(".venv"), "3.12.4").await;
+    let alt = fake_venv(cx, &dir.join("alt"), "3.11.9").await;
+    check(
+        venv && alt,
+        &format!("visual-test {LABEL}: 偽の venv の python を書ける"),
+    );
     let a = dir.join("a.py");
     let _ = std::fs::write(
         &a,
