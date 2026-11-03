@@ -19176,7 +19176,7 @@ impl TakoApp {
     /// 同じ口（`tako_control::queue::handle`）を通す = 次の 500 ms tick で起こし、persist.log に
     /// 上書きの 1 行が残る
     fn launch_wait_start_now(&mut self, pane: PaneId, cx: &mut Context<Self>) {
-        match tako_control::queue::handle("start", None, Some(pane.as_u64()), None) {
+        match tako_control::queue::handle("start", None, Some(pane.as_u64()), None, None) {
             Ok(_) => {
                 self.refresh_launch_wait_bands();
             }
@@ -65355,7 +65355,7 @@ mod self_test {
                 ),
             );
         } else {
-            let _ = tako_control::queue::handle("start", None, Some(a.as_u64()), None);
+            let _ = tako_control::queue::handle("start", None, Some(a.as_u64()), None, None);
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         while std::time::Instant::now() < deadline {

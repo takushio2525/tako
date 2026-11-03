@@ -621,6 +621,7 @@ mod tests {
             ssh: None,
             spawned_by: None,
             limit_seen: None,
+            queue_priority: None,
         }
     }
 

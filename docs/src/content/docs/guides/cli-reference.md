@@ -1914,7 +1914,14 @@ tako queue                   # PC のメモリ（使用・圧縮・空き）・s
 tako queue --json            # 生の JSON（tako が起動していなければ機の状態だけを返す）
 tako queue cargo build       # 重い処理を順番待ちで走らせる（同時数・空きメモリ・メモリ圧で割り当て。
                              # 終了コードはコマンドのまま。tako が起動していなければ待たずに走る）
+                             # 実行中の行に終わりの見込み（「あと約 3 分（前回 7 分）」。同じコマンドの 2 回目から）、
+                             # 待ちの行に「開始まで約 N 分」。端末でない cargo の進みの行（Building [...] N/M）は
+                             # tako queue が読んで出力から外す（AI に返る出力に混ざらない。端末では触らない）
 tako queue cancel 12345      # 受付番号（= 待っている tako queue の pid）の処理を取り消す
+tako queue priority 12345 high   # 受付番号の処理の優先度を変える（top / high / normal / low。default で既定へ）
+tako queue priority --pane 5 low # そのペインから出る処理の既定を変える（GUI を再起動しても残る）
+                             # 既定は 人が直接打った top・master / solo high・worker normal・ペインの外 low。
+                             # 待ちが 15 分続くごとに 1 段上がる（high まで）。走っている処理は止めない
 tako queue limits            # 上限（同時数・空けておくメモリ・swap の警戒線・待ちの上限）を読む
 tako queue limits --max-jobs 2   # 同時に走らせる数を変える（--reset で機に合わせた既定へ）
 tako queue limits --jobserver off  # tako のペインの cargo が共有する札を配らない（既定 on。on で戻す）

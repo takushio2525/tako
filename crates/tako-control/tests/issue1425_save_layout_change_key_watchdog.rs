@@ -449,6 +449,11 @@ fn cases() -> Vec<((&'static str, &'static str), Cover)> {
             ("PaneLayout", "limit_seen"),
             Cover::Mutate(|f| leaf(f, 102).limit_seen = None),
         ),
+        // #1996: 順番待ちの優先度の既定（`tako queue priority --pane N`）
+        (
+            ("PaneLayout", "queue_priority"),
+            Cover::Mutate(|f| leaf(f, 102).queue_priority = Some(tako_core::queue::Priority::Low)),
+        ),
         // ---- LimitSeenLayout（#1710）----
         (
             ("LimitSeenLayout", "notice"),
@@ -693,6 +698,8 @@ fn pane(id: u64, title: &str) -> PaneLayout {
             notice: "fedcba9876543210".into(),
             detected_at: 1_790_220_660,
         }),
+        // #1996: 順番待ちの優先度の既定（既定の None ではない値）
+        queue_priority: Some(tako_core::queue::Priority::High),
     }
 }
 

@@ -906,9 +906,15 @@ fn reason_index(r: &Reason) -> usize {
         Reason::ReplaceItemAndFile => 344,
         Reason::ReplaceFileNotInResults(_) => 345,
         Reason::ReplaceBusy => 346,
+        // #1996: 順番待ちの優先度の変更の断り（`queue::set_job_priority` / dispatch のペイン）
+        Reason::QueuePrioritySettingUnknown(_) => 347,
+        Reason::QueuePriorityLevelMissing => 348,
+        Reason::QueuePriorityTargetMissing => 349,
+        Reason::QueuePriorityTargetBoth => 350,
+        Reason::QueueJobUnknown(_) => 351,
     }
 }
-const REASON_VARIANTS: usize = 347;
+const REASON_VARIANTS: usize = 352;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1541,6 +1547,11 @@ fn reason_samples() -> Vec<Reason> {
         Reason::ReplaceItemAndFile,
         Reason::ReplaceFileNotInResults("src/a.rs".into()),
         Reason::ReplaceBusy,
+        Reason::QueuePrioritySettingUnknown("urgent".into()),
+        Reason::QueuePriorityLevelMissing,
+        Reason::QueuePriorityTargetMissing,
+        Reason::QueuePriorityTargetBoth,
+        Reason::QueueJobUnknown(4242),
     ]
 }
 
@@ -1961,6 +1972,12 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "item と file は同時に指定できない（1 行か 1 ファイルのどちらか）",
     "結果に src/a.rs の行が無い（結果の path か表示の相対パスで指定する）",
     "前の置換を当てている途中（終わってからもう一度）",
+    // #1996: 順番待ちの優先度の変更の断り（この時点の文 = 新設）
+    "優先度は top / high / normal / low、既定へ戻すなら default（受け取った値: urgent）",
+    "priority には段（top / high / normal / low / default）が要る",
+    "priority には受付番号（id）かペイン（pane）のどちらかが要る",
+    "受付番号（id）とペイン（pane）はどちらか一方だけ",
+    "受付番号 4242 は順番待ちに居ない（`tako queue` で一覧）",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形

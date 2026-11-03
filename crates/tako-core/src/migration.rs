@@ -133,6 +133,10 @@ pub enum SchemaId {
     /// 丸ごと移す。新しい置き場が既にあれば旧い方を `.pre-v1.bak` へ退避）。
     /// 中身は WebView2 のプロファイル（tako の形式ではない）なので形式の検査は持たない
     WebView2Data,
+    /// `<data_dir>/resources/history.jsonl`（+ 回した `history.1.jsonl`。順番待ちの過去の記録 = 最大メモリと
+    /// 所要時間。#2254 / #1996）。追記だけの JSONL で版数の欄は持たない（v1 固定）。行の欄を足すときは
+    /// serde の default で旧い行を読む。読めない行のあるファイルは `.unreadable.bak` へ写す
+    QueueHistory,
 }
 
 impl SchemaId {
@@ -167,6 +171,7 @@ impl SchemaId {
             Self::RunConfigs => "run_configs",
             Self::PowerShellProfile => "powershell_profile",
             Self::WebView2Data => "webview2_data",
+            Self::QueueHistory => "queue_history",
         }
     }
 
@@ -205,6 +210,7 @@ impl SchemaId {
             Self::RunConfigs,
             Self::PowerShellProfile,
             Self::WebView2Data,
+            Self::QueueHistory,
         ]
     }
 }

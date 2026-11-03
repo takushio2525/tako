@@ -62,11 +62,25 @@
 //! 先頭は飢えない: その dir が空いた時点で、先頭は入るか 2〜6 で止まる（= 後ろはもう追い越せない）ので、
 //! 空いた後に先頭より先に入る処理は無い。追い越しで走り出した処理は、先頭が走れない間の空き枠を使うだけ。
 
+//!
+//! ## 優先度と終わりの見込み（#1996）
+//!
+//! 優先度の既定（処理 > ペイン > 役割）とエイジング（待ち 15 分ごとに 1 段・`high` まで）は [`priority`]、
+//! 終わりの見込み（過去の所要時間 → cargo の `N/M` の線形）と待ちの開始の見込み・cargo の進みの行の
+//! 読み取りは [`eta`]。[`WaitingJob::priority`] は**エイジングの後の実効の段**（調停役が自分の時計で
+//! [`priority::aged`] を当てて渡す）なので、[`admit`] の並び（[`order_waiting`]）は時計を持たない
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::resources::{MachineStats, Pressure, MIB};
+
+pub mod eta;
+pub mod priority;
+
+pub use eta::Progress;
+pub use priority::{CallerRole, PriorityHint};
 
 /// 1 GiB を MiB で
 const GIB_MB: u64 = 1024;
@@ -249,6 +263,25 @@ pub fn classify(argv: &[String]) -> JobKind {
         return JobKind::Node;
     }
     JobKind::Other
+}
+
+/// 進みの行（`Building [...] N/M`）を wrapper が読む cargo のサブコマンド（#1996）。`run` / `install` は
+/// 外す（ビルドの後に走るプログラムの stderr まで受け続けることになる = 対話や長生きの子を遅らせない）
+const CARGO_PROGRESS_SUBCOMMANDS: &[&str] = &[
+    "build", "b", "check", "c", "test", "t", "bench", "clippy", "doc", "d", "rustc", "rustdoc",
+];
+
+/// cargo の進みを読む対象か（純関数。#1996）: 前置き（`env` / `nice` / `time`）の後の本体が cargo で、
+/// サブコマンド（`+toolchain` とオプションの後の最初の語）が build / test 系
+pub fn cargo_progress_target(argv: &[String]) -> bool {
+    let rest = &argv[command_start(argv)..];
+    if rest.first().map(|w| base(w)) != Some("cargo") {
+        return false;
+    }
+    rest[1..]
+        .iter()
+        .find(|w| !w.starts_with('-') && !w.starts_with('+'))
+        .is_some_and(|sub| CARGO_PROGRESS_SUBCOMMANDS.contains(&sub.as_str()))
 }
 
 /// cargo の target dir を推定する（純関数。`is_manifest` は「そのディレクトリに Cargo.toml が
@@ -517,6 +550,9 @@ pub struct HistoryRow {
     pub ran_s: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    /// cargo のユニットの総数（`Building [...] N/M` の `M`。wrapper が読めたときだけ。#1996）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub units: Option<u32>,
 }
 
 /// 見込みの出どころ
@@ -607,8 +643,11 @@ fn from_rows(rows: &[&HistoryRow], from: EstimateFrom) -> Estimate {
 
 // ===== 優先度 =====
 
-/// 優先度（S2 は並びに効くだけ。変更・エイジング・役割の既定は #1996）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+/// 優先度（並びは高い順 = `Ord` の小さい順）。既定・変更・エイジングは [`priority`]（#1996）。
+/// layout.json のペインの既定（`PaneLayout.queue_priority`）として永続する
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     /// 人が直接
@@ -679,6 +718,12 @@ pub struct JobWire {
     /// 過去の記録の鍵（#2254。ハッシュと表示名だけ。旧い wrapper は送らない = 区分の既定）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<HistoryKeys>,
+    /// 優先度の手がかり（#1996。旧い wrapper は送らない = `priority` をそのまま使う）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<PriorityHint>,
+    /// cargo の進み（#1996。wrapper が stderr から読めたときだけ。心拍と done に載せる）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<Progress>,
 }
 
 // ===== 上限 =====
@@ -923,6 +968,7 @@ pub struct WaitingJob {
     pub id: u64,
     pub estimate_mb: u64,
     pub target_dir: Option<String>,
+    /// 実効の段（エイジングの後。#1996 = 調停役が [`priority::aged`] を当てて渡す）
     pub priority: Priority,
     pub enqueued_at_ms: u64,
     /// これまでに追い越された件数（#2243。調停役がメモリに持つ = 立て直すと 0 から）
@@ -1402,6 +1448,29 @@ mod tests {
 
     fn argv(s: &str) -> Vec<String> {
         s.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn issue1996_進みを読むのはcargoのビルドとテスト系だけ() {
+        for yes in [
+            "cargo build",
+            "cargo test -p tako-core",
+            "/usr/local/bin/cargo +nightly clippy --all-targets",
+            "env CARGO_BUILD_JOBS=2 cargo t",
+            "cargo --locked check",
+        ] {
+            assert!(cargo_progress_target(&argv(yes)), "{yes}");
+        }
+        for no in [
+            "cargo run -p tako-app",
+            "cargo install --path .",
+            "cargo",
+            "cargo-nextest nextest run",
+            "bash scripts/x.sh",
+            "rustc main.rs",
+        ] {
+            assert!(!cargo_progress_target(&argv(no)), "{no}");
+        }
     }
 
     fn limits(max_jobs: u32) -> Limits {
