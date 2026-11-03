@@ -18413,9 +18413,31 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::JumpSkippedMissing(_) => 301,
         ReplyNote::JumpReopened => 302,
         ReplyNote::JumpNothingToMove => 303,
+        // #2365 の続き: `tako context-budget`（check / fix）と `tako test-residue` の人向けの表示の枠
+        ReplyNote::BudgetHeader { .. } => 304,
+        ReplyNote::BudgetItemRow { .. } => 305,
+        ReplyNote::BudgetOver { .. } => 306,
+        ReplyNote::BudgetWithin => 307,
+        ReplyNote::BudgetProposal { .. } => 308,
+        ReplyNote::BudgetDryRun => 309,
+        ReplyNote::BudgetUnchanged(_) => 310,
+        ReplyNote::BudgetMoved { .. } => 311,
+        ReplyNote::BudgetBytes { .. } => 312,
+        ReplyNote::BudgetAgedOut(_) => 313,
+        ReplyNote::BudgetToArchive(_) => 314,
+        ReplyNote::BudgetFilesChanged(_) => 315,
+        ReplyNote::ResidueTempDir(_) => 316,
+        ReplyNote::ResidueNone => 317,
+        ReplyNote::ResidueTotal { .. } => 318,
+        ReplyNote::ResidueKindRow { .. } => 319,
+        ReplyNote::ResidueSkipped { .. } => 320,
+        ReplyNote::ResidueRecheck => 321,
+        ReplyNote::ResidueRemoved { .. } => 322,
+        ReplyNote::ResidueRemovable { .. } => 323,
+        ReplyNote::ResidueApplyHint => 324,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 304;
+const REPLY_NOTE_VARIANTS: usize = 325;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -20601,6 +20623,152 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             ReplyNote::JumpNothingToMove,
             "移れる履歴が無い".into(),
         ),
+        // #2365 の続き: context-budget / test-residue の枠（旧文は `main.rs` の書式をそのまま展開）
+        (
+            ReplyNote::BudgetHeader {
+                items: 5,
+                tokens: 51234,
+            },
+            "起動時ロード: 5 項目 / 概算 51234 トークン".into(),
+        ),
+        (
+            ReplyNote::BudgetItemRow {
+                path: "~/w/AGENTS.md".into(),
+                bytes: 1234,
+                tokens: 308,
+                kind: "agents_guide".into(),
+            },
+            format!(
+                "{:<40} {:>7} bytes / 約 {:>6} tok  [{}]",
+                "~/w/AGENTS.md", 1234, 308, "agents_guide"
+            ),
+        ),
+        (
+            ReplyNote::BudgetOver {
+                metric: "entries".into(),
+                actual: 25,
+                limit: 20,
+                note: "N".into(),
+            },
+            "超過 entries: 25 > 20（N）".into(),
+        ),
+        (ReplyNote::BudgetWithin, "予算内".into()),
+        (
+            ReplyNote::BudgetProposal {
+                path: "AGENTS.md".into(),
+                next_step: "S".into(),
+            },
+            "提案 AGENTS.md: S".into(),
+        ),
+        (ReplyNote::BudgetDryRun, "（dry-run: 書き込まない）".into()),
+        (
+            ReplyNote::BudgetUnchanged("p.md".into()),
+            "p.md: 変更なし（予算内）".into(),
+        ),
+        (
+            ReplyNote::BudgetMoved {
+                path: "p.md".into(),
+                before: 25,
+                kept: 20,
+                archived: 5,
+                preserved: true,
+            },
+            "p.md: 25 件 → 残 20 件 / archive へ 5 件（総数保存: はい）".into(),
+        ),
+        (
+            ReplyNote::BudgetMoved {
+                path: "p.md".into(),
+                before: 25,
+                kept: 20,
+                archived: 4,
+                preserved: false,
+            },
+            "p.md: 25 件 → 残 20 件 / archive へ 4 件（総数保存: いいえ）".into(),
+        ),
+        (
+            ReplyNote::BudgetBytes {
+                before: 2000,
+                after: 1500,
+                tokens_before: 500,
+                tokens_after: 375,
+            },
+            "2000 → 1500 bytes（約 500 → 375 トークン）".into(),
+        ),
+        (
+            ReplyNote::BudgetAgedOut(2),
+            "保持期間を過ぎて archive から削除: 2 行".into(),
+        ),
+        (
+            ReplyNote::BudgetToArchive("- 2026-10-01 #1 a".into()),
+            "移送予定 - 2026-10-01 #1 a".into(),
+        ),
+        (ReplyNote::BudgetFilesChanged(1), "変更したファイル: 1".into()),
+        (
+            ReplyNote::ResidueTempDir("/tmp/".into()),
+            "一時ディレクトリ: /tmp/".into(),
+        ),
+        (ReplyNote::ResidueNone, "残骸はありません".into()),
+        (
+            ReplyNote::ResidueTotal {
+                count: 4,
+                bytes: "5 B".into(),
+            },
+            "残骸: 4 件 / 5 B".into(),
+        ),
+        (
+            ReplyNote::ResidueKindRow {
+                prefix: "tako-test-data-".into(),
+                width: 23,
+                count: 2,
+                bytes: "1.5 KB".into(),
+                removable: 1,
+                note: "N".into(),
+            },
+            format!(
+                "{:<23} {:>5} 件 / {:>9}（消せる 1）  N",
+                "tako-test-data-", 2, "1.5 KB"
+            ),
+        ),
+        (
+            ReplyNote::ResidueSkipped {
+                count: 1,
+                detail: "D".into(),
+            },
+            "見送り 1 件: D".into(),
+        ),
+        (
+            ReplyNote::ResidueRecheck,
+            "消す直前の再判定で対象から外れた".into(),
+        ),
+        (
+            ReplyNote::ResidueRemoved {
+                count: 2,
+                bytes: "3 B".into(),
+                failed: 0,
+                error: None,
+            },
+            "消した: 2 件 / 3 B（失敗 0）".into(),
+        ),
+        (
+            ReplyNote::ResidueRemoved {
+                count: 1,
+                bytes: "3 B".into(),
+                failed: 1,
+                error: Some("Permission denied (os error 13)".into()),
+            },
+            "消した: 1 件 / 3 B（失敗 1: Permission denied (os error 13)）".into(),
+        ),
+        (
+            ReplyNote::ResidueRemovable {
+                count: 1,
+                bytes: "3 B".into(),
+            },
+            "消せる: 1 件 / 3 B（まだ 1 つも消していない）".into(),
+        ),
+        (
+            ReplyNote::ResidueApplyHint,
+            "いま消す: tako test-residue --apply".into(),
+        ),
     ]
 }
 
@@ -21208,6 +21376,12 @@ const CLI_NOTE_SCOPES: &[&str] = &[
     "fn print_replace(",
     "fn print_undo(",
     "fn print_jump(",
+    // #2365: `tako context-budget`（check / fix）と `tako test-residue` の人向けの表示の枠
+    // （予算の理由文・直し方は応答の値、残骸の種別の説明と判定の理由は tako-core の日英の対）
+    "fn print_context_budget_check(",
+    "fn print_context_budget_proposals(",
+    "fn print_context_budget_fix(",
+    "fn test_residue_local(",
 ];
 
 /// CLI `main.rs` でまだ断りに日本語の固定文を持つ関数（頭, 理由）。**断りを移し終えたら外す**
@@ -22062,6 +22236,180 @@ fn searchとjumpの人向けの表示は表示言語で組む() {
                 c.trim()
             ));
         }
+    }
+    report_all(failures);
+}
+
+/// #2365 の続き: `tako context-budget`（check / fix）と `tako test-residue` の人向けの表示の枠も表示言語
+/// （`cli_lang()`）で組む。残骸の種別の説明と判定の理由は tako-core の日英の対を表示言語で引き、応答の JSON 用の
+/// 日本語の口（`Verdict::detail()` / `Note::ja()`）を表示に使わない（日本語の固定文そのものは `CLI_NOTE_SCOPES` の
+/// 番犬が見る）
+#[test]
+fn context_budgetとtest_residueの人向けの表示は表示言語で組む() {
+    let mut failures = Vec::new();
+    for head in [
+        "fn print_context_budget_check(",
+        "fn print_context_budget_proposals(",
+        "fn print_context_budget_fix(",
+        "fn test_residue_local(",
+    ] {
+        let Some(lines) = front_scope_lines(CLI_MAIN_SRC, Some(head)) else {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}: 走査の範囲 `{head}` が見つからない（改名ならこの表を直す）"
+            ));
+            continue;
+        };
+        let code: Vec<(usize, &str)> = lines
+            .iter()
+            .map(|(n, raw)| (*n, strip_line_comment(raw)))
+            .filter(|(_, code)| !code.trim_start().starts_with("//"))
+            .collect();
+        if !code.iter().any(|(_, c)| c.contains("cli_lang()")) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}: `{head}` が表示言語（`cli_lang()`）を引かない = 枠の言語が設定に従わない"
+            ));
+        }
+        for (line, c) in code.iter().filter(|(_, c)| {
+            c.contains("Lang::Ja") || c.contains(".detail()") || c.contains(".ja()")
+        }) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}:{line}: `{head}` が言語を日本語に固定して組む = 英語表示にもその文だけ日本語で\
+                 出る（`cli_lang()` を渡す・判定の理由は `detail_in`・種別の説明は `note.text_in`）: {}",
+                c.trim()
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+const TEST_RESIDUE_SRC: &str = include_str!("../../tako-core/src/test_residue.rs");
+const TEST_RESIDUE_PATH: &str = "crates/tako-core/src/test_residue.rs";
+
+/// 残骸の判定の通し番号（網羅 match = 判定を足すと見本の表を足すまでここが E0004 で落ちる）
+fn residue_verdict_index(v: &tako_core::test_residue::Verdict) -> usize {
+    use tako_core::test_residue::Verdict;
+    match v {
+        Verdict::Own => 0,
+        Verdict::Stale => 1,
+        Verdict::InUse => 2,
+        Verdict::ReusedPid => 3,
+        Verdict::Unknown => 4,
+    }
+}
+const RESIDUE_VERDICT_VARIANTS: usize = 5;
+
+/// 判定の理由の #2365 より前の固定文（旧 `Verdict::detail`）
+fn residue_verdict_table() -> Vec<(tako_core::test_residue::Verdict, &'static str)> {
+    use tako_core::test_residue::Verdict;
+    vec![
+        (
+            Verdict::Own,
+            "このプロセス自身の置き場（終了時に自分で消す）",
+        ),
+        (Verdict::Stale, "所有プロセスが居ない = 消せる"),
+        (Verdict::InUse, "所有プロセスが生きている = 使用中"),
+        (
+            Verdict::ReusedPid,
+            "pid は生きているが dir より後に始まった = pid 再利用（見送る）",
+        ),
+        (
+            Verdict::Unknown,
+            "所有プロセスの生死を判定できない（見送る）",
+        ),
+    ]
+}
+
+/// 種別の説明の #2365 より前の固定文（旧 `KINDS[].note`。接頭辞, 文）
+const RESIDUE_KIND_NOTES: &[(&str, &str)] = &[
+    ("tako-test-data-", "cargo test の data dir（#944 の隔離先）"),
+    (
+        "tako-agent-config-",
+        "検証プロセスの外部エージェント設定・シェル履歴（#1253 の隔離先）",
+    ),
+    (
+        "tako-test-scratch-",
+        "テスト本体が作る使い捨ての作業ディレクトリの親（#1312 の ScratchDir）",
+    ),
+    (
+        "tako-test-orchestrator-",
+        "cargo test のオーケストレーター設定（tako_control::orchestrator の隔離先）",
+    ),
+    (
+        "tako-test-supervisor-",
+        "cargo test の supervisor 監査ログ（tako_control::orchestrator の隔離先）",
+    ),
+];
+
+/// #2365 の続き: 残骸の判定の理由（`Verdict::detail_in`）と種別の説明（`KINDS[].note`）は日英を持ち、
+/// 日本語は #2365 より前の固定文とバイト一致。応答の JSON に載る日本語の口（`detail()` / `note.ja()`）も前のまま
+#[test]
+fn 残骸の判定の理由と種別の説明は日英を持ち日本語は2365より前と同じ() {
+    let verdicts = residue_verdict_table();
+    covers_every(
+        &verdicts.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+        residue_verdict_index,
+        RESIDUE_VERDICT_VARIANTS,
+        "test_residue::Verdict",
+    );
+    let mut failures = Vec::new();
+    for (v, old) in verdicts {
+        let d = format!("{v:?}");
+        let at = |lang| {
+            where_written(
+                TEST_RESIDUE_SRC,
+                TEST_RESIDUE_PATH,
+                "impl Verdict {",
+                &d,
+                lang,
+            )
+        };
+        check_core_row(
+            &mut failures,
+            at(Lang::Ja),
+            at(Lang::En),
+            format!("Verdict::{d}"),
+            old,
+            v.detail_in(Lang::Ja),
+            v.detail_in(Lang::En),
+        );
+        if v.detail() != old {
+            failures.push(format!(
+                "{}: Verdict::{d} の応答の JSON 用の文（`detail()`）が #2365 より前と違う: {}",
+                at(Lang::Ja),
+                v.detail()
+            ));
+        }
+    }
+    let kinds = tako_core::test_residue::KINDS;
+    if kinds.len() != RESIDUE_KIND_NOTES.len() {
+        failures.push(format!(
+            "{TEST_RESIDUE_PATH}: KINDS が {} 種で表は {} 種（種別を足したら旧文の表にも足す）",
+            kinds.len(),
+            RESIDUE_KIND_NOTES.len()
+        ));
+    }
+    for kind in kinds {
+        // 名指しは `prefix: "<接頭辞>"` の行の次（`note:` の行）
+        let at = TEST_RESIDUE_SRC
+            .lines()
+            .position(|l| l.contains(&format!("prefix: \"{}\"", kind.prefix)))
+            .map(|i| format!("{TEST_RESIDUE_PATH}:{}", i + 2))
+            .unwrap_or_else(|| {
+                format!("{TEST_RESIDUE_PATH}（{} の行が見つからない）", kind.prefix)
+            });
+        let Some((_, old)) = RESIDUE_KIND_NOTES.iter().find(|(p, _)| *p == kind.prefix) else {
+            failures.push(format!("{at}: {} の旧文が表に無い", kind.prefix));
+            continue;
+        };
+        check_core_row(
+            &mut failures,
+            at.clone(),
+            at,
+            format!("KINDS[{}].note", kind.prefix),
+            old,
+            kind.note.ja(),
+            kind.note.en(),
+        );
     }
     report_all(failures);
 }

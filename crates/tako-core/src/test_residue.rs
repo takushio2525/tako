@@ -47,12 +47,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::i18n::Lang;
+use crate::platform::support::Note;
+
 /// 掃除の対象にする置き場の種別。名前は必ず `<prefix><pid>` の形
 pub struct Kind {
     /// ディレクトリ名の接頭辞
     pub prefix: &'static str,
-    /// 何を置く場所か（CLI の説明に出す）
-    pub note: &'static str,
+    /// 何を置く場所か（日英。CLI の人向けの表示は表示言語、応答の JSON の `note` は日本語 = #2365 より前のまま）
+    pub note: Note,
     /// テストプロセスの起動時に**自動で**掃く対象か。
     ///
     /// `tako-agent-config-` を自動に含めないのは、これを作るのが
@@ -66,27 +69,42 @@ pub struct Kind {
 pub const KINDS: &[Kind] = &[
     Kind {
         prefix: "tako-test-data-",
-        note: "cargo test の data dir（#944 の隔離先）",
+        note: Note::new(
+            "cargo test の data dir（#944 の隔離先）",
+            "cargo test data dir (isolated by #944)",
+        ),
         auto: true,
     },
     Kind {
         prefix: "tako-agent-config-",
-        note: "検証プロセスの外部エージェント設定・シェル履歴（#1253 の隔離先）",
+        note: Note::new(
+            "検証プロセスの外部エージェント設定・シェル履歴（#1253 の隔離先）",
+            "agent settings and shell history of verification processes (isolated by #1253)",
+        ),
         auto: false,
     },
     Kind {
         prefix: "tako-test-scratch-",
-        note: "テスト本体が作る使い捨ての作業ディレクトリの親（#1312 の ScratchDir）",
+        note: Note::new(
+            "テスト本体が作る使い捨ての作業ディレクトリの親（#1312 の ScratchDir）",
+            "parent of the throwaway work dirs that tests create (ScratchDir of #1312)",
+        ),
         auto: true,
     },
     Kind {
         prefix: "tako-test-orchestrator-",
-        note: "cargo test のオーケストレーター設定（tako_control::orchestrator の隔離先）",
+        note: Note::new(
+            "cargo test のオーケストレーター設定（tako_control::orchestrator の隔離先）",
+            "cargo test orchestrator settings (isolated by tako_control::orchestrator)",
+        ),
         auto: true,
     },
     Kind {
         prefix: "tako-test-supervisor-",
-        note: "cargo test の supervisor 監査ログ（tako_control::orchestrator の隔離先）",
+        note: Note::new(
+            "cargo test の supervisor 監査ログ（tako_control::orchestrator の隔離先）",
+            "cargo test supervisor audit log (isolated by tako_control::orchestrator)",
+        ),
         auto: true,
     },
 ];
@@ -156,14 +174,31 @@ impl Verdict {
         }
     }
 
-    /// 人が読む理由
+    /// 人が読む理由の日本語（応答の JSON の `detail`。#2365 より前のまま変えない）。
+    /// 人向けの表示は [`Verdict::detail_in`] で表示言語を選ぶ
     pub fn detail(self) -> &'static str {
-        match self {
-            Verdict::Own => "このプロセス自身の置き場（終了時に自分で消す）",
-            Verdict::Stale => "所有プロセスが居ない = 消せる",
-            Verdict::InUse => "所有プロセスが生きている = 使用中",
-            Verdict::ReusedPid => "pid は生きているが dir より後に始まった = pid 再利用（見送る）",
-            Verdict::Unknown => "所有プロセスの生死を判定できない（見送る）",
+        self.detail_in(Lang::Ja)
+    }
+
+    /// 人が読む理由（#2365）。(判定, 言語) の網羅 match なので、判定を足すと日英の両方を書くまで
+    /// コンパイルが通らない。日本語は #2365 より前の固定文とバイト一致
+    pub fn detail_in(self, lang: Lang) -> &'static str {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Own, Ja) => "このプロセス自身の置き場（終了時に自分で消す）",
+            (Self::Own, En) => "this process's own dir (removed by itself on exit)",
+            (Self::Stale, Ja) => "所有プロセスが居ない = 消せる",
+            (Self::Stale, En) => "the owning process is gone = removable",
+            (Self::InUse, Ja) => "所有プロセスが生きている = 使用中",
+            (Self::InUse, En) => "the owning process is alive = in use",
+            (Self::ReusedPid, Ja) => {
+                "pid は生きているが dir より後に始まった = pid 再利用（見送る）"
+            }
+            (Self::ReusedPid, En) => {
+                "the pid is alive but started after the dir = pid reuse (skipped)"
+            }
+            (Self::Unknown, Ja) => "所有プロセスの生死を判定できない（見送る）",
+            (Self::Unknown, En) => "cannot tell whether the owning process is alive (skipped)",
         }
     }
 
@@ -569,7 +604,8 @@ pub fn report_json(temp: &Path, items: &[Residue], outcome: &SweepOutcome) -> se
             let mine: Vec<&Residue> = items.iter().filter(|r| r.prefix == kind.prefix).collect();
             serde_json::json!({
                 "prefix": kind.prefix,
-                "note": kind.note,
+                // 応答の値は #2365 より前のまま日本語（人向けの表示は CLI が表示言語で組む）
+                "note": kind.note.ja(),
                 "auto_sweep": kind.auto,
                 "total": mine.len(),
                 "bytes": mine.iter().map(|r| r.bytes).sum::<u64>(),

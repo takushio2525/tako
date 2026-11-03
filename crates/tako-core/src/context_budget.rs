@@ -1137,8 +1137,13 @@ impl Revival {
         progress_path: &str,
         archive_path: &str,
     ) -> String {
+        // 相手の 1 行を囲む括弧も表示言語（#2365。日本語は前のまま「」）
+        let (open, close) = match lang {
+            crate::i18n::Lang::Ja => ("「", "」"),
+            crate::i18n::Lang::En => ("\"", "\""),
+        };
         format!(
-            "{progress_path}:{} {}: {} ← {}:{} 「{}」",
+            "{progress_path}:{} {}: {} ← {}:{} {open}{}{close}",
             self.line,
             self.kind.label().text_in(lang),
             self.heading.trim(),
