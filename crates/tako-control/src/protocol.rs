@@ -755,6 +755,9 @@ pub enum Request {
     ///   重い処理（ビルド・テスト・ブラウザ・隔離 GUI）・ペインごとの消費・tako の外の消費、
     ///   順番待ちの節（`queue`: 実行中・待ち・上限・直近に終わった件）
     /// - "cancel": 受付番号 `id` の処理を取り消す（待ち = 外れる / 実行中 = wrapper が子を止める）
+    /// - "priority": 受付番号 `id` の処理か、ペイン `pane` から出る処理の既定の優先度を `priority`
+    ///   （top / high / normal / low / default = 既定へ戻す）にする（#1996。ペインは layout.json に残す =
+    ///   UI スレッドの dispatch が受ける。受付番号は受け口が答える）
     /// - "limits": 上限の読み書き（`limits` が空なら読むだけ。`settings.json` の `resources` 節）
     /// - "enqueue" / "poll" / "started" / "done": `tako queue <コマンド>`（wrapper）専用
     ///   （`job` に 1 件の全体を載せる upsert。MCP のカタログには出さない）
@@ -770,6 +773,12 @@ pub enum Request {
         id: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limits: Option<tako_core::queue::LimitsPatch>,
+        /// `priority` の対象のペイン（#1996。`id` とどちらか一方）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u64>,
+        /// `priority` の段（#1996）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<String>,
     },
     /// ジャンプ履歴（戻る / 進む。FR-3.29 / #1677 / #1007 S0-d）。`action`:
     /// - "list"（既定）: 履歴の全項目と現在位置
@@ -3742,6 +3751,8 @@ mod tests {
                 job: None,
                 id: None,
                 limits: None,
+                pane: None,
+                priority: None,
             },
             Request::WindowList,
             Request::BackgroundList,
@@ -3797,6 +3808,8 @@ mod tests {
             job: None,
             id: None,
             limits: None,
+            pane: None,
+            priority: None,
         }
     }
 

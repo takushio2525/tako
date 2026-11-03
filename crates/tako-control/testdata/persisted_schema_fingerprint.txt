@@ -30,7 +30,7 @@ DevicesFile: devices
 GuardFile: marks
 GuardMark: pane, url
 GuardRecord: reason, count, at_ms
-HistoryRow: at, key, shape, name, kind, peak_mb, peak_at_s, ran_s, exit_code
+HistoryRow: at, key, shape, name, kind, peak_mb, peak_at_s, ran_s, exit_code, units
 JobKind: Build, Test, Browser, Node, Gui, Agent, Other
 KeyFrom: Account, ConfigDir
 LastMessage: id, t, session, model, fast, tokens
@@ -43,11 +43,12 @@ LimitSettings: max_jobs, reserve_gb, swap_guard_gb, max_wait_min, jobserver
 ManagedMark: schema, managed_by, tako_version, content_hash, files
 NodeLayout: Pane, Split, axis, ratio, first, second
 OrchestratorConfig: auto_close, auto_push
-PaneLayout: id, session, title, title_source, role, origin, cwd, claude_session_id, agent_resume, logged_history, preview, webview, origin_tab, origin_tab_title, limit_autoresume, ssh, spawned_by, limit_seen
+PaneLayout: id, session, title, title_source, role, origin, cwd, claude_session_id, agent_resume, logged_history, preview, webview, origin_tab, origin_tab_title, limit_autoresume, ssh, spawned_by, limit_seen, queue_priority
 PendingSpawn: tmux_session, kind, label, project, agent, model, effort, issues, prompt_head, cwd, tab, pane, recorded_at
 Place: Auto, Mod, Tako
 Policy: mode, allow, disabled_rules
 PreviewLayout: path, mode
+Priority: Top, High, Normal, Low
 Profile: master_agent, model, effort, worker_model_policy, worker_model, worker_effort, delegate_guidance, worker_agent, worker_agents, system_prompt, prompt_blocks, projects, tab_naming_convention, supervisor_mode, auto_resume_dead, supervisor_max_retries, cwd, env, master_account, worker_account, ctx_threshold, auto_handoff, limit_resume, bypass_sandbox, remote_control
 ProjectEntry: cwd, description, mcp_servers
 ProjectFrom: Cwd, Profile, Catalog
@@ -126,3 +127,4 @@ version claude_mod_mark: v1 steps=0
 version run_configs: v1 steps=0
 version powershell_profile: v1 steps=0
 version webview2_data: v1 steps=0
+version queue_history: v1 steps=0

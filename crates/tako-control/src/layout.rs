@@ -341,6 +341,11 @@ pub struct PaneLayout {
     /// **旧ファイルには無いので serde default で後方互換**（移行 Step は不要）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_seen: Option<LimitSeenLayout>,
+    /// このペインから出る `tako queue` の処理の優先度の既定（#1996。`tako queue priority --pane N`）。
+    /// 器のペインが GUI の再起動をまたいでも既定が残るように保存する。
+    /// **旧ファイルには無いので serde default で後方互換**（`None` = 役割の既定。移行 Step は不要）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_priority: Option<tako_core::queue::Priority>,
 }
 
 /// 上限の告知の記憶（#1710。`tako_core::limit_resume::LimitSeen` の保存形）。
@@ -490,6 +495,7 @@ pub fn capture(
                     ssh: m.ssh,
                     spawned_by: pane.spawned_by().map(|p| p.as_u64()),
                     limit_seen: LimitSeenLayout::capture(pane.limit_seen()),
+                    queue_priority: pane.queue_priority(),
                 }
             })
             .collect(),
@@ -580,6 +586,7 @@ fn capture_node(node: &PaneNode, meta: &dyn Fn(PaneId) -> PaneMeta) -> NodeLayou
                 ssh: m.ssh,
                 spawned_by: pane.spawned_by().map(|p| p.as_u64()),
                 limit_seen: LimitSeenLayout::capture(pane.limit_seen()),
+                queue_priority: pane.queue_priority(),
             }))
         }
         PaneNode::Split {
@@ -835,6 +842,7 @@ pub const CHANGE_KEY_FIELDS: &[(&str, &str)] = &[
     ("PaneLayout", "ssh"),
     ("PaneLayout", "spawned_by"),
     ("PaneLayout", "limit_seen"),
+    ("PaneLayout", "queue_priority"),
     // LimitSeenLayout（#1710）
     ("LimitSeenLayout", "notice"),
     ("LimitSeenLayout", "detected_at"),
@@ -1012,6 +1020,8 @@ fn feed_pane<'a>(pane: &Pane, meta: &dyn Fn(PaneId) -> PaneMetaRef<'a>, h: &mut 
             detected_at.hash(h);
         }
     }
+    // PaneLayout.queue_priority（#1996）
+    pane.queue_priority().hash(h);
     meta(pane.id()).feed(h);
 }
 
@@ -1156,6 +1166,8 @@ pub fn restore(file: &LayoutFile) -> Result<(Workspace, Vec<RestoredPane>), Layo
         pane.set_spawned_by(p.spawned_by.map(PaneId::from_raw));
         // #1710: 告知の記憶を戻す（再起動後も前日の告知をその時刻から解く）
         pane.set_limit_seen(p.limit_seen.as_ref().map(LimitSeenLayout::restore));
+        // #1996: 順番待ちの優先度の既定を戻す
+        pane.set_queue_priority(p.queue_priority);
         restored.push(RestoredPane {
             pane: p.id,
             session: p.session.clone(),
@@ -1394,6 +1406,8 @@ fn restore_node(
             pane.set_spawned_by(p.spawned_by.map(PaneId::from_raw));
             // #1710: 告知の記憶を戻す（再起動後も前日の告知をその時刻から解く）
             pane.set_limit_seen(p.limit_seen.as_ref().map(LimitSeenLayout::restore));
+            // #1996: 順番待ちの優先度の既定を戻す
+            pane.set_queue_priority(p.queue_priority);
             let id = pane.id();
             restored.push(RestoredPane {
                 pane: p.id,
@@ -2660,6 +2674,7 @@ mod tests {
                 ssh: None,
                 spawned_by: None,
                 limit_seen: None,
+                queue_priority: None,
             }))
         }
         let mut tree = pane(1);
@@ -2724,6 +2739,7 @@ mod tests {
             ssh: None,
             spawned_by: None,
             limit_seen: None,
+            queue_priority: None,
         });
         assert_eq!(layout.pane_count(), 4);
         assert_eq!(layout.sessions(), vec!["tako-s1", "tako-s2", "tako-bg"]);
@@ -2824,6 +2840,7 @@ mod tests {
                 ssh: None,
                 spawned_by: None,
                 limit_seen: None,
+                queue_priority: None,
             }))
         }
         let mut id = 1u64;
@@ -2924,6 +2941,7 @@ mod tests {
             ssh: None,
             spawned_by: None,
             limit_seen: None,
+            queue_priority: None,
         });
         assert!(
             !loses_backend_session(&base, &shelved),

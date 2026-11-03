@@ -1161,6 +1161,16 @@ pub enum Reason {
     QueueSocketRequired,
     /// `tako queue serve` に `TAKO_TOKEN` が無い
     QueueTokenRequired,
+    /// `tako queue priority` / MCP `tako_queue` の `priority` の段が読めない（#1996。`got` は受け取った値）
+    QueuePrioritySettingUnknown(String),
+    /// `priority` に段が無い（#1996）
+    QueuePriorityLevelMissing,
+    /// `priority` に受付番号もペインも無い（#1996）
+    QueuePriorityTargetMissing,
+    /// `priority` に受付番号とペインの両方がある（#1996）
+    QueuePriorityTargetBoth,
+    /// 受付番号の処理が順番待ちに居ない（`cancel` / `priority`。#1996）
+    QueueJobUnknown(u64),
     /// `--wait` の要求に GUI が pane ID を返さなかった（`command` は `run` / `run-interactive`）
     RunNoPaneId(&'static str),
     /// `--wait` で待ったコマンドが 0 以外で終わった
@@ -3343,6 +3353,37 @@ impl Reason {
             }
             (Self::QueueTokenRequired, En) => {
                 "TAKO_TOKEN is required (the connecting tako queue holds the same value)".into()
+            }
+            (Self::QueuePrioritySettingUnknown(got), Ja) => format!(
+                "優先度は top / high / normal / low、既定へ戻すなら default（受け取った値: {got}）"
+            ),
+            (Self::QueuePrioritySettingUnknown(got), En) => format!(
+                "the priority is top / high / normal / low, or default to go back to the default \
+                 (got: {got})"
+            ),
+            (Self::QueuePriorityLevelMissing, Ja) => {
+                "priority には段（top / high / normal / low / default）が要る".into()
+            }
+            (Self::QueuePriorityLevelMissing, En) => {
+                "priority needs a level (top / high / normal / low / default)".into()
+            }
+            (Self::QueuePriorityTargetMissing, Ja) => {
+                "priority には受付番号（id）かペイン（pane）のどちらかが要る".into()
+            }
+            (Self::QueuePriorityTargetMissing, En) => {
+                "priority needs either a job number (id) or a pane".into()
+            }
+            (Self::QueuePriorityTargetBoth, Ja) => {
+                "受付番号（id）とペイン（pane）はどちらか一方だけ".into()
+            }
+            (Self::QueuePriorityTargetBoth, En) => {
+                "pass only one of a job number (id) and a pane".into()
+            }
+            (Self::QueueJobUnknown(id), Ja) => {
+                format!("受付番号 {id} は順番待ちに居ない（`tako queue` で一覧）")
+            }
+            (Self::QueueJobUnknown(id), En) => {
+                format!("job {id} is not in the queue (`tako queue` lists them)")
             }
             (Self::RunNoPaneId(command), Ja) => format!("{command} が pane ID を返さなかった"),
             (Self::RunNoPaneId(command), En) => format!("{command} did not return a pane ID"),
@@ -12128,9 +12169,21 @@ fn dispatch_inner(
             job,
             id,
             limits,
+            pane,
+            priority,
         } => match action.as_deref().unwrap_or("status") {
             "status" => Ok(crate::queue::with_section(crate::resources::cached_status())),
-            other => crate::queue::handle(other, job.as_ref(), id, limits.as_ref()),
+            // #1996: ペインから出る処理の優先度の既定（ペインの模型 = layout.json を書く。受付番号は下の handle）
+            "priority" if pane.is_some() => {
+                queue_pane_priority(host, id, pane, priority.as_deref())
+            }
+            other => crate::queue::handle(
+                other,
+                job.as_ref(),
+                id,
+                limits.as_ref(),
+                priority.as_deref(),
+            ),
         },
 
         // #1678: 通常は prepare_offload が background へ出す。ここへ来るのは
@@ -23934,6 +23987,47 @@ fn collect_check_health_ctx(host: &dyn ControlHost) -> CheckHealthCtx {
                 .map_err(|e| e.to_string())
         }),
     }
+}
+
+/// `tako queue priority --pane N <段>` / MCP `tako_queue` の `action: priority` + `pane`（#1996）。
+///
+/// ペインの模型に付け（layout.json の保存で GUI の再起動をまたいで残る。保存は UI 層が dispatch の後に回す）、
+/// 調停役が読むペインの一覧の覚えへもすぐ写す（次の 2 秒 tick を待たずに待ちの並びへ効く）。
+/// 応答の `jobs` は、そのペインから出ている順番待ちの処理の新しい段（処理に付けた段があればそちらが勝つ）。
+/// 走っている処理は止めない（横取りしない）。**UI スレッドで呼んでよい**（ペインの書き換えと覚えのロックだけ）
+fn queue_pane_priority(
+    host: &mut dyn ControlHost,
+    id: Option<u64>,
+    pane: Option<u64>,
+    priority: Option<&str>,
+) -> Result<Value, DispatchError> {
+    if id.is_some() {
+        return Err(Reason::QueuePriorityTargetBoth.invalid());
+    }
+    let raw = pane.ok_or_else(|| Reason::QueuePriorityTargetMissing.invalid())?;
+    let text = priority.ok_or_else(|| Reason::QueuePriorityLevelMissing.invalid())?;
+    let setting = tako_core::queue::priority::parse_setting(text)
+        .ok_or_else(|| Reason::QueuePrioritySettingUnknown(text.to_string()).invalid())?;
+    let pane_obj = host
+        .workspace_mut()
+        .pane_anywhere_mut(PaneId::from_raw(raw))
+        .ok_or(DispatchError::PaneNotFound(raw))?;
+    let before = pane_obj.queue_priority();
+    pane_obj.set_queue_priority(setting);
+    crate::resources::set_pane_queue_priority(raw, setting);
+    if before != setting {
+        crate::diag::persist_log(&format!(
+            "[queue] pane={raw} の優先度の既定 {} → {}",
+            before.map_or("default", tako_core::queue::Priority::as_str),
+            setting.map_or("default", tako_core::queue::Priority::as_str)
+        ));
+    }
+    Ok(json!({
+        "pane": raw,
+        "priority": setting.map_or("default", tako_core::queue::Priority::as_str),
+        "changed": before != setting,
+        "jobs": crate::queue::pane_jobs(raw),
+    }))
 }
 
 /// 同期経路（テスト・直呼び用）。IPC / MCP 経由は `prepare_offload` が
@@ -41103,6 +41197,84 @@ mod tests {
         );
     }
 
+    /// #1996: `tako queue priority --pane N <段>` / MCP `tako_queue` の `priority` + `pane` は dispatch の 1 実装で
+    /// ペインの模型に付き（layout.json の保存に載る）、調停役が読むペインの一覧の覚えへもすぐ写る
+    #[test]
+    fn issue1996_ペインの優先度の既定はペインに付き一覧の覚えへ写る() {
+        use tako_core::queue::Priority;
+        let _g = crate::queue::test_serial();
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        crate::resources::publish_panes(
+            vec![crate::resources::PaneEntry {
+                pane,
+                ..Default::default()
+            }],
+            None,
+        );
+        let req = |p: &str, pane: Option<u64>, id: Option<u64>| Request::Queue {
+            action: Some("priority".into()),
+            job: None,
+            id,
+            limits: None,
+            pane,
+            priority: Some(p.into()),
+        };
+        let v = dispatch(&mut host, req("high", Some(pane), None), PaneOrigin::Cli).unwrap();
+        assert_eq!(
+            (v["priority"].as_str(), v["changed"].as_bool()),
+            (Some("high"), Some(true)),
+            "{v}"
+        );
+        let model = |host: &MockHost| {
+            host.workspace()
+                .pane_anywhere(PaneId::from_raw(pane))
+                .unwrap()
+                .queue_priority()
+        };
+        assert_eq!(model(&host), Some(Priority::High));
+        assert_eq!(
+            crate::resources::pane_queue_info(pane).and_then(|(_, p)| p),
+            Some(Priority::High),
+            "一覧の覚えへ写る"
+        );
+        let saved = serde_json::to_string(&crate::layout::capture(
+            host.workspace(),
+            &|_| crate::layout::PaneMeta::default(),
+            None,
+        ))
+        .unwrap();
+        assert!(
+            saved.contains("\"queue_priority\":\"high\""),
+            "layout.json に残る: {saved}"
+        );
+        // 同じ段は changed = false・default で既定へ戻す（layout.json からも消える）
+        let v = dispatch(&mut host, req("high", Some(pane), None), PaneOrigin::Mcp).unwrap();
+        assert_eq!(v["changed"], false);
+        let v = dispatch(&mut host, req("default", Some(pane), None), PaneOrigin::Mcp).unwrap();
+        assert_eq!(v["priority"], "default");
+        assert_eq!(model(&host), None);
+        let saved = serde_json::to_string(&crate::layout::capture(
+            host.workspace(),
+            &|_| crate::layout::PaneMeta::default(),
+            None,
+        ))
+        .unwrap();
+        assert!(!saved.contains("queue_priority"), "{saved}");
+        // 境界: 居ないペイン・読めない段・受付番号とペインの両方
+        let missing = tako_core::unused_id::pane().as_u64();
+        assert!(matches!(
+            dispatch(&mut host, req("high", Some(missing), None), PaneOrigin::Cli),
+            Err(DispatchError::PaneNotFound(id)) if id == missing
+        ));
+        let e = dispatch(&mut host, req("urgent", Some(pane), None), PaneOrigin::Cli).unwrap_err();
+        assert!(e.to_string().contains("urgent"), "{e}");
+        assert_eq!(model(&host), None, "断ったら書かない");
+        let e = dispatch(&mut host, req("high", Some(pane), Some(1)), PaneOrigin::Cli).unwrap_err();
+        assert!(matches!(e, DispatchError::InvalidParams(_)), "{e}");
+        crate::resources::publish_panes(Vec::new(), None);
+    }
+
     /// #2413 の受け入れ条件 2: critical のまま、CLI / MCP と同じ `Request::Queue { action: "start" }` の口で
     /// 待っている spawn を今すぐ起こせる（次の tick で起動コマンドと依頼文が積まれる）
     #[test]
@@ -41148,6 +41320,8 @@ mod tests {
                     job: None,
                     id: Some(pane),
                     limits: None,
+                    pane: None,
+                    priority: None,
                 },
                 PaneOrigin::Mcp,
             )
@@ -41165,6 +41339,8 @@ mod tests {
                     job: None,
                     id: Some(pane + 1000),
                     limits: None,
+                    pane: None,
+                    priority: None,
                 },
                 PaneOrigin::Mcp,
             )

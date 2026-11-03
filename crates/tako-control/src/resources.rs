@@ -80,6 +80,8 @@ pub struct PaneEntry {
     pub child_pid: Option<u32>,
     /// 器（tmux / psmux）のセッション名
     pub backend_session: Option<String>,
+    /// このペインから出る `tako queue` の処理の優先度の既定（#1996。`None` = 役割の既定）
+    pub queue_priority: Option<tako_core::queue::Priority>,
 }
 
 /// 走査 1 回ぶんの覚え
@@ -200,6 +202,24 @@ pub fn publish_panes(panes: Vec<PaneEntry>, own_socket: Option<String>) {
     let mut p = lock(published());
     p.panes = panes;
     p.own_socket = own_socket;
+}
+
+/// 順番待ちの優先度の既定を決めるペインの材料（#1996）: 役割ラベルと、ペインに付けた優先度の既定。
+/// GUI が渡した一覧に無いペイン（GUI 無しの調停役・別の tako のペイン番号）は `None`
+pub fn pane_queue_info(pane: u64) -> Option<(Option<String>, Option<tako_core::queue::Priority>)> {
+    lock(published())
+        .panes
+        .iter()
+        .find(|e| e.pane == pane)
+        .map(|e| (e.role.clone(), e.queue_priority))
+}
+
+/// ペインの優先度の既定を一覧の覚えへすぐ写す（#1996。dispatch がペインに付けた直後。
+/// 次の 2 秒 tick の受け渡しを待たずに待ちの並びへ効かせる。一覧に無ければ何もしない）
+pub fn set_pane_queue_priority(pane: u64, priority: Option<tako_core::queue::Priority>) {
+    if let Some(e) = lock(published()).panes.iter_mut().find(|e| e.pane == pane) {
+        e.queue_priority = priority;
+    }
 }
 
 /// 機全体を採って覚えへ入れる

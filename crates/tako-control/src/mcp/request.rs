@@ -737,6 +737,9 @@ pub(super) fn build_request(
             action: str_arg(args, "action")?,
             job: None,
             id: u64_arg(args, "id")?,
+            // #1996: 呼び出し元のペインで補わない（受付番号と排他。明示したときだけ）
+            pane: u64_arg(args, "pane")?,
+            priority: str_arg(args, "priority")?,
             limits: match args.get("limits") {
                 None | Some(Value::Null) => None,
                 Some(v) => Some(
