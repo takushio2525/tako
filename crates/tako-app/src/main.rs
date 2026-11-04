@@ -62,6 +62,12 @@ mod resources_panel;
 mod right_panel;
 mod run_menu_ui;
 mod search_panel;
+/// visual-test `tasks-input` の送信の間の判定（#2721。純関数なのでテストでも回す）。置き場は
+/// `self_test/` だが、テスト用の足場の `mod x;` はクレートの根で宣言する（セルフテストのインラインの
+/// モジュールの中だと、製品の範囲を決める番犬 `production_range` がファイルを辿れない）
+#[cfg(any(test, feature = "visual-test"))]
+#[path = "self_test/send_lag_2721.rs"]
+mod send_lag_2721;
 mod settings_sleep;
 mod settings_window;
 mod sidebar;
