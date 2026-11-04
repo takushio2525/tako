@@ -41014,7 +41014,9 @@ mod self_test {
 
     /// **#2747 の A/B**（visual-test #745 の会話の守り）。`TAKO_2747_LEGACY=1` = 修正前の「注入した会話を
     /// `pin_chat_fixture` で守らない」へ戻す。節は定期更新をその場で 1 周回すので、旧の腕は決定的に
-    /// 「表が読める濃さで描かれる（ink=0）」で落ちる（時間の注入は要らない）
+    /// 「定期更新が注入した会話を消さない」で落ちる（時間の注入は要らない）。修正前の表の検査だけでは
+    /// 落ちない: 会話が消える前に 1 度描かれた表の配置（`chat_text_index` / `chat_body_lists`）が残り、
+    /// 3 状態とも会話が無いまま古い配置を測って素通りした（実測。narrow でもチャットの幅が絞られない）
     #[cfg(feature = "visual-test")]
     fn legacy_2747() -> bool {
         std::env::var("TAKO_2747_LEGACY").as_deref() == Ok("1")
@@ -42735,17 +42737,15 @@ mod self_test {
              kept={kept745}",
             legacy_2747()
         );
-        // 守りが外れた回は表の検査と読み違えないよう先に名指す。旧の腕は修正前と同じく下の表の検査
-        // （会話が無いので本文の濃さが 0）で落ちる形のまま
-        if !legacy_2747() {
-            check(
-                kept745 && !targets_fixture745,
-                &format!(
-                    "visual-test #745: 定期更新が注入した会話を消さない (#2747 / #853。\
-                     targets_include_fixture={targets_fixture745} / kept={kept745})"
-                ),
-            );
-        }
+        // 守りが外れた回はここで名指す（旧の腕も。下の表の検査は会話が消えても、消える前に描かれた
+        // 表の配置の残りを測って素通りする = 修正前はそれで偽の PASS になりえた）
+        check(
+            kept745 && !targets_fixture745,
+            &format!(
+                "visual-test #745: 定期更新が注入した会話を消さない (#2747 / #853。\
+                 targets_include_fixture={targets_fixture745} / kept={kept745})"
+            ),
+        );
         // プレビューの background ロード（Markdown ブロックへの差し替え）を待つ
         let loaded = wait_for_preview_state(window, cx, Duration::from_secs(5), |app| {
             matches!(
@@ -42942,6 +42942,13 @@ mod self_test {
                  collapsed={chat_collapsed} prev_collapsed={prev_collapsed} \
                  chat_h={chat_height:.0} prev_h={prev_height:.0} ratio={ratio:.2} \
                  overlaps={overlaps} ink={ink} chat_pane={has_chat}{chat_detail}{prev_detail}"
+            );
+            // #2747: 表の検査が空の会話（消える前の配置の残り）を測っていない
+            check(
+                has_chat,
+                &format!(
+                    "visual-test #745({state}): 表を測る時点で注入した会話が残っている (#2747)"
+                ),
             );
             check(
                 chat_collapsed == 0,

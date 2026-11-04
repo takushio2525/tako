@@ -4,14 +4,18 @@
 #
 # 節はフォーカス中のペインへ会話を差し込み、プレビューの読み込み（最大 5 秒）と各状態の 400ms を待ってから
 # 表を測る。修正前は会話を `pin_chat_fixture`（#853 の守り）で守っておらず、待っている間に 2 秒 tick の定期更新が
-# 挟まると、実 claude の居ないペインは「チャットではない」と読まれ `apply_chat_refresh` が会話を消す。表の検査は
-# 空の会話を測り（セルが 0 件なので折り返し・重なりは素通り）、本文の濃さ（ink）で落ちる。tick が挟まるかは運。
-# 修正後は差し込んだ update の中で pin し、定期更新をその場で 1 周回して「会話が残る」を確かめる（#2727 の
-# 項目 115 と同じ形）。1 周をその場で回すので、旧の腕（TAKO_2747_LEGACY=1）は時間の注入なしで決定的に落ちる。
+# 挟まると、実 claude の居ないペインは「チャットではない」と読まれ `apply_chat_refresh` が会話を消す。しかも
+# 修正前の表の検査では落ちない: 消える前に 1 度描かれた表の配置（`chat_text_index` / `chat_body_lists`）が残り、
+# 3 状態とも会話が無いまま古い配置を測って TAKO_VISUAL_TEST_OK になる（偽の PASS。実測で narrow でもチャットの
+# 幅が絞られない）。tick が挟まるかは運。
+# 修正後は差し込んだ update の中で pin し、定期更新をその場で 1 周回して「会話が残る」を確かめ（#2727 の
+# 項目 115 と同じ形）、各状態でも「表を測る時点で会話が残っている」を見る。1 周をその場で回すので、旧の腕
+# （TAKO_2747_LEGACY=1 = pin だけを戻す）は時間の注入なしで決定的に落ちる。
 #
 # 腕（TAKO_2747_RUNS。空白区切り。既定 `legacy ok`）:
 #   legacy  旧（TAKO_2747_LEGACY=1 = pin しない）: 1 周で会話が消え（`targets_include_fixture=true kept=false`）、
-#           「visual-test #745(dark): 表が読める濃さで描かれる（ink=0）」で FAILED = 修正前の再現
+#           「visual-test #745: 定期更新が注入した会話を消さない」で FAILED（表を測る前 = TAKO_VISUAL_TEST_OK に
+#           ならない）= 修正前の形を名指して落とす
 #   ok      新: 1 周しても会話が残り（`targets_include_fixture=false kept=true`）、3 状態とも会話がある
 #           （`chat_pane=true`）まま TAKO_VISUAL_TEST_OK（回数は TAKO_2747_OK_RUNS。既定 3）
 # `TAKO_2747_KEEP_TMP=1` はログ（腕ごとの app.log と data dir）を残して置き場を出す。
@@ -145,10 +149,10 @@ for run in $RUNS; do
       measured "$run" || continue
       check "$(has "legacy=true targets_include_fixture=true kept=false")" \
         "旧: 定期更新の 1 周がこのペインを読みに行き、注入した会話を消した"
-      check "$(in_log "TAKO_APP_SELF_TEST_FAILED: visual-test #745(dark): 表が読める濃さで描かれる（ink=0）")" \
-        "旧: 「表が読める濃さで描かれる（ink=0）」で FAILED = 修正前の再現"
-      check "$(in_log "^TAKO_VISUAL_PIXEL: chat-table dark .* chat_pane=false")" \
-        "旧: 表を測った時点で会話は無い"
+      check "$(in_log "TAKO_APP_SELF_TEST_FAILED: visual-test #745: 定期更新が注入した会話を消さない (#2747 / #853。targets_include_fixture=true / kept=false)")" \
+        "旧: 「定期更新が注入した会話を消さない」で FAILED = 修正前の形を名指す"
+      check "$(not "$(in_log "^TAKO_VISUAL_TEST_OK")")" \
+        "旧: 会話が無いまま表を測って TAKO_VISUAL_TEST_OK にならない（修正前の偽の PASS が起きない）"
       ;;
     ok)
       i=1
