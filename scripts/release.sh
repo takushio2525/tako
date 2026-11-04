@@ -332,8 +332,8 @@ require_gh() {
 }
 
 # gh_release_asset_names <tag> — 公開済みリリースのアセット名を 1 行ずつ
-# 読み手は `done <<<"$(gh_release_asset_names …)"` にする（プロセス置換にしない = #2690 / #2736。その子が
-# 終わった瞬間の書き込みが /bin/bash 3.2 で EINTR になって行が消え、set -e で 1 に化ける = 片肺の 3 が化ける）
+# 読み手は `done <<<"$(gh_release_asset_names …)"` にする（プロセス置換にしない = #2690 / #2736。ループの本体は
+# 書かないので今は割り込まれないが、子を待たずに走らせない形に揃える = set -e の下の番犬）
 gh_release_asset_names() {
   gh release view "$1" --json assets -q '.assets[].name' 2>/dev/null || true
 }

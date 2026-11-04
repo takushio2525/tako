@@ -5683,12 +5683,11 @@ const SIGCHLD_OK_MARKER: &str = "tako:sigchld-ok";
 /// 0 になったら行ごと消す。PR の CI 待ちと merge の 4 本（`PR_GATE_SCRIPTS`）は載せない。
 /// ここに載っているのは「`find -print0` の NUL 区切り（置換は NUL を運べない）」「起こしたまま
 /// 残す常駐（隔離 GUI・caffeinate・偽のピア）」を含む既存分で、1 本ずつ直す義務は無い
-/// （`.agent/conventions.md` の #2690 の節に棚卸しの内訳）
+/// （`.agent/conventions.md` の #2690 / #2736 の節に、実害の条件ごとの棚卸しの表）
 const ASYNC_CHILD_ERREXIT_FROZEN: &[(&str, usize)] = &[
     ("scripts/check-claude-mod.sh", 1),
     ("scripts/lib/bundle-privacy.sh", 1),
     ("scripts/lib/isolated-gui.sh", 1),
-    ("scripts/lib/launch-services.sh", 1),
     ("scripts/lib/virtual-display.sh", 1),
     ("scripts/promo/build-explainer.sh", 2),
     ("scripts/promo/check-readings.sh", 1),
@@ -5722,10 +5721,13 @@ fn sigchld_exception(lines: &[&str], line_no: usize) -> bool {
 /// macOS 同梱の bash 3.2 は SIGCHLD のハンドラを SA_RESTART なしで張る（4.2 から付く）。子が
 /// 終わったとき、シェルが stdout / stderr への write の中で待っていると（パイプの読み手が同じ
 /// パイプを読んでいる最中・満杯）、write は EINTR で返り、`echo` / `printf` は
-/// `write error: Interrupted system call` で失敗する（macOS の libc はその行のバッファを捨てる =
-/// 行ごと消える）。`set -e` の下ではそこで 1 で抜ける（5 = 届かない・赤の 1 の区別が化ける）。
-/// `$( … )` / パイプラインの子はシェルが待って刈り取るので、書き込みの最中には届かない。
-/// 待たずに走らせる子 = `<( … )` / `>( … )` と背景の `&` だけが、いつ終わるか決まらない
+/// `write error: Interrupted system call` で失敗し、`set -e` の下ではそこで 1 で抜けて後ろの行
+/// （結論の行）が走らない（5 = 届かない・赤の 1 の区別が化ける。割り込まれた行の文字は libc が持って
+/// いて終わるときに出る）。`$( … )` / パイプラインの子はシェルが待って刈り取るので、書き込みの最中には
+/// 届かない。待たずに走らせる子 = `<( … )` / `>( … )` と背景の `&` だけが、いつ終わるか決まらない。
+/// 実際に割り込まれるのは**子が生きている間に本体で書く行**で、本体で書かないループ・本体に前景の子が
+/// あるループは、SIGCHLD をシェルが read や前景の子の待ちで受けるので落ちない（#2736 で実測）。
+/// 規則はそこまで見分けず、待たずに走らせる子そのものを名指す（実害の形は字句解析では決めきれない）
 fn errexit_async_children(rel: &str, src: &str) -> Vec<(usize, AsyncChild)> {
     if !(declares_errexit(src, &shell_commands(src)) || is_sourced_library(rel)) {
         return Vec::new();
@@ -5826,8 +5828,8 @@ fn set_eの下で書き込みの最中に届く子のsigchldを増やさない()
         "`set -e` の下（呼び手の set -e を継ぐ scripts/lib/ を含む）で、待たずに走らせる子\n\
          （`<( … )` / `>( … )`・背景の `&`）を増やしている（#2690）。CI の macOS の /bin/bash 3.2 は\n\
          SIGCHLD を SA_RESTART なしで受けるので、その子が終わった瞬間にシェルが stdout / stderr への\n\
-         write の中で待っていると `echo: write error: Interrupted system call` になり、その行が消えて\n\
-         set -e で 1 で抜ける（結論の行が欠け、終了コードの意味が化ける。5.x では起きない）。\n\
+         write の中で待っていると `echo: write error: Interrupted system call` になり、set -e で\n\
+         そこから先が走らない（結論の行が出ず、終了コードの意味が化ける。5.x では起きない）。\n\
          `done < <(X)` は `done <<<\"$(X)\"` へ（置換の子はシェルが待って刈り取る = 書き込みの最中に\n\
          SIGCHLD が届かない）。背景の `&` は、終わるまでの間に何も書かない（wait で刈り取ってから書く）\n\
          と監査して確かめた箇所だけ、その行か直前の行に `# {SIGCHLD_OK_MARKER} <理由>` で外せる\n\
@@ -5884,7 +5886,7 @@ fn 凍結表は今の数と一致しprの待ちとmergeは子を持たない() {
         }
         for v in errexit_async_violations(rel, src, 0) {
             problems.push(format!(
-                "{v}\n  （PR の CI 待ちと merge は 0 のまま。結論の行が消えて終了コードが化ける = #2690）"
+                "{v}\n  （PR の CI 待ちと merge は 0 のまま。結論の行が出ず終了コードが化ける = #2690）"
             ));
         }
     }

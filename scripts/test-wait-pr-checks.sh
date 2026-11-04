@@ -1311,8 +1311,8 @@ assert_eq "既定の待ちの合計は 15 秒" "$(sed -n 's/^TOTAL //p' "${TMP}/
 echo "== Test 41: 書き込みの最中に子の SIGCHLD が届いても結論の行と終了コードが崩れない（#2690）=="
 # CI の macOS の /bin/bash 3.2 は SIGCHLD を SA_RESTART なしで受ける（4.2 から付く）。待たずに
 # 走らせた子（プロセス置換・背景の &）が終わった瞬間にシェルが stdout / stderr への write の中で
-# 待っていると、echo が `write error: Interrupted system call` で落ちてその行が消え（macOS の libc は
-# その行のバッファを捨てる）、set -e で 1 で抜ける。CI では読み手の tee と同じパイプを取り合った
+# 待っていると、echo が `write error: Interrupted system call` で落ち、set -e でそこから先が走らない
+# （割り込まれるのは本体で書いていた一覧の行で、その文字は libc が持っていて終わるときに出る）。CI では読み手の tee と同じパイプを取り合った
 # 一瞬だけなので間欠だった（t38red の結論の行・t39merge の 5 が 1）。ここでは腕の stdout / stderr を
 # 「いつも満杯」の FIFO（scripts/lib/slowpipe.pl。仕組みと罠はその先頭）にして write を毎回待たせ、
 # その一瞬を毎回にする（負荷は生成しない）。修正前の形（`done < <( … )`）は 3.2 で毎回落ちる
