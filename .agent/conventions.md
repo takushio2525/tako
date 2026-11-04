@@ -2674,6 +2674,21 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   （前提が崩れたときに「検査対象が壊れた」と読み違えないため。ヘルパーがやる）。
   最後のタブは閉じられない（`close_tab` が `LastTab` を返し UI 層がアプリを
   終了させる）ので、**新しいタブを作ってから**残りを閉じる
+- **画面の外の持ち越しも節が自分で決める**（#2716。単独では通るのに全節実行で止まる形）:
+  - **言語サーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は `vt_lsp_override(window, cx, id, Some(パス) | None)`
+    で書く・外す**。実行ファイルの解決は ID ごとに覚えられ（#1769）、env を書くだけでは先の
+    `.rs` の節が覚えた解決（隔離 HOME で動かない PATH の rust-analyzer）が勝って差し替えが効かない
+    （lsp-context-menu ① が 3/3 落ちた）。補助は書く・外すたびに restart の口（`tako lsp restart
+    --name <ID>` と同じ dispatch）で覚えを捨てる。直に `set_var` すると番犬
+    `issue2716_full_run_carryover_watchdog` が file:line で名指す
+  - **言語サーバの受け持つ拡張子の fixture を画素で比べる節は、言語サーバを決めてから状態の着地を
+    待って基準を撮る**（bracket-match = 実行できないパスへ差し替え → `vt_lsp_settled` を待つ。未導入の帯が
+    節の途中に出ると器が縮む）。言語サーバに用の無い節は fixture を受け持たない拡張子にする（#2714）
+  - **dispatch で直に開いたプレビューは `drain_pending_preview_loads` で流す**（#826 / #2716 の #745。
+    流さないとファイル監視の読み直しが来たときだけ揃う）
+  - A/B は `TAKO_2716_LEGACY=md-edit-resume|lsp-override|bracket-match|chat-table`（`1` で全部）、
+    持ち越しの注入は `TAKO_2716_INJECT=split|stale-resolve|no-reload|resolve-ms=<ミリ秒>`（単独実行で
+    前の節の残りを作る。旧の形は名指しで落ち、新しい形は通る）
 - **節を足したら `TAKO_VISUAL_ONLY` の腕と全節実行の並びの両方へ載せる**。腕にしか
   無い節は「最終確認」で**一度も走らない**（#948 で `preview_code_visual` /
   `remote_tree_visual` / `screen_lines_visual` の 3 本がこれだった。`remote_tree_visual`

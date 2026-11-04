@@ -42590,6 +42590,19 @@ mod self_test {
             "visual-test #745: フィクスチャに 2 列と 3 列の表がある",
         );
 
+        // #2716 の注入 `no-reload`: ファイル監視の読み直しが来ない形（節の終わりで戻す）
+        let reload_off = inject_2716("no-reload");
+        if reload_off {
+            let _ = window.update(cx, |app, _, _| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::PreviewReload {
+                        enabled: Some(false),
+                    },
+                    PaneOrigin::Cli,
+                );
+            });
+        }
         // 左 = チャット、右 = 同じ md のプレビュー
         let (chat_pane, md_pane) = window
             .update(cx, |app, _, cx| {
@@ -42609,6 +42622,12 @@ mod self_test {
                     PaneOrigin::Cli,
                 )
                 .expect("visual-test #745: プレビューを開く");
+                // 積んだ読み込みを流す（dispatch を直に呼んだので、IPC の after_dispatch の代わり。
+                // #826 / #2716。流さないと表はファイル監視の読み直し（fixture の書き込みを拾う）が
+                // 来たときだけ揃い、知らせが来ない・遅れると 5 秒で落ちる）
+                if !legacy_2716("chat-table") {
+                    app.drain_pending_preview_loads(cx);
+                }
                 let _ = tako_control::dispatch(
                     app,
                     tako_control::protocol::Request::UiMode {
@@ -42645,6 +42664,17 @@ mod self_test {
             )
         })
         .await;
+        if reload_off {
+            let _ = window.update(cx, |app, _, _| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::PreviewReload {
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+            });
+        }
         check(
             loaded.is_some(),
             "visual-test #745: プレビュー側に表がロードされる",
@@ -46736,13 +46766,10 @@ mod self_test {
         let fixture = dir.join("diagnostics.json");
         std::fs::write(&fixture, serde_json::Value::Array(published).to_string())
             .expect("diagnostics.json");
-        // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）
-        let spec = tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, &path)
-            .expect("fixture の拡張子を受け持つサーバが表に在る")
-            .spec;
-        let override_env = tako_core::lsp::servers::override_env_name(spec.id);
-        std::env::set_var(&override_env, &fake);
         std::env::set_var("TAKO_LSP_FAKE_DIAGNOSTICS", &fixture);
+        // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）。
+        // 前の節が覚えた解決は restart の口で捨てる（#2716）
+        let server = vt_lsp_override(window, cx, vt_lsp_server_of(&path), Some(&fake));
 
         let pane = window
             .update(cx, |app, _, cx| {
@@ -47228,7 +47255,7 @@ mod self_test {
             retained == (0, 0) && !edits_left,
             "visual-test 診断: ペインを閉じても診断が保持されたまま (#830)",
         );
-        std::env::remove_var(&override_env);
+        vt_lsp_override(window, cx, server, None);
         std::env::remove_var("TAKO_LSP_FAKE_DIAGNOSTICS");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -54623,6 +54650,202 @@ mod self_test {
         }
     }
 
+    /// **#2716 の A/B**（全節実行が前の節の持ち越しで止まっていた 4 か所）。
+    /// `TAKO_2716_LEGACY=1` / `all` で全部、`md-edit-resume` / `lsp-override` / `bracket-match` /
+    /// `chat-table`（カンマ区切り）で一部だけ修正前へ戻す（`check` は 1 つ目の失敗でプロセスごと
+    /// 止まるので、全節実行で後ろの旧の形を見るときは前のものを戻さない = `legacy_2711` と同じ理由）。
+    ///
+    /// - `md-edit-resume` = 節の頭で場面を作らず、前の節が残した分割の隣に開く
+    /// - `lsp-override` = 言語サーバの差し替え口（`TAKO_LSP_BIN_<ID>`）を env に書くだけで、
+    ///   前の節が覚えた実行ファイルの解決を捨てない（[`vt_lsp_override`]）
+    /// - `bracket-match` = fixture の言語サーバを決めず、状態の着地も待たずに基準を撮る
+    /// - `chat-table` = dispatch で開いた後に積んだ読み込みを流さない（ファイル監視の読み直し頼み）
+    #[cfg(feature = "visual-test")]
+    fn legacy_2716(item: &str) -> bool {
+        std::env::var("TAKO_2716_LEGACY").is_ok_and(|value| {
+            value == "1" || value == "all" || value.split(',').any(|p| p.trim() == item)
+        })
+    }
+
+    /// **#2716 の注入口**（検証プロセスの門の内側でだけ読む。カンマ区切りで並べられる）。
+    ///
+    /// - `split` = md-edit-resume の頭で、開く元のペインの右に 1 枚分割しておく（前の節が分割を
+    ///   残した形。旧の形はプレビューが 0.25 幅 = 編集ボタンの出ない幅になって落ちる）
+    /// - `stale-resolve` = lsp-context-menu の頭で、差し替え無しの `.rs` を 1 つ開いて言語サーバの
+    ///   解決を覚えさせてから閉じる（全節実行で先の `.rs` の節が残す覚えと同じ。旧の形は偽サーバへの
+    ///   差し替えが効かず ① で落ちる）
+    /// - `no-reload` = chat-table の間だけライブリロードを切る（ファイル監視の読み直しが来ない形。
+    ///   旧の形は表が揃わず落ちる）
+    /// - `resolve-ms=<ミリ秒>` = 言語サーバの実行ファイルの解決を遅らせる（tako-control の
+    ///   `LspManager` が読む。前の節の解決が bracket-match の途中に着地した形。旧の形は未導入の帯が
+    ///   基準を撮った後に出て ② / ③ で落ちる）
+    #[cfg(feature = "visual-test")]
+    fn inject_2716(item: &str) -> bool {
+        tako_core::paths::is_verification_process()
+            && std::env::var("TAKO_2716_INJECT")
+                .is_ok_and(|value| value.split(',').any(|p| p.trim() == item))
+    }
+
+    /// visual-test の fixture を受け持つ言語サーバの ID（検出表から引く。名前を書かない）
+    #[cfg(feature = "visual-test")]
+    fn vt_lsp_server_of(path: &std::path::Path) -> &'static str {
+        tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, path)
+            .expect("fixture の拡張子を受け持つサーバが表に在る")
+            .spec
+            .id
+    }
+
+    /// **visual-test の節が言語サーバの差し替え口（`TAKO_LSP_BIN_<ID>`）を書く・外す 1 実装**（#2716）。
+    ///
+    /// env を書く（`Some`）・外す（`None`）たびに restart の口（`tako lsp restart --name <ID>` /
+    /// MCP の `tako_lsp_server` と同じ dispatch）を通し、前の節が覚えた実行ファイルの解決と未導入の
+    /// 記録を捨てる。全節実行は 1 プロセスで節を回すので、env を書くだけだと先の `.rs` の節が
+    /// 覚えた解決（隔離 HOME で動かない PATH の rust-analyzer = 未導入・動く機なら本物の RA）が勝ち、
+    /// 差し替えが効かない（lsp-context-menu の ① が「言語サーバの節が無い」で 3/3 落ちた。単独実行は
+    /// 差し替えが先なので通る）。外すときも捨てないと、偽サーバの解決が後ろの節へ持ち越される。
+    /// 返り値はサーバの ID（外すときに渡す）。`TAKO_2716_LEGACY=lsp-override` は env を書くだけ
+    #[cfg(feature = "visual-test")]
+    fn vt_lsp_override(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        id: &'static str,
+        program: Option<&std::path::Path>,
+    ) -> &'static str {
+        let env = tako_core::lsp::servers::override_env_name(id);
+        match program {
+            Some(program) => std::env::set_var(&env, program),
+            None => std::env::remove_var(&env),
+        }
+        if legacy_2716("lsp-override") {
+            return id;
+        }
+        let reply = window
+            .update(cx, |app, _, cx| {
+                let r = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::LspServer {
+                        action: "restart".into(),
+                        name: Some(id.to_string()),
+                        set: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                r
+            })
+            .unwrap_or_else(|_| fail("visual-test: 言語サーバの差し替えの restart (#2716)"));
+        if let Err(e) = reply {
+            fail(&format!(
+                "visual-test: 言語サーバ {id} の差し替えの後に restart の口で解決を捨てられない: {e:?} (#2716)"
+            ));
+        }
+        id
+    }
+
+    /// 文書の言語サーバの状態が落ち着いたか（起こしている途中・取っている途中・落ちて起こし直す
+    /// 途中でない。自動で起こさずにいる = held も落ち着いた側。#2716）
+    #[cfg(feature = "visual-test")]
+    fn vt_lsp_settled(server: &tako_control::lsp::DocumentServer) -> bool {
+        use tako_core::lsp::state::ServerState as S;
+        server.held
+            || !matches!(
+                server.state,
+                S::NotStarted | S::Starting | S::Fetching | S::Crashed | S::Stopping
+            )
+    }
+
+    /// #2716 の注入 `stale-resolve`: 差し替え無しの `.rs` を `from` の右に開いて言語サーバの解決を
+    /// 覚えさせ、状態が落ち着いたら閉じる（全節実行で先の `.rs` の節が残す覚えを単独実行で作る）
+    #[cfg(feature = "visual-test")]
+    async fn vt2716_stale_resolve(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        from: PaneId,
+        label: &str,
+    ) {
+        use tako_control::protocol::Request as Req;
+        let dir =
+            std::env::temp_dir().join(format!("tako-visual-2716-stale-{}", std::process::id()));
+        remove_on_fail(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("visual-test #2716 stale-resolve の dir");
+        let _ = std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"s\"\n");
+        let file = dir.join("src").join("main.rs");
+        std::fs::write(&file, "fn main() {}\n")
+            .expect("visual-test #2716 stale-resolve の fixture");
+        let pane = window
+            .update(cx, |app, _, cx| {
+                let opened = tako_control::dispatch(
+                    app,
+                    Req::OpenFile {
+                        pane: Some(from.as_u64()),
+                        path: file.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(false),
+                        new_tab: false,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .ok()?;
+                let pane = PaneId::from_raw(opened["pane"].as_u64()?);
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::PreviewEdit {
+                        pane: Some(pane.as_u64()),
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                Some(pane)
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                fail(&format!(
+                    "visual-test {label}: 注入 stale-resolve で開けない"
+                ))
+            });
+        let settled = wait_for_app_state(
+            window,
+            cx,
+            "2716-stale-resolve",
+            Duration::from_secs(30),
+            |app| {
+                app.lsp_document_server(pane)
+                    .is_some_and(|s| vt_lsp_settled(&s))
+            },
+        )
+        .await;
+        let state = window
+            .update(cx, |app, _, _| {
+                app.lsp_document_server(pane).map(|s| s.state.slug())
+            })
+            .ok()
+            .flatten();
+        println!(
+            "TAKO_VISUAL_PIXEL: {label} inject=stale-resolve settled={settled} state={state:?}"
+        );
+        let _ = window.update(cx, |app, _, cx| {
+            app.preview_edits.remove(&pane);
+            let _ = tako_control::dispatch(
+                app,
+                Req::Close {
+                    pane: Some(pane.as_u64()),
+                    force: true,
+                    caller_role: None,
+                    caller_pane: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1684 の道具: 実ファイルを開いて（閲覧のまま = 編集モードに入らない）行が描かれるまで待つ
     #[cfg(feature = "visual-test")]
     async fn vt1684_open(
@@ -54713,14 +54936,13 @@ mod self_test {
             .unwrap_or_else(|| {
                 fail("visual-test lsp-context-menu: 偽サーバが無い（cargo build -p tako-control --bin tako-lsp-fake を先に）")
             });
-        let spec_of = |path: &std::path::Path| {
-            tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, path)
-                .expect("fixture の拡張子を受け持つサーバが表に在る")
-                .spec
-        };
-        // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）
-        let rs_env = tako_core::lsp::servers::override_env_name(spec_of(&file).id);
-        std::env::set_var(&rs_env, &fake);
+        // #2716: 全節実行で先の `.rs` の節が残す解決の覚えを単独実行で作る（注入）
+        if inject_2716("stale-resolve") {
+            vt2716_stale_resolve(window, cx, anchor, LABEL).await;
+        }
+        // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）。
+        // 前の節が覚えた解決は restart の口で捨てる（#2716）
+        let rs_server = vt_lsp_override(window, cx, vt_lsp_server_of(&file), Some(&fake));
         let goto = dir.join("goto.json");
         std::fs::write(
             &goto,
@@ -55099,8 +55321,12 @@ mod self_test {
         // ⑧ 未導入のサーバ（差し替え口が実行できないものを指す）: 1 行のあと節ごと消える
         let py = dir.join("tool.py");
         std::fs::write(&py, "def run():\n    return run\n").expect("tool.py");
-        let py_env = tako_core::lsp::servers::override_env_name(spec_of(&py).id);
-        std::env::set_var(&py_env, dir.join("no-such-server"));
+        let py_server = vt_lsp_override(
+            window,
+            cx,
+            vt_lsp_server_of(&py),
+            Some(&dir.join("no-such-server")),
+        );
         let py_pane = vt1684_open(any, window, cx, pane, &py, LABEL).await;
         let run = vt1684_point(window, cx, py_pane, 0, 4..7)
             .unwrap_or_else(|| fail("visual-test lsp-context-menu ⑧: run の位置を採れない"));
@@ -55133,8 +55359,8 @@ mod self_test {
         );
         vt1684_close(any, window, cx);
 
-        std::env::remove_var(&rs_env);
-        std::env::remove_var(&py_env);
+        vt_lsp_override(window, cx, rs_server, None);
+        vt_lsp_override(window, cx, py_server, None);
         std::env::remove_var("TAKO_LSP_FAKE_GOTO");
         for env in tako_control::lsp::menu::FAKE_FULL_MENU_RULE_ENVS {
             std::env::remove_var(env);
@@ -55264,7 +55490,7 @@ mod self_test {
 
     /// 補完の一覧を用意する: 偽サーバ（`tako-lsp-fake`）を受け持ちのサーバに差し替え、
     /// `src/main.rs` を編集モードで開いて 3 行目の行頭（字下げの後ろ）へカーソルを置く。
-    /// 返り値は (ペイン, 一時ディレクトリ, 差し替えた環境変数の名前)
+    /// 返り値は (ペイン, 一時ディレクトリ, 差し替えたサーバの ID = 後片付けで [`vt_lsp_override`] へ渡す)
     #[cfg(feature = "visual-test")]
     async fn completion_scene(
         any: AnyWindowHandle,
@@ -55274,7 +55500,7 @@ mod self_test {
         rules: Option<serde_json::Value>,
         source: &str,
         cursor: (usize, usize),
-    ) -> (PaneId, std::path::PathBuf, Option<String>) {
+    ) -> (PaneId, std::path::PathBuf, Option<&'static str>) {
         use tako_control::protocol::Request as Req;
         let anchor = ensure_fresh_scene(window, cx, label).await;
         let dir = std::env::temp_dir().join(format!("tako-visual-{label}-{}", std::process::id()));
@@ -55300,14 +55526,15 @@ mod self_test {
                 });
             let file = dir.join("completion.json");
             std::fs::write(&file, rules.to_string()).expect("completion.json");
-            // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）
-            let spec = tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, &path)
-                .expect("fixture の拡張子を受け持つサーバが表に在る")
-                .spec;
-            let name = tako_core::lsp::servers::override_env_name(spec.id);
-            std::env::set_var(&name, &fake);
             std::env::set_var("TAKO_LSP_FAKE_COMPLETION", &file);
-            override_env = Some(name);
+            // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）。
+            // 前の節が覚えた解決は restart の口で捨てる（#2716）
+            override_env = Some(vt_lsp_override(
+                window,
+                cx,
+                vt_lsp_server_of(&path),
+                Some(&fake),
+            ));
         }
         let pane = window
             .update(cx, |app, _, cx| {
@@ -55912,8 +56139,8 @@ mod self_test {
             "visual-test completion: 問い合わせ中にペインを閉じても一覧は残らない",
         );
 
-        if let Some(name) = override_env {
-            std::env::remove_var(name);
+        if let Some(server) = override_env {
+            vt_lsp_override(window, cx, server, None);
         }
         std::env::remove_var("TAKO_LSP_FAKE_COMPLETION");
         let _ = std::fs::remove_dir_all(&dir);
@@ -56238,8 +56465,8 @@ mod self_test {
         ] {
             std::env::remove_var(name);
         }
-        if let Some(name) = override_env {
-            std::env::remove_var(name);
+        if let Some(server) = override_env {
+            vt_lsp_override(window, cx, server, None);
         }
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&work);
@@ -56406,7 +56633,7 @@ mod self_test {
     ) -> (
         PaneId,
         std::path::PathBuf,
-        Option<String>,
+        Option<&'static str>,
         std::path::PathBuf,
     ) {
         let file = std::env::temp_dir().join(format!(
@@ -57063,8 +57290,8 @@ mod self_test {
             "visual-test hover: メニューを閉じればまたカードが出る (#1681)",
         );
 
-        if let Some(name) = override_env {
-            std::env::remove_var(name);
+        if let Some(server) = override_env {
+            vt_lsp_override(window, cx, server, None);
         }
         std::env::remove_var("TAKO_LSP_FAKE_COMPLETION");
         std::env::remove_var("TAKO_LSP_FAKE_HOVER");
@@ -61751,6 +61978,35 @@ mod self_test {
         use tako_control::protocol::Request as Req;
         let wait =
             |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        if inject_2716("split") {
+            // #2716 の注入: 前の節が分割を残した形（開く元の右に 1 枚）
+            let _ = window.update(cx, |app, _, cx| {
+                let base = app.focused_pane();
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::Split {
+                        pane: Some(base.as_u64()),
+                        tab: None,
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    PaneOrigin::User,
+                );
+                let _ = app.attach_pending_sessions(cx);
+                cx.notify();
+            });
+        }
+        // #2716: 開く場面は節の頭で自分で作る。前の節が残した分割の隣に開くと、既定の窓（960×600）で
+        // プレビューが 0.25 幅 = 編集ボタンの出ない幅（`PreviewHeaderVisibility` の 300px 未満）になり、
+        // 全節実行が「編集ボタンが描かれない」で止まっていた（単独実行は 0.5 幅なので通る）
+        let anchor = if legacy_2716("md-edit-resume") {
+            None
+        } else {
+            Some(ensure_fresh_scene(window, cx, "md-edit-resume").await)
+        };
         let dir = std::env::temp_dir().join(format!("tako-visual-1661-{}", std::process::id()));
         remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
@@ -61774,7 +62030,7 @@ mod self_test {
             .update(cx, |app, _, cx| {
                 app.drawer_visible = false;
                 app.panel_visible = false;
-                let base = app.focused_pane().as_u64();
+                let base = anchor.unwrap_or_else(|| app.focused_pane()).as_u64();
                 let opened = tako_control::dispatch(
                     app,
                     Req::OpenFile {
