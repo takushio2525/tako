@@ -49,6 +49,11 @@
 //! `tako context-budget`（check / fix）と `tako test-residue` の人向けの表示の枠もここが持つ。予算の理由文・直し方・
 //! 起動前の 1 行は `context_budget` が表示言語で組んだ応答の値のまま。残骸の種別の説明と判定の理由は
 //! tako-core の `Kind::note` / `Verdict::detail_in` を表示言語で引き、応答の JSON の `note` / `detail` は日本語のまま
+//!
+//! `tako remote start` / `stop` / `status` の stderr の行の枠もここが持つ。旧版の daemon・起こしている途中・自己検査の
+//! 停止の説明は `remote_generation` / `remote_starting` / `remote_serve` の `*_in` が同じ応答の構造の欄から組み、
+//! stdout の JSON（`serve_generation.detail` / `starting.detail` / `degraded` / `warnings`）は日本語のまま。
+//! 自動復帰の失敗の理由と daemon が自己検査で書く理由は中身が外から来る文なので、そのまま載せる
 
 use tako_core::handoff::{HANDOFF_PROJECTS_DIR, PROFILE_MEMO_SOFT_LIMIT_LINES};
 use tako_core::i18n::Lang;
@@ -1048,6 +1053,33 @@ pub enum ReplyNote {
     ResidueRemovable { count: usize, bytes: String },
     /// dry-run の案内: 消すコマンド
     ResidueApplyHint,
+
+    // ---- CLI の人向けの表示: リモートの公開（`tako remote start` / `stop` / `status`）----
+    // stdout の JSON（応答の値）は変えない。旧版・起こしている途中・劣化の説明は `remote_generation` /
+    // `remote_starting` / `remote_serve` の `*_in` が持ち、自動復帰の失敗の理由（`last_autostart.detail`）は
+    // GUI が記録した文のまま。行頭の改行・字下げは呼び手が付ける
+    /// start: 旧版のまま動いていた daemon を入れ替えた（`renewed.previous_pid`）
+    RemoteRenewed(u64),
+    /// start: QR コードの画像を書き出した
+    RemoteQrSaved(String),
+    /// start: QR コードを読んでもらう案内
+    RemoteQrScan,
+    /// start: QR コードの画像を作れなかった（中身は `generate_qr_png` の理由のまま）
+    RemoteQrFailed(String),
+    /// start: URL は恒久固定で秘密を含まない
+    RemoteUrlPermanent,
+    /// start: スマホにも Tailscale を入れて同じアカウントでログインする
+    RemotePhoneTailscale,
+    /// start: 初回は Mac にペアリングの承認ダイアログが出る
+    RemotePairingDialog,
+    /// start: 再起動しても公開の状態は自動で戻る
+    RemoteAutoRestore,
+    /// stop: 止めた
+    RemoteStopped,
+    /// status: 前回の起動状態へ自動で戻せなかった（`detail` は GUI が記録した理由のまま）
+    RemoteAutostartFailed { attempts: u64, detail: String },
+    /// status: 自動で戻せなかったときの次の一手
+    RemoteAutostartNextStep,
 }
 
 impl ReplyNote {
@@ -4162,6 +4194,68 @@ impl ReplyNote {
             }
             (Self::ResidueApplyHint, Ja) => "いま消す: tako test-residue --apply".into(),
             (Self::ResidueApplyHint, En) => "remove them now: tako test-residue --apply".into(),
+
+            (Self::RemoteRenewed(pid), Ja) => format!(
+                "旧版のまま動いていたリモート daemon（PID {pid}）を止めて、新版で起動し直しました。"
+            ),
+            (Self::RemoteRenewed(pid), En) => format!(
+                "Stopped the remote daemon that was still running the old version (PID {pid}) \
+                 and started it again with the new version."
+            ),
+            (Self::RemoteQrSaved(path), Ja) => format!("QR コードを生成しました: {path}"),
+            (Self::RemoteQrSaved(path), En) => format!("Saved the QR code: {path}"),
+            (Self::RemoteQrScan, Ja) => "スマホでスキャンしてください。".into(),
+            (Self::RemoteQrScan, En) => "Scan it with your phone.".into(),
+            (Self::RemoteQrFailed(error), Ja) => format!("QR コード画像の生成に失敗: {error}"),
+            (Self::RemoteQrFailed(error), En) => {
+                format!("Failed to generate the QR code image: {error}")
+            }
+            (Self::RemoteUrlPermanent, Ja) => {
+                "この URL は恒久固定で secret を含みません（Tailscale MagicDNS 名。tailnet 内限定）。"
+                    .into()
+            }
+            (Self::RemoteUrlPermanent, En) => {
+                "This URL never changes and contains no secret (a Tailscale MagicDNS name, \
+                 reachable only inside your tailnet)."
+                    .into()
+            }
+            (Self::RemotePhoneTailscale, Ja) => {
+                "スマホ側にも Tailscale アプリを入れ、同じアカウントでログインしてください。".into()
+            }
+            (Self::RemotePhoneTailscale, En) => {
+                "Install the Tailscale app on your phone too and sign in with the same account."
+                    .into()
+            }
+            (Self::RemotePairingDialog, Ja) => {
+                "初回アクセス時は Mac の画面にペアリング承認ダイアログが表示されます。".into()
+            }
+            (Self::RemotePairingDialog, En) => {
+                "On the first access, a pairing approval dialog appears on the Mac's screen.".into()
+            }
+            (Self::RemoteAutoRestore, Ja) => {
+                "tako や Mac を再起動しても、この状態は自動で戻ります（`tako remote stop` で解除）。"
+                    .into()
+            }
+            (Self::RemoteAutoRestore, En) => {
+                "This state comes back automatically after tako or the Mac restarts \
+                 (turn it off with `tako remote stop`)."
+                    .into()
+            }
+            (Self::RemoteStopped, Ja) => "リモートサーバーを停止しました".into(),
+            (Self::RemoteStopped, En) => "stopped the remote server".into(),
+            (Self::RemoteAutostartFailed { attempts, detail }, Ja) => format!(
+                "前回の起動状態へ自動で戻せませんでした（{attempts} 回試行）: {detail}"
+            ),
+            (Self::RemoteAutostartFailed { attempts, detail }, En) => format!(
+                "could not automatically restore the previous running state \
+                 ({attempts} attempt(s)): {detail}"
+            ),
+            (Self::RemoteAutostartNextStep, Ja) => {
+                "次の一手: `tako remote start` で手動起動できます".into()
+            }
+            (Self::RemoteAutostartNextStep, En) => {
+                "next step: you can start it by hand with `tako remote start`".into()
+            }
         }
     }
 }

@@ -138,6 +138,8 @@ export TAKO_REMOTE_STATE_DIR="$TMP/state"
 export TAKO_DISCOVERY_DIR="$TMP/disc"
 export TAKO_TAILSCALE_BIN="$FAKE_TS"
 mkdir -p "$TAKO_DATA_DIR" "$TAKO_REMOTE_STATE_DIR" "$TAKO_DISCOVERY_DIR"
+# 下の検査は CLI の stderr の日本語の字面を見る。行は表示言語に従う（#2365）ので、OS のロケールで答えを変えない
+echo '{"language":"ja"}' > "$TAKO_DATA_DIR/settings.json"
 case "$TAKO_REMOTE_STATE_DIR" in
   "$TMP"/*) : ;;
   *) echo "state ディレクトリが隔離されていない: $TAKO_REMOTE_STATE_DIR"; exit 1 ;;

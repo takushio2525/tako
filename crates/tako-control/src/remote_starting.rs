@@ -150,14 +150,49 @@ pub fn doing_in(marker: &StartingMarker, now: u64, lang: Lang) -> String {
     }
 }
 
-/// 人が読む 1 行（`warnings` と CLI の stderr に出す）。**stop を案内しない**のが要点
+/// 人が読む 1 行（`warnings` と status の `starting.detail` に載せる日本語）。**stop を案内しない**のが要点
 pub fn detail(marker: &StartingMarker, now: u64) -> String {
-    let doing = doing_in(marker, now, Lang::Ja);
-    format!(
-        "{doing}。新しい daemon は待ち受けを開いてから PID ファイルを書くまで数十秒かかることがあり、\
-         その間は `running: false` に見えます。止めたり起動し直したりせず、しばらく待ってから \
-         `tako remote status` を読み直してください"
-    )
+    detail_in(marker, now, Lang::Ja)
+}
+
+/// [`detail`] を表示言語で（CLI の `tako remote status` の stderr の 1 行。#2365）。日本語は [`detail`] とバイト一致
+pub fn detail_in(marker: &StartingMarker, now: u64, lang: Lang) -> String {
+    let doing = doing_in(marker, now, lang);
+    match lang {
+        Lang::Ja => format!(
+            "{doing}。新しい daemon は待ち受けを開いてから PID ファイルを書くまで数十秒かかることがあり、\
+             その間は `running: false` に見えます。止めたり起動し直したりせず、しばらく待ってから \
+             `tako remote status` を読み直してください"
+        ),
+        Lang::En => format!(
+            "{doing}. A new daemon can take tens of seconds between opening its listener and writing \
+             the PID file, and looks like `running: false` until then. Do not stop or restart it; \
+             wait a while, then check `tako remote status` again"
+        ),
+    }
+}
+
+/// status の `starting` の欄（[`status_field`] の形）から [`detail_in`] を組み直す（#2365）。
+///
+/// 応答の `detail` は日本語のまま変えないので、CLI の英語の表示は同じ欄の構造（`via` / `previous_pid` /
+/// `elapsed_secs`）から組む。経過は status を組んだ時点の値なので、日本語は応答の `detail` とバイト一致。
+/// 欄が無い（起こしている途中ではない）なら `None`
+pub fn detail_of_status_in(field: &Value, lang: Lang) -> Option<String> {
+    let elapsed = field.get("elapsed_secs")?.as_u64()?;
+    let marker = StartingMarker {
+        at: 0,
+        pid: 0,
+        via: field
+            .get("via")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        previous_pid: field
+            .get("previous_pid")
+            .and_then(Value::as_u64)
+            .and_then(|p| u32::try_from(p).ok()),
+    };
+    Some(detail_in(&marker, elapsed, lang))
 }
 
 /// `tako remote status` / MCP `tako_remote_status` の `starting`（純関数）。

@@ -65,6 +65,8 @@ STATE_DIR="$TMP/state"
 DATA_DIR="$TMP/data"
 BIN_DIR="$TMP/bin"
 mkdir -p "$STATE_DIR" "$DATA_DIR" "$BIN_DIR" "$TMP/disc"
+# 検査は CLI の stderr の日本語の字面を見る。行は表示言語に従う（#2365）ので、OS のロケールで答えを変えない
+echo '{"language":"ja"}' > "$DATA_DIR/settings.json"
 
 echo "== ビルド =="
 # shellcheck source=lib/isolated-gui.sh
