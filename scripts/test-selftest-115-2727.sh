@@ -19,8 +19,12 @@
 # 通るので、選ぶ直前のペインの様子（`TAKO_SELF_TEST_739_LAUNCH` の pane_before）も出す（#2727 段 1）。
 # `TAKO_2727_KEEP_TMP=1` はログ（腕ごとの app.log）を残して置き場を出す。
 #
-# **セルフテスト全体は項目 109（#496）を通る**。#2726（項目 109 が本物の codex / agy / claude を起こす）が
-# 着地するまでは回さない。
+# 手前の項目 739 / 749 は器の競合（#2741 = 器の最後のセッションを閉じた直後に作ったペインが即死する）で
+# 間欠的に落ち、その回は項目 115 まで届かない。その回は NG にも未実測にも数えずに `[#2741]` と名指し、
+# 腕ごとに TAKO_2727_MAX_TRIES 回（既定 3）までやり直す（やり直し切れなければ未実測）。
+#
+# セルフテスト全体は項目 109（#496）を通る。#2726（PR #2738）以後は偽の claude / codex / agy で確かめるので、
+# 本物のエージェントは起きない。
 #
 # 窓は仮想ディスプレイ tako-vd の上だけ（scripts/lib/isolated-gui.sh）。面が無い機（蓋閉じ等）は
 # 終了コード 4 = 未実測。腕ごとに「ディスプレイ指定 tako-vd: name で解決」を確かめ、無い回は未実測として
@@ -41,10 +45,12 @@ RUNS="${TAKO_2727_RUNS:-legacy ok full}"
 OK_RUNS="${TAKO_2727_OK_RUNS:-3}"
 # 1 本の上限（項目 115 までは数分。最後まで回す full は 10 分前後。混んだ機で伸びる分を見込む）
 RUN_LIMIT_SECS="${TAKO_2727_RUN_LIMIT_SECS:-2400}"
+MAX_TRIES="${TAKO_2727_MAX_TRIES:-3}"
 
 PASS=0
 FAIL=0
 UNMEASURED=0
+N2741=0
 pass() { PASS=$((PASS + 1)); echo "  [OK] $1"; }
 bad()  { FAIL=$((FAIL + 1)); echo "  [NG] $1"; }
 check() { if [ "$1" = "1" ]; then pass "$2"; else bad "$2"; fi; }
@@ -170,21 +176,53 @@ passed_115() {
   echo 1
 }
 not() { [ -z "$1" ] && echo 1; }
-# 手前の範囲外の項目で止まった回（項目 115 まで届かなかった）は数えずに名指す
-early_stop() {
-  if [ -n "$(reached_115)" ]; then return 1; fi
-  UNMEASURED=$((UNMEASURED + 1))
-  echo "  [未実測] ${1}: 項目 115 まで届かなかった（$(grep -m1 "TAKO_APP_SELF_TEST_FAILED" "$RUN_LOG" | cut -c1-160)）"
-  return 0
+# 手前の項目 739 / 749 が器の競合（#2741）の形で落ちた回か（落ちた項目の番号を出す）。
+#   749: 「検証用ペインが消えた」
+#   739: 選ぶ処理が偽（`selected=false` = 選んだ時点でそのペインのシェルが無い。`pane_before` の欄で
+#        シェルとツリーの有無を見る）
+stopped_by_2741() {
+  local head
+  head="$(upto_116)"
+  if grep -q "TAKO_APP_SELF_TEST_FAILED: #749: 検証用ペインが消えた" <<<"$head"; then
+    echo 749
+  elif grep -q "TAKO_APP_SELF_TEST_FAILED: .*(#739)" <<<"$head" \
+    && grep -q "^TAKO_SELF_TEST_739_LAUNCH: .*selected=false" <<<"$head"; then
+    echo 739
+  fi
+}
+
+# 1 つの腕を回す: run_arm <ラベル> <full か stop> [VAR=VAL ...]
+# 項目 115 まで届いた回で 0 を返す。手前の 739 / 749 が #2741 で落ちた回は NG に数えずに名指して
+# MAX_TRIES 回までやり直す。描けなかった回・別の理由で手前で止まった回・やり直し切れなかった回は未実測で 1
+run_arm() {
+  local label="$1" mode="$2" try=1 which
+  shift 2
+  while :; do
+    run_one "$label" "$mode" "$@"
+    measured "$label" || return 1
+    [ -n "$(reached_115)" ] && return 0
+    which="$(stopped_by_2741)"
+    if [ -z "$which" ]; then
+      UNMEASURED=$((UNMEASURED + 1))
+      echo "  [未実測] ${label}: 項目 115 まで届かなかった（$(grep -m1 "TAKO_APP_SELF_TEST_FAILED" "$RUN_LOG" | cut -c1-160)）"
+      return 1
+    fi
+    N2741=$((N2741 + 1))
+    echo "  [#2741] ${label}: 手前の項目 ${which} が器の競合（#2741）で落ちた = NG に数えない（${try}/${MAX_TRIES}）"
+    if [ "$try" -ge "$MAX_TRIES" ]; then
+      UNMEASURED=$((UNMEASURED + 1))
+      echo "  [未実測] ${label}: ${MAX_TRIES} 回とも #2741 で項目 115 まで届かなかった"
+      return 1
+    fi
+    try=$((try + 1))
+  done
 }
 
 for run in $RUNS; do
   case "$run" in
     legacy)
       echo "--- 旧（TAKO_2727_LEGACY=1 = pin しない）"
-      run_one "$run" stop TAKO_2727_LEGACY=1
-      measured "$run" || continue
-      early_stop "$run" && continue
+      run_arm "$run" stop TAKO_2727_LEGACY=1 || continue
       check "$(failed_with "115: チャット本文が描かれる")" \
         "旧: 項目 115 の「チャット本文が描かれる」で FAILED = 修正前の再現"
       check "$(has "legacy=true targets_include_fixture=true kept=false")" \
@@ -196,8 +234,7 @@ for run in $RUNS; do
       i=1
       while [ "$i" -le "$OK_RUNS" ]; do
         echo "--- 新（${i}/${OK_RUNS}）"
-        run_one "ok$i" stop
-        if measured "ok$i" && ! early_stop "ok$i"; then
+        if run_arm "ok$i" stop; then
           check "$(passed_115)" "新 ${i}/${OK_RUNS}: 項目 115 を通る"
           check "$(has "legacy=false targets_include_fixture=false kept=true")" \
             "新 ${i}/${OK_RUNS}: 定期更新の 1 周はこのペインを読みに行かず、会話が残る"
@@ -207,9 +244,7 @@ for run in $RUNS; do
       ;;
     full)
       echo "--- 新（最後まで）"
-      run_one full full
-      measured "$run" || continue
-      early_stop "$run" && continue
+      run_arm full full || continue
       check "$(passed_115)" "最後まで: 項目 115 を通る"
       check "$(grep -q "^TAKO_APP_SELF_TEST_OK" "$RUN_LOG" && echo 1)" "最後まで: TAKO_APP_SELF_TEST_OK"
       check "$(not "$(failed_any)")" "最後まで: FAILED が無い"
@@ -222,5 +257,5 @@ for run in $RUNS; do
 done
 
 echo
-echo "PASS=$PASS FAIL=$FAIL 未実測=$UNMEASURED"
+echo "PASS=$PASS FAIL=$FAIL 未実測=$UNMEASURED #2741 で手前で止まった回=${N2741}（NG に数えない）"
 [ "$FAIL" -eq 0 ] && [ "$UNMEASURED" -eq 0 ]
