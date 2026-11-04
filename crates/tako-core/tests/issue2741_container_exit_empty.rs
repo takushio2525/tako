@@ -432,11 +432,8 @@ mod e2e {
             outcome(&mut second, &mut rx2, Duration::from_secs(10)),
             Some(true)
         );
-        let killed = tako_core::tmux::tmux_command(Some(&server.0))
-            .arg("kill-server")
-            .output()
-            .expect("kill-server を起こせる");
-        assert!(killed.status.success(), "{killed:?}");
+        // ソケットファイルまで消す 1 実装で落とす（#2393。落ちたことは次の待ちで確かめる）
+        tako_core::tmux_backend::kill_server(&server.0);
         assert!(
             wait_exit(&mut second, &mut rx2, Duration::from_secs(10)),
             "サーバーが落ちるとクライアントも終わる"
