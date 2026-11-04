@@ -173,11 +173,13 @@ fn all(s: &Sources) -> Vec<String> {
     match fn_window(&s.cli, "fn remote_status()") {
         None => push(CLI, 0, "`remote_status` が無い（走査の空振り）"),
         Some((at, w)) => {
-            if code_line(at, &w, "status[\"starting\"][\"detail\"]").is_none() {
+            // 1 行は `starting` の欄から表示言語で組む（#2365。日本語は応答の `starting.detail` とバイト一致）
+            if code_line(at, &w, "detail_of_status_in(&status[\"starting\"]").is_none() {
                 push(
                     CLI,
                     at,
-                    "`tako remote status` が起こしている途中の 1 行（`starting.detail`）を stderr に出していない（#2608）",
+                    "`tako remote status` が起こしている途中の 1 行（`starting` の欄 = \
+                     `remote_starting::detail_of_status_in`）を stderr に出していない（#2608）",
                 );
             }
         }
@@ -281,8 +283,8 @@ fn 修正前の形へ戻すと名指しする() {
         remote: base.remote.clone(),
         cli: inject(
             &base.cli,
-            "if let Some(detail) = status[\"starting\"][\"detail\"].as_str() {",
-            "if let Some(detail) = None::<&str> {",
+            "tako_control::remote_starting::detail_of_status_in(&status[\"starting\"], lang)",
+            "None::<String>",
             "CLI が出さない",
         ),
     };

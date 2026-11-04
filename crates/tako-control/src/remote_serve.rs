@@ -405,13 +405,7 @@ pub fn status_fields(health: Option<&ServeHealth>, now: u64, interval_secs: u64)
         out["serve_handle"] = json!(v);
     }
     let degraded = if stale {
-        Some((
-            format!(
-                "serve 設定の自己検査が {age} 秒前から更新されていません\
-                 （daemon の検査スレッドが止まっている可能性）"
-            ),
-            "`tako remote stop && tako remote start` で立て直してください".to_string(),
-        ))
+        Some(stale_degraded_in(age, tako_core::i18n::Lang::Ja))
     } else if !h.ok {
         h.reason
             .clone()
@@ -425,18 +419,56 @@ pub fn status_fields(health: Option<&ServeHealth>, now: u64, interval_secs: u64)
     out
 }
 
+/// 自己検査が止まっている（結果が古い）ときの理由と次の一手（status の `degraded` には日本語を載せる）。
+/// (言語) の網羅 match で、日本語は #2365 より前の固定文とバイト一致
+fn stale_degraded_in(age: u64, lang: tako_core::i18n::Lang) -> (String, String) {
+    use tako_core::i18n::Lang::{En, Ja};
+    match lang {
+        Ja => (
+            format!(
+                "serve 設定の自己検査が {age} 秒前から更新されていません\
+                 （daemon の検査スレッドが止まっている可能性）"
+            ),
+            "`tako remote stop && tako remote start` で立て直してください".to_string(),
+        ),
+        En => (
+            format!(
+                "the serve self-check has not been updated for {age} s \
+                 (the daemon's check thread may have stopped)"
+            ),
+            "rebuild it with `tako remote stop && tako remote start`".to_string(),
+        ),
+    }
+}
+
 /// 劣化していれば warnings に載せる 1 行（GUI のリモートカードにも出る）
 pub fn degraded_warning(fields: &Value) -> Option<String> {
     degraded_warning_in(fields, tako_core::i18n::Lang::Ja)
 }
 
-/// [`degraded_warning`] の枠を表示言語で（`tako check-health` / `tako setup --check` の remote の行。#2365）。
-/// 理由と次の一手は daemon が自己検査で書いた文をそのまま載せる
+/// [`degraded_warning`] を表示言語で（`tako check-health` / `tako setup --check` / `tako remote status` の
+/// remote の行。#2365）。理由と次の一手は daemon が自己検査で書いた文をそのまま載せる。自己検査が止まって
+/// いる（`serve_state` が `stale`）ときだけは、この status を組んだ側の文なので、同じ欄の経過
+/// （`serve_checked_age_secs`）から表示言語で組み直す（応答の `degraded` は日本語のまま）
 pub fn degraded_warning_in(fields: &Value, lang: tako_core::i18n::Lang) -> Option<String> {
     use tako_core::i18n::Lang::{En, Ja};
     let d = fields.get("degraded")?;
-    let reason = d.get("reason").and_then(|v| v.as_str()).unwrap_or("");
-    let next = d.get("next_step").and_then(|v| v.as_str()).unwrap_or("");
+    let rebuilt = match (
+        fields.get("serve_state"),
+        fields.get("serve_checked_age_secs"),
+    ) {
+        (Some(state), Some(age)) if state == "stale" => {
+            age.as_u64().map(|age| stale_degraded_in(age, lang))
+        }
+        _ => None,
+    };
+    let (reason, next) = match &rebuilt {
+        Some((reason, next)) => (reason.as_str(), next.as_str()),
+        None => (
+            d.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
+            d.get("next_step").and_then(|v| v.as_str()).unwrap_or(""),
+        ),
+    };
     if reason.is_empty() {
         return None;
     }

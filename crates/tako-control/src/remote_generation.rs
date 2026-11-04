@@ -232,20 +232,60 @@ pub fn judge(recorded: Option<&ExeStamp>, started_at: Option<u64>, now: &Observe
     }
 }
 
-/// 旧版のまま動いているときの説明（status の `serve_generation.detail` と `warnings` の 1 行）
+/// 旧版のまま動いているときの説明（status の `serve_generation.detail` と `warnings` の 1 行。日本語）
 pub fn stale_detail(generation: Generation, binary: &str, pid: u32) -> Option<String> {
-    match generation {
-        Generation::Replaced(_) => Some(format!(
+    stale_detail_in(generation, binary, pid, tako_core::i18n::Lang::Ja)
+}
+
+/// [`stale_detail`] を表示言語で（CLI の `tako remote status` の stderr の 1 行。#2365）。
+/// (世代, 言語) の網羅 match で、日本語は [`stale_detail`] とバイト一致
+pub fn stale_detail_in(
+    generation: Generation,
+    binary: &str,
+    pid: u32,
+    lang: tako_core::i18n::Lang,
+) -> Option<String> {
+    use tako_core::i18n::Lang::{En, Ja};
+    match (generation, lang) {
+        (Generation::Replaced(_), Ja) => Some(format!(
             "稼働中のリモート daemon（PID {pid}）は旧版のまま動いています: \
              {binary} は daemon の起動後に差し替えられました。\
              `tako remote start` で新版へ入れ替わります（GUI を起動したときは自動で入れ替わります）"
         )),
-        Generation::Missing => Some(format!(
+        (Generation::Replaced(_), En) => Some(format!(
+            "the running remote daemon (PID {pid}) is still the old version: \
+             {binary} was replaced after the daemon started. \
+             `tako remote start` swaps it for the new version (launching the GUI swaps it automatically)"
+        )),
+        (Generation::Missing, Ja) => Some(format!(
             "稼働中のリモート daemon（PID {pid}）の実行ファイル {binary} がもうありません。\
              tako を入れ直してから `tako remote start` で入れ替えてください"
         )),
-        Generation::Current(_) | Generation::Unknown => None,
+        (Generation::Missing, En) => Some(format!(
+            "the executable {binary} of the running remote daemon (PID {pid}) no longer exists. \
+             Reinstall tako, then swap the daemon with `tako remote start`"
+        )),
+        (Generation::Current(_) | Generation::Unknown, _) => None,
     }
+}
+
+/// status の応答（`serve_generation.state` / `pid` / `serve_binary`）から [`stale_detail_in`] を組み直す（#2365）。
+///
+/// 応答の `serve_generation.detail` は日本語のまま変えないので、CLI の英語の表示は同じ応答の構造から組む。
+/// 材料は `daemon_status` が `detail` を組んだときと同じ値（`pid` = PID ファイルの pid・`serve_binary` =
+/// PID ファイルの実行ファイル）なので、日本語は応答の `detail` とバイト一致。旧版でなければ `None`
+pub fn detail_of_status_in(
+    status: &serde_json::Value,
+    lang: tako_core::i18n::Lang,
+) -> Option<String> {
+    // 根拠（`basis`）は文に出ないので、どちらで判定した旧版でも同じ文になる
+    let state = status["serve_generation"]["state"].as_str()?;
+    let generation = [Generation::Replaced(Basis::Stamp), Generation::Missing]
+        .into_iter()
+        .find(|g| g.tag() == state)?;
+    let pid = u32::try_from(status["pid"].as_u64()?).ok()?;
+    let binary = status["serve_binary"].as_str().unwrap_or_default();
+    stale_detail_in(generation, binary, pid, lang)
 }
 
 /// `tako remote status` / MCP `tako_remote_status` に載せる `serve_generation`（純関数）。
