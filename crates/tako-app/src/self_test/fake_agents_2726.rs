@@ -355,25 +355,27 @@ mod tests {
 
     #[test]
     fn 偽物の置き場の実行ファイルだけを偽物と読む() {
-        let bin = Path::new("/tmp/tako-st2726-agents-1/bin");
-        assert_eq!(
-            resolution(Some("/tmp/tako-st2726-agents-1/bin/codex"), bin),
-            Resolution::Fake
-        );
-        // 本物の CLI・alias・相対の答え・見つからないは押さない
+        // 置き場はその OS の絶対パスで組む（`/tmp/…` は Windows では絶対パスにならない）
+        let dir = tako_core::test_residue::ScratchDir::new("st2726-fake-bin");
+        let bin = dir.path().join("bin");
+        let fake = bin.join("codex").display().to_string();
+        assert_eq!(resolution(Some(&fake), &bin), Resolution::Fake);
+        // 本物の CLI（置き場の外）・alias・相対の答え・見つからないは押さない
+        let elsewhere = dir.path().join("real").join("codex").display().to_string();
         for other in [
+            elsewhere.as_str(),
             "/home/testuser/.local/bin/codex",
             "alias codex='codex --x'",
             "bin/codex",
         ] {
             assert_eq!(
-                resolution(Some(other), bin),
+                resolution(Some(other), &bin),
                 Resolution::Other(other.to_string()),
                 "{other}"
             );
         }
-        assert_eq!(resolution(Some("  "), bin), Resolution::Missing);
-        assert_eq!(resolution(None, bin), Resolution::Missing);
+        assert_eq!(resolution(Some("  "), &bin), Resolution::Missing);
+        assert_eq!(resolution(None, &bin), Resolution::Missing);
     }
 
     #[test]
@@ -393,9 +395,14 @@ mod tests {
 
     #[test]
     fn pathの先頭へ置き元の並びは保つ() {
+        // 区切り（unix は `:`・Windows は `;`）は OS のものを使う
+        let path_of = |dirs: &[&str]| std::env::join_paths(dirs).unwrap();
         let bin = Path::new("/tmp/fake/bin");
-        let joined = prepend_path(bin, Some(OsStr::new("/usr/bin:/tmp/fake/bin:/bin"))).unwrap();
-        assert_eq!(joined, OsString::from("/tmp/fake/bin:/usr/bin:/bin"));
+        let joined = prepend_path(bin, Some(&path_of(&["/usr/bin", "/tmp/fake/bin", "/bin"])));
+        assert_eq!(
+            joined.unwrap(),
+            path_of(&["/tmp/fake/bin", "/usr/bin", "/bin"])
+        );
         assert_eq!(
             prepend_path(bin, None).unwrap(),
             OsString::from("/tmp/fake/bin")
