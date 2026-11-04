@@ -69,6 +69,35 @@ pub(crate) fn legacy_2016() -> bool {
     *LEGACY.get_or_init(|| std::env::var("TAKO_2016_LEGACY").map(|v| v == "1") == Ok(true))
 }
 
+/// **#2721 の注入口**（visual-test のビルドの、検証プロセスの門の内側でだけ読む）。
+/// `TAKO_2721_INJECT` を `,` で区切った `<名前>[:<ms>]` の並びから `name` の ms を返す
+/// （`:<ms>` を省いたら 0）。送信のハンドラが読むのは回帰の模型の 2 つ:
+///
+/// - `heavy:<ms>` = ハンドラの中で眠る（送信が押下を重くした回帰）
+/// - `defer:<ms>` = 同じ update の後段（`cx.defer`）で眠る（重い処理がハンドラの外へ移った回帰）
+///
+/// 計測の揺れの側（`replay` / `preempt`）は visual-test の tasks-input が読む
+#[cfg(feature = "visual-test")]
+pub(crate) fn inject_2721(name: &str) -> Option<f64> {
+    // 門は inject_2721_spec の側（外では空 = どの名前にも当たらない）
+    inject_2721_spec()
+        .split(',')
+        .map(str::trim)
+        .find_map(|part| {
+            let (key, ms) = part.split_once(':').unwrap_or((part, ""));
+            (key == name).then(|| ms.parse().unwrap_or(0.0))
+        })
+}
+
+/// `TAKO_2721_INJECT` の生の値（検証プロセスの門の外では空。visual-test の観測の行へ出す）
+#[cfg(feature = "visual-test")]
+pub(crate) fn inject_2721_spec() -> String {
+    if !tako_core::paths::is_verification_process() {
+        return String::new();
+    }
+    std::env::var("TAKO_2721_INJECT").unwrap_or_default()
+}
+
 /// 返答欄の 1 行の高さ（#2016。欄の高さの上限をこの倍数で決める）
 pub(crate) const COMMENT_LINE_H: f32 = 16.0;
 /// 返答欄が行数ぶん伸びる上限（#2016）。超えたら欄の中でスクロールする
@@ -901,6 +930,17 @@ impl TakoApp {
         self.user_tasks.notice = None;
         cx.notify();
         self.pump_user_task_sends(cx);
+        // #2721 の回帰の模型（visual-test の検証プロセスだけ。本番のビルドには入らない）
+        #[cfg(feature = "visual-test")]
+        {
+            let nap = |ms: f64| std::thread::sleep(std::time::Duration::from_secs_f64(ms / 1000.0));
+            if let Some(ms) = inject_2721("heavy") {
+                nap(ms);
+            }
+            if let Some(ms) = inject_2721("defer") {
+                cx.defer(move |_| nap(ms));
+            }
+        }
     }
 
     /// 待っている返答を**1 本ずつ順に**積みに出す（#2016）。

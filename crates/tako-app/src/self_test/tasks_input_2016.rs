@@ -16,7 +16,10 @@
 //!    （5 回の中央値）と、やりとりに載るまでの時間。送信の費用は送信ごとに直前の空押しとの差を
 //!    採ってその中央値で見て、測る間は App Nap を止める（#2711。隔離 GUI は前面に出ないので
 //!    測定の途中で間引かれていた。A/B `TAKO_2711_LEGACY=tasks-input`・段差の注入
-//!    `TAKO_2711_INJECT=step`）
+//!    `TAKO_2711_INJECT=step`）。判定は押下が返った時点の状態と**配送そのもの**（`dispatch_event`
+//!    の内側）の差で見て、区間全体の差は静かな回だけ見る（#2721。区間全体は visual-test のビルドだけの
+//!    同期の描き直し約 48 ms を含み、機が混むと揺れる。規則は [`crate::send_lag_2721`]・A/B
+//!    `TAKO_2721_LEGACY=1`・注入 `TAKO_2721_INJECT=replay|preempt[:ms]|heavy:ms|defer:ms`）
 //! 5. 履歴: やりとりが古い順・経路 pc で積まれ、`show`（= `tako todo show` / MCP）と同じか
 //! 6. エッジ: 本文なしの返答 / 送信中にパネルを閉じる / 積めなかったら欄へ戻して理由を出す
 //!
@@ -26,6 +29,7 @@
 //! 単独実行は `TAKO_VISUAL_ONLY=tasks-input`
 
 use super::*;
+use crate::send_lag_2721::{judge, LagForm, Observed};
 use std::ffi::c_void;
 
 const SECTION: &str = "tasks-input";
@@ -297,6 +301,82 @@ fn contains(outer: Bounds<Pixels>, inner: Bounds<Pixels>, slack: f32) -> bool {
 fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+}
+
+/// #2721 の `replay`: 落ちた回（load 17.04）の区間全体の超過ぶん（観測 − 静かな機の約 48 ms）。
+/// k 回目の空押し / 送信の区間全体へ、配送の外で眠りとして再生する（負荷は生成しない）
+const REPLAY_2721_IDLE: [f64; 5] = [8.5, 255.4, 277.9, 178.8, 114.7];
+const REPLAY_2721_SEND: [f64; 5] = [81.4, 210.7, 145.9, 284.5, 184.2];
+
+/// #2721 の揺れの注入で、区間全体（配送の外）へ入れる眠りの ms
+fn outside_nap_2721(send: bool, k: usize) -> f64 {
+    if crate::tasks_panel::inject_2721("replay").is_none() {
+        return 0.0;
+    }
+    if send {
+        REPLAY_2721_SEND[k % 5]
+    } else {
+        REPLAY_2721_IDLE[k % 5]
+    }
+}
+
+/// #2721 の `preempt[:ms]`: 配送そのものの区間へ時々割り込む（2 回目の送信と 4 回目の空押しで
+/// ms 眠る。既定 100 ms = 機が混んだ回の割り込みが短い区間にもたまに当たる形）
+fn inside_nap_2721(send: bool, k: usize) -> f64 {
+    let Some(ms) = crate::tasks_panel::inject_2721("preempt") else {
+        return 0.0;
+    };
+    match (send, k) {
+        (true, 1) | (false, 3) if ms > 0.0 => ms,
+        (true, 1) | (false, 3) => 100.0,
+        _ => 0.0,
+    }
+}
+
+fn nap(ms: f64) {
+    if ms > 0.0 {
+        std::thread::sleep(std::time::Duration::from_secs_f64(ms / 1000.0));
+    }
+}
+
+/// `pos` を実マウスと同じ手順で押す（MouseDown → MouseUp）。返り値は（区間全体, 配送そのもの）の ms。
+/// 区間全体は update 1 回ずつで、visual-test のビルドでは後段の同期の描き直しを含む（#2721）。
+/// 配送そのものは `dispatch_event` の内側 = 押下のハンドラだけ。`outside` は区間全体の中・配送の外へ、
+/// `inside` は 1 つ目の配送の中へ入れる注入の眠り
+fn click_timed(
+    any: AnyWindowHandle,
+    cx: &mut AsyncApp,
+    pos: gpui::Point<Pixels>,
+    outside: f64,
+    inside: f64,
+) -> (f64, f64) {
+    let t = std::time::Instant::now();
+    nap(outside);
+    let mut dispatch_ms = 0.0;
+    let mut inside = inside;
+    for input in [
+        gpui::PlatformInput::MouseDown(MouseDownEvent {
+            button: MouseButton::Left,
+            position: pos,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        }),
+        gpui::PlatformInput::MouseUp(MouseUpEvent {
+            button: MouseButton::Left,
+            position: pos,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        }),
+    ] {
+        let _ = any.update(cx, |_, win, cx| {
+            let td = std::time::Instant::now();
+            nap(std::mem::take(&mut inside));
+            win.dispatch_event(input, cx);
+            dispatch_ms += td.elapsed().as_secs_f64() * 1000.0;
+        });
+    }
+    (t.elapsed().as_secs_f64() * 1000.0, dispatch_ms)
 }
 
 /// 項目 `target` のやりとりの件数（一覧の写しから読む）
@@ -672,12 +752,18 @@ pub(super) async fn tasks_input_visual(
     };
     let legacy2711 = legacy_2711("tasks-input");
     let step2711 = inject_2711() == "step";
+    // 判定の形（#2721。A/B は #2711 の形・その前の形）
+    let form = if legacy2711 {
+        LagForm::Legacy2711
+    } else if std::env::var("TAKO_2721_LEGACY").is_ok_and(|v| v == "1") {
+        LagForm::Legacy2721
+    } else {
+        LagForm::Current
+    };
     // 送信ごとの直前の空押し（旧は 1 回目に 1 度だけ）。`stepped` は注入の段差が入った後か
-    let mut idle_ms = Vec::new();
+    let mut observed = Observed::default();
     let mut idle_disturbed = false;
     let mut stepped = false;
-    let mut pending_shown = true;
-    let mut in_handler = Vec::new();
     let mut to_empty = Vec::new();
     let mut to_listed = Vec::new();
     let mut empty_every_time = true;
@@ -729,31 +815,24 @@ pub(super) async fn tasks_input_visual(
                     (open, comment(cx))
                 };
                 let before_idle = state_of(cx);
-                let t = std::time::Instant::now();
-                if stepped {
-                    std::thread::sleep(INJECT_2711_STEP);
-                }
-                for input in [
-                    gpui::PlatformInput::MouseDown(MouseDownEvent {
-                        button: MouseButton::Left,
-                        position: idle,
-                        modifiers: Modifiers::default(),
-                        click_count: 1,
-                        first_mouse: false,
-                    }),
-                    gpui::PlatformInput::MouseUp(MouseUpEvent {
-                        button: MouseButton::Left,
-                        position: idle,
-                        modifiers: Modifiers::default(),
-                        click_count: 1,
-                    }),
-                ] {
-                    let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
-                }
-                let ms = t.elapsed().as_secs_f64() * 1000.0;
-                idle_ms.push(ms);
+                let step = if stepped {
+                    INJECT_2711_STEP.as_secs_f64() * 1000.0
+                } else {
+                    0.0
+                };
+                let (ms, dispatch) = click_timed(
+                    any,
+                    cx,
+                    idle,
+                    step + outside_nap_2721(false, k),
+                    inside_nap_2721(false, k),
+                );
+                observed.idle_total.push(ms);
+                observed.idle_dispatch.push(dispatch);
                 stepped = step2711;
-                say(format!("baseline k={k} idle_click_handler_ms={ms:.1}"));
+                say(format!(
+                    "baseline k={k} idle_total_ms={ms:.1} idle_dispatch_ms={dispatch:.1}"
+                ));
                 // 空押しが何かに当たって状態を変えたら、基準として使えない（判定で名指しして落とす）
                 if state_of(cx) != before_idle {
                     idle_disturbed = true;
@@ -774,28 +853,21 @@ pub(super) async fn tasks_input_visual(
                 notify_and_draw(any, window, cx);
             }
             let t0 = std::time::Instant::now();
-            if stepped {
-                std::thread::sleep(INJECT_2711_STEP);
-            }
-            for input in [
-                gpui::PlatformInput::MouseDown(MouseDownEvent {
-                    button: MouseButton::Left,
-                    position: pos,
-                    modifiers: Modifiers::default(),
-                    click_count: 1,
-                    first_mouse: false,
-                }),
-                gpui::PlatformInput::MouseUp(MouseUpEvent {
-                    button: MouseButton::Left,
-                    position: pos,
-                    modifiers: Modifiers::default(),
-                    click_count: 1,
-                }),
-            ] {
-                let _ = any.update(cx, |_, win, cx| win.dispatch_event(input, cx));
-            }
-            // 押したハンドラが UI スレッドを握っていた時間（往復を待っていればここに乗る）
-            in_handler.push(t0.elapsed().as_secs_f64() * 1000.0);
+            let step = if stepped {
+                INJECT_2711_STEP.as_secs_f64() * 1000.0
+            } else {
+                0.0
+            };
+            let (ms, dispatch) = click_timed(
+                any,
+                cx,
+                pos,
+                step + outside_nap_2721(true, k),
+                inside_nap_2721(true, k),
+            );
+            // 押したハンドラが UI スレッドを握っていた時間（往復を待っていれば配送そのものに乗る）
+            observed.send_total.push(ms);
+            observed.send_dispatch.push(dispatch);
             // 修正後は返した中身が「送信中」として残る（欄を先に空にしても消えたように見せない）。
             // 旧実装は押した中で積み終えるので、この時点でもう一覧に載っている
             let (sending_now, listed_now) = window
@@ -812,7 +884,9 @@ pub(super) async fn tasks_input_visual(
                     )
                 })
                 .unwrap_or((false, 0));
-            pending_shown &= sending_now || listed_now > before;
+            observed
+                .at_return
+                .push((sending_now, listed_now.saturating_sub(before)));
             // 押した次のフレーム（欄が空なら、このフレームに空が描かれる）
             notify_and_draw(any, window, cx);
             let frame_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -830,32 +904,30 @@ pub(super) async fn tasks_input_visual(
             to_listed.push(listed);
         }
     }
-    let handler_ms = median(&mut in_handler.clone());
     let empty_ms = median(&mut to_empty.clone());
     let listed_ms = median(&mut to_listed.clone());
-    // 送信が押下に足す時間 = 送信ごとの（送信 − 直前の空押し）の中央値（#2711）。旧は
-    // （送信 5 回の中央値 − 1 回目の空押し）
-    let (send_cost_ms, cost_basis) = if legacy2711 {
-        let baseline_ms = idle_ms.first().copied().unwrap_or(f64::NAN);
-        (
-            handler_ms - baseline_ms,
-            "送信の中央値 − 1 回目の空押し（旧 #2711）",
-        )
-    } else {
-        let mut paired: Vec<f64> = in_handler
-            .iter()
-            .zip(&idle_ms)
-            .map(|(s, i)| s - i)
-            .collect();
-        (median(&mut paired), "送信ごとに直前の空押しとの差の中央値")
-    };
+    // 送信が押下に足す時間（規則は send_lag_2721）
+    let lag = judge(&observed, form);
     say(format!(
-        "send handler_ms={in_handler:.1?} median={handler_ms:.1} idle_ms={idle_ms:.1?} \
-         send_cost_ms={send_cost_ms:.1} basis={cost_basis} app_nap_held={} inject_step={step2711} \
-         idle_disturbed={idle_disturbed} pending_or_listed_at_once={pending_shown} \
+        "send total_ms={:.1?} idle_total_ms={:.1?} dispatch_ms={:.1?} idle_dispatch_ms={:.1?} \
+         at_return(sending,listed)={:?} form={form:?} state_ok={} handler_cost_ms={:.1} \
+         total_cost_ms={:.1} idle_spread_ms={:.1} total_judged={} time_ok={} app_nap_held={} \
+         inject_step={step2711} inject={:?} idle_disturbed={idle_disturbed} \
          click->empty_frame_ms={to_empty:.1?} median={empty_ms:.1} \
          click->listed_ms={to_listed:.1?} median={listed_ms:.1} empty_every_time={empty_every_time}",
-        !legacy2711
+        observed.send_total,
+        observed.idle_total,
+        observed.send_dispatch,
+        observed.idle_dispatch,
+        observed.at_return,
+        lag.state_ok,
+        lag.handler_cost_ms,
+        lag.total_cost_ms,
+        lag.idle_spread_ms,
+        lag.total_judged,
+        lag.time_ok,
+        !legacy2711,
+        crate::tasks_panel::inject_2721_spec(),
     ));
     let _ = bring_into_view(cx, "tasks-send");
     redraw(cx);
@@ -865,12 +937,10 @@ pub(super) async fn tasks_input_visual(
     // 次のフレームで空 = 押した直後に描いたフレームが空で、**送信が押下に足す時間**（何もしない所を
     // 同じ手順で押したときとの差）が 1 フレームの半分（8 ms）未満。押下そのものの配送の費用は
     // ビルド（debug / release）と画面の重さで変わるので差で見る。旧実装はハンドラが往復
-    // （積む → 運ぶ → 記録 → 一覧）を握るので、その間ぶん差が開く
+    // （積む → 運ぶ → 記録 → 一覧）を握るので、その間ぶん差が開く（時間の規則は send_lag_2721）
     let lag_ok = empty_every_time
-        && pending_shown
         && !idle_disturbed
-        && send_cost_ms.is_finite()
-        && send_cost_ms < 8.0
+        && lag.time_ok
         && to_listed.iter().all(|v| v.is_finite());
 
     // =============================================================
@@ -1073,6 +1143,23 @@ pub(super) async fn tasks_input_visual(
     let _ = std::fs::remove_file(&store);
 
     // --- 判定（観測は上で全部出してある） ---
+    // 送信の間を先に見る（#2721。`check` は 1 つ目の失敗で止まるので、旧 #2016 の A/B でも送信の
+    // 回帰そのものを名指しする。どれが落ちるかは先に 1 行で全部出す）
+    say(format!(
+        "verdicts send_state={} send_lag={lag_ok} ime={ime_ok} wrap={wrap_ok} max={max_ok} \
+         history={history_ok} edge={}",
+        lag.state_ok,
+        bare_ok && closed_ok && burst_ok && restore_ok
+    ));
+    check(
+        lag.state_ok,
+        &format!(
+            "tasks-input [{arm}]: {}（押下ごとの（送信中, 一覧の増分）= {:?}）(#2016 / #2721)",
+            lag.state_rule(),
+            observed.at_return
+        ),
+    );
+    check(lag_ok, &format!("tasks-input [{arm}]: 押した次のフレームで欄が空になる（{}{} / 空のフレームまで {empty_ms:.1} ms）(#2016 / #2711 / #2721)", lag.time_text(), if idle_disturbed { "・基準の空押しが状態を変えた" } else { "" }));
     check(ime_ok, &format!("tasks-input [{arm}]: IME の変換中の読みが欄に描かれ、候補窓が欄のキャレットに出て、確定 / unmark が欄に入る (#2016)"));
     check(
         wrap_ok,
@@ -1084,7 +1171,6 @@ pub(super) async fn tasks_input_visual(
             "tasks-input [{arm}]: 欄は上限の行数で止まり、キャレットは欄の中に見えたまま (#2016)"
         ),
     );
-    check(lag_ok, &format!("tasks-input [{arm}]: 押した次のフレームで欄が空になる（送信が押下に足す時間 {send_cost_ms:.1} ms = {cost_basis}{} / 空のフレームまで {empty_ms:.1} ms）(#2016 / #2711)", if idle_disturbed { "・基準の空押しが状態を変えた" } else { "" }));
     check(
         history_ok,
         &format!("tasks-input [{arm}]: やりとりが古い順・経路 pc で積まれ show と同じ (#2016)"),
