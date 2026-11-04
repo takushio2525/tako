@@ -41005,6 +41005,13 @@ mod self_test {
         (!file.is_empty()).then(|| std::path::PathBuf::from(file))
     }
 
+    /// **#2727 の A/B**（項目 115 の会話の守り）。`TAKO_2727_LEGACY=1` = 修正前の「注入した会話を
+    /// `pin_chat_fixture` で守らない」へ戻す。項目 115 は定期更新をその場で 1 周回すので、旧の腕は
+    /// 決定的に「チャット本文が描かれる」で落ちる（時間の注入は要らない）
+    fn legacy_2727() -> bool {
+        std::env::var("TAKO_2727_LEGACY").as_deref() == Ok("1")
+    }
+
     /// **#2711 の A/B**（visual-test 項目 152 のバッジ・tasks-input の送信の間）。
     /// `TAKO_2711_LEGACY=1` / `all` で両方、`152` / `tasks-input`（カンマ区切り）で片方だけ修正前へ戻す
     /// （`check` は 1 つ目の失敗でプロセスごと止まるので、全節実行で後ろの tasks-input の旧の形を
@@ -86058,20 +86065,32 @@ mod self_test {
                 //     `tako master` を起こし、それが本物の claude を exec する（項目 93(d1) /
                 //     97(d) と同じ作法で、積まれた行そのものを見て同じ update の中で取り下げる。
                 //     組んだ行が実際に実行される形であることは項目 93(d2) が `--version` で見る）。
+                // 選ぶ直前のペインの様子も控える（#2727 段 1: 混んだ機で `selected=false` = 選んだ時点で
+                // そのペインのシェルが無かった回があり、閉じたのかシェルだけが無いのかを次に名指すため）
                 // #967 と同型: 期待値は**製品が組む行**から作る（`tako master -<name>` の
                 // リテラルは Windows で成立しない。実体は `…\tako.exe master -<name>`）
                 let master_line = starter::starter_subcommand(StarterAction::Master, Some(probe))
                     .map(|sub| tako_control::welcome::launch_command_line(&sub))
                     .unwrap_or_default();
-                let (selected, queued739) = window
+                let (selected, queued739, pane_before) = window
                     .update(cx, |app, _, cx| {
+                        let before = format!(
+                            "shell={} in_tree={} backend={:?} display={:?} state={:?}",
+                            app.terminals.contains_key(&starter_pane),
+                            app.workspace.find_tab_of_pane(starter_pane).is_some(),
+                            app.backend_sessions.get(&starter_pane),
+                            app.pane_display_for(starter_pane),
+                            app.terminals
+                                .get(&starter_pane)
+                                .map(|s| s.command_state()),
+                        );
                         let selected = app.starter_action_with_profile(
                             starter_pane,
                             StarterAction::Master,
                             Some(probe),
                             cx,
                         );
-                        (selected, withdraw_launch(app, starter_pane))
+                        (selected, withdraw_launch(app, starter_pane), before)
                     })
                     .unwrap_or_default();
                 let delivered = !master_line.is_empty() && queued739 == [master_line.clone()];
@@ -86081,7 +86100,8 @@ mod self_test {
                     .unwrap_or(false);
                 println!(
                     "TAKO_SELF_TEST_739_LAUNCH: opened={opened} selected={selected} \
-                     delivered={delivered} closed={closed} line={:?} queued={queued739:?}",
+                     delivered={delivered} closed={closed} line={:?} queued={queued739:?} \
+                     pane_before=[{pane_before}]",
                     starter::starter_subcommand(StarterAction::Master, Some(probe)),
                 );
                 check(
@@ -91358,17 +91378,62 @@ mod self_test {
                                 ..Default::default()
                             }),
                         );
+                        // #2727: 注入した会話を 2 秒 tick の定期更新から守る（#853 と同じ口。同じ
+                        // ペインへ後で入れ直す新着の会話も、このペインの pin で守られる）
+                        if !legacy_2727() {
+                            app.pin_chat_fixture(pane);
+                        }
                         let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
                         cx.notify();
                         pane
                     })
                     .unwrap_or_else(|_| fail("115: チャットペインを用意できない (#830)"));
-                // 実描画されるまで回す（`TextLayout` は描き終わらないと bounds を持たない）
+                // #2727: 定期更新を**ここで必ず 1 周**回す（項目 98 と同じ。tick が挟まるかを運に任せない）。
+                // 守っていないペインは、実 claude が動いていないので「チャットではない」と読まれ、
+                // `apply_chat_refresh` が注入した会話を消す。表示はスターターへ戻り、下の描画待ちが
+                // 上限で切れる（混んだ機で描き終わる前に tick が挟まった回に `display=Starter` で落ちていた）
+                let targets830 = window830
+                    .update(cx, |app: &mut TakoApp, _, _| app.collect_chat_targets())
+                    .unwrap_or_default();
+                let targets_fixture830 = targets830.iter().any(|t| t.pane() == pane830);
+                let refreshed830 = if targets830.is_empty() {
+                    Vec::new()
+                } else {
+                    cx.background_executor()
+                        .spawn(async move { chat_view::load_chat_refresh(targets830) })
+                        .await
+                };
+                let _ = window830.update(cx, |app: &mut TakoApp, _, _| {
+                    app.apply_chat_refresh(refreshed830)
+                });
+                let kept830 = window830
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.chat_panes.contains_key(&pane830)
+                    })
+                    .unwrap_or(false);
+                println!(
+                    "TAKO_SELF_TEST_2727_115: legacy={} targets_include_fixture={targets_fixture830} \
+                     kept={kept830}",
+                    legacy_2727()
+                );
+                // 守りが外れた回は描画待ちの上限と読み違えないよう先に名指す。旧の腕は修正前と同じく
+                // 下の「チャット本文が描かれる」で落ちる形のまま
+                if !legacy_2727() {
+                    check(
+                        kept830 && !targets_fixture830,
+                        &format!(
+                            "115: 定期更新が注入した会話を消さない (#2727 / #853。\
+                             targets_include_fixture={targets_fixture830} / kept={kept830})"
+                        ),
+                    );
+                }
+                // 実描画されるまで回す（`TextLayout` は描き終わらないと bounds を持たない）。
+                // 上限は機の混み具合で伸ばす（#2727。81 発話の初回の描画は混んだ機で重い）
                 let drawn830 = wait_for_preview_drawn(
                     any830,
                     window830,
                     cx,
-                    Duration::from_secs(10),
+                    state_wait_budget(Duration::from_secs(10), machine_busy()),
                     |app: &TakoApp| {
                         app.pane_display_for(pane830)
                             == tako_core::ui_mode::PaneDisplay::Chat
@@ -91382,7 +91447,12 @@ mod self_test {
                 if drawn830.is_none() {
                     let why = window830
                         .update(cx, |app: &mut TakoApp, _, _| {
-                            format!("display={:?}", app.pane_display_for(pane830))
+                            format!(
+                                "display={:?} chat_pane={} pinned={}",
+                                app.pane_display_for(pane830),
+                                app.chat_panes.contains_key(&pane830),
+                                app.chat_fixture_panes.contains(&pane830)
+                            )
                         })
                         .unwrap_or_default();
                     println!("TAKO_SELF_TEST_830_NOTDRAWN: pane={pane830:?} {why}");
@@ -110961,6 +111031,204 @@ mod chat_fixture_pin_watchdog {
         assert!(body_of(&pinned, "collect_chat_targets").contains("chat_fixture_panes"));
         // 番犬モジュール自身は走査から外れている（自分の文字列で素通りしない）
         assert!(!scanned(include_str!("main.rs")).contains("mod chat_fixture_pin_watchdog"));
+    }
+
+    /// `chat_panes` へ会話を入れる口と、守る口（`concat!` で分割 = 番犬自身の行が対象に入らない）
+    const CHAT_INSERT: &str = concat!("chat_panes", ".insert(");
+    const PIN: &str = concat!("pin_chat", "_fixture(");
+    /// 注入した会話の印（`ChatPaneState` の `session_id`）。この接頭辞の会話は実 claude の transcript ではない
+    const FIXTURE_IDS: &[&str] = &[concat!("\"self", "test-"), concat!("\"vis", "ual-")];
+    /// 逃げ道（その行か直前のコメント行に `tako:chat-fixture-ok <理由>`）
+    const FIXTURE_ALLOW: &str = concat!("tako:chat", "-fixture-ok");
+    /// 同じ同期区間で pin していない既存の注入（#2727 で洗い出した。範囲外の項目 = 直すときはここから外す）。
+    /// `selftest-725-*` は項目 98 で pin 済みの `chat_pane` への入れ直しなので実際には守られている
+    /// （この規則は session_id で見るのでペインまでは見分けない）。ほかは GUI モードで 2 秒 tick が
+    /// 割り込める = 実際に落ちうるかを項目ごとには確かめていない
+    const UNPINNED_KNOWN: &[&str] = &[
+        "visual-745",
+        "visual-737",
+        "selftest-702",
+        "selftest-702-alt",
+        "selftest-716",
+        "selftest-725-long",
+        "selftest-725-empty",
+        "selftest-725-scroll",
+        "selftest-737",
+    ];
+
+    /// 注入した会話を `chat_panes` へ入れた後、同じ同期区間（前後の `.await` の間 = tick が割り込めない区間）で
+    /// `pin_chat_fixture` を呼んでいない会話（最初に入れた行, session_id）。
+    ///
+    /// 項目 115（#830）は 81 発話の会話を入れてから描画を `.await` で待っていたが pin しておらず、
+    /// 待っている間に 2 秒 tick の定期更新が挟まると、実 claude が動いていないペインは「チャットではない」と
+    /// 読まれて `apply_chat_refresh` が会話を消し、表示がスターターへ戻って描画待ちが上限で切れた（#2727）。
+    ///
+    /// 見るのは session_id ごとの**最初の**注入だけ（同じ session_id の入れ直しは同じペインへの新着 =
+    /// 最初の pin で守られる、とみなす）。限界: 同じ session_id を別のペインへ入れる形は見逃す。
+    /// 同期区間は字面の `.await` で切る（`.await` を含まない待ちの補助は区間の外を見ない）
+    fn unpinned_fixture_inserts(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+        let code = |line: &str| {
+            let t = line.trim();
+            !t.is_empty() && !t.starts_with("//")
+        };
+        let marked = |line: &str| {
+            line.find(FIXTURE_ALLOW)
+                .is_some_and(|p| !line[p + FIXTURE_ALLOW.len()..].trim().is_empty())
+        };
+        let mut seen: Vec<String> = Vec::new();
+        let mut hits = Vec::new();
+        for (index, (number, line)) in lines.iter().enumerate() {
+            if !(code(line) && line.contains(CHAT_INSERT)) {
+                continue;
+            }
+            // 入れる値の中の session_id（入れ直しの `Rc::new(next)` は持たない = 対象外）
+            let Some(id) = lines[index..]
+                .iter()
+                .take(8)
+                .filter_map(|(_, l)| {
+                    let at = l.find("session_id: ")?;
+                    let rest = &l[at + "session_id: ".len()..];
+                    FIXTURE_IDS
+                        .iter()
+                        .any(|p| rest.starts_with(p))
+                        .then(|| rest.trim_start_matches('"').split('"').next().unwrap_or(""))
+                })
+                .next()
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id.clone());
+            let start = lines[..index]
+                .iter()
+                .rposition(|(_, l)| code(l) && l.contains(".await"))
+                .map_or(0, |i| i + 1);
+            let end = lines[index..]
+                .iter()
+                .position(|(_, l)| code(l) && l.contains(".await"))
+                .map_or(lines.len(), |i| index + i);
+            let pinned = lines[start..end]
+                .iter()
+                .any(|(_, l)| code(l) && l.contains(PIN));
+            let allowed = marked(line)
+                || lines[..index]
+                    .iter()
+                    .rev()
+                    .take_while(|(_, l)| l.trim_start().starts_with("//"))
+                    .any(|(_, l)| marked(l));
+            if !pinned && !allowed {
+                hits.push((*number, id));
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn 注入した会話は次のawaitまでにpinしている() {
+        use super::selftest_launch_withdraw_watchdog::self_test_region;
+        let mut found: Vec<(String, String)> =
+            unpinned_fixture_inserts(&self_test_region(scanned(include_str!("main.rs"))))
+                .into_iter()
+                .map(|(line, id)| (format!("crates/tako-app/src/main.rs:{line}"), id))
+                .collect();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/self_test");
+        for entry in std::fs::read_dir(&dir).expect("src/self_test").flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            let lines: Vec<(usize, &str)> =
+                src.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            found.extend(
+                unpinned_fixture_inserts(&lines)
+                    .into_iter()
+                    .map(|(line, id)| (format!("crates/tako-app/src/self_test/{name}:{line}"), id)),
+            );
+        }
+        let new: Vec<&(String, String)> = found
+            .iter()
+            .filter(|(_, id)| !UNPINNED_KNOWN.contains(&id.as_str()))
+            .collect();
+        assert!(
+            new.is_empty(),
+            "{new:?} が注入した会話を pin せずに `.await` を挟んでいる。待っている間に 2 秒 tick の定期更新が\
+             挟まると、実 claude が動いていないペインは「チャットではない」と読まれて会話が消え、表示が\
+             スターターへ戻る（#2727 / #853）。入れた update の中で `pin_chat_fixture(pane)` を呼ぶこと。\
+             意図して守らないなら、その行か直前のコメント行に `tako:chat-fixture-ok <理由>` を書く"
+        );
+        // 既知リストは縮むだけ（直した項目・消えた項目が残っていたら外させる）
+        let stale: Vec<&&str> = UNPINNED_KNOWN
+            .iter()
+            .filter(|id| !found.iter().any(|(_, f)| f == **id))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "{stale:?} はもう pin せずに `.await` を挟む形ではない（直った / 消えた）。UNPINNED_KNOWN から外すこと"
+        );
+    }
+
+    /// 検出力の担保: 修正前の項目 115 の形を名指し、同じ区間の pin・印・入れ直しは許す
+    #[test]
+    fn 番犬はpinしない注入を見逃さず同じ区間のpinと入れ直しは許す() {
+        let owned = |src: &str| -> Vec<(usize, String)> {
+            src.lines()
+                .enumerate()
+                .map(|(i, l)| (i + 1, l.to_string()))
+                .collect()
+        };
+        let hits = |src: &str| {
+            let lines = owned(src);
+            let borrowed: Vec<(usize, &str)> =
+                lines.iter().map(|(n, l)| (*n, l.as_str())).collect();
+            unpinned_fixture_inserts(&borrowed)
+        };
+        let insert = |id: &str| {
+            format!(
+                "            app.{}\n                pane,\n                Rc::new(ChatPaneState {{\n                    \
+                 session_id: \"{id}\".into(),\n                }}),\n            );",
+                CHAT_INSERT
+            )
+        };
+        let pin = format!("            app.{PIN}pane);");
+        let draw = "        let drawn = wait_for_preview_drawn(any, window, cx, budget, f).await;";
+        let id = concat!("self", "test-830");
+        // 修正前の項目 115（入れる → pin せずに描画を await で待つ）
+        let bad = format!("{}\n{draw}", insert(id));
+        assert_eq!(hits(&bad), vec![(1, id.to_string())]);
+        // 修正後（同じ update の中で pin = 次の await より前）
+        let good = format!("{}\n{pin}\n{draw}", insert(id));
+        assert!(hits(&good).is_empty());
+        // 前の await の後・入れる前の pin も同じ区間
+        let pin_first = format!("        x.await;\n{pin}\n{}\n{draw}", insert(id));
+        assert!(hits(&pin_first).is_empty());
+        // 次の await の後の pin は遅い（待っている間に消える）
+        let late = format!("{}\n{draw}\n{pin}", insert(id));
+        assert_eq!(hits(&late), vec![(1, id.to_string())]);
+        // 同じ session_id の入れ直し（新着）は最初の注入の pin で守られるとみなす
+        let reinsert = format!("{}\n{pin}\n{draw}\n{}\n{draw}", insert(id), insert(id));
+        assert!(hits(&reinsert).is_empty());
+        // 理由つきの印は外す・理由の無い印では外さない
+        let allow = concat!("tako:chat", "-fixture-ok");
+        let marked = format!(
+            "            // {allow} 待たずにその場で読む\n{}\n{draw}",
+            insert(id)
+        );
+        assert!(hits(&marked).is_empty());
+        let bare = format!("            // {allow}\n{}\n{draw}", insert(id));
+        assert_eq!(hits(&bare), vec![(2, id.to_string())]);
+        // 注入ではない入れ直し（session_id を持たない）と、実 claude の session は対象外
+        let update = format!("            app.{CHAT_INSERT}pane, Rc::new(next));\n{draw}");
+        assert!(hits(&update).is_empty());
+        assert!(hits(&format!("{}\n{draw}", insert("abc-real-session"))).is_empty());
     }
 }
 
