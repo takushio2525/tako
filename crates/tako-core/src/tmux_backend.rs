@@ -197,8 +197,9 @@ pub fn backend_conf(caps: &BackendCapabilities) -> String {
 
 /// いまの器へ書く設定の中身。
 ///
-/// A/B は `TAKO_974_LEGACY=1`（能力を無視して全部書く = #974 前の挙動）と
-/// `TAKO_2085_LEGACY=1`（自ら閉じたペインの最後の出力を書き出さない = #2085 前の挙動）
+/// A/B は `TAKO_974_LEGACY=1`（能力を無視して全部書く = #974 前の挙動）・
+/// `TAKO_2085_LEGACY=1`（自ら閉じたペインの最後の出力を書き出さない = #2085 前の挙動）・
+/// `TAKO_2741_LEGACY=1`（最後のセッションが消えたらサーバーも終わる = #2741 前の挙動）
 fn conf_body() -> String {
     let legacy = std::env::var("TAKO_974_LEGACY").is_ok_and(|v| v == "1");
     let caps = crate::backend::capabilities();
@@ -208,7 +209,46 @@ fn conf_body() -> String {
         pane_died_dir().as_deref(),
         issue2085_legacy(),
     ));
+    body.push_str(&exit_empty_conf(&caps, issue2741_legacy()));
     body
+}
+
+/// #2741 の A/B（`TAKO_2741_LEGACY=1`）。同一バイナリのまま修正前の器（最後のセッションが消えると
+/// サーバーも終わる = tmux の既定 `exit-empty on`）へ戻す。**ゲートはこの 1 か所**
+pub fn issue2741_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2741_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// 器のサーバーを、最後のセッションが消えても終わらせない設定（#2741。**純関数**）。
+///
+/// tmux の既定（`exit-empty on`）では、最後のセッションが消えるとサーバーは「終わる」と決め、
+/// プロセスが消えるまで待ち受けのソケットを開いたままにする。その間に器のペインのクライアント
+/// （[`wrap_options`] = `new-session -A -D`）が繋ぐと、connect は通るのに受け付けられず、
+/// サーバーが消えた時点で `server exited unexpectedly` で終わる。拒否（ECONNREFUSED）ではないので
+/// 新しいサーバーも起こさない = **作った直後の器のペインが即死する**（隔離セルフテストの項目 739 / 749 の
+/// 間欠。空いた機では隙間はマイクロ秒以下だが、混んだ機でサーバーの終わりが延びる）。
+/// `exit-empty off` ならサーバーは終わると決めないので、隙間そのものが無くなる。
+///
+/// - 書くのは器の conf だけ（[`ensure_conf`] を `-f` で読む器の起動と、走っているサーバーへの
+///   [`sync_conf`]）。利用者の tmux（`tako tmux open`）へは読ませない
+/// - **空のサーバーが残る**。本番は GUI の再起動をまたいで器を残す設計（FR-5）なので、最後の器の
+///   ペインを閉じた後は器のソケットごとに空のサーバーが 1 本残る（次のペインがそれを使う）。
+///   使い捨てのソケット（隔離 GUI・セルフテスト・テスト）は後片付けが kill-server まで落とす
+///   （`cleanup_process_scoped` / `TmuxTestGuard`）
+/// - A/B は tmux の既定の `on` を書く（走っているサーバーも [`sync_conf`] で戻る）
+/// - 能力の無い器（psmux = 未実測）へは 1 行も書かない（#974）
+pub fn exit_empty_conf(caps: &BackendCapabilities, legacy: bool) -> String {
+    if !caps.keeps_empty_server {
+        return String::new();
+    }
+    let value = if legacy { "on" } else { "off" };
+    format!("set -s exit-empty {value}\n")
 }
 
 /// 自ら閉じたペインの最後の出力の置き場（#2085。`<data_dir>/pane-died/`）
@@ -2998,322 +3038,6 @@ set -gq copy-mode-position-format ''
         assert!(
             !crate::tmux::has_session(Some(&socket), session),
             "attach 専用のクライアントが新しいセッションを作っていない"
-        );
-    }
-
-    /// #2741 の器のペインの中身（目印を出して入力を待つだけ）
-    #[cfg(unix)]
-    fn issue2741_base() -> SpawnOptions {
-        SpawnOptions {
-            command: Some(SpawnCommand {
-                program: "/bin/sh".into(),
-                args: vec!["-c".into(), "echo TAKO2741-READY; exec cat".into()],
-            }),
-            cwd: Some(std::env::temp_dir()),
-            env: vec![],
-            scrollback_lines: None,
-        }
-    }
-
-    /// #2741: 目印が出たら `Some(true)`、目印の前に子（器のクライアント）が終わったら `Some(false)`、
-    /// 上限まで何も無ければ `None`
-    #[cfg(unix)]
-    fn issue2741_outcome(
-        session: &mut crate::TerminalSession,
-        rx: &mut futures::channel::mpsc::UnboundedReceiver<crate::SessionEvent>,
-        limit: std::time::Duration,
-    ) -> Option<bool> {
-        let ready = |s: &crate::TerminalSession| {
-            s.visible_lines()
-                .iter()
-                .any(|l| l.contains("TAKO2741-READY"))
-        };
-        let deadline = std::time::Instant::now() + limit;
-        while std::time::Instant::now() < deadline {
-            while let Ok(event) = rx.try_recv() {
-                let exit = matches!(
-                    event,
-                    crate::SessionEvent::Term(crate::TermEvent::ChildExit(_))
-                );
-                session.process_event(event);
-                if ready(session) {
-                    return Some(true);
-                }
-                if exit {
-                    return Some(false);
-                }
-            }
-            if ready(session) {
-                return Some(true);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        None
-    }
-
-    /// #2741: 器のサーバーの pid（`display-message` で引く。セッションが要る）
-    #[cfg(unix)]
-    fn issue2741_server_pid(socket: &str, session: &str) -> Option<i32> {
-        let out = crate::tmux::tmux_command(Some(socket))
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                &crate::tmux::exact_target(session),
-                "#{pid}",
-            ])
-            .output()
-            .ok()?;
-        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
-    }
-
-    /// #2741: そのプロセスが居るか（器のサーバーは launchd の子なので waitpid ではなく kill 0 で見る）
-    #[cfg(unix)]
-    fn issue2741_alive(pid: i32) -> bool {
-        // SAFETY: シグナル 0 は送らずに存在だけを問う
-        unsafe { libc::kill(pid, 0) == 0 }
-    }
-
-    /// #2741 段 1 の切り分け（観測用・既定では回さない）: 器の最後のセッションを製品どおりに閉じた
-    /// （attach クライアントへ SIGHUP → 読み捨て → 閉じる = #2625、別スレッドで kill-session =
-    /// `drop_backend_session`）直後に次の器のペインを作ると、次のクライアントが終わり際のサーバーへ
-    /// 繋いで即死するかを、kill の開始からの間合い d ms を振って数える
-    #[test]
-    #[cfg(unix)]
-    #[ignore]
-    fn issue2741_最後の器を閉じた直後に作った器のペインが生きているか() {
-        use std::time::{Duration, Instant};
-        if !crate::tmux_test_gate::container() {
-            return;
-        }
-        let socket = format!("tako-coretest-2741-{}", std::process::id());
-        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
-        let base = issue2741_base();
-        let outcome = issue2741_outcome;
-        let server_alive = |socket: &str| {
-            crate::tmux::tmux_command(Some(socket))
-                .arg("list-sessions")
-                .output()
-                .is_ok_and(|o| o.status.success())
-        };
-        let env_u64 = |name: &str, default: u64| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default)
-        };
-        let rounds = env_u64("TAKO_2741_ROUNDS", 42);
-        let max_delay = env_u64("TAKO_2741_MAX_DELAY_MS", 20);
-        let mut alive = 0;
-        let mut unknown = 0;
-        let mut dead = Vec::new();
-        for i in 0..rounds {
-            let delay = i % (max_delay + 1);
-            let a = format!("tako-e2e-2741-a{i}");
-            let (mut first, mut rx1) =
-                crate::TerminalSession::spawn(80, 24, wrap_options(base.clone(), &socket, &a))
-                    .expect("A の器のクライアントを spawn できる");
-            first.hang_up_client_on_close();
-            assert_eq!(
-                outcome(&mut first, &mut rx1, Duration::from_secs(10)),
-                Some(true),
-                "A が立つ（周 {i}）"
-            );
-            // 製品の閉じ方: UI スレッドが端末を落とし（#2625）、別スレッドが kill-session
-            drop(first);
-            drop(rx1);
-            let killer = {
-                let socket = socket.clone();
-                std::thread::spawn(move || kill_session(&socket, &a))
-            };
-            std::thread::sleep(Duration::from_millis(delay));
-            let b = format!("tako-e2e-2741-b{i}");
-            let started = Instant::now();
-            let (mut second, mut rx2) =
-                crate::TerminalSession::spawn(80, 24, wrap_options(base.clone(), &socket, &b))
-                    .expect("B の器のクライアントを spawn できる");
-            second.hang_up_client_on_close();
-            let got = outcome(&mut second, &mut rx2, Duration::from_secs(10));
-            let elapsed = started.elapsed();
-            let _ = killer.join();
-            match got {
-                Some(true) => alive += 1,
-                Some(false) => dead.push((
-                    delay,
-                    elapsed,
-                    second.exit_status(),
-                    second
-                        .visible_lines()
-                        .iter()
-                        .filter(|l| !l.trim().is_empty())
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(" | "),
-                )),
-                None => unknown += 1,
-            }
-            // 後片付け: B を閉じ、サーバーが終わるまで待つ（次の周を「器が 1 つだけ」から始める）
-            drop(second);
-            drop(rx2);
-            kill_session(&socket, &b);
-            for _ in 0..300 {
-                if !server_alive(&socket) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        println!(
-            "TAKO_2741: rounds={rounds} max_delay={max_delay}ms alive={alive} dead={} unknown={unknown}",
-            dead.len()
-        );
-        for (delay, elapsed, status, screen) in &dead {
-            println!(
-                "TAKO_2741_DEAD: delay={delay}ms died_after={elapsed:?} status={status:?} screen={screen:?}"
-            );
-        }
-    }
-
-    /// #2741 段 1 の再現（注入・既定では回さない）: 器の最後のセッションを製品どおりに閉じると、
-    /// サーバーは「終わる」と決めてから実際に消えるまで待ち受けのソケットを開いたままにする。
-    /// その間に作った器のペインのクライアントは受け付けられずに切られ、目印の前に死ぬ。
-    ///
-    /// 窓は本来短い（下の自然な所要の試験）ので、`history-file` を FIFO に向けてサーバーを終わり際
-    /// （履歴の書き出し）で止める = CPU を焼かずに窓を開けたままにする注入
-    #[test]
-    #[cfg(unix)]
-    #[ignore]
-    fn issue2741_終わり際で止めたサーバーへ繋いだ器のペインは即死する() {
-        use std::os::unix::ffi::OsStrExt;
-        use std::time::Duration;
-        if !crate::tmux_test_gate::container() {
-            return;
-        }
-        let socket = format!("tako-coretest-2741i-{}", std::process::id());
-        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
-        let dir = crate::test_residue::ScratchDir::new("tako-2741-fifo");
-        let fifo = dir.path().join("hist");
-        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: このテストの置き場の中へ FIFO を 1 つ作るだけ
-        assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
-
-        let (mut first, mut rx1) = crate::TerminalSession::spawn(
-            80,
-            24,
-            wrap_options(issue2741_base(), &socket, "tako-e2e-2741-a"),
-        )
-        .expect("A の器のクライアントを spawn できる");
-        first.hang_up_client_on_close();
-        assert_eq!(
-            issue2741_outcome(&mut first, &mut rx1, Duration::from_secs(10)),
-            Some(true),
-            "A が立つ"
-        );
-        let server = issue2741_server_pid(&socket, "tako-e2e-2741-a").expect("器のサーバーの pid");
-        let set = crate::tmux::tmux_command(Some(&socket))
-            .args(["set", "-g", "history-file"])
-            .arg(&fifo)
-            .output()
-            .expect("history-file を立てる");
-        assert!(set.status.success(), "{set:?}");
-
-        // 製品の閉じ方: 端末を落とし（#2625 の SIGHUP → 読み捨て → 閉じる）、kill-session
-        drop(first);
-        drop(rx1);
-        kill_session(&socket, "tako-e2e-2741-a");
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            issue2741_alive(server),
-            "最後のセッションが消えた後もサーバーは終わり際で止まっている（注入が効いている）"
-        );
-
-        // 止まっている間に次の器のペインを作る（製品の wrap_options = new-session -A -D）
-        let (mut second, mut rx2) = crate::TerminalSession::spawn(
-            80,
-            24,
-            wrap_options(issue2741_base(), &socket, "tako-e2e-2741-b"),
-        )
-        .expect("B の器のクライアントを spawn できる");
-        second.hang_up_client_on_close();
-        let before_release = issue2741_outcome(&mut second, &mut rx2, Duration::from_millis(500));
-        // 止めを外す（FIFO を読む側を開ける）→ サーバーが履歴を書き終えて消える
-        let reader = {
-            let fifo = fifo.clone();
-            std::thread::spawn(move || std::fs::read(&fifo).map(|b| b.len()))
-        };
-        let after_release = issue2741_outcome(&mut second, &mut rx2, Duration::from_secs(10));
-        let _ = reader.join();
-        let screen = second
-            .visible_lines()
-            .iter()
-            .filter(|l| !l.trim().is_empty())
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" | ");
-        println!(
-            "TAKO_2741_INJECT: before_release={before_release:?} after_release={after_release:?} \
-             server_alive={} status={:?} b_session={} screen={screen:?}",
-            issue2741_alive(server),
-            second.exit_status(),
-            crate::tmux::has_session(Some(&socket), "tako-e2e-2741-b"),
-        );
-        assert_eq!(
-            before_release, None,
-            "止まっている間は B は目印も出さず終わりもしない"
-        );
-        assert_eq!(
-            after_release,
-            Some(false),
-            "サーバーが消えると B のクライアントは目印の前に終わる = 器のペインが即死する"
-        );
-    }
-
-    /// #2741 段 1 の測り（既定では回さない）: 器の最後のセッションを kill してから、器のサーバーの
-    /// プロセスが消えるまでの所要 = 次の器のペインが繋ぐと即死する窓の幅（注入なし）
-    #[test]
-    #[cfg(unix)]
-    #[ignore]
-    fn issue2741_最後のセッションを消してからサーバーが消えるまでの所要() {
-        use std::time::{Duration, Instant};
-        if !crate::tmux_test_gate::container() {
-            return;
-        }
-        let socket = format!("tako-coretest-2741w-{}", std::process::id());
-        let _cleanup = TmuxTestGuard::new(vec![socket.clone()]);
-        let rounds = std::env::var("TAKO_2741_ROUNDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(20u32);
-        let mut gaps = Vec::new();
-        for i in 0..rounds {
-            let name = format!("tako-e2e-2741-w{i}");
-            let (mut first, mut rx1) = crate::TerminalSession::spawn(
-                80,
-                24,
-                wrap_options(issue2741_base(), &socket, &name),
-            )
-            .expect("器のクライアントを spawn できる");
-            first.hang_up_client_on_close();
-            assert_eq!(
-                issue2741_outcome(&mut first, &mut rx1, Duration::from_secs(10)),
-                Some(true)
-            );
-            let server = issue2741_server_pid(&socket, &name).expect("器のサーバーの pid");
-            drop(first);
-            drop(rx1);
-            kill_session(&socket, &name);
-            let killed = Instant::now();
-            while issue2741_alive(server) && killed.elapsed() < Duration::from_secs(5) {
-                std::thread::sleep(Duration::from_micros(200));
-            }
-            gaps.push(killed.elapsed());
-        }
-        gaps.sort();
-        println!(
-            "TAKO_2741_WINDOW: rounds={rounds} min={:?} median={:?} max={:?}",
-            gaps.first(),
-            gaps.get(gaps.len() / 2),
-            gaps.last()
         );
     }
 
