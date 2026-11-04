@@ -5694,9 +5694,7 @@ const ASYNC_CHILD_ERREXIT_FROZEN: &[(&str, usize)] = &[
     ("scripts/promo/check-readings.sh", 1),
     ("scripts/promo/lib.sh", 3),
     ("scripts/promo/narrate.sh", 1),
-    ("scripts/release.sh", 7),
     ("scripts/test-nightly-reserve.sh", 1),
-    ("scripts/test-release-retry.sh", 5),
     ("scripts/test-serve-watch.sh", 2),
 ];
 

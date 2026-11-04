@@ -10,6 +10,8 @@
 #              zip にライセンスが入りタグのファイルとバイト一致するか（#1850）
 #   Test 14〜15: 夜間リリースが CHANGELOG へ版の節を挿しても `## [Unreleased]` が最上段に 1 つの
 #              まま・手書きの項目がその版のリリースノートに載る（#1593。scripts/lib/changelog.sh）
+#   Test 16: 書き込みの最中に子の SIGCHLD が届いても結論の行と終了コードが崩れない（bash 3.2 の
+#              EINTR。release.sh の stdout / stderr を「いつも満杯」の FIFO にする。#2690 / #2736）
 #
 # #1850 の zip は偽の gh の `release download` が <dir>/release-assets/ から渡す（ネットワークを
 # 使わない）。zip の中の置き場と表は release.sh と同じ scripts/lib/license-bundle.sh で引くので、
@@ -451,9 +453,10 @@ test_no_wait_windows_opt_out() {
 add_license_fixtures() {
   local dir="$1" tag="${2:-}" src win
   while IFS=$'\t' read -r src win; do
+    [[ -n "$src" ]] || continue
     printf 'fixture: %s\nこれは %s の偽物（#1850 のモックテスト）\n' "$src" "$src" > "$dir/$src"
     git -C "$dir" add "$src"
-  done < <(tako_license_bundle "$dir")
+  done <<<"$(tako_license_bundle "$dir")"
   git -C "$dir" commit --quiet -m "license fixtures"
   if [[ -n "$tag" ]]; then
     git -C "$dir" tag "$tag"
@@ -477,6 +480,7 @@ make_release_zips() {
     mkdir -p "$stage"
     k=0
     while IFS=$'\t' read -r src win; do
+      [[ -n "$src" ]] || continue
       k=$((k + 1))
       if [[ "$platform" == windows && "$win_keep" != all && $k -gt $win_keep ]]; then
         continue
@@ -492,7 +496,7 @@ make_release_zips() {
       if [[ "$platform" == macos ]]; then
         printf 'appledouble\n' > "$stage/$(dirname "$entry")/._$(basename "$entry")"
       fi
-    done < <(tako_license_bundle "$dir")
+    done <<<"$(tako_license_bundle "$dir")"
     # ライセンス以外の中身（実物の zip と同じく本体も入っている形にする）
     case "$platform" in
       macos)
@@ -532,6 +536,8 @@ check_assets() {
 }
 
 # license_rows <dir> — 表の行（元ファイル<TAB>Windows での名前）
+# 読み手はプロセス置換にしない（#2690 / #2736。子が終わった瞬間の書き込みが /bin/bash 3.2 で EINTR に
+# なり set -e で止まる）。`<<<"$( … )"` は空の出力を空の 1 行で渡すので、ループの頭で空の行を飛ばす
 license_rows() {
   tako_license_bundle "$1"
 }
@@ -560,11 +566,12 @@ test_check_assets_mode() {
   assert_contains "表の本数を出す" "$CHECK_OUT" \
     "表 ${TAKO_LICENSE_BUNDLE_TABLE} の $(( $(license_rows "$dir" | wc -l) )) 本"
   while IFS=$'\t' read -r src win; do
+    [[ -n "$src" ]] || continue
     for platform in macos windows; do
       assert_contains "${platform} の ${src} が一致" "$CHECK_OUT" \
         "[OK] $(tako_license_zip_entry "$platform" "$src" "$win")（タグ v99.0.0 の ${src} とバイト一致）"
     done
-  done < <(license_rows "$dir")
+  done <<<"$(license_rows "$dir")"
   assert_contains "インストーラーは中身を見ないと明示" "$CHECK_OUT" \
     "tako-v99.0.0-windows-x86_64.exe — インストーラーは中身を見ない"
   assert_contains "ライセンスが揃ったと報告" "$CHECK_OUT" \
@@ -589,6 +596,7 @@ test_check_assets_missing_licenses() {
   # 配布物そのものは揃っている（2 つの検査は別々に報告する）
   assert_contains "両 OS の揃いは別に報告" "$CHECK_OUT" "両 OS の配布物が揃っている"
   while IFS=$'\t' read -r src win; do
+    [[ -n "$src" ]] || continue
     k=$((k + 1))
     if [[ $k -eq 1 ]]; then
       assert_contains "入っている 1 本は通す（${win}）" "$CHECK_OUT" \
@@ -599,7 +607,7 @@ test_check_assets_missing_licenses() {
     fi
     assert_contains "macOS の ${src} は通す" "$CHECK_OUT" \
       "[OK] $(tako_license_zip_entry macos "$src" "$win")（タグ v99.0.0 の ${src} とバイト一致）"
-  done < <(license_rows "$dir")
+  done <<<"$(license_rows "$dir")"
   assert_contains "崩れた zip の数で警告" "$CHECK_OUT" \
     "警告: ライセンスの同梱が崩れている（v99.0.0）— 上の [NG] の zip・OS が 1 個"
   assert_head_unchanged "$dir"
@@ -614,7 +622,7 @@ test_check_assets_byte_mismatch() {
   rows=()
   dir=$(make_test_env)
   add_license_fixtures "$dir" v99.0.0
-  while IFS= read -r src; do rows+=("$src"); done < <(license_rows "$dir")
+  while IFS= read -r src; do [[ -n "$src" ]] && rows+=("$src"); done <<<"$(license_rows "$dir")"
   IFS=$'\t' read -r first_src first_win <<< "${rows[0]}"
   IFS=$'\t' read -r last_src last_win <<< "${rows[${#rows[@]} - 1]}"
   write_assets "$dir" tako-v99.0.0-macos-arm64.zip tako-v99.0.0-windows-x86_64.zip
@@ -873,6 +881,94 @@ test_changelog_unreleased_edges() {
   rm -rf "${dir:?}"
 }
 
+# ---------------------------------------------------------------------------
+# Test 16: 書き込みの最中に子の SIGCHLD が届いても結論の行と終了コードが崩れない（#2690 / #2736）
+#
+# CI の macOS の /bin/bash 3.2 は SIGCHLD を SA_RESTART なしで受ける。release.sh の読み手が
+# `done < <( … )` だと、その子が終わった瞬間の次の行の write が EINTR（Interrupted system call）で
+# 落ちて行が消え、set -e で 1 に化ける（片肺の 3 も 1 になる）。release.sh の stdout / stderr を
+# 「いつも満杯」の FIFO（scripts/lib/slowpipe.pl。仕組みと罠はその先頭）にして write を毎回待たせ、
+# その一瞬を毎回にする（負荷は生成しない）。読み手 7 か所を、公開（両 OS 揃う / 片肺）・
+# --check-assets・--update-notes・--notes-only の 5 つの腕で通る。
+#   TAKO_2736_RUNS=<回数>（既定 3）で腕ごとの回数を、TAKO_2690_SLOWPIPE_WIDE_US=<マイクロ秒> で
+#   詰め物を書く前の待ちを足せる（窓を広げても腕が落ちないことを手元で確かめる用）
+# ---------------------------------------------------------------------------
+SLOWPIPE="$PWD/scripts/lib/slowpipe.pl"
+
+# slow_release <dir> <release.sh の引数...> — 満杯の FIFO 越しに release.sh を走らせ、SLOW_OUT / SLOW_RC へ。
+# 呼ぶ前に TMPDIR / cwd を決めたいときは呼び手が ( … ) で包む
+slow_release() {
+  local dir="$1"
+  shift
+  mkdir -p "$dir/tmp"
+  SLOW_RC=0
+  SLOW_OUT=$(TAKO_RELEASE_RETRY_WAIT=0 TAKO_WINDOWS_POLL_SECONDS=0 TMPDIR="$dir/tmp" PATH="$dir/mock-bin:$PATH" \
+    perl "$SLOWPIPE" "$dir/tmp" bash "$dir/scripts/release.sh" "$@") || SLOW_RC=$?
+}
+
+test_sigchld_slowpipe() {
+  echo ""
+  echo "--- Test 16: 書き込みの最中に子の SIGCHLD が届いても結論の行と終了コードが崩れない（#2690 / #2736）---"
+  local runs="${TAKO_2736_RUNS:-3}" i=0 dir
+  [[ "$runs" =~ ^[1-9][0-9]*$ ]] || runs=3
+  while [[ $i -lt $runs ]]; do
+    i=$((i + 1))
+
+    # 公開・両 OS 揃う: 配布物の列挙・ノートの作り直し・完全性の検査の読み手
+    dir=$(make_test_env)
+    write_assets "$dir" tako-v99.0.0-macos-arm64.zip tako-v99.0.0-windows-x86_64.exe tako-v99.0.0-windows-x86_64.zip
+    make_dual_os_gh "$dir" "$dir/assets"
+    slow_release "$dir" --skip-build --publish
+    assert_eq "公開は 0（${i} 回目）" "0" "$SLOW_RC"
+    assert_contains "公開の結論の行が欠けない（${i} 回目）" "$SLOW_OUT" "==> リリース完了"
+    assert_contains "公開の完全性の行が欠けない（${i} 回目）" "$SLOW_OUT" "両 OS の配布物が揃っている"
+    assert_not_contains "公開で書き込みが割り込まれない（${i} 回目）" "$SLOW_OUT" "write error"
+    rm -rf "${dir:?}"
+
+    # 公開・片肺: Windows の待ちの後の読み手と、終了コード 3（= 呼び手が片肺を見分ける契約）
+    dir=$(make_test_env)
+    write_assets "$dir" tako-v99.0.0-macos-arm64.zip
+    make_dual_os_gh "$dir" "$dir/assets"
+    slow_release "$dir" --skip-build --publish
+    assert_eq "片肺は 3（${i} 回目）" "3" "$SLOW_RC"
+    assert_contains "片肺の名指しが欠けない（${i} 回目）" "$SLOW_OUT" "片肺リリース"
+    assert_not_contains "片肺で書き込みが割り込まれない（${i} 回目）" "$SLOW_OUT" "write error"
+    rm -rf "${dir:?}"
+
+    # --check-assets: 完全性とライセンスの照合の読み手
+    dir=$(make_test_env)
+    add_license_fixtures "$dir" v99.0.0
+    make_release_zips "$dir" v99.0.0
+    write_assets "$dir" tako-v99.0.0-macos-arm64.zip tako-v99.0.0-windows-x86_64.exe tako-v99.0.0-windows-x86_64.zip
+    make_dual_os_gh "$dir" "$dir/assets"
+    slow_release "$dir" --check-assets v99.0.0
+    assert_eq "--check-assets は 0（${i} 回目）" "0" "$SLOW_RC"
+    assert_contains "--check-assets の結論の行が欠けない（${i} 回目）" "$SLOW_OUT" \
+      "両 OS の zip にライセンスが揃い、タグ v99.0.0 のファイルと一致している"
+    assert_not_contains "--check-assets で書き込みが割り込まれない（${i} 回目）" "$SLOW_OUT" "write error"
+    rm -rf "${dir:?}"
+
+    # --update-notes: 実アセットの読み手と、ついでの完全性の検査
+    dir=$(make_test_env)
+    write_assets "$dir" tako-v99.0.0-macos-arm64.zip tako-v99.0.0-windows-x86_64.exe tako-v99.0.0-windows-x86_64.zip
+    make_dual_os_gh "$dir" "$dir/assets"
+    slow_release "$dir" --update-notes v99.0.0
+    assert_eq "--update-notes は 0（${i} 回目）" "0" "$SLOW_RC"
+    assert_contains "--update-notes の結論の行が欠けない（${i} 回目）" "$SLOW_OUT" "==> ノートを更新した: v99.0.0"
+    assert_contains "--update-notes の完全性の行が欠けない（${i} 回目）" "$SLOW_OUT" "両 OS の配布物が揃っている"
+    assert_not_contains "--update-notes で書き込みが割り込まれない（${i} 回目）" "$SLOW_OUT" "write error"
+    rm -rf "${dir:?}"
+
+    # --notes-only: dist の配布物の読み手の直後にノートを書く
+    dir=$(make_test_env)
+    slow_release "$dir" --notes-only
+    assert_eq "--notes-only は 0（${i} 回目）" "0" "$SLOW_RC"
+    assert_contains "--notes-only のノートが欠けない（${i} 回目）" "$SLOW_OUT" "Test release"
+    assert_not_contains "--notes-only で書き込みが割り込まれない（${i} 回目）" "$SLOW_OUT" "write error"
+    rm -rf "${dir:?}"
+  done
+}
+
 # --- 実行 ---
 test_retry_then_success
 test_all_retries_fail
@@ -889,6 +985,7 @@ test_check_assets_error_paths
 test_check_assets_follows_table
 test_changelog_unreleased_single
 test_changelog_unreleased_edges
+test_sigchld_slowpipe
 
 echo ""
 echo "================================"

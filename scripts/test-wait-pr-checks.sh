@@ -1314,93 +1314,12 @@ echo "== Test 41: 書き込みの最中に子の SIGCHLD が届いても結論�
 # 待っていると、echo が `write error: Interrupted system call` で落ちてその行が消え（macOS の libc は
 # その行のバッファを捨てる）、set -e で 1 で抜ける。CI では読み手の tee と同じパイプを取り合った
 # 一瞬だけなので間欠だった（t38red の結論の行・t39merge の 5 が 1）。ここでは腕の stdout / stderr を
-# 「いつも満杯」の FIFO にして write を毎回待たせ、その一瞬を毎回にする（負荷は生成しない）。
-# 読み手は 1 ms ごとに 32 バイトだけ空け、腕が書いたら・512 バイト空けても書かなければ詰め物の NUL で
-# 満杯へ戻す（ただ遅く読むだけだと、腕が書かない間に空きが溜まって結論の行の write が待たない）。
-# 詰め物は**別に開いた**非塞の書き口から書く: O_NONBLOCK は開いた口ごとの属性で dup した口は共有する
-# ので、腕と同じ口で切り替えると、その間の腕の write が EAGAIN（Resource temporarily unavailable）で
-# 落ちる（機が重いと窓が広がり bash 5 でも落ちた = #2690 の差し戻し。名前の無いパイプは開き直せないので FIFO）。
-# 修正前の形（`done < <( … )`）は 3.2 で毎回落ちる（結果の行は出て、結論の行だけが消えて 1）。
+# 「いつも満杯」の FIFO（scripts/lib/slowpipe.pl。仕組みと罠はその先頭）にして write を毎回待たせ、
+# その一瞬を毎回にする（負荷は生成しない）。修正前の形（`done < <( … )`）は 3.2 で毎回落ちる
+# （結果の行は出て、結論の行だけが消えて 1）。
 #   TAKO_2690_T41_RUNS=<回数>（既定 3）で腕ごとの回数を、TAKO_2690_SLOWPIPE_WIDE_US=<マイクロ秒> で
 #   詰め物を書く前の待ちを足せる（窓を広げても腕が落ちないことを手元で確かめる用）
-SLOWPIPE="${TMP}/slowpipe.pl"
-cat > "${SLOWPIPE}" <<'PL_EOF'
-# 使い方: perl slowpipe.pl <FIFO を置く dir> <コマンド...>。詰め物を除いた出力をそのまま出し、コマンドの終了コードで終わる
-use strict;
-use warnings;
-use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK O_RDONLY O_WRONLY);
-use POSIX qw(:sys_wait_h mkfifo EAGAIN);
-use Time::HiRes qw(usleep);
-my $wide = $ENV{TAKO_2690_SLOWPIPE_WIDE_US} || 0;
-my $dir = shift @ARGV;
-my $FIONREAD = $^O eq 'darwin' ? 0x4004667f : 0x541B;
-my $fifo = "$dir/slowpipe.$$.fifo";
-mkfifo($fifo, 0600) or die "mkfifo: $!";
-# 読み手・詰め物の書き口・腕の書き口は、それぞれ別に開く（詰め物の口だけがずっと非塞）
-sysopen(my $r, $fifo, O_RDONLY | O_NONBLOCK) or die "open r: $!";
-sysopen(my $fill_w, $fifo, O_WRONLY | O_NONBLOCK) or die "open fill: $!";
-# 詰め物の NUL で満杯にする（PIPE_BUF 以下の write は丸ごとか 0 なので、小さい塊へ落としていく）
-sub refill {
-  usleep($wide) if $wide;
-  for my $chunk (512, 64, 8, 1) {
-    while (1) {
-      my $n = syswrite($fill_w, "\0" x $chunk);
-      last unless defined $n && $n > 0;
-    }
-  }
-}
-sub avail {
-  my $b = pack('L', 0);
-  ioctl($r, $FIONREAD, $b) or die "FIONREAD: $!";
-  return unpack('L', $b);
-}
-refill();
-my $pid = fork();
-die "fork: $!" unless defined $pid;
-if ($pid == 0) {
-  close $r;
-  close $fill_w;
-  sysopen(my $w, $fifo, O_WRONLY) or die "open w: $!";
-  open(STDOUT, '>&', $w) or die;
-  open(STDERR, '>&', $w) or die;
-  close $w;
-  exec @ARGV or die "exec: $!";
-}
-binmode STDOUT;
-$| = 1;
-my $status = 0;
-my $expect = avail();    # 前の回に読んだ後に残っているはずの量（増えていれば腕が書いた）
-my $freed = 0;           # 満杯へ戻してから空けた量
-while (1) {
-  if (waitpid($pid, WNOHANG) == $pid) { $status = $?; last; }
-  my $now = avail();
-  if ($now > $expect || $freed >= 512) {
-    refill();
-    $freed = 0;
-    $now = avail();
-  }
-  my $n = sysread($r, my $buf, 32);
-  if (!defined $n) {
-    die "read: $!" unless $! == EAGAIN;
-    ($n, $buf) = (0, '');
-  }
-  $buf =~ tr/\0//d;
-  print $buf;
-  $freed += $n;
-  $expect = $now - $n;
-  usleep(1000);
-}
-close $fill_w;
-fcntl($r, F_SETFL, fcntl($r, F_GETFL, 0) & ~O_NONBLOCK) or die "fcntl: $!";
-while (1) {
-  my $n = sysread($r, my $buf, 65536);
-  last if !defined $n || $n == 0;
-  $buf =~ tr/\0//d;
-  print $buf;
-}
-unlink $fifo;
-exit($status & 127 ? 128 + ($status & 127) : $status >> 8);
-PL_EOF
+SLOWPIPE="${REPO_ROOT}/scripts/lib/slowpipe.pl"
 run_wait_slow() { (cd "${CASE_DIR}/repo" && record_run perl "${SLOWPIPE}" "${TMP}" bash "${WAIT_SH}" "$@"); }
 run_merge_slow() { (cd "${CASE_DIR}/repo" && record_run perl "${SLOWPIPE}" "${TMP}" bash "${MERGE_SH}" "$@"); }
 T41_RUNS="${TAKO_2690_T41_RUNS:-3}"
