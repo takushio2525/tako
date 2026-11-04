@@ -340,7 +340,9 @@ mod e2e {
         );
     }
 
-    /// 注入なしで、kill からの間合いを 0〜20 ms 振っても次の器のペインは生き残る（修正前後とも = 普段の経路を壊さない）
+    /// 注入なしで、kill からの間合いを 0〜20 ms 振っても次の器のペインは生き残る。
+    /// 修正前（A/B）は混んだ機だと注入なしでも終わり際のサーバーに当たって死ぬ（= #2741 の症状）ので、
+    /// 死んだ本数を出すだけにして判定は注入の e2e に任せる
     #[test]
     fn 最後の器を閉じてから間合いを振って作った器のペインは生き残る() {
         if !tako_core::tmux_test_gate::container() {
@@ -352,11 +354,12 @@ mod e2e {
             let a = format!("tako-e2e-2741-a{i}");
             let (first, mut rx1) = spawn(&server.0, &a);
             let mut first = first;
-            assert_eq!(
-                outcome(&mut first, &mut rx1, Duration::from_secs(10)),
-                Some(true),
-                "A が立つ（周 {i}）"
-            );
+            let got = outcome(&mut first, &mut rx1, Duration::from_secs(10));
+            if got != Some(true) {
+                // 前の周の最後のセッション（b）を消した直後に作る A も同じ形で当たりうる
+                dead.push((format!("A{i}"), got, screen(&first)));
+                continue;
+            }
             drop(first);
             drop(rx1);
             let killer = {
@@ -370,11 +373,18 @@ mod e2e {
             let got = outcome(&mut second, &mut rx2, Duration::from_secs(10));
             let _ = killer.join();
             if got != Some(true) {
-                dead.push((i, got, screen(&second)));
+                dead.push((format!("B{i}"), got, screen(&second)));
             }
             drop(second);
             drop(rx2);
             kill_session(&server.0, &b);
+        }
+        println!(
+            "TAKO_2741_GAP: 21 周で死んだ器のペイン {} 本 {dead:?}",
+            dead.len()
+        );
+        if legacy() {
+            return;
         }
         assert!(
             dead.is_empty(),
@@ -399,6 +409,7 @@ mod e2e {
             outcome(&mut first, &mut rx1, Duration::from_secs(10)),
             Some(true)
         );
+        let pid = server_pid(&server.0, "tako-e2e-2741-r1");
         // 器の中のコマンド（cat）を自ら終わらせる（EOF）
         first.write(vec![0x04]);
         assert!(
@@ -406,6 +417,13 @@ mod e2e {
             "器の中のコマンドが終わるとクライアントも終わる。画面: {:?}",
             screen(&first)
         );
+        if legacy() {
+            // 修正前はサーバーも終わる。終わり際に問う・作ると本 Issue の隙間に当たるので、消え切ってから進む
+            let gone = Instant::now();
+            while alive(pid) && gone.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         let probe = probe_session(&server.0, "tako-e2e-2741-r1");
         let verdict = ReattachState::new().decide(&probe, first.child_pid(), Instant::now());
         println!("TAKO_2741_REATTACH: 自ら終わった後 probe={probe:?} verdict={verdict:?}");
