@@ -4148,20 +4148,29 @@ while IFS=$'\t' read -r a b; do echo "[$a] $b"; done <<<"$(sort -k2 <<<"$RAW")" 
 書き込みの最中に届かない。寄せると出力が空のとき空の 1 行が読まれるので、ループが空を飛ばすか
 確かめる。置換は NUL を運べないので `find -print0` を読む形はこの書き換えでは直せない。
 
-実測（`/bin/bash` 3.2.57 / Homebrew の 5.3.15。腕の stdout / stderr を「いつも満杯」のパイプにして
-write を毎回待たせる = 負荷は生成しない。`test-wait-pr-checks.sh` の Test 41 の `slowpipe.pl` と同じ形。
-ただ遅く読むだけの読み手だと、腕が書かない間に空きが溜まって結論の行の write が待たず、実物の
-スクリプト（2 秒ほど走る）では修正前でも落ちなかった）:
+実測（`/bin/bash` 3.2.57 / Homebrew の 5.3.15。腕の stdout / stderr を「いつも満杯」の FIFO にして
+write を毎回待たせる = 負荷は生成しない。`test-wait-pr-checks.sh` の Test 41 の `slowpipe.pl` と同じ形）:
 
-| 腕 | 3.2 | 5.3 |
+| 腕（20 回） | 3.2 | 5.3 |
 |---|---|---|
-| `done < <(sort …)` の直後の結論の行（10 回） | **10 回崩れる**（行が欠けて 1） | 0 |
-| 同じ形・SIGCHLD を塞いで起動（10 回） | 0（= 割り込むのは SIGCHLD） | — |
-| `done <<<"$(sort …)"` へ寄せた形（20 回） | 0 | 0 |
+| `done < <(sort …)` の直後の結論の行 | **20 回崩れる**（行が欠けて 1・`Interrupted system call`） | 0 |
+| 同じ形・SIGCHLD を塞いで起動 | 0（= 割り込むのは SIGCHLD） | — |
+| `done <<<"$(sort …)"` へ寄せた形（詰め物の窓を 3 ms 広げても） | 0 | 0 |
 | 背景の `( sleep 0.2 ) &` の終わりが書き込みに重なる | **落ちる** | 通る |
 | trap した SIGUSR1 が書き込みに重なる | 落ちる | 落ちる（= 5.x が通るのは SIGCHLD の SA_RESTART だけ） |
-| 修正前の `wait-pr-checks.sh` / `merge-pr.sh` を Test 41 で（赤・緑・merge を 3 回ずつ） | **9 回とも崩れる**（PASS=279 FAIL=24。どれも CI と同じ `line 506: echo: write error`、緑は 0 が 1・merge は 5 が 1） | 0（PASS=303） |
-| 修正後 | 0（PASS=303） | 0（PASS=303） |
+| 修正前の `wait-pr-checks.sh` / `merge-pr.sh` を Test 41 で（赤・緑・merge） | **3 回ずつ 9 回とも崩れる**（PASS=279 FAIL=24。どれも CI と同じ `line 506: echo: write error: Interrupted system call`、赤は結論の行だけ消え・緑は 0 が 1・merge は 5 が 1） | — |
+| 修正後（赤・緑・merge を 20 回ずつ・詰め物の窓 0 / 3 ms） | 0（窓 0 / 3 ms とも PASS=473 FAIL=0） | 0（窓 0 / 3 ms とも PASS=473 FAIL=0） |
+
+**再現の道具の罠**（どちらも Test 41 の最初の形で踏んだ）:
+
+- **ただ遅く読むだけの読み手は、腕が書かない間に空きが溜まる**。実物のスクリプト（2 秒ほど走る）の結論の
+  行の write が待たず、修正前でも落ちなかった。腕が書いたら・空けても書かなければ詰め物で満杯へ戻す
+- **`O_NONBLOCK` は開いた口（open file description）ごとの属性で、`dup` した口は共有する**。詰め物を
+  書く間だけ腕と同じ口に `O_NONBLOCK` を立てると、その間の腕の write が **EAGAIN**
+  （`write error: Resource temporarily unavailable`）で落ち、版を問わず結論の行が消えて 1 になる
+  （窓を 3 ms 広げると 3.2 で 30 回中 4 回・5.3 で 30 回中 2 回。機が重いと窓が広がり、合流検証の
+  bash 5 で merge の腕が落ちた）。名前の無いパイプは開き直せないので、FIFO を読み手・詰め物（ずっと非塞）・
+  腕（塞がる）の 3 つの口で別々に開く
 
 **番犬**: `shell_scripts.rs` の `set_eの下で書き込みの最中に届く子のsigchldを増やさない` が、
 `set -e` を宣言する（または `scripts/lib/` / `lib.sh` のように呼び手の set -e を継ぐ）
