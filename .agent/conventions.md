@@ -2354,7 +2354,20 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   1 つでもあれば tick が挟まるので、`pin_chat_fixture` のように**読み取り対象から
   外して race を無くす**（判定そのものは変えない）。項目 98（#725）は MCP を 3 回
   往復するあいだに会話が消え、決定的に失敗して以降の項目が一切走らなくなっていた（#853）。
-  番犬テスト `chat_fixture_pin_watchdog` が pin の欠落と順序違いを落とす
+  番犬テスト `chat_fixture_pin_watchdog` が pin の欠落と順序違いを落とす。
+  項目 115（#830）は pin を呼ばずに 81 発話の描画を `await` で待っていたので、tick が挟まった回だけ
+  会話が消えて `display=Starter` のまま描画待ちが切れていた（混んだ機で 21 回中 3 回。#2727）。
+  #2727 から同じ番犬が「注入した会話（`session_id` が `selftest-` / `visual-`）を入れた同期区間
+  （前後の `.await` の間）で pin していない」も名指す。入れてから次の `.await` までに会話を片付ける
+  （`chat_panes.clear()` / `.remove(`）注入は tick が割り込めないので名指さない。守られているのに規則が
+  見分けられない形（pin 済みのペインへの入れ直し・最後の読み取りまで `.await` を挟まない・検査の直前の
+  積み直し）は、その行か直前のコメント行に `tako:chat-fixture-ok <理由>` を書く（#2747 で既知の残りの表は
+  空 = 削除。visual-test #745 は pin 漏れだったので直した）。守りを確かめるときは tick を運に任せず、
+  項目 98 / 115・visual-test #745 のように `collect_chat_targets` → `load_chat_refresh` → `apply_chat_refresh` を
+  その場で 1 周回して会話が残るかを見る。pin したペインを節の後も使い続けるなら、節の後片付けで
+  `chat_fixture_panes` から外す（#745 = フォーカス中の元のペインを使う）。会話の配置を測る検査は、測る時点で
+  会話が `chat_panes` に残っていることも見る（消える前に 1 度描かれた `chat_text_index` / `chat_body_lists` は
+  会話が消えても残るので、#745 の表の検査は会話が無いまま古い配置を測って素通りした = 偽の PASS。#2747）
 - **PTY へ書く Enter は CR（`\r`）**。端末が Enter として送るのは CR で、PowerShell
   （PSReadLine）は素の LF を**継続行（`>>`）の開始**と解釈するので打ち込んだコマンドが
   確定しない。POSIX 側は tty の ICANON + ICRNL が CR も LF も改行へ倒すため、
@@ -2701,7 +2714,11 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     節の途中に出ると器が縮む）。言語サーバに用の無い節は fixture を受け持たない拡張子にする（#2714）
   - **dispatch で直に開いたプレビューは `drain_pending_preview_loads` で流す**（#826 / #2716 の #745。
     流さないとファイル監視の読み直しが来たときだけ揃う）
-  - A/B は `TAKO_2716_LEGACY=md-edit-resume|lsp-override|bracket-match|chat-table`（`1` で全部）、
+  - **全節実行と言語サーバの節は `TAKO_LSP_AUTOSTART=1` で起こす**（#2048 の隔離起動は文書を開いても
+    言語サーバを起こさない）。欠けていれば `vt_require_lsp_autostart`（全節実行の頭と `vt_lsp_override`）が
+    FAILED ではなく `TAKO_VISUAL_TEST_UNMET` の行と終了コード 3 で止まる（落ちたのではなく起こし方の誤り。
+    以前は lsp-context-menu ① の「言語サーバの節が無い」の FAILED に見えていた）
+  - A/B は `TAKO_2716_LEGACY=md-edit-resume|lsp-override|bracket-match|chat-table|autostart`（`1` で全部）、
     持ち越しの注入は `TAKO_2716_INJECT=split|stale-resolve|no-reload|late-band,resolve-ms=400`（単独実行で
     前の節の残りを作る。旧の形は名指しで落ち、新しい形は通る）
 - **節を足したら `TAKO_VISUAL_ONLY` の腕と全節実行の並びの両方へ載せる**。腕にしか
@@ -4207,6 +4224,12 @@ write を毎回待たせる = 負荷は生成しない。道具は `scripts/lib/
 | 修正前の `release.sh`（公開 両 OS / 片肺・`--check-assets`・`--update-notes`・`--notes-only`、計 25 回） | **0**（本体で書かない） | 0 |
 | 修正前の `test-release-retry.sh` 全体（3 回） | **0**（本体に前景の子） | — |
 | 修正前の `lib/launch-services.sh` の掃除（実体なし 5 / 40 件を 10 回ずつ・1500 件を 3 回） | **0**（本体の `lsregister -u` の待ちが刈り取る） | — |
+| `test-serve-watch.sh` の Test 4 の末尾（偽のピアを `kill` して刈り取らずに見出しを `echo`）を切り出した腕（20 回。#2740） | **9 回落ちる**（`echo "=== Test 5 …"` が `Interrupted system call`・後ろが走らず 1） | 0 |
+| 同じ腕で `kill` の直後に `wait "$PEER_PID"`（20 回） | 0 | 0 |
+| 修正前の `test-serve-watch.sh` 全体（11 回） | **1 回落ちる**（同じ見出しの `echo` が `Interrupted system call`。ほかに Test 1 で偽 tailscale の `--version` が検出の時間切れ 10 秒に当たった無関係の 1 回） | — |
+| 修正後の `test-serve-watch.sh` 全体（3.2 は 8 回・5.3 は 2 回） | 0（PASS 37 / FAIL 0） | 0 |
+| `virtual-display.sh` の起こす道（本物のライブラリ・偽の caffeinate・実経路と同じ `ensure` の別プロセス。起こす秒 2 / 0〜0.6・uuid を読めない注記の道、計 60 回。#2740） | 0（`set -e` が無く、起こした後の本体は前景の子の待ちだけ） | 0（20 回） |
+| 対照: 仮の呼び手（`set -e` で source して `ensure` の後に前景の子なしで 3000 行書く。今の呼び手には無い形。10 回） | **10 回落ちる** | 0 |
 
 **再現の道具の罠**（どれも `slowpipe.pl` を作る途中で踏んだ）:
 
@@ -4231,21 +4254,22 @@ file:line で名指す（`&&` / `>&2` / `2>&1` / `&>` / `|&`・文字列とコ�
 終わるまでの間に何も書かない（`wait` で刈り取ってから書く）と監査して確かめた箇所だけ、その行か
 直前の行に `# tako:sigchld-ok <理由>` で外せる（理由の無い宣言は無効）。
 
-#### 凍結した残り（14 箇所 / 10 本。#2736 で実害の条件ごとに棚卸し）
+#### 凍結した残り（13 箇所 / 10 本。#2736 で実害の条件ごとに棚卸し・#2740 で上の 2 つを実測）
 
 #2690 の時点は 27 箇所 / 14 本。#2736 で `release.sh` 7・`test-release-retry.sh` 5・`lib/launch-services.sh` 1 を
-`<<<"$( … )"` へ寄せた（どれも実測では修正前も落ちない形だった）。残りは「子が生きている間に本体で書くか」と
-「本体に前景の子が居るか」で並べた（上ほど実害に近い）:
+`<<<"$( … )"` へ寄せた（どれも実測では修正前も落ちない形だった）。#2740 で「当たりうる」とした 2 つを実測し、
+落ちた `test-serve-watch.sh` の偽のピアは `kill` の直後に `wait` で刈り取る形にして `# tako:sigchld-ok` で外した
+（上の表。修正前は 3.2 で 20 回中 9 回）。落ちなかった `virtual-display.sh` の caffeinate は残した。
+残りは「子が生きている間に本体で書くか」と「本体に前景の子が居るか」で並べた（上ほど実害に近い）:
 
 | 箇所 | 子 | 子が生きている間に書くか | 前景の子 | 見立て |
 |---|---|---|---|---|
-| `scripts/test-serve-watch.sh:249` | 背景（偽のピア） | 書く（`kill` の後 `wait` せずにすぐ次のテストの見出しを `echo`） | 無い | **当たりうる**（CI では回らない手元の検査。`kill` の後に `wait "$PEER_PID"` を足せば消える） |
-| `scripts/lib/virtual-display.sh:503` | 背景（`caffeinate -t 2`） | 書きうる（2 秒後に勝手に終わる。そのとき呼び手の検証スクリプトが書いていれば割り込まれる） | 呼び手次第 | **当たりうる**（低。待ちのループの間は `sleep 0.5` が刈り取る） |
 | `scripts/lib/isolated-gui.sh:705` | 背景（検証用 GUI） | 書く（GUI が生きている間ずっと） | — | 低（`stop_isolated_gui` は終わりを待つ。途中で GUI が死ぬのは検証が落ちるとき） |
 | `scripts/promo/lib.sh:1100` | 背景（収録のループ） | 書きうる | — | 低（止めるときは `wait` する。自分で終わるときだけ） |
 | `scripts/check-claude-mod.sh:144` | 背景（検査の 1 段） | 書かない（待ちのループは `kill -0` と `sleep 0.2`） | `sleep` | 低（`wait` で刈り取る） |
 | `scripts/test-nightly-reserve.sh:611` | 背景（夜間リリース） | 書かない（待ちのループは `sleep 0.1`） | `sleep` | 低 |
-| `scripts/test-serve-watch.sh:275` | 背景（消し続けるループ・40 秒） | 書かない（待ちのループは `sleep 1` と置換） | 有る | 低（止めるときは `kill` + `wait`） |
+| `scripts/test-serve-watch.sh:282` | 背景（消し続けるループ・40 秒） | 書かない（待ちのループは `sleep 1` と置換） | 有る | 低（止めるときは `kill` + `wait`） |
+| `scripts/lib/virtual-display.sh:503` | 背景（`caffeinate -t 2`） | 実経路では書かない（起こした後の本体は待ちのループと置換だけ。異常の注記は `return 0` の前） | 有る（`sleep 0.5` と置換） | なし（#2740 で実測。呼び手はどれも `bash virtual-display.sh ensure` の別プロセス = `set -e` が無く、caffeinate は呼び手の子ではない。source するのは guard テストだけで `vd_wake_displays` を差し替えている。`set -e` で source して `ensure` の後に書き続ける呼び手を足すと当たる） |
 | `scripts/promo/build-explainer.sh:179` | プロセス置換 | 書く（区間ごとの `echo`） | 有る（`python3`） | 低（前景の子が刈り取る） |
 | `scripts/promo/check-readings.sh:51` | プロセス置換 | 書く（`printf`） | 有る（`python3` を 2 回） | 低 |
 | `scripts/promo/build-explainer.sh:98` | プロセス置換 | 書かない（`/dev/null` へ） | 有る | なし |

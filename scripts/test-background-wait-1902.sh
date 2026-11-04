@@ -149,7 +149,8 @@ run_section() { # ログ 節（all = 全節実行）追加の env…
   done
   stop_isolated_gui "$pid"
   keep_log "$log"
-  grep -E "TAKO_SELF_TEST_1902|TAKO_SELF_TEST_STATE_TIMEOUT|TAKO_APP_SELF_TEST_FAILED" "$log" \
+  # TAKO_VISUAL_TEST_UNMET = 落ちたのではなく前提（言語サーバの自動起動ほか）が欠けた起動（#2716）
+  grep -E "TAKO_SELF_TEST_1902|TAKO_SELF_TEST_STATE_TIMEOUT|TAKO_APP_SELF_TEST_FAILED|TAKO_VISUAL_TEST_UNMET" "$log" \
     | cut -c1-200 | sed 's/^/    /'
   grep -q "TAKO_VISUAL_TEST_OK" "$log"
 }

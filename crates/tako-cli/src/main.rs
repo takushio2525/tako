@@ -6359,19 +6359,22 @@ fn remote_start() -> Result<(), String> {
     use tako_control::remote::{with_origin, RequestOrigin};
     // 起動の途中の断り（`RemoteRefusal::DaemonStarting`。#2613）は表示言語で文にするので、呼ぶ前に決める
     init_local_lang();
+    // 案内の行も表示言語（#2365。stdout の JSON は応答の値のまま）
+    let lang = cli_lang();
     // #2533: audit.log に「CLI から頼んだ」と残す
     let result = with_origin(RequestOrigin::Cli, tako_control::remote::spawn_daemon)?;
     println!("{}", pretty_json(&result));
     // #2518: 旧版のまま動いていた daemon を入れ替えたなら、スマホが一瞬切れた理由を言う
     if let Some(pid) = result["renewed"]["previous_pid"].as_u64() {
-        eprintln!(
-            "旧版のまま動いていたリモート daemon（PID {pid}）を止めて、新版で起動し直しました。"
-        );
+        eprintln!("{}", ReplyNote::RemoteRenewed(pid).text_in(lang));
     }
     if let Some(url) = result["url"].as_str() {
         match tako_control::remote::generate_qr_png(url) {
             Ok(path) => {
-                eprintln!("\nQR コードを生成しました: {}", path.display());
+                eprintln!(
+                    "\n{}",
+                    ReplyNote::RemoteQrSaved(path.display().to_string()).text_in(lang)
+                );
                 // tako-app が起動していれば IPC 経由で OpenFile を送る（エラーは握りつぶす）
                 let _ = send_request(Request::OpenFile {
                     pane: None,
@@ -6383,21 +6386,24 @@ fn remote_start() -> Result<(), String> {
                     line: None,
                     column: None,
                 });
-                eprintln!("スマホでスキャンしてください。");
+                eprintln!("{}", ReplyNote::RemoteQrScan.text_in(lang));
             }
-            Err(e) => eprintln!("\nQR コード画像の生成に失敗: {e}"),
+            Err(e) => eprintln!(
+                "\n{}",
+                ReplyNote::RemoteQrFailed(e.to_string()).text_in(lang)
+            ),
         }
         eprintln!("URL: {url}");
-        eprintln!(
-            "この URL は恒久固定で secret を含みません（Tailscale MagicDNS 名。tailnet 内限定）。"
-        );
-        eprintln!("スマホ側にも Tailscale アプリを入れ、同じアカウントでログインしてください。");
-        eprintln!("初回アクセス時は Mac の画面にペアリング承認ダイアログが表示されます。");
+        for note in [
+            ReplyNote::RemoteUrlPermanent,
+            ReplyNote::RemotePhoneTailscale,
+            ReplyNote::RemotePairingDialog,
+        ] {
+            eprintln!("{}", note.text_in(lang));
+        }
     }
     // #1485: 「一度起動すれば動き続ける」と読むのが自然なので、実際にそうなることを言う
-    eprintln!(
-        "tako や Mac を再起動しても、この状態は自動で戻ります（`tako remote stop` で解除）。"
-    );
+    eprintln!("{}", ReplyNote::RemoteAutoRestore.text_in(lang));
     Ok(())
 }
 
@@ -6413,7 +6419,7 @@ fn remote_stop(force: bool) -> Result<(), String> {
         with_origin(RequestOrigin::Cli, tako_control::remote::daemon_stop)?
     };
     println!("{}", pretty_json(&result));
-    eprintln!("リモートサーバーを停止しました");
+    eprintln!("{}", ReplyNote::RemoteStopped.text_in(cli_lang()));
     Ok(())
 }
 
@@ -6422,38 +6428,40 @@ fn remote_stop(force: bool) -> Result<(), String> {
 fn remote_status() -> Result<(), String> {
     local_data_gate()?;
     let status = tako_control::remote::daemon_status();
+    // stderr の行は表示言語（#2365）。stdout の JSON（`detail` / `degraded` / `warnings` ほか）は応答の値のまま
+    // 日本語なので、旧版・起こしている途中・自己検査の停止の説明は同じ応答の構造の欄から組む
+    let lang = cli_lang();
     // 自動復帰の失敗も JSON に埋もれさせない（#1485: 「起動していたのに戻っていない」を
     // 一目で分かる形に）。**判断は再計算せず状態を読むだけ**（#372 / #1473 と同じ）
     if let Some(last) = status.get("last_autostart") {
         if last.get("result").and_then(|v| v.as_str())
             == Some(tako_control::remote_autostart::RESULT_FAILED)
         {
-            eprintln!(
-                "前回の起動状態へ自動で戻せませんでした（{} 回試行）: {}",
-                last.get("attempts").and_then(|v| v.as_u64()).unwrap_or(0),
-                last.get("detail").and_then(|v| v.as_str()).unwrap_or(""),
-            );
-            eprintln!("  次の一手: `tako remote start` で手動起動できます");
+            let failed = ReplyNote::RemoteAutostartFailed {
+                attempts: last.get("attempts").and_then(|v| v.as_u64()).unwrap_or(0),
+                detail: last
+                    .get("detail")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            };
+            eprintln!("{}", failed.text_in(lang));
+            eprintln!("  {}", ReplyNote::RemoteAutostartNextStep.text_in(lang));
         }
     }
-    // 劣化は JSON の中に埋もれさせない（#1049: 「running なのに見れない」を一目で分かる形に）
-    if let Some(d) = status.get("degraded") {
-        eprintln!(
-            "リモート公開が機能していません: {}",
-            d.get("reason").and_then(|v| v.as_str()).unwrap_or("")
-        );
-        if let Some(next) = d.get("next_step").and_then(|v| v.as_str()) {
-            if !next.is_empty() {
-                eprintln!("  次の一手: {next}");
-            }
-        }
+    // 劣化は JSON の中に埋もれさせない（#1049: 「running なのに見れない」を一目で分かる形に）。
+    // 枠と次の一手の字下げは check-health と同じ 1 実装（理由は daemon が自己検査で書いた文のまま）
+    if let Some(warning) = tako_control::remote_serve::degraded_warning_in(&status, lang) {
+        eprintln!("{warning}");
     }
     // 旧版のまま動いている daemon も埋もれさせない（#2518。判定は status の欄を読むだけ）
-    if let Some(detail) = status["serve_generation"]["detail"].as_str() {
+    if let Some(detail) = tako_control::remote_generation::detail_of_status_in(&status, lang) {
         eprintln!("{detail}");
     }
     // 起こしている途中（自動復帰の入れ替えほか）は止めずに待つことを言う（#2608。欄を読むだけ）
-    if let Some(detail) = status["starting"]["detail"].as_str() {
+    if let Some(detail) =
+        tako_control::remote_starting::detail_of_status_in(&status["starting"], lang)
+    {
         eprintln!("{detail}");
     }
     println!("{}", pretty_json(&status));

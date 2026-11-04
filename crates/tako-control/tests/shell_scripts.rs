@@ -5682,7 +5682,7 @@ const SIGCHLD_OK_MARKER: &str = "tako:sigchld-ok";
 /// **増やさない**。減らしたら表も同じ数へ減らす（余りを残すと同じファイルの別の行で増やせる）。
 /// 0 になったら行ごと消す。PR の CI 待ちと merge の 4 本（`PR_GATE_SCRIPTS`）は載せない。
 /// ここに載っているのは「`find -print0` の NUL 区切り（置換は NUL を運べない）」「起こしたまま
-/// 残す常駐（隔離 GUI・caffeinate・偽のピア）」を含む既存分で、1 本ずつ直す義務は無い
+/// 残す常駐（隔離 GUI・caffeinate・消し続けるループ）」を含む既存分で、1 本ずつ直す義務は無い
 /// （`.agent/conventions.md` の #2690 / #2736 の節に、実害の条件ごとの棚卸しの表）
 const ASYNC_CHILD_ERREXIT_FROZEN: &[(&str, usize)] = &[
     ("scripts/check-claude-mod.sh", 1),
@@ -5694,7 +5694,7 @@ const ASYNC_CHILD_ERREXIT_FROZEN: &[(&str, usize)] = &[
     ("scripts/promo/lib.sh", 3),
     ("scripts/promo/narrate.sh", 1),
     ("scripts/test-nightly-reserve.sh", 1),
-    ("scripts/test-serve-watch.sh", 2),
+    ("scripts/test-serve-watch.sh", 1),
 ];
 
 /// 終了コードと結論の行を呼び手（master・CI・merge の判定）が読むので、待たずに走らせる子を

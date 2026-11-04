@@ -39,7 +39,10 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/tako-1049-XXXXXX")"
 cleanup() {
   # 隔離の不変条件などで stop_daemon の定義より前に抜けたときは呼ばない（command not found を出さない）
   if declare -F stop_daemon > /dev/null; then stop_daemon || true; fi
-  if [ -n "${PEER_PID:-}" ]; then kill "$PEER_PID" 2>/dev/null || true; fi
+  if [ -n "${PEER_PID:-}" ]; then
+    kill "$PEER_PID" 2>/dev/null || true
+    wait "$PEER_PID" 2>/dev/null || true # 刈り取ってから書く（#2740。Test 4 の kill の後と同じ）
+  fi
   rm -rf "$TMP"
 }
 # 途中で死んだテストを「緑」に化けさせない（bash 3.2 の set -e + EXIT trap。#1864）。
@@ -246,6 +249,9 @@ with open(sys.argv[1], "w") as f:
 while True:
     time.sleep(1)
 PEERPY
+# 対向は kill するまで自分では終わらない。kill の後は wait で刈り取ってから次の行を書く（#2740: 刈り取らずに
+# 次の見出しを echo すると、対向が終わった瞬間の SIGCHLD でその echo が bash 3.2 で EINTR になり set -e で止まる）
+# tako:sigchld-ok 対向は kill するまで終わらず、kill の直後に wait で刈り取る（#2740）
 python3 "$TMP/peer.py" "$TMP/peer.port" > "$TMP/peer.log" 2>&1 &
 PEER_PID=$!
 PEER_PORT=""
@@ -265,6 +271,7 @@ else
   stop_daemon
 fi
 kill "$PEER_PID" 2>/dev/null || true
+wait "$PEER_PID" 2>/dev/null || true # 刈り取ってから次の見出しを書く（#2740）
 PEER_PID=""
 
 echo

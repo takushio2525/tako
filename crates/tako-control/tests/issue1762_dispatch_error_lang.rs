@@ -18435,9 +18435,21 @@ fn reply_note_index(n: &ReplyNote) -> usize {
         ReplyNote::ResidueRemoved { .. } => 322,
         ReplyNote::ResidueRemovable { .. } => 323,
         ReplyNote::ResidueApplyHint => 324,
+        // #2365 の続き: `tako remote start` / `stop` / `status` の人向けの表示の枠
+        ReplyNote::RemoteRenewed(_) => 325,
+        ReplyNote::RemoteQrSaved(_) => 326,
+        ReplyNote::RemoteQrScan => 327,
+        ReplyNote::RemoteQrFailed(_) => 328,
+        ReplyNote::RemoteUrlPermanent => 329,
+        ReplyNote::RemotePhoneTailscale => 330,
+        ReplyNote::RemotePairingDialog => 331,
+        ReplyNote::RemoteAutoRestore => 332,
+        ReplyNote::RemoteStopped => 333,
+        ReplyNote::RemoteAutostartFailed { .. } => 334,
+        ReplyNote::RemoteAutostartNextStep => 335,
     }
 }
-const REPLY_NOTE_VARIANTS: usize = 325;
+const REPLY_NOTE_VARIANTS: usize = 336;
 
 /// 見本の Remote Control の理由・次の一手（中身は `claude_remote` の日英の `Note`）
 const RC_REASON: tako_core::platform::support::Note =
@@ -20769,6 +20781,49 @@ fn reply_note_table() -> Vec<(ReplyNote, String)> {
             ReplyNote::ResidueApplyHint,
             "いま消す: tako test-residue --apply".into(),
         ),
+        // #2365 の続き: remote start / stop / status の枠（旧文は `main.rs` の書式をそのまま展開。
+        // 行頭の改行と字下げは呼び手が付ける）
+        (
+            ReplyNote::RemoteRenewed(4242),
+            "旧版のまま動いていたリモート daemon（PID 4242）を止めて、新版で起動し直しました。".into(),
+        ),
+        (
+            ReplyNote::RemoteQrSaved("/tmp/s/tako-remote-qr.png".into()),
+            "QR コードを生成しました: /tmp/s/tako-remote-qr.png".into(),
+        ),
+        (ReplyNote::RemoteQrScan, "スマホでスキャンしてください。".into()),
+        (
+            ReplyNote::RemoteQrFailed("disk full".into()),
+            "QR コード画像の生成に失敗: disk full".into(),
+        ),
+        (
+            ReplyNote::RemoteUrlPermanent,
+            "この URL は恒久固定で secret を含みません（Tailscale MagicDNS 名。tailnet 内限定）。".into(),
+        ),
+        (
+            ReplyNote::RemotePhoneTailscale,
+            "スマホ側にも Tailscale アプリを入れ、同じアカウントでログインしてください。".into(),
+        ),
+        (
+            ReplyNote::RemotePairingDialog,
+            "初回アクセス時は Mac の画面にペアリング承認ダイアログが表示されます。".into(),
+        ),
+        (
+            ReplyNote::RemoteAutoRestore,
+            "tako や Mac を再起動しても、この状態は自動で戻ります（`tako remote stop` で解除）。".into(),
+        ),
+        (ReplyNote::RemoteStopped, "リモートサーバーを停止しました".into()),
+        (
+            ReplyNote::RemoteAutostartFailed {
+                attempts: 5,
+                detail: "D".into(),
+            },
+            "前回の起動状態へ自動で戻せませんでした（5 回試行）: D".into(),
+        ),
+        (
+            ReplyNote::RemoteAutostartNextStep,
+            "次の一手: `tako remote start` で手動起動できます".into(),
+        ),
     ]
 }
 
@@ -21382,6 +21437,11 @@ const CLI_NOTE_SCOPES: &[&str] = &[
     "fn print_context_budget_proposals(",
     "fn print_context_budget_fix(",
     "fn test_residue_local(",
+    // #2365: `tako remote start` / `stop` / `status` の人向けの表示の枠（旧版・起こしている途中・自己検査の
+    // 停止の説明は `remote_generation` / `remote_starting` / `remote_serve` の `*_in`）
+    "fn remote_start(",
+    "fn remote_stop(",
+    "fn remote_status(",
 ];
 
 /// CLI `main.rs` でまだ断りに日本語の固定文を持つ関数（頭, 理由）。**断りを移し終えたら外す**
@@ -24330,4 +24390,186 @@ fn 返答の配送の理由へ日本語の固定文を戻すと名指す() {
             "{path}: 注入（{to}）を {path}:{want} として名指すはず: {found:?}"
         );
     }
+}
+
+/// #2365 の続き: `tako remote start` / `stop` / `status` の人向けの表示も表示言語（`cli_lang()`）で組む。
+/// 旧版・起こしている途中・自己検査の停止の説明は応答の日本語の値（`["detail"]` / `degraded`）をそのまま
+/// 出さず、同じ応答の構造の欄から `*_in` で組む（日本語の固定文そのものは `CLI_NOTE_SCOPES` の番犬が見る）。
+/// 自動復帰の失敗の理由（`last_autostart` の `detail`）は GUI が記録した文なのでそのまま載せてよい
+#[test]
+fn remoteのstartとstopとstatusの人向けの表示は表示言語で組む() {
+    let mut failures = Vec::new();
+    for head in ["fn remote_start(", "fn remote_stop(", "fn remote_status("] {
+        let Some(lines) = front_scope_lines(CLI_MAIN_SRC, Some(head)) else {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}: 走査の範囲 `{head}` が見つからない（改名ならこの表を直す）"
+            ));
+            continue;
+        };
+        let code: Vec<(usize, &str)> = lines
+            .iter()
+            .map(|(n, raw)| (*n, strip_line_comment(raw)))
+            .filter(|(_, code)| !code.trim_start().starts_with("//"))
+            .collect();
+        if !code.iter().any(|(_, c)| c.contains("cli_lang()")) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}: `{head}` が表示言語（`cli_lang()`）を引かない = 行の言語が設定に従わない"
+            ));
+        }
+        for (line, c) in code.iter().filter(|(_, c)| {
+            c.contains("Lang::Ja")
+                || c.contains("[\"detail\"]")
+                || c.contains("[\"degraded\"]")
+                || c.contains("get(\"degraded\")")
+        }) {
+            failures.push(format!(
+                "{CLI_MAIN_PATH}:{line}: `{head}` が日本語に固定した文を出す = 英語表示にもその行だけ日本語で出る\
+                 （応答の `detail` / `degraded` は日本語の値。`remote_generation::detail_of_status_in` / \
+                 `remote_starting::detail_of_status_in` / `remote_serve::degraded_warning_in` で組む）: {}",
+                c.trim()
+            ));
+        }
+    }
+    report_all(failures);
+}
+
+/// #2365 の続き: 旧版の daemon（`remote_generation::stale_detail_in`）・起こしている途中（`remote_starting::detail_in`）・
+/// 自己検査の停止（`remote_serve::degraded_warning_in` の `stale`）の説明は日英を持ち、日本語は #2365 より前の
+/// 固定文とバイト一致。応答の値（`serve_generation.detail` / `starting.detail` / `degraded`）は日本語のまま、
+/// 応答の構造の欄から組み直した文（`*_of_status_in`）は直接組んだ文と同じ
+#[test]
+fn remoteの旧版と起こしている途中と自己検査の停止の説明は日英を持ち日本語は2365より前と同じ() {
+    use serde_json::json;
+    use tako_control::remote_generation::{self as generation, Basis, Generation};
+    use tako_control::remote_serve;
+    use tako_control::remote_starting::{self as starting, StartingMarker};
+    let mut f = Vec::new();
+
+    // 旧版 / 実行ファイルの消失（#2518）。根拠（basis）は文に出ない
+    let bin = "/opt/t/tako";
+    for (g, old) in [
+        (
+            Generation::Replaced(Basis::Stamp),
+            "稼働中のリモート daemon（PID 42）は旧版のまま動いています: /opt/t/tako は daemon の起動後に\
+             差し替えられました。`tako remote start` で新版へ入れ替わります（GUI を起動したときは自動で入れ替わります）",
+        ),
+        (
+            Generation::Replaced(Basis::ChangeTime),
+            "稼働中のリモート daemon（PID 42）は旧版のまま動いています: /opt/t/tako は daemon の起動後に\
+             差し替えられました。`tako remote start` で新版へ入れ替わります（GUI を起動したときは自動で入れ替わります）",
+        ),
+        (
+            Generation::Missing,
+            "稼働中のリモート daemon（PID 42）の実行ファイル /opt/t/tako がもうありません。\
+             tako を入れ直してから `tako remote start` で入れ替えてください",
+        ),
+    ] {
+        let what = format!("remote_generation::stale_detail_in({g:?})");
+        let ja = generation::stale_detail_in(g, bin, 42, Lang::Ja).unwrap_or_default();
+        let en = generation::stale_detail_in(g, bin, 42, Lang::En).unwrap_or_default();
+        check_shared(&mut f, &what, old, &ja, &en);
+        let status = json!({
+            "pid": 42,
+            "serve_binary": bin,
+            "serve_generation": generation::status_field(g, bin, 42),
+        });
+        if status["serve_generation"]["detail"] != old {
+            f.push(format!(
+                "{what}: 応答の `serve_generation.detail` が #2365 より前の日本語と違う: {}",
+                status["serve_generation"]["detail"]
+            ));
+        }
+        for (lang, want) in [(Lang::Ja, &ja), (Lang::En, &en)] {
+            let rebuilt = generation::detail_of_status_in(&status, lang).unwrap_or_default();
+            if &rebuilt != want {
+                f.push(format!(
+                    "{what}: 応答の欄から組み直した {lang:?} の文が違う\n  want: {want}\n  got:  {rebuilt}"
+                ));
+            }
+        }
+    }
+    for g in [Generation::Current(Basis::Stamp), Generation::Unknown] {
+        let status = json!({
+            "pid": 42,
+            "serve_binary": bin,
+            "serve_generation": generation::status_field(g, bin, 42),
+        });
+        if generation::detail_of_status_in(&status, Lang::En).is_some() {
+            f.push(format!("remote_generation: {g:?} なのに旧版の 1 行を組む"));
+        }
+    }
+
+    // 起こしている途中（#2608）。経路の名前は `via_label_in` の日英
+    for (via, previous_pid, old) in [
+        (
+            "autostart",
+            Some(7),
+            "GUI 起動時の自動復帰がリモート daemon を新版へ入れ替えている途中です（旧版の PID 7・開始から 3 秒）",
+        ),
+        (
+            "cli",
+            None,
+            "`tako remote start`がリモート daemon を起動している途中です（開始から 3 秒）",
+        ),
+    ] {
+        let marker = StartingMarker {
+            at: 1000,
+            pid: 1,
+            via: via.to_string(),
+            previous_pid,
+        };
+        let old = format!(
+            "{old}。新しい daemon は待ち受けを開いてから PID ファイルを書くまで数十秒かかることがあり、\
+             その間は `running: false` に見えます。止めたり起動し直したりせず、しばらく待ってから \
+             `tako remote status` を読み直してください"
+        );
+        let what = format!("remote_starting::detail_in({via})");
+        let ja = starting::detail_in(&marker, 1003, Lang::Ja);
+        let en = starting::detail_in(&marker, 1003, Lang::En);
+        check_shared(&mut f, &what, &old, &ja, &en);
+        if starting::detail(&marker, 1003) != old {
+            f.push(format!("{what}: 日本語の口（`detail`）が #2365 より前と違う"));
+        }
+        let field = starting::status_field(&marker, 1003, None);
+        if field["detail"] != old.as_str() {
+            f.push(format!(
+                "{what}: 応答の `starting.detail` が #2365 より前の日本語と違う: {}",
+                field["detail"]
+            ));
+        }
+        for (lang, want) in [(Lang::Ja, &ja), (Lang::En, &en)] {
+            let rebuilt = starting::detail_of_status_in(&field, lang).unwrap_or_default();
+            if &rebuilt != want {
+                f.push(format!(
+                    "{what}: 応答の欄から組み直した {lang:?} の文が違う\n  want: {want}\n  got:  {rebuilt}"
+                ));
+            }
+        }
+    }
+    if starting::detail_of_status_in(&serde_json::Value::Null, Lang::En).is_some() {
+        f.push("remote_starting: `starting` の欄が無いのに 1 行を組む".into());
+    }
+
+    // 自己検査の停止（#1049）: 応答の `degraded` は日本語のまま、1 行は表示言語
+    let health: remote_serve::ServeHealth = serde_json::from_value(json!({
+        "ok": true, "checked_at": 1, "state": "ok", "target": "http://127.0.0.1:1"
+    }))
+    .expect("自己検査の結果を読める");
+    let fields = remote_serve::status_fields(Some(&health), 1001, 10);
+    let reason = "serve 設定の自己検査が 1000 秒前から更新されていません（daemon の検査スレッドが止まっている可能性）";
+    let next = "`tako remote stop && tako remote start` で立て直してください";
+    if fields["degraded"]["reason"] != reason || fields["degraded"]["next_step"] != next {
+        f.push(format!(
+            "remote_serve::status_fields: 応答の `degraded` が #2365 より前の日本語と違う: {}",
+            fields["degraded"]
+        ));
+    }
+    check_shared(
+        &mut f,
+        "remote_serve::degraded_warning_in（stale）",
+        &format!("リモート公開が機能していません: {reason}\n  次の一手: {next}"),
+        &remote_serve::degraded_warning_in(&fields, Lang::Ja).unwrap_or_default(),
+        &remote_serve::degraded_warning_in(&fields, Lang::En).unwrap_or_default(),
+    );
+    report_all(f);
 }

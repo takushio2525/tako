@@ -30,7 +30,12 @@
 //!    `vt2716_own_scene`（= `ensure_fresh_scene`）で場面を作る・chat-table が開いた後に
 //!    `drain_pending_preview_loads` を呼ぶ・bracket-match が言語サーバを差し替え、状態の着地
 //!    （`vt_lsp_settled`）を基準のフレームより前に待つ
-//! 4. [`修正前の形を名指しできる`] — 修正前の形を注入すると 1〜3 のどれかが名指しで落ちる
+//! 4. [`修正前の形を名指しできる`] — 修正前の形を注入すると 1〜3・5 のどれかが名指しで落ちる
+//! 5. [`言語サーバの節は自動起動の前提を名指しで確かめる`] — 隔離起動の GUI は
+//!    `TAKO_LSP_AUTOSTART=1` が無いと文書を開いても言語サーバを起こさない（#2048）。付けずに
+//!    全節実行を起こすと lsp-context-menu ① が「言語サーバの節が無い」の FAILED に見えた（段 3 の
+//!    切り分け）。`vt_require_lsp_autostart` が全節実行の頭と差し替えの補助で確かめ、欠けていれば
+//!    `TAKO_VISUAL_TEST_UNMET` の行と終了コード 3（失敗 = 1 と別）で止まる
 //!
 //! ## 相方
 //!
@@ -251,6 +256,74 @@ fn section_problems(main: &str, bracket: &str) -> Vec<String> {
     problems
 }
 
+/// 規則 5: 言語サーバの節の前提（自動起動）を、FAILED と別の名指しで確かめているか
+fn autostart_problems(main: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let code = code_view::code_view(main);
+    let strings = code_view::without_comments(main);
+    match block_range(&code, "fn vt_require_lsp_autostart(") {
+        Some(range) => {
+            let body = &strings[range];
+            for (needle, why) in [
+                (
+                    "autostart_from_env()",
+                    "GUI が manager を作ったときと同じ判定",
+                ),
+                ("TAKO_VISUAL_TEST_UNMET", "FAILED と区別できる行"),
+                (
+                    "visual_exit(VISUAL_UNMET_EXIT_CODE)",
+                    "失敗（1）と別の終了コード",
+                ),
+                ("legacy_2716(\"autostart\")", "A/B の旧の形"),
+            ] {
+                if !body.contains(needle) {
+                    problems.push(format!(
+                        "`vt_require_lsp_autostart` に `{needle}` が無い（{why}）"
+                    ));
+                }
+            }
+            if body.contains("fail(") {
+                problems.push(
+                    "`vt_require_lsp_autostart` が `fail(` で止まる（前提の欠けを FAILED と読み違える）"
+                        .into(),
+                );
+            }
+        }
+        None => problems.push(
+            "`fn vt_require_lsp_autostart(` が無い（言語サーバの節の前提を確かめる口）".into(),
+        ),
+    }
+    if !main.contains("const VISUAL_UNMET_EXIT_CODE: i32 = 3;") {
+        problems.push(
+            "前提の欠けの終了コード `VISUAL_UNMET_EXIT_CODE` が 3 でない（失敗 = 1・置き先が無い = 4 と分ける）"
+                .into(),
+        );
+    }
+    match block_range(&code, "fn vt_lsp_override(").map(|r| &code[r]) {
+        Some(body)
+            if before(
+                body.find("vt_require_lsp_autostart("),
+                body.find("std::env::set_var("),
+            ) => {}
+        _ => problems.push(
+            "`vt_lsp_override` が差し替えを書く前に `vt_require_lsp_autostart(` を通っていない"
+                .into(),
+        ),
+    }
+    // 全節実行の並びの頭（最後の `terminal_grid_visual(` = 全節の最初の節）より前で確かめる
+    if !before(
+        strings.find("vt_require_lsp_autostart(\"全節実行\")"),
+        code.rfind("terminal_grid_visual(any, window, cx).await;"),
+    ) {
+        problems.push(
+            "全節実行の頭（最初の節 `terminal_grid_visual` の前）で `vt_require_lsp_autostart(\"全節実行\")` \
+             を通っていない（欠けたまま何分も走って lsp-context-menu ① の FAILED に見える）"
+                .into(),
+        );
+    }
+    problems
+}
+
 fn app_sources() -> Vec<(String, String)> {
     let root = workspace_root();
     let mut files = Vec::new();
@@ -305,6 +378,12 @@ fn 持ち越しで止まった節は場面と状態を自分で決める() {
 }
 
 #[test]
+fn 言語サーバの節は自動起動の前提を名指しで確かめる() {
+    let problems = autostart_problems(&read(MAIN));
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
 fn 修正前の形を名指しできる() {
     let main = read(MAIN);
     let bracket = read(BRACKET);
@@ -334,8 +413,10 @@ fn 修正前の形を名指しできる() {
     // 2b. 外すときも restart を撃つ（段 2 の途中の形 = 実の PATH の解決が次の節へ着地した）
     let restart_on_remove = main.replacen(
         "let Some(program) = program else {\n            std::env::remove_var(&env);\n            \
-         return id;\n        };\n        std::env::set_var(&env, program);",
-        "match program {\n            Some(program) => std::env::set_var(&env, program),\n            \
+         return id;\n        };\n        vt_require_lsp_autostart(id);\n        \
+         std::env::set_var(&env, program);",
+        "vt_require_lsp_autostart(id);\n        match program {\n            \
+         Some(program) => std::env::set_var(&env, program),\n            \
          None => std::env::remove_var(&env),\n        }",
         1,
     );
@@ -402,5 +483,23 @@ fn 修正前の形を名指しできる() {
             .iter()
             .any(|p| p.contains("状態の着地")),
         "着地を待たない bracket-match を名指せる"
+    );
+    // 5a. 全節実行の頭で自動起動の前提を確かめない（段 2 までの形）
+    let no_head = main.replacen("vt_require_lsp_autostart(\"全節実行\");", "", 1);
+    assert_ne!(no_head, main, "注入先（全節実行の頭の確かめ）が本文に在る");
+    assert!(
+        autostart_problems(&no_head)
+            .iter()
+            .any(|p| p.contains("全節実行の頭")),
+        "頭で確かめない全節実行を名指せる"
+    );
+    // 5b. 前提の欠けを FAILED で止める（読み手が落ちたと読み違える形）
+    let as_failed = main.replacen("visual_exit(VISUAL_UNMET_EXIT_CODE);", "fail(\"前提\");", 1);
+    assert_ne!(as_failed, main, "注入先（前提の欠けの出口）が本文に在る");
+    assert!(
+        autostart_problems(&as_failed)
+            .iter()
+            .any(|p| p.contains("`fail(`")),
+        "前提の欠けを FAILED で止める形を名指せる"
     );
 }

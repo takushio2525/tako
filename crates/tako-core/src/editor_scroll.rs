@@ -375,6 +375,34 @@ mod tests {
         assert_eq!(moved.last_visible() - 200, FOLLOW_MARGIN);
     }
 
+    /// まだ描いていない行は 1 行ぶんで見積もるので、描いてから折り返していたと分かると
+    /// キャレットが器の外に残る。描いた実寸で同じ判断をもう一度すれば入り、折り返さなければ
+    /// 何も動かない（#2737 の確かめ直し。数字は全節実行の md-find-restore の実測）
+    #[test]
+    fn 描いた後に折り返しで行が減ったら同じ判断で寄せ直す() {
+        // 本文 351.5px・行 21px → 見積もり 16 行で 170 行目（ヒット）へ追従して先頭 158
+        let estimated = view(0, 16, 252);
+        assert_eq!(visible_rows(14.0, 351.5, [None::<f32>; 0], 21.0), 16);
+        let first = follow_cursor(estimated, 170, FOLLOW_MARGIN).expect("画面外なので動く");
+        assert_eq!(first, 158);
+        // 本文 149px で filler の行が 42px（2 段）に折り返し、描いた後に入るのは 11 行
+        let drawn_rows = [
+            42.0_f32, 21.0, 42.0, 21.0, 42.0, 21.0, 42.0, 21.0, 42.0, 21.0, 21.0, 21.0,
+        ]
+        .map(Some);
+        let drawn = view(first, visible_rows(14.0, 351.5, drawn_rows, 21.0), 252);
+        assert_eq!(drawn.visible_lines, 11);
+        assert!(!drawn.contains(170), "見積もりのままだとヒットが下端の外");
+        // 描いた実寸で同じ判断をやり直すと入る
+        let again = follow_cursor(drawn, 170, FOLLOW_MARGIN).expect("実寸では外なので動く");
+        assert!(view(again, 11, 252).contains(170));
+        // 折り返さない（見積もりと実寸が同じ）なら確かめ直しは何も動かさない
+        assert_eq!(
+            follow_cursor(view(first, 16, 252), 170, FOLLOW_MARGIN),
+            None
+        );
+    }
+
     /// 文書が器より短いときも、可視行数は器の容量（1 行のファイルでも同じ）
     #[test]
     fn 文書末より先は見積もりの行で埋める() {

@@ -3149,6 +3149,9 @@ struct TakoApp {
             preview_render::PreviewBodyBuild,
         ),
     >,
+    /// 追従の確かめ直しの予約（#2737。[`preview_render::FollowRecheck`]）。追従はまだ描いていない
+    /// 行を 1 行ぶんの高さで見積もるので、描いた後にキャレットが器の外なら追い直す
+    preview_follow_recheck: HashMap<PaneId, preview_render::FollowRecheck>,
     /// 開いた直後に飛ぶ先（FR-3.27 / #1676）。値は仮想リストの item 番号（0 始まり）で、
     /// 行ジャンプは code 表示へ倒すので `line - 1` と一致する。`ListState` は
     /// **描くときに作られる**ので `OpenFile` を処理している時点ではまだ飛べず、
@@ -5591,6 +5594,7 @@ impl TakoApp {
             preview_pdf_page_image_bounds: HashMap::new(),
             preview_text_layouts: HashMap::new(),
             preview_body_lists: HashMap::new(),
+            preview_follow_recheck: HashMap::new(),
             preview_pending_reveal: HashMap::new(),
             preview_md_block_index: HashMap::new(),
             preview_line_starts: HashMap::new(),
@@ -28932,6 +28936,7 @@ impl PreviewHost for TakoApp {
         self.preview_pdf_page_image_bounds.remove(&pane);
         self.preview_text_layouts.remove(&pane);
         self.preview_body_lists.remove(&pane);
+        self.preview_follow_recheck.remove(&pane);
         // #1676: 前のファイルへの着地予約は持ち越さない（行番号の意味が変わる）
         self.preview_pending_reveal.remove(&pane);
         self.preview_md_resume_heading.remove(&pane);
@@ -41005,6 +41010,23 @@ mod self_test {
         (!file.is_empty()).then(|| std::path::PathBuf::from(file))
     }
 
+    /// **#2727 の A/B**（項目 115 の会話の守り）。`TAKO_2727_LEGACY=1` = 修正前の「注入した会話を
+    /// `pin_chat_fixture` で守らない」へ戻す。項目 115 は定期更新をその場で 1 周回すので、旧の腕は
+    /// 決定的に「チャット本文が描かれる」で落ちる（時間の注入は要らない）
+    fn legacy_2727() -> bool {
+        std::env::var("TAKO_2727_LEGACY").as_deref() == Ok("1")
+    }
+
+    /// **#2747 の A/B**（visual-test #745 の会話の守り）。`TAKO_2747_LEGACY=1` = 修正前の「注入した会話を
+    /// `pin_chat_fixture` で守らない」へ戻す。節は定期更新をその場で 1 周回すので、旧の腕は決定的に
+    /// 「定期更新が注入した会話を消さない」で落ちる（時間の注入は要らない）。修正前の表の検査だけでは
+    /// 落ちない: 会話が消える前に 1 度描かれた表の配置（`chat_text_index` / `chat_body_lists`）が残り、
+    /// 3 状態とも会話が無いまま古い配置を測って素通りした（実測。narrow でもチャットの幅が絞られない）
+    #[cfg(feature = "visual-test")]
+    fn legacy_2747() -> bool {
+        std::env::var("TAKO_2747_LEGACY").as_deref() == Ok("1")
+    }
+
     /// **#2711 の A/B**（visual-test 項目 152 のバッジ・tasks-input の送信の間）。
     /// `TAKO_2711_LEGACY=1` / `all` で両方、`152` / `tasks-input`（カンマ区切り）で片方だけ修正前へ戻す
     /// （`check` は 1 つ目の失敗でプロセスごと止まるので、全節実行で後ろの tasks-input の旧の形を
@@ -42685,6 +42707,12 @@ mod self_test {
                         ..Default::default()
                     }),
                 );
+                // #2747: 注入した会話を 2 秒 tick の定期更新から守る（#853 / #2727 と同じ口）。下で
+                // プレビューの読み込みと各状態の 400ms を待つ間に tick が挟まると、実 claude の居ない
+                // このペインは「チャットではない」と読まれて会話が消え、表の検査が空の会話を測る
+                if !legacy_2747() {
+                    app.pin_chat_fixture(chat);
+                }
                 cx.notify();
                 (
                     chat,
@@ -42692,6 +42720,37 @@ mod self_test {
                 )
             })
             .unwrap_or_else(|_| fail("visual-test #745: 準備"));
+        // #2747: 定期更新を**ここで必ず 1 周**回す（項目 98 / 115 と同じ。tick が挟まるかを運に任せない）。
+        // 守っていないペインは「チャットではない」と読まれ、`apply_chat_refresh` が注入した会話を消す
+        let targets745 = window
+            .update(cx, |app, _, _| app.collect_chat_targets())
+            .unwrap_or_default();
+        let targets_fixture745 = targets745.iter().any(|t| t.pane() == chat_pane);
+        let refreshed745 = if targets745.is_empty() {
+            Vec::new()
+        } else {
+            cx.background_executor()
+                .spawn(async move { chat_view::load_chat_refresh(targets745) })
+                .await
+        };
+        let _ = window.update(cx, |app, _, _| app.apply_chat_refresh(refreshed745));
+        let kept745 = window
+            .update(cx, |app, _, _| app.chat_panes.contains_key(&chat_pane))
+            .unwrap_or(false);
+        println!(
+            "TAKO_VISUAL_2747_745: legacy={} targets_include_fixture={targets_fixture745} \
+             kept={kept745}",
+            legacy_2747()
+        );
+        // 守りが外れた回はここで名指す（旧の腕も。下の表の検査は会話が消えても、消える前に描かれた
+        // 表の配置の残りを測って素通りする = 修正前はそれで偽の PASS になりえた）
+        check(
+            kept745 && !targets_fixture745,
+            &format!(
+                "visual-test #745: 定期更新が注入した会話を消さない (#2747 / #853。\
+                 targets_include_fixture={targets_fixture745} / kept={kept745})"
+            ),
+        );
         // プレビューの background ロード（Markdown ブロックへの差し替え）を待つ
         let loaded = wait_for_preview_state(window, cx, Duration::from_secs(5), |app| {
             matches!(
@@ -42802,6 +42861,10 @@ mod self_test {
                         )
                     })
                     .unwrap_or_else(|_| fail("visual-test #745: 状態取得"));
+            // #2747: 会話が残っているか（守りが外れると表の検査は空の会話を測る）
+            let has_chat = window
+                .update(cx, |app, _, _| app.chat_panes.contains_key(&chat_pane))
+                .unwrap_or(false);
 
             // 表ごとに「列の最大幅」を出してからセルを判定する（同じ列の取り分は
             // 行をまたいで同じなので、折り返したセルは列幅を使い切っていないと崩れ）
@@ -42883,7 +42946,14 @@ mod self_test {
                 "TAKO_VISUAL_PIXEL: chat-table {state} chat_w={chat_width:.0} prev_w={prev_width:.0} \
                  collapsed={chat_collapsed} prev_collapsed={prev_collapsed} \
                  chat_h={chat_height:.0} prev_h={prev_height:.0} ratio={ratio:.2} \
-                 overlaps={overlaps} ink={ink}{chat_detail}{prev_detail}"
+                 overlaps={overlaps} ink={ink} chat_pane={has_chat}{chat_detail}{prev_detail}"
+            );
+            // #2747: 表の検査が空の会話（消える前の配置の残り）を測っていない
+            check(
+                has_chat,
+                &format!(
+                    "visual-test #745({state}): 表を測る時点で注入した会話が残っている (#2747)"
+                ),
             );
             check(
                 chat_collapsed == 0,
@@ -42941,6 +43011,9 @@ mod self_test {
             app.ui_mode = tako_core::ui_mode::UiMode::Terminal;
             app.chat_panes.clear();
             app.chat_text_index.clear();
+            // #2747: 守りも外す（このペインは閉じない = フォーカス中の元のペイン。残すと後の節で
+            // このペインが定期更新の対象から外れたままになる）
+            app.chat_fixture_panes.remove(&chat_pane);
             let _ = tako_control::dispatch(
                 app,
                 tako_control::protocol::Request::Close {
@@ -50852,6 +50925,10 @@ mod self_test {
                 }
             }
 
+            // #2716: 全節実行は言語サーバの節を通るので、自動起動の前提を頭で確かめる
+            // （欠けていれば何分も走った後の FAILED ではなく、ここで前提の欠けとして名指す）
+            vt_require_lsp_autostart("全節実行");
+
             // #787 の前提整備: 端末グリッドの描画をピクセルで固定する。ターミナルが
             // 素の状態（1 ペイン・プロンプトだけ・テーマ既定）のうちに先に撮るので、
             // 以降の節がプレビュー / チャット / テーマを触っても影響を受けない
@@ -54697,6 +54774,8 @@ mod self_test {
     ///   前の節が覚えた実行ファイルの解決を捨てない（[`vt_lsp_override`]）
     /// - `bracket-match` = fixture の言語サーバを決めず、状態の着地も待たずに基準を撮る
     /// - `chat-table` = dispatch で開いた後に積んだ読み込みを流さない（ファイル監視の読み直し頼み）
+    /// - `autostart` = 言語サーバの自動起動の前提を確かめない（[`vt_require_lsp_autostart`]。欠けたまま
+    ///   進んで lsp-context-menu ① が FAILED に見える）
     #[cfg(feature = "visual-test")]
     fn legacy_2716(item: &str) -> bool {
         std::env::var("TAKO_2716_LEGACY").is_ok_and(|value| {
@@ -54772,6 +54851,31 @@ mod self_test {
             .id
     }
 
+    /// visual-test の前提の欠けで止める出口の終了コード（#2716）。落ちた（`fail` = 1）・知らない節（1）・
+    /// 置き先が無い（4 = `disp::REFUSED_EXIT_CODE`）と分ける = 検証の結論ではなく起こし方の誤り
+    #[cfg(feature = "visual-test")]
+    const VISUAL_UNMET_EXIT_CODE: i32 = 3;
+
+    /// **言語サーバを使う visual-test の前提を確かめる**（#2716）。隔離起動（`TAKO_ISOLATED`）の GUI は
+    /// 文書を開いても言語サーバを起こさない（#2048）。`TAKO_LSP_AUTOSTART=1` を付けずに起こすと、
+    /// 差し替えの restart が起こすのは既にある器だけで、節が後から開いた文書の器は起こされず、
+    /// 言語サーバの節が `FAILED`（lsp-context-menu ① の「言語サーバの節が無い」）に見えていた。
+    /// 欠けていれば FAILED ではなく `TAKO_VISUAL_TEST_UNMET` の行と終了コード 3 で名指して止まる
+    /// （後片付けは成功・失敗と同じ [`visual_exit`]）。判定は GUI が manager を作ったときと同じ
+    /// `autostart_from_env`。`TAKO_2716_LEGACY=autostart` は確かめない（修正前 = A/B）
+    #[cfg(feature = "visual-test")]
+    fn vt_require_lsp_autostart(label: &str) {
+        if legacy_2716("autostart") || tako_control::lsp::manager::autostart_from_env() {
+            return;
+        }
+        println!(
+            "TAKO_VISUAL_TEST_UNMET: {label}: 言語サーバの節の前提が欠けている。隔離起動の GUI は文書を\
+             開いても言語サーバを起こさない（#2048）ので、全節実行と言語サーバの節は \
+             TAKO_LSP_AUTOSTART=1 を付けて起こす（#2716）"
+        );
+        visual_exit(VISUAL_UNMET_EXIT_CODE);
+    }
+
     /// **visual-test の節が言語サーバの差し替え口（`TAKO_LSP_BIN_<ID>`）を書く・外す 1 実装**（#2716）。
     ///
     /// env を書く（`Some`）ときは restart の口（`tako lsp restart --name <ID>` / MCP の
@@ -54796,6 +54900,7 @@ mod self_test {
             std::env::remove_var(&env);
             return id;
         };
+        vt_require_lsp_autostart(id);
         std::env::set_var(&env, program);
         if legacy_2716("lsp-override") {
             return id;
@@ -62370,6 +62475,9 @@ mod self_test {
     /// Escape・Enter）へ流す。**文字は打たない**: クエリは dispatch（CLI `tako edit search` と
     /// 同じ口）で入れる（実キーの文字は機の入力ソースが未確定文字列を立てることがある = #1661）。
     /// A/B: `TAKO_1873_LEGACY=1` は ① の「描画へ戻る」で落ちる。
+    /// #2737: 本文は節の頭で約 150px へ狭める（行が 2 段に折り返す幅 = 全節実行で実測した場面）。
+    /// ① の Enter の後に、飛んだ行が描いた本文の可視範囲に入るのを状態で待ち、行の実寸の矩形で
+    /// 確かめる。`TAKO_2737_LEGACY=1`（描いた後に追従を確かめ直さない）はそこで名指しで落ちる。
     /// 単独実行は `TAKO_VISUAL_ONLY=md-find-restore`
     #[cfg(feature = "visual-test")]
     async fn md_find_restore_visual(
@@ -62390,9 +62498,23 @@ mod self_test {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("visual-test md-find-restore 一時ディレクトリ");
         let path = dir.join("note.md");
-        // Beta は画面の外に置く（閉じた後に「ヒットのあった節から描く」が見分けられる距離）
-        let filler: String = (0..80).map(|i| format!("filler line {i}\n\n")).collect();
-        let tail: String = (0..40).map(|i| format!("tail line {i}\n\n")).collect();
+        // Beta は画面の外に置く（閉じた後に「ヒットのあった節から描く」が見分けられる距離）。
+        // #2737: 先頭側の filler は狭い本文でも折り返さない短さ、Beta の手前の 10 本と Beta の後ろの
+        // tail は折り返す長さにする（先頭を描いた実寸では 1 行 = 1 段なのに、飛び先は 2 段以上 =
+        // 追従の見積もりが飛び先で外れる場面を、全節実行でも単独でも同じに作る。tail も長いのは、
+        // 確かめ直しで寄せた後の可視範囲にも折り返した行が入り、前提を新旧どちらでも確かめられるため）
+        let filler: String = (0..80)
+            .map(|i| {
+                if i < 70 {
+                    format!("f{i}\n\n")
+                } else {
+                    format!("filler line {i} long enough to wrap in a narrow pane\n\n")
+                }
+            })
+            .collect();
+        let tail: String = (0..40)
+            .map(|i| format!("tail line {i} long enough to wrap in a narrow pane\n\n"))
+            .collect();
         let fixture = format!(
             "# Title\n\nintro\n\n## Alpha\n\nbody a\n\n{filler}## Beta\n\nneedle b\n\n{tail}"
         );
@@ -62511,6 +62633,52 @@ mod self_test {
             "visual-test md-find-restore: 描画表示で開いて目次が 3 件 (#1873)",
         );
 
+        // #2737: 狭いペイン（行が折り返す幅）を節が自分で作る。全節実行では前の節が残した分割で
+        // 本文が 149px まで狭まり、filler の行が 2 段に折り返して ⌘F → Enter のヒットが下端の外に
+        // 隠れていた（単独は 450px で折り返さず通る）。どちらでも同じ場面になるよう、広ければ
+        // 右に分割して本文をその幅へ寄せる
+        const NARROW_BODY_PX: f32 = 150.0;
+        let body_width = |cx: &mut AsyncApp| {
+            notify_and_draw(any, window, cx);
+            window
+                .update(cx, |app, _, _| {
+                    app.preview_viewport_bounds(pane)
+                        .map(|b| f32::from(b.size.width))
+                })
+                .ok()
+                .flatten()
+        };
+        let wide = body_width(cx);
+        if let Some(width) = wide.filter(|w| *w > NARROW_BODY_PX * 1.2) {
+            let _ = window.update(cx, |app, _, cx| {
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::Split {
+                        pane: Some(pane.as_u64()),
+                        tab: None,
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        // 新しいペインの取り分。本文の側に NARROW_BODY_PX ぶんを残す
+                        ratio: Some(1.0 - NARROW_BODY_PX / width),
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    PaneOrigin::Cli,
+                );
+                let _ = app.attach_pending_sessions(cx);
+                let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
+                cx.notify();
+            });
+        }
+        let narrow = body_width(cx);
+        println!("TAKO_VISUAL_PIXEL: md-find-restore narrow body_w {wide:?} -> {narrow:?}");
+        check(
+            narrow.is_some_and(|w| w <= NARROW_BODY_PX * 1.2),
+            &format!(
+                "visual-test md-find-restore: 前提 = 本文が狭い（{narrow:?} px。行が折り返す幅）(#2737)"
+            ),
+        );
+
         // ① ⌘F → クエリ → Enter（code へ落ちる）→ Escape で描画へ戻る
         key(cx, find_key);
         let opened = observe(cx, pane);
@@ -62529,7 +62697,73 @@ mod self_test {
                 "visual-test md-find-restore: 検索中はエディタの行（code）の上にヒットを描く（{total} 件。{searching:?}）(#1873)"
             ),
         );
+        // #2737: Enter で飛んだ行は、描いた後も本文の可視範囲に入る（狭いペインで折り返した行の
+        // 下に隠れない）。人は見えてから閉じるので、追従の確かめ直しが着地するのを毎周期 1 フレーム
+        // 描きながら状態で待つ（確かめ直しは描いた次の描画の頭で効く）。旧の追従
+        // （`TAKO_2737_LEGACY=1`）は見積もりのまま = 描いても入らず名指しで落ちる
+        let shown = wait_for_drawn_state(
+            window,
+            any,
+            cx,
+            "md-find-hit-visible",
+            Duration::from_secs(15),
+            |app| {
+                app.preview_cursor_viewport(pane)
+                    .is_some_and(|(caret, view)| view.contains(caret))
+            },
+        )
+        .await;
+        notify_and_draw(any, window, cx);
+        let hit = window
+            .update(cx, |app, _, _| {
+                let (caret, view) = app.preview_cursor_viewport(pane)?;
+                let body = app.preview_viewport_bounds(pane)?;
+                let line = app.preview_row_geometry(pane)?.line_height;
+                let rows = app.preview_text_layouts.get(&pane)?;
+                let row = rows
+                    .get(caret)
+                    .and_then(Option::as_ref)
+                    .map(|layout| layout.bounds());
+                let wrapped = rows
+                    .iter()
+                    .flatten()
+                    .filter(|layout| layout.bounds().size.height > line * 1.5)
+                    .count();
+                Some((caret, view, body, row, wrapped))
+            })
+            .ok()
+            .flatten();
+        let (inside, wrapped) = match &hit {
+            Some((caret, view, body, row, wrapped)) => {
+                println!(
+                    "TAKO_VISUAL_PIXEL: md-find-restore hit caret={caret} first={} visible={} \
+                     row={:?} body_y={:?}..{:?} wrapped_rows={wrapped} shown={shown}",
+                    view.first_visible,
+                    view.visible_lines,
+                    row.map(|r| (f32::from(r.top()), f32::from(r.bottom()))),
+                    f32::from(body.top()),
+                    f32::from(body.bottom()),
+                );
+                (
+                    row.is_some_and(|r| r.top() >= body.top() && r.bottom() <= body.bottom()),
+                    *wrapped,
+                )
+            }
+            None => (false, 0),
+        };
+        // 確かめの前に撮る（隠れて落ちた回も、狭い本文のどこに何が描かれていたかが絵で残る）
         dump(cx, "md-find-0-searching.png");
+        check(
+            wrapped > 0,
+            "visual-test md-find-restore: 前提 = 狭いペインで本文の行が折り返している (#2737)",
+        );
+        check(
+            shown && inside,
+            &format!(
+                "visual-test md-find-restore: 検索のヒット（Enter で飛んだ行）が本文の可視範囲に描かれる\
+                 （狭いペインで折り返した行の下に隠れない。{hit:?}）(#2737)"
+            ),
+        );
         key(cx, "escape");
         let restored = wait_for_markdown_outline(window, cx, pane, 3).await;
         let closed = observe(cx, pane);
@@ -83189,6 +83423,8 @@ mod self_test {
                             },
                             PaneOrigin::User,
                         );
+                        // tako:chat-fixture-ok 注入から最後の読み取り（下の (a)〜(d)）まで .await を挟まない（#2747）。
+                        // 以後の待ちで定期更新に消されても読まない（項目 95 が会話を作り直す）
                         app.chat_panes.insert(
                             chat_pane,
                             std::rc::Rc::new(chat_view::ChatPaneState {
@@ -85698,6 +85934,7 @@ mod self_test {
                             "text": long_text,
                         })]);
                         let key = messages[0].key;
+                        // tako:chat-fixture-ok 項目 98（#725）の始めに pin 済みの chat_pane への入れ直し（#853 / #2747）
                         app.chat_panes.insert(
                             chat_pane,
                             std::rc::Rc::new(chat_view::ChatPaneState {
@@ -85753,6 +85990,7 @@ mod self_test {
                             "attachments": [{ "kind": "image" }],
                         })]);
                         let key = messages.first().map(|m| m.key).unwrap_or_default();
+                        // tako:chat-fixture-ok 項目 98（#725）の始めに pin 済みの chat_pane への入れ直し（#853 / #2747）
                         app.chat_panes.insert(
                             chat_pane,
                             std::rc::Rc::new(chat_view::ChatPaneState {
@@ -85812,6 +86050,7 @@ mod self_test {
                                     "text": format!("新着 {selecting}"),
                                 }),
                             ]);
+                            // tako:chat-fixture-ok 項目 98（#725）の始めに pin 済みの chat_pane への入れ直し（#853 / #2747）
                             app.chat_panes.insert(
                                 chat_pane,
                                 std::rc::Rc::new(chat_view::ChatPaneState {
@@ -86058,20 +86297,32 @@ mod self_test {
                 //     `tako master` を起こし、それが本物の claude を exec する（項目 93(d1) /
                 //     97(d) と同じ作法で、積まれた行そのものを見て同じ update の中で取り下げる。
                 //     組んだ行が実際に実行される形であることは項目 93(d2) が `--version` で見る）。
+                // 選ぶ直前のペインの様子も控える（#2727 段 1: 混んだ機で `selected=false` = 選んだ時点で
+                // そのペインのシェルが無かった回があり、閉じたのかシェルだけが無いのかを次に名指すため）
                 // #967 と同型: 期待値は**製品が組む行**から作る（`tako master -<name>` の
                 // リテラルは Windows で成立しない。実体は `…\tako.exe master -<name>`）
                 let master_line = starter::starter_subcommand(StarterAction::Master, Some(probe))
                     .map(|sub| tako_control::welcome::launch_command_line(&sub))
                     .unwrap_or_default();
-                let (selected, queued739) = window
+                let (selected, queued739, pane_before) = window
                     .update(cx, |app, _, cx| {
+                        let before = format!(
+                            "shell={} in_tree={} backend={:?} display={:?} state={:?}",
+                            app.terminals.contains_key(&starter_pane),
+                            app.workspace.find_tab_of_pane(starter_pane).is_some(),
+                            app.backend_sessions.get(&starter_pane),
+                            app.pane_display_for(starter_pane),
+                            app.terminals
+                                .get(&starter_pane)
+                                .map(|s| s.command_state()),
+                        );
                         let selected = app.starter_action_with_profile(
                             starter_pane,
                             StarterAction::Master,
                             Some(probe),
                             cx,
                         );
-                        (selected, withdraw_launch(app, starter_pane))
+                        (selected, withdraw_launch(app, starter_pane), before)
                     })
                     .unwrap_or_default();
                 let delivered = !master_line.is_empty() && queued739 == [master_line.clone()];
@@ -86081,7 +86332,8 @@ mod self_test {
                     .unwrap_or(false);
                 println!(
                     "TAKO_SELF_TEST_739_LAUNCH: opened={opened} selected={selected} \
-                     delivered={delivered} closed={closed} line={:?} queued={queued739:?}",
+                     delivered={delivered} closed={closed} line={:?} queued={queued739:?} \
+                     pane_before=[{pane_before}]",
                     starter::starter_subcommand(StarterAction::Master, Some(probe)),
                 );
                 check(
@@ -86308,6 +86560,7 @@ mod self_test {
                 // 作り直すので、合成した状態は待っている間に消える。検査の直前で必ず
                 // 積み直す（消えるとチャット表示にならず判定が空振りする）
                 let ensure_chat = |app: &mut TakoApp, busy: bool| {
+                    // tako:chat-fixture-ok 検査の直前に毎回積み直す（積み直してから読むまで .await を挟まない。#2747）
                     app.chat_panes.insert(
                         chat_pane,
                         std::rc::Rc::new(chat_view::ChatPaneState {
@@ -91358,17 +91611,62 @@ mod self_test {
                                 ..Default::default()
                             }),
                         );
+                        // #2727: 注入した会話を 2 秒 tick の定期更新から守る（#853 と同じ口。同じ
+                        // ペインへ後で入れ直す新着の会話も、このペインの pin で守られる）
+                        if !legacy_2727() {
+                            app.pin_chat_fixture(pane);
+                        }
                         let _ = app.workspace.active_tab_mut().tree_mut().focus(pane);
                         cx.notify();
                         pane
                     })
                     .unwrap_or_else(|_| fail("115: チャットペインを用意できない (#830)"));
-                // 実描画されるまで回す（`TextLayout` は描き終わらないと bounds を持たない）
+                // #2727: 定期更新を**ここで必ず 1 周**回す（項目 98 と同じ。tick が挟まるかを運に任せない）。
+                // 守っていないペインは、実 claude が動いていないので「チャットではない」と読まれ、
+                // `apply_chat_refresh` が注入した会話を消す。表示はスターターへ戻り、下の描画待ちが
+                // 上限で切れる（混んだ機で描き終わる前に tick が挟まった回に `display=Starter` で落ちていた）
+                let targets830 = window830
+                    .update(cx, |app: &mut TakoApp, _, _| app.collect_chat_targets())
+                    .unwrap_or_default();
+                let targets_fixture830 = targets830.iter().any(|t| t.pane() == pane830);
+                let refreshed830 = if targets830.is_empty() {
+                    Vec::new()
+                } else {
+                    cx.background_executor()
+                        .spawn(async move { chat_view::load_chat_refresh(targets830) })
+                        .await
+                };
+                let _ = window830.update(cx, |app: &mut TakoApp, _, _| {
+                    app.apply_chat_refresh(refreshed830)
+                });
+                let kept830 = window830
+                    .update(cx, |app: &mut TakoApp, _, _| {
+                        app.chat_panes.contains_key(&pane830)
+                    })
+                    .unwrap_or(false);
+                println!(
+                    "TAKO_SELF_TEST_2727_115: legacy={} targets_include_fixture={targets_fixture830} \
+                     kept={kept830}",
+                    legacy_2727()
+                );
+                // 守りが外れた回は描画待ちの上限と読み違えないよう先に名指す。旧の腕は修正前と同じく
+                // 下の「チャット本文が描かれる」で落ちる形のまま
+                if !legacy_2727() {
+                    check(
+                        kept830 && !targets_fixture830,
+                        &format!(
+                            "115: 定期更新が注入した会話を消さない (#2727 / #853。\
+                             targets_include_fixture={targets_fixture830} / kept={kept830})"
+                        ),
+                    );
+                }
+                // 実描画されるまで回す（`TextLayout` は描き終わらないと bounds を持たない）。
+                // 上限は機の混み具合で伸ばす（#2727。81 発話の初回の描画は混んだ機で重い）
                 let drawn830 = wait_for_preview_drawn(
                     any830,
                     window830,
                     cx,
-                    Duration::from_secs(10),
+                    state_wait_budget(Duration::from_secs(10), machine_busy()),
                     |app: &TakoApp| {
                         app.pane_display_for(pane830)
                             == tako_core::ui_mode::PaneDisplay::Chat
@@ -91382,7 +91680,12 @@ mod self_test {
                 if drawn830.is_none() {
                     let why = window830
                         .update(cx, |app: &mut TakoApp, _, _| {
-                            format!("display={:?}", app.pane_display_for(pane830))
+                            format!(
+                                "display={:?} chat_pane={} pinned={}",
+                                app.pane_display_for(pane830),
+                                app.chat_panes.contains_key(&pane830),
+                                app.chat_fixture_panes.contains(&pane830)
+                            )
                         })
                         .unwrap_or_default();
                     println!("TAKO_SELF_TEST_830_NOTDRAWN: pane={pane830:?} {why}");
@@ -110961,6 +111264,197 @@ mod chat_fixture_pin_watchdog {
         assert!(body_of(&pinned, "collect_chat_targets").contains("chat_fixture_panes"));
         // 番犬モジュール自身は走査から外れている（自分の文字列で素通りしない）
         assert!(!scanned(include_str!("main.rs")).contains("mod chat_fixture_pin_watchdog"));
+    }
+
+    /// `chat_panes` へ会話を入れる口と、守る口（`concat!` で分割 = 番犬自身の行が対象に入らない）
+    const CHAT_INSERT: &str = concat!("chat_panes", ".insert(");
+    const PIN: &str = concat!("pin_chat", "_fixture(");
+    /// 注入した会話の印（`ChatPaneState` の `session_id`）。この接頭辞の会話は実 claude の transcript ではない
+    const FIXTURE_IDS: &[&str] = &[concat!("\"self", "test-"), concat!("\"vis", "ual-")];
+    /// 逃げ道（その行か直前のコメント行に `tako:chat-fixture-ok <理由>`）。守られているのに規則が見分けられない
+    /// 形に使う（pin 済みのペインへの入れ直し・最後の読み取りまで `.await` を挟まない・検査の直前の積み直し）
+    const FIXTURE_ALLOW: &str = concat!("tako:chat", "-fixture-ok");
+    /// 会話の片付け。次の `.await` より前に片付ける注入は tick が割り込めないので守らなくてよい（#2747）
+    const CHAT_CLEAR: &str = concat!("chat_panes", ".clear()");
+    const CHAT_REMOVE: &str = concat!("chat_panes", ".remove(");
+
+    /// 注入した会話を `chat_panes` へ入れた後、同じ同期区間（前後の `.await` の間 = tick が割り込めない区間）で
+    /// `pin_chat_fixture` を呼んでいない会話（最初に入れた行, session_id）。
+    ///
+    /// 項目 115（#830）は 81 発話の会話を入れてから描画を `.await` で待っていたが pin しておらず、
+    /// 待っている間に 2 秒 tick の定期更新が挟まると、実 claude が動いていないペインは「チャットではない」と
+    /// 読まれて `apply_chat_refresh` が会話を消し、表示がスターターへ戻って描画待ちが上限で切れた（#2727）。
+    ///
+    /// 見るのは session_id ごとの**最初の**注入だけ（同じ session_id の入れ直しは同じペインへの新着 =
+    /// 最初の pin で守られる、とみなす）。入れてから次の `.await` までに会話を片付ける（`clear()` /
+    /// `remove(`）注入は、入れて・読んで・消すまでが 1 つの同期区間なので名指さない（#2747）。
+    /// 限界: 同じ session_id を別のペインへ入れる形と、別のペインの `remove(` で片付けたと読み違える形は
+    /// 見逃す。同期区間は字面の `.await` で切る（`.await` を含まない待ちの補助は区間の外を見ない）
+    fn unpinned_fixture_inserts(lines: &[(usize, &str)]) -> Vec<(usize, String)> {
+        let code = |line: &str| {
+            let t = line.trim();
+            !t.is_empty() && !t.starts_with("//")
+        };
+        let marked = |line: &str| {
+            line.find(FIXTURE_ALLOW)
+                .is_some_and(|p| !line[p + FIXTURE_ALLOW.len()..].trim().is_empty())
+        };
+        let mut seen: Vec<String> = Vec::new();
+        let mut hits = Vec::new();
+        for (index, (number, line)) in lines.iter().enumerate() {
+            if !(code(line) && line.contains(CHAT_INSERT)) {
+                continue;
+            }
+            // 入れる値の中の session_id（入れ直しの `Rc::new(next)` は持たない = 対象外）
+            let Some(id) = lines[index..]
+                .iter()
+                .take(8)
+                .filter_map(|(_, l)| {
+                    let at = l.find("session_id: ")?;
+                    let rest = &l[at + "session_id: ".len()..];
+                    FIXTURE_IDS
+                        .iter()
+                        .any(|p| rest.starts_with(p))
+                        .then(|| rest.trim_start_matches('"').split('"').next().unwrap_or(""))
+                })
+                .next()
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id.clone());
+            let start = lines[..index]
+                .iter()
+                .rposition(|(_, l)| code(l) && l.contains(".await"))
+                .map_or(0, |i| i + 1);
+            let end = lines[index..]
+                .iter()
+                .position(|(_, l)| code(l) && l.contains(".await"))
+                .map_or(lines.len(), |i| index + i);
+            let pinned = lines[start..end]
+                .iter()
+                .any(|(_, l)| code(l) && l.contains(PIN));
+            let cleared = lines[index..end]
+                .iter()
+                .any(|(_, l)| code(l) && (l.contains(CHAT_CLEAR) || l.contains(CHAT_REMOVE)));
+            let allowed = marked(line)
+                || lines[..index]
+                    .iter()
+                    .rev()
+                    .take_while(|(_, l)| l.trim_start().starts_with("//"))
+                    .any(|(_, l)| marked(l));
+            if !pinned && !cleared && !allowed {
+                hits.push((*number, id));
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn 注入した会話は次のawaitまでにpinしている() {
+        use super::selftest_launch_withdraw_watchdog::self_test_region;
+        let mut found: Vec<(String, String)> =
+            unpinned_fixture_inserts(&self_test_region(scanned(include_str!("main.rs"))))
+                .into_iter()
+                .map(|(line, id)| (format!("crates/tako-app/src/main.rs:{line}"), id))
+                .collect();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/self_test");
+        for entry in std::fs::read_dir(&dir).expect("src/self_test").flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            let lines: Vec<(usize, &str)> =
+                src.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            found.extend(
+                unpinned_fixture_inserts(&lines)
+                    .into_iter()
+                    .map(|(line, id)| (format!("crates/tako-app/src/self_test/{name}:{line}"), id)),
+            );
+        }
+        assert!(
+            found.is_empty(),
+            "{found:?} が注入した会話を pin せずに `.await` を挟んでいる。待っている間に 2 秒 tick の定期更新が\
+             挟まると、実 claude が動いていないペインは「チャットではない」と読まれて会話が消え、表示が\
+             スターターへ戻る（#2727 / #853）。入れた update の中で `pin_chat_fixture(pane)` を呼ぶこと。\
+             別の形で守られている（pin 済みのペインへの入れ直し等）なら、その行か直前のコメント行に\
+             `tako:chat-fixture-ok <理由>` を書く"
+        );
+    }
+
+    /// 検出力の担保: 修正前の項目 115 の形を名指し、同じ区間の pin・印・入れ直しは許す
+    #[test]
+    fn 番犬はpinしない注入を見逃さず同じ区間のpinと入れ直しは許す() {
+        let owned = |src: &str| -> Vec<(usize, String)> {
+            src.lines()
+                .enumerate()
+                .map(|(i, l)| (i + 1, l.to_string()))
+                .collect()
+        };
+        let hits = |src: &str| {
+            let lines = owned(src);
+            let borrowed: Vec<(usize, &str)> =
+                lines.iter().map(|(n, l)| (*n, l.as_str())).collect();
+            unpinned_fixture_inserts(&borrowed)
+        };
+        let insert = |id: &str| {
+            format!(
+                "            app.{}\n                pane,\n                Rc::new(ChatPaneState {{\n                    \
+                 session_id: \"{id}\".into(),\n                }}),\n            );",
+                CHAT_INSERT
+            )
+        };
+        let pin = format!("            app.{PIN}pane);");
+        let draw = "        let drawn = wait_for_preview_drawn(any, window, cx, budget, f).await;";
+        let id = concat!("self", "test-830");
+        // 修正前の項目 115（入れる → pin せずに描画を await で待つ）
+        let bad = format!("{}\n{draw}", insert(id));
+        assert_eq!(hits(&bad), vec![(1, id.to_string())]);
+        // 修正後（同じ update の中で pin = 次の await より前）
+        let good = format!("{}\n{pin}\n{draw}", insert(id));
+        assert!(hits(&good).is_empty());
+        // 前の await の後・入れる前の pin も同じ区間
+        let pin_first = format!("        x.await;\n{pin}\n{}\n{draw}", insert(id));
+        assert!(hits(&pin_first).is_empty());
+        // 次の await の後の pin は遅い（待っている間に消える）
+        let late = format!("{}\n{draw}\n{pin}", insert(id));
+        assert_eq!(hits(&late), vec![(1, id.to_string())]);
+        // 同じ session_id の入れ直し（新着）は最初の注入の pin で守られるとみなす
+        let reinsert = format!("{}\n{pin}\n{draw}\n{}\n{draw}", insert(id), insert(id));
+        assert!(hits(&reinsert).is_empty());
+        // 次の await より前に片付ける注入（入れて・読んで・消すまでが同期区間）は許す（#2747）
+        let clear = format!("            app.{CHAT_CLEAR};");
+        assert!(hits(&format!("{}\n{clear}\n{draw}", insert(id))).is_empty());
+        let remove = format!("            app.{CHAT_REMOVE}&pane);");
+        assert!(hits(&format!("{}\n{remove}\n{draw}", insert(id))).is_empty());
+        // 片付けの前に await を挟めば名指す（待っている間に消える）
+        let cleared_late = format!("{}\n{draw}\n{clear}", insert(id));
+        assert_eq!(hits(&cleared_late), vec![(1, id.to_string())]);
+        // 前の区間の片付けは数えない（入れる前の clear は守りにならない）
+        let cleared_before = format!("{clear}\n{}\n{draw}", insert(id));
+        assert_eq!(hits(&cleared_before), vec![(2, id.to_string())]);
+        // 理由つきの印は外す・理由の無い印では外さない
+        let allow = concat!("tako:chat", "-fixture-ok");
+        let marked = format!(
+            "            // {allow} 待たずにその場で読む\n{}\n{draw}",
+            insert(id)
+        );
+        assert!(hits(&marked).is_empty());
+        let bare = format!("            // {allow}\n{}\n{draw}", insert(id));
+        assert_eq!(hits(&bare), vec![(2, id.to_string())]);
+        // 注入ではない入れ直し（session_id を持たない）と、実 claude の session は対象外
+        let update = format!("            app.{CHAT_INSERT}pane, Rc::new(next));\n{draw}");
+        assert!(hits(&update).is_empty());
+        assert!(hits(&format!("{}\n{draw}", insert("abc-real-session"))).is_empty());
     }
 }
 
