@@ -40974,6 +40974,32 @@ mod self_test {
     /// `TAKO_2689_INJECT=late` で Tab / Enter を遅らせる長さ（修正前の固定待ち 800ms を十分に超える）
     const INJECT_2689_LATE: Duration = Duration::from_secs(3);
 
+    /// **#2478 の A/B**（項目 128 の脈動の前提）。`TAKO_2478_LEGACY=1` = 修正前の「シェルの起動を
+    /// 固定 1500ms 待ってから Running を注入する」へ戻す
+    fn legacy_2478() -> bool {
+        std::env::var("TAKO_2478_LEGACY").as_deref() == Ok("1")
+    }
+
+    /// **#2478 の注入口**（項目 128。検証プロセスの門の内側でだけ読む）。
+    ///
+    /// `slow-shell:<ファイル>` = 項目 128 の検証用ペインの ID を、シェルを起こす直前にそのファイルへ書く。
+    /// 呼び手（`scripts/test-selftest-128-2478.sh`）が置いた `.zshrc` は `TAKO_PANE_ID` がファイルの中身と
+    /// 同じペインでだけ 3 秒眠るので、シェルの最初のプロンプト（precmd の `133;A`）が修正前の固定待ち
+    /// 1500ms より後に届く = 混んだ機で rc の読み込みが遅れた回（load 20 で 1 回落ちた）を負荷なしで作る。
+    /// 修正前は遅れて届いた `133;A` が注入した Running を Idle へ上書きし、② が「不透明度が最後に計算した
+    /// 値で止まる」で FAILED、修正後は最初のプロンプトを待ってから注入するので通る。
+    ///
+    /// 印を env で渡さないのは、器（tmux）越しのペインのシェルへ届く env が `session_pinned_pairs` の
+    /// 許可リストに限られるため（`TAKO_PANE_ID` は載る）。返すのは書き先のファイル
+    fn inject_2478_slow_shell() -> Option<std::path::PathBuf> {
+        if !tako_core::paths::is_verification_process() {
+            return None;
+        }
+        let value = std::env::var("TAKO_2478_INJECT").ok()?;
+        let file = value.strip_prefix("slow-shell:")?;
+        (!file.is_empty()).then(|| std::path::PathBuf::from(file))
+    }
+
     /// **#2711 の A/B**（visual-test 項目 152 のバッジ・tasks-input の送信の間）。
     /// `TAKO_2711_LEGACY=1` / `all` で両方、`152` / `tasks-input`（カンマ区切り）で片方だけ修正前へ戻す
     /// （`check` は 1 つ目の失敗でプロセスごと止まるので、全節実行で後ろの tasks-input の旧の形を
@@ -93852,6 +93878,7 @@ mod self_test {
             {
                 let any945 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
                 let window945 = any945.downcast::<TakoApp>().unwrap_or(window);
+                let slow_shell = inject_2478_slow_shell();
                 let pane945 = window945
                     .update(cx, |app: &mut TakoApp, _, cx| {
                         let r = tako_control::dispatch(
@@ -93864,20 +93891,58 @@ mod self_test {
                             PaneOrigin::Cli,
                         )
                         .ok()?;
+                        let made = r["pane"].as_u64().map(PaneId::from_raw);
+                        if let (Some(file), Some(pane)) = (&slow_shell, made) {
+                            let _ = std::fs::write(file, pane.to_string());
+                        }
                         for (pane, options) in std::mem::take(&mut app.pending_attach) {
                             let _ = app.spawn_session(pane, options, cx);
                         }
-                        r["pane"].as_u64().map(PaneId::from_raw)
+                        made
                     })
                     .ok()
                     .flatten();
                 match pane945 {
                     None => println!("TAKO_SELF_TEST_SKIPPED: 128（検証用タブを作れない）"),
                     Some(pane) => {
-                        // シェルの起動出力（プロンプト + OSC 133）が落ち着くまで待つ。
-                        // ここが済むまでは実行状態が勝手に動く
+                        // シェルの起動（rc の読み込み → 最初のプロンプト）が済むのを**状態で**待つ（#2478）。
+                        //
+                        // シェルの統合は `133;A` を precmd（プロンプトの直前）でしか出さないので、
+                        // 最初のプロンプトの後はコマンドを打たない限り実行状態を動かさない。済む前に
+                        // Running を注入すると、遅れて届いた実シェルの `133;A` が Idle へ上書きし、
+                        // 脈動の途中で要素ごと消えて不透明度が最後に計算した値で止まる
+                        //（修正前は固定 1500ms。load 20 の回に 0.692 で止まって落ちた形を、rc の読み込みを
+                        // 遅らせる注入 `TAKO_2478_INJECT` で再現した）
                         notify_and_draw(any945, window945, cx);
-                        wait(cx, 1500).await;
+                        let prompts = |app: &TakoApp| {
+                            app.terminals
+                                .get(&pane)
+                                .map_or(0, |s| s.shell_marks().prompts)
+                        };
+                        let settle_started = std::time::Instant::now();
+                        let settled = if legacy_2478() {
+                            wait(cx, 1500).await;
+                            true
+                        } else {
+                            wait_for_app_state(
+                                window945,
+                                cx,
+                                "128: 検証用ペインのシェルの最初のプロンプト",
+                                state_wait_budget(Duration::from_secs(15), machine_busy()),
+                                |app| prompts(app) >= 1,
+                            )
+                            .await
+                        };
+                        let settle_ms = settle_started.elapsed().as_millis();
+                        let prompts_settled =
+                            window945.update(cx, |app, _, _| prompts(app)).unwrap_or(0);
+                        check(
+                            settled,
+                            &format!(
+                                "128: 検証用ペインのシェルが最初のプロンプトを出す \
+                                 (脈動の前提。#2478。{settle_ms}ms 待った)"
+                            ),
+                        );
                         let running = window945
                             .update(cx, |app: &mut TakoApp, _, cx| {
                                 let ok = match app.terminals.get_mut(&pane) {
@@ -93896,6 +93961,8 @@ mod self_test {
                             running,
                             "128: 検証用ペインが Running になる（脈動の前提。#945）",
                         );
+                        let prompts_injected =
+                            window945.update(cx, |app, _, _| prompts(app)).unwrap_or(0);
                         let started = std::time::Instant::now();
                         // 汚してから 1 フレーム描き、そのフレームで脈動が計算した
                         // 不透明度を読む（#786 のキャッシュがあるので notify が要る）
@@ -93938,17 +94005,43 @@ mod self_test {
                             late.push(sample(cx).1);
                             wait(cx, 250).await;
                         }
+                        // 測っている間に実行状態が実シェルの印で動いていないか（#2478 の前提）。
+                        // 動いていたら、Running を外れた時刻（注入から）も出す。要素が消えた後は
+                        // 脈動が計算されないので、late は Running のうちに最後に描いたフレームの値
+                        //（ディスプレイリンクが回らない環境では early の最後 = `early_last`）で止まる
+                        let (state_late, prompts_late, left_running) = window945
+                            .update(cx, |app, _, _| {
+                                let session = app.terminals.get(&pane);
+                                let state = session.map(|s| s.command_state());
+                                let left = session
+                                    .filter(|s| {
+                                        s.command_state() != tako_core::CommandState::Running
+                                    })
+                                    .and_then(|s| s.command_state_since())
+                                    .and_then(|at| at.checked_duration_since(started));
+                                (state, prompts(app), left)
+                            })
+                            .unwrap_or((None, 0, None));
+                        let left_running_line = left_running
+                            .map_or_else(|| "-".to_string(), |at| format!("{}ms", at.as_millis()));
                         println!(
                             "TAKO_SELF_TEST_945: legacy={} early={:.3}..{:.3}(spread {:.3}) \
-                             late={:.3}..{:.3}(spread {:.3}) idle_frames={} animated={animated}",
+                             early_last={:.3} late={:.3}..{:.3}(spread {:.3}) idle_frames={} \
+                             animated={animated} \
+                             settle={settle_ms}ms(legacy_2478={}) prompts={prompts_settled}->\
+                             {prompts_injected}->{prompts_late} state_late={state_late:?} \
+                             left_running={left_running_line} slow_shell={}",
                             std::env::var_os("TAKO_945_LEGACY").is_some(),
                             early.iter().cloned().fold(f32::MAX, f32::min),
                             early.iter().cloned().fold(f32::MIN, f32::max),
                             spread(&early),
+                            early.last().copied().unwrap_or(f32::NAN),
                             late.iter().cloned().fold(f32::MAX, f32::min),
                             late.iter().cloned().fold(f32::MIN, f32::max),
                             spread(&late),
                             idle_after.saturating_sub(idle_before),
+                            legacy_2478(),
+                            slow_shell.is_some(),
                         );
                         check(
                             animated && spread(&early) > 0.1,
@@ -93958,6 +94051,19 @@ mod self_test {
                                 spread(&early)
                             ),
                         );
+                        // 前提が崩れた回は ② と読み違えないよう先に名指す。旧の腕は修正前と同じく
+                        // ② で落ちる形のまま（上の診断の行が state_late / left_running を出す）
+                        if !legacy_2478() {
+                            check(
+                                state_late == Some(tako_core::CommandState::Running)
+                                    && prompts_late == prompts_injected,
+                                &format!(
+                                    "128: 測っている間に検証用ペインの実行状態が実シェルの印で動かない \
+                                     (脈動の前提。#2478。state {state_late:?} / prompts \
+                                     {prompts_injected}->{prompts_late} / left_running {left_running_line})"
+                                ),
+                            );
+                        }
                         check(
                             spread(&late) < 0.01
                                 && late.iter().all(|o| (o - 1.0).abs() < 0.01),
@@ -109383,6 +109489,160 @@ mod selftest_wait_watchdog {
         // 修正後の形（Tab と Enter を続けて押し、出力の行を状態で待つ）は通る
         let fixed = "                let (output, lines) = tab_enter_41c(any, window, cx, 1, \"x\", &[\"A\"]).await;";
         assert!(fixed_wait_before_enter(fixed).is_empty());
+    }
+
+    /// 側路の注入（OSC 133 を状態機械へ直に流す口）。`concat!` で分割して書く = 番犬自身の行が対象に入らない
+    const OSC_INJECT: &str = concat!("feed_osc", "_bytes(");
+    /// シェルの最初のプロンプトが届いた印（`TerminalSession::shell_marks().prompts`）を読む字面
+    const SHELL_MARKS: &str = concat!("shell", "_marks");
+    /// ペインの誕生（シェルを起こす口と、ペインを作る要求）
+    const PANE_BIRTHS: &[&str] = &[
+        concat!("spawn", "_session("),
+        concat!("Request::Tab", "New {"),
+        concat!("Request::Sp", "lit {"),
+    ];
+
+    /// 「ペインを作ってから、シェルの最初のプロンプトを待たずに側路で実行状態を注入する」形を探す（#2478）。
+    ///
+    /// 項目 128（#945）は検証用ペインを作ってから固定 1500ms 待ち、`feed_osc_bytes` で `133;A` / `133;C`
+    /// （Running）を注入していた。シェルの統合は `133;A` を precmd（プロンプトの直前）で出すので、rc の
+    /// 読み込みが固定待ちに間に合わない回（load 20）は、遅れて届いた実シェルの `133;A` が注入した Running を
+    /// Idle へ上書きした。脈動の途中で要素ごと消えるので不透明度は最後に計算した値（0.692）で止まり、
+    /// 「脈動の全長を過ぎたら止まる」で落ちた。正しい形は、注入の前に最初のプロンプトが届いた印
+    /// （`shell_marks().prompts`）を `wait_for_app_state` 等で待つこと。
+    ///
+    /// 見るのは、`feed_osc_bytes(` を呼ぶコードの行から上へ遡って最も近いペインの誕生（[`PANE_BIRTHS`]）までの
+    /// 間に `shell_marks` を読むコードの行があるか。上に誕生が無い（既にあるペインへ注入する）なら判定しない。
+    /// A/B の旧経路など意図して残す形は、その行か直前のコメント行に `tako:osc-inject-ok <理由>` を書く。
+    ///
+    /// 限界（字面の推定）: `shell_marks` を待ちではなく表示だけに使っても待ったと読む。誕生の字面に無い
+    /// 作り方（ヘルパの中で起こす等）は、さらに上の誕生まで遡る
+    fn inject_before_first_prompt(lines: &[(usize, &str)]) -> Vec<usize> {
+        const ALLOW: &str = concat!("tako:osc", "-inject-ok");
+        let code = |line: &str| {
+            let t = line.trim();
+            !t.is_empty() && !t.starts_with("//")
+        };
+        let marked = |line: &str| {
+            line.find(ALLOW)
+                .is_some_and(|p| !line[p + ALLOW.len()..].trim().is_empty())
+        };
+        let mut hits = Vec::new();
+        for (index, (number, line)) in lines.iter().enumerate() {
+            if !(code(line) && line.contains(OSC_INJECT)) {
+                continue;
+            }
+            let allowed = marked(line)
+                || lines[..index]
+                    .iter()
+                    .rev()
+                    .take_while(|(_, l)| l.trim_start().starts_with("//"))
+                    .any(|(_, l)| marked(l));
+            if allowed {
+                continue;
+            }
+            let nearest = lines[..index]
+                .iter()
+                .rev()
+                .map(|(_, l)| *l)
+                .filter(|l| code(l))
+                .find(|l| l.contains(SHELL_MARKS) || PANE_BIRTHS.iter().any(|b| l.contains(b)));
+            if nearest.is_some_and(|l| !l.contains(SHELL_MARKS)) {
+                hits.push(*number);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn 実シェルのペインへ実行状態を注入する前に最初のプロンプトを待っている() {
+        use super::selftest_launch_withdraw_watchdog::self_test_region;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/self_test");
+        let mut hits: Vec<String> =
+            inject_before_first_prompt(&self_test_region(include_str!("main.rs")))
+                .into_iter()
+                .map(|line| format!("crates/tako-app/src/main.rs:{line}"))
+                .collect();
+        for entry in std::fs::read_dir(&dir).expect("src/self_test").flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            let lines: Vec<(usize, &str)> =
+                src.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            hits.extend(
+                inject_before_first_prompt(&lines)
+                    .into_iter()
+                    .map(|line| format!("crates/tako-app/src/self_test/{name}:{line}")),
+            );
+        }
+        assert!(
+            hits.is_empty(),
+            "{hits:?} がペインを作ってから、シェルの最初のプロンプトを待たずに側路（feed_osc_bytes）で実行状態を\
+             注入している。rc の読み込みが遅れた回は、遅れて届いた実シェルの 133;A が注入した状態を上書きする（#2478）。\
+             注入の前に `shell_marks().prompts` を `wait_for_app_state` 等で待つこと。\
+             A/B の旧経路など意図して残すなら、その行か直前のコメント行に `tako:osc-inject-ok <理由>` を書く"
+        );
+    }
+
+    /// 検出力の担保: 修正前の項目 128 の形を名指し、最初のプロンプトを待つ形・印・既存のペインへの注入は許す
+    #[test]
+    fn 番犬はプロンプトを待たない注入を見逃さず待ちと印は許す() {
+        let numbered = |src: &str| -> Vec<(usize, String)> {
+            src.lines()
+                .enumerate()
+                .map(|(i, l)| (i + 1, l.to_string()))
+                .collect()
+        };
+        let hits = |src: &str| {
+            let owned = numbered(src);
+            let lines: Vec<(usize, &str)> = owned.iter().map(|(n, l)| (*n, l.as_str())).collect();
+            inject_before_first_prompt(&lines)
+        };
+        let birth = concat!(
+            "                let _ = app.spawn",
+            "_session(pane, options, cx);"
+        );
+        let fixed_wait = concat!("                wait(", "cx, 1500).await;");
+        let inject = concat!(
+            "                    session.feed_osc",
+            "_bytes(b\"\\x1b]133;C\\x07\");"
+        );
+        // 修正前の項目 128（誕生 → 固定 1500ms → 注入）
+        let bad = format!("{birth}\n{fixed_wait}\n{inject}");
+        assert_eq!(hits(&bad), vec![3]);
+        // ペインを作る要求でも誕生と読む・コメントの中の shell_marks は待ちと読まない
+        let tab_new = concat!("            tako_control::protocol::Request::Tab", "New {");
+        let commented = format!(
+            "{tab_new}\n                // {} を待つべき\n{fixed_wait}\n{inject}",
+            concat!("shell", "_marks")
+        );
+        assert_eq!(hits(&commented), vec![4]);
+        // 修正後の形（誕生 → 最初のプロンプトを状態で待つ → 注入）は通る
+        let wait_prompt = concat!(
+            "                    .map_or(0, |s| s.shell",
+            "_marks().prompts)"
+        );
+        let good = format!("{birth}\n{wait_prompt}\n{inject}");
+        assert!(hits(&good).is_empty());
+        // 理由つきの印（直前のコメント行・同じ行）は外す。理由の無い印では外さない
+        let allow = concat!("tako:osc", "-inject-ok");
+        let marked =
+            format!("{birth}\n{fixed_wait}\n                // {allow} A/B の旧経路\n{inject}");
+        assert!(hits(&marked).is_empty());
+        let same_line = format!("{birth}\n{fixed_wait}\n{inject} // {allow} 旧経路");
+        assert!(hits(&same_line).is_empty());
+        let bare = format!("{birth}\n{fixed_wait}\n                // {allow}\n{inject}");
+        assert_eq!(hits(&bare), vec![4]);
+        // 上に誕生が無い（既にあるペインへ注入する）なら判定しない・コメントの中の注入は見ない
+        assert!(hits(&format!("{fixed_wait}\n{inject}")).is_empty());
+        assert!(hits(&format!("{birth}\n                // {}", inject.trim())).is_empty());
     }
 }
 

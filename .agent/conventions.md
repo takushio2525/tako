@@ -2244,6 +2244,20 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     固定待ちは上のアンカーの空振りを覆い隠すだけ。番犬 `selftest_wait_watchdog` の
     `fixed_wait_before_enter` が「固定待ちの次のコードの行が Enter を押す `press…`」を名指す
     （A/B の旧経路など意図して残す形は、その行か直前のコメント行に `tako:fixed-wait-enter-ok <理由>`）
+- **実シェルのペインへ側路（`feed_osc_bytes`）で実行状態を注入する前に、シェルの最初のプロンプトを状態で待つ**
+  （#2478）。シェルの統合は `133;A` を precmd（プロンプトの直前 = rc を読み終えた後）で出すので、固定時間で
+  「起動が落ち着いた」とみなすと、rc の読み込みが遅れた回は遅れて届いた実シェルの `133;A` が注入した Running を
+  Idle へ上書きする。項目 128 は固定 1500ms で、load 20 の回に脈動の途中で要素ごと消え、不透明度が Running のうちに
+  最後に描いたフレームの値（0.692）で止まって「全長を過ぎたら止まる」で落ちていた（注入で再現: `prompts=0->1->2`・
+  `state_late=Some(Idle)`・late が `early_last` のまま）。
+  注入の前に `shell_marks().prompts >= 1` を `wait_for_app_state` で待ち、測り終えたら state と prompts が注入の
+  直後から動いていないことも確かめて、崩れた回は「前提が崩れた」と名指す。番犬 `selftest_wait_watchdog` の
+  `inject_before_first_prompt` が「ペインの誕生から注入までに `shell_marks` を読むコードの行が無い」を名指す
+  （意図して残す形は `tako:osc-inject-ok <理由>`）。A/B は `TAKO_2478_LEGACY=1`、注入は
+  `TAKO_2478_INJECT=slow-shell:<ファイル>`（GUI が検証用ペインの ID をそのファイルへ書き、`scripts/test-selftest-128-2478.sh`
+  が置く `.zshrc` が `TAKO_PANE_ID` の一致するペインでだけ 3 秒眠る）。**検証用ペインへの印を env で渡さない**:
+  器（tmux）越しのペインのシェルへ届く env は `session_pinned_pairs` の許可リスト（ペイン ID・統合の置き場 等）に
+  限られ、`options.env` に足しただけの値は届かない（最初の試みで実測）
 - **実 claude の「発話の内容」はビューポートから採らない**（#1175）。項目 101c は
   「引き継ぎ本文が後任へ届いた」を `visible_lines()` から探していたが、本文は
   claude の TUI では**起動直後に 1 度だけ流れる User 発話**なので、後任が数分喋れば
