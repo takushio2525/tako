@@ -6,7 +6,8 @@
 //! 「シェルスクリプトは macOS 同梱の bash 3.2 で通す（Issue #1499 / #1518）」に
 //! 書いてある規約の機械化（同じ節の「`set -e` と EXIT trap を併用するなら番人を通す」= #1864 と
 //! 「`"$( … )"` の中のダブルクォートに `{…,…}` を置かない」= #1924・
-//! 「pipefail の下で早く抜ける読み手（`grep -q` / `head`）へパイプしない」= #1633 / #2272 も）と
+//! 「pipefail の下で早く抜ける読み手（`grep -q` / `head`）へパイプしない」= #1633 / #2272・
+//! 「`set -e` の下に待たずに走らせる子を置かない」= #2690 も）と
 //! 「変数を使う rm は空で止める（Issue #2306）」と「検証スクリプトの器はソケットファイルまで消す（Issue #2399）」。
 
 use std::path::{Path, PathBuf};
@@ -1047,6 +1048,18 @@ struct WordLexer {
     /// 読んだ中で 3.2 が取り除く行継続（`\` + 改行）の `\` の位置と、取り除いても後ろの読みが
     /// 変わらないか（`join_continuations32` が使う。#2352）
     joins: Vec<(usize, bool)>,
+    /// 読んだ中の、シェルが待たずに走らせる子（`<( … )` / `>( … )` の `<` / `>`、背景の `&`）の位置
+    /// （#2690 の「書き込みの最中に子の SIGCHLD が届く」検査が使う）
+    asyncs: Vec<(usize, AsyncChild)>,
+}
+
+/// シェルが待たずに走らせる子の種類（終わった時点でシェルへ SIGCHLD が届く）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AsyncChild {
+    /// `<( … )` / `>( … )`
+    ProcSub,
+    /// `… &`
+    Background,
 }
 
 /// パイプラインの終わり方（終了コードを誰が見るか）
@@ -1139,6 +1152,7 @@ impl WordLexer {
             commands: Vec::new(),
             word_ctx: None,
             joins: Vec::new(),
+            asyncs: Vec::new(),
         }
     }
 
@@ -1334,6 +1348,14 @@ impl WordLexer {
                     cmd_start = true;
                     self.pipe_end(PipeEnd::Plain);
                 }
+                // `&>` / `&>>` は stdout と stderr をまとめた行き先（背景の `&` ではない）
+                '&' if self.peek(1) == Some('>') => {
+                    self.i += 2;
+                    if self.peek(0) == Some('>') {
+                        self.i += 1;
+                    }
+                    next_redirect = true;
+                }
                 '&' | '|' => {
                     // `|` / `|&` は段の区切り。`||` / `&&` / `&` はパイプラインを閉じる
                     if self.at("|&") {
@@ -1351,6 +1373,7 @@ impl WordLexer {
                         if ch == '|' {
                             self.pipe_stage();
                         } else {
+                            self.asyncs.push((self.i - 1, AsyncChild::Background));
                             self.pipe_end(PipeEnd::Background);
                         }
                     }
@@ -1395,6 +1418,7 @@ impl WordLexer {
                     } else if self.at("<<") {
                         self.heredoc_op();
                     } else if self.at("<(") || self.at(">(") {
+                        self.asyncs.push((self.i, AsyncChild::ProcSub));
                         self.i += 2;
                         next_redirect = false;
                         self.list_of(true, ListKind::ProcSub);
@@ -5643,4 +5667,330 @@ fn 空打ちの補助は空打ちの字面を含む行を空打ちの行と取�
     let (text, ran) = run_fake_exec_warm(body, &[("TAKO_2222_LEGACY", "1")], 1);
     assert!(!ran, "{text}");
     assert_eq!(text.lines().nth(1), Some(WARM_LINE), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// set -e の下で書き込みの最中に子の SIGCHLD が届く（bash 3.2 の EINTR。Issue #2690）
+// ---------------------------------------------------------------------------
+
+/// 監査済みの例外宣言 `# tako:sigchld-ok <理由>`（その行か直前の行。理由の無い宣言は無効）
+const SIGCHLD_OK_MARKER: &str = "tako:sigchld-ok";
+
+/// `set -e` の下（呼び手の `set -e` を継ぐライブラリを含む）で待たずに走らせる子の、#2690 の時点の数
+/// （スクリプトごと。例外宣言のものは数えない）。
+///
+/// **増やさない**。減らしたら表も同じ数へ減らす（余りを残すと同じファイルの別の行で増やせる）。
+/// 0 になったら行ごと消す。PR の CI 待ちと merge の 4 本（`PR_GATE_SCRIPTS`）は載せない。
+/// ここに載っているのは「`find -print0` の NUL 区切り（置換は NUL を運べない）」「起こしたまま
+/// 残す常駐（隔離 GUI・caffeinate・偽のピア）」を含む既存分で、1 本ずつ直す義務は無い
+/// （`.agent/conventions.md` の #2690 の節に棚卸しの内訳）
+const ASYNC_CHILD_ERREXIT_FROZEN: &[(&str, usize)] = &[
+    ("scripts/check-claude-mod.sh", 1),
+    ("scripts/lib/bundle-privacy.sh", 1),
+    ("scripts/lib/isolated-gui.sh", 1),
+    ("scripts/lib/launch-services.sh", 1),
+    ("scripts/lib/virtual-display.sh", 1),
+    ("scripts/promo/build-explainer.sh", 2),
+    ("scripts/promo/check-readings.sh", 1),
+    ("scripts/promo/lib.sh", 3),
+    ("scripts/promo/narrate.sh", 1),
+    ("scripts/release.sh", 7),
+    ("scripts/test-nightly-reserve.sh", 1),
+    ("scripts/test-release-retry.sh", 5),
+    ("scripts/test-serve-watch.sh", 2),
+];
+
+/// 終了コードと結論の行を呼び手（master・CI・merge の判定）が読むので、待たずに走らせる子を
+/// 1 つも持たない（凍結表にも載せない）スクリプト。#2690 はここで起きた
+const PR_GATE_SCRIPTS: &[&str] = &[
+    "scripts/wait-pr-checks.sh",
+    "scripts/merge-pr.sh",
+    "scripts/lib/gh-retry.sh",
+    "scripts/lib/pr-conflict.sh",
+];
+
+fn sigchld_exception(lines: &[&str], line_no: usize) -> bool {
+    let has = |l: &str| {
+        l.split(SIGCHLD_OK_MARKER)
+            .nth(1)
+            .is_some_and(|reason| !reason.trim().is_empty())
+    };
+    let at = |n: usize| n.checked_sub(1).and_then(|i| lines.get(i)).copied();
+    at(line_no).is_some_and(has) || at(line_no.wrapping_sub(1)).is_some_and(has)
+}
+
+/// 1 ファイルの、`set -e` の下で待たずに走らせる子（例外宣言のものを除く）を (行, 種類) で返す。
+///
+/// macOS 同梱の bash 3.2 は SIGCHLD のハンドラを SA_RESTART なしで張る（4.2 から付く）。子が
+/// 終わったとき、シェルが stdout / stderr への write の中で待っていると（パイプの読み手が同じ
+/// パイプを読んでいる最中・満杯）、write は EINTR で返り、`echo` / `printf` は
+/// `write error: Interrupted system call` で失敗する（macOS の libc はその行のバッファを捨てる =
+/// 行ごと消える）。`set -e` の下ではそこで 1 で抜ける（5 = 届かない・赤の 1 の区別が化ける）。
+/// `$( … )` / パイプラインの子はシェルが待って刈り取るので、書き込みの最中には届かない。
+/// 待たずに走らせる子 = `<( … )` / `>( … )` と背景の `&` だけが、いつ終わるか決まらない
+fn errexit_async_children(rel: &str, src: &str) -> Vec<(usize, AsyncChild)> {
+    if !(declares_errexit(src, &shell_commands(src)) || is_sourced_library(rel)) {
+        return Vec::new();
+    }
+    let chars: Vec<char> = src.chars().collect();
+    let lines: Vec<&str> = src.lines().collect();
+    let line_of = |pos: usize| {
+        chars[..pos.min(chars.len())]
+            .iter()
+            .filter(|&&c| c == '\n')
+            .count()
+            + 1
+    };
+    // 行継続を取り除いてから読む（`done \⏎ < <(X)`）。名指す行は原文の行
+    let (text, origin) = join_continuations32(src);
+    let mut lx = WordLexer::new(&text);
+    lx.list(false);
+    lx.asyncs
+        .iter()
+        .map(|&(pos, kind)| {
+            let at = origin.get(pos).copied().unwrap_or(chars.len());
+            (line_of(at), kind)
+        })
+        .filter(|&(n, _)| !sigchld_exception(&lines, n))
+        .collect()
+}
+
+/// 1 ファイルぶんの違反（凍結した数を超えたら、待たずに走らせる子の行をすべて file:line で並べる）
+fn errexit_async_violations(rel: &str, src: &str, frozen: usize) -> Vec<String> {
+    let found = errexit_async_children(rel, src);
+    if found.len() <= frozen {
+        return Vec::new();
+    }
+    let how = if declares_errexit(src, &shell_commands(src)) {
+        "set -e を宣言"
+    } else {
+        "set -e を宣言した側から source される"
+    };
+    let lines: Vec<&str> = src.lines().collect();
+    found
+        .iter()
+        .map(|&(n, kind)| {
+            let (what, hint) = match kind {
+                AsyncChild::ProcSub => (
+                    "プロセス置換",
+                    "`done < <(X)` は `done <<<\"$(X)\"`（置換の子はシェルが待って刈り取る）",
+                ),
+                AsyncChild::Background => (
+                    "背景の &",
+                    "書き込む前に wait で刈り取る形にするか、前景で走らせる",
+                ),
+            };
+            format!(
+                "{rel}:{n}: {what}（{how}・{frozen} → {} 箇所）→ {hint}: {}",
+                found.len(),
+                lines.get(n - 1).map_or("", |l| l.trim())
+            )
+        })
+        .collect()
+}
+
+fn frozen_async_children(rel: &str) -> usize {
+    ASYNC_CHILD_ERREXIT_FROZEN
+        .iter()
+        .find(|(f, _)| *f == rel)
+        .map_or(0, |(_, n)| *n)
+}
+
+/// 走査の対象（リポジトリ全体の `.sh`）を (相対パス, 中身) で
+fn all_shell_scripts() -> Vec<(String, String)> {
+    let root = repo_root();
+    shell_scripts()
+        .into_iter()
+        .map(|p| {
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(&p).expect("読める .sh");
+            (rel, src)
+        })
+        .collect()
+}
+
+#[test]
+fn set_eの下で書き込みの最中に届く子のsigchldを増やさない() {
+    let mut violations = Vec::new();
+    for (rel, src) in all_shell_scripts() {
+        violations.extend(errexit_async_violations(
+            &rel,
+            &src,
+            frozen_async_children(&rel),
+        ));
+    }
+    assert!(
+        violations.is_empty(),
+        "`set -e` の下（呼び手の set -e を継ぐ scripts/lib/ を含む）で、待たずに走らせる子\n\
+         （`<( … )` / `>( … )`・背景の `&`）を増やしている（#2690）。CI の macOS の /bin/bash 3.2 は\n\
+         SIGCHLD を SA_RESTART なしで受けるので、その子が終わった瞬間にシェルが stdout / stderr への\n\
+         write の中で待っていると `echo: write error: Interrupted system call` になり、その行が消えて\n\
+         set -e で 1 で抜ける（結論の行が欠け、終了コードの意味が化ける。5.x では起きない）。\n\
+         `done < <(X)` は `done <<<\"$(X)\"` へ（置換の子はシェルが待って刈り取る = 書き込みの最中に\n\
+         SIGCHLD が届かない）。背景の `&` は、終わるまでの間に何も書かない（wait で刈り取ってから書く）\n\
+         と監査して確かめた箇所だけ、その行か直前の行に `# {SIGCHLD_OK_MARKER} <理由>` で外せる\n\
+         （.agent/conventions.md「シェルスクリプトは macOS 同梱の bash 3.2 で通す」節。既存分は\n\
+         ASYNC_CHILD_ERREXIT_FROZEN で数を凍結してある）:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn 凍結表は今の数と一致しprの待ちとmergeは子を持たない() {
+    let scripts = all_shell_scripts();
+    let count = |rel: &str| {
+        scripts
+            .iter()
+            .find(|(r, _)| r == rel)
+            .map(|(r, s)| errexit_async_children(r, s).len())
+    };
+    // 1 つ目で止めずに全部を並べる（直す人が 1 回で全体を見られるように）
+    let mut problems: Vec<String> = Vec::new();
+    for (rel, n) in ASYNC_CHILD_ERREXIT_FROZEN {
+        match count(rel) {
+            None => problems.push(format!(
+                "ASYNC_CHILD_ERREXIT_FROZEN の {rel} は無い（消した / 改名したなら表の行も消す）"
+            )),
+            Some(_) if *n == 0 => problems.push(format!("{rel}: 0 箇所の行は表から消す")),
+            Some(actual) if actual < *n => problems.push(format!(
+                "{rel}: 待たずに走らせる子が {actual} 箇所に減った（表は {n}）→ 表も {actual} へ減らす\n  \
+                 （余りを残すと同じファイルの別の行で増やせる。0 なら行ごと消す）"
+            )),
+            Some(actual) if actual > *n => problems.push(format!(
+                "{rel}: 待たずに走らせる子が {n} → {actual} 箇所に増えた → 増やさない\n  \
+                 （行は set_eの下で書き込みの最中に届く子のsigchldを増やさない が file:line で名指す）"
+            )),
+            Some(_) => {}
+        }
+    }
+    // PR の CI 待ちと merge は、凍結表にも例外宣言にも逃がさない（#2690 はここで起きた）
+    for rel in PR_GATE_SCRIPTS {
+        if ASYNC_CHILD_ERREXIT_FROZEN.iter().any(|(f, _)| f == rel) {
+            problems.push(format!("{rel} は凍結表に載せない（#2690）"));
+        }
+        let Some((_, src)) = scripts.iter().find(|(r, _)| r == rel) else {
+            problems.push(format!(
+                "{rel} が無い（改名したなら PR_GATE_SCRIPTS も直す）"
+            ));
+            continue;
+        };
+        if let Some(i) = src.lines().position(|l| l.contains(SIGCHLD_OK_MARKER)) {
+            problems.push(format!(
+                "{rel}:{}: PR の CI 待ちと merge は `# {SIGCHLD_OK_MARKER}` で外さない（#2690）",
+                i + 1
+            ));
+        }
+        for v in errexit_async_violations(rel, src, 0) {
+            problems.push(format!(
+                "{v}\n  （PR の CI 待ちと merge は 0 のまま。結論の行が消えて終了コードが化ける = #2690）"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+    // 走査が空振りしていない（#2690 の時点で .sh は 300 本超）
+    assert!(
+        scripts.len() >= 200,
+        ".sh が {} 本しか採れない",
+        scripts.len()
+    );
+}
+
+#[test]
+fn 番犬は書き込みの最中に届く子の形をfile_lineで名指しする() {
+    use AsyncChild::{Background, ProcSub};
+    let e = |body: &str| {
+        errexit_async_children("scripts/x.sh", &format!("set -euo pipefail\n{body}\n"))
+    };
+
+    // #2690 で踏んだ形: wait-pr-checks.sh の結果の一覧（並べ替えの子）と期待名の読み込み（パイプライン）
+    assert_eq!(
+        e("while IFS=$'\\t' read -r a b; do\n  echo \"[$a] $b\"\ndone < <(LC_ALL=C sort -t$'\\t' -k2 <<<\"$RAW\")\necho 結論"),
+        vec![(4, ProcSub)]
+    );
+    assert_eq!(
+        e("while IFS= read -r n; do\n  X+=(\"$n\")\ndone < <(expected | awk '!seen[$0]++')"),
+        vec![(4, ProcSub)]
+    );
+    // 書き手側のプロセス置換・1 行に 2 つ・置換の中・行継続の後（名指す行は原文の行）
+    assert_eq!(e("echo x > >(cat >&2)"), vec![(2, ProcSub)]);
+    assert_eq!(e("diff <(a) <(b)"), vec![(2, ProcSub), (2, ProcSub)]);
+    assert_eq!(e("x=\"$(cat <(echo a))\""), vec![(2, ProcSub)]);
+    assert_eq!(
+        e("while read -r l; do :; done \\\n  < <(sort f)"),
+        vec![(3, ProcSub)]
+    );
+    // 背景の &（1 行・複数行のサブシェル・置換の中）
+    assert_eq!(e("sleep 1 &"), vec![(2, Background)]);
+    assert_eq!(e("(\n  sleep 1\n) &\necho x"), vec![(4, Background)]);
+    assert_eq!(e("x=$(sleep 1 & echo y)"), vec![(2, Background)]);
+
+    // 待って刈り取る子・& を含むだけの別の演算子・文字列やコメントの中は名指さない
+    for body in [
+        "while read -r l; do echo \"$l\"; done <<<\"$(sort f)\"",
+        "x=\"$(sort f | awk '{print}')\"",
+        "a && b",
+        "cmd >&2",
+        "cmd 2>&1 | tee f",
+        "cmd |& tee f",
+        "cmd &>/dev/null",
+        "cmd &>>log",
+        "(( a & b ))",
+        "[[ -n a && -n b ]]",
+        "echo '<(x) &'",
+        "echo \"<(x) &\"",
+        "# done < <(x) &",
+        "cat <<'X'\ndone < <(x) &\nX",
+    ] {
+        assert_eq!(e(body), Vec::new(), "名指してはいけない: {body}");
+    }
+
+    // set -e の無いスクリプトは対象外（行は欠けうるが終了コードは化けない）。呼び手の set -e を継ぐ
+    // ライブラリと shebang の -e は対象
+    let p = "while read -r l; do :; done < <(sort f)\n";
+    assert_eq!(errexit_async_children("scripts/x.sh", p), Vec::new());
+    assert_eq!(
+        errexit_async_children("scripts/lib/x.sh", p),
+        vec![(1, ProcSub)]
+    );
+    assert_eq!(
+        errexit_async_children("scripts/promo/lib.sh", p),
+        vec![(1, ProcSub)]
+    );
+    assert_eq!(
+        errexit_async_children("scripts/x.sh", "#!/bin/bash -e\ncmd &\n"),
+        vec![(2, Background)]
+    );
+
+    // 例外宣言は理由つきのときだけ効く（その行か直前の行）
+    assert_eq!(
+        e("# tako:sigchld-ok 終わるまで何も書かず wait で刈り取る\ncmd &"),
+        Vec::new()
+    );
+    assert_eq!(
+        e("cmd & # tako:sigchld-ok 終わるまで何も書かない"),
+        Vec::new()
+    );
+    assert_eq!(e("# tako:sigchld-ok\ncmd &"), vec![(3, Background)]);
+
+    // 凍結した数までは通し、超えたら全部の行を file:line で並べる
+    let src = "set -e\ndiff <(a) <(b)\n";
+    assert!(errexit_async_violations("scripts/x.sh", src, 2).is_empty());
+    let v = errexit_async_violations("scripts/x.sh", src, 1);
+    assert_eq!(v.len(), 2, "{v:?}");
+    assert!(
+        v[0].starts_with("scripts/x.sh:2: プロセス置換（set -e を宣言・1 → 2 箇所）"),
+        "{v:?}"
+    );
+    let v = errexit_async_violations("scripts/lib/x.sh", "cmd &\n", 0);
+    assert_eq!(v.len(), 1, "{v:?}");
+    assert!(
+        v[0].starts_with(
+            "scripts/lib/x.sh:1: 背景の &（set -e を宣言した側から source される・0 → 1 箇所）"
+        ),
+        "{v:?}"
+    );
 }

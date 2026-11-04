@@ -4136,6 +4136,69 @@ tag=$(git tag --sort=-v:refname | sed -n 1p)           # ○ 最後まで読む�
 失敗と読みうる）・`nightly-release.sh` の最新タグ（タグが増えると `set -e` で止まりうる）・
 `virtual-display.sh` / `measure-*.sh` / `promo/*.sh` の待ち合わせとロック・蓋の判定。
 
+### `set -e` の下に待たずに走らせる子を置かない（書き込みが SIGCHLD で割り込まれる。Issue #2690）
+
+3.2 は SIGCHLD のハンドラを **SA_RESTART なしで**張る（4.2 から SIGCHLD にだけ付く）。待たずに
+走らせた子（`<( … )` / `>( … )`・背景の `&`）が終わった瞬間に、シェルが stdout / stderr への write の
+中で待っていると（パイプの読み手が同じパイプを読んでいる最中・満杯）、write は EINTR で返り、
+`echo` / `printf` は `write error: Interrupted system call` で失敗する。macOS の libc はその行の
+バッファを捨てるので**行ごと消え**、`set -e` の下ではそこで **1 で抜ける**（5 = 届かない・赤の 1 の
+区別が化ける）。3.2 のエラーの行番号は直前のループの中の行を指す（#2690 の CI は `line 506` = ループの
+中の `echo` だったが、消えたのは 510 行目の結論の行）。
+
+子が出力を閉じて読み手が EOF を見てから SIGCHLD が届くまでの間に次の書き込みが来るので、
+**狙われるのは `done < <( … )` の直後の行 = 結論の行**。CI では読み手の `tee` と同じパイプを
+取り合った一瞬だけなので間欠だった（`test-wait-pr-checks.sh` の t38red の結論の行の欠け・
+t39merge の 5 が 1 = 子の `wait-pr-checks.sh` の結論が 1 に化けて「CI が揃っていない」）。
+
+```bash
+set -euo pipefail
+while IFS=$'\t' read -r a b; do echo "[$a] $b"; done < <(sort -k2 <<<"$RAW")    # ✗ 子の終わりが次の write に重なる
+echo "失敗しているチェックが 1 本ある"                                            #   ← 3.2 で消えて 1 で抜ける
+while IFS=$'\t' read -r a b; do echo "[$a] $b"; done <<<"$(sort -k2 <<<"$RAW")"  # ○ 置換の子はシェルが待って刈り取る
+```
+
+`$( … )` とパイプラインの子はシェルが待って刈り取る（刈り取りの間は SIGCHLD を塞ぐ）ので、
+書き込みの最中に届かない。寄せると出力が空のとき空の 1 行が読まれるので、ループが空を飛ばすか
+確かめる。置換は NUL を運べないので `find -print0` を読む形はこの書き換えでは直せない。
+
+実測（`/bin/bash` 3.2.57 / Homebrew の 5.3.15。腕の stdout / stderr を「いつも満杯」の FIFO にして
+write を毎回待たせる = 負荷は生成しない。`test-wait-pr-checks.sh` の Test 41 の `slowpipe.pl` と同じ形）:
+
+| 腕（20 回） | 3.2 | 5.3 |
+|---|---|---|
+| `done < <(sort …)` の直後の結論の行 | **20 回崩れる**（行が欠けて 1・`Interrupted system call`） | 0 |
+| 同じ形・SIGCHLD を塞いで起動 | 0（= 割り込むのは SIGCHLD） | — |
+| `done <<<"$(sort …)"` へ寄せた形（詰め物の窓を 3 ms 広げても） | 0 | 0 |
+| 背景の `( sleep 0.2 ) &` の終わりが書き込みに重なる | **落ちる** | 通る |
+| trap した SIGUSR1 が書き込みに重なる | 落ちる | 落ちる（= 5.x が通るのは SIGCHLD の SA_RESTART だけ） |
+| 修正前の `wait-pr-checks.sh` / `merge-pr.sh` を Test 41 で（赤・緑・merge） | **3 回ずつ 9 回とも崩れる**（PASS=279 FAIL=24。どれも CI と同じ `line 506: echo: write error: Interrupted system call`、赤は結論の行だけ消え・緑は 0 が 1・merge は 5 が 1） | — |
+| 修正後（赤・緑・merge を 20 回ずつ・詰め物の窓 0 / 3 ms） | 0（窓 0 / 3 ms とも PASS=473 FAIL=0） | 0（窓 0 / 3 ms とも PASS=473 FAIL=0） |
+
+**再現の道具の罠**（どちらも Test 41 の最初の形で踏んだ）:
+
+- **ただ遅く読むだけの読み手は、腕が書かない間に空きが溜まる**。実物のスクリプト（2 秒ほど走る）の結論の
+  行の write が待たず、修正前でも落ちなかった。腕が書いたら・空けても書かなければ詰め物で満杯へ戻す
+- **`O_NONBLOCK` は開いた口（open file description）ごとの属性で、`dup` した口は共有する**。詰め物を
+  書く間だけ腕と同じ口に `O_NONBLOCK` を立てると、その間の腕の write が **EAGAIN**
+  （`write error: Resource temporarily unavailable`）で落ち、版を問わず結論の行が消えて 1 になる
+  （窓を 3 ms 広げると 3.2 で 30 回中 4 回・5.3 で 30 回中 2 回。機が重いと窓が広がり、合流検証の
+  bash 5 で merge の腕が落ちた）。名前の無いパイプは開き直せないので、FIFO を読み手・詰め物（ずっと非塞）・
+  腕（塞がる）の 3 つの口で別々に開く
+
+**番犬**: `shell_scripts.rs` の `set_eの下で書き込みの最中に届く子のsigchldを増やさない` が、
+`set -e` を宣言する（または `scripts/lib/` / `lib.sh` のように呼び手の set -e を継ぐ）
+**リポジトリ全体の `.sh`** の `<( … )` / `>( … )`・背景の `&` を #1924 と同じ字句解析で読み、
+file:line で名指す（`&&` / `>&2` / `2>&1` / `&>` / `|&`・文字列とコメント・クォート付きヒアドキュメントの
+本文は名指さない。`$( … )` の中は読む）。PR の CI 待ちと merge（`wait-pr-checks.sh` / `merge-pr.sh` /
+`lib/gh-retry.sh` / `lib/pr-conflict.sh`）は 0 で、凍結表にも例外宣言にも逃がさない。既存分は
+`ASYNC_CHILD_ERREXIT_FROZEN` でスクリプトごとの数を凍結した（増やさない・減らしたら表も同じ数へ）。
+#2690 の棚卸しは 27 箇所 / 14 本: `release.sh` 7・`test-release-retry.sh` 5・`promo/` 7・`lib/` 4
+（`bundle-privacy.sh` の `find -print0` = 置換で直せない・隔離 GUI と caffeinate の常駐）・ほか 4
+（`check-claude-mod.sh`・`test-nightly-reserve.sh`・`test-serve-watch.sh` の背景の子）。
+終わるまでの間に何も書かない（`wait` で刈り取ってから書く）と監査して確かめた箇所だけ、その行か
+直前の行に `# tako:sigchld-ok <理由>` で外せる（理由の無い宣言は無効）。
+
 ## 変数を使う rm は空で止める（Issue #2306）
 
 `set -u` が止めるのは**未定義**だけで、**空の値は素通りする**。rm の引数の変数が空のまま走ると
