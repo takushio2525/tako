@@ -54650,12 +54650,14 @@ mod self_test {
         }
     }
 
-    /// **#2716 の A/B**（全節実行が前の節の持ち越しで止まっていた 4 か所）。
-    /// `TAKO_2716_LEGACY=1` / `all` で全部、`md-edit-resume` / `lsp-override` / `bracket-match` /
-    /// `chat-table`（カンマ区切り）で一部だけ修正前へ戻す（`check` は 1 つ目の失敗でプロセスごと
-    /// 止まるので、全節実行で後ろの旧の形を見るときは前のものを戻さない = `legacy_2711` と同じ理由）。
+    /// **#2716 の A/B**（全節実行が前の節の持ち越しで止まっていた 5 か所）。
+    /// `TAKO_2716_LEGACY=1` / `all` で全部、`md-edit-resume` / `md-find-restore` / `lsp-override` /
+    /// `bracket-match` / `chat-table`（カンマ区切り）で一部だけ修正前へ戻す（`check` は 1 つ目の失敗で
+    /// プロセスごと止まるので、全節実行で後ろの旧の形を見るときは前のものを戻さない = `legacy_2711` と
+    /// 同じ理由）。
     ///
-    /// - `md-edit-resume` = 節の頭で場面を作らず、前の節が残した分割の隣に開く
+    /// - `md-edit-resume` / `md-find-restore` = 節の頭で場面を作らず、前の節が残した分割の隣に開く
+    ///   （[`vt2716_own_scene`]）
     /// - `lsp-override` = 言語サーバの差し替え口（`TAKO_LSP_BIN_<ID>`）を env に書くだけで、
     ///   前の節が覚えた実行ファイルの解決を捨てない（[`vt_lsp_override`]）
     /// - `bracket-match` = fixture の言語サーバを決めず、状態の着地も待たずに基準を撮る
@@ -54669,8 +54671,8 @@ mod self_test {
 
     /// **#2716 の注入口**（検証プロセスの門の内側でだけ読む。カンマ区切りで並べられる）。
     ///
-    /// - `split` = md-edit-resume の頭で、開く元のペインの右に 1 枚分割しておく（前の節が分割を
-    ///   残した形。旧の形はプレビューが 0.25 幅 = 編集ボタンの出ない幅になって落ちる）
+    /// - `split` = md-edit-resume / md-find-restore の頭で、開く元のペインの右に 1 枚分割しておく
+    ///   （前の節が分割を残した形。旧の形はプレビューが 0.25 幅になって落ちる）
     /// - `stale-resolve` = lsp-context-menu の頭で、差し替え無しの `.rs` を 1 つ開いて言語サーバの
     ///   解決を覚えさせてから閉じる（全節実行で先の `.rs` の節が残す覚えと同じ。旧の形は偽サーバへの
     ///   差し替えが効かず ① で落ちる）
@@ -54684,6 +54686,43 @@ mod self_test {
         tako_core::paths::is_verification_process()
             && std::env::var("TAKO_2716_INJECT")
                 .is_ok_and(|value| value.split(',').any(|p| p.trim() == item))
+    }
+
+    /// #2716: プレビューを開く節の場面を節の頭で作る（[`ensure_fresh_scene`]）。前の節が残した分割の
+    /// 隣に開くと既定の窓でプレビューが狭くなり、単独では通る節が全節実行で止まる。返り値は開く元の錨。
+    /// 注入 `TAKO_2716_INJECT=split` は先に開く元の右へ 1 枚分割しておく（前の節が残した形）。
+    /// 旧の形（`TAKO_2716_LEGACY=<節名>`）は場面を作らない（`None` = 呼び手は今のフォーカスから開く）
+    #[cfg(feature = "visual-test")]
+    async fn vt2716_own_scene(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+    ) -> Option<PaneId> {
+        if inject_2716("split") {
+            let _ = window.update(cx, |app, _, cx| {
+                let base = app.focused_pane();
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Split {
+                        pane: Some(base.as_u64()),
+                        tab: None,
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    PaneOrigin::User,
+                );
+                let _ = app.attach_pending_sessions(cx);
+                cx.notify();
+            });
+            println!("TAKO_VISUAL_PIXEL: {label} inject=split");
+        }
+        if legacy_2716(label) {
+            return None;
+        }
+        Some(ensure_fresh_scene(window, cx, label).await)
     }
 
     /// visual-test の fixture を受け持つ言語サーバの ID（検出表から引く。名前を書かない）
@@ -61978,35 +62017,10 @@ mod self_test {
         use tako_control::protocol::Request as Req;
         let wait =
             |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
-        if inject_2716("split") {
-            // #2716 の注入: 前の節が分割を残した形（開く元の右に 1 枚）
-            let _ = window.update(cx, |app, _, cx| {
-                let base = app.focused_pane();
-                let _ = tako_control::dispatch(
-                    app,
-                    Req::Split {
-                        pane: Some(base.as_u64()),
-                        tab: None,
-                        direction: Some(tako_control::protocol::Direction::Right),
-                        ratio: None,
-                        command: None,
-                        cwd: None,
-                        focus: Some(false),
-                    },
-                    PaneOrigin::User,
-                );
-                let _ = app.attach_pending_sessions(cx);
-                cx.notify();
-            });
-        }
         // #2716: 開く場面は節の頭で自分で作る。前の節が残した分割の隣に開くと、既定の窓（960×600）で
         // プレビューが 0.25 幅 = 編集ボタンの出ない幅（`PreviewHeaderVisibility` の 300px 未満）になり、
         // 全節実行が「編集ボタンが描かれない」で止まっていた（単独実行は 0.5 幅なので通る）
-        let anchor = if legacy_2716("md-edit-resume") {
-            None
-        } else {
-            Some(ensure_fresh_scene(window, cx, "md-edit-resume").await)
-        };
+        let anchor = vt2716_own_scene(window, cx, "md-edit-resume").await;
         let dir = std::env::temp_dir().join(format!("tako-visual-1661-{}", std::process::id()));
         remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
@@ -62329,6 +62343,9 @@ mod self_test {
         } else {
             "ctrl-shift-f"
         };
+        // #2716: 開く場面は節の頭で自分で作る。md-edit-resume のプレビュー（0.5 幅）の隣に開くと
+        // 0.25 幅になり、閉じた後の描き始めが Beta の見出しにならず止まっていた（単独実行は通る）
+        vt2716_own_scene(window, cx, "md-find-restore").await;
         let dir = std::env::temp_dir().join(format!("tako-visual-1873-{}", std::process::id()));
         remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
