@@ -7600,13 +7600,13 @@ fn orchestrator_guide_local(
     Ok(())
 }
 
-/// 起動時ロードの予算（#1139）。GUI も IPC も要らないローカル処理。
-/// **壊れた設定で GUI が起動しないときにも引ける**ことが本質なので IPC 非依存にする
 /// テスト・検証プロセスの残骸の掃除（Issue #1296）。
 ///
 /// **既定は dry-run**。判定は `tako_core::test_residue` の 1 実装で、
 /// 起動時の自動掃除（テストプロセス）とまったく同じ規則を使う
-/// （「pid が生きていない」だけが削除の条件で、pid 再利用は起動時刻で見分けて見送る）
+/// （「pid が生きていない」だけが削除の条件で、pid 再利用は起動時刻で見分けて見送る）。
+/// 人向けの表示は表示言語（#2365。文は `ReplyNote`、種別の説明と判定の理由は tako-core の日英の対）で、
+/// `--json` は前のまま（`note` / `detail` は日本語）
 fn test_residue_local(args: &TestResidueArgs) -> Result<(), String> {
     use tako_core::test_residue as residue;
 
@@ -7622,13 +7622,21 @@ fn test_residue_local(args: &TestResidueArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    println!("一時ディレクトリ: {}", temp.display());
+    let lang = cli_lang();
+    println!(
+        "{}",
+        ReplyNote::ResidueTempDir(temp.display().to_string()).text_in(lang)
+    );
     if items.is_empty() {
-        println!("残骸はありません");
+        println!("{}", ReplyNote::ResidueNone.text_in(lang));
         return Ok(());
     }
     let total_bytes: u64 = items.iter().map(|r| r.bytes).sum();
-    println!("残骸: {} 件 / {}", items.len(), human_bytes(total_bytes));
+    let total = ReplyNote::ResidueTotal {
+        count: items.len(),
+        bytes: human_bytes(total_bytes),
+    };
+    println!("{}", total.text_in(lang));
     for kind in residue::KINDS {
         let mine: Vec<&residue::Residue> =
             items.iter().filter(|r| r.prefix == kind.prefix).collect();
@@ -7644,22 +7652,28 @@ fn test_residue_local(args: &TestResidueArgs) -> Result<(), String> {
             .map(|k| k.prefix.len())
             .max()
             .unwrap_or(20);
-        println!(
-            "  {:<width$} {:>5} 件 / {:>9}（消せる {removable}）  {}",
-            kind.prefix,
-            mine.len(),
-            human_bytes(bytes),
-            kind.note
-        );
+        let row = ReplyNote::ResidueKindRow {
+            prefix: kind.prefix.to_string(),
+            width,
+            count: mine.len(),
+            bytes: human_bytes(bytes),
+            removable,
+            note: kind.note.text_in(lang).to_string(),
+        };
+        println!("  {}", row.text_in(lang));
     }
     // 見送った理由は**黙って飲み込まない**（「対象が無かった」と区別できるように）
     for (code, count) in &outcome.skipped {
         let detail = items
             .iter()
             .find(|r| r.verdict.code() == code)
-            .map(|r| r.verdict.detail())
-            .unwrap_or("消す直前の再判定で対象から外れた");
-        println!("  見送り {count} 件: {detail}");
+            .map(|r| r.verdict.detail_in(lang).to_string())
+            .unwrap_or_else(|| ReplyNote::ResidueRecheck.text_in(lang));
+        let skipped = ReplyNote::ResidueSkipped {
+            count: *count,
+            detail,
+        };
+        println!("  {}", skipped.text_in(lang));
     }
     let removable_bytes: u64 = items
         .iter()
@@ -7667,25 +7681,21 @@ fn test_residue_local(args: &TestResidueArgs) -> Result<(), String> {
         .map(|r| r.bytes)
         .sum();
     if args.apply {
-        println!(
-            "\n消した: {} 件 / {}（失敗 {}{}）",
-            outcome.removed,
-            human_bytes(outcome.removed_bytes),
-            outcome.failed,
-            outcome
-                .last_error
-                .as_deref()
-                .map(|e| format!(": {e}"))
-                .unwrap_or_default()
-        );
+        let removed = ReplyNote::ResidueRemoved {
+            count: outcome.removed,
+            bytes: human_bytes(outcome.removed_bytes),
+            failed: outcome.failed,
+            error: outcome.last_error.clone(),
+        };
+        println!("\n{}", removed.text_in(lang));
     } else {
-        println!(
-            "\n消せる: {} 件 / {}（まだ 1 つも消していない）",
-            items.iter().filter(|r| r.verdict.removable()).count(),
-            human_bytes(removable_bytes)
-        );
+        let removable = ReplyNote::ResidueRemovable {
+            count: items.iter().filter(|r| r.verdict.removable()).count(),
+            bytes: human_bytes(removable_bytes),
+        };
+        println!("\n{}", removable.text_in(lang));
         // 既定値で済む引数は付けない（#322 の最簡形）
-        println!("いま消す: tako test-residue --apply");
+        println!("{}", ReplyNote::ResidueApplyHint.text_in(lang));
     }
     Ok(())
 }
@@ -7706,6 +7716,8 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// 起動時ロードの予算（#1139）。GUI も IPC も要らないローカル処理。
+/// **壊れた設定で GUI が起動しないときにも引ける**ことが本質なので IPC 非依存にする
 fn context_budget_local(args: &ContextBudgetArgs) -> Result<(), String> {
     local_data_gate()?;
     init_local_lang();
@@ -7733,32 +7745,35 @@ fn context_budget_local(args: &ContextBudgetArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// `tako context-budget`（check）の表示。枠は表示言語（#2365。文は `ReplyNote`）で、理由文・起動前の 1 行・
+/// 名指しは `context_budget::report` が表示言語で組んだ応答の値のまま
 fn print_context_budget_check(out: &serde_json::Value) {
+    let lang = cli_lang();
     let empty = vec![];
     let items = out["items"].as_array().unwrap_or(&empty);
-    println!(
-        "起動時ロード: {} 項目 / 概算 {} トークン",
-        items.len(),
-        out["totals"]["est_tokens"].as_u64().unwrap_or(0)
-    );
+    let header = ReplyNote::BudgetHeader {
+        items: items.len(),
+        tokens: out["totals"]["est_tokens"].as_u64().unwrap_or(0),
+    };
+    println!("{}", header.text_in(lang));
     for it in items {
         let v = it["violations"].as_array();
         let mark = if v.is_some() { "!" } else { " " };
-        println!(
-            "{mark} {:<40} {:>7} bytes / 約 {:>6} tok  [{}]",
-            it["path"].as_str().unwrap_or("?"),
-            it["bytes"].as_u64().unwrap_or(0),
-            it["est_tokens"].as_u64().unwrap_or(0),
-            it["kind"].as_str().unwrap_or("?")
-        );
+        let row = ReplyNote::BudgetItemRow {
+            path: it["path"].as_str().unwrap_or("?").to_string(),
+            bytes: it["bytes"].as_u64().unwrap_or(0),
+            tokens: it["est_tokens"].as_u64().unwrap_or(0),
+            kind: it["kind"].as_str().unwrap_or("?").to_string(),
+        };
+        println!("{mark} {}", row.text_in(lang));
         for x in v.into_iter().flatten() {
-            println!(
-                "      超過 {}: {} > {}（{}）",
-                x["metric"].as_str().unwrap_or("?"),
-                x["actual"].as_u64().unwrap_or(0),
-                x["limit"].as_u64().unwrap_or(0),
-                x["note"].as_str().unwrap_or("")
-            );
+            let over = ReplyNote::BudgetOver {
+                metric: x["metric"].as_str().unwrap_or("?").to_string(),
+                actual: x["actual"].as_u64().unwrap_or(0),
+                limit: x["limit"].as_u64().unwrap_or(0),
+                note: x["note"].as_str().unwrap_or("").to_string(),
+            };
+            println!("      {}", over.text_in(lang));
             // #1675: `fix` で直る復活は提案に載らないので、どこに戻ったかをここで名指しする
             // （直らないものは提案の側が同じ名指しを出す）
             if x["fixable"] == true {
@@ -7770,7 +7785,7 @@ fn print_context_budget_check(out: &serde_json::Value) {
     }
     let violations = out["violations"].as_u64().unwrap_or(0);
     if violations == 0 {
-        println!("\n予算内");
+        println!("\n{}", ReplyNote::BudgetWithin.text_in(lang));
         return;
     }
     // `tako master` の起動前 1 行・MCP の応答と同じ 1 行（#1715。予算超過と
@@ -7782,15 +7797,17 @@ fn print_context_budget_check(out: &serde_json::Value) {
 }
 
 /// 自動で直せなかったぶんの案内。**system prompt は内訳（大きい順）まで出す**（#1154）:
-/// 「大きい」だけ言われても、どの block を分ければ効くのか分からない
+/// 「大きい」だけ言われても、どの block を分ければ効くのか分からない。
+/// 枠は表示言語（#2365）で、直し方・`advice`・名指しは応答の値（表示言語で組まれている）のまま
 fn print_context_budget_proposals(out: &serde_json::Value) {
+    let lang = cli_lang();
     let empty = vec![];
     for p in out["proposals"].as_array().unwrap_or(&empty) {
-        println!(
-            "  提案 {}: {}",
-            p["path"].as_str().unwrap_or("?"),
-            p["next_step"].as_str().unwrap_or("")
-        );
+        let proposal = ReplyNote::BudgetProposal {
+            path: p["path"].as_str().unwrap_or("?").to_string(),
+            next_step: p["next_step"].as_str().unwrap_or("").to_string(),
+        };
+        println!("  {}", proposal.text_in(lang));
         for piece in p["pieces"].as_array().unwrap_or(&empty).iter().take(5) {
             println!(
                 "        {:<34} {:>7} bytes",
@@ -7809,38 +7826,38 @@ fn print_context_budget_proposals(out: &serde_json::Value) {
     }
 }
 
+/// `tako context-budget fix` の表示。枠は表示言語（#2365。文は `ReplyNote`）で、名指しと移す 1 行は
+/// 応答の値のまま
 fn print_context_budget_fix(out: &serde_json::Value, dry_run: bool) {
+    let lang = cli_lang();
     let empty = vec![];
     if dry_run {
-        println!("（dry-run: 書き込まない）");
+        println!("{}", ReplyNote::BudgetDryRun.text_in(lang));
     }
     for c in out["changes"].as_array().unwrap_or(&empty) {
-        let path = c["path"].as_str().unwrap_or("?");
+        let path = c["path"].as_str().unwrap_or("?").to_string();
         if !c["changed"].as_bool().unwrap_or(false) {
-            println!("{path}: 変更なし（予算内）");
+            println!("{}", ReplyNote::BudgetUnchanged(path).text_in(lang));
             continue;
         }
-        println!(
-            "{path}: {} 件 → 残 {} 件 / archive へ {} 件（総数保存: {}）",
-            c["entries_before"].as_u64().unwrap_or(0),
-            c["entries_kept"].as_u64().unwrap_or(0),
-            c["entries_archived"].as_u64().unwrap_or(0),
-            if c["entries_preserved"].as_bool().unwrap_or(false) {
-                "はい"
-            } else {
-                "いいえ"
-            }
-        );
-        println!(
-            "  {} → {} bytes（約 {} → {} トークン）",
-            c["bytes_before"].as_u64().unwrap_or(0),
-            c["bytes_after"].as_u64().unwrap_or(0),
-            c["est_tokens_before"].as_u64().unwrap_or(0),
-            c["est_tokens_after"].as_u64().unwrap_or(0)
-        );
+        let moved = ReplyNote::BudgetMoved {
+            path,
+            before: c["entries_before"].as_u64().unwrap_or(0),
+            kept: c["entries_kept"].as_u64().unwrap_or(0),
+            archived: c["entries_archived"].as_u64().unwrap_or(0),
+            preserved: c["entries_preserved"].as_bool().unwrap_or(false),
+        };
+        println!("{}", moved.text_in(lang));
+        let bytes = ReplyNote::BudgetBytes {
+            before: c["bytes_before"].as_u64().unwrap_or(0),
+            after: c["bytes_after"].as_u64().unwrap_or(0),
+            tokens_before: c["est_tokens_before"].as_u64().unwrap_or(0),
+            tokens_after: c["est_tokens_after"].as_u64().unwrap_or(0),
+        };
+        println!("  {}", bytes.text_in(lang));
         let aged = c["archive_lines_removed_by_age"].as_u64().unwrap_or(0);
         if aged > 0 {
-            println!("  保持期間を過ぎて archive から削除: {aged} 行");
+            println!("  {}", ReplyNote::BudgetAgedOut(aged).text_in(lang));
         }
         // #1675: アーカイブに既に在るので作業ログ側を落としたエントリ（rebase で戻ったもの）。
         // 無い回は何も出さない（それまでの表示とバイト一致）
@@ -7848,17 +7865,19 @@ fn print_context_budget_fix(out: &serde_json::Value, dry_run: bool) {
         if dropped > 0 {
             println!(
                 "  {}",
-                tako_control::context_budget::dropped_line_in(dropped, tako_core::i18n::lang())
+                tako_control::context_budget::dropped_line_in(dropped, lang)
             );
             for l in c["dropped_revived"].as_array().unwrap_or(&empty) {
                 println!("    {}", l.as_str().unwrap_or(""));
             }
         }
         for l in c["archived_preview"].as_array().unwrap_or(&empty) {
-            println!("    移送予定 {}", l.as_str().unwrap_or(""));
+            let line = ReplyNote::BudgetToArchive(l.as_str().unwrap_or("").to_string());
+            println!("    {}", line.text_in(lang));
         }
     }
-    println!("変更したファイル: {}", out["changed"].as_u64().unwrap_or(0));
+    let changed = ReplyNote::BudgetFilesChanged(out["changed"].as_u64().unwrap_or(0));
+    println!("{}", changed.text_in(lang));
     print_context_budget_proposals(out);
 }
 

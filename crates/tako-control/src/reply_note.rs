@@ -45,6 +45,10 @@
 //!
 //! `tako search`（横断検索・置換・置換の取り消し）と `tako jump` の人向けの表示の枠もここが持つ。行の中身
 //! （抜粋・置換後・当てない理由・`note` / `next_step`・移れない理由）は GUI が表示言語で組んだ応答の値のまま
+//!
+//! `tako context-budget`（check / fix）と `tako test-residue` の人向けの表示の枠もここが持つ。予算の理由文・直し方・
+//! 起動前の 1 行は `context_budget` が表示言語で組んだ応答の値のまま。残骸の種別の説明と判定の理由は
+//! tako-core の `Kind::note` / `Verdict::detail_in` を表示言語で引き、応答の JSON の `note` / `detail` は日本語のまま
 
 use tako_core::handoff::{HANDOFF_PROJECTS_DIR, PROFILE_MEMO_SOFT_LIMIT_LINES};
 use tako_core::i18n::Lang;
@@ -961,6 +965,89 @@ pub enum ReplyNote {
     JumpReopened,
     /// `tako jump back / forward`: 移れなかった理由が応答に無いとき（古い GUI）の代わりの文
     JumpNothingToMove,
+
+    // ---- CLI の人向けの表示: 起動時ロードの予算（`tako context-budget` の check / fix）----
+    // 理由文・直し方・起動前の 1 行・内訳の名前は `context_budget::report` / `fix` が表示言語で組んだ応答の値のまま。
+    // 値（パス・件数・バイト数・トークン数・軸の名前）は表記のまま埋め、字下げと行頭の印は呼び手が付ける
+    /// check の見出し: 項目の数と概算のトークン数
+    BudgetHeader { items: usize, tokens: u64 },
+    /// check の項目 1 行（`path` は 40 桁・バイト数は 7 桁・トークン数は 6 桁に揃える）
+    BudgetItemRow {
+        path: String,
+        bytes: u64,
+        tokens: u64,
+        kind: String,
+    },
+    /// check の超過 1 件（`note` は応答の理由文）
+    BudgetOver {
+        metric: String,
+        actual: u64,
+        limit: u64,
+        note: String,
+    },
+    /// check の結び: 超過が無い
+    BudgetWithin,
+    /// 自動で直せない超過の提案（`next_step` は応答の直し方）
+    BudgetProposal { path: String, next_step: String },
+    /// fix の見出し: dry-run
+    BudgetDryRun,
+    /// fix: 作業ログが予算内で変えなかった
+    BudgetUnchanged(String),
+    /// fix: 移送の件数（`preserved` = 総数が保たれたか）
+    BudgetMoved {
+        path: String,
+        before: u64,
+        kept: u64,
+        archived: u64,
+        preserved: bool,
+    },
+    /// fix: バイト数とトークン数の前後
+    BudgetBytes {
+        before: u64,
+        after: u64,
+        tokens_before: u64,
+        tokens_after: u64,
+    },
+    /// fix: 保持期間を過ぎてアーカイブから消した行数
+    BudgetAgedOut(u64),
+    /// fix --dry-run: アーカイブへ移す 1 行（中身は作業ログの見出しから組んだ 1 行のまま）
+    BudgetToArchive(String),
+    /// fix の結び: 変えたファイルの数
+    BudgetFilesChanged(u64),
+
+    // ---- CLI の人向けの表示: テスト・検証プロセスの残骸（`tako test-residue`）----
+    // 種別の説明と判定の理由は tako-core の `Kind::note` / `Verdict::detail_in` を表示言語で引いて渡す
+    // （応答の JSON の `note` / `detail` は日本語のまま）。大きさは `human_bytes` の表記のまま埋める
+    /// 走査した一時ディレクトリ
+    ResidueTempDir(String),
+    /// 残骸が 1 つも無い
+    ResidueNone,
+    /// 残骸の件数と合計の大きさ
+    ResidueTotal { count: usize, bytes: String },
+    /// 種別ごとの 1 行（`prefix` は `width` 桁・件数は 5 桁・大きさは 9 桁に揃える。`note` は種別の説明）
+    ResidueKindRow {
+        prefix: String,
+        width: usize,
+        count: usize,
+        bytes: String,
+        removable: usize,
+        note: String,
+    },
+    /// 見送った件数と理由（`detail` は判定の理由）
+    ResidueSkipped { count: usize, detail: String },
+    /// 見送りの理由: 消す直前の再判定で外れた（判定の理由を持つ残骸が無いときの代わりの文）
+    ResidueRecheck,
+    /// `--apply` の結び: 消した件数・大きさ・失敗の件数（`error` は最初の失敗の理由 = OS の文のまま）
+    ResidueRemoved {
+        count: usize,
+        bytes: String,
+        failed: usize,
+        error: Option<String>,
+    },
+    /// dry-run の結び: 消せる件数と大きさ
+    ResidueRemovable { count: usize, bytes: String },
+    /// dry-run の案内: 消すコマンド
+    ResidueApplyHint,
 }
 
 impl ReplyNote {
@@ -3897,6 +3984,184 @@ impl ReplyNote {
             (Self::JumpReopened, En) => " (reopened, since its pane had been closed)".into(),
             (Self::JumpNothingToMove, Ja) => "移れる履歴が無い".into(),
             (Self::JumpNothingToMove, En) => "no history to move to".into(),
+
+            (Self::BudgetHeader { items, tokens }, Ja) => {
+                format!("起動時ロード: {items} 項目 / 概算 {tokens} トークン")
+            }
+            (Self::BudgetHeader { items, tokens }, En) => {
+                format!("startup load: {items} item(s) / about {tokens} tokens")
+            }
+            (
+                Self::BudgetItemRow {
+                    path,
+                    bytes,
+                    tokens,
+                    kind,
+                },
+                Ja,
+            ) => format!("{path:<40} {bytes:>7} bytes / 約 {tokens:>6} tok  [{kind}]"),
+            (
+                Self::BudgetItemRow {
+                    path,
+                    bytes,
+                    tokens,
+                    kind,
+                },
+                En,
+            ) => format!("{path:<40} {bytes:>7} bytes / ~ {tokens:>6} tok  [{kind}]"),
+            (
+                Self::BudgetOver {
+                    metric,
+                    actual,
+                    limit,
+                    note,
+                },
+                Ja,
+            ) => format!("超過 {metric}: {actual} > {limit}（{note}）"),
+            (
+                Self::BudgetOver {
+                    metric,
+                    actual,
+                    limit,
+                    note,
+                },
+                En,
+            ) => format!("over {metric}: {actual} > {limit} ({note})"),
+            (Self::BudgetWithin, Ja) => "予算内".into(),
+            (Self::BudgetWithin, En) => "within budget".into(),
+            (Self::BudgetProposal { path, next_step }, Ja) => format!("提案 {path}: {next_step}"),
+            (Self::BudgetProposal { path, next_step }, En) => {
+                format!("proposal {path}: {next_step}")
+            }
+            (Self::BudgetDryRun, Ja) => "（dry-run: 書き込まない）".into(),
+            (Self::BudgetDryRun, En) => "(dry-run: nothing is written)".into(),
+            (Self::BudgetUnchanged(path), Ja) => format!("{path}: 変更なし（予算内）"),
+            (Self::BudgetUnchanged(path), En) => format!("{path}: unchanged (within budget)"),
+            (
+                Self::BudgetMoved {
+                    path,
+                    before,
+                    kept,
+                    archived,
+                    preserved,
+                },
+                Ja,
+            ) => format!(
+                "{path}: {before} 件 → 残 {kept} 件 / archive へ {archived} 件（総数保存: {}）",
+                if *preserved { "はい" } else { "いいえ" }
+            ),
+            (
+                Self::BudgetMoved {
+                    path,
+                    before,
+                    kept,
+                    archived,
+                    preserved,
+                },
+                En,
+            ) => format!(
+                "{path}: {before} entries → {kept} kept / {archived} to the archive (total preserved: {})",
+                if *preserved { "yes" } else { "no" }
+            ),
+            (
+                Self::BudgetBytes {
+                    before,
+                    after,
+                    tokens_before,
+                    tokens_after,
+                },
+                Ja,
+            ) => format!("{before} → {after} bytes（約 {tokens_before} → {tokens_after} トークン）"),
+            (
+                Self::BudgetBytes {
+                    before,
+                    after,
+                    tokens_before,
+                    tokens_after,
+                },
+                En,
+            ) => format!(
+                "{before} → {after} bytes (about {tokens_before} → {tokens_after} tokens)"
+            ),
+            (Self::BudgetAgedOut(lines), Ja) => {
+                format!("保持期間を過ぎて archive から削除: {lines} 行")
+            }
+            (Self::BudgetAgedOut(lines), En) => {
+                format!("removed from the archive after the retention period: {lines} line(s)")
+            }
+            (Self::BudgetToArchive(line), Ja) => format!("移送予定 {line}"),
+            (Self::BudgetToArchive(line), En) => format!("to archive: {line}"),
+            (Self::BudgetFilesChanged(n), Ja) => format!("変更したファイル: {n}"),
+            (Self::BudgetFilesChanged(n), En) => format!("files changed: {n}"),
+
+            (Self::ResidueTempDir(dir), Ja) => format!("一時ディレクトリ: {dir}"),
+            (Self::ResidueTempDir(dir), En) => format!("temp directory: {dir}"),
+            (Self::ResidueNone, Ja) => "残骸はありません".into(),
+            (Self::ResidueNone, En) => "no residue".into(),
+            (Self::ResidueTotal { count, bytes }, Ja) => format!("残骸: {count} 件 / {bytes}"),
+            (Self::ResidueTotal { count, bytes }, En) => {
+                format!("residue: {count} item(s) / {bytes}")
+            }
+            (
+                Self::ResidueKindRow {
+                    prefix,
+                    width,
+                    count,
+                    bytes,
+                    removable,
+                    note,
+                },
+                Ja,
+            ) => format!("{prefix:<width$} {count:>5} 件 / {bytes:>9}（消せる {removable}）  {note}"),
+            (
+                Self::ResidueKindRow {
+                    prefix,
+                    width,
+                    count,
+                    bytes,
+                    removable,
+                    note,
+                },
+                En,
+            ) => format!(
+                "{prefix:<width$} {count:>5} item(s) / {bytes:>9} ({removable} removable)  {note}"
+            ),
+            (Self::ResidueSkipped { count, detail }, Ja) => format!("見送り {count} 件: {detail}"),
+            (Self::ResidueSkipped { count, detail }, En) => format!("skipped {count}: {detail}"),
+            (Self::ResidueRecheck, Ja) => "消す直前の再判定で対象から外れた".into(),
+            (Self::ResidueRecheck, En) => "dropped by the recheck just before removal".into(),
+            (
+                Self::ResidueRemoved {
+                    count,
+                    bytes,
+                    failed,
+                    error,
+                },
+                Ja,
+            ) => format!(
+                "消した: {count} 件 / {bytes}（失敗 {failed}{}）",
+                error.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+            ),
+            (
+                Self::ResidueRemoved {
+                    count,
+                    bytes,
+                    failed,
+                    error,
+                },
+                En,
+            ) => format!(
+                "removed: {count} item(s) / {bytes} ({failed} failed{})",
+                error.as_deref().map(|e| format!(": {e}")).unwrap_or_default()
+            ),
+            (Self::ResidueRemovable { count, bytes }, Ja) => {
+                format!("消せる: {count} 件 / {bytes}（まだ 1 つも消していない）")
+            }
+            (Self::ResidueRemovable { count, bytes }, En) => {
+                format!("removable: {count} item(s) / {bytes} (nothing removed yet)")
+            }
+            (Self::ResidueApplyHint, Ja) => "いま消す: tako test-residue --apply".into(),
+            (Self::ResidueApplyHint, En) => "remove them now: tako test-residue --apply".into(),
         }
     }
 }

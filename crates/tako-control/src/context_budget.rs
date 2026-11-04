@@ -277,7 +277,15 @@ pub fn inventory(cwd: &Path, profile: Option<&str>) -> Vec<Item> {
         };
         items.push(Item {
             kind: ItemKind::SystemPrompt,
-            label: format!("{} system prompt（{profile_name}）", kind.as_str()),
+            // 名前は表示言語（#2365。MCP カタログの項目と同じ作法。日本語は前のまま全角の括弧）
+            label: match tako_core::i18n::lang() {
+                tako_core::i18n::Lang::Ja => {
+                    format!("{} system prompt（{profile_name}）", kind.as_str())
+                }
+                tako_core::i18n::Lang::En => {
+                    format!("{} system prompt ({profile_name})", kind.as_str())
+                }
+            },
             path: None,
             text: crate::orchestrator::join_prompt_pieces(&pieces),
             imported: false,
@@ -445,17 +453,21 @@ fn violation_json(it: &Item, v: &budget::Violation) -> Value {
     });
     if let Some(a) = split_advice_for(it, v) {
         // #1477: 「大きい」だけでなく**何行動かせば収まるか**を実測から返す
-        o["advice"] = json!(if tako_core::i18n::lang() == tako_core::i18n::Lang::Ja {
-            &a.ja
-        } else {
-            &a.en
-        });
+        o["advice"] = json!(advice_in(&a, tako_core::i18n::lang()));
         o["advice_ja"] = json!(a.ja);
         o["advice_en"] = json!(a.en);
         o["move_lines"] = json!(a.move_lines);
         o["marker"] = json!(tako_core::prompt_append::MARKER);
     }
     o
+}
+
+/// 応答の `advice`（項目の違反と提案の両方）の表示言語の側。日英の対は `advice_ja` / `advice_en` にも載る
+fn advice_in(a: &tako_core::prompt_append::SplitAdvice, lang: tako_core::i18n::Lang) -> &str {
+    match lang {
+        tako_core::i18n::Lang::Ja => &a.ja,
+        tako_core::i18n::Lang::En => &a.en,
+    }
 }
 
 /// 分割しても常時部が予算を超えるときの具体値（#1477）。
@@ -519,9 +531,10 @@ pub fn report(cwd: &Path, profile: Option<&str>) -> Result<Value, String> {
                     if !it.pieces.is_empty() {
                         prop["pieces"] = json!(pieces_json(&it.pieces));
                     }
-                    // #1477: 追記があるなら「区切りを何行上げれば収まるか」まで出す
+                    // #1477: 追記があるなら「区切りを何行上げれば収まるか」まで出す。
+                    // `advice` は項目の側（`violation_json`）と同じく表示言語（#2365。以前は日本語に固定）
                     if let Some(a) = split_advice_for(it, &v) {
-                        prop["advice"] = json!(a.ja);
+                        prop["advice"] = json!(advice_in(&a, tako_core::i18n::lang()));
                         prop["advice_ja"] = json!(a.ja);
                         prop["advice_en"] = json!(a.en);
                         prop["move_lines"] = json!(a.move_lines);
