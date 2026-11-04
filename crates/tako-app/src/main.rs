@@ -62683,6 +62683,8 @@ mod self_test {
             }
             None => (false, 0),
         };
+        // 確かめの前に撮る（隠れて落ちた回も、狭い本文のどこに何が描かれていたかが絵で残る）
+        dump(cx, "md-find-0-searching.png");
         check(
             wrapped > 0,
             "visual-test md-find-restore: 前提 = 狭いペインで本文の行が折り返している (#2737)",
@@ -62694,7 +62696,6 @@ mod self_test {
                  （狭いペインで折り返した行の下に隠れない。{hit:?}）(#2737)"
             ),
         );
-        dump(cx, "md-find-0-searching.png");
         key(cx, "escape");
         let restored = wait_for_markdown_outline(window, cx, pane, 3).await;
         let closed = observe(cx, pane);
