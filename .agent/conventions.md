@@ -2721,6 +2721,12 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   - A/B は `TAKO_2716_LEGACY=md-edit-resume|lsp-override|bracket-match|chat-table|autostart`（`1` で全部）、
     持ち越しの注入は `TAKO_2716_INJECT=split|stale-resolve|no-reload|late-band,resolve-ms=400`（単独実行で
     前の節の残りを作る。旧の形は名指しで落ち、新しい形は通る）
+- **節の合否を窓の寸法に預けない**（#2752）。検証スクリプトが渡す窓（`ISOLATED_GUI_BOUNDS`）は、
+  そのスクリプトを通さずに起こした回（`TAKO_VISUAL_ONLY` を直に付けた単独実行・全節実行）には
+  届かない（窓を渡さなければ既定の 960×600）。文字の幅を
+  `position_for_index` の差で測る検査は、測る区間が 1 行に収まることを前提として `check` で見る
+  （折り返すと 2 行目の x を測って比が崩れる。editor-font の md は既定の窓で 406.99 → 77.06 で
+  落ちていた）。前提が崩れたら比の失敗ではなく「前提の欠け」として名指して止める
 - **節を足したら `TAKO_VISUAL_ONLY` の腕と全節実行の並びの両方へ載せる**。腕にしか
   無い節は「最終確認」で**一度も走らない**（#948 で `preview_code_visual` /
   `remote_tree_visual` / `screen_lines_visual` の 3 本がこれだった。`remote_tree_visual`
