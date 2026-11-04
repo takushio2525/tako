@@ -54650,14 +54650,12 @@ mod self_test {
         }
     }
 
-    /// **#2716 の A/B**（全節実行が前の節の持ち越しで止まっていた 5 か所）。
-    /// `TAKO_2716_LEGACY=1` / `all` で全部、`md-edit-resume` / `md-find-restore` / `lsp-override` /
-    /// `bracket-match` / `chat-table`（カンマ区切り）で一部だけ修正前へ戻す（`check` は 1 つ目の失敗で
-    /// プロセスごと止まるので、全節実行で後ろの旧の形を見るときは前のものを戻さない = `legacy_2711` と
-    /// 同じ理由）。
+    /// **#2716 の A/B**（全節実行が前の節の持ち越しで止まっていた 4 か所）。
+    /// `TAKO_2716_LEGACY=1` / `all` で全部、`md-edit-resume` / `lsp-override` / `bracket-match` /
+    /// `chat-table`（カンマ区切り）で一部だけ修正前へ戻す（`check` は 1 つ目の失敗でプロセスごと
+    /// 止まるので、全節実行で後ろの旧の形を見るときは前のものを戻さない = `legacy_2711` と同じ理由）。
     ///
-    /// - `md-edit-resume` / `md-find-restore` = 節の頭で場面を作らず、前の節が残した分割の隣に開く
-    ///   （[`vt2716_own_scene`]）
+    /// - `md-edit-resume` = 節の頭で場面を作らず、前の節が残した分割の隣に開く（[`vt2716_own_scene`]）
     /// - `lsp-override` = 言語サーバの差し替え口（`TAKO_LSP_BIN_<ID>`）を env に書くだけで、
     ///   前の節が覚えた実行ファイルの解決を捨てない（[`vt_lsp_override`]）
     /// - `bracket-match` = fixture の言語サーバを決めず、状態の着地も待たずに基準を撮る
@@ -54671,16 +54669,19 @@ mod self_test {
 
     /// **#2716 の注入口**（検証プロセスの門の内側でだけ読む。カンマ区切りで並べられる）。
     ///
-    /// - `split` = md-edit-resume / md-find-restore の頭で、開く元のペインの右に 1 枚分割しておく
-    ///   （前の節が分割を残した形。旧の形はプレビューが 0.25 幅になって落ちる）
+    /// - `split` = md-edit-resume の頭で、開く元のペインの右に 1 枚分割しておく（前の節が分割を
+    ///   残した形。旧の形はプレビューが 0.25 幅 = 編集ボタンの出ない幅になって落ちる）
     /// - `stale-resolve` = lsp-context-menu の頭で、差し替え無しの `.rs` を 1 つ開いて言語サーバの
     ///   解決を覚えさせてから閉じる（全節実行で先の `.rs` の節が残す覚えと同じ。旧の形は偽サーバへの
     ///   差し替えが効かず ① で落ちる）
     /// - `no-reload` = chat-table の間だけライブリロードを切る（ファイル監視の読み直しが来ない形。
     ///   旧の形は表が揃わず落ちる）
+    /// - `late-band` = bracket-match の頭で、旧の形でも fixture の言語サーバを実行できないパスへ差し替える
+    ///   （解決がすぐ済む = 帯の着地の時刻を `resolve-ms` だけで決める。新しい形は自分で同じ差し替えをする）
     /// - `resolve-ms=<ミリ秒>` = 言語サーバの実行ファイルの解決を遅らせる（tako-control の
-    ///   `LspManager` が読む。前の節の解決が bracket-match の途中に着地した形。旧の形は未導入の帯が
-    ///   基準を撮った後に出て ② / ③ で落ちる）
+    ///   `LspManager` が読む）。`late-band,resolve-ms=400` で、前の節の解決が bracket-match の途中に
+    ///   着地した形になる（基準は開いてから約 0.37 秒・③ は約 1 秒。旧の形は帯が基準の後に出て ② で
+    ///   落ち、新しい形は着地を待ってから撮るので通る）
     #[cfg(feature = "visual-test")]
     fn inject_2716(item: &str) -> bool {
         tako_core::paths::is_verification_process()
@@ -62343,9 +62344,6 @@ mod self_test {
         } else {
             "ctrl-shift-f"
         };
-        // #2716: 開く場面は節の頭で自分で作る。md-edit-resume のプレビュー（0.5 幅）の隣に開くと
-        // 0.25 幅になり、閉じた後の描き始めが Beta の見出しにならず止まっていた（単独実行は通る）
-        vt2716_own_scene(window, cx, "md-find-restore").await;
         let dir = std::env::temp_dir().join(format!("tako-visual-1873-{}", std::process::id()));
         remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);

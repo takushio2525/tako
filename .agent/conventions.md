@@ -2686,8 +2686,8 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     節の途中に出ると器が縮む）。言語サーバに用の無い節は fixture を受け持たない拡張子にする（#2714）
   - **dispatch で直に開いたプレビューは `drain_pending_preview_loads` で流す**（#826 / #2716 の #745。
     流さないとファイル監視の読み直しが来たときだけ揃う）
-  - A/B は `TAKO_2716_LEGACY=md-edit-resume|md-find-restore|lsp-override|bracket-match|chat-table`（`1` で全部）、
-    持ち越しの注入は `TAKO_2716_INJECT=split|stale-resolve|no-reload|resolve-ms=<ミリ秒>`（単独実行で
+  - A/B は `TAKO_2716_LEGACY=md-edit-resume|lsp-override|bracket-match|chat-table`（`1` で全部）、
+    持ち越しの注入は `TAKO_2716_INJECT=split|stale-resolve|no-reload|late-band,resolve-ms=400`（単独実行で
     前の節の残りを作る。旧の形は名指しで落ち、新しい形は通る）
 - **節を足したら `TAKO_VISUAL_ONLY` の腕と全節実行の並びの両方へ載せる**。腕にしか
   無い節は「最終確認」で**一度も走らない**（#948 で `preview_code_visual` /

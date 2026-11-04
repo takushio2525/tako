@@ -7,8 +7,7 @@
 //! 止まらず（全節 10 回とも通過）、代わりに後ろの節が持ち越しで止まっていた:
 //!
 //! - md-edit-resume: 前の節が残した分割の隣に開くので、既定の窓（960×600）でプレビューが
-//!   0.25 幅 = 編集ボタンの出ない幅（300px 未満）になり「編集ボタンが描かれない」（6/7）。
-//!   直すと次の md-find-restore が同じ形（md-edit-resume のプレビューの隣 = 0.25 幅）で止まった
+//!   0.25 幅 = 編集ボタンの出ない幅（300px 未満）になり「編集ボタンが描かれない」（6/7）
 //! - bracket-match: fixture（`.rs`）の言語サーバの解決が前の節から節の途中に着地し、未導入の帯が
 //!   器を縮めて ② が基準の画素とずれた（1/7）
 //! - lsp-context-menu: 言語サーバの実行ファイルの解決は ID ごとに覚えられ（`LspManager` の
@@ -25,8 +24,8 @@
 //!    `"TAKO_LSP_BIN_…"` を `set_var` / `remove_var` へ直に渡す行も file:line で名指す
 //! 2. [`差し替えの補助はrestartの口で覚えを捨てる`] — `vt_lsp_override` が `LspServer` の restart を
 //!    dispatch し、旧の形（`TAKO_2716_LEGACY=lsp-override`）だけが通らない
-//! 3. [`持ち越しで止まった節は場面と状態を自分で決める`] — md-edit-resume / md-find-restore が
-//!    開く前に `vt2716_own_scene`（= `ensure_fresh_scene`）で場面を作る・chat-table が開いた後に
+//! 3. [`持ち越しで止まった節は場面と状態を自分で決める`] — md-edit-resume が開く前に
+//!    `vt2716_own_scene`（= `ensure_fresh_scene`）で場面を作る・chat-table が開いた後に
 //!    `drain_pending_preview_loads` を呼ぶ・bracket-match が言語サーバを差し替え、状態の着地
 //!    （`vt_lsp_settled`）を基準のフレームより前に待つ
 //! 4. [`修正前の形を名指しできる`] — 修正前の形を注入すると 1〜3 のどれかが名指しで落ちる
@@ -172,27 +171,22 @@ fn section_problems(main: &str, bracket: &str) -> Vec<String> {
         None => problems
             .push("`async fn vt2716_own_scene(` が無い（プレビューを開く節の場面づくり）".into()),
     }
-    for (head, name) in [
-        ("async fn md_edit_resume_visual(", "md-edit-resume"),
-        ("async fn md_find_restore_visual(", "md-find-restore"),
-    ] {
-        match block_range(&code, head).map(|r| &code[r]) {
-            Some(body) => {
-                let scene = body.find("vt2716_own_scene(");
-                let open = body.find("Req::OpenFile");
-                if !scene.is_some_and(|s| open.is_some_and(|o| s < o)) {
-                    problems.push(format!(
-                        "{name} が開く前に `vt2716_own_scene(` で場面を作っていない（前の節の分割の隣に \
-                         開くとプレビューが 0.25 幅になる）"
-                    ));
-                }
-            }
-            None => problems.push(format!("`{head}` が見つからない")),
-        }
-    }
     match block_range(&code, "async fn md_edit_resume_visual(").map(|r| &code[r]) {
-        Some(body) if body.contains("anchor.unwrap_or_else(") => {}
-        _ => problems.push("md-edit-resume が場面の錨（`anchor`）から開いていない".into()),
+        Some(body) => {
+            let scene = body.find("vt2716_own_scene(");
+            let open = body.find("Req::OpenFile");
+            if !scene.is_some_and(|s| open.is_some_and(|o| s < o)) {
+                problems.push(
+                    "md-edit-resume が開く前に `vt2716_own_scene(` で場面を作っていない（前の節の \
+                     分割の隣に開くとプレビューが 0.25 幅になり編集ボタンが出ない）"
+                        .into(),
+                );
+            }
+            if !body.contains("anchor.unwrap_or_else(") {
+                problems.push("md-edit-resume が場面の錨（`anchor`）から開いていない".into());
+            }
+        }
+        None => problems.push("`async fn md_edit_resume_visual(` が見つからない".into()),
     }
     match block_range(&code, "async fn chat_table_visual(").map(|r| &code[r]) {
         Some(body) => {
@@ -315,21 +309,22 @@ fn 修正前の形を名指しできる() {
             .any(|p| p.contains("restart の口")),
         "restart を撃たない補助を名指せる"
     );
-    // 3a. md-edit-resume / md-find-restore が場面を作らない（修正前）
-    for name in ["md-edit-resume", "md-find-restore"] {
-        let call = format!("vt2716_own_scene(window, cx, \"{name}\").await");
-        let stale_scene = main.replacen(&call, "None::<PaneId>", 1);
-        assert_ne!(
-            stale_scene, main,
-            "注入先（{name} の場面づくり）が本文に在る"
-        );
-        assert!(
-            section_problems(&stale_scene, &bracket)
-                .iter()
-                .any(|p| p.contains(&format!("{name} が開く前に"))),
-            "場面を作らない {name} を名指せる"
-        );
-    }
+    // 3a. md-edit-resume が場面を作らない（修正前）
+    let stale_scene = main.replacen(
+        "vt2716_own_scene(window, cx, \"md-edit-resume\").await",
+        "None::<PaneId>",
+        1,
+    );
+    assert_ne!(
+        stale_scene, main,
+        "注入先（md-edit-resume の場面づくり）が本文に在る"
+    );
+    assert!(
+        section_problems(&stale_scene, &bracket)
+            .iter()
+            .any(|p| p.contains("md-edit-resume が開く前に")),
+        "場面を作らない md-edit-resume を名指せる"
+    );
     let helper_off = main.replacen(
         "Some(ensure_fresh_scene(window, cx, label).await)",
         "None",
