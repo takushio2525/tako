@@ -2711,14 +2711,18 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     `set_var` すると番犬 `issue2716_full_run_carryover_watchdog` が file:line で名指す
   - **言語サーバの受け持つ拡張子の fixture を画素で比べる節は、言語サーバを決めてから状態の着地を
     待って基準を撮る**（bracket-match = 実行できないパスへ差し替え → `vt_lsp_settled` を待つ。未導入の帯が
-    節の途中に出ると器が縮む）。言語サーバに用の無い節は fixture を受け持たない拡張子にする（#2714）
+    節の途中に出ると器が縮む）。言語サーバに用の無い節は fixture を受け持たない拡張子にする（#2714）。
+    受け持つ拡張子のまま言語サーバを測らない確かめ（全節実行の cpp / python の構文の色）は、
+    `vt2716_rgba_lsp` で診断の無い偽サーバへ決めて着地を待ち、比べる範囲（行の矩形）が空なら
+    RGBA の前に名指して止める（未導入の帯が狭いペインの本文を押し出し、0 px を「色が付かない」と
+    読み違えた）
   - **dispatch で直に開いたプレビューは `drain_pending_preview_loads` で流す**（#826 / #2716 の #745。
     流さないとファイル監視の読み直しが来たときだけ揃う）
   - **全節実行と言語サーバの節は `TAKO_LSP_AUTOSTART=1` で起こす**（#2048 の隔離起動は文書を開いても
     言語サーバを起こさない）。欠けていれば `vt_require_lsp_autostart`（全節実行の頭と `vt_lsp_override`）が
     FAILED ではなく `TAKO_VISUAL_TEST_UNMET` の行と終了コード 3 で止まる（落ちたのではなく起こし方の誤り。
     以前は lsp-context-menu ① の「言語サーバの節が無い」の FAILED に見えていた）
-  - A/B は `TAKO_2716_LEGACY=md-edit-resume|lsp-override|bracket-match|chat-table|autostart`（`1` で全部）、
+  - A/B は `TAKO_2716_LEGACY=md-edit-resume|lsp-override|bracket-match|chat-table|autostart|rgba-lsp`（`1` で全部）、
     持ち越しの注入は `TAKO_2716_INJECT=split|stale-resolve|no-reload|late-band,resolve-ms=400`（単独実行で
     前の節の残りを作る。旧の形は名指しで落ち、新しい形は通る）
 - **節を足したら `TAKO_VISUAL_ONLY` の腕と全節実行の並びの両方へ載せる**。腕にしか

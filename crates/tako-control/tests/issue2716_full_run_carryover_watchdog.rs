@@ -30,12 +30,18 @@
 //!    `vt2716_own_scene`（= `ensure_fresh_scene`）で場面を作る・chat-table が開いた後に
 //!    `drain_pending_preview_loads` を呼ぶ・bracket-match が言語サーバを差し替え、状態の着地
 //!    （`vt_lsp_settled`）を基準のフレームより前に待つ
-//! 4. [`修正前の形を名指しできる`] — 修正前の形を注入すると 1〜3・5 のどれかが名指しで落ちる
+//! 4. [`修正前の形を名指しできる`] — 修正前の形を注入すると 1〜3・5・6 のどれかが名指しで落ちる
 //! 5. [`言語サーバの節は自動起動の前提を名指しで確かめる`] — 隔離起動の GUI は
 //!    `TAKO_LSP_AUTOSTART=1` が無いと文書を開いても言語サーバを起こさない（#2048）。付けずに
 //!    全節実行を起こすと lsp-context-menu ① が「言語サーバの節が無い」の FAILED に見えた（段 3 の
 //!    切り分け）。`vt_require_lsp_autostart` が全節実行の頭と差し替えの補助で確かめ、欠けていれば
 //!    `TAKO_VISUAL_TEST_UNMET` の行と終了コード 3（失敗 = 1 と別）で止まる
+//! 6. [`構文の色の確かめは言語サーバを決めて比べる行を名指す`] — 5 で全節実行が自動起動つきに
+//!    なった後、cpp / python の構文の色（読み取り RGBA）が 0 px で止まった。編集に入ると python の
+//!    未導入の帯（前の節の覚え = lsp-context-menu ⑧ の実行できないパス、無くても機に pyright が無い）が
+//!    幅 240px のペインを埋め、本文の行が 1 行も描かれず比べる範囲が空だった。`vt2716_rgba_lsp` が
+//!    fixture の言語サーバを診断の無い偽サーバへ決め、編集の絵の前に状態の着地を待ち、比べる範囲の
+//!    空を RGBA の確かめより前に名指す
 //!
 //! ## 相方
 //!
@@ -324,6 +330,68 @@ fn autostart_problems(main: &str) -> Vec<String> {
     problems
 }
 
+/// 規則 6: 全節実行の cpp / python の構文の色が言語サーバを自分で決め、比べる範囲の空を名指すか
+fn rgba_problems(main: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let code = code_view::code_view(main);
+    let strings = code_view::without_comments(main);
+    match block_range(&code, "fn vt2716_rgba_lsp(") {
+        Some(range) => {
+            let body = &strings[range];
+            for (needle, why) in [
+                (
+                    "vt_lsp_override(",
+                    "差し替えの 1 実装 = restart の口で前の節の覚えを捨てる",
+                ),
+                (
+                    "TAKO_LSP_FAKE_DIAGNOSTICS",
+                    "偽サーバの既定の診断（波線）を比べる行へ載せない",
+                ),
+                ("legacy_2716(\"rgba-lsp\")", "A/B の旧の形"),
+            ] {
+                if !body.contains(needle) {
+                    problems.push(format!("`vt2716_rgba_lsp` に `{needle}` が無い（{why}）"));
+                }
+            }
+        }
+        None => problems.push(
+            "`fn vt2716_rgba_lsp(` が無い（構文の色の確かめが fixture の言語サーバを決める口）"
+                .into(),
+        ),
+    }
+    // 全節実行の構文の色の確かめ（`読み取り RGBA` の check はこの 1 か所）より前の並び
+    let Some(read_at) = strings.find("visual-test {language} 読み取り RGBA") else {
+        problems.push("全節実行の構文の色の確かめ（`読み取り RGBA`）が見つからない".into());
+        return problems;
+    };
+    let head = &strings[..read_at];
+    if head.rfind("vt2716_rgba_lsp(window, cx, &dir").is_none() {
+        problems.push(
+            "構文の色の確かめが fixture を開く前に `vt2716_rgba_lsp(` で言語サーバを決めていない \
+             （前の節の覚えか機の PATH で未導入の帯が出て、狭いペインの本文が押し出される）"
+                .into(),
+        );
+    }
+    let settled = head.rfind("vt2716_rgba_lsp_settled(");
+    let edit_frame = head.rfind("let edit_frame = capture_frame(");
+    let empty = head.rfind("!text_bounds.is_empty()");
+    if !before(settled, edit_frame) {
+        problems.push(
+            "構文の色の確かめが編集の絵（`let edit_frame = capture_frame(`）より前に言語サーバの \
+             状態の着地（`vt2716_rgba_lsp_settled(`）を待っていない（帯が撮った後に出る）"
+                .into(),
+        );
+    }
+    if !before(edit_frame, empty) {
+        problems.push(
+            "構文の色の確かめが RGBA の前に比べる範囲の空（`!text_bounds.is_empty()`）を名指していない \
+             （本文の行が描かれないと 0 px で「色が付かない」と読み違える）"
+                .into(),
+        );
+    }
+    problems
+}
+
 fn app_sources() -> Vec<(String, String)> {
     let root = workspace_root();
     let mut files = Vec::new();
@@ -380,6 +448,12 @@ fn 持ち越しで止まった節は場面と状態を自分で決める() {
 #[test]
 fn 言語サーバの節は自動起動の前提を名指しで確かめる() {
     let problems = autostart_problems(&read(MAIN));
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn 構文の色の確かめは言語サーバを決めて比べる行を名指す() {
+    let problems = rgba_problems(&read(MAIN));
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
@@ -501,5 +575,49 @@ fn 修正前の形を名指しできる() {
             .iter()
             .any(|p| p.contains("`fail(`")),
         "前提の欠けを FAILED で止める形を名指せる"
+    );
+    // 6a. 構文の色の確かめが言語サーバを決めない（python RGBA が 0 px で止まった形）
+    let no_decide = main.replacen(
+        "vt2716_rgba_lsp(window, cx, &dir, &[\"sample.cpp\", \"sample.py\"]);",
+        "Vec::<&'static str>::new();",
+        1,
+    );
+    assert_ne!(
+        no_decide, main,
+        "注入先（構文の色の言語サーバの決め）が本文に在る"
+    );
+    assert!(
+        rgba_problems(&no_decide)
+            .iter()
+            .any(|p| p.contains("言語サーバを決めていない")),
+        "言語サーバを決めない構文の色の確かめを名指せる"
+    );
+    // 6b. 編集の絵の前に状態の着地を待たない
+    let no_settle = main.replacen(
+        "vt2716_rgba_lsp_settled(window, cx, pdf_pane, language).await;",
+        "",
+        1,
+    );
+    assert_ne!(
+        no_settle, main,
+        "注入先（構文の色の着地の待ち）が本文に在る"
+    );
+    assert!(
+        rgba_problems(&no_settle)
+            .iter()
+            .any(|p| p.contains("状態の着地")),
+        "着地を待たない構文の色の確かめを名指せる"
+    );
+    // 6c. 比べる範囲の空を名指さない（0 px の RGBA で止まる形）
+    let no_empty = main.replacen("!text_bounds.is_empty(),", "true,", 1);
+    assert_ne!(
+        no_empty, main,
+        "注入先（比べる範囲の空の名指し）が本文に在る"
+    );
+    assert!(
+        rgba_problems(&no_empty)
+            .iter()
+            .any(|p| p.contains("比べる範囲の空")),
+        "比べる範囲の空を名指さない形を名指せる"
     );
 }

@@ -51273,6 +51273,8 @@ mod self_test {
                 "visual-test PDF 選択領域の RGBA ピクセル変化",
             );
 
+            // #2716: fixture を受け持つ言語サーバをここで決める（前の節の覚え・機の PATH に任せない）
+            let rgba_servers = vt2716_rgba_lsp(window, cx, &dir, &["sample.cpp", "sample.py"]);
             for (language, file_name) in [("cpp", "sample.cpp"), ("python", "sample.py")] {
                 let opened = window
                     .update(cx, |app, _, cx| {
@@ -51330,6 +51332,8 @@ mod self_test {
                     edit_colors > 1,
                     &format!("visual-test {language} 編集構文色"),
                 );
+                // 帯や波線が出るなら出てから撮る（状態の着地を待つ = 撮った後に器が縮まない）
+                vt2716_rgba_lsp_settled(window, cx, pdf_pane, language).await;
                 let edit_frame = capture_frame(any, cx);
                 let text_bounds = window
                     .update(cx, |app, _, _| {
@@ -51344,6 +51348,18 @@ mod self_test {
                             .unwrap_or_default()
                     })
                     .unwrap_or_default();
+                // 比べる範囲が空なら差は 0 px になり「色が付かない」と読み違える。前提の欠けとして名指す
+                println!(
+                    "TAKO_VISUAL_PIXEL: {language} text_bounds={}",
+                    text_bounds.len()
+                );
+                check(
+                    !text_bounds.is_empty(),
+                    &format!(
+                        "visual-test {language} 比べる行が本文に描かれている（言語サーバの帯などで \
+                         本文の行が押し出されていない。比べる範囲が空なら RGBA は 0 px になる）(#2716)"
+                    ),
+                );
                 let read_changed = match (plain_frame.as_ref(), read_frame.as_ref()) {
                     (Some((plain, scale)), Some((read, _))) => {
                         changed_pixels_in_bounds(plain, read, &text_bounds, *scale)
@@ -51488,6 +51504,10 @@ mod self_test {
                     let _ = app.workspace.active_tab_mut().tree_mut().focus(PaneId::from_raw(base));
                 })
                 .ok();
+            for server in rgba_servers {
+                vt_lsp_override(window, cx, server, None);
+            }
+            std::env::remove_var("TAKO_LSP_FAKE_DIAGNOSTICS");
             let _ = std::fs::remove_dir_all(&dir);
 
             // ターミナルのサブラインスクロール（#159）: 半行スクロールの前後フレームを
@@ -54776,6 +54796,8 @@ mod self_test {
     /// - `chat-table` = dispatch で開いた後に積んだ読み込みを流さない（ファイル監視の読み直し頼み）
     /// - `autostart` = 言語サーバの自動起動の前提を確かめない（[`vt_require_lsp_autostart`]。欠けたまま
     ///   進んで lsp-context-menu ① が FAILED に見える）
+    /// - `rgba-lsp` = 全節実行の cpp / python の構文の色が言語サーバを決めない（[`vt2716_rgba_lsp`]。
+    ///   未導入の帯が本文を押し出し、比べる行の名指しで止まる）
     #[cfg(feature = "visual-test")]
     fn legacy_2716(item: &str) -> bool {
         std::env::var("TAKO_2716_LEGACY").is_ok_and(|value| {
@@ -54940,7 +54962,71 @@ mod self_test {
             )
     }
 
-    /// #2716 の注入 `stale-resolve`: 差し替え無しの `.rs` を `from` の右に開いて言語サーバの解決を
+    /// #2716: 全節実行の cpp / python の構文の色（読み取り / 編集の RGBA と #669 のテーマの往復）が
+    /// fixture を受け持つ言語サーバを自分で決める。この確かめは言語サーバを測らないので、診断を
+    /// 送らない偽サーバへ差し替える。決めないと編集に入った時点で、前の節の解決の覚え（lsp-context-menu ⑧
+    /// の実行できないパス）か機の PATH（pyright / clangd の有無）で未導入の帯がペインの頭に出て、
+    /// 狭いペインでは本文の行が 1 行も描かれず比べる範囲が空になる（python が 0 px で落ちた）。
+    /// 返り値は外すときに渡す ID。`TAKO_2716_LEGACY=rgba-lsp` は決めない（修正前の形）
+    #[cfg(feature = "visual-test")]
+    fn vt2716_rgba_lsp(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        dir: &std::path::Path,
+        files: &[&str],
+    ) -> Vec<&'static str> {
+        if legacy_2716("rgba-lsp") {
+            return Vec::new();
+        }
+        let fake = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|d| d.to_path_buf()))
+            .map(|d| d.join(format!("tako-lsp-fake{}", std::env::consts::EXE_SUFFIX)))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| {
+                fail("visual-test 構文の色: 偽サーバが無い（cargo build -p tako-control --bin tako-lsp-fake を先に）")
+            });
+        // 偽サーバの既定は didOpen に診断を 1 件送る = 波線が比べる行に載り、着く時刻でテーマの往復の
+        // 差が揺れる。空の配列を渡して送らせない（外すときに env も消す）
+        let quiet = dir.join("no-diagnostics.json");
+        std::fs::write(&quiet, "[]").expect("visual-test 構文の色: 空の診断");
+        std::env::set_var("TAKO_LSP_FAKE_DIAGNOSTICS", &quiet);
+        files
+            .iter()
+            .map(|file| vt_lsp_override(window, cx, vt_lsp_server_of(&dir.join(file)), Some(&fake)))
+            .collect()
+    }
+
+    /// #2716: 編集に入った文書の言語サーバの状態が落ち着くのを待ち、状態と理由を 1 行残す
+    /// （帯が出るか・前の節の覚えが残っていないかを全節実行のログで読む）。落ち着かなければ止まる
+    #[cfg(feature = "visual-test")]
+    async fn vt2716_rgba_lsp_settled(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        pane: PaneId,
+        language: &str,
+    ) {
+        let label = format!("rgba-lsp-{language}");
+        let settled = wait_for_app_state(window, cx, &label, Duration::from_secs(30), |app| {
+            app.lsp_document_server(pane)
+                .is_some_and(|s| vt_lsp_settled(&s))
+        })
+        .await;
+        let server = window
+            .update(cx, |app, _, _| {
+                app.lsp_document_server(pane)
+                    .map(|s| (s.id, s.state.slug(), s.reason.clone()))
+            })
+            .ok()
+            .flatten();
+        println!("TAKO_VISUAL_PIXEL: {language} lsp settled={settled} server={server:?}");
+        check(
+            settled,
+            &format!("visual-test {language} 編集に入った文書の言語サーバの状態が落ち着く (#2716)"),
+        );
+    }
+
+    /// #2716 の注入 `stale-resolve`:差し替え無しの `.rs` を `from` の右に開いて言語サーバの解決を
     /// 覚えさせ、状態が落ち着いたら閉じる（全節実行で先の `.rs` の節が残す覚えを単独実行で作る）
     #[cfg(feature = "visual-test")]
     async fn vt2716_stale_resolve(
