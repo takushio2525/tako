@@ -30,6 +30,11 @@ mod click_forward;
 mod command_card_ui;
 mod diagnostics_panel;
 mod drawer;
+/// visual-test の項目 109 が押すエージェントの偽物と、検証の中でエージェントの CLI を起こす入口の番犬
+/// （#2726。純関数と番犬はテストでも回すので、`send_lag_2721` と同じくクレートの根で宣言する）
+#[cfg(any(test, feature = "visual-test"))]
+#[path = "self_test/fake_agents_2726.rs"]
+mod fake_agents_2726;
 mod file_icons;
 mod filetree;
 /// フォームの重なり検査（#738）。実測矩形を突き合わせる検証専用の道具なので、
@@ -66424,6 +66429,129 @@ mod self_test {
         });
     }
 
+    /// 項目 109 の 3 択が押す偽のエージェントを置く（#2726。理由は `fake_agents_2726` の doc）。
+    ///
+    /// 偽物を書いて（background で空打ち）GUI の PATH の先頭へ置き、解消エージェントのペインと同じ形
+    /// （分割 + GUI の env のログインシェル）で確かめ用のペインを立てて `command -v` を引く。
+    /// 置けなければ `None`（PATH は戻してある）。どの名前を押してよいかは返り値の `resolves_to_fake` で引き、
+    /// 押し終えたら呼び手が `finish` で PATH を戻して置き場を消す
+    #[cfg(feature = "visual-test")]
+    async fn fake_agents_for_109(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        base: PaneId,
+    ) -> Option<crate::fake_agents_2726::FakeAgents> {
+        use crate::fake_agents_2726::{agent_names, which_command, FakeAgents};
+        // 偽物の本文は /bin/sh = unix だけ（それ以外では押さない）
+        if !cfg!(unix) {
+            return None;
+        }
+        let root = std::env::temp_dir().join(format!("tako-st2726-agents-{}", std::process::id()));
+        remove_on_fail(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        let written = cx
+            .background_executor()
+            .spawn({
+                let root = root.clone();
+                async move { FakeAgents::write(&root) }
+            })
+            .await;
+        let mut fakes = match written {
+            Ok(fakes) => fakes,
+            Err(e) => {
+                println!("TAKO_SELF_TEST_2726: 偽のエージェントを書けない: {e}");
+                return None;
+            }
+        };
+        fakes.activate();
+        // 確かめ用のペイン（解消エージェントのペインと同じく、分割して GUI の env のログインシェルを起こす）
+        let probe_pane = window
+            .update(cx, |app, _, cx| {
+                let pane = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Split {
+                        pane: Some(base.as_u64()),
+                        tab: None,
+                        direction: Some(tako_control::protocol::Direction::Down),
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    PaneOrigin::Cli,
+                )
+                .ok()
+                .and_then(|v| v["pane"].as_u64())
+                .map(PaneId::from_raw);
+                for (p, options) in std::mem::take(&mut app.pending_attach) {
+                    if app.spawn_session(p, options, cx).is_err() {
+                        app.remove_pane(p, cx);
+                    }
+                }
+                pane
+            })
+            .ok()
+            .flatten();
+        let Some(probe_pane) = probe_pane else {
+            fakes.restore();
+            println!("TAKO_SELF_TEST_2726: 確かめ用のペインを立てられない");
+            return None;
+        };
+        // シェルが入力を受ける（Idle）のを待ってから打つ。届かなくても打つ（打鍵は端末に溜まる）
+        let shell_ready = wait_for_pty_state(
+            window,
+            cx,
+            "fake-agents-shell",
+            text_wait_budget(40, 100, 15),
+            |app, _| {
+                app.terminals
+                    .get(&probe_pane)
+                    .is_some_and(|s| s.command_state() == tako_core::CommandState::Idle)
+            },
+        )
+        .await;
+        let line = which_command(&agent_names(), &fakes.which);
+        let _ = window.update(cx, |app, _, _| {
+            if let Some(session) = app.terminals.get(&probe_pane) {
+                session.write(pty_line(&line));
+            }
+        });
+        let which = fakes.which.clone();
+        let answered = wait_for_pty_state(
+            window,
+            cx,
+            "fake-agents-which",
+            text_wait_budget(40, 100, 15),
+            |_, _| which.exists(),
+        )
+        .await;
+        fakes.set_which(&std::fs::read_to_string(&which).unwrap_or_default());
+        // 確かめ用のペインを閉じ、基準ペインへフォーカスを戻す
+        let _ = window.update(cx, |app, _, cx| {
+            let _ = tako_control::dispatch(
+                app,
+                tako_control::protocol::Request::Close {
+                    pane: Some(probe_pane.as_u64()),
+                    force: true,
+                    caller_role: None,
+                    caller_pane: None,
+                },
+                PaneOrigin::Cli,
+            );
+            let _ = app.workspace.active_tab_mut().tree_mut().focus(base);
+            cx.notify();
+        });
+        let resolved: Vec<_> = agent_names()
+            .into_iter()
+            .map(|a| (a, fakes.resolved(a)))
+            .collect();
+        println!(
+            "TAKO_SELF_TEST_2726: 偽のエージェント shell_ready={shell_ready} answered={answered} \
+             resolved={resolved:?}"
+        );
+        Some(fakes)
+    }
+
     /// コンフリクトカードの操作が**実マウスで**発火するか（#496）。
     ///
     /// ルート div の `on_mouse_down` が呼ぶ一括 dismiss（#503）が `git_agent_menu_open` を
@@ -66606,76 +66734,138 @@ mod self_test {
                             );
                             // ③ 3 択それぞれの実クリックで解消エージェントのペインが立つ。
                             //    Issue の受け入れ条件 6 = claude / codex / agy の各ボタン。
-                            //    立ったペインは毎回すぐ閉じる（実エージェントを残さない）
-                            for agent in ["claude", "codex", "agy"] {
-                                let _ = window496.update(cx, |app, _, cx| {
-                                    app.git_feedback = None;
-                                    app.git_agent_menu_open = true;
-                                    cx.notify();
-                                });
-                                draw496(cx);
-                                wait(cx, 200).await;
-                                let Some(choice) = probe(cx, agent) else {
-                                    check(false, "109: 3 択のボタンが描かれない (#496)");
-                                    continue;
-                                };
-                                let before = panes_of(cx);
-                                click_at(any496, cx, choice.center());
-                                let mut after = before;
-                                for _ in 0..20 {
-                                    wait(cx, 250).await;
-                                    after = panes_of(cx);
-                                    if after > before {
-                                        break;
-                                    }
-                                }
-                                let feedback = window496
-                                    .update(cx, |app, _, _| {
-                                        app.git_feedback
-                                            .as_ref()
-                                            .map(|f| (f.message.clone(), f.is_error))
-                                    })
-                                    .ok()
-                                    .flatten();
+                            //    **押すのは偽のエージェント**（#2726）: 本物を押すと、立ったペインの
+                            //    シェルが起動コマンドの素の名前を PATH から引いて本物の CLI を起こし、
+                            //    未ログインの codex はログインの画面を利用者の本物の画面のブラウザへ
+                            //    出していた。偽物を GUI の PATH の先頭へ置き、確かめ用のペインで偽物に
+                            //    当たると分かった名前だけを押す。立ったペインは毎回すぐ閉じる
+                            let fakes = fake_agents_for_109(window496, cx, base496).await;
+                            if fakes.is_none() {
                                 println!(
-                                    "TAKO_SELF_TEST_496: agent={agent} panes {before}->{after} \
-                                     feedback={feedback:?}"
+                                    "TAKO_SELF_TEST_SKIPPED: 109 の 3 択（偽のエージェントを置けない \
+                                     = 本物を起こさないため押さない。#2726）"
                                 );
-                                check(
-                                    after > before,
-                                    &format!(
-                                        "109: 3 択「{agent}」の実クリックで解消エージェントの\
-                                         ペインが立つ (#496)"
-                                    ),
-                                );
-                                check(
-                                    window496
-                                        .update(cx, |app, _, _| !app.git_agent_menu_open)
-                                        .unwrap_or(false),
-                                    "109: 起動したら 3 択は閉じる (#496)",
-                                );
-                                // 立てたペインを閉じ、**リポを見ているペインへフォーカスを
-                                // 戻す**（戻さないと次の周で基準ペインが解決できず
-                                // 「対象ペインが未指定」になる。実測して分かった）
-                                let _ = window496.update(cx, |app, _, cx| {
-                                    let target = app.focused_pane();
-                                    if target != base496 {
-                                        let _ = tako_control::dispatch(
-                                            app,
-                                            tako_control::protocol::Request::Close {
-                                                pane: Some(target.as_u64()),
-                                                force: true,
-                                                caller_role: None,
-                                                caller_pane: None,
-                                            },
-                                            PaneOrigin::Cli,
+                            }
+                            if let Some(fakes) = fakes {
+                                for agent in crate::fake_agents_2726::agent_names() {
+                                    // 押す前に、新しいペインのシェルがこの名前を偽物へ引くと確かめる
+                                    if !fakes.resolves_to_fake(agent) {
+                                        println!(
+                                            "TAKO_SELF_TEST_SKIPPED: 109 の 3 択「{agent}」（新しい\
+                                             ペインのシェルが偽物に当たらない = {:?}。本物を起こさない\
+                                             ため押さない。#2726）",
+                                            fakes.resolved(agent)
                                         );
+                                        continue;
                                     }
-                                    let _ =
-                                        app.workspace.active_tab_mut().tree_mut().focus(base496);
-                                    cx.notify();
-                                });
-                                wait(cx, 500).await;
+                                    let _ = window496.update(cx, |app, _, cx| {
+                                        app.git_feedback = None;
+                                        app.git_agent_menu_open = true;
+                                        cx.notify();
+                                    });
+                                    draw496(cx);
+                                    wait(cx, 200).await;
+                                    let Some(choice) = probe(cx, agent) else {
+                                        check(false, "109: 3 択のボタンが描かれない (#496)");
+                                        continue;
+                                    };
+                                    let before_ids: Vec<PaneId> = window496
+                                        .update(cx, |app, _, _| {
+                                            app.workspace
+                                                .active_tab()
+                                                .tree()
+                                                .panes()
+                                                .iter()
+                                                .map(|p| p.id())
+                                                .collect()
+                                        })
+                                        .unwrap_or_default();
+                                    let before = before_ids.len();
+                                    click_at(any496, cx, choice.center());
+                                    // ペインが立ち、そのペインのシェルが偽物を端末つきで起こすまで
+                                    // 状態で待つ（#1902。旧 20 回 × 250ms の回数の窓）
+                                    let started = wait_for_pty_state(
+                                        window496,
+                                        cx,
+                                        "conflict-agent",
+                                        text_wait_budget(20, 250, 20),
+                                        |app, _| {
+                                            app.workspace.active_tab().tree().panes().len() > before
+                                                && fakes.started_in_pane(agent)
+                                        },
+                                    )
+                                    .await;
+                                    let after = panes_of(cx);
+                                    let feedback = window496
+                                        .update(cx, |app, _, _| {
+                                            app.git_feedback
+                                                .as_ref()
+                                                .map(|f| (f.message.clone(), f.is_error))
+                                        })
+                                        .ok()
+                                        .flatten();
+                                    println!(
+                                        "TAKO_SELF_TEST_496: agent={agent} panes {before}->{after} \
+                                         fake_started={started} feedback={feedback:?}"
+                                    );
+                                    check(
+                                        after > before,
+                                        &format!(
+                                            "109: 3 択「{agent}」の実クリックで解消エージェントの\
+                                             ペインが立つ (#496)"
+                                        ),
+                                    );
+                                    check(
+                                        fakes.started_in_pane(agent),
+                                        &format!(
+                                            "109: 3 択「{agent}」で立ったペインのシェルが偽の \
+                                             {agent} を起こす（本物の CLI を起こさない。#2726）"
+                                        ),
+                                    );
+                                    check(
+                                        window496
+                                            .update(cx, |app, _, _| !app.git_agent_menu_open)
+                                            .unwrap_or(false),
+                                        "109: 起動したら 3 択は閉じる (#496)",
+                                    );
+                                    // 立てたペイン（押す前に無かったペイン）を閉じ、**リポを見ている
+                                    // ペインへフォーカスを戻す**（戻さないと次の周で基準ペインが
+                                    // 解決できず「対象ペインが未指定」になる。実測して分かった）
+                                    let _ = window496.update(cx, |app, _, cx| {
+                                        let spawned: Vec<PaneId> = app
+                                            .workspace
+                                            .active_tab()
+                                            .tree()
+                                            .panes()
+                                            .iter()
+                                            .map(|p| p.id())
+                                            .filter(|p| !before_ids.contains(p))
+                                            .collect();
+                                        for target in spawned {
+                                            let _ = tako_control::dispatch(
+                                                app,
+                                                tako_control::protocol::Request::Close {
+                                                    pane: Some(target.as_u64()),
+                                                    force: true,
+                                                    caller_role: None,
+                                                    caller_pane: None,
+                                                },
+                                                PaneOrigin::Cli,
+                                            );
+                                        }
+                                        let _ = app
+                                            .workspace
+                                            .active_tab_mut()
+                                            .tree_mut()
+                                            .focus(base496);
+                                        cx.notify();
+                                    });
+                                    wait(cx, 500).await;
+                                }
+                                println!(
+                                    "TAKO_SELF_TEST_2726: 109 の偽のエージェントの呼び出し={:?}",
+                                    fakes.finish()
+                                );
                             }
                         }
                     }
@@ -78861,31 +79051,64 @@ mod self_test {
             }
 
             // 82b. コンフリクト解消エージェントはコンフリクトが無ければ起動しない (#496)。
-            // 「押しても何も起きない」を避け、理由をエラーで返すことを固定する
+            // 「押しても何も起きない」を避け、理由をエラーで返すことを固定する。
+            // **押す前に、押した先（dispatch と同じペインの cwd のリポ）がコンフリクト中でないと
+            // dispatch と同じ判定で確かめる**（#2726）。起動した cwd のリポがたまたまマージ中だと、
+            // 押すと本物の claude が起きる。コンフリクト中なら押さずに名指しする
             {
-                let _ = window.update(cx, |app, _, cx| {
-                    app.git_feedback = None;
-                    app.git_do_resolve_agent("claude", cx);
-                });
-                // #1989: リポジトリ・コンフリクトの確かめ（git）は background を通るので結果を待つ。
-                // コンフリクトしていないリポ（or リポ外）ではエラーになる
-                let guarded = wait_for_backend_state(
-                    cx,
-                    "82b-resolve-agent",
-                    text_wait_budget(20, 100, 10),
-                    |cx| {
-                        window
-                            .update(cx, |app, _, _| {
-                                app.git_feedback.as_ref().is_some_and(|f| f.is_error)
-                            })
-                            .unwrap_or(false)
-                    },
-                )
-                .await;
-                check(
-                    guarded,
-                    "解消エージェント: コンフリクトが無ければ理由つきで拒否する (#496)",
-                );
+                let target_cwd = window
+                    .update(cx, |app, _, _| {
+                        let pane = app
+                            .git_source_for_tab()
+                            .and_then(|(p, _)| p)
+                            .unwrap_or_else(|| app.focused_pane());
+                        app.terminals
+                            .get(&pane)
+                            .and_then(|s| s.cwd())
+                            .map(|p| p.to_path_buf())
+                    })
+                    .ok()
+                    .flatten();
+                let conflicted = cx
+                    .background_executor()
+                    .spawn(async move {
+                        target_cwd
+                            .as_deref()
+                            .and_then(tako_core::git::repo_root)
+                            .is_some_and(|repo| tako_core::git::conflict_state(&repo).is_active())
+                    })
+                    .await;
+                if conflicted {
+                    println!(
+                        "TAKO_SELF_TEST_SKIPPED: 82b（押した先のリポがコンフリクト中 = 押すと本物の \
+                         claude が起きるので押さない。#2726）"
+                    );
+                } else {
+                    let _ = window.update(cx, |app, _, cx| {
+                        app.git_feedback = None;
+                        // tako:launch-ok 直前でコンフリクトが無いと確かめた = dispatch が NoConflict で断り、何も起こさない（#2726）
+                        app.git_do_resolve_agent("claude", cx);
+                    });
+                    // #1989: リポジトリ・コンフリクトの確かめ（git）は background を通るので結果を待つ。
+                    // コンフリクトしていないリポ（or リポ外）ではエラーになる
+                    let guarded = wait_for_backend_state(
+                        cx,
+                        "82b-resolve-agent",
+                        text_wait_budget(20, 100, 10),
+                        |cx| {
+                            window
+                                .update(cx, |app, _, _| {
+                                    app.git_feedback.as_ref().is_some_and(|f| f.is_error)
+                                })
+                                .unwrap_or(false)
+                        },
+                    )
+                    .await;
+                    check(
+                        guarded,
+                        "解消エージェント: コンフリクトが無ければ理由つきで拒否する (#496)",
+                    );
+                }
             }
 
             // 83. ファイルツリーの隠しファイル既定非表示とトグル (#550)。
@@ -82119,10 +82342,11 @@ mod self_test {
                     })
                     .unwrap_or(false);
                 // 積んだ `tako master` はここでは走らせない（エコーペインは実行しないが、
-                // 30 秒後に本文が書かれると後続の判定を汚すので取り下げる）
+                // 30 秒後に本文が書かれると後続の判定を汚すので取り下げる。#2446 の取り下げの
+                // 1 実装 = #2726 の番犬が取り下げと読む形）
                 window
                     .update(cx, |app, _, _| {
-                        app.command_flows.retain(|c| c.pane != echo_pane)
+                        withdraw_launch(app, echo_pane);
                     })
                     .ok();
                 // 実行される形か: POSIX は素のパス、PowerShell は素のパスか呼び出し演算子つき
@@ -84476,7 +84700,7 @@ mod self_test {
                 if !tako_control::setup_bootstrap::legacy_auth_launch() {
                     window
                         .update(cx, |app, _, _| {
-                            app.command_flows.retain(|c| c.pane != fresh)
+                            withdraw_launch(app, fresh);
                         })
                         .ok();
                 }
@@ -84594,11 +84818,16 @@ mod self_test {
                     },
                 )
                 .await;
+                // 積んだ `tako master` は**走らせない**（#2726）: 走ると本物の `tako master` が
+                // 本物の claude を exec する。見たいのは押下で張られる過渡期の表示なので、
+                // 積まれたことだけ確かめて同じ update の中で取り下げる（実 claude での
+                // 「押下 → チャット確定」は 97c が TAKO_SELF_TEST_CLAUDE=1 のときだけ見る）
                 let armed = window
                     .update(cx, |app, _, cx| {
                         let done = app.starter_action(master_pane, StarterAction::Master, cx);
                         let kind = app.pane_settle.get(&master_pane).map(|s| s.kind);
-                        done && kind == Some(SettleKind::Agent)
+                        let queued = withdraw_launch(app, master_pane);
+                        done && kind == Some(SettleKind::Agent) && !queued.is_empty()
                     })
                     .unwrap_or(false);
                 // 押下からしばらく（2 秒 tick を数回跨ぐ長さ）追い、生ターミナルへ
@@ -84703,6 +84932,7 @@ mod self_test {
                         )
                         .await;
                         // スターターの主ボタンをそのまま押す（ユーザーの操作と同じ経路）
+                        // tako:launch-ok 実 claude の e2e（TAKO_SELF_TEST_CLAUDE=1 の明示の opt-in の内側。#2726）
                         let _ = window.update(cx, |app, _, cx| {
                             app.starter_action(e2e_pane, StarterAction::Solo, cx)
                         });
@@ -85522,60 +85752,41 @@ mod self_test {
                     let _ = any.update(cx, |_, win, cx| win.draw(cx).clear());
                 }
 
-                // (c) 一覧から選ぶ → そのペインのシェルへ `tako master -<name>`
-                let selected = window
+                // (c) 一覧から選ぶ → そのペインのシェルへ `tako master -<name>` が積まれる。
+                //     **走らせない**（#2726）: 積んだ行が走ると、ペインのシェルが本物の
+                //     `tako master` を起こし、それが本物の claude を exec する（項目 93(d1) /
+                //     97(d) と同じ作法で、積まれた行そのものを見て同じ update の中で取り下げる。
+                //     組んだ行が実際に実行される形であることは項目 93(d2) が `--version` で見る）。
+                // #967 と同型: 期待値は**製品が組む行**から作る（`tako master -<name>` の
+                // リテラルは Windows で成立しない。実体は `…\tako.exe master -<name>`）
+                let master_line = starter::starter_subcommand(StarterAction::Master, Some(probe))
+                    .map(|sub| tako_control::welcome::launch_command_line(&sub))
+                    .unwrap_or_default();
+                let (selected, queued739) = window
                     .update(cx, |app, _, cx| {
-                        app.starter_action_with_profile(
+                        let selected = app.starter_action_with_profile(
                             starter_pane,
                             StarterAction::Master,
                             Some(probe),
                             cx,
-                        )
-                    })
-                    .unwrap_or(false);
-                // #967 と同型: 期待値は**製品が組む行**から作る（`tako master -<name>` の
-                // リテラルは Windows で成立しない。実体は `…\tako.exe master -<name>`）。
-                // 画面は折り返すので空白を落として突き合わせる
-                let master_needle = starter::starter_subcommand(StarterAction::Master, Some(probe))
-                    .map(|sub| tako_control::welcome::launch_command_line(&sub))
-                    .map(|line| {
-                        line.chars()
-                            .filter(|c| !c.is_whitespace())
-                            .collect::<String>()
+                        );
+                        (selected, withdraw_launch(app, starter_pane))
                     })
                     .unwrap_or_default();
-                // 書き込んだ行がシェルの画面へ出るのを状態で待つ（#1902。旧 40 回 × 100ms。
-                // 期待の行を組めなければ待たずに偽）
-                let delivered = !master_needle.is_empty()
-                    && wait_for_pty_state(
-                        window,
-                        cx,
-                        "selftest-739-delivered",
-                        text_wait_budget(40, 100, 30),
-                        |app, _| {
-                            app.terminals
-                                .get(&starter_pane)
-                                .map(|s| s.visible_lines().join(""))
-                                .unwrap_or_default()
-                                .chars()
-                                .filter(|c| !c.is_whitespace())
-                                .collect::<String>()
-                                .contains(&master_needle)
-                        },
-                    )
-                    .await;
+                let delivered = !master_line.is_empty() && queued739 == [master_line.clone()];
                 // (d) 選んだらドロップダウンは閉じている
                 let closed = window
                     .update(cx, |app, _, _| app.starter_profile_menu.is_none())
                     .unwrap_or(false);
                 println!(
                     "TAKO_SELF_TEST_739_LAUNCH: opened={opened} selected={selected} \
-                     delivered={delivered} closed={closed} line={:?} needle={master_needle:?}",
+                     delivered={delivered} closed={closed} line={:?} queued={queued739:?}",
                     starter::starter_subcommand(StarterAction::Master, Some(probe)),
                 );
                 check(
                     opened && selected && delivered && closed,
-                    "▾ から選んだプロファイルで `tako master -<name>` が届き、選択後は閉じる (#739)",
+                    "▾ から選んだプロファイルで `tako master -<name>` がそのペインへ積まれ\
+                     （走らせずに取り下げる。#2726）、選択後は閉じる (#739)",
                 );
 
                 // (d') ペインが消えたら開きっぱなしの選択も落ちる（消えたペインへ起動しない）
@@ -107753,7 +107964,6 @@ mod selftest_wait_watchdog {
         ("main.rs: visual-test tree-move ⑨: 言語サーバへ旧 URI の didClose と新 URI の didOpen が届く (#1834。tail={tail:.300})", PROC),
         ("main.rs: ⑥ 幽霊のカードの × が窓の外のまま（x={:.0} / 窓 {viewport_w:.0}） (#1946)", UI),
         ("main.rs: 109: 使い捨てリポのコンフリクトを git パネルが認識する (#496)", PROC),
-        ("main.rs: 109: 3 択「{agent}」の実クリックで解消エージェントのペインが立つ (#496)", UI),
         ("main.rs: MCP theme set light（GUI 反映）", UI),
         ("main.rs: MCP theme toggle（dark へ復帰）", UI),
         ("main.rs: listen ポート検知（nc -l）", PROC),
