@@ -62,6 +62,8 @@ ls_sweep_stale_registrations() {
   ls_available || return 0
   local registered note
   local leftovers=()
+  # 読み手はプロセス置換にしない（#2690 / #2736）。本体で書くので、子が終わった瞬間の書き込みが
+  # /bin/bash 3.2 で EINTR になりうる（今は本体の lsregister -u の待ちが SIGCHLD を刈り取るので落ちない）
   while IFS= read -r registered; do
     [[ -z "$registered" ]] && continue
     [[ "$registered" == "$LS_CANONICAL_APP" ]] && continue
@@ -71,7 +73,7 @@ ls_sweep_stale_registrations() {
       ls_unregister "$registered"
       echo "    登録解除（実体なし）: $registered"
     fi
-  done < <(ls_registered_tako_paths)
+  done <<<"$(ls_registered_tako_paths)"
 
   ((${#leftovers[@]} > 0)) || return 0
   echo "警告: $LS_CANONICAL_APP 以外にも tako.app がディスク上にあります（#837）。" >&2

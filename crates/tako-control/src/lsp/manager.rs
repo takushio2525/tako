@@ -304,6 +304,25 @@ fn inject_no_bundle() -> bool {
     std::env::var("TAKO_1951_INJECT_NO_BUNDLE").is_ok_and(|v| v == "1")
 }
 
+/// 検証用の注入（#2716）: `TAKO_2716_INJECT=resolve-ms=<ミリ秒>` で、実行ファイルの解決（覚えに
+/// 無いとき = ログインシェルを起こす側）をその長さだけ遅らせる。ログインシェルの遅い機で、前の節が
+/// 始めた解決が visual-test の次の節の途中に着地した形を負荷なしで作る（bracket-match の A/B）。
+/// 検証プロセスの門の内側でだけ読む（本番の GUI では効かない）。呼び手は背景のスレッド
+fn inject_resolve_delay() {
+    if !tako_core::paths::is_verification_process() {
+        return;
+    }
+    let Ok(value) = std::env::var("TAKO_2716_INJECT") else {
+        return;
+    };
+    let ms = value
+        .split(',')
+        .find_map(|part| part.trim().strip_prefix("resolve-ms=")?.parse::<u64>().ok());
+    if let Some(ms) = ms {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
 /// 起こした実行ファイルの出どころ（`override` = 差し替えの env / `bundled` = アプリの同梱（#1951）/
 /// `path` = 利用者の PATH）。同梱の置き場の下かは文字列で見る（stat しない）
 fn found_source(spec: &ServerSpec, program_path: &str) -> &'static str {
@@ -3248,6 +3267,7 @@ impl Shared {
         if let Some(hit) = self.cached_launch(spec, activity) {
             return (hit, true);
         }
+        inject_resolve_delay();
         // 解決は待ちうる（ログインシェル）のでロックの外で
         let launch = (self.config.launcher)(spec);
         self.lock().resolved.insert(

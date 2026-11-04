@@ -377,8 +377,8 @@ pub(super) async fn completion_loading_limit_visual(
     ] {
         std::env::remove_var(var);
     }
-    if let Some(name) = override_env {
-        std::env::remove_var(name);
+    if let Some(server) = override_env {
+        vt_lsp_override(window, cx, server, None);
     }
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&work);
@@ -617,8 +617,8 @@ pub(super) async fn hover_key_loading_visual(
     ] {
         std::env::remove_var(var);
     }
-    if let Some(name) = override_env {
-        std::env::remove_var(name);
+    if let Some(server) = override_env {
+        vt_lsp_override(window, cx, server, None);
     }
     let _ = std::fs::remove_file(rules_file);
     let _ = std::fs::remove_dir_all(&dir);
@@ -708,8 +708,8 @@ pub(super) async fn hover_footer_1899_visual(
     std::env::remove_var("TAKO_LSP_HOVER_DELAY_MS");
     std::env::remove_var("TAKO_LSP_FAKE_COMPLETION");
     std::env::remove_var("TAKO_LSP_FAKE_HOVER");
-    if let Some(name) = override_env {
-        std::env::remove_var(name);
+    if let Some(server) = override_env {
+        vt_lsp_override(window, cx, server, None);
     }
     let _ = std::fs::remove_file(rules_file);
     let _ = std::fs::remove_dir_all(&dir);

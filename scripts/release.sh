@@ -295,7 +295,8 @@ claude mcp add --scope user tako -- /Applications/tako.app/Contents/MacOS/tako m
 }
 
 # dist/ にある、このタグ向けの配布物の**ファイル名**を列挙する。
-# macOS の zip 以外（後から置いた Windows 版など）も拾う
+# macOS の zip 以外（後から置いた Windows 版など）も拾う。
+# 読み手は `done <<<"$(collect_dist_asset_names …)"` にする（プロセス置換にしない = #2690 / #2736）
 collect_dist_asset_names() {
   local tag="$1" platform ext f
   for platform in $TAKO_ASSET_PLATFORMS; do
@@ -331,6 +332,8 @@ require_gh() {
 }
 
 # gh_release_asset_names <tag> — 公開済みリリースのアセット名を 1 行ずつ
+# 読み手は `done <<<"$(gh_release_asset_names …)"` にする（プロセス置換にしない = #2690 / #2736。ループの本体は
+# 書かないので今は割り込まれないが、子を待たずに走らせない形に揃える = set -e の下の番犬）
 gh_release_asset_names() {
   gh release view "$1" --json assets -q '.assets[].name' 2>/dev/null || true
 }
@@ -341,7 +344,7 @@ report_release_completeness() {
   local tag="$1" names=() platform missing found label n f
   while IFS= read -r n; do
     [[ -n "$n" ]] && names+=("$n")
-  done < <(gh_release_asset_names "$tag")
+  done <<<"$(gh_release_asset_names "$tag")"
 
   echo "==> リリース完全性の検査: $tag"
   for platform in $TAKO_ASSET_PLATFORMS; do
@@ -404,7 +407,7 @@ report_release_licenses() {
 
   while IFS= read -r n; do
     [[ -n "$n" ]] && names+=("$n")
-  done < <(gh_release_asset_names "$tag")
+  done <<<"$(gh_release_asset_names "$tag")"
 
   mkdir -p "$dl"
   for platform in $TAKO_ASSET_PLATFORMS; do
@@ -449,7 +452,7 @@ refresh_release_notes() {
   local tag="$1" version="${1#v}" names=() notes n
   while IFS= read -r n; do
     [[ -n "$n" ]] && names+=("$n")
-  done < <(gh_release_asset_names "$tag")
+  done <<<"$(gh_release_asset_names "$tag")"
   notes=$(build_release_notes "$tag" "$version" "${names[@]+"${names[@]}"}")
   gh release edit "$tag" --notes "$notes"
 }
@@ -521,7 +524,7 @@ wait_for_windows_assets() {
   # 成功していればワークフローが添付済み。念のため実アセットで確認する
   while IFS= read -r n; do
     [[ -n "$n" ]] && names+=("$n")
-  done < <(gh_release_asset_names "$tag")
+  done <<<"$(gh_release_asset_names "$tag")"
   if [[ -z "$(assets_for_platform windows "${names[@]+"${names[@]}"}")" ]]; then
     echo "警告: ワークフローは成功したが Windows アセットが Release に無い" >&2
     echo "  gh run download $run_id で成果物を取り、gh release upload $tag <file> --clobber で添付する" >&2
@@ -560,9 +563,10 @@ if [[ -n "$UPDATE_NOTES_TAG" ]]; then
   fi
   echo "==> $UPDATE_NOTES_TAG のノートを実アセットから再生成"
   UPLOADED_NAMES=()
+  # 読み手はプロセス置換にしない（#2736。gh_release_asset_names の注記と同じ）
   while IFS= read -r n; do
     [[ -n "$n" ]] && UPLOADED_NAMES+=("$n")
-  done < <(gh release view "$UPDATE_NOTES_TAG" --json assets -q '.assets[].name')
+  done <<<"$(gh release view "$UPDATE_NOTES_TAG" --json assets -q '.assets[].name')"
   if [[ ${#UPLOADED_NAMES[@]} -eq 0 ]]; then
     echo "警告: $UPDATE_NOTES_TAG にアセットが 1 つも無い（表は空になる）" >&2
   else
@@ -581,7 +585,7 @@ if [[ $NOTES_ONLY -eq 1 ]]; then
   DRY_NAMES=()
   while IFS= read -r n; do
     [[ -n "$n" ]] && DRY_NAMES+=("$n")
-  done < <(collect_dist_asset_names "$TAG")
+  done <<<"$(collect_dist_asset_names "$TAG")"
   # まだビルドしていなくても、これから作る macOS zip は必ず含まれる
   # （grep -q へパイプすると pipefail の下で偽の「無い」になり 2 行出るので、1 つずつ比べる = #1633）
   HAS_ZIP=0
@@ -1098,7 +1102,7 @@ if [[ $PUBLISH -eq 1 ]] || [[ $DRAFT -eq 1 ]]; then
     [[ -n "$n" && "$n" != "$ZIP_NAME" ]] || continue
     UPLOAD_PATHS+=("$DIST/$n")
     ASSET_NAMES+=("$n")
-  done < <(collect_dist_asset_names "$TAG")
+  done <<<"$(collect_dist_asset_names "$TAG")"
   if [[ ${#ASSET_NAMES[@]} -gt 1 ]]; then
     printf '  同梱アセット: %s\n' ${ASSET_NAMES[@]+"${ASSET_NAMES[@]}"}
   fi

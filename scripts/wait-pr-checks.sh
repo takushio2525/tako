@@ -224,9 +224,12 @@ expected_checks() {
 }
 
 EXPECTED=()
+# プロセス置換（`< <( … )`）は使わない（#2690）: その子はいつ終わるか決まらず、終わった瞬間に
+# 書き込みの最中だと /bin/bash 3.2 の echo が EINTR で落ち、set -e で 1 で抜ける。置換の子は
+# シェルが待って刈り取るので、書き込みの最中に SIGCHLD が届かない
 while IFS= read -r _name; do
   [[ -n "${_name}" ]] && EXPECTED+=("${_name}")
-done < <(expected_checks | awk '!seen[$0]++')
+done <<<"$(expected_checks | awk '!seen[$0]++')"
 [[ ${#EXPECTED[@]} -gt 0 ]] || die "期待するチェック名が 1 つも決まらない（.github/workflows を読めているか）"
 
 # ---------------------------------------------------------------- gh から今の状態を採る
@@ -500,11 +503,13 @@ done
 
 TOTAL=$(($(date +%s) - START))
 echo "結果（PR #${PR} / 経過 $(elapsed_text "${TOTAL}") / ${POLLS} 回確認）:"
+# 並べ替えの子は置換で待って刈り取ってから書く（`< <( … )` だと、子が終わった瞬間に一覧の行の echo が
+# EINTR で落ち、set -e で結論の行まで走らず 1 に化けた = #2690）
 while IFS=$'\t' read -r bucket at name; do
   [[ -n "${name}" ]] || continue
   case "${at}" in 0001-01-01* | "") at="-" ;; esac
   echo "  [${bucket}] ${name} — 完了 ${at}"
-done < <(LC_ALL=C sort -t$'\t' -k3 <<<"${CHECKS_RAW}")
+done <<<"$(LC_ALL=C sort -t$'\t' -k3 <<<"${CHECKS_RAW}")"
 
 if [[ ${FAILED_N} -gt 0 ]]; then
   echo "失敗しているチェックが ${FAILED_N} 本ある。merge してはいけない"
