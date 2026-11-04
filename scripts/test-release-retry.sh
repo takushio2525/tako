@@ -451,9 +451,10 @@ test_no_wait_windows_opt_out() {
 add_license_fixtures() {
   local dir="$1" tag="${2:-}" src win
   while IFS=$'\t' read -r src win; do
+    [[ -n "$src" ]] || continue
     printf 'fixture: %s\nこれは %s の偽物（#1850 のモックテスト）\n' "$src" "$src" > "$dir/$src"
     git -C "$dir" add "$src"
-  done < <(tako_license_bundle "$dir")
+  done <<<"$(tako_license_bundle "$dir")"
   git -C "$dir" commit --quiet -m "license fixtures"
   if [[ -n "$tag" ]]; then
     git -C "$dir" tag "$tag"
@@ -477,6 +478,7 @@ make_release_zips() {
     mkdir -p "$stage"
     k=0
     while IFS=$'\t' read -r src win; do
+      [[ -n "$src" ]] || continue
       k=$((k + 1))
       if [[ "$platform" == windows && "$win_keep" != all && $k -gt $win_keep ]]; then
         continue
@@ -492,7 +494,7 @@ make_release_zips() {
       if [[ "$platform" == macos ]]; then
         printf 'appledouble\n' > "$stage/$(dirname "$entry")/._$(basename "$entry")"
       fi
-    done < <(tako_license_bundle "$dir")
+    done <<<"$(tako_license_bundle "$dir")"
     # ライセンス以外の中身（実物の zip と同じく本体も入っている形にする）
     case "$platform" in
       macos)
@@ -532,6 +534,7 @@ check_assets() {
 }
 
 # license_rows <dir> — 表の行（元ファイル<TAB>Windows での名前）
+# 読み手はプロセス置換にしない（#2690 / #2736。子を待たずに走らせない形に揃える = set -e の下の番犬）。`<<<"$( … )"` は空の出力を空の 1 行で渡すので、ループの頭で空の行を飛ばす
 license_rows() {
   tako_license_bundle "$1"
 }
@@ -560,11 +563,12 @@ test_check_assets_mode() {
   assert_contains "表の本数を出す" "$CHECK_OUT" \
     "表 ${TAKO_LICENSE_BUNDLE_TABLE} の $(( $(license_rows "$dir" | wc -l) )) 本"
   while IFS=$'\t' read -r src win; do
+    [[ -n "$src" ]] || continue
     for platform in macos windows; do
       assert_contains "${platform} の ${src} が一致" "$CHECK_OUT" \
         "[OK] $(tako_license_zip_entry "$platform" "$src" "$win")（タグ v99.0.0 の ${src} とバイト一致）"
     done
-  done < <(license_rows "$dir")
+  done <<<"$(license_rows "$dir")"
   assert_contains "インストーラーは中身を見ないと明示" "$CHECK_OUT" \
     "tako-v99.0.0-windows-x86_64.exe — インストーラーは中身を見ない"
   assert_contains "ライセンスが揃ったと報告" "$CHECK_OUT" \
@@ -589,6 +593,7 @@ test_check_assets_missing_licenses() {
   # 配布物そのものは揃っている（2 つの検査は別々に報告する）
   assert_contains "両 OS の揃いは別に報告" "$CHECK_OUT" "両 OS の配布物が揃っている"
   while IFS=$'\t' read -r src win; do
+    [[ -n "$src" ]] || continue
     k=$((k + 1))
     if [[ $k -eq 1 ]]; then
       assert_contains "入っている 1 本は通す（${win}）" "$CHECK_OUT" \
@@ -599,7 +604,7 @@ test_check_assets_missing_licenses() {
     fi
     assert_contains "macOS の ${src} は通す" "$CHECK_OUT" \
       "[OK] $(tako_license_zip_entry macos "$src" "$win")（タグ v99.0.0 の ${src} とバイト一致）"
-  done < <(license_rows "$dir")
+  done <<<"$(license_rows "$dir")"
   assert_contains "崩れた zip の数で警告" "$CHECK_OUT" \
     "警告: ライセンスの同梱が崩れている（v99.0.0）— 上の [NG] の zip・OS が 1 個"
   assert_head_unchanged "$dir"
@@ -614,7 +619,7 @@ test_check_assets_byte_mismatch() {
   rows=()
   dir=$(make_test_env)
   add_license_fixtures "$dir" v99.0.0
-  while IFS= read -r src; do rows+=("$src"); done < <(license_rows "$dir")
+  while IFS= read -r src; do [[ -n "$src" ]] && rows+=("$src"); done <<<"$(license_rows "$dir")"
   IFS=$'\t' read -r first_src first_win <<< "${rows[0]}"
   IFS=$'\t' read -r last_src last_win <<< "${rows[${#rows[@]} - 1]}"
   write_assets "$dir" tako-v99.0.0-macos-arm64.zip tako-v99.0.0-windows-x86_64.zip

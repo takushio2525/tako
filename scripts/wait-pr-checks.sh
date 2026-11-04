@@ -503,8 +503,8 @@ done
 
 TOTAL=$(($(date +%s) - START))
 echo "結果（PR #${PR} / 経過 $(elapsed_text "${TOTAL}") / ${POLLS} 回確認）:"
-# 並べ替えの子は置換で待って刈り取ってから書く（`< <( … )` だと、子が終わった瞬間の次の結論の
-# 行が EINTR で消え、set -e で 1 に化けた = #2690）
+# 並べ替えの子は置換で待って刈り取ってから書く（`< <( … )` だと、子が終わった瞬間に一覧の行の echo が
+# EINTR で落ち、set -e で結論の行まで走らず 1 に化けた = #2690）
 while IFS=$'\t' read -r bucket at name; do
   [[ -n "${name}" ]] || continue
   case "${at}" in 0001-01-01* | "") at="-" ;; esac

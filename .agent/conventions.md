@@ -4152,55 +4152,74 @@ tag=$(git tag --sort=-v:refname | sed -n 1p)           # ○ 最後まで読む�
 失敗と読みうる）・`nightly-release.sh` の最新タグ（タグが増えると `set -e` で止まりうる）・
 `virtual-display.sh` / `measure-*.sh` / `promo/*.sh` の待ち合わせとロック・蓋の判定。
 
-### `set -e` の下に待たずに走らせる子を置かない（書き込みが SIGCHLD で割り込まれる。Issue #2690）
+### `set -e` の下に待たずに走らせる子を置かない（書き込みが SIGCHLD で割り込まれる。Issue #2690 / #2736）
 
 3.2 は SIGCHLD のハンドラを **SA_RESTART なしで**張る（4.2 から SIGCHLD にだけ付く）。待たずに
 走らせた子（`<( … )` / `>( … )`・背景の `&`）が終わった瞬間に、シェルが stdout / stderr への write の
 中で待っていると（パイプの読み手が同じパイプを読んでいる最中・満杯）、write は EINTR で返り、
-`echo` / `printf` は `write error: Interrupted system call` で失敗する。macOS の libc はその行の
-バッファを捨てるので**行ごと消え**、`set -e` の下ではそこで **1 で抜ける**（5 = 届かない・赤の 1 の
-区別が化ける）。3.2 のエラーの行番号は直前のループの中の行を指す（#2690 の CI は `line 506` = ループの
-中の `echo` だったが、消えたのは 510 行目の結論の行）。
+`echo` / `printf` は `write error: Interrupted system call` で失敗する。`set -e` の下ではそこで
+**1 で抜けて、その先が走らない**（5 = 届かない・赤の 1 の区別が化ける）。割り込まれた行の文字は
+libc が持っていて終わるときに出るので、出力に残るのはその行まで・消えるのは後ろの行（結論の行）。
 
-子が出力を閉じて読み手が EOF を見てから SIGCHLD が届くまでの間に次の書き込みが来るので、
-**狙われるのは `done < <( … )` の直後の行 = 結論の行**。CI では読み手の `tee` と同じパイプを
-取り合った一瞬だけなので間欠だった（`test-wait-pr-checks.sh` の t38red の結論の行の欠け・
-t39merge の 5 が 1 = 子の `wait-pr-checks.sh` の結論が 1 に化けて「CI が揃っていない」）。
+**割り込まれるのは、子が生きている間に本体で書いていた行**（#2736 で目印を置いて実測。#2690 の CI の
+`line 506` は一覧の最後の行の `echo` そのもので、510 行目の結論の行はそもそも走っていなかった）。
+子は自分の出力を書き終えるとすぐ終わるので、ループの本体が行を書いている最中に SIGCHLD が届く。
+逆に次の 2 つは実害にならない:
+
+- **本体で書かないループ**（配列へ集めるだけ）: SIGCHLD はシェルが EOF を待つ read の中で届き、read は
+  やり直されるので無害（`release.sh` の 7 つはこの形）
+- **本体に前景の子があるループ**（`grep -q` / `$( … )` / 外部コマンド）: 前景の子の刈り取りで、待たずに
+  走らせた子も一緒に刈り取られる（`test-release-retry.sh` の 5 つ・`lib/launch-services.sh` の掃除）
+
+番犬はそこまで見分けず、待たずに走らせる子そのものを名指す（本体で書くか・前景の子が居るかは
+字句解析では決めきれず、関数の中身や後の編集で変わる）。CI では読み手の `tee` と同じパイプを
+取り合った一瞬だけなので間欠だった（`test-wait-pr-checks.sh` の t38red の結論の行の欠け・t39merge の
+5 が 1 = 子の `wait-pr-checks.sh` の結論が 1 に化けて「CI が揃っていない」）。
 
 ```bash
 set -euo pipefail
-while IFS=$'\t' read -r a b; do echo "[$a] $b"; done < <(sort -k2 <<<"$RAW")    # ✗ 子の終わりが次の write に重なる
-echo "失敗しているチェックが 1 本ある"                                            #   ← 3.2 で消えて 1 で抜ける
+while IFS=$'\t' read -r a b; do echo "[$a] $b"; done < <(sort -k2 <<<"$RAW")    # ✗ 子の終わりが本体の write に重なる
+echo "失敗しているチェックが 1 本ある"                                            #   ← 3.2 でここまで走らず 1 で抜ける
 while IFS=$'\t' read -r a b; do echo "[$a] $b"; done <<<"$(sort -k2 <<<"$RAW")"  # ○ 置換の子はシェルが待って刈り取る
 ```
 
 `$( … )` とパイプラインの子はシェルが待って刈り取る（刈り取りの間は SIGCHLD を塞ぐ）ので、
-書き込みの最中に届かない。寄せると出力が空のとき空の 1 行が読まれるので、ループが空を飛ばすか
-確かめる。置換は NUL を運べないので `find -print0` を読む形はこの書き換えでは直せない。
+書き込みの最中に届かない。寄せるときの注意:
+
+- 出力が空のとき空の 1 行が読まれるので、ループの頭で空の行を飛ばす（`[[ -n "$x" ]] || continue`）
+- **置換の中では `set -e` が効かない**（3.2 / 5.3 とも実測。プロセス置換の中では効く）。途中で失敗しうる
+  関数を読むなら `<<<"$(set -e; f)"` にする。1 つのコマンド・`|| true`・明示の `return` で終わる関数なら同じ
+- 置換は NUL を運べないので `find -print0` を読む形はこの書き換えでは直せない
 
 実測（`/bin/bash` 3.2.57 / Homebrew の 5.3.15。腕の stdout / stderr を「いつも満杯」の FIFO にして
-write を毎回待たせる = 負荷は生成しない。`test-wait-pr-checks.sh` の Test 41 の `slowpipe.pl` と同じ形）:
+write を毎回待たせる = 負荷は生成しない。道具は `scripts/lib/slowpipe.pl`）:
 
-| 腕（20 回） | 3.2 | 5.3 |
+| 腕 | 3.2 | 5.3 |
 |---|---|---|
-| `done < <(sort …)` の直後の結論の行 | **20 回崩れる**（行が欠けて 1・`Interrupted system call`） | 0 |
-| 同じ形・SIGCHLD を塞いで起動 | 0（= 割り込むのは SIGCHLD） | — |
-| `done <<<"$(sort …)"` へ寄せた形（詰め物の窓を 3 ms 広げても） | 0 | 0 |
+| `done < <(sort …)` で本体が行を書く（20 回） | **19〜20 回崩れる**（最後の行の `echo` が `Interrupted system call`・結論の行が走らず 1） | 0 |
+| 同じ形・SIGCHLD を塞いで起動（20 回） | 0（= 割り込むのは SIGCHLD） | — |
+| `done <<<"$(sort …)"` へ寄せた形（20 回・詰め物の窓を 3 ms 広げても） | 0 | 0 |
+| 本体で書かない形（子 = `sort` / gh を呼ぶ関数、各 30 回） | 0 | — |
 | 背景の `( sleep 0.2 ) &` の終わりが書き込みに重なる | **落ちる** | 通る |
 | trap した SIGUSR1 が書き込みに重なる | 落ちる | 落ちる（= 5.x が通るのは SIGCHLD の SA_RESTART だけ） |
-| 修正前の `wait-pr-checks.sh` / `merge-pr.sh` を Test 41 で（赤・緑・merge） | **3 回ずつ 9 回とも崩れる**（PASS=279 FAIL=24。どれも CI と同じ `line 506: echo: write error: Interrupted system call`、赤は結論の行だけ消え・緑は 0 が 1・merge は 5 が 1） | — |
-| 修正後（赤・緑・merge を 20 回ずつ・詰め物の窓 0 / 3 ms） | 0（窓 0 / 3 ms とも PASS=473 FAIL=0） | 0（窓 0 / 3 ms とも PASS=473 FAIL=0） |
+| 修正前の `wait-pr-checks.sh` / `merge-pr.sh` を Test 41 で（赤・緑・merge） | **3 回ずつ 9 回とも崩れる**（PASS=279 FAIL=24・どれも CI と同じ `line 506: echo: write error: Interrupted system call`） | — |
+| 修正後（赤・緑・merge を 20 回ずつ・詰め物の窓 0 / 3 ms） | 0（PASS=473 FAIL=0） | 0（PASS=473 FAIL=0） |
+| 修正前の `release.sh`（公開 両 OS / 片肺・`--check-assets`・`--update-notes`・`--notes-only`、計 25 回） | **0**（本体で書かない） | 0 |
+| 修正前の `test-release-retry.sh` 全体（3 回） | **0**（本体に前景の子） | — |
+| 修正前の `lib/launch-services.sh` の掃除（実体なし 5 / 40 件を 10 回ずつ・1500 件を 3 回） | **0**（本体の `lsregister -u` の待ちが刈り取る） | — |
 
-**再現の道具の罠**（どちらも Test 41 の最初の形で踏んだ）:
+**再現の道具の罠**（どれも `slowpipe.pl` を作る途中で踏んだ）:
 
-- **ただ遅く読むだけの読み手は、腕が書かない間に空きが溜まる**。実物のスクリプト（2 秒ほど走る）の結論の
-  行の write が待たず、修正前でも落ちなかった。腕が書いたら・空けても書かなければ詰め物で満杯へ戻す
+- **ただ遅く読むだけの読み手は、腕が書かない間に空きが溜まる**。続けて書く行の write が待たず、
+  修正前でも落ちなかった。腕が書いたら・空けても書かなければ詰め物で満杯へ戻す
 - **`O_NONBLOCK` は開いた口（open file description）ごとの属性で、`dup` した口は共有する**。詰め物を
   書く間だけ腕と同じ口に `O_NONBLOCK` を立てると、その間の腕の write が **EAGAIN**
-  （`write error: Resource temporarily unavailable`）で落ち、版を問わず結論の行が消えて 1 になる
-  （窓を 3 ms 広げると 3.2 で 30 回中 4 回・5.3 で 30 回中 2 回。機が重いと窓が広がり、合流検証の
-  bash 5 で merge の腕が落ちた）。名前の無いパイプは開き直せないので、FIFO を読み手・詰め物（ずっと非塞）・
-  腕（塞がる）の 3 つの口で別々に開く
+  （`write error: Resource temporarily unavailable`）で落ちる（窓を 3 ms 広げると 3.2 で 30 回中 4 回・
+  5.3 で 30 回中 2 回。機が重いと窓が広がり、合流検証の bash 5 で merge の腕が落ちた）。名前の無い
+  パイプは開き直せないので、FIFO を読み手・詰め物（ずっと非塞）・腕（塞がる）の 3 つの口で別々に開く
+- 「どの write が割り込まれたか」は出力の欠け方からは読み違える（割り込まれた行の文字は残る）。
+  本体の前後に**ファイルへの目印**（`echo "M row-$x-start" >&3` / `-done`。ファイルへの write は割り込まれない）を
+  置いて、どこで止まったかを見る
 
 **番犬**: `shell_scripts.rs` の `set_eの下で書き込みの最中に届く子のsigchldを増やさない` が、
 `set -e` を宣言する（または `scripts/lib/` / `lib.sh` のように呼び手の set -e を継ぐ）
@@ -4209,11 +4228,31 @@ file:line で名指す（`&&` / `>&2` / `2>&1` / `&>` / `|&`・文字列とコ�
 本文は名指さない。`$( … )` の中は読む）。PR の CI 待ちと merge（`wait-pr-checks.sh` / `merge-pr.sh` /
 `lib/gh-retry.sh` / `lib/pr-conflict.sh`）は 0 で、凍結表にも例外宣言にも逃がさない。既存分は
 `ASYNC_CHILD_ERREXIT_FROZEN` でスクリプトごとの数を凍結した（増やさない・減らしたら表も同じ数へ）。
-#2690 の棚卸しは 27 箇所 / 14 本: `release.sh` 7・`test-release-retry.sh` 5・`promo/` 7・`lib/` 4
-（`bundle-privacy.sh` の `find -print0` = 置換で直せない・隔離 GUI と caffeinate の常駐）・ほか 4
-（`check-claude-mod.sh`・`test-nightly-reserve.sh`・`test-serve-watch.sh` の背景の子）。
 終わるまでの間に何も書かない（`wait` で刈り取ってから書く）と監査して確かめた箇所だけ、その行か
 直前の行に `# tako:sigchld-ok <理由>` で外せる（理由の無い宣言は無効）。
+
+#### 凍結した残り（14 箇所 / 10 本。#2736 で実害の条件ごとに棚卸し）
+
+#2690 の時点は 27 箇所 / 14 本。#2736 で `release.sh` 7・`test-release-retry.sh` 5・`lib/launch-services.sh` 1 を
+`<<<"$( … )"` へ寄せた（どれも実測では修正前も落ちない形だった）。残りは「子が生きている間に本体で書くか」と
+「本体に前景の子が居るか」で並べた（上ほど実害に近い）:
+
+| 箇所 | 子 | 子が生きている間に書くか | 前景の子 | 見立て |
+|---|---|---|---|---|
+| `scripts/test-serve-watch.sh:249` | 背景（偽のピア） | 書く（`kill` の後 `wait` せずにすぐ次のテストの見出しを `echo`） | 無い | **当たりうる**（CI では回らない手元の検査。`kill` の後に `wait "$PEER_PID"` を足せば消える） |
+| `scripts/lib/virtual-display.sh:503` | 背景（`caffeinate -t 2`） | 書きうる（2 秒後に勝手に終わる。そのとき呼び手の検証スクリプトが書いていれば割り込まれる） | 呼び手次第 | **当たりうる**（低。待ちのループの間は `sleep 0.5` が刈り取る） |
+| `scripts/lib/isolated-gui.sh:705` | 背景（検証用 GUI） | 書く（GUI が生きている間ずっと） | — | 低（`stop_isolated_gui` は終わりを待つ。途中で GUI が死ぬのは検証が落ちるとき） |
+| `scripts/promo/lib.sh:1100` | 背景（収録のループ） | 書きうる | — | 低（止めるときは `wait` する。自分で終わるときだけ） |
+| `scripts/check-claude-mod.sh:144` | 背景（検査の 1 段） | 書かない（待ちのループは `kill -0` と `sleep 0.2`） | `sleep` | 低（`wait` で刈り取る） |
+| `scripts/test-nightly-reserve.sh:611` | 背景（夜間リリース） | 書かない（待ちのループは `sleep 0.1`） | `sleep` | 低 |
+| `scripts/test-serve-watch.sh:275` | 背景（消し続けるループ・40 秒） | 書かない（待ちのループは `sleep 1` と置換） | 有る | 低（止めるときは `kill` + `wait`） |
+| `scripts/promo/build-explainer.sh:179` | プロセス置換 | 書く（区間ごとの `echo`） | 有る（`python3`） | 低（前景の子が刈り取る） |
+| `scripts/promo/check-readings.sh:51` | プロセス置換 | 書く（`printf`） | 有る（`python3` を 2 回） | 低 |
+| `scripts/promo/build-explainer.sh:98` | プロセス置換 | 書かない（`/dev/null` へ） | 有る | なし |
+| `scripts/promo/narrate.sh:112` | プロセス置換 | 書かない（ファイルへ追記だけ） | 有る（`ffprobe`） | なし |
+| `scripts/promo/lib.sh:55` | プロセス置換 | 書かない（配列へ集めるだけ） | 無い | なし |
+| `scripts/lib/bundle-privacy.sh:78` | プロセス置換（`find -print0`） | 書かない | 有る（`grep \| wc`） | なし（NUL 区切りなので `<<<"$( … )"` へは寄せられない） |
+| `scripts/promo/lib.sh:959` | 背景（`( … ) &` の中の GUI） | — | — | なし（包むサブシェルがすぐ終わり、GUI は本体の子ではない = SIGCHLD が本体へ届かない） |
 
 ## 変数を使う rm は空で止める（Issue #2306）
 
