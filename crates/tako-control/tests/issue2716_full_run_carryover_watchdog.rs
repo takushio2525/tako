@@ -159,6 +159,11 @@ fn helper_problems(src: &str) -> Vec<String> {
     problems
 }
 
+/// 両方が見つかり、`a` が `b` より前にあるか
+fn before(a: Option<usize>, b: Option<usize>) -> bool {
+    matches!((a, b), (Some(a), Some(b)) if a < b)
+}
+
 /// 規則 3: 持ち越しで止まった節が場面と状態を自分で決めているか（足りないものを返す）
 fn section_problems(main: &str, bracket: &str) -> Vec<String> {
     let mut problems = Vec::new();
@@ -175,7 +180,7 @@ fn section_problems(main: &str, bracket: &str) -> Vec<String> {
         Some(body) => {
             let scene = body.find("vt2716_own_scene(");
             let open = body.find("Req::OpenFile");
-            if !scene.is_some_and(|s| open.is_some_and(|o| s < o)) {
+            if !before(scene, open) {
                 problems.push(
                     "md-edit-resume が開く前に `vt2716_own_scene(` で場面を作っていない（前の節の \
                      分割の隣に開くとプレビューが 0.25 幅になり編集ボタンが出ない）"
@@ -192,7 +197,7 @@ fn section_problems(main: &str, bracket: &str) -> Vec<String> {
         Some(body) => {
             let open = body.find("Request::OpenFile");
             let drain = body.find("drain_pending_preview_loads(");
-            if !open.is_some_and(|o| drain.is_some_and(|d| o < d)) {
+            if !before(open, drain) {
                 problems.push(
                     "chat-table（#745）が dispatch で開いた後に `drain_pending_preview_loads(` を \
                      呼んでいない（表がファイル監視の読み直し頼みになる = #826 の流し忘れ）"
@@ -207,7 +212,7 @@ fn section_problems(main: &str, bracket: &str) -> Vec<String> {
         Some(body) => {
             let open = body.find("Req::OpenFile");
             let decide = body.find("vt_lsp_override(");
-            if !decide.is_some_and(|d| open.is_some_and(|o| d < o)) {
+            if !before(decide, open) {
                 problems.push(
                     "bracket-match が fixture を開く前に `vt_lsp_override(` で言語サーバを決めていない \
                      （前の節の解決が節の途中に着地する）"
@@ -216,7 +221,7 @@ fn section_problems(main: &str, bracket: &str) -> Vec<String> {
             }
             let settled = body.find("vt_lsp_settled(");
             let reference = body.find("capture_frame(");
-            if !settled.is_some_and(|s| reference.is_some_and(|r| s < r)) {
+            if !before(settled, reference) {
                 problems.push(
                     "bracket-match が基準のフレーム（最初の `capture_frame(`）より前に言語サーバの \
                      状態の着地（`vt_lsp_settled(`）を待っていない（帯が基準の後に出る）"
