@@ -2358,9 +2358,16 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   項目 115（#830）は pin を呼ばずに 81 発話の描画を `await` で待っていたので、tick が挟まった回だけ
   会話が消えて `display=Starter` のまま描画待ちが切れていた（混んだ機で 21 回中 3 回。#2727）。
   #2727 から同じ番犬が「注入した会話（`session_id` が `selftest-` / `visual-`）を入れた同期区間
-  （前後の `.await` の間）で pin していない」も名指す（既知の残りは `UNPINNED_KNOWN`・逃げ道は
-  `tako:chat-fixture-ok <理由>`）。守りを確かめるときは tick を運に任せず、項目 98 / 115 のように
-  `collect_chat_targets` → `load_chat_refresh` → `apply_chat_refresh` をその場で 1 周回して会話が残るかを見る
+  （前後の `.await` の間）で pin していない」も名指す。入れてから次の `.await` までに会話を片付ける
+  （`chat_panes.clear()` / `.remove(`）注入は tick が割り込めないので名指さない。守られているのに規則が
+  見分けられない形（pin 済みのペインへの入れ直し・最後の読み取りまで `.await` を挟まない・検査の直前の
+  積み直し）は、その行か直前のコメント行に `tako:chat-fixture-ok <理由>` を書く（#2747 で既知の残りの表は
+  空 = 削除。visual-test #745 は pin 漏れだったので直した）。守りを確かめるときは tick を運に任せず、
+  項目 98 / 115・visual-test #745 のように `collect_chat_targets` → `load_chat_refresh` → `apply_chat_refresh` を
+  その場で 1 周回して会話が残るかを見る。pin したペインを節の後も使い続けるなら、節の後片付けで
+  `chat_fixture_panes` から外す（#745 = フォーカス中の元のペインを使う）。会話の配置を測る検査は、測る時点で
+  会話が `chat_panes` に残っていることも見る（消える前に 1 度描かれた `chat_text_index` / `chat_body_lists` は
+  会話が消えても残るので、#745 の表の検査は会話が無いまま古い配置を測って素通りした = 偽の PASS。#2747）
 - **PTY へ書く Enter は CR（`\r`）**。端末が Enter として送るのは CR で、PowerShell
   （PSReadLine）は素の LF を**継続行（`>>`）の開始**と解釈するので打ち込んだコマンドが
   確定しない。POSIX 側は tty の ICANON + ICRNL が CR も LF も改行へ倒すため、
