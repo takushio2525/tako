@@ -22,8 +22,10 @@
 //! 1. [`言語サーバの差し替え口は1実装を通す`] — tako-app の本文で差し替え口の名前
 //!    （`override_env_name(`）を作ってよいのは読み（`std::env::var(`）と `vt_lsp_override` の中だけ。
 //!    `"TAKO_LSP_BIN_…"` を `set_var` / `remove_var` へ直に渡す行も file:line で名指す
-//! 2. [`差し替えの補助はrestartの口で覚えを捨てる`] — `vt_lsp_override` が `LspServer` の restart を
-//!    dispatch し、旧の形（`TAKO_2716_LEGACY=lsp-override`）だけが通らない
+//! 2. [`差し替えの補助はrestartの口で覚えを捨てる`] — `vt_lsp_override` が書くときに `LspServer` の
+//!    restart を dispatch し、旧の形（`TAKO_2716_LEGACY=lsp-override`）だけが通らない。外すときは
+//!    env を消して restart の前に戻る（restart は開いた文書が無くても器を起こし直し、実の PATH の
+//!    解決が次の節へ着地する = 持ち越しを自分で作る）
 //! 3. [`持ち越しで止まった節は場面と状態を自分で決める`] — md-edit-resume が開く前に
 //!    `vt2716_own_scene`（= `ensure_fresh_scene`）で場面を作る・chat-table が開いた後に
 //!    `drain_pending_preview_loads` を呼ぶ・bracket-match が言語サーバを差し替え、状態の着地
@@ -35,7 +37,7 @@
 //! restart が解決の覚えと未導入の記録を捨てること（CLI `tako lsp restart` / MCP と同じ dispatch）は
 //! `issue1769_lsp_followup.rs` の `servers_の2回目以降は解決を起こさず合図と_restart_で引き直す`。
 //! 実 GUI の A/B（`TAKO_2716_LEGACY` / `TAKO_2716_INJECT`）は `.agent/conventions.md` の
-//! 「visual-test の節は自分が撮る場面を節の頭で自分で作る」の節。
+//! 「画面の外の持ち越しも節が自分で決める」の項。
 
 use std::path::{Path, PathBuf};
 
@@ -153,6 +155,21 @@ fn helper_problems(src: &str) -> Vec<String> {
     if !body.contains("legacy_2716(\"lsp-override\")") {
         problems.push(
             "`vt_lsp_override` に旧の形の切り替え（`legacy_2716(\"lsp-override\")`）が無い（A/B）"
+                .into(),
+        );
+    }
+    // 外す側は restart の前に戻る（restart は開いた文書が無くても器を起こし直す）
+    let returns_early = block_range(body, "let Some(program) = program else").is_some_and(|r| {
+        let removal = &body[r];
+        removal.contains("remove_var(")
+            && removal.contains("return id")
+            && !removal.contains("Request::LspServer")
+    });
+    if !returns_early {
+        problems.push(
+            "`vt_lsp_override` の外す側（`None`）が env を消して restart の前に戻っていない\
+             （`let Some(program) = program else { remove_var(…); return id; }`。restart は開いた文書が\
+             無くても器を起こし直すので、外すたびに撃つと実の PATH の解決が次の節へ着地する）"
                 .into(),
         );
     }
@@ -313,6 +330,24 @@ fn 修正前の形を名指しできる() {
             .iter()
             .any(|p| p.contains("restart の口")),
         "restart を撃たない補助を名指せる"
+    );
+    // 2b. 外すときも restart を撃つ（段 2 の途中の形 = 実の PATH の解決が次の節へ着地した）
+    let restart_on_remove = main.replacen(
+        "let Some(program) = program else {\n            std::env::remove_var(&env);\n            \
+         return id;\n        };\n        std::env::set_var(&env, program);",
+        "match program {\n            Some(program) => std::env::set_var(&env, program),\n            \
+         None => std::env::remove_var(&env),\n        }",
+        1,
+    );
+    assert_ne!(
+        restart_on_remove, main,
+        "注入先（外す側の早い戻り）が本文に在る"
+    );
+    assert!(
+        helper_problems(&restart_on_remove)
+            .iter()
+            .any(|p| p.contains("外す側（`None`）")),
+        "外すときも restart を撃つ補助を名指せる"
     );
     // 3a. md-edit-resume が場面を作らない（修正前）
     let stale_scene = main.replacen(

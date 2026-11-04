@@ -54737,12 +54737,15 @@ mod self_test {
 
     /// **visual-test の節が言語サーバの差し替え口（`TAKO_LSP_BIN_<ID>`）を書く・外す 1 実装**（#2716）。
     ///
-    /// env を書く（`Some`）・外す（`None`）たびに restart の口（`tako lsp restart --name <ID>` /
-    /// MCP の `tako_lsp_server` と同じ dispatch）を通し、前の節が覚えた実行ファイルの解決と未導入の
-    /// 記録を捨てる。全節実行は 1 プロセスで節を回すので、env を書くだけだと先の `.rs` の節が
-    /// 覚えた解決（隔離 HOME で動かない PATH の rust-analyzer = 未導入・動く機なら本物の RA）が勝ち、
-    /// 差し替えが効かない（lsp-context-menu の ① が「言語サーバの節が無い」で 3/3 落ちた。単独実行は
-    /// 差し替えが先なので通る）。外すときも捨てないと、偽サーバの解決が後ろの節へ持ち越される。
+    /// env を書く（`Some`）ときは restart の口（`tako lsp restart --name <ID>` / MCP の
+    /// `tako_lsp_server` と同じ dispatch）を通し、前の節が覚えた実行ファイルの解決と未導入の記録を
+    /// 捨てる。全節実行は 1 プロセスで節を回すので、env を書くだけだと先の `.rs` の節が覚えた解決
+    /// （隔離 HOME で動かない PATH の rust-analyzer = 未導入・動く機なら本物の RA）が勝ち、差し替えが
+    /// 効かない（lsp-context-menu の ① が「言語サーバの節が無い」で 3/3 落ちた。単独実行は差し替えが
+    /// 先なので通る）。外す（`None`）ときは env を消すだけで restart を撃たない: restart は開いた文書が
+    /// 無くても器を起こし直す（`Event::UserRestart` は常に起こす）ので、外すたびに撃つと実の PATH の
+    /// 解決が節の後ろへ着地して次の節への持ち越しを自分で作る（動く機なら本物のサーバまで起きる）。
+    /// 偽サーバの解決の覚えは、次に差し替える節が書くときの restart で捨てる。
     /// 返り値はサーバの ID（外すときに渡す）。`TAKO_2716_LEGACY=lsp-override` は env を書くだけ
     #[cfg(feature = "visual-test")]
     fn vt_lsp_override(
@@ -54752,10 +54755,11 @@ mod self_test {
         program: Option<&std::path::Path>,
     ) -> &'static str {
         let env = tako_core::lsp::servers::override_env_name(id);
-        match program {
-            Some(program) => std::env::set_var(&env, program),
-            None => std::env::remove_var(&env),
-        }
+        let Some(program) = program else {
+            std::env::remove_var(&env);
+            return id;
+        };
+        std::env::set_var(&env, program);
         if legacy_2716("lsp-override") {
             return id;
         }
