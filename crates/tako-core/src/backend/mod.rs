@@ -323,6 +323,16 @@ pub struct BackendCapabilities {
     /// 設定を 1 行も足さず、最後の取り込みの後の行は従来どおり入らない。
     /// 器が無いときは tako が履歴をメモリで持つ（閉じるときに読み切る）ので true
     pub keeps_exit_output: bool,
+    /// **器のサーバーを、最後のセッションが消えても終わらせずに残せるか**（#2741）。
+    ///
+    /// tmux の既定（`exit-empty on`）では、最後のセッションが消えるとサーバーは「終わる」と決め、
+    /// プロセスが消えるまで待ち受けのソケットを開いたままにする。その間に作った器のペインの
+    /// クライアントは受け付けられずに `server exited unexpectedly` で終わる = 作った直後のペインが
+    /// 即死する（混んだ機で隙間が延びる）。tmux は `exit-empty off` で残せる
+    /// （`tmux_backend::exit_empty_conf`）。**psmux は未実測**（`exit-empty` を持つか・同じ隙間が
+    /// あるかを Windows 実機で確かめていない）ので false = 設定を 1 行も足さない（#974）。
+    /// 器が無いときはサーバーそのものが無い（隙間も無い）ので true
+    pub keeps_empty_server: bool,
     /// UI・診断・system prompt に出す名前
     pub label: &'static str,
 }
@@ -366,6 +376,8 @@ impl BackendCapabilities {
             "suppresses_copy_mode_indicator": self.suppresses_copy_mode_indicator,
             // #2085: 自ら閉じたペインの最後の出力がペインログへ入るか
             "keeps_exit_output": self.keeps_exit_output,
+            // #2741: 最後のセッションが消えても器のサーバーを残すか
+            "keeps_empty_server": self.keeps_empty_server,
             "note": self.degraded_note(),
         })
     }
@@ -1708,6 +1720,7 @@ mod tests {
             extended_keys: true,
             suppresses_copy_mode_indicator: true,
             keeps_exit_output: true,
+            keeps_empty_server: true,
             label: "tmux",
         };
         assert!(with_container.degraded_note().is_none());
@@ -1724,6 +1737,7 @@ mod tests {
             extended_keys: true,
             suppresses_copy_mode_indicator: true,
             keeps_exit_output: true,
+            keeps_empty_server: true,
             label: "none",
         };
         let note = without.degraded_note().expect("縮退の説明が要る");
@@ -1746,6 +1760,7 @@ mod tests {
             extended_keys: true,
             suppresses_copy_mode_indicator: true,
             keeps_exit_output: true,
+            keeps_empty_server: true,
             label: "none",
         };
         let v = caps.describe();
@@ -1767,6 +1782,7 @@ mod tests {
             extended_keys: true,
             suppresses_copy_mode_indicator: true,
             keeps_exit_output: true,
+            keeps_empty_server: true,
             label: "tmux",
         };
         assert_eq!(tmux.describe()["scrollback"], "backend");
@@ -1789,6 +1805,7 @@ mod tests {
             extended_keys: false,
             suppresses_copy_mode_indicator: false,
             keeps_exit_output: false,
+            keeps_empty_server: false,
             label: "psmux",
         };
         let v = psmux.describe();
@@ -1840,6 +1857,7 @@ mod tests {
                 extended_keys: true,
                 suppresses_copy_mode_indicator: true,
                 keeps_exit_output: true,
+                keeps_empty_server: true,
                 label: "session-host",
             }
         }
@@ -2064,6 +2082,7 @@ mod tests {
             extended_keys: true,
             suppresses_copy_mode_indicator: true,
             keeps_exit_output: true,
+            keeps_empty_server: true,
             label: "session-host",
         };
         assert!(b1.full_restore());
@@ -2137,6 +2156,7 @@ mod tests {
                 extended_keys: true,
                 suppresses_copy_mode_indicator: true,
                 keeps_exit_output: true,
+                keeps_empty_server: true,
                 label: "capture-only",
             }
         }

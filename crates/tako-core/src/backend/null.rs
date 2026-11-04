@@ -43,6 +43,8 @@ impl SessionBackend for NullBackend {
             suppresses_copy_mode_indicator: true,
             // 器が無い = 履歴は tako のメモリにあり、閉じるときに読み切る（#2085）
             keeps_exit_output: true,
+            // 器が無い = サーバーそのものが無い（最後のセッションの後の隙間も無い。#2741）
+            keeps_empty_server: true,
             label: "none",
         }
     }
