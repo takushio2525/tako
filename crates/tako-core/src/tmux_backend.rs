@@ -197,8 +197,9 @@ pub fn backend_conf(caps: &BackendCapabilities) -> String {
 
 /// いまの器へ書く設定の中身。
 ///
-/// A/B は `TAKO_974_LEGACY=1`（能力を無視して全部書く = #974 前の挙動）と
-/// `TAKO_2085_LEGACY=1`（自ら閉じたペインの最後の出力を書き出さない = #2085 前の挙動）
+/// A/B は `TAKO_974_LEGACY=1`（能力を無視して全部書く = #974 前の挙動）・
+/// `TAKO_2085_LEGACY=1`（自ら閉じたペインの最後の出力を書き出さない = #2085 前の挙動）・
+/// `TAKO_2741_LEGACY=1`（最後のセッションが消えたらサーバーも終わる = #2741 前の挙動）
 fn conf_body() -> String {
     let legacy = std::env::var("TAKO_974_LEGACY").is_ok_and(|v| v == "1");
     let caps = crate::backend::capabilities();
@@ -208,7 +209,46 @@ fn conf_body() -> String {
         pane_died_dir().as_deref(),
         issue2085_legacy(),
     ));
+    body.push_str(&exit_empty_conf(&caps, issue2741_legacy()));
     body
+}
+
+/// #2741 の A/B（`TAKO_2741_LEGACY=1`）。同一バイナリのまま修正前の器（最後のセッションが消えると
+/// サーバーも終わる = tmux の既定 `exit-empty on`）へ戻す。**ゲートはこの 1 か所**
+pub fn issue2741_legacy() -> bool {
+    static LEGACY: OnceLock<bool> = OnceLock::new();
+    *LEGACY.get_or_init(|| {
+        matches!(
+            std::env::var("TAKO_2741_LEGACY").ok().as_deref(),
+            Some("1" | "true" | "on")
+        )
+    })
+}
+
+/// 器のサーバーを、最後のセッションが消えても終わらせない設定（#2741。**純関数**）。
+///
+/// tmux の既定（`exit-empty on`）では、最後のセッションが消えるとサーバーは「終わる」と決め、
+/// プロセスが消えるまで待ち受けのソケットを開いたままにする。その間に器のペインのクライアント
+/// （[`wrap_options`] = `new-session -A -D`）が繋ぐと、connect は通るのに受け付けられず、
+/// サーバーが消えた時点で `server exited unexpectedly` で終わる。拒否（ECONNREFUSED）ではないので
+/// 新しいサーバーも起こさない = **作った直後の器のペインが即死する**（隔離セルフテストの項目 739 / 749 の
+/// 間欠。空いた機では隙間はマイクロ秒以下だが、混んだ機でサーバーの終わりが延びる）。
+/// `exit-empty off` ならサーバーは終わると決めないので、隙間そのものが無くなる。
+///
+/// - 書くのは器の conf だけ（[`ensure_conf`] を `-f` で読む器の起動と、走っているサーバーへの
+///   [`sync_conf`]）。利用者の tmux（`tako tmux open`）へは読ませない
+/// - **空のサーバーが残る**。本番は GUI の再起動をまたいで器を残す設計（FR-5）なので、最後の器の
+///   ペインを閉じた後は器のソケットごとに空のサーバーが 1 本残る（次のペインがそれを使う）。
+///   使い捨てのソケット（隔離 GUI・セルフテスト・テスト）は後片付けが kill-server まで落とす
+///   （`cleanup_process_scoped` / `TmuxTestGuard`）
+/// - A/B は tmux の既定の `on` を書く（走っているサーバーも [`sync_conf`] で戻る）
+/// - 能力の無い器（psmux = 未実測）へは 1 行も書かない（#974）
+pub fn exit_empty_conf(caps: &BackendCapabilities, legacy: bool) -> String {
+    if !caps.keeps_empty_server {
+        return String::new();
+    }
+    let value = if legacy { "on" } else { "off" };
+    format!("set -s exit-empty {value}\n")
 }
 
 /// 自ら閉じたペインの最後の出力の置き場（#2085。`<data_dir>/pane-died/`）

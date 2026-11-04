@@ -60964,11 +60964,13 @@ mod self_test {
                 })
                 .collect(),
         );
+        // #2752: md の字送りは段落の先頭の決まった区間で測る（1 行目に収まる部分。段落の末尾まで
+        // 測ると、窓が狭くて拡大で折り返した回は 2 行目の末尾の x を測ってしまう）
+        const MD_PARA: &str = "paragraph body text for measuring the glyph advance.";
+        const MD_SPAN: &str = "paragraph body text for measuring";
         let doc = write(
             "doc.md",
-            "# 見出しの行\n\nparagraph body text for measuring the glyph advance.\n\n\
-             ## 二つ目の見出し\n\n二つ目の段落\n"
-                .to_string(),
+            format!("# 見出しの行\n\n{MD_PARA}\n\n## 二つ目の見出し\n\n二つ目の段落\n"),
         );
         // 10 万行 = 編集できる上限ちょうど（`tako_core::preview_limit::MAX_LINES`）。
         // 末尾に改行を付けない（付けると編集バッファは空の 100,001 行目を持ち、
@@ -61257,10 +61259,16 @@ mod self_test {
         press(any, cx, zoom_reset);
         close(window, cx, pane);
 
-        // (8) md のレンダリング表示: 見出し・段落の行の高さと段落の字送りが文字サイズの比で動く
+        // (8) md のレンダリング表示: 見出し・段落の行の高さと段落の字送りが文字サイズの比で動く。
+        // 字送りは段落の先頭の区間 `MD_SPAN` で測り、その区間が拡大の前後とも 1 行に収まっていることを
+        // 前提として確かめる（#2752。窓の寸法に依存しない = 既定の 960×600 の窓では段落の末尾が拡大で
+        // 2 行目へ折り返し、末尾で測ると 406.99 → 77.06 になっていた）。
+        // A/B: `TAKO_2752_LEGACY=1` = 修正前の「段落の末尾で測る・前提を確かめない」
+        let legacy_2752 = std::env::var("TAKO_2752_LEGACY").as_deref() == Ok("1");
         let pane = open(any, window, cx, shell, &doc, PreviewModeWire::Markdown).await;
         focus(window, cx, pane);
-        let md = |cx: &mut AsyncApp, pane: PaneId| -> (f32, f32, f32, f32) {
+        // ((文字サイズ, 見出しの行の高さ, 段落の行の高さ, 字送りの幅), 測った区間が 1 行に収まっているか)
+        let md = |cx: &mut AsyncApp, pane: PaneId| -> ((f32, f32, f32, f32), bool) {
             notify_and_draw(any, window, cx);
             window
                 .update(cx, |app, _, _| {
@@ -61268,28 +61276,53 @@ mod self_test {
                     let heading = layouts.first()?.as_ref()?;
                     let para = layouts.get(1)?.as_ref()?;
                     let len = app.preview_line_texts.get(&pane)?.get(1)?.len();
-                    let w = para.position_for_index(len)?.x - para.position_for_index(0)?.x;
+                    let end = if legacy_2752 {
+                        len
+                    } else {
+                        MD_SPAN.len().min(len)
+                    };
+                    let start = para.position_for_index(0)?;
+                    let stop = para.position_for_index(end)?;
                     Some((
-                        app.pane_font_size(pane),
-                        f32::from(heading.line_height()),
-                        f32::from(para.line_height()),
-                        f32::from(w),
+                        (
+                            app.pane_font_size(pane),
+                            f32::from(heading.line_height()),
+                            f32::from(para.line_height()),
+                            f32::from(stop.x - start.x),
+                        ),
+                        f32::from(stop.y - start.y).abs() < 0.5,
                     ))
                 })
                 .ok()
                 .flatten()
                 .unwrap_or_default()
         };
-        let m0 = md(cx, pane);
+        let (m0, one_line0) = md(cx, pane);
         for _ in 0..3 {
             press(any, cx, zoom_in);
         }
-        let m1 = md(cx, pane);
+        let (m1, one_line1) = md(cx, pane);
         println!(
             "TAKO_VISUAL_PIXEL: editor-font markdown pane_font={}->{} heading_h={:.2}->{:.2} \
-             para_h={:.2}->{:.2} para_w={:.2}->{:.2}",
+             para_h={:.2}->{:.2} para_w={:.2}->{:.2} legacy_2752={legacy_2752} \
+             one_line={one_line0}->{one_line1}",
             m0.0, m1.0, m0.1, m1.1, m0.2, m1.2, m0.3, m1.3
         );
+        // 前提が崩れた（ペインの本文が狭く、測る区間が折り返した）回は比の失敗と読み違えないよう
+        // 前提の欠けとして名指して止まる（測れなかった回 = 既定値の 0 は下の比の検査が名指す）
+        if !legacy_2752 && m0.0 > 0.0 && m1.0 > 0.0 {
+            check(
+                one_line0 && one_line1,
+                &format!(
+                    "visual-test editor-font (#2752): 前提の欠け: md の字送りを測る区間（段落の先頭 {} 字 \
+                     「{MD_SPAN}」）が 1 行に収まっていない（{}pt → {}pt で 1 行に収まる = \
+                     {one_line0} → {one_line1}）。ペインの本文が狭すぎる",
+                    MD_SPAN.len(),
+                    m0.0,
+                    m1.0
+                ),
+            );
+        }
         expect(
             &mut failures,
             m1.0 > m0.0

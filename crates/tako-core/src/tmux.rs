@@ -727,7 +727,11 @@ impl TmuxCause {
         let lower = text.to_ascii_lowercase();
         if lower.contains("no server running") || lower.contains("error connecting to") {
             Self::NoServer
-        } else if lower.contains("can't find session") || lower.contains("session not found") {
+        } else if lower.contains("can't find session")
+            || lower.contains("session not found")
+            // #2741: セッションが 1 つも無いサーバー（空のまま残る器 = `exit-empty off`）の断り方
+            || lower.contains("no current target")
+        {
             Self::NoSession
         } else if lower.contains("can't find window") {
             Self::NoWindow
@@ -1642,6 +1646,17 @@ mod tests {
             Some("s"),
             "x",
             "can't find session: x",
+        );
+        assert!(
+            msg.contains("tmux セッション x が socket: s に無い"),
+            "{msg}"
+        );
+        // #2741: 空のまま残る器のサーバーへの断りも「セッションが無い」と読む
+        let msg = ja(
+            TmuxAction::KillSession("x".into()),
+            Some("s"),
+            "x",
+            "no current target",
         );
         assert!(
             msg.contains("tmux セッション x が socket: s に無い"),
