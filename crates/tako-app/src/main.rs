@@ -55026,7 +55026,7 @@ mod self_test {
         );
     }
 
-    /// #2716 の注入 `stale-resolve`:差し替え無しの `.rs` を `from` の右に開いて言語サーバの解決を
+    /// #2716 の注入 `stale-resolve`: 差し替え無しの `.rs` を `from` の右に開いて言語サーバの解決を
     /// 覚えさせ、状態が落ち着いたら閉じる（全節実行で先の `.rs` の節が残す覚えを単独実行で作る）
     #[cfg(feature = "visual-test")]
     async fn vt2716_stale_resolve(
