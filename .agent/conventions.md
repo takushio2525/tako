@@ -2354,7 +2354,13 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   1 つでもあれば tick が挟まるので、`pin_chat_fixture` のように**読み取り対象から
   外して race を無くす**（判定そのものは変えない）。項目 98（#725）は MCP を 3 回
   往復するあいだに会話が消え、決定的に失敗して以降の項目が一切走らなくなっていた（#853）。
-  番犬テスト `chat_fixture_pin_watchdog` が pin の欠落と順序違いを落とす
+  番犬テスト `chat_fixture_pin_watchdog` が pin の欠落と順序違いを落とす。
+  項目 115（#830）は pin を呼ばずに 81 発話の描画を `await` で待っていたので、tick が挟まった回だけ
+  会話が消えて `display=Starter` のまま描画待ちが切れていた（混んだ機で 21 回中 3 回。#2727）。
+  #2727 から同じ番犬が「注入した会話（`session_id` が `selftest-` / `visual-`）を入れた同期区間
+  （前後の `.await` の間）で pin していない」も名指す（既知の残りは `UNPINNED_KNOWN`・逃げ道は
+  `tako:chat-fixture-ok <理由>`）。守りを確かめるときは tick を運に任せず、項目 98 / 115 のように
+  `collect_chat_targets` → `load_chat_refresh` → `apply_chat_refresh` をその場で 1 周回して会話が残るかを見る
 - **PTY へ書く Enter は CR（`\r`）**。端末が Enter として送るのは CR で、PowerShell
   （PSReadLine）は素の LF を**継続行（`>>`）の開始**と解釈するので打ち込んだコマンドが
   確定しない。POSIX 側は tty の ICANON + ICRNL が CR も LF も改行へ倒すため、
