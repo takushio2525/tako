@@ -246,8 +246,8 @@ pub(super) async fn completion_cancel_visual(
     ] {
         std::env::remove_var(name);
     }
-    if let Some(name) = override_env {
-        std::env::remove_var(name);
+    if let Some(server) = override_env {
+        vt_lsp_override(window, cx, server, None);
     }
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&work);

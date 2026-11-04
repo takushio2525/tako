@@ -393,8 +393,8 @@ pub(super) async fn hover_1893_visual(
     vt1860_press(any, window, cx, "escape");
 
     std::env::remove_var("TAKO_LSP_HOVER_DELAY_MS");
-    if let Some(name) = override_env {
-        std::env::remove_var(name);
+    if let Some(server) = override_env {
+        vt_lsp_override(window, cx, server, None);
     }
     std::env::remove_var("TAKO_LSP_FAKE_COMPLETION");
     std::env::remove_var("TAKO_LSP_FAKE_HOVER");
@@ -728,8 +728,8 @@ pub(super) async fn hover_loading_visual(
     ] {
         std::env::remove_var(var);
     }
-    if let Some(name) = override_env {
-        std::env::remove_var(name);
+    if let Some(server) = override_env {
+        vt_lsp_override(window, cx, server, None);
     }
     let _ = std::fs::remove_file(rules_file);
     let _ = std::fs::remove_dir_all(&dir);

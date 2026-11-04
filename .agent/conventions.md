@@ -2244,6 +2244,20 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     固定待ちは上のアンカーの空振りを覆い隠すだけ。番犬 `selftest_wait_watchdog` の
     `fixed_wait_before_enter` が「固定待ちの次のコードの行が Enter を押す `press…`」を名指す
     （A/B の旧経路など意図して残す形は、その行か直前のコメント行に `tako:fixed-wait-enter-ok <理由>`）
+- **実シェルのペインへ側路（`feed_osc_bytes`）で実行状態を注入する前に、シェルの最初のプロンプトを状態で待つ**
+  （#2478）。シェルの統合は `133;A` を precmd（プロンプトの直前 = rc を読み終えた後）で出すので、固定時間で
+  「起動が落ち着いた」とみなすと、rc の読み込みが遅れた回は遅れて届いた実シェルの `133;A` が注入した Running を
+  Idle へ上書きする。項目 128 は固定 1500ms で、load 20 の回に脈動の途中で要素ごと消え、不透明度が Running のうちに
+  最後に描いたフレームの値（0.692）で止まって「全長を過ぎたら止まる」で落ちていた（注入で再現: `prompts=0->1->2`・
+  `state_late=Some(Idle)`・late が `early_last` のまま）。
+  注入の前に `shell_marks().prompts >= 1` を `wait_for_app_state` で待ち、測り終えたら state と prompts が注入の
+  直後から動いていないことも確かめて、崩れた回は「前提が崩れた」と名指す。番犬 `selftest_wait_watchdog` の
+  `inject_before_first_prompt` が「ペインの誕生から注入までに `shell_marks` を読むコードの行が無い」を名指す
+  （意図して残す形は `tako:osc-inject-ok <理由>`）。A/B は `TAKO_2478_LEGACY=1`、注入は
+  `TAKO_2478_INJECT=slow-shell:<ファイル>`（GUI が検証用ペインの ID をそのファイルへ書き、`scripts/test-selftest-128-2478.sh`
+  が置く `.zshrc` が `TAKO_PANE_ID` の一致するペインでだけ 3 秒眠る）。**検証用ペインへの印を env で渡さない**:
+  器（tmux）越しのペインのシェルへ届く env は `session_pinned_pairs` の許可リスト（ペイン ID・統合の置き場 等）に
+  限られ、`options.env` に足しただけの値は届かない（最初の試みで実測）
 - **実 claude の「発話の内容」はビューポートから採らない**（#1175）。項目 101c は
   「引き継ぎ本文が後任へ届いた」を `visible_lines()` から探していたが、本文は
   claude の TUI では**起動直後に 1 度だけ流れる User 発話**なので、後任が数分喋れば
@@ -2674,6 +2688,22 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   （前提が崩れたときに「検査対象が壊れた」と読み違えないため。ヘルパーがやる）。
   最後のタブは閉じられない（`close_tab` が `LastTab` を返し UI 層がアプリを
   終了させる）ので、**新しいタブを作ってから**残りを閉じる
+- **画面の外の持ち越しも節が自分で決める**（#2716。単独では通るのに全節実行で止まる形）:
+  - **言語サーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は `vt_lsp_override(window, cx, id, Some(パス) | None)`
+    で書く・外す**。実行ファイルの解決は ID ごとに覚えられ（#1769）、env を書くだけでは先の
+    `.rs` の節が覚えた解決（隔離 HOME で動かない PATH の rust-analyzer）が勝って差し替えが効かない
+    （lsp-context-menu ① が 3/3 落ちた）。補助は書くたびに restart の口（`tako lsp restart
+    --name <ID>` と同じ dispatch）で覚えを捨てる。外すときは env を消すだけ（restart は開いた文書が
+    無くても器を起こし直すので、外すたびに撃つと実の PATH の解決が次の節へ着地する）。直に
+    `set_var` すると番犬 `issue2716_full_run_carryover_watchdog` が file:line で名指す
+  - **言語サーバの受け持つ拡張子の fixture を画素で比べる節は、言語サーバを決めてから状態の着地を
+    待って基準を撮る**（bracket-match = 実行できないパスへ差し替え → `vt_lsp_settled` を待つ。未導入の帯が
+    節の途中に出ると器が縮む）。言語サーバに用の無い節は fixture を受け持たない拡張子にする（#2714）
+  - **dispatch で直に開いたプレビューは `drain_pending_preview_loads` で流す**（#826 / #2716 の #745。
+    流さないとファイル監視の読み直しが来たときだけ揃う）
+  - A/B は `TAKO_2716_LEGACY=md-edit-resume|lsp-override|bracket-match|chat-table`（`1` で全部）、
+    持ち越しの注入は `TAKO_2716_INJECT=split|stale-resolve|no-reload|late-band,resolve-ms=400`（単独実行で
+    前の節の残りを作る。旧の形は名指しで落ち、新しい形は通る）
 - **節を足したら `TAKO_VISUAL_ONLY` の腕と全節実行の並びの両方へ載せる**。腕にしか
   無い節は「最終確認」で**一度も走らない**（#948 で `preview_code_visual` /
   `remote_tree_visual` / `screen_lines_visual` の 3 本がこれだった。`remote_tree_visual`
@@ -4121,6 +4151,69 @@ tag=$(git tag --sort=-v:refname | sed -n 1p)           # ○ 最後まで読む�
 （例外宣言 0）。テスト以外は `build-app.sh` のバンドル版セルフテストの合否（OK を出したのに
 失敗と読みうる）・`nightly-release.sh` の最新タグ（タグが増えると `set -e` で止まりうる）・
 `virtual-display.sh` / `measure-*.sh` / `promo/*.sh` の待ち合わせとロック・蓋の判定。
+
+### `set -e` の下に待たずに走らせる子を置かない（書き込みが SIGCHLD で割り込まれる。Issue #2690）
+
+3.2 は SIGCHLD のハンドラを **SA_RESTART なしで**張る（4.2 から SIGCHLD にだけ付く）。待たずに
+走らせた子（`<( … )` / `>( … )`・背景の `&`）が終わった瞬間に、シェルが stdout / stderr への write の
+中で待っていると（パイプの読み手が同じパイプを読んでいる最中・満杯）、write は EINTR で返り、
+`echo` / `printf` は `write error: Interrupted system call` で失敗する。macOS の libc はその行の
+バッファを捨てるので**行ごと消え**、`set -e` の下ではそこで **1 で抜ける**（5 = 届かない・赤の 1 の
+区別が化ける）。3.2 のエラーの行番号は直前のループの中の行を指す（#2690 の CI は `line 506` = ループの
+中の `echo` だったが、消えたのは 510 行目の結論の行）。
+
+子が出力を閉じて読み手が EOF を見てから SIGCHLD が届くまでの間に次の書き込みが来るので、
+**狙われるのは `done < <( … )` の直後の行 = 結論の行**。CI では読み手の `tee` と同じパイプを
+取り合った一瞬だけなので間欠だった（`test-wait-pr-checks.sh` の t38red の結論の行の欠け・
+t39merge の 5 が 1 = 子の `wait-pr-checks.sh` の結論が 1 に化けて「CI が揃っていない」）。
+
+```bash
+set -euo pipefail
+while IFS=$'\t' read -r a b; do echo "[$a] $b"; done < <(sort -k2 <<<"$RAW")    # ✗ 子の終わりが次の write に重なる
+echo "失敗しているチェックが 1 本ある"                                            #   ← 3.2 で消えて 1 で抜ける
+while IFS=$'\t' read -r a b; do echo "[$a] $b"; done <<<"$(sort -k2 <<<"$RAW")"  # ○ 置換の子はシェルが待って刈り取る
+```
+
+`$( … )` とパイプラインの子はシェルが待って刈り取る（刈り取りの間は SIGCHLD を塞ぐ）ので、
+書き込みの最中に届かない。寄せると出力が空のとき空の 1 行が読まれるので、ループが空を飛ばすか
+確かめる。置換は NUL を運べないので `find -print0` を読む形はこの書き換えでは直せない。
+
+実測（`/bin/bash` 3.2.57 / Homebrew の 5.3.15。腕の stdout / stderr を「いつも満杯」の FIFO にして
+write を毎回待たせる = 負荷は生成しない。`test-wait-pr-checks.sh` の Test 41 の `slowpipe.pl` と同じ形）:
+
+| 腕（20 回） | 3.2 | 5.3 |
+|---|---|---|
+| `done < <(sort …)` の直後の結論の行 | **20 回崩れる**（行が欠けて 1・`Interrupted system call`） | 0 |
+| 同じ形・SIGCHLD を塞いで起動 | 0（= 割り込むのは SIGCHLD） | — |
+| `done <<<"$(sort …)"` へ寄せた形（詰め物の窓を 3 ms 広げても） | 0 | 0 |
+| 背景の `( sleep 0.2 ) &` の終わりが書き込みに重なる | **落ちる** | 通る |
+| trap した SIGUSR1 が書き込みに重なる | 落ちる | 落ちる（= 5.x が通るのは SIGCHLD の SA_RESTART だけ） |
+| 修正前の `wait-pr-checks.sh` / `merge-pr.sh` を Test 41 で（赤・緑・merge） | **3 回ずつ 9 回とも崩れる**（PASS=279 FAIL=24。どれも CI と同じ `line 506: echo: write error: Interrupted system call`、赤は結論の行だけ消え・緑は 0 が 1・merge は 5 が 1） | — |
+| 修正後（赤・緑・merge を 20 回ずつ・詰め物の窓 0 / 3 ms） | 0（窓 0 / 3 ms とも PASS=473 FAIL=0） | 0（窓 0 / 3 ms とも PASS=473 FAIL=0） |
+
+**再現の道具の罠**（どちらも Test 41 の最初の形で踏んだ）:
+
+- **ただ遅く読むだけの読み手は、腕が書かない間に空きが溜まる**。実物のスクリプト（2 秒ほど走る）の結論の
+  行の write が待たず、修正前でも落ちなかった。腕が書いたら・空けても書かなければ詰め物で満杯へ戻す
+- **`O_NONBLOCK` は開いた口（open file description）ごとの属性で、`dup` した口は共有する**。詰め物を
+  書く間だけ腕と同じ口に `O_NONBLOCK` を立てると、その間の腕の write が **EAGAIN**
+  （`write error: Resource temporarily unavailable`）で落ち、版を問わず結論の行が消えて 1 になる
+  （窓を 3 ms 広げると 3.2 で 30 回中 4 回・5.3 で 30 回中 2 回。機が重いと窓が広がり、合流検証の
+  bash 5 で merge の腕が落ちた）。名前の無いパイプは開き直せないので、FIFO を読み手・詰め物（ずっと非塞）・
+  腕（塞がる）の 3 つの口で別々に開く
+
+**番犬**: `shell_scripts.rs` の `set_eの下で書き込みの最中に届く子のsigchldを増やさない` が、
+`set -e` を宣言する（または `scripts/lib/` / `lib.sh` のように呼び手の set -e を継ぐ）
+**リポジトリ全体の `.sh`** の `<( … )` / `>( … )`・背景の `&` を #1924 と同じ字句解析で読み、
+file:line で名指す（`&&` / `>&2` / `2>&1` / `&>` / `|&`・文字列とコメント・クォート付きヒアドキュメントの
+本文は名指さない。`$( … )` の中は読む）。PR の CI 待ちと merge（`wait-pr-checks.sh` / `merge-pr.sh` /
+`lib/gh-retry.sh` / `lib/pr-conflict.sh`）は 0 で、凍結表にも例外宣言にも逃がさない。既存分は
+`ASYNC_CHILD_ERREXIT_FROZEN` でスクリプトごとの数を凍結した（増やさない・減らしたら表も同じ数へ）。
+#2690 の棚卸しは 27 箇所 / 14 本: `release.sh` 7・`test-release-retry.sh` 5・`promo/` 7・`lib/` 4
+（`bundle-privacy.sh` の `find -print0` = 置換で直せない・隔離 GUI と caffeinate の常駐）・ほか 4
+（`check-claude-mod.sh`・`test-nightly-reserve.sh`・`test-serve-watch.sh` の背景の子）。
+終わるまでの間に何も書かない（`wait` で刈り取ってから書く）と監査して確かめた箇所だけ、その行か
+直前の行に `# tako:sigchld-ok <理由>` で外せる（理由の無い宣言は無効）。
 
 ## 変数を使う rm は空で止める（Issue #2306）
 

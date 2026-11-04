@@ -207,6 +207,7 @@ delete_remote_head_branch() {
 # `git worktree list --porcelain` は「worktree <パス>」と「branch refs/heads/<名前>」が対で並ぶ
 worktree_holding_branch() {
   local want="refs/heads/$1" line path=""
+  # 読み手はプロセス置換にしない（#2690。子が終わった瞬間の書き込みが /bin/bash 3.2 で EINTR になる）
   while IFS= read -r line; do
     case "${line}" in
       "worktree "*) path="${line#worktree }" ;;
@@ -217,7 +218,7 @@ worktree_holding_branch() {
         fi
         ;;
     esac
-  done < <(git worktree list --porcelain 2>/dev/null || true)
+  done <<<"$(git worktree list --porcelain 2>/dev/null || true)"
   return 0
 }
 

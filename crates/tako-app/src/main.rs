@@ -40979,6 +40979,32 @@ mod self_test {
     /// `TAKO_2689_INJECT=late` で Tab / Enter を遅らせる長さ（修正前の固定待ち 800ms を十分に超える）
     const INJECT_2689_LATE: Duration = Duration::from_secs(3);
 
+    /// **#2478 の A/B**（項目 128 の脈動の前提）。`TAKO_2478_LEGACY=1` = 修正前の「シェルの起動を
+    /// 固定 1500ms 待ってから Running を注入する」へ戻す
+    fn legacy_2478() -> bool {
+        std::env::var("TAKO_2478_LEGACY").as_deref() == Ok("1")
+    }
+
+    /// **#2478 の注入口**（項目 128。検証プロセスの門の内側でだけ読む）。
+    ///
+    /// `slow-shell:<ファイル>` = 項目 128 の検証用ペインの ID を、シェルを起こす直前にそのファイルへ書く。
+    /// 呼び手（`scripts/test-selftest-128-2478.sh`）が置いた `.zshrc` は `TAKO_PANE_ID` がファイルの中身と
+    /// 同じペインでだけ 3 秒眠るので、シェルの最初のプロンプト（precmd の `133;A`）が修正前の固定待ち
+    /// 1500ms より後に届く = 混んだ機で rc の読み込みが遅れた回（load 20 で 1 回落ちた）を負荷なしで作る。
+    /// 修正前は遅れて届いた `133;A` が注入した Running を Idle へ上書きし、② が「不透明度が最後に計算した
+    /// 値で止まる」で FAILED、修正後は最初のプロンプトを待ってから注入するので通る。
+    ///
+    /// 印を env で渡さないのは、器（tmux）越しのペインのシェルへ届く env が `session_pinned_pairs` の
+    /// 許可リストに限られるため（`TAKO_PANE_ID` は載る）。返すのは書き先のファイル
+    fn inject_2478_slow_shell() -> Option<std::path::PathBuf> {
+        if !tako_core::paths::is_verification_process() {
+            return None;
+        }
+        let value = std::env::var("TAKO_2478_INJECT").ok()?;
+        let file = value.strip_prefix("slow-shell:")?;
+        (!file.is_empty()).then(|| std::path::PathBuf::from(file))
+    }
+
     /// **#2711 の A/B**（visual-test 項目 152 のバッジ・tasks-input の送信の間）。
     /// `TAKO_2711_LEGACY=1` / `all` で両方、`152` / `tasks-input`（カンマ区切り）で片方だけ修正前へ戻す
     /// （`check` は 1 つ目の失敗でプロセスごと止まるので、全節実行で後ろの tasks-input の旧の形を
@@ -42601,6 +42627,19 @@ mod self_test {
             "visual-test #745: フィクスチャに 2 列と 3 列の表がある",
         );
 
+        // #2716 の注入 `no-reload`: ファイル監視の読み直しが来ない形（節の終わりで戻す）
+        let reload_off = inject_2716("no-reload");
+        if reload_off {
+            let _ = window.update(cx, |app, _, _| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::PreviewReload {
+                        enabled: Some(false),
+                    },
+                    PaneOrigin::Cli,
+                );
+            });
+        }
         // 左 = チャット、右 = 同じ md のプレビュー
         let (chat_pane, md_pane) = window
             .update(cx, |app, _, cx| {
@@ -42620,6 +42659,12 @@ mod self_test {
                     PaneOrigin::Cli,
                 )
                 .expect("visual-test #745: プレビューを開く");
+                // 積んだ読み込みを流す（dispatch を直に呼んだので、IPC の after_dispatch の代わり。
+                // #826 / #2716。流さないと表はファイル監視の読み直し（fixture の書き込みを拾う）が
+                // 来たときだけ揃い、知らせが来ない・遅れると 5 秒で落ちる）
+                if !legacy_2716("chat-table") {
+                    app.drain_pending_preview_loads(cx);
+                }
                 let _ = tako_control::dispatch(
                     app,
                     tako_control::protocol::Request::UiMode {
@@ -42656,6 +42701,17 @@ mod self_test {
             )
         })
         .await;
+        if reload_off {
+            let _ = window.update(cx, |app, _, _| {
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::PreviewReload {
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+            });
+        }
         check(
             loaded.is_some(),
             "visual-test #745: プレビュー側に表がロードされる",
@@ -46747,13 +46803,10 @@ mod self_test {
         let fixture = dir.join("diagnostics.json");
         std::fs::write(&fixture, serde_json::Value::Array(published).to_string())
             .expect("diagnostics.json");
-        // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）
-        let spec = tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, &path)
-            .expect("fixture の拡張子を受け持つサーバが表に在る")
-            .spec;
-        let override_env = tako_core::lsp::servers::override_env_name(spec.id);
-        std::env::set_var(&override_env, &fake);
         std::env::set_var("TAKO_LSP_FAKE_DIAGNOSTICS", &fixture);
+        // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）。
+        // 前の節が覚えた解決は restart の口で捨てる（#2716）
+        let server = vt_lsp_override(window, cx, vt_lsp_server_of(&path), Some(&fake));
 
         let pane = window
             .update(cx, |app, _, cx| {
@@ -47239,7 +47292,7 @@ mod self_test {
             retained == (0, 0) && !edits_left,
             "visual-test 診断: ペインを閉じても診断が保持されたまま (#830)",
         );
-        std::env::remove_var(&override_env);
+        vt_lsp_override(window, cx, server, None);
         std::env::remove_var("TAKO_LSP_FAKE_DIAGNOSTICS");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -54634,6 +54687,246 @@ mod self_test {
         }
     }
 
+    /// **#2716 の A/B**（全節実行が前の節の持ち越しで止まっていた 4 か所）。
+    /// `TAKO_2716_LEGACY=1` / `all` で全部、`md-edit-resume` / `lsp-override` / `bracket-match` /
+    /// `chat-table`（カンマ区切り）で一部だけ修正前へ戻す（`check` は 1 つ目の失敗でプロセスごと
+    /// 止まるので、全節実行で後ろの旧の形を見るときは前のものを戻さない = `legacy_2711` と同じ理由）。
+    ///
+    /// - `md-edit-resume` = 節の頭で場面を作らず、前の節が残した分割の隣に開く（[`vt2716_own_scene`]）
+    /// - `lsp-override` = 言語サーバの差し替え口（`TAKO_LSP_BIN_<ID>`）を env に書くだけで、
+    ///   前の節が覚えた実行ファイルの解決を捨てない（[`vt_lsp_override`]）
+    /// - `bracket-match` = fixture の言語サーバを決めず、状態の着地も待たずに基準を撮る
+    /// - `chat-table` = dispatch で開いた後に積んだ読み込みを流さない（ファイル監視の読み直し頼み）
+    #[cfg(feature = "visual-test")]
+    fn legacy_2716(item: &str) -> bool {
+        std::env::var("TAKO_2716_LEGACY").is_ok_and(|value| {
+            value == "1" || value == "all" || value.split(',').any(|p| p.trim() == item)
+        })
+    }
+
+    /// **#2716 の注入口**（検証プロセスの門の内側でだけ読む。カンマ区切りで並べられる）。
+    ///
+    /// - `split` = md-edit-resume の頭で、開く元のペインの右に 1 枚分割しておく（前の節が分割を
+    ///   残した形。旧の形はプレビューが 0.25 幅 = 編集ボタンの出ない幅になって落ちる）
+    /// - `stale-resolve` = lsp-context-menu の頭で、差し替え無しの `.rs` を 1 つ開いて言語サーバの
+    ///   解決を覚えさせてから閉じる（全節実行で先の `.rs` の節が残す覚えと同じ。旧の形は偽サーバへの
+    ///   差し替えが効かず ① で落ちる）
+    /// - `no-reload` = chat-table の間だけライブリロードを切る（ファイル監視の読み直しが来ない形。
+    ///   旧の形は表が揃わず落ちる）
+    /// - `late-band` = bracket-match の頭で、旧の形でも fixture の言語サーバを実行できないパスへ差し替える
+    ///   （解決がすぐ済む = 帯の着地の時刻を `resolve-ms` だけで決める。新しい形は自分で同じ差し替えをする）
+    /// - `resolve-ms=<ミリ秒>` = 言語サーバの実行ファイルの解決を遅らせる（tako-control の
+    ///   `LspManager` が読む）。`late-band,resolve-ms=400` で、前の節の解決が bracket-match の途中に
+    ///   着地した形になる（基準は開いてから約 0.37 秒・③ は約 1 秒。旧の形は帯が基準の後に出て ② で
+    ///   落ち、新しい形は着地を待ってから撮るので通る）
+    #[cfg(feature = "visual-test")]
+    fn inject_2716(item: &str) -> bool {
+        tako_core::paths::is_verification_process()
+            && std::env::var("TAKO_2716_INJECT")
+                .is_ok_and(|value| value.split(',').any(|p| p.trim() == item))
+    }
+
+    /// #2716: プレビューを開く節の場面を節の頭で作る（[`ensure_fresh_scene`]）。前の節が残した分割の
+    /// 隣に開くと既定の窓でプレビューが狭くなり、単独では通る節が全節実行で止まる。返り値は開く元の錨。
+    /// 注入 `TAKO_2716_INJECT=split` は先に開く元の右へ 1 枚分割しておく（前の節が残した形）。
+    /// 旧の形（`TAKO_2716_LEGACY=<節名>`）は場面を作らない（`None` = 呼び手は今のフォーカスから開く）
+    #[cfg(feature = "visual-test")]
+    async fn vt2716_own_scene(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        label: &str,
+    ) -> Option<PaneId> {
+        if inject_2716("split") {
+            let _ = window.update(cx, |app, _, cx| {
+                let base = app.focused_pane();
+                let _ = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::Split {
+                        pane: Some(base.as_u64()),
+                        tab: None,
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        ratio: None,
+                        command: None,
+                        cwd: None,
+                        focus: Some(false),
+                    },
+                    PaneOrigin::User,
+                );
+                let _ = app.attach_pending_sessions(cx);
+                cx.notify();
+            });
+            println!("TAKO_VISUAL_PIXEL: {label} inject=split");
+        }
+        if legacy_2716(label) {
+            return None;
+        }
+        Some(ensure_fresh_scene(window, cx, label).await)
+    }
+
+    /// visual-test の fixture を受け持つ言語サーバの ID（検出表から引く。名前を書かない）
+    #[cfg(feature = "visual-test")]
+    fn vt_lsp_server_of(path: &std::path::Path) -> &'static str {
+        tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, path)
+            .expect("fixture の拡張子を受け持つサーバが表に在る")
+            .spec
+            .id
+    }
+
+    /// **visual-test の節が言語サーバの差し替え口（`TAKO_LSP_BIN_<ID>`）を書く・外す 1 実装**（#2716）。
+    ///
+    /// env を書く（`Some`）ときは restart の口（`tako lsp restart --name <ID>` / MCP の
+    /// `tako_lsp_server` と同じ dispatch）を通し、前の節が覚えた実行ファイルの解決と未導入の記録を
+    /// 捨てる。全節実行は 1 プロセスで節を回すので、env を書くだけだと先の `.rs` の節が覚えた解決
+    /// （隔離 HOME で動かない PATH の rust-analyzer = 未導入・動く機なら本物の RA）が勝ち、差し替えが
+    /// 効かない（lsp-context-menu の ① が「言語サーバの節が無い」で 3/3 落ちた。単独実行は差し替えが
+    /// 先なので通る）。外す（`None`）ときは env を消すだけで restart を撃たない: restart は開いた文書が
+    /// 無くても器を起こし直す（`Event::UserRestart` は常に起こす）ので、外すたびに撃つと実の PATH の
+    /// 解決が節の後ろへ着地して次の節への持ち越しを自分で作る（動く機なら本物のサーバまで起きる）。
+    /// 偽サーバの解決の覚えは、次に差し替える節が書くときの restart で捨てる。
+    /// 返り値はサーバの ID（外すときに渡す）。`TAKO_2716_LEGACY=lsp-override` は env を書くだけ
+    #[cfg(feature = "visual-test")]
+    fn vt_lsp_override(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        id: &'static str,
+        program: Option<&std::path::Path>,
+    ) -> &'static str {
+        let env = tako_core::lsp::servers::override_env_name(id);
+        let Some(program) = program else {
+            std::env::remove_var(&env);
+            return id;
+        };
+        std::env::set_var(&env, program);
+        if legacy_2716("lsp-override") {
+            return id;
+        }
+        let reply = window
+            .update(cx, |app, _, cx| {
+                let r = tako_control::dispatch(
+                    app,
+                    tako_control::protocol::Request::LspServer {
+                        action: "restart".into(),
+                        name: Some(id.to_string()),
+                        set: None,
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                r
+            })
+            .unwrap_or_else(|_| fail("visual-test: 言語サーバの差し替えの restart (#2716)"));
+        if let Err(e) = reply {
+            fail(&format!(
+                "visual-test: 言語サーバ {id} の差し替えの後に restart の口で解決を捨てられない: {e:?} (#2716)"
+            ));
+        }
+        id
+    }
+
+    /// 文書の言語サーバの状態が落ち着いたか（起こしている途中・取っている途中・落ちて起こし直す
+    /// 途中でない。自動で起こさずにいる = held も落ち着いた側。#2716）
+    #[cfg(feature = "visual-test")]
+    fn vt_lsp_settled(server: &tako_control::lsp::DocumentServer) -> bool {
+        use tako_core::lsp::state::ServerState as S;
+        server.held
+            || !matches!(
+                server.state,
+                S::NotStarted | S::Starting | S::Fetching | S::Crashed | S::Stopping
+            )
+    }
+
+    /// #2716 の注入 `stale-resolve`: 差し替え無しの `.rs` を `from` の右に開いて言語サーバの解決を
+    /// 覚えさせ、状態が落ち着いたら閉じる（全節実行で先の `.rs` の節が残す覚えを単独実行で作る）
+    #[cfg(feature = "visual-test")]
+    async fn vt2716_stale_resolve(
+        window: WindowHandle<TakoApp>,
+        cx: &mut AsyncApp,
+        from: PaneId,
+        label: &str,
+    ) {
+        use tako_control::protocol::Request as Req;
+        let dir =
+            std::env::temp_dir().join(format!("tako-visual-2716-stale-{}", std::process::id()));
+        remove_on_fail(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("visual-test #2716 stale-resolve の dir");
+        let _ = std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"s\"\n");
+        let file = dir.join("src").join("main.rs");
+        std::fs::write(&file, "fn main() {}\n")
+            .expect("visual-test #2716 stale-resolve の fixture");
+        let pane = window
+            .update(cx, |app, _, cx| {
+                let opened = tako_control::dispatch(
+                    app,
+                    Req::OpenFile {
+                        pane: Some(from.as_u64()),
+                        path: file.display().to_string(),
+                        mode: Some(tako_control::protocol::PreviewModeWire::Code),
+                        direction: Some(tako_control::protocol::Direction::Right),
+                        focus: Some(false),
+                        new_tab: false,
+                        line: None,
+                        column: None,
+                    },
+                    PaneOrigin::Cli,
+                )
+                .ok()?;
+                let pane = PaneId::from_raw(opened["pane"].as_u64()?);
+                let _ = tako_control::dispatch(
+                    app,
+                    Req::PreviewEdit {
+                        pane: Some(pane.as_u64()),
+                        enabled: Some(true),
+                    },
+                    PaneOrigin::Cli,
+                );
+                cx.notify();
+                Some(pane)
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                fail(&format!(
+                    "visual-test {label}: 注入 stale-resolve で開けない"
+                ))
+            });
+        let settled = wait_for_app_state(
+            window,
+            cx,
+            "2716-stale-resolve",
+            Duration::from_secs(30),
+            |app| {
+                app.lsp_document_server(pane)
+                    .is_some_and(|s| vt_lsp_settled(&s))
+            },
+        )
+        .await;
+        let state = window
+            .update(cx, |app, _, _| {
+                app.lsp_document_server(pane).map(|s| s.state.slug())
+            })
+            .ok()
+            .flatten();
+        println!(
+            "TAKO_VISUAL_PIXEL: {label} inject=stale-resolve settled={settled} state={state:?}"
+        );
+        let _ = window.update(cx, |app, _, cx| {
+            app.preview_edits.remove(&pane);
+            let _ = tako_control::dispatch(
+                app,
+                Req::Close {
+                    pane: Some(pane.as_u64()),
+                    force: true,
+                    caller_role: None,
+                    caller_pane: None,
+                },
+                PaneOrigin::Cli,
+            );
+            cx.notify();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// #1684 の道具: 実ファイルを開いて（閲覧のまま = 編集モードに入らない）行が描かれるまで待つ
     #[cfg(feature = "visual-test")]
     async fn vt1684_open(
@@ -54724,14 +55017,13 @@ mod self_test {
             .unwrap_or_else(|| {
                 fail("visual-test lsp-context-menu: 偽サーバが無い（cargo build -p tako-control --bin tako-lsp-fake を先に）")
             });
-        let spec_of = |path: &std::path::Path| {
-            tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, path)
-                .expect("fixture の拡張子を受け持つサーバが表に在る")
-                .spec
-        };
-        // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）
-        let rs_env = tako_core::lsp::servers::override_env_name(spec_of(&file).id);
-        std::env::set_var(&rs_env, &fake);
+        // #2716: 全節実行で先の `.rs` の節が残す解決の覚えを単独実行で作る（注入）
+        if inject_2716("stale-resolve") {
+            vt2716_stale_resolve(window, cx, anchor, LABEL).await;
+        }
+        // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）。
+        // 前の節が覚えた解決は restart の口で捨てる（#2716）
+        let rs_server = vt_lsp_override(window, cx, vt_lsp_server_of(&file), Some(&fake));
         let goto = dir.join("goto.json");
         std::fs::write(
             &goto,
@@ -55110,8 +55402,12 @@ mod self_test {
         // ⑧ 未導入のサーバ（差し替え口が実行できないものを指す）: 1 行のあと節ごと消える
         let py = dir.join("tool.py");
         std::fs::write(&py, "def run():\n    return run\n").expect("tool.py");
-        let py_env = tako_core::lsp::servers::override_env_name(spec_of(&py).id);
-        std::env::set_var(&py_env, dir.join("no-such-server"));
+        let py_server = vt_lsp_override(
+            window,
+            cx,
+            vt_lsp_server_of(&py),
+            Some(&dir.join("no-such-server")),
+        );
         let py_pane = vt1684_open(any, window, cx, pane, &py, LABEL).await;
         let run = vt1684_point(window, cx, py_pane, 0, 4..7)
             .unwrap_or_else(|| fail("visual-test lsp-context-menu ⑧: run の位置を採れない"));
@@ -55144,8 +55440,8 @@ mod self_test {
         );
         vt1684_close(any, window, cx);
 
-        std::env::remove_var(&rs_env);
-        std::env::remove_var(&py_env);
+        vt_lsp_override(window, cx, rs_server, None);
+        vt_lsp_override(window, cx, py_server, None);
         std::env::remove_var("TAKO_LSP_FAKE_GOTO");
         for env in tako_control::lsp::menu::FAKE_FULL_MENU_RULE_ENVS {
             std::env::remove_var(env);
@@ -55275,7 +55571,7 @@ mod self_test {
 
     /// 補完の一覧を用意する: 偽サーバ（`tako-lsp-fake`）を受け持ちのサーバに差し替え、
     /// `src/main.rs` を編集モードで開いて 3 行目の行頭（字下げの後ろ）へカーソルを置く。
-    /// 返り値は (ペイン, 一時ディレクトリ, 差し替えた環境変数の名前)
+    /// 返り値は (ペイン, 一時ディレクトリ, 差し替えたサーバの ID = 後片付けで [`vt_lsp_override`] へ渡す)
     #[cfg(feature = "visual-test")]
     async fn completion_scene(
         any: AnyWindowHandle,
@@ -55285,7 +55581,7 @@ mod self_test {
         rules: Option<serde_json::Value>,
         source: &str,
         cursor: (usize, usize),
-    ) -> (PaneId, std::path::PathBuf, Option<String>) {
+    ) -> (PaneId, std::path::PathBuf, Option<&'static str>) {
         use tako_control::protocol::Request as Req;
         let anchor = ensure_fresh_scene(window, cx, label).await;
         let dir = std::env::temp_dir().join(format!("tako-visual-{label}-{}", std::process::id()));
@@ -55311,14 +55607,15 @@ mod self_test {
                 });
             let file = dir.join("completion.json");
             std::fs::write(&file, rules.to_string()).expect("completion.json");
-            // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）
-            let spec = tako_core::lsp::servers::resolve_in(tako_core::lsp::servers::SERVERS, &path)
-                .expect("fixture の拡張子を受け持つサーバが表に在る")
-                .spec;
-            let name = tako_core::lsp::servers::override_env_name(spec.id);
-            std::env::set_var(&name, &fake);
             std::env::set_var("TAKO_LSP_FAKE_COMPLETION", &file);
-            override_env = Some(name);
+            // 受け持つサーバの差し替え口（`TAKO_LSP_BIN_<ID>`）は検出表から引く（名前を書かない）。
+            // 前の節が覚えた解決は restart の口で捨てる（#2716）
+            override_env = Some(vt_lsp_override(
+                window,
+                cx,
+                vt_lsp_server_of(&path),
+                Some(&fake),
+            ));
         }
         let pane = window
             .update(cx, |app, _, cx| {
@@ -55923,8 +56220,8 @@ mod self_test {
             "visual-test completion: 問い合わせ中にペインを閉じても一覧は残らない",
         );
 
-        if let Some(name) = override_env {
-            std::env::remove_var(name);
+        if let Some(server) = override_env {
+            vt_lsp_override(window, cx, server, None);
         }
         std::env::remove_var("TAKO_LSP_FAKE_COMPLETION");
         let _ = std::fs::remove_dir_all(&dir);
@@ -56249,8 +56546,8 @@ mod self_test {
         ] {
             std::env::remove_var(name);
         }
-        if let Some(name) = override_env {
-            std::env::remove_var(name);
+        if let Some(server) = override_env {
+            vt_lsp_override(window, cx, server, None);
         }
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&work);
@@ -56417,7 +56714,7 @@ mod self_test {
     ) -> (
         PaneId,
         std::path::PathBuf,
-        Option<String>,
+        Option<&'static str>,
         std::path::PathBuf,
     ) {
         let file = std::env::temp_dir().join(format!(
@@ -57074,8 +57371,8 @@ mod self_test {
             "visual-test hover: メニューを閉じればまたカードが出る (#1681)",
         );
 
-        if let Some(name) = override_env {
-            std::env::remove_var(name);
+        if let Some(server) = override_env {
+            vt_lsp_override(window, cx, server, None);
         }
         std::env::remove_var("TAKO_LSP_FAKE_COMPLETION");
         std::env::remove_var("TAKO_LSP_FAKE_HOVER");
@@ -61762,6 +62059,10 @@ mod self_test {
         use tako_control::protocol::Request as Req;
         let wait =
             |cx: &mut AsyncApp, ms: u64| cx.background_executor().timer(Duration::from_millis(ms));
+        // #2716: 開く場面は節の頭で自分で作る。前の節が残した分割の隣に開くと、既定の窓（960×600）で
+        // プレビューが 0.25 幅 = 編集ボタンの出ない幅（`PreviewHeaderVisibility` の 300px 未満）になり、
+        // 全節実行が「編集ボタンが描かれない」で止まっていた（単独実行は 0.5 幅なので通る）
+        let anchor = vt2716_own_scene(window, cx, "md-edit-resume").await;
         let dir = std::env::temp_dir().join(format!("tako-visual-1661-{}", std::process::id()));
         remove_on_fail(&dir);
         let _ = std::fs::remove_dir_all(&dir);
@@ -61785,7 +62086,7 @@ mod self_test {
             .update(cx, |app, _, cx| {
                 app.drawer_visible = false;
                 app.panel_visible = false;
-                let base = app.focused_pane().as_u64();
+                let base = anchor.unwrap_or_else(|| app.focused_pane()).as_u64();
                 let opened = tako_control::dispatch(
                     app,
                     Req::OpenFile {
@@ -94063,6 +94364,7 @@ mod self_test {
             {
                 let any945 = cx.update(|cx| cx.windows().first().copied()).unwrap_or(any);
                 let window945 = any945.downcast::<TakoApp>().unwrap_or(window);
+                let slow_shell = inject_2478_slow_shell();
                 let pane945 = window945
                     .update(cx, |app: &mut TakoApp, _, cx| {
                         let r = tako_control::dispatch(
@@ -94075,20 +94377,58 @@ mod self_test {
                             PaneOrigin::Cli,
                         )
                         .ok()?;
+                        let made = r["pane"].as_u64().map(PaneId::from_raw);
+                        if let (Some(file), Some(pane)) = (&slow_shell, made) {
+                            let _ = std::fs::write(file, pane.to_string());
+                        }
                         for (pane, options) in std::mem::take(&mut app.pending_attach) {
                             let _ = app.spawn_session(pane, options, cx);
                         }
-                        r["pane"].as_u64().map(PaneId::from_raw)
+                        made
                     })
                     .ok()
                     .flatten();
                 match pane945 {
                     None => println!("TAKO_SELF_TEST_SKIPPED: 128（検証用タブを作れない）"),
                     Some(pane) => {
-                        // シェルの起動出力（プロンプト + OSC 133）が落ち着くまで待つ。
-                        // ここが済むまでは実行状態が勝手に動く
+                        // シェルの起動（rc の読み込み → 最初のプロンプト）が済むのを**状態で**待つ（#2478）。
+                        //
+                        // シェルの統合は `133;A` を precmd（プロンプトの直前）でしか出さないので、
+                        // 最初のプロンプトの後はコマンドを打たない限り実行状態を動かさない。済む前に
+                        // Running を注入すると、遅れて届いた実シェルの `133;A` が Idle へ上書きし、
+                        // 脈動の途中で要素ごと消えて不透明度が最後に計算した値で止まる
+                        //（修正前は固定 1500ms。load 20 の回に 0.692 で止まって落ちた形を、rc の読み込みを
+                        // 遅らせる注入 `TAKO_2478_INJECT` で再現した）
                         notify_and_draw(any945, window945, cx);
-                        wait(cx, 1500).await;
+                        let prompts = |app: &TakoApp| {
+                            app.terminals
+                                .get(&pane)
+                                .map_or(0, |s| s.shell_marks().prompts)
+                        };
+                        let settle_started = std::time::Instant::now();
+                        let settled = if legacy_2478() {
+                            wait(cx, 1500).await;
+                            true
+                        } else {
+                            wait_for_app_state(
+                                window945,
+                                cx,
+                                "128: 検証用ペインのシェルの最初のプロンプト",
+                                state_wait_budget(Duration::from_secs(15), machine_busy()),
+                                |app| prompts(app) >= 1,
+                            )
+                            .await
+                        };
+                        let settle_ms = settle_started.elapsed().as_millis();
+                        let prompts_settled =
+                            window945.update(cx, |app, _, _| prompts(app)).unwrap_or(0);
+                        check(
+                            settled,
+                            &format!(
+                                "128: 検証用ペインのシェルが最初のプロンプトを出す \
+                                 (脈動の前提。#2478。{settle_ms}ms 待った)"
+                            ),
+                        );
                         let running = window945
                             .update(cx, |app: &mut TakoApp, _, cx| {
                                 let ok = match app.terminals.get_mut(&pane) {
@@ -94107,6 +94447,8 @@ mod self_test {
                             running,
                             "128: 検証用ペインが Running になる（脈動の前提。#945）",
                         );
+                        let prompts_injected =
+                            window945.update(cx, |app, _, _| prompts(app)).unwrap_or(0);
                         let started = std::time::Instant::now();
                         // 汚してから 1 フレーム描き、そのフレームで脈動が計算した
                         // 不透明度を読む（#786 のキャッシュがあるので notify が要る）
@@ -94149,17 +94491,43 @@ mod self_test {
                             late.push(sample(cx).1);
                             wait(cx, 250).await;
                         }
+                        // 測っている間に実行状態が実シェルの印で動いていないか（#2478 の前提）。
+                        // 動いていたら、Running を外れた時刻（注入から）も出す。要素が消えた後は
+                        // 脈動が計算されないので、late は Running のうちに最後に描いたフレームの値
+                        //（ディスプレイリンクが回らない環境では early の最後 = `early_last`）で止まる
+                        let (state_late, prompts_late, left_running) = window945
+                            .update(cx, |app, _, _| {
+                                let session = app.terminals.get(&pane);
+                                let state = session.map(|s| s.command_state());
+                                let left = session
+                                    .filter(|s| {
+                                        s.command_state() != tako_core::CommandState::Running
+                                    })
+                                    .and_then(|s| s.command_state_since())
+                                    .and_then(|at| at.checked_duration_since(started));
+                                (state, prompts(app), left)
+                            })
+                            .unwrap_or((None, 0, None));
+                        let left_running_line = left_running
+                            .map_or_else(|| "-".to_string(), |at| format!("{}ms", at.as_millis()));
                         println!(
                             "TAKO_SELF_TEST_945: legacy={} early={:.3}..{:.3}(spread {:.3}) \
-                             late={:.3}..{:.3}(spread {:.3}) idle_frames={} animated={animated}",
+                             early_last={:.3} late={:.3}..{:.3}(spread {:.3}) idle_frames={} \
+                             animated={animated} \
+                             settle={settle_ms}ms(legacy_2478={}) prompts={prompts_settled}->\
+                             {prompts_injected}->{prompts_late} state_late={state_late:?} \
+                             left_running={left_running_line} slow_shell={}",
                             std::env::var_os("TAKO_945_LEGACY").is_some(),
                             early.iter().cloned().fold(f32::MAX, f32::min),
                             early.iter().cloned().fold(f32::MIN, f32::max),
                             spread(&early),
+                            early.last().copied().unwrap_or(f32::NAN),
                             late.iter().cloned().fold(f32::MAX, f32::min),
                             late.iter().cloned().fold(f32::MIN, f32::max),
                             spread(&late),
                             idle_after.saturating_sub(idle_before),
+                            legacy_2478(),
+                            slow_shell.is_some(),
                         );
                         check(
                             animated && spread(&early) > 0.1,
@@ -94169,6 +94537,19 @@ mod self_test {
                                 spread(&early)
                             ),
                         );
+                        // 前提が崩れた回は ② と読み違えないよう先に名指す。旧の腕は修正前と同じく
+                        // ② で落ちる形のまま（上の診断の行が state_late / left_running を出す）
+                        if !legacy_2478() {
+                            check(
+                                state_late == Some(tako_core::CommandState::Running)
+                                    && prompts_late == prompts_injected,
+                                &format!(
+                                    "128: 測っている間に検証用ペインの実行状態が実シェルの印で動かない \
+                                     (脈動の前提。#2478。state {state_late:?} / prompts \
+                                     {prompts_injected}->{prompts_late} / left_running {left_running_line})"
+                                ),
+                            );
+                        }
                         check(
                             spread(&late) < 0.01
                                 && late.iter().all(|o| (o - 1.0).abs() < 0.01),
@@ -109593,6 +109974,160 @@ mod selftest_wait_watchdog {
         // 修正後の形（Tab と Enter を続けて押し、出力の行を状態で待つ）は通る
         let fixed = "                let (output, lines) = tab_enter_41c(any, window, cx, 1, \"x\", &[\"A\"]).await;";
         assert!(fixed_wait_before_enter(fixed).is_empty());
+    }
+
+    /// 側路の注入（OSC 133 を状態機械へ直に流す口）。`concat!` で分割して書く = 番犬自身の行が対象に入らない
+    const OSC_INJECT: &str = concat!("feed_osc", "_bytes(");
+    /// シェルの最初のプロンプトが届いた印（`TerminalSession::shell_marks().prompts`）を読む字面
+    const SHELL_MARKS: &str = concat!("shell", "_marks");
+    /// ペインの誕生（シェルを起こす口と、ペインを作る要求）
+    const PANE_BIRTHS: &[&str] = &[
+        concat!("spawn", "_session("),
+        concat!("Request::Tab", "New {"),
+        concat!("Request::Sp", "lit {"),
+    ];
+
+    /// 「ペインを作ってから、シェルの最初のプロンプトを待たずに側路で実行状態を注入する」形を探す（#2478）。
+    ///
+    /// 項目 128（#945）は検証用ペインを作ってから固定 1500ms 待ち、`feed_osc_bytes` で `133;A` / `133;C`
+    /// （Running）を注入していた。シェルの統合は `133;A` を precmd（プロンプトの直前）で出すので、rc の
+    /// 読み込みが固定待ちに間に合わない回（load 20）は、遅れて届いた実シェルの `133;A` が注入した Running を
+    /// Idle へ上書きした。脈動の途中で要素ごと消えるので不透明度は最後に計算した値（0.692）で止まり、
+    /// 「脈動の全長を過ぎたら止まる」で落ちた。正しい形は、注入の前に最初のプロンプトが届いた印
+    /// （`shell_marks().prompts`）を `wait_for_app_state` 等で待つこと。
+    ///
+    /// 見るのは、`feed_osc_bytes(` を呼ぶコードの行から上へ遡って最も近いペインの誕生（[`PANE_BIRTHS`]）までの
+    /// 間に `shell_marks` を読むコードの行があるか。上に誕生が無い（既にあるペインへ注入する）なら判定しない。
+    /// A/B の旧経路など意図して残す形は、その行か直前のコメント行に `tako:osc-inject-ok <理由>` を書く。
+    ///
+    /// 限界（字面の推定）: `shell_marks` を待ちではなく表示だけに使っても待ったと読む。誕生の字面に無い
+    /// 作り方（ヘルパの中で起こす等）は、さらに上の誕生まで遡る
+    fn inject_before_first_prompt(lines: &[(usize, &str)]) -> Vec<usize> {
+        const ALLOW: &str = concat!("tako:osc", "-inject-ok");
+        let code = |line: &str| {
+            let t = line.trim();
+            !t.is_empty() && !t.starts_with("//")
+        };
+        let marked = |line: &str| {
+            line.find(ALLOW)
+                .is_some_and(|p| !line[p + ALLOW.len()..].trim().is_empty())
+        };
+        let mut hits = Vec::new();
+        for (index, (number, line)) in lines.iter().enumerate() {
+            if !(code(line) && line.contains(OSC_INJECT)) {
+                continue;
+            }
+            let allowed = marked(line)
+                || lines[..index]
+                    .iter()
+                    .rev()
+                    .take_while(|(_, l)| l.trim_start().starts_with("//"))
+                    .any(|(_, l)| marked(l));
+            if allowed {
+                continue;
+            }
+            let nearest = lines[..index]
+                .iter()
+                .rev()
+                .map(|(_, l)| *l)
+                .filter(|l| code(l))
+                .find(|l| l.contains(SHELL_MARKS) || PANE_BIRTHS.iter().any(|b| l.contains(b)));
+            if nearest.is_some_and(|l| !l.contains(SHELL_MARKS)) {
+                hits.push(*number);
+            }
+        }
+        hits
+    }
+
+    #[test]
+    fn 実シェルのペインへ実行状態を注入する前に最初のプロンプトを待っている() {
+        use super::selftest_launch_withdraw_watchdog::self_test_region;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/self_test");
+        let mut hits: Vec<String> =
+            inject_before_first_prompt(&self_test_region(include_str!("main.rs")))
+                .into_iter()
+                .map(|line| format!("crates/tako-app/src/main.rs:{line}"))
+                .collect();
+        for entry in std::fs::read_dir(&dir).expect("src/self_test").flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap_or_default();
+            let lines: Vec<(usize, &str)> =
+                src.lines().enumerate().map(|(i, l)| (i + 1, l)).collect();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            hits.extend(
+                inject_before_first_prompt(&lines)
+                    .into_iter()
+                    .map(|line| format!("crates/tako-app/src/self_test/{name}:{line}")),
+            );
+        }
+        assert!(
+            hits.is_empty(),
+            "{hits:?} がペインを作ってから、シェルの最初のプロンプトを待たずに側路（feed_osc_bytes）で実行状態を\
+             注入している。rc の読み込みが遅れた回は、遅れて届いた実シェルの 133;A が注入した状態を上書きする（#2478）。\
+             注入の前に `shell_marks().prompts` を `wait_for_app_state` 等で待つこと。\
+             A/B の旧経路など意図して残すなら、その行か直前のコメント行に `tako:osc-inject-ok <理由>` を書く"
+        );
+    }
+
+    /// 検出力の担保: 修正前の項目 128 の形を名指し、最初のプロンプトを待つ形・印・既存のペインへの注入は許す
+    #[test]
+    fn 番犬はプロンプトを待たない注入を見逃さず待ちと印は許す() {
+        let numbered = |src: &str| -> Vec<(usize, String)> {
+            src.lines()
+                .enumerate()
+                .map(|(i, l)| (i + 1, l.to_string()))
+                .collect()
+        };
+        let hits = |src: &str| {
+            let owned = numbered(src);
+            let lines: Vec<(usize, &str)> = owned.iter().map(|(n, l)| (*n, l.as_str())).collect();
+            inject_before_first_prompt(&lines)
+        };
+        let birth = concat!(
+            "                let _ = app.spawn",
+            "_session(pane, options, cx);"
+        );
+        let fixed_wait = concat!("                wait(", "cx, 1500).await;");
+        let inject = concat!(
+            "                    session.feed_osc",
+            "_bytes(b\"\\x1b]133;C\\x07\");"
+        );
+        // 修正前の項目 128（誕生 → 固定 1500ms → 注入）
+        let bad = format!("{birth}\n{fixed_wait}\n{inject}");
+        assert_eq!(hits(&bad), vec![3]);
+        // ペインを作る要求でも誕生と読む・コメントの中の shell_marks は待ちと読まない
+        let tab_new = concat!("            tako_control::protocol::Request::Tab", "New {");
+        let commented = format!(
+            "{tab_new}\n                // {} を待つべき\n{fixed_wait}\n{inject}",
+            concat!("shell", "_marks")
+        );
+        assert_eq!(hits(&commented), vec![4]);
+        // 修正後の形（誕生 → 最初のプロンプトを状態で待つ → 注入）は通る
+        let wait_prompt = concat!(
+            "                    .map_or(0, |s| s.shell",
+            "_marks().prompts)"
+        );
+        let good = format!("{birth}\n{wait_prompt}\n{inject}");
+        assert!(hits(&good).is_empty());
+        // 理由つきの印（直前のコメント行・同じ行）は外す。理由の無い印では外さない
+        let allow = concat!("tako:osc", "-inject-ok");
+        let marked =
+            format!("{birth}\n{fixed_wait}\n                // {allow} A/B の旧経路\n{inject}");
+        assert!(hits(&marked).is_empty());
+        let same_line = format!("{birth}\n{fixed_wait}\n{inject} // {allow} 旧経路");
+        assert!(hits(&same_line).is_empty());
+        let bare = format!("{birth}\n{fixed_wait}\n                // {allow}\n{inject}");
+        assert_eq!(hits(&bare), vec![4]);
+        // 上に誕生が無い（既にあるペインへ注入する）なら判定しない・コメントの中の注入は見ない
+        assert!(hits(&format!("{fixed_wait}\n{inject}")).is_empty());
+        assert!(hits(&format!("{birth}\n                // {}", inject.trim())).is_empty());
     }
 }
 

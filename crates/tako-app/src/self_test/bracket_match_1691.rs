@@ -15,6 +15,11 @@
 //! 画像は判定の前に `TAKO_VISUAL_DUMP_DIR` へ `bracket-match-1-matched.png` /
 //! `bracket-match-2-unmatched.png` で落とす（新旧で dir を分けて回す）。
 //! `TAKO_1691_LEGACY=1` は対応括弧を探さないので ① が FAILED = 同一バイナリでの A/B。
+//!
+//! fixture（`.rs` = 構文でコメントと文字列を飛ばす）の言語サーバは節の頭で実行できないパスへ
+//! 差し替え、未導入の帯が着地してから基準を撮る（#2716。前の節の解決が節の途中に着地すると帯が
+//! 器を縮めて ② / ③ が落ちる）。旧の形は `TAKO_2716_LEGACY=bracket-match`、着地の遅れの注入は
+//! `TAKO_2716_INJECT=late-band,resolve-ms=400`（旧の形は ② が名指しで落ち、新しい形は通る）。
 //! 単独実行は `TAKO_VISUAL_ONLY=bracket-match`
 
 use super::*;
@@ -101,6 +106,22 @@ pub(super) async fn bracket_match_visual(
     std::fs::create_dir_all(&dir).expect("visual-test bracket-match 一時ディレクトリ");
     let path = dir.join("brackets.rs");
     std::fs::write(&path, SOURCE).expect("visual-test bracket-match の素材");
+    // #2716: fixture の言語サーバはこの節で決める（実行できないパスへ差し替え = どの機でもすぐ
+    // 未導入になる。前の節が覚えた解決は restart の口で捨てる）。決めないと前の節が始めた解決
+    // （隔離 HOME で動かない PATH の rust-analyzer。動く機なら本物の RA の診断）が節の途中に着地し、
+    // 未導入の帯が器を縮めて基準の画素からずれた（全節実行の 1/7 が ② で落ちた）。
+    // 注入 `late-band`（旧の形の A/B 用）は同じ差し替えを前の節が残した形として当て、帯の着地の
+    // 時刻を `resolve-ms=<ミリ秒>` だけで決める（旧の形は待たずに基準を撮るので、帯が後から出る）
+    let fixed = !legacy_2716("bracket-match");
+    let server = (fixed || inject_2716("late-band")).then(|| {
+        vt_lsp_override(
+            window,
+            cx,
+            vt_lsp_server_of(&path),
+            Some(&dir.join("no-such-server")),
+        )
+    });
+    let opened_at = std::time::Instant::now();
 
     let pane = window
         .update(cx, |app, _, cx| {
@@ -154,6 +175,34 @@ pub(super) async fn bracket_match_visual(
         editing,
         &format!("visual-test {SECTION}: 前提 = 編集モードを開始できる"),
     );
+    if fixed {
+        // #2716: 言語サーバの状態（未導入の帯）が着地してから基準を撮る
+        let settled = wait_for_app_state(
+            window,
+            cx,
+            "bracket-match-lsp",
+            Duration::from_secs(30),
+            |app| {
+                app.lsp_document_server(pane)
+                    .is_some_and(|s| vt_lsp_settled(&s))
+            },
+        )
+        .await;
+        let state = window
+            .update(cx, |app, _, _| {
+                app.lsp_document_server(pane)
+                    .map(|s| (s.state.slug(), s.held))
+            })
+            .ok()
+            .flatten();
+        println!("TAKO_VISUAL_PIXEL: {SECTION} lsp settled={settled} state={state:?}");
+        check(
+            settled,
+            &format!(
+                "visual-test {SECTION}: 前提 = 言語サーバの状態が落ち着いてから基準を撮る（{state:?}）(#2716)"
+            ),
+        );
+    }
 
     // カーソルを置いて応答の `document.bracket_match` を返す（CLI / MCP と同じ dispatch）
     let place = |cx: &mut AsyncApp, line: usize, col: usize| -> serde_json::Value {
@@ -217,6 +266,20 @@ pub(super) async fn bracket_match_visual(
     }
     let (reference, scale) = capture_frame(any, cx)
         .unwrap_or_else(|| fail(&format!("visual-test {SECTION}: 基準のフレームを撮れない")));
+    // 開いてから基準を撮るまでと、そのときの言語サーバの状態（#2716 の注入の時刻合わせの手掛かり）
+    let lsp_state = |cx: &mut AsyncApp| {
+        window
+            .update(cx, |app, _, _| {
+                app.lsp_document_server(pane).map(|s| s.state.slug())
+            })
+            .ok()
+            .flatten()
+    };
+    println!(
+        "TAKO_VISUAL_PIXEL: {SECTION} reference after_open_ms={} lsp={:?}",
+        opened_at.elapsed().as_millis(),
+        lsp_state(cx)
+    );
 
     // 文字 1 つぶんの矩形（論理 px。行は 0 始まり）
     let cell = |cx: &mut AsyncApp, line: usize, col: usize| -> Bounds<Pixels> {
@@ -345,6 +408,11 @@ pub(super) async fn bracket_match_visual(
         "TAKO_VISUAL_PIXEL: {SECTION} ③ lone={lone} lone_box={lone_changed}/{lone_area} \
          quoted={quoted_changed} stale_open={stale_open} stale_close={stale_close}"
     );
+    println!(
+        "TAKO_VISUAL_PIXEL: {SECTION} end after_open_ms={} lsp={:?}",
+        opened_at.elapsed().as_millis(),
+        lsp_state(cx)
+    );
     check(
         lone.is_null(),
         &format!("③ 対の無い `(` の直前では bracket_match が null（実際: {lone}）(#1691)"),
@@ -374,5 +442,8 @@ pub(super) async fn bracket_match_visual(
         );
         cx.notify();
     });
+    if let Some(server) = server {
+        vt_lsp_override(window, cx, server, None);
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

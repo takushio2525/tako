@@ -16,6 +16,7 @@
 #   7. skip されたチェック（docs だけの PR の macOS / Windows）は完了・緑として数える（#2084）
 #   8. 上限に達した = 失敗ではない。最後にもう一度見て、そろっていれば緑・赤の結論を出す（#2047）
 #   9. gh の一時的な接続エラーはやり直し、届かないままなら到達性の 5 で終わる（赤の 1 と分ける。#1704）
+#  10. 書き込みの最中に子の SIGCHLD が届いても結論の行と終了コードが崩れない（bash 3.2 の EINTR。#2690）
 # 併せて期待名の導出（pull_request で起動する job のみ / name 無しは job id）と、
 # merge-pr.sh が「揃っていないときに merge を呼ばない」ことも見る。
 #
@@ -30,6 +31,8 @@
 #   「5 のはずが 1・到達性の名指しが無い」と同じ 2 件の FAIL を起こす（手掛かりが出ることの確認用）:
 #     merge-rc = 偽 gh が merge.rc を読めず、gh pr merge が 0 で終わったことになる
 #     classify = merge-pr.sh の接続エラーの判定（grep）が 1 回だけ一致しない
+#   TAKO_2690_T41_RUNS=<回数>（既定 3）= Test 41（いつも満杯の FIFO）の腕ごとの回数。
+#   TAKO_2690_SLOWPIPE_WIDE_US=<マイクロ秒> = Test 41 の詰め物を書く前の待ち（窓を広げても落ちないことを見る）
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$PWD"
@@ -1304,6 +1307,136 @@ while IFS= read -r line; do
 done < "${TMP}/t40.out"
 assert_eq "既定の間隔は倍々（1, 2, 4, 8 秒）" "$(sed -n 's/^DELAYS //p' "${TMP}/t40.out")" "1 2 4 8 "
 assert_eq "既定の待ちの合計は 15 秒" "$(sed -n 's/^TOTAL //p' "${TMP}/t40.out")" "15"
+
+echo "== Test 41: 書き込みの最中に子の SIGCHLD が届いても結論の行と終了コードが崩れない（#2690）=="
+# CI の macOS の /bin/bash 3.2 は SIGCHLD を SA_RESTART なしで受ける（4.2 から付く）。待たずに
+# 走らせた子（プロセス置換・背景の &）が終わった瞬間にシェルが stdout / stderr への write の中で
+# 待っていると、echo が `write error: Interrupted system call` で落ちてその行が消え（macOS の libc は
+# その行のバッファを捨てる）、set -e で 1 で抜ける。CI では読み手の tee と同じパイプを取り合った
+# 一瞬だけなので間欠だった（t38red の結論の行・t39merge の 5 が 1）。ここでは腕の stdout / stderr を
+# 「いつも満杯」の FIFO にして write を毎回待たせ、その一瞬を毎回にする（負荷は生成しない）。
+# 読み手は 1 ms ごとに 32 バイトだけ空け、腕が書いたら・512 バイト空けても書かなければ詰め物の NUL で
+# 満杯へ戻す（ただ遅く読むだけだと、腕が書かない間に空きが溜まって結論の行の write が待たない）。
+# 詰め物は**別に開いた**非塞の書き口から書く: O_NONBLOCK は開いた口ごとの属性で dup した口は共有する
+# ので、腕と同じ口で切り替えると、その間の腕の write が EAGAIN（Resource temporarily unavailable）で
+# 落ちる（機が重いと窓が広がり bash 5 でも落ちた = #2690 の差し戻し。名前の無いパイプは開き直せないので FIFO）。
+# 修正前の形（`done < <( … )`）は 3.2 で毎回落ちる（結果の行は出て、結論の行だけが消えて 1）。
+#   TAKO_2690_T41_RUNS=<回数>（既定 3）で腕ごとの回数を、TAKO_2690_SLOWPIPE_WIDE_US=<マイクロ秒> で
+#   詰め物を書く前の待ちを足せる（窓を広げても腕が落ちないことを手元で確かめる用）
+SLOWPIPE="${TMP}/slowpipe.pl"
+cat > "${SLOWPIPE}" <<'PL_EOF'
+# 使い方: perl slowpipe.pl <FIFO を置く dir> <コマンド...>。詰め物を除いた出力をそのまま出し、コマンドの終了コードで終わる
+use strict;
+use warnings;
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK O_RDONLY O_WRONLY);
+use POSIX qw(:sys_wait_h mkfifo EAGAIN);
+use Time::HiRes qw(usleep);
+my $wide = $ENV{TAKO_2690_SLOWPIPE_WIDE_US} || 0;
+my $dir = shift @ARGV;
+my $FIONREAD = $^O eq 'darwin' ? 0x4004667f : 0x541B;
+my $fifo = "$dir/slowpipe.$$.fifo";
+mkfifo($fifo, 0600) or die "mkfifo: $!";
+# 読み手・詰め物の書き口・腕の書き口は、それぞれ別に開く（詰め物の口だけがずっと非塞）
+sysopen(my $r, $fifo, O_RDONLY | O_NONBLOCK) or die "open r: $!";
+sysopen(my $fill_w, $fifo, O_WRONLY | O_NONBLOCK) or die "open fill: $!";
+# 詰め物の NUL で満杯にする（PIPE_BUF 以下の write は丸ごとか 0 なので、小さい塊へ落としていく）
+sub refill {
+  usleep($wide) if $wide;
+  for my $chunk (512, 64, 8, 1) {
+    while (1) {
+      my $n = syswrite($fill_w, "\0" x $chunk);
+      last unless defined $n && $n > 0;
+    }
+  }
+}
+sub avail {
+  my $b = pack('L', 0);
+  ioctl($r, $FIONREAD, $b) or die "FIONREAD: $!";
+  return unpack('L', $b);
+}
+refill();
+my $pid = fork();
+die "fork: $!" unless defined $pid;
+if ($pid == 0) {
+  close $r;
+  close $fill_w;
+  sysopen(my $w, $fifo, O_WRONLY) or die "open w: $!";
+  open(STDOUT, '>&', $w) or die;
+  open(STDERR, '>&', $w) or die;
+  close $w;
+  exec @ARGV or die "exec: $!";
+}
+binmode STDOUT;
+$| = 1;
+my $status = 0;
+my $expect = avail();    # 前の回に読んだ後に残っているはずの量（増えていれば腕が書いた）
+my $freed = 0;           # 満杯へ戻してから空けた量
+while (1) {
+  if (waitpid($pid, WNOHANG) == $pid) { $status = $?; last; }
+  my $now = avail();
+  if ($now > $expect || $freed >= 512) {
+    refill();
+    $freed = 0;
+    $now = avail();
+  }
+  my $n = sysread($r, my $buf, 32);
+  if (!defined $n) {
+    die "read: $!" unless $! == EAGAIN;
+    ($n, $buf) = (0, '');
+  }
+  $buf =~ tr/\0//d;
+  print $buf;
+  $freed += $n;
+  $expect = $now - $n;
+  usleep(1000);
+}
+close $fill_w;
+fcntl($r, F_SETFL, fcntl($r, F_GETFL, 0) & ~O_NONBLOCK) or die "fcntl: $!";
+while (1) {
+  my $n = sysread($r, my $buf, 65536);
+  last if !defined $n || $n == 0;
+  $buf =~ tr/\0//d;
+  print $buf;
+}
+unlink $fifo;
+exit($status & 127 ? 128 + ($status & 127) : $status >> 8);
+PL_EOF
+run_wait_slow() { (cd "${CASE_DIR}/repo" && record_run perl "${SLOWPIPE}" "${TMP}" bash "${WAIT_SH}" "$@"); }
+run_merge_slow() { (cd "${CASE_DIR}/repo" && record_run perl "${SLOWPIPE}" "${TMP}" bash "${MERGE_SH}" "$@"); }
+T41_RUNS="${TAKO_2690_T41_RUNS:-3}"
+[[ "${T41_RUNS}" =~ ^[1-9][0-9]*$ ]] || T41_RUNS=3
+t41=0
+while [[ ${t41} -lt ${T41_RUNS} ]]; do
+  t41=$((t41 + 1))
+  new_case "t41red${t41}"
+  checks_json "${CF}|pass|2026-09-24T04:24:00Z" "${MAC}|fail|2026-09-24T04:56:50Z" "${WIN}|pass|2026-09-24T04:49:33Z" \
+    > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+  out="$(run_wait_slow 1669 --timeout 20 --interval 1)"
+  assert_eq "赤は 1（${t41} 回目）" "$?" "1"
+  assert_has "赤の結論の行が欠けない（${t41} 回目）" "失敗しているチェックが 1 本ある。merge してはいけない" "${out}"
+  assert_has "赤の一覧の行が欠けない（${t41} 回目）" "[pass] ${CF} — 完了" "${out}"
+  assert_hasnt "赤で書き込みが割り込まれない（${t41} 回目）" "write error" "${out}"
+
+  new_case "t41green${t41}"
+  green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+  out="$(run_wait_slow 1669 --timeout 20 --interval 1)"
+  assert_eq "緑は 0（${t41} 回目）" "$?" "0"
+  assert_has "緑の結論の行が欠けない（${t41} 回目）" "CI が全部緑で揃った" "${out}"
+  assert_hasnt "緑で書き込みが割り込まれない（${t41} 回目）" "write error" "${out}"
+
+  # #2690 の最初の観測（t39merge）と同じ腕: 待ちの子（wait-pr-checks.sh）の結論が化けると 5 が 1 になる
+  new_case "t41merge${t41}"
+  printf '%s\n' "${VIEW_OK}" > "${TAKO_GH_MOCK_DIR}/view.json"
+  green_checks > "${TAKO_GH_MOCK_DIR}/checks.1.json"
+  : > "${TAKO_GH_MOCK_DIR}/merge.not-merged"
+  echo 1 > "${TAKO_GH_MOCK_DIR}/merge.rc"
+  printf 'error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com\n' \
+    > "${TAKO_GH_MOCK_DIR}/merge.err"
+  out="$(run_merge_slow 1669 --timeout 20 --interval 1)"
+  assert_eq "merge が届かなければ 5（${t41} 回目）" "$?" "5"
+  assert_has "merge しない理由に到達性を名指しする（${t41} 回目）" "merge しない: gh pr merge が GitHub API に届かなかった" "${out}"
+  assert_hasnt "merge で書き込みが割り込まれない（${t41} 回目）" "write error" "${out}"
+done
 
 echo
 echo "=== 結果: PASS=${PASS} FAIL=${FAIL} ==="
