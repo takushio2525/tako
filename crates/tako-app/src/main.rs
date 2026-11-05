@@ -1367,6 +1367,39 @@ fn sync_session_catalog(
     }
 }
 
+/// 走査で分かった会話をカタログと worker レジストリへ書く。**background から呼ぶ**。
+/// persist ON の走査と persist OFF の mod の報告だけの腕（#2753）が同じ 1 実装を通る
+fn record_detected_sessions(
+    detected: &[tako_control::sessions::DetectedSession],
+    pane_meta: &[tako_control::sessions::PaneMetaSnapshot],
+) {
+    if detected.is_empty() {
+        // #2020: claude を 1 本も検出しなかった = 会話がすべて終わった。
+        // 溜めていた「最後に見えた時刻」をここで書く（無ければ I/O しない）
+        sync_session_catalog(&[], &[]);
+        return;
+    }
+    sync_session_catalog(detected, pane_meta);
+    // #390: worker レジストリへも session_id を反映
+    // （prompt 到達の証跡。未変更ならファイル書き込みしない）
+    // #728: 器が無ければペイン ID キーで引く
+    for d in detected {
+        use tako_control::orchestrator::registry;
+        let result = match (&d.tmux_session, d.pane) {
+            (Some(ts), _) => registry::record_session_detected(ts, &d.session_id),
+            (None, Some(pane)) => registry::record_session_detected_by_pane(pane, &d.session_id),
+            (None, None) => Ok(()),
+        };
+        if let Err(e) = result {
+            eprintln!("warning: worker レジストリの session 反映に失敗: {e}");
+        }
+    }
+    // #1638: 会話の分かった worker の実際のモデルを transcript で確かめる
+    // （spawn 直後はこの走査が即時に回る）。食い違いは persist.log へ 1 行。
+    // 未確定の worker が居なければ transcript には触らない
+    tako_control::orchestrator::registry::observe_pending_models();
+}
+
 /// persist 診断ログ（Issue #30）: `<data_dir>/persist.log` へ追記 + stderr へも出す
 /// （ターミナル起動時に見える）。Dock 起動の .app では stderr が届かないため、
 /// 「再起動でタブが消えた」原因をファイルで追えるようにする。
@@ -6606,6 +6639,11 @@ impl TakoApp {
         // ペインごとに保存して `claude --resume` へ使う。外部コマンドは background で実行し、
         // 検出失敗時は直前の成功値を壊さない。既存 persist トグルが CLI / MCP 共通の制御点。
         //
+        // #2753: 門は `sessions::scan_plan`（純関数）だけが決める。persist OFF でもセッションカタログと
+        // worker レジストリの会話 ID は tako mod の報告から書く（`plan.processes` が偽 = 子プロセスの走査と
+        // 復元の種は持たない）。修正前は persist OFF で一度も書かず、隔離 GUI で起こした master の会話が
+        // `tako sessions show` から引けなかった
+        //
         // #368: Node 起動コスト削減。3 層で無駄を排除する:
         //   1) 間隔延長（5s→30s）+ イベント駆動即時スキャン（spawn / PromptFlow 完了）
         //   2) 前段ガード: バックエンドに実行中子プロセスがなければ Node 起動を丸ごとスキップ
@@ -6631,8 +6669,8 @@ impl TakoApp {
                 // #2017: mod の報告に会話 ID が新しく載っているペインは `claude agents --json` に
                 // 問わない（`from_mod`。判断は監視と同じ `claude_mod::monitor_plan`）。走査が要るのは
                 // 残りのペイン（`scan_backends` / `scan_pids`）に居る claude だけ
-                let (should_scan, backends, pane_pids, probes, scan_backends, scan_pids, from_mod) =
-                    this.update(cx, |app: &mut TakoApp, _| {
+                let (plan, backends, pane_pids, probes, scan_backends, scan_pids, from_mod) = this
+                    .update(cx, |app: &mut TakoApp, _| {
                         let mut backends: Vec<String> = Vec::new();
                         // 器を持たないペインの (tako ペイン ID, PTY 直下の子 pid)
                         let mut pane_pids: Vec<(u64, u32)> = Vec::new();
@@ -6699,13 +6737,18 @@ impl TakoApp {
                                 pty_pid,
                             });
                         }
-                        let should = app.tmux_persist
-                            && !app.secondary
-                            && !(backends.is_empty() && pane_pids.is_empty())
-                            && std::env::var_os("TAKO_SELF_TEST").is_none();
-                        match should {
+                        let plan = tako_control::sessions::scan_plan(
+                            tako_control::sessions::ScanGate {
+                                persist: app.tmux_persist,
+                                secondary: app.secondary,
+                                self_test: std::env::var_os("TAKO_SELF_TEST").is_some(),
+                                has_targets: !(backends.is_empty() && pane_pids.is_empty()),
+                            },
+                            tako_control::sessions::legacy_2753(),
+                        );
+                        match plan.catalog {
                             true => (
-                                true,
+                                plan,
                                 backends,
                                 pane_pids,
                                 probes,
@@ -6717,11 +6760,26 @@ impl TakoApp {
                         }
                     })
                     .unwrap_or_default();
-                if !should_scan {
+                if !plan.catalog {
                     last_scan = Some(std::time::Instant::now());
                     // #2020: 走査しない間も、溜めた last_seen_at は書く（無ければ I/O しない）
                     cx.background_executor()
                         .spawn(async { sync_session_catalog(&[], &[]) })
+                        .await;
+                    continue;
+                }
+                if !plan.processes {
+                    // #2753: persist OFF。子プロセスを 1 本も起こさず（前段ガード・`claude agents --json`・
+                    // codex / agy の採取をしない）、復元の種（resume の写し・layout.json）にも触らない。
+                    // 書くのは mod の報告が答えた会話だけ（カタログ + worker レジストリ）
+                    last_scan = Some(std::time::Instant::now());
+                    let pane_meta =
+                        this.update(cx, |app: &mut TakoApp, _| app.collect_pane_meta_snapshots());
+                    let Ok(pane_meta) = pane_meta else {
+                        break;
+                    };
+                    cx.background_executor()
+                        .spawn(async move { record_detected_sessions(&from_mod, &pane_meta) })
                         .await;
                     continue;
                 }
@@ -6856,46 +6914,9 @@ impl TakoApp {
                     break;
                 };
                 // カタログの書き込み（ファイルロック + アトミック書き込み）は background で
-                if !detected.is_empty() {
-                    cx.background_executor()
-                        .spawn(async move {
-                            sync_session_catalog(&detected, &pane_meta);
-                            // #390: worker レジストリへも session_id を反映
-                            // （prompt 到達の証跡。未変更ならファイル書き込みしない）
-                            // #728: 器が無ければペイン ID キーで引く
-                            for d in &detected {
-                                use tako_control::orchestrator::registry;
-                                let result = match (&d.tmux_session, d.pane) {
-                                    (Some(ts), _) => {
-                                        registry::record_session_detected(ts, &d.session_id)
-                                    }
-                                    (None, Some(pane)) => {
-                                        registry::record_session_detected_by_pane(
-                                            pane,
-                                            &d.session_id,
-                                        )
-                                    }
-                                    (None, None) => Ok(()),
-                                };
-                                if let Err(e) = result {
-                                    eprintln!(
-                                        "warning: worker レジストリの session 反映に失敗: {e}"
-                                    );
-                                }
-                            }
-                            // #1638: 会話の分かった worker の実際のモデルを transcript で確かめる
-                            // （spawn 直後はこの走査が即時に回る）。食い違いは persist.log へ 1 行。
-                            // 未確定の worker が居なければ transcript には触らない
-                            tako_control::orchestrator::registry::observe_pending_models();
-                        })
-                        .await;
-                } else {
-                    // #2020: claude を 1 本も検出しなかった = 会話がすべて終わった。
-                    // 溜めていた「最後に見えた時刻」をここで書く（無ければ I/O しない）
-                    cx.background_executor()
-                        .spawn(async { sync_session_catalog(&[], &[]) })
-                        .await;
-                }
+                cx.background_executor()
+                    .spawn(async move { record_detected_sessions(&detected, &pane_meta) })
+                    .await;
             }
         })
         .detach();

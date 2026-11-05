@@ -27,6 +27,21 @@
 //! ファイルは `<data_dir>/sessions.yaml`（`TAKO_SESSIONS_FILE` で上書き可。隔離検証用）。
 //! 書き込みは config_io（排他 flock + アトミック書き込み + 世代バックアップ。#169）。
 //!
+//! ## 走査の門と persist の切り分け（#2753）
+//!
+//! GUI の走査は**器の永続化（persist）の機能として**生まれ（再起動後の `claude --resume` の種）、
+//! カタログはそこへ相乗りしていた。修正前は門に `tmux_persist` が入っていたので、persist が OFF
+//! （`TAKO_ISOLATED=1` の既定 = `TAKO_PERSIST=0`・設定で永続化を切った利用者）の間は**一度も書かれず**、
+//! 新しく起こした master の会話が `tako sessions show` から永久に引けなかった。いまの門は
+//! [`scan_plan`]（純関数）が決め、persist OFF でもカタログと worker レジストリの会話 ID（#390）は
+//! **tako mod の報告**から書く。子プロセスの走査（`claude agents --json`・codex / agy の採取）と
+//! 復元の種（layout.json）は persist の門に残す: 走査の既定の設定 dir は必ず起こされ（#1011）、
+//! claude 本体は起動のたびに `~/.claude.json` を書き戻す（#944）ので、persist OFF の隔離 GUI から
+//! 利用者の設定へ書く経路を作らない。
+//!
+//! 反映の遅れ（案 B）: mod の報告がカタログに無い会話 ID を運んだら、次の確認（5 秒ごと）で走査する
+//! （[`note_mod_session`]。同じ会話 ID では 1 回だけ）。A/B は `TAKO_2753_LEGACY=1`（両方とも修正前へ）
+//!
 //! ## 走査ごとの書き込みの間引き（#2020）
 //!
 //! GUI の走査は 30 秒ごとに検出した会話の `last_seen_at` を今の時刻へ進める。修正前は
@@ -431,7 +446,123 @@ pub fn sync_detected_at(
     }
     let mut throttles = throttles().lock().unwrap_or_else(|e| e.into_inner());
     let throttle = throttles.entry(path.to_path_buf()).or_default();
-    sync_detected_throttled(path, detected, panes, unix_now(), throttle).map(|_| ())
+    let result = sync_detected_throttled(path, detected, panes, unix_now(), throttle).map(|_| ());
+    // #2753: 書いた後のカタログの会話 ID を案 B の間引きへ写す（mod の報告の受け口は UI スレッドなので、
+    // そちらはこの写しだけを短い錠で読む = ファイルにも上の錠にも触らない）
+    if result.is_ok() && !legacy_2753() {
+        mod_scan_trigger()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_catalog(&throttle.catalog_ids);
+    }
+    result
+}
+
+/// #2753 の A/B。`TAKO_2753_LEGACY=1` で**同一バイナリのまま**修正前へ戻す
+/// （走査の門に persist を入れる = persist OFF ではカタログを書かない・mod の報告で走査を早めない）
+pub fn legacy_2753() -> bool {
+    std::env::var_os("TAKO_2753_LEGACY").is_some_and(|v| !v.is_empty())
+}
+
+/// GUI の会話の走査の門の材料（#2753。[`scan_plan`] へ渡す）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanGate {
+    /// 器の永続化（`tmux_persist`）が有効か
+    pub persist: bool,
+    /// セカンダリの tako（同じ data dir の別の tako が居る。プライマリのカタログを汚さない）
+    pub secondary: bool,
+    /// セルフテスト中（ユーザーのカタログ・レジストリを汚さない）
+    pub self_test: bool,
+    /// 走査の対象（器のセッション / 器を持たないペインの PTY の子）が 1 つでもあるか
+    pub has_targets: bool,
+}
+
+/// GUI の会話の走査で何をするか（#2753）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanPlan {
+    /// 検出した会話 ID をカタログ（sessions.yaml）と worker レジストリ（#390）へ書く。
+    /// これが偽なら何もしない（溜めた `last_seen_at` の書き出しだけ = #2020）
+    pub catalog: bool,
+    /// 子プロセスを走査する（前段ガード・`claude agents --json`・codex / agy の会話 ID の採取）と、
+    /// 復元の種（ペイン → 会話の写し・limit-resume の既定の適用・layout.json の書き出し）。
+    /// 偽なら検出は **tako mod の報告だけ**（子プロセスを 1 本も起こさない）
+    pub processes: bool,
+}
+
+/// GUI の会話の走査の門（#2753。純関数 = 門の正本。`tako-app` の走査ループはこれだけを見る）。
+///
+/// - セカンダリ・セルフテスト・対象なしは修正前と同じく何もしない
+/// - persist ON は修正前と同じ（走査 + 復元の種 + カタログ）
+/// - persist OFF はカタログと worker レジストリだけを mod の報告から書く（修正前は何もしなかった）
+/// - `legacy`（`TAKO_2753_LEGACY=1`）は修正前（persist OFF では何もしない）
+pub fn scan_plan(gate: ScanGate, legacy: bool) -> ScanPlan {
+    let base = !gate.secondary && !gate.self_test && gate.has_targets;
+    let full = base && gate.persist;
+    ScanPlan {
+        catalog: full || (base && !legacy),
+        processes: full,
+    }
+}
+
+/// mod の報告で走査を早めるときの間引き（#2753 の案 B。純粋な状態 = 単体テストが直接回す）。
+///
+/// 走査を頼むのは「カタログに無い・まだ頼んでいない」会話 ID だけ。heartbeat（15 秒ごと）の報告が
+/// 同じ会話 ID を運び続けても、走査は 1 回しか頼まない
+#[derive(Debug, Default)]
+pub struct ModScanTrigger {
+    /// 直前の同期で読み直したカタログの会話 ID
+    in_catalog: BTreeSet<String>,
+    /// 走査を頼んだ会話 ID（カタログに載れば `in_catalog` 側で答える）
+    requested: BTreeSet<String>,
+}
+
+/// 頼んだ会話 ID の覚えの上限。越えたら空にして数え直す（最悪でも 1 会話につき走査をもう 1 回頼むだけ）
+const MOD_SCAN_REQUESTED_MAX: usize = 4096;
+
+impl ModScanTrigger {
+    /// 同期が読み直したカタログの会話 ID を写す（書いた後の内容）
+    pub fn note_catalog(&mut self, ids: &BTreeSet<String>) {
+        self.in_catalog.clone_from(ids);
+        self.requested.retain(|id| !ids.contains(id));
+    }
+
+    /// 報告が運んだ会話 ID で走査を頼むべきか。頼むなら覚える（同じ会話 ID では二度と頼まない）
+    pub fn should_request(&mut self, session_id: &str) -> bool {
+        if !crate::transcript::is_valid_session_id(session_id)
+            || self.in_catalog.contains(session_id)
+            || self.requested.contains(session_id)
+        {
+            return false;
+        }
+        if self.requested.len() >= MOD_SCAN_REQUESTED_MAX {
+            self.requested.clear();
+        }
+        self.requested.insert(session_id.to_string());
+        true
+    }
+}
+
+fn mod_scan_trigger() -> &'static Mutex<ModScanTrigger> {
+    static TRIGGER: OnceLock<Mutex<ModScanTrigger>> = OnceLock::new();
+    TRIGGER.get_or_init(|| Mutex::new(ModScanTrigger::default()))
+}
+
+/// 受け付けた tako mod の報告が運んだ会話 ID（#2753 の案 B。GUI の UI スレッドの受け口から呼ぶ）。
+///
+/// カタログに無い新しい会話 ID なら走査を頼み（[`crate::request_claude_scan`]。GUI の走査ループは
+/// 5 秒ごとの確認でこれを拾う）、頼んだかを返す。ファイルには触らない（同期が写した会話 ID を読むだけ）
+pub fn note_mod_session(session_id: &str) -> bool {
+    if legacy_2753() {
+        return false;
+    }
+    let request = mod_scan_trigger()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .should_request(session_id);
+    if request {
+        crate::request_claude_scan();
+    }
+    request
 }
 
 /// 溜めた `last_seen_at` を書き出す（GUI の終了時。#2020）。溜めた分が無ければ I/O しない
@@ -485,6 +616,9 @@ pub struct LastSeenThrottle {
     unflushed: BTreeMap<String, String>,
     /// このプロセスが最後に書いた時刻（unix 秒）。`None` = まだ書いていない
     last_flush: Option<i64>,
+    /// 直前の同期で読み直したカタログ（書いた後の内容）の会話 ID（#2753。mod の報告が運んだ会話 ID が
+    /// 「カタログに無い」かを I/O なしで答えるための写し）
+    catalog_ids: BTreeSet<String>,
 }
 
 impl LastSeenThrottle {
@@ -547,11 +681,14 @@ pub fn sync_detected_throttled(
     }
     throttle.detected = ids;
     if !(structural || set_changed || due) {
+        // 構造が変わっていない = 会話 ID の集合はファイルと同じ
+        throttle.catalog_ids = next.entries.keys().cloned().collect();
         return Ok(SyncWrite::Skipped);
     }
     let written = write_catalog(path, &base, &next, structural)?;
     throttle.unflushed.clear();
     throttle.last_flush = Some(now_secs);
+    throttle.catalog_ids = next.entries.keys().cloned().collect();
     Ok(written)
 }
 
@@ -3338,5 +3475,151 @@ mod tests {
         let mut seen = base.clone();
         seen.last_seen_at = iso(T0 + SCAN);
         assert!(entry_eq_except_last_seen(&base, &seen));
+    }
+
+    // --- #2753: 走査の門（persist OFF でもカタログを書く）と mod の報告で走査を早める間引き -----
+
+    fn gate_2753(persist: bool, secondary: bool, self_test: bool, has_targets: bool) -> ScanGate {
+        ScanGate {
+            persist,
+            secondary,
+            self_test,
+            has_targets,
+        }
+    }
+
+    #[test]
+    fn issue2753_門はpersist_offでもカタログを書き_子プロセスの走査と復元の種はpersistに残す() {
+        let both = ScanPlan {
+            catalog: true,
+            processes: true,
+        };
+        let catalog_only = ScanPlan {
+            catalog: true,
+            processes: false,
+        };
+        let none = ScanPlan::default();
+        // persist ON は修正前と同じ（走査 + 復元の種 + カタログ）
+        assert_eq!(scan_plan(gate_2753(true, false, false, true), false), both);
+        // persist OFF（隔離 GUI の既定 = 報告の再現条件）: カタログだけ・子プロセスは起こさない
+        assert_eq!(
+            scan_plan(gate_2753(false, false, false, true), false),
+            catalog_only
+        );
+        // セカンダリ・セルフテスト・対象なしは persist に関係なく何もしない（修正前と同じ）
+        for persist in [true, false] {
+            assert_eq!(
+                scan_plan(gate_2753(persist, true, false, true), false),
+                none
+            );
+            assert_eq!(
+                scan_plan(gate_2753(persist, false, true, true), false),
+                none
+            );
+            assert_eq!(
+                scan_plan(gate_2753(persist, false, false, false), false),
+                none
+            );
+        }
+        // A/B（TAKO_2753_LEGACY=1）: persist OFF では何もしない = 修正前
+        assert_eq!(scan_plan(gate_2753(false, false, false, true), true), none);
+        assert_eq!(scan_plan(gate_2753(true, false, false, true), true), both);
+        // 「子プロセスを走査するならカタログも書く」はどの組でも崩れない
+        for bits in 0..32u8 {
+            let b = |i: u8| bits & (1 << i) != 0;
+            let plan = scan_plan(gate_2753(b(0), b(1), b(2), b(3)), b(4));
+            assert!(!plan.processes || plan.catalog, "{bits:05b}: {plan:?}");
+        }
+    }
+
+    #[test]
+    fn issue2753_modの報告だけで新しいmasterの会話がカタログへ載りshowで引ける() {
+        // persist OFF の腕が書くのは mod の報告の検出だけ（器なし = ペイン ID が対応キー）。
+        // master は pending を持たないので、ペインの role から kind / profile が決まる
+        let t = tako_core::test_residue::ScratchDir::new("t2753-mod-only");
+        let path = t.path().join("sessions.yaml");
+        let detected: Vec<DetectedSession> =
+            detected_from_mod(7, None, ID_A, Some("claude-opus-5"))
+                .into_iter()
+                .collect();
+        assert_eq!(detected.len(), 1);
+        let panes = [PaneMetaSnapshot {
+            pane: 7,
+            tab: 3,
+            tmux_session: None,
+            role: Some("orchestrator-master:t2753".into()),
+            title: None,
+            cwd: Some("/tmp/t2753".into()),
+            log_file: None,
+        }];
+        let mut th = LastSeenThrottle::default();
+        assert_eq!(
+            sync_detected_throttled(&path, &detected, &panes, T0, &mut th).unwrap(),
+            SyncWrite::Structural
+        );
+        let catalog = SessionCatalog::load_from(&path).unwrap();
+        let (id, entry) = catalog.resolve_id(ID_A).expect("show が引ける");
+        assert_eq!(id, ID_A);
+        assert_eq!(entry.kind, "master");
+        assert_eq!(entry.profile.as_deref(), Some("t2753"));
+        assert_eq!(entry.pane, Some(7));
+        assert_eq!(entry.cwd.as_deref(), Some("/tmp/t2753"));
+        // 同期が読み直したカタログの会話 ID は案 B の間引きへ写る
+        assert!(th.catalog_ids.contains(ID_A));
+    }
+
+    #[test]
+    fn issue2753_modの報告で走査を頼むのはカタログに無い会話idを初めて見たときだけ() {
+        let mut trigger = ModScanTrigger::default();
+        // 新しい会話 ID: 1 回だけ頼む（heartbeat の報告が同じ ID を運び続けても 2 回目は頼まない）
+        assert!(trigger.should_request(ID_A));
+        for _ in 0..5 {
+            assert!(!trigger.should_request(ID_A));
+        }
+        // カタログに載っている会話 ID は頼まない
+        let mut in_catalog = BTreeSet::new();
+        in_catalog.insert(ID_B.to_string());
+        trigger.note_catalog(&in_catalog);
+        assert!(!trigger.should_request(ID_B));
+        // 頼んだ会話がカタログに載れば頼んだ覚えは外れる（カタログ側で答える）
+        in_catalog.insert(ID_A.to_string());
+        trigger.note_catalog(&in_catalog);
+        assert!(trigger.requested.is_empty());
+        assert!(!trigger.should_request(ID_A));
+        // GC などでカタログから落ちた会話を mod がまだ報告していたら、もう 1 回だけ頼む
+        trigger.note_catalog(&BTreeSet::new());
+        assert!(trigger.should_request(ID_A));
+        assert!(!trigger.should_request(ID_A));
+        // 形の崩れた会話 ID は頼まない（パストラバーサル防止の検査と同じ 1 実装）
+        assert!(!trigger.should_request(""));
+        assert!(!trigger.should_request("../x"));
+        // 覚えの上限を越えたら空にして数え直す（増え続けない）
+        let mut trigger = ModScanTrigger::default();
+        for i in 0..MOD_SCAN_REQUESTED_MAX + 10 {
+            assert!(trigger.should_request(&format!("{i:08x}-2753-4000-8000-000000000000")));
+        }
+        assert!(trigger.requested.len() <= MOD_SCAN_REQUESTED_MAX);
+    }
+
+    #[test]
+    fn issue2753_同期の写しは書かなかった走査でもファイルの会話idと一致する() {
+        let t = tako_core::test_residue::ScratchDir::new("t2753-ids");
+        let path = t.path().join("sessions.yaml");
+        let mut th = LastSeenThrottle::default();
+        let ab = [det(ID_A, 1), det(ID_B, 2)];
+        sync_detected_throttled(&path, &ab, &[], T0, &mut th).unwrap();
+        // 同じ検出の 2 回目は書かない（#2020）が、写しはファイルと同じ集合のまま
+        assert_eq!(
+            sync_detected_throttled(&path, &ab, &[], T0 + 30, &mut th).unwrap(),
+            SyncWrite::Skipped
+        );
+        let on_disk: BTreeSet<String> = SessionCatalog::load_from(&path)
+            .unwrap()
+            .entries
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(th.catalog_ids, on_disk);
+        assert_eq!(on_disk.len(), 2);
     }
 }
