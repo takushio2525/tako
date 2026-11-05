@@ -22,6 +22,11 @@
 //! ログインシェルは `platform::exe::find_with_timeout`（Code Runner の #1730 と同じ 1 実装）=
 //! `probe::output_with_timeout` の上限を通る（profile が入力を待つ形でも固まらず、打ち切ったことを
 //! [`Launch::TimedOut`] で知らせる）。
+//! 解決はロックの外で待つので、`restart` / 入ったこと（`on_installed`）で覚えを捨てるたびに ID ごとの
+//! **世代**を進め、捨てる前に始まって後から着地した解決の答えは覚えへ書かない（#2746。書かないと
+//! 捨てたはずの「見つからない」が戻り、入れて restart したサーバが未導入のまま起きない）。
+//! 書く口は `remember_resolved`、捨てる口は `forget_resolved` の 1 つずつ（番犬
+//! `tests/issue2746_lsp_resolve_generation.rs`。A/B は `TAKO_2746_LEGACY=1`）。
 //!
 //! ## 未導入のサーバを取る（#1944）
 //!
@@ -161,6 +166,15 @@ pub fn legacy_2048() -> bool {
 pub fn legacy_2035() -> bool {
     matches!(
         std::env::var("TAKO_2035_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// `TAKO_2746_LEGACY=1` で解決の答えを世代を見ずに覚えへ書く（#2746 の前へ戻す A/B の入口。
+/// restart の前に始まった解決が restart の後に着地すると、捨てたはずの古い答えが覚えに戻る）
+pub fn legacy_2746() -> bool {
+    matches!(
+        std::env::var("TAKO_2746_LEGACY").ok().as_deref(),
         Some("1" | "true" | "on")
     )
 }
@@ -589,8 +603,11 @@ struct Inner {
     ui_refresh_wanted: bool,
     /// 未導入と分かったサーバ（ID ごと。restart で消える）
     not_installed: BTreeMap<&'static str, NotInstalled>,
-    /// 実行ファイルの解決の結果（ID ごと。#1769 = モジュール冒頭）
+    /// 実行ファイルの解決の結果（ID ごと。#1769 = モジュール冒頭）。**書く口は
+    /// [`Shared::remember_resolved`]、捨てる口は [`Shared::forget_resolved`] だけ**（#2746。番犬が名指す）
     resolved: BTreeMap<&'static str, Resolved>,
+    /// 解決の覚えの世代（ID ごと。#2746）。覚えを捨てるたびに進め、捨てる前に始まった解決の答えは書かない
+    resolved_gen: BTreeMap<&'static str, u64>,
     epoch: u64,
     /// 次に配る持ち手の番号（#1769）
     next_holder: u64,
@@ -648,6 +665,11 @@ struct Inflight {
 }
 
 impl Inner {
+    /// 解決の覚えの今の世代（#2746。まだ一度も捨てていなければ 0）
+    fn resolved_generation(&self, id: &str) -> u64 {
+        self.resolved_gen.get(id).copied().unwrap_or(0)
+    }
+
     fn lane(&mut self, lane: Lane) -> &mut Inflight {
         match lane {
             Lane::Completion => &mut self.completion_lane,
@@ -2203,7 +2225,7 @@ impl Shared {
         let inner = &mut *guard;
         inner.not_installed.remove(id);
         // 解決のキャッシュも捨てる（PATH に現れたなら次の起動で拾う）
-        inner.resolved.remove(id);
+        self.forget_resolved(inner, Some(id));
         inner.epoch = inner.epoch.wrapping_add(1);
         let keys: Vec<ServerKey> = inner
             .servers
@@ -2883,9 +2905,7 @@ impl Shared {
             inner.not_installed.remove(id);
         }
         // #1769: 解決のキャッシュも捨てる（入れた・PATH を直したあとの明示の引き直し）
-        inner
-            .resolved
-            .retain(|id, _| name.is_some_and(|n| n != *id));
+        self.forget_resolved(inner, name);
         let keys: Vec<ServerKey> = inner
             .servers
             .keys()
@@ -3268,16 +3288,44 @@ impl Shared {
             return (hit, true);
         }
         inject_resolve_delay();
+        // 引く直前の世代（#2746）。引いている間に覚えが捨てられたら（restart / 入った）この答えは書かない
+        let generation = self.lock().resolved_generation(spec.id);
         // 解決は待ちうる（ログインシェル）のでロックの外で
         let launch = (self.config.launcher)(spec);
-        self.lock().resolved.insert(
+        self.remember_resolved(
             spec.id,
+            generation,
             Resolved {
                 launch: launch.clone(),
                 activity,
             },
         );
         (launch, false)
+    }
+
+    /// 解決の答えを覚える（#1769）。**書く口はここだけ**（#2746。番犬が名指す）。`generation` は引く直前に
+    /// 読んだ世代で、その後に覚えが捨てられていれば（restart の前に始まった解決が後から着地した）
+    /// 古い答えなので書かない。A/B（`TAKO_2746_LEGACY=1`）は世代を見ずに書く
+    fn remember_resolved(&self, id: &'static str, generation: u64, resolved: Resolved) {
+        let mut inner = self.lock();
+        if !legacy_2746() && inner.resolved_generation(id) != generation {
+            return;
+        }
+        inner.resolved.insert(id, resolved);
+    }
+
+    /// 解決の覚えを捨てる（#1769 の引き直し。`name` が `None` なら表の全部）。**捨てる口はここだけ**
+    /// （#2746）。捨てたものの世代を進めるので、捨てる前に始まって後から着地する解決の答えは
+    /// [`Self::remember_resolved`] が書かない。解決に渡る spec はどれもこの表から来る（`resolve_document`）
+    fn forget_resolved(&self, inner: &mut Inner, name: Option<&str>) {
+        for spec in self.config.table {
+            if name.is_some_and(|n| n != spec.id) {
+                continue;
+            }
+            inner.resolved.remove(spec.id);
+            let generation = inner.resolved_gen.entry(spec.id).or_insert(0);
+            *generation = generation.wrapping_add(1);
+        }
     }
 
     fn cached_launch(&self, spec: &ServerSpec, activity: u64) -> Option<Launch> {
