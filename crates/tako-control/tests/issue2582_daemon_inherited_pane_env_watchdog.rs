@@ -323,11 +323,11 @@ fn scan_spawn_args(s: &Sources) -> Vec<Offender> {
     let mut out = Vec::new();
     match fn_window(
         &s.remote,
-        "pub fn spawn_daemon() -> Result<Value, String> {",
+        "pub fn spawn_daemon() -> Result<Value, crate::RemoteRefusal> {",
     ) {
         None => out.push(missing(
             REMOTE,
-            "pub fn spawn_daemon() -> Result<Value, String> {",
+            "pub fn spawn_daemon() -> Result<Value, crate::RemoteRefusal> {",
         )),
         Some((at, window)) => {
             if code_pos(&window, "cmd.args(SERVE_ARGS)").is_none() {
@@ -402,7 +402,7 @@ fn 走査が空振りしていない() {
         "host_env::reexec_if_stripped(&applied)",
         "pub fn run_daemon() -> io::Result<()> {",
         "audit_startup_env()",
-        "pub fn spawn_daemon() -> Result<Value, String> {",
+        "pub fn spawn_daemon() -> Result<Value, crate::RemoteRefusal> {",
         "cmd.args(SERVE_ARGS)",
         "pub const SERVE_ARGS",
     ] {

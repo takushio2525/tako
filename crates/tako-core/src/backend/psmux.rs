@@ -325,6 +325,9 @@ impl SessionBackend for PsmuxBackend {
             // `pane-died` フックで最後の出力を書き出す形を Windows 実機で確かめていない（#2085）。
             // 立てると conf へ `set-hook` / `remain-on-exit` を書くことになるので、実測までは外す
             keeps_exit_output: false,
+            // `exit-empty` を持つか・最後のセッションが消えた後の隙間があるかを Windows 実機で確かめていない（#2741）。
+            // 知らない行を conf へ書くとペインの出力へ警告が混ざる（#974）ので、実測までは書かない
+            keeps_empty_server: false,
             label: "psmux",
         }
     }

@@ -314,7 +314,8 @@ fn gate_violations(remote: &str, setup: &str) -> Vec<String> {
                 "{REMOTE}:{gate} — 隔離の門で断ったことを audit.log（`isolated_serve_refused`）へ残していない（#2619）"
             )),
         }
-        match code_line(at, &w, "return Err(refusal.to_string())") {
+        // #2365 の続きから spawn_daemon は型（`RemoteRefusal`）を返す = 呼び手が表示言語で文にする
+        match code_line(at, &w, "return Err(refusal);") {
             Some(l) if l > gate => {}
             _ => out.push(format!(
                 "{REMOTE}:{gate} — 隔離の門の断りが型（`RemoteRefusal::IsolatedServe`）の表示で返っていない。\
@@ -601,8 +602,8 @@ fn 修正前の形へ戻すと名指しする() {
         gate_violations(
             &inject(
                 &remote,
-                "return Err(refusal.to_string())",
-                "return Err(format!(\"隔離中なので serve を張りません: {refusal:?}\"))",
+                "return Err(refusal);",
+                "return Err(format!(\"隔離中なので serve を張りません: {refusal:?}\"));",
                 "日本語の固定文",
             ),
             &setup,
@@ -644,8 +645,8 @@ fn 修正前の形へ戻すと名指しする() {
     // 注入 6: 門の外に新しい書き手（daemon_status の中で serve を張り直す）
     let injected = inject(
         &remote,
-        "pub fn spawn_daemon() -> Result<Value, String> {\n",
-        "pub fn spawn_daemon() -> Result<Value, String> {\n    let _ = crate::tailscale::serve_start_target_on(\"tailscale\", None, \"http://127.0.0.1:1\");\n",
+        "pub fn spawn_daemon() -> Result<Value, crate::RemoteRefusal> {\n",
+        "pub fn spawn_daemon() -> Result<Value, crate::RemoteRefusal> {\n    let _ = crate::tailscale::serve_start_target_on(\"tailscale\", None, \"http://127.0.0.1:1\");\n",
         "門の外の書き手",
     );
     named(
@@ -769,8 +770,8 @@ fn 機械全体へ触る経路を修正前へ戻すと名指しする() {
             REMOTE,
             inject(
                 &remote,
-                "pub fn spawn_daemon() -> Result<Value, String> {\n",
-                "pub fn spawn_daemon() -> Result<Value, String> {\n    let _ = crate::tailscale::serve_stop_if_ours_on(\"tailscale\", None, None);\n",
+                "pub fn spawn_daemon() -> Result<Value, crate::RemoteRefusal> {\n",
+                "pub fn spawn_daemon() -> Result<Value, crate::RemoteRefusal> {\n    let _ = crate::tailscale::serve_stop_if_ours_on(\"tailscale\", None, None);\n",
                 "門の外の後始末",
             ),
         )]),

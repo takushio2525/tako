@@ -9,10 +9,16 @@
 //! 日本語は #2365 より前の固定文とバイト一致（`tests/issue1762_dispatch_error_lang.rs` が突き合わせる）。
 //!
 //! daemon を起こしている途中（#2608 の印が効いている間）の明示の start / stop の断り
-//! （`DaemonStarting` / `DaemonStartingStop`。#2613）もここに置く。`remote::spawn_daemon` /
-//! `daemon_stop` は `String` を返す従来の口のまま、この型の表示（呼び手のプロセスの表示言語）を載せる。
+//! （`DaemonStarting` / `DaemonStartingStop`。#2613）もここに置く。
 //! 隔離中（`TAKO_ISOLATED`）に本物の tailscale の serve を張らなかった断り（`IsolatedServe`。#2619）と、
 //! 対話の setup が Tailscale を導入しなかった断り（`IsolatedInstall`。#2624）も同じ形。
+//!
+//! daemon の起動と停止の断り（既に起動中・旧版を止められない・pid の正体を確かめられない・終わらない ほか。
+//! #2365 の続き）もここに置く。`remote::spawn_daemon` / `daemon_stop` / `daemon_force_stop` はこの型を返し、
+//! 利用者へ返す口（CLI の stderr・MCP の応答・設定画面とリモートカードの表示）は表示言語で文にする。
+//! GUI 起動時の自動復帰が残す記録（persist.log と `last_autostart.detail`）は日本語（[`RemoteRefusal::into_ja`]）。
+//! 停止要求が daemon に通らなかった理由は [`ShutdownReject`]、子の `tako remote serve` が stderr に書いた
+//! 理由と OS の終了要求の失敗の文は手を加えずに載せる。
 //!
 //! # 口
 //!
@@ -149,6 +155,73 @@ pub enum RemoteRefusal {
     /// 隔離中なので、対話の `tako remote setup` が未導入の Tailscale を導入しなかった（#2624。
     /// 導入器はこの機械全体へ入れる。通すのは `TAKO_REMOTE_ISOLATED_SERVE=1` だけ）
     IsolatedInstall,
+
+    // ---- daemon の起動と停止（`spawn_daemon` / `daemon_stop`。#2365 の続き。以前は `Err(String)` の日本語の固定文） ----
+    /// 稼働中の daemon の serve バイナリが今の解決先と違う（入れ替えは stop → start）
+    DaemonServeBinaryMismatch { running: String, expected: String },
+    /// 稼働中の daemon が今の版のまま動いている
+    DaemonAlreadyRunning,
+    /// 旧版のまま動いている daemon を止められなかったので入れ替えなかった（`why` は止められなかった理由）
+    DaemonRenewStopFailed { pid: u32, why: Box<RemoteRefusal> },
+    /// 停止の後も daemon が残っている（[`Self::DaemonRenewStopFailed`] の理由）
+    DaemonLingersAfterStop,
+    /// PID ファイルは無いが、記録された待ち受けで別の daemon が応答している（中身は待ち受けの表記）
+    DaemonListenerBusy(String),
+    /// 子の `tako remote serve` を起こせない（OS のエラー文）
+    DaemonSpawnFailed(String),
+    /// 子の stdout を取れない
+    DaemonStdoutUnavailable,
+    /// 起動情報を読むスレッドを起こせない（OS のエラー文）
+    DaemonReaderThread(String),
+    /// 子が起動情報を返さずに終わり、stderr に理由を書いた（子の文。手を加えずに載せる）
+    DaemonExitedWithMessage(String),
+    /// 子が起動情報も理由も返さずに終わった（中身は終了ステータスの表記）
+    DaemonExitedSilently(String),
+    /// 子から起動情報が時間内に来なかった
+    DaemonStartTimeout,
+    /// 止める daemon が居ない（PID ファイルが無い）
+    StopNoPidFile,
+    /// 止める daemon が居ない（PID ファイルの pid は既に終わっている）
+    StopAlreadyExited,
+    /// PID ファイルの pid が tako remote serve か確かめられないので撃たなかった（手順は打つ OS のもの）
+    StopPidUnverified {
+        pid: u32,
+        inspect: String,
+        manual: String,
+        remove: String,
+    },
+    /// 記録された待ち受けが答えた pid が tako の daemon か確かめられないので撃たなかった
+    /// （`reach` は待ち受けの表記。記録が無ければ `None`）
+    StopStalePidUnverified {
+        pid: u32,
+        reach: Option<String>,
+        inspect: String,
+        remove: String,
+    },
+    /// PID ファイルが無く、応答している待ち受けに停止要求が通らなかった。中身は箱に入れて
+    /// `RemoteRefusal` を小さく保つ（`WriteFailure` ほか Err 側で抱える型がある = clippy::result_large_err）
+    StopPidlessRefused(Box<PidlessRefusal>),
+    /// 停止要求を受け付けた pid は終わったが、記録された待ち受けがまだ応答している
+    StopListenerOutlived {
+        pid: u32,
+        reach: String,
+        inspect: String,
+    },
+    /// 穏当な終了要求の後も終わらない（通常の stop。`--force` を案内する）
+    StopTimeoutTryForce {
+        pid: u32,
+        request: &'static str,
+        secs: u64,
+        force_request: &'static str,
+    },
+    /// 終了要求の後も終わらない（state は残した）
+    StopStillRunning {
+        pid: u32,
+        request: &'static str,
+        secs: u64,
+    },
+    /// 終了要求を出せず、相手もまだ生きている（OS の終了要求の失敗の文。手を加えずに載せる）
+    StopTerminateFailed(String),
 
     // ---- daemon の HTTP API（PWA・管理 API が受け取る本文の `error`。#2365 の続き） ----
     /// 管理 API へ管理トークン無しで来た
@@ -363,6 +436,53 @@ pub enum AppVia {
     SshHosts,
     /// SSH の接続（`POST /api/ssh` / `POST /api/panes/:id/ssh`）
     SshOpen,
+}
+
+/// [`RemoteRefusal::StopPidlessRefused`] の中身（#2365 の続き）
+#[derive(Debug, Clone, PartialEq)]
+pub struct PidlessRefusal {
+    /// 記録された待ち受けの説明（`127.0.0.1:41234` ほか）
+    pub reach: String,
+    /// 停止要求が通らなかった理由
+    pub reason: ShutdownReject,
+    /// 待ち受けている相手を確かめるコマンド
+    pub inspect: String,
+    /// tako の daemon なら止めるコマンド
+    pub stop: String,
+    /// tako の daemon でなければ記録を消すコマンド
+    pub remove: String,
+}
+
+/// daemon の管理 API の停止要求（`/api/admin/shutdown`）が通らなかった理由（#2365 の続き）。
+/// [`RemoteRefusal::StopPidlessRefused`] の理由として利用者へ返る
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShutdownReject {
+    /// 管理トークンのファイルが無い
+    TokenMissing,
+    /// 管理トークンを読めない（OS のエラー文）
+    TokenUnreadable(String),
+    /// 待ち受けの記録が無い
+    NoListenerRecord,
+    /// daemon へ届かない（`endpoint` は待ち受けの表記）
+    Unreachable { endpoint: String, error: String },
+    /// 応答にヘッダの終わりが無い
+    NoHeaderBoundary,
+    /// 応答にステータス行が無い
+    NoStatusLine,
+    /// 管理トークンが合わない（401）
+    TokenMismatch,
+    /// 停止要求の受け口が無い（404 = #1599 より前の daemon か tako 以外）
+    NoShutdownRoute,
+    /// それ以外のステータスで断られた
+    NotAccepted(u16),
+    /// 応答の本文を JSON として読めない（serde のエラー文）
+    BodyUnparsable(String),
+    /// 応答に受け付けた印（`shutting_down: true`）が無い
+    NoAcceptMark,
+    /// 応答に pid が無い
+    NoPid,
+    /// 畳むと答えたのが確かめた pid とは別の daemon
+    OtherDaemon { pid: u32, expected: u32 },
 }
 
 /// daemon が断ったときの本文の中身
@@ -612,6 +732,215 @@ impl RemoteRefusal {
                  the installer fake). To exercise the install, set {}=1",
                 crate::remote_isolated_serve::OPT_IN_ENV
             ),
+            (Self::DaemonServeBinaryMismatch { running, expected }, Ja) => format!(
+                "リモートサーバーは既に起動中ですが、稼働中の serve バイナリ\
+                 （{running}）が現在の解決先（{expected}）と異なります。\
+                 `tako remote stop` してから `tako remote start` で差し替えてください"
+            ),
+            (Self::DaemonServeBinaryMismatch { running, expected }, En) => format!(
+                "the remote server is already running, but its serve binary ({running}) differs from \
+                 the current one ({expected}). Swap it with `tako remote stop`, then `tako remote start`"
+            ),
+            (Self::DaemonAlreadyRunning, Ja) => "リモートサーバーは既に起動中".to_string(),
+            (Self::DaemonAlreadyRunning, En) => "the remote server is already running".to_string(),
+            (Self::DaemonRenewStopFailed { pid, why }, Ja) => format!(
+                "旧版のまま動いているリモート daemon（PID {pid}）を止められなかったため、\
+                 入れ替えていません: {}",
+                why.text_in(lang)
+            ),
+            (Self::DaemonRenewStopFailed { pid, why }, En) => format!(
+                "could not stop the remote daemon still running the old version (PID {pid}), \
+                 so it was not swapped: {}",
+                why.text_in(lang)
+            ),
+            (Self::DaemonLingersAfterStop, Ja) => "停止後も daemon が残っています".to_string(),
+            (Self::DaemonLingersAfterStop, En) => {
+                "the daemon is still there after stopping it".to_string()
+            }
+            (Self::DaemonListenerBusy(endpoint), Ja) => {
+                format!("別の daemon が既にこの待ち受けで稼働中です: {endpoint}")
+            }
+            (Self::DaemonListenerBusy(endpoint), En) => {
+                format!("another daemon is already running on this listener: {endpoint}")
+            }
+            (Self::DaemonSpawnFailed(error), Ja) => format!("デーモンの起動に失敗: {error}"),
+            (Self::DaemonSpawnFailed(error), En) => format!("failed to start the daemon: {error}"),
+            (Self::DaemonStdoutUnavailable, Ja) => "デーモンの stdout を取得できない".to_string(),
+            (Self::DaemonStdoutUnavailable, En) => "cannot get the daemon's stdout".to_string(),
+            (Self::DaemonReaderThread(error), Ja) => {
+                format!("reader スレッドの起動に失敗: {error}")
+            }
+            (Self::DaemonReaderThread(error), En) => {
+                format!("failed to start the reader thread: {error}")
+            }
+            // 子の `tako remote serve` の文（Tailscale の不足項目の列挙ほか）は手を加えずに載せる
+            (Self::DaemonExitedWithMessage(detail), _) => detail.clone(),
+            (Self::DaemonExitedSilently(status), Ja) => {
+                format!("デーモンが起動情報を返さず終了した（{status}）")
+            }
+            (Self::DaemonExitedSilently(status), En) => {
+                format!("the daemon exited without returning its startup info ({status})")
+            }
+            (Self::DaemonStartTimeout, Ja) => {
+                "デーモンからの起動情報を受信できなかった（30 秒タイムアウト）".to_string()
+            }
+            (Self::DaemonStartTimeout, En) => {
+                "did not receive the startup info from the daemon (timed out after 30 s)".to_string()
+            }
+            (Self::StopNoPidFile, Ja) => {
+                "リモートサーバーが起動していない（PID ファイルが無い）".to_string()
+            }
+            (Self::StopNoPidFile, En) => "the remote server is not running (no PID file)".to_string(),
+            (Self::StopAlreadyExited, Ja) => {
+                "リモートサーバーが起動していない（プロセスは既に終了）".to_string()
+            }
+            (Self::StopAlreadyExited, En) => {
+                "the remote server is not running (the process has already exited)".to_string()
+            }
+            (
+                Self::StopPidUnverified {
+                    pid,
+                    inspect,
+                    manual,
+                    remove,
+                },
+                Ja,
+            ) => format!(
+                "{prefix}\n\
+                 PID ファイルに記録された PID です。state ファイルは残しました。\n\
+                 {indent}この PID の正体を確認する: {inspect}\n\
+                 {indent}tako remote serve なら止める: {manual}\n\
+                 {indent}tako の daemon でなければ記録を消す: {remove}\n\
+                 {indent}そのうえで起動し直す: tako remote start",
+                prefix = pid_identity_prefix(*pid, lang),
+                indent = "  ",
+            ),
+            (
+                Self::StopPidUnverified {
+                    pid,
+                    inspect,
+                    manual,
+                    remove,
+                },
+                En,
+            ) => format!(
+                "{prefix}\n\
+                 This is the PID recorded in the PID file. The state files were kept.\n\
+                 {indent}check what this PID is: {inspect}\n\
+                 {indent}if it is tako remote serve, stop it: {manual}\n\
+                 {indent}if it is not a tako daemon, remove the record: {remove}\n\
+                 {indent}then start it again: tako remote start",
+                prefix = pid_identity_prefix(*pid, lang),
+                indent = "  ",
+            ),
+            (
+                Self::StopStalePidUnverified {
+                    pid,
+                    reach,
+                    inspect,
+                    remove,
+                },
+                Ja,
+            ) => format!(
+                "{prefix}\n\
+                 記録された待ち受け（{reach}）が答えた PID です。state ファイルは残しました。\n\
+                 {indent}この PID の正体を確認する: {inspect}\n\
+                 {indent}tako の daemon でなければ記録を消す: {remove}\n\
+                 {indent}そのうえで起動し直す: tako remote start",
+                prefix = pid_identity_prefix(*pid, lang),
+                reach = reach.as_deref().unwrap_or("不明"),
+                indent = "  ",
+            ),
+            (
+                Self::StopStalePidUnverified {
+                    pid,
+                    reach,
+                    inspect,
+                    remove,
+                },
+                En,
+            ) => format!(
+                "{prefix}\n\
+                 This is the PID that the recorded listener ({reach}) answered with. The state files were kept.\n\
+                 {indent}check what this PID is: {inspect}\n\
+                 {indent}if it is not a tako daemon, remove the record: {remove}\n\
+                 {indent}then start it again: tako remote start",
+                prefix = pid_identity_prefix(*pid, lang),
+                reach = reach.as_deref().unwrap_or("unknown"),
+                indent = "  ",
+            ),
+            (Self::StopPidlessRefused(p), Ja) => format!(
+                "PID ファイルが無く、記録された待ち受け（{reach}）は応答していますが、\
+                 停止要求が通りませんでした: {reason}\n\
+                 相手が tako の daemon か確かめられないので、何も止めていません。state ファイルは残しました。\n\
+                 {indent}待ち受けている相手を確かめる: {inspect}\n\
+                 {indent}tako の daemon なら止める: {stop}\n\
+                 {indent}tako の daemon でなければ記録を消す: {remove}\n\
+                 {indent}そのうえで起動し直す: tako remote start",
+                reach = p.reach,
+                reason = p.reason.text_in(lang),
+                inspect = p.inspect,
+                stop = p.stop,
+                remove = p.remove,
+                indent = "  ",
+            ),
+            (Self::StopPidlessRefused(p), En) => format!(
+                "there is no PID file, and the recorded listener ({reach}) answers, but the stop request \
+                 did not go through: {reason}\n\
+                 Cannot confirm that it is a tako daemon, so nothing was stopped. The state files were kept.\n\
+                 {indent}check who is listening: {inspect}\n\
+                 {indent}if it is a tako daemon, stop it: {stop}\n\
+                 {indent}if it is not a tako daemon, remove the record: {remove}\n\
+                 {indent}then start it again: tako remote start",
+                reach = p.reach,
+                reason = p.reason.text_in(lang),
+                inspect = p.inspect,
+                stop = p.stop,
+                remove = p.remove,
+                indent = "  ",
+            ),
+            (Self::StopListenerOutlived { pid, reach, inspect }, Ja) => format!(
+                "停止要求を受け付けた PID {pid} は終わりましたが、記録された待ち受け（{reach}）は\
+                 まだ応答しています。応答したのは別のプロセスかもしれないので、止めたことにせず\
+                 state ファイルを残しました。\n  待ち受けている相手を確かめる: {inspect}"
+            ),
+            (Self::StopListenerOutlived { pid, reach, inspect }, En) => format!(
+                "PID {pid}, which accepted the stop request, has exited, but the recorded listener \
+                 ({reach}) still answers. Another process may have answered, so this is not counted as \
+                 stopped and the state files were kept.\n  check who is listening: {inspect}"
+            ),
+            (
+                Self::StopTimeoutTryForce {
+                    pid,
+                    request,
+                    secs,
+                    force_request,
+                },
+                Ja,
+            ) => format!(
+                "PID {pid} が {request} 後 {secs} 秒経っても終了しない。\
+                 `tako remote stop --force` で {force_request} を試みてください"
+            ),
+            (
+                Self::StopTimeoutTryForce {
+                    pid,
+                    request,
+                    secs,
+                    force_request,
+                },
+                En,
+            ) => format!(
+                "PID {pid} did not exit {secs} s after {request}. \
+                 Try {force_request} with `tako remote stop --force`"
+            ),
+            (Self::StopStillRunning { pid, request, secs }, Ja) => format!(
+                "PID {pid} が {request} 後 {secs} 秒経っても終了しない。state ファイルは残してあります"
+            ),
+            (Self::StopStillRunning { pid, request, secs }, En) => format!(
+                "PID {pid} did not exit {secs} s after {request}. The state files were kept"
+            ),
+            // OS の終了要求の失敗の文（境界 `platform::process::terminate` の文）は手を加えずに載せる
+            (Self::StopTerminateFailed(error), _) => error.clone(),
             (Self::AdminTokenRequired, Ja) => "管理 API はローカルの管理トークンが必要".to_string(),
             (Self::AdminTokenRequired, En) => {
                 "the admin API needs the local admin token".to_string()
@@ -1080,6 +1409,80 @@ impl RemoteRefusal {
         match body["error"].as_str() {
             Some(text) => DaemonMessage::Text(text.to_string()),
             None => DaemonMessage::Missing,
+        }
+    }
+}
+
+/// pid の正体を確かめられずに停止を中止したときの共通の前置き（正規経路と stale 経路の 1 実装。#329 / #1401）。
+/// 診断ログではなく操作の結果なので、何を中止したのかを最初に言う
+fn pid_identity_prefix(pid: u32, lang: Lang) -> String {
+    match lang {
+        Lang::Ja => format!(
+            "PID {pid} が tako remote serve であることを確認できません\
+             （PID 再利用または検証コマンド実行不能）。安全のため停止操作を中止しました。"
+        ),
+        Lang::En => format!(
+            "cannot confirm that PID {pid} is tako remote serve (the PID was reused, or the check \
+             command could not run). Stopped nothing, to be safe."
+        ),
+    }
+}
+
+impl ShutdownReject {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match。日本語は #2365 より前とバイト一致）
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::TokenMissing, Ja) => "管理トークンも無い".to_string(),
+            (Self::TokenMissing, En) => "there is no admin token either".to_string(),
+            (Self::TokenUnreadable(error), Ja) => format!("管理トークンを読めない（{error}）"),
+            (Self::TokenUnreadable(error), En) => format!("cannot read the admin token ({error})"),
+            (Self::NoListenerRecord, Ja) => "待ち受けの記録が無い".to_string(),
+            (Self::NoListenerRecord, En) => "there is no record of the listener".to_string(),
+            (Self::Unreachable { endpoint, error }, Ja) => {
+                format!("daemon へ届かない ({endpoint}): {error}")
+            }
+            (Self::Unreachable { endpoint, error }, En) => {
+                format!("cannot reach the daemon ({endpoint}): {error}")
+            }
+            (Self::NoHeaderBoundary, Ja) => "daemon の応答が不正（ヘッダ境界なし）".to_string(),
+            (Self::NoHeaderBoundary, En) => {
+                "invalid daemon response (no header boundary)".to_string()
+            }
+            (Self::NoStatusLine, Ja) => "daemon の応答が不正（ステータス行なし）".to_string(),
+            (Self::NoStatusLine, En) => "invalid daemon response (no status line)".to_string(),
+            (Self::TokenMismatch, Ja) => "管理トークンが合わない (401)".to_string(),
+            (Self::TokenMismatch, En) => "the admin token does not match (401)".to_string(),
+            (Self::NoShutdownRoute, Ja) => {
+                "停止要求の受け口が無い (404。#1599 より前の daemon か、tako 以外)".to_string()
+            }
+            (Self::NoShutdownRoute, En) => {
+                "there is no stop endpoint (404: a daemon older than #1599, or not tako)"
+                    .to_string()
+            }
+            (Self::NotAccepted(status), Ja) => {
+                format!("daemon が畳む要求を受け付けなかった ({status})")
+            }
+            (Self::NotAccepted(status), En) => {
+                format!("the daemon did not accept the shutdown request ({status})")
+            }
+            (Self::BodyUnparsable(error), Ja) => format!("daemon の応答を解釈できない: {error}"),
+            (Self::BodyUnparsable(error), En) => {
+                format!("cannot parse the daemon response: {error}")
+            }
+            (Self::NoAcceptMark, Ja) => "daemon の応答に受け付けた印が無い".to_string(),
+            (Self::NoAcceptMark, En) => {
+                "the daemon response has no sign that it accepted".to_string()
+            }
+            (Self::NoPid, Ja) => "daemon の応答に pid が無い".to_string(),
+            (Self::NoPid, En) => "the daemon response has no pid".to_string(),
+            (Self::OtherDaemon { pid, expected }, Ja) => format!(
+                "畳むと答えたのは別の daemon（PID {pid}）で、確かめた PID {expected} ではない"
+            ),
+            (Self::OtherDaemon { pid, expected }, En) => format!(
+                "the daemon that agreed to shut down is another one (PID {pid}), \
+                 not the confirmed PID {expected}"
+            ),
         }
     }
 }

@@ -377,7 +377,7 @@ fn 修正前の形へ戻すと名指しする() {
     named(
         &inject(
             &base,
-            "crate::RemoteRefusal::DaemonStarting { marker, now }.to_string()",
+            "crate::RemoteRefusal::DaemonStarting { marker, now }",
             "format!(\"起動中です（PID {}・{now}）\", marker.pid)",
             "日本語の固定文",
         ),
@@ -492,13 +492,14 @@ fn 起こしている途中のstartとstopは断る() {
     std::env::remove_var("TAKO_REMOTE_ENDPOINT");
     set_desired();
     assert!(read_desired().is_some(), "「起動していた」を置けていない");
-    // 断りの文を取り出す（断らずに進んだら、何をしたかを添えて落とす）
-    let refused = |r: Result<serde_json::Value, String>, what: String| -> String {
-        match r {
-            Ok(v) => panic!("{what}: {v}"),
-            Err(e) => e,
-        }
-    };
+    // 断りの文を取り出す（断らずに進んだら、何をしたかを添えて落とす）。文は呼び手の表示言語（#2365）
+    let refused =
+        |r: Result<serde_json::Value, tako_control::RemoteRefusal>, what: String| -> String {
+            match r {
+                Ok(v) => panic!("{what}: {v}"),
+                Err(e) => e.to_string(),
+            }
+        };
 
     {
         // GUI 起動時の自動復帰が旧版 PID 4242 を入れ替えている途中
@@ -535,7 +536,7 @@ fn 起こしている途中のstartとstopは断る() {
         let legacy_status = spawn_daemon();
         std::env::remove_var(LEGACY_ENV);
         assert!(
-            legacy_status.is_err_and(|e| e.contains("is being replaced")),
+            legacy_status.is_err_and(|e| e.to_string().contains("is being replaced")),
             "{spawn_at}: status の A/B（{LEGACY_ENV}=1）で start の断りが外れた"
         );
 

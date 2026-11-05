@@ -77,6 +77,8 @@ pub enum SessionProbe {
 /// エラー文言は tmux 3.6b の実測（ロケールに依らず英語）:
 ///
 /// - `can't find session: <名>` = セッションが無い
+/// - `no current target` = サーバーは居るがセッションが 1 つも無い = その名前のセッションも無い
+///   （#2741 で器のサーバーは `exit-empty off` = 最後のセッションが消えても空のまま残る）
 /// - `no server running on <ソケット>` = サーバーが居ない
 /// - `error connecting to <ソケット> (No such file or directory)` = ソケットごと無い
 /// - `error connecting to <ソケット> (Connection refused)` = 死んだサーバーのソケットが残っている
@@ -90,7 +92,7 @@ pub fn classify_probe(success: bool, stdout: &str, stderr: &str) -> SessionProbe
         return SessionProbe::Alive { clients };
     }
     let err = stderr.trim();
-    if err.starts_with("can't find session") {
+    if err.starts_with("can't find session") || err.starts_with("no current target") {
         SessionProbe::SessionGone
     } else if err.starts_with("no server running")
         || (err.starts_with("error connecting to")
@@ -507,6 +509,11 @@ mod tests {
         );
         assert_eq!(
             classify_probe(false, "", "can't find session: tako-x\n"),
+            SessionProbe::SessionGone
+        );
+        // #2741: 空のまま残る器のサーバー（`exit-empty off`）はセッションの名前を引く前にこう断る
+        assert_eq!(
+            classify_probe(false, "", "no current target\n"),
             SessionProbe::SessionGone
         );
         assert_eq!(

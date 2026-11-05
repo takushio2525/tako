@@ -821,6 +821,19 @@ tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無
   MCP の `backend` 応答に出る。拒否される設定の正本は
   `backend::psmux::UNKNOWN_OPTIONS`（実測で拒否されたものだけ。psmux 版 conf に
   無いだけの `default-terminal` / `escape-time` は psmux が受理するので含めない）
+- **最後のセッションが消えても器のサーバーを残す**（#2741。`exit-empty off` = `tmux_backend::exit_empty_conf`）:
+  tmux の既定（`exit-empty on`）では、最後のセッションが消えたサーバーは「終わる」と決めてからプロセスが
+  消えるまで待ち受けのソケットを開いたままにし、その間に繋いだ器のペインのクライアントが
+  `server exited unexpectedly` で即死していた（拒否ではないので新しいサーバーも起こさない。混んだ機で
+  隙間が延びる = 隔離セルフテストの項目 739 / 749 の間欠）。器の conf と `sync_conf` の再適用でだけ効かせる
+  （利用者の tmux へは読ませない）。能力は `keeps_empty_server`（psmux は未実測で false = 書かない）。
+  **空のサーバーが残る**: 本番は器のソケットごとに 1 本（GUI の再起動をまたいで器を残す設計の続き。次の
+  器のペインがそのまま使う）、使い捨てのソケットは後片付け（`cleanup_process_scoped` / `TmuxTestGuard`）が
+  kill-server で落とす。空のサーバーへの `list-clients -t =<名>` は `no current target` を返すので、
+  繋ぎ直しの生死（`backend_reattach::classify_probe`）はそれを「セッションが無い」と読む（読まないと
+  無いセッションへ繋ぎ直しに行く）。e2e は注入（`history-file` を FIFO に向けてサーバーを終わり際で止める）つきの
+  `crates/tako-core/tests/issue2741_container_exit_empty.rs`、番犬は
+  `crates/tako-control/tests/issue2741_exit_empty_watchdog.rs`。A/B は `TAKO_2741_LEGACY=1`
 - **シェル統合の共存**: tmux は OSC 7 / 133 を外へ転送しないため、統合スクリプトが
   バックエンド配下では OSC を `\ePtmux;…\e\\` パススルーで包む。同時に
   **TMUX / TMUX_PANE を unset** し、ユーザー自身の `tmux` 利用（ネスト）を
