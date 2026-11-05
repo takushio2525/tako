@@ -98,11 +98,6 @@ const ALLOWED: &[Allow] = &[
     },
     Allow {
         file: "crates/tako-control/src/remote.rs",
-        needle: "応答を解釈できない",
-        why: "リモート / daemon の HTTP・IPC の応答",
-    },
-    Allow {
-        file: "crates/tako-control/src/remote.rs",
         needle: "RemoteRefusal::DaemonResponseParse(",
         why: "daemon の admin API の HTTP の応答（ファイルではない。#2365 で文を RemoteRefusal へ移した）",
     },
@@ -115,6 +110,11 @@ const ALLOWED: &[Allow] = &[
         file: "crates/tako-control/src/remote.rs",
         needle: "RemoteRefusal::BodyJsonInvalid(",
         why: "リモートの HTTP 要求の本文（#2365 で文を RemoteRefusal へ移した）",
+    },
+    Allow {
+        file: "crates/tako-control/src/remote.rs",
+        needle: "ShutdownReject::BodyUnparsable(",
+        why: "daemon が停止要求へ返した HTTP の応答（ファイルではない。#2365 で文を ShutdownReject へ移した）",
     },
     Allow {
         file: "crates/tako-control/src/tailscale.rs",

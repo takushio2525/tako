@@ -14012,7 +14012,9 @@ fn cli_の台帳の手元の処理は日本語の口を呼ばない() {
 use tako_control::platform::local_endpoint::PeerReject;
 use tako_control::remote_auth::DeviceRole;
 use tako_control::remote_files::Denial;
-use tako_control::remote_refusal::{AppVia, DaemonMessage, ScrollbackCause};
+use tako_control::remote_refusal::{
+    AppVia, DaemonMessage, PidlessRefusal, ScrollbackCause, ShutdownReject,
+};
 use tako_control::remote_starting::StartingMarker;
 use tako_control::RemoteRefusal;
 
@@ -14163,9 +14165,58 @@ fn remote_refusal_index(r: &RemoteRefusal) -> usize {
         RemoteRefusal::ResourceJobIdUnreadable => 120,
         RemoteRefusal::ResourcePaneIdUnreadable => 121,
         RemoteRefusal::ResourcePriorityRequired => 122,
+        RemoteRefusal::DaemonServeBinaryMismatch { .. } => 123,
+        RemoteRefusal::DaemonAlreadyRunning => 124,
+        RemoteRefusal::DaemonRenewStopFailed { .. } => 125,
+        RemoteRefusal::DaemonLingersAfterStop => 126,
+        RemoteRefusal::DaemonListenerBusy(_) => 127,
+        RemoteRefusal::DaemonSpawnFailed(_) => 128,
+        RemoteRefusal::DaemonStdoutUnavailable => 129,
+        RemoteRefusal::DaemonReaderThread(_) => 130,
+        RemoteRefusal::DaemonExitedWithMessage(_) => 131,
+        RemoteRefusal::DaemonExitedSilently(_) => 132,
+        RemoteRefusal::DaemonStartTimeout => 133,
+        RemoteRefusal::StopNoPidFile => 134,
+        RemoteRefusal::StopAlreadyExited => 135,
+        RemoteRefusal::StopPidUnverified { .. } => 136,
+        RemoteRefusal::StopStalePidUnverified { .. } => 137,
+        RemoteRefusal::StopPidlessRefused(_) => 138,
+        RemoteRefusal::StopListenerOutlived { .. } => 139,
+        RemoteRefusal::StopTimeoutTryForce { .. } => 140,
+        RemoteRefusal::StopStillRunning { .. } => 141,
+        RemoteRefusal::StopTerminateFailed(_) => 142,
     }
 }
-const REMOTE_REFUSAL_VARIANTS: usize = 123;
+const REMOTE_REFUSAL_VARIANTS: usize = 143;
+
+/// `ShutdownReject` の通し番号（網羅 match = 足すとここがコンパイルで落ちる）
+fn shutdown_reject_index(r: &ShutdownReject) -> usize {
+    match r {
+        ShutdownReject::TokenMissing => 0,
+        ShutdownReject::TokenUnreadable(_) => 1,
+        ShutdownReject::NoListenerRecord => 2,
+        ShutdownReject::Unreachable { .. } => 3,
+        ShutdownReject::NoHeaderBoundary => 4,
+        ShutdownReject::NoStatusLine => 5,
+        ShutdownReject::TokenMismatch => 6,
+        ShutdownReject::NoShutdownRoute => 7,
+        ShutdownReject::NotAccepted(_) => 8,
+        ShutdownReject::BodyUnparsable(_) => 9,
+        ShutdownReject::NoAcceptMark => 10,
+        ShutdownReject::NoPid => 11,
+        ShutdownReject::OtherDaemon { .. } => 12,
+    }
+}
+const SHUTDOWN_REJECT_VARIANTS: usize = 13;
+
+/// 停止の断りの見本の手順（unix の形。中身は呼び手が組んだ文をそのまま埋める）
+const PS_4242: &str = "ps -p 4242 -o args=";
+const LSOF_41234: &str = "lsof -nP -iTCP:41234 -sTCP:LISTEN";
+const RM_PID: &str = "rm /tmp/state/tako-remote.pid";
+const RM_PORT: &str = "rm /tmp/state/tako-remote.port";
+/// 正規経路と stale 経路の中止の前置き（#2365 より前の `remote::pid_identity_refusal` の文）
+const PID_4242_UNVERIFIED: &str = "PID 4242 が tako remote serve であることを確認できません\
+     （PID 再利用または検証コマンド実行不能）。安全のため停止操作を中止しました。";
 
 /// `AppVia` / `PeerReject` の通し番号（網羅 match = 足すとここがコンパイルで落ちる）
 fn app_via_index(v: &AppVia) -> usize {
@@ -14441,6 +14492,155 @@ fn remote_refusal_table() -> Vec<(RemoteRefusal, String)> {
              インストールで、隔離の外にあるためです（偽の TAKO_TAILSCALE_BIN では導入器は偽物になりません）。\
              導入まで確かめるなら TAKO_REMOTE_ISOLATED_SERVE=1 を付けてください"
                 .into(),
+        ),
+        // ---- daemon の起動と停止（#2365 の続き。旧文は remote.rs の spawn_daemon / daemon_stop_impl /
+        // stop_verified_daemon / stale_stop_refusal / pidless_stop_refusal ほかが書いていた文） ----
+        (
+            RemoteRefusal::DaemonServeBinaryMismatch {
+                running: "/opt/old/tako".into(),
+                expected: "/Applications/tako.app/Contents/MacOS/tako".into(),
+            },
+            "リモートサーバーは既に起動中ですが、稼働中の serve バイナリ\
+             （/opt/old/tako）が現在の解決先（/Applications/tako.app/Contents/MacOS/tako）と異なります。\
+             `tako remote stop` してから `tako remote start` で差し替えてください"
+                .into(),
+        ),
+        (
+            RemoteRefusal::DaemonAlreadyRunning,
+            "リモートサーバーは既に起動中".into(),
+        ),
+        (
+            RemoteRefusal::DaemonRenewStopFailed {
+                pid: 4242,
+                why: Box::new(RemoteRefusal::DaemonLingersAfterStop),
+            },
+            "旧版のまま動いているリモート daemon（PID 4242）を止められなかったため、\
+             入れ替えていません: 停止後も daemon が残っています"
+                .into(),
+        ),
+        (
+            RemoteRefusal::DaemonLingersAfterStop,
+            "停止後も daemon が残っています".into(),
+        ),
+        (
+            RemoteRefusal::DaemonListenerBusy("127.0.0.1:41234".into()),
+            "別の daemon が既にこの待ち受けで稼働中です: 127.0.0.1:41234".into(),
+        ),
+        (
+            RemoteRefusal::DaemonSpawnFailed(EACCES.into()),
+            format!("デーモンの起動に失敗: {EACCES}"),
+        ),
+        (
+            RemoteRefusal::DaemonStdoutUnavailable,
+            "デーモンの stdout を取得できない".into(),
+        ),
+        (
+            RemoteRefusal::DaemonReaderThread("Resource temporarily unavailable (os error 35)".into()),
+            "reader スレッドの起動に失敗: Resource temporarily unavailable (os error 35)".into(),
+        ),
+        (
+            RemoteRefusal::DaemonExitedWithMessage("Tailscale is not running".into()),
+            "Tailscale is not running".into(),
+        ),
+        (
+            RemoteRefusal::DaemonExitedSilently("exit status: 1".into()),
+            "デーモンが起動情報を返さず終了した（exit status: 1）".into(),
+        ),
+        (
+            RemoteRefusal::DaemonStartTimeout,
+            "デーモンからの起動情報を受信できなかった（30 秒タイムアウト）".into(),
+        ),
+        (
+            RemoteRefusal::StopNoPidFile,
+            "リモートサーバーが起動していない（PID ファイルが無い）".into(),
+        ),
+        (
+            RemoteRefusal::StopAlreadyExited,
+            "リモートサーバーが起動していない（プロセスは既に終了）".into(),
+        ),
+        (
+            RemoteRefusal::StopPidUnverified {
+                pid: 4242,
+                inspect: PS_4242.into(),
+                manual: "kill 4242".into(),
+                remove: RM_PID.into(),
+            },
+            format!(
+                "{PID_4242_UNVERIFIED}\n\
+                 PID ファイルに記録された PID です。state ファイルは残しました。\n\
+                 \x20 この PID の正体を確認する: {PS_4242}\n\
+                 \x20 tako remote serve なら止める: kill 4242\n\
+                 \x20 tako の daemon でなければ記録を消す: {RM_PID}\n\
+                 \x20 そのうえで起動し直す: tako remote start"
+            ),
+        ),
+        (
+            RemoteRefusal::StopStalePidUnverified {
+                pid: 4242,
+                reach: None,
+                inspect: PS_4242.into(),
+                remove: RM_PORT.into(),
+            },
+            format!(
+                "{PID_4242_UNVERIFIED}\n\
+                 記録された待ち受け（不明）が答えた PID です。state ファイルは残しました。\n\
+                 \x20 この PID の正体を確認する: {PS_4242}\n\
+                 \x20 tako の daemon でなければ記録を消す: {RM_PORT}\n\
+                 \x20 そのうえで起動し直す: tako remote start"
+            ),
+        ),
+        (
+            RemoteRefusal::StopPidlessRefused(Box::new(PidlessRefusal {
+                reach: "127.0.0.1:41234".into(),
+                reason: ShutdownReject::TokenMissing,
+                inspect: LSOF_41234.into(),
+                stop: "kill <PID>".into(),
+                remove: RM_PORT.into(),
+            })),
+            format!(
+                "PID ファイルが無く、記録された待ち受け（127.0.0.1:41234）は応答していますが、\
+                 停止要求が通りませんでした: 管理トークンも無い\n\
+                 相手が tako の daemon か確かめられないので、何も止めていません。state ファイルは残しました。\n\
+                 \x20 待ち受けている相手を確かめる: {LSOF_41234}\n\
+                 \x20 tako の daemon なら止める: kill <PID>\n\
+                 \x20 tako の daemon でなければ記録を消す: {RM_PORT}\n\
+                 \x20 そのうえで起動し直す: tako remote start"
+            ),
+        ),
+        (
+            RemoteRefusal::StopListenerOutlived {
+                pid: 4242,
+                reach: "127.0.0.1:41234".into(),
+                inspect: LSOF_41234.into(),
+            },
+            format!(
+                "停止要求を受け付けた PID 4242 は終わりましたが、記録された待ち受け（127.0.0.1:41234）は\
+                 まだ応答しています。応答したのは別のプロセスかもしれないので、止めたことにせず\
+                 state ファイルを残しました。\n  待ち受けている相手を確かめる: {LSOF_41234}"
+            ),
+        ),
+        (
+            RemoteRefusal::StopTimeoutTryForce {
+                pid: 4242,
+                request: "SIGTERM",
+                secs: 5,
+                force_request: "SIGKILL",
+            },
+            "PID 4242 が SIGTERM 後 5 秒経っても終了しない。\
+             `tako remote stop --force` で SIGKILL を試みてください"
+                .into(),
+        ),
+        (
+            RemoteRefusal::StopStillRunning {
+                pid: 4242,
+                request: "SIGKILL",
+                secs: 5,
+            },
+            "PID 4242 が SIGKILL 後 5 秒経っても終了しない。state ファイルは残してあります".into(),
+        ),
+        (
+            RemoteRefusal::StopTerminateFailed("Operation not permitted (os error 1)".into()),
+            "Operation not permitted (os error 1)".into(),
         ),
         // ---- daemon の HTTP API（#2365 の続き。旧文は remote.rs の handler 群・remote_auth.rs の identify /
         // approve / deny・local_endpoint.rs の PeerReject::describe が書いていた文） ----
@@ -15013,8 +15213,12 @@ fn remote系の断りは全バリアントが日英を持ち日本語は2365よ�
             )
         };
         let (ja, en) = (r.text_in(Lang::Ja), r.text_in(Lang::En));
-        if let RemoteRefusal::ScrollbackLegacy(text) = r {
-            // 修正前の再現（A/B の腕）の文は tako が組まない: 日英とも手を加えずにそのまま
+        if let RemoteRefusal::ScrollbackLegacy(text)
+        | RemoteRefusal::DaemonExitedWithMessage(text)
+        | RemoteRefusal::StopTerminateFailed(text) = r
+        {
+            // 修正前の再現（A/B の腕）・子の `tako remote serve` の stderr・OS の終了要求の失敗の文は
+            // tako が組まない: 日英とも手を加えずにそのまま
             if ja != *text || en != *text {
                 failures.push(format!(
                     "{}: {debug}: 修正前の再現の文に手を加えている\n  ja: {ja}\n  en: {en}",
@@ -24418,6 +24622,7 @@ fn remoteのstartとstopとstatusの人向けの表示は表示言語で組む()
         }
         for (line, c) in code.iter().filter(|(_, c)| {
             c.contains("Lang::Ja")
+                || c.contains("into_ja")
                 || c.contains("[\"detail\"]")
                 || c.contains("[\"degraded\"]")
                 || c.contains("get(\"degraded\")")
@@ -24425,7 +24630,8 @@ fn remoteのstartとstopとstatusの人向けの表示は表示言語で組む()
             failures.push(format!(
                 "{CLI_MAIN_PATH}:{line}: `{head}` が日本語に固定した文を出す = 英語表示にもその行だけ日本語で出る\
                  （応答の `detail` / `degraded` は日本語の値。`remote_generation::detail_of_status_in` / \
-                 `remote_starting::detail_of_status_in` / `remote_serve::degraded_warning_in` で組む）: {}",
+                 `remote_starting::detail_of_status_in` / `remote_serve::degraded_warning_in` で組む。\
+                 `spawn_daemon` / `daemon_stop` の断りは `into_ja()` でなく `text_in(lang)`）: {}",
                 c.trim()
             ));
         }
@@ -24572,4 +24778,332 @@ fn remoteの旧版と起こしている途中と自己検査の停止の説明�
         &remote_serve::degraded_warning_in(&fields, Lang::En).unwrap_or_default(),
     );
     report_all(f);
+}
+
+/// 停止要求が daemon に通らなかった理由（`ShutdownReject`）の見本と #2365 より前の文
+/// （`remote.rs` の `shutdown_acceptor_pid` / `post_admin_shutdown` / `ask_pidless_shutdown` /
+/// `shutdown_accepted` / `request_admin_shutdown` が書いていた文）。中身の文（OS・serde）は ASCII
+fn shutdown_reject_table() -> Vec<(ShutdownReject, String)> {
+    vec![
+        (ShutdownReject::TokenMissing, "管理トークンも無い".into()),
+        (
+            ShutdownReject::TokenUnreadable(EACCES.into()),
+            format!("管理トークンを読めない（{EACCES}）"),
+        ),
+        (
+            ShutdownReject::NoListenerRecord,
+            "待ち受けの記録が無い".into(),
+        ),
+        (
+            ShutdownReject::Unreachable {
+                endpoint: "127.0.0.1:41234".into(),
+                error: "Connection refused (os error 61)".into(),
+            },
+            "daemon へ届かない (127.0.0.1:41234): Connection refused (os error 61)".into(),
+        ),
+        (
+            ShutdownReject::NoHeaderBoundary,
+            "daemon の応答が不正（ヘッダ境界なし）".into(),
+        ),
+        (
+            ShutdownReject::NoStatusLine,
+            "daemon の応答が不正（ステータス行なし）".into(),
+        ),
+        (
+            ShutdownReject::TokenMismatch,
+            "管理トークンが合わない (401)".into(),
+        ),
+        (
+            ShutdownReject::NoShutdownRoute,
+            "停止要求の受け口が無い (404。#1599 より前の daemon か、tako 以外)".into(),
+        ),
+        (
+            ShutdownReject::NotAccepted(500),
+            "daemon が畳む要求を受け付けなかった (500)".into(),
+        ),
+        (
+            ShutdownReject::BodyUnparsable("expected value at line 1 column 1".into()),
+            "daemon の応答を解釈できない: expected value at line 1 column 1".into(),
+        ),
+        (
+            ShutdownReject::NoAcceptMark,
+            "daemon の応答に受け付けた印が無い".into(),
+        ),
+        (ShutdownReject::NoPid, "daemon の応答に pid が無い".into()),
+        (
+            ShutdownReject::OtherDaemon {
+                pid: 7,
+                expected: 42,
+            },
+            "畳むと答えたのは別の daemon（PID 7）で、確かめた PID 42 ではない".into(),
+        ),
+    ]
+}
+
+#[test]
+fn daemonの停止要求が通らなかった理由は全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致(
+) {
+    let table = shutdown_reject_table();
+    covers_every(
+        &table.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+        shutdown_reject_index,
+        SHUTDOWN_REJECT_VARIANTS,
+        "ShutdownReject",
+    );
+    let mut failures = Vec::new();
+    for (r, old) in &table {
+        let debug = format!("{r:?}");
+        let at = |lang| {
+            where_written(
+                REMOTE_REFUSAL_SRC,
+                REMOTE_REFUSAL_PATH,
+                "impl ShutdownReject {",
+                &debug,
+                lang,
+            )
+        };
+        check_setup_row(
+            &mut failures,
+            &debug,
+            &at,
+            old,
+            &r.text_in(Lang::Ja),
+            &r.text_in(Lang::En),
+        );
+        // 利用者へ返るのは PID ファイルの無い停止の断りの中（理由の文がそのまま入る）
+        let wrapped = RemoteRefusal::StopPidlessRefused(Box::new(PidlessRefusal {
+            reach: "127.0.0.1:41234".into(),
+            reason: r.clone(),
+            inspect: LSOF_41234.into(),
+            stop: "kill <PID>".into(),
+            remove: RM_PORT.into(),
+        }));
+        for lang in [Lang::Ja, Lang::En] {
+            if !wrapped.text_in(lang).contains(&r.text_in(lang)) {
+                failures.push(format!(
+                    "{}: {debug}: 停止の断りの中に同じ表示言語の理由が入っていない",
+                    at(lang)
+                ));
+            }
+        }
+        if let Some(c) = has_japanese(&wrapped.text_in(Lang::En)) {
+            failures.push(format!(
+                "{}: {debug}: 英語の停止の断りに日本語（{c}）が混ざる",
+                at(Lang::En)
+            ));
+        }
+    }
+    // 待ち受けの記録が無い stale 経路（`reach: None`）と、入れ替えで止められなかった理由が型の断りのとき
+    let stale = RemoteRefusal::StopStalePidUnverified {
+        pid: 4242,
+        reach: Some("127.0.0.1:41234".into()),
+        inspect: PS_4242.into(),
+        remove: RM_PORT.into(),
+    };
+    let renew = RemoteRefusal::DaemonRenewStopFailed {
+        pid: 4242,
+        why: Box::new(RemoteRefusal::StopPidUnverified {
+            pid: 4242,
+            inspect: PS_4242.into(),
+            manual: "kill 4242".into(),
+            remove: RM_PID.into(),
+        }),
+    };
+    for r in [stale, renew] {
+        if let Some(c) = has_japanese(&r.text_in(Lang::En)) {
+            failures.push(format!("{r:?}: 英語に日本語（{c}）が混ざる"));
+        }
+        if !r.text_in(Lang::Ja).starts_with(if matches!(r, RemoteRefusal::StopStalePidUnverified { .. }) {
+            PID_4242_UNVERIFIED
+        } else {
+            "旧版のまま動いているリモート daemon（PID 4242）を止められなかったため、入れ替えていません: "
+        }) {
+            failures.push(format!("{r:?}: 日本語の文の頭が #2365 より前と違う: {}", r.text_in(Lang::Ja)));
+        }
+    }
+    report_all(failures);
+}
+
+/// daemon の起動と停止（`remote.rs`）の断りは型（`RemoteRefusal` / `ShutdownReject`）を通り、日本語の固定文を
+/// 直に組まない（#2365 の続き）。日本語の文字を含む文字列リテラルを見つけたら、その文の頭（直前の `;` / `{` /
+/// `}` から）が `eprintln!(`（stderr の診断 = 日本語のまま）でなければ名指す
+const DAEMON_LIFECYCLE_FNS: &[&str] = &[
+    "pub fn spawn_daemon()",
+    "pub fn daemon_stop()",
+    "pub fn daemon_force_stop()",
+    "fn refuse_stop_while_starting()",
+    "fn forget_if_stopped(",
+    "fn daemon_stop_impl(",
+    "fn stop_verified_daemon(",
+    "fn request_then_wait(",
+    "fn still_running_after(",
+    "fn request_admin_shutdown(",
+    "fn send_admin_shutdown(",
+    "fn post_admin_shutdown(",
+    "fn shutdown_accepted(",
+    "fn shutdown_acceptor_pid(",
+    "fn ask_pidless_shutdown(",
+    "fn pidless_stop_refusal(",
+    "fn pidless_listener_outlived(",
+    "fn stale_stop_refusal(",
+    "fn stop_stale_generation(",
+    "fn kill_stale_daemon(",
+];
+
+fn daemon_lifecycle_violations(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for head in DAEMON_LIFECYCLE_FNS {
+        let Some(lines) = front_scope_lines(src, Some(head)) else {
+            out.push(format!("{REMOTE_PATH}:0 — `{head}` が無い（走査の空振り）"));
+            continue;
+        };
+        // コメントを落とした本文を 1 本の文字列にして、行番号を引けるように持つ
+        let mut code = String::new();
+        let mut starts = Vec::new();
+        for (no, line) in &lines {
+            starts.push((code.len(), *no));
+            code.push_str(strip_line_comment(line));
+            code.push('\n');
+        }
+        let line_of = |at: usize| {
+            starts
+                .iter()
+                .rev()
+                .find(|(off, _)| *off <= at)
+                .map(|(_, no)| *no)
+                .unwrap_or(0)
+        };
+        let bytes = code.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            // 文字列リテラルの終わり（`\"` は飛ばす）
+            let open = i;
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'"' {
+                j += if bytes[j] == b'\\' { 2 } else { 1 };
+            }
+            let literal = &code[open..j.min(code.len())];
+            if has_japanese(literal).is_some() {
+                let stmt = code[..open]
+                    .rfind([';', '{', '}'])
+                    .map(|k| k + 1)
+                    .unwrap_or(0);
+                if !code[stmt..open].contains("eprintln!(") {
+                    out.push(format!(
+                        "{REMOTE_PATH}:{} — `{head}` が日本語の固定文を直に組んでいる。利用者へ返る断りは \
+                         `RemoteRefusal` / `ShutdownReject` の腕に置く（英語表示に日本語が混ざる。#2365）: {}",
+                        line_of(open),
+                        literal.chars().take(40).collect::<String>()
+                    ));
+                }
+            }
+            i = j + 1;
+        }
+    }
+    out
+}
+
+#[test]
+fn remoteのdaemonの起動と停止の断りは型を通る() {
+    let found = daemon_lifecycle_violations(REMOTE_SRC);
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+#[test]
+fn remoteのdaemonの起動と停止の断りを日本語の固定文へ戻すと名指す() {
+    // 注入 1: #2365 より前の「既に起動中」
+    let injected = REMOTE_SRC.replacen(
+        "return Err(crate::RemoteRefusal::DaemonAlreadyRunning);",
+        "return Err(\"リモートサーバーは既に起動中\".to_string());",
+        1,
+    );
+    assert_ne!(injected, REMOTE_SRC, "注入「既に起動中」の対象が無い");
+    let found = daemon_lifecycle_violations(&injected);
+    assert!(
+        found
+            .iter()
+            .any(|o| o.contains("`pub fn spawn_daemon()`") && !o.contains(":0 ")),
+        "注入「既に起動中」を名指しできていない: {found:?}"
+    );
+    // 注入 2: 停止要求の理由を日本語の固定文で組む（複数行の format!）
+    let injected = REMOTE_SRC.replacen(
+        "401 => return Err(ShutdownReject::TokenMismatch),",
+        "401 => return Err(ShutdownReject::BodyUnparsable(format!(\n            \"管理トークンが合わない ({})\", 401\n        ))),",
+        1,
+    );
+    assert_ne!(injected, REMOTE_SRC, "注入「401」の対象が無い");
+    let found = daemon_lifecycle_violations(&injected);
+    assert!(
+        found
+            .iter()
+            .any(|o| o.contains("`fn shutdown_acceptor_pid(`")),
+        "注入「401」を名指しできていない: {found:?}"
+    );
+    // 陽性対照: stderr の診断（`eprintln!`）は日本語のまま = 名指さない
+    assert!(
+        REMOTE_SRC.contains("eprintln!(\n            \"stale な待ち受けを検出しました"),
+        "陽性対照（spawn_daemon の stderr の診断）が見つからない"
+    );
+}
+
+/// GUI 起動時の自動復帰（`remote_panel.rs`）は、断りを記録（persist.log・`last_autostart.detail`）へは日本語
+/// （`into_ja`）、画面（`start_error`・通知）へは表示言語（`to_string`）で載せる（#2365 の続き。記録の文は
+/// `tako remote status` の JSON の値 = 日英で変えない）
+const REMOTE_PANEL_PATH: &str = "crates/tako-app/src/remote_panel.rs";
+
+fn autostart_record_violations(panel: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(at) = panel.find("RequestOrigin::Autostart") else {
+        return vec![format!("{REMOTE_PANEL_PATH}:0 — 自動復帰の起動（`RequestOrigin::Autostart`）が無い（走査の空振り）")];
+    };
+    let line = panel[..at].lines().count();
+    let window: String = panel[at..].lines().take(90).collect::<Vec<_>>().join("\n");
+    if !window.contains("Err(refusal) => (refusal.clone().into_ja(), refusal.to_string())") {
+        out.push(format!(
+            "{REMOTE_PANEL_PATH}:{line} — 自動復帰の断りを記録には日本語（`into_ja`）・画面には表示言語（`to_string`）で\
+             分けていない。英語表示の GUI で persist.log と `last_autostart.detail`（status の JSON の値）が英語になる（#2365）"
+        ));
+    }
+    for (needle, what) in [
+        ("LastAutostart::failed(", "諦めた記録"),
+        ("log_attempt_failure(", "再試行の記録"),
+    ] {
+        if !window.contains(needle) {
+            out.push(format!(
+                "{REMOTE_PANEL_PATH}:{line} — {what}（`{needle}`）が見つからない（走査の空振り）"
+            ));
+        }
+    }
+    if !window.contains("start_error = Some(shown.clone())") {
+        out.push(format!(
+            "{REMOTE_PANEL_PATH}:{line} — 諦めたときに画面へ出す断りが表示言語の文（`shown`）でない（#2365）"
+        ));
+    }
+    out
+}
+
+#[test]
+fn 自動復帰の記録は日本語のまま画面は表示言語() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../")
+        .join(REMOTE_PANEL_PATH);
+    let panel = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} を読めない: {e}", path.display()));
+    let found = autostart_record_violations(&panel);
+    assert!(found.is_empty(), "{}", found.join("\n"));
+    // 注入: 記録まで表示言語の文で残す形は名指す
+    let injected = panel.replacen(
+        "Err(refusal) => (refusal.clone().into_ja(), refusal.to_string())",
+        "Err(refusal) => (refusal.to_string(), refusal.to_string())",
+        1,
+    );
+    assert_ne!(injected, panel, "注入の対象が無い");
+    assert!(
+        !autostart_record_violations(&injected).is_empty(),
+        "記録を表示言語で残す形を名指しできていない"
+    );
 }

@@ -412,7 +412,7 @@ impl TakoApp {
                         )
                     })
                     .await;
-                let err = match result {
+                let (err, shown) = match result {
                     Ok(info) => {
                         let n = attempts;
                         cx.background_executor()
@@ -435,7 +435,8 @@ impl TakoApp {
                         });
                         return;
                     }
-                    Err(e) => e,
+                    // 記録（persist.log・`last_autostart.detail`）は日本語、画面は表示言語（#2365）
+                    Err(refusal) => (refusal.clone().into_ja(), refusal.to_string()),
                 };
                 if attempts >= max {
                     let n = attempts;
@@ -453,7 +454,7 @@ impl TakoApp {
                         // 諦めたら起動ボタンを返す（ここから先は人が押せる）
                         app.remote.starting = false;
                         app.remote.autostart_failed = true;
-                        app.remote.start_error = Some(err.clone());
+                        app.remote.start_error = Some(shown.clone());
                         app.notify_ui_failure(
                             crate::sidebar::NoticeArea::RemoteAutostart,
                             crate::sidebar::NoticeArm::Issue1485,
@@ -461,7 +462,7 @@ impl TakoApp {
                             autostart::REASON_SPAWN_FAILED,
                             crate::ui_text::remote::notice_autostart_failed(
                                 n,
-                                &autostart::trim_detail(&err),
+                                &autostart::trim_detail(&shown),
                             ),
                         );
                         cx.notify();
@@ -555,7 +556,8 @@ impl TakoApp {
                             .filter(|s| !s.is_empty());
                         app.remote.start_error = None;
                     }
-                    Err(e) => app.remote.start_error = Some(e),
+                    // 断り（`RemoteRefusal`）は表示言語で文にする（#2365）
+                    Err(refusal) => app.remote.start_error = Some(refusal.to_string()),
                 }
                 cx.notify();
                 // 起動できたかは daemon 状態が正（起動情報が来ても後段で落ちる余地がある）
@@ -710,9 +712,9 @@ impl TakoApp {
                 .await;
             let _ = this.update(cx, |app, cx| {
                 app.remote.stopping = false;
-                if let Err(e) = result {
-                    // 黙って失敗させない（起動失敗と同じ扱い）
-                    app.remote.stop_error = Some(e);
+                if let Err(refusal) = result {
+                    // 黙って失敗させない（起動失敗と同じ扱い）。断りは表示言語で文にする（#2365）
+                    app.remote.stop_error = Some(refusal.to_string());
                 } else {
                     // 起動パネルへ切り替わるので、不足項目を最新にしておく
                     app.remote.start_error = None;

@@ -204,7 +204,7 @@ fn scan_remote(src: &str) -> Vec<Offender> {
             let code = code_only(&window);
             if !code.contains("renewable_in_status(") || !code.contains("stop_stale_generation(") {
                 push(
-                    line_of(at, &window, "\"リモートサーバーは既に起動中\""),
+                    line_of(at, &window, "RemoteRefusal::DaemonAlreadyRunning"),
                     "`spawn_daemon` が稼働中の daemon をパスの文字列（`running_exe != expected`）だけで比べ、\
                      一致したら「既に起動中」で返している。install の contents-swap はパスを変えないので、\
                      旧版が install も GUI の再起動もまたいで残る（#2518 の真因）"
@@ -420,8 +420,8 @@ fn パスの文字列だけで比べる形へ戻すと名指しする() {
     let mut s = sources(&root);
     s.remote = inject(
         &base.remote,
-        "        if !crate::remote_generation::renewable_in_status(&status) {\n            return Err(\"リモートサーバーは既に起動中\".to_string());\n        }\n",
-        "        return Err(\"リモートサーバーは既に起動中\".to_string());\n",
+        "        if !crate::remote_generation::renewable_in_status(&status) {\n            return Err(crate::RemoteRefusal::DaemonAlreadyRunning);\n        }\n",
+        "        return Err(crate::RemoteRefusal::DaemonAlreadyRunning);\n",
         "パスの文字列だけで比べる spawn_daemon",
     );
     let (at, _) = fn_window(&s.remote, "pub fn spawn_daemon()").unwrap();
@@ -431,7 +431,7 @@ fn パスの文字列だけで比べる形へ戻すと名指しする() {
             + s.remote
                 .lines()
                 .skip(at - 1)
-                .position(|l| l.contains("\"リモートサーバーは既に起動中\""))
+                .position(|l| l.contains("RemoteRefusal::DaemonAlreadyRunning"))
                 .unwrap()
             + 1
     );
