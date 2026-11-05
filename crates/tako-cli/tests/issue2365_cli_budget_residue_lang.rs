@@ -379,6 +379,43 @@ fn digits0(s: &str) -> String {
         .collect()
 }
 
+/// 版で**桁数**まで変わる数の行（起動時ロードの合計の「概算」と MCP カタログの行）だけ、数とその前の
+/// 右寄せの空白を 1 つの ` 0` に畳む。カタログは 10 万トークンの手前にあり、ツールの引数が少し増える
+/// だけで合計の桁が繰り上がる（#2743 で `b_check_over` の合計が 6 桁になった）。比べたいのは枠の文
+/// なので、他の行（作業ログ・規約の大きさ = 砂場で固定）の桁揃えは [`digits0`] のまま見る
+fn volatile_widths(s: &str) -> String {
+    s.split_inclusive('\n')
+        .map(|line| {
+            if !(line.contains("概算") || line.contains("MCP ツールカタログ")) {
+                return line.to_string();
+            }
+            let mut out = String::new();
+            let mut spaces = String::new();
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == ' ' {
+                    spaces.push(c);
+                } else if c.is_ascii_digit() {
+                    while chars.peek().is_some_and(char::is_ascii_digit) {
+                        chars.next();
+                    }
+                    if !spaces.is_empty() {
+                        out.push(' ');
+                    }
+                    spaces.clear();
+                    out.push('0');
+                } else {
+                    out.push_str(&spaces);
+                    spaces.clear();
+                    out.push(c);
+                }
+            }
+            out.push_str(&spaces);
+            out
+        })
+        .collect()
+}
+
 fn run_lang(lang: &str, reused: &Reused) -> Vec<(&'static str, bool, Out)> {
     let dump = std::env::var_os("I2365B_DUMP").map(PathBuf::from);
     cases()
@@ -634,10 +671,13 @@ fn context_budgetとtest_residueの人向けの表示は表示言語に従い日
             failures.push(format!("{name}: ケースが無い"));
             continue;
         };
-        if digits0(&j.stdout) != stdout || !j.stderr.is_empty() {
+        let (got, want) = (
+            volatile_widths(&digits0(&j.stdout)),
+            volatile_widths(stdout),
+        );
+        if got != want || !j.stderr.is_empty() {
             failures.push(format!(
-                "{name}: 日本語表示が #2365 より前と違う\n--- want\n{stdout}--- got\n{}--- stderr\n{}",
-                digits0(&j.stdout),
+                "{name}: 日本語表示が #2365 より前と違う\n--- want\n{want}--- got\n{got}--- stderr\n{}",
                 j.stderr
             ));
         }

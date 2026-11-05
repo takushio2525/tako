@@ -5507,6 +5507,7 @@ fn dispatch_send(
             tmux_session,
             await_prompt: false,
             paste_guard: None,
+            attachments: Vec::new(),
         }
     } else {
         crate::protocol::Request::Send {
@@ -5516,6 +5517,7 @@ fn dispatch_send(
             tmux_session,
             await_prompt: false,
             paste_guard: paste_guard.map(str::to_string),
+            attachments: Vec::new(),
         }
     };
 
@@ -6998,6 +7000,7 @@ fn handle_tab_master(
             tmux_session: None,
             await_prompt: false,
             paste_guard: None,
+            attachments: Vec::new(),
         },
         crate::remote_refusal::AppVia::MasterLaunch,
     ) {
@@ -7084,8 +7087,9 @@ fn handle_upload(
     device: &crate::remote_auth::Device,
     pane_mapping: &Arc<RwLock<PaneMapping>>,
 ) {
-    const MAX_UPLOAD_SIZE: u64 = 20 * 1024 * 1024; // 20MB
-    const UPLOAD_DIR: &str = ".tako-remote-uploads";
+    // 置き場の名前と上限の正本は `tako_core::uploads`（`tako_send_input` の attachments と共有。#2743）
+    const MAX_UPLOAD_SIZE: u64 = tako_core::uploads::MAX_BYTES; // 20MB
+    const UPLOAD_DIR: &str = tako_core::uploads::DIR_NAME;
 
     // Content-Length の事前チェック
     let content_length = request

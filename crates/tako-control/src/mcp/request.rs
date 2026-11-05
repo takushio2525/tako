@@ -42,10 +42,30 @@ pub(super) fn build_request(
                 focus: bool_arg(args, "focus")?,
             }
         }
+        // #2743: `keys` を渡すと文字の代わりに生のキーを名前で送る（ツールは増やさない。
+        // 語彙は `tako_core::backend::key_name_bytes` の 1 か所 = 名前の検証は dispatch）
+        "tako_send_input" if args.get("keys").is_some_and(|v| !v.is_null()) => {
+            for other in ["text", "click", "attachments"] {
+                if args.get(other).is_some_and(|v| !v.is_null()) {
+                    return Err(Reason::NotTogether("keys", other).to_string());
+                }
+            }
+            if bool_arg(args, "await_prompt")? == Some(true) {
+                return Err(Reason::NotTogether("keys", "await_prompt").to_string());
+            }
+            Request::SendKeys {
+                pane: Some(required_u64(args, "pane")?),
+                keys: str_vec_arg(args, "keys")?.ok_or_else(|| missing("keys"))?,
+                tmux_session: str_arg(args, "tmux_session")?,
+            }
+        }
         // #1961: `click` を渡すと文字の代わりに左クリック（ツールは増やさない）
         "tako_send_input" if args.get("click").is_some() => {
             if args.get("text").is_some() {
                 return Err(Reason::NotTogether("click", "text").to_string());
+            }
+            if args.get("attachments").is_some_and(|v| !v.is_null()) {
+                return Err(Reason::NotTogether("click", "attachments").to_string());
             }
             let click = args
                 .get("click")
@@ -64,15 +84,25 @@ pub(super) fn build_request(
                 col: cell("col")?,
             }
         }
-        "tako_send_input" => Request::Send {
-            pane: Some(required_u64(args, "pane")?),
-            text: str_arg(args, "text")?.ok_or_else(|| missing("text"))?,
-            newline: bool_arg(args, "newline")?.unwrap_or(true),
-            tmux_session: str_arg(args, "tmux_session")?,
-            await_prompt: bool_arg(args, "await_prompt")?.unwrap_or(false),
-            // #2050: MCP は AI の送信 = 止めずに送って応答で警告するだけ（人の中継の印は付けない）
-            paste_guard: None,
-        },
+        "tako_send_input" => {
+            // #2743: 添付だけなら text は省ける（本文は写した先のパスだけになる）
+            let attachments = str_vec_arg(args, "attachments")?.unwrap_or_default();
+            let text = match str_arg(args, "text")? {
+                Some(text) => text,
+                None if !attachments.is_empty() => String::new(),
+                None => return Err(missing("text")),
+            };
+            Request::Send {
+                pane: Some(required_u64(args, "pane")?),
+                text,
+                newline: bool_arg(args, "newline")?.unwrap_or(true),
+                tmux_session: str_arg(args, "tmux_session")?,
+                await_prompt: bool_arg(args, "await_prompt")?.unwrap_or(false),
+                // #2050: MCP は AI の送信 = 止めずに送って応答で警告するだけ（人の中継の印は付けない）
+                paste_guard: None,
+                attachments,
+            }
+        }
         "tako_read_pane" => Request::Read {
             pane: Some(required_u64(args, "pane")?),
             lines: u64_arg(args, "lines")?.map(|n| n as usize),

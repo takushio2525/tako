@@ -983,6 +983,7 @@ impl TakoApp {
                 tmux_session: None,
                 await_prompt: false,
                 paste_guard: None,
+                attachments: Vec::new(),
             },
             PaneOrigin::User,
         );

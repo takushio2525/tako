@@ -34,7 +34,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 
 | ツール名 | 説明 |
 |---|---|
-| `tako_send_input` | ペインへテキストを送信する（全画面 TUI へは送達確認付きで配送） |
+| `tako_send_input` | ペインへテキストを送信する（全画面 TUI へは送達確認付きで配送）。`keys` で生のキー（Escape 等）、`attachments` でファイルの添付 |
 | `tako_read_pane` | ペインの画面内容をテキストで取得する |
 | `tako_set_title` | ペインの表示タイトルと役割ラベル（role）を設定する |
 | `tako_show_command` | コピー / 実行ボタンつきのコマンド提案カードを出す（会話に直書きすると折り返しでコピーが壊れるため） |

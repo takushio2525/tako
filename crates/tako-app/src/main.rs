@@ -20408,6 +20408,7 @@ impl TakoApp {
                     tmux_session: None,
                     await_prompt: false,
                     paste_guard: None,
+                    attachments: Vec::new(),
                 },
                 PaneOrigin::User,
             );
@@ -20504,6 +20505,7 @@ impl TakoApp {
                     tmux_session: None,
                     await_prompt: false,
                     paste_guard: None,
+                    attachments: Vec::new(),
                 },
                 PaneOrigin::User,
             );
@@ -52773,6 +52775,7 @@ mod self_test {
                             tmux_session: None,
                             await_prompt: false,
                             paste_guard: None,
+                            attachments: Vec::new(),
                         },
                         PaneOrigin::User,
                     );
@@ -52823,6 +52826,7 @@ mod self_test {
                                 tmux_session: None,
                                 await_prompt: false,
                                 paste_guard: None,
+                                attachments: Vec::new(),
                             },
                             PaneOrigin::User,
                         );
@@ -75537,6 +75541,7 @@ mod self_test {
                             tmux_session: None,
                             await_prompt: false,
                             paste_guard: None,
+                            attachments: Vec::new(),
                         },
                         PaneOrigin::Cli,
                     )
@@ -84438,6 +84443,7 @@ mod self_test {
                                 tmux_session: None,
                                 await_prompt: false,
                                 paste_guard: None,
+                                attachments: Vec::new(),
                             },
                             PaneOrigin::User,
                         )
@@ -84568,6 +84574,7 @@ mod self_test {
                                 tmux_session: None,
                                 await_prompt: false,
                                 paste_guard: None,
+                                attachments: Vec::new(),
                             },
                             PaneOrigin::User,
                         )
@@ -86843,6 +86850,7 @@ mod self_test {
                             tmux_session: None,
                             await_prompt: false,
                             paste_guard: None,
+                            attachments: Vec::new(),
                         },
                         PaneOrigin::User,
                     );
@@ -88808,6 +88816,7 @@ mod self_test {
                         tmux_session: None,
                         await_prompt: false,
                         paste_guard: None,
+                        attachments: Vec::new(),
                     },
                     cx,
                 )

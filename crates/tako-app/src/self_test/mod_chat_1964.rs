@@ -202,6 +202,7 @@ async fn keys(window: WindowHandle<TakoApp>, cx: &mut AsyncApp, pane: PaneId, te
             tmux_session: None,
             await_prompt: false,
             paste_guard: None,
+            attachments: Vec::new(),
         },
     );
     sleep(cx, 600).await;

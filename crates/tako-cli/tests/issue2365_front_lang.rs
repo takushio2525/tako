@@ -247,6 +247,12 @@ fn cases() -> Vec<Case> {
             &["run-config", "a.rs", "--env", "NOEQ"],
             "--env は K=V の形で指定する（指定: \"NOEQ\"）",
         ),
+        // #2743: `--key` は text と同時に渡せない（clap の英語の文ではなく前段の Reason）
+        cli(
+            "send_key_text",
+            &["send", "--key", "Escape", "x"],
+            "--key と text は同時に指定しない",
+        ),
         // ---- MCP の前段（mcp/request.rs）----
         mcp(
             "click_shape",
@@ -259,6 +265,19 @@ fn cases() -> Vec<Case> {
             "tako_send_input",
             r#"{"pane":1,"click":{"row":-1,"col":0}}"#,
             "click.row を 0 以上の整数で指定する",
+        ),
+        // #2743: keys は text / click と排他
+        mcp(
+            "keys_text",
+            "tako_send_input",
+            r#"{"pane":1,"keys":["Escape"],"text":"x"}"#,
+            "keys と text は同時に指定しない",
+        ),
+        mcp(
+            "keys_click",
+            "tako_send_input",
+            r#"{"pane":1,"keys":["Escape"],"click":{"row":0,"col":0}}"#,
+            "keys と click は同時に指定しない",
         ),
         mcp(
             "focus",

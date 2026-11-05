@@ -925,9 +925,11 @@ fn reason_index(r: &Reason) -> usize {
         Reason::RecoverCopyFailed(_) => 361,
         // #2365 の続き: CLI の `tako queue` の cancel / priority / start が調停役に届かない
         Reason::QueueArbiterOffline => 362,
+        // #2743: `tako_send_input` の attachments の写す先（ペインの作業ディレクトリ）が分からない
+        Reason::AttachCwdUnknown => 363,
     }
 }
-const REASON_VARIANTS: usize = 363;
+const REASON_VARIANTS: usize = 364;
 
 /// 全バリアントの見本（値は ASCII。英語側の検査で値の日本語を拾わないため）
 fn reason_samples() -> Vec<Reason> {
@@ -1586,6 +1588,7 @@ fn reason_samples() -> Vec<Reason> {
         Reason::RecoverWriteFailed("Permission denied (os error 13)".into()),
         Reason::RecoverCopyFailed("Permission denied (os error 13)".into()),
         Reason::QueueArbiterOffline,
+        Reason::AttachCwdUnknown,
     ]
 }
 
@@ -2027,6 +2030,8 @@ const REASON_OLD_JA: [&str; REASON_VARIANTS] = [
     "復元コピーに失敗: Permission denied (os error 13)",
     // #2365 の続き: CLI `main.rs` の `QUEUE_OFFLINE_NOTE`（cancel / priority / start の断りに使っていた）
     "順番待ちは無効（tako が起動していない）",
+    // #2743: 新しい理由（#2365 より前の文は無いので今の日本語）
+    "添付を写す先（ペインの作業ディレクトリ）が分からない",
 ];
 
 /// [`REASON_OLD_JA`] の旧文。引き継ぎの材料が無い断りは、dispatch の固定文の後ろに tako-core の雛形

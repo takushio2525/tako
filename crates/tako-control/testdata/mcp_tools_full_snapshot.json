@@ -64,6 +64,13 @@
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "attachments": {
+          "description": "添付の絶対パス（各 20MB まで）。ペインの cwd/.tako-remote-uploads/ へ写し、text の後ろにそのパスを足して送る",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "await_prompt": {
           "description": "claude TUI の ❯ プロンプト表示を待ってから送信する（既定 false。子の Claude Code へ送るときに使う）",
           "type": "boolean"
@@ -86,6 +93,13 @@
             "col"
           ],
           "type": "object"
+        },
+        "keys": {
+          "description": "生のキー名を順に送る（text / click と排他）。[\"Escape\"] で生成を止める。Enter / Tab / Space / Up / Down / Left / Right / C-c 等 / 1 文字",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "newline": {
           "description": "末尾に改行を付けるか（省略時 true。プロンプトへの部分入力は false）",

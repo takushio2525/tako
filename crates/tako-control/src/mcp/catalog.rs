@@ -154,6 +154,18 @@ pub fn tools() -> Vec<Value> {
                         "additionalProperties": false,
                         "description": "左クリックするセル（tako_read_pane の行・桁）",
                     },
+                    "keys": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "生のキー名を順に送る（text / click と排他）。[\"Escape\"] で生成を止める。\
+                            Enter / Tab / Space / Up / Down / Left / Right / C-c 等 / 1 文字",
+                    },
+                    "attachments": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "添付の絶対パス（各 20MB まで）。ペインの cwd/.tako-remote-uploads/ へ写し、\
+                            text の後ろにそのパスを足して送る",
+                    },
                     "newline": {
                         "type": "boolean",
                         "description": "末尾に改行を付けるか（省略時 true。プロンプトへの部分入力は false）",

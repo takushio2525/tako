@@ -433,6 +433,8 @@ pub enum Reason {
     ClickShape,
     /// `click.<key> を 0 以上の整数で指定する`
     ClickCell(String),
+    /// 添付（#2743）を写す先 = ペインの作業ディレクトリが分からない（`tako_send_input` の attachments）
+    AttachCwdUnknown,
     /// `axis は "x" か "y" を指定する`（`tako_resize_pane`）
     AxisXOrY,
     /// `enabled と reattach は併用できない（切替か再 attach のどちらか）`（`tako_persist`）
@@ -1751,6 +1753,13 @@ impl Reason {
             }
             (Self::ClickCell(key), Ja) => format!("click.{key} を 0 以上の整数で指定する"),
             (Self::ClickCell(key), En) => format!("click.{key} must be an integer of 0 or more"),
+            (Self::AttachCwdUnknown, Ja) => {
+                "添付を写す先（ペインの作業ディレクトリ）が分からない".to_string()
+            }
+            (Self::AttachCwdUnknown, En) => {
+                "cannot tell where to copy the attachments (the pane's working directory is unknown)"
+                    .to_string()
+            }
             (Self::AxisXOrY, Ja) => "axis は \"x\" か \"y\" を指定する".to_string(),
             (Self::AxisXOrY, En) => "axis must be \"x\" or \"y\"".to_string(),
             (Self::ReattachWithEnabled, Ja) => {
@@ -7097,6 +7106,9 @@ pub enum OffloadJob {
         row: usize,
         col: usize,
     },
+    /// 添付つきの送信（#2743）。送れる状態の確かめと写す先（ペインの cwd）の解決は UI スレッド、
+    /// 置き場への写し（1 件 20 MB まで）は background、送る本体は [`OffloadContinuation::SendAttached`]
+    SendAttach(Box<SendAttachJob>),
     /// ワークスペース横断検索（#1694）。UI スレッドでは探す範囲（workspace を読む）と右パネルへ
     /// 出す検索の登録だけを行い、走査と照合は background。出す検索の答えを置き場へ置くのは
     /// [`OffloadContinuation::WorkspaceSearch`] で UI スレッドへ戻す
@@ -7357,6 +7369,8 @@ pub enum OffloadContinuation {
     ClosePlace(Box<Request>),
     /// `tako mod` の着地（#2663。[`crate::claude_mod::land`]）。報告で読んだ ui.json の置き場を hub へ写して応答する
     Mod(Box<crate::claude_mod::Landing>),
+    /// 添付を写し終えた送信の着地（#2743。[`send_attached_land`]）
+    SendAttached(Box<SendAttachLanding>),
 }
 
 impl OffloadContinuation {
@@ -7380,6 +7394,8 @@ impl OffloadContinuation {
             | Self::SpawnLaunch(_) => false,
             // #2663: 同期の腕の判定（`protocol::changes_layout` の `Request::Mod`）と同じ = 幾何に触らない
             Self::Mod(_) => false,
+            // #2743: 同期の腕の判定（`Request::Send`）と同じ = ペインの中身だけ
+            Self::SendAttached(_) => false,
             // #1510: 押す（ペインを開く・master を起こす）ときだけタブが増える
             Self::Welcome(landing) => landing.probe_for == WelcomeProbeFor::Next,
             // #2086: 同期の腕と同じ判定（返答だけが真 = master を起こすとタブが増える）
@@ -7466,6 +7482,7 @@ pub fn finish_offload(
             close_place(host, *request, origin).map(CloseRecord::finish)
         }
         OffloadContinuation::Mod(landing) => crate::claude_mod::land(host, *landing),
+        OffloadContinuation::SendAttached(landing) => send_attached_land(host, *landing, origin),
     }
 }
 
@@ -7939,6 +7956,32 @@ pub fn prepare_offload(
         {
             Some(Ok(OffloadJob::TmuxWrite(Box::new(request.clone()))))
         }
+        // #2743: 添付つきの送信は置き場への写し（ファイルの読み書き）を UI スレッドで待たない。
+        // ここ（UI）では送れる状態か（ダイアログ）と写す先（ペインの cwd）だけを決める
+        Request::Send {
+            pane,
+            text,
+            newline,
+            tmux_session,
+            await_prompt,
+            paste_guard,
+            attachments,
+        } if !attachments.is_empty() => Some(
+            attach_plan(host, *pane, tmux_session.as_deref(), text, *await_prompt).map(|cwd| {
+                OffloadJob::SendAttach(Box::new(SendAttachJob {
+                    parts: SendParts {
+                        pane: *pane,
+                        text: text.clone(),
+                        newline: *newline,
+                        tmux_session: tmux_session.clone(),
+                        await_prompt: *await_prompt,
+                        paste_guard: paste_guard.clone(),
+                    },
+                    cwd,
+                    attachments: attachments.clone(),
+                }))
+            }),
+        ),
         // #1961: 器のペインへのクリックは器を起こすので background へ（直接ペインは PTY への
         // 書き込みだけなので `None` = 同期の dispatch）
         Request::PaneClick { pane, row, col } => match pane_click_plan(host, *pane) {
@@ -8192,6 +8235,10 @@ impl OffloadJob {
             }
             OffloadJob::LspRename(job) => {
                 OffloadOutcome::OnUi(OffloadContinuation::LspRename(Box::new(job.run())))
+            }
+            // #2743: 写し終えたら送る本体を UI スレッドへ戻す（ペインへ書くのは UI スレッドだけ）
+            OffloadJob::SendAttach(job) => {
+                OffloadOutcome::OnUi(OffloadContinuation::SendAttached(Box::new(job.run())))
             }
             OffloadJob::FileCopy(job) => {
                 let outcomes = run_copy_items(&job.items, job.naming, job.ticket.progress());
@@ -8448,6 +8495,9 @@ impl OffloadJob {
             OffloadJob::FileCopy(_) => Err(DispatchError::Operation(
                 "コピーは run_staged で走らせる（ツリーの読み直しに UI スレッドの続きが要る）"
                     .into(),
+            )),
+            OffloadJob::SendAttach(_) => Err(DispatchError::Operation(
+                "添付つきの送信は run_staged で走らせる（送る本体に UI スレッドの続きが要る）".into(),
             )),
             OffloadJob::LspCompletion(_) => Err(DispatchError::Operation(
                 "補完は run_staged で走らせる（絞り込みと確定に UI スレッドの続きが要る）".into(),
@@ -10165,26 +10215,37 @@ fn dispatch_inner(
             tmux_session,
             await_prompt,
             paste_guard,
+            attachments,
         } => {
-            // #2050: 鍵らしき文字の判定（AI の送信は警告だけ・人の中継は段に従う）。
-            // 送る前に止めるときは送達の経路へ入らない
-            let (warning, ack) =
-                match send_paste_gate(host, pane, &text, paste_guard.as_deref(), origin)? {
-                    SendGate::Blocked(reply) => return Ok(reply),
-                    SendGate::Pass => (None, None),
-                    SendGate::Deliver { warning, ack } => (warning, ack),
-                };
-            let acked = ack.map(|pane| (pane, text.clone()));
-            let out = send_to_pane(host, pane, text, newline, tmux_session, await_prompt)?;
-            // 届けた値はそのペインの確認済み（mod の送信時の確認で二度確かめない）
-            if let Some((pane, text)) = acked {
-                crate::paste_guard::note_delivered(pane, &text);
-            }
-            Ok(match warning {
-                Some(warning) => with_paste_guard(out, warning),
-                None => out,
-            })
+            // #2743: 添付はペインの作業ディレクトリの置き場へ写してから、そのパスを本文へ足して送る。
+            // IPC / MCP は写す段を background へ出す（[`OffloadJob::SendAttach`]）ので、ここで写すのは
+            // offload を通らない同期の呼び手（テスト・`TAKO_OFFLOAD=0`）だけ
+            let staged = if attachments.is_empty() {
+                Vec::new()
+            } else {
+                let cwd = attach_plan(host, pane, tmux_session.as_deref(), &text, await_prompt)?;
+                stage_attachments(&cwd, &attachments)?
+            };
+            send_reply(
+                host,
+                origin,
+                SendParts {
+                    pane,
+                    text,
+                    newline,
+                    tmux_session,
+                    await_prompt,
+                    paste_guard,
+                },
+                staged,
+            )
         }
+
+        Request::SendKeys {
+            pane,
+            keys,
+            tmux_session,
+        } => send_keys_to_pane(host, pane, &keys, tmux_session.as_deref()),
 
         Request::Read {
             pane,
@@ -22943,6 +23004,15 @@ fn dialog_blocks_send(
     if text.contains('\u{1b}') {
         return None;
     }
+    dialog_blocks_input(host, pane, tmux_session)
+}
+
+/// 選択肢ダイアログの表示中なら断る（`Send` と `SendKeys` = #2743 の共通部。例外なし）
+fn dialog_blocks_input(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    tmux_session: Option<&str>,
+) -> Option<DispatchError> {
     let (pane_id, lines) = send_target_screen(host, pane, tmux_session)?;
     let dialog = crate::claude_tui::detect_choice_dialog(&lines)?;
     dialog_send_refusal(&dialog, pane_id).map(Reason::operation)
@@ -26960,6 +27030,217 @@ fn with_paste_guard(out: Value, warning: Value) -> Value {
     }
 }
 
+/// `Send` の添付以外の欄（#2743。同期の腕と添付の着地が [`send_reply`] へ渡す）
+pub struct SendParts {
+    pane: Option<u64>,
+    text: String,
+    newline: bool,
+    tmux_session: Option<String>,
+    await_prompt: bool,
+    paste_guard: Option<String>,
+}
+
+/// `Send` の本体（同期の腕と添付の着地 [`OffloadContinuation::SendAttached`] の 1 実装。#2743）。
+///
+/// `staged` は写し終えた添付（空 = 添付なし）。そのパスを本文の後ろへ足して送り、応答の
+/// `attachments` に載せる。送らずに終わったとき（貼り付けの確認で止めた・送れなかった）は
+/// この送信のために写したファイルを消す（送っていない添付を置き場に残さない）
+fn send_reply(
+    host: &mut dyn ControlHost,
+    origin: PaneOrigin,
+    parts: SendParts,
+    staged: Vec<tako_core::uploads::Staged>,
+) -> Result<Value, DispatchError> {
+    let SendParts {
+        pane,
+        text,
+        newline,
+        tmux_session,
+        await_prompt,
+        paste_guard,
+    } = parts;
+    let text = tako_core::uploads::compose_text(&text, &staged);
+    let discard = |staged: &[tako_core::uploads::Staged]| {
+        for s in staged {
+            let _ = std::fs::remove_file(&s.path);
+        }
+    };
+    // #2050: 鍵らしき文字の判定（AI の送信は警告だけ・人の中継は段に従う）。
+    // 送る前に止めるときは送達の経路へ入らない
+    let gate = match send_paste_gate(host, pane, &text, paste_guard.as_deref(), origin) {
+        Ok(gate) => gate,
+        Err(e) => {
+            discard(&staged);
+            return Err(e);
+        }
+    };
+    let (warning, ack) = match gate {
+        SendGate::Blocked(reply) => {
+            discard(&staged);
+            return Ok(reply);
+        }
+        SendGate::Pass => (None, None),
+        SendGate::Deliver { warning, ack } => (warning, ack),
+    };
+    let acked = ack.map(|pane| (pane, text.clone()));
+    let out = match send_to_pane(host, pane, text, newline, tmux_session, await_prompt) {
+        Ok(out) => out,
+        Err(e) => {
+            discard(&staged);
+            return Err(e);
+        }
+    };
+    // 届けた値はそのペインの確認済み（mod の送信時の確認で二度確かめない）
+    if let Some((pane, text)) = acked {
+        crate::paste_guard::note_delivered(pane, &text);
+    }
+    let out = match warning {
+        Some(warning) => with_paste_guard(out, warning),
+        None => out,
+    };
+    Ok(if staged.is_empty() {
+        out
+    } else {
+        with_attachments(out, &staged)
+    })
+}
+
+/// 応答へ写した添付を載せる（#2743。形は [`with_paste_guard`] と同じ流儀）
+fn with_attachments(out: Value, staged: &[tako_core::uploads::Staged]) -> Value {
+    let list = Value::Array(
+        staged
+            .iter()
+            .map(tako_core::uploads::Staged::to_json)
+            .collect(),
+    );
+    match out {
+        Value::Object(mut map) => {
+            map.insert("attachments".into(), list);
+            Value::Object(map)
+        }
+        Value::Null => json!({ "attachments": list }),
+        other => json!({ "result": other, "attachments": list }),
+    }
+}
+
+/// 添付（#2743）を写す前の段（UI スレッド。メモリだけを読む）: 送れる状態か（選択肢ダイアログ）を
+/// 先に確かめ、写す先 = ペインの作業ディレクトリ（シェル統合の cwd・無ければ起動時の cwd）を決める。
+/// 送れないと分かっている送信のためにファイルを写さない。`await_prompt` は送る直前まで
+/// 待つ（ダイアログは送達フローが面倒を見る）ので、ここではダイアログを見ない
+fn attach_plan(
+    host: &dyn ControlHost,
+    pane: Option<u64>,
+    tmux_session: Option<&str>,
+    text: &str,
+    await_prompt: bool,
+) -> Result<PathBuf, DispatchError> {
+    if !await_prompt {
+        if let Some(err) = dialog_blocks_send(host, pane, tmux_session, text) {
+            return Err(err);
+        }
+    }
+    let (_, target) = resolve_pane(host.workspace(), pane)?;
+    host.session(target)
+        .and_then(|s| s.cwd())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| Reason::AttachCwdUnknown.operation())
+}
+
+/// 添付を置き場へ写す（#2743。同期の腕と background の 1 実装 = `tako_core::uploads::stage_all`）
+fn stage_attachments(
+    cwd: &Path,
+    attachments: &[String],
+) -> Result<Vec<tako_core::uploads::Staged>, DispatchError> {
+    let sources: Vec<PathBuf> = attachments.iter().map(PathBuf::from).collect();
+    tako_core::uploads::stage_all(cwd, &sources)
+        .map_err(|refusal| DispatchError::Operation(refusal.to_string()))
+}
+
+/// 添付を写す background の段（#2743。[`OffloadJob::SendAttach`]）
+pub struct SendAttachJob {
+    parts: SendParts,
+    cwd: PathBuf,
+    attachments: Vec<String>,
+}
+
+/// 写した結果を UI スレッドへ運ぶもの（#2743。[`OffloadContinuation::SendAttached`]）
+pub struct SendAttachLanding {
+    parts: SendParts,
+    staged: Result<Vec<tako_core::uploads::Staged>, DispatchError>,
+}
+
+impl SendAttachJob {
+    fn run(self) -> SendAttachLanding {
+        SendAttachLanding {
+            staged: stage_attachments(&self.cwd, &self.attachments),
+            parts: self.parts,
+        }
+    }
+}
+
+/// 添付の着地（#2743）: 写せていれば送る（本体は同期の腕と同じ [`send_reply`]）
+fn send_attached_land(
+    host: &mut dyn ControlHost,
+    landing: SendAttachLanding,
+    origin: PaneOrigin,
+) -> Result<Value, DispatchError> {
+    let SendAttachLanding { parts, staged } = landing;
+    send_reply(host, origin, parts, staged?)
+}
+
+/// 生のキーを名前で送る（#2743。`Request::SendKeys`）。
+///
+/// 名前は全部を先にバイト列へ直す（1 つでも知らない名前なら何も送らない）。選択肢ダイアログの
+/// 表示中は `Send` と同じく断る: 数字・Enter は選択の確定になり、矢印・Escape もダイアログの
+/// 操作になる（応答は `tako_orchestrator_respond` の 1 本 = 実在の再検証つき）。
+/// `Send` の生の ESC を含む文字列の素通し（#748）とは違い、ここに例外は無い。
+/// 1 キーずつ書く（続けて送ったキーは端末側で 1 回に読まれることがある）
+fn send_keys_to_pane(
+    host: &mut dyn ControlHost,
+    pane: Option<u64>,
+    keys: &[String],
+    tmux_session: Option<&str>,
+) -> Result<Value, DispatchError> {
+    let bytes = tako_core::backend::keys_to_bytes(keys)
+        .map_err(|refusal| DispatchError::InvalidParams(refusal.to_string()))?;
+    if let Some(err) = dialog_blocks_input(host, pane, tmux_session) {
+        return Err(err);
+    }
+    let reply = json!({ "keys": keys });
+    match resolve_pane(host.workspace(), pane) {
+        Ok((_, target)) => {
+            let session = host
+                .session(target)
+                .ok_or(DispatchError::NoSession(target.as_u64()))?;
+            for chunk in bytes {
+                session.write(chunk);
+            }
+            Ok(reply)
+        }
+        Err(e) => {
+            // ペインが解決できなければ tmux session へ名前のまま渡す（`send-keys` が同じ語彙を解釈する）
+            let Some(ts) = tmux_session else {
+                return Err(e);
+            };
+            let (session, access) = crate::reach::detached_session(ts).ok_or_else(|| {
+                DispatchError::Operation(
+                    crate::reach::UnreachableReason::NoDetachedAccess {
+                        session: ts.to_string(),
+                        note: crate::reach::no_detached_access_note(),
+                    }
+                    .note(),
+                )
+            })?;
+            for key in keys {
+                access
+                    .send_key(&session, key)
+                    .map_err(|e| DispatchError::Operation(e.to_string()))?;
+            }
+            Ok(reply)
+        }
+    }
+}
+
 /// ペインへのテキスト送信の本体（FR-2.2.2。`Request::Send` の腕から #2050 で関数へ出した。
 /// 中身は変えていない = 送達の経路・応答の形は #2050 前と同じ）
 fn send_to_pane(
@@ -28897,6 +29178,7 @@ fn deliver_user_task_response(
                     tmux_session: None,
                     await_prompt: true,
                     paste_guard: None,
+                    attachments: Vec::new(),
                 },
                 PaneOrigin::User,
             ) {
@@ -32130,6 +32412,7 @@ mod tests {
                 tmux_session: None,
                 await_prompt: true,
                 paste_guard: None,
+                attachments: Vec::new(),
             },
             PaneOrigin::Mcp,
         )
@@ -32175,6 +32458,7 @@ mod tests {
                 tmux_session: None,
                 await_prompt: true,
                 paste_guard: None,
+                attachments: Vec::new(),
             },
             PaneOrigin::Mcp,
         )
@@ -32267,6 +32551,7 @@ mod tests {
                 tmux_session: None,
                 await_prompt: true,
                 paste_guard: None,
+                attachments: Vec::new(),
             },
             PaneOrigin::Mcp,
         )
@@ -32306,6 +32591,7 @@ mod tests {
                 tmux_session: None,
                 await_prompt: true,
                 paste_guard: None,
+                attachments: Vec::new(),
             },
             PaneOrigin::Mcp,
         )
@@ -32328,6 +32614,7 @@ mod tests {
                 tmux_session: None,
                 await_prompt: true,
                 paste_guard: None,
+                attachments: Vec::new(),
             },
             PaneOrigin::Mcp,
         )
@@ -34534,6 +34821,7 @@ mod tests {
                 tmux_session: None,
                 await_prompt: false,
                 paste_guard: None,
+                attachments: Vec::new(),
             },
             PaneOrigin::Cli,
         )
@@ -45448,6 +45736,259 @@ tako | pane 2 [ compact ]       [-]
         // 別のダイアログへ遷移した場合も「このダイアログは解消」と扱う
         let next: Vec<String> = MODEL_SELECT_748.lines().map(|l| l.to_string()).collect();
         assert!(!dialog_still_open(&next, &before));
+    }
+
+    // --- #2743: tako_send_input の keys / attachments（実 PTY の子が受け取ったバイトを見る） ---
+
+    /// 実 PTY の子: 端末を raw にしてから `screen` を描き、受け取ったバイトを `out` へ `count`
+    /// バイトだけ書いて眠る。画面の最後の行が見えるまで待ってから返す（raw にする前に送った
+    /// バイトは cooked の端末に食われうるので、描画 = raw の後を待つ）
+    #[cfg(unix)]
+    fn i2743_recorder(
+        host: &mut MockHost,
+        screen: &str,
+        out: &Path,
+        count: usize,
+        cwd: Option<PathBuf>,
+    ) -> u64 {
+        use std::time::{Duration, Instant};
+        let pane = host.root_pane();
+        let script = format!(
+            "stty raw -echo; printf '%s' \"$I2743_SCREEN\"; \
+             dd bs=1 count={count} of=\"$I2743_OUT\" 2>/dev/null; sleep 60"
+        );
+        let (session, _rx) = TerminalSession::spawn(
+            120,
+            30,
+            SpawnOptions {
+                command: Some(tako_core::SpawnCommand {
+                    program: "/bin/sh".to_string(),
+                    args: vec!["-c".to_string(), script],
+                }),
+                cwd,
+                env: vec![
+                    ("I2743_SCREEN".into(), screen.replace('\n', "\r\n")),
+                    ("I2743_OUT".into(), out.display().to_string()),
+                ],
+                ..SpawnOptions::default()
+            },
+        )
+        .expect("PTY を張れる");
+        host.sessions.insert(pane, session);
+        let last = screen.lines().last().unwrap_or_default().trim().to_string();
+        let budget = tako_core::wait_budget::state_wait_budget(
+            Duration::from_secs(20),
+            tako_core::wait_budget::machine_busy(),
+        );
+        let deadline = Instant::now() + budget;
+        loop {
+            let lines = host.sessions[&pane].visible_lines();
+            if lines.iter().any(|l| l.contains(&last)) {
+                return pane;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "子の画面が描かれない（budget={budget:?}）:\n{}",
+                lines.join("\n")
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// `out` に `n` バイト溜まるまで待って中身を返す（状態で待つ）
+    #[cfg(unix)]
+    fn i2743_received(out: &Path, n: usize) -> Vec<u8> {
+        use std::time::{Duration, Instant};
+        let budget = tako_core::wait_budget::state_wait_budget(
+            Duration::from_secs(20),
+            tako_core::wait_budget::machine_busy(),
+        );
+        let deadline = Instant::now() + budget;
+        loop {
+            let got = std::fs::read(out).unwrap_or_default();
+            if got.len() >= n {
+                return got;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "子が {n} バイト受け取らない（budget={budget:?}・受け取った分 {got:?}）"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    fn i2743_keys(pane: u64, keys: &[&str]) -> Request {
+        Request::SendKeys {
+            pane: Some(pane),
+            keys: keys.iter().map(|k| k.to_string()).collect(),
+            tmux_session: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn i2743_send(pane: u64, text: &str, attachments: &[&Path]) -> Request {
+        Request::Send {
+            pane: Some(pane),
+            text: text.into(),
+            newline: true,
+            tmux_session: None,
+            await_prompt: false,
+            paste_guard: None,
+            attachments: attachments
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+        }
+    }
+
+    /// 受け入れ条件 2: 選択肢ダイアログの表示中の keys は断り、選択を確定させない。
+    /// Escape・矢印も含めて例外は無い（`Send` の生の ESC の素通し = #748 とは違う）
+    #[cfg(unix)]
+    #[test]
+    fn issue2743_ダイアログ中のkeysは断り選択を確定させない() {
+        let tmp = tako_core::test_residue::ScratchDir::new("i2743-dialog");
+        let out = tmp.path().join("got");
+        let mut host = MockHost::new();
+        let pane = i2743_recorder(&mut host, LIMIT_DIALOG_748, &out, 1, None);
+        for keys in [&["1"][..], &["Enter"], &["Escape"], &["Down", "Enter"]] {
+            let err = dispatch(&mut host, i2743_keys(pane, keys), PaneOrigin::Mcp)
+                .expect_err("ダイアログ中は断る")
+                .to_string();
+            assert!(err.contains("usage_limit"), "{keys:?}: {err}");
+            assert!(
+                err.contains(&format!("respond --pane {pane}")),
+                "respond へ誘導する: {err}"
+            );
+        }
+        // 断った後に PTY へ直に目印を書く。子が最初に受け取ったのが目印なら、断った keys は
+        // 1 バイトも届いていない（PTY は順を保つ）
+        host.sessions[&pane].write(b"Z".to_vec());
+        assert_eq!(i2743_received(&out, 1), b"Z");
+    }
+
+    /// keys は名前の順にバイト列で届く。知らない名前・空の列は 1 バイトも送らずに断る
+    #[cfg(unix)]
+    #[test]
+    fn issue2743_keysは名前の順に届き知らない名前は何も送らない() {
+        let tmp = tako_core::test_residue::ScratchDir::new("i2743-keys");
+        let out = tmp.path().join("got");
+        let mut host = MockHost::new();
+        let pane = i2743_recorder(&mut host, "$ ready-2743", &out, 5, None);
+        let err = dispatch(
+            &mut host,
+            i2743_keys(pane, &["Escape", "Esc"]),
+            PaneOrigin::Mcp,
+        )
+        .expect_err("知らない名前");
+        assert!(matches!(err, DispatchError::InvalidParams(_)), "{err:?}");
+        assert!(err.to_string().contains("\"Esc\""), "{err}");
+        let err = dispatch(&mut host, i2743_keys(pane, &[]), PaneOrigin::Mcp).expect_err("空");
+        assert!(matches!(err, DispatchError::InvalidParams(_)), "{err:?}");
+
+        let reply = dispatch(
+            &mut host,
+            i2743_keys(pane, &["Escape", "C-c", "Up"]),
+            PaneOrigin::Mcp,
+        )
+        .expect("送れる");
+        assert_eq!(reply, json!({ "keys": ["Escape", "C-c", "Up"] }));
+        assert_eq!(i2743_received(&out, 5), b"\x1b\x03\x1b[A");
+    }
+
+    /// 受け入れ条件 3: 添付は置き場へ写り、送った本文にそのパスが入る。同期の腕と、IPC / MCP の
+    /// 受け口と同じ offload の 3 段（準備 → 写す = background → 送る = 着地）の両方を通す
+    #[cfg(unix)]
+    #[test]
+    fn issue2743_添付は置き場へ写し本文にパスを足して送る() {
+        let tmp = tako_core::test_residue::ScratchDir::new("i2743-attach");
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let src = tmp.path().join("shot.png");
+        std::fs::write(&src, b"\x89PNG-2743").unwrap();
+        let out = tmp.path().join("got");
+        let dir = cwd.join(tako_core::uploads::DIR_NAME);
+        let first = format!("見て {}\r", dir.join("shot.png").display());
+        let second = format!("{}\r", dir.join("shot-2.png").display());
+        let mut host = MockHost::new();
+        let pane = i2743_recorder(
+            &mut host,
+            "$ ready-2743",
+            &out,
+            first.len() + second.len(),
+            Some(cwd.clone()),
+        );
+
+        // 無い添付は何も写さず何も送らない（置き場も作らない）
+        let missing = tmp.path().join("missing.png");
+        let err = dispatch(
+            &mut host,
+            i2743_send(pane, "見て", &[&src, &missing]),
+            PaneOrigin::Mcp,
+        )
+        .expect_err("無い添付");
+        assert!(err.to_string().contains("missing.png"), "{err}");
+        assert!(!dir.exists(), "断った送信のために置き場を作った");
+
+        // 同期の腕
+        let reply = dispatch(
+            &mut host,
+            i2743_send(pane, "見て", &[&src]),
+            PaneOrigin::Mcp,
+        )
+        .expect("送れる");
+        assert_eq!(
+            reply["attachments"][0]["path"],
+            dir.join("shot.png").display().to_string()
+        );
+        assert_eq!(reply["attachments"][0]["bytes"], 9);
+        assert_eq!(
+            std::fs::read(dir.join("shot.png")).unwrap(),
+            b"\x89PNG-2743"
+        );
+
+        // offload の腕（text なし = パスだけ。同じ名前は上書きせずにずらす）
+        let request = i2743_send(pane, "", &[&src]);
+        let job = match prepare_offload(&mut host, &request) {
+            Some(Ok(job)) => job,
+            Some(Err(e)) => panic!("準備で断った: {e}"),
+            None => panic!("添付つきの送信を background へ出していない"),
+        };
+        let OffloadOutcome::OnUi(next) = job.run_staged() else {
+            panic!("写した後の送る段を UI スレッドへ戻していない");
+        };
+        let reply = finish_offload(&mut host, next, PaneOrigin::Mcp).expect("送れる");
+        assert_eq!(
+            reply["attachments"][0]["path"],
+            dir.join("shot-2.png").display().to_string()
+        );
+
+        let got = i2743_received(&out, first.len() + second.len());
+        assert_eq!(String::from_utf8_lossy(&got), format!("{first}{second}"));
+    }
+
+    /// 選択肢ダイアログの表示中の添付つきの送信は、写す前（準備の段）で断る
+    #[cfg(unix)]
+    #[test]
+    fn issue2743_ダイアログ中の添付は写す前に断る() {
+        let tmp = tako_core::test_residue::ScratchDir::new("i2743-attach-dialog");
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let src = tmp.path().join("a.png");
+        std::fs::write(&src, b"x").unwrap();
+        let out = tmp.path().join("got");
+        let mut host = MockHost::new();
+        let pane = i2743_recorder(&mut host, LIMIT_DIALOG_748, &out, 1, Some(cwd.clone()));
+        let request = i2743_send(pane, "見て", &[&src]);
+        let err = match prepare_offload(&mut host, &request) {
+            Some(Err(e)) => e.to_string(),
+            Some(Ok(_)) => panic!("ダイアログ中なのに写す段へ進んだ"),
+            None => panic!("添付つきの送信を background へ出していない"),
+        };
+        assert!(err.contains("usage_limit"), "{err}");
+        let err = dispatch(&mut host, request, PaneOrigin::Mcp).expect_err("同期の腕も断る");
+        assert!(err.to_string().contains("usage_limit"), "{err}");
+        assert!(!cwd.join(tako_core::uploads::DIR_NAME).exists());
     }
 
     #[test]

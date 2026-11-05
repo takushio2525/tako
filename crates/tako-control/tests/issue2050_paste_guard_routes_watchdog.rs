@@ -225,12 +225,13 @@ fn sendとmodの確認は本文を診断ログへ書かず判定の1実装を引
             ));
         }
     }
-    // Send の腕は送る前に確認を通し、確かめる段では送達の経路へ入らない
+    // Send の腕は送る前に確認を通し、確かめる段では送達の経路へ入らない。
+    // #2743 から本体は `send_reply`（同期の腕と添付の着地の 1 実装）なので、そこを見る
     let arm = window(
         DISPATCH_REL,
         &src,
-        "            let (warning, ack) =",
-        Some("        Request::Read {"),
+        "fn send_reply(",
+        Some("fn with_attachments("),
     );
     let joined: String = arm
         .iter()
@@ -238,7 +239,12 @@ fn sendとmodの確認は本文を診断ログへ書かず判定の1実装を引
         .collect::<Vec<_>>()
         .join("\n");
     let gate = joined.find("send_paste_gate(");
-    let blocked = joined.find("SendGate::Blocked(reply) => return Ok(reply)");
+    // 止める腕は送達の経路を呼ばずに返る（「確かめる段なら返す」の後ろにだけ送る呼び出しが来る）
+    let blocked = joined.find("SendGate::Blocked(reply) => {").and_then(|b| {
+        let rest = &joined[b..];
+        let ret = rest.find("return Ok(reply);")?;
+        (!rest[..ret].contains("send_to_pane(")).then_some(b + ret)
+    });
     let deliver = joined.find("send_to_pane(");
     if !matches!((gate, blocked, deliver), (Some(g), Some(b), Some(d)) if g < b && b < d) {
         bad.push(format!(

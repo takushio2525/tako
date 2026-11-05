@@ -355,6 +355,8 @@ tako split --down --cwd ~/Documents/webapp --focus
 tako send --pane 3 "echo hello"
 tako send --pane 3 --no-newline "yes"
 tako send --pane 3 --await-prompt "テストを実行して結果を教えて"
+tako send --pane 3 --key Escape
+tako send --pane 3 --attach ./screenshot.png "この画面のどこがおかしい？"
 ```
 
 | オプション | 説明 |
@@ -362,10 +364,26 @@ tako send --pane 3 --await-prompt "テストを実行して結果を教えて"
 | `--pane <ID>` | 送信先ペイン（省略時は呼び出し元） |
 | `--no-newline` | 末尾に改行を付けない |
 | `--await-prompt` | 入力欄が表示されるのを待ってから送信 |
+| `--key <名前>` | テキストの代わりに生のキーを送る（繰り返し可） |
+| `--attach <パス>` | ファイルを添付する（繰り返し可） |
 
 :::note[全画面 TUI への送達は検証付き]
 Claude Code のような全画面アプリへの送信は、貼り付け → Enter 送信 → 入力欄へ反映されたかの検証、という確認ループ付きで配送されます。長い指示文が入力欄に残ったままになる心配はありません。相手が生成中でキューに積まれた場合も検知されるので、指示が消えることはありません。
 :::
+
+`--key` はキーの名前を順に送ります。生成中の Claude Code は `--key Escape` で止まります。
+使える名前は `Enter` / `Escape` / `Tab` / `Space` / `Up` / `Down` / `Left` / `Right` / `C-c` などの
+Ctrl + 英字 / 1 文字で、知らない名前が 1 つでもあれば何も送りません。テキスト・`--attach`・
+`--await-prompt` とは一緒に使えません。
+
+`--attach` はファイルをペインの作業ディレクトリの `.tako-remote-uploads/`（スマホから添付したときと
+同じ置き場）へ写し、写した先のパスを本文の後ろへ足して送ります。Claude Code はそのパスの画像や
+ファイルを読みます。1 ファイル 20 MB まで、同じ名前のファイルは上書きせず `名前-2.png` のように
+ずらします。置き場には中身を git に載せない `.gitignore` が置かれます。
+
+選択肢ダイアログ（承認・利用上限など）が出ている間は、テキストと同じく `--key` も送りません
+（数字や Enter が選択を確定してしまうため）。ダイアログには `tako orchestrator respond` で答えます。
+MCP では `tako_send_input` の `keys: ["Escape"]` / `attachments: ["<絶対パス>"]` が同じ操作です。
 
 ### tako click
 
