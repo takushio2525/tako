@@ -361,10 +361,16 @@ pub fn accept_report(
     // #1960: 帯のトグルの正本は ui.json。mod の中で切り替えた（`$.store` の時刻が新しい）なら続きの段で取り込む
     let import = parsed.band.clone().filter(|_| !core::s3_legacy());
     let path = host.claude_mod_ui_path();
+    let session_id = parsed.session_id.clone();
     let hub = host
         .claude_mod_mut()
         .ok_or_else(|| DispatchError::Operation("この tako は mod の報告を受けない".into()))?;
     let accepted = hub.accept(pane_id.as_u64(), parsed, Instant::now());
+    // #2753: カタログに無い会話 ID を運んだ報告は、走査の 30 秒を待たずに次の確認（5 秒ごと）で
+    // カタログへ載せる（同じ会話 ID では 1 回だけ頼む。ファイルには触らない）
+    if let (Accepted::Stored, Some(sid)) = (accepted, session_id.as_deref()) {
+        crate::sessions::note_mod_session(sid);
+    }
     Ok(ReportJob {
         accepted,
         pane: pane_id.as_u64(),
