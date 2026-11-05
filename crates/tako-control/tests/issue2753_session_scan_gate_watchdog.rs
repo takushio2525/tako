@@ -42,6 +42,10 @@ fn repo_root() -> PathBuf {
 #[path = "common/production_range.rs"]
 mod production_range;
 
+// 固定のバイト幅の窓は 1 実装（#2043）。端を外側へ文字境界まで広げるので日本語で落ちない
+#[path = "common/byte_window.rs"]
+mod byte_window;
+
 fn read_code(rel: &str) -> String {
     let src = std::fs::read_to_string(repo_root().join(rel))
         .unwrap_or_else(|e| panic!("{rel} を読めない: {e}"));
@@ -127,7 +131,7 @@ fn scan(sessions: &str, claude_mod: &str, main: &str) -> Vec<String> {
         Some(at) => {
             let line = line_at(main, at);
             let call = &main[at..block_end(main, at).map_or(main.len(), |e| e + 1)];
-            let tail = &main[at..(at + 600).min(main.len())];
+            let tail = byte_window::after(main, at, 600);
             if !call.contains("persist: app.tmux_persist") {
                 out.push(format!(
                     "{MAIN}:{line} `scan_plan` へ `persist: app.tmux_persist` を渡していない（#2753）"
@@ -232,7 +236,7 @@ fn scan(sessions: &str, claude_mod: &str, main: &str) -> Vec<String> {
                             line_at(claude_mod, start + i)
                         ));
                     }
-                    let near = &body[i.saturating_sub(200)..i];
+                    let near = byte_window::before(body, i, 200);
                     if !near.contains("Accepted::Stored") {
                         out.push(format!(
                             "{CLAUDE_MOD}:{} `note_mod_session(` が受け付けた報告（`Accepted::Stored`）に限っていない\
