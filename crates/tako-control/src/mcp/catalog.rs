@@ -157,14 +157,14 @@ pub fn tools() -> Vec<Value> {
                     "keys": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "生のキー名を順に送る（text / click と排他。例 [\"Escape\"] で生成を止める。\
-                            Enter / Escape / Tab / Space / Up / Down / Left / Right / C-c 等 / 1 文字）",
+                        "description": "生のキー名を順に送る（text / click と排他）。[\"Escape\"] で生成を止める。\
+                            Enter / Tab / Space / Up / Down / Left / Right / C-c 等 / 1 文字",
                     },
                     "attachments": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "添付するファイルの絶対パス（各 20MB まで）。ペインの cwd の \
-                            .tako-remote-uploads/ へ写し、そのパスを text の後ろへ足して送る",
+                        "description": "添付の絶対パス（各 20MB まで）。ペインの cwd/.tako-remote-uploads/ へ写し、\
+                            text の後ろにそのパスを足して送る",
                     },
                     "newline": {
                         "type": "boolean",
