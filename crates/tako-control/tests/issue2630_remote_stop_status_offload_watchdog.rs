@@ -446,7 +446,7 @@ fn issue2630_注入_forceをhostの停止へ回すと名指す() {
     let s = sources();
     let dispatch = inject(
         &s.dispatch,
-        "crate::remote::daemon_force_stop()\n            } else {",
+        "crate::remote::daemon_force_stop().map_err(|refusal| refusal.to_string())\n            } else {",
         "job()\n            } else {",
         "force を host の停止へ回す",
     );

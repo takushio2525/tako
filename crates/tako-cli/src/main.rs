@@ -6361,8 +6361,9 @@ fn remote_start() -> Result<(), String> {
     init_local_lang();
     // 案内の行も表示言語（#2365。stdout の JSON は応答の値のまま）
     let lang = cli_lang();
-    // #2533: audit.log に「CLI から頼んだ」と残す
-    let result = with_origin(RequestOrigin::Cli, tako_control::remote::spawn_daemon)?;
+    // #2533: audit.log に「CLI から頼んだ」と残す。断り（`RemoteRefusal`）も表示言語で文にする（#2365）
+    let result = with_origin(RequestOrigin::Cli, tako_control::remote::spawn_daemon)
+        .map_err(|refusal| refusal.text_in(lang))?;
     println!("{}", pretty_json(&result));
     // #2518: 旧版のまま動いていた daemon を入れ替えたなら、スマホが一瞬切れた理由を言う
     if let Some(pid) = result["renewed"]["previous_pid"].as_u64() {
@@ -6412,14 +6413,16 @@ fn remote_stop(force: bool) -> Result<(), String> {
     use tako_control::remote::{with_origin, RequestOrigin};
     // 起動の途中の断り（`RemoteRefusal::DaemonStartingStop`。#2613）は表示言語で文にするので、呼ぶ前に決める
     init_local_lang();
-    // #2533: audit.log に「CLI から頼んだ」と残す
+    let lang = cli_lang();
+    // #2533: audit.log に「CLI から頼んだ」と残す。断り（`RemoteRefusal`）も表示言語で文にする（#2365）
     let result = if force {
-        with_origin(RequestOrigin::Cli, tako_control::remote::daemon_force_stop)?
+        with_origin(RequestOrigin::Cli, tako_control::remote::daemon_force_stop)
     } else {
-        with_origin(RequestOrigin::Cli, tako_control::remote::daemon_stop)?
-    };
+        with_origin(RequestOrigin::Cli, tako_control::remote::daemon_stop)
+    }
+    .map_err(|refusal| refusal.text_in(lang))?;
     println!("{}", pretty_json(&result));
-    eprintln!("{}", ReplyNote::RemoteStopped.text_in(cli_lang()));
+    eprintln!("{}", ReplyNote::RemoteStopped.text_in(lang));
     Ok(())
 }
 

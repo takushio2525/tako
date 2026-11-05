@@ -8343,8 +8343,9 @@ impl OffloadJob {
             // #1555: 同期の腕（`host.remote_start().map_err(DispatchError::Operation)`）と同じ応答
             OffloadJob::RemoteStart(job) => job().map_err(DispatchError::Operation),
             // #2630: 同期の腕（`Request::RemoteStop` / `Request::RemoteStatus`）と同じ応答
+            // 断り（`RemoteRefusal`）は GUI の表示言語で文にする（#2365。同期の腕と同じ）
             OffloadJob::RemoteStop { force, job } => if force {
-                crate::remote::daemon_force_stop()
+                crate::remote::daemon_force_stop().map_err(|refusal| refusal.to_string())
             } else {
                 job()
             }
@@ -12856,7 +12857,7 @@ fn dispatch_inner(
         // A/B の `TAKO_2630_LEGACY=1`・直呼び
         Request::RemoteStop { force } => {
             if force {
-                crate::remote::daemon_force_stop().map_err(DispatchError::Operation)
+                crate::remote::daemon_force_stop().map_err(crate::RemoteRefusal::operation)
             } else {
                 host.remote_stop().map_err(DispatchError::Operation)
             }

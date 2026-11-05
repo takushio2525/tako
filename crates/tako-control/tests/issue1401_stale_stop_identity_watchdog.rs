@@ -50,6 +50,13 @@ const IDENTITY_RULE: &str = "command_line_is_tako_remote_serve";
 /// 正規経路と stale 経路の中止の説明が共有する（#2466）
 const CHECK_COMMANDS: &str = "identity_check_commands";
 
+/// 正規経路（PID ファイルの PID）と stale 経路の中止の断り（#2365 から型。文は `remote_refusal.rs`）
+const PIDFILE_REFUSAL: &str = "RemoteRefusal::StopPidUnverified";
+const STALE_REFUSAL: &str = "RemoteRefusal::StopStalePidUnverified";
+/// 2 本の中止の文が共有する前置き（`remote_refusal.rs`。#329 / #1401 の 1 実装）
+const REFUSAL_SRC: &str = "crates/tako-control/src/remote_refusal.rs";
+const IDENTITY_PREFIX: &str = "pid_identity_prefix";
+
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -135,11 +142,11 @@ fn check_kill_stale_daemon(source: &str, rel: &str) {
 /// #2466 以前は断る直前に `cleanup_state_files()` を呼んでいた。本物の daemon を取り違えると
 /// PID ファイルと管理トークンが消え、PID ファイル無しの daemon が残る（`forget_if_stopped` が
 /// 「止まった」と読んで起動の意図まで消す）。見るのは「中止の文言を返す `return Err(` を囲む
-/// 最後の `if` から、その `return Err(` まで」= 断る腕の中
+/// 最後の `if` から、その `return Err(` まで」= 断る腕の中（#2365 から中止の断りは型 `StopPidUnverified`）
 fn check_pidfile_refusal_keeps_state(source: &str, rel: &str) {
     let (line, body) = fn_body(source, rel, "\nfn daemon_stop_impl(");
-    let prefix = body.find("pid_identity_refusal(").unwrap_or_else(|| {
-        panic!("{rel}:{line} 正規経路の中止文言（`pid_identity_refusal(`）が見つからない")
+    let prefix = body.find(PIDFILE_REFUSAL).unwrap_or_else(|| {
+        panic!("{rel}:{line} 正規経路の中止の断り（`{PIDFILE_REFUSAL}`）が見つからない")
     });
     let ret = body[..prefix]
         .rfind("return Err(")
@@ -191,10 +198,9 @@ fn 正規経路の検査は修正前の形を検出する() {
     let legacy = "\nfn daemon_stop_impl(force: bool) -> Result<Value, String> {\n\
         \x20   if !verify_pid_identity(&pid_info) {\n\
         \x20       cleanup_state_files();\n\
-        \x20       return Err(format!(\n\
-        \x20           \"{prefix}state ファイルは掃除しました。\",\n\
-        \x20           prefix = pid_identity_refusal(pid_num),\n\
-        \x20       ));\n\
+        \x20       return Err(crate::RemoteRefusal::StopPidUnverified {\n\
+        \x20           pid: pid_num,\n\
+        \x20       });\n\
         \x20   }\n\
         \x20   Ok(json!({}))\n\
         }\n";
@@ -212,10 +218,9 @@ fn 正規経路の検査は修正前の形を検出する() {
         \x20       return Err(\"既に終了\".to_string());\n\
         \x20   }\n\
         \x20   if !confirmed {\n\
-        \x20       return Err(format!(\n\
-        \x20           \"{prefix}state ファイルは残しました。\",\n\
-        \x20           prefix = pid_identity_refusal(pid_num),\n\
-        \x20       ));\n\
+        \x20       return Err(crate::RemoteRefusal::StopPidUnverified {\n\
+        \x20           pid: pid_num,\n\
+        \x20       });\n\
         \x20   }\n\
         \x20   Ok(json!({}))\n\
         }\n";
@@ -268,19 +273,63 @@ fn ps出力の判定は1実装で空を弾く() {
     }
 }
 
+/// `remote_refusal.rs` の `text_in` のうち、`variant` の腕（日英）の本文を `(行番号, 本文)` で返す。
+/// 腕は 12 字下げの `(` で始まる（`(Self::X, Ja) =>` / `(\n                Self::X {`）
+fn refusal_arms(src: &str, variant: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = src.lines().collect();
+    let starts: Vec<usize> = (0..lines.len())
+        .filter(|&i| {
+            lines[i].starts_with("            (") && !lines[i].starts_with("             ")
+        })
+        .collect();
+    let mut arms = Vec::new();
+    for (k, &at) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).copied().unwrap_or(lines.len());
+        let head = lines[at..(at + 2).min(end)].join("\n");
+        if head.contains(&format!("Self::{variant} "))
+            || head.contains(&format!("Self::{variant},"))
+        {
+            arms.push((at + 1, lines[at..end].join("\n")));
+        }
+    }
+    arms
+}
+
 #[test]
 fn 中止の文言は1実装から組む() {
     let src = production(REMOTE);
     let (sline, sbody) = fn_body(&src, REMOTE, "\nfn stale_stop_refusal(");
     assert!(
-        sbody.contains("pid_identity_refusal"),
-        "{REMOTE}:{sline} stale 経路の中止文言が共通の前置きを通っていない（#1401 / #329）"
+        sbody.contains(STALE_REFUSAL),
+        "{REMOTE}:{sline} stale 経路の中止が型の断り（`{STALE_REFUSAL}`）を返していない（#1401 / #2365）"
     );
     let (dline, dbody) = fn_body(&src, REMOTE, "\nfn daemon_stop_impl(");
     assert!(
-        dbody.contains("pid_identity_refusal"),
-        "{REMOTE}:{dline} 正規経路の中止文言が共通の前置きを通っていない（#329）"
+        dbody.contains(PIDFILE_REFUSAL),
+        "{REMOTE}:{dline} 正規経路の中止が型の断り（`{PIDFILE_REFUSAL}`）を返していない（#329 / #2365）"
     );
+    // 中止の文（日英）は共通の前置きの 1 実装と `tako remote start` を通る（#329 / #1401 / #2466）
+    let refusal_src =
+        std::fs::read_to_string(repo_root().join(REFUSAL_SRC)).expect("remote_refusal.rs を読む");
+    assert!(
+        refusal_src.contains(&format!("\nfn {IDENTITY_PREFIX}(")),
+        "{REFUSAL_SRC}: 共通の前置き `{IDENTITY_PREFIX}` が無い（#329 / #1401）"
+    );
+    for variant in ["StopPidUnverified", "StopStalePidUnverified"] {
+        let arms = refusal_arms(&refusal_src, variant);
+        assert_eq!(
+            arms.len(),
+            2,
+            "{REFUSAL_SRC}: `{variant}` の日英の腕が 2 つ見つからない: {arms:?}"
+        );
+        for (line, arm) in arms {
+            assert!(
+                arm.contains(&format!("{IDENTITY_PREFIX}(")) && arm.contains("tako remote start"),
+                "{REFUSAL_SRC}:{line} `{variant}` の文が共通の前置き（`{IDENTITY_PREFIX}`）か \
+                 `tako remote start` を通っていない（#1401 / #2466）"
+            );
+        }
+    }
     // 確かめる手順（打つ OS のもの）は 2 本の中止経路が共有する 1 実装（#2466 で正規経路も
     // 手順を返すようになった）。手順の綴りはそこに、再起動の手順は各経路の説明に在る
     let (cline, cbody) = fn_body(&src, REMOTE, &format!("\nfn {CHECK_COMMANDS}("));
@@ -292,9 +341,8 @@ fn 中止の文言は1実装から組む() {
     }
     for (line, body, path) in [(sline, &sbody, "stale 経路"), (dline, &dbody, "正規経路")] {
         assert!(
-            body.contains(&format!("{CHECK_COMMANDS}(")) && body.contains("tako remote start"),
-            "{REMOTE}:{line} {path}の中止の説明が確かめる手順（`{CHECK_COMMANDS}`）か \
-             `tako remote start` を通っていない（#1401 / #2466）"
+            body.contains(&format!("{CHECK_COMMANDS}(")),
+            "{REMOTE}:{line} {path}の中止の説明が確かめる手順（`{CHECK_COMMANDS}`）を通っていない（#1401 / #2466）"
         );
     }
 }

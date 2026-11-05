@@ -29346,10 +29346,12 @@ impl PreviewHost for TakoApp {
 }
 
 /// dispatch（MCP `tako_remote_start` の IPC・設定画面の「開始」）が頼んだ daemon の起動（#2533 の経路の名乗りつき）。
-/// 同期の腕（`remote_start`）と background の仕事（`remote_start_job`。#1555）の 1 実装
+/// 同期の腕（`remote_start`）と background の仕事（`remote_start_job`。#1555）の 1 実装。
+/// 断り（`RemoteRefusal`）は GUI の表示言語で文にする（#2365）
 fn remote_start_from_dispatch() -> Result<serde_json::Value, String> {
     use tako_control::remote::{with_origin, RequestOrigin};
     with_origin(RequestOrigin::Dispatch, tako_control::remote::spawn_daemon)
+        .map_err(|refusal| refusal.to_string())
 }
 
 impl RemoteHost for TakoApp {
@@ -29386,10 +29388,12 @@ impl RemoteHost for TakoApp {
 }
 
 /// dispatch（MCP `tako_remote_stop` の IPC・設定画面の「停止」）が頼んだ daemon の停止（#2533 の経路の名乗りつき）。
-/// 同期の腕（`remote_stop`）と background の仕事（`remote_stop_job`。#2630）の 1 実装
+/// 同期の腕（`remote_stop`）と background の仕事（`remote_stop_job`。#2630）の 1 実装。
+/// 断り（`RemoteRefusal`）は GUI の表示言語で文にする（#2365）
 fn remote_stop_from_dispatch() -> Result<serde_json::Value, String> {
     use tako_control::remote::{with_origin, RequestOrigin};
     with_origin(RequestOrigin::Dispatch, tako_control::remote::daemon_stop)
+        .map_err(|refusal| refusal.to_string())
 }
 
 impl WebViewHost for TakoApp {

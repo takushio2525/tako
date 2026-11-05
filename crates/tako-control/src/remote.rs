@@ -3145,44 +3145,27 @@ fn command_line_is_tako_remote_serve(args: &str) -> bool {
     !cmd.is_empty() && cmd.contains("tako") && cmd.contains("remote") && cmd.contains("serve")
 }
 
-/// 「PID の正体を確認できなかったので撃たなかった」ときの共通の前置き
-/// （#329 / #1401 の 1 実装）。
-///
-/// 正規経路（PID ファイル）と stale 経路（health の PID）で同じ文言にしておく。
-/// 診断ログではなく**操作の結果**なので、何を中止したのかを最初に言う
-fn pid_identity_refusal(pid: u32) -> String {
-    format!(
-        "PID {pid} が tako remote serve であることを確認できません\
-         （PID 再利用または検証コマンド実行不能）。安全のため停止操作を中止しました。"
-    )
-}
-
 /// stale 経路（PID ファイルが無い）で撃たずに中止したときの説明（#1401）。
 ///
 /// state は**消さない**。応答している相手が本物の daemon かもしれないうちに記録を消すと、
 /// 生きている daemon を到達不能にしてしまう（`daemon_stop_impl` の stale 分岐と同じ理由）。
-/// 代わりに「誰が居るのか」と「記録を消す手順」を返し、人の判断に委ねる
-fn stale_stop_refusal(pid: u32) -> String {
+/// 代わりに「誰が居るのか」と「記録を消す手順」を返し、人の判断に委ねる。
+/// 文（正規経路と共通の前置き・`tako remote start`）は型の表示（#2365）
+fn stale_stop_refusal(pid: u32) -> crate::RemoteRefusal {
     let endpoint = current_endpoint();
-    let reach = endpoint
-        .as_ref()
-        .map(|e| e.describe())
-        .unwrap_or_else(|| "不明".to_string());
+    let reach = endpoint.as_ref().map(|e| e.describe());
     let record = endpoint
         .as_ref()
         .and_then(|e| e.socket_path())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(port_path);
     let (inspect, remove) = identity_check_commands(pid, &record);
-    format!(
-        "{prefix}\n\
-         記録された待ち受け（{reach}）が答えた PID です。state ファイルは残しました。\n\
-         {indent}この PID の正体を確認する: {inspect}\n\
-         {indent}tako の daemon でなければ記録を消す: {remove}\n\
-         {indent}そのうえで起動し直す: tako remote start",
-        prefix = pid_identity_refusal(pid),
-        indent = "  ",
-    )
+    crate::RemoteRefusal::StopStalePidUnverified {
+        pid,
+        reach,
+        inspect,
+        remove,
+    }
 }
 
 /// 正体を確かめられなかった pid を人が確かめる手順と、記録を消す手順（#1401 / #2466）。
@@ -3326,7 +3309,7 @@ fn parse_etime(s: &str) -> Option<u64> {
 /// デーモンを停止する（PID ファイルから kill → 終了確認 → state クリーンアップ）。
 /// P0-4: PID + 実行ファイル + 起動時刻を照合し、無関係プロセスを kill しない。
 /// PID ファイルが無い場合はポート占有者を探して stale デーモンなら回収する
-pub fn daemon_stop() -> Result<Value, String> {
+pub fn daemon_stop() -> Result<Value, crate::RemoteRefusal> {
     // #2533: 誰が・どの経路で止めたかを、止める前に残す
     audit_daemon_request("daemon_stop_requested", "stop", recorded_daemon_pid());
     refuse_stop_while_starting()?;
@@ -3334,7 +3317,7 @@ pub fn daemon_stop() -> Result<Value, String> {
 }
 
 /// `--force` 付き停止。SIGTERM を試みた後 SIGKILL を送る
-pub fn daemon_force_stop() -> Result<Value, String> {
+pub fn daemon_force_stop() -> Result<Value, crate::RemoteRefusal> {
     audit_daemon_request("daemon_stop_requested", "force_stop", recorded_daemon_pid());
     refuse_stop_while_starting()?;
     forget_if_stopped(daemon_stop_impl(true))
@@ -3348,12 +3331,12 @@ pub fn daemon_force_stop() -> Result<Value, String> {
 /// `--force` も同じ（止めても戻るので逃げ道にならない）。**断るのは明示の stop の入口だけ**で、
 /// 入れ替えの旧版の停止（`stop_stale_generation` → `daemon_stop_impl`）は通る。
 /// 断るときは `forget_if_stopped` を通さない（`desired` を消さない = 起動の結果を待つ）
-fn refuse_stop_while_starting() -> Result<(), String> {
+fn refuse_stop_while_starting() -> Result<(), crate::RemoteRefusal> {
     match start_blocks_request() {
         Some(marker) => {
             audit_refused_while_starting("daemon_stop_refused", &marker);
             let now = now_epoch_secs();
-            Err(crate::RemoteRefusal::DaemonStartingStop { marker, now }.to_string())
+            Err(crate::RemoteRefusal::DaemonStartingStop { marker, now })
         }
         None => Ok(()),
     }
@@ -3369,7 +3352,9 @@ fn refuse_stop_while_starting() -> Result<(), String> {
 /// 撃たなかった」のときは PID ファイルを残すので記録も残る = **消す条件は「止まっていること」の 1 つ**。
 /// #2466 以前は正体を確かめられないと PID ファイルを掃除していたので、本物の daemon が
 /// 生きたまま記録まで消えていた
-fn forget_if_stopped(result: Result<Value, String>) -> Result<Value, String> {
+fn forget_if_stopped(
+    result: Result<Value, crate::RemoteRefusal>,
+) -> Result<Value, crate::RemoteRefusal> {
     if daemon_status()["running"].as_bool() != Some(true) {
         clear_desired();
     }
@@ -3427,7 +3412,7 @@ fn cleanup_serve_leftover() {
     }
 }
 
-fn daemon_stop_impl(force: bool) -> Result<Value, String> {
+fn daemon_stop_impl(force: bool) -> Result<Value, crate::RemoteRefusal> {
     let pid_info = match parse_pid_file() {
         Ok(info) => info,
         Err(_) => {
@@ -3461,7 +3446,7 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
                     let _ = std::fs::remove_file(port_path());
                 }
             }
-            return Err("リモートサーバーが起動していない（PID ファイルが無い）".to_string());
+            return Err(crate::RemoteRefusal::StopNoPidFile);
         }
     };
     let pid_num = pid_info.pid;
@@ -3472,25 +3457,21 @@ fn daemon_stop_impl(force: bool) -> Result<Value, String> {
     // 「確認できない」と取り違えず、ここで片付ける（#2466）
     if has_terminated(pid_num) {
         cleanup_state_files();
-        return Err("リモートサーバーが起動していない（プロセスは既に終了）".to_string());
+        return Err(crate::RemoteRefusal::StopAlreadyExited);
     }
     if !confirmed {
         // state は**消さない**（#2466）。相手が本物の daemon だったとき、PID ファイルと
         // 管理トークンを消すと止める手掛かりを失い、PID ファイル無しの daemon が残る
         // （しかも `forget_if_stopped` が「止まった」と読んで起動の意図まで消す）。
         // 消すのは止めたと確かめた後だけ。手で確かめる手順を返し、人の判断に委ねる
+        // 文（stale 経路と共通の前置き・`tako remote start`）は型の表示（#2365）
         let (inspect, remove) = identity_check_commands(pid_num, &pid_path());
-        return Err(format!(
-            "{prefix}\n\
-             PID ファイルに記録された PID です。state ファイルは残しました。\n\
-             {indent}この PID の正体を確認する: {inspect}\n\
-             {indent}tako remote serve なら止める: {manual}\n\
-             {indent}tako の daemon でなければ記録を消す: {remove}\n\
-             {indent}そのうえで起動し直す: tako remote start",
-            prefix = pid_identity_refusal(pid_num),
-            manual = manual_stop_command(pid_num),
-            indent = "  ",
-        ));
+        return Err(crate::RemoteRefusal::StopPidUnverified {
+            pid: pid_num,
+            inspect,
+            manual: manual_stop_command(pid_num),
+            remove,
+        });
     }
     // 止め方の段は stale 経路と 1 実装（#1599）。止まったのを観測したときだけ Ok で、
     // 止まらなければ Err を返して state を残す（daemon が生きたまま記録を消さない）
@@ -3567,7 +3548,7 @@ trait StopMeans {
     /// 穏当な終了要求が強制終了と別物か（本番は `platform::process::GRACEFUL_TERMINATE`）
     fn graceful_terminate(&self) -> bool;
     /// daemon 自身に畳ませる（admin API の shutdown）。`pid` の daemon が受け付けたら Ok
-    fn ask_shutdown(&self, pid: u32) -> Result<(), String>;
+    fn ask_shutdown(&self, pid: u32) -> Result<(), crate::remote_refusal::ShutdownReject>;
     /// 境界の終了要求（`platform::process::terminate`）
     fn terminate(&self, pid: u32, force: bool) -> Result<(), String>;
     /// 終了待ち（予算つき。ゾンビも終了として数える = #619）
@@ -3584,7 +3565,7 @@ impl StopMeans for LiveStopMeans {
         crate::platform::process::GRACEFUL_TERMINATE
     }
 
-    fn ask_shutdown(&self, pid: u32) -> Result<(), String> {
+    fn ask_shutdown(&self, pid: u32) -> Result<(), crate::remote_refusal::ShutdownReject> {
         request_admin_shutdown(pid)
     }
 
@@ -3614,7 +3595,7 @@ fn stop_verified_daemon(
     pid: u32,
     mode: StopMode,
     means: &impl StopMeans,
-) -> Result<StoppedBy, String> {
+) -> Result<StoppedBy, crate::RemoteRefusal> {
     // 段 1: daemon 自身に畳ませる。後始末（serve の解除・state の掃除）を daemon が
     // やる、OS を問わない穏当な停止（Windows には SIGTERM に当たる要求が無い）。
     // 受け付けない（古い daemon・トークンが無い・届かない）か、受け付けても予算内に
@@ -3635,13 +3616,12 @@ fn stop_verified_daemon(
         }
         if mode == StopMode::Graceful {
             // 通常 stop は強制へ上げず、エラーを返して state を残す
-            return Err(format!(
-                "PID {pid} が {} 後 {} 秒経っても終了しない。\
-                 `tako remote stop --force` で {} を試みてください",
-                crate::platform::process::request_name(false),
-                TERMINATION_WAIT_BUDGET.as_secs(),
-                crate::platform::process::request_name(true),
-            ));
+            return Err(crate::RemoteRefusal::StopTimeoutTryForce {
+                pid,
+                request: crate::platform::process::request_name(false),
+                secs: TERMINATION_WAIT_BUDGET.as_secs(),
+                force_request: crate::platform::process::request_name(true),
+            });
         }
     }
     // 段 3: 強制終了
@@ -3653,25 +3633,29 @@ fn stop_verified_daemon(
 
 /// 終了要求を出して待つ（#1599）。`Ok(true)` = 終わった / `Ok(false)` = 予算切れ /
 /// `Err` = 要求を出せず、相手もまだ生きている
-fn request_then_wait(pid: u32, force: bool, means: &impl StopMeans) -> Result<bool, String> {
+fn request_then_wait(
+    pid: u32,
+    force: bool,
+    means: &impl StopMeans,
+) -> Result<bool, crate::RemoteRefusal> {
     if let Err(e) = means.terminate(pid, force) {
         // 確かめてから撃つまでの間に終わっていれば、目的は果たされている
         if means.terminated(pid) {
             return Ok(true);
         }
-        // 権限が無い等で撃てない = 止められない。止めたことにしない
-        return Err(e);
+        // 権限が無い等で撃てない = 止められない。止めたことにしない（境界の文は手を加えずに載せる）
+        return Err(crate::RemoteRefusal::StopTerminateFailed(e));
     }
     Ok(!means.wait(pid).timed_out())
 }
 
 /// 終了要求の後も終わらないときの説明（state は呼び出し側が残す）
-fn still_running_after(pid: u32, force: bool) -> String {
-    format!(
-        "PID {pid} が {} 後 {} 秒経っても終了しない。state ファイルは残してあります",
-        crate::platform::process::request_name(force),
-        TERMINATION_WAIT_BUDGET.as_secs(),
-    )
+fn still_running_after(pid: u32, force: bool) -> crate::RemoteRefusal {
+    crate::RemoteRefusal::StopStillRunning {
+        pid,
+        request: crate::platform::process::request_name(force),
+        secs: TERMINATION_WAIT_BUDGET.as_secs(),
+    }
 }
 
 /// 記録された到達先と管理トークンで、daemon に畳ませる（#1599）。
@@ -3679,10 +3663,11 @@ fn still_running_after(pid: u32, force: bool) -> String {
 /// 管理トークンは daemon が起動時に書く秘密（0600）なので、受け付けた相手は
 /// **そのトークンを持つ daemon** に限られる。さらに応答の pid が `expected_pid`
 /// （正体を確かめた pid）と一致したときだけ Ok にする
-fn request_admin_shutdown(expected_pid: u32) -> Result<(), String> {
+fn request_admin_shutdown(expected_pid: u32) -> Result<(), crate::remote_refusal::ShutdownReject> {
+    use crate::remote_refusal::ShutdownReject;
     let token = std::fs::read_to_string(token_path())
-        .map_err(|e| format!("管理トークンを読めない: {e}"))?;
-    let endpoint = current_endpoint().ok_or("待ち受けの記録が無い")?;
+        .map_err(|e| ShutdownReject::TokenUnreadable(e.to_string()))?;
+    let endpoint = current_endpoint().ok_or(ShutdownReject::NoListenerRecord)?;
     send_admin_shutdown(&endpoint, token.trim(), expected_pid)
 }
 
@@ -3691,31 +3676,42 @@ fn send_admin_shutdown(
     endpoint: &local_endpoint::Endpoint,
     token: &str,
     expected_pid: u32,
-) -> Result<(), String> {
+) -> Result<(), crate::remote_refusal::ShutdownReject> {
     shutdown_accepted(&post_admin_shutdown(endpoint, token)?, expected_pid)
 }
 
 /// shutdown の要求を送って応答全体を返す（#1599 / #2455 の 1 実装）
-fn post_admin_shutdown(endpoint: &local_endpoint::Endpoint, token: &str) -> Result<String, String> {
+fn post_admin_shutdown(
+    endpoint: &local_endpoint::Endpoint,
+    token: &str,
+) -> Result<String, crate::remote_refusal::ShutdownReject> {
     // #2533: 経路を名乗る（daemon は接続元の pid と合わせて `daemon_shutdown_requested` へ残す）
     let via = current_origin_str();
     let request = format!(
         "POST {ADMIN_SHUTDOWN_PATH} HTTP/1.1\r\nHost: localhost\r\nX-Tako-Admin: {token}\r\n\
          X-Tako-Requester-Via: {via}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
-    local_endpoint::request_raw(endpoint, &request, Some(ADMIN_SHUTDOWN_TIMEOUT))
-        .map_err(|e| format!("daemon へ届かない ({}): {e}", endpoint.describe()))
+    local_endpoint::request_raw(endpoint, &request, Some(ADMIN_SHUTDOWN_TIMEOUT)).map_err(|e| {
+        crate::remote_refusal::ShutdownReject::Unreachable {
+            endpoint: endpoint.describe(),
+            error: e.to_string(),
+        }
+    })
 }
 
 /// shutdown の応答を、正体を確かめた pid と突き合わせて読む（純関数。#1599）。
 ///
 /// 古い daemon（この道を持たない）は 404 = Err で、呼び出し側は境界の終了要求へ進む
-fn shutdown_accepted(response: &str, expected_pid: u32) -> Result<(), String> {
+fn shutdown_accepted(
+    response: &str,
+    expected_pid: u32,
+) -> Result<(), crate::remote_refusal::ShutdownReject> {
     match shutdown_acceptor_pid(response)? {
         pid if pid == expected_pid => Ok(()),
-        pid => Err(format!(
-            "畳むと答えたのは別の daemon（PID {pid}）で、確かめた PID {expected_pid} ではない"
-        )),
+        pid => Err(crate::remote_refusal::ShutdownReject::OtherDaemon {
+            pid,
+            expected: expected_pid,
+        }),
     }
 }
 
@@ -3723,38 +3719,35 @@ fn shutdown_accepted(response: &str, expected_pid: u32) -> Result<(), String> {
 ///
 /// 受け付けた印（`shutting_down: true`）と pid の両方が揃ったときだけ Ok。ステータスだけで
 /// 読むと、何にでも 200 を返す相手（ポートを再利用した別のサーバー）を「畳んだ」と取り違える
-fn shutdown_acceptor_pid(response: &str) -> Result<u32, String> {
+fn shutdown_acceptor_pid(response: &str) -> Result<u32, crate::remote_refusal::ShutdownReject> {
+    use crate::remote_refusal::ShutdownReject;
     let (head, body) = response
         .split_once("\r\n\r\n")
-        .ok_or("daemon の応答が不正（ヘッダ境界なし）")?;
+        .ok_or(ShutdownReject::NoHeaderBoundary)?;
     let status: u16 = head
         .lines()
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
-        .ok_or("daemon の応答が不正（ステータス行なし）")?;
+        .ok_or(ShutdownReject::NoStatusLine)?;
     match status {
         200 => {}
         // 管理 API は管理トークンが合わなければ 401（`check_admin`）。tako の daemon だが
         // この state の daemon ではない（別の data dir）か、トークンが古い
-        401 => return Err("管理トークンが合わない (401)".to_string()),
-        404 => {
-            return Err(
-                "停止要求の受け口が無い (404。#1599 より前の daemon か、tako 以外)".to_string(),
-            )
-        }
-        other => return Err(format!("daemon が畳む要求を受け付けなかった ({other})")),
+        401 => return Err(ShutdownReject::TokenMismatch),
+        404 => return Err(ShutdownReject::NoShutdownRoute),
+        other => return Err(ShutdownReject::NotAccepted(other)),
     }
     let value: Value = serde_json::from_str(body.trim())
-        .map_err(|e| format!("daemon の応答を解釈できない: {e}"))?;
+        .map_err(|e| ShutdownReject::BodyUnparsable(e.to_string()))?;
     if value["shutting_down"].as_bool() != Some(true) {
-        return Err("daemon の応答に受け付けた印が無い".to_string());
+        return Err(ShutdownReject::NoAcceptMark);
     }
     value["pid"]
         .as_u64()
         .and_then(|pid| u32::try_from(pid).ok())
         .filter(|pid| *pid > 0)
-        .ok_or_else(|| "daemon の応答に pid が無い".to_string())
+        .ok_or(ShutdownReject::NoPid)
 }
 
 /// PID ファイルが無いまま応答している待ち受けへ、管理トークンで停止要求を送る（#2455）。
@@ -3769,18 +3762,19 @@ fn shutdown_acceptor_pid(response: &str) -> Result<u32, String> {
 fn ask_pidless_shutdown(
     endpoint: &local_endpoint::Endpoint,
     token_file: &std::path::Path,
-) -> Result<u32, String> {
+) -> Result<u32, crate::RemoteRefusal> {
+    use crate::remote_refusal::ShutdownReject;
     let token = std::fs::read_to_string(token_file).map_err(|e| {
         let reason = if e.kind() == io::ErrorKind::NotFound {
-            "管理トークンも無い".to_string()
+            ShutdownReject::TokenMissing
         } else {
-            format!("管理トークンを読めない（{e}）")
+            ShutdownReject::TokenUnreadable(e.to_string())
         };
-        pidless_stop_refusal(endpoint, &reason)
+        pidless_stop_refusal(endpoint, reason)
     })?;
     post_admin_shutdown(endpoint, token.trim())
         .and_then(|response| shutdown_acceptor_pid(&response))
-        .map_err(|reason| pidless_stop_refusal(endpoint, &reason))
+        .map_err(|reason| pidless_stop_refusal(endpoint, reason))
 }
 
 /// 記録された待ち受けに居る相手を確かめるコマンド（打つ OS のもの。#2455）
@@ -3799,7 +3793,10 @@ fn listener_inspect_command(endpoint: &local_endpoint::Endpoint) -> String {
 /// 「起動していない」とは言わない（待ち受けは応答している）。state は**消さない**:
 /// 相手が本物の daemon かもしれないうちに記録を消すと到達不能にする（[`stale_stop_refusal`]
 /// と同じ理由）。代わりに、相手を確かめて人が止める手順を打つ OS のもので返す
-fn pidless_stop_refusal(endpoint: &local_endpoint::Endpoint, reason: &str) -> String {
+fn pidless_stop_refusal(
+    endpoint: &local_endpoint::Endpoint,
+    reason: crate::remote_refusal::ShutdownReject,
+) -> crate::RemoteRefusal {
     let record = endpoint
         .socket_path()
         .map(|p| p.to_path_buf())
@@ -3812,29 +3809,25 @@ fn pidless_stop_refusal(endpoint: &local_endpoint::Endpoint, reason: &str) -> St
     } else {
         ("kill <PID>".to_string(), format!("rm {}", record.display()))
     };
-    format!(
-        "PID ファイルが無く、記録された待ち受け（{reach}）は応答していますが、\
-         停止要求が通りませんでした: {reason}\n\
-         相手が tako の daemon か確かめられないので、何も止めていません。state ファイルは残しました。\n\
-         {indent}待ち受けている相手を確かめる: {inspect}\n\
-         {indent}tako の daemon なら止める: {stop}\n\
-         {indent}tako の daemon でなければ記録を消す: {remove}\n\
-         {indent}そのうえで起動し直す: tako remote start",
-        reach = endpoint.describe(),
-        inspect = listener_inspect_command(endpoint),
-        indent = "  ",
-    )
+    crate::RemoteRefusal::StopPidlessRefused(Box::new(crate::remote_refusal::PidlessRefusal {
+        reach: endpoint.describe(),
+        reason,
+        inspect: listener_inspect_command(endpoint),
+        stop,
+        remove,
+    }))
 }
 
 /// stale 経路で pid は終わったのに、記録された待ち受けがまだ応答しているときの説明（#2455）
-fn pidless_listener_outlived(pid: u32, endpoint: &local_endpoint::Endpoint) -> String {
-    format!(
-        "停止要求を受け付けた PID {pid} は終わりましたが、記録された待ち受け（{reach}）は\
-         まだ応答しています。応答したのは別のプロセスかもしれないので、止めたことにせず\
-         state ファイルを残しました。\n  待ち受けている相手を確かめる: {inspect}",
-        reach = endpoint.describe(),
-        inspect = listener_inspect_command(endpoint),
-    )
+fn pidless_listener_outlived(
+    pid: u32,
+    endpoint: &local_endpoint::Endpoint,
+) -> crate::RemoteRefusal {
+    crate::RemoteRefusal::StopListenerOutlived {
+        pid,
+        reach: endpoint.describe(),
+        inspect: listener_inspect_command(endpoint),
+    }
 }
 
 /// serve 子プロセスに使う tako バイナリを解決する（#432）。
@@ -3893,8 +3886,11 @@ fn serve_binary_impl(
 /// `tako remote serve` を子プロセスとして起動し、
 /// stdout から起動情報 JSON を読み取って返す。
 /// Tailscale 未セットアップ時は子プロセスが不足項目を stderr に出して終了するため、
-/// その内容がこの関数の Err に載る（#282: `tako remote setup` への誘導）
-pub fn spawn_daemon() -> Result<Value, String> {
+/// その内容がこの関数の Err に載る（#282: `tako remote setup` への誘導）。
+///
+/// 断りは [`crate::RemoteRefusal`]（#2365）。利用者へ返す口は表示言語で文にし、自動復帰の記録
+/// （persist.log・`last_autostart.detail`）は日本語（`into_ja`）で残す
+pub fn spawn_daemon() -> Result<Value, crate::RemoteRefusal> {
     // #2533: 誰が・どの経路で起こしたかを残す（初回の起動では置き場がまだ無いので作っておく）
     let _ = ensure_state_dir();
     audit_daemon_request("daemon_start_requested", "start", None);
@@ -3904,7 +3900,7 @@ pub fn spawn_daemon() -> Result<Value, String> {
     // 印を置く前に断る（検証モード・偽の tailscale・明示の opt-in は通す = `remote_isolated_serve`）
     if let Err(refusal) = crate::remote_isolated_serve::check() {
         audit_daemon_request("isolated_serve_refused", "start", None);
-        return Err(refusal.to_string());
+        return Err(refusal);
     }
     // #2613: 別の起動が daemon を起こしている途中（#2608 の印が効いている）なら、2 本目を起こさずに断る。
     // 見るのは状態を読むより前: 区間内の start は、入れ替えの途中の旧版を自分も「入れ替える相手」と
@@ -3915,7 +3911,7 @@ pub fn spawn_daemon() -> Result<Value, String> {
     if let Some(marker) = start_blocks_request() {
         audit_refused_while_starting("daemon_start_refused", &marker);
         let now = now_epoch_secs();
-        return Err(crate::RemoteRefusal::DaemonStarting { marker, now }.to_string());
+        return Err(crate::RemoteRefusal::DaemonStarting { marker, now });
     }
     // 既に起動中か確認
     let status = daemon_status();
@@ -3924,17 +3920,16 @@ pub fn spawn_daemon() -> Result<Value, String> {
         let running_exe = status["serve_binary"].as_str().unwrap_or("");
         let expected = serve_binary();
         if !running_exe.is_empty() && running_exe != expected {
-            return Err(format!(
-                "リモートサーバーは既に起動中ですが、稼働中の serve バイナリ\
-                 （{running_exe}）が現在の解決先（{expected}）と異なります。\
-                 `tako remote stop` してから `tako remote start` で差し替えてください"
-            ));
+            return Err(crate::RemoteRefusal::DaemonServeBinaryMismatch {
+                running: running_exe.to_string(),
+                expected,
+            });
         }
         // #2518: パスが同じでも、そのパスのファイルが daemon の起動後に差し替わっていれば
         // 旧版のコードで動いている（install の contents-swap）。**パスの文字列の一致だけで
         // 「既に起動中」と返さない** — 返すと install も GUI の再起動も daemon を入れ替えない
         if !crate::remote_generation::renewable_in_status(&status) {
-            return Err("リモートサーバーは既に起動中".to_string());
+            return Err(crate::RemoteRefusal::DaemonAlreadyRunning);
         }
         // pid の読み方は `stop_stale_generation` と同じ（running の応答は必ず pid を持つ）
         renewing = Some(status["pid"].as_u64().unwrap_or(0) as u32);
@@ -3952,10 +3947,7 @@ pub fn spawn_daemon() -> Result<Value, String> {
     // stale な待ち受けの回収（PID ファイル消失 + プロセス死亡で state だけ残るケース）
     if let Some(ep) = current_endpoint() {
         if local_endpoint::probe_alive(&ep) {
-            return Err(format!(
-                "別の daemon が既にこの待ち受けで稼働中です: {}",
-                ep.describe()
-            ));
+            return Err(crate::RemoteRefusal::DaemonListenerBusy(ep.describe()));
         }
         eprintln!(
             "stale な待ち受けを検出しました。自動回収します: {}",
@@ -3983,17 +3975,19 @@ pub fn spawn_daemon() -> Result<Value, String> {
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("デーモンの起動に失敗: {e}"))?;
+        .map_err(|e| crate::RemoteRefusal::DaemonSpawnFailed(e.to_string()))?;
 
     // H-6: stdout から起動情報 JSON を reader thread + recv_timeout で読み取る
     let stdout = child
         .stdout
         .take()
-        .ok_or("デーモンの stdout を取得できない")?;
+        .ok_or(crate::RemoteRefusal::DaemonStdoutUnavailable)?;
 
     let info = {
         use std::sync::mpsc;
-        let (tx, rx) = mpsc::channel::<Result<Value, String>>();
+        // 起動情報が来なかったとき（読み取りの失敗・JSON の無いまま stdout が閉じた）は `None`。
+        // 理由は下で子の stderr から拾うので、ここでは文を組まない（#2365）
+        let (tx, rx) = mpsc::channel::<Option<Value>>();
 
         std::thread::Builder::new()
             .name("daemon-stdout-reader".into())
@@ -4004,25 +3998,25 @@ pub fn spawn_daemon() -> Result<Value, String> {
                     match line {
                         Ok(line) => {
                             if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                                let _ = tx.send(Ok(v));
+                                let _ = tx.send(Some(v));
                                 return;
                             }
                         }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("デーモンの出力読み取りに失敗: {e}")));
+                        Err(_) => {
+                            let _ = tx.send(None);
                             return;
                         }
                     }
                 }
-                let _ = tx.send(Err("デーモンが起動情報 JSON を出力しなかった".to_string()));
+                let _ = tx.send(None);
             })
-            .map_err(|e| format!("reader スレッドの起動に失敗: {e}"))?;
+            .map_err(|e| crate::RemoteRefusal::DaemonReaderThread(e.to_string()))?;
 
         // JSON を得られず stdout が閉じた（子が起動前チェックで終了した等）場合も
         // タイムアウトと同じ経路に落とし、下で stderr から実際の原因を拾って返す
         match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-            Ok(Ok(v)) => Some(v),
-            Ok(Err(_)) | Err(_) => None,
+            Ok(Some(v)) => Some(v),
+            Ok(None) | Err(_) => None,
         }
     };
 
@@ -4052,14 +4046,18 @@ pub fn spawn_daemon() -> Result<Value, String> {
                 // 子の stderr（不足項目の列挙 + setup 誘導など）をそのまま伝える。
                 // 呼び出し側 CLI も「error: 」を付けるため、子側の接頭辞は剥がして二重化を防ぐ
                 let detail = detail.strip_prefix("error: ").unwrap_or(detail);
-                return Err(detail.to_string());
+                return Err(crate::RemoteRefusal::DaemonExitedWithMessage(
+                    detail.to_string(),
+                ));
             }
-            return Err(format!("デーモンが起動情報を返さず終了した（{status}）"));
+            return Err(crate::RemoteRefusal::DaemonExitedSilently(
+                status.to_string(),
+            ));
         }
         let _ = child.kill();
         // kill しただけでは終了ステータスが残る（#619）。ここでも刈り取る
         reap_daemon_child(child);
-        return Err("デーモンからの起動情報を受信できなかった（30 秒タイムアウト）".into());
+        return Err(crate::RemoteRefusal::DaemonStartTimeout);
     };
 
     // 子プロセスの終了ステータスを刈り取る（#619）
@@ -4088,7 +4086,7 @@ pub fn spawn_daemon() -> Result<Value, String> {
 /// 「起動していた」を保ったまま行うもので、`desired` を消すと次の GUI 起動で戻らなくなる。
 /// 止まったかは結果の文字列ではなく現況（`daemon_status`）で見る。止まらなければ Err で、
 /// 旧版は動いたまま残る（起こし直せないのに止めて、動いていた daemon まで失わない）
-fn stop_stale_generation(status: &Value) -> Result<u32, String> {
+fn stop_stale_generation(status: &Value) -> Result<u32, crate::RemoteRefusal> {
     let pid = status["pid"].as_u64().unwrap_or(0) as u32;
     // #2533: 入れ替えの停止も「誰が頼んだか」を残す（経路は起動を頼んだ呼び手のもの）
     audit_daemon_request("daemon_stop_requested", "renew", Some(pid));
@@ -4096,12 +4094,12 @@ fn stop_stale_generation(status: &Value) -> Result<u32, String> {
     if daemon_status()["running"].as_bool() == Some(true) {
         let why = match stopped {
             Err(e) => e,
-            Ok(_) => "停止後も daemon が残っています".to_string(),
+            Ok(_) => crate::RemoteRefusal::DaemonLingersAfterStop,
         };
-        return Err(format!(
-            "旧版のまま動いているリモート daemon（PID {pid}）を止められなかったため、\
-             入れ替えていません: {why}"
-        ));
+        return Err(crate::RemoteRefusal::DaemonRenewStopFailed {
+            pid,
+            why: Box::new(why),
+        });
     }
     Ok(pid)
 }
@@ -4271,7 +4269,7 @@ fn kill_stale_daemon(
     pid: u32,
     endpoint: &local_endpoint::Endpoint,
     means: &impl StopMeans,
-) -> Result<StoppedBy, String> {
+) -> Result<StoppedBy, crate::RemoteRefusal> {
     let mut by = StoppedBy::Shutdown;
     if means.wait(pid).timed_out() {
         // **正体確認をこの関数の中で行う**（#1401）。呼び出し側に委ねていた旧実装では、
@@ -9432,7 +9430,9 @@ mod tests {
         std::env::remove_var("TAKO_TAILSCALE_BIN");
         drop(live);
         let _ = std::fs::remove_dir_all(&dir);
-        let err = result.expect_err("待ち受けが残っているのに止めたことにした");
+        let err = result
+            .expect_err("待ち受けが残っているのに止めたことにした")
+            .into_ja();
         assert!(err.contains("まだ応答しています"), "中止理由が返る: {err}");
         assert!(kept, "止めていないのに到達先の記録を消した");
     }
@@ -10067,7 +10067,7 @@ mod tests {
         let result = daemon_stop_impl(false);
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
         assert!(result.is_err(), "PID 再利用を検知してエラーになる");
-        let err = result.unwrap_err();
+        let err = result.unwrap_err().into_ja();
         assert!(
             err.contains("確認できません"),
             "撃つ前に正体確認で中止する（#1616）。`未対応` なら停止経路まで進んでいる = \
@@ -10220,7 +10220,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(result.is_err(), "検証失敗でエラーが返る");
-        let err = result.unwrap_err();
+        let err = result.unwrap_err().into_ja();
         assert!(
             err.contains("確認できません"),
             "検証不能時のエラーメッセージ: {err}"
@@ -10258,7 +10258,9 @@ mod tests {
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
 
-        let err = result.expect_err("正体を確かめられない相手は止めない");
+        let err = result
+            .expect_err("正体を確かめられない相手は止めない")
+            .into_ja();
         assert!(alive, "撃っていない");
         assert!(
             err.contains("確認できません") && err.contains("残しました"),
@@ -10477,7 +10479,7 @@ mod tests {
         assert!(!pid_path().exists(), "PID ファイルが無い状態を作る");
 
         let status_before = daemon_status();
-        let result = daemon_stop_impl(false);
+        let result = daemon_stop_impl(false).map_err(crate::RemoteRefusal::into_ja);
         let status_after = daemon_status();
         let port_kept = port_path().exists();
 
@@ -10733,12 +10735,13 @@ mod tests {
             self.graceful
         }
 
-        fn ask_shutdown(&self, _pid: u32) -> Result<(), String> {
+        fn ask_shutdown(&self, _pid: u32) -> Result<(), crate::remote_refusal::ShutdownReject> {
             self.calls.borrow_mut().push("shutdown".into());
             if self.shutdown_ok {
                 Ok(())
             } else {
-                Err("古い daemon（404）".into())
+                // 古い daemon（404）
+                Err(crate::remote_refusal::ShutdownReject::NoShutdownRoute)
             }
         }
 
@@ -10827,7 +10830,9 @@ mod tests {
             graceful: true,
             ..Default::default()
         };
-        let err = stop_verified_daemon(42, StopMode::Graceful, &m).expect_err("止まっていない");
+        let err = stop_verified_daemon(42, StopMode::Graceful, &m)
+            .expect_err("止まっていない")
+            .into_ja();
         assert!(err.contains("--force"), "{err}");
         assert!(
             !m.calls().contains(&"terminate(force=true)".to_string()),
@@ -10845,7 +10850,9 @@ mod tests {
             shutdown_ok: true,
             ..Default::default()
         };
-        let err = stop_verified_daemon(42, StopMode::Escalate, &stuck).expect_err("止まっていない");
+        let err = stop_verified_daemon(42, StopMode::Escalate, &stuck)
+            .expect_err("止まっていない")
+            .into_ja();
         assert!(err.contains("state ファイルは残してあります"), "{err}");
         assert_eq!(
             stuck.calls(),
@@ -10946,7 +10953,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(alive, "正体を確かめられない pid が撃たれた（#1401）");
         for (pid, result, calls) in outcomes {
-            let err = result.expect_err("確かめられない相手を止めたことにした");
+            let err = result
+                .expect_err("確かめられない相手を止めたことにした")
+                .into_ja();
             assert!(err.contains("確認できません"), "pid {pid}: {err}");
             assert_eq!(calls, ["wait", "terminated"], "pid {pid}: 撃つ段へ進んだ");
         }
@@ -10961,7 +10970,9 @@ mod tests {
                 graceful: false,
                 ..Default::default()
             };
-            let err = stop_verified_daemon(42, mode, &m).expect_err("止まっていない");
+            let err = stop_verified_daemon(42, mode, &m)
+                .expect_err("止まっていない")
+                .into_ja();
             assert!(!err.contains("--force"), "{mode:?}: {err}");
             assert!(
                 err.contains("state ファイルは残してあります"),
@@ -11005,7 +11016,8 @@ mod tests {
                     ..Default::default()
                 };
                 let err = stop_verified_daemon(42, mode, &m)
-                    .expect_err("撃てなかったのに止めたことにした");
+                    .expect_err("撃てなかったのに止めたことにした")
+                    .into_ja();
                 assert!(err.contains("EPERM"), "{mode:?}: 境界の理由を返す: {err}");
                 assert!(
                     !m.calls().iter().any(|c| c == "wait"),
@@ -11040,8 +11052,9 @@ mod tests {
             LiveStopMeans.graceful_terminate()
         }
 
-        fn ask_shutdown(&self, _pid: u32) -> Result<(), String> {
-            Err("テスト: 畳む相手の daemon は居ない".into())
+        fn ask_shutdown(&self, _pid: u32) -> Result<(), crate::remote_refusal::ShutdownReject> {
+            // テスト: 畳む相手の daemon は居ない
+            Err(crate::remote_refusal::ShutdownReject::NoListenerRecord)
         }
 
         fn terminate(&self, pid: u32, force: bool) -> Result<(), String> {
@@ -11093,7 +11106,8 @@ mod tests {
             Ok(())
         );
         let other = shutdown_accepted(&ok(r#"{"shutting_down":true,"pid":7}"#), 42)
-            .expect_err("別の pid の daemon を確かめた相手と取り違えた");
+            .expect_err("別の pid の daemon を確かめた相手と取り違えた")
+            .text_in(tako_core::i18n::Lang::Ja);
         assert!(other.contains("別の daemon"), "{other}");
         // 何にでも 200 を返す相手（health の形）を「畳んだ」と読まない
         assert!(shutdown_accepted(&ok(r#"{"status":"ok","pid":42}"#), 42).is_err());
@@ -11115,14 +11129,17 @@ mod tests {
             Ok(42)
         );
         let denied = shutdown_acceptor_pid(&resp("401 Unauthorized", r#"{"error":"x"}"#))
-            .expect_err("管理トークンを断った相手を受け付けたと読んだ");
+            .expect_err("管理トークンを断った相手を受け付けたと読んだ")
+            .text_in(tako_core::i18n::Lang::Ja);
         assert!(denied.contains("管理トークンが合わない"), "{denied}");
         let old = shutdown_acceptor_pid(&resp("404 Not Found", r#"{"error":"x"}"#))
-            .expect_err("受け口の無い相手を受け付けたと読んだ");
+            .expect_err("受け口の無い相手を受け付けたと読んだ")
+            .text_in(tako_core::i18n::Lang::Ja);
         assert!(old.contains("受け口が無い"), "{old}");
         // 何にでも 200 を返す相手（health の形）を「受け付けた」と読まない
         let foreign = shutdown_acceptor_pid(&resp("200 OK", r#"{"status":"ok","pid":42}"#))
-            .expect_err("health の形を受け付けたと読んだ");
+            .expect_err("health の形を受け付けたと読んだ")
+            .text_in(tako_core::i18n::Lang::Ja);
         assert!(foreign.contains("受け付けた印が無い"), "{foreign}");
         for body in [
             r#"{"shutting_down":true}"#,
@@ -11225,7 +11242,8 @@ mod tests {
         );
         // ④ 別の pid を確かめていた送り手は Err（境界の終了要求へ進む）
         let err = send_admin_shutdown(&endpoint, "test-admin-token", me.wrapping_add(1))
-            .expect_err("別の daemon の受け付けを確かめた pid の停止と取り違えた");
+            .expect_err("別の daemon の受け付けを確かめた pid の停止と取り違えた")
+            .text_in(tako_core::i18n::Lang::Ja);
         assert!(err.contains("別の daemon"), "{err}");
 
         handle.join().expect("サーバースレッド");
@@ -11484,7 +11502,9 @@ mod tests {
         // ② 管理トークンが合わない → 断る・旗は立たない
         let wrong = dir.join("wrong.token");
         std::fs::write(&wrong, "not-the-admin-token\n").expect("トークンを書く");
-        let err = ask_pidless_shutdown(&endpoint, &wrong).expect_err("合わないトークンで止めた");
+        let err = ask_pidless_shutdown(&endpoint, &wrong)
+            .expect_err("合わないトークンで止めた")
+            .into_ja();
         assert!(err.contains("管理トークンが合わない"), "{err}");
         assert!(
             !shutdown.load(Ordering::Relaxed),
@@ -11492,7 +11512,8 @@ mod tests {
         );
         // ③ 管理トークンが無い → 送らずに断る
         let err = ask_pidless_shutdown(&endpoint, &dir.join("missing.token"))
-            .expect_err("トークンが無いのに止めた");
+            .expect_err("トークンが無いのに止めた")
+            .into_ja();
         assert!(err.contains("管理トークンも無い"), "{err}");
         assert!(
             !shutdown.load(Ordering::Relaxed),
@@ -12047,7 +12068,9 @@ mod tests {
         let pid_file_left = pid_file.exists();
         let _ = leftover.wait();
         let _ = std::fs::remove_dir_all(&dir);
-        let err = result.expect_err("既に終了しているのでエラーを返す");
+        let err = result
+            .expect_err("既に終了しているのでエラーを返す")
+            .into_ja();
         assert!(
             err.contains("既に終了"),
             "ゾンビは「既に終了」と報告する（実際: {err}）"
