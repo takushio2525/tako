@@ -34,6 +34,13 @@ pub struct LineViewport {
     pub visible_lines: usize,
     /// 文書の全行数
     pub total_lines: usize,
+    /// カーソル行が器に**丸ごと**入る、いちばん上の先頭行（#2757）。行の実寸を知る呼び手が
+    /// [`fit_top`] で出す。`None` = 行の高さが揃っているとみなす（行数だけで判断する）。
+    ///
+    /// [`follow_cursor`] は先頭をここより上へ置かない = カーソル行そのものが器に入ることを
+    /// 余白より優先する。行の高さが揃っていれば余白は `(可視 − 1) / 2` 行までなので、
+    /// この制約は行数だけの答えと必ず一致する（#1741 / #2714 の判定は変わらない）
+    pub fit_top: Option<usize>,
 }
 
 /// 器に**はみ出さずに見える行数**を、実際に描いた行の実寸から数える（#1741）。
@@ -116,11 +123,44 @@ pub fn effective_margin(visible_lines: usize, margin: usize) -> usize {
     margin.min(visible_lines.max(1).saturating_sub(1) / 2)
 }
 
+/// カーソル行が器に丸ごと入る、いちばん上の先頭行（[`LineViewport::fit_top`]。#2757）。
+///
+/// - `room`: 先頭行の上端から器の下端までの高さ（論理 px。先頭を item の頭に置いたとき）
+/// - `height`: 行の実寸（描いた行はその高さ・覚えた行はその高さ・知らない行は見積もり）
+///
+/// カーソル行から上へ、行を足しても器に収まる間だけ先頭を上げる。カーソル行だけで器より
+/// 高い（狭いペインで長く折り返した行）ならカーソル行そのもの = 行頭のキャレットが見える位置
+pub fn fit_top(cursor_line: usize, room: f32, height: impl Fn(usize) -> f32) -> usize {
+    let room = room + EDGE_EPSILON;
+    let row = |line: usize| {
+        let h = height(line);
+        if h.is_finite() && h > 0.0 {
+            h
+        } else {
+            0.0
+        }
+    };
+    let mut used = row(cursor_line);
+    let mut top = cursor_line;
+    while top > 0 && used + row(top - 1) <= room {
+        used += row(top - 1);
+        top -= 1;
+    }
+    top
+}
+
 /// カーソル行を余白込みで可視範囲へ入れるための新しい先頭可視行。
 ///
 /// **動かす必要が無ければ `None`**（ユーザーが見ている位置を理由なく動かさない）。
 /// 文書の端では余白が足りなくても寄せきる（1 行目にカーソルがあるとき、
-/// その上に 3 行の余白は作れない）
+/// その上に 3 行の余白は作れない）。
+///
+/// **カーソル行そのものが器に入ることを余白より優先する**（#2757）: 行数で決めた先頭から
+/// 見てカーソル行が器に収まらない（上の余白の行が背の高い折り返し行）なら、余白を削って
+/// 先頭を [`LineViewport::fit_top`] まで下げる。最初の追従も #2737 の確かめ直しもこの
+/// 1 実装を通るので、どちらから見ても答えが同じ = 先頭が往復しない（修正前は背の高い行の
+/// 次の行で「可視 1 行 → 先頭を下へ」「下げた先で可視 4 行 → 余白 1 行のため先頭を上へ」を
+/// 往復し、キャレットが器の外に残っていた）
 pub fn follow_cursor(view: LineViewport, cursor_line: usize, margin: usize) -> Option<usize> {
     if view.total_lines == 0 {
         return None;
@@ -141,6 +181,11 @@ pub fn follow_cursor(view: LineViewport, cursor_line: usize, margin: usize) -> O
         first
     };
     let want = want.min(max_first);
+    // カーソル行が器に入る範囲（fit_top..=cursor）へ収める。文書末の寄せ（max_first）より優先
+    let want = match view.fit_top {
+        Some(lo) => want.clamp(lo.min(cursor), cursor),
+        None => want,
+    };
     (want != view.first_visible).then_some(want)
 }
 
@@ -165,6 +210,7 @@ mod tests {
             first_visible: first,
             visible_lines: visible,
             total_lines: total,
+            fit_top: None,
         }
     }
 
@@ -437,6 +483,160 @@ mod tests {
         assert_eq!(
             cursor_row_in_viewport(view(0, 1, 500), 300, FOLLOW_MARGIN),
             0
+        );
+    }
+
+    /// #2757 の形（visual-test editor-font の折り返しの相を 560×600 の窓で実測した寸法）:
+    /// 器は先頭行の上端から 367px、行は 26px で、5 行に 1 行が 650px（25 段）に折り返す。
+    fn tall_row(line: usize) -> f32 {
+        if line % 5 == 2 {
+            650.0
+        } else {
+            26.0
+        }
+    }
+    const TALL_ROOM: f32 = 367.0;
+    const TALL_TOTAL: usize = 200;
+
+    /// 先頭 `top` で描いたときの見え方（可視行数は描いた行の実寸から数える = #1741 の 1 実装）。
+    /// `fit` = 呼び手がカーソル行の実寸を渡すか（渡さない = `TAKO_2757_LEGACY=1` の形）
+    fn tall_view(top: usize, cursor: usize, fit: bool) -> LineViewport {
+        LineViewport {
+            first_visible: top,
+            visible_lines: visible_rows(
+                0.0,
+                TALL_ROOM,
+                (top..TALL_TOTAL).map(|line| Some(tall_row(line))),
+                26.0,
+            ),
+            total_lines: TALL_TOTAL,
+            fit_top: fit.then(|| fit_top(cursor, TALL_ROOM, tall_row)),
+        }
+    }
+
+    /// 追従してから #2737 の確かめ直しを上限（8 回）まで繰り返す。戻り値 = 置いた先頭の並び
+    fn follow_then_recheck(top: usize, cursor: usize, fit: bool) -> Vec<usize> {
+        let mut tops = Vec::new();
+        let mut top = top;
+        for _ in 0..8 {
+            match follow_cursor(tall_view(top, cursor, fit), cursor, FOLLOW_MARGIN) {
+                Some(next) => {
+                    top = next;
+                    tops.push(next);
+                }
+                None => break,
+            }
+        }
+        tops
+    }
+
+    /// 先頭 `top` でカーソル行が器に丸ごと入るか
+    fn tall_cursor_fits(top: usize, cursor: usize) -> bool {
+        top <= cursor && (top..=cursor).map(tall_row).sum::<f32>() <= TALL_ROOM + EDGE_EPSILON
+    }
+
+    #[test]
+    fn 背の高い行の次の短い行へ下りても先頭が往復せず1回で収束する() {
+        // 行 2（650px = 器より高い）を先頭に置いた状態から、↓ で行 3 へ移った
+        let fixed = follow_then_recheck(2, 3, true);
+        assert_eq!(fixed, vec![3], "1 回で先頭 3 へ収束する");
+        assert!(tall_cursor_fits(3, 3), "カーソル行が器に入る");
+        // 収束した先で何度確かめ直しても動かない（確かめ直しは追従と同じ答え）
+        assert_eq!(follow_cursor(tall_view(3, 3, true), 3, FOLLOW_MARGIN), None);
+
+        // 修正前（行数だけで判断する）は「可視 1 行 → 先頭 3」「先頭 3 で可視 4 行 →
+        // 余白 1 行のため先頭 2」を往復し、上限で先頭 2（行 3 は器の外）に止まる
+        let legacy = follow_then_recheck(2, 3, false);
+        assert_eq!(legacy, vec![3, 2, 3, 2, 3, 2, 3, 2], "修正前は往復する");
+        assert!(
+            !tall_cursor_fits(2, 3),
+            "修正前の止まり先ではカーソル行が器の外"
+        );
+    }
+
+    #[test]
+    fn 背の高い行そのものへ下りたら先頭に置いて行頭のキャレットを見せる() {
+        // 行 1 を先頭に置いた状態から ↓ で行 2（器より高い）へ。丸ごとは入らないので行 2 が先頭
+        assert_eq!(fit_top(2, TALL_ROOM, tall_row), 2);
+        assert_eq!(follow_then_recheck(1, 2, true), vec![2]);
+        // 続けて ↓ を押していっても、先頭は前の値へ戻らず（往復しない）#2737 の確かめ直しの
+        // 上限（3 回）の内側で収束し、カーソル行（背の高い行は行頭）が入る。下に背の高い行が
+        // 控えていると、行数の余白を詰めながら 2 回で止まることはある（一方向）
+        let mut top = 0usize;
+        for cursor in 1..60 {
+            let tops = follow_then_recheck(top, cursor, true);
+            let mut seen = vec![top];
+            for next in &tops {
+                assert!(
+                    !seen.contains(next),
+                    "行 {cursor} で先頭が往復した（{top} → {tops:?}）"
+                );
+                seen.push(*next);
+            }
+            assert!(tops.len() <= 3, "行 {cursor} で収束しない ({tops:?})");
+            if let Some(next) = tops.last() {
+                top = *next;
+            }
+            assert!(
+                tall_cursor_fits(top, cursor) || (top == cursor && tall_row(cursor) > TALL_ROOM),
+                "行 {cursor} で先頭 {top} だとカーソル行が器の外"
+            );
+        }
+    }
+
+    #[test]
+    fn 行の高さが揃っていればfit_topは行数だけの答えを変えない() {
+        // #1741 / #2714 の追従の判定（余白は (可視 − 1) / 2 まで）は fit_top を渡しても同じ
+        for height in [13.0_f32, 21.0, 26.0] {
+            for rows in 1..=30 {
+                let room = height * rows as f32;
+                let total = 120;
+                for first in 0..60 {
+                    let base = LineViewport {
+                        first_visible: first,
+                        visible_lines: visible_rows(
+                            0.0,
+                            room,
+                            std::iter::repeat(Some(height)),
+                            height,
+                        ),
+                        total_lines: total,
+                        fit_top: None,
+                    };
+                    for cursor in 0..total {
+                        let with = LineViewport {
+                            fit_top: Some(fit_top(cursor, room, |_| height)),
+                            ..base
+                        };
+                        assert_eq!(
+                            follow_cursor(with, cursor, FOLLOW_MARGIN),
+                            follow_cursor(base, cursor, FOLLOW_MARGIN),
+                            "行 {height}px・器 {rows} 行・先頭 {first}・カーソル {cursor}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fit_topはカーソル行から上へ器に収まるところまで() {
+        // 揃った行: 器に 10 行入るなら、カーソル行を最下段に置く先頭
+        assert_eq!(fit_top(50, 210.0, |_| 21.0), 41);
+        // 文書の頭は 0 より上へ行かない
+        assert_eq!(fit_top(3, 210.0, |_| 21.0), 0);
+        // カーソル行だけで器より高ければカーソル行そのもの
+        assert_eq!(
+            fit_top(7, 100.0, |line| if line == 7 { 500.0 } else { 21.0 }),
+            7
+        );
+        // 上の行が背の高い行なら、それを先頭に含められない
+        assert_eq!(fit_top(3, TALL_ROOM, tall_row), 3);
+        assert_eq!(fit_top(6, TALL_ROOM, tall_row), 3);
+        // 測れない高さ（0・NaN）は 0 とみなす（器の容量を食わない）
+        assert_eq!(
+            fit_top(2, 21.0, |line| if line == 1 { f32::NAN } else { 21.0 }),
+            1
         );
     }
 }
