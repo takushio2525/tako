@@ -134,6 +134,7 @@ pub mod tmux_test_gate;
 pub mod tree_select;
 pub mod ui_mode;
 pub mod unused_id;
+pub mod uploads;
 pub mod url_guard;
 pub mod usage;
 pub mod user_task;

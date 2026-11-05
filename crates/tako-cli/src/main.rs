@@ -3378,8 +3378,16 @@ struct SendArgs {
     /// claude TUI の起動（❯ プロンプト表示）を待ってから送信する（信頼ダイアログは自動承諾）
     #[arg(long)]
     await_prompt: bool,
-    /// 送信するテキスト（複数引数はスペース連結）
-    #[arg(required = true)]
+    /// 生のキーを名前で送る（繰り返し可。`--key Escape` で生成中の claude を止める。text と排他。
+    /// MCP は `tako_send_input` の `keys`。#2743）
+    #[arg(long = "key", value_name = "NAME")]
+    key: Vec<String>,
+    /// 添付するファイル（繰り返し可。ペインの作業ディレクトリの `.tako-remote-uploads/` へ写し、
+    /// そのパスを本文の後ろへ足して送る。MCP は `tako_send_input` の `attachments`。#2743）
+    #[arg(long = "attach", value_name = "PATH")]
+    attach: Vec<std::path::PathBuf>,
+    /// 送信するテキスト（複数引数はスペース連結。`--key` / `--attach` だけなら省ける）
+    #[arg(required_unless_present_any = ["key", "attach"])]
     text: Vec<String>,
 }
 
@@ -5473,6 +5481,7 @@ fn orchestrator_master(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         tmux_session: None,
         await_prompt: false,
         paste_guard: None,
+        attachments: Vec::new(),
     })?;
 
     let launched = ReplyNote::MasterLaunched(launch_location(&target, lang));
@@ -5706,6 +5715,7 @@ fn orchestrator_solo(arg: Option<&str>, use_tab: bool) -> Result<(), String> {
         tmux_session: None,
         await_prompt: false,
         paste_guard: None,
+        attachments: Vec::new(),
     })?;
 
     let launched = ReplyNote::SoloLaunched(launch_location(&target, lang));
@@ -10284,6 +10294,24 @@ fn build_request(command: &Command) -> Result<Request, String> {
                 focus: Some(args.focus),
             }
         }
+        // #2743: `--key` は MCP `tako_send_input` の `keys`（text・添付・--await-prompt と排他。
+        // 断りは表示言語 = clap の英語の文にしない）
+        Command::Send(args) if !args.key.is_empty() => {
+            for (given, other) in [
+                (!args.text.is_empty(), "text"),
+                (!args.attach.is_empty(), "--attach"),
+                (args.await_prompt, "--await-prompt"),
+            ] {
+                if given {
+                    return Err(front_err(tako_control::Reason::NotTogether("--key", other)));
+                }
+            }
+            Request::SendKeys {
+                pane: target_pane(args.pane)?,
+                keys: args.key.clone(),
+                tmux_session: args.tmux_session.clone(),
+            }
+        }
         Command::Send(args) => Request::Send {
             pane: target_pane(args.pane)?,
             text: args.text.join(" "),
@@ -10291,6 +10319,16 @@ fn build_request(command: &Command) -> Result<Request, String> {
             tmux_session: args.tmux_session.clone(),
             await_prompt: args.await_prompt,
             paste_guard: None,
+            // #2743: GUI の作業ディレクトリは呼び手と違うので、相対パスはここ（呼び手の cwd）で絶対にする
+            attachments: args
+                .attach
+                .iter()
+                .map(|p| {
+                    std::path::absolute(p)
+                        .map(|abs| abs.display().to_string())
+                        .map_err(|_| front_err(tako_control::Reason::CwdUnavailable))
+                })
+                .collect::<Result<_, _>>()?,
         },
         Command::Focus(args) => {
             let direction = match (args.left, args.right, args.up, args.down) {
@@ -13456,6 +13494,28 @@ fn print_delivery(result: &Value) {
     if let Some(line) = paste_guard_line(result) {
         eprintln!("{line}");
     }
+    for line in attachment_lines(result) {
+        eprintln!("{line}");
+    }
+}
+
+/// `tako send --attach` の写した先（#2743）を 1 件 1 行で（応答の `attachments` と同じもの）
+fn attachment_lines(result: &Value) -> Vec<String> {
+    result
+        .get("attachments")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .map(|a| {
+                    format!(
+                        "[attach] path={} bytes={}",
+                        a["path"].as_str().unwrap_or("?"),
+                        a["bytes"].as_u64().unwrap_or(0)
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `tako send` の鍵らしき文字の警告（#2050）の 1 行。載せるのは規則名と伏せ字だけ（応答と同じ）
@@ -15358,6 +15418,7 @@ mod tests {
                 tmux_session: None,
                 await_prompt: false,
                 paste_guard: None,
+                attachments: Vec::new(),
             }
         );
     }

@@ -257,6 +257,8 @@ impl TakoApp {
                     OffloadContinuation::ClosePlace(_) => None,
                     // 定義ジャンプの問い合わせからは来ない（#2663 の tako mod の着地）
                     OffloadContinuation::Mod(_) => None,
+                    // 定義ジャンプの問い合わせからは来ない（#2743 の添付つきの送信の着地）
+                    OffloadContinuation::SendAttached(_) => None,
                 };
                 self.land_lsp_goto(next, menu, cx);
             }

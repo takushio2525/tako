@@ -431,6 +431,10 @@ pub enum Request {
     /// `"human"` = 貼り付けの確認の段に従う（確認の段なら送らずに `sent: false` と伏せ字を返す）、
     /// `"confirmed"` = 人が確かめた（送る）。無ければ AI・スクリプトの送信として扱い、
     /// 止めずに送って応答に `paste_guard`（規則名と伏せ字）を付けるだけ
+    ///
+    /// `attachments`（Issue #2743）は送る前にペインの作業ディレクトリの添付の置き場
+    /// （`tako_core::uploads`。スマホの添付と同じ）へ写すファイル（絶対パス）。写した先の
+    /// パスを `text` の後ろへ足して送り、応答の `attachments` に写した先を載せる
     Send {
         pane: Option<u64>,
         text: String,
@@ -442,6 +446,18 @@ pub enum Request {
         await_prompt: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         paste_guard: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<String>,
+    },
+    /// ペインへ生のキーを名前で送る（Issue #2743。MCP は `tako_send_input` の `keys`、
+    /// CLI は `tako send --key`）。語彙は `tako_core::backend::key_name_bytes` の 1 か所
+    /// （スマホのクイックキーと同じ）。1 つでも知らない名前があれば何も送らない。
+    /// 選択肢ダイアログの表示中は `Send` と同じく断る（Escape も含む。応答は respond で）
+    SendKeys {
+        pane: Option<u64>,
+        keys: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_session: Option<String>,
     },
     /// ペインの画面内容取得（FR-2.2.5）。`lines` は末尾からの行数制限。
     /// `tmux_session` 指定時はペインが見つからなくても tmux session 経由で読む
@@ -3050,6 +3066,8 @@ pub fn changes_layout(request: &Request) -> bool {
         // ホバー（#1681）は答えを返すか、`show` でカード（重ね物）を出すだけ（ペインの寸法は不変）
         | Request::LspHover { .. }
         | Request::Send { .. }
+        // 生のキー（#2743）も内側アプリへバイト列を渡すだけ
+        | Request::SendKeys { .. }
         // クリック（#1961）は内側アプリへ報告のバイト列を渡すだけ（ペインの寸法は不変）
         | Request::PaneClick { .. }
         | Request::Scroll { .. }
@@ -3488,6 +3506,7 @@ mod tests {
                 tmux_session: None,
                 await_prompt: false,
                 paste_guard: None,
+                attachments: Vec::new(),
             }
         );
     }
@@ -3513,6 +3532,7 @@ mod tests {
             tmux_session: None,
             await_prompt: false,
             paste_guard: None,
+            attachments: Vec::new(),
         };
         assert_eq!(send.kind_name(), "Send");
         // #2046: 判定を試す本文（鍵らしき文字）も種別名の外へ出ない
@@ -3796,6 +3816,7 @@ mod tests {
                 tmux_session: None,
                 await_prompt: false,
                 paste_guard: None,
+                attachments: Vec::new(),
             },
             Request::Scroll {
                 pane: None,

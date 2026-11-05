@@ -203,6 +203,33 @@ domain socket へ直送する経路で、画面解析もキー操作も伴わな
   再試行してから第 2 層へ落ちる（1 回で諦めると長文プロンプトで最も効く場面を取り逃す）
 - codex / agy と Windows は従来経路のまま（Windows は `cfg(unix)` で構造的に対象外）
 
+FR-2.2.2 追補 3（Issue #2743・2026-11-05）: **生のキーと添付**。外部の GUI フロントエンドが
+公開された口だけでチャットの「停止」（生成中の claude へ Esc）と「添付」を作れるようにする。
+新しい MCP ツールは足さず `tako_send_input` の引数で表す（CLI は `tako send --key` / `--attach`）。
+
+- `keys`（`Request::SendKeys`）: キー名の列を順に送る。語彙は `tako_core::backend::key_name_bytes`
+  の 1 か所（器の外の `send-keys` と respond の操作・スマホのクイックキーと共有。#2743 で
+  `C-<英字>` = 制御文字を足した）。1 つでも知らない名前・空の列なら 1 バイトも送らずに断る
+  （`KeyRefusal`）。text / click / attachments / await_prompt とは排他（MCP の前段と CLI が
+  `Reason::NotTogether` で表示言語の文を返す）。選択肢ダイアログの表示中は `Send` と同じく断る。
+  **Escape・矢印も例外にしない**（`Send` の「生の ESC を含む文字列は素通し」= #748 とは違う。
+  ダイアログへの応答は `tako_orchestrator_respond` の 1 本 = 実在の再検証つき）。ペインが
+  解決できなければ `tmux_session` へ名前のまま `send-keys` で渡す。1 キーずつ書くが、続けて
+  送ったキーは端末側で 1 回に読まれることがある（`["Escape", "1"]` は Alt+1 に見えうる）
+- `attachments`（`Send` の欄）: 絶対パスのファイルを対象ペインの作業ディレクトリの
+  `.tako-remote-uploads/`（スマホの添付 `/api/upload` と同じ置き場。正本は `tako_core::uploads`）
+  へ写し、写した先の絶対パスを本文の後ろへ空白区切りで足して送る（空白を含むパスは `"…"`）。
+  応答の `attachments[]` に `source` / `path` / `bytes`。1 件 20 MB まで・ファイルだけ
+  （フォルダ・FIFO は開かずに断る）・相対パスは断る（CLI は呼び手の cwd で絶対にしてから渡す）。
+  写した先は本人だけが読める形（境界 `platform::private_file`）で、**同じ名前は上書きせず
+  `名前-2.拡張子` へずらす**（先に送った添付をエージェントが読む前に差し替えない）。置き場を
+  初めて作ったときは `.gitignore`（`*`）を置く。写す前に全件を確かめ、途中で失敗した・送らずに
+  終わった（ダイアログ・貼り付けの確認）ときはこの送信のために写した分を消す
+- 添付の写し（最大 20 MB の読み書き）は UI スレッドで待たない: 準備の段（UI）で送れる状態か
+  （ダイアログ）と写す先（ペインの cwd）を決め、写すのは `OffloadJob::SendAttach`（background）、
+  送る本体は着地 `OffloadContinuation::SendAttached`（同期の腕と同じ `send_reply`）
+- remote daemon の `{keys}` / `/api/upload` の挙動は変えていない（置き場の名前と上限は共有）
+
 FR-2.2.8 の「明確なエラー」は FR-2.2.9 の解決順（環境変数 → 接続情報ファイル）を
 すべて試した上での不在を意味する（tako が起動していれば、tako の外からでも接続できる）。
 **隔離の印（#2531）**: `TAKO_ISOLATED=1` の CLI / MCP ブリッジ / remote daemon は、`TAKO_DISCOVERY_DIR` /

@@ -335,6 +335,7 @@ pub fn counts_as_input(request: &crate::protocol::Request) -> bool {
     matches!(
         request,
         Request::Send { .. }
+            | Request::SendKeys { .. }
             | Request::PaneClick { .. }
             | Request::OrchestratorRespond { .. }
             | Request::Close { .. }
@@ -772,6 +773,7 @@ mod tests {
             tmux_session: None,
             await_prompt: false,
             paste_guard: None,
+            attachments: Vec::new(),
         };
         assert!(counts_as_input(&send));
         // CLI / MCP の明示 close も数える（GUI の × と違って dispatch が器を片付ける経路）

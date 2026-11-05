@@ -774,6 +774,9 @@ pub trait DetachedAccess: DetachedCapture {
 ///
 /// 対応しないキー名は `None`（呼び出し側が「送れない」と言えるようにする。
 /// 適当なバイト列を送るとダイアログを誤操作しうるので、推測はしない）
+///
+/// `tako_send_input` の `keys`（CLI `tako send --key`。#2743）もこの語彙で、スマホの PWA の
+/// クイックキー（`Escape` / `Tab` / `C-c` / `Up` / `Down`）を含む。断りに添える一覧は [`KEY_NAMES`]
 pub fn key_name_bytes(key: &str) -> Option<Vec<u8>> {
     // 端末の Enter は CR（LF は「改行挿入」と解釈され送信にならない。#95）
     let seq: &[u8] = match key {
@@ -785,6 +788,14 @@ pub fn key_name_bytes(key: &str) -> Option<Vec<u8>> {
         "Escape" => b"\x1b",
         "Space" => b" ",
         "Tab" => b"\t",
+        // Ctrl + 英字（`C-c` = 割り込み等。tmux の `send-keys` と同じ綴り）は制御文字 1 バイト
+        other if other.len() == 3 && other.starts_with("C-") => {
+            let c = other.as_bytes()[2];
+            if !c.is_ascii_alphabetic() {
+                return None;
+            }
+            return Some(vec![c.to_ascii_lowercase() - b'a' + 1]);
+        }
         // 1 文字の印字可能 ASCII（選択肢の番号 `1` / `y` / `n` 等）はそのまま
         other => {
             let mut chars = other.chars();
@@ -798,6 +809,53 @@ pub fn key_name_bytes(key: &str) -> Option<Vec<u8>> {
         }
     };
     Some(seq.to_vec())
+}
+
+/// [`key_name_bytes`] が受ける名前の一覧（知らない名前を断るときに添える。ASCII だけ）
+pub const KEY_NAMES: &str =
+    "Enter, Escape, Tab, Space, Up, Down, Left, Right, C-<a-z> (C-c ...), 1 ASCII char";
+
+/// 知らないキー名を断る理由（#2743。`tako_send_input` の `keys` / `tako send --key`）。
+/// 表示（`Display`）は表示言語に従う（#2365）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyRefusal {
+    /// 名前の列が空
+    Empty,
+    /// 語彙に無い名前
+    Unknown(String),
+}
+
+impl KeyRefusal {
+    pub fn text_in(&self, lang: crate::i18n::Lang) -> String {
+        use crate::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Empty, Ja) => "keys に送るキー名を 1 つ以上指定する".into(),
+            (Self::Empty, En) => "give keys at least one key name".into(),
+            (Self::Unknown(key), Ja) => {
+                format!("知らないキー名: {key:?}（使えるのは {KEY_NAMES}）")
+            }
+            (Self::Unknown(key), En) => {
+                format!("unknown key name: {key:?} (known: {KEY_NAMES})")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for KeyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(crate::i18n::lang()))
+    }
+}
+
+/// キー名の列を、書く順のバイト列へ直す（#2743）。1 つでも知らない名前があれば何も返さない
+/// （途中まで送ってから断ると、送った分だけ画面が動いてしまう）
+pub fn keys_to_bytes(keys: &[String]) -> Result<Vec<Vec<u8>>, KeyRefusal> {
+    if keys.is_empty() {
+        return Err(KeyRefusal::Empty);
+    }
+    keys.iter()
+        .map(|k| key_name_bytes(k).ok_or_else(|| KeyRefusal::Unknown(k.clone())))
+        .collect()
 }
 
 // --- 本番 spawn 経路の配線（#519 M1） --------------------------------------
@@ -2292,5 +2350,37 @@ mod tests {
         assert_eq!(super::key_name_bytes("PageDown"), None);
         assert_eq!(super::key_name_bytes(""), None);
         assert_eq!(super::key_name_bytes("あ"), None);
+    }
+
+    /// #2743: PWA のクイックキーの語彙（Escape / Tab / C-c / Up / Down）が全部落ちる。
+    /// Ctrl + 英字は制御文字 1 バイト（`C-m` は従来どおり Enter と同じ CR）
+    #[test]
+    fn issue2743_ctrlキーと列の変換() {
+        assert_eq!(
+            super::key_name_bytes("Escape").as_deref(),
+            Some(&b"\x1b"[..])
+        );
+        assert_eq!(super::key_name_bytes("C-c").as_deref(), Some(&b"\x03"[..]));
+        assert_eq!(super::key_name_bytes("C-C").as_deref(), Some(&b"\x03"[..]));
+        assert_eq!(super::key_name_bytes("C-m").as_deref(), Some(&b"\r"[..]));
+        assert_eq!(super::key_name_bytes("C-1"), None);
+        assert_eq!(super::key_name_bytes("C-cc"), None);
+        for pwa in ["Escape", "Tab", "C-c", "Up", "Down"] {
+            assert!(super::key_name_bytes(pwa).is_some(), "{pwa}");
+        }
+        let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::keys_to_bytes(&keys(&["Escape", "Enter"])),
+            Ok(vec![b"\x1b".to_vec(), b"\r".to_vec()])
+        );
+        assert_eq!(super::keys_to_bytes(&[]), Err(super::KeyRefusal::Empty));
+        assert_eq!(
+            super::keys_to_bytes(&keys(&["Escape", "Esc"])),
+            Err(super::KeyRefusal::Unknown("Esc".into()))
+        );
+        let ja = super::KeyRefusal::Unknown("Esc".into()).text_in(crate::i18n::Lang::Ja);
+        let en = super::KeyRefusal::Unknown("Esc".into()).text_in(crate::i18n::Lang::En);
+        assert!(ja.starts_with("知らないキー名: \"Esc\""), "{ja}");
+        assert!(en.starts_with("unknown key name: \"Esc\""), "{en}");
     }
 }

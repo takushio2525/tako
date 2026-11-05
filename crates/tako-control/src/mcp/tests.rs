@@ -1901,6 +1901,87 @@ mod tests {
         assert!(matches!(requests.as_slice(), [Request::Send { .. }]));
     }
 
+    /// #2743: `keys` は生のキーの送信（`SendKeys`）へ写る。text / click / attachments /
+    /// await_prompt と同時なら Request を作らずに表示言語の理由（#2365 の `Reason`）で断る。
+    /// `attachments` は Send の欄へ載り、添付だけなら text を省ける
+    #[test]
+    fn issue2743_send_inputのkeysとattachments() {
+        let build = |args: Value| build_request("tako_send_input", &args, None, None);
+        assert_eq!(
+            build(json!({ "pane": 4, "keys": ["Escape"], "tmux_session": "w1" })),
+            Ok(Request::SendKeys {
+                pane: Some(4),
+                keys: vec!["Escape".into()],
+                tmux_session: Some("w1".into()),
+            })
+        );
+        for (bad, other) in [
+            (json!({ "pane": 4, "keys": ["Escape"], "text": "x" }), "text"),
+            (
+                json!({ "pane": 4, "keys": ["Escape"], "click": { "row": 0, "col": 0 } }),
+                "click",
+            ),
+            (
+                json!({ "pane": 4, "keys": ["Escape"], "attachments": ["/a.png"] }),
+                "attachments",
+            ),
+            (
+                json!({ "pane": 4, "keys": ["Escape"], "await_prompt": true }),
+                "await_prompt",
+            ),
+        ] {
+            assert_eq!(
+                build(bad.clone()),
+                Err(crate::dispatch::Reason::NotTogether("keys", other).to_string()),
+                "{bad}"
+            );
+        }
+        // 日英の文（表示言語に従う。同じ型の 2 つの言語）
+        let reason = crate::dispatch::Reason::NotTogether("keys", "text");
+        assert_eq!(
+            reason.text_in(tako_core::i18n::Lang::Ja),
+            "keys と text は同時に指定しない"
+        );
+        assert_eq!(
+            reason.text_in(tako_core::i18n::Lang::En),
+            "keys and text cannot be given together"
+        );
+        // 形の崩れた keys・pane なしも断る（Request を作らない）
+        for bad in [
+            json!({ "pane": 4, "keys": "Escape" }),
+            json!({ "pane": 4, "keys": [1] }),
+            json!({ "keys": ["Escape"] }),
+        ] {
+            let (_, requests) = run(call("tako_send_input", bad.clone()), None, true);
+            assert!(requests.is_empty(), "断らずに要求を作った: {bad}");
+        }
+        // click と attachments も同時には渡せない
+        assert_eq!(
+            build(json!({ "pane": 4, "click": { "row": 1, "col": 1 }, "attachments": ["/a"] })),
+            Err(crate::dispatch::Reason::NotTogether("click", "attachments").to_string())
+        );
+        // 添付だけ（text を省く）
+        assert_eq!(
+            build(json!({ "pane": 4, "attachments": ["/tmp/a.png"] })),
+            Ok(Request::Send {
+                pane: Some(4),
+                text: String::new(),
+                newline: true,
+                tmux_session: None,
+                await_prompt: false,
+                paste_guard: None,
+                attachments: vec!["/tmp/a.png".into()],
+            })
+        );
+        // text も添付も無ければ従来どおり text が要る
+        assert!(build(json!({ "pane": 4 })).is_err());
+        // keys: null は渡していないのと同じ（従来の text の送信）
+        assert!(matches!(
+            build(json!({ "pane": 4, "keys": null, "text": "ls" })),
+            Ok(Request::Send { .. })
+        ));
+    }
+
     #[test]
     fn ツールカタログは操作セットを網羅する() {
         let tools = tools();
