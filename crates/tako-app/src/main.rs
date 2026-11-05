@@ -54798,6 +54798,8 @@ mod self_test {
     ///   進んで lsp-context-menu ① が FAILED に見える）
     /// - `rgba-lsp` = 全節実行の cpp / python の構文の色が言語サーバを決めない（[`vt2716_rgba_lsp`]。
     ///   未導入の帯が本文を押し出し、比べる行の名指しで止まる）
+    /// - `tree-multiselect` = tree-multiselect が歓迎の帯を閉じず、⑥ で確かめた断りの通知を残したまま
+    ///   行を採る（通知が行を窓の外へ押し出し「行が窓の外」で止まる）
     #[cfg(feature = "visual-test")]
     fn legacy_2716(item: &str) -> bool {
         std::env::var("TAKO_2716_LEGACY").is_ok_and(|value| {

@@ -30,7 +30,7 @@
 //!    `vt2716_own_scene`（= `ensure_fresh_scene`）で場面を作る・chat-table が開いた後に
 //!    `drain_pending_preview_loads` を呼ぶ・bracket-match が言語サーバを差し替え、状態の着地
 //!    （`vt_lsp_settled`）を基準のフレームより前に待つ
-//! 4. [`修正前の形を名指しできる`] — 修正前の形を注入すると 1〜3・5・6 のどれかが名指しで落ちる
+//! 4. [`修正前の形を名指しできる`] — 修正前の形を注入すると 1〜3・5〜7 のどれかが名指しで落ちる
 //! 5. [`言語サーバの節は自動起動の前提を名指しで確かめる`] — 隔離起動の GUI は
 //!    `TAKO_LSP_AUTOSTART=1` が無いと文書を開いても言語サーバを起こさない（#2048）。付けずに
 //!    全節実行を起こすと lsp-context-menu ① が「言語サーバの節が無い」の FAILED に見えた（段 3 の
@@ -42,6 +42,11 @@
 //!    幅 240px のペインを埋め、本文の行が 1 行も描かれず比べる範囲が空だった。`vt2716_rgba_lsp` が
 //!    fixture の言語サーバを診断の無い偽サーバへ決め、編集の絵の前に状態の着地を待ち、比べる範囲の
 //!    空を RGBA の確かめより前に名指す
+//! 7. [`tree_multiselectは確かめた通知を消して場面の帯を閉じる`] — 6 の後、tree-multiselect が
+//!    全節実行で 3/3・単独でも「行が窓の外」で止まった。⑥ がわざと出した断りの通知（一時 dir の
+//!    絶対パス 3 本で約 225px）を消さずに次の行を採り、⑦ の t2.txt の下端が 606.5px > 窓 600px。
+//!    単独は歓迎の帯（約 110px）も乗る。場面づくりで歓迎の帯を閉じ、⑥ の断りを確かめた直後と
+//!    ⑦ の頭で `clear_notice(cx)` を通す（通知の長さそのものは #2760）
 //!
 //! ## 相方
 //!
@@ -57,6 +62,7 @@ mod code_view;
 
 const MAIN: &str = "crates/tako-app/src/main.rs";
 const BRACKET: &str = "crates/tako-app/src/self_test/bracket_match_1691.rs";
+const TREE_MS: &str = "crates/tako-app/src/self_test/tree_multiselect.rs";
 const APP_SRC: &str = "crates/tako-app/src";
 
 fn workspace_root() -> PathBuf {
@@ -392,6 +398,60 @@ fn rgba_problems(main: &str) -> Vec<String> {
     problems
 }
 
+/// 規則 7: tree-multiselect が場面の帯を閉じ、確かめた断りの通知を消してから次の行を採るか
+fn tree_ms_problems(src: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let strings = code_view::without_comments(src);
+    if !strings.contains("legacy_2716(\"tree-multiselect\")") {
+        problems.push(
+            "tree-multiselect に A/B の旧の形（`legacy_2716(\"tree-multiselect\")`）が無い".into(),
+        );
+    }
+    let scene = strings.find("ensure_fresh_scene(");
+    let welcome = strings.find("app.welcome_banner = false");
+    let first_row = strings.find("let row_point =");
+    if !(before(scene, welcome) && before(welcome, first_row)) {
+        problems.push(
+            "tree-multiselect が場面づくり（`ensure_fresh_scene(` の後・行を採る道具の前）で歓迎の帯を \
+             閉じていない（単独実行は約 110px の帯が乗り、既定の窓 600px で行が窓の外へ出る）"
+                .into(),
+        );
+    }
+    // ⑥ の断りを確かめた直後（次に行を採る `row_point(cx, &at("dst"))` より前）に消す
+    match strings.find("断ったら何も動かずクリップボードは残る") {
+        Some(checked) => {
+            let rest = &strings[checked..];
+            let next_row = rest.find("row_point(cx, &at(\"dst\"))");
+            let cleared = rest.find("clear_notice(cx)");
+            if !before(cleared, next_row) {
+                problems.push(
+                    "tree-multiselect ⑥ が断りの通知を確かめた後、消さずに次の行（dst）を採っている \
+                     （通知が約 225px まで折り返して行を窓の外へ押し出す）"
+                        .into(),
+                );
+            }
+        }
+        None => problems.push("tree-multiselect ⑥ の断りの確かめが見つからない".into()),
+    }
+    // ⑦ の頭: 最後の check より後に消してから畳む
+    match strings.find("collapse_except(cx, &[\"trash-me\"])") {
+        Some(at) => {
+            let head = &strings[..at];
+            if !before(head.rfind("check("), head.rfind("clear_notice(cx)")) {
+                problems.push(
+                    "tree-multiselect ⑦ の頭で前の段の通知を消していない（`collapse_except(cx, &[\"trash-me\"])` \
+                     の前に `clear_notice(cx)`）"
+                        .into(),
+                );
+            }
+        }
+        None => problems.push(
+            "tree-multiselect ⑦ の `collapse_except(cx, &[\"trash-me\"])` が見つからない".into(),
+        ),
+    }
+    problems
+}
+
 fn app_sources() -> Vec<(String, String)> {
     let root = workspace_root();
     let mut files = Vec::new();
@@ -454,6 +514,12 @@ fn 言語サーバの節は自動起動の前提を名指しで確かめる() {
 #[test]
 fn 構文の色の確かめは言語サーバを決めて比べる行を名指す() {
     let problems = rgba_problems(&read(MAIN));
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn tree_multiselectは確かめた通知を消して場面の帯を閉じる() {
+    let problems = tree_ms_problems(&read(TREE_MS));
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
@@ -619,5 +685,41 @@ fn 修正前の形を名指しできる() {
             .iter()
             .any(|p| p.contains("比べる範囲の空")),
         "比べる範囲の空を名指さない形を名指せる"
+    );
+    // 7a. tree-multiselect が歓迎の帯を閉じない（単独実行の形）
+    let tree = read(TREE_MS);
+    let no_welcome = tree.replacen("app.welcome_banner = false;", "", 1);
+    assert_ne!(no_welcome, tree, "注入先（歓迎の帯を閉じる行）が本文に在る");
+    assert!(
+        tree_ms_problems(&no_welcome)
+            .iter()
+            .any(|p| p.contains("歓迎の帯")),
+        "歓迎の帯を閉じない tree-multiselect を名指せる"
+    );
+    // 7b. ⑥ の断りの通知を残したまま次の行を採る（全節実行で止まった形）
+    let keep6 = tree.replacen(
+        "    if own_scene {\n        clear_notice(cx);\n    }\n    // dst へ移動として貼る",
+        "    // dst へ移動として貼る",
+        1,
+    );
+    assert_ne!(keep6, tree, "注入先（⑥ の通知を消す行）が本文に在る");
+    assert!(
+        tree_ms_problems(&keep6)
+            .iter()
+            .any(|p| p.contains("⑥ が断りの通知")),
+        "⑥ の通知を残す tree-multiselect を名指せる"
+    );
+    // 7c. ⑦ の頭で消さない
+    let keep7 = tree.replacen(
+        "    if own_scene {\n        clear_notice(cx);\n    }\n    collapse_except(cx, &[\"trash-me\"]);",
+        "    collapse_except(cx, &[\"trash-me\"]);",
+        1,
+    );
+    assert_ne!(keep7, tree, "注入先（⑦ の頭で通知を消す行）が本文に在る");
+    assert!(
+        tree_ms_problems(&keep7)
+            .iter()
+            .any(|p| p.contains("⑦ の頭")),
+        "⑦ の頭で通知を消さない tree-multiselect を名指せる"
     );
 }

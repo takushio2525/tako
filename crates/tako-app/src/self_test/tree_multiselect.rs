@@ -77,6 +77,9 @@ pub(super) async fn tree_multiselect_visual(
         );
     }
     let _ = ensure_fresh_scene(window, cx, SECTION).await;
+    // #2716: 場面（窓の上の帯・サイドバーの通知）を節が自分で決める。`TAKO_2716_LEGACY=tree-multiselect`
+    // は修正前の形 = 歓迎の帯を閉じず、⑥ で確かめた断りの通知を残したまま次の行を押す
+    let own_scene = !legacy_2716("tree-multiselect");
     let mac = cfg!(target_os = "macos");
     let plain = Modifiers::default();
     let primary = if mac {
@@ -159,6 +162,11 @@ pub(super) async fn tree_multiselect_visual(
             app.remote_notice = None;
             app.file_clipboard = None;
             app.tree_selection = None;
+            // 単独実行（初回起動）は歓迎の帯（約 110px）が窓の上に乗り、既定の窓（600px）では
+            // 場面の行が窓の外へ出る。設定へは書かずにこのプロセスの表示だけ閉じる
+            if own_scene {
+                app.welcome_banner = false;
+            }
             cx.notify();
         })
         .unwrap_or_else(|_| fail("visual-test tree-multiselect: 場面づくり"));
@@ -441,6 +449,11 @@ pub(super) async fn tree_multiselect_visual(
         at("folder/inner/x.txt").is_file() && clip(cx).is_some(),
         "visual-test tree-multiselect ⑥: 断ったら何も動かずクリップボードは残る (#1867)",
     );
+    // #2716: 確かめた断りの通知を消してから次の行を押す。通知は一時 dir の絶対パスを 3 本含み、
+    // サイドバーの幅で約 225px まで折り返して行を窓の外へ押し出す（⑦ の t2.txt の下端 606.5px > 600px）
+    if own_scene {
+        clear_notice(cx);
+    }
     // dst へ移動として貼る
     let (dst_pt, _) = row_point(cx, &at("dst"));
     press(any, window, cx, dst_pt, MouseButton::Left, plain);
@@ -506,7 +519,10 @@ pub(super) async fn tree_multiselect_visual(
         ),
     );
 
-    // ⑦ 右クリックのごみ箱がまとめて効く
+    // ⑦ 右クリックのごみ箱がまとめて効く（前の段の通知を残したまま行を採らない = #2716）
+    if own_scene {
+        clear_notice(cx);
+    }
     collapse_except(cx, &["trash-me"]);
     let (t1_pt, _) = row_point(cx, &at("trash-me/t1.txt"));
     press(any, window, cx, t1_pt, MouseButton::Left, plain);
