@@ -133,6 +133,61 @@ pub(crate) fn cursor_follow_legacy() -> bool {
     std::env::var_os("TAKO_1649_LEGACY").is_some()
 }
 
+/// 追従の確かめ直し（#2737）を切って同じバイナリで A/B を取る逃げ道（`TAKO_2737_LEGACY=1`）。
+/// 旧挙動 = 追従はまだ描いていない行を 1 行ぶんの高さと見積もったまま、描いた後に確かめない
+/// （狭いペインで行が折り返すと、器に入る行が見積もりより少なくキャレットが下端の外に残る）
+pub(crate) fn follow_recheck_legacy() -> bool {
+    std::env::var_os("TAKO_2737_LEGACY").is_some()
+}
+
+/// 追従の確かめ直しの回数の上限（#2737）。描いた行の実寸で 1 回寄せ直せばふつうは収まる。
+/// 上限は、寄せ直した先の行がまた見積もりで、描くたびに寄せ合う往復を止めるため
+const FOLLOW_RECHECK_LIMIT: u8 = 3;
+
+/// 追従の確かめ直しの予約（#2737。ペインごと）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FollowRecheck {
+    /// 追従が置いた先頭の行。確かめる前に別の操作（ホイール・目次・次の追従）が器を動かして
+    /// いたら、そちらが正なので確かめない
+    top: usize,
+    /// 残りの回数
+    left: u8,
+    /// 追従の後に器を描いたか（行の実寸が控えられた = 次の描画の頭で確かめられる）
+    painted: bool,
+}
+
+/// 追従の確かめ直し（#2737）のために「器を描いた」を控える canvas（何も描かない）。
+///
+/// 行の実寸は各行の canvas が paint のときに控える（#826 の `preview_text_layouts`）ので、
+/// 確かめるのは描き終えた後の次の描画の頭（[`TakoApp::render_preview_pane`] の入口 = 本文を
+/// 組み直して控えを空にする前）。控えたら次のフレームを頼む（製品はディスプレイの周期で描き、
+/// visual-test は自分で描くので、どちらでも次の描画が来る）
+fn follow_recheck_canvas(pane_id: PaneId, cx: &mut Context<TakoApp>) -> gpui::AnyElement {
+    let app = cx.entity().downgrade();
+    canvas(
+        |_, _, _| (),
+        move |_, _, window, cx| {
+            let Some(entity) = app.upgrade() else {
+                return;
+            };
+            if !entity.update(cx, |app, _| app.note_follow_recheck_painted(pane_id)) {
+                return;
+            }
+            let app = app.clone();
+            window.on_next_frame(move |_, cx| {
+                if let Some(entity) = app.upgrade() {
+                    entity.update(cx, |_, cx| cx.notify());
+                }
+            });
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+    .into_any_element()
+}
+
 /// Markdown プレビューの仮想リスト（#826）を切って同じバイナリで A/B を取る逃げ道
 /// （`TAKO_826_NO_MD_VIRTUAL_LIST=1`）。旧挙動 = 全ブロックの element を毎フレーム作る。
 ///
@@ -1804,6 +1859,8 @@ impl TakoApp {
         let body_font_size = self.preview_body_font_size(pane_id);
         // #2009: 描かれている = 見えている。裏で手放していたら作り直す
         self.restore_released_preview(pane_id, cx);
+        // #2737: 追従の後に描いた行の実寸で確かめ直す（本文を組み直して控えを空にする前）
+        self.recheck_preview_follow(pane_id);
         self.ensure_pdf_raster_quality(pane_id, area, cx);
         let wanted_images: Vec<usize> = match self.previews.get(&pane_id).map(|p| &p.content) {
             Some(preview::PreviewContent::Pdf(data)) => {
@@ -2139,16 +2196,21 @@ impl TakoApp {
                         let list_state =
                             self.preview_body_list_state(pane_id, PreviewBodyKind::Code, count);
                         let app = cx.entity().downgrade();
-                        vec![gpui::list(list_state, move |ix, _window, cx| {
-                            let Some(app) = app.upgrade() else {
-                                return div().into_any_element();
-                            };
-                            app.update(cx, |app, cx| app.render_preview_code_line(pane_id, ix, cx))
-                        })
-                        .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-                        .py(px(PREVIEW_BODY_PADDING))
-                        .flex_1()
-                        .into_any_element()]
+                        vec![
+                            gpui::list(list_state, move |ix, _window, cx| {
+                                let Some(app) = app.upgrade() else {
+                                    return div().into_any_element();
+                                };
+                                app.update(cx, |app, cx| {
+                                    app.render_preview_code_line(pane_id, ix, cx)
+                                })
+                            })
+                            .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                            .py(px(PREVIEW_BODY_PADDING))
+                            .flex_1()
+                            .into_any_element(),
+                            follow_recheck_canvas(pane_id, cx),
+                        ]
                     }
                 }
                 // #826: Markdown も**可視ブロックだけ**を組む（機序はコードと同じ。
@@ -4434,6 +4496,7 @@ impl TakoApp {
             .retain(|(pane, ..)| *pane != pane_id);
         self.preview_text_layouts.remove(&pane_id);
         self.preview_body_lists.remove(&pane_id);
+        self.preview_follow_recheck.remove(&pane_id);
         self.preview_pending_reveal.remove(&pane_id);
         self.preview_md_resume_heading.remove(&pane_id);
         self.preview_md_block_index.remove(&pane_id);
@@ -4767,6 +4830,10 @@ impl TakoApp {
                 item_ix: first,
                 offset_in_item: px(0.0),
             });
+            // #2737: まだ描いていない行は 1 行ぶんの高さで見積もっている。狭いペインで行が
+            // 折り返すと、描いた器に入る行が見積もりより少なくキャレットが下端の外に残る
+            // （描画の Markdown で ⌘F → Enter したヒットが隠れる）ので、描いてから確かめ直す
+            self.arm_follow_recheck(pane_id, first, FOLLOW_RECHECK_LIMIT);
             true
         } else if let Some(handle) = self.preview_scroll_handles.get(&pane_id) {
             handle.scroll_to_top_of_item(first);
@@ -4774,6 +4841,79 @@ impl TakoApp {
         } else {
             false
         }
+    }
+
+    /// 追従の確かめ直しを予約する（#2737。`left` = 残りの回数。0 なら予約を外す）
+    fn arm_follow_recheck(&mut self, pane_id: PaneId, top: usize, left: u8) {
+        if follow_recheck_legacy() || left == 0 {
+            self.preview_follow_recheck.remove(&pane_id);
+            return;
+        }
+        self.preview_follow_recheck.insert(
+            pane_id,
+            FollowRecheck {
+                top,
+                left,
+                painted: false,
+            },
+        );
+    }
+
+    /// 追従の後に器を描いたと控える（#2737）。戻り値 = 今回はじめて控えた（次のフレームを頼む）
+    fn note_follow_recheck_painted(&mut self, pane_id: PaneId) -> bool {
+        match self.preview_follow_recheck.get_mut(&pane_id) {
+            Some(recheck) if !recheck.painted => {
+                recheck.painted = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// 追従を描いた後に確かめ直す（#2737）。戻り値 = 器を動かしたか。
+    ///
+    /// 呼ぶのは描画の頭（[`Self::render_preview_pane`]）で、追従の後に器を描いてから（行の実寸が
+    /// 控えられてから）だけ確かめる。動かしたら同じ描画がその位置で組むので描き直しの頼みは
+    /// 要らない。判断は追従そのもの（[`Self::follow_preview_cursor`]）と同じ
+    /// `tako_core::editor_scroll::follow_cursor` と余白で、可視範囲は描いた行の実寸から数える
+    /// （[`Self::preview_row_geometry`]）。見積もりと実寸が同じ（折り返さない）なら何も動かない =
+    /// #1741 の追従の判定と #2714 の詰めた余白はそのまま。追従の後に別の操作が器を動かしていたら
+    /// 確かめない（ホイールで離れた位置を引き戻さない）
+    pub(crate) fn recheck_preview_follow(&mut self, pane_id: PaneId) -> bool {
+        if !self
+            .preview_follow_recheck
+            .get(&pane_id)
+            .is_some_and(|recheck| recheck.painted)
+        {
+            return false;
+        }
+        let Some(recheck) = self.preview_follow_recheck.remove(&pane_id) else {
+            return false;
+        };
+        let Some((list, PreviewBodyKind::Code, _)) = self.preview_body_lists.get(&pane_id) else {
+            return false;
+        };
+        if list.logical_scroll_top().item_ix != recheck.top {
+            return false;
+        }
+        let Some((cursor_line, view)) = self.preview_cursor_viewport(pane_id) else {
+            return false;
+        };
+        let Some(first) = tako_core::editor_scroll::follow_cursor(
+            view,
+            cursor_line,
+            tako_core::editor_scroll::FOLLOW_MARGIN,
+        ) else {
+            return false;
+        };
+        if let Some((list, PreviewBodyKind::Code, _)) = self.preview_body_lists.get(&pane_id) {
+            list.scroll_to(gpui::ListOffset {
+                item_ix: first,
+                offset_in_item: px(0.0),
+            });
+        }
+        self.arm_follow_recheck(pane_id, first, recheck.left - 1);
+        true
     }
 
     /// 仮想リストが並べているのが Markdown ブロックなら、その `ListState`（#826）。

@@ -93,6 +93,8 @@ impl SessionBackend for TmuxBackend {
             suppresses_copy_mode_indicator: true,
             // conf の `remain-on-exit` + `pane-died` フックが閉じる前に全履歴と画面を書き出す（#2085）
             keeps_exit_output: true,
+            // conf の `exit-empty off` で、最後のセッションが消えてもサーバーを残す（#2741）
+            keeps_empty_server: true,
             label: "tmux",
         }
     }

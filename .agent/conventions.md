@@ -2358,9 +2358,16 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
   項目 115（#830）は pin を呼ばずに 81 発話の描画を `await` で待っていたので、tick が挟まった回だけ
   会話が消えて `display=Starter` のまま描画待ちが切れていた（混んだ機で 21 回中 3 回。#2727）。
   #2727 から同じ番犬が「注入した会話（`session_id` が `selftest-` / `visual-`）を入れた同期区間
-  （前後の `.await` の間）で pin していない」も名指す（既知の残りは `UNPINNED_KNOWN`・逃げ道は
-  `tako:chat-fixture-ok <理由>`）。守りを確かめるときは tick を運に任せず、項目 98 / 115 のように
-  `collect_chat_targets` → `load_chat_refresh` → `apply_chat_refresh` をその場で 1 周回して会話が残るかを見る
+  （前後の `.await` の間）で pin していない」も名指す。入れてから次の `.await` までに会話を片付ける
+  （`chat_panes.clear()` / `.remove(`）注入は tick が割り込めないので名指さない。守られているのに規則が
+  見分けられない形（pin 済みのペインへの入れ直し・最後の読み取りまで `.await` を挟まない・検査の直前の
+  積み直し）は、その行か直前のコメント行に `tako:chat-fixture-ok <理由>` を書く（#2747 で既知の残りの表は
+  空 = 削除。visual-test #745 は pin 漏れだったので直した）。守りを確かめるときは tick を運に任せず、
+  項目 98 / 115・visual-test #745 のように `collect_chat_targets` → `load_chat_refresh` → `apply_chat_refresh` を
+  その場で 1 周回して会話が残るかを見る。pin したペインを節の後も使い続けるなら、節の後片付けで
+  `chat_fixture_panes` から外す（#745 = フォーカス中の元のペインを使う）。会話の配置を測る検査は、測る時点で
+  会話が `chat_panes` に残っていることも見る（消える前に 1 度描かれた `chat_text_index` / `chat_body_lists` は
+  会話が消えても残るので、#745 の表の検査は会話が無いまま古い配置を測って素通りした = 偽の PASS。#2747）
 - **PTY へ書く Enter は CR（`\r`）**。端末が Enter として送るのは CR で、PowerShell
   （PSReadLine）は素の LF を**継続行（`>>`）の開始**と解釈するので打ち込んだコマンドが
   確定しない。POSIX 側は tty の ICANON + ICRNL が CR も LF も改行へ倒すため、
@@ -2707,9 +2714,19 @@ GPUI の `Window::hit_test` は hitbox を手前から走査し、`HitboxBehavio
     節の途中に出ると器が縮む）。言語サーバに用の無い節は fixture を受け持たない拡張子にする（#2714）
   - **dispatch で直に開いたプレビューは `drain_pending_preview_loads` で流す**（#826 / #2716 の #745。
     流さないとファイル監視の読み直しが来たときだけ揃う）
-  - A/B は `TAKO_2716_LEGACY=md-edit-resume|lsp-override|bracket-match|chat-table`（`1` で全部）、
+  - **全節実行と言語サーバの節は `TAKO_LSP_AUTOSTART=1` で起こす**（#2048 の隔離起動は文書を開いても
+    言語サーバを起こさない）。欠けていれば `vt_require_lsp_autostart`（全節実行の頭と `vt_lsp_override`）が
+    FAILED ではなく `TAKO_VISUAL_TEST_UNMET` の行と終了コード 3 で止まる（落ちたのではなく起こし方の誤り。
+    以前は lsp-context-menu ① の「言語サーバの節が無い」の FAILED に見えていた）
+  - A/B は `TAKO_2716_LEGACY=md-edit-resume|lsp-override|bracket-match|chat-table|autostart`（`1` で全部）、
     持ち越しの注入は `TAKO_2716_INJECT=split|stale-resolve|no-reload|late-band,resolve-ms=400`（単独実行で
     前の節の残りを作る。旧の形は名指しで落ち、新しい形は通る）
+- **節の合否を窓の寸法に預けない**（#2752）。検証スクリプトが渡す窓（`ISOLATED_GUI_BOUNDS`）は、
+  そのスクリプトを通さずに起こした回（`TAKO_VISUAL_ONLY` を直に付けた単独実行・全節実行）には
+  届かない（窓を渡さなければ既定の 960×600）。文字の幅を
+  `position_for_index` の差で測る検査は、測る区間が 1 行に収まることを前提として `check` で見る
+  （折り返すと 2 行目の x を測って比が崩れる。editor-font の md は既定の窓で 406.99 → 77.06 で
+  落ちていた）。前提が崩れたら比の失敗ではなく「前提の欠け」として名指して止める
 - **節を足したら `TAKO_VISUAL_ONLY` の腕と全節実行の並びの両方へ載せる**。腕にしか
   無い節は「最終確認」で**一度も走らない**（#948 で `preview_code_visual` /
   `remote_tree_visual` / `screen_lines_visual` の 3 本がこれだった。`remote_tree_visual`
