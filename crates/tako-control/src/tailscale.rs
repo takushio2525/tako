@@ -369,8 +369,10 @@ impl std::fmt::Display for RunError {
 }
 
 /// setup の不足項目。`tako remote start` はこれが 1 つでもあれば起動を拒否し、
-/// 弾 6 の `tako remote setup` ウィザードはこれを埋める手順を案内する
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 弾 6 の `tako remote setup` ウィザードはこれを埋める手順を案内する。
+/// 子の `tako remote serve` の起動前の断り（`ServeRefusal::TailscaleSetupIncomplete`）に入って親へ渡るので
+/// serde を持つ（#2365 の続き）
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MissingItem {
     /// tailscale CLI が見つからない（未導入）
     CliNotFound,
@@ -385,24 +387,45 @@ pub enum MissingItem {
 }
 
 impl MissingItem {
-    /// 不足項目の 1 行説明（ユーザー向け表示用）
+    /// 不足項目の 1 行説明（日本語。対話の setup ウィザード・setup の手順の値が使う）
     pub fn describe(&self) -> String {
-        match self {
-            Self::CliNotFound => {
+        self.describe_in(tako_core::i18n::Lang::Ja)
+    }
+
+    /// 表示言語を明示しての 1 行説明（(バリアント, 言語) の網羅 match。日本語は #2365 より前とバイト一致）
+    pub fn describe_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::CliNotFound, Ja) => {
                 "Tailscale が未導入（App Store 版アプリ または brew install tailscale）".into()
             }
-            Self::DaemonNotRunning => {
+            (Self::CliNotFound, En) => {
+                "Tailscale is not installed (the App Store app, or brew install tailscale)".into()
+            }
+            (Self::DaemonNotRunning, Ja) => {
                 "Tailscale デーモンが起動していない（アプリを起動するか tailscaled を起動）"
                     .into()
             }
-            Self::NotLoggedIn => {
+            (Self::DaemonNotRunning, En) => {
+                "the Tailscale daemon is not running (open the app, or start tailscaled)".into()
+            }
+            (Self::NotLoggedIn, Ja) => {
                 "Tailscale にログインしていない（tailscale up でブラウザ認証）".into()
             }
-            Self::BackendNotRunning(state) => {
+            (Self::NotLoggedIn, En) => {
+                "not logged in to Tailscale (tailscale up signs in through the browser)".into()
+            }
+            (Self::BackendNotRunning(state), Ja) => {
                 format!("Tailscale の接続が有効でない（状態: {state}。tailscale up で再接続）")
             }
-            Self::HttpsNotEnabled => "tailnet の HTTPS 証明書が未有効\
+            (Self::BackendNotRunning(state), En) => format!(
+                "the Tailscale connection is not up (state: {state}; reconnect with tailscale up)"
+            ),
+            (Self::HttpsNotEnabled, Ja) => "tailnet の HTTPS 証明書が未有効\
                  （https://login.tailscale.com/admin/dns で MagicDNS と HTTPS Certificates を有効化）"
+                .into(),
+            (Self::HttpsNotEnabled, En) => "HTTPS certificates are not enabled for the tailnet \
+                 (enable MagicDNS and HTTPS Certificates at https://login.tailscale.com/admin/dns)"
                 .into(),
         }
     }

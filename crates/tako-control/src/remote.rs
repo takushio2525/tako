@@ -72,6 +72,7 @@ use serde_json::{json, Value};
 
 use crate::platform::local_endpoint;
 use crate::remote_auth::{DeviceRegistry, DeviceRole, Identity};
+use crate::remote_refusal::ServeRefusal;
 
 const MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// interact idle session の定期スイープ間隔
@@ -141,23 +142,23 @@ pub const ENDPOINT_ENV: &str = "TAKO_REMOTE_ENDPOINT";
 /// tailscale には unix socket の serve target が無い）。
 /// `unix` は「standalone tailscaled しか使わない」と分かっている環境向けの
 /// 互換 opt-in で、別 OS ユーザーからの到達をカーネルが遮断する強い分離を保つ
-pub fn parse_endpoint_spec(raw: Option<&str>) -> Result<local_endpoint::EndpointSpec, String> {
+pub fn parse_endpoint_spec(
+    raw: Option<&str>,
+) -> Result<local_endpoint::EndpointSpec, crate::remote_refusal::ServeRefusal> {
+    use crate::remote_refusal::ServeRefusal;
     match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
         None | Some("") | Some("tcp") | Some("loopback") | Some("loopback-tcp") | Some("auto") => {
             Ok(local_endpoint::EndpointSpec::Loopback)
         }
         Some("unix") | Some("uds") | Some("socket") => {
             if !local_endpoint::unix_supported() {
-                return Err(format!(
-                    "{ENDPOINT_ENV}=unix はこの OS では使えません（Unix domain socket の\
-                     serve target が無いため）。指定を外すとループバック TCP で待ち受けます"
-                ));
+                return Err(ServeRefusal::EndpointUnixUnsupported);
             }
             Ok(local_endpoint::EndpointSpec::Unix(socket_path()))
         }
-        Some(other) => Err(format!(
-            "{ENDPOINT_ENV} の値が不正です: {other}（tcp | unix）"
-        )),
+        Some(other) => Err(ServeRefusal::EndpointInvalid {
+            value: other.to_string(),
+        }),
     }
 }
 
@@ -178,7 +179,8 @@ pub fn legacy_mode() -> bool {
 }
 
 /// この環境で使う待ち受けの形
-pub fn endpoint_spec() -> Result<local_endpoint::EndpointSpec, String> {
+pub fn endpoint_spec() -> Result<local_endpoint::EndpointSpec, crate::remote_refusal::ServeRefusal>
+{
     if legacy_mode() {
         // 旧挙動: UDS 固定（#287 P1-2 の形）
         return parse_endpoint_spec(Some("unix"));
@@ -1818,19 +1820,63 @@ fn broadcaster_loop(
 }
 
 /// Tailscale setup の不足項目を列挙した起動拒否エラーを組み立てる。
-/// `tako remote start` の誘導文言（Issue #282: 黙って失敗させない）
+/// `tako remote start` の誘導文言（Issue #282: 黙って失敗させない）。文は親の表示言語で組む（#2365 の続き）
 fn setup_incomplete_error(status: &crate::tailscale::SetupStatus) -> io::Error {
-    let items = status
-        .missing
-        .iter()
-        .map(|m| format!("  - {}", m.describe()))
-        .collect::<Vec<_>>()
-        .join("\n");
-    io::Error::other(format!(
-        "Tailscale のセットアップが完了していないため、remote サーバーを起動できません。\n\
-         不足項目:\n{items}\n\
-         `tako remote setup` を実行してください。"
-    ))
+    serve_refused(ServeRefusal::TailscaleSetupIncomplete {
+        missing: status.missing.clone(),
+    })
+}
+
+/// 子の起動前の断りを `io::Error` に包む（`run_daemon` の `?` をそのまま通し、CLI の
+/// [`serve_failure_text`] が中から型を取り出す）
+fn serve_refused(refusal: ServeRefusal) -> io::Error {
+    io::Error::other(refusal)
+}
+
+/// 親（[`spawn_daemon`]）が子へ「起動の前の断りを型で渡して」と頼む env（#2365 の続き）。値は `json`。
+/// 旧版の親は付けないので、そのとき子は従来どおり日本語の文を書く
+pub const SERVE_REFUSAL_ENV: &str = "TAKO_REMOTE_SERVE_REFUSAL";
+
+/// 子が断りを渡す行の印（CLI の `main` が前に `error: ` を付ける）
+const SERVE_REFUSAL_MARK: &str = "tako-remote-serve-refusal: ";
+
+/// `tako remote serve`（[`run_daemon`]）が失敗したときに stderr へ書く文（CLI の `main` が前に `error: ` を付ける）。
+///
+/// 起動の前の断り（[`ServeRefusal`]）は、親が [`SERVE_REFUSAL_ENV`] で頼んだときだけ印つきの JSON 1 行
+/// （型 `refusal` と日本語の文 `ja`）で渡し、親が型へ戻して自分の表示言語で文にする（自動復帰の記録は
+/// 日本語にしたいので、子の表示言語の文では渡さない）。頼まれていない（手で叩いた・旧版の親）ときと、
+/// それ以外の失敗（bind・tailscale の CLI ほか）は従来どおりの文
+pub fn serve_failure_text(e: &io::Error) -> String {
+    let Some(refusal) = e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ServeRefusal>())
+    else {
+        return e.to_string();
+    };
+    let ja = refusal.text_in(tako_core::i18n::Lang::Ja);
+    if std::env::var(SERVE_REFUSAL_ENV).is_ok_and(|v| v == "json") {
+        let envelope = json!({ "refusal": refusal, "ja": ja });
+        return format!("{SERVE_REFUSAL_MARK}{envelope}");
+    }
+    ja
+}
+
+/// 子の stderr から、起動の前の断りの印つきの 1 行（[`serve_failure_text`]）を拾って型へ戻す。
+/// 型へ戻せない（親の知らない種別 = 親より新しい子）ときは同じ行の日本語の文を手を加えずに載せる
+fn serve_refusal_in(stderr: &str) -> Option<crate::RemoteRefusal> {
+    let line = stderr.lines().rev().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("error: ")
+            .unwrap_or(line)
+            .strip_prefix(SERVE_REFUSAL_MARK)
+    })?;
+    let envelope: Value = serde_json::from_str(line).ok()?;
+    match serde_json::from_value::<ServeRefusal>(envelope["refusal"].clone()) {
+        Ok(refusal) => Some(crate::RemoteRefusal::DaemonServeRefused(refusal)),
+        Err(_) => envelope["ja"]
+            .as_str()
+            .map(|ja| crate::RemoteRefusal::DaemonExitedWithMessage(ja.to_string())),
+    }
 }
 
 /// Tailscale の setup 状態を検証し、serve を設定して固定 ts.net URL を返す。
@@ -1843,7 +1889,8 @@ fn establish_tailscale_serve(
 ) -> io::Result<(crate::tailscale::ServeHandle, String)> {
     // #2619: daemon の中の最後の守り（`tako remote serve` を直に起こした隔離の砂場）。
     // 起動の入口 `spawn_daemon` が先に断るので、ここで断るのは入口を通らない起動だけ
-    crate::remote_isolated_serve::check().map_err(|r| io::Error::other(r.to_string()))?;
+    crate::remote_isolated_serve::check()
+        .map_err(|_| serve_refused(ServeRefusal::IsolatedServe))?;
     let status = crate::tailscale::setup_status();
     if !status.ready() {
         return Err(setup_incomplete_error(&status));
@@ -1851,10 +1898,10 @@ fn establish_tailscale_serve(
     let cli = status
         .cli_path
         .clone()
-        .ok_or_else(|| io::Error::other("tailscale CLI パスを解決できない"))?;
+        .ok_or_else(|| serve_refused(ServeRefusal::TailscaleCliUnresolved))?;
     let base_url = status
         .ts_net_url()
-        .ok_or_else(|| io::Error::other("ts.net URL を解決できない"))?;
+        .ok_or_else(|| serve_refused(ServeRefusal::TsNetUrlUnresolved))?;
 
     // どのノードで公開するかは #1038 の選択のまま。ここで**その相手を固定する**
     // （#1049: 既定探索は tailscaled 側の都合で応答するノードが変わるので、
@@ -1896,17 +1943,10 @@ fn establish_tailscale_serve(
             );
         }
         crate::tailscale::ServeState::Proxy(target) => {
-            return Err(io::Error::other(format!(
-                "tailscale serve に既存の設定があります（HTTPS:443 → {target}）。\
-                 ユーザー設定を壊さないため上書きしません。tako の以前の設定の残骸で\
-                 あれば `tailscale serve --https=443 off` で解除してください"
-            )));
+            return Err(serve_refused(ServeRefusal::ServeOccupied { target }));
         }
         crate::tailscale::ServeState::Other => {
-            return Err(io::Error::other(
-                "tailscale serve に tako 管理外の設定があります（パス分けハンドラ等）。\
-                 上書きを避けるため起動を中止しました。`tailscale serve status` で確認してください",
-            ));
+            return Err(serve_refused(ServeRefusal::ServeForeign));
         }
     }
     Ok((handle, base_url))
@@ -1981,27 +2021,15 @@ pub fn unknown_self_check_note(reason: &str) -> String {
     }
 }
 
-/// backend へ届かなかったときの「理由 + 次の一手」。
+/// backend へ届かなかったときの「理由 + 次の一手」（文は [`ServeRefusal::BackendUnreachable`] の日英の腕）。
 /// UDS を選んでいるときは、サンドボックス版 tailscaled の制約を名指しで説明する
-pub fn unreachable_advice(endpoint: &local_endpoint::Endpoint, target: &str) -> String {
-    let common = format!(
-        "tailscale serve は HTTPS:443 → {target} を向いていますが、tailscaled が\
-         その待ち受け先へ接続できていません（HTTP 502）。"
-    );
-    match endpoint {
-        local_endpoint::Endpoint::Unix(_) => format!(
-            "{common}\n\
-             macOS の GUI 版 Tailscale（Tailscale.app のシステム拡張）はサンドボックスのため\
-             **どの Unix domain socket も dial できません**（実測 #1038）。\n\
-             次の一手: `{ENDPOINT_ENV}=unix` の指定を外して `tako remote stop && tako remote start` を\
-             実行してください（既定のループバック TCP なら GUI 版でも通ります）。"
-        ),
-        local_endpoint::Endpoint::Loopback(port) => format!(
-            "{common}\n\
-             次の一手: 127.0.0.1:{port} に別のプロセスが割り込んでいないか\
-             （`tako remote status` の endpoint と `tailscale serve status` の向き先が一致するか）、\
-             `tailscale serve --https=443 off` で設定を消してから `tako remote start` をやり直してください。"
-        ),
+pub fn unreachable_refusal(endpoint: &local_endpoint::Endpoint, target: &str) -> ServeRefusal {
+    ServeRefusal::BackendUnreachable {
+        target: target.to_string(),
+        port: match endpoint {
+            local_endpoint::Endpoint::Unix(_) => None,
+            local_endpoint::Endpoint::Loopback(port) => Some(*port),
+        },
     }
 }
 
@@ -2246,26 +2274,26 @@ pub fn run_daemon() -> io::Result<()> {
     ensure_state_dir()?;
     // #2582: 起動の最初（CLI の main）に外した env を名前だけ残す（待ち受けの前 = 起動に失敗しても残る）
     audit_startup_env();
-    let spec = endpoint_spec().map_err(io::Error::other)?;
+    // #2365 の続き: 起動の前の断りは `ServeRefusal` で返す（`serve_refused`。親が表示言語で文にする）
+    let spec = endpoint_spec().map_err(serve_refused)?;
     if let local_endpoint::EndpointSpec::Unix(ref sock) = spec {
         // エンドポイントのパス長チェック（unix の sun_path 制約に由来）
         if let Some(limit) = local_endpoint::path_byte_limit() {
             let sock_bytes = sock.as_os_str().as_encoded_bytes().len();
             if sock_bytes > limit {
-                return Err(io::Error::other(format!(
-                    "socket パスが長すぎます（{sock_bytes} バイト、上限 {limit}）。\
-                     TAKO_REMOTE_STATE_DIR でより短いパスを指定してください: {}",
-                    sock.display()
-                )));
+                return Err(serve_refused(ServeRefusal::SocketPathTooLong {
+                    bytes: sock_bytes,
+                    limit,
+                    path: sock.display().to_string(),
+                }));
             }
         }
         // stale socket の回収: 既存ファイルがあれば接続試行で生死判定
         if sock.exists() {
             if local_endpoint::probe_alive(&local_endpoint::Endpoint::Unix(sock.clone())) {
-                return Err(io::Error::other(format!(
-                    "別の daemon が既にこの socket で稼働中です: {}",
-                    sock.display()
-                )));
+                return Err(serve_refused(ServeRefusal::SocketBusy {
+                    path: sock.display().to_string(),
+                }));
             }
             // stale socket — unlink して起動続行
             let _ = std::fs::remove_file(sock);
@@ -2277,8 +2305,11 @@ pub fn run_daemon() -> io::Result<()> {
     // 到達先を state ファイルへ残す（CLI / status がここから再構成する）。
     // ループバック TCP はポートが毎回変わるので、これが唯一の手がかりになる
     if let Some(port) = endpoint.port() {
-        write_secret_file(&port_path(), &port.to_string())
-            .map_err(|e| io::Error::other(format!("ポートファイルの書き出しに失敗: {e}")))?;
+        write_secret_file(&port_path(), &port.to_string()).map_err(|e| {
+            serve_refused(ServeRefusal::PortFileUnwritable {
+                error: e.to_string(),
+            })
+        })?;
     } else {
         // UDS で起動したときに前回の TCP のポートファイルが残っていると誤解決する
         let _ = std::fs::remove_file(port_path());
@@ -2290,12 +2321,9 @@ pub fn run_daemon() -> io::Result<()> {
     // アウトオブプロセス到達手段の有無を確認する。remote デーモンは tako-app とは
     // 別プロセスなので、ペインを読む・操作するには backend 側の到達手段が要る
     if !tako_core::backend::capabilities().detached_access {
-        return Err(io::Error::other(format!(
-            "永続バックエンド（{}）にアウトオブプロセス到達手段が無い。\
-             remote サーバーは tako-app の外からペインを操作するため到達手段が必須です\
-             （macOS / Linux では tmux をインストールすると有効になります）",
-            tako_core::backend::capabilities().label
-        )));
+        return Err(serve_refused(ServeRefusal::NoDetachedAccess {
+            backend: tako_core::backend::capabilities().label.to_string(),
+        }));
     }
 
     // Tailscale setup 検証 + serve 設定（不足があればここで起動拒否）。
@@ -2341,10 +2369,16 @@ pub fn run_daemon() -> io::Result<()> {
             .unwrap_or(0),
         crate::remote_generation::self_stamp_line(&exe),
     );
-    write_secret_file(&pid_path(), &pid_info)
-        .map_err(|e| io::Error::other(format!("PID ファイルの書き出しに失敗: {e}")))?;
-    write_secret_file(&token_path(), &token)
-        .map_err(|e| io::Error::other(format!("トークンファイルの書き出しに失敗: {e}")))?;
+    write_secret_file(&pid_path(), &pid_info).map_err(|e| {
+        serve_refused(ServeRefusal::PidFileUnwritable {
+            error: e.to_string(),
+        })
+    })?;
+    write_secret_file(&token_path(), &token).map_err(|e| {
+        serve_refused(ServeRefusal::TokenFileUnwritable {
+            error: e.to_string(),
+        })
+    })?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_for_signal = shutdown.clone();
@@ -2399,9 +2433,9 @@ pub fn run_daemon() -> io::Result<()> {
             );
         }
         cleanup_state_files();
-        return Err(io::Error::other(format!(
-            "URL ファイルの書き出しに失敗: {e}"
-        )));
+        return Err(serve_refused(ServeRefusal::UrlFileUnwritable {
+            error: e.to_string(),
+        }));
     }
 
     // CORS 許可 origin を設定（#287 P1: `*` 廃止 → base_url のみエコー）
@@ -2508,7 +2542,7 @@ pub fn run_daemon() -> io::Result<()> {
     if let Some(ServeReachability::BackendUnreachable) = self_check {
         // 起動を続けても全リクエストが 502 になるだけなので、理由と次の一手を出して止める
         let target = proxy_target_for(&endpoint);
-        let advice = unreachable_advice(&endpoint, &target);
+        let advice = unreachable_refusal(&endpoint, &target);
         let handle = serve_handle.lock().unwrap().clone();
         let _ = crate::tailscale::serve_stop_if_ours_on(
             &handle.cli,
@@ -2516,7 +2550,7 @@ pub fn run_daemon() -> io::Result<()> {
             Some(&target),
         );
         cleanup_state_files();
-        return Err(io::Error::other(advice));
+        return Err(serve_refused(advice));
     }
 
     // serve 設定の自己検査（#1049）: 起動後に消えても気づけるようにする。
@@ -3967,6 +4001,8 @@ pub fn spawn_daemon() -> Result<Value, crate::RemoteRefusal> {
     // Windows では何もしない（unix の setsid 相当が無い）ので、ここで塞ぐ必要がある
     tako_core::platform::process::no_console_window(&mut cmd);
     cmd.args(SERVE_ARGS)
+        // #2365 の続き: 起動の前の断りは型で渡してもらう（`serve_failure_text`。下の `serve_refusal_in` が読む）
+        .env(SERVE_REFUSAL_ENV, "json")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -4042,8 +4078,13 @@ pub fn spawn_daemon() -> Result<Value, crate::RemoteRefusal> {
                 let _ = (&mut err).take(4096).read_to_string(&mut detail);
             }
             let detail = detail.trim();
+            // #2365 の続き: 起動の前の断り（Tailscale の不足項目・serve の取り合いほか）は印つきの 1 行で届く。
+            // 型へ戻して呼び手の表示言語で文にする（自動復帰の記録は日本語 = `into_ja`）
+            if let Some(refusal) = serve_refusal_in(detail) {
+                return Err(refusal);
+            }
             if !detail.is_empty() {
-                // 子の stderr（不足項目の列挙 + setup 誘導など）をそのまま伝える。
+                // それ以外の子の stderr（旧版の子・tailscale の CLI の失敗ほか）はそのまま伝える。
                 // 呼び出し側 CLI も「error: 」を付けるため、子側の接頭辞は剥がして二重化を防ぐ
                 let detail = detail.strip_prefix("error: ").unwrap_or(detail);
                 return Err(crate::RemoteRefusal::DaemonExitedWithMessage(
@@ -7767,14 +7808,16 @@ mod tests {
             ));
         } else {
             // unix socket を持たない OS では理由と次の一手を返す
-            let e = spec.unwrap_err();
+            let e = spec.unwrap_err().text_in(tako_core::i18n::Lang::Ja);
             assert!(e.contains("ループバック TCP"), "{e}");
         }
     }
 
     #[test]
     fn 待ち受け指定の不正値は理由つきで拒否される() {
-        let e = parse_endpoint_spec(Some("http")).unwrap_err();
+        let e = parse_endpoint_spec(Some("http"))
+            .unwrap_err()
+            .text_in(tako_core::i18n::Lang::Ja);
         assert!(e.contains("tcp"), "{e}");
         assert!(e.contains("unix"), "{e}");
     }
@@ -7852,19 +7895,21 @@ mod tests {
     #[test]
     fn backend未到達の説明は理由と次の一手を持つ() {
         // UDS を選んでいるときはサンドボックス版 tailscaled の制約を名指しする
-        let uds = unreachable_advice(
+        let uds = unreachable_refusal(
             &local_endpoint::Endpoint::Unix(std::path::PathBuf::from("/tmp/a.sock")),
             "unix:/tmp/a.sock",
-        );
+        )
+        .text_in(tako_core::i18n::Lang::Ja);
         assert!(uds.contains("502"), "{uds}");
         assert!(uds.contains("Unix domain socket"), "{uds}");
         assert!(uds.contains(ENDPOINT_ENV), "{uds}");
         assert!(uds.contains("tako remote start"), "{uds}");
         // TCP のときはポートの取り合いと serve の張り直しを案内する
-        let tcp = unreachable_advice(
+        let tcp = unreachable_refusal(
             &local_endpoint::Endpoint::Loopback(18080),
             "http://127.0.0.1:18080",
-        );
+        )
+        .text_in(tako_core::i18n::Lang::Ja);
         assert!(tcp.contains("502"), "{tcp}");
         assert!(tcp.contains("127.0.0.1:18080"), "{tcp}");
         assert!(tcp.contains("tako remote start"), "{tcp}");

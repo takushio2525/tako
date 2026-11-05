@@ -194,7 +194,8 @@ pub enum ServeStep {
 /// 既定のループバック TCP はポートが起動時にしか決まらないので**ここでは張らない**
 /// （#1038: 固定 target を前提にできるのは UDS を明示したときだけ）
 pub fn configure_serve(cli: &str) -> Result<ServeStep, String> {
-    let spec = crate::remote::endpoint_spec()?;
+    // setup の手順の文は日本語のまま（対話のウィザードと非対話の `steps[].message` が共有する）
+    let spec = crate::remote::endpoint_spec().map_err(|r| r.text_in(tako_core::i18n::Lang::Ja))?;
     let sock = match spec {
         crate::platform::local_endpoint::EndpointSpec::Loopback => return Ok(ServeStep::Deferred),
         crate::platform::local_endpoint::EndpointSpec::Unix(path) => path,

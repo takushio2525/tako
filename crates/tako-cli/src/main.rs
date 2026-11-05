@@ -6550,7 +6550,8 @@ fn remote_setup_cli(
 /// `tako remote serve` — HTTP サーバーをフォアグラウンドで起動する（内部用）
 fn remote_serve() -> Result<(), String> {
     local_data_gate()?;
-    tako_control::remote::run_daemon().map_err(|e| e.to_string())
+    // #2365 の続き: 起動の前の断りは、起こした親が頼んだときだけ型で渡す（親が表示言語で文にする）
+    tako_control::remote::run_daemon().map_err(|e| tako_control::remote::serve_failure_text(&e))
 }
 
 /// `tako remote agents` — claude agents --json + tmux ペイン対応付けを表示する

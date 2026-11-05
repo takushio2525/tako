@@ -14013,9 +14013,10 @@ use tako_control::platform::local_endpoint::PeerReject;
 use tako_control::remote_auth::DeviceRole;
 use tako_control::remote_files::Denial;
 use tako_control::remote_refusal::{
-    AppVia, DaemonMessage, PidlessRefusal, ScrollbackCause, ShutdownReject,
+    AppVia, DaemonMessage, PidlessRefusal, ScrollbackCause, ServeRefusal, ShutdownReject,
 };
 use tako_control::remote_starting::StartingMarker;
+use tako_control::tailscale::MissingItem;
 use tako_control::RemoteRefusal;
 
 const REMOTE_REFUSAL_SRC: &str = include_str!("../src/remote_refusal.rs");
@@ -14185,9 +14186,10 @@ fn remote_refusal_index(r: &RemoteRefusal) -> usize {
         RemoteRefusal::StopTimeoutTryForce { .. } => 140,
         RemoteRefusal::StopStillRunning { .. } => 141,
         RemoteRefusal::StopTerminateFailed(_) => 142,
+        RemoteRefusal::DaemonServeRefused(_) => 143,
     }
 }
-const REMOTE_REFUSAL_VARIANTS: usize = 143;
+const REMOTE_REFUSAL_VARIANTS: usize = 144;
 
 /// `ShutdownReject` の通し番号（網羅 match = 足すとここがコンパイルで落ちる）
 fn shutdown_reject_index(r: &ShutdownReject) -> usize {
@@ -14541,6 +14543,13 @@ fn remote_refusal_table() -> Vec<(RemoteRefusal, String)> {
         (
             RemoteRefusal::DaemonExitedWithMessage("Tailscale is not running".into()),
             "Tailscale is not running".into(),
+        ),
+        (
+            // 中身の文は `ServeRefusal` の表が見る。ここは包んでも同じ文になること
+            RemoteRefusal::DaemonServeRefused(ServeRefusal::ServeForeign),
+            "tailscale serve に tako 管理外の設定があります（パス分けハンドラ等）。\
+             上書きを避けるため起動を中止しました。`tailscale serve status` で確認してください"
+                .into(),
         ),
         (
             RemoteRefusal::DaemonExitedSilently("exit status: 1".into()),
@@ -24951,8 +24960,24 @@ const DAEMON_LIFECYCLE_FNS: &[&str] = &[
 ];
 
 fn daemon_lifecycle_violations(src: &str) -> Vec<String> {
+    japanese_literal_violations(
+        src,
+        DAEMON_LIFECYCLE_FNS,
+        &[],
+        "利用者へ返る断りは `RemoteRefusal` / `ShutdownReject` の腕に置く（英語表示に日本語が混ざる。#2365）",
+    )
+}
+
+/// `remote.rs` の関数の本文にある日本語の文字列リテラルを file:line で名指す。stderr の診断（`eprintln!`）と、
+/// `allow` に (関数, 断片) で載せた応答の値は日本語のまま = 名指さない
+fn japanese_literal_violations(
+    src: &str,
+    heads: &[&str],
+    allow: &[(&str, &str)],
+    hint: &str,
+) -> Vec<String> {
     let mut out = Vec::new();
-    for head in DAEMON_LIFECYCLE_FNS {
+    for head in heads {
         let Some(lines) = front_scope_lines(src, Some(head)) else {
             out.push(format!("{REMOTE_PATH}:0 — `{head}` が無い（走査の空振り）"));
             continue;
@@ -24992,10 +25017,12 @@ fn daemon_lifecycle_violations(src: &str) -> Vec<String> {
                     .rfind([';', '{', '}'])
                     .map(|k| k + 1)
                     .unwrap_or(0);
-                if !code[stmt..open].contains("eprintln!(") {
+                let allowed = allow
+                    .iter()
+                    .any(|(fn_head, fragment)| fn_head == head && literal.contains(fragment));
+                if !code[stmt..open].contains("eprintln!(") && !allowed {
                     out.push(format!(
-                        "{REMOTE_PATH}:{} — `{head}` が日本語の固定文を直に組んでいる。利用者へ返る断りは \
-                         `RemoteRefusal` / `ShutdownReject` の腕に置く（英語表示に日本語が混ざる。#2365）: {}",
+                        "{REMOTE_PATH}:{} — `{head}` が日本語の固定文を直に組んでいる。{hint}: {}",
                         line_of(open),
                         literal.chars().take(40).collect::<String>()
                     ));
@@ -25048,6 +25075,357 @@ fn remoteのdaemonの起動と停止の断りを日本語の固定文へ戻す�
         REMOTE_SRC.contains("eprintln!(\n            \"stale な待ち受けを検出しました"),
         "陽性対照（spawn_daemon の stderr の診断）が見つからない"
     );
+}
+
+/// 子の `tako remote serve`（`run_daemon`）の起動の前の段（#2365 の続き）。断りは `ServeRefusal` の腕に置き、
+/// 子は印つきの 1 行で親へ渡す（親が表示言語で文にする）
+const SERVE_PREFLIGHT_FNS: &[&str] = &[
+    "pub fn run_daemon()",
+    "fn establish_tailscale_serve(",
+    "fn setup_incomplete_error(",
+    "pub fn parse_endpoint_spec(",
+    "pub fn unreachable_refusal(",
+];
+
+/// 起動を止めない注記（自己検査が結論を出せなかった理由 = 起動情報の値。日本語のまま）
+const SERVE_PREFLIGHT_ALLOW: &[(&str, &str)] = &[("pub fn run_daemon()", "自己疎通チェックが")];
+
+fn serve_preflight_violations(src: &str) -> Vec<String> {
+    japanese_literal_violations(
+        src,
+        SERVE_PREFLIGHT_FNS,
+        SERVE_PREFLIGHT_ALLOW,
+        "子の起動の前の断りは `ServeRefusal` の腕に置く（親が表示言語で文にする。英語表示に日本語が混ざる。#2365）",
+    )
+}
+
+#[test]
+fn 子のremote_serveの起動の前の断りは型を通る() {
+    let mut found = serve_preflight_violations(REMOTE_SRC);
+    // 許可の断片が消えたら許可も消す（古い許可が後から入った日本語を見逃さないように）
+    for (head, fragment) in SERVE_PREFLIGHT_ALLOW {
+        if !REMOTE_SRC.contains(fragment) {
+            found.push(format!(
+                "{REMOTE_PATH}: `{head}` の許可「{fragment}」がもう使われていない（消す）"
+            ));
+        }
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+#[test]
+fn 子のremote_serveの起動の前の断りを日本語の固定文へ戻すと名指す() {
+    // 注入 1: serve の取り合いを #2365 より前の `io::Error` の固定文へ
+    let injected = REMOTE_SRC.replacen(
+        "return Err(serve_refused(ServeRefusal::ServeForeign));",
+        "return Err(io::Error::other(\n                \"tailscale serve に tako 管理外の設定があります\",\n            ));",
+        1,
+    );
+    assert_ne!(injected, REMOTE_SRC, "注入「serve の取り合い」の対象が無い");
+    let found = serve_preflight_violations(&injected);
+    assert!(
+        found
+            .iter()
+            .any(|o| o.contains("`fn establish_tailscale_serve(`") && !o.contains(":0 ")),
+        "注入「serve の取り合い」を名指しできていない: {found:?}"
+    );
+    // 注入 2: 到達手段が無い（複数行の format!）
+    let injected = REMOTE_SRC.replacen(
+        "return Err(serve_refused(ServeRefusal::NoDetachedAccess {",
+        "return Err(io::Error::other(format!(\n            \"永続バックエンド（{}）にアウトオブプロセス到達手段が無い\", 0\n        )));\n        return Err(serve_refused(ServeRefusal::NoDetachedAccess {",
+        1,
+    );
+    assert_ne!(injected, REMOTE_SRC, "注入「到達手段」の対象が無い");
+    let found = serve_preflight_violations(&injected);
+    assert!(
+        found.iter().any(|o| o.contains("`pub fn run_daemon()`")),
+        "注入「到達手段」を名指しできていない: {found:?}"
+    );
+    // 陽性対照: stderr の診断（張り替えの進み）と許可した注記（自己検査の理由）は名指さない
+    assert!(
+        REMOTE_SRC.contains("\"以前の tako の serve 設定を検出しました"),
+        "陽性対照（establish_tailscale_serve の stderr の診断）が見つからない"
+    );
+    assert!(
+        REMOTE_SRC.contains("ServeReachability::Unknown(\"自己疎通チェックが中断された\""),
+        "陽性対照（run_daemon の自己検査の注記）が見つからない"
+    );
+    assert!(serve_preflight_violations(REMOTE_SRC).is_empty());
+}
+
+/// `ServeRefusal` の通し番号（網羅 match = 足すとここがコンパイルで落ちる）
+fn serve_refusal_index(r: &ServeRefusal) -> usize {
+    match r {
+        ServeRefusal::EndpointUnixUnsupported => 0,
+        ServeRefusal::EndpointInvalid { .. } => 1,
+        ServeRefusal::SocketPathTooLong { .. } => 2,
+        ServeRefusal::SocketBusy { .. } => 3,
+        ServeRefusal::PortFileUnwritable { .. } => 4,
+        ServeRefusal::NoDetachedAccess { .. } => 5,
+        ServeRefusal::IsolatedServe => 6,
+        ServeRefusal::TailscaleSetupIncomplete { .. } => 7,
+        ServeRefusal::TailscaleCliUnresolved => 8,
+        ServeRefusal::TsNetUrlUnresolved => 9,
+        ServeRefusal::ServeOccupied { .. } => 10,
+        ServeRefusal::ServeForeign => 11,
+        ServeRefusal::PidFileUnwritable { .. } => 12,
+        ServeRefusal::TokenFileUnwritable { .. } => 13,
+        ServeRefusal::UrlFileUnwritable { .. } => 14,
+        ServeRefusal::BackendUnreachable { .. } => 15,
+    }
+}
+const SERVE_REFUSAL_VARIANTS: usize = 16;
+
+const OS_EACCES: &str = "Permission denied (os error 13)";
+const LONG_SOCK: &str = "/tmp/x/tako-remote.sock";
+
+/// 日本語は #2365 より前の `remote.rs`（`run_daemon` / `establish_tailscale_serve` / `setup_incomplete_error` /
+/// `parse_endpoint_spec` / `unreachable_advice`）の文を見本の値で展開したもの
+fn serve_refusal_table() -> Vec<(ServeRefusal, String)> {
+    vec![
+        (
+            ServeRefusal::EndpointUnixUnsupported,
+            "TAKO_REMOTE_ENDPOINT=unix はこの OS では使えません（Unix domain socket の\
+             serve target が無いため）。指定を外すとループバック TCP で待ち受けます"
+                .into(),
+        ),
+        (
+            ServeRefusal::EndpointInvalid {
+                value: "http".into(),
+            },
+            "TAKO_REMOTE_ENDPOINT の値が不正です: http（tcp | unix）".into(),
+        ),
+        (
+            ServeRefusal::SocketPathTooLong {
+                bytes: 120,
+                limit: 103,
+                path: LONG_SOCK.into(),
+            },
+            format!(
+                "socket パスが長すぎます（120 バイト、上限 103）。\
+                 TAKO_REMOTE_STATE_DIR でより短いパスを指定してください: {LONG_SOCK}"
+            ),
+        ),
+        (
+            ServeRefusal::SocketBusy {
+                path: LONG_SOCK.into(),
+            },
+            format!("別の daemon が既にこの socket で稼働中です: {LONG_SOCK}"),
+        ),
+        (
+            ServeRefusal::PortFileUnwritable {
+                error: OS_EACCES.into(),
+            },
+            format!("ポートファイルの書き出しに失敗: {OS_EACCES}"),
+        ),
+        (
+            ServeRefusal::NoDetachedAccess {
+                backend: "none".into(),
+            },
+            "永続バックエンド（none）にアウトオブプロセス到達手段が無い。\
+             remote サーバーは tako-app の外からペインを操作するため到達手段が必須です\
+             （macOS / Linux では tmux をインストールすると有効になります）"
+                .into(),
+        ),
+        (
+            // 以前は子が `RemoteRefusal::IsolatedServe` を文にして載せていた（同じ文）
+            ServeRefusal::IsolatedServe,
+            RemoteRefusal::IsolatedServe.text_in(Lang::Ja),
+        ),
+        (
+            ServeRefusal::TailscaleSetupIncomplete {
+                missing: vec![
+                    MissingItem::NotLoggedIn,
+                    MissingItem::BackendNotRunning("Stopped".into()),
+                    MissingItem::HttpsNotEnabled,
+                ],
+            },
+            "Tailscale のセットアップが完了していないため、remote サーバーを起動できません。\n\
+             不足項目:\n\
+             \x20 - Tailscale にログインしていない（tailscale up でブラウザ認証）\n\
+             \x20 - Tailscale の接続が有効でない（状態: Stopped。tailscale up で再接続）\n\
+             \x20 - tailnet の HTTPS 証明書が未有効\
+             （https://login.tailscale.com/admin/dns で MagicDNS と HTTPS Certificates を有効化）\n\
+             `tako remote setup` を実行してください。"
+                .into(),
+        ),
+        (
+            ServeRefusal::TailscaleCliUnresolved,
+            "tailscale CLI パスを解決できない".into(),
+        ),
+        (
+            ServeRefusal::TsNetUrlUnresolved,
+            "ts.net URL を解決できない".into(),
+        ),
+        (
+            ServeRefusal::ServeOccupied {
+                target: "http://localhost:3000".into(),
+            },
+            "tailscale serve に既存の設定があります（HTTPS:443 → http://localhost:3000）。\
+             ユーザー設定を壊さないため上書きしません。tako の以前の設定の残骸で\
+             あれば `tailscale serve --https=443 off` で解除してください"
+                .into(),
+        ),
+        (
+            ServeRefusal::ServeForeign,
+            "tailscale serve に tako 管理外の設定があります（パス分けハンドラ等）。\
+             上書きを避けるため起動を中止しました。`tailscale serve status` で確認してください"
+                .into(),
+        ),
+        (
+            ServeRefusal::PidFileUnwritable {
+                error: OS_EACCES.into(),
+            },
+            format!("PID ファイルの書き出しに失敗: {OS_EACCES}"),
+        ),
+        (
+            ServeRefusal::TokenFileUnwritable {
+                error: OS_EACCES.into(),
+            },
+            format!("トークンファイルの書き出しに失敗: {OS_EACCES}"),
+        ),
+        (
+            ServeRefusal::UrlFileUnwritable {
+                error: OS_EACCES.into(),
+            },
+            format!("URL ファイルの書き出しに失敗: {OS_EACCES}"),
+        ),
+        (
+            ServeRefusal::BackendUnreachable {
+                target: format!("unix:{LONG_SOCK}"),
+                port: None,
+            },
+            format!(
+                "tailscale serve は HTTPS:443 → unix:{LONG_SOCK} を向いていますが、tailscaled が\
+                 その待ち受け先へ接続できていません（HTTP 502）。\n\
+                 macOS の GUI 版 Tailscale（Tailscale.app のシステム拡張）はサンドボックスのため\
+                 **どの Unix domain socket も dial できません**（実測 #1038）。\n\
+                 次の一手: `TAKO_REMOTE_ENDPOINT=unix` の指定を外して `tako remote stop && tako remote start` を\
+                 実行してください（既定のループバック TCP なら GUI 版でも通ります）。"
+            ),
+        ),
+        (
+            ServeRefusal::BackendUnreachable {
+                target: "http://127.0.0.1:41234".into(),
+                port: Some(41234),
+            },
+            "tailscale serve は HTTPS:443 → http://127.0.0.1:41234 を向いていますが、tailscaled が\
+             その待ち受け先へ接続できていません（HTTP 502）。\n\
+             次の一手: 127.0.0.1:41234 に別のプロセスが割り込んでいないか\
+             （`tako remote status` の endpoint と `tailscale serve status` の向き先が一致するか）、\
+             `tailscale serve --https=443 off` で設定を消してから `tako remote start` をやり直してください。"
+                .into(),
+        ),
+    ]
+}
+
+#[test]
+fn 子のremote_serveの起動の前の断りは全バリアントが日英を持ち日本語は2365より前の固定文とバイト一致(
+) {
+    let table = serve_refusal_table();
+    covers_every(
+        &table.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+        serve_refusal_index,
+        SERVE_REFUSAL_VARIANTS,
+        "ServeRefusal",
+    );
+    let mut failures = Vec::new();
+    for (r, old) in &table {
+        let debug = format!("{r:?}");
+        let at = |lang| {
+            where_written(
+                REMOTE_REFUSAL_SRC,
+                REMOTE_REFUSAL_PATH,
+                "impl ServeRefusal {",
+                &debug,
+                lang,
+            )
+        };
+        let (ja, en) = (r.text_in(Lang::Ja), r.text_in(Lang::En));
+        check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+        // 親が利用者へ返すのは `RemoteRefusal::DaemonServeRefused` に包んだ形（中身と同じ文）
+        let wrapped = RemoteRefusal::DaemonServeRefused(r.clone());
+        if wrapped.text_in(Lang::Ja) != ja || wrapped.text_in(Lang::En) != en {
+            failures.push(format!(
+                "{}: {debug}: 包んだ断りの文が中身と違う",
+                at(Lang::En)
+            ));
+        }
+        // 子から親へは JSON で渡る（往復して同じ型に戻る）
+        match serde_json::to_value(r).map(serde_json::from_value::<ServeRefusal>) {
+            Ok(Ok(back)) if back == *r => {}
+            other => failures.push(format!("{debug}: JSON の往復で同じ型に戻らない: {other:?}")),
+        }
+    }
+    report_all(failures);
+}
+
+/// `MissingItem` の通し番号（網羅 match = 足すとここがコンパイルで落ちる）
+fn missing_item_index(m: &MissingItem) -> usize {
+    match m {
+        MissingItem::CliNotFound => 0,
+        MissingItem::DaemonNotRunning => 1,
+        MissingItem::NotLoggedIn => 2,
+        MissingItem::BackendNotRunning(_) => 3,
+        MissingItem::HttpsNotEnabled => 4,
+    }
+}
+
+/// Tailscale の不足項目の 1 行は、対話の setup・setup の手順の値（`describe()` = 日本語のまま）と、子の起動前の
+/// 断りの中（`describe_in` = 親の表示言語）の両方に出る
+#[test]
+fn tailscaleの不足項目は日英を持ち日本語は2365より前と同じ() {
+    let table: Vec<(MissingItem, &str)> = vec![
+        (
+            MissingItem::CliNotFound,
+            "Tailscale が未導入（App Store 版アプリ または brew install tailscale）",
+        ),
+        (
+            MissingItem::DaemonNotRunning,
+            "Tailscale デーモンが起動していない（アプリを起動するか tailscaled を起動）",
+        ),
+        (
+            MissingItem::NotLoggedIn,
+            "Tailscale にログインしていない（tailscale up でブラウザ認証）",
+        ),
+        (
+            MissingItem::BackendNotRunning("Stopped".into()),
+            "Tailscale の接続が有効でない（状態: Stopped。tailscale up で再接続）",
+        ),
+        (
+            MissingItem::HttpsNotEnabled,
+            "tailnet の HTTPS 証明書が未有効\
+             （https://login.tailscale.com/admin/dns で MagicDNS と HTTPS Certificates を有効化）",
+        ),
+    ];
+    covers_every(
+        &table.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(),
+        missing_item_index,
+        5,
+        "MissingItem",
+    );
+    let mut failures = Vec::new();
+    for (m, old) in &table {
+        let debug = format!("{m:?}");
+        let at = |lang| {
+            where_written(
+                TAILSCALE_SRC,
+                TAILSCALE_PATH,
+                "impl MissingItem {",
+                &debug,
+                lang,
+            )
+        };
+        let (ja, en) = (m.describe_in(Lang::Ja), m.describe_in(Lang::En));
+        check_setup_row(&mut failures, &debug, &at, old, &ja, &en);
+        if m.describe() != ja {
+            failures.push(format!(
+                "{}: {debug}: describe() が日本語の腕と違う",
+                at(Lang::Ja)
+            ));
+        }
+    }
+    report_all(failures);
 }
 
 /// GUI 起動時の自動復帰（`remote_panel.rs`）は、断りを記録（persist.log・`last_autostart.detail`）へは日本語

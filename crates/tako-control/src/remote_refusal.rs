@@ -17,8 +17,10 @@
 //! #2365 の続き）もここに置く。`remote::spawn_daemon` / `daemon_stop` / `daemon_force_stop` はこの型を返し、
 //! 利用者へ返す口（CLI の stderr・MCP の応答・設定画面とリモートカードの表示）は表示言語で文にする。
 //! GUI 起動時の自動復帰が残す記録（persist.log と `last_autostart.detail`）は日本語（[`RemoteRefusal::into_ja`]）。
-//! 停止要求が daemon に通らなかった理由は [`ShutdownReject`]、子の `tako remote serve` が stderr に書いた
-//! 理由と OS の終了要求の失敗の文は手を加えずに載せる。
+//! 停止要求が daemon に通らなかった理由は [`ShutdownReject`]、子の `tako remote serve` が起動の前に断った
+//! 理由（Tailscale の不足項目・serve の取り合い・到達手段・待ち受け・state ファイル）は [`ServeRefusal`]
+//! （子が印つきの 1 行で親へ渡す）。それ以外の子の stderr の文（tailscale の CLI の失敗ほか）と OS の終了要求の
+//! 失敗の文は手を加えずに載せる。
 //!
 //! # 口
 //!
@@ -175,6 +177,8 @@ pub enum RemoteRefusal {
     DaemonReaderThread(String),
     /// 子が起動情報を返さずに終わり、stderr に理由を書いた（子の文。手を加えずに載せる）
     DaemonExitedWithMessage(String),
+    /// 子の `tako remote serve` が起動の前に断った（子が印つきの 1 行で渡した理由。#2365 の続き）
+    DaemonServeRefused(ServeRefusal),
     /// 子が起動情報も理由も返さずに終わった（中身は終了ステータスの表記）
     DaemonExitedSilently(String),
     /// 子から起動情報が時間内に来なかった
@@ -773,8 +777,10 @@ impl RemoteRefusal {
             (Self::DaemonReaderThread(error), En) => {
                 format!("failed to start the reader thread: {error}")
             }
-            // 子の `tako remote serve` の文（Tailscale の不足項目の列挙ほか）は手を加えずに載せる
+            // 型で渡らなかった子の `tako remote serve` の文（旧版の子・tailscale の CLI の失敗ほか）は
+            // 手を加えずに載せる
             (Self::DaemonExitedWithMessage(detail), _) => detail.clone(),
+            (Self::DaemonServeRefused(refusal), _) => refusal.text_in(lang),
             (Self::DaemonExitedSilently(status), Ja) => {
                 format!("デーモンが起動情報を返さず終了した（{status}）")
             }
@@ -1486,6 +1492,227 @@ impl ShutdownReject {
         }
     }
 }
+
+/// 子の `tako remote serve`（`remote::run_daemon`）が起動の前に断った理由（#2365 の続き）。
+///
+/// 子は親（`remote::spawn_daemon`）が env [`crate::remote::SERVE_REFUSAL_ENV`] で頼んだときだけ、これを
+/// 印つきの JSON 1 行で stderr へ渡す（[`crate::remote::serve_failure_text`]）。親は型へ戻して
+/// [`RemoteRefusal::DaemonServeRefused`] にし、利用者へ返す口は親の表示言語、自動復帰の記録は日本語で文にする。
+/// 頼まれていない（手で叩いた・旧版の親）ときの子の文は日本語（#2365 より前とバイト一致）。
+/// 中に入る OS のエラー文と tailscale の状態名は言語に依らずそのまま載せる
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ServeRefusal {
+    /// `TAKO_REMOTE_ENDPOINT=unix` をこの OS で頼まれた（Unix domain socket の serve target が無い）
+    EndpointUnixUnsupported,
+    /// `TAKO_REMOTE_ENDPOINT` の値を読めない
+    EndpointInvalid { value: String },
+    /// 待ち受けの socket のパスが OS の上限より長い
+    SocketPathTooLong {
+        bytes: usize,
+        limit: usize,
+        path: String,
+    },
+    /// 待ち受けの socket で別の daemon が応答している
+    SocketBusy { path: String },
+    /// ポートファイルを書けない（OS のエラー文）
+    PortFileUnwritable { error: String },
+    /// 永続バックエンドに tako-app の外から届く手段が無い（`backend` は backend の名前）
+    NoDetachedAccess { backend: String },
+    /// 隔離中に本物の tailscale の serve を張らなかった（[`RemoteRefusal::IsolatedServe`] と同じ文）
+    IsolatedServe,
+    /// Tailscale の setup の不足項目がある
+    TailscaleSetupIncomplete {
+        missing: Vec<crate::tailscale::MissingItem>,
+    },
+    /// tailscale CLI のパスを決められない
+    TailscaleCliUnresolved,
+    /// ts.net の URL を決められない
+    TsNetUrlUnresolved,
+    /// tailscale serve に tako でない向き先の設定がある
+    ServeOccupied { target: String },
+    /// tailscale serve に tako の管理外の形の設定がある（パス分けハンドラ等）
+    ServeForeign,
+    /// PID ファイルを書けない（OS のエラー文）
+    PidFileUnwritable { error: String },
+    /// 管理トークンのファイルを書けない（OS のエラー文）
+    TokenFileUnwritable { error: String },
+    /// 公開 URL のファイルを書けない（OS のエラー文）
+    UrlFileUnwritable { error: String },
+    /// tailscale serve から待ち受けへ届かない（HTTP 502）。`port` が無いのは Unix domain socket
+    BackendUnreachable { target: String, port: Option<u16> },
+}
+
+impl ServeRefusal {
+    /// 表示言語を明示しての文言（(バリアント, 言語) の網羅 match。日本語は #2365 より前とバイト一致）
+    pub fn text_in(&self, lang: Lang) -> String {
+        use crate::remote::ENDPOINT_ENV;
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::EndpointUnixUnsupported, Ja) => format!(
+                "{ENDPOINT_ENV}=unix はこの OS では使えません（Unix domain socket の\
+                 serve target が無いため）。指定を外すとループバック TCP で待ち受けます"
+            ),
+            (Self::EndpointUnixUnsupported, En) => format!(
+                "{ENDPOINT_ENV}=unix is not available on this OS (it has no Unix domain socket \
+                 serve target). Remove the setting to listen on loopback TCP"
+            ),
+            (Self::EndpointInvalid { value }, Ja) => {
+                format!("{ENDPOINT_ENV} の値が不正です: {value}（tcp | unix）")
+            }
+            (Self::EndpointInvalid { value }, En) => {
+                format!("invalid value for {ENDPOINT_ENV}: {value} (tcp | unix)")
+            }
+            (Self::SocketPathTooLong { bytes, limit, path }, Ja) => format!(
+                "socket パスが長すぎます（{bytes} バイト、上限 {limit}）。\
+                 TAKO_REMOTE_STATE_DIR でより短いパスを指定してください: {path}"
+            ),
+            (Self::SocketPathTooLong { bytes, limit, path }, En) => format!(
+                "the socket path is too long ({bytes} bytes, limit {limit}). \
+                 Set a shorter path with TAKO_REMOTE_STATE_DIR: {path}"
+            ),
+            (Self::SocketBusy { path }, Ja) => {
+                format!("別の daemon が既にこの socket で稼働中です: {path}")
+            }
+            (Self::SocketBusy { path }, En) => {
+                format!("another daemon is already running on this socket: {path}")
+            }
+            (Self::PortFileUnwritable { error }, Ja) => {
+                format!("ポートファイルの書き出しに失敗: {error}")
+            }
+            (Self::PortFileUnwritable { error }, En) => {
+                format!("failed to write the port file: {error}")
+            }
+            (Self::NoDetachedAccess { backend }, Ja) => format!(
+                "永続バックエンド（{backend}）にアウトオブプロセス到達手段が無い。\
+                 remote サーバーは tako-app の外からペインを操作するため到達手段が必須です\
+                 （macOS / Linux では tmux をインストールすると有効になります）"
+            ),
+            (Self::NoDetachedAccess { backend }, En) => format!(
+                "the persistent backend ({backend}) cannot be reached from outside the app. \
+                 The remote server operates panes from outside tako-app, so it needs that access \
+                 (on macOS / Linux, installing tmux enables it)"
+            ),
+            (Self::IsolatedServe, _) => RemoteRefusal::IsolatedServe.text_in(lang),
+            (Self::TailscaleSetupIncomplete { missing }, Ja) => format!(
+                "Tailscale のセットアップが完了していないため、remote サーバーを起動できません。\n\
+                 不足項目:\n{}\n\
+                 `tako remote setup` を実行してください。",
+                missing_lines(missing, lang)
+            ),
+            (Self::TailscaleSetupIncomplete { missing }, En) => format!(
+                "Tailscale is not fully set up, so the remote server cannot start.\n\
+                 Missing:\n{}\n\
+                 Run `tako remote setup`.",
+                missing_lines(missing, lang)
+            ),
+            (Self::TailscaleCliUnresolved, Ja) => "tailscale CLI パスを解決できない".to_string(),
+            (Self::TailscaleCliUnresolved, En) => {
+                "cannot resolve the path of the tailscale CLI".to_string()
+            }
+            (Self::TsNetUrlUnresolved, Ja) => "ts.net URL を解決できない".to_string(),
+            (Self::TsNetUrlUnresolved, En) => "cannot resolve the ts.net URL".to_string(),
+            (Self::ServeOccupied { target }, Ja) => format!(
+                "tailscale serve に既存の設定があります（HTTPS:443 → {target}）。\
+                 ユーザー設定を壊さないため上書きしません。tako の以前の設定の残骸で\
+                 あれば `tailscale serve --https=443 off` で解除してください"
+            ),
+            (Self::ServeOccupied { target }, En) => format!(
+                "tailscale serve already has a setting (HTTPS:443 → {target}). It is not \
+                 overwritten, to keep your setting. If it is left over from an earlier tako, \
+                 remove it with `tailscale serve --https=443 off`"
+            ),
+            (Self::ServeForeign, Ja) => {
+                "tailscale serve に tako 管理外の設定があります（パス分けハンドラ等）。\
+                 上書きを避けるため起動を中止しました。`tailscale serve status` で確認してください"
+                    .to_string()
+            }
+            (Self::ServeForeign, En) => "tailscale serve has a setting that tako does not manage \
+                 (path handlers or similar). Start was stopped so that it is not overwritten. \
+                 Check it with `tailscale serve status`"
+                .to_string(),
+            (Self::PidFileUnwritable { error }, Ja) => {
+                format!("PID ファイルの書き出しに失敗: {error}")
+            }
+            (Self::PidFileUnwritable { error }, En) => {
+                format!("failed to write the PID file: {error}")
+            }
+            (Self::TokenFileUnwritable { error }, Ja) => {
+                format!("トークンファイルの書き出しに失敗: {error}")
+            }
+            (Self::TokenFileUnwritable { error }, En) => {
+                format!("failed to write the token file: {error}")
+            }
+            (Self::UrlFileUnwritable { error }, Ja) => {
+                format!("URL ファイルの書き出しに失敗: {error}")
+            }
+            (Self::UrlFileUnwritable { error }, En) => {
+                format!("failed to write the URL file: {error}")
+            }
+            (Self::BackendUnreachable { target, port }, Ja) => {
+                let common = format!(
+                    "tailscale serve は HTTPS:443 → {target} を向いていますが、tailscaled が\
+                     その待ち受け先へ接続できていません（HTTP 502）。"
+                );
+                match port {
+                    None => format!(
+                        "{common}\n\
+                         macOS の GUI 版 Tailscale（Tailscale.app のシステム拡張）はサンドボックスのため\
+                         **どの Unix domain socket も dial できません**（実測 #1038）。\n\
+                         次の一手: `{ENDPOINT_ENV}=unix` の指定を外して `tako remote stop && tako remote start` を\
+                         実行してください（既定のループバック TCP なら GUI 版でも通ります）。"
+                    ),
+                    Some(port) => format!(
+                        "{common}\n\
+                         次の一手: 127.0.0.1:{port} に別のプロセスが割り込んでいないか\
+                         （`tako remote status` の endpoint と `tailscale serve status` の向き先が一致するか）、\
+                         `tailscale serve --https=443 off` で設定を消してから `tako remote start` をやり直してください。"
+                    ),
+                }
+            }
+            (Self::BackendUnreachable { target, port }, En) => {
+                let common = format!(
+                    "tailscale serve points HTTPS:443 to {target}, but tailscaled cannot connect \
+                     to that listener (HTTP 502)."
+                );
+                match port {
+                    None => format!(
+                        "{common}\n\
+                         The GUI Tailscale for macOS (the Tailscale.app system extension) is sandboxed \
+                         and **cannot dial any Unix domain socket** (measured in #1038).\n\
+                         Next step: remove the `{ENDPOINT_ENV}=unix` setting and run \
+                         `tako remote stop && tako remote start` (the default loopback TCP works with \
+                         the GUI version too)."
+                    ),
+                    Some(port) => format!(
+                        "{common}\n\
+                         Next step: check that no other process took 127.0.0.1:{port} (that the endpoint \
+                         in `tako remote status` matches the target in `tailscale serve status`), then \
+                         remove the setting with `tailscale serve --https=443 off` and run \
+                         `tako remote start` again."
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// 不足項目の行（`  - ` で始まる 1 項目 1 行。日本語は #2365 より前とバイト一致）
+fn missing_lines(missing: &[crate::tailscale::MissingItem], lang: Lang) -> String {
+    missing
+        .iter()
+        .map(|m| format!("  - {}", m.describe_in(lang)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+impl std::fmt::Display for ServeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text_in(tako_core::i18n::lang()))
+    }
+}
+
+impl std::error::Error for ServeRefusal {}
 
 impl DaemonMessage {
     /// 表示言語を明示しての文言。日本語は #2365 より前とバイト一致
