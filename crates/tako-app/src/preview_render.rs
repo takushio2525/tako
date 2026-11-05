@@ -3,6 +3,7 @@ use gpui::{
     FontWeight, HighlightStyle, MouseButton, MouseMoveEvent, Pixels, SharedString, StyledText,
     Window,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tako_core::PaneId;
 
@@ -138,6 +139,35 @@ pub(crate) fn cursor_follow_legacy() -> bool {
 /// （狭いペインで行が折り返すと、器に入る行が見積もりより少なくキャレットが下端の外に残る）
 pub(crate) fn follow_recheck_legacy() -> bool {
     std::env::var_os("TAKO_2737_LEGACY").is_some()
+}
+
+/// 追従がカーソル行の実寸を見る（#2757）のを切って同じバイナリで A/B を取る逃げ道
+/// （`TAKO_2757_LEGACY=1`）。旧挙動 = 先頭は行数だけで決まり、背の高い（長く折り返した）行の
+/// 次の行へ ↓ すると、追従と確かめ直しが「先頭を下へ」「余白のために先頭を上へ」を往復して
+/// キャレットが器の外に残る
+pub(crate) fn follow_fit_legacy() -> bool {
+    std::env::var_os("TAKO_2757_LEGACY").is_some()
+}
+
+/// 一度描いた行のうち、1 行ぶんより背の高い（器の幅で折り返した）行の実寸（#2757）。
+///
+/// 描いた行の控え（`preview_text_layouts`）は描くたびに作り直されるので、器の外へ出た行の
+/// 実寸は残らない。追従（`editor_scroll::follow_cursor`）がカーソル行を器に入れるには、上へ
+/// 出た背の高い行の高さも要る（確かめ直しの時点で上の行を 1 行ぶんと見積もると、余白のために
+/// 先頭を戻してカーソル行を器の外へ押し出す）。揃った高さの行は見積もりと同じなので覚えない
+/// = 普通のファイルでは空のまま。行の版・文字サイズ・器の幅が変わったら捨てる
+#[derive(Default)]
+pub(crate) struct RowHeightMemo {
+    key: Option<RowHeightKey>,
+    tall: HashMap<usize, f32>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct RowHeightKey {
+    /// 行の版（`preview_line_cache_rev` と同じ = 表示行の版と編集バッファの版）
+    lines: (u64, Option<u64>),
+    font_size: f32,
+    width: f32,
 }
 
 /// 追従の確かめ直しの回数の上限（#2737）。描いた行の実寸で 1 回寄せ直せばふつうは収まる。
@@ -2173,6 +2203,8 @@ impl TakoApp {
                         self.preview_line_starts.insert(pane_id, starts);
                         self.preview_line_cache_rev.insert(pane_id, (rev, source));
                     }
+                    // #2757: 背の高い行の覚えは、行の版・文字サイズ・器の幅が同じ間だけ使う
+                    self.renew_row_height_memo(pane_id, (rev, source));
                     // 可視行が自分の枠へ書き込む器。索引は常に文書の行番号。
                     // ここで先に入れておくのが要点で、`list` の item は
                     // このあとの prepaint で自分の枠へ書き込む
@@ -4495,6 +4527,7 @@ impl TakoApp {
         self.pending_md_resumes
             .retain(|(pane, ..)| *pane != pane_id);
         self.preview_text_layouts.remove(&pane_id);
+        self.preview_row_heights.remove(&pane_id);
         self.preview_body_lists.remove(&pane_id);
         self.preview_follow_recheck.remove(&pane_id);
         self.preview_pending_reveal.remove(&pane_id);
@@ -4790,14 +4823,76 @@ impl TakoApp {
         };
         let cursor_line = edit.buffer.line_byte_col(edit.buffer.cursor()).0;
         let rows = self.preview_row_geometry(pane_id)?;
+        // #2757: カーソル行が器に丸ごと入る、いちばん上の先頭行。追従も #2737 の確かめ直しも
+        // ここから同じ値を受け取る（上の行の実寸は覚えから引く = どちらから見ても同じ答え）
+        let fit_top = if follow_fit_legacy() {
+            None
+        } else {
+            self.preview_viewport_bounds(pane_id).map(|bounds| {
+                let room = f32::from(bounds.bottom() - (bounds.top() + px(PREVIEW_BODY_PADDING)));
+                let estimate = f32::from(rows.line_height);
+                tako_core::editor_scroll::fit_top(cursor_line, room, |line| {
+                    self.preview_row_height(pane_id, line, estimate)
+                })
+            })
+        };
         Some((
             cursor_line,
             tako_core::editor_scroll::LineViewport {
                 first_visible: rows.first_visible,
                 visible_lines: rows.visible_lines,
                 total_lines: lines.len(),
+                fit_top,
             },
         ))
+    }
+
+    /// 行の実寸（論理 px。#2757）: 今のフレームで描いた行 → 覚えた背の高い行 → 見積もり
+    fn preview_row_height(&self, pane_id: PaneId, line: usize, estimate: f32) -> f32 {
+        if let Some(layout) = self
+            .preview_text_layouts
+            .get(&pane_id)
+            .and_then(|rows| rows.get(line))
+            .and_then(Option::as_ref)
+        {
+            return f32::from(layout.bounds().size.height);
+        }
+        self.preview_row_heights
+            .get(&pane_id)
+            .and_then(|memo| memo.tall.get(&line).copied())
+            .unwrap_or(estimate)
+    }
+
+    /// 背の高い行の覚えを今の行の版・文字サイズ・器の幅に合わせる（#2757。違えば捨てる）
+    fn renew_row_height_memo(&mut self, pane_id: PaneId, lines: (u64, Option<u64>)) {
+        if follow_fit_legacy() {
+            self.preview_row_heights.remove(&pane_id);
+            return;
+        }
+        let key = RowHeightKey {
+            lines,
+            font_size: self.preview_body_font_size(pane_id),
+            width: self
+                .preview_viewport_bounds(pane_id)
+                .map_or(0.0, |bounds| f32::from(bounds.size.width)),
+        };
+        let memo = self.preview_row_heights.entry(pane_id).or_default();
+        if memo.key != Some(key) {
+            memo.key = Some(key);
+            memo.tall.clear();
+        }
+    }
+
+    /// 描いた行の実寸を覚える（#2757）。1 行ぶんより背の高い行だけ（揃った行は見積もりと同じ）
+    fn note_row_height(&mut self, pane_id: PaneId, line: usize, height: f32, single: f32) {
+        let Some(memo) = self.preview_row_heights.get_mut(&pane_id) else {
+            return;
+        };
+        if height > single + 0.5 {
+            memo.tall.insert(line, height);
+        } else {
+            memo.tall.remove(&line);
+        }
     }
 
     /// 編集カーソルを可視範囲へ追わせる（#1649）。戻り値 = 実際に器を動かしたか。
@@ -5267,6 +5362,8 @@ impl TakoApp {
                 if let Some((entity, pane_id, ix)) = &record {
                     if let Some(entity) = entity.upgrade() {
                         let layout = caret_layout.clone();
+                        let height = f32::from(caret_layout.bounds().size.height);
+                        let single = f32::from(caret_layout.line_height());
                         entity.update(cx, |app, _| {
                             if let Some(slot) = app
                                 .preview_text_layouts
@@ -5275,6 +5372,8 @@ impl TakoApp {
                             {
                                 *slot = Some(layout);
                             }
+                            // #2757: 背の高い行は器の外へ出ても実寸を覚えておく
+                            app.note_row_height(*pane_id, *ix, height, single);
                         });
                     }
                 }
@@ -6283,6 +6382,7 @@ mod tests {
             first_visible: 0,
             visible_lines: visible_rows(14.0, 614.0, std::iter::repeat_n(Some(18.0), 40), 18.0),
             total_lines: 5000,
+            fit_top: None,
         };
         assert_eq!(view.visible_lines, 33);
         let first = follow_cursor(view, 4900, FOLLOW_MARGIN).expect("画面外なので動く");
@@ -6319,6 +6419,7 @@ mod tests {
                 first_visible: first,
                 visible_lines: visible,
                 total_lines: total,
+                fit_top: None,
             };
             let cursor = total - 1;
             if let Some(next) = follow_cursor(view, cursor, FOLLOW_MARGIN) {

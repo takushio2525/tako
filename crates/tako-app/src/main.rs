@@ -3152,6 +3152,9 @@ struct TakoApp {
     /// 追従の確かめ直しの予約（#2737。[`preview_render::FollowRecheck`]）。追従はまだ描いていない
     /// 行を 1 行ぶんの高さで見積もるので、描いた後にキャレットが器の外なら追い直す
     preview_follow_recheck: HashMap<PaneId, preview_render::FollowRecheck>,
+    /// 一度描いた背の高い（折り返した）行の実寸（#2757。[`preview_render::RowHeightMemo`]）。
+    /// 追従がカーソル行を器に入れるのに、器の外へ出た上の行の高さも要る
+    preview_row_heights: HashMap<PaneId, preview_render::RowHeightMemo>,
     /// 開いた直後に飛ぶ先（FR-3.27 / #1676）。値は仮想リストの item 番号（0 始まり）で、
     /// 行ジャンプは code 表示へ倒すので `line - 1` と一致する。`ListState` は
     /// **描くときに作られる**ので `OpenFile` を処理している時点ではまだ飛べず、
@@ -5595,6 +5598,7 @@ impl TakoApp {
             preview_text_layouts: HashMap::new(),
             preview_body_lists: HashMap::new(),
             preview_follow_recheck: HashMap::new(),
+            preview_row_heights: HashMap::new(),
             preview_pending_reveal: HashMap::new(),
             preview_md_block_index: HashMap::new(),
             preview_line_starts: HashMap::new(),
@@ -60487,6 +60491,8 @@ mod self_test {
             cursor_visible: bool,
             /// 実装の値（追従とページ移動が使う可視行数）
             follow_lines: usize,
+            /// 追従の確かめ直し（#2737）が済んでから測ったか（#2757。上限のフレームで済まなければ false）
+            settled: bool,
         }
         impl Probe {
             fn below(&self) -> Option<usize> {
@@ -60494,6 +60500,31 @@ mod self_test {
             }
             fn above(&self) -> Option<usize> {
                 self.cursor_visible.then(|| self.cursor - self.first)
+            }
+        }
+        /// #2757: ページ移動の歩幅の設計値（#1652 の `page_step` と同じ式 = 押した時点の可視 − 1、
+        /// 最低 1 行）。行の高さが揃わない（狭いペインで折り返す）と可視は位置ごとに変わるので、
+        /// 先頭から測った 1 つの値ではなく**押す前の実測**から数える
+        fn page_step(before: &Probe) -> usize {
+            before.count.saturating_sub(1).max(1)
+        }
+        /// #2757: 着地の余白の設計値（#2714 の詰めた余白。**着地した位置の**可視から数える）
+        fn landing_margin(at: &Probe) -> usize {
+            tako_core::editor_scroll::effective_margin(at.count, FOLLOW_MARGIN)
+        }
+        /// #2757: ページ移動の判定の前提（測る前に追従の確かめ直しが済んでいる・器に丸ごと入る行がある）。
+        /// 崩れたら着地や余白の失敗と読み違えないよう前提の欠けとして名指して止まる
+        fn page_premise(label: &str, probes: &[&Probe]) {
+            for p in probes {
+                check(
+                    p.settled && p.count > 0,
+                    &format!(
+                        "visual-test editor-font (#2757): 前提の欠け: {label} の判定の前提が崩れた（確かめ直しが \
+                         済んだ = {} / 器に丸ごと入る行 = {} 行）。追従が上限のフレームで止まらないか、器より背の \
+                         高い行が器を覆っている",
+                        p.settled, p.count
+                    ),
+                );
             }
         }
 
@@ -60627,10 +60658,26 @@ mod self_test {
 
         let probe = |cx: &mut AsyncApp, pane: PaneId| -> Probe {
             notify_and_draw(any, window, cx);
+            // #2757: 追従の確かめ直し（#2737）は描いた次のフレームで当たるので、その予約が
+            // 消えるまで描いてから測る（1 フレームで測ると寄せ直す前の着地を見る。上限つき）
+            let pending = |cx: &mut AsyncApp| {
+                window
+                    .update(cx, |app, _, _| {
+                        app.preview_follow_recheck.contains_key(&pane)
+                    })
+                    .unwrap_or(false)
+            };
+            let mut frames = 12;
+            while frames > 0 && pending(cx) {
+                notify_and_draw(any, window, cx);
+                frames -= 1;
+            }
+            let settled = !pending(cx);
             window
                 .update(cx, |app, _, _| {
                     let mut out = Probe {
                         pane_fs: app.pane_font_size(pane),
+                        settled,
                         ..Probe::default()
                     };
                     let Some(view) = app.preview_viewport_bounds(pane) else {
@@ -60986,7 +61033,7 @@ mod self_test {
         // (3) 拡大したままの ↓ の追従・Page Down / Up・クリックの位置
         walk_down(cx, &mut failures, pane, "zoom-in", zoomed.count);
         cursor(cx, pane, 0, None);
-        let _ = probe(cx, pane);
+        let p0 = probe(cx, pane);
         press(any, cx, "pagedown");
         let p1 = probe(cx, pane);
         report("zoom-page-down-1", &p1);
@@ -60996,32 +61043,40 @@ mod self_test {
         press(any, cx, "pageup");
         let p3 = probe(cx, pane);
         report("zoom-page-up", &p3);
-        let step = zoomed.count.saturating_sub(1);
+        // #2757: 歩幅は押す前の実測の可視から（#1652）、余白は着地した位置の可視から（#2714）数える。
+        // 窓が狭くて行が折り返すと、見える行が位置ごとに減るので歩幅も縮む（1400×880 では 23 / 23 / 23）
+        page_premise("⌘+ の Page Down / Up", &[&p0, &p1, &p2, &p3]);
+        let want1 = p0.cursor + page_step(&p0);
         expect(
             &mut failures,
-            p1.cursor == step && p1.below() == Some(FOLLOW_MARGIN),
+            p1.cursor == want1 && p1.below() == Some(landing_margin(&p1)),
             format!(
-                "⌘+ の Page Down: 着地 {} / 下の余白 {:?} が設計（{step} / {FOLLOW_MARGIN}）と違う",
+                "⌘+ の Page Down: 着地 {} / 下の余白 {:?} が設計（{want1} / {}）と違う",
                 p1.cursor,
-                p1.below()
+                p1.below(),
+                landing_margin(&p1)
             ),
         );
+        let want2 = p1.cursor + page_step(&p1);
         expect(
             &mut failures,
-            p2.cursor == step * 2 && p2.below() == Some(FOLLOW_MARGIN),
+            p2.cursor == want2 && p2.below() == Some(landing_margin(&p2)),
             format!(
-                "⌘+ の 2 回目の Page Down: 着地 {} / 下の余白 {:?}",
+                "⌘+ の 2 回目の Page Down: 着地 {} / 下の余白 {:?} が設計（{want2} / {}）と違う",
                 p2.cursor,
-                p2.below()
+                p2.below(),
+                landing_margin(&p2)
             ),
         );
+        let want3 = p2.cursor.saturating_sub(page_step(&p2));
         expect(
             &mut failures,
-            p3.cursor == step && p3.above() == Some(FOLLOW_MARGIN),
+            p3.cursor == want3 && p3.above() == Some(landing_margin(&p3)),
             format!(
-                "⌘+ の Page Up: 着地 {} / 上の余白 {:?} が設計（{step} / {FOLLOW_MARGIN}）と違う",
+                "⌘+ の Page Up: 着地 {} / 上の余白 {:?} が設計（{want3} / {}）と違う",
                 p3.cursor,
-                p3.above()
+                p3.above(),
+                landing_margin(&p3)
             ),
         );
         let target = p3.first + 2;
@@ -61101,12 +61156,15 @@ mod self_test {
             press(any, cx, "pagedown");
             let paged = probe(cx, pane);
             report(&format!("{label}-page-down"), &paged);
+            // #2757: 歩幅は「可視 − 1、最低 1 行」（可視 1 行の狭い器でも 1 行は進む = #1652）
+            page_premise(&format!("{label} の Page Down"), &[&p, &paged]);
             expect(
                 &mut failures,
-                paged.cursor + 1 == p.count && paged.cursor_visible,
+                paged.cursor == p.cursor + page_step(&p) && paged.cursor_visible,
                 format!(
-                    "{label}: Page Down の歩幅 {} が「実矩形の可視 {} 行 − 1」と違う",
-                    paged.cursor, p.count
+                    "{label}: Page Down の歩幅 {} が「実矩形の可視 {} 行 − 1（最低 1 行）」と違う",
+                    paged.cursor - p.cursor.min(paged.cursor),
+                    p.count
                 ),
             );
         }
@@ -61161,7 +61219,49 @@ mod self_test {
         for _ in 0..40 {
             press(any, cx, "down");
             let p = probe(cx, pane);
-            if !p.cursor_visible {
+            check(
+                p.settled,
+                "visual-test editor-font (#2757): 前提の欠け: 折り返しの ↓ で追従の確かめ直し（#2737）が \
+                 上限のフレームで済まない",
+            );
+            // #2757: 器より背の高い（長く折り返した）行は丸ごとは器に入らないので、キャレットの行
+            // （字の位置の 1 段）が器に入っているかで見る。描かれていない行（= 器の外）は None
+            let line = window
+                .update(cx, |app, _, _| {
+                    let view = app.preview_viewport_bounds(pane)?;
+                    let layout = app
+                        .preview_text_layouts
+                        .get(&pane)?
+                        .get(p.cursor)?
+                        .as_ref()?;
+                    let bounds = layout.bounds();
+                    let caret = layout.position_for_index(p.col)?;
+                    let tall = bounds.size.height > view.size.height;
+                    let caret_in = caret.y >= view.top() - px(0.5)
+                        && caret.y + layout.line_height() <= view.bottom() + px(0.5);
+                    Some((
+                        f32::from(bounds.top()),
+                        f32::from(bounds.bottom()),
+                        tall,
+                        caret_in,
+                    ))
+                })
+                .ok()
+                .flatten();
+            let seen = match line {
+                Some((_, _, true, caret_in)) => caret_in,
+                Some(_) => p.cursor_visible,
+                None => false,
+            };
+            println!(
+                "TAKO_VISUAL_PIXEL: editor-font wrapped-walk cursor={} visible={}..={} \
+                 line(top,bottom,tall)={:?} seen={seen}",
+                p.cursor,
+                p.first,
+                p.last,
+                line.map(|(top, bottom, tall, _)| (top, bottom, tall))
+            );
+            if !seen {
                 hidden.push(p.cursor);
             }
         }
@@ -61384,27 +61484,33 @@ mod self_test {
         press(any, cx, "pageup");
         let b2 = probe(cx, pane);
         report("big-page-up", &b2);
-        let big_step = b1.count.saturating_sub(1);
+        // #2757: 歩幅は押す前の実測の可視から、余白は着地した位置の可視から（#2714 の詰めた余白。
+        // 狭い窓で可視 4 行なら余白は 1 行）数える
+        page_premise("10 万行の Page Up / Down", &[&b1, &b2]);
+        let up_to = near.saturating_sub(page_step(&b1));
         expect(
             &mut failures,
-            b2.cursor == near - big_step && b2.above() == Some(FOLLOW_MARGIN),
+            b2.cursor == up_to && b2.above() == Some(landing_margin(&b2)),
             format!(
-                "10 万行: Page Up の着地 {} / 上の余白 {:?} が設計（{} / {FOLLOW_MARGIN}）と違う",
+                "10 万行: Page Up の着地 {} / 上の余白 {:?} が設計（{up_to} / {}）と違う",
                 b2.cursor,
                 b2.above(),
-                near - big_step
+                landing_margin(&b2)
             ),
         );
         press(any, cx, "pagedown");
         let b3 = probe(cx, pane);
         report("big-page-down", &b3);
+        page_premise("10 万行の Page Down", &[&b3]);
+        let down_to = b2.cursor + page_step(&b2);
         expect(
             &mut failures,
-            b3.cursor == near && b3.below() == Some(FOLLOW_MARGIN),
+            b3.cursor == down_to && b3.below() == Some(landing_margin(&b3)),
             format!(
-                "10 万行: Page Down の着地 {} / 下の余白 {:?} が設計（{near} / {FOLLOW_MARGIN}）と違う",
+                "10 万行: Page Down の着地 {} / 下の余白 {:?} が設計（{down_to} / {}）と違う",
                 b3.cursor,
-                b3.below()
+                b3.below(),
+                landing_margin(&b3)
             ),
         );
         press(any, cx, doc_end);
