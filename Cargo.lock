@@ -6805,7 +6805,7 @@ checksum = "8bdb6fa0dfa67b38c1e66b7041ba9dcf23b99d8121907cd31c807a332f7a0bbb"
 
 [[package]]
 name = "tako-app"
-version = "0.8.39"
+version = "0.8.40"
 dependencies = [
  "bincode",
  "fancy-regex",
@@ -6834,7 +6834,7 @@ dependencies = [
 
 [[package]]
 name = "tako-cli"
-version = "0.8.39"
+version = "0.8.40"
 dependencies = [
  "clap",
  "serde",
@@ -6847,7 +6847,7 @@ dependencies = [
 
 [[package]]
 name = "tako-control"
-version = "0.8.39"
+version = "0.8.40"
 dependencies = [
  "base64 0.22.1",
  "flate2",
@@ -6875,7 +6875,7 @@ dependencies = [
 
 [[package]]
 name = "tako-core"
-version = "0.8.39"
+version = "0.8.40"
 dependencies = [
  "alacritty_terminal",
  "futures",
