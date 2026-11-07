@@ -370,7 +370,7 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if (CurStep = ssPostInstall) and WizardIsTaskSelected('addtopath') then
-    Log('#2767 の赤の確認（一時。revert する）: Path を足す段を外した');
+    EnvAddPath(ExpandConstant('{app}'));
   { ssPostInstall に来た = ファイルの上書きとレジストリの書き込みが済んだ（#2434） }
   if CurStep = ssPostInstall then
     InstallSucceeded := True;
