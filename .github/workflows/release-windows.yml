@@ -11,8 +11,9 @@
 #   1. タグ push で起動（scripts/release.sh の待ち合わせが workflow_dispatch でも起こせる）
 #   2. installer/windows/build-installer.ps1 で installer exe + ポータブル zip を作る
 #   3. installer/windows/lib/verify-assets.ps1 で検査（実機リリースと同じ 1 実装）。
-#      加えて、使い捨てのランナーでだけインストーラーを無人インストールし、
-#      インストール先の中身（exe 2 本 + ライセンス 3 本。#1845）を確かめる
+#      加えて、使い捨てのランナーでだけインストーラーを一巡させ（無人インストール →
+#      インストール先の中身 = exe 2 本 + ライセンス 3 本（#1845）→ ユーザー環境変数 Path →
+#      tako.exe の起動 → アンインストールで Path が外れる。#2767）確かめる
 #   4. 成果物を artifact へ上げてから Release へ添付する
 #      （artifact を先に上げるので、添付に失敗しても作り直さずに回収できる）
 #
@@ -172,10 +173,11 @@ jobs:
           . installer/windows/lib/verify-assets.ps1
           Test-TakoWindowsAssets -Tag $env:TAKO_RELEASE_TAG -OutDir 'dist/windows' | Out-Null
 
-      # インストーラーが実際にインストール先へ置くもの（exe 2 本 + ライセンス 3 本。#1845）を、
-      # 使い捨てのランナーへ無人インストールして確かめる。実機では実インストールを
-      # 上書きするので、この検査は CI だけで行う（release-windows.ps1 からは呼ばない）
-      - name: インストーラーを無人インストールして中身を検査（CI だけ）
+      # インストーラーを使い捨てのランナーで一巡させて確かめる: インストール先へ置くもの（exe 2 本 +
+      # ライセンス 3 本。#1845）・ユーザー環境変数 Path への追加・tako.exe の起動・アンインストールで
+      # Path が外れること（#2767。PR の CI も debug の exe で同じ関数を回す）。実機では実インストールを
+      # 上書きしアンインストールまでするので、この検査は CI だけで行う（release-windows.ps1 からは呼ばない）
+      - name: インストーラーを一巡させて検査（入れる → Path → 起動 → アンインストール。CI だけ）
         shell: pwsh
         run: |
           . installer/windows/lib/verify-assets.ps1

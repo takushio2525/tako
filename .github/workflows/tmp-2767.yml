@@ -1,0 +1,75 @@
+# 一時（#2767 の試行用）。PR を出す前に消す。このブランチへの push だけで走る
+name: tmp-2767
+
+on:
+  push:
+    branches: ['test/2767-*']
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v5
+      - name: Spectre-mitigated libs をインストール
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $process = Start-Process -FilePath "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" `
+            -ArgumentList "modify", "--installPath", "`"$vsPath`"", `
+              "--add", "Microsoft.VisualStudio.Component.VC.Runtimes.x86.x64.Spectre", `
+              "--quiet", "--norestart", "--nocache" `
+            -Wait -PassThru
+          if (($process.ExitCode -ne 0) -and ($process.ExitCode -ne 3010)) { exit 1 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/tako-remote/package-lock.json
+      - name: PWA をビルド
+        shell: bash
+        working-directory: web/tako-remote
+        run: npm ci --no-audit --no-fund && npm run build
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - name: ルートの Cargo.toml の指紋
+        id: cargo-root
+        shell: bash
+        run: key=$(bash scripts/lib/cargo-root-manifest-key.sh) && echo "key=$key" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: manifest-${{ steps.cargo-root.outputs.key }}
+          save-if: false
+      - name: ビルド（tako-cli / tako-app）
+        run: cargo build -p tako-cli -p tako-app
+      - name: 大きさ
+        shell: pwsh
+        run: Get-Item target/debug/tako.exe, target/debug/tako-app.exe | Format-Table Name, Length
+      - name: setup の通し検査（#2767）
+        shell: pwsh
+        run: pwsh -File scripts/windows/test-setup-windows-2767.ps1
+      - name: インストーラーの一巡の検査（#2767）
+        if: always()
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'))
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { Write-Error "choco install innosetup が失敗 (exit $LASTEXITCODE)"; exit 1 }
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'tako-installer-2767'
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          pwsh -File installer/windows/build-installer.ps1 -SkipBuild -SkipZip -BinDir target/debug -OutDir $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "ISCC の所要: $($sw.Elapsed.TotalSeconds) 秒"
+          . installer/windows/lib/verify-assets.ps1
+          $setup = @(Get-ChildItem -LiteralPath $out -Filter '*.exe' -File)
+          if ($setup.Count -ne 1) { Write-Error "インストーラーが 1 本に決まらない: $($setup.Name -join ', ')"; exit 1 }
+          $sw.Restart()
+          Test-TakoInstalledPayload -Setup $setup[0].FullName
+          Write-Host "一巡の所要: $($sw.Elapsed.TotalSeconds) 秒"
