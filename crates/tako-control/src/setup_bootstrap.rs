@@ -2033,7 +2033,8 @@ fn ensure_user_path_dirs(dirs: &[PathBuf]) -> Result<Value, SetupRefusal> {
         process_has &= user_path::contains_entry(&process_path, entry);
         let current = user_path::read_typed()?;
         // レジストリに既に在る = 新しいターミナルからは引ける
-        if let Some(next) = user_path::append_entry(&current.raw, entry) {
+        // #2767 の赤の確認（一時。revert する）: Path を足す段を外す
+        if let Some(next) = user_path::append_entry(&current.raw, entry).filter(|_| false) {
             user_path::write_typed(&user_path::UserPathValue {
                 raw: next,
                 kind: current.kind.clone(),
