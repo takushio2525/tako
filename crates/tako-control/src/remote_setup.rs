@@ -843,6 +843,34 @@ pub enum PhoneReadiness {
     ServeConflict,
     /// serve の状態を読めなかった
     ServeUnreadable,
+    /// remote がこの OS ではまだ使えない（対応表の [`SUMMARY_SUPPORT_KEY`] が使えない = #2768）。
+    /// Tailscale の状態は読まずに決まる（[`platform_unsupported`]）。`issue` は対応表の追跡先
+    UnsupportedPlatform {
+        platform: tako_core::platform::support::Platform,
+        issue: Option<u32>,
+    },
+}
+
+/// setup の末尾の行を Tailscale の状態で出してよいかを引く対応表のキー（#2768）。
+/// 行が案内する操作そのもの（`tako remote setup`）を引く。マトリクスのキーは MCP ツール名が正なので、
+/// 末尾の行のためのキーは足さない（`remote_autostart::SUPPORT_KEY` と同じ作法）
+pub const SUMMARY_SUPPORT_KEY: &str = "tako_remote_setup";
+
+/// remote（スマホからの接続）がその OS で使えないなら、末尾の 1 行の中身を返す（#2768。**純粋関数**）。
+///
+/// **`cfg!(windows)` で判定しない**（`remote_autostart::platform_supported` と同じ理由 = 対応表が
+/// 使えると言った日に片方だけ残らない）。使える OS は `None` = 従来どおり Tailscale の状態を読む。
+/// Windows は daemon の通しが未実測（#971 で Pending）なので、Tailscale を調べて
+/// `tako remote setup` を案内すると、案内どおりに打っても使えないところへ利用者を送ることになる。
+/// 対応表に無いキーは素通し（`support::gate_in` の未登録と同じ判断）
+pub fn platform_unsupported(
+    platform: tako_core::platform::support::Platform,
+) -> Option<PhoneReadiness> {
+    let support = tako_core::platform::support::support_for(platform, SUMMARY_SUPPORT_KEY)?;
+    (!support.is_usable()).then(|| PhoneReadiness::UnsupportedPlatform {
+        platform,
+        issue: support.issue(),
+    })
 }
 
 /// [`check_status`] の JSON から [`PhoneReadiness`] を決める（**純粋関数**）
@@ -942,6 +970,17 @@ pub fn phone_readiness_line(readiness: &PhoneReadiness, install_step: Option<&st
         PhoneReadiness::ServeUnreadable => {
             format!("Tailscale Serve の状態を読めませんでした。{RECHECK}")
         }
+        // 使えない OS では次に打つコマンドを添えない（打っても使えない = #2768）
+        PhoneReadiness::UnsupportedPlatform { platform, issue } => {
+            let os = match platform {
+                tako_core::platform::support::Platform::MacOs => "macOS",
+                tako_core::platform::support::Platform::Windows => "Windows",
+            };
+            match issue {
+                Some(issue) => format!("{os} ではまだ使えません（追跡: #{issue}）"),
+                None => format!("{os} では使えません"),
+            }
+        }
     };
     format!("{PHONE_LINE_HEAD}{body}")
 }
@@ -961,6 +1000,12 @@ pub fn phone_readiness_line(readiness: &PhoneReadiness, install_step: Option<&st
 /// （上限 10 秒の検出が 1 回の実行で 3 回走り、`--version` が固まる CLI で setup が 3 倍に延びていた）。
 /// `None` ならここで 1 回だけ引く
 pub fn setup_summary_lines(tailscale_dep: Option<&setup_deps::DepStatus>) -> Vec<String> {
+    // remote がこの OS で使えない（対応表の判定。Windows は #971 で Pending）なら、Tailscale を
+    // 調べずに「使えない」とだけ言う（#2768。`tako remote setup` へ案内しない・上限 10 秒の待ちも無い）
+    if let Some(readiness) = platform_unsupported(tako_core::platform::support::Platform::current())
+    {
+        return vec![phone_readiness_line(&readiness, None)];
+    }
     let fresh;
     let state = match tailscale_dep {
         Some(state) => Some(state),
@@ -1260,6 +1305,10 @@ mod tests {
             PhoneReadiness::Published { url: None },
             PhoneReadiness::ServeConflict,
             PhoneReadiness::ServeUnreadable,
+            PhoneReadiness::UnsupportedPlatform {
+                platform: tako_core::platform::support::Platform::Windows,
+                issue: Some(971),
+            },
         ];
         for readiness in all {
             let line = phone_readiness_line(&readiness, Some(INSTALL_STEP));
@@ -1282,5 +1331,69 @@ mod tests {
     fn remote_setup_answersのjsonパース() {
         let a: RemoteSetupAnswers = serde_json::from_str(r#"{"yes":true}"#).unwrap();
         assert!(a.auto_yes());
+    }
+
+    /// #2768: setup の末尾の行の gate は対応表の `tako_remote_setup` の判定そのもの。
+    /// Windows（#971 で Pending）は Tailscale を読まずに「使えない」と言い、次に打つコマンドを添えない。
+    /// macOS は gate を通り、従来どおり Tailscale の状態から 1 行を決める
+    #[test]
+    fn issue2768_末尾の行はremoteが使えないosでは状態を読まずに使えないと言う() {
+        use tako_core::platform::support::{self, Platform};
+
+        // ① 判定は対応表と同じ答え（OS ごとの分岐を別に持たない）
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let declared = support::support_for(platform, SUMMARY_SUPPORT_KEY)
+                .unwrap_or_else(|| panic!("{platform:?} に {SUMMARY_SUPPORT_KEY} の宣言が無い"));
+            assert_eq!(
+                platform_unsupported(platform).is_some(),
+                !declared.is_usable(),
+                "{platform:?}: gate が対応表の判定（{}）とずれている",
+                declared.status()
+            );
+        }
+
+        // ② macOS の分岐: gate を通る = Tailscale の状態を読む従来の 1 行へ進む
+        assert_eq!(platform_unsupported(Platform::MacOs), None);
+
+        // ③ Windows の分岐: 対応表の追跡先つきで「使えない」の 1 行。案内のコマンドを添えない
+        let windows = support::support_for(Platform::Windows, SUMMARY_SUPPORT_KEY).unwrap();
+        assert!(
+            !windows.is_usable(),
+            "前提: Windows の remote は対応表で使えない（#971）。使えるようになったら ③ は外してよい"
+        );
+        let readiness = platform_unsupported(Platform::Windows).expect("Windows は gate で止まる");
+        assert_eq!(
+            readiness,
+            PhoneReadiness::UnsupportedPlatform {
+                platform: Platform::Windows,
+                issue: windows.issue(),
+            }
+        );
+        let line = phone_readiness_line(&readiness, Some(INSTALL_STEP));
+        assert_eq!(
+            line,
+            format!(
+                "{PHONE_LINE_HEAD}Windows ではまだ使えません（追跡: #{}）",
+                windows.issue().expect("Pending は追跡先を持つ")
+            )
+        );
+        for not_offered in ["tako remote setup", "tako setup deps", INSTALL_STEP] {
+            assert!(
+                !line.contains(not_offered),
+                "使えない OS で `{not_offered}` を案内している: {line}"
+            );
+        }
+
+        // ④ 追跡先が無い（Unsupported 等）ときも 1 行で言い切る
+        assert_eq!(
+            phone_readiness_line(
+                &PhoneReadiness::UnsupportedPlatform {
+                    platform: Platform::Windows,
+                    issue: None,
+                },
+                None,
+            ),
+            format!("{PHONE_LINE_HEAD}Windows では使えません")
+        );
     }
 }
