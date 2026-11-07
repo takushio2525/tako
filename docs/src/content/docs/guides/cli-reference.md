@@ -201,7 +201,7 @@ tako setup --reset
 
 `tako setup` は**シェル統合**（ペインの作業ディレクトリ追従・コマンドの実行状態・入力予測）のスクリプトも用意します。**どの OS も設定ファイルには何も書かず**、状態が 1 行出るだけです。macOS / Linux は tako が開くシェルへ環境変数を渡すだけで効き、Windows は tako がペインの PowerShell を開くときに読み込ませます（`$PROFILE` は書き換えず、実行ポリシーが Restricted の PC でも効き、tako の外の PowerShell には影響しません）。以前の版が `$PROFILE` に足した管理ブロックは自動の移行が取り除きます（他の行はそのまま）。用意できなかったときも setup は最後まで走り、`tako shell-integration install` を「残り」として案内します。状態だけ見たいときは `tako shell-integration` または `tako setup --check` です。
 
-`tako setup` の最後には、**スマホから使えるか**を `スマホからの接続: …` の 1 行で出します。Tailscale の導入・ログイン・証明書・公開の状態を**読むだけ**で（何も入れず何も起動しません）、その状態で次に打つコマンドを添えます。Tailscale が未導入なら `tako setup deps install`（依存チェックの段で出るものと同じ案内）、入っていて途中まで済んでいるなら `tako remote setup`、公開まで済んでいれば接続先の URL です。Tailscale が入っているのに実行できないときは「未導入」とは言わず `Tailscale を実行できませんでした` と出します。Tailscale が応答しないときは `[確認できません] tailscale status --json（10 秒応答なし）` と出して先へ進むので、setup が止まることはありません。
+`tako setup` の最後には、**スマホから使えるか**を `スマホからの接続: …` の 1 行で出します。Tailscale の導入・ログイン・証明書・公開の状態を**読むだけ**で（何も入れず何も起動しません）、その状態で次に打つコマンドを添えます。Tailscale が未導入なら `tako setup deps install`（依存チェックの段で出るものと同じ案内）、入っていて途中まで済んでいるなら `tako remote setup`、公開まで済んでいれば接続先の URL です。Tailscale が入っているのに実行できないときは「未導入」とは言わず `Tailscale を実行できませんでした` と出します。Tailscale が応答しないときは `[確認できません] tailscale status --json（10 秒応答なし）` と出して先へ進むので、setup が止まることはありません。Windows ではスマホからの接続がまだ使えないため、Tailscale は調べずに `スマホからの接続: Windows ではまだ使えません（追跡: #971）` とだけ出します（使えるようになれば、[Windows 対応状況](/windows-support/) の表の更新と同時に上の 1 行へ切り替わります）。
 
 `tako setup --check` が出す診断の項目は `tako check-health` と**同じ 1 つの実装**から出ています。人が読むなら `tako setup --check`、AI や監視から読むなら `tako check-health --json`（`diagnostics.items[].key` が安定した項目名、`diagnostics.remaining` が人の操作が要るぶん）で、どちらも同じ状態には同じ答えを返します。
 
