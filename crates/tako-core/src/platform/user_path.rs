@@ -29,8 +29,13 @@
 //! - 読み出しは `GetValue(..., 'DoNotExpandEnvironmentNames')` で**生の値**を取る。
 //!   素の `Get-ItemProperty` は `%USERPROFILE%` を展開してしまい、書き戻すと
 //!   ユーザーの可搬な記述が失われる
-//! - Claude Code の公式インストーラは `~\.local\bin` をここへ足す（実機の値で確認）。
-//!   つまり通常の導入では tako の追記は**何もしない**（冪等）
+//! - Claude Code の Windows 版の公式インストーラ（`install.ps1`。2.1.252）は **Path を書き換えない**。
+//!   入れた後に「System Properties → Environment Variables から足してください」と案内して終わる
+//!   （#1057 の実機ログ: 隔離した `USERPROFILE` + PATH から `.local\bin` を剥いだ状態で
+//!   `tako setup --yes` を流し、`[2/3]` の追記が無いと詰まることを確かめた）。だから tako の追記の段が要る。
+//!   開発機の値（テストの `REAL_RAW`）に `~\.local\bin` が入っているのは、その PC で先に足してあったため
+//!   で、インストーラが足した証拠ではない（#2768 で訂正）。すでに入っている PC では tako の追記は
+//!   **何もしない**（冪等）
 
 use std::path::Path;
 

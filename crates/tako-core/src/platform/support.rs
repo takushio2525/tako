@@ -185,10 +185,26 @@ pub mod notes {
         "psmux ignores the session size options (-x / -y), so the size cannot be changed",
     );
 
-    /// #760。#722 で AI 経路は走るようになったが、命名の**質**の縮退は残る
-    pub const WIN_AUTORENAME_ONCE: Note = Note::new(
-        "AI 命名は動くが、シェル統合が無い（#525）ためタブの素材（cwd / タイトル / 実行状態）が起動後に変化せず、命名はタブごとに 1 回だけになる。claude を導入していない環境ではタブ名が PowerShell の実行ファイルパスになる（#760）",
-        "AI naming works, but without shell integration (#525) a tab's inputs (cwd, title, command state) never change after startup, so each tab is named only once. Without claude installed the tab name becomes the PowerShell executable path (#760)",
+    /// #722 で AI 経路は走るようになった。#760（PR #1561）でシェル / psmux の実行ファイルパスを
+    /// 素材から捨て、素材の凍ったタブをやり直すようにし、#2432 でペインの PowerShell が起動引数で
+    /// 統合を読むようになった。残るのは入れ子の PowerShell と、実機の見え方が未確認なこと（#2768）
+    pub const WIN_AUTORENAME_UNMEASURED: Note = Note::new(
+        "AI 命名は動く（#722）。シェル / psmux の実行ファイルパスはタブ名の素材にせず cwd の末尾へ落とし、素材が動かないタブも 5 分 → 20 分 → 60 分でやり直す（#760）。tako のペインの PowerShell は起動引数で統合を読むので cwd と実行状態が命名の素材として動く（#2432）が、ペインの中で手で起こした入れ子の PowerShell では動かず、やり直しの 3 回に頼る。どちらの手当ても Windows 実機のタブバーでの見え方は未確認",
+        "AI naming works (#722). Shell / psmux executable paths are not used as tab-name material (the last cwd segment is used instead), and tabs whose material never changes are retried after 5, 20 and 60 minutes (#760). PowerShell in a tako pane loads the integration through its launch arguments, so cwd and command state change as naming material (#2432), but a nested PowerShell started by hand inside a pane does not, and naming then relies on those three retries. How the tab bar looks with these fixes has not been checked on real Windows hardware",
+    );
+
+    /// #617。ごみ箱は main（PR #959 の移植後）で実機の再測がある。reveal / 既定アプリ /
+    /// MAX_PATH 超えは移植前のブランチでだけ実測し、8/27 の記録では未実施のまま（#2768）
+    pub const WIN_FILE_OP_UNMEASURED: Note = Note::new(
+        "ごみ箱への移動は Windows 実機で、復元できる状態で入ることを確かめた（空白 / 日本語の名前・読み取り専用・中身入りのフォルダ）。エクスプローラーで表示・既定のアプリで開く・MAX_PATH を超えるパスのごみ箱は移植前の実装でだけ確かめ、今の版では実機で測り直していない。このアプリで開く（openas のダイアログ）・ファイルツリーのドラッグでの移動・エクスプローラーとのコピー / 切り取り / 貼り付けの往復・別のドライブへの移動の断りは Windows 実機で未確認（#617）",
+        "Moving to the Recycle Bin has been confirmed on real Windows hardware to leave items restorable (names with spaces or Japanese, read-only files, folders with contents). Reveal in Explorer, opening with the default app and trashing paths longer than MAX_PATH were only checked on the implementation before it was ported and have not been re-measured on the current version. Open With (the openas dialog), moving by dragging in the file tree, copy / cut / paste round trips with Explorer and the refusal for moves across drives have not been verified on real Windows hardware (#617)",
+    );
+
+    /// #2753 以後、会話カタログの書き手は persist ON の走査と tako mod の報告。
+    /// Windows の Claude Code が mod を読むかは #1886 で未実測（#2768）
+    pub const WIN_SESSIONS_CATALOG_MOD: Note = Note::new(
+        "会話カタログは動く（器の永続化 = persist が ON なら 30 秒ごとの走査が載せる）。新しい会話をおよそ 10 秒で載せる速い経路と、persist が OFF のときの唯一の書き手は tako mod の報告で、Windows の Claude Code が mod を読むかは未実測（#1886）。persist が OFF で mod の報告が届かないと、新しい会話はカタログに載らず `tako sessions show` で引けない（master / solo は記録が無く、worker は spawn の時点の記録のまま会話 ID と結ばれない）",
+        "The session catalog works (with container persistence (persist) on, the 30-second scan catalogs conversations). The fast path that catalogs a new conversation within about 10 seconds, and the only writer while persist is off, is the tako mod report, and whether Claude Code on Windows loads the mod has not been measured (#1886). With persist off and no mod report, new conversations are not cataloged and `tako sessions show` cannot find them (master / solo have no record at all, and a worker keeps only its spawn-time record without a conversation ID)",
     );
 
     /// #936 で検知と警告は動くようになった。バナーの「張り直す」はハーネス更新と同じ実装で、
@@ -499,10 +515,10 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_auto_rename",
         macos: Support::Supported,
         windows: Support::Degraded {
-            note: notes::WIN_AUTORENAME_ONCE,
+            note: notes::WIN_AUTORENAME_UNMEASURED,
         },
         windows_evidence: Evidence::Measured(
-            "#722 の Windows 11 実測: 隔離 GUI で AI 経路が走りタブ名が AI 由来（同素材のヒューリスティックは PowerShell のパス由来で別物）。セルフテスト項目 51 / 52（適用・手動優先・ON/OFF）も緑。残る縮退は #760 の実測（素材が不変なので 2 回目以降が発火しない）",
+            "#722 の Windows 11 実測: 隔離 GUI で AI 経路が走りタブ名が AI 由来（同素材のヒューリスティックは PowerShell のパス由来で別物）。セルフテスト項目 51 / 52（適用・手動優先・ON/OFF）も緑。#760 の実測（素材が不変なので 2 回目以降が発火しない・ヒューリスティックが pwsh / psmux のパスを掴む）は PR #1561（2026-09-22 close）で直した: 実行ファイルパスの関門と凍った素材のやり直し（5 分 / 20 分 / 60 分）を Windows 形の入力の単体と macOS の隔離 GUI の A/B で確かめ、Windows 実機の見え方は未確認。#2432 の起動引数の統合で cwd と実行状態が動くことは CI の Windows ランナーの shell_integration_powershell（22 本）が根拠",
         ),
     },
     Feature {
@@ -630,9 +646,14 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_file_op",
         macos: Support::Supported,
-        windows: Support::Supported,
+        // #2768: Supported から下げた。#617 の最後の記録（8/27）は main（PR #959 の移植後）で
+        // ごみ箱だけを実機で測り直し、reveal / 開く系 / 文言 / 単体 5 本の実機実行は未実施のまま。
+        // 「315 文字のパス・reveal で選択・既定アプリの起動」は移植前のブランチ（7/27）の実測
+        windows: Support::Degraded {
+            note: notes::WIN_FILE_OP_UNMEASURED,
+        },
         windows_evidence: Evidence::Measured(
-            "#617 の Windows 11 実測: 空白 + 日本語名 / 読み取り専用 / ディレクトリ / 315 文字のパスがいずれも復元可能な状態でごみ箱へ入り、reveal で対象が選択され、既定アプリが起動する。実機で緑のテスト: os_integration の windows モジュール（FOF_ALLOWUNDO のフラグ構成 / 絶対化 / /select, の形）。#1182 のターミナル内パスリンクの cmd+右クリックメニューもこの op 群（open_in_tako / open_default / open_with / reveal / copy_*）だけで出来ているので、**Windows でも項目は 1 つも消えない**（「Finder で表示」が「エクスプローラーで表示」へ入れ替わるだけ = #617 の呼び名 1 実装。文言の入れ替えと項目の並びが変わらないことは path_link_menu_items の単体が macOS 上から両 OS 分を検査する）。ただし**メニューを出す前段のパス検出は Windows では狭い**: links::is_path_like が `/` を含む形だけを候補にするので `C:\\…` の絶対パスはリンクにならず（`src/main.rs` のような `/` 区切りの相対パスは効く）、これは #1182 以前からの #153 の範囲の制約。#1834 の `op=move`（ツリーの D&D と同じ移動）は CI の Windows ランナーで tako_core::file_move の単体（実ファイルの移動・同名の拒否・配下の拒否・実体の形での照合）が緑。**Windows 実機の D&D と別ボリューム（ERROR_NOT_SAME_DEVICE）の断りは未実測**。#1842 で移動の実行は上書きしない rename（`platform::fs_move::rename_noreplace`）になり、Windows は `MoveFileExW` をフラグ 0（`MOVEFILE_REPLACE_EXISTING` も `MOVEFILE_COPY_ALLOWED` も付けない）で呼ぶ。確認から移動までの隙間に作られた同名は OS が `ERROR_ALREADY_EXISTS` で断り、どちらの中身も残る（CI の Windows ランナーで fs_move と file_move の単体（同名のファイル・空のフォルダの上へ・隙間の注入）が根拠。実機は未実測）。#1860 の `op=copy`（複製）/ `clipboard_copy` / `clipboard_cut` / `clipboard` / `paste` は CI の Windows ランナーで tako_core::file_copy（別名はエクスプローラーと同じ「- コピー (2)」の形・上書きしない・戻す）と file_clipboard の単体、DROPFILES の組み立て・読みと Preferred DropEffect の読み分けの単体（macOS の上でも走る）が緑。OS のクリップボードは CF_HDROP + Preferred DropEffect + CF_UNICODETEXT を書き、CF_HDROP を読む。**Windows 実機のエクスプローラーとの往復（貼れる・切り取りが移動になる）とシンボリックリンクの複製（開発者モードが要る = 理由つきで断る）は未実測**。#1867 の `paths`（まとめた clipboard_copy / clipboard_cut / trash / move）・`paste_move`・`copy_progress` / `copy_cancel` は OS に依らない dispatch の 1 実装で、CI の Windows ランナーで tako_core::tree_select（選択の状態遷移・範囲・配下の除去）・file_copy（進み具合・取り消しで作りかけを戻す）・keys（Ctrl+Alt+V と、AltGr の文字を奪わない判定）の単体が緑。**Windows 実機の Ctrl+クリック・Ctrl+Alt+V・AltGr 配列での打鍵は未実測**。#1895 の `paths` の `op=copy`（まとめたコピー = 1 つのジョブ）と `copy_progress` の `eta_secs` は OS に依らない dispatch の 1 実装。1 つのファイルは Windows では `CopyFileExW`（`COPY_FILE_FAIL_IF_EXISTS` で上書きしない・進み具合ルーチンでバイトを進め `PROGRESS_CANCEL` で途中で止めて作りかけを消す）で写し、CI の Windows ランナーで fs_copy / file_copy（累計が減らない・途中の取り消しで作りかけを残さない・同名を上書きしない・0 バイト）と keys（Delete だけを奪い Shift+Delete は端末へ流す）の単体が緑。**Windows 実機の Delete キーでのごみ箱・大きな 1 ファイルの途中の取り消しの手触りは未実測**",
+            "#617 の Windows 11 実測（8/27 の最後の記録・main = PR #959 の移植後）: `tako file trash` で空白入り・日本語名・読み取り専用・中身入りのディレクトリの 4 件が、ごみ箱の項目数 +4・元の場所つき（復元できる状態）で入りディスクから消えた（MAX_PATH 超えは未）。reveal で対象が選択されること・既定アプリの起動・315 文字のパスのごみ箱は移植前のブランチ（7/27）でだけ実測し（PR #959 は同じ os_integration.rs をファイルごと移した）、8/27 の記録では reveal / 開く系 / 文言の目視 / #[cfg(windows)] の単体 5 本の実機実行がどれも未実施。「このアプリで開く…」（openas）は一度も実測していない。CI の Windows ランナーで緑のテスト: os_integration の windows モジュール 5 本（FOF_ALLOWUNDO のフラグ構成 / 絶対化 / /select, の形 / 引用符の拒否 / 存在しないパス。reveal / 既定アプリ / ごみ箱の実 e2e 3 本は ignored の手動確認用）。#1182 のターミナル内パスリンクの cmd+右クリックメニューもこの op 群（open_in_tako / open_default / open_with / reveal / copy_*）だけで出来ているので、**Windows でも項目は 1 つも消えない**（「Finder で表示」が「エクスプローラーで表示」へ入れ替わるだけ = #617 の呼び名 1 実装。文言の入れ替えと項目の並びが変わらないことは path_link_menu_items の単体が macOS 上から両 OS 分を検査する）。メニューを出す前段のパス検出は #2435 で `\\` 区切りの形（`C:\\…`・UNC・`src\\main.rs:10:5`）も候補にした（残る狭さは tako_links の行の理由）。#1834 の `op=move`（ツリーの D&D と同じ移動）は CI の Windows ランナーで tako_core::file_move の単体（実ファイルの移動・同名の拒否・配下の拒否・実体の形での照合）が緑。**Windows 実機の D&D と別ボリューム（ERROR_NOT_SAME_DEVICE）の断りは未実測**。#1842 で移動の実行は上書きしない rename（`platform::fs_move::rename_noreplace`）になり、Windows は `MoveFileExW` をフラグ 0（`MOVEFILE_REPLACE_EXISTING` も `MOVEFILE_COPY_ALLOWED` も付けない）で呼ぶ。確認から移動までの隙間に作られた同名は OS が `ERROR_ALREADY_EXISTS` で断り、どちらの中身も残る（CI の Windows ランナーで fs_move と file_move の単体（同名のファイル・空のフォルダの上へ・隙間の注入）が根拠。実機は未実測）。#1860 の `op=copy`（複製）/ `clipboard_copy` / `clipboard_cut` / `clipboard` / `paste` は CI の Windows ランナーで tako_core::file_copy（別名はエクスプローラーと同じ「- コピー (2)」の形・上書きしない・戻す）と file_clipboard の単体、DROPFILES の組み立て・読みと Preferred DropEffect の読み分けの単体（macOS の上でも走る）が緑。OS のクリップボードは CF_HDROP + Preferred DropEffect + CF_UNICODETEXT を書き、CF_HDROP を読む。**Windows 実機のエクスプローラーとの往復（貼れる・切り取りが移動になる）とシンボリックリンクの複製（開発者モードが要る = 理由つきで断る）は未実測**。#1867 の `paths`（まとめた clipboard_copy / clipboard_cut / trash / move）・`paste_move`・`copy_progress` / `copy_cancel` は OS に依らない dispatch の 1 実装で、CI の Windows ランナーで tako_core::tree_select（選択の状態遷移・範囲・配下の除去）・file_copy（進み具合・取り消しで作りかけを戻す）・keys（Ctrl+Alt+V と、AltGr の文字を奪わない判定）の単体が緑。**Windows 実機の Ctrl+クリック・Ctrl+Alt+V・AltGr 配列での打鍵は未実測**。#1895 の `paths` の `op=copy`（まとめたコピー = 1 つのジョブ）と `copy_progress` の `eta_secs` は OS に依らない dispatch の 1 実装。1 つのファイルは Windows では `CopyFileExW`（`COPY_FILE_FAIL_IF_EXISTS` で上書きしない・進み具合ルーチンでバイトを進め `PROGRESS_CANCEL` で途中で止めて作りかけを消す）で写し、CI の Windows ランナーで fs_copy / file_copy（累計が減らない・途中の取り消しで作りかけを残さない・同名を上書きしない・0 バイト）と keys（Delete だけを奪い Shift+Delete は端末へ流す）の単体が緑。**Windows 実機の Delete キーでのごみ箱・大きな 1 ファイルの途中の取り消しの手触りは未実測**",
         ),
     },
     Feature {
@@ -1417,12 +1438,15 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_remote_messages",
         macos: Support::Supported,
+        // #2768: remote（#528 の daemon）の束から外した。dispatch は transcript::read_messages_typed を
+        // 呼ぶだけで daemon も ControlHost も通らない（会話ログのファイルを読んで正規化するだけ）。
+        // 構造上は OS に依らないが実機の会話を読んだことは無いので、#591 の規約どおり Pending + 追跡 #937
         windows: Support::Pending {
-            note: notes::WIN_REMOTE_UNVERIFIED,
-            issue: 528,
+            note: notes::WIN_UNVERIFIED,
+            issue: 937,
         },
-        windows_evidence: Evidence::Measured(
-            "#937 の Windows 11 実測: CLI が <SESSION_ID> を要求するところまで確認。実機の claude が未認証で会話を作れないため本体は未実測（デーモン側は #971 でブロック）",
+        windows_evidence: Evidence::UnitTest(
+            "transcript の単体（issue2768_windowsの会話の写しを読める）が `C:\\…` 入りの会話の写し（cwd・ツールの file_path / command・Windows 形のスラグのフォルダ）を所在の解決から正規化まで通す。daemon は通らない（dispatch の RemoteMessages は transcript::read_messages_typed を呼ぶだけ）。#937 の Windows 11 実測は CLI が <SESSION_ID> を要求するところまでで、実機の claude が未認証で会話を作れず本体は未実測",
         ),
     },
     Feature {
@@ -1627,9 +1651,13 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_sessions",
         macos: Support::Supported,
-        windows: Support::Supported,
+        // #2768: Supported から下げた。#2753 以後、persist OFF のカタログの唯一の書き手と新しい
+        // 会話の前倒しは tako mod の報告で、Windows の Claude Code が mod を読むかは #1886 で未実測
+        windows: Support::Degraded {
+            note: notes::WIN_SESSIONS_CATALOG_MOD,
+        },
         windows_evidence: Evidence::Measured(
-            "#877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑。resume のペイン起動そのものは未実測だが、経路は #867 で実機実測済みの launch と同じ",
+            "#877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑。resume のペイン起動そのものは未実測だが、経路は #867 で実機実測済みの launch と同じ。#2753（PR #2763）以後、カタログの書き手は persist ON の走査と tako mod の報告（persist OFF の唯一の書き手・新しい会話の前倒し）で、門は sessions::scan_plan の純関数（単体は OS を見ない）。mod の報告が Windows の Claude Code から届くかは #1886 で未実測",
         ),
     },
     Feature {

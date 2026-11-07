@@ -1888,4 +1888,63 @@ mod tests {
             Some("claude-opus-5")
         );
     }
+
+    /// #2768: Windows の claude が書く会話の写し（`C:\…` 入り・CRLF・Windows 形のスラグのフォルダ）を、
+    /// 所在の解決から正規化まで通す。`tako_remote_messages` はこの 2 つ（`find_transcript` →
+    /// `normalize_lines`）を呼ぶだけで daemon を通らない。パスは架空のプレースホルダ（#927）
+    #[test]
+    fn issue2768_windowsの会話の写しを読める() {
+        let cwd = r"C:\Users\winuser\dev\my proj";
+        let file = r"C:\Users\winuser\dev\my proj\src\main.rs";
+        let command = r"Get-ChildItem -LiteralPath 'C:\Users\winuser\dev\my proj\src'";
+        let sid = "27680000-aaaa-4bbb-8ccc-dddddddddddd";
+        let rows = [
+            json!({"type": "user", "cwd": cwd, "sessionId": sid,
+                "message": {"role": "user", "content": format!("{file} を読んで")}}),
+            json!({"type": "assistant", "cwd": cwd, "requestId": "r1",
+                "message": {"content": [{"type": "tool_use", "id": "t1", "name": "Read",
+                    "input": {"file_path": file}}]}}),
+            // tool_result だけの user 行は会話に出ない（r1 と r2 は別の応答のまま）
+            json!({"type": "user", "cwd": cwd,
+                "message": {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": "t1", "content": "fn main() {}"}]}}),
+            json!({"type": "assistant", "cwd": cwd, "requestId": "r2",
+            "message": {"content": [
+                {"type": "tool_use", "id": "t2", "name": "PowerShell",
+                    "input": {"command": command}},
+                {"type": "text", "text": format!("{file} を読みました")},
+            ]}}),
+        ];
+        let body: String = rows.iter().map(|row| format!("{row}\r\n")).collect();
+
+        let config = tako_core::test_residue::ScratchDir::new("i2768-transcript");
+        let slug = crate::worker_mcp::project_slug(cwd);
+        assert_eq!(
+            slug, "C--Users-winuser-dev-my-proj",
+            "claude が Windows の cwd から作るフォルダ名の形"
+        );
+        let dir = config.path().join("projects").join(&slug);
+        std::fs::create_dir_all(&dir).expect("create_dir_all");
+        std::fs::write(dir.join(format!("{sid}.jsonl")), body).expect("write");
+
+        let found = locate_transcript_in(&[config.path().to_path_buf()], Some(config.path()), sid)
+            .expect("Windows 形のスラグのフォルダから所在を解決できる");
+        assert!(
+            found
+                .path
+                .ends_with(Path::new(&slug).join(format!("{sid}.jsonl"))),
+            "{found:?}"
+        );
+        assert!(found.is_default);
+
+        let msgs = read_messages_at(&found.path, 30).expect("読める");
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["text"], format!("{file} を読んで"));
+        // `\` は 1 文字のまま（二重化も `/` への置き換えもしない）
+        assert_eq!(msgs[1]["tools"][0]["name"], "Read");
+        assert_eq!(msgs[1]["tools"][0]["summary"], file);
+        assert_eq!(msgs[2]["tools"][0]["summary"], command);
+        assert_eq!(msgs[2]["text"], format!("{file} を読みました"));
+    }
 }
