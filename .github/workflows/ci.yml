@@ -546,7 +546,9 @@ jobs:
           . installer/windows/lib/verify-assets.ps1
           $setup = @(Get-ChildItem -LiteralPath $out -Filter '*.exe' -File)
           if ($setup.Count -ne 1) { Write-Error "インストーラーが 1 本に決まらない: $($setup.Name -join ', ')"; exit 1 }
-          Test-TakoInstalledPayload -Setup $setup[0].FullName
+          # 落ちた理由を PR のチェックの注釈へ名指しで出す（例外のままだとログの奥にしか残らない）
+          try { Test-TakoInstalledPayload -Setup $setup[0].FullName }
+          catch { Write-Host "::error::[#2767 インストーラーの一巡] $($_.Exception.Message)"; exit 1 }
       # **テストの「コンパイル」だけは blocking** にする（#1264）。
       # 上の `cargo build --workspace` は `tests/` のターゲットをコンパイルしないので、
       # Windows 専用の統合テスト（`#![cfg(windows)]` = macOS では空クレート）が
