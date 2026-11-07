@@ -14,8 +14,9 @@
          welcome::auto_setup_answers の JSON。写しは番犬 issue2767_windows_setup_e2e_watchdog が縛る）
       2. `tako setup --yes --answers @<file>`（明示の答え。2 回目は「変更なし」= 冪等）
       3. `tako setup --check`
-      4. `tako setup bootstrap undo-path` → `path` → `undo-path`（ユーザー環境変数 Path を読み戻し、
-         新しく開いたシェルから claude / tako が引けることまで見る）
+      4. `tako setup bootstrap undo-path` → `path` → 3 系統の `undo-path`（ユーザー環境変数 Path を読み戻し、
+         新しく開いたシェルから claude / tako が引けることまで見る。setup の段は tako の置き場と 3 系統の
+         ランチャーの置き場を足すが、`undo-path` は指定した系統と tako の置き場だけを外す）
       5. `tako setup-mcp`（登録済み = そのまま / 登録先が消えた = 付け替え）
       6. 境界: 未ログインでも setup は完走する（#1501）/ 不正な answers は書く前に断る
 

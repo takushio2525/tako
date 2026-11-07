@@ -14,8 +14,9 @@
     setup の通しの検査（scripts/windows/test-setup-windows-2767.ps1）の両方がこのファイルを
     dot-source する。
 
-    比べ方は tako.iss の NormalizePathEntry と同じ（前後の空白と引用符・末尾の \ を落とし、
-    %VAR% を展開し、大文字小文字を区別しない）。空の要素（`a;;b` や末尾の `;`）は数えない。
+    比べ方は tako.iss の NormalizePathEntry に揃える（前後の空白・末尾の \ を落とし、%VAR% を展開し、
+    大文字小文字を区別しない）。展開は %LOCALAPPDATA% などの 3 つに限らず全部、前後の引用符も落とす
+    （どちらも PATH の要素としては同じ場所を指すため）。空の要素（`a;;b` や末尾の `;`）は数えない。
 
     書くのは Restore-TakoUserPath（検査の前に取った値へ戻す）だけ。検査はどれも使い捨てのランナー
     （GitHub Actions）で走らせる前提で、呼び手が $env:GITHUB_ACTIONS を確かめる。
@@ -55,7 +56,7 @@ function Split-TakoPathList([string]$Raw) {
     @($Raw -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 }
 
-# 比べるための正規化（tako.iss の NormalizePathEntry と同じ規則）
+# 比べるための正規化（tako.iss の NormalizePathEntry に揃える。違いは冒頭の説明のとおり）
 function ConvertTo-TakoPathKey([string]$Entry) {
     $e = [Environment]::ExpandEnvironmentVariables($Entry.Trim().Trim('"'))
     while ($e.Length -gt 1 -and $e.EndsWith('\')) { $e = $e.Substring(0, $e.Length - 1) }
