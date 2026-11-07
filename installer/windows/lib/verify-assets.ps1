@@ -206,6 +206,7 @@ function Get-TakoUninstallEntry([string]$Dir) {
         $want = ConvertTo-TakoPathKey $Dir
         foreach ($name in $root.GetSubKeyNames()) {
             $sub = $root.OpenSubKey($name)
+            if ($null -eq $sub) { continue }
             try {
                 $location = [string]$sub.GetValue('InstallLocation', '')
                 if ($location -and (ConvertTo-TakoPathKey $location) -eq $want) {
@@ -335,8 +336,11 @@ function Test-TakoInstalledPayload {
         }
         Write-Host "   [OK] 新しく開いたシェルから tako が引けて動く（$($fresh.Trim())）"
 
-        # 5. アンインストール。アンインストーラーは自分の写しを一時 dir で起こし直して元は先に抜けるので、
-        # 抜けた後も「exe とアンインストール情報が消える」まで待つ
+        # 5. アンインストール。アンインストーラーは自分の写しを一時 dir で起こし直して元は先に抜ける。
+        # 写しはファイルとアンインストール情報を消した**後**で [Code] の usPostUninstall（EnvRemovePath）を
+        # 走らせるので、「消えた」だけを待つと Path を読むのが早すぎる（初回の CI で実際に当たった）。
+        # 4 つ（exe・アンインストーラー・アンインストール情報・Path の要素）がすべて消えるまで待ち、
+        # 期限を過ぎたら残ったものを名指す
         $entry = Get-TakoUninstallEntry $dir
         if ($null -eq $entry) { throw "インストール先 $dir のアンインストール情報（HKCU の Uninstall）が無い" }
         $uninstaller = $entry.UninstallString.Trim().Trim('"')
@@ -352,19 +356,26 @@ function Test-TakoInstalledPayload {
             throw "アンインストーラーが終了コード $($proc.ExitCode) で失敗した"
         }
         $deadline = (Get-Date).AddSeconds(120)
-        while ((Test-Path -LiteralPath $cli) -or (Test-Path -LiteralPath $uninstaller) -or ($null -ne (Get-TakoUninstallEntry $dir))) {
+        while ($true) {
+            $removed = Get-TakoUserPath
+            $left = [ordered]@{
+                'tako.exe'                       = (Test-Path -LiteralPath $cli)
+                'アンインストーラー'             = (Test-Path -LiteralPath $uninstaller)
+                'アンインストール情報'           = ($null -ne (Get-TakoUninstallEntry $dir))
+                'ユーザー環境変数 Path の要素'   = ((Get-TakoPathEntryCount -Entries $removed.Entries -Dir $dir) -ne 0)
+            }
+            $remaining = @($left.Keys | Where-Object { $left[$_] })
+            if ($remaining.Count -eq 0) { break }
             if ((Get-Date) -gt $deadline) {
                 if (Test-Path -LiteralPath $uninstallLog) { Get-Content -LiteralPath $uninstallLog | ForEach-Object { Write-Host $_ } }
-                throw "アンインストールが 120 秒で終わらなかった（tako.exe 残り=$(Test-Path -LiteralPath $cli) / アンインストーラー残り=$(Test-Path -LiteralPath $uninstaller) / アンインストール情報残り=$($null -ne (Get-TakoUninstallEntry $dir))）"
+                if ($left['ユーザー環境変数 Path の要素'] -and $remaining.Count -eq 1) {
+                    throw "アンインストールが終わって 120 秒たってもユーザー環境変数 Path にインストール先 $dir が残っている（tako.iss の EnvRemovePath）。いまの値: $($removed.Raw)"
+                }
+                throw "アンインストールが 120 秒で終わらなかった（残っているもの: $($remaining -join ' / ')）"
             }
             Start-Sleep -Milliseconds 500
         }
-        Write-Host '   [OK] アンインストールで exe・アンインストーラー・アンインストール情報が消えた'
-        $removed = Get-TakoUserPath
-        $count = Get-TakoPathEntryCount -Entries $removed.Entries -Dir $dir
-        if ($count -ne 0) {
-            throw "アンインストール後もユーザー環境変数 Path にインストール先 $dir が残っている（$count 回。tako.iss の EnvRemovePath）。いまの値: $($removed.Raw)"
-        }
+        Write-Host '   [OK] アンインストールで exe・アンインストーラー・アンインストール情報・Path の要素が消えた'
         $diff = Compare-TakoPathEntries -Expected $before.Entries -Actual $removed.Entries
         if ($null -ne $diff) { throw "アンインストール後のユーザー環境変数 Path が検査前と違う: $diff" }
         Write-Host "   [OK] アンインストールでユーザー環境変数 Path からインストール先が外れ、検査前の並びに戻った"

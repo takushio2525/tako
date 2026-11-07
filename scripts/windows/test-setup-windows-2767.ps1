@@ -237,12 +237,13 @@ function Assert-UserPathLacks([string]$Dir, [string]$Why) {
     Assert-That ($n -eq 0) "ユーザー環境変数 Path に $Dir が残っている（$n 回。$Why）。いまの値: $($now.Raw)"
 }
 
-# 検査の前から在った要素が、同じ順で残っていること（tako の足し引きが他を触らない）
+# 検査の前から在った要素が、同じ順で残っていること（tako の足し引きが他を触らない）。
+# tako が足しうる置き場（$TakoPathDirs = tako CLI + 3 系統のランチャー）を除いて比べる
 function Assert-UserPathKeepsOthers([string]$Why) {
     $now = Get-TakoUserPath
     $others = @($now.Entries | Where-Object {
-            (Get-TakoPathEntryCount -Entries @($_) -Dir $ClaudeBin) -eq 0 -and
-            (Get-TakoPathEntryCount -Entries @($_) -Dir $TakoDir) -eq 0
+            $entry = $_
+            @($TakoPathDirs | Where-Object { (Get-TakoPathEntryCount -Entries @($entry) -Dir $_) -gt 0 }).Count -eq 0
         })
     $diff = Compare-TakoPathEntries -Expected $Before.Entries -Actual $others
     Assert-That ($null -eq $diff) "tako が足した以外のユーザー環境変数 Path が変わった: $diff（$Why）"
@@ -272,8 +273,28 @@ try {
     $fakeSrc = Join-Path $PSScriptRoot 'fake-claude.rs'
     & rustc --edition 2021 -C debuginfo=0 -o $ClaudeExe $fakeSrc
     Assert-That ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $ClaudeExe)) "rustc で $fakeSrc を組めなかった（exit $LASTEXITCODE）"
-    Assert-That ((Get-TakoPathEntryCount -Entries $Before.Entries -Dir $ClaudeBin) -eq 0) "検査前から $ClaudeBin が Path に入っている（砂場が新しくない）"
-    Assert-That ((Get-TakoPathEntryCount -Entries $Before.Entries -Dir $TakoDir) -eq 0) "検査前から $TakoDir が Path に入っている（前の検査の残りか）"
+
+    # 3 系統のランチャーの置き場は tako の答え（レシピ表の正本 = tako_core::platform::agent_install）から引く。
+    # setup の tako CLI の段は tako の置き場とこの 3 つを Path へ足す（desired_path_dirs）
+    $script:Stage = '置き場を引く（tako setup bootstrap status-all）'
+    $r = Invoke-Tako @('setup', 'bootstrap', 'status-all', '--json')
+    Assert-Exit0 $r 'status-all'
+    $st = ConvertFrom-TakoJson $r 'status-all'
+    $LauncherDirs = [ordered]@{}
+    foreach ($a in @($st.agents)) { $LauncherDirs[[string]$a.agent] = [string]$a.launcher_dir }
+    foreach ($agent in 'claude', 'codex', 'agy') {
+        Assert-That ($LauncherDirs.Contains($agent) -and $LauncherDirs[$agent]) "status-all に $agent の launcher_dir が無い"
+        Assert-That ($LauncherDirs[$agent].StartsWith($HomeDir, [System.StringComparison]::OrdinalIgnoreCase)) `
+            "$agent の置き場が砂場の外を指す: $($LauncherDirs[$agent])（USERPROFILE の差し替えが効いていない）"
+    }
+    Assert-That ((ConvertTo-TakoPathKey $LauncherDirs['claude']) -eq (ConvertTo-TakoPathKey $ClaudeBin)) `
+        "tako が見る claude の置き場 $($LauncherDirs['claude']) と偽 claude の置き場 $ClaudeBin が違う"
+    $claudeState = @($st.agents | Where-Object { $_.agent -eq 'claude' })[0]
+    Assert-That ($claudeState.installed -and $claudeState.authenticated) "偽 claude を tako が「導入済み・ログイン済み」と読まない（installed=$($claudeState.installed) / authenticated=$($claudeState.authenticated)）"
+    $script:TakoPathDirs = @($TakoDir) + @($LauncherDirs.Values)
+    foreach ($d in $TakoPathDirs) {
+        Assert-That ((Get-TakoPathEntryCount -Entries $Before.Entries -Dir $d) -eq 0) "検査前から $d が Path に入っている（前の検査の残りか）"
+    }
 
     # --- 1. 初回起動の自動の段 ----------------------------------------------------
     $script:Stage = '1. 初回起動の自動の段（tako setup --yes --answers -）'
@@ -287,7 +308,9 @@ try {
     Assert-That ($config.Count -ge 1) "setup の完了の印（config.yaml の setup.completed: true）が $DataDir の下に無い"
     Assert-That (Test-Path -LiteralPath (Join-Path $HomeDir '.claude\CLAUDE.md') -PathType Leaf) '指示ファイル ~/.claude/CLAUDE.md が作られていない'
     Assert-UserPathHas $TakoDir 'setup の tako CLI の段（#1502）が tako.exe の置き場を足す'
-    Assert-UserPathHas $ClaudeBin 'setup の PATH の段が入れた直後の claude の置き場を足す'
+    foreach ($agent in $LauncherDirs.Keys) {
+        Assert-UserPathHas $LauncherDirs[$agent] "setup の tako CLI の段（#1502）が $agent のランチャーの置き場も足す"
+    }
     Assert-UserPathKeepsOthers 'setup は Path の末尾へ足すだけ'
     Assert-McpRegisteredToTako '検出した claude へ setup が登録する'
     Assert-NoAgentLaunch
@@ -363,8 +386,17 @@ try {
     Assert-Exit0 $r '最後の undo-path'
     Assert-UserPathLacks $ClaudeBin '最後の undo-path'
     Assert-UserPathLacks $TakoDir '最後の undo-path'
+    # setup の段が足した codex / agy の置き場は、それぞれの系統の undo-path が外す
+    # （Windows は系統ごとに置き場が違う。undo-path は指定した系統の置き場と tako の置き場だけを外す）
+    foreach ($agent in 'codex', 'agy') {
+        $r = Invoke-Tako @('setup', 'bootstrap', 'undo-path', '--agent', $agent, '--json')
+        Assert-Exit0 $r "undo-path --agent $agent"
+        $j = ConvertFrom-TakoJson $r "undo-path --agent $agent"
+        Assert-That ($j.change -eq 'removed') "undo-path --agent $agent の change が removed でない: $($j.change)（setup が足した $agent の置き場を外していない）"
+        Assert-UserPathLacks $LauncherDirs[$agent] "undo-path --agent $agent"
+    }
     $diff = Compare-TakoPathEntries -Expected $Before.Entries -Actual (Get-TakoUserPath).Entries
-    Assert-That ($null -eq $diff) "path → undo-path の後のユーザー環境変数 Path が検査前と違う: $diff"
+    Assert-That ($null -eq $diff) "3 系統の undo-path の後のユーザー環境変数 Path が検査前と違う: $diff"
     Assert-NoAgentLaunch
 
     # --- 5. setup-mcp ------------------------------------------------------------

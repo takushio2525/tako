@@ -19,7 +19,8 @@
 #
 # ドライラン（#1845）: タグ以外の ref（ブランチ）から dispatch すると、Cargo.toml の版数で
 # 1〜3 と artifact への保存までを行い、**Release へは添付しない**。PR の CI は Windows の
-# 配布物を組まないので、組み立て（build-installer.ps1 / tako.iss）を変えた PR はこれで確かめる:
+# リリースの配布物（release の exe・zip）を組まない（インストーラーの一巡だけは debug の exe で
+# 組んで回す = ci.yml・#2767）ので、組み立て（build-installer.ps1 / tako.iss）を変えた PR はこれでも確かめる:
 #   gh workflow run release-windows.yml --ref <ブランチ>
 #
 # リリースノート（ダウンロード表 / Windows 手順 / 動作要件 / Known limitations）は
