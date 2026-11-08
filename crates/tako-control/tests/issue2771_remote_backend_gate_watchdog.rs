@@ -107,7 +107,8 @@ fn scan_daemon(remote: &str, out: &mut Vec<String>) {
         remote,
         RUN_DAEMON,
         GATE,
-        &["local_endpoint::bind(", "write_secret_file(&port_path()"],
+        // port ファイルの書き出しは #2781 からガード（`owned.write_secret(&port_path()`）を通るので、両方の形に当たる字面で見る
+        &["local_endpoint::bind(", "(&port_path()"],
         "断った後に socket / port ファイルが残り、次の start が「stale な待ち受け」になる",
         out,
     );
@@ -232,10 +233,11 @@ pub fn run_interactive(yes: bool) -> Result<Value, String> {
     let joined = out.join("\n");
     for want in [
         format!("{REMOTE}:3 — `{RUN_DAEMON}` が `{GATE}` より前に `local_endpoint::bind(` へ進む"),
-        format!(
-            "{REMOTE}:5 — `{RUN_DAEMON}` が `{GATE}` より前に `write_secret_file(&port_path()` へ進む"
-        ),
+        format!("{REMOTE}:5 — `{RUN_DAEMON}` が `{GATE}` より前に `(&port_path()` へ進む"),
     ] {
-        assert!(joined.contains(&want), "名指せていない: {want}\n---\n{joined}");
+        assert!(
+            joined.contains(&want),
+            "名指せていない: {want}\n---\n{joined}"
+        );
     }
 }
