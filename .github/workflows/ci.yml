@@ -642,6 +642,16 @@ jobs:
       - name: 実行ポリシーを強制した PC での導入代行の起こし方の実行検査（#2790。HKLM AllSigned / HKCU Restricted）
         shell: pwsh
         run: pwsh -File scripts/windows/test-install-execution-policy-2790.ps1
+      # #2800: 受け入れゲート（#935）の述語を実物の Windows PowerShell 5.1 で失敗させ、結果の evidence の stderr に
+      # CLIXML（#< CLIXML / <Objs）が残らず元のエラーの文が読めるかを見る。5.1 は捕捉された stderr に cmdlet の
+      # エラーレコードを CLIXML で書く（-OutputFormat Text も見ない = #2790）ので、ゲートは導入代行と同じ
+      # powershell_stderr_text で平文へ戻す。テストは ProgramFiles を pwsh 7 の無い置き場へ向けて 5.1 へ倒した回と
+      # 既定の解決（pwsh 7）の回を、同じバイナリの TAKO_2800_LEGACY=1（修正前の形）と並べて取る = A/B。
+      # 外部に依らないので毎回走る。全数より手前に名指しで置く（#1282 と同じ理由）。
+      # --nocapture は結果の行（TAKO2800_*）をログへ残すため
+      # **ゲートの evidence が CLIXML のまま載る形へ戻ったらここで落ちる**
+      - name: 受け入れゲートの述語の 5.1 の stderr が平文で読めるかの実行検査（#2800）
+        run: cargo test -p tako-control --test issue2800_gate_clixml_windows -- --nocapture
       # #2791: Windows の codex / agy の導入代行を、公式の install.ps1 を本当に走らせて確かめる（製品の口
       # `tako setup bootstrap install --agent codex|agy` = MCP tako_setup_bootstrap と同じ経路）。導入の前後の
       # status・入った置き場・agy の取得物が残らない（起動片のスコープ）を、ポリシーなし / HKCU Restricted /
