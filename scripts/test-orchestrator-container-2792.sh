@@ -20,9 +20,10 @@
 #   ⑥ close（`tako close` = MCP `tako_close_pane`）→ ペインが消え・レジストリが閉じ・agent が終わる
 #      （器なしで agent が終了処理の途中で残るのは閉じる経路の既知の不具合 #2803 = 数えずに `[既知 #2803]` と名指す）
 #
-# claude は偽物（API を呼ばない最小の TUI。alt screen に入り最下行に `❯` の入力欄を描き、Enter で
-# 受けた依頼を会話の記録（transcript の JSONL）へ user / assistant の 2 行として書き、決まった報告
-# `REPORT-2792` を返す。`agents --json` には生きている自分を答える）。本物の claude・アカウントの枠は使わない。
+# claude / codex は偽物（API を呼ばない最小の TUI。alt screen に入り最下行に `❯` の入力欄を描き、Enter で
+# 受けた依頼を会話の記録（claude = transcript の user / assistant・codex = rollout の task_started /
+# response_item / task_complete）へ書き、決まった報告 `REPORT-2792` を返す。claude は `agents --json` に
+# 生きている自分を答え、codex は本物と同じく thread-writer のロックを握る）。本物の CLI・アカウントの枠は使わない。
 # 本番の GUI / tmux / data dir / 設定 dir には触らない（HOME も一時 dir）。**CI には登録しない**（tako-vd が要る）。
 # tako-vd が描画できない（蓋閉じ）と終了コード 4 = 未実測。
 #
