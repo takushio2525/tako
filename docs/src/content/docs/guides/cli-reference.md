@@ -280,9 +280,10 @@ tako setup deps                    # 状態確認（既定。読み取り専用�
 tako setup deps install            # 未導入のものを導入
 tako setup deps install --dep tmux # 1 つだけ導入
 tako setup deps install --dry-run  # 何を入れるかだけ表示
+tako setup deps install --yes      # 確認を省く（Windows の UAC が出るものも入れる）
 ```
 
-導入済みのものには触りません（何度実行しても同じ結果になります）。導入を代行できるのは macOS の Homebrew（`brew install`）で、Windows は打つべき `winget` のコマンドを表示します。
+導入済みのものには触りません（何度実行しても同じ結果になります）。macOS は Homebrew（`brew install`）、Windows は winget で導入します。Windows の psmux は自分のユーザーの範囲に入るのでそのまま入れ、git は Windows の管理者の確認（UAC）が出るので、端末では入れる前に 1 回だけ確認します（`--yes` で省けます。パイプ越しなど端末が無いときは入れずに `--yes` を案内します）。winget が見つからないときは、Microsoft Store の「アプリ インストーラー」を入れるか更新する案内を出します。設定画面の「セットアップ」タブの「任意の依存ツール」からもボタン 1 つで入れられます（UAC が出るものは「導入（管理者の確認あり）」と書いたボタンで、押すことが同意です）。
 
 Windows ではスマホからの接続がまだ使えないため、tailscale は一覧に出さず、psmux の用途にもリモート接続を書きません（`tako setup` の依存チェックと `tako check-health` も同じです）。使えるようになれば、[Windows 対応状況](/windows-support/) の表の更新と同時に出るようになります。
 

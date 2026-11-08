@@ -802,9 +802,9 @@
     {
       "key": "tako_setup_deps",
       "status": "degraded",
-      "note_ja": "依存の検出はできるが、導入の実行代行は macOS（Homebrew）だけ。Windows は winget のコマンドを案内する",
+      "note_ja": "依存の導入を winget で代行する（psmux は利用者の権限でそのまま、Git は管理者の確認（UAC）への同意があるときだけ）。Windows の CI のランナーで psmux と Git を実際に入れて確かめたが、ランナーは UAC の確認が出ない設定なので、確認の画面と拒否は Windows 実機で未実測（#2433）",
       "evidence": "measured",
-      "evidence_detail": "#1057 の Windows 11 実測: `tako setup deps` が器（psmux）/ git / tailscale を実際の解決結果つきで列挙し、install は winget を代行せず not_delegable で理由 + コマンドを返す"
+      "evidence_detail": "#1057 の Windows 11 実測: `tako setup deps` が器（psmux）/ git / tailscale を実際の解決結果つきで列挙する。#2433 で winget の代行を足し、Windows の CI のランナー（Windows Server 2025・winget v1.11.510）で `tako setup deps install --dep psmux` が winget を起こして入れ、status が未導入 → 導入済みへ変わること、Git は同意なしでは起こさず `--yes` で入ることを確かめた（scripts/windows/test-deps-install-2433.ps1。UAC の取り消し・取得元に届かない・winget が古い・途中の失敗は偽の winget で終了コードを注入して確かめた）"
     },
     {
       "key": "tako_setup_mcp",

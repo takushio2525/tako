@@ -355,17 +355,20 @@ fn issue1499_導入は1実装を通る() {
     // だけ。本体フローは `setup_deps::offer_and_install` の中で同じ `install` を通る
     let expected: &[(&str, &str)] = &[
         (CLI_SETUP, "run_deps"),
-        ("crates/tako-control/src/dispatch.rs", "dispatch_inner"),
+        // #2433: 同期の腕と background の腕（`OffloadJob::SetupDeps`）が通る 1 関数
+        ("crates/tako-control/src/dispatch.rs", "setup_deps_reply"),
     ];
     for (rel, _) in expected {
         let src = production(rel);
         // `install_typed` は `install` の型の口（断りを表示言語で返す dispatch が使う。#2365）で、
-        // `install` は日本語の文へ写すだけ = 同じ導入の 1 実装
+        // `install` は日本語の文へ写すだけ = 同じ導入の 1 実装。`install_in` は両者が通る本体で、
+        // 検出済みの状態を受ける（CLI が同意の確認に使った検出を使い回す。#2433）
         assert!(
             src.contains("setup_deps::install(")
                 || src.contains("crate::setup_deps::install(")
-                || src.contains("setup_deps::install_typed("),
-            "{rel}: 導入は `setup_deps::install`（型の口 `install_typed`）を通すこと（#1057 / #1499）"
+                || src.contains("setup_deps::install_typed(")
+                || src.contains("setup_deps::install_in("),
+            "{rel}: 導入は `setup_deps::install`（型の口 `install_typed` / 本体 `install_in`）を通すこと（#1057 / #1499）"
         );
     }
     // 依存の導入コマンドを自前で組み立てていない（正本は setup_deps::run_installer）

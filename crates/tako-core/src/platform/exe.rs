@@ -112,6 +112,27 @@ pub fn find_bounded(name: &str) -> BoundedFind {
     }
 }
 
+/// [`find_bounded`] の、**このプロセスが起動した後にレジストリへ足された PATH も見る**版（#2433）。
+///
+/// Windows のインストーラ（winget の portable・Git for Windows）はユーザー / マシンの環境変数 `Path`
+/// （レジストリ）へ置き場を足すが、走っているプロセス（tako の GUI・CLI）の PATH には載らない。
+/// 導入の直後に「入れたのに見つかりません」と言わないよう、新しいペインと同じ組み方（境界 B23 の
+/// [`crate::platform::user_path::pane_path`]）で PATH を組み直して探す。unix はログインシェルが
+/// profile を毎回読むので [`find_bounded`] と同じ答え
+pub fn find_fresh_bounded(name: &str) -> BoundedFind {
+    #[cfg(unix)]
+    {
+        find_bounded(name)
+    }
+    #[cfg(not(unix))]
+    {
+        BoundedFind {
+            path: imp::find_fresh(name),
+            timeout: None,
+        }
+    }
+}
+
 /// [`find`] が打ち切ったことを persist.log へ残す（名前ごとに 1 回 = 定期の呼び手で埋めない）。
 ///
 /// tako-core は persist.log の書き手を持たないので、git / tmux の場所の解決（#2151）と同じ受け口
@@ -654,6 +675,18 @@ mod imp {
             &user_install_dirs(),
             &|p| std::path::Path::new(p).is_file(),
         )
+    }
+
+    /// [`super::find_fresh_bounded`] の Windows の腕（#2433）。PATH はレジストリから組み直した値
+    /// （足すものが無い・読めないときは起動時の値）で、PATH の外の保険の置き場も同じく見る
+    pub fn find_fresh(name: &str) -> Option<String> {
+        let dirs = match crate::platform::user_path::pane_path() {
+            Some((_, value)) => split_path_list(Some(value.into())),
+            None => split_path_list(std::env::var_os("PATH")),
+        };
+        super::find_in_windows_path(name, &dirs, &pathext(), &user_install_dirs(), &|p| {
+            std::path::Path::new(p).is_file()
+        })
     }
 
     /// Windows の探索は PATH の走査だけ（子プロセスを起こさない）なので待ちが無い

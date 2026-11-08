@@ -5091,7 +5091,10 @@ Windows（約 30 分）を回した。macOS のランナーは同時に数本し
   定期実行（`schedule`・週 1 回 月曜 03:17 JST。macOS ジョブは回さない）と手動実行（`workflow_dispatch`）で
   拾う（どちらも常に true）。差分が取れない・想定外のイベントは rust と同じく走らせる側。偽物で見る
   #2790 の段は外部に依らないので毎回走る。条件なしへ戻すと番犬 `issue2791_windows_agent_install_watchdog`
-  と `scripts/test-ci-change-scope-2084.sh` の F 節が落ちる
+  と `scripts/test-ci-change-scope-2084.sh` の F 節が落ちる。任意依存の winget の実走（#2433。
+  `scripts/windows/test-deps-install-2433.ps1 -Mode real`。psmux を入れ、Git を外して入れ直す）も同じ
+  `agent_install` に乗る（`setup_deps.rs` とその検査を `AGENT_INSTALL` に足した）。Git を外すので、PATH の git を
+  使う全数のテストの**後ろ**に置く。偽の winget で断りを見る `-Mode fake` は毎回走る（番犬 `issue2433_dep_privilege_watchdog`）
 - 検証は `bash scripts/test-ci-change-scope-2084.sh`（`changes` ジョブの最初のステップ。
   パスの境界・本物の git で作った merge コミット / 浅い clone / push の before・番犬の拾い方・
   ci.yml の配線・待ち側が本物の ci.yml から導く期待名・導入代行の実走の判定と配線（F 節）。

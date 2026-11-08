@@ -1085,12 +1085,14 @@ fn powershell_output_argv(program: &str, script: &str) -> SpawnCommand {
 ///    出るので、**どのゲートの evidence にも数百バイトの XML が混ざる**
 ///    （実機実測: `$ProgressPreference` 未指定で stderr 400 バイト → 指定すると **0 バイト**）
 ///
-/// **既知の限界**: 上の 3 でも消えないのは **cmdlet のエラーレコード**（実機実測:
-/// `Get-Item` の失敗が CLIXML 632 バイト）と `Write-Host` の情報レコード（1078 バイト）。
-/// 5.1 にこの直列化を止める手段は無い。判定そのものは終了コードで決まるので**合否は
-/// 正しい**が、evidence は読みにくくなる。ネイティブコマンド（`cargo` / `git` / `gh`）は
-/// 失敗時も stderr が素のテキストなので（実機実測: `cmd /c exit 7` で stderr 0 バイト・
-/// exit 7）、ゲートの述語は**ネイティブコマンドで書くのが望ましい**
+/// 上の 3 でも消えないのは **cmdlet のエラーレコード**（実機実測: `Get-Item` の失敗が CLIXML
+/// 632 バイト）と `Write-Host` の情報レコード（1078 バイト）。5.1 にこの直列化を止める手段は無い
+/// （`-OutputFormat Text` も見ない = #2790 で Windows の CI が実測）。この argv は `-OutputFormat Text` を
+/// 付けないので pwsh 7 も同じく CLIXML で書く（#2800 の CI で実測）。#2800 からは捕捉した側
+/// （`acceptance_gates::format_evidence`）が [`powershell_stderr_text`] で平文へ戻してから evidence へ
+/// 載せる（導入代行と同じ 1 実装。版に依らない）。情報レコードは平文化が捨てるが、`Write-Host` の文字は
+/// stdout にも出る（#2800 の CI で 5.1 / pwsh 7 とも実測）。判定は終了コードで決まるので、平文化の
+/// 前後で合否は変わらない
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_output_script(command: &str) -> String {
     format!(
@@ -1132,9 +1134,10 @@ fn build_output_command(spawn: &SpawnCommand) -> std::process::Command {
 ///   （PowerShell のソース `ConsoleHost.ErrorFormat` の条件 `!OutputFormatSpecified && !IsInteractive &&
 ///   Console.IsErrorRedirected && _wasInitialCommandEncoded`）。pwsh 7 はこれで平文に戻る（7.6 で実測）が、
 ///   **Windows PowerShell 5.1 は指定を見ずに CLIXML のまま**（Windows の CI で実測。#935 の
-///   `powershell_output_script` の「既知の限界」と同じ）。そこで起動片は自分のエラーを host を通さずに
-///   平文で書き（[`powershell_script_text_command`]）、捕捉した stderr に残る CLIXML（進捗・インストーラ自身の
-///   警告やエラー）は呼び手が [`powershell_stderr_text`] で平文へ戻す
+///   `powershell_output_script` と同じで、ゲートの evidence も #2800 から同じ平文化を通す）。そこで
+///   起動片は自分のエラーを host を通さずに平文で書き（[`powershell_script_text_command`]）、捕捉した
+///   stderr に残る CLIXML（進捗・インストーラ自身の警告やエラー）は呼び手が [`powershell_stderr_text`] で
+///   平文へ戻す
 /// - `-NoLogo -NoProfile` は #2790 より前と同じ（利用者の profile を挟まない）
 ///
 /// 本文は [`powershell_script_text_command`]
@@ -1195,6 +1198,9 @@ pub fn powershell_script_text_command_in(script: &std::path::Path, legacy_2791: 
     )
 }
 
+/// PowerShell が CLIXML で書く stderr の見出しの行（[`powershell_stderr_text`] はこれの有無で平文化するかを決める）
+pub const POWERSHELL_CLIXML_MARK: &str = "#< CLIXML";
+
 /// PowerShell が CLIXML で書いた stderr を、人が読む平文へ戻す（純粋関数。#2790）。
 ///
 /// `-EncodedCommand` で起こした Windows PowerShell 5.1 は、stderr がリダイレクトされていると進捗・警告・
@@ -1207,8 +1213,11 @@ pub fn powershell_script_text_command_in(script: &std::path::Path, legacy_2791: 
 ///   `WARNING: ` 等の前置き）。進捗（`<Obj S="progress">`）は捨てる
 /// - 文字は XML の実体参照と PowerShell の `_xHHHH_`（UTF-16 の 1 単位）を戻し、改行は LF へ揃える
 /// - `#< CLIXML` を含まない入力（bash のインストーラ・pwsh 7 の平文）は借用のまま返す
+///
+/// 呼び手は 2 つ: 導入代行（`setup_bootstrap::run_installer`）と受け入れゲートの evidence（#2800。
+/// `acceptance_gates::format_evidence`）
 pub fn powershell_stderr_text(raw: &str) -> std::borrow::Cow<'_, str> {
-    const MARK: &str = "#< CLIXML";
+    const MARK: &str = POWERSHELL_CLIXML_MARK;
     if !raw.contains(MARK) {
         return std::borrow::Cow::Borrowed(raw);
     }

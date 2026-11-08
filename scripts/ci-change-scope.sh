@@ -17,6 +17,7 @@
 # 導入代行の実走（agent_install。#2791）:
 #   Windows ジョブの「codex / agy の導入代行の実走検査」は外部（chatgpt.com / antigravity.google）から
 #   本物の install.ps1 と本体を取ってくるので、毎回走らせると外部の障害・遅延で関係の無い PR まで赤になる。
+#   「任意依存の導入代行の実走検査」（#2433。winget の取得元・GitHub Releases から psmux / Git を取る）も同じ判定に乗る。
 #   変更されたパスが**どれか 1 つでも** AGENT_INSTALL に当たるときだけ agent_install=true。
 #   定期実行（schedule）と手動実行（workflow_dispatch）は上流の install.ps1 の形の変化を拾うため常に true。
 #   差分が空・取れない・想定外のイベントも true（走らせる側へ倒す。rust と同じ）
@@ -48,13 +49,15 @@ RUST_REQUIRED=(
   'docs/scripts/support-pages.mjs|対応状況ページの写しの書式と分類（gen-*-docs.mjs --check がこれで写しを作り直して突き合わせる）'
 )
 
-# 変えたら Windows で本物の install.ps1 を走らせるパス（`パターン|理由`。#2791）。
+# 変えたら Windows で本物の install.ps1 / winget を走らせるパス（`パターン|理由`。#2791 / #2433）。
 # 外部から取る実走は、導入代行の経路そのもの・それを走らせる検査・この判定を変えたときだけ回す
 AGENT_INSTALL=(
   'crates/tako-core/src/platform/agent_install.rs|導入の手順（取得元・置き場・代行の可否・起こし方）'
   'crates/tako-core/src/platform/shell.rs|install.ps1 を走らせる起動片（powershell_script_text_args）'
   'crates/tako-control/src/setup_bootstrap.rs|取得・実行・導入後の status（install_for / status_for）'
   'crates/tako-control/src/setup_refusal.rs|実走の検査が突き合わせる断りの文'
+  'crates/tako-control/src/setup_deps.rs|任意依存の導入（winget の起こし方・権限の宣言・導入後の status。#2433）'
+  'scripts/windows/test-deps-install-2433.ps1|任意依存の実走の検査そのもの（#2433）'
   'crates/tako-core/tests/issue2791_agent_install_windows.rs|実走の段が同じポリシーの下で回す偽物の検査'
   'scripts/windows/test-agent-install-2791.ps1|実走の検査そのもの'
   'scripts/windows/lib/execution-policy.ps1|実走の検査が置くポリシーの 1 実装'

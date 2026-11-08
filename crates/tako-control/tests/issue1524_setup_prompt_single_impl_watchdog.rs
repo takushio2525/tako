@@ -62,8 +62,9 @@ const ALLOWED_DIRECT: &[(&str, &str, &str)] = &[
     ),
     (
         "crates/tako-control/src/dispatch.rs",
-        "dispatch_inner",
-        "MCP `tako_setup_deps`（非対話）。端末が無いので確認のしようがない",
+        "setup_deps_reply",
+        "MCP `tako_setup_deps`（非対話）。端末が無いので確認のしようがない（同意は呼び手の `consent` = #2433）。\
+         #2433 で同期の腕と background の腕（`OffloadJob::SetupDeps`）が通る 1 関数へ寄せた",
     ),
 ];
 
@@ -248,10 +249,12 @@ fn issue1524_導入の直呼びは名指しの経路だけ() {
             &rel,
             // `install_typed` は `install` の型の口（断りを表示言語で返す dispatch が使う。#2365）=
             // 同じ導入の 1 実装なので、直呼びの棚卸しも同じ許可リストで見る
+            // `install_in` は検出済みの状態を受ける口（CLI が同意の確認に使った検出を使い回す。#2433）
             &[
                 DIRECT_INSTALL,
                 "crate::setup_deps::install(",
                 "setup_deps::install_typed(",
+                "setup_deps::install_in(",
             ],
             ALLOWED_DIRECT,
         ));

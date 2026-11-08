@@ -16,6 +16,7 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use tako_control::protocol::Request;
 use tako_control::settings::{self, Settings};
+use tako_control::setup_deps::DepView;
 use tako_core::theme::{Rgb, Theme};
 
 use crate::file_icons::ui_icon;
@@ -178,6 +179,22 @@ struct StatusCache {
     sleep: Option<serde_json::Value>,
     /// エージェント CLI の検出結果（名前, 導入済み）。background で取得する
     agents: Option<Vec<(String, bool)>>,
+    /// 任意の依存ツールの検出結果（#2433。`tako setup deps` の `deps` と同じ配列）。background で取得する
+    deps: Option<serde_json::Value>,
+}
+
+/// 検証のプロセスだけ: 依存の一覧を `TAKO_2433_DEPS_FIXTURE=<JSON の配列のファイル>` で差し替える（#2433）。
+/// macOS の上で Windows の腕（UAC の出るボタン）を描いて確かめるための口で、本番の GUI では読まない
+/// （門は `tako_core::paths::is_verification_process`）
+fn deps_fixture() -> Option<serde_json::Value> {
+    if !tako_core::paths::is_verification_process() {
+        return None;
+    }
+    let path = std::env::var_os("TAKO_2433_DEPS_FIXTURE")?;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .filter(serde_json::Value::is_array)
 }
 
 /// 実測矩形の記録（キー, 矩形）
@@ -227,6 +244,11 @@ pub struct SettingsWindow {
     remote_status_seq: u64,
     /// その読み直しを background で待っている間（#2630。初めて開いたときは「読み込み中…」を出す）
     remote_status_pending: bool,
+    /// 依存ツールを background で導入している間の名前（#2433。押し直しを無視し、ボタンを「導入中…」にする）
+    deps_busy: Option<String>,
+    /// 依存の一覧の読み直しの番号（#2433）。background の答えは最後に頼んだものだけを映す
+    /// （先に頼んだ古い答えが後から着いて上書きしない。リモートタブの #2630 と同じ形）
+    deps_seq: u64,
     status: StatusCache,
     /// Code Runner 新規追加行の確定前バッファ
     runner_new_ext: String,
@@ -279,6 +301,8 @@ impl SettingsWindow {
             remote_busy: None,
             remote_status_seq: 0,
             remote_status_pending: false,
+            deps_busy: None,
+            deps_seq: 0,
             status: StatusCache::default(),
             runner_new_ext: String::new(),
             runner_new_cmd: String::new(),
@@ -536,6 +560,7 @@ impl SettingsWindow {
                 );
                 self.status.changes = self.query(Request::SetupChanges, cx);
                 self.refresh_agent_clis(cx);
+                self.refresh_deps(cx);
             }
             SettingsTab::Sleep => {
                 self.status.sleep = self.query(
@@ -574,6 +599,106 @@ impl SettingsWindow {
     /// 解決は境界 B16（[`tako_core::platform::exe::find`]）。**`which` を起こしてはいけない**
     /// （#898）: Windows に `which` は無いので、claude / codex / agy を導入済みでも
     /// 設定画面が「未検出」と表示していた
+    /// 要求を IPC の受け口と同じ `prepare_offload` → background → 着地で通し、答えを `done` へ渡す（#2433）。
+    /// background へ出さない形（A/B の `TAKO_2433_LEGACY=1` 等）は従来どおり同期で dispatch する
+    fn dispatch_off_ui(
+        &mut self,
+        request: Request,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, Result<serde_json::Value, String>, &mut Context<Self>) + 'static,
+    ) {
+        let Some(app) = self.tako_app.upgrade() else {
+            done(self, Err(txt::error_app_gone().to_string()), cx);
+            return;
+        };
+        let prepared = app.update(cx, |app, _| tako_control::prepare_offload(app, &request));
+        let job = match prepared {
+            None => {
+                let result = self.dispatch(request, cx);
+                done(self, result, cx);
+                return;
+            }
+            Some(Err(e)) => {
+                done(self, Err(e.to_string()), cx);
+                return;
+            }
+            Some(Ok(job)) => job,
+        };
+        let weak_app = self.tako_app.clone();
+        let staged = cx
+            .background_executor()
+            .spawn(async move { job.run_staged() });
+        cx.spawn(async move |this, cx| {
+            let outcome = staged.await;
+            let origin = tako_core::pane::PaneOrigin::User;
+            let result = crate::drive_offload(weak_app, outcome, origin, cx)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                done(this, result, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 任意の依存ツールの一覧を読み直す（#2433。`tako setup deps` / MCP `tako_setup_deps` と同じ dispatch。
+    /// 検出は unix でログインシェルを起こすので background で読む）
+    fn refresh_deps(&mut self, cx: &mut Context<Self>) {
+        self.deps_seq += 1;
+        let seq = self.deps_seq;
+        // 検証のプロセスだけ: 一覧を JSON のファイルで差し替える（macOS の上で Windows の腕の行を描く。#2433）
+        if let Some(fixture) = deps_fixture() {
+            self.status.deps = Some(fixture);
+            return;
+        }
+        let request = Request::SetupDeps {
+            action: Some("status".into()),
+            dep: None,
+            dry_run: None,
+            consent: None,
+        };
+        self.dispatch_off_ui(request, cx, move |this, result, _cx| {
+            if this.deps_seq == seq {
+                this.status.deps = result.ok().map(|v| v["deps"].clone());
+            }
+        });
+    }
+
+    /// 依存ツール 1 件を入れる（#2433）。CLI `tako setup deps install --dep <名前>` / MCP `tako_setup_deps`
+    /// と同じ dispatch。**押下が同意**なので、UAC の出るものは consent=true で送る（ボタン 1 つ）
+    fn install_dep(&mut self, bin: String, elevated: bool, cx: &mut Context<Self>) {
+        if self.deps_busy.is_some() {
+            return;
+        }
+        self.deps_busy = Some(bin.clone());
+        self.message = None;
+        cx.notify();
+        let request = Request::SetupDeps {
+            action: Some("install".into()),
+            dep: Some(bin.clone()),
+            dry_run: None,
+            consent: Some(elevated),
+        };
+        self.dispatch_off_ui(request, cx, move |this, result, cx| {
+            this.deps_busy = None;
+            this.message = Some(match result {
+                Ok(value) => {
+                    // 入れずに終わった（導入済み・手段が無い）なら理由をそのまま出す
+                    match value["skipped"].as_array().and_then(|a| a.first()) {
+                        Some(skip) => (
+                            skip["detail"].as_str().unwrap_or_default().to_string(),
+                            skip["reason"] != "already_installed",
+                        ),
+                        None => (format!("{bin}: {}", txt::msg_dep_installed()), false),
+                    }
+                }
+                Err(e) => (e, true),
+            });
+            this.refresh_deps(cx);
+        });
+    }
+
     fn refresh_agent_clis(&mut self, cx: &mut Context<Self>) {
         let task = cx.background_executor().spawn(async move {
             ["claude", "codex", "agy"]
@@ -2604,6 +2729,81 @@ impl SettingsWindow {
 
     // --- セットアップタブ ---
 
+    /// 任意の依存ツールの行（#2433）。導入済みは緑のパス、入れられるものはボタン（UAC の出るものは
+    /// そう書いたボタン = 押下が同意）、手で入れるものは導入コマンド
+    fn render_deps_rows(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme();
+        let Some(deps) = self.status.deps.as_ref().and_then(|v| v.as_array()) else {
+            return div().child(
+                div()
+                    .text_color(to_hsla(theme.text_faint))
+                    .text_size(px(12.))
+                    .child(txt::msg_loading()),
+            );
+        };
+        let mut rows = div().flex().flex_col().gap(px(4.));
+        for dep in deps {
+            let bin = dep["bin"].as_str().unwrap_or("?").to_string();
+            let faint = |text: String| {
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_color(to_hsla(theme.text_faint))
+                    .text_size(px(12.))
+                    .child(text)
+            };
+            let state = match DepView::from_status(dep) {
+                DepView::Installed(path) => div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .text_color(to_hsla(theme.green))
+                    .text_size(px(12.))
+                    .child(format!("{}  {path}", txt::setup_installed())),
+                DepView::Unknown => faint(txt::setup_deps_unknown().to_string()),
+                DepView::Manual(command) => faint(command),
+                DepView::Install { .. } if self.deps_busy.as_deref() == Some(bin.as_str()) => div()
+                    .child(self.button(
+                        &format!("dep-{bin}"),
+                        txt::setup_deps_installing(),
+                        BtnKind::Disabled,
+                        |_, _, _| {},
+                    )),
+                DepView::Install { elevated } => {
+                    let label = if elevated {
+                        txt::setup_deps_install_uac()
+                    } else {
+                        txt::setup_deps_install()
+                    };
+                    let target = bin.clone();
+                    div().child(self.button(
+                        &format!("dep-{bin}"),
+                        label,
+                        BtnKind::Normal,
+                        cx.listener(move |this, _, _, cx| {
+                            this.install_dep(target.clone(), elevated, cx);
+                        }),
+                    ))
+                }
+            };
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(80.))
+                            .flex_none()
+                            .text_color(to_hsla(theme.foreground))
+                            .text_size(px(12.))
+                            .child(bin),
+                    )
+                    .child(state),
+            );
+        }
+        rows
+    }
+
     fn render_setup_tab(&self, cx: &mut Context<Self>) -> Div {
         let theme = self.theme();
 
@@ -2710,6 +2910,8 @@ impl SettingsWindow {
                     )),
             )
             .child(agents_rows)
+            .child(self.section(txt::setup_deps_header()))
+            .child(self.render_deps_rows(cx))
             .child(
                 div()
                     .pt_3()

@@ -66,20 +66,39 @@ fn request_block(source: &str, variant: &str) -> String {
     rest[..end].to_string()
 }
 
+/// `fn <name>(` の本体（次の行頭の `}` まで）を切り出す
+fn fn_block(source: &str, name: &str) -> String {
+    let needle = format!("fn {name}(");
+    let start = source
+        .find(&needle)
+        .unwrap_or_else(|| panic!("dispatch に fn {name} が無い"));
+    let rest = &source[start..];
+    let end = rest.find("\n}\n").map(|i| i + 2).unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// ツールごとの action のアームの置き場。SetupDeps は同期の腕と background の腕
+/// （`OffloadJob::SetupDeps`）が通る 1 関数 `setup_deps_reply` に置く（#2433）
+fn action_blocks(source: &str) -> [(&'static str, String); 2] {
+    [
+        (
+            "tako_setup_bootstrap",
+            request_block(source, "SetupBootstrap"),
+        ),
+        ("tako_setup_deps", fn_block(source, "setup_deps_reply")),
+    ]
+}
+
 #[test]
 fn setupツールが広告するactionはdispatchが受理する() {
     let source = dispatch_source();
-    for (tool, variant) in [
-        ("tako_setup_bootstrap", "SetupBootstrap"),
-        ("tako_setup_deps", "SetupDeps"),
-    ] {
-        let block = request_block(&source, variant);
+    for (tool, block) in action_blocks(&source) {
         for action in advertised_actions(tool) {
             let arm = format!("\"{action}\" =>");
             assert!(
                 block.contains(&arm),
                 "{tool} は action={action:?} を広告しているが dispatch の \
-                 Request::{variant} に {arm} が無い\n\
+                 アームに {arm} が無い\n\
                  → カタログとアームのどちらかが古い（#1057 でアームを消したまま \
                  コミットして踏んだ）"
             );
@@ -92,11 +111,7 @@ fn setupツールが広告するactionはdispatchが受理する() {
 #[test]
 fn dispatchが受理するactionはカタログに載っている() {
     let source = dispatch_source();
-    for (tool, variant) in [
-        ("tako_setup_bootstrap", "SetupBootstrap"),
-        ("tako_setup_deps", "SetupDeps"),
-    ] {
-        let block = request_block(&source, variant);
+    for (tool, block) in action_blocks(&source) {
         let advertised = advertised_actions(tool);
         // アームは `"<action>" =>` の形。`other =>` は網羅の受け皿なので対象外
         for line in block.lines() {
