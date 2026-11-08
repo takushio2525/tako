@@ -125,6 +125,12 @@ Windows では tmux の代わりに **psmux** が同じ役をします。psmux �
 			tools: ['tako_logs'],
 		},
 		{
+			kind: 'degraded',
+			title: '新しい会話が呼び戻しの一覧に載るまで',
+			text: 'psmux による永続化が有効（既定）なら、新しい会話は 1 分以内に `tako sessions` に載ります。永続化を切っていると、載せる手段が tako mod の報告だけになり、Windows の Claude Code で mod が動くかをまだ確かめていないため、新しく始めた会話が載らないことがあります。',
+			tools: ['tako_sessions'],
+		},
+		{
 			kind: 'pending',
 			title: '自分で作った tmux セッションの取り込み',
 			text: 'psmux では attach と寸法の指定を前提にする操作ができません。',

@@ -27,6 +27,8 @@
 //!    （相手が固まると setup の末尾ごと固まる = #1503 の規約）
 //! 6. [`打ち切りを未起動へ畳まない`] — `status --json` の打ち切りを「起動していません」と
 //!    言い切らない（#1503 の「打ち切ったら必ず知らせる」）
+//! 7. [`issue2768_使えないosではtailscaleを読む前に対応表のgateで返す`] — remote が使えない OS
+//!    （Windows は #971）で Tailscale を調べ `tako remote setup` を案内しない（#2768）
 //!
 //! 落ちるときは **file:line で名指し**する。状態ごとの字面は `remote_setup` の単体テスト
 //! （`状態ごとの1行を固定する`）、実経路（隔離 HOME + tailscale スタブで `--yes` / 非 TTY /
@@ -240,5 +242,49 @@ fn 打ち切りを未起動へ畳まない() {
     assert!(
         readiness.contains("status_timeouts(status)"),
         "{REMOTE_SETUP}:{base}: `phone_readiness` が打ち切りを見ていない（#1507）"
+    );
+}
+
+/// **7**: remote が使えない OS（対応表の `tako_remote_setup`。Windows は #971）では、末尾は
+/// Tailscale を読む前に対応表の gate で返す（#2768）。gate の判定そのものは `remote_setup` の単体
+/// （`issue2768_末尾の行はremoteが使えないosでは状態を読まずに使えないと言う`）が両 OS で見るので、
+/// ここは**配線**（呼ぶ・先に呼ぶ・OS を `cfg!` で見ない）だけを縛る
+#[test]
+fn issue2768_使えないosではtailscaleを読む前に対応表のgateで返す() {
+    let (summary, base) = fn_body(REMOTE_SETUP, "setup_summary_lines");
+    let gate = summary.find("platform_unsupported(").unwrap_or_else(|| {
+        panic!(
+            "{REMOTE_SETUP}:{base}: `setup_summary_lines` が `platform_unsupported` の gate を通っていない。\n\
+             remote が使えない OS で Tailscale を調べ `tako remote setup` を案内する形に戻る（#2768）"
+        )
+    });
+    for needle in [
+        "check_status_with(",
+        "check_status()",
+        "setup_deps::status_of(",
+    ] {
+        if let Some(at) = summary.find(needle) {
+            assert!(
+                gate < at,
+                "{REMOTE_SETUP}:{}: `setup_summary_lines` が gate より先に `{needle}` を呼んでいる。\n\
+                 使えない OS では Tailscale を読まずに返す（#2768）",
+                base + summary[..at].matches('\n').count()
+            );
+        }
+    }
+
+    let (decide, base) = fn_body(REMOTE_SETUP, "platform_unsupported");
+    assert!(
+        decide.contains("support_for(") && decide.contains("SUMMARY_SUPPORT_KEY"),
+        "{REMOTE_SETUP}:{base}: `platform_unsupported` が対応表（`support_for` + `SUMMARY_SUPPORT_KEY`）を\
+         引いていない（#2768）"
+    );
+    let mut offenders = hits(&decide, base, REMOTE_SETUP, "cfg!(");
+    offenders.extend(hits(&decide, base, REMOTE_SETUP, "#[cfg("));
+    assert!(
+        offenders.is_empty(),
+        "gate が OS を `cfg` で見ている:\n  {}\n\
+         → 対応表の判定だけで決める（使えると宣言した日に片方だけ残らない。#2768）",
+        offenders.join("\n  ")
     );
 }
