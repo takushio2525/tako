@@ -417,7 +417,7 @@ fn execute_command(cmd: &str, expect_exit_0: bool, cwd: Option<&str>) -> CheckRe
             };
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            let evidence = format_evidence(exit_code, &stdout, &stderr);
+            let evidence = format_evidence(exit_code, &stdout, &stderr, !legacy_2800());
             CheckResult { passed, evidence }
         }
         Err(e) => CheckResult {
@@ -425,6 +425,13 @@ fn execute_command(cmd: &str, expect_exit_0: bool, cwd: Option<&str>) -> CheckRe
             evidence: format!("コマンド実行に失敗: {e}"),
         },
     }
+}
+
+/// #2800 の A/B の env（`1` で捕捉した stderr を平文へ戻さずに evidence へ載せる = #2800 前の形）
+pub const ISSUE2800_LEGACY_ENV: &str = "TAKO_2800_LEGACY";
+
+fn legacy_2800() -> bool {
+    std::env::var_os(ISSUE2800_LEGACY_ENV).is_some()
 }
 
 /// PrMerged 述語の判定
@@ -489,8 +496,17 @@ fn check_pr_merged(pr_number: u32, repo: Option<&str>) -> CheckResult {
     }
 }
 
-/// コマンド出力を短縮して証拠にする
-fn format_evidence(exit_code: i32, stdout: &str, stderr: &str) -> String {
+/// コマンド出力を短縮して証拠にする。
+///
+/// `plain_stderr`（#2800）: stderr の CLIXML を平文へ戻して載せる。Windows の述語は境界 B1 が
+/// PowerShell へ `-EncodedCommand` で渡すので、stderr を捕捉すると Windows PowerShell 5.1 は cmdlet の
+/// エラーレコードを CLIXML（`#< CLIXML` + `<Objs …>`）で書く（`-OutputFormat Text` を付けても止まらない =
+/// #2790 で Windows の CI が実測）。この経路は `-OutputFormat Text` を付けないので **pwsh 7 も同じく
+/// CLIXML で書く**（#2800 の CI で実測）。#2800 より前はそれをそのまま載せていたので、失敗したゲートの
+/// 理由が XML の中に埋もれていた。平文化は導入代行（`setup_bootstrap::run_installer`）と同じ 1 実装
+/// （[`tako_core::platform::shell::powershell_stderr_text`]）で、順番は [`plain_stderr_window`] を参照。
+/// `false` は `TAKO_2800_LEGACY=1`（捕捉したまま載せる = #2800 前の形）
+fn format_evidence(exit_code: i32, stdout: &str, stderr: &str, plain_stderr: bool) -> String {
     let stdout_trimmed = stdout.trim();
     let stderr_trimmed = stderr.trim();
     let mut parts = vec![format!("exit {exit_code}")];
@@ -509,15 +525,22 @@ fn format_evidence(exit_code: i32, stdout: &str, stderr: &str) -> String {
     }
     if !stderr_trimmed.is_empty() {
         let lines: Vec<&str> = stderr_trimmed.lines().collect();
-        if lines.len() <= 5 {
-            parts.push(format!("stderr: {stderr_trimmed}"));
+        let (label, window) = if lines.len() <= 5 {
+            ("stderr".to_string(), stderr_trimmed.to_string())
         } else {
-            let last5: Vec<&str> = lines[lines.len() - 5..].to_vec();
-            parts.push(format!(
-                "stderr (last 5/{} lines): {}",
-                lines.len(),
-                last5.join("\n")
-            ));
+            (
+                format!("stderr (last 5/{} lines)", lines.len()),
+                lines[lines.len() - 5..].join("\n"),
+            )
+        };
+        let shown = if plain_stderr {
+            plain_stderr_window(stderr_trimmed, &window)
+        } else {
+            window
+        };
+        // 進捗のレコードだけの CLIXML（5.1 の「モジュールの初回の準備」）は平文にすると何も残らない
+        if !shown.is_empty() {
+            parts.push(format!("{label}: {shown}"));
         }
     }
     let joined = parts.join("; ");
@@ -528,6 +551,39 @@ fn format_evidence(exit_code: i32, stdout: &str, stderr: &str) -> String {
         )
     } else {
         joined
+    }
+}
+
+/// evidence に載せる stderr の範囲（`window`）を平文へ戻す（#2800）。`stderr` は捕捉した全体（trim 済み）。
+///
+/// **範囲は捕捉したままの行で選び、選んだ範囲を平文へ戻す**（逆にしない）。5.1 は stderr を
+/// 「`#< CLIXML` の見出し → ネイティブの子・`[Console]::Error` の素の行 → 終了時に `<Objs …>…</Objs>` の
+/// 1 行」の順に書く（#2790 の Windows の CI のログで実測）。エラーレコードは平文にすると 1 件で 6 行以上
+/// （本文 → `At line:` → `+ コード` → `+ ~~~` → `CategoryInfo` → `FullyQualifiedErrorId`）あり、本文は
+/// 先頭なので、平文にしてから末尾 5 行で切ると本文が落ちる。#2800 前は XML の 1 行に収まっていて
+/// 切られなかったので、範囲の選び方を変えずに XML だけを平文へ戻す。
+///
+/// 素の行が 4 行を超えると範囲が見出しより後ろから始まり、平文化の判定（見出しの有無）から外れるので
+/// 付け直す（見出しの行は平文化が消す）。CLIXML でない範囲は 1 バイトも変えない
+/// （POSIX の `sh -c`・ネイティブコマンドの stderr は #2800 前と同じ evidence になる）
+fn plain_stderr_window(stderr: &str, window: &str) -> String {
+    use tako_core::platform::shell::{powershell_stderr_text, POWERSHELL_CLIXML_MARK as MARK};
+    let headed;
+    let input = if stderr.contains(MARK) && !window.contains(MARK) {
+        headed = format!("{MARK}\n{window}");
+        headed.as_str()
+    } else {
+        window
+    };
+    match powershell_stderr_text(input) {
+        std::borrow::Cow::Borrowed(_) => window.to_string(),
+        // 平文化は塊の前後の改行を残すので、前後の空行だけを落とす（行頭の字下げは残す）
+        std::borrow::Cow::Owned(plain) => plain
+            .trim_end()
+            .lines()
+            .skip_while(|line| line.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -766,7 +822,7 @@ mod tests {
             .map(|i| format!("line {i}: {long_line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let evidence = format_evidence(0, &stdout, "");
+        let evidence = format_evidence(0, &stdout, "", true);
         assert!(evidence.len() <= 2100);
         assert!(evidence.contains("truncated") || evidence.contains("last 5/"));
     }
@@ -781,7 +837,7 @@ mod tests {
         // 上限をまたぐ位置に 3 バイト文字が並ぶよう、境界を 1 バイトずつ動かして総当たり
         for pad in 0..8 {
             let stdout = format!("{}{}", "x".repeat(pad), "あ".repeat(1200));
-            let evidence = format_evidence(0, &stdout, "");
+            let evidence = format_evidence(0, &stdout, "", true);
             assert!(
                 evidence.ends_with("...(truncated)"),
                 "pad={pad} で切り詰めが起きていない"
@@ -813,5 +869,151 @@ mod tests {
         let result = AcceptanceGateStore::load_from(&path);
         assert!(result.is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// ゲートの evidence の stderr の平文化（#2800）
+#[cfg(test)]
+mod tests_2800 {
+    use super::*;
+
+    /// 5.1 がゲートの述語（`Get-Item` の失敗）で書いた stderr の実物（PR #2807 の Windows の CI の
+    /// `TAKO2800_EVIDENCE_LEGACY arm=ps51 case=cmdlet` の行。置き場は架空のパス）。見出し → エラーの文が
+    /// 1 行ずつ `<S S="Error">`（CategoryInfo は幅で折り返して 2 つ）、最後に空白 1 文字の行。進捗は
+    /// `$ProgressPreference` で出ない
+    const PS51_GATE_CLIXML: &str = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><S S=\"Error\">Get-Item : Cannot find path 'C:\\tako-2800-no-such\\missing.txt' because it does not exist._x000D__x000A_</S><S S=\"Error\">At line:4 char:1_x000D__x000A_</S><S S=\"Error\">+ Get-Item -LiteralPath 'C:\\tako-2800-no-such\\missing.txt'_x000D__x000A_</S><S S=\"Error\">+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S=\"Error\">    + CategoryInfo          : ObjectNotFound: (C:\\tako-2800-no-such\\missing.txt:String) [Get-Item], ItemNotFoundExcept _x000D__x000A_</S><S S=\"Error\">   ion_x000D__x000A_</S><S S=\"Error\">    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand_x000D__x000A_</S><S S=\"Error\"> _x000D__x000A_</S></Objs>";
+
+    /// 1 件のエラーレコード（平文で 6 行）を `<S S="Error">` の並びにする
+    fn error_record(message: &str) -> String {
+        [
+            message,
+            "At line:4 char:1",
+            "+ Write-Error 'x'",
+            "+ ~~~~~~~~~~~~~~~",
+            "    + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException",
+            "    + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException",
+        ]
+        .iter()
+        .map(|line| format!("<S S=\"Error\">{line}_x000D__x000A_</S>"))
+        .collect()
+    }
+
+    fn assert_no_clixml(evidence: &str) {
+        for junk in [
+            "#< CLIXML",
+            "<Objs",
+            "<S S=",
+            "_x000D_",
+            "Preparing modules",
+        ] {
+            assert!(
+                !evidence.contains(junk),
+                "evidence に {junk} が残っている（#2800）: {evidence}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue2800_51のclixmlのstderrはevidenceで平文になる() {
+        let evidence = format_evidence(1, "", PS51_GATE_CLIXML, true);
+        assert_eq!(
+            evidence,
+            "exit 1; stderr: Get-Item : Cannot find path 'C:\\tako-2800-no-such\\missing.txt' because it does not exist.\n\
+             At line:4 char:1\n\
+             + Get-Item -LiteralPath 'C:\\tako-2800-no-such\\missing.txt'\n\
+             + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n    \
+             + CategoryInfo          : ObjectNotFound: (C:\\tako-2800-no-such\\missing.txt:String) [Get-Item], ItemNotFoundExcept \n   \
+             ion\n    \
+             + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand"
+        );
+        assert_no_clixml(&evidence);
+    }
+
+    /// A/B: `TAKO_2800_LEGACY=1` の形（捕捉したまま）は XML のまま載る = #2800 前の症状
+    #[test]
+    fn issue2800_legacyは捕捉したままのclixmlを載せる() {
+        let evidence = format_evidence(1, "", PS51_GATE_CLIXML, false);
+        assert!(
+            evidence.starts_with("exit 1; stderr: #< CLIXML\r\n<Objs Version="),
+            "{evidence}"
+        );
+    }
+
+    /// 範囲は捕捉したままの行で選んでから平文へ戻す。素の行が多く見出しが範囲の外へ出ても平文になり、
+    /// エラーレコードの先頭の本文は落ちない（平文にしてから末尾 5 行で切ると本文が落ちる）
+    #[test]
+    fn issue2800_素の行が多くてもエラーの本文を落とさない() {
+        let natives: String = (1..=6).map(|i| format!("native line {i}\r\n")).collect();
+        let stderr = format!(
+            "#< CLIXML\r\n{natives}<Objs Version=\"1.1.0.1\">{}</Objs>",
+            error_record("Write-Error 'x' : first message 2800")
+        );
+        let evidence = format_evidence(1, "", &stderr, true);
+        assert_eq!(
+            evidence,
+            "exit 1; stderr (last 5/8 lines): native line 3\nnative line 4\nnative line 5\nnative line 6\n\
+             Write-Error 'x' : first message 2800\n\
+             At line:4 char:1\n\
+             + Write-Error 'x'\n\
+             + ~~~~~~~~~~~~~~~\n    \
+             + CategoryInfo          : NotSpecified: (:) [Write-Error], WriteErrorException\n    \
+             + FullyQualifiedErrorId : Microsoft.PowerShell.Commands.WriteErrorException"
+        );
+        assert_no_clixml(&evidence);
+    }
+
+    /// 複数のエラーレコードは順に全部残す
+    #[test]
+    fn issue2800_複数のerrorレコードを順に残す() {
+        let stderr = format!(
+            "#< CLIXML\r\n<Objs Version=\"1.1.0.1\">{}{}</Objs>",
+            error_record("Write-Error 'x' : first error 2800"),
+            error_record("Write-Error 'x' : second error 2800"),
+        );
+        let evidence = format_evidence(1, "", &stderr, true);
+        assert_no_clixml(&evidence);
+        let first = evidence.find("first error 2800").expect("1 件目が無い");
+        let second = evidence.find("second error 2800").expect("2 件目が無い");
+        assert!(first < second, "{evidence}");
+        assert_eq!(evidence.matches("FullyQualifiedErrorId").count(), 2);
+    }
+
+    /// CLIXML でない stderr（POSIX の `sh -c`・ネイティブコマンド）は #2800 前と 1 バイトも変えない
+    #[test]
+    fn issue2800_clixmlでないstderrは変えない() {
+        let many: String = (1..=7).map(|i| format!("    indented {i}\r\n")).collect();
+        for stderr in [
+            "",
+            "   \n",
+            "error[E0425]: cannot find value `x`\n",
+            many.as_str(),
+            "日本語 <Objs><S S=\"Error\">見出しが無ければ触らない</S></Objs>",
+        ] {
+            assert_eq!(
+                format_evidence(3, "out", stderr, true),
+                format_evidence(3, "out", stderr, false),
+                "{stderr:?}"
+            );
+        }
+        assert_eq!(format_evidence(5, "", "", true), "exit 5");
+    }
+
+    /// 進捗のレコードだけの CLIXML（5.1 の成功時の「モジュールの初回の準備」）は stderr の欄を出さない
+    #[test]
+    fn issue2800_進捗だけのclixmlはstderrの欄を出さない() {
+        let stderr = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\"><Obj S=\"progress\" RefId=\"0\"><MS><PR N=\"Record\"><AV>Preparing modules for first use.</AV></PR></MS></Obj></Objs>";
+        assert_eq!(format_evidence(0, "ok", stderr, true), "exit 0; stdout: ok");
+        assert!(format_evidence(0, "ok", stderr, false).contains("stderr: #< CLIXML"));
+    }
+
+    /// 実際の述語の実行（境界 B1 の `sh -c`）から evidence まで平文化が通っている（配線の確かめ。
+    /// Windows の実物の 5.1 は `tests/issue2800_gate_clixml_windows.rs`）
+    #[cfg(unix)]
+    #[test]
+    fn issue2800_ゲートの実行は捕捉したclixmlを平文で残す() {
+        let cmd = "printf '%s\\n' '#< CLIXML' '<Objs Version=\"1.1.0.1\"><S S=\"Error\">gate wiring 2800_x000D__x000A_</S></Objs>' >&2; exit 1";
+        let r = execute_command(cmd, true, None);
+        assert!(!r.passed, "evidence: {}", r.evidence);
+        assert_eq!(r.evidence, "exit 1; stderr: gate wiring 2800");
     }
 }
