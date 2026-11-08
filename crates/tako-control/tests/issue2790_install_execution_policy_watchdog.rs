@@ -205,6 +205,9 @@ fn windows_steps() -> Vec<String> {
 
 const POLICY_SCRIPT: &str = "scripts/windows/test-install-execution-policy-2790.ps1";
 const POLICY_TEST: &str = "issue2790_install_execution_policy_windows";
+/// ポリシーの置き方・戻し方の 1 実装（#2791 で #2790 のスクリプトから出して共有した）
+const POLICY_LIB: &str = "scripts/windows/lib/execution-policy.ps1";
+const POLICY_LIB_DOT_SOURCE: &str = ". (Join-Path $PSScriptRoot 'lib/execution-policy.ps1')";
 
 #[test]
 fn issue2790_windowsのciがポリシーを強制した状態の実行検査を名指しで回す() {
@@ -235,17 +238,30 @@ fn issue2790_windowsのciがポリシーを強制した状態の実行検査を�
 
     let script = read(POLICY_SCRIPT);
     for needle in [
-        "SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell",
-        "SOFTWARE\\Policies\\Microsoft\\PowerShellCore",
+        POLICY_LIB_DOT_SOURCE,
         "Hive = 'HKLM'; Scope = 'MachinePolicy'; Value = 'AllSigned'",
         "Hive = 'HKCU'; Scope = 'UserPolicy'; Value = 'Restricted'",
-        "'EnableScripts'",
         POLICY_TEST,
         "TAKO_2790_POLICY",
     ] {
         assert!(
             script.contains(needle),
             "{POLICY_SCRIPT} に `{needle}` が無い（#2790）"
+        );
+    }
+    // 置き方・戻し方の 1 実装は lib（#2791 の実走の検査と共有）。5.1 と pwsh 7 の両方の置き場を書く
+    let lib = read(POLICY_LIB);
+    for needle in [
+        "SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell",
+        "SOFTWARE\\Policies\\Microsoft\\PowerShellCore",
+        "'EnableScripts'",
+        "function Set-Policy(",
+        "function Restore-Policy(",
+        "function Get-PolicySnapshot(",
+    ] {
+        assert!(
+            lib.contains(needle),
+            "{POLICY_LIB} に `{needle}` が無い（#2790 / #2791）"
         );
     }
     // 置いたポリシーは finally で戻し、テストは置く前に組む

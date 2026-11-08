@@ -20,7 +20,7 @@ tako setup bootstrap install --agent agy
 curl -fsSL https://antigravity.google/cli/install.sh | bash
 ```
 
-Windows の公式手順は `irm https://antigravity.google/cli/install.ps1 | iex` ですが、**Windows で tako が導入を代行できるのは claude だけ**です。agy は状態の確認と手順の案内までなので、表示されたコマンドをご自身で実行してください。
+Windows の公式手順は PowerShell で `irm https://antigravity.google/cli/install.ps1 | iex` です。Windows でも `tako setup` がこの公式インストーラを代わりに走らせます（管理者権限は使いません。macOS と同じく `tako setup bootstrap install --agent agy` でも入ります）。Windows では CI の使い捨て環境で本物のインストーラを走らせて確かめていますが、Windows の実機ではまだ確かめていません（[#2791](https://github.com/takushio2525/tako/issues/2791)）。
 
 単一バイナリなので本体は macOS では `~/.local/bin/agy` だけです（Windows は `%LOCALAPPDATA%\agy\bin`）。更新は agy が実行のたびに自分で行います。
 

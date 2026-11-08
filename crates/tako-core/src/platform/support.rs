@@ -253,11 +253,11 @@ pub mod notes {
         "Resolving and running declarations, extension defaults and project defaults and saving run configs work, but for Arduino sketches (.ino) the lookup of the arduino-cli bundled with Arduino IDE (%LOCALAPPDATA%\\Programs\\Arduino IDE\\… / %ProgramFiles%\\Arduino IDE\\…), upload ports (COM3 etc.) and selecting the board and port (arduino-cli board attach) have not been verified on real Windows (#1950 / #1952)",
     );
 
-    /// #1057。検出は両 OS で動くが、パッケージ導入の代行は brew（macOS）だけ
-    /// #989。3 系統とも `install.ps1` は実在するが、実機で通したのは claude だけ（#1057）
+    /// #989 / #1057 / #2791。3 系統とも公式の `install.ps1` で導入を代行する。claude は Windows 11 実機で、
+    /// codex / agy は Windows の CI のランナーで本物の `install.ps1` を走らせて確かめた（実機は未実測）
     pub const WIN_SETUP_BOOTSTRAP_AGENTS: Note = Note::new(
-        "3 系統とも状態照会と公式手順の案内はできるが、導入の実行代行は claude だけ（#1057 で実機実測）。codex / agy の install.ps1 は実在するが未実測なので代行せずコマンドを案内する（実行代行は #525 の範囲）",
-        "State checks and official-command guidance work for all three CLIs, but tako only runs the installer for you for claude (measured on real Windows in #1057). The codex / agy install.ps1 scripts exist but are unverified, so tako prints the command instead of running it (running it is tracked in #525)",
+        "3 系統とも公式の install.ps1 で導入を代行する（管理者権限は使わない）。claude は Windows 11 実機で実測（#1057）、codex / agy は Windows の CI のランナーで公式の install.ps1 を実際に走らせて確かめたが、Windows 実機では未実測（#2791）",
+        "tako runs the official install.ps1 for all three CLIs (no administrator rights). claude was measured on real Windows 11 (#1057); codex / agy were verified by running the official install.ps1 on Windows CI runners but have not been measured on real Windows hardware (#2791)",
     );
 
     pub const WIN_SETUP_DEPS: Note = Note::new(
@@ -1700,13 +1700,14 @@ pub const MATRIX: &[Feature] = &[
         key: "tako_setup_bootstrap",
         macos: Support::Supported,
         // #1057 で claude の実行代行（install / path）を Windows へ配線し実機で通した。
-        // #989 で対象が 3 系統になったが、codex / agy の Windows は未実測なので
-        // 代行せず案内まで = 全体としては Degraded（過大申告しない）
+        // #2791 で codex / agy も代行へ倒した（install.ps1 はユーザー権限だけで入る）が、確かめたのは
+        // Windows の CI のランナー（使い捨て）だけで実機では未実測 = 全体としては Degraded（過大申告しない。
+        // tako_update の #2434 と同じ扱い）
         windows: Support::Degraded {
             note: notes::WIN_SETUP_BOOTSTRAP_AGENTS,
         },
         windows_evidence: Evidence::Measured(
-            "#1057 の Windows 11 実測: 隔離 USERPROFILE + PATH 剥ぎで `tako setup` が install（install.ps1 を -ExecutionPolicy Bypass -File で実行）→ path（ユーザー環境変数 Path へ追記・undo-path で完全復帰）→ auth 誘導 まで到達。2 回目は無言で素通り。#989 で足した codex / agy は recipe の tako_can_run=false（状態照会・PATH・認証誘導は動くが install は代行しない）。#2790 で install の起こし方を、本文をテキストで読む -EncodedCommand（実行ポリシーの対象外）へ替えた。新しい形は Windows の CI でグループポリシー（HKLM AllSigned / HKCU Restricted）を置き、偽の install.ps1 で確かめた（実機では未実測）",
+            "#1057 の Windows 11 実測: 隔離 USERPROFILE + PATH 剥ぎで `tako setup` が install（install.ps1 を -ExecutionPolicy Bypass -File で実行）→ path（ユーザー環境変数 Path へ追記・undo-path で完全復帰）→ auth 誘導 まで到達。2 回目は無言で素通り。#2790 で install の起こし方を、本文をテキストで読む -EncodedCommand（実行ポリシーの対象外）へ替えた。新しい形は Windows の CI でグループポリシー（HKLM AllSigned / HKCU Restricted）を置き、偽の install.ps1 で確かめた。#2791 で codex / agy も代行へ倒し、Windows の CI のランナーで `tako setup bootstrap install --agent codex|agy` が公式の install.ps1 を実際に走らせ、status が導入済みを返すことを、ポリシーなし・HKCU Restricted・HKLM AllSigned の 3 通りで確かめた（起動片は #2791 からドットソース。実機では未実測）",
         ),
     },
     Feature {

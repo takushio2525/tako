@@ -1335,8 +1335,9 @@ pub const MATRIX: &[AgentFeature] = &[
         evidence: AgentEvidence::Measured(
             "#989: platform/agent_install.rs の recipe() が 3 系統 × 2 プラットフォームぶんの \
              公式手順を持ち、まっさら HOME + PATH 剥ぎで 3 系統とも \
-             `tako setup bootstrap install` が通る（実測）。**Windows の実行代行は claude だけ** \
-             （codex / agy は can_run=false = 状態照会と案内まで。#525）",
+             `tako setup bootstrap install` が通る（実測）。#2791 で Windows も 3 系統とも \
+             公式の install.ps1 で代行する（codex / agy は Windows の CI のランナーで実走。\
+             Windows 実機は claude だけ = platform::support の tako_setup_bootstrap）",
         ),
     },
     AgentFeature {

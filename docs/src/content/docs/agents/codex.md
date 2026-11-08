@@ -20,7 +20,7 @@ tako setup bootstrap install --agent codex
 curl -fsSL https://chatgpt.com/codex/install.sh | sh
 ```
 
-Windows の公式手順は `irm https://chatgpt.com/codex/install.ps1 | iex` ですが、**Windows で tako が導入を代行できるのは claude だけ**です。codex は状態の確認と手順の案内までなので、表示されたコマンドをご自身で実行してください。
+Windows の公式手順は PowerShell で `irm https://chatgpt.com/codex/install.ps1 | iex` です。Windows でも `tako setup` がこの公式インストーラを代わりに走らせます（管理者権限は使いません。macOS と同じく `tako setup bootstrap install --agent codex` でも入ります）。Windows では CI の使い捨て環境で本物のインストーラを走らせて確かめていますが、Windows の実機ではまだ確かめていません（[#2791](https://github.com/takushio2525/tako/issues/2791)）。
 
 本体は macOS では `~/.local/bin/codex` に置かれます（Windows は `%LOCALAPPDATA%\Programs\OpenAI\Codex\bin`）。claude と違って背景更新はしません。新しい版が出ると codex 自身が知らせるので、`codex update` で更新してください。
 

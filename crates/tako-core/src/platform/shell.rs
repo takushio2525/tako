@@ -1116,9 +1116,10 @@ fn build_output_command(spawn: &SpawnCommand) -> std::process::Command {
 /// 取得したインストーラ（`install.ps1`）の起こし方の正本で、`agent_install::InterpreterSpec::args_for`
 /// がここを通す（codex / agy の代行 = #2791 も同じ口を呼ぶ）。
 ///
-/// - **スクリプトファイルを実行しない**: 実行ポリシーが止めるのはスクリプトファイル（`-File`・ドット
-///   ソース・パスの呼び出し）で、コマンドとして渡した文字列は対象外。本文はテキストで読み、
-///   `[scriptblock]::Create` で走らせる（シェル統合 #2432 の `powershell_bootstrap` と同じ手）。
+/// - **スクリプトファイルを実行しない**: 実行ポリシーが止めるのはスクリプトファイル（`-File`・ファイルの
+///   ドットソース・パスの呼び出し）で、コマンドとして渡した文字列は対象外。本文はテキストで読み、
+///   `[scriptblock]::Create` で組んだ scriptblock を走らせる（シェル統合 #2432 の `powershell_bootstrap` と同じ手。
+///   scriptblock のドットソースはファイルを読まないので対象外のまま）。
 ///   #2790 より前の `-ExecutionPolicy Bypass -File` は Process スコープの指定なので、グループポリシー
 ///   （MachinePolicy / UserPolicy）で AllSigned / Restricted を強制した管理端末では負ける
 /// - **本文は argv に載せない**: `-EncodedCommand` に載せるのは読み込みの起動片だけで、長さは
@@ -1159,23 +1160,36 @@ pub fn powershell_script_text_args(script: &std::path::Path) -> Vec<String> {
 /// | 捕まえない終端エラー | 1 | 1（エラーレコードを `Out-String` で整形して stderr へ） |
 /// | 最後まで走った | 0 | 0 |
 ///
-/// - **子スコープ（`&`）で走らせる**: `-File` と同じく、スクリプトが立てる `Set-StrictMode` や
-///   `$ErrorActionPreference` を起動片の側へ漏らさない。シェル統合（#2432）がドットソース（`.`）なのは
-///   関数をペインのセッションへ残すためで、ここでは要らない
-/// - **起動片は `$ErrorActionPreference` を書き換えない**（子スコープが受け継ぐので、スクリプトから見える
-///   既定値が `-File` のときと変わる）
+/// - **ドットソース（`.`）で走らせる**（#2791）: スクリプトの最上位の変数と `$script:` の変数が同じ 1 つの
+///   スコープを指すのは `-File`（スクリプトのスコープ）と公式の `irm … | iex`（今のスコープ）で、子スコープ
+///   （`&`。#2790 の初版）だけが別になる。agy の `install.ps1` は関数の中で `$script:stagingPayload` へ書き、
+///   最上位の `finally` で素の `$stagingPayload` を読んで取得物を片付けるので、子スコープでは片付けが飛ぶ
+///   （pwsh 7.6 で実測。codex の `$script:guardRejected` も同じ形）。スクリプトが立てる `Set-StrictMode` /
+///   `$ErrorActionPreference` は起動片の側にも効くが、起動片の残りは `catch` の 1 文と `exit` だけで、
+///   どちらもその下で同じに動く（終了コードの表は Windows の CI で `-File` と突き合わせる）。
+///   旧形（`&`）は [`powershell_script_text_command_in`] の `legacy_2791` で組める（比較のためだけ）
+/// - **起動片は `$ErrorActionPreference` を書き換えない**（スクリプトから見える既定値が `-File` のときと変わる）
 /// - 読み込みは `ReadAllText` = BOM が無ければ UTF-8。`-File` の Windows PowerShell 5.1 は BOM の無い
 ///   ファイルを ANSI コードページで読むので、非 ASCII を含むスクリプト（codex の `install.ps1` は
 ///   BOM が無く非 ASCII が 1,596 バイト）はこちらの方が化けない
 /// - スクリプトのパスを持たない（`$PSCommandPath` が空）のは公式の `irm … | iex` と同じ
 /// - **捕まえたエラーは host を通さずに書く**（`[Console]::Error`）。`Write-Error -ErrorRecord $_` で
-///   書き直すと、5.1 は起動片の全文を「コマンド」として前に付け（`try { & ([scriptblock]… : <本文>`）、
+///   書き直すと、5.1 は起動片の全文を「コマンド」として前に付け（`try { . ([scriptblock]… : <本文>`）、
 ///   stderr のリダイレクト時は CLIXML にもなる（Windows の CI で実測）。`$_ | Out-String` は元のエラーの
 ///   位置（インストーラの何行目か）と本文を `-File` のときと同じ形に整える
 pub fn powershell_script_text_command(script: &std::path::Path) -> String {
+    powershell_script_text_command_in(script, false)
+}
+
+/// [`powershell_script_text_command`] の旧形も組める版（`legacy_2791` = #2791 より前の子スコープ `&`）。
+///
+/// 製品は旧形を使わない（Windows の CI の `issue2791_agent_install_windows` が「子スコープでは agy の
+/// 取得物の片付けが飛ぶ」を同じ偽物で示すためだけに残す）
+pub fn powershell_script_text_command_in(script: &std::path::Path, legacy_2791: bool) -> String {
     let path = crate::shell_integration::powershell_ascii_literal(&script.display().to_string());
+    let call = if legacy_2791 { '&' } else { '.' };
     format!(
-        "try {{ & ([scriptblock]::Create([System.IO.File]::ReadAllText({path}))) }}\n\
+        "try {{ {call} ([scriptblock]::Create([System.IO.File]::ReadAllText({path}))) }}\n\
          catch {{ [Console]::Error.WriteLine(($_ | Out-String).TrimEnd()); exit 1 }}\n\
          exit 0\n"
     )

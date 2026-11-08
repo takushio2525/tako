@@ -263,7 +263,7 @@ tako setup bootstrap handoff                  # 別のエージェントへ導�
 
 Windows では、ユーザー環境変数 `Path` の変更は**すでに開いているタブには届きません**。tako の新しいタブはユーザー環境変数を読み直してから起動するので、セットアップのあとは **tako で新しいタブを開けば**、tako を再起動しなくてもそのまま使えます。`tako setup` もこの状態を見分けて「新しいタブを開いてから打ってください」と案内します（`tako setup bootstrap status --json` では `needs_new_tab` が `true` になります）。
 
-**Windows で tako が実際にインストーラを走らせるのは `claude` だけ**です。`codex` / `agy` は状態の確認と公式コマンドの案内までで、実行は行いません（Windows 実機での確認が済んでいないためです）。表示される公式コマンドをご自身で実行すれば、そのあとの PATH 通しと状態確認は tako が引き継げます。詳しくは [Windows 対応状況](/windows-support/) をご覧ください。
+Windows でも tako は 3 つとも公式のインストーラ（PowerShell の `install.ps1`）を代わりに走らせます。管理者権限は使わず、会社や学校の PC で実行ポリシーが強制されていても止まりません。`claude` は Windows の実機で、`codex` / `agy` は CI の使い捨ての Windows で本物のインストーラを走らせて確かめています（`codex` / `agy` の Windows 実機での確認はまだです）。詳しくは [Windows 対応状況](/windows-support/) をご覧ください。
 
 :::note[うまく入らないときは別のエージェントに頼めます]
 ネットワークやプロキシの都合でインストーラが動かないことがあります。そのとき**入れようとしている系統以外**がすでに入っていれば、`tako setup` はそのエージェントへ「これを入れて」と頼むことを提案します（`tako setup bootstrap handoff` でも同じことができます）。1 つも入っていなければ、自分で実行するコマンドを表示して終わります。

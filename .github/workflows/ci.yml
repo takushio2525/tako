@@ -10,12 +10,21 @@
 # 噛み合わないので、`if:` で skip を「成功」として残す。docs の検査は `docs`（毎回・ubuntu）、
 # docs / .agent を読む Rust の番犬は `docs-watchdogs`（毎回・ubuntu）が受け持つ。
 # 仕組みと判定の境界は .agent/conventions.md「docs だけの変更で Rust の重いジョブを skip する」
+#
+# Windows ジョブの「codex / agy の導入代行の実走検査（#2791）」は外部から本物の install.ps1 と本体を
+# 取ってくるので、導入代行に関わるパスを変えたとき（`changes` の agent_install）と、定期実行・手動実行で
+# だけ走らせる（外部の障害・遅延で関係の無い PR まで赤にしない。上流の形の変化は定期実行で拾う）
 name: CI
 
 on:
   push:
     branches: [main]
   pull_request:
+  # 週 1 回（月曜 03:17 JST）。上流の install.ps1 の形の変化を拾う（#2791）。macOS ジョブは回さない
+  schedule:
+    - cron: '17 18 * * 0'
+  # 手動実行（上流の install.ps1 を今すぐ確かめたいとき。全部走らせる）
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,6 +41,8 @@ jobs:
     timeout-minutes: 10
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
+      # 導入代行に関わるパスを変えたか（定期・手動実行では常に true）。判定の型は ci-change-scope.sh の AGENT_INSTALL（#2791）
+      agent_install: ${{ steps.scope.outputs.agent_install }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -164,7 +175,8 @@ jobs:
   macos:
     name: macOS（build + lint + test）
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    # 定期実行（#2791 の上流の install.ps1 の確かめ）では回さない。macOS の列を週 1 で 1 時間ふさがない
+    if: needs.changes.outputs.rust == 'true' && github.event_name != 'schedule'
     runs-on: macos-latest
     # 60 分では足りない（10/27: main でも 37〜54 分。PR の CI が重なるとビルドが 10 → 20 分に延びて
     # 2 本続けて 60 分で打ち切られた）。Windows ジョブと同じ 90 分にする
@@ -630,6 +642,20 @@ jobs:
       - name: 実行ポリシーを強制した PC での導入代行の起こし方の実行検査（#2790。HKLM AllSigned / HKCU Restricted）
         shell: pwsh
         run: pwsh -File scripts/windows/test-install-execution-policy-2790.ps1
+      # #2791: Windows の codex / agy の導入代行を、公式の install.ps1 を本当に走らせて確かめる（製品の口
+      # `tako setup bootstrap install --agent codex|agy` = MCP tako_setup_bootstrap と同じ経路）。導入の前後の
+      # status・入った置き場・agy の取得物が残らない（起動片のスコープ）を、ポリシーなし / HKCU Restricted /
+      # HKLM AllSigned の 3 通りで見る。ポリシーなしの回は A/B（TAKO_2791_LEGACY=1 は断る）・既に入っている・
+      # 導入元に届かない・途中で失敗する・npm が無いも見る。USERPROFILE / LOCALAPPDATA ほかは砂場、ユーザー環境変数
+      # Path とポリシーは finally で戻す。全数より手前に名指しで置く（#1282 / #2790 と同じ理由）。
+      # **外部（chatgpt.com / antigravity.google）から取るので、導入代行に関わるパスを変えた PR・main への push と
+      # 定期実行・手動実行でだけ走らせる**（`changes` の agent_install。条件なしで毎回走る形へ戻すと番犬
+      # issue2791_windows_agent_install_watchdog が落ちる）。偽物で見る上の #2790 の段は外部に依らないので毎回走る。
+      # **Windows の codex / agy が案内止まりへ戻る・起動片が子スコープへ戻る・install.ps1 の形が変わって入らなくなったらここで落ちる**
+      - name: codex / agy の導入代行の実走検査（#2791。公式の install.ps1・ポリシー 3 通り）
+        if: needs.changes.outputs.agent_install == 'true'
+        shell: pwsh
+        run: pwsh -File scripts/windows/test-agent-install-2791.ps1
       # **ワークスペース全体のテストを blocking にする**（#1278 / #583）。
       # #583 は「POSIX 前提の既存失敗が残っているあいだ非ブロッキング」で据え置いていたが、
       # そのあいだに未検出が溜まり、実機で 19 → 24 件まで増えていた（#1278）。

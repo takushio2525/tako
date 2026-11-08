@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # tako:run: bash scripts/ci-change-scope.sh --help
 # ci-change-scope.sh — CI の変更範囲を判定する: docs だけなら Rust の重いジョブを skip する（#2084）
+#                       + 導入代行に関わるパスを変えたときだけ本物の install.ps1 を取りに行く（#2791）
 #
 # なぜ要るか:
 #   2026-10-15 未明、ドキュメントサイト刷新の docs だけの PR が 9 本並び、どれも ci.yml の
@@ -13,13 +14,21 @@
 #   rust=false でも docs を読む Rust の番犬（`no_personal_data` ほか）は
 #   scripts/ci-docs-watchdogs.sh が走らせる（Rust を丸ごと止めると個人情報の番犬まで止まる）。
 #
+# 導入代行の実走（agent_install。#2791）:
+#   Windows ジョブの「codex / agy の導入代行の実走検査」は外部（chatgpt.com / antigravity.google）から
+#   本物の install.ps1 と本体を取ってくるので、毎回走らせると外部の障害・遅延で関係の無い PR まで赤になる。
+#   変更されたパスが**どれか 1 つでも** AGENT_INSTALL に当たるときだけ agent_install=true。
+#   定期実行（schedule）と手動実行（workflow_dispatch）は上流の install.ps1 の形の変化を拾うため常に true。
+#   差分が空・取れない・想定外のイベントも true（走らせる側へ倒す。rust と同じ）
+#
 # 使い方:
 #   bash scripts/ci-change-scope.sh classify [-z] < パスの一覧   # 1 行 1 パス（-z は NUL 区切り）
 #   bash scripts/ci-change-scope.sh github                       # CI 用: 差分を採って GITHUB_OUTPUT へ
 #   git diff --name-only --no-renames origin/main... | bash scripts/ci-change-scope.sh classify
 #                                                                # 手元: この PR で Rust が skip されるか
 #     環境変数 CI_EVENT（github.event_name）/ CI_PUSH_BEFORE（github.event.before）
-# 出力: 標準出力の最後の行が rust=true / rust=false。理由は標準エラー（github では step summary にも）
+# 出力: 標準出力の最後の 2 行が agent_install=true|false と rust=true|false（最後の行が rust）。
+#       理由は標準エラー（github では step summary にも）
 set -euo pipefail
 
 # docs だけとみなすパスの型（bash の case の glob。`*` は `/` も跨ぐ）
@@ -37,6 +46,21 @@ RUST_REQUIRED=(
   'docs/src/data/windows-support.json|対応状況ページのデータ（gen-windows-support-docs.mjs --check が tako バイナリと突き合わせる）'
   'docs/src/data/agent-support.json|対応状況ページのデータ（gen-agent-support-docs.mjs --check が tako バイナリと突き合わせる）'
   'docs/scripts/support-pages.mjs|対応状況ページの写しの書式と分類（gen-*-docs.mjs --check がこれで写しを作り直して突き合わせる）'
+)
+
+# 変えたら Windows で本物の install.ps1 を走らせるパス（`パターン|理由`。#2791）。
+# 外部から取る実走は、導入代行の経路そのもの・それを走らせる検査・この判定を変えたときだけ回す
+AGENT_INSTALL=(
+  'crates/tako-core/src/platform/agent_install.rs|導入の手順（取得元・置き場・代行の可否・起こし方）'
+  'crates/tako-core/src/platform/shell.rs|install.ps1 を走らせる起動片（powershell_script_text_args）'
+  'crates/tako-control/src/setup_bootstrap.rs|取得・実行・導入後の status（install_for / status_for）'
+  'crates/tako-control/src/setup_refusal.rs|実走の検査が突き合わせる断りの文'
+  'crates/tako-core/tests/issue2791_agent_install_windows.rs|実走の段が同じポリシーの下で回す偽物の検査'
+  'scripts/windows/test-agent-install-2791.ps1|実走の検査そのもの'
+  'scripts/windows/lib/execution-policy.ps1|実走の検査が置くポリシーの 1 実装'
+  'installer/windows/lib/user-path.ps1|実走の検査がユーザー環境変数 Path を戻す 1 実装'
+  'scripts/ci-change-scope.sh|この判定そのもの'
+  '.github/workflows/ci.yml|実走の段の配線'
 )
 
 # 理由に並べるパスの上限（長い PR で summary を埋めない）
@@ -63,14 +87,31 @@ classify_path() {
   printf 'rust:docs/ と .agent/ の md 以外'
 }
 
+# 1 パスが導入代行の実走に関わるか: 当たれば理由を出して 0、当たらなければ 1（#2791）
+agent_install_path() {
+  local p="$1" spec pat
+  for spec in ${AGENT_INSTALL[@]+"${AGENT_INSTALL[@]}"}; do
+    pat="${spec%%|*}"
+    # shellcheck disable=SC2254
+    case "${p}" in ${pat}) printf '%s' "${spec#*|}"; return 0 ;; esac
+  done
+  return 1
+}
+
 # 標準入力のパス一覧を判定する。$1 = "-z" なら NUL 区切り
 classify_stream() {
-  local nul="${1:-}" p verdict n_total=0 n_rust=0 listed=0 delim=$'\n'
+  local nul="${1:-}" p verdict why n_total=0 n_rust=0 listed=0 delim=$'\n'
   [[ "${nul}" == "-z" ]] && delim=''
   REASONS=()
+  AGENT=false
+  AGENT_REASON="導入代行に関わるパスの変更なし（Windows の本物の install.ps1 の実走は skip）"
   while IFS= read -r -d "${delim}" p || [[ -n "${p}" ]]; do
     [[ -n "${p}" ]] || continue
     n_total=$((n_total + 1))
+    if [[ "${AGENT}" == "false" ]] && why="$(agent_install_path "${p}")"; then
+      AGENT=true
+      AGENT_REASON="${p} — ${why}"
+    fi
     verdict="$(classify_path "${p}")"
     if [[ "${verdict}" != "docs" ]]; then
       n_rust=$((n_rust + 1))
@@ -83,6 +124,8 @@ classify_stream() {
   if [[ ${n_total} -eq 0 ]]; then
     REASONS=("変更されたパスが 0 件（判定材料が無いので走らせる）")
     RUST=true
+    AGENT=true
+    AGENT_REASON="変更されたパスが 0 件（判定材料が無いので走らせる）"
   elif [[ ${n_rust} -eq 0 ]]; then
     REASONS=("docs だけの変更（${n_total} 件）: macOS / Windows の Rust ジョブを skip し、docs の検査と docs を読む番犬だけ走らせる")
     RUST=false
@@ -98,12 +141,15 @@ classify_stream() {
 print_reasons() {
   local r
   for r in ${REASONS[@]+"${REASONS[@]}"}; do echo "  ${r}" >&2; done
+  echo "  導入代行の実走（#2791）: agent_install=${AGENT} — ${AGENT_REASON}" >&2
 }
 
 # 判定材料が取れないときの終わり方（走らせる側へ倒す）
 conservative() {
   REASONS=("$1（走らせる側へ倒す）")
   RUST=true
+  AGENT=true
+  AGENT_REASON="$1（走らせる側へ倒す）"
 }
 
 # CI 用: イベントから差分の基点を決めて、そこから HEAD までの変更を判定する
@@ -133,6 +179,14 @@ run_github() {
         fi
       fi
       ;;
+    schedule | workflow_dispatch)
+      # 定期実行・手動実行は全部走らせる。導入代行の実走は、手元の変更に関係なく上流の install.ps1 の
+      # 形の変化を拾うためにこちらで回す（#2791）
+      REASONS=("定期実行・手動実行（${event}）: 全部走らせる")
+      RUST=true
+      AGENT=true
+      AGENT_REASON="定期実行・手動実行（${event}）は上流の install.ps1 の形の変化を拾うため常に走らせる"
+      ;;
     *)
       conservative "想定外のイベント（'${event}'）"
       ;;
@@ -154,19 +208,27 @@ run_github() {
     rm -f "${list}"
   fi
 
-  echo "変更範囲の判定（${event:-イベント不明}）: rust=${RUST}" >&2
+  echo "変更範囲の判定（${event:-イベント不明}）: rust=${RUST} agent_install=${AGENT}" >&2
   print_reasons
-  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then echo "rust=${RUST}" >> "${GITHUB_OUTPUT}"; fi
+  if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+    {
+      echo "rust=${RUST}"
+      echo "agent_install=${AGENT}"
+    } >> "${GITHUB_OUTPUT}"
+  fi
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
       echo "### 変更範囲の判定（#2084）: rust=${RUST}"
       local r
       for r in ${REASONS[@]+"${REASONS[@]}"}; do echo "- ${r}"; done
+      echo "### 導入代行の実走（#2791）: agent_install=${AGENT}"
+      echo "- ${AGENT_REASON}"
     } >> "${GITHUB_STEP_SUMMARY}"
   fi
   if [[ "${RUST}" == "false" ]]; then
     echo "::notice title=docs だけの変更（#2084）::macOS / Windows の Rust ジョブは skip（成功扱い）。docs の検査と docs を読む番犬だけ走る"
   fi
+  echo "agent_install=${AGENT}"
   echo "rust=${RUST}"
 }
 
@@ -174,6 +236,7 @@ case "${1:-}" in
   classify)
     classify_stream "${2:-}"
     print_reasons
+    echo "agent_install=${AGENT}"
     echo "rust=${RUST}"
     ;;
   github) run_github ;;
