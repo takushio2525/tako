@@ -177,10 +177,21 @@ impl Sandbox {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&tako_exe, bin.join("tako")).unwrap();
         write(&home.join(".zprofile"), "export EDITOR=vim\n");
-        shell_profile::ensure_dirs_on_path_in(&home, ShellKind::Zsh, &[bin.clone()], None).unwrap();
+        shell_profile::ensure_dirs_on_path_in(
+            &home,
+            ShellKind::Zsh,
+            std::slice::from_ref(&bin),
+            None,
+        )
+        .unwrap();
         // ログインシェルを変えた人の古いブロック（ファイルはブロックだけ = tako が作った）
-        shell_profile::ensure_dirs_on_path_in(&home, ShellKind::Bash, &[bin.clone()], None)
-            .unwrap();
+        shell_profile::ensure_dirs_on_path_in(
+            &home,
+            ShellKind::Bash,
+            std::slice::from_ref(&bin),
+            None,
+        )
+        .unwrap();
 
         // --- Windows: ユーザー環境変数 Path・以前の版の $PROFILE・WebView2 ---
         let user_path = Rc::new(RefCell::new(format!(
