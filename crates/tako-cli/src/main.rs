@@ -6392,6 +6392,11 @@ fn remote_start() -> Result<(), String> {
     if let Some(pid) = result["renewed"]["previous_pid"].as_u64() {
         eprintln!("{}", ReplyNote::RemoteRenewed(pid).text_in(lang));
     }
+    // #2786: 自己疎通が接続元検証で断られた（daemon は動いているが、スマホからの要求も全部 403）なら、
+    // 成功だけを名乗らず理由と次の一手を言う（応答の `self_check.peer_rejected` から表示言語で組む）
+    if let Some(warning) = tako_control::remote_self_check::detail_of_start_in(&result, lang) {
+        eprintln!("{warning}");
+    }
     if let Some(url) = result["url"].as_str() {
         match tako_control::remote::generate_qr_png(url) {
             Ok(path) => {
@@ -6489,6 +6494,10 @@ fn remote_status() -> Result<(), String> {
         tako_control::remote_starting::detail_of_status_in(&status["starting"], lang)
     {
         eprintln!("{detail}");
+    }
+    // 起動時の自己疎通が接続元検証で断られている（#2786。`peer_verification.self_check_rejected` を読むだけ）
+    if let Some(warning) = tako_control::remote_self_check::detail_of_status_in(&status, lang) {
+        eprintln!("{warning}");
     }
     println!("{}", pretty_json(&status));
     Ok(())

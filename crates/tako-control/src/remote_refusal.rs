@@ -57,6 +57,10 @@ use crate::DispatchError;
 /// daemon の admin API が「登録されていない端末」で断ったときの `kind`（本文の `device_id` と組で返す）
 pub const KIND_DEVICE_NOT_REGISTERED: &str = "device_not_registered";
 
+/// serve 経由を名乗る接続を接続元検証（#841）で断ったときの `kind`（本文の `code` = 理由コードと組で返す）。
+/// 起動時の自己疎通（#1038）がこれで「届いているが接続元検証で断られている」を見分ける（#2786）
+pub const KIND_PEER_UNVERIFIED: &str = "peer_unverified";
+
 /// remote 系の断り。`error` は OS / serde のエラー文（言語に依らずそのまま載せる）、
 /// ID・パス・名前は表記のまま埋める
 #[derive(Debug, Clone, PartialEq)]
@@ -1391,6 +1395,18 @@ impl RemoteRefusal {
         }
         if let Self::DeviceNotRegistered(id) = self {
             body["device_id"] = serde_json::json!(id);
+        }
+        body
+    }
+
+    /// PWA の API（層①・層②の認可ほか）が断るときの本文。`error` は daemon の表示言語の文で、接続元検証の
+    /// 断りだけ `kind`（[`KIND_PEER_UNVERIFIED`]）と理由コードの `code` を添える（#2786。起動時の自己疎通が
+    /// 字面に依らず読む = `remote_self_check::peer_reject_of_body`）。それ以外は `{"error": …}` のまま
+    pub fn http_body(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({ "error": self.to_string() });
+        if let Self::PeerUnverified(reject) = self {
+            body["kind"] = serde_json::json!(KIND_PEER_UNVERIFIED);
+            body["code"] = serde_json::json!(reject.code());
         }
         body
     }

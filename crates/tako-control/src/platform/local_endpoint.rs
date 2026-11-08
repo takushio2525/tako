@@ -241,6 +241,22 @@ impl PeerReject {
         }
     }
 
+    /// 全バリアント（[`Self::from_code`] の引き当てとテストの網羅に使う）
+    pub const ALL: [Self; 6] = [
+        Self::NoPeerAddr,
+        Self::NotLoopback,
+        Self::Unresolved,
+        Self::OwnerUntrusted,
+        Self::ImageUnknown,
+        Self::NotTailscaleDaemon,
+    ];
+
+    /// [`Self::code`] の逆引き（知らないコードは `None`）。403 の本文と status の状態ファイルから
+    /// 理由を型へ戻す（#2786）
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| r.code() == code)
+    }
+
     /// 人間向けの 1 行説明（応答本文に使う。接続元の詳細は明かさない）。daemon の表示言語で引く
     /// （#2365 の続き。日本語は以前の固定文とバイト一致）
     pub fn describe_in(&self, lang: tako_core::i18n::Lang) -> &'static str {

@@ -104,6 +104,8 @@ pub mod remote_refusal;
 /// スマホから PC の負荷と順番待ちを見る・変える経路の宣言表と受け口（#1999）
 pub mod remote_resources;
 pub mod remote_role;
+/// 起動時の自己疎通が接続元検証で断られたことの見分けと理由・次の一手（#2786）
+pub mod remote_self_check;
 pub mod remote_serve;
 pub mod remote_setup;
 pub mod remote_ssh;
