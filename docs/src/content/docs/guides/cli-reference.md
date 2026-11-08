@@ -272,6 +272,8 @@ tako setup deps install --dry-run  # 何を入れるかだけ表示
 
 導入済みのものには触りません（何度実行しても同じ結果になります）。導入を代行できるのは macOS の Homebrew（`brew install`）で、Windows は打つべき `winget` のコマンドを表示します。
 
+Windows ではスマホからの接続がまだ使えないため、tailscale は一覧に出さず、psmux の用途にもリモート接続を書きません（`tako setup` の依存チェックと `tako check-health` も同じです）。使えるようになれば、[Windows 対応状況](/windows-support/) の表の更新と同時に出るようになります。
+
 Tailscale は入っているのに応答しない（`tailscale --version` が返らない・失敗する）ときは `[OK]` ではなく `[警告] tailscale: 在りますが実行できません` と出し、入れ直しは勧めません（2 つ目の Tailscale を入れると、リモート接続がつながらなくなることがあります）。Dock から起動した tako でも、ログインシェルの PATH にある Tailscale（MacPorts や nix で入れたもの）を見つけます。
 
 標準の `tako setup` は質問をしないので、足りないツールがあっても状態と `tako setup deps install` の 1 行だけを表示します。1 つずつ「今すぐ入れますか？」と聞いてほしいときは `tako setup --review` を使ってください。

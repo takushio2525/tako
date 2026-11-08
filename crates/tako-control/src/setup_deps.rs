@@ -103,6 +103,19 @@ pub struct ExternalDep {
     pub hint: Note,
 }
 
+/// 器（tmux / psmux）の用途。remote daemon は画面を器から読む（#2771）ので、リモート接続を含む
+const CONTAINER_PURPOSE: Note = Note::new(
+    "リモート接続（tako remote）・再起動時のセッション完全復元・オーケストレーターの worker 管理",
+    "remote access (tako remote), full session restore after restart, and orchestrator worker management",
+);
+
+/// remote が使えない OS での器の用途（#2776）。[`CONTAINER_PURPOSE`] からリモート接続だけを外したもの
+/// （器が無くても失うのは永続化と worker 管理で、remote はそもそも使えない）
+const CONTAINER_PURPOSE_WITHOUT_REMOTE: Note = Note::new(
+    "再起動時のセッション完全復元・オーケストレーターの worker 管理",
+    "full session restore after restart, and orchestrator worker management",
+);
+
 /// その OS の器（永続化の器 = tmux / psmux）の行（**純粋関数**）。依存表 [`deps`] の先頭と同じもの。
 ///
 /// remote daemon の起動門（`remote_backend_gate`）が「何を入れれば使えるか」をこの名前で言う（#2771）
@@ -113,10 +126,7 @@ pub fn container_dep(platform: Platform) -> ExternalDep {
         Platform::MacOs => ExternalDep {
             bin: "tmux",
             required: false,
-            purpose: Note::new(
-                "リモート接続（tako remote）・再起動時のセッション完全復元・オーケストレーターの worker 管理",
-                "remote access (tako remote), full session restore after restart, and orchestrator worker management",
-            ),
+            purpose: CONTAINER_PURPOSE,
             installer: Some(DepInstaller::Brew { pkg: "tmux" }),
             hint: same("https://github.com/tmux/tmux/wiki/Installing"),
         },
@@ -125,10 +135,7 @@ pub fn container_dep(platform: Platform) -> ExternalDep {
         Platform::Windows => ExternalDep {
             bin: "psmux",
             required: false,
-            purpose: Note::new(
-                "リモート接続（tako remote）・再起動時のセッション完全復元・オーケストレーターの worker 管理",
-                "remote access (tako remote), full session restore after restart, and orchestrator worker management",
-            ),
+            purpose: CONTAINER_PURPOSE,
             installer: Some(DepInstaller::Winget {
                 pkg: "marlocarlo.psmux",
             }),
@@ -137,7 +144,10 @@ pub fn container_dep(platform: Platform) -> ExternalDep {
     }
 }
 
-/// そのプラットフォームの依存表（**純粋関数**なので macOS から Windows 側も検証できる）
+/// そのプラットフォームの依存表（**純粋関数**なので macOS から Windows 側も検証できる）。
+///
+/// tako が知っている依存の**全表**。この環境で調べて勧めるのは [`offered_deps`] が絞った行
+/// （remote が使えない OS では Tailscale を出さない = #2776）
 pub fn deps(platform: Platform) -> Vec<ExternalDep> {
     // URL のように日英で同じ案内
     let same = |text: &'static str| Note::new(text, text);
@@ -185,9 +195,49 @@ pub fn deps(platform: Platform) -> Vec<ExternalDep> {
     vec![container, git, tailscale]
 }
 
-/// この環境の依存表
+/// その OS で**調べて勧める**依存（**純粋関数**。remote の判定は呼び手が注入する = #2776）。
+///
+/// Tailscale はスマホからの接続（remote）のためだけの依存なので、remote が使えない OS
+/// （`remote_unusable` が `Some` = 対応表の `tako_remote_setup` が使えない。Windows は #971 で Pending）では
+/// 行ごと外す。入れても使い道が無いものの導入を勧めない（setup の末尾の行 = #2768 と同じ判断）。
+/// 器（tmux / psmux）は永続化と worker 管理に要るので行は残し、用途の文からリモート接続だけを外す。
+///
+/// **判定はここでしない**: 渡すのは `remote_setup::remote_unusable` の 1 実装の答え（[`current_deps`]）か、
+/// テストがマスを差し替えて同じ判定（`remote_setup::remote_unusable_in`）を通した答え。
+/// 対応表が使えると言った日に、末尾の行と一緒にこの行も自動で戻る
+pub fn offered_deps(
+    platform: Platform,
+    remote_unusable: Option<tako_core::platform::support::Support>,
+) -> Vec<ExternalDep> {
+    let mut deps = deps(platform);
+    if remote_unusable.is_some() {
+        deps.retain(|dep| !is_tailscale(dep));
+        for dep in deps.iter_mut().filter(|dep| is_container(dep)) {
+            dep.purpose = CONTAINER_PURPOSE_WITHOUT_REMOTE;
+        }
+    }
+    deps
+}
+
+/// この環境で調べて勧める依存表（`status` / check-health / `tako setup` の依存の段 /
+/// MCP `tako_setup_deps` が通る。remote が使えない OS では Tailscale の行が無い = #2776）
 pub fn current_deps() -> Vec<ExternalDep> {
-    let mut deps = deps(tako_core::platform::agent_install::current_platform());
+    let platform = tako_core::platform::agent_install::current_platform();
+    with_test_required(offered_deps(
+        platform,
+        crate::remote_setup::remote_unusable(platform),
+    ))
+}
+
+/// この環境の全表（勧めるかどうかの絞り込みを通さない = #2776）。名指しで 1 件を引く
+/// [`status_of`] だけが使う（`tako remote setup` は remote 自身のウィザードなので、
+/// remote が対応表で未対応の OS でも Tailscale の導入口を引ける = #842 の実機確認の経路）
+fn all_current_deps() -> Vec<ExternalDep> {
+    with_test_required(deps(tako_core::platform::agent_install::current_platform()))
+}
+
+/// [`test_required_dep`] の 1 件を必須依存へ倒す
+fn with_test_required(mut deps: Vec<ExternalDep>) -> Vec<ExternalDep> {
     if let Some(bin) = test_required_dep() {
         for dep in deps.iter_mut() {
             if dep.bin == bin {
@@ -564,9 +614,12 @@ pub fn status() -> Vec<DepStatus> {
 /// `status()` はこの環境の依存すべてを解決するので、unix では
 /// `exe::find`（ログインシェル起動）が件数ぶん走る。**1 件で足りる呼び手**
 /// （`tako remote setup` は tailscale しか見ない）はこちらを通す。
-/// 名前がこの環境の依存表に無ければ `None`（推測で作らない）
+/// 名前がこの環境の依存表に無ければ `None`（推測で作らない）。
+///
+/// 名指しで引くので、勧めるかどうかの絞り込み（[`offered_deps`]）は通さない（#2776）。
+/// 呼び手は remote 自身（ウィザード・末尾の行は判定の後）と、依存の段が導入した後の引き直しだけ
 pub fn status_of(bin: &str) -> Option<DepStatus> {
-    current_deps()
+    all_current_deps()
         .into_iter()
         .find(|d| d.bin == bin)
         .map(|dep| probe(dep, &mut InstallerMemo::default()))
@@ -1553,5 +1606,127 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn has_tailscale(deps: &[ExternalDep]) -> bool {
+        deps.iter().any(is_tailscale)
+    }
+
+    fn container_of(deps: &[ExternalDep]) -> ExternalDep {
+        *deps
+            .iter()
+            .find(|dep| is_container(dep))
+            .expect("器の行は remote の判定に関係なく残る")
+    }
+
+    /// #2776: Tailscale の行は remote の対応表の判定（`remote_setup::remote_unusable_in` の 1 実装）に従う。
+    /// マスを差し替えて通すので、**Windows が使えるようになった日に行が出る**ことを macOS の上でも縛る。
+    /// 器の行は消さず、用途の文のリモート接続だけが同じ判定に従う
+    #[test]
+    fn issue2776_tailscaleの行はremoteの対応表の判定に従う() {
+        use crate::remote_setup::remote_unusable_in;
+        use tako_core::platform::support::Support;
+        let note = Note::new("理由", "reason");
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for (cell, offered) in [
+                (Some(Support::Supported), true),
+                // 縮退していても使える = 勧める
+                (Some(Support::Degraded { note }), true),
+                (Some(Support::Pending { note, issue: 971 }), false),
+                (Some(Support::Unsupported { note }), false),
+                // 対応表に無いキーは素通し（判定の 1 実装と同じ）
+                (None, true),
+            ] {
+                let label = format!("{platform:?} / {:?}", cell.map(Support::status));
+                let deps = offered_deps(platform, remote_unusable_in(cell));
+                assert_eq!(
+                    has_tailscale(&deps),
+                    offered,
+                    "{label}: Tailscale の行が remote の判定とずれている"
+                );
+                let container = container_of(&deps);
+                assert_eq!(
+                    container.purpose.ja().contains("tako remote"),
+                    offered,
+                    "{label}: 器の用途のリモート接続が remote の判定とずれている（{}）",
+                    container.purpose.ja()
+                );
+                assert_eq!(
+                    container.purpose.en().contains("tako remote"),
+                    offered,
+                    "{label}: 器の用途（英語）のリモート接続が remote の判定とずれている"
+                );
+                // 器と git は判定に関係なく残る（永続化・worker 管理・git パネルは remote と無関係）
+                for bin in [container.bin, "git"] {
+                    assert!(
+                        deps.iter().any(|dep| dep.bin == bin),
+                        "{label}: {bin} の行まで消えている"
+                    );
+                }
+            }
+        }
+        // 使えるようになった Windows の行は全表の winget の行そのもの（導入口を作り直さない）
+        let windows = offered_deps(
+            Platform::Windows,
+            remote_unusable_in(Some(Support::Supported)),
+        );
+        let tailscale = windows.iter().find(|dep| is_tailscale(dep)).unwrap();
+        assert_eq!(
+            tailscale.installer,
+            Some(DepInstaller::Winget {
+                pkg: "tailscale.tailscale"
+            })
+        );
+    }
+
+    /// #2776: 今の対応表のとおりに出る。使える OS（macOS）の表は全表と 1 行も変わらない
+    /// （`tako setup deps` の出力を変えない）。どちらの OS の CI でも両 OS を見る
+    #[test]
+    fn issue2776_今の対応表のとおりにtailscaleの行が出る() {
+        use crate::remote_setup::{remote_unusable, SUMMARY_SUPPORT_KEY};
+        use tako_core::platform::support::support_for;
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let declared = support_for(platform, SUMMARY_SUPPORT_KEY)
+                .unwrap_or_else(|| panic!("{platform:?} に {SUMMARY_SUPPORT_KEY} の宣言が無い"));
+            let offered = offered_deps(platform, remote_unusable(platform));
+            assert_eq!(
+                has_tailscale(&offered),
+                declared.is_usable(),
+                "{platform:?}: 対応表は {} なのに Tailscale の行の有無がずれている",
+                declared.status()
+            );
+            if declared.is_usable() {
+                let full = deps(platform);
+                assert_eq!(offered.len(), full.len(), "{platform:?}");
+                for (got, want) in offered.iter().zip(&full) {
+                    assert_eq!(got.bin, want.bin, "{platform:?}");
+                    assert_eq!(got.purpose, want.purpose, "{platform:?}: {}", got.bin);
+                    assert_eq!(got.installer, want.installer, "{platform:?}: {}", got.bin);
+                    assert_eq!(got.hint, want.hint, "{platform:?}: {}", got.bin);
+                }
+            }
+        }
+        // macOS の remote は使える（使えなくなったら macOS の setup deps から Tailscale が消える = 要確認）
+        assert!(has_tailscale(&offered_deps(
+            Platform::MacOs,
+            remote_unusable(Platform::MacOs)
+        )));
+    }
+
+    /// #2776: この環境の依存表（`status` / check-health / setup の依存の段 / MCP が通る）は
+    /// 実行中の OS の判定を通る。名指しで引く `status_of` の全表は絞らない（`tako remote setup` の導入口）
+    #[test]
+    fn issue2776_この環境の依存表は同じ判定を通り名指しは絞らない() {
+        let platform = Platform::current();
+        let unusable = crate::remote_setup::remote_unusable(platform).is_some();
+        assert_eq!(
+            has_tailscale(&current_deps()),
+            !unusable,
+            "{platform:?}: この環境の依存表が remote の判定（使えない = {unusable}）とずれている"
+        );
+        assert!(
+            has_tailscale(&all_current_deps()),
+            "{platform:?}: 名指しの全表から Tailscale が消えている（`tako remote setup` が導入口を引けない）"
+        );
     }
 }

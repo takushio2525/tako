@@ -273,14 +273,24 @@ fn issue2768_使えないosではtailscaleを読む前に対応表のgateで返�
         }
     }
 
-    let (decide, base) = fn_body(REMOTE_SETUP, "platform_unsupported");
+    // 判定の 1 実装は `remote_unusable`（#2776 で依存表の Tailscale の行も同じこれを通るようになった）。
+    // 末尾の gate はそれを呼ぶだけで、対応表を自分で引き直さない
+    let (gate_fn, gate_base) = fn_body(REMOTE_SETUP, "platform_unsupported");
+    assert!(
+        gate_fn.contains("remote_unusable(") && !gate_fn.contains("support_for("),
+        "{REMOTE_SETUP}:{gate_base}: `platform_unsupported` が判定の 1 実装 `remote_unusable` を通っていない\
+         （対応表を自分で引くと、依存表の Tailscale の行と判定が割れる = #2768 / #2776）"
+    );
+    let (decide, base) = fn_body(REMOTE_SETUP, "remote_unusable");
     assert!(
         decide.contains("support_for(") && decide.contains("SUMMARY_SUPPORT_KEY"),
-        "{REMOTE_SETUP}:{base}: `platform_unsupported` が対応表（`support_for` + `SUMMARY_SUPPORT_KEY`）を\
+        "{REMOTE_SETUP}:{base}: `remote_unusable` が対応表（`support_for` + `SUMMARY_SUPPORT_KEY`）を\
          引いていない（#2768）"
     );
     let mut offenders = hits(&decide, base, REMOTE_SETUP, "cfg!(");
     offenders.extend(hits(&decide, base, REMOTE_SETUP, "#[cfg("));
+    offenders.extend(hits(&gate_fn, gate_base, REMOTE_SETUP, "cfg!("));
+    offenders.extend(hits(&gate_fn, gate_base, REMOTE_SETUP, "#[cfg("));
     assert!(
         offenders.is_empty(),
         "gate が OS を `cfg` で見ている:\n  {}\n\

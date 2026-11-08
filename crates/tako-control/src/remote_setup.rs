@@ -925,18 +925,41 @@ pub enum PhoneReadiness {
 /// 末尾の行のためのキーは足さない（`remote_autostart::SUPPORT_KEY` と同じ作法）
 pub const SUMMARY_SUPPORT_KEY: &str = "tako_remote_setup";
 
-/// remote（スマホからの接続）がその OS で使えないなら、末尾の 1 行の中身を返す（#2768。**純粋関数**）。
+/// remote（スマホからの接続）がその OS で使えないなら、対応表のそのマスを返す（**判定の 1 実装** =
+/// #2768 / #2776。**純粋関数**）。
 ///
-/// **`cfg!(windows)` で判定しない**（`remote_autostart::platform_supported` と同じ理由 = 対応表が
-/// 使えると言った日に片方だけ残らない）。使える OS は `None` = 従来どおり Tailscale の状態を読む。
-/// Windows は daemon の通しが未実測（#971 で Pending）なので、Tailscale を調べて
-/// `tako remote setup` を案内すると、案内どおりに打っても使えないところへ利用者を送ることになる。
-/// 対応表に無いキーは素通し（`support::gate_in` の未登録と同じ判断）
+/// setup の末尾の行（[`platform_unsupported`]）と依存表の Tailscale の行
+/// （`setup_deps::current_deps`）が**これだけ**を通る。別々に引くと、対応表が使えると言った日に
+/// 片方だけ「使えない」と言い続ける。**`cfg!(windows)` で判定しない**
+/// （`remote_autostart::platform_supported` と同じ理由）。使える OS は `None`。
+/// Windows は daemon の通しが未実測（#971 で Pending）
+pub fn remote_unusable(
+    platform: tako_core::platform::support::Platform,
+) -> Option<tako_core::platform::support::Support> {
+    remote_unusable_in(tako_core::platform::support::support_for(
+        platform,
+        SUMMARY_SUPPORT_KEY,
+    ))
+}
+
+/// [`remote_unusable`] の判定そのもの（**純粋関数**）。対応表のマスを差し替えるテストがここを通る
+/// （Windows が使えるようになった日の形を macOS の上でも縛る = #2776）。
+/// 対応表に無いキー（`None`）は素通し（`support::gate_in` の未登録と同じ判断）
+pub fn remote_unusable_in(
+    cell: Option<tako_core::platform::support::Support>,
+) -> Option<tako_core::platform::support::Support> {
+    cell.filter(|support| !support.is_usable())
+}
+
+/// remote がその OS で使えないなら、末尾の 1 行の中身を返す（#2768。**純粋関数**）。
+///
+/// 判定は [`remote_unusable`] の 1 実装。使える OS は `None` = 従来どおり Tailscale の状態を読む。
+/// 使えない OS で Tailscale を調べて `tako remote setup` を案内すると、案内どおりに打っても
+/// 使えないところへ利用者を送ることになる
 pub fn platform_unsupported(
     platform: tako_core::platform::support::Platform,
 ) -> Option<PhoneReadiness> {
-    let support = tako_core::platform::support::support_for(platform, SUMMARY_SUPPORT_KEY)?;
-    (!support.is_usable()).then(|| PhoneReadiness::UnsupportedPlatform {
+    remote_unusable(platform).map(|support| PhoneReadiness::UnsupportedPlatform {
         platform,
         issue: support.issue(),
     })
@@ -1464,5 +1487,35 @@ mod tests {
             ),
             format!("{PHONE_LINE_HEAD}Windows では使えません")
         );
+    }
+
+    /// #2776: 判定の 1 実装は対応表のマスの 4 状態と未登録で決まる（縮退していても使える = 出す）。
+    /// 末尾の行（`platform_unsupported`）は同じ答えを使い回す
+    #[test]
+    fn issue2776_remoteの判定は対応表のマスだけで決まる() {
+        use tako_core::platform::support::{Note, Platform, Support};
+        let note = Note::new("理由", "reason");
+        for (cell, unusable) in [
+            (Some(Support::Supported), false),
+            (Some(Support::Degraded { note }), false),
+            (Some(Support::Pending { note, issue: 971 }), true),
+            (Some(Support::Unsupported { note }), true),
+            // 対応表に無いキーは素通し（`support::gate_in` と同じ）
+            (None, false),
+        ] {
+            assert_eq!(
+                remote_unusable_in(cell).is_some(),
+                unusable,
+                "{:?} の判定がずれている",
+                cell.map(Support::status)
+            );
+        }
+        for platform in [Platform::MacOs, Platform::Windows] {
+            assert_eq!(
+                platform_unsupported(platform).is_some(),
+                remote_unusable(platform).is_some(),
+                "{platform:?}: 末尾の行が判定の 1 実装と別の答えを出している"
+            );
+        }
     }
 }
