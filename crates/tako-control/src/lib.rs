@@ -127,6 +127,7 @@ pub mod setup_bootstrap;
 pub mod setup_deps;
 pub mod setup_refusal;
 pub mod setup_remaining;
+pub mod setup_undo;
 pub mod shell_integration;
 pub mod shelved_restore;
 pub mod sketch_board;

@@ -433,6 +433,269 @@ pub fn registration_is_alive(command: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+// --- 登録を外す（アンインストールの片付け。#2788）---
+//
+// 外すのは「名前が tako で、command が tako の実行ファイル」の登録だけ。名前が tako でも別の
+// コマンドを指す登録（利用者が自分で同じ名前を付けた等）と、tako 以外の登録には触れない。
+// 書き込みは呼び手（`setup_undo`）の仕事で、ここは「外した後の本文」を返す純粋関数だけを持つ。
+//
+// codex / agy は登録を公式の `mcp add` に任せている（モジュール冒頭）が、外すのは本文の
+// 直接の編集にする: アンインストールの時点で CLI が残っているとは限らず（先に消した・PATH が
+// 切れた）、テストでは本物の CLI を起こせない。TOML は行単位で表だけを外し、**読み直した表が
+// 「元の表 − tako の登録」と一致するときだけ**書かせる（一致しなければ形が読めないとして残す）
+
+/// 登録の command が tako の実行ファイルを指すか（純粋関数）。
+/// ファイル名（拡張子 `.exe` を除き大文字小文字を問わない）が `tako` か `tako-mcp`。
+/// setup は `resolve_tako_binary` の絶対パス（解決できなければ素の `tako`）を登録する
+pub fn is_tako_command(command: &str) -> bool {
+    let name = command
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let stem = name.strip_suffix(".exe").unwrap_or(&name);
+    matches!(stem, "tako" | "tako-mcp")
+}
+
+/// 設定ファイルから tako の登録を外す判断（[`unregister_json`] / [`unregister_toml`]）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unregister {
+    /// tako の登録が無い（空のファイル・`mcpServers` が無い・名前が無い）
+    Absent,
+    /// tako の登録を外した後の本文
+    Removed(String),
+    /// 名前は tako だが tako の実行ファイルを指していない（外さない）
+    NotTako { command: String },
+    /// JSON / TOML として読めない（触らない）
+    Unreadable(String),
+    /// TOML の tako の登録が見出しの表の形でない（インライン表・ドット付きの鍵）。触らない
+    UnsupportedShape,
+}
+
+/// JSON の設定（claude の `.claude.json`・旧 `settings.json`・agy の `mcp_config.json`）から
+/// `mcpServers.tako` を外す（純粋関数）。
+///
+/// 鍵の並び・字下げ（最初の字下げの幅を使う）・行末（CRLF）・末尾の改行の有無は元に合わせる。
+/// 空になった `mcpServers` は残す（tako が作ったのか利用者が置いたのか区別できない。空でも害は無い）
+pub fn unregister_json(text: &str) -> Unregister {
+    use serde::Serialize;
+    if text.trim().is_empty() {
+        return Unregister::Absent;
+    }
+    let mut root: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return Unregister::Unreadable(e.to_string()),
+    };
+    let Some(servers) = root
+        .get_mut("mcpServers")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Unregister::Absent;
+    };
+    let Some(entry) = servers.get(SERVER_NAME) else {
+        return Unregister::Absent;
+    };
+    let command = entry
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !is_tako_command(command) {
+        return Unregister::NotTako {
+            command: command.to_string(),
+        };
+    }
+    servers.shift_remove(SERVER_NAME);
+    let indent = json_indent(text);
+    let mut out = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
+    let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
+    if let Err(e) = root.serialize(&mut ser) {
+        return Unregister::Unreadable(e.to_string());
+    }
+    let mut body = String::from_utf8(out).unwrap_or_default();
+    if text.trim_end_matches([' ', '\t']).ends_with('\n') {
+        body.push('\n');
+    }
+    if text.contains("\r\n") {
+        body = body.replace('\n', "\r\n");
+    }
+    Unregister::Removed(body)
+}
+
+/// JSON の字下げ（最初に字下げされた行の先頭の空白。無ければ 2 つの空白 = claude の書き方）
+fn json_indent(text: &str) -> String {
+    text.lines()
+        .skip(1)
+        .map(|line| {
+            line.chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect::<String>()
+        })
+        .find(|lead| !lead.is_empty())
+        .unwrap_or_else(|| "  ".to_string())
+}
+
+/// codex の `config.toml` から `[mcp_servers.tako]`（と `[mcp_servers.tako.env]` などの子の表）を外す
+/// （純粋関数）。
+///
+/// 外すのは表の見出しから最後の鍵の行まで。続くコメント・空行は次の表のもの（利用者の注記）として
+/// 残し、空行が二重にならないようにだけ詰める。ファイルの末尾の表を外したときは、残った末尾の空行を
+/// 落とす（codex は表の前に空行 1 つを入れて足す）
+pub fn unregister_toml(text: &str) -> Unregister {
+    let original: toml::Table = match toml::from_str(text) {
+        Ok(t) => t,
+        Err(e) => return Unregister::Unreadable(e.to_string()),
+    };
+    let Some(entry) = original
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .and_then(|servers| servers.get(SERVER_NAME))
+    else {
+        return Unregister::Absent;
+    };
+    let command = entry
+        .get("command")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default();
+    if !is_tako_command(command) {
+        return Unregister::NotTako {
+            command: command.to_string(),
+        };
+    }
+    let removed = remove_toml_tables(text, &["mcp_servers", SERVER_NAME]);
+    let mut expected = original.clone();
+    if let Some(servers) = expected
+        .get_mut("mcp_servers")
+        .and_then(toml::Value::as_table_mut)
+    {
+        servers.remove(SERVER_NAME);
+    }
+    let same = toml::from_str::<toml::Table>(&removed)
+        .is_ok_and(|reparsed| without_empty_servers(reparsed) == without_empty_servers(expected));
+    if same {
+        Unregister::Removed(removed)
+    } else {
+        Unregister::UnsupportedShape
+    }
+}
+
+/// 中身の無い `mcp_servers` を落とした表（比べるため。`[mcp_servers.tako]` だけの文書は
+/// 外すと `mcp_servers` ごと無くなり、明示の `[mcp_servers]` があれば空の表が残る。どちらも同じ意味）
+fn without_empty_servers(mut table: toml::Table) -> toml::Table {
+    if table
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .is_some_and(toml::Table::is_empty)
+    {
+        table.remove("mcp_servers");
+    }
+    table
+}
+
+/// 行単位で `prefix` から始まる表（`[a.b]` / `[a.b.c]` / `[[a.b.c]]`）を外す
+fn remove_toml_tables(text: &str, prefix: &[&str]) -> String {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let is_blank = |line: &str| line.trim().is_empty();
+    let is_comment = |line: &str| line.trim_start().starts_with('#');
+    // 表ごとに区切る（先頭は見出しの無い根の部分）
+    let mut sections: Vec<(bool, Vec<&str>)> = vec![(false, Vec::new())];
+    for line in &lines {
+        if let Some(keys) = toml_header_keys(line) {
+            let target = keys.len() >= prefix.len()
+                && keys.iter().zip(prefix).all(|(k, p)| k.as_str() == *p);
+            sections.push((target, Vec::new()));
+        }
+        if let Some((_, body)) = sections.last_mut() {
+            body.push(line);
+        }
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut dropped_last = false;
+    for (target, body) in sections {
+        if !target {
+            out.extend(body);
+            dropped_last = false;
+            continue;
+        }
+        // 最後の鍵の行（空行・コメントでない行）までを外し、続く注記は次の表へ残す
+        let last_content = body
+            .iter()
+            .rposition(|l| !is_blank(l) && !is_comment(l))
+            .unwrap_or(0);
+        let mut tail: &[&str] = &body[last_content + 1..];
+        if out.last().is_none_or(|l| is_blank(l)) {
+            while tail.first().is_some_and(|l| is_blank(l)) {
+                tail = &tail[1..];
+            }
+        }
+        out.extend(tail);
+        dropped_last = tail.is_empty();
+    }
+    if dropped_last {
+        while out.last().is_some_and(|l| is_blank(l)) {
+            out.pop();
+        }
+    }
+    out.concat()
+}
+
+/// TOML の表の見出し行の鍵の並び（`[a."b".c]` → a / b / c）。見出しでなければ `None`。
+///
+/// 複数行配列の途中の `[1, 2],` のような行を見出しと誤認しないよう、鍵は裸の鍵
+/// （英数字・`_`・`-`）か引用符で囲んだものだけを受け付け、閉じ括弧の後ろは空白かコメントだけを許す
+fn toml_header_keys(line: &str) -> Option<Vec<String>> {
+    let rest = line.trim_start().strip_prefix('[')?;
+    let (mut rest, array) = match rest.strip_prefix('[') {
+        Some(r) => (r, true),
+        None => (rest, false),
+    };
+    let mut keys = Vec::new();
+    loop {
+        rest = rest.trim_start_matches([' ', '\t']);
+        let (key, after) = if let Some(r) = rest.strip_prefix('"') {
+            // 基本文字列の鍵（`\` のエスケープだけ解く。比べる相手は ASCII の名前）
+            let mut key = String::new();
+            let mut chars = r.char_indices();
+            let mut end = None;
+            while let Some((i, c)) = chars.next() {
+                match c {
+                    '\\' => key.extend(chars.next().map(|(_, n)| n)),
+                    '"' => {
+                        end = Some(i + 1);
+                        break;
+                    }
+                    c => key.push(c),
+                }
+            }
+            (key, &r[end?..])
+        } else if let Some(r) = rest.strip_prefix('\'') {
+            let end = r.find('\'')?;
+            (r[..end].to_string(), &r[end + 1..])
+        } else {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return None;
+            }
+            (rest[..end].to_string(), &rest[end..])
+        };
+        keys.push(key);
+        rest = after.trim_start_matches([' ', '\t']);
+        if let Some(r) = rest.strip_prefix('.') {
+            rest = r;
+            continue;
+        }
+        rest = rest.strip_prefix(']')?;
+        if array {
+            rest = rest.strip_prefix(']')?;
+        }
+        let tail = rest.trim();
+        return (tail.is_empty() || tail.starts_with('#')).then_some(keys);
+    }
+}
+
 // --- 実 CLI を起こす層 ---
 
 fn run(
@@ -1072,5 +1335,115 @@ mod tests {
         // agy の一覧は表形式（列幅がバージョンで動く）ので JSON を求めない =
         // 設定ファイルを読む側の実装と整合している
         assert!(!list_args(WorkerAgent::Agy).contains(&"--json".to_string()));
+    }
+
+    // --- #2788: 登録を外す ---
+
+    #[test]
+    fn issue2788_takoの実行ファイルだけを名指す() {
+        for yes in [
+            "/Applications/tako.app/Contents/MacOS/tako",
+            "tako",
+            r"C:\Users\testuser\AppData\Local\Programs\tako\tako.exe",
+            r"C:\x\TAKO.EXE",
+            "/x/tako-mcp",
+        ] {
+            assert!(is_tako_command(yes), "{yes}");
+        }
+        for no in ["", "npx", "/usr/bin/takoyaki", "/x/tako-app", "/x/tako.sh"] {
+            assert!(!is_tako_command(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn issue2788_jsonはtakoの登録だけを外し並びと字下げを保つ() {
+        let text = "{\n  \"firstStartTime\": \"x\",\n  \"mcpServers\": {\n    \"mine\": {\n      \"command\": \"npx\"\n    },\n    \"tako\": {\n      \"type\": \"stdio\",\n      \"command\": \"/x/tako\",\n      \"args\": [\"mcp\", \"serve\"]\n    },\n    \"zzz\": {\n      \"command\": \"z\"\n    }\n  },\n  \"userID\": \"u\"\n}";
+        let Unregister::Removed(out) = unregister_json(text) else {
+            panic!("外れない: {:?}", unregister_json(text));
+        };
+        assert_eq!(
+            out,
+            "{\n  \"firstStartTime\": \"x\",\n  \"mcpServers\": {\n    \"mine\": {\n      \"command\": \"npx\"\n    },\n    \"zzz\": {\n      \"command\": \"z\"\n    }\n  },\n  \"userID\": \"u\"\n}"
+        );
+        // 2 回目は無い
+        assert_eq!(unregister_json(&out), Unregister::Absent);
+        // 末尾の改行・タブの字下げ・CRLF を保つ
+        let tabbed = "{\r\n\t\"mcpServers\": {\r\n\t\t\"tako\": {\r\n\t\t\t\"command\": \"tako\"\r\n\t\t}\r\n\t}\r\n}\r\n";
+        assert_eq!(
+            unregister_json(tabbed),
+            Unregister::Removed("{\r\n\t\"mcpServers\": {}\r\n}\r\n".into())
+        );
+    }
+
+    #[test]
+    fn issue2788_jsonの境界() {
+        assert_eq!(unregister_json(""), Unregister::Absent);
+        assert_eq!(unregister_json("{}"), Unregister::Absent);
+        assert_eq!(unregister_json("{\"mcpServers\": {}}"), Unregister::Absent);
+        assert!(matches!(
+            unregister_json("{ broken"),
+            Unregister::Unreadable(_)
+        ));
+        assert_eq!(
+            unregister_json("{\"mcpServers\": {\"tako\": {\"command\": \"npx\", \"args\": [\"other-tako\"]}}}"),
+            Unregister::NotTako {
+                command: "npx".into()
+            }
+        );
+    }
+
+    #[test]
+    fn issue2788_tomlはtakoの表と子の表だけを外し他の行をバイトで保つ() {
+        let before = "# codex の設定\nmodel = \"gpt\"\n\n[mcp_servers.mine]\ncommand = \"npx\"\n";
+        let text = format!(
+            "{before}\n[mcp_servers.tako]\nenv_vars = [\"TAKO_SOCKET\", \"TAKO_TOKEN\"]\ncommand = \"/x/tako\"\nargs = [\"mcp\", \"serve\"]\n\n[mcp_servers.tako.env]\nA = \"b\"\n"
+        );
+        assert_eq!(unregister_toml(&text), Unregister::Removed(before.into()));
+        // 真ん中の表を外しても、次の表の注記は残り空行は二重にならない
+        let mid = "model = \"gpt\"\n\n[mcp_servers.tako]\ncommand = \"/x/tako\"\nargs = [\n  \"mcp\",\n  \"serve\",\n]\n\n# 自分のサーバー\n[mcp_servers.mine]\ncommand = \"npx\"\n";
+        assert_eq!(
+            unregister_toml(mid),
+            Unregister::Removed(
+                "model = \"gpt\"\n\n# 自分のサーバー\n[mcp_servers.mine]\ncommand = \"npx\"\n".into()
+            )
+        );
+        // 2 回目は無い
+        assert_eq!(unregister_toml(before), Unregister::Absent);
+    }
+
+    #[test]
+    fn issue2788_tomlの境界() {
+        assert_eq!(unregister_toml(""), Unregister::Absent);
+        assert!(matches!(
+            unregister_toml("[mcp_servers.tako\n"),
+            Unregister::Unreadable(_)
+        ));
+        assert_eq!(
+            unregister_toml("[mcp_servers.tako]\ncommand = \"npx\"\n"),
+            Unregister::NotTako {
+                command: "npx".into()
+            }
+        );
+        // インライン表は見出しの表でないので外さない（書き換えずに残す）
+        assert_eq!(
+            unregister_toml("[mcp_servers]\ntako = { command = \"/x/tako\" }\n"),
+            Unregister::UnsupportedShape
+        );
+        // 引用符の見出しも同じ表として外す
+        assert_eq!(
+            unregister_toml("a = 1\n\n[\"mcp_servers\".'tako']\ncommand = \"tako\"\n"),
+            Unregister::Removed("a = 1\n".into())
+        );
+    }
+
+    #[test]
+    fn issue2788_配列の途中の行を見出しと読まない() {
+        assert_eq!(toml_header_keys("[1, 2],"), None);
+        assert_eq!(toml_header_keys("  [\"a\", \"b\"]"), None);
+        assert_eq!(toml_header_keys("[a.b] = 1"), None);
+        assert_eq!(
+            toml_header_keys("[[ a . \"b.c\" ]] # x"),
+            Some(vec!["a".to_string(), "b.c".to_string()])
+        );
     }
 }
