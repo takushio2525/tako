@@ -27194,21 +27194,28 @@ fn send_attached_land(
 /// 表示中は `Send` と同じく断る: 数字・Enter は選択の確定になり、矢印・Escape もダイアログの
 /// 操作になる（応答は `tako_orchestrator_respond` の 1 本 = 実在の再検証つき）。
 /// `Send` の生の ESC を含む文字列の素通し（#748）とは違い、ここに例外は無い。
-/// 1 キーずつ書く（続けて送ったキーは端末側で 1 回に読まれることがある）
+/// 1 キーずつ書く（続けて送ったキーは端末側で 1 回に読まれることがある）。
+/// 修飾付き Enter（`S-Enter` 等）の形は送り先のペインの器で選ぶ（#729。GUI の打鍵と同じ
+/// `TmuxHost::pane_extended_keys` → `tako_core::backend::modified_enter_bytes`）
 fn send_keys_to_pane(
     host: &mut dyn ControlHost,
     pane: Option<u64>,
     keys: &[String],
     tmux_session: Option<&str>,
 ) -> Result<Value, DispatchError> {
-    let bytes = tako_core::backend::keys_to_bytes(keys)
-        .map_err(|refusal| DispatchError::InvalidParams(refusal.to_string()))?;
+    let encode = |extended_keys: bool| {
+        tako_core::backend::keys_to_bytes(keys, extended_keys)
+            .map_err(|refusal| DispatchError::InvalidParams(refusal.to_string()))
+    };
+    // 名前の検証は送り先を引く前（知らない名前は器に依らず断る）
+    encode(true)?;
     if let Some(err) = dialog_blocks_input(host, pane, tmux_session) {
         return Err(err);
     }
     let reply = json!({ "keys": keys });
     match resolve_pane(host.workspace(), pane) {
         Ok((_, target)) => {
+            let bytes = encode(host.pane_extended_keys(target))?;
             let session = host
                 .session(target)
                 .ok_or(DispatchError::NoSession(target.as_u64()))?;
@@ -30941,6 +30948,9 @@ mod tests {
         menu_ops: Vec<crate::protocol::MenuOp>,
         /// ペイン → バックエンド tmux セッション名（#571 の e2e で実セッションを差す）
         backend_sessions: std::collections::HashMap<u64, String>,
+        /// #729: 器の能力の差し替え（None = プロセスの backend）。psmux の無い機で
+        /// CSI u を運べない器のペインを作る
+        backend_caps: Option<tako_core::backend::BackendCapabilities>,
         /// #1185: ペイン → 取り込みビュー（`tako tmux open` の登録先）。
         /// `track_tmux_view` が入れるので、製品と同じ経路で埋まる
         tmux_views: std::collections::HashMap<u64, tako_core::TmuxView>,
@@ -31108,6 +31118,7 @@ mod tests {
                 menu_bar: sample_menu_bar(),
                 menu_ops: Vec::new(),
                 backend_sessions: std::collections::HashMap::new(),
+                backend_caps: None,
                 tmux_views: std::collections::HashMap::new(),
                 sessions: std::collections::HashMap::new(),
                 tab_cols: None,
@@ -31263,6 +31274,10 @@ mod tests {
     impl TmuxHost for MockHost {
         fn backend_session(&self, pane: PaneId) -> Option<String> {
             self.backend_sessions.get(&pane.as_u64()).cloned()
+        }
+        fn backend_capabilities(&self) -> tako_core::backend::BackendCapabilities {
+            self.backend_caps
+                .unwrap_or_else(tako_core::backend::capabilities)
         }
         fn tmux_view(&self, pane: PaneId) -> Option<tako_core::TmuxView> {
             self.tmux_views.get(&pane.as_u64()).cloned()
@@ -45894,6 +45909,76 @@ tako | pane 2 [ compact ]       [-]
         .expect("送れる");
         assert_eq!(reply, json!({ "keys": ["Escape", "C-c", "Up"] }));
         assert_eq!(i2743_received(&out, 5), b"\x1b\x03\x1b[A");
+    }
+
+    /// #729: 本番の psmux の器の能力（CSI u を運べない）
+    fn i729_psmux_caps() -> tako_core::backend::BackendCapabilities {
+        use tako_core::backend::SessionBackend;
+        tako_core::backend::psmux::PsmuxBackend::with_parts(
+            "psmux".into(),
+            "3.3.7".into(),
+            "t729".into(),
+            PathBuf::from("unused-729"),
+        )
+        .capabilities()
+    }
+
+    /// #729: keys の修飾付き Enter の形を決めるのは**ペイン単位**の判定（そのペインの器）。
+    /// dispatch の `SendKeys` は `pane_extended_keys` → `keys_to_bytes` の順に引くので、その組を
+    /// 両 OS で見る（実 PTY の受信は下の unix のテスト）
+    #[test]
+    fn issue729_keysの修飾付きenterの形はそのペインの器で決まる() {
+        let mut host = MockHost::new();
+        let pane = PaneId::from_raw(host.root_pane());
+        let s_enter = vec!["S-Enter".to_string()];
+        let bytes = |host: &MockHost| {
+            tako_core::backend::keys_to_bytes(&s_enter, host.pane_extended_keys(pane)).unwrap()
+        };
+        // CSI u を運べない器（psmux）の環境でも、器に包まれていないペインは CSI u のまま
+        host.backend_caps = Some(i729_psmux_caps());
+        assert_eq!(bytes(&host), vec![b"\x1b[13;2u".to_vec()], "器なし");
+        // そのペインが psmux の器に包まれていれば ESC CR
+        host.backend_sessions
+            .insert(pane.as_u64(), "tako-729".into());
+        assert_eq!(bytes(&host), vec![b"\x1b\r".to_vec()], "psmux の器");
+        // tmux の器（CSI u を運べる）なら CSI u のまま = macOS の挙動は変わらない
+        host.backend_caps = Some(tako_core::backend::BackendCapabilities {
+            extended_keys: true,
+            ..i729_psmux_caps()
+        });
+        assert_eq!(bytes(&host), vec![b"\x1b[13;2u".to_vec()], "運べる器");
+    }
+
+    /// #729: 実 PTY の子が受け取るバイト列。器なしのペインへは CSI u、CSI u を運べない器
+    /// （psmux の能力）のペインへは ESC CR が届き、素の Enter はどちらも CR のまま
+    #[cfg(unix)]
+    #[test]
+    fn issue729_keysの修飾付きenterは器がcsi_uを運べないペインへesc_crで届く() {
+        let tmp = tako_core::test_residue::ScratchDir::new("i729-keys");
+        let keys = &["S-Enter", "C-Enter", "Enter"];
+
+        let direct = tmp.path().join("direct");
+        let mut host = MockHost::new();
+        host.backend_caps = Some(i729_psmux_caps());
+        let pane = i2743_recorder(&mut host, "$ ready-729", &direct, 15, None);
+        dispatch(&mut host, i2743_keys(pane, keys), PaneOrigin::Mcp).expect("送れる");
+        assert_eq!(
+            i2743_received(&direct, 15),
+            b"\x1b[13;2u\x1b[13;5u\r",
+            "器なしのペインは CSI u のまま"
+        );
+
+        let wrapped = tmp.path().join("wrapped");
+        let mut host = MockHost::new();
+        host.backend_caps = Some(i729_psmux_caps());
+        let pane = i2743_recorder(&mut host, "$ ready-729", &wrapped, 5, None);
+        host.backend_sessions.insert(pane, "tako-729".into());
+        dispatch(&mut host, i2743_keys(pane, keys), PaneOrigin::Mcp).expect("送れる");
+        assert_eq!(
+            i2743_received(&wrapped, 5),
+            b"\x1b\r\x1b\r\r",
+            "psmux の器のペインは ESC CR"
+        );
     }
 
     /// 受け入れ条件 3: 添付は置き場へ写り、送った本文にそのパスが入る。同期の腕と、IPC / MCP の

@@ -823,7 +823,8 @@ tako mod / MCP tako_mod ──▶ ModHub を読んで行に組む（報告が無
   `psmux: N config warning(s):` が**ペインの出力へ**混ざって画面解析と `tako read` を
   汚す（実機実測）。警告が出る = その行は元から効いていないので、落としても器の挙動は
   変わらない。対応する能力は `extended_keys`（CSI u / kitty の要求を器へ渡せるか。
-  #28 の前提）と `suppresses_copy_mode_indicator` で、どちらも `tako persist` /
+  #28 の前提。false の器のペインは修飾付き Enter を `ESC CR` で送る = #729・下記「修飾付きキー」）と
+  `suppresses_copy_mode_indicator` で、どちらも `tako persist` /
   MCP の `backend` 応答に出る。拒否される設定の正本は
   `backend::psmux::UNKNOWN_OPTIONS`（実測で拒否されたものだけ。psmux 版 conf に
   無いだけの `default-terminal` / `escape-time` は psmux が受理するので含めない）
@@ -1046,6 +1047,21 @@ client_tty = backend セッションの pane_tty）ため、backend を先に見
   Esc を CSI 27u で送るのはアプリ自身の kitty 要求を外側 Term が直接見た場合
   （`CsiUMode::Full`）のみ。往復 + 「27u」非漏出は e2e 済み、Shift+Enter の
   GUI 実キー経路はセルフテスト 45b で回帰防止
+  - **例外: CSI u を運べない器のペインでは修飾付き Enter を `ESC CR` へ落とす**（#729）。
+    「全ペイン常時」の前提は器が CSI u を運ぶこと（tmux は `extended-keys`）で、psmux は
+    CSI u も modifyOtherKeys（`ESC[27;2;13~`）も内側へ通さない。psmux が通す形のうち
+    Claude Code が「送信せず改行」と読むのは `ESC CR`（meta-Enter）だけ（Issue #729 の実測表）。
+    判定は**ペイン単位**: `TmuxHost::pane_extended_keys(pane)` = そのペインが器に包まれて
+    いれば器の能力 `BackendCapabilities::extended_keys`（tmux = true / psmux = false）、
+    包まれていなければ true（Windows の ConPTY の直接ペインは CSI u をそのまま運ぶので
+    `cfg!(windows)` では分岐しない）。符号化は `tako_core::backend::modified_enter_bytes`
+    の 1 実装で、GUI の打鍵（`keystroke_to_bytes`）と AI の送信（`tako_send_input` の keys の
+    `S-Enter` / `C-Enter` / `M-Enter` = `key_name_bytes_in`）が同じ関数を通る。Shift / Ctrl /
+    Alt の区別は畳まれる（区別を保って何も届かないより改行が届く方を採る）。Enter 以外の
+    修飾キー（Shift+Tab 等）は対象外で CSI u のまま。器を知らない呼び手（ダイアログの応答）の
+    `key_name_bytes` は修飾付き Enter を推測で出さない（None）。A/B は `TAKO_729_LEGACY=1`
+    （常に CSI u）、検証プロセスだけの注入 `TAKO_729_INJECT=no-extended-keys` は器のペインを
+    CSI u を運べない器として扱う（psmux の無い macOS の tmux の器で `1b 0d` の実経路を見る）
 - **IME 候補・未確定文字列の位置は shaping で出す**: `pane_cursor_origin` を
   col × セル幅の線形換算にすると全角行で打ち進めるほど右へずれる（描画は実フォント幅）。
   `cell_at` の逆写像（`ScreenLine::cell_cols` + `shape_line`）で求める

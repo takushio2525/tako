@@ -18570,8 +18570,11 @@ impl TakoApp {
         } else {
             CsiUMode::ModifiedOnly
         };
-        if let Some(bytes) = keystroke_to_bytes(keystroke, csi_u) {
-            let pane = self.focused_pane();
+        let pane = self.focused_pane();
+        // #729: ただし CSI u を運べない器（psmux）のペインでは修飾付き Enter を ESC CR へ落とす。
+        // 判定はペイン単位（そのペインの器）で、AI の送信（`tako_send_input` の keys）と同じ 1 本
+        let extended_keys = TmuxHost::pane_extended_keys(self, pane);
+        if let Some(bytes) = keystroke_to_bytes(keystroke, csi_u, extended_keys) {
             // #2425: 起動待ちのペインへは流さない（後から打つ起動コマンドと入力行で混ざる）。
             // 受け付けなかったことは帯に出す。処理済みを宣言して IME への回送（insertText）も止める
             if self.launch_wait_holds_input(pane, cx) {

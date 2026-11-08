@@ -749,9 +749,10 @@
     },
     {
       "key": "tako_send_input",
-      "status": "supported",
+      "status": "degraded",
+      "note_ja": "器（psmux）のペインでは修飾付き Enter（keys の S-Enter / C-Enter / M-Enter と GUI の Shift / Ctrl / Alt+Enter）を ESC CR（Alt+Enter）へ畳んで送る。Claude Code では改行になるが、Shift / Ctrl / Alt の区別は失われる（psmux が CSI u を内側へ通さないため。#729）。器に包まれていないペインは CSI u のまま。本物の psmux 3.3.7 で claude に改行として届くかは今の実装では未実測",
       "evidence": "self-test",
-      "evidence_detail": "項目 19（tako send）。非 ASCII は #907 で器の注入口へ迂回済み"
+      "evidence_detail": "項目 19（tako send）。非 ASCII は #907 で器の注入口へ迂回済み。#729: 修飾付き Enter の形はペインの器の能力 extended_keys（psmux = false）で選び、GUI の打鍵と keys が同じ tako_core::backend::modified_enter_bytes を通ることを tako-core / tako-control / tako-app の単体（CI の Windows ジョブでも走る）が固定。本物の psmux 3.3.7 での到達は未実測"
     },
     {
       "key": "tako_session_restart",

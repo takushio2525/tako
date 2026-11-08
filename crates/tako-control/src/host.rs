@@ -195,6 +195,20 @@ pub trait TmuxHost {
     fn backend_session(&self, _pane: PaneId) -> Option<String> {
         None
     }
+    /// 器の能力（#729。既定はプロセスの backend = `tako_core::backend::capabilities`）。
+    /// テストの実装は差し替えて、psmux の無い機でも CSI u を運べない器を見る
+    fn backend_capabilities(&self) -> tako_core::backend::BackendCapabilities {
+        tako_core::backend::capabilities()
+    }
+    /// このペインへ CSI u（拡張キー）が届くか（#729。**ペイン単位** = そのペインの器）。
+    /// GUI の打鍵（`keystroke_to_bytes`）と dispatch の `SendKeys` がこの 1 本で引き、
+    /// 修飾付き Enter の形（CSI u / `ESC CR`）を `tako_core::backend::modified_enter_bytes` で選ぶ
+    fn pane_extended_keys(&self, pane: PaneId) -> bool {
+        tako_core::backend::pane_extended_keys(
+            &self.backend_capabilities(),
+            self.backend_session(pane).is_some(),
+        )
+    }
     /// ペインのスクロール実体が tmux 側にあるか（バックエンドセッション、または
     /// `tako tmux open` の TmuxOpen ビュー。#181）。dispatch の `Scroll` をミラー経路
     /// （`backend_scroll_view`）へ回すかの判定。UI を持たない実装の既定は

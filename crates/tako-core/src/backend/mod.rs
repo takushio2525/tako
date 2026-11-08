@@ -777,7 +777,22 @@ pub trait DetachedAccess: DetachedCapture {
 ///
 /// `tako_send_input` の `keys`（CLI `tako send --key`。#2743）もこの語彙で、スマホの PWA の
 /// クイックキー（`Escape` / `Tab` / `C-c` / `Up` / `Down`）を含む。断りに添える一覧は [`KEY_NAMES`]
+///
+/// **修飾付き Enter（`S-Enter` 等）は `None`**: その形は送り先のペインの器で変わる（#729）ので、
+/// 器を知らない呼び手には推測で出さない。ペインが分かる呼び手は [`key_name_bytes_in`] を使う
 pub fn key_name_bytes(key: &str) -> Option<Vec<u8>> {
+    if modified_enter_mods(key).is_some() {
+        return None;
+    }
+    key_name_bytes_in(key, true)
+}
+
+/// [`key_name_bytes`] の語彙の正本。`extended_keys` は送り先のペインへ CSI u が届くか
+/// （[`pane_extended_keys`]）で、修飾付き Enter の形だけがこれで変わる（#729）
+pub fn key_name_bytes_in(key: &str, extended_keys: bool) -> Option<Vec<u8>> {
+    if let Some(mods) = modified_enter_mods(key) {
+        return Some(modified_enter_bytes(mods, extended_keys));
+    }
     // 端末の Enter は CR（LF は「改行挿入」と解釈され送信にならない。#95）
     let seq: &[u8] = match key {
         "Enter" | "C-m" => b"\r",
@@ -811,9 +826,83 @@ pub fn key_name_bytes(key: &str) -> Option<Vec<u8>> {
     Some(seq.to_vec())
 }
 
-/// [`key_name_bytes`] が受ける名前の一覧（知らない名前を断るときに添える。ASCII だけ）
-pub const KEY_NAMES: &str =
-    "Enter, Escape, Tab, Space, Up, Down, Left, Right, C-<a-z> (C-c ...), 1 ASCII char";
+/// 修飾付き Enter の名前（`S-Enter` / `M-Enter` / `C-Enter` と組み合わせ `C-S-Enter` 等。tmux の
+/// `send-keys` と同じ綴り）の修飾の値（xterm / kitty の 1 + shift | alt<<1 | ctrl<<2）。
+/// 修飾付き Enter でなければ `None`（`C-m` は Ctrl+M = 素の Enter のまま）
+fn modified_enter_mods(key: &str) -> Option<u8> {
+    let mut rest = key;
+    let mut bits = 0u8;
+    while let Some((bit, tail)) = [("S-", 1u8), ("M-", 2), ("C-", 4)]
+        .into_iter()
+        .find_map(|(prefix, bit)| rest.strip_prefix(prefix).map(|tail| (bit, tail)))
+    {
+        // 同じ修飾を 2 度書いた形（`S-S-Enter`）は推測しない
+        if bits & bit != 0 {
+            return None;
+        }
+        bits |= bit;
+        rest = tail;
+    }
+    (bits != 0 && rest == "Enter").then_some(1 + bits)
+}
+
+/// 修飾付き Enter を端末へ書くバイト列（#729。**GUI の打鍵と `tako_send_input` の `keys` の 1 実装**）。
+///
+/// `mods` は xterm / kitty の修飾の値（1 + shift | alt<<1 | ctrl<<2 | super<<3）。
+/// `extended_keys` は送り先のペインへ CSI u が届くか（[`pane_extended_keys`]）。
+///
+/// - 届く（器なしのペイン・tmux の器）: `ESC [ 13 ; mods u`（#28。tmux は `extended-keys` で運ぶ）
+/// - 届かない器（psmux）: `ESC CR`（meta-Enter）。psmux は CSI u も modifyOtherKeys も内側へ通さず、
+///   通す形のうち Claude Code が「送信せず改行」と読むのはこれだけ（#729 の実測表）。
+///   Shift / Ctrl / Alt の区別はここで畳まれる（区別を保って何も届かないより、改行が届く方を採る）
+///
+/// 修飾が無い（`mods <= 1`）なら素の Enter = CR
+pub fn modified_enter_bytes(mods: u8, extended_keys: bool) -> Vec<u8> {
+    if mods <= 1 {
+        return b"\r".to_vec();
+    }
+    if extended_keys {
+        format!("\x1b[13;{mods}u").into_bytes()
+    } else {
+        b"\x1b\r".to_vec()
+    }
+}
+
+/// このペインへ CSI u（拡張キー）が届くか（#729。**ペイン単位**の判定の本体 = 純関数）。
+///
+/// 器に包まれていないペイン（persist OFF・器なしの backend・Windows の ConPTY の直接ペイン）は
+/// 間に何も挟まらないので true（#729 の実測: ConPTY は CSI u をそのまま運ぶ）。
+/// 器に包まれていれば器の能力 [`BackendCapabilities::extended_keys`]（tmux = true / psmux = false）。
+/// OS では分岐しない（Windows でも器なしのペインは CSI u のまま）
+pub fn extended_keys_for_pane(caps: &BackendCapabilities, in_container: bool) -> bool {
+    !in_container || caps.extended_keys
+}
+
+/// [`extended_keys_for_pane`] の入口（A/B と注入の env を読む）。GUI の打鍵と dispatch の
+/// `SendKeys` は `tako_control::TmuxHost::pane_extended_keys` からここを通る。
+///
+/// - A/B: `TAKO_729_LEGACY=1` は器の能力を見ず常に CSI u（#729 前の形）
+/// - 注入: 検証プロセス（[`crate::paths::is_verification_process`]）だけ
+///   `TAKO_729_INJECT=no-extended-keys` で器のペインを「CSI u を運べない器」として扱う
+///   （psmux の無い macOS で、`ESC CR` へ落ちる実経路を tmux の器の上で観る）
+pub fn pane_extended_keys(caps: &BackendCapabilities, in_container: bool) -> bool {
+    if std::env::var_os("TAKO_729_LEGACY").is_some_and(|v| v == "1") {
+        return true;
+    }
+    if in_container && issue729_inject_no_extended_keys() {
+        return false;
+    }
+    extended_keys_for_pane(caps, in_container)
+}
+
+fn issue729_inject_no_extended_keys() -> bool {
+    crate::paths::is_verification_process()
+        && std::env::var("TAKO_729_INJECT").as_deref() == Ok("no-extended-keys")
+}
+
+/// [`key_name_bytes_in`] が受ける名前の一覧（知らない名前を断るときに添える。ASCII だけ）
+pub const KEY_NAMES: &str = "Enter, S-Enter / C-Enter / M-Enter (newline), Escape, Tab, Space, \
+     Up, Down, Left, Right, C-<a-z> (C-c ...), 1 ASCII char";
 
 /// 知らないキー名を断る理由（#2743。`tako_send_input` の `keys` / `tako send --key`）。
 /// 表示（`Display`）は表示言語に従う（#2365）
@@ -848,13 +937,14 @@ impl std::fmt::Display for KeyRefusal {
 }
 
 /// キー名の列を、書く順のバイト列へ直す（#2743）。1 つでも知らない名前があれば何も返さない
-/// （途中まで送ってから断ると、送った分だけ画面が動いてしまう）
-pub fn keys_to_bytes(keys: &[String]) -> Result<Vec<Vec<u8>>, KeyRefusal> {
+/// （途中まで送ってから断ると、送った分だけ画面が動いてしまう）。
+/// `extended_keys` は送り先のペインへ CSI u が届くか（#729。[`key_name_bytes_in`]）
+pub fn keys_to_bytes(keys: &[String], extended_keys: bool) -> Result<Vec<Vec<u8>>, KeyRefusal> {
     if keys.is_empty() {
         return Err(KeyRefusal::Empty);
     }
     keys.iter()
-        .map(|k| key_name_bytes(k).ok_or_else(|| KeyRefusal::Unknown(k.clone())))
+        .map(|k| key_name_bytes_in(k, extended_keys).ok_or_else(|| KeyRefusal::Unknown(k.clone())))
         .collect()
 }
 
@@ -2370,17 +2460,119 @@ mod tests {
         }
         let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            super::keys_to_bytes(&keys(&["Escape", "Enter"])),
+            super::keys_to_bytes(&keys(&["Escape", "Enter"]), true),
             Ok(vec![b"\x1b".to_vec(), b"\r".to_vec()])
         );
-        assert_eq!(super::keys_to_bytes(&[]), Err(super::KeyRefusal::Empty));
         assert_eq!(
-            super::keys_to_bytes(&keys(&["Escape", "Esc"])),
+            super::keys_to_bytes(&[], true),
+            Err(super::KeyRefusal::Empty)
+        );
+        assert_eq!(
+            super::keys_to_bytes(&keys(&["Escape", "Esc"]), true),
             Err(super::KeyRefusal::Unknown("Esc".into()))
         );
         let ja = super::KeyRefusal::Unknown("Esc".into()).text_in(crate::i18n::Lang::Ja);
         let en = super::KeyRefusal::Unknown("Esc".into()).text_in(crate::i18n::Lang::En);
         assert!(ja.starts_with("知らないキー名: \"Esc\""), "{ja}");
         assert!(en.starts_with("unknown key name: \"Esc\""), "{en}");
+    }
+
+    /// #729: 修飾付き Enter の形は「送り先のペインへ CSI u が届くか」だけで決まる。
+    /// 届かない器（psmux）のペインだけ ESC CR（meta-Enter）へ落とし、Shift / Ctrl / Alt を畳む
+    #[test]
+    fn issue729_修飾付きenterは器がcsi_uを運べないときだけesc_crへ落ちる() {
+        // 届く（器なし・tmux の器）: CSI u のまま（#28）
+        assert_eq!(super::modified_enter_bytes(2, true), b"\x1b[13;2u");
+        assert_eq!(super::modified_enter_bytes(3, true), b"\x1b[13;3u");
+        assert_eq!(super::modified_enter_bytes(5, true), b"\x1b[13;5u");
+        // 届かない器: どの修飾も ESC CR
+        for mods in [2, 3, 5, 6, 7] {
+            assert_eq!(
+                super::modified_enter_bytes(mods, false),
+                b"\x1b\r",
+                "mods={mods}"
+            );
+        }
+        // 境界: 修飾なしは器に依らず素の CR（Enter を ESC CR にすると送信が改行に化ける）
+        assert_eq!(super::modified_enter_bytes(1, false), b"\r");
+        assert_eq!(super::modified_enter_bytes(1, true), b"\r");
+    }
+
+    /// #729: 判定はペイン単位。器に包まれたペインだけが器の能力に従い、器なしのペインは
+    /// どの backend でも CSI u のまま（Windows の ConPTY の直接ペインを巻き添えにしない）。
+    /// 能力は本番の backend の実装から引く
+    #[test]
+    fn issue729_csi_uが届くかはそのペインの器で決まる() {
+        let tmux = super::tmux::TmuxBackend::new().capabilities();
+        let psmux = super::psmux::PsmuxBackend::with_parts(
+            "psmux".into(),
+            "3.3.7".into(),
+            "t729".into(),
+            std::path::PathBuf::from("unused-729"),
+        )
+        .capabilities();
+        let none = super::null::NullBackend.capabilities();
+        assert!(
+            !psmux.extended_keys,
+            "psmux は CSI u を運べない（#974 の実測）"
+        );
+        assert!(!super::extended_keys_for_pane(&psmux, true), "psmux の器");
+        assert!(
+            super::extended_keys_for_pane(&psmux, false),
+            "psmux 環境の器なしのペイン"
+        );
+        assert!(super::extended_keys_for_pane(&tmux, true), "tmux の器");
+        assert!(super::extended_keys_for_pane(&tmux, false));
+        assert!(super::extended_keys_for_pane(&none, true));
+        assert!(super::extended_keys_for_pane(&none, false));
+        // env の入口は本体と同じ答え（テストのプロセスは A/B も注入も立てていない）
+        for (caps, in_container) in [(&psmux, true), (&psmux, false), (&tmux, true)] {
+            assert_eq!(
+                super::pane_extended_keys(caps, in_container),
+                super::extended_keys_for_pane(caps, in_container)
+            );
+        }
+    }
+
+    /// #729: `tako_send_input` の keys の修飾付き Enter の名前（tmux の `send-keys` と同じ綴り）
+    #[test]
+    fn issue729_keysの修飾付きenterの名前() {
+        let csi_u = |k: &str| super::key_name_bytes_in(k, true);
+        let legacy = |k: &str| super::key_name_bytes_in(k, false);
+        assert_eq!(csi_u("S-Enter").as_deref(), Some(&b"\x1b[13;2u"[..]));
+        assert_eq!(csi_u("M-Enter").as_deref(), Some(&b"\x1b[13;3u"[..]));
+        assert_eq!(csi_u("C-Enter").as_deref(), Some(&b"\x1b[13;5u"[..]));
+        assert_eq!(csi_u("C-S-Enter").as_deref(), Some(&b"\x1b[13;6u"[..]));
+        assert_eq!(csi_u("S-C-Enter").as_deref(), Some(&b"\x1b[13;6u"[..]));
+        for k in ["S-Enter", "M-Enter", "C-Enter", "C-S-Enter"] {
+            assert_eq!(legacy(k).as_deref(), Some(&b"\x1b\r"[..]), "{k}");
+        }
+        // 境界: 修飾なしの Enter と `C-m` は器に依らず CR、他のキーも器に依らない
+        for k in ["Enter", "C-m"] {
+            assert_eq!(legacy(k).as_deref(), Some(&b"\r"[..]), "{k}");
+            assert_eq!(csi_u(k).as_deref(), Some(&b"\r"[..]), "{k}");
+        }
+        assert_eq!(legacy("Escape"), csi_u("Escape"));
+        assert_eq!(legacy("C-c"), csi_u("C-c"));
+        // 推測しない形
+        for k in ["S-S-Enter", "S-", "X-Enter", "S-Tab", "s-Enter", "S-Enterx"] {
+            assert_eq!(csi_u(k), None, "{k}");
+        }
+        // 器を知らない呼び手（ダイアログの応答）には修飾付き Enter を出さない
+        assert_eq!(super::key_name_bytes("S-Enter"), None);
+        assert_eq!(super::key_name_bytes("C-Enter"), None);
+        assert_eq!(super::key_name_bytes("Enter").as_deref(), Some(&b"\r"[..]));
+        // 列の変換もペインの判定を通す。名前の検証は器に依らない
+        let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::keys_to_bytes(&keys(&["S-Enter", "Enter"]), false),
+            Ok(vec![b"\x1b\r".to_vec(), b"\r".to_vec()])
+        );
+        assert_eq!(
+            super::keys_to_bytes(&keys(&["S-Enter", "Enter"]), true),
+            Ok(vec![b"\x1b[13;2u".to_vec(), b"\r".to_vec()])
+        );
+        assert!(super::KEY_NAMES.is_ascii());
+        assert!(super::KEY_NAMES.contains("S-Enter"));
     }
 }
