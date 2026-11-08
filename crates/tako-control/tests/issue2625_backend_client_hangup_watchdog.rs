@@ -221,8 +221,8 @@ fn issue2625_器のペインの端末は閉じ方の印を立てて起こす() {
     ] {
         assert!(
             cond_text.contains(needle),
-            "{MAIN}:{} の印を立てる条件に `{needle}` が無い（器でない直接のペインは閉じ方を変えない・判断は \
-             `tmux_backend::hang_up_client_on_close` の 1 か所 = A/B と psmux の除外が効く。#2625）",
+            "{MAIN}:{} の印を立てる条件に `{needle}` が無い（器のペインの判断は \
+             `tmux_backend::hang_up_client_on_close` の 1 か所 = A/B と psmux の除外が効く。器なしのペインは別の枝 = #2634 / #2803。#2625）",
             line_at(&src, start + cond)
         );
     }
