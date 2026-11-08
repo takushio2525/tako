@@ -501,8 +501,9 @@ fn check_pr_merged(pr_number: u32, repo: Option<&str>) -> CheckResult {
 /// `plain_stderr`（#2800）: stderr の CLIXML を平文へ戻して載せる。Windows の述語は境界 B1 が
 /// PowerShell へ `-EncodedCommand` で渡すので、stderr を捕捉すると Windows PowerShell 5.1 は cmdlet の
 /// エラーレコードを CLIXML（`#< CLIXML` + `<Objs …>`）で書く（`-OutputFormat Text` を付けても止まらない =
-/// #2790 で Windows の CI が実測）。#2800 より前はそれをそのまま載せていたので、失敗したゲートの理由が
-/// XML の中に埋もれていた。平文化は導入代行（`setup_bootstrap::run_installer`）と同じ 1 実装
+/// #2790 で Windows の CI が実測）。この経路は `-OutputFormat Text` を付けないので **pwsh 7 も同じく
+/// CLIXML で書く**（#2800 の CI で実測）。#2800 より前はそれをそのまま載せていたので、失敗したゲートの
+/// 理由が XML の中に埋もれていた。平文化は導入代行（`setup_bootstrap::run_installer`）と同じ 1 実装
 /// （[`tako_core::platform::shell::powershell_stderr_text`]）で、順番は [`plain_stderr_window`] を参照。
 /// `false` は `TAKO_2800_LEGACY=1`（捕捉したまま載せる = #2800 前の形）
 fn format_evidence(exit_code: i32, stdout: &str, stderr: &str, plain_stderr: bool) -> String {
@@ -876,9 +877,11 @@ mod tests {
 mod tests_2800 {
     use super::*;
 
-    /// 5.1 がゲートの述語（`Get-Item` の失敗）で書く stderr の形（#2790 の Windows の CI のログの実物と
-    /// 同じ並び: 見出し → 進捗 → エラーの文が 1 行ずつ `<S S="Error">`、最後に空白 1 文字の行）
-    const PS51_GATE_CLIXML: &str = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><Obj S=\"progress\" RefId=\"0\"><TN RefId=\"0\"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N=\"SourceId\">1</I64><PR N=\"Record\"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><S S=\"Error\">Get-Item : Cannot find path 'C:\\tako-2800-no-such\\missing.txt' because it does not exist._x000D__x000A_</S><S S=\"Error\">At line:4 char:1_x000D__x000A_</S><S S=\"Error\">+ Get-Item -LiteralPath 'C:\\tako-2800-no-such\\missing.txt'_x000D__x000A_</S><S S=\"Error\">+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S=\"Error\">    + CategoryInfo          : ObjectNotFound: (C:\\tako-2800-no-such\\missing.txt:String) [Get-Item], ItemNotFoundException_x000D__x000A_</S><S S=\"Error\">    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand_x000D__x000A_</S><S S=\"Error\"> _x000D__x000A_</S></Objs>";
+    /// 5.1 がゲートの述語（`Get-Item` の失敗）で書いた stderr の実物（PR #2807 の Windows の CI の
+    /// `TAKO2800_EVIDENCE_LEGACY arm=ps51 case=cmdlet` の行。置き場は架空のパス）。見出し → エラーの文が
+    /// 1 行ずつ `<S S="Error">`（CategoryInfo は幅で折り返して 2 つ）、最後に空白 1 文字の行。進捗は
+    /// `$ProgressPreference` で出ない
+    const PS51_GATE_CLIXML: &str = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><S S=\"Error\">Get-Item : Cannot find path 'C:\\tako-2800-no-such\\missing.txt' because it does not exist._x000D__x000A_</S><S S=\"Error\">At line:4 char:1_x000D__x000A_</S><S S=\"Error\">+ Get-Item -LiteralPath 'C:\\tako-2800-no-such\\missing.txt'_x000D__x000A_</S><S S=\"Error\">+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~_x000D__x000A_</S><S S=\"Error\">    + CategoryInfo          : ObjectNotFound: (C:\\tako-2800-no-such\\missing.txt:String) [Get-Item], ItemNotFoundExcept _x000D__x000A_</S><S S=\"Error\">   ion_x000D__x000A_</S><S S=\"Error\">    + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand_x000D__x000A_</S><S S=\"Error\"> _x000D__x000A_</S></Objs>";
 
     /// 1 件のエラーレコード（平文で 6 行）を `<S S="Error">` の並びにする
     fn error_record(message: &str) -> String {
@@ -919,7 +922,8 @@ mod tests_2800 {
              At line:4 char:1\n\
              + Get-Item -LiteralPath 'C:\\tako-2800-no-such\\missing.txt'\n\
              + ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n    \
-             + CategoryInfo          : ObjectNotFound: (C:\\tako-2800-no-such\\missing.txt:String) [Get-Item], ItemNotFoundException\n    \
+             + CategoryInfo          : ObjectNotFound: (C:\\tako-2800-no-such\\missing.txt:String) [Get-Item], ItemNotFoundExcept \n   \
+             ion\n    \
              + FullyQualifiedErrorId : PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand"
         );
         assert_no_clixml(&evidence);

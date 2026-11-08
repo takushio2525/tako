@@ -246,8 +246,12 @@ Windows 固有の要件が 3 つある（どれも実測）:
   失敗したゲートの理由を読むのが `evidence` の目的なのでここは機能の一部
 - **stderr の CLIXML を平文へ戻す（#2800）**。`-EncodedCommand` で起こした 5.1 は、
   捕捉された stderr に cmdlet のエラーレコードを CLIXML（`#< CLIXML` + `<Objs …>`）で
-  書く（`-OutputFormat Text` も見ない = #2790 で CI 実測）。`format_evidence` は導入代行と
-  同じ 1 実装 `platform::shell::powershell_stderr_text` で平文へ戻してから載せる。
+  書く（`-OutputFormat Text` も見ない = #2790 で CI 実測）。ゲートの argv は
+  `-OutputFormat Text` を付けないので pwsh 7 も同じく CLIXML で書く（#2800 の CI で実測）。
+  `format_evidence` は導入代行と同じ 1 実装 `platform::shell::powershell_stderr_text` で
+  平文へ戻してから載せる（版に依らない）。`Write-Host` の文字は stdout にも出るので、
+  平文化が情報レコードを捨てても evidence から消えない。pwsh 7 のエラーの文に入る
+  ANSI の色の符号は残る（修正前も XML の中の `_x001B_` として載っていた）。
   **範囲（5 行を超えたら末尾 5 行）は捕捉したままの行で選び、選んだ範囲を平文へ戻す**:
   5.1 は CLIXML を終了時に 1 行で書き、平文にしたエラーレコードは 1 件で 6 行以上・本文が
   先頭なので、逆の順だと本文が落ちる。CLIXML でない stderr（POSIX・ネイティブコマンド）は

@@ -3,7 +3,8 @@
 //!
 //! ゲートの述語は境界 B1（`platform::shell::output_command`）が PowerShell へ `-EncodedCommand` で渡す。
 //! 5.1 は stderr を捕捉されると cmdlet のエラーレコードを CLIXML（`#< CLIXML` + `<Objs …>`）で書く
-//! （`-OutputFormat Text` も見ない = #2790 で実測）。#2800 からは `acceptance_gates::format_evidence` が
+//! （`-OutputFormat Text` も見ない = #2790 で実測）。ゲートの argv はその指定も付けないので pwsh 7 も同じく
+//! CLIXML で書く（この検査の初回の CI で実測）。#2800 からは `acceptance_gates::format_evidence` が
 //! 導入代行と同じ 1 実装（`platform::shell::powershell_stderr_text`）で平文へ戻してから evidence へ載せる。
 //!
 //! 製品の口（`set_gate_payload_at` → `execute_gate_check_at` = `tako task gate check` / MCP
@@ -209,14 +210,15 @@ fn issue2800_ゲートの述語の51の失敗はstderrが平文で読める() {
                         case.id
                     );
                 }
-                // A/B: 修正前の形は 5.1 の cmdlet のエラーを CLIXML のまま載せていた（#2800 の症状）
-                if case.clixml {
-                    assert!(
-                        old_evidence.contains("#< CLIXML"),
-                        "{arm} {}: 修正前の形で CLIXML が出ない（前提が崩れた）: {old_evidence}",
-                        case.id
-                    );
-                }
+            }
+            // A/B: 修正前の形は cmdlet のエラーを CLIXML のまま載せていた（#2800 の症状）。ゲートの argv は
+            // `-OutputFormat Text` を付けないので 5.1 だけでなく pwsh 7 も CLIXML で書く（#2800 の CI で実測）
+            if case.clixml {
+                assert!(
+                    old_evidence.contains("#< CLIXML"),
+                    "{arm} {}: 修正前の形で CLIXML が出ない（前提が崩れた）: {old_evidence}",
+                    case.id
+                );
             }
             if !case.clixml {
                 // ネイティブコマンドの素の stderr は #2800 前と 1 バイトも変えない

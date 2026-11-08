@@ -1087,10 +1087,12 @@ fn powershell_output_argv(program: &str, script: &str) -> SpawnCommand {
 ///
 /// 上の 3 でも消えないのは **cmdlet のエラーレコード**（実機実測: `Get-Item` の失敗が CLIXML
 /// 632 バイト）と `Write-Host` の情報レコード（1078 バイト）。5.1 にこの直列化を止める手段は無い
-/// （`-OutputFormat Text` も見ない = #2790 で Windows の CI が実測）。#2800 からは捕捉した側
+/// （`-OutputFormat Text` も見ない = #2790 で Windows の CI が実測）。この argv は `-OutputFormat Text` を
+/// 付けないので pwsh 7 も同じく CLIXML で書く（#2800 の CI で実測）。#2800 からは捕捉した側
 /// （`acceptance_gates::format_evidence`）が [`powershell_stderr_text`] で平文へ戻してから evidence へ
-/// 載せる（導入代行と同じ 1 実装）。情報レコードは平文化が捨てる（文字にするのはストリームの
-/// `<S S="…">` だけ）。判定は終了コードで決まるので、平文化の前後で合否は変わらない
+/// 載せる（導入代行と同じ 1 実装。版に依らない）。情報レコードは平文化が捨てるが、`Write-Host` の文字は
+/// stdout にも出る（#2800 の CI で 5.1 / pwsh 7 とも実測）。判定は終了コードで決まるので、平文化の
+/// 前後で合否は変わらない
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_output_script(command: &str) -> String {
     format!(
