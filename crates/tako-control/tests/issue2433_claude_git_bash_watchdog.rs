@@ -129,10 +129,9 @@ fn issue2433_検査の期待と導入計画の1行が実測とそろう() {
         ("'bash-path-missing-git'", "'bash'"),
     ] {
         assert!(
-            script.lines().any(|l| {
-                let t = l.trim();
-                t.starts_with(case) && t.ends_with(&format!("= {shell}"))
-            }),
+            script.lines().any(|l| l
+                .split_once('=')
+                .is_some_and(|(k, v)| k.trim() == case && v.trim() == shell)),
             "{SCRIPT} の $Expect で {case} が {shell} でない（実測は #2433 / FR-2.37.10）"
         );
     }

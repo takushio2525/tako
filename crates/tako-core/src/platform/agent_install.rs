@@ -1143,22 +1143,20 @@ mod tests {
     /// PowerShell で走ることを知らせる。確かめていない系統・macOS には書かない（推測で埋めない）
     #[test]
     fn issue2433_windowsのclaudeだけがシェルの1行を持ちgitを要ると言わない() {
+        let mut with_note = Vec::new();
         for platform in [Platform::MacOs, Platform::Windows] {
             for agent in AgentKind::ALL {
-                let note = recipe(platform, agent).shell_note;
-                let who = format!("{}/{}", platform.as_str(), agent.as_str());
-                if platform == Platform::Windows && agent == AgentKind::Claude {
-                    let note = note.unwrap_or_else(|| panic!("{who} のシェルの 1 行が無い"));
-                    assert!(
-                        note.contains("Git for Windows は要りません"),
-                        "{who}: {note}"
-                    );
-                    assert!(note.contains("PowerShell"), "{who}: {note}");
-                    assert!(note.contains("Git Bash"), "{who}: {note}");
-                } else {
-                    assert_eq!(note, None, "{who} は確かめていないのにシェルの 1 行を持つ");
+                if let Some(note) = recipe(platform, agent).shell_note {
+                    with_note.push((platform, agent, note));
                 }
             }
+        }
+        let [(platform, agent, note)] = with_note[..] else {
+            panic!("シェルの 1 行を持つ手順が Windows の claude の 1 つでない: {with_note:?}");
+        };
+        assert_eq!((platform, agent), (Platform::Windows, AgentKind::Claude));
+        for needle in ["Git for Windows は要りません", "PowerShell", "Git Bash"] {
+            assert!(note.contains(needle), "「{needle}」が無い: {note}");
         }
     }
 }

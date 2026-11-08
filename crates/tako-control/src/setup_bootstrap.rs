@@ -3040,23 +3040,23 @@ mod tests {
         assert_eq!(json["shell_note"], note, "{json}");
         assert!(json["lines"].as_array().unwrap().iter().any(|l| l == note));
 
+        // 1 行を持つのは Windows の claude だけ（他の系統・macOS の計画の行と JSON には出ない）
+        let mut with_note = Vec::new();
         for platform in [Platform::MacOs, Platform::Windows] {
             for agent in AgentKind::ALL {
-                if platform == Platform::Windows && agent == AgentKind::Claude {
-                    continue;
-                }
                 let plan = plan_of(platform, agent, home);
-                assert!(
-                    plan.to_json()["shell_note"].is_null(),
-                    "{platform:?}/{agent:?}"
+                let in_lines = plan.lines().iter().any(|l| l.contains("Git for Windows"));
+                assert_eq!(
+                    in_lines,
+                    !plan.to_json()["shell_note"].is_null(),
+                    "{platform:?}/{agent:?}: 行と JSON がずれた"
                 );
-                assert!(
-                    !plan.lines().iter().any(|l| l.contains("Git for Windows")),
-                    "{platform:?}/{agent:?}: {:?}",
-                    plan.lines()
-                );
+                if in_lines {
+                    with_note.push((platform, agent));
+                }
             }
         }
+        assert_eq!(with_note, vec![(Platform::Windows, AgentKind::Claude)]);
     }
 
     /// 引き継ぎの指示文が系統ごとにその系統のログインコマンドを案内する（#989）
