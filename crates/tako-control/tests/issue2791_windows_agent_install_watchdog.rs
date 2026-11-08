@@ -85,12 +85,14 @@ fn issue2791_windowsの代行がclaudeだけという古い宣言が残ってい
         "Windows で代わりに導入まで行うのは claude だけ",
         "Windows で tako が実際にインストーラを走らせるのは `claude` だけ",
         "Windows で実行を代行するのは claude だけ",
+        "tako から実行を代行できるのは 3 系統のうち claude だけ",
     ];
     let files = [
         "crates/tako-core/src/platform/agent_install.rs",
         "crates/tako-core/src/platform/support.rs",
         "crates/tako-core/src/agent_support.rs",
         "crates/tako-control/src/mcp/catalog.rs",
+        "docs/src/content/docs/agents/claude.md",
         "docs/src/content/docs/agents/codex.md",
         "docs/src/content/docs/agents/agy.md",
         "docs/src/content/docs/getting-started/index.mdx",

@@ -142,7 +142,7 @@ tako は Windows 実機で動かして確かめたものだけを「対応」と
 | AI エージェント CLI | AI 連携に1つ以上必要 | `claude`（Claude Code）/ `codex`（OpenAI Codex CLI）/ `agy`（Antigravity CLI）のいずれか。**入っていなくても大丈夫です** — `tako setup` が導入まで案内します（ログインだけは、ブラウザ操作が必要なのでご自身で行います） |
 | tmux（Windows は psmux） | 推奨（リモート接続には必須） | ターミナルのセッション（作業状態）を保持するツール。入っていると **tako を閉じても実行中のプロセスが裏で動き続け、再起動しても画面ごと復元**されます。**スマホからのリモート接続（`tako remote`）にはこれが必須**です（Windows のリモート接続はまだ使えません）。オーケストレーター（master / worker）は無くても動きますが、tako を閉じると worker も止まり、次に開いたときに同じ会話で起き直します（実行中だった作業は途切れます。ほかの差は [tmux がない場合](/features/tmux-backend/#tmux-がない場合)）。macOS は `brew install tmux`、Windows は `winget install marlocarlo.psmux` で導入します（attach を前提にする一部の tmux 操作は Windows では使えません → [Windows 対応状況](/windows-support/)） |
 | [Tailscale](https://tailscale.com/) | リモート接続に必須 | `tako remote`（スマホからの接続）の transport。Mac とスマホの両方にアプリを入れて同一アカウントでログインすると、tailnet 内限定の固定 URL で安全に接続できます |
-| git | あると便利 | git パネル（ブランチ・コミットグラフ・diff 表示）で使います。macOS では `xcode-select --install` で入っていることが多いです |
+| git | あると便利 | git パネル（ブランチ・コミットグラフ・diff 表示）で使います。Windows では Claude Code がコマンドの実行に Git Bash を使いますが、無ければ PowerShell で実行するので claude はそのまま動きます。macOS では `xcode-select --install` で入っていることが多いです |
 
 :::note[tmux とは？]
 tmux（ティーマックス）は「ターミナルの中身を裏で生かしておく」ためのツールです。tako は tmux があると、アプリを閉じても実行中のコマンドや AI エージェントを裏で動かし続け、次回起動時にそのまま復元します。無くても tako は動作します（その場合、tako を閉じると実行中のプロセスも終わり、次の起動では会話を覚えている AI エージェントが同じ会話で起き直します。`tako remote` は使えません）。

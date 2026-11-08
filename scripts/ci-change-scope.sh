@@ -58,6 +58,8 @@ AGENT_INSTALL=(
   'crates/tako-core/tests/issue2791_agent_install_windows.rs|実走の段が同じポリシーの下で回す偽物の検査'
   'scripts/windows/test-agent-install-2791.ps1|実走の検査そのもの'
   'scripts/windows/lib/execution-policy.ps1|実走の検査が置くポリシーの 1 実装'
+  'scripts/windows/test-claude-git-bash-2433.ps1|claude が Git Bash 無しで動くことの実走検査そのもの（#2433）'
+  'scripts/windows/lib/fake-anthropic-2433.ps1|その検査が claude を向ける偽の Messages API（#2433）'
   'installer/windows/lib/user-path.ps1|実走の検査がユーザー環境変数 Path を戻す 1 実装'
   'scripts/ci-change-scope.sh|この判定そのもの'
   '.github/workflows/ci.yml|実走の段の配線'

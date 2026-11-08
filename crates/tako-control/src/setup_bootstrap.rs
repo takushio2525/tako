@@ -192,6 +192,9 @@ pub struct InstallPlan {
     pub auto_updates: bool,
     /// 以後どう更新されるかの 1 行（人が読む側。出どころは [`InstallRecipe::update_note`]）
     pub update_note: &'static str,
+    /// この系統がコマンドを走らせるシェルの 1 行（出どころは [`InstallRecipe::shell_note`]。
+    /// いまは Windows の claude だけ = Git for Windows が無くても動く。#2433）
+    pub shell_note: Option<&'static str>,
     /// tako が実行を代行できるか。false = 手順を案内するだけ
     pub can_run: bool,
 }
@@ -211,6 +214,9 @@ impl InstallPlan {
             out.push(format!("本体の置き場所: {}", display_path(payload)));
         }
         out.push(format!("以後の更新: {}", self.update_note));
+        if let Some(note) = self.shell_note {
+            out.push(note.to_string());
+        }
         out.push(privilege_line(self.platform));
         out
     }
@@ -236,6 +242,7 @@ impl InstallPlan {
             "payload": self.payload.as_ref().map(|p| p.display().to_string()),
             "auto_updates": self.auto_updates,
             "update_note": self.update_note,
+            "shell_note": self.shell_note,
             "can_run": self.can_run,
             "lines": self.lines(),
         })
@@ -529,6 +536,7 @@ pub fn plan_from(r: &InstallRecipe, home: &Path) -> InstallPlan {
         payload: r.payload_dir_in(home),
         auto_updates: r.auto_updates,
         update_note: r.update_note,
+        shell_note: r.shell_note,
         can_run: r.tako_can_run,
     }
 }
@@ -3003,6 +3011,50 @@ mod tests {
                 let lines = a.lines().join("\n");
                 assert!(lines.contains(a.product), "{lines}");
                 assert!(lines.contains(a.update_note), "{lines}");
+            }
+        }
+    }
+
+    /// Windows の claude の計画は「Git for Windows は要りません」を行と JSON の両方で知らせる（#2433）。
+    /// 出どころは手順の `shell_note` 1 か所で、macOS と他の系統の計画には出ない
+    #[test]
+    fn issue2433_windowsのclaudeの計画はgitが要らないことを行とjsonで知らせる() {
+        let home = Path::new("/tmp/h");
+        let win = plan_of(Platform::Windows, AgentKind::Claude, home);
+        let note = agent_install::recipe(Platform::Windows, AgentKind::Claude)
+            .shell_note
+            .expect("Windows の claude の手順にシェルの 1 行が無い");
+        let lines = win.lines();
+        assert!(
+            lines.iter().any(|l| l == note),
+            "計画の行にシェルの 1 行が無い: {lines:?}"
+        );
+        // 権限の行より前（「何をどこに入れるか」の並びの中）に出る
+        let at_note = lines.iter().position(|l| l == note).unwrap();
+        let at_privilege = lines
+            .iter()
+            .position(|l| *l == privilege_line(Platform::Windows))
+            .expect("権限の行が無い");
+        assert!(at_note < at_privilege, "{lines:?}");
+        let json = win.to_json();
+        assert_eq!(json["shell_note"], note, "{json}");
+        assert!(json["lines"].as_array().unwrap().iter().any(|l| l == note));
+
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for agent in AgentKind::ALL {
+                if platform == Platform::Windows && agent == AgentKind::Claude {
+                    continue;
+                }
+                let plan = plan_of(platform, agent, home);
+                assert!(
+                    plan.to_json()["shell_note"].is_null(),
+                    "{platform:?}/{agent:?}"
+                );
+                assert!(
+                    !plan.lines().iter().any(|l| l.contains("Git for Windows")),
+                    "{platform:?}/{agent:?}: {:?}",
+                    plan.lines()
+                );
             }
         }
     }

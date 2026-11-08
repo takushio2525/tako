@@ -124,6 +124,25 @@
 //!   `tako_setup_bootstrap` 行）はその旨を書いたうえで縮退のままにしてある
 //!
 //! A/B は `TAKO_2791_LEGACY=1`（Windows の codex / agy は状態照会と案内までに戻る。[`current_recipe`]）
+//!
+//! ## Windows の claude は Git Bash を要らない（2026-11-09 実測。#2433）
+//!
+//! #2433 の調査時点で、Claude Code の Windows ネイティブ版が Git Bash（Git for Windows）を要るかを
+//! setup が確かめていなかった（要るのに無い PC では「導入済み」と言った後で claude が止まるおそれ）。
+//! Windows の CI のランナーで本物の claude（2.1.319）を、Git を隠した砂場で起こして測った
+//! （`scripts/windows/test-claude-git-bash-2433.ps1`。認証は使わず、偽の Messages API へ向けて 1 ターン走らせる）:
+//!
+//! - **Git を隠しても入り、起動し、1 ターン走る**。シェルのツールは PowerShell だけが出て、
+//!   コマンドは PowerShell で走る（`--debug` の行は `Git Bash not found; BashTool will be unavailable`）。
+//!   認証なしの起動は Git の有無に依らず `Not logged in · Please run /login`（終了コード 1）
+//! - Git が既定の置き場（`C:\Program Files\Git`）に在れば **PATH に無くても** Bash を使う。標準でない
+//!   置き場の Git は PATH の `git` か `CLAUDE_CODE_GIT_BASH_PATH` で見つける
+//! - `CLAUDE_CODE_GIT_BASH_PATH` が存在しないファイルを指しても止まらず、自動検出へ戻る
+//!   （`[WARN] … not found; falling back to auto-detection`）
+//!
+//! だから setup は Git Bash の有無を段の判定に入れない（無くても `ready` へ進める）。違いは
+//! claude がコマンドを走らせるシェルだけなので、それを導入計画の 1 行（[`InstallRecipe::shell_note`]）で知らせる。
+//! 上流が Git Bash を必須へ戻したら、CI の同じ検査（導入代行の実走の段と同じ条件で走る）が組み合わせを名指しで落ちる
 
 use super::support::Platform;
 use std::path::PathBuf;
@@ -310,6 +329,12 @@ pub struct InstallRecipe {
     /// 文面を組まない**のは、codex が「自動ではないが自分で知らせる」の第 3 の形だから
     /// （`codex doctor` の `↑ updates … available`。実測）
     pub update_note: &'static str,
+    /// この系統がコマンドを走らせるシェルについて、導入の前に知らせる 1 行（人が読む側）。
+    ///
+    /// **段の判定には使わない**（要る物ではなく、有無で振る舞いが変わる物の説明）。いまは Windows の claude
+    /// だけが持つ: Git for Windows が無くても動き、そのときコマンドは PowerShell で走る（#2433 の実測）。
+    /// 確かめていない系統には書かない（codex / agy の Windows のシェルは推測で埋めない）
+    pub shell_note: Option<&'static str>,
     /// tako が実行を代行してよいか。false = 手順を案内するだけ
     pub tako_can_run: bool,
     /// インストールが失敗したときに案内する公式ページ（2026-09-09 に 200 を実測）。
@@ -409,6 +434,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             payload_rel: Some(".local/share/claude/versions"),
             auto_updates: true,
             update_note: "Claude Code が自分でバックグラウンド更新します",
+            shell_note: None,
             troubleshoot_url: "https://code.claude.com/docs/en/troubleshoot-install",
             tako_can_run: true,
             installer_env: &[],
@@ -432,6 +458,11 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             payload_rel: Some(".local/share/claude/versions"),
             auto_updates: true,
             update_note: "Claude Code が自分でバックグラウンド更新します",
+            // #2433: Git を隠したランナーで claude 2.1.319 が起動して 1 ターン走った（PowerShell ツール）
+            shell_note: Some(
+                "Git for Windows は要りません。無ければ claude は PowerShell でコマンドを実行し、\
+                 入っていれば Git Bash を使います",
+            ),
             troubleshoot_url: "https://code.claude.com/docs/en/troubleshoot-install",
             // #1057 で Windows 11 実機の通し実測を経て true へ倒した
             // （記録は `.agent/plans/2026-08-windows-main-merge-wip.md` の #1057 節）
@@ -454,6 +485,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             // 背景更新は無い。`codex doctor` が知らせるだけ（実測）
             auto_updates: false,
             update_note: "codex が新しい版を知らせます（`codex update` で更新します）",
+            shell_note: None,
             troubleshoot_url: "https://learn.chatgpt.com/docs/codex/cli",
             tako_can_run: true,
             // これが無いと最後の `Start Codex now? [y/N]` で返ってこない（実測）
@@ -479,6 +511,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             payload_rel: Some(".codex/packages/standalone"),
             auto_updates: false,
             update_note: "codex が新しい版を知らせます（`codex update` で更新します）",
+            shell_note: None,
             troubleshoot_url: "https://learn.chatgpt.com/docs/codex/cli",
             // ユーザー権限だけで入るので代行する（#2791。モジュールドキュメントの「Windows の codex / agy」）
             tako_can_run: true,
@@ -501,6 +534,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             payload_rel: None,
             auto_updates: true,
             update_note: "Antigravity CLI が実行のたびに自分で背景更新します",
+            shell_note: None,
             troubleshoot_url: "https://antigravity.google/docs/cli/troubleshooting",
             tako_can_run: true,
             installer_env: &[],
@@ -525,6 +559,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             payload_rel: None,
             auto_updates: true,
             update_note: "Antigravity CLI が実行のたびに自分で背景更新します",
+            shell_note: None,
             troubleshoot_url: "https://antigravity.google/docs/cli/troubleshooting",
             // ユーザー権限だけで入るので代行する（#2791。モジュールドキュメントの「Windows の codex / agy」）
             tako_can_run: true,
@@ -1102,5 +1137,28 @@ mod tests {
         }
         assert_eq!(AgentKind::parse("ollama"), None);
         assert_eq!(AgentKind::parse(""), None);
+    }
+
+    /// Windows の claude は Git for Windows が無くても動く（#2433 の実測）ので、手順は「要らない」と
+    /// PowerShell で走ることを知らせる。確かめていない系統・macOS には書かない（推測で埋めない）
+    #[test]
+    fn issue2433_windowsのclaudeだけがシェルの1行を持ちgitを要ると言わない() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for agent in AgentKind::ALL {
+                let note = recipe(platform, agent).shell_note;
+                let who = format!("{}/{}", platform.as_str(), agent.as_str());
+                if platform == Platform::Windows && agent == AgentKind::Claude {
+                    let note = note.unwrap_or_else(|| panic!("{who} のシェルの 1 行が無い"));
+                    assert!(
+                        note.contains("Git for Windows は要りません"),
+                        "{who}: {note}"
+                    );
+                    assert!(note.contains("PowerShell"), "{who}: {note}");
+                    assert!(note.contains("Git Bash"), "{who}: {note}");
+                } else {
+                    assert_eq!(note, None, "{who} は確かめていないのにシェルの 1 行を持つ");
+                }
+            }
+        }
     }
 }

@@ -381,7 +381,8 @@ for p in crates/tako-core/src/platform/agent_install.rs crates/tako-core/src/pla
   crates/tako-control/src/setup_bootstrap.rs scripts/windows/test-agent-install-2791.ps1 \
   scripts/windows/lib/execution-policy.ps1 .github/workflows/ci.yml scripts/ci-change-scope.sh \
   crates/tako-control/src/setup_refusal.rs crates/tako-core/tests/issue2791_agent_install_windows.rs \
-  installer/windows/lib/user-path.ps1; do
+  installer/windows/lib/user-path.ps1 scripts/windows/test-claude-git-bash-2433.ps1 \
+  scripts/windows/lib/fake-anthropic-2433.ps1; do
   assert_eq "実走を走らせる: ${p}" "$(classify_agent "${p}"$'\n')" "agent_install=true"
 done
 for p in crates/tako-core/src/lib.rs crates/tako-cli/src/setup.rs scripts/windows/test-install-execution-policy-2790.ps1 \
@@ -405,6 +406,9 @@ agent_wiring_problems() {
   body="$(step_body "${yml}" "codex / agy の導入代行の実走検査（#2791")"
   [[ -n "${body}" ]] || echo "windows: #2791 の実走の段が無い"
   grep -qF "if: needs.changes.outputs.agent_install == 'true'" <<<"${body}" || echo "windows: #2791 の実走の段が条件なしで毎回走る（agent_install の if が無い）"
+  body="$(step_body "${yml}" "Git Bash 無しで動くことの実走検査（#2433")"
+  [[ -n "${body}" ]] || echo "windows: #2433 の実走の段が無い"
+  grep -qF "if: needs.changes.outputs.agent_install == 'true'" <<<"${body}" || echo "windows: #2433 の実走の段が条件なしで毎回走る（agent_install の if が無い）"
   body="$(step_body "${yml}" "導入代行の起こし方の実行検査（#2790")"
   grep -qE '^        if:' <<<"${body}" && echo "windows: #2790 の偽物の段が判定で止まる（外部に依らないので毎回走らせる）"
   body="$(job_body "${yml}" changes)"
@@ -417,6 +421,7 @@ assert_eq "本物の ci.yml の実走の配線に問題が無い" "${probs}" ""
 grep -vF "if: needs.changes.outputs.agent_install == 'true'" "${CI_YML}" > "${TMP}/ci-agent-noif.yml"
 probs="$(agent_wiring_problems "${TMP}/ci-agent-noif.yml")"
 assert_has "（注入）実走の段の if が無いことを名指しする" "windows: #2791 の実走の段が条件なしで毎回走る" "${probs}"
+assert_has "（注入）#2433 の実走の段の if が無いことを名指しする" "windows: #2433 の実走の段が条件なしで毎回走る" "${probs}"
 awk '{ print } /導入代行の起こし方の実行検査（#2790/ { print "        if: needs.changes.outputs.agent_install == '"'"'true'"'"'" }' "${CI_YML}" > "${TMP}/ci-2790-if.yml"
 probs="$(agent_wiring_problems "${TMP}/ci-2790-if.yml")"
 assert_has "（注入）#2790 の段を絞ったことを名指しする" "windows: #2790 の偽物の段が判定で止まる" "${probs}"

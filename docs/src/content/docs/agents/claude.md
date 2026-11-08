@@ -22,7 +22,9 @@ tako setup bootstrap install
 curl -fsSL https://claude.ai/install.sh | bash
 ```
 
-Windows では `irm https://claude.ai/install.ps1 | iex` が公式の手順で、**tako から実行を代行できるのは 3 系統のうち claude だけ**です（codex / agy は状態の確認と案内までです）。
+Windows では `irm https://claude.ai/install.ps1 | iex` が公式の手順で、上の 1 行もこれを実行します。
+
+Windows で **Git for Windows は要りません**。無ければ claude はコマンドを PowerShell で実行し、入っていれば Git Bash を使います（Git を外した Windows の CI 環境で claude を起こし、起動からコマンドの実行まで通ることを確かめています）。Git を標準でない場所に入れていて claude が見つけられないときは、その Git の `bin\bash.exe` のパスを環境変数 `CLAUDE_CODE_GIT_BASH_PATH` に設定します（PATH から `git` が引ければ設定は要りません）。
 
 入ったあとの本体は `~/.local/bin/claude` に置かれ、更新は Claude Code が自分でバックグラウンドで行います。
 
