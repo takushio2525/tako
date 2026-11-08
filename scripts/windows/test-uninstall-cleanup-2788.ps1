@@ -96,15 +96,26 @@ foreach ($entry in [System.Environment]::GetEnvironmentVariables().GetEnumerator
     if ([string]$entry.Key -like 'TAKO_*') { $SavedTako[[string]$entry.Key] = [string]$entry.Value }
 }
 
+# env を立てる / 外す。**外すのは Remove-Item**: PowerShell は .NET の文字列引数へ $null を空文字列で渡すので、
+# `[Environment]::SetEnvironmentVariable($k, $null)` は「空の値で立てる」になる（空の CODEX_HOME が立って
+# tako が codex の設定を作業 dir の config.toml に探した = この検査の最初の CI で踏んだ）
+function Set-ProcessEnv([string]$Name, $Value) {
+    if ($null -eq $Value) {
+        Remove-Item -LiteralPath "Env:\$Name" -ErrorAction SilentlyContinue
+    } else {
+        Set-Item -LiteralPath "Env:\$Name" -Value $Value
+    }
+}
+
 function Enter-Sandbox {
-    foreach ($k in $SavedTako.Keys) { [System.Environment]::SetEnvironmentVariable($k, $null) }
-    foreach ($k in $Removed) { [System.Environment]::SetEnvironmentVariable($k, $null) }
-    foreach ($k in $SandboxEnv.Keys) { [System.Environment]::SetEnvironmentVariable($k, $SandboxEnv[$k]) }
+    foreach ($k in $SavedTako.Keys) { Set-ProcessEnv $k $null }
+    foreach ($k in $Removed) { Set-ProcessEnv $k $null }
+    foreach ($k in $SandboxEnv.Keys) { Set-ProcessEnv $k $SandboxEnv[$k] }
 }
 
 function Exit-Sandbox {
-    foreach ($k in $SavedEnv.Keys) { [System.Environment]::SetEnvironmentVariable($k, $SavedEnv[$k]) }
-    foreach ($k in $SavedTako.Keys) { [System.Environment]::SetEnvironmentVariable($k, $SavedTako[$k]) }
+    foreach ($k in $SavedEnv.Keys) { Set-ProcessEnv $k $SavedEnv[$k] }
+    foreach ($k in $SavedTako.Keys) { Set-ProcessEnv $k $SavedTako[$k] }
 }
 
 # 子を起こして待つ（終了コードを返す）
@@ -263,7 +274,9 @@ try {
     }
     Write-Host "   summary: $($plan.summary | ConvertTo-Json -Compress)"
     foreach ($item in @($plan.items | Where-Object { $_.kind -eq 'mcp' })) { Write-Host "   mcp の項目: $($item | ConvertTo-Json -Compress)" }
-    Write-Host "   env: CODEX_HOME=[$env:CODEX_HOME] HOME=[$env:HOME] USERPROFILE=[$env:USERPROFILE]"
+    foreach ($k in $Removed) {
+        Assert-That (-not (Test-Path -LiteralPath "Env:\$k")) "砂場の env に $k が残っている（空の値でも tako は立っていると読みうる）"
+    }
     Write-Host "   codex の config.toml: $CodexToml（在る: $(Test-Path -LiteralPath $CodexToml)）"
     $codexBytes = [System.IO.File]::ReadAllBytes($CodexToml)
     Write-Host "   codex の config.toml の先頭: $(($codexBytes | Select-Object -First 8 | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')・CR を含む: $($codexBytes -contains 13)"

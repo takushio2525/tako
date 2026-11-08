@@ -290,24 +290,34 @@ pub fn list_args(agent: WorkerAgent) -> Vec<String> {
 
 /// 設定ファイルの置き場（表示・読み取り用）。
 ///
-/// - codex: `$CODEX_HOME/config.toml`（未設定なら `~/.codex/config.toml`）
+/// - codex: `$CODEX_HOME/config.toml`（未設定・空なら `~/.codex/config.toml`）
 /// - agy: `~/.gemini/config/mcp_config.json`（実測: `agy mcp add` が実際に書いた先。
 ///   `HOME` を差し替えるとそちらへ付いてくる = テストで隔離できる）
 pub fn config_path(agent: WorkerAgent) -> Option<PathBuf> {
     let home = tako_core::paths::home_dir;
     match agent {
-        WorkerAgent::Codex => {
-            if let Some(dir) = std::env::var_os("CODEX_HOME") {
-                Some(PathBuf::from(dir).join("config.toml"))
-            } else {
-                home().map(|h| h.join(".codex").join("config.toml"))
-            }
-        }
+        WorkerAgent::Codex => codex_config_path_from(std::env::var_os("CODEX_HOME"), home()),
         WorkerAgent::Agy => {
             home().map(|h| h.join(".gemini").join("config").join("mcp_config.json"))
         }
         WorkerAgent::Claude => home().map(|h| h.join(".claude.json")),
     }
+}
+
+/// codex の `config.toml` の置き場（[`config_path`] の規則。env に触らない純粋関数）。
+///
+/// **空の `CODEX_HOME` は未設定と同じ**（#2788）。空のまま join すると相対パスの `config.toml`
+/// （= 作業 dir）を見て、登録が在っても「無い」と読んでいた（Windows の CI で、PowerShell が
+/// `$null` を空文字列で渡して env を「外した」つもりの空の `CODEX_HOME` が立って実際に踏んだ）
+pub fn codex_config_path_from(
+    codex_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    codex_home
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".codex")))
+        .map(|dir| dir.join("config.toml"))
 }
 
 /// `codex mcp list --json` の出力から tako の command を読む（純粋関数）。
@@ -1460,6 +1470,24 @@ mod tests {
             unregister_toml("a = 1\n\n[\"mcp_servers\".'tako']\ncommand = \"tako\"\n"),
             Unregister::Removed("a = 1\n".into())
         );
+    }
+
+    #[test]
+    fn issue2788_空のcodex_homeは未設定と同じ() {
+        let home = Some(PathBuf::from("/h"));
+        assert_eq!(
+            codex_config_path_from(Some("".into()), home.clone()),
+            Some(PathBuf::from("/h/.codex/config.toml"))
+        );
+        assert_eq!(
+            codex_config_path_from(None, home.clone()),
+            Some(PathBuf::from("/h/.codex/config.toml"))
+        );
+        assert_eq!(
+            codex_config_path_from(Some("/c".into()), home),
+            Some(PathBuf::from("/c/config.toml"))
+        );
+        assert_eq!(codex_config_path_from(Some("".into()), None), None);
     }
 
     #[test]
