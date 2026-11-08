@@ -1911,10 +1911,15 @@ fn setup_incomplete_error(status: &crate::tailscale::SetupStatus) -> io::Error {
 /// 返り値: (tailscale CLI パス, 固定 URL)。
 /// 既存の serve 設定が tako 管理形式（HTTPS:443 の "/" 単純プロキシ）で自 socket を
 /// 向いている場合は再利用し、それ以外の設定は上書きせず拒否する。
-/// 旧 TCP 形式（`http://127.0.0.1:*`）は tako の残骸と判定して自動移行する
+/// 旧 TCP 形式（`http://127.0.0.1:*`）は tako の残骸と判定して自動移行する。
+///
+/// #2793: serve を読んだ後・張る前にガード（`owned`）へ「張った serve」を持たせる。ここから先の `run_daemon` の
+/// どの出口で断っても、自分の到達先を向いている設定はガードが外す。返す handle はガードと共有する
+/// （稼働中の自己検査が相手を張り替えたら、外すときも同じ相手へ話す）
 fn establish_tailscale_serve(
     endpoint: &local_endpoint::Endpoint,
-) -> io::Result<(crate::tailscale::ServeHandle, String)> {
+    owned: &mut OwnedDaemonFiles,
+) -> io::Result<(Arc<Mutex<crate::tailscale::ServeHandle>>, String)> {
     // #2619: daemon の中の最後の守り（`tako remote serve` を直に起こした隔離の砂場）。
     // 起動の入口 `spawn_daemon` が先に断るので、ここで断るのは入口を通らない起動だけ
     crate::remote_isolated_serve::check().map_err(|r| io::Error::other(r.to_string()))?;
@@ -1938,7 +1943,12 @@ fn establish_tailscale_serve(
     let socket = socket.as_deref();
 
     let our_target = proxy_target_for(endpoint);
-    match crate::tailscale::serve_state_on(&cli, socket).map_err(io::Error::other)? {
+    let state = crate::tailscale::serve_state_on(&cli, socket).map_err(io::Error::other)?;
+    // #2793: 張る（張り替える・前回の同じ到達先を使う）前に持たせる。tako 管理外の設定で断る出口でも
+    // ガードは外さない（自分の到達先を向いていないので `serve_stop_if_ours_on` が何もしない）
+    let shared = Arc::new(Mutex::new(handle.clone()));
+    owned.hold_serve(shared.clone(), our_target.clone());
+    match state {
         crate::tailscale::ServeState::NotConfigured => {
             crate::tailscale::serve_start_target_on(&cli, socket, &our_target)
                 .map_err(io::Error::other)?;
@@ -1983,7 +1993,7 @@ fn establish_tailscale_serve(
             ));
         }
     }
-    Ok((handle, base_url))
+    Ok((shared, base_url))
 }
 
 /// `https://<host>` から host 部分を取り出す
@@ -2302,6 +2312,37 @@ fn startup_env_record(
 /// A/B の env（#2781）: 立っていれば daemon が断った出口で自分の起動の痕跡を回収しない（修正前）
 pub const OWNED_FILES_LEGACY_ENV: &str = "TAKO_2781_LEGACY";
 
+/// A/B の env（#2793）: 立っていれば daemon が serve を張った後に断った出口（ガードの Drop）で、張った serve を
+/// 外さない（修正前）。修正前から明示で外していた出口（URL の書き出しの失敗・自己疎通の 502）と正常な終了は、
+/// この env でも外す（修正前と同じ）
+pub const OWNED_SERVE_LEGACY_ENV: &str = "TAKO_2793_LEGACY";
+
+/// 故障注入（#2793）: serve を張った後の断りの出口を踏む。値は `token`（張った直後の最初の出口 = 管理トークンの
+/// 生成）/ `self-check`（自己疎通スレッドの起動）。**検証プロセス**（`TAKO_ISOLATED` 等。
+/// `tako_core::paths::is_verification_process`）でだけ読む = 本番の daemon は env があっても断らない
+pub const INJECT_AFTER_SERVE_ENV: &str = "TAKO_2793_INJECT";
+
+/// [`INJECT_AFTER_SERVE_ENV`] が `point` を指していれば、その位置の出口で断る（#2793。検証プロセスだけ）
+fn inject_after_serve(point: &str) -> io::Result<()> {
+    if tako_core::paths::is_verification_process()
+        && std::env::var(INJECT_AFTER_SERVE_ENV).is_ok_and(|v| v == point)
+    {
+        return Err(io::Error::other(format!(
+            "注入（#2793 の {INJECT_AFTER_SERVE_ENV}={point}）で断った"
+        )));
+    }
+    Ok(())
+}
+
+/// ガードが持つ「張った serve」（#2793）
+struct HeldServe {
+    /// 話しかける相手。稼働中の自己検査（#1049）が相手を張り替えたら同じ共有の handle に反映されるので、
+    /// 外すときも張った相手（いまの相手）へ話す
+    handle: Arc<Mutex<crate::tailscale::ServeHandle>>,
+    /// 自分の到達先（`proxy_target_for`）。serve がこれを向いているときだけ外す
+    target: String,
+}
+
 /// daemon が自分で書いた起動の痕跡を、`run_daemon` のどの出口でも回収するガード（#2781）。
 ///
 /// `run_daemon` は待ち受けを開いた**後**にも断る出口を持つ（Tailscale の検証・serve の設定・デバイス
@@ -2322,6 +2363,17 @@ pub const OWNED_FILES_LEGACY_ENV: &str = "TAKO_2781_LEGACY";
 /// なので触らない。外す条件は持たせない: 正常な終了も `cleanup_state_files()` の後にここを通るが、
 /// 消す相手が残っていないので何もしない（#840 の `EndpointFileGuard` と同じ考え = 出口を増やしても漏れない）。
 /// A/B（`TAKO_2781_LEGACY=1`）は何も消さない = 修正前
+///
+/// **張った serve も持つ**（#2793）: serve を張った後の出口（管理トークンの生成・デバイスレジストリの破損・
+/// PID / トークンの書き出し・スレッドの起動）で断ると、serve の設定（HTTPS:443 → `http://127.0.0.1:<ポート>`）が
+/// 誰も待ち受けていないループバックのポートを向いたまま残り、そのポートを別のローカルのプロセスが取れば tailnet の
+/// HTTPS がそこへ届いた（`.agent/threat-model-remote.md` の緩和は「毎回エフェメラルなポート」に頼っている）。
+/// `establish_tailscale_serve` が serve を読んだ後・張る**前に** [`OwnedDaemonFiles::hold_serve`] で持たせ、
+/// Drop で [`OwnedDaemonFiles::release_serve`] を通す。外すのは serve が**自分の到達先を向いているとき**だけ
+/// （`serve_stop_if_ours_on`。別の daemon が張り直したもの・利用者の設定は外さない）。Drop の中でも待ち受けを
+/// 持ったまま外す（外すまで到達先のポートを他のプロセスが取れない）。明示で外す出口（URL の書き出しの失敗・
+/// 自己疎通の 502・正常な終了）も同じ `release_serve` を通し、外した後のガードは何もしない。
+/// `TAKO_REMOTE_TEST_MODE=1` は serve を張らないので持たせない。A/B（`TAKO_2793_LEGACY=1`）は Drop で外さない = 修正前
 struct OwnedDaemonFiles {
     legacy: bool,
     /// 書いたファイルと、書いた中身
@@ -2330,16 +2382,22 @@ struct OwnedDaemonFiles {
     pid_file: std::path::PathBuf,
     /// PID ファイルが自分のままなら消す記録
     pid_scoped: Vec<std::path::PathBuf>,
+    /// 張った serve（#2793）。張る前に持たせ、外したら空にする
+    serve: Option<HeldServe>,
+    /// A/B（#2793）: Drop で serve を外さない
+    serve_legacy: bool,
 }
 
 impl OwnedDaemonFiles {
     /// 待ち受けを開いた直後に置く（`run_daemon` の 1 か所）
     fn bound() -> Self {
-        Self::new(
+        let mut owned = Self::new(
             std::env::var_os(OWNED_FILES_LEGACY_ENV).is_some(),
             pid_path(),
             vec![serve_health_path(), peer_guard_path()],
-        )
+        );
+        owned.serve_legacy = std::env::var_os(OWNED_SERVE_LEGACY_ENV).is_some();
+        owned
     }
 
     fn new(
@@ -2352,6 +2410,8 @@ impl OwnedDaemonFiles {
             written: Vec::new(),
             pid_file,
             pid_scoped,
+            serve: None,
+            serve_legacy: false,
         }
     }
 
@@ -2361,10 +2421,62 @@ impl OwnedDaemonFiles {
         self.written.push((path.to_path_buf(), content.to_string()));
         Ok(())
     }
+
+    /// serve を張る**前に**持たせる（#2793。`establish_tailscale_serve` の 1 か所）。張る途中で断っても
+    /// （`serve --bg` の打ち切りで tailscaled 側だけ設定が入った場合も）自分の到達先を向いていれば外せる
+    fn hold_serve(&mut self, handle: Arc<Mutex<crate::tailscale::ServeHandle>>, target: String) {
+        self.serve = Some(HeldServe { handle, target });
+    }
+
+    /// 持っている serve を外す（#2793。持っていなければ tailscale を呼ばない）。外すのは serve が自分の到達先を
+    /// 向いているときだけで、外した・外せなかったを audit.log へ残す（`cause` = 外した出口）。
+    /// stdout / stderr へは書かない（`spawn_daemon` が pipe を捨てた後は EPIPE で panic する。Drop の中の
+    /// panic は巻き戻しの最中なら abort になる）
+    fn release_serve(&mut self, cause: &str) {
+        let Some(held) = self.serve.take() else {
+            return;
+        };
+        // #1049: 後始末も**張った相手へ**話す。既定探索のまま解除すると、
+        // 相手が入れ替わっていたときに本物の設定が消し残る
+        let handle = lock_handle(&held.handle).clone();
+        match crate::tailscale::serve_stop_if_ours_on(
+            &handle.cli,
+            handle.socket_arg(),
+            Some(&held.target),
+        ) {
+            Ok(true) => audit_serve(
+                "serve_off",
+                serde_json::json!({
+                    "target": held.target,
+                    "handle": handle.describe(),
+                    "cause": cause,
+                }),
+            ),
+            Ok(false) => {}
+            Err(e) => audit_serve(
+                "serve_off_failed",
+                serde_json::json!({
+                    "target": held.target,
+                    "handle": handle.describe(),
+                    "error": e,
+                    "cause": cause,
+                }),
+            ),
+        }
+    }
 }
 
 impl Drop for OwnedDaemonFiles {
     fn drop(&mut self) {
+        // #2793: 張った serve を先に外す（ファイルの A/B `TAKO_2781_LEGACY` とは別に見る）
+        if !self.serve_legacy {
+            let cause = if std::thread::panicking() {
+                "daemon_panicked"
+            } else {
+                "daemon_refused"
+            };
+            self.release_serve(cause);
+        }
         if self.legacy {
             return;
         }
@@ -2473,25 +2585,27 @@ pub fn run_daemon() -> io::Result<()> {
     // ts CLI パスと fake base URL だけを用意する（本番 tailnet の serve 設定を壊さず、
     // UDS 直叩き + fake identity 注入で認証層を実測するため。#283 の実測方針）
     let test_mode = std::env::var("TAKO_REMOTE_TEST_MODE").is_ok_and(|v| v == "1");
+    // 自己検査・後始末はこの handle を通す（#1049: 話しかける相手を固定する）。
+    // #2793: serve を張る経路はガードに張った serve を持たせる（ここから先のどの出口でも外す）。
+    // test_mode は serve を張らないので持たせない
     let (serve_handle, base_url) = if test_mode {
         let cli = crate::tailscale::find_tailscale().unwrap_or_else(|| "tailscale".to_string());
         (
-            crate::tailscale::ServeHandle {
+            Arc::new(Mutex::new(crate::tailscale::ServeHandle {
                 cli,
                 socket: None,
                 variant_key: "auto",
                 node: None,
-            },
+            })),
             "http://tako-remote.test".to_string(),
         )
     } else {
-        establish_tailscale_serve(&endpoint)?
+        establish_tailscale_serve(&endpoint, &mut owned)?
     };
-    let ts_cli = serve_handle.cli.clone();
-    // 自己検査・後始末はこの handle を通す（#1049: 話しかける相手を固定する）
-    let serve_handle = Arc::new(Mutex::new(serve_handle));
+    let ts_cli = lock_handle(&serve_handle).cli.clone();
 
     // ローカル管理トークン生成（/api/admin/* 専用。リモート端末には渡らない。#283）
+    inject_after_serve("token")?;
     let token = crate::generate_token()?;
 
     // デバイスレジストリを開く（devices.json 破損時は黙って全失効させず起動を拒否する）
@@ -2561,15 +2675,8 @@ pub fn run_daemon() -> io::Result<()> {
     // 公開 URL を state ファイルに残す（`tako remote status` が接続リンクを再構成するため）
     if let Err(e) = owned.write_secret(&url_path(), &base_url) {
         // 起動情報の整合が取れないため中止する。設定した serve と state を片付ける
-        // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
-        if !test_mode {
-            let handle = serve_handle.lock().unwrap().clone();
-            let _ = crate::tailscale::serve_stop_if_ours_on(
-                &handle.cli,
-                handle.socket_arg(),
-                Some(&proxy_target_for(&endpoint)),
-            );
-        }
+        // （test_mode ではガードが serve を持っていないので触らない = 本番設定を壊さない）
+        owned.release_serve("url_write_failed");
         cleanup_state_files();
         return Err(io::Error::other(format!(
             "URL ファイルの書き出しに失敗: {e}"
@@ -2653,6 +2760,7 @@ pub fn run_daemon() -> io::Result<()> {
     } else {
         let (tx, rx) = std::sync::mpsc::channel();
         let probe_url = base_url.clone();
+        inject_after_serve("self-check")?;
         std::thread::Builder::new()
             .name("remote-self-check".into())
             .spawn(move || {
@@ -2681,12 +2789,7 @@ pub fn run_daemon() -> io::Result<()> {
         // 起動を続けても全リクエストが 502 になるだけなので、理由と次の一手を出して止める
         let target = proxy_target_for(&endpoint);
         let advice = unreachable_advice(&endpoint, &target);
-        let handle = serve_handle.lock().unwrap().clone();
-        let _ = crate::tailscale::serve_stop_if_ours_on(
-            &handle.cli,
-            handle.socket_arg(),
-            Some(&target),
-        );
+        owned.release_serve("backend_unreachable");
         cleanup_state_files();
         return Err(io::Error::other(advice));
     }
@@ -2768,38 +2871,11 @@ pub fn run_daemon() -> io::Result<()> {
         },
     );
 
-    // クリーンアップ: 自分が公開に使った serve 設定のみ解除する
-    // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
-    if !test_mode {
-        // #1049: 後始末も**張った相手へ**話す。既定探索のまま解除すると、
-        // 相手が入れ替わっていたときに本物の設定が消し残る
-        let handle = lock_handle(&serve_handle).clone();
-        match crate::tailscale::serve_stop_if_ours_on(
-            &handle.cli,
-            handle.socket_arg(),
-            Some(&proxy_target_for(&endpoint)),
-        ) {
-            Ok(true) => audit_serve(
-                "serve_off",
-                serde_json::json!({
-                    "target": proxy_target_for(&endpoint),
-                    "handle": handle.describe(),
-                    "cause": "daemon_exit",
-                }),
-            ),
-            Ok(false) => {}
-            // ここも stdout / stderr へ書かない（上と同じ理由で panic し、
-            // 直後の `cleanup_state_files` が飛んで state ファイルが残る）
-            Err(e) => audit_serve(
-                "serve_off_failed",
-                serde_json::json!({
-                    "target": proxy_target_for(&endpoint),
-                    "handle": handle.describe(),
-                    "error": e,
-                }),
-            ),
-        }
-    }
+    // クリーンアップ: 自分が公開に使った serve 設定のみ解除する（張った相手へ話す = #1049）
+    // （test_mode ではガードが serve を持っていないので触らない = 本番設定を壊さない）。
+    // 記録は audit.log だけ（stdout / stderr へ書くと上と同じ理由で panic し、
+    // 直後の `cleanup_state_files` が飛んで state ファイルが残る）
+    owned.release_serve("daemon_exit");
     cleanup_state_files();
 
     Ok(())
@@ -7860,6 +7936,212 @@ mod tests {
         let missing = dir.join("no-such-dir").join("port");
         assert!(owned.write_secret(&missing, "1").is_err());
         assert!(owned.written.is_empty(), "書けなかったファイルを覚えた");
+    }
+
+    /// #2793 の偽 tailscale: serve の設定は隣の `serve.json` に持ち、呼び出しを `calls.log` に残す
+    #[cfg(unix)]
+    const FAKE_SERVE_TS: &str = r#"#!/bin/sh
+D="$(dirname "$0")"
+while [ $# -gt 0 ]; do case "$1" in --socket) shift 2 ;; *) break ;; esac; done
+echo "$*" >> "$D/calls.log"
+case "$1 ${2:-} ${3:-}" in
+  "serve status "*) cat "$D/serve.json" ;;
+  "serve --https=443 off") echo '{}' > "$D/serve.json" ;;
+  *) exit 1 ;;
+esac
+"#;
+
+    /// #2793 の serve の設定（HTTPS:443 の "/" → `target`）
+    #[cfg(unix)]
+    fn serve_json_to(target: &str) -> String {
+        format!(
+            "{{\"TCP\":{{\"443\":{{\"HTTPS\":true}}}},\"Web\":{{\"fake-2793.tailfake.ts.net:443\":\
+             {{\"Handlers\":{{\"/\":{{\"Proxy\":\"{target}\"}}}}}}}}}}"
+        )
+    }
+
+    /// #2793 の砂場: 偽 tailscale と、いまの serve の設定を置き、その相手を指す handle を返す
+    #[cfg(unix)]
+    fn fake_serve_handle(
+        dir: &std::path::Path,
+        serve_json: &str,
+    ) -> Arc<Mutex<crate::tailscale::ServeHandle>> {
+        std::fs::write(dir.join("serve.json"), serve_json).unwrap();
+        let cli = dir.join("tailscale");
+        tako_core::fake_exec::write_script(&cli, FAKE_SERVE_TS);
+        Arc::new(Mutex::new(crate::tailscale::ServeHandle {
+            cli: cli.display().to_string(),
+            socket: None,
+            variant_key: "auto",
+            node: None,
+        }))
+    }
+
+    /// #2793 の砂場の偽 tailscale の呼び出し（1 行 1 回。`--socket` を外した引数）
+    #[cfg(unix)]
+    fn fake_serve_calls(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("calls.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    const OURS_2793: &str = "http://127.0.0.1:54883";
+
+    /// #2793: 張った後の出口で断る（ガードの drop）と、自分の到達先を向いている serve を外す
+    #[cfg(unix)]
+    #[test]
+    fn issue2793_断った出口で自分が張ったserveを外す() {
+        let scratch = tako_core::test_residue::ScratchDir::new("remote-2793-release");
+        let dir = scratch.path();
+        let handle = fake_serve_handle(dir, &serve_json_to(OURS_2793));
+        let mut owned = owned_files_in(dir, false);
+        owned.hold_serve(handle, OURS_2793.to_string());
+        drop(owned);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("serve.json")).unwrap(),
+            "{}\n",
+            "張った serve が残っている"
+        );
+        assert_eq!(
+            fake_serve_calls(dir),
+            vec!["serve status --json", "serve --https=443 off"]
+        );
+    }
+
+    /// #2793: 自分の到達先を向いていない設定（別の daemon が張り直したもの・利用者の設定・パス分け）は外さない
+    #[cfg(unix)]
+    #[test]
+    fn issue2793_自分の到達先を向いていない設定は外さない() {
+        let other_handlers = "{\"TCP\":{\"443\":{\"HTTPS\":true}},\"Web\":{\"fake-2793.tailfake.ts.net:443\":\
+             {\"Handlers\":{\"/a\":{\"Proxy\":\"http://127.0.0.1:1\"},\"/b\":{\"Proxy\":\"http://127.0.0.1:2\"}}}}}";
+        for (name, serve) in [
+            ("別の daemon", serve_json_to("http://127.0.0.1:54884")),
+            ("利用者の設定", serve_json_to("http://192.168.1.5:8080")),
+            ("パス分け", other_handlers.to_string()),
+            ("設定なし", "{}".to_string()),
+        ] {
+            let scratch = tako_core::test_residue::ScratchDir::new("remote-2793-foreign");
+            let dir = scratch.path();
+            let handle = fake_serve_handle(dir, &serve);
+            let mut owned = owned_files_in(dir, false);
+            owned.hold_serve(handle, OURS_2793.to_string());
+            drop(owned);
+            assert_eq!(
+                std::fs::read_to_string(dir.join("serve.json")).unwrap(),
+                serve,
+                "{name} の設定を外した"
+            );
+            assert_eq!(
+                fake_serve_calls(dir),
+                vec!["serve status --json"],
+                "{name}: 読むだけで外さない"
+            );
+        }
+    }
+
+    /// #2793: 明示で外した後（URL の書き出しの失敗・502・正常な終了）のガードは tailscale を呼ばない。
+    /// 持たせていない（`TAKO_REMOTE_TEST_MODE=1` = serve を張らない）ガードも呼ばない
+    #[cfg(unix)]
+    #[test]
+    fn issue2793_外した後と持たせていないガードはtailscaleを呼ばない() {
+        let scratch = tako_core::test_residue::ScratchDir::new("remote-2793-once");
+        let dir = scratch.path();
+        let handle = fake_serve_handle(dir, &serve_json_to(OURS_2793));
+        let mut owned = owned_files_in(dir, false);
+        owned.hold_serve(handle, OURS_2793.to_string());
+        owned.release_serve("daemon_exit");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("serve.json")).unwrap(),
+            "{}\n"
+        );
+        // 外した後に別の daemon が同じ到達先へ張り直しても（ありえないが）、2 度目は外さない
+        std::fs::write(dir.join("serve.json"), serve_json_to(OURS_2793)).unwrap();
+        drop(owned);
+        assert_eq!(
+            fake_serve_calls(dir),
+            vec!["serve status --json", "serve --https=443 off"],
+            "外した後のガードが tailscale を呼んだ"
+        );
+
+        let scratch = tako_core::test_residue::ScratchDir::new("remote-2793-unheld");
+        let dir = scratch.path();
+        let _handle = fake_serve_handle(dir, &serve_json_to(OURS_2793));
+        drop(owned_files_in(dir, false));
+        assert!(
+            fake_serve_calls(dir).is_empty(),
+            "持たせていないガードが tailscale を呼んだ"
+        );
+    }
+
+    /// #2793: A/B（`TAKO_2793_LEGACY=1`）は Drop で外さない = 修正前。明示で外す出口は A/B でも外す（修正前と同じ）。
+    /// ファイルの A/B（`TAKO_2781_LEGACY=1`）は serve を外すかに影響しない
+    #[cfg(unix)]
+    #[test]
+    fn issue2793_abではdropで外さず明示の出口は外す() {
+        let scratch = tako_core::test_residue::ScratchDir::new("remote-2793-legacy");
+        let dir = scratch.path();
+        let handle = fake_serve_handle(dir, &serve_json_to(OURS_2793));
+        let mut owned = owned_files_in(dir, false);
+        owned.serve_legacy = true;
+        owned.hold_serve(handle.clone(), OURS_2793.to_string());
+        drop(owned);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("serve.json")).unwrap(),
+            serve_json_to(OURS_2793),
+            "A/B なのに外した"
+        );
+        assert!(fake_serve_calls(dir).is_empty());
+
+        let mut owned = owned_files_in(dir, false);
+        owned.serve_legacy = true;
+        owned.hold_serve(handle.clone(), OURS_2793.to_string());
+        owned.release_serve("backend_unreachable");
+        drop(owned);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("serve.json")).unwrap(),
+            "{}\n",
+            "A/B でも明示の出口は外す"
+        );
+
+        std::fs::write(dir.join("serve.json"), serve_json_to(OURS_2793)).unwrap();
+        let mut owned = owned_files_in(dir, true);
+        owned.hold_serve(handle, OURS_2793.to_string());
+        drop(owned);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("serve.json")).unwrap(),
+            "{}\n",
+            "ファイルの A/B（TAKO_2781_LEGACY）で serve まで外さなくなった"
+        );
+    }
+
+    /// #2793: 外す相手は共有の handle の**いまの**相手（稼働中の自己検査が張り替えた相手 = #1049）
+    #[cfg(unix)]
+    #[test]
+    fn issue2793_外す相手は共有のhandleのいまの相手() {
+        let scratch = tako_core::test_residue::ScratchDir::new("remote-2793-follow");
+        let dir = scratch.path();
+        let old = fake_serve_handle(dir, &serve_json_to(OURS_2793));
+        let moved = dir.join("node-b");
+        std::fs::create_dir_all(&moved).unwrap();
+        let now = fake_serve_handle(&moved, &serve_json_to(OURS_2793));
+        let mut owned = owned_files_in(dir, false);
+        owned.hold_serve(old.clone(), OURS_2793.to_string());
+        let switched = lock_handle(&now).clone();
+        *lock_handle(&old) = switched;
+        drop(owned);
+        assert_eq!(
+            std::fs::read_to_string(moved.join("serve.json")).unwrap(),
+            "{}\n",
+            "いまの相手の設定が残っている"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("serve.json")).unwrap(),
+            serve_json_to(OURS_2793),
+            "張り替える前の相手へ話した"
+        );
     }
 
     /// #2582: audit.log の 1 行は名前だけ（値 = トークン・セッション ID を載せない）。外すものが無ければ書かない
