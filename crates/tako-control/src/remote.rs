@@ -2299,6 +2299,96 @@ fn startup_env_record(
     }))
 }
 
+/// A/B の env（#2781）: 立っていれば daemon が断った出口で自分の起動の痕跡を回収しない（修正前）
+pub const OWNED_FILES_LEGACY_ENV: &str = "TAKO_2781_LEGACY";
+
+/// daemon が自分で書いた起動の痕跡を、`run_daemon` のどの出口でも回収するガード（#2781）。
+///
+/// `run_daemon` は待ち受けを開いた**後**にも断る出口を持つ（Tailscale の検証・serve の設定・デバイス
+/// レジストリ・PID / トークンの書き出し・スレッドの起動）。出口ごとに後片付けを書く形では出口を増やすたびに
+/// 抜けが出る（#2781 の前は Tailscale の不足で断るたびに port ファイルが残り、次の start が毎回「stale な
+/// 待ち受け」を言い、そのポートを別のプロセスが取っていれば起動ごと断っていた）。そこで待ち受けを開いた直後に
+/// このガードを置き、Drop で回収する（Err の早期 return でも panic の巻き戻しでも走る）。
+///
+/// 消すのは**自分が書いたままの**ファイルだけ（後から別の daemon が書き直したものは消さない）:
+/// - 書いたファイル（port / PID / トークン / URL）は [`OwnedDaemonFiles::write_secret`] を通して書き、
+///   中身がそのときのままなら消す。port は待ち受けを持っている間は同じポートを他のプロセスが開けないので、
+///   中身の一致で自分のものと言える（ガードを待ち受けより後に宣言する = 先に drop する）
+/// - 中身が動く記録（serve の自己検査 `tako-remote.serve`・接続元検証 `tako-remote.peer`）は、
+///   PID ファイルが自分のままだったときだけ消す（書くのは PID ファイルを書いた daemon だけ）
+///
+/// UDS の socket（`TAKO_REMOTE_ENDPOINT=unix`）は待ち受け（tiny_http の `Server`）の Drop が消すので
+/// ここでは持たない。起こしている途中の印（`tako-remote.starting`。#2608）は書き手が親の `spawn_daemon`
+/// なので触らない。外す条件は持たせない: 正常な終了も `cleanup_state_files()` の後にここを通るが、
+/// 消す相手が残っていないので何もしない（#840 の `EndpointFileGuard` と同じ考え = 出口を増やしても漏れない）。
+/// A/B（`TAKO_2781_LEGACY=1`）は何も消さない = 修正前
+struct OwnedDaemonFiles {
+    legacy: bool,
+    /// 書いたファイルと、書いた中身
+    written: Vec<(std::path::PathBuf, String)>,
+    /// PID ファイルの置き場（自分のままかで `pid_scoped` を消すかを決める）
+    pid_file: std::path::PathBuf,
+    /// PID ファイルが自分のままなら消す記録
+    pid_scoped: Vec<std::path::PathBuf>,
+}
+
+impl OwnedDaemonFiles {
+    /// 待ち受けを開いた直後に置く（`run_daemon` の 1 か所）
+    fn bound() -> Self {
+        Self::new(
+            std::env::var_os(OWNED_FILES_LEGACY_ENV).is_some(),
+            pid_path(),
+            vec![serve_health_path(), peer_guard_path()],
+        )
+    }
+
+    fn new(
+        legacy: bool,
+        pid_file: std::path::PathBuf,
+        pid_scoped: Vec<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            legacy,
+            written: Vec::new(),
+            pid_file,
+            pid_scoped,
+        }
+    }
+
+    /// 起動の痕跡を書いて覚える（書き方は `write_secret_file` と同じ）。書けなかったものは覚えない
+    fn write_secret(&mut self, path: &std::path::Path, content: &str) -> io::Result<()> {
+        write_secret_file(path, content)?;
+        self.written.push((path.to_path_buf(), content.to_string()));
+        Ok(())
+    }
+}
+
+impl Drop for OwnedDaemonFiles {
+    fn drop(&mut self) {
+        if self.legacy {
+            return;
+        }
+        let still_ours = |path: &std::path::Path, content: &str| {
+            std::fs::read_to_string(path).is_ok_and(|now| now == content)
+        };
+        // PID ファイルを消す前に見る
+        let pid_ours = self
+            .written
+            .iter()
+            .any(|(path, content)| *path == self.pid_file && still_ours(path, content));
+        for (path, content) in &self.written {
+            if still_ours(path, content) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if pid_ours {
+            for path in &self.pid_scoped {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 /// 独立デーモンとして HTTP サーバーを起動し、SIGTERM まで待機する。
 /// `tako remote serve` から呼ばれる内部用関数。
 ///
@@ -2356,10 +2446,15 @@ pub fn run_daemon() -> io::Result<()> {
     let (server, endpoint) = local_endpoint::bind(&spec)?;
     // #1403: 受信は複数ワーカーで行うので共有できる形にする（`tiny_http::Server` は `Sync`）
     let server = Arc::new(server);
+    // #2781: ここから先のどの出口でも、自分が書いた起動の痕跡（port / PID / トークン / URL）を回収する。
+    // 待ち受けより後に宣言する（drop は宣言の逆順 = 待ち受けを持ったまま port の中身を突き合わせる）。
+    // 待ち受け（`bind`）とこの行の間に断りの出口を置かない（番犬 `issue2781_daemon_owned_files_watchdog`）
+    let mut owned = OwnedDaemonFiles::bound();
     // 到達先を state ファイルへ残す（CLI / status がここから再構成する）。
     // ループバック TCP はポートが毎回変わるので、これが唯一の手がかりになる
     if let Some(port) = endpoint.port() {
-        write_secret_file(&port_path(), &port.to_string())
+        owned
+            .write_secret(&port_path(), &port.to_string())
             .map_err(|e| io::Error::other(format!("ポートファイルの書き出しに失敗: {e}")))?;
     } else {
         // UDS で起動したときに前回の TCP のポートファイルが残っていると誤解決する
@@ -2416,9 +2511,11 @@ pub fn run_daemon() -> io::Result<()> {
             .unwrap_or(0),
         crate::remote_generation::self_stamp_line(&exe),
     );
-    write_secret_file(&pid_path(), &pid_info)
+    owned
+        .write_secret(&pid_path(), &pid_info)
         .map_err(|e| io::Error::other(format!("PID ファイルの書き出しに失敗: {e}")))?;
-    write_secret_file(&token_path(), &token)
+    owned
+        .write_secret(&token_path(), &token)
         .map_err(|e| io::Error::other(format!("トークンファイルの書き出しに失敗: {e}")))?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -2462,7 +2559,7 @@ pub fn run_daemon() -> io::Result<()> {
     }
 
     // 公開 URL を state ファイルに残す（`tako remote status` が接続リンクを再構成するため）
-    if let Err(e) = write_secret_file(&url_path(), &base_url) {
+    if let Err(e) = owned.write_secret(&url_path(), &base_url) {
         // 起動情報の整合が取れないため中止する。設定した serve と state を片付ける
         // （test_mode では serve を張っていないので触らない = 本番設定を壊さない）
         if !test_mode {
@@ -7665,6 +7762,104 @@ mod tests {
         ] {
             assert!(!is_serve_invocation(args(other)), "{other:?}");
         }
+    }
+
+    /// #2781 の砂場: 置き場と、そこを指すガード（PID ファイル = `pid`・PID に紐づく記録 = `serve` / `peer`）
+    fn owned_files_in(dir: &std::path::Path, legacy: bool) -> OwnedDaemonFiles {
+        OwnedDaemonFiles::new(
+            legacy,
+            dir.join("pid"),
+            vec![dir.join("serve"), dir.join("peer")],
+        )
+    }
+
+    /// #2781: 断った出口（ガードの drop）で、自分が書いたままのファイルと PID に紐づく記録を消す。
+    /// 書いていないファイル（起こしている途中の印・利用者の意図の記録）は残す
+    #[test]
+    fn issue2781_断った出口で自分が書いた起動の痕跡を消す() {
+        let scratch = tako_core::test_residue::ScratchDir::new("remote-2781-owned");
+        let dir = scratch.path();
+        let mut owned = owned_files_in(dir, false);
+        owned.write_secret(&dir.join("port"), "54330").unwrap();
+        owned
+            .write_secret(&dir.join("pid"), "4242\n/x/tako\n1\n")
+            .unwrap();
+        owned.write_secret(&dir.join("token"), "t0ken").unwrap();
+        for other in ["serve", "peer", "starting", "desired"] {
+            std::fs::write(dir.join(other), "{}").unwrap();
+        }
+        drop(owned);
+        for gone in ["port", "pid", "token", "serve", "peer"] {
+            assert!(!dir.join(gone).exists(), "{gone} が残っている");
+        }
+        for kept in ["starting", "desired"] {
+            assert!(dir.join(kept).exists(), "書いていない {kept} まで消した");
+        }
+    }
+
+    /// #2781: 書いた後に別の daemon が書き直したファイルは消さない。PID ファイルが書き直されていれば、
+    /// PID に紐づく記録（自己検査・接続元検証）もその daemon のものなので消さない
+    #[test]
+    fn issue2781_別のdaemonが書き直したファイルは消さない() {
+        let scratch = tako_core::test_residue::ScratchDir::new("remote-2781-rewritten");
+        let dir = scratch.path();
+        let mut owned = owned_files_in(dir, false);
+        owned.write_secret(&dir.join("port"), "54330").unwrap();
+        owned.write_secret(&dir.join("pid"), "4242\n").unwrap();
+        owned.write_secret(&dir.join("token"), "t0ken").unwrap();
+        std::fs::write(dir.join("port"), "54331").unwrap();
+        std::fs::write(dir.join("pid"), "4343\n").unwrap();
+        std::fs::write(dir.join("serve"), "{}").unwrap();
+        drop(owned);
+        assert_eq!(std::fs::read_to_string(dir.join("port")).unwrap(), "54331");
+        assert_eq!(std::fs::read_to_string(dir.join("pid")).unwrap(), "4343\n");
+        assert!(
+            dir.join("serve").exists(),
+            "別の daemon の自己検査の記録を消した"
+        );
+        assert!(!dir.join("token").exists(), "自分のトークンが残っている");
+    }
+
+    /// #2781: PID ファイルを書く前に断った出口（Tailscale の不足ほか）は port だけを消し、
+    /// PID に紐づく記録（前の daemon のもの）には触らない。正常な終了（`cleanup_state_files` の後）は何もしない
+    #[test]
+    fn issue2781_pidを書く前の出口と正常な終了() {
+        let scratch = tako_core::test_residue::ScratchDir::new("remote-2781-early");
+        let dir = scratch.path();
+        let mut owned = owned_files_in(dir, false);
+        owned.write_secret(&dir.join("port"), "54330").unwrap();
+        std::fs::write(dir.join("serve"), "{}").unwrap();
+        drop(owned);
+        assert!(!dir.join("port").exists(), "port ファイルが残っている");
+        assert!(
+            dir.join("serve").exists(),
+            "PID を書く前なのに PID に紐づく記録を消した"
+        );
+
+        // 正常な終了: 掃除の後に来るので消す相手が無い（後から来た daemon の port も消さない）
+        let mut owned = owned_files_in(dir, false);
+        owned.write_secret(&dir.join("port"), "54330").unwrap();
+        std::fs::remove_file(dir.join("port")).unwrap();
+        std::fs::write(dir.join("port"), "54332").unwrap();
+        drop(owned);
+        assert_eq!(std::fs::read_to_string(dir.join("port")).unwrap(), "54332");
+    }
+
+    /// #2781: A/B（`TAKO_2781_LEGACY=1`）は何も消さない = 修正前。書けなかったファイルは覚えない
+    #[test]
+    fn issue2781_abでは消さず書けなかったものは覚えない() {
+        let scratch = tako_core::test_residue::ScratchDir::new("remote-2781-legacy");
+        let dir = scratch.path();
+        let mut owned = owned_files_in(dir, true);
+        owned.write_secret(&dir.join("port"), "54330").unwrap();
+        owned.write_secret(&dir.join("pid"), "4242\n").unwrap();
+        drop(owned);
+        assert!(dir.join("port").exists() && dir.join("pid").exists());
+
+        let mut owned = owned_files_in(dir, false);
+        let missing = dir.join("no-such-dir").join("port");
+        assert!(owned.write_secret(&missing, "1").is_err());
+        assert!(owned.written.is_empty(), "書けなかったファイルを覚えた");
     }
 
     /// #2582: audit.log の 1 行は名前だけ（値 = トークン・セッション ID を載せない）。外すものが無ければ書かない

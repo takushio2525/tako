@@ -135,12 +135,12 @@ fn scan_remote(src: &str) -> Vec<Offender> {
                 .into(),
         ),
         Some((at, _)) => {
-            // 組み立ての式は数行なので、書き出し（`write_secret_file(&pid_path()`）までを見る
+            // 組み立ての式は数行なので、書き出し（#2781 からガードの `owned.write_secret(&pid_path()`）までを見る
             let lines: Vec<&str> = src.lines().collect();
             let body: Vec<&str> = lines
                 .iter()
                 .skip(at - 1)
-                .take_while(|l| !l.contains("write_secret_file(&pid_path()"))
+                .take_while(|l| !l.contains("(&pid_path()"))
                 .copied()
                 .collect();
             if !code_only(&body.join("\n")).contains("self_stamp_line(") {
