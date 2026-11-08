@@ -32,6 +32,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use tako_core::platform::agent_install::{recipe, AgentKind, InstallRecipe};
+use tako_core::platform::shell::powershell_stderr_text;
 use tako_core::platform::support::Platform;
 use tako_core::test_residue::ScratchDir;
 
@@ -184,6 +185,10 @@ fn read_marker(marker: &Path) -> Option<String> {
 /// ステップが置いたポリシーが**実際に効いている**ことを確かめる（効いていないまま新旧を比べると偽の緑になる）
 fn assert_policy_effective(program: &str, scope: &str, value: &str) {
     let mut command = Command::new(program);
+    // CI では cargo を起こした pwsh 7 の PSModulePath が子へ漏れ、5.1 が 7 の置き場の
+    // Microsoft.PowerShell.Security を拾って読めず Get-ExecutionPolicy が落ちた（AllSigned の下の実測）。
+    // ここはポリシーの値を読むだけなので、継いだ値を外して各版の既定の置き場へ戻す
+    command.env_remove("PSModulePath");
     command.args([
         "-NoLogo",
         "-NoProfile",
@@ -316,18 +321,22 @@ fn issue2790_終了コードはfileで走らせたときと同じ() {
                 ran.summary()
             );
             if name == "throw" {
+                // 起動片は捕まえたエラーを host を通さずに平文で書く（5.1 の CLIXML にも、起動片の全文を
+                // 「コマンド」として前に付けた形にもしない）。製品の `run_installer` と同じ口で読んで見る
+                let plain = powershell_stderr_text(&ran.stderr);
+                println!("TAKO2790_EXIT_PLAIN program={program} [{}]", plain.trim());
                 assert!(
-                    contains_loose(&ran.stderr, "fake installer terminating error 2790"),
+                    contains_loose(&plain, "fake installer terminating error 2790"),
                     "{program}: 終端エラーの中身が stderr に出ていない: {}",
                     ran.summary()
                 );
-                // `-OutputFormat Text` を外すと、-EncodedCommand + stderr のリダイレクトでエラーが
-                // CLIXML になり、GUI / MCP の代行の断りの文へ XML のまま載る
-                assert!(
-                    !ran.stderr.contains("#< CLIXML"),
-                    "{program}: 捕捉したエラーが CLIXML になっている（平文でない）: {}",
-                    ran.summary()
-                );
+                for junk in ["<Objs", "[scriptblock]::Create"] {
+                    assert!(
+                        !plain.contains(junk),
+                        "{program}: 捕捉したエラーに {junk} が残っている: {}",
+                        ran.summary()
+                    );
+                }
             }
             if policy.is_none() {
                 let mut legacy = legacy_form(&script, &program, &marker);
@@ -376,13 +385,19 @@ fn issue2790_読めないスクリプトは理由つきで1で終わる() {
                 ran.summary()
             );
             assert_eq!(ran.code, Some(1), "{program} {name}: {}", ran.summary());
+            // 製品の `run_installer` と同じ口で平文へ戻してから見る
+            let plain = powershell_stderr_text(&ran.stderr);
+            println!(
+                "TAKO2790_UNREADABLE_PLAIN case={name} program={program} [{}]",
+                plain.trim()
+            );
             assert!(
-                !ran.stderr.contains("#< CLIXML"),
-                "{program} {name}: 捕捉したエラーが CLIXML になっている: {}",
+                !plain.contains("<Objs"),
+                "{program} {name}: 平文へ戻らない: {}",
                 ran.summary()
             );
             assert!(
-                contains_loose(&ran.stderr, needle),
+                contains_loose(&plain, needle),
                 "{program} {name}: 理由が stderr に出ていない: {}",
                 ran.summary()
             );

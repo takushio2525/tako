@@ -687,7 +687,7 @@ mod tests {
             decoded,
             format!(
                 "try {{ & ([scriptblock]::Create([System.IO.File]::ReadAllText({literal}))) }}\n\
-                 catch {{ Write-Error -ErrorRecord $_ -ErrorAction Continue; exit 1 }}\n\
+                 catch {{ [Console]::Error.WriteLine(($_ | Out-String).TrimEnd()); exit 1 }}\n\
                  exit 0\n"
             )
         );

@@ -1323,7 +1323,10 @@ fn run_installer(
                 error: e.to_string(),
             })?;
         let mut log = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_raw = String::from_utf8_lossy(&output.stderr);
+        // Windows PowerShell 5.1 は `-EncodedCommand` + stderr の捕捉で進捗・警告・エラーを CLIXML で書く
+        // （#2790）。断りの文へ XML のまま載せないよう平文へ戻す（CLIXML でなければ素通り）
+        let stderr = tako_core::platform::shell::powershell_stderr_text(&stderr_raw);
         if !stderr.trim().is_empty() {
             if !log.is_empty() {
                 log.push('\n');

@@ -157,6 +157,12 @@ fn issue2790_インストーラを起こすcommandはinstaller_commandの1実装
         body.contains(".installer_command(script)"),
         "run_installer が InstallRecipe::installer_command を通していない（#2790）"
     );
+    // 5.1 は -EncodedCommand + stderr の捕捉で CLIXML を書く（-OutputFormat Text を見ない = CI 実測）。
+    // 平文へ戻さずに断りの文へ載せると、利用者に XML を見せる
+    assert!(
+        body.contains("powershell_stderr_text(&stderr_raw)"),
+        "run_installer が捕捉した stderr を powershell_stderr_text で平文へ戻していない（#2790）"
+    );
     for forbidden in ["runner.args_for(", "runner.candidates", "Command::new("] {
         assert!(
             !body.contains(forbidden),
