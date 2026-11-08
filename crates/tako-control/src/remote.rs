@@ -9053,7 +9053,10 @@ mod tests {
             "断りは unix と同じ受信失敗（{receive_failed}…）: {message}"
         );
         assert!(
-            app_conn.read().expect("接続").client.is_none(),
+            matches!(
+                with_app_ipc(&app_conn, |conn| conn.client.is_none()),
+                Ok(true)
+            ),
             "通信失敗なので接続を捨てる（次の get() で張り直す）"
         );
         assert!(
