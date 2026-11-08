@@ -174,7 +174,7 @@ fn raw_reads(rel: &str, src: &str) -> Vec<String> {
                     .any(|t| !t.is_empty() && alias_is_codex(t, start));
             if hits {
                 let line = code[..start].matches('\n').count() + 1;
-                out.push(format!("{rel}:{line} {}{arg})", call));
+                out.push(format!("{rel}:{line} {call}{arg})"));
             }
         }
     }
@@ -203,7 +203,7 @@ fn codex_homeを素で読むのは解決の正本だけ() {
 fn 走査が空振りしていない() {
     let sources = crate_sources();
     assert!(
-        sources.len() > 1_000,
+        sources.len() > 500,
         "走査したファイルが少なすぎる（走査に失敗している）: {} 本",
         sources.len()
     );

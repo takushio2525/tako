@@ -290,7 +290,7 @@ pub fn list_args(agent: WorkerAgent) -> Vec<String> {
 
 /// 設定ファイルの置き場（表示・読み取り用）。
 ///
-/// - codex: `$CODEX_HOME/config.toml`（未設定・空なら `~/.codex/config.toml`）
+/// - codex: `$CODEX_HOME/config.toml`（未設定・空・空白だけなら `~/.codex/config.toml`）
 /// - agy: `~/.gemini/config/mcp_config.json`（実測: `agy mcp add` が実際に書いた先。
 ///   `HOME` を差し替えるとそちらへ付いてくる = テストで隔離できる）
 pub fn config_path(agent: WorkerAgent) -> Option<PathBuf> {
