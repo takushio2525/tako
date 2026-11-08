@@ -789,9 +789,9 @@
     {
       "key": "tako_setup_bootstrap",
       "status": "degraded",
-      "note_ja": "3 系統とも状態照会と公式手順の案内はできるが、導入の実行代行は claude だけ（#1057 で実機実測）。codex / agy の install.ps1 は実在するが未実測なので代行せずコマンドを案内する（実行代行は #525 の範囲）",
+      "note_ja": "3 系統とも公式の install.ps1 で導入を代行する（管理者権限は使わない）。claude は Windows 11 実機で実測（#1057）、codex / agy は Windows の CI のランナーで公式の install.ps1 を実際に走らせて確かめたが、Windows 実機では未実測（#2791）",
       "evidence": "measured",
-      "evidence_detail": "#1057 の Windows 11 実測: 隔離 USERPROFILE + PATH 剥ぎで `tako setup` が install（install.ps1 を -ExecutionPolicy Bypass -File で実行）→ path（ユーザー環境変数 Path へ追記・undo-path で完全復帰）→ auth 誘導 まで到達。2 回目は無言で素通り。#989 で足した codex / agy は recipe の tako_can_run=false（状態照会・PATH・認証誘導は動くが install は代行しない）。#2790 で install の起こし方を、本文をテキストで読む -EncodedCommand（実行ポリシーの対象外）へ替えた。新しい形は Windows の CI でグループポリシー（HKLM AllSigned / HKCU Restricted）を置き、偽の install.ps1 で確かめた（実機では未実測）"
+      "evidence_detail": "#1057 の Windows 11 実測: 隔離 USERPROFILE + PATH 剥ぎで `tako setup` が install（install.ps1 を -ExecutionPolicy Bypass -File で実行）→ path（ユーザー環境変数 Path へ追記・undo-path で完全復帰）→ auth 誘導 まで到達。2 回目は無言で素通り。#2790 で install の起こし方を、本文をテキストで読む -EncodedCommand（実行ポリシーの対象外）へ替えた。新しい形は Windows の CI でグループポリシー（HKLM AllSigned / HKCU Restricted）を置き、偽の install.ps1 で確かめた。#2791 で codex / agy も代行へ倒し、Windows の CI のランナーで `tako setup bootstrap install --agent codex|agy` が公式の install.ps1 を実際に走らせ、status が導入済みを返すことを、ポリシーなし・HKCU Restricted・HKLM AllSigned の 3 通りで確かめた（起動片は #2791 からドットソース。実機では未実測）"
     },
     {
       "key": "tako_setup_changes",

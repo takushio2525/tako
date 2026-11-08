@@ -3230,7 +3230,7 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
-        // 出自: #868 / #989 / #525 / #1057
+        // 出自: #868 / #989 / #525 / #1057 / #2791（Windows も 3 系統とも代行する）
         json!({
             "name": "tako_setup_bootstrap",
             "description": "エージェント CLI（claude / codex / agy）のゼロスタート導入（CLI が無い環境で \
@@ -3240,7 +3240,6 @@ pub fn tools() -> Vec<Value> {
                 status-all は 3 系統ぶん。install は公式インストーラを実行する。\
                 **実行前に install_plan（製品名・公式コマンド・取得元・置き場所・更新のされ方）を\
                 必ずユーザーへ提示する**（dry_run=true で計画だけ）。\
-                **Windows で代行できるのは claude だけ**（codex / agy は can_run=false）。\
                 path はランチャーの置き場所を新しいターミナルの PATH へ通す（冪等）、undo-path はその取り消し。\
                 handoff（読むだけ）は自動導入が通らなかったときの計画: candidates と prompt があれば \
                 tako_orchestrator_spawn / tako_run でその CLI に代行させ、available=false なら \

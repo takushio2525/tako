@@ -92815,7 +92815,7 @@ mod self_test {
                             && lines.contains(r.update_note)
                             && lines.contains("管理者権限");
                         // 代行の可否が手順の宣言と一致すること
-                        // （Windows は claude だけ true = #989 のやること 6）
+                        // （#2791 から両 OS とも 3 系統 true。`TAKO_2791_LEGACY=1` なら Windows の codex / agy は false）
                         let can_run = st
                             .as_ref()
                             .and_then(|v| v["install_plan"]["can_run"].as_bool())

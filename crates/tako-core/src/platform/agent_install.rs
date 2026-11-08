@@ -93,13 +93,37 @@
 //!   （`agy install` = 「Configure environment paths and shell settings」。実測の `agy help install`）
 //! - Windows の設置先は `%LOCALAPPDATA%\agy\bin`（公式 docs の Windows 節）
 //!
-//! ## Windows で codex / agy の実行を代行しない理由（#989）
+//! ## Windows の codex / agy の調査の根拠（2026-11-08 実測。#2791）
 //!
-//! `install.ps1` は 3 系統とも実在するが、実機で通したのは claude だけ（#1057）。
-//! 未実測の経路を `tako_can_run: true` にすると「代行できるはず」で失敗して詰まるので、
-//! codex / agy の Windows は **状態照会と公式手順の案内まで**にしてある
-//! （実行代行は #525 の範囲。宣言は [`crate::platform::support`] の
-//! `tako_setup_bootstrap` 行と [`crate::agent_support`] のマトリクス）
+//! #989 では `install.ps1` が実在するのを確かめただけで、実機で通したのは claude だけ（#1057）だったので
+//! codex / agy の Windows は案内止まり（`tako_can_run: false`）にしていた。#2791 で中身を読み、
+//! どちらも**ユーザー権限だけで入る**ことを確かめて代行へ倒した（UAC の要る手段は無い）。
+//!
+//! - codex: 公式 README（`openai/codex`）の Windows の手順は
+//!   `powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"`
+//!   （案内の 1 行は PowerShell のプロンプトで打つ形の `irm … | iex` のまま = #2790 / #322）。代わりの手段は
+//!   npm（`npm install -g @openai/codex`。Node が要る）だけで winget は無い。`install.ps1` は 302 で
+//!   `https://releases.openai.com/codex/install.ps1` へ飛ぶ 71,052 バイト（Authenticode の署名つき）。
+//!   管理者権限の参照は 0 件で、実体は `$env:CODEX_HOME`（空なら `%USERPROFILE%\.codex`）の
+//!   `packages\standalone` へ置き、`%LOCALAPPDATA%\Programs\OpenAI\Codex\bin` をそこへの junction にする。
+//!   ユーザー環境変数 Path も**インストーラ自身**が書く。`SHA256SUMS` で検証する（署名検証はインストーラ自身）。
+//!   問いは `Start Codex now?` と npm 版の削除の 2 つで、どちらも `CODEX_NON_INTERACTIVE=1`
+//!   （[`InstallRecipe::installer_env`]）か入出力のリダイレクトで聞かずに「いいえ」になる
+//! - agy: 公式 Quickstart（`https://antigravity.google/docs/getting-started`）の
+//!   「Windows (PowerShell)」が `irm https://antigravity.google/cli/install.ps1 | iex`（7,165 バイト）。
+//!   `%LOCALAPPDATA%\agy\bin\agy.exe` へマニフェストの sha512 と突き合わせてから置き、
+//!   最後に `agy.exe install` が PATH を整える。既に在れば `Notice: 'agy.exe' is already installed` で 0 を返す
+//!   （= 冪等）。**取得物の片付けが `$script:` のスコープに依る**（関数の中で `$script:stagingPayload` へ書き、
+//!   `finally` で素の `$stagingPayload` を読む）ので、起動片は `-File` / `irm | iex` と同じスコープで走らせる
+//!   （`platform::shell::powershell_script_text_command` のドットソース。子スコープだと片付けが飛び、
+//!   `%LOCALAPPDATA%\antigravity\staging\agy.exe` が残る）
+//! - 起こし方は claude と同じ 1 実装（[`WINDOWS_POWERSHELL_RUNNER`] = 本文をテキストで読む `-EncodedCommand`。
+//!   #2790）。実行ポリシーを強制した PC でも止まらない
+//! - 実走は Windows の CI のランナーで行う（`scripts/windows/test-agent-install-2791.ps1`）。
+//!   Windows の実機（クライアント版）では未実測なので、宣言（[`crate::platform::support`] の
+//!   `tako_setup_bootstrap` 行）はその旨を書いたうえで縮退のままにしてある
+//!
+//! A/B は `TAKO_2791_LEGACY=1`（Windows の codex / agy は状態照会と案内までに戻る。[`current_recipe`]）
 
 use super::support::Platform;
 use std::path::PathBuf;
@@ -456,8 +480,9 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             auto_updates: false,
             update_note: "codex が新しい版を知らせます（`codex update` で更新します）",
             troubleshoot_url: "https://learn.chatgpt.com/docs/codex/cli",
-            // Windows は状態照会と案内まで（実行代行は #525 の範囲。#989）
-            tako_can_run: false,
+            // ユーザー権限だけで入るので代行する（#2791。モジュールドキュメントの「Windows の codex / agy」）
+            tako_can_run: true,
+            // これが無いと端末つきの実行で最後の `Start Codex now? [y/N]` を聞く（install.ps1 の Prompt-YesNo）
             installer_env: &[("CODEX_NON_INTERACTIVE", "1")],
             runner: WINDOWS_POWERSHELL_RUNNER,
         },
@@ -501,19 +526,38 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             auto_updates: true,
             update_note: "Antigravity CLI が実行のたびに自分で背景更新します",
             troubleshoot_url: "https://antigravity.google/docs/cli/troubleshooting",
-            // Windows は状態照会と案内まで（実行代行は #525 の範囲。#989）
-            tako_can_run: false,
+            // ユーザー権限だけで入るので代行する（#2791。モジュールドキュメントの「Windows の codex / agy」）
+            tako_can_run: true,
             installer_env: &[],
             runner: WINDOWS_POWERSHELL_RUNNER,
         },
     }
 }
 
+/// [`recipe`] に #2791 の A/B を重ねる（**純粋関数**。`legacy_2791` = #2791 より前）。
+///
+/// #2791 より前は Windows の codex / agy を代行せず、状態照会と公式手順の案内までだった
+/// （`tako_can_run: false`）。それ以外の欄は前後で同じ
+pub fn recipe_in(platform: Platform, agent: AgentKind, legacy_2791: bool) -> InstallRecipe {
+    let mut r = recipe(platform, agent);
+    if legacy_2791 && platform == Platform::Windows && agent != AgentKind::Claude {
+        r.tako_can_run = false;
+    }
+    r
+}
+
+/// `TAKO_2791_LEGACY=1` で #2791 より前（Windows の codex / agy は状態照会と案内まで）へ戻す。
+/// **同一バイナリで A/B が取れる**（Windows の CI の `scripts/windows/test-agent-install-2791.ps1` が使う）
+pub fn issue2791_legacy() -> bool {
+    std::env::var_os("TAKO_2791_LEGACY").is_some()
+}
+
 /// Windows の `install.ps1` を走らせる形（3 系統で同じなので 1 箇所に置く）。
 ///
 /// - **5.1（`powershell.exe`）を先に置く**。Windows へ必ず同梱されている側を既定に
 ///   するとマシンごとの差が出ない（pwsh 7 は任意導入）。3 系統の `install.ps1` は
-///   どれも `Set-StrictMode` / `Invoke-RestMethod` 止まりなので 5.1 で動く
+///   どれも 5.1 で動く形で書かれている（`Set-StrictMode` / `Invoke-RestMethod` / `Invoke-WebRequest`、
+///   codex は junction の付け替えに `Add-Type` の C#。Windows の CI で 5.1 から実走して確かめる = #2791）
 /// - **本文をテキストで読んで走らせる**（[`ScriptPassing::PowerShellText`]。#2790）。落としたファイルを
 ///   `-File` で走らせると既定の `RemoteSigned` に弾かれる（claude で実機実測。#1057）。#1057 は
 ///   `-ExecutionPolicy Bypass` で避けたが、これは Process スコープの指定なので、グループポリシーで
@@ -537,9 +581,9 @@ pub fn current_platform() -> Platform {
     }
 }
 
-/// この実行環境向けの手順
+/// この実行環境向けの手順（A/B は `TAKO_2791_LEGACY=1` = [`issue2791_legacy`]）
 pub fn current_recipe(agent: AgentKind) -> InstallRecipe {
-    recipe(current_platform(), agent)
+    recipe_in(current_platform(), agent, issue2791_legacy())
 }
 
 #[cfg(test)]
@@ -686,11 +730,42 @@ mod tests {
         assert_eq!(
             decoded,
             format!(
-                "try {{ & ([scriptblock]::Create([System.IO.File]::ReadAllText({literal}))) }}\n\
+                "try {{ . ([scriptblock]::Create([System.IO.File]::ReadAllText({literal}))) }}\n\
                  catch {{ [Console]::Error.WriteLine(($_ | Out-String).TrimEnd()); exit 1 }}\n\
                  exit 0\n"
             )
         );
+    }
+
+    /// 起動片は scriptblock を**ドットソース**で走らせる（#2791）。子スコープ（`&`）だと、最上位の変数と
+    /// `$script:` の変数が別になり、agy の `install.ps1` の取得物の片付け（`$script:stagingPayload` を書いて
+    /// `finally` で `$stagingPayload` を読む）が飛ぶ。製品の既定の口（`args_for` = 3 系統の Windows の
+    /// レシピ）で縛るので、`&` へ戻す変更はここが名指しで落とす
+    #[test]
+    fn issue2791_起動片はscriptblockをドットソースで走らせる() {
+        let script = std::path::Path::new(WIN_SCRIPT_2790);
+        for agent in AgentKind::ALL {
+            let who = agent.as_str();
+            let args = recipe(Platform::Windows, agent).runner.args_for(script);
+            let decoded = decoded_2790(&args[5]);
+            assert!(
+                decoded.starts_with("try { . ([scriptblock]::Create("),
+                "{who}: 起動片がドットソースでない（子スコープでは $script: の変数が最上位と別になる）: {decoded}"
+            );
+            assert!(
+                !decoded.contains("& ([scriptblock]"),
+                "{who}: 子スコープの呼び出しが残っている: {decoded}"
+            );
+        }
+        // 旧形（比較のためだけに組める）は子スコープの `&`。違いは呼び出しの 1 文字だけ
+        let new = crate::platform::shell::powershell_script_text_command_in(script, false);
+        let old = crate::platform::shell::powershell_script_text_command_in(script, true);
+        assert_eq!(
+            old,
+            new.replacen("try { . (", "try { & (", 1),
+            "旧形との差は呼び出しの 1 文字だけ"
+        );
+        assert_ne!(old, new);
     }
 
     /// 符号化そのものの往復（非 ASCII・改行・引用符・`$`・バッククォートを含む本文）。
@@ -932,25 +1007,64 @@ mod tests {
         }
     }
 
-    /// 代行してよいのは**実機で通した組み合わせだけ**（過大申告しない。#989 / #1057）
+    /// 3 系統 × 2 プラットフォームのすべてで導入を代行する（#2791。Windows の codex / agy の
+    /// `install.ps1` はユーザー権限だけで入る = モジュールドキュメントの「Windows の codex / agy」）。
+    /// Windows の codex / agy を案内止まりへ戻す変更はここが名指しで落とす
     #[test]
-    fn windowsで代行するのはclaudeだけ() {
+    fn issue2791_windowsも3系統とも導入を代行する() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for agent in AgentKind::ALL {
+                let r = recipe(platform, agent);
+                assert!(
+                    r.tako_can_run,
+                    "{}/{} は代行する（#2791）",
+                    platform.as_str(),
+                    agent.as_str()
+                );
+                // A/B の旧アームが無いときは recipe と同じ
+                assert_eq!(recipe_in(platform, agent, false), r);
+            }
+        }
+        // Windows で代行する 3 系統は同じ 1 実装（#2790 の本文をテキストで読む -EncodedCommand）で起こす
         for agent in AgentKind::ALL {
-            assert!(
-                recipe(Platform::MacOs, agent).tako_can_run,
-                "macOS は 3 系統とも代行する（{}）",
+            assert_eq!(
+                recipe(Platform::Windows, agent).runner,
+                WINDOWS_POWERSHELL_RUNNER,
+                "{}",
                 agent.as_str()
             );
         }
-        assert!(recipe(Platform::Windows, AgentKind::Claude).tako_can_run);
-        assert!(
-            !recipe(Platform::Windows, AgentKind::Codex).tako_can_run,
-            "Windows の codex は案内まで（#525）"
-        );
-        assert!(
-            !recipe(Platform::Windows, AgentKind::Agy).tako_can_run,
-            "Windows の agy は案内まで（#525）"
-        );
+    }
+
+    /// `TAKO_2791_LEGACY=1` の旧アーム: Windows の codex / agy だけが案内止まり（`tako_can_run: false`）へ戻り、
+    /// macOS と Windows の claude と、代行の可否以外の欄は変わらない
+    #[test]
+    fn issue2791_旧アームはwindowsのcodexとagyだけ案内止まりへ戻す() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for agent in AgentKind::ALL {
+                let new = recipe(platform, agent);
+                let old = recipe_in(platform, agent, true);
+                let delegated_since_2791 =
+                    platform == Platform::Windows && agent != AgentKind::Claude;
+                assert_eq!(
+                    old.tako_can_run,
+                    !delegated_since_2791,
+                    "{}/{}",
+                    platform.as_str(),
+                    agent.as_str()
+                );
+                assert_eq!(
+                    InstallRecipe {
+                        tako_can_run: new.tako_can_run,
+                        ..old
+                    },
+                    new,
+                    "{}/{}: 代行の可否以外が変わった",
+                    platform.as_str(),
+                    agent.as_str()
+                );
+            }
+        }
     }
 
     /// codex のインストーラは最後に `Start Codex now? [y/N]` を聞く（実測）。

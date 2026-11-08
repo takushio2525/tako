@@ -630,6 +630,16 @@ jobs:
       - name: 実行ポリシーを強制した PC での導入代行の起こし方の実行検査（#2790。HKLM AllSigned / HKCU Restricted）
         shell: pwsh
         run: pwsh -File scripts/windows/test-install-execution-policy-2790.ps1
+      # #2791: Windows の codex / agy の導入代行を、公式の install.ps1 を本当に走らせて確かめる（製品の口
+      # `tako setup bootstrap install --agent codex|agy` = MCP tako_setup_bootstrap と同じ経路）。導入の前後の
+      # status・入った置き場・agy の取得物が残らない（起動片のスコープ）を、ポリシーなし / HKCU Restricted /
+      # HKLM AllSigned の 3 通りで見る。ポリシーなしの回は A/B（TAKO_2791_LEGACY=1 は断る）・既に入っている・
+      # 導入元に届かない・途中で失敗する・npm が無いも見る。USERPROFILE / LOCALAPPDATA ほかは砂場、ユーザー環境変数
+      # Path とポリシーは finally で戻す。全数より手前に名指しで置く（#1282 / #2790 と同じ理由）。
+      # **Windows の codex / agy が案内止まりへ戻る・起動片が子スコープへ戻る・install.ps1 の形が変わって入らなくなったらここで落ちる**
+      - name: codex / agy の導入代行の実走検査（#2791。公式の install.ps1・ポリシー 3 通り）
+        shell: pwsh
+        run: pwsh -File scripts/windows/test-agent-install-2791.ps1
       # **ワークスペース全体のテストを blocking にする**（#1278 / #583）。
       # #583 は「POSIX 前提の既存失敗が残っているあいだ非ブロッキング」で据え置いていたが、
       # そのあいだに未検出が溜まり、実機で 19 → 24 件まで増えていた（#1278）。

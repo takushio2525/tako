@@ -45,11 +45,9 @@ if ($env:GITHUB_ACTIONS -ne 'true') {
 }
 
 $TestName = 'issue2790_install_execution_policy_windows'
-# Windows PowerShell 5.1 と pwsh 7 のグループポリシーの置き場
-$PolicyKeys = @(
-    'SOFTWARE\Policies\Microsoft\Windows\PowerShell',
-    'SOFTWARE\Policies\Microsoft\PowerShellCore'
-)
+# ポリシーの置き方・戻し方の 1 実装（$PolicyKeys・Get-PolicySnapshot・Set-Policy・Restore-Policy。#2791 で
+# scripts/windows/test-agent-install-2791.ps1 と共有するため lib へ出した）
+. (Join-Path $PSScriptRoot 'lib/execution-policy.ps1')
 $Cases = @(
     [pscustomobject]@{ Hive = 'HKLM'; Scope = 'MachinePolicy'; Value = 'AllSigned' },
     [pscustomobject]@{ Hive = 'HKCU'; Scope = 'UserPolicy'; Value = 'Restricted' }
@@ -62,87 +60,9 @@ function Say([string]$Message) {
     [Console]::WriteLine("[#2790 $script:Stage] $Message")
 }
 
-function Get-HiveRoot([string]$Hive) {
-    if ($Hive -eq 'HKLM') { return [Microsoft.Win32.Registry]::LocalMachine }
-    return [Microsoft.Win32.Registry]::CurrentUser
-}
-
-# $Sub の途中で最初に無い鍵（無ければ $null）。戻すときはここから下を丸ごと消す（作った分だけ消す）
-function Get-FirstMissing($Root, [string]$Sub) {
-    $path = ''
-    foreach ($part in $Sub.Split('\')) {
-        $path = if ($path) { "$path\$part" } else { $part }
-        $key = $Root.OpenSubKey($path)
-        if ($null -eq $key) { return $path }
-        $key.Dispose()
-    }
-    return $null
-}
-
-# 置く前の状態（鍵が在ったか・2 つの値）
-function Get-PolicySnapshot([string]$Hive) {
-    $root = Get-HiveRoot $Hive
-    $out = @()
-    foreach ($sub in $PolicyKeys) {
-        $missing = Get-FirstMissing $root $sub
-        $enable = $null
-        $policy = $null
-        if ($null -eq $missing) {
-            $key = $root.OpenSubKey($sub)
-            try {
-                $enable = $key.GetValue('EnableScripts')
-                $policy = $key.GetValue('ExecutionPolicy')
-            } finally { $key.Dispose() }
-        }
-        $out += [pscustomobject]@{ Sub = $sub; Missing = $missing; EnableScripts = $enable; ExecutionPolicy = $policy }
-    }
-    return $out
-}
-
-function Format-Snapshot($Snapshot) {
-    ($Snapshot | ForEach-Object {
-        '{0}: missing={1} EnableScripts={2} ExecutionPolicy={3}' -f $_.Sub, $_.Missing, $_.EnableScripts, $_.ExecutionPolicy
-    }) -join ' | '
-}
-
-function Set-Policy([string]$Hive, [string]$Value) {
-    $root = Get-HiveRoot $Hive
-    foreach ($sub in $PolicyKeys) {
-        $key = $root.CreateSubKey($sub)
-        try {
-            if ($Value -eq 'Restricted') {
-                # グループポリシーの「スクリプトの実行を有効にする」を無効にした形（EnableScripts = 0 だけ）
-                $key.SetValue('EnableScripts', 0, [Microsoft.Win32.RegistryValueKind]::DWord)
-                $key.DeleteValue('ExecutionPolicy', $false)
-            } else {
-                $key.SetValue('EnableScripts', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
-                $key.SetValue('ExecutionPolicy', $Value, [Microsoft.Win32.RegistryValueKind]::String)
-            }
-        } finally { $key.Dispose() }
-    }
-}
-
-function Restore-Policy([string]$Hive, $Snapshot) {
-    $root = Get-HiveRoot $Hive
-    foreach ($s in $Snapshot) {
-        if ($null -ne $s.Missing) {
-            $root.DeleteSubKeyTree($s.Missing, $false)
-            continue
-        }
-        $key = $root.OpenSubKey($s.Sub, $true)
-        try {
-            if ($null -eq $s.EnableScripts) { $key.DeleteValue('EnableScripts', $false) }
-            else { $key.SetValue('EnableScripts', $s.EnableScripts, [Microsoft.Win32.RegistryValueKind]::DWord) }
-            if ($null -eq $s.ExecutionPolicy) { $key.DeleteValue('ExecutionPolicy', $false) }
-            else { $key.SetValue('ExecutionPolicy', $s.ExecutionPolicy, [Microsoft.Win32.RegistryValueKind]::String) }
-        } finally { $key.Dispose() }
-    }
-}
-
 # 実効の実行ポリシーの一覧（ログ用。5.1 の実物に聞く）
 function Show-PolicyList([string]$When) {
-    $list = & powershell.exe -NoLogo -NoProfile -Command "Get-ExecutionPolicy -List | ForEach-Object { '' + `$_.Scope + '=' + `$_.ExecutionPolicy }"
-    Say ("{0}: {1}" -f $When, ($list -join ', '))
+    Say ("{0}: {1}" -f $When, (Get-PolicyListText))
 }
 
 # テストは置く前に組む（ポリシーの下で cargo の build.rs を走らせない）
