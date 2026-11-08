@@ -8,7 +8,8 @@
 use serde_json::Value;
 
 /// tailscale CLI の探索候補。PATH → brew 標準 → App Store 版 / brew cask 版
-/// （App Store 版は .app 同梱バイナリが CLI を兼ねる。弾 0 項目 5）
+/// （App Store 版は .app 同梱バイナリが CLI を兼ねる。弾 0 項目 5）。
+/// Windows はこの後ろにインストーラの既定の置き場が足される（[`detection_candidates`]。#2772）
 const TAILSCALE_CANDIDATES: &[&str] = &[
     "tailscale",
     "/opt/homebrew/bin/tailscale",
@@ -116,13 +117,56 @@ pub fn detect_tailscale() -> Detection {
             login_shell_lookup,
             probe,
         ),
-        Err(_) => pick_candidate(
-            TAILSCALE_CANDIDATES,
-            process_path_lookup,
-            try_bare,
-            login_shell_lookup,
-            probe,
-        ),
+        Err(_) => {
+            let candidates = detection_candidates(cfg!(windows), |key| std::env::var_os(key));
+            let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
+            pick_candidate(
+                &candidates,
+                process_path_lookup,
+                try_bare,
+                login_shell_lookup,
+                probe,
+            )
+        }
+    }
+}
+
+/// 検出の候補（**純関数**。OS と環境変数の引き方を差し替えて両 OS の形を検査する。#2772）。
+///
+/// 固定の候補（[`TAILSCALE_CANDIDATES`]）の後ろに、この OS のインストーラの既定の置き場
+/// （[`install_paths_for`]）を足す（既に在れば足さない）。Windows の `exe::find` が見るのは
+/// このプロセスの PATH だけなので、Tailscale より先に起動した GUI と、そこから起こした remote daemon は
+/// PATH が古いまま `tailscale` を引けない（setup が winget で入れた直後の再検出も同じ）。#2772 前の
+/// Windows は固定の候補が macOS の置き場だけで、`%ProgramFiles%\Tailscale\tailscale.exe` を
+/// 隔離の門（[`real_candidate_paths`]）でしか引いていなかった。置き場は門と同じ 1 実装を引く
+pub(crate) fn detection_candidates(
+    windows: bool,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<String> {
+    let mut out: Vec<String> = TAILSCALE_CANDIDATES.iter().map(|c| c.to_string()).collect();
+    for path in install_paths_for(windows, var) {
+        // 候補は文字列で試すので、UTF-8 で表せない置き場は載せない（起こせる形にならない）
+        let Some(path) = path.to_str() else {
+            continue;
+        };
+        if !out.iter().any(|c| c == path) {
+            out.push(path.to_string());
+        }
+    }
+    out
+}
+
+/// この OS のインストーラの既定の置き場（#2772: 検出の候補 [`detection_candidates`] と
+/// 隔離の門 [`real_candidate_paths`] が同じこの 1 実装を引く）。Windows は [`windows_install_paths`]、
+/// それ以外の OS は固定の候補に含まれているので足さない
+pub(crate) fn install_paths_for(
+    windows: bool,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<std::path::PathBuf> {
+    if windows {
+        windows_install_paths(var)
+    } else {
+        Vec::new()
     }
 }
 
@@ -146,7 +190,7 @@ pub fn real_candidate_paths() -> Vec<std::path::PathBuf> {
         real_candidate_paths_with(
             TAILSCALE_CANDIDATES,
             tako_core::platform::exe::find,
-            &windows_install_paths(|key| std::env::var_os(key)),
+            &install_paths_for(true, |key| std::env::var_os(key)),
         )
     } else {
         real_candidate_paths_with(
@@ -2371,5 +2415,104 @@ mod tests {
             &[real_exe.clone(), real_exe],
         );
         assert_eq!(twice.len(), TAILSCALE_CANDIDATES.len() - 1 + 1);
+    }
+
+    /// 64bit の Windows の環境変数の見本（`ProgramFiles` と `ProgramW6432` が同じ置き場）
+    fn program_files_var(
+        base: &std::path::Path,
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> + '_ {
+        move |key| {
+            matches!(key, "ProgramFiles" | "ProgramW6432").then(|| base.as_os_str().to_owned())
+        }
+    }
+
+    /// #2772: Windows の検出の候補はインストーラの既定の置き場を含む（#2772 前は macOS の置き場だけで、
+    /// `%ProgramFiles%\Tailscale\tailscale.exe` は隔離の門でしか引いていなかった）。unix の候補は変えない
+    #[test]
+    fn windowsの検出の候補はインストーラの既定の置き場を含む() {
+        let program_files = abs("Program Files");
+        let real_exe = program_files.join("Tailscale").join("tailscale.exe");
+        let real_exe_str = real_exe.to_str().expect("utf-8").to_string();
+
+        let win = detection_candidates(true, program_files_var(&program_files));
+        assert!(
+            win.contains(&real_exe_str),
+            "Windows の検出の候補に Tailscale のインストーラの既定の置き場が無い: {win:?}"
+        );
+        // 固定の候補（PATH の素の名前が先頭）の並びは変えず、後ろへ足す
+        assert_eq!(win[..TAILSCALE_CANDIDATES.len()], *TAILSCALE_CANDIDATES);
+        assert_eq!(win.len(), TAILSCALE_CANDIDATES.len() + 1, "{win:?}");
+
+        // unix は `ProgramFiles` が立っていても足さない = #2772 前と同じ候補
+        let unix = detection_candidates(false, program_files_var(&program_files));
+        assert_eq!(unix, TAILSCALE_CANDIDATES);
+        // 環境変数が無ければ Windows でも固定の候補だけ
+        assert_eq!(detection_candidates(true, |_| None), TAILSCALE_CANDIDATES);
+    }
+
+    /// #2772: 検出の候補と隔離の門の本物の置き場は同じ 1 実装（[`install_paths_for`]）を引く =
+    /// 検出が使いうる置き場を門が偽物と読まない（片方だけ足すと食い違う）
+    #[test]
+    fn 検出の候補と隔離の門は同じインストーラの置き場を引く() {
+        let program_files = abs("Program Files");
+        let x86 = abs("Program Files (x86)");
+        // 32bit のプロセス: 2 つの置き場が両方に載る
+        let var = |key: &str| match key {
+            "ProgramFiles" => Some(x86.clone().into_os_string()),
+            "ProgramW6432" => Some(program_files.clone().into_os_string()),
+            _ => None,
+        };
+        let install = install_paths_for(true, var);
+        assert_eq!(install, windows_install_paths(var));
+        assert_eq!(install.len(), 2, "{install:?}");
+        let candidates = detection_candidates(true, var);
+        let real = real_candidate_paths_with(TAILSCALE_CANDIDATES, |_| None, &install);
+        for path in &install {
+            let s = path.to_str().expect("utf-8");
+            assert!(
+                candidates.iter().any(|c| c == s),
+                "検出の候補に {s} が無い: {candidates:?}"
+            );
+            assert!(real.contains(path), "隔離の門に {s} が無い: {real:?}");
+        }
+        // unix は両方とも足さない
+        assert!(install_paths_for(false, var).is_empty());
+    }
+
+    /// #2772: Tailscale より先に起動した GUI（PATH が古い = 素の名前を引けない）でも、
+    /// インストーラの既定の置き場の CLI を検出する。#2772 前は「無い」と答えていた
+    #[test]
+    fn pathが古いwindowsでもインストーラの置き場のtailscaleを見つける() {
+        let program_files = abs("Program Files");
+        let real_exe = program_files
+            .join("Tailscale")
+            .join("tailscale.exe")
+            .to_str()
+            .expect("utf-8")
+            .to_string();
+        let candidates = detection_candidates(true, program_files_var(&program_files));
+        let candidates: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let mut tried = Vec::new();
+        let detection = pick_candidate(
+            &candidates,
+            |_| None,
+            true, // Windows は引けない素の名前も素の名前のまま試す（try_unresolved_bare）
+            |_| tako_core::platform::exe::BoundedFind::default(),
+            |c| {
+                tried.push(c.to_string());
+                if c == real_exe {
+                    CandidateProbe::Runnable
+                } else {
+                    CandidateProbe::Absent
+                }
+            },
+        );
+        assert_eq!(
+            detection,
+            Detection::Runnable(real_exe.clone()),
+            "PATH の古い Windows で Tailscale のインストーラの既定の置き場を試していない（試した順: {tried:?}）"
+        );
+        // 素の名前（PATH）が先に試される = PATH に別の CLI があればそちらを採る並びは変えない
+        assert_eq!(tried.first().map(String::as_str), Some("tailscale"));
     }
 }
