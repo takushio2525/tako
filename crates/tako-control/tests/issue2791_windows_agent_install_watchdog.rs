@@ -3,7 +3,7 @@
 //! #989 で Windows の codex / agy は `tako_can_run: false`（状態照会と公式手順の案内まで）にし、根拠の文は
 //! 「実行代行は #525 の範囲」とした。#525 に専用の作業は無く、claude 以外を選んだ Windows の利用者は
 //! 手で導入することになっていた。#2791 で両方の `install.ps1` を読み、ユーザー権限だけで入ることを確かめて
-//! 代行へ倒した。戻る道は 4 つある。4 つとも塞ぐ:
+//! 代行へ倒した。戻る道は 4 つある。4 つとも塞ぐ（5 は実走の段の走らせ方）:
 //!
 //! 1. **手順の後退**: Windows のレシピの `tako_can_run` が false へ戻る・#2790 の起こし方
 //!    （本文をテキストで読む `-EncodedCommand`）から外れる・起動片が子スコープ（`&`）へ戻る
@@ -13,6 +13,10 @@
 //! 3. **実走の検査の抜け**: Windows の CI が本物の `install.ps1` を走らせる名指しのステップを持たない・
 //!    非ブロッキングに倒れる・全数より後ろへ回る・ポリシー 3 通り / A/B / 境界のどれかが落ちる
 //! 4. **偽物の検査の抜け**: 起こし方のスコープを実物の PowerShell で見る Windows のテストが無い
+//! 5. **実走の段が毎回走る形**: 実走は外部（chatgpt.com / antigravity.google）から本物を取るので、条件なしで
+//!    毎回走らせると外部の障害・遅延で関係の無い PR まで赤になる。導入代行に関わるパスを変えたとき
+//!    （`changes` の `agent_install` = `scripts/ci-change-scope.sh` の `AGENT_INSTALL`）と定期・手動実行でだけ
+//!    走らせる。偽物で見る #2790 の段は外部に依らないので毎回走らせる
 
 use std::path::{Path, PathBuf};
 use tako_core::platform::agent_install::{self, AgentKind, ScriptPassing};
@@ -256,4 +260,85 @@ fn issue2791_起こし方のスコープを実物のpowershellで見るテスト
             "{WINDOWS_TEST} に `{needle}` が無い（#2791）"
         );
     }
+}
+
+/// 5. 実走の段は導入代行に関わるパスを変えたときと定期・手動実行でだけ走る（外部に依るので毎回は走らせない）。
+/// 偽物で見る #2790 の段は毎回走る
+#[test]
+fn issue2791_実走の段は条件つきで偽物の2790の段は毎回走る() {
+    let steps = windows_steps();
+    let run = steps
+        .iter()
+        .find(|s| s.contains(SCRIPT))
+        .unwrap_or_else(|| panic!("ci.yml の windows ジョブに {SCRIPT} のステップが無い（#2791）"));
+    assert!(
+        run.lines()
+            .any(|l| l.trim() == "if: needs.changes.outputs.agent_install == 'true'"),
+        "実走の段が条件なしで毎回走る形に戻っている（外部の障害で関係の無い PR まで赤になる。#2791）。\
+         `if: needs.changes.outputs.agent_install == 'true'` を付ける:\n{run}"
+    );
+    let fake = steps
+        .iter()
+        .find(|s| s.contains("scripts/windows/test-install-execution-policy-2790.ps1"))
+        .expect("ci.yml の windows ジョブに #2790 の段が無い");
+    assert!(
+        !fake.lines().any(|l| l.trim_start().starts_with("if:")),
+        "偽物で見る #2790 の段が判定で止まる（外部に依らないので毎回走らせる。#2791）:\n{fake}"
+    );
+
+    let ci = read(".github/workflows/ci.yml");
+    let changes = ci
+        .split_once("\n  changes:")
+        .map(|(_, rest)| rest.split_once("\n  docs:").map(|(b, _)| b).unwrap_or(rest))
+        .expect("ci.yml に changes ジョブが無い");
+    assert!(
+        changes.contains("agent_install: ${{ steps.scope.outputs.agent_install }}"),
+        "changes ジョブが agent_install を出していない（#2791）"
+    );
+    let on = ci
+        .split_once("\non:\n")
+        .map(|(_, rest)| rest.split_once("\n\n").map(|(b, _)| b).unwrap_or(rest))
+        .expect("ci.yml に on: が無い");
+    for (needle, why) in [
+        (
+            "  schedule:",
+            "上流の install.ps1 の形の変化を定期実行で拾う",
+        ),
+        ("  workflow_dispatch:", "手動でも実走を回せる"),
+        ("  pull_request:", "PR の CI"),
+    ] {
+        assert!(
+            on.lines().any(|l| l.starts_with(needle)),
+            "ci.yml の on: に `{}` が無い（{why}。#2791）:\n{on}",
+            needle.trim()
+        );
+    }
+
+    // 判定の型: 依頼で名指しされたパスを変えたら実走を走らせる（正本は ci-change-scope.sh の AGENT_INSTALL）
+    let scope = read("scripts/ci-change-scope.sh");
+    let table = scope
+        .split_once("AGENT_INSTALL=(")
+        .and_then(|(_, rest)| rest.split_once("\n)"))
+        .map(|(t, _)| t)
+        .expect("ci-change-scope.sh に AGENT_INSTALL の表が無い");
+    for path in [
+        "crates/tako-core/src/platform/agent_install.rs",
+        "crates/tako-core/src/platform/shell.rs",
+        "crates/tako-control/src/setup_bootstrap.rs",
+        SCRIPT,
+        "scripts/windows/lib/execution-policy.ps1",
+        ".github/workflows/ci.yml",
+        WINDOWS_TEST,
+    ] {
+        assert!(
+            table.contains(&format!("'{path}|")),
+            "ci-change-scope.sh の AGENT_INSTALL に {path} が無い（変えても実走が走らない。#2791）"
+        );
+    }
+    // 定期・手動実行では常に走らせる
+    assert!(
+        scope.contains("schedule | workflow_dispatch)")
+            && scope.contains("echo \"agent_install=${AGENT}\""),
+        "ci-change-scope.sh が定期・手動実行で agent_install を出していない（#2791）"
+    );
 }

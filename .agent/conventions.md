@@ -5076,11 +5076,22 @@ Windows（約 30 分）を回した。macOS のランナーは同時に数本し
   仕組みは `.agent/release.md`「配布物に同梱するライセンス」
 - push（main）も同じ判定で skip する。docs だけのコミットは直前の main と Rust の入力が同じ
   なので、full を回しても新しく見るものが無い（docs の検査と番犬は main でも走る）
+- **外部から本物を取る段は、関わるパスを変えたときだけ走らせる**（#2791）。Windows ジョブの
+  「codex / agy の導入代行の実走検査」は chatgpt.com / antigravity.google から本物の `install.ps1` と
+  本体を取るので、毎回走らせると外部の障害・遅延で関係の無い PR まで赤になる。`changes` が
+  2 つ目の出力 `agent_install` を出し（型は `scripts/ci-change-scope.sh` の `AGENT_INSTALL`。導入代行の
+  経路・実走の検査・この判定・`ci.yml` を 1 つでも触れば true）、段は
+  `if: needs.changes.outputs.agent_install == 'true'` で skip する。上流の `install.ps1` の形の変化は
+  定期実行（`schedule`・週 1 回 月曜 03:17 JST。macOS ジョブは回さない）と手動実行（`workflow_dispatch`）で
+  拾う（どちらも常に true）。差分が取れない・想定外のイベントは rust と同じく走らせる側。偽物で見る
+  #2790 の段は外部に依らないので毎回走る。条件なしへ戻すと番犬 `issue2791_windows_agent_install_watchdog`
+  と `scripts/test-ci-change-scope-2084.sh` の F 節が落ちる
 - 検証は `bash scripts/test-ci-change-scope-2084.sh`（`changes` ジョブの最初のステップ。
   パスの境界・本物の git で作った merge コミット / 浅い clone / push の before・番犬の拾い方・
-  ci.yml の配線・待ち側が本物の ci.yml から導く期待名。`--no-renames` を外した写し・
-  配線を壊した写しで同じ検査が落ちることも見る）。判定だけ試すなら
+  ci.yml の配線・待ち側が本物の ci.yml から導く期待名・導入代行の実走の判定と配線（F 節）。
+  `--no-renames` を外した写し・配線を壊した写しで同じ検査が落ちることも見る）。判定だけ試すなら
   `git diff --name-only --no-renames origin/main... | bash scripts/ci-change-scope.sh classify`
+  （最後の 2 行が `agent_install=…` と `rust=…`）
 
 ## 設定・データファイルのスキーマ変更（Issue #916）
 

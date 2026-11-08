@@ -16,6 +16,8 @@
 #      rust=true のときだけ・番犬ジョブは毎回 ubuntu で・ライセンス一覧の検査は rust=true の
 #      ときだけ ubuntu で = #1851）
 #   E. 本物の ci.yml から scripts/wait-pr-checks.sh が導く期待名に新しいジョブが入る
+#   F. 導入代行の実走（agent_install。#2791）: 導入代行に関わるパスを変えたときだけ true・
+#      定期実行 / 手動実行は true・取れないときは true・ci.yml の段に if があり #2790 の段には無い
 # 検出力: 判定・配線を壊した写しを作り、同じ検査が落ちることも確かめる
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -52,6 +54,8 @@ git config --global protocol.file.allow always
 
 # 最後の行（rust=…）だけを返す
 classify() { printf '%s' "$1" | bash "${SCOPE_SH}" classify 2>/dev/null | tail -1; }
+# agent_install=… の行だけを返す（#2791）
+classify_agent() { printf '%s' "$1" | bash "${SCOPE_SH}" classify 2>/dev/null | grep '^agent_install='; }
 
 echo "== A: パスの境界 =="
 assert_eq "docs/ だけ → skip" "$(classify $'docs/src/content/docs/guides/a.md\ndocs/public/og.png\n')" "rust=false"
@@ -136,14 +140,14 @@ run_github_in_clone() {
 make_pr_merge docs 'echo changed >> docs/a.md; echo new > .agent/c.md' 'echo moved >> crates/x/src/other.rs'
 out="$(run_github_in_clone merge-docs CI_EVENT=pull_request)"
 assert_has "docs だけの PR（main 側は crates が進んでいる）→ skip" "rust=false" "${out}"
-assert_eq "GITHUB_OUTPUT へ rust=false を書く" "$(cat "${TMP}/gh_output")" "rust=false"
+assert_eq "GITHUB_OUTPUT へ rust=false と agent_install=false を書く" "$(cat "${TMP}/gh_output")" $'rust=false\nagent_install=false'
 assert_has "step summary に結論を書く" "変更範囲の判定（#2084）: rust=false" "$(cat "${TMP}/gh_summary")"
 assert_has "skip するときは notice を出す" "::notice title=docs だけの変更（#2084）::" "${out}"
 
 make_pr_merge code 'echo changed >> docs/a.md; echo "// x" >> crates/x/src/main.rs'
 out="$(run_github_in_clone merge-code CI_EVENT=pull_request)"
 assert_has "docs + crates の PR → 走らせる" "rust=true" "${out}"
-assert_eq "GITHUB_OUTPUT へ rust=true を書く" "$(cat "${TMP}/gh_output")" "rust=true"
+assert_eq "GITHUB_OUTPUT へ rust=true と agent_install=false を書く" "$(cat "${TMP}/gh_output")" $'rust=true\nagent_install=false'
 assert_has "理由に crates のパスを出す" "crates/x/src/main.rs" "${out}"
 assert_hasnt "走らせるときは notice を出さない" "::notice" "${out}"
 
@@ -196,9 +200,23 @@ assert_has "before が取れない → 走らせる" "rust=true" "${out}"
 assert_has "取れない理由を言う" "を取得できない" "${out}"
 out="$(run_github_in_clone main CI_EVENT=push CI_PUSH_BEFORE='')"
 assert_has "before が空 → 走らせる" "rust=true" "${out}"
-out="$(run_github_in_clone main CI_EVENT=workflow_dispatch)"
+out="$(run_github_in_clone main CI_EVENT=merge_group)"
 assert_has "想定外のイベント → 走らせる" "rust=true" "${out}"
-assert_eq "想定外のイベントでも GITHUB_OUTPUT へ書く" "$(cat "${TMP}/gh_output")" "rust=true"
+assert_eq "想定外のイベントでも GITHUB_OUTPUT へ書く（実走も走らせる側）" "$(cat "${TMP}/gh_output")" $'rust=true\nagent_install=true'
+for ev in schedule workflow_dispatch; do
+  out="$(run_github_in_clone main CI_EVENT="${ev}")"
+  assert_eq "${ev} → 全部走らせ、導入代行の実走も走らせる（#2791）" "$(cat "${TMP}/gh_output")" $'rust=true\nagent_install=true'
+  assert_has "${ev} の理由を言う" "上流の install.ps1 の形の変化を拾うため常に走らせる" "${out}"
+  assert_has "${ev} の step summary に実走の結論を書く" "導入代行の実走（#2791）: agent_install=true" "$(cat "${TMP}/gh_summary")"
+done
+
+# 導入代行に関わるパスの PR（#2791）。setup_bootstrap.rs を触った PR は実走を走らせ、理由に名指しする
+make_pr_merge agent 'mkdir -p crates/tako-control/src; echo "// y" > crates/tako-control/src/setup_bootstrap.rs'
+out="$(run_github_in_clone merge-agent CI_EVENT=pull_request)"
+assert_eq "導入代行に関わるパスの PR → 実走を走らせる（#2791）" "$(cat "${TMP}/gh_output")" $'rust=true\nagent_install=true'
+assert_has "実走を走らせる理由にパスを名指しする" "crates/tako-control/src/setup_bootstrap.rs — 取得・実行・導入後の status" "${out}"
+out="$(run_github_in_clone merge-code CI_EVENT=pull_request)"
+assert_has "関係の無いコードの PR → 実走は skip（#2791）" "agent_install=false" "${out}"
 
 echo "== B 検出力: --no-renames を外した写しは移動を docs だけと誤る =="
 sed 's/ --no-renames//' "${SCOPE_SH}" > "${TMP}/scope-renames.sh"
@@ -356,6 +374,55 @@ assert_has "（注入）番犬ジョブが macOS の列に並ぶことを名指�
 grep -vF 'bash scripts/third-party-licenses.sh --check' "${CI_YML}" > "${TMP}/ci-nolicenses.yml"
 probs="$(wiring_problems "${TMP}/ci-nolicenses.yml")"
 assert_has "（注入）ライセンス一覧の検査が無いことを名指しする" "licenses: third-party-licenses.sh --check を呼んでいない" "${probs}"
+
+echo "== F: 導入代行の実走（agent_install。#2791） =="
+# 依頼で名指しされたパス（少なくともこれら）と、実走の検査が読むもの
+for p in crates/tako-core/src/platform/agent_install.rs crates/tako-core/src/platform/shell.rs \
+  crates/tako-control/src/setup_bootstrap.rs scripts/windows/test-agent-install-2791.ps1 \
+  scripts/windows/lib/execution-policy.ps1 .github/workflows/ci.yml scripts/ci-change-scope.sh \
+  crates/tako-control/src/setup_refusal.rs crates/tako-core/tests/issue2791_agent_install_windows.rs \
+  installer/windows/lib/user-path.ps1; do
+  assert_eq "実走を走らせる: ${p}" "$(classify_agent "${p}"$'\n')" "agent_install=true"
+done
+for p in crates/tako-core/src/lib.rs crates/tako-cli/src/setup.rs scripts/windows/test-install-execution-policy-2790.ps1 \
+  docs/a.md crates/tako-core/src/platform/shell.rs.bak crates/tako-core/src/platform/agent_install_x.rs; do
+  assert_eq "実走は skip: ${p}" "$(classify_agent "${p}"$'\n')" "agent_install=false"
+done
+assert_eq "docs だけ + 導入代行のパス → 両方走らせる" "$(printf 'docs/a.md\nscripts/windows/lib/execution-policy.ps1\n' | bash "${SCOPE_SH}" classify 2>/dev/null | tr '\n' ' ')" "agent_install=true rust=true "
+assert_eq "空の差分 → 実走も走らせる側" "$(classify_agent '')" "agent_install=true"
+
+# ci.yml の配線: 実走の段だけが agent_install で絞られ、#2790 の段は毎回走る
+# $1 = ci.yml / $2 = 段の名前に含まれる語 → その段の本文（`      - ` から次の段まで）
+step_body() {
+  awk -v want="$2" '
+    /^      - / { in_step = (index($0, want) > 0) }
+    /^  [A-Za-z0-9_-]+:[ \t]*$/ { in_step = 0 }
+    in_step && $0 !~ /^[ \t]*#/ { print }
+  ' "$1"
+}
+agent_wiring_problems() {
+  local yml="$1" body
+  body="$(step_body "${yml}" "codex / agy の導入代行の実走検査（#2791")"
+  [[ -n "${body}" ]] || echo "windows: #2791 の実走の段が無い"
+  grep -qF "if: needs.changes.outputs.agent_install == 'true'" <<<"${body}" || echo "windows: #2791 の実走の段が条件なしで毎回走る（agent_install の if が無い）"
+  body="$(step_body "${yml}" "導入代行の起こし方の実行検査（#2790")"
+  grep -qE '^        if:' <<<"${body}" && echo "windows: #2790 の偽物の段が判定で止まる（外部に依らないので毎回走らせる）"
+  body="$(job_body "${yml}" changes)"
+  grep -qF 'agent_install: ${{ steps.scope.outputs.agent_install }}' <<<"${body}" || echo "changes: outputs.agent_install が無い"
+  grep -qE '^  schedule:[ \t]*$' "${yml}" || echo "on: schedule が無い（上流の install.ps1 の変化を拾えない）"
+  grep -qE '^  workflow_dispatch:[ \t]*$' "${yml}" || echo "on: workflow_dispatch が無い"
+}
+probs="$(agent_wiring_problems "${CI_YML}")"
+assert_eq "本物の ci.yml の実走の配線に問題が無い" "${probs}" ""
+grep -vF "if: needs.changes.outputs.agent_install == 'true'" "${CI_YML}" > "${TMP}/ci-agent-noif.yml"
+probs="$(agent_wiring_problems "${TMP}/ci-agent-noif.yml")"
+assert_has "（注入）実走の段の if が無いことを名指しする" "windows: #2791 の実走の段が条件なしで毎回走る" "${probs}"
+awk '{ print } /導入代行の起こし方の実行検査（#2790/ { print "        if: needs.changes.outputs.agent_install == '"'"'true'"'"'" }' "${CI_YML}" > "${TMP}/ci-2790-if.yml"
+probs="$(agent_wiring_problems "${TMP}/ci-2790-if.yml")"
+assert_has "（注入）#2790 の段を絞ったことを名指しする" "windows: #2790 の偽物の段が判定で止まる" "${probs}"
+grep -vE '^  schedule:|cron:' "${CI_YML}" > "${TMP}/ci-noschedule.yml"
+probs="$(agent_wiring_problems "${TMP}/ci-noschedule.yml")"
+assert_has "（注入）定期実行が無いことを名指しする" "on: schedule が無い" "${probs}"
 
 echo "== E: 本物の ci.yml から待ちスクリプトが導く期待名 =="
 mkdir -p "${TMP}/ghbin"
