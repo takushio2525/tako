@@ -584,6 +584,8 @@ pub fn run_bootstrap(
 /// 外せなかった項目があれば終了コード 1（残りは進めてある）
 pub fn run_undo(dry_run: bool, json: bool) -> Result<(), String> {
     use tako_control::setup_undo;
+    // 守る data dir が引けない隔離（`TAKO_ISOLATED=1` で `TAKO_DATA_DIR` が無い）は断る（#2694）
+    crate::local_data_gate()?;
     let lang = tako_core::i18n::lang();
     let targets = setup_undo::Targets::from_process().map_err(|e| e.text_in(lang))?;
     let report = setup_undo::run(&targets, dry_run);

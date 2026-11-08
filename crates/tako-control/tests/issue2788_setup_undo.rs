@@ -47,7 +47,10 @@ fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
             let meta = std::fs::symlink_metadata(&path).unwrap();
             if meta.file_type().is_symlink() {
                 let to = std::fs::read_link(&path).unwrap();
-                out.insert(format!("{rel} -> link"), to.to_string_lossy().into_owned().into_bytes());
+                out.insert(
+                    format!("{rel} -> link"),
+                    to.to_string_lossy().into_owned().into_bytes(),
+                );
             } else if meta.is_dir() {
                 out.insert(format!("{rel}/"), Vec::new());
                 stack.push(path);
@@ -115,8 +118,14 @@ impl Sandbox {
         write(&data.join("layout.json"), "{\"tabs\": []}\n");
         write(&data.join("persist.log"), "2026-11-08 起動\n");
         write(&data.join("sessions.yaml"), "sessions: []\n");
-        write(&data.join("orchestrator/config.yaml"), "setup:\n  completed: true\n");
-        write(&data.join("shell-integration/zshenv.zsh"), "# integration\n");
+        write(
+            &data.join("orchestrator/config.yaml"),
+            "setup:\n  completed: true\n",
+        );
+        write(
+            &data.join("shell-integration/zshenv.zsh"),
+            "# integration\n",
+        );
 
         // --- MCP 登録 ---
         let claude_json_after = "{\n  \"firstStartTime\": \"2026-11-08T00:00:00.000Z\",\n  \"mcpServers\": {\n    \"mine\": {\n      \"type\": \"stdio\",\n      \"command\": \"npx\",\n      \"args\": [\n        \"my-server\"\n      ]\n    }\n  },\n  \"userID\": \"u\"\n}".to_string();
@@ -157,7 +166,10 @@ impl Sandbox {
 
         // --- tako mod の skills（印つきの写し / 利用者のもの） ---
         mod_core::write_copy(&home.join(".claude"), &mod_core::Expected::current()).unwrap();
-        write(&acct.join("skills/tako/SKILL.md"), "# 自分で作った tako という skill\n");
+        write(
+            &acct.join("skills/tako/SKILL.md"),
+            "# 自分で作った tako という skill\n",
+        );
 
         // --- PATH（unix のブロック + symlink） ---
         let bin = home.join(".local/bin");
@@ -181,7 +193,10 @@ impl Sandbox {
             // 以前の版の書き方（区切りの改行 1 個 + ブロック。text_block::apply の形）
             "Set-Alias ll Get-ChildItem\n\n# >>> tako shell integration >>>\n. 'x'\n# <<< tako shell integration <<<\n",
         );
-        write(&local.join("WebView2/EBWebView/Default/Cache/data_0"), "cache");
+        write(
+            &local.join("WebView2/EBWebView/Default/Cache/data_0"),
+            "cache",
+        );
         write(
             &tako_dir.join("tako-app.exe.WebView2/EBWebView/Local State"),
             "{}",
@@ -217,7 +232,10 @@ impl Sandbox {
             protected: vec![self.data.clone()],
             verification: true,
             claude_json: setup_undo::claude_json_paths(&claude_dirs),
-            claude_settings: claude_dirs.iter().map(|t| t.dir.join("settings.json")).collect(),
+            claude_settings: claude_dirs
+                .iter()
+                .map(|t| t.dir.join("settings.json"))
+                .collect(),
             claude_config_dirs: claude_dirs,
             codex_config: Some(home.join(".codex/config.toml")),
             agy_config: Some(home.join(".gemini/config/mcp_config.json")),
@@ -265,10 +283,17 @@ fn issue2788_連携が外れdataは1バイトも変わらず利用者の本文�
 
     // 1. MCP 登録が外れ、tako 以外の登録・他の鍵は残る
     assert_eq!(read(&sb.home.join(".claude.json")), sb.claude_json_after);
-    let acct: serde_json::Value = serde_json::from_str(&read(&sb.acct.join(".claude.json"))).unwrap();
-    assert!(acct["mcpServers"].get("tako").is_none(), "アカウントの設定 dir の登録が残った");
+    let acct: serde_json::Value =
+        serde_json::from_str(&read(&sb.acct.join(".claude.json"))).unwrap();
+    assert!(
+        acct["mcpServers"].get("tako").is_none(),
+        "アカウントの設定 dir の登録が残った"
+    );
     let settings = read(&sb.home.join(".claude/settings.json"));
-    assert!(!settings.contains("\"tako\"") && settings.contains("\"theme\": \"dark\""), "{settings}");
+    assert!(
+        !settings.contains("\"tako\"") && settings.contains("\"theme\": \"dark\""),
+        "{settings}"
+    );
     assert_eq!(read(&sb.home.join(".codex/config.toml")), sb.codex_before);
     let agy: serde_json::Value =
         serde_json::from_str(&read(&sb.home.join(".gemini/config/mcp_config.json"))).unwrap();
@@ -277,7 +302,10 @@ fn issue2788_連携が外れdataは1バイトも変わらず利用者の本文�
 
     // 1. 指示ファイルの同期ブロックが外れ、利用者の本文はバイト単位で残る
     assert_eq!(read(&sb.home.join(".claude/CLAUDE.md")), USER_RULES);
-    assert!(!sb.home.join(".codex/AGENTS.md").exists(), "ブロックだけのファイルが残った");
+    assert!(
+        !sb.home.join(".codex/AGENTS.md").exists(),
+        "ブロックだけのファイルが残った"
+    );
     assert_eq!(read(&sb.home.join(".gemini/GEMINI.md")), USER_RULES);
 
     // 1. mod の skills: 印つきの写しだけを外し、利用者の tako は残す
@@ -293,11 +321,17 @@ fn issue2788_連携が外れdataは1バイトも変わらず利用者の本文�
         assert!(std::fs::symlink_metadata(sb.home.join(".local/bin/tako")).is_err());
     }
     assert_eq!(read(&sb.home.join(".zprofile")), "export EDITOR=vim\n");
-    assert!(!sb.home.join(".bash_profile").exists(), "ブロックだけの profile が残った");
+    assert!(
+        !sb.home.join(".bash_profile").exists(),
+        "ブロックだけの profile が残った"
+    );
     // Windows のユーザー環境変数 Path: tako を入れた先だけを外し、共有の置き場は残す
     assert_eq!(
         *sb.user_path.borrow(),
-        format!("C:\\Windows\\System32;{}", sb.home.join(".local/bin").display())
+        format!(
+            "C:\\Windows\\System32;{}",
+            sb.home.join(".local/bin").display()
+        )
     );
 
     // 1. 以前の版のシェル統合と WebView2 のキャッシュ
@@ -305,7 +339,10 @@ fn issue2788_連携が外れdataは1バイトも変わらず利用者の本文�
         read(&sb.home.join("Documents/PowerShell/profile.ps1")),
         "Set-Alias ll Get-ChildItem\n"
     );
-    assert!(!sb.local.exists(), "空になった %LOCALAPPDATA%\\tako が残った");
+    assert!(
+        !sb.local.exists(),
+        "空になった %LOCALAPPDATA%\\tako が残った"
+    );
     assert!(!sb.tako_dir.join("tako-app.exe.WebView2").exists());
 
     // 2. data dir は 1 バイトも変わらない
@@ -319,7 +356,13 @@ fn issue2788_連携が外れdataは1バイトも変わらず利用者の本文�
     let second_json = second.to_json(tako_core::i18n::Lang::Ja);
     assert_eq!(second_json["summary"]["removed"], 0, "{second_json:#}");
     assert_eq!(second_json["summary"]["failed"], 0, "{second_json:#}");
-    assert_eq!(*sb.user_path.borrow(), format!("C:\\Windows\\System32;{}", sb.home.join(".local/bin").display()));
+    assert_eq!(
+        *sb.user_path.borrow(),
+        format!(
+            "C:\\Windows\\System32;{}",
+            sb.home.join(".local/bin").display()
+        )
+    );
 }
 
 #[test]
@@ -357,7 +400,10 @@ fn issue2788_置き場に他のコマンドが残るならpathのブロックは
     ));
     assert_eq!(read(&sb.home.join(".zprofile")), zprofile_before);
     if cfg!(unix) {
-        assert_eq!(outcome_of(&report, Kind::CliLink, ".local/bin/tako"), &Outcome::Removed);
+        assert_eq!(
+            outcome_of(&report, Kind::CliLink, ".local/bin/tako"),
+            &Outcome::Removed
+        );
     }
     // 英語の表示でも理由を名指す
     let en = report.render_lines(tako_core::i18n::Lang::En).join("\n");
@@ -368,7 +414,10 @@ fn issue2788_置き場に他のコマンドが残るならpathのブロックは
 #[test]
 fn issue2788_壊れた設定は触らず残りは進める() {
     let sb = Sandbox::new("broken");
-    write(&sb.home.join(".claude.json"), "{ \"mcpServers\": { \"tako\": ");
+    write(
+        &sb.home.join(".claude.json"),
+        "{ \"mcpServers\": { \"tako\": ",
+    );
     let broken_md = format!("{SYNC_BEGIN}\n終わりの印が無い\n{USER_RULES}");
     write(&sb.home.join(".claude/CLAUDE.md"), &broken_md);
     // 名前は tako でも別のコマンド（利用者が自分で付けた）
@@ -379,9 +428,15 @@ fn issue2788_壊れた設定は触らず残りは進める() {
     let report = setup_undo::run(&sb.targets(), false);
     assert!(matches!(
         outcome_of(&report, Kind::Mcp, "home/.claude.json"),
-        Outcome::Kept(KeepReason::Unreadable { .. })
+        Outcome::Kept(KeepReason::Broken {
+            line: 1,
+            column: 26
+        })
     ));
-    assert_eq!(read(&sb.home.join(".claude.json")), "{ \"mcpServers\": { \"tako\": ");
+    assert_eq!(
+        read(&sb.home.join(".claude.json")),
+        "{ \"mcpServers\": { \"tako\": "
+    );
     assert_eq!(
         outcome_of(&report, Kind::Instructions, ".claude/CLAUDE.md"),
         &Outcome::Kept(KeepReason::UnterminatedBlock)
@@ -442,7 +497,9 @@ fn issue2788_data_dirの下の書き先は断る() {
     );
     let before = snapshot(&sb.data);
     let mut targets = sb.targets();
-    targets.claude_json.push(sb.data.join("agent-home/.claude.json"));
+    targets
+        .claude_json
+        .push(sb.data.join("agent-home/.claude.json"));
     targets.claude_config_dirs.push(Target {
         dir: inside,
         sources: vec![Source::Override],
@@ -499,7 +556,10 @@ fn issue2788_外を指すtakoのリンクも置き場で判定して外す() {
         ..Targets::default()
     };
     let report = setup_undo::run(&targets, false);
-    assert_eq!(outcome_of(&report, Kind::CliLink, ".local/bin/tako"), &Outcome::Removed);
+    assert_eq!(
+        outcome_of(&report, Kind::CliLink, ".local/bin/tako"),
+        &Outcome::Removed
+    );
     assert!(std::fs::symlink_metadata(bin.join("tako")).is_err());
     assert!(outside.exists(), "指す先に触れた");
 }

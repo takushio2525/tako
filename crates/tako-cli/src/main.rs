@@ -18255,6 +18255,24 @@ mod help_text_parity {
         cmd
     }
 
+    /// #2788: アンインストーラー（installer/windows/tako.iss）が打つ `tako setup undo` がそのまま通る
+    #[test]
+    fn setup_undoはアンインストーラーの打ち方で通る() {
+        for argv in [
+            vec!["tako", "setup", "undo"],
+            vec!["tako", "setup", "undo", "--dry-run", "--json"],
+        ] {
+            let cli = Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let Command::Setup(args) = cli.command else {
+                panic!("{argv:?} が setup にならない");
+            };
+            assert!(
+                matches!(args.command, Some(SetupCommand::Undo { .. })),
+                "{argv:?} が setup undo にならない"
+            );
+        }
+    }
+
     /// `tako setup-mcp --help` が**実際に書く場所**を述べている（#1248 の①）
     #[test]
     fn setup_mcpのhelpが書き先の正本と一致する() {

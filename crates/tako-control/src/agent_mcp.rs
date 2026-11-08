@@ -467,8 +467,9 @@ pub enum Unregister {
     Removed(String),
     /// 名前は tako だが tako の実行ファイルを指していない（外さない）
     NotTako { command: String },
-    /// JSON / TOML として読めない（触らない）
-    Unreadable(String),
+    /// JSON / TOML として読めない（触らない）。位置（1 始まりの行・列）だけを持ち、中身は引用しない
+    /// （素の serde / toml の文言はファイルの値や行をそのまま出す = #2230）
+    Broken { line: usize, column: usize },
     /// TOML の tako の登録が見出しの表の形でない（インライン表・ドット付きの鍵）。触らない
     UnsupportedShape,
 }
@@ -485,7 +486,12 @@ pub fn unregister_json(text: &str) -> Unregister {
     }
     let mut root: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
-        Err(e) => return Unregister::Unreadable(e.to_string()),
+        Err(e) => {
+            return Unregister::Broken {
+                line: e.line(),
+                column: e.column(),
+            }
+        }
     };
     let Some(servers) = root
         .get_mut("mcpServers")
@@ -510,8 +516,8 @@ pub fn unregister_json(text: &str) -> Unregister {
     let mut out = Vec::new();
     let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
     let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
-    if let Err(e) = root.serialize(&mut ser) {
-        return Unregister::Unreadable(e.to_string());
+    if root.serialize(&mut ser).is_err() {
+        return Unregister::UnsupportedShape;
     }
     let mut body = String::from_utf8(out).unwrap_or_default();
     if text.trim_end_matches([' ', '\t']).ends_with('\n') {
@@ -545,7 +551,20 @@ fn json_indent(text: &str) -> String {
 pub fn unregister_toml(text: &str) -> Unregister {
     let original: toml::Table = match toml::from_str(text) {
         Ok(t) => t,
-        Err(e) => return Unregister::Unreadable(e.to_string()),
+        Err(e) => {
+            let at = e.span().map_or(0, |span| span.start).min(text.len());
+            let before = text.get(..at).unwrap_or_default();
+            return Unregister::Broken {
+                line: before.matches('\n').count() + 1,
+                column: before
+                    .rsplit('\n')
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .count()
+                    + 1,
+            };
+        }
     };
     let Some(entry) = original
         .get("mcp_servers")
@@ -1380,12 +1399,14 @@ mod tests {
         assert_eq!(unregister_json(""), Unregister::Absent);
         assert_eq!(unregister_json("{}"), Unregister::Absent);
         assert_eq!(unregister_json("{\"mcpServers\": {}}"), Unregister::Absent);
-        assert!(matches!(
-            unregister_json("{ broken"),
-            Unregister::Unreadable(_)
-        ));
         assert_eq!(
-            unregister_json("{\"mcpServers\": {\"tako\": {\"command\": \"npx\", \"args\": [\"other-tako\"]}}}"),
+            unregister_json("{ broken"),
+            Unregister::Broken { line: 1, column: 3 }
+        );
+        assert_eq!(
+            unregister_json(
+                "{\"mcpServers\": {\"tako\": {\"command\": \"npx\", \"args\": [\"other-tako\"]}}}"
+            ),
             Unregister::NotTako {
                 command: "npx".into()
             }
@@ -1404,7 +1425,8 @@ mod tests {
         assert_eq!(
             unregister_toml(mid),
             Unregister::Removed(
-                "model = \"gpt\"\n\n# 自分のサーバー\n[mcp_servers.mine]\ncommand = \"npx\"\n".into()
+                "model = \"gpt\"\n\n# 自分のサーバー\n[mcp_servers.mine]\ncommand = \"npx\"\n"
+                    .into()
             )
         );
         // 2 回目は無い
@@ -1414,10 +1436,14 @@ mod tests {
     #[test]
     fn issue2788_tomlの境界() {
         assert_eq!(unregister_toml(""), Unregister::Absent);
-        assert!(matches!(
-            unregister_toml("[mcp_servers.tako\n"),
-            Unregister::Unreadable(_)
-        ));
+        // 壊れた行の中身（トークン等）を理由へ引用しない = 位置だけ
+        assert_eq!(
+            unregister_toml("a = 1\nsecret = \"sk-xxx\n"),
+            Unregister::Broken {
+                line: 2,
+                column: 17
+            }
+        );
         assert_eq!(
             unregister_toml("[mcp_servers.tako]\ncommand = \"npx\"\n"),
             Unregister::NotTako {

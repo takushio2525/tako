@@ -207,6 +207,18 @@ tako setup --reset
 
 `--answers` は `selected_agent`、`provider_plans`、`instruction_content`、`profile`、`projects`、`orchestrator`、`sleep_guard` を受け取ります。同じ JSON は MCP `tako_setup` でも使えるため、AI に日本語で希望を伝えてセットアップを代行させられます。`projects` は指定時に全登録を置き換えます。
 
+### tako setup undo
+
+tako が外へ書いた連携（AI エージェントへの MCP 登録・指示ファイルへ同期した共通ルールのブロック・tako mod の skills・`tako` コマンドの PATH・Windows の WebView2 のキャッシュ）を外します。**データ（設定・レイアウト・ログ・会話の一覧）は残します**。tako を消す前に 1 回打ちます（Windows のアンインストーラーは自分で呼びます）。
+
+```bash
+tako setup undo             # 外す
+tako setup undo --dry-run   # 何を外すかだけ表示（何も変えない）
+tako setup undo --json      # 結果を JSON で（MCP の tako_setup に undo: true を渡したのと同じ）
+```
+
+外すのは tako が書いたと分かるものだけです（名前が `tako` で tako の実行ファイルを指す MCP 登録・tako の印のブロック・印つきの mod の写し）。自分で書いた本文や他の MCP 登録は残し、読めない・壊れたファイルは触らずに理由を出します。2 回打っても 2 回目は何もしません。外せなかったものがあると終了コード 1 です（残りは外し終えています）。消すもの・残すものの一覧は[アンインストール](/getting-started/#アンインストール)を見てください。
+
 ### tako setup bootstrap
 
 エージェント CLI（`claude` / `codex` / `agy`）がまだ入っていない環境で、導入から認証までを案内・実行します。**`tako setup` が「1 つも使える系統が無い」ことを見つけたら自動でこの段を通る**ので、普段このコマンドを直接叩く必要はありません。AI から段ごとに操作したいときや、状態だけ確認したいときに使います。

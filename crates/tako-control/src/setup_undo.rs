@@ -3,7 +3,7 @@
 //! tako を消した後に残ると害になるもの（消えた tako を指す MCP 登録 = agent の起動のたびに MCP の
 //! 接続に失敗する、など）を、tako を消す**前**に 1 回で外す。Windows のアンインストーラー
 //! （`installer/windows/tako.iss` の `usUninstall`）がこれを呼び、macOS は `brew uninstall` の前に
-//! 利用者が打つ（cask の uninstall の段は `brew upgrade` でも走るので使わない。FR-2.42.31）。
+//! 利用者が打つ（cask の uninstall の段は `brew upgrade` でも走るので使わない。FR-2.14.20）。
 //!
 //! | 外すもの | 置き場 | 外す条件 |
 //! |---|---|---|
@@ -72,8 +72,10 @@ impl Kind {
 pub enum KeepReason {
     /// 名前は tako だが tako の実行ファイルを指していない
     NotTakoCommand { command: String },
-    /// 読めない・壊れている（JSON / TOML として読めない・UTF-8 でない）
+    /// 読めない（OS の読み込みの誤り・UTF-8 でない）
     Unreadable { error: String },
+    /// JSON / TOML として読めない（位置だけ。中身は引用しない = #2230）
+    Broken { line: usize, column: usize },
     /// 同期ブロックの始まりの印だけがあって終わりの印が無い
     UnterminatedBlock,
     /// codex の登録が見出しの表の形でない
@@ -93,6 +95,7 @@ impl KeepReason {
         match self {
             KeepReason::NotTakoCommand { .. } => "not_tako_command",
             KeepReason::Unreadable { .. } => "unreadable",
+            KeepReason::Broken { .. } => "broken",
             KeepReason::UnterminatedBlock => "unterminated_block",
             KeepReason::UnsupportedShape => "unsupported_shape",
             KeepReason::DirStillUsed { .. } => "dir_still_used",
@@ -302,17 +305,12 @@ pub struct Report {
 pub fn run(t: &Targets, dry_run: bool) -> Report {
     let mut items: Vec<Item> = Vec::new();
     // 1. MCP 登録
-    for path in &t.claude_json {
-        items.push(unregister_file(t, Some("claude"), path, FileForm::Json, dry_run));
-    }
-    for path in &t.claude_settings {
-        items.push(unregister_file(t, Some("claude"), path, FileForm::Json, dry_run));
-    }
-    if let Some(path) = &t.codex_config {
-        items.push(unregister_file(t, Some("codex"), path, FileForm::Toml, dry_run));
-    }
-    if let Some(path) = &t.agy_config {
-        items.push(unregister_file(t, Some("agy"), path, FileForm::Json, dry_run));
+    let mcp_files = (t.claude_json.iter().chain(&t.claude_settings))
+        .map(|p| ("claude", p, FileForm::Json))
+        .chain(t.codex_config.iter().map(|p| ("codex", p, FileForm::Toml)))
+        .chain(t.agy_config.iter().map(|p| ("agy", p, FileForm::Json)));
+    for (agent, path, form) in mcp_files {
+        items.push(unregister_file(t, Some(agent), path, form, dry_run));
     }
     // 2. 指示ファイルの同期ブロック
     for (agent, path) in &t.instructions {
@@ -451,7 +449,9 @@ fn unregister_file(
                 Unregister::NotTako { command } => {
                     Outcome::Kept(KeepReason::NotTakoCommand { command })
                 }
-                Unregister::Unreadable(error) => Outcome::Kept(KeepReason::Unreadable { error }),
+                Unregister::Broken { line, column } => {
+                    Outcome::Kept(KeepReason::Broken { line, column })
+                }
                 Unregister::UnsupportedShape => Outcome::Kept(KeepReason::UnsupportedShape),
             }
         }
@@ -486,9 +486,7 @@ fn undo_synced_block(t: &Targets, path: &Path, dry_run: bool) -> Outcome {
     };
     match crate::agents_sync::remove_synced_block(&text) {
         Ok(None) => Outcome::Absent,
-        Err(crate::agents_sync::UnterminatedBlock) => {
-            Outcome::Kept(KeepReason::UnterminatedBlock)
-        }
+        Err(crate::agents_sync::UnterminatedBlock) => Outcome::Kept(KeepReason::UnterminatedBlock),
         Ok(Some(rest)) if rest.is_empty() => remove_file(t, path, dry_run),
         Ok(Some(rest)) => rewrite(t, path, &rest, dry_run),
     }
@@ -535,7 +533,9 @@ fn undo_mod_skills(t: &Targets, dry_run: bool) -> Vec<Item> {
             (_, Err(e)) => Outcome::Failed(e.clone()),
             (mod_core::Action::Remove, Ok(mod_core::Outcome::Planned)) => Outcome::WouldRemove,
             (mod_core::Action::Remove, Ok(_)) => Outcome::Removed,
-            _ if r.blocked.is_some() && !matches!(r.inspection.copy, mod_core::CopyState::Absent) => {
+            _ if r.blocked.is_some()
+                && !matches!(r.inspection.copy, mod_core::CopyState::Absent) =>
+            {
                 Outcome::Kept(KeepReason::OutsideSandbox)
             }
             _ if !matches!(r.inspection.copy, mod_core::CopyState::Absent) => {
@@ -771,7 +771,12 @@ impl Report {
             ));
         }
         if let Some(data) = &self.kept_data {
-            lines.push(UndoText::KeptData { path: display(data) }.text_in(lang));
+            lines.push(
+                UndoText::KeptData {
+                    path: display(data),
+                }
+                .text_in(lang),
+            );
         }
         lines.push(if self.dry_run {
             UndoText::NextDryRun.text_in(lang)
@@ -794,10 +799,16 @@ pub enum UndoText {
     /// 項目の名前
     Label(Kind, Option<&'static str>),
     Keep(KeepReason),
-    AbsentCount { count: usize },
+    AbsentCount {
+        count: usize,
+    },
     /// 外せなかった項目の数（CLI の終了コード 1 の文）
-    FailedCount { count: usize },
-    KeptData { path: String },
+    FailedCount {
+        count: usize,
+    },
+    KeptData {
+        path: String,
+    },
     /// tako 本体の消し方（OS ごと）
     Next,
     NextDryRun,
@@ -850,7 +861,10 @@ impl UndoText {
                     "名前は tako ですが tako の実行ファイルを指していない（{command}）ので残しました"
                 ),
                 KeepReason::Unreadable { error } => {
-                    format!("読めない・壊れているので触っていません（{error}）")
+                    format!("読めないので触っていません（{error}）")
+                }
+                KeepReason::Broken { line, column } => {
+                    format!("壊れていて読めない（{line} 行 {column} 列）ので触っていません")
                 }
                 KeepReason::UnterminatedBlock => {
                     "同期ブロックの終わりの印が無く、どこまでが tako のものか分からないので触っていません"
@@ -876,7 +890,10 @@ impl UndoText {
                     "kept: it is named tako but does not point to the tako executable ({command})"
                 ),
                 KeepReason::Unreadable { error } => {
-                    format!("left untouched: it cannot be read or is broken ({error})")
+                    format!("left untouched: it cannot be read ({error})")
+                }
+                KeepReason::Broken { line, column } => {
+                    format!("left untouched: it is broken (line {line}, column {column})")
                 }
                 KeepReason::UnterminatedBlock => {
                     "left untouched: the end marker of the synced block is missing, so tako cannot tell where its part ends"
