@@ -246,7 +246,6 @@ fn 表示とjsonは同じ項目から出る() {
         "tako_cli_path",
         "shell_integration",
         "dep.git",
-        "dep.tailscale",
         "setup",
         "update",
         "agents_sync",
@@ -265,6 +264,17 @@ fn 表示とjsonは同じ項目から出る() {
             .bin
     );
     required.push(&container);
+    // #2776: Tailscale は remote が使える OS だけ（判定は setup の末尾の行と同じ 1 実装。Windows は #971）。
+    // 使えない OS では出さない（入れても使い道が無いものの導入を勧めない）
+    let platform = tako_core::platform::support::Platform::current();
+    if tako_control::remote_setup::remote_unusable(platform).is_none() {
+        required.push("dep.tailscale");
+    } else {
+        assert!(
+            !keys.iter().any(|k| k == "dep.tailscale"),
+            "{platform:?} は remote が使えないのに Tailscale の項目が出ている: {keys:?}"
+        );
+    }
     // #2431: WebView2 ランタイムの版は Windows だけ（macOS の WKWebView は OS に含まれる = 出さない）
     if cfg!(windows) {
         required.push("webview2");
