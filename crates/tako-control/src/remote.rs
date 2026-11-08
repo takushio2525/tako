@@ -1196,11 +1196,21 @@ fn check_admin(ctx: &DaemonCtx, request: &tiny_http::Request) -> bool {
 
 // --- IPC クライアント（daemon → app の正規 dispatch 経路。#281 H-7）---
 
+/// daemon → app の IPC で応答を待つ上限（読み取り 1 回あたり）。
+///
+/// **両 OS がこの 1 つを引く**（#2774）。unix はソケットの `set_read_timeout`、Windows は
+/// 名前付きパイプの overlapped 読み取り（`platform::named_pipe::PipeStream`）で同じ値を付ける。
+/// GUI が固まっても daemon の HTTP ワーカーがこの時間で戻り、通信失敗（`Reason::ReceiveFailed`）
+/// として返す。#2774 まで Windows は同期の `File` で読んでいて上限が無く、ワーカーが戻らなかった
+pub(crate) const APP_IPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// daemon から tako-app の IPC ソケットへ接続し、Request を dispatch 経由で実行する。
 /// discovery::read_candidates で接続情報を自動発見する
 pub(crate) struct AppIpcClient {
     socket: String,
     token: String,
+    /// 応答を待つ上限（本番は [`APP_IPC_READ_TIMEOUT`]。テストは短い値を入れて上限の経路を見る）
+    read_timeout: std::time::Duration,
 }
 
 impl AppIpcClient {
@@ -1212,6 +1222,7 @@ impl AppIpcClient {
                 return Some(Self {
                     socket: info.socket,
                     token: info.token,
+                    read_timeout: APP_IPC_READ_TIMEOUT,
                 });
             }
         }
@@ -1220,12 +1231,18 @@ impl AppIpcClient {
 
     /// ソケットが生きていてトークンが通るかプローブする
     fn probe(socket: &str, token: &str) -> bool {
-        Self::roundtrip_raw(socket, token, crate::protocol::Request::List).is_ok()
+        Self::roundtrip_raw(
+            socket,
+            token,
+            crate::protocol::Request::List,
+            APP_IPC_READ_TIMEOUT,
+        )
+        .is_ok()
     }
 
     /// IPC に Request を送り、結果を返す
     pub(crate) fn request(&self, request: crate::protocol::Request) -> Result<Value, String> {
-        Self::roundtrip_raw(&self.socket, &self.token, request)
+        Self::roundtrip_raw(&self.socket, &self.token, request, self.read_timeout)
     }
 
     /// 失敗の**種別つき**で送る（#1078）。
@@ -1234,7 +1251,7 @@ impl AppIpcClient {
     /// 通信そのものが失敗したのを区別する。前者で接続を捨てると
     /// **健全な IPC 接続を利用者の入力ミスで落とす**ことになる
     fn request_checked(&self, request: crate::protocol::Request) -> Result<Value, AppCallError> {
-        Self::roundtrip_checked(&self.socket, &self.token, request)
+        Self::roundtrip_checked(&self.socket, &self.token, request, self.read_timeout)
     }
 
     /// [`Self::roundtrip_raw`] の種別つき版。**同じワイヤ経路**を通す
@@ -1243,8 +1260,9 @@ impl AppIpcClient {
         socket: &str,
         token: &str,
         request: crate::protocol::Request,
+        read_timeout: std::time::Duration,
     ) -> Result<Value, AppCallError> {
-        match Self::roundtrip_detailed(socket, token, request) {
+        match Self::roundtrip_detailed(socket, token, request, read_timeout) {
             Ok(Ok(v)) => Ok(v),
             // app が答えた = 接続は健全
             Ok(Err(e)) => Err(AppCallError::Rejected {
@@ -1261,8 +1279,9 @@ impl AppIpcClient {
         socket: &str,
         token: &str,
         request: crate::protocol::Request,
+        read_timeout: std::time::Duration,
     ) -> Result<Value, String> {
-        match Self::roundtrip_detailed(socket, token, request) {
+        match Self::roundtrip_detailed(socket, token, request, read_timeout) {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(e.message),
             Err(e) => Err(e),
@@ -1289,46 +1308,55 @@ impl AppIpcClient {
         socket: &str,
         token: &str,
         request: crate::protocol::Request,
+        read_timeout: std::time::Duration,
     ) -> Result<Result<Value, crate::protocol::RpcError>, String> {
-        Self::roundtrip_typed(socket, token, request)
+        Self::roundtrip_typed(socket, token, request, read_timeout)
             .map_err(|reason| reason.text_in(crate::settings::client_lang()))
     }
 
-    /// [`Self::roundtrip_detailed`] の本体。通信の断りを型で返す（文は言語を選んで引く）
+    /// [`Self::roundtrip_detailed`] の本体。通信の断りを型で返す（文は言語を選んで引く）。
+    /// `read_timeout` を過ぎても app が答えなければ [`crate::Reason::ReceiveFailed`]（両 OS 同じ。#2774）
     fn roundtrip_typed(
         socket: &str,
         token: &str,
         request: crate::protocol::Request,
+        read_timeout: std::time::Duration,
     ) -> Result<Result<Value, crate::protocol::RpcError>, crate::Reason> {
-        let (read_half, write_half) = Self::connect_stream(socket)?;
+        let (read_half, write_half) = Self::connect_stream(socket, read_timeout)?;
         Self::roundtrip_on(read_half, write_half, token, request)
     }
 
     #[cfg(unix)]
-    fn connect_stream(socket: &str) -> Result<(impl Read, impl Write), crate::Reason> {
+    fn connect_stream(
+        socket: &str,
+        read_timeout: std::time::Duration,
+    ) -> Result<(impl Read, impl Write), crate::Reason> {
         use std::os::unix::net::UnixStream;
 
         let stream = UnixStream::connect(socket).map_err(|e| crate::Reason::AppCannotConnect {
             socket: socket.to_string(),
             error: e.to_string(),
         })?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-            .ok();
+        stream.set_read_timeout(Some(read_timeout)).ok();
         let read_half = stream
             .try_clone()
             .map_err(|e| crate::Reason::ConnectionCloneFailed(e.to_string()))?;
         Ok((read_half, stream))
     }
 
+    /// unix と同じ形（上限を付けてから読みの半分を複製する）。上限は overlapped の読み取りで
+    /// 効かせる（境界 B3 の `PipeStream`。#2774 まで同期の `File` で上限が無かった）
     #[cfg(windows)]
-    fn connect_stream(socket: &str) -> Result<(impl Read, impl Write), crate::Reason> {
-        let stream = crate::platform::named_pipe::connect_client(socket, 3_000).map_err(|e| {
-            crate::Reason::AppCannotConnect {
+    fn connect_stream(
+        socket: &str,
+        read_timeout: std::time::Duration,
+    ) -> Result<(impl Read, impl Write), crate::Reason> {
+        let mut stream = crate::platform::named_pipe::connect_client_stream(socket, 3_000)
+            .map_err(|e| crate::Reason::AppCannotConnect {
                 socket: socket.to_string(),
                 error: e.to_string(),
-            }
-        })?;
+            })?;
+        stream.set_read_timeout(Some(read_timeout)).ok();
         let read_half = stream
             .try_clone()
             .map_err(|e| crate::Reason::ConnectionCloneFailed(e.to_string()))?;
@@ -8724,6 +8752,7 @@ mod tests {
         let client = AppIpcClient {
             socket: sock.display().to_string(),
             token: "t".into(),
+            read_timeout: APP_IPC_READ_TIMEOUT,
         };
         match client.request_checked(crate::protocol::Request::List) {
             Err(AppCallError::Rejected { message, .. }) => {
@@ -8748,6 +8777,7 @@ mod tests {
         let dead = AppIpcClient {
             socket: dir.join("nope.sock").display().to_string(),
             token: "t".into(),
+            read_timeout: APP_IPC_READ_TIMEOUT,
         };
         assert!(
             matches!(
@@ -8789,8 +8819,13 @@ mod tests {
 
         // 繋がらない（ソケットが無い）
         let gone = dir.join("gone.sock").display().to_string();
-        let err = AppIpcClient::roundtrip_typed(&gone, "t", crate::protocol::Request::List)
-            .expect_err("繋がらない");
+        let err = AppIpcClient::roundtrip_typed(
+            &gone,
+            "t",
+            crate::protocol::Request::List,
+            APP_IPC_READ_TIMEOUT,
+        )
+        .expect_err("繋がらない");
         let crate::Reason::AppCannotConnect { socket, error } = &err else {
             panic!("繋がらないのは AppCannotConnect: {err:?}");
         };
@@ -8801,8 +8836,13 @@ mod tests {
             "日本語は #2365 より前の文とバイト一致"
         );
         // 文にする口は GUI の外の表示言語で引く（ipc.rs の `refusal` と同じ）
-        let text = AppIpcClient::roundtrip_detailed(&gone, "t", crate::protocol::Request::List)
-            .expect_err("繋がらない");
+        let text = AppIpcClient::roundtrip_detailed(
+            &gone,
+            "t",
+            crate::protocol::Request::List,
+            APP_IPC_READ_TIMEOUT,
+        )
+        .expect_err("繋がらない");
         assert_eq!(text, err.text_in(crate::settings::client_lang()));
 
         // 答えずに閉じる・壊れた行を返す app を模す（1 回ずつ受ける）
@@ -8824,16 +8864,25 @@ mod tests {
             }
         });
         let socket = sock.display().to_string();
-        let no_reply = AppIpcClient::roundtrip_typed(&socket, "t", crate::protocol::Request::List)
-            .expect_err("答えずに閉じる");
+        let no_reply = AppIpcClient::roundtrip_typed(
+            &socket,
+            "t",
+            crate::protocol::Request::List,
+            APP_IPC_READ_TIMEOUT,
+        )
+        .expect_err("答えずに閉じる");
         assert_eq!(no_reply, crate::Reason::AppNoReply);
         assert_eq!(
             no_reply.text_in(Lang::Ja),
             "tako app から応答が返らなかった"
         );
-        let unreadable =
-            AppIpcClient::roundtrip_typed(&socket, "t", crate::protocol::Request::List)
-                .expect_err("壊れた行");
+        let unreadable = AppIpcClient::roundtrip_typed(
+            &socket,
+            "t",
+            crate::protocol::Request::List,
+            APP_IPC_READ_TIMEOUT,
+        )
+        .expect_err("壊れた行");
         let crate::Reason::ReplyUnreadable(error) = &unreadable else {
             panic!("壊れた行は ipc.rs と同じ ReplyUnreadable: {unreadable:?}");
         };
@@ -8859,6 +8908,165 @@ mod tests {
             "一時ディレクトリ配下以外は消さない"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #2774: 答えない app への IPC は両 OS とも同じ上限の経路で通信失敗になる ---
+
+    /// 要求を 1 行受け取ったまま答えない偽 app（GUI が固まった形）。`connections` 本の接続を
+    /// 受けて握り、`release` が送られる（か落ちる）まで閉じない。`app` は受けた接続数を返す
+    struct SilentApp2774 {
+        /// daemon が繋ぐ先（unix はソケットのパス・Windows はパイプ名）
+        socket: String,
+        release: std::sync::mpsc::Sender<()>,
+        app: std::thread::JoinHandle<usize>,
+        /// unix のソケットを置く使い捨ての dir（Windows は使わない）
+        _dir: Option<tako_core::test_residue::ScratchDir>,
+    }
+
+    #[cfg(unix)]
+    fn silent_app_2774(connections: usize) -> SilentApp2774 {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tako_core::test_residue::ScratchDir::new("2774-app");
+        let sock = dir.join("app.sock");
+        let listener = UnixListener::bind(&sock).expect("UDS");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let app = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..connections {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut line = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut line);
+                held.push(stream);
+            }
+            let _ = released.recv();
+            held.len()
+        });
+        SilentApp2774 {
+            socket: sock.display().to_string(),
+            release,
+            app,
+            _dir: Some(dir),
+        }
+    }
+
+    #[cfg(windows)]
+    fn silent_app_2774(connections: usize) -> SilentApp2774 {
+        use crate::platform::named_pipe;
+        use std::io::{BufRead, BufReader};
+
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let name = format!(
+            r"\\.\pipe\tako-test-2774-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        // 最初のインスタンスは返す前に作る（daemon が繋ぐ時点で待ち受けている）
+        let first = named_pipe::create_server_instance(&name, true).expect("パイプを作れる");
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let accept_name = name.clone();
+        let app = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            let mut next = Some(first);
+            for i in 0..connections {
+                let Some(instance) = next.take() else {
+                    break;
+                };
+                let Ok(stream) = instance.wait_client() else {
+                    break;
+                };
+                // 次の接続のインスタンスを先に作る（daemon の 2 本目は 1 本目を握ったまま来る）
+                if i + 1 < connections {
+                    next = named_pipe::create_server_instance(&accept_name, false).ok();
+                }
+                let mut line = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut line);
+                held.push(stream);
+            }
+            let _ = released.recv();
+            held.len()
+        });
+        SilentApp2774 {
+            socket: name,
+            release,
+            app,
+            _dir: None,
+        }
+    }
+
+    /// #2774: 答えない app（GUI が固まった形）への daemon の IPC は、**両 OS とも**読み取りの上限で
+    /// 戻り、unix と同じ断り（`Reason::ReceiveFailed`。HTTP は 502 で接続を捨てる）になる。
+    ///
+    /// Windows は #2774 まで同期の `File` で読んでいて上限が無く、ここで戻らなかった（daemon の
+    /// HTTP ワーカーが固まる）。上限は短い値を注入し、テスト側の待ち（`GUARD`）を過ぎたら名指しで
+    /// 落とす（CI をハングで止めない）。判定は時間ではなく戻り方（状態コードと断りの種別）で書く
+    #[test]
+    fn issue2774_答えないappへのipcは上限で戻り両osとも502と受信失敗の断りになる() {
+        const GUARD: std::time::Duration = std::time::Duration::from_secs(20);
+        let limit = std::time::Duration::from_millis(200);
+        let silent = silent_app_2774(2);
+        let socket = silent.socket.clone();
+
+        let app_conn = Arc::new(RwLock::new(AppConnection {
+            client: Some(AppIpcClient {
+                socket: socket.clone(),
+                token: "t".into(),
+                read_timeout: limit,
+            }),
+            last_attempt: std::time::Instant::now(),
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let conn = Arc::clone(&app_conn);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            // HTTP の段（通信失敗 = 502 + 接続を捨てる）
+            let dispatched = app_dispatch(
+                &conn,
+                crate::protocol::Request::List,
+                crate::remote_refusal::AppVia::Plain,
+            );
+            let took = started.elapsed();
+            // 型の段: 同じ相手へもう 1 本（断りのバリアントを直接見る）
+            let typed =
+                AppIpcClient::roundtrip_typed(&socket, "t", crate::protocol::Request::List, limit);
+            println!(
+                "TAKO2774_APP_DISPATCH status={:?} took={took:?}",
+                dispatched.as_ref().map(|_| 200u16).map_err(|e| e.0)
+            );
+            let _ = tx.send((dispatched, typed));
+        });
+        let Ok((dispatched, typed)) = rx.recv_timeout(GUARD) else {
+            panic!(
+                "#2774: 答えない app への daemon の IPC が {GUARD:?} 待っても戻らない\
+                 （読み取りに上限が無い = HTTP ワーカーが固まる）"
+            );
+        };
+        let (status, message) = dispatched.expect_err("答えない app は通信失敗");
+        assert_eq!(status, 502, "通信失敗は unix と同じ 502: {message}");
+        let receive_failed =
+            crate::Reason::ReceiveFailed(String::new()).text_in(crate::settings::client_lang());
+        assert!(
+            message.starts_with(&receive_failed),
+            "断りは unix と同じ受信失敗（{receive_failed}…）: {message}"
+        );
+        assert!(
+            app_conn.read().expect("接続").client.is_none(),
+            "通信失敗なので接続を捨てる（次の get() で張り直す）"
+        );
+        assert!(
+            matches!(typed, Err(crate::Reason::ReceiveFailed(_))),
+            "型の段も受信失敗: {typed:?}"
+        );
+
+        let _ = silent.release.send(());
+        assert_eq!(
+            silent.app.join().expect("偽 app"),
+            2,
+            "偽 app は 2 本とも受けていた（繋がらなかったのではなく読み取りを打ち切った）"
+        );
     }
 
     #[test]
@@ -12667,6 +12875,7 @@ mod tests {
             client: Some(AppIpcClient {
                 socket: sock.display().to_string(),
                 token: "t".into(),
+                read_timeout: APP_IPC_READ_TIMEOUT,
             }),
             last_attempt: std::time::Instant::now(),
         }));

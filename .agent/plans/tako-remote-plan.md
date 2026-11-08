@@ -349,7 +349,11 @@ Geist / Geist Mono。**フォントは自己ホスト**（Google Fonts 参照禁
   `A=3` なら health **0.002 秒** / `A=4` で **2.51 秒** / `A=6` は health 2.53 秒 +
   溢れた A5・A6 が **6.04 秒**（次の空きを待つ）。SSH 先が固まる環境では
   `TAKO_REMOTE_HTTP_WORKERS` を上げるのが逃げ道だが、**本筋は遅い経路側に
-  タイムアウトを置くこと**（`/api/files` の IPC は 10 秒・`/api/v2/panes` の tmux は 5 秒）
+  タイムアウトを置くこと**（`/api/files` の IPC は 10 秒・`/api/v2/panes` の tmux は 5 秒）。
+  IPC の 10 秒は**両 OS 共通の定数 `remote::APP_IPC_READ_TIMEOUT`**（#2774。Windows は
+  それまで同期の `File` で読んでいて上限が無く、GUI が固まると IPC のロックを握ったワーカーが
+  戻らず、残りのワーカーもロック待ちで全部止まる形だった（コード読み）。いまは overlapped の `named_pipe::PipeStream`
+  で同じ上限を付け、打ち切りは unix と同じ `Reason::ReceiveFailed` = 502 + 接続を捨てる）
 - 検証は `cargo test -p tako-control --lib remote::tests`（順序・IPC の直列化・panic 耐性・
   合流・本数の解釈）と番犬 `issue1403_http_workers_watchdog`
 
