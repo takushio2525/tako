@@ -1489,11 +1489,13 @@ fn run_dependency_check(
     }
 }
 
-/// `tako setup deps [install]`。MCP `tako_setup_deps` と 1:1（#88 / #1057）
+/// `tako setup deps [install]`。MCP `tako_setup_deps` と 1:1（#88 / #1057）。
+/// `yes` = UAC が出る導入への同意（MCP の `consent`。#2433）
 pub fn run_deps(
     action: Option<&str>,
     dep: Option<&str>,
     dry_run: bool,
+    yes: bool,
     json: bool,
 ) -> Result<(), String> {
     let action = action.unwrap_or("status");
@@ -1505,15 +1507,28 @@ pub fn run_deps(
         // ここだけは `offer_and_install` を通さず `install` を直に呼ぶ（#1524）。
         // 利用者が導入そのものを名指しで打った経路なので、案内も `[y/N]` も要らない
         // （聞き直すのは #322 の逆）。判断（`offer_for`）が要るのは「ついでに勧める」
-        // 側 = `tako setup` の依存チェック段と `tako remote setup` の [1/5] だけ
-        "install" => setup_deps::install(
-            dep,
-            DepInstallOptions {
-                dry_run,
-                // CLI は端末を持つので進捗をそのまま流す
-                interactive: std::io::IsTerminal::is_terminal(&std::io::stdin()),
-            },
-        )?,
+        // 側 = `tako setup` の依存チェック段と `tako remote setup` の [1/5] だけ。
+        // 例外は UAC が出る導入（#2433）: 利用者の同意が要るので、端末なら 1 回だけ聞く（`--yes` で省く）
+        "install" => {
+            let states = setup_deps::status();
+            let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            let consent = yes
+                || (!dry_run
+                    && tty
+                    && ask_elevation_consent(&setup_deps::consent_needed(&states, dep)));
+            setup_deps::install_in(
+                states,
+                dep,
+                DepInstallOptions {
+                    dry_run,
+                    // CLI は端末を持つので進捗をそのまま流す
+                    interactive: tty,
+                    consent,
+                },
+                tako_core::i18n::Lang::Ja,
+            )
+            .map_err(tako_control::SetupRefusal::into_ja)?
+        }
         other => {
             return Err(format!(
                 "不明な action: {other:?}（status / install のいずれか）"
@@ -1526,6 +1541,26 @@ pub fn run_deps(
     }
     print_deps_human(action, &value);
     Ok(())
+}
+
+/// UAC が出る導入への同意を 1 回だけ聞く（#2433。対象が無ければ聞かない = false）。
+/// y / yes だけを同意と読む（読めない入力・空は同意しない）
+fn ask_elevation_consent(bins: &[&str]) -> bool {
+    if bins.is_empty() {
+        return false;
+    }
+    eprintln!(
+        "次の依存の導入では Windows の管理者の確認（UAC）が出ます: {}",
+        bins.join(" / ")
+    );
+    eprint!("続けますか？ [y/N]: ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        eprintln!();
+        return false;
+    }
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn print_deps_human(action: &str, value: &serde_json::Value) {
@@ -1557,6 +1592,10 @@ fn print_deps_human(action: &str, value: &serde_json::Value) {
                             eprintln!(
                                 "      いま入れる: tako setup deps install   （{command} 相当）"
                             );
+                            // #2433: UAC が出るものは、導入の前に 1 回だけ同意を聞く
+                            if dep["privilege"].as_str() == Some("elevated") {
+                                eprintln!("      導入では Windows の管理者の確認（UAC）が出ます");
+                            }
                         } else {
                             eprintln!("      導入方法: {command}");
                         }

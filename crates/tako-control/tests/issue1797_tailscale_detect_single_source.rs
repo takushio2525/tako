@@ -180,6 +180,7 @@ fn 依存段とremoteの答えが揃う() {
             tako_control::setup_deps::DepInstallOptions {
                 dry_run: true,
                 interactive: false,
+                consent: false,
             },
         );
         std::env::remove_var("TAKO_TAILSCALE_BIN");

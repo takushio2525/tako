@@ -34,6 +34,31 @@
 //! 判断は [`offer_for`] の 1 本（**理由を返す純粋関数**）に閉じてあり、CLI は
 //! 読んで表示するだけ。A/B は `TAKO_1499_LEGACY=1`（標準 setup が聞かない
 //! = #1499 前の挙動）
+//!
+//! ## Windows の winget の代行（#2433）
+//!
+//! #1057 から Windows は winget のコマンドを案内するだけだった。#2433 で Windows の CI のランナー
+//! （Windows Server 2025・winget v1.11.510）で実測してから代行へ倒した:
+//!
+//! - winget は `%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe`（アプリ実行エイリアス = 再解析ポイント）
+//! - psmux（zip の portable）は `--scope user` で**管理者権限なしに**入る（4 秒・exit 0）。実体は
+//!   `%LOCALAPPDATA%\Microsoft\WinGet\Packages`、`psmux` / `pmux` / `tmux` の symlink が
+//!   `%LOCALAPPDATA%\Microsoft\WinGet\Links` に張られ、**winget 自身がユーザー環境変数 Path へ Links を足す**
+//! - 導入済みは `0x8A15002B`（UPDATE_NOT_APPLICABLE。`--scope` の有無に依らない）・知らない引数は
+//!   `0x8A150002`・取得元に届かない（`--proxy` で塞いだ）は `0x80072EFD`・無い id は `0x8A150014`
+//! - ランナーは管理者で `ConsentPromptBehaviorAdmin=0`（確認なしに昇格）なので **UAC の確認そのものと
+//!   拒否は観測できない**。拒否の終了コードは winget のソースから決めた: 昇格が要るインストーラは
+//!   `ShellExecuteEx` の `runas` で起こし、取り消すと `0x800704C7`（`HRESULT_FROM_WIN32(ERROR_CANCELLED)`）
+//!   で返る。MSI / Burn の 1602 と Inno の 2 / 5 は `0x8A15010C`（INSTALL_CANCELLED_BY_USER）へ写される
+//!   （`ManifestCommon.cpp` の `GetDefaultKnownReturnCodes`）
+//!
+//! 依存ごとの「利用者の権限で入る / 管理者の確認（UAC）が出うる」は依存表（[`deps`] / [`container_dep`]）の
+//! [`InstallPrivilege`] の 1 か所で宣言する（2026-11-08 の利用者の判断 = psmux は利用者の権限、Git / Tailscale は
+//! UAC。winget-pkgs のマニフェストは Git = `ElevationRequirement: elevatesSelf`、Tailscale = `Scope: machine`）。
+//! UAC が出うるものは**利用者の同意があるときだけ**起こす（CLI は 1 回の確認か `--yes`・MCP は `consent`・
+//! 設定画面はボタン）。判断は [`DepInstallOptions::consent`] と [`InstallPrivilege::needs_consent`] だけで、
+//! 依存の名前で分けない（番犬 `crates/tako-control/tests/issue2433_dep_privilege_watchdog.rs`）。
+//! A/B は `TAKO_2433_LEGACY=1`（Windows は案内だけ = #2433 前）
 
 use std::io::{BufRead, Write};
 
@@ -41,13 +66,41 @@ use serde_json::{json, Value};
 use tako_core::i18n::Lang;
 use tako_core::platform::support::{Note, Platform};
 
+/// 導入に要る権限（#2433）。**依存ごとの宣言は依存表の 1 か所**（[`deps`] / [`container_dep`]）で、
+/// 同意を取るかどうかはこの値だけで決まる（依存の名前で分けない）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPrivilege {
+    /// 利用者の権限だけで入る（同意を取らずにそのまま代行する）
+    User,
+    /// 管理者の確認（Windows の UAC）が出うる（利用者の同意があるときだけ代行する）
+    Elevated,
+}
+
+impl InstallPrivilege {
+    /// 機械可読の名前（`tako setup deps` の JSON の `privilege`）
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Elevated => "elevated",
+        }
+    }
+
+    /// 起こす前に利用者の同意が要るか
+    pub fn needs_consent(self) -> bool {
+        matches!(self, Self::Elevated)
+    }
+}
+
 /// 導入手段。**tako が実行を代行してよいか**は手段ごとに決まる
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DepInstaller {
-    /// Homebrew（macOS）
+    /// Homebrew（macOS）。どれも利用者の権限で入る
     Brew { pkg: &'static str },
-    /// winget（Windows）。**案内だけ**（実機で実測していない手順を黙って走らせない）
-    Winget { pkg: &'static str },
+    /// winget（Windows）。権限は依存ごとに宣言する（#2433）
+    Winget {
+        pkg: &'static str,
+        privilege: InstallPrivilege,
+    },
 }
 
 impl DepInstaller {
@@ -59,21 +112,48 @@ impl DepInstaller {
         }
     }
 
-    /// 実行する引数（`program` の後ろ）
-    pub fn args(self) -> Vec<String> {
+    /// 導入に要る権限
+    pub fn privilege(self) -> InstallPrivilege {
         match self {
-            Self::Brew { pkg } => vec!["install".into(), pkg.into()],
-            Self::Winget { pkg } => vec![
-                "install".into(),
-                "--id".into(),
-                pkg.into(),
-                "--accept-source-agreements".into(),
-                "--accept-package-agreements".into(),
-            ],
+            Self::Brew { .. } => InstallPrivilege::User,
+            Self::Winget { privilege, .. } => privilege,
         }
     }
 
-    /// 人へ見せる 1 行（#322 の最簡形）
+    /// 実行する引数（`program` の後ろ）。
+    ///
+    /// winget は id を完全一致・取得元を winget に絞り（msstore の同意を求めない）、winget 自身の
+    /// 問い（同意・確認）を出さない。利用者の権限で入るものは `--scope user` で入る先を利用者の範囲へ
+    /// 固定し（machine の版を選ばれて UAC が出ることが無い）、`--silent` で何も出さない。UAC が出うるものは
+    /// `--silent` を付けない = インストーラの既定（進み具合の表示つきの無人）。MSI の完全サイレント
+    /// （`/quiet`）は昇格の確認を出さずに失敗することがあるため（#2433。実機では未実測）
+    pub fn args(self) -> Vec<String> {
+        match self {
+            Self::Brew { pkg } => vec!["install".into(), pkg.into()],
+            Self::Winget { pkg, privilege } => {
+                let mut args: Vec<String> =
+                    ["install", "--id", pkg, "--exact", "--source", "winget"]
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect();
+                if privilege == InstallPrivilege::User {
+                    args.extend(["--scope".into(), "user".into(), "--silent".into()]);
+                }
+                args.extend(
+                    [
+                        "--disable-interactivity",
+                        "--accept-source-agreements",
+                        "--accept-package-agreements",
+                    ]
+                    .iter()
+                    .map(|s| (*s).to_string()),
+                );
+                args
+            }
+        }
+    }
+
+    /// 人へ見せる 1 行（tako が起こすのと同じ形 = 「何をどの導入器で」を偽らない）
     pub fn command_line(self) -> String {
         format!("{} {}", self.program(), self.args().join(" "))
     }
@@ -82,10 +162,15 @@ impl DepInstaller {
     pub fn tako_can_run(self) -> bool {
         match self {
             Self::Brew { .. } => true,
-            // Windows のパッケージ導入は実機で通しの実測をしてから代行する（#525）
-            Self::Winget { .. } => false,
+            // #2433: Windows の CI のランナーで実測してから代行へ倒した。A/B は案内だけ（#2433 前）
+            Self::Winget { .. } => !legacy_2433(),
         }
     }
+}
+
+/// #2433 の A/B（Windows の winget は案内だけ = #2433 前の挙動）
+pub fn legacy_2433() -> bool {
+    std::env::var_os("TAKO_2433_LEGACY").is_some()
 }
 
 /// tako が実行時に使う外部コマンド 1 件
@@ -137,13 +222,15 @@ pub fn container_dep(platform: Platform) -> ExternalDep {
             hint: same("https://github.com/tmux/tmux/wiki/Installing"),
         },
         // Windows の器は psmux（tmux 互換 CLI の別実装）。**`tmux` を探しても見つからない**。
-        // remote daemon は画面をこの器から読む（#2771 で門が採取だけを求めるようになった）
+        // remote daemon は画面をこの器から読む（#2771 で門が採取だけを求めるようになった）。
+        // zip の portable なので利用者の権限で入る（#2433 の実測）
         Platform::Windows => ExternalDep {
             bin: "psmux",
             required: false,
             purpose: CONTAINER_PURPOSE,
             installer: Some(DepInstaller::Winget {
                 pkg: "marlocarlo.psmux",
+                privilege: InstallPrivilege::User,
             }),
             hint: same("https://github.com/marlocarlo/psmux"),
         },
@@ -167,7 +254,11 @@ pub fn deps(platform: Platform) -> Vec<ExternalDep> {
         ),
         installer: match platform {
             Platform::MacOs => Some(DepInstaller::Brew { pkg: "git" }),
-            Platform::Windows => Some(DepInstaller::Winget { pkg: "Git.Git" }),
+            // インストーラが自分で昇格を求める（winget-pkgs の `ElevationRequirement: elevatesSelf`）
+            Platform::Windows => Some(DepInstaller::Winget {
+                pkg: "Git.Git",
+                privilege: InstallPrivilege::Elevated,
+            }),
         },
         hint: match platform {
             Platform::MacOs => Note::new(
@@ -186,8 +277,10 @@ pub fn deps(platform: Platform) -> Vec<ExternalDep> {
         ),
         installer: match platform {
             Platform::MacOs => Some(DepInstaller::Brew { pkg: "tailscale" }),
+            // マシン全体へ入る（winget-pkgs の `Scope: machine` だけ）
             Platform::Windows => Some(DepInstaller::Winget {
                 pkg: "tailscale.tailscale",
+                privilege: InstallPrivilege::Elevated,
             }),
         },
         hint: match platform {
@@ -311,8 +404,10 @@ impl DepStatus {
             "required": self.dep.required,
             "purpose": self.dep.purpose.ja(),
             "install_command": installer.map(DepInstaller::command_line),
-            // 手段があっても代行できないことがある（Windows の winget）
+            // 手段があっても代行できないことがある（導入器が無い・A/B の Windows の winget）
             "can_run": self.can_tako_install(),
+            // 導入に要る権限（#2433。"elevated" は同意があるときだけ起こす = install の consent）
+            "privilege": installer.map(|i| i.privilege().slug()),
             "installer_found": self.installer_path(),
             "install_dir": self
                 .installer_path()
@@ -565,7 +660,8 @@ fn resolve_bounded(dep: &ExternalDep) -> Resolved {
             detection: Some(detection),
         };
     }
-    let found = tako_core::platform::exe::find_bounded(dep.bin);
+    // Windows はレジストリの PATH を読み直して探す（導入の直後・tako を開いたまま入れたもの = #2433）
+    let found = tako_core::platform::exe::find_fresh_bounded(dep.bin);
     if found.path.is_some() || !is_container(dep) {
         return Resolved {
             found: found.path,
@@ -677,6 +773,48 @@ fn is_tailscale(dep: &ExternalDep) -> bool {
     dep.bin == "tailscale"
 }
 
+/// 画面（設定の Setup タブ）の依存 1 行で出すもの（#2433）。status の 1 件（[`DepStatus::to_json`]）から
+/// 決める**純粋関数**で、何を入れられるか・同意が要るかは status に載った値だけを読む
+/// （画面に判断を持たない。押したら CLI / MCP と同じ `tako_setup_deps` の install を送る）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepView {
+    /// 導入済み（見つかったパス）
+    Installed(String),
+    /// tako が入れられる。`elevated` = 押すと Windows の UAC が出る（押下が同意 = consent=true で送る）
+    Install { elevated: bool },
+    /// 手で入れる（導入コマンドか案内）
+    Manual(String),
+    /// 検出を打ち切った・在るが動かない（入れ直させない）
+    Unknown,
+}
+
+impl DepView {
+    pub fn from_status(dep: &Value) -> Self {
+        if dep["lookup_timeout"].is_object() {
+            return Self::Unknown;
+        }
+        if let Some(path) = dep["found"].as_str() {
+            return if dep["runnable"].as_bool() == Some(false) {
+                Self::Unknown
+            } else {
+                Self::Installed(path.to_string())
+            };
+        }
+        if dep["can_run"].as_bool() == Some(true) {
+            return Self::Install {
+                elevated: dep["privilege"].as_str() == Some(InstallPrivilege::Elevated.slug()),
+            };
+        }
+        Self::Manual(
+            dep["install_command"]
+                .as_str()
+                .or_else(|| dep["hint"].as_str())
+                .unwrap_or_default()
+                .to_string(),
+        )
+    }
+}
+
 /// 検出結果の JSON（`tako_setup_bootstrap` の `deps` と同じ形を保つ）
 pub fn status_json() -> Value {
     Value::Array(status().iter().map(DepStatus::to_json).collect())
@@ -689,6 +827,181 @@ pub struct DepInstallOptions {
     pub dry_run: bool,
     /// 端末があるか。true = 出力を利用者へ流す
     pub interactive: bool,
+    /// 管理者の確認（Windows の UAC）が出うる導入に利用者が同意したか（#2433）。
+    /// false なら起こさず `skipped` に `needs_consent` で載せる（CLI の 1 回の確認 / `--yes`・
+    /// MCP の `consent`・設定画面のボタンだけが true にする）
+    pub consent: bool,
+}
+
+/// 導入しなかった理由（`skipped[]` の 1 件）。**機械可読の名前と人への文は型が持つ**（#2433 で型へ。
+/// 文は表示言語で組む = #2365。日本語は #2433 より前の固定文とバイト一致）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepSkip {
+    /// 導入済み（触らない = 冪等）
+    AlreadyInstalled { bin: &'static str, path: String },
+    /// 導入済みかを確かめられなかった（#1533。入っているかもしれないものを入れ直さない）
+    Unconfirmed { bin: &'static str, waited_secs: u64 },
+    /// 導入手段が無い
+    NoInstaller { hint: Note },
+    /// この環境では tako が代行しない（A/B の `TAKO_2433_LEGACY=1` の winget）
+    NotDelegable { command: String },
+    /// 導入器（brew / winget）がこの環境に無い
+    InstallerMissing { program: &'static str, hint: Note },
+    /// 管理者の確認（UAC）が出うるので、同意が無いまま起こさない（#2433）
+    NeedsConsent { bin: &'static str, command: String },
+}
+
+/// winget を入れ直す・更新するときの案内（Microsoft の公式の短縮 URL）
+const WINGET_GET_URL: &str = "https://aka.ms/getwinget";
+
+impl DepSkip {
+    /// 機械可読の理由（`skipped[].reason`）
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::AlreadyInstalled { .. } => "already_installed",
+            Self::Unconfirmed { .. } => "unconfirmed",
+            Self::NoInstaller { .. } => "no_installer",
+            Self::NotDelegable { .. } => "not_delegable",
+            Self::InstallerMissing { .. } => "installer_missing",
+            Self::NeedsConsent { .. } => "needs_consent",
+        }
+    }
+
+    /// 人への文（`skipped[].detail`）
+    pub fn text_in(&self, lang: Lang) -> String {
+        use Lang::{En, Ja};
+        match (self, lang) {
+            (Self::AlreadyInstalled { bin, path }, Ja) => format!("{bin} は導入済みです（{path}）"),
+            (Self::AlreadyInstalled { bin, path }, En) => {
+                format!("{bin} is already installed ({path})")
+            }
+            (Self::Unconfirmed { bin, waited_secs }, Ja) => format!(
+                "{bin}: 確認できません（ログインシェルが {waited_secs} 秒で応答なし）。\
+                 .zprofile などが入力を待っていないか確かめてから、もう一度実行してください"
+            ),
+            (Self::Unconfirmed { bin, waited_secs }, En) => format!(
+                "{bin}: cannot check (the login shell did not respond in {waited_secs} s). \
+                 Check that .zprofile and the like are not waiting for input, then run it again"
+            ),
+            (Self::NoInstaller { hint }, Ja) => {
+                format!("自動導入の手段がありません: {}", hint.ja())
+            }
+            (Self::NoInstaller { hint }, En) => {
+                format!("there is no way to install it automatically: {}", hint.en())
+            }
+            (Self::NotDelegable { command }, Ja) => format!(
+                "この環境では tako が導入を代行しません。次のコマンドを実行してください: {command}"
+            ),
+            (Self::NotDelegable { command }, En) => format!(
+                "tako does not install it for you in this environment. Run this command: {command}"
+            ),
+            // winget はアプリ インストーラー（Microsoft Store のアプリ）の一部。無い・壊れているときは
+            // そちらを入れ直すのが公式の手順
+            (Self::InstallerMissing { program: "winget", hint }, Ja) => format!(
+                "winget が見つかりません。Microsoft Store の「アプリ インストーラー」を入れるか更新してから、\
+                 もう一度実行してください（{WINGET_GET_URL}）。手で入れるなら: {}",
+                hint.ja()
+            ),
+            (Self::InstallerMissing { program: "winget", hint }, En) => format!(
+                "winget cannot be found. Install or update \"App Installer\" from the Microsoft Store, \
+                 then run it again ({WINGET_GET_URL}). To install it by hand: {}",
+                hint.en()
+            ),
+            (Self::InstallerMissing { program, hint }, Ja) => format!(
+                "{program} が見つかりません。{program} を導入するか、{} を参照してください",
+                hint.ja()
+            ),
+            (Self::InstallerMissing { program, hint }, En) => format!(
+                "{program} cannot be found. Install {program}, or see {}",
+                hint.en()
+            ),
+            (Self::NeedsConsent { bin, command }, Ja) => format!(
+                "{bin} の導入では Windows の管理者の確認（UAC）が出るので、同意が無いまま入れません。\
+                 入れるなら: tako setup deps install --yes（{command} 相当）"
+            ),
+            (Self::NeedsConsent { bin, command }, En) => format!(
+                "installing {bin} shows the Windows administrator prompt (UAC), so it is not installed \
+                 without your consent. To install it: tako setup deps install --yes (same as {command})"
+            ),
+        }
+    }
+
+    fn to_json(&self, bin: &str, lang: Lang) -> Value {
+        json!({
+            "bin": bin,
+            "reason": self.slug(),
+            "detail": self.text_in(lang),
+        })
+    }
+}
+
+/// 依存 1 件を導入するときの次の一手（**判断の 1 実装**。[`install_in`] と [`consent_needed`] が同じ判断を通る）
+enum Step<'a> {
+    Skip(DepSkip),
+    Run {
+        installer: DepInstaller,
+        program: &'a str,
+    },
+}
+
+/// 依存 1 件をどう扱うか（判断の順序に意味がある: 在るものは触らない・確かめられないものは入れない・
+/// 手段と導入器が揃ってから同意を問う = 入れられないものに同意を求めない）
+fn step_for(state: &DepStatus, consent: bool) -> Step<'_> {
+    let bin = state.dep.bin;
+    if let Some(path) = &state.found {
+        return Step::Skip(DepSkip::AlreadyInstalled {
+            bin,
+            path: path.clone(),
+        });
+    }
+    if let Some(notice) = state.unconfirmed() {
+        return Step::Skip(DepSkip::Unconfirmed {
+            bin,
+            waited_secs: notice.waited_secs,
+        });
+    }
+    let Some(installer) = state.dep.installer else {
+        return Step::Skip(DepSkip::NoInstaller {
+            hint: state.dep.hint,
+        });
+    };
+    if !installer.tako_can_run() {
+        return Step::Skip(DepSkip::NotDelegable {
+            command: installer.command_line(),
+        });
+    }
+    let Some(program) = state.installer_path() else {
+        return Step::Skip(DepSkip::InstallerMissing {
+            program: installer.program(),
+            hint: state.dep.hint,
+        });
+    };
+    if installer.privilege().needs_consent() && !consent {
+        return Step::Skip(DepSkip::NeedsConsent {
+            bin,
+            command: installer.command_line(),
+        });
+    }
+    Step::Run { installer, program }
+}
+
+/// この指定（`bin` 省略 = 未導入のものすべて）で導入するとき、**同意が無いと起こさない**依存（#2433）。
+///
+/// CLI の `tako setup deps install` が 1 回だけ確認するかを決めるのに使う。[`install_in`] が同意なしなら
+/// `needs_consent` で返すものと**同じ判断**（[`step_for`]）を通る（片方だけ変わると、聞かずに断る・
+/// 聞いたのに入らない、が生まれる）
+pub fn consent_needed(states: &[DepStatus], bin: Option<&str>) -> Vec<&'static str> {
+    states
+        .iter()
+        .filter(|state| bin.is_none_or(|b| b == state.dep.bin))
+        .filter(|state| {
+            matches!(
+                step_for(state, false),
+                Step::Skip(DepSkip::NeedsConsent { .. })
+            )
+        })
+        .map(|state| state.dep.bin)
+        .collect()
 }
 
 /// 未導入の依存を導入する。`bin` 省略で**未導入のものすべて**。
@@ -696,16 +1009,26 @@ pub struct DepInstallOptions {
 /// 導入済みのものは触らない（**冪等**）。手段が無い / 代行できないものは
 /// 実行せず理由つきで `skipped` に載せる（黙って飛ばさない）
 pub fn install(bin: Option<&str>, opts: DepInstallOptions) -> Result<Value, String> {
-    install_typed(bin, opts).map_err(crate::SetupRefusal::into_ja)
+    install_in(status(), bin, opts, Lang::Ja).map_err(crate::SetupRefusal::into_ja)
 }
 
-/// [`install`] の型の口（断りを表示言語で返す dispatch の `tako_setup_deps` が使う。#2365）。
+/// [`install`] の型の口（断りと `skipped[].detail` を表示言語で返す dispatch の `tako_setup_deps` が使う。#2365）。
 /// 従来の口（CLI の `tako setup deps install`・`tako setup` の依存の段 = 枠が日本語）は日本語のまま
 pub fn install_typed(
     bin: Option<&str>,
     opts: DepInstallOptions,
 ) -> Result<Value, crate::SetupRefusal> {
-    let all = status();
+    install_in(status(), bin, opts, tako_core::i18n::lang())
+}
+
+/// 検出済みの状態から導入する（CLI が確認のために検出した結果を使い回す = 2 回検出しない。#2433）。
+/// `lang` は `skipped[].detail` の言語（断りは型のまま返す）
+pub fn install_in(
+    all: Vec<DepStatus>,
+    bin: Option<&str>,
+    opts: DepInstallOptions,
+    lang: Lang,
+) -> Result<Value, crate::SetupRefusal> {
     if let Some(bin) = bin {
         if !all.iter().any(|s| s.dep.bin == bin) {
             return Err(crate::SetupRefusal::UnknownDep {
@@ -721,70 +1044,32 @@ pub fn install_typed(
     let mut installed = Vec::new();
     let mut skipped = Vec::new();
     let mut planned = Vec::new();
+    let mut consent_required = Vec::new();
     for state in &all {
         if bin.is_some_and(|b| b != state.dep.bin) {
             continue;
         }
-        if let Some(path) = &state.found {
-            skipped.push(json!({
-                "bin": state.dep.bin,
-                "reason": "already_installed",
-                "detail": format!("{} は導入済みです（{path}）", state.dep.bin),
-            }));
-            continue;
-        }
-        // 導入済みかを確かめられなかった（#1533）。入っているかもしれないものを入れ直さない
-        if let Some(text) = state.unconfirmed_text() {
-            skipped.push(json!({
-                "bin": state.dep.bin,
-                "reason": "unconfirmed",
-                "detail": format!(
-                    "{text}。.zprofile などが入力を待っていないか確かめてから、もう一度実行してください"
-                ),
-            }));
-            continue;
-        }
-        let Some(installer) = state.dep.installer else {
-            skipped.push(json!({
-                "bin": state.dep.bin,
-                "reason": "no_installer",
-                "detail": format!("自動導入の手段がありません: {}", state.dep.hint.ja()),
-            }));
-            continue;
-        };
-        if !installer.tako_can_run() {
-            skipped.push(json!({
-                "bin": state.dep.bin,
-                "reason": "not_delegable",
-                "detail": format!(
-                    "この環境では tako が導入を代行しません。次のコマンドを実行してください: {}",
-                    installer.command_line()
-                ),
-            }));
-            continue;
-        }
-        let Some(program) = state.installer_path() else {
-            skipped.push(json!({
-                "bin": state.dep.bin,
-                "reason": "installer_missing",
-                "detail": format!(
-                    "{} が見つかりません。{} を導入するか、{} を参照してください",
-                    installer.program(),
-                    installer.program(),
-                    state.dep.hint.ja()
-                ),
-            }));
-            continue;
+        let (installer, program) = match step_for(state, opts.consent) {
+            Step::Skip(skip) => {
+                if matches!(skip, DepSkip::NeedsConsent { .. }) {
+                    consent_required.push(state.dep.bin);
+                }
+                skipped.push(skip.to_json(state.dep.bin, lang));
+                continue;
+            }
+            Step::Run { installer, program } => (installer, program),
         };
         planned.push(json!({
             "bin": state.dep.bin,
             "command": installer.command_line(),
+            "privilege": installer.privilege().slug(),
         }));
         if opts.dry_run {
             continue;
         }
-        run_installer(program, installer, opts.interactive)?;
-        // 「実行した」ではなく「引けるようになった」を確かめてから成功と言う
+        run_installer(program, installer, state.dep.bin, opts.interactive)?;
+        // 「実行した」ではなく「引けるようになった」を確かめてから成功と言う。
+        // Windows はレジストリの PATH を読み直して探す（winget がユーザー環境変数 Path へ足した置き場 = #2433）
         match resolve(&state.dep) {
             Some(path) => installed.push(json!({ "bin": state.dep.bin, "path": path })),
             None => {
@@ -800,13 +1085,77 @@ pub fn install_typed(
         "planned": planned,
         "installed": installed,
         "skipped": skipped,
+        // 同意が無いので起こさなかった依存（#2433。consent=true で呼び直せば入る）
+        "consent_required": consent_required,
         "deps": status_json(),
     }))
+}
+
+/// winget の終了コードの読み（#2433。値は winget の `AppInstallerErrors.h` と CI のランナーでの実測）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WingetExit {
+    /// 入った（0）
+    Installed,
+    /// winget は「もう入っている」と答えた（導入済み 0x8A15002B は実測。0x8A150061 / 0x8A15010D も同じ意味）。
+    /// tako の検出が見落としただけかもしれないので、再検出の答えで決める
+    AlreadyInstalled,
+    /// 利用者が管理者の確認（UAC）で取り消した（0x800704C7 = runas の取り消し・0x8A15010C =
+    /// インストーラが返した取り消し・1223 = ERROR_CANCELLED）
+    Declined,
+    /// 取得元に届かない（0x8A150008 / 0x8A150107 / 0x8A150045 と WinINet の 0x80072EE0〜0x80072F8F。
+    /// 0x80072EFD は実測）
+    Unreachable,
+    /// tako の渡す引数を受け付けない（0x8A150002。`--disable-interactivity` は winget 1.4 から）
+    TooOld,
+    /// それ以外の途中の失敗
+    Failed,
+}
+
+/// 終了コードを読む（**純粋関数**。Windows の終了コードは 32 ビットの符号なしなので符号を外して見る）
+pub fn classify_winget_exit(code: i32) -> WingetExit {
+    match code as u32 {
+        0 => WingetExit::Installed,
+        0x8A15_002B | 0x8A15_0061 | 0x8A15_010D => WingetExit::AlreadyInstalled,
+        0x8A15_010C | 0x8007_04C7 | 1223 => WingetExit::Declined,
+        0x8A15_0008 | 0x8A15_0107 | 0x8A15_0045 | 0x8007_2EE0..=0x8007_2F8F => {
+            WingetExit::Unreachable
+        }
+        0x8A15_0002 => WingetExit::TooOld,
+        _ => WingetExit::Failed,
+    }
+}
+
+/// winget の終了コードを導入の結末にする（**純粋関数**。`Ok` = 再検出へ進む）
+pub fn winget_outcome(
+    code: i32,
+    command: String,
+    bin: &str,
+    log: String,
+) -> Result<(), crate::SetupRefusal> {
+    let shown = format!("0x{:08X}", code as u32);
+    match classify_winget_exit(code) {
+        WingetExit::Installed | WingetExit::AlreadyInstalled => Ok(()),
+        WingetExit::Declined => Err(crate::SetupRefusal::DepElevationDeclined {
+            bin: bin.to_string(),
+        }),
+        WingetExit::Unreachable => Err(crate::SetupRefusal::DepSourceUnreachable {
+            command,
+            code: shown,
+            log,
+        }),
+        WingetExit::TooOld => Err(crate::SetupRefusal::DepInstallerTooOld { command, log }),
+        WingetExit::Failed => Err(crate::SetupRefusal::DepWingetFailed {
+            command,
+            code: shown,
+            log,
+        }),
+    }
 }
 
 fn run_installer(
     program: &str,
     installer: DepInstaller,
+    bin: &str,
     interactive: bool,
 ) -> Result<(), crate::SetupRefusal> {
     let mut command = std::process::Command::new(program);
@@ -845,12 +1194,33 @@ fn run_installer(
     if status.success() {
         return Ok(());
     }
-    // 出力の添え方（空なら添えない・あれば改行を挟む）は断りの型の 1 か所が持つ
-    Err(crate::SetupRefusal::DepInstallerFailed {
-        command: installer.command_line(),
-        code: status.code().unwrap_or(-1),
-        log,
-    })
+    let code = status.code().unwrap_or(-1);
+    match installer {
+        // winget は「入っている」「取り消した」「届かない」を終了コードで言い分けるので読んでから断る
+        DepInstaller::Winget { .. } => {
+            winget_outcome(code, installer.command_line(), bin, winget_log(&log))
+        }
+        // 出力の添え方（空なら添えない・あれば改行を挟む）は断りの型の 1 か所が持つ
+        DepInstaller::Brew { .. } => Err(crate::SetupRefusal::DepInstallerFailed {
+            command: installer.command_line(),
+            code,
+            log,
+        }),
+    }
+}
+
+/// winget の捕捉した出力から、進み具合の表示（回転する `-` `\` `|` `/` と █ / ▒ の棒）を落とす
+/// （断りへ載せるのは文の行だけ。CI の実測で出力の半分以上がこの行だった）
+fn winget_log(log: &str) -> String {
+    log.lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.chars().all(|c| matches!(c, '-' | '\\' | '|' | '/'))
+                && !line.contains(['█', '▒'])
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // --- 未検出の依存 1 件をその場で入れる（#1499 → #1509 で「体験」ごと 1 実装へ）---
@@ -1016,9 +1386,11 @@ pub fn offer_and_install(
         }
         DepOffer::Ask => {
             say_plan(io, state)?;
+            // UAC が出うるものは、同じ 1 回の問いで同意も取る（#2433。y が同意 = 2 回聞かない）
+            let elevated = elevation_note(state, lang);
             let question = match lang {
-                Lang::Ja => format!("{} をインストールしますか？ [y/N]: ", dep.bin),
-                Lang::En => format!("Install {}? [y/N]: ", dep.bin),
+                Lang::Ja => format!("{} をインストールしますか？{elevated} [y/N]: ", dep.bin),
+                Lang::En => format!("Install {}?{elevated} [y/N]: ", dep.bin),
             };
             write!(io.writer, "{}{question}", io.indent).map_err(|e| e.to_string())?;
             let _ = io.writer.flush();
@@ -1054,9 +1426,15 @@ pub fn offer_and_install(
             say_plan(io, state)?;
             say(
                 io,
-                match lang {
-                    Lang::Ja => "--yes のため確認を省略してインストールします",
-                    Lang::En => "Installing without asking because of --yes",
+                &match lang {
+                    Lang::Ja => format!(
+                        "--yes のため確認を省略してインストールします{}",
+                        elevation_note(state, lang)
+                    ),
+                    Lang::En => format!(
+                        "Installing without asking because of --yes{}",
+                        elevation_note(state, lang)
+                    ),
                 },
             )?;
         }
@@ -1067,6 +1445,8 @@ pub fn offer_and_install(
             dry_run: false,
             // 端末を持つ経路から呼ばれるので導入器の進捗をそのまま流す
             interactive: true,
+            // ここへ来るのは y と答えたか `--yes` のときだけ = UAC への同意も含む（#2433）
+            consent: true,
         },
     ) {
         // `install` は「引けるようになった」ものだけ `installed` へ載せる
@@ -1086,6 +1466,19 @@ pub fn offer_and_install(
             }
             Ok(DepOutcome::NotInstalled)
         }
+    }
+}
+
+/// UAC が出うる依存の問いに添える句（#2433。利用者の権限で入るものは空 = 従来の文とバイト一致）
+fn elevation_note(state: &DepStatus, lang: Lang) -> &'static str {
+    let elevated = state
+        .dep
+        .installer
+        .is_some_and(|i| i.privilege().needs_consent());
+    match (elevated, lang) {
+        (false, _) => "",
+        (true, Lang::Ja) => "（Windows の管理者の確認（UAC）が出ます）",
+        (true, Lang::En) => " (Windows will show the administrator prompt (UAC))",
     }
 }
 
@@ -1172,14 +1565,56 @@ mod tests {
         }
     }
 
-    /// 代行してよいのは実測済みの手段だけ（#525 / #868 と同じ基準）
+    const PSMUX: DepInstaller = DepInstaller::Winget {
+        pkg: "marlocarlo.psmux",
+        privilege: InstallPrivilege::User,
+    };
+    const GIT: DepInstaller = DepInstaller::Winget {
+        pkg: "Git.Git",
+        privilege: InstallPrivilege::Elevated,
+    };
+
+    /// 代行してよいのは実測済みの手段だけ（#525 / #868 と同じ基準）。winget は #2433 の CI のランナーで
+    /// 実測してから代行へ倒した（A/B の `TAKO_2433_LEGACY=1` は案内だけ = 子プロセスで見る統合テスト）
     #[test]
-    fn 未実測の手段は代行しない() {
+    fn issue2433_実測済みの手段は代行する() {
         assert!(DepInstaller::Brew { pkg: "tmux" }.tako_can_run());
-        assert!(!DepInstaller::Winget {
-            pkg: "marlocarlo.psmux"
+        assert!(
+            PSMUX.tako_can_run(),
+            "Windows の winget が案内だけに戻っている（#2433）"
+        );
+        assert!(
+            GIT.tako_can_run(),
+            "UAC の出る winget も同意があれば代行する（#2433）"
+        );
+    }
+
+    /// #2433: 依存ごとの権限は依存表の 1 か所で宣言する（2026-11-08 の利用者の判断）。
+    /// psmux は利用者の権限・Git / Tailscale は UAC。macOS の brew はどれも利用者の権限
+    #[test]
+    fn issue2433_依存ごとの権限は依存表で宣言する() {
+        let privilege_of = |platform, bin: &str| {
+            deps(platform)
+                .into_iter()
+                .find(|dep| dep.bin == bin)
+                .and_then(|dep| dep.installer)
+                .map(DepInstaller::privilege)
+        };
+        use InstallPrivilege::{Elevated, User};
+        assert_eq!(privilege_of(Platform::Windows, "psmux"), Some(User));
+        assert_eq!(privilege_of(Platform::Windows, "git"), Some(Elevated));
+        assert_eq!(privilege_of(Platform::Windows, "tailscale"), Some(Elevated));
+        for dep in deps(Platform::MacOs) {
+            assert_eq!(
+                dep.installer.map(DepInstaller::privilege),
+                Some(User),
+                "{}: macOS の brew に同意の要る依存を作らない（Homebrew の経路を変えない）",
+                dep.bin
+            );
         }
-        .tako_can_run());
+        assert_eq!(User.slug(), "user");
+        assert_eq!(Elevated.slug(), "elevated");
+        assert!(!User.needs_consent() && Elevated.needs_consent());
     }
 
     #[test]
@@ -1188,13 +1623,326 @@ mod tests {
             DepInstaller::Brew { pkg: "tmux" }.command_line(),
             "brew install tmux"
         );
-        // winget は非対話で通す引数が要る（人が打つときも同じ形になる）
-        let winget = DepInstaller::Winget {
-            pkg: "marlocarlo.psmux",
+        // winget は非対話で通す引数が要る（tako が起こすのと同じ形を見せる）
+        assert_eq!(
+            PSMUX.command_line(),
+            "winget install --id marlocarlo.psmux --exact --source winget --scope user --silent \
+             --disable-interactivity --accept-source-agreements --accept-package-agreements"
+        );
+        // UAC が出うるものは入る先を固定せず、--silent を付けない（MSI の完全サイレントは昇格の確認を出さずに失敗することがある）
+        assert_eq!(
+            GIT.command_line(),
+            "winget install --id Git.Git --exact --source winget \
+             --disable-interactivity --accept-source-agreements --accept-package-agreements"
+        );
+    }
+
+    /// #2433: winget の終了コードの読み。実測（CI のランナー）の値と winget のソースの値
+    #[test]
+    fn issue2433_wingetの終了コードを読む() {
+        use WingetExit::*;
+        let hr = |code: u32| code as i32;
+        for (code, want) in [
+            (0, Installed),
+            // 実測: 導入済み（--scope の有無に依らない）
+            (hr(0x8A15_002B), AlreadyInstalled),
+            (hr(0x8A15_0061), AlreadyInstalled),
+            (hr(0x8A15_010D), AlreadyInstalled),
+            // winget のソース: runas の取り消し / インストーラの取り消しの写し / 素の ERROR_CANCELLED
+            (hr(0x8007_04C7), Declined),
+            (hr(0x8A15_010C), Declined),
+            (1223, Declined),
+            // 実測: --proxy で塞いだ 0x80072EFD。WinINet の範囲の両端と winget の取得の失敗
+            (hr(0x8007_2EFD), Unreachable),
+            (hr(0x8007_2EE0), Unreachable),
+            (hr(0x8007_2F8F), Unreachable),
+            (hr(0x8A15_0008), Unreachable),
+            (hr(0x8A15_0107), Unreachable),
+            (hr(0x8A15_0045), Unreachable),
+            // 実測: 知らない引数
+            (hr(0x8A15_0002), TooOld),
+            // 実測: 無い id。範囲の外側・ShellExecute の失敗・素の 1
+            (hr(0x8A15_0014), Failed),
+            (hr(0x8007_2F90), Failed),
+            (hr(0x8A15_0006), Failed),
+            (1, Failed),
+        ] {
+            assert_eq!(classify_winget_exit(code), want, "0x{:08X}", code as u32);
+        }
+    }
+
+    /// #2433: 終了コードごとの断りは型で、日英の文を持つ（英語に日本語が混ざらない）
+    #[test]
+    fn issue2433_wingetの断りは型で日英を持つ() {
+        let japanese = |s: &str| {
+            s.chars()
+                .any(|c| matches!(c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF | 0xFF00..=0xFFEF))
         };
-        assert!(winget
-            .command_line()
-            .starts_with("winget install --id marlocarlo.psmux"));
+        let cmd = || GIT.command_line();
+        let outcome = |code: u32| winget_outcome(code as i32, cmd(), "git", "log".into());
+        assert_eq!(outcome(0), Ok(()));
+        assert_eq!(outcome(0x8A15_002B), Ok(()), "導入済みは再検出へ進む");
+        let cases = [
+            (
+                0x8007_04C7,
+                "取り消されました",
+                "cancelled at the administrator prompt",
+            ),
+            (
+                0x8A15_010C,
+                "取り消されました",
+                "cancelled at the administrator prompt",
+            ),
+            (
+                0x8007_2EFD,
+                "取得元に届きませんでした（exit 0x80072EFD）",
+                "could not reach",
+            ),
+            (0x8A15_0002, "アプリ インストーラー", "App Installer"),
+            (
+                0x8A15_0006,
+                "が失敗しました（exit 0x8A150006）",
+                "failed (exit 0x8A150006)",
+            ),
+        ];
+        for (code, ja, en) in cases {
+            let refusal = outcome(code).expect_err("断る");
+            let (ja_text, en_text) = (refusal.text_in(Lang::Ja), refusal.text_in(Lang::En));
+            assert!(ja_text.contains(ja), "0x{code:08X}: {ja_text}");
+            assert!(en_text.contains(en), "0x{code:08X}: {en_text}");
+            assert!(!japanese(&en_text), "英語に日本語が混ざる: {en_text}");
+        }
+    }
+
+    /// 進み具合の表示（回転・棒）は断りへ載せない。文の行は残す
+    #[test]
+    fn issue2433_wingetの出力から進み具合を落とす() {
+        let raw = "   - \n   \\ \n  ██████▒▒▒▒  1.2 MB / 3.4 MB\n\nFound psmux [marlocarlo.psmux]\n   | \nInstaller failed";
+        assert_eq!(
+            winget_log(raw),
+            "Found psmux [marlocarlo.psmux]\nInstaller failed"
+        );
+    }
+
+    /// Windows の依存の検出結果を組み立てる（導入器 = winget は見つかっている）
+    fn windows_state(installer: DepInstaller, bin: &'static str) -> DepStatus {
+        DepStatus {
+            dep: ExternalDep {
+                bin,
+                required: false,
+                purpose: Note::new("テスト", "test"),
+                installer: Some(installer),
+                hint: Note::new("https://example.invalid", "https://example.invalid"),
+            },
+            found: None,
+            installer_found: Some("C:\\w\\winget.exe".into()),
+            lookup_timeout: None,
+            detection: None,
+        }
+    }
+
+    fn planned_bins(value: &Value) -> Vec<String> {
+        value["planned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["bin"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// #2433: UAC の出る依存は同意が無いと起こさず、`needs_consent` と `consent_required` で返す。
+    /// 利用者の権限で入るものは同意を問わずに起こす。確認を出すかの判断（`consent_needed`）も同じ判断
+    #[test]
+    fn issue2433_uacの出る依存は同意が無いと起こさない() {
+        let states = || vec![windows_state(PSMUX, "psmux"), windows_state(GIT, "git")];
+        let dry = |consent| DepInstallOptions {
+            dry_run: true,
+            interactive: false,
+            consent,
+        };
+        let without = install_in(states(), None, dry(false), Lang::Ja).expect("計画は作れる");
+        assert_eq!(planned_bins(&without), ["psmux"], "{without}");
+        assert_eq!(without["consent_required"], json!(["git"]));
+        let skip = &without["skipped"][0];
+        assert_eq!(skip["bin"], "git");
+        assert_eq!(skip["reason"], "needs_consent");
+        assert!(
+            skip["detail"]
+                .as_str()
+                .unwrap()
+                .contains("管理者の確認（UAC）が出るので、同意が無いまま入れません"),
+            "{skip}"
+        );
+        assert_eq!(without["planned"][0]["privilege"], "user", "{without}");
+
+        let with = install_in(states(), None, dry(true), Lang::Ja).expect("計画は作れる");
+        assert_eq!(planned_bins(&with), ["psmux", "git"], "{with}");
+        assert_eq!(with["consent_required"], json!([]));
+        assert_eq!(with["planned"][1]["privilege"], "elevated");
+
+        // 名指しで絞っても同じ
+        let named = install_in(states(), Some("git"), dry(false), Lang::En).unwrap();
+        assert_eq!(named["consent_required"], json!(["git"]));
+        assert!(
+            named["skipped"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("installing git shows the Windows administrator prompt (UAC)"),
+            "{named}"
+        );
+
+        // 確認を出すかの判断は install と同じ: UAC の出る未導入だけ
+        assert_eq!(consent_needed(&states(), None), ["git"]);
+        assert_eq!(consent_needed(&states(), Some("psmux")), Vec::<&str>::new());
+        // 入っている・導入器が無い・確かめられない Git には同意を求めない（入れられないものに聞かない）
+        let mut found = windows_state(GIT, "git");
+        found.found = Some("C:\\Program Files\\Git\\cmd\\git.exe".into());
+        let mut no_winget = windows_state(GIT, "git");
+        no_winget.installer_found = None;
+        for state in [found, no_winget] {
+            assert!(consent_needed(&[state], None).is_empty());
+        }
+    }
+
+    /// #2433: winget が無いときの案内は、アプリ インストーラーを入れる道と手で入れる道を日英で言う
+    #[test]
+    fn issue2433_wingetが無いときの案内() {
+        let mut state = windows_state(PSMUX, "psmux");
+        state.installer_found = None;
+        let opts = DepInstallOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        for (lang, want) in [
+            (
+                Lang::Ja,
+                "winget が見つかりません。Microsoft Store の「アプリ インストーラー」",
+            ),
+            (
+                Lang::En,
+                "winget cannot be found. Install or update \"App Installer\"",
+            ),
+        ] {
+            let value = install_in(vec![state.clone()], None, opts, lang).unwrap();
+            let skip = &value["skipped"][0];
+            assert_eq!(skip["reason"], "installer_missing");
+            let detail = skip["detail"].as_str().unwrap();
+            assert!(detail.starts_with(want), "{detail}");
+            assert!(detail.contains(WINGET_GET_URL) && detail.contains("https://example.invalid"));
+        }
+    }
+
+    /// `skipped[].detail` の日本語は #2433 より前の固定文とバイト一致（英語に日本語が混ざらない）
+    #[test]
+    fn issue2433_導入しなかった理由の文() {
+        let hint = Note::new("App Store で探す", "search the App Store");
+        let cases = [
+            (
+                DepSkip::AlreadyInstalled {
+                    bin: "tmux",
+                    path: "/opt/homebrew/bin/tmux".into(),
+                },
+                "tmux は導入済みです（/opt/homebrew/bin/tmux）",
+            ),
+            (
+                DepSkip::Unconfirmed {
+                    bin: "tmux",
+                    waited_secs: 5,
+                },
+                "tmux: 確認できません（ログインシェルが 5 秒で応答なし）。.zprofile などが入力を待っていないか確かめてから、もう一度実行してください",
+            ),
+            (
+                DepSkip::NoInstaller { hint },
+                "自動導入の手段がありません: App Store で探す",
+            ),
+            (
+                DepSkip::NotDelegable {
+                    command: "winget install x".into(),
+                },
+                "この環境では tako が導入を代行しません。次のコマンドを実行してください: winget install x",
+            ),
+            (
+                DepSkip::InstallerMissing {
+                    program: "brew",
+                    hint,
+                },
+                "brew が見つかりません。brew を導入するか、App Store で探す を参照してください",
+            ),
+        ];
+        for (skip, ja) in cases {
+            assert_eq!(skip.text_in(Lang::Ja), ja);
+            let en = skip.text_in(Lang::En);
+            assert!(
+                !en.chars()
+                    .any(|c| matches!(c as u32, 0x3000..=0x30FF | 0x4E00..=0x9FFF)),
+                "{en}"
+            );
+        }
+    }
+
+    /// #2433: 画面の 1 行は status の値だけで決まる（UAC の出るものは押下が同意のボタン）
+    #[test]
+    fn issue2433_画面の行はstatusから決める() {
+        let view = |state: &DepStatus| DepView::from_status(&state.to_json());
+        assert_eq!(
+            view(&windows_state(GIT, "git")),
+            DepView::Install { elevated: true }
+        );
+        assert_eq!(
+            view(&windows_state(PSMUX, "psmux")),
+            DepView::Install { elevated: false }
+        );
+        let mut found = windows_state(PSMUX, "psmux");
+        found.found = Some("C:\\x\\psmux.exe".into());
+        assert_eq!(view(&found), DepView::Installed("C:\\x\\psmux.exe".into()));
+        // winget が無い = 入れられない → 手で打つコマンド
+        let mut no_winget = windows_state(GIT, "git");
+        no_winget.installer_found = None;
+        assert_eq!(view(&no_winget), DepView::Manual(GIT.command_line()));
+        // 在るが動かない・確かめられないものは入れ直させない
+        let mut unrunnable = fake_status(None, None);
+        unrunnable.found = Some("/x/tailscale".into());
+        unrunnable.detection = Some(crate::tailscale::Detection::Unrunnable(
+            "/x/tailscale".into(),
+        ));
+        assert_eq!(view(&unrunnable), DepView::Unknown);
+        let mut timed_out = windows_state(PSMUX, "psmux");
+        timed_out.lookup_timeout = Some(tako_core::probe::TimeoutNotice {
+            label: tako_core::probe::label("zsh", &["-l"]),
+            waited_secs: 5,
+        });
+        assert_eq!(view(&timed_out), DepView::Unknown);
+        // 手段の無いものは案内
+        assert_eq!(
+            view(&fake_status(None, None)),
+            DepView::Manual("App Store で「Tailscale」を検索".into())
+        );
+    }
+
+    /// #2433: `tako setup` の依存の段は、UAC の出る依存の問いに同意の句を添える（2 回聞かない）。
+    /// 利用者の権限のものは従来の文のまま
+    #[test]
+    fn issue2433_依存の段の問いはuacを言う() {
+        let git = windows_state(GIT, "git");
+        let (outcome, out) = run_offer(&git, ask_ctx(), "n\n");
+        assert_eq!(outcome, DepOutcome::NotInstalled);
+        assert!(
+            out.contains(
+                "git をインストールしますか？（Windows の管理者の確認（UAC）が出ます） [y/N]: "
+            ),
+            "{out}"
+        );
+        let (_, en) = run_offer_in(&git, ask_ctx(), "n\n", Lang::En);
+        assert!(
+            en.contains("Install git? (Windows will show the administrator prompt (UAC)) [y/N]: "),
+            "{en}"
+        );
+        let psmux = windows_state(PSMUX, "psmux");
+        let (_, out) = run_offer(&psmux, ask_ctx(), "n\n");
+        assert!(
+            out.contains("psmux をインストールしますか？ [y/N]: "),
+            "{out}"
+        );
     }
 
     /// 「どこへ入るか」は Homebrew の構造から導く（`brew --prefix` を起こさない）
@@ -1213,10 +1961,7 @@ mod tests {
         assert_eq!(install_dir(brew, "/tmp/stub/brew"), None);
         assert_eq!(install_dir(brew, "brew"), None);
         // winget は置き場がパッケージ任せなので答えない
-        assert_eq!(
-            install_dir(DepInstaller::Winget { pkg: "Git.Git" }, "C:\\w\\winget.exe"),
-            None
-        );
+        assert_eq!(install_dir(GIT, "C:\\w\\winget.exe"), None);
     }
 
     /// `can_run`（JSON）と `[y/N]` を出すかの判断が**同じ 1 実装**を見る（#1499）
@@ -1258,6 +2003,7 @@ mod tests {
             DepInstallOptions {
                 dry_run: true,
                 interactive: false,
+                consent: false,
             },
         )
         .expect("計画は作れる");
@@ -1594,6 +2340,7 @@ mod tests {
             DepInstallOptions {
                 dry_run: true,
                 interactive: false,
+                consent: false,
             },
         )
         .expect("計画は作れる");
@@ -1680,7 +2427,8 @@ mod tests {
         assert_eq!(
             tailscale.installer,
             Some(DepInstaller::Winget {
-                pkg: "tailscale.tailscale"
+                pkg: "tailscale.tailscale",
+                privilege: InstallPrivilege::Elevated,
             })
         );
     }

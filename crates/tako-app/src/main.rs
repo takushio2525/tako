@@ -34327,6 +34327,11 @@ mod self_test {
     mod net_resume_2112;
     #[cfg(feature = "visual-test")]
     use net_resume_2112::net_resume_visual;
+    /// #2433: 設定画面の任意の依存ツールの行（UAC の出る依存のボタン。visual-test `setup-deps-2433`）
+    #[cfg(feature = "visual-test")]
+    mod setup_deps_2433;
+    #[cfg(feature = "visual-test")]
+    use setup_deps_2433::setup_deps_visual;
     /// #2016: tasks ビューの返答欄（IME・折り返し・送信の間）と返答の履歴（visual-test `tasks-input`）
     #[cfg(feature = "visual-test")]
     mod tasks_input_2016;
@@ -50905,6 +50910,11 @@ mod self_test {
                     net_resume_visual(any, window, cx).await;
                     visual_exit(0);
                 }
+                // #2433: 設定画面の任意の依存ツールの行（Windows の腕は TAKO_2433_DEPS_FIXTURE で描く）
+                "setup-deps-2433" => {
+                    setup_deps_visual(any, window, cx).await;
+                    visual_exit(0);
+                }
                 // #1691: カーソルを括弧に置くと対の括弧が実ピクセルで強調され、対が無いと出ないか
                 "bracket-match" => {
                     bracket_match_visual(any, window, cx).await;
@@ -50949,7 +50959,7 @@ mod self_test {
                          tree-clipboard / tree-multiselect / tree-keyboard-copy / tree-keys / completion / completion-real / lsp-context-menu / lsp-held-2048 / \
                          lsp-context-menu-real / md-edit-resume / md-find-restore / hover / hover-real / \
                          hover-1893 / hover-loading / hover-loading-real / mod-limits / mod-bar / ino-highlight / \
-                         syntax-alias / extra-syntax / net-resume / \
+                         syntax-alias / extra-syntax / net-resume / setup-deps-2433 / \
                          background-drawer / show-command-caller / tasks-input / preview-memory / \
                          workspace-search-1694 / workspace-replace-2045 / paste-guard / bracket-match / enter-1759 / \
                          changelog-offload / changelog-expand / tasks-launch-2182 / palette-alias / preview-reveal-2247）"
@@ -92912,6 +92922,7 @@ mod self_test {
                                     action: Some(action.into()),
                                     dep: dep.clone(),
                                     dry_run,
+                                    consent: None,
                                 },
                                 PaneOrigin::Cli,
                             )
