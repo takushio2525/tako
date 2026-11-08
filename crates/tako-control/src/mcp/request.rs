@@ -6,6 +6,21 @@ use super::tools;
 use crate::dispatch::Reason;
 use crate::protocol::{Axis, Direction, Request};
 
+/// `tako_setup` の答えの鍵（`setup::SetupAnswers` の最上位の欄。`undo` と一緒に来たら名指して断る。#2788）
+const SETUP_ANSWER_KEYS: [&str; 11] = [
+    "selected_agent",
+    "provider_plans",
+    "instruction_content",
+    "profile",
+    "projects",
+    "orchestrator",
+    "sleep_guard",
+    "launch_agent",
+    "config_share",
+    "mod_ui",
+    "install",
+];
+
 /// 前段の断りの文（#2365）。表示言語に従う（日英の正本は [`Reason::text_in`]）。
 /// GUI の HTTP 経路は GUI の表示言語、stdio ブリッジは起動時に設定から決めた表示言語
 fn missing(key: &str) -> String {
@@ -1344,9 +1359,42 @@ pub(super) fn build_request(
         "tako_setup_models" => Request::SetupModels {
             agent: str_arg(args, "agent")?,
         },
-        "tako_setup" => Request::SetupRun {
-            answers: Some(args.clone()),
-        },
+        // #2788: `undo: true` は setup の逆 = tako が外へ書いた連携を外す（ツールは増やさない）。
+        // 答え（answers）と一緒には受けない（片付けと setup を 1 回で両方やる意味は無い）
+        "tako_setup" if bool_arg(args, "undo")? == Some(true) => {
+            let other = args.as_object().and_then(|o| {
+                o.iter()
+                    .find(|(k, v)| !v.is_null() && !matches!(k.as_str(), "undo" | "dry_run"))
+            });
+            if let Some((key, _)) = other {
+                let name = SETUP_ANSWER_KEYS
+                    .iter()
+                    .find(|k| **k == key.as_str())
+                    .copied()
+                    .unwrap_or("answers");
+                return Err(Reason::NotTogether("undo", name).to_string());
+            }
+            Request::SetupUndo {
+                dry_run: bool_arg(args, "dry_run")?,
+            }
+        }
+        "tako_setup" => {
+            if bool_arg(args, "dry_run")?.is_some() {
+                return Err(Reason::ActionNeeds {
+                    action: "dry_run".into(),
+                    key: "undo",
+                }
+                .to_string());
+            }
+            // `undo: false` は素の setup（答えには載せない = SetupAnswers は知らない鍵を断る）
+            let mut answers = args.clone();
+            if let Some(o) = answers.as_object_mut() {
+                o.remove("undo");
+            }
+            Request::SetupRun {
+                answers: Some(answers),
+            }
+        }
         "tako_agents_sync_rules" => Request::AgentsSyncRules {
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             source: str_arg(args, "source")?.map(|s| s.to_string()),

@@ -2031,6 +2031,14 @@ pub enum Request {
         #[serde(default)]
         answers: Option<serde_json::Value>,
     },
+    /// tako が外へ書いた連携（agent への MCP 登録・指示ファイルの同期ブロック・mod の skills・PATH ほか）を
+    /// 外し、data dir は残す（Issue #2788。CLI `tako setup undo`・MCP `tako_setup` の `undo`）。
+    /// 処理はプロセス内で完結する（GUI の状態に触らない）
+    SetupUndo {
+        /// 外さずに「何を外すか」だけを返す
+        #[serde(default)]
+        dry_run: Option<bool>,
+    },
     /// エージェント共通ルールの同期（Issue #136）。
     /// `action` = "sync"（同期実行）/ "status"（状態確認）
     AgentsSyncRules {
@@ -3132,6 +3140,7 @@ pub fn changes_layout(request: &Request) -> bool {
         | Request::SetupDeps { .. }
         | Request::SetupModels { .. }
         | Request::SetupRun { .. }
+        | Request::SetupUndo { .. }
         | Request::RemoteStart {}
         | Request::RemoteStop { .. }
         | Request::RemoteSetup { .. }
@@ -3551,6 +3560,10 @@ mod tests {
         assert_eq!(Request::List.kind_name(), "List");
         assert_eq!(Request::SetupChanges.kind_name(), "SetupChanges");
         assert_eq!(Request::SetupRun { answers: None }.kind_name(), "SetupRun");
+        assert_eq!(
+            Request::SetupUndo { dry_run: None }.kind_name(),
+            "SetupUndo"
+        );
         assert_eq!(
             Request::SetupModels { agent: None }.kind_name(),
             "SetupModels"

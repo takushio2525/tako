@@ -559,7 +559,9 @@ fn undo_cli_link(t: &Targets, link: &Path, dry_run: bool) -> Outcome {
         Err(_) => Outcome::Absent,
         Ok(meta) if !meta.file_type().is_symlink() => Outcome::Kept(KeepReason::NotOurs),
         Ok(_) => {
-            if let Some(reason) = guard(t, link) {
+            // 番人は symlink の置き場（親）で見る。リンクそのものを渡すと指す先（tako の実体 = 一時 dir の
+            // 外）まで辿って「外へ書く」と取り違える。外すのはリンクだけで、指す先には触れない
+            if let Some(reason) = guard(t, link.parent().unwrap_or(link)) {
                 return Outcome::Kept(reason);
             }
             if dry_run {
@@ -793,6 +795,8 @@ pub enum UndoText {
     Label(Kind, Option<&'static str>),
     Keep(KeepReason),
     AbsentCount { count: usize },
+    /// 外せなかった項目の数（CLI の終了コード 1 の文）
+    FailedCount { count: usize },
     KeptData { path: String },
     /// tako 本体の消し方（OS ごと）
     Next,
@@ -902,6 +906,12 @@ impl UndoText {
             (Self::AbsentCount { count }, En) => {
                 format!("{count} place(s) had nothing to remove (unchanged)")
             }
+            (Self::FailedCount { count }, Ja) => {
+                format!("{count} か所を外せませんでした（上の [失敗] の行）。直してから tako setup undo をやり直してください")
+            }
+            (Self::FailedCount { count }, En) => format!(
+                "could not remove {count} item(s) (the [failed] lines above). Fix them and run tako setup undo again"
+            ),
             (Self::KeptData { path }, Ja) => {
                 format!("データ（設定・レイアウト・ログ・会話のカタログ）は残しています: {path}")
             }

@@ -481,3 +481,25 @@ fn issue2788_claudeの設定dirから引くclaude_jsonの置き場() {
         ]
     );
 }
+
+/// tako CLI の symlink が一時 dir の外（.app の実体）を指していても、外すのはリンクだけ。
+/// 番人はリンクの置き場で見る（指す先まで辿ると「外へ書く」と取り違えて残していた。macOS の実経路で発見）
+#[cfg(unix)]
+#[test]
+fn issue2788_外を指すtakoのリンクも置き場で判定して外す() {
+    let scratch = ScratchDir::new("issue2788-link-outside");
+    let bin = scratch.path().join("home/.local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let outside = PathBuf::from("/bin/sh");
+    assert!(outside.exists());
+    std::os::unix::fs::symlink(&outside, bin.join("tako")).unwrap();
+    let targets = Targets {
+        verification: true,
+        cli_link: Some(bin.join("tako")),
+        ..Targets::default()
+    };
+    let report = setup_undo::run(&targets, false);
+    assert_eq!(outcome_of(&report, Kind::CliLink, ".local/bin/tako"), &Outcome::Removed);
+    assert!(std::fs::symlink_metadata(bin.join("tako")).is_err());
+    assert!(outside.exists(), "指す先に触れた");
+}

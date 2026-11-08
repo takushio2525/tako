@@ -4359,6 +4359,16 @@ enum SetupCommand {
         #[arg(long)]
         json: bool,
     },
+    /// tako が外へ書いた連携（agent への MCP 登録・指示ファイルの同期ブロック・mod の skills・PATH）を
+    /// 外す。設定・レイアウト・ログなどのデータは残す。tako を消す前に 1 回（#2788）
+    Undo {
+        /// 外さずに「何を外すか」だけ出す
+        #[arg(long)]
+        dry_run: bool,
+        /// 出力を JSON にする（MCP tako_setup の undo と同一ペイロード）
+        #[arg(long)]
+        json: bool,
+    },
     /// 任意依存ツール（tmux / git / tailscale）の状態確認とその場導入（#88 / #1057）
     Deps {
         /// status（既定・読み取り専用）/ install
@@ -4680,6 +4690,9 @@ fn cli_main() -> ExitCode {
             tako_core::i18n::set_lang(tako_control::settings::peek_lang_setting().resolve());
             if let Some(SetupCommand::Models { ref agent, json }) = args.command {
                 setup::run_models(agent.as_deref(), json)
+            } else if let Some(SetupCommand::Undo { dry_run, json }) = args.command {
+                // #2788: data dir に触れない手元の処理（移行の段も通さない）。アンインストーラーも呼ぶ
+                setup::run_undo(dry_run, json)
             } else if let Some(SetupCommand::Bootstrap {
                 ref action,
                 ref agent,
