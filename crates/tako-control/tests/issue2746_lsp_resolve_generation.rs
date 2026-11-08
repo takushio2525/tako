@@ -58,6 +58,16 @@ impl Gate {
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    /// ゲートを外す（止めるサーバの解決も止めない）
+    fn disarm(&self) {
+        self.blocked.store(true, Ordering::SeqCst);
+    }
+
+    /// ゲートを掛け直す（止めるサーバの次の 1 回を止める）
+    fn arm(&self) {
+        self.blocked.store(false, Ordering::SeqCst);
+    }
 }
 
 /// 表の先頭から `n` 個（先頭は rust-analyzer）
@@ -260,21 +270,39 @@ fn restartの後に開いた文書のサーバは古い答えで未導入にな�
 }
 
 /// (d) 名指しの restart は名指したサーバの世代だけを進める = 別のサーバの解決の答えは捨てない
-/// （#1769 の「名指しならその 1 つだけ引き直す」を保つ。修正前後で同じ）
+/// （#1769 の「名指しならその 1 つだけ引き直す」を保つ。修正前後で同じ）。覚えた答え（1 回目の名指し）と
+/// 解決中の答え（2 回目の名指し）の両方で確かめる
+///
+/// 2 回目に名指すサーバの答えは、その restart の**前に覚えへ入れておき**、止めた解決の間は覚えから
+/// 答えさせる（#2766）。表の解決は並行なので、名指すサーバも止めた解決と同じ `servers()` で引かせると、
+/// その世代読みが restart の後になった回は新しい世代で正しく覚えへ入り（restart の後に始まった解決 =
+/// 新しい答え）、「引き直す」の見込みが解決スレッドの順番に依存していた
 #[test]
 fn 名指しのrestartは別のサーバの解決の答えを捨てない() {
     let blocked = servers::SERVERS[0].id;
     let named = servers::SERVERS[1].id;
     let (gate, entered, release) = Gate::new(blocked);
     let manager = LspManager::new(gated(Arc::clone(&gate), table(2)));
+    // 両方の答えを覚えへ入れ、止めるサーバを名指しで restart してからゲートを掛ける
+    gate.disarm();
+    manager.servers();
+    assert_eq!(gate.calls(), 2, "前置き: 両方を 1 回ずつ引いて覚える");
+    manager.restart(Some(blocked));
+    gate.arm();
     std::thread::scope(|s| {
+        // 引き直すのは名指した止めるサーバだけ（名指していないサーバは覚えから答え、解決スレッドを起こさない）
         let inflight = s.spawn(|| manager.servers());
-        entered
-            .recv_timeout(Duration::from_secs(10))
-            .expect("1 回目の解決が始まる");
+        entered.recv_timeout(Duration::from_secs(10)).expect(
+            "名指したサーバは引き直す（止めるサーバの解決が始まらない = restart の後も覚えから答えた）",
+        );
         manager.restart(Some(named));
         release.send(()).unwrap();
-        inflight.join().unwrap();
+        let during = inflight.join().unwrap();
+        assert_eq!(
+            row(&during, 1)["cached"],
+            json!(true),
+            "名指していないサーバの覚えた答えは捨てない（{blocked} を名指した restart の後）"
+        );
     });
     let calls_before = gate.calls();
     let after = manager.servers();
