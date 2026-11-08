@@ -458,8 +458,7 @@ impl io::Read for PipeStream {
         let handle = self.handle;
         let ptr = buf.as_mut_ptr();
         let len = u32::try_from(buf.len()).unwrap_or(u32::MAX);
-        // INJECT-2774: 上限を外す（修正前の同期読みと同じく答えない相手の前で戻らない）
-        match self.overlapped_io(None, |ov| unsafe {
+        match self.overlapped_io(self.read_timeout, |ov| unsafe {
             ReadFile(handle, ptr, len, std::ptr::null_mut(), ov)
         }) {
             // 相手が閉じた = EOF（std の `File` の読み取りと同じ解釈）
