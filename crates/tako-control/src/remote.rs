@@ -1351,12 +1351,14 @@ impl AppIpcClient {
         socket: &str,
         read_timeout: std::time::Duration,
     ) -> Result<(impl Read, impl Write), crate::Reason> {
-        let mut stream = crate::platform::named_pipe::connect_client_stream(socket, 3_000)
-            .map_err(|e| crate::Reason::AppCannotConnect {
+        // INJECT-2774: 修正前の形（同期の File・読み取りの上限なし）へ戻す。CI で名指しの失敗を見る
+        let _ = read_timeout;
+        let stream = crate::platform::named_pipe::connect_client(socket, 3_000).map_err(|e| {
+            crate::Reason::AppCannotConnect {
                 socket: socket.to_string(),
                 error: e.to_string(),
-            })?;
-        stream.set_read_timeout(Some(read_timeout)).ok();
+            }
+        })?;
         let read_half = stream
             .try_clone()
             .map_err(|e| crate::Reason::ConnectionCloneFailed(e.to_string()))?;
