@@ -37,6 +37,10 @@
 //! .NET の `Process.Path` / `GetModuleFileNameEx` も改名前の名前を返すので
 //! 「Get-Process で見えているパス」を根拠にしないこと。
 //!
+//! 名前だけ要る呼び手は [`image_name`] を使う（#2773）。`OpenProcess` で開けない
+//! プロセス（非昇格から見た LocalSystem のサービス）は在籍表の `szExeFile` へ落とす。
+//! 落とし先の判定は純関数 [`resolve_image_name`] で、macOS のテストでも走る。
+//!
 //! ## 依存クレートを足さない方針
 //!
 //! `windows-sys` は入れず必要な関数だけ宣言する（`platform::locale` の
@@ -143,6 +147,77 @@ pub fn current_uid() -> Option<u32> {
 /// 改名後のパスを返す（モジュールの解説を参照。#936 の stale 検知が依っている）
 pub fn image_path(pid: u32) -> Option<std::path::PathBuf> {
     imp::image_path(pid)
+}
+
+/// 実行ファイル名をどこから引いたか（#2773）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageNameSource {
+    /// 実行ファイルのパス（[`image_path`]。Windows は `OpenProcess` + `QueryFullProcessImageNameW`）
+    Image,
+    /// 在籍表の名前（[`snapshot_checked`]。Windows は `PROCESSENTRY32W::szExeFile`）。
+    /// `OpenProcess` で開けないプロセス（LocalSystem のサービスなど）の落とし先
+    Roster,
+}
+
+impl ImageNameSource {
+    /// 診断用の安定した語
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Roster => "roster",
+        }
+    }
+}
+
+/// 実行中プロセスの実行ファイル名（パス抜き）と、その引き元（#2773）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageName {
+    pub name: String,
+    pub source: ImageNameSource,
+}
+
+/// 実行中プロセスの実行ファイル名（パス抜き）。取れなければ `None`（#2773）。
+///
+/// まず [`image_path`] で引き、**引けなければ在籍表の名前へ落とす**。Windows の
+/// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` は非昇格のユーザーから LocalSystem の
+/// サービス（tailscaled）を開けない見込みが高く、パスだけに頼ると正規の tailscaled を
+/// 名乗れない。在籍表（Toolhelp）は権限に関係なく全プロセスの名前を返す。
+///
+/// 名前しか要らない呼び手（remote の接続元検証の名前ゲート）向け。パスが要る呼び手
+/// （#936 の stale 検知 = 改名を反映する「いまのファイル名」が要る）は [`image_path`] を使う。
+/// 在籍表の名前は起動時の名前で、改名を反映しないため。
+/// 在籍表を持たない OS（[`snapshot_supported`] が `false`）は [`image_path`] と同じ結果になる
+pub fn image_name(pid: u32) -> Option<ImageName> {
+    resolve_image_name(pid, image_path(pid), snapshot_checked)
+}
+
+/// [`image_name`] の判定（純関数。OS に依らない。#2773）。
+///
+/// `opened` は [`image_path`] の結果（`None` = `OpenProcess` で開けなかった）。
+/// 引けていればそれが正で、在籍表は**引けなかったときだけ**取る（取るのは重いので
+/// `roster` は遅延で呼ぶ）。在籍表でも引けなければ `None`（呼び手は拒否側へ倒す）
+pub fn resolve_image_name(
+    pid: u32,
+    opened: Option<std::path::PathBuf>,
+    roster: impl FnOnce() -> Option<Vec<ProcEntry>>,
+) -> Option<ImageName> {
+    if let Some(path) = opened {
+        return Some(ImageName {
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            source: ImageNameSource::Image,
+        });
+    }
+    let table = roster()?;
+    let entry = table.iter().find(|e| e.pid == pid)?;
+    let raw = entry.name.trim();
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or(raw).trim();
+    (!name.is_empty()).then(|| ImageName {
+        name: name.to_string(),
+        source: ImageNameSource::Roster,
+    })
 }
 
 /// プロセスの祖先の 1 段（#2533）
@@ -1465,6 +1540,103 @@ mod tests {
         assert_eq!(super::loopback_tcp_peer(9, 9), None);
         // 特権ポート同士の接続は（非 root では）張れないので必ず見つからない
         assert_eq!(super::loopback_tcp_peer(1, 2), None);
+    }
+
+    fn entry(pid: u32, name: &str) -> super::ProcEntry {
+        super::ProcEntry {
+            pid,
+            ppid: 4,
+            name: name.to_string(),
+        }
+    }
+
+    /// #2773: パスで引けたらそれが正で、在籍表は取らない（従来の経路を変えない）
+    #[test]
+    fn 名前はパスで引けたら在籍表を見ない() {
+        let got = super::resolve_image_name(
+            42,
+            Some(std::path::PathBuf::from("/opt/x/bin/tailscaled")),
+            || panic!("パスで引けたのに在籍表を取った"),
+        );
+        assert_eq!(
+            got,
+            Some(super::ImageName {
+                name: "tailscaled".to_string(),
+                source: super::ImageNameSource::Image,
+            })
+        );
+    }
+
+    /// #2773: `OpenProcess` で開けない（`opened = None`）ときは在籍表の名前へ落とし、
+    /// 在籍表でも引けなければ `None`（呼び手は拒否側へ倒す）
+    #[test]
+    fn 開けないプロセスの名前は在籍表へ落とす() {
+        use super::{resolve_image_name, ImageName, ImageNameSource};
+        let roster = || Some(vec![entry(7, "svchost.exe"), entry(42, "tailscaled.exe")]);
+        assert_eq!(
+            resolve_image_name(42, None, roster),
+            Some(ImageName {
+                name: "tailscaled.exe".to_string(),
+                source: ImageNameSource::Roster,
+            }),
+            "同じ pid の行の名前を使う"
+        );
+        // 在籍表が取れない（Toolhelp の失敗 / 在籍表を持たない OS）
+        assert_eq!(resolve_image_name(42, None, || None), None);
+        // pid が載っていない（引いた直後に居なくなった）。別の pid の名前を借りない
+        assert_eq!(
+            resolve_image_name(43, None, || Some(vec![entry(42, "tailscaled.exe")])),
+            None
+        );
+        // 名前が空の行は名前として使わない
+        assert_eq!(
+            resolve_image_name(42, None, || Some(vec![entry(42, " ")])),
+            None
+        );
+        // パスが混ざっていてもファイル名だけにする（`ImageName::name` はパス抜き）
+        assert_eq!(
+            resolve_image_name(42, None, || Some(vec![entry(
+                42,
+                "C:\\Program Files\\Tailscale\\tailscaled.exe"
+            )]))
+            .map(|n| n.name),
+            Some("tailscaled.exe".to_string())
+        );
+    }
+
+    /// #2773: 本物の在籍表で落とし先が当たるか。Windows は Toolhelp の `szExeFile` から
+    /// 自分の名前を引ける。在籍表を持たない OS は `None`（落とし先が無い = 従来どおり）
+    #[test]
+    fn 開けないプロセスの落とし先は本物の在籍表を引く() {
+        let me = std::process::id();
+        let got = super::resolve_image_name(me, None, super::snapshot_checked);
+        if super::snapshot_supported() {
+            let own = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .expect("自分の実行ファイル名");
+            let got = got.expect("在籍表から自分の名前を引けるはず");
+            assert_eq!(got.source, super::ImageNameSource::Roster);
+            assert!(
+                got.name.eq_ignore_ascii_case(&own),
+                "在籍表の名前が自分の実行ファイル名と違う: {got:?} / {own}"
+            );
+        } else {
+            assert_eq!(got, None);
+        }
+    }
+
+    /// #2773: 自分のプロセスはパスで引ける（従来の経路。落とし先を通らない）
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn 自分の名前はパスから引く() {
+        let own = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .expect("自分の実行ファイル名");
+        let got = super::image_name(std::process::id()).expect("自分の名前は引けるはず");
+        assert_eq!(got.source, super::ImageNameSource::Image);
+        assert!(got.name.eq_ignore_ascii_case(&own), "{got:?} / {own}");
     }
 
     /// #1282: コマンドライン / 起動時刻の FFI が**実際に読めるか**。

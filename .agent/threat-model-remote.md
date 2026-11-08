@@ -442,6 +442,13 @@ tailnet 越しに読み出せる（`~/.ssh/id_*` や `.env` を含む）。#1079
   `GetExtendedTcpTable` で接続元 pid と実行ファイル名までは引けるが、その pid の
   トークン SID を読むには別の権限が要るため、**名前のゲートだけ**が残る。
   実行ファイルを `tailscaled.exe` と名付けた別ユーザーのプロセスは通ってしまう。
+  名前は `procinfo::image_name` で引き、`OpenProcess` で開けない接続元は在籍表の
+  `szExeFile` へ落とす（#2773）。**#2773 より前は開けない接続元を `image_unknown` で
+  断っていた**ので、非昇格から開けない別ユーザーのプロセスは偶然そこで落ちていたが、
+  同じ理由で正規の tailscaled（LocalSystem のサービス）も落ち、スマホの全リクエストが
+  403 になる恐れがあった。名前のゲートは名前しか見ないので、落とし先で強さは変わらない
+  （別ユーザーを排除する段は所有者ゲートで、その方針は #1438 で見直す）。
+  在籍表の名前で通した daemon は `peer_verification.name_from_roster_at` と persist.log に 1 回残す。
   `tako remote status` の `peer_verification.owner_check` が `unavailable` と名乗るので、
   効いていないことは実行時に読める。塞ぐには pid → トークン SID の引き当てが要り、
   Windows 実機での検証が前提になる（Windows 全体は #467 配下）。
