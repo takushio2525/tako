@@ -17,12 +17,6 @@ use super::*;
 
 const SECTION: &str = "setup-deps-2433";
 
-async fn sleep(cx: &mut AsyncApp, ms: u64) {
-    cx.background_executor()
-        .timer(Duration::from_millis(ms))
-        .await;
-}
-
 fn dump(image: &image::RgbaImage, name: &str) {
     if let Ok(dir) = std::env::var("TAKO_VISUAL_DUMP_DIR") {
         let dir = std::path::Path::new(&dir);
@@ -80,14 +74,16 @@ fn windows_dep(bin: &str, found: Option<&str>, privilege: &str, pkg: &str) -> se
 
 const LINKS_PSMUX: &str = "C:\\Users\\winuser\\AppData\\Local\\Microsoft\\WinGet\\Links\\psmux.exe";
 
-/// 一覧を書いて、タブを切り替えて読み直させ、ボタンが描かれるまで撮り直す
+/// 一覧を書いて、タブを切り替えて読み直させ（一覧の差し替えは読み直しの中で同期に効く）、描き終わって
+/// 静止した絵とボタンの実矩形を返す
 async fn show(
+    window: WindowHandle<TakoApp>,
     settings: WindowHandle<crate::settings_window::SettingsWindow>,
     cx: &mut AsyncApp,
     fixture: &std::path::Path,
     deps: serde_json::Value,
-    expect_psmux_button: bool,
 ) -> (
+    image::RgbaImage,
     Option<crate::form_layout::Rect>,
     Option<crate::form_layout::Rect>,
 ) {
@@ -101,19 +97,27 @@ async fn show(
         cx.notify();
     });
     let settings_any: AnyWindowHandle = settings.into();
-    let mut rects = (None, None);
-    for _ in 0..40 {
-        let _ = capture_frame(settings_any, cx);
-        rects = (
-            button_rect(settings, cx, "git"),
-            button_rect(settings, cx, "psmux"),
-        );
-        if rects.0.is_some() && rects.1.is_some() == expect_psmux_button {
-            break;
-        }
-        sleep(cx, 100).await;
-    }
-    rects
+    let frame = match wait_for_quiet_frame(
+        settings_any,
+        window,
+        cx,
+        SECTION,
+        text_wait_budget(40, 100, 15),
+        |_, _| true,
+    )
+    .await
+    {
+        QuietFrame::Quiet(frame, _) => frame,
+        QuietFrame::Moving => capture_frame(settings_any, cx)
+            .map(|(frame, _)| frame)
+            .unwrap_or_else(|| fail(&format!("visual-test {SECTION}: 設定画面を撮れない"))),
+        QuietFrame::NoCapture => fail(&format!("visual-test {SECTION}: 設定画面を撮れない")),
+    };
+    (
+        frame,
+        button_rect(settings, cx, "git"),
+        button_rect(settings, cx, "psmux"),
+    )
 }
 
 pub(super) async fn setup_deps_visual(
@@ -128,24 +132,33 @@ pub(super) async fn setup_deps_visual(
             "visual-test {SECTION}: TAKO_2433_DEPS_FIXTURE が無い（一覧を書く置き場を渡して起こす）"
         ));
     };
+    // 開いた時点の読み込みから差し替えが効くよう、窓を開く前に一覧を書く
+    let both = serde_json::json!([
+        windows_dep("psmux", None, "user", "marlocarlo.psmux"),
+        windows_dep("git", None, "elevated", "Git.Git"),
+    ]);
+    if std::fs::write(&fixture, both.to_string()).is_err() {
+        fail(&format!("visual-test {SECTION}: 一覧を書けない"));
+    }
     let _ = window.update(cx, |app, _, cx| {
         app.open_settings_window_impl(Some(SettingsTab::Setup), cx);
     });
-    let mut settings = None;
-    for _ in 0..40 {
-        settings = window
-            .update(cx, |app, _, _| app.settings_window_handle)
-            .ok()
-            .flatten();
-        if settings.is_some() {
-            break;
-        }
-        sleep(cx, 100).await;
-    }
-    let Some(settings) = settings else {
+    // 窓は defer で開く = 状態（ハンドルが立つ）で待つ
+    wait_for_app_state(
+        window,
+        cx,
+        "setup-deps-2433: 設定ウィンドウ",
+        state_wait_budget(Duration::from_secs(4), machine_busy()),
+        |app| app.settings_window_handle.is_some(),
+    )
+    .await;
+    let Some(settings) = window
+        .update(cx, |app, _, _| app.settings_window_handle)
+        .ok()
+        .flatten()
+    else {
         fail(&format!("visual-test {SECTION}: 設定ウィンドウが開かない"));
     };
-    let settings_any: AnyWindowHandle = settings.into();
     let _ = settings.update(cx, |_, window, cx| {
         window.resize(size(px(760.), px(720.)));
         cx.notify();
@@ -153,15 +166,8 @@ pub(super) async fn setup_deps_visual(
     let width = |r: crate::form_layout::Rect| r.x1 - r.x0;
 
     // ① psmux（利用者の権限）と Git（UAC）が未導入 = ボタン 2 つ。Git は「導入（管理者の確認あり）」
-    let both = serde_json::json!([
-        windows_dep("psmux", None, "user", "marlocarlo.psmux"),
-        windows_dep("git", None, "elevated", "Git.Git"),
-    ]);
-    let (git, psmux) = show(settings, cx, &fixture, both, true).await;
-    match capture_frame(settings_any, cx) {
-        Some((frame, _)) => dump(&frame, "setup-deps-2433-both.png"),
-        None => fail(&format!("visual-test {SECTION} ①: 設定画面を撮れない")),
-    }
+    let (frame, git, psmux) = show(window, settings, cx, &fixture, both).await;
+    dump(&frame, "setup-deps-2433-both.png");
     let (Some(git), Some(psmux)) = (git, psmux) else {
         fail(&format!(
             "visual-test {SECTION} ①: 入れられる依存のボタンが描かれていない（git={git:?} psmux={psmux:?}）"
@@ -182,11 +188,8 @@ pub(super) async fn setup_deps_visual(
         windows_dep("psmux", Some(LINKS_PSMUX), "user", "marlocarlo.psmux"),
         windows_dep("git", None, "elevated", "Git.Git"),
     ]);
-    let (git2, psmux2) = show(settings, cx, &fixture, after, false).await;
-    match capture_frame(settings_any, cx) {
-        Some((frame, _)) => dump(&frame, "setup-deps-2433-psmux-installed.png"),
-        None => fail(&format!("visual-test {SECTION} ②: 設定画面を撮れない")),
-    }
+    let (frame, git2, psmux2) = show(window, settings, cx, &fixture, after).await;
+    dump(&frame, "setup-deps-2433-psmux-installed.png");
     check(
         git2.is_some() && psmux2.is_none(),
         &format!(

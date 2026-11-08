@@ -246,6 +246,9 @@ pub struct SettingsWindow {
     remote_status_pending: bool,
     /// 依存ツールを background で導入している間の名前（#2433。押し直しを無視し、ボタンを「導入中…」にする）
     deps_busy: Option<String>,
+    /// 依存の一覧の読み直しの番号（#2433）。background の答えは最後に頼んだものだけを映す
+    /// （先に頼んだ古い答えが後から着いて上書きしない。リモートタブの #2630 と同じ形）
+    deps_seq: u64,
     status: StatusCache,
     /// Code Runner 新規追加行の確定前バッファ
     runner_new_ext: String,
@@ -299,6 +302,7 @@ impl SettingsWindow {
             remote_status_seq: 0,
             remote_status_pending: false,
             deps_busy: None,
+            deps_seq: 0,
             status: StatusCache::default(),
             runner_new_ext: String::new(),
             runner_new_cmd: String::new(),
@@ -641,6 +645,8 @@ impl SettingsWindow {
     /// 任意の依存ツールの一覧を読み直す（#2433。`tako setup deps` / MCP `tako_setup_deps` と同じ dispatch。
     /// 検出は unix でログインシェルを起こすので background で読む）
     fn refresh_deps(&mut self, cx: &mut Context<Self>) {
+        self.deps_seq += 1;
+        let seq = self.deps_seq;
         // 検証のプロセスだけ: 一覧を JSON のファイルで差し替える（macOS の上で Windows の腕の行を描く。#2433）
         if let Some(fixture) = deps_fixture() {
             self.status.deps = Some(fixture);
@@ -652,8 +658,10 @@ impl SettingsWindow {
             dry_run: None,
             consent: None,
         };
-        self.dispatch_off_ui(request, cx, |this, result, _cx| {
-            this.status.deps = result.ok().map(|v| v["deps"].clone());
+        self.dispatch_off_ui(request, cx, move |this, result, _cx| {
+            if this.deps_seq == seq {
+                this.status.deps = result.ok().map(|v| v["deps"].clone());
+            }
         });
     }
 
@@ -676,9 +684,6 @@ impl SettingsWindow {
             this.deps_busy = None;
             this.message = Some(match result {
                 Ok(value) => {
-                    if let Some(deps) = value.get("deps") {
-                        this.status.deps = Some(deps.clone());
-                    }
                     // 入れずに終わった（導入済み・手段が無い）なら理由をそのまま出す
                     match value["skipped"].as_array().and_then(|a| a.first()) {
                         Some(skip) => (
