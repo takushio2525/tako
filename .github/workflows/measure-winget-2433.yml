@@ -12,7 +12,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
-          function Code($c) { '{0} (0x{1:X8})' -f $c, ([uint32]([int64]$c -band 0xFFFFFFFF)) }
+          function Code($c) { if ($null -eq $c) { return 'null' }; '{0} (0x{0:X8})' -f [int]$c }
           Write-Output '== 権限と UAC'
           whoami
           $p = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
