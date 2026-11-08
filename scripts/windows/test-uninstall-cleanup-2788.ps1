@@ -262,6 +262,9 @@ try {
         Write-Host "   $($item.outcome) $($item.kind) $($item.path)$why"
     }
     Write-Host "   summary: $($plan.summary | ConvertTo-Json -Compress)"
+    foreach ($item in @($plan.items | Where-Object { $_.kind -eq 'mcp' })) { Write-Host "   mcp の項目: $($item | ConvertTo-Json -Compress)" }
+    Write-Host "   env: CODEX_HOME=[$env:CODEX_HOME] HOME=[$env:HOME] USERPROFILE=[$env:USERPROFILE]"
+    Write-Host "   codex の config.toml: $CodexToml（在る: $(Test-Path -LiteralPath $CodexToml)）"
     $codexBytes = [System.IO.File]::ReadAllBytes($CodexToml)
     Write-Host "   codex の config.toml の先頭: $(($codexBytes | Select-Object -First 8 | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')・CR を含む: $($codexBytes -contains 13)"
     Assert-That (@($plan.items | Where-Object { $_.kind -eq 'mcp' -and $_.agent -eq 'codex' -and $_.outcome -eq 'would_remove' }).Count -eq 1) `
