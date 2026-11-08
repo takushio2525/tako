@@ -37,21 +37,36 @@ use tako_control::setup::SYSTEM_PROMPT;
 const CONFIG_DEFAULT: &str = include_str!("../../../resources/setup/templates/config-default.yaml");
 
 pub fn load_answers(input: Option<&str>) -> Result<SetupAnswers, String> {
+    load_answers_from(input, &mut std::io::stdin())
+}
+
+/// [`load_answers`] の本体（標準入力を引数で受ける = 単体テストが stdin の経路を通せる）。
+///
+/// 読み元は**バイト列のまま**読み、符号化の判定と復号は `SetupAnswers::from_bytes` の 1 実装に任せる
+/// （#2789）。`read_to_string` で読むと、Windows PowerShell 5.1 の `Out-File` の既定（BOM 付きの UTF-16LE）は
+/// 読み取りの段で「UTF-8 でない」と断られ、`-Encoding utf8`（BOM 付きの UTF-8）は BOM が残って
+/// JSON の解析が 1 文字目で落ちていた
+fn load_answers_from(
+    input: Option<&str>,
+    stdin: &mut dyn std::io::Read,
+) -> Result<SetupAnswers, String> {
+    use tako_control::setup::AnswersSource;
     let Some(input) = input else {
         return Ok(SetupAnswers::default());
     };
-    let json = if input == "-" {
-        let mut json = String::new();
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut json)
+    if input == "-" {
+        let mut bytes = Vec::new();
+        stdin
+            .read_to_end(&mut bytes)
             .map_err(|e| format!("setup answers の標準入力読み取りに失敗: {e}"))?;
-        json
+        SetupAnswers::from_bytes(&bytes, &AnswersSource::Stdin)
     } else if let Some(path) = input.strip_prefix('@') {
-        std::fs::read_to_string(path)
-            .map_err(|e| format!("setup answers ファイルの読み取りに失敗 ({path}): {e}"))?
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("setup answers ファイルの読み取りに失敗 ({path}): {e}"))?;
+        SetupAnswers::from_bytes(&bytes, &AnswersSource::File(path.to_string()))
     } else {
-        input.to_string()
-    };
-    SetupAnswers::from_json(&json)
+        SetupAnswers::from_bytes(input.as_bytes(), &AnswersSource::Arg)
+    }
 }
 
 // --- パスユーティリティ ---
@@ -4164,6 +4179,56 @@ mod tests {
         // モデル設定キーはテンプレに含まれない（profiles/*.yaml が正。Issue #27）
         assert!(!CONFIG_DEFAULT.contains("master_model"));
         assert!(!CONFIG_DEFAULT.contains("worker_model"));
+    }
+
+    /// **#2789 の受け入れ条件 1**: `--answers @<file>` と `--answers -` が、UTF-8（BOM 無し / 有り）・
+    /// BOM 付きの UTF-16LE / BE を同じ答えとして読む（CLI の読み取りの段から通す）。
+    /// 修正前は `read_to_string` が UTF-16 を読み取りの段で断り、UTF-8 の BOM は JSON の解析で落ちた
+    #[test]
+    fn issue2789_answersのファイルと標準入力は4つの符号化で同じ答えになる() {
+        let text = "{\r\n  \"selected_agent\": \"claude\",\r\n  \
+                    \"provider_plans\": { \"claude\": \"max\" },\r\n  \
+                    \"instruction_content\": \"# 日本語のルール 🎉\",\r\n  \
+                    \"install\": false,\r\n  \"launch_agent\": \"none\"\r\n}\r\n";
+        let want = serde_json::to_value(SetupAnswers::from_json(text).unwrap()).unwrap();
+        let utf16 = |bom: [u8; 2], unit: fn(u16) -> [u8; 2]| {
+            let mut out = bom.to_vec();
+            out.extend(text.encode_utf16().flat_map(unit));
+            out
+        };
+        let mut utf8_bom = vec![0xef, 0xbb, 0xbf];
+        utf8_bom.extend(text.as_bytes());
+        let tmp = tako_core::test_residue::ScratchDir::new("setup-answers-2789");
+        for (name, bytes) in [
+            ("utf8", text.as_bytes().to_vec()),
+            ("utf8-bom", utf8_bom),
+            ("utf16le", utf16([0xff, 0xfe], u16::to_le_bytes)),
+            ("utf16be", utf16([0xfe, 0xff], u16::to_be_bytes)),
+        ] {
+            let file = tmp.join(format!("{name}.json"));
+            std::fs::write(&file, &bytes).unwrap();
+            let arg = format!("@{}", file.display());
+            let mut no_stdin = std::io::empty();
+            let from_file = load_answers_from(Some(&arg), &mut no_stdin)
+                .unwrap_or_else(|e| panic!("--answers @{name}.json を読めない: {e}"));
+            let mut stdin = std::io::Cursor::new(bytes);
+            let from_stdin = load_answers_from(Some("-"), &mut stdin)
+                .unwrap_or_else(|e| panic!("--answers -（{name}）を読めない: {e}"));
+            assert_eq!(
+                serde_json::to_value(from_file).unwrap(),
+                want,
+                "@{name}.json"
+            );
+            assert_eq!(
+                serde_json::to_value(from_stdin).unwrap(),
+                want,
+                "- の {name}"
+            );
+        }
+        // 引数の JSON も同じ口を通る（先頭の BOM 文字は剥がす）
+        let mut no_stdin = std::io::empty();
+        let inline = load_answers_from(Some(&format!("\u{feff}{text}")), &mut no_stdin).unwrap();
+        assert_eq!(serde_json::to_value(inline).unwrap(), want, "引数");
     }
 
     #[test]

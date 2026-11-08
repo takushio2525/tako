@@ -205,7 +205,7 @@ tako setup --reset
 
 `tako setup --check` が出す診断の項目は `tako check-health` と**同じ 1 つの実装**から出ています。人が読むなら `tako setup --check`、AI や監視から読むなら `tako check-health --json`（`diagnostics.items[].key` が安定した項目名、`diagnostics.remaining` が人の操作が要るぶん）で、どちらも同じ状態には同じ答えを返します。
 
-`--answers` は `selected_agent`、`provider_plans`、`instruction_content`、`profile`、`projects`、`orchestrator`、`sleep_guard` を受け取ります。同じ JSON は MCP `tako_setup` でも使えるため、AI に日本語で希望を伝えてセットアップを代行させられます。`projects` は指定時に全登録を置き換えます。
+`--answers` は `selected_agent`、`provider_plans`、`instruction_content`、`profile`、`projects`、`orchestrator`、`sleep_guard` を受け取ります。同じ JSON は MCP `tako_setup` でも使えるため、AI に日本語で希望を伝えてセットアップを代行させられます。`projects` は指定時に全登録を置き換えます。答えのファイルと標準入力は UTF-8（BOM の有無を問わない）と BOM 付きの UTF-16 を読めるので、Windows PowerShell の `Out-File` で書いたファイルもそのまま渡せます。
 
 ### tako setup undo
 

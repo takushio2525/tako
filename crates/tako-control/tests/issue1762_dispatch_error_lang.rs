@@ -11907,10 +11907,12 @@ fn setup_refusal_index(r: &SetupRefusal) -> usize {
         S::PathBlock(_) => 54,
         S::CliLink(_) => 55,
         S::UserPath(_) => 56,
+        S::AnswersUnreadable { .. } => 57,
+        S::AnswersEmpty(_) => 58,
     }
 }
 
-const SETUP_REFUSAL_VARIANTS: usize = 57;
+const SETUP_REFUSAL_VARIANTS: usize = 59;
 
 /// tako-core の 3 型（bootstrap の path / undo-path の中身）の通し番号
 fn path_block_index(e: &PathBlockError) -> usize {
@@ -12360,6 +12362,21 @@ fn setup_refusal_table() -> Vec<(SetupRefusal, String)> {
         (
             S::UserPath(UserPathError::Unsupported),
             "このプラットフォームにはプロセス外に永続する PATH がありません（profile 経路を使ってください）"
+                .into(),
+        ),
+        // #2789 で足した断り（#2365 より前の文は無いので、足した時点の日本語を固定する）
+        (
+            S::AnswersUnreadable {
+                source: tako_control::setup::AnswersSource::File("/h/answers.json".into()),
+                reason: tako_core::text::TextDecodeError::Utf16WithoutBom { big_endian: false },
+            },
+            "setup answers（ファイル /h/answers.json）を読めません: BOM の無い UTF-16LE に見えます\
+             （NUL のバイトを含みます）。UTF-8 で保存し直してください（PowerShell なら `Out-File -Encoding utf8`）"
+                .into(),
+        ),
+        (
+            S::AnswersEmpty(tako_control::setup::AnswersSource::Stdin),
+            "setup answers（標準入力）が空です。JSON のオブジェクトを渡してください（既定のままなら `{}`）"
                 .into(),
         ),
     ]
