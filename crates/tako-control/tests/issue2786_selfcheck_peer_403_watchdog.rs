@@ -150,7 +150,7 @@ fn scan_classify(src: &str, out: &mut Vec<String>) {
         || find(&w, "ServeReachability::PeerRejected(").is_none()
     {
         out.push(format!(
-            "{REMOTE}:{at} — `classify_self_check_reply` が 403 の本文を `remote_self_check::peer_reject_of_body(` で \
+            "{REMOTE}:{at} — `classify_self_check_reply` が 403 の本文を `remote_self_check::peer_reject_of_body(` で\
              読んで `PeerRejected` を返していない"
         ));
     }
