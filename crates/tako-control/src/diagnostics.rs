@@ -1355,19 +1355,11 @@ fn instruction_path(agent: AgentKind) -> Option<std::path::PathBuf> {
     let home = tako_core::paths::home_dir().filter(|p| p.is_absolute())?;
     Some(match agent {
         AgentKind::Claude => home.join(".claude/CLAUDE.md"),
-        AgentKind::Codex => codex_home_dir()?.join("AGENTS.md"),
+        // 空・空白だけの `CODEX_HOME` は未設定と同じ = `~/.codex`（#2798。解決の正本は codex_session。
+        // ここに来た時点でホームは絶対パスなので、既定へ倒したときも相対には組まない）
+        AgentKind::Codex => crate::codex_session::codex_home()?.join("AGENTS.md"),
         AgentKind::Agy => home.join(".gemini/GEMINI.md"),
     })
-}
-
-fn codex_home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("CODEX_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            tako_core::paths::home_dir()
-                .filter(|p| p.is_absolute())
-                .map(|home| home.join(".codex"))
-        })
 }
 
 // --- エージェント共通ルール同期（#136） --------------------------------------
@@ -1685,6 +1677,27 @@ fn ipc_item(lang: Lang) -> Item {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2798: codex の指示ファイルの項目は、空・空白だけの `CODEX_HOME` でも `~/.codex/AGENTS.md` を見る
+    /// （前は空のパスへ join して作業 dir の `AGENTS.md` を見ていた）。空でない値は手を加えない
+    #[test]
+    fn issue2798_空のcodex_homeでも既定の置き場の指示ファイルを見る() {
+        if tako_core::run_alone!(issue2798_空のcodex_homeでも既定の置き場の指示ファイルを見る)
+        {
+            return;
+        }
+        let scratch = tako_core::test_residue::ScratchDir::new("diag-codex-home-2798");
+        let home = scratch.path().join("home");
+        let _home = crate::test_home::HomeGuard::set(&home);
+        for (label, value, dir) in crate::test_home::codex_home_cases(&home, scratch.path()) {
+            crate::test_home::set_codex_home(value.as_deref());
+            assert_eq!(
+                instruction_path(AgentKind::Codex),
+                Some(dir.join("AGENTS.md")),
+                "{label}"
+            );
+        }
+    }
 
     /// #2431: WebView2 の版の項目。macOS は出さない・入っていなければ不足・古ければ警告で、
     /// どちらも次の一手の行を持つ

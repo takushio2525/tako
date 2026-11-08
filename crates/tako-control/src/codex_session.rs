@@ -57,16 +57,42 @@ use serde_json::Value;
 /// ターンの開始・完了は末尾に来るので全文を読む必要が無い（発話本文は別途 tail する）
 const STATE_TAIL_BYTES: u64 = 256 * 1024;
 
+/// codex の設定の置き場を指す環境変数の名前
+pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
+
 /// `CODEX_HOME`（既定 `~/.codex`）。
-/// **環境変数を先に見る**のは codex 自身がそうしているため（`--help` の記述）
+/// **環境変数を先に見る**のは codex 自身がそうしているため（`--help` の記述）。
+///
+/// **`CODEX_HOME` の解決の正本はここ 1 本**（#2798）。前は診断・setup・認証の読み取り・MCP の
+/// 片付けがそれぞれ素の `var_os("CODEX_HOME")` を読み、空の値を置き場として join していた
+/// （= 作業 dir の `config.toml` / `AGENTS.md` / `auth.json` を見る。#2788 で 1 か所だけ直した）。
+/// 素の読み出しを外で書く形は番犬 `issue2798_codex_home_resolution_watchdog` が名指す
 pub fn codex_home() -> Option<PathBuf> {
-    if let Some(v) = std::env::var_os("CODEX_HOME") {
-        let p = PathBuf::from(v);
-        if !p.as_os_str().is_empty() {
-            return Some(p);
-        }
-    }
-    tako_core::paths::home_dir().map(|h| h.join(".codex"))
+    codex_home_from(
+        std::env::var_os(CODEX_HOME_ENV),
+        tako_core::paths::home_dir(),
+    )
+}
+
+/// [`codex_home`] の規則（env に触らない純粋関数）。値が置き場を指さなければ `<home>/.codex`
+pub fn codex_home_from(
+    codex_home: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    codex_home
+        .as_deref()
+        .and_then(codex_home_value)
+        .or_else(|| home.map(|h| h.join(".codex")))
+}
+
+/// `CODEX_HOME` の値を置き場として読む。**空・空白だけは未設定と同じ**（`None`）。
+///
+/// codex の導入スクリプトも `${CODEX_HOME:-$HOME/.codex}`（Windows は「空なら `%USERPROFILE%\.codex`」）で
+/// 空を既定へ倒す。Windows では PowerShell が `$null` を空文字列で渡し、env を外したつもりの
+/// 空の `CODEX_HOME` が立つ（#2788 で CI が実際に踏んだ）。それ以外（相対パス・前後に空白のある値）は
+/// 手を加えずそのまま使う（codex 自身と同じ読み方）
+pub fn codex_home_value(value: &std::ffi::OsStr) -> Option<PathBuf> {
+    (!value.to_string_lossy().trim().is_empty()).then(|| PathBuf::from(value))
 }
 
 /// codex のターン状態（claude の `agents --json` に相当するもの）
@@ -888,5 +914,69 @@ mod pane_lookup_tests {
         );
         assert_eq!(pane_pid_of(&panes, "tako-missing"), None);
         assert!(!session_has_pane(&panes, "tako-missing"));
+    }
+}
+
+/// `CODEX_HOME` の解決の正本（#2798）
+#[cfg(test)]
+mod codex_home_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    /// 空・空白だけは未設定と同じ = `<home>/.codex`。空でない値は相対パスも前後の空白も手を加えない
+    #[test]
+    fn issue2798_空と空白だけは未設定と同じで空でない値はそのまま() {
+        let home = Some(PathBuf::from("/h"));
+        let default = Some(PathBuf::from("/h/.codex"));
+        for blank in ["", " ", " \t ", "\n", "\u{3000}"] {
+            assert_eq!(
+                codex_home_from(Some(OsString::from(blank)), home.clone()),
+                default,
+                "{blank:?} は未設定と同じ"
+            );
+            assert_eq!(codex_home_value(OsString::from(blank).as_os_str()), None);
+        }
+        assert_eq!(codex_home_from(None, home.clone()), default);
+        for kept in ["/c", "rel/codex", " /c ", "."] {
+            assert_eq!(
+                codex_home_from(Some(OsString::from(kept)), home.clone()),
+                Some(PathBuf::from(kept)),
+                "{kept:?} は値のまま"
+            );
+        }
+        // ホームも決められなければ決めない（相対の `.codex` を組まない）
+        assert_eq!(codex_home_from(Some("".into()), None), None);
+        assert_eq!(codex_home_from(None, None), None);
+        assert_eq!(
+            codex_home_from(Some("/c".into()), None),
+            Some(PathBuf::from("/c"))
+        );
+    }
+
+    /// UTF-8 でない値は空白だけになりえない（置き場として値のまま使う）
+    #[cfg(unix)]
+    #[test]
+    fn issue2798_utf8でない値は値のまま() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(vec![b' ', 0xff, b' ']);
+        assert_eq!(
+            codex_home_from(Some(raw.clone()), Some(PathBuf::from("/h"))),
+            Some(PathBuf::from(raw))
+        );
+    }
+
+    /// 実際の env を読む入口も同じ規則（env を書き換えるのでこの 1 本だけの子で走らせる。#2400）
+    #[test]
+    fn issue2798_codex_homeは空のenvで既定の置き場を返す() {
+        if tako_core::run_alone!(issue2798_codex_homeは空のenvで既定の置き場を返す) {
+            return;
+        }
+        let scratch = tako_core::test_residue::ScratchDir::new("codex-home-2798");
+        let home = scratch.path().join("home");
+        let _home = crate::test_home::HomeGuard::set(&home);
+        for (label, value, dir) in crate::test_home::codex_home_cases(&home, scratch.path()) {
+            crate::test_home::set_codex_home(value.as_deref());
+            assert_eq!(codex_home(), Some(dir), "{label}");
+        }
     }
 }

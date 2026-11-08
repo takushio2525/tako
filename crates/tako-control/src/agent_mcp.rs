@@ -296,28 +296,15 @@ pub fn list_args(agent: WorkerAgent) -> Vec<String> {
 pub fn config_path(agent: WorkerAgent) -> Option<PathBuf> {
     let home = tako_core::paths::home_dir;
     match agent {
-        WorkerAgent::Codex => codex_config_path_from(std::env::var_os("CODEX_HOME"), home()),
+        // 空・空白だけの `CODEX_HOME` は未設定と同じ（#2788）。空のまま join すると相対パスの
+        // `config.toml`（= 作業 dir）を見て、登録が在っても「無い」と読んでいた。解決の正本は
+        // codex_session の 1 本（#2798）
+        WorkerAgent::Codex => crate::codex_session::codex_home().map(|dir| dir.join("config.toml")),
         WorkerAgent::Agy => {
             home().map(|h| h.join(".gemini").join("config").join("mcp_config.json"))
         }
         WorkerAgent::Claude => home().map(|h| h.join(".claude.json")),
     }
-}
-
-/// codex の `config.toml` の置き場（[`config_path`] の規則。env に触らない純粋関数）。
-///
-/// **空の `CODEX_HOME` は未設定と同じ**（#2788）。空のまま join すると相対パスの `config.toml`
-/// （= 作業 dir）を見て、登録が在っても「無い」と読んでいた（Windows の CI で、PowerShell が
-/// `$null` を空文字列で渡して env を「外した」つもりの空の `CODEX_HOME` が立って実際に踏んだ）
-pub fn codex_config_path_from(
-    codex_home: Option<std::ffi::OsString>,
-    home: Option<PathBuf>,
-) -> Option<PathBuf> {
-    codex_home
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home.map(|h| h.join(".codex")))
-        .map(|dir| dir.join("config.toml"))
 }
 
 /// `codex mcp list --json` の出力から tako の command を読む（純粋関数）。
@@ -1474,20 +1461,22 @@ mod tests {
 
     #[test]
     fn issue2788_空のcodex_homeは未設定と同じ() {
-        let home = Some(PathBuf::from("/h"));
-        assert_eq!(
-            codex_config_path_from(Some("".into()), home.clone()),
-            Some(PathBuf::from("/h/.codex/config.toml"))
-        );
-        assert_eq!(
-            codex_config_path_from(None, home.clone()),
-            Some(PathBuf::from("/h/.codex/config.toml"))
-        );
-        assert_eq!(
-            codex_config_path_from(Some("/c".into()), home),
-            Some(PathBuf::from("/c/config.toml"))
-        );
-        assert_eq!(codex_config_path_from(Some("".into()), None), None);
+        // 規則の正本は codex_session::codex_home（#2798）。ここは片付けの読み手が実際の env で
+        // そこを通ることを見る（env を書き換えるのでこの 1 本だけの子で走らせる。#2400）
+        if tako_core::run_alone!(issue2788_空のcodex_homeは未設定と同じ) {
+            return;
+        }
+        let scratch = tako_core::test_residue::ScratchDir::new("agent-mcp-codex-home-2798");
+        let home = scratch.path().join("home");
+        let _home = crate::test_home::HomeGuard::set(&home);
+        for (label, value, dir) in crate::test_home::codex_home_cases(&home, scratch.path()) {
+            crate::test_home::set_codex_home(value.as_deref());
+            assert_eq!(
+                config_path(WorkerAgent::Codex),
+                Some(dir.join("config.toml")),
+                "{label}"
+            );
+        }
     }
 
     #[test]
