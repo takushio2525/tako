@@ -1111,6 +1111,69 @@ fn build_output_command(spawn: &SpawnCommand) -> std::process::Command {
     command
 }
 
+/// `.ps1` ファイルを**実行ポリシーの対象外で**走らせる PowerShell の起動引数（純粋関数。#2790）。
+///
+/// 取得したインストーラ（`install.ps1`）の起こし方の正本で、`agent_install::InterpreterSpec::args_for`
+/// がここを通す（codex / agy の代行 = #2791 も同じ口を呼ぶ）。
+///
+/// - **スクリプトファイルを実行しない**: 実行ポリシーが止めるのはスクリプトファイル（`-File`・ドット
+///   ソース・パスの呼び出し）で、コマンドとして渡した文字列は対象外。本文はテキストで読み、
+///   `[scriptblock]::Create` で走らせる（シェル統合 #2432 の `powershell_bootstrap` と同じ手）。
+///   #2790 より前の `-ExecutionPolicy Bypass -File` は Process スコープの指定なので、グループポリシー
+///   （MachinePolicy / UserPolicy）で AllSigned / Restricted を強制した管理端末では負ける
+/// - **本文は argv に載せない**: `-EncodedCommand` に載せるのは読み込みの起動片だけで、長さは
+///   スクリプトの大きさに依らない（コマンドラインの上限は 32,767 文字。codex の `install.ps1` は
+///   71,052 バイト = UTF-16LE の base64 で約 19 万字になり載らない。2026-11-08 実測）
+/// - **パスは ASCII だけの式で埋める**（`shell_integration::powershell_ascii_literal`。空白・単引用符・
+///   日本語のユーザー名でも崩れない。#2432 と共有）
+/// - **`-OutputFormat Text` を明示する**: 指定が無いまま `-EncodedCommand` で起こすと、非対話で stderr が
+///   リダイレクトされているとき PowerShell は「PowerShell から呼ばれた」と見なしてエラーを CLIXML で書く
+///   （PowerShell のソース `ConsoleHost.ErrorFormat` の条件 `!OutputFormatSpecified && !IsInteractive &&
+///   Console.IsErrorRedirected && _wasInitialCommandEncoded`。pwsh 7.6 で実測）。GUI / MCP から代行すると
+///   インストーラのエラーが `#< CLIXML <Objs …>` のまま断りの文へ載るので、`-File` のときと同じ平文に戻す
+/// - `-NoLogo -NoProfile` は #2790 より前と同じ（利用者の profile を挟まない）
+///
+/// 本文は [`powershell_script_text_command`]
+pub fn powershell_script_text_args(script: &std::path::Path) -> Vec<String> {
+    vec![
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-OutputFormat".to_string(),
+        "Text".to_string(),
+        "-EncodedCommand".to_string(),
+        encode_powershell_command(&powershell_script_text_command(script)),
+    ]
+}
+
+/// [`powershell_script_text_args`] が `-EncodedCommand` に載せる本文（符号化する前。純粋関数。#2790）。
+///
+/// 終了コードは `-File` で走らせたときと同じに揃える（呼び手の `setup_bootstrap::run_installer` が
+/// 終了コードで失敗の種類を分けるため）:
+///
+/// | スクリプト | `-File`（#2790 より前） | この本文 |
+/// |---|---|---|
+/// | `exit N` | N | N（`exit` は `catch` に捕まらず、プロセスごと N で終わる） |
+/// | 捕まえない終端エラー | 1 | 1（エラーレコードはそのまま stderr へ） |
+/// | 最後まで走った | 0 | 0 |
+///
+/// - **子スコープ（`&`）で走らせる**: `-File` と同じく、スクリプトが立てる `Set-StrictMode` や
+///   `$ErrorActionPreference` を起動片の側へ漏らさない。シェル統合（#2432）がドットソース（`.`）なのは
+///   関数をペインのセッションへ残すためで、ここでは要らない
+/// - **起動片は `$ErrorActionPreference` を書き換えない**（子スコープが受け継ぐので、スクリプトから見える
+///   既定値が `-File` のときと変わる）
+/// - 読み込みは `ReadAllText` = BOM が無ければ UTF-8。`-File` の Windows PowerShell 5.1 は BOM の無い
+///   ファイルを ANSI コードページで読むので、非 ASCII を含むスクリプト（codex の `install.ps1` は
+///   BOM が無く非 ASCII が 1,596 バイト）はこちらの方が化けない
+/// - スクリプトのパスを持たない（`$PSCommandPath` が空）のは公式の `irm … | iex` と同じ
+pub fn powershell_script_text_command(script: &std::path::Path) -> String {
+    let path = crate::shell_integration::powershell_ascii_literal(&script.display().to_string());
+    format!(
+        "try {{ & ([scriptblock]::Create([System.IO.File]::ReadAllText({path}))) }}\n\
+         catch {{ Write-Error -ErrorRecord $_ -ErrorAction Continue; exit 1 }}\n\
+         exit 0\n"
+    )
+}
+
 /// `-EncodedCommand` が要求する UTF-16LE + base64。
 ///
 /// base64 は 20 行で書けるうえ、依存を増やさない判断

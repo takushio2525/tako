@@ -1298,23 +1298,11 @@ fn run_installer(
     interactive: bool,
 ) -> Result<String, SetupRefusal> {
     let r = recipe_for(agent);
-    let runner = r.runner;
-    // インタプリタと引数はプラットフォーム境界（B17）が持つデータから組む。
+    // インタプリタ・引数・env はプラットフォーム境界（B17）の 1 実装が組む（#2790。Windows は
+    // 実行ポリシーの対象外の形 = 本文をテキストで読む `-EncodedCommand`）。
     // ここに `bash` / `powershell` を書かない = 経路の取り違えが起きない
-    let shell = runner
-        .candidates
-        .iter()
-        .find_map(|name| tako_core::platform::exe::find(name))
-        .unwrap_or_else(|| runner.fallback.to_string());
-    let mut command = std::process::Command::new(&shell);
-    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
-    tako_core::platform::process::no_console_window(&mut command);
-    command.args(runner.args_for(script));
-    // インストーラの対話プロンプトを黙らせる env（codex の `Start Codex now?` 対策）。
-    // **手順の側が持つデータ**なので、ここに系統名を書かない
-    for (key, value) in r.installer_env {
-        command.env(key, value);
-    }
+    let mut command = r.installer_command(script);
+    let shell = command.get_program().to_string_lossy().into_owned();
     let (status, log) = if interactive {
         let status = command
             .stdin(std::process::Stdio::inherit())

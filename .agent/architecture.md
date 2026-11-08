@@ -661,7 +661,9 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   を足す（unix は `None` = 従来どおり。tmux へコマンドを渡すと zsh ラッパーが ZDOTDIR を食うため）。
   スクリプトファイルを実行しないので実行ポリシー（Restricted を含む）の対象外で、`-NoProfile` を
   付けないのでユーザーの profile も今までどおり読まれる。`-ExecutionPolicy Bypass` は採らない
-  （ペインと子の PowerShell の Process スコープまで緩むため）。既知の制限: ペインの中で手で起こした
+  （ペインと子の PowerShell の Process スコープまで緩むため。グループポリシーで強制された AllSigned /
+  Restricted にも負ける）。エージェント CLI の導入代行が取得した `install.ps1` を起こす形も同じ手
+  （`platform::shell::powershell_script_text_args`。#2790・FR-2.33.1）。既知の制限: ペインの中で手で起こした
   入れ子の PowerShell には統合が入らない。残った `$PROFILE` のブロックは移行
   （`SchemaId::PowerShellProfile`）が取り除く。
   **読み込みは共有違反のときだけ読み直す**（#2659）: `ReadAllText` は他の書き手を許さない開き方なので、

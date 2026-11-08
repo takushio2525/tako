@@ -609,6 +609,15 @@ jobs:
       # --nocapture は戻り方と所要の行（TAKO2774_*）をログへ残すため
       - name: 名前付きパイプの読み取りの上限の実行検査（#2774。remote daemon → GUI）
         run: cargo test -p tako-control --lib -- platform::named_pipe remote::tests::issue2774 --nocapture
+      # #2790: エージェント CLI の導入代行の起こし方を、グループポリシーで実行ポリシーを強制した状態
+      # （HKLM MachinePolicy = AllSigned / HKCU UserPolicy = Restricted。5.1 と pwsh 7 の両方の置き場）で
+      # 実際に回す。新しい形（本文をテキストで読む -EncodedCommand）は偽の install.ps1 が走って印が残り、
+      # 修正前の形（-ExecutionPolicy Bypass -File）は同じ条件で弾かれ、手で打つ案内の 1 行は走ることを見る。
+      # 置いたポリシーはスクリプトの finally で戻し、戻ったことまで読み戻す。全数より手前に名指しで置く
+      # （#1282 と同じ理由。ポリシーを置いている間に他のテストを走らせない = 全数の中では置かない）
+      - name: 実行ポリシーを強制した PC での導入代行の起こし方の実行検査（#2790。HKLM AllSigned / HKCU Restricted）
+        shell: pwsh
+        run: pwsh -File scripts/windows/test-install-execution-policy-2790.ps1
       # **ワークスペース全体のテストを blocking にする**（#1278 / #583）。
       # #583 は「POSIX 前提の既存失敗が残っているあいだ非ブロッキング」で据え置いていたが、
       # そのあいだに未検出が溜まり、実機で 19 → 24 件まで増えていた（#1278）。

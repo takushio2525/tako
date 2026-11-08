@@ -40,8 +40,12 @@
 //!   プラットフォームごとに変える（[`ScriptSignature`]）
 //! - `param()` を持つので `-File` で走らせても既定 `$Target = "latest"` が効く
 //! - 実機の ExecutionPolicy は `CurrentUser = RemoteSigned`（実測）。落としたファイルを
-//!   `-File` で走らせるには **`-ExecutionPolicy Bypass`**（プロセス限定）が要る。
-//!   公式の `irm | iex` は文字列を食わせるので ExecutionPolicy の対象外
+//!   `-File` で走らせると弾かれる。公式の `irm | iex` は文字列を食わせるので ExecutionPolicy の対象外。
+//!   #1057 は `-ExecutionPolicy Bypass`（Process スコープ）で避けたが、グループポリシーで
+//!   AllSigned / Restricted を強制した PC では負けるので、#2790 から**本文をテキストで読んで
+//!   `-EncodedCommand` の起動片から走らせる**（[`ScriptPassing::PowerShellText`]。`irm | iex` と同じく
+//!   実行ポリシーの対象外）。失敗したときに案内する手で打つ 1 行は公式の `irm … | iex` のまま
+//!   （同じ理由で実行ポリシーの対象外で、最も簡単な形 = #322）
 //! - 設置先は `~\.local\bin\claude.exe`。ここは
 //!   [`crate::platform::exe`] の走査対象なので、PATH が再ログインまで
 //!   伝播しない Windows でも導入直後に検出できる
@@ -194,6 +198,35 @@ pub fn looks_like_installer(signature: ScriptSignature, head: &[u8]) -> bool {
     }
 }
 
+/// 取得したスクリプトをインタプリタへどう渡すか（#2790）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptPassing {
+    /// パスを argv の最後に置く（`bash <path>` / `sh <path>`）
+    Path,
+    /// 本文をテキストで読み、`-EncodedCommand` の起動片から scriptblock として走らせる（PowerShell）。
+    /// **実行ポリシーの対象外**なので、グループポリシーで AllSigned / Restricted を強制した PC でも
+    /// 止まらない（組み立ての正本は `platform::shell::powershell_script_text_args`）
+    PowerShellText,
+}
+
+/// #2790 より前の Windows の起こし方（`TAKO_2790_LEGACY=1` の A/B と、CI で「これは弾かれる」を
+/// 示す比較のためだけに残す）。`-ExecutionPolicy Bypass` は Process スコープなので、グループポリシーの
+/// MachinePolicy / UserPolicy に負ける
+pub const LEGACY_POWERSHELL_FILE_ARGS: &[&str] = &[
+    "-NoLogo",
+    "-NoProfile",
+    // tako:ps-file-ok A/B の旧アームと CI の「これは弾かれる」の比較だけ（#2790）
+    "-ExecutionPolicy",
+    "Bypass",
+    // tako:ps-file-ok 同上
+    "-File",
+];
+
+/// `TAKO_2790_LEGACY=1` で #2790 より前（`-ExecutionPolicy Bypass -File`）の起こし方へ戻す
+pub fn issue2790_legacy() -> bool {
+    std::env::var_os("TAKO_2790_LEGACY").is_some()
+}
+
 /// 取得したインストーラを走らせるインタプリタ（**データだけ**。解決は呼び出し側）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpreterSpec {
@@ -202,24 +235,35 @@ pub struct InterpreterSpec {
     /// どれも見つからなかったときに名前で起こす最後の手段
     /// （Windows の `CreateProcess` と unix の絶対パスはどちらもこれで起動できる）
     pub fallback: &'static str,
-    /// スクリプトのパスの**直前**に置く引数
-    pub leading_args: &'static [&'static str],
-    /// 取得先ファイルの拡張子。PowerShell は `.ps1` 以外を実行しない
+    /// スクリプトの渡し方（#2790。それまでは「パスの直前に置く引数」の並びだった）
+    pub passing: ScriptPassing,
+    /// 取得先ファイルの拡張子（`.ps1` は #2790 より前の `-File` が要求した名残だが、
+    /// 取得物が何かを一時ファイルの名前で見分けられるので残す）
     pub script_ext: &'static str,
     /// 取得したものの見分け方
     pub signature: ScriptSignature,
 }
 
 impl InterpreterSpec {
-    /// スクリプトのパスを与えて argv を組む（`leading_args` + パス）
+    /// スクリプトのパスを与えて argv を組む（**起こし方の正本**。A/B は `TAKO_2790_LEGACY=1`）
     pub fn args_for(&self, script: &std::path::Path) -> Vec<std::ffi::OsString> {
-        let mut args: Vec<std::ffi::OsString> = self
-            .leading_args
-            .iter()
-            .map(|a| std::ffi::OsString::from(*a))
-            .collect();
-        args.push(script.as_os_str().to_os_string());
-        args
+        self.args_for_in(script, issue2790_legacy())
+    }
+
+    /// [`Self::args_for`] の純粋関数版（`legacy` = #2790 より前の `-ExecutionPolicy Bypass -File`）
+    pub fn args_for_in(&self, script: &std::path::Path, legacy: bool) -> Vec<std::ffi::OsString> {
+        match self.passing {
+            ScriptPassing::Path => vec![script.as_os_str().to_os_string()],
+            ScriptPassing::PowerShellText if legacy => LEGACY_POWERSHELL_FILE_ARGS
+                .iter()
+                .map(std::ffi::OsString::from)
+                .chain([script.as_os_str().to_os_string()])
+                .collect(),
+            ScriptPassing::PowerShellText => super::shell::powershell_script_text_args(script)
+                .into_iter()
+                .map(std::ffi::OsString::from)
+                .collect(),
+        }
     }
 }
 
@@ -286,6 +330,32 @@ impl InstallRecipe {
     pub fn payload_dir_in(&self, home: &std::path::Path) -> Option<PathBuf> {
         self.payload_rel.map(|rel| rel_join(home, rel))
     }
+
+    /// 取得したインストーラを走らせる `Command`（**起こし方の 1 実装**。#2790）。
+    ///
+    /// インタプリタの解決（候補を前から探し、無ければ [`InterpreterSpec::fallback`]）・引数
+    /// （[`InterpreterSpec::args_for`]）・インストーラへ渡す env（[`Self::installer_env`]）・
+    /// コンソールを出さない設定（#586）までを組む。stdio と待ち方は呼び手が決める
+    /// （`setup_bootstrap::run_installer`）。Windows の CI のポリシー検査
+    /// （`tests/issue2790_install_execution_policy_windows.rs`）も同じここを通して偽のインストーラを起こす。
+    /// 起こしたインタプリタの名前は `Command::get_program` で読める
+    pub fn installer_command(&self, script: &std::path::Path) -> std::process::Command {
+        let program = self
+            .runner
+            .candidates
+            .iter()
+            .find_map(|name| super::exe::find(name))
+            .unwrap_or_else(|| self.runner.fallback.to_string());
+        let mut command = std::process::Command::new(program);
+        super::process::no_console_window(&mut command);
+        command.args(self.runner.args_for(script));
+        // インストーラの対話プロンプトを黙らせる env（codex の `Start Codex now?` 対策）。
+        // **手順の側が持つデータ**なので、ここに系統名を書かない
+        for (key, value) in self.installer_env {
+            command.env(key, value);
+        }
+        command
+    }
 }
 
 /// `/` 区切りの相対パスを結合する（Windows でも `\` に解決される）
@@ -321,7 +391,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             runner: InterpreterSpec {
                 candidates: &["bash"],
                 fallback: "/bin/bash",
-                leading_args: &[],
+                passing: ScriptPassing::Path,
                 script_ext: "sh",
                 signature: ScriptSignature::Shebang,
             },
@@ -367,7 +437,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             runner: InterpreterSpec {
                 candidates: &["sh"],
                 fallback: "/bin/sh",
-                leading_args: &[],
+                passing: ScriptPassing::Path,
                 script_ext: "sh",
                 signature: ScriptSignature::Shebang,
             },
@@ -412,7 +482,7 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
             runner: InterpreterSpec {
                 candidates: &["bash"],
                 fallback: "/bin/bash",
-                leading_args: &[],
+                passing: ScriptPassing::Path,
                 script_ext: "sh",
                 signature: ScriptSignature::Shebang,
             },
@@ -444,20 +514,15 @@ pub fn recipe(platform: Platform, agent: AgentKind) -> InstallRecipe {
 /// - **5.1（`powershell.exe`）を先に置く**。Windows へ必ず同梱されている側を既定に
 ///   するとマシンごとの差が出ない（pwsh 7 は任意導入）。3 系統の `install.ps1` は
 ///   どれも `Set-StrictMode` / `Invoke-RestMethod` 止まりなので 5.1 で動く
-/// - `-ExecutionPolicy Bypass` は**このプロセスだけ**に効く（マシンの設定は変えない）。
-///   公式の `irm | iex` は文字列を食わせるので ExecutionPolicy の対象外だが、
-///   ファイルへ落として `-File` で走らせるこちらは既定の `RemoteSigned` に弾かれる
-///   （claude で実機実測。#1057）
+/// - **本文をテキストで読んで走らせる**（[`ScriptPassing::PowerShellText`]。#2790）。落としたファイルを
+///   `-File` で走らせると既定の `RemoteSigned` に弾かれる（claude で実機実測。#1057）。#1057 は
+///   `-ExecutionPolicy Bypass` で避けたが、これは Process スコープの指定なので、グループポリシーで
+///   AllSigned / Restricted を強制した管理端末（学校・会社の PC）では負ける。実行ポリシーが止めるのは
+///   スクリプトファイルだけで、公式の `irm | iex` が通るのも文字列を食わせるから。同じ理由で通る形へ寄せた
 /// - `-NoProfile` はユーザーの profile を挟まないため
 const WINDOWS_POWERSHELL_RUNNER: InterpreterSpec = InterpreterSpec {
     candidates: &["powershell", "pwsh"],
-    leading_args: &[
-        "-NoLogo",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-File",
-    ],
+    passing: ScriptPassing::PowerShellText,
     fallback: "powershell.exe",
     script_ext: "ps1",
     signature: ScriptSignature::PowerShell,
@@ -516,32 +581,202 @@ mod tests {
     fn 走らせ方はプラットフォームごとに決まる() {
         let mac = recipe(Platform::MacOs, AgentKind::Claude).runner;
         assert_eq!(mac.candidates, &["bash"]);
-        assert!(mac.leading_args.is_empty(), "bash はパスを直接受ける");
+        assert_eq!(mac.passing, ScriptPassing::Path, "bash はパスを直接受ける");
         assert_eq!(mac.script_ext, "sh");
         assert_eq!(mac.signature, ScriptSignature::Shebang);
 
         let win = recipe(Platform::Windows, AgentKind::Claude).runner;
         assert_eq!(win.candidates, &["powershell", "pwsh"]);
-        // `-File` はスクリプトパスの直前でなければならない
-        assert_eq!(win.leading_args.last(), Some(&"-File"));
-        // 既定の ExecutionPolicy（RemoteSigned）で弾かれないようにする（実機実測）
-        assert!(win.leading_args.contains(&"Bypass"));
+        // 本文をテキストで読んで走らせる（実行ポリシーの対象外。#2790）
+        assert_eq!(win.passing, ScriptPassing::PowerShellText);
         assert_eq!(win.signature, ScriptSignature::PowerShell);
     }
 
     #[test]
-    fn argvはleading引数のあとにスクリプトパスを置く() {
-        let script = std::path::Path::new("/tmp/tako-install.ps1");
-        let win = recipe(Platform::Windows, AgentKind::Claude).runner;
-        let args = win.args_for(script);
-        assert_eq!(
-            args.last().map(|a| a.to_string_lossy().to_string()),
-            Some(script.display().to_string())
-        );
-        assert_eq!(args.len(), win.leading_args.len() + 1);
+    fn unixのargvはスクリプトのパス1個() {
+        let script = std::path::Path::new("/tmp/tako-install.sh");
+        for agent in AgentKind::ALL {
+            let mac = recipe(Platform::MacOs, agent).runner;
+            assert_eq!(
+                mac.args_for(script),
+                vec![std::ffi::OsString::from("/tmp/tako-install.sh")],
+                "{} は引数 1 個",
+                agent.as_str()
+            );
+        }
+    }
 
+    // --- #2790: Windows の起こし方（実行ポリシーに頼らない） ---
+
+    /// 一時 dir の置き場の例（日本語のユーザー名・空白・単引用符を含む = 層ごとに崩れやすい形）
+    const WIN_SCRIPT_2790: &str =
+        r"C:\Users\山田 太郎\AppData\Local\Temp\tako-claude-install-'1'.ps1";
+
+    /// `-EncodedCommand` の値を復号して、`container_safe_script`（#906）が足した末尾の空白を落とす
+    fn decoded_2790(encoded: &std::ffi::OsString) -> String {
+        let text = crate::platform::shell::decode_powershell_command(&encoded.to_string_lossy());
+        text.trim_end_matches(' ').to_string()
+    }
+
+    /// **製品の既定の口（`args_for` = env を読む側）で**組み立てを縛る。`TAKO_2790_LEGACY=1` の注入や
+    /// `-ExecutionPolicy Bypass -File` へ戻す変更は、このテストが名指しで落とす（受け入れ条件 3）
+    #[test]
+    fn issue2790_windowsの導入代行は実行ポリシーに頼らずencodedcommandで起こす() {
+        let script = std::path::Path::new(WIN_SCRIPT_2790);
+        for agent in AgentKind::ALL {
+            let who = agent.as_str();
+            let args = recipe(Platform::Windows, agent).runner.args_for(script);
+            let words: Vec<String> = args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            // `-OutputFormat Text` = 捕捉したエラーを CLIXML にさせない（`-File` のときと同じ平文）
+            assert_eq!(
+                words[..5],
+                [
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-OutputFormat",
+                    "Text",
+                    "-EncodedCommand"
+                ],
+                "{who}: {words:?}"
+            );
+            assert_eq!(words.len(), 6, "{who}: 符号化した 1 個で終わる: {words:?}");
+            // 実行ポリシーに頼る形・スクリプトファイルを実行する形が混ざっていない
+            for flag in ["-ExecutionPolicy", "Bypass", "-File", "-Command"] {
+                assert!(
+                    !words.iter().any(|w| w.eq_ignore_ascii_case(flag)),
+                    "{who}: {flag} が残っている: {words:?}"
+                );
+            }
+            assert!(
+                !words.iter().any(|w| w.contains("tako-claude-install")),
+                "{who}: スクリプトのパスを素の argv で渡している: {words:?}"
+            );
+            // 復号すると本文の正本に戻る（UTF-16LE の base64）
+            let decoded = decoded_2790(&args[5]);
+            assert_eq!(
+                decoded,
+                crate::platform::shell::powershell_script_text_command(script),
+                "{who}"
+            );
+            assert!(
+                decoded.contains("[scriptblock]::Create([System.IO.File]::ReadAllText("),
+                "{who}: 本文をテキストで読んでいない: {decoded}"
+            );
+            assert!(decoded.is_ascii(), "{who}: 起動片は ASCII だけ: {decoded}");
+        }
+    }
+
+    /// パスの日本語・空白・単引用符は ASCII だけの式で埋まり、復号すると元のパスの式へ戻る
+    /// （シェル統合 #2432 と同じ `powershell_ascii_literal` を共有する）
+    #[test]
+    fn issue2790_起動片はパスの非asciiと空白と引用符を崩さない() {
+        let script = std::path::Path::new(WIN_SCRIPT_2790);
+        let args = recipe(Platform::Windows, AgentKind::Claude)
+            .runner
+            .args_for_in(script, false);
+        let decoded = decoded_2790(&args[5]);
+        let literal = crate::shell_integration::powershell_ascii_literal(WIN_SCRIPT_2790);
+        assert_eq!(
+            literal,
+            r"'C:\Users\' + [char]0x5C71 + [char]0x7530 + ' ' + [char]0x592A + [char]0x90CE + '\AppData\Local\Temp\tako-claude-install-''1''.ps1'"
+        );
+        assert_eq!(
+            decoded,
+            format!(
+                "try {{ & ([scriptblock]::Create([System.IO.File]::ReadAllText({literal}))) }}\n\
+                 catch {{ Write-Error -ErrorRecord $_ -ErrorAction Continue; exit 1 }}\n\
+                 exit 0\n"
+            )
+        );
+    }
+
+    /// 符号化そのものの往復（非 ASCII・改行・引用符・`$`・バッククォートを含む本文）。
+    /// 起動片は ASCII だけだが、同じ符号化を #2791 ほかが本文に使っても化けないことを縛る
+    #[test]
+    fn issue2790_符号化はutf16leのbase64で元の本文に戻る() {
+        let body = "param([string]$Target = \"latest\")\n\
+                    Write-Output '日本語の印 ''単'' \"二重\" `$dollar ✅'\r\n\
+                    exit 7\n";
+        let encoded = crate::platform::shell::encode_powershell_command(body);
+        assert!(
+            encoded
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(&b)),
+            "base64 の文字だけ: {encoded}"
+        );
+        let decoded = crate::platform::shell::decode_powershell_command(&encoded);
+        assert_eq!(decoded.trim_end_matches(' '), body);
+    }
+
+    /// argv に載るのは起動片だけなので、長さはインストーラの大きさに依らない。
+    /// 置き場が長い非 ASCII のパスでもコマンドラインの上限（32,767 文字）に十分収まる
+    /// （本文を載せる案は codex の `install.ps1` = 71,052 バイトで約 19 万字になり載らない）
+    #[test]
+    fn issue2790_起こし方の長さはインストーラの大きさに依らず上限に収まる() {
+        const WINDOWS_COMMAND_LINE_MAX: usize = 32_767;
+        let program = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let line_len = |script: &str| {
+            let args = recipe(Platform::Windows, AgentKind::Claude)
+                .runner
+                .args_for_in(std::path::Path::new(script), false);
+            program.len() + args.iter().map(|a| a.len() + 1).sum::<usize>()
+        };
+        let typical = line_len(r"C:\Users\winuser\AppData\Local\Temp\tako-claude-install-4242.ps1");
+        assert!(typical < 2_000, "ふだんの置き場: {typical} 文字");
+        // 260 文字ぶんの非 ASCII（1 文字が `[char]0xNNNN` の 12 文字 + 区切りへ膨らむ最悪の形）
+        let long = format!(r"C:\{}\tako-claude-install-4242.ps1", "山".repeat(260));
+        let worst = line_len(&long);
+        assert!(
+            worst < WINDOWS_COMMAND_LINE_MAX / 2,
+            "長い非 ASCII の置き場: {worst} 文字"
+        );
+    }
+
+    /// 修正前の形は A/B（`TAKO_2790_LEGACY=1`）と CI の「これは弾かれる」の比較でだけ組む
+    #[test]
+    fn issue2790_修正前の起こし方はabの旧アームで再現できる() {
+        let script = std::path::Path::new(WIN_SCRIPT_2790);
+        let args = recipe(Platform::Windows, AgentKind::Claude)
+            .runner
+            .args_for_in(script, true);
+        let mut expected: Vec<std::ffi::OsString> = LEGACY_POWERSHELL_FILE_ARGS
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect();
+        expected.push(script.as_os_str().to_os_string());
+        assert_eq!(args, expected);
+        // unix の渡し方は A/B で変わらない
         let mac = recipe(Platform::MacOs, AgentKind::Claude).runner;
-        assert_eq!(mac.args_for(script).len(), 1, "bash は引数 1 個");
+        assert_eq!(
+            mac.args_for_in(script, true),
+            mac.args_for_in(script, false)
+        );
+    }
+
+    /// 失敗したときに案内する手で打つ 1 行も実行ポリシーの対象外の形（#2790）。
+    /// 公式の `irm <url> | iex` は文字列を `iex` で走らせる = スクリプトファイルを実行しないので
+    /// 管理端末でも通り、最も簡単な形（#322）。`-File` や `-ExecutionPolicy` を足した形にしない
+    #[test]
+    fn issue2790_windowsで手で打つ案内も実行ポリシーの対象外の公式の1行() {
+        for agent in AgentKind::ALL {
+            let r = recipe(Platform::Windows, agent);
+            assert_eq!(
+                r.source.official_command,
+                format!("irm {} | iex", r.source.url),
+                "{}",
+                agent.as_str()
+            );
+            for flag in ["-File", "-ExecutionPolicy", "Bypass", "powershell"] {
+                assert!(
+                    !r.source.official_command.contains(flag),
+                    "{}: {flag}",
+                    agent.as_str()
+                );
+            }
+        }
     }
 
     /// 取得したものの見分け方（**実物の先頭で確認した形**を固定する）。
