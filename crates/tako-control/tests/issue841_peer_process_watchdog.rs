@@ -23,6 +23,8 @@
 //! 3. [`verify_peerはエンドポイントの形で分岐する`] — UDS にも検証を通す / TCP の検証を素通しにする
 //! 4. [`verify_peerは2つのゲートを両方通す`] — 所有者ゲートか実行ファイルゲートが消える
 //! 5. [`名前の判定は設置場所に依らない`] — 実行ファイルの**パス**を焼き込む（受け入れ条件 4）
+//! 6. [`名前はopenprocessで開けなければ在籍表へ落とす`] — #2773 の落とし先が消える
+//!    （Windows の非昇格から LocalSystem の tailscaled を開けず、スマホが全部 403 に戻る）
 //!
 //! 併せて、拒否の記録が理由コードだけであること（[`拒否の記録は理由コードだけを残す`]）と、
 //! 状態が `tako remote status` から読めること（[`検証の状態はstatusに出る`]）も見る。
@@ -35,6 +37,7 @@ mod production_range;
 
 const REMOTE: &str = "crates/tako-control/src/remote.rs";
 const ENDPOINT: &str = "crates/tako-control/src/platform/local_endpoint.rs";
+const PROCINFO: &str = "crates/tako-core/src/platform/procinfo.rs";
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -163,9 +166,13 @@ fn check_auth_paths_use_entry(source: &str, rel: &str) {
     }
 }
 
+/// `verify_peer` の本体（#2773 で名前の引き方を受け取る形に分けた。`verify_peer` は
+/// 本番の引き方 `procinfo::image_name` を渡すだけ = [`check_name_source`] が見る）
+const VERIFY_BODY: &str = "\nfn verify_peer_naming(";
+
 /// 検査④: 分岐は**プラットフォームではなくエンドポイントの形**（受け入れ条件 4）
 fn check_endpoint_shape_branch(source: &str, rel: &str) {
-    let (line, body) = fn_body(source, rel, "\npub fn verify_peer(");
+    let (line, body) = fn_body(source, rel, VERIFY_BODY);
     let shape = body.find("let Endpoint::Loopback(").unwrap_or_else(|| {
         panic!(
             "{rel}:{line} `verify_peer` がエンドポイントの形で分岐していない（#841）。\
@@ -190,7 +197,7 @@ fn check_endpoint_shape_branch(source: &str, rel: &str) {
 
 /// 検査⑤: 2 つのゲートが両方在り、材料が欠けたら拒否側へ倒れる
 fn check_two_gates(source: &str, rel: &str) {
-    let (line, body) = fn_body(source, rel, "\npub fn verify_peer(");
+    let (line, body) = fn_body(source, rel, VERIFY_BODY);
     assert!(
         body.contains("procinfo::current_uid()") && body.contains("PeerReject::OwnerUntrusted"),
         "{rel}:{line} 所有者ゲートが消えている（#841）。\
@@ -198,7 +205,7 @@ fn check_two_gates(source: &str, rel: &str) {
          これが UDS 0600 の「別 OS ユーザーを排除する」性質を戻している唯一の段"
     );
     assert!(
-        body.contains("procinfo::image_path(") && body.contains("looks_like_tailscale_daemon("),
+        body.contains("name_of(") && body.contains("looks_like_tailscale_daemon("),
         "{rel}:{line} 実行ファイルゲートが消えている（#841）"
     );
     for reject in [
@@ -245,6 +252,41 @@ fn check_name_rule_is_path_free(source: &str, rel: &str) {
     );
 }
 
+/// 検査⑦（#2773）: `verify_peer` は本番の名前の引き方として `procinfo::image_name`
+/// （パス → 在籍表の順）を渡す。`image_path` だけに戻すと、Windows の非昇格から
+/// `OpenProcess` で開けない LocalSystem の tailscaled が `ImageUnknown` で全部 403 になる
+fn check_name_source(source: &str, rel: &str) {
+    let (line, body) = fn_body(source, rel, "\npub fn verify_peer(");
+    assert!(
+        body.contains("verify_peer_naming(") && body.contains("procinfo::image_name"),
+        "{rel}:{line} `verify_peer` が名前を `procinfo::image_name` で引いていない（#2773）。\
+         `image_path` だけだと `OpenProcess` で開けない接続元（Windows の LocalSystem の\
+         tailscaled）の名前を引けず、正規の serve からのリクエストが全部 403 になる"
+    );
+    assert!(
+        !body.contains("cfg!(") && !body.contains("target_os"),
+        "{rel}:{line} `verify_peer` がプラットフォームで分岐している（#841 / #2773）"
+    );
+}
+
+/// 検査⑧（#2773）: 境界の `procinfo::image_name` はパスで引けなければ在籍表へ落とす
+/// （落とし先の判定は純関数 `resolve_image_name` の 1 実装）
+fn check_roster_fallback(source: &str, rel: &str) {
+    let (line, body) = fn_body(source, rel, "\npub fn image_name(");
+    assert!(
+        body.contains("resolve_image_name(")
+            && body.contains("image_path(pid)")
+            && body.contains("snapshot_checked"),
+        "{rel}:{line} `image_name` が在籍表へ落ちていない（#2773）。\
+         パス（`image_path`）で引けなければ在籍表（`snapshot_checked`）の名前を使うこと"
+    );
+    let (line, body) = fn_body(source, rel, "\npub fn resolve_image_name(");
+    assert!(
+        body.contains("roster()") && body.contains("ImageNameSource::Roster"),
+        "{rel}:{line} `resolve_image_name` が在籍表を引いていない（#2773）"
+    );
+}
+
 #[test]
 fn xffを読む入口は1実装だけ() {
     check_single_xff_entry(&production(REMOTE), REMOTE);
@@ -273,6 +315,12 @@ fn verify_peerは2つのゲートを両方通す() {
 #[test]
 fn 名前の判定は設置場所に依らない() {
     check_name_rule_is_path_free(&production(ENDPOINT), ENDPOINT);
+}
+
+#[test]
+fn 名前はopenprocessで開けなければ在籍表へ落とす() {
+    check_name_source(&production(ENDPOINT), ENDPOINT);
+    check_roster_fallback(&production(PROCINFO), PROCINFO);
 }
 
 #[test]
@@ -353,8 +401,11 @@ fn 検査は修正前の形を検出する() {
     assert!(caught.is_err(), "③' 入口が増えたことを検出できていない");
 
     // ④ UDS にも検証を通す（分岐が消える）
-    let no_shape =
-        "\npub fn verify_peer(endpoint: &Endpoint, peer: Option<SocketAddr>) -> PeerTrust {\n\
+    let no_shape = "\nfn verify_peer_naming(\n\
+        \x20   endpoint: &Endpoint,\n\
+        \x20   peer: Option<SocketAddr>,\n\
+        \x20   name_of: impl FnOnce(u32) -> Option<ImageName>,\n\
+        ) -> PeerTrust {\n\
         \x20   let Some(peer) = peer else {\n\
         \x20       return PeerTrust::Rejected(PeerReject::NoPeerAddr);\n\
         \x20   };\n\
@@ -367,8 +418,11 @@ fn 検査は修正前の形を検出する() {
     );
 
     // ⑤ プラットフォームで分岐する（Windows だけ素通しにする形）
-    let by_platform =
-        "\npub fn verify_peer(endpoint: &Endpoint, peer: Option<SocketAddr>) -> PeerTrust {\n\
+    let by_platform = "\nfn verify_peer_naming(\n\
+        \x20   endpoint: &Endpoint,\n\
+        \x20   peer: Option<SocketAddr>,\n\
+        \x20   name_of: impl FnOnce(u32) -> Option<ImageName>,\n\
+        ) -> PeerTrust {\n\
         \x20   let Endpoint::Loopback(local_port) = endpoint else {\n\
         \x20       return PeerTrust::NotRequired;\n\
         \x20   };\n\
@@ -381,8 +435,11 @@ fn 検査は修正前の形を検出する() {
     assert!(caught.is_err(), "⑤ プラットフォーム分岐を検出できていない");
 
     // ⑥ 所有者ゲートを外す（名前だけで信じる = 別ユーザーの偽 tailscaled が通る）
-    let name_only =
-        "\npub fn verify_peer(endpoint: &Endpoint, peer: Option<SocketAddr>) -> PeerTrust {\n\
+    let name_only = "\nfn verify_peer_naming(\n\
+        \x20   endpoint: &Endpoint,\n\
+        \x20   peer: Option<SocketAddr>,\n\
+        \x20   name_of: impl FnOnce(u32) -> Option<ImageName>,\n\
+        ) -> PeerTrust {\n\
         \x20   let Endpoint::Loopback(local_port) = endpoint else {\n\
         \x20       return PeerTrust::NotRequired;\n\
         \x20   };\n\
@@ -392,10 +449,10 @@ fn 検査は修正前の形を検出する() {
         \x20   let Some(found) = procinfo::loopback_tcp_peer(peer.port(), *local_port) else {\n\
         \x20       return PeerTrust::Rejected(PeerReject::Unresolved);\n\
         \x20   };\n\
-        \x20   let Some(path) = procinfo::image_path(found.pid) else {\n\
+        \x20   let Some(image) = name_of(found.pid) else {\n\
         \x20       return PeerTrust::Rejected(PeerReject::ImageUnknown);\n\
         \x20   };\n\
-        \x20   if !looks_like_tailscale_daemon(&name) {\n\
+        \x20   if !looks_like_tailscale_daemon(&image.name) {\n\
         \x20       return PeerTrust::Rejected(PeerReject::NotTailscaleDaemon);\n\
         \x20   }\n\
         \x20   PeerTrust::Trusted\n\
@@ -409,4 +466,34 @@ fn 検査は修正前の形を検出する() {
         }\n";
     let caught = std::panic::catch_unwind(|| check_name_rule_is_path_free(by_path, "注入"));
     assert!(caught.is_err(), "⑦ パスの焼き込みを検出できていない");
+
+    // ⑧ 名前をパスだけで引く形へ戻す（#2773 の修正前。Windows の LocalSystem の tailscaled が
+    //    `OpenProcess` で開けず全部 403）
+    let path_only =
+        "\npub fn verify_peer(endpoint: &Endpoint, peer: Option<SocketAddr>) -> PeerTrust {\n\
+        \x20   verify_peer_naming(endpoint, peer, |pid| {\n\
+        \x20       procinfo::image_path(pid).map(|p| ImageName::from(p))\n\
+        \x20   })\n\
+        }\n";
+    let caught = std::panic::catch_unwind(|| check_name_source(path_only, "注入"));
+    assert!(
+        caught.is_err(),
+        "⑧ 名前の引き方がパスだけに戻ったのを検出できていない"
+    );
+
+    // ⑨ 境界の `image_name` から在籍表への落とし先を外す（#2773 の修正前と同じ結果）
+    let no_roster = "\npub fn image_name(pid: u32) -> Option<ImageName> {\n\
+        \x20   resolve_image_name(pid, image_path(pid), || None)\n\
+        }\n\
+        \npub fn resolve_image_name(\n\
+        \x20   pid: u32,\n\
+        ) -> Option<ImageName> {\n\
+        \x20   let table = roster()?;\n\
+        \x20   Some(ImageName { name, source: ImageNameSource::Roster })\n\
+        }\n";
+    let caught = std::panic::catch_unwind(|| check_roster_fallback(no_roster, "注入"));
+    assert!(
+        caught.is_err(),
+        "⑨ 在籍表への落とし先の欠落を検出できていない"
+    );
 }

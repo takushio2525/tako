@@ -282,6 +282,11 @@ pub struct PeerGuardState {
     /// 直近の拒否の時刻（UNIX 秒）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_at: Option<u64>,
+    /// 接続元の実行ファイル名を在籍表から引いて通した最初の時刻（UNIX 秒。#2773）。
+    /// Windows の `OpenProcess` で開けない接続元（LocalSystem の tailscaled）が名前ゲートを
+    /// 通った印。無い = 名前は全部パスから引けた（または #2773 以前の daemon）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_from_roster_at: Option<u64>,
 }
 
 /// 接続元検証の状態ファイル（#841）
@@ -929,6 +934,8 @@ struct DaemonCtx {
 struct PeerRejectState {
     total: u64,
     last: Option<(&'static str, u64)>,
+    /// 実行ファイル名を在籍表から引いて通した最初の時刻（#2773）
+    roster_name_at: Option<u64>,
 }
 
 /// デバイスごとの WS 接続状態
@@ -1019,14 +1026,44 @@ impl DaemonCtx {
         write_peer_guard(&self.peer_guard_state());
     }
 
+    /// 接続元の実行ファイル名を在籍表から引いて通したことを記録する（#2773）。
+    ///
+    /// 正規の tailscaled が `OpenProcess` で開けない環境では**全リクエスト**がここを通るので、
+    /// 記録するのは daemon ごとに最初の 1 回だけ（`persist.log` の 1 行と status の時刻）。
+    /// 残すのは引き元の語だけで、接続元の名前・パス・ヘッダの中身は載せない
+    fn record_roster_name(&self) {
+        let at = now_epoch_secs();
+        let first = {
+            let mut st = self
+                .peer_rejects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let first = st.roster_name_at.is_none();
+            if first {
+                st.roster_name_at = Some(at);
+            }
+            first
+        };
+        if !first {
+            return;
+        }
+        crate::diag::persist_log(&format!(
+            "remote 接続元検証: 実行ファイル名を在籍表から引いて通した name_from={} endpoint_kind={}\
+             （OpenProcess で開けない接続元。この daemon では以後記録しない）",
+            local_endpoint::ImageNameSource::Roster.code(),
+            self.endpoint.kind_str()
+        ));
+        write_peer_guard(&self.peer_guard_state());
+    }
+
     /// status へ出す接続元検証の状態（#841）
     fn peer_guard_state(&self) -> PeerGuardState {
-        let (total, last) = {
+        let (total, last, roster_name_at) = {
             let st = self
                 .peer_rejects
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (st.total, st.last)
+            (st.total, st.last, st.roster_name_at)
         };
         PeerGuardState {
             enforced: matches!(self.endpoint, local_endpoint::Endpoint::Loopback(_))
@@ -1035,6 +1072,7 @@ impl DaemonCtx {
             rejected: total,
             last_code: last.map(|(c, _)| c.to_string()),
             last_at: last.map(|(_, at)| at),
+            name_from_roster_at: roster_name_at,
         }
     }
 
@@ -1105,6 +1143,14 @@ fn forwarded_identity(
             403,
             crate::RemoteRefusal::PeerUnverified(reject).to_string(),
         ));
+    }
+    if matches!(
+        trust,
+        local_endpoint::PeerTrust::Trusted {
+            name_from: local_endpoint::ImageNameSource::Roster
+        }
+    ) {
+        ctx.record_roster_name();
     }
     Ok((forwarded, header_value(request, "x-forwarded-host")))
 }
@@ -8072,6 +8118,66 @@ mod tests {
         handle.join().expect("サーバースレッド");
         std::env::remove_var("TAKO_REMOTE_STATE_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2773: 接続元の名前を在籍表から引いて通したことは、daemon ごとに**最初の 1 回だけ**
+    /// persist.log の 1 行と status の `name_from_roster_at` に残る（正規の tailscaled が
+    /// 開けない環境では全リクエストが通るので、毎回は書かない）
+    #[test]
+    fn issue2773_在籍表の名前で通したことは最初の1回だけ記録する() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2773_在籍表の名前で通したことは最初の1回だけ記録する)
+        {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tako_core::test_residue::ScratchDir::new("2773-roster-name");
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        std::env::remove_var("TAKO_841_LEGACY");
+        let ctx = DaemonCtx {
+            registry: Mutex::new(DeviceRegistry::open(&dir).expect("レジストリ")),
+            ts_cli: "tailscale".to_string(),
+            admin_token: "test-admin-token".to_string(),
+            tmux_socket: "tako-test-2773".to_string(),
+            ws_connections: Mutex::new(HashMap::new()),
+            base_url: "https://example.tail0000.ts.net".to_string(),
+            expected_host: "example.tail0000.ts.net".to_string(),
+            endpoint: local_endpoint::Endpoint::Loopback(40001),
+            peer_rejects: Mutex::new(PeerRejectState::default()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        const LINE: &str =
+            "remote 接続元検証: 実行ファイル名を在籍表から引いて通した name_from=roster";
+        let lines = || {
+            crate::diag::persist_log_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default()
+                .matches(LINE)
+                .count()
+        };
+        let before = lines();
+
+        ctx.record_roster_name();
+        let first = read_peer_guard().expect("接続元検証の状態ファイル");
+        let at = first
+            .name_from_roster_at
+            .expect("在籍表の名前で通した時刻が status に出る");
+        assert_eq!(first.rejected, 0, "通したのは拒否ではない");
+        assert_eq!(lines(), before + 1, "persist.log に 1 行残る");
+
+        ctx.record_roster_name();
+        ctx.record_roster_name();
+        let again = read_peer_guard().expect("接続元検証の状態ファイル");
+        assert_eq!(again.name_from_roster_at, Some(at), "最初の時刻のまま");
+        assert_eq!(lines(), before + 1, "2 回目以降は書かない");
+        let log = crate::diag::persist_log_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        assert!(
+            !log.contains("test-admin-token"),
+            "管理トークンは診断ログへ出さない"
+        );
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
     }
 
     /// #1724: **権限外からのコマンドカード実行は API で拒否される**（画面で隠すだけにしない）。

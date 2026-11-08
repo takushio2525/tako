@@ -26,7 +26,9 @@
 //!    **Windows はソケットの所有者を引く手段が無い**ので、この段は強制できない
 //!    （[`owner_check_kind`] が `unavailable` を返す。残存リスクは脅威モデル参照）
 //! 2. **実行ファイルゲート**: 接続元の実行ファイル名が tailscale デーモンのものであること
-//!    （[`looks_like_tailscale_daemon`]）
+//!    （[`looks_like_tailscale_daemon`]）。名前は `procinfo::image_name` で引く。
+//!    Windows の `OpenProcess` で開けない接続元（LocalSystem の tailscaled）は在籍表の
+//!    名前へ落とす（#2773）。名前しか見ない段なので、引き元が変わってもゲートの強さは同じ
 //!
 //! **分岐はプラットフォームではなくエンドポイントの形**で行う。`TAKO_REMOTE_ENDPOINT=unix`
 //! を明示した UDS 経路は、同一ユーザー限定をカーネルが強制しているので検証を通さない。
@@ -40,6 +42,8 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+pub use tako_core::platform::procinfo::{ImageName, ImageNameSource};
 
 /// ループバック TCP の接続先は常に 127.0.0.1（LAN へは出さない）
 const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
@@ -184,8 +188,9 @@ pub enum PeerTrust {
     /// 検証の対象外。UDS はカーネルが 0600 で同一ユーザーに限定するので、
     /// 「serve 経由の identity を信じてよい」根拠がエンドポイントの形そのものにある
     NotRequired,
-    /// 信頼できる（tailscale デーモンが張った接続）
-    Trusted,
+    /// 信頼できる（tailscale デーモンが張った接続）。`name_from` は名前ゲートが見た名前の
+    /// 引き元（在籍表へ落ちたかを診断へ残すため。#2773）
+    Trusted { name_from: ImageNameSource },
     /// 信頼できない
     Rejected(PeerReject),
 }
@@ -266,6 +271,17 @@ impl PeerReject {
 /// 「接続が既に閉じていて所有者を引けない」も拒否側 = 攻撃者が接続を即閉じることで
 /// 検証を素通りさせられない
 pub fn verify_peer(endpoint: &Endpoint, peer: Option<SocketAddr>) -> PeerTrust {
+    verify_peer_naming(endpoint, peer, tako_core::platform::procinfo::image_name)
+}
+
+/// [`verify_peer`] の本体。`name_of` は接続元 pid の実行ファイル名を引く口で、本番は
+/// `procinfo::image_name`（パス → 在籍表の順。#2773）。テストが `OpenProcess` の失敗を
+/// 注入するために分けてある
+fn verify_peer_naming(
+    endpoint: &Endpoint,
+    peer: Option<SocketAddr>,
+    name_of: impl FnOnce(u32) -> Option<ImageName>,
+) -> PeerTrust {
     let Endpoint::Loopback(local_port) = endpoint else {
         // UDS: 0600 の socket + 0700 の親ディレクトリで別ユーザーは接続自体が不能
         return PeerTrust::NotRequired;
@@ -290,18 +306,17 @@ pub fn verify_peer(endpoint: &Endpoint, peer: Option<SocketAddr>) -> PeerTrust {
             return PeerTrust::Rejected(PeerReject::OwnerUntrusted);
         }
     }
-    // ② 実行ファイルゲート: 名前で見る（設置場所は環境ごとに違う = 受け入れ条件 4）
-    let Some(path) = tako_core::platform::procinfo::image_path(found.pid) else {
+    // ② 実行ファイルゲート: 名前で見る（設置場所は環境ごとに違う = 受け入れ条件 4）。
+    //    パスでも在籍表でも引けなければ拒否（#2773 の落とし先も fail-closed のまま）
+    let Some(image) = name_of(found.pid) else {
         return PeerTrust::Rejected(PeerReject::ImageUnknown);
     };
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if !looks_like_tailscale_daemon(&name) {
+    if !looks_like_tailscale_daemon(&image.name) {
         return PeerTrust::Rejected(PeerReject::NotTailscaleDaemon);
     }
-    PeerTrust::Trusted
+    PeerTrust::Trusted {
+        name_from: image.source,
+    }
 }
 
 /// 実行ファイル名が tailscale デーモンのものか（純関数）。
@@ -603,9 +618,153 @@ mod tests {
         let _env = EnvGuard::set(TRUSTED_PEER_NAMES_ENV, &SelfConnection::own_image_name());
         assert_eq!(
             verify_peer(&conn.endpoint, conn.peer()),
-            PeerTrust::Trusted,
-            "所有者ゲート + 実行ファイルゲートの両方を通れば信頼する"
+            PeerTrust::Trusted {
+                name_from: ImageNameSource::Image
+            },
+            "所有者ゲート + 実行ファイルゲートの両方を通れば信頼する。\
+             自分のプロセスは開けるので、名前は従来どおりパスから引く（#2773 の落とし先を通らない）"
         );
+    }
+
+    // --- OpenProcess で開けない接続元の名前（#2773）---
+
+    /// `OpenProcess` の失敗を注入した名前の引き方（在籍表は `roster` を渡す）。
+    /// 落とし先の判定は本番と同じ `procinfo::resolve_image_name` の 1 実装
+    fn open_fails(
+        roster: impl FnOnce() -> Option<Vec<tako_core::platform::procinfo::ProcEntry>>,
+    ) -> impl FnOnce(u32) -> Option<ImageName> {
+        move |pid| tako_core::platform::procinfo::resolve_image_name(pid, None, roster)
+    }
+
+    /// 在籍表に 1 行だけ載せる（`pid` の実行ファイル名が `name`）
+    fn roster_of(
+        pid: u32,
+        name: &str,
+    ) -> impl FnOnce() -> Option<Vec<tako_core::platform::procinfo::ProcEntry>> {
+        let name = name.to_string();
+        move || {
+            Some(vec![tako_core::platform::procinfo::ProcEntry {
+                pid,
+                ppid: 4,
+                name,
+            }])
+        }
+    }
+
+    #[test]
+    fn 開けない接続元は在籍表の名前でtailscaledと分かれば通る() {
+        // env を読む（LEGACY / 信頼名）ので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(開けない接続元は在籍表の名前でtailscaledと分かれば通る)
+        {
+            return;
+        }
+        std::env::remove_var(LEGACY_ENV);
+        std::env::remove_var(TRUSTED_PEER_NAMES_ENV);
+        let conn = SelfConnection::new();
+        // 接続元の pid は本物（自分）を表から引く。名前だけを「OpenProcess で開けず、
+        // 在籍表には tailscaled.exe と載っている」= 非昇格から見た LocalSystem の tailscaled にする
+        let me = std::process::id();
+        assert_eq!(
+            verify_peer_naming(
+                &conn.endpoint,
+                conn.peer(),
+                open_fails(roster_of(me, "tailscaled.exe"))
+            ),
+            PeerTrust::Trusted {
+                name_from: ImageNameSource::Roster
+            },
+            "OpenProcess で開けなくても、在籍表の名前が tailscaled なら通す（#2773）"
+        );
+    }
+
+    #[test]
+    fn 開けない接続元は在籍表の名前が別名なら断る() {
+        // env を読む（LEGACY / 信頼名）ので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(開けない接続元は在籍表の名前が別名なら断る) {
+            return;
+        }
+        std::env::remove_var(LEGACY_ENV);
+        std::env::remove_var(TRUSTED_PEER_NAMES_ENV);
+        let conn = SelfConnection::new();
+        let me = std::process::id();
+        assert_eq!(
+            verify_peer_naming(
+                &conn.endpoint,
+                conn.peer(),
+                open_fails(roster_of(me, "evil.exe"))
+            ),
+            PeerTrust::Rejected(PeerReject::NotTailscaleDaemon),
+            "落とし先の名前も同じ名前ゲートにかける"
+        );
+    }
+
+    #[test]
+    fn 開けない接続元は在籍表でも引けなければ断る() {
+        // env を読む（LEGACY / 信頼名）ので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(開けない接続元は在籍表でも引けなければ断る) {
+            return;
+        }
+        std::env::remove_var(LEGACY_ENV);
+        std::env::remove_var(TRUSTED_PEER_NAMES_ENV);
+        let conn = SelfConnection::new();
+        let me = std::process::id();
+        // 在籍表そのものが取れない（Toolhelp の失敗 / 在籍表を持たない OS）
+        assert_eq!(
+            verify_peer_naming(&conn.endpoint, conn.peer(), open_fails(|| None)),
+            PeerTrust::Rejected(PeerReject::ImageUnknown),
+            "パスでも在籍表でも引けなければ今までどおり断る（fail-closed）"
+        );
+        // 在籍表は取れたが、その pid が載っていない（引いた直後に居なくなった）
+        assert_eq!(
+            verify_peer_naming(
+                &conn.endpoint,
+                conn.peer(),
+                open_fails(roster_of(me.wrapping_add(1), "tailscaled.exe"))
+            ),
+            PeerTrust::Rejected(PeerReject::ImageUnknown),
+            "別の pid の tailscaled を接続元と取り違えない"
+        );
+        // 載っているが名前が空
+        assert_eq!(
+            verify_peer_naming(&conn.endpoint, conn.peer(), open_fails(roster_of(me, "  "))),
+            PeerTrust::Rejected(PeerReject::ImageUnknown),
+            "名前の無い行を名前として使わない"
+        );
+    }
+
+    /// 本物の在籍表で落とし先が当たるか（#2773）。Windows は Toolhelp の `szExeFile` から
+    /// 自分の名前を引けて信頼名の宣言で通る。在籍表を持たない OS は今までどおり
+    /// `ImageUnknown`（Windows 以外の挙動は変えない）
+    #[test]
+    fn 開けない接続元の落とし先は本物の在籍表を引く() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(開けない接続元の落とし先は本物の在籍表を引く)
+        {
+            return;
+        }
+        std::env::remove_var(LEGACY_ENV);
+        let conn = SelfConnection::new();
+        let _env = EnvGuard::set(TRUSTED_PEER_NAMES_ENV, &SelfConnection::own_image_name());
+        let trust = verify_peer_naming(
+            &conn.endpoint,
+            conn.peer(),
+            open_fails(tako_core::platform::procinfo::snapshot_checked),
+        );
+        if tako_core::platform::procinfo::snapshot_supported() {
+            assert_eq!(
+                trust,
+                PeerTrust::Trusted {
+                    name_from: ImageNameSource::Roster
+                },
+                "在籍表から自分の実行ファイル名を引けるはず"
+            );
+        } else {
+            assert_eq!(
+                trust,
+                PeerTrust::Rejected(PeerReject::ImageUnknown),
+                "在籍表を持たない OS は落とし先が無い = 従来どおり断る"
+            );
+        }
     }
 
     #[test]
@@ -681,7 +840,9 @@ mod tests {
         let _env = EnvGuard::set(TRUSTED_PEER_NAMES_ENV, &SelfConnection::own_image_name());
         assert_eq!(
             verify_peer(&conn.endpoint, conn.peer()),
-            PeerTrust::Trusted,
+            PeerTrust::Trusted {
+                name_from: ImageNameSource::Image
+            },
             "同じ接続でも材料が変われば判定も変わる（= 前回の答えを使い回していない）"
         );
     }
