@@ -167,7 +167,8 @@ FAKE
 
 # 偽の agy の入口（API を呼ばない。#2805）。本物と同じく会話のディレクトリ
 # （`~/.gemini/antigravity-cli/brain/<ID>`）を開いたまま持ち（tako は lsof でこれを読む）、実況 JSONL
-# （`brain/<ID>/.system_generated/logs/transcript.jsonl`）へターンを書く。`--conversation <ID>` なら同じ会話
+# （`brain/<ID>/.system_generated/logs/transcript.jsonl`）へターンを書き、会話の実体
+# （`conversations/<ID>.db`。GUI の再起動の復元が在るかを見る）を置く。`--conversation <ID>` なら同じ会話
 write_fake_agy() {
   cat >"$1" <<'FAKE'
 #!/bin/bash
@@ -185,7 +186,10 @@ resumed=no
 [ -n "$cid" ] && resumed=yes
 [ -n "$cid" ] || cid=$(printf '%08x-2805-4000-8000-%012x' "$$" "$(date +%s)")
 brain="$HOME/.gemini/antigravity-cli/brain/$cid"
-mkdir -p "$brain/.system_generated/logs"
+mkdir -p "$brain/.system_generated/logs" "$HOME/.gemini/antigravity-cli/conversations"
+# 会話の実体（本物は SQLite。tako は中身を読まず、在るかで「会話が見つからない」を言い分けて復元を決める）
+db="$HOME/.gemini/antigravity-cli/conversations/$cid.db"
+[ -f "$db" ] || : >"$db"
 transcript="$brain/.system_generated/logs/transcript.jsonl"
 [ -f "$transcript" ] || : >"$transcript"
 echo "START pid=$$ sid=$cid resumed=$resumed" >>"$FAKE_DIR/agy.log"
