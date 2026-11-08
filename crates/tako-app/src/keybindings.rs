@@ -609,12 +609,24 @@ pub(crate) fn is_paste_keystroke(ks: &Keystroke) -> bool {
 /// キー入力 → PTY バイト列。`csi_u` は kitty keyboard protocol（disambiguate
 /// フラグ。TUI が `CSI > 1 u` で有効化。Claude Code 等が Shift+Enter を
 /// 区別するために使う）の送出範囲。UI 層は常に ModifiedOnly 以上を渡す。
-/// それ以外のフラグ（REPORT_ALL_KEYS 等）は未対応（必要になったら拡張する）
-pub(crate) fn keystroke_to_bytes(ks: &Keystroke, csi_u: CsiUMode) -> Option<Vec<u8>> {
+/// それ以外のフラグ（REPORT_ALL_KEYS 等）は未対応（必要になったら拡張する）。
+/// `extended_keys` は送り先のペインへ CSI u が届くか（#729。`TmuxHost::pane_extended_keys`）
+pub(crate) fn keystroke_to_bytes(
+    ks: &Keystroke,
+    csi_u: CsiUMode,
+    extended_keys: bool,
+) -> Option<Vec<u8>> {
     let mods = encode_modifiers(&ks.modifiers);
+    // #729: 修飾付き Enter は AI の送信（`tako_send_input` の keys）と同じ 1 実装で組む。
+    // CSI u を運べない器（psmux）のペインでだけ ESC CR へ落ちる
+    if ks.key == "enter" && mods > 1 {
+        return Some(tako_core::backend::modified_enter_bytes(
+            mods,
+            extended_keys,
+        ));
+    }
     let csi_u_code: Option<u32> = match ks.key.as_str() {
         "escape" if csi_u == CsiUMode::Full || mods > 1 => Some(27),
-        "enter" if mods > 1 => Some(13),
         "tab" if mods > 1 => Some(9),
         "backspace" if mods > 1 => Some(127),
         _ => None,
@@ -938,9 +950,9 @@ mod tests {
         }
     }
 
-    /// 既定モード（ModifiedOnly = 全ペイン共通）でのバイト変換
+    /// 既定モード（ModifiedOnly = 全ペイン共通）・CSI u が届くペインでのバイト変換
     fn keystroke_to_bytes_default(ks: &Keystroke) -> Option<Vec<u8>> {
-        keystroke_to_bytes(ks, CsiUMode::ModifiedOnly)
+        keystroke_to_bytes(ks, CsiUMode::ModifiedOnly, true)
     }
 
     #[test]
@@ -1013,35 +1025,35 @@ mod tests {
     #[test]
     fn disambiguate有効時は修飾付きenterをcsi_uで送る() {
         assert_eq!(
-            keystroke_to_bytes(&ks_shift("enter"), CsiUMode::Full),
+            keystroke_to_bytes(&ks_shift("enter"), CsiUMode::Full, true),
             Some(b"\x1b[13;2u".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks_ctrl("enter"), CsiUMode::Full),
+            keystroke_to_bytes(&ks_ctrl("enter"), CsiUMode::Full, true),
             Some(b"\x1b[13;5u".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks_shift("tab"), CsiUMode::Full),
+            keystroke_to_bytes(&ks_shift("tab"), CsiUMode::Full, true),
             Some(b"\x1b[9;2u".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks_shift("backspace"), CsiUMode::Full),
+            keystroke_to_bytes(&ks_shift("backspace"), CsiUMode::Full, true),
             Some(b"\x1b[127;2u".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks("escape"), CsiUMode::Full),
+            keystroke_to_bytes(&ks("escape"), CsiUMode::Full, true),
             Some(b"\x1b[27u".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks("enter"), CsiUMode::Full),
+            keystroke_to_bytes(&ks("enter"), CsiUMode::Full, true),
             Some(b"\r".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks("tab"), CsiUMode::Full),
+            keystroke_to_bytes(&ks("tab"), CsiUMode::Full, true),
             Some(b"\t".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks("backspace"), CsiUMode::Full),
+            keystroke_to_bytes(&ks("backspace"), CsiUMode::Full, true),
             Some(b"\x7f".to_vec())
         );
     }
@@ -1049,21 +1061,85 @@ mod tests {
     #[test]
     fn 既定モードはesc単押しを素のescで送り修飾付きキーはcsi_uで送る() {
         assert_eq!(
-            keystroke_to_bytes(&ks("escape"), CsiUMode::ModifiedOnly),
+            keystroke_to_bytes(&ks("escape"), CsiUMode::ModifiedOnly, true),
             Some(b"\x1b".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks_shift("enter"), CsiUMode::ModifiedOnly),
+            keystroke_to_bytes(&ks_shift("enter"), CsiUMode::ModifiedOnly, true),
             Some(b"\x1b[13;2u".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks_shift("tab"), CsiUMode::ModifiedOnly),
+            keystroke_to_bytes(&ks_shift("tab"), CsiUMode::ModifiedOnly, true),
             Some(b"\x1b[9;2u".to_vec())
         );
         assert_eq!(
-            keystroke_to_bytes(&ks_shift("escape"), CsiUMode::ModifiedOnly),
+            keystroke_to_bytes(&ks_shift("escape"), CsiUMode::ModifiedOnly, true),
             Some(b"\x1b[27;2u".to_vec())
         );
+    }
+
+    /// #729: CSI u を運べない器（psmux）のペインでは、修飾付き Enter だけを ESC CR（meta-Enter）へ
+    /// 落とす。素の Enter と Enter 以外のキーはペインの器に依らない（Issue の対象は Enter だけ）
+    #[test]
+    fn issue729_csi_uを運べない器のペインでは修飾付きenterをesc_crで送る() {
+        for mode in [CsiUMode::ModifiedOnly, CsiUMode::Full] {
+            for key in [
+                ks_shift("enter"),
+                ks_ctrl("enter"),
+                ks_mods("enter", None, alt()),
+            ] {
+                assert_eq!(
+                    keystroke_to_bytes(&key, mode, false),
+                    Some(b"\x1b\r".to_vec()),
+                    "{key:?}"
+                );
+            }
+            // 境界: 素の Enter は CR のまま（ESC CR にすると送信が改行に化ける）
+            assert_eq!(
+                keystroke_to_bytes(&ks("enter"), mode, false),
+                Some(b"\r".to_vec())
+            );
+            // Enter 以外は器に依らない
+            for key in [
+                ks_shift("tab"),
+                ks_shift("backspace"),
+                ks("escape"),
+                ks_shift("up"),
+            ] {
+                assert_eq!(
+                    keystroke_to_bytes(&key, mode, false),
+                    keystroke_to_bytes(&key, mode, true),
+                    "{key:?}"
+                );
+            }
+        }
+        // 届くペイン（器なし・tmux の器）は CSI u のまま（#28）
+        assert_eq!(
+            keystroke_to_bytes(&ks_mods("enter", None, alt()), CsiUMode::ModifiedOnly, true),
+            Some(b"\x1b[13;3u".to_vec())
+        );
+    }
+
+    /// #729: GUI の打鍵と AI の送信（`tako_send_input` の keys）は修飾付き Enter を同じバイト列にする
+    /// （1 実装 = `tako_core::backend::modified_enter_bytes`。手で押すと改行できるのに AI から送ると
+    /// 無反応、という差を作らない）
+    #[test]
+    fn issue729_修飾付きenterは打鍵とkeysで同じバイト列になる() {
+        let pairs = [
+            (ks_shift("enter"), "S-Enter"),
+            (ks_ctrl("enter"), "C-Enter"),
+            (ks_mods("enter", None, alt()), "M-Enter"),
+            (ks("enter"), "Enter"),
+        ];
+        for extended_keys in [true, false] {
+            for (key, name) in &pairs {
+                assert_eq!(
+                    keystroke_to_bytes(key, CsiUMode::ModifiedOnly, extended_keys),
+                    tako_core::backend::key_name_bytes_in(name, extended_keys),
+                    "{name} extended_keys={extended_keys}"
+                );
+            }
+        }
     }
 
     #[test]

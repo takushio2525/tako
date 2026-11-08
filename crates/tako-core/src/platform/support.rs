@@ -200,6 +200,13 @@ pub mod notes {
         "Moving to the Recycle Bin has been confirmed on real Windows hardware to leave items restorable (names with spaces or Japanese, read-only files, folders with contents). Reveal in Explorer, opening with the default app and trashing paths longer than MAX_PATH were only checked on the implementation before it was ported and have not been re-measured on the current version. Open With (the openas dialog), moving by dragging in the file tree, copy / cut / paste round trips with Explorer and the refusal for moves across drives have not been verified on real Windows hardware (#617)",
     );
 
+    /// #729。psmux は CSI u（`ESC [ 13 ; 2 u`）を内側へ通さないので、器に包まれたペインの
+    /// 修飾付き Enter は `ESC CR`（meta-Enter）へ畳む（`tako_core::backend::modified_enter_bytes`）
+    pub const WIN_PSMUX_MODIFIED_ENTER: Note = Note::new(
+        "器（psmux）のペインでは修飾付き Enter（keys の S-Enter / C-Enter / M-Enter と GUI の Shift / Ctrl / Alt+Enter）を ESC CR（Alt+Enter）へ畳んで送る。Claude Code では改行になるが、Shift / Ctrl / Alt の区別は失われる（psmux が CSI u を内側へ通さないため。#729）。器に包まれていないペインは CSI u のまま。本物の psmux 3.3.7 で claude に改行として届くかは今の実装では未実測",
+        "In psmux container panes, modified Enter (S-Enter / C-Enter / M-Enter in keys, and Shift / Ctrl / Alt+Enter in the GUI) is sent as ESC CR (Alt+Enter). Claude Code treats it as a newline, but the Shift / Ctrl / Alt distinction is lost, because psmux does not pass CSI u through to the inner app (#729). Panes without a container keep CSI u. Whether it reaches claude as a newline through a real psmux 3.3.7 has not been measured with the current implementation",
+    );
+
     /// #2753 以後、会話カタログの書き手は persist ON の走査と tako mod の報告。
     /// Windows の Claude Code が mod を読むかは #1886 で未実測（#2768）
     pub const WIN_SESSIONS_CATALOG_MOD: Note = Note::new(
@@ -1628,9 +1635,12 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_send_input",
         macos: Support::Supported,
-        windows: Support::Supported,
+        // #729: 器（psmux）のペインの修飾付き Enter は ESC CR へ畳む（区別が失われる）ので Degraded
+        windows: Support::Degraded {
+            note: notes::WIN_PSMUX_MODIFIED_ENTER,
+        },
         windows_evidence: Evidence::SelfTest(
-            "項目 19（tako send）。非 ASCII は #907 で器の注入口へ迂回済み",
+            "項目 19（tako send）。非 ASCII は #907 で器の注入口へ迂回済み。#729: 修飾付き Enter の形はペインの器の能力 extended_keys（psmux = false）で選び、GUI の打鍵と keys が同じ tako_core::backend::modified_enter_bytes を通ることを tako-core / tako-control / tako-app の単体（CI の Windows ジョブでも走る）が固定。本物の psmux 3.3.7 での到達は未実測",
         ),
     },
     Feature {

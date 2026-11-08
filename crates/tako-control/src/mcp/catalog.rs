@@ -158,7 +158,7 @@ pub fn tools() -> Vec<Value> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "生のキー名を順に送る（text / click と排他）。[\"Escape\"] で生成を止める。\
-                            Enter / Tab / Space / Up / Down / Left / Right / C-c 等 / 1 文字",
+                            Enter/S-Enter(改行)/Tab/Space/Up/Down/Left/Right/C-c 等/1 文字",
                     },
                     "attachments": {
                         "type": "array",

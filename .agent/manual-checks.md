@@ -538,6 +538,19 @@ tako-app で見る。修正前の形は同じバイナリで `TAKO_724_LEGACY=1`
 - [ ] 印（`<data_dir>\webview-guard.json`）を手で置いて起動 → その Web ビューは自動で開かず「保留」
   （ペインに理由と「開く」）。「開く」で開き、印が消える
 
+### Windows の器（psmux）のペインで Shift+Enter が改行になる（#729）
+
+器のペインの修飾付き Enter を `ESC CR` へ落とす判定と符号化は単体（両 OS の CI）、macOS の tmux の器で
+CSI u のまま届くこと・注入（`TAKO_729_INJECT=no-extended-keys`）で `1b 0d` になることは実経路で
+確認済み。残るのは本物の psmux（3.3.7）での到達と claude の解釈。修正前の形は同じバイナリで
+`TAKO_729_LEGACY=1`（常に CSI u = 何も届かない）。
+
+- [ ] persist ON（器 = psmux）のペインで claude を起こし、`AAA` → Shift+Enter → `BBB` → 2 行に分かれて
+  入力欄に残る（送信もクリアもされない）。Ctrl+Enter・Alt+Enter も同じ
+- [ ] 同じペインへ `tako send --pane <N> --key S-Enter` → 改行が入る（AI の送信も同じ形）
+- [ ] persist OFF の直接ペイン（ConPTY）の claude で Shift+Enter → 改行（CSI u のまま届く）
+- [ ] 器のペインの素の PowerShell で Enter → 従来どおりコマンドが実行される（素の Enter は CR のまま）
+
 ## sleep-guard 状態チップ + 詳細ポップオーバー（#440、2026-07-22）
 
 チップ文言の選択ロジック・ポップオーバー文言の組み立て・絵文字ゼロは unit test で

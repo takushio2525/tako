@@ -216,6 +216,12 @@ FR-2.2.2 追補 3（Issue #2743・2026-11-05）: **生のキーと添付**。外
   ダイアログへの応答は `tako_orchestrator_respond` の 1 本 = 実在の再検証つき）。ペインが
   解決できなければ `tmux_session` へ名前のまま `send-keys` で渡す。1 キーずつ書くが、続けて
   送ったキーは端末側で 1 回に読まれることがある（`["Escape", "1"]` は Alt+1 に見えうる）
+- 修飾付き Enter（#729）: `S-Enter` / `C-Enter` / `M-Enter`（組み合わせ `C-S-Enter` 等も。
+  tmux の `send-keys` と同じ綴り）。形は送り先のペインの器で選び、GUI の Shift / Ctrl / Alt+Enter と
+  同じ 1 実装（`tako_core::backend::modified_enter_bytes`）を通る: 器なし・tmux の器のペインは
+  CSI u（`ESC [ 13 ; 2 u` 等）、CSI u を運べない器（psmux）のペインは `ESC CR`（区別は畳まれる）。
+  判定はペイン単位（`TmuxHost::pane_extended_keys`。設計は `.agent/architecture.md` の
+  「修飾付きキー」）。カタログの説明文は詰めて ±0 B
 - `attachments`（`Send` の欄）: 絶対パスのファイルを対象ペインの作業ディレクトリの
   `.tako-remote-uploads/`（スマホの添付 `/api/upload` と同じ置き場。正本は `tako_core::uploads`）
   へ写し、写した先の絶対パスを本文の後ろへ空白区切りで足して送る（空白を含むパスは `"…"`）。
