@@ -3056,4 +3056,45 @@ mod tests {
                 .is_ok()
         );
     }
+
+    /// #2788: `tako_setup` の `undo` は片付けの要求になり（ツールは増やさない）、答えとは混ぜない
+    #[test]
+    fn tako_setup_の_undo_は片付けの要求になる() {
+        assert_eq!(
+            build_request("tako_setup", &json!({"undo": true}), None, None).unwrap(),
+            Request::SetupUndo { dry_run: None }
+        );
+        assert_eq!(
+            build_request("tako_setup", &json!({"undo": true, "dry_run": true}), None, None)
+                .unwrap(),
+            Request::SetupUndo {
+                dry_run: Some(true)
+            }
+        );
+        // 答えと一緒には受けない（名指して断る）
+        let err = build_request(
+            "tako_setup",
+            &json!({"undo": true, "selected_agent": "claude"}),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("selected_agent"), "{err}");
+        // dry_run だけ（undo なし）は断る
+        assert!(build_request("tako_setup", &json!({"dry_run": true}), None, None).is_err());
+        // undo: false は素の setup（答えに undo を載せない = SetupAnswers が知らない鍵で断らない）
+        assert_eq!(
+            build_request(
+                "tako_setup",
+                &json!({"undo": false, "selected_agent": "claude"}),
+                None,
+                None
+            )
+            .unwrap(),
+            Request::SetupRun {
+                answers: Some(json!({"selected_agent": "claude"}))
+            }
+        );
+        assert!(validate_known_params("tako_setup", &json!({"undo": true, "dry_run": true})).is_ok());
+    }
 }

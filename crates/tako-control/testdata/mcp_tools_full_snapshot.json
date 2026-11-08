@@ -4415,6 +4415,10 @@
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "dry_run": {
+          "description": "undo で外さず判断だけ返す",
+          "type": "boolean"
+        },
         "instruction_content": {
           "description": "選択 agent のグローバル指示ファイルへ書く完全な Markdown。省略は既存維持",
           "type": "string"
@@ -4523,6 +4527,10 @@
             }
           },
           "type": "object"
+        },
+        "undo": {
+          "description": "true で逆に tako の連携（MCP 登録・同期ブロック・mod の skills・PATH）を外す。data dir は残す（アンインストール前）",
+          "type": "boolean"
         }
       },
       "type": "object"

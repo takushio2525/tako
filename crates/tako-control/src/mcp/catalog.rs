@@ -3331,6 +3331,11 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "undo": {
+                        "type": "boolean",
+                        "description": "true で逆に tako の連携（MCP 登録・同期ブロック・mod の skills・PATH）を外す。data dir は残す（アンインストール前）",
+                    },
+                    "dry_run": {"type": "boolean", "description": "undo で外さず判断だけ返す"},
                     "selected_agent": {
                         "type": "string",
                         "enum": ["claude", "codex", "agy"],

@@ -13342,6 +13342,15 @@ fn dispatch_inner(
             run_setup_cli(&tako_bin, &answers_json)
         }
 
+        // #2788: tako が外へ書いた連携を外し、data dir は残す（CLI `tako setup undo` と同じ 1 実装）。
+        // ファイルの読み書きだけでプロセス内で完結し、GUI の状態には触らない
+        Request::SetupUndo { dry_run } => {
+            let targets =
+                crate::setup_undo::Targets::from_process().map_err(SetupRefusal::operation)?;
+            let report = crate::setup_undo::run(&targets, dry_run.unwrap_or(false));
+            Ok(report.to_json(tako_core::i18n::lang()))
+        }
+
         Request::AgentsSyncRules {
             action,
             source,

@@ -148,6 +148,39 @@ fn replace_synced_block(existing: &str, new_content: &str) -> (String, bool) {
     }
 }
 
+/// 同期ブロックの始まりの印はあるが、終わりの印が無い（[`remove_synced_block`] は触らない）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnterminatedBlock;
+
+/// 同期ブロックを取り除いた本文（アンインストールの片付け。#2788）。ブロックが無ければ `None`。
+///
+/// [`replace_synced_block`] の逆: 先頭へ「ブロック + 空行 1 つ」で入れたので、先頭のブロックは
+/// 直後の空行 1 つと一緒に外す（元の本文へバイト単位で戻る）。新規に作ったファイル（ブロックだけ）は
+/// 空文字列になる。利用者が途中へ動かしたブロックは、前後の空行が二重にならないよう直後の空行を
+/// 1 つだけ外す。**ブロックの外は 1 文字も変えない**（行末の CRLF もそのまま）。
+/// 始まりの印の後に終わりの印が無ければ、どこまでが tako のものか分からないので
+/// [`UnterminatedBlock`] を返して触らせない
+pub fn remove_synced_block(existing: &str) -> Result<Option<String>, UnterminatedBlock> {
+    let is_blank = |line: &str| line.trim().is_empty();
+    let mut lines: Vec<&str> = existing.split_inclusive('\n').collect();
+    let mut removed = false;
+    // 2 つ以上あっても（手で写した等）全部外す。1 回で必ず 1 つ減るので有限で終わる
+    while let Some(begin) = lines.iter().position(|l| l.trim() == BEGIN_MARKER) {
+        let end = lines[begin + 1..]
+            .iter()
+            .position(|l| l.trim() == END_MARKER)
+            .map(|offset| begin + 1 + offset)
+            .ok_or(UnterminatedBlock)?;
+        lines.drain(begin..=end);
+        let before_is_blank = begin == 0 || is_blank(lines[begin - 1]);
+        if lines.get(begin).is_some_and(|l| is_blank(l)) && before_is_blank {
+            lines.remove(begin);
+        }
+        removed = true;
+    }
+    Ok(removed.then(|| lines.concat()))
+}
+
 /// バックアップファイルのパスを決定（.bak、既存なら .bak.1, .bak.2 ...）
 fn backup_path(file: &Path) -> PathBuf {
     let name = file
@@ -483,5 +516,52 @@ mod tests {
         assert!(result.contains("Line3\nLine4\n"));
         assert!(!result.contains("old stuff"));
         assert!(result.contains("new content"));
+    }
+
+    /// #2788: 同期で入れたブロックを外すと、入れる前の本文へバイト単位で戻る
+    #[test]
+    fn issue2788_remove_restores_original_bytes() {
+        for original in [
+            "# My Rules\n\nSome content\n",
+            "no trailing newline",
+            "\n先頭が空行\n",
+            "# CRLF\r\n\r\nbody\r\n",
+        ] {
+            let (inserted, _) = replace_synced_block(original, "common rules\n");
+            assert_eq!(
+                remove_synced_block(&inserted),
+                Ok(Some(original.to_string())),
+                "{original:?}"
+            );
+        }
+        // 新規に作ったファイル（ブロックだけ）は空になる
+        let created = emit_synced_block("common rules");
+        assert_eq!(remove_synced_block(&created), Ok(Some(String::new())));
+    }
+
+    #[test]
+    fn issue2788_remove_moved_block_keeps_outside_and_single_blank() {
+        let text = format!("# A\n\n{BEGIN_MARKER}\nx\n{END_MARKER}\n\n# B\n");
+        assert_eq!(
+            remove_synced_block(&text),
+            Ok(Some("# A\n\n# B\n".to_string()))
+        );
+        // 前が空行でなければ直後の空行は残す（利用者の段落の区切り）
+        let text = format!("# A\n{BEGIN_MARKER}\nx\n{END_MARKER}\n\n# B\n");
+        assert_eq!(
+            remove_synced_block(&text),
+            Ok(Some("# A\n\n# B\n".to_string()))
+        );
+    }
+
+    #[test]
+    fn issue2788_remove_without_block_or_end_marker() {
+        assert_eq!(remove_synced_block("# only mine\n"), Ok(None));
+        let broken = format!("{BEGIN_MARKER}\n利用者の本文\n");
+        assert_eq!(remove_synced_block(&broken), Err(UnterminatedBlock));
+        // 2 つあれば両方外す
+        let twice =
+            format!("{BEGIN_MARKER}\na\n{END_MARKER}\n\nmine\n{BEGIN_MARKER}\nb\n{END_MARKER}\n");
+        assert_eq!(remove_synced_block(&twice), Ok(Some("mine\n".to_string())));
     }
 }

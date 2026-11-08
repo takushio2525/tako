@@ -577,6 +577,31 @@ pub fn run_bootstrap(
     Ok(())
 }
 
+/// `tako setup undo [--dry-run] [--json]`（#2788）。tako が外へ書いた連携を外し、data dir は残す。
+///
+/// 判断と書き込みは `tako_control::setup_undo` の 1 実装（MCP `tako_setup` の `undo` と同じ）。
+/// GUI を通さず data dir にも触れないので、tako が動いていなくても・アンインストーラーからでも打てる。
+/// 外せなかった項目があれば終了コード 1（残りは進めてある）
+pub fn run_undo(dry_run: bool, json: bool) -> Result<(), String> {
+    use tako_control::setup_undo;
+    // 守る data dir が引けない隔離（`TAKO_ISOLATED=1` で `TAKO_DATA_DIR` が無い）は断る（#2694）
+    crate::local_data_gate()?;
+    let lang = tako_core::i18n::lang();
+    let targets = setup_undo::Targets::from_process().map_err(|e| e.text_in(lang))?;
+    let report = setup_undo::run(&targets, dry_run);
+    if json {
+        println!("{}", crate::pretty_json(&report.to_json(lang)));
+    } else {
+        for line in report.render_lines(lang) {
+            eprintln!("{line}");
+        }
+    }
+    match report.failed() {
+        0 => Ok(()),
+        count => Err(setup_undo::UndoText::FailedCount { count }.text_in(lang)),
+    }
+}
+
 fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
     match action {
         "status-all" => {

@@ -440,6 +440,28 @@ pub fn remove_from_previous_profile_in_typed(
         .transpose()
 }
 
+/// tako の PATH ブロックが入りうるログインシェルの profile（`$HOME` 相対）と、その種別（#2788）。
+///
+/// setup が書いたことのある置き場の全部（[`ShellKind::login_profile_in`] が選びうるもの）。
+/// アンインストールの片付けは今の `$SHELL` に限らずこの全部を見る（ログインシェルを変えた人の
+/// 古いブロックも、tako を消した後には誰も外せなくなるため）
+pub const PATH_BLOCK_PROFILES: [(ShellKind, &str); 5] = [
+    (ShellKind::Zsh, ".zprofile"),
+    (ShellKind::Bash, ".bash_profile"),
+    (ShellKind::Bash, ".bash_login"),
+    (ShellKind::Sh, ".profile"),
+    (ShellKind::Fish, ".config/fish/config.fish"),
+];
+
+/// 名指した `profile` から tako のブロックを取り除く（[`remove_from_profile_in`] と同じ 1 実装。
+/// アンインストールの片付けが [`PATH_BLOCK_PROFILES`] を 1 つずつ渡す口。#2788）
+pub fn remove_block_from_typed(
+    shell: ShellKind,
+    profile: &Path,
+) -> Result<EnsureOutcome, PathBlockError> {
+    remove_block_at(shell, profile.to_path_buf())
+}
+
 /// `profile` から tako のブロックを取り除く（元のバイト列へ完全に戻す。無ければ触らない）。
 ///
 /// 外して 0 バイトになったら**ファイルごと消す**（#2602）。text_block は無いファイルを空として読むので、

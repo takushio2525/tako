@@ -6,6 +6,9 @@
 ;   - 配置するのは tako-app.exe（GUI）と tako.exe（CLI）の 2 本。
 ;     この 2 本は必ず同一ディレクトリに置く。dispatch.rs の resolve_tako_binary() が
 ;     current_exe の兄弟として tako.exe を解決するため、離すと AI 経由の CLI 操作が壊れる。
+;   - アンインストールは、ファイルを消す前に `{app}\tako.exe setup undo` で tako が外へ書いた連携
+;     （MCP 登録・指示ファイルの同期ブロック・mod の skills・WebView2 のキャッシュ）を外す（#2788）。
+;     データ（%APPDATA%\tako）は残す。上書きインストール・アプリ内更新では走らない。
 ;   - ユーザー PATH（HKCU\Environment）へ {app} を追加する。tako 自身は PATH を触らないので、
 ;     ペイン内で `tako` を叩く「AI フルコントロール」経路はこの追加に依存している。
 ;     HKLM は一切触らない。
@@ -376,8 +379,34 @@ begin
     InstallSucceeded := True;
 end;
 
+{ #2788: tako が外へ書いた連携（agent への MCP 登録・指示ファイルの同期ブロック・mod の skills・
+  WebView2 のキャッシュ）を、ファイルを消す前に tako 自身に外させる（tako setup undo = 1 実装）。
+  データ（%APPDATA%\tako の設定・レイアウト・ログ・会話のカタログ）は残す。
+  ここはアンインストーラーだけが通る。上書きインストール・アプリ内更新（#2434 / #2443 の無言インストール）は
+  アンインストーラーを起こさないので片付けは走らない（CurStepChanged からは呼ばない。番犬が縛る）。
+  失敗してもアンインストールは止めない（結果はアンインストールのログへ残す） }
+procedure UndoTakoIntegrations();
+var
+  Cli: string;
+  ResultCode: Integer;
+begin
+  Cli := ExpandConstant('{app}\{#CliExeName}');
+  if not FileExists(Cli) then
+  begin
+    Log('tako setup undo: tako.exe not found: ' + Cli);
+    Exit;
+  end;
+  if Exec(Cli, 'setup undo', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    Log(Format('tako setup undo finished (exit %d)', [ResultCode]))
+  else
+    Log(Format('tako setup undo could not start: %s', [SysErrorMessage(ResultCode)]));
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
+  { ファイルを消す直前（tako.exe がまだ在る）に連携を外す }
+  if CurUninstallStep = usUninstall then
+    UndoTakoIntegrations();
   { タスクを選んでいたかに関わらず消す。入っていなければ EnvRemovePath は何もしない }
   if CurUninstallStep = usPostUninstall then
     EnvRemovePath(ExpandConstant('{app}'));

@@ -549,6 +549,18 @@ jobs:
           # 落ちた理由を PR のチェックの注釈へ名指しで出す（例外のままだとログの奥にしか残らない）
           try { Test-TakoInstalledPayload -Setup $setup[0].FullName }
           catch { Write-Host "::error::[#2767 インストーラーの一巡] $($_.Exception.Message)"; exit 1 }
+      # #2788: アンインストールの片付けの一巡（入れる → setup で連携を書く → 上書きインストール = アプリ内更新の
+      # 引数 → アンインストール）。上のステップが組んだインストーラーをそのまま使う。USERPROFILE / APPDATA /
+      # LOCALAPPDATA は一時 dir の砂場、claude は偽物（scripts/windows/fake-claude.rs）。
+      # **アンインストーラーが tako setup undo を起こさない・上書きインストールで片付けが走る・data dir を書き換える・
+      # 利用者の MCP 登録や本文を消す形へ戻ったらここで落ちる**
+      - name: アンインストールの片付けの一巡（#2788。連携が外れ data dir と利用者のものが残る）
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'tako-installer-2767'
+          $setup = @(Get-ChildItem -LiteralPath $out -Filter '*.exe' -File)
+          if ($setup.Count -ne 1) { Write-Error "インストーラーが 1 本に決まらない: $($setup.Name -join ', ')"; exit 1 }
+          pwsh -File scripts/windows/test-uninstall-cleanup-2788.ps1 -Setup $setup[0].FullName
       # **テストの「コンパイル」だけは blocking** にする（#1264）。
       # 上の `cargo build --workspace` は `tests/` のターゲットをコンパイルしないので、
       # Windows 専用の統合テスト（`#![cfg(windows)]` = macOS では空クレート）が

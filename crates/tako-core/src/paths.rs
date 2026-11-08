@@ -586,12 +586,17 @@ pub fn default_data_dir() -> Option<PathBuf> {
     }
 }
 
+/// macOS の既定の data dir（`$HOME` 相対）。Homebrew の cask の `zap` が消す置き場もこれと同じ
+/// （番犬 `issue2788_uninstall_cleanup_watchdog` が `distribution/homebrew-cask-draft.rb` と突き合わせる。
+/// cask は macOS 専用なので、どの OS の CI からも読めるよう定数で持つ）
+pub const MACOS_DATA_DIR_REL: &str = "Library/Application Support/tako";
+
 /// unix の [`default_data_dir`] のうち HOME から組み立てる規則（`XDG_DATA_HOME` は見ない）。
 /// 子プロセスへ一時の HOME を渡すテストが、その子の既定の置き場を同じ 1 実装で求める口（#2531）
 #[cfg(unix)]
 pub fn default_data_dir_under_home(home: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/tako")
+        home.join(MACOS_DATA_DIR_REL)
     } else {
         home.join(".local/share/tako")
     }

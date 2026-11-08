@@ -231,7 +231,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 
 | ツール名 | 説明 |
 |---|---|
-| `tako_setup` | `tako setup` を非対話で実行する（日本語の希望を回答 JSON にして代行） |
+| `tako_setup` | `tako setup` を非対話で実行する（日本語の希望を回答 JSON にして代行）。`undo: true` は逆に tako が外へ書いた連携を外す（`tako setup undo` と同じ。データは残す。`dry_run: true` で判断だけ） |
 | `tako_setup_changes` | setup のアップデート追従状況を照会する |
 | `tako_setup_mcp` | claude / codex / agy へ MCP 接続設定を追加する（`agent` 省略で導入済みの全 CLI） |
 | `tako_setup_bootstrap` | エージェント CLI（claude / codex / agy）が未導入の環境へのゼロスタート導入 |
