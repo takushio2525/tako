@@ -1313,6 +1313,8 @@ ANSI コードページ**（英語版 = CP1252 / 日本語版 = CP932）とし�
 | `installer/windows/make-icon.ps1` | 開発者（`.ico` はコミット済み。`commands.md` の `pwsh -File`） | (B) |
 | `installer/windows/lib/release-assets.ps1` | 上の 3 本と `verify-assets.ps1` が dot-source・`release_assets.rs` のテストが pwsh で | (B) |
 | `installer/windows/lib/verify-assets.ps1` | CI（`shell: pwsh` で dot-source）と `release-windows.ps1`・`license_bundle_watchdog` が pwsh で | (B) |
+| `installer/windows/lib/user-path.ps1` | `verify-assets.ps1` と `scripts/windows/test-setup-windows-2767.ps1` が dot-source（CI だけ。#2767） | (B) |
+| `scripts/windows/test-setup-windows-2767.ps1` | CI の windows ジョブ（`ci.yml` の `pwsh -File`。#2767） | (B) |
 | `scripts/windows/measure-window.ps1` | 開発者の実機計測。本文の Usage が `powershell -File`（5.1）で、もともと 5.1 向けに ASCII で書いてある | (A) |
 | `scripts/windows/check-powershell51.ps1` | CI の windows ジョブが `shell: powershell`（5.1）で走らせる | (A) |
 | `crates/tako-core/shell-integration/tako.ps1` | tako がペインの PowerShell（5.1 を含む）を起こすときにテキストとして読ませる（#2432。それまでは利用者の `$PROFILE` から読んでいた）。リポジトリの写しは `include_str!` のテンプレートで ASCII（番犬あり）、書き出し時に BOM を付ける | 例外（`EXEMPT`） |

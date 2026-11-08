@@ -61,14 +61,22 @@ GPL-3.0 第 4 条・Apache-2.0 第 4 条 (a)・MIT / BSD の表示義務は、�
   zip は `Test-TakoWindowsAssets` が展開してリポジトリの元ファイルとのバイト一致を見る
   （CI・実機の両経路）。インストール先は `Test-TakoInstalledPayload` が**使い捨ての CI
   ランナーでだけ**無人インストールして見る（実機で走らせると同じ AppId の実インストールの
-  登録を上書きするので、`release-windows.ps1` からは呼ばない。番犬もこれを固定する）
+  登録を上書きするので、`release-windows.ps1` からは呼ばない。番犬もこれを固定する）。
+  同じ 1 回のインストールで**一巡**も見る（#2767）: ユーザー環境変数 Path（HKCU）にインストール先が
+  1 回入る → インストール先の `tako.exe --version` がインストーラーの FileVersion と同じ版で動き、
+  Path を読み直した新しい cmd からも `tako` が引ける → アンインストーラー（`UninstallString`）で
+  exe とアンインストール情報が消え、Path が検査前の並びに戻る。Path は最後に必ず検査前へ戻す。
+  PR の CI（`ci.yml` の windows）も debug の exe を `build-installer.ps1 -SkipBuild -BinDir target/debug`
+  で包んで同じ関数を回す（tako.iss を変えた PR がタグを待たずに落ちる）。番犬は
+  `crates/tako-control/tests/issue2767_windows_setup_e2e_watchdog.rs`
 - **公開後の検査**（#1850）: `scripts/release.sh --check-assets [tag]` が Release の zip（両 OS）を
   一時 dir へ取得し（`gh release download` の読み取りだけ・確かめたら消す）、同梱表の全部が入って
   **そのタグのファイルと**バイト一致するかを見る。zip の中の置き場は macOS =
   `tako.app/Contents/Resources/`・Windows = `tako/`（v0.8.37 の実物で確認）。`.exe` は開けないので
   見ない。v0.8.25（同梱前）は Windows の zip の 2 本の欠けで exit 1、v0.8.37 は通る。
   モックは `scripts/test-release-retry.sh` の Test 9〜13
-- **Windows の配布物のドライラン**: PR の CI は Windows の配布物を組まない（タグ push 時だけ）。
+- **Windows の配布物のドライラン**: PR の CI は Windows の**リリースの**配布物を組まない（タグ push 時だけ。
+  インストーラーの一巡だけは debug の exe で組んで回す = #2767）。
   組み立てを変えた PR は `gh workflow run release-windows.yml --ref <ブランチ>` で確かめる。
   タグ以外の ref では Cargo.toml の版数で組み立て・検査・artifact 保存（`tako-windows-dryrun-<run id>`）
   までを行い、**Release へは添付しない**。ログの「zip の tako/ の中身」「インストール先の中身」が

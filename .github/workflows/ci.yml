@@ -517,6 +517,38 @@ jobs:
           key: manifest-${{ steps.cargo-root.outputs.key }}
       - name: ビルド
         run: cargo build --workspace
+      # #2767: `tako setup` 一式を Windows で通しに回す（macOS の test-setup-*.sh に当たる実経路テスト）。
+      # 初回起動の自動の段 → `--yes --answers` → `--check` → `bootstrap undo-path / path` → `setup-mcp` と
+      # 境界（未ログイン・不正な answers）。USERPROFILE / APPDATA / LOCALAPPDATA / TEMP は一時 dir の砂場、
+      # claude は scripts/windows/fake-claude.rs を rustc で組んだ偽物（外部のインストールスクリプトは走らない）。
+      # ユーザー環境変数 Path（HKCU）は足した後に読み戻して確かめ、最後に検査前へ戻す。
+      # 全数より手前に名指しで置く（#1282 と同じ理由）。上のビルドの tako.exe を使うので追加の組み立ては無い。
+      # **setup が Path を足さない / 外さない・agent を対話起動する・砂場の外へ書く形へ戻ったらここで落ちる**
+      - name: setup の通し検査（#2767。隔離した USERPROFILE / APPDATA と偽の claude.exe）
+        shell: pwsh
+        run: pwsh -File scripts/windows/test-setup-windows-2767.ps1
+      # #2767: インストーラーの一巡（入れる → 中身 → ユーザー環境変数 Path → tako.exe の起動 → アンインストール →
+      # Path が外れる）。PR の CI は release を組まないので、上のビルドの debug の exe を同じ build-installer.ps1 で
+      # 包む（tako.iss はリリースと同じ）。検査は release-windows.yml と同じ Test-TakoInstalledPayload の 1 実装。
+      # Inno Setup はランナーイメージに入っているが、消えていたら入れる（release-windows.yml と同じ）。
+      # **tako.iss の Path の足し引き（EnvAddPath / EnvRemovePath）が壊れたらここで落ちる**
+      - name: インストーラーの一巡の検査（#2767。debug の exe で組み、入れる → Path → 起動 → アンインストール）
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue) -or (Test-Path -LiteralPath (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'))
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { Write-Error "choco install innosetup が失敗 (exit $LASTEXITCODE)"; exit 1 }
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'tako-installer-2767'
+          pwsh -File installer/windows/build-installer.ps1 -SkipBuild -SkipZip -BinDir target/debug -OutDir $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          . installer/windows/lib/verify-assets.ps1
+          $setup = @(Get-ChildItem -LiteralPath $out -Filter '*.exe' -File)
+          if ($setup.Count -ne 1) { Write-Error "インストーラーが 1 本に決まらない: $($setup.Name -join ', ')"; exit 1 }
+          # 落ちた理由を PR のチェックの注釈へ名指しで出す（例外のままだとログの奥にしか残らない）
+          try { Test-TakoInstalledPayload -Setup $setup[0].FullName }
+          catch { Write-Host "::error::[#2767 インストーラーの一巡] $($_.Exception.Message)"; exit 1 }
       # **テストの「コンパイル」だけは blocking** にする（#1264）。
       # 上の `cargo build --workspace` は `tests/` のターゲットをコンパイルしないので、
       # Windows 専用の統合テスト（`#![cfg(windows)]` = macOS では空クレート）が
