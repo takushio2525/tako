@@ -48,6 +48,39 @@ impl Drop for HomeGuard {
     }
 }
 
+/// `CODEX_HOME` を差し替える（`None` = 外す。#2798）。`HOME` と同じくプロセスに 1 つなので、
+/// `tako_core::run_alone!` を通したその 1 本だけの子の中でしか呼べない（子は終われば消えるので戻さない）
+pub(crate) fn set_codex_home(value: Option<&std::ffi::OsStr>) {
+    tako_core::test_child::assert_alone("set_codex_home");
+    match value {
+        Some(v) => std::env::set_var(crate::codex_session::CODEX_HOME_ENV, v),
+        None => std::env::remove_var(crate::codex_session::CODEX_HOME_ENV),
+    }
+}
+
+/// `CODEX_HOME` の値と、そのとき読み手が見るべき codex の置き場（#2798）。
+///
+/// `home` は差し替えた `HOME`（[`HomeGuard::set`]）、`scratch` は空でない値に使う置き場。
+/// 空文字・空白だけは**未設定と同じ** `<HOME>/.codex`、空でない値（相対パスも）は手を加えずそのまま
+pub(crate) fn codex_home_cases(
+    home: &Path,
+    scratch: &Path,
+) -> Vec<(&'static str, Option<OsString>, std::path::PathBuf)> {
+    let default = home.join(".codex");
+    let custom = scratch.join("custom-codex");
+    vec![
+        ("未設定", None, default.clone()),
+        ("空文字", Some("".into()), default.clone()),
+        ("空白だけ", Some(" \t ".into()), default),
+        ("絶対パス", Some(custom.clone().into_os_string()), custom),
+        (
+            "相対パス",
+            Some("rel/codex".into()),
+            std::path::PathBuf::from("rel/codex"),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

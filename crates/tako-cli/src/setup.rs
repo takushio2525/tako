@@ -86,17 +86,13 @@ fn setup_dir() -> Result<PathBuf, String> {
     tako_control::setup::setup_dir()
 }
 
-fn codex_home_dir() -> Option<PathBuf> {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home_dir().map(|home| home.join(".codex")))
-}
-
 fn instruction_path(agent: SetupAgent) -> Option<PathBuf> {
     let home = home_dir()?;
     Some(match agent {
         SetupAgent::Claude => home.join(".claude/CLAUDE.md"),
-        SetupAgent::Codex => codex_home_dir()?.join("AGENTS.md"),
+        // 空・空白だけの `CODEX_HOME` は未設定と同じ = `~/.codex`（#2798。前は作業 dir の AGENTS.md へ
+        // 書いていた）。解決の正本は codex_session。ここに来た時点でホームは絶対パス
+        SetupAgent::Codex => tako_control::codex_session::codex_home()?.join("AGENTS.md"),
         SetupAgent::Agy => home.join(".gemini/GEMINI.md"),
     })
 }
@@ -3994,6 +3990,44 @@ fn print_context_budget_status() {
 mod tests {
     use super::*;
     use tako_control::setup::SetupConfig;
+
+    /// #2798: codex の指示ファイルの書き先は、空・空白だけの `CODEX_HOME` でも `~/.codex/AGENTS.md`
+    /// （前は空のパスへ join して**作業 dir の `AGENTS.md`** を指し、setup がそこへ書いていた）。
+    /// 空でない値（相対パスも）は手を加えない
+    #[test]
+    fn issue2798_空のcodex_homeでも指示ファイルは既定の置き場() {
+        if tako_core::run_alone!(issue2798_空のcodex_homeでも指示ファイルは既定の置き場)
+        {
+            return;
+        }
+        let scratch = tako_core::test_residue::ScratchDir::new("cli-setup-codex-home-2798");
+        let home = scratch.path().join("home");
+        let custom = scratch.path().join("custom-codex");
+        // 子の中だけ（他のテストは居ない。子は終われば消えるので戻さない = #2400）
+        std::env::set_var("HOME", &home);
+        let cases: [(&str, Option<&std::ffi::OsStr>, PathBuf); 5] = [
+            ("未設定", None, home.join(".codex")),
+            ("空文字", Some("".as_ref()), home.join(".codex")),
+            ("空白だけ", Some(" \t ".as_ref()), home.join(".codex")),
+            ("絶対パス", Some(custom.as_os_str()), custom.clone()),
+            (
+                "相対パス",
+                Some("rel/codex".as_ref()),
+                PathBuf::from("rel/codex"),
+            ),
+        ];
+        for (label, value, dir) in cases {
+            match value {
+                Some(v) => std::env::set_var(tako_control::codex_session::CODEX_HOME_ENV, v),
+                None => std::env::remove_var(tako_control::codex_session::CODEX_HOME_ENV),
+            }
+            assert_eq!(
+                instruction_path(SetupAgent::Codex),
+                Some(dir.join("AGENTS.md")),
+                "{label}"
+            );
+        }
+    }
 
     /// **#1510 の受け入れ条件 3**: GUI の初回起動の自動の段（`welcome::auto_setup_answers`）は、
     /// エージェント CLI の公式インストーラも brew / winget の依存導入も**走らせない**。

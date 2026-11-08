@@ -1048,6 +1048,11 @@ Win32 のパス正規化と `MAX_PATH` 制限を無効にする**入口指定**�
 - **「`cfg(test)` の中だけ許す」という走査は書かない**: テスト本文の文字列リテラルに
   `{` が 1 つあるだけで波括弧の対応が崩れ、そのファイルの残り全部が例外になる
   （= 本番コードの直読みを見逃す）。数え違いが「見逃す」側へ倒れる検査は番犬にならない
+- **codex の置き場（`CODEX_HOME`）も入口は 1 本**: `tako_control::codex_session::codex_home()`
+  （値だけを持つとき = env 計画の export は `codex_home_value`）。**空・空白だけは未設定と同じ**
+  `~/.codex`（Windows の PowerShell は `$null` を空文字列で渡す）。素の `var_os("CODEX_HOME")` は
+  空を置き場として join し作業 dir の `config.toml` / `AGENTS.md` / `auth.json` を見るので、
+  正本の外の素の読み出しは番犬 `issue2798_codex_home_resolution_watchdog` が file:line で落とす（#2798）
 
 `~` 短縮を各所で組み立てると、同じ規則が**別々に劣化する**。移送前は 10 か所にあって、
 ①ホーム解決の欠け（Windows で 1 つも縮まらない）②ホーム自身の扱い（`~` を出す実装と

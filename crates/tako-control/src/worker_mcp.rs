@@ -581,11 +581,15 @@ pub fn prepare_from(
 ///
 /// env 計画の export（プロファイル / アカウントの `env:`）→ 明示の unset なら既定の `~/.codex` →
 /// 検証プロセスでは検証用のホームの `.codex`（本物の設定を読まない。usage の `codex_homes` と同じ）→
-/// tako の環境変数 `CODEX_HOME` → `~/.codex`
+/// tako の環境変数 `CODEX_HOME` → `~/.codex`。
+/// export も env と同じく**空・空白だけは決めていない**と読む（値の読み方の正本は codex_session。#2798）
 pub fn codex_home_for(env: &EnvPlan) -> Option<PathBuf> {
-    const KEY: &str = "CODEX_HOME";
-    if let Some(v) = env.export_value(KEY).filter(|v| !v.is_empty()) {
-        return Some(PathBuf::from(v));
+    const KEY: &str = crate::codex_session::CODEX_HOME_ENV;
+    if let Some(home) = env
+        .export_value(KEY)
+        .and_then(|v| crate::codex_session::codex_home_value(std::ffi::OsStr::new(v)))
+    {
+        return Some(home);
     }
     if env.unsets.iter().any(|k| k == KEY) || tako_core::paths::is_verification_process() {
         return crate::orchestrator::agent_config_home().map(|h| h.join(".codex"));
@@ -1303,6 +1307,20 @@ trust_level = "trusted"
             fallback,
             crate::orchestrator::agent_config_home().map(|h| h.join(".codex"))
         );
+        // #2798: export の空・空白だけも決めていないと読む（空のパスを置き場にしない）
+        for blank in ["", " \t "] {
+            let plan = EnvPlan {
+                exports: vec![("CODEX_HOME".into(), blank.into())],
+                unsets: vec![],
+            };
+            assert_eq!(codex_home_for(&plan), fallback, "{blank:?}");
+        }
+        // 相対パスの export は値のまま
+        let plan = EnvPlan {
+            exports: vec![("CODEX_HOME".into(), "rel/ch".into())],
+            unsets: vec![],
+        };
+        assert_eq!(codex_home_for(&plan), Some(PathBuf::from("rel/ch")));
     }
 
     #[test]

@@ -695,9 +695,8 @@ pub fn normalize_plan(plan: &str) -> String {
 /// Codex の OAuth JWT payload に含まれる ChatGPT plan claim をローカルで読む。
 /// token 自体・account ID・メールアドレスは戻り値にもログにも出さない。
 pub fn codex_plan_from_auth_file() -> Option<String> {
-    let home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| tako_core::paths::home_dir().map(|h| h.join(".codex")))?;
+    // 空・空白だけの `CODEX_HOME` は未設定と同じ（#2798。前は作業 dir の auth.json を読んでいた）
+    let home = crate::codex_session::codex_home()?;
     codex_plan_from_auth_file_at(&home.join("auth.json"))
 }
 
@@ -2470,6 +2469,42 @@ fn homebrew_json() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2798: codex のプランの読み取りは、空・空白だけの `CODEX_HOME` でも `~/.codex/auth.json` を読む
+    /// （前は空のパスへ join して作業 dir の `auth.json` を読み、ログイン済みでもプランが空だった）
+    #[test]
+    fn issue2798_空のcodex_homeでも既定の置き場の認証ファイルを読む() {
+        if tako_core::run_alone!(issue2798_空のcodex_homeでも既定の置き場の認証ファイルを読む)
+        {
+            return;
+        }
+        let scratch = tako_core::test_residue::ScratchDir::new("bootstrap-codex-home-2798");
+        let home = scratch.path().join("home");
+        let _home = crate::test_home::HomeGuard::set(&home);
+        let api_login = r#"{"OPENAI_API_KEY":"test-key-2798"}"#;
+        let put = |dir: &Path| {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("auth.json"), api_login).unwrap();
+        };
+        for (label, value, dir) in crate::test_home::codex_home_cases(&home, scratch.path()) {
+            crate::test_home::set_codex_home(value.as_deref());
+            if dir.is_absolute() {
+                put(&dir);
+                assert_eq!(
+                    codex_plan_from_auth_file().as_deref(),
+                    Some("api"),
+                    "{label}"
+                );
+                std::fs::remove_file(dir.join("auth.json")).unwrap();
+            } else {
+                // 相対パスは値のまま（作業 dir の下）を読む = 既定の置き場へは倒さない。
+                // 作業 dir へは書かないので、既定の置き場にだけ置いて読まないことを見る
+                put(&home.join(".codex"));
+                assert_eq!(codex_plan_from_auth_file(), None, "{label}");
+                std::fs::remove_file(home.join(".codex").join("auth.json")).unwrap();
+            }
+        }
+    }
 
     /// #2550: 種別の分からない `$SHELL` を zsh と見なさない（空・未設定のときだけ OS の既定）
     #[test]
