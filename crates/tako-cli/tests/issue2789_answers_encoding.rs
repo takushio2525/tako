@@ -14,7 +14,8 @@
 //!
 //! 両 OS で走らせる（Windows の CI は PowerShell 5.1 の `Out-File` の実物を
 //! `scripts/windows/test-setup-windows-2767.ps1` でも通す）。
-//! A/B: `TAKO_2789_CLI_BIN=<修正前の tako>` で別のバイナリを叩ける（修正前は 6 ケースで落ちる）
+//! A/B: `TAKO_2789_CLI_BIN=<修正前の tako>` で別のバイナリを叩ける（修正前は 4 つの符号化の検査が
+//! BOM 付きの UTF-8 と UTF-16 の 6 ケース、読めない形の検査が 6 ケース全部で落ちる）
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -182,6 +183,15 @@ fn issue2789_4つの符号化の答えはファイルと標準入力で同じ答
     assert!(failures.is_empty(), "{}", failures.join("\n---\n"));
 }
 
+/// 読めない形の 1 ケース（表示言語・名前・読み元 = `file` / `-`・バイト列・出てほしい文）
+type Refusal = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Vec<u8>,
+    &'static [&'static str],
+);
+
 /// 受け入れ条件 3 の CLI の口: BOM の無い UTF-16・空・BOM だけは、何の形と見たかと直し方を
 /// 表示言語で言って断る（英語表示の断りに日本語が混ざらない）
 #[test]
@@ -190,7 +200,7 @@ fn issue2789_読めない形は表示言語で何の形と見たかと直し方�
         .encode_utf16()
         .flat_map(u16::to_le_bytes)
         .collect();
-    let cases: [(&str, &str, &str, Vec<u8>, &[&str]); 6] = [
+    let cases: [Refusal; 6] = [
         (
             "en",
             "BOM の無い UTF-16LE のファイル",
@@ -296,15 +306,30 @@ fn issue2789_windowsのciは51のout_fileで書いた答えを通す段を持つ
             r"System32\WindowsPowerShell\v1.0\powershell.exe",
             "pwsh 7 ではなく Windows PowerShell 5.1 の実物で書く",
         ),
-        ("Encoding = ''", "Out-File の既定（BOM 付きの UTF-16LE）の段"),
-        ("Encoding = ' -Encoding utf8'", "-Encoding utf8（BOM 付きの UTF-8）の段"),
-        ("Head = 'FF-FE'", "既定の書き出しが UTF-16LE の BOM で始まる前提を確かめる"),
-        ("Head = 'EF-BB-BF'", "-Encoding utf8 が UTF-8 の BOM で始まる前提を確かめる"),
+        (
+            "Encoding = ''",
+            "Out-File の既定（BOM 付きの UTF-16LE）の段",
+        ),
+        (
+            "Encoding = ' -Encoding utf8'",
+            "-Encoding utf8（BOM 付きの UTF-8）の段",
+        ),
+        (
+            "Head = 'FF-FE'",
+            "既定の書き出しが UTF-16LE の BOM で始まる前提を確かめる",
+        ),
+        (
+            "Head = 'EF-BB-BF'",
+            "-Encoding utf8 が UTF-8 の BOM で始まる前提を確かめる",
+        ),
         (
             "Invoke-Tako @('setup', '--yes', '--answers', \"@$ps51File\")",
             "5.1 で書いた答えを --answers @<file> に渡す",
         ),
-        ("BOM の無い UTF-16LE に見えます", "読めない形の断りを確かめる"),
+        (
+            "BOM の無い UTF-16LE に見えます",
+            "読めない形の断りを確かめる",
+        ),
     ] {
         assert!(
             text.contains(needle),

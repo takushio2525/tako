@@ -1730,10 +1730,7 @@ mod tests {
                 en.contains(&source.text_in(Lang::En)),
                 "{name}: 読み元を名指さない: {en}"
             );
-            assert!(
-                en.chars().all(|c| c.is_ascii()),
-                "{name}: 英語に日本語が混ざる: {en}"
-            );
+            assert!(en.is_ascii(), "{name}: 英語に日本語が混ざる: {en}");
             if let SetupRefusal::AnswersUnreadable { reason, .. } = &want {
                 assert!(
                     ja.contains(&reason.text_in(Lang::Ja)),

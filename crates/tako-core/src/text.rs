@@ -392,13 +392,10 @@ mod tests {
             );
             assert_ne!(ja, en, "{e:?}: 日英が同じ文");
             assert!(
-                en.chars().all(|c| c.is_ascii()),
+                en.is_ascii(),
                 "{e:?}: 英語に ASCII の外の文字が混ざる: {en}"
             );
-            assert!(
-                ja.chars().any(|c| !c.is_ascii()),
-                "{e:?}: 日本語が英語のまま: {ja}"
-            );
+            assert!(!ja.is_ascii(), "{e:?}: 日本語が英語のまま: {ja}");
         }
     }
 
