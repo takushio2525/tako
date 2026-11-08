@@ -103,17 +103,23 @@ pub struct ExternalDep {
     pub hint: Note,
 }
 
-/// 器（tmux / psmux）の用途。remote daemon は画面を器から読む（#2771）ので、リモート接続を含む
+/// 器（tmux / psmux）の用途。remote daemon は画面を器から読む（#2771）ので、リモート接続を含む。
+///
+/// 表示は「用途: …」の後に「無くても tako 自体は動きますが、上記の機能が使えません」が続くので、
+/// **器が無いと使えないものだけ**を書く（#2792）。オーケストレーターの worker 管理は器なしでも
+/// spawn・監視・報告・close まで動く（`scripts/test-orchestrator-container-2792.sh` の実測）ので並べない。
+/// 器なしで失うのは「tako を閉じている間も動き続け、開き直したら同じプロセスへ繋ぎ直す」ことで、
+/// master / worker もそこに含まれる（器なしは同じ会話で起き直すが実行中の作業は途切れる）
 const CONTAINER_PURPOSE: Note = Note::new(
-    "リモート接続（tako remote）・再起動時のセッション完全復元・オーケストレーターの worker 管理",
-    "remote access (tako remote), full session restore after restart, and orchestrator worker management",
+    "リモート接続（tako remote）・tako を閉じている間も実行中のプロセス（AI エージェントの master / worker を含む）を動かし続け、再起動で画面ごと戻す",
+    "remote access (tako remote), and keeping running processes (including AI agent masters / workers) alive while tako is closed so they come back with their screens on restart",
 );
 
 /// remote が使えない OS での器の用途（#2776）。[`CONTAINER_PURPOSE`] からリモート接続だけを外したもの
-/// （器が無くても失うのは永続化と worker 管理で、remote はそもそも使えない）
+/// （器が無くても失うのは永続化 = master / worker の生存を含むもので、remote はそもそも使えない）
 const CONTAINER_PURPOSE_WITHOUT_REMOTE: Note = Note::new(
-    "再起動時のセッション完全復元・オーケストレーターの worker 管理",
-    "full session restore after restart, and orchestrator worker management",
+    "tako を閉じている間も実行中のプロセス（AI エージェントの master / worker を含む）を動かし続け、再起動で画面ごと戻す",
+    "keeping running processes (including AI agent masters / workers) alive while tako is closed so they come back with their screens on restart",
 );
 
 /// その OS の器（永続化の器 = tmux / psmux）の行（**純粋関数**）。依存表 [`deps`] の先頭と同じもの。
@@ -200,7 +206,7 @@ pub fn deps(platform: Platform) -> Vec<ExternalDep> {
 /// Tailscale はスマホからの接続（remote）のためだけの依存なので、remote が使えない OS
 /// （`remote_unusable` が `Some` = 対応表の `tako_remote_setup` が使えない。Windows は #971 で Pending）では
 /// 行ごと外す。入れても使い道が無いものの導入を勧めない（setup の末尾の行 = #2768 と同じ判断）。
-/// 器（tmux / psmux）は永続化と worker 管理に要るので行は残し、用途の文からリモート接続だけを外す。
+/// 器（tmux / psmux）は永続化（master / worker の生存を含む）に要るので行は残し、用途の文からリモート接続だけを外す。
 ///
 /// **判定はここでしない**: 渡すのは `remote_setup::remote_unusable` の 1 実装の答え（[`current_deps`]）か、
 /// テストがマスを差し替えて同じ判定（`remote_setup::remote_unusable_in`）を通した答え。
@@ -1656,7 +1662,7 @@ mod tests {
                     offered,
                     "{label}: 器の用途（英語）のリモート接続が remote の判定とずれている"
                 );
-                // 器と git は判定に関係なく残る（永続化・worker 管理・git パネルは remote と無関係）
+                // 器と git は判定に関係なく残る（永続化・git パネルは remote と無関係）
                 for bin in [container.bin, "git"] {
                     assert!(
                         deps.iter().any(|dep| dep.bin == bin),
@@ -1677,6 +1683,38 @@ mod tests {
                 pkg: "tailscale.tailscale"
             })
         );
+    }
+
+    /// #2792: 器の用途は「器が無いと使えないもの」だけを並べる。表示は用途の後に「無くても tako 自体は
+    /// 動きますが、上記の機能が使えません」が続くので、器なしでも spawn・監視・報告・close まで動く
+    /// worker 管理を並べると「無いと worker 管理が使えない」と読める（実測は
+    /// `scripts/test-orchestrator-container-2792.sh`）。器なしで失う master / worker の生存は名指す。
+    /// remote の判定のどちらの腕でも・両 OS で・日英とも同じ約束
+    #[test]
+    fn issue2792_器の用途に器なしで動くworker管理を並べない() {
+        use crate::remote_setup::remote_unusable_in;
+        use tako_core::platform::support::Support;
+        let note = Note::new("理由", "reason");
+        for platform in [Platform::MacOs, Platform::Windows] {
+            for cell in [
+                Some(Support::Supported),
+                Some(Support::Pending { note, issue: 971 }),
+            ] {
+                let label = format!("{platform:?} / {:?}", cell.map(Support::status));
+                let deps = offered_deps(platform, remote_unusable_in(cell));
+                let purpose = container_of(&deps).purpose;
+                for text in [purpose.ja(), purpose.en()] {
+                    assert!(
+                        !text.contains("worker 管理") && !text.contains("worker management"),
+                        "{label}: 器なしでも動く worker 管理を器の用途に並べている（{text}）"
+                    );
+                    assert!(
+                        text.contains("master / worker") || text.contains("masters / workers"),
+                        "{label}: 器なしで失う master / worker の生存を名指していない（{text}）"
+                    );
+                }
+            }
+        }
     }
 
     /// #2776: 今の対応表のとおりに出る。使える OS（macOS）の表は全表と 1 行も変わらない

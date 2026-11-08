@@ -115,7 +115,7 @@ tako orchestrator profiles set default --clear-model
 
 ### tako を閉じてしまった / Mac を再起動した
 
-tmux がインストールされていれば、worker のプロセスは裏で生き続け、tako を再起動すると画面ごと復元されます。詳しくは [tmux バックエンド](/features/tmux-backend/)を参照してください。
+tmux がインストールされていれば、worker のプロセスは裏で生き続け、tako を再起動すると画面ごと復元されます。tmux が無いときは worker も止まりますが、次に tako を開くと同じ会話で起き直します（実行中だった作業は途切れるので、master に続きを頼んでください）。詳しくは [tmux バックエンド](/features/tmux-backend/#tmux-がない場合)を参照してください。
 
 ## 仕組みの補足（読まなくても使えます）
 
