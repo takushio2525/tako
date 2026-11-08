@@ -5554,10 +5554,10 @@ tako のメインスレッドは止まっていない（同じ区間の `tako sc
 - **PTY のスレッドは閉じる知らせで抜けたときだけ、`Pty` を落とす前に `hang_up_and_drain` を通る**:
   子へ SIGHUP → 子の側が全部閉じる（macOS は EOF・Linux は EIO）まで親側を読み捨てる → 閉じる。
   読んだバイトは捨て、UI へイベントを送らない（漏れても #1857 の serial の照合と「端末の無いペイン」で捨てられる）。
-  上限（`pty_loop::HANG_UP_DRAIN_MAX` = 2 秒）を過ぎたら従来どおり閉じる。実測では SIGHUP から
+  上限（`pty_loop::HANG_UP_DRAIN_MAX` = 2 秒）を過ぎたら回線を切ってから閉じる（下の #2803）。実測では SIGHUP から
   子の側が閉じるまで 10〜25ms、閉じた器が `tmux ls` から消えるまで 25〜60ms（修正前は 630〜700ms）
-- 直接ペイン（器なし。器なしの `tako tmux open` のペインは下の #2634）・Windows（psmux = ConPTY には tty の close が無い）は
-  従来どおり `Msg::Shutdown`
+- 器なしのペインは下の #2634（`tako tmux open` のビュー）と #2803（素のペイン）。Windows（psmux = ConPTY には
+  tty の close が無い）は従来どおり `Msg::Shutdown`
 - A/B は `TAKO_2625_LEGACY=1`（ゲートは `tmux_backend::issue2625_legacy()` の 1 か所）。番犬は
   `crates/tako-control/tests/issue2625_backend_client_hangup_watchdog.rs`、閉じた後の出力を読み切ることは
   `tako_core::terminal` の単体テスト、実経路（止まり・fd・子プロセス・ゾンビ・終了と復元・直接ペイン・A/B）は
@@ -5574,6 +5574,20 @@ tako のメインスレッドは止まっていない（同じ区間の `tako sc
   サーバーが閉じるので止まらない（器 3 枚で外からの `tmux ls` 7〜9ms）。終了の経路は変えない。
   番犬は `crates/tako-control/tests/issue2634_tmux_open_hangup_watchdog.rs`、実経路（tmux open の close の器なし /
   器あり・終了と起動し直し・A/B）は `bash scripts/test-tmux-open-quit-2634.sh`
+- **器なしの素のペインも同じ順で閉じる**（#2803）: PTY 直下の子はログインシェルで、従来の閉じ方では
+  シェルが SIGHUP で終わる間際に端末へ書いた出力を誰も読まない。zsh は前景のジョブ（`bash -c '…'`・bash の入口を
+  持つ CLI）が残っていれば `zsh: warning: 1 jobs SIGHUPed` を書き、**セッションリーダーの exit は端末の出力が
+  読まれるまで待つ**（macOS）ので、シェルは exit の途中（`ps` の STAT `?Es`）で、PTY のスレッドは `Pty` の drop の
+  `wait4` で互いに待ち、プロセス 2 本・`/dev/ptmx` の fd・スレッドが GUI の終了まで残った（隔離 GUI の sample で
+  PTY のスレッドが 17/17 `wait4`。前景が zsh から直接の `sleep`・`zsh -c` だと zsh は何も書かずに終わるので起きない）。
+  `spawn_session` の同じ `if` に「`backend_session.is_none()` かつ `tmux_view_panes` に載っていない」枝を足し、判断は
+  `pty_loop::hang_up_direct_on_close()`（unix・`TAKO_2803_LEGACY=1` でない）の 1 か所。
+  **読み捨てが上限を過ぎたら、監視から外した後に回線を切る**（`PtyLoop::hang_up_line` = 親側の番号の中身を
+  `dup2` で `/dev/null` に差し替える。番号は空けない）。`trap '' HUP` のシェルは SIGHUP では終わらず、回線を切らないと
+  `Pty` の drop の wait が返らない（修正前から残っていた形）。回線断で子の側の read は EOF・write は EIO になる。
+  HUP を無視して走り続ける子（`nohup` の形）は他の端末と同じく走り続ける。UI スレッドは閉じる知らせを送るだけ。
+  GUI の終了の経路は変えない。番犬は `crates/tako-control/tests/issue2803_direct_pane_hangup_watchdog.rs`、
+  実経路（Issue の対照表・HUP を無視するシェル / ジョブ・出力し続けるジョブ・A/B）は `bash scripts/test-direct-close-2803.sh`
 
 ## 機械全体の設定を倒す記録には「所有者」を書く（Issue #1373 / #449）
 

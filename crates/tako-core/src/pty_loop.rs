@@ -136,12 +136,34 @@ fn is_peer_closed(err: &io::Error) -> bool {
 /// [`Msg::HangUpAndDrain`] で子の側が全部閉じるのを待つ上限（#2625）。
 ///
 /// 器（tmux）の attach クライアントなら、SIGHUP から子の側が全部閉じるまでは実測 10〜25ms。
-/// 上限に達したら従来どおり閉じる（= tmux サーバーが最後の close で止まりうる形へ戻るだけ）
+/// 上限に達したら回線を切ってから閉じる（#2803。子の側を開いたまま SIGHUP を無視するものが居る形。
+/// `TAKO_2803_LEGACY=1` では従来どおり閉じる = tmux サーバーが最後の close で止まりうる形へ戻るだけ）
 pub const HANG_UP_DRAIN_MAX: Duration = Duration::from_secs(2);
 
 /// 同上の待ちで、読むものが無いときに次に読むまで寝る間隔
 #[cfg(unix)]
 const HANG_UP_DRAIN_POLL: Duration = Duration::from_millis(2);
+
+/// #2803 の A/B（`TAKO_2803_LEGACY=1`）。同一バイナリのまま修正前の閉じ方へ戻す: 器なしのペインは
+/// [`Msg::Shutdown`]（読むのをやめる → SIGHUP → 子を wait → 親側を閉じる）・[`Msg::HangUpAndDrain`] の
+/// 読み捨てが上限を過ぎても回線を切らない。**ゲートはこの 1 か所**
+pub fn issue2803_legacy() -> bool {
+    std::env::var("TAKO_2803_LEGACY").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "on"))
+}
+
+/// 器なしのペイン（PTY 直下の子がログインシェル）の端末を、閉じるときに [`Msg::HangUpAndDrain`] で
+/// 閉じるか（#2803。立てるのは [`crate::TerminalSession::hang_up_client_on_close`]）。
+///
+/// [`Msg::Shutdown`] の後の `Pty` の drop は「SIGHUP → 子を wait → 親側を閉じる」の順で、そのとき親側は
+/// もう誰も読んでいない。シェルが SIGHUP で終わる間際に端末へ書くと（zsh は前景のジョブが残っていれば
+/// `zsh: warning: 1 jobs SIGHUPed` / `zsh: hangup …` を書く）、セッションリーダーの exit は端末の出力が
+/// 読まれるまで待つ（macOS）ので、シェルは exit の途中（`ps` の STAT が `?Es`）で止まり、PTY のスレッドは
+/// その wait で止まり、親側の fd も閉じない（互いに待つ。GUI を終了するまで残る）。
+///
+/// 偽: unix 以外（ConPTY には tty の close が無い）・A/B
+pub fn hang_up_direct_on_close() -> bool {
+    cfg!(unix) && !issue2803_legacy()
+}
 
 /// 読み取りバッファの初期サイズ。`MAX_LOCKED_READ` 以上の最小の 2 冪（64 KiB）。
 /// ロックが取れている通常経路はこのサイズで完結する
@@ -179,7 +201,10 @@ pub enum Msg {
     /// クライアントの tty は tmux サーバーも開いていて、その**最後の close はサーバーの中**
     /// （`server_client_lost`）で起き、読まれない出力が残った tty の close が約 600ms 戻らない
     /// = 器のサーバー全体（他の器のペインの画面・tako が器へ打つ命令）がその間止まる。
-    /// 親側を読み続けたまま閉じさせれば止まらない。`limit` を過ぎたら待たずに閉じる
+    /// 親側を読み続けたまま閉じさせれば止まらない。`limit` を過ぎたら回線を切ってから閉じる（#2803）。
+    ///
+    /// 器なしのペインも使う（#2803。[`hang_up_direct_on_close`]）: シェルが SIGHUP で終わる間際に
+    /// 端末へ書くと、読まれるまでシェルの exit が止まり、`Shutdown` の後の wait と互いに待つ
     HangUpAndDrain { child: u32, limit: Duration },
     /// PTY をリサイズする
     Resize(WindowSize),
@@ -388,6 +413,10 @@ pub struct PtyLoop<T: EventedPty, U: EventListener> {
     /// [`Msg::HangUpAndDrain`] を受けて抜けたときの子の pid と待つ上限（#2625）。
     /// **立つのは閉じる知らせで抜けたときだけ**（子の終了の腕・読み書きの失敗で抜けたら立たない）
     hang_up: Option<(u32, Duration)>,
+    /// PTY の親側の fd（#2803。[`Self::with_master_fd`] で渡す）。持ち主は `pty` で、`pty` を落とすまで有効。
+    /// 読み捨てが上限を過ぎたときに回線を切る（[`Self::hang_up_line`]）ためだけに使う
+    #[cfg(unix)]
+    master_fd: Option<std::os::fd::RawFd>,
 }
 
 impl<T, U> PtyLoop<T, U>
@@ -412,7 +441,17 @@ where
             event_proxy,
             wakeup_pending,
             hang_up: None,
+            #[cfg(unix)]
+            master_fd: None,
         })
+    }
+
+    /// PTY の親側の fd を渡す（#2803）。`fd` は `pty` が持つ親側の fd でなければならない
+    /// （`pty` を落とすまで有効 = このループが持ち続ける）。渡さなければ回線を切る段は何もしない
+    #[cfg(unix)]
+    pub fn with_master_fd(mut self, fd: std::os::fd::RawFd) -> Self {
+        self.master_fd = Some(fd);
+        self
     }
 
     /// 未処理の `Wakeup` が無いときだけ送る（#816）
@@ -573,9 +612,12 @@ where
     /// 器（tmux）の attach クライアントは SIGHUP で抜け、tmux サーバーがその tty を閉じる。
     /// その間も親側を読んでいるので、サーバーの close は読まれない出力を抱えて待たない。
     /// 読んだバイトは捨てる（閉じたペインの画面はもう描かない・UI へイベントも送らない）。
-    /// 子の側が全部閉じたら macOS は EOF（0）、Linux は EIO が返る。`limit` を過ぎたら待たずに戻る
+    /// 子の側が全部閉じたら macOS は EOF（0）、Linux は EIO が返る。`limit` を過ぎたら待たずに戻る。
+    ///
+    /// 返り値は子の側が全部閉じた（か、もう読めない）なら真・`limit` を過ぎたら偽（#2803。偽なら
+    /// 呼び手が回線を切ってから `Pty` を落とす = [`Self::hang_up_line`]）
     #[cfg(unix)]
-    fn hang_up_and_drain(&mut self, child: u32, limit: Duration) {
+    fn hang_up_and_drain(&mut self, child: u32, limit: Duration) -> bool {
         // SAFETY: kill(2) へ値を渡すだけ。子を回収する（= pid を手放す）のはこのループの
         // 子の終了の腕と `Pty` の drop だけで、ここへ来るのは閉じる知らせで抜けたとき
         // （子の終了の腕を通っていない）かつ `Pty` の drop より前 = pid はまだこの子のもの
@@ -588,20 +630,20 @@ where
             // 上限は毎回見る（相手が書き続けても抜ける）
             if started.elapsed() >= limit {
                 tracing::warn!(
-                    "PTY の子の側が {}ms で閉じなかったので待たずに閉じる（#2625）",
+                    "PTY の子の側が {}ms で閉じなかったので回線を切って閉じる（#2625 / #2803）",
                     limit.as_millis()
                 );
-                return;
+                return false;
             }
             match self.pty.reader().read(&mut buf) {
                 // 子の側が全部閉じた（macOS）
-                Ok(0) => return,
+                Ok(0) => return true,
                 Ok(_) => {}
                 Err(err) => match err.kind() {
                     ErrorKind::Interrupted => {}
                     ErrorKind::WouldBlock => std::thread::sleep(HANG_UP_DRAIN_POLL),
                     // 子の側が全部閉じた（Linux の EIO）か、もう読めない
-                    _ => return,
+                    _ => return true,
                 },
             }
         }
@@ -609,7 +651,55 @@ where
 
     /// Windows（ConPTY）は従来どおり閉じる（#2625 は unix の tty の close の話）
     #[cfg(not(unix))]
-    fn hang_up_and_drain(&mut self, _child: u32, _limit: Duration) {}
+    fn hang_up_and_drain(&mut self, _child: u32, _limit: Duration) -> bool {
+        true
+    }
+
+    /// PTY の親側を `/dev/null` に差し替えて回線を切る（#2803）。読み捨てが上限を過ぎても子の側が
+    /// 閉じないとき、`Pty` を落とす（= SIGHUP → 子を wait → 親側を閉じる）前に通る。
+    ///
+    /// 子の側を開いたまま SIGHUP を無視するもの（`trap '' HUP` のシェル・`nohup` の子）が居ると、
+    /// 親側を閉じるのは子を wait した後なので、シェルが HUP を無視していれば wait が返らない
+    /// （シェルは誰も閉じない端末を読み続ける）。先に親側を閉じれば回線断になり（子の側の read は EOF・
+    /// write は EIO・セッションリーダーへ SIGHUP）、シェルは終わり、その exit も端末の吐き出しを待たない。
+    /// HUP を無視して子の側を開いたまま走り続けるもの（`nohup` の子）は、他の端末と同じく走り続ける。
+    ///
+    /// fd の番号は `dup2` で中身だけ差し替える（番号は `Pty` を落とすまで埋まったまま = 他のスレッドが
+    /// 開いた fd と取り違えない）。`Pty` の drop がその番号（`/dev/null`）を閉じる
+    #[cfg(unix)]
+    fn hang_up_line(&mut self) {
+        let Some(master) = self.master_fd else {
+            return;
+        };
+        // SAFETY: open(2) へ固定のパスを渡すだけ
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if null < 0 {
+            tracing::warn!(
+                "PTY の回線を切れない（/dev/null を開けない: {}。#2803）",
+                io::Error::last_os_error()
+            );
+            return;
+        }
+        // SAFETY: `master` は `self.pty` が持つ親側の fd で、`self.pty` を落とすのはこの後
+        // （`with_master_fd` の約束）。差し替えた後も番号は埋まったままで、`Pty` の drop が閉じる
+        let replaced = unsafe { libc::dup2(null, master) };
+        let err = io::Error::last_os_error();
+        // SAFETY: 開いた /dev/null を閉じ、差し替えた番号にも close-on-exec を付け直す
+        // （dup2 は付けない。`Pty` を落とすまでの間に他のスレッドが起こす子へ漏らさない）
+        unsafe {
+            libc::close(null);
+            if replaced >= 0 {
+                libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        if replaced < 0 {
+            tracing::warn!("PTY の回線を切れない（{err}。#2803）");
+        }
+    }
+
+    /// Windows（ConPTY）は読み捨て自体を行わない（[`Self::hang_up_and_drain`] が常に真）ので来ない
+    #[cfg(not(unix))]
+    fn hang_up_line(&mut self) {}
 
     #[inline]
     fn pty_write(&mut self, state: &mut State) -> io::Result<()> {
@@ -813,13 +903,20 @@ where
                 }
 
                 // #2625: 閉じる知らせが器のクライアントを先に帰す形なら、子の側が全部閉じるまで
-                // 親側を読み捨ててから閉じる（`Pty` の drop より前 = 親側がまだ開いている）
+                // 親側を読み捨ててから閉じる（`Pty` の drop より前 = 親側がまだ開いている）。
+                // #2803: 器なしのペインも同じ形。上限までに子の側が閉じなければ回線を切る
+                let mut cut_line = false;
                 if let Some((child, limit)) = self.hang_up.take() {
-                    self.hang_up_and_drain(child, limit);
+                    cut_line = !self.hang_up_and_drain(child, limit) && !issue2803_legacy();
                 }
 
                 // 監視対象はここでは drop されないので明示的に外す
                 let _ = self.pty.deregister(&self.poll);
+
+                // #2803: 監視から外した後に親側を差し替える（`Pty` の drop の wait が返らない形を作らない）
+                if cut_line {
+                    self.hang_up_line();
+                }
             })
             .expect("PTY reader スレッドの起動")
     }

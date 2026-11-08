@@ -11102,11 +11102,16 @@ impl TakoApp {
         // 閉じる（tty の最後の close を器のサーバーの中で起こさない = サーバー全体を止めない）。
         // 閉じる経路（× / ⌘W / CLI / MCP / タブ・窓ごと）はすべて端末の drop を通るのでここで決める。
         // #2634: 器なしの `tako tmux open` のペインも PTY 直下の子が（利用者の）tmux サーバーの
-        // attach クライアントなので同じ順で閉じる（`track_tmux_view` は spawn より先に呼ばれる）
+        // attach クライアントなので同じ順で閉じる（`track_tmux_view` は spawn より先に呼ばれる）。
+        // #2803: 器なしの素のペインも同じ順で閉じる（シェルが HUP で終わる間際に端末へ書くと、
+        // 読まないままの wait とシェルの exit が互いに待ち、プロセス・PTY の fd・スレッドが残る）
         if (backend_session.is_some() && tako_core::tmux_backend::hang_up_client_on_close())
             || (backend_session.is_none()
                 && self.tmux_view_panes.contains_key(&pane_id)
                 && tako_core::tmux_backend::hang_up_view_client_on_close())
+            || (backend_session.is_none()
+                && !self.tmux_view_panes.contains_key(&pane_id)
+                && tako_core::pty_loop::hang_up_direct_on_close())
         {
             session.hang_up_client_on_close();
         }
