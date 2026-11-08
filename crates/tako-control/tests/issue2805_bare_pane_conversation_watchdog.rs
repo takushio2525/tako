@@ -64,7 +64,9 @@ fn scan(src: &str) -> Vec<String> {
     let mut window = |head: &str| match fn_window(&lines, head) {
         Some(w) => Some(w),
         None => {
-            out.push(format!("{DISPATCH}:0 — `{head}` が見つからない（改名したら番犬も直す）"));
+            out.push(format!(
+                "{DISPATCH}:0 — `{head}` が見つからない（改名したら番犬も直す）"
+            ));
             None
         }
     };
@@ -89,10 +91,7 @@ fn scan(src: &str) -> Vec<String> {
     }
     // 2〜3. report / status は 2 つの口を通し、器のセッションだけの口を直に呼ばない
     let mut bodies = Vec::new();
-    for head in [
-        "fn finish_orchestrator_report(",
-        "fn finish_worker_status(",
-    ] {
+    for head in ["fn finish_orchestrator_report(", "fn finish_worker_status("] {
         if let Some((at, w)) = window(head) {
             bodies.push((head, at, w));
         }
@@ -201,7 +200,10 @@ fn issue2805_番犬は配線の外れを名指す() {
         ),
     ];
     for (label, from, to, expect) in cases {
-        assert!(src.contains(from), "{label}: 注入の元 `{from}` が実物に無い");
+        assert!(
+            src.contains(from),
+            "{label}: 注入の元 `{from}` が実物に無い"
+        );
         let injected = src.replacen(from, to, 1);
         let offenders = scan(&injected);
         assert!(

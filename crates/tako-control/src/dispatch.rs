@@ -19226,14 +19226,12 @@ fn collect_report_ctx(host: &dyn ControlHost, query: WorkerQuery) -> ReportCtx {
         .is_none()
         .then(|| bare_pty_pid(host, target))
         .flatten();
-    let backend = host
-        .backend_session(target)
-        .filter(|b| {
-            query
-                .tmux_session
-                .as_deref()
-                .is_none_or(|expect| expect == b)
-        });
+    let backend = host.backend_session(target).filter(|b| {
+        query
+            .tmux_session
+            .as_deref()
+            .is_none_or(|expect| expect == b)
+    });
     // #2017: 同一性を確かめたペインの mod の報告だけを使う（別ペインの報告は別の worker のもの）
     let now = std::time::Instant::now();
     let mod_session = backend.as_ref().and_then(|_| {
@@ -21293,7 +21291,11 @@ fn bare_pty_pid(host: &dyn ControlHost, target: PaneId) -> Option<u32> {
 }
 
 /// ペインの codex の thread_id（#984）。器があれば器のセッションから、器なしは PTY 直下の子 pid から（#2805）
-fn codex_thread_for_pane(pane_id: u64, backend: Option<&str>, pty_pid: Option<u32>) -> Option<String> {
+fn codex_thread_for_pane(
+    pane_id: u64,
+    backend: Option<&str>,
+    pty_pid: Option<u32>,
+) -> Option<String> {
     match (backend, pty_pid) {
         (Some(backend), _) => crate::codex_session::resolve_thread_id_for_backend(backend),
         (None, Some(pid)) => crate::codex_session::resolve_thread_id_for_pty(pane_id, pid),
@@ -63012,7 +63014,10 @@ tako | pane 2 [ compact ]       [-]
             {
                 return pid;
             }
-            assert!(Instant::now() < deadline, "{what} を待ちきれない（{budget:?}）");
+            assert!(
+                Instant::now() < deadline,
+                "{what} を待ちきれない（{budget:?}）"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -63047,8 +63052,9 @@ tako | pane 2 [ compact ]       [-]
     #[cfg(target_os = "macos")]
     #[test]
     fn issue2805_器なしのcodexのworkerはreportもstatusも会話の記録から読む() {
-        if tako_core::run_alone!(issue2805_器なしのcodexのworkerはreportもstatusも会話の記録から読む)
-        {
+        if tako_core::run_alone!(
+            issue2805_器なしのcodexのworkerはreportもstatusも会話の記録から読む
+        ) {
             return;
         }
         const TID: &str = "2805c0de-0000-4000-8000-000000000001";
@@ -63105,8 +63111,15 @@ tako | pane 2 [ compact ]       [-]
 
         // A/B: 修正前（器なしでは引かない）へ戻す
         std::env::set_var("TAKO_2805_LEGACY", "1");
-        assert!(report_2805(&host, pane).is_err(), "旧: 器なしの report は失敗");
-        assert_eq!(status_2805(&host, pane)["status_source"], "screen", "旧: 画面の推定");
+        assert!(
+            report_2805(&host, pane).is_err(),
+            "旧: 器なしの report は失敗"
+        );
+        assert_eq!(
+            status_2805(&host, pane)["status_source"],
+            "screen",
+            "旧: 画面の推定"
+        );
         drop(tree);
     }
 
@@ -63115,7 +63128,8 @@ tako | pane 2 [ compact ]       [-]
     #[cfg(target_os = "macos")]
     #[test]
     fn issue2805_器なしのagyのworkerはreportもstatusも会話の記録から読む() {
-        if tako_core::run_alone!(issue2805_器なしのagyのworkerはreportもstatusも会話の記録から読む) {
+        if tako_core::run_alone!(issue2805_器なしのagyのworkerはreportもstatusも会話の記録から読む)
+        {
             return;
         }
         const CID: &str = "2805a9a9-0000-4000-8000-000000000002";
@@ -63157,8 +63171,15 @@ tako | pane 2 [ compact ]       [-]
         assert_eq!(s["status"], "idle", "{s}");
 
         std::env::set_var("TAKO_2805_LEGACY", "1");
-        assert!(report_2805(&host, pane).is_err(), "旧: 器なしの report は失敗");
-        assert_eq!(status_2805(&host, pane)["status_source"], "screen", "旧: 画面の推定");
+        assert!(
+            report_2805(&host, pane).is_err(),
+            "旧: 器なしの report は失敗"
+        );
+        assert_eq!(
+            status_2805(&host, pane)["status_source"],
+            "screen",
+            "旧: 画面の推定"
+        );
         drop(tree);
     }
 
@@ -63186,10 +63207,8 @@ tako | pane 2 [ compact ]       [-]
             collect_report_ctx(&host, query(Some("tako-gone"))).pty_pid,
             None
         );
-        let ctx = verify_ctx_pane_identity(
-            collect_worker_status_ctx(&host, pane),
-            Some("tako-gone"),
-        );
+        let ctx =
+            verify_ctx_pane_identity(collect_worker_status_ctx(&host, pane), Some("tako-gone"));
         assert_eq!(ctx.pty_pid, None);
         // 器のあるペインは器のセッションから辿る（PTY の子は根にしない）
         host.backend_sessions.insert(pane, "tako-s2805".into());
