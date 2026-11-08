@@ -112,6 +112,8 @@ function New-SandboxEnv([string]$PathValue, [hashtable]$ExtraEnv) {
     $vars['TMP'] = $TmpDir
     # 判定は日本語の字面で見る（表示言語の既定が OS の言語に従うので固定する。#2365）
     $vars['TAKO_LANG'] = 'ja'
+    # 一時の注入（#2775 の受け入れ条件 2: 修正前の形 = TAKO_2775_LEGACY=1 で検査が名指しで落ちるか。次のコミットで戻す）
+    $vars["TAKO_2775_LEGACY"] = "1"
     if ($PathValue) { $vars['PATH'] = $PathValue }
     if ($ExtraEnv) { foreach ($k in $ExtraEnv.Keys) { $vars[$k] = [string]$ExtraEnv[$k] } }
     $vars
