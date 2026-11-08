@@ -14190,9 +14190,10 @@ fn remote_refusal_index(r: &RemoteRefusal) -> usize {
         RemoteRefusal::StopTimeoutTryForce { .. } => 140,
         RemoteRefusal::StopStillRunning { .. } => 141,
         RemoteRefusal::StopTerminateFailed(_) => 142,
+        RemoteRefusal::DaemonNoScreenCapture { .. } => 143,
     }
 }
-const REMOTE_REFUSAL_VARIANTS: usize = 143;
+const REMOTE_REFUSAL_VARIANTS: usize = 144;
 
 /// `ShutdownReject` の通し番号（網羅 match = 足すとここがコンパイルで落ちる）
 fn shutdown_reject_index(r: &ShutdownReject) -> usize {
@@ -14554,6 +14555,17 @@ fn remote_refusal_table() -> Vec<(RemoteRefusal, String)> {
         (
             RemoteRefusal::DaemonStartTimeout,
             "デーモンからの起動情報を受信できなかった（30 秒タイムアウト）".into(),
+        ),
+        (
+            // #2771 で足した断り（#2365 より前の固定文は無いので、足したときの日本語を固定する）
+            RemoteRefusal::DaemonNoScreenCapture {
+                container: "psmux",
+                label: "none",
+            },
+            "リモートサーバーはペインの画面を tako の外から読むので、画面を読める器（psmux）が要ります\
+             （いまの永続バックエンド: none）。入っていなければ `tako setup deps install` で入れてから、\
+             もう一度 `tako remote start` を実行してください"
+                .into(),
         ),
         (
             RemoteRefusal::StopNoPidFile,

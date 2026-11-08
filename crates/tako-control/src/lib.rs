@@ -91,6 +91,8 @@ pub mod reach;
 pub mod remote;
 pub mod remote_auth;
 pub mod remote_autostart;
+/// remote daemon が器に求める能力の門（画面の読み取り = `detached_capture`。#2771）
+pub mod remote_backend_gate;
 pub mod remote_cards;
 pub mod remote_files;
 pub mod remote_generation;

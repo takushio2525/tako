@@ -179,6 +179,12 @@ pub enum RemoteRefusal {
     DaemonExitedSilently(String),
     /// 子から起動情報が時間内に来なかった
     DaemonStartTimeout,
+    /// 画面を外から読める器が無いので daemon を起こさなかった（門は `remote_backend_gate`。#2771）。
+    /// `container` はこの OS の器の名前（`tako setup deps install` が入れるもの）、`label` はいまの永続バックエンド
+    DaemonNoScreenCapture {
+        container: &'static str,
+        label: &'static str,
+    },
     /// 止める daemon が居ない（PID ファイルが無い）
     StopNoPidFile,
     /// 止める daemon が居ない（PID ファイルの pid は既に終わっている）
@@ -787,6 +793,16 @@ impl RemoteRefusal {
             (Self::DaemonStartTimeout, En) => {
                 "did not receive the startup info from the daemon (timed out after 30 s)".to_string()
             }
+            (Self::DaemonNoScreenCapture { container, label }, Ja) => format!(
+                "リモートサーバーはペインの画面を tako の外から読むので、画面を読める器（{container}）が要ります\
+                 （いまの永続バックエンド: {label}）。入っていなければ `tako setup deps install` で入れてから、\
+                 もう一度 `tako remote start` を実行してください"
+            ),
+            (Self::DaemonNoScreenCapture { container, label }, En) => format!(
+                "The remote server reads pane screens from outside tako, so it needs a session container \
+                 that can capture them ({container}; current persistence backend: {label}). If it is not \
+                 installed, run `tako setup deps install`, then run `tako remote start` again"
+            ),
             (Self::StopNoPidFile, Ja) => {
                 "リモートサーバーが起動していない（PID ファイルが無い）".to_string()
             }

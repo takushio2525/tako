@@ -2246,6 +2246,14 @@ pub fn run_daemon() -> io::Result<()> {
     ensure_state_dir()?;
     // #2582: 起動の最初（CLI の main）に外した env を名前だけ残す（待ち受けの前 = 起動に失敗しても残る）
     audit_startup_env();
+    // #2771: 器への到達の門。daemon は tako-app と別プロセスなのでペインの画面を器から読む（操作は
+    // app の IPC へ渡す）= 要るのは採取だけ。**待ち受けを開く前に**置く: 断った後に socket / port ファイルが
+    // 残ると、次の start が「stale な待ち受け」を毎回言い、そのポートを別のプロセスが取っていれば起動ごと断る。
+    // A/B（`TAKO_2771_LEGACY=1`）は修正前の位置（port ファイルの後）で修正前の判定（送出を求める）
+    let gate_legacy = crate::remote_backend_gate::legacy();
+    if !gate_legacy {
+        crate::remote_backend_gate::check_current().map_err(|r| io::Error::other(r.to_string()))?;
+    }
     let spec = endpoint_spec().map_err(io::Error::other)?;
     if let local_endpoint::EndpointSpec::Unix(ref sock) = spec {
         // エンドポイントのパス長チェック（unix の sun_path 制約に由来）
@@ -2287,15 +2295,8 @@ pub fn run_daemon() -> io::Result<()> {
     // tmux バックエンドソケット名を解決
     let tmux_socket = tako_core::tmux_backend::socket_name();
 
-    // アウトオブプロセス到達手段の有無を確認する。remote デーモンは tako-app とは
-    // 別プロセスなので、ペインを読む・操作するには backend 側の到達手段が要る
-    if !tako_core::backend::capabilities().detached_access {
-        return Err(io::Error::other(format!(
-            "永続バックエンド（{}）にアウトオブプロセス到達手段が無い。\
-             remote サーバーは tako-app の外からペインを操作するため到達手段が必須です\
-             （macOS / Linux では tmux をインストールすると有効になります）",
-            tako_core::backend::capabilities().label
-        )));
+    if gate_legacy {
+        crate::remote_backend_gate::check_current().map_err(|r| io::Error::other(r.to_string()))?;
     }
 
     // Tailscale setup 検証 + serve 設定（不足があればここで起動拒否）。
