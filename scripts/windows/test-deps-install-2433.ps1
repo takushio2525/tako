@@ -228,10 +228,13 @@ function Test-Fake {
         'exit /b %FAKE_WINGET_EXIT%'
     )
     $sysPath = @((Join-Path $sys 'System32'), $sys, (Join-Path $sys 'System32\Wbem'), (Join-Path $sys 'System32\WindowsPowerShell\v1.0')) -join ';'
-    # 砂場: git / psmux が見えない（PATH・%ProgramFiles%\Git\cmd・WinGet\Links・レジストリの PATH の読み直しを塞ぐ）
+    # 砂場: git / psmux が見えない（PATH・%ProgramFiles%\Git\cmd・WinGet\Links・レジストリの PATH の読み直しを塞ぐ）。
+    # 64 ビットのプロセスの ProgramFiles は生成時に ProgramW6432 から組み直される（ProgramFiles だけを
+    # 差し替えても子には元の C:\Program Files が見える = 初回の CI で実測）ので、両方を砂場へ向ける
     $base = @{
         PATH                 = "$fakeDir;$sysPath"
         ProgramFiles         = $pf
+        ProgramW6432         = $pf
         USERPROFILE          = $home2433
         APPDATA              = (Join-Path $home2433 'AppData\Roaming')
         LOCALAPPDATA         = (Join-Path $home2433 'AppData\Local')
@@ -248,6 +251,9 @@ function Test-Fake {
     function Get-Marker { if (Test-Path -LiteralPath $marker) { (Get-Content -LiteralPath $marker -Raw).Trim() } else { $null } }
 
     $script:Stage = '前提（砂場で git / psmux が見えない・偽の winget を見る）'
+    # 子から見える値を残す（砂場の差し替えが効いているかの診断）
+    $seen = Invoke-Child -FilePath (Join-Path $sys 'System32\cmd.exe') -Arguments @('/d', '/c', 'echo PF=%ProgramFiles% W=%ProgramW6432% L=%TAKO_2428_LEGACY%') -Overrides $base -TimeoutSec 60
+    Write-Host ("TAKO2433_SANDBOX {0}" -f $seen.Out.Trim())
     foreach ($bin in @('git', 'psmux')) {
         $d = Get-DepStatus $bin 'fake-before' $base
         Assert-That ($null -eq $d.found) "砂場で $bin が見えている: $($d.found)"
