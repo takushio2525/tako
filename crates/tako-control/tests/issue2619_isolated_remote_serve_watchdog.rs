@@ -32,7 +32,7 @@
 //! 8. 対話の setup の `run_interactive` は、QR を既定のビューアで開く（`open_default`）前に
 //!    門（`Op::OpenViewer`）を通る
 //! 9. 後始末の書き手 `serve_stop_if_ours(_on)` の呼び手と、remote_setup.rs の導入器・ビューアの呼び手は
-//!    既知の場所（上の 3 つ・門を通った daemon の中の `run_daemon`・tailscale.rs の包み）にしか無い
+//!    既知の場所（上の 3 つ・門を通った daemon のガードの `release_serve`・tailscale.rs の包み）にしか無い
 //! 10. 実際の門（`allowed` / `check_install`）が env で答えを変える（操作ごとの通す理由。実経路）
 //!
 //! # 見逃す側へ倒れないための作り
@@ -211,9 +211,11 @@ fn machine_op_violations(remote: &str, setup: &str) -> Vec<String> {
 }
 
 /// 後始末の書き手 `serve_stop_if_ours(_on)` を呼んでよい関数（ファイル, 関数名）。
-/// 門を通った daemon の中（`run_daemon` = `establish_tailscale_serve` の後）・門を通る後始末・tailscale.rs の包み
+/// 門を通った daemon の中（ガード `OwnedDaemonFiles` の `release_serve` = 持たせるのは門を通った
+/// `establish_tailscale_serve` だけ。#2793 で `run_daemon` の直の呼び出しをここへ寄せた）・門を通る後始末・
+/// tailscale.rs の包み
 const KNOWN_CLEANUP_CALLERS: &[(&str, &str)] = &[
-    (REMOTE, "run_daemon"),
+    (REMOTE, "release_serve"),
     (REMOTE, "cleanup_serve_leftover"),
     (TAILSCALE, "serve_stop_if_ours"),
 ];
