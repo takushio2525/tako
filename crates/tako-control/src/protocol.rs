@@ -2017,6 +2017,10 @@ pub enum Request {
         /// install で実行せず計画だけ返す
         #[serde(default)]
         dry_run: Option<bool>,
+        /// 管理者の確認（Windows の UAC）が出うる導入への利用者の同意（#2433）。
+        /// true のときだけ起こす（省略 = 同意なし = 起こさず `consent_required` に載せる）
+        #[serde(default)]
+        consent: Option<bool>,
     },
     /// 利用可能なモデル一覧の照会（Issue #1002。**読み取り専用**）。
     /// `agent` 省略で全系統。取得手段は各 CLI の一覧コマンド（codex = `codex debug models` /
@@ -3583,6 +3587,7 @@ mod tests {
                 action: None,
                 dep: None,
                 dry_run: None,
+                consent: None,
             }
             .kind_name(),
             "SetupDeps"

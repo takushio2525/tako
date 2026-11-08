@@ -4,7 +4,7 @@
  * 事実の出どころ: installer/windows/tako.iss（per-user・PATH 追加は既定オン・Windows 10 1809 以降 x64）/
  * 台帳 W 節（未署名なので SmartScreen が出ることがある・Windows のメニュー行）/
  * crates/tako-control/src/shell_integration.rs・setup_deps.rs の出力の形（シェル統合は $PROFILE を書かずペインの起動時に読む = #2432・
- * psmux は winget のコマンドを案内するだけで代行しない）。パスは架空。
+ * psmux は winget で入れる = #2433）。パスは架空。
  */
 import Scrolly from '../motion/Scrolly.astro';
 import Step from '../motion/Step.astro';
@@ -62,7 +62,9 @@ import Cmd from '../motion/Cmd.astro';
 							<span class="tk-l" data-at="7" style="--d: .5s"><span class="tk-ok">[OK]</span> シェル統合: 配置しました</span>
 							<span class="tk-l" data-at="7" style="--d: .7s"><span class="tk-acc">[検出]</span> claude（認証済み）</span>
 							<span class="tk-l" data-at="7" style="--d: .9s"><span class="tk-warn">[任意]</span> psmux: 見つかりません（任意）</span>
-							<span class="tk-l tk-dim" data-at="7" style="--d: 1s">    導入方法: winget install --id marlocarlo.psmux …</span>
+							<span class="tk-l tk-dim" data-at="7" style="--d: 1s">    導入: winget install --id marlocarlo.psmux …</span>
+							<span class="tk-l" data-at="7" style="--d: 1.05s">    psmux をインストールしますか？ [y/N]: y</span>
+							<span class="tk-l" data-at="7" style="--d: 1.1s"><span class="tk-ok">[OK]</span> psmux: C:\Users\winuser\AppData\Local\Microsoft\WinGet\Links\psmux.exe（インストール完了）</span>
 							<span class="tk-l" data-at="7" style="--d: 1.2s"><span class="tk-ok">[OK]</span> Claude MCP: tako が登録済み</span>
 							<span class="tk-l tk-ok tk-b" data-at="7" style="--d: 1.5s">セットアップが完了しました。</span>
 						</Pane>
@@ -93,7 +95,7 @@ import Cmd from '../motion/Cmd.astro';
 	</Step>
 	<Step title="セットアップ">
 		<p>新しいタブで <code>tako setup</code> が走ります。Windows では、ペインの作業フォルダを追うために <strong>PowerShell のプロファイルへ tako の管理ブロックを 1 つ足します</strong>（何をどこへ書くかを先に表示します。<code>tako shell-integration uninstall</code> で外せます）。</p>
-		<p>再起動しても画面を残す psmux など、入っていない道具は打つコマンドを案内します。あとは macOS と同じく <code>tako master</code> で始められます。</p>
-		<Cmd prompt="PS>">winget install marlocarlo.psmux</Cmd>
+		<p>再起動しても画面を残す psmux など、入っていない道具はその場で入れるかを 1 回聞き、winget で入れます（git は Windows の管理者の確認が出ます）。後から入れるなら下の 1 行です。あとは macOS と同じく <code>tako master</code> で始められます。</p>
+		<Cmd prompt="PS>">tako setup deps install</Cmd>
 	</Step>
 </Scrolly>

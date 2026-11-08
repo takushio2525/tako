@@ -381,7 +381,8 @@ for p in crates/tako-core/src/platform/agent_install.rs crates/tako-core/src/pla
   crates/tako-control/src/setup_bootstrap.rs scripts/windows/test-agent-install-2791.ps1 \
   scripts/windows/lib/execution-policy.ps1 .github/workflows/ci.yml scripts/ci-change-scope.sh \
   crates/tako-control/src/setup_refusal.rs crates/tako-core/tests/issue2791_agent_install_windows.rs \
-  installer/windows/lib/user-path.ps1; do
+  installer/windows/lib/user-path.ps1 crates/tako-control/src/setup_deps.rs \
+  scripts/windows/test-deps-install-2433.ps1; do
   assert_eq "実走を走らせる: ${p}" "$(classify_agent "${p}"$'\n')" "agent_install=true"
 done
 for p in crates/tako-core/src/lib.rs crates/tako-cli/src/setup.rs scripts/windows/test-install-execution-policy-2790.ps1 \

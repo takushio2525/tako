@@ -4365,7 +4365,7 @@
     "name": "tako_setup_bootstrap"
   },
   {
-    "description": "任意依存ツール（tmux / psmux / git / tailscale）の検出とその場導入。どれも**無くても tako 自体は動く**が、欠けるとリモート接続・セッション完全復元・git パネルが使えない。status（既定・読むだけ）は各依存の found / install_command / can_run（tako が導入を代行できるか）/ hint。install は未導入のものを導入する（dep で 1 件に絞れる。dry_run=true で計画だけ。**導入済みは触らない** = 冪等）。代行できない環境（Windows の winget）や導入手段が無いものは実行せず skipped に理由つきで載る。名前はプラットフォームで変わる（永続化の器は macOS = tmux / Windows = psmux）ので、推測せず status の bin を使う。",
+    "description": "任意依存ツール（tmux / psmux / git / tailscale）の検出とその場導入。どれも**無くても tako 自体は動く**が、欠けるとリモート接続・セッション完全復元・git パネルが使えない。status（既定・読むだけ）は各依存の found / install_command / can_run（tako が導入を代行できるか）/ hint。install は未導入のものを導入する（dep で 1 件に絞れる。dry_run=true で計画だけ。**導入済みは触らない** = 冪等）。privilege=elevated（Windows の UAC が出る）は consent=true のときだけ入れ、無ければ consent_required に載る。入れないものは skipped に理由つき。名前はプラットフォームで変わる（永続化の器は macOS = tmux / Windows = psmux）ので、推測せず status の bin を使う。",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -4376,6 +4376,10 @@
             "install"
           ],
           "type": "string"
+        },
+        "consent": {
+          "description": "UAC の出る導入への利用者の同意（本人に確かめてから true）",
+          "type": "boolean"
         },
         "dep": {
           "description": "対象の実行ファイル名（status の bin。省略で未導入のものすべて）",

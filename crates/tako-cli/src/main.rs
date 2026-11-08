@@ -4379,6 +4379,9 @@ enum SetupCommand {
         /// install で実行せず何を入れるかだけ出す
         #[arg(long)]
         dry_run: bool,
+        /// install で Windows の管理者の確認（UAC）が出る導入にも同意する（端末なら省略時に 1 回だけ聞く。#2433）
+        #[arg(long, short = 'y')]
+        yes: bool,
         /// 出力を JSON にする（MCP tako_setup_deps と同一ペイロード）
         #[arg(long)]
         json: bool,
@@ -4705,10 +4708,11 @@ fn cli_main() -> ExitCode {
                 ref action,
                 ref dep,
                 dry_run,
+                yes,
                 json,
             }) = args.command
             {
-                setup::run_deps(action.as_deref(), dep.as_deref(), dry_run, json)
+                setup::run_deps(action.as_deref(), dep.as_deref(), dry_run, yes, json)
             } else if args.check {
                 setup::run_check()
             } else if args.changes {

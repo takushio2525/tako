@@ -143,6 +143,22 @@ pub enum SetupRefusal {
     },
     /// 導入器は正常終了したのにコマンドを引けない
     DepMissingAfterInstall { command: String, bin: String },
+    /// 利用者が管理者の確認（Windows の UAC）で導入を取り消した（#2433。winget の終了コードで読む）
+    DepElevationDeclined { bin: String },
+    /// 導入器が取得元に届かない（#2433。`code` は終了コードの 16 進の表記 = `0x80072EFD`）
+    DepSourceUnreachable {
+        command: String,
+        code: String,
+        log: String,
+    },
+    /// 導入器が tako の渡す引数を受け付けない（#2433。winget の版が古い）
+    DepInstallerTooOld { command: String, log: String },
+    /// winget が途中で失敗した（#2433。`code` は終了コードの 16 進の表記 = `0x8A150006`）
+    DepWingetFailed {
+        command: String,
+        code: String,
+        log: String,
+    },
 
     // ---- エージェント CLI の導入（`setup_bootstrap`。系統名とホームの解決） ----
     /// 不明な系統名（`allowed` は系統を ` / ` で並べたもの）
@@ -419,6 +435,42 @@ impl SetupRefusal {
             (Self::DepMissingAfterInstall { command, bin }, En) => format!(
                 "{command} finished without errors, but {bin} cannot be located.\n\
                  Reopen the terminal, then check with `tako setup deps`"
+            ),
+            (Self::DepElevationDeclined { bin }, Ja) => format!(
+                "{bin} の導入は管理者の確認（UAC）で取り消されました。\
+                 入れるときは、もう一度実行して確認の画面で「はい」を選んでください"
+            ),
+            (Self::DepElevationDeclined { bin }, En) => format!(
+                "installing {bin} was cancelled at the administrator prompt (UAC). \
+                 To install it, run it again and choose Yes on the prompt"
+            ),
+            (Self::DepSourceUnreachable { command, code, log }, Ja) => format!(
+                "{command} が取得元に届きませんでした（exit {code}）。\
+                 ネットワークとプロキシの設定を確かめてから、もう一度実行してください{}",
+                log_detail(log)
+            ),
+            (Self::DepSourceUnreachable { command, code, log }, En) => format!(
+                "{command} could not reach the download source (exit {code}). \
+                 Check the network and proxy settings, then run it again{}",
+                log_detail(log)
+            ),
+            (Self::DepInstallerTooOld { command, log }, Ja) => format!(
+                "winget が tako の渡す引数を受け付けませんでした（版が古い可能性があります）。\
+                 Microsoft Store の「アプリ インストーラー」を更新してから、もう一度実行してください: {command}{}",
+                log_detail(log)
+            ),
+            (Self::DepInstallerTooOld { command, log }, En) => format!(
+                "winget did not accept the arguments tako passes (it may be too old). \
+                 Update \"App Installer\" from the Microsoft Store, then run it again: {command}{}",
+                log_detail(log)
+            ),
+            (Self::DepWingetFailed { command, code, log }, Ja) => format!(
+                "{command} が失敗しました（exit {code}）。上に出ているエラーを確認してください{}",
+                log_detail(log)
+            ),
+            (Self::DepWingetFailed { command, code, log }, En) => format!(
+                "{command} failed (exit {code}). Check the error shown above{}",
+                log_detail(log)
             ),
 
             (Self::UnknownBootstrapAgent { got, allowed }, Ja) => {
