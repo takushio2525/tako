@@ -94,7 +94,7 @@ master を起動できるのは claude と codex です。worker は claude・co
 
 ### 再起動しても壊れない
 
-worker は [tmux バックエンド](/features/tmux-backend/)（Windows では psmux）の上で動きます。tako を閉じても worker のプロセスは裏で動き続け、次に開いたときに画面ごと戻ります。
+tmux（Windows では psmux）が入っていれば、worker は [tmux バックエンド](/features/tmux-backend/)の上で動きます。tako を閉じても worker のプロセスは裏で動き続け、次に開いたときに画面ごと戻ります。tmux が無くても worker は使えますが、tako を閉じると止まり、次に開いたときに同じ会話で起き直します（→ [tmux がない場合](/features/tmux-backend/#tmux-がない場合)）。
 
 ### プロジェクトをまたげる
 

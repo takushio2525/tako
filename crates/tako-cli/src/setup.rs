@@ -4266,7 +4266,7 @@ mod tests {
             // #286: tailscale を弾 6 で追加）
             assert_eq!(deps.len(), 3, "{platform:?}");
         }
-        // 永続化の器は macOS では tmux（remote / 永続化 / worker 管理が対象機能）
+        // 永続化の器は macOS では tmux（remote と永続化 = master / worker の生存が対象機能。#2792）
         let mac = setup_deps::deps(Platform::MacOs);
         let tmux = mac.iter().find(|d| d.bin == "tmux").expect("tmux が要る");
         assert!(!tmux.required);
