@@ -1351,7 +1351,7 @@ fn instruction_items(states: &BootstrapStates, lang: Lang) -> Vec<Item> {
 }
 
 /// 系統ごとのグローバル指示ファイル（`tako setup` が書く先と同じ置き場）
-fn instruction_path(agent: AgentKind) -> Option<std::path::PathBuf> {
+pub(crate) fn instruction_path(agent: AgentKind) -> Option<std::path::PathBuf> {
     let home = tako_core::paths::home_dir().filter(|p| p.is_absolute())?;
     Some(match agent {
         AgentKind::Claude => home.join(".claude/CLAUDE.md"),

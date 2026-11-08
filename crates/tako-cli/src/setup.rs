@@ -4072,6 +4072,57 @@ mod tests {
         }
     }
 
+    /// #2810: `tako setup` が書く指示ファイルと、共通ルールの同期の書き先（`agents_sync`）・
+    /// 導入計画の本体の置き場が同じ codex の置き場を見る（前は後の 2 つが `~/.codex` の決め打ちで、
+    /// 空でない `CODEX_HOME` のとき setup の置き場とずれていた）。Windows の形（`D:\codex`）も見る
+    #[test]
+    fn issue2810_setupと同期と導入計画は同じcodexの置き場を見る() {
+        if tako_core::run_alone!(issue2810_setupと同期と導入計画は同じcodexの置き場を見る)
+        {
+            return;
+        }
+        let scratch = tako_core::test_residue::ScratchDir::new("cli-setup-codex-readers-2810");
+        let home = scratch.path().join("home");
+        let custom = scratch.path().join("custom-codex");
+        // 子の中だけ（他のテストは居ない。子は終われば消えるので戻さない = #2400）
+        std::env::set_var("HOME", &home);
+        let cases: [(&str, Option<&std::ffi::OsStr>, PathBuf); 5] = [
+            ("未設定", None, home.join(".codex")),
+            ("空文字", Some("".as_ref()), home.join(".codex")),
+            ("絶対パス", Some(custom.as_os_str()), custom.clone()),
+            (
+                "Windows の形",
+                Some(r"D:\codex".as_ref()),
+                r"D:\codex".into(),
+            ),
+            (
+                "相対パス",
+                Some("rel/codex".as_ref()),
+                PathBuf::from("rel/codex"),
+            ),
+        ];
+        for (label, value, dir) in cases {
+            match value {
+                Some(v) => std::env::set_var(tako_control::codex_session::CODEX_HOME_ENV, v),
+                None => std::env::remove_var(tako_control::codex_session::CODEX_HOME_ENV),
+            }
+            let setup_writes = instruction_path(SetupAgent::Codex);
+            assert_eq!(setup_writes, Some(dir.join("AGENTS.md")), "{label}: setup");
+            assert_eq!(
+                tako_control::agents_sync::AgentKind::Codex.target_path(),
+                setup_writes,
+                "{label}: 同期の書き先"
+            );
+            let plan = tako_control::setup_bootstrap::install_plan_for(AgentKind::Codex)
+                .expect("導入計画");
+            assert_eq!(
+                plan.payload,
+                Some(dir.join("packages").join("standalone")),
+                "{label}: 導入計画"
+            );
+        }
+    }
+
     /// **#1510 の受け入れ条件 3**: GUI の初回起動の自動の段（`welcome::auto_setup_answers`）は、
     /// エージェント CLI の公式インストーラも brew / winget の依存導入も**走らせない**。
     /// `--yes` でも・端末があってもなくても・代行できる環境でもできない環境でも同じ

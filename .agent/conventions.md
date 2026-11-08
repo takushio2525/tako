@@ -1053,6 +1053,13 @@ Win32 のパス正規化と `MAX_PATH` 制限を無効にする**入口指定**�
   `~/.codex`（Windows の PowerShell は `$null` を空文字列で渡す）。素の `var_os("CODEX_HOME")` は
   空を置き場として join し作業 dir の `config.toml` / `AGENTS.md` / `auth.json` を見るので、
   正本の外の素の読み出しは番犬 `issue2798_codex_home_resolution_watchdog` が file:line で落とす（#2798）
+- **codex の置き場の下のパスは `codex_home()` から組み、ホームへ `.codex` を join しない**（#2810）。
+  `home.join(".codex/AGENTS.md")` の形は空でない `CODEX_HOME`（例: `D:\codex`）を見ないので、診断・setup の
+  置き場とずれる（共通ルールの同期の書き先と導入計画の本体の置き場がこれで残っていた）。tako-core は
+  tako-control に依存できないので、tako-core の側は**解決済みの値を引数で受ける**
+  （`InstallRecipe::payload_dir_in(home, codex_home)`。根は `payload_root`）。本番コードで中身が `.codex` で
+  始まる文字列リテラルは同じ番犬が file:line で落とし、codex の置き場ではない `.codex`（プロジェクトの
+  `.codex/config.toml` など）は番犬の `ALLOWED_DOT_CODEX` に理由つきで載せる
 
 `~` 短縮を各所で組み立てると、同じ規則が**別々に劣化する**。移送前は 10 か所にあって、
 ①ホーム解決の欠け（Windows で 1 つも縮まらない）②ホーム自身の扱い（`~` を出す実装と
