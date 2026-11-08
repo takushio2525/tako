@@ -660,6 +660,10 @@ fn print_bootstrap_human(action: &str, value: &serde_json::Value) {
         "install" => {
             if value["performed"].as_bool() == Some(true) {
                 eprintln!("インストールが完了しました");
+                // 入れた後に知っておくこと（Windows の claude = Git for Windows は要らない。#2433）
+                if let Some(note) = value["install_plan"]["shell_note"].as_str() {
+                    eprintln!("  {note}");
+                }
             } else {
                 eprintln!("実行はしていません（--dry-run）。実行される内容:");
                 print_install_plan(&value["install_plan"]);

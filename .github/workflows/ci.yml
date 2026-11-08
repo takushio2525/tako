@@ -666,6 +666,19 @@ jobs:
         if: needs.changes.outputs.agent_install == 'true'
         shell: pwsh
         run: pwsh -File scripts/windows/test-agent-install-2791.ps1
+      # #2433: Windows の Claude Code が Git Bash（Git for Windows）を要るかを、本物の claude を起こして見張る。
+      # 製品の口（`tako setup bootstrap install` = MCP tako_setup_bootstrap と同じ install_for）で Git を隠した砂場へ入れ、
+      # Git を隠す / 既定の置き場に在るが PATH に無い / PATH に在る / 標準でない置き場（PATH の git・CLAUDE_CODE_GIT_BASH_PATH）/
+      # CLAUDE_CODE_GIT_BASH_PATH が存在しないファイル、の組み合わせで claude を起こす。認証は使わず、偽の Messages API
+      # （scripts/windows/lib/fake-anthropic-2433.ps1）へ向けて 1 ターン走らせ、出されたシェルのツールと実際に走ったシェルを見る。
+      # 各組み合わせで tako setup bootstrap status も読み、Git の有無で段が変わらないことと導入計画の 1 行を見る。
+      # Git の名前の変更とユーザー環境変数 Path は finally で戻す。全数より手前に名指しで置く（#1282 / #2790 と同じ理由）。
+      # **外部（claude.ai）から取るので、#2791 の段と同じ条件（agent_install）でだけ走らせる**。
+      # **上流の claude が Git Bash を必須へ戻す・tako が Git Bash の有無を段の判定に入れる形へ戻ったらここで落ちる**
+      - name: Windows の claude が Git Bash 無しで動くことの実走検査（#2433。Git を隠す / PATH から外す / CLAUDE_CODE_GIT_BASH_PATH）
+        if: needs.changes.outputs.agent_install == 'true'
+        shell: pwsh
+        run: pwsh -File scripts/windows/test-claude-git-bash-2433.ps1 -Tako target\debug\tako.exe
       # #2433: Windows の任意依存の導入代行（winget）の断りと同意の検査。偽の winget（winget.cmd）を砂場の PATH の先頭に
       # 置いて終了コードを注入し、製品の口（tako setup deps install = MCP tako_setup_deps と同じ setup_deps::install_in）が
       # UAC の取り消し・取得元に届かない・winget が古い・途中の失敗・winget が無い・A/B を日本語の断りで言うこと、
