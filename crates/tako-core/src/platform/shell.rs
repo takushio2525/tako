@@ -1270,6 +1270,7 @@ fn clixml_unescape(text: &str) -> String {
             Some(unit) => {
                 units.extend(rest[..i].encode_utf16());
                 units.push(unit);
+                // 切り出し安全: 先頭 4 バイトが ASCII の 16 進数字・5 バイト目が `_` と確かめた後
                 rest = &tail[5..];
             }
             None => {

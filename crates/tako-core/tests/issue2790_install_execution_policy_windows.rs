@@ -182,8 +182,17 @@ fn read_marker(marker: &Path) -> Option<String> {
         .map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
-/// ステップが置いたポリシーが**実際に効いている**ことを確かめる（効いていないまま新旧を比べると偽の緑になる）
+/// ステップが置いたポリシーが**実際に効いている**ことを確かめる（効いていないまま新旧を比べると偽の緑になる）。
+///
+/// 値を読んで突き合わせるのは Windows PowerShell 5.1（製品の第 1 候補）だけ。pwsh 7 は AllSigned の下で
+/// `Microsoft.PowerShell.Security` の型データ（署名の無い `.ps1xml`）を読めず、`Get-ExecutionPolicy` 自体が
+/// 落ちる（Windows の CI で実測）ので、読めた値を記録するだけにする。pwsh 7 の置き場のポリシーが効いていることは、
+/// 同じ回の `issue2790_修正前の起こし方はポリシーを強制した状態で弾かれる` が pwsh 7 でも修正前の形が
+/// 弾かれることで示す
 fn assert_policy_effective(program: &str, scope: &str, value: &str) {
+    let strict = Path::new(program)
+        .file_stem()
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("powershell"));
     let mut command = Command::new(program);
     // CI では cargo を起こした pwsh 7 の PSModulePath が子へ漏れ、5.1 が 7 の置き場の
     // Microsoft.PowerShell.Security を拾って読めず Get-ExecutionPolicy が落ちた（AllSigned の下の実測）。
@@ -196,7 +205,13 @@ fn assert_policy_effective(program: &str, scope: &str, value: &str) {
         "'EFFECTIVE=' + (Get-ExecutionPolicy); Get-ExecutionPolicy -List | ForEach-Object { 'LIST=' + $_.Scope + '=' + $_.ExecutionPolicy }",
     ]);
     let ran = run(command, "Get-ExecutionPolicy");
-    println!("TAKO2790_POLICY program={program} {}", ran.summary());
+    println!(
+        "TAKO2790_POLICY program={program} strict={strict} {}",
+        ran.summary()
+    );
+    if !strict {
+        return;
+    }
     assert!(
         ran.stdout.contains(&format!("EFFECTIVE={value}")),
         "{program}: 置いたポリシー {scope}={value} が効いていない: {}",
