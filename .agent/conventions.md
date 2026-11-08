@@ -168,7 +168,8 @@ UI 表示言語は日英切替（既定 = OS ロケール、`tako lang` / MCP `t
   3 つを同じ言語でそろえて組む（`message()` / `Display` は `i18n::lang()`）。tako-control の
   `RunError` は型を持つ（`Invalid(UiError)` / `Refused(UpdateError)` / `Lock`）。
   **言語を固定する口**: setup（`--answers` の検証・`run_setup_stage`・`--review` の対話）は枠が
-  日本語なので `text_in(Lang::Ja)`、persist.log の記録（と重複除けの鍵）・`tako migrate` の
+  日本語なので `text_in(Lang::Ja)`（`--answers` の読み取りの段 = 符号化と空の断り
+  `SetupRefusal::AnswersUnreadable` / `AnswersEmpty` は #2789 から表示言語）、persist.log の記録（と重複除けの鍵）・`tako migrate` の
   `validate_text` も日本語。`tako mod ui` の成功の応答の枠（`applies_to` / `note` / `choices` の説明・
   `hotkey`）・CLI の人向けの表示（`print_mod_ui`）・引数の読み方の断り（`cli_request` =
   `CliRequestError`）・置き場の断り（`default_path` = `UiText::NoDataDir`）・排他の断り

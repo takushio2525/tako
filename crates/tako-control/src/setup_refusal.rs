@@ -1,4 +1,4 @@
-//! setup 系（claude への MCP 登録・`tako setup` の非対話実行と answers の検証・setup の設定 config.yaml・
+//! setup 系（claude への MCP 登録・`tako setup` の非対話実行と answers の読み込みと検証・setup の設定 config.yaml・
 //! 共通ルール同期・依存の導入・エージェント CLI の導入の系統名とホーム）の断り（#2365）。
 //!
 //! dispatch の `tako_setup_mcp` / `tako_setup` / `tako_setup_changes` / `tako_agents_sync_rules` /
@@ -16,6 +16,8 @@
 //! （CLI の `tako setup` は枠が日本語の手元の処理 = FR-2.42.21 の「setup は日本語」）。断りを表示言語で
 //! 返す dispatch だけが型の口（`*_typed`）を通す。CLI の `tako setup-mcp` は dispatch の
 //! `setup_mcp_agents` を手元で呼ぶので、呼ぶ前に表示言語を決める（`init_local_lang`）。
+//! 例外は `--answers` の読み取りの段（`setup::SetupAnswers::from_bytes`）の符号化と空の断りで、
+//! 何の形と見たかと直し方を表示言語で言う（#2789。Windows の手順書の利用者へ向けた文）。
 //!
 //! codex / agy への MCP 登録の断りは [`crate::agent_mcp::AgentMcpError`]（同じ網羅 match の形）が持つ。
 //! エージェント名の検証は orchestrator の [`crate::orchestrator::ConfigError`] を使う。
@@ -31,8 +33,10 @@ use tako_core::load_issue::{JsonReason, YamlReason};
 use tako_core::platform::user_path::UserPathError;
 use tako_core::shell_profile::PathBlockError;
 use tako_core::tako_cli_path::LinkError;
+use tako_core::text::TextDecodeError;
 
 use crate::orchestrator::ConfigError;
+use crate::setup::AnswersSource;
 use crate::DispatchError;
 
 /// setup 系の断り。`error` / `detail` / `stderr` / `output` / `log` は OS・外部コマンド・serde のエラー文と
@@ -72,6 +76,15 @@ pub enum SetupRefusal {
     SetupWaitFailed(String),
     /// 子の `tako setup` が非ゼロ終了（`output` は子の出力 = setup の枠なので日本語のまま）
     SetupFailed { code: i32, output: String },
+
+    // ---- answers の読み込み（CLI `tako setup --answers @<file>` / `-`。`setup::decode_answers`。#2789） ----
+    /// answers のバイト列を文字列にできない（BOM の無い UTF-16・不正な UTF-8・UTF-32 ほか）
+    AnswersUnreadable {
+        source: AnswersSource,
+        reason: TextDecodeError,
+    },
+    /// answers が空（0 バイト・BOM と空白だけ）
+    AnswersEmpty(AnswersSource),
 
     // ---- answers の検証（`setup::SetupAnswers::validate`） ----
     /// `selected_agent` が claude / codex / agy のどれでもない
@@ -252,6 +265,26 @@ impl SetupRefusal {
             (Self::AnswersEncode(e), En) => {
                 format!("failed to encode the setup answers as JSON: {e}")
             }
+            (Self::AnswersUnreadable { source, reason }, Ja) => format!(
+                "setup answers（{}）を読めません: {}。{}",
+                source.text_in(lang),
+                reason.text_in(lang),
+                source.fix_in(lang)
+            ),
+            (Self::AnswersUnreadable { source, reason }, En) => format!(
+                "cannot read the setup answers ({}): {}. {}",
+                source.text_in(lang),
+                reason.text_in(lang),
+                source.fix_in(lang)
+            ),
+            (Self::AnswersEmpty(source), Ja) => format!(
+                "setup answers（{}）が空です。JSON のオブジェクトを渡してください（既定のままなら `{{}}`）",
+                source.text_in(lang)
+            ),
+            (Self::AnswersEmpty(source), En) => format!(
+                "the setup answers ({}) are empty. Pass a JSON object (`{{}}` to keep the defaults)",
+                source.text_in(lang)
+            ),
             (Self::SetupSpawn(e), Ja) => format!("tako setup の起動に失敗: {e}"),
             (Self::SetupSpawn(e), En) => format!("failed to start tako setup: {e}"),
             (Self::SetupStdinUnavailable, Ja) => "tako setup の標準入力を開けない".to_string(),

@@ -12,7 +12,9 @@
 
       1. 初回起動の自動の段（GUI の welcome::run_auto_setup と同じ `tako setup --yes --answers -` +
          welcome::auto_setup_answers の JSON。写しは番犬 issue2767_windows_setup_e2e_watchdog が縛る）
-      2. `tako setup --yes --answers @<file>`（明示の答え。2 回目は「変更なし」= 冪等）
+      2. `tako setup --yes --answers @<file>`（明示の答え。2 回目は「変更なし」= 冪等）。
+         Windows PowerShell 5.1 の `Out-File`（既定 = BOM 付きの UTF-16LE / `-Encoding utf8` = BOM 付きの UTF-8）で
+         書いた同じ答えも「変更なし」で通り、BOM の無い UTF-16LE は書く前に断る（#2789）
       3. `tako setup --check`
       4. 案内どおりの 1 本の `tako setup bootstrap undo-path` で、ユーザー環境変数 Path が setup 前の並びへ戻る
          （#2775。レジストリを読み戻して比べる）→ `path` → `undo-path`（新しく開いたシェルから claude / tako が
@@ -361,6 +363,62 @@ try {
     Assert-UserPathHas $TakoDir '2 回目でも重複して足さない'
     Assert-UserPathHas $ClaudeBin '2 回目でも重複して足さない'
     Assert-NoAgentLaunch
+
+    # --- 2b. Windows PowerShell 5.1 の Out-File で書いた答え（#2789）-----------------------
+    # 手順書どおり powershell.exe（5.1）の ConvertTo-Json | Out-File で書いた答えが、上の UTF-8 と同じ答えとして
+    # 通る（同じ答えなので「変更なし」）。5.1 の Out-File は既定で BOM 付きの UTF-16LE、-Encoding utf8 は
+    # BOM 付きの UTF-8 を書く（修正前は前者が読み取りの段、後者が JSON の解析の 1 文字目で落ちた）
+    $script:Stage = '2b. PowerShell 5.1 の Out-File で書いた答え（#2789）'
+    Write-Host "-- $script:Stage"
+    $Ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    Assert-That (Test-Path -LiteralPath $Ps51 -PathType Leaf) "Windows PowerShell 5.1 が無い: $Ps51"
+    foreach ($case in @(
+            @{ Name = 'Out-File の既定'; File = 'answers-ps51-default.json'; Encoding = ''; Head = 'FF-FE' },
+            @{ Name = 'Out-File -Encoding utf8'; File = 'answers-ps51-utf8.json'; Encoding = ' -Encoding utf8'; Head = 'EF-BB-BF' })) {
+        $ps51File = Join-Path $Root $case.File
+        $ps51Script = @(
+            "`$ErrorActionPreference = 'Stop'",
+            "@{ selected_agent = 'claude'; provider_plans = @{ claude = 'max' }; sleep_guard = @{ mode = 'while-agents-running'; power = 'ac-only' }; install = `$false; launch_agent = 'none' } |",
+            "    ConvertTo-Json -Depth 4 | Out-File -FilePath '$($ps51File.Replace("'", "''"))'$($case.Encoding)",
+            "`$PSVersionTable.PSVersion.ToString()"
+        ) -join "`n"
+        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($ps51Script))
+        # pwsh 7 の PSModulePath（7 のモジュールの置き場を含む）を 5.1 へ継がせない = 5.1 は自分の既定から読む
+        $savedModulePath = $env:PSModulePath
+        try {
+            Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
+            $ps51Out = & $Ps51 -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1
+            $ps51Code = $LASTEXITCODE
+        } finally {
+            $env:PSModulePath = $savedModulePath
+        }
+        $ps51Version = (@($ps51Out) | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^\d+\.\d+' } | Select-Object -Last 1)
+        Assert-That ($ps51Code -eq 0 -and (Test-Path -LiteralPath $ps51File -PathType Leaf)) `
+            "powershell.exe（5.1）の $($case.Name) で答えを書けなかった（exit $ps51Code）: $(@($ps51Out) -join ' / ')"
+        Assert-That (([string]$ps51Version).StartsWith('5.1')) "答えを書いたのが Windows PowerShell 5.1 でない: $ps51Version"
+        $ps51Bytes = [System.IO.File]::ReadAllBytes($ps51File)
+        $ps51Head = ($ps51Bytes[0..2] | ForEach-Object { $_.ToString('X2') }) -join '-'
+        Write-Host "   書き出し: powershell.exe $ps51Version の $($case.Name) → 先頭 $ps51Head（$($ps51Bytes.Length) バイト）"
+        Assert-That ($ps51Head.StartsWith($case.Head)) "5.1 の $($case.Name) の先頭が $($case.Head) でない: $ps51Head（前提の符号化が違う）"
+        $r = Invoke-Tako @('setup', '--yes', '--answers', "@$ps51File")
+        Assert-Exit0 $r "5.1 の $($case.Name) の答えの setup"
+        Assert-Contains $r '[input] setup agent: claude' "5.1 の $($case.Name) の答えの setup" 'answers の selected_agent を使う'
+        Assert-Contains $r '[input] claude プラン: max' "5.1 の $($case.Name) の答えの setup" 'answers の provider_plans を使う'
+        Assert-Contains $r $SummaryUnchanged "5.1 の $($case.Name) の答えの setup" '上の UTF-8 と同じ答え（符号化に依らない）なので何も変えない'
+    }
+    Assert-NoAgentLaunch
+
+    # 境界: BOM の無い UTF-16LE は、何の形と見たかと直し方を言って、書く前に断る
+    $noBomFile = Join-Path $Root 'answers-utf16-nobom.json'
+    [System.IO.File]::WriteAllBytes($noBomFile, [System.Text.UnicodeEncoding]::new($false, $false).GetBytes((Get-Content -LiteralPath $answersFile -Raw)))
+    $dataBefore = @(Get-ChildItem -LiteralPath $DataDir -Recurse -File | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })
+    $r = Invoke-Tako @('setup', '--yes', '--answers', "@$noBomFile")
+    Assert-That ($r.Code -ne 0) 'BOM の無い UTF-16LE の答えを setup が受け付けた（終了コード 0）'
+    Assert-Contains $r 'BOM の無い UTF-16LE に見えます' 'BOM の無い UTF-16LE の答え' '何の形と見たかを言う'
+    Assert-Contains $r 'Out-File -Encoding utf8' 'BOM の無い UTF-16LE の答え' '直し方を言う'
+    Write-Host "   断り: $(@($r.Err -split "`r?`n" | Where-Object { $_ -ne '' })[0])"
+    $dataAfter = @(Get-ChildItem -LiteralPath $DataDir -Recurse -File | ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" })
+    Assert-That ((Compare-Object $dataBefore $dataAfter | Measure-Object).Count -eq 0) '読めない答えで断ったのにデータの置き場のファイルが変わった（書く前に断る）'
 
     # --- 3. 環境チェック ----------------------------------------------------------
     $script:Stage = '3. tako setup --check'

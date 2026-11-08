@@ -217,12 +217,88 @@ pub struct SetupSleepGuardAnswers {
     pub power: Option<String>,
 }
 
+/// `tako setup --answers` の読み元（読めない形の断りで名指し、直し方を選ぶ。#2789）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswersSource {
+    /// `--answers -`
+    Stdin,
+    /// `--answers @<path>`（パスは表記のまま）
+    File(String),
+    /// `--answers '<json>'`（引数の文字列そのもの）
+    Arg,
+}
+
+impl AnswersSource {
+    /// 断りの文で名指す読み元
+    pub fn text_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::Stdin, Ja) => "標準入力".to_string(),
+            (Self::Stdin, En) => "standard input".to_string(),
+            (Self::File(path), Ja) => format!("ファイル {path}"),
+            (Self::File(path), En) => format!("file {path}"),
+            (Self::Arg, Ja) => "--answers の引数".to_string(),
+            (Self::Arg, En) => "the --answers argument".to_string(),
+        }
+    }
+
+    /// 読めない形のときの直し方（読み元ごと。ファイルは PowerShell 5.1 / 7 のどちらでも
+    /// 読める形で書き出す 1 つのオプションを案内する = #322 の最簡形）
+    pub fn fix_in(&self, lang: tako_core::i18n::Lang) -> String {
+        use tako_core::i18n::Lang::{En, Ja};
+        match (self, lang) {
+            (Self::File(_), Ja) => {
+                "UTF-8 で保存し直してください（PowerShell なら `Out-File -Encoding utf8`）"
+                    .to_string()
+            }
+            (Self::File(_), En) => {
+                "Save it again as UTF-8 (in PowerShell: `Out-File -Encoding utf8`)".to_string()
+            }
+            (Self::Stdin, Ja) => {
+                "UTF-8 で流すか、ファイルに保存して `--answers @<ファイル>` で渡してください"
+                    .to_string()
+            }
+            (Self::Stdin, En) => {
+                "Pipe it as UTF-8, or save it to a file and pass `--answers @<file>`".to_string()
+            }
+            (Self::Arg, Ja) => "UTF-8 の JSON を渡してください".to_string(),
+            (Self::Arg, En) => "Pass the JSON as UTF-8".to_string(),
+        }
+    }
+}
+
+/// `--answers` の読み元のバイト列を JSON の文字列にする（#2789。[`SetupAnswers::from_bytes`] の型の口）。
+///
+/// 符号化は [`tako_core::text::decode_text`] の 1 実装で決める: UTF-8（BOM の有無を問わない）と
+/// BOM 付きの UTF-16LE / BE（Windows PowerShell 5.1 の `Out-File` の既定と `-Encoding utf8`）を同じ本文に
+/// し、BOM の無い UTF-16・不正な UTF-8 などは何の形と見たかと直し方で断る。0 バイト・BOM と空白だけも
+/// JSON の解析の文（`EOF while parsing`）ではなく「空」と言って断る
+pub fn decode_answers(bytes: &[u8], source: &AnswersSource) -> Result<String, SetupRefusal> {
+    let (text, _) =
+        tako_core::text::decode_text(bytes).map_err(|reason| SetupRefusal::AnswersUnreadable {
+            source: source.clone(),
+            reason,
+        })?;
+    if text.trim().is_empty() {
+        return Err(SetupRefusal::AnswersEmpty(source.clone()));
+    }
+    Ok(text)
+}
+
 impl SetupAnswers {
     pub fn from_json(input: &str) -> Result<Self, String> {
         let answers: Self =
             serde_json::from_str(input).map_err(|e| format!("setup answers JSON が不正: {e}"))?;
         answers.validate()?;
         Ok(answers)
+    }
+
+    /// `--answers` の読み元のバイト列から読む（CLI `tako setup --answers @<file>` / `-` / `<json>`。#2789）。
+    /// 読めない形と空の断りは表示言語（[`decode_answers`]）、JSON と中身の断りは [`Self::from_json`] と
+    /// 同じ（日本語 = CLI の `tako setup` の枠）
+    pub fn from_bytes(bytes: &[u8], source: &AnswersSource) -> Result<Self, String> {
+        let text = decode_answers(bytes, source).map_err(|r| r.to_string())?;
+        Self::from_json(&text)
     }
 
     /// answers の検証。断りの文は**日本語のまま**（呼び手は CLI の `tako setup` = 枠が日本語）。
@@ -1538,6 +1614,148 @@ mod tests {
         assert!(SetupAnswers::from_json(r#"{"launch_agent":"claude"}"#).is_ok());
         assert!(SetupAnswers::from_json(r#"{"launch_agent":"none"}"#).is_ok());
         assert!(SetupAnswers::from_json(r#"{"launch_agent":"unknown"}"#).is_err());
+    }
+
+    /// #2789 の見本: 日本語・サロゲート対・CRLF（PowerShell の `ConvertTo-Json` + `Out-File` の形）
+    const ANSWERS_2789: &str = "{\r\n  \"selected_agent\": \"claude\",\r\n  \
+        \"provider_plans\": { \"claude\": \"max\" },\r\n  \
+        \"instruction_content\": \"# ルール 🎉 𠮷\",\r\n  \
+        \"projects\": { \"app\": { \"cwd\": \"~/src/アプリ\" } },\r\n  \
+        \"sleep_guard\": { \"mode\": \"while-agents-running\", \"power\": \"ac-only\" },\r\n  \
+        \"install\": false,\r\n  \"launch_agent\": \"none\"\r\n}\r\n";
+
+    /// 符号化の名前と、その形のバイト列（UTF-16 は BOM 付き = PowerShell の書き出しと同じ）
+    fn encodings_2789(text: &str) -> Vec<(&'static str, Vec<u8>)> {
+        let utf16 = |bom: [u8; 2], unit: fn(u16) -> [u8; 2]| {
+            let mut out = bom.to_vec();
+            out.extend(text.encode_utf16().flat_map(unit));
+            out
+        };
+        let mut utf8_bom = vec![0xef, 0xbb, 0xbf];
+        utf8_bom.extend(text.as_bytes());
+        vec![
+            ("UTF-8", text.as_bytes().to_vec()),
+            ("UTF-8 BOM", utf8_bom),
+            ("UTF-16LE BOM", utf16([0xff, 0xfe], u16::to_le_bytes)),
+            ("UTF-16BE BOM", utf16([0xfe, 0xff], u16::to_be_bytes)),
+        ]
+    }
+
+    /// 受け入れ条件 1（#2789）: 答えのファイルと標準入力の 4 つの符号化が、素の UTF-8 の文字列と
+    /// 同じ答えになる（修正前は UTF-8 BOM が JSON の解析の 1 文字目で、UTF-16 が読み取りの段で落ちた）
+    #[test]
+    fn issue2789_answersは4つの符号化とファイルと標準入力で同じ答えになる() {
+        let want = serde_json::to_value(SetupAnswers::from_json(ANSWERS_2789).unwrap()).unwrap();
+        assert_eq!(want["instruction_content"], "# ルール 🎉 𠮷");
+        for source in [AnswersSource::Stdin, AnswersSource::File("a.json".into())] {
+            for (name, bytes) in encodings_2789(ANSWERS_2789) {
+                let got = SetupAnswers::from_bytes(&bytes, &source)
+                    .unwrap_or_else(|e| panic!("{name}（{source:?}）を読めない: {e}"));
+                assert_eq!(
+                    serde_json::to_value(got).unwrap(),
+                    want,
+                    "{name}（{source:?}）が素の UTF-8 と違う答えになった"
+                );
+            }
+        }
+    }
+
+    /// 受け入れ条件 3（#2789）: 読めない形は何の形と見たかと直し方を日英で言う。中身の断り
+    /// （不正な selected_agent）は復号の後の検証へ届く = 4 つの符号化のどれでも同じ断りになる
+    #[test]
+    fn issue2789_読めない形と空は何の形と見たかと直し方を日英で言って断る() {
+        use tako_core::i18n::Lang;
+        use tako_core::text::TextDecodeError;
+        let file = AnswersSource::File("answers.json".into());
+        let le_no_bom: Vec<u8> = "{}".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let cases: Vec<(&str, Vec<u8>, AnswersSource, SetupRefusal)> = vec![
+            (
+                "BOM の無い UTF-16LE",
+                le_no_bom.clone(),
+                file.clone(),
+                SetupRefusal::AnswersUnreadable {
+                    source: file.clone(),
+                    reason: TextDecodeError::Utf16WithoutBom { big_endian: false },
+                },
+            ),
+            (
+                "Shift_JIS",
+                b"{\"instruction_content\":\"\x93\xfa\"}".to_vec(),
+                AnswersSource::Stdin,
+                SetupRefusal::AnswersUnreadable {
+                    source: AnswersSource::Stdin,
+                    reason: TextDecodeError::InvalidUtf8 { offset: 24 },
+                },
+            ),
+            (
+                "奇数バイトの UTF-16LE",
+                vec![0xff, 0xfe, 0x7b, 0x00, 0x7d],
+                file.clone(),
+                SetupRefusal::AnswersUnreadable {
+                    source: file.clone(),
+                    reason: TextDecodeError::Utf16OddLength {
+                        big_endian: false,
+                        len: 5,
+                    },
+                },
+            ),
+            (
+                "空ファイル",
+                Vec::new(),
+                file.clone(),
+                SetupRefusal::AnswersEmpty(file.clone()),
+            ),
+            (
+                "BOM だけ",
+                vec![0xef, 0xbb, 0xbf],
+                AnswersSource::Stdin,
+                SetupRefusal::AnswersEmpty(AnswersSource::Stdin),
+            ),
+            (
+                "UTF-16LE の BOM と改行だけ",
+                vec![0xff, 0xfe, 0x0d, 0x00, 0x0a, 0x00],
+                file.clone(),
+                SetupRefusal::AnswersEmpty(file.clone()),
+            ),
+        ];
+        for (name, bytes, source, want) in cases {
+            let got = decode_answers(&bytes, &source).expect_err(name);
+            assert_eq!(got, want, "{name}");
+            let (ja, en) = (got.text_in(Lang::Ja), got.text_in(Lang::En));
+            assert!(
+                ja.contains(&source.text_in(Lang::Ja)),
+                "{name}: 読み元を名指さない: {ja}"
+            );
+            assert!(
+                en.contains(&source.text_in(Lang::En)),
+                "{name}: 読み元を名指さない: {en}"
+            );
+            assert!(en.is_ascii(), "{name}: 英語に日本語が混ざる: {en}");
+            if let SetupRefusal::AnswersUnreadable { reason, .. } = &want {
+                assert!(
+                    ja.contains(&reason.text_in(Lang::Ja)),
+                    "{name}: 形を言わない: {ja}"
+                );
+                assert!(
+                    ja.contains(&source.fix_in(Lang::Ja)),
+                    "{name}: 直し方が無い: {ja}"
+                );
+                assert!(
+                    en.contains(&source.fix_in(Lang::En)),
+                    "{name}: 直し方が無い: {en}"
+                );
+            }
+        }
+        // BOM 無しの UTF-16 を BOM 付きにすれば通る（直し方のとおりにすれば読める）
+        let mut with_bom = vec![0xff, 0xfe];
+        with_bom.extend(&le_no_bom);
+        assert!(SetupAnswers::from_bytes(&with_bom, &file).is_ok());
+        // 中身の断りはどの符号化でも同じ（復号の後の検証へ届く）
+        let bogus = r#"{"selected_agent":"bogus"}"#;
+        for (name, bytes) in encodings_2789(bogus) {
+            let e = SetupAnswers::from_bytes(&bytes, &file).expect_err(name);
+            assert_eq!(e, SetupAnswers::from_json(bogus).unwrap_err(), "{name}");
+        }
     }
 
     #[test]
