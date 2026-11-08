@@ -666,6 +666,27 @@ jobs:
         if: needs.changes.outputs.agent_install == 'true'
         shell: pwsh
         run: pwsh -File scripts/windows/test-agent-install-2791.ps1
+      # #2433: Windows の Claude Code が Git Bash（Git for Windows）を要るかを、本物の claude を起こして見張る。
+      # 製品の口（`tako setup bootstrap install` = MCP tako_setup_bootstrap と同じ install_for）で Git を隠した砂場へ入れ、
+      # Git を隠す / 既定の置き場に在るが PATH に無い / PATH に在る / 標準でない置き場（PATH の git・CLAUDE_CODE_GIT_BASH_PATH）/
+      # CLAUDE_CODE_GIT_BASH_PATH が存在しないファイル、の組み合わせで claude を起こす。認証は使わず、偽の Messages API
+      # （scripts/windows/lib/fake-anthropic-2433.ps1）へ向けて 1 ターン走らせ、出されたシェルのツールと実際に走ったシェルを見る。
+      # 各組み合わせで tako setup bootstrap status も読み、Git の有無で段が変わらないことと導入計画の 1 行を見る。
+      # Git の名前の変更とユーザー環境変数 Path は finally で戻す。全数より手前に名指しで置く（#1282 / #2790 と同じ理由）。
+      # **外部（claude.ai）から取るので、#2791 の段と同じ条件（agent_install）でだけ走らせる**。
+      # **上流の claude が Git Bash を必須へ戻す・tako が Git Bash の有無を段の判定に入れる形へ戻ったらここで落ちる**
+      - name: Windows の claude が Git Bash 無しで動くことの実走検査（#2433。Git を隠す / PATH から外す / CLAUDE_CODE_GIT_BASH_PATH）
+        if: needs.changes.outputs.agent_install == 'true'
+        shell: pwsh
+        run: pwsh -File scripts/windows/test-claude-git-bash-2433.ps1 -Tako target\debug\tako.exe
+      # #2433: Windows の任意依存の導入代行（winget）の断りと同意の検査。偽の winget（winget.cmd）を砂場の PATH の先頭に
+      # 置いて終了コードを注入し、製品の口（tako setup deps install = MCP tako_setup_deps と同じ setup_deps::install_in）が
+      # UAC の取り消し・取得元に届かない・winget が古い・途中の失敗・winget が無い・A/B を日本語の断りで言うこと、
+      # **同意なしの Git では winget を起こさない**こと、起こす引数（psmux = --scope user --silent）を見る。
+      # 外部に依らないので毎回走る（条件を付けると番犬 issue2433_dep_privilege_watchdog が落ちる）
+      - name: 任意依存の導入代行の断りの検査（#2433。偽の winget）
+        shell: pwsh
+        run: pwsh -File scripts/windows/test-deps-install-2433.ps1 -Mode fake
       # **ワークスペース全体のテストを blocking にする**（#1278 / #583）。
       # #583 は「POSIX 前提の既存失敗が残っているあいだ非ブロッキング」で据え置いていたが、
       # そのあいだに未検出が溜まり、実機で 19 → 24 件まで増えていた（#1278）。
@@ -678,6 +699,15 @@ jobs:
       # これでは「直したら次が出る」を 1 PR 1 往復でしか進められない
       - name: テスト（#1278 で blocking 化。全数を採るため --no-fail-fast）
         run: cargo test --workspace --no-fail-fast
+      # #2433: 任意依存の導入代行を本物の winget で回す（製品の口 `tako setup deps install`）。psmux を利用者の権限で
+      # 入れて導入の前後の status を記録し、Git は一度外してから「同意なし = 起こさない → --yes = 入る」を確かめて元の
+      # 置き場（machine）へ戻す。**外部（winget の取得元・GitHub Releases）から取るので、導入代行に関わるパスを変えた
+      # PR・main への push と定期実行・手動実行でだけ走らせる**（`changes` の agent_install）。Git を外して入れ直すので、
+      # PATH の git を使う全数のテストの**後ろ**に置く。ユーザー環境変数 Path・psmux・Git はスクリプトの finally で戻す
+      - name: 任意依存の導入代行の実走検査（#2433。本物の winget・psmux と Git）
+        if: needs.changes.outputs.agent_install == 'true'
+        shell: pwsh
+        run: pwsh -File scripts/windows/test-deps-install-2433.ps1 -Mode real
 
   # THIRD-PARTY-LICENSES.md（両 OS の配布物に同梱するライセンス本文。#1709 / #1845）が、今の
   # Cargo.lock から作り直した物と一致するか（#1851）。依存を足し引き・更新して作り直しを忘れると

@@ -1355,6 +1355,7 @@ pub(super) fn build_request(
             action: str_arg(args, "action")?.map(|s| s.to_string()),
             dep: str_arg(args, "dep")?.map(|s| s.to_string()),
             dry_run: bool_arg(args, "dry_run")?,
+            consent: bool_arg(args, "consent")?,
         },
         "tako_setup_models" => Request::SetupModels {
             agent: str_arg(args, "agent")?,

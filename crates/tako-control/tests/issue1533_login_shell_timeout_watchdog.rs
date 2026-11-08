@@ -415,11 +415,13 @@ fn 寄せ先の1実装を通る() {
     );
     // 眺めは文字列を潰す（`find_bounded("gh")` の名前は見えない）ので、口の名前だけで縛る
     expect(CONFIG_SHARE_ENV, "find_gh", &["exe::find_bounded("]);
+    // #2433: 依存の検出は Windows でレジストリの PATH を読み直す口を通る（unix は find_bounded そのもの）
     expect(
         SETUP_DEPS,
         "resolve_bounded",
-        &["exe::find_bounded(dep.bin)"],
+        &["exe::find_fresh_bounded(dep.bin)"],
     );
+    expect(EXE, "find_fresh_bounded", &["find_bounded(name)"]);
     expect(
         DISPATCH,
         "finish_check_health",

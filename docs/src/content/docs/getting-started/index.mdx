@@ -115,7 +115,7 @@ tako は Windows 実機で動かして確かめたものだけを「対応」と
 		{
 			kind: 'degraded',
 			title: '依存ツールと AI エージェント CLI の自動導入',
-			text: 'psmux・git は winget のコマンドを案内するだけで、代わりに入れるのは claude だけです。Tailscale はスマホからの接続が Windows で使えるようになるまで案内しません。',
+			text: 'psmux・git は winget で、claude / codex / agy は公式のインストーラーで代わりに入れます（git は Windows の管理者の確認（UAC）が出るので、同意したときだけ入れます）。確かめたのは GitHub の Windows のテスト機だけで、UAC の確認の画面と断ったときの動きは実機で未確認です。Tailscale はスマホからの接続が Windows で使えるようになるまで案内しません。',
 			tools: ['tako_setup_deps', 'tako_setup_bootstrap'],
 		},
 		{
@@ -142,7 +142,7 @@ tako は Windows 実機で動かして確かめたものだけを「対応」と
 | AI エージェント CLI | AI 連携に1つ以上必要 | `claude`（Claude Code）/ `codex`（OpenAI Codex CLI）/ `agy`（Antigravity CLI）のいずれか。**入っていなくても大丈夫です** — `tako setup` が導入まで案内します（ログインだけは、ブラウザ操作が必要なのでご自身で行います） |
 | tmux（Windows は psmux） | 推奨（リモート接続には必須） | ターミナルのセッション（作業状態）を保持するツール。入っていると **tako を閉じても実行中のプロセスが裏で動き続け、再起動しても画面ごと復元**されます。**スマホからのリモート接続（`tako remote`）にはこれが必須**です（Windows のリモート接続はまだ使えません）。オーケストレーター（master / worker）は無くても動きますが、tako を閉じると worker も止まり、次に開いたときに同じ会話で起き直します（実行中だった作業は途切れます。ほかの差は [tmux がない場合](/features/tmux-backend/#tmux-がない場合)）。macOS は `brew install tmux`、Windows は `winget install marlocarlo.psmux` で導入します（attach を前提にする一部の tmux 操作は Windows では使えません → [Windows 対応状況](/windows-support/)） |
 | [Tailscale](https://tailscale.com/) | リモート接続に必須 | `tako remote`（スマホからの接続）の transport。Mac とスマホの両方にアプリを入れて同一アカウントでログインすると、tailnet 内限定の固定 URL で安全に接続できます |
-| git | あると便利 | git パネル（ブランチ・コミットグラフ・diff 表示）で使います。macOS では `xcode-select --install` で入っていることが多いです |
+| git | あると便利 | git パネル（ブランチ・コミットグラフ・diff 表示）で使います。Windows では Claude Code がコマンドの実行に Git Bash を使いますが、無ければ PowerShell で実行するので claude はそのまま動きます。macOS では `xcode-select --install` で入っていることが多いです |
 
 :::note[tmux とは？]
 tmux（ティーマックス）は「ターミナルの中身を裏で生かしておく」ためのツールです。tako は tmux があると、アプリを閉じても実行中のコマンドや AI エージェントを裏で動かし続け、次回起動時にそのまま復元します。無くても tako は動作します（その場合、tako を閉じると実行中のプロセスも終わり、次の起動では会話を覚えている AI エージェントが同じ会話で起き直します。`tako remote` は使えません）。
@@ -298,7 +298,7 @@ AI 連携に必要な設定を、**1 コマンドで自動的に**行います�
 実行すると、次の処理が自動で順に行われます。
 
 1. **シェル統合の用意** — ペインの作業ディレクトリ追従・コマンドの実行状態・入力予測が効くように、シェル統合のスクリプトを用意します。**どの OS も設定ファイルは 1 バイトも書き換えません**。macOS / Linux は tako が開くシェルへ環境変数を渡すだけで効き（`[OK] シェル統合: 環境変数の注入で有効です` と 1 行出るだけです）、Windows は tako がペインの PowerShell を開くときに読み込ませます（`[OK] シェル統合: tako が開く PowerShell へ起動時に読ませます` と 1 行出るだけで、`$PROFILE` は書き換えず、実行ポリシーが Restricted の PC でも効きます）。以前の版が `$PROFILE` に足した管理ブロックは、この前の移行の段が取り除きます。用意できなかったときも setup は最後まで走り、`tako shell-integration install` を「残り」として案内します
-2. **エージェント CLI と依存ツールのチェック** — claude / codex / agy をすべて検出します。認証済み CLI が1つなら自動選択し、複数なら前回値または安全な既定を採用します。**1 つも使える系統が無いときだけ**、その場で導入を案内します（上の tip 参照）。tmux / git / Tailscale などの任意依存は、見つからなければ「何をどのコマンドで入れるか」を表示したうえで `tmux をインストールしますか？ [y/N]:` と **1 回だけ確認し、`y` ならその場で導入して再検出します**（`--yes` は確認を省いて導入、パイプ越しなど端末のない実行では導入せず案内だけを出します）。Windows では導入を代わりに行わず、打つ `winget` のコマンドを案内します
+2. **エージェント CLI と依存ツールのチェック** — claude / codex / agy をすべて検出します。認証済み CLI が1つなら自動選択し、複数なら前回値または安全な既定を採用します。**1 つも使える系統が無いときだけ**、その場で導入を案内します（上の tip 参照）。tmux / git / Tailscale などの任意依存は、見つからなければ「何をどのコマンドで入れるか」を表示したうえで `tmux をインストールしますか？ [y/N]:` と **1 回だけ確認し、`y` ならその場で導入して再検出します**（`--yes` は確認を省いて導入、パイプ越しなど端末のない実行では導入せず案内だけを出します）。Windows は `winget` で導入します（git は Windows の管理者の確認（UAC）が出るので、その旨を同じ 1 回の確認に添えます。`y` か `--yes` が同意です）
 3. **認証・プラン確認** — Claude は認証と Pro / Max 等、Codex は認証と ChatGPT プランを取得できる範囲で自動判定します。検出不能でも安全に未指定にできる情報は `unknown` を採用します。token やアカウント情報は保存・表示しません
 4. **MCP 接続の準備** — 検出したエージェント CLI すべてへ tako の MCP サーバーを登録します。書き込み先は claude が `~/.claude.json`、codex が `~/.codex/config.toml` の `[mcp_servers.tako]`、agy が `~/.gemini/config/mcp_config.json` です（claude だけは `tako setup-mcp --project` で `<cwd>/.mcp.json` にも入れられます）。**書き先が `~/.claude/settings.json` だったのは古い tako で、いまはそこに残った設定を掃除する側です。** codex はこれに加えて、master / worker として起動するときに起動コマンドへその場でも MCP 設定を渡します（tako の外で立ち上げた codex にツールを出さないための経路です）
 5. **推奨 profile の生成** — プラン規模に応じて master / worker、effort、worker ポリシーを `profiles/default.yaml` へ生成します。モデル名は固定せず、各 CLI の最新の既定モデルを使います。既存 profile はそのまま維持します

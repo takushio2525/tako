@@ -3277,8 +3277,8 @@ pub fn tools() -> Vec<Value> {
                 どれも**無くても tako 自体は動く**が、欠けるとリモート接続・セッション完全復元・\
                 git パネルが使えない。status（既定・読むだけ）は各依存の found / install_command / \
                 can_run（tako が導入を代行できるか）/ hint。install は未導入のものを導入する（dep で 1 件に絞れる。\
-                dry_run=true で計画だけ。**導入済みは触らない** = 冪等）。代行できない環境（Windows の winget）や\
-                導入手段が無いものは実行せず skipped に理由つきで載る。名前はプラットフォームで変わる\
+                dry_run=true で計画だけ。**導入済みは触らない** = 冪等）。privilege=elevated（Windows の UAC が出る）は \
+                consent=true のときだけ入れ、無ければ consent_required に載る。入れないものは skipped に理由つき。名前はプラットフォームで変わる\
                 （永続化の器は macOS = tmux / Windows = psmux）ので、推測せず status の bin を使う。",
             "inputSchema": {
                 "type": "object",
@@ -3295,6 +3295,10 @@ pub fn tools() -> Vec<Value> {
                     "dry_run": {
                         "type": "boolean",
                         "description": "action=install で実行せず計画だけ返す",
+                    },
+                    "consent": {
+                        "type": "boolean",
+                        "description": "UAC の出る導入への利用者の同意（本人に確かめてから true）",
                     },
                 },
                 "additionalProperties": false,

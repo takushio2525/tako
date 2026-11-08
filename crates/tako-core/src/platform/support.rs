@@ -260,9 +260,11 @@ pub mod notes {
         "tako runs the official install.ps1 for all three CLIs (no administrator rights). claude was measured on real Windows 11 (#1057); codex / agy were verified by running the official install.ps1 on Windows CI runners but have not been measured on real Windows hardware (#2791)",
     );
 
+    /// #1057 / #2433。winget で導入を代行する（psmux は利用者の権限・Git は UAC への同意があるときだけ）。
+    /// 確かめたのは Windows の CI のランナー（管理者・UAC の確認が出ない設定）だけで、実機の UAC は未実測
     pub const WIN_SETUP_DEPS: Note = Note::new(
-        "依存の検出はできるが、導入の実行代行は macOS（Homebrew）だけ。Windows は winget のコマンドを案内する",
-        "Dependency detection works, but tako only runs the installer for you on macOS (Homebrew); on Windows it prints the winget command instead",
+        "依存の導入を winget で代行する（psmux は利用者の権限でそのまま、Git は管理者の確認（UAC）への同意があるときだけ）。Windows の CI のランナーで psmux と Git を実際に入れて確かめたが、ランナーは UAC の確認が出ない設定なので、確認の画面と拒否は Windows 実機で未実測（#2433）",
+        "tako installs the dependencies with winget (psmux with user rights as is; Git only with consent to the administrator prompt (UAC)). Installing psmux and Git was verified on Windows CI runners, but the runners never show the UAC prompt, so the prompt and declining it have not been measured on real Windows hardware (#2433)",
     );
 
     /// #971 / #1038。unix ソケット target の決め打ちは #1038 で解消したが、Windows 実機は未実測
@@ -1721,13 +1723,14 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_setup_deps",
         macos: Support::Supported,
-        // 検出は両 OS で動くが、導入の代行は brew（macOS）だけ。
-        // Windows は winget のコマンドを案内する（実機実測を経てから代行する）
+        // #2433 で Windows も winget で導入を代行するようにした（依存ごとの権限は setup_deps の依存表で宣言）。
+        // 確かめたのは Windows の CI のランナー（使い捨て・管理者・UAC の確認が出ない）だけで、実機の UAC の
+        // 確認と拒否は未実測 = 全体としては Degraded（過大申告しない。tako_setup_bootstrap の #2791 と同じ扱い）
         windows: Support::Degraded {
             note: notes::WIN_SETUP_DEPS,
         },
         windows_evidence: Evidence::Measured(
-            "#1057 の Windows 11 実測: `tako setup deps` が器（psmux）/ git / tailscale を実際の解決結果つきで列挙し、install は winget を代行せず not_delegable で理由 + コマンドを返す",
+            "#1057 の Windows 11 実測: `tako setup deps` が器（psmux）/ git / tailscale を実際の解決結果つきで列挙する。#2433 で winget の代行を足し、Windows の CI のランナー（Windows Server 2025・winget v1.11.510）で `tako setup deps install --dep psmux` が winget を起こして入れ、status が未導入 → 導入済みへ変わること、Git は同意なしでは起こさず `--yes` で入ることを確かめた（scripts/windows/test-deps-install-2433.ps1。UAC の取り消し・取得元に届かない・winget が古い・途中の失敗は偽の winget で終了コードを注入して確かめた）",
         ),
     },
     Feature {

@@ -1337,7 +1337,9 @@ pub const MATRIX: &[AgentFeature] = &[
              公式手順を持ち、まっさら HOME + PATH 剥ぎで 3 系統とも \
              `tako setup bootstrap install` が通る（実測）。#2791 で Windows も 3 系統とも \
              公式の install.ps1 で代行する（codex / agy は Windows の CI のランナーで実走。\
-             Windows 実機は claude だけ = platform::support の tako_setup_bootstrap）",
+             Windows 実機は claude だけ = platform::support の tako_setup_bootstrap）。\
+             #2433: Windows の claude は Git for Windows が無くても入り・起動して 1 ターン走る\
+             （コマンドは PowerShell。CI のランナーで 2.1.319 を実走）",
         ),
     },
     AgentFeature {

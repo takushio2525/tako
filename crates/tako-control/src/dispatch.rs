@@ -7072,6 +7072,10 @@ pub enum OffloadJob {
     /// 投げた要求を、IPC / MCP と同じ口（`queue::answer` = `ipc::submit` が手前で答える関数）で答える。
     /// status は覚えが古ければ走査する（1 回 wall 11〜24 ms）ので UI スレッドで答えない
     Queue(Box<Request>),
+    /// 任意依存の検出と導入（`tako_setup_deps`。#2433）。検出（unix はログインシェル・tailscale は
+    /// `--version`）と導入器（brew / winget。UAC の確認を待つこともある）を UI スレッドで待たない。
+    /// workspace に触らないのでそのまま background から応答する
+    SetupDeps(Box<Request>),
     /// tmux 一覧（#1984）。UI スレッドでは tako のペインとの対応表だけを写し、
     /// `tmux list-sessions` ほか（ソケットごとに数本）は background で起こす
     TmuxList {
@@ -8150,6 +8154,11 @@ pub fn prepare_offload(
         queued @ Request::Queue { .. } if !crate::queue::needs_ui(queued) => {
             Some(Ok(OffloadJob::Queue(Box::new(queued.clone()))))
         }
+        // #2433: 依存の検出・導入を UI スレッドで待たない（winget の導入は数分・UAC の確認を待つ）。
+        // A/B の `TAKO_2433_LEGACY=1` は修正前と同じ `None` = UI スレッドで同期に答える
+        deps @ Request::SetupDeps { .. } if !crate::setup_deps::legacy_2433() => {
+            Some(Ok(OffloadJob::SetupDeps(Box::new(deps.clone()))))
+        }
         Request::TmuxList { socket } if !tako_core::probe::issue1984_legacy() => {
             Some(Ok(OffloadJob::TmuxList {
                 ctx: collect_tmux_context(host),
@@ -8197,6 +8206,44 @@ pub fn prepare_offload(
             })
         }
         _ => None,
+    }
+}
+
+/// `tako_setup_deps` の応答（同期の腕と background の腕 = [`OffloadJob::SetupDeps`] が通る 1 実装。#2433）。
+/// 導入（brew / winget）は利用者が終わりを待つと分かって撃つ要求なので、応答の上限は持たない
+/// （`protocol::default_reply_timeout`）
+fn setup_deps_reply(request: &Request) -> Result<Value, DispatchError> {
+    let Request::SetupDeps {
+        action,
+        dep,
+        dry_run,
+        consent,
+    } = request
+    else {
+        unreachable!("setup_deps_reply は SetupDeps だけを受ける");
+    };
+    match action.as_deref().unwrap_or("status") {
+        "status" => Ok(serde_json::json!({
+            "deps": crate::setup_deps::status_json(),
+            "install_command": "tako setup deps install",
+        })),
+        "install" => crate::setup_deps::install_typed(
+            dep.as_deref(),
+            crate::setup_deps::DepInstallOptions {
+                dry_run: dry_run.unwrap_or(false),
+                // GUI 内 dispatch には端末が無いので出力は捕捉して応答へ載せる
+                interactive: false,
+                // UAC が出うる導入は呼び手の明示の同意があるときだけ（#2433。MCP の consent・設定画面のボタン）
+                consent: consent.unwrap_or(false),
+            },
+        )
+        .map_err(SetupRefusal::operation),
+        other => Err(Reason::UnknownValue {
+            key: "action",
+            got: other.to_string(),
+            allowed: "status / install".into(),
+        }
+        .invalid()),
     }
 }
 
@@ -8419,6 +8466,8 @@ impl OffloadJob {
             .map_err(DispatchError::Operation),
             // #1995: `ipc::submit` が手前で答えるのと同じ関数（接続のスレッドの代わりに background）
             OffloadJob::Queue(request) => crate::queue::answer(&request),
+            // #2433: 同期の腕（`Request::SetupDeps`）と同じ関数
+            OffloadJob::SetupDeps(request) => setup_deps_reply(&request),
             OffloadJob::UsageShow { query, shown } => crate::usage::usage_payload(
                 &query,
                 crate::usage::Refresh::Budget(crate::usage::MCP_REFRESH_BUDGET),
@@ -13281,35 +13330,9 @@ fn dispatch_inner(
             }
         }
 
-        Request::SetupDeps {
-            action,
-            dep,
-            dry_run,
-        } => {
-            // 依存の検出と brew / winget での導入。プロセス内で完結する（#88 / #1057）
-            let action = action.as_deref().unwrap_or("status");
-            match action {
-                "status" => Ok(serde_json::json!({
-                    "deps": crate::setup_deps::status_json(),
-                    "install_command": "tako setup deps install",
-                })),
-                "install" => crate::setup_deps::install_typed(
-                    dep.as_deref(),
-                    crate::setup_deps::DepInstallOptions {
-                        dry_run: dry_run.unwrap_or(false),
-                        // GUI 内 dispatch には端末が無いので出力は捕捉して応答へ載せる
-                        interactive: false,
-                    },
-                )
-                .map_err(SetupRefusal::operation),
-                other => Err(Reason::UnknownValue {
-                    key: "action",
-                    got: other.to_string(),
-                    allowed: "status / install".into(),
-                }
-                .invalid()),
-            }
-        }
+        // 依存の検出と brew / winget での導入。プロセス内で完結する（#88 / #1057）。
+        // GUI では `prepare_offload` が background へ出す（#2433。winget / brew の導入を UI スレッドで待たない）
+        request @ Request::SetupDeps { .. } => setup_deps_reply(&request),
 
         Request::SetupModels { agent } => {
             // 読み取り専用・プロセス内完結（アプリ状態に依存しない）。

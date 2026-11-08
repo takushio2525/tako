@@ -312,6 +312,7 @@ fn setup系の断りは表示言語に従う() {
         tako_control::setup_deps::DepInstallOptions {
             dry_run: true,
             interactive: false,
+            consent: false,
         },
     )
     .expect_err("不明な依存は断られる");

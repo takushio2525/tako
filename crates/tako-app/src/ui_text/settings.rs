@@ -578,6 +578,35 @@ pub fn setup_not_installed() -> &'static str {
     tr!("未導入", "Not installed")
 }
 
+/// 任意の依存ツールの見出し（#2433。`tako setup deps` と同じ表）
+pub fn setup_deps_header() -> &'static str {
+    tr!("任意の依存ツール", "Optional tools")
+}
+
+/// 依存を入れるボタン（利用者の権限で入るもの）
+pub fn setup_deps_install() -> &'static str {
+    tr!("導入", "Install")
+}
+
+/// 依存を入れるボタン（押すと Windows の UAC が出るもの。押下が同意 = #2433）
+pub fn setup_deps_install_uac() -> &'static str {
+    tr!("導入（管理者の確認あり）", "Install (admin prompt)")
+}
+
+pub fn setup_deps_installing() -> &'static str {
+    tr!("導入中…", "Installing…")
+}
+
+/// 検出を打ち切った・在るが動かない（入れ直させない）
+pub fn setup_deps_unknown() -> &'static str {
+    tr!("確認できません", "Cannot check")
+}
+
+/// 「<名前>: 導入しました」の後半
+pub fn msg_dep_installed() -> &'static str {
+    tr!("導入しました", "installed")
+}
+
 pub fn setup_mcp_header() -> &'static str {
     tr!("MCP 登録", "MCP registration")
 }
@@ -1672,6 +1701,12 @@ mod tests {
                 setup_agents_header().into(),
                 setup_installed().into(),
                 setup_not_installed().into(),
+                setup_deps_header().into(),
+                setup_deps_install().into(),
+                setup_deps_install_uac().into(),
+                setup_deps_installing().into(),
+                setup_deps_unknown().into(),
+                msg_dep_installed().into(),
                 setup_mcp_header().into(),
                 desc_mcp().into(),
                 setup_mcp_register().into(),

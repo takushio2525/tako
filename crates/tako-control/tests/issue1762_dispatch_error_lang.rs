@@ -11909,10 +11909,14 @@ fn setup_refusal_index(r: &SetupRefusal) -> usize {
         S::UserPath(_) => 56,
         S::AnswersUnreadable { .. } => 57,
         S::AnswersEmpty(_) => 58,
+        S::DepElevationDeclined { .. } => 59,
+        S::DepSourceUnreachable { .. } => 60,
+        S::DepInstallerTooOld { .. } => 61,
+        S::DepWingetFailed { .. } => 62,
     }
 }
 
-const SETUP_REFUSAL_VARIANTS: usize = 59;
+const SETUP_REFUSAL_VARIANTS: usize = 63;
 
 /// tako-core の 3 型（bootstrap の path / undo-path の中身）の通し番号
 fn path_block_index(e: &PathBlockError) -> usize {
@@ -12377,6 +12381,42 @@ fn setup_refusal_table() -> Vec<(SetupRefusal, String)> {
         (
             S::AnswersEmpty(tako_control::setup::AnswersSource::Stdin),
             "setup answers（標準入力）が空です。JSON のオブジェクトを渡してください（既定のままなら `{}`）"
+                .into(),
+        ),
+        // #2433 で足した winget の断り（#2365 より前の文は無いので、足した時点の日本語を固定する）
+        (
+            S::DepElevationDeclined { bin: "git".into() },
+            "git の導入は管理者の確認（UAC）で取り消されました。\
+             入れるときは、もう一度実行して確認の画面で「はい」を選んでください"
+                .into(),
+        ),
+        (
+            S::DepSourceUnreachable {
+                command: "winget install --id Git.Git".into(),
+                code: "0x80072EFD".into(),
+                log: "  InternetOpenUrl() failed. \n".into(),
+            },
+            "winget install --id Git.Git が取得元に届きませんでした（exit 0x80072EFD）。\
+             ネットワークとプロキシの設定を確かめてから、もう一度実行してください\nInternetOpenUrl() failed."
+                .into(),
+        ),
+        (
+            S::DepInstallerTooOld {
+                command: "winget install --id Git.Git".into(),
+                log: String::new(),
+            },
+            "winget が tako の渡す引数を受け付けませんでした（版が古い可能性があります）。\
+             Microsoft Store の「アプリ インストーラー」を更新してから、もう一度実行してください: winget install --id Git.Git"
+                .into(),
+        ),
+        (
+            S::DepWingetFailed {
+                command: "winget install --id Git.Git".into(),
+                code: "0x8A150006".into(),
+                log: "Installer failed with exit code: 1".into(),
+            },
+            "winget install --id Git.Git が失敗しました（exit 0x8A150006）。上に出ているエラーを確認してください\n\
+             Installer failed with exit code: 1"
                 .into(),
         ),
     ]
