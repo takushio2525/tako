@@ -3840,6 +3840,8 @@ fn pidless_listener_outlived(
 ///    .app と食い違って実機検証が旧コードを踏む事故が起きた
 /// ③ .app が無い環境（cargo install 等）は CLI 自身（current_exe）
 /// ④ それ以外（ファイル名が tako でない呼び出し元）は resolve_tako_binary に委ねる
+///
+/// CLI の実行ファイル名は `dispatch::tako_cli_file_name()`（Windows は `tako.exe`。#2772）
 fn serve_binary() -> String {
     let isolated = std::env::var("TAKO_REMOTE_TEST_MODE").is_ok_and(|v| v == "1")
         || matches!(
@@ -3847,25 +3849,40 @@ fn serve_binary() -> String {
             Some("1" | "true" | "on")
         );
     let stable_exists = std::path::Path::new(crate::dispatch::STABLE_APP_BINARY).is_file();
-    serve_binary_impl(isolated, std::env::current_exe().ok(), stable_exists)
-        .unwrap_or_else(crate::dispatch::resolve_tako_binary)
+    serve_binary_impl(
+        isolated,
+        std::env::current_exe().ok().as_deref(),
+        stable_exists,
+        &crate::dispatch::tako_cli_file_name(),
+        &|p| p.is_file(),
+    )
+    .unwrap_or_else(crate::dispatch::resolve_tako_binary)
 }
 
-/// serve_binary の判定本体（テスト可能な純関数寄りの形。None = resolve_tako_binary へ委譲）
+/// serve_binary の判定本体（純関数。None = resolve_tako_binary へ委譲）。
+///
+/// CLI の実行ファイル名を `cfg` ではなく `file_name` の引数で表すのが要点（`resolve_tako_binary_with`
+/// と同じ形。**macOS 上から Windows の形も検査できる**）。#2772 前は `"tako"` 決め打ちで、Windows の
+/// CLI は `tako.exe` なので ① の隔離の腕（自分自身・同じ世代の兄弟）と ③ が一度も当たらず、
+/// `resolve_tako_binary` の PATH の段が勝つ = 隔離の検証でもインストール済みの別の世代が daemon になりえた
 fn serve_binary_impl(
     isolated: bool,
-    current_exe: Option<std::path::PathBuf>,
+    current_exe: Option<&std::path::Path>,
     stable_exists: bool,
+    file_name: &str,
+    is_file: &dyn Fn(&std::path::Path) -> bool,
 ) -> Option<String> {
+    let is_cli =
+        |exe: &std::path::Path| exe.file_name().and_then(|n| n.to_str()) == Some(file_name);
     if isolated {
-        if let Some(ref exe) = current_exe {
-            if exe.file_name().and_then(|n| n.to_str()) == Some("tako") {
+        if let Some(exe) = current_exe {
+            if is_cli(exe) {
                 return Some(exe.display().to_string());
             }
             // GUI（tako-app）等からの起動: 同ディレクトリの CLI（同世代）を使う
             if let Some(dir) = exe.parent() {
-                let sibling = dir.join("tako");
-                if sibling.is_file() {
+                let sibling = dir.join(file_name);
+                if is_file(&sibling) {
                     return Some(sibling.display().to_string());
                 }
             }
@@ -3874,8 +3891,8 @@ fn serve_binary_impl(
     if stable_exists {
         return Some(crate::dispatch::STABLE_APP_BINARY.to_string());
     }
-    if let Some(ref exe) = current_exe {
-        if exe.file_name().and_then(|n| n.to_str()) == Some("tako") {
+    if let Some(exe) = current_exe {
+        if is_cli(exe) {
             return Some(exe.display().to_string());
         }
     }
@@ -11650,46 +11667,108 @@ mod tests {
         );
     }
 
+    /// [`serve_binary_impl`] をこの OS の実行ファイル名と実ファイルで引く（#432 の検査の形）
+    fn serve_binary_here(
+        isolated: bool,
+        current_exe: &std::path::Path,
+        stable_exists: bool,
+    ) -> Option<String> {
+        serve_binary_impl(
+            isolated,
+            Some(current_exe),
+            stable_exists,
+            &crate::dispatch::tako_cli_file_name(),
+            &|p| p.is_file(),
+        )
+    }
+
     #[test]
     fn serve_binary_implは通常モードで安定バイナリを優先する() {
         // #432: PATH 上の dev CLI から start しても .app 世代の serve を立てる
-        let dev_cli = std::path::PathBuf::from("/tmp/dev/target/release/tako");
+        let dev_cli = std::path::Path::new("/tmp/dev/target/release")
+            .join(crate::dispatch::tako_cli_file_name());
         assert_eq!(
-            serve_binary_impl(false, Some(dev_cli.clone()), true).as_deref(),
+            serve_binary_here(false, &dev_cli, true).as_deref(),
             Some(crate::dispatch::STABLE_APP_BINARY)
         );
         // .app が無い環境では CLI 自身
         assert_eq!(
-            serve_binary_impl(false, Some(dev_cli), false).as_deref(),
-            Some("/tmp/dev/target/release/tako")
+            serve_binary_here(false, &dev_cli, false),
+            Some(dev_cli.display().to_string())
         );
     }
 
     #[test]
     fn serve_binary_implは検証モードで自世代バイナリを返す() {
         // #432: 隔離・検証時は /Applications に飛ばず検証対象の世代で serve を立てる
-        let dev_cli = std::path::PathBuf::from("/tmp/dev/target/release/tako");
+        let dev_cli = std::path::Path::new("/tmp/dev/target/release")
+            .join(crate::dispatch::tako_cli_file_name());
         assert_eq!(
-            serve_binary_impl(true, Some(dev_cli), true).as_deref(),
-            Some("/tmp/dev/target/release/tako")
+            serve_binary_here(true, &dev_cli, true),
+            Some(dev_cli.display().to_string())
         );
         // GUI（tako-app）から: 同ディレクトリに実在する CLI（同世代）へ
-        let dir = std::env::temp_dir().join(format!("tako-432-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sibling = dir.join("tako");
+        let dir = tako_core::test_residue::ScratchDir::new("tako-432-test");
+        let sibling = dir.path().join(crate::dispatch::tako_cli_file_name());
         std::fs::write(&sibling, b"stub").unwrap();
-        let gui = dir.join("tako-app");
+        let gui = dir.path().join("tako-app");
         assert_eq!(
-            serve_binary_impl(true, Some(gui.clone()), true).as_deref(),
-            Some(sibling.display().to_string().as_str())
+            serve_binary_here(true, &gui, true),
+            Some(sibling.display().to_string())
         );
         // sibling が無ければ通常フロー（安定バイナリ）へ落ちる
         std::fs::remove_file(&sibling).unwrap();
         assert_eq!(
-            serve_binary_impl(true, Some(gui), true).as_deref(),
+            serve_binary_here(true, &gui, true).as_deref(),
             Some(crate::dispatch::STABLE_APP_BINARY)
         );
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #2772: Windows の CLI（`tako.exe`）でも隔離の腕が当たる。#2772 前は `"tako"` 決め打ちで
+    /// 自分自身も同じ世代の兄弟も見つけられず、`resolve_tako_binary`（PATH が先）へ落ちて
+    /// インストール済みの別の世代が daemon になりえた。OS を問わず両方の名前の形を検査する
+    #[test]
+    fn serve_binary_implはwindowsのtako_exeでも自世代を返す() {
+        let dir = std::path::Path::new("/opt/tako-2772");
+        for file_name in ["tako.exe", "tako"] {
+            let cli = dir.join(file_name);
+            let gui = dir.join(if file_name.ends_with(".exe") {
+                "tako-app.exe"
+            } else {
+                "tako-app"
+            });
+            let only_cli = |p: &std::path::Path| p == cli;
+            // CLI 自身から（隔離）: 自分自身
+            assert_eq!(
+                serve_binary_impl(true, Some(&cli), true, file_name, &only_cli),
+                Some(cli.display().to_string()),
+                "{file_name}: 隔離の CLI 自身を serve に使わない"
+            );
+            // GUI から（隔離）: 同じディレクトリの CLI（同じ世代）
+            assert_eq!(
+                serve_binary_impl(true, Some(&gui), true, file_name, &only_cli),
+                Some(cli.display().to_string()),
+                "{file_name}: 隔離の GUI の隣の CLI を serve に使わない"
+            );
+            // .app の無い環境（Windows の通常）: CLI 自身
+            assert_eq!(
+                serve_binary_impl(false, Some(&cli), false, file_name, &only_cli),
+                Some(cli.display().to_string()),
+                "{file_name}: .app の無い環境で CLI 自身を serve に使わない"
+            );
+            // GUI から（通常・.app 無し）は resolve_tako_binary へ委ねる（#432 のまま）
+            assert_eq!(
+                serve_binary_impl(false, Some(&gui), false, file_name, &only_cli),
+                None
+            );
+        }
+        // 名前の違う隣（Windows の CLI の名前で探して `tako` しか無い等）は拾わない
+        let gui = dir.join("tako-app.exe");
+        let only_bare = |p: &std::path::Path| p == dir.join("tako");
+        assert_eq!(
+            serve_binary_impl(true, Some(&gui), false, "tako.exe", &only_bare),
+            None
+        );
     }
 
     /// #590: シグナルマスクのリセットが効くこと。
