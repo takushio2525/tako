@@ -9020,7 +9020,7 @@ mod tests {
         }));
         let (tx, rx) = std::sync::mpsc::channel();
         let conn = Arc::clone(&app_conn);
-        std::thread::spawn(move || {
+        let caller = std::thread::spawn(move || {
             let started = std::time::Instant::now();
             // HTTP の段（通信失敗 = 502 + 接続を捨てる）
             let dispatched = app_dispatch(
@@ -9052,11 +9052,16 @@ mod tests {
             message.starts_with(&receive_failed),
             "断りは unix と同じ受信失敗（{receive_failed}…）: {message}"
         );
+        // 接続を捨てたか（unix と同じ）。ロックは取らない: `with_app_ipc` を通すとプロセス全体の
+        // 同時実行数（`IPC_INFLIGHT`）を数えてしまい、並走する #1403 のテストの測定窓を汚す
+        // （実測: CI の macOS で peak 2）。呼び手のスレッドが抜けた後の 1 つを取り出して読む
+        caller.join().expect("呼び手");
+        let left = Arc::try_unwrap(app_conn)
+            .ok()
+            .and_then(|lock| lock.into_inner().ok())
+            .expect("呼び手が抜けた後は接続の持ち主が 1 つだけ残る");
         assert!(
-            matches!(
-                with_app_ipc(&app_conn, |conn| conn.client.is_none()),
-                Ok(true)
-            ),
+            left.client.is_none(),
             "通信失敗なので接続を捨てる（次の get() で張り直す）"
         );
         assert!(
