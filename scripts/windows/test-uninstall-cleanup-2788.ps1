@@ -252,8 +252,24 @@ try {
     Assert-IntegrationsPresent '上書きインストールの後（片付けは走らない）'
     Assert-DataUnchanged $dataBefore '上書きインストールの後'
 
-    # --- 4. アンインストール ------------------------------------------------------
-    $script:Stage = '4. アンインストール'
+    # --- 4. 外すものの見立て（dry-run = 何も変えない）。アンインストーラーは出力を捨てるので、
+    # 同じ 1 実装の判断をここで CI のログへ残す（何が外れる予定で、何を理由つきで残すか）
+    $script:Stage = '4. 外すものの見立て（tako setup undo --dry-run --json）'
+    Write-Host "-- $script:Stage"
+    $plan = (Invoke-Tako @('setup', 'undo', '--dry-run', '--json')).Out | ConvertFrom-Json -Depth 32
+    foreach ($item in @($plan.items | Where-Object { $_.outcome -ne 'absent' })) {
+        $why = if ($item.PSObject.Properties.Name -contains 'reason') { "（$($item.reason.code): $($item.reason.message)）" } else { '' }
+        Write-Host "   $($item.outcome) $($item.kind) $($item.path)$why"
+    }
+    Write-Host "   summary: $($plan.summary | ConvertTo-Json -Compress)"
+    $codexBytes = [System.IO.File]::ReadAllBytes($CodexToml)
+    Write-Host "   codex の config.toml の先頭: $(($codexBytes | Select-Object -First 8 | ForEach-Object { '{0:X2}' -f $_ }) -join ' ')・CR を含む: $($codexBytes -contains 13)"
+    Assert-That (@($plan.items | Where-Object { $_.kind -eq 'mcp' -and $_.agent -eq 'codex' -and $_.outcome -eq 'would_remove' }).Count -eq 1) `
+        'dry-run の見立てで codex の MCP 登録が would_remove でない（上の行の理由を見る）'
+    Assert-DataUnchanged $dataBefore 'dry-run の後'
+
+    # --- 5. アンインストール ------------------------------------------------------
+    $script:Stage = '5. アンインストール'
     Write-Host "-- $script:Stage"
     $entry = Get-TakoUninstallEntry $InstallDir
     Assert-That ($null -ne $entry) "インストール先 $InstallDir のアンインストール情報（UninstallString）が無い"
@@ -274,8 +290,8 @@ try {
     Assert-That ($line.Count -ge 1 -and ($line -join "`n") -match 'finished \(exit 0\)') `
         'アンインストールのログに tako setup undo の終了（exit 0）が無い（usUninstall で起こしていない）'
 
-    # --- 5. 連携が外れ、データと利用者のものは残る -----------------------------------
-    $script:Stage = '5. 片付けの結果'
+    # --- 6. 連携が外れ、データと利用者のものは残る -----------------------------------
+    $script:Stage = '6. 片付けの結果'
     Write-Host "-- $script:Stage"
     $servers = Get-McpServers $ClaudeJson
     Assert-That (-not ($servers -contains 'tako')) "~/.claude.json に tako の MCP 登録が残った: $($servers -join ', ')"
