@@ -1373,13 +1373,135 @@ fn run_installer(
 /// 「tako 自身の CLI → エージェント CLI のランチャー」で、重複は
 /// [`shell_profile::ensure_dirs_on_path_in`] が落とす。
 /// **macOS は 3 系統とも `~/.local/bin` で tako の symlink 先も同じ**なので、
-/// 実際に並ぶのは 1 個 = ブロックの中身は #1502 前と変わらない
+/// 実際に並ぶのは 1 個 = ブロックの中身は #1502 前と変わらない。
+/// **Windows（ユーザー環境変数 Path）は [`user_path_dirs`] を通す**（系統ごとに置き場が違い、
+/// 1 エントリずつ足し引きする。#2775）
 fn desired_path_dirs(home: &Path, tako: Option<&tako_cli_path::Placement>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = tako.map(|p| p.dir.clone()).into_iter().collect();
     for agent in bootstrap_agents() {
         dirs.push(recipe_for(agent).launcher_dir_in(home));
     }
     dirs
+}
+
+/// Windows のユーザー環境変数 Path への操作（[`user_path_dirs_for`] の引数。#2775）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserPathOp {
+    /// `tako setup` の tako CLI の段（系統を名指さない）
+    SetupStage,
+    /// `tako setup bootstrap path`（名指した系統）
+    Path(AgentKind),
+    /// `tako setup bootstrap undo-path`（名指した系統。#2775 からは外す範囲に効かない = 旧アームだけが読む）
+    Undo(AgentKind),
+}
+
+/// 1 系統ぶんのランチャーの置き場と、そこにランチャーが在るか
+#[derive(Debug, Clone)]
+struct LauncherSlot {
+    agent: AgentKind,
+    dir: PathBuf,
+    installed: bool,
+}
+
+/// Windows のユーザー環境変数 Path で tako が足す / 外す置き場（**足す側と外す側の正本**。#2775）。
+///
+/// - undo-path: tako の置き場と**全系統**のランチャーの置き場（`--agent` に依らない）。
+///   unix の undo-path がマーカーブロックごと外すのと同じ意味で、setup が足した分は案内どおりの
+///   1 本（`tako setup bootstrap undo-path`）で全部外れる。#2775 前の setup の段が足した
+///   入っていない系統の置き場（残骸）もここで外れる
+/// - setup の段・path: tako の置き場と、path で名指した系統と、**ランチャーが置き場に在る系統**の
+///   置き場。入っていない系統の置き場は足さない（在りもしないディレクトリを利用者の Path に並べない。
+///   後から入れた系統は setup の 2 回目・`tako setup bootstrap path` が足す）。path は undo-path の逆 =
+///   外した後の path で、入っている系統の置き場も戻る
+///
+/// `legacy`（`TAKO_2775_LEGACY=1`）は #2775 前: setup の段は全系統、path / undo-path は名指した系統と
+/// tako の置き場だけ（setup が足した codex / agy の置き場が既定の undo-path で残った）。
+/// **純粋関数**（置き場と導入済みかを引数で受ける）なので macOS の `cargo test` から Windows の表で縛れる
+fn user_path_dirs_for(
+    tako_dir: Option<&Path>,
+    slots: &[LauncherSlot],
+    op: UserPathOp,
+    legacy: bool,
+) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut push = |dir: &Path| {
+        if !dirs.iter().any(|d| d == dir) {
+            dirs.push(dir.to_path_buf());
+        }
+    };
+    let named = |agent: AgentKind| slots.iter().find(|s| s.agent == agent);
+    match (op, legacy) {
+        (UserPathOp::Path(agent) | UserPathOp::Undo(agent), true) => {
+            if let Some(slot) = named(agent) {
+                push(&slot.dir);
+            }
+            if let Some(dir) = tako_dir {
+                push(dir);
+            }
+        }
+        (UserPathOp::SetupStage, true) | (UserPathOp::Undo(_), false) => {
+            if let Some(dir) = tako_dir {
+                push(dir);
+            }
+            for slot in slots {
+                push(&slot.dir);
+            }
+        }
+        (UserPathOp::Path(agent), false) => {
+            // 名指した系統を先頭に置く（#2775 前と同じ並び。入っていなくても名指しなら足す）
+            if let Some(slot) = named(agent) {
+                push(&slot.dir);
+            }
+            if let Some(dir) = tako_dir {
+                push(dir);
+            }
+            for slot in slots.iter().filter(|s| s.installed) {
+                push(&slot.dir);
+            }
+        }
+        (UserPathOp::SetupStage, false) => {
+            if let Some(dir) = tako_dir {
+                push(dir);
+            }
+            for slot in slots.iter().filter(|s| s.installed) {
+                push(&slot.dir);
+            }
+        }
+    }
+    dirs
+}
+
+/// [`user_path_dirs_for`] をこのホームの導入状況で引く（Windows の Path を触る 3 つの口が通る 1 本）
+fn user_path_dirs(
+    home: &Path,
+    tako: Option<&tako_cli_path::Placement>,
+    op: UserPathOp,
+) -> Vec<PathBuf> {
+    let mut agents = bootstrap_agents();
+    // 名指した系統は `TAKO_989_LEGACY=1`（claude だけ）でも表に載せる（#2775 前も名指しの置き場は触った）
+    if let UserPathOp::Path(agent) | UserPathOp::Undo(agent) = op {
+        if !agents.contains(&agent) {
+            agents.push(agent);
+        }
+    }
+    let slots: Vec<LauncherSlot> = agents
+        .into_iter()
+        .map(|agent| {
+            let r = recipe_for(agent);
+            LauncherSlot {
+                agent,
+                dir: r.launcher_dir_in(home),
+                installed: is_executable(&r.launcher_path_in(home)),
+            }
+        })
+        .collect();
+    user_path_dirs_for(tako.map(|p| p.dir.as_path()), &slots, op, legacy_2775())
+}
+
+/// `TAKO_2775_LEGACY=1` で #2775 前（Windows の setup の段は入っていない系統の置き場まで足し、
+/// undo-path は名指した系統と tako の置き場だけを外す）へ戻す。**同一バイナリで A/B が取れる**
+fn legacy_2775() -> bool {
+    std::env::var_os("TAKO_2775_LEGACY").is_some()
 }
 
 /// tako CLI の設置計画（解決できなければ `None` = 従来どおりエージェントぶんだけ通す）
@@ -1534,8 +1656,14 @@ fn ensure_tako_cli_path_inner() -> Result<Value, CliPathError> {
         ));
     };
     let link_change = ensure_tako_cli_link(&plan).map_err(CliPathError::Refusal)?;
-    let path = ensure_dirs_on_path(&home, &desired_path_dirs(&home, Some(&plan)))
-        .map_err(CliPathError::Refusal)?;
+    // #2775: Windows はユーザー環境変数 Path へ 1 エントリずつ足すので、入っていない系統の置き場は足さない
+    // （unix はブロック 1 組に毎回全部を書く = 部分集合を渡すと前回の分が消える）
+    let dirs = if user_path::is_supported() {
+        user_path_dirs(&home, Some(&plan), UserPathOp::SetupStage)
+    } else {
+        desired_path_dirs(&home, Some(&plan))
+    };
+    let path = ensure_dirs_on_path(&home, &dirs).map_err(CliPathError::Refusal)?;
     Ok(json!({
         "link_change": link_change.as_str(),
         "path": path,
@@ -1928,7 +2056,7 @@ pub fn ensure_path_for_typed(agent: AgentKind) -> Result<Value, SetupRefusal> {
         None => tako_cli_path::LinkChange::Unchanged,
     };
     if user_path::is_supported() {
-        return ensure_user_path(agent, &dir, plan.as_ref(), link_change);
+        return ensure_user_path(agent, &home, &dir, plan.as_ref(), link_change);
     }
     let path = ensure_dirs_on_path(&home, &desired_path_dirs(&home, plan.as_ref()))?;
     let verified = path["verified"].as_bool().unwrap_or(false);
@@ -1963,21 +2091,17 @@ pub fn ensure_path_for_typed(agent: AgentKind) -> Result<Value, SetupRefusal> {
 /// Windows のユーザー PATH（`HKCU\Environment\Path`）へ通す（冪等。境界 B23）。
 ///
 /// **末尾へ足す**ので、ユーザーが自分で並べた優先順位は動かない。
-/// 書いたあと**読み直して確かめる**（「書いたはず」で終わらせない）
+/// 書いたあと**読み直して確かめる**（「書いたはず」で終わらせない）。
+/// 足すのは名指した系統・tako 自身の CLI（#1502）・ランチャーが在るほかの系統の置き場
+/// （undo-path の逆。並びと範囲の正本は [`user_path_dirs_for`]。#2775）
 fn ensure_user_path(
     agent: AgentKind,
+    home: &Path,
     dir: &Path,
     tako: Option<&tako_cli_path::Placement>,
     link_change: tako_cli_path::LinkChange,
 ) -> Result<Value, SetupRefusal> {
-    let mut dirs = vec![dir.to_path_buf()];
-    // #1502: tako 自身の CLI のディレクトリも同じ経路で足す（**末尾へ追記**なので
-    // ユーザーが並べた優先順位は動かない）
-    if let Some(plan) = tako {
-        if !dirs.contains(&plan.dir) {
-            dirs.push(plan.dir.clone());
-        }
-    }
+    let dirs = user_path_dirs(home, tako, UserPathOp::Path(agent));
     let path = ensure_user_path_dirs(&dirs)?;
     let verified = path["verified"].as_bool().unwrap_or(false);
     Ok(json!({
@@ -2079,12 +2203,7 @@ pub fn undo_path_for_typed(agent: AgentKind) -> Result<Value, SetupRefusal> {
         None => tako_cli_path::LinkChange::Absent,
     };
     if user_path::is_supported() {
-        return undo_user_path(
-            agent,
-            &recipe_for(agent).launcher_dir_in(&home),
-            plan.as_ref(),
-            link_change,
-        );
+        return undo_user_path(agent, &home, plan.as_ref(), link_change);
     }
     let (shell, _) = shell_target();
     let shell = shell.ok_or(SetupRefusal::ShellProfileUnknownForUndo)?;
@@ -2109,8 +2228,14 @@ pub fn undo_path_for_typed(agent: AgentKind) -> Result<Value, SetupRefusal> {
     Ok(value)
 }
 
-/// Windows のユーザー PATH からランチャーの置き場所のエントリを取り除く。
+/// Windows のユーザー PATH から tako が受け持つ置き場のエントリを取り除く。
 /// **他のエントリは 1 つも触らない**（純粋関数側のテストで固定してある）。
+///
+/// 外すのは tako の置き場と**全系統**のランチャーの置き場（`agent` に依らない。#2775）。
+/// setup の段は系統ごとに違う置き場を足すので、名指した系統だけを外すと案内どおりの
+/// `tako setup bootstrap undo-path`（既定は claude）で codex / agy の分が残った。
+/// unix の undo-path もマーカーブロックごと外す = `--agent` に依らないので、意味がそろう。
+/// 実際に外したエントリは応答の `removed_dirs` に並べる
 ///
 /// ## unix との非対称（意図的）
 ///
@@ -2119,21 +2244,17 @@ pub fn undo_path_for_typed(agent: AgentKind) -> Result<Value, SetupRefusal> {
 /// **誰が入れたかに関係なくランチャーの置き場所のエントリを外す**
 /// （公式インストーラが入れた分も対象）。`undo-path` は AI / 利用者が
 /// 明示的に叩くコマンドで、外した結果は `tako setup bootstrap path` で戻せるので
+/// （path は入っている系統の置き場も足し直す = undo-path の逆。#2775）
 /// この非対称は受け入れる。目印のための状態ファイルは作らない
 /// （#513 の共有カタログへ分類が要るものを、可逆な 1 操作のために増やさない）
 fn undo_user_path(
     agent: AgentKind,
-    dir: &Path,
+    home: &Path,
     tako: Option<&tako_cli_path::Placement>,
     link_change: tako_cli_path::LinkChange,
 ) -> Result<Value, SetupRefusal> {
-    let mut dirs = vec![dir.to_path_buf()];
-    if let Some(plan) = tako {
-        if !dirs.contains(&plan.dir) {
-            dirs.push(plan.dir.clone());
-        }
-    }
-    let mut change = PathChange::Absent;
+    let dirs = user_path_dirs(home, tako, UserPathOp::Undo(agent));
+    let mut removed: Vec<&PathBuf> = Vec::new();
     for entry in &dirs {
         let current = user_path::read_typed()?;
         if let Some(next) = user_path::remove_entry(&current.raw, entry) {
@@ -2141,14 +2262,20 @@ fn undo_user_path(
                 raw: next,
                 kind: current.kind.clone(),
             })?;
-            change = PathChange::Removed;
+            removed.push(entry);
         }
     }
+    let change = if removed.is_empty() {
+        PathChange::Absent
+    } else {
+        PathChange::Removed
+    };
     Ok(json!({
         "agent": agent.as_str(),
         "shell": "windows-user-path",
         "profile": "HKCU\\Environment\\Path",
         "dirs": dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
+        "removed_dirs": removed.iter().map(|d| d.display().to_string()).collect::<Vec<_>>(),
         "change": change.as_str(),
         "tako_cli_link_change": link_change.as_str(),
     }))
@@ -2974,5 +3101,179 @@ mod tests {
         assert_eq!(json["launcher_dir_on_process_path"], false);
         // `needs_new_tab` は実行中の環境で決まる（Windows だけが立てる）
         assert_eq!(json["needs_new_tab"], user_path::rereads_for_new_panes());
+    }
+
+    // --- #2775: Windows のユーザー環境変数 Path の足し引きの対称 ---
+
+    /// Windows のレシピ表の置き場で、`installed` のビット（claude / codex / agy の順）が立った系統を
+    /// 「ランチャーが在る」とした表
+    fn windows_slots(home: &Path, installed: u8) -> Vec<LauncherSlot> {
+        AgentKind::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &agent)| {
+                let r = agent_install::recipe(Platform::Windows, agent);
+                LauncherSlot {
+                    agent,
+                    dir: r.launcher_dir_in(home),
+                    installed: installed & (1 << i) != 0,
+                }
+            })
+            .collect()
+    }
+
+    fn windows_tako_dir(home: &Path) -> PathBuf {
+        home.join("AppData")
+            .join("Local")
+            .join("Programs")
+            .join("tako")
+    }
+
+    /// 足す側（setup の段・3 系統それぞれの path）が足しうる置き場の和
+    fn added_by_setup_and_path(
+        tako: Option<&Path>,
+        slots: &[LauncherSlot],
+        legacy: bool,
+    ) -> Vec<PathBuf> {
+        let mut added = user_path_dirs_for(tako, slots, UserPathOp::SetupStage, legacy);
+        for agent in AgentKind::ALL {
+            added.extend(user_path_dirs_for(
+                tako,
+                slots,
+                UserPathOp::Path(agent),
+                legacy,
+            ));
+        }
+        added
+    }
+
+    /// 受け入れ条件: setup / path が足した置き場は、案内どおりの 1 本（`--agent` なし = claude）の
+    /// undo-path で全部外れる。導入状況の 8 通り × tako の置き場の有無で見る。
+    /// 旧アーム（`TAKO_2775_LEGACY=1`）は codex / agy の置き場が残る = 修正前の不具合を同じ表で再現する
+    #[test]
+    fn windowsのsetupとpathが足した置き場は案内どおりのundo_path1本で全部外れる() {
+        let home = Path::new("/home/winuser");
+        let tako = windows_tako_dir(home);
+        let mut legacy_left = Vec::new();
+        for tako_dir in [Some(tako.as_path()), None] {
+            for installed in 0u8..8 {
+                let slots = windows_slots(home, installed);
+                let undo = user_path_dirs_for(
+                    tako_dir,
+                    &slots,
+                    UserPathOp::Undo(AgentKind::Claude),
+                    false,
+                );
+                for dir in added_by_setup_and_path(tako_dir, &slots, false) {
+                    assert!(
+                        undo.contains(&dir),
+                        "導入状況 {installed:03b}（tako の置き場 {}）: setup / path が足す {} を \
+                         既定の undo-path が外さない（外すのは {undo:?}）",
+                        tako_dir.is_some(),
+                        dir.display()
+                    );
+                }
+                // 外す範囲は `--agent` に依らない（unix の undo-path がブロックごと外すのと同じ）
+                for agent in AgentKind::ALL {
+                    assert_eq!(
+                        user_path_dirs_for(tako_dir, &slots, UserPathOp::Undo(agent), false),
+                        undo,
+                        "導入状況 {installed:03b}: undo-path --agent {} の外す範囲が既定と違う",
+                        agent.as_str()
+                    );
+                }
+                let legacy_undo =
+                    user_path_dirs_for(tako_dir, &slots, UserPathOp::Undo(AgentKind::Claude), true);
+                legacy_left.extend(
+                    added_by_setup_and_path(tako_dir, &slots, true)
+                        .into_iter()
+                        .filter(|d| !legacy_undo.contains(d)),
+                );
+            }
+        }
+        // 旧アームでは setup の段が足した codex / agy の置き場が既定の undo-path で残る（#2775 の症状）
+        for agent in [AgentKind::Codex, AgentKind::Agy] {
+            let dir = agent_install::recipe(Platform::Windows, agent).launcher_dir_in(home);
+            assert!(
+                legacy_left.contains(&dir),
+                "旧アームで {} の置き場が残らない = 不具合を再現できていない",
+                agent.as_str()
+            );
+        }
+    }
+
+    /// 入っていない系統の置き場は setup の段も path も足さない（名指しの path だけは足す）。
+    /// 旧アームの setup の段は入っていなくても全系統を足した
+    #[test]
+    fn windowsのsetupとpathは入っていない系統の置き場を足さない() {
+        let home = Path::new("/home/winuser");
+        let tako = windows_tako_dir(home);
+        let dir = |agent| agent_install::recipe(Platform::Windows, agent).launcher_dir_in(home);
+        let none = windows_slots(home, 0b000);
+        let claude_only = windows_slots(home, 0b001);
+        assert_eq!(
+            user_path_dirs_for(Some(&tako), &none, UserPathOp::SetupStage, false),
+            vec![tako.clone()],
+            "何も入っていなければ setup の段が足すのは tako の置き場だけ"
+        );
+        assert_eq!(
+            user_path_dirs_for(Some(&tako), &claude_only, UserPathOp::SetupStage, false),
+            vec![tako.clone(), dir(AgentKind::Claude)],
+            "claude だけ入っていれば tako と claude の置き場だけ"
+        );
+        assert_eq!(
+            user_path_dirs_for(
+                Some(&tako),
+                &claude_only,
+                UserPathOp::Path(AgentKind::Claude),
+                false
+            ),
+            vec![dir(AgentKind::Claude), tako.clone()],
+            "path は名指した系統を先頭に足す（#2775 前と同じ並び）"
+        );
+        assert_eq!(
+            user_path_dirs_for(
+                Some(&tako),
+                &none,
+                UserPathOp::Path(AgentKind::Codex),
+                false
+            ),
+            vec![dir(AgentKind::Codex), tako.clone()],
+            "名指しの path は入っていなくても足す（利用者が明示した）"
+        );
+        assert_eq!(
+            user_path_dirs_for(Some(&tako), &none, UserPathOp::SetupStage, true),
+            vec![
+                tako.clone(),
+                dir(AgentKind::Claude),
+                dir(AgentKind::Codex),
+                dir(AgentKind::Agy)
+            ],
+            "旧アームの setup の段は入っていない系統の置き場まで足した"
+        );
+    }
+
+    /// path は undo-path の逆: 外した後の `tako setup bootstrap path`（既定の claude）で、setup の段が
+    /// 足していた置き場（入っている codex / agy の分も）がすべて戻る
+    #[test]
+    fn windowsのpathはundo_pathの逆でsetupが足していた置き場を全部戻す() {
+        let home = Path::new("/home/winuser");
+        let tako = windows_tako_dir(home);
+        for installed in 0u8..8 {
+            let slots = windows_slots(home, installed);
+            let path = user_path_dirs_for(
+                Some(&tako),
+                &slots,
+                UserPathOp::Path(AgentKind::Claude),
+                false,
+            );
+            for dir in user_path_dirs_for(Some(&tako), &slots, UserPathOp::SetupStage, false) {
+                assert!(
+                    path.contains(&dir),
+                    "導入状況 {installed:03b}: setup の段が足す {} を path が戻さない（{path:?}）",
+                    dir.display()
+                );
+            }
+        }
     }
 }
