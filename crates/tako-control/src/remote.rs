@@ -287,6 +287,14 @@ pub struct PeerGuardState {
     /// 通った印。無い = 名前は全部パスから引けた（または #2773 以前の daemon）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name_from_roster_at: Option<u64>,
+    /// 起動時の自己疎通（#1038）が接続元検証で断られた理由コード（#2786）。serve の中継元（tailscale
+    /// デーモン）を信じられていない = スマホからの要求も全部 403 になる。後で serve 経由の接続が検証を
+    /// 通ったら下ろす。無い = 断られていない（または #2786 以前の daemon）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_check_rejected: Option<String>,
+    /// その時刻（UNIX 秒）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_check_rejected_at: Option<u64>,
 }
 
 /// 接続元検証の状態ファイル（#841）
@@ -936,6 +944,9 @@ struct PeerRejectState {
     last: Option<(&'static str, u64)>,
     /// 実行ファイル名を在籍表から引いて通した最初の時刻（#2773）
     roster_name_at: Option<u64>,
+    /// 起動時の自己疎通が接続元検証で断られた理由コードと時刻（#2786）。後で serve 経由の接続が
+    /// 検証を通ったら下ろす
+    self_check: Option<(&'static str, u64)>,
 }
 
 /// デバイスごとの WS 接続状態
@@ -1056,14 +1067,52 @@ impl DaemonCtx {
         write_peer_guard(&self.peer_guard_state());
     }
 
+    /// 起動時の自己疎通が接続元検証で断られたことを残す（#2786）。status の
+    /// `peer_verification.self_check_rejected` と persist.log の 1 行。**daemon は止めない**
+    fn record_self_check_peer_reject(&self, reject: local_endpoint::PeerReject) {
+        {
+            let mut st = self
+                .peer_rejects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            st.self_check = Some((reject.code(), now_epoch_secs()));
+        }
+        crate::diag::persist_log(&format!(
+            "remote 自己疎通: 接続元検証で断られた code={} endpoint_kind={}\
+             （daemon は止めない。スマホからの要求も 403 になる）",
+            reject.code(),
+            self.endpoint.kind_str()
+        ));
+        write_peer_guard(&self.peer_guard_state());
+    }
+
+    /// serve 経由の接続が接続元検証を通った（#2786）。自己疎通の断りが残っていれば、中継元を信じられる
+    /// ようになったので下ろす（status が「全部断られている」と言い続けない）。普段は何も書かない
+    fn record_peer_trusted(&self) {
+        let cleared = {
+            let mut st = self
+                .peer_rejects
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            st.self_check.take()
+        };
+        let Some((code, _)) = cleared else {
+            return;
+        };
+        crate::diag::persist_log(&format!(
+            "remote 自己疎通: 接続元検証の断り（code={code}）が解けた（serve 経由の接続が検証を通った）"
+        ));
+        write_peer_guard(&self.peer_guard_state());
+    }
+
     /// status へ出す接続元検証の状態（#841）
     fn peer_guard_state(&self) -> PeerGuardState {
-        let (total, last, roster_name_at) = {
+        let (total, last, roster_name_at, self_check) = {
             let st = self
                 .peer_rejects
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (st.total, st.last, st.roster_name_at)
+            (st.total, st.last, st.roster_name_at, st.self_check)
         };
         PeerGuardState {
             enforced: matches!(self.endpoint, local_endpoint::Endpoint::Loopback(_))
@@ -1073,6 +1122,8 @@ impl DaemonCtx {
             last_code: last.map(|(c, _)| c.to_string()),
             last_at: last.map(|(_, at)| at),
             name_from_roster_at: roster_name_at,
+            self_check_rejected: self_check.map(|(c, _)| c.to_string()),
+            self_check_rejected_at: self_check.map(|(_, at)| at),
         }
     }
 
@@ -1108,8 +1159,8 @@ fn notify_desktop(message: &str) -> bool {
 enum AuthDecision {
     /// 承認済みデバイスとして許可
     Allowed(crate::remote_auth::Device),
-    /// 拒否（HTTP status, エラーメッセージ）
-    Rejected(u16, String),
+    /// 拒否（HTTP status, 断り）。本文は [`refuse`] が組む（接続元検証の断りは `kind` / `code` つき。#2786）
+    Rejected(u16, crate::RemoteRefusal),
 }
 
 /// **`X-Forwarded-For` / `X-Forwarded-Host` を identity として読む唯一の入口**（#841）。
@@ -1131,7 +1182,7 @@ enum AuthDecision {
 fn forwarded_identity(
     ctx: &DaemonCtx,
     request: &tiny_http::Request,
-) -> Result<(Option<String>, Option<String>), (u16, String)> {
+) -> Result<(Option<String>, Option<String>), (u16, crate::RemoteRefusal)> {
     let forwarded = header_value(request, "x-forwarded-for");
     if forwarded.is_none() {
         return Ok((None, None));
@@ -1139,10 +1190,10 @@ fn forwarded_identity(
     let trust = local_endpoint::verify_peer(&ctx.endpoint, request.remote_addr().copied());
     if let Some(reject) = trust.reject() {
         ctx.record_peer_reject(reject);
-        return Err((
-            403,
-            crate::RemoteRefusal::PeerUnverified(reject).to_string(),
-        ));
+        return Err((403, crate::RemoteRefusal::PeerUnverified(reject)));
+    }
+    if matches!(trust, local_endpoint::PeerTrust::Trusted { .. }) {
+        ctx.record_peer_trusted();
     }
     if matches!(
         trust,
@@ -1185,18 +1236,13 @@ fn authorize_device(
                     crate::RemoteRefusal::RoleTooLow {
                         required,
                         current: device.role,
-                    }
-                    .to_string(),
+                    },
                 ),
-                None => {
-                    AuthDecision::Rejected(403, crate::RemoteRefusal::DeviceNotPaired.to_string())
-                }
+                None => AuthDecision::Rejected(403, crate::RemoteRefusal::DeviceNotPaired),
             }
         }
-        Ok(Identity::Local) => {
-            AuthDecision::Rejected(401, crate::RemoteRefusal::ServeOnly.to_string())
-        }
-        Err(e) => AuthDecision::Rejected(401, e.to_string()),
+        Ok(Identity::Local) => AuthDecision::Rejected(401, crate::RemoteRefusal::ServeOnly),
+        Err(e) => AuthDecision::Rejected(401, e),
     }
 }
 
@@ -1205,7 +1251,7 @@ fn authorize_device(
 fn identify_tailnet(
     ctx: &DaemonCtx,
     request: &tiny_http::Request,
-) -> Result<crate::tailscale::WhoisInfo, (u16, String)> {
+) -> Result<crate::tailscale::WhoisInfo, (u16, crate::RemoteRefusal)> {
     let (forwarded, forwarded_host) = forwarded_identity(ctx, request)?;
     match crate::remote_auth::identify(
         &ctx.registry,
@@ -1215,8 +1261,8 @@ fn identify_tailnet(
         &ctx.expected_host,
     ) {
         Ok(Identity::Tailnet(who)) => Ok(who),
-        Ok(Identity::Local) => Err((401, crate::RemoteRefusal::ServeOnly.to_string())),
-        Err(e) => Err((401, e.to_string())),
+        Ok(Identity::Local) => Err((401, crate::RemoteRefusal::ServeOnly)),
+        Err(e) => Err((401, e)),
     }
 }
 
@@ -2032,6 +2078,10 @@ fn serve_handle_for(host: &str, cli: &str, node: Option<String>) -> crate::tails
 pub enum ServeReachability {
     /// serve が backend へ到達できた（認証で 401 / 403 が返るのは正常）
     Reachable(u16),
+    /// serve は backend へ届いたが、接続元検証（#841）が serve の中継を断った（#2786）。
+    /// スマホからの要求も全部 403 になる。中身は daemon が 403 の本文に添えた理由。
+    /// **起動は止めない**（中継元を認めるかは環境の側で直す。理由は start / status で言う）
+    PeerRejected(local_endpoint::PeerReject),
     /// serve は動いているが backend を dial できない（502）。
     /// tailscaled が待ち受け先へ接続できていない = tako 側の設定ミスか
     /// tailscaled の制約（サンドボックス版は unix socket を dial できない）
@@ -2047,6 +2097,54 @@ pub fn classify_self_check(result: Result<u16, String>) -> ServeReachability {
         Ok(502) => ServeReachability::BackendUnreachable,
         Ok(code) => ServeReachability::Reachable(code),
         Err(e) => ServeReachability::Unknown(e),
+    }
+}
+
+/// 自己疎通の判定に 403 の本文も使う形（テスト可能な純関数。#2786）。
+///
+/// 403 の本文が接続元検証の断り（`kind` = `peer_unverified` と理由コード）なら
+/// [`ServeReachability::PeerRejected`]。理由の無い 403・JSON でない本文・それ以外のステータスは
+/// [`classify_self_check`] と同じ答え（401 / 403 / 404 は到達・502 は未到達）
+pub fn classify_self_check_reply(result: Result<(u16, String), String>) -> ServeReachability {
+    if let Ok((403, body)) = &result {
+        if let Some(reject) = crate::remote_self_check::peer_reject_of_body(body) {
+            return ServeReachability::PeerRejected(reject);
+        }
+    }
+    classify_self_check(result.map(|(code, _)| code))
+}
+
+/// 自己疎通が読む 403 の本文の上限（daemon の断りの本文は 1 行の JSON）
+const SELF_CHECK_BODY_LIMIT: u64 = 16 * 1024;
+
+/// 自己疎通が GET する先（#1038）。普段は serve の公開 URL（ts.net）で、検証用の注入
+/// （`remote_self_check::INJECT_ENV` = `direct`。#2786）のときだけ daemon のループバックの待ち受けへ直に打ち、
+/// serve と同じ転送ヘッダを付ける
+struct SelfCheckTarget {
+    url: String,
+    /// (`X-Forwarded-For`, `X-Forwarded-Host`)。直に打つときだけ
+    forwarded: Option<(String, String)>,
+}
+
+impl SelfCheckTarget {
+    fn for_daemon(
+        base_url: &str,
+        endpoint: &local_endpoint::Endpoint,
+        expected_host: &str,
+    ) -> Self {
+        if let local_endpoint::Endpoint::Loopback(port) = endpoint {
+            if crate::remote_self_check::inject_direct() {
+                return Self {
+                    url: format!("http://127.0.0.1:{port}/api/health"),
+                    // tailnet の CGNAT 帯の見本（実在のノードである必要は無い = 接続元検証で先に断られる）
+                    forwarded: Some(("100.64.0.1".to_string(), expected_host.to_string())),
+                };
+            }
+        }
+        Self {
+            url: format!("{}/api/health", base_url.trim_end_matches('/')),
+            forwarded: None,
+        }
     }
 }
 
@@ -2090,8 +2188,9 @@ pub fn unreachable_advice(endpoint: &local_endpoint::Endpoint, target: &str) -> 
 }
 
 /// ts.net URL へ 1 回だけ HTTP GET し、serve が backend へ到達できているかを見る。
-/// 認証は通らなくてよい（401 でも「届いている」証拠になる）ので資格情報は送らない
-fn probe_serve(base_url: &str, timeout: std::time::Duration) -> ServeReachability {
+/// 認証は通らなくてよい（401 でも「届いている」証拠になる）ので資格情報は送らない。
+/// 403 だけは本文も読み、接続元検証の断りを到達と数えない（#2786。A/B `TAKO_2786_LEGACY=1` は修正前の分類）
+fn probe_serve(target: &SelfCheckTarget, timeout: std::time::Duration) -> ServeReachability {
     if env_on(INJECT_UNREACHABLE_ENV) {
         // 故障注入: サンドボックス版 tailscaled に当たった状況を決定的に再現する
         return ServeReachability::BackendUnreachable;
@@ -2101,14 +2200,35 @@ fn probe_serve(base_url: &str, timeout: std::time::Duration) -> ServeReachabilit
         .timeout_global(Some(timeout))
         .build()
         .new_agent();
-    let url = format!("{}/api/health", base_url.trim_end_matches('/'));
-    let result = agent
-        .get(&url)
-        .header("User-Agent", "tako-remote-selfcheck")
+    let mut request = agent
+        .get(&target.url)
+        .header("User-Agent", "tako-remote-selfcheck");
+    if let Some((forwarded_for, forwarded_host)) = &target.forwarded {
+        request = request
+            .header("X-Forwarded-For", forwarded_for)
+            .header("X-Forwarded-Host", forwarded_host);
+    }
+    let result = request
         .call()
-        .map(|r| r.status().as_u16())
+        .map(|mut r| {
+            let code = r.status().as_u16();
+            // 本文を読めなくても状態コードの判定は変えない（理由の無い 403 = 到達）
+            let body = if code == 403 {
+                r.body_mut()
+                    .with_config()
+                    .limit(SELF_CHECK_BODY_LIMIT)
+                    .read_to_string()
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (code, body)
+        })
         .map_err(|e| e.to_string());
-    classify_self_check(result)
+    if crate::remote_self_check::legacy_mode() {
+        return classify_self_check(result.map(|(code, _)| code));
+    }
+    classify_self_check_reply(result)
 }
 
 // --- HTTP 受信ループの並列化（#1403）---------------------------------------
@@ -2759,12 +2879,12 @@ pub fn run_daemon() -> io::Result<()> {
         None
     } else {
         let (tx, rx) = std::sync::mpsc::channel();
-        let probe_url = base_url.clone();
+        let probe_target = SelfCheckTarget::for_daemon(&base_url, &endpoint, &ctx.expected_host);
         inject_after_serve("self-check")?;
         std::thread::Builder::new()
             .name("remote-self-check".into())
             .spawn(move || {
-                let _ = tx.send(probe_serve(&probe_url, SELF_CHECK_TIMEOUT));
+                let _ = tx.send(probe_serve(&probe_target, SELF_CHECK_TIMEOUT));
             })?;
         let deadline = std::time::Instant::now() + SELF_CHECK_TIMEOUT + SELF_CHECK_GRACE;
         let outcome = loop {
@@ -2792,6 +2912,12 @@ pub fn run_daemon() -> io::Result<()> {
         owned.release_serve("backend_unreachable");
         cleanup_state_files();
         return Err(io::Error::other(advice));
+    }
+    // 接続元検証で断られた（#2786）: serve は届いているので**止めない**。中継元を認めるかは環境の側で
+    // 直すもの（所有者ゲート #1438・名前のゲート）で、止めると status から理由を読めなくなる。
+    // 理由は status（`peer_verification.self_check_rejected`）と下の起動情報の `self_check` で言う
+    if let Some(ServeReachability::PeerRejected(reject)) = self_check {
+        ctx.record_self_check_peer_reject(reject);
     }
 
     // serve 設定の自己検査（#1049）: 起動後に消えても気づけるようにする。
@@ -2846,6 +2972,9 @@ pub fn run_daemon() -> io::Result<()> {
                 "unknown": reason,
                 "note": unknown_self_check_note(reason),
             });
+        }
+        Some(ServeReachability::PeerRejected(reject)) => {
+            info["self_check"] = crate::remote_self_check::start_field(*reject);
         }
         Some(ServeReachability::BackendUnreachable) | None => {}
     }
@@ -3204,12 +3333,26 @@ pub fn daemon_status() -> Value {
         status["serve_generation"] = field;
         warnings.extend(warning);
     }
+    // 接続元プロセス検証の状態（#841）。daemon が起動時と拒否のたびに書く。
+    // ファイルが無い = #841 以前の daemon が動いている（状態を名乗れない）
+    let peer_guard = read_peer_guard();
+    // 起動時の自己疎通が接続元検証で断られた（#2786）: running だけを名乗らせない（#1049 と同じ考え）。
+    // スマホからの要求も全部 403 になるので、理由と次の一手を warnings にも載せる（文は日本語。
+    // CLI は `remote_self_check::detail_of_status_in` で表示言語に組む）
+    if let Some(reject) = peer_guard
+        .as_ref()
+        .and_then(|g| g.self_check_rejected.as_deref())
+        .and_then(local_endpoint::PeerReject::from_code)
+    {
+        warnings.push(crate::remote_self_check::warning_in(
+            reject,
+            tako_core::i18n::Lang::Ja,
+        ));
+    }
     if !warnings.is_empty() {
         status["warnings"] = json!(warnings);
     }
-    // 接続元プロセス検証の状態（#841）。daemon が起動時と拒否のたびに書く。
-    // ファイルが無い = #841 以前の daemon が動いている（状態を名乗れない）
-    status["peer_verification"] = match read_peer_guard() {
+    status["peer_verification"] = match peer_guard {
         Some(guard) => serde_json::to_value(&guard).unwrap_or_else(|_| json!({ "known": false })),
         None => json!({ "known": false }),
     };
@@ -5142,11 +5285,7 @@ fn respond(request: tiny_http::Request, status: u16, body: Option<String>) {
 /// 断りを `{"error": …}` の本文で返す（#2365 の続き）。文は daemon の表示言語（起動時に設定から
 /// 決まる = #1077）。handler 群は日本語の固定文を直に書かず、ここへ [`crate::RemoteRefusal`] を渡す
 fn refuse(request: tiny_http::Request, status: u16, refusal: crate::RemoteRefusal) {
-    respond(
-        request,
-        status,
-        Some(json!({ "error": refusal.to_string() }).to_string()),
-    );
+    respond(request, status, Some(refusal.http_body().to_string()));
 }
 
 /// M-4: 機密データを含む応答。Cache-Control: no-store, private を付与する
@@ -6013,9 +6152,7 @@ fn handle_request_v2(
     // 静的アセット（PWA）とペアリング前 API も tailnet ノード限定
     let who = match identify_tailnet(ctx, &request) {
         Ok(who) => who,
-        Err((status, e)) => {
-            return respond(request, status, Some(json!({ "error": e }).to_string()));
-        }
+        Err((status, refusal)) => return refuse(request, status, refusal),
     };
 
     // API 以外のパスは PWA 静的ファイルとして配信（層①通過のみで可 —
@@ -6155,9 +6292,7 @@ fn handle_request_v2(
     let required = required_role(&method, &path);
     let device = match authorize_device_checked(ctx, &request, required) {
         Ok(device) => device,
-        Err((status, e)) => {
-            return respond(request, status, Some(json!({ "error": e }).to_string()));
-        }
+        Err((status, refusal)) => return refuse(request, status, refusal),
     };
 
     // --- リモート端末管理（Admin role。承認・role 変更は含まない = GUI 限定）---
@@ -6317,7 +6452,7 @@ fn authorize_device_checked(
     ctx: &DaemonCtx,
     request: &tiny_http::Request,
     required: DeviceRole,
-) -> Result<crate::remote_auth::Device, (u16, String)> {
+) -> Result<crate::remote_auth::Device, (u16, crate::RemoteRefusal)> {
     match authorize_device(ctx, request, required) {
         AuthDecision::Allowed(device) => Ok(device),
         AuthDecision::Rejected(status, e) => Err((status, e)),
@@ -7640,9 +7775,7 @@ fn handle_ws_v2(
     // 二層認証（画面データは Observe role から）
     let device = match authorize_device_checked(ctx, &request, DeviceRole::Observe) {
         Ok(device) => device,
-        Err((status, e)) => {
-            return respond(request, status, Some(json!({ "error": e }).to_string()));
-        }
+        Err((status, refusal)) => return refuse(request, status, refusal),
     };
     let Some(pane_param) = query_param(&url_full, "pane") else {
         return refuse(request, 400, crate::RemoteRefusal::WsPaneQueryRequired);
@@ -8411,6 +8544,265 @@ esac
         ));
     }
 
+    /// #2786: 接続元検証（#841）の 403 は「届いているが断られている」で、到達とは数えない。
+    /// 修正前は 403 を本文に依らず `Reachable` とし、全リクエストが断られていても start が成功を名乗った
+    #[test]
+    fn 自己疎通は接続元検証の403を到達と数えない() {
+        for reject in local_endpoint::PeerReject::ALL {
+            let body = crate::RemoteRefusal::PeerUnverified(reject)
+                .http_body()
+                .to_string();
+            assert_eq!(
+                classify_self_check_reply(Ok((403, body.clone()))),
+                ServeReachability::PeerRejected(reject),
+                "接続元検証の 403 を到達と数えている（#2786）: {body}"
+            );
+            // 401 / 404 / 502 の分類は本文に依らず従来どおり
+            assert_eq!(
+                classify_self_check_reply(Ok((401, body.clone()))),
+                ServeReachability::Reachable(401)
+            );
+            assert_eq!(
+                classify_self_check_reply(Ok((404, body.clone()))),
+                ServeReachability::Reachable(404)
+            );
+            assert_eq!(
+                classify_self_check_reply(Ok((502, body))),
+                ServeReachability::BackendUnreachable
+            );
+        }
+        // 理由の無い 403・JSON でない 403・別のゲートの 403（Origin・role）は従来どおり到達
+        for body in [
+            String::new(),
+            "Forbidden".to_string(),
+            r#"{"error":"x"}"#.to_string(),
+            crate::RemoteRefusal::OriginNotAllowed("https://evil".into())
+                .http_body()
+                .to_string(),
+            crate::RemoteRefusal::DeviceNotPaired
+                .http_body()
+                .to_string(),
+        ] {
+            assert_eq!(
+                classify_self_check_reply(Ok((403, body.clone()))),
+                ServeReachability::Reachable(403),
+                "{body}"
+            );
+        }
+        assert!(matches!(
+            classify_self_check_reply(Err("timeout".into())),
+            ServeReachability::Unknown(_)
+        ));
+    }
+
+    /// #2786: 断りの本文は接続元検証のときだけ `kind` と理由コードを添え、ほかは `{"error": …}` のまま
+    /// （修正前とバイト一致 = PWA の読み方を変えない）
+    #[test]
+    fn 断りの本文は接続元検証のときだけkindとcodeを添える() {
+        let reject = local_endpoint::PeerReject::NotTailscaleDaemon;
+        let refusal = crate::RemoteRefusal::PeerUnverified(reject);
+        let body = refusal.http_body();
+        assert_eq!(body["error"], json!(refusal.to_string()));
+        assert_eq!(
+            body["kind"],
+            json!(crate::remote_refusal::KIND_PEER_UNVERIFIED)
+        );
+        assert_eq!(body["code"], json!("not_tailscale_daemon"));
+        for other in [
+            crate::RemoteRefusal::ServeOnly,
+            crate::RemoteRefusal::DeviceNotPaired,
+            crate::RemoteRefusal::OriginNotAllowed("https://evil".into()),
+        ] {
+            assert_eq!(
+                other.http_body().to_string(),
+                json!({ "error": other.to_string() }).to_string(),
+                "接続元検証でない断りの本文が変わった"
+            );
+        }
+    }
+
+    /// #2786: 偽の相手（決めた状態と本文を返すローカルの HTTP）へ実際に自己疎通を打ち、本文まで読んで
+    /// 分類する。所有者ゲート（#1438）の 403 は断り・理由の無い 403 と JSON でない 403 は到達・
+    /// 401 / 404 / 502 は従来どおり。直に打つ注入の形（転送ヘッダつき）も相手へ届く
+    #[test]
+    fn 自己疎通は偽の相手が返す接続元検証の403を名指す() {
+        use std::io::{Read, Write};
+        let owner_body =
+            crate::RemoteRefusal::PeerUnverified(local_endpoint::PeerReject::OwnerUntrusted)
+                .http_body()
+                .to_string();
+        let cases: Vec<(&str, String, ServeReachability)> = vec![
+            (
+                "403 Forbidden",
+                owner_body,
+                ServeReachability::PeerRejected(local_endpoint::PeerReject::OwnerUntrusted),
+            ),
+            (
+                "403 Forbidden",
+                r#"{"error":"forbidden"}"#.to_string(),
+                ServeReachability::Reachable(403),
+            ),
+            (
+                "403 Forbidden",
+                "<html>Forbidden</html>".to_string(),
+                ServeReachability::Reachable(403),
+            ),
+            (
+                "401 Unauthorized",
+                r#"{"error":"x"}"#.to_string(),
+                ServeReachability::Reachable(401),
+            ),
+            (
+                "404 Not Found",
+                String::new(),
+                ServeReachability::Reachable(404),
+            ),
+            (
+                "502 Bad Gateway",
+                String::new(),
+                ServeReachability::BackendUnreachable,
+            ),
+        ];
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("偽の相手の bind");
+        let port = listener.local_addr().expect("偽の相手の addr").port();
+        let replies: Vec<(String, String)> = cases
+            .iter()
+            .map(|(status, body, _)| (status.to_string(), body.clone()))
+            .collect();
+        let server = std::thread::spawn(move || {
+            let mut heads = Vec::new();
+            for (status, body) in replies {
+                let (mut stream, _) = listener.accept().expect("偽の相手の accept");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .ok();
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                heads.push(String::from_utf8_lossy(&head).to_string());
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+            heads
+        });
+        let timeout = std::time::Duration::from_secs(10);
+        for (i, (status, body, expected)) in cases.iter().enumerate() {
+            // 最初の 1 本は直に打つ注入の形（serve と同じ転送ヘッダつき）で打つ
+            let target = SelfCheckTarget {
+                url: format!("http://127.0.0.1:{port}/api/health"),
+                forwarded: (i == 0).then(|| {
+                    (
+                        "100.64.0.1".to_string(),
+                        "example.tail0000.ts.net".to_string(),
+                    )
+                }),
+            };
+            assert_eq!(
+                &probe_serve(&target, timeout),
+                expected,
+                "偽の相手が {status} / {body:?} を返した"
+            );
+        }
+        let heads = server.join().expect("偽の相手のスレッド");
+        let first = heads[0].to_ascii_lowercase();
+        assert!(
+            first.contains("x-forwarded-for: 100.64.0.1")
+                && first.contains("x-forwarded-host: example.tail0000.ts.net"),
+            "直に打つ形は serve と同じ転送ヘッダを付ける: {}",
+            heads[0]
+        );
+        assert!(
+            !heads[1].to_ascii_lowercase().contains("x-forwarded-for"),
+            "普段の形は転送ヘッダを付けない（serve が付ける）: {}",
+            heads[1]
+        );
+    }
+
+    /// #2786: 自己疎通の断りは status（`peer_verification.self_check_rejected`）と persist.log に残り、
+    /// 後で serve 経由の接続が検証を通ったら下ろす（「全部断られている」と言い続けない）
+    #[test]
+    fn issue2786_自己疎通の断りを残し検証を通った接続で下ろす() {
+        // env を書き換えるので、この 1 本だけの子で走らせる（#2400）
+        if tako_core::run_alone!(issue2786_自己疎通の断りを残し検証を通った接続で下ろす)
+        {
+            return;
+        }
+        let _env = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tako_core::test_residue::ScratchDir::new("2786-self-check");
+        std::env::set_var("TAKO_REMOTE_STATE_DIR", dir.as_os_str());
+        let ctx = DaemonCtx {
+            registry: Mutex::new(DeviceRegistry::open(&dir).expect("レジストリ")),
+            ts_cli: "tailscale".to_string(),
+            admin_token: "test-admin-token".to_string(),
+            tmux_socket: "tako-test-2786".to_string(),
+            ws_connections: Mutex::new(HashMap::new()),
+            base_url: "https://example.tail0000.ts.net".to_string(),
+            expected_host: "example.tail0000.ts.net".to_string(),
+            endpoint: local_endpoint::Endpoint::Loopback(40002),
+            peer_rejects: Mutex::new(PeerRejectState::default()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        let count = |needle: &str| {
+            crate::diag::persist_log_path()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default()
+                .matches(needle)
+                .count()
+        };
+        const REJECTED: &str = "remote 自己疎通: 接続元検証で断られた code=owner_untrusted";
+        const CLEARED: &str = "remote 自己疎通: 接続元検証の断り（code=owner_untrusted）が解けた";
+        let (rejected_before, cleared_before) = (count(REJECTED), count(CLEARED));
+
+        // 断りが無い間は検証を通っても何も書かない
+        ctx.record_peer_trusted();
+        assert_eq!(
+            read_peer_guard(),
+            None,
+            "断りが無いのに状態ファイルを書いた"
+        );
+
+        ctx.record_self_check_peer_reject(local_endpoint::PeerReject::OwnerUntrusted);
+        let guard = read_peer_guard().expect("接続元検証の状態ファイル");
+        assert_eq!(
+            guard.self_check_rejected.as_deref(),
+            Some("owner_untrusted")
+        );
+        assert!(guard.self_check_rejected_at.is_some());
+        assert_eq!(
+            count(REJECTED),
+            rejected_before + 1,
+            "persist.log に 1 行残る"
+        );
+        let status = json!({ "peer_verification": serde_json::to_value(&guard).unwrap() });
+        assert_eq!(
+            crate::remote_self_check::reject_of_status(&status),
+            Some(local_endpoint::PeerReject::OwnerUntrusted),
+            "status の欄から理由を読める"
+        );
+
+        ctx.record_peer_trusted();
+        let cleared = read_peer_guard().expect("接続元検証の状態ファイル");
+        assert_eq!(
+            cleared.self_check_rejected, None,
+            "検証を通った接続で下ろす"
+        );
+        assert_eq!(cleared.self_check_rejected_at, None);
+        assert_eq!(count(CLEARED), cleared_before + 1);
+        ctx.record_peer_trusted();
+        assert_eq!(count(CLEARED), cleared_before + 1, "下ろした後は書かない");
+        std::env::remove_var("TAKO_REMOTE_STATE_DIR");
+    }
+
     #[test]
     fn 疎通を測れなかったときは起動を止めず理由を添える() {
         let dns = unknown_self_check_note(
@@ -8572,6 +8964,13 @@ esac
                 .any(|lang| body
                     .contains(local_endpoint::PeerReject::NotTailscaleDaemon.describe_in(lang))),
             "拒否理由が返る: {body}"
+        );
+        // #2786: 本文は理由コードを添え、起動時の自己疎通が字面に依らず「接続元検証で断られた」と読む
+        let payload = body.split("\r\n\r\n").nth(1).unwrap_or("");
+        assert_eq!(
+            crate::remote_self_check::peer_reject_of_body(payload),
+            Some(local_endpoint::PeerReject::NotTailscaleDaemon),
+            "daemon の 403 の本文を自己疎通が読めない: {body}"
         );
         // ② 層②（role 認可）が要る経路も同じ入口で落ちる。
         //    IPC を触らない `/api/devices`（Admin role）を使う = #1403 の
