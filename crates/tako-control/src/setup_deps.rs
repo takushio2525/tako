@@ -103,11 +103,13 @@ pub struct ExternalDep {
     pub hint: Note,
 }
 
-/// そのプラットフォームの依存表（**純粋関数**なので macOS から Windows 側も検証できる）
-pub fn deps(platform: Platform) -> Vec<ExternalDep> {
+/// その OS の器（永続化の器 = tmux / psmux）の行（**純粋関数**）。依存表 [`deps`] の先頭と同じもの。
+///
+/// remote daemon の起動門（`remote_backend_gate`）が「何を入れれば使えるか」をこの名前で言う（#2771）
+pub fn container_dep(platform: Platform) -> ExternalDep {
     // URL のように日英で同じ案内
     let same = |text: &'static str| Note::new(text, text);
-    let container = match platform {
+    match platform {
         Platform::MacOs => ExternalDep {
             bin: "tmux",
             required: false,
@@ -118,20 +120,28 @@ pub fn deps(platform: Platform) -> Vec<ExternalDep> {
             installer: Some(DepInstaller::Brew { pkg: "tmux" }),
             hint: same("https://github.com/tmux/tmux/wiki/Installing"),
         },
-        // Windows の器は psmux（tmux 互換 CLI の別実装）。**`tmux` を探しても見つからない**
+        // Windows の器は psmux（tmux 互換 CLI の別実装）。**`tmux` を探しても見つからない**。
+        // remote daemon は画面をこの器から読む（#2771 で門が採取だけを求めるようになった）
         Platform::Windows => ExternalDep {
             bin: "psmux",
             required: false,
             purpose: Note::new(
-                "再起動時のセッション完全復元・オーケストレーターの worker 管理",
-                "full session restore after restart and orchestrator worker management",
+                "リモート接続（tako remote）・再起動時のセッション完全復元・オーケストレーターの worker 管理",
+                "remote access (tako remote), full session restore after restart, and orchestrator worker management",
             ),
             installer: Some(DepInstaller::Winget {
                 pkg: "marlocarlo.psmux",
             }),
             hint: same("https://github.com/marlocarlo/psmux"),
         },
-    };
+    }
+}
+
+/// そのプラットフォームの依存表（**純粋関数**なので macOS から Windows 側も検証できる）
+pub fn deps(platform: Platform) -> Vec<ExternalDep> {
+    // URL のように日英で同じ案内
+    let same = |text: &'static str| Note::new(text, text);
+    let container = container_dep(platform);
     let git = ExternalDep {
         bin: "git",
         required: false,

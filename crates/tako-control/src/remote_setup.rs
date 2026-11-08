@@ -12,6 +12,9 @@
 //! 6. 自己接続確認
 //! 7. スマホ側手順 + 固定 URL の QR（PNG）表示
 //!
+//! `tako remote start` を案内する前に、画面を読める器（tmux / psmux）を確かめる。無ければ start より先に
+//! 器の導入を案内する（daemon の起動門 `remote_backend_gate` と同じ判定。非対話は QR の前で止まる。#2771）
+//!
 //! dispatch + MCP `tako_remote_setup` と 1:1。
 //! 非対話は `--yes` / `--answers` で可能にし、開発不変条件を維持する。
 
@@ -318,6 +321,13 @@ pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, crate::
         message: format!("固定 URL: {ts_url}"),
     });
 
+    // Step 4.5: 画面を読める器（#2771）。無ければ `tako remote start` は daemon の門で必ず断られるので、
+    // start の前に器の導入を案内して止まる（Tailscale の段の結果は steps に残る）
+    if let Some(step) = container_step() {
+        result.steps.push(step);
+        return Ok(serde_json::to_value(&result).unwrap());
+    }
+
     // Step 5: QR PNG 生成
     match crate::remote::generate_qr_png(&ts_url) {
         Ok(path) => {
@@ -342,6 +352,51 @@ pub fn run_noninteractive(answers: &RemoteSetupAnswers) -> Result<Value, crate::
     result.phone_instructions = Some(phone_setup_instructions(&ts_url));
 
     Ok(serde_json::to_value(&result).unwrap())
+}
+
+/// 器の段の `step`（#2771）
+const CONTAINER_STEP: &str = "container";
+
+/// 画面を読める器（tmux / psmux）の段（#2771）。判定は daemon の起動門と同じ 1 実装
+/// （[`crate::remote_backend_gate::check_current`]）で、通れば `None`。
+///
+/// 通らなければ `tako remote start` は daemon の門で必ず断られるので、start を案内する前に器を入れる
+/// 1 行を返す。1 行は依存の導入口（[`setup_deps::next_step_line`] = #1499 / #1524 の 1 実装）が作る
+/// （ここで `brew install` / `winget install` を組み立てない。#322 の最簡形もそちらが決める）。
+/// 器が見つかっているのに読めない（`TAKO_BACKEND=none`・適合しない版の psmux）ときは入れ直させない。
+/// A/B（`TAKO_2771_LEGACY=1`）は修正前と同じく段を出さない
+fn container_step() -> Option<SetupStepResult> {
+    crate::remote_backend_gate::check_current().err()?;
+    if crate::remote_backend_gate::legacy() {
+        return None;
+    }
+    let container = crate::remote_backend_gate::container_name(
+        tako_core::platform::support::Platform::current(),
+    );
+    let state = setup_deps::status_of(container);
+    if state.as_ref().is_some_and(|s| s.found.is_some()) {
+        let label = tako_core::backend::capabilities().label;
+        return Some(SetupStepResult {
+            step: CONTAINER_STEP,
+            status: "unusable",
+            message: format!(
+                "器（{container}）は見つかりましたが、いまの永続バックエンド（{label}）では画面を tako の外から\
+                 読めません。このままでは `tako remote start` が断られます"
+            ),
+        });
+    }
+    let install = state
+        .as_ref()
+        .map(setup_deps::next_step_line)
+        .unwrap_or_default();
+    Some(SetupStepResult {
+        step: CONTAINER_STEP,
+        status: "missing",
+        message: format!(
+            "画面を読める器（{container}）が見つかりません。リモートサーバーはペインの画面を tako の外から\
+             読むので、`tako remote start` の前に入れてください。{install}"
+        ),
+    })
 }
 
 /// 検出の段（`tailscale_detect`）の 1 行（MCP `tako_remote_setup` の `run`。#1816）。
@@ -637,14 +692,28 @@ pub fn run_interactive(
     writeln!(writer, "{instructions}").map_err(|e| e.to_string())?;
 
     writeln!(writer).map_err(|e| e.to_string())?;
-    writeln!(
-        writer,
-        "リモート接続を開始するには `tako remote start` を実行してください。"
-    )
-    .map_err(|e| e.to_string())?;
+    // #2771: 画面を読める器が無いと `tako remote start` は daemon の門で必ず断られるので、先に器の導入を案内する
+    let container = container_step();
+    match &container {
+        Some(step) => {
+            writeln!(writer, "{}", step.message).map_err(|e| e.to_string())?;
+            if step.status == "missing" {
+                writeln!(
+                    writer,
+                    "入れたら `tako remote start` でリモート接続を開始できます。"
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        None => writeln!(
+            writer,
+            "リモート接続を開始するには `tako remote start` を実行してください。"
+        )
+        .map_err(|e| e.to_string())?,
+    }
 
     Ok(json!({
-        "success": true,
+        "success": container.is_none(),
         "ts_net_url": ts_url,
         "qr_path": qr_path,
     }))
