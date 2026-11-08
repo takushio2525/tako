@@ -832,19 +832,16 @@ pub fn key_name_bytes_in(key: &str, extended_keys: bool) -> Option<Vec<u8>> {
 fn modified_enter_mods(key: &str) -> Option<u8> {
     let mut rest = key;
     let mut bits = 0u8;
-    loop {
-        let bit = match rest.get(..2) {
-            Some("S-") => 1,
-            Some("M-") => 2,
-            Some("C-") => 4,
-            _ => break,
-        };
+    while let Some((bit, tail)) = [("S-", 1u8), ("M-", 2), ("C-", 4)]
+        .into_iter()
+        .find_map(|(prefix, bit)| rest.strip_prefix(prefix).map(|tail| (bit, tail)))
+    {
         // 同じ修飾を 2 度書いた形（`S-S-Enter`）は推測しない
         if bits & bit != 0 {
             return None;
         }
         bits |= bit;
-        rest = &rest[2..];
+        rest = tail;
     }
     (bits != 0 && rest == "Enter").then_some(1 + bits)
 }
