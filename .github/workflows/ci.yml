@@ -603,6 +603,12 @@ jobs:
         run: cargo test -p tako-core --lib platform::private_file -- --nocapture
       - name: 秘密のファイルの ACL の実行検査（#1632 / #2581。remote・control.json・トークン・塩・受け取り）
         run: cargo test -p tako-control --lib -- remote::tests::issue1632 remote::tests::issue2581 remote::tests::write_secret_file remote::tests::ensure_state_dir --nocapture
+      # #2774: remote daemon → GUI の名前付きパイプの読み取りの上限（overlapped + CancelIoEx）も
+      # **macOS では 1 行も実行できない** FFI。答えない相手で上限の経路で戻るか・打ち切りが unix と同じ
+      # 502 と受信失敗の断りになるかを、全数より手前に名指しで置く（#1282 と同じ理由）。
+      # --nocapture は戻り方と所要の行（TAKO2774_*）をログへ残すため
+      - name: 名前付きパイプの読み取りの上限の実行検査（#2774。remote daemon → GUI）
+        run: cargo test -p tako-control --lib -- platform::named_pipe remote::tests::issue2774 --nocapture
       # **ワークスペース全体のテストを blocking にする**（#1278 / #583）。
       # #583 は「POSIX 前提の既存失敗が残っているあいだ非ブロッキング」で据え置いていたが、
       # そのあいだに未検出が溜まり、実機で 19 → 24 件まで増えていた（#1278）。

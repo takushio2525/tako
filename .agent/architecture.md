@@ -426,6 +426,12 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   残り時間を入れ直す。macOS は相手が閉じた後の入れ直しを EINVAL で拒むので、その読みは待たない
   読みを 1 回だけして届いている応答を読む = #2169）、windows の named pipe は往復を別スレッドで
   回して待つ。時間切れは他の候補へ回らない（固まった GUI で待ちが候補の数だけ伸びるため）
+- **remote daemon → GUI の読み取りは両 OS とも同じ上限で打ち切る**（FR-6.28 / #2774）: 上限は
+  `remote::APP_IPC_READ_TIMEOUT`（10 秒・読み取り 1 回あたり）の 1 つで、unix はソケットの
+  `set_read_timeout`、windows は境界 B3 の `named_pipe::connect_client_stream` が返す
+  `PipeStream`（overlapped で開き、上限を過ぎたら `CancelIoEx` → **取り消しの完了まで待って**から
+  `TimedOut` を返す = スレッドもハンドルも残さない）。CLI の `connect_client`（同期の `File`）は
+  変えていない（CLI は上の別スレッドの待ちで上限を持つ）
 - CLI / MCP からの `close` は「最後のタブの最後のペイン」を拒否する
   （アプリ終了に等しい操作は UI の cmd+W のみ。FR-2.5.9 の安全性方針）
 - **接続情報の永続化と発見（FR-2.2.9、2026-06-12）**: アプリ起動時に
