@@ -1111,6 +1111,178 @@ fn build_output_command(spawn: &SpawnCommand) -> std::process::Command {
     command
 }
 
+/// `.ps1` ファイルを**実行ポリシーの対象外で**走らせる PowerShell の起動引数（純粋関数。#2790）。
+///
+/// 取得したインストーラ（`install.ps1`）の起こし方の正本で、`agent_install::InterpreterSpec::args_for`
+/// がここを通す（codex / agy の代行 = #2791 も同じ口を呼ぶ）。
+///
+/// - **スクリプトファイルを実行しない**: 実行ポリシーが止めるのはスクリプトファイル（`-File`・ドット
+///   ソース・パスの呼び出し）で、コマンドとして渡した文字列は対象外。本文はテキストで読み、
+///   `[scriptblock]::Create` で走らせる（シェル統合 #2432 の `powershell_bootstrap` と同じ手）。
+///   #2790 より前の `-ExecutionPolicy Bypass -File` は Process スコープの指定なので、グループポリシー
+///   （MachinePolicy / UserPolicy）で AllSigned / Restricted を強制した管理端末では負ける
+/// - **本文は argv に載せない**: `-EncodedCommand` に載せるのは読み込みの起動片だけで、長さは
+///   スクリプトの大きさに依らない（コマンドラインの上限は 32,767 文字。codex の `install.ps1` は
+///   71,052 バイト = UTF-16LE の base64 で約 19 万字になり載らない。2026-11-08 実測）
+/// - **パスは ASCII だけの式で埋める**（`shell_integration::powershell_ascii_literal`。空白・単引用符・
+///   日本語のユーザー名でも崩れない。#2432 と共有）
+/// - **`-OutputFormat Text` を明示する**: 指定が無いまま `-EncodedCommand` で起こすと、非対話で stderr が
+///   リダイレクトされているとき PowerShell は「PowerShell から呼ばれた」と見なしてエラーを CLIXML で書く
+///   （PowerShell のソース `ConsoleHost.ErrorFormat` の条件 `!OutputFormatSpecified && !IsInteractive &&
+///   Console.IsErrorRedirected && _wasInitialCommandEncoded`）。pwsh 7 はこれで平文に戻る（7.6 で実測）が、
+///   **Windows PowerShell 5.1 は指定を見ずに CLIXML のまま**（Windows の CI で実測。#935 の
+///   `powershell_output_script` の「既知の限界」と同じ）。そこで起動片は自分のエラーを host を通さずに
+///   平文で書き（[`powershell_script_text_command`]）、捕捉した stderr に残る CLIXML（進捗・インストーラ自身の
+///   警告やエラー）は呼び手が [`powershell_stderr_text`] で平文へ戻す
+/// - `-NoLogo -NoProfile` は #2790 より前と同じ（利用者の profile を挟まない）
+///
+/// 本文は [`powershell_script_text_command`]
+pub fn powershell_script_text_args(script: &std::path::Path) -> Vec<String> {
+    vec![
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-OutputFormat".to_string(),
+        "Text".to_string(),
+        "-EncodedCommand".to_string(),
+        encode_powershell_command(&powershell_script_text_command(script)),
+    ]
+}
+
+/// [`powershell_script_text_args`] が `-EncodedCommand` に載せる本文（符号化する前。純粋関数。#2790）。
+///
+/// 終了コードは `-File` で走らせたときと同じに揃える（呼び手の `setup_bootstrap::run_installer` が
+/// 終了コードで失敗の種類を分けるため）:
+///
+/// | スクリプト | `-File`（#2790 より前） | この本文 |
+/// |---|---|---|
+/// | `exit N` | N | N（`exit` は `catch` に捕まらず、プロセスごと N で終わる） |
+/// | 捕まえない終端エラー | 1 | 1（エラーレコードを `Out-String` で整形して stderr へ） |
+/// | 最後まで走った | 0 | 0 |
+///
+/// - **子スコープ（`&`）で走らせる**: `-File` と同じく、スクリプトが立てる `Set-StrictMode` や
+///   `$ErrorActionPreference` を起動片の側へ漏らさない。シェル統合（#2432）がドットソース（`.`）なのは
+///   関数をペインのセッションへ残すためで、ここでは要らない
+/// - **起動片は `$ErrorActionPreference` を書き換えない**（子スコープが受け継ぐので、スクリプトから見える
+///   既定値が `-File` のときと変わる）
+/// - 読み込みは `ReadAllText` = BOM が無ければ UTF-8。`-File` の Windows PowerShell 5.1 は BOM の無い
+///   ファイルを ANSI コードページで読むので、非 ASCII を含むスクリプト（codex の `install.ps1` は
+///   BOM が無く非 ASCII が 1,596 バイト）はこちらの方が化けない
+/// - スクリプトのパスを持たない（`$PSCommandPath` が空）のは公式の `irm … | iex` と同じ
+/// - **捕まえたエラーは host を通さずに書く**（`[Console]::Error`）。`Write-Error -ErrorRecord $_` で
+///   書き直すと、5.1 は起動片の全文を「コマンド」として前に付け（`try { & ([scriptblock]… : <本文>`）、
+///   stderr のリダイレクト時は CLIXML にもなる（Windows の CI で実測）。`$_ | Out-String` は元のエラーの
+///   位置（インストーラの何行目か）と本文を `-File` のときと同じ形に整える
+pub fn powershell_script_text_command(script: &std::path::Path) -> String {
+    let path = crate::shell_integration::powershell_ascii_literal(&script.display().to_string());
+    format!(
+        "try {{ & ([scriptblock]::Create([System.IO.File]::ReadAllText({path}))) }}\n\
+         catch {{ [Console]::Error.WriteLine(($_ | Out-String).TrimEnd()); exit 1 }}\n\
+         exit 0\n"
+    )
+}
+
+/// PowerShell が CLIXML で書いた stderr を、人が読む平文へ戻す（純粋関数。#2790）。
+///
+/// `-EncodedCommand` で起こした Windows PowerShell 5.1 は、stderr がリダイレクトされていると進捗・警告・
+/// エラーの各レコードを `#< CLIXML` + `<Objs …>` で書く（`-OutputFormat Text` を見ない。Windows の CI で
+/// 実測）。導入代行を GUI / MCP から捕捉して走らせると、これがそのまま断りの文へ載る。
+///
+/// - `<Objs …>…</Objs>` の塊だけを置き換え、塊の外の素のテキスト（インストーラが起こしたネイティブの子が
+///   同じ stderr へ直接書いたもの・起動片が `[Console]::Error` で書いたもの）はそのまま残す
+/// - ストリームの `<S S="Error|warning|verbose|debug">` だけを文字にする（警告などは host と同じ
+///   `WARNING: ` 等の前置き）。進捗（`<Obj S="progress">`）は捨てる
+/// - 文字は XML の実体参照と PowerShell の `_xHHHH_`（UTF-16 の 1 単位）を戻し、改行は LF へ揃える
+/// - `#< CLIXML` を含まない入力（bash のインストーラ・pwsh 7 の平文）は借用のまま返す
+pub fn powershell_stderr_text(raw: &str) -> std::borrow::Cow<'_, str> {
+    const MARK: &str = "#< CLIXML";
+    if !raw.contains(MARK) {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("<Objs") {
+        out.push_str(&rest[..start]);
+        let block = &rest[start..];
+        let Some(end) = block.find("</Objs>") else {
+            out.push_str(block);
+            rest = "";
+            break;
+        };
+        out.push_str(&clixml_streams_text(&block[..end]));
+        rest = &block[end + "</Objs>".len()..];
+    }
+    out.push_str(rest);
+    let text = out.replace("\r\n", "\n");
+    let lines: Vec<&str> = text.lines().filter(|l| l.trim() != MARK).collect();
+    std::borrow::Cow::Owned(lines.join("\n"))
+}
+
+/// 1 つの `<Objs>` の塊から、ストリームの文字（`<S S="…">`）だけを順に取り出す
+fn clixml_streams_text(block: &str) -> String {
+    const OPEN: &str = "<S S=\"";
+    let mut out = String::new();
+    let mut rest = block;
+    while let Some(i) = rest.find(OPEN) {
+        let after = &rest[i + OPEN.len()..];
+        let Some(q) = after.find('"') else { break };
+        let stream = after[..q].to_ascii_lowercase();
+        let Some(gt) = after[q..].find('>') else {
+            break;
+        };
+        let body = &after[q + gt + 1..];
+        let Some(close) = body.find("</S>") else {
+            break;
+        };
+        let prefix = match stream.as_str() {
+            "error" => Some(""),
+            "warning" => Some("WARNING: "),
+            "verbose" => Some("VERBOSE: "),
+            "debug" => Some("DEBUG: "),
+            _ => None,
+        };
+        if let Some(prefix) = prefix {
+            out.push_str(prefix);
+            out.push_str(&clixml_unescape(&body[..close]));
+        }
+        rest = &body[close + "</S>".len()..];
+    }
+    out
+}
+
+/// XML の実体参照と PowerShell の `_xHHHH_` を戻す（サロゲートの対は UTF-16 のまま組み直す）
+fn clixml_unescape(text: &str) -> String {
+    let xml = text
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    let mut units: Vec<u16> = Vec::with_capacity(xml.len());
+    let mut rest = xml.as_str();
+    while let Some(i) = rest.find("_x") {
+        let tail = &rest[i + 2..];
+        let unit = (tail.len() >= 5 && tail.as_bytes()[4] == b'_')
+            .then(|| tail.get(..4))
+            .flatten()
+            .filter(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|hex| u16::from_str_radix(hex, 16).ok());
+        match unit {
+            Some(unit) => {
+                units.extend(rest[..i].encode_utf16());
+                units.push(unit);
+                // 切り出し安全: 先頭 4 バイトが ASCII の 16 進数字・5 バイト目が `_` と確かめた後
+                rest = &tail[5..];
+            }
+            None => {
+                units.extend(rest[..i + 2].encode_utf16());
+                rest = tail;
+            }
+        }
+    }
+    units.extend(rest.encode_utf16());
+    String::from_utf16_lossy(&units)
+}
+
 /// `-EncodedCommand` が要求する UTF-16LE + base64。
 ///
 /// base64 は 20 行で書けるうえ、依存を増やさない判断
@@ -2827,5 +2999,84 @@ mod tests_1657 {
         let got = imp::run_pane_command_legacy("npm test", MARKER);
         let want = posix_run_pane_command("npm test", MARKER);
         assert_eq!((got.program, got.args), (want.program, want.args));
+    }
+}
+
+#[cfg(test)]
+mod tests_2790 {
+    use super::*;
+
+    /// Windows の CI の 5.1 が `-EncodedCommand` + stderr の捕捉で書いた実物の形（置き場だけ伏せた）。
+    /// 先頭に「モジュールの初回の準備」の進捗、続いてエラーの文が 1 行ずつ `<S S="Error">` に入る
+    const PS51_CLIXML: &str = "#< CLIXML\r\n<Objs Version=\"1.1.0.1\" xmlns=\"http://schemas.microsoft.com/powershell/2004/04\"><Obj S=\"progress\" RefId=\"0\"><TN RefId=\"0\"><T>System.Management.Automation.PSCustomObject</T><T>System.Object</T></TN><MS><I64 N=\"SourceId\">1</I64><PR N=\"Record\"><AV>Preparing modules for first use.</AV><AI>0</AI><Nil /><PI>-1</PI><PC>-1</PC><T>Completed</T><SR>-1</SR><SD> </SD></PR></MS></Obj><S S=\"Error\">fake installer terminating error 2790_x000D__x000A_</S><S S=\"Error\">At line:13 char:29_x000D__x000A_</S><S S=\"Error\">+ if ($env:TAKO_2790_THROW) { throw 'x' } &amp;&amp; &lt;ok&gt;_x000D__x000A_</S><S S=\"Error\">    + CategoryInfo          : OperationStopped: (C:\\Users\\winuser\\AppData:String) [], RuntimeE _x000D__x000A_</S><S S=\"Error\">   xception_x000D__x000A_</S></Objs>";
+
+    #[test]
+    fn issue2790_51のclixmlのstderrを平文へ戻す() {
+        let got = powershell_stderr_text(PS51_CLIXML);
+        assert_eq!(
+            got,
+            "fake installer terminating error 2790\n\
+             At line:13 char:29\n\
+             + if ($env:TAKO_2790_THROW) { throw 'x' } && <ok>\n    \
+             + CategoryInfo          : OperationStopped: (C:\\Users\\winuser\\AppData:String) [], RuntimeE \n   \
+             xception"
+        );
+        for junk in [
+            "#< CLIXML",
+            "<Objs",
+            "<S S=",
+            "_x000D_",
+            "Preparing modules",
+        ] {
+            assert!(!got.contains(junk), "{junk} が残っている: {got}");
+        }
+    }
+
+    /// 塊の外の素のテキスト（ネイティブの子・起動片の `[Console]::Error`）は順番ごと残し、
+    /// 警告は host と同じ前置きを付ける。進捗だけの塊は何も残さない
+    #[test]
+    fn issue2790_clixmlの外の素の行と警告を順に残す() {
+        let raw = "native child said hello\r\n#< CLIXML\r\n\
+                   <Objs Version=\"1.1.0.1\"><Obj S=\"progress\" RefId=\"0\"><AV>Preparing</AV></Obj></Objs>\
+                   <Objs Version=\"1.1.0.1\"><S S=\"warning\">Could not remove temporary file_x000D__x000A_</S></Objs>\
+                   Installation failed (exit code 3)\r\n";
+        assert_eq!(
+            powershell_stderr_text(raw),
+            "native child said hello\n\
+             WARNING: Could not remove temporary file\n\
+             Installation failed (exit code 3)"
+        );
+    }
+
+    /// CLIXML でない出力（bash のインストーラ・pwsh 7 の平文）は借用のまま 1 バイトも変えない
+    #[test]
+    fn issue2790_clixmlでない出力は素通りする() {
+        for raw in [
+            "",
+            "curl: (6) Could not resolve host\n",
+            "\u{1b}[31;1mException: \u{1b}[31;1mboom\u{1b}[0m\n",
+            "日本語のエラー _x000D_ <Objs> は CLIXML の印が無ければ触らない",
+        ] {
+            let got = powershell_stderr_text(raw);
+            assert!(matches!(got, std::borrow::Cow::Borrowed(_)), "{raw:?}");
+            assert_eq!(got, raw);
+        }
+    }
+
+    /// 文字の戻し方: XML の実体参照・`_xHHHH_`（制御文字・`_` そのもの・サロゲートの対）・非 ASCII
+    #[test]
+    fn issue2790_clixmlの文字の符号を戻す() {
+        let raw = "#< CLIXML\n<Objs><S S=\"Error\">&quot;a&apos; &amp;amp; _x001B_[31m _x005F_x0041_ _xD83D__xDE00_ 日本語 _x41_ tako_x86_64</S></Objs>";
+        assert_eq!(
+            powershell_stderr_text(raw),
+            "\"a' &amp; \u{1b}[31m _x0041_ \u{1f600} 日本語 _x41_ tako_x86_64"
+        );
+    }
+
+    /// 終わりの無い塊（途中で切れた出力）は捨てずにそのまま残す（理由を消さない）
+    #[test]
+    fn issue2790_閉じていないclixmlは残す() {
+        let raw = "#< CLIXML\n<Objs><S S=\"Error\">cut";
+        assert_eq!(powershell_stderr_text(raw), "<Objs><S S=\"Error\">cut");
     }
 }

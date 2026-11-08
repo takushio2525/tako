@@ -1298,23 +1298,11 @@ fn run_installer(
     interactive: bool,
 ) -> Result<String, SetupRefusal> {
     let r = recipe_for(agent);
-    let runner = r.runner;
-    // インタプリタと引数はプラットフォーム境界（B17）が持つデータから組む。
+    // インタプリタ・引数・env はプラットフォーム境界（B17）の 1 実装が組む（#2790。Windows は
+    // 実行ポリシーの対象外の形 = 本文をテキストで読む `-EncodedCommand`）。
     // ここに `bash` / `powershell` を書かない = 経路の取り違えが起きない
-    let shell = runner
-        .candidates
-        .iter()
-        .find_map(|name| tako_core::platform::exe::find(name))
-        .unwrap_or_else(|| runner.fallback.to_string());
-    let mut command = std::process::Command::new(&shell);
-    // #586: GUI プロセスから到達するのでコンソールウィンドウを出させない
-    tako_core::platform::process::no_console_window(&mut command);
-    command.args(runner.args_for(script));
-    // インストーラの対話プロンプトを黙らせる env（codex の `Start Codex now?` 対策）。
-    // **手順の側が持つデータ**なので、ここに系統名を書かない
-    for (key, value) in r.installer_env {
-        command.env(key, value);
-    }
+    let mut command = r.installer_command(script);
+    let shell = command.get_program().to_string_lossy().into_owned();
     let (status, log) = if interactive {
         let status = command
             .stdin(std::process::Stdio::inherit())
@@ -1335,7 +1323,10 @@ fn run_installer(
                 error: e.to_string(),
             })?;
         let mut log = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr_raw = String::from_utf8_lossy(&output.stderr);
+        // Windows PowerShell 5.1 は `-EncodedCommand` + stderr の捕捉で進捗・警告・エラーを CLIXML で書く
+        // （#2790）。断りの文へ XML のまま載せないよう平文へ戻す（CLIXML でなければ素通り）
+        let stderr = tako_core::platform::shell::powershell_stderr_text(&stderr_raw);
         if !stderr.trim().is_empty() {
             if !log.is_empty() {
                 log.push('\n');
