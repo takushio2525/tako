@@ -864,8 +864,9 @@ WORKER_ERROR の種別と推奨リカバリ（`worker_status` の `error.kind` /
 | `usage_limit` | usage limit 到達で停止 | `wait_reset` | 解除時刻まで待ってから続行指示 |
 | `limit_dialog` | rate limit 起因の選択ダイアログ（codex のモデル切替等）で停止 | `respond_dialog` | ダイアログの選択肢に応答 |
 
-`worker_status` は `has_running_children`（tmux セッション配下で実行中の子プロセスがあるか。**器なしの worker では
-今は常に false** = #2804）と
+`worker_status` は `has_running_children`（ペインのシェルの配下で実行中の子プロセスがあるか。器ありは器のセッションの
+ペイン、器なしは PTY 直下の子（ペインのシェル）を根に、**シェル自身を除いた子孫**を数える = #2804。agent の TUI も
+シェルの子なので、生きている間は true・agent が終わってシェルだけ残ったら false）と
 `collapsed`（TUI 折りたたみ状態か）も返す。`collapsed` が true のとき read の画面テキストは
 不完全な可能性があるため、`has_running_children` と `status` フィールドを優先的に使うこと
 
