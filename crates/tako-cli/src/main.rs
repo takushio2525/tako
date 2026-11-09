@@ -89,6 +89,10 @@ enum Command {
     Focus(FocusArgs),
     /// タブ / ペインのツリー構造・ジオメトリ・状態を JSON で出力する
     List,
+    /// 変化の出来事（ペインの増減・role・タブ名・ターン状態）を --since より後から JSON で出す
+    /// （MCP `tako_events` と 1:1。Issue #2731）。--wait-ms で該当が出るまで待ち（上限 30000）、
+    /// --follow は待ちを繰り返して届いた分を 1 行 1 JSON で流し続ける
+    Events(EventsArgs),
     /// 環境の健全性を診断する（MCP `tako_check_health` と 1:1）。
     /// アプリへ届かないときは IPC の受け口だけをローカルで診断する（Issue #1441）
     #[command(name = "check-health")]
@@ -4225,6 +4229,27 @@ struct ModArgs {
     json: bool,
 }
 
+/// 変化の出来事の購読の引数（Issue #2731）。最簡形（#322）: `tako events` で今ある出来事を全部
+#[derive(Args)]
+struct EventsArgs {
+    /// この番号より後の出来事を出す（前の応答の cursor を渡す。省略は 0 = 残っている全部）
+    #[arg(long)]
+    since: Option<u64>,
+    /// 種類で絞る（繰り返し可。pane_added / pane_closed / role_changed / tab_renamed / turn_changed）
+    #[arg(long = "kind")]
+    kinds: Vec<String>,
+    /// ペインで絞る（繰り返し可。指定するとタブの出来事は出ない）
+    #[arg(long = "pane")]
+    panes: Vec<u64>,
+    /// 該当が無いときに待つ長さ（ms。上限 30000 へ丸める。省略は 0 = 待たない。
+    /// --follow の既定は上限で、1000 未満は 1000）
+    #[arg(long)]
+    wait_ms: Option<u64>,
+    /// 待ちを繰り返し、出来事が届いた応答を 1 行 1 JSON で流し続ける（Ctrl+C で止める）
+    #[arg(long)]
+    follow: bool,
+}
+
 /// UI 表示言語コマンドの引数（Issue #435）
 #[derive(Args)]
 struct LangArgs {
@@ -5023,6 +5048,8 @@ fn cli_main() -> ExitCode {
             mod_install_local(args)
         }
         Command::Config(ref args) => config_share_local(args),
+        // #2731: --follow は長ポーリングの繰り返し（中身は 1 回ごとに `Request::Events` = MCP と同じ応答）
+        Command::Events(ref args) if args.follow => events_follow(args),
         // run-interactive --wait は起動 + ポーリングの合成。終了コードは結末から決まる
         // （上限で打ち切ったら 124 = `timeout(1)` と同じ。#1778）
         Command::RunInteractive(ref args) if args.wait => {
@@ -5044,6 +5071,46 @@ fn cli_main() -> ExitCode {
         Err(message) => {
             eprintln!("error: {message}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `tako events --follow`（#2731）。長ポーリングを繰り返し、出来事・溢れ・待たなかった理由のどれかが
+/// 載った応答を 1 行 1 JSON（MCP `tako_events` と同じ形）で出し続ける。該当の無い時間切れは出さない。
+/// GUI が再起動して epoch が変わったら、新しい起動の頭（`since` 0）から読み直す
+fn events_follow(args: &EventsArgs) -> Result<(), String> {
+    // 待たない指定で繰り返すと打ち続けるので、1 回の待ちは 1 秒を下回らせない
+    let wait_ms = Some(
+        args.wait_ms
+            .unwrap_or(tako_core::events::MAX_WAIT_MS)
+            .max(1_000),
+    );
+    let mut since = args.since;
+    let mut epoch: Option<String> = None;
+    loop {
+        let page = send_request(Request::Events {
+            since,
+            kinds: args.kinds.clone(),
+            panes: args.panes.clone(),
+            wait_ms,
+        })?;
+        let now = page["epoch"].as_str().map(str::to_string);
+        if epoch.is_some() && now != epoch {
+            // 前の起動の cursor は新しい起動の番号と関係が無い
+            epoch = now;
+            since = Some(0);
+            continue;
+        }
+        epoch = now;
+        since = page["cursor"].as_u64().or(since);
+        let has_events = page["events"].as_array().is_some_and(|e| !e.is_empty());
+        let skipped = page.get("wait_skipped").is_some();
+        if has_events || page["dropped"] == true || skipped {
+            println!("{page}");
+        }
+        if skipped {
+            // 同時の待ちがふさがっている: すぐ打ち直すと待たずに回り続けるので間を置く
+            std::thread::sleep(std::time::Duration::from_secs(1));
         }
     }
 }
@@ -11244,6 +11311,12 @@ fn build_request(command: &Command) -> Result<Request, String> {
             index: args.index,
             focus: Some(args.focus).filter(|f| *f),
         },
+        Command::Events(args) => Request::Events {
+            since: args.since,
+            kinds: args.kinds.clone(),
+            panes: args.panes.clone(),
+            wait_ms: args.wait_ms,
+        },
         Command::Lang(args) => Request::Lang {
             action: args.value.as_deref().map(|_| "set".to_string()),
             value: args.value.clone(),
@@ -14599,6 +14672,7 @@ fn print_result(command: &Command, result: &Value) {
         Command::List => {
             println!("{}", pretty_json(result));
         }
+        Command::Events(_) => println!("{}", pretty_json(result)),
         Command::Tab(TabCommand::New { .. }) | Command::Tab(TabCommand::Pin { .. }) => {
             println!("{result}")
         }
@@ -14894,6 +14968,47 @@ mod tests {
     fn 引数定義が壊れていない() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    /// #2731: `tako events` の引数は MCP `tako_events` と同じ `Request::Events` へ写る
+    /// （`--kind` / `--pane` は繰り返し可・省略は空 = すべて・`--pane` は呼び出し元で補わない）
+    #[test]
+    fn issue2731_eventsの引数は購読の要求へ写る() {
+        let request = |args: &[&str]| build_request(&parse(args)).unwrap();
+        assert_eq!(
+            request(&[
+                "tako",
+                "events",
+                "--since",
+                "42",
+                "--kind",
+                "role_changed",
+                "--kind",
+                "turn_changed",
+                "--pane",
+                "3",
+                "--pane",
+                "4",
+                "--wait-ms",
+                "20000",
+            ]),
+            Request::Events {
+                since: Some(42),
+                kinds: vec!["role_changed".into(), "turn_changed".into()],
+                panes: vec![3, 4],
+                wait_ms: Some(20000),
+            }
+        );
+        assert_eq!(
+            request(&["tako", "events"]),
+            Request::Events {
+                since: None,
+                kinds: Vec::new(),
+                panes: Vec::new(),
+                wait_ms: None,
+            }
+        );
+        assert!(Cli::try_parse_from(["tako", "events", "--wait-ms", "-1"]).is_err());
     }
 
     /// #2045: `--replace` は action=replace（検索語つき = 探してから / 省くと右パネルの結果へ）、

@@ -12310,6 +12310,9 @@ fn dispatch_inner(
         // #1993 / #1994: 通常は受け口（`ipc::submit`）が答えるのでここへは来ない。来たら（UI スレッドの
         // 同期の dispatch）**採らずに**覚えだけを返す（走査は 1 回 11 ms = UI の 1 フレームを超える）。
         // 順番待ちの操作も走査の覚えを読むだけ
+        // #2731: 変化の出来事の購読。IPC / MCP の要求は `ipc::submit` が手前で答える（待つのは
+        // 接続のスレッド）。ここへ来るのは GUI の中からの呼び出しだけなので、決して待たない
+        events @ Request::Events { .. } => crate::events::answer(&events, false),
         Request::Queue {
             action,
             job,
@@ -41676,6 +41679,129 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         });
+    }
+
+    /// #2731: UI スレッドの dispatch へ来た購読は決して待たず、待たなかった理由を欄で返す
+    /// （待つのは `ipc::submit` の接続のスレッドだけ）。該当の出ないペインで絞り、並走する
+    /// テストが積む出来事で「該当があったから待たなかった」にならないようにする
+    #[test]
+    fn issue2731_uiスレッドのdispatchは購読で待たない() {
+        let mut host = MockHost::new();
+        let out = dispatch(
+            &mut host,
+            Request::Events {
+                since: Some(tako_core::events::log().cursor()),
+                kinds: Vec::new(),
+                panes: vec![u64::MAX - 2731],
+                wait_ms: Some(tako_core::events::MAX_WAIT_MS),
+            },
+            PaneOrigin::Mcp,
+        )
+        .unwrap();
+        assert_eq!(out["wait_skipped"], "not_on_connection_thread", "{out}");
+        assert_eq!(out["events"], serde_json::json!([]), "{out}");
+        assert_eq!(out["wait_ms"], tako_core::events::MAX_WAIT_MS);
+        let unknown = dispatch(
+            &mut host,
+            Request::Events {
+                since: None,
+                kinds: vec!["launch_changed".into()],
+                panes: Vec::new(),
+                wait_ms: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(unknown, DispatchError::InvalidParams(_)),
+            "{unknown:?}"
+        );
+    }
+
+    /// #2731: dispatch の書き込み系（split / title の role / tab rename / close）が、ドメインの
+    /// 書き換えの 1 か所を通って出来事を積む（dispatch 側に積む処理を散らさない）
+    #[test]
+    fn issue2731_dispatchの書き込みが出来事を積む() {
+        use tako_core::events::Detail;
+        let mut host = MockHost::new();
+        let root = host.root_pane();
+        let captured = tako_core::events::capture_on_this_thread();
+        let split = dispatch(
+            &mut host,
+            Request::Split {
+                pane: Some(root),
+                tab: None,
+                direction: None,
+                ratio: None,
+                command: None,
+                cwd: None,
+                focus: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let new_pane = split["pane"].as_u64().expect("新しいペイン");
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(new_pane),
+                title: None,
+                role: Some("orchestrator-master:dev".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        dispatch(
+            &mut host,
+            Request::TabRename {
+                pane: Some(new_pane),
+                tab: None,
+                title: "レビュー".into(),
+                source: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let tab = host
+            .workspace()
+            .find_tab_of_pane(PaneId::from_raw(new_pane))
+            .expect("タブ")
+            .as_u64();
+        dispatch(
+            &mut host,
+            Request::Close {
+                pane: Some(new_pane),
+                force: true,
+                caller_role: None,
+                caller_pane: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let got = captured.take();
+        let kinds: Vec<&str> = got.iter().map(|d| d.kind().as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["pane_added", "role_changed", "tab_renamed", "pane_closed"],
+            "{got:?}"
+        );
+        assert_eq!(got[0].pane(), Some(new_pane));
+        assert_eq!(
+            got[1],
+            Detail::RoleChanged {
+                pane: new_pane,
+                from: None,
+                to: Some("orchestrator-master:dev".into()),
+            }
+        );
+        assert_eq!(got[2].tab(), Some(tab));
+        assert_eq!(
+            got[3],
+            Detail::PaneClosed {
+                pane: new_pane,
+                role: Some("orchestrator-master:dev".into()),
+            }
+        );
     }
 
     /// #2413: メモリ圧 warn / critical の間の spawn はペインとレジストリを作り、起動コマンドと依頼文を

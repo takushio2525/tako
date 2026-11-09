@@ -60,6 +60,8 @@ pub mod diag;
 pub mod diagnostics;
 pub mod discovery;
 pub mod dispatch;
+/// 変化の出来事の購読（#2731。長ポーリング）
+pub mod events;
 pub mod fda;
 pub mod handoff_guard;
 pub mod health_text;

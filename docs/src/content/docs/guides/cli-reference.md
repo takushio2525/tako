@@ -1,12 +1,12 @@
 ---
 title: CLI リファレンス
 seoTitle: tako CLI リファレンス — コマンドの逆引き一覧
-description: tako コマンド全 97 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
+description: tako コマンド全 98 種の逆引き一覧 — 目的・使い方・実行例・よく使うオプション
 ---
 
 `tako` CLI は、ターミナルの画面操作（ペイン分割・テキスト送信・レイアウト変更など）をコマンドとして実行するためのツールです。シェルスクリプトからの自動化にも、AI エージェントからの操作にも使われます。
 
-トップレベルのコマンドは **97 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
+トップレベルのコマンドは **98 種**で、その多くがさらにサブコマンドを持ちます。ほぼすべてが同名の MCP ツールと 1:1 で対応しており（[MCP ツール一覧](/guides/mcp-tools/)）、人ができる操作は AI も同じ経路で実行できます。
 
 ## 共通の前提
 
@@ -23,7 +23,7 @@ tako orchestrator spawn --help
 
 ## コマンド早見表
 
-やりたいことから引くための全 97 コマンドの一覧です。詳細のあるものはリンクから飛べます。
+やりたいことから引くための全 98 コマンドの一覧です。詳細のあるものはリンクから飛べます。
 
 ### 画面を操作する
 
@@ -36,6 +36,7 @@ tako orchestrator spawn --help
 | [`links`](#tako-links) | 画面のリンク（Cmd+クリック / Windows は Ctrl+クリックで開けるもの）を列挙する |
 | [`lsp`](#tako-lsp) | 言語サーバ（LSP）の状態と起動・停止・編集中のコードの診断・定義ジャンプ・整形（編集モードで自動的に起きる） |
 | [`list`](#tako-list) | タブ・ペインの構成を JSON で得る |
+| [`events`](#tako-events) | ペインの増減・role・タブ名・ターン状態の変化を待って受け取る |
 | [`focus`](#tako-focus) | フォーカスを移す |
 | [`scroll`](#tako-scroll) | スクロールバックを動かす |
 | [`close`](#tako-close) | ペインを閉じる |
@@ -443,6 +444,19 @@ tako links --text "$(cat out.txt)"   # 画面の写しで判定を再現する
 
 ```bash
 tako list
+```
+
+### tako events
+
+ペインの増減（`pane_added` / `pane_closed`）・役割ラベルの変化（`role_changed`）・タブ名の変化（`tab_renamed`）・ターン状態の変化（`turn_changed` = idle / busy / permission / question。tako mod の報告から）を、番号（`seq`）の順に JSON で出します。外のスクリプトやアプリが `tako list` を何度も読み直さずに変化を知るための口で、MCP の `tako_events` と同じ応答です。
+
+応答の `cursor` を次の `--since` に渡すと、その後の変化だけを受け取れます。`--wait-ms` を付けると、該当が無いときはその長さ（上限 30000）まで待ち、変化が来た時点で返ります。`epoch`（tako の起動ごとに変わる）が変わったか `dropped` が `true` のときは、取りこぼしがあるので `tako list` で読み直してください。出来事に載るのは種類・ペイン / タブの番号・役割ラベル・タブ名だけで、画面の中身や会話の本文は載りません。
+
+```bash
+tako events                                   # いま残っている出来事を全部
+tako events --since 42 --wait-ms 20000        # 42 番より後を、来るまで最大 20 秒待つ
+tako events --kind role_changed --pane 7      # 種類とペインで絞る（どちらも繰り返し可）
+tako events --follow                          # 待ちを繰り返して 1 行 1 JSON で流し続ける
 ```
 
 ### tako focus

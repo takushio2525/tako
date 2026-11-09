@@ -151,7 +151,7 @@ const WINDOWS_CATEGORIES = [
     'tako_equalize_layout', 'tako_move_pane_to_tab', 'tako_scroll_pane',
     'tako_scrollback',
     'tako_send_input', 'tako_send_input.keys', 'tako_send_input.attachments',
-    'tako_read_pane', 'tako_links', 'tako_list_panes', 'tako_set_title',
+    'tako_read_pane', 'tako_links', 'tako_list_panes', 'tako_events', 'tako_set_title',
     'tako_create_tab', 'tako_select_tab', 'tako_rename_tab', 'tako_reorder_tab',
     'tako_collapse_tab', 'tako_pin_tab_title', 'tako_confirm_close',
     'tako_auto_rename', 'tako_autosuggest', 'tako_window', 'tako_menu',

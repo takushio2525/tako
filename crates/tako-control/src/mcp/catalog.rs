@@ -85,6 +85,22 @@ pub fn tools() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
         }),
         json!({
+            "name": "tako_events",
+            "description": "ペインの増減・role・タブ名・ターン状態の変化を since より後から返す（ポーリングの代わり）。\
+                該当が無ければ wait_ms（上限 30000）まで待つ。cursor を次の since に渡し、epoch が変わるか \
+                dropped なら tako_list_panes で読み直す。種類は kinds_known。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "since": { "type": "integer", "minimum": 0 },
+                    "kinds": { "type": "array", "items": { "type": "string" } },
+                    "panes": { "type": "array", "items": { "type": "integer" } },
+                    "wait_ms": { "type": "integer", "minimum": 0 },
+                },
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "tako_split_pane",
             "description": "ペインを分割して新しいターミナルペインを作り、新ペイン ID を返す。\
                 command を指定するとシェルの代わりにそれを実行する（dev サーバー・`git diff`・\

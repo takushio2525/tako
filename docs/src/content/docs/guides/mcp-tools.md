@@ -1,10 +1,10 @@
 ---
 title: MCP ツール一覧
 seoTitle: MCP ツール一覧 — AI エージェントがターミナルを操作するためのツール
-description: tako が AI エージェントに公開する 162 個の MCP ツールの全リスト
+description: tako が AI エージェントに公開する 163 個の MCP ツールの全リスト
 ---
 
-tako は **162 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
+tako は **163 個の MCP ツール**を AI エージェント（Claude Code / Codex 等）に公開しています。ほぼすべてが `tako` CLI のコマンドと 1:1 で対応しているため、細かい引数や挙動は [CLI リファレンス](/guides/cli-reference/)の対応コマンドも合わせて参照してください。
 
 :::tip[登録は一度きり]
 MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度行えば、以降はどのプロジェクトでも自動的に使えます。codex を master にする場合は `tako master` の起動時にだけ設定が注入されるため、グローバル設定の変更すら不要です。
@@ -19,6 +19,7 @@ MCP ツールの登録は `tako setup`（または `tako setup-mcp`）で一度�
 | ツール名 | 説明 |
 |---|---|
 | `tako_list_panes` | タブ・ペインのツリー構造・ジオメトリ・状態を JSON で取得。**操作前にまず呼ぶ** |
+| `tako_events` | ペインの増減・role・タブ名・ターン状態の変化を `since` より後から受け取る。該当が無ければ `wait_ms`（上限 30000）まで待つ長ポーリングで、一覧を何度も読み直さずに済む |
 | `tako_split_pane` | ペインを分割して新ペインを作る（方向・比率・実行コマンド指定可） |
 | `tako_close_pane` | ペインを閉じる |
 | `tako_focus_pane` | 指定ペインへフォーカスを移す |
