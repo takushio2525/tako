@@ -1581,14 +1581,13 @@
       "key": "worker_trust",
       "summary_ja": "作業フォルダを起動前に信頼済みにしておく（信頼ダイアログで止まらない）",
       "evidence": "source",
-      "evidence_detail": "orchestrator/agent.rs の ensure_trusted_in が worker に渡る env 計画から 3 系統ぶん 書き分けてある（claude = <config dir>/.claude.json = アカウントの CLAUDE_CONFIG_DIR / codex = $CODEX_HOME/config.toml = worker_mcp::codex_home_for（プロファイルの env → tako の CODEX_HOME → ~/.codex。#2816）/ agy = ~/.gemini/antigravity-cli/settings.json）。agy だけ固定パス",
+      "evidence_detail": "orchestrator/agent.rs の ensure_trusted_in が worker に渡る env 計画から 3 系統ぶん 書き分けてある（claude = <config dir>/.claude.json = アカウントの CLAUDE_CONFIG_DIR / codex = $CODEX_HOME/config.toml = worker_mcp::codex_home_for（プロファイルの env → tako の CODEX_HOME → ~/.codex。#2816）/ agy = ~/.gemini/antigravity-cli/settings.json）。codex は #2816 から worker が読む置き場へ書く（前は ~/.codex/config.toml の決め打ちで縮退）。agy だけ固定パス",
       "agents": {
         "claude": {
           "status": "supported"
         },
         "codex": {
-          "status": "degraded",
-          "note_ja": "設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない"
+          "status": "supported"
         },
         "agy": {
           "status": "degraded",

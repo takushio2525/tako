@@ -2091,7 +2091,7 @@ pub const MATRIX: &[AgentFeature] = &[
             "The working folder is marked trusted before launch, so no trust dialog blocks start-up",
         ),
         claude: S::Supported,
-        codex: degraded(notes::FIXED_CONFIG_PATH),
+        codex: S::Supported,
         agy: degraded(notes::FIXED_CONFIG_PATH),
         local: pending(notes::LOCAL_HARNESS_UNDECIDED, 990),
         evidence: AgentEvidence::Source(
@@ -2099,6 +2099,7 @@ pub const MATRIX: &[AgentFeature] = &[
              書き分けてある（claude = <config dir>/.claude.json = アカウントの CLAUDE_CONFIG_DIR / \
              codex = $CODEX_HOME/config.toml = worker_mcp::codex_home_for（プロファイルの env → \
              tako の CODEX_HOME → ~/.codex。#2816）/ agy = ~/.gemini/antigravity-cli/settings.json）。\
+             codex は #2816 から worker が読む置き場へ書く（前は ~/.codex/config.toml の決め打ちで縮退）。\
              agy だけ固定パス",
         ),
     },
