@@ -221,3 +221,7 @@ pub(crate) use bin_resolve::resolve_bin;
 const _: () = {
     let _ = serde_json::Map::<String, serde_json::Value>::shift_insert;
 };
+
+// #1537 の注入（手で戻す）: Windows でだけ出る製品コードの警告
+#[cfg(windows)]
+fn inject_1537_windows_only() {}

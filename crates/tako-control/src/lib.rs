@@ -239,3 +239,7 @@ fn load_or_create_token_at(path: &std::path::Path) -> std::io::Result<String> {
     tako_core::platform::private_file::restrict(path)?;
     Ok(token)
 }
+
+// #1537 の注入（手で戻す）: Windows のテストの cfg の内側だけで出る警告
+#[cfg(all(test, windows))]
+fn inject_1537_test_only() {}
