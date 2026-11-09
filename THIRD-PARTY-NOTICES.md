@@ -55,6 +55,9 @@ Apache-2.0 セクション 4(b) が要求する「改変の明示」:
 - Unix で PTY への書き込みが EIO（子の側の端末が全部閉じた）になったとき、ループを
   畳まずに未送信の入力を捨てて PTY の監視を外し、子の終了イベントを待って `ChildExit` を
   送るようにした（Issue #2114。畳むと子の終了が誰にも届かない）
+- Windows で PTY を poller へ登録した直後に、子の終了イベントのトークンの完了パケットを
+  1 つ置くようにした（Issue #2729。登録より前に子が終わると、upstream の子の終了の合図は
+  poller を起こさず `ChildExit` が届かない）
 
 The read buffer was moved from a 1 MiB stack array to a heap `Vec<u8>` that starts at
 64 KiB and grows on demand; `ref_test` and `drain_on_exit` were dropped; logging was
@@ -63,7 +66,10 @@ re-declared with the same values (guarded by a unit test against a real PTY); th
 types were renamed to fit tako's naming; and on Unix an EIO from a PTY write (the
 child side of the terminal is fully closed) no longer ends the loop — pending input is
 dropped, the PTY is removed from the poller, and the loop waits for the child-exit event
-so that `ChildExit` is still delivered.
+so that `ChildExit` is still delivered. On Windows the loop also posts one completion
+packet with the child-exit token right after registering the PTY, so a child that exited
+before the registration (whose exit signal never woke the poller) still gets its
+`ChildExit` delivered.
 
 ### GPL との関係 / Relationship to the GPL
 

@@ -556,7 +556,12 @@ mod tests {
             },
         )
         .expect("PTY を張れる");
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // 子の終わりの知らせを状態で待つ（上限は安全弁で、混み具合で伸ばす政策は 1 実装を通す）
+        let budget = tako_core::wait_budget::state_wait_budget(
+            Duration::from_secs(30),
+            tako_core::wait_budget::machine_busy(),
+        );
+        let deadline = Instant::now() + budget;
         let mut exited = false;
         while !exited && Instant::now() < deadline {
             match rx.try_recv() {
@@ -570,7 +575,16 @@ mod tests {
                 }
             }
         }
-        assert!(exited, "子の終わりが届かない");
+        // 届かなければ「子が終わらない」か「終わったのに知らせが来ない」（#2729: Windows で PTY の
+        // ループが登録より前に終わった子の合図を拾わなかった形）かを名指す
+        assert!(
+            exited,
+            "子の終わりが {budget:?} 以内に届かない（子 pid {:?}・生きている={:?}）",
+            session.child_pid(),
+            session
+                .child_pid()
+                .map(tako_core::platform::process::pid_alive)
+        );
         // claude の画面の形（alternate screen・太字・全角・利用制限の告知・入力欄・フッター）
         session.print_local(concat!(
             "\u{1b}[?1049h\u{1b}[H\u{1b}[2J\u{1b}[1m❯ 作業を続けて\u{1b}[0m\r\n\r\n",
