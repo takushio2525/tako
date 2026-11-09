@@ -1064,7 +1064,7 @@ fn powershell_output_argv(program: &str, script: &str) -> SpawnCommand {
 
 /// PTY 無しで走らせる PowerShell スクリプト（純粋関数）。
 ///
-/// 実行ペイン（[`powershell_run_script`]）との違いは 2 つ:
+/// 実行ペイン（[`powershell_run_script`]）との違いは次の 4 つ:
 ///
 /// 1. **確定した終了コードを `exit` で親へ返す**。`-EncodedCommand` の終了コードは
 ///    `$LASTEXITCODE` を素通しせず、実機実測では `cmd /c exit 7` が親から見て
@@ -1367,7 +1367,7 @@ fn clixml_unescape(text: &str) -> String {
 ///   残す。**結果に ESC（0x1B）は 1 つも残らない**
 ///
 /// ESC を含まない入力は借用のまま返す
-pub fn strip_ansi_escapes(text: &str) -> std::borrow::Cow<'_, str> {
+fn strip_ansi_escapes(text: &str) -> std::borrow::Cow<'_, str> {
     const ESC: char = '\u{1b}';
     if !text.contains(ESC) {
         return std::borrow::Cow::Borrowed(text);
