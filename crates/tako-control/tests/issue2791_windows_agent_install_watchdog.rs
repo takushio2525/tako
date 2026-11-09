@@ -61,9 +61,12 @@ fn issue2791_windowsの3系統は代行し同じ1実装で起こす() {
             Some(tako_core::platform::shell::encode_powershell_command(&body)),
             "Windows の {who} の起動引数が起動片の正本を載せていない"
         );
+        // #2822 から本文は関数 `install.ps1` として定義し、その名前をドットソースする（スコープは同じ）
         assert!(
-            body.starts_with("try { . ([scriptblock]::Create("),
-            "起動片がドットソースでない（子スコープでは agy の取得物の片付けが飛ぶ。#2791）: {body}"
+            body.contains("\n. install.ps1\n")
+                && !body.contains("& install.ps1")
+                && !body.contains("& ([scriptblock]"),
+            "起動片がドットソースでない（子スコープでは agy の取得物の片付けが飛ぶ。#2791 / #2822）: {body}"
         );
     }
     // A/B の旧アーム（TAKO_2791_LEGACY=1）だけが Windows の codex / agy を案内止まりへ戻す

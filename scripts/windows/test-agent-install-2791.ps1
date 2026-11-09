@@ -347,7 +347,8 @@ function Test-Boundaries($Installed) {
     $script:Stage = '境界: 途中で失敗する / codex（存在しない版）'
     $sb = New-Sandbox 'midway-codex'
     $r = Invoke-Tako $sb @('setup', 'bootstrap', 'install', '--agent', 'codex') @{ CODEX_RELEASE = '0.0.1' }
-    Assert-Refused $r '存在しない版の install --agent codex' @('Codex CLI のインストーラが失敗しました', $Agents['codex'].Troubleshoot, '0.0.1') @('claude', '<Objs')
+    # #2822: 断りの文に色の符号（ESC）とインストーラ本文（冒頭の Set-StrictMode の行）を載せない
+    Assert-Refused $r '存在しない版の install --agent codex' @('Codex CLI のインストーラが失敗しました', $Agents['codex'].Troubleshoot, '0.0.1') @('claude', '<Objs', [string][char]27, 'Set-StrictMode -Version Latest')
     Assert-That (-not (Test-Path -LiteralPath (Join-Path $sb.LocalAppData 'Programs\OpenAI\Codex\bin\codex.exe'))) '失敗したのに codex のランチャーが置かれた'
     Write-Host ("TAKO2791_MIDWAY agent=codex exit={0}" -f $r.Code)
 
@@ -356,7 +357,7 @@ function Test-Boundaries($Installed) {
     # %LOCALAPPDATA%\antigravity をファイルにしておくと、install.ps1 は staging の dir を作れずに止まる
     Set-Content -LiteralPath (Join-Path $sb.LocalAppData 'antigravity') -Value 'not a directory 2791' -Encoding ascii
     $r = Invoke-Tako $sb @('setup', 'bootstrap', 'install', '--agent', 'agy')
-    Assert-Refused $r '置き場を作れない install --agent agy' @('Antigravity CLI のインストーラが失敗しました', $Agents['agy'].Troubleshoot, 'staging') @('claude', '<Objs')
+    Assert-Refused $r '置き場を作れない install --agent agy' @('Antigravity CLI のインストーラが失敗しました', $Agents['agy'].Troubleshoot, 'staging') @('claude', '<Objs', [string][char]27, 'Set-StrictMode -Version Latest')
     Assert-That (-not (Test-Path -LiteralPath (Join-Path $sb.LocalAppData 'agy\bin\agy.exe'))) '失敗したのに agy のランチャーが置かれた'
     Write-Host ("TAKO2791_MIDWAY agent=agy exit={0}" -f $r.Code)
 }

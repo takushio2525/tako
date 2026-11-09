@@ -879,7 +879,10 @@ fn powershell_run_pane_command_1657(
     }
 }
 
-/// [`powershell_run_pane_command_1657`] が走らせるスクリプト（純粋関数）
+/// [`powershell_run_pane_command_1657`] が走らせるスクリプト。
+///
+/// 5.1 の最上位の `Write-Error` で包みの行が画面に出ないよう、終了コードの片は
+/// [`powershell_pane_exit_code_script`] を通す（#2822。`TAKO_2822_LEGACY=1` で #2822 前の形）
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_run_pane_script(
     command: &str,
@@ -887,13 +890,25 @@ fn powershell_run_pane_script(
     exit_file: Option<&std::path::Path>,
     lang: crate::i18n::Lang,
 ) -> String {
+    powershell_run_pane_script_in(command, marker_prefix, exit_file, lang, legacy_2822())
+}
+
+/// [`powershell_run_pane_script`] の本体（純粋関数。`legacy_2822` = #2822 前の形）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_run_pane_script_in(
+    command: &str,
+    marker_prefix: &str,
+    exit_file: Option<&std::path::Path>,
+    lang: crate::i18n::Lang,
+    legacy_2822: bool,
+) -> String {
     let (report, cleanup) = powershell_exit_report(marker_prefix, exit_file);
     format!(
         "{}{report}\n\
          {hint}\n\
          try {{ $null = [Console]::ReadLine() }} catch {{ }}\n\
          {cleanup}",
-        powershell_exit_code_script(command),
+        powershell_pane_exit_code_script(command, legacy_2822),
         hint = powershell_exit_hint_line(lang),
     )
 }
@@ -991,15 +1006,48 @@ fn powershell_run_pane_command(program: &str, command: &str, marker_prefix: &str
 /// 「ペインでは正しく判定できるのにゲートでは失敗が成功に見える」形の食い違いが起きない
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_exit_code_script(command: &str) -> String {
+    powershell_exit_code_script_in(command, "")
+}
+
+/// [`powershell_exit_code_script`] の 1 行目の末尾へ `first_line_tail` を足せる版（#2822）。
+///
+/// 実行ペインの包み（[`powershell_pane_exit_code_script`]）が 5.1 の `$MyInvocation` を外す片を、
+/// **利用者のコマンドより前の同じ 1 行目**に置くための口（利用者のコマンドは 2 行目のまま）。
+/// 空を渡すと [`powershell_exit_code_script`] と 1 バイトも変わらない（受け入れゲートの包みと
+/// 失敗したときだけ止める形はこちらを空で通る）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_exit_code_script_in(command: &str, first_line_tail: &str) -> String {
     format!(
         // プロファイルが走らせたネイティブ exe の値が残っていると誤検知するので先に消す
-        "$global:LASTEXITCODE = $null\n\
+        "$global:LASTEXITCODE = $null{first_line_tail}\n\
          {command}\n\
          $__tako_ok = $?\n\
          if ($__tako_ok) {{ $__tako_code = 0 }}\n\
          elseif ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {{ $__tako_code = $LASTEXITCODE }}\n\
          else {{ $__tako_code = 1 }}\n"
     )
+}
+
+/// 実行ペインの包みが通る終了コードの片（#2822。`legacy_2822` = #2822 前の形 = 何も足さない）。
+///
+/// 5.1 の `Write-Error` はエラーレコードの呼び出し元をその場の `$MyInvocation` にし、エラーの表示
+/// （NormalView）はそれが Script なら本文を「コマンド」として前に付ける。利用者のコマンドの最上位で
+/// `Write-Error` を呼ぶと、それがこの包み全体（終了コードの判定・側路への書き込み・案内・入力待ちの
+/// 約 10 行）になり、ペインの画面へ本文の前に並んでいた（Windows の CI の 5.1.26100 で実測）。
+/// 受け入れゲートの包み（#2812）と同じ片 [`POWERSHELL_51_FORGET_INVOCATION`] を 1 行目の末尾に置くと
+/// 呼び出し元は `Write-Error` 自身になり、cmdlet の失敗と同じ `Write-Error : <本文>` +
+/// `At line:2 char:1`（利用者のコマンドの位置。行番号は #2822 の前と同じ 2 行目）の形になる。
+/// pwsh 7 は外さない（#2812 と同じ理由で版で分ける）。代償として利用者のコマンドの最上位で読む
+/// `$MyInvocation` は 5.1 では `$null` になる（もともと `-EncodedCommand` の本文で、スクリプトの
+/// パスは持たない）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_pane_exit_code_script(command: &str, legacy_2822: bool) -> String {
+    let tail = if legacy_2822 {
+        ""
+    } else {
+        POWERSHELL_51_FORGET_INVOCATION
+    };
+    powershell_exit_code_script_in(command, tail)
 }
 
 /// 実行ペインで走らせる PowerShell スクリプト（純粋関数）。
@@ -1011,15 +1059,22 @@ fn powershell_exit_code_script(command: &str) -> String {
 /// プロファイルを読んでいるのと揃えるため。conda / nvm が `$PROFILE` で通す PATH が
 /// 効かないと「コマンドが見つからない」になる
 /// （**PTY 無しの [`powershell_output_script`] は逆に `-NoProfile`**。あちらの
-/// POSIX 側は `sh -c` = プロファイルを読まないので、揃える先が違う）
+/// POSIX 側は `sh -c` = プロファイルを読まないので、揃える先が違う）。
+/// 5.1 の包みの行は [`powershell_pane_exit_code_script`] が消す（#2822。`TAKO_2822_LEGACY=1` で残る）
 #[cfg_attr(not(windows), allow(dead_code))]
 fn powershell_run_script(command: &str, marker_prefix: &str) -> String {
+    powershell_run_script_in(command, marker_prefix, legacy_2822())
+}
+
+/// [`powershell_run_script`] の本体（純粋関数。`legacy_2822` = #2822 前の形）
+#[cfg_attr(not(windows), allow(dead_code))]
+fn powershell_run_script_in(command: &str, marker_prefix: &str, legacy_2822: bool) -> String {
     // マーカーの引用は PowerShell 方言の `quote_arg`（単引用符 + `''` 二重化）へ委ねる
     let marker = ShellDialect::PowerShell.quote_arg(marker_prefix);
     format!(
         "{}Write-Host ({marker} + $__tako_code)\n\
          try {{ $null = [Console]::ReadLine() }} catch {{ }}\n",
-        powershell_exit_code_script(command)
+        powershell_pane_exit_code_script(command, legacy_2822)
     )
 }
 
@@ -1125,7 +1180,8 @@ fn powershell_output_script_in(command: &str, legacy_2812: bool) -> String {
     )
 }
 
-/// [`powershell_output_script`] の 2 行目の末尾へ足す片（#2812。5.1 のときだけ `$MyInvocation` を外す）
+/// [`powershell_output_script`] の 2 行目の末尾へ足す片（#2812。5.1 のときだけ `$MyInvocation` を外す）。
+/// 実行ペインの包みも同じ片を 1 行目の末尾へ足す（#2822。[`powershell_pane_exit_code_script`]）
 const POWERSHELL_51_FORGET_INVOCATION: &str =
     "; if ($PSVersionTable.PSVersion.Major -le 5) { $MyInvocation = $null }";
 
@@ -1135,6 +1191,15 @@ pub const ISSUE2812_LEGACY_ENV: &str = "TAKO_2812_LEGACY";
 
 fn legacy_2812() -> bool {
     std::env::var_os(ISSUE2812_LEGACY_ENV).is_some()
+}
+
+/// #2822 の A/B の env（`1` で #2822 前の形 = 導入代行の起動片は scriptblock を直にドットソースして pwsh 7 の
+/// 色を止めず、実行ペインの包みは 5.1 の `$MyInvocation` を外さない）。#2812 / #2800 とは独立
+/// （それらはゲートの包みと CLIXML の平文化だけを戻す）
+pub const ISSUE2822_LEGACY_ENV: &str = "TAKO_2822_LEGACY";
+
+fn legacy_2822() -> bool {
+    std::env::var_os(ISSUE2822_LEGACY_ENV).is_some()
 }
 
 /// [`output_command`] の共通部分（argv を `Command` へ移して副作用の抑止を掛ける）
@@ -1214,14 +1279,69 @@ pub fn powershell_script_text_args(script: &std::path::Path) -> Vec<String> {
 ///   書き直すと、5.1 は起動片の全文を「コマンド」として前に付け（`try { . ([scriptblock]… : <本文>`）、
 ///   stderr のリダイレクト時は CLIXML にもなる（Windows の CI で実測）。`$_ | Out-String` は元のエラーの
 ///   位置（インストーラの何行目か）と本文を `-File` のときと同じ形に整える
+/// - **本文は関数 [`POWERSHELL_INSTALLER_FUNCTION`]（`install.ps1`）として定義し、名前でドットソースする**
+///   （#2822）。5.1 の `Write-Error` はエラーレコードの呼び出し元をその場の `$MyInvocation` にし、エラーの表示
+///   （NormalView）はそれが Script なら本文を「コマンド」として前に付ける。scriptblock を直にドットソースすると
+///   インストーラの最上位の `$MyInvocation` はその scriptblock（= インストーラ全体）になり、最上位の
+///   `Write-Error`（claude の `install.ps1` の失敗はどれもこの形）で**インストーラの全文**（codex は 71 KB）が
+///   断りの文の前に出ていた（Windows の CI の 5.1.26100 で実測）。関数なら呼び出し元は関数になり、表示は
+///   `install.ps1 : <本文>` + `At line:4 char:1` / `+ . install.ps1`（呼び出しの行。#2822 の前は起動片の 1 行目
+///   `try { . ([scriptblock]::Create(…` だった）になる。`$MyInvocation` を `$null` にする #2812 の手は採らない:
+///   ドットソースの呼び出しがインストーラの最上位に自分の `$MyInvocation`（`InvocationName` が `.`）を置くので
+///   起動片の側で外しても効かず（手元の pwsh 7.6 で確かめた）、agy の `install.ps1` は
+///   `Set-StrictMode -Version Latest` の下で最上位の `$MyInvocation.MyCommand` を読む（`$null` だと止まる）。
+///   関数でも `MyCommand` は在り、`Path` を持たず `InvocationName` は `.` なので agy の判定（`$isSourced`）は
+///   #2822 の前と同じ。スコープもドットソースのまま（`$script:` の片付けが同じに動く。偽物 13 種の終了コードと
+///   agy の骨組みの片付けを 5.1 / pwsh 7 の両方で突き合わせた）
+/// - **捕捉されているときだけ pwsh 7 の色を止める**（#2822。[`POWERSHELL_PLAIN_WHEN_CAPTURED`]）
+///
+/// `TAKO_2822_LEGACY=1` で #2822 前の形（scriptblock を直にドットソース・色を止めない）に戻る
 pub fn powershell_script_text_command(script: &std::path::Path) -> String {
-    powershell_script_text_command_in(script, false)
+    if legacy_2822() {
+        return powershell_script_text_command_in(script, false);
+    }
+    powershell_installer_function_command(script)
 }
 
-/// [`powershell_script_text_command`] の旧形も組める版（`legacy_2791` = #2791 より前の子スコープ `&`）。
+/// [`powershell_script_text_command`] の本体（純粋関数。#2822）。
+///
+/// 1 行目 = 色の止め（[`POWERSHELL_PLAIN_WHEN_CAPTURED`]）、2〜5 行目 = 読み込み・関数の定義・呼び出し・捕捉、
+/// 6 行目 = `exit 0`。呼び出しの行（4 行目）は `. install.ps1` だけにする（5.1 の位置の行と pwsh 7 の
+/// `Line |` に出るのはこの 1 行。インストーラ自身の行で起きたエラーの位置はインストーラの行番号のまま）。
+/// 読み込みは `try` の中（読めない・構文エラーは捕まえて理由つきで 1 = #2790 と同じ）
+pub fn powershell_installer_function_command(script: &std::path::Path) -> String {
+    let path = crate::shell_integration::powershell_ascii_literal(&script.display().to_string());
+    let name = POWERSHELL_INSTALLER_FUNCTION;
+    format!(
+        "{POWERSHELL_PLAIN_WHEN_CAPTURED}\n\
+         try {{\n\
+         ${{function:{name}}} = [scriptblock]::Create([System.IO.File]::ReadAllText({path}))\n\
+         . {name}\n\
+         }} catch {{ [Console]::Error.WriteLine(($_ | Out-String).TrimEnd()); exit 1 }}\n\
+         exit 0\n"
+    )
+}
+
+/// 導入代行の起動片がインストーラ本文を定義する関数の名前（#2822。公式の 3 系統の取得物の名前と同じ）。
+/// 5.1 の最上位の `Write-Error` の表示は `install.ps1 : <本文>`、pwsh 7 は `install.ps1: ` になる
+pub const POWERSHELL_INSTALLER_FUNCTION: &str = "install.ps1";
+
+/// 導入代行の起動片の 1 行目（#2822）。
+///
+/// pwsh 7.2 以降は、インストーラが host に書いたエラー（`Write-Error` ほか）を `$PSStyle` の色で飾ったまま
+/// stderr へ書く（`-OutputFormat Text` の平文でも。Windows の CI の pwsh 7.6.9 で、最上位の `Write-Error` で
+/// ESC 3 個・関数の中の `Write-Error` で 32 個）。`OutputRendering` を `PlainText` にすると 0 になる（同じ CI）。
+/// 止めるのは**捕捉されている（stdout か stderr がリダイレクト）ときだけ**で、端末で対話実行するときの色は
+/// 変えない。5.1 は `$PSStyle` を持たないので `$null` で何もしない（インストーラが `Set-StrictMode` を立てる
+/// 前に読むので未定義でも止まらない。`$Error` も増えない = 同じ CI で実測）。制約付き言語モードなどで
+/// 書けなければ黙って既定のまま。ネイティブの子が同じ stderr へ直接書いた色は変えない（#2800 / #2812 と同じ）
+pub const POWERSHELL_PLAIN_WHEN_CAPTURED: &str = "try { if ($null -ne $PSStyle -and ([Console]::IsErrorRedirected -or [Console]::IsOutputRedirected)) { $PSStyle.OutputRendering = 'PlainText' } } catch { }";
+
+/// [`powershell_script_text_command`] の旧形も組める版（`legacy_2791` = #2791 より前の子スコープ `&`。
+/// `false` は #2791〜#2822 前の形 = scriptblock を直にドットソース = `TAKO_2822_LEGACY=1` の形）。
 ///
 /// 製品は旧形を使わない（Windows の CI の `issue2791_agent_install_windows` が「子スコープでは agy の
-/// 取得物の片付けが飛ぶ」を同じ偽物で示すためだけに残す）
+/// 取得物の片付けが飛ぶ」を同じ偽物で示すためと、#2822 の A/B のためだけに残す）
 pub fn powershell_script_text_command_in(script: &std::path::Path, legacy_2791: bool) -> String {
     let path = crate::shell_integration::powershell_ascii_literal(&script.display().to_string());
     let call = if legacy_2791 { '&' } else { '.' };
@@ -2368,8 +2488,14 @@ mod tests {
     #[test]
     fn 終了コードの決め方はペインとpty無しで共有する() {
         let shared = powershell_exit_code_script("cargo test");
+        // 実行ペインの片は共有の片の 1 行目の末尾に 5.1 の片を足しただけ（#2822）
+        let pane = powershell_pane_exit_code_script("cargo test", false);
+        assert_eq!(
+            pane.replacen(POWERSHELL_51_FORGET_INVOCATION, "", 1),
+            shared
+        );
         assert!(
-            powershell_run_script("cargo test", "__TAKO_EXIT=").starts_with(&shared),
+            powershell_run_script("cargo test", "__TAKO_EXIT=").starts_with(&pane),
             "実行ペインが共有の片から始まっていない"
         );
         assert!(
@@ -3022,9 +3148,9 @@ mod tests_1657 {
         // 切り出し安全: args は引数の Vec
         assert_eq!(&got.args[..2], ["-NoLogo", "-EncodedCommand"]);
         let script = decode_powershell_command(&got.args[2]);
-        // 終了コードの決め方は PTY 無しの実行と同じ 1 実装（#935）
+        // 終了コードの決め方は PTY 無しの実行と同じ 1 実装（#935。ペインは 1 行目に 5.1 の片を足す = #2822）
         assert!(
-            script.starts_with(&powershell_exit_code_script("cargo test")),
+            script.starts_with(&powershell_pane_exit_code_script("cargo test", false)),
             "{script}"
         );
         let quoted = "'C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\12.code'";
@@ -3370,5 +3496,249 @@ mod tests_2812 {
             powershell_output_script("cargo test").contains(POWERSHELL_51_FORGET_INVOCATION),
             "powershell_output_script が 5.1 の $MyInvocation を外していない（#2812。{ISSUE2812_LEGACY_ENV} が立っている？）"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_2822 {
+    use super::*;
+    use crate::i18n::Lang;
+
+    /// 共有の終了コードの片（ゲート・実行ペイン・失敗時だけ止める形の 3 つが通る）の #2822 前の字面
+    const EXIT_CODE_CARGO_TEST: &str = "$global:LASTEXITCODE = $null\n\
+        cargo test\n\
+        $__tako_ok = $?\n\
+        if ($__tako_ok) { $__tako_code = 0 }\n\
+        elseif ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) { $__tako_code = $LASTEXITCODE }\n\
+        else { $__tako_code = 1 }\n";
+
+    /// 受け入れゲートの経路（PTY 無しの包み）と共有の片は #2822 の前後でバイト一致（受け入れ条件 5）
+    #[test]
+    fn issue2822_ゲートの包みと共有の片は修正前とバイト一致() {
+        assert_eq!(
+            powershell_exit_code_script("cargo test"),
+            EXIT_CODE_CARGO_TEST
+        );
+        let head = "try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }\n";
+        assert_eq!(
+            powershell_output_script_in("cargo test", false),
+            format!(
+                "{head}$ProgressPreference = 'SilentlyContinue'; if ($PSVersionTable.PSVersion.Major -le 5) {{ $MyInvocation = $null }}\n\
+                 {EXIT_CODE_CARGO_TEST}exit $__tako_code\n"
+            )
+        );
+        assert_eq!(
+            powershell_output_script_in("cargo test", true),
+            format!("{head}$ProgressPreference = 'SilentlyContinue'\n{EXIT_CODE_CARGO_TEST}exit $__tako_code\n")
+        );
+    }
+
+    /// macOS の経路（実行ペインの `/bin/sh -c`・PTY 無しの `sh -c`）は #2822 の前後でバイト一致（受け入れ条件 5）
+    #[test]
+    fn issue2822_macosの実行ペインとpty無しの実行は修正前とバイト一致() {
+        let file = std::path::Path::new("/tmp/tako-2822/run-exit/1.code");
+        assert_eq!(
+            posix_run_pane_script("cargo test", "__TAKO_EXIT=", Some(file), Lang::Ja),
+            "cargo test\n\
+             __tako_code=$?\n\
+             { printf '%s\\n' \"$__tako_code\" > /tmp/tako-2822/run-exit/1.code; } 2>/dev/null\n\
+             printf '\\n\\033[2m%s%s%s\\033[0m\\n' '[tako] 終了コード ' \"$__tako_code\" ' / Enter でこのペインを閉じます'\n\
+             read -r __TAKO_DUMMY__ 2>/dev/null || true\n\
+             rm -f /tmp/tako-2822/run-exit/1.code 2>/dev/null"
+        );
+        assert_eq!(
+            posix_run_pane_script("cargo test", "__TAKO_EXIT=", None, Lang::En),
+            "cargo test\n\
+             __tako_code=$?\n\
+             echo \"__TAKO_EXIT=$__tako_code\"\n\
+             printf '\\n\\033[2m%s%s%s\\033[0m\\n' '[tako] Exit code ' \"$__tako_code\" ' / Press Enter to close this pane'\n\
+             read -r __TAKO_DUMMY__ 2>/dev/null || true"
+        );
+        let argv = posix_output_argv("cargo test");
+        assert_eq!(
+            (argv.program.as_str(), argv.args.as_slice()),
+            ("sh", &["-c".to_string(), "cargo test".to_string()][..])
+        );
+        // macOS の導入代行は bash / sh のインストーラ。平文化は CLIXML でない入力を借用のまま返す（1 バイトも変えない）
+        let raw = "\u{1b}[31merror: install failed\u{1b}[0m\n";
+        assert!(matches!(powershell_stderr_text(raw), std::borrow::Cow::Borrowed(r) if r == raw));
+    }
+
+    const SCRIPT: &str = "C:\\Users\\winuser\\AppData\\Local\\Temp\\tako-codex-install-1.ps1";
+
+    /// 導入代行の起動片（#2822）: 1 行目で捕捉されているときだけ pwsh 7 の色を止め、本文を関数 `install.ps1` として
+    /// 定義し、4 行目の `. install.ps1` だけでドットソースする（5.1 の位置の行と pwsh 7 の `Line |` に出るのはこの行）
+    #[test]
+    fn issue2822_起動片は本文を関数として定義し名前でドットソースする() {
+        let script = std::path::Path::new(SCRIPT);
+        let got = powershell_installer_function_command(script);
+        let path = crate::shell_integration::powershell_ascii_literal(SCRIPT);
+        assert_eq!(
+            got,
+            format!(
+                "try {{ if ($null -ne $PSStyle -and ([Console]::IsErrorRedirected -or [Console]::IsOutputRedirected)) {{ $PSStyle.OutputRendering = 'PlainText' }} }} catch {{ }}\n\
+                 try {{\n\
+                 ${{function:install.ps1}} = [scriptblock]::Create([System.IO.File]::ReadAllText({path}))\n\
+                 . install.ps1\n\
+                 }} catch {{ [Console]::Error.WriteLine(($_ | Out-String).TrimEnd()); exit 1 }}\n\
+                 exit 0\n"
+            )
+        );
+        let lines: Vec<&str> = got.lines().collect();
+        assert_eq!(
+            lines[3], ". install.ps1",
+            "呼び出しの行は 4 行目に 1 文だけ: {got}"
+        );
+        // 5.1 で外すのではなく関数にする（agy の install.ps1 は StrictMode の下で $MyInvocation.MyCommand を読む）
+        assert!(!got.contains("$MyInvocation"), "{got}");
+        // scriptblock を直にドットソースする形（#2822 前）・子スコープの形が残っていない
+        assert!(!got.contains(". ([scriptblock]"), "{got}");
+        assert!(
+            !got.contains("& install.ps1") && !got.contains("& ([scriptblock]"),
+            "{got}"
+        );
+        // 読み込みは try の中（読めない・構文エラーは捕まえて理由つきで 1 = #2790）
+        let open = got.find("try {\n").expect("try が無い");
+        assert!(open < got.find("ReadAllText(").expect("読み込みが無い"));
+        // 5.1 には $PSStyle が無い: 未定義の参照で止まらないよう `$null -ne` で見てから書く
+        assert!(got.starts_with(POWERSHELL_PLAIN_WHEN_CAPTURED), "{got}");
+        assert!(
+            POWERSHELL_PLAIN_WHEN_CAPTURED.contains("$null -ne $PSStyle -and")
+                && POWERSHELL_PLAIN_WHEN_CAPTURED.contains("IsErrorRedirected"),
+            "{POWERSHELL_PLAIN_WHEN_CAPTURED}"
+        );
+        assert!(got.is_ascii(), "起動片は ASCII だけ: {got}");
+    }
+
+    /// A/B: `TAKO_2822_LEGACY=1` の形は #2822 前の製品の起動片（scriptblock を直にドットソース）と 1 バイトも違わない
+    #[test]
+    fn issue2822_旧形は2791の起動片そのもの() {
+        let script = std::path::Path::new(SCRIPT);
+        let path = crate::shell_integration::powershell_ascii_literal(SCRIPT);
+        assert_eq!(
+            powershell_script_text_command_in(script, false),
+            format!(
+                "try {{ . ([scriptblock]::Create([System.IO.File]::ReadAllText({path}))) }}\n\
+                 catch {{ [Console]::Error.WriteLine(($_ | Out-String).TrimEnd()); exit 1 }}\n\
+                 exit 0\n"
+            )
+        );
+    }
+
+    /// 実行ペインの包み（#2822）: 1 行目の末尾で 5.1 の `$MyInvocation` を外し、利用者のコマンドは 2 行目のまま
+    #[test]
+    fn issue2822_実行ペインの包みは51でだけ呼び出し元を外しコマンドは2行目のまま() {
+        let file =
+            std::path::Path::new("C:\\Users\\winuser\\AppData\\Roaming\\tako\\run-exit\\3.code");
+        for (what, new, old) in [
+            (
+                "#1657 の形",
+                powershell_run_pane_script_in(
+                    "Write-Error 'x'",
+                    "__TAKO_EXIT=",
+                    Some(file),
+                    Lang::Ja,
+                    false,
+                ),
+                powershell_run_pane_script_in(
+                    "Write-Error 'x'",
+                    "__TAKO_EXIT=",
+                    Some(file),
+                    Lang::Ja,
+                    true,
+                ),
+            ),
+            (
+                "#1657 前の形",
+                powershell_run_script_in("Write-Error 'x'", "__TAKO_EXIT=", false),
+                powershell_run_script_in("Write-Error 'x'", "__TAKO_EXIT=", true),
+            ),
+        ] {
+            let lines: Vec<&str> = new.lines().collect();
+            assert_eq!(
+                lines[0],
+                "$global:LASTEXITCODE = $null; if ($PSVersionTable.PSVersion.Major -le 5) { $MyInvocation = $null }",
+                "{what}: {new}"
+            );
+            assert_eq!(
+                lines[1], "Write-Error 'x'",
+                "{what}: 利用者のコマンドが 2 行目でない: {new}"
+            );
+            // 旧形は 1 行目に何も足さない。差はその片だけ
+            assert_eq!(
+                old.lines().next(),
+                Some("$global:LASTEXITCODE = $null"),
+                "{what}"
+            );
+            assert!(!old.contains("$MyInvocation"), "{what}: {old}");
+            assert_eq!(
+                new.replacen(POWERSHELL_51_FORGET_INVOCATION, "", 1),
+                old,
+                "{what}"
+            );
+        }
+    }
+
+    /// 既定の入口（env を読む）は修正後の形を使う。`TAKO_2822_LEGACY=1` で走らせるとここが名指しで落ちる
+    #[test]
+    fn issue2822_既定の入口は修正後の形() {
+        let script = std::path::Path::new(SCRIPT);
+        assert_eq!(
+            powershell_script_text_command(script),
+            powershell_installer_function_command(script),
+            "導入代行の起動片が #2822 前の形（{ISSUE2822_LEGACY_ENV} が立っている？）"
+        );
+        assert!(
+            powershell_run_pane_script("x", "__TAKO_EXIT=", None, Lang::En)
+                .contains(POWERSHELL_51_FORGET_INVOCATION),
+            "実行ペインの包みが 5.1 の $MyInvocation を外していない（#2822。{ISSUE2822_LEGACY_ENV} が立っている？）"
+        );
+        assert!(
+            powershell_run_script("x", "__TAKO_EXIT=").contains(POWERSHELL_51_FORGET_INVOCATION),
+            "#1657 前の実行ペインの包みが 5.1 の $MyInvocation を外していない（#2822）"
+        );
+    }
+
+    /// `TAKO_2822_LEGACY=1` は導入代行の起動片と実行ペインの包みだけを戻し、ゲートの包み（#2812）は動かさない。
+    /// 逆に `TAKO_2812_LEGACY=1` は #2822 の 2 つを動かさない（独立した A/B）
+    #[test]
+    fn issue2822_旧形の門は2812と独立() {
+        if crate::run_alone!(issue2822_旧形の門は2812と独立) {
+            return;
+        }
+        let script = std::path::Path::new(SCRIPT);
+        let gate = powershell_output_script("cargo test");
+        let launcher = powershell_installer_function_command(script);
+        let pane = powershell_run_pane_script("x", "__TAKO_EXIT=", None, Lang::En);
+
+        std::env::set_var(ISSUE2822_LEGACY_ENV, "1");
+        assert_eq!(
+            powershell_script_text_command(script),
+            powershell_script_text_command_in(script, false)
+        );
+        assert!(
+            !powershell_run_pane_script("x", "__TAKO_EXIT=", None, Lang::En)
+                .contains("$MyInvocation")
+        );
+        assert!(!powershell_run_script("x", "__TAKO_EXIT=").contains("$MyInvocation"));
+        assert_eq!(
+            powershell_output_script("cargo test"),
+            gate,
+            "TAKO_2822_LEGACY がゲートの包みを動かした"
+        );
+        std::env::remove_var(ISSUE2822_LEGACY_ENV);
+
+        std::env::set_var(ISSUE2812_LEGACY_ENV, "1");
+        assert_eq!(powershell_script_text_command(script), launcher);
+        assert_eq!(
+            powershell_run_pane_script("x", "__TAKO_EXIT=", None, Lang::En),
+            pane
+        );
+        assert_ne!(
+            powershell_output_script("cargo test"),
+            gate,
+            "TAKO_2812_LEGACY がゲートの包みを戻さない"
+        );
+        std::env::remove_var(ISSUE2812_LEGACY_ENV);
     }
 }

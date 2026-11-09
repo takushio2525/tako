@@ -116,7 +116,9 @@
 //!   （= 冪等）。**取得物の片付けが `$script:` のスコープに依る**（関数の中で `$script:stagingPayload` へ書き、
 //!   `finally` で素の `$stagingPayload` を読む）ので、起動片は `-File` / `irm | iex` と同じスコープで走らせる
 //!   （`platform::shell::powershell_script_text_command` のドットソース。子スコープだと片付けが飛び、
-//!   `%LOCALAPPDATA%\antigravity\staging\agy.exe` が残る）
+//!   `%LOCALAPPDATA%\antigravity\staging\agy.exe` が残る）。agy は `Set-StrictMode -Version Latest` の下で最上位の
+//!   `$MyInvocation.MyCommand` を読むので、起動片は `$MyInvocation` を `$null` にしない（#2822 は本文を関数
+//!   `install.ps1` として定義してその名前をドットソースする = 失敗の文にインストーラの全文が出ない）
 //! - 起こし方は claude と同じ 1 実装（[`WINDOWS_POWERSHELL_RUNNER`] = 本文をテキストで読む `-EncodedCommand`。
 //!   #2790）。実行ポリシーを強制した PC でも止まらない
 //! - 実走は Windows の CI のランナーで行う（`scripts/windows/test-agent-install-2791.ps1`）。
@@ -795,20 +797,27 @@ mod tests {
             literal,
             r"'C:\Users\' + [char]0x5C71 + [char]0x7530 + ' ' + [char]0x592A + [char]0x90CE + '\AppData\Local\Temp\tako-claude-install-''1''.ps1'"
         );
+        // #2822 から本文は関数 `install.ps1` として定義し、名前でドットソースする（1 行目は色の止め）
         assert_eq!(
             decoded,
             format!(
-                "try {{ . ([scriptblock]::Create([System.IO.File]::ReadAllText({literal}))) }}\n\
-                 catch {{ [Console]::Error.WriteLine(($_ | Out-String).TrimEnd()); exit 1 }}\n\
-                 exit 0\n"
+                "{}\n\
+                 try {{\n\
+                 ${{function:install.ps1}} = [scriptblock]::Create([System.IO.File]::ReadAllText({literal}))\n\
+                 . install.ps1\n\
+                 }} catch {{ [Console]::Error.WriteLine(($_ | Out-String).TrimEnd()); exit 1 }}\n\
+                 exit 0\n",
+                crate::platform::shell::POWERSHELL_PLAIN_WHEN_CAPTURED
             )
         );
     }
 
-    /// 起動片は scriptblock を**ドットソース**で走らせる（#2791）。子スコープ（`&`）だと、最上位の変数と
+    /// 起動片は本文を**ドットソース**で走らせる（#2791）。子スコープ（`&`）だと、最上位の変数と
     /// `$script:` の変数が別になり、agy の `install.ps1` の取得物の片付け（`$script:stagingPayload` を書いて
-    /// `finally` で `$stagingPayload` を読む）が飛ぶ。製品の既定の口（`args_for` = 3 系統の Windows の
-    /// レシピ）で縛るので、`&` へ戻す変更はここが名指しで落とす
+    /// `finally` で `$stagingPayload` を読む）が飛ぶ。#2822 からは本文を関数 `install.ps1` として定義し、
+    /// その名前をドットソースする（スコープは同じ。5.1 の最上位の `Write-Error` にインストーラの全文が
+    /// 出ない）。製品の既定の口（`args_for` = 3 系統の Windows のレシピ）で縛るので、`&` へ戻す変更は
+    /// ここが名指しで落とす
     #[test]
     fn issue2791_起動片はscriptblockをドットソースで走らせる() {
         let script = std::path::Path::new(WIN_SCRIPT_2790);
@@ -817,11 +826,12 @@ mod tests {
             let args = recipe(Platform::Windows, agent).runner.args_for(script);
             let decoded = decoded_2790(&args[5]);
             assert!(
-                decoded.starts_with("try { . ([scriptblock]::Create("),
-                "{who}: 起動片がドットソースでない（子スコープでは $script: の変数が最上位と別になる）: {decoded}"
+                decoded.contains("\n${function:install.ps1} = [scriptblock]::Create(")
+                    && decoded.contains("\n. install.ps1\n"),
+                "{who}: 起動片が本文の関数をドットソースしていない（子スコープでは $script: の変数が最上位と別になる。#2791 / #2822）: {decoded}"
             );
             assert!(
-                !decoded.contains("& ([scriptblock]"),
+                !decoded.contains("& ([scriptblock]") && !decoded.contains("& install.ps1"),
                 "{who}: 子スコープの呼び出しが残っている: {decoded}"
             );
         }

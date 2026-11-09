@@ -664,7 +664,7 @@ Phase 2 時点では `TAKO_MCP_URL` 以外の 4 つを `TerminalSession::spawn`�
   （ペインと子の PowerShell の Process スコープまで緩むため。グループポリシーで強制された AllSigned /
   Restricted にも負ける）。エージェント CLI の導入代行が取得した `install.ps1` を起こす形も同じ手
   （`platform::shell::powershell_script_text_args`。#2790・FR-2.33.1。#2791 から scriptblock はドットソースで
-  走らせる = `irm | iex` / `-File` と同じスコープ。agy の `install.ps1` の取得物の片付けが `$script:` に依る）。既知の制限: ペインの中で手で起こした
+  走らせる = `irm | iex` / `-File` と同じスコープ。agy の `install.ps1` の取得物の片付けが `$script:` に依る。#2822 から本文は関数 `install.ps1` として定義してその名前をドットソースし、捕捉中だけ pwsh 7 の色を止める = 失敗の文にインストーラ本文と色の符号を載せない。FR-2.33.1）。既知の制限: ペインの中で手で起こした
   入れ子の PowerShell には統合が入らない。残った `$PROFILE` のブロックは移行
   （`SchemaId::PowerShellProfile`）が取り除く。
   **読み込みは共有違反のときだけ読み直す**（#2659）: `ReadAllText` は他の書き手を許さない開き方なので、
