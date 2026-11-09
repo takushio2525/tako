@@ -37,7 +37,7 @@ fn fn_body<'a>(src: &'a str, rel: &str, name: &str) -> (&'a str, usize) {
         .unwrap_or_else(|| panic!("{rel} に fn {name} が無い（#2812）"));
     let rest = &src[start..];
     let end = rest.find("\n}\n").map(|i| i + 2).unwrap_or(rest.len());
-    let line = src[..start].lines().count() + 1;
+    let line = src[..start].matches('\n').count() + 1;
     (&rest[..end], line)
 }
 
@@ -125,7 +125,7 @@ fn issue2812_ゲートの包みは51でだけ呼び出し元を外す() {
     let decl = src
         .find("const POWERSHELL_51_FORGET_INVOCATION")
         .unwrap_or_else(|| panic!("{SHELL} に POWERSHELL_51_FORGET_INVOCATION が無い（#2812）"));
-    let decl_line = src[..decl].lines().count() + 1;
+    let decl_line = src[..decl].matches('\n').count() + 1;
     let rest = &src[decl..];
     // 値は `"; if …` で始まるので、終わりは `";` + 改行で探す
     let value = &rest[..rest.find("\";\n").map(|i| i + 2).unwrap_or(rest.len())];
@@ -224,7 +224,7 @@ fn issue2812_仕様が色の符号は残るへ戻っていない() {
         .map(|i| start + i)
         .unwrap_or(spec.len());
     let section = &spec[start..end];
-    let line = spec[..start].lines().count() + 1;
+    let line = spec[..start].matches('\n').count() + 1;
     assert!(
         !section.contains("色の符号は残る"),
         "{SPEC}:{line}: ゲートの節が「pwsh 7 の色の符号は残る」のまま。#2812 から平文化が除く"
