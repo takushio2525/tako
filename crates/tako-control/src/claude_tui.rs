@@ -907,8 +907,32 @@ fn ensure_bypass_accepted_at(path: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+/// #1886 の A/B（同一バイナリで修正前 = Windows でも作業 dir の文字列をそのまま鍵にする）
+pub const TRUST_KEY_LEGACY_ENV: &str = "TAKO_1886_LEGACY";
+
+/// claude が `.claude.json` の `projects` の鍵に使う作業 dir の形（#1886）。
+///
+/// Windows の claude は作業 dir の `\` を `/` にした形を鍵にする（CI のランナーで claude 2.1.319 が自分で書いた鍵は
+/// `C:/Users/…/work`、tako が書いていた鍵は同じパスの `C:\Users\…\work` で、違いは区切りだけだった）。
+/// `\` 区切りの鍵は信頼済みと読まれず、信頼の確認が出て、確認が通るまで hooks module（tako mod）も読まれない。
+/// unix はそのまま。判定は [`claude_project_key_in`]（OS と A/B を引数で受ける = macOS でも Windows の形を検査できる）
+pub fn claude_project_key(cwd: &str) -> String {
+    let legacy = std::env::var_os(TRUST_KEY_LEGACY_ENV).is_some_and(|v| !v.is_empty());
+    claude_project_key_in(cwd, cfg!(windows), legacy)
+}
+
+/// [`claude_project_key`] の本体。Windows は verbatim の前置き（`\\?\`）を剥がしてから `\` を `/` にする
+/// （claude の作業 dir は前置きを持たない）
+pub fn claude_project_key_in(cwd: &str, windows: bool, legacy: bool) -> String {
+    if !windows || legacy {
+        return cwd.to_string();
+    }
+    tako_core::platform::path::strip_verbatim_str(cwd).replace('\\', "/")
+}
+
 fn ensure_trusted_at(path: &Path, cwd: &str) -> Result<bool, TrustWriteError> {
     let shown = || path.display().to_string();
+    let key = claude_project_key(cwd);
     let mut root: serde_json::Value = match std::fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s).map_err(|e| TrustWriteError::Parse {
             path: shown(),
@@ -934,12 +958,12 @@ fn ensure_trusted_at(path: &Path, cwd: &str) -> Result<bool, TrustWriteError> {
             field: "projects".to_string(),
         })?;
     let entry = projects
-        .entry(cwd.to_string())
+        .entry(key.clone())
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .ok_or_else(|| TrustWriteError::FieldNotObject {
             path: shown(),
-            field: format!("projects.{cwd}"),
+            field: format!("projects.{key}"),
         })?;
     if entry
         .get("hasTrustDialogAccepted")
@@ -1613,6 +1637,37 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1886: Windows の claude は作業 dir の `\` を `/` にした形を `projects` の鍵にする（CI のランナーで
+    /// claude 2.1.319 が書いた鍵との突き合わせ）。verbatim の前置きは剥がす。unix と A/B はそのまま
+    #[test]
+    fn issue1886_windowsの事前信頼の鍵はclaudeの形に寄せる() {
+        let cwd = r"C:\Users\winuser\tako 1886 データ\work";
+        assert_eq!(
+            claude_project_key_in(cwd, true, false),
+            "C:/Users/winuser/tako 1886 データ/work"
+        );
+        assert_eq!(
+            claude_project_key_in(r"\\?\C:\Users\winuser\work", true, false),
+            "C:/Users/winuser/work"
+        );
+        assert_eq!(
+            claude_project_key_in("C:/Users/winuser/work", true, false),
+            "C:/Users/winuser/work",
+            "既に / 区切りならそのまま"
+        );
+        assert_eq!(
+            claude_project_key_in(cwd, true, true),
+            cwd,
+            "A/B は修正前の形"
+        );
+        assert_eq!(
+            claude_project_key_in("/work/proj", false, false),
+            "/work/proj"
+        );
+        // 書き込みの鍵は claude_project_key の 1 本（unix ではテストの鍵そのまま = 既存のテストの前提）
+        assert_eq!(claude_project_key("/work/proj"), "/work/proj");
     }
 
     #[test]

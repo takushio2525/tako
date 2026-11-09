@@ -101,10 +101,9 @@
     },
     {
       "key": "tako_events",
-      "status": "degraded",
-      "note_ja": "長ポーリングは named pipe でも HTTP MCP でも同じ受け口で待つ（Windows 実機の named pipe では未実測）。turn_changed は tako mod の報告から積むので、Windows で mod の報告を実測するまで（#1886）出るかは確かめていない。ターン状態は tako_orchestrator_worker_status（画面からの推定）で読める",
+      "status": "supported",
       "evidence": "unit-test",
-      "evidence_detail": "issue2731_events_long_poll の HTTP MCP の段（UI の受け口を読まない状態での長ポーリング・時間切れ・丸め・9 本目）と issue2731_events_no_body が Windows CI でも緑。named pipe の段は unix のソケットで確かめ、受け口（ipc::submit）は同じ"
+      "evidence_detail": "issue2731_events_long_poll の HTTP MCP の段（UI の受け口を読まない状態での長ポーリング・時間切れ・丸め・9 本目）と issue2731_events_no_body が Windows CI でも緑。#1886: Windows CI（windows-latest・build 26100）で本物の Claude Code 2.1.319 の mod の報告が名前付きパイプで ModHub::accept（turn_changed の書き手）へ届き（run 42624715941）、同じ実測（issue1886_windows_claude_loads_tako_mod_and_reports の inline の回）で、その名前付きパイプに製品の `tako events --kind turn_changed --wait-ms 30000` を待たせると上限まで待たずに最初のターンの移りで起きて返り（受け口は ipc::submit = UI の受け口を通らない）、積まれた turn_changed は報告のターンの移り（idle → permission → idle を含む・source=mod）と 1 対 1。実機の GUI での通しは未実測（#1886）"
     },
     {
       "key": "tako_fda",
@@ -288,9 +287,9 @@
     },
     {
       "key": "tako_mod",
-      "status": "pending",
-      "note_ja": "実装はプラットフォーム共通で macOS と同じ経路を通るが、Windows 実機での実測がまだ無い（動く見込み。失敗したらまずここを疑う）",
-      "evidence": "unverified"
+      "status": "supported",
+      "evidence": "unit-test",
+      "evidence_detail": "#1886: Windows CI（windows-latest・build 26100）で本物の Claude Code 2.1.319 を偽の Messages API へ向けて起こし（scripts/windows/test-claude-mod-1886.ps1 → issue1886_windows_claude_loads_tako_mod_and_reports。run 42624715941）、空白と日本語を含む data dir に展開した mod が env CLAUDE_CODE_PLUGIN_DIRS から読まれ（-p の init の plugins に展開先のパス）、既に値がある場合の `;` 連結では 2 本とも読まれ、`tako mod install`（claude の版は GUI と同じ bounded_claude_version で 2.1.319 と判定）が置いた <設定 dir>\\skills\\tako の写しからも読まれることを確認。ConPTY のペイン（command 直起動とペインの PowerShell 5.1 から打つ形）に渡した TAKO_PANE_ID / TAKO_CLI（空白と日本語を含むパス）/ TAKO_SOCKET / CLAUDE_CODE_PLUGIN_DIRS はシェルを経てもバイト一致で届き、mod → tako mod report → 名前付きパイプの報告が受け口に届いて mod_turn が idle → permission（pending_tool=Bash）→ idle（last_turn）と遷移し、/exit で ended が届く（注入しない対照は 0 本・mod_reason=ab_off）。Windows の区切りを `:` にする注入で `;` 連結の回だけが名指しで落ちる（run 42625653487）。信頼の確認が通るまで hooks module は読まれないので、tako の事前信頼の鍵を claude の形（`/` 区切り）へ寄せた（claude_tui::claude_project_key。修正前の形では確認が出る）。器（psmux）のペインと実機の GUI・本物のアカウントでの通しは未実測（#1886）"
     },
     {
       "key": "tako_move_pane_to_tab",
@@ -783,10 +782,9 @@
     },
     {
       "key": "tako_sessions",
-      "status": "degraded",
-      "note_ja": "会話カタログは動く（器の永続化 = persist が ON なら 30 秒ごとの走査が載せる）。新しい会話をおよそ 10 秒で載せる速い経路と、persist が OFF のときの唯一の書き手は tako mod の報告で、Windows の Claude Code が mod を読むかは未実測（#1886）。persist が OFF で mod の報告が届かないと、新しい会話はカタログに載らず `tako sessions show` で引けない（master / solo は記録が無く、worker は spawn の時点の記録のまま会話 ID と結ばれない）",
+      "status": "supported",
       "evidence": "measured",
-      "evidence_detail": "#877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑。resume のペイン起動そのものは未実測だが、経路は #867 で実機実測済みの launch と同じ。#2753（PR #2763）以後、カタログの書き手は persist ON の走査と tako mod の報告（persist OFF の唯一の書き手・新しい会話の前倒し）で、門は sessions::scan_plan の純関数（単体は OS を見ない）。mod の報告が Windows の Claude Code から届くかは #1886 で未実測"
+      "evidence_detail": "#877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑。resume のペイン起動そのものは未実測だが、経路は #867 で実機実測済みの launch と同じ。#2753（PR #2763）以後、カタログの書き手は persist ON の走査と tako mod の報告（persist OFF の唯一の書き手・新しい会話の前倒し）で、門は sessions::scan_plan の純関数（単体は OS を見ない）。#1886: session_id 入りの mod の報告が Windows の Claude Code 2.1.319 から名前付きパイプで届くことを Windows CI の ConPTY のペインで実測（run 42624715941・tako_mod の行と同じ検査）。persist が OFF で mod も無い（tako mod off・claude の版が下限未満・--bare / --safe-mode）と、master / solo は会話カタログに載らず、worker は spawn の時点の記録のまま会話 ID と結ばれない（OS 共通の依存）"
     },
     {
       "key": "tako_set_title",
