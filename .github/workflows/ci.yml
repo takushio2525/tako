@@ -702,6 +702,21 @@ jobs:
         if: needs.changes.outputs.agent_install == 'true'
         shell: pwsh
         run: pwsh -File scripts/windows/test-claude-git-bash-2433.ps1 -Tako target\debug\tako.exe
+      # #1886: Windows の Claude Code が tako mod を読み、mod → `tako mod report`（TAKO_CLI の絶対パス）→ 名前付きパイプの
+      # IPC → tako の受け取り（mod_turn）まで通るか、ConPTY のペインへの env 注入が効くかを、本物の claude で見張る。
+      # 製品の口（`tako setup bootstrap install`）で砂場へ入れ、偽の Messages API（lib/fake-anthropic-2433.ps1）へ向けて、
+      # GUI と同じ部品（展開・注入の 3 段・ConPTY・IpcServer・ModHub）で組んだテスト
+      # （crates/tako-control/tests/issue1886_claude_mod_windows.rs）を --ignored で名指しで回す。組み合わせは
+      # env だけ / env の ; 連結 + ペインの PowerShell から打つ / skills/tako の写しだけ / 注入しない対照（どれも空白と
+      # 日本語を含むパス）。ユーザー環境変数 Path は finally で戻す。全数より手前に名指しで置く（#1282 と同じ理由）。
+      # **外部（claude.ai）から取るので、#2433 の段と同じ条件（agent_install）でだけ走らせる**（mod・展開と注入・写し・
+      # mod_turn を組む関数の変更も agent_install に当たる = ci-change-scope.sh）。
+      # **上流の claude が CLAUDE_CODE_PLUGIN_DIRS や skills の読み方・mod の API を変える・tako の注入の区切りや
+      # CLI のパス・名前付きパイプの配線が崩れたらここで落ちる**
+      - name: Windows の claude が tako mod を読み報告が tako へ届くことの実走検査（#1886。env の ; 連結・skills/tako・ConPTY）
+        if: needs.changes.outputs.agent_install == 'true'
+        shell: pwsh
+        run: pwsh -File scripts/windows/test-claude-mod-1886.ps1 -Tako target\debug\tako.exe
       # #2433: Windows の任意依存の導入代行（winget）の断りと同意の検査。偽の winget（winget.cmd）を砂場の PATH の先頭に
       # 置いて終了コードを注入し、製品の口（tako setup deps install = MCP tako_setup_deps と同じ setup_deps::install_in）が
       # UAC の取り消し・取得元に届かない・winget が古い・途中の失敗・winget が無い・A/B を日本語の断りで言うこと、

@@ -211,13 +211,6 @@ pub mod notes {
         "In psmux container panes, modified Enter (S-Enter / C-Enter / M-Enter in keys, and Shift / Ctrl / Alt+Enter in the GUI) is sent as ESC CR (Alt+Enter). Claude Code treats it as a newline, but the Shift / Ctrl / Alt distinction is lost, because psmux does not pass CSI u through to the inner app (#729). Panes without a container keep CSI u. Whether it reaches claude as a newline through a real psmux 3.3.7 has not been measured with the current implementation",
     );
 
-    /// #2753 以後、会話カタログの書き手は persist ON の走査と tako mod の報告。
-    /// Windows の Claude Code が mod を読むかは #1886 で未実測（#2768）
-    pub const WIN_SESSIONS_CATALOG_MOD: Note = Note::new(
-        "会話カタログは動く（器の永続化 = persist が ON なら 30 秒ごとの走査が載せる）。新しい会話をおよそ 10 秒で載せる速い経路と、persist が OFF のときの唯一の書き手は tako mod の報告で、Windows の Claude Code が mod を読むかは未実測（#1886）。persist が OFF で mod の報告が届かないと、新しい会話はカタログに載らず `tako sessions show` で引けない（master / solo は記録が無く、worker は spawn の時点の記録のまま会話 ID と結ばれない）",
-        "The session catalog works (with container persistence (persist) on, the 30-second scan catalogs conversations). The fast path that catalogs a new conversation within about 10 seconds, and the only writer while persist is off, is the tako mod report, and whether Claude Code on Windows loads the mod has not been measured (#1886). With persist off and no mod report, new conversations are not cataloged and `tako sessions show` cannot find them (master / solo have no record at all, and a worker keeps only its spawn-time record without a conversation ID)",
-    );
-
     /// #936 で検知と警告は動くようになった。バナーの「張り直す」はハーネス更新と同じ実装で、
     /// プロセスの終了要求（境界 B5 の制御側）は #1599 で Windows にも入った。
     /// 残る縮退は「強制終了になる」ことと、Windows 実機での通しが未実測なこと
@@ -947,13 +940,13 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_mod",
         macos: Support::Supported,
-        // 展開と env 注入（区切り `;` は単体テストで確認）は共通の経路だが、Windows の
-        // Claude Code が CLAUDE_CODE_PLUGIN_DIRS から mod を読むかは未実測（#1886）
-        windows: Support::Pending {
-            note: notes::WIN_UNVERIFIED,
-            issue: 1886,
-        },
-        windows_evidence: Evidence::Unverified,
+        // #1886: Windows CI のランナーで本物の Claude Code を起こし、GUI と同じ部品（展開・注入の 3 段・ConPTY・
+        // 名前付きパイプの IpcServer・ModHub）で読み込みから mod_turn まで実測した。常設の検査は ci.yml の
+        // agent_install の門の中（scripts/windows/test-claude-mod-1886.ps1）
+        windows: Support::Supported,
+        windows_evidence: Evidence::UnitTest(
+            "#1886: Windows CI（windows-latest・build 26100）で本物の Claude Code 2.1.319 を偽の Messages API へ向けて起こし（scripts/windows/test-claude-mod-1886.ps1 → issue1886_windows_claude_loads_tako_mod_and_reports。run 42624715941）、空白と日本語を含む data dir に展開した mod が env CLAUDE_CODE_PLUGIN_DIRS から読まれ（-p の init の plugins に展開先のパス）、既に値がある場合の `;` 連結では 2 本とも読まれ、`tako mod install`（claude の版は GUI と同じ bounded_claude_version で 2.1.319 と判定）が置いた <設定 dir>\\skills\\tako の写しからも読まれることを確認。ConPTY のペイン（command 直起動とペインの PowerShell 5.1 から打つ形）に渡した TAKO_PANE_ID / TAKO_CLI（空白と日本語を含むパス）/ TAKO_SOCKET / CLAUDE_CODE_PLUGIN_DIRS はシェルを経てもバイト一致で届き、mod → tako mod report → 名前付きパイプの報告が受け口に届いて mod_turn が idle → permission（pending_tool=Bash）→ idle（last_turn）と遷移し、/exit で ended が届く（注入しない対照は 0 本・mod_reason=ab_off）。Windows の区切りを `:` にする注入で `;` 連結の回だけが名指しで落ちる（run 42625653487）。信頼の確認が通るまで hooks module は読まれないので、tako の事前信頼の鍵を claude の形（`/` 区切り）へ寄せた（claude_tui::claude_project_key。修正前の形では確認が出る）。器（psmux）のペインと実機の GUI・本物のアカウントでの通しは未実測（#1886）",
+        ),
     },
     Feature {
         key: "tako_move_pane_to_tab",
@@ -1688,13 +1681,11 @@ pub const MATRIX: &[Feature] = &[
     Feature {
         key: "tako_sessions",
         macos: Support::Supported,
-        // #2768: Supported から下げた。#2753 以後、persist OFF のカタログの唯一の書き手と新しい
-        // 会話の前倒しは tako mod の報告で、Windows の Claude Code が mod を読むかは #1886 で未実測
-        windows: Support::Degraded {
-            note: notes::WIN_SESSIONS_CATALOG_MOD,
-        },
+        // #2768 で Degraded へ下げた理由（Windows の Claude Code が mod を読むか未実測）は #1886 の
+        // Windows CI の実測で解けたので戻した。mod への依存（persist OFF の唯一の書き手）は OS 共通
+        windows: Support::Supported,
         windows_evidence: Evidence::Measured(
-            "#877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑。resume のペイン起動そのものは未実測だが、経路は #867 で実機実測済みの launch と同じ。#2753（PR #2763）以後、カタログの書き手は persist ON の走査と tako mod の報告（persist OFF の唯一の書き手・新しい会話の前倒し）で、門は sessions::scan_plan の純関数（単体は OS を見ない）。mod の報告が Windows の Claude Code から届くかは #1886 で未実測",
+            "#877 で実機の session_id 解決（resolve_session_id_for_backend -> Some）を実測 + sessions の単体 14 本が実機で緑。resume のペイン起動そのものは未実測だが、経路は #867 で実機実測済みの launch と同じ。#2753（PR #2763）以後、カタログの書き手は persist ON の走査と tako mod の報告（persist OFF の唯一の書き手・新しい会話の前倒し）で、門は sessions::scan_plan の純関数（単体は OS を見ない）。#1886: session_id 入りの mod の報告が Windows の Claude Code 2.1.319 から名前付きパイプで届くことを Windows CI の ConPTY のペインで実測（run 42624715941・tako_mod の行と同じ検査）。persist が OFF で mod も無い（tako mod off・claude の版が下限未満・--bare / --safe-mode）と、master / solo は会話カタログに載らず、worker は spawn の時点の記録のまま会話 ID と結ばれない（OS 共通の依存）",
         ),
     },
     Feature {

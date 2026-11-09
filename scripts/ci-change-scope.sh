@@ -18,6 +18,8 @@
 #   Windows ジョブの「codex / agy の導入代行の実走検査」は外部（chatgpt.com / antigravity.google）から
 #   本物の install.ps1 と本体を取ってくるので、毎回走らせると外部の障害・遅延で関係の無い PR まで赤になる。
 #   「任意依存の導入代行の実走検査」（#2433。winget の取得元・GitHub Releases から psmux / Git を取る）も同じ判定に乗る。
+#   「claude が tako mod を読み報告が届くことの実走検査」（#1886。claude.ai から本物の claude を取る）も同じ判定に乗り、
+#   mod そのもの・展開と注入・写し・mod_turn を組む関数を変えたときも走る。
 #   変更されたパスが**どれか 1 つでも** AGENT_INSTALL に当たるときだけ agent_install=true。
 #   定期実行（schedule）と手動実行（workflow_dispatch）は上流の install.ps1 の形の変化を拾うため常に true。
 #   差分が空・取れない・想定外のイベントも true（走らせる側へ倒す。rust と同じ）
@@ -49,7 +51,7 @@ RUST_REQUIRED=(
   'docs/scripts/support-pages.mjs|対応状況ページの写しの書式と分類（gen-*-docs.mjs --check がこれで写しを作り直して突き合わせる）'
 )
 
-# 変えたら Windows で本物の install.ps1 / winget を走らせるパス（`パターン|理由`。#2791 / #2433）。
+# 変えたら Windows で本物の install.ps1 / winget を走らせるパス（`パターン|理由`。#2791 / #2433 / #1886）。
 # 外部から取る実走は、導入代行の経路そのもの・それを走らせる検査・この判定を変えたときだけ回す
 AGENT_INSTALL=(
   'crates/tako-core/src/platform/agent_install.rs|導入の手順（取得元・置き場・代行の可否・起こし方）'
@@ -62,7 +64,14 @@ AGENT_INSTALL=(
   'scripts/windows/test-agent-install-2791.ps1|実走の検査そのもの'
   'scripts/windows/lib/execution-policy.ps1|実走の検査が置くポリシーの 1 実装'
   'scripts/windows/test-claude-git-bash-2433.ps1|claude が Git Bash 無しで動くことの実走検査そのもの（#2433）'
-  'scripts/windows/lib/fake-anthropic-2433.ps1|その検査が claude を向ける偽の Messages API（#2433）'
+  'scripts/windows/lib/fake-anthropic-2433.ps1|その検査が claude を向ける偽の Messages API（#2433・#1886）'
+  'scripts/windows/test-claude-mod-1886.ps1|claude が tako mod を読み報告が届くことの実走検査そのもの（#1886）'
+  'crates/tako-control/tests/issue1886_claude_mod_windows.rs|その検査の本体（ConPTY・名前付きパイプ・ModHub。#1886）'
+  'crates/tako-core/claude-mod/*|その検査が本物の claude に読ませる mod そのもの（#1886）'
+  'crates/tako-core/src/claude_mod.rs|mod の展開と注入の env（区切りと連結。#1886）'
+  'crates/tako-core/src/claude_mod_install.rs|skills/tako の写し（#1886）'
+  'crates/tako-control/src/claude_mod_install.rs|写しを置く先と注入の断り（refine_injection。#1886）'
+  'crates/tako-control/src/claude_mod.rs|報告から mod_turn を組む関数（turn_json。#1886）'
   'installer/windows/lib/user-path.ps1|実走の検査がユーザー環境変数 Path を戻す 1 実装'
   'scripts/ci-change-scope.sh|この判定そのもの'
   '.github/workflows/ci.yml|実走の段の配線'

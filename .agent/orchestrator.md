@@ -727,7 +727,9 @@ MCP は `tako_orchestrator_layout` が同名パラメータで 1:1。
 
 1. **事前信頼**: spawn 時に `~/.claude.json` の `projects.<cwd>.hasTrustDialogAccepted` を
    立て、初回フォルダの信頼ダイアログ自体を出さない（ダイアログが送信プロンプトを
-   消費する問題の根治）。書けなかった場合もダイアログ検出 → Enter 承諾でフォールバック
+   消費する問題の根治）。書けなかった場合もダイアログ検出 → Enter 承諾でフォールバック。
+   Windows の claude は鍵を作業 dir の `\` を `/` にした形で持つので、鍵はその形で書く
+   （`claude_tui::claude_project_key`。#1886。`\` 区切りの鍵は信頼済みと読まれず、確認が通るまで tako mod も読まれない）
 2. **貼り付けと送信の分離**: プロンプト本体は bracketed paste で入力欄へ貼り、送信の
    Enter は分離した単独キーとして遅延送信する（マルチラインもそのまま渡る。
    改行の 2 スペース平坦化は廃止）

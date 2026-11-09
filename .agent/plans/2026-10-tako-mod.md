@@ -428,8 +428,8 @@ S1〜S6 には入れない。
 - 既存のマス（`master_ctx_percent` / `worker_limit_detect` / `worker_permission_dialog` /
   `worker_status_detect`）は claude 列が既に Supported なので変えない。S2 で根拠欄に
   「mod があれば一次ソース、無ければ画面」と書き足す
-- OS 軸（`platform::support`）: Windows は Pending（#1886。#467 との接点。区切り `;` の単体テストは
-  S1 で入れるが、実機の Claude Code で mod が動くかは未実測）
+- OS 軸（`platform::support`）: Windows は Supported（#1886 で Windows CI の実測 = §8。器（psmux）のペインと
+  実機の GUI・本物のアカウントでの通しは未実測で #1886 に残す）
 
 ## 5. mod の作りの規約（S1 で `crates/tako-core/claude-mod/` に入れるときに守る）
 
@@ -650,7 +650,21 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
     `disableAllHooks` と組織の `allowManagedModsOnly` は見分けない（設定の層が cwd に依る・後者は未実測 = §9.9）ので
     `not_loaded` にまとめる
 - 版 2.1.287〜2.1.293 は未実測（下限を 2.1.294 にした理由）
-- Windows の Claude Code で mod（と `CLAUDE_CODE_PLUGIN_DIRS` の `;` 区切り）が動くかは未実測
+- **Windows（#1886 で Windows CI に常設。2026-11-09・claude 2.1.319）**: 実機が無いので windows-latest のランナーで
+  本物の claude を偽の Messages API（`scripts/windows/lib/fake-anthropic-2433.ps1`）へ向けて起こし、GUI を立てずに
+  GUI と同じ部品で組んだ（`crates/tako-control/tests/issue1886_claude_mod_windows.rs`。展開 `install_in`・注入の 3 段
+  `ModHub::decide` → `refine_injection` → `pane_env`・ConPTY の `TerminalSession`・名前付きパイプの `IpcServer::start_at`・
+  受けた報告は `parse_report` → `ModHub::accept` → `turn_json`）。結果: env の展開先（空白と日本語を含む data dir）から
+  読まれる・既に値がある場合の `;` 連結で 2 本とも読まれる・`tako mod install`（claude の版の判定は GUI と同じ
+  `bounded_claude_version`）が置いた `skills\tako` の写しから読まれる（-p の init の `plugins` のパスで出どころを確認）・
+  ConPTY のペイン（command 直起動とペインの PowerShell 5.1 から打つ形）へ渡した env がバイト一致で届く・報告が
+  名前付きパイプで届き `mod_turn` が idle → permission（`pending_tool=Bash`・classic 系も届く）→ idle（`last_turn`）・
+  `/exit` で ended・注入しない対照は 0 本。**罠 2 つ**: (1) 信頼の確認が通るまで hooks module は読まれない
+  （debug の記録 `hooks modules not loaded until workspace trust is accepted`）。Windows の claude は `projects` の鍵を
+  作業 dir の `\` を `/` にした形で持ち、tako の事前信頼の `\` 区切りの鍵は信頼済みと読まれなかった → 事前信頼の鍵を
+  claude の形へ寄せた（`claude_tui::claude_project_key`。A/B `TAKO_1886_LEGACY=1`）。(2) 2.1.319 の対話の既定は
+  auto mode で、偽の API の経路ではサーバ側の安全確認が通らず標準でない確認が出る（測るときは
+  `--permission-mode default`）。残り: 器（psmux）のペインの `update-environment` 経由・実機の GUI・本物のアカウント
 - desktop / VS Code 拡張 / Remote Control の surface は未実測（tako のペインは terminal だけなので
   S1〜S5 には影響しない）
 - `$.mcp.connect` で mod 自身の manifest に tako の MCP を書けば、`tako setup-mcp` 無しでも tako の

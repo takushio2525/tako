@@ -383,11 +383,16 @@ for p in crates/tako-core/src/platform/agent_install.rs crates/tako-core/src/pla
   crates/tako-control/src/setup_refusal.rs crates/tako-core/tests/issue2791_agent_install_windows.rs \
   installer/windows/lib/user-path.ps1 crates/tako-control/src/setup_deps.rs \
   scripts/windows/test-deps-install-2433.ps1 scripts/windows/test-claude-git-bash-2433.ps1 \
-  scripts/windows/lib/fake-anthropic-2433.ps1; do
+  scripts/windows/lib/fake-anthropic-2433.ps1 \
+  scripts/windows/test-claude-mod-1886.ps1 crates/tako-control/tests/issue1886_claude_mod_windows.rs \
+  crates/tako-core/claude-mod/hooks/register.ts crates/tako-core/claude-mod/.claude-plugin/plugin.json \
+  crates/tako-core/src/claude_mod.rs crates/tako-core/src/claude_mod_install.rs \
+  crates/tako-control/src/claude_mod_install.rs crates/tako-control/src/claude_mod.rs; do
   assert_eq "実走を走らせる: ${p}" "$(classify_agent "${p}"$'\n')" "agent_install=true"
 done
 for p in crates/tako-core/src/lib.rs crates/tako-cli/src/setup.rs scripts/windows/test-install-execution-policy-2790.ps1 \
-  docs/a.md crates/tako-core/src/platform/shell.rs.bak crates/tako-core/src/platform/agent_install_x.rs; do
+  docs/a.md crates/tako-core/src/platform/shell.rs.bak crates/tako-core/src/platform/agent_install_x.rs \
+  crates/tako-core/src/claude_mod_ui.rs crates/tako-control/src/claude_mod_ui.rs; do
   assert_eq "実走は skip: ${p}" "$(classify_agent "${p}"$'\n')" "agent_install=false"
 done
 assert_eq "docs だけ + 導入代行のパス → 両方走らせる" "$(printf 'docs/a.md\nscripts/windows/lib/execution-policy.ps1\n' | bash "${SCOPE_SH}" classify 2>/dev/null | tr '\n' ' ')" "agent_install=true rust=true "
@@ -410,6 +415,10 @@ agent_wiring_problems() {
   body="$(step_body "${yml}" "Git Bash 無しで動くことの実走検査（#2433")"
   [[ -n "${body}" ]] || echo "windows: #2433 の実走の段が無い"
   grep -qF "if: needs.changes.outputs.agent_install == 'true'" <<<"${body}" || echo "windows: #2433 の実走の段が条件なしで毎回走る（agent_install の if が無い）"
+  body="$(step_body "${yml}" "tako mod を読み報告が tako へ届くことの実走検査（#1886")"
+  [[ -n "${body}" ]] || echo "windows: #1886 の実走の段が無い"
+  grep -qF "if: needs.changes.outputs.agent_install == 'true'" <<<"${body}" || echo "windows: #1886 の実走の段が条件なしで毎回走る（agent_install の if が無い）"
+  grep -qF 'scripts/windows/test-claude-mod-1886.ps1 -Tako target\debug\tako.exe' <<<"${body}" || echo "windows: #1886 の実走の段が検査のスクリプトを製品の tako.exe で呼んでいない"
   body="$(step_body "${yml}" "導入代行の起こし方の実行検査（#2790")"
   grep -qE '^        if:' <<<"${body}" && echo "windows: #2790 の偽物の段が判定で止まる（外部に依らないので毎回走らせる）"
   body="$(job_body "${yml}" changes)"
@@ -423,6 +432,13 @@ grep -vF "if: needs.changes.outputs.agent_install == 'true'" "${CI_YML}" > "${TM
 probs="$(agent_wiring_problems "${TMP}/ci-agent-noif.yml")"
 assert_has "（注入）実走の段の if が無いことを名指しする" "windows: #2791 の実走の段が条件なしで毎回走る" "${probs}"
 assert_has "（注入）#2433 の実走の段の if が無いことを名指しする" "windows: #2433 の実走の段が条件なしで毎回走る" "${probs}"
+assert_has "（注入）#1886 の実走の段の if が無いことを名指しする" "windows: #1886 の実走の段が条件なしで毎回走る" "${probs}"
+grep -vF 'scripts/windows/test-claude-mod-1886.ps1' "${CI_YML}" > "${TMP}/ci-no1886.yml"
+probs="$(agent_wiring_problems "${TMP}/ci-no1886.yml")"
+assert_has "（注入）#1886 の実走の段が検査を呼ばないことを名指しする" "windows: #1886 の実走の段が検査のスクリプトを製品の tako.exe で呼んでいない" "${probs}"
+grep -vF 'tako mod を読み報告が tako へ届くことの実走検査（#1886' "${CI_YML}" > "${TMP}/ci-no1886-step.yml"
+probs="$(agent_wiring_problems "${TMP}/ci-no1886-step.yml")"
+assert_has "（注入）#1886 の実走の段を消したことを名指しする" "windows: #1886 の実走の段が無い" "${probs}"
 awk '{ print } /導入代行の起こし方の実行検査（#2790/ { print "        if: needs.changes.outputs.agent_install == '"'"'true'"'"'" }' "${CI_YML}" > "${TMP}/ci-2790-if.yml"
 probs="$(agent_wiring_problems "${TMP}/ci-2790-if.yml")"
 assert_has "（注入）#2790 の段を絞ったことを名指しする" "windows: #2790 の偽物の段が判定で止まる" "${probs}"
