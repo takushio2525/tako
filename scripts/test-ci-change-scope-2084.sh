@@ -387,7 +387,8 @@ for p in crates/tako-core/src/platform/agent_install.rs crates/tako-core/src/pla
   scripts/windows/test-claude-mod-1886.ps1 crates/tako-control/tests/issue1886_claude_mod_windows.rs \
   crates/tako-core/claude-mod/hooks/register.ts crates/tako-core/claude-mod/.claude-plugin/plugin.json \
   crates/tako-core/src/claude_mod.rs crates/tako-core/src/claude_mod_install.rs \
-  crates/tako-control/src/claude_mod_install.rs crates/tako-control/src/claude_mod.rs; do
+  crates/tako-control/src/claude_mod_install.rs crates/tako-control/src/claude_mod.rs \
+  crates/tako-control/tests/issue2842_claude_version_windows.rs crates/tako-control/src/stale_binary.rs; do
   assert_eq "実走を走らせる: ${p}" "$(classify_agent "${p}"$'\n')" "agent_install=true"
 done
 for p in crates/tako-core/src/lib.rs crates/tako-cli/src/setup.rs scripts/windows/test-install-execution-policy-2790.ps1 \

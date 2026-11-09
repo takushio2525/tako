@@ -283,13 +283,39 @@ fn extract_version_via_cli(binary: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// #2842 の A/B: `TAKO_2842_LEGACY=1` は修正前と同じく、[`quick_claude_version`] が
+/// パスからしか版を読まない（Windows のランチャは実体のコピーなので `None` になる）
+pub const QUICK_VERSION_LEGACY_ENV: &str = "TAKO_2842_LEGACY";
+
+/// [`QUICK_VERSION_LEGACY_ENV`] が立っているか。呼ばれるたびに読む（起動時と背景の判定の 2 回だけ）
+fn quick_version_legacy() -> bool {
+    matches!(
+        std::env::var(QUICK_VERSION_LEGACY_ENV).ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
 /// 子プロセスを起こさずに claude の版を読む（#1879。tako mod の注入判定の控え）。
 ///
 /// PATH の走査と `~/.local/bin/claude`（ネイティブインストーラの既定の置き場。Finder から
-/// 起動した .app の PATH には入っていない）を stat し、symlink の先のパスから版を読むだけ。
-/// GUI の起動直後に復元するペインへも注入を効かせたいので、ここは UI スレッドで呼べる重さに保つ。
+/// 起動した .app の PATH には入っていない）を stat し、symlink の先のパスから版を読む。
+/// パスに版が無ければ実行ファイルの版リソース（境界 B16 の [`tako_core::platform::exe::file_version`]）を読む。
+/// Windows のランチャ `…\.local\bin\claude.exe` は symlink ではなく実体のコピーで、パスに版が入らない
+/// （#2842。修正前は `None` で、起動直後に作るペインの注入判定が「版が不明」へ落ちていた）。
+/// unix の境界は常に `None` を返すので、unix の答えは変わらない。
+/// GUI の起動直後に復元するペインへも注入を効かせたいので、ここは UI スレッドで呼べる重さに保つ
+/// （版リソースの読み取りは exe をデータとして写像して固定情報を引くだけで、子プロセスを起こさない）。
 /// 読めなければ `None`（[`bounded_claude_version`] を背景で回す）
 pub fn quick_claude_version() -> Option<String> {
+    quick_version_among(
+        &quick_candidates(),
+        quick_version_legacy(),
+        tako_core::platform::exe::file_version,
+    )
+}
+
+/// [`quick_claude_version`] が見る候補（PATH の各 dir の claude → `~/.local/bin/claude` の順）
+fn quick_candidates() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| {
             std::env::split_paths(&path)
@@ -302,15 +328,43 @@ pub fn quick_claude_version() -> Option<String> {
         candidates.push(home.join(".local").join("bin").join(CLAUDE_BIN));
     }
     candidates
+}
+
+/// 候補を前から見て、最初に版が読めたものを返す。版リソースの読み手は引数
+/// （テストで偽物に差し替え、macOS からも Windows の形を通す）
+fn quick_version_among(
+    candidates: &[PathBuf],
+    legacy: bool,
+    file_version: impl Fn(&Path) -> Option<String>,
+) -> Option<String> {
+    candidates
         .iter()
         .filter(|c| is_executable_file(c))
         .find_map(|c| {
             let real = tako_core::platform::path::canonicalize(c).ok()?;
-            version_from_segments(&path_segments(&real))
+            launcher_version(&real, legacy, &file_version)
         })
 }
 
+/// 実体のパス 1 つから版を読む（純粋関数）。パスの成分 → 版リソースの順で、
+/// `legacy`（#2842 の A/B）は版リソースを読まない
+fn launcher_version(
+    real: &Path,
+    legacy: bool,
+    file_version: &impl Fn(&Path) -> Option<String>,
+) -> Option<String> {
+    if let Some(version) = version_from_segments(&path_segments(real)) {
+        return Some(version);
+    }
+    if legacy {
+        return None;
+    }
+    file_version(real)
+}
+
 /// 上限つきで claude の版を判定する（#1879。[`quick_claude_version`] で読めないときに背景で 1 回）。
+/// Windows の `.local\bin\claude.exe` は #2842 から [`quick_claude_version`] の時点で読めるので、
+/// ここまで落ちるのは claude が PATH と `~/.local/bin` に無い・版リソースを持たない（npm の `claude.cmd` 等）とき。
 ///
 /// ランチャの探索（ログインシェルの `command -v`）と `claude --version` の起動はどちらも
 /// 上限を持つ経路（#1503）を通す。**background executor から呼ぶこと**
@@ -994,5 +1048,244 @@ mod tests {
             }
             None => assert!(launcher_path().is_none() || resolve_claude_symlink().is_none()),
         }
+    }
+
+    // ===== #2842: 起動時の版の控えは版リソースも読む =====
+
+    /// 置き場 `dir` に「実行できる claude」を 1 つ置く（中身は `bytes`）
+    fn place_claude(dir: &Path, bytes: &[u8]) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("置き場を作れる");
+        let bin = dir.join(CLAUDE_BIN);
+        std::fs::write(&bin, bytes).expect("claude を置ける");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        bin
+    }
+
+    /// パスに版が無い実体（Windows のランチャ = 実体のコピー）は版リソースから読む。
+    /// パスに版があれば版リソースは読まない。A/B（legacy）は修正前と同じく読まない
+    #[test]
+    fn パスに版が無ければ版リソースから読む_2842() {
+        use std::cell::Cell;
+        let reads = Cell::new(0);
+        let with_info = |_: &Path| {
+            reads.set(reads.get() + 1);
+            Some("2.1.319".to_string())
+        };
+        let launcher = Path::new(r"C:\Users\winuser\.local\bin\claude.exe");
+        assert_eq!(
+            launcher_version(launcher, false, &with_info).as_deref(),
+            Some("2.1.319"),
+            "quick_claude_version がパスに版の無い実体の版リソースを読んでいない（#2842）"
+        );
+        // 修正前（A/B）は読まない = Windows のランチャで None
+        assert_eq!(launcher_version(launcher, true, &with_info), None);
+        // パスに版があればそれを使い、版リソースは読まない（unix の symlink の先・Windows の versions\<版>）
+        let before = reads.get();
+        for path in [
+            "/Users/user/.local/share/claude/versions/2.1.300",
+            r"C:\Users\winuser\.local\share\claude\versions\2.1.300",
+        ] {
+            assert_eq!(
+                launcher_version(Path::new(path), false, &with_info).as_deref(),
+                Some("2.1.300"),
+                "{path}"
+            );
+        }
+        assert_eq!(reads.get(), before, "パスで読めたのに版リソースも読んだ");
+        // 版リソースを持たない・読めない exe は従来どおり None
+        assert_eq!(launcher_version(launcher, false, &|_: &Path| None), None);
+    }
+
+    /// 候補を前から見て、版の読めない候補（版リソースを持たない exe）は飛ばして次を見る。
+    /// 無い候補は版リソースを読みに行かない
+    #[test]
+    fn 版の読めない候補を飛ばして次の候補から読む_2842() {
+        use std::cell::RefCell;
+        let scratch = tako_core::test_residue::ScratchDir::new("stale-binary-2842");
+        let no_info = place_claude(&scratch.join("no-info"), b"no version resource");
+        let with_info = place_claude(&scratch.join("with info 版"), b"has version resource");
+        let missing = scratch.join("missing").join(CLAUDE_BIN);
+        let asked = RefCell::new(Vec::new());
+        // 版リソースを持つのは「with info 版」の置き場の実体だけ
+        let reader = |p: &Path| {
+            let dir = p
+                .parent()
+                .and_then(|d| d.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            asked.borrow_mut().push(dir.clone());
+            (dir == "with info 版").then(|| "2.1.319".to_string())
+        };
+        let candidates = [missing.clone(), no_info.clone(), with_info.clone()];
+        assert_eq!(
+            quick_version_among(&candidates, false, reader).as_deref(),
+            Some("2.1.319")
+        );
+        assert_eq!(
+            *asked.borrow(),
+            ["no-info", "with info 版"],
+            "無い候補の版リソースを読みに行った・候補の順に見ていない"
+        );
+        // 版リソースを持つ候補が無ければ None
+        assert_eq!(
+            quick_version_among(&[missing, no_info.clone()], false, reader),
+            None
+        );
+        // A/B は修正前と同じく None
+        assert_eq!(
+            quick_version_among(&[no_info, with_info], true, reader),
+            None
+        );
+    }
+
+    /// unix の答えは変わらない。境界の unix の腕は版リソースを持たない（常に `None`）ので、
+    /// 本物の読み手を通しても新旧（A/B）が同じ答えになる
+    #[cfg(unix)]
+    #[test]
+    fn unixの版の読み方は修正前と同じ_2842() {
+        let scratch = tako_core::test_residue::ScratchDir::new("stale-binary-2842-unix");
+        // ネイティブインストーラの形: bin/claude → share/claude/versions/2.1.300
+        let versions = scratch.join("share").join("claude").join("versions");
+        std::fs::create_dir_all(&versions).unwrap();
+        let real = place_claude(&versions, b"#!/bin/sh\n");
+        let real_versioned = versions.join("2.1.300");
+        std::fs::rename(&real, &real_versioned).unwrap();
+        let bin = scratch.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let link = bin.join(CLAUDE_BIN);
+        std::os::unix::fs::symlink(&real_versioned, &link).unwrap();
+        // パスに版が無い実体（symlink でない置き場）
+        let plain = place_claude(&scratch.join("plain"), b"#!/bin/sh\n");
+        let reader = tako_core::platform::exe::file_version;
+        assert_eq!(reader(&plain), None, "unix の境界が版リソースを返した");
+        for legacy in [false, true] {
+            assert_eq!(
+                quick_version_among(std::slice::from_ref(&link), legacy, reader).as_deref(),
+                Some("2.1.300"),
+                "legacy={legacy}"
+            );
+            assert_eq!(
+                quick_version_among(std::slice::from_ref(&plain), legacy, reader),
+                None,
+                "legacy={legacy}"
+            );
+            assert_eq!(
+                quick_version_among(&[plain.clone(), link.clone()], legacy, reader).as_deref(),
+                Some("2.1.300"),
+                "legacy={legacy}"
+            );
+        }
+    }
+
+    /// Windows の実ファイルで、版リソースを持つ exe からは版を読み、持たない・読めない exe は `None`。
+    /// 置き場には空白と日本語を含める（利用者名に空白・日本語がある PC の `~\.local\bin` と同じ形）
+    #[cfg(windows)]
+    #[test]
+    fn windowsは版リソースを持つexeから版を読み無ければnone_2842() {
+        let scratch = tako_core::test_residue::ScratchDir::new("stale-binary-2842-win");
+        let odd = scratch.join("空白 と 日本語");
+        let reader = tako_core::platform::exe::file_version;
+        // 版リソースを持つ exe（OS の cmd.exe を claude.exe の名前で置く）
+        let system = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot がある"))
+            .join("System32")
+            .join("cmd.exe");
+        let expected = reader(&system).expect("前提: cmd.exe は版リソースを持つ");
+        let with_info = place_claude(
+            &odd.join("with"),
+            &std::fs::read(&system).expect("cmd.exe を読める"),
+        );
+        // 版リソースを持たない exe（Rust のテストバイナリ自身。名前は問わないのでその場で使う）
+        let no_info = std::env::current_exe().expect("テストバイナリのパス");
+        assert_eq!(
+            reader(&no_info),
+            None,
+            "前提: テストバイナリは版リソースを持たない"
+        );
+        // 読めない exe（PE でない中身・0 バイト）
+        let garbage = place_claude(&odd.join("garbage"), b"MZ this is not a PE image");
+        let empty = place_claude(&odd.join("empty"), b"");
+
+        assert_eq!(
+            quick_version_among(std::slice::from_ref(&with_info), false, reader),
+            Some(expected.clone()),
+            "quick_claude_version が版リソースを持つ claude.exe から版を読んでいない（#2842）"
+        );
+        assert_eq!(
+            quick_version_among(std::slice::from_ref(&with_info), true, reader),
+            None,
+            "A/B（修正前）は版リソースを読まない"
+        );
+        for (name, path) in [
+            ("版リソース無し", &no_info),
+            ("PE でない", &garbage),
+            ("0 バイト", &empty),
+        ] {
+            assert_eq!(
+                quick_version_among(std::slice::from_ref(path), false, reader),
+                None,
+                "{name}: {}",
+                path.display()
+            );
+        }
+        // 読めない候補を飛ばして、版リソースを持つ候補まで進む
+        assert_eq!(
+            quick_version_among(&[garbage, empty, no_info, with_info], false, reader),
+            Some(expected)
+        );
+    }
+
+    /// 製品の口（env から候補を集める [`quick_claude_version`]）を通しで見る。PATH に claude が無く
+    /// `~/.local/bin` にだけある（ネイティブインストーラの直後・.app を Finder から起こした PATH と同じ形）。
+    /// unix は symlink の先のパスから新旧とも読め、Windows は実体のコピーなので新だけが読める
+    #[test]
+    fn 製品の口はホームのlocal_binから版を読む_2842() {
+        if tako_core::run_alone!(製品の口はホームのlocal_binから版を読む_2842) {
+            return;
+        }
+        let scratch = tako_core::test_residue::ScratchDir::new("stale-binary-2842-home");
+        let home = scratch.join("home 空白 と 日本語");
+        let local_bin = home.join(".local").join("bin");
+        #[cfg(unix)]
+        let (want_new, want_legacy) = {
+            let versions = home
+                .join(".local")
+                .join("share")
+                .join("claude")
+                .join("versions");
+            let real = place_claude(&versions, b"#!/bin/sh\n");
+            let real_versioned = versions.join("2.1.300");
+            std::fs::rename(&real, &real_versioned).unwrap();
+            std::fs::create_dir_all(&local_bin).unwrap();
+            std::os::unix::fs::symlink(&real_versioned, local_bin.join(CLAUDE_BIN)).unwrap();
+            (Some("2.1.300".to_string()), Some("2.1.300".to_string()))
+        };
+        #[cfg(windows)]
+        let (want_new, want_legacy) = {
+            let system = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot がある"))
+                .join("System32")
+                .join("cmd.exe");
+            place_claude(
+                &local_bin,
+                &std::fs::read(&system).expect("cmd.exe を読める"),
+            );
+            (tako_core::platform::exe::file_version(&system), None)
+        };
+        let empty_path = scratch.join("empty-path");
+        std::fs::create_dir_all(&empty_path).unwrap();
+        let _home = crate::test_home::HomeGuard::set(&home);
+        std::env::set_var("PATH", &empty_path);
+        std::env::remove_var(QUICK_VERSION_LEGACY_ENV);
+        assert!(want_new.is_some(), "前提: 置いた claude の版");
+        assert_eq!(
+            quick_claude_version(),
+            want_new,
+            "quick_claude_version が ~/.local/bin の claude の版を読んでいない（#2842）"
+        );
+        std::env::set_var(QUICK_VERSION_LEGACY_ENV, "1");
+        assert_eq!(quick_claude_version(), want_legacy, "A/B（修正前）の答え");
     }
 }

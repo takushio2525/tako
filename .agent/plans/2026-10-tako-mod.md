@@ -662,12 +662,18 @@ S2〜S5 は S1 の後なら並行できるが、`progress.md` の衝突（#1228�
   `/exit` で ended・注入しない対照は 0 本。同じ回で、ターンを始める前に製品の `tako events --kind turn_changed
   --wait-ms 30000`（#2731 の長ポーリング = FR-2.45）を同じ名前付きパイプで待たせると、上限まで待たずに最初の
   ターンの移りで起きて返り、出来事のバッファの turn_changed は報告のターンの移りと 1 対 1（source=mod）
-  → `tako_events` の Windows も Supported へ上げた。**罠 2 つ**: (1) 信頼の確認が通るまで hooks module は読まれない
+  → `tako_events` の Windows も Supported へ上げた。**罠 3 つ**: (1) 信頼の確認が通るまで hooks module は読まれない
   （debug の記録 `hooks modules not loaded until workspace trust is accepted`）。Windows の claude は `projects` の鍵を
   作業 dir の `\` を `/` にした形で持ち、tako の事前信頼の `\` 区切りの鍵は信頼済みと読まれなかった → 事前信頼の鍵を
   claude の形へ寄せた（`claude_tui::claude_project_key`。A/B `TAKO_1886_LEGACY=1`）。(2) 2.1.319 の対話の既定は
   auto mode で、偽の API の経路ではサーバ側の安全確認が通らず標準でない確認が出る（測るときは
-  `--permission-mode default`）。残り: 器（psmux）のペインの `update-environment` 経由・実機の GUI・本物のアカウント
+  `--permission-mode default`）。(3) Windows の `<home>\.local\bin\claude.exe` は symlink ではなく実体のコピーで、
+  パスに版が入らない。GUI の起動時の版の控え `quick_claude_version` はパスからしか読まず `None` を返し、背景の
+  `bounded_claude_version`（版リソース → `claude --version`）が返るまでに作るペイン（起動時の復元を含む）が
+  `claude_unknown` で注入されなかった → #2842 で、パスに版が無ければ exe の版リソース（境界 B16 の `exe::file_version`）を
+  読む形へ直した（A/B `TAKO_2842_LEGACY=1`）。本物の claude.exe での確認は同じ ps1 の段
+  （`crates/tako-control/tests/issue2842_claude_version_windows.rs`）。
+  残り: 器（psmux）のペインの `update-environment` 経由・実機の GUI・本物のアカウント
 - desktop / VS Code 拡張 / Remote Control の surface は未実測（tako のペインは terminal だけなので
   S1〜S5 には影響しない）
 - `$.mcp.connect` で mod 自身の manifest に tako の MCP を書けば、`tako setup-mcp` 無しでも tako の

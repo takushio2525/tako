@@ -18,14 +18,17 @@
          （MCP tako_setup_bootstrap と同じ setup_bootstrap::install_for）で入れ、空白と日本語を含む設定 dir へ
          `tako mod install`（MCP tako_mod の install と同じ run_action）で skills\tako の写しを置く。このとき claude の版を
          GUI と同じ bounded_claude_version で判定する（埋まらないと注入も写しも止まる）
-      2. 偽の Messages API（lib/fake-anthropic-2433.ps1）を立てる（認証は使わない）
-      3. crates/tako-control/tests/issue1886_claude_mod_windows.rs を --ignored で名指しで回す。テストは GUI と同じ
+      2. crates/tako-control/tests/issue2842_claude_version_windows.rs を --ignored で名指しで回す（#2842）。GUI の
+         起動時の版の控え quick_claude_version が、入れた claude.exe（symlink でない実体のコピー）から版を読むかを
+         claude --version と突き合わせる（起こすのは claude --version だけ）
+      3. 偽の Messages API（lib/fake-anthropic-2433.ps1）を立てる（認証は使わない）
+      4. crates/tako-control/tests/issue1886_claude_mod_windows.rs を --ignored で名指しで回す。テストは GUI と同じ
          部品（展開・注入の 3 段・ConPTY・名前付きパイプの IpcServer・ModHub）で組み、4 つの組み合わせ
          （env だけ / env の ; 連結 + ペインの PowerShell から打つ / skills/tako の写しだけ / 注入しない対照）で
          claude を起こして、報告の到着・mod_turn・ターン状態の遷移・/exit の ended を見る
-      4. 偽の API が受けた要求の要約を TAKO1886_API の行で残す
+      5. 偽の API が受けた要求の要約を TAKO1886_API の行で残す
 
-    結果はテストの TAKO1886_* の行と末尾の表で CI のログへ残る。ユーザー環境変数 Path（HKCU。導入が足す）は
+    結果はテストの TAKO1886_* / TAKO2842_* の行と末尾の表で CI のログへ残る。ユーザー環境変数 Path（HKCU。導入が足す）は
     finally で戻して、戻ったことまで確かめる。そのため GitHub Actions の使い捨てランナー以外では走らせない。
 
 .PARAMETER Tako
@@ -49,6 +52,7 @@ $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 . (Join-Path $RepoRoot 'installer/windows/lib/user-path.ps1')
 $FakeApi = Join-Path $PSScriptRoot 'lib/fake-anthropic-2433.ps1'
 $TestName = 'issue1886_windows_claude_loads_tako_mod_and_reports'
+$VersionTestName = 'issue2842_quick_claude_version_reads_real_claude_exe'
 
 if (-not (Test-Path -LiteralPath $Tako -PathType Leaf)) { throw "tako.exe が無い: $Tako（先に cargo build -p tako-cli）" }
 $TakoExe = (Resolve-Path -LiteralPath $Tako).ProviderPath
@@ -174,6 +178,25 @@ try {
         Fail '設定 dir に skills\tako の写し（管理印 .tako-managed）が置かれていない'
     }
     Write-Host "TAKO1886_MOD_INSTALL claude_version=$($installed.claude_version) min=$($installed.min_claude_version)"
+
+    # #2842: GUI の起動時の版の控え（quick_claude_version）が、この置き場の本物の claude.exe（symlink でない実体の
+    # コピー = パスに版が入らない）から版を読むか。PATH に無く ~\.local\bin にだけある形と PATH の先頭の形を製品の口で
+    # 呼び、claude --version と突き合わせる（修正前の腕 TAKO_2842_LEGACY=1 の答えと注入の判断も記録する）。
+    # 落ちても後ろの #1886 の実測は続ける（失敗は最後にまとめて出す）
+    $script:Stage = '版の読み取り（#2842）'
+    $env:TAKO_2842_CLAUDE_EXE = $ClaudeExe
+    $env:TAKO_2842_HOME = $Sandbox.Home
+    Push-Location $RepoRoot
+    try {
+        & cargo test -p tako-control --test issue2842_claude_version_windows -- --ignored --exact $VersionTestName --nocapture --test-threads=1
+        $versionExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+        foreach ($k in @('TAKO_2842_CLAUDE_EXE', 'TAKO_2842_HOME')) {
+            Remove-Item -LiteralPath "Env:$k" -ErrorAction SilentlyContinue
+        }
+    }
+    if ($versionExit -ne 0) { $failures += "[#2842 版の読み取り] $VersionTestName が終了コード $versionExit（上の TAKO2842_* の行を見る）" }
 
     $script:Stage = '偽の API'
     $fake = Start-FakeApi (Join-Path $RunRoot 'api')
