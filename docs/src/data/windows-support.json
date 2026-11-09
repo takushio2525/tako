@@ -755,6 +755,19 @@
       "evidence_detail": "項目 19（tako send）。非 ASCII は #907 で器の注入口へ迂回済み。#729: 修飾付き Enter の形はペインの器の能力 extended_keys（psmux = false）で選び、GUI の打鍵と keys が同じ tako_core::backend::modified_enter_bytes を通ることを tako-core / tako-control / tako-app の単体（CI の Windows ジョブでも走る）が固定。本物の psmux 3.3.7 での到達は未実測"
     },
     {
+      "key": "tako_send_input.attachments",
+      "status": "supported",
+      "evidence": "unit-test",
+      "evidence_detail": "#2824: Windows CI で、添付が対象ペインの作業ディレクトリの .tako-remote-uploads へ写り、送った本文にドライブ文字から始まり \\ で区切った写し先のパスが入る（日本語と空白を含むパスは \"…\" で囲む。verbatim の前置きは付けない）ことを実 ConPTY の子が受け取った本文で確認（issue2743_添付は置き場へ写し本文にパスを足して送る・issue2824_添付は日本語と空白を含むパスでも写り本文にそのパスが入る）。ダイアログ中・相対パス・無い・20 MB 超の断りも unix と同じ（issue2743_ダイアログ中の添付は写す前に断る）。置き場がジャンクションなら書かない（uploads::tests::置き場がジャンクションなら書かない）。MAX_PATH を超える作業ディレクトリでも写り本人だけの DACL が当たる（#2824 で境界 B32 の長いパスを直した。uploads::tests::長いパスの作業ディレクトリでも写して本人だけの形にする・platform::private_file::tests::issue2824_長いパスにも本人だけのdaclを当てる）。実機の Claude Code が添付の画像を読むかは #937 で未実測"
+    },
+    {
+      "key": "tako_send_input.keys",
+      "status": "degraded",
+      "note_ja": "器（psmux）のペインでは修飾付き Enter（keys の S-Enter / C-Enter / M-Enter と GUI の Shift / Ctrl / Alt+Enter）を ESC CR（Alt+Enter）へ畳んで送る。Claude Code では改行になるが、Shift / Ctrl / Alt の区別は失われる（psmux が CSI u を内側へ通さないため。#729）。器に包まれていないペインは CSI u のまま。本物の psmux 3.3.7 で claude に改行として届くかは今の実装では未実測",
+      "evidence": "unit-test",
+      "evidence_detail": "#2824: Windows CI の実 ConPTY（build 26100 の inbox の conhost）で、器なしのペインへ送った keys の語彙の全名前（Escape / Enter / 矢印 / Tab / Space / C-<英字> / 1 文字 / 修飾付き Enter）が、VT 入力の子（node / claude と同じ条件）に tako の書いたバイト列のまま届く（issue2824_keysの語彙は名前ごとに同じバイト列で子に届く・issue2743_keysは名前の順に届き知らない名前は何も送らない・issue729_keysの修飾付きenterは器がcsi_uを運べないペインへesc_crで届く）。ダイアログ中の断り・知らない名前 / 空の列の断りも unix と同じ（issue2743_ダイアログ中のkeysは断り選択を確定させない）。キーイベントで読む子（VT 入力を立てない Win32 のコンソールアプリ）には、ConPTY が CSI u の修飾付き Enter を落とし、ESC と次のキーが 1 回の読み取りに入ると Alt+そのキーへ畳む（issue2824_conptyのキーイベントは修飾付きenterを落としescと次のキーをaltへ畳む）。器（psmux）のペインは CI に psmux が無く未実測。実機の Claude Code で Esc が生成を止めるかは #937 で未実測"
+    },
+    {
       "key": "tako_session_restart",
       "status": "degraded",
       "note_ja": "引き継ぎ再起動は使える。ハーネス更新（会話を保ったまま CLI を建て直す）の終了要求は #1599 で Windows にも入ったが、Windows には穏当な終了要求が無いので CLI は後始末の機会なく強制終了（TerminateProcess）される。古い CLI が起こした子（MCP サーバ・背景のシェル）は tako がペインの中で止める（#2462。GUI のアプリは残す）が、器（psmux）のペインでは CLI だけが止まり子はペインを閉じるまで残る。終了 → シェルの復帰 → --resume の送達の通しは Windows 実機で未実測（#1067 / #1599）",
