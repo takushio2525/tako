@@ -1310,8 +1310,13 @@ pub struct InstallOptions {
 /// 取得したインストーラを実行する。
 ///
 /// 端末があるときは出力をそのまま流す（インストーラは進捗と TUI を出す）。
-/// GUI 内 dispatch から呼ばれたときは端末が無いので捕捉し、失敗時の診断へ回す
-fn run_installer(
+/// GUI 内 dispatch から呼ばれたときは端末が無いので捕捉し、失敗時の診断へ回す。
+///
+/// CLI（`tako setup bootstrap install`）と MCP（`tako_setup_bootstrap`）はどちらも [`install_for_typed`] から
+/// ここを通るので、断りの文（[`SetupRefusal::InstallerFailed`] の `log`）はこの 1 実装が組む。公開しているのは
+/// Windows の CI の検査（#2822 の `issue2822_install_ansi_windows`）が取得を挟まずに偽の `install.ps1` で
+/// 同じ文を確かめるため（取得元は外部なので、その段は #2791 と同じ条件でだけ走らせる）
+pub fn run_installer(
     agent: AgentKind,
     script: &Path,
     interactive: bool,

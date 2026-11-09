@@ -660,6 +660,21 @@ jobs:
       # **pwsh 7 の色の符号か 5.1 の包みの行が evidence へ戻ったらここで落ちる**
       - name: 受け入れゲートの evidence に色の符号と包みの行が載らないかの実行検査（#2812）
         run: cargo test -p tako-control --test issue2812_gate_ansi_windows -- --nocapture
+      # #2822: エージェント CLI の導入代行（tako setup bootstrap install = MCP tako_setup_bootstrap が通る
+      # setup_bootstrap::run_installer）へ偽の install.ps1 を渡し、実物の 5.1 と pwsh 7（PATH から WindowsPowerShell を
+      # 外して製品の解決を倒す）で失敗させる。断りの文に pwsh 7 の色の符号（ESC）が 1 バイトも残らないこと、5.1 の最上位の
+      # Write-Error でインストーラ本文が出ないこと、エラーの本文と終了コードが残ること、ネイティブの子の出力は変えないことを
+      # 見る。同じバイナリの TAKO_2822_LEGACY=1（修正前の形）と並べ、TAKO_2812_LEGACY との 4 通りも残す = A/B。
+      # 取得（外部）を挟まないので毎回走る。全数より手前に名指しで置く。--nocapture は結果の行（TAKO2822_*）をログへ残すため
+      # **pwsh 7 の色の符号か 5.1 のインストーラ本文が導入代行の断りの文へ戻ったらここで落ちる**
+      - name: 導入代行の失敗の文に色の符号とインストーラ本文が載らないかの実行検査（#2822）
+        run: cargo test -p tako-control --test issue2822_install_ansi_windows -- --nocapture
+      # #2822: 実行ペイン（platform::shell::run_pane_command）を ConPTY で実物の 5.1 と pwsh 7 から立て、利用者のコマンドの
+      # 最上位の Write-Error で 5.1 の包みの行が画面に出ないこと、利用者のコマンドの位置（At line:2）と終了コードが
+      # 変わらないこと、pwsh 7 の画面が新旧で同じことを見る。TAKO_2822_LEGACY=1 と並べる = A/B。外部に依らないので毎回走る。
+      # --nocapture は結果の行（TAKO2822_PANE*）をログへ残すため
+      - name: 実行ペインの画面に 5.1 の包みの行が出ないかの実行検査（#2822）
+        run: cargo test -p tako-core --test issue2822_run_pane_windows -- --nocapture
       # #2791: Windows の codex / agy の導入代行を、公式の install.ps1 を本当に走らせて確かめる（製品の口
       # `tako setup bootstrap install --agent codex|agy` = MCP tako_setup_bootstrap と同じ経路）。導入の前後の
       # status・入った置き場・agy の取得物が残らない（起動片のスコープ）を、ポリシーなし / HKCU Restricted /
