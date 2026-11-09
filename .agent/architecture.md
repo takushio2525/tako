@@ -363,6 +363,16 @@ resident なので減らない（減るのは仮想サイズだけ）。**バッ
   `issue1857_*` が旧経路では「クライアント: pid は居ない」で落ちる = 待っている間に流した
   端末の応答がクライアントの終わった後の PTY へ届く）。番犬は
   `pty_loop::tests::issue2114_*`（実 PTY を包み、合図を握って順序を必ず作る）
+- **登録より前に終わった子の `ChildExit` も落とさない**（#2729。Windows だけ）。Windows の
+  子の終了の合図（alacritty の `ChildExitWatcher`）は、子が終わった時点で poller への登録が
+  無ければ合図を内側のチャネルへ積むだけで **poller を起こさない**（読み取り側の
+  `UnblockedReader::register` は初回の登録で必ず 1 回起こすが、子の側にはその段が無い）。
+  ループは PTY を張った後に別スレッドで登録するので、すぐ終わる子（`cmd.exe /c exit 0`）が
+  登録より先に終わると `ChildExit` が永久に届かない（Windows CI の `tick_screens` のテストが
+  30 秒待って落ちた間欠）。tako は登録の直後に子のトークンの完了パケットを 1 つ置き
+  （`arm_child_event`）、子の腕が積まれた合図を拾う。unix は合図が SIGCHLD のパイプに残り
+  level の poll が登録の後に拾うので何もしない。A/B は `TAKO_2729_LEGACY=1`。番犬は
+  `pty_loop::tests::issue2729_*`（合図が積まれたのを見届けてからループへ渡し、順序を必ず作る）
 - 由来と改変内容の告知は `THIRD-PARTY-NOTICES.md`（Apache-2.0 → GPL-3.0-or-later は一方向互換）
 
 **「tako は使っていない」に見える段を落とさない**（#1707 の教訓）。#817 の移植は upstream の

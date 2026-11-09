@@ -27,11 +27,14 @@
 //! 伸びた分は `pty_read` の最後に初期サイズへ戻すので、一度混雑したペインが
 //! 1 MiB を抱えたままにはならない。
 //!
-//! 意図して変えたのは「子の終了を必ず `ChildExit` で知らせる」ための 1 点（#2114）:
-//! unix で書き込みが EIO（子の側 = スレーブが全部閉じた）になっても**ループを畳まない**。
-//! upstream はここで畳むので、子の終了の合図（SIGCHLD）より先に書き込みが失敗した回は
-//! `Pty` の drop が子を回収し、子の終了が誰にも届かない。tako は書けない入力を捨て、
-//! PTY の fd を監視から外して合図を待つ。
+//! 意図して変えたのは「子の終了を必ず `ChildExit` で知らせる」ための 2 点:
+//!
+//! - unix で書き込みが EIO（子の側 = スレーブが全部閉じた）になっても**ループを畳まない**（#2114）。
+//!   upstream はここで畳むので、子の終了の合図（SIGCHLD）より先に書き込みが失敗した回は
+//!   `Pty` の drop が子を回収し、子の終了が誰にも届かない。tako は書けない入力を捨て、
+//!   PTY の fd を監視から外して合図を待つ
+//! - Windows で PTY を監視へ登録した直後に、子の終了の合図を**1 度見に行く**（#2729。
+//!   [`arm_child_event`]）。登録より前に子が終わっていると、upstream の合図は誰も起こさない
 //!
 //! # 由来とライセンス
 //!
@@ -103,6 +106,36 @@ fn legacy_1628_skip_drain() -> bool {
 fn legacy_2114_break_on_closed_write() -> bool {
     std::env::var("TAKO_2114_LEGACY").is_ok_and(|v| v == "1")
 }
+
+/// A/B の旧経路アーム（`TAKO_2729_LEGACY=1`）。PTY を監視へ登録した直後に子の終了の合図を
+/// **見に行かない** = #2729 の前の形（upstream と同じ）へ戻す。検証専用で、既定では通らない
+fn legacy_2729_skip_child_arm() -> bool {
+    std::env::var("TAKO_2729_LEGACY").is_ok_and(|v| v == "1")
+}
+
+/// PTY を監視へ登録した直後に、子の終了の合図を 1 度見に行かせる（#2729）。
+///
+/// Windows の合図（alacritty の `ChildExitWatcher`）は、子が終わった時点で登録が無ければ
+/// `ChildEvent::Exited` を内側のチャネルへ積むだけで poller を起こさない（読み取り側の
+/// `UnblockedReader::register` は初回の登録で必ず 1 回起こすが、子の側にはその段が無い）。
+/// このループは PTY を張った後に別スレッドで登録するので、すぐ終わる子（`cmd.exe /c exit 0` は
+/// 数十 ms）が登録より先に終わると、積まれた合図を誰も読まず `ChildExit` が永久に届かない
+/// （Windows CI の `tick_screens` のテストが 30 秒待って落ちた形）。ここで子のトークンの
+/// 完了パケットを 1 つ置けば、ループの子の腕が `next_child_event` で積まれた合図を拾う
+/// （子が生きていれば `None` で何もしない = 余分に 1 回起きるだけ）。
+///
+/// unix は不要: 合図は SIGCHLD のパイプに 1 バイト残り、level の poll が登録の後に拾う
+#[cfg(windows)]
+fn arm_child_event(poll: &Poller) {
+    use polling::os::iocp::{CompletionPacket, PollerIocpExt};
+    let packet = CompletionPacket::new(PollingEvent::readable(PTY_CHILD_EVENT_TOKEN));
+    if let Err(err) = poll.post(packet) {
+        tracing::warn!("子の終了の合図を見に行けない（登録より前に終わった子は届かない）: {err}");
+    }
+}
+
+#[cfg(not(windows))]
+fn arm_child_event(_poll: &Poller) {}
 
 /// 注入（`TAKO_2114_INJECT_CHILD_EVENT_DELAY_MS=<ms>`）。子の終了の合図（SIGCHLD）を受けてから
 /// 処理するまでを指定の時間だけ遅らせる = 負荷の下で合図の処理が遅れた回を再現する。
@@ -413,6 +446,9 @@ pub struct PtyLoop<T: EventedPty, U: EventListener> {
     /// [`Msg::HangUpAndDrain`] を受けて抜けたときの子の pid と待つ上限（#2625）。
     /// **立つのは閉じる知らせで抜けたときだけ**（子の終了の腕・読み書きの失敗で抜けたら立たない）
     hang_up: Option<(u32, Duration)>,
+    /// 登録の直後に子の終了の合図を見に行くか（#2729。[`arm_child_event`]）。
+    /// 既定は真・`TAKO_2729_LEGACY=1` で偽（テストは値で渡す = #2395）
+    arm_child: bool,
     /// PTY の親側の fd（#2803。[`Self::with_master_fd`] で渡す）。持ち主は `pty` で、`pty` を落とすまで有効。
     /// 読み捨てが上限を過ぎたときに回線を切る（[`Self::hang_up_line`]）ためだけに使う
     #[cfg(unix)]
@@ -441,9 +477,17 @@ where
             event_proxy,
             wakeup_pending,
             hang_up: None,
+            arm_child: !legacy_2729_skip_child_arm(),
             #[cfg(unix)]
             master_fd: None,
         })
+    }
+
+    /// 登録の直後に子の終了の合図を見に行くかを値で決める（#2729 の A/B をテストが env なしで渡す）
+    #[cfg(all(test, windows))]
+    fn with_child_arm(mut self, on: bool) -> Self {
+        self.arm_child = on;
+        self
     }
 
     /// PTY の親側の fd を渡す（#2803）。`fd` は `pty` が持つ親側の fd でなければならない
@@ -749,6 +793,10 @@ where
                 if let Err(err) = unsafe { self.pty.register(&self.poll, interest, poll_opts) } {
                     tracing::error!("PTY イベントループの登録に失敗した: {err}");
                     return;
+                }
+                // #2729: 登録より前に子が終わっていた回も、子の腕が積まれた合図を拾う
+                if self.arm_child {
+                    arm_child_event(&self.poll);
                 }
 
                 let mut events =
@@ -1356,5 +1404,185 @@ mod tests {
             "ChildExit の後はループが畳まれる"
         );
         assert_eq!(ps_stat(pid), None, "子は回収済み");
+    }
+
+    /// #2729 の単体テスト用の部品（Windows）。登録より前に積まれた子の終了の合図を預かる PTY
+    #[cfg(windows)]
+    mod exited_first {
+        use super::*;
+        use alacritty_terminal::term::{test::TermSize, Config, Term};
+        use alacritty_terminal::tty::{self, EventedReadWrite, Options, Pty, Shell};
+
+        /// 子の終了の合図をテストが先に読み取って預かる PTY。預かった合図は次の
+        /// `next_child_event` で返す（= 合図は積まれているが、誰も poller を起こしていない形）
+        struct ExitedFirst {
+            inner: Pty,
+            pending: Option<ChildEvent>,
+        }
+
+        impl EventedReadWrite for ExitedFirst {
+            type Reader = <Pty as EventedReadWrite>::Reader;
+            type Writer = <Pty as EventedReadWrite>::Writer;
+
+            unsafe fn register(
+                &mut self,
+                poll: &Arc<Poller>,
+                interest: PollingEvent,
+                mode: PollMode,
+            ) -> io::Result<()> {
+                // Safety: 呼び手の約束（登録元は deregister まで生きる）をそのまま引き継ぐ
+                unsafe { self.inner.register(poll, interest, mode) }
+            }
+
+            fn reregister(
+                &mut self,
+                poll: &Arc<Poller>,
+                interest: PollingEvent,
+                mode: PollMode,
+            ) -> io::Result<()> {
+                self.inner.reregister(poll, interest, mode)
+            }
+
+            fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
+                self.inner.deregister(poll)
+            }
+
+            fn reader(&mut self) -> &mut Self::Reader {
+                self.inner.reader()
+            }
+
+            fn writer(&mut self) -> &mut Self::Writer {
+                self.inner.writer()
+            }
+        }
+
+        impl EventedPty for ExitedFirst {
+            fn next_child_event(&mut self) -> Option<ChildEvent> {
+                self.pending
+                    .take()
+                    .or_else(|| self.inner.next_child_event())
+            }
+        }
+
+        impl event::OnResize for ExitedFirst {
+            fn on_resize(&mut self, window_size: WindowSize) {
+                self.inner.on_resize(window_size);
+            }
+        }
+
+        /// 端末のイベントをそのまま流す受け手
+        #[derive(Clone)]
+        struct Chan(mpsc::Sender<Event>);
+
+        impl EventListener for Chan {
+            fn send_event(&self, event: Event) {
+                let _ = self.0.send(event);
+            }
+        }
+
+        /// `cmd.exe /c exit 7` を ConPTY で起こし、**子の終了の合図が積まれたのを見届けてから**
+        /// ループへ渡す。返すのはループが送った `ChildExit`（届かなければ None）。
+        /// `arm` はループの [`PtyLoop::with_child_arm`]（偽 = #2729 の前の形）
+        pub(super) fn child_exit_after_late_register(
+            arm: bool,
+        ) -> Option<std::process::ExitStatus> {
+            let options = Options {
+                shell: Some(Shell::new(
+                    "cmd.exe".to_string(),
+                    vec!["/c".to_string(), "exit 7".to_string()],
+                )),
+                ..Options::default()
+            };
+            let window_size = WindowSize {
+                num_lines: 24,
+                num_cols: 80,
+                cell_width: 8,
+                cell_height: 16,
+            };
+            let mut pty = tty::new(&options, window_size, 0).expect("ConPTY を張れる");
+            let budget = crate::wait_budget::state_wait_budget(
+                Duration::from_secs(30),
+                crate::wait_budget::machine_busy(),
+            );
+            // 前提: まだ誰も登録していない PTY で、子の終了の合図が積まれる（= alacritty の合図は
+            // poller を起こさなかった）。時間ではなく合図そのもので待つ
+            let deadline = Instant::now() + budget;
+            let pending = loop {
+                if let Some(event) = pty.next_child_event() {
+                    break event;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "前提: 子（cmd.exe /c exit 7）の終了の合図が {budget:?} 以内に積まれない"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            assert!(
+                matches!(pending, ChildEvent::Exited(Some(_))),
+                "前提: 積まれた合図は終了コードつきの終了: {pending:?}"
+            );
+
+            let (tx, rx) = mpsc::channel();
+            let listener = Chan(tx);
+            let term = Arc::new(FairMutex::new(Term::new(
+                Config::default(),
+                &TermSize::new(80, 24),
+                listener.clone(),
+            )));
+            let pty = ExitedFirst {
+                inner: pty,
+                pending: Some(pending),
+            };
+            let event_loop = PtyLoop::new(term, listener, pty, Arc::new(AtomicBool::new(false)))
+                .expect("ループを作れる")
+                .with_child_arm(arm);
+            let sender = event_loop.channel();
+            let handle = event_loop.spawn();
+            // 届くのを状態で待つ（上限は安全弁。旧経路は何も起こされないので上限まで届かない）
+            let mut status = None;
+            while let Ok(event) = rx.recv_timeout(budget) {
+                if let Event::ChildExit(exit) = event {
+                    status = Some(exit);
+                    break;
+                }
+            }
+            // 届かなかった回（旧経路）もループを畳んで子と ConPTY を片付ける
+            let _ = sender.send(Msg::Shutdown);
+            handle.join().expect("PTY のスレッドが畳まれる");
+            status
+        }
+    }
+
+    /// #2729: Windows で、PTY を監視へ登録するより前に子が終わっていても `ChildExit` が届く。
+    ///
+    /// alacritty の `ChildExitWatcher` は、子が終わった時点で登録が無ければ合図をチャネルへ
+    /// 積むだけで poller を起こさない。CI ではループのスレッドの登録が遅れた回だけ当たり、
+    /// `tick_screens` のテストが `cmd.exe /c exit 0` の終わりを 30 秒待って落ちた。ここでは
+    /// **合図が積まれたのを見届けてから**ループへ渡し、その順を時間ではなく状態で必ず作る。
+    /// 修正前の形は下の `issue2729_旧経路は登録より前に終わった子のchildexitを落とす`（手元の A/B）
+    #[cfg(windows)]
+    #[test]
+    fn issue2729_登録より前に終わった子でもchildexitが届く() {
+        let status = exited_first::child_exit_after_late_register(true).expect(
+            "登録より前に終わった子の ChildExit が届かない（#2729: 子の合図を見に行っていない）",
+        );
+        assert_eq!(status.code(), Some(7), "子の終了コードがそのまま届く");
+    }
+
+    /// #2729 の A/B: 修正前の形（登録の後に子の合図を見に行かない = `TAKO_2729_LEGACY=1`）は
+    /// 登録より前に終わった子の `ChildExit` を落とす = 上の網が効いていることの確かめ。
+    ///
+    /// **CI からは外してある**（`#[ignore]`）: 届かないことは上限まで待たないと言えないので、
+    /// 1 回に状態待ちの上限（素の 30 秒）を使い切る。手元で
+    /// `cargo test -p tako-core --lib issue2729 -- --ignored` で回す
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "旧経路の A/B。上限まで待つので手元で --ignored で回す"]
+    fn issue2729_旧経路は登録より前に終わった子のchildexitを落とす() {
+        assert_eq!(
+            exited_first::child_exit_after_late_register(false),
+            None,
+            "旧経路でも届いた = 登録より前に終わった形を作れていない（網の前提が崩れている）"
+        );
     }
 }
