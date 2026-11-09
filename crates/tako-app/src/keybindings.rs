@@ -751,6 +751,25 @@ pub fn link_modifier_active(modifiers: &Modifiers) -> bool {
     )
 }
 
+/// 「修飾 + クリック / Enter」の主修飾キーが押されているか（Issue #1601）。
+///
+/// **キーバインド表に無い「修飾 + クリック / Enter」の判定は全部ここを通す**
+/// （ペイン / タブの × の確認スキップ・git のコミット確定・タスクの返答・設定の確定）。
+/// `Modifiers::platform` を直接見ると Windows では Win キーになり、Win+クリック /
+/// Win+Enter は OS が持っていて実質押せない（#1601 の症状）。
+///
+/// 判定の表そのものは `tako_core::platform::keys::platform_modifier_active`（純粋関数・
+/// リンクの [`link_modifier_active`] と同じ表）で、ここは GPUI の `Modifiers` をその引数へ
+/// 落とすだけの薄い層。**分岐をここへ書かない**。番犬は
+/// `crates/tako-control/tests/issue1601_platform_modifier_watchdog.rs`
+pub fn platform_modifier_active(modifiers: &Modifiers) -> bool {
+    tako_core::platform::keys::platform_modifier_active(
+        Platform::current(),
+        modifiers.platform,
+        modifiers.control,
+    )
+}
+
 /// リンクを開く修飾キーだけを立てた `Modifiers`（セルフテスト・検証の入力生成用）。
 ///
 /// 合成イベントで `platform: true` を直書きすると、**Windows のセルフテストだけが
@@ -2286,32 +2305,63 @@ mod tests {
         }
     }
 
-    /// #1203: platform 修飾（macOS = command / Windows = Win キー）を直接見ている
-    /// 操作は、非 macOS では**案内を出さない**こと。
+    /// #1601: バインド表に載っていない「修飾 + クリック」「修飾 + Enter」の修飾は
+    /// **両 OS で押せる打鍵**（macOS = command / Windows = Ctrl）を案内し、判定も同じ表を見る。
     ///
-    /// `shortcut_hint_for` が非 macOS の platform 修飾バインドを落とす規則と
-    /// 同じで、こちらはバインド表に載っていない「修飾 + クリック」「修飾 + Enter」用。
-    /// Win+クリック / Win+Enter は押せないので、案内すると嘘になる。
-    ///
-    /// **リンクを開く操作はここの対象外**（#763 で Windows 側を Ctrl へ移したので、
-    /// `keys::link_modifier` は両 OS とも表記を返す）
+    /// #1203 の時点では判定が GPUI の platform 修飾（Windows = Win キー）を直接見ていたので、
+    /// Windows は案内ごと落としていた（`platform_modifier` が `None`）。#1601 で判定を
+    /// `platform_modifier_active` へ寄せ、Windows を Ctrl へ移した（リンクの #763 と同じ表）
     #[test]
-    fn platform修飾の案内は非macosでは出ない() {
+    fn platform修飾の案内は両osで押せる打鍵を出す() {
         use tako_core::platform::keys;
-        assert!(keys::platform_modifier(Platform::MacOs).is_some());
-        assert_eq!(keys::platform_modifier(Platform::Windows), None);
-        assert_eq!(keys::modifier_enter(Platform::Windows), None);
+        assert_eq!(keys::platform_modifier(Platform::Windows).symbol, "Ctrl");
+        assert_eq!(keys::modifier_enter(Platform::Windows), "Ctrl+Enter");
+        assert_eq!(keys::modifier_click_prefix(Platform::Windows), "Ctrl+");
         // macOS 側は「バインド表の ⌘ と同じ記号」であること（記号がずれると
         // 同じ画面に ⌘ と Cmd が混在する）
         let cmd_k = Keystroke::parse("cmd-k").expect("cmd-k");
         let mac = format_keystroke_for(&cmd_k, Platform::MacOs);
-        let symbol = keys::platform_modifier(Platform::MacOs)
-            .expect("macOS")
-            .symbol;
+        let symbol = keys::platform_modifier(Platform::MacOs).symbol;
         assert!(
             mac.starts_with(symbol),
             "バインド表は {mac:?} と書くのに案内の修飾記号は {symbol:?} で食い違っている"
         );
+        // Windows 側も「バインド表が Ctrl と書く綴り」と同じ（`Ctrl+Shift+P` の `Ctrl`）
+        let ctrl_k = Keystroke::parse("ctrl-shift-p").expect("ctrl-shift-p");
+        let win = format_keystroke_for(&ctrl_k, Platform::Windows);
+        let symbol = keys::platform_modifier(Platform::Windows).symbol;
+        assert!(
+            win.starts_with(&format!("{symbol}+")),
+            "バインド表は {win:?} と書くのに案内の修飾記号は {symbol:?} で食い違っている"
+        );
+    }
+
+    /// #1601: 「修飾 + Enter」の確定は入力欄のキー処理が見る（バインド表には無い）。
+    /// バインド表が同じ打鍵（macOS = `cmd-enter` / Windows = `ctrl-enter`）を握っていると
+    /// 入力欄へ届かず、案内どおりに押しても確定しない。**両 OS の表**を macOS 上から見る
+    #[test]
+    fn 修飾_enterはバインド表に奪われない() {
+        for platform in [Platform::MacOs, Platform::Windows] {
+            let spec = match platform {
+                Platform::MacOs => "cmd-enter",
+                Platform::Windows => "ctrl-enter",
+            };
+            let want = Keystroke::parse(spec).expect("enter の打鍵");
+            let taken: Vec<String> = bindings_for(platform)
+                .iter()
+                .filter(|b| {
+                    let ks = b.keystrokes();
+                    ks.len() == 1
+                        && ks[0].inner().key == want.key
+                        && ks[0].inner().modifiers == want.modifiers
+                })
+                .map(|b| b.action().name().to_string())
+                .collect();
+            assert!(
+                taken.is_empty(),
+                "{platform:?}: {spec} をバインド表が握っている（入力欄の確定へ届かない）: {taken:?}"
+            );
+        }
     }
 
     /// #1203: 打鍵を含む案内文が Windows 構成で macOS の表記を出さないこと。
@@ -2328,17 +2378,12 @@ mod tests {
             // プレビューの保存ボタン
             crate::ui_text::preview::save_with_key(keys::save_preview(platform)),
             // git パネルのコミット入力欄
-            crate::ui_text::panel::git_commit_placeholder(
-                "main",
-                keys::modifier_enter(platform).as_deref(),
-            ),
+            crate::ui_text::panel::git_commit_placeholder("main", &keys::modifier_enter(platform)),
             // 設定の「settings.json 直接編集」
             crate::ui_text::settings::advanced_edit_help(keys::platform_modifier(platform)),
+            // 確認ダイアログのスキップ案内（#1601 で Windows も Ctrl+クリックで出る）
+            crate::ui_text::dialog::close_skip_hint(&keys::modifier_click_prefix(platform)),
         ];
-        // 確認ダイアログのスキップ案内（非 macOS では行ごと出ない）
-        if let Some(m) = keys::platform_modifier(platform) {
-            out.push(crate::ui_text::dialog::close_skip_hint(m.symbol));
-        }
         // `tako ui-mode` の next_step（CLI / MCP の機械可読な案内）
         if let Some(step) = TerminalReason::ModeTerminal.next_step_for(platform) {
             out.push(step.ja().to_string());
@@ -2372,6 +2417,49 @@ mod tests {
                 texts.iter().any(|t| t.contains("Ctrl+Shift+S")),
                 "保存の実キーが案内に出ていない: {texts:?}"
             );
+            // #1601: 「修飾 + Enter / クリック」の案内も落とさず Ctrl で出る
+            assert!(
+                texts.iter().any(|t| t.contains("Ctrl+Enter")),
+                "確定の Ctrl+Enter が案内に出ていない: {texts:?}"
+            );
+            assert!(
+                texts
+                    .iter()
+                    .any(|t| t.contains("Ctrl+クリック") || t.contains("Ctrl+click")),
+                "確認スキップの Ctrl+クリックが案内に出ていない: {texts:?}"
+            );
+        });
+    }
+
+    /// #1601: Windows の「修飾 + クリック / Enter」の案内の実文字列（macOS 上から組む）。
+    /// 修飾以外の文は macOS と同じ（下の `macosの案内文は従来の記号表記のまま` と対）
+    #[test]
+    fn windowsの修飾操作の案内はctrlで出る() {
+        crate::ui_text::tests_support::with_lang(tako_core::i18n::Lang::Ja, || {
+            let texts = key_hint_texts(Platform::Windows);
+            for expect in [
+                "メッセージ (Ctrl+Enter で \"main\" にコミット)",
+                "本文をクリックすると編集できる（Ctrl+Enter または 保存 で確定 / Esc で取消）",
+                "Ctrl+クリックで確認なしで閉じる",
+            ] {
+                assert!(
+                    texts.iter().any(|t| t == expect),
+                    "Windows の文言 {expect:?} が無い: {texts:?}"
+                );
+            }
+        });
+        crate::ui_text::tests_support::with_lang(tako_core::i18n::Lang::En, || {
+            let texts = key_hint_texts(Platform::Windows);
+            for expect in [
+                "Message (Ctrl+Enter to commit on \"main\")",
+                "Click the text to edit (Ctrl+Enter or Save to apply, Esc to cancel)",
+                "Ctrl+click closes without confirmation",
+            ] {
+                assert!(
+                    texts.iter().any(|t| t == expect),
+                    "Windows の英語文言 {expect:?} が無い: {texts:?}"
+                );
+            }
         });
     }
 

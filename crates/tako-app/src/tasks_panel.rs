@@ -1267,8 +1267,8 @@ impl TakoApp {
         cx: &mut Context<Self>,
     ) -> bool {
         match keystroke.key.as_str() {
-            // ⌘Enter で送る（git のコミット欄と同じ割り当て）
-            "enter" if keystroke.modifiers.platform => {
+            // ⌘Enter（Windows は Ctrl+Enter）で送る（git のコミット欄と同じ割り当て。#1601）
+            "enter" if crate::keybindings::platform_modifier_active(&keystroke.modifiers) => {
                 if let Some(id) = self.expanded_user_task_id() {
                     self.user_task_respond(&id, cx);
                 }

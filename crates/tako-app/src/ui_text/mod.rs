@@ -172,13 +172,20 @@ pub(crate) mod tests_support {
     /// macOS の platform 修飾（`⌘` / `Cmd`）。**正本から引く**（#1203。
     /// カタログテストへ記号を直書きすると、番犬が見張っている経路の外で
     /// 手書き表記が増えていく）
-    pub(crate) fn mac_modifier() -> Option<tako_core::platform::keys::ModifierLabel> {
+    pub(crate) fn mac_modifier() -> tako_core::platform::keys::ModifierLabel {
         tako_core::platform::keys::platform_modifier(tako_core::platform::support::Platform::MacOs)
     }
 
     /// macOS の「修飾 + Enter」表記（`Cmd+Enter`）
-    pub(crate) fn mac_modifier_enter() -> Option<String> {
+    pub(crate) fn mac_modifier_enter() -> String {
         tako_core::platform::keys::modifier_enter(tako_core::platform::support::Platform::MacOs)
+    }
+
+    /// macOS の「修飾 + クリック」の頭（`⌘`。#1601）
+    pub(crate) fn mac_click_prefix() -> String {
+        tako_core::platform::keys::modifier_click_prefix(
+            tako_core::platform::support::Platform::MacOs,
+        )
     }
 
     /// 判定は `tako_core::emoji::is_emoji` の 1 実装を通す（#1536）。

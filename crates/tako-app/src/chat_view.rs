@@ -3140,7 +3140,7 @@ impl TakoApp {
                         cx.stop_propagation();
                         this.close_pane_with_confirm(
                             pane_id,
-                            event.modifiers().platform,
+                            crate::keybindings::platform_modifier_active(&event.modifiers()),
                             CloseOrigin::PaneButton,
                             cx,
                         );

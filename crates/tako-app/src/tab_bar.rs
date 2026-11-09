@@ -698,7 +698,7 @@ impl TakoApp {
                                                         cx.stop_propagation();
                                                         this.close_tab_with_confirm(
                                                             id,
-                                                            event.modifiers().platform,
+                                                            crate::keybindings::platform_modifier_active(&event.modifiers()),
                                                             cx,
                                                         );
                                                     },

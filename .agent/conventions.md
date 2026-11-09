@@ -5829,14 +5829,14 @@ GPUI の `cmd` は platform 修飾で、Windows では **Win キー**へ解決�
   `save_preview` / `quit`）を引く。両者の一致は番犬
   `案内文の打鍵表記はバインド表と一致する` が **macOS / Windows の両方**について検査する
 - **バインド表に無い「修飾 + クリック」「修飾 + Enter」**（確認スキップ・コミット確定・
-  設定の確定）は `keys::platform_modifier` / `keys::modifier_enter` を引く。
-  **非 macOS は `None`** = その案内を出さない。Win+クリック / Win+Enter は押せないので、
-  表記を Windows 風に置き換えるのではなく**案内ごと落とす**のが正しい
-  （`shortcut_hint_for` が非 macOS の platform 修飾バインドを落とすのと同じ規則）
-- **リンクを開く「修飾 + クリック」だけは例外**で、`keys::link_click` /
-  `keys::link_modifier` が**両 OS とも表記を返す**（`Option` ではない）。#763 で
-  打鍵そのものを Windows は Ctrl へ移したので、案内を落とす理由が無い。
-  下の「リンクを開く修飾キー」節を見ること
+  タスクの返答・設定の確定）は `keys::platform_modifier` / `keys::modifier_enter` /
+  `keys::modifier_click_prefix` を引く。**両 OS とも表記を返す**（macOS = `⌘` / `Cmd`・
+  Windows = `Ctrl`。`Option` ではない）。判定も同じ表の `keys::platform_modifier_active` を
+  通すので、案内どおりに押せば効く。下の「「修飾 + クリック / Enter」の修飾キー」節を見ること
+  （#1203 の時点では判定が Win キーを見ていたので Windows は `None` = 案内ごと落としていた。
+  #1601 で判定を Ctrl へ移して揃えた）
+- **リンクを開く「修飾 + クリック」**も同じ表（`keys::link_click` / `keys::link_modifier` は
+  `platform_modifier` へ委ねる名前）。下の「リンクを開く修飾キー」節を見ること
 - 判定はすべて **`Platform` を引数に取る純粋関数**。`cfg!` で分けると
   「Windows でどう見えるか」を macOS の CI で押さえられない（#515 と同じ方針）。
   そのため `key_bindings()` の表も `cfg` をやめ、`bindings_for(platform)` が
@@ -5866,6 +5866,31 @@ OS のシェルに食われてユーザーはリンクへ到達できない（#7
   `platform: true` を直書きすると**実装だけ Ctrl へ移って Windows のセルフテストが落ちる**
 - 番犬は `crates/tako-control/tests/issue763_link_modifier_watchdog.rs`（4 規則:
   ホバー呼び出しの実引数 / クリック判定の `if` 条件 / マウスハンドラ本体 / 合成イベント）
+
+## 「修飾 + クリック / Enter」の修飾キー（Issue #1601）
+
+キーバインド表に無い「修飾 + クリック / Enter」の操作（ペイン / タブの × の確認スキップ・
+git のコミット確定・ユーザー向けタスクの返答・設定の複数行欄の確定）は
+**`keybindings::platform_modifier_active` を通す**。`Modifiers::platform` を直読みすると
+Windows では Win キーになり、Win+クリック / Win+Enter は OS が持っていて押せない。
+
+- 判定の正本は `tako_core::platform::keys::platform_modifier_active(platform, platform_key, control)`。
+  **macOS = command のみ / Windows = control のみ**で、リンク（#763）と**同じ表**
+  （`link_modifier_active` はここへ委ねる）。`platform || control` を素で書くのは駄目
+  （macOS の Ctrl+クリックは右クリック相当）
+- 表記は同じ表の `keys::platform_modifier`（記号 / 語）・`keys::modifier_enter`
+  （`Cmd+Enter` / `Ctrl+Enter`）・`keys::modifier_click_prefix`（`⌘` / `Ctrl+`。後ろへ
+  「クリック」を続ける 1 語の頭。macOS は #1203 からの `⌘クリック` のまま）。
+  案内を組む `ui_text` の関数は修飾を `Option` で受けない（Windows で案内を落とす経路を作らない）
+- MCP `tako_confirm_close` の説明はリンクと同じ `link_click()`（実行 OS の打鍵。
+  スナップショットは `<link-click>` に伏せて比べる）
+- 番犬は `crates/tako-control/tests/issue1601_platform_modifier_watchdog.rs`（4 規則:
+  確認スキップのクリックの実引数 / `"enter"` の腕 / control を素で混ぜない / 案内は同じ表から
+  実行 OS で引く）。判定の両 OS の答えは `keys` の単体、組み上がった文言の両 OS ぶんは
+  `keybindings::tests`（`windowsの修飾操作の案内はctrlで出る` / `macosの案内文は従来の記号表記のまま`）、
+  実画面は visual-test `TAKO_VISUAL_ONLY=modifier-hints-1601`（案内の 3 画面を `1601-*.png` へ書き出し、
+  × の主修飾 / それ以外の修飾と、設定の複数行欄の素の Enter / 主修飾ではない修飾 + Enter / 主修飾 + Enter を
+  窓の実の打鍵経路で押す。実行 OS の表で組むので macOS で回せば macOS の見た目と判定）
 
 ## MCP カタログの説明文は AI が使える情報だけ載せる（Issue #1540）
 

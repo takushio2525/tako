@@ -62,7 +62,7 @@ AI に「このコマンドを実行してください」と言われて、画�
 
 ## Windows で使う
 
-コマンドカードは **Windows 版でも使えます**。カードの表示と「新規ペインで実行」は Windows 実機で確かめていて、実行は PowerShell で行います。まだのものは次の 2 つです。
+コマンドカードは **Windows 版でも使えます**。カードの表示と「新規ペインで実行」は Windows 実機で確かめていて、実行は PowerShell で行います。Claude Code の画面の中に出るカード（tako mod）は、mod が Windows の Claude Code に読まれて tako へ報告が届くことを Windows の CI で確かめています。まだのものは次の 1 つです。
 
 <WindowsLimits
 	items={[
@@ -71,12 +71,6 @@ AI に「このコマンドを実行してください」と言われて、画�
 			title: 'スマホからの実行',
 			text: 'スマホからの接続（tako remote）そのものが、Windows 実機での通しの確認がまだです。',
 			tools: ['tako_remote_setup', 'tako_remote_start'],
-		},
-		{
-			kind: 'pending',
-			title: 'Claude Code の画面の中に出るカード（tako mod）',
-			text: '実装は macOS と共通ですが、Windows 実機での確認がまだです。',
-			tools: ['tako_mod'],
 		},
 	]}
 />
