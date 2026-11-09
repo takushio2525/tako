@@ -534,6 +534,13 @@ master は結果を確認してユーザーに報告する。
 （読み替え・フォールバックが起きたときは案内と `unset TAKO_PANE_ID` を表示する）。
 `tako solo` も同じ解決順。
 
+**新しいタブの起動行はシェルの準備を待って届く**（#2826）。`--tab`・呼び出し元不明のときは TabNew の
+直後に起動行を `Request::Send` で送る。作りたてのシェル（まだ最初のプロンプトを出していない）への
+改行つきの 1 行は dispatch が worker の spawn と同じ送達フロー（シェル準備待ち → エコー確認 → 分離 Enter）
+へ寄せる（判断は `tako_core::shell_send::shell_wait`。Windows の器 = psmux では即時に書くと全損した）。
+CLI 側は何も変えていない = 出力は従来と同じ。インライン起動（自分のペイン = プロンプトを出した
+シェル）は従来どおり即時に書く。詳細は `.agent/requirements.md` の FR-2.2.2 追補 5
+
 **default.yaml を読めなくても立てるが、黙らない**（#2227）。プロファイルの読み込みは
 `master_launch::load_profile` の 1 実装で、CLI・スマホの「+ master」・返答の配送（#1450）が
 同じ判定を通る。壊れた YAML・型違い・UTF-8 でない default.yaml では**組み込み既定で立てる**

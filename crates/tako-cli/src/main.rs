@@ -13517,6 +13517,9 @@ fn print_delivery(result: &Value) {
     if let Some(line) = delivery_line(result) {
         eprintln!("{line}");
     }
+    if let Some(line) = shell_wait_line(result) {
+        eprintln!("{line}");
+    }
     if let Some(line) = paste_guard_line(result) {
         eprintln!("{line}");
     }
@@ -13566,6 +13569,14 @@ fn paste_guard_line(result: &Value) -> Option<String> {
         g["verdict"].as_str().unwrap_or("?"),
         found.join(", ")
     ))
+}
+
+/// `tako send` が作りたてのシェルへの送信を送達フローへ寄せたときの 1 行（#2826。応答の
+/// `shell_wait` と同じ語彙 = `first_prompt` / `previous_flow`）。本文はシェルの準備を待ってから
+/// 送られるので、呼び手は待ちを重ねなくてよい
+fn shell_wait_line(result: &Value) -> Option<String> {
+    let reason = result.get("shell_wait")?.as_str()?;
+    Some(format!("[shell-wait] reason={reason}"))
 }
 
 /// `[delivery] …` の 1 行を組む（機械検証できるよう印字と分けてある）
@@ -15429,6 +15440,35 @@ mod tests {
             delivery_line(&serde_json::json!({ "delivery": serde_json::Value::Null })).is_none(),
             "null なら出さない"
         );
+    }
+
+    /// #2826: 作りたてのシェルへの送信を送達フローへ寄せた応答は `[delivery]` に続けて
+    /// `[shell-wait]` の 1 行を出す。即時に書いた応答（`null`）・TUI 向けの送達フローの応答には出さない
+    #[test]
+    fn issue2826_送達フローへ寄せた送信は_shell_waitの1行を出す() {
+        // dispatch の応答の形（積んだ応答は `queued_json` の 1 箇所で組む = delivery は queued）
+        let result = serde_json::json!({
+            "queued": true,
+            "pane": 7,
+            "delivery": tako_core::prompt_delivery::Status::queued().to_json(),
+            "shell_wait": "first_prompt",
+        });
+        assert_eq!(
+            shell_wait_line(&result).as_deref(),
+            Some("[shell-wait] reason=first_prompt")
+        );
+        assert_eq!(
+            delivery_line(&result).as_deref(),
+            Some("[delivery] state=queued elapsed=0s"),
+            "積んだ時点の delivery の行も出る"
+        );
+        assert!(shell_wait_line(&serde_json::Value::Null).is_none());
+        let tui = serde_json::json!({
+            "queued": true,
+            "pane": 7,
+            "delivery": tako_core::prompt_delivery::Status::queued().to_json(),
+        });
+        assert!(shell_wait_line(&tui).is_none());
     }
 
     #[test]

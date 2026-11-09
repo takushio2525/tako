@@ -17892,6 +17892,20 @@ fn queued_json(pane: Option<PaneId>, predecessor: Option<Value>) -> Value {
     })
 }
 
+/// 作りたてのペインへの送信を送達フローへ寄せた応答（#2826）。
+///
+/// `shell_wait` = 寄せた理由（`first_prompt` = まだ最初のプロンプトを出していない /
+/// `previous_flow` = 先に積んだ送達フローの後ろに並ぶ）。本文はシェルの準備を待ってから
+/// 送るので、呼び手は待ちを重ねなくてよい。`delivery` は積んだ時点の `queued` だけで、この経路の
+/// 顛末は `tako_read_pane` の `delivery` には出ない（TUI 向けの送達フローとは別の経路 = 結果は画面で見る）
+fn shell_wait_json(pane: PaneId, wait: tako_core::shell_send::ShellWait) -> Value {
+    // 積んだ応答の組み立ては `queued_json` の 1 箇所（#1292）。TUI 向けの送達フローの前任は
+    // この経路の前に並ばない（そちらが送達フローの決着を待つ = `hold_for_command_flow`）ので None
+    let mut out = queued_json(Some(pane), None);
+    out["shell_wait"] = Value::from(wait.as_str());
+    out
+}
+
 fn spawn_tmux_delivery(session: String, text: String, wait_ready: bool) {
     std::thread::spawn(move || {
         // #1259: 顛末の行に載せる経過（`経過=0s` と書くと嘘になる）
@@ -27390,6 +27404,37 @@ fn send_to_pane(
             let session = host
                 .session(target)
                 .ok_or(DispatchError::NoSession(target.as_u64()))?;
+            // #2826: 作りたての素のシェル（まだ最初のプロンプトを出していない）への改行つきの
+            // 1 行は、worker の spawn と同じ送達フロー（シェル準備待ち → エコー確認 → 分離 Enter）
+            // へ寄せる。即時に書くと器（psmux）が入力を読み始める前のバイトを落とす（Windows CI の
+            // 実測で全損）。器のペインは器のクライアント自身が代替画面に入るので、下の代替画面の
+            // 分岐より先に判断する（判断は `shell_send::shell_wait` の 1 実装。A/B は `TAKO_2826_LEGACY=1`）
+            if !tako_core::shell_send::legacy_2826() {
+                let backend = host.backend_session(target);
+                let facts = tako_core::shell_send::SendTarget {
+                    fresh_shell_age: host.fresh_shell_age(target),
+                    prompts: session.shell_marks().prompts,
+                    alt_screen: session.is_alt_screen(),
+                    container: backend.is_some(),
+                    flow_pending: host.command_flow_pending(target),
+                    exited: session.exit_status().is_some(),
+                    injects: crate::delivery::injection_target(
+                        backend.as_deref(),
+                        &normalize_newlines_for_keys(&text),
+                    )
+                    .is_some(),
+                };
+                if let Some(wait) = tako_core::shell_send::shell_wait(&text, newline, &facts) {
+                    crate::diag::flow_log(&format!(
+                        "送信を送達フローへ寄せた: pane={} 理由={} 長さ={}",
+                        target.as_u64(),
+                        wait.as_str(),
+                        text.len()
+                    ));
+                    host.queue_command_flow(target, text);
+                    return Ok(shell_wait_json(target, wait));
+                }
+            }
             if session.is_alt_screen() {
                 // Enter 単独送信（text が空 / 改行のみ）は送達確認つき Enter フローへ
                 // （Issue #95: 素の CR 1 発は claude TUI に取りこぼされることがあり、
@@ -31071,6 +31116,8 @@ mod tests {
         writes: Vec<(PaneId, String)>,
         /// #640: 送達確認つきで積まれた起動コマンド（pane, 本文）
         command_flows: Vec<(PaneId, String)>,
+        /// #2826: 素のシェルとして新しく起こしてからの経過（GUI の `fresh_shell_spawns` の代役）
+        fresh_shell_ages: std::collections::HashMap<u64, std::time::Duration>,
         /// #1006: 実 PTY のセッション（既存ペインの SSH 化は「素のシェルか」を
         /// セッションから判定するので、モックでは実物を持たせる）
         sessions: std::collections::HashMap<u64, TerminalSession>,
@@ -31233,6 +31280,7 @@ mod tests {
                 prompt_delivery_states: std::collections::HashMap::new(),
                 writes: Vec::new(),
                 command_flows: Vec::new(),
+                fresh_shell_ages: std::collections::HashMap::new(),
                 tmux_windows: std::collections::HashMap::new(),
                 backend_windows: std::collections::HashMap::new(),
                 backend_windows_refreshes: std::cell::Cell::new(0),
@@ -31349,6 +31397,12 @@ mod tests {
         }
         fn queue_command_flow(&mut self, pane: PaneId, command: String) {
             self.command_flows.push((pane, command));
+        }
+        fn fresh_shell_age(&self, pane: PaneId) -> Option<std::time::Duration> {
+            self.fresh_shell_ages.get(&pane.as_u64()).copied()
+        }
+        fn command_flow_pending(&self, pane: PaneId) -> bool {
+            self.command_flows.iter().any(|(p, _)| *p == pane)
         }
         fn detach_session(&mut self, pane: PaneId, origin: CloseOrigin, caller: Option<&str>) {
             self.detached.push(pane.as_u64());
@@ -32575,6 +32629,359 @@ mod tests {
             out["delivery"]["transient"], true,
             "待てば解ける見込みかが応答から読めない"
         );
+    }
+
+    // --- #2826: 作りたてのペインへの送信は spawn と同じ送達フローへ寄る ---------------------
+
+    /// `Request::Send`（CLI `tako send` / MCP `tako_send_input` の 1 実装）を撃つ
+    fn i2826_send(host: &mut MockHost, pane: u64, text: &str, newline: bool) -> Value {
+        dispatch(
+            host,
+            Request::Send {
+                pane: Some(pane),
+                text: text.into(),
+                newline,
+                tmux_session: None,
+                await_prompt: false,
+                paste_guard: None,
+                attachments: Vec::new(),
+            },
+            PaneOrigin::Mcp,
+        )
+        .expect("送信が受け付けられる")
+    }
+
+    /// 作りたての素のシェルの代役: 起こしたばかりで印の無い端末（ログインシェルは起こさない =
+    /// #2415）と、GUI が控える「素のシェルとして起こしてからの経過」
+    fn i2826_fresh_pane(host: &mut MockHost, pane: u64) {
+        let (session, _rx) =
+            TerminalSession::spawn(80, 24, i2415_session_options()).expect("PTY を張れる");
+        host.sessions.insert(pane, session);
+        host.fresh_shell_ages
+            .insert(pane, std::time::Duration::from_millis(200));
+    }
+
+    #[test]
+    fn issue2826_作りたての素のシェルへの改行つき送信は送達フローへ寄る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        i2826_fresh_pane(&mut host, pane);
+        let out = i2826_send(&mut host, pane, "tako master", true);
+        assert_eq!(
+            out["shell_wait"], "first_prompt",
+            "作りたてのペインへの送信が送達フローへ寄っていない（即時に書くと器が落とす。#2826）: {out}"
+        );
+        assert_eq!(out["queued"], true, "{out}");
+        assert_eq!(out["pane"], pane, "{out}");
+        assert_eq!(
+            out["delivery"]["state"], "queued",
+            "積んだ応答は queued_json の 1 箇所で組む（#1292）: {out}"
+        );
+        assert_eq!(
+            host.command_flows,
+            vec![(PaneId::from_raw(pane), "tako master".to_string())],
+            "worker の spawn と同じ `queue_command_flow` へ本文がそのまま積まれる"
+        );
+    }
+
+    /// `tako master --tab` / `tako solo --tab` は TabNew → Title → Send の順に撃つ（CLI の
+    /// `new_tab_target` と `orchestrator_master` / `orchestrator_solo`）。作ったペインへの起動行は
+    /// dispatch の同じ判断を通って送達フローへ寄る（CLI 側は何も変えない）
+    #[test]
+    fn issue2826_master_tabの起動行も作りたてのペインの送達フローを通る() {
+        let mut host = MockHost::new();
+        let _root = host.root_pane();
+        let tab = dispatch(
+            &mut host,
+            Request::TabNew {
+                title: None,
+                focus: Some(true),
+                cwd: None,
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let pane = tab["pane"].as_u64().expect("TabNew は作ったペインを返す");
+        assert!(
+            host.attached.contains(&pane),
+            "TabNew は素のシェルの端末を起こす"
+        );
+        // GUI は TabNew の応答を返す前に端末を起こし、素のシェルとして控える（`spawn_session`）
+        i2826_fresh_pane(&mut host, pane);
+        dispatch(
+            &mut host,
+            Request::Title {
+                pane: Some(pane),
+                title: None,
+                role: Some("orchestrator-master".into()),
+            },
+            PaneOrigin::Cli,
+        )
+        .unwrap();
+        let line = "claude --model x --append-system-prompt-file /tmp/p.md";
+        let out = i2826_send(&mut host, pane, line, true);
+        assert_eq!(out["shell_wait"], "first_prompt", "{out}");
+        assert_eq!(
+            host.command_flows,
+            vec![(PaneId::from_raw(pane), line.to_string())]
+        );
+    }
+
+    #[test]
+    fn issue2826_legacyは作りたてのペインへも即時に書く() {
+        if tako_core::run_alone!(issue2826_legacyは作りたてのペインへも即時に書く) {
+            return;
+        }
+        std::env::set_var("TAKO_2826_LEGACY", "1");
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        i2826_fresh_pane(&mut host, pane);
+        let out = i2826_send(&mut host, pane, "tako master", true);
+        assert_eq!(out, Value::Null, "修正前の即時書き込みの応答");
+        assert!(
+            host.command_flows.is_empty(),
+            "A/B の旧アームで送達フローへ寄せた"
+        );
+    }
+
+    #[test]
+    fn issue2826_改行なし_複数行_古いペインは従来どおり即時に書く() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        i2826_fresh_pane(&mut host, pane);
+        assert_eq!(i2826_send(&mut host, pane, "tako mas", false), Value::Null);
+        assert_eq!(
+            i2826_send(&mut host, pane, "cd /tmp\nls", true),
+            Value::Null
+        );
+        // 作りたてと見なす上限を過ぎた（統合の印を出さないシェル）
+        host.fresh_shell_ages
+            .insert(pane, tako_core::shell_send::FRESH_PANE_WINDOW);
+        assert_eq!(i2826_send(&mut host, pane, "ls", true), Value::Null);
+        // 素のシェルとして起こしたと GUI が言わないペイン（明示コマンド・器への繋ぎ直し・復元）
+        host.fresh_shell_ages.remove(&pane);
+        assert_eq!(i2826_send(&mut host, pane, "ls", true), Value::Null);
+        assert!(host.command_flows.is_empty(), "{:?}", host.command_flows);
+    }
+
+    /// 連続で送る: 1 本目を送達フローへ寄せた後、2 本目はその後ろに並ぶ（即時に書くと、まだ
+    /// Enter を待っている 1 本目の行に混ざる）
+    #[test]
+    fn issue2826_送達フローが残るペインへの2本目はその後ろに並ぶ() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        i2826_fresh_pane(&mut host, pane);
+        assert_eq!(
+            i2826_send(&mut host, pane, "cd /tmp", true)["shell_wait"],
+            "first_prompt"
+        );
+        // 1 本目の途中でシェルがプロンプトを出した・作りたての上限を過ぎた、でも並ぶ
+        host.fresh_shell_ages.remove(&pane);
+        let out = i2826_send(&mut host, pane, "tako master", true);
+        assert_eq!(out["shell_wait"], "previous_flow", "{out}");
+        assert_eq!(out["pane"], pane, "{out}");
+        assert_eq!(
+            host.command_flows
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cd /tmp", "tako master"],
+            "送った順に並ぶ"
+        );
+    }
+
+    /// 本物のシェルの代役（`/bin/sh`）の端末を起こし、イベントを汲みながら `ready` を待つ
+    #[cfg(unix)]
+    fn i2826_shell_pane(
+        host: &mut MockHost,
+        pane: u64,
+        script: &str,
+        ready: impl Fn(&TerminalSession) -> bool,
+    ) {
+        let options = SpawnOptions {
+            command: Some(tako_core::SpawnCommand {
+                program: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+            }),
+            ..SpawnOptions::default()
+        };
+        let (session, mut rx) = TerminalSession::spawn(80, 24, options).expect("PTY を張れる");
+        host.sessions.insert(pane, session);
+        // 上限は混み具合で伸ばすだけの 1 実装（#1308。固定窓に戻さない）
+        let budget = tako_core::wait_budget::state_wait_budget(
+            std::time::Duration::from_secs(15),
+            tako_core::wait_budget::machine_busy(),
+        );
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            while let Ok(event) = rx.try_recv() {
+                let _ = host
+                    .sessions
+                    .get_mut(&pane)
+                    .expect("入れた端末")
+                    .process_event(event);
+            }
+            if ready(&host.sessions[&pane]) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "端末が前提の状態にならない: {:?}",
+                host.sessions[&pane].visible_lines()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// **最初のプロンプトを出したシェル**（OSC 133;A を受けた）への送信は、作りたての経過が
+    /// 上限の内でも修正前とバイト一致で即時に書く（待ちが入らない = 応答が `null`・送達フローを
+    /// 積まない）。書いたバイトは端末を raw にした `cat` がそのままファイルへ落とす
+    #[cfg(unix)]
+    #[test]
+    fn issue2826_プロンプトを出したシェルへは修正前とバイト一致で即時に書く() {
+        if tako_core::run_alone!(issue2826_プロンプトを出したシェルへは修正前とバイト一致で即時に書く)
+        {
+            return;
+        }
+        let dir = tako_core::test_residue::ScratchDir::new("2826-bytes");
+        let mut written = Vec::new();
+        for legacy in [false, true] {
+            if legacy {
+                std::env::set_var("TAKO_2826_LEGACY", "1");
+            }
+            let mut host = MockHost::new();
+            let pane = host.root_pane();
+            let file = dir.path().join(format!("got-{legacy}"));
+            let script = format!(
+                "printf '\\033]133;A\\007'; stty raw -echo; exec cat > '{}'",
+                file.display()
+            );
+            i2826_shell_pane(&mut host, pane, &script, |s| s.shell_marks().prompts >= 1);
+            host.fresh_shell_ages
+                .insert(pane, std::time::Duration::from_millis(200));
+            let out = i2826_send(&mut host, pane, "echo hi", true);
+            assert_eq!(out, Value::Null, "即時書き込みの応答（legacy={legacy}）");
+            assert!(host.command_flows.is_empty(), "送達フローを積んだ");
+            let budget = tako_core::wait_budget::state_wait_budget(
+                std::time::Duration::from_secs(10),
+                tako_core::wait_budget::machine_busy(),
+            );
+            let deadline = std::time::Instant::now() + budget;
+            let got = loop {
+                let got = std::fs::read(&file).unwrap_or_default();
+                if got.len() >= b"echo hi\r".len() || std::time::Instant::now() >= deadline {
+                    break got;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            eprintln!(
+                "[2826] legacy={legacy} 書いたバイト={:?}",
+                String::from_utf8_lossy(&got)
+            );
+            written.push(got);
+        }
+        assert_eq!(written[0], b"echo hi\r".to_vec(), "新の書いたバイト");
+        assert_eq!(written[0], written[1], "修正前（legacy）とバイト一致");
+    }
+
+    /// 器なしのペインの代替画面 = 本物の全画面 TUI。作りたての経過の内でも、従来どおり TUI 向けの
+    /// 送達フローへ（応答も修正前と同じ）
+    #[cfg(unix)]
+    #[test]
+    fn issue2826_全画面tuiへの送信は修正前と同じtui向けの送達フロー() {
+        if tako_core::run_alone!(issue2826_全画面tuiへの送信は修正前と同じtui向けの送達フロー)
+        {
+            return;
+        }
+        let mut replies = Vec::new();
+        for legacy in [false, true] {
+            if legacy {
+                std::env::set_var("TAKO_2826_LEGACY", "1");
+            }
+            let mut host = MockHost::new();
+            let pane = host.root_pane();
+            i2826_shell_pane(
+                &mut host,
+                pane,
+                "printf '\\033[?1049h'; exec sleep 600",
+                TerminalSession::is_alt_screen,
+            );
+            host.fresh_shell_ages
+                .insert(pane, std::time::Duration::from_millis(200));
+            let out = i2826_send(&mut host, pane, "やること", true);
+            assert_eq!(out["queued"], true, "{out}");
+            assert!(out.get("shell_wait").is_none(), "{out}");
+            // TUI 向けの送達フロー（`queue_send_flow`）の応答 = 積む前の顛末つき（`queued_json`）
+            assert_eq!(
+                out["delivery"]["state"], "queued",
+                "TUI 向けの送達フロー: {out}"
+            );
+            assert!(host.command_flows.is_empty());
+            assert_eq!(out["pane"], pane, "{out}");
+            // 腕ごとに別の host = ペイン ID だけは違う（それ以外を比べる）
+            let mut out = out;
+            out["pane"] = Value::Null;
+            replies.push(out);
+        }
+        assert_eq!(replies[0], replies[1], "応答が修正前と同じ");
+    }
+
+    /// 器のペインは器のクライアント自身が代替画面に入る（Windows CI の psmux で作ってから約 0.3 秒）。
+    /// 作りたての素のシェルなら外側の代替画面を全画面 TUI と読まずに送達フローへ寄せる。
+    /// プロンプトを出した後は従来どおり（TUI 向けの送達フロー）
+    #[cfg(unix)]
+    #[test]
+    fn issue2826_器のペインは外側の代替画面でも作りたてなら送達フローへ寄る() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.backend_sessions.insert(pane, "tako-2826x".into());
+        i2826_shell_pane(
+            &mut host,
+            pane,
+            "printf '\\033[?1049h'; exec sleep 600",
+            TerminalSession::is_alt_screen,
+        );
+        host.fresh_shell_ages
+            .insert(pane, std::time::Duration::from_millis(200));
+        let out = i2826_send(&mut host, pane, "tako master", true);
+        assert_eq!(out["shell_wait"], "first_prompt", "{out}");
+        assert_eq!(host.command_flows.len(), 1, "送達フローへ積む");
+
+        // プロンプトの印を受けた器のペイン = 従来どおり
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        host.backend_sessions.insert(pane, "tako-2826y".into());
+        i2826_shell_pane(
+            &mut host,
+            pane,
+            "printf '\\033]133;A\\007\\033[?1049h'; exec sleep 600",
+            |s| s.is_alt_screen() && s.shell_marks().prompts >= 1,
+        );
+        host.fresh_shell_ages
+            .insert(pane, std::time::Duration::from_millis(200));
+        let out = i2826_send(&mut host, pane, "ls", true);
+        assert!(out.get("shell_wait").is_none(), "{out}");
+        assert_eq!(
+            out["delivery"]["state"], "queued",
+            "TUI 向けの送達フロー: {out}"
+        );
+        assert!(host.command_flows.is_empty());
+    }
+
+    /// シェルがプロンプトを出す前に終わったペイン: 送達フローへ寄せず従来どおり（書いても誰も読まない）
+    #[cfg(unix)]
+    #[test]
+    fn issue2826_プロンプト前に終わったシェルへは寄せない() {
+        let mut host = MockHost::new();
+        let pane = host.root_pane();
+        i2826_shell_pane(&mut host, pane, "exit 3", |s| s.exit_status().is_some());
+        host.fresh_shell_ages
+            .insert(pane, std::time::Duration::from_millis(200));
+        assert_eq!(
+            i2826_send(&mut host, pane, "tako master", true),
+            Value::Null
+        );
+        assert!(host.command_flows.is_empty());
     }
 
     /// `read_pane` は画面と一緒に送達の顛末も返す（#1259）。

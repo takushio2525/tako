@@ -616,6 +616,104 @@ impl ShellSendFlow {
     }
 }
 
+// --- 作りたてのペインへの送信（#2826） -----------------------------------------------
+//
+// `tako send` / MCP `tako_send_input`（dispatch の `Request::Send`）は、シェルへの送信を
+// 即時に書き込む。worker の spawn・スターター・master の後任の起動は上の送達フローを通すのに、
+// 外部のフロントエンドの「`tako_create_tab` の直後に `tako_send_input("tako master")`」と
+// `tako master --tab` / `tako solo --tab`（TabNew の直後に素の Send）は通っていなかった。
+//
+// Windows CI の実 ConPTY の実測（#2826）: 器（psmux）のペインへ作ってから 300 ms 後に
+// 即時で書くと全損した（#2092 の門が開いた後・器のクライアントが入力を読み始める前の窓）。
+// 門を外すと 0 ms でも 0/10。同じ条件で送達フローは全回届く。
+//
+// ここは「その送信を送達フローへ寄せるか」の判断だけを持つ（純関数。dispatch の 1 か所が呼ぶ）。
+
+/// 作りたてのペインと見なす上限（#2826）。GUI が素のシェルとして起こしてからこれを過ぎたら、
+/// 最初のプロンプトの印が来ていなくても「統合の印を出さないシェル」と見なして従来どおり
+/// 即時に書く（待ちを足し続けない）。送達フローがシェルの起動を待つ上限と同じ長さ
+pub const FRESH_PANE_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(READY_MAX_TICKS as u64 * TICK_MS);
+
+/// A/B 用の逃げ道（`TAKO_2826_LEGACY=1`）。作りたてのペインへの送信も修正前と同じく
+/// 即時に書く。送信のたびに読む（同じテストプロセスの中で新旧を並べて測るため）
+pub fn legacy_2826() -> bool {
+    matches!(
+        std::env::var("TAKO_2826_LEGACY").ok().as_deref(),
+        Some("1" | "true" | "on")
+    )
+}
+
+/// 送信先のペインについて分かっていること（#2826。dispatch が host から集める）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendTarget {
+    /// GUI が**素のシェルとして新しく**起こしてからの経過。None = そう起こしたペインではない
+    /// （明示コマンドのペイン・器のセッションへの繋ぎ直し・復元）か、host が知らない
+    pub fresh_shell_age: Option<std::time::Duration>,
+    /// シェル統合のプロンプトの印（OSC 133;A）の回数
+    pub prompts: u64,
+    /// ペインの端末が代替画面（全画面 TUI）にいる
+    pub alt_screen: bool,
+    /// 器（tmux / psmux）のペイン。器のクライアント自身が代替画面に入るので、
+    /// 外側の `alt_screen` では中身が全画面 TUI かを言えない（#694 と同じ罠）
+    pub container: bool,
+    /// 先に積んだ起動コマンドの送達フローがまだ終わっていない
+    pub flow_pending: bool,
+    /// PTY 直下の子が終わっている（書いても誰も読まない）
+    pub exited: bool,
+    /// 本文を器の注入口で入れる（#907。器のクライアントが運べない文字を含む）。
+    /// 送達フローは打鍵で書くので、その文字を落とす
+    pub injects: bool,
+}
+
+/// 送信を送達フローへ寄せた理由（応答の `shell_wait`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellWait {
+    /// 作りたての素のシェルで、まだ最初のプロンプトを出していない
+    FirstPrompt,
+    /// そのペインへ先に積んだ起動コマンドの送達フローが残っている（後ろに並ぶ。
+    /// 即時に書くと、まだ Enter を待っている前の行に混ざる）
+    PreviousFlow,
+}
+
+impl ShellWait {
+    /// 応答・ログに出す安定した語彙
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstPrompt => "first_prompt",
+            Self::PreviousFlow => "previous_flow",
+        }
+    }
+}
+
+/// `Request::Send` の送信を送達フロー（シェル準備待ち → エコー確認 → 分離 Enter）へ寄せるか（#2826）。
+///
+/// 寄せるのは**改行つきの 1 行**だけ（Enter だけの送信を含む）。寄せないものは従来どおり:
+///
+/// - 改行なし（プロンプトへの部分入力）・複数行（送達フローは 1 行を確かめる作り）
+/// - 器の注入口で入れる本文（#907）・終わった端末
+/// - 全画面 TUI が前面（器なしのペインの代替画面）= 従来の TUI 向けの送達フロー。そちらは
+///   先に積んだ起動コマンドの送達フローを待ってから送る（`hold_for_command_flow`）
+/// - 最初のプロンプトを出したシェル・作ってから [`FRESH_PANE_WINDOW`] を過ぎたシェル
+///   （先に積んだ送達フローが残っていなければ）= 即時に書く
+pub fn shell_wait(text: &str, newline: bool, target: &SendTarget) -> Option<ShellWait> {
+    let body = text.trim_end_matches(['\r', '\n']);
+    if !newline || body.contains(['\r', '\n']) || target.injects || target.exited {
+        return None;
+    }
+    let fresh = target.prompts == 0
+        && target
+            .fresh_shell_age
+            .is_some_and(|age| age < FRESH_PANE_WINDOW);
+    if fresh && (!target.alt_screen || target.container) {
+        return Some(ShellWait::FirstPrompt);
+    }
+    if target.alt_screen {
+        return None;
+    }
+    target.flow_pending.then_some(ShellWait::PreviousFlow)
+}
+
 /// 空白をすべて落とした文字列。ターミナルの折り返しは**文字を足さず改行位置を変える**だけ
 /// なので、行を連結して空白を落とせば折り返しに関係なく照合できる
 fn squash(s: &str) -> String {
@@ -1288,5 +1386,134 @@ mod tests {
             assert_eq!(f.tick(&[]), ShellSendAction::Wait);
         }
         assert_eq!(write_of(&f.tick(&[])).as_deref(), Some(CMD));
+    }
+
+    // --- #2826: 作りたてのペインへの送信を送達フローへ寄せるか -----------------------
+
+    /// GUI が素のシェルとして起こしてすぐ・まだ印が無い器なしのペイン
+    fn fresh() -> SendTarget {
+        SendTarget {
+            fresh_shell_age: Some(std::time::Duration::from_millis(300)),
+            prompts: 0,
+            alt_screen: false,
+            container: false,
+            flow_pending: false,
+            exited: false,
+            injects: false,
+        }
+    }
+
+    #[test]
+    fn issue2826_作りたての素のシェルへの改行つきの1行は最初のプロンプトを待つ() {
+        assert_eq!(
+            shell_wait("tako master", true, &fresh()),
+            Some(ShellWait::FirstPrompt)
+        );
+        // 末尾の改行は本文の一部ではない（送達フローが落とす）
+        assert_eq!(
+            shell_wait("tako master\n", true, &fresh()),
+            Some(ShellWait::FirstPrompt)
+        );
+        // Enter だけの送信も同じ（作りたてのシェルへ素の CR を先に書かない）
+        assert_eq!(shell_wait("", true, &fresh()), Some(ShellWait::FirstPrompt));
+        assert_eq!(ShellWait::FirstPrompt.as_str(), "first_prompt");
+    }
+
+    #[test]
+    fn issue2826_器のペインは外側の代替画面を全画面tuiと読まない() {
+        // 器のクライアント自身が代替画面に入る（Windows CI の psmux・手元の tmux とも約 0.3〜0.6 秒）
+        let target = SendTarget {
+            container: true,
+            alt_screen: true,
+            ..fresh()
+        };
+        assert_eq!(
+            shell_wait("tako master", true, &target),
+            Some(ShellWait::FirstPrompt)
+        );
+        // 器なしのペインの代替画面は本物の全画面 TUI = 従来の TUI 向けの送達フロー
+        let tui = SendTarget {
+            alt_screen: true,
+            ..fresh()
+        };
+        assert_eq!(shell_wait("tako master", true, &tui), None);
+    }
+
+    #[test]
+    fn issue2826_プロンプトを出したシェルと古いペインは従来どおり即時() {
+        let prompted = SendTarget {
+            prompts: 1,
+            ..fresh()
+        };
+        assert_eq!(shell_wait("ls", true, &prompted), None);
+        // 印を出さないシェルでも、上限を過ぎたら待ちを足さない
+        let old = SendTarget {
+            fresh_shell_age: Some(FRESH_PANE_WINDOW),
+            ..fresh()
+        };
+        assert_eq!(shell_wait("ls", true, &old), None);
+        // 素のシェルとして新しく起こしたペインでない（明示コマンド・器への繋ぎ直し・復元）
+        let unknown = SendTarget {
+            fresh_shell_age: None,
+            ..fresh()
+        };
+        assert_eq!(shell_wait("ls", true, &unknown), None);
+        // 器のペインでプロンプトを出した後は外側の代替画面 = 従来の TUI 向けの送達フロー
+        let container_prompted = SendTarget {
+            container: true,
+            alt_screen: true,
+            prompts: 2,
+            ..fresh()
+        };
+        assert_eq!(shell_wait("ls", true, &container_prompted), None);
+    }
+
+    #[test]
+    fn issue2826_改行なし_複数行_注入_終わった端末は寄せない() {
+        assert_eq!(shell_wait("tako mas", false, &fresh()), None);
+        assert_eq!(shell_wait("cd /tmp\nls", true, &fresh()), None);
+        assert_eq!(shell_wait("cd /tmp\rls\r", true, &fresh()), None);
+        let injects = SendTarget {
+            injects: true,
+            ..fresh()
+        };
+        assert_eq!(shell_wait("echo 日本語", true, &injects), None);
+        let exited = SendTarget {
+            exited: true,
+            ..fresh()
+        };
+        assert_eq!(shell_wait("tako master", true, &exited), None);
+    }
+
+    #[test]
+    fn issue2826_先に積んだ送達フローが残るペインへの送信はその後ろに並ぶ() {
+        // プロンプトを出した後でも、前の行がまだ Enter を待っている間に即時で書くと混ざる
+        let pending = SendTarget {
+            prompts: 1,
+            flow_pending: true,
+            ..fresh()
+        };
+        assert_eq!(
+            shell_wait("ls", true, &pending),
+            Some(ShellWait::PreviousFlow)
+        );
+        assert_eq!(ShellWait::PreviousFlow.as_str(), "previous_flow");
+        // 全画面 TUI へは TUI 向けの送達フロー（そちらが前の送達フローの決着を待つ）
+        let tui = SendTarget {
+            alt_screen: true,
+            ..pending
+        };
+        assert_eq!(shell_wait("ls", true, &tui), None);
+        // 改行なしは寄せない（従来どおり即時。範囲外）
+        assert_eq!(shell_wait("ls", false, &pending), None);
+    }
+
+    #[test]
+    fn issue2826_作りたてと見なす上限は送達フローのシェル待ちの上限と同じ() {
+        assert_eq!(
+            FRESH_PANE_WINDOW,
+            std::time::Duration::from_millis(READY_MAX_TICKS as u64 * TICK_MS)
+        );
+        assert_eq!(FRESH_PANE_WINDOW.as_secs(), 30);
     }
 }
