@@ -369,12 +369,6 @@ const ALLOWED_DOT_CODEX: &[(&str, &str, &str)] = &[
         "\"\" | \".codex\" =>",
         "置き場を組まない（既定の置き場の名前を表示名 `codex` へ読み替えるだけ）",
     ),
-    (
-        "crates/tako-control/src/orchestrator/agent.rs",
-        "ensure_codex_trusted_at(&home.join(\".codex/config.toml\"), cwd)",
-        "既知の残り（#2810 の範囲外で直していない。worker の信頼の書き込みが `CODEX_HOME` を見ない）。\
-         直したらこの行を消す",
-    ),
 ];
 
 /// 本番コードの眺め: `#[cfg(test)]` の領域とコメントを空白へ潰す（文字列は残す・行番号は原文のまま）
@@ -535,6 +529,12 @@ fn issue2810_実ファイルへ決め打ちを戻すと名指す() {
             "crates/tako-control/src/setup_bootstrap.rs",
             "crate::codex_session::codex_home().ok_or(SetupRefusal::BootstrapHomeUnresolved)?",
             "home.join(\".codex\")",
+        ),
+        // #2816: worker の信頼の書き先（#2810 では「既知の残り」として凍結していた形）
+        (
+            "crates/tako-control/src/orchestrator/agent.rs",
+            "Path::new(cwd).join(codex_home).join(\"config.toml\")",
+            "home.join(\".codex/config.toml\")",
         ),
     ];
     let root = repo_root();

@@ -584,6 +584,12 @@ pub fn prepare_from(
 /// tako の環境変数 `CODEX_HOME` → `~/.codex`。
 /// export も env と同じく**空・空白だけは決めていない**と読む（値の読み方の正本は codex_session。#2798）
 pub fn codex_home_for(env: &EnvPlan) -> Option<PathBuf> {
+    codex_home_for_in(env, tako_core::paths::is_verification_process())
+}
+
+/// [`codex_home_for`] の検証プロセスの判定を引数で受ける版（#2816）。
+/// テストのプロセスは検証プロセスなので、本物の `CODEX_HOME` を読む枝はこの口からしか通せない
+pub(crate) fn codex_home_for_in(env: &EnvPlan, verification: bool) -> Option<PathBuf> {
     const KEY: &str = crate::codex_session::CODEX_HOME_ENV;
     if let Some(home) = env
         .export_value(KEY)
@@ -591,7 +597,7 @@ pub fn codex_home_for(env: &EnvPlan) -> Option<PathBuf> {
     {
         return Some(home);
     }
-    if env.unsets.iter().any(|k| k == KEY) || tako_core::paths::is_verification_process() {
+    if env.unsets.iter().any(|k| k == KEY) || verification {
         return crate::orchestrator::agent_config_home().map(|h| h.join(".codex"));
     }
     crate::codex_session::codex_home()

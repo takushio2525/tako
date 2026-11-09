@@ -19847,19 +19847,17 @@ fn dispatch_orchestrator_handoff(
     host.attach_session(new_id, options);
 
     // 事前信頼。claude は config dir 配下の .claude.json を読むので、アカウント指定で
-    // CLAUDE_CONFIG_DIR を注入する場合はその config dir へ書く（#558）
-    let _ = orchestrator::agent::ensure_trusted_in(
-        master_agent,
-        profile_env.claude_config_dir().as_deref(),
-        &cwd.to_string_lossy(),
-    )
-    .unwrap_or_else(|e| {
-        eprintln!(
-            "warning: handoff 事前信頼失敗（ダイアログ検出で継続）: {}",
-            e.text_in(Lang::Ja)
-        );
-        false
-    });
+    // CLAUDE_CONFIG_DIR を注入する場合はその config dir へ書く（#558）。codex は
+    // プロファイルの env の CODEX_HOME の config.toml（#2816）
+    let _ =
+        orchestrator::agent::ensure_trusted_in(master_agent, &profile_env, &cwd.to_string_lossy())
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "warning: handoff 事前信頼失敗（ダイアログ検出で継続）: {}",
+                    e.text_in(Lang::Ja)
+                );
+                false
+            });
 
     // コマンド送信（送達確認つき。#640）
     host.queue_command_flow(new_id, master_cmd);
@@ -20073,19 +20071,18 @@ fn dispatch_git_resolve_agent(
     });
 
     // 事前信頼（未信頼フォルダの確認ダイアログにプロンプトが食われるのを防ぐ。Issue #32）。
-    // 書き先は起動する claude の config dir 配下（#558）
+    // 書き先は起動する CLI が読む置き場（claude の config dir = #558・codex の CODEX_HOME = #2816）
     let claude_config_dir = profile_env.claude_config_dir();
-    let pre_trusted =
-        orchestrator::agent::ensure_trusted_in(worker_agent, claude_config_dir.as_deref(), &cwd)
-            .unwrap_or_else(|e| {
-                // #983: 分類済みの理由 + 次の一手で残す（無言の劣化を作らない）
-                let _ = launch_warning(
-                    worker_agent,
-                    crate::orchestrator::agent_cli::AgentCliProblem::TrustWriteFailed,
-                    &e,
-                );
-                false
-            });
+    let pre_trusted = orchestrator::agent::ensure_trusted_in(worker_agent, &profile_env, &cwd)
+        .unwrap_or_else(|e| {
+            // #983: 分類済みの理由 + 次の一手で残す（無言の劣化を作らない）
+            let _ = launch_warning(
+                worker_agent,
+                crate::orchestrator::agent_cli::AgentCliProblem::TrustWriteFailed,
+                &e,
+            );
+            false
+        });
     if launch.skip_permissions && worker_agent == orchestrator::agent::WorkerAgent::Claude {
         let _ = crate::claude_tui::ensure_bypass_accepted_in(claude_config_dir.as_deref()).map_err(
             |e| {
@@ -20923,9 +20920,10 @@ impl SpawnPlaced {
         // 事前信頼: 未信頼フォルダでエージェント CLI を起動すると信頼ダイアログが出て、
         // 送信したプロンプトがダイアログへの応答として消費される（Issue #32 問題 1）。
         // 起動前に各 CLI の設定ファイル（claude: <config dir>/.claude.json /
-        // codex: ~/.codex/config.toml / agy: ~/.gemini/antigravity-cli/settings.json）へ
-        // 信頼済みを書き込んでダイアログ自体を出さない。claude の書き先は起動する
-        // config dir 配下でなければ効かない（#558。アカウント指定で変わる）。
+        // codex: $CODEX_HOME/config.toml / agy: ~/.gemini/antigravity-cli/settings.json）へ
+        // 信頼済みを書き込んでダイアログ自体を出さない。書き先は起動する CLI が読む置き場で
+        // なければ効かないので、worker に渡る env 計画から決める（claude の config dir は
+        // アカウント指定で変わる = #558・codex の CODEX_HOME はプロファイルの env で変わる = #2816）。
         // 失敗しても PromptFlow のダイアログ検出 → 承諾がフォールバックするため継続する。
         // **起動を積むのはこの段の後**（[`spawn_launch`]）なので、書き込みは起動より前に済む
         let claude_config_dir = profile_env.claude_config_dir();
@@ -20958,19 +20956,15 @@ impl SpawnPlaced {
                 "message": w.to_string(),
             }));
         }
-        let pre_trusted = orchestrator::agent::ensure_trusted_in(
-            worker_agent,
-            claude_config_dir.as_deref(),
-            &cwd,
-        )
-        .unwrap_or_else(|e| {
-            launch_warnings.push(launch_warning(
-                worker_agent,
-                crate::orchestrator::agent_cli::AgentCliProblem::TrustWriteFailed,
-                &e,
-            ));
-            false
-        });
+        let pre_trusted = orchestrator::agent::ensure_trusted_in(worker_agent, &profile_env, &cwd)
+            .unwrap_or_else(|e| {
+                launch_warnings.push(launch_warning(
+                    worker_agent,
+                    crate::orchestrator::agent_cli::AgentCliProblem::TrustWriteFailed,
+                    &e,
+                ));
+                false
+            });
 
         // Bypass Permissions 事前承認（#407）: skip_permissions=true の claude worker は
         // --dangerously-skip-permissions で起動する。初回は確認ダイアログが出て既定選択
