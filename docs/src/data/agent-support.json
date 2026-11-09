@@ -27,7 +27,7 @@
       "key": "account_switch",
       "summary_ja": "アカウント（資格情報）の切替に追従する",
       "evidence": "source",
-      "evidence_detail": "accounts.yaml のアカウントは CLAUDE_CONFIG_DIR だけを注入・解除する （orchestrator/mod.rs の resolved_env_plan_with_account。#512 / #558）。codex の置き場 （CODEX_HOME）はアカウントでは切り替わらず、事前信頼はプロファイルの env の CODEX_HOME に 追従するだけ（orchestrator/agent.rs の ensure_trusted_in。#2816）。agy は ~/.gemini/antigravity-cli/settings.json を固定で開く",
+      "evidence_detail": "accounts.yaml のアカウントは CLAUDE_CONFIG_DIR だけを注入・解除する （orchestrator/mod.rs の resolved_env_plan_with_account。#512 / #558）。AccountEntry に env の欄は無い。codex の置き場（CODEX_HOME）はアカウントでは切り替わらず、事前信頼はプロファイルの env の CODEX_HOME に追従するだけ（orchestrator/agent.rs の ensure_trusted_in。#2816）。agy は CLAUDE_CONFIG_DIR を読まず、agy 1.5.3 の --help に置き場やアカウントを選ぶフラグが無い。ログインの切替は agy の中の /logout → /login で、起動ごとに資格情報を変える口は env の AGY_ADC_AUTH と GEMINI_API_KEY（settings の modelProvider と組む）だけ（同梱の changelog。AGY_ACCOUNT は Plugins Manager で繋いだアカウントを選ぶもので agy 自身のログインではない）。#2829",
       "agents": {
         "claude": {
           "status": "supported"
@@ -39,7 +39,7 @@
         },
         "agy": {
           "status": "pending",
-          "note_ja": "設定ファイルの場所が固定なので、tako のアカウント切替がこの系統には効かない",
+          "note_ja": "tako のアカウント切替は CLAUDE_CONFIG_DIR しか動かさず、agy はそれを読まないので、agy のログインは切り替わらない（agy のログインの切替は agy の中の /logout → /login）",
           "issue": 975
         },
         "local": {

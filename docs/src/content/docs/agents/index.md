@@ -60,4 +60,4 @@ tako setup bootstrap status-all
 ## まだ固定になっているところ
 
 - **master / solo の系統は起動時に選べません**。プロファイルの `master_agent` を変えてから `tako master` を起動する形です。起動のたびに選べるようにする導線は対応中です（[#988](https://github.com/takushio2525/tako/issues/988)）
-- **アカウントの切り替えは claude だけに効きます**。codex / agy は設定ファイルの置き場が固定なので、tako 側からアカウントを差し替えられません（[#975](https://github.com/takushio2525/tako/issues/975)）
+- **アカウントの切り替えは claude だけに効きます**。tako のアカウント切り替えは claude の設定の置き場（`CLAUDE_CONFIG_DIR`）しか動かさないので、codex の置き場（`CODEX_HOME`）も agy のログインも切り替わりません。agy のアカウントは agy の中の `/logout` → `/login` で切り替えます（[#975](https://github.com/takushio2525/tako/issues/975)）

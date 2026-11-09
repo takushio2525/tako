@@ -500,6 +500,15 @@ pub mod notes {
         "tako's account switching only changes CLAUDE_CONFIG_DIR, so codex's home (CODEX_HOME) is not switched",
     );
 
+    /// #2829: agy は `CLAUDE_CONFIG_DIR` を読まず、ログインの切替は agy の中で行う
+    /// （agy 1.5.3 の `--help` と同梱の changelog で確認）。前は「設定ファイルの場所が固定」と
+    /// 言っていたが、効かない理由は置き場ではなく、アカウントが注入する env が
+    /// `CLAUDE_CONFIG_DIR` だけ（#512 / #558）なこと
+    pub const AGY_SIGN_IN_NOT_SWITCHED: Note = Note::new(
+        "tako のアカウント切替は CLAUDE_CONFIG_DIR しか動かさず、agy はそれを読まないので、agy のログインは切り替わらない（agy のログインの切替は agy の中の /logout → /login）",
+        "tako's account switching only changes CLAUDE_CONFIG_DIR, which agy does not read, so agy's sign-in is not switched (agy switches accounts with /logout then /login inside agy)",
+    );
+
     /// #985: codex はクレジット切れの出口が課金しか無い
     pub const CODEX_CREDITS_NEED_PURCHASE: Note = Note::new(
         "5h / 週の枠は解除を待って自分で再開するが、ワークスペースのクレジットが尽きた場合は「待つ」出口が無い（増枠申請・購入・獲得済みリセットの引き換えしか無いので、tako は何も選ばずに止まる）",
@@ -794,14 +803,18 @@ pub const MATRIX: &[AgentFeature] = &[
         ),
         claude: S::Supported,
         codex: pending(notes::CODEX_HOME_NOT_SWITCHED, 975),
-        agy: pending(notes::FIXED_CONFIG_PATH, 975),
+        agy: pending(notes::AGY_SIGN_IN_NOT_SWITCHED, 975),
         local: local_pending(),
         evidence: AgentEvidence::Source(
             "accounts.yaml のアカウントは CLAUDE_CONFIG_DIR だけを注入・解除する \
-             （orchestrator/mod.rs の resolved_env_plan_with_account。#512 / #558）。codex の置き場 \
-             （CODEX_HOME）はアカウントでは切り替わらず、事前信頼はプロファイルの env の CODEX_HOME に \
-             追従するだけ（orchestrator/agent.rs の ensure_trusted_in。#2816）。agy は \
-             ~/.gemini/antigravity-cli/settings.json を固定で開く",
+             （orchestrator/mod.rs の resolved_env_plan_with_account。#512 / #558）。AccountEntry に \
+             env の欄は無い。codex の置き場（CODEX_HOME）はアカウントでは切り替わらず、事前信頼は\
+             プロファイルの env の CODEX_HOME に追従するだけ（orchestrator/agent.rs の \
+             ensure_trusted_in。#2816）。agy は CLAUDE_CONFIG_DIR を読まず、agy 1.5.3 の --help に\
+             置き場やアカウントを選ぶフラグが無い。ログインの切替は agy の中の /logout → /login で、\
+             起動ごとに資格情報を変える口は env の AGY_ADC_AUTH と GEMINI_API_KEY（settings の \
+             modelProvider と組む）だけ（同梱の changelog。AGY_ACCOUNT は Plugins Manager で繋いだ\
+             アカウントを選ぶもので agy 自身のログインではない）。#2829",
         ),
     },
     AgentFeature {
@@ -2377,6 +2390,27 @@ mod tests {
                  codex の置き場は CODEX_HOME から解決するので、本当の理由を書くこと（#2820）",
                 f.key
             );
+        }
+    }
+
+    /// #2829: アカウント切替が claude 以外に効かない理由は「置き場が固定」ではなく、
+    /// tako のアカウントが注入する env が `CLAUDE_CONFIG_DIR` だけ（#512 / #558）なこと。
+    /// codex（置き場は CODEX_HOME から解決 = #2798）も agy（ログインの切替は agy の中）も、
+    /// 理由文の日英でその仕組みを名指す（別の理由へ戻すと docs と診断が実装と食い違う）
+    #[test]
+    fn issue2829_アカウント切替の理由はclaude_config_dirしか動かないことを言う() {
+        for agent in [Agent::Codex, Agent::Agy] {
+            let note = support_for(agent, keys::ACCOUNT_SWITCH)
+                .and_then(AgentSupport::note)
+                .unwrap_or_else(|| panic!("account_switch の {} に理由文が無い", agent.as_str()));
+            for text in [note.ja(), note.en()] {
+                assert!(
+                    text.contains("CLAUDE_CONFIG_DIR"),
+                    "account_switch の {} の理由が、tako のアカウントは CLAUDE_CONFIG_DIR しか \
+                     動かさないことを言っていない（#2829）: {text}",
+                    agent.as_str()
+                );
+            }
         }
     }
 
