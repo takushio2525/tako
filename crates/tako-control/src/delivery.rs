@@ -219,6 +219,23 @@ pub fn log_fallback(pane: Option<u64>, backend_session: &str, reason: &str) {
     ));
 }
 
+/// 本文を器の注入口へ入れる組み合わせなら、その器のセッション名（#907 の判定の 1 実装）。
+///
+/// [`inject_non_ascii`] と、送達フローへ寄せるかの判断（#2826。送達フローは打鍵で書くので、
+/// 注入が要る本文を寄せると器のクライアントが落とす文字を失う）が同じ答えを使う
+pub fn injection_target<'a>(backend_session: Option<&'a str>, text: &str) -> Option<&'a str> {
+    // `TAKO_907_NO_INJECT=1` で修正前（常に打鍵）へ戻せる = 同一バイナリで A/B が取れる
+    if std::env::var_os("TAKO_907_NO_INJECT").is_some() {
+        return None;
+    }
+    let caps = tako_core::backend::capabilities();
+    if !tako_core::backend::needs_text_injection(&caps, text) {
+        return None;
+    }
+    // 器が無いペイン（能力が true でも起こり得る: persist OFF で作ったペイン）は None
+    backend_session
+}
+
 /// **非 ASCII の本文を器の注入口へ入れる**（#907）。
 ///
 /// 器つきペインへのテキストは従来「外側 PTY への打鍵」で送っていたが、
@@ -230,23 +247,14 @@ pub fn log_fallback(pane: Option<u64>, backend_session: &str, reason: &str) {
 /// `Ok(false)` = 迂回不要（従来どおり打鍵する）/ `Err` = 迂回すべきだが失敗した
 /// （呼び出し側は打鍵へ落ちる = 従来の壊れ方に留める。無音で失うより良い）
 pub fn inject_non_ascii(backend_session: Option<&str>, text: &str) -> Result<bool, &'static str> {
-    // `TAKO_907_NO_INJECT=1` で修正前（常に打鍵）へ戻せる = 同一バイナリで A/B が取れる
-    if std::env::var_os("TAKO_907_NO_INJECT").is_some() {
-        return Ok(false);
-    }
-    let caps = tako_core::backend::capabilities();
-    if !tako_core::backend::needs_text_injection(&caps, text) {
-        return Ok(false);
-    }
-    let Some(session) = backend_session else {
-        // 器が無いペイン（能力が true でも起こり得る: persist OFF で作ったペイン）
+    let Some(session) = injection_target(backend_session, text) else {
         return Ok(false);
     };
     match tako_core::backend::inject_text(session, text) {
         Ok(()) => {
             crate::diag::persist_log(&format!(
                 "送達: 器へ注入（session={session} 器={} 文字数={}）",
-                caps.label,
+                tako_core::backend::capabilities().label,
                 text.chars().count()
             ));
             Ok(true)

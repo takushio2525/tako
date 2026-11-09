@@ -2514,6 +2514,10 @@ struct TakoApp {
         HashMap<PaneId, (tako_core::prompt_delivery::Status, std::time::Instant)>,
     /// 新規ペインの素のシェルへ起動コマンドを送り届けるステートマシン（Issue #640）
     command_flows: Vec<ShellCommandFlow>,
+    /// 素のシェルとして新しく起こしたペインと、その時刻（#2826）。作りたてのシェルへの
+    /// `tako send` / `tako_send_input` を送達フローへ寄せる判断の材料（`fresh_shell_age`）。
+    /// 明示コマンドのペイン・器への繋ぎ直し・復元では入れない（同じペインを起こし直したら消す）
+    fresh_shell_spawns: HashMap<PaneId, std::time::Instant>,
     /// 起動コマンドを送り終えた時点のシェル統合の印（Issue #1940）。この後に
     /// コマンド終了の印（OSC 133;D）が来たら、起動したエージェントがすぐ終わった
     /// = 起動失敗。TUI の起動を待つ送達フローがこれを見て、待たずに理由つきで決着する
@@ -5339,6 +5343,7 @@ impl TakoApp {
             prompt_flows: Vec::new(),
             prompt_delivery_states: HashMap::new(),
             command_flows: Vec::new(),
+            fresh_shell_spawns: HashMap::new(),
             launch_baselines: HashMap::new(),
             agent_relaunches: Vec::new(),
             relaunch_flow_events: Vec::new(),
@@ -11017,6 +11022,8 @@ impl TakoApp {
             tako_core::claude_mod::LIST_SEP,
         ));
         self.claude_mod.record_spawn(pane_id.as_u64(), &injection);
+        // #2826: 素のシェル（起動コマンドの指定が無い）として起こすか。器で包む前に控える
+        let bare_shell = options.command.is_none();
         // 明示コマンドはログインシェル経由で実行する（.app の最小 PATH では
         // `tmux attach` や `npm` が直接 exec で見つからない。2026-06-12 リグレッション (7)）
         options.command = options.command.map(tako_core::login_shell_command);
@@ -11040,6 +11047,8 @@ impl TakoApp {
         };
         // #641: 復元の直後の全滅から救済するシェルは器を使わない（器の不調に巻き込まれない）
         let direct = self.direct_spawn.remove(&pane_id);
+        // #2826: 既にある器のセッションへ繋いだか（繋ぎ直し・復元 = 中のシェルは作りたてではない）
+        let mut reused_container = false;
         if let Some(name) = reattach_to {
             options = tako_core::tmux_backend::reattach_options(
                 options,
@@ -11048,6 +11057,7 @@ impl TakoApp {
             );
             container_pin = tako_core::encoding_pin::ContainerPin::for_session(&name);
             backend_session = Some(name);
+            reused_container = true;
         } else {
             // #885: 器を配るか・器の中でどう起こすかは backend が答える（reserve の名前の検査 =
             // #428・器ごとの組み立て。psmux はここで器のオーナー記録を取る = #177）。器を持たない
@@ -11065,6 +11075,8 @@ impl TakoApp {
             container_pin = spawn.pin;
             if let Some(session) = spawn.session {
                 let name = session.into_string();
+                // 復元したペイン（layout.json の器の名前 = `new-session -A` が既存へ繋ぐ）
+                reused_container = existing.is_some();
                 self.backend_sessions.insert(pane_id, name.clone());
                 backend_session = Some(name);
                 container_spawn = true;
@@ -11087,6 +11099,7 @@ impl TakoApp {
         options
             .scrollback_lines
             .get_or_insert(self.scrollback_lines);
+        let spawned_at = std::time::Instant::now();
         let (mut session, mut rx) =
             match TerminalSession::spawn_in(INITIAL_COLS, INITIAL_ROWS, options, container_pin) {
                 Ok(spawned) => spawned,
@@ -11098,6 +11111,12 @@ impl TakoApp {
                     return Err(e);
                 }
             };
+        // #2826: 素のシェルとして新しく起こしたペインを控える（作りたてのシェルへの送信を
+        // 送達フローへ寄せる判断の材料）。起こし直したペインの古い控えは消す
+        self.note_fresh_shell(
+            pane_id,
+            (bare_shell && !reused_container).then_some(spawned_at),
+        );
         // #2625: 器（tmux）のペインは、閉じるときに attach クライアントを先に帰してから PTY を
         // 閉じる（tty の最後の close を器のサーバーの中で起こさない = サーバー全体を止めない）。
         // 閉じる経路（× / ⌘W / CLI / MCP / タブ・窓ごと）はすべて端末の drop を通るのでここで決める。
@@ -14133,6 +14152,22 @@ impl TakoApp {
                 .pane_settle
                 .get(&pane_id)
                 .map(|settle| settle.state(has_role)),
+        }
+    }
+
+    /// 素のシェルとして新しく起こしたペインを控える（#2826。`None` = 控えを消す）。
+    /// 作りたてと見なす上限（`shell_send::FRESH_PANE_WINDOW`）を過ぎた控えはここで捨てる
+    fn note_fresh_shell(&mut self, pane: PaneId, spawned_at: Option<std::time::Instant>) {
+        let window = tako_core::shell_send::FRESH_PANE_WINDOW;
+        self.fresh_shell_spawns
+            .retain(|_, at| at.elapsed() < window);
+        match spawned_at {
+            Some(at) => {
+                self.fresh_shell_spawns.insert(pane, at);
+            }
+            None => {
+                self.fresh_shell_spawns.remove(&pane);
+            }
         }
     }
 
@@ -26820,6 +26855,14 @@ impl SessionHost for TakoApp {
             return None;
         }
         Some(status.to_json())
+    }
+
+    fn fresh_shell_age(&self, pane: PaneId) -> Option<std::time::Duration> {
+        self.fresh_shell_spawns.get(&pane).map(|at| at.elapsed())
+    }
+
+    fn command_flow_pending(&self, pane: PaneId) -> bool {
+        self.command_flows.iter().any(|c| c.pane == pane)
     }
 
     fn queue_command_flow(&mut self, pane: PaneId, command: String) {

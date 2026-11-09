@@ -134,6 +134,7 @@ pub fn tools() -> Vec<Value> {
                 改行つき送信は送達確認ループで配送され（マルチライン可）、応答は queued: true で即座に返る。\
                 顛末は tako_read_pane の delivery で追う（読み方もそちら）。応答の delivery には積む前に\
                 **未決着**（queued / waiting）だったフローだけが出る = この送達はその後ろに並ぶ（決着済みは出ない）。\
+                作りたてのシェルへの改行つき 1 行は準備を待って送る（応答に shell_wait）。\
                 text を空にして newline: true で Enter 単独送信（入力欄が空へ戻るまで再送）。\
                 **選択肢ダイアログ表示中は送信を拒否してエラーを返す**（数字なら選択が確定してしまう）。\
                 エラー本文の選択肢を見て tako_orchestrator_respond で応答する。\

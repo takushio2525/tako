@@ -148,6 +148,20 @@ pub trait SessionHost {
     /// 届かなければ書き直す（状態遷移は `tako_core::shell_send`）。
     /// 既定実装は何もしない（テスト用モック等）
     fn queue_command_flow(&mut self, _pane: PaneId, _command: String) {}
+    /// ペインを**素のシェルとして新しく**起こしてからの経過（#2826）。
+    ///
+    /// 作りたてのシェル（まだ最初のプロンプトを出していない）への `Request::Send` を
+    /// [`Self::queue_command_flow`] へ寄せる判断（`tako_core::shell_send::shell_wait`）の材料。
+    /// 明示コマンドのペイン・器のセッションへの繋ぎ直し・復元したペインは None。
+    /// 既定は None（GUI が居ない host では作りたてと言えない = 従来どおり即時に書く）
+    fn fresh_shell_age(&self, _pane: PaneId) -> Option<std::time::Duration> {
+        None
+    }
+    /// そのペインへ積んだ [`Self::queue_command_flow`] がまだ終わっていないか（#2826）。
+    /// 終わる前に即時で書くと、Enter を待っている前の行に混ざる。既定は false
+    fn command_flow_pending(&self, _pane: PaneId) -> bool {
+        false
+    }
     /// エージェント CLI のプロセスを建て直す（Issue #1067 のハーネス更新）。
     ///
     /// 「終了要求を出す」までは dispatch が同期で行う（応答へ結果を載せるため）。

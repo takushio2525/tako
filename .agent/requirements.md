@@ -236,6 +236,38 @@ FR-2.2.2 追補 3（Issue #2743・2026-11-05）: **生のキーと添付**。外
   送る本体は着地 `OffloadContinuation::SendAttached`（同期の腕と同じ `send_reply`）
 - remote daemon の `{keys}` / `/api/upload` の挙動は変えていない（置き場の名前と上限は共有）
 
+FR-2.2.2 追補 4（Issue #2826・2026-11-09）: **作りたてのペインへの改行つき送信はシェルの準備を待つ**。
+外部の GUI フロントエンドは `tako_create_tab` の直後に `tako_send_input("tako master")` を送り、
+`tako master --tab` / `tako solo --tab`（と呼び出し元が分からず新しいタブへ立てる経路 = #567）は
+TabNew の直後に素の `Request::Send` を撃つ。シェルへの送信は即時書き込みなので、worker の spawn・
+スターターが通している送達フロー（#640。シェル準備待ち → エコー確認 → 分離 Enter）を通っていなかった。
+Windows CI の実 ConPTY の実測: 器（psmux 3.4.0）のペインへ作ってから 300 ms 後に即時で書くと全損した
+（#2092 の門 = 器の中のシェルの pid が見えるまで預かる、が開いた後・器のクライアントが入力を読み始める
+前の窓）。門を外すと 0 ms でも 0/10。器なしのペインと macOS（zsh・器なし / tmux）は全回届いた。
+
+- 判断は `tako_core::shell_send::shell_wait` の 1 実装を dispatch の `send_to_pane` が呼ぶ（CLI `tako send` と
+  MCP `tako_send_input` が同じ関数を通る）。寄せるのは**改行つきの 1 行**（Enter だけの送信を含む）で、
+  送り先が「GUI が素のシェルとして新しく起こしたペイン（`ControlHost::fresh_shell_age`）・まだ最初の
+  プロンプトの印（OSC 133;A）が無い・起こしてから `FRESH_PANE_WINDOW`（30 秒 = 送達フローがシェルを
+  待つ上限）以内」のとき（理由 `first_prompt`）と、そのペインへ積んだ送達フローがまだ終わっていないとき
+  （`previous_flow` = 後ろに並ぶ。即時に書くと Enter を待っている前の行に混ざる）
+- **器のペインは外側の代替画面で「全画面 TUI が前面」と判断しない**: 器のクライアント自身が代替画面に
+  入る（Windows CI の psmux で作ってから約 0.3 秒・手元の tmux で約 0.6 秒）ので、判断は代替画面の分岐より
+  前に置く。器なしのペインの代替画面は本物の全画面 TUI = 従来どおり TUI 向けの送達フロー
+- 寄せないもの（従来どおり）: 改行なし・複数行・器の注入口で入れる本文（#907。送達フローは打鍵で書く）・
+  終わった端末・プロンプトを出したシェル・作ってから 30 秒を過ぎたシェル（統合の印を出さないシェル
+  でも待ちを足し続けない）・明示コマンドのペイン・器のセッションへの繋ぎ直し・復元したペイン
+- 応答: `{"queued": true, "pane": N, "shell_wait": "first_prompt" | "previous_flow"}`。本文はシェルの
+  準備を待ってから送るので呼び手は待ちを重ねない。`delivery` は載せない（顛末を `tako_read_pane` の
+  `delivery` で追う TUI 向けの送達フローとは別の経路）。CLI の `tako send` は `[shell-wait] reason=…` の
+  1 行を stderr へ。`tako master --tab` / `tako solo --tab` の出力は変えない（応答を表示しない）
+- GUI は素のシェルとして起こしたペインと時刻を `spawn_session` で控える（`fresh_shell_spawns`）。
+  配線は番犬 `crates/tako-control/tests/issue2826_fresh_shell_wiring_watchdog.rs`、実 PTY / 実 ConPTY の
+  実測は `crates/tako-control/tests/issue2826_fresh_pane_send.rs`（`TAKO2826_ROUNDS` / `TAKO2826_DELAY_MS`）
+- A/B: `TAKO_2826_LEGACY=1`（作りたてのペインへも修正前と同じく即時に書く）
+- 改行なしの送信は範囲外: 作りたてのペインへ「改行つき → 改行なし」の順に続けて送ると、改行なしの方が
+  先に届きうる（送達フローを待たない）。続けて送るなら 1 行ずつ改行つきで送る
+
 FR-2.2.8 の「明確なエラー」は FR-2.2.9 の解決順（環境変数 → 接続情報ファイル）を
 すべて試した上での不在を意味する（tako が起動していれば、tako の外からでも接続できる）。
 **隔離の印（#2531）**: `TAKO_ISOLATED=1` の CLI / MCP ブリッジ / remote daemon は、`TAKO_DISCOVERY_DIR` /
