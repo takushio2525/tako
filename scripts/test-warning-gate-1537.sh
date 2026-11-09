@@ -19,6 +19,9 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$PWD"
 GATE="${REPO_ROOT}/scripts/warning-gate.sh"
+# CI（GitHub Actions）の中で走ると GITHUB_ACTIONS=true を継ぐ。外の値は外し、
+# 注釈の有無は下で明示的に付けたときだけ確かめる
+unset GITHUB_ACTIONS
 
 PASS=0
 FAIL=0
