@@ -124,7 +124,7 @@ pub enum Ineligible {
     NonSubscriptionAuth { env_key: String },
     /// 組織のポリシーで無効化されている（managed settings）
     DisabledByPolicy { source: String },
-    /// この系統に Remote Control が無い（codex / agy）
+    /// tako がこの系統の起動へ Remote Control を渡さない（codex は上流の形が別物・agy は配線が未決 = #2835）
     AgentUnsupported { agent: String },
 }
 
@@ -172,8 +172,8 @@ impl Ineligible {
                 "Remote Control is disabled by your organization's policy (the managed setting disableRemoteControl)",
             ),
             Self::AgentUnsupported { .. } => Note::new(
-                "この系統に Claude 公式の Remote Control に相当する仕組みが無い（claude 専用）",
-                "This agent has no counterpart to Claude's official Remote Control (it is claude-only)",
+                "tako の Remote Control の opt-in は claude 専用で、この系統の起動には渡さない（系統ごとの上流の手段と tako の配線は `tako agent-support` の remote_control）",
+                "tako's Remote Control opt-in is claude-only and is not passed to this agent's launch (see remote_control in `tako agent-support` for each agent's upstream mechanism and tako's wiring)",
             ),
         }
     }
@@ -213,7 +213,7 @@ pub struct EligibilityFacts {
     pub env: Vec<(String, String)>,
     /// managed settings の `disableRemoteControl` が true か
     pub disabled_by_policy: Option<String>,
-    /// 起動する agent 系統（`claude` 以外は Remote Control を持たない）
+    /// 起動する agent 系統（tako が Remote Control を渡すのは `claude` だけ。agy の公式の口への配線は #2835）
     pub agent: String,
 }
 
@@ -248,7 +248,7 @@ impl Eligibility {
 /// 適格性の判定（**純粋関数**。env グローバルにも設定ファイルにも触らない）。
 ///
 /// 判定順は「確実に効くもの」から。`agent` が claude 以外なら env を見る前に落とす
-/// （そもそもフラグが存在しない）
+/// （tako は claude 以外へフラグを渡さない。codex に同名のフラグは無く、agy の `--remote-control` は #2835）
 pub fn eligibility(facts: &EligibilityFacts) -> Eligibility {
     if facts.agent != "claude" {
         return Eligibility::Blocked(Ineligible::AgentUnsupported {
@@ -602,7 +602,7 @@ mod tests {
     #[test]
     fn claude_以外の系統は_env_を見る前に落ちる() {
         for agent in ["codex", "agy"] {
-            // 阻害 env が無くても落ちる（そもそもフラグが無い）
+            // 阻害 env が無くても落ちる（tako は claude 以外へ渡さない。agy の公式の口は #2835）
             assert_eq!(
                 eligibility(&facts(agent, &[])),
                 Eligibility::Blocked(Ineligible::AgentUnsupported {
@@ -679,6 +679,30 @@ mod tests {
             }
         }
         assert_eq!(kinds.len(), all.len());
+    }
+
+    /// #2831: agy には 1.2.6 から公式の `--remote-control` がある（能力マトリクスの remote_control は
+    /// pending = tako 側の未配線）。断りの理由（spawn の応答の `warnings`・スマホの一覧の案内に出る）で
+    /// 「この系統に相当する仕組みが無い」と言うとマトリクスと食い違うので、言うのは tako が渡さないことだけ
+    #[test]
+    fn issue2831_系統で断る理由は上流に手段が無いと言わない() {
+        let reason = Ineligible::AgentUnsupported {
+            agent: "agy".into(),
+        }
+        .reason();
+        assert!(
+            !reason.ja().contains("相当する仕組みが無い"),
+            "agent_unsupported の理由が「相当する仕組みが無い」と言っている。agy には公式の \
+             `--remote-control` がある（#2831）: {}",
+            reason.ja()
+        );
+        assert!(
+            !reason.en().contains("no counterpart"),
+            "agent_unsupported の英語の理由が no counterpart と言っている（#2831）: {}",
+            reason.en()
+        );
+        // PWA の e2e（remote-link-1077.spec.js）は「claude 専用」を見る
+        assert!(reason.ja().contains("claude 専用") && reason.en().contains("claude-only"));
     }
 
     #[test]

@@ -66,7 +66,7 @@ const LINK = {
     session_id: null,
     account_label: null,
     state: 'ineligible: agent_unsupported',
-    reason: 'この系統に Claude 公式の Remote Control に相当する仕組みが無い（claude 専用）',
+    reason: 'tako の Remote Control の opt-in は claude 専用で、この系統の起動には渡さない（系統ごとの上流の手段と tako の配線は `tako agent-support` の remote_control）',
     next_step: '会話をスマホから見たい場合は master / worker を claude で起動する（`tako agent-support --agent <系統>` で差を確認できる）',
     enable_command: null,
   },

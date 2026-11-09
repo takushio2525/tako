@@ -180,7 +180,7 @@ pub struct WorkerLaunch<'a> {
     pub allow_sandbox_bypass: bool,
     /// この worker の会話を Claude 公式の Remote Control へ繋ぐか
     /// （プロファイルの `remote_control`。既定 false = 繋がない。Issue #1068）。
-    /// claude 以外には相当するフラグが無いので何も付かない
+    /// claude 以外には何も付かない（codex に同名のフラグは無い。agy の `--remote-control` へ広げるかは #2835）
     pub remote_control: bool,
     /// プロファイル worker_agents.<agent>.args の追加 CLI 引数（上級者向け）
     pub extra_args: &'a [String],
@@ -381,7 +381,8 @@ pub fn build_worker_cmd_in(
     }
     // Remote Control（#1068）は claude 専用。判定は呼び出し側（dispatch）が
     // `remote_control_decision` で済ませており、ここは付けるかどうかだけを見る。
-    // **claude 以外では絶対に付けない**（codex / agy に同名フラグが無く即死する）
+    // **claude 以外では付けない**（codex は同名のフラグが無く即死する。agy の `--remote-control` は
+    // プロファイルの opt-in をそこへ広げるかが未決 = #2835）
     if launch.remote_control && launch.agent == WorkerAgent::Claude {
         cmd.push(' ');
         cmd.push_str(crate::claude_remote::REMOTE_CONTROL_FLAG);
