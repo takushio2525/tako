@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use crate::protocol::PanelViewWire;
 
 /// リンクを開く「修飾 + クリック」の表記（実行プラットフォーム。Issue #763）。
+/// 確認ダイアログのスキップ（× の修飾 + クリック。#1601）も同じ表なのでここを引く。
 ///
 /// macOS は `⌘+クリック` / Windows は `Ctrl+クリック`。**直書きしない**:
 /// カタログは MCP を繋いだエージェント全員が起動時に読むので、Windows へ
@@ -1346,16 +1347,16 @@ pub fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
-        // 出自: #763
+        // 出自: #763 / #1601（スキップの修飾はリンクと同じ表 = 実行 OS の打鍵）
         json!({
             "name": "tako_confirm_close",
-            "description": "タブ / ペインを閉じる際の確認ダイアログの ON/OFF を\
+            "description": format!("タブ / ペインを閉じる際の確認ダイアログの ON/OFF を\
                 切り替える（enabled 省略は現在状態の取得のみ）。有効時、× クリックとペインを閉じる\
-                キーで「失われるもの」を要約した確認ダイアログを表示する（macOS のみ command キー +\
-                クリックでスキップできる。Windows は Win キーになるため非対応）。\
+                キーで「失われるもの」を要約した確認ダイアログを表示する（× を {lc}すると\
+                確認なしで閉じる）。\
                 確認が入るのは role 付き（エージェント）ペインと実行中プロセスを持つペインだけで、\
                 空のシェルペインは従来どおり即クローズする。CLI / MCP からの close は\
-                確認なし（AI フルコントロール）。設定は config.yaml に永続化される。",
+                確認なし（AI フルコントロール）。設定は config.yaml に永続化される。", lc = link_click()),
             "inputSchema": {
                 "type": "object",
                 "properties": {

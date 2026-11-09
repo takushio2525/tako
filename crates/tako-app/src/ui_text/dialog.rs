@@ -69,10 +69,10 @@ pub fn close_enter() -> &'static str {
 }
 /// 「修飾 + クリックで確認を飛ばす」パワーユーザー動線の案内。
 ///
-/// スキップ判定は GPUI の platform 修飾を直接見ている（`close_pane_with_confirm` の
-/// `cmd_held`）。Windows では Win+クリックになり実質押せないので、**案内自体を出さない**
-/// （`tako_core::platform::keys::platform_modifier` が `None` を返す = 呼び出し側が
-/// 行ごと落とす）。#1203
+/// `prefix` は `tako_core::platform::keys::modifier_click_prefix`（macOS = `⌘` /
+/// Windows = `Ctrl+`）。スキップの判定（`close_pane_with_confirm` の `cmd_held` を作る
+/// `keybindings::platform_modifier_active`）と同じ表なので、両 OS とも案内どおりに押せる
+/// （#1601。それまでは Windows では Win+クリック = 押せないので案内ごと落としていた）
 pub fn close_skip_hint(modifier: &str) -> String {
     tr!(
         format!("{modifier}クリックで確認なしで閉じる"),
@@ -104,7 +104,10 @@ mod tests {
                 lost_tmux(1),
                 cancel_esc().to_string(),
                 close_enter().to_string(),
-                close_skip_hint(tests_support::mac_modifier().expect("macOS").symbol),
+                close_skip_hint(&tests_support::mac_click_prefix()),
+                close_skip_hint(&tako_core::platform::keys::modifier_click_prefix(
+                    tako_core::platform::support::Platform::Windows,
+                )),
             ]
         });
     }

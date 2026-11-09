@@ -1118,23 +1118,16 @@ pub fn advanced_editor_header() -> &'static str {
 
 /// settings.json 直接編集の操作説明。
 ///
-/// `modifier` は確定の修飾キー（macOS = `⌘` / `Cmd`）。**確定は GPUI の platform
-/// 修飾を直接見ている**ので Windows では Win+Enter になり、押せる打鍵が無い。
-/// そのときは `None` を渡して打鍵に触れない文にする（保存ボタンが入口。#1203）
-pub fn advanced_edit_help(modifier: Option<tako_core::platform::keys::ModifierLabel>) -> String {
-    match modifier {
-        Some(m) => {
-            let (symbol, word) = (m.symbol, m.word);
-            tr!(
-                format!("本文をクリックすると編集できる（{symbol}+Enter または 保存 で確定 / Esc で取消）"),
-                format!("Click the text to edit ({word}+Enter or Save to apply, Esc to cancel)")
-            )
-        }
-        None => tr!(
-            "本文をクリックすると編集できる（保存 で確定 / Esc で取消）".to_string(),
-            "Click the text to edit (Save to apply, Esc to cancel)".to_string()
-        ),
-    }
+/// `modifier` は確定の修飾キー（`tako_core::platform::keys::platform_modifier`。
+/// macOS = `⌘` / `Cmd`・Windows = `Ctrl`）。確定の判定
+/// （`keybindings::platform_modifier_active`）と同じ表なので、両 OS とも案内どおりに
+/// 押せる（#1601。それまでは Windows では Win+Enter = 押せないので打鍵に触れない文へ落としていた）
+pub fn advanced_edit_help(modifier: tako_core::platform::keys::ModifierLabel) -> String {
+    let (symbol, word) = (modifier.symbol, modifier.word);
+    tr!(
+        format!("本文をクリックすると編集できる（{symbol}+Enter または 保存 で確定 / Esc で取消）"),
+        format!("Click the text to edit ({word}+Enter or Save to apply, Esc to cancel)")
+    )
 }
 
 pub fn advanced_save() -> &'static str {
@@ -1784,7 +1777,9 @@ mod tests {
                 remote_device_desc("nDEVICE"),
                 advanced_editor_header().into(),
                 advanced_edit_help(crate::ui_text::tests_support::mac_modifier()),
-                advanced_edit_help(None),
+                advanced_edit_help(tako_core::platform::keys::platform_modifier(
+                    tako_core::platform::support::Platform::Windows,
+                )),
                 advanced_save().into(),
                 advanced_reload().into(),
                 advanced_reveal(FileManager::Finder).into(),
