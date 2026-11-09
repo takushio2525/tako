@@ -2410,8 +2410,8 @@ mod tests {
             assert_eq!(
                 support_for(agent, keys::WORKER_TRUST),
                 Some(AgentSupport::Supported),
-                "worker_trust の {} が Supported ではない。tako は agent ごとに CLI が読む設定へ \
-                 信頼を書く（orchestrator/agent.rs の ensure_trusted_in）。縮退させるなら書き先と \
+                "worker_trust の {} が Supported ではない。tako は agent ごとに CLI が読む設定へ\
+                 信頼を書く（orchestrator/agent.rs の ensure_trusted_in）。縮退させるなら書き先と\
                  読み先がずれる実例を根拠に書くこと（#2829）",
                 agent.as_str()
             );
@@ -2431,7 +2431,7 @@ mod tests {
             for text in [note.ja(), note.en()] {
                 assert!(
                     text.contains("CLAUDE_CONFIG_DIR"),
-                    "account_switch の {} の理由が、tako のアカウントは CLAUDE_CONFIG_DIR しか \
+                    "account_switch の {} の理由が、tako のアカウントは CLAUDE_CONFIG_DIR しか\
                      動かさないことを言っていない（#2829）: {text}",
                     agent.as_str()
                 );
