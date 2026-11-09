@@ -1246,6 +1246,10 @@ tako usage --issue 2203 --by session    # その Issue の会話ごと（Issue �
 tako usage --show                       # 同じ内容を右パネルの usage ビューでも開く
 ```
 
+会話カタログに会話を載せるのは、永続化（tmux / psmux）の走査と tako mod の報告の 2 つです。永続化を切っていて
+tako mod も無い（`tako mod off`・claude の版が古い・`--bare` / `--safe-mode` で起動）と、master / solo の会話は
+`tako sessions` に載らず、worker の会話は起動したときの記録のまま会話 ID と結び付きません（macOS / Windows 共通）。
+
 `tako usage` は claude の会話記録から**使用量のメタデータだけ**（トークン数・モデル・時刻）を読んで索引を作り、
 トークン（入力・出力・キャッシュの作成と読み出し）・API 換算の金額・会話数を出します。API 換算はモデル別の単価で
 計算した目安で、サブスクリプションの請求額ではありません。会話の本文は読みません。初回は会話記録を全部読むので

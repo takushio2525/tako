@@ -6,7 +6,8 @@
  * 2.42.35（ボタンはキーで押す。ctrl+x → Tab）。
  * 帯の並びと文言: crates/tako-core/claude-mod/hooks/register.ts（segmentsOf / WORDS.ja / barText）、
  * 既定のボタン: crates/tako-core/src/claude_mod_ui.rs の default_buttons（compact / ホットキー c）。
- * 書かない: Windows で確認済み（tako_mod は未実測）、codex / agy でも出る、帯のボタンをマウスで押せる。
+ * Windows の tako_mod は対応（#1886 の Windows CI の実測。札は expect="supported"）。
+ * 書かない: Windows の実機の画面で確認済み（GUI での通しは未実測）、codex / agy でも出る、帯のボタンをマウスで押せる。
  */
 import Scrolly from '../motion/Scrolly.astro';
 import Step from '../motion/Step.astro';
