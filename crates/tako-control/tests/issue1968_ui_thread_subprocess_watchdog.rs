@@ -65,6 +65,8 @@ const FORBIDDEN_ON_UI: &[(&str, &str)] = &[
         "`tmux list-panes -a` + `ps` を起こす",
     ),
     ("backend_pane_pids(", "`tmux list-panes -a` を起こす"),
+    // #2804: 器なしのペインの子の有無（写した PTY 直下の子 pid を根に数えるのは後段 `probe_running_children`）
+    ("bare_pane_has_running_children", "`ps` を起こす（#2804）"),
     ("process_parent_map(", "`ps` を起こす"),
     ("Command::new(", "子プロセスを起こす"),
     ("capture_scrollback_joined(", "`tmux capture-pane` を起こす"),
@@ -466,6 +468,13 @@ const INJECTIONS: &[Injection] = &[
         from: "            has_running_children: false,\n            live_tail: lines.map(tail_join),",
         to: "            has_running_children: crate::agents::has_running_children(\"x\"),\n            live_tail: lines.map(tail_join),",
         expect: "agents::has_running_children",
+    },
+    Injection {
+        name: "収集で器なしのペインの子プロセスを数える（#2804 の後段を写しの段へ寄せる）",
+        file: DISPATCH,
+        from: "            has_running_children: false,\n            live_tail: lines.map(tail_join),",
+        to: "            has_running_children: self.pty_pid.is_some_and(crate::agents::bare_pane_has_running_children),\n            live_tail: lines.map(tail_join),",
+        expect: "bare_pane_has_running_children",
     },
     Injection {
         name: "報告の収集で器を採取する",

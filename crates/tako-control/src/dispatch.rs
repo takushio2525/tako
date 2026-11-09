@@ -21256,7 +21256,8 @@ pub struct WorkerStatusCtx {
     /// 入力欄のテキスト属性（#1297。`tako_read_pane` の `input_status.style` と同じ 1 実装）。
     /// **None = 属性が取れない**（ペインが GUI に無く素の tmux capture へ落ちた等）
     input_style: Option<tako_core::InputStyle>,
-    /// tmux セッション配下に実行中の子プロセスがあるか（#224）。
+    /// ペインのシェルの配下に実行中の子プロセスがあるか（#224。器ありは器のセッション・
+    /// 器なしは PTY 直下の子 pid を根に数える = #2804）。
     /// UI スレッドの収集では埋めず、background の [`probe_running_children`] が埋める（#1968）
     has_running_children: bool,
     /// 利用上限後の自動復帰の状態（#813。UI スレッドで写し取る）
@@ -21485,12 +21486,19 @@ fn worker_status_from_seed(seed: WorkerStatusSeed, q: WorkerQuery) -> Result<Val
 /// master の watch が worker の状態を引くたびに UI スレッドが子プロセスの出力待ち（`poll`）で
 /// 止まっていた。しかも `prepare_offload` は計測区間の外なので perf.log にも出なかった
 /// （本番と同じ構成の隔離 GUI の修正前の形で、メインスレッドの 10 秒 `sample` の約 11% がここ）。
-/// 同一性の検証（[`verify_ctx_pane_identity`]）の**後**に呼ぶ = 別ペインの器は数えない
+/// 同一性の検証（[`verify_ctx_pane_identity`]）の**後**に呼ぶ = 別ペインの器は数えない。
+///
+/// #2804: 器なしのペインは UI スレッドで写した PTY 直下の子 pid（[`bare_pty_pid`]）を根に数える
+/// （#2805 の会話 ID と同じ二段構え・規則は GUI の走査 #1367 と同じ 1 実装）。旧実装は器のセッション名が
+/// ある場合だけ数えていたので、器なしの worker は agent が動いていても常に false で、#1297 の倒し
+/// （入力待ち + 背景作業 → idle）・unknown の子の有無の補助が効かず、busy の worker が #224 の stalled へ
+/// 倒れていた。器ありの腕は修正前と同じ
 fn probe_running_children(mut ctx: WorkerStatusCtx) -> WorkerStatusCtx {
-    ctx.has_running_children = ctx
-        .backend_session
-        .as_deref()
-        .is_some_and(crate::agents::has_running_children);
+    ctx.has_running_children = match (ctx.backend_session.as_deref(), ctx.pty_pid) {
+        (Some(session), _) => crate::agents::has_running_children(session),
+        (None, Some(pid)) => crate::agents::bare_pane_has_running_children(pid),
+        (None, None) => false,
+    };
     ctx
 }
 
@@ -22495,8 +22503,9 @@ fn apply_worker_status_corrections(resolved: ResolvedWorkerStatus) -> Result<Val
 
     // #224 停滞検知: busy だが実行中子プロセスなし → stalled（停滞）。
     // #1880: mod の busy は対象外。45 秒以内の heartbeat が「claude は生きていてターンが
-    // 終わっていない」を claude 自身の口で言っている（器なしの直接ペインは子プロセスを
-    // 数えられず has_children が常に false なので、入れると画面の busy 表示が無い瞬間に倒れる）
+    // 終わっていない」を claude 自身の口で言っている（#2804 までは器なしの直接ペインの has_children が
+    // 常に false で、入れると画面の busy 表示が無い瞬間に倒れていた。器なしも数える今も、
+    // 生きている claude の申告を子プロセスの有無で覆さない）
     let mut stalled_info: Option<Value> = None;
     if status == "busy" && !has_children && status_source != "mod" {
         let screen_busy = recent_output
@@ -63237,6 +63246,229 @@ tako | pane 2 [ compact ]       [-]
         host.backend_sessions.insert(pane, "tako-s2805".into());
         assert_eq!(collect_report_ctx(&host, query(None)).pty_pid, None);
         assert_eq!(collect_worker_status_ctx(&host, pane).pty_pid, None);
+    }
+
+    // ---- #2804: 器なしの worker の has_running_children ----
+
+    /// 器なしのペイン（MockHost に本物の PTY）の「シェル（PTY 直下の子）→ agent 役の子」の木（#2804）。
+    ///
+    /// agent 役（`sleep`）を終わらせると、シェルは子を持たないまま入力を待つ
+    /// （= agent が終わってシェルだけ残ったペインの形。`read` は組み込みなので子を起こさない）
+    #[cfg(unix)]
+    struct BareTree2804 {
+        /// PTY 直下の子（ペインのシェル）
+        root: u32,
+        /// agent 役の子
+        agent: u32,
+        /// シェルが agent 役の終わりを見届けた（刈り取った）印
+        gone: std::path::PathBuf,
+        _scratch: tako_core::test_residue::ScratchDir,
+    }
+
+    #[cfg(unix)]
+    impl BareTree2804 {
+        /// `pane` に PTY を張り、シェルの子として agent 役を起こす（起きるまで待つ）
+        fn spawn(host: &mut MockHost, pane: u64) -> Self {
+            let scratch = tako_core::test_residue::ScratchDir::new("bare-children-2804");
+            let agent_file = scratch.path().join("agent.pid");
+            let gone = scratch.path().join("agent.gone");
+            let (session, _rx) = TerminalSession::spawn(
+                80,
+                24,
+                SpawnOptions {
+                    command: Some(tako_core::SpawnCommand {
+                        program: "/bin/bash".to_string(),
+                        args: vec![
+                            "-c".to_string(),
+                            r#"sleep 120 & echo $! >"$T2804_AGENT"; wait; : >"$T2804_GONE"; read -r _"#
+                                .to_string(),
+                        ],
+                    }),
+                    env: vec![
+                        ("T2804_AGENT".to_string(), agent_file.display().to_string()),
+                        ("T2804_GONE".to_string(), gone.display().to_string()),
+                    ],
+                    ..SpawnOptions::default()
+                },
+            )
+            .expect("PTY を張れる");
+            let root = session.child_pid().expect("PTY 直下の子の pid");
+            host.sessions.insert(pane, session);
+            let agent = wait_state_2804("agent 役の起動", || {
+                std::fs::read_to_string(&agent_file)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+            });
+            Self {
+                root,
+                agent,
+                gone,
+                _scratch: scratch,
+            }
+        }
+
+        /// agent 役を終わらせ、シェルが刈り取る（`wait` が返る）まで待つ
+        fn end_agent(&self) {
+            // SAFETY: 自分が起こした pid へ送るだけ（名前一致の一括 kill はしない）
+            unsafe {
+                libc::kill(self.agent as libc::pid_t, libc::SIGKILL);
+            }
+            wait_state_2804("シェルが agent 役の終わりを見届ける", || {
+                self.gone.exists().then_some(())
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for BareTree2804 {
+        fn drop(&mut self) {
+            for pid in [self.agent, self.root] {
+                // SAFETY: 自分が起こした pid へ送るだけ
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// 状態で待つ（上限は機の混み具合で伸ばすだけ）
+    #[cfg(unix)]
+    fn wait_state_2804<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+        use std::time::{Duration, Instant};
+        let budget = tako_core::wait_budget::state_wait_budget(
+            Duration::from_secs(20),
+            tako_core::wait_budget::machine_busy(),
+        );
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(v) = probe() {
+                return v;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} を待ちきれない（{budget:?}）"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// 状態の照会（CLI `tako orchestrator status` / MCP `tako_orchestrator_worker_status` の受け口と同じ:
+    /// UI スレッドの準備 → background のジョブ）
+    #[cfg(unix)]
+    fn status_2804(host: &MockHost, pane: u64) -> Value {
+        let job = match worker_status_prepare(host, Some(pane), None, None, None) {
+            Ok(OffloadJob::WorkerStatusQuery(job)) => job,
+            Ok(_) => panic!("状態の照会のジョブにならない"),
+            Err(e) => panic!("準備が断った: {e:?}"),
+        };
+        match job.run() {
+            OffloadOutcome::Reply(reply) => reply.expect("状態を返す"),
+            _ => panic!("ペイン指定の照会は background でそのまま答える"),
+        }
+    }
+
+    /// #2804: 器なしの worker でも、agent が生きている間の `has_running_children` は true。
+    /// 画面から決まらない（unknown）ときの子の有無の補助（busy へ倒す）も効く。
+    /// agent が終わってシェルだけ残ったペイン・別の worker と分かったペイン（#390 の同一性）は false。
+    /// `TAKO_2804_LEGACY=1` で修正前（器なしは常に false = 補助も効かず unknown のまま）
+    #[cfg(unix)]
+    #[test]
+    fn issue2804_器なしのworkerはagentが生きている間has_running_childrenがtrue() {
+        if tako_core::run_alone!(issue2804_器なしのworkerはagentが生きている間has_running_childrenがtrue)
+        {
+            return;
+        }
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused().as_u64();
+        let tree = BareTree2804::spawn(&mut host, pane);
+        // 前提: 器なしのペイン = 器の名前が無く、PTY 直下の子（シェル）が根になる
+        assert_eq!(host.backend_session(PaneId::from_raw(pane)), None);
+        // UI スレッドの写しは根を写すだけで数えない（#1968）
+        let seed = collect_worker_status_ctx(&host, pane);
+        assert_eq!(seed.pty_pid, Some(tree.root));
+        assert!(!seed.has_running_children);
+
+        let v = status_2804(&host, pane);
+        assert_eq!(
+            v["has_running_children"], true,
+            "#2804: 器なしでも agent（シェルの子）が生きている間は true: {v}"
+        );
+        assert_eq!(v["status_source"], "screen", "{v}");
+        assert_eq!(
+            v["status"], "busy",
+            "#2804: 画面から決まらないとき子の有無で busy へ倒す補助が効く: {v}"
+        );
+
+        // 別の worker と分かったペイン（期待する器があるのに器の無いペイン）は数えない
+        let other =
+            verify_ctx_pane_identity(collect_worker_status_ctx(&host, pane), Some("tako-gone"));
+        assert!(
+            !crate::agents::with_shared_scan(|| probe_running_children(other))
+                .has_running_children
+        );
+
+        // agent が終わってシェルだけ残ったペイン
+        tree.end_agent();
+        let v = status_2804(&host, pane);
+        assert_eq!(
+            v["has_running_children"], false,
+            "シェルだけなら false: {v}"
+        );
+        assert_eq!(v["status"], "unknown", "{v}");
+        drop(tree);
+
+        // A/B: 修正前（器なしは数えない）。agent の生きている木を張り直して同じ照会
+        let tree = BareTree2804::spawn(&mut host, pane);
+        std::env::set_var("TAKO_2804_LEGACY", "1");
+        let legacy = status_2804(&host, pane);
+        assert_eq!(legacy["has_running_children"], false, "旧: {legacy}");
+        assert_eq!(
+            legacy["status"], "unknown",
+            "旧: 子の有無の補助が効かない: {legacy}"
+        );
+        drop(tree);
+    }
+
+    /// #2804: 器なしの worker でも #1297 の倒し（一次シグナルが busy + 入力待ち + 背景作業 → idle）が効く。
+    /// 倒しは `has_children` を要求する（子の無い busy は #224 の stalled が拾う）ので、修正前の器なしは
+    /// 同じ画面が stalled へ倒れていた。子の有無は実プロセスの木を照会の後段が数えた値をそのまま渡す
+    #[cfg(unix)]
+    #[test]
+    fn issue2804_器なしでも背景作業つきの入力待ちはidleへ倒れる() {
+        let mut host = MockHost::new();
+        let pane = host.ws.active_tab().tree().focused().as_u64();
+        let tree = BareTree2804::spawn(&mut host, pane);
+        let probed = crate::agents::with_shared_scan(|| {
+            probe_running_children(collect_worker_status_ctx(&host, pane))
+        });
+        assert!(
+            probed.has_running_children,
+            "#2804: 器なしでも agent の生きているペインは子あり"
+        );
+        let v = apply_worker_status_corrections(ResolvedWorkerStatus {
+            has_children: probed.has_running_children,
+            ..i1273_resolved(I1273_IDLE_WITH_BACKGROUND)
+        })
+        .unwrap();
+        assert_eq!(v["status"], "idle", "watch が WORKER_IDLE を出せる: {v}");
+        assert_eq!(v["idle_despite_primary_busy"], true, "{v}");
+        assert_eq!(v["has_running_children"], true, "{v}");
+
+        // 修正前の数え方（器なしは数えない）では同じ画面が #224 の stalled へ倒れる
+        let legacy_children = crate::agents::bare_pane_has_running_children_in(
+            tree.root,
+            &crate::agents::process_parent_map(),
+            true,
+        );
+        assert!(!legacy_children);
+        let legacy = apply_worker_status_corrections(ResolvedWorkerStatus {
+            has_children: legacy_children,
+            ..i1273_resolved(I1273_IDLE_WITH_BACKGROUND)
+        })
+        .unwrap();
+        assert_eq!(legacy["status"], "stalled", "旧: {legacy}");
+        assert_eq!(legacy["idle_despite_primary_busy"], false, "旧: {legacy}");
+        drop(tree);
     }
 }
 

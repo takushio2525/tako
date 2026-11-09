@@ -26,6 +26,9 @@
 #   ⑥ close（`tako close` = MCP `tako_close_pane`）→ ペインが消え・レジストリが閉じ・agent が終わる
 #      （codex / agy の worker もここで閉じる）
 #      （器なしで agent が終了処理の途中で残るのは閉じる経路の既知の不具合 #2803 = 数えずに `[既知 #2803]` と名指す）
+#   ②④⑤ と ③' の status では `has_running_children`（#2804）も見る: agent が生きている間（② / ③' / ⑤ の後）は
+#      true・突然死の後（④）は false。#2804 から器なしでも PTY 直下の子（シェル）を根に数えるので、どの腕でも同じ値。
+#      `TAKO_2804_LEGACY=1` を付けて回すと器なしの腕（none / off）は修正前（常に false）を期待する
 #
 # claude / codex は偽物（API を呼ばない最小の TUI。alt screen に入り最下行に `❯` の入力欄を描き、Enter で
 # 受けた依頼を会話の記録（claude = transcript の user / assistant・codex = rollout の task_started /
@@ -39,6 +42,7 @@
 # 使い方: scripts/test-orchestrator-container-2792.sh            # 既定 = none tmux
 #         ARMS=none scripts/test-orchestrator-container-2792.sh
 #         ARMS="none off" TAKO_2805_LEGACY=1 …（#2805 の修正前の形を同じバイナリで見る）
+#         TAKO_2804_LEGACY=1 …（#2804 の修正前の形 = 器なしの has_running_children が常に false）
 #         KEEP=1 …（置き場を残す。応答の全文は <置き場>/responses/ に入る）
 set -uo pipefail
 
@@ -50,8 +54,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=lib/fake-exec.sh
 . "$REPO_ROOT/scripts/lib/fake-exec.sh"
 ARMS="${ARMS:-none tmux}"
-# #2805 の A/B（GUI へそのまま継がせる）
+# #2805 / #2804 の A/B（GUI へそのまま継がせる）
 LEGACY_2805="${TAKO_2805_LEGACY:-}"
+LEGACY_2804="${TAKO_2804_LEGACY:-}"
 
 PASS=0
 FAIL=0
@@ -345,6 +350,7 @@ start_gui() {
   # 器の設定が OFF（Homebrew cask の既定。tmux は在っても使わない）
   [ "$arm" = off ] && persist=0
   [ -n "$LEGACY_2805" ] && arm_env+=("TAKO_2805_LEGACY=$LEGACY_2805")
+  [ -n "$LEGACY_2804" ] && arm_env+=("TAKO_2804_LEGACY=$LEGACY_2804")
   # 起動待ち（#2413）はメモリの圧で spawn を待たせる = 器と無関係の揺れなので旧挙動（その場で起こす）
   if ! launch_isolated_gui "$log" "HOME=$GHOME" "SHELL=/bin/zsh" "TAKO_PERSIST=$persist" \
     "FAKE_DIR=$FAKE_DIR" "CODEX_HOME=$CH" "TAKO_2413_LEGACY=1" ${arm_env[@]+"${arm_env[@]}"}; then
@@ -444,6 +450,22 @@ watch_of() {
   echo "    watch($tag, rc=$rc): $(printf '%s' "$out" | head -3 | mask 300)"
 }
 
+# 直前の status の `has_running_children` を確かめる（#2804）。$1 = 腕・$2 = 誰の・$3 = 段の名前・
+# $4 = agent が生きているか（1 = 生きている → true・0 = 死んだ後 → false）。
+# `TAKO_2804_LEGACY=1` の器なしの腕（none / off）だけは修正前（常に false）を期待する
+children_expect() {
+  local arm="$1" who="$2" tag="$3" alive="$4" got want
+  got="$(jq -r '.has_running_children // "なし"' <<<"$STATUS_JSON" 2>/dev/null)"
+  want=false
+  [ "$alive" = 1 ] && want=true
+  if [ -n "$LEGACY_2804" ] && [ "$arm" != tmux ]; then
+    check "$([ "$got" = false ] && echo 1 || echo 0)" "[${arm}][旧 #2804] ${who} の has_running_children は常に false（${tag}: ${got}）"
+    return
+  fi
+  check "$([ "$got" = "$want" ] && echo 1 || echo 0)" \
+    "[${arm}] ${who} の has_running_children は agent が$([ "$alive" = 1 ] && echo 生きている間 || echo 死んだ後) ${want}（${tag}: ${got}）"
+}
+
 # codex / agy の worker の会話の記録の読みを確かめる（③' と ⑤ の後）。$1 = 腕・$2 = agent・$3 = 段の名前。
 # #2805 から器なしでもペインの PTY 直下の子から会話 ID を辿るので、どの腕でも status は会話の記録
 # （codex-session / agy-session）・report は会話の記録（transcript）を返す。`TAKO_2805_LEGACY=1` の器なしの腕
@@ -485,6 +507,7 @@ agent_steps() {
   watch_of "$cpane" "$agent" 120
   check "$(case "$WATCH_OUT" in *WORKER_IDLE*) echo 1 ;; *) echo 0 ;; esac)" "[${arm}] ${agent} の watch が WORKER_IDLE を返す"
   status_of "$cpane" "$agent"
+  children_expect "$arm" "$agent" spawn 1
   report_of "$cpane" "$agent"
   agent_expect "$arm" "$agent" spawn
 }
@@ -501,6 +524,7 @@ agent_after_restart() {
   # 起き直した agent が会話を開くまで（status が状態のソースを決めるまで）待つ
   wait_until 60 '[ "$(iso_cli orchestrator status --pane "$cpane" 2>/dev/null | jq -r ".status_source // empty")" = "${agent}-session" ]'
   status_of "$cpane" "${agent}-after-restart"
+  children_expect "$arm" "$agent" after-restart 1
   report_of "$cpane" "${agent}-after-restart"
   agent_expect "$arm" "$agent" after-restart
 }
@@ -567,6 +591,7 @@ run_arm() {
   check "$(case "$WATCH_OUT" in *WORKER_IDLE*) echo 1 ;; *) echo 0 ;; esac)" "[${arm}] watch が WORKER_IDLE を返す"
   wait_until 60 '[ -n "$(iso_cli orchestrator status --pane "$wpane" 2>/dev/null | jq -r ".resolved_session_id // empty")" ]'
   status_of "$wpane" first
+  children_expect "$arm" claude first 1
   sid="$(jq -r '.resolved_session_id // empty' <<<"$STATUS_JSON" 2>/dev/null)"
   check "$([ -n "$sid" ] && echo 1 || echo 0)" "[${arm}] status が会話 ID を解決した（${sid:-なし}）"
   report_of "$wpane" first
@@ -593,6 +618,7 @@ run_arm() {
   watch_of "$wpane" dead 40
   check "$(case "$WATCH_OUT" in *WORKER_DEAD*) echo 1 ;; *) echo 0 ;; esac)" "[${arm}] 突然死の後の watch が WORKER_DEAD を返す"
   status_of "$wpane" dead
+  children_expect "$arm" claude dead 0
   local rcmd
   rcmd="$(jq -r '.resume_command // empty' <<<"$STATUS_JSON" 2>/dev/null)"
   [ -n "$rcmd" ] || rcmd="$(printf '%s\n' "$WATCH_OUT" | sed -n 's/^  resume: //p' | head -1)"
@@ -656,6 +682,7 @@ run_arm() {
   fi
   if [ -n "$wpane" ]; then
     status_of "$wpane" after-restart
+    children_expect "$arm" claude after-restart 1
     report_of "$wpane" after-restart
     check "$(case "$(jq -r '.text // empty' <<<"$REPORT_JSON")" in *REPORT-2792*) echo 1 ;; *) echo 0 ;; esac)" \
       "[${arm}] GUI の再起動の後も report が同じ会話の報告を返す"

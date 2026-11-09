@@ -1113,6 +1113,36 @@ pub fn has_running_children(backend_session: &str) -> bool {
     child_count > 0
 }
 
+/// 器を持たないペインに実行中の子プロセスがあるか（#2804。worker_status の `has_running_children`）。
+///
+/// [`has_running_children`] の器なし版。`pty_pid` は PTY 直下の子（= ペインのシェル）で、
+/// **その自身を除いた**子孫が 1 つでも居れば true（agent の TUI もシェルの子なので、生きている間は
+/// true）。規則は GUI の走査（#372 / #1367 の [`RunningChildrenScanState::is_pane_busy`]）と同じ
+/// [`has_running_descendants_inner`] の 1 実装で、器ありの [`has_running_children`] とも同じ問いになる。
+/// `ps` を 1 回起こす（[`with_shared_scan`] の内側なら相乗り）ので **UI スレッドで呼ばない**（#1968）
+pub fn bare_pane_has_running_children(pty_pid: u32) -> bool {
+    bare_pane_has_running_children_in(pty_pid, &process_parent_map(), legacy_2804())
+}
+
+/// 判定の本体（A/B のため旧挙動を引数で受ける。#2804）。
+///
+/// `legacy_backend_only` が真なら器なしのペインを数えない = #2804 前の挙動（常に false）
+pub fn bare_pane_has_running_children_in(
+    pty_pid: u32,
+    parents: &HashMap<u32, u32>,
+    legacy_backend_only: bool,
+) -> bool {
+    !legacy_backend_only && has_running_descendants_inner(&[pty_pid], parents)
+}
+
+/// #2804 の A/B。`TAKO_2804_LEGACY=1` で**同一バイナリのまま**旧挙動へ戻す
+/// （worker_status の `has_running_children` が器のセッションしか数えない = 器なしの worker で常に false）。
+/// 呼ばれるのは状態の照会 1 回に 1 度（background）だけなので覚えずに毎回読む
+/// （#2805 の A/B と同じ。`run_alone!` の子のテストが途中で切り替えて旧挙動を確かめられる）
+pub fn legacy_2804() -> bool {
+    std::env::var_os("TAKO_2804_LEGACY").is_some_and(|v| v == "1")
+}
+
 /// バックエンドセッション群のうち実行中の子プロセスを持つものの数を返す。
 /// sleep_guard の busy_agents カウントで persist 復元後の worker を拾うために使う（#324）
 pub fn count_sessions_with_running_children(sessions: &[&str]) -> usize {
@@ -1473,6 +1503,22 @@ mod tests {
             parent != 0 && parent != me,
             "自プロセスの親が壊れている: ppid={parent}"
         );
+    }
+
+    /// #2804: 器なしのペインの子の有無は PTY 直下の子（シェル）**自身を除いた**子孫で数える
+    /// （GUI の走査 #372 / #1367 と同じ規則）
+    #[test]
+    fn issue2804_器なしのペインはシェル自身を除いた子孫で数える() {
+        // 100 = ペインのシェル（根）・200 = agent・300 = agent の子・900 = 無関係
+        let parents = HashMap::from([(100, 1), (200, 100), (300, 200), (900, 1)]);
+        assert!(bare_pane_has_running_children_in(100, &parents, false));
+        // agent が終わってシェルだけ残った
+        let shell_only = HashMap::from([(100, 1), (900, 1)]);
+        assert!(!bare_pane_has_running_children_in(100, &shell_only, false));
+        // シェルがもう居ない（ペインが閉じた・古い pid）
+        assert!(!bare_pane_has_running_children_in(555, &parents, false));
+        // A/B: 修正前は器なしを数えない
+        assert!(!bare_pane_has_running_children_in(100, &parents, true));
     }
 
     #[test]
