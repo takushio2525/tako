@@ -31,6 +31,7 @@
 #         ARMS=off scripts/test-bare-children-2804.sh
 #         TAKO_2804_LEGACY=1 scripts/test-bare-children-2804.sh
 #         KEEP=1 …（置き場を残す。応答の全文は <置き場>/responses/ に入る）
+#         TAKO_PERF_VERBOSE=1 KEEP=1 …（GUI の 16ms 超の区間を <置き場>/data/perf.log へ残す）
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -127,8 +128,10 @@ use strict;
 use warnings;
 my ($kind) = @ARGV;
 $| = 1;
-open(my $pf, '>', "$ENV{FAKE_DIR}/$kind.pid") and print $pf $$;
-close $pf if $pf;
+if (open(my $pf, '>', "$ENV{FAKE_DIR}/$kind.pid")) {
+    print $pf $$;
+    close $pf;
+}
 system('/bin/stty', 'raw', '-echo');
 my $rule = "\xe2\x94\x80" x 45;
 my @lines = $kind eq 'claude'
@@ -191,6 +194,8 @@ start_gui() {
     arm_env=("PATH=$BIN:/usr/bin:/bin:/usr/sbin:/sbin")
   fi
   [ -n "$LEGACY_2804" ] && arm_env+=("TAKO_2804_LEGACY=$LEGACY_2804")
+  # UI スレッドの準備の所要を perf.log に残す（16ms 超。照会の UI の段が重くなっていないかを比べる）
+  [ -n "${TAKO_PERF_VERBOSE:-}" ] && arm_env+=("TAKO_PERF_VERBOSE=$TAKO_PERF_VERBOSE")
   if ! launch_isolated_gui "$log" "HOME=$GHOME" "SHELL=/bin/zsh" "TAKO_PERSIST=$persist" \
     "FAKE_DIR=$FAKE_DIR" "FAKE_SID=$SID" ${arm_env[@]+"${arm_env[@]}"}; then
     echo "  未実測: 隔離 GUI を起こせない（tako-vd が描画できない = 蓋閉じ等）"
@@ -288,6 +293,7 @@ run_arm() {
   cpid="$(screen_pid claude)"
   OWN_PIDS="$OWN_PIDS $cpid"
   check "$([ -n "$cpid" ] && echo 1 || echo 0)" "[${arm}] 偽 claude がペインで起きた（pid ${cpid:-なし}）"
+  [ -n "$cpid" ] || echo "    ペインの画面: $(iso_cli read --pane "$pane" 2>&1 | tail -6 | mask 300)"
   echo "    木: $(ps -o pid=,ppid=,command= -p "${cpid:-1}" 2>/dev/null | mask 160)"
   # 画面が描けるまで（背景作業の申告を読めるまで）待つ
   wait_until 30 '[ "$(iso_cli orchestrator status --pane "$pane" --session-id "$SID" 2>/dev/null | jq -r ".background_work // empty")" != "" ]'
