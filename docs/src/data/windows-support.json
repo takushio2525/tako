@@ -100,6 +100,13 @@
       "evidence_detail": "項目 23（tako equalize）"
     },
     {
+      "key": "tako_events",
+      "status": "degraded",
+      "note_ja": "長ポーリングは named pipe でも HTTP MCP でも同じ受け口で待つ（Windows 実機の named pipe では未実測）。turn_changed は tako mod の報告から積むので、Windows で mod の報告を実測するまで（#1886）出るかは確かめていない。ターン状態は tako_orchestrator_worker_status（画面からの推定）で読める",
+      "evidence": "unit-test",
+      "evidence_detail": "issue2731_events_long_poll の HTTP MCP の段（UI の受け口を読まない状態での長ポーリング・時間切れ・丸め・9 本目）と issue2731_events_no_body が Windows CI でも緑。named pipe の段は unix のソケットで確かめ、受け口（ipc::submit）は同じ"
+    },
+    {
       "key": "tako_fda",
       "status": "unsupported",
       "note_ja": "Windows に macOS の TCC（フルディスクアクセス）に相当する仕組みが無い",

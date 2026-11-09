@@ -53,6 +53,17 @@ pub enum PaneOrigin {
     Suggestion,
 }
 
+impl PaneOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Cli => "cli",
+            Self::Mcp => "mcp",
+            Self::Suggestion => "suggestion",
+        }
+    }
+}
+
 /// タイトルの出どころ（FR-2.12.3）。明示リネーム（CLI / MCP / UI）= Manual は
 /// 自動リネーム（Auto）に上書きされない。Manual のクリアで Default に戻り自動が再開する
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -119,8 +130,16 @@ pub struct Pane {
 
 impl Pane {
     pub fn new(origin: PaneOrigin) -> Self {
+        let id = PaneId::next();
+        // #2731: ペインができたことを外の購読者へ（role は後から `set_role` が積む）
+        crate::events::emit(crate::events::Detail::PaneAdded {
+            pane: id.as_u64(),
+            origin: origin.as_str(),
+            restored: false,
+            role: None,
+        });
         Self {
-            id: PaneId::next(),
+            id,
             origin,
             title: None,
             title_source: TitleSource::Default,
@@ -146,6 +165,14 @@ impl Pane {
         limit_autoresume: bool,
     ) -> Self {
         PaneId::reserve(id);
+        // #2731: 復元したペインも「できた」として積む（GUI の起動ごとに epoch が変わるので、
+        // 受け手は `since: 0` で今あるペインを知れる）
+        crate::events::emit(crate::events::Detail::PaneAdded {
+            pane: id,
+            origin: origin.as_str(),
+            restored: true,
+            role: role.clone(),
+        });
         Self {
             id: PaneId(id),
             origin,
@@ -216,7 +243,16 @@ impl Pane {
         self.queue_priority = priority;
     }
 
+    /// 役割ラベルを書き換える。値が変わったら外の購読者へ `role_changed` を積む（#2731。
+    /// 比べるのは前後の値だけ = 読み取りを足さない）
     pub fn set_role(&mut self, role: Option<String>) {
+        if self.role != role {
+            crate::events::emit(crate::events::Detail::RoleChanged {
+                pane: self.id.as_u64(),
+                from: self.role.clone(),
+                to: role.clone(),
+            });
+        }
         self.role = role;
     }
 
@@ -302,6 +338,19 @@ impl Pane {
     }
 }
 
+/// #2731: ペインが消えたことを外の購読者へ。`Pane` は複製できない（`Clone` を持たない）ので、
+/// 破棄 = そのペインがプロセスから消えた時点。タブ間の移動・バックグラウンドへの退避は値の移動で
+/// 破棄されないので積まない。閉じる 3 経路（GUI の × / タブ close / CLI・MCP の close）と、
+/// 実行ペインの差し替え（#1657）・復旧での作り直しのどれもがここを通る
+impl Drop for Pane {
+    fn drop(&mut self) {
+        crate::events::emit(crate::events::Detail::PaneClosed {
+            pane: self.id.as_u64(),
+            role: self.role.take(),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +372,75 @@ mod tests {
         pane.set_title(None);
         assert!(pane.set_title_auto("再開".into()));
         assert_eq!(pane.title(), Some("再開"));
+    }
+
+    /// #2731: 生成・role の変化・破棄が外の購読者へ積まれる。同じ値の書き直しは積まない
+    #[test]
+    fn 生成とroleの変化と破棄を出来事へ積む() {
+        use crate::events::Detail;
+        let captured = crate::events::capture_on_this_thread();
+        let mut pane = Pane::new(PaneOrigin::Mcp);
+        let id = pane.id().as_u64();
+        pane.set_role(Some("orchestrator-master".into()));
+        pane.set_role(Some("orchestrator-master".into()));
+        pane.set_role(Some("orchestrator-master:dev".into()));
+        drop(pane);
+        assert_eq!(
+            captured.take(),
+            [
+                Detail::PaneAdded {
+                    pane: id,
+                    origin: "mcp",
+                    restored: false,
+                    role: None,
+                },
+                Detail::RoleChanged {
+                    pane: id,
+                    from: None,
+                    to: Some("orchestrator-master".into()),
+                },
+                Detail::RoleChanged {
+                    pane: id,
+                    from: Some("orchestrator-master".into()),
+                    to: Some("orchestrator-master:dev".into()),
+                },
+                Detail::PaneClosed {
+                    pane: id,
+                    role: Some("orchestrator-master:dev".into()),
+                },
+            ]
+        );
+    }
+
+    /// #2731: 復元は持ち越した role ごと「できた」として積む
+    #[test]
+    fn 復元したペインもroleつきで積む() {
+        use crate::events::Detail;
+        let captured = crate::events::capture_on_this_thread();
+        let pane = Pane::restore(
+            PaneId::next().as_u64(),
+            PaneOrigin::Cli,
+            None,
+            TitleSource::Default,
+            Some("dev-server".into()),
+            false,
+        );
+        let id = pane.id().as_u64();
+        drop(pane);
+        assert_eq!(
+            captured.take(),
+            [
+                Detail::PaneAdded {
+                    pane: id,
+                    origin: "cli",
+                    restored: true,
+                    role: Some("dev-server".into()),
+                },
+                Detail::PaneClosed {
+                    pane: id,
+                    role: Some("dev-server".into()),
+                },
+            ]
+        );
     }
 }

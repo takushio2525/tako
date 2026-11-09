@@ -1091,6 +1091,47 @@ mod tests {
         );
     }
 
+    /// #2731: `tako_events` は `Request::Events` へそのまま写る（種類の検証は dispatch の 1 か所）。
+    /// 負の値は前段で断り、`panes` は 1 つなら整数でもよい
+    #[test]
+    fn issue2731_eventsは購読の要求へ写す() {
+        let (_, requests) = run(
+            call(
+                "tako_events",
+                json!({ "since": 42, "kinds": ["role_changed"], "panes": [3, 4], "wait_ms": 20000 }),
+            ),
+            Some(7),
+            true,
+        );
+        assert_eq!(
+            requests,
+            vec![Request::Events {
+                since: Some(42),
+                kinds: vec!["role_changed".into()],
+                panes: vec![3, 4],
+                wait_ms: Some(20000),
+            }]
+        );
+        let (_, requests) = run(call("tako_events", json!({ "panes": 5 })), Some(7), true);
+        assert_eq!(
+            requests,
+            vec![Request::Events {
+                since: None,
+                kinds: Vec::new(),
+                panes: vec![5],
+                wait_ms: None,
+            }]
+        );
+        for (args, key) in [
+            (json!({ "wait_ms": -1 }), "wait_ms"),
+            (json!({ "since": -5 }), "since"),
+            (json!({ "panes": [1, -2] }), "panes"),
+        ] {
+            let err = build_request("tako_events", &args, None, None).unwrap_err();
+            assert!(says(&err, &Reason::NotNonNegInt(key.into())), "{err}");
+        }
+    }
+
     /// #1996: `tako_queue` の priority は受付番号かペインと段をそのまま `Request::Queue` へ写す
     /// （呼び出し元のペインで補わない = 受付番号と排他のまま dispatch / 受け口が判断する）
     #[test]
@@ -2019,7 +2060,8 @@ mod tests {
         // #1879 の tako_mod（Claude Code の mod 連携の状態と切替）を追加して 160
         // #1694 の tako_search（ワークスペース横断検索。results / open / clear は同じツールの action）を追加して 161
         // #1993 の tako_queue（PC のメモリ・CPU と重い処理の状況）を追加して 162
-        assert_eq!(tools.len(), 162);
+        // #2731 の tako_events（変化の出来事の購読。長ポーリング）を追加して 163
+        assert_eq!(tools.len(), 163);
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
             assert!(name.starts_with("tako_"), "{name} は tako_ 接頭辞");

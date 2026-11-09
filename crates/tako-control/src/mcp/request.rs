@@ -40,6 +40,13 @@ pub(super) fn build_request(
 ) -> Result<Request, String> {
     Ok(match name {
         "tako_list_panes" => Request::List,
+        // #2731: 変化の出来事の購読（長ポーリング）。種類の検証は dispatch（`events::query_of`）の 1 か所
+        "tako_events" => Request::Events {
+            since: u64_arg(args, "since")?,
+            kinds: str_vec_arg(args, "kinds")?.unwrap_or_default(),
+            panes: u64_list_arg(args, "panes")?,
+            wait_ms: u64_arg(args, "wait_ms")?,
+        },
         "tako_split_pane" => {
             let tab = u64_arg(args, "tab")?;
             Request::Split {
@@ -1836,6 +1843,19 @@ pub(super) fn u64_arg(args: &Value, key: &str) -> Result<Option<u64>, String> {
             .as_u64()
             .map(Some)
             .ok_or_else(|| Reason::NotNonNegInt(key.to_string()).to_string()),
+    }
+}
+
+/// 非負整数の配列（1 つだけなら配列でなくてもよい）。省略は空
+fn u64_list_arg(args: &Value, key: &str) -> Result<Vec<u64>, String> {
+    let not_int = || Reason::NotNonNegInt(key.to_string()).to_string();
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| v.as_u64().ok_or_else(not_int))
+            .collect(),
+        Some(v) => v.as_u64().map(|n| vec![n]).ok_or_else(not_int),
     }
 }
 

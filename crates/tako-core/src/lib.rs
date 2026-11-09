@@ -28,6 +28,8 @@ pub mod dialog;
 pub mod editor_scroll;
 pub mod emoji;
 pub mod encoding_pin;
+/// 外の購読者へ流す変化の出来事（#2731）
+pub mod events;
 pub mod fake_exec;
 pub mod file_clipboard;
 pub mod file_copy;

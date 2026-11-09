@@ -85,6 +85,11 @@ pub fn submit(
             return crate::queue::answer(&request).map_err(SubmitError::Rejected);
         }
     }
+    // #2731: 変化の出来事の購読も UI の受け口へ渡さずここで答える。長ポーリングの待ちはこの接続の
+    // スレッド（IPC は接続ごと・HTTP MCP は要求ごとのスレッド）で行い、UI スレッドを塞がない
+    if let Request::Events { .. } = &request {
+        return crate::events::answer(&request, true).map_err(SubmitError::Rejected);
+    }
     let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
     tx.unbounded_send(IncomingRequest {
         request,

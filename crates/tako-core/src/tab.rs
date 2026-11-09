@@ -111,13 +111,26 @@ impl Tab {
 
     /// 初期タイトルの差し替え（出どころは変えない。UI の連番付け直し等）
     pub fn set_title(&mut self, title: impl Into<String>) {
-        self.title = title.into();
+        self.replace_title(title.into());
     }
 
     /// 明示リネーム（`tako tab rename` / MCP / UI。FR-2.12.3 で自動より優先される）
     pub fn set_title_manual(&mut self, title: impl Into<String>) {
-        self.title = title.into();
         self.title_source = TitleSource::Manual;
+        self.replace_title(title.into());
+    }
+
+    /// タイトルを書き換える 1 実装。値が変わったら外の購読者へ `tab_renamed` を積む（#2731。
+    /// 比べるのは前後の値だけ = 読み取りを足さない）。出どころは呼び手が先に書いておく
+    fn replace_title(&mut self, title: String) {
+        if self.title != title {
+            crate::events::emit(crate::events::Detail::TabRenamed {
+                tab: self.id.as_u64(),
+                from: std::mem::replace(&mut self.title, title),
+                to: self.title.clone(),
+                source: self.title_source.as_str(),
+            });
+        }
     }
 
     /// 手動リネームの解除。タイトルは保持しつつ Default に戻し、自動リネームを再開させる
@@ -130,8 +143,8 @@ impl Tab {
         if self.title_source == TitleSource::Manual {
             return false;
         }
-        self.title = title.into();
         self.title_source = TitleSource::Auto;
+        self.replace_title(title.into());
         true
     }
 
@@ -405,5 +418,33 @@ mod tests {
         std::fs::remove_dir_all(&tmp).unwrap();
         assert!(tab.prune_dead_folders());
         assert!(tab.pinned_folders().is_empty());
+    }
+
+    /// #2731: タイトルの書き換え 3 口が外の購読者へ積まれる（同じ値・手動の後の自動は積まない）
+    #[test]
+    fn タイトルの変化を出来事へ積む() {
+        use crate::events::Detail;
+        let mut tab = Tab::new("1", Pane::new(PaneOrigin::User));
+        let id = tab.id().as_u64();
+        let captured = crate::events::capture_on_this_thread();
+        tab.set_title("2");
+        assert!(tab.set_title_auto("ビルド"));
+        tab.set_title_manual("ビルド");
+        tab.set_title_manual("レビュー");
+        assert!(!tab.set_title_auto("別名"));
+        let renamed = |from: &str, to: &str, source: &'static str| Detail::TabRenamed {
+            tab: id,
+            from: from.into(),
+            to: to.into(),
+            source,
+        };
+        assert_eq!(
+            captured.take(),
+            [
+                renamed("1", "2", "default"),
+                renamed("2", "ビルド", "auto"),
+                renamed("ビルド", "レビュー", "manual"),
+            ]
+        );
     }
 }

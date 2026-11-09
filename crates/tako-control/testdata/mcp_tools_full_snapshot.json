@@ -9,6 +9,36 @@
     "name": "tako_list_panes"
   },
   {
+    "description": "ペインの増減・role・タブ名・ターン状態の変化を since より後から返す（ポーリングの代わり）。該当が無ければ wait_ms（上限 30000）まで待つ。cursor を次の since に渡し、epoch が変わるか dropped なら tako_list_panes で読み直す。種類は kinds_known。",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "kinds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "panes": {
+          "items": {
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "since": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "wait_ms": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "tako_events"
+  },
+  {
     "description": "ペインを分割して新しいターミナルペインを作り、新ペイン ID を返す。command を指定するとシェルの代わりにそれを実行する（dev サーバー・`git diff`・ファイルビューアの表示に使う）。ユーザーに成果物を見せるとき・レビューを求めるときは、口頭で説明せずこれで実際に開いて提示すること。分割元は pane（その隣）か tab（そのタブのフォーカスペインの隣）で、どちらも省略すると呼び出し元の隣。",
     "inputSchema": {
       "additionalProperties": false,
